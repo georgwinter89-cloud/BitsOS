@@ -1,0 +1,9 @@
+# Lines of root.out that may be missing on V2: "<line>: <owner>: <why>".
+mounted: FS (vfs-sys): mount (165) ENOSYS (linux-6.6/fs/namespace.c:3861); tmpfs exists in V2, only the syscall is missing
+proc-mounts: FS (vfs-sys): no /proc/mounts, /proc/self/mounts (linux-6.6/fs/proc_namespace.c:101 show_vfsmnt)
+mount-list: FS (vfs-sys): mount without arguments reads /proc/mounts
+df: FS (vfs-sys): df needs the tmpfs mounted by mount (165, ENOSYS); statfs (137) works since FS-1b
+unmounted: FS (vfs-sys): umount2 (166) ENOSYS (linux-6.6/fs/namespace.c:1920)
+chroot: FS (vfs-sys): chroot (161) ENOSYS (linux-6.6/fs/open.c:593)
+ping: NW (net): socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) as root gives EPROTONOSUPPORT (linux-6.6/net/ipv4/af_inet.c:251 inet_create, net/ipv4/raw.c)
+traceroute: NW (net): raw ICMP receive socket as for ping

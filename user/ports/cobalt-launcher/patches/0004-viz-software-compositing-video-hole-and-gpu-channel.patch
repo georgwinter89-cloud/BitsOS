@@ -1,0 +1,125 @@
+diff --git a/components/viz/service/display/software_renderer.cc b/components/viz/service/display/software_renderer.cc
+index 8740f6a0ce..5db6effc36 100644
+--- a/components/viz/service/display/software_renderer.cc
++++ b/components/viz/service/display/software_renderer.cc
+@@ -53,6 +53,11 @@
+ #include "ui/gfx/geometry/skia_conversions.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
++#if BUILDFLAG(USE_STARBOARD_MEDIA)
++#include "components/viz/common/quads/video_hole_draw_quad.h"
++#include "components/viz/service/display/starboard/video_geometry_setter.h"
++#endif  // BUILDFLAG(USE_STARBOARD_MEDIA)
++
+ namespace viz {
+ namespace {
+ 
+@@ -356,6 +361,15 @@ void SoftwareRenderer::DoDrawQuad(const DrawQuad* quad,
+     case DrawQuad::Material::kSharedElement:
+       NOTREACHED();
+     case DrawQuad::Material::kVideoHole:
++#if BUILDFLAG(USE_STARBOARD_MEDIA)
++      // Starboard plays video under the UI (punch-out). Software compositing
++      // has no overlay processor, so do here what
++      // OverlayStrategyUnderlayStarboard does for GL: report where the video
++      // goes and leave the hole transparent.
++      DrawStarboardVideoHole(VideoHoleDrawQuad::MaterialCast(quad),
++                             sk_device_matrix);
++      break;
++#else
+       // VideoHoleDrawQuad should only be used by Cast, and should
+       // have been replaced by cast-specific OverlayProcessor before
+       // reach here. In non-cast build, an untrusted render could send such
+@@ -364,6 +378,7 @@ void SoftwareRenderer::DoDrawQuad(const DrawQuad* quad,
+       // of causing a crash.
+       DrawUnsupportedQuad(quad);
+       break;
++#endif  // BUILDFLAG(USE_STARBOARD_MEDIA)
+   }
+ 
+   current_canvas_->resetMatrix();
+@@ -620,6 +635,27 @@ void SoftwareRenderer::DrawRenderPassQuad(
+   current_canvas_->drawRect(dest_visible_rect, current_paint_);
+ }
+ 
++#if BUILDFLAG(USE_STARBOARD_MEDIA)
++void SoftwareRenderer::DrawStarboardVideoHole(const VideoHoleDrawQuad* quad,
++                                              const SkMatrix& device_matrix) {
++  if (current_frame()->current_render_pass ==
++      current_frame()->root_render_pass) {
++    // Device space of the root pass is the window.
++    SkRect display_rect =
++        device_matrix.mapRect(gfx::RectToSkRect(quad->rect));
++    auto& setter = GetVideoGeometrySetter();
++    if (setter.is_bound()) {
++      setter->SetVideoGeometry(gfx::SkRectToRectF(display_rect),
++                               gfx::OVERLAY_TRANSFORM_NONE,
++                               quad->overlay_plane_id);
++    }
++  }
++  SkPaint paint;
++  paint.setBlendMode(SkBlendMode::kClear);
++  current_canvas_->drawRect(gfx::RectToSkRect(quad->visible_rect), paint);
++}
++#endif  // BUILDFLAG(USE_STARBOARD_MEDIA)
++
+ void SoftwareRenderer::DrawUnsupportedQuad(const DrawQuad* quad) {
+ #ifdef NDEBUG
+   current_paint_.setColor(SkColors::kWhite);
+diff --git a/components/viz/service/display/software_renderer.h b/components/viz/service/display/software_renderer.h
+index e4cea3a3a3..4c3aa31551 100644
+--- a/components/viz/service/display/software_renderer.h
++++ b/components/viz/service/display/software_renderer.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "build/build_config.h"
++#include "build/buildflag.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+ #include "components/viz/service/display/direct_renderer.h"
+ #include "components/viz/service/display/display_resource_provider_software.h"
+@@ -16,6 +17,8 @@
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/latency/latency_info.h"
+ 
++class SkMatrix;
++
+ namespace viz {
+ class DebugBorderDrawQuad;
+ class OutputSurface;
+@@ -25,6 +28,7 @@ class SoftwareOutputDevice;
+ class SolidColorDrawQuad;
+ class TextureDrawQuad;
+ class TileDrawQuad;
++class VideoHoleDrawQuad;
+ 
+ class VIZ_SERVICE_EXPORT SoftwareRenderer : public DirectRenderer {
+  public:
+@@ -93,6 +97,10 @@ class VIZ_SERVICE_EXPORT SoftwareRenderer : public DirectRenderer {
+   void DrawTextureQuad(const TextureDrawQuad* quad);
+   void DrawTileQuad(const TileDrawQuad* quad);
+   void DrawUnsupportedQuad(const DrawQuad* quad);
++#if BUILDFLAG(USE_STARBOARD_MEDIA)
++  void DrawStarboardVideoHole(const VideoHoleDrawQuad* quad,
++                              const SkMatrix& device_matrix);
++#endif
+   bool ShouldApplyBackdropFilters(
+       const cc::FilterOperations* backdrop_filters,
+       const AggregatedRenderPassDrawQuad* quad) const;
+diff --git a/components/viz/service/gl/gpu_service_impl.cc b/components/viz/service/gl/gpu_service_impl.cc
+index 1fb6c73e0d..b22c9ebb7f 100644
+--- a/components/viz/service/gl/gpu_service_impl.cc
++++ b/components/viz/service/gl/gpu_service_impl.cc
+@@ -1055,8 +1055,11 @@ void GpuServiceImpl::EstablishGpuChannel(int32_t client_id,
+   // Queue requests received while the display is shut down for backgrounding
+   // rather than returning a transient failure, avoiding an infinite retry loop
+   // from clients during suspend.
++  // Without GL (--use-gl=disabled, software compositing) the display is
++  // never initialized, so queueing would block the renderer forever.
+   gl::GLDisplayEGL* display = gl::GetDefaultDisplayEGL();
+-  if (display && !display->IsInitialized()) {
++  if (display && !display->IsInitialized() &&
++      gl::GetGLImplementation() != gl::kGLImplementationDisabled) {
+     pending_establish_gpu_channel_requests_.push_back(
+         {client_id, client_tracing_id, is_gpu_host, std::move(callback)});
+     return;

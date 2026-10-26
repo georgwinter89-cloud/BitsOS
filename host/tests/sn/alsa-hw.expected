@@ -1,0 +1,32 @@
+ctl.pversion 0 0x20009
+ctl.card_info 0 BitsOS BitsOS
+ctl.next_device(-1) 0 0
+ctl.next_device(0) 0 -1
+pcm.pversion 0 0x2000f
+pcm.info 0 BitsOS Mixer 1/1
+writei.open -77
+prepare.open -77
+state.open 0
+refine 0 access 0x8 format 0x4404 channels 1-2 rate 8000-192000 sample_bits 16-32 buffer_bytes_max 4194304
+refine.44200 -22
+hw_params 0 period 1200 periods 4 buffer 4800 bytes 19200 msbits 16 rate 48000/1 pause 1 mmap 0
+state.setup 1
+writei.setup -77
+sw_params.avail_min0 -22
+sw_params 0 boundary ok
+prepare 0
+state.prepared 2
+start.empty -32
+pause.prepared -77
+resume -38
+writei.efault -14
+writei 0 result 48000
+state.running 3
+delay 0 ok
+sync_ptr 0 state 3 appl 48000 avail_min 1200
+drain 0
+status.drained 0 state 1 appl 48000 hw 48000 avail 4800 delay 0
+rewind -77 18446744073709551539
+hw_free 0
+state.freed 0
+ioctl.unknown -25

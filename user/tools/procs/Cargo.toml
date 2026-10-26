@@ -1,0 +1,8 @@
+[package]
+name = "procs"
+version = "0.1.0"
+edition = "2024"
+description = "ps/top-like process listing from /proc (UL-4b)"
+
+[dependencies]
+usys = { path = "../usys" }

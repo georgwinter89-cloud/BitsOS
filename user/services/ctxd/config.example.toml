@@ -1,0 +1,42 @@
+# ctxd settings (namespace context.*). Copy to ~/.config/ctxd/config.toml and adapt.
+# Without any config file the only root is the synthetic test set host/cx-eval/docs.
+
+[context]
+# Only these folders are read. private = true: never shown to Claude (MCP), only on Georg's own screen.
+roots = [
+  { path = "/home/georg/ctxd-probe/dokumente" },
+  { path = "/home/georg/ctxd-probe/privat", private = true },
+]
+# Extra folders that are always refused (the Windows disk rules apply anyway).
+forbidden_roots = []
+# data = "/home/georg/.local/share/ctxd"      # default; or --data DIR
+
+[context.index]
+threads = 8            # extraction workers
+max_file_mb = 64
+rescan_seconds = 60
+watch = true             # inotify on the roots: changes are indexed within seconds
+watch_debounce_ms = 1000
+
+[context.embedder]
+kind = "llama"         # llama | fake | none (keyword only)
+threads = 8            # Mini-PC budget
+slots = 2
+# model = ".../multilingual-e5-small-q8_0.gguf"   # default: third_party/models/
+# server = ".../llama-server"                     # default: third_party/build/llama.cpp/bin/
+
+[context.rank]
+w_v = 0.45
+w_b = 0.30
+w_r = 0.10
+v_min = 0.35
+b_min = 0.20
+candidates = 100
+
+[context.claude]
+snippet_chars = 200    # about two sentences; 0 = no snippets for Claude
+allow_forget = false   # context_forget over MCP
+
+[context.mcp]
+port = 29510           # http://127.0.0.1:29510/mcp
+# token = "..."        # optional bearer token

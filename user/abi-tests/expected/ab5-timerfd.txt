@@ -1,0 +1,112 @@
+create(99) = -EINVAL
+create(MONOTONIC, bad flags) = -EINVAL
+create(PROCESS_CPUTIME) = -EINVAL
+create(MONOTONIC_RAW) = -EINVAL
+create(REALTIME_ALARM) as a user = -EPERM
+create(BOOTTIME_ALARM) as a user = -EPERM
+create(MONOTONIC, NONBLOCK|CLOEXEC) ok: yes
+  F_GETFD = 1
+  F_GETFL = 4002
+  fstat mode = 600
+  the same anonymous inode as an eventfd: yes
+  read 4 bytes = -EINVAL
+  read unarmed (nonblocking) = -EAGAIN
+  write = -EINVAL
+  lseek = 0
+  pread = -ESPIPE
+  ioctl(FIONREAD) = -ENOTTY
+  gettime unarmed = 0
+  all zero: yes
+settime(bad flags 4) = -EINVAL
+settime(tv_nsec 1e9) = -EINVAL
+settime(interval nsec -1) = -EINVAL
+settime(value sec -1) = -EINVAL
+settime(new = kernel address) = -EFAULT
+settime(new = NULL) = -EFAULT
+settime(fd -1) = -EBADF
+settime(fd 999) = -EBADF
+settime(an eventfd) = -EINVAL
+settime(bad flags, eventfd) = -EINVAL
+gettime(an eventfd) = -EINVAL
+gettime(fd -1) = -EBADF
+gettime(kernel address) = -EFAULT
+settime(1 h, old = kernel address) = -EFAULT
+  the timer was set anyway: yes
+settime(value 0, interval 5 ms, &old) = 0
+  old: about 1 h left, no interval: yes
+  disarmed: value 0, interval kept: yes
+  read = -EAGAIN
+  ioctl(unknown 0x5400) = -ENOTTY
+one-shot 40 ms = 0
+  gettime: in (0, 40 ms], no interval: yes
+  poll at once: 0
+  poll (5 s): 0x1
+  gettime after: value 0: yes
+  read = 1
+  read again = -EAGAIN
+  poll after the read: 0
+absolute +30 ms = 0
+  poll (5 s): 0x1
+  not before the time: yes
+  read = 1
+absolute 1 ns (past) = 0
+  poll (5 s): 0x1
+  read = 1
+absolute 0 = 0
+  read = -EAGAIN
+expired, then re-armed for 1 h: read = -EAGAIN
+periodic 10 ms = 0
+  after 105 ms: at least 5 expiries in one read: yes
+  and no more than the periods that passed: yes
+  gettime: next in (0, 10 ms], interval 10 ms: yes
+  gettime of an expired periodic timer moves it on: yes
+  the periods gettime saw are still counted (>= 3): yes
+  settime returns the old interval: yes
+  read after the stop = -EAGAIN
+REALTIME relative 20 ms = 0
+  poll (5 s): 0x1
+  read = 1
+REALTIME absolute +20 ms = 0
+  poll (5 s): 0x1
+  read = 1
+REALTIME ABSTIME|CANCEL_ON_SET +1 h = 0
+  read = -EAGAIN
+REALTIME CANCEL_ON_SET without ABSTIME = 0
+BOOTTIME relative 20 ms = 0
+  poll (5 s): 0x1
+  read = 1
+BOOTTIME absolute +20 ms = 0
+  poll (5 s): 0x1
+  read = 1
+BOOTTIME ABSTIME|CANCEL_ON_SET +1 h = 0
+  read = -EAGAIN
+BOOTTIME CANCEL_ON_SET without ABSTIME = 0
+MONOTONIC relative 20 ms = 0
+  poll (5 s): 0x1
+  read = 1
+MONOTONIC absolute +20 ms = 0
+  poll (5 s): 0x1
+  read = 1
+MONOTONIC ABSTIME|CANCEL_ON_SET +1 h = 0
+  read = -EAGAIN
+MONOTONIC CANCEL_ON_SET without ABSTIME = 0
+blocking read of a 30 ms timer = 1
+  it waited: yes
+readv(2 + 4 bytes) = -EINVAL
+readv(4 + 4 bytes) = 8
+  the count split over both: 1 and 0: yes
+epoll_ctl(ADD, EPOLLIN|EPOLLET) = 0
+  epoll_wait before arming (0 ms) = 0
+  epoll_wait (5 s): 1 events 0x1 data 7
+  50 ms later, nothing read: epoll_wait (0 ms) = 0
+  read: several expiries: yes
+  after the read the next expiry is an edge again: 1 events 0x1
+ioctl(TFD_IOC_SET_TICKS, 5) = 0
+  poll: 0x1
+  read = 5
+ioctl(TFD_IOC_SET_TICKS, 0) = -EINVAL
+ioctl(TFD_IOC_SET_TICKS, kernel address) = -EFAULT
+ioctl(TFD_IOC_SET_TICKS) on an eventfd = -ENOTTY
+fork: the child read the shared timer's expiry: yes
+  and the parent sees it expired: yes
+ab5 timerfd: done

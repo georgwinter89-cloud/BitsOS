@@ -1,0 +1,6 @@
+Fahrtkosten zur Arbeit 2025
+Einfache Strecke: 23 km
+Arbeitstage im Büro: 164
+Homeoffice-Tage: 54
+Entfernungspauschale: 0,30 EUR je Kilometer bis zum 20. Kilometer, danach 0,38 EUR
+Fahrtkosten gesamt: 1.263,52 EUR (Taschenrechner, nochmal prüfen)

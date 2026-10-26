@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>BR4 loading</title>
+<style>
+  /* BR-4a: the BR-4 measuring page. Every result goes into document.title (MCP `windows {}` shows it), into the
+     console (chrome://inspect is not needed: `log` does not see it, the title does) and into #out (--dump-dom).
+     Modes by query: ?mode=load, ?mode=scroll[&s=20], ?mode=video&src=clip.webm[&s=60]. */
+  html, body { margin: 0; background: #f4f1ea; color: #222; font-family: sans-serif; }
+  #out { position: fixed; top: 0; right: 0; margin: 0; padding: 6px 10px; background: #222; color: #fff; font: 14px monospace; z-index: 2; white-space: pre; }
+  video { display: block; width: 100vw; height: 100vh; background: #000; object-fit: contain; }
+  .blk { margin: 24px; padding: 16px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0, 0, 0, .25); }
+  .blk p { font-size: 18px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<pre id="out">BR4 loading</pre>
+<script>
+"use strict";
+const q = new URLSearchParams(location.search);
+const mode = q.get("mode") || "load";
+const secs = Math.max(1, Number(q.get("s")) || (mode === "video" ? 60 : 20));
+const out = document.getElementById("out");
+function show(s) { document.title = s; out.textContent = s; console.log(s); }
+function pct(a, p) { if (!a.length) return 0; const b = a.slice().sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.floor(p * b.length))]; }
+const mem = () => (performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) + "MB" : "-");
+
+function load() {
+  // Navigation timing of this page itself: DOMContentLoaded and load from the request's start.
+  addEventListener("load", () => setTimeout(() => {
+    const n = performance.getEntriesByType("navigation")[0];
+    const r = (x) => Math.round(x);
+    show(n ? `BR4 load done dcl=${r(n.domContentLoadedEventEnd)}ms load=${r(n.loadEventEnd)}ms heap=${mem()}` : "BR4 load done no-timing");
+  }, 0));
+}
+
+function scroll() {
+  // A long page with text, gradients and shadows, scrolled by 4 px per frame: frame intervals from rAF.
+  const colours = ["#cc4433", "#33aa66", "#3366cc", "#ccaa33", "#8844aa"];
+  for (let i = 0; i < 400; i++) {
+    const d = document.createElement("div");
+    d.className = "blk";
+    d.style.background = `linear-gradient(90deg, ${colours[i % 5]}33, #ffffff)`;
+    d.innerHTML = `<h2>Abschnitt ${i + 1}</h2><p>Umlaute äöüß, Emoji 🎉, CJK 漢字. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>`;
+    document.body.appendChild(d);
+  }
+  const gaps = [];
+  let last = 0, t0 = 0;
+  function step(t) {
+    if (!t0) t0 = t;
+    if (last) gaps.push(t - last);
+    last = t;
+    scrollBy(0, 4);
+    if (scrollY + innerHeight >= document.body.scrollHeight - 4) scrollTo(0, 0);
+    const el = (t - t0) / 1000;
+    if (el < secs) {
+      if (gaps.length % 60 === 0) show(`BR4 scroll t=${Math.round(el)}s frames=${gaps.length}`);
+      requestAnimationFrame(step);
+      return;
+    }
+    const fps = gaps.length / el, long = gaps.filter((g) => g > 25).length;
+    show(`BR4 scroll done fps=${fps.toFixed(1)} p95=${pct(gaps, 0.95).toFixed(1)}ms long=${long}/${gaps.length} ${innerWidth}x${innerHeight}@${devicePixelRatio} heap=${mem()}`);
+  }
+  requestAnimationFrame(step);
+}
+
+function video() {
+  // getVideoPlaybackQuality once a second: dropped of total frames since the start, and the codec as played.
+  const v = document.createElement("video");
+  v.muted = q.get("muted") !== "0";
+  v.autoplay = true;
+  v.loop = true;
+  v.playsInline = true;
+  v.src = q.get("src") || "clip-vp9-1080p60.webm";
+  document.body.insertBefore(v, out);
+  v.addEventListener("error", () => show(`BR4 video error ${v.error ? v.error.code : "?"} ${v.src}`));
+  let t0 = 0, base = null;
+  const tick = setInterval(() => {
+    if (!v.getVideoPlaybackQuality) { show("BR4 video error no-getVideoPlaybackQuality"); clearInterval(tick); return; }
+    const q0 = v.getVideoPlaybackQuality();
+    // Counted from the first second that plays (the start-up frames are not the steady state).
+    if (!t0 && v.currentTime > 0) { t0 = performance.now(); base = q0; }
+    const p = base ? { droppedVideoFrames: q0.droppedVideoFrames - base.droppedVideoFrames, totalVideoFrames: q0.totalVideoFrames - base.totalVideoFrames } : { droppedVideoFrames: 0, totalVideoFrames: 0 };
+    const el = t0 ? (performance.now() - t0) / 1000 : 0;
+    const head = el >= secs ? "BR4 video done" : `BR4 video t=${Math.round(el)}s`;
+    const drop = p.totalVideoFrames ? (100 * p.droppedVideoFrames / p.totalVideoFrames).toFixed(1) : "0.0";
+    show(`${head} ${v.videoWidth}x${v.videoHeight} dropped=${p.droppedVideoFrames}/${p.totalVideoFrames} (${drop}%) fps=${el ? (p.totalVideoFrames / el).toFixed(1) : 0} heap=${mem()}`);
+    if (el >= secs) { clearInterval(tick); v.pause(); }
+  }, 1000);
+}
+
+({ load, scroll, video }[mode] || (() => show(`BR4 error unknown mode ${mode}`)))();
+</script>
+</body>
+</html>

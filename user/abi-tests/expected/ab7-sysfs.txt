@@ -1,0 +1,217 @@
+meminfo MemTotal: yes
+meminfo MemFree: yes
+meminfo MemAvailable: yes
+meminfo Buffers: yes
+meminfo Cached: yes
+meminfo SwapCached: yes
+meminfo Active: yes
+meminfo Inactive: yes
+meminfo Active(anon): yes
+meminfo Inactive(anon): yes
+meminfo Active(file): yes
+meminfo Inactive(file): yes
+meminfo Unevictable: yes
+meminfo Mlocked: yes
+meminfo SwapTotal: yes
+meminfo SwapFree: yes
+meminfo Zswap: yes
+meminfo Zswapped: yes
+meminfo Dirty: yes
+meminfo Writeback: yes
+meminfo AnonPages: yes
+meminfo Mapped: yes
+meminfo Shmem: yes
+meminfo KReclaimable: yes
+meminfo Slab: yes
+meminfo SReclaimable: yes
+meminfo SUnreclaim: yes
+meminfo KernelStack: yes
+meminfo PageTables: yes
+meminfo SecPageTables: yes
+meminfo NFS_Unstable: yes
+meminfo Bounce: yes
+meminfo WritebackTmp: yes
+meminfo CommitLimit: yes
+meminfo Committed_AS: yes
+meminfo VmallocTotal: yes
+meminfo VmallocUsed: yes
+meminfo VmallocChunk: yes
+meminfo Percpu: yes
+meminfo HardwareCorrupted: yes
+meminfo AnonHugePages: yes
+meminfo ShmemHugePages: yes
+meminfo ShmemPmdMapped: yes
+meminfo FileHugePages: yes
+meminfo FilePmdMapped: yes
+meminfo CmaTotal: yes
+meminfo CmaFree: yes
+meminfo Unaccepted: yes
+meminfo HugePages_Total: yes
+meminfo HugePages_Free: yes
+meminfo HugePages_Rsvd: yes
+meminfo HugePages_Surp: yes
+meminfo Hugepagesize: yes
+meminfo Hugetlb: yes
+meminfo 6.6 keys in Linux order: yes
+meminfo kB lines padded as show_val_kb: yes
+meminfo MemFree and MemAvailable within MemTotal: yes
+meminfo SwapFree within SwapTotal: yes
+meminfo Committed_AS and CommitLimit set: yes
+meminfo Hugepagesize 2048: yes
+stat starts with "cpu  ": yes
+stat cpu lines = online CPUs + 1: yes
+stat cpu lines have 10 numbers: yes
+stat sum line >= each cpu line: yes
+stat line intr : yes
+stat line ctxt : yes
+stat line btime : yes
+stat line processes : yes
+stat line procs_running : yes
+stat line procs_blocked : yes
+stat line softirq : yes
+stat btime in the past: yes
+stat processes and procs_running >= 1: yes
+stat softirq has 11 numbers: yes
+uptime is two %lu.%02lu numbers: yes
+uptime idle <= uptime x online CPUs: yes
+loadavg is three loads, running/total, last pid: yes
+loadavg 1 <= running <= total: yes
+loadavg last pid >= the child's pid: yes
+version starts with "Linux version <release> (": yes
+version ends with the uname version: yes
+filesystems nodev	sysfs: yes
+filesystems nodev	tmpfs: yes
+filesystems nodev	proc: yes
+filesystems nodev	devtmpfs: yes
+filesystems nodev	sockfs: yes
+filesystems nodev	pipefs: yes
+filesystems 	vfat: yes
+filesystems lines start with nodev<TAB> or <TAB>: yes
+hostname = uname nodename: yes
+domainname = uname domainname: yes
+osrelease = uname release: yes
+ostype = Linux
+version = uname version: yes
+pid_max >= 32768: yes
+uuid is a v4 uuid: yes
+uuid differs per read: yes
+boot_id is a v4 uuid and stays: yes
+entropy_avail = 256
+poolsize = 256
+overcommit_memory is 0, 1 or 2: yes
+mode /proc/sys/kernel/hostname = 644 size as Linux
+mode /proc/sys/kernel/domainname = 644 size as Linux
+mode /proc/sys/kernel/osrelease = 444 size as Linux
+mode /proc/sys/kernel/ostype = 444 size as Linux
+mode /proc/sys/kernel/version = 444 size as Linux
+mode /proc/sys/kernel/pid_max = 644 size as Linux
+mode /proc/sys/kernel/random/uuid = 444 size as Linux
+mode /proc/sys/kernel/random/boot_id = 444 size as Linux
+mode /proc/sys/kernel/random/entropy_avail = 444 size as Linux
+mode /proc/sys/kernel/random/poolsize = 444 size as Linux
+mode /proc/sys/vm/overcommit_memory = 644 size as Linux
+open hostname for writing = -EACCES
+open overcommit_memory for writing = -EACCES
+sethostname as a user = -EPERM
+sethostname 65 bytes as a user = -EPERM
+setdomainname as a user = -EPERM
+mode /proc/sys/kernel/cap_last_cap = 444 size as Linux
+kernel/cap_last_cap is one number: yes
+mode /proc/sys/kernel/ngroups_max = 444 size as Linux
+kernel/ngroups_max is one number: yes
+mode /proc/sys/kernel/overflowuid = 644 size as Linux
+kernel/overflowuid is one number: yes
+mode /proc/sys/kernel/overflowgid = 644 size as Linux
+kernel/overflowgid is one number: yes
+mode /proc/sys/kernel/randomize_va_space = 644 size as Linux
+kernel/randomize_va_space is one number: yes
+mode /proc/sys/kernel/tainted = 644 size as Linux
+kernel/tainted is one number: yes
+mode /proc/sys/kernel/threads-max = 644 size as Linux
+kernel/threads-max is one number: yes
+mode /proc/sys/vm/max_map_count = 644 size as Linux
+vm/max_map_count is one number: yes
+mode /proc/sys/vm/mmap_min_addr = 644 size as Linux
+vm/mmap_min_addr is one number: yes
+mode /proc/sys/vm/overcommit_kbytes = 644 size as Linux
+vm/overcommit_kbytes is one number: yes
+mode /proc/sys/vm/overcommit_ratio = 644 size as Linux
+vm/overcommit_ratio is one number: yes
+mode /proc/sys/vm/swappiness = 644 size as Linux
+vm/swappiness is one number: yes
+cap_last_cap = 40
+ngroups_max = 65536
+overflowuid = 65534
+randomize_va_space is 0, 1 or 2: yes
+max_map_count >= 65530: yes
+open cap_last_cap for writing = -EACCES
+uuid reread after lseek 0 is new: yes
+online count = sysconf(_SC_NPROCESSORS_ONLN): yes
+online within possible: yes
+present = possible: yes
+offline = possible - online: yes
+kernel_max = 8191
+isolated empty: yes
+kernel_max >= the highest possible CPU: yes
+mode /sys/devices/system/cpu/online = 444 size as Linux
+mode /sys/devices/system/cpu/possible = 444 size as Linux
+mode /sys/devices/system/cpu/present = 444 size as Linux
+mode /sys/devices/system/cpu/offline = 444 size as Linux
+mode /sys/devices/system/cpu/kernel_max = 444 size as Linux
+mode /sys/devices/system/cpu/isolated = 444 size as Linux
+cpuN directories = possible CPUs: yes
+cpu0/online = ENOENT
+cpuinfo blocks = online CPUs: yes
+cpuinfo apicid unique: yes
+cpuinfo physical id, core id, siblings, cpu cores match topology: yes
+every online CPU has the 16 topology files: yes
+topology lists hold the CPU, thread = core_cpus, package = core_siblings: yes
+package_cpus mask = package_cpus_list: yes
+cpuinfo keys: processor; vendor_id; cpu family; model; model name; stepping; cpu MHz; physical id; siblings; core id; cpu cores; apicid; initial apicid; fpu; fpu_exception; cpuid level; wp; flags; bugs; bogomips; clflush size; cache_alignment; address sizes; power management;
+cpuinfo flags list avx2 exactly when CPUID has it: yes
+cpuinfo flags start with fpu: yes
+mode /sys/devices/system/cpu/cpu0/topology/core_cpus_list = 444 size as Linux
+mode /sys/devices/system/cpu/cpu0/topology/core_cpus = 444 size as Linux
+mode /sys/devices/system/cpu/cpu0/topology = 755 size as Linux
+smt/active is 0 or 1: yes
+smt/control is a state: yes
+smt active means control on: yes
+mode /sys/devices/system/cpu/smt/control = 644 size as Linux
+cpu0 has cache leaves with Linux's attributes: yes
+lo link = ../../devices/virtual/net/lo
+lo address = 00:00:00:00:00:00
+lo addr_len = 6
+lo broadcast = 00:00:00:00:00:00
+lo flags = 0x9
+lo type = 772
+lo ifindex = 1
+lo iflink = 1
+lo mtu = 65536
+lo operstate = unknown
+lo tx_queue_len = 1000
+lo carrier = 1
+lo carrier_changes = 0
+lo carrier_up_count = 0
+lo carrier_down_count = 0
+lo dev_id = 0x0
+lo dev_port = 0
+lo addr_assign_type = 0
+lo name_assign_type = 2
+lo link_mode = 0
+lo netdev_group = 0
+lo dormant = 0
+lo testing = 0
+lo proto_down = 0
+lo uevent = INTERFACE=lo
+IFINDEX=1
+lo speed = -EINVAL
+lo duplex = -EINVAL
+class/net lists lo: yes
+class/net entries are links: yes
+every interface has address, operstate, mtu and the 24 counters: yes
+mode /sys/class/net/lo/mtu = 644 size as Linux
+mode /sys/class/net/lo/address = 444 size as Linux
+mode /sys/class/net/lo/statistics/rx_bytes = 444 size as Linux
+mode /sys/class/net/lo/statistics = 755 size as Linux
+open lo/mtu for writing = -EACCES
+class/net/nosuchif0/mtu = ENOENT

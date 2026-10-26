@@ -1,0 +1,22 @@
+[package]
+name = "rtw89"
+version = "0.1.0"
+edition = "2024"
+description = "Realtek RTL8852BE (owner: WL)"
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+wifi = { path = "../../wifi" }
+hal = { path = "../../hal" }
+rtw89-core = { path = "../../rtw89-core" }
+mm = { path = "../../mm" }
+time = { path = "../../time" }
+sched = { path = "../../sched" }
+net = { path = "../../net" }
+mcp = { path = "../../mcp" }
+vfs = { path = "../../vfs" }
+ktest = { path = "../../ktest" }

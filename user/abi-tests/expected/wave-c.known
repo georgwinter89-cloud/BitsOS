@@ -1,0 +1,7 @@
+# Known differences of BitsOS from CachyOS in wave C: "<id>: <owning item>: <why>" (the AB/FS/NW to-do list).
+# ul.abi.wave_c fails on any difference not listed here, and reports listed ones that now equal Linux (remove them).
+# Measured 15.10.2026 on main + lane/FS (FS-1, FS-2 with FS-1 change requests 1, 2a, 3 applied).
+
+# setattr calls and statfs (FS-1b): equal to Linux since FS-1b (lines removed).
+
+# sockets for programs (NW-5) and AF_UNIX socket pairs: equal to Linux since INT-A2a (lines removed).

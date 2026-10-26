@@ -1,0 +1,58 @@
+TIOCGPTN = 0
+ptsname is /dev/pts/<TIOCGPTN>: yes
+stat slave = 0
+slave mode 20600 gid 5 uid is mine 1
+slave rdev is 136:<n>: yes
+stat /dev/ptmx = 0
+ptmx mode 20666 rdev 5:2
+TIOCGPTLCK = 0
+locked 0
+open locked slave = -errno 5
+TIOCSPTLCK 1 = 0
+TIOCGPTLCK = 0
+locked 1
+write master before slave open = 1
+slave opens: yes
+isatty master: yes
+isatty slave: yes
+slave termios: iflag 02400 oflag 05 cflag 0277 lflag 0105073 vmin 1
+master's TCGETS is the slave's: yes
+TIOCGWINSZ = 0
+winsize 0x0 0x0
+TIOCGDEV slave = 0
+TIOCGDEV is 136:<n>: yes
+TIOCGPTN on the slave = -ENOTTY
+TIOCPKT 0 = 0
+TIOCGPKT = 0
+packet 0
+TIOCSIG 0 = -EINVAL
+TIOCNOTTY on the master = -ENOTTY
+TIOCGPGRP on the master = 0
+pgrp 0
+TIOCGSID on the master = -ENOTTY
+TIOCGPGRP on the slave = -ENOTTY
+poll before: master 0x4 slave 0x4
+master reads echo (7): h e l l o \r \n
+poll slave 0x5
+FIONREAD slave = 0
+slave has 6
+slave reads (6): h e l l o \n
+master reads echo (8): a b 08   08 c \r \n
+slave reads (3): a c \n
+master reads output (8): o n e \r \n t w o
+poll master 0x1
+FIONREAD master = 0
+master has 1
+tcsetattr raw = 0
+slave reads raw (3): x \r y
+poll master after raw input 0
+master reads raw output (1): \n
+epoll_ctl master = 0
+epoll_wait empty = 0
+epoll_wait = 1
+event 0x1 data 7
+read empty master = -EAGAIN
+poll master after slave close 0x14
+read master = -errno 5
+write master = 1
+poll master after reopen 0

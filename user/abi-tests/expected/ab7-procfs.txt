@@ -1,0 +1,257 @@
+stat read: ok
+stat fields = 52
+stat comm = (abi-procfs)
+stat state = R
+stat pid: yes
+stat ppid: yes
+stat pgrp: yes
+stat session: yes
+stat num_threads = 1
+stat exit_signal = 17
+stat exit_code = 0
+stat vsize > 0: yes
+stat code range: yes
+stat startstack in the stack: yes
+stat args then env: yes
+stat data range: yes
+stat start_brk <= brk: yes
+statm fields = 7
+statm size = vsize: yes
+statm text > 0, lib and dt 0: yes
+status keys: Name Umask State Tgid Ngid Pid PPid TracerPid Uid Gid FDSize Groups NStgid NSpid NSpgid NSsid Kthread VmPeak VmSize VmLck VmPin VmHWM VmRSS RssAnon RssFile RssShmem VmData VmStk VmExe VmLib VmPTE VmSwap HugetlbPages CoreDumping THP_enabled untag_mask Threads SigQ SigPnd ShdPnd SigBlk SigIgn SigCgt CapInh CapPrm CapEff CapBnd CapAmb NoNewPrivs Seccomp Seccomp_filters Speculation_Store_Bypass SpeculationIndirectBranch Cpus_allowed Cpus_allowed_list Mems_allowed Mems_allowed_list voluntary_ctxt_switches nonvoluntary_ctxt_switches x86_Thread_features x86_Thread_features_locked
+Name = abi-procfs
+Umask = 0027
+State = R (running)
+Tgid = Pid = getpid: yes
+PPid: yes
+Uid: yes
+Kthread = 0
+Threads = 1
+SigPnd = 0000000000000000
+SigBlk = 0000000000000200
+SigIgn = 0000000000000800
+SigCgt = 0000000008000000
+CapEff = 0000000000000000
+NoNewPrivs = 0
+Seccomp = 0
+Cpus_allowed_list = affinity: yes
+Mems_allowed_list = 0
+NoNewPrivs after prctl = 1
+comm = abi-procfs\n
+comm after PR_SET_NAME = renamed\n
+stat comm after PR_SET_NAME = (renamed)
+comm write = 7
+PR_GET_NAME after the write = viaproc
+comm write long = 20
+comm after long write = abcdefghijklmno\n
+comm write newline = 3
+comm after newline write = nl\n\n
+status Name after newline write = nl\n
+comm mode = 644
+cmdline = argv: yes
+cmdline args = a b|c|
+cmdline after argv[0][0]='Z' starts Z = yes
+environ = the initial environment: yes
+environ mode = 400
+auxv pairs end with AT_NULL: yes
+auxv AT_PAGESZ = 4096
+maps exe lines: r--p/0 r-xp/off rw-p/off rw-p/off
+maps exe lines have the file's inode: yes
+maps anonymous line = "rw-p 00000000 00:00 0 "
+maps [heap]: no
+maps [stack]: yes
+maps [vdso]: yes
+smaps_rollup first line ends [rollup]: yes
+smaps_rollup keys: Rss Pss Pss_Dirty Pss_Anon Pss_File Pss_Shmem Shared_Clean Shared_Dirty Private_Clean Private_Dirty Referenced Anonymous KSM LazyFree AnonHugePages ShmemPmdMapped FilePmdMapped Shared_Hugetlb Private_Hugetlb Swap SwapPss Locked
+smaps_rollup Rss > 0: yes
+limits header = Limit                     Soft Limit           Hard Limit           Units     |
+limits names: [Max cpu time             ] [Max file size            ] [Max data size            ] [Max stack size           ] [Max core file size       ] [Max resident set         ] [Max processes            ] [Max open files           ] [Max locked memory        ] [Max address space        ] [Max file locks           ] [Max pending signals      ] [Max msgqueue size        ] [Max nice priority        ] [Max realtime priority    ] [Max realtime timeout     ]
+limits core = Max core file size        0                    0                    bytes     |
+limits nice unit = space
+cwd -> /tmp
+root -> /
+exe names the program: yes
+exe lstat mode = 120777
+pid dir mode = 40555
+pid dir has the 24 names = 24
+file: pos flags mnt_id ino
+file flags = 02100002
+file pos = 5
+file link has the path: /tmp/abi-procfs-N
+unlinked file link: /tmp/abi-procfs-N (deleted)
+eventfd link: anon_inode:[eventfd]
+eventfd: pos flags mnt_id ino eventfd-count eventfd-id eventfd-semaphore
+eventfd flags = 02004002
+eventfd pos = 0
+eventfd count line = 3
+eventfd semaphore line = 0
+timerfd link: anon_inode:[timerfd]
+timerfd: pos flags mnt_id ino clockid ticks settime flags it_value it_interval
+timerfd flags = 02000002
+timerfd pos = 0
+timerfd clockid = 1
+timerfd ticks = 0
+timerfd settime flags = 00
+timerfd it_interval = (1, 0)
+timerfd it_value about 100 s: yes
+signalfd link: anon_inode:[signalfd]
+signalfd: pos flags mnt_id ino sigmask
+signalfd flags = 02000002
+signalfd pos = 0
+signalfd sigmask = 0000000000000200
+epoll link: anon_inode:[eventpoll]
+epoll: pos flags mnt_id ino tfd
+epoll flags = 02000002
+epoll pos = 0
+epoll tfd line: tfd:        N events:       N data:             N  pos:N ino:N sdev:N
+pipe link: pipe:[N]
+pipe read end: pos flags mnt_id ino
+pipe read end flags = 04000
+pipe read end pos = 0
+pipe write end: pos flags mnt_id ino
+pipe write end flags = 04001
+pipe write end pos = 0
+memfd link: /memfd:procfs (deleted)
+memfd: pos flags mnt_id ino
+memfd flags = 02100002
+memfd pos = 0
+closed fd fdinfo = -ENOENT
+fdinfo dir mode = 555
+fd dir mode = 500
+Threads with a worker = 2
+task entries = 2
+task has main and worker: yes
+worker stat pid = tid: yes
+worker stat num_threads = 2
+worker stat exit_signal = -1
+worker stat state = S
+worker comm = abi-procfs\n
+worker comm write = 6
+worker comm after write = worker\n
+main comm unchanged = abi-procfs\n
+worker status Pid = tid: yes
+worker status Tgid = pid: yes
+worker status Name = worker
+/proc/<tid> = ok
+thread-self -> <pid>/task/<tid>: yes
+Threads after join = 1
+oom_score_adj is a number and a newline: yes
+write 500 = 3
+oom_score_adj now = 500\n
+write 100 = 4
+write -1 = -13
+write 1001 = -22
+write abc = -22
+oom_score_adj after = 100\n
+oom_score in 0..2000: yes
+child inherits oom_score_adj: yes
+child maps = ok
+child environ = ok
+child comm write = -22
+non-dumpable child maps = -EACCES
+non-dumpable child environ = -EACCES
+non-dumpable child stat = ok
+non-dumpable child stat startcode = 1
+non-dumpable child fdinfo dir = EACCES
+non-dumpable child exe readlink = EACCES
+zombie state = Z
+zombie vsize = 0
+zombie cmdline length = 0
+zombie status VmSize = -
+zombie status State = Z (zombie)
+reaped child stat = -ENOENT
+other process is root's: yes
+reader is not root: yes
+other maps open = EACCES
+other environ open = EACCES
+other auxv open = EACCES
+other mem open = EACCES
+other personality open = EACCES
+other smaps open = EACCES
+other smaps_rollup open = EACCES
+other stat open = ok
+other status open = ok
+other cmdline open = ok
+other comm open = ok
+other limits open = ok
+other cgroup open = ok
+other exe readlink = EACCES
+other exe lstat = ok
+other cwd readlink = EACCES
+other cwd lstat = ok
+other root readlink = EACCES
+other root lstat = ok
+other fd dir = EACCES
+other fdinfo dir = EACCES
+other oom_score_adj write = -13
+other comm write = -13
+cmdline pread at 3 = the rest: yes
+cmdline pread past the end = 0
+cmdline read into a bad buffer = -1 EFAULT
+status read into a bad buffer = -1 EFAULT
+comm write with a NUL = 5
+comm after the NUL write = ab\n
+comm write empty = 0
+comm after the empty write = \n
+oom_score_adj write 105 NUL junk = 9
+oom_score_adj after NUL write = 105\n
+oom_score_adj write 16 bytes = 12
+oom_score_adj write 2147483648 = -34
+oom_score_adj write 0x64 = 4
+personality = 00000000\n
+personality mode = 400
+cgroup starts 0::/: yes
+mem mode = 600 size = 0
+mem pread of a variable: yes
+mem pread at 0 = -1 errno 5
+mem pread across an unmapped page = 4096
+mounts has /: yes
+mounts has proc on /proc: yes
+mount flags of /proc = rw,nosuid,nodev,noexec,relatime
+mount flags of /sys = rw,nosuid,nodev,noexec,relatime
+mount flags of /dev = rw,nosuid
+mount flags of /dev/pts = rw,nosuid,noexec,relatime
+mount flags of /dev/shm = rw,nosuid,nodev
+devpts options have mode=600: yes
+mountinfo lines have the shape: yes
+mountinfo /proc mount options = rw,nosuid,nodev,noexec,relatime
+mountinfo /proc super options = rw
+VmHWM >= VmRSS > 0: yes
+RssAnon + RssFile + RssShmem = VmRSS: yes
+VmPTE > 0: yes
+VmPeak >= VmSize: yes
+statm resident = VmRSS, shared = RssFile + RssShmem: yes
+untouched smaps Rss = 0
+untouched smaps Size = 256
+touched smaps Rss = 256
+touched smaps Pss = 256
+touched smaps Pss_Dirty = 256
+touched smaps Shared_Clean = 0
+touched smaps Shared_Dirty = 0
+touched smaps Private_Clean = 0
+touched smaps Private_Dirty = 256
+touched smaps Referenced = 256
+touched smaps Anonymous = 256
+touched smaps Swap = 0
+touched smaps Locked = 0
+touched smaps KernelPageSize = 4
+touched smaps THPeligible = 0
+touched smaps VmFlags = rd wr mr mw me ac
+forked smaps Rss = 256
+forked smaps Pss = 128
+forked smaps Shared_Dirty = 256
+forked smaps Private_Dirty = 0
+after the child smaps Pss = 256
+unmapped smaps entry = -1
+after munmap VmHWM >= VmRSS: yes
+smaps entries each have VmFlags: yes
+smaps Rss sums to smaps_rollup Rss: yes
+rollup 0 < Pss <= Rss: yes
+rollup Pss_Anon + Pss_File + Pss_Shmem = Pss (within 2 kB): yes
+ru_maxrss >= VmHWM: yes
+RUSAGE_THREAD ru_maxrss >= VmHWM: yes
+RUSAGE_CHILDREN ru_maxrss covers the 4 MiB child: yes
+wait4 ru_maxrss covers the 8 MiB child: yes
+RUSAGE_CHILDREN rises to the 8 MiB child: yes
+ru_maxrss after execve keeps the 16 MiB peak (SELF, THREAD) = yes
+RUSAGE_CHILDREN rises to the 16 MiB child across its execve: yes

@@ -1,0 +1,4 @@
+Stromverbrauch des neuen Rechners
+Leerlauf 38 Watt, Surfen 52 Watt, Spielen 330 Watt, Volllast CPU+GPU 410 Watt.
+Mit der Fritz-Steckdose gemessen. Bei 3 Stunden Spielen am Tag etwa 360 kWh im Jahr
+zusätzlich, ungefähr 130 EUR Mehrkosten beim aktuellen Strompreis.

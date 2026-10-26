@@ -1,0 +1,25 @@
+== multi: wake, cmp_requeue, wake_op
+multi.gathered = 6
+multi.wake_2_of_6 = 2
+multi.cmp_requeue.mismatch = -EAGAIN
+multi.cmp_requeue.wake1_move1 = 2
+multi.wake_op.cmp_false = 1
+multi.wake_op.word = 2
+multi.wake_op.cmp_true = 1
+multi.wake_op.word = 3
+multi.wake.rest = 1
+multi.wake.none_left = 0
+multi.all_returned_0: yes
+== multi: counts of zero
+multi.gathered = 2
+multi.requeue_0_0 = 0
+multi.wake_0_wakes_one = 1
+multi.wake.rest = 1
+multi.all_returned_0: yes
+== multi: bitsets
+multi.gathered = 3
+multi.wake_bitset.4 = 0
+multi.wake_bitset.2 = 2
+multi.wake_bitset.1 = 1
+multi.all_returned_0: yes
+== end

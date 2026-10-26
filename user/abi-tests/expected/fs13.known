@@ -1,0 +1,4 @@
+# Known DIFF cases of `cargo xtask abi-diff` for FS-13's program (abi-mountflags): "<case>: <owner>: <why>".
+# The probes of mode tmpfs run on V2 in ktest fs.mountflags.programs on a mount the kernel makes, compared with
+# CachyOS's answers in host/tests/fs/mountflags-linux.txt.
+abi-mountflags tmpfs: FS: V2 has no unshare(CLONE_NEWUSER|CLONE_NEWNS) nor mount(2) before FS-11 (A6): the setup line differs

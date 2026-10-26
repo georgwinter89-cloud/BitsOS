@@ -1,0 +1,28 @@
+[package]
+name = "amdgpu"
+version = "0.1.0"
+edition = "2024"
+description = "Radeon 780M whole-GPU device object (dcn first) (owner: GX)"
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+hal = { path = "../../hal" }
+ktest = { path = "../../ktest" }
+# GX-2: register names/offsets (generated), the MCP tools (dcn_snapshot, dcn_writes), the GOP framebuffer from
+# the BootInfo (kexec keeps it), policy for the ktests' tool context.
+dcn314-regs = { path = "../../dcn314-regs" }
+mcp = { path = "../../mcp" }
+kexec = { path = "../../kexec" }
+bootinfo = { path = "../../bootinfo" }
+policy = { path = "../../policy" }
+# GX-3: the flip engine for gopfb's fbdev (trait, GopFb over A0/A1), the kernel clock and sleeps for the waits.
+gopfb = { path = "../gopfb" }
+display = { path = "../../display" }
+time = { path = "../../time" }
+sched = { path = "../../sched" }
+# GX-4: the `mode` monitor command (console::command!) and the confirmation prompt on the screen.
+console = { path = "../../console" }

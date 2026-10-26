@@ -1,0 +1,20 @@
+[package]
+name = "bitspkg"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS package tool (PK-1, B2): build, install with atomic switch, rollback, verify, remove, gc"
+publish = false
+
+# sha2 is the version fetch already pins (no new download). settingsd's library checks setting keys exactly as
+# the registry will (PK-2 registers them there); usys gives renameat2 (RENAME_EXCHANGE) without unsafe here.
+[dependencies]
+sha2 = { version = "=0.10.9", default-features = false }
+usys = { path = "../usys" }
+settingsd = { path = "../../services/settingsd" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitspkg"
+path = "src/main.rs"

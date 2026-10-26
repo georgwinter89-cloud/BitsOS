@@ -1,0 +1,9 @@
+exception: thrown five frames down
+stream: 3.141593 beef
+libm: 1.414213562373 7.389056098931 2.302585092994 3.000000000000
+libm: 1.414213562373 0.493150590279
+threads: sum=2002000 0:7 1:8 2:9 3:10 main:7
+rethrown: from a thread (St12out_of_range)
+sorted: apple banana fig pear
+virtual: 6Circle 12.566371 1
+done

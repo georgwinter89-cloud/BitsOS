@@ -1,0 +1,3 @@
+# Known DIFF cases of `cargo xtask abi-diff` for AB-5's program (abi-ab5): "<case>: <owner>: <why>".
+# CachyOS's answers are recorded in expected/ab5-*.txt; the ktest ab.ab5.programs compares V2 with them and skips
+# the listed cases with the same reason until the missing piece is there.

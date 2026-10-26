@@ -1,0 +1,44 @@
+[package]
+name = "bitscomp"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS Wayland compositor (WY-0 spike: nested on CachyOS, software composition)"
+publish = false
+
+# Own workspace: built on its own (nested on CachyOS, and for V2 by `cargo xtask image` through the manifest's
+# `cargo:` source, which builds without default features); the user/ workspace manifest stays untouched.
+# wyclient: WY-1a's Wayland test client for V2 (pure Rust wayland-client, no libwayland on V2).
+[workspace]
+members = ["wyclient"]
+
+[features]
+default = ["nested"]
+# The nested back end (a window in the host's Wayland session): winit, wayland-client through libwayland.
+# The V2 build leaves it out, so neither winit nor libwayland-client are linked or dlopened there.
+nested = ["dep:winit", "wayland-client/system", "wayland-client/dlopen", "dep:wayland-sys", "dep:memmap2"]
+
+# Exact pins (listed with licenses in plan/notes/wy-WY-0.md; downloads covered by Georg's OK of 20.10.).
+[dependencies]
+smithay = { version = "=0.7.0", default-features = false, features = ["wayland_frontend", "desktop", "renderer_pixman"] }
+winit = { version = "=0.30.13", optional = true, default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+# The nested back end uses it through libwayland (`system`); WY-5b's settings page (`bitscomp page`, a placeholder
+# window whose content bitscomp draws itself) speaks the protocol in pure Rust on V2, as wyclient does.
+wayland-client = "=0.31.15"
+wayland-protocols = { version = "=0.32.13", features = ["client"] }
+memmap2 = { version = "=0.9.11", optional = true }
+calloop = { version = "=0.14.5", features = ["signals"] }
+# WY-1a: fbdev/evdev/KD/timerfd ioctls (already in the lock through Smithay's dependencies; no new download).
+libc = "=0.2.191"
+wayland-sys = { version = "=0.31.11", optional = true, features = ["client", "dlopen"] }
+# WY-4: MC-6's client library (path dependency, no crates): the MCP tools windows and window_kill.
+mcpreg = { path = "../../lib/mcpreg" }
+# WY-5: Exo 2 for the interface, grey-level antialiased (plan/spec/rust-ecosystem.md §2.5 names it). std instead of
+# hashbrown (no extra crate); its one dependency ttf-parser 0.25.1 was already in the cargo cache.
+fontdue = { version = "=0.9.5", default-features = false, features = ["std", "simd"] }
+# WY-11: Xcursor theme files (Adwaita). In the lock already (winit's dependency) and in the local cargo cache; no
+# dependencies of its own.
+xcursor = "=0.3.11"
+
+[profile.release]
+opt-level = 3
+debug = 1

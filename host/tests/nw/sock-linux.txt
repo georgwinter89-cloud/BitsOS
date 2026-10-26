@@ -1,0 +1,1471 @@
+# NW-5: the socket programs on Linux (CachyOS 7.2.11, uid 1000), one block per case: `=== <program> <args>`,
+# the end (`end: exit N` or `end: signal N`), then stdout. Made from `cargo xtask abi-diff <program> --host-only`'s
+# Linux transcripts (target/xtask/abi-diff); compared on V2 by the ktests nw.sock.abi_* (crates/syscall/src/socket_ktests.rs).
+=== abi-unix pair
+end: exit 0
+part: pair
+socketpair(STREAM) = 0
+fresh pair a: poll 1 revents 0x4
+send hello = 5
+send world = 6
+b with data: poll 1 revents 0x5
+ioctl(FIONREAD) = 0
+  FIONREAD 11
+recv(3, MSG_PEEK) = 3
+  peeked 'hel'
+recv(64) = 11
+  got 'hello world'
+recv(MSG_DONTWAIT) empty = -EAGAIN
+shutdown(a, SHUT_WR) = 0
+recv after peer SHUT_WR = 0
+b after peer SHUT_WR: poll 1 revents 0x2005
+a after own SHUT_WR: poll 1 revents 0x4
+send after own SHUT_WR = -EPIPE
+shutdown(how 3) = -EINVAL
+shutdown(how -1) = -EINVAL
+send b->a = 4
+recv a = 4
+close(a) = 0
+recv after peer close = 0
+b after peer close: poll 1 revents 0x2015
+send to closed peer = -EPIPE
+socketpair(STREAM) again = 0
+send unread = 10
+recv: peer closed with our data unread = -ECONNRESET
+recv again = 0
+-- SEQPACKET pair
+socketpair = 0
+send one = 3
+send second = 6
+recvmsg(2 bytes) = 2
+  flags 0x20 data 'on'
+recv(1, MSG_TRUNC) = 6
+recv empty queue = -EAGAIN
+send empty = 0
+recv empty message = 0
+send for FIONREAD = 4
+send another = 6
+ioctl(FIONREAD) = 0
+  FIONREAD 10
+close(a) = 0
+recv after close, non-blocking = 0
+send to closed peer = -EPIPE
+survivor: poll 1 revents 0x2015
+-- DGRAM pair
+socketpair = 0
+send one = 3
+send second = 6
+recvmsg(2 bytes) = 2
+  flags 0x20 data 'on'
+recv(1, MSG_TRUNC) = 6
+recv empty queue = -EAGAIN
+send empty = 0
+recv empty message = 0
+send for FIONREAD = 4
+send another = 6
+ioctl(FIONREAD) = 0
+  FIONREAD 4
+close(a) = 0
+recv after close, non-blocking = -EAGAIN
+send to closed peer = -ECONNREFUSED
+survivor: poll 1 revents 0x4
+-- nonblocking stream fills up
+socketpair(STREAM|NONBLOCK) = 0
+  F_GETFL nonblock: yes
+  last send = -EAGAIN, more than 64 KiB queued: yes
+full writer: poll 0 revents 0
+  read back all: yes
+drained writer: poll 1 revents 0x4
+end of part pair
+=== abi-unix names
+end: exit 0
+part: names
+bind abstract = 0
+bind abstract twice = -EINVAL
+bind abstract taken = -EADDRINUSE
+bind abstract, other type = 0
+getsockname = 0
+  len equal: yes, bytes equal: yes
+getsockname unbound = 0
+  len 2 family 1
+bind autobind = 0
+  autobind len 8, leading NUL yes, five hex digits yes
+sendto by name = 4
+recvfrom = 4
+  sender address is the autobind name: yes
+sendto nobody = -ECONNREFUSED
+send unconnected = -ENOTCONN
+connect s -> u = 0
+sendto s from t (s connected elsewhere) = -EPERM
+sendto s from its peer = 2
+connect AF_UNSPEC = 0
+getpeername after disconnect = -ENOTCONN
+sendto s from t now = 1
+bind wrong family = -EINVAL
+bind length 1 = -EINVAL
+bind length 111 = -EINVAL
+-- path names
+bind path = 0
+stat socket file = 0
+  socket: yes mode 755
+  getsockname len is strlen+3: yes
+bind existing path = -EADDRINUSE
+bind a bound socket to a second path = -EINVAL
+  second file left behind: no
+connect, not listening = -ECONNREFUSED
+connect stream path from dgram = -EPROTOTYPE
+connect missing path = -ENOENT
+bind in a missing directory = -ENOENT
+connect to a regular file = -ECONNREFUSED
+connect after the bound socket closed = -ECONNREFUSED
+  file still there: yes
+end of part names
+=== abi-unix listen
+end: exit 0
+part: listen
+listen unbound = -EINVAL
+accept, not listening = -EINVAL
+listen dgram = -EOPNOTSUPP
+accept dgram = -EOPNOTSUPP
+bind = 0
+listen(1) = 0
+  SO_ACCEPTCONN 1
+connect first = 0
+connect again = -EISCONN
+connect second, backlog 1, non-blocking = 0
+connect third, backlog 1 full, non-blocking = -EAGAIN
+connect a connected socket to a missing path = -ENOENT
+send before accept = 5
+listener with one waiting: poll 1 revents 0x1
+accept4 ok: yes, peer len 2, cloexec yes, nonblock yes
+recv early data = 5
+  accepted socket's name is the listener's: yes
+  client's peer is the listener's path: yes
+SO_PEERCRED of accepted = 0
+  len 12 pid is mine yes uid is mine yes gid is mine yes
+SO_PEERCRED of client = 0
+  pid is mine yes
+SO_PEERCRED unconnected = 0
+  pid 0 uid -1 gid -1
+accept the second: ok
+accept nothing waiting (non-blocking) = -EAGAIN
+accept4 bad flags = -EINVAL
+connect third = 0
+close listener with one waiting = 0
+recv on the never-accepted connection = -ECONNRESET
+send on it = -EPIPE
+end of part listen
+=== abi-unix rights
+end: exit 0
+part: rights
+socketpair(STREAM) = 0
+sendmsg 2 fds = 1
+close the original = 0
+recvmsg with room for 2, MSG_CMSG_CLOEXEC = 1
+  msg_flags 0x40000000 controllen 24
+  cmsg level 1 type 1 len 24
+  fd 0: valid yes cloexec yes
+  fd 1: valid no cloexec yes
+read at the shared offset = 3
+  read '234' (offset 2 came along)
+offset now = 5
+sendmsg 1 fd = 1
+sendmsg 2 fds = 1
+recvmsg G = 1
+  msg_flags 0 controllen 24
+  cmsg level 1 type 1 len 20
+  fd 0: valid yes cloexec no
+recvmsg H with room for one fd = 1
+  msg_flags 0x8 controllen 20
+  cmsg level 1 type 1 len 20
+  fd 0: valid yes cloexec no
+sendmsg 1 fd = 1
+recvmsg without control buffer = 1
+  msg_flags 0x8 controllen 0
+sendmsg 1 fd = 1
+recvmsg control below one header = 1
+  msg_flags 0x8 controllen 0
+sendmsg 1 fd = 1
+recvmsg MSG_PEEK = 1
+  msg_flags 0 controllen 24
+  cmsg level 1 type 1 len 20
+  fd 0: valid yes cloexec no
+recvmsg after peek = 1
+  msg_flags 0 controllen 24
+  cmsg level 1 type 1 len 20
+  fd 0: valid yes cloexec no
+sendmsg a closed fd = -EBADF
+sendmsg 254 fds = -EINVAL
+sendmsg 253 fds = 1
+recvmsg 253 into room for 16 = 1
+  msg_flags 0x8 controllen 80
+  cmsg level 1 type 1 len 80
+  fd 0: valid yes cloexec no
+  fd 1: valid no cloexec no
+  fd 2: valid no cloexec no
+  fd 3: valid no cloexec no
+  fd 4: valid no cloexec no
+  fd 5: valid no cloexec no
+  fd 6: valid no cloexec no
+  fd 7: valid no cloexec no
+  fd 8: valid no cloexec no
+  fd 9: valid no cloexec no
+  fd 10: valid no cloexec no
+  fd 11: valid no cloexec no
+  fd 12: valid no cloexec no
+  fd 13: valid no cloexec no
+  fd 14: valid no cloexec no
+  fd 15: valid no cloexec no
+-- in flight while the receiver closes
+sendmsg = 1
+close receiver = 0
+send to it = -EPIPE
+-- a socket sent over itself
+socketpair(DGRAM) = 0
+send own end over itself = 1
+recvmsg = 1
+  msg_flags 0 controllen 24
+  cmsg level 1 type 1 len 20
+  fd 0: valid yes cloexec no
+the received end works = 1
+recv on it = 1
+send own end again and close both = 1
+another pair after the cycle = 0
+seqpacket fd passing = 3
+recvmsg seqpacket = 3
+  msg_flags 0 controllen 24
+  cmsg level 1 type 1 len 20
+  fd 0: valid yes cloexec no
+end of part rights
+=== abi-unix creds
+end: exit 0
+part: creds
+socketpair(DGRAM) = 0
+SO_PASSCRED on b = 0
+  SO_PASSCRED 1
+send = 1
+recvmsg = 1
+  controllen 32 flags 0
+  cmsg type 2 len 28 pid mine yes uid mine yes gid mine yes
+send = 1
+recvmsg with a short control buffer = 1
+  controllen 20 flags 0x8
+send = 1
+recvmsg without control = 1
+  flags 0x8
+sendmsg own SCM_CREDENTIALS = 1
+sendmsg another uid: EPERM
+sendmsg SCM_CREDENTIALS of the wrong length = -EINVAL
+sendmsg unknown SOL_SOCKET type = -EINVAL
+sendmsg other level (ignored) = 1
+sendmsg cmsg_len below a header = -EINVAL
+-- stream: messages of different senders are not glued with SO_PASSCRED
+socketpair(STREAM) = 0
+SO_PASSCRED = 0
+recvmsg glues one sender's writes = 4
+end of part creds
+=== abi-unix opts
+end: exit 0
+part: opts
+SO_TYPE 1 SO_DOMAIN 1 SO_PROTOCOL 0
+SO_SNDBUF 212992 SO_RCVBUF 212992 SO_ERROR 0 SO_PASSCRED 0 SO_ACCEPTCONN 0
+SO_SNDBUF 1000 = 0
+  SO_SNDBUF 4608
+SO_RCVBUF 100000 = 0
+  SO_RCVBUF 200000
+SO_SNDBUF -1 = 0
+  SO_SNDBUF 8388608
+SO_TYPE set = -ENOPROTOOPT
+unknown option = -ENOPROTOOPT
+optlen 2 = -EINVAL
+SOL_TCP on AF_UNIX = -EOPNOTSUPP
+getsockopt SOL_TCP on AF_UNIX = -EOPNOTSUPP
+getsockopt unknown = -ENOPROTOOPT
+getsockopt negative len = -EINVAL
+getsockopt into 2 bytes = 0
+  len 2 value 1
+getsockopt with a big len = 0
+  len 4
+SO_RCVTIMEO 1.0015 s = 0
+  back 1 s 2000 us
+SO_RCVTIMEO usec 1e6 = -EDOM
+SO_RCVTIMEO short optlen = -EINVAL
+SO_LINGER = 0
+  linger 1 5 len 8
+recv with SO_RCVTIMEO 30 ms = -EAGAIN
+waited at least 30 ms: yes
+-- errors
+socket(AF_UNIX, 99) = -EINVAL
+socket(AF_UNIX, SOCK_RDM) = -ESOCKTNOSUPPORT
+socket(AF_UNIX, STREAM, 7) = -EPROTONOSUPPORT
+socket(AF_UNIX, STREAM|0x100) = -EINVAL
+socket(46, STREAM) = -EAFNOSUPPORT
+socket(AF_UNIX, SOCK_RAW): ok, SO_TYPE 2
+bind on /dev/null = -ENOTSOCK
+listen on /dev/null = -ENOTSOCK
+getsockopt on /dev/null = -ENOTSOCK
+bind on fd 999 = -EBADF
+socketpair into a kernel address = -EFAULT
+socketpair(AF_UNIX, 99) = -EINVAL
+send from a kernel address = -EFAULT
+recv into a kernel address = -EFAULT
+recv into a kernel address with data = -EFAULT
+recv the data afterwards = 4
+recvmsg MSG_CMSG_COMPAT = -EINVAL
+sendmsg bad msghdr = -EFAULT
+sendmsg 1025 iovecs = -EMSGSIZE
+end of part opts
+=== abi-unix mmsg
+end: exit 0
+part: mmsg
+socketpair(DGRAM) = 0
+sendmmsg 3 = 3
+  msg_len 3 4 5
+sendmmsg 0 = 0
+recvmmsg 4 (3 waiting), MSG_DONTWAIT = 3
+  msg_len 3 4 4 flags 0 0 0x20
+recvmmsg nothing waiting = -EAGAIN
+recvmmsg MSG_WAITFORONE = 1
+recvmmsg bad timeout = -EINVAL
+recvmmsg timeout at a kernel address = -EFAULT
+recvmmsg with a timeout, one waiting, MSG_WAITFORONE = 1
+  timeout left below 5 s: yes
+end of part mmsg
+=== abi-unix iov
+end: exit 0
+part: iov
+socketpair(DGRAM) = 0
+writev 2 segments = 7
+recv: one datagram = 7
+  got 'abcdefg'
+write 100000 bytes = 100000
+recv it whole = 100000
+send = 6
+readv = 6
+  'xy' 'zuvw'
+read on an unconnected stream socket = -EINVAL
+end of part iov
+=== abi-unix sigpipe
+end: signal 13
+part: sigpipe
+writing to a closed peer
+=== abi-unix hostile
+end: exit 0
+part: hostile
+socketpair(DGRAM) = 0
+sendmsg msghdr at a kernel address = -EFAULT
+recvmsg msghdr at address 8 = -EFAULT
+sendmsg iov array at a kernel address = -EFAULT
+sendmsg iov array at address 8 = -EFAULT
+sendmsg iovlen 1025 = -EMSGSIZE
+recvmsg iovlen 1025 = -EMSGSIZE
+sendmsg data at a kernel address = -EFAULT
+sendmsg iov_len -1 = -EINVAL
+sendmsg 0 bytes at a kernel address = -EFAULT
+recv the empty datagram = -EAGAIN
+send from a kernel address = -EFAULT
+sendmsg name at a kernel address = -EFAULT
+sendmsg namelen 129 = -EINVAL
+sendmsg namelen -1 = -EINVAL
+sendto address at a kernel address = -EFAULT
+sendmsg control at a kernel address = -EFAULT
+sendmsg cmsg_len below the header = -EINVAL
+sendmsg cmsg_len past msg_controllen = -EINVAL
+sendmsg SCM_RIGHTS with 2 bytes of fds = 4
+recv it = 4
+sendmsg SCM_RIGHTS fd -1 = -EBADF
+sendmsg SOL_SOCKET type 99 = -EINVAL
+sendmsg level 99 (not ours: skipped) = 4
+recv it = 4
+sendmsg msg_controllen 8 (no whole header) = 4
+recv it = 4
+sendmsg msg_controllen 1 MiB = -ENOBUFS
+recv nothing = -EAGAIN
+send abcd = 4
+recvmsg into a kernel address = -EFAULT
+recv after the failed check = 4
+send abcd = 4
+recvmsg into address 8 (the copy faults) = -EFAULT
+recv after the failed copy = -EAGAIN
+send efgh = 4
+recvmsg name to a kernel address = 4
+recv after it = -EAGAIN
+recvfrom address length at a kernel address = -EAGAIN
+socketpair(STREAM) as the passed object = 0
+sendmsg one end of it = 1
+recvmsg with control at a kernel address = 1
+  MSG_CTRUNC set
+recv on the other end: the passed end was closed = 0
+sendmmsg, the second entry's data at a kernel address = 1
+  first msg_len 2
+sendmmsg vector at a kernel address = -EFAULT
+recvmmsg vector at a kernel address = -EFAULT
+recvmmsg vlen 0 = 0
+recvmmsg, the second entry's buffer at a kernel address = 1
+send = 2
+send = 2
+recvmmsg, the second entry's buffer at a kernel address = -EFAULT
+recv what is left = 2
+socketpair into a kernel address = -EFAULT
+  no fds left behind: yes
+bind from a kernel address = -EFAULT
+bind 200-byte address = -EINVAL
+connect from a kernel address = -EFAULT
+getsockname to a kernel address = -EFAULT
+getsockname length at a kernel address = -EFAULT
+getsockname length -1 = -EINVAL
+getsockopt value to a kernel address = -EFAULT
+getsockopt length at a kernel address = -EFAULT
+getsockopt length -1 = -EINVAL
+setsockopt value at a kernel address = -EFAULT
+setsockopt length 2 = -EINVAL
+setsockopt length -1 = -EINVAL
+bind abstract = 0
+listen = 0
+connect = 0
+accept to a kernel address = -EFAULT
+client recv = 0
+accept4 with flags 1 = -EINVAL
+end of part hostile
+=== abi-unix limits
+end: exit 0
+part: limits
+socketpair(DGRAM) = 0
+send 300000 bytes as one datagram = -EMSGSIZE
+send SO_SNDBUF - 32 bytes = 212960
+send SO_SNDBUF - 31 bytes = -EMSGSIZE
+socketpair(SEQPACKET) = 0
+send 300000 bytes as one record = -EMSGSIZE
+setrlimit(RLIMIT_NOFILE, 16) = 0
+socketpair(STREAM) = 0
+sends of one fd each until ETOOMANYREFS; between 10 and 17 of them: yes
+send after the receiver closed with files queued = -EPIPE
+socketpair(STREAM) = 0
+socketpair(STREAM) as the passed object = 0
+sendmsg one end of it = 1
+recv on the other end while the passed end is in flight = -EAGAIN
+close the receiver = 0
+recv on the other end after = 0
+recv after the peer closed with unread data = -ECONNRESET
+recv again = 0
+send = -EPIPE
+end of part limits
+=== abi-unix ioctl
+end: exit 0
+part: ioctl
+socketpair(DGRAM) = 0
+ioctl(FIONBIO, 1) = 0
+  O_NONBLOCK set
+recv without MSG_DONTWAIT = -EAGAIN
+ioctl(FIONBIO, 0) = 0
+ioctl(SIOCINQ) = 0
+  SIOCINQ 3 (the first datagram)
+dgram ioctl(SIOCATMARK) = -EOPNOTSUPP
+stream ioctl(SIOCATMARK) = 0
+  SIOCATMARK 0
+ioctl(SIOCGPGRP) = 0
+  SIOCGPGRP 0
+ioctl(SIOCGSTAMP) = -ENOTTY
+ioctl(TCGETS) = -ENOTTY
+SO_TIMESTAMP 0 SO_TIMESTAMPNS 0 SO_BUSY_POLL 0 SO_INCOMING_CPU -1
+set SO_TIMESTAMPNS = 0
+  SO_TIMESTAMP 0 SO_TIMESTAMPNS 1
+set SO_TIMESTAMP = 0
+  SO_TIMESTAMP 1 SO_TIMESTAMPNS 0
+clear SO_TIMESTAMP = 0
+  SO_TIMESTAMP 0 SO_TIMESTAMPNS 0
+get SO_TIMESTAMPING = 0
+  length 8 flags 0 bind_phc 0
+set SO_TIMESTAMPING 0 = 0
+set SO_BUSY_POLL -1 = -EINVAL
+set SO_BUSY_POLL 50 = 0
+  SO_BUSY_POLL 50
+set SO_INCOMING_CPU 3 = 0
+  SO_INCOMING_CPU 3
+get SO_BINDTODEVICE = 0
+  length 0
+set SO_BINDTODEVICE "" = 0
+set SO_BINDTODEVICE length 0 = 0
+set SO_BINDTODEVICE nw5nodev0 = -ENODEV
+set SO_BINDTODEVICE from a kernel address = -EFAULT
+get SO_PEERGROUPS on a pair: 0, length a multiple of 4: yes
+get SO_PEERGROUPS unconnected = -ENODATA
+end of part ioctl
+=== abi-inet tcp
+end: exit 0
+part: tcp
+SO_TYPE 1 SO_PROTOCOL 6 SO_DOMAIN 2 SO_ERROR 0
+SO_SNDBUF 16384 SO_RCVBUF 131072 TCP_NODELAY 0 TCP_MAXSEG 536 IP_TTL 64 SO_REUSEADDR 0 SO_KEEPALIVE 0
+fresh socket: poll 1 revents 0x14
+name of a fresh socket: 0.0.0.0 port 0
+getpeername fresh = -ENOTCONN
+recv on a fresh socket = -ENOTCONN
+send on a fresh socket = -EPIPE
+shutdown a fresh socket = -ENOTCONN
+accept on a fresh socket = -EINVAL
+bind 127.0.0.1:24620 = 0
+bind again = -EINVAL
+name: 127.0.0.1 port 24620
+bind the same port = -EADDRINUSE
+bind 0.0.0.0 on that port = -EADDRINUSE
+bind port 80 as a user = -EACCES
+bind 8.8.8.8 = -EADDRNOTAVAIL
+bind 15 bytes = -EINVAL
+bind family AF_INET6 = -EAFNOSUPPORT
+bind AF_UNSPEC with INADDR_ANY = 0
+  port chosen: yes
+listen(4) = 0
+SO_ACCEPTCONN 1
+listener, nothing waiting: poll 0 revents 0
+listen again = 0
+connect = 0
+connect again = -EISCONN
+listener, one waiting: poll 1 revents 0x1
+accept4: ok len 16 cloexec yes nonblock yes
+  peer port is the client's: yes, client's name 127.0.0.1, peer 127.0.0.1
+  client's peer port 24620, accepted's own port 24620
+connected client: poll 1 revents 0x4
+send = 9
+ioctl(FIONREAD) = 0
+  FIONREAD 9
+recv(5, MSG_PEEK) = 5
+recv(64) = 9
+  got 'hello tcp'
+recv nothing (accept4 SOCK_NONBLOCK) = -EAGAIN
+recvfrom gives no address = -EAGAIN
+shutdown(client, SHUT_WR) = 0
+recv after FIN = 0
+server after FIN: poll 1 revents 0x2005
+client after own SHUT_WR: poll 1 revents 0x4
+send after own SHUT_WR = -EPIPE
+server answers = 6
+client reads the answer = 6
+server closes = 0
+client reads EOF = 0
+client after both FINs: poll 1 revents 0x2015
+-- close with unread data resets
+connect = 0
+send to the server = 6
+server closes without reading = 0
+client after the reset: poll 1 revents 0x201d
+client recv = -ECONNRESET
+client recv again = 0
+client send = -EPIPE
+-- SO_LINGER 0 resets
+SO_LINGER {1, 0} = 0
+client recv after the reset = -ECONNRESET
+-- connect to a closed port
+blocking connect = -ECONNREFUSED
+SO_ERROR after it = 0
+after the refusal: poll 1 revents 0x14
+non-blocking connect = -EINPROGRESS
+after the refusal: poll 1 revents 0x201d
+SO_ERROR 111 then 0
+connect again = -ECONNABORTED
+-- non-blocking connect that works
+connect 0.0.0.0 (non-blocking) = -EINPROGRESS
+after the handshake: poll 1 revents 0x4
+connect again = 0
+and again = -EISCONN
+  peer 127.0.0.1
+accepted: yes, local address of the accepted 127.0.0.1
+accept nothing waiting = -EAGAIN
+-- SO_REUSEADDR
+SO_REUSEADDR 1
+bind first (reuse) = 0
+bind second (no reuse) = -EADDRINUSE
+bind second (reuse) = 0
+listen on the first while the second holds the port = 0
+listen after the second closed = 0
+listen without bind = 0
+  port chosen: yes, address 0.0.0.0
+-- options
+TCP_NODELAY 1 = 0
+  TCP_NODELAY 1
+TCP_NODELAY short = -EINVAL
+unknown TCP option = -ENOPROTOOPT
+TCP_KEEPIDLE 10 = 0
+  TCP_KEEPIDLE 10 TCP_KEEPINTVL 75 TCP_KEEPCNT 9
+TCP_KEEPIDLE 0 = -EINVAL
+SO_KEEPALIVE = 0
+  SO_KEEPALIVE 1
+IP_TOS = 0
+  IP_TOS 16
+SOL_UDP on TCP = -ENOPROTOOPT
+end of part tcp
+=== abi-inet udp
+end: exit 0
+part: udp
+SO_TYPE 2 SO_PROTOCOL 17 SO_SNDBUF 212992 SO_RCVBUF 212992
+fresh UDP socket: poll 1 revents 0x4
+bind 127.0.0.1:24630 = 0
+bind the same port = -EADDRINUSE
+send unconnected = -EDESTADDRREQ
+sendto = 5
+  sendto bound an ephemeral port: yes
+receiver: poll 1 revents 0x5
+ioctl(FIONREAD) = 0
+  FIONREAD 5
+recvfrom(3) = 3
+  from len 16, port is the sender's yes, ip 127.0.0.1
+recv, the rest of the datagram is gone = -EAGAIN
+recvmsg(4) = 4
+  msg_flags 0x20
+recv(1, MSG_TRUNC) = 3
+recv MSG_PEEK = 4
+recv = 4
+sendto port 0 = -EINVAL
+sendto 65508 bytes = -EMSGSIZE
+sendto 65507 bytes = 65507
+recv the big one = 65507
+sendto broadcast without SO_BROADCAST = -EACCES
+sendto 15-byte address = -EINVAL
+-- connected
+connect a -> c = 0
+  a's peer 127.0.0.1 port 24632
+b sends to a (not a's peer) = 6
+c sends to a = 6
+a receives = 6
+  got 'from c'
+a receives again = -EAGAIN
+connect AF_UNSPEC = 0
+getpeername after it = -ENOTCONN
+-- port unreachable
+connect to a port nobody has = 0
+send = 1
+after the ICMP error: poll 1 revents 0xc
+send again = -ECONNREFUSED
+send a third time = 1
+recv = -ECONNREFUSED
+SO_ERROR 0
+shutdown unconnected = -ENOTCONN
+shutdown connected = 0
+recv after SHUT_RD (non-blocking) = -EAGAIN
+after SHUT_RD: poll 1 revents 0x2005
+listen on UDP = -EOPNOTSUPP
+accept on UDP = -EOPNOTSUPP
+bind 24630 after close = 0
+end of part udp
+=== abi-inet errors
+end: exit 0
+part: errors
+socket(AF_INET, STREAM, UDP) = -EPROTONOSUPPORT
+socket(AF_INET, DGRAM, TCP) = -EPROTONOSUPPORT
+socket(AF_INET, STREAM, 300) = -EINVAL
+socket(AF_INET, STREAM, -1) = -EINVAL
+socket(AF_INET, SEQPACKET) = -ESOCKTNOSUPPORT
+socket(AF_INET, RAW, ICMP): EPERM
+socketpair(AF_INET) = -EOPNOTSUPP
+connect 15 bytes = -EINVAL
+connect 1 byte = -EINVAL
+connect family AF_INET6 = -EAFNOSUPPORT
+connect from a kernel address = -EFAULT
+connect 129-byte address = -EINVAL
+send MSG_OOB = -EPIPE
+end of part errors
+=== abi-inet sigpipe
+end: signal 13
+part: sigpipe
+send on an unconnected TCP socket
+=== abi-inet hostile
+end: exit 0
+part: hostile
+bind udp 127.0.0.1:24636 = 0
+sendto from a kernel address = -EFAULT
+sendto address at a kernel address = -EFAULT
+sendto address of 15 bytes = -EINVAL
+sendto address of 129 bytes = -EINVAL
+sendto itself = 4
+recv into a kernel address = -EFAULT
+recv after the failed check = 4
+sendto itself = 4
+recv into address 8 (the copy faults) = -EFAULT
+recv after the failed copy = -EAGAIN
+sendto itself = 4
+recvfrom with the address to a kernel address = -EFAULT
+recv after it = -EAGAIN
+sendto itself = 4
+recvfrom with the length at a kernel address = -EFAULT
+recv after it = -EAGAIN
+setsockopt IP_TTL from a kernel address = -EFAULT
+getsockopt IP_TTL to a kernel address = -EFAULT
+bind tcp 127.0.0.1:24637 = 0
+listen = 0
+connect = 0
+accepted: yes
+send from a kernel address = -EFAULT
+send abcd = 4
+recv into a kernel address = -EFAULT
+recv into address 8 (the copy faults) = -EFAULT
+recv after the failed copy = 4
+setsockopt TCP_NODELAY from a kernel address = -EFAULT
+getsockopt TCP_NODELAY length at a kernel address = -EFAULT
+getpeername to a kernel address = -EFAULT
+end of part hostile
+=== abi-inet ioctl
+end: exit 0
+part: ioctl
+tcp ioctl(SIOCATMARK) = 0
+  SIOCATMARK 0
+udp ioctl(SIOCATMARK) = -ENOTTY
+tcp ioctl(SIOCGPGRP) = 0
+  SIOCGPGRP 0
+tcp ioctl(SIOCGSTAMP) before any packet = -ENOENT
+udp ioctl(SIOCGSTAMP) before any packet = -ENOENT
+udp ioctl(SIOCINQ) empty = 0
+  SIOCINQ 0
+tcp ioctl(SIOCINQ) unconnected = 0
+listen = 0
+tcp ioctl(SIOCINQ) listening = -EINVAL
+tcp ioctl(SIOCOUTQ) listening = -EINVAL
+tcp ioctl(SIOCATMARK) listening = 0
+  SIOCATMARK 0
+SO_INCOMING_CPU tcp -1 udp -1
+get SO_PEERGROUPS on udp = -ENODATA
+end of part ioctl
+=== abi-inet tcp6
+end: exit 0
+part: tcp6
+SO_DOMAIN 10 SO_TYPE 1 SO_PROTOCOL 6
+name of a fresh socket: len 28 family 10 :: port 0
+getpeername fresh = -ENOTCONN
+bind [::1]:24640 = 0
+name: len 28 family 10 ::1 port 24640, IPV6_V6ONLY now 1
+listen = 0
+AF_INET connect 127.0.0.1:24640 (the listener is ::1 only) = -ECONNREFUSED
+connect [::1]:24640 = 0
+client: len 28 family 10 ::1, peer len 28 family 10 ::1 port 24640
+accept: len 28 ::1, port is the client's: yes
+accepted: len 28 family 10 ::1 port 24640, SO_DOMAIN 10
+send ping = 4
+recv = 4
+send pong = 4
+recv = 4
+connect [::1]:24641 (nobody) = -ECONNREFUSED
+bind [::]:24642 = 0
+listen = 0
+AF_INET bind 0.0.0.0:24642 = -EADDRINUSE
+AF_INET connect 127.0.0.1:24642 = 0
+accept the IPv4 peer: len 28 ::ffff:127.0.0.1, port is the client's: yes
+accepted: len 28 family 10 ::ffff:127.0.0.1
+connect [::]:24642 = 0
+accept the IPv6 peer: len 28 ::1, port is the client's: yes
+connect [::ffff:127.0.0.1]:24642 = 0
+client: len 28 family 10 ::ffff:127.0.0.1
+accept the mapped peer: len 28 ::ffff:127.0.0.1, port is the client's: yes
+IPV6_V6ONLY 1 = 0
+bind [::]:24643 = 0
+IPV6_V6ONLY 0 after bind = -EINVAL
+AF_INET bind 0.0.0.0:24643 = 0
+v6-only bind [::ffff:127.0.0.1]:24643 = -EINVAL
+v6-only connect [::ffff:127.0.0.1]:24643 = -ENETUNREACH
+end of part tcp6
+=== abi-inet udp6
+end: exit 0
+part: udp6
+SO_DOMAIN 10 SO_TYPE 2 SO_PROTOCOL 17
+bind [::1]:24644 = 0
+sendto [::1]:24644 = 5
+recvfrom = 5
+  from len 28 ::1, port is the sender's: yes
+AF_INET sendto 127.0.0.1:24644 = 2
+recv (::1 hears no IPv4) = -EAGAIN
+bind [::]:24645 = 0
+AF_INET sender: sent 1, got 1 from len 28 ::ffff:127.0.0.1
+AF_INET6 sender to ::1: sent 1, got 1 from len 28 ::1
+AF_INET6 sender with a sockaddr_in: sent 1, got 1 from len 28 ::ffff:127.0.0.1
+connect [::1]:65535 = 0
+  peer len 28 family 10 ::1 port 65535, name len 28 family 10 ::1
+connect [::1]:24646 = 0
+send = 1
+send again (port unreachable) = -ECONNREFUSED
+v6-only sendto a sockaddr_in = -ENETUNREACH
+v6-only connect a sockaddr_in = -EAFNOSUPPORT
+sendto [::1]:0 = -EINVAL
+sendto 23 bytes = -EINVAL
+sendto AF_UNSPEC unconnected = -EDESTADDRREQ
+end of part udp6
+=== abi-inet v6errors
+end: exit 0
+part: v6errors
+socket(AF_INET6, SEQPACKET) = -ESOCKTNOSUPPORT
+socket(AF_INET6, STREAM, UDP) = -EPROTONOSUPPORT
+socketpair(AF_INET6) = -EOPNOTSUPP
+bind 23 bytes = -EINVAL
+bind a sockaddr_in = -EINVAL
+bind family AF_INET, 28 bytes = -EAFNOSUPPORT
+bind [::2] = -EADDRNOTAVAIL
+bind [fe80::1] without scope = -EINVAL
+bind [fe80::1%9999] = -ENODEV
+TCP bind [ff02::1] = -EINVAL
+TCP connect a sockaddr_in = -EINVAL
+TCP connect [ff02::1] = -ENETUNREACH
+bind [::1]:24647 = -ENODEV
+bind again = -ENODEV
+end of part v6errors
+=== abi-inet v6opts
+end: exit 0
+part: v6opts
+tcp SO_REUSEADDR = 0
+tcp SO_RCVBUF = 0
+tcp SO_SNDBUF = 0
+tcp SO_KEEPALIVE = 0
+tcp SO_BROADCAST = 0
+tcp TCP_KEEPIDLE = 0
+tcp TCP_KEEPINTVL = 0
+tcp TCP_NODELAY = 0
+udp SO_REUSEADDR = 0
+udp SO_RCVBUF = 0
+udp SO_SNDBUF = 0
+udp SO_BROADCAST = 0
+get IPV6_V6ONLY: tcp 0 udp 0
+get IPV6_UNICAST_HOPS: tcp 64 udp 64
+get IPV6_MULTICAST_HOPS: tcp 1 udp 1
+get IPV6_MULTICAST_LOOP: tcp 1 udp 1
+get IPV6_MULTICAST_IF: tcp 0 udp 0
+get IPV6_TCLASS: tcp 0 udp 0
+get IPV6_RECVPKTINFO: tcp 0 udp 0
+get IPV6_MTU_DISCOVER: tcp 1 udp 1
+get IPV6_ADDR_PREFERENCES: tcp 1280 udp 1280
+get IPV6_MULTICAST_ALL: tcp 1 udp 1
+get IPV6_DONTFRAG: tcp 0 udp 0
+get IPV6_RECVERR: tcp 0 udp 0
+get IPV6_MINHOPCOUNT: tcp 0 udp 0
+get IPV6_MTU: tcp ENOTCONN0 udp ENOTCONN0
+get IPV6_ADDRFORM: tcp ENOTCONN0 udp ENOTCONN0
+get IPV6_ADD_MEMBERSHIP: tcp ENOPROTOOPT0 udp ENOPROTOOPT0
+get SOL_IPV6 999: tcp ENOPROTOOPT0 udp ENOPROTOOPT0
+tcp IPV6_UNICAST_HOPS 256 = -EINVAL
+tcp IPV6_UNICAST_HOPS 7 = 0
+tcp IPV6_UNICAST_HOPS -2 = -EINVAL
+tcp IPV6_TCLASS 0xbb = 0
+udp IPV6_TCLASS 0xbb = 0
+udp IPV6_TCLASS 256 = -EINVAL
+tcp IPV6_MULTICAST_HOPS 5 = -ENOPROTOOPT
+udp IPV6_MULTICAST_HOPS -1 = 0
+udp IPV6_MULTICAST_LOOP 2 = -EINVAL
+udp IPV6_MULTICAST_LOOP 0 = 0
+udp IPV6_MULTICAST_IF 0 = 0
+udp IPV6_MULTICAST_IF 9999 = -ENODEV
+tcp IPV6_MULTICAST_IF 0 = -ENOPROTOOPT
+udp IPV6_RECVPKTINFO 1 = 0
+udp IPV6_RECVTCLASS 1 = 0
+udp IPV6_RECVHOPLIMIT 1 = 0
+udp IPV6_MTU 1000 = -EINVAL
+udp IPV6_MTU 1280 = 0
+udp IPV6_MTU_DISCOVER 6 = -EINVAL
+udp IPV6_ADDR_PREFERENCES TMP|PUBLIC = -EINVAL
+udp IPV6_ADDR_PREFERENCES PUBLIC = 0
+udp IPV6_ADDRFORM unconnected = -ENOTCONN
+udp SOL_IPV6 999 = -ENOPROTOOPT
+AF_INET socket IPV6_V6ONLY = -ENOPROTOOPT
+now: tcp UNICAST_HOPS 7 TCLASS 0xb8, udp TCLASS 0xbb MULTICAST_HOPS 1 ADDR_PREFERENCES 0x402 RECVPKTINFO 1
+IPV6_V6ONLY with 2 bytes = -EINVAL
+SOL_IP on AF_INET6: IP_TTL 64 IP_TOS 0
+IP_TOS on AF_INET6 = 0
+connect [::ffff:127.0.0.1]:24648 = 0
+IPV6_ADDRFORM get: 10
+IPV6_ADDRFORM AF_INET = 0
+after: SO_DOMAIN 2, peer 127.0.0.1 port 24648, IPV6_V6ONLY -100095
+IPV6_ADDRFORM on a ::1 peer = -EADDRNOTAVAIL
+end of part v6opts
+=== abi-inet v6more
+end: exit 0
+part: v6more
+tcp: bind [::1]:24650 0, again EADDRINUSE
+tcp: IPV6_V6ONLY after the failed bind 0
+bind [::]:24651 = 0
+tcp: IPV6_V6ONLY 0
+AF_INET bind 127.0.0.1:24651 = -EADDRINUSE
+udp: bind [::1]:24650 0, again EADDRINUSE
+udp: IPV6_V6ONLY after the failed bind 0
+bind [::]:24651 = 0
+udp: IPV6_V6ONLY 0
+AF_INET bind 127.0.0.1:24651 = -EADDRINUSE
+v6-only bind [::]:24652 = 0
+listen = 0
+AF_INET bind 0.0.0.0:24652 = 0
+listen = 0
+AF_INET connect 127.0.0.1:24652 = 0
+AF_INET6 connect [::1]:24652 = 0
+v6-only listener accepts: len 28 ::1, port is the client's: yes
+AF_INET listener accepts: 127.0.0.1
+bind [::1]:24653 = 0
+listen = 0
+AF_INET bind 127.0.0.1:24653 = 0
+listen = 0
+AF_INET connect 127.0.6.1:24654 (only ::1 listens) = -ECONNREFUSED
+udp v6-only bind [::]:24655 = 0
+udp AF_INET bind 0.0.0.0:24655 = 0
+v6-only gets six
+AF_INET gets four
+AF_INET gets alt
+v6-only gets more: no
+bind [ff02::fb]:24656 = -EINVAL
+bind [ff02::fb%lo]:24656 = 0
+getsockname: len 28 family 10 ff02::fb scope 1, IPV6_V6ONLY 1
+bind [ff05::fb]:24657 = 0
+getsockname: len 28 family 10 ff05::fb
+unicast to ::1 reaches the group socket: no
+from ::1: flags
+  IPV6_PKTINFO len 20 ::1 ifindex 1
+  level 41 type 52 len 4 int 64
+  level 41 type 67 len 4 int 0
+from 127.0.0.1: flags
+  IPV6_PKTINFO len 20 ::ffff:127.0.0.1 ifindex 1
+  IP_PKTINFO len 12 ifindex 1 spec_dst 127.0.0.1 addr 127.0.0.1
+AF_INET: flags
+  IP_PKTINFO len 12 ifindex 1 spec_dst 127.0.0.1 addr 127.0.0.1
+  level 0 type 2 len 4 int 64
+  level 0 type 1 byte 0
+AF_INET without control space: flags MSG_CTRUNC
+IPV6_UNICAST_HOPS with 2 bytes = -EINVAL
+IPV6_TCLASS with 1 byte = -EINVAL
+IPV6_UNICAST_HOPS from a kernel address = -EFAULT
+bind from a kernel address = -EFAULT
+connect from a kernel address = -EFAULT
+end of part v6more
+=== abi-fdpass shm
+end: exit 0
+socketpair = 0
+ftruncate = 0
+sendmsg create_pool = 11
+fd arrived: yes, request 'create_pool'
+compositor mapping: ok
+first frame right: yes
+second frame right: yes
+still mapped after the client unmapped: yes
+done
+=== abi-fdpass memfd
+end: exit 0
+socketpair = 0
+ftruncate = 0
+sendmsg create_pool = 11
+fd arrived: yes, request 'create_pool'
+compositor mapping: ok
+first frame right: yes
+second frame right: yes
+still mapped after the client unmapped: yes
+done
+# NW-6: abi-netlink on Linux (CachyOS 7.2.11, uid 1000), same format; compared by nw.sock.abi_netlink.
+=== abi-netlink sock
+end: exit 0
+socket(STREAM) = -ESOCKTNOSUPPORT
+socket(SEQPACKET) = -ESOCKTNOSUPPORT
+socket(RAW, protocol 32) = -EPROTONOSUPPORT
+socket(RAW, protocol -1) = -EPROTONOSUPPORT
+socket(DGRAM, ROUTE) works: yes
+socket(RAW, ROUTE) works: yes
+SO_TYPE 3 SO_PROTOCOL 0 SO_DOMAIN 16 SO_RCVBUF 212992 SO_SNDBUF 212992 SO_ERROR 0 SO_PASSCRED 0
+fresh socket: poll 1 revents 0x4
+getsockname fresh: len 12 family 16 pad 0 pid 0 groups 0
+getpeername fresh: len 12 family 16 pad 0 pid 0 groups 0
+bind len 11 = -EINVAL
+bind family AF_INET = -EINVAL
+bind pid 0 = 0
+getsockname after bind: len 12 family 16 pad 0 pid own groups 0
+bind pid 0 again = -EINVAL
+bind own pid with RTMGRP_LINK = 0
+getsockname with a group: len 12 family 16 pad 0 pid own groups 0x1
+bind another socket to the same pid = -EADDRINUSE
+connect the other to the kernel = 0
+the other's name (autobind): len 12 family 16 pad 0 pid negative groups 0
+the other's peer: len 12 family 16 pad 0 pid 0 groups 0
+connect len 1 = -EINVAL
+connect AF_UNSPEC = 0
+connect family AF_INET = -EINVAL
+connect len 11 = -EINVAL
+connect to a user socket (not root) = -EPERM
+sendto a user socket (not root) = -EPERM
+sendto a group (not root) = -EPERM
+sendto len-11 address = -EINVAL
+ADD_MEMBERSHIP 0 = -EINVAL
+ADD_MEMBERSHIP 1000 = -EINVAL
+ADD_MEMBERSHIP IPV4_IFADDR = 0
+getsockname with two groups: len 12 family 16 pad 0 pid own groups 0x11
+LIST_MEMBERSHIPS = 0
+  length 8 word0 0x11
+LIST_MEMBERSHIPS into 2 bytes = 0
+  length 8
+DROP_MEMBERSHIP LINK = 0
+getsockname after the drop: len 12 family 16 pad 0 pid own groups 0x10
+PKTINFO: default 0, set 7 -> 0, now 1, off 0
+BROADCAST_ERROR: default 0, set 7 -> 0, now 1, off 0
+NO_ENOBUFS: default 0, set 7 -> 0, now 1, off 0
+CAP_ACK: default 0, set 7 -> 0, now 1, off 0
+EXT_ACK: default 0, set 7 -> 0, now 1, off 0
+GET_STRICT_CHK: default 0, set 7 -> 0, now 1, off 0
+setsockopt with optlen 2 (value read as 0) = 0
+getsockopt EXT_ACK into 2 bytes = -EINVAL
+getsockopt negative length = -EINVAL
+getsockopt option 99 = -ENOPROTOOPT
+setsockopt option 99 = -ENOPROTOOPT
+getsockopt SOL_IP = -ENOPROTOOPT
+setsockopt SOL_IP = -ENOPROTOOPT
+setsockopt LISTEN_ALL_NSID (not root) = -EPERM
+ioctl(FIONREAD) = -ENOTTY
+shutdown = -EOPNOTSUPP
+listen = -EOPNOTSUPP
+accept = -EOPNOTSUPP
+socketpair(AF_NETLINK) = -EOPNOTSUPP
+send 0 bytes = -ENODATA
+send MSG_OOB = -EOPNOTSUPP
+recv MSG_OOB = -EOPNOTSUPP
+recv empty, non-blocking = -EAGAIN
+send a too large message = -EMSGSIZE
+=== abi-netlink msgs
+end: exit 0
+send GETLINK dump = 20
+send bound the socket (autobind): yes
+GETLINK dump: messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+at least one link: yes
+recvmsg into 16 bytes = 16, MSG_TRUNC yes
+the dump still ends with DONE: yes
+MSG_PEEK then MSG_TRUNC into 8 bytes give the same length: yes
+GETLINK without NLM_F_REQUEST: -EAGAIN
+GETLINK with only NLM_F_ACK: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+NOOP with NLM_F_ACK: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 1
+NOOP without NLM_F_ACK: -EAGAIN
+GETLINK dump without payload: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+type 0x7fff: 52 bytes
+  ERROR len 52 flags 0 seq-ok yes pid-ok yes error EOPNOTSUPP request-type 32767
+NEWLINK (not root): 52 bytes
+  ERROR len 52 flags 0 seq-ok yes pid-ok yes error EPERM request-type 16
+DELADDR without NLM_F_ACK (not root): 52 bytes
+  ERROR len 52 flags 0 seq-ok yes pid-ok yes error EPERM request-type 21
+send nlmsg_len 8 = 16
+answer to nlmsg_len 8: -EAGAIN
+send nlmsg_len 60 in 32 bytes = 32
+answer to nlmsg_len 60: -EAGAIN
+send 10 bytes = 10
+answer to 10 bytes: -EAGAIN
+send two requests = 52
+answer:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+answer: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+answer: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 1
+GETLINK index 9999: 52 bytes
+  ERROR len 52 flags 0 seq-ok yes pid-ok yes error ENODEV request-type 18
+GETLINK index 0 without a name: 52 bytes
+  ERROR len 52 flags 0 seq-ok yes pid-ok yes error EINVAL request-type 18
+GETLINK by name lo:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+GETLINK by name zz: 60 bytes
+  ERROR len 60 flags 0 seq-ok yes pid-ok yes error ENODEV request-type 18
+second dump: EBUSY: yes
+EBUSY right after the first datagram: yes
+first dump ends with DONE: yes
+NEWLINK with CAP_ACK: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error EPERM request-type 16
+recvmsg = 36 namelen 12 family 16 pid 0 groups 0 controllen 24 cmsg level 270 type 3 len 20 group 0
+recvmsg with SO_PASSCRED = 36 cmsg level 1 type 2 len 28 pid 0 uid 0 gid 0
+write a request = 20
+read its ack = 36
+after reading everything: poll 1 revents 0x4
+with an answer queued: poll 1 revents 0x5
+strict GETLINK with a 1-byte header: no messages, DONE error EINVAL alone yes flags 0x2, messages flags 0, seq ok, pid ok
+strict GETLINK with an index: no messages, DONE error EINVAL alone yes flags 0x2, messages flags 0, seq ok, pid ok
+strict GETLINK: messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+as many links as without strict checking: yes
+strict GETADDR AF_INET index 1: messages, DONE error 0 alone yes flags 0x22, messages flags 0x22, seq ok, pid ok
+  addresses: 1
+strict GETADDR index 9999: no messages, DONE error ENODEV alone yes flags 0x22, messages flags 0, seq ok, pid ok
+strict GETADDR with a prefix length: no messages, DONE error EINVAL alone yes flags 0x2, messages flags 0, seq ok, pid ok
+=== abi-netlink link
+end: exit 0
+lo: family 0 type 772 index 1 flags 0x10049 change 0
+  ADDRESS length 6 00:00:00:00:00:00
+  BROADCAST length 6 00:00:00:00:00:00
+  IFNAME lo
+  MTU 65536
+  QDISC noqueue
+  STATS length 96
+  TXQLEN 1000
+  MAP length 32 all zero yes
+  OPERSTATE 0
+  LINKMODE 0
+  STATS64 length 200
+  GROUP 0
+  PROMISCUITY 0
+  NUM_TX_QUEUES 1
+  NUM_RX_QUEUES 1
+  CARRIER 1
+  PROTO_DOWN 0
+  GSO_MAX_SEGS 65535
+  GSO_MAX_SIZE 65536
+  MIN_MTU 0
+  MAX_MTU 0
+  GRO_MAX_SIZE 65536
+  TSO_MAX_SIZE 524280
+  TSO_MAX_SEGS 65535
+  ALLMULTI 0
+  GSO_IPV4_MAX_SIZE 65536
+  GRO_IPV4_MAX_SIZE 65536
+GETLINK: messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+lo seen: yes
+every Ethernet link well-formed: yes
+GETLINK with family AF_INET: messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+same links for AF_INET: yes
+lo address: family 2 prefixlen 8 flags 0x80 scope 254 index 1
+  ADDRESS 127.0.0.1
+  LOCAL 127.0.0.1
+  LABEL lo
+  CACHEINFO preferred 0xffffffff valid 0xffffffff
+  FLAGS 0x80
+  ADDRESS before LOCAL: yes
+GETADDR AF_INET: messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+AF_INET dump: only AF_INET: yes
+every address on a dumped link: yes
+GETADDR AF_INET6 ends with DONE: yes
+AF_INET6 dump: no AF_INET: yes
+GETADDR AF_UNSPEC: messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+AF_UNSPEC dump has the AF_INET ones: yes
+GETADDR AF_PACKET (no such dump: all families): messages, DONE error 0 alone yes flags 0x2, messages flags 0x2, seq ok, pid ok
+=== abi-netlink ifaddrs
+end: exit 0
+getifaddrs = 0
+lo AF_PACKET: flags 0x10049 ifindex 1 hatype 772 halen 6 addr 000000000000 data yes
+lo AF_INET: flags 0x10049 addr 127.0.0.1 netmask 255.0.0.0 broadaddr set
+every entry has a name: yes
+lo AF_PACKET once: yes
+lo AF_INET once: yes
+if_nameindex first: 1 lo
+=== abi-netlink devbind
+end: exit 0
+SO_BINDTODEVICE get, not bound = 0
+  length 0
+SO_BINDTODEVICE nope = -ENODEV
+SO_BINDTODEVICE lo = 0
+SO_BINDTODEVICE get = 0
+  length 3 name lo byte3 0x55
+SO_BINDTODEVICE get into 15 bytes = -EINVAL
+SO_BINDTODEVICE lo, name without NUL (2 bytes) = -EPERM
+SO_BINDTODEVICE "" (unbind, not root, while bound) = -EPERM
+SO_BINDTODEVICE lo on AF_UNIX = 0
+SO_BINDTODEVICE length 0 (unbind, not root, while bound) = -EPERM
+SO_BINDTODEVICE lo on netlink = 0
+SO_BINDTOIFINDEX get, not bound = 0
+  value 0 length 4
+SO_BINDTOIFINDEX -1 = -EINVAL
+SO_BINDTOIFINDEX with 2 bytes = -EINVAL
+SO_BINDTOIFINDEX 99999 (no such interface) = 0
+SO_BINDTOIFINDEX get = 0
+  value 99999 length 4
+SO_BINDTODEVICE get while bound to 99999 = -ENODEV
+SO_BINDTOIFINDEX 1 (not root, while bound) = -EPERM
+SO_BINDTOIFINDEX 1 = 0
+SO_BINDTODEVICE get after SO_BINDTOIFINDEX 1 = 0
+  length 3 name lo
+=== abi-netlink hostile
+end: exit 0
+send a request and a broken one = 64
+answer:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+answer: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+answer: -EAGAIN
+nlmsg_len 0 = 32
+  answer: -EAGAIN
+nlmsg_len 0xf = 32
+  answer: -EAGAIN
+nlmsg_len 0xffffffff = 32
+  answer: -EAGAIN
+GETLINK with a 1-byte payload: 40 bytes
+  ERROR len 40 flags 0 seq-ok yes pid-ok yes error EINVAL request-type 18
+GETLINK lo, attribute longer than the message:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+  then: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+GETLINK lo, attribute shorter than its header:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+  then: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+GETLINK lo, attribute type 0:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+  then: 36 bytes
+  ERROR len 36 flags 0x100 seq-ok yes pid-ok yes error 0 request-type 18
+GETLINK by an empty IFLA_IFNAME: 56 bytes
+  ERROR len 56 flags 0 seq-ok yes pid-ok yes error ERANGE request-type 18
+GETADDR AF_INET6 2001:db8::1: 64 bytes
+  ERROR len 64 flags 0 seq-ok yes pid-ok yes error EADDRNOTAVAIL request-type 22
+GETADDR AF_INET6 IFA_LOCAL 2001:db8::1: 64 bytes
+  ERROR len 64 flags 0 seq-ok yes pid-ok yes error EADDRNOTAVAIL request-type 22
+GETADDR AF_INET6 without an address: 44 bytes
+  ERROR len 44 flags 0 seq-ok yes pid-ok yes error EINVAL request-type 22
+GETADDR AF_INET6 with a 4-byte address: 52 bytes
+  ERROR len 52 flags 0 seq-ok yes pid-ok yes error ERANGE request-type 22
+GETADDR AF_INET6 with a label and a prefix length: 72 bytes
+  ERROR len 72 flags 0 seq-ok yes pid-ok yes error EADDRNOTAVAIL request-type 22
+GETADDR AF_INET6 in namespace 5: 72 bytes
+  ERROR len 72 flags 0 seq-ok yes pid-ok yes error EINVAL request-type 22
+GETADDR AF_INET6 on interface 99999: 64 bytes
+  ERROR len 64 flags 0 seq-ok yes pid-ok yes error EADDRNOTAVAIL request-type 22
+GETADDR AF_INET6 with a 1-byte payload: 40 bytes
+  ERROR len 40 flags 0 seq-ok yes pid-ok yes error EINVAL request-type 22
+GETADDR AF_INET (dump only): 44 bytes
+  ERROR len 44 flags 0 seq-ok yes pid-ok yes error EOPNOTSUPP request-type 22
+GETADDR AF_UNSPEC (dump only): 44 bytes
+  ERROR len 44 flags 0 seq-ok yes pid-ok yes error EOPNOTSUPP request-type 22
+strict GETLINK lo, attribute longer than the message: ERROR error EINVAL text "bytes leftover after parsing attributes"
+strict GETADDR AF_INET6 with a 1-byte payload: ERROR error EINVAL text "ipv6: Invalid header for get address request"
+strict GETADDR AF_INET6 with a prefix length: ERROR error EINVAL text "ipv6: Invalid values in header for get address request"
+strict GETADDR AF_INET6 with a label: ERROR error EINVAL text "ipv6: Unsupported attribute in get address request"
+strict GETADDR AF_INET6 with a 4-byte address: ERROR error ERANGE text "Attribute failed policy validation"
+strict GETADDR AF_INET6 with attribute type 0: ERROR error EINVAL text "Unknown attribute type"
+strict GETADDR AF_INET6 with attribute type 40: ERROR error EINVAL text "Unknown attribute type"
+strict GETADDR AF_INET6 2001:db8::1: ERROR error EADDRNOTAVAIL text ""
+strict GETADDR AF_INET6 dump with a 1-byte payload: DONE error EINVAL text "ipv6: Invalid header for address dump request"
+strict GETADDR AF_INET6 dump with a prefix length: DONE error EINVAL text "ipv6: Invalid values in header for address dump request"
+strict GETLINK lo afterwards:
+  NEWLINK flags 0 seq-ok yes pid-ok yes index 1
+=== abi-netlink ioctl
+end: exit 0
+-- on udp
+SIOCGIFNAME -: name lo byte15 0 int 1
+SIOCGIFNAME -: -ENODEV
+SIOCGIFINDEX lo: name lo byte15 0 int 1
+SIOCGIFINDEX lo:7: name lo:7 byte15 0 int 1
+SIOCGIFINDEX nope: -ENODEV
+SIOCGIFFLAGS lo: name lo byte15 0 flags 0x49
+SIOCGIFMTU lo: name lo byte15 0 int 65536
+SIOCGIFMETRIC lo: name lo byte15 0 int 0
+SIOCGIFTXQLEN lo: name lo byte15 0 int 1000
+SIOCGIFHWADDR lo: name lo byte15 0 family 772 addr 000000000000 rest 0x55
+SIOCGIFHWADDR nope: -ENODEV
+SIOCGIFMAP lo: name lo byte15 0 map 0 0 0 0 0 0 tail 0x55
+SIOCGIFSLAVE lo: -EINVAL
+SIOCGIFSLAVE nope: -ENODEV
+SIOCGIFADDR lo: name lo byte15 0 family 2 port 0 addr 127.0.0.1 zero 0 tail 0x55
+SIOCGIFADDR lo:7: -EADDRNOTAVAIL
+SIOCGIFADDR nope: -ENODEV
+SIOCGIFNETMASK lo: name lo byte15 0 family 2 port 0 addr 255.0.0.0 zero 0 tail 0x55
+SIOCGIFBRDADDR lo: name lo byte15 0 family 2 port 0 addr 0.0.0.0 zero 0 tail 0x55
+SIOCGIFDSTADDR lo: name lo byte15 0 family 2 port 0 addr 127.0.0.1 zero 0 tail 0x55
+SIOCGIFPFLAGS lo: -EINVAL
+SIOCGIFMEM lo: -ENOTTY
+SIOCGIFINDEX 0123456789abcdefgh: -ENODEV
+SIOCSIFFLAGS lo: -EPERM
+SIOCSIFMTU lo: -EPERM
+SIOCSIFADDR lo: -EPERM
+SIOCSIFNAME lo: -EPERM
+SIOCSIFTXQLEN lo: -EPERM
+SIOCADDMULTI lo: -EPERM
+SIOCGMIIPHY lo: -EPERM
+SIOCWANDEV lo: -EOPNOTSUPP
+SIOCWANDEV nope: -ENODEV
+SIOCDEVPRIVATE lo: -EOPNOTSUPP
+SIOCDEVPRIVATE nope: -ENODEV
+SIOCBONDINFOQUERY lo: -EOPNOTSUPP
+SIOCRTMSG lo: -EINVAL
+SIOCGIFCOUNT lo: -ENOTTY
+0x89ff nope: -ENODEV
+SIOCGIFINDEX to a kernel address = -EFAULT
+SIOCGIFADDR to a kernel address = -EFAULT
+SIOCGIFMEM to a kernel address = -EFAULT
+SIOCGIFCONF to a kernel address = -EFAULT
+SIOCETHTOOL to a kernel address = -EFAULT
+0x8999 to a kernel address = -EFAULT
+0x89a9 to a kernel address = -EFAULT
+SIOCGIFCONF count = 0
+  multiple of 40: yes, at least one: yes
+SIOCGIFCONF = 0
+  same length as the count: yes
+  first: lo family 2 addr 127.0.0.1 byte14 0
+SIOCGIFCONF into 39 bytes = 0
+  ifc_len 0
+SIOCGIFCONF negative length = 0
+  ifc_len 0
+SIOCGIFCONF entries to a kernel address = -EFAULT
+SIOCETHTOOL GLINK lo = 0
+  data 1
+SIOCETHTOOL GLINK nope = -ENODEV
+SIOCETHTOOL lo, data at a kernel address = -EFAULT
+-- on unix
+SIOCGIFNAME -: name lo byte15 0 int 1
+SIOCGIFNAME -: -ENODEV
+SIOCGIFINDEX lo: name lo byte15 0 int 1
+SIOCGIFINDEX lo:7: name lo:7 byte15 0 int 1
+SIOCGIFINDEX nope: -ENODEV
+SIOCGIFFLAGS lo: name lo byte15 0 flags 0x49
+SIOCGIFMTU lo: name lo byte15 0 int 65536
+SIOCGIFMETRIC lo: name lo byte15 0 int 0
+SIOCGIFTXQLEN lo: name lo byte15 0 int 1000
+SIOCGIFHWADDR lo: name lo byte15 0 family 772 addr 000000000000 rest 0x55
+SIOCGIFHWADDR nope: -ENODEV
+SIOCGIFMAP lo: name lo byte15 0 map 0 0 0 0 0 0 tail 0x55
+SIOCGIFSLAVE lo: -EINVAL
+SIOCGIFSLAVE nope: -ENODEV
+SIOCGIFADDR lo: -ENOTTY
+SIOCGIFADDR lo:7: -ENOTTY
+SIOCGIFADDR nope: -ENOTTY
+SIOCGIFNETMASK lo: -ENOTTY
+SIOCGIFBRDADDR lo: -ENOTTY
+SIOCGIFDSTADDR lo: -ENOTTY
+SIOCGIFPFLAGS lo: -ENOTTY
+SIOCGIFMEM lo: -ENOTTY
+SIOCGIFINDEX 0123456789abcdefgh: -ENODEV
+SIOCSIFFLAGS lo: -EPERM
+SIOCSIFMTU lo: -EPERM
+SIOCSIFADDR lo: -ENOTTY
+SIOCSIFNAME lo: -EPERM
+SIOCSIFTXQLEN lo: -EPERM
+SIOCADDMULTI lo: -EPERM
+SIOCGMIIPHY lo: -EPERM
+SIOCWANDEV lo: -EOPNOTSUPP
+SIOCWANDEV nope: -ENODEV
+SIOCDEVPRIVATE lo: -EOPNOTSUPP
+SIOCDEVPRIVATE nope: -ENODEV
+SIOCBONDINFOQUERY lo: -EOPNOTSUPP
+SIOCRTMSG lo: -ENOTTY
+SIOCGIFCOUNT lo: -ENOTTY
+0x89ff nope: -ENODEV
+SIOCGIFINDEX to a kernel address = -EFAULT
+SIOCGIFADDR to a kernel address = -EFAULT
+SIOCGIFMEM to a kernel address = -EFAULT
+SIOCGIFCONF to a kernel address = -EFAULT
+SIOCETHTOOL to a kernel address = -EFAULT
+0x8999 to a kernel address = -EFAULT
+0x89a9 to a kernel address = -EFAULT
+SIOCGIFCONF count = 0
+  multiple of 40: yes, at least one: yes
+SIOCGIFCONF = 0
+  same length as the count: yes
+  first: lo family 2 addr 127.0.0.1 byte14 0
+SIOCGIFCONF into 39 bytes = 0
+  ifc_len 0
+SIOCGIFCONF negative length = 0
+  ifc_len 0
+SIOCGIFCONF entries to a kernel address = -EFAULT
+SIOCETHTOOL GLINK lo = 0
+  data 1
+SIOCETHTOOL GLINK nope = -ENODEV
+SIOCETHTOOL lo, data at a kernel address = -EFAULT
+-- on netlink
+SIOCGIFNAME -: name lo byte15 0 int 1
+SIOCGIFNAME -: -ENODEV
+SIOCGIFINDEX lo: name lo byte15 0 int 1
+SIOCGIFINDEX lo:7: name lo:7 byte15 0 int 1
+SIOCGIFINDEX nope: -ENODEV
+SIOCGIFFLAGS lo: name lo byte15 0 flags 0x49
+SIOCGIFMTU lo: name lo byte15 0 int 65536
+SIOCGIFMETRIC lo: name lo byte15 0 int 0
+SIOCGIFTXQLEN lo: name lo byte15 0 int 1000
+SIOCGIFHWADDR lo: name lo byte15 0 family 772 addr 000000000000 rest 0x55
+SIOCGIFHWADDR nope: -ENODEV
+SIOCGIFMAP lo: name lo byte15 0 map 0 0 0 0 0 0 tail 0x55
+SIOCGIFSLAVE lo: -EINVAL
+SIOCGIFSLAVE nope: -ENODEV
+SIOCGIFADDR lo: -ENOTTY
+SIOCGIFADDR lo:7: -ENOTTY
+SIOCGIFADDR nope: -ENOTTY
+SIOCGIFNETMASK lo: -ENOTTY
+SIOCGIFBRDADDR lo: -ENOTTY
+SIOCGIFDSTADDR lo: -ENOTTY
+SIOCGIFPFLAGS lo: -ENOTTY
+SIOCGIFMEM lo: -ENOTTY
+SIOCGIFINDEX 0123456789abcdefgh: -ENODEV
+SIOCSIFFLAGS lo: -EPERM
+SIOCSIFMTU lo: -EPERM
+SIOCSIFADDR lo: -ENOTTY
+SIOCSIFNAME lo: -EPERM
+SIOCSIFTXQLEN lo: -EPERM
+SIOCADDMULTI lo: -EPERM
+SIOCGMIIPHY lo: -EPERM
+SIOCWANDEV lo: -EOPNOTSUPP
+SIOCWANDEV nope: -ENODEV
+SIOCDEVPRIVATE lo: -EOPNOTSUPP
+SIOCDEVPRIVATE nope: -ENODEV
+SIOCBONDINFOQUERY lo: -EOPNOTSUPP
+SIOCRTMSG lo: -ENOTTY
+SIOCGIFCOUNT lo: -ENOTTY
+0x89ff nope: -ENODEV
+SIOCGIFINDEX to a kernel address = -EFAULT
+SIOCGIFADDR to a kernel address = -EFAULT
+SIOCGIFMEM to a kernel address = -EFAULT
+SIOCGIFCONF to a kernel address = -EFAULT
+SIOCETHTOOL to a kernel address = -EFAULT
+0x8999 to a kernel address = -EFAULT
+0x89a9 to a kernel address = -EFAULT
+SIOCGIFCONF count = 0
+  multiple of 40: yes, at least one: yes
+SIOCGIFCONF = 0
+  same length as the count: yes
+  first: lo family 2 addr 127.0.0.1 byte14 0
+SIOCGIFCONF into 39 bytes = 0
+  ifc_len 0
+SIOCGIFCONF negative length = 0
+  ifc_len 0
+SIOCGIFCONF entries to a kernel address = -EFAULT
+SIOCETHTOOL GLINK lo = 0
+  data 1
+SIOCETHTOOL GLINK nope = -ENODEV
+SIOCETHTOOL lo, data at a kernel address = -EFAULT
+-- on tcp
+SIOCGIFNAME -: name lo byte15 0 int 1
+SIOCGIFNAME -: -ENODEV
+SIOCGIFINDEX lo: name lo byte15 0 int 1
+SIOCGIFINDEX lo:7: name lo:7 byte15 0 int 1
+SIOCGIFINDEX nope: -ENODEV
+SIOCGIFFLAGS lo: name lo byte15 0 flags 0x49
+SIOCGIFMTU lo: name lo byte15 0 int 65536
+SIOCGIFMETRIC lo: name lo byte15 0 int 0
+SIOCGIFTXQLEN lo: name lo byte15 0 int 1000
+SIOCGIFHWADDR lo: name lo byte15 0 family 772 addr 000000000000 rest 0x55
+SIOCGIFHWADDR nope: -ENODEV
+SIOCGIFMAP lo: name lo byte15 0 map 0 0 0 0 0 0 tail 0x55
+SIOCGIFSLAVE lo: -EINVAL
+SIOCGIFSLAVE nope: -ENODEV
+SIOCGIFADDR lo: name lo byte15 0 family 2 port 0 addr 127.0.0.1 zero 0 tail 0x55
+SIOCGIFADDR lo:7: -EADDRNOTAVAIL
+SIOCGIFADDR nope: -ENODEV
+SIOCGIFNETMASK lo: name lo byte15 0 family 2 port 0 addr 255.0.0.0 zero 0 tail 0x55
+SIOCGIFBRDADDR lo: name lo byte15 0 family 2 port 0 addr 0.0.0.0 zero 0 tail 0x55
+SIOCGIFDSTADDR lo: name lo byte15 0 family 2 port 0 addr 127.0.0.1 zero 0 tail 0x55
+SIOCGIFPFLAGS lo: -EINVAL
+SIOCGIFMEM lo: -ENOTTY
+SIOCGIFINDEX 0123456789abcdefgh: -ENODEV
+SIOCSIFFLAGS lo: -EPERM
+SIOCSIFMTU lo: -EPERM
+SIOCSIFADDR lo: -EPERM
+SIOCSIFNAME lo: -EPERM
+SIOCSIFTXQLEN lo: -EPERM
+SIOCADDMULTI lo: -EPERM
+SIOCGMIIPHY lo: -EPERM
+SIOCWANDEV lo: -EOPNOTSUPP
+SIOCWANDEV nope: -ENODEV
+SIOCDEVPRIVATE lo: -EOPNOTSUPP
+SIOCDEVPRIVATE nope: -ENODEV
+SIOCBONDINFOQUERY lo: -EOPNOTSUPP
+SIOCRTMSG lo: -EINVAL
+SIOCGIFCOUNT lo: -ENOTTY
+0x89ff nope: -ENODEV
+SIOCGIFINDEX to a kernel address = -EFAULT
+SIOCGIFADDR to a kernel address = -EFAULT
+SIOCGIFMEM to a kernel address = -EFAULT
+SIOCGIFCONF to a kernel address = -EFAULT
+SIOCETHTOOL to a kernel address = -EFAULT
+0x8999 to a kernel address = -EFAULT
+0x89a9 to a kernel address = -EFAULT
+SIOCGIFCONF count = 0
+  multiple of 40: yes, at least one: yes
+SIOCGIFCONF = 0
+  same length as the count: yes
+  first: lo family 2 addr 127.0.0.1 byte14 0
+SIOCGIFCONF into 39 bytes = 0
+  ifc_len 0
+SIOCGIFCONF negative length = 0
+  ifc_len 0
+SIOCGIFCONF entries to a kernel address = -EFAULT
+SIOCETHTOOL GLINK lo = 0
+  data 1
+SIOCETHTOOL GLINK nope = -ENODEV
+SIOCETHTOOL lo, data at a kernel address = -EFAULT
+if_nametoindex(lo) = 1
+if_nametoindex(nope) = 0 errno ENODEV
+if_indextoname(1) = lo
+if_indextoname(9999) = NULL errno ENXIO

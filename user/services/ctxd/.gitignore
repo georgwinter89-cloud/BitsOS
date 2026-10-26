@@ -1,0 +1,2 @@
+# Downloads and builds never go into git (CX-1 notes list URLs and SHA256).
+/third_party/

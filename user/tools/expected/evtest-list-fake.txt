@@ -1,0 +1,3 @@
+Available devices:
+@D/event0:	(ENOTTY)
+@D/event1:	(ENOTTY)

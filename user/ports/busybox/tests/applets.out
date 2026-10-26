@@ -1,0 +1,11 @@
+applets listed
+BusyBox v1.36.1
+clean: hostname
+clean: dmesg
+clean: su
+clean: ipcs
+clean: cp
+hostname kept
+cp copied
+end
+exit 0

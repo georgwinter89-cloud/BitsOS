@@ -1,0 +1,165 @@
+# MM-5b ABI script 2: madvise, mremap, mincore and shared anonymous memory. Runs on CachyOS
+# (host/tests/mm/abi/mmops.c, output in linux-expected2.txt) and in the kernel (ktest mm.as.abi_diff2); not on the
+# pure model. Same words as mm-ops.txt; B = a free window, L = the last mmap/mremap result. Not here, because
+# Linux and V2 may differ without an ABI difference: contents after MADV_FREE (Linux frees lazily), mincore after
+# MADV_FREE, MADV_REMOVE on a writable shared mapping (V2: EOPNOTSUPP until the page cache punches holes),
+# MADV_COLLAPSE and anything that depends on transparent huge pages.
+
+# --- madvise argument checks
+madvise B+0x1 0x1000 dontneed
+madvise B 0x1000 99
+madvise B 0x1000 5
+madvise B 0 dontneed
+madvise B 0xfffffffffffff001 dontneed
+madvise B 0x1000 dontneed
+madvise B 0 hwpoison
+mmap B+0x10000 0x4000 rw private|anon|fixed
+madvise B+0x10000 0x1000 hwpoison
+madvise B+0x10000 0x1000 soft_offline
+
+# --- DONTNEED gives anonymous pages back: zero after, the commit stays
+store B+0x10000 0x11
+store B+0x11000 0x22
+store B+0x12000 0x33
+mincore B+0x10000 0x4000
+madvise B+0x11000 0x1000 dontneed
+mincore B+0x10000 0x4000
+load B+0x11000
+load B+0x10000
+load B+0x12000
+mincore B+0x10000 0x4000
+madvise B+0x10000 0x4000 dontneed
+mincore B+0x10000 0x4000
+load B+0x12000
+
+# --- holes: the mapped parts change, ENOMEM at the end
+store B+0x10000 0x55
+madvise B+0x10000 0x8000 dontneed
+load B+0x10000
+madvise B+0x8000 0x9000 dontneed
+madvise B+0x14000 0x1000 willneed
+
+# --- advice that only changes flags or is accepted
+madvise B+0x11000 0x1000 dontfork
+madvise B+0x11000 0x1000 wipeonfork
+maps
+madvise B+0x11000 0x1000 dofork
+madvise B+0x11000 0x1000 keeponfork
+madvise B+0x10000 0x4000 normal
+madvise B+0x10000 0x4000 random
+madvise B+0x10000 0x4000 sequential
+madvise B+0x10000 0x4000 willneed
+madvise B+0x10000 0x4000 cold
+madvise B+0x10000 0x4000 pageout
+madvise B+0x10000 0x4000 dontdump
+madvise B+0x10000 0x4000 dodump
+madvise B+0x10000 0x4000 hugepage
+madvise B+0x10000 0x4000 nohugepage
+madvise B+0x10000 0x4000 mergeable
+madvise B+0x10000 0x4000 unmergeable
+madvise B+0x10000 0x1000 remove
+store B+0x13000 0x77
+madvise B+0x13000 0x1000 free
+store B+0x13000 0x78
+load B+0x13000
+maps
+
+# --- POPULATE
+mmap B+0x18000 0x2000 none private|anon|fixed
+madvise B+0x18000 0x2000 populate_read
+mprotect B+0x18000 0x2000 r
+madvise B+0x18000 0x2000 populate_write
+madvise B+0x18000 0x2000 populate_read
+mincore B+0x18000 0x2000
+mmap B+0x1a000 0x3000 rw private|anon|fixed
+madvise B+0x1a000 0x3000 populate_write
+mincore B+0x1a000 0x3000
+load B+0x1b000
+munmap B+0x18000 0x5000
+
+# --- shared anonymous memory: an object behind the mapping
+mmap B+0x20000 0x2000 rw shared|anon|fixed
+madvise B+0x20000 0x1000 wipeonfork
+madvise B+0x20000 0x1000 free
+store B+0x20000 0x66
+madvise B+0x20000 0x1000 dontneed
+load B+0x20000
+mincore B+0x20000 0x2000
+mmap B+0x24000 0x1000 r shared|anon|fixed
+madvise B+0x24000 0x1000 remove
+mprotect B+0x24000 0x1000 rw
+maps
+
+# --- mincore checks
+mincore B+0x1 0x1000
+mincore B+0x30000 0x1000
+mincore B+0x10000 0
+mincore B+0x13000 0x3000
+mincore 0xffffffffffff0000 0x1000
+mincore 0x7ffffffff000 0x2000
+mmap B+0x28000 0x2000 none private|anon|fixed
+mincore B+0x28000 0x2000
+munmap B+0x28000 0x2000
+
+# --- mremap argument checks
+mremap B+0x10001 0x1000 0x2000 maymove 0
+mremap B+0x10000 0x1000 0x2000 8 0
+mremap B+0x10000 0x1000 0x2000 fixed 0
+mremap B+0x10000 0x1000 0x2000 dontunmap|maymove 0
+mremap B+0x10000 0x1000 0 maymove 0
+mremap B+0x30000 0x1000 0x2000 maymove 0
+mremap B+0x10000 0x8000 0x9000 maymove 0
+mremap B+0x10000 0 0x1000 maymove 0
+
+# --- grow in place, shrink, grow refused, move
+mmap B+0x40000 0x2000 rw private|anon|fixed
+store B+0x40000 0x77
+mremap B+0x40000 0x2000 0x4000 none 0
+maps
+load B+0x40000
+load B+0x43000
+mremap B+0x40000 0x4000 0x1000 none 0
+maps
+mmap B+0x41000 0x1000 r private|anon|fixed
+mremap B+0x40000 0x1000 0x3000 none 0
+mremap B+0x40000 0x1000 0x1000 none 0
+mremap B+0x40000 0x1000 0x3000 maymove 0
+load L
+load B+0x40000
+munmap L 0x3000
+munmap B+0x41000 0x1000
+
+# --- MREMAP_FIXED: replaces the target, overlap and low addresses refused
+mmap B+0x50000 0x2000 rw private|anon|fixed
+store B+0x50000 0x88
+store B+0x51000 0x99
+mmap B+0x60000 0x1000 r private|anon|fixed
+mremap B+0x50000 0x2000 0x2000 maymove|fixed B+0x60000
+maps
+load B+0x60000
+load B+0x61000
+load B+0x50000
+mremap B+0x60000 0x2000 0x2000 maymove|fixed B+0x61000
+mremap B+0x60000 0x1000 0x1000 maymove|fixed 0x1000
+mremap B+0x60000 0x2000 0x1000 maymove|fixed B+0x70000
+maps
+load B+0x70000
+
+# --- MREMAP_DONTUNMAP: the old range stays, empty
+mremap B+0x70000 0x1000 0x1000 maymove|dontunmap B+0x80000
+load B+0x80000
+load B+0x70000
+maps
+
+# --- mremap of shared anonymous memory: old length 0 duplicates it
+mremap B+0x20000 0 0x1000 maymove 0
+store B+0x20000 0x5a
+load L
+munmap L 0x1000
+mremap B+0x20000 0x2000 0x2000 maymove|fixed B+0x90000
+load B+0x90000
+maps
+
+# --- clean up
+munmap B 0x100000
+maps

@@ -1,0 +1,52 @@
+diff --git a/cobalt/BUILD.gn b/cobalt/BUILD.gn
+index 7649dcef6c..c8edc30cb9 100644
+--- a/cobalt/BUILD.gn
++++ b/cobalt/BUILD.gn
+@@ -14,6 +14,7 @@
+ 
+ import("//build/linux/strip_binary.gni")
+ import("//build/toolchain/toolchain.gni")
++import("//starboard/build/config/bitsos.gni")
+ import("//cobalt/build/locales.gni")
+ import("//cobalt/build/modular_executable.gni")
+ import("//testing/test.gni")
+@@ -268,6 +269,9 @@ source_set("common") {
+ 
+   if (is_starboard) {
+     sources += [ "app/cobalt_switch_defaults_starboard.cc" ]
++    if (cobalt_bitsos_canvas) {
++      defines = [ "COBALT_BITSOS_CANVAS" ]
++    }
+   } else if (is_ios && target_platform == "tvos") {
+     sources += [ "app/cobalt_switch_defaults_tvos.cc" ]
+   }
+diff --git a/cobalt/app/cobalt_switch_defaults_starboard.cc b/cobalt/app/cobalt_switch_defaults_starboard.cc
+index 9186f411d5..6d99553091 100644
+--- a/cobalt/app/cobalt_switch_defaults_starboard.cc
++++ b/cobalt/app/cobalt_switch_defaults_starboard.cc
+@@ -77,6 +77,13 @@ CommandLinePreprocessor::GetCobaltToggleSwitches() {
+       ::switches::kForceDarkMode,
+       // Hide scrollbars to avoid memory allocation.
+       ::switches::kHideScrollbars,
++#if defined(COBALT_BITSOS_CANVAS)
++      // BitsOS port: no GL. viz composites in software and presents through
++      // the dev.bitsos.Canvas Starboard extension.
++      ::switches::kDisableGpuCompositing,
++      // BitsOS port: TCP only for now (one UDP datagram per port there).
++      ::switches::kDisableQuic,
++#endif
+   };
+   return kCobaltToggleSwitches;
+ }
+@@ -98,7 +105,10 @@ CommandLinePreprocessor::GetCobaltParamSwitchDefaults() {
+        "ReclaimPrepaintTilesWhenIdle, "
+        "ReclaimOldPrepaintTiles"},
+   // Force some ozone settings.
+-#if BUILDFLAG(IS_OZONE)
++#if BUILDFLAG(IS_OZONE) && defined(COBALT_BITSOS_CANVAS)
++      // BitsOS port: no GL at all (software compositing).
++      {::switches::kUseGL, "disabled"},
++#elif BUILDFLAG(IS_OZONE)
+       {::switches::kUseGL, "angle"},
+       {::switches::kUseANGLE, "gles-egl"},
+ #endif

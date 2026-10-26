@@ -1,0 +1,4 @@
+# Known DIFF cases of `cargo xtask abi-diff` for FS-14's program (abi-memfd-lazy): "<case>: <owner>: <why>".
+# The probes of mode limit run on V2 in ktest fs.memfd.lazy.limit on a 64-page tmpfs the kernel mounts, compared
+# with CachyOS's answers in host/tests/fs/memfd-lazy-linux.txt.
+abi-memfd-lazy limit: FS: V2 has no unshare(CLONE_NEWUSER|CLONE_NEWNS) nor mount(2) before FS-11 (A6): the setup line differs

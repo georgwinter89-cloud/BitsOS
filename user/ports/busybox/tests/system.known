@@ -1,0 +1,2 @@
+# Lines of system.out that may be missing on V2: "<line>: <owner>: <why>".
+df: FS (vfs-sys): df finds the mount point in /proc/mounts, which V2 does not have (linux-6.6/fs/proc_namespace.c)

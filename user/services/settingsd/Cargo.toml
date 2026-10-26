@@ -1,0 +1,25 @@
+[package]
+name = "settingsd"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS settings registry (CL-1): typed keys, journal with undo, socket API"
+publish = false
+
+# A member of the user workspace (INT-W3). No crates.io dependencies on purpose: the user workspace has no
+# serde/toml. usys (UL's raw system calls) gives umask without unsafe here.
+
+[dependencies]
+usys = { path = "../../tools/usys" }
+# MC-6 client library (no dependencies of its own): registers the settings_* MCP tools (CL-2).
+mcpreg = { path = "../../lib/mcpreg" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "settingsd"
+path = "src/main.rs"
+
+[[bin]]
+name = "settings"
+path = "src/bin/settings.rs"

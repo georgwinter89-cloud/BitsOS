@@ -1,0 +1,12 @@
+[package]
+name = "time"
+version = "0.1.0"
+edition = "2024"
+description = "Clock (TSC calibrated against HPET/PM timer/PIT), per-CPU HrTimer queues on the LAPIC timer, RTC wall clock (owner: CP)"
+
+[dependencies]
+bootinfo = { path = "../bootinfo" }
+hal = { path = "../hal" }
+ksync = { path = "../ksync" }
+kreg = { path = "../kreg" }
+klog = { path = "../klog" }

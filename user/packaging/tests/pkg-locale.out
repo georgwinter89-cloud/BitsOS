@@ -1,0 +1,43 @@
+start: C
+setlocale(LC_ALL, "C") = C
+setlocale(LC_ALL, "POSIX") = C
+setlocale(LC_ALL, "C.UTF-8") = C.UTF-8
+setlocale(LC_ALL, "C.utf8") = C.utf8
+setlocale(LC_ALL, "en_US.UTF-8") = en_US.UTF-8
+setlocale(LC_ALL, "en_US.utf8") = en_US.utf8
+setlocale(LC_ALL, "de_DE.UTF-8") = de_DE.UTF-8
+setlocale(LC_ALL, "de_DE.utf8") = de_DE.utf8
+setlocale(LC_ALL, "de_DE") = (null)
+setlocale(LC_ALL, "en_US") = (null)
+setlocale(LC_ALL, "de_DE.ISO-8859-1") = (null)
+setlocale(LC_ALL, "xx_YY.UTF-8") = (null)
+C: codeset=ANSI_X3.4-1968 radix='.' thousep='' d_fmt='%m/%d/%y' t_fmt='%H:%M:%S' day1=Sunday mon3=Mar yes=^[yY]
+C: lconv dp='.' ts='' cur='' intcur='' mon_dp='' frac=127 p_cs_precedes=127
+C: strftime 'Monday Mon March Mar 03/02/26 14:05:09 Mon Mar  2 14:05:09 2026'
+C: printf '1234567.89' '9876543'
+C: mbstowcs=-1 towupper(u-umlaut)=0xfc iswalpha(sharp-s)=0
+C: strcoll(apfel-umlaut, birne) > 0
+C.UTF-8: codeset=UTF-8 radix='.' thousep='' d_fmt='%m/%d/%y' t_fmt='%H:%M:%S' day1=Sunday mon3=Mar yes=^[yY]
+C.UTF-8: lconv dp='.' ts='' cur='' intcur='' mon_dp='' frac=127 p_cs_precedes=127
+C.UTF-8: strftime 'Monday Mon March Mar 03/02/26 14:05:09 Mon Mar  2 14:05:09 2026'
+C.UTF-8: printf '1234567.89' '9876543'
+C.UTF-8: mbstowcs=5 towupper(u-umlaut)=0xdc iswalpha(sharp-s)=1
+C.UTF-8: strcoll(apfel-umlaut, birne) > 0
+en_US.UTF-8: codeset=UTF-8 radix='.' thousep=',' d_fmt='%m/%d/%Y' t_fmt='%r' day1=Sunday mon3=Mar yes=^[+1yY]
+en_US.UTF-8: lconv dp='.' ts=',' cur='$' intcur='USD ' mon_dp='.' frac=2 p_cs_precedes=1
+en_US.UTF-8: strftime 'Monday Mon March Mar 03/02/2026 02:05:09 PM Mon 02 Mar 2026 02:05:09 PM UTC'
+en_US.UTF-8: printf '1,234,567.89' '9,876,543'
+en_US.UTF-8: mbstowcs=5 towupper(u-umlaut)=0xdc iswalpha(sharp-s)=1
+en_US.UTF-8: strcoll(apfel-umlaut, birne) < 0
+de_DE.UTF-8: codeset=UTF-8 radix=',' thousep='.' d_fmt='%d.%m.%Y' t_fmt='%T' day1=Sonntag mon3=Mär yes=^[+1jJyY]
+de_DE.UTF-8: lconv dp=',' ts='.' cur='€' intcur='EUR ' mon_dp=',' frac=2 p_cs_precedes=0
+de_DE.UTF-8: strftime 'Montag Mo März Mär 02.03.2026 14:05:09 Mo 02 Mär 2026 14:05:09 UTC'
+de_DE.UTF-8: printf '1.234.567,89' '9.876.543'
+de_DE.UTF-8: mbstowcs=5 towupper(u-umlaut)=0xdc iswalpha(sharp-s)=1
+de_DE.UTF-8: strcoll(apfel-umlaut, birne) < 0
+mixed: LC_CTYPE=C;LC_NUMERIC=de_DE.UTF-8;LC_TIME=de_DE.UTF-8;LC_COLLATE=C;LC_MONETARY=C;LC_MESSAGES=C;LC_PAPER=C;LC_NAME=C;LC_ADDRESS=C;LC_TELEPHONE=C;LC_MEASUREMENT=C;LC_IDENTIFICATION=C
+newlocale de=ok bad=fail
+nl_langinfo_l: day2=Montag codeset=UTF-8
+uselocale: radix=',' global still 'C'
+uselocale back: radix='.'
+done

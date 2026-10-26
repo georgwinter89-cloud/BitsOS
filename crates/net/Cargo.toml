@@ -1,0 +1,32 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+description = "smoltcp glue, KSocket, sockets (owner: NW)"
+
+[dependencies]
+devmodel = { path = "../devmodel" }
+# NW-3b: the TSC for the stack's seed (random ephemeral start, RFC 6056).
+hal = { path = "../hal" }
+vfs = { path = "../vfs" }
+ksync = { path = "../ksync" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+policy = { path = "../policy" }
+uapi = { path = "../uapi" }
+# NW-3: the TCP/IP stack (0BSD, plan/spec/rust-ecosystem.md). Exact version, no std, no log. Reno is the
+# congestion control because Cubic needs f64 (no SSE in the kernel, R10). The neighbour cache is a cache (old
+# entries are evicted), not a limit on peers; 64 covers a home LAN without long linear scans.
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+  "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-icmp",
+  "socket-dhcpv4", "auto-icmp-echo-reply", "iface-neighbor-cache-count-64", "assembler-max-segment-count-8",
+  # NW-7: per-connection wakers (no dependency; `core::task::Waker` built safely from an `Arc` via `alloc::task::Wake`).
+  "async",
+] }
+
+# In-kernel tests only exist in the kernel build.
+[target.'cfg(target_os = "none")'.dependencies]
+ktest = { path = "../ktest" }
+mm-core = { path = "../mm-core" }

@@ -1,0 +1,31 @@
+[package]
+name = "kexec"
+version = "0.1.0"
+edition = "2024"
+description = "Reload (owner: RB)"
+
+[dependencies]
+acpi = { path = "../acpi" }
+bootinfo = { path = "../bootinfo" }
+# RB-9: the console commands system_list, system_pin, install_system (console does not depend on kexec).
+console = { path = "../console" }
+# RB-6: bitsboot's own checks and marker rule (its firmware-free library), so install_kernel judges a bundle as the
+# loader will at the next boot.
+bitsboot = { path = "../../boot/bitsboot" }
+hal = { path = "../hal" }
+devmodel = { path = "../devmodel" }
+fs-fat = { path = "../fs-fat" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ksync = { path = "../ksync" }
+ktest = { path = "../ktest" }
+mcp = { path = "../mcp" }
+mm-core = { path = "../mm-core" }
+net = { path = "../net" }
+pci = { path = "../pci" }
+# RB-quiesce: rb.quiesce.qemu_action runs platform::power::reboot/poweroff with work on every AP.
+platform = { path = "../platform" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+uapi = { path = "../uapi" }
+vfs = { path = "../vfs" }

@@ -1,0 +1,15 @@
+#!/bin/sh
+# PK-4: Brave from its package. BR's launcher (bitsos/brave, a copy of user/ports/brave-launcher/bitsos/brave)
+# with the tree = this package folder through `current` (a second start finds the running Brave by that path)
+# and the profile in the package's data folder /data/appdata/brave, which `bitspkg remove brave` takes along.
+# T absolute and through `current` however this was started (`sh bitsos/run`, a relative path, a PATH name).
+case $0 in */*) D=${0%/*} ;; *) D=. ;; esac
+T=$(cd "$D/.." && pwd) || exit 1
+DATA=${BRAVE_DATA:-/data}
+PD=$DATA/appdata/brave
+# bitspkg made the data folder (root's, 0700); Brave runs as uid 1000. Until bitsrun hands it over (PK-3):
+if [ "$(id -u)" = 0 ] && [ -d "$PD" ] && [ ! -L "$PD" ] && [ "$(stat -c %u "$PD")" = 0 ]; then
+  chown 1000:1000 "$PD" || { echo "brave: cannot give $PD to uid 1000"; exit 1; }
+fi
+# Without a data volume the launcher would pack the profile onto the stick: keep even that in the data folder.
+BRAVE_TREE=$T BRAVE_DATA=$DATA BRAVE_HOME=${BRAVE_HOME:-$PD/home} exec sh "$T/bitsos/brave" "$@"

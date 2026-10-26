@@ -1,0 +1,12 @@
+[package]
+name = "mcpreg"
+version = "0.1.0"
+edition = "2024"
+description = "MC-6: register MCP tools with the BitsOS kernel over /run/bitsos/mcp.sock (client library for Rust services) and mcp-fakesvc, the test service"
+publish = false
+
+[dependencies]
+
+[[bin]]
+name = "mcp-fakesvc"
+path = "src/bin/mcp-fakesvc.rs"

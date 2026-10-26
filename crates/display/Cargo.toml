@@ -1,0 +1,10 @@
+[package]
+name = "display"
+version = "0.1.0"
+edition = "2024"
+description = "RamFrame, fbdev, surfaces, compositor (owner: DP)"
+
+[dependencies]
+ksync = { path = "../ksync" }
+klog = { path = "../klog" }
+devmodel = { path = "../devmodel" }

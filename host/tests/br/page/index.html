@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>BR-1 loading</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; background: #f4f1ea; color: #222; }
+  .box { width: 80px; height: 80px; background: #c43; animation: spin 2s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  pre { background: #fff; padding: 8px; }
+  .tall { height: 3000px; background: linear-gradient(#f4f1ea, #8ab); }
+</style>
+</head>
+<body>
+<h1>BitsOS BR-1: Brave unter strace</h1>
+<p>Umlaute äöüß, Emoji 🎉🙂, CJK 漢字, Arabisch مرحبا.</p>
+<div class="box"></div>
+<canvas id="cv" width="320" height="120"></canvas>
+<pre id="log"></pre>
+<div class="tall"></div>
+<script>
+// Each check exercises one browser subsystem whose syscalls the trace should show (storage, worker threads,
+// WebAudio on ALSA, WebAssembly, fetch); the title tells the driver script when everything has run.
+const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+const results = {};
+async function run(name, f) {
+  try { await f(); results[name] = 'ok'; } catch (e) { results[name] = 'err ' + e; }
+  log(name + ': ' + results[name]);
+}
+(async () => {
+  await run('canvas', async () => {
+    const c = document.getElementById('cv').getContext('2d');
+    c.fillStyle = '#36a'; c.fillRect(10, 10, 300, 100); c.fillStyle = '#fff'; c.font = '24px sans-serif';
+    c.fillText('Canvas 2D', 20, 70);
+  });
+  await run('localStorage', async () => { localStorage.setItem('br1', 'x'.repeat(1000)); });
+  await run('indexedDB', () => new Promise((ok, bad) => {
+    const r = indexedDB.open('br1', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('s');
+    r.onerror = () => bad(r.error);
+    r.onsuccess = () => {
+      const tx = r.result.transaction('s', 'readwrite');
+      tx.objectStore('s').put(new Uint8Array(65536), 'blob');
+      tx.oncomplete = ok; tx.onerror = () => bad(tx.error);
+    };
+  }));
+  await run('cacheStorage', async () => {
+    if (!self.caches) throw 'no caches (needs a secure context)';
+    const c = await caches.open('br1'); await c.put('/x', new Response('x'));
+  });
+  await run('fetch', async () => { const j = await (await fetch('data.json')).json(); if (!j.ok) throw 'bad json'; });
+  await run('worker', () => new Promise((ok, bad) => {
+    const src = 'onmessage = (e) => { let s = 0; for (let i = 0; i < 1e6; i++) s += i; postMessage(s); }';
+    const w = new Worker(URL.createObjectURL(new Blob([src])));
+    w.onmessage = () => { w.terminate(); ok(); }; w.onerror = bad; w.postMessage(1);
+  }));
+  await run('wasm', async () => {
+    // (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+    const b = new Uint8Array([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,3,2,1,0,7,7,1,3,97,100,100,0,0,10,9,1,7,0,32,0,32,1,106,11]);
+    const { instance } = await WebAssembly.instantiate(b);
+    if (instance.exports.add(2, 3) !== 5) throw 'wrong sum';
+  });
+  await run('webaudio', async () => {
+    // Silent on purpose: the stream still runs through the audio output path (ALSA), but nothing is heard.
+    const ctx = new AudioContext();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    g.gain.value = 0; o.connect(g).connect(ctx.destination); o.start();
+    await new Promise((r) => setTimeout(r, 1500));
+    if (ctx.state !== 'running') throw 'state ' + ctx.state;
+  });
+  let y = 0;
+  const step = () => { y = (y + 4) % 2000; window.scrollTo(0, y); requestAnimationFrame(step); };
+  requestAnimationFrame(step);
+  const bad = Object.keys(results).filter((k) => results[k] !== 'ok');
+  document.title = 'BR-1 done ' + (bad.length ? 'fail=' + bad.join(',') : 'all-ok');
+})();
+</script>
+</body>
+</html>

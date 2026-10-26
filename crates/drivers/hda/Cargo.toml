@@ -1,0 +1,28 @@
+[package]
+name = "hda"
+version = "0.1.0"
+edition = "2024"
+description = "HD Audio (owner: SN)"
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+mm = { path = "../../mm" }
+hal = { path = "../../hal" }
+hdacodec = { path = "../../hdacodec" }
+# SN-5: the display side of HDMI audio goes through `amdgpu::dcn::DcnRegs` (GX).
+amdgpu = { path = "../amdgpu" }
+time = { path = "../../time" }
+sched = { path = "../../sched" }
+ktest = { path = "../../ktest" }
+
+[dev-dependencies]
+# SN-5: the display engine's register image for the HDMI glue's host tests (src/tests_hdmi.rs).
+hdacodec = { path = "../../hdacodec", features = ["fake"] }
+
+[features]
+# The register-level fake controller (src/fake.rs) for host tests of crates on top of hda (snd).
+fake = []

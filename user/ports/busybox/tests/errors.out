@@ -1,0 +1,16 @@
+sh: line 2: nosuchcmd: not found
+missing 127
+pipe 1
+cat: can't open '/nonexistent': No such file or directory
+cat 1
+ls: /nonexistent: No such file or directory
+ls 1
+sh: line 6: /: Permission denied
+dir 126
+term 143
+kill 137
+wrap 44
+or 3
+and 1
+end
+exit 7

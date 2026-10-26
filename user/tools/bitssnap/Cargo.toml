@@ -1,0 +1,22 @@
+[package]
+name = "bitssnap"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS snapshots of /data (VS-2, B1): scheduler with retention, list, file and folder restore, MCP tools snapshots/restore"
+publish = false
+
+# usys: renameat2 (RENAME_EXCHANGE) without unsafe here; settingsd: its JSON for the snap.* keys; mcpreg: the
+# MCP tools. No crate from outside the workspace.
+[dependencies]
+usys = { path = "../usys" }
+settingsd = { path = "../../services/settingsd" }
+mcpreg = { path = "../../lib/mcpreg" }
+# VS-3: a program's restore puts its package version back through bitspkg's own install (store, hooks).
+bitspkg = { path = "../bitspkg" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitssnap"
+path = "src/main.rs"

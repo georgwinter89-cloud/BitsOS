@@ -1,0 +1,22 @@
+[package]
+name = "proc"
+version = "0.1.0"
+edition = "2024"
+description = "Processes, ELF, signals (owner: AB)"
+
+[dependencies]
+mm = { path = "../mm" }
+vfs = { path = "../vfs" }
+sched = { path = "../sched" }
+block = { path = "../block" }
+hal = { path = "../hal" }
+uapi = { path = "../uapi" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+policy = { path = "../policy" }
+ksync = { path = "../ksync" }
+mm-core = { path = "../mm-core" }
+mcp = { path = "../mcp" }
+net = { path = "../net" }
+time = { path = "../time" }
+ktest = { path = "../ktest" }

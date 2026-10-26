@@ -1,0 +1,170 @@
+# FS-2 cases: /dev, /proc and /sys as a program (uid 1000) sees them, with what Linux answers (checked on CachyOS
+# by host/tests/fs/11-dev-cases-linux.sh). Same format and runners as cases.txt (fs-cases.c on CachyOS and V2,
+# vfs host test `dev_cases` without the lines that need a process: those name /proc/self or the token pid).
+# Extra commands: has DIR a,b,c (all names listed by getdents64; "pid" = the runner's own pid), rdev PATH
+# (major:minor), mode PATH (type:perm), nonzero FD N (bytes read, "zeros" if all were 0), self PATH (readlink
+# equals the own pid: "pid"), key FILE PREFIX (a line starts with it: yes/no), text FILE TEXT (substring:
+# yes/no), grep FILE PREFIX (that line, blanks collapsed, the own pid as "pid"), field FILE N (Nth blank-separated
+# field of the first line, the own pid as "pid"), lines FILE, fields FILE, cmdline (/proc/self/cmdline equals
+# argv: "argv").
+
+# --- the mounts
+mode /dev => dir:755
+mode /proc => dir:555
+mode /sys => dir:555
+has /dev null,zero,full,random,urandom,tty,console => yes
+
+# --- /dev/null
+mode /dev/null => chr:666
+rdev /dev/null => 1:3
+stat /dev/null => chr:666:1:0
+open /dev/null O_RDWR => fd:A
+read A 10 => ""
+write A "abc" => 3
+write A "" => 0
+lseek A 5 SEEK_SET => 0
+lseek A 0 SEEK_CUR => 0
+lseek A 0 SEEK_END => 0
+pread A 4 100 => ""
+pwrite A "x" 9 => 1
+fstat A => chr:666:1:0
+fsync A => EINVAL
+close A => 0
+open /dev/null O_RDONLY|O_DIRECTORY => ENOTDIR
+open /dev/null O_WRONLY|O_APPEND => fd:A
+write A "appended" => 8
+close A => 0
+open /dev/null O_RDONLY => fd:A
+write A "x" => EBADF
+close A => 0
+
+# --- /dev/zero
+rdev /dev/zero => 1:5
+mode /dev/zero => chr:666
+open /dev/zero O_RDWR => fd:A
+read A 4 => "\0\0\0\0"
+read A 0 => ""
+write A "abc" => 3
+lseek A 100 SEEK_SET => 0
+pread A 2 50 => "\0\0"
+fstat A => chr:666:1:0
+close A => 0
+
+# --- /dev/full
+rdev /dev/full => 1:7
+open /dev/full O_RDWR => fd:A
+write A "x" => ENOSPC
+read A 3 => "\0\0\0"
+lseek A 7 SEEK_SET => 0
+close A => 0
+
+# --- /dev/random, /dev/urandom
+rdev /dev/random => 1:8
+rdev /dev/urandom => 1:9
+mode /dev/urandom => chr:666
+mode /dev/random => chr:666
+open /dev/urandom O_RDWR => fd:A
+nonzero A 64 => 64
+nonzero A 4096 => 4096
+write A "more seed" => 9
+lseek A 0 SEEK_END => 0
+close A => 0
+open /dev/random O_RDONLY => fd:A
+nonzero A 32 => 32
+close A => 0
+open /dev/urandom O_RDONLY|O_NONBLOCK => fd:A
+nonzero A 16 => 16
+close A => 0
+
+# --- /dev/tty is a terminal device (its open needs a controlling terminal on Linux: not tested here)
+rdev /dev/tty => 5:0
+mode /dev/tty => chr:666
+rdev /dev/console => 5:1
+
+# --- names in /dev belong to root
+open /dev/fs-cases-new O_CREAT|O_WRONLY 0644 => EACCES
+unlink /dev/null => EACCES
+mkdir /dev/fs-cases-dir 0755 => EACCES
+# FS-3: mknod is a create like the others (devtmpfs for root only; proc has no new names; sysfs: may_create)
+mknod /dev/fs-cases-fifo S_IFIFO|0644 0 => EACCES
+mknod /proc/fs-cases-fifo S_IFIFO|0644 0 => ENOENT
+mknod /sys/fs-cases-fifo S_IFIFO|0644 0 => EACCES
+mknod /proc/meminfo S_IFIFO|0644 0 => EEXIST
+mknod /dev/null S_IFCHR|0666 0x103 => EEXIST
+text /proc/sys/fs/pipe-max-size 1048576 => yes
+text /proc/sys/fs/pipe-user-pages-soft 16384 => yes
+lines /proc/sys/fs/pipe-max-size => 1
+
+# --- /proc: files of the kernel
+has /proc self,meminfo,cpuinfo,uptime => yes
+mode /proc/meminfo => reg:444
+chmod /proc/meminfo 0444 => EPERM
+stat /proc/meminfo => reg:444:1:0
+key /proc/meminfo MemTotal: => yes
+key /proc/meminfo MemFree: => yes
+key /proc/meminfo MemAvailable: => yes
+key /proc/meminfo SwapTotal: => yes
+key /proc/cpuinfo processor => yes
+key /proc/cpuinfo vendor_id => yes
+key /proc/cpuinfo "model name" => yes
+key /proc/cpuinfo flags => yes
+text /proc/cpuinfo " avx2 " => yes
+lines /proc/uptime => 1
+fields /proc/uptime => 2
+open /proc/meminfo O_WRONLY => EACCES
+open /proc/meminfo O_RDONLY => fd:A
+read A 9 => "MemTotal:"
+lseek A 0 SEEK_SET => 0
+read A 9 => "MemTotal:"
+close A => 0
+open /proc/fs-cases-new O_CREAT|O_WRONLY 0644 => ENOENT
+mkdir /proc/fs-cases-dir 0755 => ENOENT
+unlink /proc/meminfo => EACCES
+rename /proc/meminfo /proc/fs-cases-x => ENOENT
+symlink /tmp /proc/fs-cases-link => ENOENT
+open /proc/no-such-file O_RDONLY => ENOENT
+open /proc/0 O_RDONLY => ENOENT
+
+# --- /proc: the own process
+mode /proc/self => lnk:777
+self /proc/self => pid
+has /proc pid => yes
+has /proc/self stat,status,cmdline,maps => yes
+mode /proc/self/stat => reg:444
+mode /proc/self/status => reg:444
+mode /proc/self/cmdline => reg:444
+mode /proc/self/maps => reg:444
+field /proc/self/stat 1 => pid
+field /proc/self/stat 2 => (fs-cases)
+field /proc/self/stat 3 => R
+grep /proc/self/status Name: => "Name: fs-cases"
+grep /proc/self/status State: => "State: R (running)"
+grep /proc/self/status Pid: => "Pid: pid"
+grep /proc/self/status Tgid: => "Tgid: pid"
+grep /proc/self/status Uid: => "Uid: 1000 1000 1000 1000"
+key /proc/self/status VmRSS: => yes
+cmdline => argv
+text /proc/self/maps [stack] => yes
+text /proc/self/maps " r-xp " => yes
+open /proc/self/stat O_WRONLY => EACCES
+unlink /proc/self/stat => EPERM
+rmdir /proc/self => EACCES
+mkdir /proc/self/fs-cases-dir 0755 => ENOENT
+open /proc/self/fs-cases-new O_CREAT|O_WRONLY 0644 => ENOENT
+# FS-1b: proc_setattr refuses a mode change under the process directory, also to its owner; chown -1 -1 passes
+chmod /proc/self/status 0400 => EPERM
+chmod /proc/self 0500 => EPERM
+chown /proc/self/status -1 -1 => 0
+
+# --- /sys: the PCI view
+has /sys bus,devices => yes
+has /sys/bus pci => yes
+has /sys/bus/pci devices,drivers => yes
+has /sys/bus/pci/devices 0000:00:00.0 => yes
+mode /sys/bus/pci/devices/0000:00:00.0 => lnk:777
+mode /sys/bus/pci/devices/0000:00:00.0/vendor => reg:444
+stat /sys/bus/pci/devices/0000:00:00.0/vendor => reg:444:1:4096
+key /sys/bus/pci/devices/0000:00:00.0/class 0x0600 => yes
+lines /sys/bus/pci/devices/0000:00:00.0/vendor => 1
+open /sys/fs-cases-new O_CREAT|O_WRONLY 0644 => EACCES
+mkdir /sys/fs-cases-dir 0755 => EACCES

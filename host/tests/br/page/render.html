@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>BR-3 loading</title>
+<style>
+  /* BR-3: a still page for the screen comparison (10-start.sh): no animation, no caret, no scrolling. The three
+     colour blocks are counted on the screen; text, canvas and SVG are compared with the host's picture. */
+  html, body { margin: 0; overflow: hidden; background: #f4f1ea; color: #222; font-family: sans-serif; }
+  h1 { margin: 16px 24px 8px; font-size: 28px; }
+  p { margin: 4px 24px; font-size: 18px; }
+  .row { display: flex; gap: 16px; margin: 16px 24px; }
+  .row div { flex: 1; height: 140px; }
+  #r { background: #cc4433; } #g { background: #33aa66; } #b { background: #3366cc; }
+  canvas, svg { margin: 0 24px; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1>BitsOS BR-3: Brave rendert diese Seite</h1>
+<p>Umlaute äöüß ÄÖÜ, Emoji 🎉🙂, CJK 漢字かな, Arabisch مرحبا بالعالم.</p>
+<p style="font-family: monospace">monospace 0123456789 {}[]()&lt;&gt; ~|@€</p>
+<div class="row"><div id="r"></div><div id="g"></div><div id="b"></div></div>
+<canvas id="cv" width="360" height="140"></canvas>
+<svg width="360" height="140" viewBox="0 0 360 140">
+  <rect x="10" y="10" width="120" height="120" rx="16" fill="#ffaa00"/>
+  <circle cx="220" cy="70" r="60" fill="none" stroke="#663399" stroke-width="12"/>
+  <path d="M290 130 L340 10 L350 130 Z" fill="#008899"/>
+</svg>
+<script>
+const cv = document.getElementById('cv').getContext('2d');
+const gr = cv.createLinearGradient(0, 0, 360, 0);
+gr.addColorStop(0, '#000000'); gr.addColorStop(1, '#ffffff');
+cv.fillStyle = gr; cv.fillRect(0, 0, 360, 70);
+cv.fillStyle = '#222222'; cv.font = '28px sans-serif'; cv.fillText('Canvas äöü 漢字', 8, 112);
+// The title tells the driver that fonts are loaded and two frames are drawn after it.
+document.fonts.ready.then(() => requestAnimationFrame(() => requestAnimationFrame(() => {
+  document.title = 'BR-3 render ready';
+})));
+</script>
+</body>
+</html>

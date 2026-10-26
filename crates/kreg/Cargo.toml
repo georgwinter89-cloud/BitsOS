@@ -1,0 +1,8 @@
+[package]
+name = "kreg"
+version = "0.1.0"
+edition = "2024"
+description = "Registries by linker section (distributed slices), init levels (owner: desk)"
+
+[dependencies]
+

@@ -1,0 +1,18 @@
+[package]
+name = "wyclient"
+version = "0.1.0"
+edition = "2024"
+description = "WY-1a: a small Wayland test client for bitscomp on V2 (pure Rust wayland-client, no libwayland)"
+publish = false
+
+# Same exact pins as bitscomp's lock (no new download); without wayland-client's `system` feature the client
+# speaks the protocol itself, so V2 needs no libwayland-client.
+[dependencies]
+wayland-client = "=0.31.15"
+# WY-11: staging + unstable for wp_cursor_shape_v1 (it names the tablet protocol); same crate, no download.
+wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"] }
+libc = "=0.2.191"
+
+[[bin]]
+name = "wyclient"
+path = "src/main.rs"

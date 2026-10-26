@@ -1,0 +1,11 @@
+[package]
+name = "klog"
+version = "0.1.0"
+edition = "2024"
+description = "Structured events (B6), log ring, sinks (owner: RB)"
+
+[dependencies]
+hal = { path = "../hal" }
+ksync = { path = "../ksync" }
+kreg = { path = "../kreg" }
+ktest = { path = "../ktest" }

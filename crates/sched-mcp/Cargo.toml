@@ -1,0 +1,14 @@
+[package]
+name = "sched-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP tools of the scheduler/sync lane: locks (owner: SC)"
+
+[dependencies]
+ksync = { path = "../ksync" }
+mcp = { path = "../mcp" }
+policy = { path = "../policy" }
+ktest = { path = "../ktest" }
+hal = { path = "../hal" }
+mm = { path = "../mm" }
+sched = { path = "../sched" }

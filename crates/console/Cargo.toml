@@ -1,0 +1,27 @@
+[package]
+name = "console"
+version = "0.1.0"
+edition = "2024"
+description = "Kernel VT, fonts, keymaps, line discipline, monitor command line, evdev sink (owner: IN)"
+
+[dependencies]
+display = { path = "../display" }
+devmodel = { path = "../devmodel" }
+ksync = { path = "../ksync" }
+# IN-4: B3 questions at evdev open and EVIOCGRAB.
+policy = { path = "../policy" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+time = { path = "../time" }
+vfs = { path = "../vfs" }
+uapi = { path = "../uapi" }
+hal = { path = "../hal" }
+sched = { path = "../sched" }
+ktest = { path = "../ktest" }
+acpi = { path = "../acpi" }
+# INT-A1: reboot/poweroff through CP-5's platform functions.
+platform = { path = "../platform" }
+mm-core = { path = "../mm-core" }
+net = { path = "../net" }
+# IN-3: the console font (named in plan/spec/rust-ecosystem.md §2.5). Only the sizes and ranges the console uses.
+noto-sans-mono-bitmap = { version = "=0.3.2", default-features = false, features = ["regular", "size_16", "size_24", "size_32", "unicode-basic-latin", "unicode-latin-1-supplement"] }

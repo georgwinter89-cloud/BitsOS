@@ -1,0 +1,10 @@
+# YT-4a: nplb passes on V2 in QEMU (10-nplb.sh filter), recorded 21.10.2026: 3,483 measured, minus 2 for tests that
+# turn into skips under load (names decide failures). Raise it when a fix lands (the scenario prints a note).
+# INT-W6: 3,486 measured after /etc/localtime became a link and readlink("") ENOENT (IsIANAFormat runs again).
+# INT-W7: 3,490 measured with SchedParam failing (FS-15 statvfs, NW-v6 AF_INET6 TryThemAll TCP/UDP pass), minus 2.
+# UL-6 (21.10.): 3,492 measured with LANG=de_DE.UTF-8 in nplb's environment (SbSystemGetLocaleIdTest.SunnyDay
+# passes) and the racy SchedParam passing; 3,491 without it, minus 2. The locale suites never needed glibc's files
+# (they passed before: the same 16 skips as Linux, ShouldSkipLocale).
+# INT-W8: 3,496 measured (AB-13's alarm clocks: 5 former self-skips pass; 3,526 ran, 28 skipped, 2 failed =
+# CrashpadConfigTest.VerifyUploadCert and the racy SchedParam), minus 2.
+3494

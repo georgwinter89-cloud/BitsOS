@@ -1,0 +1,1356 @@
+
+## calls of other programs (not counted above or below)
+   5148  /usr/bin/xdg-mime
+   2863  /usr/bin/grep
+   1248  /usr/bin/cut
+    897  /usr/bin/head
+    838  /usr/bin/xdg-settings
+    632  /usr/bin/xprop
+    284  /usr/bin/dbus-send
+    220  /usr/bin/uname
+     51  /usr/bin/xdg-mime <event>
+     12  /usr/bin/xdg-settings <event>
+
+## syscalls by count
+  57029  futex
+  31281  epoll_wait
+  19267  recvmsg
+  14550  read
+  12729  ppoll
+  11075  sendto
+  10183  write
+   7219  close
+   6686  openat
+   5412  fcntl
+   3446  mprotect
+   3184  statx
+   3169  gettid
+   3082  mmap
+   2975  access
+   2540  fstat
+   2065  sendmsg
+   1697  fstatfs
+   1686  ioctl
+   1387  lseek
+   1241  madvise
+   1179  stat
+   1053  pwrite64
+    905  getpid
+    890  newfstatat
+    853  readlink
+    726  rt_sigaction
+    713  poll
+    536  rt_sigprocmask
+    467  getrandom
+    389  getdents64
+    355  prctl
+    289  munmap
+    277  fdatasync
+    259  lstat
+    256  ftruncate
+    202  readlinkat
+    162  faccessat2
+    156  memfd_create
+    147  clock_gettime
+    134  set_robust_list
+    134  pread64
+    122  prlimit64
+    116  rseq
+    115  epoll_ctl
+    113  mkdir
+    110  clone3
+    108  setpriority
+     73  uname
+     68  dup
+     56  geteuid
+     45  eventfd2
+     45  socket
+     37  socketpair
+     37  rename
+     34  pkey_mprotect
+     33  setsockopt
+     31  epoll_create1
+     31  inotify_add_watch
+     28  connect
+     26  dup2
+     26  sched_yield
+     21  mremap
+     19  getuid
+     18  fallocate
+     17  exit
+     16  sigaltstack
+     16  creat
+     15  sched_getaffinity
+     15  recvfrom
+     13  getsockopt
+     13  statfs
+     12  clone
+     12  exit_group
+     12  getegid
+     12  getgid
+     11  wait4
+     11  getsockname
+     10  sched_setscheduler
+     10  pipe2
+      9  execve
+      9  unlink
+      8  brk
+      8  arch_prctl
+      8  set_tid_address
+      7  shutdown
+      6  flock
+      6  sched_setaffinity
+      6  bind
+      6  unlinkat
+      5  rt_sigreturn
+      4  symlink
+      4  capset
+      3  sysinfo
+      2  setsid
+      2  getresuid
+      2  getresgid
+      2  inotify_init
+      2  pkey_alloc
+      2  getrusage
+      2  getpriority
+      2  sched_get_priority_min
+      2  sched_get_priority_max
+      2  kill
+      1  landlock_create_ruleset
+      1  listen
+      1  sched_getparam
+      1  sched_getscheduler
+      1  clock_nanosleep
+
+## errors (syscall errno)
+   4334  futex EAGAIN
+   3456  recvmsg EAGAIN
+   3028  futex ETIMEDOUT
+    628  readlink EINVAL
+    476  openat ENOENT
+    457  stat ENOENT
+    327  access ENOENT
+     72  newfstatat ENOENT
+     72  prlimit64 EFAULT
+     60  futex ?
+     48  ioctl ENXIO
+     27  lstat ENOENT
+     23  ioctl ENOTTY
+     18  epoll_wait ?
+     17  exit ?
+     16  connect ENOENT
+     12  exit_group ?
+     11  recvfrom EAGAIN
+      8  mkdir EEXIST
+      8  ioctl EINVAL
+      8  ioctl ENOENT
+      7  memfd_create EINVAL
+      7  eventfd2 EINVAL
+      6  inotify_add_watch ENOENT
+      6  inotify_add_watch ENOTDIR
+      6  readlinkat ENOENT
+      6  faccessat2 ENOENT
+      6  ppoll ?
+      5  unlink ENOENT
+      5  madvise EINVAL
+      5  ioctl EOPNOTSUPP
+      5  recvmsg ECONNRESET
+      4  rt_sigaction EINVAL
+      3  write EACCES
+      3  readlink ENOENT
+      3  connect EINPROGRESS
+      3  read EAGAIN
+      3  rt_sigreturn EINTR
+      3  read ?
+      3  poll ?
+      2  setsockopt EOPNOTSUPP
+      2  setsockopt EPERM
+      2  sendto EPIPE
+      1  rename ENOENT
+      1  mkdir EACCES
+      1  futex EPERM
+      1  clock_nanosleep ?
+      1  fdatasync ?
+
+## ioctl request on fd -> outcome
+    681  FIONREAD                         on UNIX-STREAM                              -> ok
+    390  SNDRV_CTL_IOCTL_PCM_NEXT_DEVICE  on /dev/snd/controlC0<char 116              -> ok
+    226  SNDRV_CTL_IOCTL_CARD_INFO        on /dev/snd/controlC0<char 116              -> ok
+    120  SNDRV_CTL_IOCTL_PVERSION         on /dev/snd/controlC0<char 116              -> ok
+     64  DRM_IOCTL_AMDGPU_INFO or DRM_IOCTL_IVPU_SUBMIT on /dev/dri/renderD128<char 226             -> ok
+     48  SNDRV_CTL_IOCTL_PCM_INFO         on /dev/snd/controlC0<char 116              -> ENXIO
+     36  DRM_IOCTL_VERSION                on /dev/dri/renderD128<char 226             -> ok
+      8  DRM_IOCTL_AMDGPU_INFO or DRM_IOCTL_IVPU_SUBMIT on /dev/dri/renderD128<char 226             -> EINVAL
+      8  SNDRV_CTL_IOCTL_CARD_INFO        on /dev/snd/controlC1<char 116              -> ok
+      8  SNDRV_CTL_IOCTL_PCM_INFO         on /dev/snd/controlC0<char 116              -> ENOENT
+      8  SNDRV_CTL_IOCTL_PCM_INFO         on /dev/snd/controlC0<char 116              -> ok
+      8  SNDRV_CTL_IOCTL_ELEM_INFO        on /dev/snd/controlC0<char 116              -> ok
+      8  SNDRV_CTL_IOCTL_ELEM_READ        on /dev/snd/controlC0<char 116              -> ok
+      6  DRM_IOCTL_GET_CAP                on /dev/dri/renderD128<char 226             -> ok
+      6  SNDRV_CTL_IOCTL_CARD_INFO        on /dev/snd/controlC2<char 116              -> ok
+      6  SNDRV_CTL_IOCTL_CARD_INFO        on /dev/snd/controlC3<char 116              -> ok
+      4  _IOC                             on /dev/dri/renderD128<char 226             -> ok
+      4  SIOCGIWNAME                      on UDPv6                                    -> EOPNOTSUPP
+      4  SIOCETHTOOL                      on UDPv6                                    -> ok
+      3  SIOCGIFNAME                      on UDPv6                                    -> ok
+      2  DRM_IOCTL_SYNCOBJ_CREATE         on /dev/dri/renderD128<char 226             -> ok
+      2  DRM_IOCTL_AMDGPU_GEM_CREATE      on /dev/dri/renderD128<char 226             -> ok
+      2  DRM_IOCTL_GEM_CLOSE              on /dev/dri/renderD128<char 226             -> ok
+      2  DRM_IOCTL_SYNCOBJ_DESTROY        on /dev/dri/renderD128<char 226             -> ok
+      2  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/History             -> ENOTTY
+      2  SIOCGIFHWADDR                    on UDP                                      -> ok
+      2  SNDRV_CTL_IOCTL_PVERSION         on /dev/snd/controlC1<char 116              -> ok
+      2  SNDRV_CTL_IOCTL_PVERSION         on /dev/snd/controlC2<char 116              -> ok
+      2  SNDRV_CTL_IOCTL_PVERSION         on /dev/snd/controlC3<char 116              -> ok
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/segmentation_platform/ukm_db -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Web Data            -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/ServerCertificate   -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/declarative_performance_observer.db -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Affiliation Database -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Login Data          -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Login Data For Account -> ENOTTY
+      1  SIOCGIWESSID                     on UDP                                      -> EOPNOTSUPP
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Shared Dictionary/db -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Trust Tokens        -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Reporting and NEL   -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Favicons            -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Top Sites           -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Account Web Data    -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Cookies             -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/WebStorage/QuotaManager -> ENOTTY
+      1  TCGETS2                          on $OUT/brave.log                           -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/heavy_ad_intervention_opt_out.db -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Shortcuts           -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/Network Action Predictor -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/DIPS                -> ENOTTY
+      1  F2FS_IOC_GET_FEATURES            on $RUN/profile/Default/ads_service/database.sqlite -> ENOTTY
+
+## /proc paths
+    215  /proc/self/fd/N  [openat -> ok]
+    133  /proc/PID/task/TID/status  [openat -> ok]
+     30  /proc/self/exe  [readlink -> ok]
+     26  /proc/PID/stat  [openat -> ok]
+     25  /proc/PID/status  [openat -> ok]
+     13  /proc/self/cmdline  [openat -> ok]
+     12  /proc/PID/task  [openat -> ok]
+     11  /proc/stat  [openat -> ok]
+     10  /proc/self/stat  [openat -> ok]
+      9  /proc/PID/oom_score_adj  [access -> ok]
+      9  /proc/PID/oom_score_adj  [creat -> ok]
+      8  /proc/self/fd  [openat -> ok]
+      8  /proc/PID/clear_refs  [openat -> ok]
+      6  /proc/self/maps  [openat -> ok]
+      4  /proc  [readlink -> EINVAL]
+      4  /proc/self  [readlink -> ok]
+      4  /proc/PID  [readlink -> EINVAL]
+      4  /proc/PID/exe  [readlink -> ok]
+      4  /proc/sys/fs/inotify/max_user_watches  [openat -> ok]
+      4  /proc/self/status  [openat -> ok]
+      4  /proc/  [openat -> ok]
+      3  /proc/cpuinfo  [openat -> ok]
+      2  /proc/sys/kernel/yama/ptrace_scope  [lstat -> ok]
+      2  /proc/self/exe  [execve -> ok]
+      2  /proc/PID/statm  [openat -> ok]
+      2  /proc/self/task/TID/comm  [openat -> ok]
+      1  /proc/PID/comm  [openat -> ok]
+
+## /sys paths
+    100  /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq  [openat -> ok]
+     86  /sys/fs/cgroup/cpuset/chrome  [stat -> ENOENT]
+     86  /sys/fs/cgroup/schedtune/chrome  [stat -> ENOENT]
+     52  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0  [readlink -> EINVAL]
+     40  /sys/devices/system/cpu/cpuN/cpu_capacity  [openat -> ok]
+     26  /sys  [readlink -> EINVAL]
+     26  /sys/dev  [readlink -> EINVAL]
+     26  /sys/dev/char  [readlink -> EINVAL]
+     26  /sys/devices  [readlink -> EINVAL]
+     26  /sys/devices/pci0000:00  [readlink -> EINVAL]
+     26  /sys/devices/pci0000:00/0000:00:06.0  [readlink -> EINVAL]
+     26  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0  [readlink -> EINVAL]
+     26  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0  [readlink -> EINVAL]
+     26  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/drm  [readlink -> EINVAL]
+     20  /sys/fs/cgroup/cpuset/chrome/urgent  [stat -> ENOENT]
+     20  /sys/fs/cgroup/schedtune/chrome/urgent  [stat -> ENOENT]
+     16  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/uevent  [openat -> ok]
+     16  /sys/devices/pci0000:80/0000:80:14.0/usb3/subsystem  [readlinkat -> ok]
+     13  /sys/dev/char/226:1  [readlink -> ok]
+     13  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/drm/card1  [readlink -> EINVAL]
+     13  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/drm/card1/device  [readlink -> ok]
+     13  /sys/dev/char/226:128  [readlink -> ok]
+     13  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/drm/renderD128  [readlink -> EINVAL]
+     13  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/drm/renderD128/device  [readlink -> ok]
+     11  /sys/devices/system/cpu/possible  [openat -> ok]
+     10  /sys/dev/char/226:128/device/subsystem  [readlink -> ok]
+     10  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/vendor  [openat -> ok]
+     10  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/device  [openat -> ok]
+     10  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/subsystem_vendor  [openat -> ok]
+     10  /sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/subsystem_device  [openat -> ok]
+      9  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/subsystem  [readlinkat -> ok]
+      8  /sys/dev/char/226:1/device/subsystem  [readlink -> ok]
+      8  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/subsystem  [readlinkat -> ok]
+      7  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/subsystem  [readlinkat -> ok]
+      6  /sys/dev/char/226:1/device/drm  [stat -> ok]
+      6  /sys/dev/char/226:128/device/drm  [stat -> ok]
+      6  /sys/dev/char/226:128/device/vendor  [openat -> ok]
+      6  /sys/dev/char/226:128/device/device  [openat -> ok]
+      6  /sys/dev/char/226:128/device/drm  [newfstatat -> ok]
+      6  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.4/subsystem  [readlinkat -> ok]
+      5  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/subsystem  [readlinkat -> ok]
+      5  /sys/devices/pci0000:80/0000:80:14.0/usb4/subsystem  [readlinkat -> ok]
+      4  /sys/devices/system/cpu/online  [openat -> ok]
+      4  /sys/devices/system/cpu/present  [openat -> ok]
+      4  /sys/devices/pci0000:80/0000:80:14.0/subsystem  [readlinkat -> ok]
+      4  /sys/devices/pci0000:80/subsystem  [readlinkat -> ENOENT]
+      4  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-7/subsystem  [readlinkat -> ok]
+      4  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-14/subsystem  [readlinkat -> ok]
+      3  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-3/subsystem  [readlinkat -> ok]
+      3  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-13/subsystem  [readlinkat -> ok]
+      3  /sys/devices/pci0000:00/0000:00:0d.0/usb1/subsystem  [readlinkat -> ok]
+      3  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-9/subsystem  [readlinkat -> ok]
+      3  /sys/devices/pci0000:80/0000:80:14.0/usb4/4-8/subsystem  [readlinkat -> ok]
+      3  /sys/devices/pci0000:00/0000:00:0d.0/usb2/subsystem  [readlinkat -> ok]
+      2  /sys/dev/char/226:1/device/drm  [newfstatat -> ok]
+      2  /sys/devices/system/cpu/kernel_max  [openat -> ok]
+      2  /sys/class/dmi/id/product_name  [openat -> ok]
+      2  /sys/class/dmi/id/sys_vendor  [openat -> ok]
+      2  /sys/class/dmi/id/board_vendor  [openat -> ok]
+      2  /sys/class/dmi/id/bios_vendor  [openat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-3/3-3:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-7/3-7:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.4/3-10.4:1.1/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-13/3-13:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.6/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/3-10.3:1.4/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:00/0000:00:0d.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:00/subsystem  [readlinkat -> ENOENT]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.4/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-0:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/3-10.3:1.2/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.2/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-14/3-14:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/3-10.3:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-7/3-7:1.1/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb4/4-0:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.4/3-10.4:1.2/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-9/3-9:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb4/4-8/4-8:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.4/3-10.4:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/3-10.3:1.5/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.5/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:00/0000:00:0d.0/usb1/1-0:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/3-10.3:1.3/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.3/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-14/3-14:1.1/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/3-10.3:1.1/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/3-12.1:1.1/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:00/0000:00:0d.0/usb2/2-0:1.0/subsystem  [readlinkat -> ok]
+      2  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.4/3-10.4:1.3/subsystem  [readlinkat -> ok]
+      1  /sys/class/tty/tty0/active  [openat -> ok]
+      1  /sys/devices/virtual/dmi/id/sys_vendor  [openat -> ok]
+      1  /sys/devices/virtual/dmi/id/product_name  [openat -> ok]
+      1  /sys/bus  [openat -> ok]
+      1  /sys/bus/usb/devices/  [openat -> ok]
+      1  /sys/class  [openat -> ok]
+      1  /sys/devices/pci0000:00/0000:00:0d.0/usb1/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:00/0000:00:0d.0/usb2/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.3/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-10/3-10.4/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-12/3-12.1/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-13/descriptors  [openat -> ok]
+      1  /sys/bus/cpu/devices/cpuN/microcode/version  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-14/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-3/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-7/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb3/3-9/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb4/descriptors  [openat -> ok]
+      1  /sys/devices/pci0000:80/0000:80:14.0/usb4/4-8/descriptors  [openat -> ok]
+
+## /dev paths
+    234  /dev/snd/controlC0  [openat -> ok]
+     10  /dev/null  [openat -> ok]
+     10  /dev/disk/by-uuid/UUID  [stat -> ok]
+     10  /dev/disk/by-uuid/UUID  [readlink -> ok]
+      8  /dev/dri  [openat -> ok]
+      8  /dev/snd/controlC1  [openat -> ok]
+      6  /dev/dri/card1  [stat -> ok]
+      6  /dev/dri/renderD128  [stat -> ok]
+      6  /dev/urandom  [openat -> ok]
+      6  /dev/snd/controlC2  [openat -> ok]
+      6  /dev/snd/controlC3  [openat -> ok]
+      4  /dev/dri/renderD128  [openat -> ok]
+      4  /dev/dri/card1  [newfstatat -> ok]
+      4  /dev/dri/renderD128  [newfstatat -> ok]
+      2  /dev/dri/card128  [access -> ENOENT]
+      2  /dev/dri/renderD128  [access -> ok]
+      2  /dev/snd/controlC4  [openat -> ENOENT]
+      2  /dev/aloadC4  [openat -> ENOENT]
+      2  /dev/snd/controlC5  [openat -> ENOENT]
+      2  /dev/aloadC5  [openat -> ENOENT]
+      2  /dev/snd/controlC6  [openat -> ENOENT]
+      2  /dev/aloadC6  [openat -> ENOENT]
+      2  /dev/snd/controlC7  [openat -> ENOENT]
+      2  /dev/aloadC7  [openat -> ENOENT]
+      2  /dev/snd/controlC8  [openat -> ENOENT]
+      2  /dev/aloadC8  [openat -> ENOENT]
+      2  /dev/snd/controlC9  [openat -> ENOENT]
+      2  /dev/aloadC9  [openat -> ENOENT]
+      2  /dev/snd/controlC10  [openat -> ENOENT]
+      2  /dev/aloadC10  [openat -> ENOENT]
+      2  /dev/snd/controlC11  [openat -> ENOENT]
+      2  /dev/aloadC11  [openat -> ENOENT]
+      2  /dev/snd/controlC12  [openat -> ENOENT]
+      2  /dev/aloadC12  [openat -> ENOENT]
+      2  /dev/snd/controlC13  [openat -> ENOENT]
+      2  /dev/aloadC13  [openat -> ENOENT]
+      2  /dev/snd/controlC14  [openat -> ENOENT]
+      2  /dev/aloadC14  [openat -> ENOENT]
+      2  /dev/snd/controlC15  [openat -> ENOENT]
+      2  /dev/aloadC15  [openat -> ENOENT]
+      2  /dev/snd/controlC16  [openat -> ENOENT]
+      2  /dev/aloadC16  [openat -> ENOENT]
+      2  /dev/snd/controlC17  [openat -> ENOENT]
+      2  /dev/aloadC17  [openat -> ENOENT]
+      2  /dev/snd/controlC18  [openat -> ENOENT]
+      2  /dev/aloadC18  [openat -> ENOENT]
+      2  /dev/snd/controlC19  [openat -> ENOENT]
+      2  /dev/aloadC19  [openat -> ENOENT]
+      2  /dev/snd/controlC20  [openat -> ENOENT]
+      2  /dev/aloadC20  [openat -> ENOENT]
+      2  /dev/snd/controlC21  [openat -> ENOENT]
+      2  /dev/aloadC21  [openat -> ENOENT]
+      2  /dev/snd/controlC22  [openat -> ENOENT]
+      2  /dev/aloadC22  [openat -> ENOENT]
+      2  /dev/snd/controlC23  [openat -> ENOENT]
+      2  /dev/aloadC23  [openat -> ENOENT]
+      2  /dev/snd/controlC24  [openat -> ENOENT]
+      2  /dev/aloadC24  [openat -> ENOENT]
+      2  /dev/snd/controlC25  [openat -> ENOENT]
+      2  /dev/aloadC25  [openat -> ENOENT]
+      2  /dev/snd/controlC26  [openat -> ENOENT]
+      2  /dev/aloadC26  [openat -> ENOENT]
+      2  /dev/snd/controlC27  [openat -> ENOENT]
+      2  /dev/aloadC27  [openat -> ENOENT]
+      2  /dev/snd/controlC28  [openat -> ENOENT]
+      2  /dev/aloadC28  [openat -> ENOENT]
+      2  /dev/snd/controlC29  [openat -> ENOENT]
+      2  /dev/aloadC29  [openat -> ENOENT]
+      2  /dev/snd/controlC30  [openat -> ENOENT]
+      2  /dev/aloadC30  [openat -> ENOENT]
+      2  /dev/snd/controlC31  [openat -> ENOENT]
+      2  /dev/aloadC31  [openat -> ENOENT]
+      1  /dev/shm  [statfs -> ok]
+      1  /dev/disk/by-uuid  [openat -> ok]
+      1  /dev/shm/  [openat -> ok]
+
+## /etc paths
+    516  /etc/ld.so.cache  [newfstatat -> ok]
+      8  /etc/ld.so.cache  [openat -> ok]
+      8  /etc/ld.so.preload  [access -> ENOENT]
+      8  /etc/drirc  [openat -> ENOENT]
+      8  /etc  [inotify_add_watch -> ok]
+      6  /etc/gnutls/config  [newfstatat -> ok]
+      6  /etc/gnutls/config  [openat -> ok]
+      6  /etc/nsswitch.conf  [newfstatat -> ok]
+      6  /etc/passwd  [openat -> ok]
+      5  /etc/os-release  [openat -> ok]
+      5  /etc/opt/chrome/native-messaging-hosts  [stat -> ok]
+      5  /etc  [readlink -> EINVAL]
+      5  /etc/opt  [readlink -> EINVAL]
+      5  /etc/opt/chrome  [readlink -> EINVAL]
+      5  /etc/opt/chrome/native-messaging-hosts  [readlink -> EINVAL]
+      4  /etc/fonts/fonts.conf  [access -> ok]
+      4  /etc/fonts/conf.d  [access -> ok]
+      4  /etc/fonts/conf.d/10-hinting-slight.conf  [access -> ok]
+      4  /etc/fonts/conf.d/10-powerline-symbols.conf  [access -> ok]
+      4  /etc/fonts/conf.d/10-scale-bitmap-fonts.conf  [access -> ok]
+      4  /etc/fonts/conf.d/10-symbols.conf  [access -> ok]
+      4  /etc/fonts/conf.d/10-yes-antialias.conf  [access -> ok]
+      4  /etc/fonts/conf.d/11-lcdfilter-default.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-dejavu-lgc-sans-mono.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-dejavu-lgc-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-dejavu-lgc-serif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-dejavu-sans-mono.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-dejavu-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-dejavu-serif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/20-unhint-small-vera.conf  [access -> ok]
+      4  /etc/fonts/conf.d/30-metric-aliases.conf  [access -> ok]
+      4  /etc/fonts/conf.d/40-nonlatin.conf  [access -> ok]
+      4  /etc/fonts/conf.d/45-generic.conf  [access -> ok]
+      4  /etc/fonts/conf.d/45-latin.conf  [access -> ok]
+      4  /etc/fonts/conf.d/46-noto-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/46-noto-serif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/48-guessfamily.conf  [access -> ok]
+      4  /etc/fonts/conf.d/48-spacing.conf  [access -> ok]
+      4  /etc/fonts/conf.d/49-sansserif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/50-user.conf  [access -> ok]
+      4  /etc/fonts/conf.d/51-local.conf  [access -> ok]
+      4  /etc/fonts/local.conf  [access -> ENOENT]
+      4  /etc/fonts/conf.d/57-dejavu-sans-mono.conf  [access -> ok]
+      4  /etc/fonts/conf.d/57-dejavu-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/57-dejavu-serif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/58-dejavu-lgc-sans-mono.conf  [access -> ok]
+      4  /etc/fonts/conf.d/58-dejavu-lgc-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/58-dejavu-lgc-serif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/60-generic.conf  [access -> ok]
+      4  /etc/fonts/conf.d/60-latin.conf  [access -> ok]
+      4  /etc/fonts/conf.d/65-fonts-persian.conf  [access -> ok]
+      4  /etc/fonts/conf.d/65-nonlatin.conf  [access -> ok]
+      4  /etc/fonts/conf.d/66-noto-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/66-noto-serif.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-unifont.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-bookman.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-c059.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-dNl.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-fallback-backwards.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-fallback-generics.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-fallback-specifics.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-gothic.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-nimbus-mono-ps.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-nimbus-roman.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-nimbus-sans.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-p052.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-standard-symbols-ps.conf  [access -> ok]
+      4  /etc/fonts/conf.d/69-urw-z003.conf  [access -> ok]
+      4  /etc/fonts/conf.d/80-delicious.conf  [access -> ok]
+      4  /etc/fonts/conf.d/90-synthetic.conf  [access -> ok]
+      3  /etc/nsswitch.conf  [openat -> ok]
+      3  /etc/alsa/conf.d  [access -> ok]
+      3  /etc/alsa/conf.d  [newfstatat -> ok]
+      3  /etc/alsa/conf.d  [openat -> ok]
+      3  /etc/alsa/conf.d/10-rate-lav.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/10-samplerate.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/10-speexrate.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/50-arcam-av-ctl.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/50-jack.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/50-oss.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/50-pipewire.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/50-pulseaudio.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/60-a52-encoder.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/60-speex.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/60-upmix.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/60-vdownmix.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/98-usb-stream.conf  [openat -> ok]
+      3  /etc/alsa/conf.d/99-pipewire-default.conf  [openat -> ok]
+      3  /etc/asound.conf  [access -> ENOENT]
+      2  /etc/brave/policies/managed  [stat -> ENOENT]
+      2  /etc/brave/policies/recommended  [stat -> ENOENT]
+      2  /etc/brave  [inotify_add_watch -> ENOENT]
+      2  /etc/brave  [lstat -> ENOENT]
+      2  /etc/brave/policies  [inotify_add_watch -> ENOENT]
+      2  /etc/brave/policies  [lstat -> ENOENT]
+      2  /etc/fonts/fonts.conf  [readlink -> EINVAL]
+      2  /etc/fonts/fonts.conf  [openat -> ok]
+      2  /etc/fonts/conf.d  [readlink -> EINVAL]
+      2  /etc/fonts/conf.d  [openat -> ok]
+      2  /etc/fonts/conf.d/10-hinting-slight.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/10-powerline-symbols.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/10-scale-bitmap-fonts.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/10-symbols.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/10-yes-antialias.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/11-lcdfilter-default.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-dejavu-lgc-sans-mono.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-dejavu-lgc-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-dejavu-lgc-serif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-dejavu-sans-mono.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-dejavu-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-dejavu-serif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/20-unhint-small-vera.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/30-metric-aliases.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/40-nonlatin.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/45-generic.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/45-latin.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/46-noto-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/46-noto-serif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/48-guessfamily.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/48-spacing.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/49-sansserif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/50-user.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/51-local.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/57-dejavu-sans-mono.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/57-dejavu-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/57-dejavu-serif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/58-dejavu-lgc-sans-mono.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/58-dejavu-lgc-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/58-dejavu-lgc-serif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/60-generic.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/60-latin.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/65-fonts-persian.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/65-nonlatin.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/66-noto-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/66-noto-serif.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-unifont.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-bookman.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-c059.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-dNl.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-fallback-backwards.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-fallback-generics.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-fallback-specifics.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-gothic.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-nimbus-mono-ps.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-nimbus-roman.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-nimbus-sans.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-p052.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-standard-symbols-ps.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/69-urw-z003.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/80-delicious.conf  [readlink -> ok]
+      2  /etc/fonts/conf.d/90-synthetic.conf  [readlink -> ok]
+      2  /etc/fonts/70-no-bitmaps-except-emoji.conf  [access -> ENOENT]
+      2  /etc/resolv.conf  [inotify_add_watch -> ENOTDIR]
+      2  /etc/resolv.conf  [lstat -> ok]
+      2  /etc/nsswitch.conf  [inotify_add_watch -> ENOTDIR]
+      2  /etc/nsswitch.conf  [lstat -> ok]
+      2  /etc/hosts  [inotify_add_watch -> ENOTDIR]
+      2  /etc/hosts  [lstat -> ok]
+      2  /etc/resolv.conf  [newfstatat -> ok]
+      2  /etc/host.conf  [openat -> ok]
+      2  /etc/hosts  [access -> ok]
+      2  /etc/resolv.conf  [openat -> ok]
+      2  /etc/hosts  [stat -> ok]
+      2  /etc/hosts  [openat -> ok]
+      2  /etc/pipewire/client.conf  [access -> ENOENT]
+      2  /etc/pipewire/client.conf.d  [access -> ok]
+      2  /etc/pipewire/client.conf.d  [openat -> ok]
+      1  /etc/brave/policies/managed  [openat -> ENOENT]
+      1  /etc/brave/policies/recommended  [openat -> ENOENT]
+      1  /etc/brave/policies/managed  [inotify_add_watch -> ENOENT]
+      1  /etc/brave/policies/managed  [lstat -> ENOENT]
+      1  /etc/fonts/fonts.conf  [stat -> ok]
+      1  /etc/brave/policies/recommended  [inotify_add_watch -> ENOENT]
+      1  /etc/brave/policies/recommended  [lstat -> ENOENT]
+      1  /etc/fonts/conf.d  [stat -> ok]
+      1  /etc/fonts/fonts.conf  [newfstatat -> ok]
+      1  /etc/fonts/conf.d  [newfstatat -> ok]
+      1  /etc/dconf/profile/user  [openat -> ENOENT]
+      1  /etc/xkb  [newfstatat -> ENOENT]
+      1  /etc/gtk-3.0/settings.ini  [access -> ENOENT]
+      1  /etc/xdg/gtk-3.0/settings.ini  [access -> ENOENT]
+      1  /etc/pulse/client.conf  [openat -> ok]
+      1  /etc/pulse/client.conf.d  [openat -> ENOENT]
+
+## /run paths
+      2  /run/udev/control  [access -> ok]
+      1  /run/dconf/user/1000  [openat -> ENOENT]
+      1  /run/systemd/journal/socket  [access -> ok]
+
+## /proc and /sys opened for writing
+      8  /proc/PID/clear_refs O_WRONLY -> ok
+      2  /proc/self/task/TID/comm O_WRONLY|O_CLOEXEC -> ok
+
+## other paths (3 levels)
+   3184  (fd)  [statx -> ok]
+   2048  /usr/share/fonts/...  [access -> ok]
+    412  devices  [openat -> ok]
+    366  /  [openat -> ok]
+    366  sys  [openat -> ok]
+    332  pci0000:80  [openat -> ok]
+    324  0000:80:14.0  [openat -> ok]
+    308  /usr/share/fontconfig/...  [access -> ok]
+    293  usb3  [openat -> ok]
+    258  /usr/share/fontconfig/...  [openat -> ok]
+    208  /usr/share/drirc.d/...  [openat -> ok]
+    202  /usr/share/icons/...  [openat -> ok]
+    156  uevent  [faccessat2 -> ok]
+    156  uevent  [openat -> ok]
+    154  /usr/share/fontconfig/...  [readlink -> EINVAL]
+    138  ..  [openat -> ok]
+    129  /usr/share/fontconfig/...  [stat -> ok]
+    129  /usr/share/fontconfig/...  [newfstatat -> ok]
+     99  3-10  [openat -> ok]
+     91  /usr/share/alsa/...  [openat -> ok]
+     67  3-12  [openat -> ok]
+     66  /var/tmp/claude-v2/...  [lstat -> ok]
+     53  3-12.1  [openat -> ok]
+     50  /usr/share/fonts/...  [openat -> ok]
+     48  /usr/share/fonts/...  [openat -> ENOENT]
+     48  /usr/share/alsa/...  [newfstatat -> ok]
+     47  /usr/share/locale/...  [openat -> ENOENT]
+     47  3-10.3  [openat -> ok]
+     46  bus  [openat -> ok]
+     46  usb  [openat -> ok]
+     38  $RUN/profile/Default  [stat -> ok]
+     37  $RUN/profile  [stat -> ok]
+     35  3-10.4  [openat -> ok]
+     31  /usr/share/xkeyboard-config-2/...  [openat -> ok]
+     30  /var/tmp/claude-v2/...  [readlink -> EINVAL]
+     28  $RUN/profile/Default  [openat -> ok]
+     28  pci0000:00  [openat -> ok]
+     25  usb4  [openat -> ok]
+     24  /var/cache/fontconfig/...  [openat -> ok]
+     24  $RUN/home/.cache/fontconfig/HEX-le64.cache-12  [openat -> ENOENT]
+     24  $RUN/home/.fontconfig/HEX-le64.cache-12  [openat -> ENOENT]
+     24  0000:00:0d.0  [openat -> ok]
+     23  3-7  [openat -> ok]
+     23  3-14  [openat -> ok]
+     22  /var  [lstat -> ok]
+     22  /var/tmp  [lstat -> ok]
+     22  /var/tmp/claude-v2  [lstat -> ok]
+     22  $OUT  [lstat -> ok]
+     22  $RUN  [lstat -> ok]
+     22  $RUN/profile  [lstat -> ok]
+     21  $RUN/profile/Default  [lstat -> ok]
+     17  3-3  [openat -> ok]
+     17  3-13  [openat -> ok]
+     17  3-9  [openat -> ok]
+     14  /usr/lib/pipewire-0.3/...  [newfstatat -> ok]
+     14  /usr/lib/pipewire-0.3/...  [openat -> ok]
+     13  $RUN/profile/Default/Reporting and NEL-wal  [stat -> ENOENT]
+     12  /var/tmp/claude-v2/...  [newfstatat -> ok]
+     12  /usr/share/pixmaps/...  [openat -> ENOENT]
+     12  /usr/share/cursors/...  [openat -> ENOENT]
+     11  /usr/share/fonts/...  [stat -> ok]
+     11  /usr/share/fonts/...  [newfstatat -> ok]
+     11  $RUN/profile/Default/Shared Dictionary/db-wal  [stat -> ENOENT]
+     11  $RUN/profile/Default/Reporting and NEL-journal  [stat -> ok]
+     11  /var/lib/alsa/...  [access -> ENOENT]
+     11  usb1  [openat -> ok]
+     11  4-8  [openat -> ok]
+     11  usb2  [openat -> ok]
+     10  /var  [readlink -> EINVAL]
+     10  /var/tmp  [readlink -> EINVAL]
+     10  /var/tmp/claude-v2  [readlink -> EINVAL]
+     10  $OUT  [readlink -> EINVAL]
+     10  $RUN  [readlink -> EINVAL]
+     10  /usr/share/locale/...  [openat -> ok]
+     10  $RUN/profile/Default/Reporting and NEL  [stat -> ok]
+     10  $RUN/profile/Default/Cookies-wal  [stat -> ENOENT]
+      9  /  [inotify_add_watch -> ok]
+      9  /usr/share/icons/...  [openat -> ENOENT]
+      9  $RUN/profile/Default/Shared Dictionary/db-journal  [stat -> ok]
+      8  /usr/lib/libdl.so.2  [openat -> ok]
+      8  /usr/lib/libpthread.so.0  [openat -> ok]
+      8  /usr/lib/libm.so.6  [openat -> ok]
+      8  /usr/lib/libgcc_s.so.1  [openat -> ok]
+      8  /usr/lib/libc.so.6  [openat -> ok]
+      8  /usr/share/drirc.d  [openat -> ok]
+      8  $RUN/home/.drirc  [openat -> ENOENT]
+      8  $RUN/profile/Default/History  [stat -> ok]
+      8  $RUN/profile/Default/Service Worker/Database/CURRENT  [access -> ENOENT]
+      8  $RUN/profile/Default/Cookies  [stat -> ok]
+      8  $RUN/profile/Default/Cookies-journal  [stat -> ok]
+      8  /usr/share/alsa/...  [access -> ok]
+      8  bConfigurationValue  [openat -> ok]
+      8  busnum  [openat -> ok]
+      8  devnum  [openat -> ok]
+      7  $RUN/profile/First Run  [stat -> ENOENT]
+      7  /usr/local/share/...  [access -> ENOENT]
+      7  $RUN/profile/Default  [access -> ok]
+      7  $RUN/profile/Default/Local Storage/leveldb/MANIFEST-N  [stat -> ok]
+      7  $RUN/profile/Default/Session Storage/MANIFEST-N  [stat -> ok]
+      7  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb  [openat -> ok]
+      7  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb/MANIFEST-N  [stat -> ok]
+      7  manufacturer  [openat -> ok]
+      7  product  [openat -> ok]
+      6  /usr/lib/libglib-2.0.so.0  [openat -> ok]
+      6  /usr/lib/libgobject-2.0.so.0  [openat -> ok]
+      6  /usr/lib/libnspr4.so  [openat -> ok]
+      6  /usr/lib/libnss3.so  [openat -> ok]
+      6  /usr/lib/libnssutil3.so  [openat -> ok]
+      6  /usr/lib/libsmime3.so  [openat -> ok]
+      6  /usr/lib/libgio-2.0.so.0  [openat -> ok]
+      6  /usr/lib/libatk-1.0.so.0  [openat -> ok]
+      6  /usr/lib/libatk-bridge-2.0.so.0  [openat -> ok]
+      6  /usr/lib/libdbus-1.so.3  [openat -> ok]
+      6  /usr/lib/libcups.so.2  [openat -> ok]
+      6  /usr/lib/libexpat.so.1  [openat -> ok]
+      6  /usr/lib/libxcb.so.1  [openat -> ok]
+      6  /usr/lib/libxkbcommon.so.0  [openat -> ok]
+      6  /usr/lib/libasound.so.2  [openat -> ok]
+      6  /usr/lib/libgbm.so.1  [openat -> ok]
+      6  /usr/lib/libX11.so.6  [openat -> ok]
+      6  /usr/lib/libXext.so.6  [openat -> ok]
+      6  /usr/lib/libcairo.so.2  [openat -> ok]
+      6  /usr/lib/libpango-1.0.so.0  [openat -> ok]
+      6  /usr/lib/libudev.so.1  [openat -> ok]
+      6  /usr/lib/libXcomposite.so.1  [openat -> ok]
+      6  /usr/lib/libXdamage.so.1  [openat -> ok]
+      6  /usr/lib/libXfixes.so.3  [openat -> ok]
+      6  /usr/lib/libXrandr.so.2  [openat -> ok]
+      6  /usr/lib/libatspi.so.0  [openat -> ok]
+      6  /usr/lib/libpcre2-8.so.0  [openat -> ok]
+      6  /usr/lib/libffi.so.8  [openat -> ok]
+      6  /usr/lib/libplds4.so  [openat -> ok]
+      6  /usr/lib/libplc4.so  [openat -> ok]
+      6  /usr/lib/libgmodule-2.0.so.0  [openat -> ok]
+      6  /usr/lib/libz.so.1  [openat -> ok]
+      6  /usr/lib/libmount.so.1  [openat -> ok]
+      6  /usr/lib/libsystemd.so.0  [openat -> ok]
+      6  /usr/lib/libavahi-common.so.3  [openat -> ok]
+      6  /usr/lib/libavahi-client.so.3  [openat -> ok]
+      6  /usr/lib/libgnutls.so.30  [openat -> ok]
+      6  /usr/lib/libXau.so.6  [openat -> ok]
+      6  /usr/lib/libXdmcp.so.6  [openat -> ok]
+      6  /usr/lib/libdrm.so.2  [openat -> ok]
+      6  /usr/lib/libpng16.so.16  [openat -> ok]
+      6  /usr/lib/libfontconfig.so.1  [openat -> ok]
+      6  /usr/lib/libfreetype.so.6  [openat -> ok]
+      6  /usr/lib/libXrender.so.1  [openat -> ok]
+      6  /usr/lib/libxcb-render.so.0  [openat -> ok]
+      6  /usr/lib/libxcb-shm.so.0  [openat -> ok]
+      6  /usr/lib/libpixman-1.so.0  [openat -> ok]
+      6  /usr/lib/libfribidi.so.0  [openat -> ok]
+      6  /usr/lib/libthai.so.0  [openat -> ok]
+      6  /usr/lib/libharfbuzz.so.0  [openat -> ok]
+      6  /usr/lib/libXi.so.6  [openat -> ok]
+      6  /usr/lib/libblkid.so.1  [openat -> ok]
+      6  /usr/lib/libleancrypto.so.1.9  [openat -> ok]
+      6  /usr/lib/libp11-kit.so.0  [openat -> ok]
+      6  /usr/lib/libidn2.so.0  [openat -> ok]
+      6  /usr/lib/libunistring.so.5  [openat -> ok]
+      6  /usr/lib/libtasn1.so.6  [openat -> ok]
+      6  /usr/lib/libhogweed.so.7  [openat -> ok]
+      6  /usr/lib/libnettle.so.9  [openat -> ok]
+      6  /usr/lib/libgmp.so.10  [openat -> ok]
+      6  /usr/lib/libbz2.so.1.0  [openat -> ok]
+      6  /usr/lib/libbrotlidec.so.1  [openat -> ok]
+      6  /usr/lib/libdatrie.so.1  [openat -> ok]
+      6  /usr/lib/libgraphite2.so.3  [openat -> ok]
+      6  /usr/lib/libbrotlicommon.so.1  [openat -> ok]
+      6  /usr/lib/locale/...  [openat -> ok]
+      6  /opt  [readlink -> EINVAL]
+      6  /opt/brave-bin  [readlink -> EINVAL]
+      6  /opt/brave-bin/locales/...  [access -> ENOENT]
+      6  /opt/brave-bin/locales/...  [access -> ok]
+      6  $RUN/profile/WidevineCdm/latest-component-updated-widevine-cdm  [access -> ENOENT]
+      6  /usr/lib/gio/...  [newfstatat -> ok]
+      6  /usr/share/themes/...  [access -> ENOENT]
+      6  $RUN/profile/Default/Cache/Cache_Data  [stat -> ok]
+      6  $RUN/profile/Default/Local Storage/leveldb  [openat -> ok]
+      6  $RUN/profile/Default/Shared Dictionary/db  [stat -> ok]
+      6  $RUN/profile/Default/Session Storage  [openat -> ok]
+      6  $RUN/profile/Default/Local Storage/leveldb/LOG  [stat -> ok]
+      6  $RUN/profile/Default/Local Storage/leveldb/LOCK  [stat -> ok]
+      6  $RUN/profile/Default/Local Storage/leveldb/CURRENT  [stat -> ok]
+      6  $RUN/profile/Default/Session Storage/LOG  [stat -> ok]
+      6  $RUN/profile/Default/Session Storage/LOCK  [stat -> ok]
+      6  $RUN/profile/Default/Session Storage/CURRENT  [stat -> ok]
+      6  /usr/X11R6/lib/...  [openat -> ENOENT]
+      6  $RUN/profile/Default/File System  [stat -> ENOENT]
+      6  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb/LOG  [stat -> ok]
+      6  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb/LOCK  [stat -> ok]
+      6  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb/CURRENT  [stat -> ok]
+      6  uevent  [faccessat2 -> ENOENT]
+      5  /opt/brave-bin/icudtl.dat  [openat -> ok]
+      5  /usr/share/zoneinfo/...  [openat -> ok]
+      5  $RUN/profile  [readlink -> EINVAL]
+      5  /usr/lib/gconv/...  [openat -> ok]
+      5  $RUN/home  [readlink -> EINVAL]
+      5  $RUN/home/.config  [readlink -> EINVAL]
+      5  $RUN/home/.config/BraveSoftware  [readlink -> EINVAL]
+      5  $RUN/home/.config/BraveSoftware/Brave-Browser  [readlink -> EINVAL]
+      5  $RUN/home/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts  [readlink -> EINVAL]
+      5  /opt/brave-bin/locales  [stat -> ok]
+      5  /opt/brave-bin/chrome_100_percent.pak  [openat -> ok]
+      5  /opt/brave-bin/chrome_200_percent.pak  [openat -> ok]
+      5  /opt/brave-bin/locales/...  [openat -> ok]
+      5  /opt/brave-bin/resources.pak  [openat -> ok]
+      5  /opt/brave-bin/brave_resources.pak  [openat -> ok]
+      5  /opt/brave-bin/brave_100_percent.pak  [openat -> ok]
+      5  /opt/brave-bin/brave_200_percent.pak  [openat -> ok]
+      5  $RUN/profile/Default/Sync Data/LevelDB  [openat -> ok]
+      5  $RUN/profile/Default/Site Characteristics Database  [openat -> ok]
+      5  $RUN/profile/Default/BraveWallet/Brave Wallet Storage  [openat -> ok]
+      5  $RUN/profile/Default/Extension Rules  [openat -> ok]
+      5  $RUN/profile/Default/Sync Data/LevelDB/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/shared_proto_db/metadata  [stat -> ok]
+      5  $RUN/profile/Default/shared_proto_db/metadata  [openat -> ok]
+      5  $RUN/profile/Default/Site Characteristics Database/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/BraveWallet/Brave Wallet Storage/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/Extension Rules/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/Extension Scripts  [openat -> ok]
+      5  $RUN/profile/Default/shared_proto_db/metadata/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/shared_proto_db  [openat -> ok]
+      5  $RUN/profile/Default/Extension Scripts/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/shared_proto_db/MANIFEST-N  [stat -> ok]
+      5  $RUN/profile/Default/Extension State  [openat -> ok]
+      5  $RUN/profile/Default/Extension State/MANIFEST-N  [stat -> ok]
+      5  3-3:1.0  [openat -> ok]
+      5  3-7:1.0  [openat -> ok]
+      5  3-10.4:1.1  [openat -> ok]
+      5  3-13:1.0  [openat -> ok]
+      5  3-12.1:1.6  [openat -> ok]
+      5  3-10.3:1.4  [openat -> ok]
+      5  3-12.1:1.4  [openat -> ok]
+      5  3-0:1.0  [openat -> ok]
+      5  3-10.3:1.2  [openat -> ok]
+      5  3-12.1:1.2  [openat -> ok]
+      5  3-10:1.0  [openat -> ok]
+      5  3-14:1.0  [openat -> ok]
+      5  3-10.3:1.0  [openat -> ok]
+      5  3-12.1:1.0  [openat -> ok]
+      5  3-7:1.1  [openat -> ok]
+      5  4-0:1.0  [openat -> ok]
+      5  3-10.4:1.2  [openat -> ok]
+      5  3-9:1.0  [openat -> ok]
+      5  4-8:1.0  [openat -> ok]
+      5  3-10.4:1.0  [openat -> ok]
+      5  3-10.3:1.5  [openat -> ok]
+      5  3-12.1:1.5  [openat -> ok]
+      5  1-0:1.0  [openat -> ok]
+      5  3-10.3:1.3  [openat -> ok]
+      5  3-12.1:1.3  [openat -> ok]
+      5  3-14:1.1  [openat -> ok]
+      5  3-10.3:1.1  [openat -> ok]
+      5  3-12:1.0  [openat -> ok]
+      5  3-12.1:1.1  [openat -> ok]
+      5  2-0:1.0  [openat -> ok]
+      5  3-10.4:1.3  [openat -> ok]
+      5  serial  [openat -> ENOENT]
+      5  $RUN/profile/Default/GCM Store/Encryption  [openat -> ok]
+      5  $RUN/profile/Default/GCM Store/Encryption/MANIFEST-N  [stat -> ok]
+      4  /opt/brave-bin/brave  [execve -> ok]
+      4  $RUN/profile/Consent To Send Stats  [openat -> ENOENT]
+      4  /opt/brave-bin/brave  [readlink -> EINVAL]
+      4  /var  [newfstatat -> ok]
+      4  /var/tmp  [newfstatat -> ok]
+      4  /var/tmp/claude-v2  [newfstatat -> ok]
+      4  $OUT  [newfstatat -> ok]
+      4  $RUN  [newfstatat -> ok]
+      4  $RUN/home  [newfstatat -> ok]
+      4  $RUN/home/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts  [stat -> ok]
+      4  $RUN/home/.config/fontconfig/conf.d  [access -> ENOENT]
+      4  $RUN/home/.config/fontconfig/fonts.conf  [access -> ENOENT]
+      4  /usr/lib/tinysparql-3.0/...  [openat -> ENOENT]
+      4  $RUN/home//.local/share/icons/hicolor/cursors/  [openat -> ENOENT]
+      4  $RUN/home//.local/share/icons/hicolor//index.theme  [openat -> ENOENT]
+      4  $RUN/home//.icons/hicolor/cursors/  [openat -> ENOENT]
+      4  $RUN/home//.icons/hicolor//index.theme  [openat -> ENOENT]
+      4  $RUN/home//.cursors/hicolor/cursors/  [openat -> ENOENT]
+      4  $RUN/home//.cursors/hicolor//index.theme  [openat -> ENOENT]
+      4  $RUN/profile/Default/History-wal  [stat -> ENOENT]
+      4  $RUN/profile/Default/Sessions  [openat -> ok]
+      4  $RUN/profile/Default/Sync Data/LevelDB/LOG  [stat -> ok]
+      4  $RUN/profile/Default/Sync Data/LevelDB/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/Sync Data/LevelDB/CURRENT  [stat -> ok]
+      4  $RUN/profile/Default/Trust Tokens  [stat -> ok]
+      4  $RUN/profile/Default/Cache/Cache_Data/HEX  [openat -> ok]
+      4  $RUN/profile/Default/Reporting and NEL-journal  [openat -> ok]
+      4  $RUN/profile/Default/Site Characteristics Database/LOG  [stat -> ok]
+      4  $RUN/profile/Default/Site Characteristics Database/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/Site Characteristics Database/CURRENT  [stat -> ok]
+      4  $RUN/profile/Default/BraveWallet/Brave Wallet Storage/LOG  [stat -> ok]
+      4  $RUN/profile/Default/BraveWallet/Brave Wallet Storage/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/BraveWallet/Brave Wallet Storage/CURRENT  [stat -> ok]
+      4  $RUN/profile/Default/Extension Rules/LOG  [stat -> ok]
+      4  $RUN/profile/Default/Extension Rules/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/Extension Rules/CURRENT  [stat -> ok]
+      4  $RUN/profile/Default/Local Storage/leveldb/N.log  [stat -> ok]
+      4  $RUN/profile/Default/shared_proto_db/metadata/LOG  [stat -> ok]
+      4  $RUN/profile/Default/shared_proto_db/metadata/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/shared_proto_db/metadata/CURRENT  [stat -> ok]
+      4  $RUN/profile/Default/Session Storage/N.log  [stat -> ok]
+      4  $RUN/profile/Default/Extension Scripts/LOG  [stat -> ok]
+      4  $RUN/profile/Default/Extension Scripts/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/Extension Scripts/CURRENT  [stat -> ok]
+      4  /opt/brave-bin/resources/...  [access -> ENOENT]
+      4  $RUN/profile/Default/shared_proto_db/LOG  [stat -> ok]
+      4  $RUN/profile/Default/shared_proto_db/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/shared_proto_db/CURRENT  [stat -> ok]
+      4  /tmp/.org.chromium.Chromium.X  [openat -> ok]
+      4  $RUN/profile/Default/Extension State/LOG  [stat -> ok]
+      4  $RUN/profile/Default/Extension State/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/Extension State/CURRENT  [stat -> ok]
+      4  $RUN/profile/Default/WebStorage/QuotaManager  [stat -> ok]
+      4  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb  [stat -> ok]
+      4  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb/N.log  [stat -> ok]
+      4  $RUN/profile/Default/Service Worker/CacheStorage/HEX/a2d3ddfd-3191-42b0-abad-9d4b9e3b4c39  [stat -> ok]
+      4  /usr/lib/spa-0.2/...  [openat -> ok]
+      4  $RUN/profile/Default/DIPS  [stat -> ok]
+      4  $RUN/profile/Default/GCM Store/Encryption/LOG  [stat -> ok]
+      4  $RUN/profile/Default/GCM Store/Encryption/LOCK  [stat -> ok]
+      4  $RUN/profile/Default/GCM Store/Encryption/CURRENT  [stat -> ok]
+      3  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports  [stat -> ok]
+      3  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/settings.dat  [openat -> ok]
+      3  $RUN/home/.cache  [newfstatat -> ok]
+      3  $RUN/profile  [openat -> ok]
+      3  /opt/brave-bin/v8_context_snapshot.bin  [openat -> ok]
+      3  self/task/  [newfstatat -> ok]
+      3  $RUN/home/.local/share/fonts  [stat -> ENOENT]
+      3  /usr/local/share/...  [stat -> ENOENT]
+      3  $RUN/home/.fonts  [stat -> ENOENT]
+      3  /usr/lib/gio/...  [openat -> ok]
+      3  $RUN/home/.local/share/fonts  [newfstatat -> ENOENT]
+      3  /usr/local/share/...  [newfstatat -> ENOENT]
+      3  $RUN/home/.fonts  [newfstatat -> ENOENT]
+      3  $RUN/profile/segmentation_platform/ukm_db  [stat -> ok]
+      3  $RUN/profile/Default/Sync Data/LevelDB/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/ClientCertificates__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/declarative_performance_observer.db  [stat -> ok]
+      3  $RUN/profile/Default/Affiliation Database  [stat -> ok]
+      3  $RUN/profile/Default/Code Cache/js  [stat -> ok]
+      3  $RUN/profile/Default/Code Cache/wasm  [stat -> ok]
+      3  $RUN/profile/Default/Site Characteristics Database/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/Sessions_Encrypted  [newfstatat -> ENOENT]
+      3  $RUN/profile/Default/BraveWallet/Brave Wallet Storage/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/commerce_subscription_db__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/discount_infos_db__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/parcel_tracking_db__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/chrome_cart_db__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/discounts_db__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/PersistentOriginTrials__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/Extension Rules/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/Local Storage/leveldb/MANIFEST-N  [openat -> ok]
+      3  /opt/brave-bin/MEIPreload/...  [access -> ok]
+      3  $RUN/profile/Default/Shared Dictionary/cache  [stat -> ok]
+      3  $RUN/profile/Default/shared_proto_db/metadata/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/Session Storage/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/Extension Scripts/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/shared_proto_db/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/Cookies-journal  [openat -> ok]
+      3  $RUN/profile/Default/Extension State/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/WebStorage  [openat -> ok]
+      3  (fd)  [stat -> ENOENT]
+      3  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.blob  [stat -> ENOENT]
+      3  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.blob  [openat -> ENOENT]
+      3  $RUN/profile/Default/IndexedDB/http_127.0.0.1_31000.indexeddb.leveldb/MANIFEST-N  [openat -> ok]
+      3  /usr/etc/alsa/...  [access -> ENOENT]
+      3  /usr/etc/asound.conf  [access -> ENOENT]
+      3  $RUN/home/.asoundrc  [access -> ENOENT]
+      3  $RUN/home/.config/alsa/asoundrc  [access -> ENOENT]
+      3  $RUN/profile/Default/Network Action Predictor  [stat -> ok]
+      3  serial  [openat -> ok]
+      3  $RUN/profile/Default/AutofillStrikeDatabase__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/BudgetDatabase__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/GCM Store/Encryption/MANIFEST-N  [openat -> ok]
+      3  $RUN/profile/Default/Feature Engagement Tracker/AvailabilityDB__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/Feature Engagement Tracker/EventDB__tmp_for_rebuild  [access -> ENOENT]
+      3  $RUN/profile/Default/Download Service/EntryDB__tmp_for_rebuild  [access -> ENOENT]
+      2  /opt/brave-bin/chrome_crashpad_handler  [execve -> ok]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/new  [mkdir -> EEXIST]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/new  [stat -> ok]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/pending  [mkdir -> EEXIST]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/pending  [stat -> ok]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/completed  [mkdir -> EEXIST]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/completed  [stat -> ok]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/attachments  [mkdir -> EEXIST]
+      2  $RUN/home/.config/BraveSoftware/Brave-Browser/Crash Reports/attachments  [stat -> ok]
+      2  /usr/lib/gbm/...  [openat -> ENOENT]
+      2  /usr/lib/gbm/...  [openat -> ok]
+      2  /usr/lib/libgallium-26.2.4-arch3.1.so  [openat -> ok]
+      2  /usr/lib/libLLVM.so.23.1  [openat -> ok]
+      2  /usr/lib/libzstd.so.1  [openat -> ok]
+      2  /usr/lib/libSPIRV-Tools.so  [openat -> ok]
+      2  /usr/lib/libsensors.so.5  [openat -> ok]
+      2  /usr/lib/libxcb-randr.so.0  [openat -> ok]
+      2  /usr/lib/libxcb-sync.so.1  [openat -> ok]
+      2  /usr/lib/libxcb-present.so.0  [openat -> ok]
+      2  /usr/lib/libxshmfence.so.1  [openat -> ok]
+      2  /usr/lib/libxcb-xfixes.so.0  [openat -> ok]
+      2  /usr/lib/libxcb-dri3.so.0  [openat -> ok]
+
+## execve
+      4  /opt/brave-bin/brave -> ok
+      2  /opt/brave-bin/chrome_crashpad_handler -> ok
+      2  /proc/self/exe -> ok
+      1  /usr/bin/xdg-settings -> ok
+
+## socket / socketpair
+     23  socketpair(AF_UNIX, SOCK_STREAM, 0) -> ok
+     15  AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0 -> ok
+     13  AF_INET6, SOCK_DGRAM, IPPROTO_IP -> ok
+     12  socketpair(AF_UNIX, SOCK_SEQPACKET, 0) -> ok
+      4  AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0 -> ok
+      3  AF_INET, SOCK_DGRAM, IPPROTO_IP -> ok
+      3  AF_INET, SOCK_STREAM, IPPROTO_TCP -> ok
+      2  socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0) -> ok
+      2  AF_UNIX, SOCK_STREAM, 0 -> ok
+      2  AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT -> ok
+      2  AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE -> ok
+      1  AF_NETLINK, SOCK_RAW, NETLINK_ROUTE -> ok
+
+## connect
+     13  AF_UNIX sun_path="$RUN/xdg/no-bus" -> ENOENT
+      6  AF_INET6 sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:4860:4860::8888", &sin6_addr), sin6_scope_id=0 -> ok
+      3  AF_INET sin_port=htons(31000), sin_addr=inet_addr("127.0.0.1") -> EINPROGRESS
+      2  AF_UNIX sun_path="$RUN/xdg/wayland-br1-N" -> ok
+      2  AF_UNIX sun_path="$RUN/xdg/no-pipewire" -> ENOENT
+      1  AF_UNIX sun_path="/run/dbus/system_bus_socket" -> ok
+      1  AF_UNIX sun_path="$RUN/xdg/no-pulse" -> ENOENT
+
+## bind
+      3  AF_NETLINK nl_pid=0, nl_groups=0xN -> ok
+      2  AF_NETLINK nl_pid=0, nl_groups=N -> ok
+      1  AF_UNIX sun_path="/tmp/org.chromium.Chromium.HaJ8qq/SingletonSocket" -> ok
+
+## setsockopt / getsockopt
+     12  setsockopt SOL_SOCKET SO_PASSCRED -> ok
+      6  getsockopt SOL_SOCKET SO_ERROR -> ok
+      4  getsockopt SOL_SOCKET SO_RCVBUF -> ok
+      3  setsockopt SOL_TCP TCP_NODELAY -> ok
+      3  setsockopt SOL_SOCKET SO_KEEPALIVE -> ok
+      3  setsockopt SOL_TCP TCP_KEEPIDLE -> ok
+      3  setsockopt SOL_TCP TCP_KEEPINTVL -> ok
+      2  getsockopt SOL_SOCKET SO_PASSCRED -> ok
+      2  setsockopt SOL_TCP TCP_NODELAY -> EOPNOTSUPP
+      2  setsockopt SOL_SOCKET SO_RCVBUF -> ok
+      2  setsockopt SOL_SOCKET SO_RCVBUFFORCE -> EPERM
+      2  setsockopt SOL_SOCKET SO_ATTACH_FILTER -> ok
+      1  getsockopt SOL_SOCKET SO_PEERCRED -> ok
+      1  setsockopt SOL_SOCKET SO_PRIORITY -> ok
+
+## clone / clone3 flags
+    108  clone3 CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID -> ok
+     12  clone CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD -> ok
+      2  clone3 CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND -> ok
+
+## mmap prot/flags
+    532  prot=PROT_READ|PROT_WRITE flags=MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE fd=file -> ok
+    529  prot=PROT_READ flags=MAP_PRIVATE|MAP_DENYWRITE fd=file -> ok
+    527  prot=PROT_READ|PROT_EXEC flags=MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE fd=file -> ok
+    524  prot=PROT_READ flags=MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE fd=file -> ok
+    322  prot=PROT_READ|PROT_WRITE flags=MAP_SHARED fd=file -> ok
+    166  prot=PROT_READ flags=MAP_SHARED fd=file -> ok
+    138  prot=PROT_READ|PROT_WRITE flags=MAP_PRIVATE|MAP_ANONYMOUS fd=-1 -> ok
+     98  prot=PROT_READ|PROT_WRITE flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK fd=-1 -> ok
+     73  prot=PROT_READ|PROT_WRITE flags=MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS fd=-1 -> ok
+     57  prot=PROT_NONE flags=MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS fd=-1 -> ok
+     46  prot=PROT_READ flags=MAP_PRIVATE fd=file -> ok
+     41  prot=PROT_NONE flags=MAP_PRIVATE|MAP_ANONYMOUS fd=-1 -> ok
+     22  prot=PROT_NONE flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE fd=-1 -> ok
+      6  prot=PROT_READ|PROT_WRITE flags=MAP_DROPPABLE|MAP_ANONYMOUS fd=-1 -> ok
+      1  prot=PROT_READ|PROT_WRITE flags=MAP_SHARED|MAP_NORESERVE fd=file -> ok
+
+## mprotect prot
+   2814  mprotect PROT_READ|PROT_WRITE -> ok
+    625  mprotect PROT_READ -> ok
+     22  pkey_mprotect PROT_READ|PROT_WRITE -> ok
+      7  pkey_mprotect PROT_NONE -> ok
+      7  mprotect PROT_NONE -> ok
+      3  pkey_mprotect PROT_READ|PROT_WRITE|PROT_EXEC -> ok
+      2  pkey_mprotect PROT_READ -> ok
+
+## madvise / mremap ...
+   1094  madvise MADV_DONTNEED -> ok
+     96  madvise MADV_GUARD_INSTALL -> ok
+     39  madvise MADV_DODUMP -> ok
+     21  mremap MREMAP_MAYMOVE -> ok
+      5  madvise 0xffffffff /* MADV_??? */ -> EINVAL
+      5  madvise MADV_WIPEONFORK -> ok
+      2  madvise MADV_DONTDUMP -> ok
+
+## prctl options
+    125  PR_SET_VMA, PR_SET_VMA_ANON_NAME -> ok
+    113  PR_SET_NAME -> ok
+     99  PR_GET_NAME -> ok
+     14  PR_SET_PTRACER -> ok
+      4  PR_SET_NO_NEW_PRIVS -> ok
+
+## signals delivered
+      4  SIGCHLD CLD_EXITED
+      3  SIGTERM SI_USER
+      2  SIGCHLD CLD_KILLED
+
+## signals sent
+      2  kill SIGTERM -> ok
+
+## rt_sigaction installs
+     11  SIGTERM SIG_DFL SA_RESTORER
+     10  SIGHUP SIG_DFL SA_RESTORER
+     10  SIGINT SIG_DFL SA_RESTORER
+     10  SIGALRM SIG_DFL SA_RESTORER
+     10  SIGCHLD SIG_DFL SA_RESTORER
+      9  SIGRT_1 handler SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO
+      8  SIGPIPE SIG_IGN SA_RESTORER|SA_RESTART
+      8  SIGABRT handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGBUS handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGFPE handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGILL handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGQUIT handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGSEGV handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGTRAP handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGXCPU handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      8  SIGXFSZ handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      6  SIGQUIT SIG_DFL SA_RESTORER
+      6  SIGILL SIG_DFL SA_RESTORER
+      6  SIGABRT SIG_DFL SA_RESTORER
+      6  SIGFPE SIG_DFL SA_RESTORER
+      6  SIGSEGV SIG_DFL SA_RESTORER
+      6  SIGBUS SIG_DFL SA_RESTORER
+      6  SIGTRAP SIG_DFL SA_RESTORER
+      4  SIGQUIT SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGILL SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGTRAP SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGABRT SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGBUS SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGFPE SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGSEGV SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGPIPE SIG_DFL SA_RESTORER|SA_RESTART
+      4  SIGXCPU SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGXFSZ SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGSYS SIG_DFL SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      4  SIGRT_1 SIG_DFL SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO
+      3  SIGCHLD handler SA_RESTORER
+      2  SIGABRT handler SA_RESTORER|SA_SIGINFO
+      2  SIGBUS handler SA_RESTORER|SA_SIGINFO
+      2  SIGFPE handler SA_RESTORER|SA_SIGINFO
+      2  SIGILL handler SA_RESTORER|SA_SIGINFO
+      2  SIGQUIT handler SA_RESTORER|SA_SIGINFO
+      2  SIGSEGV handler SA_RESTORER|SA_SIGINFO
+      2  SIGSYS handler SA_RESTORER|SA_SIGINFO
+      2  SIGTRAP handler SA_RESTORER|SA_SIGINFO
+      2  SIGXCPU handler SA_RESTORER|SA_SIGINFO
+      2  SIGXFSZ handler SA_RESTORER|SA_SIGINFO
+      2  SIGALRM handler SA_RESTORER|SA_SIGINFO
+      2  SIGHUP handler SA_RESTORER|SA_SIGINFO
+      2  SIGINT handler SA_RESTORER|SA_SIGINFO
+      2  SIGPIPE handler SA_RESTORER|SA_SIGINFO
+      2  SIGPROF handler SA_RESTORER|SA_SIGINFO
+      2  SIGTERM handler SA_RESTORER|SA_SIGINFO
+      2  SIGUSR1 handler SA_RESTORER|SA_SIGINFO
+      2  SIGUSR2 handler SA_RESTORER|SA_SIGINFO
+      2  SIGVTALRM handler SA_RESTORER|SA_SIGINFO
+      2  SIGPWR handler SA_RESTORER|SA_SIGINFO
+      2  SIGSTKFLT handler SA_RESTORER|SA_SIGINFO
+      2  SIGIO handler SA_RESTORER|SA_SIGINFO
+      2  SIGSYS handler SA_RESTORER|SA_ONSTACK|SA_SIGINFO|
+      2  SIGTSTP SIG_DFL SA_RESTORER
+      1  SIGPIPE SIG_IGN SA_RESTORER
+      1  SIGTERM handler SA_RESTORER
+      1  SIGINT handler SA_RESTORER
+      1  SIGHUP handler SA_RESTORER
+      1  SIGTTIN SIG_DFL SA_RESTORER
+
+## fcntl
+   2073  F_GETFL -> ok
+   1375  F_SETFL, O_RDWR|O_NONBLOCK -> ok
+   1370  F_SETFL, O_RDWR -> ok
+    146  F_ADD_SEALS, F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW -> ok
+    124  F_SETLK, {l_type=F_RDLCK, l_whence=SEEK_SET, l_sta -> ok
+    120  F_SETLK, {l_type=F_UNLCK, l_whence=SEEK_SET, l_sta -> ok
+    119  F_SETLK, {l_type=F_WRLCK, l_whence=SEEK_SET, l_sta -> ok
+     45  F_SETFL, O_RDONLY|O_NONBLOCK -> ok
+     12  F_GETFD -> ok
+      6  F_DUPFD_CLOEXEC, 0 -> ok
+      4  F_DUPFD_CLOEXEC, 512 -> ok
+      4  F_SETFD, FD_CLOEXEC -> ok
+      4  F_DUPFD, 256 -> ok
+      3  F_DUPFD_CLOEXEC, 3 -> ok
+      2  F_SETFD, 0 -> ok
+      2  F_ADD_SEALS, F_SEAL_SEAL|F_SEAL_SHRINK -> ok
+      1  F_DUPFD_QUERY, 6</dev/dri/renderD128<char 226:128> -> ok
+      1  F_DUPFD_QUERY, 20</dev/dri/renderD128<char 226:128 -> ok
+      1  F_SETFL, O_WRONLY|O_NONBLOCK -> ok
+
+## prlimit64
+     72  RLIMIT_NPROC get -> EFAULT
+     14  RLIMIT_STACK get -> ok
+     13  RLIMIT_NOFILE get -> ok
+     12  RLIMIT_NICE get -> ok
+      6  RLIMIT_RTTIME set -> ok
+      2  RLIMIT_DATA get -> ok
+      2  RLIMIT_RTTIME get -> ok
+      1  RLIMIT_NPROC get -> ok
+
+## scheduling
+     44  setpriority(PRIO_PROCESS, 0, 0) -> ok
+     43  setpriority(PRIO_PROCESS, T, 0) -> ok
+     26  sched_yield() -> ok
+     10  setpriority(PRIO_PROCESS, 0, -8) -> ok
+      8  setpriority(PRIO_PROCESS, T, -8) -> ok
+      7  sched_getaffinity(T, 32, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19]) -> ok
+      6  sched_setaffinity(T, 128, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 2) -> ok
+      5  sched_getaffinity(T, 8, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19]) -> ok
+      3  sched_getaffinity(T, 128, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19]) -> ok
+      2  sched_setscheduler(T, SCHED_BATCH, {sched_priority=0}) -> ok
+      2  setpriority(PRIO_PROCESS, T, 19) -> ok
+      2  getpriority(PRIO_PROCESS, T) -> ok
+      2  sched_get_priority_min(SCHED_FIFO) -> ok
+      2  sched_get_priority_max(SCHED_FIFO) -> ok
+      2  sched_setscheduler(T, SCHED_FIFO, {sched_priority=83}) -> ok
+      2  sched_setscheduler(T, SCHED_OTHER, {sched_priority=0}) -> ok
+      2  sched_setscheduler(T, SCHED_RESET_ON_FORK|SCHED_OTHER, {sched_priority=0}) -> ok
+      2  sched_setscheduler(T, SCHED_RR, {sched_priority=8}) -> ok
+      1  setpriority(PRIO_PROCESS, T, 5) -> ok
+      1  sched_getparam(T, {sched_priority=0}) -> ok
+      1  sched_getscheduler(T) -> ok
+
+## futex ops
+  35902  FUTEX_WAKE_PRIVATE -> ok
+  12338  FUTEX_WAIT_BITSET_PRIVATE -> ok
+   3732  FUTEX_WAIT_PRIVATE -> EAGAIN
+   3026  FUTEX_WAIT_BITSET_PRIVATE -> ETIMEDOUT
+   1171  FUTEX_WAIT_PRIVATE -> ok
+    593  FUTEX_WAIT_BITSET_PRIVATE -> EAGAIN
+    175  FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME -> ok
+     51  FUTEX_WAIT_BITSET_PRIVATE -> ?
+     16  FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME -> ok
+      8  FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME -> EAGAIN
+      4  FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME -> ?
+      3  FUTEX_WAIT_PRIVATE -> ?
+      2  FUTEX_WAIT_BITSET -> ok
+      2  FUTEX_WAKE -> ok
+      2  FUTEX_WAIT_PRIVATE -> ETIMEDOUT
+      1  FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME -> EAGAIN
+      1  FUTEX_UNLOCK_PI_PRIVATE -> EPERM
+      1  FUTEX_WAKE_PRIVATE -> ?
+      1  FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME -> ?
+
+## memfd_create
+    146  "shared-memory-region", MFD_CLOEXEC|MFD_ALLOW_SEALING|MFD_NOEXEC_SEAL -> ok
+      7  "", MFD_CLOEXEC|MFD_ALLOW_SEALING|MFD_HUGETLB|MFD_NOEXEC_SEAL|MFD_EXEC|0x3ffffe0|63<<MFD_HUGE_SHIFT -> EINVAL
+      1  "wayland-cursor", MFD_CLOEXEC|MFD_ALLOW_SEALING|MFD_NOEXEC_SEAL -> ok
+      1  "wayland-cursor", MFD_CLOEXEC|MFD_ALLOW_SEALING -> ok
+      1  "pulseaudio", MFD_CLOEXEC|MFD_ALLOW_SEALING|MFD_NOEXEC_SEAL -> ok
+
+## statfs f_type
+   1649  fstatfs SYSFS_MAGIC -> ok
+     48  fstatfs BTRFS_SUPER_MAGIC -> ok
+     12  statfs BTRFS_SUPER_MAGIC -> ok
+      1  statfs TMPFS_MAGIC -> ok
+
+## other calls (args folded)
+    371  getrandom("…", 8, 0) -> ok
+    134  set_robust_list(ADDR, 24) -> ok
+    116  rseq({cpu_id_start=0, cpu_id=RSEQ_CPU_ID_UNINITIALIZED, rseq_cs=NULL, flags) -> ok
+     73  uname({sysname="…", nodename="…", ...}) -> ok
+     56  getrandom("…", 48, 0) -> ok
+     25  epoll_create1(0) -> ok
+     25  eventfd2(0, EFD_NONBLOCK) -> ok
+     17  getrandom("…", 32, 0) -> ok
+     11  eventfd2(0, EFD_CLOEXEC|EFD_NONBLOCK) -> ok
+      8  arch_prctl(ARCH_SET_FS, ADDR) -> ok
+      8  getrandom("…", 16, GRND_NONBLOCK) -> ok
+      8  getrandom("…", 8, GRND_NONBLOCK) -> ok
+      8  sigaltstack(NULL, {ss_sp=NULL, ss_flags=SS_DISABLE, ss_size=0}) -> ok
+      8  sigaltstack({ss_sp=ADDR, ss_flags=0, ss_size=N}, NULL) -> ok
+      8  fallocate(39</memfd:wayland-cursor>(deleted), 0, 0, N) -> ok
+      8  fallocate(90</memfd:wayland-cursor>(deleted), 0, 0, N) -> ok
+      7  eventfd2(0, EFD_SEMAPHORE|EFD_CLOEXEC|EFD_NONBLOCK|ADDR) -> EINVAL
+      6  epoll_create1(EPOLL_CLOEXEC) -> ok
+      5  getrandom("…", 1, GRND_NONBLOCK) -> ok
+      5  wait4(N, NULL, WNOHANG, NULL) -> ok
+      5  shutdown(N<UNIX-STREAM:[N->N]>, SHUT_RDWR) -> ok
+      4  wait4(N, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) -> ok
+      4  flock(5</var/tmp/claude-v2/br/target/br1/trace/run/home/.config/BraveSoftwar) -> ok
+      4  capset({version=_LINUX_CAPABILITY_VERSION_3, pid=0}, {effective=0, permitted=) -> ok
+      3  sysinfo({uptime=N, loads=[N, N, N], totalram=N, freeram=N, sharedram=N, buffer) -> ok
+      3  pipe2([22<pipe:[N]>, 23<pipe:[N]>], 0) -> ok
+      2  setsid() -> ok
+      2  getrandom("…", 16, 0) -> ok
+      2  inotify_init() -> ok
+      2  pkey_alloc(0, PKEY_UNRESTRICTED) -> ok
+      2  flock(41</var/tmp/claude-v2/br/target/br1/trace/run/home/.config/BraveSoftwa) -> ok
+      2  getrusage(RUSAGE_SELF, {ru_utime={tv_sec=0, tv_usec=N}, ru_stime={tv_sec=0, tv_u) -> ok
+      2  eventfd2(0, EFD_SEMAPHORE|EFD_CLOEXEC) -> ok
+      2  pipe2([N<pipe:[N]>, N<pipe:[N]>], 0) -> ok
+      2  wait4(N, ADDR, WNOHANG, NULL) -> ok
+      1  fallocate(8</var/tmp/claude-v2/br/target/br1/trace/run/home/.cache/mesa_shader_c) -> ok
+      1  fallocate(5</var/tmp/claude-v2/br/target/br1/trace/run/profile/BrowserMetrics/Br) -> ok
+      1  shutdown(6<UNIX:[N->N]>, SHUT_RD) -> ok
+      1  shutdown(7<UNIX:[N->N]>, SHUT_WR) -> ok
+      1  pipe2([8<pipe:[N]>, 9<pipe:[N]>], 0) -> ok
+      1  landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) -> ok
+      1  pipe2([13<pipe:[N]>, 14<pipe:[N]>], O_CLOEXEC) -> ok
+      1  listen(15<UNIX-STREAM:[N,"…"]>, 5) -> ok
+      1  pipe2([35<pipe:[N]>, 38<pipe:[N]>], 0) -> ok
+      1  pipe2([21<pipe:[N]>, 22<pipe:[N]>], 0) -> ok
+      1  pipe2([22<pipe:[N]>, 23<pipe:[N]>], O_CLOEXEC) -> ok
+
+## process ends
+     23  +++ killed by SIGTERM +++

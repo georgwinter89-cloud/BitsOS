@@ -1,0 +1,16 @@
+[package]
+name = "sched"
+version = "0.1.0"
+edition = "2024"
+description = "Threads, scheduling classes (B4), run queues (owner: SC)"
+
+[dependencies]
+hal = { path = "../hal" }
+ksync = { path = "../ksync" }
+mm-core = { path = "../mm-core" }
+klog = { path = "../klog" }
+time = { path = "../time" }
+acpi = { path = "../acpi" }
+ktest = { path = "../ktest" }
+kreg = { path = "../kreg" }
+uapi = { path = "../uapi" }

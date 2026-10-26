@@ -1,0 +1,22 @@
+#!/bin/sh
+# C++ compiler for BitsOS V2 programs: clang++ with libc++, libc++abi (inside libc++.a) and libunwind
+# from the musl sysroot built by ../build.sh. Same output kind as v2-cc (static-pie). V2_SYSROOT overrides.
+here=$(dirname "$(readlink -f "$0")")
+sysroot=${V2_SYSROOT:-$here/../out/sysroot}
+[ -f "$sysroot/usr/lib/libc++.a" ] || { echo "v2-c++: no sysroot at $sysroot (run user/sysroot/build.sh)" >&2; exit 1; }
+link=1
+for a in "$@"; do
+  case $a in
+    -c|-S|-E|-M|-MM|-fsyntax-only) link=0 ;;
+    -r) [ $link = 1 ] && link=r ;;  # partial link (ld -r): an object file, not a program
+    -shared) echo "v2-c++: -shared is not supported (V2 programs are static-pie only)" >&2; exit 1 ;;
+  esac
+done
+if [ $link = r ]; then
+  set -- -fuse-ld=lld "$@"
+elif [ $link = 1 ]; then
+  set -- -static-pie -fuse-ld=lld -rtlib=compiler-rt --unwindlib=libunwind -stdlib=libc++ "$@"
+fi
+# -nostdinc++ + explicit path: clang would otherwise prefer a host libc++ next to /usr/bin/clang.
+exec clang++ --target=x86_64-unknown-linux-musl --sysroot="$sysroot" --gcc-toolchain="$sysroot/usr" -fPIE \
+  -nostdinc++ -isystem "$sysroot/usr/include/c++/v1" "$@"

@@ -1,0 +1,126 @@
+wave C begin
+c.mkdir.scratch: = 0
+c.mkdir.again: -EEXIST
+c.mkdirat.sub: = 0
+c.mkdir.missing_parent: -ENOENT
+c.create.a: = 1
+c.create.b: = 1
+c.create.c: = 1
+c.getdents64.listing: ./4 ../4 a/8 b/8 c/8 sub/4
+c.getdents64.on_file: -ENOTDIR
+c.rename.a_to_d: = 0
+c.rename.missing: -ENOENT
+c.rename.over_existing: = 0
+c.rename.content_moved: a
+c.rename.dir_over_file: -ENOTDIR
+c.renameat.c_to_a: = 0
+c.renameat2.noreplace_existing: -EEXIST
+c.renameat2.exchange: = 0
+c.renameat2.exchanged_content: b
+c.link.b_to_e: = 0
+c.link.nlink: 2
+c.link.existing_target: -EEXIST
+c.link.directory: -EPERM
+c.symlink.f_to_b: = 0
+c.readlink.f: b
+c.readlink.not_a_link: -EINVAL
+c.lstat.f_type: symlink
+c.stat.f_follows: regular
+c.newfstatat.nofollow: symlink
+c.symlink.dangling: = 0
+c.stat.dangling: -ENOENT
+c.getdents64.listing_after: ./4 ../4 a/8 b/8 e/8 f/10 g/10 sub/4
+c.truncate.100: = 0
+c.truncate.size: 100
+c.truncate.negative: -EINVAL
+c.truncate.directory: -EISDIR
+c.ftruncate.5000: = 0
+c.ftruncate.size: 5000
+c.ftruncate.negative: -EINVAL
+c.pwrite64.at_4000: = 3
+c.pread64.at_3998: = 8
+c.pread64.content: [0, 0, 88, 89, 90]
+c.pread64.past_end: = 0
+c.pread64.negative_offset: -EINVAL
+c.lseek.unchanged_by_pread: = 0
+c.fsync: = 0
+c.fdatasync: = 0
+c.fchmod.600: = 0
+c.fchmod.mode: 600
+c.fchown.to_self: = 0
+c.fstatfs: ok
+c.chmod.644: = 0
+c.utimensat.set: = 0
+c.utimensat.mtime: (1234567890, 500)
+c.utimensat.bad_nsec: -EINVAL
+c.statfs.tmp_type: 0x1021994
+c.statfs.proc_type: 0x9fa0
+c.access.read: = 0
+c.access.exec_denied: -EACCES
+c.access.missing: -ENOENT
+c.faccessat.dir_search: = 0
+c.chdir.scratch: = 0
+c.getcwd.is_scratch: true
+c.getcwd.small_buffer: -ERANGE
+c.stat.relative: 5000
+c.chdir.file: -ENOTDIR
+c.fchdir.root: = 0
+c.getcwd.root: true
+c.rmdir.not_empty: -ENOTEMPTY
+c.unlinkat.removedir_not_empty: -ENOTEMPTY
+c.unlink.directory: -EISDIR
+c.rmdir.file: -ENOTDIR
+c.unlinkat.sub: = 0
+c.unlink.a: = 0
+c.unlink.b: = 0
+c.unlink.e: = 0
+c.unlink.f: = 0
+c.unlink.g: = 0
+c.rmdir.scratch: = 0
+c.dev_null.write: = 4
+c.dev_null.read: = 0
+c.dev_zero.read: 16 zero true
+c.dev_urandom.read: = 16
+c.dev_full.write: -ENOSPC
+c.proc_self.stat_pid: true
+c.proc_self.link_is_pid: true
+c.proc_self.exe_ends_abi_c: true
+c.proc_self.cmdline_nul_terminated: true
+c.proc.meminfo_first_line: true
+c.proc.cpuinfo_processor: true
+c.proc.uptime_two_numbers: true
+c.socket.tcp: ok
+c.setsockopt.reuseaddr: = 0
+c.getsockopt.reuseaddr: 1
+c.getsockopt.type: 1
+c.bind.loopback_any_port: = 0
+c.getsockname.loopback_port_set: [127, 0, 0, 1] true
+c.listen: = 0
+c.connect.loopback: = 0
+c.accept4.peer: [127, 0, 0, 1]
+c.getpeername.matches_client: true
+c.setsockopt.nodelay: = 0
+c.getsockopt.nodelay: true
+c.send.ping: = 4
+c.recv.ping: ping
+c.sendmsg.pong: = 4
+c.recvmsg.pong: pong
+c.recv.nothing_dontwait: -EAGAIN
+c.shutdown.write: = 0
+c.recv.after_peer_shutdown: = 0
+c.getsockopt.error: 0
+c.connect.refused: -ECONNREFUSED
+c.socket.bad_family: -EAFNOSUPPORT
+c.socket.bad_type: -EINVAL
+c.listen.not_a_socket: -ENOTSOCK
+c.bind.udp: = 0
+c.sendto.udp_self: = 5
+c.recvfrom.udp_self: hello [127, 0, 0, 1] same_port true
+c.recvfrom.udp_empty_dontwait: -EAGAIN
+c.socketpair.write: = 3
+c.socketpair.read: abc
+c.socketpair.back: = 2
+c.socketpair.read_back: = 2
+c.socketpair.peer_closed_read: = 0
+c.socketpair.inet_unsupported: -EOPNOTSUPP
+wave C end (124 checks)

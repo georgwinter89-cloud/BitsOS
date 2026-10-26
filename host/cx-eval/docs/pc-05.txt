@@ -1,0 +1,5 @@
+BIOS-Update Notizen
+Board-Version 1.12 -> 1.31 (neuer AGESA-Code für DDR5-Stabilität).
+USB-Stick FAT32, Datei umbenannt, Flashback-Taste hinten, 5 Minuten warten, nicht ausschalten.
+Danach EXPO im Setup aktivieren und Lüfterkurve auf "Silent" stellen.
+Secure Boot vorläufig aus lassen.

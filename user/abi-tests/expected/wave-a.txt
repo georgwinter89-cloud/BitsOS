@@ -1,0 +1,112 @@
+wave A begin
+a.getpid.positive: true
+a.gettid.equals_pid: true
+a.set_tid_address.returns_tid: true
+a.getuid.equals_geteuid: true
+a.getgid.equals_getegid: true
+a.uname.sysname: Linux
+a.uname.machine: x86_64
+a.uname.nodename_nonempty: true
+a.uname.release_starts_with_digit: true
+a.write.stdout_line_length: = length
+a.writev.three_parts: = length
+a.write.bad_fd: -EBADF
+a.write.negative_fd: -EBADF
+a.write.bad_buffer: -EFAULT
+a.write.zero_length: = 0
+a.read.stdin_eof: = 0
+a.read.bad_fd: -EBADF
+a.read.bad_buffer_on_stdin: = 0
+a.fstat.stdin_type: fifo
+a.fstat.stdout_type: fifo
+a.fstat.bad_fd: -EBADF
+a.fstat.bad_buffer: -EFAULT
+a.ioctl.tiocgwinsz_on_pipe: -ENOTTY
+a.ioctl.tiocgwinsz_bad_fd: -EBADF
+a.lseek.on_pipe: -ESPIPE
+a.mkdir.scratch: = 0
+a.open.missing: -ENOENT
+a.open.missing_dir: -ENOENT
+a.open.bad_path: -EFAULT
+a.open.dir_for_writing: -EISDIR
+a.open.create: ok
+a.open.create_gives_lowest_fd: true
+a.write.file_10000: = 10000
+a.lseek.cur: = 10000
+a.lseek.end: = 10000
+a.lseek.set_100: = 100
+a.lseek.negative: -EINVAL
+a.lseek.bad_whence: -EINVAL
+a.lseek.beyond_end: = 20000
+a.read.write_only_fd: -EBADF
+a.fstat.file_type: regular
+a.fstat.file_size: 10000
+a.fstat.file_mode: 644
+a.fstat.file_nlink: 1
+a.fstat.uid_is_euid: true
+a.close.file: = 0
+a.close.again: -EBADF
+a.open.excl_existing: -EEXIST
+a.open.file_as_dir: -ENOTDIR
+a.openat.cwd_relative_absolute: ok
+a.read.first_4096: = 4096
+a.read.first_4096_content: true
+a.read.rest: = 5904
+a.read.rest_content: true
+a.read.at_eof: = 0
+a.write.read_only_fd: -EBADF
+a.newfstatat.empty_path_on_fd: 10000
+a.newfstatat.size: 10000
+a.newfstatat.empty_path: -ENOENT
+a.newfstatat.missing: -ENOENT
+a.newfstatat.dir_type: directory
+a.open.rdwr_reuses_lowest_fd: true
+a.unlink.file: = 0
+a.rmdir.scratch: = 0
+a.brk.initial_nonzero: true
+a.brk.grow_3_pages: true
+a.brk.new_memory_rw: Some(90)
+a.brk.restore: true
+a.mmap.anon_aligned: true
+a.mmap.anon_zeroed: true
+a.mmap.anon_rw: 42
+a.mprotect.read_only: = 0
+a.mprotect.still_readable: 0
+a.mprotect.bad_prot: -EINVAL
+a.mprotect.none_then_rw: = 0
+a.mprotect.content_kept: 42
+a.munmap.middle_page: = 0
+a.munmap.neighbours_kept: Some(0) Some(0)
+a.mmap.fixed_into_hole: = 4096
+a.mmap.fixed_page_zeroed: 0
+a.mmap.zero_length: -EINVAL
+a.mmap.neither_private_nor_shared: -EINVAL
+a.mmap.fixed_unaligned: -EINVAL
+a.mmap.fixed_below_min_addr: -EPERM
+a.mmap.huge: -ENOMEM
+a.mmap.noreserve_1tib: ok
+a.munmap.unaligned: -EINVAL
+a.munmap.zero_length: -EINVAL
+a.munmap.unmapped_low: = 0
+a.mprotect.unaligned: -EINVAL
+a.arch_prctl.get_fs_nonzero: true
+a.arch_prctl.get_gs: ok
+a.arch_prctl.unknown_code: -EINVAL
+a.clock_gettime.monotonic: ok
+a.clock_gettime.nsec_in_range: true
+a.clock_gettime.non_decreasing: true
+a.clock_gettime.realtime: ok
+a.clock_gettime.bad_buffer: -EFAULT
+a.nanosleep.20ms: = 0
+a.nanosleep.slept_at_least_20ms: true
+a.nanosleep.zero: = 0
+a.nanosleep.nsec_too_big: -EINVAL
+a.nanosleep.negative: -EINVAL
+a.rt_sigprocmask.query: ok
+a.rt_sigaction.query_sigusr1: ok
+a.sigaltstack.query: ok
+a.getrandom.16: = 16
+a.poll.stdout_and_bad_fd: = 2
+a.poll.revents: 4 32
+a.prlimit64.nofile_cur_le_max: true
+wave A end (108 checks)

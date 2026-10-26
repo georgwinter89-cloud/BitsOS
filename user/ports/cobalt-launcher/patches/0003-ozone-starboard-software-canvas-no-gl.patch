@@ -1,0 +1,235 @@
+diff --git a/ui/ozone/platform/starboard/BUILD.gn b/ui/ozone/platform/starboard/BUILD.gn
+index 84b9218e55..9ef45701d5 100644
+--- a/ui/ozone/platform/starboard/BUILD.gn
++++ b/ui/ozone/platform/starboard/BUILD.gn
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import("//build/config/ozone.gni")
++import("//starboard/build/config/bitsos.gni")
+ 
+ assert(is_starboard)
+ 
+@@ -54,6 +55,18 @@ source_set("starboard") {
+     "//ui/platform_window",
+     "//ui/platform_window/stub",
+   ]
++
++  if (cobalt_bitsos_canvas) {
++    sources += [
++      "bitsos_canvas_starboard.cc",
++      "bitsos_canvas_starboard.h",
++    ]
++    defines += [ "COBALT_BITSOS_CANVAS" ]
++    deps += [
++      "//skia",
++      "//ui/gfx/geometry",
++    ]
++  }
+ }
+ 
+ source_set("starboard_unittests") {
+diff --git a/ui/ozone/platform/starboard/bitsos_canvas_starboard.cc b/ui/ozone/platform/starboard/bitsos_canvas_starboard.cc
+new file mode 100644
+index 0000000000..f2c9569cd9
+--- /dev/null
++++ b/ui/ozone/platform/starboard/bitsos_canvas_starboard.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Cobalt Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "ui/ozone/platform/starboard/bitsos_canvas_starboard.h"
++
++#include <stdint.h>
++#include <string.h>
++
++#include "base/logging.h"
++#include "starboard/extension/bitsos_canvas.h"
++#include "starboard/system.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkPixmap.h"
++#include "third_party/skia/include/core/SkSurface.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/vsync_provider.h"
++
++namespace ui {
++namespace {
++
++class BitsosCanvas : public SurfaceOzoneCanvas {
++ public:
++  BitsosCanvas(gfx::AcceleratedWidget widget,
++               const StarboardExtensionBitsosCanvasApi* api)
++      : widget_(widget), api_(api) {}
++  BitsosCanvas(const BitsosCanvas&) = delete;
++  BitsosCanvas& operator=(const BitsosCanvas&) = delete;
++  ~BitsosCanvas() override = default;
++
++  SkCanvas* GetCanvas() override {
++    return surface_ ? surface_->getCanvas() : nullptr;
++  }
++
++  void ResizeCanvas(const gfx::Size& size, float scale) override {
++    if (surface_ && surface_->width() == size.width() &&
++        surface_->height() == size.height()) {
++      return;
++    }
++    surface_ = SkSurfaces::Raster(
++        SkImageInfo::MakeN32Premul(size.width(), size.height()));
++  }
++
++  void PresentCanvas(const gfx::Rect& damage) override {
++    SkPixmap pm;
++    if (!surface_ || !surface_->peekPixels(&pm)) {
++      return;
++    }
++    gfx::Rect r =
++        gfx::IntersectRects(damage, gfx::Rect(pm.width(), pm.height()));
++    if (r.IsEmpty()) {
++      return;
++    }
++    api_->Present(reinterpret_cast<void*>(static_cast<intptr_t>(widget_)),
++                  pm.addr(), static_cast<int32_t>(pm.rowBytes()), pm.width(),
++                  pm.height(), r.x(), r.y(), r.width(), r.height());
++  }
++
++  // No vsync source: viz paces frames with its own begin-frame timer.
++  std::unique_ptr<gfx::VSyncProvider> CreateVSyncProvider() override {
++    return nullptr;
++  }
++
++ private:
++  const gfx::AcceleratedWidget widget_;
++  const StarboardExtensionBitsosCanvasApi* const api_;
++  sk_sp<SkSurface> surface_;
++};
++
++}  // namespace
++
++std::unique_ptr<SurfaceOzoneCanvas> CreateBitsosCanvas(
++    gfx::AcceleratedWidget widget) {
++  const auto* api = static_cast<const StarboardExtensionBitsosCanvasApi*>(
++      SbSystemGetExtension(kStarboardExtensionBitsosCanvasName));
++  if (!api || strcmp(api->name, kStarboardExtensionBitsosCanvasName) != 0 ||
++      api->version < 1 || !api->Present) {
++    LOG(ERROR) << "Starboard extension " << kStarboardExtensionBitsosCanvasName
++               << " is missing; software compositing cannot present.";
++    return nullptr;
++  }
++  LOG(INFO) << "Software compositing presents through "
++            << kStarboardExtensionBitsosCanvasName << " v" << api->version;
++  return std::make_unique<BitsosCanvas>(widget, api);
++}
++
++}  // namespace ui
+diff --git a/ui/ozone/platform/starboard/bitsos_canvas_starboard.h b/ui/ozone/platform/starboard/bitsos_canvas_starboard.h
+new file mode 100644
+index 0000000000..fddd47c22a
+--- /dev/null
++++ b/ui/ozone/platform/starboard/bitsos_canvas_starboard.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Cobalt Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef UI_OZONE_PLATFORM_STARBOARD_BITSOS_CANVAS_STARBOARD_H_
++#define UI_OZONE_PLATFORM_STARBOARD_BITSOS_CANVAS_STARBOARD_H_
++
++#include <memory>
++
++#include "ui/gfx/native_widget_types.h"
++#include "ui/ozone/public/surface_ozone_canvas.h"
++
++namespace ui {
++
++// Returns a software canvas that presents through the platform's
++// "dev.bitsos.Canvas" Starboard extension, or nullptr (logged) when the
++// platform does not offer it.
++std::unique_ptr<SurfaceOzoneCanvas> CreateBitsosCanvas(
++    gfx::AcceleratedWidget widget);
++
++}  // namespace ui
++
++#endif  // UI_OZONE_PLATFORM_STARBOARD_BITSOS_CANVAS_STARBOARD_H_
+diff --git a/ui/ozone/platform/starboard/ozone_platform_starboard.cc b/ui/ozone/platform/starboard/ozone_platform_starboard.cc
+index 10b7bf62e8..75171a69aa 100644
+--- a/ui/ozone/platform/starboard/ozone_platform_starboard.cc
++++ b/ui/ozone/platform/starboard/ozone_platform_starboard.cc
+@@ -165,6 +165,11 @@ class OzonePlatformStarboard : public OzonePlatform {
+ OzonePlatform* CreateOzonePlatformStarboard() {
+   base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
+   if (cmd->HasSwitch(switches::kUseGL)) {
++#if defined(COBALT_BITSOS_CANVAS)
++    // Without GL everything is composited in software (dev.bitsos.Canvas).
++    if (cmd->GetSwitchValueASCII(switches::kUseGL) !=
++        gl::kGLImplementationDisabledName)
++#endif
+     CHECK_EQ(cmd->GetSwitchValueASCII(switches::kUseGL),
+              gl::kGLImplementationANGLEName)
+         << " Unsupported " << switches::kUseGL << " implementation";
+diff --git a/ui/ozone/platform/starboard/surface_factory_starboard.cc b/ui/ozone/platform/starboard/surface_factory_starboard.cc
+index 47294badba..f367fb818c 100644
+--- a/ui/ozone/platform/starboard/surface_factory_starboard.cc
++++ b/ui/ozone/platform/starboard/surface_factory_starboard.cc
+@@ -14,6 +14,11 @@
+ 
+ #include "ui/ozone/platform/starboard/surface_factory_starboard.h"
+ 
++#if defined(COBALT_BITSOS_CANVAS)
++#include "ui/ozone/platform/starboard/bitsos_canvas_starboard.h"
++#include "ui/ozone/public/surface_ozone_canvas.h"
++#endif
++
+ namespace ui {
+ 
+ SurfaceFactoryStarboard::SurfaceFactoryStarboard() = default;
+@@ -36,4 +41,11 @@ GLOzone* SurfaceFactoryStarboard::GetGLOzone(
+       return nullptr;
+   }
+ }
++
++#if defined(COBALT_BITSOS_CANVAS)
++std::unique_ptr<SurfaceOzoneCanvas>
++SurfaceFactoryStarboard::CreateCanvasForWidget(gfx::AcceleratedWidget widget) {
++  return CreateBitsosCanvas(widget);
++}
++#endif
+ }  // namespace ui
+diff --git a/ui/ozone/platform/starboard/surface_factory_starboard.h b/ui/ozone/platform/starboard/surface_factory_starboard.h
+index 064685b7dd..dad2db83ef 100644
+--- a/ui/ozone/platform/starboard/surface_factory_starboard.h
++++ b/ui/ozone/platform/starboard/surface_factory_starboard.h
+@@ -33,6 +33,12 @@ class SurfaceFactoryStarboard : public SurfaceFactoryOzone {
+ 
+   GLOzone* GetGLOzone(const gl::GLImplementationParts& implementation) override;
+ 
++#if defined(COBALT_BITSOS_CANVAS)
++  // Software compositing target (--disable-gpu-compositing).
++  std::unique_ptr<SurfaceOzoneCanvas> CreateCanvasForWidget(
++      gfx::AcceleratedWidget widget) override;
++#endif
++
+  private:
+   GLOzoneEGLStarboard egl_implementation_;
+ };

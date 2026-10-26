@@ -1,0 +1,8 @@
+served by httpd
+via nc
+ip-link
+ip-addr
+ifconfig
+ping-eperm
+end
+exit 0

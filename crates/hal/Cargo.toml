@@ -1,0 +1,8 @@
+[package]
+name = "hal"
+version = "0.1.0"
+edition = "2024"
+description = "Trusted base: CPU, paging primitives, port/MMIO, per-CPU, entry stubs, user copy (owner: desk/CP/MM/SC/PC/RB/AB)"
+
+[dependencies]
+bootinfo = { path = "../bootinfo" }

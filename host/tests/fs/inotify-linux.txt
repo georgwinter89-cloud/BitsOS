@@ -1,0 +1,137 @@
+# fs-inotify on Linux (CachyOS 7.2.11, max_queued_events 16384), one block per mode: `=== <mode>`, the end
+# (`end: exit N` or `end: signal N`), then stdout. Checked again by host/tests/fs/18-inotify-linux.sh; compared on
+# V2 by ktest fs.inotify.programs (every mode) and `cargo xtask abi-diff abi-inotify`.
+=== checks
+end: exit 0
+init1 bad flag: EINVAL
+init1 fd cloexec: yes
+init1 F_GETFL nonblock: yes
+inotify_init: ok
+add mask 0: EINVAL
+add unknown bit: EINVAL
+add bad fd: EBADF
+add MASK_ADD|MASK_CREATE: EINVAL
+add on a plain fd: EINVAL
+rm on a plain fd: EINVAL
+add ONLYDIR on a file: ENOTDIR
+add missing: ENOENT
+add empty path: ENOENT
+add bad path pointer: EFAULT
+add dir: 1
+add file: 2
+add dir again: 1
+add dir MASK_CREATE: EEXIST
+rm unknown wd: EINVAL
+rm bad fd: EBADF
+rm file watch: 0
+after rm: wd 2 IGNORED (none) cookie=- len 0
+rm it again: EINVAL
+add file again: 3
+read empty nonblock: EAGAIN
+dir back to CREATE: 1
+FIONREAD: ok 80
+read 47 bytes: EINVAL
+read 0 bytes: EINVAL
+read 60 bytes (one event): 48
+first: wd 1 len 32 name abcdefghijklmnop
+read the rest: 32
+lseek: 0
+write: EBADF
+fstat mode 600
+fd link: anon_inode:inotify
+max_queued_events: 16384
+max_user_instances: readable
+max_user_watches: readable
+=== dir
+end: exit 0
+watch w: 1
+create+2 writes+close: wd 1 CREATE f cookie=- len 16
+create+2 writes+close: wd 1 OPEN f cookie=- len 16
+create+2 writes+close: wd 1 MODIFY f cookie=- len 16
+create+2 writes+close: wd 1 CLOSE_WRITE f cookie=- len 16
+chmod: wd 1 ATTRIB f cookie=- len 16
+open+read+eof+close: wd 1 OPEN f cookie=- len 16
+open+read+eof+close: wd 1 ACCESS f cookie=- len 16
+open+read+eof+close: wd 1 CLOSE_NOWRITE f cookie=- len 16
+ls w: wd 1 OPEN|ISDIR (none) cookie=- len 0
+ls w: wd 1 ACCESS|ISDIR (none) cookie=- len 0
+ls w: wd 1 CLOSE_NOWRITE|ISDIR (none) cookie=- len 0
+rename f g: wd 1 MOVED_FROM f cookie=a len 16
+rename f g: wd 1 MOVED_TO g cookie=a len 16
+link g h: wd 1 CREATE h cookie=- len 16
+unlink h: wd 1 DELETE h cookie=- len 16
+O_TRUNC open: wd 1 OPEN g cookie=- len 16
+O_TRUNC open: wd 1 MODIFY g cookie=- len 16
+O_TRUNC open: wd 1 CLOSE_WRITE g cookie=- len 16
+truncate: wd 1 MODIFY g cookie=- len 16
+ftruncate+fallocate+KEEP_SIZE: wd 1 OPEN g cookie=- len 16
+ftruncate+fallocate+KEEP_SIZE: wd 1 MODIFY g cookie=- len 16
+ftruncate+fallocate+KEEP_SIZE: wd 1 CLOSE_WRITE g cookie=- len 16
+utimes: wd 1 ATTRIB g cookie=- len 16
+O_PATH open+close: no events
+symlink+mkfifo: wd 1 CREATE s cookie=- len 16
+symlink+mkfifo: wd 1 CREATE p cookie=- len 16
+rename s over g: wd 1 MOVED_FROM s cookie=b len 16
+rename s over g: wd 1 MOVED_TO g cookie=b len 16
+unlink g p: wd 1 DELETE g cookie=- len 16
+unlink g p: wd 1 DELETE p cookie=- len 16
+watch w/d: 2
+mkdir d + file in it: wd 1 CREATE|ISDIR d cookie=- len 16
+mkdir d + file in it: wd 2 CREATE x cookie=- len 16
+mkdir d + file in it: wd 2 OPEN x cookie=- len 16
+mkdir d + file in it: wd 2 CLOSE_WRITE x cookie=- len 16
+rename d e: wd 1 MOVED_FROM|ISDIR d cookie=c len 16
+rename d e: wd 1 MOVED_TO|ISDIR e cookie=c len 16
+rename d e: wd 2 MOVE_SELF (none) cookie=- len 0
+rmdir e: wd 2 DELETE x cookie=- len 16
+rmdir e: wd 2 DELETE_SELF (none) cookie=- len 0
+rmdir e: wd 2 IGNORED (none) cookie=- len 0
+rmdir e: wd 1 DELETE|ISDIR e cookie=- len 16
+rmdir w: wd 1 DELETE_SELF (none) cookie=- len 0
+rmdir w: wd 1 IGNORED (none) cookie=- len 0
+=== self
+end: exit 0
+watch s: 1
+link: wd 1 ATTRIB (none) cookie=- len 0
+unlink one name: wd 1 ATTRIB (none) cookie=- len 0
+rename: wd 1 MOVE_SELF (none) cookie=- len 0
+unlink while open: wd 1 OPEN (none) cookie=- len 0
+unlink while open: wd 1 ATTRIB (none) cookie=- len 0
+last close: wd 1 CLOSE_NOWRITE (none) cookie=- len 0
+last close: wd 1 DELETE_SELF (none) cookie=- len 0
+last close: wd 1 IGNORED (none) cookie=- len 0
+oneshot: 2
+oneshot two opens: wd 2 OPEN (none) cookie=- len 0
+oneshot two opens: wd 2 IGNORED (none) cookie=- len 0
+watch o OPEN: 3
+MASK_ADD CLOSE_NOWRITE: 3
+open after MASK_ADD: wd 3 OPEN (none) cookie=- len 0
+open after MASK_ADD: wd 3 CLOSE_NOWRITE (none) cookie=- len 0
+replace with ATTRIB: 3
+open+chmod after replace: wd 3 ATTRIB (none) cookie=- len 0
+watch x EXCL_UNLINK: 4
+write+close after unlink (EXCL_UNLINK): no events
+watch x plain: 4
+write+close after unlink: wd 4 MODIFY f2 cookie=- len 16
+write+close after unlink: wd 4 CLOSE_WRITE f2 cookie=- len 16
+rmdir x: wd 4 IGNORED (none) cookie=- len 0
+DONT_FOLLOW on a symlink: 5
+follow the symlink: 3
+ONLYDIR|DONT_FOLLOW on a symlink: ENOTDIR
+chmod through the link: wd 3 ATTRIB (none) cookie=- len 0
+unlink l o: wd 5 ATTRIB (none) cookie=- len 0
+unlink l o: wd 5 IGNORED (none) cookie=- len 0
+unlink l o: wd 3 ATTRIB (none) cookie=- len 0
+unlink l o: wd 3 IGNORED (none) cookie=- len 0
+=== wait
+end: exit 0
+watch v: 1
+poll empty: 0 revents 0
+epoll_ctl: ok
+blocking read: 32 bytes, late
+poll ready: 1 revents 1
+epoll_wait: 1 events 1 data 7
+overflow: wd -1 len 0 after 16384 events
+queued 16384 events, 1 overflow, 0 after it
+after the overflow was read: wd 1 MODIFY a cookie=- len 16
+after the overflow was read: wd 1 MODIFY b cookie=- len 16

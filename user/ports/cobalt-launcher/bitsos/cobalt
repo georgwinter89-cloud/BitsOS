@@ -1,0 +1,360 @@
+#!/bin/sh
+# YT-2: `cobalt` starts YouTube TV (Cobalt with YT-1's framebuffer/evdev back end) on BitsOS V2 from the
+# BusyBox shell. Lives in \BITSOS2\bin\ (on PATH); Cobalt itself in \BITSOS2\cobalt\ (manifest `tree cobalt`).
+#   cobalt [URL] [-- loader_app arguments]   start (default URL https://www.youtube.com/tv); Ctrl+Alt+Backspace ends
+#   cobalt --check                           check the tree, libraries, screen, sound and profile; start nothing
+#   cobalt --stats                           picture/sound numbers of the running or last session (YT-5)
+# The screen: Cobalt takes it with its first picture (or at once by KD_GRAPHICS on a terminal) and the kernel gives
+# it back to the console when Cobalt ends, however it ends. The desktop (bitscomp) holds the screen while it runs:
+# then `cobalt` goes on in the background, ends the desktop (its control socket's `quit`), runs Cobalt and starts
+# the desktop again with the same arguments, environment and user (read from /proc before it ended).
+# The sign-in (Cobalt's ~/.cobalt_files: cookies, local storage) is kept on the stick as one file,
+# \BITSOS2\home\cobalt_files.tar (one file: no FAT name rules for Cobalt's names, one rename swaps it), plus the
+# copy before it (.old). Unpacked into RAM at the start, Cobalt runs on tmpfs (full POSIX semantics, no stick wear
+# from its cache), packed back after a clean end by whoever runs this script (root, or uid 1000 through the stick's
+# home class). Cobalt never runs as root (YT-6): started by root (the console shell, a terminal of a desktop started
+# from the console) it runs as uid 1000 (BusyBox chpst -u 1000:1000; V2's credentials since AB-13) and says so; if
+# root cannot hand over, it refuses to start: one rule for every start, and nothing of root's in user 1000's files.
+# COBALT_ALLOW_ROOT=1 runs it as root anyway (works; for diagnosis). YouTube's "This video format is not supported"
+# was not root's doing: plan/notes/yt-YT-6.md.
+# The COBALT_* settings exist for host/tests/yt/launcher.sh (a fake tree and mount table on the build host).
+MNT=${COBALT_MOUNT:-/boot}
+T=${COBALT_TREE:-$MNT/BITSOS2/cobalt}
+P=${COBALT_HOME:-$MNT/BITSOS2/home}
+PROF=$P/cobalt_files.tar
+# /proc/self/mounts: Linux and V2 both have it (V2 has no /proc/mounts link yet, YT-4a change request).
+MOUNTS=${COBALT_MOUNTS:-/proc/self/mounts}
+ALSA_SYS=${COBALT_ALSA_SYS:-/usr/share/alsa/alsa.conf}
+USER_RUN=${COBALT_USER_RUN:-/run/user/1000}
+TMP=${COBALT_TMP:-/tmp}
+URL=https://www.youtube.com/tv
+PATH=${COBALT_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
+export PATH
+UID_NOW=$(id -u 2>/dev/null)
+
+say() { echo "cobalt: $*"; }
+# Without a number here root would pass for another user.
+case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
+
+tree_ok() {
+  for f in loader_app app/cobalt/lib/libcobalt.so app/cobalt/content/cobalt_shell.pak app/cobalt/content/ssl/certs; do
+    [ -e "$T/$f" ] || { say "tree $T: $f is missing (copy \\BITSOS2\\cobalt\\ to the stick)"; return 1; }
+  done
+}
+
+# Libraries as the loader finds them when the kernel starts loader_app: RPATH $ORIGIN/lib, no LD_LIBRARY_PATH,
+# exactly as the start below runs it.
+libs_ok() {
+  out=$(env -u LD_LIBRARY_PATH LD_TRACE_LOADED_OBJECTS=1 "$T/loader_app" 2>&1) || { say "libraries: the loader failed: $out"; return 1; }
+  miss=$(echo "$out" | grep "not found")
+  [ -z "$miss" ] || { say "libraries missing: $(echo "$miss" | sed 's/^[[:space:]]*//' | tr '\n' ';' | sed 's/;$//; s/;/; /g')"; return 1; }
+  say "libraries: $(echo "$out" | grep -c '=>') found, none missing"
+}
+
+# A process that still runs (a zombie has ended: its files, fb0 among them, are closed).
+alive() { kill -0 "$1" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null; }
+
+# The desktop's own process: bitscomp also runs helpers under its name (`bitscomp page ...` for the settings
+# view, `bitscomp ctl ...`), which are not desktops.
+desk_pids() {
+  ps_=
+  for p in $(pidof bitscomp); do
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+      *" page "* | *" ctl "* | *" page" | *" ctl") ;;
+      *) ps_="$ps_${ps_:+ }$p" ;;
+    esac
+  done
+  echo "$ps_"
+}
+
+# The desktop, if one runs: sets DESK (pid) and DESK_AS (the prefix that starts it again as its own user).
+# 0 = it runs and can be handed over, 1 = it runs and cannot ($why), 2 = none.
+desk_check() {
+  DESK=$(desk_pids)
+  DESK_AS=
+  [ -n "$DESK" ] || return 2
+  # shellcheck disable=SC2086
+  set -- $DESK
+  [ $# = 1 ] || { why="$# desktops run"; return 1; }
+  DESK=$1
+  du=$(sed -n 's/^Uid:[[:space:]]*\([0-9]*\).*/\1/p' "/proc/$DESK/status" 2>/dev/null)
+  dg=$(sed -n 's/^Gid:[[:space:]]*\([0-9]*\).*/\1/p' "/proc/$DESK/status" 2>/dev/null)
+  [ -n "$du" ] && cat "/proc/$DESK/cmdline" "/proc/$DESK/environ" >/dev/null 2>&1 \
+    || { why="its start line (/proc/$DESK) cannot be read"; return 1; }
+  [ "$du" != "$UID_NOW" ] || return 0
+  if [ "$UID_NOW" = 0 ] && chpst -u "$du:$dg" true 2>/dev/null; then DESK_AS="chpst -u $du:$dg"; return 0; fi
+  why="it runs as uid $du and this shell as uid $UID_NOW (start cobalt in a terminal of the desktop)"
+  return 1
+}
+
+# Who has the screen. fbdev serves one holder, so a second Cobalt cannot start; the desktop is handed over.
+screen_free() {
+  pid=$(pidof loader_app)
+  [ -z "$pid" ] || { say "screen: Cobalt runs already (pid $pid)"; return 1; }
+  desk_check
+  case $? in
+    2) say "screen: free" ;;
+    0) say "screen: the desktop has it (bitscomp, pid $DESK); cobalt ends it for the run and starts it again afterwards" ;;
+    *) say "screen: the desktop has it (bitscomp, pid $DESK) and cannot be handed over: $why"; return 1 ;;
+  esac
+}
+
+# Ends the desktop through its control socket (its own orderly end gives the screen back) and waits for it.
+desk_stop() {
+  sock=wayland-bits-0 prev=
+  tr '\0' '\n' <"$PRIV/desk.cmd" >"$PRIV/desk.argv"
+  while IFS= read -r a; do
+    [ "$prev" != --socket ] || sock=$a
+    prev=$a
+  done <"$PRIV/desk.argv"
+  xdg=$(tr '\0' '\n' <"$PRIV/desk.env" | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -n 1)
+  out=$(XDG_RUNTIME_DIR=${xdg:-$XDG_RUNTIME_DIR} bitscomp ctl --socket "$sock" quit 2>&1) \
+    || { say "the desktop did not take 'quit' on socket $sock: $out"; return 1; }
+  n=0
+  while alive "$DESK"; do
+    n=$((n + 1))
+    [ $n -le 100 ] || { say "the desktop (pid $DESK) did not end within 10 s; Cobalt not started"; return 1; }
+    sleep 0.1
+  done
+  say "desktop ended (pid $DESK, socket $sock)"
+}
+
+# Starts the desktop again: the same environment and arguments, a session of its own, its own user. Its start
+# line and log stay in $PRIV (this script's user only): Cobalt's user must not choose what root starts.
+desk_start() {
+  cat "$PRIV/desk.env" "$PRIV/desk.cmd" >"$PRIV/desk.all"
+  # shellcheck disable=SC2086
+  (cd / && exec setsid $DESK_AS xargs -0 env -i <"$PRIV/desk.all" >"$PRIV/bitscomp.log" 2>&1) &
+  n=0
+  while [ -z "$(desk_pids)" ]; do
+    n=$((n + 1))
+    [ $n -le 50 ] || { say "the desktop did not start again within 5 s (log $PRIV/bitscomp.log)"; return 1; }
+    sleep 0.1
+  done
+  rm -f "$PRIV/desk.env" "$PRIV/desk.cmd" "$PRIV/desk.argv" "$PRIV/desk.all"
+  say "desktop started again (pid $(desk_pids))"
+}
+
+# Whether this user can keep the profile on the stick: /boot mounted rw and the home directory writable.
+can_save() {
+  grep -q "^[^ ]* $MNT vfat rw[, ]" "$MOUNTS" || { why="the stick is not mounted writable at $MNT"; return 1; }
+  if [ "$UID_NOW" = 0 ]; then return 0; fi
+  if [ -d "$P" ] && [ -w "$P" ]; then return 0; fi
+  why="$P is not writable for uid $UID_NOW (YT-2 change request to FS)"
+  return 1
+}
+
+profile_line() {
+  if can_save; then say "profile: $PROF (packed back to the stick after a clean end)"
+  else say "profile: in RAM only ($RUN), not on the stick: $why"; fi
+}
+
+# libasound: the system's configuration if there is one, else ours (default = plug on card 0, device 0).
+# With "dry" (--check) it only says which.
+sound_env() {
+  if [ -r "$ALSA_SYS" ]; then
+    say "sound: ALSA configuration $ALSA_SYS"
+    return
+  fi
+  card=${COBALT_ALSA_CARD:-0}
+  if [ "$1" = dry ]; then say "sound: own ALSA configuration (card $card through plug)"; return; fi
+  u sh -c 'cat >"$1"' _ "$RUN/asound.conf" <<EOF
+pcm.!default { type plug slave.pcm "bitsos" }
+pcm.bitsos { type hw card $card device 0 }
+ctl.!default { type hw card $card }
+EOF
+  export ALSA_CONFIG_PATH="$RUN/asound.conf"
+  say "sound: own ALSA configuration (card $card through plug)"
+}
+
+# The uid Cobalt runs as: the caller's, but never root's. Sets DROP (the prefix that makes root uid 1000: BusyBox
+# chpst -u = setgroups, setgid, setuid) or NOROOT (why root cannot hand over).
+as_user() {
+  DROP= NOROOT=
+  [ "$UID_NOW" = 0 ] || return 0
+  out=$(chpst -u 1000:1000 id -u 2>&1)
+  if [ "$out" = 1000 ]; then DROP="chpst -u 1000:1000"; return 0; fi
+  NOROOT="root cannot hand over to uid 1000 (chpst -u 1000:1000: $(echo "${out:-no answer}" | head -n 1))"
+}
+
+# Started by root without a handover: in German and English, as Georg reads it on the console.
+refuse_root() {
+  say "Cobalt startet nicht als root: $NOROOT."
+  say "  Bitte als Benutzer 1000 starten (zum Beispiel ueber MCP) oder ein BitsOS mit setgroups/setuid nehmen."
+  say "Cobalt does not run as root: $NOROOT."
+  say "  Start it as user 1000 (MCP run, for example) or use a BitsOS with setgroups/setuid."
+}
+
+# Runs a command as the uid Cobalt runs as. The run directory is that user's: root reads there, but makes,
+# writes, moves and removes nothing there itself (a link that user planted would turn root's write, or a chown,
+# onto any file). Root only opens the stick's profile files ($P: vfat, no links) for the user's tar.
+# shellcheck disable=SC2086
+u() { $DROP "$@"; }
+
+# The sign-in into $H: the stick's copy, else the one before it, else the RAM one, else a new one. A RAM copy that
+# could not be saved (.unsaved) is newer than the stick's and is kept. A copy that cannot be read is left alone.
+restore() {
+  u mkdir -p "$H" || return 1
+  if [ -e "$H/.unsaved" ] && [ -d "$H/.cobalt_files" ]; then say "profile: the one from the last start in RAM (not on the stick)"; return 0; fi
+  for src in "$PROF" "$PROF.old"; do
+    [ -f "$src" ] || continue
+    # shellcheck disable=SC2016
+    if u sh -c 'rm -rf "$1/.restore" && mkdir "$1/.restore" && tar -xf - -C "$1/.restore" 2>/dev/null && [ -d "$1/.restore/.cobalt_files" ] &&
+        rm -rf "$1/.cobalt_files" && mv "$1/.restore/.cobalt_files" "$1/.cobalt_files" && rm -rf "$1/.restore"' _ "$H" <"$src"; then
+      say "profile: taken from the stick (${src##*/})"
+      return 0
+    fi
+    u rm -rf "$H/.restore"
+    say "profile: $src cannot be read"
+  done
+  if [ -d "$H/.cobalt_files" ]; then say "profile: the one from the last start in RAM"
+  else say "profile: new (sign in once)"; fi
+}
+
+# Packs the profile back after a clean end: a new file first, then the swap by renames (the last copy becomes
+# .old, the new one the copy), so any failure leaves a readable copy on the stick.
+save() {
+  [ -d "$H/.cobalt_files" ] || return 0
+  if [ -n "$unclean" ]; then
+    u touch "$H/.unsaved"
+    say "profile not saved: $unclean; the stick keeps the copy of the last clean end"
+    return 0
+  fi
+  if ! can_save; then u touch "$H/.unsaved"; say "sign-in not kept on the stick: $why"; return 0; fi
+  if ! { mkdir -p "$P" && rm -f "$PROF.new"; }; then not_saved "$P cannot be made"; return 1; fi
+  u tar -cf - -C "$H" .cobalt_files >"$PROF.new" || { not_saved "writing $PROF.new failed (stick full?)"; return 1; }
+  if [ -f "$PROF" ] && ! { rm -f "$PROF.old" && mv "$PROF" "$PROF.old"; }; then
+    not_saved "$PROF cannot be moved aside"
+    return 1
+  fi
+  if ! mv "$PROF.new" "$PROF"; then
+    [ -e "$PROF" ] || [ ! -f "$PROF.old" ] || mv "$PROF.old" "$PROF"
+    not_saved "$PROF.new cannot be renamed"
+    return 1
+  fi
+  u rm -f "$H/.unsaved"
+  sync
+  say "profile saved on the stick ($(du -k "$PROF" | cut -f1) KB)"
+}
+not_saved() { rm -f "$PROF.new"; u touch "$H/.unsaved"; say "profile not saved: $*"; }
+
+# Cobalt's RAM directory belongs to the uid Cobalt runs as: user 1000's runtime directory, or root's own (only with
+# COBALT_ALLOW_ROOT=1).
+as_user
+if [ -n "$DROP" ]; then RUN=$USER_RUN/cobalt
+elif [ "$UID_NOW" != 0 ] && [ -n "$XDG_RUNTIME_DIR" ]; then RUN=$XDG_RUNTIME_DIR/cobalt
+else RUN=$TMP/cobalt-$UID_NOW; fi
+H=$RUN/home
+
+case "$1" in
+  -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --stats)
+    # Written by Cobalt's backend at most once a second while video plays (av_stats.h): frames shown and
+    # dropped, the picture's offset against the audio clock. COBALT_AV_TRACE=1 at the start adds one line per
+    # frame in av-trace.txt next to it.
+    pid=$(pidof loader_app)
+    if [ -n "$pid" ]; then say "Cobalt runs (pid $pid)"; else say "Cobalt does not run (numbers of the last session)"; fi
+    [ -f "$RUN/av-stats.txt" ] || { say "no numbers in $RUN/av-stats.txt: no video has played since the last start"; exit 1; }
+    up=$(awk '{printf "%.0f", $1 * 1000000}' /proc/uptime 2>/dev/null)
+    say "$RUN/av-stats.txt (time_us is the monotonic clock; now ${up:-unknown} us):"
+    cat "$RUN/av-stats.txt"
+    exit 0 ;;
+  --check)
+    rc=0
+    tree_ok && say "tree $T: ok" || rc=1
+    [ $rc = 0 ] && { libs_ok || rc=1; }
+    screen_free || true
+    if [ -n "$DROP" ]; then say "user: runs as uid 1000 (started by root: $DROP)"
+    elif [ -z "$NOROOT" ]; then say "user: runs as uid $UID_NOW"
+    elif [ "$COBALT_ALLOW_ROOT" = 1 ]; then say "user: runs as uid 0 (COBALT_ALLOW_ROOT=1, not supported: $NOROOT)"
+    else say "user: runs as uid 0: refused, $NOROOT"; rc=1; fi
+    profile_line
+    sound_env dry
+    exit $rc ;;
+esac
+
+if [ -n "$NOROOT" ]; then
+  if [ "$COBALT_ALLOW_ROOT" != 1 ]; then refuse_root; exit 1; fi
+  say "runs as root (COBALT_ALLOW_ROOT=1), not supported: $NOROOT"
+fi
+if [ -n "$COBALT_HANDOVER" ] && [ -z "$COBALT_LOGGED" ]; then
+  # The detached run (its own session): its output goes to $RUN/launcher.log, written by Cobalt's user.
+  # shellcheck disable=SC2016
+  COBALT_LOGGED=1 sh "$0" "$@" </dev/null 2>&1 | u sh -c 'exec cat >"$1"' _ "$RUN/launcher.log"
+  exit 0
+fi
+tree_ok || exit 1
+screen_free || exit 1
+if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
+  # Normally init makes it at boot (owner 1000, mode 700); the same here if it is missing.
+  mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; exit 1; }
+fi
+u mkdir -p "$RUN" || { say "cannot make $RUN"; exit 1; }
+if [ "$UID_NOW" = 0 ] && [ -z "$DROP" ]; then
+  # Root's own directory (COBALT_ALLOW_ROOT=1) in the shared $TMP: never one another user made or linked.
+  { [ ! -L "$RUN" ] && [ "$(stat -c %u "$RUN" 2>/dev/null)" = 0 ] && chmod 700 "$RUN"; } \
+    || { say "$RUN is not root's own directory: nothing started"; exit 1; }
+fi
+[ -z "$DROP" ] || [ -n "$COBALT_HANDOVER" ] || say "started by root: Cobalt runs as uid 1000 ($DROP)"
+if [ -n "$DESK" ] && [ -z "$COBALT_HANDOVER" ]; then
+  # Started inside the desktop (a terminal of it ends with it): go on detached, in a session of its own. The
+  # desktop's start line goes to a directory of this script's user alone (mktemp -d: new, mode 700).
+  PRIV=$(mktemp -d "$TMP/cobalt-desk.XXXXXX") || { say "cannot make a directory in $TMP"; exit 1; }
+  cat "/proc/$DESK/environ" >"$PRIV/desk.env" && cat "/proc/$DESK/cmdline" >"$PRIV/desk.cmd" \
+    || { say "the desktop's start line cannot be read"; rm -rf "$PRIV"; exit 1; }
+  say "the desktop ends for Cobalt and starts again when Cobalt ends (log $RUN/launcher.log)"
+  COBALT_HANDOVER=$DESK COBALT_DESKDIR=$PRIV setsid sh "$0" "$@" </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
+if [ -n "$COBALT_HANDOVER" ]; then
+  PRIV=$COBALT_DESKDIR
+  [ -n "$PRIV" ] && [ -d "$PRIV" ] && [ ! -L "$PRIV" ] || { say "no desktop start line (COBALT_DESKDIR '$PRIV')"; exit 1; }
+  [ "$DESK" = "$COBALT_HANDOVER" ] || { say "the desktop changed (pid ${DESK:-none}, was $COBALT_HANDOVER)"; exit 1; }
+  desk_stop || exit 1
+fi
+
+if [ -n "$1" ] && [ "$1" != "--" ]; then URL=$1; shift; fi
+[ "$1" != "--" ] || shift
+restore || { say "cannot make $H"; [ -z "$COBALT_HANDOVER" ] || desk_start; exit 1; }
+sound_env
+LOG=$RUN/cobalt.log
+AV=$RUN/av-stats.txt
+u rm -f "$AV" "$AV.new" "$RUN/av-trace.txt"
+TTY=
+if (: </dev/tty) 2>/dev/null; then TTY=1; fi
+say "starting $URL (log $LOG); Ctrl+Alt+Backspace ends it"
+START=$(date +%s)
+# The log is opened by Cobalt's user (sh -c, then exec: the pid stays Cobalt's).
+# shellcheck disable=SC2086,SC2016
+env -u LD_LIBRARY_PATH HOME="$H" ${DROP:+XDG_RUNTIME_DIR=$USER_RUN} BITSOS_BACKEND=fb BITSOS_FB=/dev/fb0 BITSOS_KEYMAP=de BITSOS_AV_STATS="$AV" \
+  ${COBALT_AV_TRACE:+BITSOS_AV_TRACE=$RUN/av-trace.txt} ${TTY:+BITSOS_KD_GRAPHICS=1} $DROP sh -c 'exec "$@" >"$0" 2>&1' "$LOG" \
+  "$T/loader_app" --evergreen_lite --disable-dev-shm-usage "--url=$URL" "$@" &
+CHILD=$!
+sig=
+trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+wait $CHILD
+rc=$?
+killed=
+if [ -n "$sig" ]; then
+  # A trapped signal ends `wait` early with 128+signal: give Cobalt 10 s for its own end (then SIGKILL) and
+  # wait again for its real status (127: the first `wait` had it already).
+  n=0
+  while alive $CHILD; do
+    n=$((n + 1))
+    [ $n -le 20 ] || { kill -KILL $CHILD 2>/dev/null; killed=1; break; }
+    sleep 0.5
+  done
+  wait $CHILD
+  r=$?
+  [ $r = 127 ] || rc=$r
+fi
+trap - INT TERM HUP
+say "Cobalt ended (code $rc) after $(( $(date +%s) - START )) s"
+# Clean: Cobalt's own exit (any code: its storage is flushed on that path), or its end on our SIGTERM. A crash
+# (signal) or the SIGKILL may leave LevelDB/SQLite half written: then the stick keeps the copy it has.
+unclean=
+if [ -n "$killed" ]; then unclean="Cobalt had to be killed"
+elif [ $rc -gt 128 ] && { [ -z "$sig" ] || [ $rc != 143 ]; }; then unclean="Cobalt ended by signal $((rc - 128))"; fi
+save
+[ -z "$COBALT_HANDOVER" ] || desk_start
+exit $rc

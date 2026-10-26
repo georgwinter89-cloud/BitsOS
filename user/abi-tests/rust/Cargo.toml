@@ -1,0 +1,14 @@
+# ABI diff programs in Rust (AB-3 harness; programs: UL). Built by `cargo xtask abi-diff` for
+# x86_64-unknown-linux-musl with the stable toolchain of user/ (user/rust-toolchain.toml); std only.
+[package]
+name = "abi-rs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A workspace of its own: user/Cargo.toml's workspace does not list it.
+[workspace]
+
+[profile.release]
+opt-level = 2
+debug = false

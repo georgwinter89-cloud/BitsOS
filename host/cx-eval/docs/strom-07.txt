@@ -1,0 +1,4 @@
+Zählerstand Wechsel
+Zähler 1ESM0123456789 (Wohnung, Flur)
+15.01.2026 um 07:30 abgelesen: 41.822,6 kWh
+Foto vom Zähler ist im Ordner Wohnung. Beiden Anbietern per Formular gemeldet.

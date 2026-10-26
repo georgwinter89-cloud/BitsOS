@@ -1,0 +1,34 @@
+//! CRC-32C (Castagnoli) for superblocks and metadata pages. Software table: the kernel has no SSE4.2 codegen
+//! (R10) and a commit checks only a handful of pages.
+
+const POLY: u32 = 0x82F6_3B78;
+
+const fn table() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { (c >> 1) ^ POLY } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+}
+
+static TABLE: [u32; 256] = table();
+
+pub fn crc32c(data: &[u8]) -> u32 {
+    !update(!0, data)
+}
+
+/// Streaming form: start with `!0`, finish with `!`.
+pub fn update(mut c: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        c = TABLE[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
+    }
+    c
+}

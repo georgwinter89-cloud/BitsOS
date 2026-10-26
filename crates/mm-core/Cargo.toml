@@ -1,0 +1,11 @@
+[package]
+name = "mm-core"
+version = "0.1.0"
+edition = "2024"
+description = "Frame allocator, slab, GlobalAlloc (trusted base) (owner: MM)"
+
+[dependencies]
+hal = { path = "../hal" }
+ksync = { path = "../ksync" }
+bootinfo = { path = "../bootinfo" }
+klog = { path = "../klog" }

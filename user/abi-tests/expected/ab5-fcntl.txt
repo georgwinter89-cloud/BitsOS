@@ -1,0 +1,130 @@
+F_GETLK nothing locked = 0: type 2 whence 0 start 0 len 0 pid -
+F_GETLK type F_UNLCK = -EINVAL
+F_GETLK type 7 = -EINVAL
+F_SETLK whence 9 = -EINVAL
+F_SETLK start -1 = -EINVAL
+F_SETLK len -20 at 10 = -EINVAL
+F_SETLK start LLONG_MAX len 2 = -EOVERFLOW
+F_SETLK SEEK_END start LLONG_MAX = -EOVERFLOW
+F_SETLK type 7 = -EINVAL
+F_SETLK kernel address = -EFAULT
+F_GETLK kernel address = -EFAULT
+F_SETLK F_WRLCK on a read-only fd = -EBADF
+F_SETLK F_RDLCK on it = 0
+F_SETLK F_UNLCK on it = 0
+F_SETLK F_RDLCK on a write-only fd = -EBADF
+F_SETLK F_WRLCK 0..4 = 0
+F_SETLK F_RDLCK 10.. = 0
+  own locks never conflict: F_GETLK = 0: type 2 whence 0 start 0 len 0 pid -
+child: F_GETLK F_WRLCK 2..2 = 0: type 1 whence 0 start 0 len 5 pid a process
+child: F_GETLK F_RDLCK 3.. = 0: type 1 whence 0 start 0 len 5 pid a process
+child: F_GETLK F_WRLCK 5..9 (the gap) = 0: type 2 whence 0 start 5 len 5 pid -
+child: F_GETLK F_WRLCK 9..10 = 0: type 0 whence 0 start 10 len 0 pid a process
+child: F_SETLK F_RDLCK 12.. = 0
+child: F_SETLK F_WRLCK 0..0 = -EAGAIN
+child: F_SETLK F_WRLCK 5..9 = 0
+parent: F_SETLKW F_WRLCK 5..5 would wait for the waiting child = -EDEADLK
+parent: F_GETLK F_WRLCK 5.. = 0: type 1 whence 0 start 5 len 5 pid a process
+child: F_SETLKW F_WRLCK 0..0 (waits) = 0
+parent: after our close(ro) the child holds 0..0: F_GETLK = 0: type 1 whence 0 start 0 len 1 pid a process
+parent: after the child's exit: F_GETLK = 0: type 2 whence 0 start 0 len 0 pid -
+F_SETLK F_WRLCK 0..9 = 0
+F_SETLK F_UNLCK 3..5 = 0
+F_SETLK F_RDLCK 8..8 = 0
+child: F_GETLK F_RDLCK 0.. = 0: type 1 whence 0 start 0 len 3 pid a process
+child: F_GETLK F_RDLCK 3.. = 0: type 1 whence 0 start 6 len 2 pid a process
+child: F_GETLK F_WRLCK 7.. = 0: type 1 whence 0 start 6 len 2 pid a process
+child: F_GETLK F_WRLCK 8.. = 0: type 0 whence 0 start 8 len 1 pid a process
+child: F_GETLK F_RDLCK 8..8 = 0: type 2 whence 0 start 8 len 1 pid -
+child: F_GETLK F_WRLCK 10.. = 0: type 2 whence 0 start 10 len 0 pid -
+F_SETLK F_UNLCK all = 0
+F_OFD_SETLK F_WRLCK 0..0 on o1 = 0
+F_OFD_SETLK F_WRLCK 0..0 on o2 = -EAGAIN
+F_OFD_GETLK on o2 = 0: type 1 whence 0 start 0 len 1 pid -1
+F_GETLK (POSIX) on fd sees the OFD lock = 0: type 1 whence 0 start 0 len 1 pid -1
+F_OFD_SETLK on a dup of o1 = 0
+F_OFD_SETLK with l_pid 5 = -EINVAL
+F_OFD_GETLK with l_pid 5 = -EINVAL
+  after close(o1) the dup keeps it: o2 = -EAGAIN
+  after the last close: o2 = 0
+F_SETLK F_WRLCK 0..9 = 0
+  held: yes
+dup2(fd, fd) = 0
+  held after dup2(fd, fd): yes
+dup2(fd, d) over a dup of the same open file = 0
+  held after it: no
+F_SETLK F_WRLCK 0..9 = 0
+dup3(other, d, O_CLOEXEC) over an fd of the file = 0
+  held after it: no
+F_SETLK F_WRLCK 0..9 = 0
+dup2(fd, 70) into a free fd = 0
+  held after it: yes
+close_range(70, 70, CLOSE_RANGE_CLOEXEC) = 0
+  held after it: yes
+close_range(70, 70, 0) = 0
+  held after it: no
+F_GETOWN fresh = 0
+F_GETOWN_EX fresh = 0
+  type 0 pid 0
+F_SETOWN(getpid()) = 0
+  F_GETOWN is our pid: yes
+  F_GETOWN_EX type 1, pid is ours: yes
+F_SETOWN(-getpgrp()) = 0
+  F_GETOWN is -pgrp: yes
+  F_GETOWN_EX type 2
+F_SETOWN(no such pid) = -ESRCH
+F_SETOWN(INT_MIN) = -EINVAL
+F_SETOWN(0) = 0
+  F_GETOWN = 0
+  F_GETOWN_EX type 1 pid 0
+F_SETOWN_EX(TID, gettid()) = 0
+  F_GETOWN is the tid: yes
+F_SETOWN_EX(type 9) = -EINVAL
+F_SETOWN_EX(PID, no such pid) = -ESRCH
+F_SETOWN_EX(PID, -5) = -ESRCH
+F_SETOWN_EX(kernel address) = -EFAULT
+F_GETOWN_EX(kernel address) = -EFAULT
+F_GETOWNER_UIDS = 0
+  both our uid: yes
+F_GETOWNER_UIDS(kernel address) = -EFAULT
+F_GETOWN after the owner was reaped = 0
+a dup shares the owner: yes
+another open of the file = 0
+F_GETSIG fresh = 0
+F_SETSIG(SIGUSR1) = 0
+  F_GETSIG on the dup = 10
+F_SETSIG(65) = -EINVAL
+F_SETSIG(-1) = -EINVAL
+F_SETSIG(64) = 0
+F_SETSIG(0) = 0
+F_GETLEASE = 2
+F_SETLEASE(F_UNLCK) without a lease = -EAGAIN
+F_SETLEASE(7) = -EINVAL
+F_SETLEASE(F_RDLCK) on /dev/null = -EACCES
+F_GETLEASE on /dev/null = 2
+F_GET_RW_HINT fresh = 0
+  hint 0
+F_SET_RW_HINT(3) = 0
+  another open reads hint 3 (it is the inode's)
+F_SET_RW_HINT(6) = -EINVAL
+F_SET_RW_HINT(kernel address) = -EFAULT
+F_GET_RW_HINT(kernel address) = -EFAULT
+F_DUPFD_QUERY(fd, its dup) = 1
+F_DUPFD_QUERY(fd, /dev/null) = 0
+F_DUPFD_QUERY(fd, 999) = -EBADF
+F_DUPFD_QUERY(fd, -1) = -EBADF
+F_GETOWN on an O_PATH fd = -EBADF
+F_GETLK on an O_PATH fd = -EBADF
+F_ADD_SEALS on a pipe = -EINVAL
+F_GET_SEALS on a pipe = -EINVAL
+F_SETFL(O_DIRECT) on /dev/null = -EINVAL
+  F_GETFL 100002
+F_SETFL(O_DIRECT) on a tmpfs file = 0
+  F_GETFL 140002
+F_SETFL(0) = 0
+F_SETFL(O_DIRECT) on an eventfd = -EINVAL
+F_GET_SEALS on an eventfd = -EINVAL
+F_CANCELLK = -EINVAL
+unknown command 9999 = -EINVAL
+F_GETOWN(999) = -EBADF
+ab5 fcntl: done

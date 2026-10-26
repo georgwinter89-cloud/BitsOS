@@ -1,0 +1,18 @@
+[package]
+name = "fs-fat"
+version = "0.1.0"
+edition = "2024"
+description = "FAT32 on the boot stick behind the VFS, with the stick identity rules (owner: FS)"
+
+[dependencies]
+vfs = { path = "../vfs" }
+block = { path = "../block" }
+devmodel = { path = "../devmodel" }
+klog = { path = "../klog" }
+mm-core = { path = "../mm-core" }
+kreg = { path = "../kreg" }
+ksync = { path = "../ksync" }
+ktest = { path = "../ktest" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+uapi = { path = "../uapi" }

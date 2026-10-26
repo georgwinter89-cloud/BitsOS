@@ -1,0 +1,14 @@
+target/
+/stick-backup-v1/
+*.img
+/out/
+user/target/
+.lane
+/ref/
+/stick-config.txt
+/stick-backup-v1-*/
+__pycache__/
+
+# the stick ID of your own stick (cargo xtask stick)
+/stick.id
+/plan/

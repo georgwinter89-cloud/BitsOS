@@ -1,0 +1,10 @@
+[package]
+name = "seccomp"
+version = "0.1.0"
+edition = "2024"
+description = "seccomp-bpf (owner: SX)"
+
+[dependencies]
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+uapi = { path = "../uapi" }

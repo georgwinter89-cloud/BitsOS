@@ -1,0 +1,71 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2024"
+description = "The BitsOS V2 kernel binary: entry, init levels, linker script; nothing else (desk)"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+# Boots, runs every registered ktest (filter from CONFIG `ktest=`), prints KTEST lines on COM1, exits QEMU.
+ktest = []
+
+[dependencies]
+# INT-W9 (WL-4 CR 4): config::take_secret zeroes the WLAN passphrase after its one reader.
+zeroize = { version = "=1.9.1", default-features = false }
+acpi = { path = "../crates/acpi" }
+bitsvol = { path = "../crates/bitsvol" }
+block = { path = "../crates/block" }
+bootinfo = { path = "../crates/bootinfo" }
+console = { path = "../crates/console" }
+console-cmds = { path = "../crates/console-cmds" }
+crypt = { path = "../crates/crypt" }
+devmodel = { path = "../crates/devmodel" }
+display = { path = "../crates/display" }
+amdgpu = { path = "../crates/drivers/amdgpu" }
+fch-wdt = { path = "../crates/drivers/fch-wdt" }
+gopfb = { path = "../crates/drivers/gopfb" }
+hda = { path = "../crates/drivers/hda" }
+igc = { path = "../crates/drivers/igc" }
+nvme = { path = "../crates/drivers/nvme" }
+rtw89 = { path = "../crates/drivers/rtw89" }
+usb-core = { path = "../crates/drivers/usb-core" }
+usb-hid = { path = "../crates/drivers/usb-hid" }
+usb-msd = { path = "../crates/drivers/usb-msd" }
+virtio-net = { path = "../crates/drivers/virtio-net" }
+xhci = { path = "../crates/drivers/xhci" }
+fs-ext4 = { path = "../crates/fs-ext4" }
+fs-fat = { path = "../crates/fs-fat" }
+hal = { path = "../crates/hal" }
+kexec = { path = "../crates/kexec" }
+klog = { path = "../crates/klog" }
+klogd = { path = "../crates/klogd" }
+sched-mcp = { path = "../crates/sched-mcp" }
+kreg = { path = "../crates/kreg" }
+ksync = { path = "../crates/ksync" }
+ktest = { path = "../crates/ktest" }
+mcp = { path = "../crates/mcp" }
+mm = { path = "../crates/mm" }
+mm-core = { path = "../crates/mm-core" }
+net = { path = "../crates/net" }
+pci = { path = "../crates/pci" }
+platform = { path = "../crates/platform" }
+policy = { path = "../crates/policy" }
+policy-mcp = { path = "../crates/policy-mcp" }
+proc = { path = "../crates/proc" }
+sched = { path = "../crates/sched" }
+seccomp = { path = "../crates/seccomp" }
+snapshots = { path = "../crates/snapshots" }
+snd = { path = "../crates/snd" }
+syscall = { path = "../crates/syscall" }
+time = { path = "../crates/time" }
+tpm = { path = "../crates/tpm" }
+uapi = { path = "../crates/uapi" }
+userland = { path = "../crates/userland" }
+vfs = { path = "../crates/vfs" }
+vfs-sys = { path = "../crates/vfs-sys" }
+wifi = { path = "../crates/wifi" }

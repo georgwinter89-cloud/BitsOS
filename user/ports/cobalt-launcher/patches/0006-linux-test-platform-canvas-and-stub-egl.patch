@@ -1,0 +1,457 @@
+diff --git a/starboard/linux/shared/BUILD.gn b/starboard/linux/shared/BUILD.gn
+index 938fbf61f9..a287b53e7d 100644
+--- a/starboard/linux/shared/BUILD.gn
++++ b/starboard/linux/shared/BUILD.gn
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import("//starboard/build/config/bitsos.gni")
+ import("//starboard/build/config/toolchain_variables.gni")
+ import("//starboard/shared/starboard/media/media_tests.gni")
+ import("//starboard/shared/starboard/player/buildfiles.gni")
+@@ -307,6 +308,17 @@ static_library("starboard_platform_sources") {
+   if (is_debug || is_devel) {
+     defines += [ "SB_PLAYER_ENABLE_VIDEO_DUMPER" ]
+   }
++
++  if (cobalt_bitsos_canvas) {
++    # BitsOS port test platform: dev.bitsos.Canvas (X11 part in
++    # //starboard/linux/x64x11/shared) and the failing EGL selected by
++    # BITSOS_STUB_EGL=1.
++    sources += [
++      "//starboard/shared/bitsos/egl_gles_stub.cc",
++      "//starboard/shared/bitsos/egl_gles_stub.h",
++    ]
++    defines += [ "STARBOARD_BITSOS_CANVAS" ]
++  }
+ }
+ 
+ source_set("starboard_platform_tests") {
+diff --git a/starboard/linux/shared/system_get_extensions.cc b/starboard/linux/shared/system_get_extensions.cc
+index ff0ad6e873..08e1a3ca20 100644
+--- a/starboard/linux/shared/system_get_extensions.cc
++++ b/starboard/linux/shared/system_get_extensions.cc
+@@ -29,6 +29,11 @@
+ #include "starboard/shared/posix/free_space.h"
+ #include "starboard/shared/posix/memory_mapped_file.h"
+ 
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/extension/bitsos_canvas.h"
++#include "starboard/shared/x11/bitsos_canvas_x11.h"
++#endif
++
+ #if BUILDFLAG(IS_STARBOARD)
+ #include "starboard/elf_loader/evergreen_config.h"
+ #include "starboard/extension/loader_app_metrics.h"
+@@ -87,5 +92,10 @@ const void* SbSystemGetExtension(const char* name) {
+   if (strcmp(name, kStarboardExtensionLowMemoryKillName) == 0) {
+     return starboard::GetLowMemoryKillApi();
+   }
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (strcmp(name, kStarboardExtensionBitsosCanvasName) == 0) {
++    return starboard::GetBitsosCanvasApiX11();
++  }
++#endif
+   return NULL;
+ }
+diff --git a/starboard/linux/x64x11/shared/BUILD.gn b/starboard/linux/x64x11/shared/BUILD.gn
+index 6d32bc0ee4..92309d9934 100644
+--- a/starboard/linux/x64x11/shared/BUILD.gn
++++ b/starboard/linux/x64x11/shared/BUILD.gn
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import("//starboard/build/config/bitsos.gni")
++
+ group("starboard_platform") {
+   public_deps = [
+     ":starboard_platform_sources",
+@@ -54,5 +56,12 @@ static_library("starboard_platform_sources") {
+     sources += [ "//starboard/linux/x64x11/public_system_properties.cc" ]
+   }
+ 
++  if (cobalt_bitsos_canvas) {
++    sources += [
++      "//starboard/shared/x11/bitsos_canvas_x11.cc",
++      "//starboard/shared/x11/bitsos_canvas_x11.h",
++    ]
++  }
++
+   configs += [ "//starboard/build/config:starboard_implementation" ]
+ }
+diff --git a/starboard/shared/bitsos/egl_gles_stub.cc b/starboard/shared/bitsos/egl_gles_stub.cc
+new file mode 100644
+index 0000000000..acb3c94f14
+--- /dev/null
++++ b/starboard/shared/bitsos/egl_gles_stub.cc
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Cobalt Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "starboard/shared/bitsos/egl_gles_stub.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "starboard/common/log.h"
++
++namespace starboard {
++namespace bitsos {
++namespace {
++
++// Matches any interface entry: returns a zero value of its result type.
++template <typename F>
++struct Fail;
++template <typename R, typename... Args>
++struct Fail<R (*)(Args...)> {
++  static R Call(Args...) {
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      SB_LOG(WARNING) << "BitsOS stub EGL called: " << __PRETTY_FUNCTION__;
++    }
++    return R();
++  }
++};
++
++SbEglInt32 GetErrorNotInitialized() {
++  SB_LOG(WARNING) << "BitsOS stub EGL called: eglGetError";
++  return SB_EGL_NOT_INITIALIZED;
++}
++
++const char* QueryStringEmpty(SbEglDisplay, SbEglInt32 name) {
++  SB_LOG(WARNING) << "BitsOS stub EGL called: eglQueryString " << name;
++  // EGL_EXTENSIONS: an empty client extension list instead of null.
++  return name == 0x3055 ? "" : nullptr;
++}
++
++SbEglInterface MakeFailingEgl() {
++  SbEglInterface i;
++  memset(&i, 0, sizeof(i));
++#define SB_FAIL(field) i.field = &Fail<decltype(i.field)>::Call
++  SB_FAIL(eglChooseConfig);
++  SB_FAIL(eglCopyBuffers);
++  SB_FAIL(eglCreateContext);
++  SB_FAIL(eglCreatePbufferSurface);
++  SB_FAIL(eglCreatePixmapSurface);
++  SB_FAIL(eglCreateWindowSurface);
++  SB_FAIL(eglDestroyContext);
++  SB_FAIL(eglDestroySurface);
++  SB_FAIL(eglGetConfigAttrib);
++  SB_FAIL(eglGetConfigs);
++  SB_FAIL(eglGetCurrentDisplay);
++  SB_FAIL(eglGetCurrentSurface);
++  SB_FAIL(eglGetDisplay);
++  SB_FAIL(eglGetProcAddress);
++  SB_FAIL(eglInitialize);
++  SB_FAIL(eglMakeCurrent);
++  SB_FAIL(eglQueryContext);
++  SB_FAIL(eglQuerySurface);
++  SB_FAIL(eglSwapBuffers);
++  SB_FAIL(eglTerminate);
++  SB_FAIL(eglWaitGL);
++  SB_FAIL(eglWaitNative);
++  SB_FAIL(eglBindTexImage);
++  SB_FAIL(eglReleaseTexImage);
++  SB_FAIL(eglSurfaceAttrib);
++  SB_FAIL(eglSwapInterval);
++  SB_FAIL(eglBindAPI);
++  SB_FAIL(eglQueryAPI);
++  SB_FAIL(eglCreatePbufferFromClientBuffer);
++  SB_FAIL(eglReleaseThread);
++  SB_FAIL(eglWaitClient);
++  SB_FAIL(eglGetCurrentContext);
++  SB_FAIL(eglCreateSync);
++  SB_FAIL(eglDestroySync);
++  SB_FAIL(eglClientWaitSync);
++  SB_FAIL(eglGetSyncAttrib);
++  SB_FAIL(eglCreateImage);
++  SB_FAIL(eglDestroyImage);
++  SB_FAIL(eglGetPlatformDisplay);
++  SB_FAIL(eglCreatePlatformWindowSurface);
++  SB_FAIL(eglCreatePlatformPixmapSurface);
++  SB_FAIL(eglWaitSync);
++#undef SB_FAIL
++  i.eglGetError = &GetErrorNotInitialized;
++  i.eglQueryString = &QueryStringEmpty;
++  return i;
++}
++
++}  // namespace
++
++const SbEglInterface* GetFailingEglInterface() {
++  static const SbEglInterface kInterface = MakeFailingEgl();
++  return &kInterface;
++}
++
++const SbGlesInterface* GetEmptyGlesInterface() {
++  static const SbGlesInterface kInterface = {};
++  return &kInterface;
++}
++
++bool IsStubEglRequested() {
++  static const bool requested = [] {
++    const char* v = getenv("BITSOS_STUB_EGL");
++    return v && *v && strcmp(v, "0") != 0;
++  }();
++  return requested;
++}
++
++}  // namespace bitsos
++}  // namespace starboard
+diff --git a/starboard/shared/bitsos/egl_gles_stub.h b/starboard/shared/bitsos/egl_gles_stub.h
+new file mode 100644
+index 0000000000..a2fcf42c25
+--- /dev/null
++++ b/starboard/shared/bitsos/egl_gles_stub.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Cobalt Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// BitsOS port: an EGL that never initialises and an empty GLES table.
++// A platform without any GL hands these out, so Chromium's GL set-up fails
++// cleanly and it falls back to software compositing (dev.bitsos.Canvas).
++
++#ifndef STARBOARD_SHARED_BITSOS_EGL_GLES_STUB_H_
++#define STARBOARD_SHARED_BITSOS_EGL_GLES_STUB_H_
++
++#include "starboard/egl.h"
++#include "starboard/gles.h"
++
++namespace starboard {
++namespace bitsos {
++
++// Every call fails: displays and surfaces are null, booleans are false and
++// eglGetError() reports EGL_NOT_INITIALIZED.
++const SbEglInterface* GetFailingEglInterface();
++
++// All entries null.
++const SbGlesInterface* GetEmptyGlesInterface();
++
++// The Linux test platform keeps its real EGL unless the environment variable
++// BITSOS_STUB_EGL is set to something other than "0".
++bool IsStubEglRequested();
++
++}  // namespace bitsos
++}  // namespace starboard
++
++#endif  // STARBOARD_SHARED_BITSOS_EGL_GLES_STUB_H_
+diff --git a/starboard/shared/egl/system_egl.cc b/starboard/shared/egl/system_egl.cc
+index de928cc0d9..7100b9739e 100644
+--- a/starboard/shared/egl/system_egl.cc
++++ b/starboard/shared/egl/system_egl.cc
+@@ -17,6 +17,10 @@
+ 
+ #include "starboard/egl.h"
+ 
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/egl_gles_stub.h"
++#endif
++
+ #if !defined(EGL_VERSION_1_0) || !defined(EGL_VERSION_1_1) || \
+     !defined(EGL_VERSION_1_2) || !defined(EGL_VERSION_1_3) || \
+     !defined(EGL_VERSION_1_4)
+@@ -123,5 +127,10 @@ const SbEglInterface g_sb_egl_interface = {
+ }  // namespace
+ 
+ const SbEglInterface* SbGetEglInterface() {
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::IsStubEglRequested()) {
++    return starboard::bitsos::GetFailingEglInterface();
++  }
++#endif
+   return &g_sb_egl_interface;
+ }
+diff --git a/starboard/shared/gles/system_gles2.cc b/starboard/shared/gles/system_gles2.cc
+index 8e0f947e89..8f91cd8ee6 100644
+--- a/starboard/shared/gles/system_gles2.cc
++++ b/starboard/shared/gles/system_gles2.cc
+@@ -17,6 +17,10 @@
+ 
+ #include "starboard/gles.h"
+ 
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/egl_gles_stub.h"
++#endif
++
+ namespace {
+ 
+ const SbGlesInterface g_sb_gles_interface = {
+@@ -271,5 +275,10 @@ const SbGlesInterface g_sb_gles_interface = {
+ }  // namespace
+ 
+ const SbGlesInterface* SbGetGlesInterface() {
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::IsStubEglRequested()) {
++    return starboard::bitsos::GetEmptyGlesInterface();
++  }
++#endif
+   return &g_sb_gles_interface;
+ }
+diff --git a/starboard/shared/x11/bitsos_canvas_x11.cc b/starboard/shared/x11/bitsos_canvas_x11.cc
+new file mode 100644
+index 0000000000..3e58e6c0cc
+--- /dev/null
++++ b/starboard/shared/x11/bitsos_canvas_x11.cc
+@@ -0,0 +1,105 @@
++// Copyright 2026 The Cobalt Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++#include "starboard/shared/x11/bitsos_canvas_x11.h"
++
++#include <stdint.h>
++
++#include <mutex>
++
++#include "starboard/common/log.h"
++#include "starboard/extension/bitsos_canvas.h"
++
++// Xlib last: its macros (None, Status, Bool) clash with other headers.
++#include <X11/Xlib.h>
++#include <X11/Xutil.h>
++
++namespace starboard {
++namespace {
++
++// Own connection, used only from Chromium's compositor thread (under the
++// lock), so the application's display needs no XInitThreads().
++std::mutex g_mutex;
++Display* g_display = nullptr;
++Window g_window = 0;
++Visual* g_visual = nullptr;
++int g_depth = 0;
++GC g_gc = nullptr;
++
++bool BindWindow(Window window) {
++  if (!g_display) {
++    g_display = XOpenDisplay(nullptr);
++    if (!g_display) {
++      SB_LOG(ERROR) << "dev.bitsos.Canvas: XOpenDisplay failed";
++      return false;
++    }
++  }
++  if (window == g_window && g_gc) {
++    return true;
++  }
++  if (g_gc) {
++    XFreeGC(g_display, g_gc);
++    g_gc = nullptr;
++  }
++  XWindowAttributes attrs;
++  if (!XGetWindowAttributes(g_display, window, &attrs)) {
++    return false;
++  }
++  g_visual = attrs.visual;
++  g_depth = attrs.depth;
++  g_gc = XCreateGC(g_display, window, 0, nullptr);
++  g_window = window;
++  return true;
++}
++
++void Present(void* window_handle,
++             const void* pixels,
++             int32_t stride,
++             int32_t width,
++             int32_t height,
++             int32_t damage_x,
++             int32_t damage_y,
++             int32_t damage_width,
++             int32_t damage_height) {
++  std::lock_guard<std::mutex> lock(g_mutex);
++  Window window = static_cast<Window>(reinterpret_cast<uintptr_t>(window_handle));
++  if (!BindWindow(window)) {
++    return;
++  }
++  XImage* image = XCreateImage(g_display, g_visual, g_depth, ZPixmap, 0,
++                               static_cast<char*>(const_cast<void*>(pixels)),
++                               width, height, 32, stride);
++  if (!image) {
++    return;
++  }
++  XPutImage(g_display, window, g_gc, image, damage_x, damage_y, damage_x,
++            damage_y, damage_width, damage_height);
++  image->data = nullptr;  // Owned by the caller.
++  XDestroyImage(image);
++  // Write the request out now: |pixels| is only valid during this call.
++  XFlush(g_display);
++}
++
++const StarboardExtensionBitsosCanvasApi kBitsosCanvasApi = {
++    kStarboardExtensionBitsosCanvasName,
++    1,
++    &Present,
++};
++
++}  // namespace
++
++const void* GetBitsosCanvasApiX11() {
++  return &kBitsosCanvasApi;
++}
++
++}  // namespace starboard
+diff --git a/starboard/shared/x11/bitsos_canvas_x11.h b/starboard/shared/x11/bitsos_canvas_x11.h
+new file mode 100644
+index 0000000000..6a77b42cb8
+--- /dev/null
++++ b/starboard/shared/x11/bitsos_canvas_x11.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Cobalt Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++#ifndef STARBOARD_SHARED_X11_BITSOS_CANVAS_X11_H_
++#define STARBOARD_SHARED_X11_BITSOS_CANVAS_X11_H_
++
++namespace starboard {
++
++// The "dev.bitsos.Canvas" extension for the Linux X11 test platform: puts the
++// frame into the window's GL child window, which the X11 application thread
++// already composites over punch-out video.
++const void* GetBitsosCanvasApiX11();
++
++}  // namespace starboard
++
++#endif  // STARBOARD_SHARED_X11_BITSOS_CANVAS_X11_H_

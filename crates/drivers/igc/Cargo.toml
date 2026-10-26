@@ -1,0 +1,18 @@
+[package]
+name = "igc"
+version = "0.1.0"
+edition = "2024"
+description = "Intel I226-V / 82576 (owner: NW)"
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+mm = { path = "../../mm" }
+hal = { path = "../../hal" }
+time = { path = "../../time" }
+sched = { path = "../../sched" }
+net = { path = "../../net" }
+ktest = { path = "../../ktest" }

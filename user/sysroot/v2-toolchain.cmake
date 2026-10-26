@@ -1,0 +1,14 @@
+# CMake toolchain for C/C++ ports built as BitsOS V2 programs (static-pie, musl, libc++):
+#   cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=<V2>/user/sysroot/v2-toolchain.cmake ...
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(CMAKE_C_COMPILER ${CMAKE_CURRENT_LIST_DIR}/bin/v2-cc)
+set(CMAKE_CXX_COMPILER ${CMAKE_CURRENT_LIST_DIR}/bin/v2-c++)
+set(CMAKE_AR llvm-ar)
+set(CMAKE_RANLIB llvm-ranlib)
+set(CMAKE_SYSROOT ${CMAKE_CURRENT_LIST_DIR}/out/sysroot)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)

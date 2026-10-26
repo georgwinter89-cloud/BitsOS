@@ -1,0 +1,15 @@
+[package]
+name = "policy-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "The connection view's MCP tool and console command `connections` (B3, PM-2) (owner: PM)"
+
+[dependencies]
+policy = { path = "../policy" }
+mcp = { path = "../mcp" }
+console = { path = "../console" }
+proc = { path = "../proc" }
+time = { path = "../time" }
+klog = { path = "../klog" }
+ktest = { path = "../ktest" }
+ksync = { path = "../ksync" }

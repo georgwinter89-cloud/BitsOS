@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>WY-0 Testseite</title>
+<style>
+  body { font-family: sans-serif; margin: 2em; background: #fafafa; color: #222; }
+  .row { padding: 6px 10px; border-bottom: 1px solid #ddd; }
+  .row:nth-child(odd) { background: #eef3f8; }
+  input { font-size: 1.3em; width: 30em; }
+</style>
+</head>
+<body>
+<h1 id="title">BitsOS WY-0: Brave in bitscomp</h1>
+<p>Umlaute: äöü ÄÖÜ ß. Die Seite kommt vom lokalen Testserver.</p>
+<p><input id="field" autofocus placeholder="Hier tippen"></p>
+<p id="echo"></p>
+<div id="rows"></div>
+<script>
+  const rows = document.getElementById('rows');
+  for (let i = 1; i <= 400; i++) {
+    const d = document.createElement('div');
+    d.className = 'row';
+    d.textContent = 'Zeile ' + i + ': Lorem ipsum dolor sit amet, Größe und Übermaß, Fußgänger auf der Straße.';
+    rows.appendChild(d);
+  }
+  const field = document.getElementById('field');
+  field.addEventListener('input', () => {
+    document.getElementById('echo').textContent = 'Eingabe: ' + field.value;
+    document.title = 'WY-0 Eingabe: ' + field.value;
+  });
+  // ?scroll=N scrolls N pixels per frame forever: the "scrolling scene" of the CPU measurement.
+  const step = Number(new URLSearchParams(location.search).get('scroll') || 0);
+  if (step > 0) {
+    const tick = () => {
+      const max = document.documentElement.scrollHeight - innerHeight;
+      scrollTo(0, scrollY + step > max ? 0 : scrollY + step);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+</script>
+</body>
+</html>

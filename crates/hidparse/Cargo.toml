@@ -1,0 +1,8 @@
+[package]
+name = "hidparse"
+version = "0.1.0"
+edition = "2024"
+description = "HID report-descriptor parser, report field extraction, Linux evdev mapping (owner: IN, item IN-1)"
+
+[dependencies]
+

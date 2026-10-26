@@ -1,0 +1,12 @@
+[package]
+name = "policy"
+version = "0.1.0"
+edition = "2024"
+description = "Georg's per-program rules, connection records (B3) (owner: PM)"
+
+[dependencies]
+ksync = { path = "../ksync" }
+klog = { path = "../klog" }
+# ktests only: the ask ktests answer from a second thread.
+ktest = { path = "../ktest" }
+sched = { path = "../sched" }

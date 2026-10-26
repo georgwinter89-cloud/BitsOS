@@ -1,0 +1,84 @@
+## Our choices on top of busybox's defconfig (build.sh checks that each line survives oldconfig).
+## v2-cc links static-pie itself; busybox's own -static/-pie switches would fight it.
+# CONFIG_STATIC is not set
+# CONFIG_PIE is not set
+## Applets run through the /bin/<applet> links, never by re-executing /proc/self/exe.
+# CONFIG_FEATURE_PREFER_APPLETS is not set
+# CONFIG_FEATURE_SH_STANDALONE is not set
+## V2 has no sendfile yet (ENOSYS); busybox then uses read/write.
+# CONFIG_FEATURE_USE_SENDFILE is not set
+## PID 1 is our init; no second init, getty or power switching from a shell.
+# CONFIG_INIT is not set
+# CONFIG_LINUXRC is not set
+# CONFIG_HALT is not set
+# CONFIG_POWEROFF is not set
+# CONFIG_REBOOT is not set
+# CONFIG_GETTY is not set
+# CONFIG_BOOTCHARTD is not set
+## No tools that format, partition or raw-write disks, poke physical memory, the watchdog, the RTC, I2C or
+## flash: V2's guards (nvme_write, stick_write) stay the only way to write a disk, and Georg's stick and NVMe
+## never meet mkfs or fdisk by a typo.
+# CONFIG_DEVMEM is not set
+# CONFIG_FDISK is not set
+# CONFIG_MKE2FS is not set
+# CONFIG_MKFS_EXT2 is not set
+# CONFIG_MKFS_MINIX is not set
+# CONFIG_MKFS_VFAT is not set
+# CONFIG_MKDOSFS is not set
+# CONFIG_MKSWAP is not set
+# CONFIG_FSCK_MINIX is not set
+# CONFIG_FSCK is not set
+# CONFIG_BLKDISCARD is not set
+# CONFIG_FREERAMDISK is not set
+# CONFIG_FDFLUSH is not set
+# CONFIG_FDFORMAT is not set
+# CONFIG_HDPARM is not set
+# CONFIG_PARTPROBE is not set
+# CONFIG_WATCHDOG is not set
+# CONFIG_RTCWAKE is not set
+# CONFIG_HWCLOCK is not set
+# CONFIG_I2CGET is not set
+# CONFIG_I2CSET is not set
+# CONFIG_I2CDUMP is not set
+# CONFIG_I2CDETECT is not set
+# CONFIG_I2CTRANSFER is not set
+# CONFIG_NANDWRITE is not set
+# CONFIG_NANDDUMP is not set
+# CONFIG_UBIATTACH is not set
+# CONFIG_UBIDETACH is not set
+# CONFIG_UBIMKVOL is not set
+# CONFIG_UBIRMVOL is not set
+# CONFIG_UBIRSVOL is not set
+# CONFIG_UBIUPDATEVOL is not set
+# CONFIG_UBIRENAME is not set
+# CONFIG_SWAPON is not set
+# CONFIG_SWAPOFF is not set
+# CONFIG_LOSETUP is not set
+# CONFIG_SETSERIAL is not set
+# CONFIG_RAIDAUTORUN is not set
+# CONFIG_FSFREEZE is not set
+# CONFIG_FSTRIM is not set
+# CONFIG_ADJTIMEX is not set
+# CONFIG_FATATTR is not set
+## tc does not build against current Linux UAPI headers (CBQ was removed from them in Linux 6.8).
+# CONFIG_TC is not set
+## The shell: ash with line editing, history and job control.
+CONFIG_ASH=y
+CONFIG_SH_IS_ASH=y
+CONFIG_ASH_JOB_CONTROL=y
+CONFIG_FEATURE_EDITING=y
+CONFIG_FEATURE_EDITING_HISTORY=255
+CONFIG_FEATURE_EDITING_SAVEHISTORY=y
+CONFIG_FEATURE_TAB_COMPLETION=y
+## The applets the brief names (defconfig has them; listed so a later defconfig cannot drop them silently).
+CONFIG_VI=y
+CONFIG_LESS=y
+CONFIG_PS=y
+CONFIG_TOP=y
+CONFIG_FREE=y
+CONFIG_MOUNT=y
+CONFIG_PING=y
+CONFIG_WGET=y
+CONFIG_NC=y
+CONFIG_IP=y
+CONFIG_IFCONFIG=y

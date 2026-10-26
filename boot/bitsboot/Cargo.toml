@@ -1,0 +1,28 @@
+[package]
+name = "bitsboot"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS V2 UEFI loader: no menu, system generations, BootInfo v1 (owner: BT)"
+
+# The firmware-free checks and choices; also built for the host so `cargo test -p bitsboot` runs them.
+[lib]
+name = "bitsboot_pure"
+path = "src/pure/lib.rs"
+doctest = false
+
+[[bin]]
+name = "bitsboot"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+bootinfo = { path = "../../crates/bootinfo" }
+
+# Only the UEFI binary talks to the firmware; keeping uefi out of host builds keeps its global allocator out
+# of the host test binary.
+[target.'cfg(target_os = "uefi")'.dependencies]
+# No `logger`/`panic_handler` features: bitsboot logs into the LOADER_LOG buffer too and its panic screen
+# returns to the firmware instead of shutting the machine down.
+uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
+log = { version = "0.4", default-features = false }

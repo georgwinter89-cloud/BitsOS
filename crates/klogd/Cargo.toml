@@ -1,0 +1,29 @@
+[package]
+name = "klogd"
+version = "0.1.0"
+edition = "2024"
+description = "klog service: drain thread for deferred sinks, ring sizing, MCP tool log (owner: RB)"
+
+[dependencies]
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ktest = { path = "../ktest" }
+mcp = { path = "../mcp" }
+mm-core = { path = "../mm-core" }
+policy = { path = "../policy" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+ksync = { path = "../ksync" }
+# RB-4 (mirror): the network for the normal path and the cards for the emergency path, CONFIG and the Reload
+# counter from kexec's BootInfo, interrupts off in the emergency ktests.
+devmodel = { path = "../devmodel" }
+hal = { path = "../hal" }
+kexec = { path = "../kexec" }
+net = { path = "../net" }
+# RB-7b (metrics): programs' CPU time, disks, the root complex for k10temp's SMN reads.
+proc = { path = "../proc" }
+block = { path = "../block" }
+pci = { path = "../pci" }
+# RB-8 (journal): the node /dev/bitsos/events (devnode!, errno values, the boot id from vfs::random).
+vfs = { path = "../vfs" }
+uapi = { path = "../uapi" }

@@ -1,0 +1,107 @@
+sysinfo = 0
+  uptime > 0: yes
+  loads below 1000.0: yes
+  totalram > 64 MiB: yes
+  freeram <= totalram: yes
+  sharedram <= totalram: yes
+  freeswap <= totalswap: yes
+  procs > 0: yes
+  mem_unit = 1, totalhigh = 0, freehigh = 0
+sysinfo(kernel address) = -EFAULT
+sysinfo(NULL) = -EFAULT
+  uptime grew after 1.1 s: yes
+getrandom(16, 0) = 16
+getrandom(16, GRND_NONBLOCK) = 16
+getrandom(16, GRND_RANDOM) = 16
+getrandom(16, GRND_INSECURE) = 16
+getrandom(16, GRND_INSECURE|GRND_NONBLOCK) = 16
+getrandom(16, GRND_RANDOM|GRND_INSECURE) = -EINVAL
+getrandom(16, 8) = -EINVAL
+getrandom(16, 1 << 32) = 16
+getrandom(NULL, 0) = 0
+getrandom(kernel address, 1) = -EFAULT
+getrandom(NULL, 1) = -EFAULT
+getrandom(8 bytes before an unmapped page, 64) = 8
+two 32-byte answers differ: yes
+4096 bytes: fewer than 64 zero bytes: yes
+getrlimit(99) = -EINVAL
+getrlimit(NOFILE, kernel address) = -EFAULT
+setrlimit(NOFILE, 64/128) = 0
+  now 64/128
+setrlimit(NOFILE, hard up to 256) as a user = -EPERM
+setrlimit(NOFILE, cur above max) = -EINVAL
+setrlimit(NOFILE, max above nr_open) = -EPERM
+setrlimit(NOFILE, kernel address) = -EFAULT
+  open with NOFILE 10: stopped after 7 with EMFILE
+  dup = -EMFILE
+  dup2(0, 10) = -EBADF
+  dup2(0, 9) = 9
+  fcntl(0, F_DUPFD, 10) = -EINVAL
+  fcntl(0, F_DUPFD, 3) = -EMFILE
+prlimit64(child, NOFILE, 20/128, &old) = 0
+  old = 64/128
+prlimit64(no such pid, NOFILE, NULL, &old) = -ESRCH
+prlimit64(no such pid, NOFILE, kernel address, NULL) = -EFAULT
+prlimit64(0, 99, NULL, &old) = -EINVAL
+prlimit64(0, NOFILE, NULL, kernel address) = -EFAULT
+prlimit64(-1, NOFILE, NULL, &old) = -ESRCH
+  the child sees NOFILE 20: yes
+dup(-1) = -EBADF
+dup(999) = -EBADF
+dup2(999, 50) = -EBADF
+dup2(fd, fd) = 0
+dup2(999, 999) = -EBADF
+dup2(fd, -1) = -EBADF
+dup3(fd, fd, 0) = -EINVAL
+dup3(fd, 50, 1) = -EINVAL
+dup3(fd, 50, O_CLOEXEC) = 50
+  F_GETFD = 1
+dup2(fd, 50) over it = 50
+  F_GETFD (dup2 clears close-on-exec) = 0
+dup shares the open file (status flags): yes
+  and not the close-on-exec bit = 0
+sched_yield = 0
+F_GETPIPE_SZ of a new pipe = 65536
+F_SETPIPE_SZ(0): one page = 4096
+F_SETPIPE_SZ(5000) rounds up = 8192
+  F_GETPIPE_SZ on the other end = 8192
+F_SETPIPE_SZ(65536) = 65536
+F_SETPIPE_SZ(2 MiB) above pipe-max-size = -EPERM
+F_SETPIPE_SZ(0x80000001) = -EINVAL
+F_SETPIPE_SZ(-1) = -EINVAL
+F_SETPIPE_SZ(1 << 32): the int argument = 4096
+  F_GETPIPE_SZ = 4096
+F_SETPIPE_SZ(65536) again = 65536
+write 12288 bytes = 12288
+F_SETPIPE_SZ(4096) with three pages queued = -EBUSY
+F_SETPIPE_SZ(16384) with three pages queued = 16384
+  read them back = 12288
+F_GETPIPE_SZ on /dev/null = -EBADF
+F_SETPIPE_SZ on /dev/null = -EBADF
+F_GETPIPE_SZ on an eventfd = -EBADF
+F_GETPIPE_SZ(999) = -EBADF
+close_range(5, 3, 0) = -EINVAL
+close_range(60, 60, 8): unknown flag = -EINVAL
+close_range(60, 61, 0) = 0
+  60 and 61 closed, 62 open: yes
+close_range(62, ~0, CLOSE_RANGE_CLOEXEC) = 0
+  F_GETFD(62) = 1
+close_range(62, ~0, CLOSE_RANGE_UNSHARE) = 0
+  F_GETFD(62) = -EBADF
+close_range(4000, ~0, 0): nothing open = 0
+close_range(~0, ~0, 0) = 0
+  fd itself still open: yes
+getpriority(0) works: yes
+setpriority(PRIO_PROCESS, the thread's tid, 19) = 0
+  getpriority(the thread's tid) = 19
+  the main thread's nice is unchanged: yes
+sched_setaffinity(the thread's tid, CPU 0) = 0
+  sched_getaffinity(the thread's tid) = 0
+  only CPU 0: yes
+  the main thread's mask is unchanged: yes
+  the thread's own getpriority(0): 19
+setpriority(PRIO_PROCESS, own tid, 18) = 0
+sched_setaffinity(0, CPU 0) = 0
+  the child has nice 18: yes
+  the child runs on CPU 0 only: yes
+ab5 misc: done

@@ -1,0 +1,14 @@
+PID COMMAND
+ps-rows
+mem
+Linux
+uptime
+date
+proc-self
+nproc
+Mem:
+df
+paged
+two
+end
+exit 0

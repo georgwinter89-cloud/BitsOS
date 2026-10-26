@@ -1,0 +1,9 @@
+Ausdruck der elektronischen Lohnsteuerbescheinigung 2025
+Arbeitgeber: Brandtner Maschinenbau GmbH, Beispielstadt
+Zeitraum: 01.01.2025 bis 31.12.2025
+Bruttoarbeitslohn: 52.480,00 EUR
+Einbehaltene Lohnsteuer: 8.912,00 EUR
+Solidaritätszuschlag: 0,00 EUR
+Kirchensteuer: 712,96 EUR
+Steuerklasse: 3
+Bitte sorgfältig aufbewahren, die Daten liegen dem Finanzamt bereits vor.

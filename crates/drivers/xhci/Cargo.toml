@@ -1,0 +1,18 @@
+[package]
+name = "xhci"
+version = "0.1.0"
+edition = "2024"
+description = "xHCI host controller (owner: US)"
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+mm = { path = "../../mm" }
+hal = { path = "../../hal" }
+time = { path = "../../time" }
+sched = { path = "../../sched" }
+ktest = { path = "../../ktest" }
+usb-core = { path = "../usb-core" }

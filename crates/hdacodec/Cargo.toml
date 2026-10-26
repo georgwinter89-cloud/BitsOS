@@ -1,0 +1,22 @@
+[package]
+name = "hdacodec"
+version = "0.1.0"
+edition = "2024"
+description = "HD Audio codec graph: model from verb answers, output paths, setup verb lists, dump format (owner: SN, item SN-1)"
+
+[dependencies]
+
+[dev-dependencies]
+# Register names and fields to check the DP audio tables against (SN-5); tests only.
+dcn314-regs = { path = "../dcn314-regs" }
+
+[features]
+# Synthetic codecs (ALC269, AMD AA01) for the fixture generator and tests; not for the kernel.
+synth = []
+# The display engine's register image (dpaudio_fake) for the kernel glue's host tests in hda; not for the kernel.
+fake = []
+
+[[example]]
+name = "synth"
+required-features = ["synth"]
+

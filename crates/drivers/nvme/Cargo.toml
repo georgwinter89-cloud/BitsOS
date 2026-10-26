@@ -1,0 +1,20 @@
+[package]
+name = "nvme"
+version = "0.1.0"
+edition = "2024"
+description = "NVMe with the write gate (owner: NV)"
+
+[dependencies]
+block = { path = "../../block" }
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+ktest = { path = "../../ktest" }
+mcp = { path = "../../mcp" }
+mm = { path = "../../mm" }
+policy = { path = "../../policy" }
+hal = { path = "../../hal" }
+sched = { path = "../../sched" }
+time = { path = "../../time" }

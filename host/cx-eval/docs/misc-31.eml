@@ -1,0 +1,12 @@
+From: Sicherheit Nordbank <sicherheit@nordbank-konto.example>
+To: thomas.keller@example.org
+Subject: Dringend: Ihr Konto wird gesperrt!
+Date: Thu, 09 Apr 2026 03:12:00 +0200
+Message-ID: <phish-409@nordbank-konto.example>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sehr geehrter Kunde, wir haben ungewöhnliche Aktivitäten auf Ihrem Konto festgestellt.
+Bestätigen Sie sofort Ihre Daten über den Link unten, sonst wird Ihr Konto gesperrt.
+(Das ist Phishing, nicht von meiner Bank. Nicht klicken. Zum Löschen vorgemerkt.)

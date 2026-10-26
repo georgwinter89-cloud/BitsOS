@@ -1,0 +1,41 @@
+<!doctype html>
+<!-- YT-5: what Cobalt answers YouTube's format questions with (MediaSource.isTypeSupported, as YouTube TV asks
+     with width/height/framerate; MediaCapabilities.decodingInfo). One console line per question:
+     "caps: <yes|no> <type>", then "caps: done". Expected on BitsOS: no 4K/8K, no HDR, no ec-3/ac-3. -->
+<html>
+<head><meta charset="utf-8"><title>caps</title></head>
+<body style="background:#000">
+<script>
+'use strict';
+const q = [
+  'video/webm; codecs="vp9"; width=1920; height=1080; framerate=60',
+  'video/webm; codecs="vp9"; width=1080; height=1920; framerate=30',
+  'video/webm; codecs="vp9"; width=1920; height=1088; framerate=30',
+  'video/webm; codecs="vp9"; width=1921; height=1080; framerate=30',
+  'video/webm; codecs="vp9"; width=2560; height=1440; framerate=30',
+  'video/webm; codecs="vp9"; width=3840; height=2160; framerate=30',
+  'video/webm; codecs="vp9"; width=7680; height=4320; framerate=30',
+  'video/mp4; codecs="av01.0.09M.08"; width=1920; height=1080; framerate=60',
+  'video/mp4; codecs="av01.0.12M.08"; width=3840; height=2160; framerate=60',
+  'video/webm; codecs="vp09.02.51.10.01.09.16.09.00"; width=1920; height=1080',
+  'video/mp4; codecs="av01.0.09M.10.0.110.09.16.09.0"; width=1920; height=1080',
+  'video/mp4; codecs="avc1.640028"; width=1920; height=1080; framerate=30',
+  'audio/webm; codecs="opus"',
+  'audio/mp4; codecs="mp4a.40.2"',
+  'audio/mp4; codecs="ac-3"',
+  'audio/mp4; codecs="ec-3"',
+];
+for (const t of q) console.log('caps: ' + (MediaSource.isTypeSupported(t) ? 'yes' : 'no') + ' ' + t);
+(async () => {
+  if (navigator.mediaCapabilities) {
+    for (const [w, h] of [[1920, 1080], [3840, 2160]]) {
+      const r = await navigator.mediaCapabilities.decodingInfo({ type: 'media-source',
+        video: { contentType: 'video/webm; codecs="vp9"', width: w, height: h, bitrate: 8000000, framerate: 30 } });
+      console.log('caps: ' + (r.supported ? 'yes' : 'no') + ' decodingInfo vp9 ' + w + 'x' + h);
+    }
+  }
+  console.log('caps: done');
+})();
+</script>
+</body>
+</html>

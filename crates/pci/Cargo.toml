@@ -1,0 +1,16 @@
+[package]
+name = "pci"
+version = "0.1.0"
+edition = "2024"
+description = "PCI enumeration (ECAM), capabilities, BAR sizing, driver registry, opt-in keys (owner: PC)"
+
+[dependencies]
+acpi = { path = "../acpi" }
+dcn314-regs = { path = "../dcn314-regs" }
+hal = { path = "../hal" }
+ksync = { path = "../ksync" }
+kreg = { path = "../kreg" }
+klog = { path = "../klog" }
+ktest = { path = "../ktest" }
+sched = { path = "../sched" }
+time = { path = "../time" }

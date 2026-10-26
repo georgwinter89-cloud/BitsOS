@@ -1,0 +1,6 @@
+Benchmark und Stresstest
+Cinebench Multi: 15.842 Punkte, Single: 1.838
+Spiele 1440p hoch: 112 FPS Durchschnitt, 1 Prozent Tiefstwerte 84 FPS
+CPU unter Last 74 Grad, Grafikkarte 68 Grad, Hotspot 84 Grad
+Lüfterlautstärke subjektiv leise bis 60 Prozent Drehzahl.
+RAM-Test: 4 Durchläufe Memtest ohne Fehler.

@@ -1,0 +1,388 @@
+#!/bin/sh
+# BR-2: `brave` starts the Brave browser (CachyOS's build) on BitsOS V2 in the running desktop (bitscomp). Lives in
+# \BITSOS2\bin\ (on PATH); Brave itself in \BITSOS2\brave\ (manifest `tree brave`, made by scripts/stage-v2.sh).
+#   brave [URL] [-- Brave arguments]   start in the desktop; ends when Brave ends (Ctrl+Q or its window's close)
+#   brave --check                      check the tree, libraries, fonts, desktop, user and profile; start nothing
+# Brave is a Wayland client: it needs the desktop. It never runs as root: started by root (console, MCP as root) it
+# runs as uid 1000 (BusyBox chpst -u 1000:1000), and refuses to start if root cannot hand over. Its sandbox is off
+# (--no-sandbox: V2 has no seccomp and user namespaces yet, SX-1..3).
+# The profile (bookmarks, cookies, settings): on the data volume, /data/appdata/brave, when one is mounted writable
+# at /data (ext4, FS-8); else as one file on the stick, \BITSOS2\home\brave_profile.tar (+ the copy before it, .old),
+# unpacked into RAM at the start and packed back after a clean end, as Cobalt's sign-in: FAT holds neither the
+# SingletonLock symlink nor SQLite's locks. The page cache stays in RAM then. The first start on a data volume
+# takes the stick's tar profile over into the empty /data/appdata/brave once and renames it .imported (INT-W11).
+# One Brave per profile: a second `brave URL` hands the URL to the running one (Chromium's own singleton).
+# The BRAVE_* settings exist for host/tests/br/20-launcher.sh (a fake tree and mount table on the build host).
+MNT=${BRAVE_MOUNT:-/boot}
+T=${BRAVE_TREE:-$MNT/BITSOS2/brave}
+P=${BRAVE_HOME:-$MNT/BITSOS2/home}
+PROF=$P/brave_profile.tar
+DATA=${BRAVE_DATA:-/data}
+PD=$DATA/appdata/brave
+# The kernel's line about /data (FS-8c): waiting, creating, mounted pool|plain rw|ro, skipped/failed <why>.
+STATE=${BRAVE_DATA_STATE:-/run/bitsos/data-state}
+MOUNTS=${BRAVE_MOUNTS:-/proc/self/mounts}
+ALSA_SYS=${BRAVE_ALSA_SYS:-/usr/share/alsa/alsa.conf}
+USER_RUN=${BRAVE_USER_RUN:-/run/user/1000}
+TMP=${BRAVE_TMP:-/tmp}
+URL=
+PATH=${BRAVE_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
+export PATH
+UID_NOW=$(id -u 2>/dev/null)
+# The flags of BR-1's run on CachyOS (plan/notes/br-BR-1.md), which V2 is measured against.
+FLAGS="--ozone-platform=wayland --disable-gpu --password-store=basic --no-sandbox --disable-breakpad
+--disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required"
+# Dark or light as the desktop (settingsd theme.mode, Georg 23.10.): Chromium has no portal here to ask, so the
+# browser and web pages' prefers-color-scheme follow --force-dark-mode; a change applies at Brave's next start.
+THEME=${BRAVE_THEME-$(settings get theme.mode 2>/dev/null)}
+[ "$THEME" != dark ] || FLAGS="$FLAGS --force-dark-mode"
+
+say() { echo "brave: $*"; }
+case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
+
+tree_ok() {
+  for f in brave resources.pak icudtl.dat v8_context_snapshot.bin locales/en-US.pak lib/libgtk-3.so.0 \
+      etc/fonts/fonts.conf share/glib-2.0/schemas/gschemas.compiled; do
+    [ -e "$T/$f" ] || { say "tree $T: $f is missing (copy \\BITSOS2\\brave\\ to the stick)"; return 1; }
+  done
+}
+
+# Brave has no RPATH: its libraries come through LD_LIBRARY_PATH=$T/lib, exactly as the start below sets it. The
+# libraries Chromium and NSS dlopen (GTK 3, the soft token, freebl) are listed by the loader itself (ld.so --list).
+LDSO=${BRAVE_LDSO:-/usr/lib/ld-linux-x86-64.so.2}
+libs_ok() {
+  out=$(env LD_LIBRARY_PATH="$T/lib" LD_TRACE_LOADED_OBJECTS=1 "$T/brave" 2>&1) || { say "libraries: the loader failed: $out"; return 1; }
+  for so in libgtk-3.so.0 libsoftokn3.so libfreeblpriv3.so; do
+    o=$("$LDSO" --library-path "$T/lib" --list "$T/lib/$so" 2>&1) || { say "libraries: the loader failed on lib/$so: $o"; return 1; }
+    out="$out
+$o"
+  done
+  miss=$(echo "$out" | grep "not found" | sort -u)
+  [ -z "$miss" ] || { say "libraries missing: $(echo "$miss" | sed 's/^[[:space:]]*//' | tr '\n' ';' | sed 's/;$//; s/;/; /g')"; return 1; }
+  say "libraries: $(echo "$out" | grep '=>' | sed 's/^[[:space:]]*//; s/ (.*//' | sort -u | grep -c .) found, none missing"
+}
+
+fonts_line() {
+  n=$(ls "$T/fonts" 2>/dev/null | grep -c .)
+  c=$(ls "$T/fontcache" 2>/dev/null | grep -c '\.cache-')
+  say "fonts: $n in $T/fonts, $c prebuilt cache file(s)"
+}
+
+# The desktop's own process (bitscomp's helpers `bitscomp page/ctl ...` are not desktops); sets WD (the Wayland
+# socket's path) or why.
+desk_pids() {
+  ps_=
+  for p in $(pidof bitscomp); do
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+      *" page "* | *" ctl "* | *" page" | *" ctl") ;;
+      *) ps_="$ps_${ps_:+ }$p" ;;
+    esac
+  done
+  echo "$ps_"
+}
+find_desk() {
+  WD= why=
+  if [ -n "$WAYLAND_DISPLAY" ] && [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    WD=$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  set -- $(desk_pids)
+  [ $# -gt 0 ] || { why="none runs (start the desktop first)"; return 1; }
+  [ $# = 1 ] || { why="$# desktops run"; return 1; }
+  sock=wayland-bits-0 prev=
+  for a in $(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null); do
+    [ "$prev" != --socket ] || sock=$a
+    prev=$a
+  done
+  xdg=$(tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -n 1)
+  [ -n "$xdg" ] || { why="its XDG_RUNTIME_DIR cannot be read (/proc/$1/environ)"; return 1; }
+  WD=$xdg/$sock
+  [ -S "$WD" ] || { why="its socket $WD is missing"; WD=; return 1; }
+}
+
+# The uid Brave runs as: the caller's, never root's (DROP = root's hand-over to uid 1000, NOROOT = why it fails).
+as_user() {
+  DROP= NOROOT=
+  [ "$UID_NOW" = 0 ] || return 0
+  out=$(chpst -u 1000:1000 id -u 2>&1)
+  if [ "$out" = 1000 ]; then DROP="chpst -u 1000:1000"; return 0; fi
+  NOROOT="root cannot hand over to uid 1000 (chpst -u 1000:1000: $(echo "${out:-no answer}" | head -n 1))"
+}
+# shellcheck disable=SC2086
+u() { $DROP "$@"; }
+
+# The desktop as Brave's user can reach it (root's own bitscomp is not uid 1000's).
+desk_line() {
+  if ! find_desk; then say "desktop: $why"; return 1; fi
+  if u test -w "$WD"; then say "desktop: $WD"; return 0; fi
+  why="$WD is not writable for Brave's user"
+  say "desktop: $why"
+  return 1
+}
+
+# Where the profile lives (sets MODE data|tar|ram and why).
+mounted_rw() { awk -v m="$1" '$2 == m { split($4, o, ","); if (o[1] == "rw") { print $3; found = 1 } } END { exit !found }' "$MOUNTS" 2>/dev/null | tail -n 1; }
+profile_mode() {
+  why=
+  fs=$(mounted_rw "$DATA")
+  if [ -n "$fs" ] && [ "$fs" != vfat ]; then MODE=data; return; fi
+  [ -z "$fs" ] && why="no data volume at $DATA" || why="$DATA is vfat"
+  if [ "$(mounted_rw "$MNT")" != vfat ]; then why="$why and the stick is not mounted writable at $MNT"; MODE=ram; return; fi
+  if [ "$UID_NOW" = 0 ] || { [ -d "$P" ] && [ -w "$P" ]; }; then MODE=tar; return; fi
+  why="$why and $P is not writable for uid $UID_NOW"
+  MODE=ram
+}
+# Before the first choice: /data may still be coming (the kernel mounts it in the background after boot). Waits
+# while the state says `waiting` (130 s at most) or is missing although the kernel's folder exists (5 s: a kernel
+# before FS-8c writes none). `creating` (the first boot makes the image, minutes) does not wait: the stick's tar
+# profile is used as before and taken over on a later start.
+data_wait() {
+  fs=$(mounted_rw "$DATA")
+  [ -z "$fs" ] || [ "$fs" = vfat ] || return 0
+  n=0
+  while :; do
+    st=$(head -n 1 "$STATE" 2>/dev/null)
+    case $st in
+      waiting*) max=${BRAVE_DATA_WAIT:-260} ;;
+      '') [ -d "${STATE%/*}" ] || return 0; max=10 ;;
+      creating*) say "profile: data volume is being made; the stick's profile is used this time"; return 0 ;;
+      *) return 0 ;;
+    esac
+    [ $n -lt "$max" ] || { say "profile: /data is still not there (${st:-no state}); not waiting longer"; return 0; }
+    [ $n != 0 ] || say "profile: waiting for the data volume (${st:-no state yet})"
+    n=$((n + 1))
+    sleep 0.5
+  done
+}
+profile_line() {
+  profile_mode
+  case $MODE in
+    data) say "profile: $PD (data volume)" ;;
+    tar) say "profile: $PROF (packed back after a clean end; $why)" ;;
+    *) say "profile: in RAM only ($RUN/profile): $why" ;;
+  esac
+}
+
+# The data volume's folder for Brave, owned by Brave's user (root makes it once; never through a link).
+data_dir() {
+  u mkdir -p "$PD" 2>/dev/null && u test -w "$PD" && return 0
+  [ "$UID_NOW" = 0 ] || { say "cannot make $PD"; return 1; }
+  mkdir -p "$DATA/appdata" && { [ -e "$PD" ] || { mkdir "$PD" && chown 1000:1000 "$PD" && chmod 700 "$PD"; }; } \
+    && [ ! -L "$PD" ] && [ "$(stat -c %u "$PD")" = 1000 ] || { say "$PD is not uid 1000's own directory"; return 1; }
+}
+
+# Once: the stick's tar profile (else the copy before it) into the empty data folder; the tar becomes .imported
+# (where it can be renamed) so later starts never take it again. A failed unpack leaves the folder empty.
+import_tar() {
+  [ -z "$(ls -A "$PD" 2>/dev/null)" ] || return 0
+  for src in "$PROF" "$PROF.old"; do
+    [ -f "$src" ] || continue
+    # shellcheck disable=SC2016
+    if u sh -c 'rm -rf "$1/.import" && mkdir "$1/.import" && tar -xf - -C "$1/.import" 2>/dev/null && [ -d "$1/.import/profile" ] &&
+        for f in "$1/.import/profile/"* "$1/.import/profile/".[!.]* "$1/.import/profile/"..?*; do
+          [ ! -e "$f" ] && [ ! -L "$f" ] || mv "$f" "$1/" || exit 1; done && rm -rf "$1/.import"' _ "$PD" <"$src"; then
+      if mv "$src" "$PROF.imported" 2>/dev/null; then say "profile: the stick's ${src##*/} taken over into $PD (now ${PROF##*/}.imported)"
+      else say "profile: the stick's ${src##*/} taken over into $PD (it stays on the stick)"; fi
+      return 0
+    fi
+    u sh -c 'cd "$1" && rm -rf -- * .[!.]* ..?*' _ "$PD"
+    say "profile: $src cannot be taken over"
+  done
+}
+
+# The tar profile into $RUN/profile: the stick's copy, else the one before it, else the one in RAM, else new.
+restore() {
+  if [ -e "$RUN/.unsaved" ] && [ -d "$RUN/profile" ]; then say "profile: the one from the last start in RAM (not on the stick)"; return 0; fi
+  for src in "$PROF" "$PROF.old"; do
+    [ -f "$src" ] || continue
+    # shellcheck disable=SC2016
+    if u sh -c 'rm -rf "$1/.restore" && mkdir "$1/.restore" && tar -xf - -C "$1/.restore" 2>/dev/null && [ -d "$1/.restore/profile" ] &&
+        rm -rf "$1/profile" && mv "$1/.restore/profile" "$1/profile" && rm -rf "$1/.restore"' _ "$RUN" <"$src"; then
+      say "profile: taken from the stick (${src##*/})"
+      return 0
+    fi
+    u rm -rf "$RUN/.restore"
+    say "profile: $src cannot be read"
+  done
+  if [ -d "$RUN/profile" ]; then say "profile: the one from the last start in RAM"; else say "profile: new"; fi
+}
+# Packed back after a clean end: a new file, then renames (copy -> .old, new -> copy); a failure keeps a copy.
+save() {
+  [ -d "$RUN/profile" ] || return 0
+  if [ -n "$unclean" ]; then u touch "$RUN/.unsaved"; say "profile not saved: $unclean; the stick keeps the copy of the last clean end"; return 0; fi
+  if ! { mkdir -p "$P" && rm -f "$PROF.new"; }; then not_saved "$P cannot be made"; return 1; fi
+  drop_caches
+  u tar -cf - -C "$RUN" profile >"$PROF.new" \
+    || { not_saved "writing $PROF.new failed (stick full, or over FAT's 4 GiB per file?)"; return 1; }
+  if [ -f "$PROF" ] && ! { rm -f "$PROF.old" && mv "$PROF" "$PROF.old"; }; then not_saved "$PROF cannot be moved aside"; return 1; fi
+  if ! mv "$PROF.new" "$PROF"; then
+    [ -e "$PROF" ] || [ ! -f "$PROF.old" ] || mv "$PROF.old" "$PROF"
+    not_saved "$PROF.new cannot be renamed"
+    return 1
+  fi
+  u rm -f "$RUN/.unsaved"
+  sync
+  kb=$(du -k "$PROF" | cut -f1)
+  say "profile saved on the stick ($kb KB)"
+  [ "${kb:-0}" -le 1048576 ] || say "warning: the profile's copy is over 1 GiB; FAT holds at most 4 GiB per file"
+}
+not_saved() { rm -f "$PROF.new"; u touch "$RUN/.unsaved"; say "profile not saved: $*"; }
+# Caches Chromium makes again stay out of the stick's copy (FAT holds at most 4 GiB per file); in each profile
+# folder (Default, Profile N, ...) and at the top. CacheStorage (the Cache API) is a site's data and stays.
+CACHES="Cache|Code Cache|GPUCache|DawnCache|DawnGraphiteCache|DawnWebGPUCache|Service Worker/ScriptCache|GrShaderCache|GraphiteDawnCache|ShaderCache|component_crx_cache|extensions_crx_cache"
+# shellcheck disable=SC2016
+drop_caches() { u sh -c 'IFS="|"; for c in $2; do for d in "$1" "$1"/*/; do rm -rf "${d%/}/$c"; done; done' _ "$RUN/profile" "$CACHES"; }
+
+# A running Brave from this tree: its browser process (not a helper with --type=), as "pid profile-folder". A second
+# start hands its URL to it through Chromium's own singleton (SingletonSocket in that folder) instead of a second
+# browser on the same profile. Chromium rewrites its argv into one string with spaces (its process title; Linux and
+# V2 then show one NUL in /proc/PID/cmdline, BR-3), so spaces split the words as NULs do; the profile path has none.
+running() {
+  for p in $(pidof brave); do
+    [ -r "/proc/$p/cmdline" ] || continue
+    # shellcheck disable=SC2016
+    tr '\0 ' '\n\n' <"/proc/$p/cmdline" 2>/dev/null | awk -v t="$T/brave" -v p="$p" '
+      $0 == t { exe = 1 } /^--type=/ { helper = 1 } /^--user-data-dir=/ { dir = substr($0, 17) }
+      END { if (exe && !helper && dir != "") { print p " " dir; exit 0 } exit 1 }' && return 0
+  done
+  return 1
+}
+# One launcher of this user owns the profile at a time (restore, Brave, save): $RUN/.lock, made atomically (mkdir)
+# as Brave's user, with the launcher's pid. A lock whose launcher is gone (killed, crashed) is taken over.
+LOCK= LOCKED= HOLDER=
+holder_alive() {
+  [ -n "$1" ] && [ -r "/proc/$1/cmdline" ] || return 1
+  for a in $(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null); do
+    case $a in "${0##*/}" | */"${0##*/}") return 0 ;; esac
+  done
+  return 1
+}
+lock_profile() {
+  for _ in 1 2; do
+    # shellcheck disable=SC2016
+    if u mkdir "$LOCK" 2>/dev/null; then u sh -c 'echo "$1" >"$2/pid"' _ $$ "$LOCK"; LOCKED=1; return 0; fi
+    HOLDER=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -z "$HOLDER" ]; then
+      # Made but no pid yet: a start in that very moment, unless it is old.
+      age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || echo 0) ))
+      [ "$age" -gt 5 ] || return 1
+    elif holder_alive "$HOLDER"; then return 1; fi
+    say "the lock of a start that is gone (pid ${HOLDER:-none}) is taken over"
+    u rm -rf "$LOCK"
+  done
+  return 1
+}
+unlock() { [ -z "$LOCKED" ] || u rm -rf "$LOCK"; LOCKED=; }
+
+# Brave with BR-1's flags in a clean environment, as BR-1 measured on CachyOS; the rest points into the tree:
+# libraries, fontconfig, cursors, GTK's schemas (memory backend: no dconf), no D-Bus, PulseAudio or accessibility bus
+# (Chromium then uses ALSA). run_brave LOG ARGS: replaces the calling shell (call it with & or as the last step).
+# shellcheck disable=SC2086,SC2016
+run_brave() {
+  log=$1; shift
+  exec env -i PATH="$PATH" HOME="$RUN/home" LANG="${LANG:-de_DE.UTF-8}" ${TZ:+TZ=$TZ} \
+    XDG_RUNTIME_DIR="${WD%/*}" WAYLAND_DISPLAY="${WD##*/}" LD_LIBRARY_PATH="$T/lib" \
+    FONTCONFIG_FILE="$T/etc/fonts/fonts.conf" XCURSOR_PATH="$T/share/icons" XCURSOR_THEME=Adwaita XCURSOR_SIZE="${XCURSOR_SIZE:-32}" \
+    XDG_DATA_DIRS="$T/share:/usr/share" GSETTINGS_SCHEMA_DIR="$T/share/glib-2.0/schemas" GSETTINGS_BACKEND=memory \
+    GTK_USE_PORTAL=0 NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: \
+    PULSE_SERVER=none $DROP sh -c 'exec "$@" >"$0" 2>&1' "$log" "$T/brave" $FLAGS "$@"
+}
+# The URL (or a new window) to the running Brave $1 with profile $2: Chromium's second start hands it over and ends.
+forward() {
+  bp=$1 bd=$2; shift 2
+  say "Brave runs already (pid $bp): ${URL:-a new window} goes to it (profile $bd)"
+  run_brave "$RUN/forward.log" "--user-data-dir=$bd" ${URL:+"$URL"} "$@"
+}
+
+as_user
+if [ -n "$DROP" ]; then RUN=$USER_RUN/brave
+elif [ "$UID_NOW" != 0 ] && [ -n "$XDG_RUNTIME_DIR" ]; then RUN=$XDG_RUNTIME_DIR/brave
+else RUN=$TMP/brave-$UID_NOW; fi
+# PK-2 CR5: the package wrapper puts the run folder (HOME, logs, lock) into the package's data folder.
+[ -z "$BRAVE_RUN" ] || RUN=$BRAVE_RUN
+
+case "$1" in
+  -h|--help) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --check)
+    rc=0
+    tree_ok && say "tree $T: ok" || rc=1
+    [ $rc = 0 ] && { libs_ok || rc=1; }
+    fonts_line
+    desk_line || true
+    if [ -n "$DROP" ]; then say "user: runs as uid 1000 (started by root: $DROP)"
+    elif [ -z "$NOROOT" ]; then say "user: runs as uid $UID_NOW"
+    else say "user: runs as uid 0: refused, $NOROOT"; rc=1; fi
+    profile_line
+    if b=$(running); then say "running: pid ${b%% *} (profile ${b#* }); a start hands its URL to it"; else say "running: no"; fi
+    if [ -r "$ALSA_SYS" ]; then say "sound: ALSA configuration $ALSA_SYS"; else say "sound: no ALSA configuration ($ALSA_SYS)"; fi
+    exit $rc ;;
+esac
+
+if [ -n "$NOROOT" ]; then
+  say "Brave startet nicht als root: $NOROOT. Bitte als Benutzer 1000 starten (zum Beispiel ueber MCP)."
+  say "Brave does not run as root: $NOROOT. Start it as user 1000 (MCP run, for example)."
+  exit 1
+fi
+tree_ok || exit 1
+desk_line || exit 1
+if [ -n "$1" ] && [ "$1" != "--" ]; then URL=$1; shift; fi
+[ "$1" != "--" ] || shift
+if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
+  mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; exit 1; }
+fi
+u mkdir -p "$RUN/home" || { say "cannot make $RUN"; exit 1; }
+LOCK=$RUN/.lock
+if ! lock_profile; then
+  # Another start of this user is starting or running Brave: its Brave gets the URL once it runs (10 s at most).
+  n=0
+  until b=$(running); do
+    n=$((n + 1))
+    [ $n -le "${BRAVE_WAIT:-20}" ] || { say "another start (pid ${HOLDER:-?}) holds $LOCK, but no Brave runs: nothing started"; exit 1; }
+    sleep 0.5
+  done
+  forward "${b%% *}" "${b#* }" "$@"
+fi
+trap unlock EXIT
+# A Brave not started from this run folder (a start with another one, or by hand) keeps its profile, too.
+if b=$(running); then unlock; trap - EXIT; forward "${b%% *}" "${b#* }" "$@"; fi
+data_wait
+profile_mode
+CACHE=
+# From here on no Brave of this tree runs: Chromium's lock links (they name this host and a pid) are stale.
+case $MODE in
+  data) data_dir || exit 1; import_tar; u rm -f "$PD/SingletonLock" "$PD/SingletonSocket" "$PD/SingletonCookie"; PROFILE=$PD; say "profile: $PD" ;;
+  tar) restore; u rm -f "$RUN/profile/SingletonLock" "$RUN/profile/SingletonSocket" "$RUN/profile/SingletonCookie"; PROFILE=$RUN/profile; CACHE="--disk-cache-dir=$RUN/cache" ;;
+  *) say "profile: in RAM only: $why"; PROFILE=$RUN/profile; CACHE="--disk-cache-dir=$RUN/cache" ;;
+esac
+u mkdir -p "$PROFILE" || { say "cannot make $PROFILE"; exit 1; }
+LOG=$RUN/brave.log
+say "starting ${URL:-the start page} (log $LOG)"
+START=$(date +%s)
+# shellcheck disable=SC2086
+run_brave "$LOG" "--user-data-dir=$PROFILE" $CACHE ${URL:+"$URL"} "$@" &
+CHILD=$!
+sig=
+trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+wait $CHILD
+rc=$?
+killed=
+if [ -n "$sig" ]; then
+  # Brave's own end on SIGTERM flushes its databases; after 10 s it is killed.
+  n=0
+  while kill -0 $CHILD 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$CHILD/status" 2>/dev/null; do
+    n=$((n + 1))
+    [ $n -le 20 ] || { kill -KILL $CHILD 2>/dev/null; killed=1; break; }
+    sleep 0.5
+  done
+  wait $CHILD
+  r=$?
+  [ $r = 127 ] || rc=$r
+fi
+trap - INT TERM HUP
+say "Brave ended (code $rc) after $(( $(date +%s) - START )) s"
+unclean=
+if [ -n "$killed" ]; then unclean="Brave had to be killed"
+elif [ $rc -gt 128 ] && { [ -z "$sig" ] || [ $rc != 143 ]; }; then unclean="Brave ended by signal $((rc - 128))"; fi
+[ "$MODE" != tar ] || save
+exit $rc

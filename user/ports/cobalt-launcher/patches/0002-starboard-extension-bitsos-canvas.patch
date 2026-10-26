@@ -1,0 +1,57 @@
+diff --git a/starboard/extension/bitsos_canvas.h b/starboard/extension/bitsos_canvas.h
+new file mode 100644
+index 0000000000..118ac8120c
+--- /dev/null
++++ b/starboard/extension/bitsos_canvas.h
+@@ -0,0 +1,51 @@
++// BitsOS port: software canvas extension.
++//
++// Lets Chromium's software compositor (viz, --disable-gpu-compositing) hand
++// each finished frame to the platform as a plain pixel buffer, so the port
++// needs no EGL/GLES at all. Video still goes through punch-out: the platform
++// composites the current video frame under this buffer, whose pixels are
++// transparent where the video shows through.
++
++#ifndef STARBOARD_EXTENSION_BITSOS_CANVAS_H_
++#define STARBOARD_EXTENSION_BITSOS_CANVAS_H_
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define kStarboardExtensionBitsosCanvasName "dev.bitsos.Canvas"
++
++typedef struct StarboardExtensionBitsosCanvasApi {
++  // Name should be the string |kStarboardExtensionBitsosCanvasName|.
++  const char* name;
++
++  // This specifies the version of the API that is implemented.
++  uint32_t version;
++
++  // The fields below this point were added in version 1 or later.
++
++  // Shows |pixels| in the window |window_handle| (the value of
++  // SbWindowGetPlatformHandle()). |pixels| is |width| x |height| premultiplied
++  // BGRA (Skia N32 on little endian), |stride| bytes per row, and stays valid
++  // and unchanged for the duration of the call only. Only the rectangle
++  // (damage_x, damage_y, damage_width, damage_height) changed since the
++  // previous call for this window; the platform may copy just that part.
++  // Called from Chromium's compositor thread.
++  void (*Present)(void* window_handle,
++                  const void* pixels,
++                  int32_t stride,
++                  int32_t width,
++                  int32_t height,
++                  int32_t damage_x,
++                  int32_t damage_y,
++                  int32_t damage_width,
++                  int32_t damage_height);
++} StarboardExtensionBitsosCanvasApi;
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // STARBOARD_EXTENSION_BITSOS_CANVAS_H_

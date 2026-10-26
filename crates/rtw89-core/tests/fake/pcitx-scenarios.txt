@@ -1,0 +1,135 @@
+# pcitx scenarios, run by tests/fake/pcitx-js.mjs on the JS driver's own pcitx.mjs
+# (kit FakeDev) and by tests/pcitx_js.rs on rtw89-core's pcitx (MemBus); both print
+# every op and the results, and the two texts must be equal line by line.
+# The first scenarios are js/test-pcitx.mjs's, in its order; then more.
+#
+# Commands (`;` joins several on a line; `repeat N ...` runs the line N times with $i
+# = 0..N-1; `every K R cmd` inside runs cmd when i % K == R):
+#   new                           fresh chip: pciAlloc (JS ring lengths) + pciTxInit
+#   chipnew                       test-pcitx's fake chip: every ring's index reads 0
+#   chip                          the fake chip takes every kicked BD, one report each on RPQ
+#   tx RING KIND LEN MACID SEQ [nokick] [extra=N]
+#                                 KIND: mgmt | data:TID | nowd:TID (no WD info) |
+#                                 qsel:TID:QSEL (data info with another QSEL) | h2c;
+#                                 the frame has LEN + extra bytes
+#   txframe KIND LEN SEQ          txrx's txFrame as pcitx sees it (data: resource check first)
+#   kick RING | resource RING | reclaim | init
+#   force RING VALUE              what the ring's index register reads: 0x.. | hw:N (N << 16) |
+#                                 hw:rpq+K (the RPQ's wp + K, mod its length, << 16)
+#   rpqbuf SLOT INFO RPPS [long] [drv=N] [size=N] [pad=N]
+#                                 an RPQ buffer: SLOT = N | rpq+K; INFO = rxbd_info flags;
+#                                 RPPS = seq:qsel:status,... or -; size = WRITE_SIZE
+#                                 (default: the bytes written); pad = zero bytes up to N
+#   page RING SEQ | wd RING | rpq | kicks RING
+
+## pciTx: WD page, address info, TX BD, kick off
+new
+tx CH8 mgmt 30 0 0x123
+page CH8 0
+wd CH8
+
+## a release report on RPQ gives the page back
+force RPQ hw:1; force CH8 hw:1
+rpqbuf 0 0x1c000 0:0x12:0
+reclaim
+wd CH8
+rpq
+
+## refused frames (nothing taken, nothing written), then the longest frame that fits
+tx ACH0 mgmt 30 0 0
+tx CH8 mgmt 30 0 0 extra=100
+tx ACH0 qsel:0:3 60 0 0
+tx CH12 h2c 30 0 0
+tx CH8 mgmt 2049 0 0
+tx CH8 mgmt 2048 0 0 nokick
+wd CH8
+
+## pciTxResource on a full ring (ACH1, 4 BDs)
+resource ACH1
+tx ACH1 data:1 60 0 0 nokick; tx ACH1 data:1 60 0 1 nokick; tx ACH1 data:1 60 0 2
+tx ACH1 data:1 60 0 3
+force ACH1 hw:2
+resource ACH1
+rpqbuf 1 0x1c000 0:1:0,1:1:1
+force RPQ hw:2
+reclaim
+resource ACH1
+wd ACH1
+
+## a report that comes before the TX BD index moved
+tx ACH2 data:4 60 0 0
+rpqbuf 2 0x1c000 0:2:0
+force RPQ hw:3; force ACH2 0
+reclaim
+wd ACH2
+tx ACH2 data:5 60 0 1; tx ACH2 data:5 60 0 2
+force ACH2 hw:3
+resource ACH2
+wd ACH2
+
+## RPQ buffers the release path refuses
+rpqbuf rpq+0 0x18000 1:2:0
+force RPQ hw:rpq+2
+reclaim
+rpq
+rpqbuf rpq+0 0x1c000 1:0x1a:0
+force RPQ hw:rpq+1
+reclaim
+
+## no WD page and no report: the resource check returns at once (ACH3)
+tx ACH3 data:6 60 0 0; tx ACH3 data:6 60 0 1; tx ACH3 data:6 60 0 2
+force ACH3 hw:1
+resource ACH3
+tx ACH3 data:7 60 0 3
+resource ACH3
+wd ACH3
+
+## a fake chip: every kicked BD is sent, one release report per frame
+new
+chipnew
+repeat 40 txframe mgmt 40 0; txframe data:0 60 $i; chip; every 3 2 reclaim
+repeat 4 chip; reclaim
+kicks CH8
+kicks ACH0
+wd CH8
+wd ACH0
+repeat 15 txframe data:0 60 $i
+chip
+txframe data:0 60 99
+repeat 20 txframe mgmt 40 0
+repeat 4 chip; reclaim
+wd CH8
+wd ACH0
+
+## beyond test-pcitx: a frame without WD info, kicked later
+new
+tx ACH0 nowd:0 60 3 7 nokick
+page ACH0 0
+kick ACH0
+wd ACH0
+
+## hostile reports: twice the same, a seq past the pages, past Linux's 512, a masked channel
+tx CH8 mgmt 30 0 1
+force CH8 hw:1
+rpqbuf 0 0x1c000 0:0x12:0,0:0x12:0,20:0x12:0,600:0x12:0,1:0x19:0,2:0x12:7
+force RPQ hw:1
+reclaim
+wd CH8
+wd ACH0
+
+## a long RX descriptor with drv info, and a WRITE_SIZE past the buffer
+tx ACH0 data:0 60 0 0; tx ACH0 data:0 60 0 1
+force ACH0 hw:2
+rpqbuf 1 0x1c000 1:0:0 long drv=2
+rpqbuf 2 0x1c000 0:0:0 size=0x3fff pad=96
+force RPQ hw:3
+reclaim
+wd ACH0
+rpq
+
+## init after frames: every page free again
+tx ACH1 data:2 60 0 0; tx ACH1 data:2 60 0 1
+init
+wd ACH1
+tx ACH1 data:2 60 0 2
+wd ACH1

@@ -1,0 +1,108 @@
+fb0: char 1, major 29 minor 0, mode 660
+GET_V = 0
+bpp 32 red 16/8 green 8/8 blue 0/8 transp 0/0 grayscale 0 nonstd 0
+xres_virtual == xres: yes
+yres_virtual is yres or 2 * yres: yes
+offsets 0 0, activate 0, pixclock 0, vmode 0
+GET_F = 0
+id "BitsOS gopfb", smem_start 0, type 0, visual 2, panstep 1 1, wrapstep 0, accel 0
+line_length == 4 * xres: yes
+smem_len holds the virtual screen: yes
+smem_len is whole pages: yes
+GET_V(kernel address) = -EFAULT
+GET_F(kernel address) = -EFAULT
+PUT_V(kernel address) = -EFAULT
+PAN(kernel address) = -EFAULT
+PUT_V(same) = 0
+PUT_V(xres - 8) = -EINVAL
+PUT_V(xres_virtual + 1) = -EINVAL
+PUT_V(yres_virtual + 1) = -EINVAL
+PUT_V(16 bpp 565) = -EINVAL
+PUT_V(16 bpp, format all zero) = 0
+  bpp 32 red 16/8
+PUT_V(ARGB) = -EINVAL
+PUT_V(grayscale) = -EINVAL
+PUT_V(nonstd) = -EINVAL
+PUT_V(TEST, timings) = 0
+  pixclock 0 left_margin 0 reserved0 0
+PUT_V(TEST, yres_virtual = yres) = 0
+  yres_virtual filled to the buffer: yes
+PUT_V(INV_MODE of the current mode) = -EINVAL
+PUT_V(INV_MODE of another mode) = 0
+PUT_V(FORCE | KD_TEXT) = 0
+  activate back 128
+PUT_V(xres 4) = -EINVAL
+PAN(yoffset = yres) as the buffer allows: yes
+  GET_V shows the offset: yes
+PAN(one row too far) = -EINVAL
+PAN(xoffset 1) = -EINVAL
+PAN(YWRAP) = -EINVAL
+PAN(0) = 0
+WAITFORVSYNC = 0
+WAITFORVSYNC(kernel address) = 0
+WAITFORVSYNC(garbage) = 0
+GETCMAP(0, 16) = 0
+  entry 4 = aaaa 0000 0000, entry 9 = 5555 5555 ffff
+GETCMAP(256, 1) = -EINVAL
+GETCMAP(0, 0) = -EINVAL
+GETCMAP(green at a kernel address) = -EFAULT
+PUTCMAP(2, 2) = 0
+GETCMAP(1, 4) = 0
+  red 0000 1000 1001 aaaa
+PUTCMAP(15, 2) = -EINVAL
+PUTCMAP(0, 0) = -EINVAL
+PUTCMAP(0, 1 << 30) = -E2BIG
+PUTCMAP(blue at a kernel address) = -EFAULT
+PUTCMAP(start 0x7fffffff, 2) = -EINVAL
+PUTCMAP(start 0xfffffff0, 2) = -EINVAL
+GETCMAP(start 0xffffffff, 1) = -EINVAL
+GETCMAP(255, 0xffffffff) = 0
+GETCMAP(kernel address) = -EFAULT
+PUTCMAP(restore) = 0
+BLANK(1) = 0
+BLANK(0) = 0
+BLANK(5) = -EINVAL
+CURSOR = -EINVAL
+GET_CON2FBMAP = 0
+  framebuffer 7
+GET_VBLANK = -ENOTTY
+ioctl 0x46ff = -ENOTTY
+TCGETS = -ENOTTY
+pwrite(row 0) = 256
+pread(row 0) = 256
+  read back the same: yes
+pwrite(at smem_len) = -ENOSPC
+pwrite(past smem_len) = -EFBIG
+pwrite(across the end) = 8
+pread(at smem_len) = 0
+pread(across the end) = 8
+pread(kernel address) = -EFAULT
+pwrite(kernel address) = -EFAULT
+pread(offset -4) = -EINVAL
+pwrite(offset -4) = -EINVAL
+pread(offset 1 << 40) = 0
+pwrite(offset 1 << 40) = -EFBIG
+mmap(smem_len, shared): yes
+  mapping shows what pwrite wrote: yes
+pread(pixel 1) = 4
+  pread sees the store: yes
+pread(last pixel) = 4
+  the last page is mapped: yes
+msync = 0
+munmap = 0
+mmap(past smem_len) is accepted (pages fault later): yes
+mmap(private) maps: yes
+fsync = 0
+lseek(100, SEEK_END) = 100
+lseek(-4, SEEK_END) = -EINVAL
+lseek(0, SEEK_DATA) = -ENXIO
+lseek(-4, SEEK_DATA) = -EINVAL
+lseek(0, SEEK_HOLE) = -ENXIO
+lseek(-4, SEEK_HOLE) = 0
+lseek(8, SEEK_SET) = 8
+lseek(4, SEEK_CUR) = 12
+lseek(0, 5) = -EINVAL
+mmap(write, read-only fd) = EACCES
+write(read-only fd) = -EBADF
+PUT_V(restore) = 0
+done

@@ -1,0 +1,131 @@
+PR_SET_NAME("abi-ab5-thread-name-long") = 0
+PR_GET_NAME = 0
+  name = "abi-ab5-thread-", byte 15 is 0: yes, byte 16 untouched: yes
+  after "short": "short"
+PR_SET_NAME(kernel address) = -EFAULT
+PR_GET_NAME(kernel address) = -EFAULT
+  a forked child has the same name: yes
+PR_GET_DUMPABLE = 1
+PR_SET_DUMPABLE(2) = -EINVAL
+PR_SET_DUMPABLE(0) = 0
+PR_GET_DUMPABLE = 0
+  a forked child's dumpable: 0
+PR_SET_DUMPABLE(1) = 0
+PR_SET_PDEATHSIG(65) = -EINVAL
+PR_SET_PDEATHSIG(64) = 0
+PR_SET_PDEATHSIG(-1) = -EINVAL
+PR_SET_PDEATHSIG(SIGUSR2) = 0
+PR_GET_PDEATHSIG = 0
+  signal = 12
+  a forked child's pdeath signal: 0
+PR_GET_PDEATHSIG(kernel address) = -EFAULT
+PR_SET_PDEATHSIG(0) = 0
+PR_GET_TIMING = 0
+PR_SET_TIMING(1) = -EINVAL
+PR_SET_TIMING(0) = 0
+PR_GET_UNALIGN = -EINVAL
+PR_GET_FPEMU = -EINVAL
+PR_GET_ENDIAN = -EINVAL
+PR_GET_FP_MODE = -EINVAL
+PR_GET_TSC = 0
+  tsc = 1
+PR_SET_TSC(PR_TSC_ENABLE) = 0
+PR_SET_TSC(7) = -EINVAL
+PR_TASK_PERF_EVENTS_DISABLE = 0
+PR_TASK_PERF_EVENTS_ENABLE = 0
+PR_MPX_ENABLE_MANAGEMENT = -EINVAL
+PR_SVE_GET_VL = -EINVAL
+PR_GET_TAGGED_ADDR_CTRL = -EINVAL
+unknown option 0x7fffffff = -EINVAL
+option 0 = -EINVAL
+option -1 = -EINVAL
+PR_GET_NO_NEW_PRIVS = 0
+PR_GET_NO_NEW_PRIVS(1) = -EINVAL
+PR_SET_NO_NEW_PRIVS(2) = -EINVAL
+PR_SET_NO_NEW_PRIVS(1, 1) = -EINVAL
+PR_SET_NO_NEW_PRIVS(1) in a child: set yes, reads 1 yes, inherited yes
+  PR_GET_NO_NEW_PRIVS here still = 0
+PR_GET_TIMERSLACK > 0: yes
+PR_SET_TIMERSLACK(1000) = 0
+PR_GET_TIMERSLACK = 1000
+  a child starts with 1000 and resets to it: yes yes
+PR_SET_TIMERSLACK(-1) = 0
+  PR_GET_TIMERSLACK raw = -1
+PR_SET_TIMERSLACK(1 << 63) = 0
+  PR_GET_TIMERSLACK raw = -9223372036854775808
+PR_SET_TIMERSLACK(0) = 0
+  back to the start value: yes
+PR_MCE_KILL_GET = 2
+PR_MCE_KILL_GET(1) = -EINVAL
+PR_MCE_KILL(SET, EARLY) = 0
+PR_MCE_KILL_GET = 1
+PR_MCE_KILL(SET, LATE) = 0
+PR_MCE_KILL_GET = 0
+PR_MCE_KILL(SET, 9) = -EINVAL
+PR_MCE_KILL_GET = 0
+PR_MCE_KILL(CLEAR, 1) = -EINVAL
+PR_MCE_KILL(CLEAR, 0) = 0
+PR_MCE_KILL(5) = -EINVAL
+PR_MCE_KILL(SET, EARLY, arg4) = -EINVAL
+PR_MCE_KILL_GET = 2
+PR_GET_THP_DISABLE = 0
+PR_SET_THP_DISABLE(1) = 0
+PR_GET_THP_DISABLE = 1
+PR_SET_THP_DISABLE(1, 1) = -EINVAL
+PR_GET_THP_DISABLE(1) = -EINVAL
+PR_SET_THP_DISABLE(0) = 0
+PR_CAPBSET_READ(41) = -EINVAL
+PR_CAPBSET_READ(40) = 1
+PR_CAPBSET_DROP(1) as a user = -EPERM
+PR_GET_SECUREBITS = 0
+PR_SET_SECUREBITS(1) as a user = -EPERM
+PR_GET_KEEPCAPS = 0
+PR_SET_KEEPCAPS(2) = -EINVAL
+PR_SET_KEEPCAPS(1) = 0
+PR_GET_KEEPCAPS = 1
+PR_GET_SECUREBITS = 16
+PR_SET_KEEPCAPS(0) = 0
+PR_CAP_AMBIENT(IS_SET, 0) = 0
+PR_CAP_AMBIENT(IS_SET, 99) = -EINVAL
+PR_CAP_AMBIENT(RAISE, 0) = -EPERM
+PR_CAP_AMBIENT(LOWER, 0) = 0
+PR_CAP_AMBIENT(CLEAR_ALL) = 0
+PR_CAP_AMBIENT(CLEAR_ALL, 1) = -EINVAL
+PR_CAP_AMBIENT(9, 0) = -EINVAL
+PR_SET_PTRACER(0) = 0
+PR_SET_PTRACER(ANY) = 0
+PR_SET_PTRACER(no such pid) = -EINVAL
+PR_SET_IO_FLUSHER(1) as a user = -EPERM
+PR_GET_IO_FLUSHER as a user = -EPERM
+PR_GET_SPECULATION_CTRL(99) = -ENODEV
+PR_GET_SPECULATION_CTRL(0, 1) = -EINVAL
+PR_SET_SPECULATION_CTRL(99, 0) = -ENODEV
+PR_SET_SPECULATION_CTRL(0, 0, 1) = -EINVAL
+PR_SET_SYSCALL_USER_DISPATCH(OFF) = 0
+PR_SET_SYSCALL_USER_DISPATCH(OFF, 1) = -EINVAL
+PR_SET_SYSCALL_USER_DISPATCH(5) = -EINVAL
+PR_SET_MM(PR_SET_MM_MAP_SIZE) = 0
+  size = 104
+PR_SET_MM(PR_SET_MM_MAP, size 7) = -EINVAL
+PR_SET_MM(PR_SET_MM_START_CODE) as a user = -EPERM
+PR_GET_TID_ADDRESS = 0
+  it is the address given: yes
+PR_GET_TID_ADDRESS(kernel address) = -EFAULT
+PR_GET_AUXV: the size of saved_auxv, a multiple of 16 of at least 400 bytes: yes
+  it holds AT_PAGESZ 4096 before its AT_NULL: yes
+  nothing written past the size: yes
+  with len 8: the same answer, one word written: yes
+PR_GET_AUXV(kernel address, 16) = -EFAULT
+PR_GET_AUXV(NULL, 0): the size again: yes
+PR_GET_AUXV(aux, 16, 1) = -EINVAL
+PR_GET_CHILD_SUBREAPER = 0
+  = 0
+PR_SET_CHILD_SUBREAPER(1) = 0
+  now 1
+PR_GET_CHILD_SUBREAPER(kernel address) = -EFAULT
+the child ended with 0: yes
+the orphaned grandchild came to us (the subreaper): yes
+  and was killed by its pdeath signal SIGUSR1: yes
+  no more children = -ECHILD
+PR_SET_CHILD_SUBREAPER(0): now 0
+ab5 prctl: done

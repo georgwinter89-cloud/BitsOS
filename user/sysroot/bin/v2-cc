@@ -1,0 +1,23 @@
+#!/bin/sh
+# C compiler for BitsOS V2 programs: clang against the musl sysroot built by ../build.sh.
+# Output: static-pie x86-64 Linux executables (the same kind Rust's x86_64-unknown-linux-musl makes),
+# so V2's ELF loader has one path (ET_DYN + self-relocation in musl's rcrt1.o) for C, C++ and Rust.
+# Runs unchanged on CachyOS. V2_SYSROOT overrides the sysroot.
+here=$(dirname "$(readlink -f "$0")")
+sysroot=${V2_SYSROOT:-$here/../out/sysroot}
+[ -f "$sysroot/usr/lib/libc.a" ] || { echo "v2-cc: no sysroot at $sysroot (run user/sysroot/build.sh)" >&2; exit 1; }
+link=1
+for a in "$@"; do
+  case $a in
+    -c|-S|-E|-M|-MM|-fsyntax-only) link=0 ;;
+    -r) [ $link = 1 ] && link=r ;;  # partial link (ld -r): an object file, not a program
+    -shared) echo "v2-cc: -shared is not supported (V2 programs are static-pie only)" >&2; exit 1 ;;
+  esac
+done
+# Link flags only when linking, so plain compiles stay free of "unused argument" warnings.
+if [ $link = r ]; then
+  set -- -fuse-ld=lld "$@"
+elif [ $link = 1 ]; then
+  set -- -static-pie -fuse-ld=lld -rtlib=compiler-rt --unwindlib=libunwind "$@"
+fi
+exec clang --target=x86_64-unknown-linux-musl --sysroot="$sysroot" --gcc-toolchain="$sysroot/usr" -fPIE "$@"

@@ -1,0 +1,121 @@
+# UL-5: the package manifest, read by `cargo xtask image`, `initrd` and `stick` (host/xtask/src/package.rs).
+# The user workspace, user/c and the ABI-diff programs still go into the initramfs /bin by themselves; this file
+# adds programs from elsewhere and says where each goes. One entry per line: <place> <name> <source>
+#   place   initrd  /bin/<name> in the initramfs (RAM after boot; travels with every Reload and install_kernel)
+#           data    a data file or directory tree in the initramfs; <name> is then its absolute V2 path and the
+#                   source host:/abs/path (a directory is copied whole, sorted; pacman's licence texts come along)
+#           stick   \BITSOS2\bin\<name> on the stick = /boot/BITSOS2/bin/<name> on V2 (FS-7 mounts the stick at
+#                   /boot; read from the stick when run, for programs too big to keep in RAM; the shell's PATH
+#                   ends with it)
+#           tree    YT-2: a whole directory \BITSOS2\<name>\ on the stick (/boot/BITSOS2/<name>); the source is
+#                   host:/abs/dir, copied with its relative paths (FAT-safe names only, empty directories left
+#                   out); the libraries its programs need beyond the initramfs set go to its own lib\ (RPATH
+#                   $ORIGIN/lib), the rest of the set stays in the initramfs. A tree's name may equal a program's.
+#                   BR-2: so do the needs of the shared libraries the source has in its lib\ (dlopened ones).
+#                   A ktest image carries a tree only if its filter can run the tree's ktests ul.pkg.<name>*
+#                   (V2_STICK_TREES=1 or =<name>,<name> puts trees into any image; image.rs tree_wanted).
+#   source  host:/abs/path    a CachyOS file copied unchanged; a dynamic one pulls its libraries into the set
+#           file:rel/path     YT-2: a file of this repository copied unchanged (a launcher script; for data: a configuration file)
+#           g++:rel/path.cc   built with the host's g++ against CachyOS's glibc and libstdc++ (PIE, dynamic)
+#           gcc:rel/path.c    built with the host's gcc against CachyOS's glibc (PIE, dynamic)
+#           cargo:rel/dir     the binary <name> of the cargo package in rel/dir, built for the host (CachyOS glibc,
+#                             dynamic) with --release --locked --offline --no-default-features, stripped, x86-64-v3
+#           localedef:<locale>/<charmap>  UL-6, data only: a glibc locale directory made by the host's localedef
+#                             (--no-archive) from /usr/share/i18n; a file equal to an earlier data file becomes a link
+# A source the host lacks fails the build; V2_PKG_OPTIONAL=1 leaves it out with a note (the ktests then skip).
+
+# The library-set check (ktest ul.pkg.cxx): exceptions through libgcc_s, iostreams, threads, libm.
+initrd pkg-cxx  g++:user/packaging/tests/pkg-cxx.cc
+# UL-6: the ABI-diff locale program (ul.pkg.locale compares its output with pkg-locale.out, made on CachyOS).
+initrd pkg-locale gcc:user/abi-tests/dyn/locale.c
+# A CachyOS C++ program run from the stick (ktest ul.pkg.stick): libstdc++, libgcc_s, libm, libc.
+stick  ninja    host:/usr/bin/ninja
+
+# WY-1a: the compositor on V2 (fbdev + evdev back end; ~4 MB stripped, so RAM is fine) and its Wayland test client.
+initrd bitscomp cargo:user/services/bitscomp
+initrd wyclient cargo:user/services/bitscomp/wyclient
+# The German keymap's xkeyboard-config files (what `xkbcli compile-keymap --layout de` opens, about 330 KB), at
+# CachyOS's path, which libxkbcommon has built in (no XKB_CONFIG_ROOT needed).
+data /usr/share/xkeyboard-config-2/rules/evdev   host:/usr/share/xkeyboard-config-2/rules/evdev
+data /usr/share/xkeyboard-config-2/keycodes      host:/usr/share/xkeyboard-config-2/keycodes
+data /usr/share/xkeyboard-config-2/types         host:/usr/share/xkeyboard-config-2/types
+data /usr/share/xkeyboard-config-2/compat        host:/usr/share/xkeyboard-config-2/compat
+data /usr/share/xkeyboard-config-2/symbols/pc        host:/usr/share/xkeyboard-config-2/symbols/pc
+data /usr/share/xkeyboard-config-2/symbols/de        host:/usr/share/xkeyboard-config-2/symbols/de
+data /usr/share/xkeyboard-config-2/symbols/latin     host:/usr/share/xkeyboard-config-2/symbols/latin
+data /usr/share/xkeyboard-config-2/symbols/inet      host:/usr/share/xkeyboard-config-2/symbols/inet
+data /usr/share/xkeyboard-config-2/symbols/keypad    host:/usr/share/xkeyboard-config-2/symbols/keypad
+data /usr/share/xkeyboard-config-2/symbols/kpdl      host:/usr/share/xkeyboard-config-2/symbols/kpdl
+data /usr/share/xkeyboard-config-2/symbols/level3    host:/usr/share/xkeyboard-config-2/symbols/level3
+data /usr/share/xkeyboard-config-2/symbols/srvr_ctrl host:/usr/share/xkeyboard-config-2/symbols/srvr_ctrl
+# WY-11: bitscomp's pointer theme (Adwaita from CachyOS's adwaita-cursors, CC-BY-SA-3.0 OR LGPL-3.0-only; the licence
+# texts come along). 35 files, about 12 MB (wait and progress are animated, 4.7 MB each); the aliases become links.
+data /usr/share/icons/Adwaita/cursors host:/usr/share/icons/Adwaita/cursors
+
+# WY-1b: foot, the terminal bitscomp starts (Strg+Alt+Enter, "Neues Terminal"); its libraries come by ldd.
+initrd foot host:/usr/bin/foot
+# One monospace family (noto-fonts, OFL-1.1); bitscomp names it in foot's --font, so no aliases are needed.
+data /usr/share/fonts/noto/NotoSansMono-Regular.ttf host:/usr/share/fonts/noto/NotoSansMono-Regular.ttf
+data /usr/share/fonts/noto/NotoSansMono-Bold.ttf    host:/usr/share/fonts/noto/NotoSansMono-Bold.ttf
+# fontconfig: CachyOS's fonts.conf (dirs, cache dirs; its conf.d include is ignore_missing) and two of the
+# conf.d rules CachyOS links, for the same antialiasing and hinting as on the host.
+data /etc/fonts/fonts.conf                       host:/etc/fonts/fonts.conf
+data /etc/fonts/conf.d/10-hinting-slight.conf    host:/usr/share/fontconfig/conf.avail/10-hinting-slight.conf
+data /etc/fonts/conf.d/10-yes-antialias.conf     host:/usr/share/fontconfig/conf.avail/10-yes-antialias.conf
+# foot's own terminfo entries (TERM=foot, foot's default), ncurses' copies.
+data /usr/share/terminfo/f/foot                  host:/usr/share/terminfo/f/foot
+data /usr/share/terminfo/f/foot-direct           host:/usr/share/terminfo/f/foot-direct
+# glibc's C.UTF-8 locale (bitscomp sets LC_CTYPE=C.UTF-8 when no locale is set) and libxkbcommon's compose table
+# for it (dead keys: ^ ´ ` on the German keyboard), the files foot opens for them in an strace.
+data /usr/lib/locale/C.utf8                      host:/usr/lib/locale/C.utf8
+# UL-6: German and US English for glibc programs (init sets LANG=de_DE.UTF-8). glibc looks for the normalized
+# name (de_DE.UTF-8 -> de_DE.utf8) in /usr/lib/locale; CachyOS has these two only inside locale-archive, so they
+# are made here: de_DE.utf8 2.96 MB (LC_COLLATE 2.59 MB); en_US.utf8 adds 8 KB, its LC_COLLATE (de_DE's) and
+# LC_CTYPE (C.utf8's) become links.
+data /usr/lib/locale/de_DE.utf8                  localedef:de_DE/UTF-8
+data /usr/lib/locale/en_US.utf8                  localedef:en_US/UTF-8
+data /usr/share/X11/locale/compose.dir           host:/usr/share/X11/locale/compose.dir
+data /usr/share/X11/locale/locale.alias          host:/usr/share/X11/locale/locale.alias
+data /usr/share/X11/locale/en_US.UTF-8/Compose   host:/usr/share/X11/locale/en_US.UTF-8/Compose
+# The clock in bitscomp (and glibc programs) shows German local time (desk 21.10., WY-5 CR). /etc/localtime is a
+# link to it, as on CachyOS (package.rs adds the link): Starboard's SbTimeZoneGetName reads only the link target
+# (YT-4a CR 1).
+data /usr/share/zoneinfo/Europe/Berlin           host:/usr/share/zoneinfo/Europe/Berlin
+
+# YT-2: YouTube TV (Cobalt with YT-1's framebuffer/evdev back end, ~155 MB) in \BITSOS2\cobalt\: the tree is
+# made from YT-1's build by user/ports/cobalt-launcher/scripts/stage-v2.sh (run it again after a Cobalt rebuild);
+# libX11 & co. and libasound come into cobalt\lib\ by ldd. `cobalt` starts it from the shell (`cobalt --check`).
+tree  cobalt host:/var/tmp/claude-v2/yt/cobalt/v2-stick/cobalt
+stick cobalt file:user/ports/cobalt-launcher/bitsos/cobalt
+
+# BR-2: Brave (CachyOS's brave-bin, ~480 MB, plus its libraries by ldd) in \BITSOS2\brave\: the tree is made from
+# /opt/brave-bin, GTK 3/NSS (dlopened), fonts with a prebuilt fontconfig cache, cursors and GTK's schemas by
+# user/ports/brave-launcher/scripts/stage-v2.sh (run it again after a Brave update). `brave` starts it in the
+# desktop (`brave --check`).
+tree  brave host:/var/tmp/claude-v2/stage/brave
+stick brave file:user/ports/brave-launcher/bitsos/brave
+# ktest ul.pkg.brave_fonts: fontconfig as Brave loads it, against the tree's prebuilt cache (16 KB).
+initrd fc-probe gcc:user/ports/brave-launcher/tests/fc-probe.c
+# What glibc and Chromium read in /etc beyond init's files: name services without systemd-resolved (BR-1 failure
+# list rows 3, 16) and a machine id (libdbus, Chromium). The us layout Chromium's keyboard layout engine compiles
+# besides the desktop's keymap (BR-2 trace: symbols/us).
+data /etc/nsswitch.conf                           file:user/ports/brave-launcher/files/nsswitch.conf
+data /etc/machine-id                              file:user/ports/brave-launcher/files/machine-id
+data /usr/share/xkeyboard-config-2/symbols/us     host:/usr/share/xkeyboard-config-2/symbols/us
+
+# SN-4: ALSA on V2 (card 0 = the mixer). CachyOS's aplay and speaker-test (alsa-utils; libasound comes by ldd)
+# and the alsa-lib configuration libasound reads: alsa.conf, cards/aliases.conf, the pcm/ and ctl/ definitions
+# alsa.conf includes. No alsa.conf.d (its pipewire/pulse files would make "default" a sound server) and no
+# cards/<driver>.conf for "BitsOS", so "default" is plug -> hw:0 (pcm/default.conf). The raw-ioctl check
+# program (V2 only: never run where a real sound card is).
+initrd aplay          host:/usr/bin/aplay
+initrd speaker-test   host:/usr/bin/speaker-test
+# SN-9 (INT-W9): arecord is CachyOS's link to aplay (aplay picks capture by argv[0]); /etc/asound.conf routes
+# "default" capture through plug -> mmap_emul -> hw:0,0 (V2's hw PCM has no mmap), playback stays plug -> hw:0.
+initrd arecord        host:/usr/bin/arecord
+data /etc/asound.conf file:host/tests/sn/asound.conf
+initrd alsa-hw        gcc:host/tests/sn/alsa-hw.c
+data /usr/share/alsa/alsa.conf          host:/usr/share/alsa/alsa.conf
+data /usr/share/alsa/cards/aliases.conf host:/usr/share/alsa/cards/aliases.conf
+data /usr/share/alsa/pcm                host:/usr/share/alsa/pcm
+data /usr/share/alsa/ctl                host:/usr/share/alsa/ctl

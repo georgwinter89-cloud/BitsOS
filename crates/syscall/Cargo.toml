@@ -1,0 +1,24 @@
+[package]
+name = "syscall"
+version = "0.1.0"
+edition = "2024"
+description = "Linux syscall dispatch (owner: AB)"
+
+[dependencies]
+proc = { path = "../proc" }
+console = { path = "../console" }
+vfs = { path = "../vfs" }
+block = { path = "../block" }
+# NW-5: the socket syscalls (glue granted to NW, src/socket.rs).
+net = { path = "../net" }
+uapi = { path = "../uapi" }
+kreg = { path = "../kreg" }
+klog = { path = "../klog" }
+hal = { path = "../hal" }
+mm = { path = "../mm" }
+mm-core = { path = "../mm-core" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+ksync = { path = "../ksync" }
+policy = { path = "../policy" }
+ktest = { path = "../ktest" }

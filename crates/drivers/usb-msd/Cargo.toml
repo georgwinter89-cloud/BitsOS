@@ -1,0 +1,17 @@
+[package]
+name = "usb-msd"
+version = "0.1.0"
+edition = "2024"
+description = "USB mass storage: Bulk-Only Transport, SCSI, C: BlockDevice (owner: US)"
+
+[dependencies]
+block = { path = "../../block" }
+devmodel = { path = "../../devmodel" }
+usb-core = { path = "../usb-core" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+ksync = { path = "../../ksync" }
+ktest = { path = "../../ktest" }
+pci = { path = "../../pci" }
+sched = { path = "../../sched" }
+time = { path = "../../time" }

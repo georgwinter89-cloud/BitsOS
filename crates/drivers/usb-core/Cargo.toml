@@ -1,0 +1,10 @@
+[package]
+name = "usb-core"
+version = "0.1.0"
+edition = "2024"
+description = "USB core, hubs (owner: US)"
+
+[dependencies]
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }

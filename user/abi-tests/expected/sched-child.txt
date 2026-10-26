@@ -1,0 +1,25 @@
+setrlimit(RLIMIT_NICE, 0) = 0
+setrlimit(RLIMIT_RTPRIO, 0) = 0
+sched_setaffinity(CPU 0) = 0
+setpriority(PRIO_PROCESS, 0, 3) = 0
+sched_setscheduler(SCHED_BATCH, 0) = 0
+child inherited the mask (CPU 0 only): yes
+getpriority(child) (nice 3 inherited) = 17
+sched_getscheduler(child) = 3
+sched_setaffinity(child, last CPU) = 0
+  read back: the last CPU only: yes
+setpriority(PRIO_PROCESS, child, 10) = 0
+getpriority(child) = 10
+setpriority(PRIO_PROCESS, child, 2): lowering without RLIMIT_NICE = -EACCES
+getpriority(own, unchanged) = 17
+wait4 collects the child: yes
+  it exited: yes
+  child saw its new mask: yes
+  child saw nice 10: yes
+  child kept SCHED_BATCH: yes
+  wait4 rusage: usec below 1e6, user time > 0: yes
+getrusage(RUSAGE_CHILDREN) = 0
+  equal to wait4's times: yes
+times: children's ticks match: yes
+getpriority(reaped child) = -ESRCH
+sched_getaffinity(reaped child) = -ESRCH

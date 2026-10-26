@@ -1,0 +1,15 @@
+[package]
+name = "acpi"
+version = "0.1.0"
+edition = "2024"
+description = "ACPI tables and CP's kernel-side CPU set-up (owner: CP)"
+
+[dependencies]
+bootinfo = { path = "../bootinfo" }
+hal = { path = "../hal" }
+kreg = { path = "../kreg" }
+klog = { path = "../klog" }
+ksync = { path = "../ksync" }
+ktest = { path = "../ktest" }
+time = { path = "../time" }
+mm-core = { path = "../mm-core" }

@@ -1,0 +1,50 @@
+input_event 24 input_id 8 input_absinfo 24 input_mask 16
+EVIOCGVERSION 0x80044501 EVIOCGID 0x80084502 EVIOCGNAME(256) 0x81004506 EVIOCGBIT(EV_KEY,96) 0x80604521
+EVIOCGABS(ABS_X) 0x80184540 EVIOCGRAB 0x40044590 EVIOCSCLOCKID 0x400445a0 EVIOCGKEY(96) 0x80604518 EVIOCREVOKE 0x40044591
+EV_VERSION 0x10001 KEY_MAX 0x2ff EV_MAX 0x1f
+EVIOCGVERSION = 0
+  version 0x10001
+EVIOCGID = 0
+  bus 0x6 vendor 0 product 0x1 version 0x1
+EVIOCGNAME(256) = 20
+  name BitsOS MCP keyboard
+EVIOCGNAME(6) = 6
+EVIOCGPHYS(64) = 11
+  phys mcp/input0
+EVIOCGUNIQ(64) = -ENOENT
+EVIOCGBIT(0,32) = 8
+  bytes: 03 00 12 00
+EVIOCGBIT(EV_KEY,128) = 96
+  bytes: fe ff ff ff
+EVIOCGBIT(EV_LED,8) = 8
+  bytes: 07 00
+EVIOCGBIT(EV_REL,8) = 8
+EVIOCGBIT(EV_REP,8) = -EINVAL
+EVIOCGKEY(128) = 96
+EVIOCGPROP(8) = 8
+EVIOCGREP = 0
+  delay 500 period 33
+EVIOCGABS(ABS_X) = -EINVAL
+EVIOCGNAME bad pointer = -EFAULT
+unknown 'E' command = -EINVAL
+terminal command = -EINVAL
+EVIOCSCLOCKID(99) = -EINVAL
+EVIOCSCLOCKID(MONOTONIC) = 0
+read 10 bytes = -EINVAL
+read nothing queued = -EAGAIN
+EVIOCGRAB 1 = 0
+EVIOCGRAB 1 (second client) = -errno 16
+EVIOCGRAB 0 (second client) = -EINVAL
+ready
+events 4
+  type 1 code 16 value 1
+  type 0 code 0 value 0
+  type 1 code 16 value 0
+  type 0 code 0 value 0
+timestamps on CLOCK_MONOTONIC: yes
+read nonblock, empty = -EAGAIN
+EVIOCGRAB 0 = 0
+EVIOCGRAB 0 again = -EINVAL
+EVIOCREVOKE = 0
+read after revoke = -ENODEV
+done

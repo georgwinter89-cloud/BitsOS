@@ -1,0 +1,150 @@
+wave B begin
+b.sched_yield: = 0
+b.sched_getaffinity.has_cpus: true
+b.sched_getaffinity.odd_size: -EINVAL
+b.sched_getscheduler.self: = 0
+b.sched_get_priority_max.fifo: = 99
+b.sched_get_priority_min.fifo: = 1
+b.sched_get_priority_max.other: = 0
+b.sched_get_priority_max.bad_policy: -EINVAL
+b.sched_getparam.self: 0
+b.available_parallelism: true
+b.gettid.main_equals_pid: true
+b.tkill.self_sig0: = 0
+b.tgkill.self_sig0: = 0
+b.tgkill.no_such_thread: -ESRCH
+b.tgkill.bad_signal: -EINVAL
+b.kill.self_sig0: = 0
+b.kill.bad_signal: -EINVAL
+b.kill.no_such_process: -ESRCH
+b.futex.wake_nobody: = 0
+b.futex.wake_nobody_private: = 0
+b.futex.wait_value_changed: -EAGAIN
+b.futex.wait_timeout_10ms: -ETIMEDOUT
+b.futex.waited_at_least_10ms: true
+b.futex.wait_bad_timeout: -EINVAL
+b.futex.bad_op: -ENOSYS
+b.thread.spawn: ok
+b.thread.result: 42
+b.thread.own_tid: true
+b.thread.same_pid: true
+b.thread.condvar_pingpong: 200
+b.thread.eight_counters: 8 threads, total 8000
+b.clone.sighand_without_vm: -EINVAL
+b.clone.thread_without_sighand: -EINVAL
+b.fcntl.getfd_cloexec: = 1
+b.fcntl.getfl_rdwr: = 32770
+b.fcntl.setfl_nonblock: = 0
+b.fcntl.getfl_has_nonblock: true
+b.fcntl.setfd_clear: = 0
+b.fcntl.getfd_cleared: = 0
+b.dup: ok
+b.dup.no_cloexec: = 0
+b.dup2.to_50: = 50
+b.dup2.same_fd: = 50
+b.dup3.to_50_cloexec: = 50
+b.dup3.cloexec_set: = 1
+b.dup3.same_fd: -EINVAL
+b.dup3.bad_flags: -EINVAL
+b.dup2.bad_fd: -EBADF
+b.fcntl.dupfd_60: = 60
+b.fcntl.dupfd_cloexec_70: = 70
+b.fcntl.dupfd_cloexec_flag: = 1
+b.fcntl.bad_fd: -EBADF
+b.pipe2.cloexec_flag: = 1
+b.fcntl.getfl_read_end: = 0
+b.fcntl.getfl_write_end: = 1
+b.poll.empty_pipe: = 0
+b.write.pipe: = 5
+b.ioctl.fionread: 5
+b.poll.pipe_readable: = 1
+b.poll.pipe_readable_revents: 1
+b.ppoll.pipe_readable: = 1
+b.read.pipe: = 5
+b.fcntl.setfl_nonblock_pipe: = 0
+b.read.empty_nonblocking: -EAGAIN
+b.epoll_ctl.add: = 0
+b.epoll_ctl.add_again: -EEXIST
+b.epoll_wait.nothing: Ok([])
+b.epoll_wait.readable: Ok([(1, 7)])
+b.epoll_pwait.readable: Ok([(1, 7)])
+b.epoll_ctl.mod: = 0
+b.epoll_wait.after_mod: Ok([(1, 8)])
+b.epoll_ctl.del: = 0
+b.epoll_ctl.del_again: -ENOENT
+b.epoll_ctl.self: -EINVAL
+b.epoll_ctl.bad_op: -EINVAL
+b.epoll_wait.zero_max: -EINVAL
+b.epoll_create1.bad_flags: -EINVAL
+b.close.write_end: = 0
+b.poll.writer_gone: = 1
+b.poll.writer_gone_revents: 16
+b.read.writer_gone_eof: = 0
+b.write.no_reader: -EPIPE
+b.pipe2.bad_flags: -EINVAL
+b.eventfd.read: = 8
+b.eventfd.value: 3
+b.eventfd.read_empty: -EAGAIN
+b.eventfd.write: = 8
+b.eventfd.write_max: -EINVAL
+b.eventfd.read_short_buffer: -EINVAL
+b.eventfd.value_after_write: 5
+b.eventfd2.bad_flags: -EINVAL
+b.mincore.first_page_touched: Ok([1, 0, 0, 0])
+b.madvise.dontneed: = 0
+b.madvise.dontneed_zeroes: 0
+b.madvise.bad_advice: -EINVAL
+b.madvise.unaligned: -EINVAL
+b.madvise.willneed: = 0
+b.msync.sync: = 0
+b.msync.bad_flags: -EINVAL
+b.mremap.grow_maymove: ok
+b.mremap.content_kept: 77
+b.mremap.new_part_zero: 0
+b.mremap.shrink: ok
+b.mremap.shrink_in_place: true
+b.mremap.content_after_shrink: 77
+b.prlimit64.set_nofile_64: = 0
+b.prlimit64.nofile_now: 64
+b.dup2.above_limit: -EBADF
+b.prlimit64.cur_above_max: -EINVAL
+b.prlimit64.bad_resource: -EINVAL
+b.sysinfo.uptime_nonnegative: true
+b.sysinfo.totalram_positive: true
+b.sysinfo.freeram_le_total: true
+b.sysinfo.procs_positive: true
+b.sysinfo.mem_unit: 1
+b.prctl.set_name: = 0
+b.prctl.get_name: abi-b-name
+b.prctl.get_dumpable: = 1
+b.prctl.unknown_option: -EINVAL
+b.getrandom.zero: = 0
+b.getrandom.nonblock_32: = 32
+b.getrandom.bad_flags: -EINVAL
+b.clock_getres.monotonic: (0, 1)
+b.clock_gettime.bad_clock: -EINVAL
+b.clock_gettime.boottime: ok
+b.clock_gettime.process_cputime: ok
+b.clock_gettime.realtime_after_2024: true
+b.gettimeofday.after_2024: true
+b.clock_nanosleep.1ms: = 0
+b.clock_nanosleep.abs_past: = 0
+b.clock_nanosleep.bad_clock: -EINVAL
+b.std.thread_sleep_1ms: true
+b.rt_sigprocmask.old_written: Ok(Some(0))
+b.rt_sigprocmask.block_usr1: = 0
+b.rt_sigprocmask.usr1_blocked: Ok(Some(512))
+b.rt_sigprocmask.unblock_usr1: = 0
+b.rt_sigprocmask.bad_how: -EINVAL
+b.rt_sigprocmask.bad_size: -EINVAL
+b.rt_sigaction.usr1_default: 0
+b.rt_sigaction.usr1_ignore: = 0
+b.rt_sigaction.usr1_now_ignored: 1
+b.rt_sigaction.usr1_default_again: = 0
+b.rt_sigaction.sigkill: -EINVAL
+b.rt_sigaction.bad_signal: -EINVAL
+b.rt_sigaction.bad_size: -EINVAL
+b.sigaltstack.too_small: -ENOMEM
+b.sigaltstack.bad_flags: -EINVAL
+b.sigaltstack.std_installed_one: flags 0 size>=8192 true
+wave B end (148 checks)

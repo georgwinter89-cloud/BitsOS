@@ -1,0 +1,24 @@
+flock(a, LOCK_SH) = 0
+flock(b, LOCK_SH) = 0
+flock(b, LOCK_EX|LOCK_NB) while a shares = -EAGAIN
+flock(b, LOCK_SH|LOCK_NB) after its failed conversion = 0
+flock(a, LOCK_EX|LOCK_NB) while b shares = -EAGAIN
+flock(b, LOCK_UN) = 0
+flock(a, LOCK_EX|LOCK_NB) alone = 0
+flock(a2 = dup(a), LOCK_EX|LOCK_NB): the same open file = 0
+flock(b, LOCK_SH|LOCK_NB) against it = -EAGAIN
+  after close(a), a2 keeps it: flock(b, LOCK_SH|LOCK_NB) = -EAGAIN
+  after the last close: flock(b, LOCK_EX|LOCK_NB) = 0
+flock(b, LOCK_UN) twice = 0
+flock(b, LOCK_SH|LOCK_EX) = -EINVAL
+flock(b, 0) = -EINVAL
+flock(b, LOCK_NB) = -EINVAL
+flock(b, LOCK_MAND|LOCK_EX) = 0
+flock(999, LOCK_SH) = -EBADF
+flock(O_PATH fd, LOCK_SH) = -EBADF
+flock(pipe, LOCK_EX) = 0
+child holds LOCK_EX: flock(b, LOCK_SH|LOCK_NB) = -EAGAIN
+flock(b, LOCK_SH) waits for the child's exit = 0
+  it waited: yes
+a forked child shares the parent's lock (same open file): yes
+ab5 flock: done

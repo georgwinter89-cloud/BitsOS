@@ -1,0 +1,27 @@
+cap.open2 -16
+cap.pversion 0 0x2000f
+cap.info 0 stream 1 BitsOS Mixer 0/1
+readi.open -77
+refine 0 access 0x8 format 0x4404 channels 1-2 rate 48000-48000 sample_bits 16-32 buffer_bytes_max 4194304
+refine.44100 -22
+hw_params 0 period 1200 periods 4 buffer 4800 bytes 19200 msbits 16 rate 48000/1 pause 1 mmap 0
+state.setup 1
+readi.setup -77
+sw_params 0 boundary ok
+prepare 0
+state.prepared 2
+readi.efault -14
+readi 0 frames 96000
+state.running 3
+status 0 state 3 waiting ok
+delay 0 ok
+readi.overrun -32
+state.xrun 4
+prepare 0
+start 0
+drop 0
+state.dropped 1
+rewind -77 18446744073709551539
+write -22
+hw_free 0
+state.freed 0

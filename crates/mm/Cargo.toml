@@ -1,0 +1,19 @@
+[package]
+name = "mm"
+version = "0.1.0"
+edition = "2024"
+description = "Address spaces, VMAs, faults, DMA pools (owner: MM)"
+
+[dependencies]
+bootinfo = { path = "../bootinfo" }
+hal = { path = "../hal" }
+mm-core = { path = "../mm-core" }
+ksync = { path = "../ksync" }
+uapi = { path = "../uapi" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ktest = { path = "../ktest" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+# FS-5: file-backed VMAs (vfs::mmap::MapBacking); vfs sits below mm.
+vfs = { path = "../vfs" }

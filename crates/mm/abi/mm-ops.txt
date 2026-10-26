@@ -1,0 +1,154 @@
+# MM-5a ABI script: wave-A memory calls for anonymous memory. Runs on CachyOS (host/tests/mm/abi/mmops.c,
+# output in linux-expected.txt), in the kernel (ktest mm.as.abi_diff) and on the pure model (cargo test -p mm).
+# B = a free window, H = the program break before the first line, L = the last mmap result. One space
+# between words. Not here (CPU- or kernel-version-dependent): loads from PROT_EXEC-only pages (execute-only
+# through protection keys), MAP_GROWSDOWN, MAP_DROPPABLE, file mappings.
+
+# --- mmap argument checks
+mmap 0 0x1000 rw anon
+mmap 0 0 rw private|anon
+mmap 0 0xfffffffffffff001 rw private|anon
+mmap 0 0x7ffffffff000 rw private|anon
+mmap B+0x123 0x1000 rw private|anon|fixed
+mmap 0x7ffffffff800 0x1000 rw private|anon|fixed
+mmap 0x1000 0x1000 rw private|anon|fixed
+mmap 0xf000 0x1000 rw private|anon|fixed
+mmap B 0x1000 rw anon|fixed
+mmap B 0x1000 rw validate|anon|fixed
+mmap 0 0x200000 rw private|anon|hugetlb
+maps
+
+# --- hints, fixed, noreplace
+mmap B+0x10000 0x3000 rw private|anon
+mmap B+0x10800 0x1000 rw private|anon
+munmap L 0x1000
+mmap B+0x11000 0x1000 r private|anon|noreplace
+mmap B+0x11000 0x1000 r private|anon|fixed
+mmap B+0x20000 0x5000 rw private|anon|noreplace
+mmap B+0x20123 0x1000 rw private|anon|noreplace
+mmap 0x10 0x1000 rw private|anon
+munmap L 0x1000
+mmap 0xf000 0x1000 rw private|anon
+mmap 0x10010 0x1000 rw private|anon
+munmap L 0x1000
+munmap 0x10000 0x1000
+mmap 0 0x1000 rw private|anon
+munmap L 0x1000
+mmap B+0x3fffe000 0x2000 rw private|anon
+munmap L 0x2000
+mmap 0 0x1000 rw private|anon|32bit
+munmap L 0x1000
+mmap 0x200123 0x1000 rw private|anon|32bit
+munmap L 0x1000
+mmap 0x1000 0x1000 rw private|anon|32bit
+munmap L 0x1000
+mmap 0x3ffff000 0x2000 rw private|anon|32bit
+munmap L 0x2000
+mmap 0x90000000 0x1000 rw private|anon|32bit
+munmap L 0x1000
+mmap B+0x60000 0x1000 rw private|anon|32bit
+munmap L 0x1000
+mmap 0x200000 0x1000 rw private|anon|fixed
+mmap 0x200000 0x1000 rw private|anon|32bit
+munmap L 0x1000
+munmap 0x200000 0x1000
+mmap 0x40000000 0x40000000 none private|anon|fixed|noreserve
+mmap 0x7ffff000 0x1000 rw private|anon|32bit
+munmap 0x7ffff000 0x1000
+mmap 0x7ffff000 0x1000 rw private|anon|32bit
+mmap 0x7ffff000 0x1000 rw private|anon|32bit
+munmap 0x40000000 0x40000000
+mmap B+0x30000 0x2000 rw shared|anon|fixed
+mmap B+0x40000 0x1001 rw private|anon|fixed|noreserve|stack
+mmap B+0x50000 0x3000 rw private|anon|fixed|populate
+maps
+
+# --- contents: zero on first touch, kept by mprotect, gone after munmap and MAP_FIXED
+load B+0x10008
+store B+0x10008 0x5a
+load B+0x10008
+store B+0x11000 0x1
+load B+0x11000
+mprotect B+0x10000 0x1000 none
+load B+0x10008
+store B+0x10008 0x1
+mprotect B+0x10000 0x1000 rw
+load B+0x10008
+mprotect B+0x10000 0x1000 w
+load B+0x10008
+store B+0x10009 0x77
+mprotect B+0x10000 0x1000 rw
+mmap B+0x10000 0x1000 rw private|anon|fixed
+load B+0x10008
+store B+0x50fff 0x33
+munmap B+0x50000 0x3000
+mmap B+0x50000 0x3000 rw private|anon|fixed
+load B+0x50fff
+load B+0x60000
+store B+0x60000 0x1
+maps
+
+# --- munmap: argument checks and splitting
+munmap B+0x10001 0x1000
+munmap B+0x10000 0
+munmap 0x7ffffffff000 0x2000
+munmap 0x7ffffffff000 0x1000
+munmap B+0x900000 0x1000
+mmap B+0x100000 0xa000 rw private|anon|fixed
+munmap B+0x103000 0x2000
+maps
+munmap B+0x101000 0x7001
+maps
+munmap B+0xff000 0x1000000
+maps
+
+# --- mprotect: checks, splitting, merging, holes
+mmap B+0x200000 0x8000 rw private|anon|fixed
+mprotect B+0x200001 0x1000 r
+mprotect B+0x200000 0 r
+mprotect B+0x200000 0x1000 0x10
+mprotect B+0x200000 0x1000 0x3000000
+mprotect B+0x200000 0x1000 0x1000001
+mprotect B+0x200000 0x1000 0x2000001
+mprotect B+0x200000 0x1000 0x9
+mprotect B+0x1ff000 0x2000 r
+mprotect 0x7ffffffff000 0x2000 r
+mprotect B+0x202000 0x1000 r
+mprotect B+0x204000 0x2000 none
+mprotect B+0x206000 0x1 rx
+maps
+mprotect B+0x200000 0x8000 rw
+maps
+munmap B+0x203000 0x1000
+mprotect B+0x201000 0x5000 r
+maps
+store B+0x201000 0x1
+store B+0x205000 0x1
+load B+0x205000
+mprotect B+0x200000 0x10000 none
+maps
+mmap 0x7fffffffe000 0x1000 rw private|anon|fixed
+mprotect 0x7fffffffe000 0x2000 r
+munmap 0x7fffffffe000 0x1000
+
+# --- brk
+brk 0
+brk H-0x1000
+brk H+0x3001
+heap
+store H+0x3000 0x11
+load H+0x3000
+brk H+0x3fff
+load H+0x3000
+brk H+0x1000
+heap
+load H+0x1000
+brk H+0x3000
+load H+0x2000
+mmap H+0x8000 0x1000 rw private|anon|noreplace
+brk H+0x7000
+brk H+0x7001
+brk H+0x6fff
+heap
+brk H
+heap

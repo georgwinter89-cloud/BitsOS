@@ -1,0 +1,21 @@
+epoll_wait SA_RESTART=0: -1 -EINTR handled 1
+epoll_pwait SA_RESTART=0: -1 -EINTR handled 1
+epoll_pwait2 SA_RESTART=0: -1 -EINTR handled 1
+poll SA_RESTART=0: -1 -EINTR handled 1
+ppoll SA_RESTART=0: -1 -EINTR handled 1
+select SA_RESTART=0: -1 -EINTR handled 1
+pselect6 SA_RESTART=0: -1 -EINTR handled 1
+epoll_wait SA_RESTART=1: -1 -EINTR handled 1
+epoll_pwait SA_RESTART=1: -1 -EINTR handled 1
+epoll_pwait2 SA_RESTART=1: -1 -EINTR handled 1
+poll SA_RESTART=1: -1 -EINTR handled 1
+ppoll SA_RESTART=1: -1 -EINTR handled 1
+select SA_RESTART=1: -1 -EINTR handled 1
+pselect6 SA_RESTART=1: -1 -EINTR handled 1
+epoll_pwait with an empty mask: -1 -EINTR handled 1, SIGUSR2 blocked in the handler: no, SIGUSR1 blocked after: yes
+epoll_pwait2 with an empty mask: -1 -EINTR handled 1, SIGUSR2 blocked in the handler: no, SIGUSR1 blocked after: yes
+ppoll with an empty mask: -1 -EINTR handled 1, SIGUSR2 blocked in the handler: no, SIGUSR1 blocked after: yes
+pselect6 with an empty mask: -1 -EINTR handled 1, SIGUSR2 blocked in the handler: no, SIGUSR1 blocked after: yes
+ppoll with SIGUSR1 kept blocked: 0 handled 0
+after unblocking: handled 1
+sigwait: done

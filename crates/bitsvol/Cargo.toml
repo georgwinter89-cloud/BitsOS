@@ -1,0 +1,12 @@
+[package]
+name = "bitsvol"
+version = "0.1.0"
+edition = "2024"
+description = "Copy-on-write volumes and snapshots (B1) (owner: VS)"
+
+[dependencies]
+devmodel = { path = "../devmodel" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ksync = { path = "../ksync" }
+ktest = { path = "../ktest" }

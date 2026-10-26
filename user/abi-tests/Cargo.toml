@@ -1,0 +1,24 @@
+[package]
+name = "abi-tests"
+version = "0.1.0"
+edition = "2024"
+description = "ABI test programs for waves A-C: each prints a deterministic transcript that must equal CachyOS's (UL-2; the abi-diff harness is AB-3's)"
+
+[lib]
+name = "abitest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abi-a"
+path = "src/bin/abi-a.rs"
+
+[[bin]]
+name = "abi-b"
+path = "src/bin/abi-b.rs"
+
+[[bin]]
+name = "abi-c"
+path = "src/bin/abi-c.rs"
+
+[dependencies]
+usys = { path = "../tools/usys" }

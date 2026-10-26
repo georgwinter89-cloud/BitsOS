@@ -1,0 +1,108 @@
+# fs-memfd on Linux (CachyOS 7.2.11, tmpfs /dev/shm, vm.memfd_noexec 0), one block per mode: `=== <mode>`, the end
+# (`end: exit N` or `end: signal N`), then stdout. Checked again by host/tests/fs/15-memfd-linux.sh; compared on V2
+# by ktests fs.memfd.programs (basic) and fs.memfd.wl_shm (the client: and compositor: lines of wl-fork).
+=== basic
+end: exit 0
+memfd made: yes
+cloexec: 1
+seals at start: 0
+fd link: /memfd:basic (deleted)
+link lstat: mode 120700 size 64
+fstat: mode 100777 nlink 0 size 0
+ftruncate 3 pages: 0
+shared rw: mapped
+read sees the mapping: hello
+maps: rw-s /memfd:basic (deleted)
+add WRITE with a writable mapping: EBUSY
+add FUTURE_WRITE: 0
+seals: 0x10
+new shared rw: EPERM
+new shared ro: mapped
+mprotect it rw: EACCES
+the old mapping still writes: Hello
+the read-only mapping sees it: H
+write(2): EPERM
+private rw: mapped
+private copy stays private: Hello E
+munmap the writable mapping: 0
+add WRITE now: 0
+shared ro after WRITE: mapped
+it reads: Hello
+shared rw after WRITE: EPERM
+add SHRINK: 0
+reopened read-only: yes
+seals through it: 0x1a
+add through it: EPERM
+same file: yes
+reads: Hello
+its shared ro: mapped
+open O_RDWR|O_TRUNC through the link: EPERM
+open O_NOFOLLOW: ELOOP
+final seals: 0x1a
+link after close: ENOENT
+odd name link: /memfd:a/b c (deleted)
+plain seals: 0x1 cloexec 0
+noexec: mode 100666 seals 0x20
+exec seal on 0777 brings: 0x3e
+/dev/shm file seals: 0x1
+add to it: EPERM
+posix_fallocate 2 pages: 0
+size after it: 8192
+pool shared rw: mapped
+punch the first page: 0
+the mapping sees the hole: 0 p
+punch 100 bytes: 0
+around them: p 0 0 p
+fallocate inside under GROW: 0
+fallocate past the end under GROW: EPERM
+posix_fallocate past the end under GROW: EPERM
+punch under SHRINK: 0
+punch under WRITE: EPERM
+pool size stays: 8192
+fallocate 1 TiB: ENOSPC
+fallocate 1 TiB KEEP_SIZE: ENOSPC
+its size stays: 0
+vm.memfd_noexec: 0
+done
+=== wl-fork
+end: exit 0
+client: memfd made: yes
+client: ftruncate: 0
+client: shared rw: mapped
+client: frame 1 sum 75bba321
+client: seal shrink|grow: 0
+compositor: size 196608 seals 0x6
+compositor: access O_RDWR
+compositor: shared ro: mapped
+compositor: frame 1 sum 75bba321
+compositor: shrink EPERM
+compositor: grow EPERM
+compositor: seen 1
+client: frame 2 sum 6b9f9842
+compositor: frame 2 sum 6b9f9842
+compositor: munmap: 0
+compositor: done
+client: munmap: 0
+client: close: 0
+client: done
+=== wl-socket
+end: exit 0
+client: memfd made: yes
+client: ftruncate: 0
+client: shared rw: mapped
+client: frame 1 sum 75bba321
+client: seal shrink|grow: 0
+compositor: size 196608 seals 0x6
+compositor: access O_RDWR
+compositor: shared ro: mapped
+compositor: frame 1 sum 75bba321
+compositor: shrink EPERM
+compositor: grow EPERM
+compositor: seen 1
+client: frame 2 sum 6b9f9842
+compositor: frame 2 sum 6b9f9842
+compositor: munmap: 0
+compositor: done
+client: munmap: 0
+client: close: 0
+client: done

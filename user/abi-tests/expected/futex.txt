@@ -1,0 +1,125 @@
+== wait/wake
+wake.nobody.private = 0
+wake.nobody.shared = 0
+wake.zero_count = 0
+wait.mismatch.private = -EAGAIN
+wait.mismatch.shared = -EAGAIN
+wait.timeout_10ms = -errno 110
+wait.waited_10ms: yes
+wait.timeout_zero = -errno 110
+wait.timeout_bad_ns = -EINVAL
+wait.timeout_negative = -EINVAL
+wait.timeout_fault = -EFAULT
+wait.bad_ns_and_mismatch = -EINVAL
+wait.misaligned = -EINVAL
+wake.misaligned = -EINVAL
+wait.null.private = -EFAULT
+wake.null.private = 0
+wake.null.shared = -EFAULT
+wake.kernel.private = -EFAULT
+wake.noncanonical.private = -EFAULT
+wait.noncanonical.private = -EFAULT
+wake.noncanonical.shared = -EFAULT
+wake.user_top.private = 0
+wake.user_top_plus4.private = -EFAULT
+wake.user_top.shared = -EFAULT
+wait.user_top.private = -EFAULT
+unknown_op = -ENOSYS
+futex_fd = -ENOSYS
+== bitset and clocks
+wait_bitset.zero = -EINVAL
+wake_bitset.zero = -EINVAL
+wake_bitset.nobody = 0
+wait_bitset.abs_past_mono = -errno 110
+wait_bitset.abs_past_real = -errno 110
+wait_bitset.abs_10ms_mono = -errno 110
+wait_bitset.waited_until: yes
+wait_bitset.abs_10ms_real = -errno 110
+wait_bitset.mismatch_past = -EAGAIN
+wait.clock_realtime = -ENOSYS
+wait.clock_realtime_bad_timeout = -EFAULT
+wake.clock_realtime = -ENOSYS
+wake_bitset.clock_realtime = -ENOSYS
+wake.timeout_ignored = 0
+== wake_op
+wake_op.set = 0
+wake_op.set.value = 7
+wake_op.add = 0
+wake_op.add.value = 6
+wake_op.or_shift = 0
+wake_op.or_shift.value = 22
+wake_op.andn = 0
+wake_op.andn.value = 16
+wake_op.xor = 0
+wake_op.xor.value = 2031
+wake_op.shift_out_of_range = 0
+wake_op.shift_out_of_range.value = 2
+wake_op.bad_op = -ENOSYS
+wake_op.bad_op.value = 1
+wake_op.bad_cmp = -ENOSYS
+wake_op.bad_cmp.value = 9
+wake_op.misaligned2 = -EINVAL
+wake_op.null2 = -EFAULT
+wake_op.null2.bad_op = -ENOSYS
+wake_op.kernel2 = -EFAULT
+== requeue
+requeue.nobody = 0
+requeue.negative_wake = -EINVAL
+requeue.negative_requeue = -EINVAL
+cmp_requeue.mismatch = -EAGAIN
+cmp_requeue.match = 0
+cmp_requeue.misaligned1 = -EINVAL
+cmp_requeue.misaligned2 = -EINVAL
+cmp_requeue.null1 = -EFAULT
+requeue.null1 = 0
+requeue.null.shared = -EFAULT
+== shared keys
+anon_ro.wait.shared = -EFAULT
+anon_ro.wait.private = -EAGAIN
+anon_ro.wake.shared = -EFAULT
+anon_ro.wake.private = 0
+anon_none.wake.shared = -EFAULT
+anon_none.wake.private = 0
+anon_none.wait.private = -EFAULT
+wake_op.anon_ro2 = -EFAULT
+wake_op.anon_ro2.shared = -EFAULT
+shm.open: yes
+shm.truncate: yes
+file_shared.wait.mismatch = -EAGAIN
+file_shared.wake = 0
+file_shared_ro.wait.mismatch = -EAGAIN
+file_shared_ro.wake = 0
+file_shared_ro.wake_op2 = -EFAULT
+file_shared_ro.value = 7
+file_shared.wake_op = 0
+file_shared.value = 8
+file_private_ro.wait.mismatch = -EAGAIN
+file_private_ro.wake_op2 = -EFAULT
+file_private_rw.wait.mismatch = -EAGAIN
+file_private_rw.wake_op = 0
+file_private_rw.value = 9, file = 8
+file_shared.wait.timeout = -errno 110
+== futex_waitv
+waitv.flags = -EINVAL
+waitv.zero = -EINVAL
+waitv.129 = -EINVAL
+waitv.null = -EINVAL
+waitv.bad_clock = -EINVAL
+waitv.bad_timeout = -EFAULT
+waitv.past_mono = -errno 110
+waitv.past_real = -errno 110
+waitv.10ms = -errno 110
+waitv.mismatch = -EAGAIN
+waitv.val_low_32_bits = -EINVAL
+waitv.no_futex32 = -EINVAL
+waitv.bad_flag = -EINVAL
+waitv.reserved = -EINVAL
+waitv.misaligned = -EINVAL
+waitv.null_word = -EFAULT
+waitv.bad_array = -EFAULT
+== robust list
+set_robust_list.len23 = -EINVAL
+set_robust_list = 0
+get_robust_list = 0
+get_robust_list.same: yes
+== end

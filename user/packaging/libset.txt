@@ -1,0 +1,16 @@
+# UL-5: the glibc library set for dynamic programs, copied from CachyOS (the build host) into every image.
+# <soname> <when>: always = in every image (programs copied later, over MCP or onto the stick, find them);
+# needed = only when a program of the image needs it (ldd). A library ldd names for a program and not listed
+# here joins as "needed" too. The files land in /usr/lib as on CachyOS, the loader too (/lib64 and /lib are links
+# to usr/lib, /usr/lib64 to lib); glibc's only system directory there; V2 has no /etc/ld.so.cache.
+# Versions, sizes, SHA-256 and licences of the set: libset.lock (cargo xtask initrd --lock rewrites it).
+ld-linux-x86-64.so.2 always
+libc.so.6            always
+libm.so.6            always
+# glibc >= 2.34 has libpthread, libdl and librt inside libc; these are its empty stubs for older programs.
+libpthread.so.0      always
+libdl.so.2           always
+librt.so.1           always
+libgcc_s.so.1        always
+# Always (UL-5 fixer): C++ programs put on the stick or written over MCP later (Node, Brave, PK-4) need it.
+libstdc++.so.6       always

@@ -1,0 +1,15 @@
+# BitsOS V2 CONFIG.TXT defaults written by `xtask image` (format: name=value, last wins, '#' starts a comment).
+# Extra lines from `--config-extra "k=v;k2=v2"` and from ktest (`ktest=<filter>`) are appended below these.
+
+# Kernel log verbosity: error, warn, info, debug, trace
+loglevel=info
+# What the screen console shows (IN-quiet): console_log=off|error|warn|info|debug|all (default warn = Warn+ plus
+# boot, link, DHCP, MCP, watchdog, init, reload, power, input lines). loglevel= decides the ring and the mirror.
+# What a kernel panic does after it printed: halt (stay for the serial log) or reboot
+panic=halt
+# CPUs (CP-4b): smp=off keeps the other CPUs offline; cpus=N starts at most N. Default: all (Reload parks them, RB-5b).
+# Console mirror (RB-4): mirror=a.b.c.d[:port] sends every log line as UDP (port 6666 if left out; V1's console=
+# is read when mirror= is absent). Test only: rb_mirror_panic=on forces a panic ktest (QEMU).
+# Display (DP-1): display_refresh=<Hz>, e.g. 59.95, replaces the 60 Hz vblank estimate until EDID exists.
+# Data volume (FS-8c): data_img_mb=<MiB> size of a new \BITSOS2\data.img (default 2048, 32..4095; 0 = no /data).
+# An existing image is never changed; a new one is made only when 512 MiB of the stick stay free.

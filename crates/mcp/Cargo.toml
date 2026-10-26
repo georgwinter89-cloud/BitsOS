@@ -1,0 +1,33 @@
+[package]
+name = "mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP kernel service, tool registry (owner: MC)"
+
+[dependencies]
+net = { path = "../net" }
+ksync = { path = "../ksync" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+sched = { path = "../sched" }
+policy = { path = "../policy" }
+time = { path = "../time" }
+ktest = { path = "../ktest" }
+acpi = { path = "../acpi" }
+bootinfo = { path = "../bootinfo" }
+devmodel = { path = "../devmodel" }
+hal = { path = "../hal" }
+platform = { path = "../platform" }
+mm-core = { path = "../mm-core" }
+pci = { path = "../pci" }
+display = { path = "../display" }
+console = { path = "../console" }
+vfs = { path = "../vfs" }
+uapi = { path = "../uapi" }
+# MC-4b: `reboot` reads the boot stick's generations (FS-7's SYS listing) and names what bitsboot's own rule
+# (`bitsboot_pure::gens::choose`) starts next.
+fs-fat = { path = "../fs-fat" }
+bitsboot = { path = "../../boot/bitsboot" }
+# V2-LANES MC-3 names it for screen's PNG (no_std + alloc, pinned). Its inflate reads the PNG back in the
+# tests; the deflate side is src/deflate.rs (miniz's compressor needs more than a 64 KiB kernel stack, see there).
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }

@@ -1,0 +1,6 @@
+Überweisung zum Facharzt
+Patient: Thomas Keller, geboren 1985
+Überweisung an: Orthopädische Praxis Dr. Sommer
+Diagnose: anhaltende Schulterschmerzen rechts
+Auftrag: Bildgebung (MRT), Mitbehandlung
+Ausgestellt von Dr. Weidner, Hausarztpraxis Beispielstadt, 09.04.2026

@@ -1,0 +1,81 @@
+# BitsOS V2 workspace (desk-owned, V2-LANES.md §2). user/ is a separate workspace (stable toolchain, musl).
+[workspace]
+resolver = "3"
+members = [
+  "crates/acpi",
+  "crates/dcn314-regs",
+  "crates/hdacodec",
+  "crates/hidparse",
+  "crates/rtw89-core",
+  "host/gen/dcn314",
+  "crates/bitsvol",
+  "crates/block",
+  "crates/bootinfo",
+  "crates/console",
+  "crates/console-cmds",
+  "crates/crypt",
+  "crates/devmodel",
+  "crates/display",
+  "crates/drivers/amdgpu",
+  "crates/drivers/fch-wdt",
+  "crates/drivers/gopfb",
+  "crates/drivers/hda",
+  "crates/drivers/igc",
+  "crates/drivers/nvme",
+  "crates/drivers/rtw89",
+  "crates/drivers/usb-audio",
+  "crates/drivers/usb-core",
+  "crates/drivers/usb-hid",
+  "crates/drivers/usb-msd",
+  "crates/drivers/virtio-net",
+  "crates/drivers/xhci",
+  "crates/fs-ext4",
+  "crates/fs-fat",
+  "crates/hal",
+  "crates/kexec",
+  "crates/klog",
+  "crates/klogd",
+  "crates/kreg",
+  "crates/ksync",
+  "crates/ktest",
+  "crates/mcp",
+  "crates/mm",
+  "crates/mm-core",
+  "crates/net",
+  "crates/pci",
+  "crates/platform",
+  "crates/policy",
+  "crates/policy-mcp",
+  "crates/proc",
+  "crates/sched",
+  "crates/sched-mcp",
+  "crates/seccomp",
+  "crates/snapshots",
+  "crates/snd",
+  "crates/syscall",
+  "crates/time",
+  "crates/tpm",
+  "crates/uapi",
+  "crates/userland",
+  "crates/vfs",
+  "crates/vfs-sys",
+  "crates/wifi",
+  "kernel",
+  "boot/bitsboot",
+  "host/xtask",
+]
+# `cargo test` without -p runs the host-testable crates only (the kernel and the loader need their own targets).
+default-members = ["host/xtask"]
+exclude = ["user"]
+
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+# Line tables and symbols stay in the image: RB-2's backtrace and the symbol table need them.
+debug = 1

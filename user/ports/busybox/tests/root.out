@@ -1,0 +1,14 @@
+0
+mounted
+proc-mounts
+mount-list
+df
+in-tmpfs
+unmounted
+0 0
+chroot
+ping
+traceroute
+ifconfig-list
+end
+exit 0

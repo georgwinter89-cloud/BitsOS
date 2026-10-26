@@ -1,0 +1,180 @@
+setrlimit(RLIMIT_NICE, 0) = 0
+setrlimit(RLIMIT_RTPRIO, 0) = 0
+sched_getaffinity(len 128) returns the cpumask size: a multiple of 8, at most 128: yes
+sched_getaffinity(len 4) = -EINVAL
+sched_getaffinity(len 12) = -EINVAL
+sched_getaffinity(pid -1) = -ESRCH
+sched_getaffinity(no such pid) = -ESRCH
+sched_getaffinity(kernel address) = -EFAULT
+sched_getaffinity(len 2^29) = -EINVAL
+sched_getaffinity(len 2^32 + 128) answers like len 128: yes
+sched_setaffinity(bad pointer, no such pid) = -EFAULT
+sched_setaffinity(no such pid) = -ESRCH
+sched_setaffinity(pid -1) = -ESRCH
+sched_setaffinity(empty) = -EINVAL
+sched_setaffinity(len 0) = -EINVAL
+sched_setaffinity(only CPU 63) = -EINVAL
+sched_setaffinity(CPU 0, len 128) = 0
+getcpu = 0
+  cpu 0 node 0
+  one CPU in the mask, CPU 0: yes
+sched_setaffinity(CPUs 0-1, len 1) = 0
+  on CPU 0 or 1: yes
+sched_setaffinity(all) = 0
+  every online CPU in the mask: yes
+getcpu(NULL, NULL) = 0
+getcpu(cpu, NULL) = 0
+  cpu below the online count: yes
+getcpu(NULL, node) = 0
+  node 0
+getcpu(kernel address, node) = -EFAULT
+getcpu(cpu, kernel address) = -EFAULT
+setpriority(which 3) = -EINVAL
+setpriority(which -1) = -EINVAL
+getpriority(which 3) = -EINVAL
+setpriority(PRIO_PROCESS, 0, 5) = 0
+getpriority(PRIO_PROCESS, 0) (20 - nice) = 15
+setpriority(PRIO_PROCESS, own pid, 7) = 0
+getpriority(PRIO_PROCESS, own pid) = 13
+setpriority(5): lowering without RLIMIT_NICE = -EACCES
+setpriority(7): the same value = 0
+setpriority(100): clamped to 19 = 0
+getpriority after 100 = 1
+setpriority(-100) as a user = -EACCES
+setpriority(no such pid) = -ESRCH
+getpriority(no such pid) = -ESRCH
+setpriority(pid -1) = -ESRCH
+getpriority(pid -1) = -ESRCH
+setpriority(PRIO_USER, no such user) = -ESRCH
+getpriority(PRIO_USER, no such user) = -ESRCH
+setpriority(PRIO_PGRP, no such group) = -ESRCH
+getpriority(PRIO_PGRP, 0) in 1..40: yes
+getpriority(PRIO_USER, 0) in 1..40: yes
+sched_getscheduler(0) = 0
+sched_getscheduler(-1) = -EINVAL
+sched_getscheduler(no such pid) = -ESRCH
+sched_getparam(0) = 0
+  priority 0
+sched_getparam(NULL) = -EINVAL
+sched_getparam(-1) = -EINVAL
+sched_getparam(no such pid) = -ESRCH
+sched_getparam(kernel address) = -EFAULT
+sched_setscheduler(policy -1) = -EINVAL
+sched_setscheduler(NULL) = -EINVAL
+sched_setscheduler(pid -1) = -EINVAL
+sched_setscheduler(kernel address) = -EFAULT
+sched_setscheduler(kernel address, no such pid) = -EFAULT
+sched_setscheduler(no such pid) = -ESRCH
+sched_setscheduler(policy 4) = -EINVAL
+sched_setscheduler(policy 8) = -EINVAL
+sched_setscheduler(policy 4 | RESET_ON_FORK) = -EINVAL
+sched_setscheduler(SCHED_DEADLINE) = -EINVAL
+sched_setscheduler(SCHED_FIFO, 0) = -EINVAL
+sched_setscheduler(SCHED_FIFO, 100) = -EINVAL
+sched_setscheduler(SCHED_FIFO, -1) = -EINVAL
+sched_setscheduler(SCHED_OTHER, 1) = -EINVAL
+sched_setscheduler(SCHED_FIFO, 1) without RLIMIT_RTPRIO = -EPERM
+sched_setscheduler(SCHED_RR, 50) without RLIMIT_RTPRIO = -EPERM
+sched_setscheduler(SCHED_EXT, 0) = 0
+sched_getscheduler = 7
+sched_setscheduler(SCHED_OTHER, 0) = 0
+sched_getscheduler = 0
+sched_setscheduler(SCHED_BATCH, 0) = 0
+sched_getscheduler = 3
+sched_setparam(0) = 0
+sched_setparam(1) = -EINVAL
+sched_setparam(NULL) = -EINVAL
+sched_setparam(no such pid) = -ESRCH
+sched_setparam(-1) = -EINVAL
+sched_setparam(kernel address) = -EFAULT
+sched_setparam(-1 priority) = -EINVAL
+sched_setscheduler(SCHED_RR, 0) = -EINVAL
+sched_setscheduler(SCHED_RR, 100) = -EINVAL
+sched_setscheduler(SCHED_IDLE, 1) = -EINVAL
+sched_setscheduler(SCHED_FIFO | RESET_ON_FORK, 1) without RLIMIT_RTPRIO = -EPERM
+sched_getscheduler = 3
+sched_setscheduler(SCHED_BATCH | RESET_ON_FORK) = 0
+sched_getscheduler = 1073741827
+sched_setparam(0) keeps the flag = 0
+sched_getscheduler = 1073741827
+sched_setscheduler(SCHED_BATCH): clearing the flag = -EPERM
+sched_setscheduler(SCHED_IDLE | RESET_ON_FORK) = 0
+sched_getscheduler = 1073741829
+sched_getparam under SCHED_IDLE = 0
+  priority 0
+sched_setparam(1) under SCHED_IDLE = -EINVAL
+sched_setscheduler(SCHED_OTHER | RESET_ON_FORK): leaving SCHED_IDLE at nice 19 = -EPERM
+sched_getscheduler = 1073741829
+getpriority stays = 1
+sched_get_priority_max(0) = 0
+sched_get_priority_min(0) = 0
+sched_get_priority_max(1) = 99
+sched_get_priority_min(1) = 1
+sched_get_priority_max(2) = 99
+sched_get_priority_min(2) = 1
+sched_get_priority_max(3) = 0
+sched_get_priority_min(3) = 0
+sched_get_priority_max(5) = 0
+sched_get_priority_min(5) = 0
+sched_get_priority_max(6) = 0
+sched_get_priority_min(6) = 0
+sched_get_priority_max(7) = 0
+sched_get_priority_min(7) = 0
+sched_get_priority_max(4) = -EINVAL
+sched_get_priority_min(4) = -EINVAL
+sched_get_priority_max(8) = -EINVAL
+sched_get_priority_min(8) = -EINVAL
+sched_get_priority_max(-1) = -EINVAL
+sched_get_priority_min(-1) = -EINVAL
+times(NULL) > 0: yes
+times(buf) >= times(NULL): yes
+  no children's time: yes
+times(kernel address) = -EFAULT
+getrusage(2) = -EINVAL
+getrusage(-2) = -EINVAL
+getrusage(kernel address) = -EFAULT
+getrusage(RUSAGE_CHILDREN) = 0
+  all zero without children: yes
+getrusage(RUSAGE_SELF) = 0
+  some CPU time, usec below 1e6: yes
+  ru_maxrss > 0: yes
+getrusage(RUSAGE_THREAD) = 0
+  usec below 1e6, some CPU time, ru_maxrss > 0: yes
+  at most RUSAGE_SELF's time and switches: yes
+  page-fault, block-I/O and IPC fields of a thread: no 0x55 left: yes
+clock_getres(2) = 0
+  resolution 1 ns
+clock_gettime(2) = 0
+clock_getres(3) = 0
+  resolution 1 ns
+clock_gettime(3) = 0
+clock_getres(-8) = 0
+  resolution 1000000 ns
+clock_gettime(-8) = 0
+clock_getres(-7) = 0
+  resolution 1000000 ns
+clock_gettime(-7) = 0
+clock_getres(-6) = 0
+  resolution 1 ns
+clock_gettime(-6) = 0
+clock_getres(-4) = 0
+  resolution 1000000 ns
+clock_gettime(-4) = 0
+clock_getres(-3) = 0
+  resolution 1000000 ns
+clock_gettime(-3) = 0
+clock_getres(-2) = 0
+  resolution 1 ns
+clock_gettime(-2) = 0
+VIRT <= PROF: yes
+clock_gettime(own thread clock by pid) = 0
+clock_gettime(own process clock by pid) = 0
+clock_gettime(process clock of no such pid) = -EINVAL
+clock_gettime(thread clock of no such pid) = -EINVAL
+clock_getres(process clock of no such pid) = -EINVAL
+clock_nanosleep(CLOCK_THREAD_CPUTIME_ID) = -EOPNOTSUPP
+clock_nanosleep(own thread clock) = -EINVAL
+clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0) = 0
+clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, ABSTIME, 1 ns) = 0
+clock_nanosleep(PROF clock, ABSTIME, 1 ns) = 0
+clock_nanosleep(process clock of no such pid) = -EINVAL

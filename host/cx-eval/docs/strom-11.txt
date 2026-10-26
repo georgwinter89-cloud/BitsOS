@@ -1,0 +1,4 @@
+Abschlagsplan Nordlicht Fix 12
+Monatlicher Abschlag 78,00 EUR, fällig zum 3. Werktag per Lastschrift
+Berechnung: Jahresverbrauch geschätzt 2.300 kWh x 29,80 ct = 685,40 EUR + Grundpreis 150,00 EUR, geteilt durch 12 plus Sicherheitsaufschlag.
+Anpassung nach der ersten Jahresabrechnung.

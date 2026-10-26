@@ -1,0 +1,31 @@
+[package]
+name = "ctxd"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS context service prototype (CX-1): context instead of folders"
+publish = false
+
+# Own workspace: ctxd is built on its own (CachyOS prototype, later static musl for V2);
+# the user/ workspace manifest stays untouched.
+[workspace]
+
+# Exact pins (CX-1 notes list them; downloads covered by Georg's OK of 15.10.).
+[dependencies]
+blake3 = "=1.8.7"
+encoding_rs = "=0.8.42"
+inotify = { version = "=0.11.0", default-features = false }
+instant-distance = "=0.6.1"
+mail-parser = "=0.11.9"
+pdf-extract = "=0.12.1"
+quick-xml = "=0.42.0"
+rlimit = "=0.11.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tantivy = { version = "=0.26.2", default-features = false, features = ["mmap", "lz4-compression"] }
+toml = "=1.1.8"
+unicode-normalization = "=0.1.25"
+zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+debug = false

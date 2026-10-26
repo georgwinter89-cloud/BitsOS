@@ -1,0 +1,3 @@
+commit: asked 64 MiB in 4 MiB steps (mmap): committed 64 MiB, stop=limit
+again after munmap: the same amount, nothing leaked
+commit: ok

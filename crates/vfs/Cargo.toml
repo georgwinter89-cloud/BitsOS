@@ -1,0 +1,15 @@
+[package]
+name = "vfs"
+version = "0.1.0"
+edition = "2024"
+description = "VFS, tmpfs, devfs, procfs, pipes, epoll, mount views (B2), freeze (B1) (owner: FS)"
+
+[dependencies]
+ksync = { path = "../ksync" }
+kreg = { path = "../kreg" }
+klog = { path = "../klog" }
+mm-core = { path = "../mm-core" }
+hal = { path = "../hal" }
+ktest = { path = "../ktest" }
+policy = { path = "../policy" }
+uapi = { path = "../uapi" }

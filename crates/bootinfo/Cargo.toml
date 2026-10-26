@@ -1,0 +1,8 @@
+[package]
+name = "bootinfo"
+version = "0.1.0"
+edition = "2024"
+description = "Versioned, tagged hand-over format between bitsboot, the kernel and Reload (desk contract)"
+
+[lib]
+test = true

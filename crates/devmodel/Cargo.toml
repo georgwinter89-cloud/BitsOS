@@ -1,0 +1,8 @@
+[package]
+name = "devmodel"
+version = "0.1.0"
+edition = "2024"
+description = "Driver traits (hardware abstraction), Quiesce, registry (owner: desk/PC)"
+
+[dependencies]
+ksync = { path = "../ksync" }

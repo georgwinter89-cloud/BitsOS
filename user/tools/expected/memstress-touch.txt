@@ -1,0 +1,4 @@
+touch 16 MiB (4096 pages), 4 orders x 2 rounds: written and read back
+dontneed odd pages: they read zero, the even ones kept their bytes
+dontneed all: zero
+touch: ok

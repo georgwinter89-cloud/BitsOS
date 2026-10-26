@@ -1,0 +1,22 @@
+[package]
+name = "gopfb"
+version = "0.1.0"
+edition = "2024"
+description = "GOP framebuffer back end (owner: DP)"
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+display = { path = "../../display" }
+bootinfo = { path = "../../bootinfo" }
+hal = { path = "../../hal" }
+klog = { path = "../../klog" }
+ksync = { path = "../../ksync" }
+ktest = { path = "../../ktest" }
+sched = { path = "../../sched" }
+time = { path = "../../time" }
+kreg = { path = "../../kreg" }
+mm = { path = "../../mm" }
+policy = { path = "../../policy" }
+proc = { path = "../../proc" }
+uapi = { path = "../../uapi" }
+vfs = { path = "../../vfs" }

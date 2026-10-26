@@ -1,0 +1,10 @@
+user loop: user time grew by >= 250 ms: yes
+user loop: system time grew by < 100 ms: yes
+syscall loop: system time grew by >= 30 ms: yes
+syscall loop: user + system grew by >= 250 ms: yes
+times: tms_utime >= 25 ticks: yes
+times: tms_utime + tms_stime >= 55 ticks: yes
+CPU clocks: VIRT >= 250 ms: yes
+CPU clocks: PROF >= 550 ms and >= VIRT: yes
+CPU clocks: PROCESS_CPUTIME >= PROF - 50 ms: yes
+RUSAGE_THREAD: user >= 250 ms: yes

@@ -1,0 +1,9 @@
+[package]
+name = "dcn314-gen"
+version = "0.1.0"
+edition = "2024"
+description = "Generates crates/dcn314-regs from Linux's dcn_3_1_4 headers and the G-1 snapshot (owner: GX)"
+publish = false
+
+
+[dependencies]

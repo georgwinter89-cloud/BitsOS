@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bitsos-fb input test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #3366cc; overflow: hidden; }
+  #box { position: absolute; left: 0; top: 0; width: 480px; height: 270px; background: #ff8800; }
+</style></head>
+<body><div id="box"></div>
+<script>
+  // Records what the backend delivers; fb-e2e.sh reads window.__log over DevTools.
+  window.__log = [];
+  const add = (s) => window.__log.push(s);
+  addEventListener('keydown', (e) => add('down ' + e.key + ' ' + e.keyCode));
+  addEventListener('keyup', (e) => add('up ' + e.key));
+  addEventListener('mousedown', (e) => add('mousedown ' + e.button + ' ' + Math.round(e.clientX) + ',' + Math.round(e.clientY)));
+  addEventListener('mouseup', (e) => add('mouseup ' + e.button));
+  addEventListener('wheel', (e) => add('wheel ' + Math.sign(e.deltaY)));
+</script></body></html>

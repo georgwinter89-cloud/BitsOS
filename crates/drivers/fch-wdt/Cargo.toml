@@ -1,0 +1,20 @@
+[package]
+name = "fch-wdt"
+version = "0.1.0"
+edition = "2024"
+description = "FCH watchdog (owner: RB)"
+
+[dependencies]
+# INT-A1: the console command `hang` (IN-3 change request 8).
+console = { path = "../../console" }
+devmodel = { path = "../../devmodel" }
+hal = { path = "../../hal" }
+kexec = { path = "../../kexec" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+ksync = { path = "../../ksync" }
+ktest = { path = "../../ktest" }
+mcp = { path = "../../mcp" }
+pci = { path = "../../pci" }
+sched = { path = "../../sched" }
+time = { path = "../../time" }

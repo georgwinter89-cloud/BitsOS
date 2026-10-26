@@ -1,0 +1,14 @@
+[package]
+name = "block"
+version = "0.1.0"
+edition = "2024"
+description = "Block layer: request queue with merging and B4 priorities, write-refusal hook (R8a), RAM disk (owner: FS)"
+
+[dependencies]
+devmodel = { path = "../devmodel" }
+ksync = { path = "../ksync" }
+klog = { path = "../klog" }
+ktest = { path = "../ktest" }
+sched = { path = "../sched" }
+uapi = { path = "../uapi" }
+vfs = { path = "../vfs" }

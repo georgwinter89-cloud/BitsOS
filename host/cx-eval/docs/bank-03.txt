@@ -1,0 +1,8 @@
+Kontoauszug Girokonto, Dezember 2025
+IBAN DE00 1234 5678 9012 3456 78 (Beispiel)
+01.12. Gehalt Brandtner Maschinenbau +3.412,18
+01.12. Miete Hausverwaltung Brandt -1.060,00
+03.12. Sonnenwerk Energie Abschlag -78,00
+05.12. Supermarkt Karte -83,40
+15.12. Sparplan Nordbank -300,00
+Saldo am 31.12.: 4.118,76 EUR

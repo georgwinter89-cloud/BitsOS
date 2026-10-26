@@ -1,0 +1,21 @@
+subshell 3
+pipe 0
+killed 143
+waited 0
+trapped
+after
+func 7
+1 2 3 
+match
+42
+heredoc line
+child 5
+timeout 143
+A=1
+loop 20
+nested deep
+fd3
+stopped
+stopcont 143
+end
+exit 0

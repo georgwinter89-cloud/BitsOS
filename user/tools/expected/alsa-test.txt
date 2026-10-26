@@ -1,0 +1,1 @@
+alsa-test: stub until SN-4 (ALSA PCM on V2): nothing played, skipped

@@ -1,0 +1,385 @@
+{
+ "version": 1,
+ "language": "de",
+ "note": "Synthetic. relevant = documents Georg would want in the workspace (a document may be relevant to two topics). near_distractors share words but do not belong. hard = relevant documents that contain none of the query words (filled by check.py --update).",
+ "topics": [
+  {
+   "id": "steuer",
+   "name": "Steuererklärung 2025",
+   "query": "Steuererklärung 2025",
+   "query_alt": "Was brauche ich dieses Jahr für das Finanzamt?",
+   "relevant": [
+    "steuer-01",
+    "steuer-02",
+    "steuer-03",
+    "steuer-04",
+    "steuer-05",
+    "steuer-06",
+    "steuer-07",
+    "steuer-08",
+    "steuer-09",
+    "steuer-10",
+    "steuer-11",
+    "steuer-12",
+    "bank-09",
+    "garten-12"
+   ],
+   "near_distractors": [
+    "arzt-10",
+    "garten-01",
+    "misc-01",
+    "misc-02",
+    "misc-04",
+    "misc-34",
+    "misc-37"
+   ],
+   "hard": [
+    "bank-09",
+    "garten-12",
+    "steuer-01",
+    "steuer-02",
+    "steuer-03",
+    "steuer-04",
+    "steuer-06",
+    "steuer-07",
+    "steuer-08",
+    "steuer-09",
+    "steuer-10",
+    "steuer-11"
+   ]
+  },
+  {
+   "id": "auto",
+   "name": "Autoversicherung",
+   "query": "Autoversicherung wechseln",
+   "query_alt": "günstigere Kfz-Police finden und alte kündigen",
+   "relevant": [
+    "auto-01",
+    "auto-02",
+    "auto-03",
+    "auto-04",
+    "auto-05",
+    "auto-06",
+    "auto-07",
+    "auto-08",
+    "auto-09",
+    "auto-10"
+   ],
+   "near_distractors": [
+    "auto-11",
+    "misc-01",
+    "misc-05",
+    "misc-06",
+    "misc-07"
+   ],
+   "hard": [
+    "auto-05",
+    "auto-09",
+    "auto-10"
+   ]
+  },
+  {
+   "id": "italien",
+   "name": "Urlaub Italien",
+   "query": "Urlaub in Italien",
+   "query_alt": "alles zur Toskana-Reise im Juni",
+   "relevant": [
+    "italien-01",
+    "italien-02",
+    "italien-03",
+    "italien-04",
+    "italien-05",
+    "italien-06",
+    "italien-07",
+    "italien-08",
+    "italien-09",
+    "italien-10",
+    "italien-11"
+   ],
+   "near_distractors": [
+    "misc-08",
+    "misc-09",
+    "misc-10",
+    "misc-11",
+    "misc-36",
+    "misc-38",
+    "misc-39",
+    "rezept-04"
+   ],
+   "hard": [
+    "italien-01",
+    "italien-02",
+    "italien-03",
+    "italien-04",
+    "italien-05",
+    "italien-06",
+    "italien-07",
+    "italien-08",
+    "italien-09",
+    "italien-11"
+   ]
+  },
+  {
+   "id": "arzt",
+   "name": "Arzt und Krankenkasse",
+   "query": "Arzt und Krankenkasse",
+   "query_alt": "Befunde, Rechnungen und Erstattungen zur Gesundheit",
+   "relevant": [
+    "arzt-01",
+    "arzt-02",
+    "arzt-03",
+    "arzt-04",
+    "arzt-05",
+    "arzt-06",
+    "arzt-07",
+    "arzt-08",
+    "arzt-09",
+    "arzt-10",
+    "arzt-11",
+    "steuer-07"
+   ],
+   "near_distractors": [
+    "italien-07",
+    "misc-12",
+    "misc-13",
+    "misc-14",
+    "misc-28"
+   ],
+   "hard": [
+    "arzt-01",
+    "arzt-02",
+    "arzt-03",
+    "arzt-04",
+    "arzt-05",
+    "arzt-06",
+    "arzt-09",
+    "arzt-11"
+   ]
+  },
+  {
+   "id": "miete",
+   "name": "Mietvertrag und Nebenkosten",
+   "query": "Mietvertrag und Nebenkosten",
+   "query_alt": "was ich für die Wohnung zahle und was mit dem Vermieter vereinbart ist",
+   "relevant": [
+    "miete-01",
+    "miete-02",
+    "miete-03",
+    "miete-04",
+    "miete-05",
+    "miete-06",
+    "miete-07",
+    "miete-08",
+    "miete-09",
+    "miete-10",
+    "miete-11"
+   ],
+   "near_distractors": [
+    "bank-03",
+    "garten-02",
+    "italien-02",
+    "misc-15",
+    "misc-16",
+    "misc-18",
+    "misc-21"
+   ],
+   "hard": [
+    "miete-03",
+    "miete-04",
+    "miete-05",
+    "miete-06",
+    "miete-07",
+    "miete-08",
+    "miete-09"
+   ]
+  },
+  {
+   "id": "strom",
+   "name": "Stromvertrag",
+   "query": "Stromvertrag",
+   "query_alt": "wer liefert meinen Strom und was kostet es",
+   "relevant": [
+    "strom-01",
+    "strom-02",
+    "strom-03",
+    "strom-04",
+    "strom-05",
+    "strom-06",
+    "strom-07",
+    "strom-08",
+    "strom-09",
+    "strom-10",
+    "strom-11"
+   ],
+   "near_distractors": [
+    "miete-10",
+    "misc-19",
+    "misc-20",
+    "misc-21",
+    "pc-10"
+   ],
+   "hard": [
+    "strom-01",
+    "strom-02",
+    "strom-06",
+    "strom-07",
+    "strom-08",
+    "strom-09",
+    "strom-10",
+    "strom-11"
+   ]
+  },
+  {
+   "id": "garten",
+   "name": "Garten",
+   "query": "Garten 2026",
+   "query_alt": "was ich draußen anbaue, pflege und baue",
+   "relevant": [
+    "garten-01",
+    "garten-02",
+    "garten-03",
+    "garten-04",
+    "garten-05",
+    "garten-06",
+    "garten-07",
+    "garten-08",
+    "garten-09",
+    "garten-10",
+    "garten-11",
+    "garten-12",
+    "garten-13"
+   ],
+   "near_distractors": [
+    "miete-03",
+    "misc-22",
+    "misc-23",
+    "misc-24",
+    "misc-36",
+    "rezept-08"
+   ],
+   "hard": [
+    "garten-03",
+    "garten-04",
+    "garten-05",
+    "garten-06",
+    "garten-07",
+    "garten-08",
+    "garten-10",
+    "garten-13"
+   ]
+  },
+  {
+   "id": "pc",
+   "name": "Computerbau",
+   "query": "Computer zusammenbauen",
+   "query_alt": "Teile und Aufbau für den neuen Rechner",
+   "relevant": [
+    "pc-01",
+    "pc-02",
+    "pc-03",
+    "pc-04",
+    "pc-05",
+    "pc-06",
+    "pc-07",
+    "pc-08",
+    "pc-09",
+    "pc-10",
+    "pc-11"
+   ],
+   "near_distractors": [
+    "misc-25",
+    "misc-26",
+    "misc-27",
+    "misc-40",
+    "strom-10"
+   ],
+   "hard": [
+    "pc-01",
+    "pc-03",
+    "pc-04",
+    "pc-05",
+    "pc-06",
+    "pc-07",
+    "pc-09",
+    "pc-10",
+    "pc-11"
+   ]
+  },
+  {
+   "id": "rezept",
+   "name": "Rezepte",
+   "query": "Rezepte zum Nachkochen",
+   "query_alt": "was koche ich am Wochenende",
+   "relevant": [
+    "rezept-01",
+    "rezept-02",
+    "rezept-03",
+    "rezept-04",
+    "rezept-05",
+    "rezept-06",
+    "rezept-07",
+    "rezept-08",
+    "rezept-09",
+    "rezept-10",
+    "rezept-11"
+   ],
+   "near_distractors": [
+    "italien-06",
+    "misc-10",
+    "misc-28",
+    "misc-29",
+    "misc-30",
+    "misc-39"
+   ],
+   "hard": [
+    "rezept-01",
+    "rezept-02",
+    "rezept-03",
+    "rezept-04",
+    "rezept-05",
+    "rezept-06",
+    "rezept-07",
+    "rezept-08",
+    "rezept-10"
+   ]
+  },
+  {
+   "id": "bank",
+   "name": "Bank und Depot",
+   "query": "Bank und Depot",
+   "query_alt": "Konto, Sparplan und was meine Bank kostet",
+   "relevant": [
+    "bank-01",
+    "bank-02",
+    "bank-03",
+    "bank-04",
+    "bank-05",
+    "bank-06",
+    "bank-07",
+    "bank-08",
+    "bank-09",
+    "bank-10",
+    "bank-11",
+    "steuer-12"
+   ],
+   "near_distractors": [
+    "miete-09",
+    "misc-18",
+    "misc-31",
+    "misc-32",
+    "misc-33",
+    "steuer-02"
+   ],
+   "hard": [
+    "bank-02",
+    "bank-03",
+    "bank-04",
+    "bank-05",
+    "bank-06",
+    "bank-07",
+    "bank-09",
+    "bank-10"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,8 @@
+[package]
+name = "stress"
+version = "0.1.0"
+edition = "2024"
+description = "Counting threads: N workers count for S seconds and print their counts and the CPUs they ran on (UL-2)"
+
+[dependencies]
+usys = { path = "../usys" }

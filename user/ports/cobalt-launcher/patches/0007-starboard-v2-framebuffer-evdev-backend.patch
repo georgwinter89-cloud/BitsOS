@@ -1,0 +1,5420 @@
+BitsOS V2 (YT-1): framebuffer + evdev backend for the Linux loader_app.
+
+BITSOS_BACKEND=fb runs the same loader_app without X11: windows on fbdev
+(FBIOGET_VSCREENINFO/FSCREENINFO + mmap, or a fake file), the 1080p canvas
+from dev.bitsos.Canvas plus punch-out video composed and scaled 4/3 to
+1440p in software (SSE2), input from evdev nodes or a test FIFO, ALSA/Pulse
+sound unchanged. Without the variable the X11 debug backend of 0006 runs.
+Also: AC-3/E-AC-3 reported unsupported (no Dolby decoder; ads stalled),
+video above 1920x1080 (either orientation) and HDR reported unsupported (the
+window is 1080p, the screen SDR; the core count rule offered 8K on 16
+threads), the ALSA sink reporting frames as consumed when played (written
+minus snd_pcm_delay, as the PulseAudio sink does) instead of when written,
+so the audio clock follows the speaker (YT-5), the render algorithm's A/V
+note for the backend's numbers (a weak hook, YT-5), and
+VideoFrame::is_cpu_frame() so the backend checks a frame's
+kind before casting (Cobalt builds without RTTI).
+Applies on 27.lts.3 (3befd332) after 0001-0006.
+
+diff --git a/starboard/linux/shared/media_is_audio_supported.cc b/starboard/linux/shared/media_is_audio_supported.cc
+index 2e0248d..08130ca 100644
+--- a/starboard/linux/shared/media_is_audio_supported.cc
++++ b/starboard/linux/shared/media_is_audio_supported.cc
+@@ -36,7 +36,13 @@ bool MediaIsAudioSupported(SbMediaAudioCodec audio_codec,
+ 
+   if (audio_codec == kSbMediaAudioCodecAc3 ||
+       audio_codec == kSbMediaAudioCodecEac3) {
++#if defined(STARBOARD_BITSOS_CANVAS)
++    // BitsOS: there is no Dolby decoder. Claiming AC-3/E-AC-3 makes YouTube
++    // pick it (mostly for ads), the decoder then fails and playback stalls.
++    return false;
++#else
+     return bitrate <= kSbMediaMaxAudioBitrateInBitsPerSecond;
++#endif
+   }
+ 
+   if (audio_codec == kSbMediaAudioCodecVorbis) {
+diff --git a/starboard/linux/shared/media_is_video_supported.cc b/starboard/linux/shared/media_is_video_supported.cc
+index 6221a2a..f9114ec 100644
+--- a/starboard/linux/shared/media_is_video_supported.cc
++++ b/starboard/linux/shared/media_is_video_supported.cc
+@@ -24,6 +24,9 @@
+ #include "starboard/shared/libde265/de265_library_loader.h"
+ #include "starboard/shared/starboard/media/media_util.h"
+ #include "starboard/system.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/media_caps.h"
++#endif
+ 
+ namespace starboard {
+ 
+@@ -40,6 +43,13 @@ bool MediaIsVideoSupported(SbMediaVideoCodec video_codec,
+                            int64_t bitrate,
+                            int fps,
+                            bool decode_to_texture_required) {
++#if defined(STARBOARD_BITSOS_CANVAS)
++  // BitsOS: the framebuffer is SDR BT.709 and the frame is cut to 8 bits on
++  // the CPU (CpuVideoFrame); an HDR stream would play with wrong colours.
++  if (!IsSDRVideo(bit_depth, primary_id, transfer_id, matrix_id)) {
++    return false;
++  }
++#endif
+   if (!IsSDRVideo(bit_depth, primary_id, transfer_id, matrix_id)) {
+     if (bit_depth != 10 && bit_depth != 12) {
+       return false;
+@@ -61,10 +71,21 @@ bool MediaIsVideoSupported(SbMediaVideoCodec video_codec,
+     // just as well as normal video.
+   }
+ 
++#if defined(STARBOARD_BITSOS_CANVAS)
++  // BitsOS: at most 1080p in either orientation (bitsos_fb::
++  // VideoSizeSupported). The core count rule below would offer 8K on the
++  // Mini-PC (16 threads) and YouTube would pick 4K.
++  if (!bitsos_fb::VideoSizeSupported(frame_width, frame_height)) {
++    return false;
++  }
++  const int max_width = bitsos_fb::kMaxVideoLongSide;
++  const int max_height = bitsos_fb::kMaxVideoLongSide;
++#else
+   static const bool can_support_8k = SbSystemGetNumberOfProcessors() >= 16;
+ 
+   const int max_width = can_support_8k ? 7680 : 1920;
+   const int max_height = can_support_8k ? 4320 : 1080;
++#endif
+ 
+   return (video_codec == kSbMediaVideoCodecAv1 ||
+           video_codec == kSbMediaVideoCodecH264 ||
+diff --git a/starboard/linux/shared/system_get_extensions.cc b/starboard/linux/shared/system_get_extensions.cc
+index 08e1a3c..1e9fec5 100644
+--- a/starboard/linux/shared/system_get_extensions.cc
++++ b/starboard/linux/shared/system_get_extensions.cc
+@@ -31,6 +31,7 @@
+ 
+ #if defined(STARBOARD_BITSOS_CANVAS)
+ #include "starboard/extension/bitsos_canvas.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
+ #include "starboard/shared/x11/bitsos_canvas_x11.h"
+ #endif
+ 
+@@ -94,7 +95,9 @@ const void* SbSystemGetExtension(const char* name) {
+   }
+ #if defined(STARBOARD_BITSOS_CANVAS)
+   if (strcmp(name, kStarboardExtensionBitsosCanvasName) == 0) {
+-    return starboard::GetBitsosCanvasApiX11();
++    return starboard::bitsos::FbBackendSelected()
++               ? starboard::bitsos::GetBitsosCanvasApiFb()
++               : starboard::GetBitsosCanvasApiX11();
+   }
+ #endif
+   return NULL;
+diff --git a/starboard/linux/x64x11/BUILD.gn b/starboard/linux/x64x11/BUILD.gn
+index 6b53135..6145319 100644
+--- a/starboard/linux/x64x11/BUILD.gn
++++ b/starboard/linux/x64x11/BUILD.gn
+@@ -12,11 +12,17 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import("//starboard/build/config/bitsos.gni")
++
+ static_library("starboard_platform") {
+   check_includes = false
+ 
+   sources = [ "//starboard/linux/x64x11/run_starboard_main.cc" ]
+ 
++  if (cobalt_bitsos_canvas) {
++    defines = [ "STARBOARD_BITSOS_CANVAS" ]
++  }
++
+   public_deps = [
+     "//starboard/linux/x64x11/shared:starboard_platform",
+     "//starboard/shared/starboard/player:video_dmp",
+diff --git a/starboard/shared/alsa/alsa_audio_sink_type.cc b/starboard/shared/alsa/alsa_audio_sink_type.cc
+index 75d2f30..4c1d4e3 100644
+--- a/starboard/shared/alsa/alsa_audio_sink_type.cc
++++ b/starboard/shared/alsa/alsa_audio_sink_type.cc
+@@ -30,6 +30,9 @@
+ #include "starboard/common/time.h"
+ #include "starboard/configuration.h"
+ #include "starboard/shared/alsa/alsa_util.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/alsa_played.h"
++#endif
+ #include "starboard/shared/starboard/player/job_thread.h"
+ 
+ namespace starboard {
+@@ -131,6 +134,16 @@ class AlsaAudioSink : public SbAudioSinkImpl {
+                    int frames_to_write,
+                    int frames_in_buffer,
+                    int offset_in_frames);
++#if defined(STARBOARD_BITSOS_CANVAS)
++  // BitsOS (YT-5): frames count as consumed when they have been played, i.e.
++  // written minus snd_pcm_delay() (bitsos_fb::AlsaPlayed). Upstream reports
++  // them when written, so the audio clock (and with it every video frame) ran
++  // ahead of the speaker by all that ALSA holds (~85 ms on V2).
++  void ReportPlayed(int delayed_frames);
++  void ReportAllWritten();
++  void Report(int frames);
++  bitsos_fb::AlsaPlayed played_;
++#endif
+ 
+   Type* const type_;
+   const SbAudioSinkUpdateSourceStatusFunc update_source_status_func_;
+@@ -284,6 +297,9 @@ bool AlsaAudioSink::IdleLoop() {
+       drain = false;
+       AlsaWriteFrames(playback_handle_, silence_frames_, kFramesPerRequest);
+       AlsaDrain(playback_handle_);
++#if defined(STARBOARD_BITSOS_CANVAS)
++      ReportAllWritten();  // drained: everything written has been played
++#endif
+     }
+     usleep(time_to_wait_us_);
+   }
+@@ -298,6 +314,9 @@ bool AlsaAudioSink::PlaybackLoop() {
+   double playback_rate = 1.0;
+   for (;;) {
+     int delayed_frame = AlsaGetBufferedFrames(playback_handle_);
++#if defined(STARBOARD_BITSOS_CANVAS)
++    ReportPlayed(delayed_frame);
++#endif
+     if (std::unique_lock lock(mutex_, std::try_to_lock); lock.owns_lock()) {
+       if (destroying_) {
+         SB_DLOG(INFO) << "AlsaAudioSink exits playback loop : destroying";
+@@ -320,6 +339,25 @@ bool AlsaAudioSink::PlaybackLoop() {
+                       << is_playing << " frames in buffer " << frames_in_buffer;
+         return true;
+       }
++#if defined(STARBOARD_BITSOS_CANVAS)
++      // The source still holds what ALSA has not played: write after it.
++      if (playback_rate == 1.0) {
++        if (played_.Resync(frames_in_buffer)) {
++          SB_LOG(WARNING) << "AlsaAudioSink: the source holds "
++                          << frames_in_buffer
++                          << " frames, fewer than counted in ALSA: re-synced";
++        }
++        const int in_alsa = static_cast<int>(played_.InAlsa());
++        frames_in_buffer -= in_alsa;
++        offset_in_frames = (offset_in_frames + in_alsa) % frames_per_channel_;
++        if (frames_in_buffer <= 0) {
++          usleep(time_to_wait_us_);
++          continue;
++        }
++      } else {
++        ReportAllWritten();  // the resampling path reports at write time
++      }
++#endif
+       WriteFrames(playback_rate, std::min(kFramesPerRequest, frames_in_buffer),
+                   frames_in_buffer, offset_in_frames);
+     } else {
+@@ -345,7 +383,11 @@ void AlsaAudioSink::WriteFrames(double playback_rate,
+           IncrementPointerByBytes(frame_buffer_,
+                                   offset_in_frames * bytes_per_frame),
+           frames_to_buffer_end);
++#if defined(STARBOARD_BITSOS_CANVAS)
++      played_.Wrote(consumed);
++#else
+       consume_frames_func_(consumed, CurrentMonotonicTime(), context_);
++#endif
+       if (consumed != frames_to_buffer_end) {
+         SB_DLOG(INFO) << "AlsaAudioSink exits write frames : consumed "
+                       << consumed << " frames, with " << frames_to_buffer_end
+@@ -362,7 +404,11 @@ void AlsaAudioSink::WriteFrames(double playback_rate,
+                         IncrementPointerByBytes(
+                             frame_buffer_, offset_in_frames * bytes_per_frame),
+                         frames_to_write);
++#if defined(STARBOARD_BITSOS_CANVAS)
++    played_.Wrote(consumed);
++#else
+     consume_frames_func_(consumed, CurrentMonotonicTime(), context_);
++#endif
+   } else {
+     // A very low quality resampler that simply shift the audio frames to play
+     // at the right time.
+@@ -396,6 +442,28 @@ void AlsaAudioSink::WriteFrames(double playback_rate,
+   }
+ }
+ 
++#if defined(STARBOARD_BITSOS_CANVAS)
++void AlsaAudioSink::ReportPlayed(int delayed_frames) {
++  bool fell_back = false;
++  Report(played_.Played(delayed_frames, CurrentMonotonicTime(), &fell_back));
++  if (fell_back) {
++    SB_LOG(WARNING) << "AlsaAudioSink: snd_pcm_delay() unknown for "
++                    << bitsos_fb::AlsaPlayed::kUnknownDelayFallbackUs / 1000
++                    << " ms: frames count as played when written";
++  }
++}
++
++void AlsaAudioSink::ReportAllWritten() {
++  Report(played_.All());
++}
++
++void AlsaAudioSink::Report(int frames) {
++  if (frames > 0) {
++    consume_frames_func_(frames, CurrentMonotonicTime(), context_);
++  }
++}
++#endif  // defined(STARBOARD_BITSOS_CANVAS)
++
+ class AlsaAudioSinkType : public SbAudioSinkPrivate::Type {
+  public:
+   SbAudioSink Create(
+diff --git a/starboard/linux/x64x11/run_starboard_main.cc b/starboard/linux/x64x11/run_starboard_main.cc
+index e5f98fe..792d2a2 100644
+--- a/starboard/linux/x64x11/run_starboard_main.cc
++++ b/starboard/linux/x64x11/run_starboard_main.cc
+@@ -29,6 +29,21 @@
+ #include "starboard/elf_loader/elf_loader_constants.h"
+ #endif
+ #include "starboard/shared/x11/application_x11.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#endif
++
++namespace {
++
++template <typename App>
++int RunApplication(int argc, char** argv, SbEventHandleCallback callback) {
++  App application(callback);
++  starboard::LinkReceiver receiver(&application);
++  return application.Run(argc, argv);
++}
++
++}  // namespace
+ 
+ int SbRunStarboardMain(int argc, char** argv, SbEventHandleCallback callback) {
+   // Set M_ARENA_MAX to a low value to slow memory growth due to fragmentation.
+@@ -45,10 +60,18 @@ int SbRunStarboardMain(int argc, char** argv, SbEventHandleCallback callback) {
+   SbLogRawDumpStack(3);
+ #endif
+ 
+-  starboard::ApplicationX11 application(callback);
+-
+-  starboard::LinkReceiver receiver(&application);
+-  int result = application.Run(argc, argv);
++  int result;
++#if defined(STARBOARD_BITSOS_CANVAS)
++  // BitsOS V2: BITSOS_BACKEND=fb runs on fbdev + evdev instead of X11.
++  if (starboard::bitsos::FbBackendSelected()) {
++    result = RunApplication<starboard::bitsos::ApplicationBitsosFb>(
++        argc, argv, callback);
++  } else
++#endif
++  {
++    result =
++        RunApplication<starboard::ApplicationX11>(argc, argv, callback);
++  }
+ 
+   starboard::UninstallSuspendSignalHandlers();
+   starboard::UninstallDebugSignalHandlers();
+diff --git a/starboard/linux/x64x11/shared/BUILD.gn b/starboard/linux/x64x11/shared/BUILD.gn
+index 92309d9..b1b2abf 100644
+--- a/starboard/linux/x64x11/shared/BUILD.gn
++++ b/starboard/linux/x64x11/shared/BUILD.gn
+@@ -28,6 +28,25 @@ group("starboard_platform") {
+   ]
+ }
+ 
++if (cobalt_bitsos_canvas) {
++  # The per-pixel work of the framebuffer backend runs for every video frame:
++  # built for speed, not size.
++  source_set("bitsos_fb_pixels") {
++    check_includes = false
++    sources = [
++      "//starboard/shared/bitsos/fb/fb_pixels.cc",
++      "//starboard/shared/bitsos/fb/fb_pixels.h",
++      "//starboard/shared/bitsos/fb/fb_yuv.cc",
++      "//starboard/shared/bitsos/fb/fb_yuv.h",
++    ]
++    configs -= [ "//build/config/compiler:default_optimization" ]
++    configs += [
++      "//build/config/compiler:optimize_max",
++      "//starboard/build/config:starboard_implementation",
++    ]
++  }
++}
++
+ static_library("starboard_platform_sources") {
+   check_includes = false
+   sources = [
+@@ -60,7 +79,29 @@ static_library("starboard_platform_sources") {
+     sources += [
+       "//starboard/shared/x11/bitsos_canvas_x11.cc",
+       "//starboard/shared/x11/bitsos_canvas_x11.h",
++
++      # BitsOS V2 backend (BITSOS_BACKEND=fb): fbdev + evdev instead of X11.
++      "//starboard/shared/bitsos/fb/application_bitsos_fb.cc",
++      "//starboard/shared/bitsos/fb/application_bitsos_fb.h",
++      "//starboard/shared/bitsos/fb/av_stats.cc",
++      "//starboard/shared/bitsos/fb/av_stats.h",
++      "//starboard/shared/bitsos/fb/backend_fb.cc",
++      "//starboard/shared/bitsos/fb/backend_fb.h",
++      "//starboard/shared/bitsos/fb/console_guard.cc",
++      "//starboard/shared/bitsos/fb/console_guard.h",
++      "//starboard/shared/bitsos/fb/evdev_decoder.cc",
++      "//starboard/shared/bitsos/fb/evdev_decoder.h",
++      "//starboard/shared/bitsos/fb/evdev_devices.cc",
++      "//starboard/shared/bitsos/fb/evdev_devices.h",
++      "//starboard/shared/bitsos/fb/fb_compositor.cc",
++      "//starboard/shared/bitsos/fb/fb_compositor.h",
++      "//starboard/shared/bitsos/fb/fb_config.cc",
++      "//starboard/shared/bitsos/fb/fb_config.h",
++      "//starboard/shared/bitsos/fb/fb_device.cc",
++      "//starboard/shared/bitsos/fb/fb_device.h",
+     ]
++    defines = [ "STARBOARD_BITSOS_CANVAS" ]
++    deps = [ ":bitsos_fb_pixels" ]
+   }
+ 
+   configs += [ "//starboard/build/config:starboard_implementation" ]
+diff --git a/starboard/shared/bitsos/egl_gles_stub.cc b/starboard/shared/bitsos/egl_gles_stub.cc
+index acb3c94..a379324 100644
+--- a/starboard/shared/bitsos/egl_gles_stub.cc
++++ b/starboard/shared/bitsos/egl_gles_stub.cc
+@@ -116,7 +116,10 @@ const SbGlesInterface* GetEmptyGlesInterface() {
+ bool IsStubEglRequested() {
+   static const bool requested = [] {
+     const char* v = getenv("BITSOS_STUB_EGL");
+-    return v && *v && strcmp(v, "0") != 0;
++    // The framebuffer backend (BITSOS_BACKEND=fb) has no GL at all.
++    const char* backend = getenv("BITSOS_BACKEND");
++    return (v && *v && strcmp(v, "0") != 0) ||
++           (backend && strcmp(backend, "fb") == 0);
+   }();
+   return requested;
+ }
+diff --git a/starboard/shared/bitsos/egl_gles_stub.h b/starboard/shared/bitsos/egl_gles_stub.h
+index a2fcf42..aa07948 100644
+--- a/starboard/shared/bitsos/egl_gles_stub.h
++++ b/starboard/shared/bitsos/egl_gles_stub.h
+@@ -33,7 +33,7 @@ const SbEglInterface* GetFailingEglInterface();
+ const SbGlesInterface* GetEmptyGlesInterface();
+ 
+ // The Linux test platform keeps its real EGL unless the environment variable
+-// BITSOS_STUB_EGL is set to something other than "0".
++// BITSOS_STUB_EGL is set to something other than "0", or BITSOS_BACKEND=fb.
+ bool IsStubEglRequested();
+ 
+ }  // namespace bitsos
+diff --git a/starboard/shared/starboard/player/filter/cpu_video_frame.h b/starboard/shared/starboard/player/filter/cpu_video_frame.h
+index 7adaab0..985df4f 100644
+--- a/starboard/shared/starboard/player/filter/cpu_video_frame.h
++++ b/starboard/shared/starboard/player/filter/cpu_video_frame.h
+@@ -48,7 +48,8 @@ class CpuVideoFrame : public VideoFrame {
+     const uint8_t* data;
+   };
+ 
+-  explicit CpuVideoFrame(int64_t timestamp) : VideoFrame(timestamp) {}
++  explicit CpuVideoFrame(int64_t timestamp)
++      : VideoFrame(timestamp, /*is_cpu_frame=*/true) {}
+ 
+   Format format() const { return format_; }
+   const Size& size() const { return size_; }
+diff --git a/starboard/shared/starboard/player/filter/video_frame_internal.h b/starboard/shared/starboard/player/filter/video_frame_internal.h
+index 66da458..a0585e9 100644
+--- a/starboard/shared/starboard/player/filter/video_frame_internal.h
++++ b/starboard/shared/starboard/player/filter/video_frame_internal.h
+@@ -33,6 +33,9 @@ class VideoFrame : public RefCountedThreadSafe<VideoFrame> {
+   virtual ~VideoFrame() {}
+ 
+   bool is_end_of_stream() const { return timestamp_ == kMediaTimeEndOfStream; }
++  // BitsOS: true for a CpuVideoFrame, so that a renderer can check the type
++  // before casting (Cobalt builds without RTTI).
++  bool is_cpu_frame() const { return is_cpu_frame_; }
+   int64_t timestamp() const {
+     SB_DCHECK(!is_end_of_stream());
+     return timestamp_;
+@@ -42,8 +45,13 @@ class VideoFrame : public RefCountedThreadSafe<VideoFrame> {
+     return new VideoFrame(kMediaTimeEndOfStream);
+   }
+ 
++ protected:
++  VideoFrame(int64_t timestamp, bool is_cpu_frame)
++      : timestamp_(timestamp), is_cpu_frame_(is_cpu_frame) {}
++
+  private:
+   int64_t timestamp_;  // microseconds
++  bool is_cpu_frame_ = false;
+ 
+   VideoFrame(const VideoFrame&) = delete;
+   void operator=(const VideoFrame&) = delete;
+diff --git a/starboard/shared/starboard/player/filter/video_render_algorithm_impl.cc b/starboard/shared/starboard/player/filter/video_render_algorithm_impl.cc
+index d9138f1..77be5c2 100644
+--- a/starboard/shared/starboard/player/filter/video_render_algorithm_impl.cc
++++ b/starboard/shared/starboard/player/filter/video_render_algorithm_impl.cc
+@@ -18,6 +18,16 @@
+ #include "starboard/common/log.h"
+ #include "starboard/common/time.h"
+ 
++// BitsOS (YT-5): the framebuffer backend's A/V numbers (starboard/shared/
++// bitsos/fb/av_stats.cc). Weak: every other build links without it.
++extern "C" void BitsosAvNoteRender(const void* who,
++                                   int64_t media_time_us,
++                                   bool audio_playing,
++                                   double playback_rate,
++                                   int64_t frame_pts_us,
++                                   int64_t dropped_frames)
++    __attribute__((weak));
++
+ namespace starboard {
+ 
+ VideoRenderAlgorithmImpl::VideoRenderAlgorithmImpl(
+@@ -119,6 +129,10 @@ void VideoRenderAlgorithmImpl::Render(
+ 
+   if (!frames->front()->is_end_of_stream()) {
+     last_frame_timestamp_ = frames->front()->timestamp();
++    if (BitsosAvNoteRender) {
++      BitsosAvNoteRender(this, media_time, is_audio_playing, playback_rate,
++                         last_frame_timestamp_, dropped_frames_);
++    }
+     if (draw_frame_cb) {
+       auto status = draw_frame_cb(frames->front(), 0);
+       if (status == VideoRendererSink::kReleased) {
+@@ -274,6 +288,10 @@ void VideoRenderAlgorithmImpl::RenderWithCadence(
+       current_frame_rendered_times_ = 1;
+       last_frame_timestamp_ = frames->front()->timestamp();
+     }
++    if (BitsosAvNoteRender) {
++      BitsosAvNoteRender(this, media_time, is_audio_playing, playback_rate,
++                         last_frame_timestamp_, dropped_frames_);
++    }
+     if (draw_frame_cb) {
+       auto status = draw_frame_cb(frames->front(), 0);
+       if (status == VideoRendererSink::kReleased) {
+diff --git a/starboard/shared/x11/player_set_bounds.cc b/starboard/shared/x11/player_set_bounds.cc
+index 98c7d35..baf1623 100644
+--- a/starboard/shared/x11/player_set_bounds.cc
++++ b/starboard/shared/x11/player_set_bounds.cc
+@@ -20,6 +20,10 @@
+ #include "starboard/common/rect.h"
+ #include "starboard/shared/starboard/player/player_internal.h"
+ #include "starboard/shared/x11/application_x11.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#endif
+ 
+ void SbPlayerSetBounds(SbPlayer player,
+                        int z_index,
+@@ -33,5 +37,12 @@ void SbPlayerSetBounds(SbPlayer player,
+   }
+   starboard::Rect rect(x, y, width, height);
+   player->SetBounds(z_index, rect);
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::FbBackendSelected()) {
++    starboard::bitsos::ApplicationBitsosFb::Get()->PlayerSetBounds(
++        player, z_index, rect);
++    return;
++  }
++#endif
+   starboard::ApplicationX11::Get()->PlayerSetBounds(player, z_index, rect);
+ }
+diff --git a/starboard/shared/x11/window_create.cc b/starboard/shared/x11/window_create.cc
+index f05e778..96f5199 100644
+--- a/starboard/shared/x11/window_create.cc
++++ b/starboard/shared/x11/window_create.cc
+@@ -17,7 +17,17 @@
+ // clang-format on
+ 
+ #include "starboard/shared/x11/application_x11.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#endif
+ 
+ SbWindow SbWindowCreate(const SbWindowOptions* options) {
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::FbBackendSelected()) {
++    return starboard::bitsos::ApplicationBitsosFb::Get()->CreateWindow(
++        options);
++  }
++#endif
+   return starboard::ApplicationX11::Get()->CreateWindow(options);
+ }
+diff --git a/starboard/shared/x11/window_destroy.cc b/starboard/shared/x11/window_destroy.cc
+index a20f26e..f67d8c8 100644
+--- a/starboard/shared/x11/window_destroy.cc
++++ b/starboard/shared/x11/window_destroy.cc
+@@ -17,7 +17,17 @@
+ // clang-format on
+ 
+ #include "starboard/shared/x11/application_x11.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#endif
+ 
+ bool SbWindowDestroy(SbWindow window) {
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::FbBackendSelected()) {
++    return starboard::bitsos::ApplicationBitsosFb::Get()->DestroyWindow(
++        window);
++  }
++#endif
+   return starboard::ApplicationX11::Get()->DestroyWindow(window);
+ }
+diff --git a/starboard/shared/x11/window_get_platform_handle.cc b/starboard/shared/x11/window_get_platform_handle.cc
+index 6bb25c4..fd4af6f 100644
+--- a/starboard/shared/x11/window_get_platform_handle.cc
++++ b/starboard/shared/x11/window_get_platform_handle.cc
+@@ -18,11 +18,21 @@
+ 
+ #include "starboard/player.h"
+ #include "starboard/shared/x11/window_internal.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#endif
+ 
+ void* SbWindowGetPlatformHandle(SbWindow window) {
+   if (!SbWindowIsValid(window)) {
+     return NULL;
+   }
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::FbBackendSelected()) {
++    return starboard::bitsos::ApplicationBitsosFb::Get()->GetPlatformHandle(
++        window);
++  }
++#endif
+ 
+   Window handle = None;
+   handle = window->gl_window;
+diff --git a/starboard/shared/x11/window_get_size.cc b/starboard/shared/x11/window_get_size.cc
+index e4d7d72..42c55d0 100644
+--- a/starboard/shared/x11/window_get_size.cc
++++ b/starboard/shared/x11/window_get_size.cc
+@@ -18,12 +18,22 @@
+ 
+ #include "starboard/common/log.h"
+ #include "starboard/shared/x11/window_internal.h"
++#if defined(STARBOARD_BITSOS_CANVAS)
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#endif
+ 
+ bool SbWindowGetSize(SbWindow window, SbWindowSize* size) {
+   if (!SbWindowIsValid(window)) {
+     SB_DLOG(ERROR) << __FUNCTION__ << ": Invalid window.";
+     return false;
+   }
++#if defined(STARBOARD_BITSOS_CANVAS)
++  if (starboard::bitsos::FbBackendSelected()) {
++    return starboard::bitsos::ApplicationBitsosFb::Get()->GetWindowSize(
++        window, size);
++  }
++#endif
+ 
+   size->width = window->width;
+   size->height = window->height;
+diff --git a/starboard/shared/bitsos/fb/alsa_played.h b/starboard/shared/bitsos/fb/alsa_played.h
+new file mode 100644
+index 0000000..e8f16ad
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/alsa_played.h
+@@ -0,0 +1,97 @@
++// BitsOS V2 Cobalt backend: when frames written to ALSA count as played
++// (YT-5).
++//
++// Used by starboard/shared/alsa/alsa_audio_sink_type.cc (patch 0007). Upstream
++// reports frames to the source as consumed when they are written, so the audio
++// clock (and every video frame with it) ran ahead of the speaker by all that
++// ALSA holds. Here a frame counts as played when written minus snd_pcm_delay(),
++// as the PulseAudio sink does with pa_stream_get_time(). The sink logs; this
++// class only counts. Header-only, so the patched file needs no new GN
++// dependency; host tests: host/tests/yt/alsa_played_test.cc.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_ALSA_PLAYED_H_
++#define STARBOARD_SHARED_BITSOS_FB_ALSA_PLAYED_H_
++
++#include <stdint.h>
++
++namespace bitsos_fb {
++
++class AlsaPlayed {
++ public:
++  // How long the delay may stay unknown before written counts as played
++  // again (upstream's rule), so that a failing snd_pcm_delay() cannot stop
++  // the clock: the source would then hold only frames already in ALSA and
++  // nothing more would be written or reported.
++  static constexpr int64_t kUnknownDelayFallbackUs = 100'000;
++
++  // |frames| more were written at playback rate 1.
++  void Wrote(int frames) {
++    if (frames > 0) {
++      written_ += frames;
++    }
++  }
++
++  // Written but not yet reported as played: what the source still holds and
++  // ALSA has.
++  int64_t InAlsa() const { return written_ - reported_; }
++
++  // Frames to report as played now, given snd_pcm_delay() (< 0: unknown) at
++  // |now_us|. The delay may also count silence the idle loop wrote: never
++  // below what was reported, never more than was written. |*fell_back| is set
++  // on the call that gives up on an unknown delay.
++  int Played(int delayed_frames, int64_t now_us, bool* fell_back) {
++    *fell_back = false;
++    if (delayed_frames < 0) {
++      if (unknown_since_us_ < 0) {
++        unknown_since_us_ = now_us;
++      }
++      if (now_us - unknown_since_us_ < kUnknownDelayFallbackUs) {
++        return 0;  // report later
++      }
++      *fell_back = !falling_back_;
++      falling_back_ = true;
++      return All();
++    }
++    unknown_since_us_ = -1;
++    falling_back_ = false;
++    const int64_t played = written_ - delayed_frames;
++    if (played <= reported_) {
++      return 0;
++    }
++    const int64_t n = played - reported_;
++    reported_ = played;
++    return static_cast<int>(n);
++  }
++
++  // Everything written counts as played (drained, or the resampling path).
++  int All() {
++    const int64_t n = written_ - reported_;
++    reported_ = written_;
++    return static_cast<int>(n);
++  }
++
++  // The source holds |frames_in_buffer| frames it has not seen reported. If
++  // that is less than InAlsa(), the source was reset under the sink (Seek
++  // destroys the sink, so this should not happen) or the count is wrong:
++  // from now on only what the source holds counts as being in ALSA. Without
++  // this the sink would wait for frames that never come. True if it
++  // re-synced.
++  bool Resync(int frames_in_buffer) {
++    const int64_t holds = frames_in_buffer > 0 ? frames_in_buffer : 0;
++    if (holds >= InAlsa()) {
++      return false;
++    }
++    written_ = reported_ + holds;
++    return true;
++  }
++
++ private:
++  int64_t written_ = 0;
++  int64_t reported_ = 0;
++  int64_t unknown_since_us_ = -1;
++  bool falling_back_ = false;
++};
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_ALSA_PLAYED_H_
+diff --git a/starboard/shared/bitsos/fb/application_bitsos_fb.cc b/starboard/shared/bitsos/fb/application_bitsos_fb.cc
+new file mode 100644
+index 0000000..d22542d
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/application_bitsos_fb.cc
+@@ -0,0 +1,545 @@
++// BitsOS V2 Cobalt backend: the Starboard application for fbdev + evdev.
++
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/kd.h>
++#include <math.h>
++#include <poll.h>
++#include <string.h>
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <algorithm>
++
++#include "starboard/common/log.h"
++#include "starboard/common/time.h"
++#include "starboard/event.h"
++#include "starboard/input.h"
++#include "starboard/key.h"
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++#include "starboard/shared/bitsos/fb/console_guard.h"
++#include "starboard/shared/linux/system_network_status.h"
++#include "starboard/shared/starboard/audio_sink/audio_sink_internal.h"
++#include "starboard/shared/starboard/player/filter/cpu_video_frame.h"
++
++namespace starboard {
++namespace bitsos {
++namespace {
++
++// The decoder speaks SbKey values without including Starboard; make sure
++// they are the same numbers.
++static_assert(kSbKeyReturn == 0x0D && kSbKeyEscape == 0x1B, "SbKey");
++static_assert(kSbKeyLeft == 0x25 && kSbKeyUp == 0x26 && kSbKeyRight == 0x27 &&
++                  kSbKeyDown == 0x28,
++              "SbKey arrows");
++static_assert(kSbKeyA == 0x41 && kSbKey0 == 0x30 && kSbKeyF1 == 0x70, "SbKey");
++static_assert(kSbKeyMediaPlayPause == 0xB3 && kSbKeyMediaRewind == 0xE3 &&
++                  kSbKeyMediaFastForward == 0xE4 && kSbKeyBrowserBack == 0xA6,
++              "SbKey media");
++static_assert(kSbKeyMouse1 == 0x7000 && kSbKeyMouse3 == 0x7002, "SbKey mouse");
++static_assert(kSbKeyModifiersAlt == bitsos_fb::kModAlt &&
++                  kSbKeyModifiersCtrl == bitsos_fb::kModCtrl &&
++                  kSbKeyModifiersMeta == bitsos_fb::kModMeta &&
++                  kSbKeyModifiersShift == bitsos_fb::kModShift &&
++                  kSbKeyModifiersPointerButtonLeft ==
++                      bitsos_fb::kModButtonLeft &&
++                  kSbKeyModifiersPointerButtonRight ==
++                      bitsos_fb::kModButtonRight &&
++                  kSbKeyModifiersPointerButtonMiddle ==
++                      bitsos_fb::kModButtonMiddle,
++              "SbKeyModifiers");
++
++constexpr int64_t kRescanUsec = 2'000'000;
++
++enum DeviceId { kKeyboardId = 1, kMouseId = 2, kRemoteId = 3 };
++
++void LogLine(const std::string& line) {
++  SB_LOG(INFO) << "bitsos-fb: " << line;
++}
++
++// One punch-out frame; converted to BGRA once, on the compositor thread.
++// Only CPU frames can be shown; any other kind is skipped (black).
++class FrameImage : public bitsos_fb::VideoImage {
++ public:
++  explicit FrameImage(const scoped_refptr<VideoFrame>& frame)
++      : frame_(frame) {}
++
++  int64_t timestamp() const override { return frame_->timestamp(); }
++  void FrameSize(int* width, int* height) const override {
++    CpuVideoFrame* cpu = Cpu();
++    *width = cpu ? cpu->size().width : 0;
++    *height = cpu ? cpu->size().height : 0;
++  }
++
++  bool GetYuv(bitsos_fb::YuvPlanes* planes) override {
++    CpuVideoFrame* cpu = Cpu();
++    if (!cpu || cpu->format() != CpuVideoFrame::kYV12 ||
++        cpu->GetPlaneCount() < 3) {
++      return false;
++    }
++    const CpuVideoFrame::Plane& y = cpu->GetPlane(0);
++    const CpuVideoFrame::Plane& u = cpu->GetPlane(1);
++    const CpuVideoFrame::Plane& v = cpu->GetPlane(2);
++    planes->y = y.data;
++    planes->u = u.data;
++    planes->v = v.data;
++    planes->y_pitch = y.pitch_in_bytes;
++    planes->u_pitch = u.pitch_in_bytes;
++    planes->v_pitch = v.pitch_in_bytes;
++    planes->width = cpu->size().width;
++    planes->height = cpu->size().height;
++    planes->y_rows = y.size.height;
++    planes->u_rows = u.size.height;
++    planes->v_rows = v.size.height;
++    return planes->Valid();
++  }
++
++  bool Get(const uint8_t** data, int* width, int* height,
++           int* pitch) override {
++    if (!converted_) {
++      converted_ = true;
++      CpuVideoFrame* cpu = Cpu();
++      if (!cpu) {
++        return false;
++      }
++      if (cpu->format() == CpuVideoFrame::kBGRA32) {
++        bgra_ = cpu;
++      } else if (cpu->format() == CpuVideoFrame::kYV12) {
++        bgra_ = cpu->ConvertTo(CpuVideoFrame::kBGRA32);
++      }
++    }
++    if (!bgra_ || bgra_->GetPlaneCount() < 1) {
++      return false;
++    }
++    const CpuVideoFrame::Plane& plane = bgra_->GetPlane(0);
++    if (plane.size.width <= 0 || plane.size.height <= 0 ||
++        plane.pitch_in_bytes < plane.size.width * 4) {
++      return false;
++    }
++    *data = plane.data;
++    *width = plane.size.width;
++    *height = plane.size.height;
++    *pitch = plane.pitch_in_bytes;
++    return *data != nullptr;
++  }
++
++ private:
++  CpuVideoFrame* Cpu() const {
++    return frame_ && frame_->is_cpu_frame()
++               ? static_cast<CpuVideoFrame*>(frame_.get())
++               : nullptr;
++  }
++
++  scoped_refptr<VideoFrame> frame_;
++  bool converted_ = false;
++  scoped_refptr<CpuVideoFrame> bgra_;
++};
++
++bitsos_fb::Rect ToRect(const Rect& r) {
++  return bitsos_fb::MakeRect(r.x, r.y, r.size.width, r.size.height);
++}
++
++SbKeyLocation Location(const bitsos_fb::InEvent& e) {
++  if (e.right_side) {
++    return kSbKeyLocationRight;
++  }
++  switch (e.key) {
++    case kSbKeyShift:
++    case kSbKeyControl:
++    case kSbKeyMenu:
++    case kSbKeyLwin:
++      return kSbKeyLocationLeft;
++  }
++  return kSbKeyLocationUnspecified;
++}
++
++}  // namespace
++
++struct ApplicationBitsosFb::Window {
++  uint32_t handle = 0;
++  int width = 0;
++  int height = 0;
++};
++
++ApplicationBitsosFb::ApplicationBitsosFb(
++    SbEventHandleCallback sb_event_handle_callback)
++    : QueueApplication(sb_event_handle_callback),
++      config_(FbConfig()),
++      decoder_(config_.keymap) {
++  wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
++  SB_CHECK(wake_fd_ >= 0) << "eventfd: " << strerror(errno);
++  for (const std::string& s : config_.ignored) {
++    LogLine("setting not understood, default kept: " + s);
++  }
++  SbAudioSinkImpl::Initialize();
++  NetworkNotifier::GetOrCreateInstance();
++}
++
++ApplicationBitsosFb::~ApplicationBitsosFb() {
++  SbAudioSinkImpl::TearDown();
++  SetKdGraphics(false);
++  if (wake_fd_ >= 0) {
++    close(wake_fd_);
++  }
++}
++
++void ApplicationBitsosFb::Initialize() {
++  time_zone_monitor_ = starboard::shared::linux::TimeZoneMonitor::Create();
++  if (config_.kd_graphics) {
++    SetKdGraphics(true);
++  }
++  inputs_.reset(new bitsos_fb::EvdevDevices(config_, &LogLine));
++  inputs_->Rescan();
++  next_rescan_ = CurrentMonotonicTime() + kRescanUsec;
++}
++
++void ApplicationBitsosFb::Teardown() {
++  time_zone_monitor_ = nullptr;
++  std::shared_ptr<bitsos_fb::FbCompositor> comp;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    comp.swap(compositor_);
++  }
++  if (comp) {
++    comp->Stop();
++  }
++  inputs_.reset();
++  fb_.Close();
++  SetKdGraphics(false);
++}
++
++void ApplicationBitsosFb::SetKdGraphics(bool on) {
++  if (on) {
++    tty_fd_ = open("/dev/tty", O_RDWR | O_CLOEXEC);
++    if (tty_fd_ < 0) {
++      LogLine(std::string("console stays in text mode: ") + strerror(errno));
++      return;
++    }
++    // Armed first: a crash right after the switch still gives the console
++    // back.
++    bitsos_fb::ArmConsoleGuard(tty_fd_, &bitsos_fb::RestoreTextMode);
++    if (ioctl(tty_fd_, KDSETMODE, KD_GRAPHICS) != 0) {
++      LogLine(std::string("console stays in text mode: ") + strerror(errno));
++      bitsos_fb::DisarmConsoleGuard();
++      close(tty_fd_);
++      tty_fd_ = -1;
++    }
++  } else if (tty_fd_ >= 0) {
++    bitsos_fb::DisarmConsoleGuard();
++    bitsos_fb::RestoreTextMode(tty_fd_);
++    close(tty_fd_);
++    tty_fd_ = -1;
++  }
++}
++
++std::shared_ptr<bitsos_fb::FbCompositor> ApplicationBitsosFb::Compositor() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return compositor_;
++}
++
++SbWindow ApplicationBitsosFb::CreateWindow(const SbWindowOptions* options) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (!fb_.is_open()) {
++    if (fb_failed_) {
++      return kSbWindowInvalid;
++    }
++    std::string error;
++    if (!fb_.Open(config_, &error)) {
++      fb_failed_ = true;
++      SB_LOG(ERROR) << "bitsos-fb: no screen: " << error;
++      return kSbWindowInvalid;
++    }
++    LogLine("screen " + fb_.Describe() + " path=" + config_.fb_path);
++  }
++  Window* w = new Window;
++  w->handle = next_handle_++;
++  w->width = config_.window_w;
++  w->height = config_.window_h;
++  if (options && options->size.width > 0 && options->size.height > 0 &&
++      options->size.width <= bitsos_fb::kMaxWindowW &&
++      options->size.height <= bitsos_fb::kMaxWindowH) {
++    w->width = options->size.width;
++    w->height = options->size.height;
++  }
++  windows_.push_back(w);
++  if (windows_.size() == 1) {
++    compositor_ = std::make_shared<bitsos_fb::FbCompositor>(
++        &fb_, w->width, w->height, config_.cursor, &LogLine);
++    compositor_->Start();
++    const bitsos_fb::Placement& p = compositor_->scaler().placement();
++    SetGeometryLocked(w->width, w->height, p);
++    SB_LOG(INFO) << "bitsos-fb: window " << w->width << "x" << w->height
++                 << " shown at " << p.x << "," << p.y << " size " << p.w
++                 << "x" << p.h;
++  }
++  return reinterpret_cast<SbWindow>(w);
++}
++
++void ApplicationBitsosFb::SetGeometryLocked(int w, int h,
++                                            const bitsos_fb::Placement& p) {
++  geometry_changed_ = true;
++  geometry_w_ = w;
++  geometry_h_ = h;
++  geometry_placement_ = p;
++  geometry_screen_w_ = fb_.width();
++  geometry_screen_h_ = fb_.height();
++  WakeSystemEventWait();
++}
++
++bool ApplicationBitsosFb::DestroyWindow(SbWindow window) {
++  std::shared_ptr<bitsos_fb::FbCompositor> old;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    Window* w = reinterpret_cast<Window*>(window);
++    auto it = std::find(windows_.begin(), windows_.end(), w);
++    if (!w || it == windows_.end()) {
++      return false;
++    }
++    const bool was_front = it == windows_.begin();
++    windows_.erase(it);
++    delete w;
++    if (was_front) {
++      old.swap(compositor_);
++      if (!windows_.empty()) {
++        Window* next = windows_.front();
++        compositor_ = std::make_shared<bitsos_fb::FbCompositor>(
++            &fb_, next->width, next->height, config_.cursor, &LogLine);
++        compositor_->Start();
++        SetGeometryLocked(next->width, next->height,
++                          compositor_->scaler().placement());
++      }
++    }
++  }
++  if (old) {
++    old->Stop();
++  }
++  return true;
++}
++
++bool ApplicationBitsosFb::GetWindowSize(SbWindow window, SbWindowSize* size) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  Window* w = reinterpret_cast<Window*>(window);
++  if (!size ||
++      std::find(windows_.begin(), windows_.end(), w) == windows_.end()) {
++    return false;
++  }
++  size->width = w->width;
++  size->height = w->height;
++  size->video_pixel_ratio = 1.0f;
++  return true;
++}
++
++void* ApplicationBitsosFb::GetPlatformHandle(SbWindow window) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  Window* w = reinterpret_cast<Window*>(window);
++  if (std::find(windows_.begin(), windows_.end(), w) == windows_.end()) {
++    return nullptr;
++  }
++  // gfx::AcceleratedWidget is a uint32_t: a small number, not a pointer.
++  return reinterpret_cast<void*>(static_cast<uintptr_t>(w->handle));
++}
++
++void ApplicationBitsosFb::Present(void* window_handle, const void* pixels,
++                                  int32_t stride, int32_t width,
++                                  int32_t height, int32_t damage_x,
++                                  int32_t damage_y, int32_t damage_width,
++                                  int32_t damage_height) {
++  std::shared_ptr<bitsos_fb::FbCompositor> comp;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (windows_.empty() ||
++        reinterpret_cast<uintptr_t>(window_handle) != windows_.front()->handle) {
++      return;
++    }
++    comp = compositor_;
++  }
++  if (comp) {
++    comp->Present(pixels, stride, width, height,
++                  bitsos_fb::MakeRect(damage_x, damage_y, damage_width,
++                                      damage_height));
++  }
++}
++
++void ApplicationBitsosFb::PlayerSetBounds(SbPlayer player, int z_index,
++                                          const Rect& rect) {
++  if (auto comp = Compositor()) {
++    comp->SetVideoBounds(reinterpret_cast<uintptr_t>(player), z_index,
++                         ToRect(rect));
++  }
++}
++
++void ApplicationBitsosFb::AcceptFrame(SbPlayer player,
++                                      const scoped_refptr<VideoFrame>& frame,
++                                      int z_index,
++                                      const Rect& rect) {
++  auto comp = Compositor();
++  if (!comp) {
++    return;
++  }
++  const uintptr_t key = reinterpret_cast<uintptr_t>(player);
++  if (!frame || frame->is_end_of_stream()) {
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      last_frames_.erase(key);
++    }
++    comp->RemoveVideo(key);
++    return;
++  }
++  {
++    // The punch-out sink hands the same frame over again on every tick
++    // (about 100 times a second); only a new frame is work for the screen.
++    std::lock_guard<std::mutex> lock(mutex_);
++    scoped_refptr<VideoFrame>& last = last_frames_[key];
++    if (last.get() == frame.get()) {
++      return;
++    }
++    last = frame;
++  }
++  comp->SetVideoFrame(key, std::make_shared<FrameImage>(frame));
++}
++
++bool ApplicationBitsosFb::MayHaveSystemEvents() {
++  // Input devices are watched from the start, window or not; this also makes
++  // every wake-up go through the one eventfd.
++  return true;
++}
++
++void ApplicationBitsosFb::WakeSystemEventWait() {
++  const uint64_t one = 1;
++  // EAGAIN only when the counter is full, i.e. already signalled.
++  (void)!write(wake_fd_, &one, sizeof(one));
++}
++
++Application::Event* ApplicationBitsosFb::WaitForSystemEventWithTimeout(
++    int64_t time) {
++  if (Event* e = TakePending()) {
++    return e;
++  }
++  const int64_t now = CurrentMonotonicTime();
++  if (inputs_ && now >= next_rescan_) {
++    inputs_->Rescan();
++    next_rescan_ = now + kRescanUsec;
++  }
++  std::vector<pollfd> fds;
++  pollfd wake;
++  wake.fd = wake_fd_;
++  wake.events = POLLIN;
++  wake.revents = 0;
++  fds.push_back(wake);
++  if (inputs_) {
++    inputs_->AddPollFds(&fds);
++  }
++  int64_t wait = std::max<int64_t>(0, time);
++  if (inputs_) {
++    wait = std::min<int64_t>(wait, std::max<int64_t>(0, next_rescan_ - now));
++  }
++  timespec ts;
++  ts.tv_sec = static_cast<time_t>(wait / 1'000'000);
++  ts.tv_nsec = static_cast<long>((wait % 1'000'000) * 1000);
++  const int n = ppoll(fds.data(), fds.size(), &ts, nullptr);
++  if (n <= 0) {
++    return nullptr;
++  }
++  if (fds[0].revents) {
++    uint64_t count;
++    (void)!read(wake_fd_, &count, sizeof(count));
++  }
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (geometry_changed_) {
++      geometry_changed_ = false;
++      decoder_.SetGeometry(geometry_w_, geometry_h_, geometry_placement_,
++                           geometry_screen_w_, geometry_screen_h_);
++    }
++  }
++  if (inputs_) {
++    std::vector<bitsos_fb::InEvent> events;
++    inputs_->ReadReady(fds, &decoder_, &events);
++    pending_.insert(pending_.end(), events.begin(), events.end());
++    if (!events.empty()) {
++      if (auto comp = Compositor()) {
++        comp->SetPointer(decoder_.pointer_screen_x(),
++                         decoder_.pointer_screen_y(),
++                         decoder_.pointer_seen());
++      }
++    }
++  }
++  return TakePending();
++}
++
++Application::Event* ApplicationBitsosFb::TakePending() {
++  SbWindow window = kSbWindowInvalid;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!windows_.empty()) {
++      window = reinterpret_cast<SbWindow>(windows_.front());
++    }
++  }
++  while (!pending_.empty()) {
++    const bitsos_fb::InEvent e = pending_.front();
++    pending_.pop_front();
++    if (e.type == bitsos_fb::InEvent::kPress && e.key == kSbKeyBackspace &&
++        (e.modifiers & bitsos_fb::kModCtrl) &&
++        (e.modifiers & bitsos_fb::kModAlt)) {
++      // Way out: the keyboard is taken exclusively, so the console's own
++      // keys (Ctrl+Alt+F1..) do not work while Cobalt runs.
++      LogLine("Ctrl+Alt+Backspace: stopping");
++      Stop(0);
++      continue;
++    }
++    if (!SbWindowIsValid(window)) {
++      continue;  // nobody to send it to yet
++    }
++    SbInputData* data = new SbInputData();
++    memset(data, 0, sizeof(*data));
++    data->window = window;
++    switch (e.type) {
++      case bitsos_fb::InEvent::kPress:
++        data->type = kSbInputEventTypePress;
++        break;
++      case bitsos_fb::InEvent::kUnpress:
++        data->type = kSbInputEventTypeUnpress;
++        break;
++      case bitsos_fb::InEvent::kMove:
++        data->type = kSbInputEventTypeMove;
++        break;
++      case bitsos_fb::InEvent::kWheel:
++        data->type = kSbInputEventTypeWheel;
++        break;
++    }
++    switch (e.source) {
++      case bitsos_fb::InEvent::kKeyboard:
++        data->device_type = kSbInputDeviceTypeKeyboard;
++        data->device_id = kKeyboardId;
++        break;
++      case bitsos_fb::InEvent::kMouse:
++        data->device_type = kSbInputDeviceTypeMouse;
++        data->device_id = kMouseId;
++        data->pressure = NAN;
++        data->size = {NAN, NAN};
++        data->tilt = {NAN, NAN};
++        break;
++      case bitsos_fb::InEvent::kRemote:
++        data->device_type = kSbInputDeviceTypeRemote;
++        data->device_id = kRemoteId;
++        break;
++    }
++    data->key = static_cast<SbKey>(e.key);
++    data->character = static_cast<wchar_t>(e.character);
++    data->key_location = Location(e);
++    data->key_modifiers = static_cast<unsigned int>(e.modifiers);
++    data->position.x = static_cast<float>(e.x);
++    data->position.y = static_cast<float>(e.y);
++    data->delta.x = static_cast<float>(e.dx);
++    data->delta.y = static_cast<float>(e.dy);
++    return new Event(kSbEventTypeInput, data, &DeleteDestructor<SbInputData>);
++  }
++  return nullptr;
++}
++
++}  // namespace bitsos
++}  // namespace starboard
+diff --git a/starboard/shared/bitsos/fb/application_bitsos_fb.h b/starboard/shared/bitsos/fb/application_bitsos_fb.h
+new file mode 100644
+index 0000000..f50b319
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/application_bitsos_fb.h
+@@ -0,0 +1,112 @@
++// BitsOS V2 Cobalt backend: the Starboard application for fbdev + evdev.
++//
++// Same job as ApplicationX11, without X: windows are rectangles on the
++// framebuffer (only the first is shown), input comes from evdev nodes, the
++// UI arrives through dev.bitsos.Canvas and video frames through punch-out
++// (AcceptFrame), and FbCompositor puts them together on the screen.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_APPLICATION_BITSOS_FB_H_
++#define STARBOARD_SHARED_BITSOS_FB_APPLICATION_BITSOS_FB_H_
++
++#include <stdint.h>
++
++#include <deque>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++#include "starboard/common/rect.h"
++#include "starboard/player.h"
++#include "starboard/shared/bitsos/fb/evdev_decoder.h"
++#include "starboard/shared/bitsos/fb/evdev_devices.h"
++#include "starboard/shared/bitsos/fb/fb_compositor.h"
++#include "starboard/shared/bitsos/fb/fb_config.h"
++#include "starboard/shared/bitsos/fb/fb_device.h"
++#include "starboard/shared/internal_only.h"
++#include "starboard/shared/linux/time_zone_monitor.h"
++#include "starboard/shared/starboard/player/filter/video_frame_internal.h"
++#include "starboard/shared/starboard/queue_application.h"
++#include "starboard/window.h"
++
++namespace starboard {
++namespace bitsos {
++
++class ApplicationBitsosFb : public QueueApplication {
++ public:
++  explicit ApplicationBitsosFb(SbEventHandleCallback sb_event_handle_callback);
++  ~ApplicationBitsosFb() override;
++
++  static ApplicationBitsosFb* Get() {
++    return static_cast<ApplicationBitsosFb*>(Application::Get());
++  }
++
++  SbWindow CreateWindow(const SbWindowOptions* options);
++  bool DestroyWindow(SbWindow window);
++  bool GetWindowSize(SbWindow window, SbWindowSize* size);
++  void* GetPlatformHandle(SbWindow window);
++  void PlayerSetBounds(SbPlayer player, int z_index, const Rect& rect);
++
++  // dev.bitsos.Canvas Present (Chromium's compositor thread).
++  void Present(void* window_handle, const void* pixels, int32_t stride,
++               int32_t width, int32_t height, int32_t damage_x,
++               int32_t damage_y, int32_t damage_width, int32_t damage_height);
++
++ protected:
++  void AcceptFrame(SbPlayer player,
++                   const scoped_refptr<VideoFrame>& frame,
++                   int z_index,
++                   const Rect& rect) override;
++
++  bool IsStartImmediate() override { return !HasPreloadSwitch(); }
++  bool IsPreloadImmediate() override { return HasPreloadSwitch(); }
++
++  void Initialize() override;
++  void Teardown() override;
++
++  bool MayHaveSystemEvents() override;
++  Event* WaitForSystemEventWithTimeout(int64_t time) override;
++  void WakeSystemEventWait() override;
++
++ private:
++  struct Window;
++
++  std::shared_ptr<bitsos_fb::FbCompositor> Compositor();
++  Event* TakePending();
++  void SetGeometryLocked(int w, int h, const bitsos_fb::Placement& p);
++  void SetKdGraphics(bool on);
++
++  const bitsos_fb::Config config_;
++  bitsos_fb::FbDevice fb_;
++  bitsos_fb::EvdevDecoder decoder_;
++  std::unique_ptr<bitsos_fb::EvdevDevices> inputs_;
++  int wake_fd_ = -1;
++  int tty_fd_ = -1;
++  int64_t next_rescan_ = 0;
++  std::deque<bitsos_fb::InEvent> pending_;
++
++  // Windows and the compositor are reached from several threads.
++  std::mutex mutex_;
++  std::vector<Window*> windows_;
++  std::shared_ptr<bitsos_fb::FbCompositor> compositor_;
++  uint32_t next_handle_ = 1;
++  bool fb_failed_ = false;
++  // Set by CreateWindow/DestroyWindow (any thread), applied to the decoder
++  // by the event thread, which owns it.
++  bool geometry_changed_ = false;
++  int geometry_w_ = 0;
++  int geometry_h_ = 0;
++  bitsos_fb::Placement geometry_placement_;
++  int geometry_screen_w_ = 0;
++  int geometry_screen_h_ = 0;
++  // The frame last handed to the compositor, per player.
++  std::map<uintptr_t, scoped_refptr<VideoFrame>> last_frames_;
++
++  std::unique_ptr<::starboard::shared::linux::TimeZoneMonitor>
++      time_zone_monitor_;
++};
++
++}  // namespace bitsos
++}  // namespace starboard
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_APPLICATION_BITSOS_FB_H_
+diff --git a/starboard/shared/bitsos/fb/av_stats.cc b/starboard/shared/bitsos/fb/av_stats.cc
+new file mode 100644
+index 0000000..8c64754
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/av_stats.cc
+@@ -0,0 +1,304 @@
++// BitsOS V2 Cobalt backend: A/V numbers (see av_stats.h).
++
++#include "starboard/shared/bitsos/fb/av_stats.h"
++
++#include <stdlib.h>
++#include <time.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cinttypes>
++
++namespace bitsos_fb {
++
++namespace {
++
++constexpr int64_t kFlushUs = 1'000'000;
++constexpr int64_t kLogUs = 10'000'000;
++constexpr int64_t kPlayerGoneUs = 10'000'000;
++
++int64_t MonotonicUs() {
++  timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<int64_t>(ts.tv_sec) * 1'000'000 + ts.tv_nsec / 1000;
++}
++
++void StderrLog(const std::string& line) {
++  fprintf(stderr, "bitsos-fb: %s\n", line.c_str());
++}
++
++std::string Ms(int64_t us) {
++  char b[32];
++  snprintf(b, sizeof(b), "%.1f", static_cast<double>(us) / 1000.0);
++  return b;
++}
++
++std::string WindowText(const char* name, const AvStats::Window& w) {
++  if (w.n == 0) {
++    return std::string(name) + " n=0\n";
++  }
++  char b[256];
++  snprintf(b, sizeof(b),
++           "%s n=%" PRIu64 " avg_ms=%s min_ms=%s max_ms=%s within_20ms=%" PRIu64
++           " within_40ms=%" PRIu64 " over_80ms=%" PRIu64 "\n",
++           name, w.n, Ms(w.sum_us / static_cast<int64_t>(w.n)).c_str(),
++           Ms(w.min_us).c_str(), Ms(w.max_us).c_str(), w.within_20ms,
++           w.within_40ms, w.over_80ms);
++  return b;
++}
++
++}  // namespace
++
++void AvStats::Window::Add(int64_t off_us) {
++  min_us = n == 0 ? off_us : std::min(min_us, off_us);
++  max_us = n == 0 ? off_us : std::max(max_us, off_us);
++  ++n;
++  sum_us += off_us;
++  const int64_t a = off_us < 0 ? -off_us : off_us;
++  within_20ms += a <= 20'000;
++  within_40ms += a <= 40'000;
++  over_80ms += a > 80'000;
++}
++
++AvStats* AvStats::Get() {
++  // Lives as long as the process: the player and compositor threads may
++  // still report while static destructors run.
++  static AvStats* stats =
++      new AvStats(getenv("BITSOS_AV_STATS"), getenv("BITSOS_AV_TRACE"),
++                  StderrLog, /*writer_thread=*/true);
++  return stats;
++}
++
++AvStats::AvStats(const char* stats_path, const char* trace_path, LogFn log,
++                 bool writer_thread)
++    : stats_path_(stats_path ? stats_path : ""), log_(log) {
++  if (trace_path && *trace_path) {
++    trace_ = fopen(trace_path, "ae");
++    if (!trace_ && log_) {
++      log_(std::string("av: cannot open the trace ") + trace_path);
++    }
++  }
++  if (writer_thread && (trace_ || !stats_path_.empty() || log_)) {
++    writer_ = std::thread([this] { WriterLoop(); });
++  }
++}
++
++AvStats::~AvStats() {
++  {
++    std::lock_guard<std::mutex> lock(out_mutex_);
++    stop_ = true;
++  }
++  wake_.notify_all();
++  if (writer_.joinable()) {
++    writer_.join();
++  }
++  std::lock_guard<std::mutex> io(io_mutex_);
++  FlushTrace();
++  if (trace_) {
++    fclose(trace_);
++  }
++}
++
++void AvStats::WriterLoop() {
++  std::unique_lock<std::mutex> lock(out_mutex_);
++  while (!stop_) {
++    wake_.wait_for(lock, std::chrono::microseconds(kWriterWakeUs));
++    if (stop_) {
++      break;
++    }
++    lock.unlock();
++    Flush(MonotonicUs());
++    lock.lock();
++  }
++}
++
++void AvStats::NoteRender(int64_t now_us, const void* who, int64_t media_us,
++                         bool playing, double rate, int64_t pts_us,
++                         int64_t dropped) {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    ++renders_;
++    auto it = players_.find(who);
++    if (it == players_.end()) {
++      it = players_.emplace(who, Player()).first;
++    }
++    // A count below the last one is a new player at the same address.
++    const int64_t base = dropped >= it->second.dropped ? it->second.dropped : 0;
++    dropped_ += static_cast<uint64_t>(dropped - base);
++    it->second.dropped = dropped;
++    it->second.seen_us = now_us;
++    for (auto p = players_.begin(); p != players_.end();) {
++      p = now_us - p->second.seen_us > kPlayerGoneUs ? players_.erase(p)
++                                                     : std::next(p);
++    }
++    media_us_ = media_us;
++    media_at_us_ = now_us;
++    playing_ = playing;
++    rate_ = rate;
++    (void)pts_us;
++    dirty_ = true;
++  }
++}
++
++void AvStats::NoteShown(int64_t now_us, int64_t pts_us, int w, int h) {
++  bool have = false;
++  int64_t off = 0;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    ++shown_;
++    last_pts_us_ = pts_us;
++    if (w > 0 && h > 0) {
++      last_w_ = w;
++      last_h_ = h;
++      if (static_cast<int64_t>(w) * h >
++          static_cast<int64_t>(max_w_) * max_h_) {
++        max_w_ = w;
++        max_h_ = h;
++      }
++    }
++    if (playing_ && media_us_ >= 0 && rate_ > 0) {
++      const int64_t clock =
++          media_us_ + static_cast<int64_t>(
++                          static_cast<double>(now_us - media_at_us_) * rate_);
++      off = pts_us - clock;
++      have = off <= kOffsetIgnoreUs && off >= -kOffsetIgnoreUs;
++    }
++    if (have) {
++      last_offset_us_ = off;
++      total_.Add(off);
++      recent_.Add(off);
++    } else {
++      ++skipped_;
++    }
++    dirty_ = true;
++  }
++  if (!trace_) {
++    return;
++  }
++  char b[96];
++  const int n =
++      have ? snprintf(b, sizeof(b), "shown %" PRId64 " %" PRId64 " %" PRId64
++                      "\n", now_us, pts_us, off)
++           : snprintf(b, sizeof(b), "shown %" PRId64 " %" PRId64 " -\n",
++                      now_us, pts_us);
++  if (n <= 0 || static_cast<size_t>(n) >= sizeof(b)) {
++    return;
++  }
++  std::lock_guard<std::mutex> lock(out_mutex_);
++  if (trace_pending_.size() + static_cast<size_t>(n) > kTracePendingMax) {
++    ++trace_lost_;
++  } else {
++    trace_pending_.append(b, static_cast<size_t>(n));
++  }
++}
++
++std::string AvStats::Text(int64_t now_us) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return TextLocked(now_us);
++}
++
++std::string AvStats::TextLocked(int64_t now_us) {
++  char b[512];
++  snprintf(b, sizeof(b),
++           "bitsos-av 1\n"
++           "time_us=%" PRId64 "\n"
++           "playing=%d rate=%.2f\n"
++           "media_time_us=%" PRId64 " read_us_ago=%" PRId64 "\n"
++           "last_pts_us=%" PRId64 " last_offset_ms=%s\n"
++           "frame_last=%dx%d frame_max=%dx%d\n"
++           "renders=%" PRIu64 " frames_shown=%" PRIu64
++           " frames_dropped=%" PRIu64 " offsets_skipped=%" PRIu64 "\n",
++           now_us, playing_ ? 1 : 0, rate_, media_us_, now_us - media_at_us_,
++           last_pts_us_, Ms(last_offset_us_).c_str(), last_w_, last_h_,
++           max_w_, max_h_, renders_, shown_,
++           dropped_, skipped_);
++  return std::string(b) + WindowText("offset_total", total_) +
++         WindowText("offset_recent", recent_);
++}
++
++void AvStats::FlushTrace() {
++  if (!trace_) {
++    return;
++  }
++  std::string text;
++  uint64_t lost = 0;
++  {
++    std::lock_guard<std::mutex> lock(out_mutex_);
++    text.swap(trace_pending_);
++    lost = trace_lost_;
++    trace_lost_ = 0;
++  }
++  if (lost) {
++    fprintf(trace_, "lost %" PRIu64 "\n", lost);
++    if (log_) {
++      log_("av: the trace writer fell behind, " + std::to_string(lost) +
++           " lines lost");
++    }
++  }
++  if (!text.empty()) {
++    fwrite(text.data(), 1, text.size(), trace_);
++  }
++  fflush(trace_);
++}
++
++void AvStats::Flush(int64_t now_us) {
++  std::lock_guard<std::mutex> io(io_mutex_);
++  FlushTrace();
++  std::string text;
++  std::string line;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (log_ && (logged_us_ == 0 || now_us - logged_us_ >= kLogUs)) {
++      // The first note only starts the first 10 s.
++      if (logged_us_ != 0 && shown_ != shown_at_log_) {
++        const double secs = static_cast<double>(now_us - logged_us_) / 1e6;
++        char b[160];
++        snprintf(b, sizeof(b),
++                 "av: %.1f frames/s shown, %" PRIu64 " dropped in %.0f s; ",
++                 static_cast<double>(shown_ - shown_at_log_) / secs,
++                 dropped_ - dropped_at_log_, secs);
++        line = b + WindowText("offset", recent_);
++        line.pop_back();
++      }
++      logged_us_ = now_us;
++      shown_at_log_ = shown_;
++      dropped_at_log_ = dropped_;
++      recent_ = Window();
++    }
++    if (!stats_path_.empty() && dirty_ &&
++        (flushed_us_ == 0 || now_us - flushed_us_ >= kFlushUs)) {
++      text = TextLocked(now_us);
++      flushed_us_ = now_us;
++      dirty_ = false;
++    }
++  }
++  if (!line.empty()) {
++    log_(line);
++  }
++  if (text.empty()) {
++    return;
++  }
++  // Readers see the old file or the new one, never half of one.
++  const std::string tmp = stats_path_ + ".new";
++  FILE* f = fopen(tmp.c_str(), "we");
++  if (!f) {
++    return;
++  }
++  const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
++  if (fclose(f) == 0 && ok) {
++    rename(tmp.c_str(), stats_path_.c_str());
++  }
++}
++
++}  // namespace bitsos_fb
++
++// Weak in video_render_algorithm_impl.cc: called on every Render() that
++// draws a frame.
++extern "C" void BitsosAvNoteRender(const void* who, int64_t media_time_us,
++                                   bool audio_playing, double playback_rate,
++                                   int64_t frame_pts_us,
++                                   int64_t dropped_frames) {
++  bitsos_fb::AvStats::Get()->NoteRender(
++      bitsos_fb::MonotonicUs(), who, media_time_us, audio_playing,
++      playback_rate, frame_pts_us, dropped_frames);
++}
+diff --git a/starboard/shared/bitsos/fb/av_stats.h b/starboard/shared/bitsos/fb/av_stats.h
+new file mode 100644
+index 0000000..4f39620
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/av_stats.h
+@@ -0,0 +1,138 @@
++// BitsOS V2 Cobalt backend: picture against the audio clock, frame and drop
++// counts (YT-5).
++//
++// Starboard's render algorithm reports on every Render() that draws: the
++// audio clock (media time), the frame it chose and its drop counter
++// (BitsosAvNoteRender, a weak hook in video_render_algorithm_impl.cc). The
++// compositor reports when a frame reached the screen (NoteShown). The offset
++// of a shown frame = its timestamp minus the audio clock at that moment (the
++// last media time read, run on at the playback rate): > 0 the picture is
++// early, < 0 it is late. The audio clock is Cobalt's: frames written to ALSA
++// minus snd_pcm_delay, so this is the whole chain as far as the delay is
++// honest (SN-7).
++//
++// Out: a small key=value file (BITSOS_AV_STATS), replaced by rename at most
++// once a second while notes come in, so that MCP can read it at any time; a
++// log line every 10 s while frames are shown; with BITSOS_AV_TRACE one line
++// per shown frame ("shown <monotonic us> <pts us> <offset us|->", and
++// "lost <n>" if the writer fell more than kTracePendingMax behind).
++//
++// The notes only count under a lock; all file and log output is done by
++// Flush(), on a writer thread of its own (or by the caller in tests), so a
++// slow stick or profile file system cannot hold up frame choice or
++// presentation, which would show up as the very drops these numbers count.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_AV_STATS_H_
++#define STARBOARD_SHARED_BITSOS_FB_AV_STATS_H_
++
++#include <stdint.h>
++#include <stdio.h>
++
++#include <condition_variable>
++#include <map>
++#include <mutex>
++#include <string>
++#include <thread>
++
++namespace bitsos_fb {
++
++class AvStats {
++ public:
++  // Offsets over this are seeks or a second player, not sync.
++  static constexpr int64_t kOffsetIgnoreUs = 2'000'000;
++  // How often the writer thread flushes.
++  static constexpr int64_t kWriterWakeUs = 250'000;
++  // Trace text waiting for the writer; more is counted as lost, not kept, so
++  // a stalled file system cannot make Cobalt's memory grow.
++  static constexpr size_t kTracePendingMax = 1 << 20;
++
++  struct Window {
++    uint64_t n = 0;        // offsets counted
++    int64_t sum_us = 0;
++    int64_t min_us = 0;
++    int64_t max_us = 0;
++    uint64_t within_20ms = 0;
++    uint64_t within_40ms = 0;
++    uint64_t over_80ms = 0;
++    void Add(int64_t off_us);
++  };
++
++  typedef void (*LogFn)(const std::string& line);
++
++  // The process-wide instance, paths from the environment (may be unset).
++  static AvStats* Get();
++
++  // |writer_thread|: start the thread that calls Flush(); without it the
++  // caller does (tests, with their own clock).
++  AvStats(const char* stats_path, const char* trace_path, LogFn log,
++          bool writer_thread = false);
++  AvStats(const AvStats&) = delete;
++  AvStats& operator=(const AvStats&) = delete;
++  ~AvStats();
++
++  // From the render algorithm (player thread). |who| tells the players
++  // apart; |dropped| is that player's own running count.
++  void NoteRender(int64_t now_us, const void* who, int64_t media_us,
++                  bool playing, double rate, int64_t pts_us, int64_t dropped);
++  // From the compositor thread, after a new frame went to the screen;
++  // |w| x |h| is its decoded size (0 x 0 if unknown).
++  void NoteShown(int64_t now_us, int64_t pts_us, int w = 0, int h = 0);
++
++  // Writes what is due as of |now_us|: pending trace lines, the 10 s log
++  // line, the file (at most once a second, only if something changed).
++  void Flush(int64_t now_us);
++
++  // The file's text as of |now_us| (also for tests).
++  std::string Text(int64_t now_us);
++
++ private:
++  struct Player {
++    int64_t dropped = 0;
++    int64_t seen_us = 0;
++  };
++
++  void WriterLoop();
++  void FlushTrace();
++  std::string TextLocked(int64_t now_us);
++
++  const std::string stats_path_;
++  const LogFn log_;
++  FILE* trace_ = nullptr;
++
++  std::mutex io_mutex_;  // one Flush() at a time
++
++  std::mutex out_mutex_;  // the pending trace and the writer's stop flag
++  std::condition_variable wake_;
++  std::string trace_pending_;
++  uint64_t trace_lost_ = 0;
++  bool stop_ = false;
++  std::thread writer_;
++
++  std::mutex mutex_;  // the numbers
++  std::map<const void*, Player> players_;
++  uint64_t renders_ = 0;
++  uint64_t shown_ = 0;
++  uint64_t dropped_ = 0;
++  uint64_t skipped_ = 0;  // shown while paused, or offset ignored
++  int64_t media_us_ = -1;
++  int64_t media_at_us_ = 0;
++  bool playing_ = false;
++  double rate_ = 0;
++  int64_t last_pts_us_ = -1;
++  int64_t last_offset_us_ = 0;
++  int last_w_ = 0;
++  int last_h_ = 0;
++  int max_w_ = 0;  // the largest frame shown (by area)
++  int max_h_ = 0;
++  Window total_;
++  Window recent_;  // since the last log line
++  uint64_t shown_at_log_ = 0;
++  uint64_t dropped_at_log_ = 0;
++  int64_t logged_us_ = 0;
++  int64_t flushed_us_ = 0;
++  bool dirty_ = false;
++};
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_AV_STATS_H_
+diff --git a/starboard/shared/bitsos/fb/backend_fb.cc b/starboard/shared/bitsos/fb/backend_fb.cc
+new file mode 100644
+index 0000000..bf06339
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/backend_fb.cc
+@@ -0,0 +1,56 @@
++// BitsOS V2 Cobalt backend: choosing it, and its dev.bitsos.Canvas.
++
++#include "starboard/shared/bitsos/fb/backend_fb.h"
++
++#include <stdlib.h>
++
++#include "starboard/extension/bitsos_canvas.h"
++#include "starboard/shared/bitsos/fb/application_bitsos_fb.h"
++
++namespace starboard {
++namespace bitsos {
++namespace {
++
++const char* RealGetenv(const char* name) {
++  return getenv(name);
++}
++
++void Present(void* window_handle,
++             const void* pixels,
++             int32_t stride,
++             int32_t width,
++             int32_t height,
++             int32_t damage_x,
++             int32_t damage_y,
++             int32_t damage_width,
++             int32_t damage_height) {
++  ApplicationBitsosFb* app = ApplicationBitsosFb::Get();
++  if (app) {
++    app->Present(window_handle, pixels, stride, width, height, damage_x,
++                 damage_y, damage_width, damage_height);
++  }
++}
++
++const StarboardExtensionBitsosCanvasApi kCanvasApi = {
++    kStarboardExtensionBitsosCanvasName,
++    1,
++    &Present,
++};
++
++}  // namespace
++
++const bitsos_fb::Config& FbConfig() {
++  static const bitsos_fb::Config config = bitsos_fb::ReadConfig(&RealGetenv);
++  return config;
++}
++
++bool FbBackendSelected() {
++  return FbConfig().fb_backend;
++}
++
++const void* GetBitsosCanvasApiFb() {
++  return &kCanvasApi;
++}
++
++}  // namespace bitsos
++}  // namespace starboard
+diff --git a/starboard/shared/bitsos/fb/backend_fb.h b/starboard/shared/bitsos/fb/backend_fb.h
+new file mode 100644
+index 0000000..1b68fbf
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/backend_fb.h
+@@ -0,0 +1,27 @@
++// BitsOS V2 Cobalt backend: choosing it, and its dev.bitsos.Canvas.
++//
++// The Linux loader_app keeps its X11 window (the debug backend on CachyOS);
++// BITSOS_BACKEND=fb switches the same binary to the framebuffer + evdev
++// backend that V2 uses. ALSA sound is the same in both.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_BACKEND_FB_H_
++#define STARBOARD_SHARED_BITSOS_FB_BACKEND_FB_H_
++
++#include "starboard/shared/bitsos/fb/fb_config.h"
++
++namespace starboard {
++namespace bitsos {
++
++// Settings from the environment, read once.
++const bitsos_fb::Config& FbConfig();
++
++// True when BITSOS_BACKEND=fb.
++bool FbBackendSelected();
++
++// The "dev.bitsos.Canvas" extension of the framebuffer backend.
++const void* GetBitsosCanvasApiFb();
++
++}  // namespace bitsos
++}  // namespace starboard
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_BACKEND_FB_H_
+diff --git a/starboard/shared/bitsos/fb/console_guard.cc b/starboard/shared/bitsos/fb/console_guard.cc
+new file mode 100644
+index 0000000..cabe124
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/console_guard.cc
+@@ -0,0 +1,119 @@
++// BitsOS V2 Cobalt backend: gives the text console back however Cobalt ends.
++
++#include "starboard/shared/bitsos/fb/console_guard.h"
++
++#include <linux/kd.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include <atomic>
++
++namespace bitsos_fb {
++namespace {
++
++struct Guarded {
++  int sig;
++  bool fatal;
++};
++
++const Guarded kSignals[] = {
++    {SIGSEGV, true},  {SIGBUS, true},   {SIGFPE, true},
++    {SIGILL, true},   {SIGABRT, true},  {SIGTERM, false},
++    {SIGINT, false},  {SIGHUP, false},  {SIGQUIT, false},
++};
++constexpr int kCount = sizeof(kSignals) / sizeof(kSignals[0]);
++
++std::atomic<int> g_fd{-1};
++std::atomic<RestoreFn> g_restore{nullptr};
++struct sigaction g_old[kCount];
++bool g_installed = false;
++bool g_atexit = false;
++
++void RunRestore() {
++  const int fd = g_fd.exchange(-1);
++  const RestoreFn fn = g_restore.load();
++  if (fd >= 0 && fn) {
++    fn(fd);
++  }
++}
++
++bool HasHandler(const struct sigaction& a) {
++  return (a.sa_flags & SA_SIGINFO) ? a.sa_sigaction != nullptr
++                                   : a.sa_handler != SIG_DFL &&
++                                         a.sa_handler != SIG_IGN;
++}
++
++void Handler(int sig, siginfo_t* info, void* context) {
++  for (int i = 0; i < kCount; ++i) {
++    if (kSignals[i].sig != sig) {
++      continue;
++    }
++    const struct sigaction& old = g_old[i];
++    if (kSignals[i].fatal || !HasHandler(old)) {
++      RunRestore();
++    }
++    if (HasHandler(old)) {
++      if (old.sa_flags & SA_SIGINFO) {
++        old.sa_sigaction(sig, info, context);
++      } else {
++        old.sa_handler(sig);
++      }
++      return;
++    }
++    // Default action (or ignore): put it back and let the signal act once
++    // this handler returns (it is blocked until then).
++    sigaction(sig, &old, nullptr);
++    raise(sig);
++    return;
++  }
++}
++
++void AtExit() {
++  RunRestore();
++}
++
++}  // namespace
++
++void RestoreTextMode(int fd) {
++  ioctl(fd, KDSETMODE, KD_TEXT);
++}
++
++void ArmConsoleGuard(int fd, RestoreFn restore) {
++  g_restore.store(restore);
++  g_fd.store(fd);
++  if (!g_atexit) {
++    g_atexit = atexit(&AtExit) == 0;
++  }
++  if (g_installed) {
++    return;
++  }
++  struct sigaction sa;
++  memset(&sa, 0, sizeof(sa));
++  sa.sa_sigaction = &Handler;
++  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
++  sigemptyset(&sa.sa_mask);
++  for (int i = 0; i < kCount; ++i) {
++    sigaction(kSignals[i].sig, &sa, &g_old[i]);
++  }
++  g_installed = true;
++}
++
++void DisarmConsoleGuard() {
++  g_fd.store(-1);
++  if (!g_installed) {
++    return;
++  }
++  for (int i = 0; i < kCount; ++i) {
++    struct sigaction now;
++    // Only put the old one back if ours is still in place.
++    if (sigaction(kSignals[i].sig, nullptr, &now) == 0 &&
++        (now.sa_flags & SA_SIGINFO) && now.sa_sigaction == &Handler) {
++      sigaction(kSignals[i].sig, &g_old[i], nullptr);
++    }
++  }
++  g_installed = false;
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/console_guard.h b/starboard/shared/bitsos/fb/console_guard.h
+new file mode 100644
+index 0000000..b665bcd
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/console_guard.h
+@@ -0,0 +1,33 @@
++// BitsOS V2 Cobalt backend: gives the text console back however Cobalt ends.
++//
++// With BITSOS_KD_GRAPHICS=1 the console is switched to graphics mode; if the
++// program then dies without its normal teardown, the console would stay
++// dark. Armed, this guard runs a restore function (KD_TEXT) at exit() and on
++// fatal signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT), then hands the
++// signal on to whatever handler was there before. Stop signals (SIGTERM,
++// SIGINT, SIGHUP, SIGQUIT) restore only when nobody else handles them (a
++// handler there means an orderly stop, whose teardown restores anyway).
++// SIGKILL cannot be caught: georg-vt-check.sh restores after the process.
++// Handlers installed later by Chromium may not pass signals on to this one;
++// the script covers that too.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_CONSOLE_GUARD_H_
++#define STARBOARD_SHARED_BITSOS_FB_CONSOLE_GUARD_H_
++
++namespace bitsos_fb {
++
++// Must be async-signal-safe (a single ioctl, a write).
++typedef void (*RestoreFn)(int fd);
++
++// Arms the guard for |fd|; |restore| runs at most once.
++void ArmConsoleGuard(int fd, RestoreFn restore);
++
++// Normal end (the caller restores itself): puts the old handlers back.
++void DisarmConsoleGuard();
++
++// ioctl(fd, KDSETMODE, KD_TEXT).
++void RestoreTextMode(int fd);
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_CONSOLE_GUARD_H_
+diff --git a/starboard/shared/bitsos/fb/evdev_decoder.cc b/starboard/shared/bitsos/fb/evdev_decoder.cc
+new file mode 100644
+index 0000000..78875c7
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/evdev_decoder.cc
+@@ -0,0 +1,600 @@
++// BitsOS V2 Cobalt backend: Linux evdev records -> input events for Cobalt.
++
++#include "starboard/shared/bitsos/fb/evdev_decoder.h"
++
++#include <linux/input-event-codes.h>
++#include <string.h>
++
++#include <algorithm>
++
++namespace bitsos_fb {
++namespace {
++
++// SbKey values used here (starboard/key.h; the glue checks them).
++enum : int {
++  kBackspace = 0x08,
++  kTab = 0x09,
++  kReturn = 0x0D,
++  kShift = 0x10,
++  kControl = 0x11,
++  kMenu = 0x12,
++  kPause = 0x13,
++  kCapital = 0x14,
++  kEscape = 0x1B,
++  kSpace = 0x20,
++  kPrior = 0x21,
++  kNext = 0x22,
++  kEnd = 0x23,
++  kHome = 0x24,
++  kLeft = 0x25,
++  kUp = 0x26,
++  kRight = 0x27,
++  kDown = 0x28,
++  kInsert = 0x2D,
++  kDelete = 0x2E,
++  kKey0 = 0x30,
++  kKeyA = 0x41,
++  kLwin = 0x5B,
++  kRwin = 0x5C,
++  kApps = 0x5D,
++  kNumpad0 = 0x60,
++  kMultiply = 0x6A,
++  kAdd = 0x6B,
++  kSubtract = 0x6D,
++  kDecimal = 0x6E,
++  kDivide = 0x6F,
++  kF1 = 0x70,
++  kBrowserBack = 0xA6,
++  kVolumeMute = 0xAD,
++  kVolumeDown = 0xAE,
++  kVolumeUp = 0xAF,
++  kMediaNextTrack = 0xB0,
++  kMediaPrevTrack = 0xB1,
++  kMediaStop = 0xB2,
++  kMediaPlayPause = 0xB3,
++  kOem1 = 0xBA,
++  kOemPlus = 0xBB,
++  kOemComma = 0xBC,
++  kOemMinus = 0xBD,
++  kOemPeriod = 0xBE,
++  kOem2 = 0xBF,
++  kOem3 = 0xC0,
++  kOem4 = 0xDB,
++  kOem5 = 0xDC,
++  kOem6 = 0xDD,
++  kOem7 = 0xDE,
++  kOem102 = 0xE2,
++  kMediaRewind = 0xE3,
++  kMediaFastForward = 0xE4,
++  kMouse1 = 0x7000,
++  kMouse2 = 0x7001,
++  kMouse3 = 0x7002,
++  kMouse4 = 0x7003,
++  kMouse5 = 0x7004,
++};
++
++// Letter keys in Linux code order (QWERTY positions).
++const char kRowQ[] = "QWERTYUIOP";  // KEY_Q .. KEY_P
++const char kRowA[] = "ASDFGHJKL";   // KEY_A .. KEY_L
++const char kRowZ[] = "ZXCVBNM";     // KEY_Z .. KEY_M
++
++int Letter(int code) {
++  if (code >= KEY_Q && code <= KEY_P) {
++    return kRowQ[code - KEY_Q];
++  }
++  if (code >= KEY_A && code <= KEY_L) {
++    return kRowA[code - KEY_A];
++  }
++  if (code >= KEY_Z && code <= KEY_M) {
++    return kRowZ[code - KEY_Z];
++  }
++  return 0;
++}
++
++int ModifierBit(int code) {
++  switch (code) {
++    case KEY_LEFTSHIFT:
++    case KEY_RIGHTSHIFT:
++      return kModShift;
++    case KEY_LEFTCTRL:
++    case KEY_RIGHTCTRL:
++      return kModCtrl;
++    case KEY_LEFTALT:
++    case KEY_RIGHTALT:
++      return kModAlt;
++    case KEY_LEFTMETA:
++    case KEY_RIGHTMETA:
++      return kModMeta;
++  }
++  return 0;
++}
++
++int MouseButtonKey(int code, int* bit) {
++  switch (code) {
++    case BTN_LEFT:
++      *bit = kModButtonLeft;
++      return kMouse1;
++    case BTN_MIDDLE:
++      *bit = kModButtonMiddle;
++      return kMouse2;
++    case BTN_RIGHT:
++      *bit = kModButtonRight;
++      return kMouse3;
++    case BTN_SIDE:
++      *bit = 0;
++      return kMouse4;
++    case BTN_EXTRA:
++      *bit = 0;
++      return kMouse5;
++  }
++  *bit = 0;
++  return 0;
++}
++
++int GamepadKey(int code) {
++  switch (code) {
++    case BTN_SOUTH:
++    case BTN_START:
++    case BTN_TRIGGER:
++      return kReturn;
++    case BTN_EAST:
++    case BTN_SELECT:
++    case BTN_MODE:
++    case BTN_THUMB:
++      return kEscape;
++    case BTN_NORTH:
++    case BTN_WEST:
++      return kMediaPlayPause;
++    case BTN_TL:
++    case BTN_TL2:
++      return kMediaRewind;
++    case BTN_TR:
++    case BTN_TR2:
++      return kMediaFastForward;
++    case BTN_DPAD_UP:
++      return kUp;
++    case BTN_DPAD_DOWN:
++      return kDown;
++    case BTN_DPAD_LEFT:
++      return kLeft;
++    case BTN_DPAD_RIGHT:
++      return kRight;
++  }
++  return 0;
++}
++
++bool IsMouseButton(int code) {
++  return code >= BTN_MOUSE && code < BTN_JOYSTICK;
++}
++
++bool IsGamepadButton(int code) {
++  return (code >= BTN_JOYSTICK && code < BTN_DIGI) ||
++         (code >= BTN_DPAD_UP && code <= BTN_DPAD_RIGHT);
++}
++
++bool IsPointerClass(DevClass c) {
++  return c == DevClass::kAny || c == DevClass::kMouse ||
++         c == DevClass::kAbsPointer;
++}
++
++// Remembers which keys a device holds; true if |code| was held before.
++bool Hold(DeviceState* dev, int code, bool down) {
++  auto it = std::find(dev->held.begin(), dev->held.end(), code);
++  const bool was = it != dev->held.end();
++  if (down && !was) {
++    dev->held.push_back(code);
++  } else if (!down && was) {
++    dev->held.erase(it);
++  }
++  return was;
++}
++
++int Clamp(double v, int lo, int hi) {
++  if (v < lo) {
++    return lo;
++  }
++  if (v > hi) {
++    return hi;
++  }
++  return static_cast<int>(v);
++}
++
++}  // namespace
++
++int LinuxKeyToSbKey(int code, Keymap keymap) {
++  if (int l = Letter(code)) {
++    if (keymap == Keymap::kDe && (l == 'Y' || l == 'Z')) {
++      l = l == 'Y' ? 'Z' : 'Y';  // QWERTZ
++    }
++    return kKeyA + (l - 'A');
++  }
++  if (code >= KEY_1 && code <= KEY_9) {
++    return kKey0 + 1 + (code - KEY_1);
++  }
++  if (code >= KEY_F1 && code <= KEY_F10) {
++    return kF1 + (code - KEY_F1);
++  }
++  switch (code) {
++    case KEY_0: return kKey0;
++    case KEY_ESC: return kEscape;
++    case KEY_MINUS: return kOemMinus;
++    case KEY_EQUAL: return kOemPlus;
++    case KEY_BACKSPACE: return kBackspace;
++    case KEY_TAB: return kTab;
++    case KEY_LEFTBRACE: return kOem4;
++    case KEY_RIGHTBRACE: return kOem6;
++    case KEY_ENTER:
++    case KEY_KPENTER:
++    case KEY_OK:
++    case KEY_SELECT: return kReturn;
++    case KEY_LEFTCTRL:
++    case KEY_RIGHTCTRL: return kControl;
++    case KEY_SEMICOLON: return kOem1;
++    case KEY_APOSTROPHE: return kOem7;
++    case KEY_GRAVE: return kOem3;
++    case KEY_LEFTSHIFT:
++    case KEY_RIGHTSHIFT: return kShift;
++    case KEY_BACKSLASH: return kOem5;
++    case KEY_COMMA: return kOemComma;
++    case KEY_DOT: return kOemPeriod;
++    case KEY_SLASH: return kOem2;
++    case KEY_KPASTERISK: return kMultiply;
++    case KEY_LEFTALT:
++    case KEY_RIGHTALT: return kMenu;
++    case KEY_SPACE: return kSpace;
++    case KEY_CAPSLOCK: return kCapital;
++    case KEY_KP0: return kNumpad0;
++    case KEY_KP1: return kNumpad0 + 1;
++    case KEY_KP2: return kNumpad0 + 2;
++    case KEY_KP3: return kNumpad0 + 3;
++    case KEY_KP4: return kNumpad0 + 4;
++    case KEY_KP5: return kNumpad0 + 5;
++    case KEY_KP6: return kNumpad0 + 6;
++    case KEY_KP7: return kNumpad0 + 7;
++    case KEY_KP8: return kNumpad0 + 8;
++    case KEY_KP9: return kNumpad0 + 9;
++    case KEY_KPMINUS: return kSubtract;
++    case KEY_KPPLUS: return kAdd;
++    case KEY_KPDOT: return kDecimal;
++    case KEY_KPSLASH: return kDivide;
++    case KEY_102ND: return kOem102;
++    case KEY_F11: return kF1 + 10;
++    case KEY_F12: return kF1 + 11;
++    case KEY_HOME: return kHome;
++    case KEY_UP: return kUp;
++    case KEY_PAGEUP: return kPrior;
++    case KEY_LEFT: return kLeft;
++    case KEY_RIGHT: return kRight;
++    case KEY_END: return kEnd;
++    case KEY_DOWN: return kDown;
++    case KEY_PAGEDOWN: return kNext;
++    case KEY_INSERT: return kInsert;
++    case KEY_DELETE: return kDelete;
++    case KEY_MUTE: return kVolumeMute;
++    case KEY_VOLUMEDOWN: return kVolumeDown;
++    case KEY_VOLUMEUP: return kVolumeUp;
++    case KEY_PAUSE: return kPause;
++    case KEY_LEFTMETA: return kLwin;
++    case KEY_RIGHTMETA: return kRwin;
++    case KEY_COMPOSE: return kApps;
++    case KEY_BACK: return kBrowserBack;
++    case KEY_EXIT: return kEscape;
++    case KEY_NEXTSONG: return kMediaNextTrack;
++    case KEY_PREVIOUSSONG: return kMediaPrevTrack;
++    case KEY_STOPCD:
++    case KEY_STOP: return kMediaStop;
++    case KEY_PLAYPAUSE:
++    case KEY_PLAY:
++    case KEY_PAUSECD: return kMediaPlayPause;
++    case KEY_REWIND: return kMediaRewind;
++    case KEY_FASTFORWARD: return kMediaFastForward;
++  }
++  return 0;
++}
++
++int LinuxKeyToChar(int code, bool shift, Keymap keymap) {
++  const int key = LinuxKeyToSbKey(code, keymap);
++  if (key >= kKeyA && key <= kKeyA + 25) {
++    return shift ? key : key + ('a' - 'A');
++  }
++  if (!shift && key >= kKey0 && key <= kKey0 + 9) {
++    return key;
++  }
++  if (key == kSpace) {
++    return ' ';
++  }
++  return 0;
++}
++
++EvdevDecoder::EvdevDecoder(Keymap keymap) : keymap_(keymap) {
++  SetGeometry(1920, 1080, FitWindow(1920, 1080, 1920, 1080));
++}
++
++void EvdevDecoder::SetGeometry(int win_w, int win_h,
++                               const Placement& placement, int screen_w,
++                               int screen_h) {
++  win_w_ = std::max(1, win_w);
++  win_h_ = std::max(1, win_h);
++  placement_ = placement;
++  if (placement_.w <= 0 || placement_.h <= 0) {
++    placement_.x = placement_.y = 0;
++    placement_.w = win_w_;
++    placement_.h = win_h_;
++  }
++  screen_w_ = screen_w > 0 ? screen_w : placement_.x + placement_.w;
++  screen_h_ = screen_h > 0 ? screen_h : placement_.y + placement_.h;
++  px_ = placement_.x + placement_.w / 2;
++  py_ = placement_.y + placement_.h / 2;
++}
++
++void EvdevDecoder::ToWindow(double* x, double* y) const {
++  double wx = (px_ - placement_.x) * win_w_ / placement_.w;
++  double wy = (py_ - placement_.y) * win_h_ / placement_.h;
++  *x = std::min(std::max(wx, 0.0), static_cast<double>(win_w_ - 1));
++  *y = std::min(std::max(wy, 0.0), static_cast<double>(win_h_ - 1));
++}
++
++void EvdevDecoder::Emit(InEvent::Type type, InEvent::Source source, int key,
++                        std::vector<InEvent>* out) {
++  InEvent e;
++  e.type = type;
++  e.source = source;
++  e.key = key;
++  e.modifiers = modifiers_;
++  if (source == InEvent::kMouse) {
++    ToWindow(&e.x, &e.y);
++  }
++  out->push_back(e);
++}
++
++void EvdevDecoder::Feed(DeviceState* dev, const uint8_t* data, size_t n,
++                        std::vector<InEvent>* out) {
++  while (n > 0) {
++    const size_t take = std::min(n, kInputEventSize - dev->partial_len);
++    memcpy(dev->partial + dev->partial_len, data, take);
++    dev->partial_len += take;
++    data += take;
++    n -= take;
++    if (dev->partial_len < kInputEventSize) {
++      break;
++    }
++    dev->partial_len = 0;
++    uint16_t type, code;
++    int32_t value;
++    memcpy(&type, dev->partial + 16, 2);
++    memcpy(&code, dev->partial + 18, 2);
++    memcpy(&value, dev->partial + 20, 4);
++    Record(dev, type, code, value, out);
++  }
++}
++
++void EvdevDecoder::Record(DeviceState* dev, int type, int code, int value,
++                          std::vector<InEvent>* out) {
++  switch (type) {
++    case EV_SYN:
++      if (code == SYN_REPORT) {
++        Flush(out);
++      } else if (code == SYN_DROPPED) {
++        // The kernel lost events: drop the half-seen report.
++        moved_ = false;
++        wheel_x_ = wheel_y_ = 0;
++      }
++      return;
++    case EV_KEY:
++      Key(dev, code, value, out);
++      return;
++    case EV_REL:
++      if (!IsPointerClass(dev->cls)) {
++        return;
++      }
++      // One report never moves more than the screen; hostile values are cut.
++      value = std::max(-100000, std::min(100000, value));
++      if (code == REL_X || code == REL_Y) {
++        const Placement& p = placement_;
++        if (code == REL_X) {
++          px_ = Clamp(px_ + value, p.x, p.x + p.w - 1);
++        } else {
++          py_ = Clamp(py_ + value, p.y, p.y + p.h - 1);
++        }
++        moved_ = true;
++        pointer_seen_ = true;
++      } else if (code == REL_WHEEL) {
++        wheel_y_ -= value;  // evdev: positive = away from the user = up
++      } else if (code == REL_HWHEEL) {
++        wheel_x_ += value;
++      }
++      return;
++    case EV_ABS:
++      if (dev->cls == DevClass::kAbsPointer) {
++        AbsPointer(dev, code, value);
++      } else if (dev->cls == DevClass::kAny ||
++                 dev->cls == DevClass::kGamepad) {
++        Abs(dev, code, value, out);
++      }
++      return;
++  }
++}
++
++void EvdevDecoder::Key(DeviceState* dev, int code, int value,
++                       std::vector<InEvent>* out) {
++  if (value < 0 || value > 2) {
++    return;
++  }
++  const bool down = value != 0;
++  if (code == BTN_TOUCH && dev->cls == DevClass::kAbsPointer) {
++    code = BTN_LEFT;  // a touch screen: touching is the click
++  }
++  if (IsMouseButton(code)) {
++    if (!IsPointerClass(dev->cls)) {
++      return;
++    }
++    if (value == 2) {
++      return;
++    }
++    int bit = 0;
++    const int key = MouseButtonKey(code, &bit);
++    if (!key || Hold(dev, code, down) == down) {
++      return;  // unknown, or no change (a release we never saw pressed)
++    }
++    if (moved_) {
++      Flush(out);
++    }
++    if (down) {
++      modifiers_ |= bit;
++    } else {
++      modifiers_ &= ~bit;
++    }
++    pointer_seen_ = true;
++    Emit(down ? InEvent::kPress : InEvent::kUnpress, InEvent::kMouse, key,
++         out);
++    return;
++  }
++  if (IsGamepadButton(code)) {
++    if (dev->cls != DevClass::kAny && dev->cls != DevClass::kGamepad) {
++      return;
++    }
++    const int key = GamepadKey(code);
++    if (key && (value == 2 || Hold(dev, code, down) != down)) {
++      Emit(down ? InEvent::kPress : InEvent::kUnpress, InEvent::kRemote, key,
++           out);
++      out->back().repeat = value == 2;
++    }
++    return;
++  }
++  if (code >= BTN_MISC && code < KEY_OK) {
++    return;  // touch, tool and other button ranges: not used
++  }
++  if (dev->cls == DevClass::kMouse || dev->cls == DevClass::kAbsPointer) {
++    return;
++  }
++  const int key = LinuxKeyToSbKey(code, keymap_);
++  const int bit = ModifierBit(code);
++  if (!key && !bit) {
++    return;
++  }
++  if (value != 2 && Hold(dev, code, down) == down) {
++    return;  // no change: a release we never saw pressed, or a double press
++  }
++  if (bit) {
++    if (down) {
++      modifiers_ |= bit;
++    } else {
++      modifiers_ &= ~bit;
++    }
++  }
++  if (!key) {
++    return;
++  }
++  Emit(down ? InEvent::kPress : InEvent::kUnpress, InEvent::kKeyboard, key,
++       out);
++  InEvent& e = out->back();
++  e.repeat = value == 2;
++  e.character =
++      down ? LinuxKeyToChar(code, (modifiers_ & kModShift) != 0, keymap_) : 0;
++  e.right_side = code == KEY_RIGHTSHIFT || code == KEY_RIGHTCTRL ||
++                 code == KEY_RIGHTALT || code == KEY_RIGHTMETA;
++}
++
++void EvdevDecoder::Direction(int* held, int now, int key_neg, int key_pos,
++                             std::vector<InEvent>* out) {
++  if (*held == now) {
++    return;
++  }
++  if (*held != 0) {
++    Emit(InEvent::kUnpress, InEvent::kRemote, *held < 0 ? key_neg : key_pos,
++         out);
++  }
++  if (now != 0) {
++    Emit(InEvent::kPress, InEvent::kRemote, now < 0 ? key_neg : key_pos, out);
++  }
++  *held = now;
++}
++
++void EvdevDecoder::Abs(DeviceState* dev, int code, int value,
++                       std::vector<InEvent>* out) {
++  switch (code) {
++    case ABS_HAT0X:
++      Direction(&dev->hat_x, (value > 0) - (value < 0), kLeft, kRight, out);
++      return;
++    case ABS_HAT0Y:
++      Direction(&dev->hat_y, (value > 0) - (value < 0), kUp, kDown, out);
++      return;
++    case ABS_X:
++    case ABS_Y: {
++      const AxisRange& r = code == ABS_X ? dev->abs_x : dev->abs_y;
++      if (r.max <= r.min) {
++        return;
++      }
++      // -1 .. 1; pressed beyond 0.5, released below 0.3 (no flicker).
++      const double v =
++          2.0 * (static_cast<double>(value) - r.min) / (r.max - r.min) - 1.0;
++      int* held = code == ABS_X ? &dev->stick_x : &dev->stick_y;
++      int now = *held;
++      if (v > 0.5) {
++        now = 1;
++      } else if (v < -0.5) {
++        now = -1;
++      } else if (v > -0.3 && v < 0.3) {
++        now = 0;
++      }
++      if (code == ABS_X) {
++        Direction(held, now, kLeft, kRight, out);
++      } else {
++        Direction(held, now, kUp, kDown, out);
++      }
++      return;
++    }
++  }
++}
++
++void EvdevDecoder::AbsPointer(DeviceState* dev, int code, int value) {
++  if (code != ABS_X && code != ABS_Y) {
++    return;
++  }
++  const AxisRange& r = code == ABS_X ? dev->abs_x : dev->abs_y;
++  if (r.max <= r.min) {
++    return;
++  }
++  // The device's range covers the whole screen; the pointer stays on the
++  // window like a mouse's.
++  const double f =
++      (static_cast<double>(std::max(r.min, std::min(r.max, value))) - r.min) /
++      (static_cast<double>(r.max) - r.min);
++  const Placement& p = placement_;
++  if (code == ABS_X) {
++    px_ = Clamp(f * (screen_w_ - 1), p.x, p.x + p.w - 1);
++  } else {
++    py_ = Clamp(f * (screen_h_ - 1), p.y, p.y + p.h - 1);
++  }
++  moved_ = true;
++  pointer_seen_ = true;
++}
++
++void EvdevDecoder::ReleaseAll(DeviceState* dev, std::vector<InEvent>* out) {
++  dev->partial_len = 0;
++  const std::vector<int> held = dev->held;
++  for (int code : held) {
++    Key(dev, code, 0, out);
++  }
++  dev->held.clear();
++  Direction(&dev->hat_x, 0, kLeft, kRight, out);
++  Direction(&dev->hat_y, 0, kUp, kDown, out);
++  Direction(&dev->stick_x, 0, kLeft, kRight, out);
++  Direction(&dev->stick_y, 0, kUp, kDown, out);
++}
++
++void EvdevDecoder::Flush(std::vector<InEvent>* out) {
++  if (moved_) {
++    moved_ = false;
++    Emit(InEvent::kMove, InEvent::kMouse, 0, out);
++  }
++  if (wheel_x_ || wheel_y_) {
++    Emit(InEvent::kWheel, InEvent::kMouse, 0, out);
++    InEvent& e = out->back();
++    e.dx = static_cast<double>(std::max(-1000LL, std::min(1000LL, wheel_x_)));
++    e.dy = static_cast<double>(std::max(-1000LL, std::min(1000LL, wheel_y_)));
++    wheel_x_ = wheel_y_ = 0;
++  }
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/evdev_decoder.h b/starboard/shared/bitsos/fb/evdev_decoder.h
+new file mode 100644
+index 0000000..3d363aa
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/evdev_decoder.h
+@@ -0,0 +1,143 @@
++// BitsOS V2 Cobalt backend: Linux evdev records -> input events for Cobalt.
++//
++// Plain C++17 (no Starboard, only Linux's event numbers), so the host tests
++// feed it any bytes. Every record is 24 bytes (struct input_event on x86-64:
++// time 16, type 2, code 2, value 4); records may arrive in pieces.
++//
++// What comes out is already in Cobalt's terms: key values are SbKey values
++// (the Windows virtual key codes, e.g. 0x26 = Up), modifier bits are
++// SbKeyModifiers. Cobalt 27's Ozone layer drops gamepad-type events, so a
++// pad is turned into remote-control keys: d-pad, hat and left stick =
++// arrows, A = Enter, B = Escape (back), X = play/pause, shoulders = rewind /
++// fast forward, Start = Enter, Select/Mode = Escape. An absolute pointer
++// (a tablet such as QEMU's usb-tablet, or a touch screen) moves the pointer
++// to where it points; touchpads are not supported (they need libinput-like
++// handling and are not classified as pointers).
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_EVDEV_DECODER_H_
++#define STARBOARD_SHARED_BITSOS_FB_EVDEV_DECODER_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <vector>
++
++#include "starboard/shared/bitsos/fb/fb_config.h"
++#include "starboard/shared/bitsos/fb/fb_pixels.h"
++
++namespace bitsos_fb {
++
++constexpr size_t kInputEventSize = 24;
++
++// What a device was found to be. kAny = unknown (a FIFO or file from a test):
++// every event type is taken (EV_ABS as a gamepad).
++enum class DevClass { kAny, kKeyboard, kMouse, kGamepad, kAbsPointer };
++
++// SbKeyModifiers bits.
++enum : int {
++  kModAlt = 1 << 0,
++  kModCtrl = 1 << 1,
++  kModMeta = 1 << 2,
++  kModShift = 1 << 3,
++  kModButtonLeft = 1 << 4,
++  kModButtonRight = 1 << 5,
++  kModButtonMiddle = 1 << 6,
++};
++
++struct AxisRange {
++  int min = -32768;
++  int max = 32767;
++};
++
++// Per-device state; owned by the device list, handed to Feed.
++struct DeviceState {
++  DevClass cls = DevClass::kAny;
++  uint8_t partial[kInputEventSize];
++  size_t partial_len = 0;
++  AxisRange abs_x;
++  AxisRange abs_y;
++  // -1, 0, 1 per axis: what is held down now from the hat and the stick.
++  int hat_x = 0;
++  int hat_y = 0;
++  int stick_x = 0;
++  int stick_y = 0;
++  // Linux codes of the keys and buttons held down now, so that they can be
++  // let go when the device disappears.
++  std::vector<int> held;
++};
++
++struct InEvent {
++  enum Type { kPress, kUnpress, kMove, kWheel };
++  enum Source { kKeyboard, kMouse, kRemote };
++  Type type = kPress;
++  Source source = kKeyboard;
++  int key = 0;            // SbKey value (0 = unknown)
++  int character = 0;      // Unicode code point for text keys, else 0
++  bool repeat = false;    // key held down (evdev value 2)
++  bool right_side = false;  // right-hand modifier key
++  int modifiers = 0;      // kMod* bits
++  double x = 0;           // pointer position in window pixels
++  double y = 0;
++  double dx = 0;          // wheel steps (+y = down, +x = right)
++  double dy = 0;
++};
++
++class EvdevDecoder {
++ public:
++  explicit EvdevDecoder(Keymap keymap = Keymap::kDe);
++
++  // Window size and where it sits on the screen; the pointer moves in screen
++  // pixels and is reported in window pixels. Puts the pointer in the middle.
++  // |screen_w|/|screen_h| (0 = the placement's corner) is what an absolute
++  // pointer's range covers.
++  void SetGeometry(int win_w, int win_h, const Placement& placement,
++                   int screen_w = 0, int screen_h = 0);
++
++  // Decodes |n| bytes from |dev| and appends the resulting events.
++  void Feed(DeviceState* dev, const uint8_t* data, size_t n,
++            std::vector<InEvent>* out);
++
++  // The device is gone: lets go of everything it still holds (keys,
++  // modifiers, buttons, pad directions) and forgets a half record.
++  void ReleaseAll(DeviceState* dev, std::vector<InEvent>* out);
++
++  // Pointer in screen pixels, and whether any mouse has moved or clicked.
++  int pointer_screen_x() const { return static_cast<int>(px_); }
++  int pointer_screen_y() const { return static_cast<int>(py_); }
++  bool pointer_seen() const { return pointer_seen_; }
++
++ private:
++  void Record(DeviceState* dev, int type, int code, int value,
++              std::vector<InEvent>* out);
++  void Key(DeviceState* dev, int code, int value, std::vector<InEvent>* out);
++  void Abs(DeviceState* dev, int code, int value, std::vector<InEvent>* out);
++  void AbsPointer(DeviceState* dev, int code, int value);
++  void Flush(std::vector<InEvent>* out);
++  void Direction(int* held, int now, int key_neg, int key_pos,
++                 std::vector<InEvent>* out);
++  void Emit(InEvent::Type type, InEvent::Source source, int key,
++            std::vector<InEvent>* out);
++  void ToWindow(double* x, double* y) const;
++
++  Keymap keymap_;
++  int modifiers_ = 0;
++  int win_w_ = 1920;
++  int win_h_ = 1080;
++  Placement placement_;
++  int screen_w_ = 1920;
++  int screen_h_ = 1080;
++  double px_ = 0;
++  double py_ = 0;
++  bool pointer_seen_ = false;
++  bool moved_ = false;
++  long long wheel_x_ = 0;
++  long long wheel_y_ = 0;
++};
++
++// Linux key code -> SbKey value (0 if not used), and the text it types.
++int LinuxKeyToSbKey(int code, Keymap keymap);
++int LinuxKeyToChar(int code, bool shift, Keymap keymap);
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_EVDEV_DECODER_H_
+diff --git a/starboard/shared/bitsos/fb/evdev_devices.cc b/starboard/shared/bitsos/fb/evdev_devices.cc
+new file mode 100644
+index 0000000..ab20c1c
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/evdev_devices.cc
+@@ -0,0 +1,314 @@
++// BitsOS V2 Cobalt backend: the set of open input devices.
++
++#include "starboard/shared/bitsos/fb/evdev_devices.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <glob.h>
++#include <linux/input.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <set>
++
++namespace bitsos_fb {
++namespace {
++
++static_assert(sizeof(struct input_event) == kInputEventSize,
++              "the decoder assumes the x86-64 input_event layout");
++
++bool Bit(const std::vector<unsigned long>& bits, int n) {
++  const size_t per = sizeof(unsigned long) * 8;
++  const size_t i = static_cast<size_t>(n) / per;
++  return i < bits.size() && ((bits[i] >> (n % per)) & 1);
++}
++
++bool GetBits(int fd, int type, int max, std::vector<unsigned long>* bits) {
++  const size_t per = sizeof(unsigned long) * 8;
++  bits->assign(max / per + 1, 0);
++  const int len = static_cast<int>(bits->size() * sizeof(unsigned long));
++  return ioctl(fd, EVIOCGBIT(type, len), bits->data()) >= 0;
++}
++
++const char* ClassName(DevClass c) {
++  switch (c) {
++    case DevClass::kAny:
++      return "raw event stream";
++    case DevClass::kKeyboard:
++      return "keyboard";
++    case DevClass::kMouse:
++      return "mouse";
++    case DevClass::kGamepad:
++      return "gamepad";
++    case DevClass::kAbsPointer:
++      return "absolute pointer";
++  }
++  return "?";
++}
++
++enum class Kind { kTaken, kUnwanted, kError };
++
++// An ioctl that a non-evdev node rejects means "not an input device"; any
++// other failure may pass (the device is still being set up).
++Kind Failed() {
++  return errno == ENOTTY || errno == EINVAL ? Kind::kUnwanted : Kind::kError;
++}
++
++// What a real evdev node can send. kError: the node did not answer (tried
++// again later); kUnwanted: nothing useful for Cobalt.
++Kind Classify(int fd, DevClass* cls) {
++  std::vector<unsigned long> ev, keys, rel, abs, props;
++  if (!GetBits(fd, 0, EV_MAX, &ev)) {
++    return Failed();
++  }
++  if (!Bit(ev, EV_KEY)) {
++    return Kind::kUnwanted;
++  }
++  if (!GetBits(fd, EV_KEY, KEY_MAX, &keys)) {
++    return Failed();
++  }
++  const bool has_rel = Bit(ev, EV_REL) && GetBits(fd, EV_REL, REL_MAX, &rel) &&
++                       Bit(rel, REL_X) && Bit(rel, REL_Y);
++  const bool has_abs = Bit(ev, EV_ABS) && GetBits(fd, EV_ABS, ABS_MAX, &abs) &&
++                       Bit(abs, ABS_X) && Bit(abs, ABS_Y);
++  // Touchpads say INPUT_PROP_POINTER; their absolute finger position is not
++  // a screen position.
++  props.assign(INPUT_PROP_MAX / (sizeof(unsigned long) * 8) + 1, 0);
++  const bool touchpad =
++      ioctl(fd, EVIOCGPROP(static_cast<int>(props.size() *
++                                            sizeof(unsigned long))),
++            props.data()) >= 0 &&
++      Bit(props, INPUT_PROP_POINTER);
++  const bool gamepad = Bit(keys, BTN_GAMEPAD) || Bit(keys, BTN_JOYSTICK);
++  const bool mouse = has_rel && Bit(keys, BTN_LEFT);
++  const bool tablet = has_abs && !has_rel && !touchpad &&
++                      (Bit(keys, BTN_LEFT) || Bit(keys, BTN_TOUCH));
++  const bool keyboard = Bit(keys, KEY_SPACE) || Bit(keys, KEY_ENTER) ||
++                        Bit(keys, KEY_UP) || Bit(keys, KEY_OK);
++  if (gamepad) {
++    *cls = DevClass::kGamepad;
++  } else if (mouse && keyboard) {
++    *cls = DevClass::kAny;
++  } else if (mouse) {
++    *cls = DevClass::kMouse;
++  } else if (tablet) {
++    *cls = DevClass::kAbsPointer;
++  } else if (keyboard) {
++    *cls = DevClass::kKeyboard;
++  } else {
++    return Kind::kUnwanted;
++  }
++  return Kind::kTaken;
++}
++
++void ReadAxis(int fd, int axis, AxisRange* range) {
++  struct input_absinfo info;
++  memset(&info, 0, sizeof(info));
++  if (ioctl(fd, EVIOCGABS(axis), &info) == 0 && info.maximum > info.minimum) {
++    range->min = info.minimum;
++    range->max = info.maximum;
++  }
++}
++
++}  // namespace
++
++EvdevDevices::EvdevDevices(const Config& config, LogFn log)
++    : config_(config), log_(log) {}
++
++EvdevDevices::~EvdevDevices() {
++  while (!devices_.empty()) {
++    CloseAt(devices_.size() - 1, nullptr, nullptr, nullptr);
++  }
++}
++
++bool EvdevDevices::IsOpen(const std::string& path) const {
++  for (const auto& d : devices_) {
++    if (d->path == path) {
++      return true;
++    }
++  }
++  return false;
++}
++
++EvdevDevices::Skipped* EvdevDevices::FindSkipped(const std::string& path) {
++  for (Skipped& s : skipped_) {
++    if (s.path == path) {
++      return &s;
++    }
++  }
++  return nullptr;
++}
++
++bool EvdevDevices::Skip(const std::string& path, unsigned long long inode,
++                        bool final) {
++  if (Skipped* s = FindSkipped(path)) {
++    const bool news = s->inode != inode || s->final != final;
++    s->inode = inode;
++    s->final = final;
++    return news;
++  }
++  skipped_.push_back(Skipped{path, inode, final});
++  return true;
++}
++
++void EvdevDevices::Rescan() {
++  std::set<std::string> seen;
++  for (const std::string& pattern : config_.evdev_patterns) {
++    glob_t g;
++    memset(&g, 0, sizeof(g));
++    if (glob(pattern.c_str(), GLOB_NOSORT, nullptr, &g) == 0) {
++      for (size_t i = 0; i < g.gl_pathc; ++i) {
++        const std::string path(g.gl_pathv[i]);
++        seen.insert(path);
++        struct stat st;
++        if (IsOpen(path) || stat(path.c_str(), &st) != 0) {
++          continue;
++        }
++        const Skipped* s = FindSkipped(path);
++        if (s && s->final && s->inode == st.st_ino) {
++          continue;
++        }
++        OpenOne(path);
++      }
++    }
++    globfree(&g);
++  }
++  // Forget nodes that are gone: when they come back, they get a new look.
++  skipped_.erase(std::remove_if(skipped_.begin(), skipped_.end(),
++                                [&](const Skipped& s) {
++                                  return seen.count(s.path) == 0;
++                                }),
++                 skipped_.end());
++}
++
++void EvdevDevices::OpenOne(const std::string& path) {
++  struct stat st;
++  if (stat(path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) {
++    return;  // gone again, or a folder like /dev/input/by-id
++  }
++  const bool fifo = S_ISFIFO(st.st_mode);
++  const bool regular = S_ISREG(st.st_mode);
++  // A FIFO is opened read-write so that it never signals end-of-file.
++  const int flags = (fifo ? O_RDWR : O_RDONLY) | O_NONBLOCK | O_CLOEXEC;
++  const int fd = open(path.c_str(), flags);
++  if (fd < 0) {
++    const int err = errno;
++    if (Skip(path, st.st_ino, false)) {
++      log_("input: cannot open " + path + " (tried again later): " +
++           strerror(err));
++    }
++    return;
++  }
++  std::unique_ptr<Device> d(new Device);
++  d->path = path;
++  d->fd = fd;
++  d->regular_file = regular;
++  d->inode = st.st_ino;
++  if (S_ISCHR(st.st_mode)) {
++    const Kind kind = Classify(fd, &d->state.cls);
++    if (kind != Kind::kTaken) {
++      const int err = errno;
++      close(fd);
++      const bool final = kind == Kind::kUnwanted;
++      if (Skip(path, st.st_ino, final) && !final) {
++        log_("input: " + path + " does not answer (tried again later): " +
++             strerror(err));
++      }
++      return;
++    }
++    if (d->state.cls == DevClass::kGamepad ||
++        d->state.cls == DevClass::kAbsPointer) {
++      ReadAxis(fd, ABS_X, &d->state.abs_x);
++      ReadAxis(fd, ABS_Y, &d->state.abs_y);
++    }
++    if (config_.evdev_grab && ioctl(fd, EVIOCGRAB, 1) != 0) {
++      log_("input: could not take " + path + " exclusively: " +
++           strerror(errno));
++    }
++  } else if (!fifo && !regular) {
++    close(fd);
++    if (Skip(path, st.st_ino, true)) {
++      log_("input: " + path + " is neither an evdev node, a FIFO nor a file");
++    }
++    return;
++  }
++  // Opened now: a later failure is news again.
++  skipped_.erase(std::remove_if(skipped_.begin(), skipped_.end(),
++                                [&](const Skipped& s) { return s.path == path; }),
++                 skipped_.end());
++  log_("input: opened " + path + " as " + ClassName(d->state.cls));
++  devices_.push_back(std::move(d));
++}
++
++void EvdevDevices::CloseAt(size_t index, const char* why,
++                           EvdevDecoder* decoder, std::vector<InEvent>* out) {
++  Device* d = devices_[index].get();
++  if (decoder && out) {
++    decoder->ReleaseAll(&d->state, out);
++  }
++  if (why) {
++    log_("input: closed " + d->path + " (" + why + ")");
++  }
++  close(d->fd);
++  devices_.erase(devices_.begin() + static_cast<long>(index));
++}
++
++void EvdevDevices::AddPollFds(std::vector<pollfd>* fds) const {
++  for (const auto& d : devices_) {
++    pollfd p;
++    p.fd = d->fd;
++    p.events = POLLIN;
++    p.revents = 0;
++    fds->push_back(p);
++  }
++}
++
++void EvdevDevices::ReadReady(const std::vector<pollfd>& fds,
++                             EvdevDecoder* decoder,
++                             std::vector<InEvent>* out) {
++  uint8_t buf[kInputEventSize * 64];
++  for (size_t i = 0; i < devices_.size();) {
++    Device* d = devices_[i].get();
++    short revents = 0;
++    for (const pollfd& p : fds) {
++      if (p.fd == d->fd) {
++        revents = p.revents;
++        break;
++      }
++    }
++    if (!revents) {
++      ++i;
++      continue;
++    }
++    const char* failed = nullptr;
++    // Bounded: a device that never runs dry cannot hold the loop forever.
++    for (int round = 0; round < 64; ++round) {
++      const ssize_t n = read(d->fd, buf, sizeof(buf));
++      if (n > 0) {
++        decoder->Feed(&d->state, buf, static_cast<size_t>(n), out);
++        continue;
++      }
++      if (n == 0) {
++        failed = d->regular_file ? "end of file" : "end of stream";
++      } else if (errno != EAGAIN && errno != EINTR) {
++        failed = strerror(errno);
++      }
++      break;
++    }
++    if (failed) {
++      // A test file is read once; a device that failed is opened again by
++      // Rescan only if its node is still (or again) there.
++      if (d->regular_file) {
++        Skip(d->path, d->inode, true);
++      }
++      CloseAt(i, failed, decoder, out);
++    } else {
++      ++i;
++    }
++  }
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/evdev_devices.h b/starboard/shared/bitsos/fb/evdev_devices.h
+new file mode 100644
+index 0000000..0099e02
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/evdev_devices.h
+@@ -0,0 +1,87 @@
++// BitsOS V2 Cobalt backend: the set of open input devices.
++//
++// Devices come from BITSOS_EVDEV patterns and are looked for again every few
++// seconds (a keyboard plugged in later just works; one pulled out is closed
++// on its first read error, and whatever it still held is let go). A node
++// that could not be opened (e.g. udev has not set its rights yet) is tried
++// again at every rescan. A real evdev node is sorted by what it can send
++// (keyboard, mouse, pad, tablet; others are closed again and not tried
++// again while the same node is there) and grabbed if asked. A
++// FIFO or plain file (tests) cannot answer ioctls and is read as kAny; a FIFO
++// is opened read-write so it never reports end-of-file when a writer leaves.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_EVDEV_DEVICES_H_
++#define STARBOARD_SHARED_BITSOS_FB_EVDEV_DEVICES_H_
++
++#include <poll.h>
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "starboard/shared/bitsos/fb/evdev_decoder.h"
++#include "starboard/shared/bitsos/fb/fb_config.h"
++
++namespace bitsos_fb {
++
++class EvdevDevices {
++ public:
++  // |log| receives one line per device change ("opened ... as mouse").
++  typedef void (*LogFn)(const std::string& line);
++
++  EvdevDevices(const Config& config, LogFn log);
++  EvdevDevices(const EvdevDevices&) = delete;
++  EvdevDevices& operator=(const EvdevDevices&) = delete;
++  ~EvdevDevices();
++
++  // Opens devices matching the patterns that are not open yet.
++  void Rescan();
++
++  // Appends one pollfd per open device (events = POLLIN).
++  void AddPollFds(std::vector<pollfd>* fds) const;
++
++  // Reads whatever the devices whose pollfd shows activity have, decodes it
++  // and appends the events. Devices that fail are closed.
++  void ReadReady(const std::vector<pollfd>& fds, EvdevDecoder* decoder,
++                 std::vector<InEvent>* out);
++
++  size_t size() const { return devices_.size(); }
++
++ private:
++  struct Device {
++    std::string path;
++    int fd = -1;
++    bool regular_file = false;
++    unsigned long long inode = 0;
++    DeviceState state;
++  };
++
++  // A node looked at and not taken. |final|: not wanted (or a test file
++  // already read), never retried while the same node is there; otherwise
++  // it failed to open and is retried (logged once).
++  struct Skipped {
++    std::string path;
++    unsigned long long inode;
++    bool final;
++  };
++
++  bool IsOpen(const std::string& path) const;
++  Skipped* FindSkipped(const std::string& path);
++  // Records |path|; true if this is news (worth a log line).
++  bool Skip(const std::string& path, unsigned long long inode, bool final);
++  void OpenOne(const std::string& path);
++  // Closes a device; with |decoder|, first lets go of what it holds.
++  void CloseAt(size_t index, const char* why, EvdevDecoder* decoder,
++               std::vector<InEvent>* out);
++
++  Config config_;
++  LogFn log_;
++  std::vector<std::unique_ptr<Device>> devices_;
++  // Entries go away once their path is no longer found, so a node that
++  // comes back (re-plugged) is looked at again.
++  std::vector<Skipped> skipped_;
++};
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_EVDEV_DEVICES_H_
+diff --git a/starboard/shared/bitsos/fb/fb_compositor.cc b/starboard/shared/bitsos/fb/fb_compositor.cc
+new file mode 100644
+index 0000000..8a3de88
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_compositor.cc
+@@ -0,0 +1,401 @@
++// BitsOS V2 Cobalt backend: puts UI, video and pointer on the framebuffer.
++
++#include "starboard/shared/bitsos/fb/fb_compositor.h"
++
++#include "starboard/shared/bitsos/fb/av_stats.h"
++
++#include <pthread.h>
++#include <string.h>
++
++#include <algorithm>
++#include <sstream>
++
++namespace bitsos_fb {
++namespace {
++
++constexpr std::chrono::milliseconds kRecheckInterval(500);
++
++}  // namespace
++
++FbCompositor::FbCompositor(FbDevice* fb, int win_w, int win_h,
++                           CursorMode cursor, LogFn log)
++    : fb_(fb),
++      win_w_(std::max(1, win_w)),
++      win_h_(std::max(1, win_h)),
++      cursor_mode_(cursor),
++      cursor_scale_(CursorScaleFor(fb->height())),
++      last_log_(std::chrono::steady_clock::now()),
++      log_(log),
++      last_recheck_(std::chrono::steady_clock::now()) {
++  scaler_.Init(win_w_, win_h_,
++               FitWindow(win_w_, win_h_, fb_->width(), fb_->height()));
++  ui_.assign(static_cast<size_t>(win_w_) * win_h_, 0);
++  composed_.assign(ui_.size(), 0);
++}
++
++FbCompositor::~FbCompositor() {
++  Stop();
++}
++
++void FbCompositor::Start() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (started_) {
++    return;
++  }
++  started_ = true;
++  stop_ = false;
++  // Black everywhere first (the bars around a window of another shape).
++  ClearFb(fb_->pixels(), fb_->pitch(), fb_->format(),
++          MakeRect(0, 0, fb_->width(), fb_->height()));
++  damage_ = MakeRect(0, 0, win_w_, win_h_);
++  thread_ = std::thread(&FbCompositor::Loop, this);
++}
++
++void FbCompositor::Stop() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!started_) {
++      return;
++    }
++    stop_ = true;
++  }
++  wake_.notify_all();
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++  std::lock_guard<std::mutex> lock(mutex_);
++  started_ = false;
++  idle_.notify_all();
++}
++
++void FbCompositor::DamageLocked(const Rect& src) {
++  const Rect r = Intersect(src, MakeRect(0, 0, win_w_, win_h_));
++  if (r.Empty()) {
++    return;
++  }
++  damage_ = Union(damage_, r);
++  wake_.notify_one();
++}
++
++bool FbCompositor::CursorVisibleLocked() const {
++  switch (cursor_mode_) {
++    case CursorMode::kOn:
++      return true;
++    case CursorMode::kOff:
++      return false;
++    case CursorMode::kAuto:
++      return cursor_seen_;
++  }
++  return false;
++}
++
++void FbCompositor::Present(const void* pixels, int stride, int width,
++                           int height, const Rect& damage) {
++  if (!pixels || width <= 0 || height <= 0 ||
++      static_cast<long long>(stride) < static_cast<long long>(width) * 4) {
++    return;
++  }
++  const Rect r = Intersect(
++      damage, MakeRect(0, 0, std::min(width, win_w_), std::min(height, win_h_)));
++  std::lock_guard<std::mutex> lock(mutex_);
++  ++stats_.presents;
++  if (r.Empty()) {
++    return;
++  }
++  const uint8_t* src = static_cast<const uint8_t*>(pixels);
++  for (int y = r.y; y < r.y + r.h; ++y) {
++    memcpy(&ui_[static_cast<size_t>(y) * win_w_ + r.x],
++           src + static_cast<size_t>(y) * stride + static_cast<size_t>(r.x) * 4,
++           static_cast<size_t>(r.w) * 4);
++  }
++  DamageLocked(r);
++}
++
++void FbCompositor::SetVideoBounds(uintptr_t player, int z_index,
++                                  const Rect& bounds) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  Video& v = videos_[player];
++  DamageLocked(v.bounds);
++  v.z = z_index;
++  v.bounds = bounds;
++  DamageLocked(v.bounds);
++}
++
++void FbCompositor::SetVideoFrame(uintptr_t player,
++                                 std::shared_ptr<VideoImage> image) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  Video& v = videos_[player];
++  v.image = std::move(image);
++  v.fresh = true;
++  ++stats_.video_frames;
++  DamageLocked(v.bounds);
++}
++
++void FbCompositor::RemoveVideo(uintptr_t player) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  auto it = videos_.find(player);
++  if (it == videos_.end()) {
++    return;
++  }
++  DamageLocked(it->second.bounds);
++  videos_.erase(it);
++}
++
++void FbCompositor::SetPointer(int screen_x, int screen_y, bool seen) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (screen_x == cursor_x_ && screen_y == cursor_y_ && seen == cursor_seen_) {
++    return;
++  }
++  cursor_x_ = screen_x;
++  cursor_y_ = screen_y;
++  cursor_seen_ = seen;
++  cursor_dirty_ = true;
++  wake_.notify_one();
++}
++
++void FbCompositor::WaitIdle() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  idle_.wait(lock, [this] {
++    return !started_ || stop_ ||
++           (!busy_ && damage_.Empty() && !cursor_dirty_);
++  });
++}
++
++FbCompositor::Stats FbCompositor::stats() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return stats_;
++}
++
++void FbCompositor::Loop() {
++  pthread_setname_np(pthread_self(), "bitsos_fb");
++  std::unique_lock<std::mutex> lock(mutex_);
++  while (true) {
++    // The timeout only serves the screen recheck.
++    wake_.wait_for(lock, kRecheckInterval, [this] {
++      return stop_ || !damage_.Empty() || cursor_dirty_;
++    });
++    if (stop_) {
++      break;
++    }
++    RecheckScreenLocked();
++    if (damage_.Empty() && !cursor_dirty_) {
++      continue;
++    }
++    const Rect dmg = damage_;
++    damage_ = Rect();
++    const bool cursor_moved = cursor_dirty_;
++    cursor_dirty_ = false;
++    busy_ = true;
++    std::vector<Video> videos;
++    for (auto& kv : videos_) {
++      if (kv.second.image && !Intersect(kv.second.bounds, dmg).Empty()) {
++        videos.push_back(kv.second);
++        kv.second.fresh = false;
++      }
++    }
++    std::stable_sort(videos.begin(), videos.end(),
++                     [](const Video& a, const Video& b) { return a.z < b.z; });
++    const bool want_cursor = CursorVisibleLocked();
++    const int cx = cursor_x_;
++    const int cy = cursor_y_;
++
++    // Video frames are converted and drawn without the lock: Present and the
++    // player are never held up by a conversion.
++    lock.unlock();
++    const auto t0 = std::chrono::steady_clock::now();
++    if (!dmg.Empty()) {
++      // Black first, unless a video layer covers all of it anyway.
++      bool covered = false;
++      for (const Video& v : videos) {
++        covered = covered || Intersect(v.bounds, dmg) == dmg;
++      }
++      if (!covered) {
++        Fill(composed_.data(), win_w_, dmg, 0);
++      }
++      bool drawn_all = true;
++      for (const Video& v : videos) {
++        drawn_all = DrawVideo(v, dmg) && drawn_all;
++      }
++      if (covered && !drawn_all) {
++        Fill(composed_.data(), win_w_, dmg, 0);
++        for (const Video& v : videos) {
++          DrawVideo(v, dmg);
++        }
++      }
++    }
++    lock.lock();
++    if (!dmg.Empty()) {
++      BlendUiOver(ui_.data(), win_w_, composed_.data(), win_w_, dmg);
++    }
++    ++stats_.passes;
++    lock.unlock();
++    const auto t1 = std::chrono::steady_clock::now();
++
++    const Rect old_cursor =
++        cursor_on_ ? CursorRect(cursor_on_x_, cursor_on_y_, cursor_scale_) : Rect();
++    cursor_on_ = want_cursor;
++    cursor_on_x_ = cx;
++    cursor_on_y_ = cy;
++    if (!dmg.Empty()) {
++      RenderDst(scaler_.SrcToDst(dmg));
++    }
++    if (cursor_moved) {
++      // Restore what was under the old pointer, then draw the new one.
++      if (!old_cursor.Empty()) {
++        RenderDst(old_cursor);
++      }
++      if (cursor_on_) {
++        RenderDst(CursorRect(cx, cy, cursor_scale_));
++      }
++    }
++
++    const auto t2 = std::chrono::steady_clock::now();
++    // steady_clock is CLOCK_MONOTONIC, the clock Starboard's media time
++    // notes use.
++    const int64_t shown_us = static_cast<int64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            t2.time_since_epoch())
++            .count());
++    for (const Video& v : videos) {
++      const int64_t pts = v.fresh ? v.image->timestamp() : -1;
++      if (pts >= 0) {
++        int w, h;
++        v.image->FrameSize(&w, &h);
++        AvStats::Get()->NoteShown(shown_us, pts, w, h);
++      }
++    }
++    lock.lock();
++    const auto us = [](std::chrono::steady_clock::duration d) {
++      return static_cast<uint64_t>(
++          std::chrono::duration_cast<std::chrono::microseconds>(d).count());
++    };
++    stats_.compose_us += us(t1 - t0);
++    stats_.scale_us += us(t2 - t1);
++    stats_.max_pass_us = std::max(stats_.max_pass_us, us(t2 - t0));
++    MaybeLogLocked();
++    busy_ = false;
++    if (damage_.Empty() && !cursor_dirty_) {
++      idle_.notify_all();
++    }
++  }
++  busy_ = false;
++  idle_.notify_all();
++}
++
++void FbCompositor::RecheckScreenLocked() {
++  const auto now = std::chrono::steady_clock::now();
++  if (screen_lost_ || now - last_recheck_ < kRecheckInterval) {
++    return;
++  }
++  last_recheck_ = now;
++  switch (fb_->Recheck()) {
++    case FbDevice::Change::kSame:
++      return;
++    case FbDevice::Change::kMoved:
++      // Another page is visible now: everything again, bars included.
++      ++stats_.pans;
++      ClearFb(fb_->pixels(), fb_->pitch(), fb_->format(),
++              MakeRect(0, 0, fb_->width(), fb_->height()));
++      damage_ = MakeRect(0, 0, win_w_, win_h_);
++      return;
++    case FbDevice::Change::kLost:
++      screen_lost_ = true;
++      stats_.lost = true;
++      if (log_) {
++        log_("screen mode changed while running; nothing is drawn any more");
++      }
++      return;
++  }
++}
++
++bool FbCompositor::DrawVideo(const Video& v, const Rect& dmg) {
++  const Rect clip =
++      Intersect(Intersect(v.bounds, dmg), MakeRect(0, 0, win_w_, win_h_));
++  if (clip.Empty()) {
++    return true;
++  }
++  YuvPlanes yuv;
++  if (v.image->GetYuv(&yuv) && yuv.Valid()) {
++    if (yuv.width == v.bounds.w && yuv.height == v.bounds.h) {
++      // The usual case: the frame fills its rectangle 1:1.
++      ConvertYuvRect(yuv,
++                     MakeRect(clip.x - v.bounds.x, clip.y - v.bounds.y, clip.w,
++                              clip.h),
++                     composed_.data(), win_w_, clip.x, clip.y);
++      return true;
++    }
++    if (scratch_image_ != v.image) {
++      scratch_.resize(static_cast<size_t>(yuv.width) * yuv.height);
++      ConvertYuvRect(yuv, MakeRect(0, 0, yuv.width, yuv.height),
++                     scratch_.data(), yuv.width, 0, 0);
++      scratch_image_ = v.image;
++    }
++    DrawStretched(reinterpret_cast<const uint8_t*>(scratch_.data()),
++                  yuv.width, yuv.height, yuv.width * 4, v.bounds, clip,
++                  composed_.data(), win_w_);
++    return true;
++  }
++  const uint8_t* data = nullptr;
++  int w = 0, h = 0, pitch = 0;
++  if (!v.image->Get(&data, &w, &h, &pitch)) {
++    return false;
++  }
++  DrawStretched(data, w, h, pitch, v.bounds, clip, composed_.data(), win_w_);
++  return true;
++}
++
++void FbCompositor::MaybeLogLocked() {
++  const auto now = std::chrono::steady_clock::now();
++  if (!log_ || now - last_log_ < std::chrono::seconds(10)) {
++    return;
++  }
++  const double secs =
++      std::chrono::duration<double>(now - last_log_).count();
++  const Stats& a = logged_;
++  const Stats& b = stats_;
++  const uint64_t passes = b.passes - a.passes;
++  std::ostringstream s;
++  s.setf(std::ios::fixed);
++  s.precision(1);
++  s << "screen stats: presents/s=" << (b.presents - a.presents) / secs
++    << " video_frames/s=" << (b.video_frames - a.video_frames) / secs
++    << " passes/s=" << passes / secs
++    << " screen_mpix/s=" << (b.screen_pixels - a.screen_pixels) / secs / 1e6;
++  s.precision(2);
++  s << " compose_ms=" << (passes ? (b.compose_us - a.compose_us) / 1e3 / passes : 0)
++    << " scale_ms=" << (passes ? (b.scale_us - a.scale_us) / 1e3 / passes : 0)
++    << " max_pass_ms=" << b.max_pass_us / 1e3;
++  if (b.pans) {
++    s << " pans=" << b.pans;
++  }
++  stats_.max_pass_us = 0;
++  logged_ = stats_;
++  last_log_ = now;
++  log_(s.str());
++}
++
++void FbCompositor::RenderDst(const Rect& dst) {
++  if (screen_lost_) {
++    return;
++  }
++  const Rect screen = MakeRect(0, 0, fb_->width(), fb_->height());
++  const Rect d = Intersect(dst, screen);
++  if (d.Empty()) {
++    return;
++  }
++  const Placement& p = scaler_.placement();
++  const Rect area = MakeRect(p.x, p.y, p.w, p.h);
++  if (!(Intersect(d, area) == d)) {
++    ClearFb(fb_->pixels(), fb_->pitch(), fb_->format(), d);
++  }
++  scaler_.Render(composed_.data(), win_w_, d, fb_->pixels(), fb_->pitch(),
++                 fb_->format());
++  if (cursor_on_) {
++    DrawCursor(fb_->pixels(), fb_->pitch(), fb_->format(), cursor_on_x_,
++               cursor_on_y_, cursor_scale_, d);
++  }
++  std::lock_guard<std::mutex> lock(mutex_);
++  stats_.screen_pixels += static_cast<uint64_t>(d.w) * d.h;
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/fb_compositor.h b/starboard/shared/bitsos/fb/fb_compositor.h
+new file mode 100644
+index 0000000..d6fd3e4
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_compositor.h
+@@ -0,0 +1,161 @@
++// BitsOS V2 Cobalt backend: puts UI, video and pointer on the framebuffer.
++//
++// Cobalt hands over the UI (premultiplied BGRA, the window size, with a
++// damage rectangle) from its compositor thread and video frames from the
++// player thread. Both calls only copy or store and wake this compositor's
++// own thread, which does the work for the damaged part:
++//   black -> video frames (z order, punch-out) -> UI over it
++//   -> scaled into the screen (4/3 for 1080p on 1440p) -> pointer on top.
++// No thread of Cobalt ever waits for the screen beyond one short copy.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_FB_COMPOSITOR_H_
++#define STARBOARD_SHARED_BITSOS_FB_FB_COMPOSITOR_H_
++
++#include <stdint.h>
++
++#include <chrono>
++#include <condition_variable>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "starboard/shared/bitsos/fb/fb_config.h"
++#include "starboard/shared/bitsos/fb/fb_device.h"
++#include "starboard/shared/bitsos/fb/fb_pixels.h"
++#include "starboard/shared/bitsos/fb/fb_yuv.h"
++
++namespace bitsos_fb {
++
++// One decoded video frame, read on the compositor thread. GetYuv (preferred)
++// hands out the YV12 planes; otherwise Get returns BGRA pixels (it may
++// convert on first use). Both stay valid while the object lives; false if
++// the frame cannot be shown that way.
++class VideoImage {
++ public:
++  virtual ~VideoImage() = default;
++  virtual bool GetYuv(YuvPlanes* planes) {
++    (void)planes;
++    return false;
++  }
++  virtual bool Get(const uint8_t** data, int* width, int* height,
++                   int* pitch) = 0;
++  // Presentation time in microseconds, < 0 if unknown (av_stats.h).
++  virtual int64_t timestamp() const { return -1; }
++  // The decoded frame's size (0 x 0 if unknown), for the numbers only.
++  virtual void FrameSize(int* width, int* height) const {
++    *width = 0;
++    *height = 0;
++  }
++};
++
++class FbCompositor {
++ public:
++  struct Stats {
++    uint64_t presents = 0;
++    uint64_t video_frames = 0;
++    uint64_t passes = 0;
++    uint64_t screen_pixels = 0;
++    uint64_t compose_us = 0;  // building the window image
++    uint64_t scale_us = 0;    // writing the screen
++    uint64_t max_pass_us = 0;
++    uint64_t pans = 0;   // the visible page moved and was drawn again
++    bool lost = false;   // the screen mode changed: nothing drawn any more
++  };
++  typedef void (*LogFn)(const std::string& line);
++
++  // |fb| must be open and outlive the compositor. With |log|, a line of
++  // numbers is written every 10 s while something changes.
++  FbCompositor(FbDevice* fb, int win_w, int win_h, CursorMode cursor,
++               LogFn log = nullptr);
++  FbCompositor(const FbCompositor&) = delete;
++  FbCompositor& operator=(const FbCompositor&) = delete;
++  ~FbCompositor();
++
++  void Start();
++  void Stop();
++
++  int window_w() const { return win_w_; }
++  int window_h() const { return win_h_; }
++  const Scaler& scaler() const { return scaler_; }
++
++  // dev.bitsos.Canvas Present: copies the damaged part of |pixels|.
++  void Present(const void* pixels, int stride, int width, int height,
++               const Rect& damage);
++
++  // Video layers, keyed by the player. Bounds are window pixels; an empty
++  // rectangle hides the layer. A null image removes the frame.
++  void SetVideoBounds(uintptr_t player, int z_index, const Rect& bounds);
++  void SetVideoFrame(uintptr_t player, std::shared_ptr<VideoImage> image);
++  void RemoveVideo(uintptr_t player);
++
++  // Pointer in screen pixels; |seen| = a mouse has been used.
++  void SetPointer(int screen_x, int screen_y, bool seen);
++
++  // Blocks until all handed-over work is on the screen (tests, shutdown).
++  void WaitIdle();
++
++  Stats stats();
++
++ private:
++  struct Video {
++    int z = 0;
++    Rect bounds;
++    std::shared_ptr<VideoImage> image;
++    bool fresh = false;  // |image| has not been on the screen yet
++  };
++
++  void Loop();
++  // Follows a pan of the real framebuffer (lock held).
++  void RecheckScreenLocked();
++  void RenderDst(const Rect& dst);
++  void DamageLocked(const Rect& src);
++  void MaybeLogLocked();
++  // Puts one video layer into composed_ inside |clip|; false if nothing
++  // could be drawn.
++  bool DrawVideo(const Video& v, const Rect& clip);
++  bool CursorVisibleLocked() const;
++
++  FbDevice* const fb_;
++  const int win_w_;
++  const int win_h_;
++  const CursorMode cursor_mode_;
++  const int cursor_scale_;
++  Scaler scaler_;
++
++  std::mutex mutex_;
++  std::condition_variable wake_;
++  std::condition_variable idle_;
++  bool started_ = false;
++  bool stop_ = false;
++  bool busy_ = false;
++  Rect damage_;
++  std::vector<uint32_t> ui_;
++  std::map<uintptr_t, Video> videos_;
++  int cursor_x_ = 0;
++  int cursor_y_ = 0;
++  bool cursor_seen_ = false;
++  bool cursor_dirty_ = false;
++  Stats stats_;
++  Stats logged_;  // stats_ at the last log line
++  std::chrono::steady_clock::time_point last_log_;
++  const LogFn log_;
++
++  // Compositor thread only.
++  std::vector<uint32_t> composed_;
++  // A scaled video frame converted once (tile previews).
++  std::vector<uint32_t> scratch_;
++  std::shared_ptr<VideoImage> scratch_image_;  // held: no address reuse
++  std::chrono::steady_clock::time_point last_recheck_;
++  bool screen_lost_ = false;
++  bool cursor_on_ = false;
++  int cursor_on_x_ = 0;
++  int cursor_on_y_ = 0;
++  std::thread thread_;
++};
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_FB_COMPOSITOR_H_
+diff --git a/starboard/shared/bitsos/fb/fb_config.cc b/starboard/shared/bitsos/fb/fb_config.cc
+new file mode 100644
+index 0000000..1f2c497
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_config.cc
+@@ -0,0 +1,147 @@
++// BitsOS V2 Cobalt backend: settings, read once from the environment.
++
++#include "starboard/shared/bitsos/fb/fb_config.h"
++
++#include <stdlib.h>
++
++namespace bitsos_fb {
++namespace {
++
++bool ParseSide(const std::string& s, int* out) {
++  if (s.empty() || s.size() > 5) {
++    return false;
++  }
++  int v = 0;
++  for (char c : s) {
++    if (c < '0' || c > '9') {
++      return false;
++    }
++    v = v * 10 + (c - '0');
++  }
++  if (v < 1 || v > kMaxSide) {
++    return false;
++  }
++  *out = v;
++  return true;
++}
++
++std::vector<std::string> SplitColon(const std::string& s) {
++  std::vector<std::string> parts;
++  std::string cur;
++  for (char c : s) {
++    if (c == ':') {
++      if (!cur.empty()) {
++        parts.push_back(cur);
++      }
++      cur.clear();
++    } else {
++      cur.push_back(c);
++    }
++  }
++  if (!cur.empty()) {
++    parts.push_back(cur);
++  }
++  return parts;
++}
++
++}  // namespace
++
++bool ParseSize(const std::string& s, int* w, int* h) {
++  const size_t x = s.find_first_of("xX");
++  if (x == std::string::npos) {
++    return false;
++  }
++  int a, b;
++  if (!ParseSide(s.substr(0, x), &a) || !ParseSide(s.substr(x + 1), &b)) {
++    return false;
++  }
++  *w = a;
++  *h = b;
++  return true;
++}
++
++Config ReadConfig(GetEnvFn getenv_fn) {
++  Config c;
++  auto get = [&](const char* name) -> const char* {
++    const char* v = getenv_fn(name);
++    return (v && *v) ? v : nullptr;
++  };
++  auto ignore = [&](const char* name, const char* value) {
++    c.ignored.push_back(std::string(name) + "=" + value);
++  };
++  auto flag = [&](const char* name, bool* out) {
++    if (const char* v = get(name)) {
++      const std::string s(v);
++      if (s == "1" || s == "on" || s == "yes") {
++        *out = true;
++      } else if (s == "0" || s == "off" || s == "no") {
++        *out = false;
++      } else {
++        ignore(name, v);
++      }
++    }
++  };
++
++  if (const char* v = get("BITSOS_BACKEND")) {
++    c.fb_backend = std::string(v) == "fb";
++  }
++  if (const char* v = get("BITSOS_FB")) {
++    c.fb_path = v;
++  }
++  if (const char* v = get("BITSOS_FB_FAKE")) {
++    if (ParseSize(v, &c.fake_w, &c.fake_h)) {
++      c.fb_fake = true;
++    } else {
++      ignore("BITSOS_FB_FAKE", v);
++    }
++  }
++  if (const char* v = get("BITSOS_WINDOW")) {
++    int w, h;
++    if (ParseSize(v, &w, &h) && w <= kMaxWindowW && h <= kMaxWindowH) {
++      c.window_w = w;
++      c.window_h = h;
++    } else {
++      ignore("BITSOS_WINDOW", v);
++    }
++  }
++  if (c.fb_fake) {
++    // A fake screen means a test: real input devices only when named.
++    c.evdev_patterns.clear();
++    c.evdev_grab = false;
++  }
++  if (const char* v = get("BITSOS_EVDEV")) {
++    std::vector<std::string> parts = SplitColon(v);
++    if (parts.empty()) {
++      ignore("BITSOS_EVDEV", v);
++    } else {
++      c.evdev_patterns = parts;
++    }
++  }
++  flag("BITSOS_EVDEV_GRAB", &c.evdev_grab);
++  if (const char* v = get("BITSOS_KEYMAP")) {
++    const std::string s(v);
++    if (s == "de") {
++      c.keymap = Keymap::kDe;
++    } else if (s == "us") {
++      c.keymap = Keymap::kUs;
++    } else {
++      ignore("BITSOS_KEYMAP", v);
++    }
++  }
++  if (const char* v = get("BITSOS_CURSOR")) {
++    const std::string s(v);
++    if (s == "auto") {
++      c.cursor = CursorMode::kAuto;
++    } else if (s == "on" || s == "1") {
++      c.cursor = CursorMode::kOn;
++    } else if (s == "off" || s == "0") {
++      c.cursor = CursorMode::kOff;
++    } else {
++      ignore("BITSOS_CURSOR", v);
++    }
++  }
++  flag("BITSOS_KD_GRAPHICS", &c.kd_graphics);
++  return c;
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/fb_config.h b/starboard/shared/bitsos/fb/fb_config.h
+new file mode 100644
+index 0000000..6b2b009
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_config.h
+@@ -0,0 +1,70 @@
++// BitsOS V2 Cobalt backend: settings, read once from the environment.
++//
++//   BITSOS_BACKEND      "fb" selects this backend; anything else keeps X11.
++//   BITSOS_FB           framebuffer device or fake file      (/dev/fb0)
++//   BITSOS_FB_FAKE      WxH: treat BITSOS_FB as a plain file of that size,
++//                       32-bit BGRX, no ioctls (agents' tests)   (unset)
++//   BITSOS_WINDOW       WxH of the Cobalt window, at most 1920x1080
++//                                                              (1920x1080)
++//   BITSOS_EVDEV        input devices: paths or glob patterns separated by
++//                       ':'; FIFOs and plain files are read as raw
++//                       struct input_event records    (/dev/input/event*;
++//                       with BITSOS_FB_FAKE: none, so a test run never
++//                       reads or grabs the real keyboard and mouse)
++//   BITSOS_EVDEV_GRAB   1: take real devices exclusively (EVIOCGRAB)
++//                       (then the console's Ctrl+Alt+F1.. are dead while
++//                       Cobalt runs; Ctrl+Alt+Backspace ends Cobalt)
++//                                            (1; with BITSOS_FB_FAKE: 0)
++//   BITSOS_KEYMAP       "de" (QWERTZ letters) or "us"                  (de)
++//   BITSOS_CURSOR       "auto" (after the first mouse move), "on", "off"
++//   BITSOS_KD_GRAPHICS  1: switch the controlling VT to graphics mode while
++//                       running (a real console only; restored at exit) (0)
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_FB_CONFIG_H_
++#define STARBOARD_SHARED_BITSOS_FB_FB_CONFIG_H_
++
++#include <string>
++#include <vector>
++
++namespace bitsos_fb {
++
++enum class CursorMode { kAuto, kOn, kOff };
++enum class Keymap { kDe, kUs };
++
++struct Config {
++  bool fb_backend = false;
++  std::string fb_path = "/dev/fb0";
++  bool fb_fake = false;
++  int fake_w = 0;
++  int fake_h = 0;
++  // Tests only (no environment setting): bytes per fake row (0 = width*4)
++  // and fake virtual height (0 = height), to mimic padded or paged fbdevs.
++  int fake_pitch = 0;
++  int fake_virtual_h = 0;
++  int window_w = 1920;
++  int window_h = 1080;
++  std::vector<std::string> evdev_patterns{"/dev/input/event*"};
++  bool evdev_grab = true;
++  Keymap keymap = Keymap::kDe;
++  CursorMode cursor = CursorMode::kAuto;
++  bool kd_graphics = false;
++  // Settings that were present but not understood (kept default), for the
++  // log: "BITSOS_WINDOW=abc".
++  std::vector<std::string> ignored;
++};
++
++// |getenv_fn| is getenv in the program and a fake in the tests.
++typedef const char* (*GetEnvFn)(const char* name);
++Config ReadConfig(GetEnvFn getenv_fn);
++
++// "1920x1080" -> 1920, 1080. Each side 1..16384; false otherwise.
++bool ParseSize(const std::string& s, int* w, int* h);
++
++// The largest window Cobalt is given (Y-NUMBERS: 1080p cap).
++constexpr int kMaxWindowW = 1920;
++constexpr int kMaxWindowH = 1080;
++constexpr int kMaxSide = 16384;
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_FB_CONFIG_H_
+diff --git a/starboard/shared/bitsos/fb/fb_device.cc b/starboard/shared/bitsos/fb/fb_device.cc
+new file mode 100644
+index 0000000..e7d80a9
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_device.cc
+@@ -0,0 +1,333 @@
++// BitsOS V2 Cobalt backend: the Linux framebuffer (fbdev) or a fake one.
++
++#include "starboard/shared/bitsos/fb/fb_device.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <unistd.h>
++
++#include <sstream>
++
++namespace bitsos_fb {
++namespace {
++
++std::string Errno(const char* what, const std::string& path) {
++  return std::string(what) + " " + path + ": " + strerror(errno);
++}
++
++bool SameFormat(const PixelFormat& a, const PixelFormat& b) {
++  return a.bits_per_pixel == b.bits_per_pixel &&
++         a.red_offset == b.red_offset && a.red_length == b.red_length &&
++         a.green_offset == b.green_offset &&
++         a.green_length == b.green_length &&
++         a.blue_offset == b.blue_offset && a.blue_length == b.blue_length;
++}
++
++bool InFolder(const std::string& path, const char* folder) {
++  const size_t n = strlen(folder);
++  return path.compare(0, n, folder) == 0 &&
++         (path.size() == n || path[n] == '/');
++}
++
++bool InSystemFolder(const std::string& path) {
++  return InFolder(path, "/dev") || InFolder(path, "/proc") ||
++         InFolder(path, "/sys");
++}
++
++}  // namespace
++
++bool SameMode(const FbGeometry& a, const FbGeometry& b) {
++  return a.width == b.width && a.height == b.height && a.pitch == b.pitch &&
++         SameFormat(a.format, b.format);
++}
++
++bool ValidateGeometry(const fb_var_screeninfo& var,
++                      const fb_fix_screeninfo& fix,
++                      size_t map_size,
++                      FbGeometry* out,
++                      std::string* why) {
++  if (fix.type != FB_TYPE_PACKED_PIXELS ||
++      (fix.visual != FB_VISUAL_TRUECOLOR &&
++       fix.visual != FB_VISUAL_DIRECTCOLOR)) {
++    *why = "not a packed true-colour framebuffer";
++    return false;
++  }
++  FbGeometry g;
++  g.format.bits_per_pixel = static_cast<int>(var.bits_per_pixel);
++  g.format.red_offset = static_cast<int>(var.red.offset);
++  g.format.red_length = static_cast<int>(var.red.length);
++  g.format.green_offset = static_cast<int>(var.green.offset);
++  g.format.green_length = static_cast<int>(var.green.length);
++  g.format.blue_offset = static_cast<int>(var.blue.offset);
++  g.format.blue_length = static_cast<int>(var.blue.length);
++  const char* format_why = nullptr;
++  if (var.bits_per_pixel > 32 || !g.format.Validate(&format_why)) {
++    *why = format_why ? format_why : "unsupported pixel size";
++    return false;
++  }
++  if (var.xres < 1 || var.yres < 1 || var.xres > kMaxSide ||
++      var.yres > kMaxSide) {
++    *why = "odd resolution";
++    return false;
++  }
++  // All sums in 64 bits: every field is a 32-bit value from the kernel.
++  const uint64_t bpp = static_cast<uint64_t>(g.format.BytesPerPixel());
++  const uint64_t xres = var.xres, yres = var.yres;
++  const uint64_t pitch = fix.line_length;
++  if (static_cast<uint64_t>(var.xoffset) + xres > var.xres_virtual ||
++      static_cast<uint64_t>(var.yoffset) + yres > var.yres_virtual) {
++    *why = "visible page lies outside the virtual screen";
++    return false;
++  }
++  if (pitch < xres * bpp || pitch > static_cast<uint64_t>(INT_MAX)) {
++    *why = "line length does not fit the width";
++    return false;
++  }
++  const uint64_t offset = var.yoffset * pitch + var.xoffset * bpp;
++  // The last row needs only its pixels, not the padding after them.
++  const uint64_t end = offset + (yres - 1) * pitch + xres * bpp;
++  if (end > map_size) {
++    *why = "framebuffer memory too small for the mode";
++    return false;
++  }
++  g.width = static_cast<int>(xres);
++  g.height = static_cast<int>(yres);
++  g.pitch = static_cast<int>(pitch);
++  g.offset = static_cast<size_t>(offset);
++  *out = g;
++  return true;
++}
++
++bool IsSystemPath(const std::string& path) {
++  if (InSystemFolder(path)) {
++    return true;
++  }
++  // The folder the file would be in, with links and ".." resolved.
++  const size_t slash = path.rfind('/');
++  const std::string dir = slash == std::string::npos ? "."
++                          : slash == 0              ? "/"
++                                                    : path.substr(0, slash);
++  char resolved[PATH_MAX];
++  if (!realpath(dir.c_str(), resolved)) {
++    return false;  // no such folder: opening fails anyway
++  }
++  return InSystemFolder(resolved);
++}
++
++FbDevice::~FbDevice() {
++  Close();
++}
++
++void FbDevice::Close() {
++  if (map_) {
++    munmap(map_, map_size_);
++  }
++  if (fd_ >= 0) {
++    close(fd_);
++  }
++  fd_ = -1;
++  map_ = nullptr;
++  map_size_ = 0;
++  pixels_.store(nullptr, std::memory_order_release);
++  pending_.store(0);
++  geo_ = FbGeometry();
++}
++
++bool FbDevice::Open(const Config& config, std::string* error) {
++  Close();
++  const bool ok = config.fb_fake ? OpenFake(config, error)
++                                 : OpenReal(config.fb_path, error);
++  if (!ok) {
++    Close();
++  }
++  return ok;
++}
++
++bool FbDevice::OpenReal(const std::string& path, std::string* error) {
++  fake_ = false;
++  const std::string not_fb =
++      path + " is not a framebuffer device (set BITSOS_FB_FAKE=WxH for a "
++             "plain file)";
++  // Look before opening: only a framebuffer node is ever opened read-write.
++  struct stat st;
++  if (stat(path.c_str(), &st) != 0) {
++    *error = Errno("cannot find", path);
++    return false;
++  }
++  if (!S_ISCHR(st.st_mode) || major(st.st_rdev) != kFbMajor) {
++    *error = not_fb;
++    return false;
++  }
++  fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC);
++  if (fd_ < 0) {
++    *error = Errno("cannot open", path);
++    return false;
++  }
++  struct stat st2;
++  if (fstat(fd_, &st2) != 0 || st2.st_rdev != st.st_rdev) {
++    *error = not_fb;
++    return false;
++  }
++  fb_var_screeninfo var;
++  fb_fix_screeninfo fix;
++  memset(&var, 0, sizeof(var));
++  memset(&fix, 0, sizeof(fix));
++  if (ioctl(fd_, FBIOGET_VSCREENINFO, &var) != 0) {
++    *error = Errno("FBIOGET_VSCREENINFO on", path);
++    return false;
++  }
++  if (ioctl(fd_, FBIOGET_FSCREENINFO, &fix) != 0) {
++    *error = Errno("FBIOGET_FSCREENINFO on", path);
++    return false;
++  }
++  std::string why;
++  if (!ValidateGeometry(var, fix, fix.smem_len, &geo_, &why)) {
++    *error = path + ": " + why;
++    return false;
++  }
++  map_size_ = fix.smem_len;
++  map_ = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
++  if (map_ == MAP_FAILED) {
++    map_ = nullptr;
++    *error = Errno("cannot map", path);
++    return false;
++  }
++  pixels_.store(static_cast<uint8_t*>(map_) + geo_.offset,
++                std::memory_order_release);
++  return true;
++}
++
++bool FbDevice::OpenFake(const Config& config, std::string* error) {
++  fake_ = true;
++  const std::string& path = config.fb_path;
++  // A fake is a plain file the user owns; a device node is never opened.
++  if (IsSystemPath(path)) {
++    *error = "BITSOS_FB_FAKE refuses a path in /dev, /proc or /sys: " + path;
++    return false;
++  }
++  // First look read-only (no create, no links followed): only a plain file
++  // is then opened for writing.
++  const int ro = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW |
++                                        O_CLOEXEC);
++  struct stat st;
++  memset(&st, 0, sizeof(st));
++  if (ro >= 0) {
++    const bool regular = fstat(ro, &st) == 0 && S_ISREG(st.st_mode);
++    close(ro);
++    if (!regular) {
++      *error = path + " is not a plain file";
++      return false;
++    }
++    fd_ = open(path.c_str(), O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
++  } else if (errno == ENOENT) {
++    // O_EXCL: if something appeared meanwhile, this fails instead.
++    fd_ = open(path.c_str(),
++               O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
++  } else {
++    *error = Errno("cannot open fake framebuffer", path);
++    return false;
++  }
++  if (fd_ < 0) {
++    *error = Errno("cannot open fake framebuffer", path);
++    return false;
++  }
++  struct stat st2;
++  if (fstat(fd_, &st2) != 0 || !S_ISREG(st2.st_mode) ||
++      (ro >= 0 && (st2.st_dev != st.st_dev || st2.st_ino != st.st_ino))) {
++    *error = path + " is not a plain file";
++    return false;
++  }
++  const int w = config.fake_w;
++  const int h = config.fake_h;
++  const int vh = config.fake_virtual_h > h ? config.fake_virtual_h : h;
++  const long long pitch =
++      config.fake_pitch > 0 ? config.fake_pitch : static_cast<long long>(w) * 4;
++  if (w < 1 || h < 1 || pitch < static_cast<long long>(w) * 4 ||
++      pitch > INT_MAX || vh > kMaxSide * 2) {
++    *error = "odd fake framebuffer size";
++    return false;
++  }
++  map_size_ = static_cast<size_t>(pitch) * vh;
++  if (static_cast<size_t>(st2.st_size) != map_size_ &&
++      ftruncate(fd_, static_cast<off_t>(map_size_)) != 0) {
++    *error = Errno("cannot size fake framebuffer", path);
++    return false;
++  }
++  map_ = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
++  if (map_ == MAP_FAILED) {
++    map_ = nullptr;
++    *error = Errno("cannot map", path);
++    return false;
++  }
++  geo_.width = w;
++  geo_.height = h;
++  geo_.pitch = static_cast<int>(pitch);
++  geo_.offset = 0;
++  geo_.format = PixelFormat();
++  pixels_.store(static_cast<uint8_t*>(map_), std::memory_order_release);
++  return true;
++}
++
++FbDevice::Change FbDevice::ApplyGeometry(const FbGeometry& g) {
++  if (!map_) {
++    return Change::kLost;
++  }
++  Change c = Change::kSame;
++  if (!SameMode(g, geo_) || g.offset > map_size_ ||
++      map_size_ - g.offset <
++          static_cast<size_t>(g.height - 1) * g.pitch +
++              static_cast<size_t>(g.width) * g.format.BytesPerPixel()) {
++    c = Change::kLost;
++  } else if (g.offset != geo_.offset) {
++    geo_.offset = g.offset;
++    pixels_.store(static_cast<uint8_t*>(map_) + g.offset,
++                  std::memory_order_release);
++    c = Change::kMoved;
++  }
++  if (c != Change::kSame) {
++    // kLost wins over a pan that was not reported yet.
++    int old = pending_.load();
++    while (old != static_cast<int>(Change::kLost) &&
++           !pending_.compare_exchange_weak(old, static_cast<int>(c))) {
++    }
++  }
++  return c;
++}
++
++FbDevice::Change FbDevice::Recheck() {
++  if (map_ && !fake_) {
++    fb_var_screeninfo var;
++    fb_fix_screeninfo fix;
++    memset(&var, 0, sizeof(var));
++    memset(&fix, 0, sizeof(fix));
++    FbGeometry g;
++    std::string why;
++    if (ioctl(fd_, FBIOGET_VSCREENINFO, &var) != 0 ||
++        ioctl(fd_, FBIOGET_FSCREENINFO, &fix) != 0 ||
++        !ValidateGeometry(var, fix, map_size_, &g, &why)) {
++      pending_.store(static_cast<int>(Change::kLost));
++    } else {
++      ApplyGeometry(g);
++    }
++  }
++  return static_cast<Change>(pending_.exchange(0));
++}
++
++std::string FbDevice::Describe() const {
++  std::ostringstream s;
++  s << (fake_ ? "fake" : "fbdev") << " " << geo_.width << "x" << geo_.height
++    << " bpp=" << geo_.format.bits_per_pixel << " pitch=" << geo_.pitch
++    << " page_offset=" << geo_.offset
++    << " rgb_offsets=" << geo_.format.red_offset << "/"
++    << geo_.format.green_offset << "/" << geo_.format.blue_offset;
++  return s.str();
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/fb_device.h b/starboard/shared/bitsos/fb/fb_device.h
+new file mode 100644
+index 0000000..7d8b374
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_device.h
+@@ -0,0 +1,101 @@
++// BitsOS V2 Cobalt backend: the Linux framebuffer (fbdev) or a fake one.
++//
++// Real: FBIOGET_VSCREENINFO/FBIOGET_FSCREENINFO, then mmap of the whole
++// framebuffer memory; drawing goes to the visible page (xoffset/yoffset).
++// The page is checked again from time to time (Recheck), because fbcon may
++// pan a framebuffer whose virtual height is larger than the screen. One
++// buffer only: no page flip and no vsync (that needs the V2 DP contract).
++// Fake (BITSOS_FB_FAKE=WxH): a plain file of W*H*4 bytes, 32-bit BGRX,
++// mapped shared, so a test tool can read the picture at any time.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_FB_DEVICE_H_
++#define STARBOARD_SHARED_BITSOS_FB_FB_DEVICE_H_
++
++#include <linux/fb.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <atomic>
++#include <string>
++
++#include "starboard/shared/bitsos/fb/fb_config.h"
++#include "starboard/shared/bitsos/fb/fb_pixels.h"
++
++namespace bitsos_fb {
++
++// Linux's framebuffer device major number (linux/major.h FB_MAJOR); V2's
++// fbdev must use it too.
++constexpr unsigned kFbMajor = 29;
++
++// A usable mode: the visible page inside the mapped memory.
++struct FbGeometry {
++  int width = 0;
++  int height = 0;
++  int pitch = 0;      // bytes per row (line_length; may be padded)
++  size_t offset = 0;  // first byte of the visible page in the mapping
++  PixelFormat format;
++};
++
++bool SameMode(const FbGeometry& a, const FbGeometry& b);
++
++// Checks a mode as the kernel reports it against |map_size| bytes of mapped
++// memory. False with a reason for anything that would draw outside it or
++// that the backend cannot draw. Pure, so the tests feed it made-up modes.
++bool ValidateGeometry(const fb_var_screeninfo& var,
++                      const fb_fix_screeninfo& fix,
++                      size_t map_size,
++                      FbGeometry* out,
++                      std::string* why);
++
++// True if |path| is, or resolves into, a device or kernel folder (/dev,
++// /proc, /sys); a fake framebuffer is never put there.
++bool IsSystemPath(const std::string& path);
++
++class FbDevice {
++ public:
++  enum class Change { kSame, kMoved, kLost };
++
++  FbDevice() = default;
++  FbDevice(const FbDevice&) = delete;
++  FbDevice& operator=(const FbDevice&) = delete;
++  ~FbDevice();
++
++  // False with a reason in |error| (nothing stays open then).
++  bool Open(const Config& config, std::string* error);
++  void Close();
++
++  bool is_open() const { return map_ != nullptr; }
++  bool fake() const { return fake_; }
++  int width() const { return geo_.width; }
++  int height() const { return geo_.height; }
++  int pitch() const { return geo_.pitch; }
++  const PixelFormat& format() const { return geo_.format; }
++  // First byte of the visible page.
++  uint8_t* pixels() const { return pixels_.load(std::memory_order_acquire); }
++  // One-line description for the log.
++  std::string Describe() const;
++
++  // Reads the mode again (real device; one ioctl pair). kMoved: the visible
++  // page moved (pixels() changed, everything must be drawn again). kLost:
++  // the mode changed under us (size or format); stop drawing.
++  Change Recheck();
++  // Takes |g| as the new mode; what Recheck does after reading it. Tests
++  // call it on a fake to play a pan.
++  Change ApplyGeometry(const FbGeometry& g);
++
++ private:
++  bool OpenReal(const std::string& path, std::string* error);
++  bool OpenFake(const Config& config, std::string* error);
++
++  int fd_ = -1;
++  bool fake_ = false;
++  void* map_ = nullptr;
++  size_t map_size_ = 0;
++  FbGeometry geo_;
++  std::atomic<uint8_t*> pixels_{nullptr};
++  std::atomic<int> pending_{0};  // a Change not yet reported by Recheck
++};
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_FB_DEVICE_H_
+diff --git a/starboard/shared/bitsos/fb/fb_pixels.cc b/starboard/shared/bitsos/fb/fb_pixels.cc
+new file mode 100644
+index 0000000..3c3f77a
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_pixels.cc
+@@ -0,0 +1,539 @@
++// BitsOS V2 Cobalt backend: pixel work for the framebuffer path.
++
++#include "starboard/shared/bitsos/fb/fb_pixels.h"
++
++#include <string.h>
++
++#include <algorithm>
++
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++
++namespace bitsos_fb {
++namespace {
++
++// Rectangles come from other threads and other programs; all arithmetic on
++// them is done in 64 bits so hostile values cannot overflow.
++Rect FromEdges(long long l, long long t, long long r, long long b) {
++  if (r <= l || b <= t) {
++    return Rect();
++  }
++  return MakeRect(static_cast<int>(l), static_cast<int>(t),
++                  static_cast<int>(r - l), static_cast<int>(b - t));
++}
++
++// Weighted mix of two BGRX pixels, |w| = weight of |b| in 0..256. Red and blue
++// are mixed together in one multiply: each lane stays below 2^16.
++inline uint32_t Lerp(uint32_t a, uint32_t b, uint32_t w) {
++  const uint32_t iw = 256 - w;
++  const uint32_t rb = ((a & 0xFF00FFu) * iw + (b & 0xFF00FFu) * w) >> 8;
++  const uint32_t g = ((a & 0x00FF00u) * iw + (b & 0x00FF00u) * w) >> 8;
++  return (rb & 0xFF00FFu) | (g & 0x00FF00u);
++}
++
++inline void Store(uint8_t* p, const PixelFormat& f, uint32_t bgrx) {
++  if (f.bits_per_pixel == 32) {
++    const uint32_t v = f.Pack(bgrx);
++    memcpy(p, &v, 4);
++  } else {
++    const uint16_t v = static_cast<uint16_t>(f.Pack(bgrx));
++    memcpy(p, &v, 2);
++  }
++}
++
++// out[i] = mix of a[i] and b[i], |w| = weight of b in 0..256. Same rounding
++// as Lerp, but the alpha byte is mixed too (it is ignored later).
++void LerpRows(const uint32_t* a, const uint32_t* b, uint32_t w, uint32_t* out,
++              int n) {
++  int i = 0;
++#if defined(__SSE2__)
++  const __m128i z = _mm_setzero_si128();
++  const __m128i wb = _mm_set1_epi16(static_cast<short>(w));
++  const __m128i wa = _mm_set1_epi16(static_cast<short>(256 - w));
++  for (; i + 4 <= n; i += 4) {
++    const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
++    const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
++    const __m128i lo = _mm_srli_epi16(
++        _mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(va, z), wa),
++                      _mm_mullo_epi16(_mm_unpacklo_epi8(vb, z), wb)),
++        8);
++    const __m128i hi = _mm_srli_epi16(
++        _mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(va, z), wa),
++                      _mm_mullo_epi16(_mm_unpackhi_epi8(vb, z), wb)),
++        8);
++    _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i),
++                     _mm_packus_epi16(lo, hi));
++  }
++#endif
++  for (; i < n; ++i) {
++    out[i] = Lerp(a[i], b[i], w);
++  }
++}
++
++// ui (premultiplied) over d; the result's alpha byte is 0.
++inline uint32_t BlendOne(uint32_t s, uint32_t d) {
++  const uint32_t a = s >> 24;
++  if (a == 255) {
++    return s & 0xFFFFFFu;
++  }
++  if (a == 0) {
++    // Fully transparent (the video hole): keep what is below. A colour here
++    // would break the premultiplied rule, so it is ignored.
++    return d & 0xFFFFFFu;
++  }
++  const uint32_t inv = 255 - a;
++  uint32_t rb = (d & 0xFF00FFu) * inv + 0x800080u;
++  rb = ((rb + ((rb >> 8) & 0xFF00FFu)) >> 8) & 0xFF00FFu;
++  uint32_t g = ((d >> 8) & 0xFFu) * inv + 0x80u;
++  g = ((g + (g >> 8)) >> 8) & 0xFFu;
++  // Premultiplied: each colour of |s| is <= a, so no channel overflows.
++  return ((s & 0xFFFFFFu) + (rb | (g << 8))) & 0xFFFFFFu;
++}
++
++void BuildAxis(int src, int dst, std::vector<int>* i0, std::vector<int>* i1,
++               std::vector<int>* w) {
++  i0->resize(dst);
++  i1->resize(dst);
++  w->resize(dst);
++  const double step = static_cast<double>(src) / dst;
++  for (int d = 0; d < dst; ++d) {
++    double pos = (d + 0.5) * step - 0.5;
++    if (pos < 0) {
++      pos = 0;
++    }
++    int a = static_cast<int>(pos);
++    if (a > src - 1) {
++      a = src - 1;
++    }
++    int weight = static_cast<int>((pos - a) * 256.0 + 0.5);
++    int b = a + 1;
++    if (b > src - 1) {
++      b = src - 1;
++      weight = 0;
++    }
++    if (weight >= 256) {
++      a = b;
++      weight = 0;
++    }
++    (*i0)[d] = a;
++    (*i1)[d] = weight ? b : a;
++    (*w)[d] = weight;
++  }
++}
++
++// First and last index d with i1[d] >= lo and i0[d] <= hi; false if none.
++bool AxisRange(const std::vector<int>& i0, const std::vector<int>& i1, int lo,
++               int hi, int* first, int* last) {
++  auto f = std::lower_bound(i1.begin(), i1.end(), lo);
++  auto l = std::upper_bound(i0.begin(), i0.end(), hi);
++  if (f == i1.end() || l == i0.begin()) {
++    return false;
++  }
++  *first = static_cast<int>(f - i1.begin());
++  *last = static_cast<int>(l - i0.begin()) - 1;
++  return *first <= *last;
++}
++
++const char* const kCursor[kCursorH] = {
++    "X           ", "XX          ", "X.X         ", "X..X        ",
++    "X...X       ", "X....X      ", "X.....X     ", "X......X    ",
++    "X.......X   ", "X........X  ", "X.........X ", "X......XXXXX",
++    "X...X..X    ", "X..XX..X    ", "X.X  X..X   ", "XX   X..X   ",
++    "X     X..X  ", "      X..X  ", "       XX   ",
++};
++
++}  // namespace
++
++Rect MakeRect(int x, int y, int w, int h) {
++  Rect r;
++  r.x = x;
++  r.y = y;
++  r.w = w;
++  r.h = h;
++  return r;
++}
++
++Rect Intersect(const Rect& a, const Rect& b) {
++  if (a.Empty() || b.Empty()) {
++    return Rect();
++  }
++  const long long l = std::max<long long>(a.x, b.x);
++  const long long t = std::max<long long>(a.y, b.y);
++  const long long r =
++      std::min<long long>(static_cast<long long>(a.x) + a.w,
++                          static_cast<long long>(b.x) + b.w);
++  const long long bo =
++      std::min<long long>(static_cast<long long>(a.y) + a.h,
++                          static_cast<long long>(b.y) + b.h);
++  return FromEdges(l, t, r, bo);
++}
++
++Rect Union(const Rect& a, const Rect& b) {
++  if (a.Empty()) {
++    return b.Empty() ? Rect() : b;
++  }
++  if (b.Empty()) {
++    return a;
++  }
++  const long long l = std::min<long long>(a.x, b.x);
++  const long long t = std::min<long long>(a.y, b.y);
++  const long long r =
++      std::max<long long>(static_cast<long long>(a.x) + a.w,
++                          static_cast<long long>(b.x) + b.w);
++  const long long bo =
++      std::max<long long>(static_cast<long long>(a.y) + a.h,
++                          static_cast<long long>(b.y) + b.h);
++  // Clamp to int: a union of two valid int rectangles may not fit.
++  const long long kMax = 0x3FFFFFFF;
++  return FromEdges(std::max(l, -kMax), std::max(t, -kMax), std::min(r, kMax),
++                   std::min(bo, kMax));
++}
++
++bool PixelFormat::Validate(const char** why) const {
++  const char* reason = nullptr;
++  if (bits_per_pixel != 32 && bits_per_pixel != 16) {
++    reason = "only 32 and 16 bits per pixel are supported";
++  } else {
++    const int off[3] = {red_offset, green_offset, blue_offset};
++    const int len[3] = {red_length, green_length, blue_length};
++    for (int i = 0; i < 3 && !reason; ++i) {
++      if (len[i] < 1 || len[i] > 8 || off[i] < 0 ||
++          off[i] + len[i] > bits_per_pixel) {
++        reason = "colour field outside the pixel or wider than 8 bits";
++      }
++    }
++  }
++  if (why) {
++    *why = reason;
++  }
++  return reason == nullptr;
++}
++
++bool PixelFormat::IsXrgb8888() const {
++  return bits_per_pixel == 32 && red_offset == 16 && red_length == 8 &&
++         green_offset == 8 && green_length == 8 && blue_offset == 0 &&
++         blue_length == 8;
++}
++
++uint32_t PixelFormat::Pack(uint32_t bgrx) const {
++  if (IsXrgb8888()) {
++    // The top byte is opaque in case the device reads it as alpha.
++    return bgrx | 0xFF000000u;
++  }
++  const uint32_t r = (bgrx >> 16) & 0xFF;
++  const uint32_t g = (bgrx >> 8) & 0xFF;
++  const uint32_t b = bgrx & 0xFF;
++  uint32_t v = ((r >> (8 - red_length)) << red_offset) |
++               ((g >> (8 - green_length)) << green_offset) |
++               ((b >> (8 - blue_length)) << blue_offset);
++  if (bits_per_pixel == 32) {
++    // Unused bits set, as for XRGB above.
++    uint32_t used = (((1u << red_length) - 1) << red_offset) |
++                    (((1u << green_length) - 1) << green_offset) |
++                    (((1u << blue_length) - 1) << blue_offset);
++    v |= ~used & 0xFF000000u;
++  }
++  return v;
++}
++
++Placement FitWindow(int win_w, int win_h, int scr_w, int scr_h) {
++  Placement p;
++  if (win_w <= 0 || win_h <= 0 || scr_w <= 0 || scr_h <= 0) {
++    return p;
++  }
++  // Compare win_w/win_h with scr_w/scr_h without rounding.
++  const long long lhs = static_cast<long long>(scr_w) * win_h;
++  const long long rhs = static_cast<long long>(scr_h) * win_w;
++  if (lhs <= rhs) {
++    p.w = scr_w;
++    p.h = static_cast<int>(static_cast<long long>(scr_w) * win_h / win_w);
++  } else {
++    p.h = scr_h;
++    p.w = static_cast<int>(static_cast<long long>(scr_h) * win_w / win_h);
++  }
++  p.w = std::max(1, std::min(p.w, scr_w));
++  p.h = std::max(1, std::min(p.h, scr_h));
++  p.x = (scr_w - p.w) / 2;
++  p.y = (scr_h - p.h) / 2;
++  return p;
++}
++
++bool Scaler::Init(int src_w, int src_h, const Placement& placement) {
++  src_w_ = src_h_ = 0;
++  if (src_w <= 0 || src_h <= 0 || placement.w <= 0 || placement.h <= 0) {
++    return false;
++  }
++  src_w_ = src_w;
++  src_h_ = src_h;
++  placement_ = placement;
++  identity_ = src_w == placement.w && src_h == placement.h;
++  four_thirds_ = static_cast<long long>(src_w) * 4 ==
++                     static_cast<long long>(placement.w) * 3 &&
++                 src_w >= 8;
++  BuildAxis(src_w, placement.w, &x0_, &x1_, &wx_);
++  BuildAxis(src_h, placement.h, &y0_, &y1_, &wy_);
++  return true;
++}
++
++Rect Scaler::SrcToDst(const Rect& src) const {
++  const Rect s = Intersect(src, MakeRect(0, 0, src_w_, src_h_));
++  if (s.Empty()) {
++    return Rect();
++  }
++  int x0, x1, y0, y1;
++  if (!AxisRange(x0_, x1_, s.x, s.x + s.w - 1, &x0, &x1) ||
++      !AxisRange(y0_, y1_, s.y, s.y + s.h - 1, &y0, &y1)) {
++    return Rect();
++  }
++  return MakeRect(placement_.x + x0, placement_.y + y0, x1 - x0 + 1,
++                  y1 - y0 + 1);
++}
++
++void Scaler::DstToSrc(double dx, double dy, double* sx, double* sy) const {
++  if (src_w_ <= 0) {
++    *sx = *sy = 0;
++    return;
++  }
++  double x = (dx - placement_.x) * src_w_ / placement_.w;
++  double y = (dy - placement_.y) * src_h_ / placement_.h;
++  *sx = std::min(std::max(x, 0.0), static_cast<double>(src_w_ - 1));
++  *sy = std::min(std::max(y, 0.0), static_cast<double>(src_h_ - 1));
++}
++
++void Scaler::ScaleRow(const uint32_t* row, int from, int n, uint32_t* out,
++                      uint32_t alpha) const {
++  int d = from;
++  const int end = from + n;
++#if defined(__SSE2__)
++  if (four_thirds_) {
++    // Screen pixels 4k..4k+3 mix source pairs (3k-1,3k) .. (3k+2,3k+3)
++    // with the second one weighted 7/8, 5/8, 3/8, 1/8: two overlapping
++    // loads give all four pairs at once. Groups at the edges, where the
++    // tables clamp, go through the general loop below.
++    const __m128i z = _mm_setzero_si128();
++    const __m128i a_or = _mm_set1_epi32(static_cast<int>(alpha));
++    const __m128i wb_lo = _mm_set_epi16(160, 160, 160, 160, 224, 224, 224, 224);
++    const __m128i wa_lo = _mm_set_epi16(96, 96, 96, 96, 32, 32, 32, 32);
++    const __m128i wb_hi = _mm_set_epi16(32, 32, 32, 32, 96, 96, 96, 96);
++    const __m128i wa_hi = _mm_set_epi16(224, 224, 224, 224, 160, 160, 160, 160);
++    const int last_group = (src_w_ - 4) / 3;  // 3k + 3 <= src_w - 1
++    for (; d < end && (d % 4 != 0 || d < 4); ++d) {
++      out[d - from] = Lerp(row[x0_[d]], row[x1_[d]], wx_[d]) | alpha;
++    }
++    for (; d + 4 <= end && d / 4 <= last_group; d += 4) {
++      const int s = 3 * (d / 4);
++      const __m128i a =
++          _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + s - 1));
++      const __m128i b =
++          _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + s));
++      const __m128i lo = _mm_srli_epi16(
++          _mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(a, z), wa_lo),
++                        _mm_mullo_epi16(_mm_unpacklo_epi8(b, z), wb_lo)),
++          8);
++      const __m128i hi = _mm_srli_epi16(
++          _mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(a, z), wa_hi),
++                        _mm_mullo_epi16(_mm_unpackhi_epi8(b, z), wb_hi)),
++          8);
++      _mm_storeu_si128(reinterpret_cast<__m128i*>(out + (d - from)),
++                       _mm_or_si128(_mm_packus_epi16(lo, hi), a_or));
++    }
++  }
++#endif
++  for (; d < end; ++d) {
++    out[d - from] = Lerp(row[x0_[d]], row[x1_[d]], wx_[d]) | alpha;
++  }
++}
++
++namespace {
++
++// out[i] = in[i] | alpha.
++void CopyOr(const uint32_t* in, uint32_t* out, int n, uint32_t alpha) {
++  int i = 0;
++#if defined(__SSE2__)
++  const __m128i a = _mm_set1_epi32(static_cast<int>(alpha));
++  for (; i + 4 <= n; i += 4) {
++    _mm_storeu_si128(
++        reinterpret_cast<__m128i*>(out + i),
++        _mm_or_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i)),
++                     a));
++  }
++#endif
++  for (; i < n; ++i) {
++    out[i] = in[i] | alpha;
++  }
++}
++
++}  // namespace
++
++void Scaler::Render(const uint32_t* src,
++                    int src_stride,
++                    const Rect& dst,
++                    uint8_t* fb,
++                    int fb_pitch,
++                    const PixelFormat& format) const {
++  if (src_w_ <= 0) {
++    return;
++  }
++  const Rect area = MakeRect(placement_.x, placement_.y, placement_.w,
++                             placement_.h);
++  const Rect d = Intersect(dst, area);
++  if (d.Empty()) {
++    return;
++  }
++  const int bpp = format.BytesPerPixel();
++  // An XRGB screen is written directly; other layouts go through line_.
++  const bool xrgb = format.IsXrgb8888();
++  const uint32_t alpha = xrgb ? 0xFF000000u : 0;
++  const int rx0 = d.x - placement_.x;
++  // Source columns this rectangle reads.
++  const int c0 = identity_ ? rx0 : x0_[rx0];
++  const int c1 = identity_ ? rx0 + d.w - 1 : x1_[rx0 + d.w - 1];
++  if (!identity_ && mixed_.size() < static_cast<size_t>(src_w_)) {
++    mixed_.resize(src_w_);
++  }
++  if (!xrgb && line_.size() < static_cast<size_t>(d.w)) {
++    line_.resize(d.w);
++  }
++  for (int y = d.y; y < d.y + d.h; ++y) {
++    const int ry = y - placement_.y;
++    uint8_t* out = fb + static_cast<size_t>(y) * fb_pitch +
++                   static_cast<size_t>(d.x) * bpp;
++    uint32_t* target = xrgb ? reinterpret_cast<uint32_t*>(out) : line_.data();
++    if (identity_) {
++      CopyOr(src + static_cast<size_t>(ry) * src_stride + rx0, target, d.w,
++             alpha);
++    } else {
++      const uint32_t* row = src + static_cast<size_t>(y0_[ry]) * src_stride;
++      if (wy_[ry]) {
++        LerpRows(row + c0, src + static_cast<size_t>(y1_[ry]) * src_stride + c0,
++                 static_cast<uint32_t>(wy_[ry]), mixed_.data() + c0,
++                 c1 - c0 + 1);
++        row = mixed_.data();
++      }
++      ScaleRow(row, rx0, d.w, target, alpha);
++    }
++    if (!xrgb) {
++      for (int i = 0; i < d.w; ++i, out += bpp) {
++        Store(out, format, line_[i]);
++      }
++    }
++  }
++}
++
++void Fill(uint32_t* img, int stride, const Rect& r, uint32_t value) {
++  for (int y = r.y; y < r.y + r.h; ++y) {
++    std::fill_n(img + static_cast<size_t>(y) * stride + r.x, r.w, value);
++  }
++}
++
++void DrawStretched(const uint8_t* pic,
++                   int pic_w,
++                   int pic_h,
++                   int pic_pitch,
++                   const Rect& dst,
++                   const Rect& clip,
++                   uint32_t* img,
++                   int stride) {
++  if (!pic || pic_w <= 0 || pic_h <= 0 || pic_pitch < pic_w * 4) {
++    return;
++  }
++  const Rect c = Intersect(dst, clip);
++  if (c.Empty()) {
++    return;
++  }
++  std::vector<int> sx(c.w);
++  for (int i = 0; i < c.w; ++i) {
++    sx[i] = static_cast<int>(static_cast<long long>(c.x + i - dst.x) * pic_w /
++                             dst.w);
++  }
++  const bool same_w = pic_w == dst.w;
++  for (int y = c.y; y < c.y + c.h; ++y) {
++    const int syy = static_cast<int>(
++        static_cast<long long>(y - dst.y) * pic_h / dst.h);
++    const uint32_t* row = reinterpret_cast<const uint32_t*>(
++        pic + static_cast<size_t>(syy) * pic_pitch);
++    uint32_t* out = img + static_cast<size_t>(y) * stride + c.x;
++    if (same_w) {
++      memcpy(out, row + sx[0], static_cast<size_t>(c.w) * 4);
++    } else {
++      for (int i = 0; i < c.w; ++i) {
++        out[i] = row[sx[i]];
++      }
++    }
++  }
++}
++
++void BlendUiOver(const uint32_t* ui, int ui_stride, uint32_t* out,
++                 int out_stride, const Rect& r) {
++  for (int y = r.y; y < r.y + r.h; ++y) {
++    const uint32_t* u = ui + static_cast<size_t>(y) * ui_stride + r.x;
++    uint32_t* o = out + static_cast<size_t>(y) * out_stride + r.x;
++    int i = 0;
++#if defined(__SSE2__)
++    // Most of a frame is opaque UI or the fully transparent video hole.
++    const __m128i amask = _mm_set1_epi32(static_cast<int>(0xFF000000u));
++    const __m128i rgb = _mm_set1_epi32(0x00FFFFFF);
++    const __m128i zero = _mm_setzero_si128();
++    for (; i + 4 <= r.w; i += 4) {
++      const __m128i s =
++          _mm_loadu_si128(reinterpret_cast<const __m128i*>(u + i));
++      const __m128i a = _mm_and_si128(s, amask);
++      __m128i* p = reinterpret_cast<__m128i*>(o + i);
++      if (_mm_movemask_epi8(_mm_cmpeq_epi32(a, amask)) == 0xFFFF) {
++        _mm_storeu_si128(p, _mm_and_si128(s, rgb));
++      } else if (_mm_movemask_epi8(_mm_cmpeq_epi32(a, zero)) == 0xFFFF) {
++        _mm_storeu_si128(p, _mm_and_si128(_mm_loadu_si128(p), rgb));
++      } else {
++        for (int k = 0; k < 4; ++k) {
++          o[i + k] = BlendOne(u[i + k], o[i + k]);
++        }
++      }
++    }
++#endif
++    for (; i < r.w; ++i) {
++      o[i] = BlendOne(u[i], o[i]);
++    }
++  }
++}
++
++void ClearFb(uint8_t* fb, int fb_pitch, const PixelFormat& format,
++             const Rect& r) {
++  const int bpp = format.BytesPerPixel();
++  for (int y = r.y; y < r.y + r.h; ++y) {
++    uint8_t* out = fb + static_cast<size_t>(y) * fb_pitch +
++                   static_cast<size_t>(r.x) * bpp;
++    for (int x = 0; x < r.w; ++x, out += bpp) {
++      Store(out, format, 0);
++    }
++  }
++}
++
++int CursorScaleFor(int screen_h) {
++  return std::max(1, std::min(4, screen_h / 720));
++}
++
++Rect CursorRect(int x, int y, int scale) {
++  return MakeRect(x, y, kCursorW * scale, kCursorH * scale);
++}
++
++void DrawCursor(uint8_t* fb, int fb_pitch, const PixelFormat& format,
++                int x, int y, int scale, const Rect& clip) {
++  scale = std::max(1, scale);
++  const Rect c = Intersect(CursorRect(x, y, scale), clip);
++  const int bpp = format.BytesPerPixel();
++  for (int py = c.y; py < c.y + c.h; ++py) {
++    const char* line = kCursor[(py - y) / scale];
++    for (int px = c.x; px < c.x + c.w; ++px) {
++      const char ch = line[(px - x) / scale];
++      if (ch == ' ') {
++        continue;
++      }
++      Store(fb + static_cast<size_t>(py) * fb_pitch +
++                static_cast<size_t>(px) * bpp,
++            format, ch == 'X' ? 0x000000u : 0xFFFFFFu);
++    }
++  }
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/fb_pixels.h b/starboard/shared/bitsos/fb/fb_pixels.h
+new file mode 100644
+index 0000000..4c3ce2a
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_pixels.h
+@@ -0,0 +1,145 @@
++// BitsOS V2 Cobalt backend: pixel work for the framebuffer path.
++//
++// Plain C++17, no Starboard and no Linux headers, so the host tests build it
++// with any compiler. Pixels of the window side (UI canvas, video frames, the
++// composed frame) are 32-bit little-endian BGRA: A<<24 | R<<16 | G<<8 | B.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_FB_PIXELS_H_
++#define STARBOARD_SHARED_BITSOS_FB_FB_PIXELS_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <vector>
++
++namespace bitsos_fb {
++
++struct Rect {
++  int x = 0;
++  int y = 0;
++  int w = 0;
++  int h = 0;
++
++  bool Empty() const { return w <= 0 || h <= 0; }
++  bool operator==(const Rect& o) const {
++    return x == o.x && y == o.y && w == o.w && h == o.h;
++  }
++};
++
++Rect MakeRect(int x, int y, int w, int h);
++Rect Intersect(const Rect& a, const Rect& b);
++// Smallest rectangle holding both; an empty input is ignored.
++Rect Union(const Rect& a, const Rect& b);
++
++// How a framebuffer pixel is laid out. Only 32 bpp and 16 bpp with channel
++// fields of at most 8 bits are supported (Validate says why not).
++struct PixelFormat {
++  int bits_per_pixel = 32;
++  int red_offset = 16;
++  int red_length = 8;
++  int green_offset = 8;
++  int green_length = 8;
++  int blue_offset = 0;
++  int blue_length = 8;
++
++  bool Validate(const char** why) const;
++  bool IsXrgb8888() const;
++  int BytesPerPixel() const { return bits_per_pixel / 8; }
++  uint32_t Pack(uint32_t bgrx) const;
++};
++
++// Where the window lands on the screen: scaled to fit, aspect kept, centered.
++// 1920x1080 on 2560x1440 gives the full screen (factor 4/3).
++struct Placement {
++  int x = 0;
++  int y = 0;
++  int w = 0;
++  int h = 0;
++};
++Placement FitWindow(int win_w, int win_h, int scr_w, int scr_h);
++
++// Bilinear scaling of the composed window image onto the screen.
++class Scaler {
++ public:
++  // False (and nothing set up) for sizes <= 0 or an empty placement.
++  bool Init(int src_w, int src_h, const Placement& placement);
++
++  int src_w() const { return src_w_; }
++  int src_h() const { return src_h_; }
++  const Placement& placement() const { return placement_; }
++
++  // Screen pixels whose value depends on any source pixel in |src|.
++  Rect SrcToDst(const Rect& src) const;
++
++  // Screen coordinates -> window coordinates (for the pointer).
++  void DstToSrc(double dx, double dy, double* sx, double* sy) const;
++
++  // Writes the screen pixels of |dst| (clipped to the placement) from |src|
++  // (src_w x src_h BGRA, |src_stride| pixels per row) into |fb|. A pixel's
++  // value does not depend on |dst|, so partial updates leave no seams.
++  // Rows are mixed first, then columns; 1080p -> 1440p (exactly 4/3) uses a
++  // fixed-weight SSE2 kernel.
++  void Render(const uint32_t* src,
++              int src_stride,
++              const Rect& dst,
++              uint8_t* fb,
++              int fb_pitch,
++              const PixelFormat& format) const;
++
++ private:
++  int src_w_ = 0;
++  int src_h_ = 0;
++  Placement placement_;
++  bool identity_ = false;
++  bool four_thirds_ = false;
++  // Per destination column/row (relative to the placement): the two source
++  // indices and the weight of the second one (0..256).
++  std::vector<int> x0_, x1_, wx_;
++  std::vector<int> y0_, y1_, wy_;
++
++  // Screen columns [from, from + n) (relative to the placement) of one row;
++  // |alpha| is ORed into every result (0xFF000000 for an XRGB screen).
++  void ScaleRow(const uint32_t* row, int from, int n, uint32_t* out,
++                uint32_t alpha) const;
++
++  // Row buffers, kept between calls (Render runs on one thread only).
++  mutable std::vector<uint32_t> mixed_;
++  mutable std::vector<uint32_t> line_;
++};
++
++// Fills |r| of a BGRA image with |value|.
++void Fill(uint32_t* img, int stride, const Rect& r, uint32_t value);
++
++// Draws a BGRA picture (|pic|, pic_w x pic_h, |pic_pitch| bytes per row)
++// stretched into |dst| of the image, nearest neighbour, only inside |clip|.
++// Used for video frames, which normally arrive 1:1.
++void DrawStretched(const uint8_t* pic,
++                   int pic_w,
++                   int pic_h,
++                   int pic_pitch,
++                   const Rect& dst,
++                   const Rect& clip,
++                   uint32_t* img,
++                   int stride);
++
++// out = ui + out * (255 - ui.alpha) / 255 over |r|; |ui| is premultiplied.
++// The result's alpha byte is 0.
++void BlendUiOver(const uint32_t* ui, int ui_stride, uint32_t* out,
++                 int out_stride, const Rect& r);
++
++// Fills a rectangle of the framebuffer with black.
++void ClearFb(uint8_t* fb, int fb_pitch, const PixelFormat& format,
++             const Rect& r);
++
++// The mouse pointer, drawn by the backend (the web app draws none).
++// Hot spot is the top-left pixel; |scale| enlarges it (2 on 1440p).
++constexpr int kCursorW = 12;
++constexpr int kCursorH = 19;
++int CursorScaleFor(int screen_h);
++Rect CursorRect(int x, int y, int scale);
++void DrawCursor(uint8_t* fb, int fb_pitch, const PixelFormat& format,
++                int x, int y, int scale, const Rect& clip);
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_FB_PIXELS_H_
+diff --git a/starboard/shared/bitsos/fb/fb_yuv.cc b/starboard/shared/bitsos/fb/fb_yuv.cc
+new file mode 100644
+index 0000000..bac2659
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_yuv.cc
+@@ -0,0 +1,120 @@
++// BitsOS V2 Cobalt backend: YV12 (I420) video frames -> BGRX.
++
++#include "starboard/shared/bitsos/fb/fb_yuv.h"
++
++#include <string.h>
++
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++
++namespace bitsos_fb {
++namespace {
++
++// BT.709 limited range, as starboard's ConvertTo:
++//   r = 1.164 (y-16) + 1.793 (v-128)
++//   g = 1.164 (y-16) - 0.213 (u-128) - 0.533 (v-128)
++//   b = 1.164 (y-16) + 2.112 (u-128)
++// Each term is (x << 6) * (coefficient * 1024) >> 16, which is exactly what
++// _mm_mulhi_epi16 computes, so scalar and SSE2 agree to the bit.
++constexpr int kY = 1192;
++constexpr int kVr = 1836;
++constexpr int kUg = 218;
++constexpr int kVg = 546;
++constexpr int kUb = 2163;
++
++inline int Term(int x, int k) {
++  return (x * 64 * k) >> 16;  // x * 64: shifting a negative is undefined
++}
++
++inline uint32_t Clamp8(int v) {
++  return static_cast<uint32_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
++}
++
++}  // namespace
++
++bool YuvPlanes::Valid() const {
++  const int cw = width / 2 + (width & 1);
++  const int ch = height / 2 + (height & 1);
++  return y && u && v && width > 0 && height > 0 && y_pitch >= width &&
++         u_pitch >= cw && v_pitch >= cw && y_rows >= height && u_rows >= ch &&
++         v_rows >= ch;
++}
++
++uint32_t YuvToBgrx(int y, int u, int v) {
++  const int yc = Term(y - 16, kY);
++  const int d = u - 128;
++  const int e = v - 128;
++  const int r = yc + Term(e, kVr);
++  const int g = yc - Term(d, kUg) - Term(e, kVg);
++  const int b = yc + Term(d, kUb);
++  return (Clamp8(r) << 16) | (Clamp8(g) << 8) | Clamp8(b);
++}
++
++void ConvertYuvRect(const YuvPlanes& f, const Rect& src_in, uint32_t* out,
++                    int out_stride, int dst_x, int dst_y) {
++  if (!f.Valid()) {
++    return;
++  }
++  const Rect src = Intersect(src_in, MakeRect(0, 0, f.width, f.height));
++  if (src.Empty()) {
++    return;
++  }
++  for (int row = src.y; row < src.y + src.h; ++row) {
++    const uint8_t* yp = f.y + static_cast<size_t>(row) * f.y_pitch;
++    const uint8_t* up = f.u + static_cast<size_t>(row / 2) * f.u_pitch;
++    const uint8_t* vp = f.v + static_cast<size_t>(row / 2) * f.v_pitch;
++    uint32_t* o = out + static_cast<size_t>(dst_y + row - src.y) * out_stride +
++                  (dst_x - src.x);
++    int x = src.x;
++    const int end = src.x + src.w;
++    if (x & 1) {
++      o[x] = YuvToBgrx(yp[x], up[x / 2], vp[x / 2]);
++      ++x;
++    }
++#if defined(__SSE2__)
++    const __m128i z = _mm_setzero_si128();
++    const __m128i k16 = _mm_set1_epi16(16);
++    const __m128i k128 = _mm_set1_epi16(128);
++    const __m128i ky = _mm_set1_epi16(kY);
++    const __m128i kvr = _mm_set1_epi16(kVr);
++    const __m128i kug = _mm_set1_epi16(kUg);
++    const __m128i kvg = _mm_set1_epi16(kVg);
++    const __m128i kub = _mm_set1_epi16(kUb);
++    for (; x + 8 <= end; x += 8) {
++      int u4, v4;
++      memcpy(&u4, up + x / 2, 4);
++      memcpy(&v4, vp + x / 2, 4);
++      __m128i yy = _mm_unpacklo_epi8(
++          _mm_loadl_epi64(reinterpret_cast<const __m128i*>(yp + x)), z);
++      __m128i uu = _mm_cvtsi32_si128(u4);
++      __m128i vv = _mm_cvtsi32_si128(v4);
++      uu = _mm_unpacklo_epi8(_mm_unpacklo_epi8(uu, uu), z);
++      vv = _mm_unpacklo_epi8(_mm_unpacklo_epi8(vv, vv), z);
++      yy = _mm_slli_epi16(_mm_sub_epi16(yy, k16), 6);
++      uu = _mm_slli_epi16(_mm_sub_epi16(uu, k128), 6);
++      vv = _mm_slli_epi16(_mm_sub_epi16(vv, k128), 6);
++      const __m128i yc = _mm_mulhi_epi16(yy, ky);
++      const __m128i r = _mm_adds_epi16(yc, _mm_mulhi_epi16(vv, kvr));
++      const __m128i g = _mm_subs_epi16(
++          _mm_subs_epi16(yc, _mm_mulhi_epi16(uu, kug)),
++          _mm_mulhi_epi16(vv, kvg));
++      const __m128i b = _mm_adds_epi16(yc, _mm_mulhi_epi16(uu, kub));
++      const __m128i b8 = _mm_packus_epi16(b, b);
++      const __m128i g8 = _mm_packus_epi16(g, g);
++      const __m128i r8 = _mm_packus_epi16(r, r);
++      const __m128i bg = _mm_unpacklo_epi8(b8, g8);
++      const __m128i ra = _mm_unpacklo_epi8(r8, z);
++      _mm_storeu_si128(reinterpret_cast<__m128i*>(o + x),
++                       _mm_unpacklo_epi16(bg, ra));
++      _mm_storeu_si128(reinterpret_cast<__m128i*>(o + x + 4),
++                       _mm_unpackhi_epi16(bg, ra));
++    }
++#endif
++    for (; x < end; ++x) {
++      o[x] = YuvToBgrx(yp[x], up[x / 2], vp[x / 2]);
++    }
++  }
++}
++
++}  // namespace bitsos_fb
+diff --git a/starboard/shared/bitsos/fb/fb_yuv.h b/starboard/shared/bitsos/fb/fb_yuv.h
+new file mode 100644
+index 0000000..c29605d
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/fb_yuv.h
+@@ -0,0 +1,46 @@
++// BitsOS V2 Cobalt backend: YV12 (I420) video frames -> BGRX.
++//
++// Same colour formula as Starboard's CpuVideoFrame::ConvertTo (BT.709,
++// limited range), but without a per-frame 8 MB allocation and with SSE2, and
++// straight into the composed window image, only for the rows and columns
++// that are needed.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_FB_YUV_H_
++#define STARBOARD_SHARED_BITSOS_FB_FB_YUV_H_
++
++#include <stdint.h>
++
++#include "starboard/shared/bitsos/fb/fb_pixels.h"
++
++namespace bitsos_fb {
++
++struct YuvPlanes {
++  const uint8_t* y = nullptr;
++  const uint8_t* u = nullptr;
++  const uint8_t* v = nullptr;
++  int y_pitch = 0;
++  int u_pitch = 0;
++  int v_pitch = 0;
++  int width = 0;   // of the luma plane; chroma is half size, rounded up
++  int height = 0;
++  // Rows each plane really has (its buffer holds rows * pitch bytes).
++  int y_rows = 0;
++  int u_rows = 0;
++  int v_rows = 0;
++
++  // The planes hold every pixel of width x height (chroma: half, rounded
++  // up), so that no read can go past them.
++  bool Valid() const;
++};
++
++// Converts the frame pixels |src| (frame coordinates, clipped to the frame)
++// into |out| at (dst_x, dst_y) for the top-left of |src|.
++void ConvertYuvRect(const YuvPlanes& f, const Rect& src, uint32_t* out,
++                    int out_stride, int dst_x, int dst_y);
++
++// One pixel, scalar; the SSE2 path gives exactly the same values.
++uint32_t YuvToBgrx(int y, int u, int v);
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_FB_YUV_H_
+diff --git a/starboard/shared/bitsos/fb/media_caps.h b/starboard/shared/bitsos/fb/media_caps.h
+new file mode 100644
+index 0000000..0da4189
+--- /dev/null
++++ b/starboard/shared/bitsos/fb/media_caps.h
+@@ -0,0 +1,29 @@
++// BitsOS V2 Cobalt backend: the largest video Cobalt offers (YT-5).
++//
++// Used by starboard/linux/shared/media_is_video_supported.cc (patch 0007).
++// The window is at most 1920x1080 (scaled to the screen in software) and every
++// frame is decoded and converted on the CPU, so a larger stream costs only
++// time; YouTube picks the largest size offered. Header-only, so the patched
++// file needs no new GN dependency; host tests: host/tests/yt/media_caps_test.cc.
++
++#ifndef STARBOARD_SHARED_BITSOS_FB_MEDIA_CAPS_H_
++#define STARBOARD_SHARED_BITSOS_FB_MEDIA_CAPS_H_
++
++namespace bitsos_fb {
++
++constexpr int kMaxVideoLongSide = 1920;
++// 1088: a 1080p stream coded in 16-pixel macroblocks may report its coded
++// height. 1920 is already a multiple of 16, so the long side needs no margin.
++constexpr int kMaxVideoShortSide = 1088;
++
++// Either orientation: a 1080x1920 (vertical) stream costs what 1080p costs.
++// Sizes of 0 (not known yet) pass, as upstream's rule lets them pass.
++inline bool VideoSizeSupported(int width, int height) {
++  const int long_side = width > height ? width : height;
++  const int short_side = width > height ? height : width;
++  return long_side <= kMaxVideoLongSide && short_side <= kMaxVideoShortSide;
++}
++
++}  // namespace bitsos_fb
++
++#endif  // STARBOARD_SHARED_BITSOS_FB_MEDIA_CAPS_H_

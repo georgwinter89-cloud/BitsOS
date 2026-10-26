@@ -1,0 +1,15 @@
+ok   mmap(MAP_SHARED, PROT_WRITE) of an O_RDONLY file: EACCES
+ok   mmap(MAP_PRIVATE, PROT_READ|PROT_WRITE) of an O_RDONLY file: ok
+ok   memfd_create(MFD_ALLOW_SEALING): F_GET_SEALS 0
+ok   ftruncate 2 pages, pwrite a stamp
+ok   F_ADD_SEALS(WRITE) while a shared writable map exists: EBUSY
+ok   F_ADD_SEALS(SHRINK|GROW|WRITE) after munmap: ok, F_GET_SEALS 0xe
+ok   sealed: ftruncate smaller EPERM
+ok   sealed: ftruncate larger EPERM
+ok   sealed: pwrite EPERM
+ok   sealed: mmap(MAP_SHARED, PROT_WRITE) EPERM
+ok   sealed: a shared read-only map sees the stamp
+ok   F_ADD_SEALS(SEAL), then F_ADD_SEALS(FUTURE_WRITE): EPERM
+ok   mremap growth (MAYMOVE) of 2 to 64 pages keeps the bytes
+ok   munmap of the middle page: mincore ENOMEM there, the neighbours keep their bytes
+rules: 14 ok, 0 failed

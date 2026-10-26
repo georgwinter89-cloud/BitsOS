@@ -1,0 +1,11 @@
+# YT-4a: nplb failures on V2 in QEMU (host/tests/yt/10-nplb.sh), with the change request in plan/notes/yt-YT-4a.md.
+# Linux = YT-1's framebuffer run on CachyOS (cobalt/runs-yt/nplb-fb-fix). A failure not listed here turns the
+# scenario red; a listed test that passes is fine (when the count rises the scenario asks to raise the floor and drop it).
+# same as Linux (environment): no app/cobalt content in nplb's content (SbSystemGetLocaleIdTest.SunnyDay passes
+# since UL-6 put LANG into nplb's environment; the Linux reference run had none)
+CrashpadConfigTest.VerifyUploadCert
+# race in the test (its thread has ended: glibc ESRCH); Linux 0-14 %, V2 in QEMU most runs (passed in UL-6's run)
+PosixThreadAttrTest.SchedParam
+# same as Linux (nplb-reference-fails.txt): Cobalt's microphone_impl answers -1 for a NULL buffer where the test
+# wants 0; it runs since SN-9 gave V2 a capture device (INT-W9)
+SbMicrophoneReadTest.RainyDayAudioBufferIsNULL

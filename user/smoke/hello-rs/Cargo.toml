@@ -1,0 +1,5 @@
+[package]
+name = "hello-rs"
+version = "0.1.0"
+edition = "2024"
+description = "G0 ring-3 smoke test: Rust std startup against the wave-A stubs"

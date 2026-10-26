@@ -1,0 +1,11 @@
+# R10: BitsOS's own programs are built for x86-64-v3 (AVX2, FMA3, BMI2, ...); both the Mini-PC (Zen 4) and
+# the Gaming-PC meet it. Foreign programs (Brave, Node, Steam) come as their vendors built them.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# ring (TLS in fetch, UL-4a) compiles its C/asm with cc-rs, which looks for "x86_64-linux-musl-gcc" by default.
+# Plain clang is enough: ring's C needs only freestanding headers, and cc-rs passes the musl target to clang.
+# Not v2-cc: that needs the musl sysroot built first, which the gate's user build does not need otherwise.
+[env]
+CC_x86_64_unknown_linux_musl = "clang"
+AR_x86_64_unknown_linux_musl = "llvm-ar"

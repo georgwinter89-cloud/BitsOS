@@ -1,0 +1,6 @@
+# BR-3: what Brave met on V2 that differs from CachyOS (plan/notes/br-BR-3.md, change requests 1-6). Remove a line
+# in the same commit that lands its fix, so abi-diff turns red if the fix regresses.
+abi-br3 uevent: NW: NETLINK_KOBJECT_UEVENT is EPROTONOSUPPORT, Linux opens it and binds any of 32 groups for everyone (BR-3 CR 3)
+abi-br3probe anonname: AB+MM: PR_SET_VMA_ANON_NAME is EINVAL (decided: as Linux without CONFIG_ANON_VMA_NAME); CachyOS has it on (BR-3 CR 5)
+abi-br3probe probes: AB+NW: /proc/<pid>/clear_refs ENOENT and TCP_INFO ENOPROTOOPT; the other probes are the same (BR-3 CR 6)
+abi-br3probe env: machine: yama, cpufreq, cpu_capacity, microcode, DMI, /dev/dri ENOENT and no IPv6 route in QEMU; not a bug by itself (BR-3 open point)

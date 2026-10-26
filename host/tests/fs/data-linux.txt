@@ -1,0 +1,105 @@
+# fs-data DIR on Linux (CachyOS 6.x, a fresh directory; made by host/tests/fs/19-data-linux.sh's run). V2: 50-data.sh in /data.
+end: exit 0
+statfs: 0 bsize_pos=1 blocks_ge_bfree=1 bfree_ge_bavail=1 files_ge_ffree=1 namelen=255
+fstatfs: 0 same_type=1
+fsync dir: 0
+open excl: fd
+open excl again: EEXIST
+pwrite: 10000
+pread: 10000 same=1
+fdatasync: 0
+ftruncate 5000: 0
+size after truncate: 5000
+fallocate 0..20000: 0
+size after fallocate: 20000 tail_read=15000 zero=1 blocks_ge_40=1
+fallocate keep_size 0..65536: 0
+size after keep_size: 20000
+pwrite past 4 GiB: 3
+size big: 4294967299
+ftruncate 0: 0
+fsync: 0
+futimens: 0
+times: atime=1000000000.123456789 mtime=1100000000.987654321
+utimensat omit atime: 0
+times: atime=1000000000.123456789 mtime=1200000000.000000005
+link: 0
+nlink: 2
+unlink both: 0
+open after unlink: nlink=0 pwrite=1
+rename over: 0
+read Local State: "new"
+read Local State.tmp: ENOENT
+renameat2 noreplace: EEXIST
+renameat2 exchange: 0
+read Local State: "o"
+read other: "new"
+mkdir d1: 0
+mkdir d2: 0
+mkdir d1 again: EEXIST
+d1 mode: 700
+rename dir over non-empty dir: ENOTEMPTY
+rename file over dir: EISDIR
+rename dir over file: ENOTDIR
+rename dir into itself: EINVAL
+rmdir non-empty: ENOTEMPTY
+unlink d2/inside: 0
+rename dir over empty dir: 0
+stat d1: ENOENT
+d2 mode now: 700
+symlink: 0
+symlink again: EEXIST
+readlink: 11 "bitsos-1234"
+lstat: link=1 size=11
+stat through dangling: ENOENT
+open nofollow: ELOOP
+symlink long: 0
+readlink long into 64: 64
+unlink SingletonLock: 0
+entries: 6
+flock a ex: 0
+flock b ex nb: EAGAIN
+flock b sh nb: EAGAIN
+flock dup ex nb (same lock): 0
+flock a un: 0
+flock b sh nb: 0
+flock a sh nb: 0
+flock a ex nb (b shares): EAGAIN
+flock a ex nb (b closed): 0
+flock bad op: EINVAL
+setlk wr 0+100: 0
+setlk rd 200+10: 0
+child getlk rd 50+10: 0 WRLCK start=0 len=100 owner=1
+child getlk rd 200+10: 0 UNLCK start=200 len=10 owner=0
+child getlk wr 205+1: 0 RDLCK start=200 len=10 owner=1
+child getlk wr 300+eof: 0 UNLCK start=300 len=0 owner=0
+child setlk rd 0+10: EAGAIN
+child setlk rd 200+10: 0
+child setlk wr 500+10: 0
+parent getlk wr 500+10: 0 WRLCK start=500 len=10 owner=1
+parent setlk wr 505+1: EAGAIN
+parent setlk un 0+0: 0
+parent getlk after child exit: 0 UNLCK start=0 len=0 owner=0
+setlk bad type: EINVAL
+setlk negative start: EINVAL
+setlk wr on read-only fd: EBADF
+map ftruncate 3 pages: 0
+mmap shared: 0
+msync: 0
+pread after store: same=1
+pread page 2: 1
+pwrite page 1: 15
+map sees pwrite: 1
+map ftruncate 5 pages: 0
+mmap grown: 0 zeros=1 old=1
+private store stays private: 1
+munmap: 0
+fsync map: 0
+reopened: size=20480 same=1
+ioctl f2fs features: ENOTTY
+unlink map: 0
+mkdir many: 0
+many: made renamed unlinked errors=0
+many: names=1200 renamed=400 dots=2
+many: rmdir non-empty: ENOTEMPTY
+rmdir many: 0
+rmdir dir: 0

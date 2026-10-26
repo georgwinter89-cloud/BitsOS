@@ -1,0 +1,19 @@
+hostname
+uname-n
+BROADCAST=192.168.100.255
+NETWORK=192.168.100.0
+NETMASK=255.0.0.0
+inet 127.0.0.1/8
+lo:
+ip-route-local
+Kernel IP routing table
+arp
+netstat-listen
+Active Internet
+over-tcp
+nc 1
+wget 1
+wget: can't connect to remote host: Connection refused
+over-udp
+end
+exit 0

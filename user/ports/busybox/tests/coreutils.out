@@ -1,0 +1,86 @@
+c
+/a/b
+pwd
+y
+mkdir exists
+2
+f
+readlink-f
+realpath
+1
+hard2
+-rw-r--r--
+. .. 
+4
+x
+sym@  x: y/ 
+1000
+dat
+4096
+1577934245
+full-time
+-rw-------
+-rwxr-----
+750
+640
+640
+y
+y
+mktemp
+mktemp-d
+. ./x ./x3 
+./inst ./inst2 
+./big
+0
+5 6
+2
+dat
+big
+du-s
+fifo
+through-fifo
+fifo
+1536
+at
+0000000 \0 x
+sync
+fsync
+locked
+flock-n
+f x/ x/y/ 
+f
+x
+f
+dat
+dat
+dat
+4096
+unzip 1
+     1	dat
+dat
+xxx
+1970-01-01 00:00:00
+1614834367
+2020
+12
+/
+1000
+1000
+which
+cd
+type
+rw
+x-dir
+compare
+niced
+nohup
+usleep
+not a tty
+tty 1
+mountpoint
+1 directories, 0 files
+shred
+1 2 3 4 5 
+hostid
+end
+exit 0

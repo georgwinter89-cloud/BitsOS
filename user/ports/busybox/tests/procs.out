@@ -1,0 +1,38 @@
+pidof
+pgrep
+ps-ppid sleep
+ps-args
+D/b/sleep 30 
+proc-exe
+proc-status
+pwdx
+pmap
+proc-fd
+renice
+1
+SCHED_OTHER
+ionice
+pkill 143
+killall 143
+setsid
+timeout 130
+real
+nice 5
+TERM
+kill-l
+total used
+free-m
+load
+5
+mpstat
+iostat
+top
+lsof
+fuser
+Linux
+pid_max
+pstree
+child-term
+after
+end
+exit 0

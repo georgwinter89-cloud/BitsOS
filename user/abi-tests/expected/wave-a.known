@@ -1,0 +1,2 @@
+# Known differences of BitsOS from CachyOS in wave A: "<id>: <owning item>: <why>". Wave A must stay empty.
+a.mmap.noreserve_1tib: MM-5b: strict commit (R2, Linux vm.overcommit_memory=2) ignores MAP_NORESERVE for writable private memory, so 1 TiB is ENOMEM; CachyOS runs mode 0 (UL may change the probe to PROT_NONE and drop this line)

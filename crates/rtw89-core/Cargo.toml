@@ -1,0 +1,73 @@
+[package]
+name = "rtw89-core"
+version = "0.1.0"
+edition = "2024"
+description = "Realtek RTL8852BE driver core: Bus trait, trace bus, bring-up prefix, PCIe host interface and DMAC pre-init, frame TX and release reports, firmware and H2C/C2H, MAC init, efuse and PHY (BB/RF tables, DM init, tracking), RF calibration part 1 (RCK, DACK, RX DCK, IQK, RF channel) and part 2 (TSSI, DPK, TX power tracking), channel switch, TX power and regulatory domain, Bluetooth coexistence (WLAN only), generated tables (owner: WL)"
+publish = false
+
+
+[features]
+default = []
+# host only: the trace bus (V1's 16-byte op records to the JS fake chip) and the in-memory test bus
+std = []
+
+[dependencies]
+wifi = { path = "../wifi" }
+
+[[test]]
+name = "fake_golden"
+required-features = ["std"]
+
+[[test]]
+name = "pci_js"
+required-features = ["std"]
+
+[[test]]
+name = "pcitx_js"
+required-features = ["std"]
+
+[[test]]
+name = "pcitx_golden"
+required-features = ["std"]
+
+[[test]]
+name = "fw_js"
+required-features = ["std"]
+
+[[test]]
+name = "macinit_js"
+required-features = ["std"]
+
+[[test]]
+name = "phy_js"
+required-features = ["std"]
+
+[[test]]
+name = "rfk1_js"
+required-features = ["std"]
+
+[[test]]
+name = "rfk2_js"
+required-features = ["std"]
+
+[[test]]
+name = "chan_js"
+required-features = ["std"]
+
+[[test]]
+name = "btc_js"
+required-features = ["std"]
+
+[[test]]
+name = "txrx_js"
+required-features = ["std"]
+
+# The workspace gate runs `cargo test` without features: the host-only tests turn `std` on for themselves.
+[dev-dependencies]
+rtw89-core = { path = ".", features = ["std"] }
+wifi = { path = "../wifi", features = ["peer"] }
+# the IP side of the WLAN-as-netdev test (tests/fake_golden/net.rs); the net crate's version and features
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+  "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-icmp",
+  "socket-dhcpv4", "auto-icmp-echo-reply", "iface-neighbor-cache-count-64", "assembler-max-segment-count-8",
+] }

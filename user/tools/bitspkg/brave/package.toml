@@ -1,0 +1,38 @@
+# PK-4: Brave as a package (plan/PACKAGES.md section 7). The tree is BR-2's stick tree (stage-v2.sh) plus the
+# libraries bitspkg import adds, BR's launcher (bitsos/brave) and the package's wrapper (bitsos/run); make.sh.
+format = 1
+name = "brave"
+version = "1.97.59"
+de = "Der Browser Brave (aus CachyOS kopiert)"
+en = "The Brave browser (copied from CachyOS)"
+program = "bitsos/run"
+
+[[permission]]
+kind = "net_connect"
+proto = "tcp"
+port = 443
+why = "Webseiten (HTTPS)"
+
+[[permission]]
+kind = "net_connect"
+proto = "tcp"
+port = 80
+why = "Webseiten (HTTP)"
+
+[[permission]]
+kind = "net_connect"
+proto = "udp"
+port = 443
+why = "QUIC (HTTP/3, YouTube)"
+
+[[permission]]
+kind = "device"
+class = "audio"
+why = "Ton von Webseiten und Videos"
+
+[[permission]]
+kind = "path"
+path = "/home/georg/Downloads"
+write = true
+create = true
+why = "Heruntergeladene Dateien"

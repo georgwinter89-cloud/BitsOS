@@ -1,0 +1,175 @@
+# How `cargo xtask abi-diff` runs the programs of user/abi-tests (one line per run):
+#   <program> [arguments...] [stdin=<text>]
+# Words are separated by spaces; "double quotes" group, and inside them \n, \t, \" and \\ work.
+# A program without a line runs once with no arguments and empty stdin. Environment on both sides:
+# PATH=/bin HOME=/ ABI_TEST=1; working directory /.
+abi-ids
+abi-signals
+abi-time
+abi-poll stdin="x\n"
+abi-ioctl
+abi-ends exit0
+abi-ends exit7
+abi-ends exit_group300
+abi-ends abort
+abi-ends raise-blocked
+abi-ends sigkill
+abi-ends stderr
+abi-rs-std one "two words" "" stdin="line one\nline two\n"
+abi-rs-abort
+abi-mmap shm
+abi-mmap order2
+abi-mmap private
+abi-mmap errors
+abi-mmap maps
+abi-mmap bus
+abi-mmap grow
+abi-mm5b advise
+abi-mm5b remap
+abi-mm5b shared
+abi-mm5b file
+abi-mm5b msync
+abi-mm5b reserve 256
+abi-fork
+abi-threads
+abi-rs-threads
+abi-pipeline
+abi-futex
+abi-futex pi
+abi-futex multi
+abi-futex robust-die /dev/shm/abi-futex-robust
+abi-futex robust-check /dev/shm/abi-futex-robust
+abi-pthread mutex
+abi-pthread condvar
+abi-pthread barrier
+abi-pthread many
+abi-pthread robust
+abi-pthread timed
+abi-pthread rwlock
+abi-pthread sem
+abi-sched
+abi-sched burn
+abi-sched child
+abi-pipe self
+abi-pipe sigpipe
+abi-pipe sigpipe-ign
+abi-pipe sigpipe-block
+abi-pipe eventfd
+abi-pipe atomic
+abi-pipe reopen
+abi-epoll basic
+abi-epoll modes
+abi-epoll close
+abi-epoll nested
+abi-epoll flags
+abi-epoll timeouts
+abi-epoll select
+abi-epoll poll
+abi-epoll sigwait
+abi-memfd basic
+abi-memfd wl-fork
+abi-memfd wl-socket
+abi-memfd-lazy pools
+abi-memfd-lazy blocks
+abi-memfd-lazy limit
+abi-rmap punch
+abi-rmap truncate
+abi-inotify checks
+abi-inotify dir
+abi-inotify self
+abi-inotify wait
+abi-mountflags proc
+abi-mountflags tmpfs
+abi-fsattr statfs
+abi-fsattr objects
+abi-fsattr copy
+abi-fsattr ctime
+abi-procfs "a b" c
+abi-sysfs
+abi-ab5 timerfd
+abi-ab5 prctl
+abi-ab5 misc
+abi-ab5 flock
+abi-ab5 fcntl
+abi-sigframe info
+abi-sigframe context
+abi-sigframe mask
+abi-sigframe order
+abi-sigframe altstack
+abi-sig2 signalfd
+abi-sig2 restart
+abi-sig2 suspend
+abi-sig2 timedwait
+abi-sig2 queueinfo
+abi-sig2 stopcont
+abi-sig2 itimer
+abi-sig2 fsintr
+abi-unix pair
+abi-unix names
+abi-unix listen
+abi-unix rights
+abi-unix creds
+abi-unix opts
+abi-unix mmsg
+abi-unix sigpipe
+abi-unix hostile
+abi-unix limits
+abi-unix ioctl
+abi-netlink sock
+abi-netlink msgs
+abi-netlink link
+abi-netlink ifaddrs
+abi-netlink devbind
+abi-netlink hostile
+abi-netlink ioctl
+abi-inet tcp
+abi-inet udp
+abi-inet errors
+abi-inet sigpipe
+abi-inet hostile
+abi-inet ioctl
+abi-inet tcp6
+abi-inet udp6
+abi-inet v6errors
+abi-inet v6opts
+abi-inet v6more
+abi-fdpass shm
+abi-fdpass memfd
+abi-unix iov
+# AB-8: dynamic glibc programs (PT_INTERP /lib64/ld-linux-x86-64.so.2; on V2 the harness first writes the
+# library set to /lib64 and /usr/lib over MCP). dyn-ls and dyn-cat are CachyOS's own /usr/bin/ls and cat.
+dyn-hello one "two words"
+dyn-hello stack
+dyn-threads
+dyn-cat stdin="first line\nsecond line\n"
+dyn-cat /proc/self/comm
+dyn-ls -d / /dev/null /proc/self
+# AB-8 fixer: padzero, bss, private writes never reach the file, RELRO, glibc's startup calls and their errnos,
+# execve of a copy with a bad PT_INTERP (ENOENT, EACCES, cut at the first NUL, ELIBBAD, EIO).
+dyn-edges
+# UL-6: glibc's locales from /usr/lib/locale (directories made by localedef on V2, locale-archive on CachyOS):
+# the same answers either way. "env" with this environment (no LANG) is the C locale on both sides.
+dyn-locale
+dyn-locale env
+# "lang": LANG=de_DE.UTF-8 as init sets it for the console, setlocale(LC_ALL, "") must give de_DE on both sides.
+dyn-locale lang
+# AB-12: pidfds (pidfd_open, CLONE_PIDFD, pidfd_send_signal, pidfd_getfd, waitid P_PIDFD, poll/epoll, fdinfo).
+abi-pidfd
+# IN-7: ptys (ptmx, slave, job control on a pty, hangup, /dev/tty).
+abi-pty basics
+abi-pty jobs
+abi-pty hangup
+abi-pty devtty
+abi-pty peer
+abi-nplb
+# BR-3: what Brave met on V2 (plan/notes/br-BR-3.md)
+abi-br3 tasknlink
+abi-br3 siocgiw
+abi-br3 uevent
+abi-br3 procnlink
+abi-br3probe pkey
+abi-br3probe anonname
+abi-br3probe probes
+abi-br3probe env
+# GX-5a CR 4 (INT-W15): abi-fbcursor runs here without arguments only (number + /dev/null answer); its v2 mode is
+# V2-only (a private ioctl Linux answers ENOTTY for) and runs in ktest dp.fbdev.cursor.program.

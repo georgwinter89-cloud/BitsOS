@@ -1,0 +1,29 @@
+first
+second
+c.txt
+2:second
+1st
+second
+a.txt
+2
+./a.txt
+./s.txt
+./sub/c.txt
+exists
+13 regular file
+640
+2020-01-02
+a.txt
+sub/
+sub/c.txt
+second
+4096
+100
+diff 1
+same
+du
+a.txt
+link
+s.txt
+removed
+exit 0

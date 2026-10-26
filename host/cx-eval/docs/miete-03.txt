@@ -1,0 +1,7 @@
+Betriebskostenabrechnung 01.01.2024 bis 31.12.2024
+Wohnung Lindenweg 14, 3. OG links, 78 m²
+Grundsteuer 214,30 | Wasser und Abwasser 388,00 | Müllabfuhr 162,15
+Hausmeister 301,60 | Aufzug 0,00 | Gebäudeversicherung 244,50
+Heizung und Warmwasser (laut Ablesefirma) 1.043,20 | Allgemeinstrom 98,00 | Gartenpflege 40,00
+Summe 2.491,75 EUR
+Verteilung nach Wohnfläche, Heizung zu 70 Prozent nach Verbrauch.

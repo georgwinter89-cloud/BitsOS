@@ -1,0 +1,9 @@
+[package]
+name = "tpm"
+version = "0.1.0"
+edition = "2024"
+description = "TPM CRB (option) (owner: KS)"
+
+[dependencies]
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }

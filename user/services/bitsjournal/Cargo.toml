@@ -1,0 +1,20 @@
+[package]
+name = "bitsjournal"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS journal (RB-8, B6): kernel events and metrics from /dev/bitsos/events, compressed on /data/system/journal with retention, MCP tool journal"
+publish = false
+
+# settingsd: its JSON for the journal.* keys; mcpreg: the MCP tool. miniz_oxide (zlib blocks, the Adler-32 in
+# them finds a torn or damaged block): plan/spec/rust-ecosystem.md §2.5, the kernel workspace's pin =0.9.1.
+[dependencies]
+settingsd = { path = "../settingsd" }
+mcpreg = { path = "../../lib/mcpreg" }
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsjournal"
+path = "src/main.rs"

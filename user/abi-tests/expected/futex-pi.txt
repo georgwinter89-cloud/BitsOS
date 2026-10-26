@@ -1,0 +1,81 @@
+== pi
+trylock_pi = 0
+trylock_pi.owner_is_me: yes
+unlock_pi = 0
+unlock_pi.value = 0
+lock_pi = 0
+unlock_pi.again = 0
+unlock_pi.not_owner = -EPERM
+cmp_requeue_pi.same = -EINVAL
+== pi threads
+handover.lock_pi = 0
+handover.owner_is_me: yes
+handover.waiters_bit: yes
+handover.holder_trylock = 0
+handover.holder_unlock = 0
+handover.unlock_last = 0
+handover.value = 0
+trylock.contended = -EAGAIN
+trylock.contended.waiters_bit: yes
+trylock.contended.again = -EAGAIN
+trylock.holder_unlock = 0
+trylock.value = 0
+mixed.wake = -EINVAL
+mixed.cmp_requeue = -EINVAL
+mixed.wake_op = -EINVAL
+mixed.wait_on_pi_word = -EAGAIN
+mixed.unlock_not_owner = -EPERM
+mixed.holder_unlock = 0
+mixed.waiter_lock = 0
+mixed.waiter_was_owner: yes
+mixed.value = 0
+died.lock_pi = 0
+died.owner_is_me: yes
+died.owner_died_bit: yes
+died.waiters_bit: yes
+died.dier_lock = 0
+died.unlock = 0
+died.value = 0
+died_robust.lock_pi = 0
+died_robust.owner_is_me: yes
+died_robust.owner_died_bit: yes
+died_robust.waiters_bit: yes
+died_robust.dier_lock = 0
+died_robust.unlock = 0
+died_robust.value = 0
+timeout.lock_pi_realtime = -errno 110
+timeout.waiters_bit_kept: yes
+timeout.lock_pi2_monotonic = -errno 110
+timeout.lock_pi2_realtime = -errno 110
+timeout.lock_pi_past = -errno 110
+timeout.lock_pi_bad_ns = -EINVAL
+timeout.lock_pi_clock_realtime = -ENOSYS
+timeout.holder_unlock = 0
+timeout.value = 0
+deadlock.lock_pi = -errno 35
+deadlock.unlock = 0
+deadlock.other_first = 0
+deadlock.other_second = 0
+deadlock.values = 0 0
+esrch.lock_pi = -ESRCH
+esrch.waiters_set: yes
+esrch.trylock_pi = -ESRCH
+self.lock_pi = -errno 35
+self.trylock_pi = -errno 35
+owner_died.unlock = 0
+owner_died.unlock.value = 0
+owner_died.lock_pi = 0
+owner_died.lock_pi.kept: yes
+waiters_only.trylock_pi = 0
+waiters_only.value: yes
+unlock.free = -EPERM
+lock_pi.misaligned = -EINVAL
+lock_pi.null = -EFAULT
+lock_pi.kernel = -EFAULT
+unlock_pi.null = -EFAULT
+trylock_pi.kernel = -EFAULT
+lock_pi.shared = 0
+unlock_pi.shared = 0
+wait_requeue_pi.same = -EINVAL
+cmp_requeue_pi.nr_wake2 = -EINVAL
+cmp_requeue_pi.negative = -EINVAL

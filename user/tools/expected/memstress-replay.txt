@@ -1,0 +1,8 @@
+reserve 70.4 GiB in 9 ranges (PROT_NONE, MAP_NORESERVE): ok
+commit 2250 calls of 32 KiB (mprotect RW, each touched): 70 MiB
+madvise(DONTNEED) 2000 calls of 4-20 KiB: each piece reads zero after
+madvise(DONTNEED) one call of 16 MiB: zero
+madvise(18) once: ok
+shm: 200 mmaps (MAP_SHARED) of 100 /dev/shm files, writer and reader views agree, 200 munmaps
+enomem: 0
+replay: ok

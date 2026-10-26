@@ -1,0 +1,30 @@
+[package]
+name = "vfs-sys"
+version = "0.1.0"
+edition = "2024"
+description = "The file syscalls of vfs registered with syscall! on a process's memory, plus their ktests (owner: FS)"
+
+[dependencies]
+vfs = { path = "../vfs" }
+syscall = { path = "../syscall" }
+proc = { path = "../proc" }
+hal = { path = "../hal" }
+uapi = { path = "../uapi" }
+kreg = { path = "../kreg" }
+ksync = { path = "../ksync" }
+klog = { path = "../klog" }
+ktest = { path = "../ktest" }
+policy = { path = "../policy" }
+sched = { path = "../sched" }
+mm = { path = "../mm" }
+mm-core = { path = "../mm-core" }
+time = { path = "../time" }
+pci = { path = "../pci" }
+console = { path = "../console" }
+# FS-13: the MCP tool `preload` (mcp does not depend on vfs-sys).
+mcp = { path = "../mcp" }
+block = { path = "../block" }
+bootinfo = { path = "../bootinfo" }
+kexec = { path = "../kexec" }
+# NW-5 change request: read/write/readv/writev on a socket fd go to the socket layer.
+net = { path = "../net" }

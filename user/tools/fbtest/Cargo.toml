@@ -1,0 +1,8 @@
+[package]
+name = "fbtest"
+version = "0.1.0"
+edition = "2024"
+description = "fbdev patterns, panning and checks on /dev/fb0 (UL-4b)"
+
+[dependencies]
+usys = { path = "../usys" }

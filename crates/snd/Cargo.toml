@@ -1,0 +1,32 @@
+[package]
+name = "snd"
+version = "0.1.0"
+edition = "2024"
+description = "Mixer, ALSA PCM (owner: SN)"
+
+[dependencies]
+devmodel = { path = "../devmodel" }
+ksync = { path = "../ksync" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+hda = { path = "../drivers/hda" }
+usb-audio = { path = "../drivers/usb-audio" }
+usb-core = { path = "../drivers/usb-core" }
+hdacodec = { path = "../hdacodec" }
+pci = { path = "../pci" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+ktest = { path = "../ktest" }
+mm-core = { path = "../mm-core" }
+vfs = { path = "../vfs" }
+proc = { path = "../proc" }
+policy = { path = "../policy" }
+uapi = { path = "../uapi" }
+# SN-10: /sys/bitsos/snd_output and the MCP tool snd (neither depends on snd, hda or usb-audio).
+vfs-sys = { path = "../vfs-sys" }
+mcp = { path = "../mcp" }
+# SN-11: the loader's EDID (kexec::boot::edid) when the boot switch runs before the kernel handed it to hda.
+kexec = { path = "../kexec" }
+
+[dev-dependencies]
+hda = { path = "../drivers/hda", features = ["fake"] }

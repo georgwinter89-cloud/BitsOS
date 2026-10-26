@@ -1,0 +1,20 @@
+[package]
+name = "fs-ext4"
+version = "0.1.0"
+edition = "2024"
+description = "ext4 data volume (FS-8) (owner: FS)"
+
+[dependencies]
+vfs = { path = "../vfs" }
+block = { path = "../block" }
+bitsvol = { path = "../bitsvol" }
+fs-fat = { path = "../fs-fat" }
+kexec = { path = "../kexec" }
+sched = { path = "../sched" }
+devmodel = { path = "../devmodel" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ksync = { path = "../ksync" }
+ktest = { path = "../ktest" }
+uapi = { path = "../uapi" }
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }

@@ -1,0 +1,10 @@
+ok   /proc/self names this process
+ok   stat: pid, comm, state R, ppid
+ok   status: Name, Pid, PPid, Uid
+ok   cmdline: argv
+ok   meminfo: MemTotal >= MemAvailable > 0
+ok   uptime > 0
+ok   listing has this process
+ok   child listed: ppid, comm, cmdline
+ok   child gone after kill and wait
+selftest: 9 ok, 0 failed

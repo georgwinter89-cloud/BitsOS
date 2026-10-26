@@ -1,0 +1,52 @@
+# fs-memfd-lazy on Linux (CachyOS 7.2.11, unprivileged user namespaces, shmem_enabled advise), one block per mode:
+# `=== <mode>`, the end (`end: exit N` or `end: signal N`), then stdout. Checked again by
+# host/tests/fs/17-memfd-lazy-linux.sh; compared on V2 by ktests fs.memfd.lazy (pools, blocks) and fs.memfd.lazy.limit
+# (the limit block without its setup line, mode `at` on a 64-page tmpfs the kernel mounts).
+=== pools
+end: exit 0
+pool 0
+ftruncate 512 MiB: 0, st_blocks 0, size 536870912
+one page touched: 0, st_blocks 8, size 536870912
+punch from page 1 on: 0, st_blocks 8, size 536870912
+pool 1
+ftruncate 512 MiB: 0, st_blocks 0, size 536870912
+one page touched: 0, st_blocks 8, size 536870912
+punch from page 1 on: 0, st_blocks 8, size 536870912
+pool 2
+ftruncate 512 MiB: 0, st_blocks 0, size 536870912
+one page touched: 0, st_blocks 8, size 536870912
+punch from page 1 on: 0, st_blocks 8, size 536870912
+pool 3
+ftruncate 512 MiB: 0, st_blocks 0, size 536870912
+one page touched: 0, st_blocks 8, size 536870912
+punch from page 1 on: 0, st_blocks 8, size 536870912
+pools ok
+=== blocks
+end: exit 0
+ftruncate 1 MiB: 0, st_blocks 0, size 1048576
+write 4 pages: 4 pages, st_blocks 32, size 1048576
+write 1 byte at page 100: 1 bytes, st_blocks 40, size 1048576
+read a hole: 16 bytes, st_blocks 40, size 1048576
+read fault in a hole (shared): 0, st_blocks 48, size 1048576
+punch pages 0-1: 0, st_blocks 32, size 1048576
+punch inside page 2: 0, st_blocks 32, size 1048576
+fallocate 4 pages at page 300 KEEP_SIZE: 0, st_blocks 64, size 1048576
+ftruncate to the same size: 0, st_blocks 32, size 1048576
+fallocate pages 10-19: 0, st_blocks 112, size 1048576
+ftruncate 1 page: 0, st_blocks 0, size 4096
+=== limit
+end: exit 0
+setup: 64-page tmpfs
+ftruncate 1 GiB on a 64-page tmpfs: 0, st_blocks 0, size 1073741824
+ftruncate 1 MiB: 0, st_blocks 0, size 1048576
+write 80 pages: 64 pages, st_blocks 512, size 1048576
+write 1 byte at page 70: ENOSPC
+fallocate 1 page at page 70: ENOSPC
+fallocate 65 pages: ENOSPC, st_blocks 512, size 1048576
+fault past the size: signal SIGBUS
+punch pages 0-7: 0, st_blocks 448, size 1048576
+write 1 byte at page 70: 1 bytes, st_blocks 456, size 1048576
+fallocate 8 pages at page 80: ENOSPC, st_blocks 456, size 1048576
+fallocate 7 pages at page 80: 0, st_blocks 512, size 1048576
+ftruncate 0: 0, st_blocks 0, size 0
+write 64 pages again: 64 pages, st_blocks 512, size 262144

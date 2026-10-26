@@ -1,0 +1,8 @@
+[package]
+name = "uapi"
+version = "0.1.0"
+edition = "2024"
+description = "Linux ABI numbers, structs, errno, ioctl codes (owner: desk/AB)"
+
+[dependencies]
+

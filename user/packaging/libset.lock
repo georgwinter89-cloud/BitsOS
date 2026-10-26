@@ -1,0 +1,34 @@
+# UL-5: the glibc library set of the image, as the build host (CachyOS) gave it. Written by `cargo xtask initrd
+# --lock`; every image build compares its set with this file and notes what differs.
+# lib <path on V2> <size> <sha256> <package> <version> <licences, ' | ' between pacman's entries>
+# A build compares only the libraries it carries (a needed one, like libcap for AB-8's dyn-ls, may be absent);
+# V2_PKG_STRICT_LOCK=1 makes a difference an error.
+lib /usr/lib/ld-linux-x86-64.so.2 283632 2a950d46575efa0210d22440988f5a6b4507ebddc6c86d9a42e6e7ef6f01463e glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libasound.so.2 1178232 a213c78c023a4f1a404512be2d6e773ae58dd2717d1ce948b2da6f821e1bce3b alsa-lib 1.2.16.1-1.1 LGPL-2.1-or-later
+lib /usr/lib/libbrotlicommon.so.1 141264 0a5a0d15264043c6cb99d3076501d4503bafde11eaea28f353e399b4ce6b2981 brotli 1.2.0-1.1 MIT
+lib /usr/lib/libbrotlidec.so.1 59264 f747ed8ca1a29c53744f6e2b12dbd70d78838682a5914505b173c1ad50db4ca9 brotli 1.2.0-1.1 MIT
+lib /usr/lib/libbz2.so.1.0 74720 c208e149de372d9aca88f752849b33dea032b8054d1718d662666bd3bad33f8b bzip2 1.0.8-6.1 BSD
+lib /usr/lib/libc.so.6 2440544 071e34179e645b25f8a8c2e7108894dc665caa9f5f8c939cd579a75b6638bc3f glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libcap.so.2 51256 86e6c51b059d7dba0d3b2f37d34b223708ead6176047f2fa4a819c9ddf0bfd0e libcap 2.78-1.1 BSD-3-Clause OR GPL-2.0-only
+lib /usr/lib/libdl.so.2 14352 336a6874f359104ec9bef6d2f2948f11e0f079d347e986880a240f1156a42d4d glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libexpat.so.1 223176 fed5805d579adfeb84191d33c28efd6906df61581fa2c4b3b2879c3abc457d94 expat 2.9.0-1.1 MIT
+lib /usr/lib/libfcft.so.4 149504 24b8be2343614626d72904d21907d0a2f90206f9cbbfc4b074d1dc4404db62cd fcft 3.3.3-1.1 MIT
+lib /usr/lib/libffi.so.8 55528 ea7da6217398e85e0a83ae367e70cde716ec626c782d29221907b893fc43866e libffi 3.8.0-1.1 MIT
+lib /usr/lib/libfontconfig.so.1 550872 fc3a03d0f608f688bf06e4cda7c55031eb3725a375a46994de28f766f364cc04 fontconfig 2:2.18.3-2.1 HPND AND Unicode-DFS-2016
+lib /usr/lib/libfreetype.so.6 1243080 e21271fcdb58bac3a87844265f5c45c3e93d28223f949a70858abe846b11fb9a freetype2 2.15.0-1.1 FTL OR GPL-2.0-or-later
+lib /usr/lib/libgcc_s.so.1 219376 571745fb27883c763315fab54a536906064c1df6804d1a7884713dac259da68d libgcc 16.2.1+r23+gd564253eb6c8-1 GPL-3.0-or-later WITH GCC-exception-3.1 | GFDL-1.3-or-later
+lib /usr/lib/libglib-2.0.so.0 1592776 ba8385e7df96155348ddd165a202cb0140eb23bb80f7599f377251290d0e13b6 glib2 2.90.1-1.1 LGPL-2.1-or-later
+lib /usr/lib/libgraphite2.so.3 137160 70eebd2fda11b867ebff5a8e3bdf272875acdde0851d258c98b3b046b01b4fc7 graphite 1:1.3.15-1 LGPL-2.1-or-later OR MPL-2.0 OR GPL-2.0-or-later
+lib /usr/lib/libharfbuzz.so.0 1527952 ed4fdeb6e269b08a553273e3aa15984c23ac59218eedb01b191e1b08ab630251 harfbuzz 14.6.0-1.1 MIT
+lib /usr/lib/libm.so.6 1075616 58b6b82e39d59d7810d402ba4ec34359fde058204fdb7cd5a269fda256a35421 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libpcre2-8.so.0 850224 a12e07c72567e9c5bbc94320fe63afc80a1ecd5dbbf95bf992474ebdd749fd2d pcre2 10.49-1.1 BSD-2-Clause | BSD-3-Clause WITH PCRE2-exception
+lib /usr/lib/libpixman-1.so.0 1378352 6be6a7644bb89d88130d05f3fa2e1fd0ce09aa88064f069c785c856f9556ff79 pixman 0.46.4-1.1 MIT
+lib /usr/lib/libpng16.so.16 346136 778b85f05e157b6ea5d3d257c28e19c6c19273db8c34fbc2344f26cdd073efdd libpng 1.6.59-1.1 libpng-2.0
+lib /usr/lib/libpthread.so.0 14360 bcdf5c8472353bd04780314cee7d27e07594153332ac526a390d6e5b38792ee4 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/librt.so.1 14424 3a34174e94af447fab7b67e96ac7fe44ea12e6238683e3de8420ae397fdea458 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libstdc++.so.6 3312696 412e0fc561a10581aaff2d101206939a31fa12c696590d8d4a5ec3655953ffe0 libstdc++ 16.2.1+r23+gd564253eb6c8-1 GPL-3.0-or-later WITH GCC-exception-3.1 | GFDL-1.3-or-later
+lib /usr/lib/libutf8proc.so.3 366464 29bda970626617c558f57fa2df65982d998c78e5fee999d0c863aa8d7a95e978 libutf8proc 2.12.0-1.1 MIT | custom
+lib /usr/lib/libwayland-client.so.0 64264 7628f449109d3d8502d740fd3be71cf11b1b901e245fc8040728155ab55686da wayland 1.26.0-1.1 MIT
+lib /usr/lib/libwayland-cursor.so.0 31200 8fcc85be60c73c89ef375181c2d5e4d0f878c8e57b2e92434cb3bc6128b78c64 wayland 1.26.0-1.1 MIT
+lib /usr/lib/libxkbcommon.so.0 440488 f3bd4c6baa0e7ba9fbccf8446871100efe5b4677c1c0dc3063068a42dad7032d libxkbcommon 1.13.2-1.1 MIT
+lib /usr/lib/libz.so.1 223392 63e814634983bfa53890b48cb56760ca38840fbcf91f66a51222eef85eaa08b7 zlib-ng-compat 2.3.3-2 Zlib

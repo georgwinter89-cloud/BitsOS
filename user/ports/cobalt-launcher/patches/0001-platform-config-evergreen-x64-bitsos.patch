@@ -1,0 +1,35 @@
+diff --git a/cobalt/build/configs/evergreen-x64-bitsos/args.gn b/cobalt/build/configs/evergreen-x64-bitsos/args.gn
+new file mode 100644
+index 0000000000..237cf3576f
+--- /dev/null
++++ b/cobalt/build/configs/evergreen-x64-bitsos/args.gn
+@@ -0,0 +1,4 @@
++# BitsOS port: evergreen-x64 plus the software canvas (no GL for the UI).
++import("//cobalt/build/configs/evergreen-x64/args.gn")
++
++cobalt_bitsos_canvas = true
+diff --git a/cobalt/build/gn.py b/cobalt/build/gn.py
+index bf299c270b..555e9ccaf8 100755
+--- a/cobalt/build/gn.py
++++ b/cobalt/build/gn.py
+@@ -62,6 +62,7 @@ _COBALT_STARBOARD_PLATFORMS = [
+     'evergreen-arm64',
+     'evergreen-arm-hardfp-rdk',
+     'evergreen-x64',
++    'evergreen-x64-bitsos',
+     'linux-x64x11',
+     'linux-x64x11-modular',
+     'linux-x64x11-no-starboard',
+diff --git a/starboard/build/config/bitsos.gni b/starboard/build/config/bitsos.gni
+new file mode 100644
+index 0000000000..7a2a2109fc
+--- /dev/null
++++ b/starboard/build/config/bitsos.gni
+@@ -0,0 +1,7 @@
++# BitsOS port switches. Read by both toolchains: the Cobalt side (libcobalt)
++# and the Starboard side (loader_app, the Linux test platform).
++declare_args() {
++  # Software compositing into a plain pixel buffer handed to the platform
++  # through the "dev.bitsos.Canvas" extension, instead of EGL/GLES.
++  cobalt_bitsos_canvas = false
++}

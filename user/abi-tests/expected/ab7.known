@@ -1,0 +1,6 @@
+# Known differences of `abi-procfs` (AB-7a) from CachyOS's transcript ab7-procfs.txt: "<label> | <owner>: why".
+# The label is a line's text before its first ": " or " = "; the ktest ab7.procfs.program skips a differing
+# line only when its label is exactly one of these (so a known line never hides another one).
+maps [vdso] | AB-9: V2 has no vDSO yet
+# The whole case for `cargo xtask abi-diff` (only the lines above differ; the ktest checks every other line):
+abi-procfs a b c: AB-9: no vDSO yet

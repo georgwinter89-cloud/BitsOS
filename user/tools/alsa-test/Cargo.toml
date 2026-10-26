@@ -1,0 +1,7 @@
+[package]
+name = "alsa-test"
+version = "0.1.0"
+edition = "2024"
+description = "Sound test, a stub until SN-4 (UL-4b)"
+
+[dependencies]

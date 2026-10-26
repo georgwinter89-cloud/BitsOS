@@ -1,0 +1,9 @@
+[package]
+name = "ktest"
+version = "0.1.0"
+edition = "2024"
+description = "In-kernel test runner (owner: desk)"
+
+[dependencies]
+kreg = { path = "../kreg" }
+hal = { path = "../hal" }

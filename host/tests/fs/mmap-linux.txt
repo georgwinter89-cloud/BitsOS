@@ -1,0 +1,139 @@
+# fs-mmap on Linux (CachyOS 7.2.9, tmpfs /tmp and /dev/shm), one block per mode: `=== <mode>`, the end
+# (`end: exit N` or `end: signal N`), then stdout. Made from `cargo xtask abi-diff abi-mmap`'s Linux
+# transcripts; checked again by host/tests/fs/12-mmap-linux.sh; compared on V2 by ktest fs.map.programs.
+=== shm
+end: exit 0
+unlinked nlink: 0
+ftruncate 3 pages: 0
+both mapped: yes
+two places: yes
+fresh pages read zero: yes
+read through b: written through a
+pread sees: written through a
+a sees pwrite: pwrite
+size: 12288 blocks>0: yes
+a sees b's store: yes
+munmap a: 0
+b after munmap a: written through a
+close: 0
+b after close: written through a
+b still writable: W
+munmap b: 0
+munmap middle: 0
+pieces: L R file: R
+done
+=== order2
+end: exit 0
+unlinked nlink: 0
+ftruncate 3 pages: 0
+both mapped: yes
+two places: yes
+fresh pages read zero: yes
+read through b: written through a
+pread sees: written through a
+a sees pwrite: pwrite
+size: 12288 blocks>0: yes
+a sees b's store: yes
+close: 0
+a after close: written through a
+munmap b: 0
+a after munmap b: written through a X
+munmap a: 0
+munmap middle: 0
+pieces: L R file: R
+unlinked nlink: 0
+ftruncate 3 pages: 0
+both mapped: yes
+two places: yes
+fresh pages read zero: yes
+read through b: written through a
+pread sees: written through a
+a sees pwrite: pwrite
+size: 12288 blocks>0: yes
+a sees b's store: yes
+munmap b: 0
+munmap a: 0
+file after both munmaps: written through a
+close: 0
+munmap middle: 0
+pieces: L R file: R
+done
+=== private
+end: exit 0
+mapped: yes
+file after private store: f, shared map: f, private map: p
+untouched private page sees pwrite: w
+copied private page keeps its copy: f
+read into private map: 12 into the map, file still: f
+write from shared map: 2 fw
+mprotect private RO: 0
+content kept: p w
+mprotect private RW: 0
+after RW again: map q file f
+done
+=== errors
+end: exit 0
+shared write on O_RDONLY: EACCES
+shared read on O_RDONLY: mapped
+private write on O_RDONLY: mapped
+private on O_WRONLY: EACCES
+shared on O_WRONLY: EACCES
+O_PATH fd: EBADF
+closed fd: EBADF
+fd -1 without MAP_ANONYMOUS: EBADF
+fd 2^32+rw (int truncation): mapped
+directory: ENODEV
+/dev/null: ENODEV
+unaligned offset: EINVAL
+unaligned offset, bad fd: EINVAL
+length 0: EINVAL
+length 0, bad fd: EBADF
+map type 0: EINVAL
+map type 0xf: EINVAL
+SHARED_VALIDATE: mapped
+SHARED_VALIDATE|MAP_SYNC: EOPNOTSUPP
+SHARED|MAP_SYNC: mapped
+MAP_HUGETLB on a file: EINVAL
+MAP_GROWSDOWN on a file: EINVAL
+offset past MAX_LFS_FILESIZE: EOVERFLOW
+offset near the top, overflow: EOVERFLOW
+offset beyond the file (allowed): mapped
+below mmap_min_addr, MAP_FIXED: EPERM
+type 0 with offset overflow: EOVERFLOW
+mprotect RW shared on O_RDONLY: EACCES
+mprotect RX shared on O_RDONLY: 0
+mprotect RW private on O_RDONLY: 0
+private copy written: 1
+mprotect over anon + RO shared: EACCES
+anonymous part changed: 7
+msync MS_SYNC: 0
+msync MS_ASYNC: 0
+msync MS_INVALIDATE: 0
+msync 0: 0
+msync ASYNC|SYNC: EINVAL
+msync bad flag: EINVAL
+msync unaligned: EINVAL
+msync len 0: 0
+msync unaligned len: 0
+msync over a hole MS_SYNC: ENOMEM
+msync over a hole MS_ASYNC: ENOMEM
+msync hole first MS_SYNC: ENOMEM
+msync unmapped only: ENOMEM
+msync overflow: ENOMEM
+done
+=== maps
+end: exit 0
+map r--s 00000000 ... (deleted)
+map r--p 00002000 ... (deleted)
+map rw-s 00001000 ... (deleted)
+done
+=== bus
+end: signal 7
+page 0 ok: x
+=== grow
+end: exit 0
+ftruncate 3 pages: 0
+grown page through the map: g
+ftruncate back to 1 page: 0
+page 0 still: 0, pread past the end: 0
+done

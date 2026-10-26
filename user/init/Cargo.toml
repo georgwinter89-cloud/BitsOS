@@ -1,0 +1,16 @@
+[package]
+name = "init"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS V2 PID 1: mounts what the kernel did not, /etc from the DHCP view, reaps orphans, starts the console shell, never exits (UL-2)"
+
+[lib]
+name = "initlib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[dependencies]
+usys = { path = "../tools/usys" }

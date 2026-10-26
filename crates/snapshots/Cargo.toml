@@ -1,0 +1,26 @@
+[package]
+name = "snapshots"
+version = "0.1.0"
+edition = "2024"
+description = "Consistent snapshots of /data (B1, VS-2): freeze, snapshot, thaw, list, read-only snapshot mounts, /dev/bitssnap (owner: VS)"
+
+[dependencies]
+bitsvol = { path = "../bitsvol" }
+fs-ext4 = { path = "../fs-ext4" }
+vfs = { path = "../vfs" }
+block = { path = "../block" }
+devmodel = { path = "../devmodel" }
+proc = { path = "../proc" }
+policy = { path = "../policy" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+kexec = { path = "../kexec" }
+# VS-3: system_pin through the MCP registry (rb-RB-9.md decision 9) and the console commands; neither depends
+# on snapshots (no cycle).
+mcp = { path = "../mcp" }
+console = { path = "../console" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ksync = { path = "../ksync" }
+ktest = { path = "../ktest" }
+uapi = { path = "../uapi" }

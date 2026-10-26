@@ -1,0 +1,8 @@
+[package]
+name = "usys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw Linux x86-64 system calls with safe wrappers for UL's programs (init, stress, abi-tests); the only unsafe code of those programs"
+
+[lib]
+path = "src/lib.rs"

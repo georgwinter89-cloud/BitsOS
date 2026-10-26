@@ -1,0 +1,5 @@
+# Known DIFF cases of `cargo xtask abi-diff` for SC's programs (abi-futex, abi-pthread): "<case>: <owner>: <why>".
+# Only V2's side is missing; CachyOS's answers are recorded (expected/futex*.txt, the strings in sc.futex.pthread).
+# abi-diff itself does not read this file yet (desk change request in plan/notes/sc-SC-5.md); the ktests skip
+# these cases with the same reasons and fail as soon as the missing piece is there and the answer differs.
+# Pruned 20.10.2026 by AB-5: the AB-4 and SC-6 CR1 lines equal CachyOS now (abi-diff --smp 16 on lane/AB).

@@ -1,0 +1,23 @@
+[package]
+name = "console-cmds"
+version = "0.1.0"
+edition = "2024"
+description = "Monitor commands of the console that need processes: ps, run (owner: IN)"
+
+[dependencies]
+console = { path = "../console" }
+proc = { path = "../proc" }
+policy = { path = "../policy" }
+klog = { path = "../klog" }
+kreg = { path = "../kreg" }
+ktest = { path = "../ktest" }
+sched = { path = "../sched" }
+time = { path = "../time" }
+uapi = { path = "../uapi" }
+vfs = { path = "../vfs" }
+# SN-5/SN-8b (INT-W8): the `snd` monitor command.
+snd = { path = "../snd" }
+hda = { path = "../drivers/hda" }
+# IN-6: the pointer-over-a-program ktest with a real fbdev program (DP's fb0 node owner, the screen's picture).
+display = { path = "../display" }
+gopfb = { path = "../drivers/gopfb" }

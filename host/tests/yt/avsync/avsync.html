@@ -1,0 +1,58 @@
+<!doctype html>
+<!-- YT-5: A/V sync test page for Cobalt (served by host/tests/yt/20-avsync.sh or by hand).
+     Plays video.webm + audio.webm (make-clip.sh) through MSE, one SourceBuffer each, as YouTube does.
+     Cobalt's backend writes its own numbers (BITSOS_AV_STATS / BITSOS_AV_TRACE); the page only logs
+     getVideoPlaybackQuality once a second to the console (Cobalt's log) and into the title. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>avsync</title>
+<style>
+  html, body { margin: 0; background: #000; height: 100%; overflow: hidden; }
+  video { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<video id="v"></video>
+<script>
+'use strict';
+const v = document.getElementById('v');
+const log = (s) => { console.log('avsync: ' + s); document.title = 'avsync ' + s; };
+const types = { video: 'video/webm; codecs="vp9"', audio: 'audio/webm; codecs="opus"' };
+const ms = new MediaSource();
+v.src = URL.createObjectURL(ms);
+ms.addEventListener('sourceopen', async () => {
+  try {
+    const bufs = await Promise.all(['video', 'audio'].map(async (k) => {
+      if (!MediaSource.isTypeSupported(types[k])) throw new Error(k + ' type not supported');
+      const r = await fetch(k + '.webm');
+      if (!r.ok) throw new Error(k + '.webm: HTTP ' + r.status);
+      return [k, await r.arrayBuffer()];
+    }));
+    await Promise.all(bufs.map(([k, data]) => new Promise((ok, bad) => {
+      const sb = ms.addSourceBuffer(types[k]);
+      sb.addEventListener('updateend', ok, { once: true });
+      sb.addEventListener('error', () => bad(new Error(k + ' append failed')), { once: true });
+      sb.appendBuffer(data);
+    })));
+    ms.endOfStream();
+    log('appended, duration ' + ms.duration.toFixed(2));
+    await v.play();
+    log('playing');
+  } catch (e) {
+    log('error ' + e.message);
+  }
+});
+v.addEventListener('ended', () => log('ended ' + stats()));
+v.addEventListener('error', () => log('media error ' + (v.error && v.error.message)));
+function stats() {
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+  const b = [];
+  for (let i = 0; i < v.buffered.length; i++) b.push(v.buffered.start(i).toFixed(2) + '-' + v.buffered.end(i).toFixed(2));
+  return 't=' + v.currentTime.toFixed(2) + ' frames=' + q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames +
+    ' ready=' + v.readyState + ' buffered=' + (b.join(',') || 'none');
+}
+setInterval(() => { if (!v.paused) log(stats()); }, 1000);
+</script>
+</body>
+</html>

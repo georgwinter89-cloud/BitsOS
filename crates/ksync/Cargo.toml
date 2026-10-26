@@ -1,0 +1,9 @@
+[package]
+name = "ksync"
+version = "0.1.0"
+edition = "2024"
+description = "Locks, wait queues, completions (trusted base) (owner: SC)"
+
+[dependencies]
+hal = { path = "../hal" }
+

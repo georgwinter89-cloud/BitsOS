@@ -1,0 +1,47 @@
+# UL-4b tool cases: one table for CachyOS (host/tests/ul/40-tools-linux.sh) and V2 (ktest ul.tools.cases).
+# name  exit  stdout (a file in expected/, or - = not compared)  program args...
+# @D = a fresh scratch dir holding the empty regular files event0, event1, mouse0 and fb (fake devices: no case
+# opens a real /dev/input or /dev/fb0, CachyOS's are Georg's keyboard and screen).
+procs_selftest    0  procs-selftest.txt     procs --selftest
+procs_list        0  -                      procs
+procs_top         0  -                      procs --top -n 2 -d 0.2
+procs_probe       0  -                      procs --probe
+procs_help        0  -                      procs --help
+procs_usage       2  -                      procs --bogus
+procs_pid_usage   2  -                      procs -p x
+procs_pid_gone    1  -                      procs -p 2147483647
+procs_delay_big   2  -                      procs --top -n 1 -d 1e30
+evtest_help       0  -                      evtest --help
+evtest_list_fake  0  evtest-list-fake.txt   evtest --dir @D
+evtest_missing    1  -                      evtest @D/none
+evtest_null       4  -                      evtest /dev/null
+evtest_file       4  -                      evtest --describe @D/event0
+evtest_query_file 4  -                      evtest --query @D/event0 EV_KEY KEY_A
+evtest_query_args 2  -                      evtest --query @D/event0 EV_KEY
+evtest_query_type 2  -                      evtest --query @D/event0 EV_REL REL_X
+evtest_query_code 2  -                      evtest --query @D/event0 EV_KEY KEY_NONSENSE
+evtest_timeout_big 2 -                      evtest --timeout 20000000000 @D/event0
+evtest_usage      2  -                      evtest --count x
+evtest_two        2  -                      evtest @D/event0 @D/event1
+fbtest_help       0  -                      fbtest --help
+fbtest_usage      2  -                      fbtest
+fbtest_mode       2  -                      fbtest bogus
+fbtest_args       2  -                      fbtest draw 1
+fbtest_null       4  -                      fbtest --dev /dev/null info
+fbtest_file       4  -                      fbtest --dev @D/fb check
+fbtest_missing    1  -                      fbtest --dev @D/none draw 1 1
+fbtest_seconds_big 2 -                      fbtest --dev @D/fb demo --seconds 18446744073709551615
+memstress_help    0  -                      memstress --help
+memstress_usage   2  -                      memstress
+memstress_mode    2  -                      memstress bogus
+memstress_zero    2  -                      memstress touch --mb 0
+memstress_touch   0  memstress-touch.txt    memstress touch
+memstress_commit  0  memstress-commit.txt   memstress commit
+memstress_commit_mmap 0 memstress-commit-mmap.txt memstress commit --mmap
+memstress_rules   0  memstress-rules.txt    memstress rules
+memstress_mb_big  2  -                      memstress touch --mb 18446744073709551615
+memstress_sec_big 2  -                      memstress replay --seconds 18446744073709551615
+memstress_replay  0  memstress-replay.txt   memstress replay
+alsa_stub         77 alsa-test.txt          alsa-test
+alsa_help         0  -                      alsa-test --help
+bitspkg_selftest  0  -                      bitspkg selftest @D

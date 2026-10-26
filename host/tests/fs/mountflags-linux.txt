@@ -1,0 +1,37 @@
+# fs-mountflags on Linux (CachyOS 7.2.11, unprivileged user namespaces), one block per mode: `=== <mode>`, the end
+# (`end: exit N` or `end: signal N`), then stdout. Checked again by host/tests/fs/16-mountflags-linux.sh; the tmpfs
+# block (without its setup line) is compared on V2 by ktest fs.mountflags.programs (mode `at`).
+=== proc
+end: exit 0
+proc mount: rw,nosuid,nodev,noexec,relatime
+mmap R proc: ENODEV
+mmap RX proc: EPERM
+mmap RX shared proc: EPERM
+exec proc: EACCES
+access X_OK proc: EACCES
+end
+=== tmpfs
+end: exit 0
+setup: 0
+mount: rw,nosuid,nodev,noexec,relatime
+exec noexec: EACCES
+exec plain: ran
+exec script noexec: EACCES
+exec interp noexec: EACCES
+exec script plain: ran
+access X_OK noexec: EACCES
+access R_OK noexec: 0
+access X_OK plain: 0
+mmap R private: 0
+mmap RX private: EPERM
+mmap RX shared: EPERM
+mmap X private: EPERM
+mprotect RX: EACCES
+mmap RX private plain: 0
+stat dev: chr
+open dev: EACCES
+open dev O_PATH: 0
+open dev plain: 0
+mkfifo: 0
+open fifo: 0
+end
