@@ -28,6 +28,11 @@ test the code. A line only goes into the list above once it is true on the real 
 These pictures come from the desktop's automated tests in QEMU, so the red and green windows are test programs and
 the labels are in German, as on the real machine.
 
+The boot screen lists each start step and hands over to the desktop without a jump. This run had no remote-control
+setup, sound or network card, which is why those rows are not green.
+
+![The BitsOS boot screen with a glowing ring, the name and the list of start steps](docs/images/boot-screen.png)
+
 | Ring menu on a window | Light theme |
 |---|---|
 | ![The ring menu on a window, with actions such as close, float and wider](docs/images/desktop-ring-menu.png) | ![The desktop with two test windows in the light theme](docs/images/desktop-light.png) |
