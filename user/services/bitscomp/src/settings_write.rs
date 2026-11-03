@@ -1,4 +1,5 @@
-//! WY-5b: changes from the settings page to settingsd (`set`, `undo`; user/services/settingsd/src/proto.rs). One
+//! WY-5b: changes from the settings page to settingsd (`set`, `undo`, and `register` for the per-workspace
+//! Absicht keys of the Bühne, CR DS-3-4; user/services/settingsd/src/proto.rs). One
 //! thread of its own sends them in order, one request per connection with the same 5 s limit as the reader (B4:
 //! the frame loop never waits for settingsd). The answer comes back to the main loop as a German line for the page;
 //! the new value itself arrives through the watch (`settings`), as every other change does, so the screen follows
@@ -34,6 +35,9 @@ pub enum Req {
     /// (`expect_seq`, WY-10/2): a change by another program between that check and the undo is refused by
     /// settingsd (`changed_meanwhile`) instead of being undone.
     Undo { confirmed: Option<Sure> },
+    /// CR DS-3-4: bitscomp's own keys (owner bitscomp, in the shared `desktop` namespace): the Absicht headline of
+    /// each workspace, as (key, workspace name).
+    Register { keys: Vec<(String, String)> },
 }
 
 /// The change an undo dialog was confirmed for.
@@ -122,6 +126,7 @@ fn key_of(r: &Req) -> Option<String> {
     match r {
         Req::Set { key, .. } => Some(key.clone()),
         Req::Undo { .. } => None,
+        Req::Register { keys } => keys.first().map(|(k, _)| k.clone()),
     }
 }
 
@@ -253,8 +258,31 @@ pub fn request_line(r: &Req) -> String {
             }
             Json::obj(v)
         }
+        Req::Register { keys } => {
+            let defs = keys.iter().map(|(k, name)| absicht_def(k, name)).collect();
+            Json::obj(vec![("op", Json::str("register")), ("owner", Json::str(OWNER)), ("keys", Json::Arr(defs))])
+        }
     }
     .to_string()
+}
+
+/// The owner bitscomp registers its keys as (settingsd checks it against the key's applier).
+pub const OWNER: &str = "bitscomp";
+
+/// One Absicht key: free text up to 400 bytes (about 200 characters with umlauts), empty by default (no headline).
+fn absicht_def(key: &str, name: &str) -> Json {
+    let text = Json::obj(vec![
+        ("de", Json::str(&format!("Absicht des Arbeitsraums „{name}“ (Überschrift auf der Bühne; leer: keine)"))),
+        ("en", Json::str(&format!("Intent of workspace \"{name}\" (headline on the stage; empty: none)"))),
+    ]);
+    Json::obj(vec![
+        ("key", Json::str(key)),
+        ("schema", Json::obj(vec![("type", Json::str("text")), ("max_bytes", Json::Num(400.0))])),
+        ("default", Json::str("")),
+        ("text", text),
+        ("restart", Json::str("none")),
+        ("safety", Json::str("normal")),
+    ])
 }
 
 fn request(socket: &str, line: &str) -> Result<Json, String> {
@@ -301,6 +329,7 @@ pub fn answer(pid: u32, r: &Req, j: &Json) -> Done {
     }
     match r {
         Req::Set { key, .. } => Done { pid, ok, key: Some(key.clone()), text: "Geändert".into(), ask: None },
+        Req::Register { .. } => Done { pid, ok, key: key_of(r), text: "Angemeldet".into(), ask: None },
         Req::Undo { .. } => {
             let key = j
                 .get("undone")
@@ -332,6 +361,15 @@ mod tests {
         let b = request_line(&Req::set("theme.layout.statusbar", Json::Bool(false)));
         assert!(b.contains(r#""value":false"#), "{b}");
         assert_eq!(request_line(&Req::UNDO), r#"{"op":"undo","n":1,"source":"einstellungen"}"#);
+        let reg = Req::Register { keys: vec![("desktop.absicht.arbeitsraum-1".into(), "Arbeitsraum 1".into())] };
+        let j = Json::parse(&request_line(&reg)).unwrap();
+        assert_eq!(j.get("op").and_then(Json::as_str), Some("register"));
+        assert_eq!(j.get("owner").and_then(Json::as_str), Some("bitscomp"));
+        let k = &j.get("keys").and_then(Json::as_array).unwrap()[0];
+        assert_eq!(k.get("key").and_then(Json::as_str), Some("desktop.absicht.arbeitsraum-1"));
+        assert_eq!(k.get("default").and_then(Json::as_str), Some(""));
+        let de = k.get("text").and_then(|t| t.get("de")).and_then(Json::as_str).unwrap();
+        assert!(de.contains("„Arbeitsraum 1“"), "{de}");
         let sure = Req::Undo { confirmed: Some(Sure { key: "test.risky".into(), seq: Some(42) }) };
         assert_eq!(request_line(&sure), r#"{"op":"undo","n":1,"source":"einstellungen","confirmed":true,"expect_seq":42}"#);
         let d = answer(1, &sure, &Json::parse(r#"{"ok":false,"error":"changed_meanwhile","message":"x"}"#).unwrap());

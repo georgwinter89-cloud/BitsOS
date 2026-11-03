@@ -16,3 +16,6 @@ time = { path = "../../time" }
 sched = { path = "../../sched" }
 net = { path = "../../net" }
 ktest = { path = "../../ktest" }
+
+[lints]
+workspace = true

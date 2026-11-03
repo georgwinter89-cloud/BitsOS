@@ -7,6 +7,8 @@ description = "Reload (owner: RB)"
 [dependencies]
 acpi = { path = "../acpi" }
 bootinfo = { path = "../bootinfo" }
+# RB-14: the storage stop before the jump (`block::shutdown`).
+block = { path = "../block" }
 # RB-9: the console commands system_list, system_pin, install_system (console does not depend on kexec).
 console = { path = "../console" }
 # RB-6: bitsboot's own checks and marker rule (its firmware-free library), so install_kernel judges a bundle as the
@@ -20,6 +22,8 @@ kreg = { path = "../kreg" }
 ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
 mcp = { path = "../mcp" }
+# RB-12: rb.crash.nmi_user_stress runs user code in address spaces of its own.
+mm = { path = "../mm" }
 mm-core = { path = "../mm-core" }
 net = { path = "../net" }
 pci = { path = "../pci" }
@@ -28,4 +32,11 @@ platform = { path = "../platform" }
 sched = { path = "../sched" }
 time = { path = "../time" }
 uapi = { path = "../uapi" }
+# RB-18: the stick's CONFIG text does not stay in freed heap (kernel/Cargo.toml pins the same version).
+zeroize = { version = "=1.9.1", default-features = false }
 vfs = { path = "../vfs" }
+# RB-13: the panic path halts and resets every xHCI controller before its reset (`xhci::panic_stop_all`).
+xhci = { path = "../drivers/xhci" }
+
+[lints]
+workspace = true

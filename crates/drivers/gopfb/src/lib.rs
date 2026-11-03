@@ -274,29 +274,6 @@ impl GopFb {
         }
     }
 
-    /// Rate (mHz), period (ns) and where they came from.
-    pub fn vblank_rate(&self) -> (u32, u64, RefreshSource) {
-        self.vblank.rate()
-    }
-    /// The next estimated vblank.
-    pub fn next_vblank(&self) -> VblankEvent {
-        self.vblank.next(time::now_ns())
-    }
-    pub fn vblank_period_ns(&self) -> u64 {
-        self.vblank.period_ns()
-    }
-    /// Sleeps until the next estimated vblank; None if that is further away than `timeout_ns`.
-    pub fn wait_vblank(&self, timeout_ns: u64) -> Option<VblankEvent> {
-        let now = time::now_ns();
-        let next = self.vblank.next(now);
-        let dt = next.time_ns.saturating_sub(now);
-        if dt > timeout_ns {
-            return None;
-        }
-        sched::sleep_ns(dt);
-        Some(next)
-    }
-
     /// Writes rows `y..y+h`, columns `x..x+w` of `src` (stride `src_stride`), already range-checked.
     fn copy_rect(&self, src: &[u32], src_stride: usize, x: usize, y: usize, w: usize, h: usize) -> bool {
         let mut words = [0u32; CHUNK];

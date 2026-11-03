@@ -4,11 +4,14 @@
 # A build compares only the libraries it carries (a needed one, like libcap for AB-8's dyn-ls, may be absent);
 # V2_PKG_STRICT_LOCK=1 makes a difference an error.
 lib /usr/lib/ld-linux-x86-64.so.2 283632 2a950d46575efa0210d22440988f5a6b4507ebddc6c86d9a42e6e7ef6f01463e glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libBrokenLocale.so.1 14432 df5dc8851fb6b96692c824169359e46533cfee168ea95ef5f850780916182fe9 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libanl.so.1 14352 6f772981274e30169bf9a3a0e7c22aa1474aba81ce335dddd2e5a3a2bcdf0eda glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libasound.so.2 1178232 a213c78c023a4f1a404512be2d6e773ae58dd2717d1ce948b2da6f821e1bce3b alsa-lib 1.2.16.1-1.1 LGPL-2.1-or-later
-lib /usr/lib/libbrotlicommon.so.1 141264 0a5a0d15264043c6cb99d3076501d4503bafde11eaea28f353e399b4ce6b2981 brotli 1.2.0-1.1 MIT
-lib /usr/lib/libbrotlidec.so.1 59264 f747ed8ca1a29c53744f6e2b12dbd70d78838682a5914505b173c1ad50db4ca9 brotli 1.2.0-1.1 MIT
+lib /usr/lib/libbrotlicommon.so.1 141264 431ba8ac8e33307329ef575c13d2cff77262cd7e9c8f3b56a18c6fe667abf0e8 brotli 1.2.1-1.1 MIT
+lib /usr/lib/libbrotlidec.so.1 59264 d8b1e6da218c888d4396fafe35372c7cce28b4e8fa579c6f352a89316cd780c3 brotli 1.2.1-1.1 MIT
 lib /usr/lib/libbz2.so.1.0 74720 c208e149de372d9aca88f752849b33dea032b8054d1718d662666bd3bad33f8b bzip2 1.0.8-6.1 BSD
 lib /usr/lib/libc.so.6 2440544 071e34179e645b25f8a8c2e7108894dc665caa9f5f8c939cd579a75b6638bc3f glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libc_malloc_debug.so.0 60272 6176bdb149aa18d8cbbc3f2e50b620c36995aa262f6aab2adb02a6fabd0c6993 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libcap.so.2 51256 86e6c51b059d7dba0d3b2f37d34b223708ead6176047f2fa4a819c9ddf0bfd0e libcap 2.78-1.1 BSD-3-Clause OR GPL-2.0-only
 lib /usr/lib/libdl.so.2 14352 336a6874f359104ec9bef6d2f2948f11e0f079d347e986880a240f1156a42d4d glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libexpat.so.1 223176 fed5805d579adfeb84191d33c28efd6906df61581fa2c4b3b2879c3abc457d94 expat 2.9.0-1.1 MIT
@@ -21,13 +24,23 @@ lib /usr/lib/libglib-2.0.so.0 1592776 ba8385e7df96155348ddd165a202cb0140eb23bb80
 lib /usr/lib/libgraphite2.so.3 137160 70eebd2fda11b867ebff5a8e3bdf272875acdde0851d258c98b3b046b01b4fc7 graphite 1:1.3.15-1 LGPL-2.1-or-later OR MPL-2.0 OR GPL-2.0-or-later
 lib /usr/lib/libharfbuzz.so.0 1527952 ed4fdeb6e269b08a553273e3aa15984c23ac59218eedb01b191e1b08ab630251 harfbuzz 14.6.0-1.1 MIT
 lib /usr/lib/libm.so.6 1075616 58b6b82e39d59d7810d402ba4ec34359fde058204fdb7cd5a269fda256a35421 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libmvec.so.1 1050992 cea848d7c542078f91f11aa44157eb07e0c62f3941d6b1c5f8e7d25fcf8b8eea glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libnsl.so.1 108632 7572c4f945cc7263b675302c6332d0c6b2f6dad77d5f1c53b18948bf848e4d93 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libnss_compat.so.2 47640 6f6a3c2936427c100daa8cbf2bdb341c2998504082d2a436bde5cf3a0fff022b glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libnss_db.so.2 39008 a81f15504d692b81a1df48b46c8d1875029f9751953a38f21936e82e626d41b4 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libnss_dns.so.2 14208 0997ebd9212b7ac901264cb9d3e5bf164b6979502e508cc5f69dff2c52309f95 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libnss_files.so.2 14208 c46ca98e032309fd6c190c762466feddc99a5d4c484e99ffc0e3d7173dacc783 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libnss_hesiod.so.2 30816 578535ff563e602fd4b4d57dc00466a282ab495b16351c1fee780377d3fd42f5 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libpcre2-8.so.0 850224 a12e07c72567e9c5bbc94320fe63afc80a1ecd5dbbf95bf992474ebdd749fd2d pcre2 10.49-1.1 BSD-2-Clause | BSD-3-Clause WITH PCRE2-exception
 lib /usr/lib/libpixman-1.so.0 1378352 6be6a7644bb89d88130d05f3fa2e1fd0ce09aa88064f069c785c856f9556ff79 pixman 0.46.4-1.1 MIT
 lib /usr/lib/libpng16.so.16 346136 778b85f05e157b6ea5d3d257c28e19c6c19273db8c34fbc2344f26cdd073efdd libpng 1.6.59-1.1 libpng-2.0
 lib /usr/lib/libpthread.so.0 14360 bcdf5c8472353bd04780314cee7d27e07594153332ac526a390d6e5b38792ee4 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
+lib /usr/lib/libresolv.so.2 72000 2d7d7eeb48ccdaacc79f0d74ea3d8633b08d27548b0df8b9cef3c78aff21bc9e glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/librt.so.1 14424 3a34174e94af447fab7b67e96ac7fe44ea12e6238683e3de8420ae397fdea458 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libstdc++.so.6 3312696 412e0fc561a10581aaff2d101206939a31fa12c696590d8d4a5ec3655953ffe0 libstdc++ 16.2.1+r23+gd564253eb6c8-1 GPL-3.0-or-later WITH GCC-exception-3.1 | GFDL-1.3-or-later
+lib /usr/lib/libthread_db.so.1 55912 a3e032ad9dcf2d33c7b5109886f3a26dc0e28e4c6b03034e0acee0b74bc46e31 glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libutf8proc.so.3 366464 29bda970626617c558f57fa2df65982d998c78e5fee999d0c863aa8d7a95e978 libutf8proc 2.12.0-1.1 MIT | custom
+lib /usr/lib/libutil.so.1 14352 815016550791325af7163bf5d377d06233557b7c7ffb353b95ba8f92ee0b29ac glibc 2.44+r50+g1848099f063e-3 GPL-2.0-or-later | LGPL-2.1-or-later
 lib /usr/lib/libwayland-client.so.0 64264 7628f449109d3d8502d740fd3be71cf11b1b901e245fc8040728155ab55686da wayland 1.26.0-1.1 MIT
 lib /usr/lib/libwayland-cursor.so.0 31200 8fcc85be60c73c89ef375181c2d5e4d0f878c8e57b2e92434cb3bc6128b78c64 wayland 1.26.0-1.1 MIT
 lib /usr/lib/libxkbcommon.so.0 440488 f3bd4c6baa0e7ba9fbccf8446871100efe5b4677c1c0dc3063068a42dad7032d libxkbcommon 1.13.2-1.1 MIT

@@ -6,3 +6,6 @@ description = "HID report-descriptor parser, report field extraction, Linux evde
 
 [dependencies]
 
+
+[lints]
+workspace = true

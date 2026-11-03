@@ -2,7 +2,7 @@
 //! stick at `/data`) or a block disk, and the list of mounted volumes for a sync of all of them (before a
 //! Reload or a power-off: the change request in the FS-8a notes).
 
-use crate::dev::{CachedDiskDev, Dev, DiskDev, ImageDev};
+use crate::dev::{CachedDiskDev, Dev, ImageDev};
 use crate::vol::{Options, Volume};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -114,10 +114,4 @@ pub fn mount_image(ns: &MountNs, image: &str, at: &str, opts: Options) -> Result
 pub fn mount_disk(disk: Arc<block::Disk>, start: u64, blocks: u64, ns: &MountNs, at: &str, opts: Options) -> Result<(Arc<Volume>, Arc<Mount>), i64> {
     let place = Place::Disk(Arc::as_ptr(&disk) as usize, start, start.saturating_add(blocks));
     mount_dev(Arc::new(CachedDiskDev::new(disk, start, blocks)), Some(place), ns, at, opts)
-}
-
-/// As `mount_disk` without a cache: every read and write is one request in order (tests of the write order).
-pub fn mount_disk_direct(disk: Arc<block::Disk>, start: u64, blocks: u64, ns: &MountNs, at: &str, opts: Options) -> Result<(Arc<Volume>, Arc<Mount>), i64> {
-    let place = Place::Disk(Arc::as_ptr(&disk) as usize, start, start.saturating_add(blocks));
-    mount_dev(Arc::new(DiskDev::new(disk, start, blocks)), Some(place), ns, at, opts)
 }

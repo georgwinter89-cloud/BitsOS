@@ -10,6 +10,8 @@
 //! - `Aperture::Ram(DmaBuffer)`: a DMA buffer (WB for a shadow buffer, or UC/WC: MM-4 retyped its direct-map
 //!   alias already). Its pages are mapped with the buffer's type; the map keeps the buffer, so its frames stay
 //!   allocated while any mapping or VMA of the device exists.
+//! - `Aperture::Pages(DmaPages)` (MM-14): pinned scattered pages (a GPU buffer); page `i` of the aperture is
+//!   page `i` of the object, mapped with the object's type; the map keeps the object as for `Ram`.
 //! - `Aperture::Mmio`: device memory outside RAM (a framebuffer or VRAM BAR, registers), page-aligned, with the
 //!   type of every kernel window over it (`vmap::check_aperture`; Linux `reserve_pfn_range` refuses the same).
 //!
@@ -32,6 +34,7 @@
 
 use crate::aspace::AsCore;
 use crate::dma::DmaBuffer;
+use crate::dma_pages::DmaPages;
 use crate::vmap::{self, ApertureRefusal};
 use crate::PAGE;
 use alloc::sync::{Arc, Weak};
@@ -39,7 +42,7 @@ use alloc::vec::Vec;
 use hal::paging::CacheType;
 use ksync::SpinLock;
 use vfs::mmap::{FileMap, MapBacking};
-use vfs::pagecache::PageFault;
+use vfs::pagecache::{CachePage, PageFault};
 use vfs::OpenFile;
 
 /// Memory a device may hand to programs (see the module docs).
@@ -48,6 +51,12 @@ pub enum Aperture {
     Mmio { phys: u64, len: u64, cache: CacheType },
     /// A DMA buffer; programs get its pages with the buffer's own type. The map keeps it alive.
     Ram(Arc<DmaBuffer>),
+    /// MM-14: pinned scattered pages; programs get them with the object's own type. The map keeps it alive.
+    Pages(Arc<DmaPages>),
+    /// DR-5 (CR-DR5-2): page-cache pages (a udmabuf's memfd pages); programs get them write-back. The map holds
+    /// the pages themselves: a `CachePage` owns its frame and frees it only when dropped, so a mapped frame stays
+    /// allocated (the type proves it, as `Pages` does for DmaPages; no raw address from outside MM/VFS).
+    Frames(Arc<Vec<Arc<CachePage>>>),
 }
 
 /// Why `DeviceMap::new` refused the apertures.
@@ -66,13 +75,35 @@ pub enum ApertureError {
     NoMemory,
 }
 
+/// What keeps a RAM aperture's frames allocated while the map lives (and, for a page list, where they are).
+enum Keep {
+    Mmio,
+    Ram(#[allow(dead_code)] Arc<DmaBuffer>),
+    Pages(Arc<DmaPages>),
+    Frames(Arc<Vec<Arc<CachePage>>>),
+}
+
 /// One checked aperture.
 struct Ap {
+    /// The first page's address (contiguous apertures; unused for a page list).
     phys: u64,
     pages: u64,
     cache: CacheType,
-    /// Keeps a RAM aperture's frames allocated while the map lives.
-    _ram: Option<Arc<DmaBuffer>>,
+    keep: Keep,
+}
+
+impl Ap {
+    /// The physical address of page `page`, None outside the aperture.
+    fn phys_of(&self, page: u64) -> Option<u64> {
+        if page >= self.pages {
+            return None;
+        }
+        match &self.keep {
+            Keep::Pages(p) => p.page_phys(page),
+            Keep::Frames(l) => l.get(usize::try_from(page).ok()?)?.phys(),
+            Keep::Mmio | Keep::Ram(_) => Some(self.phys + page * PAGE),
+        }
+    }
 }
 
 /// What a device's fault hook answers: a page of one of its apertures.
@@ -129,7 +160,19 @@ fn check_one(a: Aperture) -> Result<Ap, ApertureError> {
             if pages == 0 {
                 return Err(ApertureError::Empty);
             }
-            Ok(Ap { phys: b.phys(), pages, cache: b.cpu().cache(), _ram: Some(b) })
+            Ok(Ap { phys: b.phys(), pages, cache: b.cpu().cache(), keep: Keep::Ram(b) })
+        }
+        Aperture::Pages(p) => {
+            if p.pages() == 0 {
+                return Err(ApertureError::Empty);
+            }
+            Ok(Ap { phys: 0, pages: p.pages(), cache: p.cache_type(), keep: Keep::Pages(p) })
+        }
+        Aperture::Frames(l) => {
+            if l.is_empty() {
+                return Err(ApertureError::Empty);
+            }
+            Ok(Ap { phys: 0, pages: l.len() as u64, cache: CacheType::WriteBack, keep: Keep::Frames(l) })
         }
         Aperture::Mmio { phys, len, cache } => {
             if len == 0 {
@@ -144,7 +187,7 @@ fn check_one(a: Aperture) -> Result<Ap, ApertureError> {
                 ApertureRefusal::Ram => ApertureError::OverlapsRam,
                 ApertureRefusal::TypeConflict(_) => ApertureError::TypeConflict,
             })?;
-            Ok(Ap { phys, pages: len / PAGE, cache, _ram: None })
+            Ok(Ap { phys, pages: len / PAGE, cache, keep: Keep::Mmio })
         }
     }
 }
@@ -178,8 +221,8 @@ impl DeviceMap {
     pub(crate) fn fault(&self, pgoff: u64, write: bool) -> Result<Resolved, PageFault> {
         DEVICE_FAULTS.inc();
         let pg = self.ops.fault(pgoff, write)?;
-        match self.apertures.get(pg.aperture).filter(|a| pg.page < a.pages) {
-            Some(a) => Ok(Resolved { phys: a.phys + pg.page * PAGE, cache: a.cache, writable: pg.writable }),
+        match self.apertures.get(pg.aperture).and_then(|a| a.phys_of(pg.page).map(|p| (a, p))) {
+            Some((a, phys)) => Ok(Resolved { phys, cache: a.cache, writable: pg.writable }),
             None => {
                 DEVICE_BAD_PAGES.inc();
                 klog::event!(Error, "mm", "device.bad_page", pgoff = pgoff, aperture = pg.aperture, page = pg.page,
@@ -285,8 +328,21 @@ pub fn unregister(rdev: u64) -> bool {
     g.len() != before
 }
 
-/// The mappable device behind an open file, if it is a registered character device.
+/// DR-6 (CR-DR6-1): the mappable device for an `mmap` of `pages` pages at page offset `pgoff`: the file's
+/// answer for that range (a DRM render node: the GEM object there, or Linux's errno), else `lookup`.
+pub fn lookup_at(f: &OpenFile, pgoff: u64, pages: u64) -> Option<Result<Arc<DeviceMap>, i64>> {
+    if let Some(r) = f.file.device_map_at(pgoff, pages) {
+        return Some(r.and_then(|m| m.downcast::<DeviceMap>().map_err(|_| uapi::errno::ENODEV)));
+    }
+    lookup(f).map(Ok)
+}
+
+/// The mappable device behind an open file: the file's own map (a dma-buf, CR-DR5-1), else a registered
+/// character device.
 pub fn lookup(f: &OpenFile) -> Option<Arc<DeviceMap>> {
+    if let Some(m) = f.file.device_map() {
+        return m.downcast::<DeviceMap>().ok();
+    }
     if f.file.mode() & uapi::S_IFMT != uapi::S_IFCHR {
         return None;
     }

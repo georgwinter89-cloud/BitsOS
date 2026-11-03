@@ -33,6 +33,9 @@ impl Rw for Live {
     fn write(&self, byte: u32, value: u32, check: u32) -> Result<(), DcnError> {
         self.0.write_masked(byte, value, check)
     }
+    fn write_as(&self, byte: u32, value: u32, check: u32, owner: crate::dcn::Owner) -> Result<(), DcnError> {
+        self.0.write_owned(byte, value, check, owner)
+    }
 }
 
 pub struct KClock;

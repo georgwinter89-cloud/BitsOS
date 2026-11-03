@@ -6,8 +6,9 @@
 //! disturb a device but never the kernel's memory. `framebuffer` only hands out the part of the vmap area
 //! below the bump start the kernel gave `init` (what bitsboot mapped there: the GOP framebuffer). `init`
 //! runs once; later calls change nothing.
-//! G0: windows are carved from the vmap area by a bump pointer and never unmapped; MM-2 adds a real vmap
-//! allocator with unmapping, and PC-1 builds BAR windows on top.
+//! `map_device` windows are carved from the vmap area by a bump pointer and never unmapped (each mapped once per
+//! boot: ACPI registers, a driver's BAR0). A window that must be unmapped again comes from mm's vmap allocator
+//! (MM-2) through `paging::map_device_window`.
 
 use crate::paging::{self, CacheType, PageFlags};
 use alloc::vec::Vec;
@@ -178,20 +179,6 @@ impl IoMem {
         }
         // SAFETY: the destination range is inside the mapped window (checked).
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.virt as usize + off) as *mut u8, src.len()) };
-        Ok(())
-    }
-
-    /// Fills `len` 32-bit pixels starting at byte `off` with `value`.
-    pub fn fill32(&self, off: usize, len: usize, value: u32) -> Result<(), MmioError> {
-        let bytes = len.checked_mul(4).ok_or(MmioError::OutOfBounds)?;
-        if !(self.virt as usize).wrapping_add(off).is_multiple_of(4) || off.checked_add(bytes).is_none_or(|e| e > self.size) {
-            return Err(MmioError::OutOfBounds);
-        }
-        let p = (self.virt as usize + off) as *mut u32;
-        for i in 0..len {
-            // SAFETY: inside the window (checked above), aligned.
-            unsafe { p.add(i).write_volatile(value) };
-        }
         Ok(())
     }
 }

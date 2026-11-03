@@ -13,7 +13,15 @@
 # `park_others` in crates/platform/src/power.rs and crates/mcp/src/tools/reboot.rs); without it they check that
 # the reset or power-off still happens and say SKIP for the park lines. RB_REQUIRE_GLUE=1 (the desk's acceptance
 # run once CR1/CR2 are in) turns those SKIPs into FAILs.
-# Ports: RB's range (BITSOS_PORT_LO, default 23000); MCP forward at LO+120.
+# RB-14: the same for the storage stop before the park (change requests CR-1 reboot.rs, CR-2 platform/power.rs of
+# plan/notes/rb-RB-14.md): once the source calls block::shutdown::stop_all there, runs 3 and 5 must log
+# `block shutdown.done why=<reboot|mcp-reboot> ... quiet=true` before the park line; until then SKIP.
+# RB-15: the shutdown order of klog::shutdown on the console (runs 3 and 5): the mirror paused before the storage
+# stop, the storage step, the park, the quiesce step, then the drivers' quiesce and the reset; no step out of
+# order. Run 5 also has the console mirror on (CONFIG mirror= to V1's console-listen.mjs, igb): the listener
+# must get every shutdown line (mirror_paused, shutdown.done, cpus.parked, step=quiesce) and "mirror ended"
+# before the second start's start line, i.e. the end datagram left the card before the reset.
+# Ports: RB's range (BITSOS_PORT_LO, default 23000); MCP forward at LO+120, the mirror listener at LO+130.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN="${BITSOS_RUN_DIR:-target/xtask/runs/rb-60-reboot-park}"
@@ -23,12 +31,22 @@ HERE="$(pwd)/host/tests/rb"
 QMP_EVENTS="$(pwd)/host/tests/cp/qmp_events.py"
 LO="${BITSOS_PORT_LO:-23000}"
 MCP_FWD=$((LO + 120))
+MIRROR_PORT=$((LO + 130))
+# V1's host listener, unchanged (BITSOS_LISTENER overrides where V1 lies; no home value in the public tree).
+LISTENER="${BITSOS_LISTENER:-$HOME/BitsOS/BitsOS-Plattform/console-listen.mjs}"
 TOKEN="rbq-scenario-token-5e7a"
 SMP="${RB_SMP:-16}"
 OTHERS=$((SMP - 1))
 fail=0
 missing_glue() { if [ "${RB_REQUIRE_GLUE:-0}" = 1 ]; then echo "FAIL $1 (RB_REQUIRE_GLUE=1)"; fail=1; else echo "SKIP $1"; fi; }
 check() { if grep -aEq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3 (no '$2' in $(basename "$1"))"; fail=1; fi; }
+# order FILE A B WHAT: the first line matching A comes before the first line matching B.
+order() {
+    local a b
+    a=$(grep -anE -- "$2" "$1" | head -1 | cut -d: -f1)
+    b=$(grep -anE -- "$3" "$1" | head -1 | cut -d: -f1)
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then echo "ok   $4"; else echo "FAIL $4 (line ${a:-none} of '$2', ${b:-none} of '$3')"; fail=1; fi
+}
 
 PIDS=()
 stop_run() { # qemu.out of the run, xtask pid
@@ -90,7 +108,8 @@ check "$RUN/off.log" 'power off\.slp_typ ' "poweroff: SLP_TYP written with the C
 off_lines off "poweroff"
 
 glue_cp=0
-grep -q 'park_others("reboot")' crates/platform/src/power.rs && grep -q 'park_others("poweroff")' crates/platform/src/power.rs && glue_cp=1
+grep -Eq 'park_others\("reboot"\)|stop_and_(park|quiesce)\("reboot"' crates/platform/src/power.rs \
+    && grep -Eq 'park_others\("poweroff"\)|stop_and_(park|quiesce)\("poweroff"' crates/platform/src/power.rs && glue_cp=1
 run preboot "$KT;rb_quiesce_test=platform-reboot" "--resets 1 --boots 2" -action reboot=reset
 reset_lines preboot "platform reboot"
 run poff "$KT;rb_quiesce_test=platform-poweroff" "--until-shutdown" -action shutdown=pause
@@ -103,15 +122,50 @@ if [ "$glue_cp" = 1 ]; then
 else
     missing_glue "platform park lines: crates/platform/src/power.rs calls no park_others(\"reboot\"/\"poweroff\") yet (change request 1)"
 fi
+if grep -q 'block::shutdown::stop_all(' crates/platform/src/power.rs; then
+    check "$RUN/preboot.log" 'block shutdown\.done why="?reboot"? .*quiet=true' "platform reboot: storage stopped quiet (RB-14)"
+    order "$RUN/preboot.log" 'block shutdown\.done why="?reboot"? ' 'power cpus\.parked what="?reboot"? ' "platform reboot: storage stop before the park (RB-14)"
+else
+    missing_glue "platform storage stop: crates/platform/src/power.rs calls no block::shutdown::stop_all yet (RB-14 CR-2)"
+fi
 
-# 5. MCP reboot with load on the APs (a normal image, not a ktest image).
+# shutdown_order LOG WHAT LABEL STOP_LINE: RB-15's order of klog::shutdown on the console.
+shutdown_order() {
+    local w="what=\"?$2\"?"
+    order "$1" "shutdown mirror_paused $w" "block shutdown\.done why=\"?$2\"? " "$3: mirror paused before the storage stop (RB-15)"
+    order "$1" "block shutdown\.done why=\"?$2\"? " "shutdown step $w step=\"?storage" "$3: storage step after the storage stop (RB-15)"
+    order "$1" "shutdown step $w step=\"?storage" "power cpus\.parked $w " "$3: park after the storage step (RB-15)"
+    order "$1" "power cpus\.parked $w " "shutdown step $w step=\"?parked" "$3: parked step after the park (RB-15)"
+    order "$1" "shutdown step $w step=\"?parked" "shutdown step $w step=\"?quiesce" "$3: quiesce step after the parked step (RB-15)"
+    order "$1" "shutdown step $w step=\"?quiesce" "$4" "$3: the drivers' quiesce after the quiesce step (RB-15)"
+    order "$1" "$4" "shutdown step $w step=\"?reset" "$3: the reset step last (RB-15)"
+    if grep -aEq "shutdown step $w .*in_order=false" "$1"; then echo "FAIL $3: a shutdown step out of order"; fail=1; else echo "ok   $3: no step out of order"; fi
+}
+if grep -Eq 'klog::shutdown::(pause_mirror|run\()' crates/platform/src/power.rs; then
+    shutdown_order "$RUN/preboot.log" reboot "platform reboot" 'power reboot\.requested '
+else
+    missing_glue "platform shutdown order: crates/platform/src/power.rs pauses no mirror yet (RB-15)"
+fi
+
+# 5. MCP reboot with load on the APs (a normal image, not a ktest image), the console mirror on.
 glue_mc=0
 grep -q 'park_others("mcp-reboot")' crates/mcp/src/tools/reboot.rs && glue_mc=1
 tag=mcp
 log="$RUN/$tag.log"
 sock="$RUN/$tag.qmp"
 rm -f "$log" "$sock"
-cargo xtask image --name rbq-mcp --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;rb_quiesce_load_s=120" > "$RUN/$tag-image.txt" 2>&1
+listen_out="$RUN/$tag-listener.txt"
+lpid=""
+rm -f "$listen_out"
+mirror_cfg=""
+if command -v node > /dev/null && [ -f "$LISTENER" ]; then
+    node "$LISTENER" "$MIRROR_PORT" "$listen_out" > "$listen_out.out" 2>&1 &
+    lpid=$!
+    PIDS+=("$lpid")
+    for _ in $(seq 50); do grep -q "listening on UDP port $MIRROR_PORT" "$listen_out" 2> /dev/null && break; sleep 0.1; done
+    mirror_cfg=";mirror=10.0.2.2:$MIRROR_PORT"
+fi
+cargo xtask image --name rbq-mcp --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;rb_quiesce_load_s=120$mirror_cfg" > "$RUN/$tag-image.txt" 2>&1
 cargo xtask qemu --name rbq-mcp --smp "$SMP" --net igb --hostfwd "$MCP_FWD:8765" --timeout 300 --serial-log "$log" -- -qmp "unix:$sock,server,wait=off" -action reboot=reset > "$RUN/$tag-qemu.txt" 2>&1 &
 qpid=$!
 PIDS+=("$qpid")
@@ -131,5 +185,58 @@ if [ "$glue_mc" = 1 ]; then
     parked_lines "$log" "MCP reboot"
 else
     missing_glue "MCP park lines: crates/mcp/src/tools/reboot.rs calls no park_others(\"mcp-reboot\") yet (change request 2)"
+fi
+if grep -q 'block::shutdown::stop_all("mcp-reboot"' crates/mcp/src/tools/reboot.rs; then
+    check "$log" 'block shutdown\.done why="?mcp-reboot"? .*quiet=true' "MCP reboot: storage stopped quiet (RB-14)"
+    check "$log" 'mcp reboot\.(synced|sync_timeout|sync_skipped) .*ms=[0-9]+' "MCP reboot: the write-back's time is logged (RB-14)"
+    order "$log" 'block shutdown\.done why="?mcp-reboot"? ' 'power cpus\.parked what="?mcp-reboot"? ' "MCP reboot: storage stop before the park (RB-14)"
+else
+    missing_glue "MCP storage stop: crates/mcp/src/tools/reboot.rs calls no block::shutdown::stop_all(\"mcp-reboot\") yet (RB-14 CR-1)"
+fi
+if grep -Eq 'klog::shutdown::(pause_mirror\("mcp-reboot"|run\()' crates/mcp/src/tools/reboot.rs; then
+    shutdown_order "$log" mcp-reboot "MCP reboot" 'mcp reboot\.quiesced '
+    check "$log" 'shutdown mirror_paused what="?mcp-reboot"? .*done=true' "MCP reboot: the mirror paused, the card said its raw frames were sent (RB-15)"
+    check "$log" 'mcp reboot\.quiesced devices="?([^ ]*,)?mirror,([^ ]*,)?igc0' "MCP reboot: the mirror quiesced before the card (RB-15)"
+    if [ -n "$lpid" ]; then
+        sleep 1
+        kill -INT "$lpid" 2> /dev/null || true
+        wait "$lpid" 2> /dev/null || true
+        for l in 'shutdown mirror_paused what="?mcp-reboot"?' 'block shutdown\.done why="?mcp-reboot"? ' 'power cpus\.parked what="?mcp-reboot"? ' 'shutdown step what="?mcp-reboot"? step="?quiesce'; do
+            check "$listen_out" "$l" "MCP reboot listener: '$l' arrived (RB-15, raw path)"
+        done
+        order "$listen_out" 'shutdown step what="?mcp-reboot"? step="?quiesce' 'mirror ended' "MCP reboot listener: the quiesce step before the end datagram (RB-15)"
+        # The end datagram goes out in the quiesce, before the reset; the second kernel's mirror start (if it went
+        # live before QEMU was stopped) comes after it.
+        ended=$(grep -an 'mirror ended' "$listen_out" | head -1 | cut -d: -f1)
+        second=$(grep -anE ' start [0-9]+: ' "$listen_out" | sed -n 2p | cut -d: -f1)
+        if [ -n "$ended" ] && { [ -z "$second" ] || [ "$ended" -lt "$second" ]; }; then
+            echo "ok   MCP reboot listener: 'mirror ended' (line $ended) before the reset${second:+ and the second start (line $second)} (RB-15)"
+        else
+            echo "FAIL MCP reboot listener: 'mirror ended' line ${ended:-none}, second start line ${second:-none} (RB-15)"; fail=1
+        fi
+        if grep -aq 'bytes lost\]' "$listen_out"; then echo "FAIL MCP reboot listener: a loss marker"; fail=1; else echo "ok   MCP reboot listener: nothing lost"; fi
+        # RB-16: a breadcrumb before each step and each device's quiesce on the wire (the mirror and its card
+        # quiesced after every other device); the card's own crumb under the crumb stream after the end datagram.
+        if grep -q 'klog::crumb::leave' crates/devmodel/src/lib.rs; then
+            check "$listen_out" 'crumb [0-9]+ quiesce "?mcp-reboot' "MCP reboot listener: the quiesce step's breadcrumb (RB-16)"
+            order "$listen_out" 'crumb [0-9]+ device rb-quiesce-test' 'crumb [0-9]+ device mirror' "MCP reboot listener: the test device's breadcrumb before the mirror's (RB-16)"
+            order "$listen_out" 'crumb [0-9]+ device mirror' 'mirror ended' "MCP reboot listener: the mirror's breadcrumb before its end datagram (RB-16)"
+            order "$listen_out" 'mirror ended' 'crumb [0-9]+ device igc0' "MCP reboot listener: the card's breadcrumb after the end, quiesced last (RB-16)"
+            check "$log" 'mcp reboot\.quiesced devices="?([^ ]*,)?rb-quiesce-test,([^ ]*,)?mirror,igc0"?([[:space:]]|$)' "MCP reboot: the transport (mirror, igc0) quiesced last (RB-16)"
+        fi
+    else
+        echo "SKIP MCP reboot listener: node or $LISTENER missing"
+    fi
+else
+    missing_glue "MCP shutdown order: crates/mcp/src/tools/reboot.rs pauses no mirror yet (RB-15)"
+fi
+# RB-17 CR-2: acpi::power::reboot leaves a crumb right before each reset write (FADT, CF9 6, CF9 0xE, 8042).
+# QEMU cannot show those crumbs: the wire (mirror, card) is quiesced before the reset and QEMU has no FCH
+# watchdog to keep them; CR-2's host test checks the mapping, the Mini-PC list (RB-17 K4) the next start's
+# reading. Here only the source glue.
+if grep -Eq 'klog::crumb::leave\(' crates/acpi/src/power.rs && grep -q 'fn crumb' crates/acpi/src/power.rs; then
+    echo "ok   reboot: a crumb before each reset write in acpi::power::reboot (RB-17 CR-2)"
+else
+    missing_glue "reboot: crates/acpi/src/power.rs leaves no crumb before its reset writes yet (RB-17 CR-2)"
 fi
 exit $fail

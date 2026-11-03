@@ -117,6 +117,50 @@ impl Buddy {
         self.head(phys, order).is_some_and(|m| m == Meta::new(State::Alloc, order, kind as usize).with_tag(tag))
     }
 
+    /// MM-13: turns the allocated block (phys, order) of `kind` into 2^order allocated order-0 frames of `kind`
+    /// (a transparent huge page whose mapping gets split or shared: each 4 KiB piece is then freed on its own,
+    /// Linux `split_huge_page`). The caller owns the whole block (it maps it, under its own lock), so only the
+    /// head's state can race (a stray free): it is claimed first (tag -> `TAG_BUSY`). False, nothing changed,
+    /// unless the block is in that state.
+    pub fn split_block(&self, phys: u64, order: u32, kind: Kind) -> bool {
+        if order == 0 || order > MAX_ORDER || !self.retag(phys, order, kind, TAG_NONE, TAG_BUSY) {
+            return false;
+        }
+        let pfn = phys / PAGE;
+        let Some(r) = self.region_of(pfn) else { return false };
+        for i in 1..1u64 << order {
+            self.set_meta(r, pfn + i, Meta::new(State::Alloc, 0, kind as usize));
+        }
+        self.set_meta(r, pfn, Meta::new(State::Alloc, 0, kind as usize));
+        true
+    }
+
+    /// MM-13: the reverse of `split_block`: 2^order allocated order-0 frames of `kind` from `phys` (aligned to
+    /// the block size) become one allocated block again (a huge page whose 4 KiB pieces this space holds alone
+    /// again, Linux's reuse of an exclusive THP). Each frame is claimed first; one that is not an allocated
+    /// order-0 frame of `kind` (freed, a block, another owner tag) undoes the claims and answers false.
+    pub fn merge_block(&self, phys: u64, order: u32, kind: Kind) -> bool {
+        if order == 0 || order > MAX_ORDER || self.head(phys, order).is_none() {
+            return false;
+        }
+        let n = 1u64 << order;
+        for i in 0..n {
+            if !self.retag(phys + i * PAGE, 0, kind, TAG_NONE, TAG_BUSY) {
+                for j in 0..i {
+                    self.retag(phys + j * PAGE, 0, kind, TAG_BUSY, TAG_NONE);
+                }
+                return false;
+            }
+        }
+        let pfn = phys / PAGE;
+        let Some(r) = self.region_of(pfn) else { return false };
+        for i in 1..n {
+            self.set_meta(r, pfn + i, Meta::NONE);
+        }
+        self.set_meta(r, pfn, Meta::new(State::Alloc, order, kind as usize));
+        true
+    }
+
     /// Is the frame at `phys` the head of a later piece of a run?
     fn tail_at(&self, phys: u64) -> bool {
         let pfn = phys / PAGE;

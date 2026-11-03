@@ -6,7 +6,9 @@
 //!
 //! The rhythm (spec/wlan.md §3, V1 K6 `nicwlanwatch.asm` reworked): after a link is lost the
 //! first join comes 2 s later, then six more 10 s apart, then one every 60 s, as long as the
-//! interface is on. Switched on, the first join comes at once.
+//! interface is on. Switched on, the first join comes at once; when it fails the next comes 2 s
+//! later (WL-9: on 24.10. the first join after boot failed and the second went through, 10 s
+//! late), then the rhythm goes on as after a loss.
 
 use crate::events::{EventLog, LinkLoss, WifiEvent};
 
@@ -63,6 +65,8 @@ pub struct Supervisor {
     rhythm: Rhythm,
     /// joins since the link was lost (or the interface was switched on)
     attempt: u32,
+    /// switched on and no join has ended yet
+    fresh: bool,
     why: LinkLoss,
     events: EventLog<WifiEvent>,
 }
@@ -79,6 +83,7 @@ impl Supervisor {
             state: SvState::Off,
             rhythm,
             attempt: 0,
+            fresh: false,
             why: LinkLoss::JoinFailed,
             events: EventLog::new(),
         }
@@ -101,6 +106,7 @@ impl Supervisor {
     pub fn on(&mut self, now: u64) {
         if self.state == SvState::Off {
             self.attempt = 0;
+            self.fresh = true;
             self.state = SvState::Waiting { until: now };
         }
     }
@@ -112,6 +118,7 @@ impl Supervisor {
         }
         self.state = SvState::Off;
         self.attempt = 0;
+        self.fresh = false;
     }
 
     /// Whether to start a join now (then the state is `Joining` until `joined`/`join_failed`)
@@ -144,6 +151,7 @@ impl Supervisor {
         }
         self.state = SvState::Up;
         self.attempt = 0;
+        self.fresh = false;
         self.events.push(WifiEvent::LinkUp);
     }
 
@@ -152,7 +160,10 @@ impl Supervisor {
         if self.state == SvState::Off {
             return;
         }
-        self.schedule(now, LinkLoss::JoinFailed);
+        // the first join after switching on came without the 2 s a loss waits: its retry gets them
+        let in_ms = (self.fresh && self.attempt == 1).then_some(self.rhythm.first_ms);
+        self.fresh = false;
+        self.schedule(now, LinkLoss::JoinFailed, in_ms);
     }
 
     /// The link is gone (the AP ended it, no beacons, the chip failed): join again by the rhythm,
@@ -162,12 +173,14 @@ impl Supervisor {
             return;
         }
         self.attempt = 0;
-        self.schedule(now, why);
+        self.fresh = false;
+        self.schedule(now, why, None);
     }
 
-    fn schedule(&mut self, now: u64, why: LinkLoss) {
+    // `in_ms`: a wait other than the rhythm's for the next join
+    fn schedule(&mut self, now: u64, why: LinkLoss, in_ms: Option<u64>) {
         let next = self.attempt.saturating_add(1);
-        let in_ms = self.rhythm.delay(next);
+        let in_ms = in_ms.unwrap_or_else(|| self.rhythm.delay(next));
         self.why = why;
         self.state = SvState::Waiting {
             until: now.saturating_add(in_ms),

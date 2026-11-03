@@ -173,7 +173,7 @@ fn sample(d: &KeyDef) -> Value {
         (Type::Int { min, max, .. }, Value::Int(n)) => Value::Int(if n == max { *min } else { *max }),
         // A word default (kernel.preload.max_mb = all): a number is the change.
         (Type::Int { min, word: Some(_), .. }, Value::Text(_)) => Value::Int(*min),
-        (Type::Choice(c), v) => Value::Text(c.iter().find(|x| Value::Text((*x).clone()) != *v).unwrap().clone()),
+        (Type::Choice { values: c, .. }, v) => Value::Text(c.iter().find(|x| Value::Text((*x).clone()) != *v).unwrap().clone()),
         (Type::Color, _) => Value::Text("#123abc".into()),
         (Type::Text { .. }, _) => Value::Text("Test Font".into()),
         (Type::LogSpec, _) => Value::Text("warn,net=debug".into()),
@@ -188,7 +188,7 @@ fn wrong(d: &KeyDef) -> Vec<String> {
         Type::Int { min, max, .. } => {
             [max.checked_add(1), min.checked_sub(1)].into_iter().flatten().map(|n| n.to_string()).collect()
         }
-        Type::Choice(_) => vec![r#""no_such_choice""#.into()],
+        Type::Choice { .. } => vec![r#""no_such_choice""#.into()],
         Type::Color => vec![r##""#12""##.into(), r#""red""#.into()],
         Type::Text { max } => vec![format!("\"{}\"", "x".repeat(max + 1)), r#""a\tb""#.into()],
         Type::LogSpec => vec![r#""net=loud""#.into(), r#""=debug""#.into()],

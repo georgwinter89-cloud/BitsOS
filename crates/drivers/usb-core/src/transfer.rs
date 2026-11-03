@@ -19,7 +19,7 @@
 //! - **Interrupt IN pipes** (`Device::interrupt_pipe`): the host keeps `depth` transfers queued and hands every
 //!   report to a sink; errors are repaired by the host (V1's give-up rule after 50 in a row).
 
-use crate::host::{Sink, UsbError};
+use crate::host::UsbError;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
@@ -240,9 +240,6 @@ impl Transfer {
         self.urb.result().unwrap_or(XferResult::failed(UsbError::Timeout, 0))
     }
 }
-
-/// The sink type of interrupt pipes, re-exported here for class drivers.
-pub type PipeSink = Sink;
 
 #[cfg(test)]
 mod tests {

@@ -422,6 +422,9 @@ pub mod gen_flag {
     pub const OTHERS_SKIPPED: u32 = 1 << 4;
     /// Safe mode (BT-5, the Gaming-PC): bitsboot wrote no marker and chose read-only.
     pub const SAFE_MODE: u32 = 1 << 5;
+    /// RB-14 CR-3 (INT-W24): the last start ended in a sync flood (FCH `S5_RESET_STATUS` bit 27 or 31), so the
+    /// newest generation kept its one try and the newest confirmed one was started.
+    pub const FLOOD_START: u32 = 1 << 6;
 }
 impl Generation {
     pub(crate) fn parse(p: &[u8]) -> Option<Self> {

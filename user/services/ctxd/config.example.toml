@@ -4,12 +4,12 @@
 [context]
 # Only these folders are read. private = true: never shown to Claude (MCP), only on Georg's own screen.
 roots = [
-  { path = "/home/georg/ctxd-probe/dokumente" },
-  { path = "/home/georg/ctxd-probe/privat", private = true },
+  { path = "/home/user/ctxd-probe/dokumente" },
+  { path = "/home/user/ctxd-probe/privat", private = true },
 ]
 # Extra folders that are always refused (the Windows disk rules apply anyway).
 forbidden_roots = []
-# data = "/home/georg/.local/share/ctxd"      # default; or --data DIR
+# data = "~/.local/share/ctxd"      # default; or --data DIR
 
 [context.index]
 threads = 8            # extraction workers

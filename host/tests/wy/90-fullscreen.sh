@@ -26,6 +26,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 
 echo "== build bitscomp, wyclient"
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q --offline && cargo build --release -q --offline -p wyclient)
+# WY-14/15: WY_GPU=1 runs this scenario with the gpu build, WY_GPU=gles with its GLES renderer (tools/gpu-host.sh).
+. "$ROOT/host/tests/wy/tools/gpu-host.sh"
 
 PIDS=()
 cleanup() {
@@ -78,9 +80,10 @@ red() { # x y: the screen pixel shows the fullscreen client's colour (pattern 0)
 }
 
 echo "== bitscomp 2000x1125 (1600x900 logical), two tiles and a float"
-"$BIN" --backend headless --size 2000x1125 --socket "$SOCK" --mcp none --fixed-status --settings none >"$RUN/bitscomp.log" 2>&1 &
+"${START[@]}" --backend headless --size 2000x1125 --socket "$SOCK" --mcp none --fixed-status --settings none >"$RUN/bitscomp.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/$SOCK.ctl" ] && break; sleep 0.1; done
+gpu_host_check "$RUN/bitscomp.log" "${PIDS[-1]}"
 wait_for "end" ctl list "no control socket"
 client Links 0
 client Rechts 1

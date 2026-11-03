@@ -16,3 +16,8 @@ time = { path = "../../time" }
 sched = { path = "../../sched" }
 ktest = { path = "../../ktest" }
 usb-core = { path = "../usb-core" }
+# RB-14: the storage stop before a reset (`block::shutdown`, stage Host).
+block = { path = "../../block" }
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@
 // noted with its place in the trace (d.calls).
 import { pathToFileURL } from 'node:url';
 
-const WZ = process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan';
+const WZ = process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`;
 const { R } = await import(pathToFileURL(`${WZ}/kit/rtwdev.mjs`).href);
 
 async function setHwSchTxEn(d, txEn, mask) {

@@ -82,7 +82,7 @@ pub(crate) fn admit_at(tat: &AtomicU64, now: u64, period: u64, tolerance: u64) -
 }
 
 /// The emit path's check (`record`).
-pub(crate) fn admit(subsystem: &'static str, name: &'static str, now: u64) -> bool {
+pub(crate) fn admit(subsystem: &'static str, name: &'static str, level: crate::Level, now: u64) -> bool {
     let period = PERIOD_NS.load(Ordering::Relaxed);
     if period == 0 || now == 0 || subsystem == "klog" || SUSPENDED.load(Ordering::Relaxed) != 0 {
         return true;
@@ -91,7 +91,9 @@ pub(crate) fn admit(subsystem: &'static str, name: &'static str, now: u64) -> bo
     if admit_at(&key.tat, now, period, TOLERANCE_NS.load(Ordering::Relaxed)) {
         return true;
     }
-    key.suppressed.fetch_add(1, Ordering::Relaxed);
+    // Count and level in one word (`count_one`), so `report` takes both at once: a record is never counted in
+    // one round and summarised at another round's level.
+    let _ = key.suppressed.try_update(Ordering::Relaxed, Ordering::Relaxed, |w| Some(count_one(w, level)));
     SUPPRESSED.inc();
     false
 }
@@ -101,7 +103,8 @@ pub fn suppressed() -> u64 {
     SUPPRESSED.get()
 }
 
-/// klogd, once a second: reports and clears the per-key counts (one Warn record per key that lost records).
+/// klogd, once a second: reports and clears the per-key counts (one record per key that lost records, at the
+/// level of the records it lost).
 /// Returns the records reported.
 pub fn sweep() -> u64 {
     let mut total = 0;
@@ -111,11 +114,49 @@ pub fn sweep() -> u64 {
 
 /// Reports and clears one key's count (`sweep`); the records reported.
 pub(crate) fn report(k: &keys::Key) -> u64 {
-    if k.suppressed.load(Ordering::Relaxed) == 0 {
+    if k.suppressed.load(Ordering::Relaxed) & COUNT_MASK == 0 {
         return 0;
     }
     let Some((sub, name)) = k.names() else { return 0 };
-    let n = k.suppressed.swap(0, Ordering::Relaxed);
-    event!(Warn, "klog", "ratelimit.suppressed", subsystem = sub, event = name, count = n);
+    let (n, kept) = unpack(k.suppressed.swap(0, Ordering::Relaxed));
+    if n == 0 {
+        return 0;
+    }
+    // The summary carries the level of what it stands for: a storm of Debug records is not a warning (Georg
+    // 26.10.: a warning only when something is wrong; Linux's lib/ratelimit.c prints its "callbacks suppressed"
+    // line at KERN_WARNING whatever was limited, BitsOS does not). A count without a level (written directly,
+    // not by `admit`) is a handled state: Info.
+    let level = kept.unwrap_or(crate::Level::Info);
+    // Shown when the records it stands for would be (their subsystem's setting), whatever "klog"'s is.
+    if level <= crate::levels::effective(sub, false) {
+        // event! takes a literal level; this summary's level is a runtime value (the suppressed records' level),
+        // so the Event is built by hand, mirroring the macro's field construction.
+        let fields = [
+            crate::Field { key: "subsystem", value: crate::IntoValue::into_value(sub) },
+            crate::Field { key: "event", value: crate::IntoValue::into_value(name) },
+            crate::Field { key: "count", value: crate::IntoValue::into_value(&n) },
+        ];
+        crate::record_admitted(&crate::Event { level, subsystem: "klog", name: "ratelimit.suppressed", fields: &fields, message: None }, false);
+    }
     n
+}
+
+/// `Key::suppressed` holds the count in its low 56 bits and the most severe suppressed level in the top byte
+/// (`Level as u8 + 1`; 0: none kept).
+pub(crate) const COUNT_MASK: u64 = (1 << 56) - 1;
+
+/// The word after one more suppressed record at `level` (saturating count, most severe level kept).
+pub(crate) fn count_one(w: u64, level: crate::Level) -> u64 {
+    let count = ((w & COUNT_MASK) + 1).min(COUNT_MASK);
+    let code = level as u64 + 1;
+    let old = w >> 56;
+    let code = if old == 0 { code } else { old.min(code) };
+    (code << 56) | count
+}
+
+/// (count, most severe level) of a `Key::suppressed` word.
+pub(crate) fn unpack(w: u64) -> (u64, Option<crate::Level>) {
+    use crate::Level::*;
+    let code = (w >> 56) as u8;
+    (w & COUNT_MASK, [Error, Warn, Info, Debug, Trace].into_iter().find(|l| *l as u8 + 1 == code))
 }

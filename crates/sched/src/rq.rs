@@ -60,12 +60,6 @@ impl<T> RunQueue<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub fn rt_len(&self) -> usize {
-        self.rt.len()
-    }
-    pub fn fair_len(&self) -> usize {
-        self.fair.len()
-    }
 
     /// Queues a KernelRt thread behind the others of its priority, or (`front`, a preempted thread) before them.
     /// `Err(item)`: no memory to grow the queue.

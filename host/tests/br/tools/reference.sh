@@ -6,6 +6,8 @@
 #   reference.sh OUT HTTP_PORT URL MARK [Brave arguments...]
 # Writes OUT/shot.ppm (the screen once MARK is in the window title and the picture stood still), OUT/list.txt,
 # OUT/bitscomp.log, OUT/brave.log. Exit 0 = picture made. The HTTP server on 127.0.0.1:HTTP_PORT is the caller's.
+# BR-6: with REF_KEYS (evdev key codes as `bitscomp ctl key` takes them, German layout) and REF_MARK2 the keys are
+# typed once MARK is there (a chrome:// page Chromium does not open from its command line), then REF_MARK2 is awaited.
 set -uo pipefail
 OUT=$1 PORT=$2 URL=$3 MARK=$4
 shift 4
@@ -66,6 +68,17 @@ for _ in $(seq 60); do
 done
 [ "$ok" = 1 ] || { echo "FAIL: '$MARK' never in the host's window title"; ctl list; exit 1; }
 ctl max >/dev/null
+if [ -n "${REF_KEYS:-}" ]; then
+    sleep 2
+    # shellcheck disable=SC2086
+    ctl key $REF_KEYS >/dev/null
+    ok=0
+    for _ in $(seq 60); do
+        if ctl list 2>/dev/null | grep -qF "${REF_MARK2:?REF_MARK2 goes with REF_KEYS}"; then ok=1; break; fi
+        sleep 1
+    done
+    [ "$ok" = 1 ] || { echo "FAIL: '$REF_MARK2' never in the host's window title after the keys"; ctl list; exit 1; }
+fi
 # The picture stands still: two shots a second apart are the same file.
 prev=""
 for i in $(seq 20); do

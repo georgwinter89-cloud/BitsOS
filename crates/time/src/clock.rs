@@ -92,23 +92,56 @@ impl Clock {
 
     pub fn snapshot(&self) -> Snapshot {
         loop {
-            let s1 = self.seq.load(Ordering::Acquire);
-            if s1 & 1 == 1 {
-                core::hint::spin_loop();
-                continue;
-            }
-            let snap = Snapshot {
-                base_tsc: self.base_tsc.load(Ordering::Relaxed),
-                base_ns: self.base_ns.load(Ordering::Relaxed),
-                hz: self.hz.load(Ordering::Relaxed),
-                ns_mult: self.ns_mult.load(Ordering::Relaxed),
-                tick_mult: self.tick_mult.load(Ordering::Relaxed),
-            };
-            fence(Ordering::Acquire);
-            if self.seq.load(Ordering::Relaxed) == s1 {
+            if let Some(snap) = self.read_once() {
                 return snap;
             }
+            core::hint::spin_loop();
         }
+    }
+
+    /// `snapshot` with at most `spins` tries (RB-13 CR-5): `None` while a writer holds the sequence odd longer.
+    /// A CPU a panic stopped inside `set_rate` keeps it odd for good; the panic path and the log's clock must not
+    /// spin on that.
+    pub fn try_snapshot(&self, spins: u32) -> Option<Snapshot> {
+        for _ in 0..spins {
+            if let Some(snap) = self.read_once() {
+                return Some(snap);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+
+    /// The fields as they are, without the sequence check: a value that may mix an old and a new rate, for
+    /// when `try_snapshot` gave up (a log time stamp, never a deadline).
+    pub fn snapshot_unchecked(&self) -> Snapshot {
+        self.fields()
+    }
+
+    fn read_once(&self) -> Option<Snapshot> {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if s1 & 1 == 1 {
+            return None;
+        }
+        let snap = self.fields();
+        fence(Ordering::Acquire);
+        (self.seq.load(Ordering::Relaxed) == s1).then_some(snap)
+    }
+
+    fn fields(&self) -> Snapshot {
+        Snapshot {
+            base_tsc: self.base_tsc.load(Ordering::Relaxed),
+            base_ns: self.base_ns.load(Ordering::Relaxed),
+            hz: self.hz.load(Ordering::Relaxed),
+            ns_mult: self.ns_mult.load(Ordering::Relaxed),
+            tick_mult: self.tick_mult.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Moves the sequence by one (tests: odd = a writer that never ends, as a CPU a panic stopped in `set_rate`).
+    #[cfg(test)]
+    pub(crate) fn bump_seq_for_test(&self) {
+        self.seq.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Sets the rate from TSC value `tsc` on: the clock reads what it read there with the old rate (0 the first
@@ -145,6 +178,19 @@ impl Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_snapshot_gives_up_while_a_writer_holds_the_sequence() {
+        let c = Clock::new();
+        c.set_rate(1000, 2_000_000_000);
+        assert_eq!(c.try_snapshot(10).map(|s| s.hz), Some(2_000_000_000));
+        c.bump_seq_for_test();
+        assert!(c.try_snapshot(1000).is_none());
+        assert_eq!(c.snapshot_unchecked().hz, 2_000_000_000);
+        c.bump_seq_for_test();
+        assert_eq!(c.try_snapshot(1).map(|s| s.base_tsc), Some(1000));
+        assert_eq!(c.try_snapshot(0), None);
+    }
 
     #[test]
     fn conversion_is_exact_to_a_ppb() {

@@ -21,6 +21,7 @@ TOKEN="wy1b-scenario-token-7e2f"
 LOG="$RUN_DIR/serial.log"
 QMP="$RUN_DIR/qmp.sock"
 NAME=wy-foot
+WY_GPU_CFG=$(bash host/tests/wy/tools/gpu-image.sh config)
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
 
 PROBE="$RUN_DIR/memfd-lazy"
@@ -28,7 +29,9 @@ V2_SYSROOT="${V2_SYSROOT:-$PWD/user/sysroot/out/sysroot}" user/sysroot/bin/v2-cc
     -o "$PROBE" host/tests/wy/memfd_lazy.c
 "$PROBE" | grep -qx "result ok" || { echo "RED: memfd_lazy on CachyOS (the oracle) did not say result ok"; exit 1; }
 export WY_MEMFD_PROBE="$PROBE"
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=${WY_LOGLEVEL:-warn,syscall=info};screen=1280x800"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=${WY_LOGLEVEL:-warn,syscall=info};screen=1280x800$WY_GPU_CFG"
+# WY-14: WY_GPU=1 runs this scenario with the gpu build (CONFIG.TXT bitscomp=gpu, tools/gpu-image.sh).
+bash host/tests/wy/tools/gpu-image.sh image "$NAME"
 rm -f "$LOG" "$QMP"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 600 --serial-log "$LOG" \
     -- -smp 4 -qmp "unix:$QMP,server=on,wait=off" > "$RUN_DIR/qemu.out" 2>&1 &

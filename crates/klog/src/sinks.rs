@@ -1,7 +1,8 @@
 //! Sinks: where rendered lines go besides the ring and serial.
 //!
-//! - Inline sinks (`add_sink`, the G0 contract) run in the emitter's context and must be quick.
-//! - Deferred sinks (`add_deferred_sink`) are fed from the ring by `drain_deferred`, which the klogd thread
+//! - Every sink is deferred (C1 removed the G0 inline kind, `add_sink`: no code used it, and the emitter walked
+//!   the list for it on every line). Deferred sinks (`add_deferred_sink`) are fed from the ring by
+//!   `drain_deferred`, which the klogd thread
 //!   runs; the emitter never waits for them, so a slow sink (framebuffer scroll, the network mirror of RB-4)
 //!   cannot slow down or block the code that logs. A deferred sink that falls behind the ring gets one
 //!   `Sink::lost(n)` call (default: the line `[... n records lost]`; RB-4's mirror overrides it to send
@@ -23,18 +24,15 @@
 use crate::reader::{self, Filter};
 use crate::{Level, Sink};
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ksync::OnceRef;
 
 pub struct SinkNode {
     name: &'static str,
     sink: &'static dyn Sink,
-    deferred: bool,
-    /// Deferred sinks: the next sequence number this sink has not seen.
+    /// The next sequence number this sink has not seen.
     cursor: AtomicU64,
     removed: AtomicBool,
-    /// CPU tag while an inline sink runs, so a nested emit on that CPU skips it instead of recursing.
-    busy: AtomicUsize,
     next: OnceRef<SinkNode>,
 }
 
@@ -87,28 +85,15 @@ fn iter() -> impl Iterator<Item = &'static SinkNode> {
     })
 }
 
-fn node(name: &'static str, sink: &'static dyn Sink, deferred: bool, cursor: u64) -> SinkNode {
-    SinkNode {
-        name,
-        sink,
-        deferred,
-        cursor: AtomicU64::new(cursor),
-        removed: AtomicBool::new(false),
-        busy: AtomicUsize::new(0),
-        next: OnceRef::new(),
-    }
-}
-
-/// G0 contract: an inline sink, called in the emitter's context (needs the heap).
-pub fn add_sink(s: &'static dyn Sink) {
-    append(node("inline", s, false, 0));
+fn node(name: &'static str, sink: &'static dyn Sink, cursor: u64) -> SinkNode {
+    SinkNode { name, sink, cursor: AtomicU64::new(cursor), removed: AtomicBool::new(false), next: OnceRef::new() }
 }
 
 /// A sink fed by the klogd thread. `replay`: start with the oldest record still kept (the mirror wants the
 /// whole boot), else with the next record.
 pub fn add_deferred_sink(name: &'static str, s: &'static dyn Sink, replay: bool) -> SinkId {
     let start = if replay { 0 } else { crate::next_seq() };
-    let id = append(node(name, s, true, start));
+    let id = append(node(name, s, start));
     if replay && !drainer() {
         // No drainer yet: catch this sink up now (the caller is the boot, a normal context); then the emitters
         // feed it. If another CPU feeds right now, it takes this sink along.
@@ -123,24 +108,9 @@ pub fn remove_sink(id: SinkId) {
     id.0.removed.store(true, Ordering::Release);
 }
 
-/// The emitter's part: inline sinks always; while no drainer runs also the deferred sinks, from the ring in
-/// order (`catch_up`), if this context may draw.
-pub(crate) fn inline(level: Level, line: &str) {
-    {
-        // The thread stays on this CPU while it owns a sink's `busy` tag (a move would leave the tag naming a
-        // CPU it no longer runs on, and that CPU's lines would skip the sink; review INT-A1d core 2). Not across
-        // `catch_up` below, which needs `may_feed` (preempt count 0).
-        let _pg = ksync::PreemptGuard::new();
-        let me = crate::cpu_tag();
-        for n in iter().filter(|n| !n.deferred && !n.removed.load(Ordering::Acquire)) {
-            if n.busy.load(Ordering::Acquire) == me {
-                continue;
-            }
-            n.busy.store(me, Ordering::Release);
-            n.sink.write_line(level, line);
-            let _ = n.busy.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed);
-        }
-    }
+/// The emitter's part: while no drainer runs it feeds the sinks from the ring in order (`catch_up`), if this
+/// context may draw.
+pub(crate) fn after_emit() {
     if !drainer() && may_feed() {
         catch_up(EMIT_ROUNDS);
     }
@@ -162,7 +132,7 @@ fn catch_up(rounds: usize) {
         if DRAINING.swap(true, Ordering::SeqCst) {
             return;
         }
-        for n in iter().filter(|n| n.deferred && !n.removed.load(Ordering::Acquire)) {
+        for n in iter().filter(|n| !n.removed.load(Ordering::Acquire)) {
             drain_node(n, CATCH_UP_BUDGET);
         }
         DRAINING.swap(false, Ordering::SeqCst);
@@ -187,7 +157,7 @@ pub(crate) fn flush_emergency() {
 /// True when a deferred sink has records it has not seen.
 pub fn pending() -> bool {
     let next = crate::next_seq();
-    iter().any(|n| n.deferred && !n.removed.load(Ordering::Acquire) && n.cursor.load(Ordering::Acquire) < next)
+    iter().any(|n| !n.removed.load(Ordering::Acquire) && n.cursor.load(Ordering::Acquire) < next)
 }
 
 /// Feeds every deferred sink up to `budget` records each; returns the lines written. Only one drainer runs
@@ -199,7 +169,7 @@ pub fn drain_deferred(budget: usize) -> usize {
         return 0;
     }
     let mut written = 0;
-    for n in iter().filter(|n| n.deferred && !n.removed.load(Ordering::Acquire)) {
+    for n in iter().filter(|n| !n.removed.load(Ordering::Acquire)) {
         written += drain_node(n, budget);
     }
     DRAINING.swap(false, Ordering::SeqCst);
@@ -228,7 +198,7 @@ fn drain_node(n: &SinkNode, budget: usize) -> usize {
     written
 }
 
-/// (name, deferred, cursor) of every active sink, for `ring_info` and the `log` tool.
-pub fn list() -> alloc::vec::Vec<(&'static str, bool, u64)> {
-    iter().filter(|n| !n.removed.load(Ordering::Acquire)).map(|n| (n.name, n.deferred, n.cursor.load(Ordering::Relaxed))).collect()
+/// (name, cursor) of every active sink, for `ring_info` and the `log` tool.
+pub fn list() -> alloc::vec::Vec<(&'static str, u64)> {
+    iter().filter(|n| !n.removed.load(Ordering::Acquire)).map(|n| (n.name, n.cursor.load(Ordering::Relaxed))).collect()
 }

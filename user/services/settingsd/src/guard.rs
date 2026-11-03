@@ -8,8 +8,8 @@
 pub const R8_SWITCHES: &[&str] = &["nvme_write", "stick_write", "usb_msd_write"];
 /// CONFIG.TXT keys the kernel never shows; they stay out of journal, history and answers.
 pub const KERNEL_SECRETS: &[&str] = &["token", "wlan_psk", "claude_api_key"];
-/// FS-7's guarded CONFIG keys.
-const GUARDED: &[&str] = &["nvme_write", "stick_write", "usb_msd_write"];
+/// FS-7's guarded CONFIG keys (MC-10: `mcp`, `mcp_confirmer` too; fs-fat also keeps `mcp` from being dropped).
+const GUARDED: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
 
 fn is_switch(s: &str) -> bool {
     let s = s.trim().trim_start_matches('\u{feff}').to_ascii_lowercase();
@@ -123,6 +123,10 @@ pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
         {
             return Err(k.to_string());
         }
+    }
+    // MC-10: `mcp` may not even be dropped (fs-fat's FIXED_KEYS).
+    if effective(new, "mcp") != effective(old, "mcp") {
+        return Err(String::from("mcp"));
     }
     Ok(())
 }

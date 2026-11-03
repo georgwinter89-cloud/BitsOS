@@ -39,6 +39,8 @@ pub trait Conn: TcpStream {
     fn send_queue(&self) -> usize;
     fn set_nodelay(&self, _on: bool) {}
     fn set_keepalive(&self, _on: bool) {}
+    /// TCP_QUICKACK: false is Linux's pingpong mode (delayed ACKs), true leaves it (NW-10 fixer).
+    fn set_quickack(&self, _on: bool) {}
     /// The program owning it (its connection records name that program, B3).
     fn set_owner(&self, _who: policy::Subject) {}
     /// The socket layer saw the handshake finish (the connection record is written then, not inside `state`,

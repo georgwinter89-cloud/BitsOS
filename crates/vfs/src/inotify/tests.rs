@@ -26,7 +26,7 @@ macro_rules! env {
     ($ns:ident, $fds:ident, $mem:ident, $s:ident) => {
         let ($ns, $fds) = program_view();
         let $mem = Mem::new();
-        let $s = Sys { mem: &$mem, fds: &$fds, ns: &$ns, cred: USER, subject: SUBJECT };
+        let $s = Sys { mem: &$mem, fds: &$fds, fs: &crate::fd::FsState::new(), ns: &$ns, cred: USER, subject: SUBJECT };
     };
 }
 

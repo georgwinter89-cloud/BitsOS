@@ -2,7 +2,7 @@
 
 use crate::cpu::{self, EFER};
 use crate::handover::{self, Loaded, ModuleFile};
-use crate::{Ctx, R, elf, fail, files, generation, gop, machine, markers, mem, stick};
+use crate::{Ctx, R, elf, fail, fch, files, generation, gop, machine, markers, mem, stick};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,6 +14,7 @@ use log::{info, warn};
 use uefi::boot;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::Directory;
+use zeroize::Zeroize;
 
 const FW_DIR: &str = "\\BITSOS2\\fw";
 const CONFIG: &str = "\\BITSOS2\\CONFIG.TXT";
@@ -39,7 +40,7 @@ pub fn run() -> R<Infallible> {
     let mut root = files::open_volume(device)?;
     let volume = files::volume_info(&mut root);
 
-    let file = match files::read(&mut root, CONFIG)? {
+    let mut file = match files::read(&mut root, CONFIG)? {
         Some(c) => {
             info!("{CONFIG}: {} bytes", c.len());
             c
@@ -50,6 +51,8 @@ pub fn run() -> R<Infallible> {
         }
     };
     let (config, safe) = choose_profile(&file);
+    // RB-18: CONFIG.TXT holds secrets and this RAM is free once the kernel runs.
+    file.zeroize();
     let hook = if cpu::hypervisor() { config::test_hook(&config) } else { TestHook::None };
     if hook != TestHook::None {
         warn!("test hook {}: {hook:?} (honoured only under a hypervisor)", config::TEST_KEY);
@@ -60,7 +63,8 @@ pub fn run() -> R<Infallible> {
     // The firmware blobs first: a read error there must not use up a new generation's one try (TRY is written
     // inside load_generation; after it only the stick probe, the screen and the hand-over remain).
     let fw = load_fw(&mut root)?;
-    let (generation, kernel, segments, initrd) = load_generation(&mut root, &gens_found, pin, safe)?;
+    let flood = !safe && after_sync_flood();
+    let (generation, kernel, segments, initrd) = load_generation(&mut root, &gens_found, pin, safe, flood)?;
     let mut modules = alloc::vec![initrd];
     modules.extend(fw);
     let mut stick = stick::probe(device, &mut root);
@@ -108,15 +112,40 @@ fn choose_profile(file: &[u8]) -> (Vec<u8>, bool) {
     (config, d.profile.safe())
 }
 
+/// RB-14 CR-3: whether the FCH says the last start ended in a sync flood (read only; logged either way).
+fn after_sync_flood() -> bool {
+    match fch::s5_reset_status() {
+        Ok(v) if v != u32::MAX && v & fch::SYNC_FLOOD != 0 => {
+            warn!("bitsboot flood_start s5_reset_status={v:#010x}: the last start ended in a sync flood; a new generation keeps its one try");
+            true
+        }
+        Ok(v) => {
+            info!("bitsboot s5_reset_status={v:#010x}");
+            false
+        }
+        Err(why) => {
+            info!("bitsboot s5_reset_status not read: {why}");
+            false
+        }
+    }
+}
+
 type Chosen = (bootinfo::Generation, elf::Loaded, Vec<bitsboot_pure::elf::Segment>, ModuleFile);
 
 /// The marker rule (`bitsboot_pure::gens::choose`, V2-PLAN §7): load what it picks; a generation whose files
 /// fail the checks, or whose TRY cannot be written, goes back to the rule, which then picks the next one.
-/// Safe mode (`safe`) chooses by `gens::choose_read_only`: no marker is ever written.
-fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens::Pin, safe: bool) -> R<Chosen> {
+/// Safe mode (`safe`) chooses by `gens::choose_read_only`: no marker is ever written. A start after a sync flood
+/// (`flood`, RB-14 CR-3) chooses by `gens::choose_after_flood`: a new generation keeps its one try.
+fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens::Pin, safe: bool, flood: bool) -> R<Chosen> {
     let (mut bad, mut mark_failed, mut problems) = (Vec::new(), Vec::new(), Vec::<String>::new());
     loop {
-        let choice = if safe { gens::choose_read_only(gens_found, pin, &bad) } else { gens::choose(gens_found, pin, &bad, &mark_failed) };
+        let choice = if safe {
+            gens::choose_read_only(gens_found, pin, &bad)
+        } else if flood {
+            gens::choose_after_flood(gens_found, pin, &bad, &mark_failed)
+        } else {
+            gens::choose(gens_found, pin, &bad, &mark_failed)
+        };
         let (record, mark_try, why) = match choice {
             gens::Choice::Start { record, mark_try, why } => (record, mark_try, why),
             gens::Choice::Refuse(why) => {
@@ -148,7 +177,7 @@ fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens:
             gens::flag_names(record.flags)
         );
         // A fallback or anything unusual is a warning (it shows on the screen in another colour).
-        let unusual = gens::flag::PIN_IGNORED | gens::flag::NO_CONFIRMED_FALLBACK | gens::flag::MARKER_WRITE_FAILED | gens::flag::OTHERS_SKIPPED;
+        let unusual = gens::flag::PIN_IGNORED | gens::flag::NO_CONFIRMED_FALLBACK | gens::flag::MARKER_WRITE_FAILED | gens::flag::OTHERS_SKIPPED | gens::flag::FLOOD_START;
         if record.skipped != 0 && record.reason != bootinfo::gen_reason::PINNED || record.flags & unusual != 0 {
             warn!("bitsboot {line}");
         } else {

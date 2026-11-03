@@ -35,10 +35,10 @@ mod view;
 
 pub use ask::{answer, ask_timeout_ns, pending_asks, set_ask_listener, set_ask_timeout_ns, AskInfo, AskListener};
 pub use conn::{conn_keep, record_conn, recent_connections, set_conn_keep, ConnKind, ConnRecord};
-pub use dns::{dns_keep, dns_names, note_dns_answer, parse_answer, set_dns_keep};
-pub use udp::{set_udp_peer_keep, udp_peer_keep, UdpPeers};
+pub use dns::{dns_keep, dns_names, note_dns_answer, parse_answer};
+pub use udp::{udp_peer_keep, UdpPeers};
 pub use view::{
-    connection_counts, connections, forget_test_connections, open as open_conn, open_counted, proto_name, record_live_ns, set_owners, set_record_live_ns,
+    connection_counts, connections, forget_test_connections, open as open_conn, open_counted, proto_name, record_live_ns, set_owners,
     ConnCounters, ConnFilter, ConnHandle, ConnInfo, Owners,
 };
 pub use rules::{Decision, DeviceRule, NameRule, NetRule, PathRule, RuleSet, SignalRule};

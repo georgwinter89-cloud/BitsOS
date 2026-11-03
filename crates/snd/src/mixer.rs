@@ -64,6 +64,13 @@ impl Config {
     pub fn period_ns(&self) -> u64 {
         self.period as u64 * 1_000_000_000 / OUT_RATE as u64
     }
+    /// SN-13 (w25): how long a retiring output may take to play out its rest before it is closed anyway: twice
+    /// what a drain takes (lead + drain margin) plus four periods. A stream whose position stops (a controller
+    /// that stopped counting) would otherwise stay open, and the controller streaming, with no client (B4).
+    pub fn retire_ns(&self) -> u64 {
+        let frames = self.lead as u64 + self.drain_margin as u64 + 4 * self.period as u64;
+        2 * frames * 1_000_000_000 / OUT_RATE as u64
+    }
 }
 
 /// What the mixer thread shares with clients and callers.
@@ -152,7 +159,7 @@ impl Shared {
         }
     }
 
-    fn now(&self) -> u64 {
+    pub(crate) fn now(&self) -> u64 {
         #[cfg(test)]
         if let t @ 1.. = self.test_now.load(Ordering::Acquire) {
             return t;
@@ -300,9 +307,35 @@ impl Out {
     }
 }
 
+/// Span of the lateness window: the reported worst lateness covers the last one to two of these.
+pub const LATE_WINDOW_NS: u64 = 1_000_000_000;
+
+/// What an xrun knew (SN-12): the desk reads it from `snd client.xrun` to tell a late writer from a late
+/// mixer (the 24.10. YouTube xruns). Times in ns; host tests read it with [`Core::last_xrun`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XrunInfo {
+    pub id: u64,
+    /// Output period (frames at the output rate) and the frames this mix step wanted and got (client rate).
+    pub period: u32,
+    pub need: usize,
+    pub got: usize,
+    /// The client ring after the step: free frames (ALSA avail) and its size.
+    pub avail: usize,
+    pub ring: usize,
+    pub consumed: u64,
+    /// Since the writer's last write that took frames (None: it never wrote).
+    pub since_write: Option<u64>,
+    /// How late this mixer step ran after the wake-up it asked for, and the most in the last one to two
+    /// [`LATE_WINDOW_NS`] of busy steps since the previous xrun.
+    pub late: u64,
+    pub late_max: u64,
+}
+
 struct Retiring {
     o: Out,
     until: u64,
+    /// Closed at this time even if the position never reaches `until` ([`Config::retire_ns`]).
+    deadline: u64,
 }
 
 pub struct Core<B: Backend> {
@@ -323,6 +356,16 @@ pub struct Core<B: Backend> {
     hw_underruns: u64,
     published: Option<String>,
     now: u64,
+    /// Clock at which the previous step asked to run again (0: none yet); `late` is how far past it this
+    /// step ran (a kick before it is not late). The worst lateness is kept over a sliding window of one to
+    /// two [`LATE_WINDOW_NS`] (`late_max` this window from `late_win_at`, `late_prev` the one before) and is
+    /// cleared while idle and at each xrun report, so an old spike does not show up in a later xrun.
+    due: u64,
+    late: u64,
+    late_max: u64,
+    late_prev: u64,
+    late_win_at: u64,
+    last_xrun: Option<XrunInfo>,
     acc: Vec<[i64; 2]>,
     tmp: Vec<[i32; 2]>,
     inbuf: Vec<[i16; 2]>,
@@ -370,6 +413,12 @@ impl<B: Backend> Core<B> {
             hw_underruns: 0,
             published: None,
             now: 0,
+            due: 0,
+            late: 0,
+            late_max: 0,
+            late_prev: 0,
+            late_win_at: 0,
+            last_xrun: None,
             acc: Vec::new(),
             tmp: Vec::new(),
             inbuf: Vec::new(),
@@ -383,12 +432,44 @@ impl<B: Backend> Core<B> {
     pub fn backend(&mut self) -> &mut B {
         &mut self.b
     }
+    /// The thread starts its sleep at `due - sleep`, after the step's own work: it moves `due` there so the
+    /// step's run time is not counted as lateness (host tests keep step's own `now + sleep`).
+    pub fn sleeping_until(&mut self, due: u64) {
+        self.due = due;
+    }
+    /// How late the last step ran, and the worst lateness in the current window (see `late_max`).
+    pub fn lateness(&self) -> (u64, u64) {
+        (self.late, self.late_max.max(self.late_prev))
+    }
+    /// The last xrun this mixer reported.
+    pub fn last_xrun(&self) -> Option<XrunInfo> {
+        self.last_xrun
+    }
 
     /// One round; returns how long the thread may sleep (it is also woken by kicks).
     pub fn step(&mut self, now: u64) -> u64 {
+        let sleep = self.step_inner(now);
+        self.due = now.saturating_add(sleep);
+        sleep
+    }
+
+    fn step_inner(&mut self, now: u64) -> u64 {
         self.now = now;
+        self.late = if self.due == 0 { 0 } else { now.saturating_sub(self.due) };
+        let gone = now.saturating_sub(self.late_win_at);
+        if gone >= LATE_WINDOW_NS {
+            self.late_prev = if gone >= 2 * LATE_WINDOW_NS { 0 } else { self.late_max };
+            self.late_max = 0;
+            self.late_win_at = now;
+        }
+        self.late_max = self.late_max.max(self.late);
         self.sync_voices();
         let busy = self.voices.iter().any(|v| matches!(v.snap, State::Running | State::Draining));
+        if !busy {
+            // Idle steps sleep long and nothing can xrun; their lateness says nothing about a later stream.
+            self.late_max = 0;
+            self.late_prev = 0;
+        }
         let tgen = self.sh.target_gen.load(Ordering::Acquire);
         let jack = self.b.take_jack_events();
         if tgen != self.target_gen || jack {
@@ -582,7 +663,8 @@ impl<B: Backend> Core<B> {
                 let new = self.new_out(s, Some(ep), self.mixed - n as u64, carry);
                 if old.ep.is_some() {
                     let until = old.written + self.cfg.drain_margin as u64;
-                    self.retiring.push(Retiring { o: old, until });
+                    let deadline = self.now.saturating_add(self.cfg.retire_ns());
+                    self.retiring.push(Retiring { o: old, until, deadline });
                 } else {
                     old.s.close();
                 }
@@ -652,7 +734,8 @@ impl<B: Backend> Core<B> {
         klog::event!(Info, "snd", "mix.idle_close", endpoint = a.name().as_str(), why = why, written = a.written);
         if a.ep.is_some() && a.started {
             let until = a.written + self.cfg.drain_margin as u64;
-            self.retiring.push(Retiring { o: a, until });
+            let deadline = self.now.saturating_add(self.cfg.retire_ns());
+            self.retiring.push(Retiring { o: a, until, deadline });
         } else {
             a.s.stop();
             a.s.close();
@@ -764,6 +847,14 @@ impl<B: Backend> Core<B> {
                 s.close();
                 return false;
             }
+            if now >= r.deadline {
+                r.o.s.stop();
+                let s = core::mem::replace(&mut r.o.s, NullOut::boxed(0, now));
+                klog::event!(Warn, "snd", "mix.retire_timeout", endpoint = r.o.name().as_str(), played = pos, until = r.until;
+                    "the position did not reach the end of the drain in time: closed anyway");
+                s.close();
+                return false;
+            }
             if pos > r.o.written {
                 r.o.written = pos;
             }
@@ -836,7 +927,30 @@ impl<B: Backend> Core<B> {
                     v.snap = State::Xrun;
                     v.c.silence.fetch_add((need - got) as u64, Ordering::AcqRel);
                     let u = v.c.underruns.fetch_add(1, Ordering::AcqRel) + 1;
-                    klog::event!(Warn, "snd", "client.xrun", id = v.c.id, name = v.c.name.as_str(), count = u; "stopped until prepared");
+                    let (avail, ring) = {
+                        let r = v.c.ring.lock();
+                        (r.free(), r.capacity())
+                    };
+                    let wrote = v.c.wrote_at.load(Ordering::Acquire);
+                    let x = XrunInfo {
+                        id: v.c.id,
+                        period: self.cfg.period,
+                        need,
+                        got,
+                        avail,
+                        ring,
+                        consumed: v.c.consumed.load(Ordering::Acquire),
+                        since_write: (wrote != 0).then(|| self.now.saturating_sub(wrote)),
+                        late: self.late,
+                        late_max: self.late_max.max(self.late_prev),
+                    };
+                    self.late_max = 0;
+                    self.late_prev = 0;
+                    self.last_xrun = Some(x);
+                    klog::event!(Warn, "snd", "client.xrun", id = x.id, name = v.c.name.as_str(), count = u, period = x.period,
+                        need = x.need, got = x.got, avail = x.avail, ring = x.ring, consumed = x.consumed,
+                        since_write_us = x.since_write.map_or(-1, |t| (t / 1000) as i64), late_us = x.late / 1000,
+                        late_max_us = x.late_max / 1000; "stopped until prepared");
                     v.c.space.wake_all();
                     v.c.kick_poll();
                     v.c.done.wake_all();

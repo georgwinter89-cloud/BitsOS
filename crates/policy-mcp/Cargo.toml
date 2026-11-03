@@ -13,3 +13,6 @@ time = { path = "../time" }
 klog = { path = "../klog" }
 ktest = { path = "../ktest" }
 ksync = { path = "../ksync" }
+
+[lints]
+workspace = true

@@ -117,7 +117,7 @@ fn socket_api_and_cli() {
     assert_eq!((code, out.trim()), (0, "150"));
     let (code, out, _) = cli(&env, &["list", "theme.font"]);
     assert_eq!(code, 0);
-    assert!(out.contains("theme.font.ui = Exo 2"), "{out}");
+    assert!(out.contains("theme.font.ui = Figtree"), "{out}");
     let (code, out, _) = cli(&env, &["history", "3"]);
     assert_eq!(code, 0);
     assert!(out.lines().next().unwrap().contains("theme.scale: 125 -> 150 by cli"), "{out}");

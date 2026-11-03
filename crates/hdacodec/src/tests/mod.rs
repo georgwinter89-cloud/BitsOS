@@ -4,8 +4,10 @@ mod hostile;
 mod input;
 mod minipc;
 mod parse;
+mod dcnsmu;
 mod dpaudio;
 mod eld;
+mod shutdown;
 mod units;
 mod v1ref;
 

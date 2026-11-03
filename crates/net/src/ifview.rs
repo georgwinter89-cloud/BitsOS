@@ -3,10 +3,12 @@
 //!
 //! Index 1 is `lo` (127.0.0.1/8, as on every Linux); the stack's cards follow in registration order from index 2
 //! (`igc0` = 2 on the Mini-PC), under the names the drivers gave them (the names `/proc/net/dhcp` and the log
-//! use). V2 has IPv4 only, one address per card at most (its DHCP lease or static address), and every card is
+//! use). V2 has IPv4 only, one address per card at most (its DHCP lease or static address; NW-12: a network
+//! namespace's lo has the addresses its programs gave it, and ::1 while it is UP), and every card is
 //! administratively up (the kernel's stack drives all of them): flags as Linux's `dev_get_flags` shows a card
 //! that is up, RUNNING and LOWER_UP with carrier.
 
+use crate::netns::Net;
 use crate::stack::Stack;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -51,11 +53,34 @@ pub struct Addr {
     /// Seconds left (`INFINITY` with IFA_F_PERMANENT for an address without a lifetime).
     pub valid_s: u32,
     pub preferred_s: u32,
+    /// NW-12: the flags besides IFA_F_PERMANENT (IFA_F_SECONDARY, and what a program asked for, such as
+    /// IFA_F_NOPREFIXROUTE).
+    pub extra: u32,
+    /// NW-12: the label (`ifa_label`) when it is not the interface's name (an alias such as "lo:1").
+    pub label: Option<String>,
+    /// NW-12: a broadcast address a program gave a loopback address (cards compute theirs, `broadcast`).
+    pub brd: Option<[u8; 4]>,
 }
 
 impl Addr {
+    /// An address without extra flags, label or set broadcast address.
+    pub fn plain(ip: [u8; 4], prefix: u8, scope: u8, valid_s: u32, preferred_s: u32) -> Addr {
+        Addr { ip, prefix, scope, valid_s, preferred_s, extra: 0, label: None, brd: None }
+    }
     pub fn flags(&self) -> u32 {
-        if self.valid_s == INFINITY { IFA_F_PERMANENT } else { 0 }
+        self.extra | if self.valid_s == INFINITY { IFA_F_PERMANENT } else { 0 }
+    }
+    pub fn secondary(&self) -> bool {
+        self.extra & IFA_F_SECONDARY != 0
+    }
+    /// The label as `ifa_label` holds it: the alias or the interface's name.
+    pub fn label_or<'a>(&'a self, ifname: &'a str) -> &'a str {
+        self.label.as_deref().unwrap_or(ifname)
+    }
+    /// Whether `ip` is in this address's subnet (`inet_ifa_match`).
+    pub fn covers(&self, ip: [u8; 4]) -> bool {
+        let m = u32::from_be_bytes(self.mask());
+        u32::from_be_bytes(self.ip) & m == u32::from_be_bytes(ip) & m
     }
     pub fn mask(&self) -> [u8; 4] {
         let m = if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix.min(32) as u32) };
@@ -64,12 +89,37 @@ impl Addr {
     /// Linux sets a broadcast address for an Ethernet card's address (`ip addr add ... brd +`, what DHCP clients
     /// do) and none for the loopback's; /31 and /32 have none.
     pub fn broadcast(&self, loopback: bool) -> Option<[u8; 4]> {
-        if loopback || self.prefix >= 31 {
+        if loopback {
+            return self.brd;
+        }
+        if self.prefix >= 31 {
             return None;
         }
         let m = u32::from_be_bytes(self.mask());
         Some((u32::from_be_bytes(self.ip) | !m).to_be_bytes())
     }
+}
+
+/// NW-12: one IPv6 address of an interface (`struct inet6_ifaddr`): only a namespace's ::1 so far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Addr6 {
+    pub ip: [u8; 16],
+    pub prefix: u8,
+    pub scope: u8,
+    pub flags: u32,
+    /// `ifa_proto` (IFAPROT_KERNEL_LO for ::1).
+    pub proto: u8,
+}
+
+/// `IFAPROT_KERNEL_LO` (include/uapi/linux/if_addr.h).
+pub const IFAPROT_KERNEL_LO: u8 = 1;
+pub const IFA_F_SECONDARY: u32 = 0x01;
+
+/// lo's ::1/128 (`init_loopback`, linux-6.6/net/ipv6/addrconf.c:3214).
+pub fn lo6() -> Addr6 {
+    let mut ip = [0u8; 16];
+    ip[15] = 1;
+    Addr6 { ip, prefix: 128, scope: RT_SCOPE_HOST, flags: IFA_F_PERMANENT, proto: IFAPROT_KERNEL_LO }
 }
 
 /// One interface (`struct net_device` as far as programs see it).
@@ -85,20 +135,34 @@ pub struct Link {
     pub carrier_down: u32,
     pub stats: NetStats,
     pub addrs: Vec<Addr>,
+    /// NW-12: IPv6 addresses (a namespace's lo while it is UP: ::1; V2 shows none elsewhere).
+    pub addrs6: Vec<Addr6>,
+    /// NW-12: `tx_queue_len` (DEFAULT_TX_QUEUE_LEN unless a program changed a namespace's lo).
+    pub txqlen: u32,
+    /// The flags set administratively: IFF_UP and the changeable ones a program set (IFF_PROMISC, IFF_NOARP,
+    /// ...). Every card and the initial namespace's lo: IFF_UP; NW-11: a new network namespace's lo starts at 0.
+    pub admin_flags: u32,
 }
 
 impl Link {
-    /// `dev_get_flags` of a device that is up.
+    /// `dev_get_flags`: RUNNING and LOWER_UP only while the device is up.
     pub fn flags(&self) -> u32 {
-        let base = if self.loopback { IFF_UP | IFF_LOOPBACK } else { IFF_UP | IFF_BROADCAST | IFF_MULTICAST };
-        if self.carrier { base | IFF_RUNNING | IFF_LOWER_UP } else { base }
+        let base = (if self.loopback { IFF_LOOPBACK } else { IFF_BROADCAST | IFF_MULTICAST }) | self.admin_flags;
+        if self.up() && self.carrier { base | IFF_RUNNING | IFF_LOWER_UP } else { base }
+    }
+    /// Administratively up (IFF_UP).
+    pub fn up(&self) -> bool {
+        self.admin_flags & IFF_UP != 0
     }
     pub fn arphrd(&self) -> u16 {
         if self.loopback { ARPHRD_LOOPBACK } else { ARPHRD_ETHER }
     }
-    /// The loopback has no operational state of its own (UNKNOWN, as Linux shows it).
+    /// The loopback has no operational state of its own (UNKNOWN, as Linux shows it) while it is up; a device
+    /// that is down is DOWN (`rfc2863_policy`).
     pub fn operstate(&self) -> u8 {
-        if self.loopback {
+        if !self.up() {
+            IF_OPER_DOWN
+        } else if self.loopback {
             IF_OPER_UNKNOWN
         } else if self.carrier {
             IF_OPER_UP
@@ -131,17 +195,30 @@ fn stack() -> Option<&'static Stack> {
 }
 
 fn loopback() -> Link {
+    lo_link(IFF_UP, alloc::vec![lo_addr()], Vec::new(), LOOPBACK_MTU, TX_QUEUE_LEN)
+}
+
+/// lo's 127.0.0.1/8 (`inetdev_event` NETDEV_UP for a loopback, linux-6.6/net/ipv4/devinet.c:1575).
+pub fn lo_addr() -> Addr {
+    Addr::plain([127, 0, 0, 1], 8, RT_SCOPE_HOST, INFINITY, INFINITY)
+}
+
+/// lo with administrative flags `admin_flags` and these addresses, MTU and queue length.
+pub(crate) fn lo_link(admin_flags: u32, addrs: Vec<Addr>, addrs6: Vec<Addr6>, mtu: u32, txqlen: u32) -> Link {
     Link {
         index: 1,
         name: String::from("lo"),
         loopback: true,
         mac: [0; 6],
-        mtu: LOOPBACK_MTU,
+        mtu,
         carrier: true,
         carrier_up: 0,
         carrier_down: 0,
         stats: NetStats::default(),
-        addrs: alloc::vec![Addr { ip: [127, 0, 0, 1], prefix: 8, scope: RT_SCOPE_HOST, valid_s: INFINITY, preferred_s: INFINITY }],
+        addrs,
+        addrs6,
+        txqlen,
+        admin_flags,
     }
 }
 
@@ -187,7 +264,7 @@ pub fn links() -> Vec<Link> {
                     (true, Some(e)) => (e.saturating_sub(now) / 1_000_000_000).min(INFINITY as u64 - 1) as u32,
                     _ => INFINITY,
                 };
-                alloc::vec![Addr { ip: a.0, prefix, scope: RT_SCOPE_UNIVERSE, valid_s: left, preferred_s: left }]
+                alloc::vec![Addr::plain(a.0, prefix, RT_SCOPE_UNIVERSE, left, left)]
             })
             .unwrap_or_default();
         let index = i as u32 + 2;
@@ -203,8 +280,42 @@ pub fn links() -> Vec<Link> {
             carrier_down: d.carrier_down,
             stats: d.stats,
             addrs,
+            addrs6: Vec::new(),
+            txqlen: TX_QUEUE_LEN,
+            admin_flags: IFF_UP,
         });
     }
+    v
+}
+
+/// NW-12: one route of the initial namespace's main table as /proc/net/route shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route4 {
+    pub dev: String,
+    pub dst: [u8; 4],
+    pub gateway: [u8; 4],
+    pub prefix: u8,
+    pub metric: u32,
+}
+
+/// NW-12: the main table of the initial namespace (the cards' routes; lo's are all in the local table): a
+/// default route for each card with a router, a connected route for each card's subnet, each with the card's
+/// metric, in table order (by destination, then metric).
+pub fn routes4() -> Vec<Route4> {
+    let names = links();
+    let Some(st) = stack() else { return Vec::new() };
+    let mut v = Vec::new();
+    for (i, c) in st.interfaces().into_iter().enumerate() {
+        let Some((a, prefix)) = c.info.addr else { continue };
+        let Some(l) = names.iter().find(|l| l.index == i as u32 + 2) else { continue };
+        if let Some(r) = c.info.router {
+            v.push(Route4 { dev: l.name.clone(), dst: [0; 4], gateway: r.0, prefix: 0, metric: c.info.metric });
+        }
+        let m = crate::route::mask(prefix);
+        let net = (u32::from_be_bytes(a.0) & m).to_be_bytes();
+        v.push(Route4 { dev: l.name.clone(), dst: net, gateway: [0; 4], prefix, metric: c.info.metric });
+    }
+    v.sort_by_key(|r| (u32::from_be_bytes(r.dst), r.prefix, r.metric));
     v
 }
 
@@ -216,15 +327,37 @@ pub fn by_name(name: &[u8]) -> Option<Link> {
     links().into_iter().find(|l| l.name.as_bytes() == name)
 }
 
+/// NW-11: the interfaces of network namespace `net`: the initial one has `links()`, any other only its own lo.
+pub fn links_in(net: &Net) -> Vec<Link> {
+    match net {
+        None => links(),
+        Some(v) => alloc::vec![v.lo_link()],
+    }
+}
+
+pub fn by_index_in(net: &Net, index: u32) -> Option<Link> {
+    match net {
+        None => by_index(index),
+        Some(_) => links_in(net).into_iter().find(|l| l.index == index),
+    }
+}
+
+pub fn by_name_in(net: &Net, name: &[u8]) -> Option<Link> {
+    match net {
+        None => by_name(name),
+        Some(_) => links_in(net).into_iter().find(|l| l.name.as_bytes() == name),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn addresses_and_flags() {
-        let a = Addr { ip: [192, 168, 100, 113], prefix: 24, scope: 0, valid_s: 100, preferred_s: 100 };
+        let a = Addr::plain([192, 0, 2, 113], 24, 0, 100, 100);
         assert_eq!(a.mask(), [255, 255, 255, 0]);
-        assert_eq!(a.broadcast(false), Some([192, 168, 100, 255]));
+        assert_eq!(a.broadcast(false), Some([192, 0, 2, 255]));
         assert_eq!(a.broadcast(true), None);
         assert_eq!(a.flags(), 0);
         let p = Addr { prefix: 32, valid_s: INFINITY, ..a.clone() };

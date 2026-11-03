@@ -8,8 +8,8 @@
 //! - `procs --selftest`: checks /proc against what this process knows (pid, ppid, uid, argv) and a child it
 //!   starts and kills; prints the same lines on Linux and V2 (`ok ...`, the summary), exit 0 when all pass.
 //!
-//! Every file may be missing (V2's procfs is partial until AB-7): a missing value prints `-`, a process that
-//! ends between the listing and the read is skipped. Field layout: linux-6.6/fs/proc/array.c `do_task_stat`
+//! Every file may be missing (a kernel without it, a process that ends): a missing value prints `-`, a process
+//! that ends between the listing and the read is skipped. Field layout: linux-6.6/fs/proc/array.c `do_task_stat`
 //! (:467; comm in parentheses, may hold spaces and ')': parsed up to the last ')'), `proc_pid_status`; TIME is
 //! utime+stime in USER_HZ (100) ticks.
 //! Exit codes: 0 ok, 1 a selftest check failed or /proc unreadable, 2 usage.

@@ -41,6 +41,15 @@ impl Frame {
         }
     }
 
+    /// PF-6: the frame for MM's copy straight to a program (None for a heap page: host tests keep the stack
+    /// path).
+    pub fn page_frame(&self) -> Option<&mm_core::PageFrame> {
+        match &self.0 {
+            Mem::Block(b) => Some(b),
+            Mem::Heap(_) => None,
+        }
+    }
+
     /// A stable identity of this page: the physical address, or for a heap page its kernel address (tests).
     pub fn ident(&self) -> u64 {
         match &self.0 {

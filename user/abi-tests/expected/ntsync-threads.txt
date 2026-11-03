@@ -1,0 +1,15 @@
+thread wait_any woken by release = 0 index 1
+sem after thread took it: ret 0 count 0 max 10
+wait_all still waiting with one object: yes
+sem not taken by a waiting wait_all: ret 0 count 1 max 10
+thread wait_all woken by the last object = 0 index 0
+sem after wait_all: ret 0 count 0 max 10
+auto after wait_all: ret 0 manual 0 signaled 0
+thread woken by pulse = 0 index 0
+manual after pulse: ret 0 manual 1 signaled 0
+thread woken by alert = 0 index 1
+thread takes abandoned mutex = -EOWNERDEAD index 0
+mutex after thread: ret 0 owner 6 count 1
+thread wait ended by a signal = -EINTR
+thread wait_all ended by a signal = -EINTR
+sem after interrupted waits: ret 0 count 0 max 10

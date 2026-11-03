@@ -4,12 +4,13 @@
 
 use std::time::Duration;
 
-use smithay::desktop::Window;
+use crate::win::Window;
 
 use crate::layout::Workspace;
 use crate::state::App;
 
-/// Claude's ring (plan/spec/desktop.md §3). Only `Idle` is used until CL-3 drives it through `App::set_ring`.
+/// Claude's ring (plan/spec/desktop.md §3). Until CL-3 drives it, only the control command `ring` sets it
+/// (`App::set_ring`); otherwise it stays `Idle`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ring {
     Idle,
@@ -43,6 +44,8 @@ pub enum Spot {
     Start(crate::start::Part),
     /// A settings page (the pid of its window's program) and the part of it (WY-5b).
     Page(u32, crate::page::Part),
+    /// DS-3: a part of the Bühne preset WY's chrome has no name for (sun, bell, Feld bar, strip, "+N").
+    Buehne(crate::chrome_render::buehne::Part),
 }
 
 pub struct Desk {
@@ -119,8 +122,8 @@ pub fn summary(tiles: usize, tabs: usize) -> String {
 }
 
 fn counts(ws: &Workspace<Window>) -> (usize, usize) {
-    let tabs = ws.tiles.iter().map(|t| t.stack.len()).sum::<usize>() + ws.floating.len();
-    (ws.tiles.len() + ws.floating.len(), tabs)
+    // WY-12: a minimised window is in no tile but still open: it counts as a tab (and keeps the workspace).
+    (ws.tiles.len() + ws.floating.len(), ws.all_windows().count())
 }
 
 impl App {
@@ -140,6 +143,7 @@ impl App {
         self.desk.parked.push(Workspace::default());
         let i = self.desk.names.len() - 1;
         self.ws_switch(i);
+        self.absicht_register();
         i
     }
 
@@ -186,8 +190,7 @@ impl App {
     pub fn parked_windows(&self) -> Vec<Window> {
         let mut v = Vec::new();
         for ws in &self.desk.parked {
-            v.extend(ws.tiles.iter().flat_map(|t| t.stack.iter().cloned()));
-            v.extend(ws.floating.iter().map(|f| f.win.clone()));
+            v.extend(ws.all_windows().cloned());
         }
         v
     }
@@ -199,8 +202,7 @@ impl App {
         }
     }
 
-    /// The internal API for CL-3: Claude's state on the ring.
-    #[allow(dead_code)] // used by CL-3; today only Idle is shown
+    /// Claude's state on the ring: the control command `ring` today, CL-3 later.
     pub fn set_ring(&mut self, r: Ring) {
         if self.desk.ring != r {
             self.desk.ring = r;

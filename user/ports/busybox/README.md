@@ -16,7 +16,7 @@ controlling terminal, so ash has job control.
 | `CONFIG_STATIC`/`CONFIG_PIE` off | `v2-cc` links static-pie itself; busybox's own switches would fight it |
 | `FEATURE_PREFER_APPLETS`, `FEATURE_SH_STANDALONE` off | applets run through the `/bin` links, never by re-executing `/proc/self/exe` |
 | `FEATURE_USE_SENDFILE` off | V2 has no `sendfile` yet |
-| init, linuxrc, halt, poweroff, reboot, getty, bootchartd off | PID 1 is our init; no power switching from a shell |
+| init, linuxrc, getty, bootchartd off; halt, poweroff, reboot on (UL-7) | PID 1 is our init: the applets signal it (SIGUSR1/SIGUSR2/SIGTERM), it ends every program, syncs and calls reboot(2); `halt` powers off as `poweroff` does (no halt with the power left on); power off only from real input (R8f) |
 | devmem, fdisk, mkfs.*, mke2fs, mkswap, fsck, blkdiscard, hdparm, partprobe, losetup, swapon/off, watchdog, hwclock, rtcwake, adjtimex, i2c*, nand*, ubi*, setserial, raidautorun, fsfreeze, fstrim, fatattr, freeramdisk, fdflush, fdformat off | nothing on V2 needs them; the kernel's guards (`nvme_write`, `stick_write`) stay the only way to write a disk, and Georg's stick and NVMe never meet mkfs or fdisk by a typo |
 | `tc` off | does not build against current Linux UAPI headers (CBQ removed in 6.8) |
 | ash with editing, history 255, saved history, tab completion, job control | the console shell |

@@ -295,7 +295,9 @@ fn prctl_calls() -> TestResult {
     expect("PR_SET_NO_NEW_PRIVS", t.call(nr_more::PRCTL, &[PR_SET_NO_NEW_PRIVS as u64, 1]), 0)?;
     expect("PR_GET_NO_NEW_PRIVS", t.call(nr_more::PRCTL, &[PR_GET_NO_NEW_PRIVS as u64]), 1)?;
     expect("PR_GET_AUXV(NULL, 0)", t.call(nr_more::PRCTL, &[PR_GET_AUXV as u64, 0, 0]), 416)?;
-    expect("PR_SET_SECCOMP (not built)", t.call(nr_more::PRCTL, &[PR_SET_SECCOMP as u64, 1]), -EINVAL)?;
+    // SX-1 builds seccomp: mode 1 would put the test thread in strict mode; an unknown mode is EINVAL.
+    expect("PR_SET_SECCOMP(3)", t.call(nr_more::PRCTL, &[PR_SET_SECCOMP as u64, 3]), -EINVAL)?;
+    expect("PR_GET_SECCOMP", t.call(nr_more::PRCTL, &[PR_GET_SECCOMP as u64]), 0)?;
     expect("unknown option", t.call(nr_more::PRCTL, &[0x7fff_ffff]), -EINVAL)?;
     Ok(())
 }

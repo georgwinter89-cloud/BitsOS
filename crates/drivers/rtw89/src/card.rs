@@ -25,6 +25,11 @@ use rtw89_core::fw::Firmware;
 use rtw89_core::sta::StaEnv;
 
 use crate::kbus::KBus;
+use crate::config::{self, FwMiss};
+
+// RB-15: quiesces that found the chip held by its thread (bus master off without the chip's own DMA stop).
+klog::counter!(QUIESCE_CHIP_HELD, "wlan.rtw89.quiesce_chip_held");
+klog::counter!(STOP_BEFORE_PARK_HELD, "wlan.rtw89.stop_before_park_held");
 
 /// The stack's frames waiting for the thread; past this `transmit` says "ring full" (the stack
 /// sends again later). The TX ring's own length: the chip cannot take more at once anyway.
@@ -337,26 +342,39 @@ fn start(card: &Arc<Card>) -> bool {
         let _ = pci.disable_device();
         return false;
     }
-    let paths = crate::config::fw_paths(&|k| net::config(k));
     let mut tries: u64 = 0;
+    let mut stick_waited_ms: u64 = 0;
     let fw = loop {
         if card.quiesced.load(Ordering::Acquire) {
             return false;
         }
+        // read again on every try: CONFIG.TXT's wlan_fw= comes from the stick as well
+        let paths = config::fw_paths(&|k| net::config(k));
         match load_firmware(&paths) {
             Ok((from, fw)) => {
                 klog::event!(Info, "wlan", "fw.file", ifname = card.name.as_str(), path = from.as_str());
                 break fw;
             }
-            Err(e) => {
-                // the stick may be mounted after the PCI probe: every second for 30 s, then every 10 s
-                if tries == 0 || tries.is_multiple_of(30) {
-                    klog::event!(Warn, "wlan", "fw.missing", ifname = card.name.as_str(), tries = tries; "{}", e.as_str());
+            Err(e) => match config::fw_miss(fs_fat::stick::volume().is_some(), stick_waited_ms, tries) {
+                FwMiss::WaitStick { say } => {
+                    if say {
+                        klog::event!(Info, "wlan", "fw.wait_stick", ifname = card.name.as_str(), max_ms = config::STICK_WAIT_MS;
+                            "the firmware file is not in the initramfs: waiting for the boot stick");
+                    }
+                    card.set_phase("waiting for the boot stick (the firmware file)");
+                    if fs_fat::stick::wait_mounted(config::STICK_STEP_MS).is_none() {
+                        stick_waited_ms += config::STICK_STEP_MS;
+                    }
                 }
-                card.set_phase("waiting for the firmware file (see the log: fw.missing)");
-                tries += 1;
-                sched::sleep_ns(if tries < 30 { 1_000_000_000 } else { 10_000_000_000 });
-            }
+                FwMiss::Retry { warn, sleep_ms } => {
+                    if warn {
+                        klog::event!(Warn, "wlan", "fw.missing", ifname = card.name.as_str(), tries = tries; "{}", e.as_str());
+                    }
+                    card.set_phase("waiting for the firmware file (see the log: fw.missing)");
+                    tries += 1;
+                    sched::sleep_ns(sleep_ms * 1_000_000);
+                }
+            },
         }
     };
     let network = match crate::config::network_with(&|k| net::config(k), &mut |f| net::take_secret("wlan_psk", f)) {
@@ -396,8 +414,10 @@ fn mac_off_first(card: &Card) {
     let Some(core) = g.as_mut() else { return };
     match rtw89_core::bringup::safety::mac_off_if_on(&mut core.bus) {
         Ok(m) if m.powered_off => {
-            klog::event!(Warn, "wlan", "chip.found_on", ifname = card.name.as_str(), mac_state = m.mac_state;
-                "the MAC was left on: powered off before bus master")
+            log(&card.name, core::iter::once(rtw89_core::drv::events::found_on(format!(
+                "the MAC was left on (MAC state {}): powered off before bus master",
+                m.mac_state
+            ))))
         }
         Ok(m) if m.dead_look => {
             klog::event!(Warn, "wlan", "chip.dead_look", ifname = card.name.as_str(); "IC_PWR_STATE reads all ones (the bring-up decides)")
@@ -571,22 +591,185 @@ impl Quiesce for Card {
     fn name(&self) -> &str {
         &self.name
     }
-    // Before Reload, reboot or a panic: bus master and MSI off first (no DMA from here on), then,
-    // when the thread does not hold the chip, the CH12 key copies wiped and the MAC powered off
-    // with spinning waits (no sleep, no klog). Every DMA chunk is zeroed before it goes.
+    // Before Reload, reboot or a panic (RB-15: DMA stopped by the chip before bus master goes off, as
+    // a reset with PCIe DMA in flight floods the Mini-PC's FCH): when the thread does not hold the
+    // chip, its interrupts masked, the CH12 key copies wiped, the HCI DMA stopped and the MAC powered
+    // off with spinning waits (no sleep, no klog); then MSI and bus master off; then every DMA chunk
+    // zeroed (the chip can no longer write into it). With the chip held (its thread was stopped half-
+    // way) bus master off alone: no chip access beside a half-done one.
     fn quiesce(&self) {
         self.quiesced.store(true, Ordering::SeqCst);
-        if let Some(pci) = self.pci.as_ref() {
+        let mut core = self.core.try_lock();
+        let mut parts = Parts { core: core.as_mut().and_then(|g| g.as_mut()), pci: self.pci.as_ref() };
+        let _ = quiesce_in_order(&mut parts);
+    }
+}
+
+// RB-16: the chip stopped in thread context before the park. The thread holds `core` for a whole turn and a
+// turn may sleep (a delay of SPIN_US or more, an H2C wait), so a CPU parked inside it left the Quiesce with
+// the chip held: bus master off beside a running chip and its firmware's DMA (the 4 floods in 20 reboots came
+// with wlan0 up). Linux stops the chip before a reboot through the interface going down (`rtw89_ops_stop` ->
+// `rtw89_core_stop`, linux-6.6/drivers/net/wireless/realtek/rtw89/mac80211.c:69, core.c:3571: HCI deinit, MAC off
+// and the HCI reset), while every thread runs; here the same chip stop as the Quiesce's, under the lock the
+// thread lets go of within its turn. `quiesced` first: the thread's next bus access ends its turn at once,
+// and it never starts another. The Quiesce later finds the chip off and only switches bus master off and
+// zeroes the DMA chunks.
+impl devmodel::StopBeforePark for Card {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn stop(&self, budget_ns: u64) -> bool {
+        stop_under_lock(&self.quiesced, || self.core.lock_timeout(budget_ns), |mut g| Parts { core: g.as_mut(), pci: None }.stop_chip())
+    }
+}
+
+/// The thread's accesses off (`gone`) before the lock is waited for, then the chip stopped under it; a lock
+/// that stays held is counted and left to the Quiesce. Apart for its host test.
+pub(crate) fn stop_under_lock<G>(gone: &AtomicBool, take: impl FnOnce() -> Option<G>, stop: impl FnOnce(G) -> bool) -> bool {
+    gone.store(true, Ordering::SeqCst);
+    match take() {
+        Some(g) => stop(g),
+        None => {
+            STOP_BEFORE_PARK_HELD.inc();
+            false
+        }
+    }
+}
+
+/// The three parts of the quiesce, apart so their order is host-tested (RB-15 fixer).
+pub(crate) trait QuiesceParts {
+    /// Interrupts masked, CH12 wiped, HCI DMA stopped, MAC off (spinning waits); false: the chip is held.
+    fn stop_chip(&mut self) -> bool;
+    /// MSI and bus master off.
+    fn bus_master_off(&mut self);
+    /// Every DMA chunk zeroed.
+    fn wipe_dma(&mut self);
+}
+
+/// The chip's DMA stopped before bus master goes off; the chunks zeroed only after (the chip can no longer
+/// write into them) and only when the chip was stopped (else its thread still owns them). Returns whether
+/// the chip was stopped.
+pub(crate) fn quiesce_in_order(p: &mut impl QuiesceParts) -> bool {
+    let stopped = p.stop_chip();
+    if !stopped {
+        QUIESCE_CHIP_HELD.inc();
+    }
+    p.bus_master_off();
+    if stopped {
+        p.wipe_dma();
+    }
+    stopped
+}
+
+struct Parts<'a> {
+    core: Option<&'a mut Core>,
+    pci: Option<&'a pci::PciFunction>,
+}
+
+impl QuiesceParts for Parts<'_> {
+    fn stop_chip(&mut self) -> bool {
+        let Some(c) = self.core.as_mut() else { return false };
+        c.bus.inner.quiet = true;
+        if let Some(r) = c.runner.as_mut() {
+            r.quiesce(&mut c.bus);
+        }
+        true
+    }
+    fn bus_master_off(&mut self) {
+        if let Some(pci) = self.pci {
             let _ = pci.disable_device();
         }
-        if let Some(mut g) = self.core.try_lock()
-            && let Some(core) = g.as_mut()
-        {
-            core.bus.inner.quiet = true;
-            if let Some(r) = core.runner.as_mut() {
-                r.quiesce(&mut core.bus);
-            }
-            core.bus.inner.dma.wipe_all();
+    }
+    fn wipe_dma(&mut self) {
+        if let Some(c) = self.core.as_mut() {
+            c.bus.inner.dma.wipe_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod quiesce_tests {
+    use super::{QuiesceParts, quiesce_in_order};
+    use alloc::vec::Vec;
+
+    struct Rec {
+        held: bool,
+        log: Vec<&'static str>,
+    }
+    impl QuiesceParts for Rec {
+        fn stop_chip(&mut self) -> bool {
+            self.log.push("chip");
+            !self.held
+        }
+        fn bus_master_off(&mut self) {
+            self.log.push("bus_master");
+        }
+        fn wipe_dma(&mut self) {
+            self.log.push("wipe");
+        }
+    }
+
+    #[test]
+    fn the_chip_stops_its_dma_before_bus_master_goes_off() {
+        let mut r = Rec { held: false, log: Vec::new() };
+        assert!(quiesce_in_order(&mut r));
+        assert_eq!(r.log, ["chip", "bus_master", "wipe"]);
+    }
+
+    #[test]
+    fn the_stop_before_the_park_ends_the_threads_accesses_before_it_waits_for_the_lock() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let gone = AtomicBool::new(false);
+        let stopped = super::stop_under_lock(&gone, || gone.load(Ordering::SeqCst).then_some(7u8), |g| g == 7);
+        assert!(stopped && gone.load(Ordering::SeqCst));
+        let before = super::STOP_BEFORE_PARK_HELD.get();
+        let gone = AtomicBool::new(false);
+        assert!(!super::stop_under_lock(&gone, || None::<u8>, |_| unreachable!("no lock, no chip access")));
+        assert!(gone.load(Ordering::SeqCst), "the thread stays off the chip; the Quiesce finishes");
+        assert!(super::STOP_BEFORE_PARK_HELD.get() > before);
+    }
+
+    // RB-16 fixer: the turn's thread holds `core` past the budget (a CPU parked mid-turn, or a turn that sleeps
+    // longer): the stop gives up within the budget, touches no chip, counts it, and the Quiesce after the park
+    // (its `try_lock` still fails) turns bus master off alone and leaves the DMA chunks to their owner.
+    #[test]
+    fn a_core_held_past_the_budget_leaves_the_quiesce_bus_master_off_alone() {
+        extern crate std;
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let core = Arc::new(ksync::Mutex::named("t.rtw89.core", 0u8));
+        let (held, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let holder = {
+            let (core, held, go) = (core.clone(), held.clone(), go.clone());
+            std::thread::spawn(move || {
+                let _turn = core.lock();
+                held.store(true, Ordering::Release);
+                while !go.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            })
+        };
+        while !held.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let gone = AtomicBool::new(false);
+        let before = super::STOP_BEFORE_PARK_HELD.get();
+        let stopped = super::stop_under_lock(&gone, || core.lock_timeout(1_000_000), |_| unreachable!("held: no chip access"));
+        assert!(!stopped && gone.load(Ordering::SeqCst), "given up, the thread kept off the chip");
+        assert!(super::STOP_BEFORE_PARK_HELD.get() > before, "counted");
+        let mut r = Rec { held: core.try_lock().is_none(), log: Vec::new() };
+        assert!(!quiesce_in_order(&mut r));
+        assert_eq!(r.log, ["chip", "bus_master"], "no wipe beside the holder");
+        go.store(true, Ordering::Release);
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn a_held_chip_gets_bus_master_off_alone() {
+        let before = super::QUIESCE_CHIP_HELD.get();
+        let mut r = Rec { held: true, log: Vec::new() };
+        assert!(!quiesce_in_order(&mut r));
+        assert_eq!(r.log, ["chip", "bus_master"]);
+        assert!(super::QUIESCE_CHIP_HELD.get() > before);
     }
 }

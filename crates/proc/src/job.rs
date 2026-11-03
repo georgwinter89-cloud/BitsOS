@@ -86,29 +86,6 @@ pub fn setsid(caller: &Process) -> Result<u32, Errno> {
     Ok(caller.pid)
 }
 
-/// `session_of_pgrp`: the session of group `pgrp`, or of the process with that pid when no group has it.
-pub fn pgrp_session(pgrp: u32) -> Option<u32> {
-    let t = TABLE.lock();
-    if let Some(g) = t.iter().find(|q| q.pgid() == pgrp) {
-        return Some(g.sid());
-    }
-    ids_of(&t, pgrp as i32).map(|(_, _, s, _)| s)
-}
-
-/// IN-4's TIOCSPGRP, once its tty found it is the caller's controlling terminal (ENOTTY otherwise is the tty's
-/// answer): EINVAL for a negative id, ESRCH when nothing has that id, EPERM when it belongs to another
-/// session (`tiocspgrp`).
-pub fn check_tcsetpgrp(caller: &Process, pgrp: i32) -> Result<(), Errno> {
-    if pgrp < 0 {
-        return Err(EINVAL);
-    }
-    match pgrp_session(pgrp as u32) {
-        None => Err(ESRCH),
-        Some(s) if s != caller.sid() => Err(EPERM),
-        Some(_) => Ok(()),
-    }
-}
-
 /// Whether some process is in group `pgid` (for the tty's foreground checks).
 pub fn pgrp_exists(pgid: u32) -> bool {
     TABLE.lock().iter().any(|q| q.pgid() == pgid)

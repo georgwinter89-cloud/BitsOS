@@ -18,3 +18,9 @@ ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
 uapi = { path = "../uapi" }
 miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+policy = { path = "../policy" }

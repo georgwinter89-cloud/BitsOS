@@ -17,6 +17,7 @@ pub mod iface;
 #[cfg(target_os = "none")]
 mod kernel;
 mod phy;
+pub(crate) mod quickack;
 pub(crate) mod sockets;
 pub mod tcp;
 pub mod udp;

@@ -9,7 +9,7 @@
 //!
 //! `kill` follows kill(2) (`kill_pid_info`: a thread id names its whole process; signal 0 probes; 1..=64) with
 //! the rights of root (MCP acts as BitsOS itself, so AB-6's uid rule always allows it), B3's
-//! `Access::Signal` per target, and two MCP rules: PID 1 only with `confirm: true` (then SIGKILL and SIGSTOP
+//! `Access::Signal` per target, and three MCP rules: PID 1 never SIGUSR1/SIGUSR2 (power off, UL-7 R8f), PID 1 only with `confirm: true` (then SIGKILL and SIGSTOP
 //! reach it as from the kernel, `force`; other signals still need a handler of init's, as in Linux), kernel
 //! threads never. The siginfo is SI_USER with pid 0 and uid 0 (as from a root process outside every namespace).
 
@@ -23,7 +23,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use mcp::{Json, StopTarget, ToolContext, ToolError, ToolOutput, ToolResult};
-use uapi::ab::signal::{SIGCONT, SIGINT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU};
+use uapi::ab::signal::{SIGCONT, SIGINT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGUSR1, SIGUSR2};
 use uapi::ab::signal_names;
 
 const KIB_PER_PAGE: u64 = hal::PAGE_SIZE as u64 / 1024;
@@ -295,6 +295,13 @@ fn may_send(ctx_caller: &policy::Subject, p: &Process, sig: u32, confirm: bool) 
         let name = shown(sig);
         klog::event!(Warn, "proc", "mcp.kill_refused", pid = 1, signal = name.as_str(), reason = "init without confirm");
         return Err(ToolError::Refused(format!("PID 1 (init) gets {name} only with confirm: true")));
+    }
+    // UL-7 (MC CR, INT-W27): SIGUSR1/SIGUSR2 are init's halt and power-off; a power-off comes only from real
+    // input (R8f), so MCP never sends them, even confirmed (init would refuse them anyway: sender pid 0).
+    if p.pid == 1 && (sig == SIGUSR1 || sig == SIGUSR2) {
+        let name = shown(sig);
+        klog::event!(Warn, "proc", "mcp.kill_refused", pid = 1, signal = name.as_str(), reason = "power off only from real input");
+        return Err(ToolError::Refused(format!("PID 1 (init) never gets {name} from MCP: power off only from real input (R8f)")));
     }
     policy::check(ctx_caller, &policy::Access::Signal { target_pid: p.pid, signal: sig }).map_err(|d| {
         klog::event!(Info, "proc", "mcp.kill_refused", pid = p.pid, signal = sig, reason = d.reason.as_str());

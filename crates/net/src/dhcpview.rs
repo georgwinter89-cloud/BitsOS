@@ -55,8 +55,15 @@ pub fn card_line(
 
 pub const HEADER: &str = "# BitsOS network cards and DHCP leases (one line per card)\n";
 
+/// The text of /proc/net/dhcp (NW-12: `procnet` shows it in the initial namespace only).
+#[cfg(not(target_os = "none"))]
+pub fn text() -> String {
+    String::from(HEADER)
+}
+
+/// The text of /proc/net/dhcp (NW-12: `procnet` shows it in the initial namespace only).
 #[cfg(target_os = "none")]
-fn render() -> String {
+pub fn text() -> String {
     let mut s = String::from(HEADER);
     let Some(stack) = crate::stack::kernel() else { return s };
     let now = time::now_ns();
@@ -77,9 +84,6 @@ fn render() -> String {
     }
     s
 }
-
-#[cfg(target_os = "none")]
-vfs::procfile!("/proc/net/dhcp", render);
 
 #[cfg(test)]
 mod tests {

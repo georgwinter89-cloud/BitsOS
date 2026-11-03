@@ -29,6 +29,7 @@ ktest!("pc.msi.disable_device", QemuOnly, msi_disable_device);
 ktest!("pc.msi.restore", QemuOnly, msi_restore);
 ktest!("pc.msi.polled", QemuOnly, msi_polled);
 ktest!("pc.msi.virtio", QemuOnly, msi_virtio);
+ktest!("pc.msi.firmware_off", QemuOnly, msi_firmware_off);
 
 const EDU: (u16, u16) = (0x1234, 0x11E8);
 const E1000E: (u16, u16) = (0x8086, 0x10D3);
@@ -577,4 +578,36 @@ fn msi_virtio() -> R {
     let vs = vectors_of(&set);
     drop(set);
     check_gone(n.loc, &vs)
+}
+
+/// Clears the NO_MSI ktest hook however the test ends.
+struct FirmwareMsiBack;
+
+impl Drop for FirmwareMsiBack {
+    fn drop(&mut self) {
+        irq::FIRMWARE_NO_MSI_TEST.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// C1: a firmware with FADT NO_MSI gets no MSI or MSI-X from `alloc_irqs` (Linux `pci_no_msi`): a request that
+/// allows polling is polled with a `msi.firmware_off` event, one that does not is refused.
+fn msi_firmware_off() -> R {
+    // Not mass storage (R8a refuses it before the firmware check) and not a bridge (its MSI is the port's).
+    let usable = |n: &Node| !matches!(n.class >> 16, 0x01 | 0x06) && (n.cap(crate::caps::id::MSIX).is_some() || n.cap(crate::caps::id::MSI).is_some());
+    let Some(n) = spare(usable).into_iter().next() else {
+        return ktest::skip("no driverless function with MSI or MSI-X (host/tests/pc/50-msi.sh adds them)");
+    };
+    let f = n.function();
+    f.enable_device(true).map_err(|e| format!("{e}"))?;
+    let _back = FirmwareMsiBack;
+    irq::FIRMWARE_NO_MSI_TEST.store(true, core::sync::atomic::Ordering::Relaxed);
+    let seq = klog::next_seq();
+    kassert!(f.alloc_irqs(&IrqRequest::new("ktest-nomsi", 1, 1).modes(true, true, false)).err() == Some(irq::IrqError::NoVectors), "not refused without polling");
+    let set = f.alloc_irqs(&IrqRequest::new("ktest-nomsi", 1, 2).poll_ns(2 * MS)).map_err(|e| format!("{e}"))?;
+    kassert!(set.mode() == IrqMode::Polled && set.vector(0).is_none(), "mode {:?} under NO_MSI", set.mode());
+    check_device(n.loc, IrqMode::Polled, set.len())?;
+    kassert!(events(seq, "msi.firmware_off").len() >= 2, "no msi.firmware_off event per request");
+    drop(set);
+    kassert!(irq::sets().iter().all(|s| s.0 != n.loc), "set still listed");
+    Ok(())
 }

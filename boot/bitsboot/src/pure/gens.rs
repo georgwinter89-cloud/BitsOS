@@ -211,6 +211,32 @@ pub fn choose_read_only(gens: &[GenDir], pin: Pin, bad: &[u32]) -> Choice {
     }
 }
 
+/// RB-14 CR-3 (INT-W24): the marker rule for a start right after a sync flood (the FCH's `S5_RESET_STATUS` says
+/// the last start was ended by the data fabric). Such a start can die early for reasons that have nothing to do
+/// with the generation, so where [`choose`] would give the newest generation its one try (write `TRY`), the newest
+/// confirmed generation starts instead and the new one keeps its try for the next start, as
+/// [`choose_read_only`] does; every other write (a TRY when no confirmed generation exists) stays. A Start that
+/// changed carries [`flag::FLOOD_START`].
+pub fn choose_after_flood(gens: &[GenDir], pin: Pin, bad: &[u32], mark_failed: &[u32]) -> Choice {
+    match choose(gens, pin, bad, mark_failed) {
+        Choice::Start { record, mark_try: true, why } => {
+            let n = record.number;
+            let ok = |g: &&GenDir| g.ok && g.kernel && g.initrd && !bad.contains(&g.number) && g.number != n;
+            match gens.iter().filter(ok).max_by_key(|g| g.number) {
+                Some(o) => {
+                    let others = if bad.iter().any(|&b| b != n) { flag::OTHERS_SKIPPED } else { 0 };
+                    let flags = record.flags & flag::PIN_IGNORED | others | flag::FLOOD_START;
+                    let record = Generation { number: o.number, reason: gen_reason::FALLBACK_AFTER_TRY, skipped: n, flags };
+                    let why = format!("start after a sync flood: newest confirmed generation; generation {n} keeps its one try for the next start");
+                    Choice::Start { record, mark_try: false, why }
+                }
+                None => Choice::Start { record, mark_try: true, why: format!("{why}; after a sync flood, but no confirmed generation to start instead") },
+            }
+        }
+        other => other,
+    }
+}
+
 /// The one kind of path bitsboot ever writes: `\BITSOS2\SYS\<digits>\TRY` (R8b: markers only below SYS).
 pub fn is_marker_path(path: &str) -> bool {
     let Some(rest) = path.strip_prefix(SYS).and_then(|r| r.strip_prefix('\\')) else { return false };
@@ -258,6 +284,7 @@ pub fn flag_names(f: u32) -> String {
         (flag::UNMARKED, "UNMARKED"),
         (flag::OTHERS_SKIPPED, "OTHERS_SKIPPED"),
         (flag::SAFE_MODE, "SAFE_MODE"),
+        (flag::FLOOD_START, "FLOOD_START"),
     ];
     let on: Vec<&str> = names.iter().filter(|(b, _)| f & b != 0).map(|(_, n)| *n).collect();
     if on.is_empty() { String::from("-") } else { on.join(",") }

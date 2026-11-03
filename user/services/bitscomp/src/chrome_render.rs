@@ -1,17 +1,30 @@
 //! The chrome's place in the frame (WY-5): one cached image per bar (`chrome_draw`), the start page, the
 //! address suggestions and the notice; each is redrawn only when its look changes. The start animation only
-//! changes the images' alpha and offset (`anim`).
+//! changes the images' alpha and offset (`anim`). DS-2: the wallpaper under everything (`wallpaper`) and Claude's
+//! ring as small sprites of their own, so a busy ring (10 steps a second at most) redraws only itself. DS-3: the
+//! Bühne preset (`buehne` geometry, `scene` images) replaces the bars when theme.layout.preset is buehne. DS-5: the boot
+//! scene (`boot`) lies over everything at the start until the desktop is ready.
+
+pub mod boot;
+mod boot_art;
+mod boot_draw;
+mod boot_model;
+mod boot_ring;
+#[cfg(test)]
+mod boot_tests;
+pub mod buehne;
+pub mod scene;
+pub mod wallpaper;
 
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::backend::renderer::pixman::PixmanRenderer;
 
 use crate::chrome::{self, Chrome, Part};
-use crate::chrome_draw::{self as draw, FavLook, ListLook, STATUS_GLOW, SideLook, StatusLook, SuggestLook, TopLook};
+use crate::chrome_draw::{self as draw, FavLook, ListLook, RingLook, STATUS_GLOW, SideLook, StatusLook, SuggestLook, TopLook};
 use crate::deco::image_a;
 use crate::desk::Spot;
 use crate::header::px_rect;
 use crate::layout::Rect;
-use crate::render::CompElement;
+use crate::render::{CompElement, CompRenderer};
 use crate::start_draw::{self, StartLook};
 use crate::state::App;
 
@@ -25,6 +38,13 @@ pub struct Images {
     start: Option<(StartLook, MemoryRenderBuffer)>,
     suggest: Option<(SuggestLook, MemoryRenderBuffer)>,
     notice: Option<((String, Rect, u64), MemoryRenderBuffer)>,
+    top_ring: Option<(RingLook, MemoryRenderBuffer)>,
+    side_ring: Option<(RingLook, MemoryRenderBuffer)>,
+    /// Read by `wallpaper::elements` (render.rs draws it under every layer).
+    pub(crate) wallpaper: Option<(wallpaper::Key, MemoryRenderBuffer)>,
+    pub(crate) buehne: scene::Images,
+    /// DS-5: the boot scene over the desktop at the start (`boot`).
+    pub(crate) boot: boot::Boot,
 }
 
 /// The cached image for `look`, drawn again when the look differs.
@@ -47,10 +67,14 @@ impl App {
     }
 
     pub fn chrome(&self) -> Chrome {
+        if let Some(b) = self.buehne() {
+            return b.chrome();
+        }
         let inputs = chrome::Inputs {
             size: (self.area_full().w, self.area_full().h),
             favourites: self.desk.favourites.clone(),
             workspaces: self.ws_count(),
+            minimized: self.ws.minimized.len(),
             reveal: self.desk.reveal.shown,
         };
         chrome::layout(&self.theme, &inputs)
@@ -59,6 +83,7 @@ impl App {
     /// Something the chrome shows changed: a frame (the looks decide what is redrawn).
     pub fn chrome_dirty(&mut self) {
         self.needs_frame = true;
+        self.buehne_work_sync();
     }
 
     /// The field being edited: the top bar's, or the tile's own bar.
@@ -119,14 +144,14 @@ impl App {
 }
 
 /// Places a cached chrome image at `r` moved by `dy`, faded by `alpha`.
-fn put(pixman: &mut PixmanRenderer, buf: &MemoryRenderBuffer, r: Rect, dy: f32, s: f64, alpha: f32, out: &mut Vec<CompElement>) {
+fn put<R: CompRenderer>(renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, dy: f32, s: f64, alpha: f32, out: &mut Vec<CompElement<R>>) {
     let moved = Rect { y: r.y + dy.round() as i32, ..r };
     let p = px_rect(r, s);
-    out.extend(image_a(pixman, buf, moved, (p.w, p.h), s, alpha));
+    out.extend(image_a(renderer, buf, moved, (p.w, p.h), s, alpha));
 }
 
 /// The notice and the address suggestions, topmost first: they lie over everything, floating windows too (WY-5c).
-pub fn over(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
+pub fn over<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
     let t = app.theme.clone();
     let s = t.scale;
     let now = crate::pacer::now();
@@ -135,8 +160,8 @@ pub fn over(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
     let tg = app.theme_gen;
     let ch = app.chrome();
     let mut out = Vec::new();
-    let put = |pixman: &mut PixmanRenderer, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement>| {
-        put(pixman, buf, r, dy, s, alpha, out)
+    let put = |renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement<R>>| {
+        put(renderer, buf, r, dy, s, alpha, out)
     };
     if let Some((text, _)) = app.desk.notice.clone() {
         let a = ch.address;
@@ -144,7 +169,7 @@ pub fn over(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
         let w = (chrome::logical_width(&f, &text, s) + 24).min(a.w);
         let r = Rect { x: a.x, y: a.y + a.h + 8, w, h: 30 };
         let buf = cached(&mut app.images.notice, &(text.clone(), r, tg), |(tx, r, _)| draw::notice(tx, *r, &t));
-        put(pixman, buf, r, 0.0, &mut out);
+        put(renderer, buf, r, 0.0, &mut out);
     }
     if let Some(e) = app.desk.edit.clone() {
         let items = app.suggestions();
@@ -156,7 +181,7 @@ pub fn over(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
             };
             let look = SuggestLook { frame, rows, items, pick: e.pick, hover: hv, theme: tg };
             let buf = cached(&mut app.images.suggest, &look, |l| draw::suggest(l, &t));
-            put(pixman, buf, frame, 0.0, &mut out);
+            put(renderer, buf, frame, 0.0, &mut out);
         }
     }
     out
@@ -164,7 +189,13 @@ pub fn over(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
 
 /// The bars and the start page, topmost first. They lie below floating windows (WY-5c) and above the tiles; the
 /// tiles never reach under a docked bar, a revealed one lies over them.
-pub fn elements(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
+pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
+    if let Some(b) = app.buehne() {
+        // The classic bars' images are not drawn: let them go (a switch back draws them again).
+        let im = &mut app.images;
+        (im.top, im.favs, im.list, im.side, im.status, im.side_ring) = (None, None, None, None, None, None);
+        return scene::elements(app, renderer, &b);
+    }
     let t = app.theme.clone();
     let s = t.scale;
     let now = crate::pacer::now();
@@ -176,8 +207,8 @@ pub fn elements(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> 
         _ => None,
     };
     let mut out = Vec::new();
-    let put = |pixman: &mut PixmanRenderer, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement>| {
-        put(pixman, buf, r, dy, s, alpha, out)
+    let put = |renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement<R>>| {
+        put(renderer, buf, r, dy, s, alpha, out)
     };
     let edit_top = app.desk.edit.as_ref().filter(|e| e.tile.is_none());
     let look = TopLook {
@@ -190,11 +221,16 @@ pub fn elements(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> 
         },
         cursor: edit_top.map(|e| e.before().to_string()),
         hover,
-        ring: app.desk.ring,
         context: None,
     };
+    // The busy ring's step: the same for both rings; asks for the next step's frame only while it moves.
+    let ring = app.desk.ring;
+    let step = app.status.ring.shown(crate::ring::moves(ring), now, &t);
+    let rl = RingLook { rect: ch.ring, ring, step, size: draw::TOP_RING, theme: tg };
+    let rbuf = cached(&mut app.images.top_ring, &rl, |l| draw::ring_sprite(l, &t));
+    put(renderer, rbuf, ch.ring, -glide, &mut out);
     let buf = cached(&mut app.images.top, &look, |l| draw::top(l, &t));
-    put(pixman, buf, ch.top, -glide, &mut out);
+    put(renderer, buf, ch.top, -glide, &mut out);
     if let Some(bar) = ch.favs {
         let fh = match hover {
             Some(Part::Fav(i)) => Some(i),
@@ -202,18 +238,22 @@ pub fn elements(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> 
         };
         let look = FavLook { chrome: ch.clone(), theme: tg, items: app.desk.favourites.clone(), hover: fh };
         let buf = cached(&mut app.images.favs, &look, |l| draw::favs(l, &t));
-        put(pixman, buf, bar, -glide, &mut out);
+        put(renderer, buf, bar, -glide, &mut out);
     }
     if let Some(r) = ch.status {
-        let look = StatusLook { rect: r, theme: tg, blocks: app.status.blocks.clone(), clock: app.status.clock.clone() };
+        let look = StatusLook { rect: r, theme: tg, blocks: app.status.blocks.clone(), clock: app.status.clock.clone(), grant: app.install_marker() };
         let buf = cached(&mut app.images.status, &look, |l| draw::status(l, &t));
-        put(pixman, buf, Rect { y: r.y - STATUS_GLOW, h: r.h + STATUS_GLOW, ..r }, glide, &mut out);
+        put(renderer, buf, Rect { y: r.y - STATUS_GLOW, h: r.h + STATUS_GLOW, ..r }, glide, &mut out);
     }
     // A revealed bar lies over the tiles: it comes before (above) the start page and the tiles.
     if let Some(r) = ch.side {
-        let look = SideLook { rect: r, theme: tg, name: app.desk.claude_name.clone(), ring: app.desk.ring };
+        let rr = draw::side_ring_rect(r);
+        let rl = RingLook { rect: rr, ring, step, size: draw::SIDE_RING, theme: tg };
+        let rbuf = cached(&mut app.images.side_ring, &rl, |l| draw::ring_sprite(l, &t));
+        put(renderer, rbuf, rr, 0.0, &mut out);
+        let look = SideLook { rect: r, theme: tg, name: app.desk.claude_name.clone(), ring, solid: !ch.side_docked };
         let buf = cached(&mut app.images.side, &look, |l| draw::side(l, &t));
-        put(pixman, buf, r, 0.0, &mut out);
+        put(renderer, buf, r, 0.0, &mut out);
     }
     if !ch.list_shown {
         app.images.list = None;
@@ -225,14 +265,15 @@ pub fn elements(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> 
         })
         .collect();
     if ch.list_shown {
-        let look = ListLook { chrome: ch.clone(), theme: tg, entries, active: app.desk.active, hover };
+        let minimized = app.ws.minimized.iter().map(|m| crate::minimize::label(&m.win)).collect();
+        let look = ListLook { chrome: ch.clone(), theme: tg, entries, minimized, active: app.desk.active, hover };
         let buf = cached(&mut app.images.list, &look, |l| draw::list(l, &t));
-        put(pixman, buf, ch.list, 0.0, &mut out);
+        put(renderer, buf, ch.list, 0.0, &mut out);
     }
     if app.start_shown() {
         let look = app.start_look(tg);
         let buf = cached(&mut app.images.start, &look, |l| start_draw::draw(l, &t));
-        put(pixman, buf, ch.work, 0.0, &mut out);
+        put(renderer, buf, ch.work, 0.0, &mut out);
     }
     out
 }

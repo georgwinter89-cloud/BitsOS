@@ -5,16 +5,22 @@ edition = "2024"
 description = "Kernel side of UL's programs: starts and watches /bin/init (PID 1), the DHCP view at /proc/net/dhcp init reads, and the ktests of init, the abi-* programs and stress (owner: UL)"
 
 [dependencies]
+net = { path = "../net" }
+
+# Only the bare-metal parts (the supervisor's runtime, the ktests) use these; a host build has the init path, the
+# transcript comparison and the DHCP view.
+[target.'cfg(target_os = "none")'.dependencies]
 proc = { path = "../proc" }
 vfs = { path = "../vfs" }
-net = { path = "../net" }
 sched = { path = "../sched" }
 ksync = { path = "../ksync" }
 klog = { path = "../klog" }
 ktest = { path = "../ktest" }
-kreg = { path = "../kreg" }
 policy = { path = "../policy" }
 uapi = { path = "../uapi" }
 console = { path = "../console" }
 display = { path = "../display" }
 time = { path = "../time" }
+
+[lints]
+workspace = true

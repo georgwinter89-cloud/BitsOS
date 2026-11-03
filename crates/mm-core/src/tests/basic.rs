@@ -213,3 +213,34 @@ fn bad_order_alloc_is_refused() {
     assert_eq!(b.alloc(63, Zone::Dma32, Kind::Other), None);
     b.check().unwrap();
 }
+
+#[test]
+fn huge_block_splits_into_frames_and_merges_back() {
+    // MM-13: a 2 MiB user block split into 512 order-0 frames (each freed on its own), and merged back.
+    let b = staged(&[free(2 * MIB, 8 * MIB)]);
+    let before = b.zone_info(0);
+    let p = b.alloc(9, Zone::Dma32, Kind::User).unwrap();
+    assert!(b.run_allocated(p, 512, Kind::User), "a block of order 9");
+    assert!(!b.split_block(p, 9, Kind::Driver), "wrong kind: refused");
+    assert!(!b.split_block(p + PAGE, 9, Kind::User), "not the head: refused");
+    assert!(b.split_block(p, 9, Kind::User));
+    assert!(!b.run_allocated(p, 512, Kind::User), "no block any more");
+    assert!((0..512).all(|i| b.run_allocated(p + i * PAGE, 1, Kind::User)), "512 order-0 user frames");
+    assert!(!b.split_block(p, 9, Kind::User), "a second split finds no block");
+    assert!(b.merge_block(p, 9, Kind::User));
+    assert!(b.run_allocated(p, 512, Kind::User), "one block again");
+    assert!(!b.run_allocated(p + PAGE, 1, Kind::User));
+    // Split again and free one piece: the merge must refuse and change nothing.
+    assert!(b.split_block(p, 9, Kind::User));
+    b.free(p + 7 * PAGE, 0, Kind::User);
+    assert!(!b.merge_block(p, 9, Kind::User), "a freed piece refuses the merge");
+    assert!((0..512).filter(|&i| i != 7).all(|i| b.run_allocated(p + i * PAGE, 1, Kind::User)), "the claims were undone");
+    for i in (0..512).filter(|&i| i != 7) {
+        b.free(p + i * PAGE, 0, Kind::User);
+    }
+    assert_eq!(b.stats().used_by_kind[Kind::User as usize], 0, "every piece counted once");
+    b.drain_all();
+    b.check().unwrap();
+    assert_eq!(before.free_blocks, b.zone_info(0).free_blocks, "the pieces merged back in the buddy lists");
+    assert_eq!(b.stats().leaked_bytes, 0);
+}

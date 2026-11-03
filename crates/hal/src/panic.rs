@@ -56,26 +56,33 @@ pub fn reset_after_ns(ns: u64, tsc_hz: u64) -> ! {
     reset_now()
 }
 
+/// The 0xCF9 codes `reset_now` tries, in order: hard reset (the one the firmware's own reset register does on the
+/// Mini-PC: `cf9_6` in the FCH's reset status), then full reset (RB-13: as the MCP `reboot`'s plan).
+pub const LAST_RESORT_CF9: [u8; 2] = [crate::cpu::reset::CF9_CODE_HARD, crate::cpu::reset::CF9_CODE_FULL];
+
 /// The last-resort resets, for when the firmware's own reset register (FADT, which `kexec::crash` tries first,
-/// like the MCP `reboot`) did nothing: 0xCF9 hard reset, the 8042 reset line, finally a triple fault. For real
-/// hardware without COM1, where a silent halt after a fatal error looks exactly like a hang (A0 on the Mini-PC).
+/// like the MCP `reboot`) did nothing: 0xCF9 hard reset, 0xCF9 full reset, the 8042 reset line, finally a triple
+/// fault. For real hardware without COM1, where a silent halt after a fatal error looks exactly like a hang (A0 on the Mini-PC).
 /// Whether RAM keeps its contents (the crash page) is the board's business (measured once on the Mini-PC, RB-2
 /// notes); the crash page's lines were written back to RAM when written (`crash_page_write`), and the caches are
 /// written back here once more before the reset.
 pub fn reset_now() -> ! {
     crate::cpu::disable_interrupts();
     imp::write_back_caches();
-    // CP-5's CF9 sequence (read-modify-write, Linux arch/x86/kernel/reboot.c:694-700), as the console reboot path.
+    // CP-5's CF9 sequence (read-modify-write, Linux arch/x86/kernel/reboot.c:694-700), as the console reboot path;
+    // RB-13: hard, then full, the MCP `reboot`'s order (`acpi::power::reboot_plan`).
     use crate::cpu::reset;
-    let (arm, go) = reset::cf9_writes(reset::read_cf9(), reset::CF9_CODE_HARD);
-    reset::write_cf9(arm);
-    // Linux waits 50 us between the two writes; no TSC rate here, so a pause loop well above that.
-    for _ in 0..10_000 {
-        core::hint::spin_loop();
-    }
-    reset::write_cf9(go);
-    for _ in 0..1_000_000 {
-        core::hint::spin_loop();
+    for code in LAST_RESORT_CF9 {
+        let (arm, go) = reset::cf9_writes(reset::read_cf9(), code);
+        reset::write_cf9(arm);
+        // Linux waits 50 us between the two writes; no TSC rate here, so a pause loop well above that.
+        for _ in 0..10_000 {
+            core::hint::spin_loop();
+        }
+        reset::write_cf9(go);
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
     }
     crate::portio::raw::outb(0x64, 0xFE);
     for _ in 0..1_000_000 {
@@ -210,11 +217,25 @@ pub fn entry_return_with(env: &WalkEnv<'_>, rip: u64, rsp: u64) -> Option<Step> 
 /// mode, or a full `out` (a bound on one report). At the trap stub's call of `hal_kernel_trap` the trap frame
 /// right above it gives the interrupted rip, rsp and rbp, and the walk goes on there (possibly on another stack:
 /// NMI, #DF and #MC run on IST stacks).
-pub fn walk_with(env: &WalkEnv<'_>, rsp: u64, mut rbp: u64, out: &mut [Step]) -> usize {
+pub fn walk_with(env: &WalkEnv<'_>, rsp: u64, rbp: u64, out: &mut [Step]) -> usize {
+    let mut n = 0;
+    walk_visit_with(env, rsp, rbp, out.len(), &mut |s| {
+        out[n] = s;
+        n += 1;
+    });
+    n
+}
+
+/// `walk_with` handing each step to `visit` (up to `max` steps) instead of storing it: the crash report streams a
+/// long walk (an exception recursion, RB-12) without a buffer on the #DF stack. Returns the steps visited.
+pub fn walk_visit_with(env: &WalkEnv<'_>, rsp: u64, mut rbp: u64, max: usize, visit: &mut dyn FnMut(Step)) -> usize {
     let mut n = 0;
     let mut prev: Option<u64> = None;
+    // The last trap frames crossed: one met again is a loop (a nested NMI wrote its frame over a running NMI's,
+    // whose stack then leads back to that frame), not more history.
+    let mut crossed = [0u64; 4];
     let Some(mut win) = Window::new(env, rsp) else { return 0 };
-    while n < out.len() {
+    while n < max {
         if rbp == 0 || !rbp.is_multiple_of(8) {
             break;
         }
@@ -226,6 +247,11 @@ pub fn walk_with(env: &WalkEnv<'_>, rsp: u64, mut rbp: u64, out: &mut [Step]) ->
         let (Some(next), Some(ret)) = (win.read(env, rbp), rbp.checked_add(8).and_then(|a| win.read(env, a))) else { break };
         if (env.is_trap_return)(ret) {
             let f = rbp.wrapping_add(16);
+            if crossed.contains(&f) {
+                break;
+            }
+            crossed.rotate_right(1);
+            crossed[0] = f;
             let mut rd = |o: u64| f.checked_add(o).and_then(|a| win.read(env, a));
             let (Some(int_rbp), Some(vector), Some(error), Some(rip), Some(cs)) =
                 (rd(TF_RBP), rd(TF_VECTOR), rd(TF_ERROR), rd(TF_RIP), rd(TF_CS))
@@ -233,13 +259,13 @@ pub fn walk_with(env: &WalkEnv<'_>, rsp: u64, mut rbp: u64, out: &mut [Step]) ->
                 break;
             };
             let user = cs & 3 != 0;
-            out[n] = Step::Trap { vector, error, rip, user };
+            visit(Step::Trap { vector, error, rip, user });
             n += 1;
             let Some(int_rsp) = rd(TF_RSP).filter(|_| !user) else { break };
-            if n < out.len()
+            if n < max
                 && let Some(s) = entry_return_with(env, rip, int_rsp)
             {
-                out[n] = s;
+                visit(s);
                 n += 1;
             }
             // The interrupted code's stack (the IST stack held the frame): a new window, no ordering against it.
@@ -252,7 +278,7 @@ pub fn walk_with(env: &WalkEnv<'_>, rsp: u64, mut rbp: u64, out: &mut [Step]) ->
         if !(env.is_text)(ret) {
             break;
         }
-        out[n] = Step::Call(ret);
+        visit(Step::Call(ret));
         n += 1;
         prev = Some(rbp);
         rbp = next;
@@ -273,6 +299,13 @@ fn live_env<R>(f: impl FnOnce(&WalkEnv<'_>) -> R) -> R {
 pub fn walk(rbp: u64, out: &mut [Step]) -> usize {
     let rsp = imp::stack_pointer();
     live_env(|env| walk_with(env, rsp, rbp, out))
+}
+
+/// `walk` handing each step to `visit` (up to `max` steps; see `walk_visit_with`).
+#[inline(never)]
+pub fn walk_visit(rbp: u64, max: usize, visit: &mut dyn FnMut(Step)) -> usize {
+    let rsp = imp::stack_pointer();
+    live_env(|env| walk_visit_with(env, rsp, rbp, max, visit))
 }
 
 /// Walks the stack of interrupted code (`rsp`, `rbp` from its trap frame; the NMI handler). Crate-private: the
@@ -746,6 +779,71 @@ mod tests {
         m.put(tf + TF_RIP, 0x40_1000);
         m.put(tf + TF_CS, 0x33);
         assert_eq!(run(&m, ist, 8), [Step::Trap { vector: 2, error: 0, rip: 0x40_1000, user: true }]);
+    }
+
+    /// A trap frame at `tf` (the stub's call of `hal_kernel_trap` right below it, at `tf - 16`).
+    fn trap_at(m: &Mem, tf: u64, rip: u64, int_rsp: u64, int_rbp: u64) {
+        m.frame(tf - 16, 0xdead_0000, STUB_RET);
+        m.put(tf + TF_RBP, int_rbp);
+        m.put(tf + TF_VECTOR, 14);
+        m.put(tf + TF_ERROR, 0);
+        m.put(tf + TF_RIP, rip);
+        m.put(tf + TF_CS, 0x08);
+        m.put(tf + TF_RSP, int_rsp);
+    }
+
+    #[test]
+    fn an_exception_recursion_is_walked_to_its_first_fault() {
+        // The 26.10. shape: 30 nested #PF, each frame 0x1f8 above the next, then the first fault's own caller.
+        let m = Mem::new();
+        let top = 0xFFFF_E8FF_FEDE_C000u64;
+        let hook = TEXT.0 + 0x19;
+        let mut rbp = top - 30 * 0x1f8 - 0x100;
+        let start = rbp;
+        for k in 0..30u64 {
+            // The hook's frame returns into hal_kernel_trap, whose frame (at tf - 16) returns into the stub.
+            let tf = top - (30 - k) * 0x1f8;
+            m.frame(rbp, tf - 16, TEXT.0 + 0x181);
+            let next = tf + 0xb0 + 0x40;
+            trap_at(&m, tf, if k == 29 { TEXT.0 + 0x900 } else { hook }, next - 0x10, next);
+            rbp = next;
+        }
+        m.frame(rbp, 0, TEXT.0 + 0xa00);
+        let st = run_in(&m, &[], start, start, 256);
+        assert!(st.len() > 40, "{} steps", st.len());
+        assert_eq!(st.last(), Some(&Step::Call(TEXT.0 + 0xa00)), "the walk reaches the first fault's caller");
+        assert!(st.contains(&Step::Trap { vector: 14, error: 0, rip: TEXT.0 + 0x900, user: false }));
+        // The visitor sees the same steps.
+        let read = |a: u64| m.0.borrow().get(&a).copied();
+        let ok = |p: u64| p >= KERNEL_HALF;
+        let trap = |r: u64| r == STUB_RET;
+        let text = |a: u64| a >= TEXT.0 && a < TEXT.1;
+        let env = WalkEnv { read: &read, code: &read, page_ok: &ok, is_trap_return: &trap, is_text: &text };
+        let mut seen = Vec::new();
+        assert_eq!(walk_visit_with(&env, start, start, 256, &mut |s| seen.push(s)), st.len());
+        assert_eq!(seen, st);
+    }
+
+    #[test]
+    fn a_trap_frame_that_leads_back_to_itself_ends_the_walk() {
+        // A nested NMI's frame over a running NMI's: the interrupted rsp/rbp lead back down to the same frame.
+        let m = Mem::new();
+        let top = 0xFFFF_E8FF_FEDE_C000u64;
+        let tf = top - 0xb0;
+        let deep = top - 0x900;
+        trap_at(&m, tf, TEXT.0 + 0x1b5, deep, deep);
+        m.frame(deep, tf - 16, TEXT.0 + 0x200);
+        let st = run_in(&m, &[], tf - 16, tf - 16, 64);
+        assert_eq!(st.len(), 2, "{st:?}");
+    }
+
+    #[test]
+    fn a_user_half_frame_pointer_is_never_read() {
+        let m = Mem::new();
+        let s = 0xFFFF_C900_0001_0000u64;
+        m.frame(s, 0x7fff_f000, TEXT.0 + 0x100);
+        m.frame(0x7fff_f000, 0, TEXT.0 + 0x200);
+        assert_eq!(run(&m, s, 8), [Step::Call(TEXT.0 + 0x100)], "the program's frame is below the window");
     }
 
     #[test]

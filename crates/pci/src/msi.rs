@@ -129,10 +129,6 @@ pub fn msi_read_mask(c: &dyn ConfigAccess, at: Loc, l: &MsiLayout) -> Option<u32
     l.mask_off().map(|o| c.read32(at, o))
 }
 
-pub fn msi_read_pending(c: &dyn ConfigAccess, at: Loc, l: &MsiLayout) -> Option<u32> {
-    l.pending_off().map(|o| c.read32(at, o))
-}
-
 /// Control as read: (enabled, messages enabled as log2).
 pub fn msi_state(c: &dyn ConfigAccess, at: Loc, l: &MsiLayout) -> (bool, u8) {
     let d = c.read32(at, l.cap as u16);

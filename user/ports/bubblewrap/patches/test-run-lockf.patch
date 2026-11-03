@@ -1,0 +1,37 @@
+--- a/test-run.sh
++++ b/test-run.sh
+@@ -238,26 +238,20 @@
+ 
+ # Test --die-with-parent
+ 
++# BitsOS V2 (user/ports/bubblewrap/patches): no Python on V2; the same lock calls in bwrap-lockf (tools/bwrap-lockf.c)
+ cat >lockf-n.py <<EOF
+-#!/usr/bin/env python3
+-import struct,fcntl,sys
+-path = sys.argv[1]
+-if sys.argv[2] == 'wait':
+-  locktype = fcntl.F_SETLKW
+-else:
+-  locktype = fcntl.F_SETLK
+-lockdata = struct.pack("hhqqhh", fcntl.F_WRLCK, 0, 0, 0, 0, 0)
+-fd=open(sys.argv[1], 'a')
+-try:
+-  fcntl.fcntl(fd.fileno(), locktype, lockdata)
+-except IOError as e:
+-  sys.exit(1)
+-sys.exit(0)
++#!/bin/sh
++exec bwrap-lockf "\$@"
+ EOF
+ chmod a+x lockf-n.py
+ touch lock
+ 
+ for die_with_parent_argv in "--die-with-parent" "--die-with-parent --unshare-pid"; do
++    # BitsOS V2: without the parent-death signal reaching a pid namespace's init the lock wait below never ends.
++    if [ "$die_with_parent_argv" != "--die-with-parent" ] && ! bwrap-pdeath-probe; then
++        ok_skip "die with parent ${die_with_parent_argv}: the parent-death signal does not reach a pid namespace's init"
++        continue
++    fi
+     # We have to loop here, because bwrap doesn't wait for the lock if
+     # another process is holding it. If we're unlucky, lockf-n.py will
+     # be holding it.

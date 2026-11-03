@@ -47,6 +47,7 @@ mod tests_rs;
 mod tests_usb;
 mod ktests_usb;
 mod ktests_out;
+mod ktests_reboot;
 mod helper;
 pub mod output;
 mod tool;

@@ -19,6 +19,7 @@ LO="${BITSOS_PORT_LO:-23000}"
 MCP_FWD=$((LO + 100))
 HTTP=$((LO + 110))
 TOKEN="rb5a-scenario-token-91c2"
+export RB18_PSK="rb18-fake-psk-not-real"
 LOG="$RUN_DIR/serial.log"
 NAME=rb-reload
 SMP="${RB_SMP:-16}"
@@ -26,14 +27,18 @@ SMP="${RB_SMP:-16}"
 # Needs the desk's kernel lines (plan/notes/rb-RB-5a.md, change request 1): without kexec::set_boot_info the
 # kernel cannot hand its BootInfo on, without net::init MCP is not reachable from the host.
 if ! grep -q "kexec::set_boot_info" kernel/src/main.rs || ! grep -q "net::init" kernel/src/main.rs; then
-    echo "SKIP: kernel/src/main.rs lacks kexec::set_boot_info or net::init (desk change request 1 of RB-5a / NW-3)"
-    exit 0
+    echo "FAIL: kernel/src/main.rs lacks kexec::set_boot_info or net::init (desk change request 1 of RB-5a / NW-3)"
+    exit 1
 fi
 
 # The MCP log parsing first (seconds, no QEMU); 15-reload-parser.sh runs the same in the plain gate.
 python3 -I "$HERE/reload_scenario.py" --selftest > "$RUN_DIR/selftest.out" || { cat "$RUN_DIR/selftest.out"; exit 1; }
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;rb_squeeze_mb=256;rb_choke_mb=10"
+# INT-W27b (SX-3b/3c CR6): the squeeze leaves room for the test bundle's initramfs in one piece; 256 MiB stopped
+# fitting the ~92 MB initramfs (bwrap and the whole glibc set), reload_scenario.py reads the same value.
+export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-384}
+# RB-18: a made-up passphrase (no WLAN card here): blanked in the boot record, named in the summary after each Reload.
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;wlan_psk=$RB18_PSK;mcp_port=8765;loglevel=info;rb_squeeze_mb=$RB_SQUEEZE_MB;rb_choke_mb=10"
 BUNDLES="$RUN_DIR/bundles"
 rm -rf "$BUNDLES"
 mkdir -p "$BUNDLES/base"
@@ -58,3 +63,15 @@ trap cleanup EXIT
 
 python3 -I "$HERE/reload_scenario.py" "$MCP_FWD" "$TOKEN" "$LOG" "$BUNDLES" "$HTTP" "$SMP"
 grep -a "kexec \(handover\|reload\.\(jump\|refused\)\)" "$LOG" | tail -30
+
+# RB-16: every jump left its crumbs (CPUs stopped, one per device, quiesced, the bus-master sweep) before it: the
+# jump line names the last one and their number (the wire and keep stores themselves are checked by
+# 60-reboot-park.sh and the rb.wdt.crumb ktest; QEMU has no FCH watchdog).
+jumps=$(grep -ac 'kexec reload\.jump ' "$LOG" || true)
+crumbed=$(grep -a 'kexec reload\.jump ' "$LOG" | grep -aE 'last_crumb="?reload_sweep' | sed -n 's/.*crumb_seq=\([0-9]*\).*/\1/p' | awk '$1 >= 4' | wc -l)
+if [ "$jumps" -gt 0 ] && [ "$crumbed" -eq "$jumps" ]; then
+    echo "ok   every Reload jump ($jumps) came after the crumbs of its stages (RB-16)"
+else
+    echo "FAIL Reload jumps $jumps, with the stage crumbs $crumbed (RB-16: reload.jump crumb_seq>=4 last_crumb=reload_sweep)"
+    exit 1
+fi

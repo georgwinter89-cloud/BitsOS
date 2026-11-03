@@ -155,10 +155,6 @@ impl Fat {
         Ok(())
     }
 
-    pub fn has_changes(&self) -> bool {
-        !self.dirty.is_empty()
-    }
-
     /// Writes the changed sectors: all to FAT 1, then all to FAT 2 (and further copies). A failed write
     /// leaves the sectors marked changed (the next `write_out` tries again).
     pub fn write_out(&mut self, dev: &dyn Dev) -> Result<(), i64> {

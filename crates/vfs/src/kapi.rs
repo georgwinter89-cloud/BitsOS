@@ -15,6 +15,75 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use uapi::errno::*;
+use zeroize::Zeroize;
+
+/// RB-18: the whole of a regular file that holds secrets, at most `max` bytes (EFBIG above): no copy of the text is
+/// left behind in freed heap, and the file's clean page-cache pages are zeroed and dropped afterwards
+/// (`PageCache::forget_clean`), so the next reader reads it back from the file system. Pages with unwritten changes
+/// stay (they hold the file's only current content) until a later read finds them clean.
+pub fn read_secret(p: &Path, max: usize) -> Result<Vec<u8>, Errno> {
+    if p.dentry.is_dir() {
+        return Err(EISDIR);
+    }
+    let f = node::file_of(&p.dentry);
+    let result = read_whole(&*f, f.size() as usize, max);
+    if let Data::External(ops) = &p.dentry.inode.data
+        && let Some(cache) = ops.page_cache()
+    {
+        let stayed = cache.forget_clean();
+        if stayed != 0 {
+            klog::event!(Debug, "vfs", "secret.pages_stayed", pages = stayed; "a secret file has pages in use or not written yet");
+        }
+    }
+    result
+}
+
+/// Reads to the file's end into one buffer; a file that outgrows `size` meanwhile moves to a larger one and the old
+/// one is zeroed.
+fn read_whole(f: &dyn File, size: usize, max: usize) -> Result<Vec<u8>, Errno> {
+    if size > max {
+        return Err(EFBIG);
+    }
+    let fresh = |cap: usize| -> Result<Vec<u8>, Errno> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(cap).map_err(|_| ENOMEM)?;
+        v.resize(cap, 0);
+        Ok(v)
+    };
+    // One byte more than the size: a read that fills it did not meet the end.
+    let mut out = fresh(size.saturating_add(1).min(max.saturating_add(1)))?;
+    let mut got = 0;
+    let end = loop {
+        let n = match f.read_at(got as u64, &mut out[got..]) {
+            Ok(n) => n,
+            Err(e) => break Err(e),
+        };
+        if n == 0 {
+            break Ok(());
+        }
+        got += n;
+        if got > max {
+            break Err(EFBIG);
+        }
+        if got == out.len() {
+            match fresh(out.len().saturating_mul(2).min(max.saturating_add(1))) {
+                Ok(mut more) => {
+                    more[..got].copy_from_slice(&out[..got]);
+                    out.zeroize();
+                    out = more;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    if let Err(e) = end {
+        out.zeroize();
+        return Err(e);
+    }
+    out[got..].zeroize();
+    out.truncate(got);
+    Ok(out)
+}
 
 /// The content of a new regular file on the file system of `sb` (its pages are charged to that tmpfs's pool
 /// when allocated, FS-14).
@@ -202,6 +271,13 @@ impl MountNs {
             chunk = (chunk * 2).min(1 << 20);
         }
         Ok(out)
+    }
+
+
+    /// RB-18: [`MountNs::read_file`] for a file that holds secrets (CONFIG.TXT): see [`read_secret`].
+    pub fn read_secret_file(&self, path: &str, max: usize) -> Result<Vec<u8>, Errno> {
+        let p = self.lookup_path(path.as_bytes(), true)?;
+        read_secret(&p, max)
     }
 
     /// Writes `data` at `offset` (or appends) to an existing or new regular file (mode 0644 when new).

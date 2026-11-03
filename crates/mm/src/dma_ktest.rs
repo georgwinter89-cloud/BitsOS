@@ -28,7 +28,9 @@ fn masks() -> TestResult {
         let c = DmaConstraints::from_mask_bits(bits);
         match DmaBuffer::alloc(3 * PAGE as usize, c) {
             Ok(x) => kassert!(x.device_addr() + 3 * PAGE <= 1 << bits, "{bits}-bit buffer at {:#x}", x.device_addr()),
-            Err(DmaError::NoMemory) if bits <= 24 => {}
+            // Below 256 MiB the pool is small and a long run can use it up (W28: a 28-bit mask after about 600
+            // tests in release); the address check above still holds for every buffer handed out.
+            Err(DmaError::NoMemory) if bits <= 28 => klog::event!(Info, "mm", "ktest.dma_mask.none_free", bits = bits as u64),
             Err(e) => return Err(format!("{bits}-bit mask: {e:?}")),
         }
     }

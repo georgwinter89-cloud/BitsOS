@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod bytes;
 pub mod clock;
 pub mod cpu_keys;
+pub mod cst;
 pub mod fadt;
 pub mod guard;
 pub mod hpet;
@@ -157,6 +158,8 @@ pub struct Acpi {
     pub dsdt: Option<TableInfo>,
     /// `\_S5` and where it was found (signature, physical address of that table).
     pub s5: Option<(s5::S5, Signature, u64)>,
+    /// FD-1: the first static `_CST` (processor idle states) in the DSDT or an SSDT, and where it was found.
+    pub cst: Option<(cst::Cst, Signature, u64)>,
     pub notes: Notes,
 }
 

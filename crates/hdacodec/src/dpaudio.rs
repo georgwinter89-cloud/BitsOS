@@ -71,7 +71,8 @@ const fn gate(loc: Loc, mask: u32, want: u32, differ: bool, name: &'static str) 
 }
 
 /// In this order. The first two confirm the segment bases (the undo needs only them). The 14th is the kernel's
-/// own: the undo writes DP_SEC_CNTL 0 whole, which must take away only what `on` added.
+/// own: `on` adds DP audio only next to no other secondary packets the firmware sends (the undo clears the audio
+/// fields and keeps the rest, as Linux).
 pub const GATES: [Gate; 14] = [
     gate(Loc::Bar(0xE318), !0, 0x1002AA01, false, "codec_id 1002AA01: segment 2 base"),
     gate(Loc::Bar(0x508), !0, 600_000_000, false, "DP_DTO0_MODULO 600 MHz: segment 1 base"),
@@ -111,6 +112,13 @@ const fn e(x: u32) -> Loc {
 }
 
 pub const ON_WRITES: usize = 48;
+/// DIG0's DP_SEC_CNTL and the fields Linux's `enc1_se_disable_dp_audio` clears (`dcn10_stream_encoder.c:1405`):
+/// STREAM_ENABLE (bit 0, the master switch of every secondary packet), ASP, ATP, AIP, ACM.
+pub const DP_SEC_CNTL: u32 = 0x157AC;
+pub const DP_SEC_STREAM_ENABLE: u32 = 0x1;
+pub const DP_SEC_AUDIO: u32 = DP_SEC_STREAM_ENABLE | 0x10 | 0x100 | 0x1000 | 0x1_0000;
+/// The undo's entry for DP_SEC_CNTL, after which `off` puts STREAM_ENABLE back if another field is still set.
+const UNDO_DP_SEC: usize = 1;
 pub const OFF_WRITES: usize = 41;
 /// The endpoint registers stage 3 sets to 0 (AUDIO_DESCRIPTOR1-13 but 8 and 12) take the sink's descriptors.
 const DESCRIPTORS: [u32; 12] = [0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x31, 0x32, 0x33, 0x35];
@@ -167,7 +175,7 @@ pub fn on_writes(az: &AzConfig) -> Vec<Write> {
 /// (saved-5.json, 04.10.2026) written whole.
 pub const UNDO: [Write; OFF_WRITES] = [
     w(0, b(0x15508), 0, 0x0400_0800, 0xBB7F_FFFF), // AFMT_AUDIO_PACKET_CONTROL
-    w(0, b(0x157AC), 0, 0, !0),                    // DP_SEC_CNTL
+    w(0, b(DP_SEC_CNTL), !DP_SEC_AUDIO, 0, !0),    // DP_SEC_CNTL: the audio fields and STREAM_ENABLE 0 (see `off`)
     w(0, b(0x155C0), 0, 0x100, 0xFFFF_FEFF),       // DIG0_AFMT_CNTL
     w(0, b(0x157D4), 0, 0, !0),                    // DP_SEC_TIMESTAMP
     w(0, b(0x157C4), 0, 0x8000, !0),               // DP_SEC_AUD_N
@@ -467,6 +475,16 @@ struct Applied {
     error: Option<(Write, u32, RegError)>,
 }
 
+impl Applied {
+    /// `next` after this one (counts summed, the first surprise and error kept).
+    fn add(&mut self, next: Applied) {
+        self.writes += next.writes;
+        self.mismatched += next.mismatched;
+        self.surprise = self.surprise.or(next.surprise);
+        self.error = self.error.or(next.error);
+    }
+}
+
 fn apply<R: Regs>(r: &mut R, list: &[Write], stop: bool) -> Applied {
     let mut a = Applied { writes: 0, mismatched: 0, surprise: None, error: None };
     for (i, wr) in list.iter().enumerate() {
@@ -507,6 +525,13 @@ fn apply<R: Regs>(r: &mut R, list: &[Write], stop: bool) -> Applied {
 /// V1 `dp_audio_on` for the sink `az`: gates, then the 48 writes; already on: nothing written. A surprise or a
 /// failed access is undone at once.
 pub fn on<R: Regs>(r: &mut R, az: &AzConfig) -> Result<On, OnError> {
+    on_with(r, az, |_| {})
+}
+
+/// [`on`] with `enabled` run between the endpoint's enable (stage 4, `dce_aud_az_enable`) and the audio packets
+/// (stage 5): where Linux 6.6 sends the SMU its PME message (`dce110_hw_sequencer.c:1100-1106`, SN-13 w25). Not
+/// run when nothing is written (no engine, a gate, already on) or a write before it failed.
+pub fn on_with<R: Regs>(r: &mut R, az: &AzConfig, enabled: impl FnOnce(&mut R)) -> Result<On, OnError> {
     if !present(r) {
         return Err(OnError::NoEngine);
     }
@@ -521,7 +546,16 @@ pub fn on<R: Regs>(r: &mut R, az: &AzConfig) -> Result<On, OnError> {
         Err(_) => return Err(OnError::NoEngine),
     }
     let list = on_writes(az);
-    let a = apply(r, &list, true);
+    let k = list.iter().position(|w| w.stage >= 5).unwrap_or(list.len());
+    let mut a = apply(r, &list[..k], true);
+    if a.surprise.is_none() && a.error.is_none() {
+        enabled(r);
+        let mut rest = apply(r, &list[k..], true);
+        let off = k as u32;
+        rest.surprise = rest.surprise.map(|(wr, nth, wrote, read)| (wr, nth + off, wrote, read));
+        rest.error = rest.error.map(|(wr, nth, e)| (wr, nth + off, e));
+        a.add(rest);
+    }
     if let Some((wr, nth, wrote, read)) = a.surprise {
         return Err(OnError::Surprise { stage: wr.stage, nth, loc: wr.loc, wrote, read, undo: off(r) });
     }
@@ -533,7 +567,9 @@ pub fn on<R: Regs>(r: &mut R, az: &AzConfig) -> Result<On, OnError> {
 
 /// V1 `dp_audio_off`: the firmware's values back. Needs only gates 1 and 2 (not the link: the picture may have
 /// changed since). A write that does not read back is counted and the rest still written. No waits: also the
-/// Quiesce path (interrupts off).
+/// Quiesce path (interrupts off). DP_SEC_CNTL as Linux's `enc1_se_disable_dp_audio` (`dcn10_stream_encoder.c:1405`,
+/// SN-12): the audio fields and STREAM_ENABLE cleared, then STREAM_ENABLE set back if another field (an infoframe
+/// sender) is still on, since the register is shared with them; written whole to 0 before.
 pub fn off<R: Regs>(r: &mut R) -> Result<Off, OffError> {
     if !present(r) {
         return Err(OffError::NoEngine);
@@ -543,7 +579,22 @@ pub fn off<R: Regs>(r: &mut R) -> Result<Off, OffError> {
         Ok(Some((gate, read))) => return Err(OffError::NotConfirmed { gate, read }),
         Err(_) => return Err(OffError::NoEngine),
     }
-    let a = apply(r, &UNDO, false);
+    let mut a = apply(r, &UNDO[..=UNDO_DP_SEC], false);
+    if a.error.is_none() {
+        let keep = match get(r, b(DP_SEC_CNTL)) {
+            Ok(v) => (v != 0 && v & DP_SEC_STREAM_ENABLE == 0).then_some(v),
+            Err(e) => {
+                a.error = Some((UNDO[UNDO_DP_SEC], UNDO_DP_SEC as u32 + 1, e));
+                None
+            }
+        };
+        if keep.is_some() {
+            a.add(apply(r, &[w(0, b(DP_SEC_CNTL), !0, DP_SEC_STREAM_ENABLE, !0)], false));
+        }
+    }
+    if a.error.is_none() {
+        a.add(apply(r, &UNDO[UNDO_DP_SEC + 1..], false));
+    }
     if let Some((wr, _, error)) = a.error {
         return Err(OffError::Access { writes: a.writes, loc: wr.loc, error });
     }

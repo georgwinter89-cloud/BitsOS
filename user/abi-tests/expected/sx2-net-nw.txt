@@ -1,0 +1,7 @@
+parent: bind abstract = 0
+parent: listen = 0
+same namespace: connect = 0
+unshare(CLONE_NEWUSER|CLONE_NEWNET) = 0
+new namespace: connect abstract = -ECONNREFUSED
+new namespace: tcp bind(192.0.2.1) = 0
+child: exit 0

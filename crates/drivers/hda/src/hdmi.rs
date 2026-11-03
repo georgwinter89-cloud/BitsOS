@@ -4,6 +4,11 @@
 //! audio pin (3, AZ endpoint 0 -> DIG0) is playable. `hdmi_off` and Quiesce (Reload, reboot, power off) put the
 //! display side back to the firmware's values.
 //!
+//! SN-13 (w25): Linux's DP audio on and off also send the display's SMU mailbox `UpdatePmeRestore`
+//! (`hdacodec::dcnsmu`); so does this glue now: in `on` between the endpoint's enable and the packets, after
+//! `off` and after Quiesce's undo. Its three mailbox writes are not display writes (`smu_writes`, not
+//! `write_calls`); `DcnRegs` still logs them (GX-D9: every write logged).
+//!
 //! QEMU has no display engine: `DcnRegs::attached()` is `None`, every call answers "no display
 //! engine" and nothing is written (ktest `sn.dpaudio.absent`).
 
@@ -15,6 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use amdgpu::dcn::{self, DcnError, DcnRegs};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use hdacodec::dcnsmu::{self, Mailbox, Sent};
 use hdacodec::dpaudio::{self, EP_INDEX, Off, OffError, On, OnError, RegError, Regs, State};
 use hdacodec::eld::{AzConfig, EdidError, Sink};
 use ksync::{IrqSpinLock, Mutex, SpinLock};
@@ -32,11 +38,24 @@ static GEN: AtomicU32 = AtomicU32::new(0);
 /// Quiesce does not wait for the pair longer than this many tries: a holder on another CPU is done with one
 /// access within microseconds; one that never lets go (a stopped CPU) is not waited for.
 const PAIR_TRIES: u32 = 1 << 16;
+/// The SMU message's bounds (Linux waits up to 2 s, `dcn314_smu.c` 10 us x 200000; the Mini-PC's PMFW answered
+/// in ~450 us): in thread context (`on`, `off`) and in Quiesce (also the panic path). Each wait polls the clock
+/// and stops after a number of polls too, so a clock that does not run (host tests, a stuck clock) ends it.
+const PME_THREAD_NS: u64 = 100_000_000;
+const PME_QUIESCE_NS: u64 = 5_000_000;
+const PME_POLLS: u32 = 20_000;
+const PME_POLL_SPINS: u32 = 64;
+/// In thread context the first this-long of a wait spins (the PMFW's usual answer comes within it); after it each
+/// poll sleeps `PME_SLEEP_NS`, so a silent PMFW costs `on`/`off` a bounded sleep, not 100 ms of a busy CPU (B4).
+const PME_SPIN_NS: u64 = 2_000_000;
+const PME_SLEEP_NS: u64 = 50_000;
 
 /// What the glue needs of the display owner: `DcnRegs` on the hardware, a register image in host tests.
 pub trait Raw {
     fn read(&self, byte: u32) -> Result<u32, DcnError>;
     fn write(&self, byte: u32, v: u32) -> Result<(), DcnError>;
+    /// A write without the read-back compare (the SMU mailbox: its response register changes under the write).
+    fn write_unchecked(&self, byte: u32, v: u32) -> Result<(), DcnError>;
 }
 
 impl Raw for DcnRegs {
@@ -46,6 +65,57 @@ impl Raw for DcnRegs {
     fn write(&self, byte: u32, v: u32) -> Result<(), DcnError> {
         DcnRegs::write(self, byte, v)
     }
+    fn write_unchecked(&self, byte: u32, v: u32) -> Result<(), DcnError> {
+        // Logged as every BAR5 write (GX-D9), compared on no bit.
+        DcnRegs::write_masked(self, byte, v, 0)
+    }
+}
+
+/// The SMU mailbox over the owner's registers; its writes are counted apart from the display writes.
+struct Smu<'a, A: Raw + ?Sized> {
+    raw: &'a A,
+    latch: &'a Latch,
+}
+
+impl<A: Raw + ?Sized> Mailbox for Smu<'_, A> {
+    fn read(&mut self, byte: u32) -> Result<u32, RegError> {
+        self.raw.read(byte).map_err(map)
+    }
+    fn write(&mut self, byte: u32, v: u32) -> Result<(), RegError> {
+        self.latch.smu_writes.fetch_add(1, Ordering::AcqRel);
+        self.raw.write_unchecked(byte, v).map_err(map)
+    }
+}
+
+/// A wait bound for the SMU message: `clock` until `ns` from now, at most `PME_POLLS` polls of a short spin.
+pub(crate) fn pme_bound(clock: &dyn Fn() -> u64, ns: u64) -> impl FnMut() -> bool + '_ {
+    pme_bound_with(clock, ns, None)
+}
+
+/// [`pme_bound`] that sleeps between polls once `PME_SPIN_NS` have passed (`sleep`: thread context only).
+pub(crate) fn pme_bound_with<'c>(clock: &'c dyn Fn() -> u64, ns: u64, sleep: Option<&'c dyn Fn(u64)>) -> impl FnMut() -> bool + 'c {
+    let start = clock();
+    let end = start.saturating_add(ns);
+    let mut polls = 0u32;
+    move || {
+        match sleep {
+            Some(z) if clock().saturating_sub(start) >= PME_SPIN_NS => z(PME_SLEEP_NS),
+            _ => {
+                for _ in 0..PME_POLL_SPINS {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        polls += 1;
+        polls < PME_POLLS && clock() < end
+    }
+}
+
+/// The thread-context bound (`on`, `off`): real clock, sleeping after the first `PME_SPIN_NS`.
+fn thread_bound() -> impl FnMut() -> bool {
+    static CLOCK: fn() -> u64 = time::now_ns;
+    static SLEEP: fn(u64) = sched::sleep_ns;
+    pme_bound_with(&CLOCK, PME_THREAD_NS, Some(&SLEEP))
 }
 
 /// The undo's bookkeeping. `armed`: display registers may differ from the firmware's because of this kernel, so
@@ -53,7 +123,8 @@ impl Raw for DcnRegs {
 /// written or an undo restored every register.
 pub(crate) struct Latch {
     armed: AtomicBool,
-    /// Quiesce cannot log: bit 31 = a note, 30 = refused, 29 = the pair was busy, 15:8 = writes, 7:0 = mismatched.
+    /// Quiesce cannot log: bit 31 = a note, 30 = refused, 29 = the pair was busy, 27:24 = the SMU message after
+    /// the undo (`Sent::code`), 15:8 = writes, 7:0 = mismatched.
     note: AtomicU32,
     /// Writes handed to the owner (refused ones included) that can change what the display engine does: the
     /// absent-device and boot-switch ktests check it stays. Not the endpoint index selects, see `selects`.
@@ -62,11 +133,32 @@ pub(crate) struct Latch {
     /// register and put the index back under the same hold, so a plain state read writes it twice; the endpoint
     /// register itself is written through `EP_DATA`, which counts in `write_calls`.
     selects: AtomicU64,
+    /// SN-13 (w25): SMU mailbox writes (not display writes), the mailbox taken (one sender at a time), the last
+    /// thread-context message's code (bits 3:0 `on`, 7:4 `off`; `Sent::code`).
+    smu_writes: AtomicU64,
+    pub(crate) smu_held: AtomicBool,
+    pme_last: AtomicU32,
 }
 
 impl Latch {
     pub(crate) const fn new() -> Self {
-        Latch { armed: AtomicBool::new(false), note: AtomicU32::new(0), write_calls: AtomicU64::new(0), selects: AtomicU64::new(0) }
+        Latch {
+            armed: AtomicBool::new(false),
+            note: AtomicU32::new(0),
+            write_calls: AtomicU64::new(0),
+            selects: AtomicU64::new(0),
+            smu_writes: AtomicU64::new(0),
+            smu_held: AtomicBool::new(false),
+            pme_last: AtomicU32::new(0),
+        }
+    }
+    pub(crate) fn smu_writes(&self) -> u64 {
+        self.smu_writes.load(Ordering::Acquire)
+    }
+    /// The last `on`'s and `off`'s SMU message (`Sent::code_name`).
+    pub(crate) fn pme_last(&self) -> (&'static str, &'static str) {
+        let v = self.pme_last.load(Ordering::Acquire);
+        (Sent::code_name(v & 0xF), Sent::code_name(v >> 4 & 0xF))
     }
     pub(crate) fn armed(&self) -> bool {
         self.armed.load(Ordering::Acquire)
@@ -84,6 +176,7 @@ impl Latch {
             pair_busy: n >> 29 & 1 == 1,
             writes: n >> 8 & 0xFF,
             mismatched: n & 0xFF,
+            pme: n >> 24 & 0xF,
         })
     }
 }
@@ -97,6 +190,14 @@ pub struct QuiesceNote {
     pub pair_busy: bool,
     pub writes: u32,
     pub mismatched: u32,
+    /// SN-13 (w25): the SMU message after the undo (`Sent::code`; 0 = not sent).
+    pub pme: u32,
+}
+
+impl QuiesceNote {
+    pub fn pme_name(&self) -> &'static str {
+        Sent::code_name(self.pme)
+    }
 }
 
 pub(crate) struct Bus<'a, A: Raw + ?Sized> {
@@ -170,8 +271,17 @@ impl<'a, A: Raw + ?Sized> Ctx<'a, A> {
     /// `dpaudio::on`, armed before its first write: a Quiesce during the writes, or after an undo that did not
     /// restore everything, still undoes.
     pub(crate) fn on(&self, az: &AzConfig) -> Result<On, OnError> {
+        self.on_timed(az, thread_bound)
+    }
+
+    /// [`Ctx::on`] with `bound` making each SMU message's wait bound when that message is sent (its own deadline,
+    /// not shared with the writes before it or with a second message). SN-13 (w25), Linux's order: the endpoint
+    /// enabled, then `UpdatePmeRestore`, then the packets. A failed `on` whose writes were undone at once sends it
+    /// again, as Linux's audio off does. Linux ignores the message's outcome; so does this (logged by `display_on`).
+    pub(crate) fn on_timed<B: FnMut() -> bool>(&self, az: &AzConfig, mut bound: impl FnMut() -> B) -> Result<On, OnError> {
         let before = self.latch.armed.swap(true, Ordering::AcqRel);
-        let r = dpaudio::on(&mut self.bus(false), az);
+        let mut enabled = None;
+        let r = dpaudio::on_with(&mut self.bus(false), az, |_| enabled = Some(self.pme(&mut bound(), true)));
         let armed = match &r {
             Ok(_) => true,
             // Refused before any write: as it was.
@@ -180,25 +290,43 @@ impl<'a, A: Raw + ?Sized> Ctx<'a, A> {
             Err(e) => !matches!(e.undo(), Some(Ok(o)) if o.mismatched == 0),
         };
         self.latch.armed.store(armed, Ordering::Release);
+        if let Some(on) = enabled {
+            let off = if r.is_err() { Some(self.pme(&mut bound(), true)) } else { None };
+            self.note_pme(Some(on), off);
+        }
         r
     }
 
-    /// `dpaudio::off`; disarmed only when every register read back as the firmware's.
+    /// `dpaudio::off`; disarmed only when every register read back as the firmware's. SN-13 (w25): then the SMU
+    /// message (Linux's `dce110_disable_audio_stream` after the packets are off), only when the undo was written.
     pub(crate) fn off(&self) -> Result<Off, OffError> {
+        self.off_timed(thread_bound)
+    }
+
+    pub(crate) fn off_timed<B: FnMut() -> bool>(&self, mut bound: impl FnMut() -> B) -> Result<Off, OffError> {
         let r = dpaudio::off(&mut self.bus(false));
         if matches!(&r, Ok(o) if o.mismatched == 0) {
             self.latch.armed.store(false, Ordering::Release);
         }
+        if r.is_ok() {
+            let sent = self.pme(&mut bound(), true);
+            self.note_pme(None, Some(sent));
+        }
         r
     }
 
-    /// From Quiesce (interrupts off, maybe the panic path): the undo if armed. No waits, no klog: the result goes
-    /// into the note.
+    /// From Quiesce (interrupts off, maybe the panic path): the undo if armed, then the SMU message. No sleep, no
+    /// klog, every wait on `clock` (the panic path's own) and bounded: the result goes into the note.
     pub(crate) fn quiesce(&self) {
+        let clock = time::now_ns;
+        self.quiesce_with(&clock)
+    }
+
+    pub(crate) fn quiesce_with(&self, clock: &dyn Fn() -> u64) {
         if !self.latch.armed() {
             return;
         }
-        let note = match dpaudio::off(&mut self.bus(true)) {
+        let mut note = match dpaudio::off(&mut self.bus(true)) {
             Ok(o) => {
                 if o.mismatched == 0 {
                     self.latch.armed.store(false, Ordering::Release);
@@ -210,7 +338,31 @@ impl<'a, A: Raw + ?Sized> Ctx<'a, A> {
             }
             Err(_) => 1 << 31 | 1 << 30,
         };
+        if note >> 30 & 1 == 0 {
+            note |= self.pme(&mut pme_bound(clock, PME_QUIESCE_NS), false).code() << 24;
+        }
         self.latch.note.store(note, Ordering::Release);
+    }
+
+    /// `UpdatePmeRestore` with the mailbox taken (one sender at a time). `wait` false (Quiesce): a held mailbox is
+    /// not waited for (its holder may be a stopped CPU): `Busy`, nothing sent.
+    fn pme(&self, more: &mut dyn FnMut() -> bool, wait: bool) -> Sent {
+        let held = &self.latch.smu_held;
+        while held.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            if !wait || !more() {
+                return Sent::Busy;
+            }
+        }
+        let r = dcnsmu::update_pme_restore(&mut Smu { raw: self.raw, latch: self.latch }, more);
+        held.store(false, Ordering::Release);
+        r
+    }
+
+    fn note_pme(&self, on: Option<Sent>, off: Option<Sent>) {
+        let old = self.latch.pme_last.load(Ordering::Acquire);
+        let lo = on.map_or(old & 0xF, Sent::code);
+        let hi = off.map_or(old >> 4 & 0xF, Sent::code);
+        self.latch.pme_last.store(lo | hi << 4, Ordering::Release);
     }
 }
 
@@ -227,6 +379,17 @@ pub fn write_calls() -> u64 {
 /// `EP_INDEX` selects (and their put-backs) handed to `DcnRegs` under the endpoint pair since boot (SN-13).
 pub fn index_selects() -> u64 {
     LATCH.selects()
+}
+
+/// SN-13 (w25): SMU mailbox writes since boot (three per `UpdatePmeRestore`; not display writes).
+pub fn smu_writes() -> u64 {
+    LATCH.smu_writes()
+}
+
+/// SN-13 (w25): what the last display-side on and off got from the SMU message (`ok`, `not_ready`, `no_answer`,
+/// `refused`, `access`, `busy`, `none`).
+pub fn pme_last() -> (&'static str, &'static str) {
+    LATCH.pme_last()
 }
 
 /// Changes when the HDMI output appears or goes.
@@ -300,6 +463,19 @@ pub fn sink_known() -> bool {
     SINK.lock().is_some()
 }
 
+/// SN-13 (w25): the SMU message of a display-side on or off (Info when answered OK, else Warn: Linux goes on too).
+fn log_pme(when: &'static str, w0: u64) {
+    let (on, off) = LATCH.pme_last();
+    let result = if when == "on" { on } else { off };
+    let writes = LATCH.smu_writes().saturating_sub(w0);
+    if result == "ok" {
+        klog::event!(Info, "snd", "dpaudio.pme", when = when, result = result, smu_writes = writes);
+    } else {
+        klog::event!(Warn, "snd", "dpaudio.pme", when = when, result = result, smu_writes = writes;
+            "the SMU did not take UpdatePmeRestore (Linux goes on as well)");
+    }
+}
+
 fn log_off(r: &Result<Off, OffError>) {
     match r {
         Ok(o) => klog::event!(Info, "snd", "dpaudio.off", writes = o.writes, mismatched = o.mismatched, text = o.line().as_str()),
@@ -315,9 +491,13 @@ pub fn display_on() -> Result<On, String> {
         return Err(OnError::NoEngine.why());
     };
     let az = az()?;
+    let w0 = LATCH.smu_writes();
     let r = ctx(regs).on(&az);
     match &r {
-        Ok(o @ On::Written { writes }) => klog::event!(Warn, "snd", "dpaudio.on", writes = *writes, text = o.line().as_str()),
+        Ok(o @ On::Written { writes }) => {
+            klog::event!(Info, "snd", "dpaudio.on", writes = *writes, text = o.line().as_str());
+            log_pme("on", w0);
+        }
         Ok(o @ On::AlreadyOn) => klog::event!(Info, "snd", "dpaudio.on_already", text = o.line().as_str()),
         Err(OnError::NoEngine) => klog::event!(Info, "snd", "dpaudio.no_engine"; "no display engine: nothing written"),
         Err(e @ OnError::Gate { read, .. }) => klog::event!(Warn, "snd", "dpaudio.gate", read = klog::Hex(*read as u64), text = e.line().as_str()),
@@ -340,8 +520,12 @@ pub fn display_off() -> Result<Off, String> {
         klog::event!(Info, "snd", "dpaudio.no_engine"; "no display engine: nothing undone");
         return Err(OffError::NoEngine.line());
     };
+    let w0 = LATCH.smu_writes();
     let r = ctx(regs).off();
     log_off(&r);
+    if r.is_ok() {
+        log_pme("off", w0);
+    }
     r.map_err(|e| e.line())
 }
 
@@ -401,11 +585,20 @@ pub fn hdmi_off() -> Result<Off, String> {
 
 /// From the GPU controller's Quiesce (interrupts off, maybe the panic path): the undo if this kernel's writes may
 /// still be in the display registers. No waits, no klog: the result is kept for [`quiesce_note`].
-pub(crate) fn quiesce_display() {
+/// `clock`: the panic path's own (None: the kernel's), for the SMU message's bounded wait.
+pub(crate) fn quiesce_display(clock: Option<&(dyn Fn() -> u64 + Sync)>) {
     // `attached_now`: Quiesce never maps or logs; an engine nobody attached was never written either.
     if let Some(regs) = DcnRegs::attached_now() {
-        ctx(regs).quiesce();
+        match clock {
+            Some(c) => ctx(regs).quiesce_with(c),
+            None => ctx(regs).quiesce(),
+        }
     }
+}
+
+/// The display side may still hold this kernel's writes (a Quiesce would undo them).
+pub(crate) fn display_armed() -> bool {
+    LATCH.armed()
 }
 
 /// The last Quiesce's undo, if any (ktests, the console after a Reload).

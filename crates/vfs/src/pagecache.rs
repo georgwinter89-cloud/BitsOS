@@ -23,15 +23,16 @@
 //! released and inserts it after, B4). `vfs.cache.sync` (Mutex per file) keeps one write-back of a file at a
 //! time, taken before `vfs.inode.data`, which is released while the backend writes.
 
+use crate::cache_view::{Gone, Pages, Shared, NO_MARK};
+pub use crate::cache_view::{QuickSink, Stop};
 use crate::frame::{Frame, PAGE};
-use crate::index::PageIndex;
 use crate::memfd::{F_SEAL_EXEC, F_SEAL_FUTURE_WRITE, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE};
 use crate::pool::{pages_for, Pool};
 use crate::readahead;
 use crate::Errno;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use ksync::{Mutex, WaitQueue};
 use uapi::errno::*;
 
@@ -46,6 +47,11 @@ static NO_FRAME: AtomicBool = AtomicBool::new(false);
 klog::counter!(WRITEBACK_PAGES, "vfs.cache.writeback_pages");
 klog::counter!(NO_FRAME_COUNT, "vfs.cache.no_frame");
 klog::counter!(CARRIED, "vfs.cache.truncated_mapped_pages");
+// PF-5: lockless steps that raced a truncate or a punch (copied again on the locked path). No counter on the
+// lockless path itself: a shared counter line written by every read is what PF-5 removes.
+klog::counter!(QUICK_RETRIES, "vfs.read.quick_retries");
+// PF-4: pages a hole punch took out of a size-charged file while reads still copied from them.
+klog::counter!(READ_HELD_PUNCHED, "vfs.cache.punched_read_pages");
 klog::counter!(NO_CHARGE_FAULTS, "vfs.cache.fault_no_charge");
 klog::counter!(FILL_READS, "vfs.cache.fill_reads");
 klog::counter!(FILL_PAGES, "vfs.cache.fill_pages");
@@ -76,6 +82,19 @@ pub struct CachePage {
     carries_charge: AtomicBool,
     /// MM-9: the reclaim clock's view (`REFERENCED`, `COLD`, `PRELOADED`; `crate::reclaim`).
     state: AtomicU8,
+    /// PF-4: references reads hold for their copy (`cache_view::ReadHold`), so a hole punch can tell them from a
+    /// mapping's pin: it takes a page only reads hold out of the index (their copy keeps the frame), as Linux's
+    /// punch drops a folio a reader still holds.
+    pub(crate) reads: AtomicU32,
+    /// PF-5: left the cache's accounting when it left the index alone (`account_out`); its frame waits for a
+    /// grace period as pending memory, and its drop only frees it.
+    out: AtomicBool,
+    /// PF-5: left the index while something else still held it (a locked read, a pin): the last of those to
+    /// let go before the grace queue's own drop accounts it out (`cache_view::ReadHold`), so its charge does not
+    /// wait for the queue.
+    pub(crate) retired: AtomicBool,
+    /// RB-18: the page held a secret ([`PageCache::forget_clean`]): its frame is zeroed before it goes back.
+    pub(crate) wipe: AtomicBool,
 }
 
 /// MM-9: used since the reclaim clock last passed (a new page starts so: one pass of protection).
@@ -99,7 +118,7 @@ impl CachePage {
         if pool.is_some() {
             TMPFS_FRAMES.fetch_add(1, Ordering::Relaxed);
         }
-        Some(Arc::new(CachePage { frame, dirty: AtomicBool::new(false), pool: pool.cloned(), carries_charge: AtomicBool::new(false), state: AtomicU8::new(REFERENCED) }))
+        Some(Arc::new(CachePage { frame, dirty: AtomicBool::new(false), pool: pool.cloned(), carries_charge: AtomicBool::new(false), state: AtomicU8::new(REFERENCED), reads: AtomicU32::new(0), out: AtomicBool::new(false), retired: AtomicBool::new(false), wipe: AtomicBool::new(false) }))
     }
     /// The frame's physical address (None only for heap pages without a frame allocator: host tests).
     pub fn phys(&self) -> Option<u64> {
@@ -111,6 +130,11 @@ impl CachePage {
     }
     pub fn read(&self, off: usize, out: &mut [u8]) {
         self.frame.read(off, out)
+    }
+    /// PF-6: the page's frame for a copy straight to a program (`UserMem::write_page` of the kernel's user
+    /// memory); None for a heap page (host tests).
+    pub fn page_frame(&self) -> Option<&mm_core::PageFrame> {
+        self.frame.page_frame()
     }
     pub fn write(&self, off: usize, data: &[u8]) {
         self.frame.write(off, data)
@@ -136,14 +160,45 @@ impl CachePage {
     }
 }
 
-impl Drop for CachePage {
-    fn drop(&mut self) {
+impl CachePage {
+    /// PF-5: the page left the index with no other reference (`cache_view::Gone`): it leaves the cache's numbers
+    /// now (frames held, tmpfs frames, a carried pool charge, R2) instead of at its drop, which waits for a grace
+    /// period. Returns the bytes that wait (once; 0 when it was accounted out already).
+    pub(crate) fn account_out(&self) -> u64 {
+        if self.out.swap(true, Ordering::AcqRel) {
+            return 0;
+        }
+        self.leave_accounts();
+        PAGE as u64
+    }
+    /// PF-5: drops a reference that is not the index's (a locked read's, a mapping's pin). When the page left
+    /// the index while this one held it and only the grace queue's reference stays, the page leaves the
+    /// cache's numbers now (its charge back at once, R2) instead of at the queue's drop. Two holders that let
+    /// go together may both see three references: then the queue's drop does it.
+    pub(crate) fn release(p: Arc<CachePage>) {
+        if p.retired.load(Ordering::Acquire) && Arc::strong_count(&p) == 2 {
+            p.account_out();
+        }
+        drop(p);
+    }
+    fn leave_accounts(&self) {
         FRAMES_HELD.fetch_sub(1, Ordering::Relaxed);
         if let Some(pool) = &self.pool {
             TMPFS_FRAMES.fetch_sub(1, Ordering::Relaxed);
-            if *self.carries_charge.get_mut() {
+            if self.carries_charge.swap(false, Ordering::AcqRel) {
                 pool.uncharge(1);
             }
+        }
+    }
+}
+
+impl Drop for CachePage {
+    fn drop(&mut self) {
+        if *self.wipe.get_mut() {
+            self.frame.zero_from(0);
+        }
+        if !*self.out.get_mut() {
+            self.leave_accounts();
         }
     }
 }
@@ -250,11 +305,13 @@ pub enum PageFault {
 }
 
 pub(crate) struct Inner {
-    pub(crate) size: u64,
+    /// The file's size; readers without this lock see it through `pages` (`set_size` keeps both).
+    size: u64,
     /// Pages a size-charged file is charged to its pool for (= pages_for(size)); 0 for lazily charged files,
     /// whose pages carry their own charge.
     charged: u64,
-    pub(crate) pages: PageIndex<Arc<CachePage>>,
+    /// PF-4: the index (and the size again) behind `vfs.inode.index`, so reads look up without this lock.
+    pub(crate) pages: Pages,
     /// FS-10: the file's seals (`shmem_inode_info.seals`; tmpfs files start with F_SEAL_SEAL, memfd_create
     /// may clear it). Kept under this lock with `writable_maps`, so F_ADD_SEALS, writes, truncates and new
     /// shared mappings see one consistent state (Linux: `inode_lock` and `i_mmap_writable`).
@@ -277,6 +334,23 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+    /// PF-4: sets the size for both views (this lock's and the readers').
+    fn set_size(&mut self, size: u64) {
+        self.size = size;
+        self.pages.set_size(size);
+    }
+    /// FS-12: opens the next read-ahead window (`Ra::open`) and shows its mark to readers without this lock.
+    pub(crate) fn open_ra(&mut self, start: u64, pages: u64, max: u64) -> Option<(u64, u64)> {
+        let r = self.ra.open(start, pages, max);
+        self.sync_mark();
+        r
+    }
+    fn sync_mark(&self) {
+        self.pages.ra().ra_mark.store(self.ra.mark.unwrap_or(NO_MARK), Ordering::Release);
+    }
     /// Whether a running fill reads page `idx`.
     fn in_flight(&self, idx: u64) -> bool {
         self.reading.iter().any(|&(s, e, _)| s <= idx && idx < e)
@@ -294,8 +368,6 @@ impl Inner {
 /// FS-12: the read-ahead state of one file (`readahead`).
 #[derive(Default)]
 pub(crate) struct Ra {
-    /// The page after the last one a read touched.
-    next: u64,
     /// The last window (pages; 0 = none yet).
     win: u64,
     /// Reaching this page queues the next window (first page of the last one; None after it was reached).
@@ -355,6 +427,10 @@ impl Drop for Reading<'_> {
     }
 }
 
+/// PF-4: `read_direct`'s consumer: (page or None for a hole, offset in the page, bytes, bytes of the read
+/// before them) -> bytes it took.
+pub type ReadSink<'a> = dyn FnMut(Option<&CachePage>, usize, usize, usize) -> usize + 'a;
+
 /// Where a write goes, from the locked state: (position, length).
 type WriteAt<'a> = dyn Fn(&Inner) -> Result<(u64, usize), Errno> + 'a;
 
@@ -371,6 +447,8 @@ struct Batch {
 pub struct PageCache {
     /// Shared (Arc) only with a queued read-ahead job, which holds it weakly.
     inner: Arc<Mutex<Inner>>,
+    /// PF-4: the index and size as reads see them without `inner` (`cache_view`).
+    view: Arc<Shared>,
     pool: Option<Arc<Pool>>,
     /// FS-14: pool pages are charged one by one when allocated (Linux VM_NORESERVE); false: by size.
     lazy: bool,
@@ -424,7 +502,9 @@ impl PageCache {
     fn build(pool: Option<Arc<Pool>>, backend: Option<Arc<dyn Backend>>, size: u64, lazy: bool) -> PageCache {
         // `memfd_file_seals_ptr`: only shmem (tmpfs) files have seals; a block file system's files do not.
         let sealable = pool.is_some() && backend.is_none();
-        let inner = Arc::new(Mutex::named("vfs.inode.data", Inner { size, charged: 0, pages: PageIndex::new(), seals: if sealable { F_SEAL_SEAL } else { 0 }, writable_maps: 0, epoch: 0, ra: Ra::default(), reading: Vec::new(), clock: 0, preload_at: None }));
+        let pages = Pages::new(size);
+        let view = pages.shared();
+        let inner = Arc::new(Mutex::named("vfs.inode.data", Inner { size, charged: 0, pages, seals: if sealable { F_SEAL_SEAL } else { 0 }, writable_maps: 0, epoch: 0, ra: Ra::default(), reading: Vec::new(), clock: 0, preload_at: None }));
         // MM-9: a block file system's clean pages can be read again, so reclaim may take them; tmpfs pages
         // (the pool's) never go (no swap).
         if Self::may_reclaim(&pool, &backend) {
@@ -432,6 +512,7 @@ impl PageCache {
         }
         PageCache {
             inner,
+            view,
             ra_max: backend.as_ref().map_or(0, |b| b.read_ahead_pages()),
             lazy,
             sealable,
@@ -450,6 +531,12 @@ impl PageCache {
     #[cfg(test)]
     pub(crate) fn data_lock_free(&self) -> bool {
         self.inner.try_lock().is_some()
+    }
+
+    /// Host tests (PF-4): holds `vfs.inode.data` (a read of cached pages must not wait for it).
+    #[cfg(test)]
+    pub(crate) fn hold_data_lock(&self) -> ksync::MutexGuard<'_, Inner> {
+        self.inner.lock()
     }
 
     /// The locked state, for a reclaim ring (`reclaim::Ring`).
@@ -815,14 +902,11 @@ impl PageCache {
         }
     }
 
-    /// FS-12: read-ahead bookkeeping of one locked step of `read_at` that touched pages `[first, end)` and
+    /// FS-12: read-ahead bookkeeping of one step of `read_direct` that touched pages `[first, end)` and
     /// stopped at `missing` (`cont`: the step continues the same read). Returns the job to queue, if any (the
     /// file is marked `queued` then).
     fn ra_note(&self, g: &mut Inner, first: u64, end: u64, missing: Option<u64>, cont: bool) -> Option<readahead::Job> {
-        if self.ra_max == 0 || !readahead::active() {
-            return None;
-        }
-        let seq = cont || first == 0 || first == g.ra.next;
+        let seq = cont || first == 0 || first == self.view.ra_next.load(Ordering::Relaxed);
         let mut window = None;
         if g.ra.mark.is_some_and(|m| m >= first && m < end) {
             g.ra.mark = None;
@@ -841,58 +925,150 @@ impl PageCache {
                 window = Some(idx + 1);
             }
         }
-        g.ra.next = end;
+        self.view.ra_next.store(end, Ordering::Relaxed);
         let pages = pages_for(g.size);
-        let (first, count) = g.ra.open(window?, pages, self.ra_max)?;
+        let opened = window.and_then(|w| g.open_ra(w, pages, self.ra_max));
+        g.sync_mark();
+        let (first, count) = opened?;
         Some(readahead::Job { inner: Arc::downgrade(&self.inner), backend: self.backend.clone()?, first, count, epoch: g.epoch })
     }
 
+    /// FS-12 for one step of `read_direct`: a step of cached pages that does not reach the mark only notes where
+    /// it ended (no data lock); a miss or the mark takes the lock for `ra_note` and queues its job.
+    fn ra_step(&self, first: u64, end: u64, missing: Option<u64>, cont: bool) {
+        if self.ra_max == 0 || !readahead::active() {
+            return;
+        }
+        let mark = self.view.mark();
+        if missing.is_none() && !(mark != NO_MARK && mark >= first && mark < end) {
+            self.view.ra_next.store(end, Ordering::Relaxed);
+            return;
+        }
+        let mut g = self.inner.lock();
+        let job = self.ra_note(&mut g, first, end, missing, cont);
+        drop(g);
+        if let Some(j) = job {
+            let range = (j.first, j.first + j.count);
+            if readahead::queue(j) {
+                // FS-13: the read-ahead thread reads these for this reader's program.
+                crate::preload::note_fill(self, range.0, range.1);
+            } else {
+                self.inner.lock().ra.queued = false;
+            }
+        }
+    }
+
+    /// Reads into `buf` at `pos` (kernel callers, the bounce path of the read syscalls): cached pages lockless
+    /// (`read_quick`), the rest through `read_direct`.
     pub fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<usize, Errno> {
-        let mut done = 0;
-        loop {
-            let mut g = self.inner.lock();
+        let (got, stop) = self.read_quick(pos, buf.len(), &mut |page, off, n, done| {
+            let out = &mut buf[done..done + n];
+            match page {
+                Some(p) => p.read(off, out),
+                None => out.fill(0),
+            }
+            n
+        });
+        if got == buf.len() || stop == Stop::Eof {
+            return Ok(got);
+        }
+        let (pos, buf) = (pos + got as u64, &mut buf[got..]);
+        let r = self.read_direct(pos, buf.len(), &mut |page, off, n, done| {
+            let out = &mut buf[done..done + n];
+            match page {
+                Some(p) => p.read(off, out),
+                None => out.fill(0),
+            }
+            n
+        });
+        match r {
+            Ok((n, _)) => Ok(got + n),
+            Err(_) if got > 0 => Ok(got),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// PF-5: reads up to `len` bytes at `pos` from cached pages with no lock and no reference, step by step
+    /// (`Shared::quick`: one read section per `BATCH` pages), through `sink`, which must not sleep, fault or
+    /// take a lock (it runs inside the section). Ends at the end of the file, at a page not cached (a
+    /// backend's: `read_direct` reads it), when the sink takes less, or when a step raced a truncate or a punch
+    /// (`Stop::Retry`: that step's bytes do not count; the caller goes on with `read_direct` from the bytes
+    /// returned, which copies them again). Returns (bytes taken, why it stopped); `Stop::More` only when `len`
+    /// bytes were taken.
+    pub fn read_quick(&self, pos: u64, len: usize, sink: &mut QuickSink<'_>) -> (usize, Stop) {
+        let mut done = 0usize;
+        let backend = self.backend.is_some();
+        while done < len {
             let here = pos + done as u64;
-            if here >= g.size || done == buf.len() {
-                return Ok(done);
+            let (n, stop) = self.view.quick(here, len - done, backend, &mut |p, off, k, d| sink(p, off, k, done + d));
+            if n > 0 {
+                self.ra_step(here / P, (here + n as u64).div_ceil(P), None, done > 0);
+            }
+            done += n;
+            match stop {
+                Stop::More => {}
+                Stop::Retry => {
+                    QUICK_RETRIES.inc();
+                    return (done, stop);
+                }
+                _ => return (done, stop),
+            }
+        }
+        (done, Stop::More)
+    }
+
+    /// PF-4: reads up to `len` bytes at `pos` through `sink(page, off, n, done)`, which takes `n` bytes of `page`
+    /// from `off` (None: a hole, `n` zeros) as the bytes `done..done + n` of the read and answers how many it
+    /// took. Without `vfs.inode.data`: each step looks up to `BATCH` pages up under `vfs.inode.index` (the size
+    /// of the same moment clips it), keeps them by their `Arc` and copies with no lock held, so readers of one
+    /// file run in parallel and a page truncate cuts off meanwhile stays alive until its copy is done (its bytes
+    /// may be stale then, as a racing read's are on Linux). A missing page of a file with a backend is read
+    /// (`fill_with`, as before) and the step looked up again. Ok((bytes, short)): `short` when the sink took
+    /// fewer bytes than offered (a user fault): the read ends there. Err only when nothing was read.
+    pub fn read_direct(&self, pos: u64, len: usize, sink: &mut ReadSink<'_>) -> Result<(usize, bool), Errno> {
+        let end = pos.saturating_add(len as u64);
+        let mut done = 0usize;
+        loop {
+            let here = pos + done as u64;
+            if done == len {
+                return Ok((done, false));
             }
             let (first, cont) = (here / P, done > 0);
-            let n = buf.len().min((g.size - pos).min(usize::MAX as u64) as usize);
-            let mut missing = None;
-            while done < n {
-                let p = pos + done as u64;
-                let (idx, off) = (p / P, (p % P) as usize);
+            let snap = self.view.snap(first, end, self.backend.is_some());
+            if here >= snap.size {
+                return Ok((done, false));
+            }
+            let n = len.min((snap.size - pos).min(usize::MAX as u64) as usize);
+            for page in snap.pages[..snap.len].iter() {
+                if done >= n {
+                    break;
+                }
+                let off = ((pos + done as u64) % P) as usize;
                 let k = (PAGE - off).min(n - done);
-                match g.pages.get(idx) {
-                    Some(page) => {
-                        page.touch();
-                        page.read(off, &mut buf[done..done + k])
-                    }
-                    None if self.backend.is_some() => {
-                        missing = Some(idx);
-                        break;
-                    }
-                    None => buf[done..done + k].fill(0),
+                if let Some(p) = page {
+                    p.touch();
                 }
-                done += k;
-            }
-            let end = missing.unwrap_or_else(|| (pos + done as u64).div_ceil(P));
-            let job = self.ra_note(&mut g, first, end, missing, cont);
-            drop(g);
-            if let Some(j) = job {
-                let range = (j.first, j.first + j.count);
-                if readahead::queue(j) {
-                    // FS-13: the read-ahead thread reads these for this reader's program.
-                    crate::preload::note_fill(self, range.0, range.1);
-                } else {
-                    self.inner.lock().ra.queued = false;
+                let got = sink(page.as_deref(), off, k, done);
+                done += got.min(k);
+                if got < k {
+                    return Ok((done, true));
                 }
             }
-            let Some(idx) = missing else { return Ok(done) };
+            let missing = snap.missing.filter(|_| done < n);
+            drop(snap);
+            let stop = missing.unwrap_or_else(|| (pos + done as u64).div_ceil(P));
+            self.ra_step(first, stop, missing, cont);
+            let Some(idx) = missing else {
+                if done >= n {
+                    return Ok((done, false));
+                }
+                continue;
+            };
             // A backend with the background read-ahead (FS-12, ext4) keeps the page-by-page fill: the job
             // already reads the pages after `idx`, and a long fill here would race it for the same pages.
             let want = if self.ra_max > 0 { 1 } else { (pos + n as u64).div_ceil(P).saturating_sub(idx) };
             if let Err(e) = self.fill_with(idx, Reach::Forward(want)) {
-                return if done == 0 { Err(e) } else { Ok(done) };
+                return if done == 0 { Err(e) } else { Ok((done, false)) };
             }
         }
     }
@@ -972,7 +1148,9 @@ impl PageCache {
         if let Some(pool) = &self.pool {
             pool.uncharge(prepaid);
         }
-        g.size = g.size.max(pos + done as u64);
+        if pos + done as u64 > g.size {
+            g.set_size(pos + done as u64);
+        }
         self.settle_charge(g);
         if done == 0 {
             return Err(first_err.unwrap_or(ENOSPC));
@@ -1038,8 +1216,11 @@ impl PageCache {
         // pages past the end.
         if size < g.size || (size == g.size && g.pages.next_from(pages_for(size)).is_some()) {
             g.epoch = g.epoch.wrapping_add(1);
+            // PF-4: the size first, then the pages (`truncate_setsize` before `truncate_pagecache`): a read
+            // without this lock never finds a cut-off page missing inside the old size (it would read zeros).
+            g.set_size(size);
             let keep = pages_for(size);
-            let mut cut: Vec<Arc<CachePage>> = Vec::new();
+            let mut cut: Vec<Gone> = Vec::new();
             let mut carried = 0u64;
             let (pool_file, lazy) = (self.pool.is_some(), self.lazy);
             // Dropped after the lock (a page's last reference frees its frame, which never needs this lock,
@@ -1049,7 +1230,7 @@ impl PageCache {
                 // gives it back when its last pin goes, so the pool bound holds for frames really held (R2).
                 // No new reference can appear once it left the index, so a count of 1 stays 1.
                 // A lazy file's page carries its charge already.
-                if pool_file && Arc::strong_count(&p) > 1 {
+                if pool_file && p.strong_count() > 1 {
                     if !lazy {
                         p.carries_charge.store(true, Ordering::Release);
                     }
@@ -1072,14 +1253,39 @@ impl PageCache {
             {
                 page.frame.zero_from((size % P) as usize);
             }
-            g.size = size;
+            g.set_size(size);
             self.settle_charge(&mut g);
             drop(g);
             drop(cut);
             return Ok(());
         }
-        g.size = size;
+        g.set_size(size);
         Ok(())
+    }
+
+    /// RB-18: a file that holds a secret (CONFIG.TXT): every page in the cache is marked to be zeroed when its frame
+    /// goes back, and the clean ones no one else holds leave the cache now (their frames after a grace period: a
+    /// lockless reader may still copy, as with reclaim). Dirty and mapped pages stay, marked: they hold the file's only
+    /// current content or are in use. The file reads back from its backend. Returns the pages that stayed.
+    pub fn forget_clean(&self) -> u64 {
+        if self.backend.is_none() {
+            // A tmpfs file: the cache is its content.
+            return self.pages();
+        }
+        let _wb = self.sync_lock.lock();
+        let g = self.inner.lock();
+        let (mut at, mut stayed) = (0, 0);
+        while let Some((i, dirty)) = g.pages.next_with(at, |_, p| {
+            p.wipe.store(true, Ordering::Release);
+            p.is_dirty()
+        }) {
+            at = i + 1;
+            match if dirty { None } else { g.pages.take_alone(i) } {
+                Some(page) => page.drop_nowait(),
+                None => stayed += 1,
+            }
+        }
+        stayed
     }
 
     /// fallocate on a tmpfs file after `vfs_fallocate`'s checks (`shmem_fallocate`, linux-6.6/mm/shmem.c:2995-3130;
@@ -1109,7 +1315,7 @@ impl PageCache {
             if g.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
                 return Err(EPERM);
             }
-            Self::punch_locked(&mut g, offset, end);
+            self.punch_locked(&mut g, offset, end);
             return Ok(());
         }
         if g.seals & F_SEAL_GROW != 0 && end > g.size {
@@ -1135,7 +1341,7 @@ impl PageCache {
             return Ok(());
         }
         g.charged += need;
-        g.size = end;
+        g.set_size(end);
         Ok(())
     }
 
@@ -1189,7 +1395,7 @@ impl PageCache {
             return Err(e);
         }
         if mode & FALLOC_FL_KEEP_SIZE == 0 && end > g.size {
-            g.size = end;
+            g.set_size(end);
         }
         Ok(())
     }
@@ -1202,28 +1408,62 @@ impl PageCache {
     /// it stays at its index, zeroed, until the next unmap or punch, so at most one page per index of the hole
     /// (a private copy made before the punch keeps its data in both). A size-charged file keeps its charge (it
     /// follows the size); a lazily charged file's freed page gives its own back (FS-14).
-    fn punch_locked(g: &mut Inner, start: u64, end: u64) {
+    ///
+    /// PF-4: a page only reads hold for their copy (no data lock) is no pin: it leaves the index as a free one
+    /// does (Linux's punch drops a folio a reader holds; the read copies the old bytes, as any racing read may),
+    /// so SEEK_HOLE and the charge see the hole at once. Its frame lives until the last read ends; a
+    /// size-charged file's page then carries one page of charge of its own meanwhile (R2: frames really
+    /// held), or, when the pool refuses that page, it stays zeroed in place as a pinned one.
+    fn punch_locked(&self, g: &mut Inner, start: u64, end: u64) {
         if end <= start {
             return;
         }
         g.epoch = g.epoch.wrapping_add(1);
         let (first, last) = (start / P, (end - 1) / P);
         let mut at = first;
-        while let Some((i, p)) = g.pages.next_from(at) {
+        while let Some((i, ())) = g.pages.next_with(at, |_, _| ()) {
             if i > last {
                 break;
             }
             let lo = if i == first { (start % P) as usize } else { 0 };
             let hi = if i == last { ((end - 1) % P) as usize + 1 } else { PAGE };
-            let drop_page = lo == 0 && hi == PAGE && Arc::strong_count(p) == 1;
-            if !drop_page {
+            let taken = lo == 0 && hi == PAGE && self.take_punched(g, i);
+            if !taken && let Some(p) = g.pages.get(i) {
                 p.frame.zero_range(lo, hi - lo);
-            } else {
-                g.pages.remove(i);
             }
             match i.checked_add(1) {
                 Some(n) => at = n,
                 None => break,
+            }
+        }
+    }
+
+    /// `punch_locked`'s whole page `i`: true when it left the index. A read-held page of a size-charged file
+    /// takes its own page of charge first (the file's charge follows the size; the frame outlives the cut).
+    fn take_punched(&self, g: &mut Inner, i: u64) -> bool {
+        let size_pool = self.pool.as_ref().filter(|_| !self.lazy);
+        if size_pool.is_none() {
+            return g.pages.take_unpinned(i).is_some();
+        }
+        if let Some(p) = g.pages.take_alone(i) {
+            drop(p);
+            return true;
+        }
+        let Some(pool) = size_pool else { return false };
+        if pool.charge(1).is_err() {
+            return false;
+        }
+        match g.pages.take_unpinned(i) {
+            Some((p, _)) => {
+                // Taken under the write side, so no read can hold it anew; a read that ended meanwhile left
+                // it alone, and its drop here gives the page back at once.
+                p.carries_charge.store(true, Ordering::Release);
+                READ_HELD_PUNCHED.inc();
+                true
+            }
+            None => {
+                pool.uncharge(1);
+                false
             }
         }
     }
@@ -1344,7 +1584,7 @@ impl PageCache {
     /// The cached page at `pgoff`, if any (no read, no allocation).
     pub fn cached(&self, pgoff: u64) -> Option<Arc<CachePage>> {
         // A probe (mincore, tests): not a use, so the reclaim clock is not told (`touch`).
-        self.inner.lock().pages.get(pgoff).cloned()
+        self.view.get(pgoff)
     }
 
     /// Dirty pages now.

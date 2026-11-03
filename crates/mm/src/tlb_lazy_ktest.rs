@@ -10,12 +10,16 @@
 //! - `mm.tlb.lazy_copy`: a kernel thread on a CPU that holds the root lazily (with a stale entry after a skipped
 //!   unmap and a remap) copies the root's memory and must see the new contents (`tlb::without_lazy`).
 //!
-//! The counts in `lazy_skip` are exact: nothing else loads the test root, so an AP that is lazy on it at its
-//! read was lazy on it since its `ap_lazy`, through the flush (counted as a skip in the flush's first look) and
-//! until its catch-up; a request reaching a lazy AP that is behind makes it leave, so it would not count as kept.
+//! The counts in `lazy_skip` are exact for an AP that ran no other thread in the round (C1, the MM-11 pattern of
+//! `mm.tlb.stale_user`): since SC-3 an AP runs other threads between two `on()` calls, and a switch to a thread
+//! whose saved root is the test root loads it as owner again (the flush then asks that CPU, an IPI, not a skip;
+//! a later switch to a kernel thread makes it lazy again). So a round's lazy reads and IPIs are judged only for
+//! the APs whose switch counter did not move in it; for those, a lazy AP at its read was lazy on the root since
+//! its `ap_lazy`, through the flush (counted as a skip in the flush's first look) and until its catch-up. Every
+//! AP, moved or not, must still fault on the unmapped page.
 
 use crate::linux::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ};
-use crate::tlb_ktest::{ap_read_in, ap_read_lazy, ap_write_in, aps, on, FAULT, LAZY_BIT, PF_P, PF_W, PROBE_ROOT, WRITE_VAL};
+use crate::tlb_ktest::{ap_read_in, ap_read_lazy, ap_write_in, aps, moved, on, switches, FAULT, LAZY_BIT, PF_P, PF_W, PROBE_ROOT, WRITE_VAL};
 use crate::{AddressSpace, Fill};
 use alloc::format;
 use alloc::sync::Arc;
@@ -83,6 +87,8 @@ fn lazy_skip() -> TestResult {
     let frames_before = user_frames();
     let s0 = tlb::stats();
     let (mut kept, mut asked, mut lazy_before, mut shot) = (0u64, 0u64, 0u64, 0u64);
+    // Lazy reads of APs that ran no other thread in their round (the judged ones), and rounds with a switch.
+    let (mut judged, mut switched) = (0u64, 0u64);
     {
         let a = AddressSpace::with_fill(Fill::OnFault).map_err(e)?;
         let base = a.sys_mmap(0, PAGES * P, RW, AP, 0).map_err(e)?;
@@ -97,6 +103,9 @@ fn lazy_skip() -> TestResult {
             let va = base + (r % (PAGES - 1)) * P;
             let v = val(0x100 + r);
             a.write_u64(va, v).map_err(e)?;
+            let sw = switches(&aps);
+            let mut round_kept = alloc::vec![0u64; aps.len()];
+            let mut round_shot = alloc::vec![0u64; aps.len()];
             for &c in &aps {
                 kassert!(on(c, ap_read_in, va)? == v, "round {r}: CPU {c} before the change");
                 lazy_before += on(c, ap_lazy, 0)?;
@@ -104,10 +113,10 @@ fn lazy_skip() -> TestResult {
             // Odd rounds write-protect first: a lazy AP must not write through its old writable entry.
             if r % 2 == 1 {
                 a.sys_mprotect(va, P, PROT_READ).map_err(e)?;
-                for &c in &aps {
+                for (k, &c) in aps.iter().enumerate() {
                     WRITE_VAL.store(v, SeqCst);
                     let w = on(c, ap_write_lazy, va)?;
-                    kept += (w & LAZY_BIT != 0) as u64;
+                    round_kept[k] += (w & LAZY_BIT != 0) as u64;
                     kassert!(read_only(w), "round {r}: CPU {c} wrote a write-protected page: {w:#x}");
                     on(c, ap_lazy, 0)?;
                 }
@@ -121,10 +130,19 @@ fn lazy_skip() -> TestResult {
             let quiet = tlb::stats().kernel == kflush;
             for (k, &c) in aps.iter().enumerate() {
                 let x = on(c, ap_read_lazy, va)?;
-                kept += (x & LAZY_BIT != 0) as u64;
+                round_kept[k] += (x & LAZY_BIT != 0) as u64;
                 kassert!(gone(x), "round {r}: CPU {c} read {x:#x} after munmap");
                 if quiet && x & LAZY_BIT != 0 && tlb::cpu_irqs(c) != irqs[k] {
-                    shot += 1;
+                    round_shot[k] += 1;
+                }
+            }
+            let moved = moved(&aps, &sw);
+            switched += !moved.is_empty() as u64;
+            for (k, c) in aps.iter().enumerate() {
+                kept += round_kept[k];
+                if !moved.contains(c) {
+                    judged += round_kept[k];
+                    shot += round_shot[k];
                 }
             }
             kassert!(a.sys_mmap(va, P, RW, AP | MAP_FIXED, 0).map_err(e)? == va, "round {r}: remap refused");
@@ -133,9 +151,9 @@ fn lazy_skip() -> TestResult {
         let s1 = tlb::stats();
         kassert!(s1.give_ups == s0.give_ups, "a shootdown gave up");
         kassert!(shot == 0, "{shot} times a shootdown IPI reached an AP that held the root lazily through the unmap");
-        kassert!(s1.lazy_skips - s0.lazy_skips >= kept, "{kept} lazy reads, {} skips", s1.lazy_skips - s0.lazy_skips);
-        kassert!(s1.lazy_catchups - s0.lazy_catchups >= kept, "{kept} lazy reads, {} catch-ups", s1.lazy_catchups - s0.lazy_catchups);
-        klog::event!(Info, "mm", "ktest.tlb_lazy_skip", aps = aps.len(), rounds = ROUNDS, kept = kept, ipis_in_unmaps = asked,
+        kassert!(s1.lazy_skips - s0.lazy_skips >= judged, "{judged} lazy reads without a switch ({kept} in all), {} skips", s1.lazy_skips - s0.lazy_skips);
+        kassert!(s1.lazy_catchups - s0.lazy_catchups >= judged, "{judged} lazy reads without a switch ({kept} in all), {} catch-ups", s1.lazy_catchups - s0.lazy_catchups);
+        klog::event!(Info, "mm", "ktest.tlb_lazy_skip", aps = aps.len(), rounds = ROUNDS, kept = kept, judged = judged, switched_rounds = switched, ipis_in_unmaps = asked,
             skips = s1.lazy_skips - s0.lazy_skips, catchups = s1.lazy_catchups - s0.lazy_catchups, lazy_leaves = s1.lazy_leaves - s0.lazy_leaves);
     }
     kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
@@ -165,9 +183,16 @@ fn lazy_tables() -> TestResult {
     let _s = probe::user_probes().map_err(e)?;
     PROBE_ROOT.store(a.root(), SeqCst);
     let mut lazy = 0u64;
+    let mut lazy_aps = Vec::new();
+    // Before the APs go lazy: a switch right after `ap_lazy` may already make one an owner again (MM-11 pattern).
+    let sw = switches(&aps);
     for &c in &aps {
         kassert!(on(c, ap_read_in, far)? == val(2), "CPU {c} far page");
-        lazy += on(c, ap_lazy, 0)?;
+        let l = on(c, ap_lazy, 0)?;
+        lazy += l;
+        if l == 1 {
+            lazy_aps.push(c);
+        }
     }
     if lazy == 0 {
         // Every AP ran another thread right after `ap_lazy` (busy machine): nothing to shoot lazily.
@@ -177,19 +202,26 @@ fn lazy_tables() -> TestResult {
     a.sys_munmap(far, P).map_err(e)?;
     let t1 = paging::count_user_tables(a.root());
     kassert!(t1 < t0, "the far unmap freed no tables ({t0} -> {t1})");
-    for &c in &aps {
+    // An AP that ran no other thread since `ap_lazy` must have left the root; one that switched may have taken it
+    // again as owner through a thread whose saved root is `a`'s (it then flushed as an owner and may be lazy again
+    // by now). Neither may read the freed page through its TLB (checked below for every AP).
+    let moved = moved(&aps, &sw);
+    for &c in aps.iter().filter(|c| !moved.contains(c)) {
         let r = on(c, ap_root, 0)?;
-        kassert!(r != a.root(), "CPU {c} still holds the root after tables were freed");
+        kassert!(r != a.root(), "CPU {c} still holds the root after tables were freed (no thread switch since it went lazy)");
     }
-    kassert!(a.loaded_on().is_empty(), "still in the mask: {:?}", a.loaded_on());
+    let kept = a.loaded_on();
+    kassert!(kept.iter().all(|c| moved.contains(c)), "still in the mask: {kept:?} (switched: {moved:?})");
     let s1 = tlb::stats();
-    // At least one: an AP that ran another thread between `ap_lazy` and the unmap left the root otherwise.
-    kassert!(s1.lazy_leaves > s0.lazy_leaves, "{lazy} lazy APs, no lazy leave");
+    // At least one when a lazy AP stayed without a switch: it can only have left the root lazily.
+    if lazy_aps.iter().any(|c| !moved.contains(c)) {
+        kassert!(s1.lazy_leaves > s0.lazy_leaves, "{lazy} lazy APs, no lazy leave");
+    }
     for &c in &aps {
         kassert!(gone(on(c, ap_read_in, far)?), "CPU {c} reads the far page after munmap");
         kassert!(on(c, ap_read_in, base)? == val(1), "CPU {c} near page");
     }
-    klog::event!(Info, "mm", "ktest.tlb_lazy_tables", aps = aps.len(), lazy = lazy, tables_freed = t0 - t1,
+    klog::event!(Info, "mm", "ktest.tlb_lazy_tables", aps = aps.len(), lazy = lazy, switched = moved.len(), tables_freed = t0 - t1,
         lazy_leaves = s1.lazy_leaves - s0.lazy_leaves, ipis = s1.ipis - s0.ipis);
     Ok(())
 }

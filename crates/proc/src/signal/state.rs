@@ -302,9 +302,6 @@ impl Signals {
         (wake, cld)
     }
 
-    pub fn has_thread(&self, key: u64) -> bool {
-        self.threads.contains_key(&key)
-    }
     /// AB-7a: queued siginfos of the group (`/proc/<pid>/status` SigQ).
     pub fn queued_count(&self) -> u64 {
         self.queued

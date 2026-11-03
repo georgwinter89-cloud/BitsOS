@@ -24,6 +24,12 @@
 //! at most every 100 ms, so a program drawing unseen claims again once the screen is free. The VT is told
 //! (`display::sync_vt`) and a returned guard dropped only after `fbdev.screen` is released.
 //!
+//! **Damage instead of faults (DP-6, `damage`).** A holder that knows what it changed (bitscomp) reports its
+//! rectangles with `FBIO_BITSOS_DAMAGE`; from then on its pages are mapped writable at the first touch and never
+//! write-protected, and only the reported rectangles are copied (at the call for the shown window, at the pan for
+//! a hidden one). The hold's end (or BITSOS_DAMAGE_END) write-protects every page again: plain fbdev programs
+//! and the next holder get the tracked path above.
+//!
 //! **Pacing (DP-3).** FBIO_WAITFORVSYNC returns at the next vblank of the live display's clock (gopfb's
 //! estimate at the exact EDID or CONFIG rate); `FBIO_BITSOS_PACING` (`pacing`) tells a program that rate, its
 //! source, the last and next vblank (CLOCK_MONOTONIC) and when fb0's last picture reached the scanout.
@@ -43,8 +49,10 @@
 pub mod abi;
 pub mod compositor;
 pub mod cursor;
+pub mod damage;
 mod ktests_cursor;
 mod ktests_compositor;
+mod ktests_damage;
 pub mod dirty;
 pub mod flip;
 pub mod handback;
@@ -54,6 +62,7 @@ pub mod mem;
 pub mod pacing;
 mod ktests_pacing;
 mod scene;
+mod seed;
 
 use abi::{Cmap, CmapUser, Geometry, SetOutcome, UserIo, Var};
 use alloc::string::String;
@@ -104,6 +113,9 @@ struct Shared {
     claim_pid: AtomicU32,
     /// The pid holding the screen (0 = the console has it).
     holder: AtomicU32,
+    /// DP-6: the holder reports its damage (`damage`, 0 = none): pages are mapped writable at once and never
+    /// write-protected, nothing is marked. Set and cleared under `fbdev.screen`, before any write-protect.
+    damage_pid: AtomicU32,
     wq: WaitQueue,
 }
 
@@ -128,6 +140,14 @@ impl DeviceOps for Ops {
             return Err(PageFault::Bus);
         }
         let per = (mem::CHUNK / 4096) as u64;
+        let at = (pgoff / per) as usize;
+        if s.damage_pid.load(Ordering::Acquire) != 0 {
+            // DP-6: the holder says what it changed; the first touch of a page is its last fault until the end.
+            if write {
+                WRITE_FAULTS.inc();
+            }
+            return Ok(DevicePage { aperture: at, page: pgoff % per, writable: true });
+        }
         let writable = if write {
             s.dirty.lock().set(pgoff);
             WRITE_FAULTS.inc();
@@ -144,7 +164,7 @@ impl DeviceOps for Ops {
             // A page already marked may stay writable: the next flush protects it again.
             s.dirty.lock().is_set(pgoff)
         };
-        Ok(DevicePage { aperture: (pgoff / per) as usize, page: pgoff % per, writable })
+        Ok(DevicePage { aperture: at, page: pgoff % per, writable })
     }
 }
 
@@ -178,6 +198,8 @@ struct Screen {
     busy_logged: bool,
     /// When the pages may be write-protected again after a claim that did not take the screen (ns).
     rearm_at: u64,
+    /// DP-6: damage reported for a window not shown yet (the next pan to it copies only that).
+    reported: damage::Pending,
 }
 
 pub struct Fb {
@@ -197,6 +219,9 @@ pub struct Fb {
     flip_seq: AtomicU64,
     /// GX-3: fb0's frames went to the hidden buffer; the first copy after flipping stopped is whole.
     flipping: AtomicBool,
+    /// INT-D1 (CR DS-5-3): no take yet since boot and no store that the dirty map does not track: the first take
+    /// copies the console's picture into fb0 first (`seed`).
+    fresh: AtomicBool,
     screen: Mutex<Screen>,
     /// Presents of fb0's picture and the time the last one finished (pacing), one record: a reader never pairs
     /// a count with another present's time. Written under `fbdev.screen`; nothing is taken under it.
@@ -359,6 +384,7 @@ fn init() -> Result<(), &'static str> {
         pending: AtomicBool::new(false),
         claim_pid: AtomicU32::new(0),
         holder: AtomicU32::new(0),
+        damage_pid: AtomicU32::new(0),
         wq: WaitQueue::new(),
     });
     let map = match DeviceMap::new(Arc::new(Ops(shared.clone())), mem.apertures()) {
@@ -385,7 +411,9 @@ fn init() -> Result<(), &'static str> {
         rearm_pending: AtomicBool::new(false),
         flip_seq: AtomicU64::new(0),
         flipping: AtomicBool::new(false),
-        screen: Mutex::named("fbdev.screen", Screen { frame, guard: None, holder: None, release_gen: 0, busy_logged: false, rearm_at: 0 }),
+        fresh: AtomicBool::new(true),
+        screen: Mutex::named("fbdev.screen", Screen { frame, guard: None, holder: None, release_gen: 0, busy_logged: false, rearm_at: 0,
+            reported: damage::Pending::default() }),
         present: SpinLock::named("fbdev.present", Presented::default()),
     });
     FB.get_or_init(|| Some(fb.clone()));
@@ -552,6 +580,8 @@ impl Fb {
         }
         scr.rearm_at = now + 100 * MS;
         self.rearm_pending.store(false, Ordering::Release);
+        // The cleared marks named a program's stores: a later first take must not seed over them.
+        self.fresh.store(false, Ordering::Release);
         self.shared.dirty.lock().clear();
         self.map.write_protect(0, self.shared.pages.saturating_sub(1));
         REARMS.inc();
@@ -621,6 +651,7 @@ impl Fb {
                 if let Some(f) = flip::get() {
                     f.rearm();
                 }
+                self.seed(scr);
                 self.refresh(scr);
                 true
             }
@@ -646,6 +677,12 @@ impl Fb {
         self.shared.holder.store(0, Ordering::Release);
         // Older claims are stale (every page is protected again below): only a new store claims the screen.
         self.shared.claim_pid.store(0, Ordering::Release);
+        // DP-6: the damage reports end with the hold (before the write-protect, so no fault maps a page writable after it).
+        let reporter = self.shared.damage_pid.swap(0, Ordering::AcqRel);
+        if reporter != 0 {
+            klog::event!(Info, "fbdev", "damage.off", pid = reporter, why = reason);
+        }
+        scr.reported.clear();
         self.shared.dirty.lock().clear();
         self.map.write_protect(0, self.shared.pages.saturating_sub(1));
         RELEASES.inc();
@@ -659,7 +696,9 @@ impl Fb {
         let top = self.yoffset.load(Ordering::Acquire) as u64;
         let (a, b) = dirty::pages_of_rows(top, self.g().height as u64, self.line());
         self.shared.dirty.lock().take_runs(a, b, |_, _| {});
-        self.map.write_protect(a, b);
+        if !self.damaging() {
+            self.map.write_protect(a, b);
+        }
         let Screen { frame, guard, .. } = scr;
         if !self.mem.read_pixels((top * self.line()) as usize, frame.pixels_mut()) {
             klog::event!(Error, "fbdev", "copy.refused", top = top; "the visible window lies outside the buffer (bug)");
@@ -738,7 +777,10 @@ impl Fb {
         self.shared.dirty.lock().take_runs(a, b, |x, y| runs.push((x, y)));
         let (Some(first), Some(last)) = (runs.first(), runs.last()) else { return };
         // Clean pages in between are read-only already (only a store makes a page writable, and a store marks it).
-        self.map.write_protect(first.0, last.1);
+        // DP-6: while the holder reports damage only write(2) marks pages, and nothing is protected.
+        if !self.damaging() {
+            self.map.write_protect(first.0, last.1);
+        }
         let t0 = time::now_ns();
         let Screen { frame, guard, .. } = scr;
         let mut rows = 0;
@@ -755,21 +797,25 @@ impl Fb {
         if let Some(g) = guard.as_mut() {
             self.show(g, frame);
         }
-        let d = time::now_ns().saturating_sub(t0);
-        FLUSH_NS.add(d);
-        FLUSH_PX.add(rows * w as u64);
-        let old = FLUSH_MAX.fetch_max(d, Ordering::Relaxed);
-        if d > old {
-            FLUSH_MAX_NS.add(d - old);
-        }
+        account_flush(t0, rows * w as u64);
+    }
+
+    /// DP-6: the holder reports its damage (`damage`).
+    fn damaging(&self) -> bool {
+        self.shared.damage_pid.load(Ordering::Acquire) != 0
     }
 
     /// The picture moved (a pan or an applied mode; `yoffset` was set with the var): the new window is shown at once.
     fn show_offset(&self, who: Option<&Arc<Process>>, via: &'static str) {
         {
             let mut scr = self.screen.lock();
+            let top = self.yoffset.load(Ordering::Acquire);
             if scr.guard.is_some() {
-                self.refresh(&mut scr);
+                // DP-6: a pan to a window whose damage was reported copies only that.
+                if !(via == "pan" && self.pan_damage(&mut scr, top)) {
+                    scr.reported.clear();
+                    self.refresh(&mut scr);
+                }
             } else if let Some(p) = who {
                 self.take(&mut scr, p, via);
             }
@@ -852,6 +898,7 @@ impl Fb {
         if count == 0 {
             return if err != 0 { Err(err) } else { Ok(0) };
         }
+        self.unfresh();
         if !self.mem.write(pos as usize, &buf[..count as usize]) {
             return Err(EFAULT);
         }
@@ -952,6 +999,8 @@ impl Fb {
             compositor::FBIO_BITSOS_COMPOSITOR => compositor::ioctl(self, arg, io, who),
             // GX-5a: the hardware cursor for the screen's holder (`cursor`).
             cursor::FBIO_BITSOS_CURSOR => cursor::ioctl(self, arg, io, who),
+            // DP-6: the holder's damage rectangles instead of write-protected pages (`damage`).
+            damage::FBIO_BITSOS_DAMAGE => damage::ioctl(self, arg, io, who),
             _ => Err(ENOTTY),
         }
     }
@@ -979,6 +1028,17 @@ impl UserIo for CallerIo {
     }
     fn write(&self, addr: u64, data: &[u8]) -> bool {
         self.0.as_ref().is_some_and(|p| p.mm.copy_to_user(addr, data).is_ok())
+    }
+}
+
+/// The kernel's half of a frame (WY-1a CR5 counters): `px` pixels copied and presented since `t0`.
+fn account_flush(t0: u64, px: u64) {
+    let d = time::now_ns().saturating_sub(t0);
+    FLUSH_NS.add(d);
+    FLUSH_PX.add(px);
+    let old = FLUSH_MAX.fetch_max(d, Ordering::Relaxed);
+    if d > old {
+        FLUSH_MAX_NS.add(d - old);
     }
 }
 

@@ -363,9 +363,24 @@ fn quiesce() -> TestResult {
     let _cards = net::stack::hold_cards();
     let d = card!(true);
     let seq = klog::next_seq();
+    // RB-15: the mirror's question first: a frame given, then the card's done (DD written back) within 1 s.
+    let req = frames::arp_request(d.mac_bytes(), GUEST_IP, GATEWAY);
+    kassert!(d.poll_tx(&req), "poll_tx refused on a running card");
+    let deadline = time::now_ns() + 1_000_000_000;
+    while d.tx_done() != Some(true) {
+        kassert!(time::now_ns() < deadline, "the card never said done: {:?}", d.tx_done());
+        sched::sleep_ms(1);
+    }
+    let t0 = time::now_ns();
     Quiesce::quiesce(&*d);
+    let quiesce_ms = (time::now_ns() - t0) / 1_000_000;
     let hw = d.hw();
     kassert!(d.state() == State::Quiesced);
+    kassert!(d.tx_done().is_none(), "a quiesced card cannot say done");
+    let (_, q) = d.quiesce_report().ok_or("no quiesce note")?;
+    kassert!(!q.drain_timeout && !q.queue_timeout && !q.gio_timeout, "a wait ran out under QEMU: {:?} ({} ms)", q, quiesce_ms);
+    kassert!((hw.rd(regs::TXDCTL) | hw.rd(regs::RXDCTL)) & regs::QUEUE_ENABLE == 0, "queues off");
+    kassert!(hw.rd(regs::WUC) == 0 && hw.rd(regs::WUFC) == 0, "Wake-on-LAN off");
     kassert!(hw.pci_command() & cmd::BUS_MASTER == 0, "bus master cleared");
     kassert!(hw.rd(regs::CTRL_EXT) & regs::CTRL_EXT_DRV_LOAD == 0, "DRV_LOAD cleared");
     kassert!(hw.rd(regs::RCTL) & 2 == 0 && hw.rd(regs::TCTL) & regs::TCTL_EN == 0, "RX/TX off");

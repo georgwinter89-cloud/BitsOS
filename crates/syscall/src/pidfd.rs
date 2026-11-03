@@ -25,9 +25,9 @@ fn sys_pidfd_open(c: &mut SysCtx<'_>) -> i64 {
     if flags & !PIDFD_NONBLOCK != 0 || pid <= 0 {
         return -EINVAL;
     }
-    let target = match proc::find(pid as u32) {
+    let target = match crate::ns_sys::find(c, pid as u32) {
         Some(p) => p,
-        None if proc::find_thread(pid as u32).is_some() => return -EINVAL,
+        None if crate::ns_sys::find_thread(c, pid as u32).is_some() => return -EINVAL,
         None => return -ESRCH,
     };
     let f = proc::pidfd::new_file(target.group(), flags & PIDFD_NONBLOCK != 0);

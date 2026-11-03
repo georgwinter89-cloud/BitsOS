@@ -8,11 +8,17 @@
 //!
 //! Only frames presented while the input thread works through a batch of events count for the console paths
 //! (`batch_done` forgets input that drew nothing, so a later unrelated frame is never charged with it).
+//!
+//! IN-8: a frame over the 20 ms budget warns only on the paths BitsOS draws itself (`Path::owned`); a program's
+//! own frame (`Path::Program`) is its drawing, counted the same but summed up per program at Info (`program`).
+
+pub mod program;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use ksync::SpinLock;
+pub use program::{Reader, Window};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Path {
@@ -32,6 +38,36 @@ impl Path {
             Path::PointerOverProgram => "pointer_over_program",
             Path::Program => "program",
         }
+    }
+
+    /// BitsOS draws the frame itself: the console, the pointer, and the arrow it draws over a program's picture
+    /// (the program's drawing does not hold it up). A program's own frame is not BitsOS's to make faster.
+    pub fn owned(self) -> bool {
+        !matches!(self, Path::Program)
+    }
+}
+
+/// What a frame's input-to-screen time means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    InBudget,
+    /// Over the budget on a path BitsOS owns: a warning (rate-limited 1, 2, 4, ...).
+    Late,
+    /// Over the budget in a program's own drawing: counted, summed up per program at Info.
+    ProgramLate,
+    /// Older than `STALE_NS`: not the input's reaction, outside the numbers.
+    Stale,
+}
+
+pub fn classify(path: Path, total_ns: u64) -> Verdict {
+    if total_ns > STALE_NS {
+        Verdict::Stale
+    } else if total_ns <= BUDGET_NS {
+        Verdict::InBudget
+    } else if path.owned() {
+        Verdict::Late
+    } else {
+        Verdict::ProgramLate
     }
 }
 
@@ -134,10 +170,25 @@ static INPUT_THREAD: AtomicU64 = AtomicU64::new(0);
 /// Earliest arrival of input the input thread took and no frame has shown yet (0 = none), and when it took it.
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static PICKED: AtomicU64 = AtomicU64::new(0);
-/// The same for events programs read from /dev/input (fbdev's frame hook ends them).
-static PROGRAM: AtomicU64 = AtomicU64::new(0);
-static PROGRAM_READ: AtomicU64 = AtomicU64::new(0);
+/// The same for events programs read from /dev/input (fbdev's frame hook ends them), with who read them: one
+/// lock keeps the three together, so a frame is never charged to a reader that came after its swap. Programs'
+/// reads and the present hook take it, never the input thread.
+#[derive(Clone, Copy)]
+struct ProgramPending {
+    arrival: u64,
+    picked: u64,
+    who: Reader,
+}
+impl ProgramPending {
+    const NONE: ProgramPending = ProgramPending { arrival: 0, picked: 0, who: Reader::UNKNOWN };
+}
+static PROGRAM: SpinLock<ProgramPending> = SpinLock::named("console.latency.program", ProgramPending::NONE);
+/// Late frames on the paths BitsOS owns (the warning's 1, 2, 4, ... count).
 static SLOW: AtomicU64 = AtomicU64::new(0);
+/// IN-8: the per-program windows; taken only for program frames and by the tool, never by the input thread.
+static PROGRAMS: SpinLock<program::Programs> = SpinLock::named("console.latency.programs", program::Programs::new());
+/// Program summaries logged since the last reset.
+static SUMMARIES: AtomicU64 = AtomicU64::new(0);
 
 klog::counter!(FRAMES, "input.latency.frames");
 klog::counter!(OVER_BUDGET, "input.latency.over_budget");
@@ -153,10 +204,12 @@ fn on_input_thread() -> bool {
 }
 
 /// Keeps the earliest of `arrival` in (pending, picked); 0 arrivals carry no time and are ignored.
-fn note(pending: &AtomicU64, picked: &AtomicU64, arrival: u64, at: u64) {
+fn note(pending: &AtomicU64, picked: &AtomicU64, arrival: u64, at: u64) -> bool {
     if arrival != 0 && pending.compare_exchange(0, arrival, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         picked.store(at, Ordering::Release);
+        return true;
     }
+    false
 }
 
 /// The input thread took an event that arrived at `arrival` (its evdev time) at `picked`.
@@ -169,9 +222,18 @@ pub fn batch_done() {
     PENDING.store(0, Ordering::Release);
 }
 
-/// A program read events; `arrival` the earliest of them.
-pub fn program_read(arrival: u64, at: u64) {
-    note(&PROGRAM, &PROGRAM_READ, arrival, at);
+/// A program read events at `at`; `arrival` the earliest of them. `who` names the reading program and is asked
+/// only when this read opens the pending slot (once a frame), and outside the lock. A second program's read before
+/// the next frame is not charged (one slot: the first reader since the last frame owns it).
+pub fn program_read(arrival: u64, at: u64, who: impl FnOnce() -> Reader) {
+    if arrival == 0 || PROGRAM.lock().arrival != 0 {
+        return;
+    }
+    let who = who();
+    let mut p = PROGRAM.lock();
+    if p.arrival == 0 {
+        *p = ProgramPending { arrival, picked: at, who };
+    }
 }
 
 /// The start of a frame's copy, with the input it shows.
@@ -207,14 +269,18 @@ pub fn left(s: Option<Stamp>, path: Path) {
 
 /// A program's frame left (`start_ns`) and was copied (`done_ns`): DP's fbdev hook (change request IN-6/2).
 pub fn program_frame(start_ns: u64, done_ns: u64) {
-    let arrival = PROGRAM.swap(0, Ordering::AcqRel);
-    if arrival != 0 {
-        let picked = PROGRAM_READ.load(Ordering::Acquire);
-        record(Sample { path: Path::Program, arrival_ns: arrival, picked_ns: picked, start_ns, done_ns });
+    let p = core::mem::replace(&mut *PROGRAM.lock(), ProgramPending::NONE);
+    if p.arrival != 0 {
+        record_as(Sample { path: Path::Program, arrival_ns: p.arrival, picked_ns: p.picked, start_ns, done_ns }, p.who);
     }
 }
 
 pub fn record(s: Sample) {
+    record_as(s, Reader::UNKNOWN);
+}
+
+/// `who`: the program that read the input (program frames only).
+pub fn record_as(s: Sample, who: Reader) {
     let t = s.total_ns();
     {
         let mut st = STORE.lock();
@@ -227,14 +293,71 @@ pub fn record(s: Sample) {
         }
     }
     FRAMES.inc();
-    if t > BUDGET_NS && t <= STALE_NS {
-        OVER_BUDGET.inc();
-        let n = SLOW.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            klog::event!(Warn, "input", "latency.over_budget", path = s.path.name(), us = t / 1000, count = n;
-                "a frame showed input later than the 20 ms budget");
+    match classify(s.path, t) {
+        Verdict::Late => {
+            OVER_BUDGET.inc();
+            let n = SLOW.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                klog::event!(Warn, "input", "latency.over_budget", path = s.path.name(), us = t / 1000, count = n;
+                    "a frame showed input later than the 20 ms budget");
+            }
+        }
+        Verdict::ProgramLate => OVER_BUDGET.inc(),
+        Verdict::InBudget | Verdict::Stale => {}
+    }
+    if s.path == Path::Program {
+        program_seen(who, t, time::now_ns());
+    }
+}
+
+/// Puts a program frame into its program's window, after closing the windows a minute old.
+fn program_seen(who: Reader, t: u64, now: u64) {
+    flush_programs(now);
+    loop {
+        let want = {
+            let mut p = PROGRAMS.lock();
+            if p.add(who, t, now) {
+                return;
+            }
+            p.room_wanted()
+        };
+        let mut more: Vec<Window> = Vec::new();
+        if more.try_reserve_exact(want).is_err() {
+            klog::event!(Warn, "input", "latency.program_no_room", pid = who.pid, windows = want;
+                "no memory for a program's latency window; its frame stays in the path numbers only");
+            return;
+        }
+        let old = PROGRAMS.lock().grow(more);
+        drop(old);
+    }
+}
+
+/// Closes the programs' windows that are a minute old: one Info summary for each with late frames. Runs at
+/// every program frame and when the tool reads, so a program that stopped drawing is summed up at the next one.
+pub fn flush_programs(now: u64) {
+    loop {
+        let Some(w) = PROGRAMS.lock().take_due(now) else { return };
+        if w.late > 0 {
+            SUMMARIES.fetch_add(1, Ordering::Relaxed);
+            klog::event!(Info, "input", "latency.program_late", pid = w.who.pid, comm = w.who.name(), frames = w.frames,
+                late = w.late, worst_us = w.worst_ns / 1000, median_us = w.median_ns() / 1000,
+                window_s = now.saturating_sub(w.start_ns) / 1_000_000_000;
+                "a program drew input later than 20 ms (its own drawing; BitsOS's paths keep the budget)");
         }
     }
+}
+
+/// The open program windows (after closing the due ones) and how many summaries were logged since the reset.
+/// Room is reserved before the lock, as in `report`.
+pub fn programs() -> (Vec<Window>, u64) {
+    flush_programs(time::now_ns());
+    let want = PROGRAMS.lock().windows().len();
+    let mut out: Vec<Window> = Vec::new();
+    if out.try_reserve_exact(want).is_ok() {
+        let p = PROGRAMS.lock();
+        out.extend(p.windows().iter().take(want).cloned());
+    }
+    (out, SUMMARIES.load(Ordering::Relaxed))
 }
 
 /// Copy of the numbers: per path, and the recent frames (oldest first). The input thread (KernelRt) records under
@@ -267,7 +390,17 @@ pub fn reset() {
         st.recent.clear();
     }
     SLOW.store(0, Ordering::Relaxed);
+    *PROGRAM.lock() = ProgramPending::NONE;
+    let old = PROGRAMS.lock().clear();
+    drop(old);
+    SUMMARIES.store(0, Ordering::Relaxed);
     klog::event!(Info, "input", "latency.reset");
+}
+
+/// The warning's count of late frames on BitsOS's own paths.
+#[cfg(test)]
+pub(crate) fn late_owned() -> u64 {
+    SLOW.load(Ordering::Relaxed)
 }
 
 /// How many recent frames are kept (at least 1).

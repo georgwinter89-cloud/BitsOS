@@ -1,0 +1,37 @@
+# Radeon 780M (1002:1900) registers the GX-7b state classifier reads, as the Mini-PC showed them on 27.10.2026
+# (CachyOS live, Linux 7.1.6, amdgpu loaded by hand after boot: its register trace of the whole load, and the
+# registers read back after the load).
+# <name> <dword> <cold> <after_linux> <source>
+#   cold:        the trace's first event for that dword when it is a read (the firmware's state before amdgpu)
+#   after_linux: read back after the load, or the value Linux last wrote (registers it never read)
+#   synthetic:   in neither (Linux 7.1 never reads it on this APU); a plausible value so the rules can run
+#   -: not known for that state (the fake answers "not readable")
+MP0_C2PMSG_81 0x16091 0x000000b1 0x000000b1 synthetic(sOS sign of life; Linux skips is_sos_alive here)
+MP0_C2PMSG_33 0x16061 0x80000000 0x80000000 trace-first/read-after
+MP0_C2PMSG_64 0x16080 0x80c00000 0x80c20000 trace-first/read-after
+MP0_C2PMSG_67 0x16083 0x00000000 0x000001b0 trace-first/read-after
+MP0_C2PMSG_69 0x16085 - 0x00339000 -/last-write
+MP0_C2PMSG_70 0x16086 - 0x00000080 -/last-write
+MP0_C2PMSG_71 0x16087 0x00000000 0x00001000 synthetic/last-write
+MP1_C2PMSG_66 0x16282 - 0x00000006 -/last-write
+MP1_C2PMSG_82 0x16292 - 0x00000007 -/read-after
+MP1_C2PMSG_90 0x1629a - 0x00000001 -/read-after
+MP1_C2PMSG_91 0x1629b 0x00000001 0x00000001 trace-first/read-after
+RCC_DOORBELL_APER_EN 0x00de0 0x00000000 0x00000001 trace-first/read-after
+RCC_CONFIG_MEMSIZE 0x00de3 0x00000200 0x00000200 trace-first/read-after
+MMMC_VM_FB_OFFSET 0x1a8d7 0x00000840 0x00000840 trace-first/read-after
+MMMC_VM_FB_LOCATION_BASE 0x1a8ec 0x00008000 0x00008000 trace-first/read-after
+MMMC_VM_AGP_TOP 0x1a8ee - 0x00000000 -/last-write
+MMMC_VM_AGP_BOT 0x1a8ef - 0x00ffffff -/last-write
+MMMC_VM_AGP_BASE 0x1a8f0 - 0x00000000 -/last-write
+MMMC_VM_SYSTEM_APERTURE_LOW_ADDR 0x1a8f1 - 0x00200000 -/last-write
+MMMC_VM_SYSTEM_APERTURE_HIGH_ADDR 0x1a8f2 - 0x002007ff -/last-write
+MMMC_VM_MX_L1_TLB_CNTL 0x1a8f3 0x00000501 0x00001859 trace-first/read-after
+MMVM_L2_CNTL 0x1a700 0x00080602 0x00080e01 trace-first/read-after
+MMVM_CONTEXT0_CNTL 0x1a740 0x01fffe00 0x01fffe01 trace-first/read-after
+IH_RB_CNTL 0x01120 0x40610000 0x40330121 trace-first/read-after
+IH_RB_BASE 0x01121 - 0xff002090 -/last-write
+IH_RB_BASE_HI 0x01122 - 0x0000007f -/last-write
+IH_RB_RPTR 0x01123 - 0x00000000 -/last-write
+IH_RB_WPTR 0x01124 - 0x00000000 -/last-write
+IH_DOORBELL_RPTR 0x01127 - 0x100002f0 -/last-write

@@ -60,7 +60,7 @@ fn hostile_sizes_are_refused_at_the_call_and_leak_nothing() {
     let ns = Arc::new(MountNs::new_empty());
     let fds = FdTable::new();
     let mem = Mem(RefCell::new(Vec::new()));
-    let s = Sys { mem: &mem, fds: &fds, ns: &ns, cred: Cred { uid: 1000, gid: 1000 }, subject: policy::Subject::KERNEL };
+    let s = Sys { mem: &mem, fds: &fds, fs: &vfs::FsState::new(), ns: &ns, cred: Cred { uid: 1000, gid: 1000 }, subject: policy::Subject::KERNEL };
     let data0 = system_charged();
     let fd = call(&s, 319, [mem.put(b"hostile"), (MFD_ALLOW_SEALING | MFD_CLOEXEC) as u64, 0, 0, 0, 0]);
     assert!(fd >= 0);

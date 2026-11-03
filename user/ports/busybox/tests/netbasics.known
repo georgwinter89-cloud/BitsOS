@@ -1,5 +1,4 @@
 # Lines of netbasics.out that may be missing on V2: "<line>: <owner>: <why>".
 ip-route-local: NW (net): rtnetlink RTM_GETROUTE dump answers EOPNOTSUPP (crates/net/src/sock/rtnl.rs; linux-6.6/net/ipv4/fib_frontend.c inet_dump_fib)
-Kernel IP routing table: NW (net): no /proc/net/route (linux-6.6/net/ipv4/fib_trie.c fib_route_seq_show)
 arp: NW (net): no /proc/net/arp (linux-6.6/net/ipv4/arp.c arp_seq_show)
-netstat-listen: NW (net): no /proc/net/tcp, udp, tcp6, udp6, unix (linux-6.6/net/ipv4/tcp_ipv4.c tcp4_seq_show, udp.c udp4_seq_show)
+netstat-listen: NW (net): no /proc/net/tcp6, udp6 (linux-6.6/net/ipv6/tcp_ipv6.c tcp6_seq_show, udp.c udp6_seq_show)

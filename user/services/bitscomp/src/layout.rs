@@ -120,11 +120,13 @@ pub struct Workspace<W> {
     pub focus: Focus,
     /// WY-8: the window the client put into fullscreen; its tile or float stays as it was, so leaving restores it.
     pub fullscreen: Option<W>,
+    /// WY-12: minimised windows, oldest first; they are in no tile and no float (not drawn, no input).
+    pub minimized: Vec<Minimized<W>>,
 }
 
 impl<W: Clone + PartialEq> Default for Workspace<W> {
     fn default() -> Self {
-        Self { tiles: Vec::new(), floating: Vec::new(), focus: Focus::None, fullscreen: None }
+        Self { tiles: Vec::new(), floating: Vec::new(), focus: Focus::None, fullscreen: None, minimized: Vec::new() }
     }
 }
 
@@ -153,6 +155,7 @@ impl<W: Clone + PartialEq> Workspace<W> {
 
     pub fn remove(&mut self, w: &W) {
         self.take(w);
+        self.forget_minimized(w);
     }
 
     /// Removes a window from a tile; drops the tile when its stack gets empty and keeps the focus valid.
@@ -418,6 +421,10 @@ impl<W: Clone + PartialEq> Workspace<W> {
 
 #[path = "layout_move.rs"]
 mod moves;
+
+#[path = "layout_min.rs"]
+mod mins;
+pub use mins::Minimized;
 
 #[cfg(test)]
 #[path = "layout_tests.rs"]

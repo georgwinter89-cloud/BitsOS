@@ -88,10 +88,16 @@ fn leaving_the_gpu_controller() {
     assert!(!on_controller(&st(None, 0), "hda1"));
     // A name that only starts with the controller's is another controller.
     assert!(!on_controller(&st(Some("hda10/jack/0:0x15"), 1), "hda1"));
-    // The bound follows CONFIG snd_latency_ms: 2 x (lead + drain margin + 4 periods).
+    // The bound follows CONFIG snd_latency_ms: the retire deadline (2 x (lead + drain margin + 4 periods)) plus
+    // four periods and 10 ms, so the mixer's own deadline always ends first (SN-13 fixer).
     let c = Config::latency_ms(40);
-    let want = 2 * (c.lead as u64 + c.drain_margin as u64 + 4 * c.period as u64) * 1_000_000_000 / 48_000;
-    assert_eq!(leave_bound_ns(&c), want);
+    let retire = 2 * (c.lead as u64 + c.drain_margin as u64 + 4 * c.period as u64) * 1_000_000_000 / 48_000;
+    assert_eq!(c.retire_ns(), retire);
+    assert_eq!(leave_bound_ns(&c), retire + 4 * c.period_ns() + 10_000_000);
+    for ms in [5, 10, 40, 200, 500] {
+        let k = Config::latency_ms(ms);
+        assert!(leave_bound_ns(&k) >= k.retire_ns() + 2 * k.period_ns() + 10_000_000, "{ms} ms");
+    }
     assert!(leave_bound_ns(&Config::latency_ms(500)) > leave_bound_ns(&c));
 }
 

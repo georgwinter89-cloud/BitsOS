@@ -41,6 +41,9 @@ impl FrameAlloc for BuddyFrames {
     fn alloc(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64> {
         (**self).alloc(order, zone, kind)
     }
+    fn alloc_light(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64> {
+        (**self).alloc_light(order, zone, kind)
+    }
     fn free(&self, phys: u64, order: u32, kind: Kind) {
         (**self).free(phys, order, kind)
     }

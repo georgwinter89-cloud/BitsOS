@@ -139,15 +139,15 @@ impl P<'_> {
 fn with_program<R>(ns: &Arc<MountNs>, cred: Cred, f: impl FnOnce(&P<'_>) -> R) -> R {
     let fds = FdTable::new();
     let mem = Mem::new();
-    let p = P { s: Sys { mem: &mem, fds: &fds, ns, cred, subject: SUBJECT }, mem: &mem };
+    let p = P { s: Sys { mem: &mem, fds: &fds, fs: &crate::fd::FsState::new(), ns, cred, subject: SUBJECT }, mem: &mem };
     f(&p)
 }
 
 // ---- the registries
 
-static FALLBACK_OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static STRAY_OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-/// What IN's G0 console device does with output: keep it (the test reads it back).
+/// A device registered at a terminal's path: keeps its output, so the tests see that nothing reaches it.
 struct Recorder;
 impl File for Recorder {
     fn read_at(&self, _pos: u64, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -155,7 +155,7 @@ impl File for Recorder {
         Ok(buf.len().min(3))
     }
     fn write_at(&self, _pos: u64, buf: &[u8]) -> Result<usize, Errno> {
-        FALLBACK_OUT.lock().unwrap().extend_from_slice(buf);
+        STRAY_OUT.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
     fn mode(&self) -> u32 {
@@ -210,8 +210,8 @@ fn dev_b() -> Arc<dyn DirSource> {
     Arc::new(Dev("b"))
 }
 
-/// Duplicates are refused (the first registration wins, FS's own devices first), a terminal registration is
-/// adopted as that node's fallback, procfiles land on proc and sysfs, two computed sources on one directory
+/// Duplicates are refused (the first registration wins, FS's own devices first, the terminals among them),
+/// procfiles land on proc and sysfs, two computed sources on one directory
 /// are merged, a computed directory outside proc/sysfs is refused.
 #[test]
 fn registries_and_duplicates() {
@@ -231,9 +231,9 @@ fn registries_and_duplicates() {
         ProcDirEntry { path: "/tmp/plain", make: dev_a },
     ];
     let st = devfs::populate_from(&ns, &devs, &files, &dirs);
-    // 5 memory devices + 3 terminals + foo + sub/bar; refused: /dev/null again, the second /dev/foo,
-    // the computed directory on tmpfs.
-    assert_eq!((st.devnodes, st.adopted, st.procfiles, st.procdirs, st.failed), (10, 1, 2, 2, 3), "{st:?}");
+    // 5 memory devices + 3 terminals + foo + sub/bar; refused: /dev/null again, the second /dev/foo, /dev/tty0
+    // (a terminal is FS's own node), the computed directory on tmpfs.
+    assert_eq!((st.devnodes, st.procfiles, st.procdirs, st.failed), (10, 2, 2, 4), "{st:?}");
     assert_eq!(devfs::builtin_paths().len(), 8);
     assert_eq!(ns.read_file("/dev/null", 10).unwrap(), b"", "the built-in /dev/null wins");
     let mut b = [0u8; 8];
@@ -254,7 +254,7 @@ fn registries_and_duplicates() {
     assert_eq!(sys2, vec![b"from-a".to_vec(), b"from-b".to_vec()]);
     assert!(ns.lookup("/sys/devices/system/from-b").is_ok());
     assert_eq!(ns.lookup("/sys/devices/nothing").err(), Some(ENOENT));
-    // tty0 (adopted) writes to the registered device until a backend is set: checked in tty_fallback_then_backend.
+    // tty0 is the terminal node, not the refused registration.
     let t = ns.lookup("/dev/tty0").unwrap().attr();
     assert_eq!((t.mode, t.rdev, t.uid, t.gid), (uapi::S_IFCHR | 0o620, crate::abi::encode_dev(4, 0), 1000, 5));
 }
@@ -457,6 +457,33 @@ impl FileSource for Live {
     }
 }
 
+/// FS-16: a writable seq_file-like attribute (pwrite ESPIPE) and a positional one (default), both keeping what
+/// was written last and where.
+struct Written {
+    seq: bool,
+    last: Mutex<(u64, Vec<u8>)>,
+}
+impl FileSource for Written {
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(b"text\n".to_vec())
+    }
+    fn write(&self, who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        self.write_at(who, u64::MAX, data)
+    }
+    fn write_at(&self, _who: Cred, pos: u64, data: &[u8]) -> Result<usize, Errno> {
+        *self.last.lock().unwrap() = (pos, data.to_vec());
+        Ok(data.len())
+    }
+    fn positional_write(&self, _opened_for_write: bool) -> bool {
+        !self.seq
+    }
+}
+static SEQ_W: std::sync::OnceLock<Arc<Written>> = std::sync::OnceLock::new();
+static POS_W: std::sync::OnceLock<Arc<Written>> = std::sync::OnceLock::new();
+fn written(seq: bool) -> Arc<Written> {
+    (if seq { &SEQ_W } else { &POS_W }).get_or_init(|| Arc::new(Written { seq, last: Mutex::new((0, Vec::new())) })).clone()
+}
+
 struct Files;
 impl DirSource for Files {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
@@ -464,6 +491,8 @@ impl DirSource for Files {
             SynthEntry::file("counting", 0o444, Arc::new(Counting)),
             SynthEntry::file("private", 0o444, Arc::new(Private)),
             SynthEntry::file("config", 0o444, Arc::new(Live)),
+            SynthEntry::file("seq", 0o666, written(true)),
+            SynthEntry::file("pos", 0o666, written(false)),
         ])
     }
 }
@@ -509,8 +538,47 @@ fn snapshots_and_live_files() {
     });
 }
 
-/// The terminals: before a backend, output goes to the adopted device (IN's G0 console) or, without one, to
-/// the kernel log; reads are end of file. After `set_console`, writes, reads (with O_NONBLOCK), ioctls and
+/// FS-16: pwrite64/pwritev/pwritev2 at a position on a seq_file-like source and on a `proc_create_single` file
+/// are ESPIPE before the mode check (linux-6.6/fs/read_write.c `ksys_pwrite64`, `do_pwritev`; fs/seq_file.c
+/// `seq_open` clears FMODE_PWRITE); write(2), pwritev2 at -1 (the file position), pread and lseek stay. A positional
+/// source (/proc/<pid>/mem, sysfs) still gets the position.
+#[test]
+fn pwrite_on_seq_files_is_espipe() {
+    let (ns, _) = program_view();
+    fake_system(&ns);
+    devfs::populate_from(&ns, &[], &[], &[ProcDirEntry { path: "/proc/test", make: files }]);
+    with_program(&ns, USER, |p| {
+        let fd = p.open("/proc/test/seq", 2, 0);
+        assert!(fd >= 0, "open seq: {fd}");
+        let b = p.mem.alloc(b"abc");
+        let mut iov = Vec::new();
+        iov.extend_from_slice(&b.to_le_bytes());
+        iov.extend_from_slice(&3u64.to_le_bytes());
+        let v = p.mem.alloc(&iov);
+        assert_eq!(p.call(18, [fd as u64, b, 3, 0, 0]), -ESPIPE, "pwrite64");
+        assert_eq!(p.call(296, [fd as u64, v, 1, 0, 0]), -ESPIPE, "pwritev");
+        assert_eq!(p.call(328, [fd as u64, v, 1, 0, 0]), -ESPIPE, "pwritev2 at 0");
+        assert_eq!(p.call(18, [fd as u64, b, 3, (-1i64) as u64, 0]), -EINVAL, "a negative position first");
+        assert_eq!(p.call(18, [999, b, 3, 0, 0]), -EBADF, "then the fd");
+        assert_eq!(p.write(fd, b"xy"), 2, "write(2) at the position");
+        assert_eq!(written(true).last.lock().unwrap().1, b"xy");
+        assert_eq!(p.call(328, [fd as u64, v, 1, u64::MAX, 0]), 3, "pwritev2 at -1 is writev");
+        assert_eq!(p.call(17, [fd as u64, p.mem.alloc_zero(8), 8, 0, 0]), 5, "pread stays");
+        assert_eq!(p.call(8, [fd as u64, 0, 0, 0, 0]), 0, "lseek stays");
+        p.close(fd);
+        let fd = p.open("/proc/test/pos", 2, 0);
+        assert_eq!(p.call(18, [fd as u64, b, 3, 7, 0]), 3, "a positional source keeps pwrite");
+        assert_eq!(*written(false).last.lock().unwrap(), (7, b"abc".to_vec()));
+        p.close(fd);
+        let fd = p.open("/proc/meminfo", 0, 0);
+        assert!(fd >= 0, "open meminfo: {fd}");
+        assert_eq!(p.call(18, [fd as u64, b, 3, 0, 0]), -ESPIPE, "single_open file read-only: ESPIPE before EBADF");
+        p.close(fd);
+    });
+}
+
+/// The terminals: before a backend, output goes to the kernel log and reads are end of file (a `devnode!` of a
+/// terminal path is refused, it never serves the node). After `set_console`, writes, reads (with O_NONBLOCK), ioctls and
 /// poll readiness come from the backend; a second backend is refused.
 #[test]
 fn tty_fallback_then_backend() {
@@ -521,9 +589,9 @@ fn tty_fallback_then_backend() {
         // Before the backend (the only test that sets it runs these steps first).
         let fd = p.open("/dev/console", 2, 0);
         assert!(fd >= 0, "uid 1000 opens its console: {fd}");
-        assert_eq!(p.write(fd, b"hello console\n"), 14);
-        assert!(FALLBACK_OUT.lock().unwrap().ends_with(b"hello console\n"));
-        assert_eq!(p.read(fd, 10).unwrap(), b"kkk", "reads go to the adopted device");
+        assert_eq!(p.write(fd, b"hello console\n"), 14, "no backend: the kernel log");
+        assert!(STRAY_OUT.lock().unwrap().is_empty(), "the refused registration got the output");
+        assert_eq!(p.read(fd, 10).unwrap(), b"", "no backend: end of file");
         let t = p.open("/dev/tty", 2, 0);
         assert_eq!(p.write(t, b"to the log\n"), 11, "no device: the kernel log");
         assert_eq!(p.read(t, 10).unwrap(), b"", "no device: end of file");
@@ -533,7 +601,7 @@ fn tty_fallback_then_backend() {
         assert!(!crate::tty::set_console(&BACKEND), "a second backend is refused");
         assert_eq!(p.write(fd, b"now the VT\n"), 11);
         assert_eq!(&*BACKEND.out.lock().unwrap(), b"now the VT\n");
-        assert!(!FALLBACK_OUT.lock().unwrap().ends_with(b"now the VT\n"));
+        assert!(STRAY_OUT.lock().unwrap().is_empty());
         BACKEND.lines.lock().unwrap().push(b"line\n".to_vec());
         assert!(f_events_in(&ns));
         assert_eq!(p.read(fd, 10).unwrap(), b"line\n");

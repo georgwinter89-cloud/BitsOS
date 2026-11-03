@@ -74,7 +74,7 @@ struct Conn {
 klog::counter!(REQUESTS, "mcp.requests");
 // Requests that passed the token and Origin checks and whose answer went out (RB-6 CR1): the boot confirmation
 // proves "MCP has answered" with this one, so a peer without the token cannot confirm a new generation.
-klog::counter!(ANSWERED, "mcp.answered");
+klog::counter!(pub(crate) ANSWERED, "mcp.answered");
 
 pub(crate) fn serve(sh: Arc<Shared>, slot: Arc<Slot>, mut s: Owned) {
     let Some(stream) = s.0.take() else { return };
@@ -248,69 +248,12 @@ impl Conn {
         }
     }
 
-    /// Runs a tool in a worker and waits for it until its deadline (+ grace), the server stopping, or the
-    /// answer. `output` and `stop` are answered right here (they must work while every worker is stuck). Err is
-    /// the text of an `isError` result.
+    /// Runs a tool (`run_tool`); an action it asked for after its answer is kept for `request`.
     fn run_tool(&mut self, tool: &Tool, ctx: ToolContext, args: &Json) -> Result<ToolResult, String> {
-        if let Some(f) = calls::server_tool(tool.name()) {
-            return Ok(f(&self.sh, args));
-        }
-        if !tool.is_service() {
-            return self.run_in_worker(tool, ctx, args);
-        }
-        // MC-6: a call to a service waits apart from the lifeline's places (a hung service fills at most these).
-        if !self.sh.enter_service() {
-            klog::event!(Warn, "mcp", "svc.busy", tool = tool.name(), waiting = self.sh.cfg.conns);
-            return Err(format!(
-                "ERROR: {} calls to user-space services are waiting already (mcp_conns); try again when one ended. The kernel's own tools answer meanwhile",
-                self.sh.cfg.conns
-            ));
-        }
-        self.slot.in_service.store(true, Ordering::Release);
-        let r = self.run_in_worker(tool, ctx, args);
-        self.slot.in_service.store(false, Ordering::Release);
-        self.sh.leave_service();
+        let sh = self.sh.clone();
+        let (r, after) = run_tool(&sh, tool, ctx, args, &self.peer, Some(&self.slot), &|| sh.stop.load(Ordering::Acquire));
+        self.after = after;
         r
-    }
-
-    fn run_in_worker(&mut self, tool: &Tool, ctx: ToolContext, args: &Json) -> Result<ToolResult, String> {
-        let deadline = ctx.deadline_ns;
-        let Ok(call) = worker::submit(&self.sh, tool, ctx, args) else {
-            return Err(String::from("ERROR: no thread for the tool (out of memory)"));
-        };
-        let end = deadline.saturating_add(TOOL_GRACE_NS);
-        loop {
-            let now = self.sh.now();
-            let stopping = self.stopping();
-            if !call.done() && (now >= end || stopping) && call.abandon() {
-                let why = if stopping { "the server stops" } else { "its deadline passed" };
-                klog::event!(Warn, "mcp", "tool.still_running", tool = tool.name(), call = call.id, peer = self.peer.as_str(), reason = why);
-                let mut text = format!(
-                    "Still running: {} (call {id}) did not return before {why}. output {{\"call\":{id}}} shows its progress and, once it ends, its result; stop {{\"call\":{id}}} asks it to stop",
-                    tool.name(),
-                    id = call.id
-                );
-                // What the tool reported so far goes with this answer (V1's run: the output so far, then
-                // "Still running"); `output` then shows only what comes after it.
-                let (out, lost) = call.take_output();
-                if lost > 0 {
-                    text.push_str(&format!("\n[... {lost} bytes of output lost]"));
-                }
-                if !out.is_empty() {
-                    text.push_str("\n--- progress so far ---\n");
-                    text.push_str(out.trim_end_matches('\n'));
-                }
-                return Err(text);
-            }
-            if call.done() {
-                calls::forget(&self.sh, &call);
-                // `abandon` failed above or was never tried, so the call is ours: `output`/`stop` never take it.
-                let (result, after) = call.take_own();
-                self.after = after;
-                return Ok(result.unwrap_or_else(|| Err(crate::ToolError::Failed(String::from("no result")))));
-            }
-            self.sh.env.wait(&call.wq, &mut || call.done(), end.saturating_sub(now).clamp(1, SLICE_NS));
-        }
     }
 
     fn timed_out(&mut self, t0: u64) -> Next {
@@ -361,3 +304,71 @@ impl Conn {
         klog::event!(Info, "mcp", "http.request", peer = self.peer.as_str(), what = what, status = status, bytes = bytes, ms = ms, rpc = dash(method), tool = dash(tool));
     }
 }
+
+/// Runs a tool in a worker and waits for it until its deadline (+ grace), `abort` (the server stopping, the
+/// gate's caller killed), or the answer. `output` and `stop` are answered right here (they must work while every
+/// worker is stuck). The result's Err is the text of an `isError` result; the second value is an action the tool
+/// asked to run after its answer. `slot`: the connection, marked while it waits for a service (MC-6).
+pub(crate) fn run_tool(sh: &Arc<Shared>, tool: &Tool, ctx: ToolContext, args: &Json, peer: &str, slot: Option<&Slot>, abort: &dyn Fn() -> bool) -> (Result<ToolResult, String>, Option<AfterAnswer>) {
+    if let Some(f) = calls::server_tool(tool.name()) {
+        return (Ok(f(sh, args)), None);
+    }
+    if !tool.is_service() {
+        return run_in_worker(sh, tool, ctx, args, peer, abort);
+    }
+    // MC-6: a call to a service waits apart from the lifeline's places (a hung service fills at most these).
+    if !sh.enter_service() {
+        klog::event!(Warn, "mcp", "svc.busy", tool = tool.name(), waiting = sh.cfg.conns);
+        let text = format!("ERROR: {} calls to user-space services are waiting already (mcp_conns); try again when one ended. The kernel's own tools answer meanwhile", sh.cfg.conns);
+        return (Err(text), None);
+    }
+    if let Some(s) = slot {
+        s.in_service.store(true, Ordering::Release);
+    }
+    let r = run_in_worker(sh, tool, ctx, args, peer, abort);
+    if let Some(s) = slot {
+        s.in_service.store(false, Ordering::Release);
+    }
+    sh.leave_service();
+    r
+}
+
+fn run_in_worker(sh: &Arc<Shared>, tool: &Tool, ctx: ToolContext, args: &Json, peer: &str, abort: &dyn Fn() -> bool) -> (Result<ToolResult, String>, Option<AfterAnswer>) {
+        let deadline = ctx.deadline_ns;
+        let Ok(call) = worker::submit(sh, tool, ctx, args) else {
+            return (Err(String::from("ERROR: no thread for the tool (out of memory)")), None);
+        };
+        let end = deadline.saturating_add(TOOL_GRACE_NS);
+        loop {
+            let now = sh.now();
+            let stopping = abort();
+            if !call.done() && (now >= end || stopping) && call.abandon() {
+                let why = if stopping { "the server stops" } else { "its deadline passed" };
+                klog::event!(Warn, "mcp", "tool.still_running", tool = tool.name(), call = call.id, peer = peer, reason = why);
+                let mut text = format!(
+                    "Still running: {} (call {id}) did not return before {why}. output {{\"call\":{id}}} shows its progress and, once it ends, its result; stop {{\"call\":{id}}} asks it to stop",
+                    tool.name(),
+                    id = call.id
+                );
+                // What the tool reported so far goes with this answer (V1's run: the output so far, then
+                // "Still running"); `output` then shows only what comes after it.
+                let (out, lost) = call.take_output();
+                if lost > 0 {
+                    text.push_str(&format!("\n[... {lost} bytes of output lost]"));
+                }
+                if !out.is_empty() {
+                    text.push_str("\n--- progress so far ---\n");
+                    text.push_str(out.trim_end_matches('\n'));
+                }
+                return (Err(text), None);
+            }
+            if call.done() {
+                calls::forget(sh, &call);
+                // `abandon` failed above or was never tried, so the call is ours: `output`/`stop` never take it.
+                let (result, after) = call.take_own();
+                return (Ok(result.unwrap_or_else(|| Err(crate::ToolError::Failed(String::from("no result"))))), after);
+            }
+            sh.env.wait(&call.wq, &mut || call.done(), end.saturating_sub(now).clamp(1, SLICE_NS));
+        }
+}
+

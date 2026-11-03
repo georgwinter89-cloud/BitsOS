@@ -70,16 +70,37 @@ pub fn user_exit() {
     mark(false);
 }
 
+/// `user_enter` for the caller's own thread `t` (the caller guarantees `t` is the current thread: proc's run
+/// loop with its `sched_thread`). Saves cloning the current thread's Arc twice per syscall (INT-W19, AB-15 CR 1).
+pub fn user_enter_of(t: &Thread) {
+    mark_of(t, true);
+    if !USER_MARKED.load(Ordering::Relaxed) {
+        USER_MARKED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `user_exit` for the caller's own thread `t` (see `user_enter_of`).
+pub fn user_exit_of(t: &Thread) {
+    mark_of(t, false);
+}
+
 pub(crate) fn mark(user: bool) {
     if !crate::STARTED.load(Ordering::Acquire) {
         return;
     }
-    let _irq = hal::cpu::IrqGuard::new();
     let Some(t) = crate::current_thread() else { return };
+    mark_of(&t, user);
+}
+
+fn mark_of(t: &Thread, user: bool) {
+    if !crate::STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let _irq = hal::cpu::IrqGuard::new();
     if t.in_user.load(Ordering::Relaxed) == user {
         return;
     }
-    crate::run::account_and_mark(cpus::this(), &t, time::now_ns(), Some(user));
+    crate::run::account_and_mark(cpus::this(), t, time::now_ns(), Some(user));
 }
 
 /// Whether the calling thread is in user mode by its marks (between `user_enter` and `user_exit`).

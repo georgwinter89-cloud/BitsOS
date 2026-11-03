@@ -16,8 +16,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "alsa-test"
+name = "bitsact"
 version = "0.1.0"
+dependencies = [
+ "mcpreg",
+]
+
+[[package]]
+name = "bitsinstall"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mcp-wire",
+ "ring",
+]
 
 [[package]]
 name = "bitsjournal"
@@ -26,6 +38,18 @@ dependencies = [
  "mcpreg",
  "miniz_oxide",
  "settingsd",
+]
+
+[[package]]
+name = "bitsmcp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mcp-wire",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
 ]
 
 [[package]]
@@ -54,6 +78,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "brave-act"
+version = "0.1.0"
+dependencies = [
+ "bitsact",
+ "mcpreg",
 ]
 
 [[package]]
@@ -169,6 +201,10 @@ name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
+name = "mcp-wire"
+version = "0.1.0"
 
 [[package]]
 name = "mcpreg"

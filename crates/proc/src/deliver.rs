@@ -259,9 +259,10 @@ fn setup_frame(t: &Arc<Thread>, ctx: &mut UserContext, info: &SigInfo, act: &Sig
     let [trapno, err, cr2] = t.trap();
     let head = sf::FrameHead {
         restorer: act.restorer,
-        uc_flags: sf::UC_FP_XSTATE | sf::UC_SIGCONTEXT_SS | sf::UC_STRICT_RESTORE_SS,
+        // AB-10a: the selectors the program ran with (0x23 for WoW64's 32-bit code), strict SS only for 64-bit.
+        uc_flags: sf::frame_uc_flags(ctx.cs),
         stack: AltStack { sp: alt.sp, flags: alt.flags, size: alt.size }.to_bytes(),
-        mctx: sf::Mcontext { regs: ctx.regs, cs: hal::gdt::USER_CS, ss: hal::gdt::USER_SS, err, trapno, oldmask: mask, cr2, fpstate: fp },
+        mctx: sf::Mcontext { regs: ctx.regs, cs: ctx.cs, ss: ctx.ss, err, trapno, oldmask: mask, cr2, fpstate: fp },
         sigmask: mask,
     };
     if p.mm.copy_to_user(frame, &sf::encode(&head)).is_err() {
@@ -278,6 +279,9 @@ fn setup_frame(t: &Arc<Thread>, ctx: &mut UserContext, info: &SigInfo, act: &Sig
     r.rdx = frame + sf::UC_OFFSET;
     r.rip = act.handler;
     r.rsp = frame;
+    // The handler runs in 64-bit mode whatever the signal interrupted (`__setup_rt_frame`: __USER_CS/__USER_DS).
+    ctx.cs = hal::gdt::USER_CS;
+    ctx.ss = hal::gdt::USER_DS;
     // DF clear for the function entry, RF and TF off (no debug trap at the handler's first instruction).
     r.rflags &= !(0x400 | 0x1_0000 | 0x100);
     sf::init_user_fpu();
@@ -317,9 +321,16 @@ pub fn sigreturn(t: &Arc<Thread>, ctx: &mut UserContext) -> i64 {
     let flags = sf::restored_rflags(ctx.regs.rflags, m.regs.rflags);
     ctx.regs = m.regs;
     ctx.regs.rflags = flags;
-    if !sf::selectors_ok(m.cs, m.ss, h.uc_flags) {
+    if let Some(err) = sf::selector_fault(m.cs, m.ss, h.uc_flags) {
+        // On Linux the return's IRET faults (#GP with the selector): the handler sees trap 13 and that code.
+        let [_, _, cr2] = t.trap();
+        t.set_trap(13, err, cr2);
         return bad_frame(t, ctx, frame, "selectors");
     }
+    // `restore_sigcontext`: back to the frame's code segment (0x33, or 0x23 for 32-bit code); SS is 0x2b,
+    // checked above or forced valid.
+    ctx.cs = m.cs | 3;
+    ctx.ss = hal::gdt::USER_DS;
     if let Err(why) = restore_fpu(&p, m.fpstate) {
         sf::init_user_fpu();
         return bad_frame(t, ctx, frame, why);
@@ -436,7 +447,8 @@ pub(crate) fn notify_parent_cld(g: &Group, why: Cld) {
         Cld::Continued => (CLD_CONTINUED, SIGCONT as i32),
     };
     let times = g.cpu_times();
-    let info = SigInfo::chld(SIGCHLD, code, g.tgid, g.real_uid(), status, ticks(times.user_ns), ticks(times.system_ns));
+    let (pid, uid) = g.ids_seen_by(&pp);
+    let info = SigInfo::chld(SIGCHLD, code, pid, uid, status, ticks(times.user_ns), ticks(times.system_ns));
     let a = pp.signals.raw(|s| s.action(SIGCHLD));
     if a.handler != crate::signal::SIG_IGN && a.flags & crate::signal::SA_NOCLDSTOP == 0 && !pp.is_finished() {
         let _ = pp.send_info(info, To::Group, false);
@@ -478,6 +490,19 @@ pub fn signal_current_thread(sig: u32) -> bool {
         }
         None => false,
     }
+}
+
+/// SX-1 glue: a seccomp TRAP's SIGSYS (linux-6.6/kernel/seccomp.c `force_sig_seccomp` with HANDLER_CURRENT):
+/// si_code SYS_SECCOMP, si_errno the filter's data, si_call_addr the address after the `syscall`
+/// instruction, si_syscall and si_arch what the filter saw. Forced like a fault: a blocked or ignored SIGSYS
+/// goes back to its default action (the process ends) instead of waiting.
+pub fn force_seccomp_trap(t: &Thread, data: u16, call_addr: u64, nr: u32, arch: u32) {
+    let mut info = SigInfo::new(uapi::ab::signal::SIGSYS, seccomp::consts::SYS_SECCOMP);
+    info.0[4..8].copy_from_slice(&(data as i32).to_le_bytes());
+    info.0[16..24].copy_from_slice(&call_addr.to_le_bytes());
+    info.0[24..28].copy_from_slice(&nr.to_le_bytes());
+    info.0[28..32].copy_from_slice(&arch.to_le_bytes());
+    t.group().force_info(t.sig_key(), info, false);
 }
 
 #[cfg(test)]

@@ -57,6 +57,20 @@ fn frame_line(s: &Sample) -> String {
     )
 }
 
+/// IN-8: one program's open window (frames that showed its input since `start_ns`; summed up at Info once a minute).
+fn window_line(w: &latency::Window) -> String {
+    format!(
+        "program pid={} comm={} frames={} over_20ms={} worst_us={} median_us~{} since_ns={}",
+        w.who.pid,
+        w.who.name(),
+        w.frames,
+        w.late,
+        us(w.worst_ns),
+        us(w.median_ns()),
+        w.start_ns
+    )
+}
+
 fn latency_tool(_ctx: &ToolContext, args: &Json) -> ToolResult {
     let last = arg_u64(args, "last")?.unwrap_or(16);
     if last > LAST_MAX {
@@ -75,6 +89,15 @@ fn latency_tool(_ctx: &ToolContext, args: &Json) -> ToolResult {
     out.push(String::from("input-to-screen latency per frame (report arrival = the USB interrupt -> the frame leaves for the framebuffer copy; stages: queue = interrupt to the input thread, draw = to the copy, copy = the copy itself)"));
     for (p, st) in &paths {
         out.push(path_line(p.name(), st));
+    }
+    let (windows, summaries) = latency::programs();
+    out.push(format!(
+        "program windows open={} summaries={} (a program's own drawing: Info latency.program_late at most once a minute per program; the other paths warn over 20 ms)",
+        windows.len(),
+        summaries
+    ));
+    for w in &windows {
+        out.push(window_line(w));
     }
     out.push(format!("pointer over a program: drawn_at={:?} keep={}", console::pointer_over::drawn_at(), latency::keep()));
     let shown = (last as usize).min(recent.len());
@@ -148,17 +171,27 @@ mod tests {
         }
         let s = |i: u64| Sample { path: Path::Pointer, arrival_ns: 1_000 * i, picked_ns: 1_000 * i + 100, start_ns: 1_000 * i + 2_000, done_ns: 1_000 * i + 3_000 };
         call(r#"{"keep":3}"#).unwrap();
+        let who = latency::Reader { pid: 31, comm: *b"video\0\0\0\0\0\0\0\0\0\0\0" };
+        latency::record_as(Sample { path: Path::Program, arrival_ns: 0, picked_ns: 0, start_ns: 30_000_000, done_ns: 31_000_000 }, who);
         for i in 1..=5 {
             latency::record(s(i));
         }
         let t = call(r#"{"last":2}"#).unwrap();
         assert!(t.contains("pointer: frames=5 "), "{t}");
+        assert!(t.contains("\nprogram: frames=1 ") && t.contains(" over_20ms=1 "), "{t}");
+        assert!(t.contains("program windows open=1 summaries=0"), "{t}");
+        assert!(t.contains("\nprogram pid=31 comm=video frames=1 over_20ms=1 worst_us=30000.0 median_us~"), "{t}");
         assert!(t.contains("recent frames n=3 shown=2"), "{t}");
         assert!(t.contains("arrival_ns=5000 ") && t.contains("arrival_ns=4000 ") && !t.contains("arrival_ns=3000 "), "{t}");
         assert!(t.contains("keep=3"), "{t}");
+        // A minute later the window closes into one summary (the host clock stands at 0).
+        latency::flush_programs(console::latency::program::WINDOW_NS);
+        let t = call("{}").unwrap();
+        assert!(t.contains("program windows open=0 summaries=1") && !t.contains("\nprogram pid="), "{t}");
         let t = call(r#"{"reset":true,"keep":64}"#).unwrap();
         assert!(t.contains("pointer: frames=5 "), "the answer shows the numbers before the reset:\n{t}");
         let t = call("{}").unwrap();
         assert!(t.contains("pointer: frames=0 ") && t.contains("recent frames n=0 shown=0"), "{t}");
+        assert!(t.contains("program windows open=0 summaries=0"), "{t}");
     }
 }

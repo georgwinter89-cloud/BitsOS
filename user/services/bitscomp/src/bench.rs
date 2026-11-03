@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use smithay::utils::{Physical, Rectangle};
 
 use crate::backend::Backend;
-use crate::render::Compositor;
+use crate::render::Picture;
 use crate::state::App;
 
 pub const MAX_N: u32 = 120;
@@ -35,7 +35,7 @@ pub struct Run {
 }
 
 /// Starts the first queued `bench` when none runs (later ones wait for it).
-pub fn take(app: &mut App, comp: &Compositor, run: &mut Option<Run>) {
+pub fn take(app: &mut App, comp: &dyn Picture, run: &mut Option<Run>) {
     if run.is_some() {
         return;
     }
@@ -58,7 +58,7 @@ pub fn take(app: &mut App, comp: &Compositor, run: &mut Option<Run>) {
 
 /// One turn's share of the bench; the answer goes out when the last set is done. Returns when the loop must wake
 /// next for it (None: finished).
-pub fn step(app: &mut App, comp: &Compositor, backend: &mut dyn Backend, run: &mut Option<Run>, period: Duration) -> Option<Duration> {
+pub fn step(app: &mut App, comp: &dyn Picture, backend: &mut dyn Backend, run: &mut Option<Run>, period: Duration) -> Option<Duration> {
     let r = run.as_mut()?;
     let (w, h) = comp.size();
     let (name, side) = SETS[r.set];

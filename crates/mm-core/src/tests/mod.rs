@@ -3,6 +3,8 @@
 extern crate std;
 
 mod basic;
+mod dma_pages;
+mod grace;
 mod guards;
 mod heap;
 mod heap_guard;

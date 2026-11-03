@@ -1,0 +1,9 @@
+open the target's ns/user = yes
+chdir(/proc) = 0
+setns(the target's user namespace) with a CLONE_FS sibling = -EINVAL
+unshare(CLONE_FS) = 0
+chdir(/) = 0
+setns(the target's user namespace) alone = 0
+in the target's namespace = yes
+sibling (exit 0: its cwd is still /proc): exit 0
+target: exit 0

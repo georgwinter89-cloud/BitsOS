@@ -7,6 +7,8 @@
 //! `name (linux-6.6/path:line)` citation in src/sta/ and crates/wifi against the Linux 6.6 tree
 //! (V2/ref/linux-6.6, read only). No node, no fake chip.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,13 +19,13 @@ use rtw89_core::tables::regs::*;
 fn wz() -> PathBuf {
     std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/georg/BitsOS/werkzeuge/plattform/wlan"))
+        .unwrap_or_else(|| common::desk("werkzeuge/plattform/wlan"))
 }
 
 fn linux66() -> PathBuf {
     std::env::var_os("LINUX_6_6")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/georg/BitsOS/V2/ref/linux-6.6"))
+        .unwrap_or_else(|| common::desk("V2/ref/linux-6.6"))
 }
 
 fn read(p: &Path) -> String {

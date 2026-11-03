@@ -17,13 +17,15 @@
 //! Before the reset every file and file system is written back (`vfs::writeback::sync_all`, FS-7 change
 //! request 1): a `write_file` or an install's last stick write is on the stick before the machine resets. The
 //! write-back runs in a helper thread with a deadline (B4, MC-4b fixer): a stick that hangs does not stop the
-//! reset (`reboot.sync_timeout`).
+//! reset (`reboot.sync_timeout`). Then the order of `klog::shutdown` (RB-15): the console mirror leaves the
+//! network stack, the storage stop (RB-14, `block::shutdown`), the park, the quiesce (the mirror's end datagram
+//! and the card's done before the network cards stop), the reset; each step a `shutdown step` event.
 
 use super::opt_bool;
 use crate::boot;
 use crate::bounded::{self, Bounded};
 use crate::{Json, ToolContext, ToolError, ToolOutput, ToolResult, mcp_tool};
-use acpi::power::{self, RebootPlan, Step};
+use acpi::power::{self, RebootPlan};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -38,31 +40,51 @@ pub type ResetPlan = RebootPlan;
 const SYNC_DEADLINE_NS: u64 = 10_000_000_000;
 
 /// After the answer: write back every file and file system (the stick's last writes, at most
-/// `SYNC_DEADLINE_NS`), park the other CPUs, quiesce every driver, then the reset paths. Never returns.
+/// `SYNC_DEADLINE_NS`), pause the console mirror, stop storage, park the other CPUs, quiesce every driver, then
+/// the reset paths (RB-15's order, `klog::shutdown`). Never returns.
 fn reset(p: RebootPlan) {
     // RB-8: the journal writes down what is still in the ring before the reset (at most DRAIN_NS).
     let _ = klog::journal::wait_drained("mcp-reboot", klog::journal::DRAIN_NS, &sched::sleep_ns);
-    match bounded::run("mcp-reboot-sync", SYNC_DEADLINE_NS, vfs::writeback::sync_all) {
+    let t0 = time::now_ns();
+    let synced = bounded::run("mcp-reboot-sync", SYNC_DEADLINE_NS, vfs::writeback::sync_all);
+    let ms = time::now_ns().saturating_sub(t0) / 1_000_000;
+    match synced {
         Bounded::Done(synced) if synced.failed > 0 => {
-            klog::event!(Warn, "mcp", "reboot.synced", flushed = synced.flushed, failed = synced.failed;
+            klog::event!(Warn, "mcp", "reboot.synced", flushed = synced.flushed, failed = synced.failed, ms = ms;
                 "some files or file systems could not be written back before the reset");
         }
-        Bounded::Done(synced) => klog::event!(Info, "mcp", "reboot.synced", flushed = synced.flushed, failed = synced.failed),
-        Bounded::TimedOut => klog::event!(Warn, "mcp", "reboot.sync_timeout", deadline_ms = SYNC_DEADLINE_NS / 1_000_000;
+        Bounded::Done(synced) => klog::event!(Info, "mcp", "reboot.synced", flushed = synced.flushed, failed = synced.failed, ms = ms),
+        Bounded::TimedOut => klog::event!(Warn, "mcp", "reboot.sync_timeout", deadline_ms = SYNC_DEADLINE_NS / 1_000_000, ms = ms;
             "the write-back did not finish (a hung or pulled stick?): resetting anyway"),
-        Bounded::NoThread | Bounded::Busy => klog::event!(Warn, "mcp", "reboot.sync_skipped";
+        Bounded::NoThread | Bounded::Busy => klog::event!(Warn, "mcp", "reboot.sync_skipped", ms = ms;
             "no thread for the write-back (no memory for its stack): resetting without it"),
     }
-    // RB-quiesce: the other CPUs parked first (on CPU 0); never released, the reset follows.
-    let _park = platform::power::park_others("mcp-reboot");
-    let devices = devmodel::quiesce_all();
-    klog::event!(Info, "mcp", "reboot.quiesced", devices = devices.join(","));
-    power::reboot(&p, &|ns| sched::sleep_ns(ns))
+    let sleep = |ns: u64| sched::sleep_ns(ns);
+    // RB-15 (`klog::shutdown::run`): the console mirror leaves the network stack before the storage stop and
+    // the park (Linux stops the netconsole before device_shutdown); from here on each step's lines go out raw
+    // and the card is asked until it has sent them, so no mirror frame is in the card's DMA when the reset
+    // comes. RB-14: every disk closed, drained and flushed before the park; RB-quiesce: the other CPUs parked
+    // (on CPU 0, never released); then the mirror's rest and end datagram, the card's done, the cards.
+    let _ended = klog::shutdown::run(
+        "mcp-reboot",
+        &sleep,
+        || {
+            let _ = block::shutdown::stop_all("mcp-reboot", block::shutdown::STOP_NS);
+            // RB-16: thread-context device stops (rtw89's chip under its own lock) before the park.
+            platform::power::stop_before_park("mcp-reboot");
+        },
+        || platform::power::park_others("mcp-reboot"),
+        || {
+            let devices = devmodel::quiesce_all();
+            klog::event!(Info, "mcp", "reboot.quiesced", devices = devices.join(","));
+        },
+    );
+    power::reboot(&p, &sleep)
 }
 
 /// The answer's text (pure; host-tested).
 fn answer(dry: bool, running: &str, next: &str, p: &RebootPlan) -> String {
-    let steps: Vec<String> = p.steps.iter().map(Step::describe).collect();
+    let steps: Vec<String> = p.steps.iter().map(acpi::power::Step::describe).collect();
     let mut t = format!(
         "{}: running {running}.\nnext start: {next}\nreset by: {}\nGeorg's boot order starts the stick again (V2) while it is plugged in.",
         if dry { "reboot (dry run, nothing happens)" } else { "rebooting once this answer is out" },
@@ -176,7 +198,7 @@ mod tests {
     #[test]
     fn without_a_fadt_the_triple_fault_still_resets() {
         let p = power::reboot_plan(None);
-        assert_eq!(p.steps.last(), Some(&Step::TripleFault));
+        assert_eq!(p.steps.last(), Some(&acpi::power::Step::TripleFault));
         assert!(answer(false, "x", "y", &p).contains("no FADT"));
     }
 }

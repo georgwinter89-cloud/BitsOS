@@ -1,7 +1,7 @@
 /* AB-2: prints what a program finds at its start (argv, envp, auxiliary vector), normalised so the same text
  * comes out on CachyOS and on BitsOS V2: values that differ between machines (addresses, the CPU's feature
  * words) are printed as the check they pass ("AT_PHDR=own program headers"), values Linux fixes (page size,
- * clock ticks, uid) as numbers. Lines for entries only Linux has today (vDSO, rseq) start with "linux-only".
+ * clock ticks, uid) as numbers. Lines for entries only Linux has today (rseq) start with "linux-only".
  * Build: user/sysroot/bin/v2-cc -O2 -o ab-auxv auxv.c (static-PIE, musl). */
 #include <cpuid.h>
 #include <elf.h>
@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     uint64_t k = av->a_type, v = av->a_un.a_val;
     const char *nm = name(k);
     if (!nm) { printf("unknown auxv key %llu\n", (unsigned long long)k); continue; }
-    if (k == AT_SYSINFO_EHDR || k == 27 || k == 28) { printf("linux-only %s\n", nm); continue; }
+    if (k == 27 || k == 28) { printf("linux-only %s\n", nm); continue; }
     n++;
     printf("%s=", nm);
     switch (k) {
@@ -80,6 +80,8 @@ int main(int argc, char **argv) {
     }
     case AT_PLATFORM: printf("%s\n", (const char *)v); break;
     case 51: printf("%s\n", v >= 1024 && v % 16 == 0 ? ">=1024, 16-aligned" : "WRONG"); break;
+    /* AB-14: the vDSO's ELF header (an address: printed as what is there). */
+    case AT_SYSINFO_EHDR: printf("%s\n", v && !memcmp((const void *)v, ELFMAG, SELFMAG) ? "an ELF header" : "WRONG"); break;
     default: printf("%llu\n", (unsigned long long)v);
     }
   }

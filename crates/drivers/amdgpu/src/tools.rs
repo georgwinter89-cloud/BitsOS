@@ -150,7 +150,7 @@ pub fn writes_text(total: u64, mismatched: u64, recent: &[dcn::LoggedWrite]) -> 
     let mut s = format!("writes {total}, read back different {mismatched}, last {} shown\n", recent.len());
     for w in recent {
         s += &format!(
-            "#{} {:05X} {} wrote {:#010x} read {:#010x}{}\n",
+            "#{} {:05X} {} wrote {:#010x} read {:#010x}{}{}\n",
             w.seq,
             w.offset,
             snapshot::name(w.offset),
@@ -160,6 +160,11 @@ pub fn writes_text(total: u64, mismatched: u64, recent: &[dcn::LoggedWrite]) -> 
                 (false, _) => "",
                 (true, true) => " (status bits)",
                 (true, false) => " MISMATCH",
+            },
+            match w.owner {
+                dcn::Owner::Other => "",
+                dcn::Owner::Flip => " (page flip)",
+                dcn::Owner::Cursor => " (cursor)",
             }
         );
     }

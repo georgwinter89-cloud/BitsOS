@@ -1,0 +1,10 @@
+[package]
+name = "amdgpu-fmt"
+version = "0.1.0"
+edition = "2024"
+description = "Pure AMD GPU hardware formats: GFX 11 page tables, walker, VMID/PASID allocators, GART, PM4/SDMA codecs and interpreters, rings, fences, hang detection and recovery (owner: GR, items GR-1, GR-2, GR-3)"
+
+[dependencies]
+
+[lints]
+workspace = true

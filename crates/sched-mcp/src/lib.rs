@@ -8,12 +8,16 @@
 //! `sched` (Safety read-only, SC-3): per-CPU scheduler state and, with `threads`, every thread (`sched_tool`).
 //!
 //! `sched_focus` (Safety change, SC-7a): the program in front and the compositor/input grants (`focus_tool`).
+//!
+//! `idle_mode` (Safety change, FD-1, measuring build only): the idle loop's sleep depth (`idle_tool`).
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
 mod focus_tool;
+#[cfg(bitsos_fd_measure)]
+mod idle_tool;
 mod sched_tool;
 mod user_fpu;
 

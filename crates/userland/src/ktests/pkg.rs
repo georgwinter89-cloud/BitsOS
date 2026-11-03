@@ -41,8 +41,11 @@ pub(super) fn entries(list: &str) -> Vec<Line<'_>> {
         .collect()
 }
 
+/// The most of the list a test reads (a test bound, not a limit of the package: LO-1's tree made it 1.3 MB, 8500 lines).
+const MAX_LIST: usize = 16 << 20;
+
 pub(super) fn list() -> Result<String, String> {
-    let b = vfs::root_ns().read_file(LIST, 1 << 20).map_err(|e| format!("{LIST}: {e:?} (an image from xtask before UL-5?)"))?;
+    let b = vfs::root_ns().read_file(LIST, MAX_LIST).map_err(|e| format!("{LIST}: {e:?} (an image from xtask before UL-5?)"))?;
     Ok(String::from_utf8_lossy(&b).into_owned())
 }
 
@@ -173,6 +176,25 @@ fn locale() -> TestResult {
     Ok(())
 }
 ktest!("ul.pkg.locale", Safe, locale);
+
+/// Georg 30.10. ("Programme werden nur noch am Mini PC getestet"): a program tree's tests (class Program) run only on
+/// the Mini-PC, where the tree and its launcher must be on the stick: every way they can be missing is a failure,
+/// never a skip (CONTRACTS section 4), also on an image built with V2_PKG_OPTIONAL=1. Returns the list lines of the
+/// files below `tree` (`/boot/BITSOS2/<tree>/`) and the launcher `/boot/BITSOS2/bin/<launcher>`'s path, after
+/// checking the launcher against its list line and the stick's identity (STICK.ID within 30 s).
+pub(super) fn program_tree<'a>(list: &'a str, tree: &str, launcher: &str) -> Result<(Vec<Line<'a>>, String), String> {
+    let all = entries(list);
+    let lines: Vec<Line> = all.iter().copied().filter(|e| e.kind == "stick" && e.path.starts_with(tree)).collect();
+    kassert!(!lines.is_empty(), "no {tree} in this image's package list (stage the tree and build the image again)");
+    let want = format!("/boot/BITSOS2/bin/{launcher}");
+    let Some(l) = all.iter().find(|e| e.kind == "stick" && e.path == want) else {
+        return Err(format!("{want} is not in this image's package list"));
+    };
+    let ns = vfs::root_ns();
+    kassert!(wait_for(30 * SEC, || ns.lookup("/boot/BITSOS2/STICK.ID").is_ok()), "the stick did not show /boot/BITSOS2/STICK.ID within 30 s");
+    file_ok(&want, l, 0o755).map_err(|e| format!("{e} (copy \\BITSOS2\\bin\\{launcher} and \\BITSOS2\\{} to the stick again)", tree.trim_end_matches('/').rsplit('/').next().unwrap_or(tree)))?;
+    Ok((lines, want))
+}
 
 /// The stick's program `name`: Ok(None) = skip (not on this stick, which is not the test stick, or not in an
 /// optional image); a test stick without it, or a required image whose list lacks it, fails.

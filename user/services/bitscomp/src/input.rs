@@ -57,6 +57,33 @@ fn binding(sym: Keysym) -> Option<Action> {
     })
 }
 
+/// WY-12: the direction of Alt+Tab (forward) or Shift+Alt+Tab (back).
+fn switch_dir(sym: Keysym, shift: bool) -> Option<i32> {
+    match sym {
+        Keysym::ISO_Left_Tab => Some(-1),
+        Keysym::Tab => Some(if shift { -1 } else { 1 }),
+        _ => None,
+    }
+}
+
+/// Where an input event came from (R8c). Only `Physical` input may answer the installer's dialog (MC-9b): the
+/// back end decides it per device (evdev: MCP's injected devices and any `BUS_VIRTUAL` device are `Injected`),
+/// the control socket's `key`/`click`/... are always `Injected`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Physical,
+    Injected,
+}
+
+impl Origin {
+    pub fn name(self) -> &'static str {
+        match self {
+            Origin::Physical => "physical",
+            Origin::Injected => "injected",
+        }
+    }
+}
+
 /// Ctrl+Alt+1..9 by key position (evdev KEY_1..KEY_9 = 2..10), whatever the layout puts there.
 fn workspace_key(code: Keycode) -> Option<Action> {
     let c = code.raw().checked_sub(8)?;
@@ -64,8 +91,24 @@ fn workspace_key(code: Keycode) -> Option<Action> {
 }
 
 impl App {
+    /// An event of the control socket: `Injected`, unless the headless test path `phys` set `ctl_origin`.
     pub fn handle_input(&mut self, ev: InputEvent) {
+        let o = self.ctl_origin;
+        self.handle_input_as(ev, o);
+    }
+
+    /// An event from a back end, with the origin of its device.
+    pub fn handle_input_as(&mut self, ev: InputEvent, origin: Origin) {
+        self.input_origin = origin;
         let time = self.now_ms();
+        // MC-9b: while the overlay is shown, the wheel scrolls its text and reaches no window.
+        if self.install.shown() {
+            match ev {
+                InputEvent::Wheel { steps } => return self.install_wheel(steps),
+                InputEvent::HWheel { .. } => return,
+                _ => {}
+            }
+        }
         match ev {
             InputEvent::Key { code, pressed } => self.key(code, pressed, time),
             InputEvent::Motion { x, y } => {
@@ -101,6 +144,31 @@ impl App {
         let kb = self.seat.get_keyboard().unwrap();
         let action =
             kb.input::<Action, _>(self, keycode, state, SERIAL_COUNTER.next_serial(), time, |app, mods, sym| {
+                // MC-9b: the installer's overlay takes every key first (nothing reaches a window or a shortcut
+                // while it is shown); Ctrl+Alt+G opens the grant dialog (real keyboard only).
+                if pressed && app.install_takes_keys() {
+                    app.intercepted.insert(keycode);
+                    app.install_key(sym.modified_sym());
+                    return FilterResult::Intercept(Action::None);
+                }
+                // DS-5: a key while the boot scene is up opens the desktop at once and types nothing (as the
+                // kernel's boot screen keeps its key from the shell).
+                if pressed && app.images.boot.shown() {
+                    app.intercepted.insert(keycode);
+                    app.boot_key();
+                    return FilterResult::Intercept(Action::None);
+                }
+                if pressed && mods.ctrl && mods.alt && sym.modified_sym() == Keysym::g {
+                    app.intercepted.insert(keycode);
+                    app.install_grant_open();
+                    return FilterResult::Intercept(Action::None);
+                }
+                // MC-10: Ctrl+Alt+V opens (or ends) full access for the paired Gaming-PC (real keyboard only).
+                if pressed && mods.ctrl && mods.alt && sym.modified_sym() == Keysym::v {
+                    app.intercepted.insert(keycode);
+                    app.access_open();
+                    return FilterResult::Intercept(Action::None);
+                }
                 // Esc closes the circle menu or drops a header drag, and stays with bitscomp.
                 if pressed && sym.modified_sym() == Keysym::Escape && app.cancel_pointer_modes() {
                     app.intercepted.insert(keycode);
@@ -114,10 +182,20 @@ impl App {
                     app.intercepted.insert(keycode);
                     return FilterResult::Intercept(a);
                 }
-                // WY-5c: Super+Up maximises (and restores), as on classic desktops.
+                // WY-5c: Super+Up maximises (and restores), as on classic desktops; WY-12: Super+Down minimises.
                 if pressed && mods.logo && !mods.ctrl && !mods.alt && sym.modified_sym() == Keysym::Up {
                     app.intercepted.insert(keycode);
                     return FilterResult::Intercept(Action::Maximise);
+                }
+                if pressed && mods.logo && !mods.ctrl && !mods.alt && sym.modified_sym() == Keysym::Down {
+                    app.intercepted.insert(keycode);
+                    return FilterResult::Intercept(Action::Minimize);
+                }
+                // WY-12: Alt+Tab and Shift+Alt+Tab switch windows, minimised ones too (Shift turns Tab into
+                // ISO_Left_Tab in most layouts).
+                if pressed && mods.alt && !mods.ctrl && !mods.logo && let Some(dir) = switch_dir(sym.modified_sym(), mods.shift) {
+                    app.intercepted.insert(keycode);
+                    return FilterResult::Intercept(Action::Switch(dir));
                 }
                 // A settings page's field being edited takes every other key (WY-5b).
                 if pressed && let Some(pid) = app.page_edit_pid() {

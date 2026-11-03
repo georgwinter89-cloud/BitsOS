@@ -151,6 +151,11 @@ fn vma_lines(out: &mut String, v: &Vma, c: &Ctx, p: &Process, each: &mut dyn FnM
         (VmaKind::Image, None) => line(out, vs, ve, perms, 0, 0, 0, Some(&p.path)),
         (VmaKind::Stack, _) => line(out, vs, ve, perms, 0, 0, 0, Some("[stack]")),
         (VmaKind::Heap, _) => line(out, vs, ve, perms, 0, 0, 0, Some("[heap]")),
+        // AB-14: Linux's special mappings show offset 0 and their name (`arch_vma_name`).
+        (VmaKind::File, _) if v.file.as_ref().is_some_and(proc::vdso::is_vdso) => {
+            let name = if v.file.as_ref().is_some_and(|f| f.pgoff == 0) { "[vvar]" } else { "[vdso]" };
+            line(out, vs, ve, perms, 0, 0, 0, Some(name));
+        }
         (VmaKind::File, _) if file.is_some() => {
             if let Some((m, pgoff)) = file {
                 let a = m.inode().attr(m.path().dentry.sb.dev, 0);
@@ -177,7 +182,7 @@ pub(super) fn render_maps(g: &Group, p: &Process) -> String {
 }
 
 /// `__show_smap`'s rows from `Rss` on; `rollup` adds Pss_Anon/Pss_File/Pss_Shmem as Linux does only there.
-fn usage_rows(s: &mut String, u: &PageUsage, rollup: bool) {
+fn usage_rows(s: &mut String, u: &PageUsage, rollup: bool, anon_huge: u64) {
     let kb = |b: u64| b >> 10;
     let pk = |x: u64| (x >> PSS_SHIFT) >> 10;
     let mut row = |name: &str, v: u64| {
@@ -199,8 +204,11 @@ fn usage_rows(s: &mut String, u: &PageUsage, rollup: bool) {
     row("Private_Dirty:  ", kb(u.private_dirty));
     row("Referenced:     ", kb(u.referenced));
     row("Anonymous:      ", kb(u.anonymous));
-    // V2 has no KSM, lazy free, huge pages, swap or mlock: Linux's zero rows.
-    for name in ["KSM:            ", "LazyFree:       ", "AnonHugePages:  ", "ShmemPmdMapped: ", "FilePmdMapped:  ",
+    // V2 has no KSM, lazy free, file or shmem huge pages, swap or mlock: Linux's zero rows; MM-13's anonymous ones.
+    row("KSM:            ", 0);
+    row("LazyFree:       ", 0);
+    row("AnonHugePages:  ", kb(anon_huge));
+    for name in ["ShmemPmdMapped: ", "FilePmdMapped:  ",
         "Shared_Hugetlb: ", "Private_Hugetlb: ", "Swap:           ", "SwapPss:        ", "Locked:         "]
     {
         row(name, 0);
@@ -223,15 +231,19 @@ fn vm_flags(s: &mut String, v: &Vma) {
         (f.is_none_or(|f| f.may_write), "mw"),
         (f.is_none_or(|f| f.may_exec), "me"),
         (may_share, "ms"),
-        (v.kind == VmaKind::Stack, "gd"),
+        (v.kind == VmaKind::Stack || v.flags.growsdown, "gd"),
         // A device mapping is Linux's `io_remap_pfn_range`: VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP.
         (device, "pf"),
         (device, "io"),
+        (v.flags.seq_read, "sr"),
+        (v.flags.rand_read, "rr"),
         (v.flags.dontfork, "dc"),
         (device, "de"),
         (v.flags.account, "ac"),
         (v.flags.wipeonfork, "wf"),
         (device, "dd"),
+        (v.flags.hugepage, "hg"),
+        (v.flags.nohugepage, "nh"),
     ];
     s.push_str("VmFlags: ");
     for (on, m) in flags {
@@ -292,8 +304,8 @@ pub(super) fn render_smaps(g: &Group, p: &Process) -> Result<String, Errno> {
         vma_lines(&mut s, v, &c, p, &mut |s, a, b| {
             let part = if a == v.start && b == v.end { *u } else { share_of(u, a, b, b == last_end, &mut taken, &mut given) };
             let _ = write!(s, "Size:           {:>8} kB\nKernelPageSize: {:>8} kB\nMMUPageSize:    {:>8} kB\n", b.saturating_sub(a) >> 10, 4, 4);
-            usage_rows(s, &part, false);
-            let _ = writeln!(s, "THPeligible:    {:>8}", 0);
+            usage_rows(s, &part, false, p.mm.anon_huge_in(a, b));
+            let _ = writeln!(s, "THPeligible:    {:>8}", p.mm.thp_eligible(v) as u8);
             vm_flags(s, v);
         });
     }
@@ -309,6 +321,6 @@ pub(super) fn render_smaps_rollup(g: &Group, p: &Process) -> String {
     let vmas = p.mm.vmas();
     let (Some(first), Some(last)) = (vmas.first(), vmas.last()) else { return s };
     line(&mut s, first.start, last.end, *b"---p", 0, 0, 0, Some("[rollup]"));
-    usage_rows(&mut s, &p.mm.page_usage_total(), true);
+    usage_rows(&mut s, &p.mm.page_usage_total(), true, p.mm.anon_huge_bytes());
     s
 }

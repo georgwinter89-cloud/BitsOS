@@ -177,7 +177,7 @@ fn theme_line(app: &App) -> String {
         hex(t.bg),
         t.scale,
         t.motion,
-        if t.effects_gpu { "gpu" } else { "cheap" },
+        t.effects.word(),
         if t.layout.address_top { "top" } else { "tile" },
         t.layout.favourites,
         t.layout.sidebar,

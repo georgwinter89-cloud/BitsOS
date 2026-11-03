@@ -45,6 +45,7 @@ pub mod quirks;
 pub mod mem;
 pub mod regs;
 pub mod ring;
+pub mod shutdown;
 pub mod trb;
 
 #[cfg(test)]
@@ -64,13 +65,17 @@ mod tests_xfer;
 #[cfg(test)]
 mod tests_fixes;
 #[cfg(test)]
+mod tests_panic;
+#[cfg(test)]
+mod tests_shutdown;
+#[cfg(test)]
 mod tests_ev;
 #[cfg(test)]
 mod tests_isoch;
 #[cfg(test)]
 mod fake_iso;
 
-pub use driver::{controllers, is_xhci, KernelEnv, Xhci, CLASS_XHCI};
-pub use hc::{CmdCompletion, CmdError, Controller, Env, State};
+pub use driver::{controllers, is_xhci, panic_stop_all, KernelEnv, Xhci, CLASS_XHCI};
+pub use hc::{CmdCompletion, CmdError, Controller, Env, PanicStop, State};
 pub use bulk::dci_of;
 pub use pipe::PIPE_ERROR_LIMIT;

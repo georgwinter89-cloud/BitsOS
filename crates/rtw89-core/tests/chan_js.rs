@@ -10,6 +10,8 @@
 //! two texts must be equal line by line. Needs node and the read-only WLAN tree;
 //! RTW89_SKIP_FAKE=1 skips (with a line on stderr), but never with BITSOS_GATE or CI set.
 
+mod common;
+
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,7 +53,7 @@ fn skip(test: &str) -> bool {
 fn wlan_dir() -> PathBuf {
     std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into())
+        .unwrap_or_else(|| common::desk("werkzeuge/plattform/wlan"))
 }
 
 fn ld<T: std::fmt::Display>(a: &[T]) -> String {

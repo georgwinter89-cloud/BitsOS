@@ -3,8 +3,10 @@
 //! that cannot be read and answers EIO when not one byte came (`access_remote_vm` returned 0); once the
 //! memory is gone a read gives 0 bytes.
 //!
-//! Writing needs the position, which `vfs::synth::FileSource::write` does not get: a write answers EIO
-//! (change request to FS for a positioned write).
+//! A write goes through `write_at` (INT-W21, FS-16 CR to AB): the same page-by-page walk, stopping at the first
+//! page that cannot be written, EIO when not one byte went in. Linux writes with FOLL_FORCE, so a debugger can
+//! poke a private read-only page (a breakpoint into text, copy-on-write); V2's `copy_to_user` keeps the mapping's
+//! protection, so such a page answers EIO here (no program of V2's set relies on it).
 
 use super::{Target, may_read_mm};
 use alloc::vec::Vec;
@@ -51,8 +53,28 @@ impl FileSource for Mem {
         }
         Ok(got)
     }
-    fn write(&self, _who: Cred, _data: &[u8]) -> Result<usize, Errno> {
-        klog::event!(Debug, "proc", "mem.write_unsupported", tgid = self.0.tgid);
-        Err(EIO)
+    /// write(2) without a position (the file's own position is passed through `write_at` by vfs).
+    fn write(&self, who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        self.write_at(who, 0, data)
+    }
+    fn write_at(&self, _who: Cred, pos: u64, data: &[u8]) -> Result<usize, Errno> {
+        let Ok((g, p)) = self.0.live() else { return Ok(0) };
+        if g.is_finished() {
+            return Ok(0);
+        }
+        let mut put = 0;
+        while put < data.len() {
+            let a = pos.saturating_add(put as u64);
+            let n = ((4096 - (a & 4095)) as usize).min(data.len() - put);
+            if p.mm.copy_to_user(a, &data[put..put + n]).is_err() {
+                break;
+            }
+            put += n;
+        }
+        if put == 0 && !data.is_empty() {
+            klog::event!(Debug, "proc", "mem.write_fault", tgid = self.0.tgid, addr = pos);
+            return Err(EIO);
+        }
+        Ok(put)
     }
 }

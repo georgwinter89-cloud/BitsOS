@@ -492,7 +492,7 @@ fn dump_parts_follow_the_reader() {
     let _g = shared();
     // `netlink_dump`: the first part fits a page (NLMSG_GOODSIZE); once the reader has read with a larger
     // buffer, parts grow to its size (at most 32 KiB less the overhead); DONE follows in a part of its own.
-    let c = super::Caller { pid: 4041, uid: 1000, gid: 1000, subject: policy::Subject::KERNEL };
+    let c = super::Caller::new(4041, 1000, 1000, policy::Subject::KERNEL);
     let n = NetlinkSock::create(SOCK_RAW, 0, &c).unwrap();
     let msgs_in: alloc::collections::VecDeque<Vec<u8>> = (0..40u8)
         .map(|i| {
@@ -526,7 +526,7 @@ fn membership_follows_groups_under_races() {
     view();
     // Two threads join and leave different groups of one socket at once: afterwards the member table agrees
     // with the groups the socket really has (membership is decided under the table's lock, checker NW-6 #1).
-    let c = super::Caller { pid: 4061, uid: 1000, gid: 1000, subject: policy::Subject::KERNEL };
+    let c = super::Caller::new(4061, 1000, 1000, policy::Subject::KERNEL);
     for keep in [false, true] {
         let s = NetlinkSock::create(SOCK_RAW, 0, &c).unwrap();
         let t: Vec<_> = [1u32, 5]
@@ -534,7 +534,7 @@ fn membership_follows_groups_under_races() {
             .map(|g| {
                 let s = s.clone();
                 std::thread::spawn(move || {
-                    let c = super::Caller { pid: 4061, uid: 1000, gid: 1000, subject: policy::Subject::KERNEL };
+                    let c = super::Caller::new(4061, 1000, 1000, policy::Subject::KERNEL);
                     for _ in 0..2000 {
                         s.setsockopt(NETLINK_ADD_MEMBERSHIP, g, &c).unwrap();
                         s.setsockopt(NETLINK_DROP_MEMBERSHIP, g, &c).unwrap();

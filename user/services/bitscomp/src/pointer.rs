@@ -4,7 +4,7 @@
 //! client under the pointer (reserved for "run text", desktop.md §5); on a header there is none, so nothing.
 
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
-use smithay::desktop::Window;
+use crate::win::Window;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
@@ -26,7 +26,11 @@ impl App {
         let pos = self.pointer;
         let mut focus = None;
         self.reveal_motion(crate::pacer::now());
-        if let Some(m) = &self.menu {
+        if self.install.shown() {
+            // MC-9b: no window has the pointer (nor its own cursor image) while the overlay is shown.
+            self.install_motion();
+            self.cursor_deco = Some(CursorIcon::Default);
+        } else if let Some(m) = &self.menu {
             let hover = match menu::hit(m.centre, &m.items, &self.theme, pos.x, pos.y) {
                 MenuHit::Item(d) => Some(d),
                 _ => None,
@@ -84,6 +88,16 @@ impl App {
     }
 
     pub(crate) fn button(&mut self, code: u32, pressed: bool, time: u32) {
+        // MC-9b: the overlay keeps every press and its release (also once it closed); a release of a press from
+        // before it opened takes the usual way.
+        if pressed && self.install.shown() {
+            self.install.buttons.insert(code);
+            self.install_press(code);
+            return;
+        }
+        if !pressed && self.install.buttons.remove(&code) {
+            return;
+        }
         let kept = if code == BTN_MIDDLE {
             false
         } else if pressed {
@@ -248,9 +262,7 @@ impl App {
             }
             // Closing a hidden page must not show it first.
             (Part::TabClose(_), _) => {
-                if let Some(t) = window.toplevel() {
-                    t.send_close();
-                }
+                crate::xwm::close(&window);
             }
             _ => {}
         }

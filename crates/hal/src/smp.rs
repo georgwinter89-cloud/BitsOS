@@ -1071,6 +1071,10 @@ fn tsc_rounds(b: &ApBoot, clock: fn() -> u64) -> Vec<(u64, u64, u64)> {
 
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 fn refuse(b: &ApBoot, why: &'static str) -> ! {
+    // Step 7 = `idt::ap_setup_end` ran; before it the parking AP still holds the lower-half GS check off.
+    if b.step.load(Ordering::Acquire) < 7 {
+        crate::idt::ap_setup_end();
+    }
     // SAFETY: only this AP writes `side`, before publishing ST_REFUSED.
     unsafe { (*b.side.get()).refused = Some(why) };
     b.stage.store(ST_REFUSED, Ordering::Release);
@@ -1115,6 +1119,8 @@ extern "C" fn hal_ap_main(boot: *const ApBoot) -> ! {
     // `this_cpu` (klog, locks, PerCpu, the trap handlers).
     crate::gdt::load(b.gdt);
     percpu::install_this_cpu(b.local);
+    // CP-8: no lower-half GS check on this CPU until its CR4 has FSGSBASE (`idt::ap_setup_end`).
+    crate::idt::ap_setup_begin();
     crate::idt::load_this_cpu();
     b.idt_loaded.store(true, Ordering::Release);
     ap_setup(b)
@@ -1190,6 +1196,7 @@ fn ap_setup(b: &'static ApBoot) -> ! {
     crate::pat::init_this_cpu();
     b.step.store(6, Ordering::Release);
     crate::entry::init_syscall();
+    crate::idt::ap_setup_end();
     b.step.store(7, Ordering::Release);
     let x = crate::xsave::init_this_cpu();
     if x.size != sh.xsave_size {

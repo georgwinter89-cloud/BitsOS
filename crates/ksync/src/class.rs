@@ -6,34 +6,8 @@
 
 use crate::cpu::CpuSync;
 use crate::order;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-
-/// Counters of one class. Times are TSC ticks (converted with `set_tsc_hz` when reported).
-pub(crate) struct Stats {
-    pub acquired: AtomicU64,
-    pub contended: AtomicU64,
-    pub wait_ticks: AtomicU64,
-    pub wait_max: AtomicU64,
-    pub hold_ticks: AtomicU64,
-    pub hold_max: AtomicU64,
-    pub try_failed: AtomicU64,
-    pub timeouts: AtomicU64,
-}
-
-impl Stats {
-    const fn new() -> Self {
-        Stats {
-            acquired: AtomicU64::new(0),
-            contended: AtomicU64::new(0),
-            wait_ticks: AtomicU64::new(0),
-            wait_max: AtomicU64::new(0),
-            hold_ticks: AtomicU64::new(0),
-            hold_max: AtomicU64::new(0),
-            try_failed: AtomicU64::new(0),
-            timeouts: AtomicU64::new(0),
-        }
-    }
-}
+use crate::slots::Stats;
+use core::sync::atomic::{AtomicPtr, Ordering, fence};
 
 pub struct LockClass {
     pub(crate) name: &'static str,
@@ -105,9 +79,21 @@ fn lookup(name: &str) -> Option<&'static LockClass> {
     find_dynamic(name, DYNAMIC.load(Ordering::Acquire), core::ptr::null_mut())
 }
 
+/// PF-2: gives a class made before the CPU count was known (the order table's, early ones) its per-CPU slots
+/// at a later lock's first resolution.
+pub(crate) fn late_cover(c: &LockClass, cpu: &CpuSync) {
+    // Never for the allocator's own classes: this runs before their lock word is taken, so `alloc_held` is still 0 although the CPU is already inside the
+    // allocator, and covering would enter it again (mm-core mags.rs:101 avoids the same re-entry).
+    // Their slots come only from `prepare_cpus`; if that failed they keep counting in the shared slot.
+    if !c.alloc && c.stats.covered() < crate::slots::target() && cpu.may_alloc() {
+        c.stats.cover(crate::slots::target());
+    }
+}
+
 /// The class of `name`, creating it if needed and allowed. Called inside the bookkeeping section of `cpu`.
 pub(crate) fn resolve(name: &'static str, cpu: &CpuSync) -> Option<&'static LockClass> {
     if let Some(c) = lookup(name) {
+        late_cover(c, cpu);
         return Some(c);
     }
     if !cpu.may_alloc() {
@@ -123,20 +109,33 @@ pub(crate) fn resolve(name: &'static str, cpu: &CpuSync) -> Option<&'static Lock
     let (level, _) = order::level_of(name);
     // SAFETY: `p` is a fresh allocation of the right layout, not yet visible to anyone.
     unsafe { p.write(LockClass::fixed(name, level, false)) };
+    // Slots before the class is visible: CPUs that find it start counting in their own slot right away.
+    // SAFETY: still unpublished, we are the only user.
+    unsafe { (*p).stats.cover(crate::slots::target()) };
     let mut head = DYNAMIC.load(Ordering::Acquire);
     let mut seen = core::ptr::null_mut();
     loop {
         // Another CPU may have added the same name since we looked: use theirs.
         if let Some(c) = find_dynamic(name, head, seen) {
-            // SAFETY: ours was never published; give the memory back.
-            unsafe { alloc::alloc::dealloc(p as *mut u8, layout) };
+            // SAFETY: ours was never published; give the memory back (its slots first).
+            unsafe {
+                (*p).stats.free_unpublished();
+                alloc::alloc::dealloc(p as *mut u8, layout);
+            }
             return Some(c);
         }
         // SAFETY: still unpublished, we are the only writer.
         unsafe { (*p).next.store(head, Ordering::Relaxed) };
         match DYNAMIC.compare_exchange(head, p, Ordering::AcqRel, Ordering::Acquire) {
-            // SAFETY: published now and never freed: a 'static shared reference from here on.
-            Ok(_) => return Some(unsafe { &*p }),
+            Ok(_) => {
+                // SAFETY: published now and never freed: a 'static shared reference from here on.
+                let c = unsafe { &*p };
+                // Pairs with the fence in `slots::cover_all`: either it walks this class, or we see its target
+                // (a target raised while we built the node).
+                fence(Ordering::SeqCst);
+                c.stats.cover(crate::slots::target());
+                return Some(c);
+            }
             Err(h) => {
                 seen = head;
                 head = h;

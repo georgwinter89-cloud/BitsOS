@@ -76,7 +76,7 @@ impl Target {
         if !p.is_mount_root() || p.dentry.sb.fstype != "ext4" {
             return Err(ENODEV);
         }
-        if p.mnt.readonly {
+        if p.mnt.is_readonly() {
             return Err(EROFS);
         }
         let disk = m.disk.clone().unwrap_or_default();

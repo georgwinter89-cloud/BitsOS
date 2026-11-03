@@ -117,9 +117,6 @@ impl Transport {
     pub fn num_queues(&self) -> u16 {
         self.common.read16(NUM_QUEUES).unwrap_or(0)
     }
-    pub fn no_config_vector(&self) -> Result<(), devmodel::DevError> {
-        io(self.common.write16(CONFIG_MSIX_VECTOR, NO_VECTOR))
-    }
     /// Configuration changes (the link bit) to MSI-X table entry `v` (NW-4). The device answers NO_VECTOR when
     /// it cannot (§4.1.5.1.2): `Ok(false)`.
     pub fn config_vector(&self, v: u16) -> Result<bool, devmodel::DevError> {

@@ -1,0 +1,324 @@
+#!/bin/sh
+# LO-1: `libreoffice` starts LibreOffice (CachyOS's libreoffice-fresh) on BitsOS V2 in the running desktop (bitscomp).
+# Lives in \BITSOS2\bin\ (on PATH); LibreOffice itself in \BITSOS2\libreoffice\ (manifest `tree libreoffice`, made by
+# scripts/stage-v2.sh).
+#   libreoffice [writer|calc|impress|draw|math|--writer|--calc|...] [FILE...]   start in the desktop (the start
+#                      centre without a module); ends when LibreOffice ends
+#   libreoffice --convert-to FORMAT [--outdir DIR] FILE...   without a window (--headless), no desktop needed
+#   libreoffice --check  check the tree, libraries, desktop, user, home and language; start and write nothing
+#   libreoffice --env    print the environment LibreOffice gets (one VAR=value per line); start nothing
+# Every other argument goes to LibreOffice unchanged. It never runs as root: started by root (console, MCP as root) it
+# runs as uid 1000 (BusyBox chpst -u 1000:1000), and refuses to start if root cannot hand over.
+# HOME is the user's real home on the data volume, /data/home/1000 (FS-8c), when one is mounted writable at /data:
+# LibreOffice's profile (settings, recent documents, its first-start restart) is $HOME/.config/libreoffice/4 there,
+# fontconfig's cache $HOME/.cache, and "Save" offers $HOME first, so documents and settings survive a reboot.
+# Without a data volume HOME is in RAM ($RUN/home) and the launcher says so: nothing there survives a reboot.
+# A first start with a new profile ends with code 81 ("restart", which LibreOffice's own oosplash would handle): the
+# launcher starts it again with the same arguments (3 times at most). A second start hands its documents to the
+# running LibreOffice (its own pipe in /tmp) and ends.
+# Language: settings.language (de or en, settingsd) picks LANG de_DE.UTF-8 or en_US.UTF-8 (dates, numbers, paper);
+# the menus are German only when the tree has the German language pack (stage-v2.sh with libreoffice-fresh-de).
+# The LO_* settings exist for tests: a fake tree and mount table on the build host; LO_HOME (a home of its own, the
+# ktest ul.pkg.libreoffice_convert's scratch folder, so a test never touches the user's profile).
+MNT=${LO_MOUNT:-/boot}
+T=${LO_TREE:-$MNT/BITSOS2/libreoffice}
+DATA=${LO_DATA:-/data}
+HOME_DATA=$DATA/home/1000
+# The kernel's line about /data (FS-8c): waiting, creating, mounted pool|plain rw|ro, skipped/failed <why>.
+STATE=${LO_DATA_STATE:-/run/bitsos/data-state}
+MOUNTS=${LO_MOUNTS:-/proc/self/mounts}
+USER_RUN=${LO_USER_RUN:-/run/user/1000}
+TMP=${LO_TMP:-/tmp}
+PATH=${LO_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
+export PATH
+UID_NOW=$(id -u 2>/dev/null)
+LDSO=${LO_LDSO:-/usr/lib/ld-linux-x86-64.so.2}
+# The libraries LibreOffice loads itself (dlopen) beside soffice.bin's own: the GTK 3 window plugin, Writer, Calc,
+# and NSS's soft token. Their needs come with the tree (xtask) or the initramfs.
+DLOPENED="program/libvclplug_gtk3lo.so program/libswlo.so program/libsclo.so lib/libsoftokn3.so"
+MAX_RESTARTS=3
+NOMAKE=
+
+say() { echo "libreoffice: $*"; }
+case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
+
+tree_ok() {
+  for f in program/soffice.bin program/bootstraprc program/sofficerc program/fundamentalrc program/types.rdb \
+      program/libvclplug_gtk3lo.so share/registry/main.xcd share/registry/bitsos.xcd share/config/images_colibre.zip \
+      lib/libsoftokn3.so etc/fonts/fonts.conf gtk/share/glib-2.0/schemas/gschemas.compiled gtk/share/mime/mime.cache \
+      gtk/share/icons/Adwaita/index.theme gtk/share/icons/hicolor/index.theme gtk/etc/gdk-pixbuf/loaders.cache \
+      gtk/glycin/glycin-image-rs gtk/share/glycin-loaders/2+/conf.d/glycin-image-rs.conf gtk/libexec/bwrap; do
+    [ -e "$T/$f" ] || { say "tree $T: $f is missing (copy \\BITSOS2\\libreoffice\\ to the stick)"; return 1; }
+  done
+}
+
+# The loader as the start below runs soffice.bin (LD_LIBRARY_PATH=$T/lib; program/ through its RUNPATH $ORIGIN) and
+# as dlopen finds the plugins (ld.so --list, what ldd runs).
+libs_ok() {
+  out=$(env LD_LIBRARY_PATH="$T/lib" "$LDSO" --list "$T/program/soffice.bin" 2>&1) || { say "libraries: the loader failed: $out"; return 1; }
+  for so in $DLOPENED; do
+    o=$("$LDSO" --library-path "$T/lib" --list "$T/$so" 2>&1) || { say "libraries: the loader failed on $so: $o"; return 1; }
+    out="$out
+$o"
+  done
+  miss=$(echo "$out" | grep "not found" | sort -u)
+  [ -z "$miss" ] || { say "libraries missing: $(echo "$miss" | sed 's/^[[:space:]]*//' | tr '\n' ';' | sed 's/;$//; s/;/; /g')"; return 1; }
+  say "libraries: $(echo "$out" | grep '=>' | sed 's/^[[:space:]]*//; s/ (.*//' | sort -u | grep -c .) found, none missing"
+}
+
+# The desktop's own process (bitscomp's helpers `bitscomp page/ctl ...` are not desktops); sets WD (the Wayland
+# socket's path) or why. As Brave's launcher finds it.
+desk_pids() {
+  ps_=
+  for p in $(pidof bitscomp); do
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+      *" page "* | *" ctl "* | *" page" | *" ctl") ;;
+      *) ps_="$ps_${ps_:+ }$p" ;;
+    esac
+  done
+  echo "$ps_"
+}
+find_desk() {
+  WD= why=
+  if [ -n "$WAYLAND_DISPLAY" ] && [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    WD=$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  set -- $(desk_pids)
+  [ $# -gt 0 ] || { why="none runs (start the desktop first)"; return 1; }
+  [ $# = 1 ] || { why="$# desktops run"; return 1; }
+  sock=wayland-bits-0 prev=
+  for a in $(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null); do
+    [ "$prev" != --socket ] || sock=$a
+    prev=$a
+  done
+  xdg=$(tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -n 1)
+  [ -n "$xdg" ] || { why="its XDG_RUNTIME_DIR cannot be read (/proc/$1/environ)"; return 1; }
+  WD=$xdg/$sock
+  [ -S "$WD" ] || { why="its socket $WD is missing"; WD=; return 1; }
+}
+
+# The uid LibreOffice runs as: the caller's, never root's (DROP = root's hand-over to uid 1000, NOROOT = why it fails).
+as_user() {
+  DROP= NOROOT=
+  [ "$UID_NOW" = 0 ] || return 0
+  out=$(chpst -u 1000:1000 id -u 2>&1)
+  if [ "$out" = 1000 ]; then DROP="chpst -u 1000:1000"; return 0; fi
+  NOROOT="root cannot hand over to uid 1000 (chpst -u 1000:1000: $(echo "${out:-no answer}" | head -n 1))"
+}
+# shellcheck disable=SC2086
+u() { $DROP "$@"; }
+
+desk_line() {
+  if ! find_desk; then say "desktop: $why"; return 1; fi
+  if u test -w "$WD"; then say "desktop: $WD"; return 0; fi
+  why="$WD is not writable for LibreOffice's user"
+  say "desktop: $why"
+  return 1
+}
+
+mounted_rw() { awk -v m="$1" '$2 == m { split($4, o, ","); if (o[1] == "rw") { print $3; found = 1 } } END { exit !found }' "$MOUNTS" 2>/dev/null | tail -n 1; }
+# /data may still be coming (the kernel mounts it in the background after boot): waits while the state says
+# `waiting` (130 s at most) or is missing although the kernel's folder exists (5 s), as Brave's launcher does.
+data_wait() {
+  fs=$(mounted_rw "$DATA")
+  [ -z "$fs" ] || [ "$fs" = vfat ] || return 0
+  n=0
+  while :; do
+    st=$(head -n 1 "$STATE" 2>/dev/null)
+    case $st in
+      waiting*) max=${LO_DATA_WAIT:-260} ;;
+      '') [ -d "${STATE%/*}" ] || return 0; max=10 ;;
+      *) return 0 ;;
+    esac
+    [ $n -lt "$max" ] || { say "home: /data is still not there (${st:-no state}); not waiting longer"; return 0; }
+    [ $n != 0 ] || say "home: waiting for the data volume (${st:-no state yet})"
+    n=$((n + 1))
+    sleep 0.5
+  done
+}
+# The user's home on the data volume, uid 1000's own (root makes it if a volume older than FS-8c lacks it; never
+# through a link). Sets H and HOME_WHY (empty: on the data volume).
+# NOMAKE (--check, --env): only look, make nothing; a missing home is then named as the one a start will make.
+home_dir() {
+  H=$RUN/home HOME_WHY= HOME_NEW=
+  if [ -n "$LO_HOME" ]; then H=$LO_HOME; return 0; fi
+  fs=$(mounted_rw "$DATA")
+  if [ -z "$fs" ]; then HOME_WHY="no data volume at $DATA"; return 0; fi
+  if [ "$fs" = vfat ]; then HOME_WHY="$DATA is vfat"; return 0; fi
+  if [ -n "$NOMAKE" ] && [ ! -e "$HOME_DATA" ] && [ ! -L "$HOME_DATA" ]; then H=$HOME_DATA HOME_NEW=1; return 0; fi
+  if [ ! -e "$HOME_DATA" ] && [ ! -L "$HOME_DATA" ]; then
+    if [ "$UID_NOW" = 0 ]; then
+      mkdir -p "$DATA/home" && [ ! -L "$DATA/home" ] && mkdir -m 700 "$HOME_DATA" && chown -h 1000:1000 "$HOME_DATA" \
+        || { rmdir "$HOME_DATA" 2>/dev/null; HOME_WHY="$HOME_DATA cannot be made"; return 0; }
+    else
+      { [ ! -L "$DATA/home" ] && mkdir -m 700 "$HOME_DATA" 2>/dev/null; } || { HOME_WHY="$HOME_DATA cannot be made"; return 0; }
+    fi
+  fi
+  if [ -L "$HOME_DATA" ] || [ "$(stat -c %u "$HOME_DATA" 2>/dev/null)" != 1000 ] || ! u test -w "$HOME_DATA"; then
+    HOME_WHY="$HOME_DATA is not uid 1000's own writable folder"
+    return 0
+  fi
+  H=$HOME_DATA
+}
+home_line() {
+  if [ -n "$LO_HOME" ]; then say "home: $H (LO_HOME)"
+  elif [ -n "$HOME_NEW" ]; then say "home: $H (data volume; made at the first start; documents and settings stay)"
+  elif [ -z "$HOME_WHY" ]; then say "home: $H (data volume; documents and settings stay)"
+  else say "home: $H (in RAM: gone at the next boot; $HOME_WHY)"; fi
+  say "profile: $H/.config/libreoffice/4"
+}
+
+# settings.language (settingsd) -> LANG; LO_LANG or a LANG of the caller win. Sets LNG and the UI line.
+language() {
+  if [ -n "$LO_LANG" ]; then LNG=$LO_LANG
+  elif case $LANG in ''|C|C.*|POSIX) false ;; esac; then LNG=$LANG
+  else
+    case $(settings get settings.language 2>/dev/null) in
+      en*) LNG=en_US.UTF-8 ;;
+      *) LNG=de_DE.UTF-8 ;;
+    esac
+  fi
+  case $LNG in
+    de*) if [ -f "$T/share/registry/res/registry_de.xcd" ] || [ -f "$T/share/registry/Langpack-de.xcd" ]; then ui="German"
+         else ui="English (the tree has no German language pack: stage-v2.sh with libreoffice-fresh-de)"; fi ;;
+    *) ui="English" ;;
+  esac
+  say "language: LANG=$LNG, menus $ui"
+}
+
+# glycin (GTK's image loaders) takes the first bwrap on PATH; the tree's stand-in comes last there (as in Brave's).
+loaders_line() {
+  lb=$(PATH="$PATH:$T/gtk/libexec" command -v bwrap)
+  if [ "$lb" = "$T/gtk/libexec/bwrap" ]; then say "image loaders: without a sandbox (the tree's bwrap stand-in; no real bwrap on PATH)"
+  else say "image loaders: sandbox by ${lb:-no bwrap at all}"; fi
+}
+
+# A running LibreOffice of this tree (its soffice.bin), as "pid".
+running() {
+  for p in $(pidof soffice.bin); do
+    [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$T/program/soffice.bin" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# soffice.bin in a clean environment pointing into the tree: libraries, fontconfig, GTK 3 on bitscomp's Wayland
+# (cursors, icons, schemas with the memory backend, the MIME database, gdk-pixbuf's glycin loader), no D-Bus,
+# accessibility bus, OpenCL or network printing (CUPS only through its local socket, R9). run_lo LOG ARGS: replaces
+# the calling shell (call it with & or as the last step); LOG "-" keeps the output on this terminal.
+# shellcheck disable=SC2086,SC2016
+run_lo() {
+  log=$1; shift
+  lo_env $DROP sh -c 'if [ "$0" = - ]; then exec "$@"; fi; exec "$@" >"$0" 2>&1' "$log" "$T/program/soffice.bin" "$@"
+}
+# The environment itself: `lo_env PROGRAM ARGS` replaces the calling shell with PROGRAM in it (`--env`: env).
+# shellcheck disable=SC2086
+lo_env() {
+  exec env -i PATH="$PATH:$T/gtk/libexec" HOME="$H" LANG="$LNG" ${TZ:+TZ=$TZ} ${GTK_THEME:+GTK_THEME=$GTK_THEME} \
+    ${WD:+XDG_RUNTIME_DIR="${WD%/*}"} ${WD:+WAYLAND_DISPLAY="${WD##*/}"} GDK_BACKEND=wayland LD_LIBRARY_PATH="$T/lib" \
+    SAL_USE_VCLPLUGIN="$VCL" SAL_DISABLE_OPENCL=1 \
+    FONTCONFIG_FILE="$T/etc/fonts/fonts.conf" XCURSOR_PATH="$T/gtk/share/icons" XCURSOR_THEME=Adwaita XCURSOR_SIZE="${XCURSOR_SIZE:-32}" \
+    XDG_DATA_DIRS="$T/gtk/share" GSETTINGS_SCHEMA_DIR="$T/gtk/share/glib-2.0/schemas" GSETTINGS_BACKEND=memory \
+    GDK_PIXBUF_MODULE_FILE="$T/gtk/etc/gdk-pixbuf/loaders.cache" CUPS_SERVER=/run/cups/cups.sock \
+    GTK_USE_PORTAL=0 NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: "$@"
+}
+
+as_user
+if [ -n "$DROP" ]; then RUN=$USER_RUN/libreoffice
+elif [ "$UID_NOW" != 0 ] && [ -n "$XDG_RUNTIME_DIR" ]; then RUN=$XDG_RUNTIME_DIR/libreoffice
+else RUN=$TMP/libreoffice-$UID_NOW; fi
+
+case "$1" in
+  -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --check)
+    rc=0 NOMAKE=1
+    tree_ok && say "tree $T: ok" || rc=1
+    [ $rc = 0 ] && { libs_ok || rc=1; }
+    desk_line || true
+    if [ -n "$DROP" ]; then say "user: runs as uid 1000 (started by root: $DROP)"
+    elif [ -z "$NOROOT" ]; then say "user: runs as uid $UID_NOW"
+    else say "user: runs as uid 0: refused, $NOROOT"; rc=1; fi
+    home_dir
+    home_line
+    language
+    loaders_line
+    if p=$(running); then say "running: pid $p; a start hands its documents to it"; else say "running: no"; fi
+    exit $rc ;;
+  --env)
+    NOMAKE=1
+    find_desk || WD=
+    home_dir
+    language >/dev/null
+    VCL=gtk3 GTK_THEME=
+    [ "$(settings get theme.mode 2>/dev/null)" != dark ] || GTK_THEME=Adwaita:dark
+    lo_env env ;;
+esac
+
+if [ -n "$NOROOT" ]; then
+  say "LibreOffice startet nicht als root: $NOROOT. Bitte als Benutzer 1000 starten (zum Beispiel ueber MCP)."
+  say "LibreOffice does not run as root: $NOROOT. Start it as user 1000 (MCP run, for example)."
+  exit 1
+fi
+# The module words, and whether this start needs a window at all.
+case "$1" in
+  writer|calc|impress|draw|math|base) [ -e "$1" ] || { m=--$1; shift; set -- "$m" "$@"; } ;;
+esac
+HEADLESS= VCL=gtk3
+for a in "$@"; do
+  case $a in --headless|--convert-to|--print-to|--cat) HEADLESS=1 VCL=svp ;; esac
+done
+tree_ok || exit 1
+if [ -n "$HEADLESS" ]; then WD=; else desk_line || exit 1; fi
+if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
+  mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; exit 1; }
+fi
+u mkdir -p "$RUN/home" || { say "cannot make $RUN"; exit 1; }
+data_wait
+home_dir
+home_line
+[ -z "$HOME_WHY" ] || say "Achtung: kein Datenträger unter $DATA, Dokumente und Einstellungen gehen beim Neustart verloren."
+language
+GTK_THEME=
+[ "$(settings get theme.mode 2>/dev/null)" != dark ] || GTK_THEME=Adwaita:dark
+# A start from / (bitscomp, MCP) opens its file dialogs and relative names in the home folder.
+[ "$(pwd)" != / ] || cd "$H" 2>/dev/null || :
+if [ -n "$HEADLESS" ]; then
+  set -- --headless --norestore --nologo "$@"
+  LOG=-
+else
+  loaders_line
+  LOG=$RUN/libreoffice.log
+  if p=$(running); then say "LibreOffice runs already (pid $p): the start goes to it"; fi
+fi
+if [ "$LOG" = - ]; then say "starting $*"; else say "starting ${*:-the start centre} (log $LOG)"; fi
+START=$(date +%s)
+n=0 sig= CHILD= rc=143
+# One trap for the whole loop: a signal between an end with 81 and the next start ends the loop instead of being lost.
+trap 'sig=1; [ -z "$CHILD" ] || kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+while [ -z "$sig" ]; do
+  run_lo "$LOG" "$@" &
+  CHILD=$!
+  # A signal that came while this start was being made: the trap had no child to pass it on to.
+  [ -z "$sig" ] || kill -TERM $CHILD 2>/dev/null
+  wait $CHILD
+  rc=$?
+  [ -z "$sig" ] && [ $rc = 81 ] && [ $n -lt $MAX_RESTARTS ] || break
+  n=$((n + 1))
+  say "LibreOffice asked for a restart (code 81, a new profile); starting again ($n)"
+done
+if [ -n "$sig" ] && [ -n "$CHILD" ]; then
+  # LibreOffice's own end on SIGTERM saves its recovery data; after 10 s it is killed.
+  k=0
+  while kill -0 $CHILD 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$CHILD/status" 2>/dev/null; do
+    k=$((k + 1))
+    [ $k -le 20 ] || { kill -KILL $CHILD 2>/dev/null; break; }
+    sleep 0.5
+  done
+  wait $CHILD
+  r=$?
+  [ $r = 127 ] || rc=$r
+fi
+trap - INT TERM HUP
+say "LibreOffice ended (code $rc) after $(( $(date +%s) - START )) s"
+exit $rc

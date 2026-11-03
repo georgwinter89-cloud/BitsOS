@@ -8,3 +8,6 @@ description = "USB core, hubs (owner: US)"
 ksync = { path = "../../ksync" }
 klog = { path = "../../klog" }
 kreg = { path = "../../kreg" }
+
+[lints]
+workspace = true

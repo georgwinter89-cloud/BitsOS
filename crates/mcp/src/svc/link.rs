@@ -39,7 +39,7 @@ pub trait Listen: Send + Sync {
 }
 
 /// The kernel acting on its own sockets (SO_PEERCRED pid 0, root).
-const KERNEL: Caller = Caller { pid: 0, uid: 0, gid: 0, subject: policy::Subject::KERNEL };
+const KERNEL: Caller = Caller::new(0, 0, 0, policy::Subject::KERNEL);
 /// Linux's somaxconn: connections waiting for `accept` (a queue bound, not a count of services).
 const BACKLOG: usize = 4096;
 /// The socket file's mode, 0666: services started by init run as root, programs `run` starts as uid 1000; who

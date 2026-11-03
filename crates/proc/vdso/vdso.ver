@@ -1,0 +1,16 @@
+/* The symbols the vDSO exports, all with version LINUX_2.6 as glibc and musl look them up
+   (Linux's list, linux-6.6/arch/x86/entry/vdso/vdso.lds.S, without SGX). */
+LINUX_2.6 {
+global:
+	clock_gettime;
+	__vdso_clock_gettime;
+	gettimeofday;
+	__vdso_gettimeofday;
+	getcpu;
+	__vdso_getcpu;
+	time;
+	__vdso_time;
+	clock_getres;
+	__vdso_clock_getres;
+local: *;
+};

@@ -68,3 +68,5 @@ pub const ESOCKTNOSUPPORT: i64 = 94;
 pub const EPFNOSUPPORT: i64 = 96;
 pub const ESHUTDOWN: i64 = 108;
 pub const ETOOMANYREFS: i64 = 109;
+pub const EOWNERDEAD: i64 = 130;
+pub const ENOTRECOVERABLE: i64 = 131;

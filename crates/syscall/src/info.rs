@@ -4,50 +4,77 @@
 //! (drivers/char/random.c :1364), sched_yield (kernel/sched/core.c; the affinity calls are SC-6's `sched_sys`).
 //!
 //! AB-13: the credential calls (getuid family, set*id, setfs*id, get/setgroups) on `proc::cred`.
+//!
+//! SX-2: pids and tids as the caller's pid namespace numbers them, uids and gids as its user namespace names
+//! them (`ns_sys`): what a program passes is made a kernel id first (no mapping: EINVAL; setfs*id: no change).
 
 use crate::SysCtx;
 use alloc::sync::Arc;
 use proc::Process;
 use proc::cred::{self, Cap, Cred};
 use proc::rlimit::Rlimit;
+use crate::ns_sys::{gid_view, kgid, kuid, uid_view};
 use uapi::ab::random::*;
 use uapi::ab::rlimit::RLIMIT_NOFILE;
 use uapi::errno::*;
 
 fn sys_getpid(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.pid as i64
+    c.proc.vpid() as i64
 }
 crate::syscall!(GETPID, sys_getpid);
 
 /// The calling thread's id (the main thread's is the pid).
 fn sys_gettid(c: &mut SysCtx<'_>) -> i64 {
-    c.thread.tid() as i64
+    c.thread.vtid() as i64
 }
 crate::syscall!(GETTID, sys_gettid);
 
 fn sys_getuid(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.cred().uid as i64
+    let k = c.proc.cred();
+    uid_view(&k, k.uid) as i64
 }
 crate::syscall!(GETUID, sys_getuid);
 
 fn sys_geteuid(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.cred().euid as i64
+    let k = c.proc.cred();
+    uid_view(&k, k.euid) as i64
 }
 crate::syscall!(GETEUID, sys_geteuid);
 
 fn sys_getgid(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.cred().gid as i64
+    let k = c.proc.cred();
+    gid_view(&k, k.gid) as i64
 }
 crate::syscall!(GETGID, sys_getgid);
 
 fn sys_getegid(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.cred().egid as i64
+    let k = c.proc.cred();
+    gid_view(&k, k.egid) as i64
 }
 crate::syscall!(GETEGID, sys_getegid);
 
 /// The 32-bit id argument `i` (`uid_t`; -1 = unchanged / invalid).
 fn id(c: &SysCtx<'_>, i: usize) -> u32 {
     c.args[i] as u32
+}
+
+/// SX-2: uid arguments as kernel ids (`make_kuid`; -1 stays -1); None when one has no mapping (EINVAL).
+fn kuids<const N: usize>(c: &SysCtx<'_>) -> Option<[u32; N]> {
+    let k = c.proc.cred();
+    let mut out = [0u32; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = kuid(&k, id(c, i))?;
+    }
+    Some(out)
+}
+
+fn kgids<const N: usize>(c: &SysCtx<'_>) -> Option<[u32; N]> {
+    let k = c.proc.cred();
+    let mut out = [0u32; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = kgid(&k, id(c, i))?;
+    }
+    Some(out)
 }
 
 /// Runs one set*id rule of `proc::cred` and commits its result: 0 or the negated errno.
@@ -65,51 +92,54 @@ fn set(c: &SysCtx<'_>, what: &'static str, f: impl FnOnce(&Cred) -> cred::Change
 /// `__sys_setreuid`, :372 `__sys_setregid`, :667 `__sys_setresuid`, :769 `__sys_setresgid` (the rules are in
 /// `proc::cred`, host-tested there).
 fn sys_setuid(c: &mut SysCtx<'_>) -> i64 {
-    let u = id(c, 0);
+    let Some([u]) = kuids::<1>(c).filter(|[u]| *u != cred::NO_ID) else { return -EINVAL };
     set(c, "setuid", |o| cred::set_uid(o, u))
 }
 crate::syscall!(SETUID, sys_setuid);
 
 fn sys_setgid(c: &mut SysCtx<'_>) -> i64 {
-    let g = id(c, 0);
+    let Some([g]) = kgids::<1>(c).filter(|[g]| *g != cred::NO_ID) else { return -EINVAL };
     set(c, "setgid", |o| cred::set_gid(o, g))
 }
 crate::syscall!(SETGID, sys_setgid);
 
 fn sys_setreuid(c: &mut SysCtx<'_>) -> i64 {
-    let (r, e) = (id(c, 0), id(c, 1));
+    let Some([r, e]) = kuids::<2>(c) else { return -EINVAL };
     set(c, "setreuid", |o| cred::set_reuid(o, r, e))
 }
 crate::syscall_nr!(uapi::ab::nr_more::SETREUID, "setreuid", sys_setreuid);
 
 fn sys_setregid(c: &mut SysCtx<'_>) -> i64 {
-    let (r, e) = (id(c, 0), id(c, 1));
+    let Some([r, e]) = kgids::<2>(c) else { return -EINVAL };
     set(c, "setregid", |o| cred::set_regid(o, r, e))
 }
 crate::syscall_nr!(uapi::ab::nr_more::SETREGID, "setregid", sys_setregid);
 
 fn sys_setresuid(c: &mut SysCtx<'_>) -> i64 {
-    let (r, e, s) = (id(c, 0), id(c, 1), id(c, 2));
+    let Some([r, e, s]) = kuids::<3>(c) else { return -EINVAL };
     set(c, "setresuid", |o| cred::set_resuid(o, r, e, s))
 }
 crate::syscall_nr!(uapi::ab::nr_more::SETRESUID, "setresuid", sys_setresuid);
 
 fn sys_setresgid(c: &mut SysCtx<'_>) -> i64 {
-    let (r, e, s) = (id(c, 0), id(c, 1), id(c, 2));
+    let Some([r, e, s]) = kgids::<3>(c) else { return -EINVAL };
     set(c, "setresgid", |o| cred::set_resgid(o, r, e, s))
 }
 crate::syscall_nr!(uapi::ab::nr_more::SETRESGID, "setresgid", sys_setresgid);
 
 /// `setfsuid`/`setfsgid` (sys.c :863, :907): the previous id, whether or not it changed.
 fn sys_setfsuid(c: &mut SysCtx<'_>) -> i64 {
-    let u = id(c, 0);
-    c.proc.change_cred(c.thread, |o| Ok(cred::set_fsuid(o, u))).map_or_else(|_| c.proc.cred().fsuid, |old| old.fsuid) as i64
+    // An unmapped id changes nothing (`uid_valid` fails), the old fsuid comes back as the caller names it.
+    let u = kuid(&c.proc.cred(), id(c, 0)).unwrap_or(cred::NO_ID);
+    let old = c.proc.change_cred(c.thread, |o| Ok(cred::set_fsuid(o, u))).unwrap_or_else(|_| c.proc.cred());
+    uid_view(&old, old.fsuid) as i64
 }
 crate::syscall_nr!(uapi::ab::nr_more::SETFSUID, "setfsuid", sys_setfsuid);
 
 fn sys_setfsgid(c: &mut SysCtx<'_>) -> i64 {
-    let g = id(c, 0);
-    c.proc.change_cred(c.thread, |o| Ok(cred::set_fsgid(o, g))).map_or_else(|_| c.proc.cred().fsgid, |old| old.fsgid) as i64
+    let g = kgid(&c.proc.cred(), id(c, 0)).unwrap_or(cred::NO_ID);
+    let old = c.proc.change_cred(c.thread, |o| Ok(cred::set_fsgid(o, g))).unwrap_or_else(|_| c.proc.cred());
+    gid_view(&old, old.fsgid) as i64
 }
 crate::syscall_nr!(uapi::ab::nr_more::SETFSGID, "setfsgid", sys_setfsgid);
 
@@ -125,13 +155,13 @@ fn put3(c: &SysCtx<'_>, ptrs: [u64; 3], v: [u32; 3]) -> i64 {
 
 fn sys_getresuid(c: &mut SysCtx<'_>) -> i64 {
     let k = c.proc.cred();
-    put3(c, [c.args[0], c.args[1], c.args[2]], [k.uid, k.euid, k.suid])
+    put3(c, [c.args[0], c.args[1], c.args[2]], [k.uid, k.euid, k.suid].map(|u| uid_view(&k, u)))
 }
 crate::syscall_nr!(uapi::ab::nr_more::GETRESUID, "getresuid", sys_getresuid);
 
 fn sys_getresgid(c: &mut SysCtx<'_>) -> i64 {
     let k = c.proc.cred();
-    put3(c, [c.args[0], c.args[1], c.args[2]], [k.gid, k.egid, k.sgid])
+    put3(c, [c.args[0], c.args[1], c.args[2]], [k.gid, k.egid, k.sgid].map(|g| gid_view(&k, g)))
 }
 crate::syscall_nr!(uapi::ab::nr_more::GETRESGID, "getresgid", sys_getresgid);
 
@@ -153,7 +183,7 @@ fn sys_getgroups(c: &mut SysCtx<'_>) -> i64 {
         if bytes.try_reserve_exact(n * 4).is_err() {
             return -ENOMEM;
         }
-        bytes.extend(k.groups.iter().flat_map(|g| g.to_le_bytes()));
+        bytes.extend(k.groups.iter().flat_map(|&g| gid_view(&k, g).to_le_bytes()));
         if c.proc.mm.copy_to_user(c.args[1], &bytes).is_err() {
             return -EFAULT;
         }
@@ -166,7 +196,9 @@ crate::syscall_nr!(uapi::ab::nr_more::GETGROUPS, "getgroups", sys_getgroups);
 /// unsigned, so negative too), ENOMEM when the list cannot be held, then each id read in order: EFAULT at the
 /// first unreadable one, EINVAL at the first -1 (`groups_from_user`).
 fn sys_setgroups(c: &mut SysCtx<'_>) -> i64 {
-    if !c.proc.capable(Cap::Setgid) {
+    // `may_setgroups`: CAP_SETGID in the caller's user namespace, and that namespace allows setgroups.
+    let me = c.proc.cred();
+    if !cred::own_capable(&me, Cap::Setgid) || !me.user_ns.may_setgroups() {
         return -EPERM;
     }
     let n = c.args[0] as i32 as u32 as usize;
@@ -186,10 +218,9 @@ fn sys_setgroups(c: &mut SysCtx<'_>) -> i64 {
     }
     for ch in raw[..copied * 4].chunks_exact(4) {
         let g = u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
-        if g == cred::NO_ID {
-            return -EINVAL;
-        }
-        groups.push(g);
+        // `make_kgid` + `gid_valid`: -1 and unmapped ids are EINVAL.
+        let Some(k) = kgid(&me, g).filter(|&k| k != cred::NO_ID) else { return -EINVAL };
+        groups.push(k);
     }
     if copied < n {
         return -EFAULT;
@@ -223,7 +254,7 @@ crate::syscall!(UNAME, sys_uname);
 /// returns the thread's id.
 fn sys_set_tid_address(c: &mut SysCtx<'_>) -> i64 {
     c.thread.clear_child_tid.store(c.args[0], core::sync::atomic::Ordering::Release);
-    c.thread.tid() as i64
+    c.thread.vtid() as i64
 }
 crate::syscall!(SET_TID_ADDRESS, sys_set_tid_address);
 
@@ -244,20 +275,20 @@ crate::syscall!(SET_ROBUST_LIST, sys_set_robust_list);
 /// caller has CAP_SYS_RESOURCE. Not the kill rule (review AB-5 finding 7).
 pub(crate) fn may_prlimit(me: &Cred, t: &Cred) -> bool {
     let ids = [t.uid, t.euid, t.suid].iter().all(|&x| x == me.uid) && [t.gid, t.egid, t.sgid].iter().all(|&x| x == me.gid);
-    ids || cred::capable(me, Cap::SysResource)
+    ids || cred::ns_capable(me, &t.user_ns, Cap::SysResource)
 }
 
 /// Process `pid` as the target of a query or change (0 = the caller; a thread id names its process, as
 /// `find_task_by_vpid`): ESRCH when there is none, EPERM unless `may_prlimit`. Since UL-2 init runs as uid 0
 /// (review INT-A1d user 4).
 fn target(c: &SysCtx<'_>, pid: i32) -> Result<Arc<Process>, i64> {
-    if pid == 0 || pid as u32 == c.proc.pid {
+    if pid == 0 || pid as u32 == c.proc.vpid() {
         return Ok(c.proc.clone());
     }
     if pid < 0 {
         return Err(-ESRCH);
     }
-    let t = proc::find(pid as u32).or_else(|| proc::find_thread(pid as u32).and_then(|t| t.group().image())).ok_or(-ESRCH)?;
+    let t = crate::ns_sys::find(c, pid as u32).or_else(|| crate::ns_sys::find_thread(c, pid as u32).and_then(|t| t.group().image())).ok_or(-ESRCH)?;
     if !may_prlimit(&c.proc.cred(), &t.cred()) {
         return Err(-EPERM);
     }
@@ -272,7 +303,7 @@ fn sys_get_robust_list(c: &mut SysCtx<'_>) -> i64 {
         c.thread.robust_list.load(core::sync::atomic::Ordering::Acquire)
     } else {
         let tid = pid as i32;
-        let Some(t) = (tid > 0).then(|| proc::find_thread(tid as u32)).flatten() else { return -ESRCH };
+        let Some(t) = (tid > 0).then(|| crate::ns_sys::find_thread(c, tid as u32)).flatten() else { return -ESRCH };
         let Some(owner) = t.group().image() else { return -ESRCH };
         if !c.proc.may_ptrace(&owner, false) {
             return -EPERM;

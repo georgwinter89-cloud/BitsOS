@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use smithay::desktop::Window;
+use crate::win::Window;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::backend::DisconnectReason;
 
@@ -90,7 +90,19 @@ impl App {
 
     /// The pid of the window's program (0 when unknown).
     pub fn pid_of(&self, w: &Window) -> i32 {
+        // WY-3: Xwayland is one client for every X11 program; the program's own pid comes from the X server.
+        if let Some(x) = w.x11() {
+            return x.pid.get() as i32;
+        }
         self.client_of(w).and_then(|c| c.get_data::<ClientState>().map(|d| d.pid)).unwrap_or(0)
+    }
+
+    /// LO-1: the process group of `pid`: a program a launcher started (LibreOffice's soffice.bin under its sh
+    /// launcher) is in the group `spawn` made for the launcher. `pid` itself when it has none to read.
+    pub fn group_of(pid: u32) -> u32 {
+        // SAFETY: getpgid only reads the pid; an ended or foreign pid answers -1 (ESRCH).
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        u32::try_from(pgid).unwrap_or(pid)
     }
 
     /// "window N (app_id) of pid P", for log lines and answers.
@@ -100,6 +112,13 @@ impl App {
 
     /// Ends the program of `w`; the answer says what was done.
     pub fn end_window(&mut self, w: &Window, why: &str) -> Result<String, String> {
+        // WY-3: never Xwayland itself: the X server drops the program's connection (KillClient).
+        if let Some(x) = w.x11() {
+            x.want_kill.set(true);
+            let what = self.describe(w);
+            eprintln!("bitscomp: {what}: its X connection is closed (KillClient, {why})");
+            return Ok(format!("{what}: X client killed"));
+        }
         let client = self.client_of(w).ok_or("the window has no client any more")?;
         let pid = self.pid_of(w);
         let what = self.describe(w);

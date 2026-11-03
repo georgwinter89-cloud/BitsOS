@@ -1176,3 +1176,176 @@ fn back_pressure_bounds_the_writer_and_loses_nothing() {
     assert!(tail[..] == data[off..off + 2_000_000], "2 MB through a full TX ring arrived changed");
     assert!(TX_REQUEUED.get() > requeued, "the full TX ring refused frames and they were held (net.tx_requeued)");
 }
+
+static QUICK_NOW: AtomicU64 = AtomicU64::new(1000 * S);
+/// A clock that stands still unless the test moves it (smoltcp's delayed-ACK timer then never fires by itself).
+fn clock_quick() -> u64 {
+    QUICK_NOW.load(Ordering::Acquire)
+}
+
+/// Bytes `st` has sent on its connection with local port `port` that the peer did not acknowledge yet.
+fn unacked(st: &Stack, port: u16) -> usize {
+    let card = st.ifaces.lock()[0].clone();
+    let g = card.inner.lock();
+    g.sockets
+        .iter()
+        .find_map(|(_, x)| match x {
+            smoltcp::socket::Socket::Tcp(t) if t.local_endpoint().is_some_and(|l| l.port == port) => Some(t.send_queue()),
+            _ => None,
+        })
+        .unwrap_or(usize::MAX)
+}
+
+/// NW-10 (Linux `tcp_incr_quickack`): an outgoing connection ACKs at once for its first 16 segments, then delays a
+/// lone segment's ACK (smoltcp's 10 ms), and ACKs at once again after a quiet spell of more than 200 ms.
+#[test]
+fn outgoing_connection_acks_quickly_then_delays_then_quickly_after_quiet() {
+    use super::quickack::{QUICK_BYTES, QUIET_NS};
+    const MS: u64 = 1_000_000;
+    let n = net_on(clock_quick, true);
+    let l = n.b.tcp_listen(at(Ipv4::ANY, 7120), 2).unwrap();
+    let c = n.a.tcp_connect(at(B, 7120), T).unwrap();
+    let s = l.accept(T).unwrap();
+    s.write_all(b"head", T).unwrap();
+    assert_eq!(read_all(&*c, 4), b"head");
+    eventually("quick mode: a lone segment acknowledged without the clock moving", || unacked(n.b, 7120) == 0);
+    let bulk = alloc::vec![7u8; QUICK_BYTES as usize + 4096];
+    s.write_all(&bulk, T).unwrap();
+    assert_eq!(read_all(&*c, bulk.len()).len(), bulk.len());
+    QUICK_NOW.fetch_add(11 * MS, Ordering::AcqRel);
+    eventually("the bulk acknowledged", || unacked(n.b, 7120) == 0);
+    s.write_all(b"x", T).unwrap();
+    assert_eq!(read_all(&*c, 1), b"x");
+    n.poll().settle();
+    n.poll().settle();
+    assert_eq!(unacked(n.b, 7120), 1, "after the quick budget a lone segment waits for the delayed-ACK timer");
+    QUICK_NOW.fetch_add(11 * MS, Ordering::AcqRel);
+    eventually("the delayed ACK after 10 ms", || unacked(n.b, 7120) == 0);
+    QUICK_NOW.fetch_add(QUIET_NS + MS, Ordering::AcqRel);
+    s.write_all(b"y", T).unwrap();
+    assert_eq!(read_all(&*c, 1), b"y");
+    // That segment's ACK was decided on arrival (delayed); the read after the quiet spell starts quick mode.
+    QUICK_NOW.fetch_add(11 * MS, Ordering::AcqRel);
+    eventually("y acknowledged", || unacked(n.b, 7120) == 0);
+    s.write_all(b"z", T).unwrap();
+    assert_eq!(read_all(&*c, 1), b"z");
+    eventually("quick again after a quiet spell", || unacked(n.b, 7120) == 0);
+}
+
+static PING_NOW: AtomicU64 = AtomicU64::new(1000 * S);
+/// Its own still clock (the quick-mode test above moves `QUICK_NOW` by quiet spells).
+fn clock_ping() -> u64 {
+    PING_NOW.load(Ordering::Acquire)
+}
+
+/// NW-10 fixer: TCP_QUICKACK 0 (Linux pingpong mode) delays ACKs even within the quick budget; 1 leaves pingpong
+/// and the rest of the budget ACKs at once again. An accepted connection goes between at once and delayed.
+#[test]
+fn tcp_quickack_option_switches_pingpong() {
+    use crate::conn::Conn;
+    const MS: u64 = 1_000_000;
+    let n = net_on(clock_ping, true);
+    let l = n.b.listen_prog(at(Ipv4::ANY, 7121), crate::loopback::Side::V4, 2, policy::Subject::KERNEL, 256 * 1024, 128 * 1024).unwrap();
+    let c = super::tcp::connect(n.a, at(B, 7121), T, 256 * 1024, 128 * 1024, policy::Subject::KERNEL).unwrap();
+    let mut got = None;
+    eventually("accepted", || {
+        got = l.try_accept();
+        got.is_some()
+    });
+    let s = got.unwrap();
+    let send = |b: &[u8]| {
+        let mut done = 0;
+        while done < b.len() {
+            done += s.try_send(&b[done..]).unwrap();
+        }
+    };
+    c.set_quickack(false);
+    send(b"head");
+    assert_eq!(read_all(&c, 4), b"head");
+    n.poll().settle();
+    n.poll().settle();
+    assert_eq!(unacked(n.b, 7121), 4, "pingpong: the ACK waits for the delayed-ACK timer within the quick budget");
+    PING_NOW.fetch_add(11 * MS, Ordering::AcqRel);
+    eventually("the delayed ACK after 10 ms", || unacked(n.b, 7121) == 0);
+    c.set_quickack(true);
+    send(b"x");
+    assert_eq!(read_all(&c, 1), b"x");
+    eventually("quick again: acknowledged without the clock moving", || unacked(n.b, 7121) == 0);
+    // The accepted side ACKs at once (`tune_listen`) and delays with TCP_QUICKACK 0.
+    let lp = c.local().port;
+    c.write_all(b"up", T).unwrap();
+    eventually("an accepted connection ACKs at once", || unacked(n.a, lp) == 0);
+    let mut b = [0u8; 8];
+    eventually("read up", || s.try_recv(&mut b, false).unwrap() == Some(2));
+    s.set_quickack(false);
+    c.write_all(b"up", T).unwrap();
+    eventually("arrived", || s.recv_queue() == 2);
+    n.poll().settle();
+    n.poll().settle();
+    assert_eq!(unacked(n.a, lp), 2, "an accepted connection in pingpong mode delays its ACK");
+    PING_NOW.fetch_add(11 * MS, Ordering::AcqRel);
+    eventually("and ACKs after the timer", || unacked(n.a, lp) == 0);
+}
+
+/// NW-10 fixer: every change of a program's connection over a card moves its change counter, which makes the
+/// round wake `inet::READY` (`prog_woke`): the handshake ending, data, room to send again, the peer's FIN, a reset.
+/// poll and epoll on AF_INET sockets sleep on READY alone (no 10 ms looks), so each must wake it.
+#[test]
+fn program_connections_wake_on_every_change() {
+    use crate::conn::Conn;
+    let n = net();
+    let prog = policy::Subject { program: policy::ProgramId(1), pid: 7, uid: 1000 };
+    let l = n.b.listen_prog(at(Ipv4::ANY, 7122), crate::loopback::Side::V4, 4, prog, 64 * 1024, 64 * 1024).unwrap();
+    let accept = || {
+        let mut got = None;
+        eventually("accepted", || {
+            got = l.try_accept();
+            got.is_some()
+        });
+        got.unwrap()
+    };
+    // Each change after a look (`state` registers the wakers, as the socket layer's poll does).
+    let woke = |c: &dyn Conn, what: &str, change: &mut dyn FnMut()| {
+        let _ = c.state();
+        let seen = c.change_seq().unwrap();
+        change();
+        eventually(what, || c.change_seq().unwrap() != seen);
+    };
+    let c = super::tcp::connect_start(n.a, at(B, 7122), None, 64 * 1024, 64 * 1024, prog, None).unwrap();
+    let _ = c.state();
+    let seen = c.change_seq().unwrap();
+    eventually("the handshake ends", || !c.state().connecting);
+    assert_ne!(c.change_seq().unwrap(), seen, "the handshake's end moved the counter");
+    let s = accept();
+    woke(&c, "data arrives", &mut || assert_eq!(s.try_send(b"data").unwrap(), 4));
+    assert!(c.state().readable);
+    // The peer reads nothing: its window, then our send buffer, fill up.
+    let chunk = alloc::vec![1u8; 16 * 1024];
+    let mut idle = 0;
+    while idle < 20 {
+        if c.try_send(&chunk).unwrap() == 0 {
+            idle += 1;
+            thread::sleep(std::time::Duration::from_millis(2));
+        } else {
+            idle = 0;
+        }
+    }
+    assert!(!c.state().writable, "the send buffer is full");
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    woke(&c, "room to send again", &mut || {
+        while s.try_recv(&mut buf, false).unwrap().is_some_and(|k| k > 0) {}
+    });
+    eventually("writable", || c.state().writable);
+    while c.try_recv(&mut buf, false).unwrap().is_some_and(|k| k > 0) {}
+    woke(&c, "the peer's FIN", &mut || s.finish());
+    eventually("end of stream", || c.state().eof);
+    // A reset: the peer goes with unread data.
+    let c2 = super::tcp::connect_start(n.a, at(B, 7122), None, 64 * 1024, 64 * 1024, prog, None).unwrap();
+    eventually("the second handshake", || !c2.state().connecting);
+    let s2 = accept();
+    assert_eq!(c2.try_send(b"unread").unwrap(), 6);
+    eventually("arrived", || s2.recv_queue() == 6);
+    let mut s2 = Some(s2);
+    woke(&c2, "the peer's reset", &mut || drop(s2.take()));
+    eventually("reset seen", || c2.state().error.is_some());
+}

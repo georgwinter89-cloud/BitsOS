@@ -1,0 +1,4 @@
+# Known differences of `abi-sigstorm` (AB-16) from CachyOS's transcripts sigstorm-*.txt.
+# Case lines "<case>: <owner>: <why>" are for `cargo xtask abi-diff`; label lines "<label> | <owner>: <why>" let the
+# ktest ab.signal.nmi_storm skip a differing line whose label (the text before its first ": ") is exactly this one.
+# Remove both in the commit that lands the fix, so the diff turns red if it regresses.

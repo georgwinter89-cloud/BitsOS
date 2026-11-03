@@ -139,6 +139,45 @@ pub fn power_up(codec: &Codec, out: &Output) -> Result<Vec<Action>, SetupError> 
     Ok(list)
 }
 
+/// How long a shutdown waits for a function group to report D3 (Linux `snd_hda_sync_power_state` waits up to
+/// 500 ms; the codec's own answer comes within a frame). The controller's Quiesce bounds every wait further.
+pub const D3_WAIT_MS: u32 = 10;
+
+/// The codec at shutdown, in Linux 6.6's order (`hda_codec.c:3045` snd_hda_codec_shutdown ->
+/// `hda_call_codec_suspend` :2883): every converter off its stream (`really_cleanup_stream` :1212: stream tag and
+/// channel 0, format 0), then the function group in D3 and every widget with power control
+/// (`hda_set_power_state` :2785, `snd_hda_codec_set_power_to_all` :2735), then the group's actual state waited
+/// for. All converters, not only the ones a stream set: the list is built at bring-up and sent from Quiesce, which
+/// cannot look at the streams (a stopped CPU may hold their lock); a 0 to an idle converter changes nothing.
+/// Pins with EAPD stay powered (the safe half of `snd_hda_codec_eapd_power_filter` :2765, which reads EAPD first).
+/// No depop delay (:2795, against clicks of analog amplifiers at power-down): the reset follows.
+pub fn shutdown(codec: &Codec) -> Vec<Action> {
+    let mut list = Vec::new();
+    for g in codec.audio_groups() {
+        for w in g.widgets.iter().filter(|w| matches!(w.kind(), WidgetType::Output | WidgetType::Input)) {
+            list.push(Action::Set { nid: w.nid, verb: set(SET_CHANNEL_STREAMID, 0) });
+            list.push(Action::Set { nid: w.nid, verb: set_format(0) });
+        }
+    }
+    for g in codec.audio_groups() {
+        list.push(Action::Set { nid: g.nid, verb: set(SET_POWER_STATE, PWRST_D3) });
+        for w in g.widgets.iter().filter(|w| w.caps.power_control()) {
+            if w.kind() == WidgetType::Pin && w.pin_caps.eapd() {
+                continue;
+            }
+            list.push(Action::Set { nid: w.nid, verb: set(SET_POWER_STATE, PWRST_D3) });
+        }
+        list.push(Action::WaitFor {
+            nid: g.nid,
+            verb: GET_POWER_STATE,
+            mask: 0xF0,
+            value: (PWRST_D3 as u32) << 4,
+            timeout_ms: D3_WAIT_MS,
+        });
+    }
+    list
+}
+
 /// Everything to make `out` play `stream`: [`power_up`], then the AMD list ([`ati::setup`]) for
 /// a digital output on an AMD codec, else the generic list ([`path_setup`]).
 pub fn output_setup(
@@ -239,7 +278,7 @@ impl JackSense {
         answer & (1 << 31) != 0
     }
 
-    /// HDMI/DP pins: the ELD is valid (F09 bit 30).
+    /// HDMI/DP pins: the ELD is valid (F09 bit 30). Only the fixture tests use it today (C1).
     pub fn eld_valid(answer: u32) -> bool {
         answer & (1 << 30) != 0
     }

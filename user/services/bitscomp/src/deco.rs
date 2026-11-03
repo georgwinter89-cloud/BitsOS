@@ -6,43 +6,45 @@
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement};
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
-use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::desktop::Window;
+use crate::win::Window;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 
 use crate::canvas::{Box2, Canvas};
+use crate::chrome_render::wallpaper::Paper;
 use crate::grab::Grab;
 use crate::header::{self, GLOW, px_rect};
 use crate::layout::{Place, Placement, Rect};
-use crate::render::CompElement;
+use crate::render::{CompElement, CompRenderer};
 use crate::state::App;
 use crate::theme::{Rgba, Theme};
 use crate::zones::{self, Drop, Part};
 use crate::{menu, tabs};
+
+pub mod hud;
 
 fn px_loc(x: i32, y: i32, s: f64) -> Point<f64, Physical> {
     Point::from((crate::header::px(x, s) as f64, crate::header::px(y, s) as f64))
 }
 
 /// An image element drawn at output resolution: `px` buffer pixels shown over `logical` points.
-pub(crate) fn image(pixman: &mut PixmanRenderer, buf: &MemoryRenderBuffer, r: Rect, px: (i32, i32), s: f64) -> Option<CompElement> {
-    image_a(pixman, buf, r, px, s, 1.0)
+pub(crate) fn image<R: CompRenderer>(renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, px: (i32, i32), s: f64) -> Option<CompElement<R>> {
+    image_a(renderer, buf, r, px, s, 1.0)
 }
 
 /// As `image`, faded by `alpha` (start animation, menus unfolding).
-pub(crate) fn image_a(
-    pixman: &mut PixmanRenderer,
+pub(crate) fn image_a<R: CompRenderer>(
+    renderer: &mut R,
     buf: &MemoryRenderBuffer,
     r: Rect,
     px: (i32, i32),
     s: f64,
     alpha: f32,
-) -> Option<CompElement> {
+) -> Option<CompElement<R>> {
     let src: Rectangle<f64, Logical> = Rectangle::from_size(Size::from((px.0 as f64, px.1 as f64)));
     let size: Size<i32, Logical> = (r.w, r.h).into();
     let a = (alpha < 1.0).then_some(alpha.max(0.0));
-    MemoryRenderBufferRenderElement::from_buffer(pixman, px_loc(r.x, r.y, s), buf, a, Some(src), Some(size), Kind::Unspecified)
+    MemoryRenderBufferRenderElement::from_buffer(renderer, px_loc(r.x, r.y, s), buf, a, Some(src), Some(size), Kind::Unspecified)
         .ok()
         .map(CompElement::from)
 }
@@ -70,8 +72,9 @@ fn pieces(t: &Theme, f: Rect, focused: bool, round: bool) -> Vec<(u8, Rect, Rgba
     v
 }
 
-/// A bottom corner of a tile (`right` or left): the gap colour outside the rounded edge, the border, the glow.
-fn corner(t: &Theme, f: Rect, right: bool, focused: bool) -> (Rect, Canvas) {
+/// A bottom corner of a tile (`right` or left): the wallpaper's own pixels outside the rounded edge (DS-2, so the
+/// corner matches the ground's dots and glow), the border, the glow.
+fn corner(t: &Theme, f: Rect, right: bool, focused: bool, paper: &Paper) -> (Rect, Canvas) {
     let s = t.scale;
     let r = t.radius.max(1);
     let area = Rect { x: if right { f.x + f.w - r } else { f.x - GLOW }, y: f.y + f.h - r, w: r + GLOW, h: r + GLOW };
@@ -80,7 +83,17 @@ fn corner(t: &Theme, f: Rect, right: bool, focused: bool) -> (Rect, Canvas) {
     let fb = Box2 { x: (p.x - o.x) as f32, y: (p.y - o.y) as f32, w: p.w as f32, h: p.h as f32 };
     let rad = (t.radius as f64 * s) as f32;
     let mut c = Canvas::new(o.w, o.h);
-    c.rrect_outside(fb, rad, t.bg);
+    if paper.w == 0 {
+        // No output size yet: the plain ground.
+        c.rrect_outside(fb, rad, t.bg);
+    } else {
+        for y in 0..o.h {
+            for x in 0..o.w {
+                let k = 1.0 - hud::rbox_cov(fb, rad, x as f32 + 0.5, y as f32 + 0.5);
+                c.put_cov(x, y, paper.pixel(o.x + x, o.y + y), (k * 255.0).round() as u8);
+            }
+        }
+    }
     if focused {
         c.glow(fb, rad, if t.effects_gpu { 6 } else { 2 }, t.glow);
     }
@@ -93,11 +106,24 @@ pub struct CornerKey {
     pub frame: Rect,
     pub focused: bool,
     pub theme: u64,
+    /// The output's physical size: the wallpaper under the corner follows it.
+    pub output: (i32, i32),
+    /// DS-3: the Bühne's stage (its glass lies under the corner).
+    pub stage: Option<Rect>,
+}
+
+/// The ground a tile corner rounds off to: the wallpaper, with the Bühne's stage glass where the stage is.
+fn paper_for(t: &Theme, output: (i32, i32), stage: Option<Rect>) -> Paper {
+    let p = Paper::new(t, output.0, output.1);
+    match stage {
+        Some(r) => p.with_stage(Box2::of(px_rect(r, t.scale)), t.radius_card as f32 * t.board as f32, hud::glass(t, hud::Glass::Card)),
+        None => p,
+    }
 }
 
 /// A window's frame elements, topmost first: the header image, the corners, the borders.
-pub fn frame(app: &mut App, pixman: &mut PixmanRenderer, p: &Placement<Window>) -> Vec<CompElement> {
-    let Some(id) = p.win.toplevel().map(|t| t.wl_surface().id()) else { return Vec::new() };
+pub fn frame<R: CompRenderer>(app: &mut App, renderer: &mut R, p: &Placement<Window>) -> Vec<CompElement<R>> {
+    let Some(id) = p.win.surface().map(|s| s.id()) else { return Vec::new() };
     let t = app.theme.clone();
     let s = t.scale;
     let (_, shown) = zones::pages(p.place);
@@ -137,20 +163,25 @@ pub fn frame(app: &mut App, pixman: &mut PixmanRenderer, p: &Placement<Window>) 
     }
     let ir = header::image_rect(p.frame, &t);
     let hr = px_rect(ir, s);
-    let mut out: Vec<CompElement> = image(pixman, &entry.1, ir, (hr.w, hr.h), s).into_iter().collect();
+    let mut out: Vec<CompElement<R>> = image(renderer, &entry.1, ir, (hr.w, hr.h), s).into_iter().collect();
     if tiled {
-        let key = CornerKey { frame: p.frame, focused: p.focused, theme: app.theme_gen };
+        let output = crate::chrome_render::wallpaper::output_px(app);
+        let stage = app.buehne().map(|b| b.stage);
+        let key = CornerKey { frame: p.frame, focused: p.focused, theme: app.theme_gen, output, stage };
+        let mut paper = None;
         for right in [false, true] {
             let e = app.corner_img.entry((id.clone(), right)).or_insert_with(|| {
-                let (r, c) = corner(&t, p.frame, right, p.focused);
+                let pp = paper.get_or_insert_with(|| paper_for(&t, output, stage));
+                let (r, c) = corner(&t, p.frame, right, p.focused, pp);
                 (key.clone(), r, c.into_buffer())
             });
             if e.0 != key {
-                let (r, c) = corner(&t, p.frame, right, p.focused);
+                let pp = paper.get_or_insert_with(|| paper_for(&t, output, stage));
+                let (r, c) = corner(&t, p.frame, right, p.focused, pp);
                 *e = (key.clone(), r, c.into_buffer());
             }
             let pr = px_rect(e.1, s);
-            out.extend(image(pixman, &e.2, e.1, (pr.w, pr.h), s));
+            out.extend(image(renderer, &e.2, e.1, (pr.w, pr.h), s));
         }
     }
     for (part, rect, color) in pieces(&t, p.frame, p.focused, tiled) {
@@ -163,10 +194,11 @@ pub fn frame(app: &mut App, pixman: &mut PixmanRenderer, p: &Placement<Window>) 
 }
 
 /// The circle menu and the drop preview, topmost first.
-pub fn overlays(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
+pub fn overlays<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
+    // DS-5: the boot scene first (topmost of bitscomp's own layers: only the installer and the cursor lie above).
+    let mut out: Vec<CompElement<R>> = app.boot_frame(renderer).into_iter().collect();
     let t = app.theme.clone();
     let s = t.scale;
-    let mut out = Vec::new();
     if let Some(m) = &app.menu {
         let key = (m.items, m.hover, app.theme_gen);
         if app.menu_img.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -176,7 +208,7 @@ pub fn overlays(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> 
         let r = Rect { x: m.centre.0 as i32 - ex, y: m.centre.1 as i32 - ey, w: 2 * ex, h: 2 * ey };
         let px = ((r.w as f64 * s).round() as i32, (r.h as f64 * s).round() as i32);
         let a = app.anim.menu_alpha(crate::pacer::now(), &t);
-        out.extend(image_a(pixman, &app.menu_img.as_ref().unwrap().1, r, px, s, a));
+        out.extend(image_a(renderer, &app.menu_img.as_ref().unwrap().1, r, px, s, a));
     }
     if let Some(Grab::MoveTile { drop, .. }) = &app.grab {
         let frames = app.ws.tile_frames(app.area(), t.gap);

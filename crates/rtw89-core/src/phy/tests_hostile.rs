@@ -166,11 +166,10 @@ impl<B: Bus + ?Sized> ChipOps<B> for NoOps {
 }
 
 fn firmware() -> Firmware {
-    let p = std::path::PathBuf::from(
-        std::env::var_os("WLAN_TOOLS")
-            .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into()),
-    )
-    .join("firmware/rtw8852b_fw-2.bin");
+    let p = std::env::var_os("WLAN_TOOLS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::test_desk::desk("werkzeuge/plattform/wlan"))
+        .join("firmware/rtw8852b_fw-2.bin");
     Firmware::parse(std::fs::read(p).expect("the firmware file"), 1, false).unwrap()
 }
 

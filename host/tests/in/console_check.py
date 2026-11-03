@@ -6,7 +6,7 @@ Usage: console_check.py shell|monitor <host port> <token> <qmp socket> <run dir>
 shell (a normal boot: init keeps BusyBox ash on the console since UL-3a, prompt `/ # `; the monitor waits): IN-quiet:
 the default console level (warn) keeps MCP's Info request lines off the screen; `echo off > /sys/bitsos/console_log`
 + clear; type a line with umlauts and AltGr characters; QEMU's screendump must equal the Rust model's picture pixel
-for pixel (cargo test ... screendump_matches_model); an injected `reboot` line finds no reboot in the shell and the
+for pixel (cargo test ... screendump_matches_model); an injected `poweroff` line is refused by init (R8f, UL-7) and the
 machine stays up; a mouse move draws the pointer; at console_log info the request lines show and a half-typed
 command stays whole below them.
 monitor (CONFIG init=off: no session holds the console, so the kernel monitor `bits>` reads it): `log level off` +
@@ -233,9 +233,10 @@ def shell(c, q):
     r = subprocess.run(["cargo", "test", "-q", "-p", "console", "--lib", "screendump_matches_model", "--", "--ignored", "--nocapture"],
                        cwd=ROOT, env=env, capture_output=True, text=True)
     need(r.returncode == 0, "QEMU screendump equals the Rust model pixel for pixel", r.stdout[-3000:] + r.stderr[-3000:])
-    # 3. Injected input cannot restart the machine from the shell: it has no reboot (user/ports/busybox).
-    tool(c, "send_keys", {"text": "reboot\n"})
-    wait_screen(c, "reboot: not found", "an injected reboot line finds no reboot in the console shell")
+    # 3. Injected input cannot power the machine off from the shell (UL-7: the shell has reboot/poweroff now, an
+    # injected restart is allowed, an injected power-off is refused by init, R8f).
+    tool(c, "send_keys", {"text": "poweroff\n"})
+    wait_screen(c, "power off refused", "an injected poweroff is refused by init (R8f)")
     time.sleep(2)
     need(SHELL_PROMPT.strip() in screen_text(c), "the machine stayed up (MCP answers, the shell's prompt is back)")
     # 4. The pointer appears where the mouse moved it (start: screen centre).

@@ -76,8 +76,7 @@ pub fn parse_unix(ctl: &[u8], caller: &Caller, mut fd: impl FnMut(i32) -> Option
                     return Err(EINVAL);
                 }
                 let c = Ucred { pid: u32_at(data, 0), uid: u32_at(data, 4), gid: u32_at(data, 8) };
-                check_creds(&c, caller)?;
-                out.creds = Some(c);
+                out.creds = Some(check_creds(&c, caller)?);
             }
             _ => return Err(EINVAL),
         }
@@ -85,21 +84,35 @@ pub fn parse_unix(ctl: &[u8], caller: &Caller, mut fd: impl FnMut(i32) -> Option
     Ok(out)
 }
 
-/// `scm_check_creds`: a program may send its own pid, uid and gid only (root: anything, but the pid must
-/// exist, ESRCH); -1 as an id is EINVAL.
-fn check_creds(c: &Ucred, caller: &Caller) -> Result<(), Errno> {
-    if c.uid == u32::MAX || c.gid == u32::MAX {
-        return Err(EINVAL);
-    }
-    let root = caller.uid == 0;
-    let ok = (c.pid == caller.pid || root) && (c.uid == caller.uid || root) && (c.gid == caller.gid || root);
+/// `scm_check_creds` and `__scm_send` (linux-6.6/net/core/scm.c:45-63, :166-196): the ids as the sender names
+/// them must map into its user namespace (EINVAL; -1 never does); a program may send its own pid and its real,
+/// effective or saved uid and gid only (CAP_SYS_ADMIN over its pid namespace: any pid; CAP_SETUID/CAP_SETGID:
+/// any uid/gid), else EPERM; the
+/// pid must name a process in its pid namespace (ESRCH). The answer is in kernel ids: the receiver reads them
+/// in its own namespaces (`Caller::view_of`).
+fn check_creds(c: &Ucred, caller: &Caller) -> Result<Ucred, Errno> {
+    use super::cap;
+    let (kuid, kgid) = match &caller.ids {
+        None => (Some(c.uid).filter(|u| *u != u32::MAX), Some(c.gid).filter(|g| *g != u32::MAX)),
+        Some(i) => (i.uid_to_kernel(c.uid), i.gid_to_kernel(c.gid)),
+    };
+    let (Some(kuid), Some(kgid)) = (kuid, kgid) else { return Err(EINVAL) };
+    let own_pid = c.pid == caller.pid_view();
+    let ok = (own_pid || caller.can(cap::SYS_ADMIN)) && (caller.cred.uid.contains(&kuid) || caller.can(cap::SETUID))
+        && (caller.cred.gid.contains(&kgid) || caller.can(cap::SETGID));
     if !ok {
         return Err(EPERM);
     }
-    if c.pid != caller.pid && !super::pid_exists(c.pid) {
-        return Err(ESRCH);
-    }
-    Ok(())
+    let kpid = if own_pid {
+        caller.pid
+    } else {
+        match &caller.ids {
+            None => Some(c.pid).filter(|p| super::pid_exists(*p)),
+            Some(i) => i.pid_to_kernel(c.pid),
+        }
+        .ok_or(ESRCH)?
+    };
+    Ok(Ucred { pid: kpid, uid: kuid, gid: kgid })
 }
 
 /// TCP and UDP (`sock_cmsg_send`, `ip_cmsg_send`): headers are checked; SOL_SOCKET ones this kernel does not
@@ -126,7 +139,7 @@ mod tests {
         v
     }
 
-    const ME: Caller = Caller { pid: 7, uid: 1000, gid: 1000, subject: policy::Subject::KERNEL };
+    const ME: Caller = Caller::new(7, 1000, 1000, policy::Subject::KERNEL);
 
     #[test]
     fn walk_and_checks() {
@@ -144,6 +157,16 @@ mod tests {
         assert_eq!(c.creds, Some(Ucred { pid: 7, uid: 1000, gid: 1000 }));
         let other = hdr(SOL_SOCKET, SCM_CREDENTIALS, &Ucred { pid: 7, uid: 0, gid: 1000 }.bytes());
         assert_eq!(parse_unix(&other, &ME, |_| None).err(), Some(EPERM));
+        // A set-user-ID program (real 1000, effective 2000, saved 3000; not root) may send its real or saved
+        // ids as well as its effective ones (`scm_check_creds`: uid, euid or suid), but no id it does not hold.
+        let ids = super::super::CredIds { uid: [1000, 2000, 3000], gid: [1000, 2000, 3000] };
+        let suid = Caller { cred: ids, ..Caller::new(7, 2000, 2000, policy::Subject::KERNEL) };
+        let real = hdr(SOL_SOCKET, SCM_CREDENTIALS, &Ucred { pid: 7, uid: 1000, gid: 1000 }.bytes());
+        assert_eq!(parse_unix(&real, &suid, |_| None).unwrap().creds, Some(Ucred { pid: 7, uid: 1000, gid: 1000 }));
+        let saved = hdr(SOL_SOCKET, SCM_CREDENTIALS, &Ucred { pid: 7, uid: 3000, gid: 2000 }.bytes());
+        assert_eq!(parse_unix(&saved, &suid, |_| None).unwrap().creds, Some(Ucred { pid: 7, uid: 3000, gid: 2000 }));
+        let held_not = hdr(SOL_SOCKET, SCM_CREDENTIALS, &Ucred { pid: 7, uid: 1000, gid: 60 }.bytes());
+        assert_eq!(parse_unix(&held_not, &suid, |_| None).err(), Some(EPERM), "gid 60 is none of the three");
         let short = hdr(SOL_SOCKET, SCM_CREDENTIALS, &[0; 8]);
         assert_eq!(parse_unix(&short, &ME, |_| None).err(), Some(EINVAL));
         let unknown = hdr(SOL_SOCKET, 99, &[]);

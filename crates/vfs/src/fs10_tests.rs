@@ -64,7 +64,7 @@ macro_rules! env {
     ($ns:ident, $fds:ident, $mem:ident, $s:ident) => {
         let ($ns, $fds) = program_view();
         let $mem = Mem::new();
-        let $s = Sys { mem: &$mem, fds: &$fds, ns: &$ns, cred: USER, subject: SUBJECT };
+        let $s = Sys { mem: &$mem, fds: &$fds, fs: &crate::fd::FsState::new(), ns: &$ns, cred: USER, subject: SUBJECT };
     };
 }
 
@@ -341,7 +341,7 @@ fn proc_fd_magic_link_opens_the_memfd_again() {
     let fds = Arc::new(FdTable::new());
     crate::devfs::attach(&ns, "/proc/fdt", Arc::new(FdDir(fds.clone(), ns.clone()))).unwrap();
     let mem = Mem::new();
-    let s = Sys { mem: &mem, fds: &fds, ns: &ns, cred: USER, subject: SUBJECT };
+    let s = Sys { mem: &mem, fds: &fds, fs: &crate::fd::FsState::new(), ns: &ns, cred: USER, subject: SUBJECT };
     let fd = memfd(&s, &mem, b"reopen", MFD_ALLOW_SEALING);
     assert_eq!(pwrite(&s, &mem, fd, b"pixels", 0), 6);
     assert_eq!(fcntl(&s, fd, F_ADD_SEALS, F_SEAL_SHRINK as u64), 0);

@@ -291,7 +291,8 @@ impl Registry {
         }
     }
 
-    /// Tries the stick at once (tests, and a later "stick plugged in" hint).
+    /// Tries the stick at once instead of waiting for the back-off. Today only the store tests (tests/store.rs) call
+    /// it; nothing sends a "stick plugged in" hint yet (C1: kept for CL, which would call it from that hint).
     pub fn tick_now(&mut self) -> bool {
         self.retry_at = Instant::now();
         self.tick()

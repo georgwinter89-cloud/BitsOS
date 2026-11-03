@@ -577,3 +577,187 @@ fn wake_all_from_a_handler_frees_nothing() {
     assert!(h.join().unwrap());
     assert_eq!(wq.waiter_count(), 0);
 }
+
+/// PF-2 micro test: N threads take N different locks of one class. Before PF-2 all of them wrote the class's
+/// shared counters; now each thread ("CPU" on the host) writes its own slot. Prints ns per lock/unlock for the
+/// notes (`cargo test -p ksync --release percpu_micro -- --nocapture`); only the exact sum is asserted.
+#[test]
+fn percpu_micro() {
+    const ROUNDS: u64 = 200_000;
+    for n in [1usize, 2, 4, 8] {
+        let name: &'static str = std::boxed::Box::leak(std::format!("t.percpu.micro{n}").into_boxed_str());
+        // Each lock on its own cache lines, so only the statistics can share a line.
+        #[repr(align(128))]
+        struct Padded(SpinLock<u64>);
+        let locks: Arc<Vec<Padded>> = Arc::new((0..n).map(|_| Padded(SpinLock::named(name, 0))).collect());
+        let go = Arc::new(AtomicUsize::new(0));
+        let ns = Arc::new(AtomicU64::new(0));
+        let (l2, g2, ns2) = (locks.clone(), go.clone(), ns.clone());
+        threads(n, move |i| {
+            drop(l2[i].0.lock());
+            // This thread has its host "CPU" index now; give every class a slot for it.
+            prepare_cpus(1);
+            g2.fetch_add(1, Ordering::SeqCst);
+            while g2.load(Ordering::SeqCst) < n {}
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                *l2[i].0.lock() += 1;
+            }
+            ns2.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        });
+        let s = stats::class(name).unwrap();
+        assert_eq!(s.acquired, n as u64 * (ROUNDS + 1), "{s:?}");
+        // Every thread counted in its own slot (the threads were alive at once, so their indices differ).
+        let sp = stats::spread(name).unwrap();
+        assert_eq!(sp.cpus.len(), n, "{sp:?}");
+        assert!(sp.cpus.iter().all(|&(_, a)| a >= ROUNDS), "{sp:?}");
+        std::eprintln!("percpu_micro n={n} ns_per_lock={:.1}", ns.load(Ordering::Relaxed) as f64 / (n as u64 * ROUNDS) as f64);
+    }
+}
+
+#[test]
+fn slots_cover_and_sum() {
+    let s = std::boxed::Box::leak(std::boxed::Box::new(slots::Stats::new()));
+    // No slot yet: everything counts in the shared one.
+    s.here().acquired.fetch_add(3, Ordering::Relaxed);
+    s.here().hold_max.fetch_max(7, Ordering::Relaxed);
+    assert_eq!(s.covered(), 0);
+    s.cover(4);
+    assert_eq!(s.covered(), 4);
+    s.cover(3);
+    assert_eq!(s.covered(), 4, "covering less is a no-op");
+    s.cover(5);
+    assert_eq!(s.covered(), 8, "growth at least doubles");
+    let mut seen = Vec::new();
+    s.for_each_slot(|cpu, x| {
+        if let Some(i) = cpu {
+            seen.push(i);
+            x.acquired.fetch_add(i as u64 + 1, Ordering::Relaxed);
+            x.hold_max.fetch_max(i as u64, Ordering::Relaxed);
+            x.wait_max.fetch_max(100 - i as u64, Ordering::Relaxed);
+        }
+    });
+    seen.sort_unstable();
+    assert_eq!(seen, (0..8).collect::<Vec<_>>());
+    let sum = s.sums();
+    assert_eq!(sum.acquired, 3 + (1..=8).sum::<u64>());
+    assert_eq!(sum.hold_max, 7, "max fields combine with max, the shared slot included");
+    assert_eq!(sum.wait_max, 100);
+}
+
+#[test]
+fn slots_sum_every_field() {
+    // Every counter written with its own value in the shared slot and in several CPU slots: the summed fields
+    // add up, the two max fields take the largest of all slots (the shared one included).
+    let s = std::boxed::Box::leak(std::boxed::Box::new(slots::Stats::new()));
+    s.cover(4);
+    let mut want = slots::Sums::default();
+    let mut n = 0u64;
+    s.for_each_slot(|cpu, x| {
+        let k = cpu.map_or(1000, |i| i as u64 + 1);
+        n += 1;
+        let r = Ordering::Relaxed;
+        let v = [k, 2 * k + 1, 3 * k + 2, 50 + (k * 7) % 13, 5 * k + 3, 70 + (k * 11) % 17, 7 * k + 4, 8 * k + 5];
+        x.acquired.fetch_add(v[0], r);
+        x.contended.fetch_add(v[1], r);
+        x.wait_ticks.fetch_add(v[2], r);
+        x.wait_max.fetch_max(v[3], r);
+        x.hold_ticks.fetch_add(v[4], r);
+        x.hold_max.fetch_max(v[5], r);
+        x.try_failed.fetch_add(v[6], r);
+        x.timeouts.fetch_add(v[7], r);
+        want.acquired += v[0];
+        want.contended += v[1];
+        want.wait_ticks += v[2];
+        want.wait_max = want.wait_max.max(v[3]);
+        want.hold_ticks += v[4];
+        want.hold_max = want.hold_max.max(v[5]);
+        want.try_failed += v[6];
+        want.timeouts += v[7];
+    });
+    assert_eq!(n, 5, "the shared slot and CPUs 0..4");
+    let got = s.sums();
+    let pair = |a: &slots::Sums| {
+        [a.acquired, a.contended, a.wait_ticks, a.wait_max, a.hold_ticks, a.hold_max, a.try_failed, a.timeouts]
+    };
+    assert_eq!(pair(&got), pair(&want));
+    // The shared slot's maxima (k = 1000) are not the largest here: max is not "last slot wins".
+    assert_eq!(got.wait_max, (1..=4u64).chain([1000]).map(|k| 50 + (k * 7) % 13).max().unwrap());
+    assert_eq!(got.hold_max, (1..=4u64).chain([1000]).map(|k| 70 + (k * 11) % 17).max().unwrap());
+}
+
+#[test]
+fn late_cover_skips_allocator_classes() {
+    // The late cover at a lock's first resolution runs before the lock word is taken, so for the allocator's own
+    // classes it would enter the allocator from inside itself: those get slots only from `prepare_cpus`.
+    let _ = crate::cpu::cpu_index();
+    assert!(slots::target() >= 1);
+    let alloc: &'static LockClass = std::boxed::Box::leak(std::boxed::Box::new(LockClass::fixed("t.late.alloc", 0, true)));
+    let plain: &'static LockClass = std::boxed::Box::leak(std::boxed::Box::new(LockClass::fixed("t.late.plain", 0, false)));
+    let cpu = crate::cpu::CpuSync::new();
+    assert!(cpu.may_alloc());
+    class::late_cover(alloc, &cpu);
+    class::late_cover(plain, &cpu);
+    assert_eq!(alloc.stats.covered(), 0, "an allocator class never allocates on the lock path");
+    assert!(plain.stats.covered() >= 1);
+}
+
+#[test]
+fn slots_cover_races() {
+    let s: &'static slots::Stats = std::boxed::Box::leak(std::boxed::Box::new(slots::Stats::new()));
+    threads(8, move |i| {
+        for n in 1..=(40 + i * 3) {
+            s.cover(n);
+        }
+    });
+    let mut seen = Vec::new();
+    s.for_each_slot(|cpu, _| seen.extend(cpu));
+    seen.sort_unstable();
+    assert_eq!(seen, (0..s.covered()).collect::<Vec<_>>(), "every CPU exactly one slot");
+    assert!(s.covered() >= 61);
+}
+
+#[test]
+fn stats_exact_over_slot_creation() {
+    // Threads keep counting while classes get their slots (prepare_cpus) under them: no count is lost.
+    let l = Arc::new(SpinLock::named("t.percpu.grow", 0u64));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (l2, s2) = (l.clone(), stop.clone());
+    let grower = std::thread::spawn(move || {
+        for n in 1..200 {
+            prepare_cpus(n);
+        }
+        s2.store(true, Ordering::Release);
+    });
+    threads(6, move |_| {
+        for _ in 0..20_000 {
+            *l2.lock() += 1;
+        }
+    });
+    grower.join().unwrap();
+    assert!(stop.load(Ordering::Acquire));
+    let s = stats::class("t.percpu.grow").unwrap();
+    assert_eq!(s.acquired, 120_000);
+    assert_eq!(*l.lock(), 120_000);
+}
+
+#[test]
+fn class_creation_race_keeps_slots() {
+    // Many threads create the same new class at once: the losers free their unpublished node and its slots,
+    // and every acquisition is counted once.
+    for round in 0..20 {
+        let name: &'static str = std::boxed::Box::leak(std::format!("t.percpu.race{round}").into_boxed_str());
+        prepare_cpus(64);
+        let ready = Arc::new(AtomicUsize::new(0));
+        let r2 = ready.clone();
+        threads(12, move |_| {
+            let l = SpinLock::named(name, ());
+            r2.fetch_add(1, Ordering::SeqCst);
+            while r2.load(Ordering::SeqCst) < 12 {
+                std::hint::spin_loop();
+            }
+            drop(l.lock());
+        });
+        assert_eq!(stats::class(name).map(|s| s.acquired), Some(12));
+    }
+}

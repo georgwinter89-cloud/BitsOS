@@ -71,9 +71,8 @@ fn read_phys(_ctx: &ToolContext, args: &Json) -> ToolResult {
         return Err(ToolError::Refused(why));
     }
     let mut buf = vec![0u8; len as usize];
-    // No plain "read RAM" primitive in hal yet (change request in plan/notes/mc-MC-2.md): dma_buf::read is the
-    // bounds-checked volatile read through the direct map, and the range was just checked to be RAM.
-    if !hal::dma_buf::read(addr, buf.len(), 0, &mut buf) {
+    // hal's bounded read-only RAM reader (volatile, through the direct map); the range was just checked to be RAM.
+    if !hal::dma_buf::read_ram(addr, &mut buf) {
         return Err(ToolError::Failed(String::from("the direct-map read refused the range")));
     }
     let body = if base64 {

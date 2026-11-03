@@ -93,12 +93,12 @@ fn clock_target(c: &SysCtx<'_>, pid: u32, thread: bool, gettime: bool) -> Option
         return Some(if thread { Target::Thread(c.thread.clone()) } else { Target::Process(c.proc.clone()) });
     }
     if thread {
-        return proc::find_thread(pid).filter(|t| t.group().tgid == c.proc.pid).map(Target::Thread);
+        return crate::ns_sys::find_thread(c, pid).filter(|t| t.group().tgid == c.proc.pid).map(Target::Thread);
     }
-    if gettime && pid == c.thread.tid() {
+    if gettime && pid == c.thread.vtid() {
         return Some(Target::Process(c.proc.clone()));
     }
-    proc::find(pid).map(Target::Process)
+    crate::ns_sys::find(c, pid).map(Target::Process)
 }
 
 /// clock_gettime on a CPU clock.

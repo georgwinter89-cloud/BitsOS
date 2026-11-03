@@ -1,0 +1,17 @@
+# GX-7a: the GPU firmware files `cargo xtask image` puts on the stick (BITSOS2/firmware/<name>, V2
+# /boot/BITSOS2/firmware/<name>), decompressed from the host's linux-firmware-amdgpu, with LICENSE.amdgpu.
+# The 780M's needs as `ipmod::plan(..).files()` gives them, fallbacks included; a host test keeps this list
+# equal to the modules' (tests/psp.rs `firmware_list_matches_the_modules`). Never into git: names only.
+amdgpu/psp_13_0_4_toc.bin
+amdgpu/psp_13_0_4_ta.bin
+amdgpu/gc_11_0_1_pfp.bin
+amdgpu/gc_11_0_1_me.bin
+amdgpu/gc_11_0_1_mec.bin
+amdgpu/gc_11_0_1_rlc.bin
+amdgpu/gc_11_0_1_imu.bin
+amdgpu/gc_11_0_1_mes_2.bin
+amdgpu/gc_11_0_1_mes.bin
+amdgpu/gc_11_0_1_mes1.bin
+amdgpu/sdma_6_0_1.bin
+amdgpu/dcn_3_1_4_dmcub.bin
+amdgpu/vcn_4_0_2.bin

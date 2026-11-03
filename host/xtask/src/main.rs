@@ -3,6 +3,7 @@ mod abi_diff;
 mod cpio;
 mod deps;
 mod dropcheck;
+mod firmware;
 mod image;
 mod ktest;
 mod qemu;
@@ -17,15 +18,16 @@ pub const EXPECTED_RUSTC_DATE: &str = "2026-10-13";
 
 const USAGE: &str = "usage: cargo xtask <command>
   build [--release] [--ktest]
-  initrd [--out F]
+  initrd [--out F] [--lock]
   image [--name N] [--gen G] [--config-extra \"k=v;k2=v2\"] [--release] [--ktest]
   qemu [--name N] [--smp N] [--mem M] [--net none|user|igb|virtio] [--hostfwd H:G]... [--res WxH]
-       [--display none|gtk] [--timeout S] [--serial-log F] [-- extra qemu args]
+       [--display none|gtk] [--timeout S] [--serial-log F] [--boot-retries N] [-- extra qemu args]
   ktest [FILTER] [--split f1,f2,...] [--timeout S] [--config-extra \"k=v;k2=v2\"] [--release]
   test [--no-ktest]
   fullrun [--quick] [--script-timeout S]
   stick --target <mountpoint> [--write] [--retire-v1 | --bundle D | --build | --confirm N | --prune ...] (cargo xtask stick --help)
   serve --dir D --port P
+  abi-diff [FILTER] [--host-only | --remote HOST:PORT --token T] [--port P] [--timeout S] [--smp N]
   deps
   toolchain";
 

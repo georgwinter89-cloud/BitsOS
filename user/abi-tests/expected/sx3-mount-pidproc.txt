@@ -1,0 +1,12 @@
+uid_map = 11
+setgroups = 4
+gid_map = 11
+getpid = 1
+make / rslave = 0
+tmpfs = 0
+mkdir p = 0
+proc = 0
+self = 1
+1/stat pid = 1
+processes = 1
+pidproc: exit 0

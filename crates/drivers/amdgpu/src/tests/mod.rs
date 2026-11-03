@@ -3,11 +3,27 @@
 
 extern crate std;
 
+mod blob;
+mod bringup;
 mod cursor;
+mod disc;
+mod fakes;
+mod ipmod;
 mod fake;
 mod flip;
 mod gates;
+mod gmc;
+mod handoff;
 mod layout;
 mod mode;
 mod model;
+mod prenow;
+mod psp;
+mod regdiff;
+mod gfxring;
+mod mes;
+mod sdma;
 mod snap;
+mod state;
+mod ucode;
+mod vm;

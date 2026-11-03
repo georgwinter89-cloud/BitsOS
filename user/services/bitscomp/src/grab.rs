@@ -1,7 +1,7 @@
 //! Held-left-button drags: a header or tab click that may become a move, floating moves and resizes, tile drags
 //! with a drop target (or a new place in the own tab strip), gap drags.
 
-use smithay::desktop::Window;
+use crate::win::Window;
 use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point};
 

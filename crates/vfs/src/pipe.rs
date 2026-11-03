@@ -24,8 +24,8 @@
 //! openers, woken by writes with the key IN|RDNORM, `wr` for writers, woken by reads of a full pipe with
 //! OUT|WRNORM; the last close of a side wakes both without a key. Conditions read the lock-free mirrors
 //! `used`/`max`/`readers`/`writers`. Waits
-//! run in 50 ms slices and end with EINTR once the program was killed (B4: no unbounded wait; until AB-6
-//! delivers signals, a pending signal with a handler does not interrupt).
+//! run in 50 ms slices and end with EINTR once the program was killed or a signal waits for its handler (B4:
+//! no unbounded wait).
 
 use crate::abi::{self, Attr};
 use crate::inode::{Cred, Inode, Meta};

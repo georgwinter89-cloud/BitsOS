@@ -11,6 +11,8 @@
 //! `/bin/fs-mmap` against Linux's transcript.
 //! FS-10: memfd_create (the seal commands go through fcntl) and the ktests of `/bin/fs-memfd` (`fs10_ktests`).
 //! FS-14: inotify's four calls; the ktests of `/bin/fs-memfd-lazy` and `/bin/fs-inotify` (`fs14_ktests`).
+//! SX-3a: mount(2), umount2(2), pivot_root(2) (`mount_sys`), every call in the caller's mount namespace's view;
+//! ktests `sx.mnt.*` (`mnt_ktests`).
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -25,7 +27,14 @@ mod fs10_ktests;
 mod fs13_ktests;
 mod fs14_inotify_ktests;
 mod fs14_ktests;
+mod fs17_ktests;
 mod kmsg;
+mod mount_sys;
+mod pf3_ktests;
+mod pf4_ktests;
+mod pf5_ktests;
+mod pf6_ktests;
+mod mnt_ktests;
 pub mod preload;
 mod preload_ktests;
 mod preload_reclaim_ktest;
@@ -40,15 +49,49 @@ use uapi::errno::*;
 use vfs::Errno;
 use vfs::sys::{Args, Sys, SysFn, UserMem};
 
+/// A hole's bytes for the no-fault copy (tmpfs).
+static ZEROS: [u8; vfs::frame::PAGE] = [0; vfs::frame::PAGE];
+
 /// A process's memory as `vfs::sys` sees it (MM-5a's checked copies; lazily filled pages are filled).
-struct ProcMem<'a>(&'a Process);
+pub(crate) struct ProcMem<'a>(pub(crate) &'a Process);
 
 impl UserMem for ProcMem<'_> {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
         self.0.mm.copy_from_user(buf, addr).is_ok()
     }
+    /// PF-6: the no-fault copy first (no `mm.as`: the threads of one program do not queue on their address
+    /// space's lock for the common case of a present, writable buffer), the locked copy (which fills pages) for
+    /// what it left.
     fn write(&self, addr: u64, data: &[u8]) -> bool {
-        self.0.mm.copy_to_user(addr, data).is_ok()
+        let d = self.0.mm.copy_to_user_nofault(addr, data);
+        d == data.len() || self.0.mm.copy_to_user(addr + d as u64, &data[d..]).is_ok()
+    }
+    /// PF-6: page-cache pages are copied straight from their frames (`write_page`), with no buffer.
+    fn direct_page_copy(&self) -> bool {
+        true
+    }
+    /// PF-6 (fs-PF-4 CR 2): straight from the frame: no-fault first, then `copy_frames_to_user` (one `mm.as`,
+    /// user pages filled) from the first byte it left. A heap page (never in the kernel) through the stack.
+    fn write_page(&self, addr: u64, page: &vfs::pagecache::CachePage, off: usize, n: usize) -> usize {
+        let n = n.min(vfs::frame::PAGE.saturating_sub(off));
+        let Some(pf) = page.page_frame() else {
+            return vfs::sys::write_page_through_stack(self, addr, page, off, n);
+        };
+        let d = self.0.mm.copy_frame_to_user_nofault(addr, pf, off, n);
+        if d == n {
+            return n;
+        }
+        d + self.0.mm.copy_frames_to_user(addr + d as u64, &[(pf, off + d, n - d)])
+    }
+    /// PF-6 (fs-PF-5 CR 2): the lockless read section's copy: no lock, no fault handled.
+    fn nofault_page_copy(&self) -> bool {
+        true
+    }
+    fn write_page_nofault(&self, addr: u64, page: Option<&vfs::pagecache::CachePage>, off: usize, n: usize) -> usize {
+        match page {
+            Some(p) => p.page_frame().map_or(0, |pf| self.0.mm.copy_frame_to_user_nofault(addr, pf, off, n)),
+            None => self.0.mm.copy_to_user_nofault(addr, &ZEROS[..n.min(ZEROS.len())]),
+        }
     }
     /// FS-4: the calling program is being ended (a kill, a fatal signal: Linux `fatal_signal_pending`).
     fn interrupted(&self) -> bool {
@@ -89,13 +132,26 @@ fn signal_pending() -> bool {
     proc::current_signal_pending()
 }
 
-/// Runs `f` for the calling process. Credentials: the process's uid; the group is the same number (wave A
-/// answers getgid with it too) until AB's credentials item gives processes their own gid.
 /// FS-3: a write to a pipe without readers sends SIGPIPE to the caller (`send_sig(SIGPIPE, current, 0)`).
-/// Its default action ends the program; ignored it is dropped and the write answers EPIPE; with a handler it
-/// stays pending until AB-6 delivers it.
+/// Its default action ends the program; ignored it is dropped and the write answers EPIPE; with a handler the
+/// syscall exit delivers it.
 fn sigpipe() {
     proc::signal_current_thread(uapi::ab::signal::SIGPIPE);
+}
+
+/// SX-2: stat's owner ids as the caller's user namespace names them (`from_kuid_munged`; 65534 unmapped). Without
+/// any user namespace besides the initial one, the ids are the identity (the common case costs no lock).
+fn id_view(uid: u32, gid: u32) -> (u32, u32) {
+    if proc::ns::user::live() == 0 {
+        return (uid, gid);
+    }
+    match proc::current() {
+        Some(p) => {
+            let c = p.cred();
+            (c.user_ns.uid(uid), c.user_ns.gid(gid))
+        }
+        None => (uid, gid),
+    }
 }
 
 fn current_fs_cred() -> Option<vfs::Cred> {
@@ -110,11 +166,26 @@ fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     vfs::pipe::set_sigpipe(sigpipe);
     vfs::inode::set_group_check(proc::cred::current_in_group);
     vfs::inode::set_current_cred(current_fs_cred);
+    vfs::inode::set_id_view(id_view);
     let p = c.proc;
     let mem = ProcMem(p);
-    let s = Sys { mem: &mem, fds: &p.fds, ns: &p.ns, cred: p.fs_cred(), subject: p.subject() };
+    // FS-16: the calling thread's cwd/root/umask, apart from the fd table.
+    let fs = c.thread.fs(p);
+    let ns = mount_view(p);
+    // PF-6: one look at the credentials per call (each `cred()` takes the group's `proc.cred` lock and its
+    // `Arc` count: with many threads the most contended lock of a read, plan/notes/fs-PF-6.md).
+    let cred = p.cred();
+    let subject = policy::Subject { program: p.program, pid: p.pid, uid: cred.euid };
+    let s = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: cred.fs(), subject };
+    drop(cred);
     let a: Args = c.args;
     f(&s, a)
+}
+
+/// SX-3a: the mount view of `p`'s calls (its mount namespace's). While no view was ever copied every process
+/// uses the boot view it holds, so the common path takes no lock.
+pub(crate) fn mount_view(p: &Process) -> alloc::sync::Arc<vfs::MountNs> {
+    if vfs::MountNs::copies_exist() { p.mount_ns() } else { p.ns.clone() }
 }
 
 /// One handler per call. Numbers `uapi::nr` names go through `syscall!`; the few it does not name yet

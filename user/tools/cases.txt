@@ -42,6 +42,4 @@ memstress_rules   0  memstress-rules.txt    memstress rules
 memstress_mb_big  2  -                      memstress touch --mb 18446744073709551615
 memstress_sec_big 2  -                      memstress replay --seconds 18446744073709551615
 memstress_replay  0  memstress-replay.txt   memstress replay
-alsa_stub         77 alsa-test.txt          alsa-test
-alsa_help         0  -                      alsa-test --help
 bitspkg_selftest  0  -                      bitspkg selftest @D

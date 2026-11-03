@@ -28,3 +28,6 @@ bootinfo = { path = "../bootinfo" }
 kexec = { path = "../kexec" }
 # NW-5 change request: read/write/readv/writev on a socket fd go to the socket layer.
 net = { path = "../net" }
+
+[lints]
+workspace = true

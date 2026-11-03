@@ -117,25 +117,44 @@ pub struct Pool {
 }
 
 /// The device barriers this pool asked for (cache flushes and FUA writes: on a USB stick without DPOFUA and on an
-/// image file each FUA write is a write plus a flush), for the snapshot pause's breakdown (VS-2b).
+/// image file each FUA write is a write plus a flush), for the snapshot pause's breakdown (VS-2b) and the commit
+/// times (VS-7, `Pool::io_stats`).
 struct Barriers {
     count: AtomicU64,
     ns: AtomicU64,
     /// Something was written (not FUA) since the last flush; true at open (writes before it are unknown).
     unflushed: AtomicBool,
+    /// Volume bytes written (not FUA; commits' own runs not counted) since the last flush began, and those the
+    /// flushes made durable (all time). `owed` is shared with the `PoolHandle` (`owed_counter`): its flush
+    /// before the pool lock asks it without the lock, and every barrier, inner commits' included, clears it.
+    owed: Arc<AtomicU64>,
+    covered: AtomicU64,
+    /// Bytes the commits wrote themselves (metadata runs, superblocks) and ns in those writes.
+    meta_bytes: AtomicU64,
+    meta_ns: AtomicU64,
 }
 
 impl Default for Barriers {
     fn default() -> Self {
-        Barriers { count: AtomicU64::new(0), ns: AtomicU64::new(0), unflushed: AtomicBool::new(true) }
+        let z = || AtomicU64::new(0);
+        Barriers { count: z(), ns: z(), unflushed: AtomicBool::new(true), owed: Arc::new(z()), covered: z(), meta_bytes: z(), meta_ns: z() }
     }
 }
 
 impl Barriers {
     fn add(&self, t0: Option<u64>) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        if let (Some(a), Some(b)) = (t0, ksync::now_ns()) {
+        if let (Some(a), Some(b)) = (t0, crate::timing::now()) {
             self.ns.fetch_add(b.saturating_sub(a), Ordering::Relaxed);
+        }
+    }
+    fn wrote(&self, bytes: usize) {
+        self.owed.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    fn meta(&self, bytes: usize, t0: Option<u64>) {
+        self.meta_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        if let (Some(a), Some(b)) = (t0, crate::timing::now()) {
+            self.meta_ns.fetch_add(b.saturating_sub(a), Ordering::Relaxed);
         }
     }
 }
@@ -227,16 +246,40 @@ impl Pool {
     pub fn barriers(&self) -> (u64, u64) {
         (self.io.count.load(Ordering::Relaxed), self.io.ns.load(Ordering::Relaxed))
     }
+    /// The device side of the commits since open (VS-7; `IoStats::since` gives one commit's part).
+    pub fn io_stats(&self) -> crate::timing::IoStats {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        crate::timing::IoStats {
+            flushes: g(&self.io.count),
+            flush_ns: g(&self.io.ns),
+            bytes: g(&self.io.meta_bytes),
+            write_ns: g(&self.io.meta_ns),
+            covered: g(&self.io.covered),
+        }
+    }
+    /// Volume bytes written since the last barrier began, readable without the pool lock (VS-7, `PoolHandle`).
+    pub(crate) fn owed_counter(&self) -> Arc<AtomicU64> {
+        self.io.owed.clone()
+    }
+    /// The handle flushed the device without the pool lock after `bytes` of volume writes (VS-7): they no longer
+    /// count as carried by the next barrier, which still runs (`unflushed` stays).
+    pub(crate) fn flushed_outside(&self, bytes: u64) {
+        let _ = self.io.owed.try_update(Ordering::AcqRel, Ordering::Acquire, |o| Some(o.saturating_sub(bytes)));
+    }
     /// The device's cache flush, counted; none when nothing was written since the last one.
     pub(crate) fn barrier(&self) -> Result<()> {
         if !self.io.unflushed.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        let t0 = ksync::now_ns();
+        let owed = self.io.owed.swap(0, Ordering::AcqRel);
+        let t0 = crate::timing::now();
         let r = self.dev.flush();
         self.io.add(t0);
         if r.is_err() {
             self.io.unflushed.store(true, Ordering::Release);
+            self.io.owed.fetch_add(owed, Ordering::AcqRel);
+        } else {
+            self.io.covered.fetch_add(owed, Ordering::Relaxed);
         }
         Ok(r?)
     }
@@ -320,9 +363,10 @@ impl Pool {
     }
 
     pub(crate) fn io_write(&self, off: u64, buf: &[u8], fua: bool, prio: IoPriority) -> Result<()> {
-        let t0 = if fua { ksync::now_ns() } else { None };
+        let t0 = if fua { crate::timing::now() } else { None };
         if !fua {
             self.io.unflushed.store(true, Ordering::Release);
+            self.io.wrote(buf.len());
         }
         let mut done = 0usize;
         while done < buf.len() {
@@ -517,6 +561,13 @@ impl Pool {
 
     /// Makes everything written so far durable (the stacked device's flush).
     pub fn commit(&mut self) -> Result<()> {
+        self.commit_at(IoPriority::Normal)
+    }
+
+    /// `commit` whose writes go at `prio`, never below Normal: everyone waits for the pool lock it holds (the
+    /// rule of FAT's volume lock, FS-12), and a commit for an Interactive caller goes Interactive.
+    pub fn commit_at(&mut self, prio: IoPriority) -> Result<()> {
+        let prio = prio.min(IoPriority::Normal);
         if !self.meta_dirty() {
             return self.barrier();
         }
@@ -536,7 +587,7 @@ impl Pool {
         for (&p, c) in self.cache.iter_mut().filter(|(_, c)| c.dirty) {
             layout::seal(&mut c.data, p, generation);
             if !run.is_empty() && (p != next || run.len() as u64 >= self.dev_max) {
-                Self::write_run(&self.dev, self.bs, self.dev_max, run_start, &run)?;
+                Self::write_run(&self.dev, &self.io, (self.bs, self.dev_max), run_start, &run, prio)?;
                 run.clear();
             }
             if run.is_empty() {
@@ -548,7 +599,7 @@ impl Pool {
             pages += 1;
         }
         if !run.is_empty() {
-            Self::write_run(&self.dev, self.bs, self.dev_max, run_start, &run)?;
+            Self::write_run(&self.dev, &self.io, (self.bs, self.dev_max), run_start, &run, prio)?;
         }
         self.barrier()?;
         let sb = Super {
@@ -561,7 +612,9 @@ impl Pool {
             next_id: self.next_id,
             time: self.time,
         };
-        self.io_write((generation % 2) * PAGE as u64, &sb.encode(), true, IoPriority::Normal)?;
+        self.io_write((generation % 2) * PAGE as u64, &sb.encode(), true, prio)?;
+        // Its time is a barrier's (`io_write` counts FUA writes there).
+        self.io.meta(PAGE, None);
         for c in self.cache.values_mut() {
             c.dirty = false;
         }
@@ -577,14 +630,16 @@ impl Pool {
         Ok(())
     }
 
-    fn write_run(dev: &Arc<dyn BlockDevice>, bs: u64, max: u64, page: u64, run: &[u8]) -> Result<()> {
+    fn write_run(dev: &Arc<dyn BlockDevice>, io: &Barriers, (bs, max): (u64, u64), page: u64, run: &[u8], prio: IoPriority) -> Result<()> {
         let off = page * PAGE as u64;
         let mut done = 0usize;
+        let t0 = crate::timing::now();
         while done < run.len() {
             let n = (run.len() - done).min(max as usize);
-            dev.write_blocks((off + done as u64) / bs, &run[done..done + n], false, IoPriority::Normal)?;
+            dev.write_blocks((off + done as u64) / bs, &run[done..done + n], false, prio)?;
             done += n;
         }
+        io.meta(run.len(), t0);
         Ok(())
     }
 

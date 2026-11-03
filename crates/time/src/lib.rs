@@ -47,6 +47,8 @@ use sources::{CpuidRates, Hpet, HpetError, HpetInfo, PmTimer};
 
 pub(crate) static CLOCK: Clock = Clock::new();
 pub(crate) static TICK_HOOK: Once<fn()> = Once::new();
+/// AB-14 (INT-W19): called after every rate change and wall-clock set (proc's vDSO page republishes).
+static PUBLISH_HOOK: Once<fn()> = Once::new();
 static SOURCE: AtomicU32 = AtomicU32::new(tsc_source::NONE);
 static HPET: Once<Hpet> = Once::new();
 static CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::named("time.calibration", None);
@@ -70,7 +72,7 @@ pub fn init(reload_calibrated_hz: u64) {
     };
     CLOCK.set_rate(t, hz);
     SOURCE.store(src, Ordering::Release);
-    klog::install_clock(now_ns);
+    klog::install_clock(now_ns_unlocked);
     klog::event!(Info, "time", "clock.ready", tsc_hz = hz, source = name; "first rate; CP-5 calibrates against the HPET once the ACPI tables are read");
 }
 
@@ -82,6 +84,37 @@ pub fn tsc_hz() -> u64 {
 /// Monotonic nanoseconds since `init` (0 before). Lock-free; any context, NMI included.
 pub fn now_ns() -> u64 {
     CLOCK.snapshot().ns_at(hal::cpu::rdtsc())
+}
+
+/// Tries of the sequence lock before the bounded reads give up (a few ms at most; a writer holds it for a few
+/// hundred cycles).
+const BOUNDED_SPINS: u32 = 100_000;
+/// Set once a bounded read gave up: later ones try only briefly (each panic log line would wait again).
+static CLOCK_STUCK: AtomicBool = AtomicBool::new(false);
+
+/// `now_ns` that gives up (`None`) when the clock's sequence lock stays held (RB-13 CR-5: a CPU a panic
+/// stopped inside `Clock::set_rate`). Never blocks.
+pub fn now_ns_bounded() -> Option<u64> {
+    let spins = if CLOCK_STUCK.load(Ordering::Relaxed) { 64 } else { BOUNDED_SPINS };
+    match CLOCK.try_snapshot(spins) {
+        Some(s) => Some(s.ns_at(hal::cpu::rdtsc())),
+        None => {
+            // No klog event here: this is the log's own clock. kexec's panic report says it (`clock_stuck`).
+            CLOCK_STUCK.store(true, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Whether a bounded read found the clock's sequence lock held for good (the panic report logs it).
+pub fn clock_stuck() -> bool {
+    CLOCK_STUCK.load(Ordering::Relaxed)
+}
+
+/// The log's clock and the panic report's uptime: `now_ns_bounded`, else the clock's fields as they are (a
+/// stamp that may mix two rates, never a hang). Never blocks.
+pub fn now_ns_unlocked() -> u64 {
+    now_ns_bounded().unwrap_or_else(|| CLOCK.snapshot_unchecked().ns_at(hal::cpu::rdtsc()))
 }
 
 /// The monotonic ns a TSC value stands for (traces, the Reload hand-over).
@@ -115,6 +148,30 @@ pub fn set_tick_hook(f: fn()) -> bool {
         f
     });
     set
+}
+
+/// AB-14 (INT-W19): the hook the clock calls after every rate change (`calibrate`, the re-check's correction
+/// and its end, `set_rate_for_test`) and every wall-clock set (`wall::set_realtime`, `wall::set_tz`,
+/// `wall::read_rtc`), always in thread context with no clock lock held: proc's vDSO page republishes at once
+/// instead of at its next refresh. First call wins (false after).
+pub fn set_publish_hook(f: fn()) -> bool {
+    let mut set = false;
+    PUBLISH_HOOK.get_or_init(|| {
+        set = true;
+        f
+    });
+    set
+}
+
+pub(crate) fn published() {
+    if let Some(f) = PUBLISH_HOOK.get() {
+        f()
+    }
+}
+
+/// The clock's line now, exactly as `now_ns` reads it (the vDSO page's base).
+pub fn snapshot() -> clock::Snapshot {
+    CLOCK.snapshot()
 }
 
 /// True when every online CPU's timers fire by its LAPIC timer interrupt: nobody has to poll for hrtimers
@@ -280,6 +337,7 @@ pub fn calibrate(inputs: &CalibInputs) -> Calibration {
     );
     CLOCK.set_rate(hal::cpu::rdtsc(), chosen.0);
     SOURCE.store(chosen.1.code(), Ordering::Release);
+    published();
     let c = Calibration {
         hz: chosen.0,
         source: chosen.1,
@@ -350,6 +408,8 @@ pub fn finish_recheck() -> Option<recheck::Recheck> {
     let start = RECHECK_START.lock().take()?;
     let r = conclude(start, under_hypervisor(), true);
     RECHECK_PENDING.store(false, Ordering::Release);
+    // The vDSO page answers only once the re-check is over (its MODE_NONE gate): publish the final rate now.
+    published();
     Some(r)
 }
 
@@ -413,6 +473,20 @@ fn apply_rate(tsc: u64, hz: u64, source: Source) {
         c.hz = hz;
         c.source = source;
     }
+    published();
+}
+
+/// ktests only: runs `f` with the boot's re-check marked pending (the vDSO page must say MODE_NONE meanwhile),
+/// then marks it done again; each change publishes. `None` when a real re-check is pending (left alone).
+pub fn hold_recheck_pending_for_test<R>(f: impl FnOnce() -> R) -> Option<R> {
+    if RECHECK_PENDING.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    published();
+    let r = f();
+    RECHECK_PENDING.store(false, Ordering::Release);
+    published();
+    Some(r)
 }
 
 /// ktests only: runs the clock at `hz` from now on (rebased, never back) with `source` in the report, e.g. a

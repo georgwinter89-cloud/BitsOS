@@ -4,7 +4,7 @@
 
 use crate::device::{self, BringUpError, Card, Config, State};
 use crate::irq::IrqSetup;
-use crate::fake::{Ev, Fake, AN_DELAY_NS, MAC};
+use crate::fake::{Ev, Fake, ResetCompl, AN_DELAY_NS, MAC};
 use crate::hw::{cmd, PciFail};
 use crate::phy::{self, PhyError};
 use crate::regs::{self, Model};
@@ -354,8 +354,107 @@ fn phy_reset_skipped_while_manc_blocks_it() {
     assert_eq!(phy::reset(&f), phy::PhyReset::Blocked);
     assert!(!f.trace().contains(&Ev::PhyReset));
     f.poke(regs::MANC, 0);
-    assert_eq!(phy::reset(&f), phy::PhyReset::Done);
+    assert!(matches!(phy::reset(&f), phy::PhyReset::Done { .. }));
     assert_eq!(f.trace().iter().filter(|e| **e == Ev::PhyReset).count(), 1);
+}
+
+/// NW-9: the sequence of Linux `igc_phy_hw_reset` (PHY_RST set, held, released; PHPM looked at from 100 us
+/// after the release) and its result for each way the completion bit may behave.
+fn reset_with(compl: ResetCompl) -> (Fake, phy::PhyReset, u64) {
+    let f = Fake::new(Model::I226);
+    f.knobs(|k| k.phy_reset_compl = compl);
+    let t0 = f.now();
+    let r = phy::reset(&f);
+    let took_us = (f.now() - t0) / 1000;
+    (f, r, took_us)
+}
+
+#[test]
+fn phy_reset_sequence_and_immediate_completion() {
+    let (f, r, took_us) = reset_with(ResetCompl::Level { after_ns: 0 });
+    assert_eq!(r, phy::PhyReset::Done { us: 100 }, "seen at the first look, 100 us after the release");
+    assert!(took_us < 3_000, "no long wait: {took_us} us");
+    let t = f.trace();
+    let ctrl: Vec<u32> = t.iter().filter_map(|e| match e { Ev::Wr(o, v) if *o == regs::CTRL => Some(*v), _ => None }).collect();
+    assert_eq!(ctrl.len(), 2, "PHY_RST set, then released: {ctrl:x?}");
+    assert!(ctrl[0] & regs::ctrl::PHY_RST != 0 && ctrl[1] & regs::ctrl::PHY_RST == 0);
+    assert_eq!(ctrl[0] & !regs::ctrl::PHY_RST, ctrl[1], "the rest of CTRL is written back unchanged");
+}
+
+#[test]
+fn phy_reset_waits_for_a_late_completion() {
+    let (_, r, _) = reset_with(ResetCompl::Level { after_ns: 30 * MS });
+    let phy::PhyReset::Done { us } = r else { panic!("late completion is still done: {r:?}") };
+    assert!((30_000..30_200).contains(&us), "seen within one step of 30 ms: {us}");
+}
+
+#[test]
+fn phy_reset_catches_a_short_completion_pulse() {
+    // A bit that shows for 3 us only: stepping in 100 us (as before NW-9) steps over it.
+    let (_, r, _) = reset_with(ResetCompl::Pulse { after_ns: 400_000, len_ns: 3_000 });
+    let phy::PhyReset::Done { us } = r else { panic!("pulse missed: {r:?}") };
+    assert!((400..=403).contains(&us), "{us}");
+}
+
+#[test]
+fn phy_reset_without_completion_bit_but_answering_phy_is_unconfirmed() {
+    let (_, r, took_us) = reset_with(ResetCompl::Never);
+    assert!(matches!(r, phy::PhyReset::Unconfirmed { phpm } if phpm & regs::PHPM_RST_COMPL == 0), "{r:?}");
+    assert!((50_000..55_000).contains(&took_us), "the whole 50 ms waited, then given up: {took_us} us");
+}
+
+#[test]
+fn phy_reset_wait_sleeps_only_when_the_caller_sleeps() {
+    // NW-9 fixer: the 50 ms worst case must not spin on the restart worker; at probe it spins by design.
+    let f = Fake::new(Model::I226);
+    f.knobs(|k| k.phy_reset_compl = ResetCompl::Never);
+    let _ = phy::reset(&f);
+    assert_eq!(f.pauses(), 0, "plain hw spins");
+    let f = Fake::new(Model::I226);
+    f.knobs(|k| k.phy_reset_compl = ResetCompl::Never);
+    assert!(matches!(phy::reset(&crate::hw::Sleepy(&f)), phy::PhyReset::Unconfirmed { .. }));
+    assert!(f.pauses() > 400, "the worker's 100 us steps sleep: {}", f.pauses());
+}
+
+#[test]
+fn phy_reset_real_timeout_when_the_phy_is_silent_too() {
+    let f = Fake::new(Model::I226);
+    f.knobs(|k| {
+        k.phy_reset_compl = ResetCompl::Never;
+        k.mdic_dead = true;
+    });
+    assert!(matches!(phy::reset(&f), phy::PhyReset::NoCompletion { .. }));
+    let f = Fake::new(Model::I226);
+    f.knobs(|k| k.phy_reset_compl = ResetCompl::Never);
+    phy::write(&f, Model::I226, regs::phy::ID1, 0xFFFF).unwrap();
+    assert!(matches!(phy::reset(&f), phy::PhyReset::NoCompletion { .. }), "an all-ones PHY ID is no answer");
+}
+
+#[test]
+fn normal_bring_up_logs_no_phy_reset_warning() {
+    for compl in [ResetCompl::Level { after_ns: 0 }, ResetCompl::Level { after_ns: 15 * MS }, ResetCompl::Never] {
+        let f = Fake::new(Model::I226);
+        f.knobs(|k| k.phy_reset_compl = compl);
+        let c = card_on(f, Model::I226, small());
+        c.start().expect("bring-up");
+        assert!(!klog_has(&c, "igc.phy_reset_timeout"), "{compl:?}");
+        let up = klog_text(&c, "igc.up").expect("igc.up");
+        let want = if compl == ResetCompl::Never { "phy_reset=unconfirmed" } else { "phy_reset=done" };
+        assert!(up.contains(want), "{compl:?}: {up}");
+        settle(&c);
+        assert!(c.link().up);
+    }
+}
+
+#[test]
+fn bring_up_warns_on_a_real_phy_reset_timeout() {
+    let f = Fake::new(Model::I226);
+    f.knobs(|k| k.phy_reset_compl = ResetCompl::Never);
+    phy::write(&f, Model::I226, regs::phy::ID1, 0xFFFF).unwrap();
+    let c = card_on(f, Model::I226, small());
+    c.start().expect("bring-up goes on, as Linux does");
+    assert!(klog_has(&c, "igc.phy_reset_timeout"));
+    assert!(klog_text(&c, "igc.up").expect("igc.up").contains("phy_reset=timeout"));
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -754,7 +853,7 @@ fn quiesce_order_and_drain() {
     f.clear_trace();
     c.quiesce();
     let t = f.trace();
-    assert_eq!(t[0], Ev::Wr(regs::RCTL, 0), "receive off first");
+    assert!(matches!(t[0], Ev::Wr(regs::RCTL, v) if v & regs::RCTL_EN == 0), "receive off first: {:x?}", t[0]);
     assert_eq!(f.sent().len(), 5, "drained before transmit went off");
     let tctl_off = pos(&t, |e| matches!(e, Ev::Wr(regs::TCTL, v) if v & regs::TCTL_EN == 0));
     let reset_at = pos(&t, |e| *e == Ev::Reset);
@@ -857,6 +956,13 @@ fn rx_descriptors_go_back_every_16_frames() {
 fn klog_has(c: &Card<Fake>, name: &str) -> bool {
     let me = alloc::format!("ifname={} ", c.name());
     klog::tail(1 << 20).iter().any(|r| r.name == name && alloc::format!("{} ", r.text).contains(&me))
+}
+
+/// The text of this card's last event with this name.
+fn klog_text(c: &Card<Fake>, name: &str) -> Option<String> {
+    let me = alloc::format!("ifname={} ", c.name());
+    klog::tail(1 << 20).iter().rev().find(|r| r.name == name && alloc::format!("{} ", r.text).contains(&me))
+        .map(|r| alloc::format!("{}", r.text))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1025,4 +1131,147 @@ fn phy0_not_given_back_is_reported_and_taken_over_next_time() {
     assert!(a.took_over_own_bit);
     phy::release(&f).unwrap();
     assert_eq!(f.peek(regs::SW_FW_SYNC), 0);
+}
+
+// RB-15: the stop in Linux's order (igc_down + __igc_shutdown), every wait bounded and counted.
+
+fn is_txdctl_off(e: &Ev) -> bool {
+    matches!(e, Ev::Wr(regs::TXDCTL, v) if v & regs::QUEUE_ENABLE == 0 && v & regs::QUEUE_SWFLUSH != 0)
+}
+
+#[test]
+fn quiesce_disables_both_queues_and_waits_before_the_master_disable_and_the_reset() {
+    let c = running(Model::I226);
+    let f = c.hw();
+    f.set_msi(true, false);
+    f.knobs(|k| k.tx_autorun = true);
+    for i in 0..3 {
+        c.transmit(&frame(i, 200)).unwrap();
+    }
+    f.clear_trace();
+    let t0 = f.now();
+    c.quiesce();
+    let spent_us = (f.now() - t0) / 1000;
+    let t = f.trace();
+    assert_eq!(f.sent().len(), 3, "drained before the queue went off");
+    let tctl_off = pos(&t, |e| matches!(e, Ev::Wr(regs::TCTL, v) if v & regs::TCTL_EN == 0));
+    let txq_off = pos(&t, is_txdctl_off);
+    let rxq_off = pos(&t, |e| matches!(e, Ev::Wr(regs::RXDCTL, v) if v & regs::QUEUE_ENABLE == 0));
+    let gio = pos(&t, |e| matches!(e, Ev::Wr(regs::CTRL, v) if v & regs::ctrl::GIO_MASTER_DISABLE != 0));
+    let reset_at = pos(&t, |e| *e == Ev::Reset);
+    let txq_again = reset_at + pos(&t[reset_at..], is_txdctl_off);
+    let wuc = pos(&t, |e| *e == Ev::Wr(regs::WUC, 0));
+    let wufc = pos(&t, |e| *e == Ev::Wr(regs::WUFC, 0));
+    let drv = pos(&t, |e| matches!(e, Ev::Wr(regs::CTRL_EXT, v) if v & regs::CTRL_EXT_DRV_LOAD == 0));
+    let msi = pos(&t, |e| *e == Ev::MsiOff);
+    let bme = pos(&t, |e| matches!(e, Ev::Pci(v) if v & cmd::BUS_MASTER == 0));
+    assert!(tctl_off < txq_off && txq_off < rxq_off && rxq_off < gio && gio < reset_at, "{t:x?}");
+    assert!(reset_at < txq_again && txq_again < wuc && wuc < wufc && wufc < drv && drv < msi && msi < bme, "{t:x?}");
+    // Linux's 10 ms after the disables and the reset's own 10 ms: nothing shorter, nothing unbounded.
+    assert!(spent_us >= device::QUEUE_SETTLE_US + 10_000, "{spent_us} us");
+    assert!(spent_us < device::DRAIN_US + device::QUEUE_WAIT_US + reset::GIO_WAIT_US, "{spent_us} us");
+    let (was, q) = c.quiesce_report().unwrap();
+    assert_eq!(was, State::Running);
+    assert!(!q.any_timeout(), "{q:?}");
+    c.poll();
+    assert!(klog_text(&c, "igc.quiesce").is_some_and(|t| !t.contains("timeout")));
+    assert!(c.quiesce_report().is_none(), "the note is logged once");
+}
+
+#[test]
+fn a_queue_that_stays_on_is_waited_for_bounded_counted_and_logged() {
+    let c = running(Model::I226);
+    let f = c.hw();
+    f.knobs(|k| k.queue_stays_on = true);
+    f.clear_trace();
+    let before = device::QUIESCE_QUEUE_TIMEOUTS.get();
+    let t0 = f.now();
+    c.quiesce();
+    let spent_us = (f.now() - t0) / 1000;
+    assert!(spent_us >= device::QUEUE_WAIT_US && spent_us < device::QUEUE_WAIT_US + 100_000, "{spent_us} us");
+    let (_, q) = c.quiesce_report().unwrap();
+    assert!(q.queue_timeout && !q.gio_timeout && !q.drain_timeout, "{q:?}");
+    assert!(device::QUIESCE_QUEUE_TIMEOUTS.get() > before, "counted (a global counter: other tests may add)");
+    // The stop goes on as Linux does: reset, bus master off.
+    assert!(f.trace().contains(&Ev::Reset) && f.pci() & cmd::BUS_MASTER == 0);
+    c.poll();
+    assert!(klog_text(&c, "igc.quiesce").is_some_and(|t| t.contains("queue_timeout=true")));
+}
+
+#[test]
+fn master_requests_that_stay_pending_get_linuxs_wait_then_the_reset() {
+    let c = running(Model::I82576);
+    let f = c.hw();
+    f.knobs(|k| k.gio_stuck = true);
+    f.clear_trace();
+    let before = device::QUIESCE_GIO_TIMEOUTS.get();
+    let t0 = f.now();
+    // A reboot's quiesce (the platform reset follows): Linux's wait.
+    c.quiesce_bounded(device::gio_wait_for(klog::shutdown::Step::Quiesce));
+    let spent_us = (f.now() - t0) / 1000;
+    assert!(spent_us >= reset::GIO_WAIT_US && spent_us < reset::GIO_WAIT_US + 200_000, "{spent_us} us");
+    let (_, q) = c.quiesce_report().unwrap();
+    assert!(q.gio_timeout && !q.queue_timeout, "{q:?}");
+    assert!(device::QUIESCE_GIO_TIMEOUTS.get() > before, "counted (a global counter: other tests may add)");
+    let t = f.trace();
+    assert!(pos(&t, |e| *e == Ev::Reset) < pos(&t, |e| *e == Ev::MsiOff));
+    c.poll();
+    assert!(klog_text(&c, "igc.quiesce").is_some_and(|t| t.contains("gio_timeout=true")));
+}
+
+/// RB-15 fixer: outside a reboot's quiesce (a Reload, a panic with interrupts off) the spin is the short one.
+#[test]
+fn a_quiesce_outside_a_reboot_bounds_the_gio_wait_short() {
+    assert_eq!(device::gio_wait_for(klog::shutdown::Step::None), reset::GIO_WAIT_SHORT_US);
+    assert_eq!(device::gio_wait_for(klog::shutdown::Step::Parked), reset::GIO_WAIT_SHORT_US);
+    assert_eq!(device::gio_wait_for(klog::shutdown::Step::Quiesce), reset::GIO_WAIT_US);
+    assert_eq!(device::gio_wait_for(klog::shutdown::Step::Reset), reset::GIO_WAIT_US);
+    let c = running(Model::I82576);
+    let f = c.hw();
+    f.knobs(|k| k.gio_stuck = true);
+    let t0 = f.now();
+    c.quiesce_bounded(device::gio_wait_for(klog::shutdown::Step::None));
+    let spent_us = (f.now() - t0) / 1000;
+    assert!(spent_us >= reset::GIO_WAIT_SHORT_US && spent_us < reset::GIO_WAIT_SHORT_US + 200_000, "{spent_us} us");
+    assert!(c.quiesce_report().unwrap().1.gio_timeout);
+    assert!(f.pci() & cmd::BUS_MASTER == 0);
+}
+
+#[test]
+fn a_ring_that_does_not_drain_is_counted_and_stopped_anyway() {
+    let c = running(Model::I226);
+    let f = c.hw();
+    f.knobs(|k| k.tx_stalled = true);
+    c.transmit(&frame(0, 60)).unwrap();
+    let before = device::QUIESCE_DRAIN_TIMEOUTS.get();
+    c.quiesce();
+    let (_, q) = c.quiesce_report().unwrap();
+    assert!(q.drain_timeout, "{q:?}");
+    assert!(device::QUIESCE_DRAIN_TIMEOUTS.get() > before, "counted (a global counter: other tests may add)");
+    assert!(f.pci() & cmd::BUS_MASTER == 0);
+}
+
+/// The mirror's question before the quiesce (RB-15): sent means TDH == TDT and every descriptor written back.
+#[test]
+fn tx_done_needs_the_head_at_the_tail_and_every_descriptor_back() {
+    let c = running(Model::I226);
+    let f = c.hw();
+    assert_eq!(c.tx_done(), Some(true), "nothing given: done");
+    for i in 0..3 {
+        assert!(c.poll_tx(&frame(i, 80)));
+    }
+    assert_eq!(c.tx_done(), Some(false), "TDH behind TDT");
+    assert_eq!(f.run_tx(), 3);
+    assert_eq!(c.tx_done(), Some(true), "sent and written back");
+    // Head at the tail but a descriptor not yet written back: not done.
+    assert!(c.poll_tx(&frame(7, 80)));
+    let tdt = f.peek(regs::TDT);
+    f.poke(regs::TDH, tdt);
+    assert_eq!(c.tx_done(), Some(false), "DD missing");
+    // The TX lock held elsewhere: the DD bits cannot be read, so it cannot say (no wait either).
+    assert_eq!(c.with_tx_locked(|| c.tx_done()), None);
+    c.quiesce();
+    assert_eq!(c.tx_done(), None, "a stopped card cannot say");
+    f.knobs(|k| k.all_ones = true);
+    assert_eq!(c.tx_done(), None);
 }

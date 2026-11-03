@@ -150,13 +150,15 @@ impl futex::Space for ProcSpace<'_> {
         }
         proc::current_signal_pending().then_some(self.restart)
     }
-    /// SC-7b: the TID programs see (the PI futex word's owner field).
+    /// SC-7b: the TID programs see (the PI futex word's owner field; SX-2: in the thread's pid namespace).
     fn tid(&self) -> Option<u32> {
-        proc::current_thread().map(|t| t.tid())
+        proc::current_thread().map(|t| t.vtid())
     }
-    /// SC-7b: any live user thread with this TID (Linux `find_get_task_by_vpid`; one namespace).
+    /// SC-7b: any live user thread with this TID (Linux `find_get_task_by_vpid`: SX-2, in the caller's pid
+    /// namespace).
     fn thread_of(&self, tid: u32) -> Option<u64> {
-        proc::find_thread(tid).map(|t| t.kthread()).filter(|&k| k != 0)
+        let id = proc::current().map_or(Some(tid), |p| p.pid_ns.id(tid))?;
+        proc::find_thread(id).map(|t| t.kthread()).filter(|&k| k != 0)
     }
 }
 

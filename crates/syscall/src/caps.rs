@@ -1,8 +1,11 @@
-//! `capget` and `capset` (linux-6.6/kernel/capability.c :141, :220) over V2's capability model: no stored
-//! sets, the permitted and effective sets follow from the ids (`proc::cred::cap_sets`, the one place), the
-//! inheritable set is empty. capget answers as Linux for any task; capset can keep the sets as they are and
-//! refuses (EPERM) what Linux refuses, but also a lowering, which V2 could not hold (fail-safe: a program
-//! that drops capabilities learns that it did not happen instead of believing it did).
+//! `capget` and `capset` (linux-6.6/kernel/capability.c :141, :220) over V2's capability model
+//! (`proc::cred`): the permitted and effective sets follow from the ids until something stores them (a new
+//! user namespace, or capset itself: SX-2), the inheritable set is stored. capget answers as Linux for any
+//! task; capset follows `cap_capset` (EPERM for growing what Linux refuses) and stores the result, so a
+//! program can drop capabilities (Chromium's sandbox keeps only CAP_SYS_ADMIN, then none).
+//!
+//! Approximation: Linux keeps the sets per thread; V2 per thread group, like the ids (AB-13). Chromium drops
+//! them while single-threaded.
 
 use crate::SysCtx;
 use proc::cred::{self, Cred};
@@ -36,7 +39,7 @@ fn header_pid(c: &SysCtx<'_>, header: u64) -> Result<i32, i64> {
 /// (effective, permitted, inheritable) of credentials `k` under bounding set `bset`.
 fn sets(k: &Cred, bset: u64) -> [u64; 3] {
     let (prm, eff) = cred::cap_sets(k, bset);
-    [eff, prm, 0]
+    [eff, prm, k.cap_inh]
 }
 
 /// `struct __user_cap_data_struct[blocks]`: {effective, permitted, inheritable} per 32 bits.
@@ -63,10 +66,10 @@ fn sys_capget(c: &mut SysCtx<'_>) -> i64 {
         return -EINVAL;
     }
     // `cap_get_target_pid` (:109): pid 0 is the caller; any other task id may be read (no LSM).
-    let s = if pid == 0 || pid as u32 == c.thread.tid() {
+    let s = if pid == 0 || pid as u32 == c.thread.vtid() {
         sets(&c.proc.cred(), c.thread.prctl().cap_bset())
     } else {
-        match proc::find_thread(pid as u32) {
+        match crate::ns_sys::find_thread(c, pid as u32) {
             Some(t) => sets(&t.group().cred(), t.prctl().cap_bset()),
             None => return -ESRCH,
         }
@@ -88,7 +91,7 @@ fn sys_capset(c: &mut SysCtx<'_>) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    if pid != 0 && pid as u32 != c.thread.tid() {
+    if pid != 0 && pid as u32 != c.thread.vtid() {
         return -EPERM;
     }
     let mut raw = [0u8; 24];
@@ -98,16 +101,21 @@ fn sys_capset(c: &mut SysCtx<'_>) -> i64 {
     let word = |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]) as u64;
     let valid = proc::prctl_state::CAP_FULL_SET;
     let want = [0, 4, 8].map(|o| (word(o) | word(12 + o) << 32) & valid);
-    let have = sets(&c.proc.cred(), c.thread.prctl().cap_bset());
-    if want == have {
+    let bset = c.thread.prctl().cap_bset();
+    if want == sets(&c.proc.cred(), bset) {
         return 0;
     }
-    // security/commoncap.c `cap_capset`: inheritable within old inheritable|permitted (no CAP_SETPCAP case
-    // needed: inheritable is empty and permitted bounds it), permitted within the old permitted, effective
-    // within the new permitted. Everything else here is a lowering V2 cannot store.
+    // security/commoncap.c `cap_capset` (`proc::cred::capset`), then `commit_creds`.
     let [e, p, i] = want;
-    let linux_ok = i & !(have[2] | have[1]) == 0 && p & !have[1] == 0 && e & !p == 0;
-    klog::event!(Info, "syscall", "capset.refused", pid = c.proc.pid, eff = e, prm = p, inh = i, linux_would = linux_ok as u32; "no stored capability sets in V2: only the current sets can be set");
-    -EPERM
+    match c.proc.change_cred(c.thread, |o| cred::capset(o, bset, want)) {
+        Ok(_) => {
+            klog::event!(Info, "syscall", "capset", pid = c.proc.pid, eff = klog::Hex(e), prm = klog::Hex(p), inh = klog::Hex(i));
+            0
+        }
+        Err(err) => {
+            klog::event!(Info, "syscall", "capset.refused", pid = c.proc.pid, eff = klog::Hex(e), prm = klog::Hex(p), inh = klog::Hex(i));
+            -err
+        }
+    }
 }
 crate::syscall_nr!(uapi::ab::nr_more::CAPSET, "capset", sys_capset);

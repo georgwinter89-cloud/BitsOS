@@ -21,10 +21,13 @@
 //! previous record, reads and writes the boot marker that shows whether RAM survived the reset), the NMI slots,
 //! and the symbol table.
 
+mod clean;
 pub mod record;
 pub mod symbols;
 pub mod text;
 mod ktests;
+mod ktests_nmi_user;
+pub mod notes;
 mod tool;
 
 use crate::boot;
@@ -37,6 +40,8 @@ use ksync::Once;
 use record::{Header, Marker, MarkerFound, flags};
 use symbols::Symbols;
 use text::{Buf, OneLine};
+
+pub use clean::{set_sound_hook, set_watchdog_hook, watchdog_secs, SoundHook, Watchdog, WatchdogHook, WATCHDOG_MARGIN_S};
 
 // ---------------------------------------------------------------------------------------------------------
 // CONFIG
@@ -159,6 +164,58 @@ pub fn hand_on_kernel(id: u64) -> bool {
     hal::panic::crash_page_write(off, &Marker { next_kernel: id, ..m }.bytes())
 }
 
+/// The driver notes the kernel one Reload before handed on (read once at boot, `notes`).
+static NOTES_IN: Once<Vec<(u32, Vec<u8>)>> = Once::new();
+/// The try-lock of the note slots (two writers at once: the second gets `false`).
+static NOTE_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// GX-7f CR-1 (INT-W25): hands a driver note of at most `notes::MAX_DATA` bytes on to the next kernel of this
+/// boot (written now; a later call with the same tag replaces it). Safe in a Quiesce hook with interrupts off: no
+/// allocation, no lock but a try, no log line. False without a crash page, for tag 0 or too many bytes, while
+/// another writer holds the slots, or when every slot holds another tag of this kernel.
+pub fn hand_on_note(tag: u32, bytes: &[u8]) -> bool {
+    let Some((m, _)) = MINE.get().copied() else { return false };
+    let Some((_, len)) = hal::panic::crash_page() else { return false };
+    let len = len as usize;
+    let Some(slot) = notes::encode(&m.boot_id, tag, m.reload, bytes) else { return false };
+    if NOTE_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        return false;
+    }
+    let n = notes::area(len) / notes::SLOT;
+    let at = |i: usize| {
+        let mut b = [0u8; notes::SLOT];
+        let off = notes::slot_offset(len, record::MARKER, i) as u64;
+        (hal::panic::crash_page_read(off, &mut b)).then_some(()).and_then(|_| notes::parse(&m.boot_id, &b).map(|x| (x.tag, x.reload)))
+    };
+    let done = notes::choose_slot(n, at, tag, m.reload)
+        .is_some_and(|i| hal::panic::crash_page_write(notes::slot_offset(len, record::MARKER, i) as u64, &slot));
+    NOTE_BUSY.store(false, Ordering::Release);
+    done
+}
+
+/// GX-7f CR-1 (INT-W25): the note with `tag` the kernel before handed on, only when this kernel came from that
+/// kernel's Reload (the rule of `running_kernel_id`); None after a firmware start or without such a note.
+pub fn note_from_last(tag: u32) -> Option<Vec<u8>> {
+    NOTES_IN.get()?.iter().find(|(t, _)| *t == tag).map(|(_, d)| d.clone())
+}
+
+/// The notes in a heap copy of the page that a kernel with Reload counter `mine` of boot `me` takes.
+fn notes_handed(page: &[u8], me: &[u8; 16], mine: u32) -> Vec<(u32, Vec<u8>)> {
+    let len = page.len();
+    let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+    for i in 0..notes::area(len) / notes::SLOT {
+        let o = notes::slot_offset(len, record::MARKER, i);
+        if let Some(n) = notes::parse(me, &page[o..o + notes::SLOT])
+            && notes::from_last(n.reload, mine)
+            && !out.iter().any(|(t, _)| *t == n.tag)
+            && out.try_reserve(1).is_ok()
+        {
+            out.push((n.tag, n.data.to_vec()));
+        }
+    }
+    out
+}
+
 /// RB-11: a Reload's `jump` with kernel id `id` handed on; `jump` returns only when the jump did not happen, and
 /// the id is then taken back (a failed Reload leaves no id for a later one to inherit).
 pub fn jump_handing_on<E>(id: u64, jump: impl FnOnce() -> E) -> E {
@@ -247,21 +304,45 @@ fn init_reset() -> &'static str {
     }
 }
 
-/// Resets the machine: the FADT register, then hal's last resorts. Lock- and allocation-free.
+/// Resets the machine in the MCP `reboot`'s order (`acpi::power::reboot_plan`): the FADT register, then hal's
+/// last resorts (0xCF9 hard, 0xCF9 full, 8042, triple fault). Each path is logged before it is tried (RB-13: the
+/// mirror's last line names the one that reset). Lock- and allocation-free.
 fn reset_machine() -> ! {
     let io = RESET_IO.load(Ordering::Acquire);
+    let mut n = 0;
     if io != NO_RESET {
+        n += 1;
+        clean::step(n, "FADT I/O register");
         let _ = hal::portio::outb((io >> 8) as u16, io as u8);
-        hal::panic::spin_ns(RESET_STEP_NS, time::tsc_hz());
+        hal::panic::spin_ns(RESET_STEP_NS, panic_hz());
     }
     if let Some((w, v)) = RESET_MEM.get() {
+        n += 1;
+        clean::step(n, "FADT memory register");
         let _ = w.write8(0, *v);
-        hal::panic::spin_ns(RESET_STEP_NS, time::tsc_hz());
+        hal::panic::spin_ns(RESET_STEP_NS, panic_hz());
     }
+    clean::step(n + 1, LAST_RESORTS);
     hal::panic::reset_now()
 }
 
+/// What `hal::panic::reset_now` tries, in its order (`hal::panic::LAST_RESORT_CF9`, host-tested).
+const LAST_RESORTS: &str = "0xCF9 hard (0x6), 0xCF9 full (0xe), 8042, triple fault";
+
+/// The reset order this boot found, for the record (no heap).
+fn describe_reset(w: &mut dyn Write) {
+    let io = RESET_IO.load(Ordering::Acquire);
+    if io != NO_RESET {
+        let _ = write!(w, "FADT I/O {:#x} <- {:#x}, then ", io >> 8, io & 0xFF);
+    }
+    if RESET_MEM.get().is_some() {
+        let _ = write!(w, "FADT memory register, then ");
+    }
+    let _ = write!(w, "{LAST_RESORTS}");
+}
+
 fn init_config() {
+    PANIC_HZ.store(time::tsc_hz(), Ordering::Release);
     let (mode, secs, problem) = parse_config(boot::config("panic").as_deref(), boot::config("panic_delay").as_deref());
     MODE.store(mode, Ordering::Release);
     DELAY_S.store(secs, Ordering::Release);
@@ -342,6 +423,13 @@ fn init_page() {
         time_ns: time::now_ns(),
         next_kernel: 0,
     };
+    // GX-7f CR-1: the boot id is in each note's checksum, so only a Reload of this same boot hands notes on.
+    let handed_notes = notes_handed(&page, &me, mine.reload);
+    if !handed_notes.is_empty() {
+        let tags: Vec<String> = handed_notes.iter().map(|(t, d)| alloc::format!("{:08x}/{}", t, d.len())).collect();
+        klog::event!(Info, "crash", "notes.handed", count = handed_notes.len(), reload = mine.reload, tags = tags.join(",").as_str(); "driver notes from the kernel before this Reload");
+    }
+    NOTES_IN.get_or_init(|| handed_notes);
     let off = (len - record::MARKER) as u64;
     if hal::panic::crash_page_write(off, &mine.bytes()) {
         MINE.get_or_init(|| (mine, off));
@@ -437,6 +525,8 @@ kreg::initcall!(kreg::Level::Core, "crash.init", init);
 
 /// Steps of the reporting CPU's backtrace (a bound on one report).
 const OWN_DEPTH: usize = 40;
+/// Steps the walk may go on to after a full `OWN_DEPTH` (streamed, repeats folded: a sanity bound, not a buffer).
+const OWN_WALK_MAX: usize = 1024;
 /// Bytes of the record's body kept for the newest log lines from before the panic.
 const LOG_RESERVE: usize = 1024;
 /// Callers of each other CPU that go into the record's line for it (all of them go to the log and the mirror):
@@ -469,11 +559,23 @@ pub fn stop_others() {
     }
 }
 
-/// Nanoseconds on the TSC, for waits in the panic path (`time::now_ns` is 0 before the clock exists).
+/// The TSC rate the panic path counts with, read at boot (`init_config`). RB-13 fixer: `time::tsc_hz` and
+/// `time::now_ns` read the clock's sequence lock, which a CPU the panic stopped inside `Clock::set_rate` (the
+/// TSC recheck) leaves odd for good; the panic path's own waits must not depend on it. A later recheck moves the
+/// rate by ppm only, which does not matter for these bounds.
+static PANIC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// The TSC rate for panic waits (4 GHz assumed before `init_config`). Never blocks.
+fn panic_hz() -> u64 {
+    match PANIC_HZ.load(Ordering::Acquire) {
+        0 => 4_000_000_000,
+        hz => hz,
+    }
+}
+
+/// Nanoseconds on the TSC, for waits in the panic path (`time::now_ns` is 0 before the clock exists). Never blocks.
 fn clock() -> u64 {
-    let hz = time::tsc_hz();
-    let hz = if hz == 0 { 4_000_000_000 } else { hz };
-    ((hal::cpu::rdtsc() as u128 * 1_000_000_000) / hz as u128) as u64
+    ((hal::cpu::rdtsc() as u128 * 1_000_000_000) / panic_hz() as u128) as u64
 }
 
 /// "name+0x1f" for an address (a return address is looked up one byte earlier: the call, not what follows).
@@ -604,6 +706,111 @@ impl Page {
         hal::panic::crash_page_write(0, &h.bytes(f.finish()));
         h.body_len
     }
+}
+
+/// What `Fold` makes of one raw step of the walk's rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Folded {
+    /// Print step `n` (after a `Repeat` line for the steps folded before it, if any).
+    Print { n: usize, step: Step, repeat: Option<(usize, usize)> },
+    /// Nothing to print (already printed, settled away, or folded).
+    Nothing,
+}
+
+/// The rest of the reporting CPU's walk after the first `OWN_DEPTH` steps (pure; host-tested): settled like them
+/// (`settle_with`), and every run of one repeated two-step pattern (a trap and the handler frame it re-entered,
+/// the 26.10. #PF recursion) folded into one `(first step, count)`, so the outermost steps (where the recursion
+/// began) show.
+pub(crate) struct Fold {
+    /// Raw steps still to pass over (the ones already printed).
+    skip: usize,
+    /// Index of the next step.
+    next: usize,
+    prev_trap: Option<u64>,
+    /// The last two steps, oldest first.
+    last: [Step; 2],
+    folded: usize,
+    first_folded: usize,
+}
+
+impl Fold {
+    pub(crate) fn new(raw: usize, printed: usize) -> Fold {
+        Fold { skip: raw, next: printed, prev_trap: None, last: [Step::None; 2], folded: 0, first_folded: 0 }
+    }
+
+    /// `offset_of`: offset of an address in its function (the symbol table), as for `settle_with`.
+    pub(crate) fn step(&mut self, s: Step, offset_of: Option<&dyn Fn(u64) -> Option<u64>>) -> Folded {
+        let prev = self.prev_trap;
+        self.prev_trap = match s {
+            Step::Trap { rip, user: false, .. } => Some(rip),
+            _ => None,
+        };
+        if self.skip > 0 {
+            self.skip -= 1;
+            self.last = [self.last[1], s];
+            return Folded::Nothing;
+        }
+        let s = match (s, prev, offset_of) {
+            (Step::Guess(ret), Some(r), Some(off)) => match off(r) {
+                Some(o) if o <= 1 => Step::Call(ret),
+                Some(_) => return Folded::Nothing,
+                None => s,
+            },
+            _ => s,
+        };
+        let n = self.next;
+        self.next += 1;
+        let again = s != Step::None && s == self.last[0];
+        self.last = [self.last[1], s];
+        if again {
+            if self.folded == 0 {
+                self.first_folded = n;
+            }
+            self.folded += 1;
+            return Folded::Nothing;
+        }
+        Folded::Print { n, step: s, repeat: self.take() }
+    }
+
+    /// The run folded last, if any (at the end of the walk).
+    pub(crate) fn take(&mut self) -> Option<(usize, usize)> {
+        let r = (self.folded > 0).then_some((self.first_folded, self.folded));
+        self.folded = 0;
+        r
+    }
+
+    pub(crate) fn steps(&self) -> usize {
+        self.next
+    }
+}
+
+fn repeat_line(page: &mut Page, cpu: usize, (from, count): (usize, usize)) {
+    klog::try_event!(Error, "crash", "repeat", cpu = cpu, n = from, steps = count; "these steps repeat the two before them");
+    let mut l = Buf::<96>::new();
+    let _ = write!(l, " #{from}..#{} repeat the two steps above ({count} steps)", from + count - 1);
+    page.line(l.as_str());
+}
+
+/// Prints the walk's rest through `Fold` (section 3 of the report).
+fn print_rest(page: &mut Page, cpu: usize, rbp: u64, raw: usize, printed: usize) {
+    let mut f = Fold::new(raw, printed);
+    let table = symbols().map(|(t, _)| t);
+    let off = |a: u64| table.and_then(|t| t.lookup(a).map(|x| x.1));
+    let off: Option<&dyn Fn(u64) -> Option<u64>> = if table.is_some() { Some(&off) } else { None };
+    hal::panic::walk_visit(rbp, OWN_WALK_MAX, &mut |s| {
+        if let Folded::Print { n, step, repeat } = f.step(s, off) {
+            if let Some(r) = repeat {
+                repeat_line(page, cpu, r);
+            }
+            step_line(page, cpu, n, step);
+        }
+    });
+    if let Some(r) = f.take() {
+        repeat_line(page, cpu, r);
+    }
+    let mut l = Buf::<64>::new();
+    let _ = write!(l, "cpu {cpu} backtrace end ({} steps)", f.steps());
+    page.line(l.as_str());
 }
 
 fn step_line(page: &mut Page, cpu: usize, i: usize, s: Step) {
@@ -766,10 +973,14 @@ pub fn report(info: &core::panic::PanicInfo<'_>) -> ! {
         finish(action());
     }
     let me = hal::percpu::this_cpu();
-    let up = time::now_ns();
+    // CR-5: a CPU stopped inside `Clock::set_rate` holds the clock's sequence lock for good; never spin on it.
+    let up = time::now_ns_unlocked();
     // RB-klog: serial is printed from the ring by one CPU at a time; what it had not printed yet comes first,
     // so the serial log reads in order up to the panic.
     klog::flush_serial_emergency(PRE_PANIC_LINES);
+    if time::clock_stuck() {
+        klog::event!(Error, "crash", "clock.stuck"; "the clock's sequence lock stays held (a stopped CPU in set_rate): time stamps read its fields unchecked");
+    }
     // The record's log part ends here: what happened before the panic, not the report itself.
     let seq0 = klog::next_seq();
     klog::try_event!(Error, "kernel", "panic"; "{}", info);
@@ -796,18 +1007,34 @@ pub fn report(info: &core::panic::PanicInfo<'_>) -> ! {
         }
     }
     klog::flush_emergency();
+    // RB-13: the watchdog waits for the panic's own reset (`clean`).
+    let reboot = match action() {
+        Action::Reboot { secs } => Some(secs),
+        Action::Halt { .. } => None,
+    };
+    if let Some(secs) = reboot {
+        clean::watchdog(secs, Some(&mut page));
+    }
 
     // 3. This CPU (from the caller of `report`: the panic handler, then core's panic machinery, then the code).
     let mut steps = [Step::None; OWN_DEPTH];
-    let n = hal::panic::walk(rbp, &mut steps);
-    let n = settle(&mut steps, n);
+    let raw = hal::panic::walk(rbp, &mut steps);
+    let n = settle(&mut steps, raw);
     l.clear();
     let _ = write!(l, "cpu {me} backtrace ({n} frames{}):", if symbols().is_some() { "" } else { ", no symbol table" });
     page.line(l.as_str());
     for (i, s) in steps[..n].iter().enumerate() {
         step_line(&mut page, me, i, *s);
     }
+    if raw == OWN_DEPTH {
+        // RB-12: a full walk goes on (an exception recursion filled the 40 steps before the first fault showed).
+        print_rest(&mut page, me, rbp, raw, n);
+    }
     klog::flush_emergency();
+    // RB-13: the xHCI controllers halted and reset before the reset, their lines early in the record (`clean`).
+    if reboot.is_some() {
+        clean::devices(Some(&mut page));
+    }
 
     // 4. The others.
     let mut seen = [(0u32, 0usize); SEEN];
@@ -859,9 +1086,12 @@ pub fn finish(a: Action) -> ! {
             hal::panic::halt_forever()
         }
         Action::Reboot { secs } => {
+            // Done in `report` already, unless the report itself panicked (each step runs once).
+            clean::watchdog(secs, None);
+            clean::devices(None);
             klog::try_event!(Error, "crash", "reboot", in_s = secs; "restarting the machine in {secs} s");
             klog::flush_emergency();
-            hal::panic::spin_ns(secs.saturating_mul(1_000_000_000), time::tsc_hz());
+            hal::panic::spin_ns(secs.saturating_mul(1_000_000_000), panic_hz());
             reset_machine()
         }
     }

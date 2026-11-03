@@ -1,0 +1,22 @@
+[package]
+name = "bitsinstall"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS installer service (MC-9a): the only process the kernel lets install, pin, Reload, reboot and change guarded settings, and only after a person confirmed or a standing grant covers it"
+publish = false
+
+# mcp-wire: the gate's protocol (`mcp_wire::gate`, `mcp_wire::installer`) and the JSON both sides use. libc:
+# prctl, seccomp(2) and SO_PEERCRED in src/sys.rs (the pin already in user/Cargo.lock, no new download).
+[dependencies]
+mcp-wire = { path = "../../../crates/mcp-wire" }
+libc = "=0.2.190"
+# MC-10: SHA-256 of the paired client certificates (their keys name the full-access grants). The pin bitsmcp
+# already uses (user/Cargo.lock; Apache-2.0 AND ISC), no new download.
+ring = { version = "=0.17.14", default-features = false }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsinstall"
+path = "src/main.rs"

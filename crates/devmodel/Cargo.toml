@@ -5,4 +5,9 @@ edition = "2024"
 description = "Driver traits (hardware abstraction), Quiesce, registry (owner: desk/PC)"
 
 [dependencies]
+# RB-16: breadcrumbs before each device's quiesce (klog::crumb, lock-free).
+klog = { path = "../klog" }
 ksync = { path = "../ksync" }
+
+[lints]
+workspace = true

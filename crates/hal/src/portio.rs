@@ -15,6 +15,12 @@ fn refused(port: u16) -> bool {
     matches!(port, 0x170..=0x177 | 0x1F0..=0x1F7 | 0x370..=0x377 | 0x3F0..=0x3F7 | 0xCF8..=0xCFF)
 }
 
+/// Whether all `bytes` ports from `port` on pass the guard (SC-9: the idle planner refuses a C-state port the
+/// guard would refuse, so the entry never meets a refusal).
+pub fn allowed(port: u16, bytes: u32) -> bool {
+    (0..bytes).all(|i| port.checked_add(i as u16).is_some_and(|p| !refused(p)))
+}
+
 pub(crate) mod raw {
     #[cfg(target_os = "none")]
     pub fn outb(port: u16, v: u8) {

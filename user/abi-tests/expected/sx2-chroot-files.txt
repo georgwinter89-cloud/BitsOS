@@ -1,0 +1,14 @@
+unshare(CLONE_NEWUSER) = 0
+clone(CLONE_FILES) = yes
+chroot(/proc) with a CLONE_FILES sibling = 0
+CLONE_FILES sibling: stat(/self/status) (below /proc) = -ENOENT
+CLONE_FILES sibling: stat(/proc/self/status) (below /) = 0
+CLONE_FILES sibling: exit 0
+CLONE_FILES: exit 0
+unshare(CLONE_NEWUSER) = 0
+clone(CLONE_FILES|CLONE_FS) = yes
+chroot(/proc) with a CLONE_FILES|CLONE_FS sibling = 0
+CLONE_FILES|CLONE_FS sibling: stat(/self/status) (below /proc) = 0
+CLONE_FILES|CLONE_FS sibling: stat(/proc/self/status) (below /) = -ENOENT
+CLONE_FILES|CLONE_FS sibling: exit 0
+CLONE_FILES|CLONE_FS: exit 0

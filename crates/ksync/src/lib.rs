@@ -14,7 +14,7 @@
 //!   violations (never a panic); the scheduler reports new ones as `klog` events (`ksync lock.violation`) and
 //!   ktests fail on unexpected ones.
 //! - **Statistics** per class in every build (`stats`): taken, contended, wait and hold times; the `locks` MCP
-//!   tool shows them (`stats::report`).
+//!   tool shows them (`stats::report`). Counted per CPU and summed when read (`slots`, PF-2).
 //! - SMP: lock words use Acquire/Release; the bookkeeping is per CPU (`cpu`) and per thread, lock-free and
 //!   allocation-free on the lock path. CP-4 calls `prepare_cpus(n)` before the APs take locks.
 //!
@@ -38,6 +38,7 @@ pub mod lockdep;
 mod mutex;
 pub mod order;
 mod raw;
+mod slots;
 mod spin;
 pub mod stats;
 pub mod user_word;

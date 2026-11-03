@@ -10,6 +10,12 @@
 //!   back (the file's lines for them go, the boot copy's go to the end: last line wins);
 //! - a safe-mode boot (bitsboot wrapped the file in its profile lines and nothing writes the stick then), a
 //!   missing, unreadable or too large file, a stick that does not answer in time: the boot copy, logged.
+//!
+//! RB-18: the boot copy has its secret values blanked (`secret`), so the next kernel gets them from the file. When
+//! no file is handed on, what the running kernel still holds in clear (the MCP token) goes on with the boot copy;
+//! a take-once secret (the WLAN passphrase) is gone until a Reload reads the stick again, logged. A Reload over MCP
+//! refuses that beforehand without `force` ([`refuse_secret_loss`]). Text of the file never stays in freed heap: this
+//! kernel may run on after a dry run.
 
 use crate::handover::{self, BuildError};
 use crate::stage::Staged;
@@ -18,6 +24,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bootinfo::{Generation, gen_reason};
 use core::sync::atomic::{AtomicBool, Ordering};
+use zeroize::Zeroize;
 
 /// Keys a Reload never changes: R8a's guarded keys and bitsboot's profile choice.
 pub const KEPT_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "profile", "profile_reason"];
@@ -76,12 +83,20 @@ impl Outcome {
 
 /// A line's key and value read as loosely as the loosest reader (fs-fat's guard): `#` comment, a BOM, any case
 /// of the key, a non-UTF-8 byte (as the kernel's lossy parser). One reader for the comparison and the merge, so
-/// no spelling is counted by one and missed by the other.
+/// no spelling is counted by one and missed by the other. RB-18: a secret's value is not copied, `*` stands for
+/// any value (empty stays empty).
 fn key_value(raw: &[u8]) -> Option<(String, String)> {
-    let l = String::from_utf8_lossy(raw);
-    let l = l.split('#').next().unwrap_or("").trim().trim_start_matches('\u{feff}');
-    let (k, v) = l.split_once('=')?;
-    Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+    let lossy = String::from_utf8_lossy(raw).into_owned();
+    let kv = {
+        let l = lossy.split('#').next().unwrap_or("").trim().trim_start_matches('\u{feff}');
+        l.split_once('=').map(|(k, v)| {
+            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+            let v = if crate::secret::is_secret(&k) && !v.is_empty() { "*" } else { v };
+            (k, v.to_string())
+        })
+    };
+    lossy.into_bytes().zeroize();
+    kv
 }
 
 /// The value `key` has (read as [`key_value`]; last line wins).
@@ -128,23 +143,34 @@ fn merge(boot: &[u8], file: &[u8]) -> Vec<u8> {
 
 /// The CONFIG text the new kernel gets (`None`: the boot copy unchanged) and why (pure; host-tested).
 pub fn choose_config(boot: &[u8], file: FileNow) -> (Option<Vec<u8>>, Outcome) {
-    let text = match file {
+    let mut text = match file {
         FileNow::Text(t) => t,
         FileNow::Missing => return (None, Outcome::Missing),
         FileNow::Failed(e) => return (None, Outcome::Failed(e)),
         FileNow::Slow => return (None, Outcome::Slow),
         FileNow::Busy => return (None, Outcome::Busy),
     };
+    let chosen = from_file(boot, &text);
+    text.zeroize();
+    chosen
+}
+
+fn from_file(boot: &[u8], text: &[u8]) -> (Option<Vec<u8>>, Outcome) {
     if text == boot {
         return (None, Outcome::Unchanged);
+    }
+    // RB-18: the file is the boot copy but for the values this kernel blanked: unchanged, and the only source of
+    // those values for the new kernel.
+    if crate::secret::holds_value(text) && crate::secret::blanked(text) == boot {
+        return (Some(text.to_vec()), Outcome::Unchanged);
     }
     if boot_is_safe(boot) {
         return (None, Outcome::SafeMode);
     }
-    let changed: Vec<&'static str> = KEPT_KEYS.iter().copied().filter(|k| effective(&text, k) != effective(boot, k)).collect();
-    let guard = fs_fat::protect::config_guard(boot, &text);
+    let changed: Vec<&'static str> = KEPT_KEYS.iter().copied().filter(|k| effective(text, k) != effective(boot, k)).collect();
+    let guard = fs_fat::protect::config_guard(boot, text);
     if changed.is_empty() && guard.is_ok() {
-        return (Some(text), Outcome::Fresh);
+        return (Some(text.to_vec()), Outcome::Fresh);
     }
     let mut keys = changed;
     if let Err(k) = guard
@@ -153,9 +179,10 @@ pub fn choose_config(boot: &[u8], file: FileNow) -> (Option<Vec<u8>>, Outcome) {
     {
         keys.push(k);
     }
-    let merged = merge(boot, &text);
+    let mut merged = merge(boot, text);
     if fs_fat::protect::config_guard(boot, &merged).is_err() || KEPT_KEYS.iter().any(|k| effective(&merged, k) != effective(boot, k)) {
         // Cannot happen (the merge puts the boot lines back verbatim); the boot copy is the safe answer.
+        merged.zeroize();
         return (None, Outcome::KeptKeys(Vec::new()));
     }
     (Some(merged), Outcome::KeptKeys(keys))
@@ -185,6 +212,15 @@ pub struct Plan {
     pub boot_bytes: usize,
 }
 
+/// RB-18: `config` is the stick's text with its secrets.
+impl Drop for Plan {
+    fn drop(&mut self) {
+        if let Some(c) = self.config.as_mut() {
+            c.zeroize();
+        }
+    }
+}
+
 /// One stick read at a time: a stick that hangs holds one helper, not one per Reload or dry run.
 static READING: AtomicBool = AtomicBool::new(false);
 /// Woken when a helper ends (its result is in, `READING` is free).
@@ -193,6 +229,15 @@ static READ_WQ: ksync::WaitQueue = ksync::WaitQueue::new();
 struct Slot {
     v: ksync::SpinLock<Option<StickNow>>,
     done: AtomicBool,
+}
+
+/// RB-18: a read that came in after the deadline leaves no stick text in freed heap.
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(StickNow { file: FileNow::Text(t), .. }) = self.v.lock().as_mut() {
+            t.zeroize();
+        }
+    }
 }
 
 fn take_reader() -> bool {
@@ -212,7 +257,7 @@ fn read_stick(running: Option<u32>, max: usize, wait_for_reader: bool) -> StickN
     let started = sched::spawn("reload-config", sched::Class::Normal, move || {
         let now = match fs_fat::stick::with_sys(|sys| {
             let path = alloc::format!("{}/BITSOS2/CONFIG.TXT", sys.mount);
-            let file = match sys.ns.read_file(&path, max) {
+            let file = match sys.ns.read_secret_file(&path, max) {
                 Ok(t) => FileNow::Text(t),
                 Err(uapi::errno::ENOENT) => FileNow::Missing,
                 Err(e) => FileNow::Failed(e),
@@ -248,6 +293,7 @@ pub fn plan(capacity: usize, wait_for_reader: bool, target: Option<Generation>) 
     };
     let now = read_stick(if target.is_some() { None } else { running.map(|g| g.number) }, capacity, wait_for_reader);
     let (config, outcome) = choose_config(&boot_copy, now.file);
+    let config = config.or_else(|| crate::secret::refill(&boot_copy, &crate::boot::live_secret));
     let generation = if target.is_some() { target } else { refreshed_generation(running, now.ok) };
     Plan { config, outcome, generation, switched: target.is_some(), boot_bytes: boot_copy.len() }
 }
@@ -267,46 +313,66 @@ pub struct Rebuilt {
 
 /// The staged BootInfo with the plan's CONFIG and GENERATION; a CONFIG too large for the KEEP block (or any
 /// other build error) is dropped and the generation tried alone, so the confirmed generation is not lost with it.
+/// RB-18: the staged record is blanked, so the retry writes the running kernel's token back into it.
 pub fn rebuild(staged: &[u8], capacity: usize, p: &Plan) -> Rebuilt {
+    rebuild_with(staged, capacity, p, &crate::boot::live_secret)
+}
+
+/// [`rebuild`] with `live` for what the running kernel holds in clear (pure; host-tested).
+pub fn rebuild_with(staged: &[u8], capacity: usize, p: &Plan, live: &dyn Fn(&str) -> Option<String>) -> Rebuilt {
     let none = |error| Rebuilt { bytes: None, config: false, generation: false, error };
     if p.config.is_none() && p.generation.is_none() {
         return none(None);
     }
-    match handover::refresh(staged, capacity, p.config.as_deref(), p.generation) {
-        Ok(b) => Rebuilt { bytes: Some(b), config: p.config.is_some(), generation: p.generation.is_some(), error: None },
-        Err(e) if p.config.is_some() && p.generation.is_some() => match handover::refresh(staged, capacity, None, p.generation) {
-            Ok(b) => Rebuilt { bytes: Some(b), config: false, generation: true, error: Some(e) },
-            Err(_) => none(Some(e)),
-        },
-        Err(e) => none(Some(e)),
+    let e = match handover::refresh(staged, capacity, p.config.as_deref(), p.generation) {
+        Ok(b) => return Rebuilt { bytes: Some(b), config: p.config.is_some(), generation: p.generation.is_some(), error: None },
+        Err(e) => e,
+    };
+    if p.config.is_none() {
+        return none(Some(e));
+    }
+    let mut own = bootinfo::BootInfo::parse(staged).ok().and_then(|b| b.config()).and_then(|c| crate::secret::refill(c, live));
+    if own.is_none() && p.generation.is_none() {
+        return none(Some(e));
+    }
+    let retry = handover::refresh(staged, capacity, own.as_deref(), p.generation);
+    if let Some(o) = own.as_mut() {
+        o.zeroize();
+    }
+    match retry {
+        Ok(b) => Rebuilt { bytes: Some(b), config: false, generation: p.generation.is_some(), error: Some(e) },
+        Err(_) => none(Some(e)),
     }
 }
 
 /// The plan's one-line description (reload's dry run; values never, only sizes and key names).
 pub fn describe(p: &Plan, r: &Rebuilt, capacity: usize) -> String {
     let cfg = match (&p.config, &p.outcome) {
-        (Some(c), _) if !r.config => alloc::format!(
-            "CONFIG: the boot copy ({} bytes): the stick's CONFIG.TXT ({} bytes) does not fit the KEEP block ({} bytes)",
+        (Some(c), o) if !r.config => alloc::format!(
+            "CONFIG: the boot copy ({} bytes): {} ({} bytes) does not fit the KEEP block ({} bytes)",
             p.boot_bytes,
+            if matches!(o, Outcome::Unchanged | Outcome::Fresh | Outcome::KeptKeys(_)) { "the stick's CONFIG.TXT" } else { "the boot copy with the running kernel's token" },
             c.len(),
             capacity
         ),
+        // RB-18: a config beside these outcomes is the file again (Unchanged) or the boot copy with the running
+        // kernel's token (the others); neither is news for this line.
+        (_, Outcome::Unchanged) => alloc::format!("CONFIG: unchanged since boot ({} bytes)", p.boot_bytes),
         (Some(c), Outcome::KeptKeys(k)) => alloc::format!(
             "CONFIG: the stick's CONFIG.TXT ({} bytes, boot copy {}), with {} as at boot",
             c.len(),
             p.boot_bytes,
             k.join(",")
         ),
-        (Some(c), _) => alloc::format!("CONFIG: the stick's CONFIG.TXT ({} bytes, boot copy {})", c.len(), p.boot_bytes),
-        (None, Outcome::Unchanged) => alloc::format!("CONFIG: unchanged since boot ({} bytes)", p.boot_bytes),
-        (None, Outcome::Failed(e)) => {
+        (Some(c), Outcome::Fresh) => alloc::format!("CONFIG: the stick's CONFIG.TXT ({} bytes, boot copy {})", c.len(), p.boot_bytes),
+        (_, Outcome::Failed(e)) => {
             alloc::format!("CONFIG: the boot copy ({} bytes): the stick's file could not be read ({})", p.boot_bytes, crate::install::errno_name(*e))
         }
-        (None, Outcome::Busy) => alloc::format!(
+        (_, Outcome::Busy) => alloc::format!(
             "CONFIG: not read now, an earlier read of the stick is still running (the jump waits for it and reads then; boot copy {} bytes)",
             p.boot_bytes
         ),
-        (None, o) => alloc::format!("CONFIG: the boot copy ({} bytes, {})", p.boot_bytes, o.name()),
+        (_, o) => alloc::format!("CONFIG: the boot copy ({} bytes, {})", p.boot_bytes, o.name()),
     };
     match (p.generation, r.generation) {
         (Some(g), true) if p.switched => alloc::format!(
@@ -321,11 +387,59 @@ pub fn describe(p: &Plan, r: &Rebuilt, capacity: usize) -> String {
     }
 }
 
+/// What the jump would do if it came now: its line, why, and the secrets the new kernel would start without.
+struct Forecast {
+    line: String,
+    outcome: Outcome,
+    lost: Vec<&'static str>,
+}
+
+fn forecast(st: &Staged, wait_for_reader: bool) -> Forecast {
+    let cap = st.summary.bootinfo_capacity;
+    let p = plan(cap, wait_for_reader, st.generation);
+    let mut r = rebuild(st.bootinfo_bytes(), cap, &p);
+    let line = describe(&p, &r, cap);
+    let lost = secrets_missing(r.bytes.as_deref().unwrap_or(st.bootinfo_bytes()));
+    if let Some(b) = r.bytes.as_mut() {
+        b.zeroize();
+    }
+    Forecast { line, outcome: p.outcome.clone(), lost }
+}
+
 /// The dry run's line: what the jump would hand on from the stick now (no wait for an earlier read).
 pub fn dry_run(st: &Staged) -> String {
-    let cap = st.summary.bootinfo_capacity;
-    let p = plan(cap, false, st.generation);
-    describe(&p, &rebuild(st.bootinfo_bytes(), cap, &p), cap)
+    let Forecast { mut line, outcome, lost } = forecast(st, false);
+    // Busy: the jump waits for that read and reads the stick then.
+    if !lost.is_empty() && outcome != Outcome::Busy {
+        line.push_str(&alloc::format!("; the new kernel would have no value for {}", lost.join(",")));
+        if crate::secret::loss_blocks_reload(&lost, pci::registry::opted_in("wlan")) {
+            line.push_str(" (a real Reload refuses this without force)");
+        }
+    }
+    line
+}
+
+/// RB-18, before a Reload over MCP answers: `Err` with the reason when the new kernel would come up without a secret
+/// the machine's network needs (a stick that is slow right now, a file too large). It would be off the network with
+/// nobody at it, and this kernel can still say no and go on. The read at the jump can still lose one (logged).
+pub fn refuse_secret_loss(st: &Staged) -> Result<(), String> {
+    let Forecast { outcome, lost, .. } = forecast(st, true);
+    if !crate::secret::loss_blocks_reload(&lost, pci::registry::opted_in("wlan")) {
+        return Ok(());
+    }
+    let keys = lost.join(",");
+    klog::event!(Warn, "kexec", "reload.refused", reason = "secret_missing", keys = keys.as_str(), source = outcome.name());
+    Err(alloc::format!(
+        "the new kernel would have no value for {keys} ({}): this machine could drop off the network. Try again when the stick answers, or pass force:true with the cable in",
+        outcome.name()
+    ))
+}
+
+/// RB-18: the secrets the running kernel's boot copy names and the BootInfo `handed` gives no value.
+fn secrets_missing(handed: &[u8]) -> Vec<&'static str> {
+    let Some((bi, _)) = crate::boot::boot_info() else { return Vec::new() };
+    let handed = bootinfo::BootInfo::parse(handed).ok().and_then(|b| b.config()).unwrap_or(b"");
+    crate::secret::missing(bi.config().unwrap_or(b""), handed)
 }
 
 /// What [`apply_plan`] did to the staged BootInfo.
@@ -354,7 +468,7 @@ pub fn apply_plan(st: &mut Staged, p: &Plan, check: &dyn Fn(&Staged) -> Result<(
     };
     let old = st.replace_bootinfo(new);
     if let Err(e) = check(st) {
-        st.replace_bootinfo(old);
+        st.replace_bootinfo(old).zeroize();
         klog::event!(Warn, "kexec", "reload.config_kept", reload = counter, error = e.as_str();
             "the refreshed BootInfo failed the jump's checks: the new kernel gets the staged one");
         return Applied::Kept;
@@ -401,5 +515,11 @@ pub fn apply(st: &mut Staged) -> Applied {
             reader = if p.outcome == Outcome::Slow { "this_read" } else { "earlier_read" };
             "a stick read is still running at the jump: the Reload goes on, the quiesce stops the stick's controller");
     }
-    apply_plan(st, &p, &|s| s.check().map_err(|e| alloc::format!("{e:?}")))
+    let applied = apply_plan(st, &p, &|s| s.check().map_err(|e| alloc::format!("{e:?}")));
+    let lost = secrets_missing(st.bootinfo_bytes());
+    if !lost.is_empty() {
+        klog::event!(Warn, "kexec", "reload.secret_missing", reload = counter, keys = lost.join(",").as_str(), source = p.outcome.name();
+            "the new kernel starts without these values; the next Reload that reads the stick or a firmware start brings them back");
+    }
+    applied
 }

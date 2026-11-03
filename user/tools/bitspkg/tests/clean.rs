@@ -69,7 +69,8 @@ fn settingsd_down_before_the_removal_refuses_it() {
     let d = tmp("clean-down");
     let st = Store::new(&d.join("root"));
     let mut st = st;
-    st.hooks = Hooks::standard(Some(d.join("nobody.sock")));
+    let run = sock_dir();
+    st.hooks = Hooks::standard(Some(run.join("nobody.sock")));
     let p = package(&d, "1.0");
     let r = install::install(&st, &p).unwrap();
     assert_eq!(r.hooks_failed, 1, "the settings registration fails and is counted");
@@ -85,7 +86,8 @@ fn a_hook_failing_after_the_commit_is_finished_later() {
     let _one = one();
     let d = tmp("clean-pending");
     let root = d.join("root");
-    let (sd, sock) = (d.join("settings"), d.join("run/s.sock"));
+    let run = sock_dir();
+    let (sd, sock) = (d.join("settings"), run.join("s.sock"));
     start_settingsd(&sd, &sock).unwrap();
     let down = Arc::new(AtomicBool::new(false));
     let table = Arc::new(Mutex::new(BTreeMap::new()));
@@ -129,7 +131,8 @@ fn a_hook_failing_after_the_commit_is_finished_later() {
 fn keep_data_keeps_the_values_for_a_reinstall() {
     let _one = one();
     let d = tmp("clean-keep");
-    let (sd, sock) = (d.join("settings"), d.join("run/s.sock"));
+    let run = sock_dir();
+    let (sd, sock) = (d.join("settings"), run.join("s.sock"));
     start_settingsd(&sd, &sock).unwrap();
     let mut st = Store::new(&d.join("root"));
     st.hooks = Hooks::standard(Some(sock.clone()));
@@ -168,12 +171,13 @@ fn cuts_during_install_and_removal_leave_no_settings_behind() {
     let work = d.join("pkgs");
     std::fs::create_dir_all(&work).unwrap();
     let (p1, p2) = (package(&work, "1.0"), package(&work, "2.0"));
+    let run = sock_dir();
     let (p1, p2) = (p1.to_str().unwrap().to_string(), p2.to_str().unwrap().to_string());
     for (what, n_max) in [("remove", 200u64), ("install", 200)] {
         let mut n = 1;
         loop {
             let at = d.join(format!("{what}-{n}"));
-            let (root, sock) = (at.join("root"), d.join(format!("run/{what}-{n}.sock")));
+            let (root, sock) = (at.join("root"), run.join(&format!("{what}-{n}.sock")));
             start_settingsd(&at.join("settings"), &sock).unwrap();
             let s = Settings { socket: sock.clone() };
             let seed = Json::obj().with("op", "set").with("key", "theme.accent").with("value", "#123456").with("source", "test");
@@ -240,7 +244,8 @@ fn value(s: &Settings, key: &str) -> Option<String> {
 fn switch_and_rollback_follow_the_current_version_keys() {
     let _one = one();
     let d = tmp("clean-switch");
-    let (sd, sock) = (d.join("settings"), d.join("run/s.sock"));
+    let run = sock_dir();
+    let (sd, sock) = (d.join("settings"), run.join("s.sock"));
     start_settingsd(&sd, &sock).unwrap();
     let mut st = Store::new(&d.join("root"));
     st.hooks = Hooks::standard(Some(sock.clone()));
@@ -264,7 +269,7 @@ fn switch_and_rollback_follow_the_current_version_keys() {
     assert!(!st.version_dir("demo", "1.0").exists());
     let k = settings_keys(&s);
     assert!(k.contains("app.demo.third") && !k.contains("app.demo.start") && !k.contains("app.demo.homepage"), "after 3.0: {k}");
-    let sock2 = d.join("run/s2.sock");
+    let sock2 = run.join("s2.sock");
     start_settingsd(&sd, &sock2).unwrap();
     st.hooks = Hooks::standard(Some(sock2.clone()));
     let s2 = Settings { socket: sock2 };
@@ -280,7 +285,8 @@ fn switch_and_rollback_follow_the_current_version_keys() {
 fn recover_with_settingsd_hanging_is_bounded() {
     let _one = one();
     let d = tmp("clean-hang");
-    let (sd, sock) = (d.join("settings"), d.join("run/s.sock"));
+    let run = sock_dir();
+    let (sd, sock) = (d.join("settings"), run.join("s.sock"));
     start_settingsd(&sd, &sock).unwrap();
     let mut st = Store::new(&d.join("root"));
     st.hooks = Hooks::standard(Some(sock.clone()));
@@ -292,7 +298,7 @@ fn recover_with_settingsd_hanging_is_bounded() {
     bitspkg::build::build(&t, None, Some(&d.join("pkg-b"))).unwrap();
     install::install(&st, &d.join("pkg-b")).unwrap();
     // A socket that accepts and never answers.
-    let hang = d.join("run/hang.sock");
+    let hang = run.join("hang.sock");
     let l = std::os::unix::net::UnixListener::bind(&hang).unwrap();
     std::thread::spawn(move || {
         let mut keep = Vec::new();
@@ -312,7 +318,7 @@ fn recover_with_settingsd_hanging_is_bounded() {
     assert!(remove::remove(&st, "demo", false).is_err());
     assert!(remove::remove(&st, "demob", false).is_err());
     assert!(st.pending_removal("demo").unwrap() && st.pending_removal("demob").unwrap());
-    let hang = d.join("run/hang.sock");
+    let hang = run.join("hang.sock");
     st.hooks = Hooks::standard(Some(hang));
     let t0 = std::time::Instant::now();
     assert!(install::register(&st, None).is_ok(), "recover does not fail the command");
@@ -328,5 +334,13 @@ fn recover_with_settingsd_hanging_is_bounded() {
 fn a_socket_path_too_long_for_sun_path_is_named() {
     let s = Settings { socket: std::path::PathBuf::from(format!("/tmp/{}/s.sock", "x".repeat(120))) };
     let e = s.request(&Json::obj().with("op", "status")).unwrap_err();
+    assert!(e.contains("longer than a Unix socket address holds"), "{e}");
+}
+
+#[test]
+fn a_settingsd_socket_too_long_for_sun_path_is_named_at_the_start() {
+    let d = tmp("clean-long");
+    let sock = std::path::PathBuf::from(format!("/tmp/{}/s.sock", "x".repeat(120)));
+    let e = start_settingsd(&d.join("settings"), &sock).unwrap_err();
     assert!(e.contains("longer than a Unix socket address holds"), "{e}");
 }

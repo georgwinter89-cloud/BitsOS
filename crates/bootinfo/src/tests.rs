@@ -55,6 +55,9 @@ fn round_trip_all_records() {
     let bi = BootInfo::parse(&buf).unwrap();
     assert_eq!(bi.total_size(), len);
     assert_eq!(bi.config().unwrap(), b"token=abc\nscreen=2560x1440\n");
+    // RB-18: the offset names the record's text in the raw bytes.
+    let off = bi.config_offset().unwrap();
+    assert_eq!(&buf[off..off + 9], b"token=abc");
     let fb = bi.framebuffer().unwrap();
     assert_eq!((fb.width, fb.height, fb.stride, fb.format), (2560, 1440, 2560, PixelFormat::Bgrx));
     let ml = bi.mode_list().unwrap();

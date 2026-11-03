@@ -1,7 +1,8 @@
 //! Protocol handlers. Window management decisions live in `wm.rs`; these only translate protocol events.
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords};
+use smithay::desktop::{PopupKind, find_popup_root_surface, get_popup_toplevel_coords};
+use crate::win::Window;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecoMode;
@@ -15,7 +16,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, set_data_device_focus,
 };
@@ -45,6 +46,8 @@ impl CompositorHandler for App {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // WY-16: the buffers this commit replaces go back after the frame, not now (`release`).
+        self.dma.hold.keep_tree(surface);
         on_commit_buffer_handler::<Self>(surface);
         self.needs_frame = true;
         self.stats.commits += 1;
@@ -60,9 +63,7 @@ impl CompositorHandler for App {
                     if let Ok(pid) = u32::try_from(self.pid_of(&window)) {
                         self.foot_drawn(pid);
                         // WY-7: its start (or its launcher's: the same process group) is answered now.
-                        // SAFETY: getpgid only reads the pid; an ended or foreign pid answers -1 (ESRCH).
-                        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-                        let group = u32::try_from(pgid).unwrap_or(pid);
+                        let group = Self::group_of(pid);
                         if self.launches.mapped(pid) | self.launches.mapped(group) {
                             self.needs_frame = true;
                         }
@@ -74,8 +75,9 @@ impl CompositorHandler for App {
                         self.recent_add(&a);
                     }
                 }
-                let toplevel = window.toplevel().unwrap();
-                if !toplevel.is_initial_configure_sent() {
+                if let Some(toplevel) = window.toplevel()
+                    && !toplevel.is_initial_configure_sent()
+                {
                     // The size and server-side frame were set as pending state when the window was placed.
                     toplevel.send_configure();
                 }
@@ -132,7 +134,12 @@ impl App {
 }
 
 impl BufferHandler for App {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+    fn buffer_destroyed(&mut self, buffer: &wl_buffer::WlBuffer) {
+        // WY-16: the renderer's mapping or EGL image of a destroyed dma-buf goes at the next turn.
+        if smithay::wayland::dmabuf::get_dmabuf(buffer).is_ok() {
+            self.dma.cleanup_due = true;
+        }
+    }
 }
 
 impl ShmHandler for App {
@@ -194,6 +201,14 @@ impl XdgShellHandler for App {
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
         let sent = self.client_max(&surface, false);
         answer(self, &surface, sent);
+    }
+
+    /// WY-12: the client's own minimise button (Brave's). xdg-shell has no state to answer with: the window is
+    /// hidden (or the request ignored, see `minimize`), the client hears only that it lost `activated`.
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(w) = self.find_window(surface.wl_surface()) {
+            self.minimize(&w, "its own request");
+        }
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
@@ -291,6 +306,15 @@ impl smithay::wayland::tablet_manager::TabletSeatHandler for App {}
 
 impl SelectionHandler for App {
     type SelectionUserData = ();
+
+    // WY-3: the clipboard between X11 and Wayland (`xsel`).
+    fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _seat: Seat<Self>) {
+        crate::xwayland::new_selection(self, ty, source);
+    }
+
+    fn send_selection(&mut self, ty: SelectionTarget, mime: String, fd: std::os::fd::OwnedFd, _seat: Seat<Self>, _ud: &()) {
+        crate::xwayland::send_selection(self, ty, mime, fd);
+    }
 }
 
 impl DataDeviceHandler for App {
@@ -329,6 +353,10 @@ impl App {
     /// a wish of the user's: the window takes its place in the tiles as any other.
     fn client_max(&mut self, surface: &ToplevelSurface, max: bool) -> bool {
         let Some(w) = self.find_window(surface.wl_surface()) else { return false };
+        if self.ws.is_minimized(&w) {
+            eprintln!("bitscomp: window {} asks to be maximised while minimised: refused", crate::ctl::win_id(&w));
+            return false;
+        }
         if !surface.is_initial_configure_sent() || self.ws.find(&w).is_none() || self.ws.is_max(&w) == max {
             return false;
         }
@@ -350,6 +378,11 @@ impl App {
     fn client_fullscreen(&mut self, surface: &ToplevelSurface, on: bool) -> bool {
         let Some(w) = self.find_window(surface.wl_surface()) else { return false };
         let id = crate::ctl::win_id(&w);
+        if on && (self.ws.is_minimized(&w) || self.desk.parked.iter().any(|ws| ws.is_minimized(&w))) {
+            // Hidden: it is told its state as it is (not fullscreen, not activated) and stays minimised.
+            eprintln!("bitscomp: window {id} asks for fullscreen while minimised: refused");
+            return false;
+        }
         if on && self.is_hung(&w) {
             // Not answering pings but asking for the screen: refused, and no configure (B4).
             eprintln!("bitscomp: window {id} asks for fullscreen while it does not answer: refused");
@@ -387,8 +420,7 @@ impl App {
     /// Lays out at once and says whether `w` got its configure from that.
     fn configured_by_layout(&mut self, w: &Window) -> bool {
         self.apply_layout();
-        let t = w.toplevel().unwrap();
-        t.is_initial_configure_sent() && !self.is_hung(w)
+        w.toplevel().is_none_or(|t| t.is_initial_configure_sent()) && !self.is_hung(w)
     }
 
     /// `maximised` (WY-5c): the xdg `maximized` state of a maximised float, so the client shows its own restore

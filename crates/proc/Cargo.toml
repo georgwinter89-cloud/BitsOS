@@ -20,3 +20,7 @@ mcp = { path = "../mcp" }
 net = { path = "../net" }
 time = { path = "../time" }
 ktest = { path = "../ktest" }
+seccomp = { path = "../seccomp" }
+
+[lints]
+workspace = true

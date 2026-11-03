@@ -186,6 +186,8 @@ pub struct Storage<L: Link> {
     io: Mutex<Io<L>>,
     gate: Gate,
     gone: AtomicBool,
+    /// RB-14: the storage stop before a reset ended this device's I/O (`stop_io`); `resume_io` undoes it.
+    stopped: AtomicBool,
     /// Bytes per READ/WRITE command (speed and quirks).
     pub max_bytes: usize,
     /// R8: CONFIG `usb_msd_write=on` when the device was attached.
@@ -211,6 +213,7 @@ impl<L: Link> Storage<L> {
             io: Mutex::named("usb.msd.io", Io { bot, buf: None, sense: None, epoch: 0 }),
             gate: Gate::new(),
             gone: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             max_bytes: max_bytes.max(512),
             writes_allowed,
             speed: "?",
@@ -238,16 +241,41 @@ impl<L: Link> Storage<L> {
 
     /// Runs `f` with the device to itself (gate at `prio`, then the I/O state).
     pub fn with_io<R>(&self, prio: IoPriority, f: impl FnOnce(&mut Io<L>) -> R) -> Result<R, DevError> {
-        if self.is_gone() {
+        if self.is_gone() || self.is_stopped() {
             return Err(DevError::Gone);
         }
         let _g = self.gate.acquire(prio, GATE_TIMEOUT_NS)?;
+        // RB-14: a stop that came while this caller waited for the gate wins: no command after it.
+        if self.is_stopped() {
+            return Err(DevError::Gone);
+        }
         let mut io = self.io.lock_timeout(GATE_TIMEOUT_NS).ok_or(DevError::Timeout)?;
         if self.is_gone() || io.bot.link.gone() {
             self.set_gone();
             return Err(DevError::Gone);
         }
         Ok(f(&mut io))
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// RB-14, the storage stop before a reset (`block::shutdown`, after every disk's cache flush): no command
+    /// starts from now on (`Gone`), and the one under way (if any) is waited for until `deadline_ns`, by taking
+    /// the gate it holds. True: the device was idle when this returned (nothing of it on the bus).
+    pub fn stop_io(&self, deadline_ns: u64, now: &dyn Fn() -> u64) -> bool {
+        self.stopped.store(true, Ordering::Release);
+        let left = deadline_ns.saturating_sub(now());
+        match self.gate.acquire(IoPriority::Interactive, left) {
+            Ok(_g) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Undoes `stop_io` (a Reload that did not jump, ktests).
+    pub fn resume_io(&self) {
+        self.stopped.store(false, Ordering::Release);
     }
 
     /// GET MAX LUN (Linux `usb_stor_Bulk_max_lun`, transport.c:1075): a stall, an empty answer or a value above

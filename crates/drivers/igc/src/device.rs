@@ -52,6 +52,11 @@ pub const RETRY_SOON_TIMES: u32 = 6;
 pub const RETRY_LATER_NS: u64 = 60_000_000_000;
 /// Quiesce lets the TX ring drain this long (the mirror's last lines, ≤ 70 ms measured in V1).
 pub const DRAIN_US: u64 = 100_000;
+/// Quiesce: how long the TX and RX queues may take to report off after the disable (RB-15).
+pub const QUEUE_WAIT_US: u64 = 10_000;
+/// Quiesce: Linux `igc_down`'s wait after the receive/transmit disables (`usleep_range(10000, 20000)`,
+/// linux-6.6/drivers/net/ethernet/intel/igc/igc_main.c:5087), here at least this long in all.
+pub const QUEUE_SETTLE_US: u64 = 10_000;
 /// How long an explicit `restart` waits for one the poller is running (a bring-up takes up to ~4 s).
 const RESTART_WAIT_NS: u64 = 10_000_000_000;
 /// After a data-path failure (`fail`) the poller restarts the card this much later.
@@ -71,6 +76,10 @@ klog::counter!(RESTARTS, "net.igc.restarts");
 klog::counter!(HW_MISSED, "net.igc.hw_missed");
 klog::counter!(HW_NO_BUFFER, "net.igc.hw_no_buffer");
 klog::counter!(HW_CRC_ERRORS, "net.igc.hw_crc_errors");
+klog::counter!(pub QUIESCE_DRAIN_TIMEOUTS, "net.igc.quiesce_drain_timeouts");
+klog::counter!(pub QUIESCE_QUEUE_TIMEOUTS, "net.igc.quiesce_queue_timeouts");
+klog::counter!(pub QUIESCE_GIO_TIMEOUTS, "net.igc.quiesce_gio_timeouts");
+klog::counter!(pub QUIESCE_AUTO_READ_TIMEOUTS, "net.igc.quiesce_auto_read_timeouts");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -183,8 +192,9 @@ pub struct Card<H: Hw> {
     retries: AtomicU32,
     restarting: AtomicBool,
     /// Quiesce does not log (it may run on the panic path); it leaves a note the next `poll`/`restart` logs.
-    /// Bit 7 = note present, low bits = the state before.
-    quiesce_note: AtomicU8,
+    /// `QuiesceReport::pack`: bit 31 = note present, low byte = the state before, bits 8.. = the waits that
+    /// timed out.
+    quiesce_note: AtomicU32,
     tx_late: AtomicU32,
     tdh_seen: AtomicU32,
     irq_mode: AtomicU8,
@@ -235,7 +245,7 @@ impl<H: Hw> Card<H> {
             next_restart: AtomicU64::new(0),
             retries: AtomicU32::new(0),
             restarting: AtomicBool::new(false),
-            quiesce_note: AtomicU8::new(0),
+            quiesce_note: AtomicU32::new(0),
             tx_late: AtomicU32::new(0),
             tdh_seen: AtomicU32::new(NO_TDH),
             irq_mode: AtomicU8::new(IRQ_POLLED),
@@ -331,7 +341,7 @@ impl<H: Hw> Card<H> {
     fn bring_up<W: Hw>(&self, hw: &W) -> Result<(), BringUpError> {
         let r = self.bring_up_steps(hw);
         if r.is_err() {
-            self.stop_hw(false);
+            self.stop_hw(false, reset::GIO_WAIT_SHORT_US);
         }
         r
     }
@@ -376,7 +386,7 @@ impl<H: Hw> Card<H> {
             klog::event!(Warn, "net", "igc.reset_fallback", ifname = ifname, attempt = self.retries.load(Ordering::Relaxed) + 1;
                 "CTRL.DEV_RST instead of CTRL.RST after failed restarts");
         }
-        let rr = reset::reset(hw, self.model, kind);
+        let rr = reset::reset(hw, self.model, kind, reset::GIO_WAIT_SHORT_US);
         if rr.gio_timeout || rr.auto_read_timeout {
             klog::event!(Debug, "net", "igc.reset_waits", ifname = ifname, gio_timeout = rr.gio_timeout,
                 auto_read_timeout = rr.auto_read_timeout; "went on after the deadline, as Linux does");
@@ -392,7 +402,10 @@ impl<H: Hw> Card<H> {
         }
         match pr.reset {
             Some(PhyReset::Blocked) => klog::event!(Info, "net", "igc.phy_reset_blocked", ifname = ifname; "MANC blocks PHY resets"),
-            Some(PhyReset::NoCompletion) => klog::event!(Warn, "net", "igc.phy_reset_timeout", ifname = ifname),
+            Some(PhyReset::Unconfirmed { phpm }) => klog::event!(Debug, "net", "igc.phy_reset_unconfirmed", ifname = ifname,
+                phpm = klog::Hex(phpm as u64); "PHPM showed no reset complete; the PHY answers with its ID"),
+            Some(PhyReset::NoCompletion { phpm }) => klog::event!(Warn, "net", "igc.phy_reset_timeout", ifname = ifname,
+                phpm = klog::Hex(phpm as u64); "no reset complete in PHPM and no PHY ID over MDIC"),
             _ => {}
         }
         if let Some(e) = pr.advertise_error {
@@ -428,7 +441,8 @@ impl<H: Hw> Card<H> {
         self.retries.store(0, Ordering::Relaxed);
         let (rxs, txs) = (self.rx.lock().count(), self.tx.lock().count());
         klog::event!(Info, "net", "igc.up", ifname = ifname, model = self.model.name(), mac = mac_str(mac), rx_ring = rxs,
-            tx_ring = txs, phy_reset = match pr.reset { Some(PhyReset::Done) => "done", Some(_) => "skipped", None => "n/a" },
+            tx_ring = txs, phy_reset = pr.reset.map_or("n/a", PhyReset::as_str),
+            phy_reset_us = match pr.reset { Some(PhyReset::Done { us }) => us, _ => 0 },
             irq = setup.name(), itr_us = self.itr >> 2);
         if setup == IrqSetup::Polled && self.want_irqs {
             klog::event!(Warn, "net", "igc.irq_polled", ifname = ifname; "no MSI-X or MSI: the card is polled (fallback)");
@@ -437,23 +451,56 @@ impl<H: Hw> Card<H> {
         Ok(())
     }
 
-    /// Stops the card's DMA and interrupts (`V1:igc.asm:129-142`, Quiesce in spec §2.2): receive off, optionally
-    /// the TX ring drained, transmit off, the reset, DRV_LOAD off, MSI off **before** bus master off. Lock-free,
-    /// spinning only, no klog: Quiesce runs it on the panic path.
-    fn stop_hw(&self, drain: bool) {
+    /// Stops the card's DMA and interrupts (`V1:igc.asm:129-142`, Quiesce in spec §2.2), in Linux's order
+    /// (`igc_down` + `__igc_shutdown`, linux-6.6/drivers/net/ethernet/intel/igc/igc_main.c:5057, 7028): receive
+    /// off, optionally the TX ring drained, transmit off, both queues disabled (TXDCTL with SWFLUSH,
+    /// `igc_disable_tx_ring_hw` :319) and waited for, at least Linux's 10 ms, interrupts masked, the reset (GIO
+    /// master disable and its wait for pending requests first, `igc_reset_hw_base`), the queues once more (as
+    /// `igc_down` after `igc_reset`), Wake-on-LAN off, DRV_LOAD off, MSI off **before** bus master off.
+    /// Lock-free, spinning only, no klog: Quiesce runs it on the panic path. Every wait that ran out is counted
+    /// and in the report.
+    fn stop_hw(&self, drain: bool, gio_us: u64) -> QuiesceReport {
         let hw = &self.hw;
-        hw.wr(regs::RCTL, 0);
+        let mut q = QuiesceReport::default();
+        hw.clear_bits(regs::RCTL, regs::RCTL_EN);
         if drain {
-            let _ = until(hw, DRAIN_US, 100, || {
+            q.drain_timeout = !until(hw, DRAIN_US, 100, || {
                 let (h, t) = (hw.rd(regs::TDH), hw.rd(regs::TDT));
                 h == t || h == !0
             });
         }
         hw.clear_bits(regs::TCTL, regs::TCTL_EN);
-        let _ = reset::reset(hw, self.model, ResetKind::Global);
+        disable_queues(hw);
+        hw.flush();
+        let t0 = hw.now_ns();
+        q.queue_timeout = !until(hw, QUEUE_WAIT_US, 100, || queues_off(hw));
+        let spent_us = hw.now_ns().saturating_sub(t0) / 1_000;
+        if spent_us < QUEUE_SETTLE_US {
+            hw.delay_us(QUEUE_SETTLE_US - spent_us);
+        }
+        // igc_irq_disable before the reset.
+        reset::quiet(hw, self.model);
+        let rr = reset::reset(hw, self.model, ResetKind::Global, gio_us);
+        q.gio_timeout = rr.gio_timeout;
+        q.auto_read_timeout = rr.auto_read_timeout;
+        // The 82576's RX queue comes enabled out of reset; Linux disables the TX queues after igc_reset too.
+        disable_queues(hw);
+        hw.wr(regs::WUC, 0);
+        hw.wr(regs::WUFC, 0);
         hw.clear_bits(regs::CTRL_EXT, regs::CTRL_EXT_DRV_LOAD);
         // PC-2 `disable_device`: MSI off before bus master off; lock-free and silent, as Quiesce needs.
         hw.pci_off();
+        for (hit, c) in [
+            (q.drain_timeout, &QUIESCE_DRAIN_TIMEOUTS),
+            (q.queue_timeout, &QUIESCE_QUEUE_TIMEOUTS),
+            (q.gio_timeout, &QUIESCE_GIO_TIMEOUTS),
+            (q.auto_read_timeout, &QUIESCE_AUTO_READ_TIMEOUTS),
+        ] {
+            if hit {
+                c.inc();
+            }
+        }
+        q
     }
 
     /// The reset bit for this attempt: RST, and on the I226 from `DEV_RST_AFTER` failed restarts on DEV_RST
@@ -499,10 +546,19 @@ impl<H: Hw> Card<H> {
     }
 
     fn log_quiesce_note(&self) {
-        let n = self.quiesce_note.swap(0, Ordering::AcqRel);
-        if n & 0x80 != 0 {
-            klog::event!(Info, "net", "igc.quiesce", ifname = self.name.as_str(), was = State::from(n & 0x3f).as_str());
+        let Some((was, q)) = QuiesceReport::unpack(self.quiesce_note.swap(0, Ordering::AcqRel)) else { return };
+        if q.any_timeout() {
+            klog::event!(Warn, "net", "igc.quiesce", ifname = self.name.as_str(), was = was.as_str(),
+                drain_timeout = q.drain_timeout, queue_timeout = q.queue_timeout, gio_timeout = q.gio_timeout,
+                auto_read_timeout = q.auto_read_timeout; "a wait of the stop ran out (went on as Linux does)");
+        } else {
+            klog::event!(Info, "net", "igc.quiesce", ifname = self.name.as_str(), was = was.as_str());
         }
+    }
+
+    /// The last quiesce's note without taking it (tests).
+    pub fn quiesce_report(&self) -> Option<(State, QuiesceReport)> {
+        QuiesceReport::unpack(self.quiesce_note.load(Ordering::Acquire))
     }
 
     /// Stops and starts the card again from any state (ktests, Reload's undo path), from a thread: its waits
@@ -739,7 +795,7 @@ impl<H: Hw> Card<H> {
             self.link_up.store(false, Ordering::Release);
             // A restart running already does the stop itself.
             if !self.restarting.swap(true, Ordering::AcqRel) {
-                self.stop_hw(false);
+                self.stop_hw(false, reset::GIO_WAIT_SHORT_US);
                 self.restarting.store(false, Ordering::Release);
             }
             // Retry after a second: a ring error is the driver's or a glitch; the card itself may be fine. Not
@@ -906,10 +962,37 @@ impl<H: Hw> Card<H> {
     /// Stop for Reload, reboot and panic: receive off, the TX ring drained (bounded), transmit off, the reset,
     /// DRV_LOAD off, MSI off before bus master off. Lock-free, no klog; the event is logged later from a note.
     pub fn quiesce(&self) {
+        self.quiesce_bounded(gio_wait_for(klog::shutdown::reached()));
+    }
+
+    /// `quiesce` with the GIO bound given (tests; `quiesce` picks it by the shutdown step).
+    pub fn quiesce_bounded(&self, gio_us: u64) {
+        // Carrier off first (Linux netif_carrier_off): transmit and poll_tx refuse from here on.
         let was = State::from(self.state.swap(State::Quiesced as u8, Ordering::AcqRel));
         let link = self.link_up.swap(false, Ordering::AcqRel);
-        self.stop_hw(was == State::Running && link);
-        self.quiesce_note.store(0x80 | was as u8, Ordering::Release);
+        let q = self.stop_hw(was == State::Running && link, gio_us);
+        self.quiesce_note.store(q.pack(was), Ordering::Release);
+    }
+
+    /// RB-15 (`klog::shutdown::TxDone`): everything handed to the card is sent: TDH == TDT and every descriptor
+    /// written back (DD). None when the card is not running or reads all ones. Lock-free (a held TX lock:
+    /// TDH == TDT alone), no klog: the mirror asks it inside the quiesce.
+    pub fn tx_done(&self) -> Option<bool> {
+        if self.state() != State::Running {
+            return None;
+        }
+        let (h, t) = (self.hw.rd(regs::TDH), self.hw.rd(regs::TDT));
+        if h == !0 || t == !0 {
+            return None;
+        }
+        if h != t {
+            return Some(false);
+        }
+        // TDH == TDT says every descriptor was fetched, not that its write-back is done: with the TX lock held
+        // elsewhere the DD bits cannot be read, so "cannot say" (the mirror then settles by time).
+        let mut tx = self.tx.try_lock()?;
+        let _ = tx.reclaim(self.hw.now_ns());
+        Some(tx.in_flight() == 0)
     }
 
     /// Test hook: fail the card as a broken ring would.
@@ -921,4 +1004,54 @@ impl<H: Hw> Card<H> {
         let _g = self.tx.lock();
         f()
     }
+}
+
+/// The GIO bound of a quiesce: Linux's `reset::GIO_WAIT_US` when the platform reset follows (a reboot or
+/// power-off reached its quiesce step, `klog::shutdown`), the short one for a Reload or a panic (a spin with
+/// interrupts off, B4; RB-15 fixer).
+pub fn gio_wait_for(reached: klog::shutdown::Step) -> u64 {
+    if reached >= klog::shutdown::Step::Quiesce { reset::GIO_WAIT_US } else { reset::GIO_WAIT_SHORT_US }
+}
+
+/// What a quiesce's waits saw (B6 without logging in Quiesce: counters at once, the note for later).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuiesceReport {
+    /// The TX ring did not drain within `DRAIN_US`.
+    pub drain_timeout: bool,
+    /// A queue did not report off within `QUEUE_WAIT_US`.
+    pub queue_timeout: bool,
+    /// STATUS.GIO_MASTER_ENABLE still set after the GIO bound (master requests pending at the reset).
+    pub gio_timeout: bool,
+    /// The NVM auto-read after the reset not reported (QEMU never reports it).
+    pub auto_read_timeout: bool,
+}
+
+impl QuiesceReport {
+    pub fn any_timeout(&self) -> bool {
+        self.drain_timeout || self.queue_timeout || self.gio_timeout
+    }
+    fn pack(&self, was: State) -> u32 {
+        let flags = [self.drain_timeout, self.queue_timeout, self.gio_timeout, self.auto_read_timeout];
+        let bits = flags.iter().enumerate().fold(0u32, |a, (i, &f)| a | (f as u32) << (8 + i));
+        1 << 31 | bits | was as u32
+    }
+    fn unpack(v: u32) -> Option<(State, QuiesceReport)> {
+        if v & 1 << 31 == 0 {
+            return None;
+        }
+        let f = |i: u32| v >> (8 + i) & 1 == 1;
+        Some((State::from((v & 0x3f) as u8), QuiesceReport { drain_timeout: f(0), queue_timeout: f(1), gio_timeout: f(2), auto_read_timeout: f(3) }))
+    }
+}
+
+/// Both queues off: QUEUE_ENABLE cleared, SWFLUSH set on TX (Linux `igc_disable_tx_ring_hw`), RX likewise.
+fn disable_queues<H: Hw>(hw: &H) {
+    hw.wr(regs::TXDCTL, (hw.rd(regs::TXDCTL) & !regs::QUEUE_ENABLE) | regs::QUEUE_SWFLUSH);
+    hw.clear_bits(regs::RXDCTL, regs::QUEUE_ENABLE);
+}
+
+/// Both queues report off (a card reading all ones counts as off: nothing to wait for).
+fn queues_off<H: Hw>(hw: &H) -> bool {
+    let (t, r) = (hw.rd(regs::TXDCTL), hw.rd(regs::RXDCTL));
+    (t == !0 && r == !0) || (t | r) & regs::QUEUE_ENABLE == 0
 }

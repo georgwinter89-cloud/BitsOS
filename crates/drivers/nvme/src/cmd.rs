@@ -12,10 +12,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AdminOp {
-    DeleteSq = 0x00,
     CreateSq = 0x01,
     GetLogPage = 0x02,
-    DeleteCq = 0x04,
     CreateCq = 0x05,
     Identify = 0x06,
     SetFeatures = 0x09,
@@ -30,8 +28,8 @@ pub enum IoOp {
     Read = 0x02,
 }
 
-pub const ADMIN_OPS: [AdminOp; 8] =
-    [AdminOp::DeleteSq, AdminOp::CreateSq, AdminOp::GetLogPage, AdminOp::DeleteCq, AdminOp::CreateCq, AdminOp::Identify, AdminOp::SetFeatures, AdminOp::GetFeatures];
+pub const ADMIN_OPS: [AdminOp; 6] =
+    [AdminOp::CreateSq, AdminOp::GetLogPage, AdminOp::CreateCq, AdminOp::Identify, AdminOp::SetFeatures, AdminOp::GetFeatures];
 pub const IO_OPS: [IoOp; 2] = [IoOp::Flush, IoOp::Read];
 
 /// I/O opcodes that change media (NVM command set): Write, Write Uncorrectable, Write Zeroes, Dataset
@@ -140,12 +138,6 @@ impl AdminCmd {
         let cdw10 = qid as u32 | ((depth as u32 - 1) << 16);
         let cdw11 = 1 | (2 << 1) | (cqid as u32) << 16;
         admin(AdminOp::CreateSq, 0, prp1, [cdw10, cdw11, 0, 0, 0, 0])
-    }
-    pub fn delete_sq(qid: u16) -> AdminCmd {
-        admin(AdminOp::DeleteSq, 0, 0, [qid as u32, 0, 0, 0, 0, 0])
-    }
-    pub fn delete_cq(qid: u16) -> AdminCmd {
-        admin(AdminOp::DeleteCq, 0, 0, [qid as u32, 0, 0, 0, 0, 0])
     }
 }
 

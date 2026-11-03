@@ -75,7 +75,7 @@ fn the_stick_rule() {
     for p in ["/boot/BITSOS2/home/a", "/boot/BITSOS2", "/boot/BITSOS2/homes", "/boot/BITSOS2/cobalt/home", "/tmp/home"] {
         assert!(!is_stick_home(p), "{p}");
     }
-    for (dir, name) in [("/boot/BITSOS2", "cobalt"), ("/boot/BITSOS2", ".push-cobalt"), ("/boot/bitsos2/cobalt/lib", "x.so"), ("/boot/BITSOS2/home/georg", "a")] {
+    for (dir, name) in [("/boot/BITSOS2", "cobalt"), ("/boot/BITSOS2", ".push-cobalt"), ("/boot/bitsos2/cobalt/lib", "x.so"), ("/boot/BITSOS2/home/user", "a")] {
         assert!(stick_refusal(dir, name.as_bytes()).is_none(), "{dir} {name}");
     }
     for (dir, name) in [
@@ -280,4 +280,18 @@ fn fetch_refuses_before_it_makes_directories() {
     assert!(!exists("/t7/new"), "a refused fetch left directories behind");
     let j = call("fetch", r#"{"url":"http://8.8.8.8/x","path":"/t7/new/f","parents":true}"#);
     assert!(failed(&j) && !exists("/t7/new"), "{}", j.to_string());
+}
+
+/// MC-10: the installer's grants are out of every file tool's reach, the place itself and all below it.
+#[test]
+fn the_access_store_is_never_reached() {
+    for p in ["/data/bitsos-access", "/data/bitsos-access/grants", "/data/bitsos-access/x/y"] {
+        assert!(super::access_store_refusal(p).is_some_and(|w| w.contains("full-access grants")), "{p}");
+    }
+    for p in ["/boot/BITSOS2/mcp/confirmed", "/boot/bitsos2/MCP/Confirmed", "/boot/BITSOS2/mcp/confirmed.new", "/boot/BITSOS2/mcp/access-revoked"] {
+        assert!(super::access_store_refusal(p).is_some(), "{p}");
+    }
+    for p in ["/data/bitsos", "/data/bitsos-accessories", "/data", "/tmp/data/bitsos-access", "/", "/boot/BITSOS2/mcp/confirmedx", "/boot/BITSOS2/mcp"] {
+        assert!(super::access_store_refusal(p).is_none(), "{p}");
+    }
 }

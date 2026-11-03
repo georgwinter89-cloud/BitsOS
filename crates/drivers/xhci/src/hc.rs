@@ -29,6 +29,9 @@ pub const HALT_NS: u64 = 20 * MS;
 pub const RESET_NS: u64 = 1000 * MS;
 /// After writing HCRST nothing is read for 1 ms (Linux `xhci_reset`: some Intel controllers hang otherwise).
 pub const HCRST_QUIET_NS: u64 = MS;
+/// RB-13: the panic path's bound for HCRST and CNR (Linux `xhci_shutdown`'s XHCI_RESET_SHORT_USEC,
+/// linux-6.6/drivers/usb/host/xhci.h:233).
+pub const PANIC_RESET_NS: u64 = 250 * MS;
 pub const BIOS_NS: u64 = 1000 * MS;
 /// A command waits at most this long, then the command ring is aborted (V1 `XH_CMD_MS`).
 pub const CMD_NS: u64 = 1000 * MS;
@@ -229,6 +232,68 @@ pub(crate) type SlotTable<M> = Vec<Option<Arc<SlotEntry<M>>>>;
 pub(crate) enum Wait {
     Timeout,
     Gone,
+}
+
+/// What `Controller::panic_stop` did (RB-13; the crash record names it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanicStop {
+    /// The registers read all ones: nothing more was written.
+    pub gone: bool,
+    /// HCH within `HALT_NS`.
+    pub halted: bool,
+    /// HCRST written (only on a halted controller).
+    pub reset: bool,
+    /// HCRST and CNR clear within `PANIC_RESET_NS`.
+    pub ready: bool,
+    /// From the first register access to bus master off.
+    pub ns: u64,
+}
+
+/// RB-13 fixer: the controllers as the panic path walks them, without the `CONTROLLERS` lock (an idle CPU
+/// stopped by the panic's NMI inside `poll_all`, or a panic inside `controllers()`'s clone, holds that lock for
+/// good). A chain of nodes, each set once and leaked: lock-free to add and to walk, no limit on the count (R1),
+/// never shrinks (a controller is never removed; a gone one reads all ones and is skipped).
+pub struct PanicList<T: 'static> {
+    head: ksync::OnceRef<PanicNode<T>>,
+}
+
+struct PanicNode<T: 'static> {
+    item: T,
+    next: ksync::OnceRef<PanicNode<T>>,
+}
+
+impl<T: Sync + 'static> PanicList<T> {
+    pub const fn new() -> Self {
+        PanicList { head: ksync::OnceRef::new() }
+    }
+
+    /// Appends `item` at the end (probe order). Lock-free: the first `set` on the last link wins, a loser
+    /// follows the winner's node; a link being set right now is waited for (its setter is inside two stores).
+    pub fn add(&self, item: T) {
+        let node: &'static PanicNode<T> = alloc::boxed::Box::leak(alloc::boxed::Box::new(PanicNode { item, next: ksync::OnceRef::new() }));
+        let mut link = &self.head;
+        loop {
+            if link.set(node) {
+                return;
+            }
+            match link.get() {
+                Some(n) => link = &n.next,
+                None => core::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Calls `f` on every item in order; returns how many. No lock, no heap: a link still being set ends the walk.
+    pub fn for_each(&self, f: &mut dyn FnMut(&'static T)) -> usize {
+        let mut n = 0;
+        let mut cur = self.head.get();
+        while let Some(node) = cur {
+            f(&node.item);
+            n += 1;
+            cur = node.next.get();
+        }
+        n
+    }
 }
 
 impl<E: Env> Controller<E> {
@@ -703,6 +768,75 @@ impl<E: Env> Controller<E> {
         self.quiesce_note.store(0x80 | if halted { 0x40 } else { 0 } | (was & 0x3F), Ordering::Release);
         // No wake-up here: waking takes the scheduler's lock, which the panicking CPU may hold. A command
         // waiter sleeps in slices of at most `FALLBACK_NS` and then sees the state.
+    }
+
+    /// RB-13, the panic path before the machine reset (granted to RB with `driver::panic_stop_all`): halt (RS
+    /// off, HCH within `HALT_NS`), on a halted controller HCRST with CNR clear within `PANIC_RESET_NS`, then bus
+    /// master off. Linux's `xhci_shutdown` halts and resets only for some controllers
+    /// (linux-6.6/drivers/usb/host/xhci.c:631-662; no reset when not halted, as in `xhci_reset`, :171-186);
+    /// here every halted one is reset, so the firmware takes the root ports over as after power-on (the
+    /// Mini-PC booted Windows instead of the stick after a panic reset, 27.10.). Spinning waits only; no lock,
+    /// heap, klog or sleep. The controller stays `Quiesced`: after HCRST its rings are stale, nothing may restart it.
+    ///
+    /// `now` is the panic path's clock (ns): `time::now_ns` reads a sequence lock that a CPU stopped inside
+    /// `Clock::set_rate` would leave odd for good, so the caller hands a TSC clock that cannot block.
+    pub fn panic_stop(&self, now: &dyn Fn() -> u64) -> PanicStop {
+        let t0 = now();
+        let mut r = PanicStop::default();
+        self.state.store(State::Quiesced as u8, Ordering::Release);
+        self.settled.store(false, Ordering::Release);
+        let c = self.caps.op(regs::USBCMD);
+        let s = self.caps.op(regs::USBSTS);
+        let v = self.rd(c);
+        if v == u32::MAX {
+            r.gone = true;
+        } else {
+            self.wr(c, v & !(cmd::RS | cmd::INTE | cmd::HSEE));
+            match self.panic_poll(s, sts::HCH, sts::HCH, HALT_NS, now) {
+                Ok(()) => r.halted = true,
+                Err(Wait::Gone) => r.gone = true,
+                Err(Wait::Timeout) => {}
+            }
+        }
+        if r.halted {
+            self.wr(c, cmd::HCRST);
+            r.reset = true;
+            let quiet = now().saturating_add(HCRST_QUIET_NS);
+            while now() < quiet {
+                self.env.relax(false);
+            }
+            let start = now();
+            let done = self.panic_poll(c, cmd::HCRST, 0, PANIC_RESET_NS, now).and_then(|()| {
+                let left = PANIC_RESET_NS.saturating_sub(now().saturating_sub(start));
+                self.panic_poll(s, sts::CNR, 0, left, now)
+            });
+            match done {
+                Ok(()) => r.ready = true,
+                Err(Wait::Gone) => r.gone = true,
+                Err(Wait::Timeout) => {}
+            }
+        }
+        let _ = self.env.bus_master(false);
+        r.ns = now().saturating_sub(t0);
+        r
+    }
+
+    /// `poll` with spinning only, on the panic path's clock.
+    fn panic_poll(&self, off: usize, mask: u32, want: u32, timeout_ns: u64, now: &dyn Fn() -> u64) -> Result<(), Wait> {
+        let deadline = now().saturating_add(timeout_ns);
+        loop {
+            let v = self.rd(off);
+            if v == u32::MAX {
+                return Err(Wait::Gone);
+            }
+            if v & mask == want {
+                return Ok(());
+            }
+            if now() >= deadline {
+                return Err(Wait::Timeout);
+            }
+            self.env.relax(false);
+        }
     }
 
     pub fn log_quiesce_note(&self) {

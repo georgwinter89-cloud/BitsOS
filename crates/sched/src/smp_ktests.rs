@@ -153,8 +153,20 @@ fn scale64() -> R {
         let mut last: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         for w in 0..3 {
             crate::sleep_ns(window);
-            let now: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-            let stuck: Vec<usize> = (0..N).filter(|&i| now[i] == last[i]).collect();
+            let mut now: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            let mut stuck: Vec<usize> = (0..N).filter(|&i| now[i] == last[i]).collect();
+            // As deadline64 (RB-17 CR-3): under a hypervisor a busy thread may miss the fixed window (a descheduled
+            // vCPU, host load); there starvation means no progress in 10 s. The timing itself is judged on the
+            // Mini-PC only, where the one-window check stays strict.
+            if hypervisor() && !stuck.is_empty() {
+                let t1 = time::now_ns();
+                while stuck.iter().any(|&i| counters[i].load(Ordering::Relaxed) == last[i]) && time::now_ns() - t1 < 10 * SEC {
+                    crate::sleep_ms(20);
+                }
+                klog::event!(Info, "sched", "ktest.scale64_late", window = w, threads = stuck.len(), waited_ms = (time::now_ns() - t1) / MS);
+                now = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+                stuck.retain(|&i| now[i] == last[i]);
+            }
             // What the scheduler thinks of them (state, CPU, virtual runtime, migrations) against their CPU's queue.
             let why: Vec<String> = stuck
                 .iter()

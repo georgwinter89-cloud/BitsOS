@@ -1,0 +1,7 @@
+before exec: ldt and tls slot 13 set
+after exec: modify_ldt read = 0
+after exec: tls slot 12 empty yes
+after exec: tls slot 13 empty yes
+after exec: tls slot 14 empty yes
+after exec: ds 0 es 0 fs 0 gs 0
+done

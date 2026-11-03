@@ -17,6 +17,7 @@ TOKEN="wy5-scenario-token-8e2a"
 LOG="$RUN_DIR/serial.log"
 QMP="$RUN_DIR/qmp.sock"
 NAME=wy-theme
+WY_GPU_CFG=$(bash host/tests/wy/tools/gpu-image.sh config)
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
 
 echo "== host references: dark, light, light with the amber accent"
@@ -28,7 +29,9 @@ python3 -I host/tests/wy/v2_reference.py "$CARGO_TARGET_DIR/release/bitscomp" "$
     > "$RUN_DIR/ref.out"
 tail -3 "$RUN_DIR/ref.out"
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=warn;screen=1280x800" > "$RUN_DIR/image.txt" 2>&1 || { tail -20 "$RUN_DIR/image.txt"; exit 1; }
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=warn;screen=1280x800$WY_GPU_CFG" > "$RUN_DIR/image.txt" 2>&1 || { tail -20 "$RUN_DIR/image.txt"; exit 1; }
+# WY-14: WY_GPU=1 runs this scenario with the gpu build (CONFIG.TXT bitscomp=gpu, tools/gpu-image.sh).
+bash host/tests/wy/tools/gpu-image.sh image "$NAME"
 rm -f "$LOG" "$QMP"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 420 --serial-log "$LOG" \
     -- -smp 4 -qmp "unix:$QMP,server=on,wait=off" > "$RUN_DIR/qemu.out" 2>&1 &

@@ -18,7 +18,7 @@ use smithay::utils::{Physical, Rectangle};
 
 use super::flip::{Flip, Refused};
 use super::{Backend, copy_rects, evdev, vt};
-use crate::render::Compositor;
+use crate::render::Picture;
 use crate::state::App;
 
 const FBIOGET_VSCREENINFO: u64 = 0x4600;
@@ -26,6 +26,9 @@ const FBIOGET_FSCREENINFO: u64 = 0x4602;
 const FBIOPAN_DISPLAY: u64 = 0x4606;
 /// V2's `_IOR('F', 0xB0, struct bitsos_fb_pacing)` (64 bytes; gopfb fbdev/pacing.rs).
 const FBIO_BITSOS_PACING: u64 = 0x8040_46B0;
+/// V2's `_IOW('F', 0xB3, struct bitsos_fb_damage)` (24 bytes; gopfb fbdev/damage.rs, DP-6): the rectangles just
+/// copied into a window, so the kernel copies only those and never write-protects the mapping (no fault per page).
+const FBIO_BITSOS_DAMAGE: u64 = 0x4018_46B3;
 /// `struct fb_var_screeninfo`: 40 u32 (160 bytes); the indexes used here.
 const VAR_WORDS: usize = 40;
 const XRES: usize = 0;
@@ -48,6 +51,8 @@ pub struct Fbdev {
     /// GX-3 CR 2: `var` is the screeninfo to pan with, `flip` which window is drawn and shown.
     var: [u8; VAR_WORDS * 4],
     flip: Flip,
+    /// DP-6: the kernel takes damage reports (false after the first refusal: ENOTTY on Linux, then never again).
+    damage: bool,
     /// Dropped after the mapping (fields drop in order after `Drop::drop`): the console comes back last.
     _console: vt::Console,
 }
@@ -105,7 +110,7 @@ impl Fbdev {
             return Err(format!("{path}: mmap {map_len} bytes: {}", std::io::Error::last_os_error()));
         }
         let console = vt::Console::take();
-        let fb = Fbdev {
+        let mut fb = Fbdev {
             file,
             map: map.cast(),
             map_len,
@@ -113,8 +118,11 @@ impl Fbdev {
             stride_px: line / 4,
             var: vb,
             flip: Flip::new(halves),
+            damage: true,
             _console: console,
         };
+        // DP-6: reports on before the first store, so no page of the mapping faults more than once.
+        fb.report(0, &[]);
         evdev::start(handle)?;
         eprintln!("bitscomp: fbdev: {path} {w}x{h}, {line} bytes per line, {}", if halves { "two windows (pan)" } else { "one window" });
         Ok(fb)
@@ -122,6 +130,34 @@ impl Fbdev {
 }
 
 impl Fbdev {
+    /// DP-6: tells the kernel which rectangles of window `w` were just copied (FBIO_BITSOS_DAMAGE before the pan).
+    fn report(&mut self, w: usize, rects: &[Rectangle<i32, Physical>]) {
+        if !self.damage {
+            return;
+        }
+        let (sw, sh) = self.size;
+        let mut list: Vec<[u32; 4]> = Vec::with_capacity(rects.len());
+        for r in rects {
+            let x0 = r.loc.x.clamp(0, sw);
+            let y0 = r.loc.y.clamp(0, sh);
+            let x1 = (r.loc.x + r.size.w).clamp(0, sw);
+            let y1 = (r.loc.y + r.size.h).clamp(0, sh);
+            if x1 > x0 && y1 > y0 {
+                list.push([x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]);
+            }
+        }
+        let mut b = [0u8; 24];
+        b[4..8].copy_from_slice(&((w * self.size.1 as usize) as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&(list.len() as u32).to_le_bytes());
+        b[16..24].copy_from_slice(&(list.as_ptr() as u64).to_le_bytes());
+        if let Err(e) = ioctl_buf(self.file.as_raw_fd(), FBIO_BITSOS_DAMAGE, &mut b) {
+            self.damage = false;
+            if e.raw_os_error() != Some(libc::ENOTTY) {
+                eprintln!("bitscomp: fbdev: damage report refused: {e}; the kernel tracks the stores itself from now on");
+            }
+        }
+    }
+
     /// FBIOPAN_DISPLAY to window `w`; once more when a signal interrupted the wait for the flip.
     fn pan(&mut self, w: usize) -> std::io::Result<()> {
         let yoffset = (w * self.size.1 as usize) as u32;
@@ -153,7 +189,7 @@ impl Backend for Fbdev {
     /// Input arrives through the evdev sources in the event loop.
     fn dispatch(&mut self, _app: &mut App) {}
 
-    fn present(&mut self, comp: &Compositor, damage: &[Rectangle<i32, Physical>]) {
+    fn present(&mut self, comp: &dyn Picture, damage: &[Rectangle<i32, Physical>]) {
         if comp.size() != self.size {
             return;
         }
@@ -163,6 +199,7 @@ impl Backend for Fbdev {
         let (w, rects) = self.flip.frame(damage, Rectangle::from_size(self.size.into()));
         let half = self.stride_px * self.size.1 as usize;
         copy_rects(comp, &mut all[w * half..(w + 1) * half], self.stride_px, &rects);
+        self.report(w, &rects);
         if !two {
             return;
         }

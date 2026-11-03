@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const V1 = process.env.V1 ?? '/home/georg/BitsOS/BitsOS-Plattform';
+const V1 = process.env.V1 ?? `${process.env.HOME}/BitsOS/BitsOS-Plattform`;
 process.chdir(V1); // gamepad-model.mjs reads usb/hidparse.asm relative to the working directory
 const load = (f) => import(pathToFileURL(join(V1, f)).href);
 const { hidParse, layoutFields, randomDescriptors } = await load('hidparse-model.mjs');

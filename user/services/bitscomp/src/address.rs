@@ -1,6 +1,8 @@
 //! The address bar (plan/spec/desktop.md §1a, WY-5): it shows the selected tab's address; a click (or Ctrl+Alt+L)
 //! makes it editable, and Enter opens what BitsOS can open today: `programm/terminal` (also `terminal`, `foot`,
-//! `app/terminal`) starts foot, `einstellungen/...` opens bitscomp's settings page (`page`, WY-5b), a web
+//! `app/terminal`) starts foot, `programm/writer`, `programm/calc`, `programm/impress`, `programm/draw` and
+//! `programm/libreoffice` (also without `programm/`) start LibreOffice from the stick (LO-1, its launcher
+//! `\BITSOS2\bin\libreoffice`), `einstellungen/...` opens bitscomp's settings page (`page`, WY-5b), a web
 //! address is noted as not available yet. Enter and Alt+Enter open in a new tab of the focused stack (a tab cannot
 //! navigate yet: there is no address layer below it), Ctrl+Enter in a new tile.
 
@@ -45,10 +47,56 @@ pub struct Edit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Open {
     Terminal,
+    /// LO-1: LibreOffice with one of its modules.
+    Office(Office),
     /// A key prefix of the settings registry.
     Settings(String),
     Web(String),
     Unknown(String),
+}
+
+/// LO-1: LibreOffice's modules, as the launcher names them (`libreoffice writer`); `Start` is its start centre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Office {
+    Start,
+    Writer,
+    Calc,
+    Impress,
+    Draw,
+}
+
+/// LO-1: LibreOffice's launcher on the stick (manifest `stick libreoffice`), started through sh as Brave's is.
+pub const OFFICE_LAUNCHER: &str = "/boot/BITSOS2/bin/libreoffice";
+
+impl Office {
+    const ALL: [(Office, &'static str); 5] =
+        [(Office::Start, "libreoffice"), (Office::Writer, "writer"), (Office::Calc, "calc"), (Office::Impress, "impress"), (Office::Draw, "draw")];
+
+    /// The address word (`programm/<word>`), also the launcher's module word.
+    pub fn word(self) -> &'static str {
+        Self::ALL.iter().find(|(o, _)| *o == self).map_or("libreoffice", |(_, w)| w)
+    }
+
+    fn of_word(w: &str) -> Option<Office> {
+        Self::ALL.iter().find(|(_, x)| *x == w).map(|(o, _)| *o)
+    }
+
+    /// The argv bitscomp starts it with.
+    pub fn argv(self) -> Vec<String> {
+        let mut v = vec!["/bin/sh".to_string(), OFFICE_LAUNCHER.to_string()];
+        if self != Office::Start {
+            v.push(self.word().into());
+        }
+        v
+    }
+
+    /// The module of a LibreOffice window's app_id (GTK 3 sets `libreoffice-<module>`).
+    fn of_app_id(id: &str) -> Option<Office> {
+        match id {
+            "libreoffice" | "soffice" | "libreoffice-startcenter" => Some(Office::Start),
+            _ => id.strip_prefix("libreoffice-").and_then(Office::of_word).filter(|o| *o != Office::Start),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +123,9 @@ pub fn resolve(addr: &str) -> Open {
         "einstellungen" => return Open::Settings(String::new()),
         _ => {}
     }
+    if let Some(o) = Office::of_word(a.strip_prefix("programm/").unwrap_or(&a)) {
+        return Open::Office(o);
+    }
     if let Some(rest) = a.strip_prefix("einstellungen/") {
         // German words for the keys (`aussehen/akzent` = theme.accent); other paths are key prefixes.
         return Open::Settings(crate::page::prefix_of(rest));
@@ -91,7 +142,10 @@ pub fn of_window(app_id: &str) -> String {
     match id.as_str() {
         "" => "programm/fenster".into(),
         "foot" | "footclient" => "programm/terminal".into(),
-        _ => format!("programm/{id}"),
+        _ => match Office::of_app_id(&id) {
+            Some(o) => format!("programm/{}", o.word()),
+            None => format!("programm/{id}"),
+        },
     }
 }
 
@@ -262,6 +316,10 @@ impl App {
         }
         match resolve(addr) {
             Open::Terminal => self.open_program(crate::terminal::TERMINAL.iter().map(|s| s.to_string()).collect(), w, tile),
+            Open::Office(_) if !std::path::Path::new(OFFICE_LAUNCHER).is_file() => {
+                return self.notice("LibreOffice ist nicht auf dem Stick (\\BITSOS2\\libreoffice\\ und \\BITSOS2\\bin\\libreoffice fehlen)");
+            }
+            Open::Office(o) => self.open_program(o.argv(), w, tile),
             // WY-5b: bitscomp's own settings page (its prefix comes from the address again).
             Open::Settings(_) => self.open_page(&normalise(addr), w, tile),
             Open::Web(a) => self.notice(format!("Webseiten kann BitsOS noch nicht öffnen: {a}")),
@@ -320,6 +378,22 @@ mod tests {
         assert_eq!(resolve("dokumente/rechnung-oktober"), Open::Unknown("dokumente/rechnung-oktober".into()));
         assert_eq!(of_window("foot"), "programm/terminal");
         assert_eq!(of_window("Brave-Browser"), "programm/brave-browser");
+    }
+
+    #[test]
+    fn office_addresses_start_libreoffice_and_name_its_windows() {
+        for (a, o) in [("programm/writer", Office::Writer), ("Writer", Office::Writer), ("app/calc", Office::Calc), ("calc", Office::Calc),
+            ("programm/impress", Office::Impress), ("draw", Office::Draw), ("libreoffice", Office::Start), ("programm/libreoffice", Office::Start)] {
+            assert_eq!(resolve(a), Open::Office(o), "{a}");
+        }
+        assert_eq!(resolve("programm/writer2"), Open::Unknown("programm/writer2".into()));
+        assert_eq!(Office::Writer.argv(), ["/bin/sh", OFFICE_LAUNCHER, "writer"]);
+        assert_eq!(Office::Start.argv(), ["/bin/sh", OFFICE_LAUNCHER]);
+        for (id, addr) in [("libreoffice-writer", "programm/writer"), ("libreoffice-calc", "programm/calc"), ("libreoffice-impress", "programm/impress"),
+            ("libreoffice-draw", "programm/draw"), ("libreoffice-startcenter", "programm/libreoffice"), ("soffice", "programm/libreoffice"),
+            ("libreoffice-math", "programm/libreoffice-math"), ("libreoffice-libreoffice", "programm/libreoffice-libreoffice")] {
+            assert_eq!(of_window(id), addr, "{id}");
+        }
     }
 
     #[test]

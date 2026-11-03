@@ -75,6 +75,7 @@ def main():
     # WY-8: LAT_FB=--fb-pan (GX-3 CR 2's two windows) or --fb-copy (the default) for comparing both.
     comp = f.COMP = Job(c, "/bin/bitscomp", ["--socket", v.SOCK, "--stats", "5", *os.environ.get("LAT_FB", "").split()])
     comp.wait_for(r"backend=fbdev size=\d+x\d+", "bitscomp started on fbdev")
+    v.check_build(c, comp.text)
     f.keys(c, "ctrl+alt+enter")
     f.wait_windows(c, 1, "Strg+Alt+Enter opened a foot window")
     f.wait_shells(c, 1, "the first foot's shell is ready")

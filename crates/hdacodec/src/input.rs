@@ -146,7 +146,8 @@ pub fn vref(w: &Widget, kind: InputKind) -> u8 {
 }
 
 /// Where the capture gain sits: the first input amp with gain steps from the ADC on (the ADC's own on the
-/// ALC269), as (node, input index, caps). Linux names it "Capture Volume"/"Capture Switch".
+/// ALC269), as (node, input index, caps). Linux names it "Capture Volume"/"Capture Switch". No caller in the
+/// kernel yet (a capture gain control would use it); its test pins the Mini-PC's ALC269 answer (C1).
 pub fn capture_amp(codec: &Codec, inp: &Input) -> Option<(Nid, u8, crate::caps::AmpCaps)> {
     let g = codec.groups.iter().find(|g| g.nid == inp.group)?;
     inp.path.iter().filter_map(|h| Some((g.widget(h.nid)?, h.input?))).find_map(|(w, i)| {

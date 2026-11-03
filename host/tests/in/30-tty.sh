@@ -1,9 +1,12 @@
 #!/bin/bash
 # slow
-# IN-4: the console terminal with physical keys (QEMU's USB keyboard through QMP): a raw-mode program started
-# with the monitor's `run` reads the keys as a Linux console sends them, VTIME times out and the settings come
-# back; Ctrl+C ends a program blocked in a canonical read with SIGINT (exit code 130 on the console); the evdev
-# nodes exist for MCP's devices and the USB keyboard and mouse.
+# IN-4: the console terminal with physical keys (QEMU's USB keyboard through QMP): a raw-mode program reads the
+# keys as a Linux console sends them, VTIME times out and the settings come back; Ctrl+C ends a program blocked
+# in a canonical read with SIGINT; the evdev nodes exist for MCP's devices and the USB keyboard and mouse.
+# Since UL-3a init keeps BusyBox ash on the console (`/ # `) and the kernel monitor (`bits>`) reads only while no
+# session holds it, so two boots (as 20-console.sh):
+#  1. shell (a normal boot): the programs typed at ash; `echo $?` says 130 after the Ctrl+C.
+#  2. monitor (CONFIG init=off): the programs started with the monitor's `run`; it shows `exit code 130`.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/in-30-tty}"
@@ -42,19 +45,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info"
-stop_qemu
-rm -f "$LOG" "$QMP"
-cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 300 --serial-log "$LOG" -- \
-    -machine i8042=off -device qemu-xhci,id=xb \
-    -device usb-kbd,bus=xb.0,port=1,id=kbd1 -device usb-mouse,bus=xb.0,port=2,id=mouse1 \
-    -qmp "unix:$QMP,server=on,wait=off" > "$RUN_DIR/qemu.out" 2>&1 &
-QPID=$!
+boot() {
+    local mode="$1" extra="$2"
+    LOG="$RUN_DIR/serial-$mode.log"
+    cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info$extra"
+    stop_qemu
+    rm -f "$LOG" "$QMP"
+    cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 300 --serial-log "$LOG" -- \
+        -machine i8042=off -device qemu-xhci,id=xb \
+        -device usb-kbd,bus=xb.0,port=1,id=kbd1 -device usb-mouse,bus=xb.0,port=2,id=mouse1 \
+        -qmp "unix:$QMP,server=on,wait=off" > "$RUN_DIR/qemu-$mode.out" 2>&1 &
+    QPID=$!
+    python3 -I "$HERE/tty_check.py" "$mode" "$FWD" "$TOKEN" "$QMP" "$RUN_DIR"
+    if [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then kill "$QPID" 2>/dev/null || true; fi
+    stop_qemu
+    wait "$QPID" 2>/dev/null || true
+    QPID=""
+    if grep -aq "lock.violation" "$LOG"; then echo "RED: lock order broken ($mode)"; grep -a "lock.violation" "$LOG" | head; exit 1; fi
+    if grep -aq "PANIC" "$LOG"; then echo "RED: a panic ($mode)"; exit 1; fi
+    grep -aq "proc signal.fatal .*signal=SIGINT" "$LOG" || { echo "RED: no SIGINT end for the program Ctrl+C was typed at ($mode)"; exit 1; }
+    grep -aq "input evdev.node node=/dev/input/event0 name=\"BitsOS MCP keyboard\"" "$LOG" || { echo "RED: no evdev node for MCP's keyboard ($mode)"; exit 1; }
+    if grep -aq "$TOKEN" "$LOG"; then echo "RED: the token appears in the log (R8i, $mode)"; exit 1; fi
+}
 
-python3 -I "$HERE/tty_check.py" "$FWD" "$TOKEN" "$QMP" "$RUN_DIR"
-if grep -aq "lock.violation" "$LOG"; then echo "RED: lock order broken"; grep -a "lock.violation" "$LOG" | head; exit 1; fi
-if grep -aq "PANIC" "$LOG"; then echo "RED: a panic"; exit 1; fi
-grep -aq "proc signal.fatal .*signal=SIGINT" "$LOG" || { echo "RED: no SIGINT end for the program Ctrl+C was typed at"; exit 1; }
-grep -aq "input evdev.node node=/dev/input/event0 name=\"BitsOS MCP keyboard\"" "$LOG" || { echo "RED: no evdev node for MCP's keyboard"; exit 1; }
-if grep -aq "$TOKEN" "$LOG"; then echo "RED: the token appears in the log (R8i)"; exit 1; fi
-echo "in tty: green (raw program read physical keys, VTIME, settings restored, Ctrl+C = SIGINT for the foreground program, evdev nodes)"
+boot shell ""
+grep -aq "init: started the console shell" "$RUN_DIR/serial-shell.log" || { echo "RED: init did not start the console shell"; exit 1; }
+boot monitor ";init=off"
+grep -aq "ul init.off" "$RUN_DIR/serial-monitor.log" || { echo "RED: no ul init.off event (CONFIG init=off)"; exit 1; }
+echo "in tty: green (shell and monitor: raw program read physical keys, VTIME, settings restored, Ctrl+C = SIGINT for the foreground program, evdev nodes)"

@@ -79,19 +79,6 @@ pub fn trap_what(vector: u8) -> &'static str {
     }
 }
 
-/// Reason of a page fault from the error code alone (when the address space cannot say more).
-pub fn page_fault_reason(error: u64) -> &'static str {
-    if error & 1 == 0 {
-        "not mapped"
-    } else if error & 2 != 0 {
-        "write to read-only memory"
-    } else if error & 16 != 0 {
-        "execute of non-executable memory"
-    } else {
-        "access not allowed"
-    }
-}
-
 /// The V2 message (R3): program, pid, thread, what, address and reason, plus the instruction address.
 /// A page fault names the faulting address; other exceptions name the instruction.
 pub fn fault_message(program: &str, pid: u32, thread: u64, vector: u8, addr: u64, rip: u64, reason: &str) -> String {
@@ -138,8 +125,5 @@ mod tests {
         assert_eq!(m, "Program hello (pid 104, thread 9) ended: ERROR: Page fault at 0x0: not mapped (rip 0x401234)");
         let m = fault_message("x", 1, 2, 6, 0, 0x5000, "invalid opcode");
         assert!(m.contains("Invalid instruction at rip 0x5000"));
-        assert_eq!(page_fault_reason(0x4), "not mapped");
-        assert_eq!(page_fault_reason(0x7), "write to read-only memory");
-        assert_eq!(page_fault_reason(0x15), "execute of non-executable memory");
     }
 }

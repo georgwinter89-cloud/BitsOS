@@ -11,18 +11,13 @@
 use crate::view::{open, ConnHandle};
 use crate::{dns, IpAddr, NetProto, Subject};
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use ksync::SpinLock;
 
-static KEEP: AtomicUsize = AtomicUsize::new(64);
+const KEEP: usize = 64;
 
-/// Peers each UDP socket shows on their own (the rest share one entry). Applies to peers seen from now on.
-pub fn set_udp_peer_keep(n: usize) {
-    KEEP.store(n.max(1), Ordering::Relaxed);
-}
-
+/// Peers each UDP socket shows on their own (the rest share one entry). Fixed (PM-3 may make it a setting).
 pub fn udp_peer_keep() -> usize {
-    KEEP.load(Ordering::Relaxed)
+    KEEP
 }
 
 struct Peers {

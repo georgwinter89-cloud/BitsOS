@@ -75,6 +75,8 @@ klog::counter!(APS_FAILED, "smp.aps_failed");
 
 fn bring_up() -> Result<(), &'static str> {
     let out = run();
+    // CP-8: every CPU that will ever run kernel code has its CR4 now; kernel faults may read the GS base.
+    hal::idt::arm_gs_base_check();
     *OUTCOME.lock() = Some(out);
     Ok(())
 }

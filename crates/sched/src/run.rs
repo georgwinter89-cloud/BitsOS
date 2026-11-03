@@ -41,14 +41,18 @@ pub(crate) fn account(cs: &CpuSched, t: &Thread, now: u64) {
 
 /// `account`, then (SC-6) `user`: the thread enters (true) or leaves (false) user mode at `now`. One write
 /// section for the readers of `Thread::cpu_times`.
+///
+/// INT-W19 (AB-15 CR 2): the sums are added with a plain load and store, not a locked `fetch_add`. Their only
+/// writer is this function, on the CPU that runs `t` (and owns `cs`), interrupts off: a thread's fields move to
+/// another CPU only through a switch, which orders them; readers only load (the thread's under `acct_seq`).
 pub(crate) fn account_and_mark(cs: &CpuSched, t: &Thread, now: u64, user: Option<bool>) {
     t.acct_begin();
     let start = t.exec_start.swap(now, Ordering::Relaxed);
     let d = if start == 0 { 0 } else { now.saturating_sub(start) };
-    t.runtime_ns.fetch_add(d, Ordering::Relaxed);
+    add_owned(&t.runtime_ns, d);
     let was_user = t.in_user.load(Ordering::Relaxed);
     if was_user {
-        t.utime_ns.fetch_add(d, Ordering::Relaxed);
+        add_owned(&t.utime_ns, d);
     }
     if let Some(u) = user {
         t.in_user.store(u, Ordering::Relaxed);
@@ -56,14 +60,14 @@ pub(crate) fn account_and_mark(cs: &CpuSched, t: &Thread, now: u64, user: Option
     t.acct_end();
     cs.acct_at.store(now, Ordering::Relaxed);
     if t.is_idle() {
-        cs.idle_ns.fetch_add(d, Ordering::Relaxed);
+        add_owned(&cs.idle_ns, d);
         return;
     }
-    cs.busy_ns.fetch_add(d, Ordering::Relaxed);
+    add_owned(&cs.busy_ns, d);
     if was_user {
-        cs.user_ns.fetch_add(d, Ordering::Relaxed);
+        add_owned(&cs.user_ns, d);
         if t.nice.load(Ordering::Relaxed) > 0 {
-            cs.nice_ns.fetch_add(d, Ordering::Relaxed);
+            add_owned(&cs.nice_ns, d);
         }
     }
     if t.class() != Class::KernelRt {
@@ -75,6 +79,12 @@ pub(crate) fn account_and_mark(cs: &CpuSched, t: &Thread, now: u64, user: Option
         cs.curr_class.store(t.class() as u8, Ordering::Relaxed);
         cs.curr_policy.store(t.policy.load(Ordering::Relaxed), Ordering::Relaxed);
     }
+}
+
+/// `a += d` by its only writer (see `account_and_mark`): wrapping like `fetch_add`, without the lock prefix.
+#[inline]
+fn add_owned(a: &core::sync::atomic::AtomicU64, d: u64) {
+    a.store(a.load(Ordering::Relaxed).wrapping_add(d), Ordering::Relaxed);
 }
 
 /// Queues `t` (state Runnable, not on any CPU) on `cpu` (its pinned CPU instead, if it has one; SC-6: a CPU

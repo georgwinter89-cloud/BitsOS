@@ -6,3 +6,6 @@ description = "Host build/test tool: build, image, qemu (with refusals), test, f
 
 [dependencies]
 bootinfo = { path = "../../crates/bootinfo" }
+
+[lints]
+workspace = true

@@ -6,14 +6,13 @@
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement};
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::allocator::Fourcc;
 use smithay::input::pointer::CursorImageSurfaceData;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::compositor::with_states;
 
-use crate::render::CompElement;
+use crate::render::{CompElement, CompRenderer};
 use crate::state::App;
 
 /// B black outline, W white body, space transparent; the hot spot is the top left pixel.
@@ -52,18 +51,18 @@ pub fn arrow(k: i32, w: i32, h: i32) -> (i32, i32, Vec<u8>) {
 /// The pointer's elements (topmost first), empty when it is hidden or the host draws it; WY-7's "starting" mark
 /// beside it while a started program has no window yet (shown also when a client hid the pointer, and in software
 /// beside a hardware cursor).
-pub fn elements(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
+pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
     if !app.draw_pointer {
         return Vec::new();
     }
-    let mut out = if app.cursor.on_hw { Vec::new() } else { pointer(app, pixman) };
+    let mut out = if app.cursor.on_hw { Vec::new() } else { pointer(app, renderer) };
     if app.launches.busy() {
-        out.extend(starting(app, pixman));
+        out.extend(starting(app, renderer));
     }
     out
 }
 
-fn starting(app: &mut App, pixman: &mut PixmanRenderer) -> Option<CompElement> {
+fn starting<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Option<CompElement<R>> {
     let s = app.theme.scale;
     let d = padded((16.0 * s).round() as i32, s);
     if app.mark_img.as_ref().is_none_or(|(dd, _)| *dd != d) {
@@ -80,13 +79,14 @@ fn starting(app: &mut App, pixman: &mut PixmanRenderer) -> Option<CompElement> {
     });
     let at = app.pointer + Point::from((ox.max(14.0), oy.max(16.0)));
     let at = at.to_physical(s);
-    MemoryRenderBufferRenderElement::from_buffer(pixman, Point::from((at.x.round(), at.y.round())), buf, None, Some(src), Some(size), Kind::Cursor)
+    MemoryRenderBufferRenderElement::from_buffer(renderer, Point::from((at.x.round(), at.y.round())), buf, None, Some(src), Some(size), Kind::Cursor)
         .ok()
         .map(CompElement::from)
 }
 
-fn pointer(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
-    if app.cursor_hidden && app.cursor_deco.is_none() {
+fn pointer<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
+    // DS-5: no pointer over the boot scene (the kernel's picture has none; it shows with the desktop).
+    if (app.cursor_hidden && app.cursor_deco.is_none()) || app.images.boot.shown() {
         return Vec::new();
     }
     let s = app.theme.scale;
@@ -99,7 +99,7 @@ fn pointer(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
             st.data_map.get::<CursorImageSurfaceData>().map(|d| d.lock().map(|a| a.hotspot).unwrap_or_default()).unwrap_or_default()
         });
         let loc: Point<i32, smithay::utils::Physical> = (at - hot.to_f64().to_physical(s)).to_i32_round();
-        return render_elements_from_surface_tree(pixman, &surface, loc, s, 1.0, Kind::Cursor);
+        return render_elements_from_surface_tree(renderer, &surface, loc, s, 1.0, Kind::Cursor);
     }
     // WY-11: the named shape's theme image (`hwcursor::cursor_sync` keeps it current), 1:1 in output pixels.
     let Some(img) = app.cursor.img.clone() else { return Vec::new() };
@@ -121,7 +121,7 @@ fn pointer(app: &mut App, pixman: &mut PixmanRenderer) -> Vec<CompElement> {
     // Shown at one buffer pixel per output pixel whatever the scale.
     let size: Size<i32, Logical> = ((w as f64 / s).round() as i32, (h as f64 / s).round() as i32).into();
     let loc = Point::from((at.x.round() - img.hot.0 as f64, at.y.round() - img.hot.1 as f64));
-    MemoryRenderBufferRenderElement::from_buffer(pixman, loc, buf, None, Some(src), Some(size), Kind::Cursor)
+    MemoryRenderBufferRenderElement::from_buffer(renderer, loc, buf, None, Some(src), Some(size), Kind::Cursor)
         .ok()
         .map(CompElement::from)
         .into_iter()

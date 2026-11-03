@@ -16,3 +16,6 @@ mcp = { path = "../../mcp" }
 pci = { path = "../../pci" }
 sched = { path = "../../sched" }
 time = { path = "../../time" }
+
+[lints]
+workspace = true

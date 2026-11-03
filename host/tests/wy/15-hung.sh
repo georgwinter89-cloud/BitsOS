@@ -7,7 +7,10 @@
 # alone (bitscomp sends SIGCONT with it, so a stopped program runs to its end); ctl kill on C, which ignores
 # SIGTERM, needs the SIGKILL 2 s later; E stops reading its socket and ctl flood overflows its output queue:
 # bitscomp drops it with a line and A's frames go on; a stopped client that gets SIGCONT answers again
-# (hung=false, "answers again"); "Programm beenden" in the circle menu ends A by SIGTERM.
+# (hung=false, "answers again"); WY-13: F drops one pong, is probed while hung (its open ping is sent again) and
+# answers again within 2 s of answering that probe; G answers every ping with a wrong serial: it stays hung while
+# its probes keep coming (the open ping sent again, ever further apart); "Programm beenden" in the circle menu ends A by SIGTERM; then,
+# on a static screen, the main loop sleeps (ctl stats loop_turns, past_wakes).
 # Frame-time numbers are printed, judged only loosely (callbacks keep coming).
 set -euo pipefail
 
@@ -159,6 +162,33 @@ kill -CONT "$DPID"
 wait_for 'title="D" pid=[0-9]+ hung=false' "D does not answer again after SIGCONT" 25
 grep -q "of pid $DPID: answers again" "$RUN/bitscomp.log" || fail "no 'answers again' line"
 
+echo "== WY-13: F drops one pong, is probed while hung and answers again"
+"$CLIENT" --title F --pattern 5 --drop-pong 2 >"$RUN/f.log" 2>&1 & PIDS+=($!); FPID=$!
+wait_for 'title="F" pid=[0-9]+ hung=true' "F not hung after its dropped pong" 50
+grep -q "dropped pong of ping 2" "$RUN/f.log" || fail "F did not drop its second pong"
+for _ in $(seq 15); do grep -q "answered ping 3 after the drop" "$RUN/f.log" && break; sleep 0.2; done
+grep -q "answered ping 3 after the drop" "$RUN/f.log" || fail "F got no probe within 3 s of being hung"
+wait_for 'title="F" pid=[0-9]+ hung=false' "F still hung 2 s after it answered the probe" 10
+grep -q "of pid $FPID: answers again" "$RUN/bitscomp.log" || fail "no 'answers again' line for F"
+grep -q "of pid $FPID: still hung: its ping is still open" "$RUN/bitscomp.log" || fail "no 'still open' line for F's probe"
+[ "$(grep -c "of pid $FPID: still hung" "$RUN/bitscomp.log")" -eq 1 ] || fail "more than one probe line for F's one hang"
+kill -KILL "$FPID"
+wait_gone F "F's window did not go after SIGKILL"
+
+echo "== WY-13: G pongs with a wrong serial: it stays hung, and the probes keep coming"
+"$CLIENT" --title G --pattern 6 --wrong-pong >"$RUN/g.log" 2>&1 & PIDS+=($!); GPID=$!
+wait_for 'title="G" pid=[0-9]+ hung=true' "G not hung although its pongs carry a wrong serial" 50
+g0=$(grep -c "^wrong pong" "$RUN/g.log" || true)
+sleep 4.5
+g1=$(grep -c "^wrong pong" "$RUN/g.log" || true)
+echo "G: pings seen $g0 when hung, $g1 4.5 s later"
+[ "$((g1 - g0))" -ge 3 ] || fail "G got $((g1 - g0)) probes in 4.5 s while hung (the first ones come a second apart)"
+[ "$((g1 - g0))" -le 5 ] || fail "G got $((g1 - g0)) probes in 4.5 s (more than one a second)"
+ctl list | grep -Eq 'title="G" pid=[0-9]+ hung=true' || fail "a wrong serial made G answer again"
+grep -q "of pid $GPID: answers again" "$RUN/bitscomp.log" && fail "'answers again' for G's wrong serial"
+kill -KILL "$GPID"
+wait_gone G "G's window did not go after SIGKILL"
+
 echo "== Programm beenden from the circle menu on A"
 read -r hx hy <<<"$(hot_field A header)"
 ctl click "$hx" "$hy" right >/dev/null
@@ -169,6 +199,16 @@ wait_gone A "A did not go after Programm beenden"
 grep -q "of pid $APID: SIGTERM (Programm beenden)" "$RUN/bitscomp.log" || fail "no SIGTERM line for A"
 sleep 2.5
 grep -q "of pid $APID: still there" "$RUN/bitscomp.log" && fail "A needed SIGKILL"
+
+echo "== WY-13: a static screen (D only, answering): the main loop sleeps"
+s0=$(ctl stats); sleep 3; s1=$(ctl stats)
+num() { echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+turns=$(( $(num "$s1" loop_turns) - $(num "$s0" loop_turns) ))
+past=$(( $(num "$s1" past_wakes) - $(num "$s0" past_wakes) ))
+echo "static 3 s: loop_turns +$turns past_wakes +$past timer_sets +$(( $(num "$s1" timer_sets) - $(num "$s0" timer_sets) )) unread_reads=$(num "$s1" unread_reads)"
+[ "$turns" -le 300 ] || fail "the loop turned $turns times in 3 s on a static screen"
+[ "$past" -le 30 ] || fail "$past turns slept until a time already past in 3 s"
+grep -q "turns in a row woke for a time already past" "$RUN/bitscomp.log" && fail "the spin guard spoke: $(grep "turns in a row" "$RUN/bitscomp.log" | head -1)"
 
 echo "== quit"
 ctl quit >/dev/null

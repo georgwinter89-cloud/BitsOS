@@ -11,8 +11,10 @@ use uapi::errno::*;
 use vfs::abi::{O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_WRONLY};
 use vfs::{Ctx, MountNs};
 
-/// Keys only Georg's own edit may add or change (R8a `nvme_write`, `stick_write`, `usb_msd_write` (FS-6, US-4)).
-const GUARDED_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write"];
+/// Keys only Georg's own edit may add or change (R8a `nvme_write`, `stick_write`, `usb_msd_write` (FS-6, US-4);
+/// MC-10: `mcp`, `mcp_confirmer`). fs-fat's guard has the last word (`fs_fat::protect::config_guard`, which also
+/// keeps `mcp` from being dropped).
+const GUARDED_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
 
 /// How a write changes a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +70,7 @@ pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
     for line in guarded_lines(new) {
         if !before.contains(&line) {
             return Err(format!(
-                "CONFIG.TXT: the line {}={} would be added or changed; nvme_write, stick_write and usb_msd_write are set only by Georg himself (R8a)",
+                "CONFIG.TXT: the line {}={} would be added or changed; nvme_write, stick_write, usb_msd_write, mcp and mcp_confirmer are set only by Georg himself (R8a)",
                 line.0, line.1
             ));
         }
@@ -77,7 +79,7 @@ pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
     // reorders or drops them can still change that value (nvme_write=on above nvme_write=off). FS-7's guard checks it.
     if let Err(k) = fs_fat::protect::config_guard(old, new) {
         return Err(format!(
-            "CONFIG.TXT: the value of {k} that counts (its last line) would change; nvme_write, stick_write and usb_msd_write are set only by Georg himself (R8a)"
+            "CONFIG.TXT: the value of {k} that counts (its last line) would change or, for mcp, go; nvme_write, stick_write, usb_msd_write, mcp and mcp_confirmer are set only by Georg himself (R8a)"
         ));
     }
     Ok(())

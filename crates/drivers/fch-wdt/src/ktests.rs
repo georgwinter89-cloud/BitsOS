@@ -10,6 +10,7 @@ use crate::regs::{self, Fake};
 use crate::system::{self, SchedCpus, State};
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ktest::{TestResult, kassert, ktest};
@@ -139,6 +140,23 @@ fn spin_round(d: &Dog, fake: &Fake, k: usize) -> TestResult {
     Ok(())
 }
 
+/// Keeps the test thread on CPU 0, then gives the old pin back.
+struct OnCpu0(Option<usize>);
+
+impl OnCpu0 {
+    fn take() -> Result<OnCpu0, String> {
+        let prev = sched::current_thread().and_then(|t| t.pinned());
+        kassert!(sched::pin_current(Some(0)), "the test thread could not move to CPU 0");
+        Ok(OnCpu0(prev))
+    }
+}
+
+impl Drop for OnCpu0 {
+    fn drop(&mut self) {
+        sched::pin_current(self.0);
+    }
+}
+
 /// A CPU spinning with interrupts off: stalled within the window (no probe answer), no kick, the others alive;
 /// after it lets go, kicks resume.
 fn spin_stalls() -> TestResult {
@@ -147,6 +165,10 @@ fn spin_stalls() -> TestResult {
         return ktest::skip("one CPU: nothing to stall");
     }
     let k = n - 1;
+    // On CPU 0 for the test: from CPU k itself `call_on` would run the spin inline (8 s, interrupts off) and
+    // answer Ok(0) (RB-14 fixer: seen in the full ktest run once earlier tests' park had unpinned the runner
+    // and the scheduler had moved it to CPU k).
+    let _cpu0 = OnCpu0::take()?;
     let fake = Arc::new(Fake::new(false, false, Some(time::now_ns)));
     let d = test_dog(&fake, SEC);
     d.arm().map_err(|e| e.text())?;
@@ -190,7 +212,8 @@ ktest!("rb.wdt.start", Safe, start_verdict);
 
 /// The whole system path on the fake block: armed with the real kicker hrtimer (kicks arrive), the `watchdog`
 /// tool's text, Quiesce for a reboot (grace count, still running, no kicks), resume, Quiesce for a Reload
-/// (stopped), resume, and stopped at the end (so `hang` refuses again).
+/// (stopped), resume, the panic hook (RB-13: grace count of the panic delay plus margin, no kicks), resume, and
+/// stopped at the end (so `hang` refuses again).
 fn system_fake() -> TestResult {
     if !hal::cpu::detect().hypervisor {
         return ktest::skip("only under a hypervisor (the real chip is the system's)");
@@ -228,7 +251,46 @@ fn system_fake() -> TestResult {
     kassert!(left == if reload_grace { State::Grace } else { State::Stopped }, "{left:?}");
     kassert!(reload_grace || !regs::running(d.regs()), "stopped for a Reload");
     system::resume().map_err(|e| e.text())?;
+    // RB-17: the Reload's own Quiesce holds the chip (no kicks, still counting) so the crumbs up to the jump land;
+    // kexec's before-jump hook stops it after the last one, which the next start then reads as the end.
+    let left = system::quiesce_for_jump();
+    kassert!(left == State::Grace && regs::running(d.regs()), "held for the jump: {left:?} control {:#x}", d.regs().ctl_read());
+    let base = system::crumb_base();
+    if !reload_grace {
+        let jump = crate::crumb::code(klog::crumb::Stage::ReloadJump as u16, base);
+        if let Some(jump) = jump {
+            kassert!(d.crumb(jump), "the jump's crumb is kept while held");
+        }
+        let k4 = d.kicks();
+        sched::sleep_ns(1500 * MS);
+        kassert!(d.kicks() == k4, "no kicks while held");
+        kassert!(system::stop_at_jump() && system::state() == State::Stopped && !regs::running(d.regs()));
+        if jump.is_some() {
+            let prev = crate::crumb::Previous::read_with(d.regs().count_read(), base, false);
+            kassert!(prev.id == Some(klog::crumb::Stage::ReloadJump as u16) && !prev.incomplete(), "{}", prev.text());
+        }
+    }
+    kassert!(!system::stop_at_jump(), "the stop is one-shot");
+    // RB-17 fixer: the jump failed after that stop: kexec's failed-jump hook arms the chip again without kicks,
+    // and no second stop follows it (the next stop needs a new hold).
+    system::after_failed_jump();
+    kassert!(system::state() == State::Grace && regs::running(d.regs()), "re-armed after a failed jump: {:?} control {:#x}", system::state(), d.regs().ctl_read());
+    let k5 = d.kicks();
+    kassert!(!system::stop_at_jump() && regs::running(d.regs()), "no second stop after a failed jump");
+    sched::sleep_ns(1500 * MS);
+    kassert!(d.kicks() == k5, "no kicks after a failed jump");
+    system::resume().map_err(|e| e.text())?;
     kassert!(system::state() == State::Armed && regs::running(d.regs()));
+    // RB-13: the panic hook: counting from the panic's delay plus the margin, still running, no kicks.
+    let want = kexec::crash::watchdog_secs(90);
+    let got = system::panic_grace(want);
+    kassert!(got == kexec::crash::Watchdog::Grace { secs: want }, "{got:?}");
+    kassert!(system::state() == State::Grace && regs::running(d.regs()) && d.regs().count_read() == want,
+        "panic grace: state {:?} control {:#x} count {}", system::state(), d.regs().ctl_read(), d.regs().count_read());
+    let k3 = d.kicks();
+    sched::sleep_ns(2500 * MS);
+    kassert!(d.kicks() == k3, "no kicks after the panic hook");
+    system::resume().map_err(|e| e.text())?;
     let k2 = d.kicks();
     let t0 = time::now_ns();
     while d.kicks() == k2 {
@@ -244,3 +306,42 @@ fn system_fake() -> TestResult {
     Ok(())
 }
 ktest!("rb.wdt.system_fake", QemuOnly, system_fake);
+
+/// RB-16: a breadcrumb in the system dog's count register (the real chip on the Mini-PC, the fake under QEMU):
+/// the code is in the counter and decodes back, the watchdog is quiesced last (after the mirror's transport),
+/// and `klog::crumb::clear` puts the normal timeout back. Rerunnable; the state is left as found.
+fn crumb_in_the_count() -> TestResult {
+    let st = wait_started();
+    if system::system().is_none() && hal::cpu::detect().hypervisor {
+        let fake = Arc::new(Fake::new(false, false, Some(time::now_ns)));
+        kassert!(system::start_fake(Box::new(fake)) || system::on_fake(), "the fake system dog did not start");
+    }
+    let Some(d) = system::system() else { return ktest::skip(&format!("no system watchdog ({})", st.name())) };
+    let stopped_before = system::state() != State::Armed;
+    if stopped_before {
+        if !system::on_fake() {
+            return ktest::skip(&format!("the real watchdog is {} (not armed): nothing to write into", system::state().name()));
+        }
+        system::resume().map_err(|e| e.text())?;
+    }
+    kassert!(devmodel::place_of("fch-wdt") == devmodel::Place::Final, "the watchdog is not placed last");
+    let base = system::crumb_base();
+    kassert!(base > d.timeout_s(), "crumb range base {base} not above the timeout {}", d.timeout_s());
+    let left = klog::crumb::leave(klog::crumb::Stage::Test, "rb-crumb-test");
+    let code = crate::crumb::code(klog::crumb::Stage::Test as u16, base).ok_or("no code")?;
+    let count = d.regs().count_read();
+    let back = crate::crumb::decode(count, base);
+    klog::crumb::clear();
+    let restored = d.regs().count_read();
+    if stopped_before {
+        d.stop();
+        system::quiesce_now(true);
+    }
+    kassert!(left.keep == Some(true), "the keep store did not take the crumb: {left:?}");
+    kassert!(count <= code && count + 2 >= code, "count {count}, code {code}");
+    kassert!(back == Some(klog::crumb::Stage::Test as u16), "count {count} decodes to {back:?}");
+    kassert!(restored <= d.timeout_s(), "the timeout is not back: count {restored}");
+    klog::event!(Info, "watchdog", "ktest.crumb", count = count, code = code, base = base, restored = restored, fake = system::on_fake());
+    Ok(())
+}
+ktest!("rb.wdt.crumb", Safe, crumb_in_the_count);

@@ -11,6 +11,8 @@
 //! after unpacking (INT-A1, `kexec::boot::note_initrd_released`): from then on its range is ordinary allocator
 //! memory and must not be read through `read_phys` (kexec's module readers check `kexec::boot::module_readable`).
 //! hal cannot enforce that by range, because frames Reload stages later may lie inside the released range.
+//! `fill_keep` (RB-18) takes a byte range of this kernel's own BootInfo `BITS_KEEP` block, once, before the other
+//! CPUs start and with no reference into that range used afterwards, or a frame the caller got from the allocator.
 //!
 //! The stub (`bits_kexec_stub_*`) is position independent and runs from the `KEEP` stub page, which the running
 //! kernel's tables (bitsboot maps it identity, executable) and the new tables (kexec builds them like bitsboot)
@@ -388,6 +390,28 @@ pub fn zero_phys(phys: u64, len: u64) -> bool {
     unsafe {
         core::ptr::write_bytes(crate::phys_to_virt(phys) as *mut u8, 0, len as usize)
     };
+    true
+}
+
+/// RB-18: overwrites `len` bytes at physical `phys` with `byte` (the module rule's range). Volatile: the bytes are
+/// a secret's and nothing may read them afterwards, so the compiler must not drop the write.
+pub fn fill_keep(phys: u64, len: u64, byte: u8) -> bool {
+    if phys.checked_add(len).is_none() {
+        return false;
+    }
+    #[cfg(target_os = "none")]
+    // SAFETY: by the module rule the range is RAM, direct-mapped and writable in bitsboot's tables and the kernel's.
+    // Either it is the caller's private frame, or it lies in the BootInfo KEEP block. There one thread runs (the
+    // other CPUs have not started), and Rust's rule for the `&'static [u8]` kernel_entry made over the block is kept
+    // by not using it again: kernel_entry parses a new BootInfo from the raw pointer after this write (RB-18 CR-5).
+    unsafe {
+        let p = crate::phys_to_virt(phys) as *mut u8;
+        for i in 0..len as usize {
+            p.add(i).write_volatile(byte);
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = byte;
     true
 }
 

@@ -12,8 +12,9 @@
 #                   out); the libraries its programs need beyond the initramfs set go to its own lib\ (RPATH
 #                   $ORIGIN/lib), the rest of the set stays in the initramfs. A tree's name may equal a program's.
 #                   BR-2: so do the needs of the shared libraries the source has in its lib\ (dlopened ones).
-#                   A ktest image carries a tree only if its filter can run the tree's ktests ul.pkg.<name>*
-#                   (V2_STICK_TREES=1 or =<name>,<name> puts trees into any image; image.rs tree_wanted).
+#                   Georg 30.10., programs only on the Mini-PC: no QEMU image carries a tree by itself; only
+#                   V2_STICK_TREES=1 or =<name>,<name> puts trees into an image (image.rs tree_wanted). The package list
+#                   names them all the same, and a build still needs their stages.
 #   source  host:/abs/path    a CachyOS file copied unchanged; a dynamic one pulls its libraries into the set
 #           file:rel/path     YT-2: a file of this repository copied unchanged (a launcher script; for data: a configuration file)
 #           g++:rel/path.cc   built with the host's g++ against CachyOS's glibc and libstdc++ (PIE, dynamic)
@@ -34,6 +35,16 @@ stick  ninja    host:/usr/bin/ninja
 # WY-1a: the compositor on V2 (fbdev + evdev back end; ~4 MB stripped, so RAM is fine) and its Wayland test client.
 initrd bitscomp cargo:user/services/bitscomp
 initrd wyclient cargo:user/services/bitscomp/wyclient
+# WY-14: the gpu build (\BITSOS2\bin\bitscomp-gpu), linked against the Mesa tree's own glibc (\BITSOS2\mesa\, whose
+# loader is its PT_INTERP, so no host libraries are added for it); CONFIG bitscomp=gpu hands over to it. Without the
+# tree on the stick, /bin/bitscomp (the rescue build) keeps running.
+stick bitscomp-gpu cargo:user/services/bitscomp+gpu
+# WY-3 (INT-W27b): Xwayland in software (\BITSOS2\xwayland\, 14 MB): bin/Xwayland and bin/xkbcomp run on the Mesa
+# tree's glibc (PT_INTERP and DT_RPATH there), so nothing comes by ldd; lib/ holds what the Mesa tree lacks and
+# share/X11/xkb the keymap data. Made by user/ports/xwayland/scripts/build-v2.sh without XW_TEST (needs the Mesa
+# stage; XW_OUT=<dir> puts the tree in <dir>/xwayland), then copied to the source below; bitscomp starts it at the
+# first X11 client on DISPLAY=:0.
+tree  xwayland host:/var/tmp/claude-v2/stage/xwayland
 # The German keymap's xkeyboard-config files (what `xkbcli compile-keymap --layout de` opens, about 330 KB), at
 # CachyOS's path, which libxkbcommon has built in (no XKB_CONFIG_ROOT needed).
 data /usr/share/xkeyboard-config-2/rules/evdev   host:/usr/share/xkeyboard-config-2/rules/evdev
@@ -94,6 +105,16 @@ stick cobalt file:user/ports/cobalt-launcher/bitsos/cobalt
 # desktop (`brave --check`).
 tree  brave host:/var/tmp/claude-v2/stage/brave
 stick brave file:user/ports/brave-launcher/bitsos/brave
+# LO-1: LibreOffice (CachyOS's libreoffice-fresh, its signed package from pacman's cache; ~380 MB plus its libraries
+# by ldd, among them those of program/*.so, which find each other through RUNPATH $ORIGIN) in \BITSOS2\libreoffice\:
+# made by user/ports/libreoffice-launcher/scripts/stage-v2.sh (run it again after an update). `libreoffice` starts
+# it in the desktop (`libreoffice writer`, `libreoffice calc`, `libreoffice --check`); bitscomp's addresses
+# programm/writer, programm/calc and programm/libreoffice do the same.
+tree  libreoffice host:/var/tmp/claude-v2/stage/libreoffice
+stick libreoffice file:user/ports/libreoffice-launcher/bitsos/libreoffice
+# liblangtag's language-tag registry (2.2 MB), at the path liblangtag has built in (no variable moves it): without it
+# every LibreOffice start warns "Unable to read the xml file" and BCP 47 tags (de-DE) are not checked.
+data /usr/share/liblangtag host:/usr/share/liblangtag
 # ktest ul.pkg.brave_fonts: fontconfig as Brave loads it, against the tree's prebuilt cache (16 KB).
 initrd fc-probe gcc:user/ports/brave-launcher/tests/fc-probe.c
 # What glibc and Chromium read in /etc beyond init's files: name services without systemd-resolved (BR-1 failure
@@ -101,6 +122,10 @@ initrd fc-probe gcc:user/ports/brave-launcher/tests/fc-probe.c
 # besides the desktop's keymap (BR-2 trace: symbols/us).
 data /etc/nsswitch.conf                           file:user/ports/brave-launcher/files/nsswitch.conf
 data /etc/machine-id                              file:user/ports/brave-launcher/files/machine-id
+# INT-W27b (SX-3c CR2): os-release(5), at both places programs read it (steam-runtime-system-info's
+# container.host.os-release names V2).
+data /usr/lib/os-release                          file:user/packaging/os-release
+data /etc/os-release                              file:user/packaging/os-release
 data /usr/share/xkeyboard-config-2/symbols/us     host:/usr/share/xkeyboard-config-2/symbols/us
 
 # SN-4: ALSA on V2 (card 0 = the mixer). CachyOS's aplay and speaker-test (alsa-utils; libasound comes by ldd)

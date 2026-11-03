@@ -34,10 +34,23 @@ pub enum Ev {
     Woke,
 }
 
-pub const MAC: [u8; 6] = [0xC8, 0xFF, 0xBF, 0x06, 0x08, 0x34];
+pub const MAC: [u8; 6] = [0x02, 0xB1, 0x75, 0x00, 0x00, 0x01];
 pub const AN_DELAY_NS: u64 = 500_000_000;
 
+/// When PHPM's reset-complete bit shows after PHY_RST is released (NW-9: the real I226's behaviour is not
+/// known, so the driver must cope with each).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetCompl {
+    /// Set `after_ns` after the release and stays set.
+    Level { after_ns: u64 },
+    /// Set only from `after_ns` to `after_ns + len_ns` after the release.
+    Pulse { after_ns: u64, len_ns: u64 },
+    /// Never set again.
+    Never,
+}
+
 pub struct Knobs {
+    pub phy_reset_compl: ResetCompl,
     pub cable: bool,
     /// SWSM.SMBI cannot be cleared at all.
     pub smbi_locked: bool,
@@ -58,6 +71,8 @@ pub struct Knobs {
     /// `Hw::enable` answers with this error (PC-2's `enable_device` refused or failed).
     pub enable_fails: Option<PciFail>,
     pub queue_wont_enable: bool,
+    /// RB-15: a queue does not report off (its QUEUE_ENABLE reads 1 after the driver cleared it) until a reset.
+    pub queue_stays_on: bool,
     /// MPC's next value (clear on read).
     pub missed: u32,
     /// The transmit engine runs whenever the driver reads TDH (a card sending in the background).
@@ -71,6 +86,7 @@ pub struct Knobs {
 impl Default for Knobs {
     fn default() -> Self {
         Knobs {
+            phy_reset_compl: ResetCompl::Level { after_ns: 0 },
             cable: true,
             smbi_locked: false,
             fw_holds_swesmbi_until: 0,
@@ -85,6 +101,7 @@ impl Default for Knobs {
             bars_lost: false,
             enable_fails: None,
             queue_wont_enable: false,
+            queue_stays_on: false,
             missed: 0,
             tx_autorun: false,
             irq: crate::irq::IrqSetup::Polled,
@@ -105,6 +122,8 @@ struct St {
     msix_on: bool,
     an_enabled: bool,
     link_at: Option<u64>,
+    /// When PHY_RST was last released (PHPM's completion bit is computed from it).
+    phy_released_at: Option<u64>,
     trace: Vec<Ev>,
     bus: Vec<VecMem>,
     next_addr: u64,
@@ -139,6 +158,7 @@ impl Fake {
         let mut phy = [0u16; 32];
         phy[phy::BMCR as usize] = phy::BMCR_POWER_DOWN;
         phy[phy::ANAR as usize] = 0x0C01;
+        phy[phy::ID1 as usize] = 0x67C9;
         Fake {
             model,
             hook: SpinLock::new(None),
@@ -157,6 +177,7 @@ impl Fake {
                 msix_on: false,
                 an_enabled: false,
                 link_at: None,
+                phy_released_at: None,
                 trace: Vec::new(),
                 bus: Vec::new(),
                 next_addr: 0x1_0000_0000,
@@ -440,6 +461,17 @@ impl Hw for Fake {
                 self.run_tx_locked(&mut s);
                 reg(&s, regs::TDH)
             }
+            regs::PHPM => {
+                let p = reg(&s, regs::PHPM);
+                let Some(t) = s.phy_released_at else { return p };
+                let since = now.saturating_sub(t);
+                let set = match s.k.phy_reset_compl {
+                    ResetCompl::Level { after_ns } => since >= after_ns,
+                    ResetCompl::Pulse { after_ns, len_ns } => since >= after_ns && since < after_ns.saturating_add(len_ns),
+                    ResetCompl::Never => false,
+                };
+                if set { p | regs::PHPM_RST_COMPL } else { p & !regs::PHPM_RST_COMPL }
+            }
             r if r == self.model.icr() => {
                 let v = reg(&s, r);
                 s.regs.insert(r, 0);
@@ -467,13 +499,13 @@ impl Hw for Fake {
                     s.trace.push(Ev::PhyReset);
                     let p = reg(&s, regs::PHPM);
                     s.regs.insert(regs::PHPM, p & !regs::PHPM_RST_COMPL);
+                    s.phy_released_at = None;
                     s.phy[0] = phy::BMCR_POWER_DOWN;
                     s.an_enabled = false;
                     s.link_at = None;
                 }
                 if v & ctrl::PHY_RST == 0 && old & ctrl::PHY_RST != 0 {
-                    let p = reg(&s, regs::PHPM);
-                    s.regs.insert(regs::PHPM, p | regs::PHPM_RST_COMPL);
+                    s.phy_released_at = Some(now);
                 }
                 s.regs.insert(regs::CTRL, v);
             }
@@ -497,6 +529,15 @@ impl Hw for Fake {
             }
             regs::RXDCTL | regs::TXDCTL if s.k.queue_wont_enable => {
                 s.regs.insert(off, v & !regs::QUEUE_ENABLE);
+            }
+            regs::RXDCTL | regs::TXDCTL if s.k.queue_stays_on => {
+                let on = reg(&s, off) & regs::QUEUE_ENABLE;
+                s.regs.insert(off, v | on);
+            }
+            regs::PHPM => {
+                // The completion bit is the hardware's: a read-modify-write does not change it.
+                let keep = reg(&s, regs::PHPM) & regs::PHPM_RST_COMPL;
+                s.regs.insert(regs::PHPM, (v & !regs::PHPM_RST_COMPL) | keep);
             }
             regs::EICR => {
                 let c = reg(&s, regs::EICR);

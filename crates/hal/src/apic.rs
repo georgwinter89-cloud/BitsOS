@@ -261,10 +261,6 @@ pub fn isr_bit(vector: u8) -> bool {
 pub fn irr_bit(vector: u8) -> bool {
     reg_bit(REG_IRR, vector)
 }
-/// Whether the in-service vector was accepted level-triggered (TMR).
-pub fn tmr_bit(vector: u8) -> bool {
-    reg_bit(REG_TMR, vector)
-}
 
 fn reg_bit(base: u32, vector: u8) -> bool {
     read(base + 0x10 * (vector as u32 / 32)).is_some_and(|w| w & (1 << (vector % 32)) != 0)

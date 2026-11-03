@@ -109,6 +109,10 @@ pub const RXPBS: usize = 0x2404;
 pub const TXPBS: usize = 0x3404;
 pub const RFCTL: usize = 0x5008;
 pub const MANC: usize = 0x5820;
+/// Wake-up control and filter control (Linux `IGC_WUC`/`IGC_WUFC`, igc_regs.h:291-292): 0 at shutdown without
+/// Wake-on-LAN (`__igc_shutdown`).
+pub const WUC: usize = 0x5800;
+pub const WUFC: usize = 0x5808;
 pub const PTM_CTRL: usize = 0x12540;
 
 pub mod ctrl {
@@ -179,6 +183,10 @@ pub const EEER_EEE: u32 = 0x7_0000;
 
 // Rings (`V1:igcring.asm:183-185, 214-234`).
 pub const QUEUE_ENABLE: u32 = 1 << 25;
+/// TXDCTL/RXDCTL software flush (Linux `IGC_TXDCTL_SWFLUSH`, igc_base.h:86): set with the queue disable.
+pub const QUEUE_SWFLUSH: u32 = 1 << 26;
+/// RCTL receiver enable (Linux `IGC_RCTL_EN`).
+pub const RCTL_EN: u32 = 1 << 1;
 /// RXDCTL WTHRESH 1: each descriptor written back at once (matters while polling).
 pub const RX_WTHRESH1: u32 = 1 << 16;
 /// Advanced one-buffer descriptors, 2 KB buffers.
@@ -252,6 +260,8 @@ pub mod phy {
     pub const BMCR_RESTART_AN: u16 = 0x0200;
     pub const BMCR_POWER_DOWN: u16 = 0x0800;
     pub const BMCR_AN_ENABLE: u16 = 0x1000;
+    /// PHY identifier, upper word (Linux `PHY_ID1`): 0 or all ones when nothing answers.
+    pub const ID1: u32 = 2;
     pub const ANAR: u32 = 4;
     /// 10 half/full, 100 half/full (Linux `NWAY_AR_*_CAPS`).
     pub const ANAR_SPEEDS: u16 = 0x01E0;

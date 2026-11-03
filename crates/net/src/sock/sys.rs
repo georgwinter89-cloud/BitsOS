@@ -31,7 +31,7 @@ fn access_ok(buf: u64, count: u64) -> bool {
 }
 
 fn caller(s: &Sys<'_>) -> Caller {
-    Caller { pid: s.subject.pid, uid: s.cred.uid, gid: s.cred.gid, subject: s.subject }
+    super::with_ns(Caller::new(s.subject.pid, s.cred.uid, s.cred.gid, s.subject))
 }
 
 /// `sockfd_lookup_light`: EBADF (no fd, or an O_PATH one), ENOTSOCK.
@@ -92,7 +92,7 @@ fn addr_out(s: &Sys<'_>, k: &[u8], uaddr: u64, ulen: u64) -> Result<(), Errno> {
     put(s, ulen, &(k.len() as u32).to_le_bytes())
 }
 
-fn open_file(f: Arc<SockFile>, flags: u64) -> Arc<OpenFile> {
+pub(crate) fn open_file(f: Arc<SockFile>, flags: u64) -> Arc<OpenFile> {
     OpenFile::new(f, OpenFlags { read: true, write: true, nonblock: flags & SOCK_NONBLOCK != 0, ..Default::default() })
 }
 
@@ -103,7 +103,7 @@ fn install(s: &Sys<'_>, f: Arc<SockFile>, flags: u64) -> Result<usize, Errno> {
 
 /// `__sock_create` with the families BitsOS has: AF_UNIX, AF_INET, AF_INET6 (::1 and v4-mapped peers, NW-v6) and
 /// AF_NETLINK (NETLINK_ROUTE, NW-6).
-fn create(family: u64, ty: u32, protocol: u64, c: &Caller) -> Result<Kind, Errno> {
+pub(crate) fn create(family: u64, ty: u32, protocol: u64, c: &Caller) -> Result<Kind, Errno> {
     let family = family as u32 as i32;
     if family < 0 || family as u64 >= NPROTO {
         return Err(EAFNOSUPPORT);
@@ -118,7 +118,7 @@ fn create(family: u64, ty: u32, protocol: u64, c: &Caller) -> Result<Kind, Errno
                 return Err(EPROTONOSUPPORT);
             }
             let t = UType::from_linux(ty).ok_or(ESOCKTNOSUPPORT)?;
-            Ok(Kind::Unix(UnixSock::new(t)))
+            Ok(Kind::Unix(UnixSock::new_in(t, c.net.clone())))
         }
         AF_INET => Ok(Kind::Inet(InetSock::create(ty, protocol as u32 as i32, c)?)),
         AF_INET6 => Ok(Kind::Inet(InetSock::create6(ty, protocol as u32 as i32, c)?)),
@@ -677,8 +677,9 @@ fn recvmsg_one(s: &Sys<'_>, f: &OpenFile, k: &SockFile, at: u64, flags: u32) -> 
         for (level, ty, d) in &r.ctl {
             out.put(s, *level, *ty, d);
         }
+        // Kept in kernel ids; the receiver reads them in its own namespaces (`scm_set_cred`, NW-11).
         if let Some(c) = r.creds {
-            out.put(s, SOL_SOCKET, SCM_CREDENTIALS, &c.bytes());
+            out.put(s, SOL_SOCKET, SCM_CREDENTIALS, &caller(s).view_of(c).bytes());
         }
         if !r.fds.is_empty() {
             out.rights(s, r.fds, flags & MSG_CMSG_CLOEXEC != 0);
@@ -905,7 +906,7 @@ fn set_sol_socket(k: &SockFile, c: &Caller, name: u32, val: &[u8]) -> Result<(),
         SO_BUSY_POLL if v < 0 => return Err(EINVAL),
         SO_BUSY_POLL => o.busy_poll.store(v as u32, Ordering::Relaxed),
         SO_INCOMING_CPU => o.incoming_cpu.store(v, Ordering::Relaxed),
-        SO_BINDTOIFINDEX => return bind_to_index(k, c.uid, v),
+        SO_BINDTOIFINDEX => return bind_to_index(k, c, v),
         _ => return Err(ENOPROTOOPT),
     }
     Ok(())
@@ -918,16 +919,16 @@ fn set_bindtodevice(s: &Sys<'_>, k: &SockFile, optval: u64, optlen: usize) -> Re
     let n = optlen.min(IFNAMSIZ - 1);
     let name = read_bytes(s, optval, n)?;
     let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
-    let index = if name.is_empty() { 0 } else { crate::ifview::by_name(name).ok_or(ENODEV)?.index };
-    bind_to_index(k, s.cred.uid, index as i32)
+    let index = if name.is_empty() { 0 } else { crate::ifview::by_name_in(k.net(), name).ok_or(ENODEV)?.index };
+    bind_to_index(k, &caller(s), index as i32)
 }
 
 /// `sock_bindtoindex_locked` (SO_BINDTODEVICE by name, SO_BINDTOIFINDEX by number): EPERM to change a binding
 /// without CAP_NET_RAW, EINVAL for a negative index. An index that names no interface is taken as it is (Linux
 /// does not look it up either).
-fn bind_to_index(k: &SockFile, uid: u32, index: i32) -> Result<(), Errno> {
+fn bind_to_index(k: &SockFile, c: &Caller, index: i32) -> Result<(), Errno> {
     let o = k.opts();
-    if o.bound_dev.load(Ordering::Relaxed) != 0 && uid != 0 {
+    if o.bound_dev.load(Ordering::Relaxed) != 0 && !c.can(super::cap::NET_RAW) {
         return Err(EPERM);
     }
     if index < 0 {
@@ -947,7 +948,7 @@ fn get_bindtodevice(k: &SockFile, len: usize) -> Result<Vec<u8>, Errno> {
     if len < IFNAMSIZ {
         return Err(EINVAL);
     }
-    let mut v = crate::ifview::by_index(index).ok_or(ENODEV)?.name.into_bytes();
+    let mut v = crate::ifview::by_index_in(k.net(), index).ok_or(ENODEV)?.name.into_bytes();
     v.push(0);
     Ok(v)
 }
@@ -982,7 +983,7 @@ pub fn setsockopt(s: &Sys<'_>, a: Args) -> i64 {
                 // SOL_IPV6 has struct values (ipv6_mreq, in6_pktinfo); everything else reads an int.
                 let want = if level == inet::SOL_IPV6 { inet::opt6_len(name) } else { 4 };
                 let val = read_bytes(s, a[3], n.min(want));
-                i.setsockopt(level, name, optlen as usize, val)
+                i.setsockopt(level, name, optlen as usize, val, &caller(s))
                     .map(|_| 0)
             }
             // `netlink_setsockopt`: SOL_NETLINK only; a value shorter than an int is read as 0.
@@ -998,7 +999,7 @@ pub fn setsockopt(s: &Sys<'_>, a: Args) -> i64 {
 }
 
 /// SOL_SOCKET values for getsockopt (`sk_getsockopt`).
-fn get_sol_socket(k: &SockFile, name: u32) -> Result<Vec<u8>, Errno> {
+fn get_sol_socket(s: &Sys<'_>, k: &SockFile, name: u32) -> Result<Vec<u8>, Errno> {
     let o = k.opts();
     let int = |v: u32| v.to_le_bytes().to_vec();
     let b = |f: u32| int(o.has(f) as u32);
@@ -1036,7 +1037,13 @@ fn get_sol_socket(k: &SockFile, name: u32) -> Result<Vec<u8>, Errno> {
                 Kind::Unix(u) => u.peercred(),
                 _ => None,
             };
-            c.unwrap_or(super::Ucred { pid: 0, uid: u32::MAX, gid: u32::MAX }).bytes().to_vec()
+            // `cred_to_ucred` in the reader's namespaces (NW-11; no peer: pid 0, ids -1).
+            match c {
+                Some(c) => caller(s).view_of(c),
+                None => super::Ucred { pid: 0, uid: u32::MAX, gid: u32::MAX },
+            }
+            .bytes()
+            .to_vec()
         }
         SO_ACCEPTCONN => int(match &k.kind {
             Kind::Unix(u) => u.is_listening(),
@@ -1075,7 +1082,7 @@ pub fn getsockopt(s: &Sys<'_>, a: Args) -> i64 {
         let v = if level == SOL_SOCKET && name == SO_BINDTODEVICE {
             get_bindtodevice(&k, len as usize)?
         } else if level == SOL_SOCKET {
-            get_sol_socket(&k, name)?
+            get_sol_socket(s, &k, name)?
         } else {
             match &k.kind {
                 Kind::Unix(_) => return Err(EOPNOTSUPP),
@@ -1138,6 +1145,6 @@ pub fn dev_ioctl(s: &Sys<'_>, a: Args) -> Option<i64> {
         return None;
     }
     let k = SockFile::of(&f.file)?;
-    let asker = super::devioctl::Asker { mem: s.mem, uid: s.cred.uid };
+    let asker = super::devioctl::Asker { mem: s.mem, caller: caller(s), net: k.net().clone() };
     super::devioctl::ioctl(&asker, &k, a[1] as u32 as u64, a[2])
 }

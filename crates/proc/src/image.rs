@@ -128,7 +128,9 @@ pub(crate) fn load(mm: &AddressSpace, prog: &Image<'_>, interp: Option<&Image<'_
     let mut rnd = [0u8; 16];
     crate::random_bytes(&mut rnd);
     let interp_base = iplan.as_ref().map_or(0, |p| p.bias);
-    let aux = auxv(prog.elf, &plan, interp_base, cred);
+    // AB-14: [vvar] and [vdso] after the program and its interpreter (Linux's ARCH_SETUP_ADDITIONAL_PAGES).
+    let vdso = crate::vdso::map_into(mm);
+    let aux = auxv(prog.elf, &plan, interp_base, vdso, cred);
     let img = stack::build(STACK_TOP, stack_size, argv, envp, execfn, rnd, &aux).map_err(|e| match e {
         stack::StackError::TooBig => SpawnError::TooBig,
         stack::StackError::NoMemory => SpawnError::NoMemory,
@@ -225,13 +227,18 @@ pub fn min_sigstack_size() -> u64 {
     (440 + 15 + xsave + 4 + 112 + 63).next_multiple_of(16)
 }
 
-/// The auxiliary vector in Linux's order (ARCH_DLINFO first, then `create_elf_tables`). Not there: AT_SYSINFO_EHDR
-/// (no vDSO before AB-9: glibc and musl then make the real clock syscalls), AT_RSEQ_* (rseq is ENOSYS, AB-8's
-/// decision), AT_BASE_PLATFORM (x86 has none). `interp_base` is AT_BASE (0 without an interpreter).
-pub(crate) fn auxv(elf: &elf::Elf, plan: &load::Plan, interp_base: u64, cred: &crate::cred::Cred) -> Vec<(u64, stack::AuxVal)> {
+/// The auxiliary vector in Linux's order (ARCH_DLINFO first: AT_SYSINFO_EHDR when the vDSO is mapped (AB-14),
+/// AT_MINSIGSTKSZ; then `create_elf_tables`). Not there: AT_RSEQ_* (rseq is ENOSYS, AB-8's decision),
+/// AT_BASE_PLATFORM (x86 has none). `interp_base` is AT_BASE (0 without an interpreter), `vdso` the image's
+/// address.
+pub(crate) fn auxv(elf: &elf::Elf, plan: &load::Plan, interp_base: u64, vdso: Option<u64>, cred: &crate::cred::Cred) -> Vec<(u64, stack::AuxVal)> {
     use stack::AuxVal::*;
     use uapi::auxv::*;
-    alloc::vec![
+    let mut v = Vec::new();
+    if let Some(a) = vdso {
+        v.push((AT_SYSINFO_EHDR, Value(a)));
+    }
+    v.extend([
         (AT_MINSIGSTKSZ, Value(min_sigstack_size())),
         (AT_HWCAP, Value(hal::cpu::cpuid(1, 0).edx as u64)),
         (AT_PAGESZ, Value(4096)),
@@ -254,5 +261,6 @@ pub(crate) fn auxv(elf: &elf::Elf, plan: &load::Plan, interp_base: u64, cred: &c
         (AT_HWCAP2, Value(if hal::entry::user_fsgsbase() { HWCAP2_FSGSBASE } else { 0 })),
         (AT_EXECFN, ExecFn),
         (AT_PLATFORM, Platform),
-    ]
+    ]);
+    v
 }

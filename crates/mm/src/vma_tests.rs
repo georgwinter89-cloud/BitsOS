@@ -208,3 +208,31 @@ fn file_vmas_split_and_merge() {
     assert_eq!(t.len(), 4, "anonymous memory never merges with a file VMA");
     check(&t);
 }
+
+/// MM-11: the gap a munmap may free page tables in reaches from the VMA below to the VMA above.
+#[test]
+fn gap_around_is_free_pgtables_floor_and_ceiling() {
+    let mut t = VmaTree::new();
+    assert_eq!(t.gap_around(10 * P, 20 * P), (0, u64::MAX), "no VMA at all");
+    t.insert(anon(2 * P, 5 * P, RW)).unwrap();
+    t.insert(anon(30 * P, 40 * P, RO)).unwrap();
+    t.insert(anon(50 * P, 60 * P, RW)).unwrap();
+    assert_eq!(t.gap_around(10 * P, 20 * P), (5 * P, 30 * P));
+    assert_eq!(t.gap_around(5 * P, 30 * P), (5 * P, 30 * P), "touching neighbours");
+    assert_eq!(t.gap_around(40 * P, 50 * P), (40 * P, 50 * P));
+    assert_eq!(t.gap_around(70 * P, 80 * P), (60 * P, u64::MAX), "nothing above");
+    assert_eq!(t.gap_around(0, P), (0, 2 * P), "nothing below");
+}
+
+#[test]
+fn read_hints_split_and_merge_back() {
+    // MM-12: MADV_RANDOM on the middle splits like the other flag advice; MADV_NORMAL merges it back.
+    let mut t = VmaTree::new();
+    t.insert(anon(10 * P, 20 * P, RW)).unwrap();
+    t.update(12 * P, 14 * P, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (true, false)).unwrap();
+    assert_eq!(t.len(), 3);
+    assert!(t.find(13 * P).unwrap().flags.rand_read && !t.find(15 * P).unwrap().flags.rand_read);
+    t.update(10 * P, 20 * P, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (false, false)).unwrap();
+    assert_eq!(ranges(&t), [(10 * P, 20 * P, RW)]);
+    check(&t);
+}

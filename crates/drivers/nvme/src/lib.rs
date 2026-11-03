@@ -1,5 +1,8 @@
 //! NVMe, read side (NV-1; V2-PLAN §8a.8, R8a). Owner: NV.
 //!
+//! Internal NVMe stays read-only until NV-2 builds the write path: the write gate around it (`block::policy`'s
+//! `nvme_write`, MC-10's full-access tick) is live safety scaffolding that nothing behind it reads yet (C1).
+//!
 //! - `regs`, `cmd`, `queue`, `prp`, `ident`: registers, the command builder (no media-writing opcode exists),
 //!   the ring logic, PRP lists and the Identify/SMART layouts, as plain logic (host-tested);
 //! - `ctrl::Controller<H>`: bring-up, admin and I/O queue (polled first, then the MSI-X vector), Read, Flush,

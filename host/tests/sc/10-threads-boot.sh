@@ -23,7 +23,7 @@ cargo xtask qemu --name "$NAME" --timeout 12 --net user --serial-log "$LOG" || t
 
 grep -a "sched ready\|sched timers.ready\|sched timer.fallback\|sched cpu.join\|smoke \|thread.exit id=1 \|PANIC\|panicked\|switch.failed\|spawn.failed\|stack_overflow\|ksync lock\.\|reap.stalled" "$LOG" || true
 grep -aq "sched ready mode=sc3-smp" "$LOG" || { echo "RED: no sched ready event"; exit 1; }
-grep -aq "sched timers.ready sleep=hrtimer tick=hrtimer_when_busy" "$LOG" || { echo "RED: no sched timers.ready event"; exit 1; }
+grep -aq "sched timers.ready sleep=hrtimer_per_cpu tick=hrtimer_when_busy" "$LOG" || { echo "RED: no sched timers.ready event"; exit 1; }
 if grep -aq "E sched " "$LOG"; then echo "RED: scheduler error event"; exit 1; fi
 grep -aq "sched cpu.join cpu=1 " "$LOG" || { echo "RED: the AP did not join the scheduler"; exit 1; }
 if grep -aq "reap.stalled\|cpu.join_failed" "$LOG"; then echo "RED: reaper stall or a CPU that could not join"; exit 1; fi

@@ -16,17 +16,41 @@
 //! under an immediate flip type), X26 (0x1B8A is the LOCK on 3.1.4).
 
 use crate::attach::{Pipe, Regs};
-use crate::dcn::{DcnError, DcnRegs};
+use crate::dcn::{DcnError, DcnRegs, Owner};
 use crate::layout as l;
 
 /// A register owner that also writes: every write is read back; only the bits in `check` must match.
 pub trait Rw: Regs {
     fn write(&self, byte: u32, value: u32, check: u32) -> Result<(), DcnError>;
+    /// GX-7m2: `write` on behalf of `owner` (the display's write log tells the compositor's flips and cursor
+    /// updates apart); owners without a log ignore it.
+    fn write_as(&self, byte: u32, value: u32, check: u32, owner: Owner) -> Result<(), DcnError> {
+        let _ = owner;
+        self.write(byte, value, check)
+    }
 }
 
 impl Rw for DcnRegs {
     fn write(&self, byte: u32, value: u32, check: u32) -> Result<(), DcnError> {
         DcnRegs::write_masked(self, byte, value, check)
+    }
+    fn write_as(&self, byte: u32, value: u32, check: u32, owner: Owner) -> Result<(), DcnError> {
+        DcnRegs::write_owned(self, byte, value, check, owner)
+    }
+}
+
+/// GX-7m2: `r` with every write made on behalf of `owner` (a page flip's, a cursor update's).
+pub struct As<'a, R: Rw>(pub &'a R, pub Owner);
+
+impl<R: Rw> Regs for As<'_, R> {
+    fn read(&self, byte: u32) -> Option<u32> {
+        self.0.read(byte)
+    }
+}
+
+impl<R: Rw> Rw for As<'_, R> {
+    fn write(&self, byte: u32, value: u32, check: u32) -> Result<(), DcnError> {
+        self.0.write_as(byte, value, check, self.1)
     }
 }
 
@@ -123,6 +147,8 @@ fn program(r: &impl Rw, p: &Pipe, addr: u64, types: Types) -> Result<(), FlipErr
 pub fn order(r: &impl Rw, pipes: &[Pipe], addr: u64, types: Types) -> Result<Ordered, FlipError> {
     let otgs = pipes.iter().filter(|p| u32::from(p.otg) < 32).fold(0u32, |m, p| m | 1 << p.otg);
     let mut locked = 0u32;
+    // GX-7m2: every write of the flip is the compositor's (the picture proof lists them apart).
+    let r = &As(r, Owner::Flip);
     let res = locked_section(r, pipes, addr, types, otgs, &mut locked);
     let mut un = Ok(());
     for k in (0..32).rev().filter(|k| locked & (1 << k) != 0) {

@@ -5,7 +5,7 @@ extern crate std;
 
 use crate::backend::{Backend, Endpoint, OutError, Stream, Target, WakeFn};
 use crate::client::{self, Playback, SndError, State, UNITY};
-use crate::mixer::{Config, Core, Shared, start_together};
+use crate::mixer::{Config, Core, LATE_WINDOW_NS, Shared, start_together};
 use crate::testsig::{self, frames};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -38,11 +38,19 @@ struct Hw {
     none: bool,
     hp: bool,
     jack: bool,
+    /// The streams' positions stop (a controller that stopped counting).
+    stall: bool,
+    /// Only this controller's streams stop counting.
+    stall_dev: Option<String>,
 }
 
 impl Hw {
     fn advance(&mut self, n: usize) {
-        for s in self.sims.iter_mut().filter(|s| s.running && !s.closed) {
+        if self.stall {
+            return;
+        }
+        let stalled = self.stall_dev.clone();
+        for s in self.sims.iter_mut().filter(|s| s.running && !s.closed && stalled.as_deref() != Some(s.ep.dev.as_str())) {
             let name = s.ep.name();
             let i = match self.sinks.iter().position(|x| x.0 == name) {
                 Some(i) => i,
@@ -158,9 +166,12 @@ struct T {
 
 impl T {
     fn new(delay: usize) -> T {
+        T::with_latency(delay, 40)
+    }
+    fn with_latency(delay: usize, ms: u32) -> T {
         let hw: HwRef = Arc::new(Mutex::new(Hw { delay, ..Default::default() }));
         let sh = Arc::new(Shared::new());
-        let core = Core::new(Fake(hw.clone()), sh.clone(), Config::latency_ms(40));
+        let core = Core::new(Fake(hw.clone()), sh.clone(), Config::latency_ms(ms));
         T { hw, sh, core, now: 1_000_000_000 }
     }
     fn ms(&mut self, ms: usize) {
@@ -389,6 +400,93 @@ fn idle_output_closes_and_reopens() {
     assert_eq!(t.sh.status().clients, 1, "the closed client is still listed");
 }
 
+/// SN-13 (w25): an idle output whose position stopped is closed after `retire_ns` instead of staying open (and
+/// its controller streaming) with no client.
+#[test]
+fn idle_output_with_a_stalled_position_closes_anyway() {
+    let mut t = T::new(0);
+    let x = t.open(F48, 4800);
+    x.write_frames(&frames(testsig::c, 0, 960)).unwrap();
+    x.start_drain();
+    t.until(1000, || x.state() == State::Drained);
+    drop(x);
+    t.hw.lock().unwrap().stall = true;
+    let cfg = Config::latency_ms(40);
+    t.ms((cfg.idle_ns / 1_000_000) as usize + 5);
+    assert_eq!(t.sh.status().streams, 1, "retiring: it waits for its rest to play");
+    assert_eq!(t.hw.lock().unwrap().open_count(), 1);
+    t.ms((cfg.retire_ns() / 1_000_000) as usize + 2);
+    assert_eq!(t.sh.status().streams, 0);
+    assert_eq!(t.hw.lock().unwrap().open_count(), 0, "closed although the position never moved");
+    assert!(cfg.retire_ns() < 1_000_000_000, "bound {} ns", cfg.retire_ns());
+}
+
+/// SN-13 fixer: `hdmi-off` moves the target, then waits `leave_bound_ns` for the mixer to leave the controller.
+/// With the old controller's position stopped, the retiring output's own deadline closes it inside that wait.
+#[test]
+fn a_stalled_output_leaves_its_controller_within_the_hdmi_off_bound() {
+    let mut t = T::new(0);
+    t.sh.set_target(Target::Fixed { dev: "dev1".into(), port: Port::Jack });
+    let x = t.open(F48, 60000);
+    x.write_frames(&frames(testsig::c, 0, 30000)).unwrap();
+    x.start();
+    t.ms(200);
+    assert_eq!(t.sh.status().endpoint.as_deref(), Some(D1));
+    t.hw.lock().unwrap().stall_dev = Some("dev1".into());
+    t.sh.set_target(Target::Fixed { dev: "dev0".into(), port: Port::Jack });
+    let cfg = Config::latency_ms(40);
+    let bound_ms = (crate::output::leave_bound_ns(&cfg) / 1_000_000) as usize;
+    let sh = t.sh.clone();
+    let waited = t.until(bound_ms, || !crate::output::on_controller(&sh.status(), "dev1"));
+    assert!(waited as u64 * 1_000_000 >= cfg.retire_ns(), "left after {waited} ms: before the deadline, so not stalled");
+    assert_eq!(t.sh.status().endpoint.as_deref(), Some(D0));
+    assert_eq!(t.hw.lock().unwrap().open_count(), 1, "only the new output open");
+    drop(x);
+}
+
+/// SN-13 fixer: a retiring output whose position counts closes when its rest has played (the `until` path), well
+/// before `retire_ns`, at every latency; nothing of its rest is cut off.
+#[test]
+fn a_normal_drain_closes_before_the_retire_deadline() {
+    for ms in [5u32, 40, 200] {
+        let mut t = T::with_latency(0, ms);
+        let cfg = Config::latency_ms(ms);
+        t.sh.set_target(Target::Fixed { dev: "dev0".into(), port: Port::Jack });
+        let x = t.open(F48, 60000);
+        x.write_frames(&frames(testsig::c, 0, 30000)).unwrap();
+        x.start();
+        t.ms(200);
+        assert_eq!(t.sh.status().endpoint.as_deref(), Some(D0), "{ms} ms");
+        t.sh.set_target(Target::Fixed { dev: "dev1".into(), port: Port::Jack });
+        let sh = t.sh.clone();
+        t.until(50, || sh.status().endpoint.as_deref() == Some(D1));
+        let waited = t.until(2000, || sh.status().streams == 1) as u64 * 1_000_000;
+        let drain = (cfg.lead as u64 + cfg.drain_margin as u64 + 2 * cfg.period as u64) * 1_000_000_000 / 48_000;
+        assert!(waited <= drain + 5_000_000, "{ms} ms: retired after {waited} ns, a drain takes {drain} ns");
+        assert!(waited + cfg.period_ns() < cfg.retire_ns(), "{ms} ms: closed by the deadline, not by its rest");
+        x.start_drain();
+        t.until(3000, || x.state() == State::Drained);
+        t.ms(500);
+        let mut all: Vec<u64> = counters(&t.sink(D0)).into_iter().chain(counters(&t.sink(D1))).collect();
+        all.sort();
+        assert_eq!(all, (1..=30000).collect::<Vec<u64>>(), "{ms} ms: the retiring output's rest was cut off");
+    }
+}
+
+/// SN-13 fixer: the retire deadline grows with the latency and always leaves a whole drain twice over.
+#[test]
+fn retire_deadline_follows_the_latency() {
+    let mut last = 0;
+    for ms in [5u32, 10, 20, 40, 100, 200, 500] {
+        let c = Config::latency_ms(ms);
+        let drain = (c.lead as u64 + c.drain_margin as u64) * 1_000_000_000 / 48_000;
+        assert!(c.retire_ns() >= 2 * drain + 4 * c.period_ns(), "{ms} ms");
+        assert!(c.retire_ns() >= last, "{ms} ms");
+        last = c.retire_ns();
+    }
+    assert!(Config::latency_ms(500).retire_ns() > 1_000_000_000, "the high-latency bound is above 1 s");
+}
+
 #[test]
 fn release_closes_without_waiting_for_idle() {
     let mut t = T::new(0);
@@ -523,11 +621,19 @@ fn stop_on_underrun_is_xrun_until_prepared() {
     let mut t = T::new(0);
     let x = t.open(F48, 4800);
     x.set_stop_on_underrun(true);
+    t.sh.test_now.store(t.now, core::sync::atomic::Ordering::Release);
     x.write_frames(&frames(testsig::c, 0, 960)).unwrap();
     x.start();
     t.ms(100);
     assert_eq!(x.state(), State::Xrun);
     assert_eq!(x.underruns().0, 1);
+    // SN-12: the xrun carries what the desk needs to tell a late writer from a late mixer.
+    let i = t.core.last_xrun().expect("xrun reported");
+    assert_eq!((i.id, i.period, i.ring, i.avail, i.consumed), (x.id(), 480, 4800, 4800, 960));
+    assert!(i.got < i.need, "{i:?}");
+    let at = i.since_write.expect("it wrote");
+    assert!(at >= 1_000_000 && at <= 100_000_000 && at % 1_000_000 == 0, "{i:?}");
+    assert_eq!((i.late, i.late_max), (0, 0), "1 ms steps never pass the 5 ms wake-up");
     assert_eq!(sound(&t.sink(D0)).len(), 960, "what it had was played");
     assert_eq!(x.write_frames(&[[1, 1]]), Err(SndError::Xrun));
     assert_eq!(x.wait_space(10, 1_000_000), Err(SndError::Xrun));
@@ -546,6 +652,64 @@ fn stop_on_underrun_is_xrun_until_prepared() {
     t.ms(100);
     assert_eq!(x.state(), State::Xrun);
     assert!(x.drain(1_000_000));
+}
+
+#[test]
+fn xrun_reports_how_late_the_mixer_woke() {
+    let mut t = T::new(0);
+    let x = t.open(F48, 4800);
+    x.set_stop_on_underrun(true);
+    t.sh.test_now.store(t.now, core::sync::atomic::Ordering::Release);
+    assert_eq!(x.write_frames(&frames(testsig::c, 0, 4800)), Ok(4800));
+    x.start();
+    t.ms(1);
+    assert_eq!(x.state(), State::Running);
+    // The mixer asked to run again in 5 ms (half a 10 ms period) but runs 50 ms later; the xrun that follows
+    // when the ring runs dry reports that 45 ms as the worst lateness since the previous report.
+    t.hw.lock().unwrap().advance(48 * 50);
+    t.now += 50_000_000;
+    t.sh.test_now.store(t.now, core::sync::atomic::Ordering::Release);
+    t.core.step(t.now);
+    t.until(200, || x.state() == State::Xrun);
+    let i = t.core.last_xrun().expect("xrun reported");
+    assert_eq!((i.late, i.late_max), (0, 45_000_000), "{i:?}");
+    assert!(i.since_write.is_some_and(|w| w > 51_000_000), "{i:?}");
+    // The maximum restarts after each report.
+    x.drop_pending();
+    assert_eq!(x.write_frames(&frames(testsig::c, 0, 480)), Ok(480));
+    x.start();
+    t.ms(100);
+    let j = t.core.last_xrun().expect("second xrun");
+    assert_eq!((j.late, j.late_max), (0, 0), "{j:?}");
+}
+
+#[test]
+fn early_wakes_are_not_late_and_old_spikes_age_out() {
+    let mut t = T::new(0);
+    let x = t.open(F48, 48_000);
+    assert_eq!(x.write_frames(&frames(testsig::c, 0, 48_000)), Ok(48_000));
+    x.start();
+    t.ms(1);
+    assert_eq!(x.state(), State::Running);
+    let at = |t: &mut T, ms: u64| {
+        t.hw.lock().unwrap().advance(48 * ms as usize);
+        t.now += ms * 1_000_000;
+        t.sh.test_now.store(t.now, core::sync::atomic::Ordering::Release);
+        t.core.step(t.now)
+    };
+    // The thread sleeps until 5 ms from now; a kick wakes it after 1 ms: not late.
+    t.core.sleeping_until(t.now + 5_000_000);
+    let sleep = at(&mut t, 1);
+    assert_eq!(t.core.lateness(), (0, 0));
+    // The next wake comes 15 ms after the one that step asked for.
+    at(&mut t, sleep / 1_000_000 + 15);
+    assert_eq!(t.core.lateness(), (15_000_000, 15_000_000));
+    // On time for two windows: the 15 ms spike no longer counts.
+    for _ in 0..(2 * LATE_WINDOW_NS / 1_000_000 / 4 + 1) {
+        at(&mut t, 4);
+    }
+    assert_eq!(x.state(), State::Running);
+    assert_eq!(t.core.lateness(), (0, 0));
 }
 
 #[test]

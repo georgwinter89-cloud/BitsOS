@@ -378,6 +378,11 @@ pub(super) fn mgmt_of(mpdu: &[u8]) -> Option<Mgmt> {
             aid,
             capability,
         },
+        // a deauthentication or disassociation whose BSSID is not its sender is a TDLS
+        // teardown, never the AP ending our session (linux-6.6/net/mac80211/mlme.c:3828, :3876)
+        MgmtKind::Deauth { .. } | MgmtKind::Disassoc { .. } if m.hdr.addr3 != Some(a2) => {
+            return None;
+        }
         MgmtKind::Deauth { reason } => Mgmt::Deauth { a1, a2, reason },
         MgmtKind::Disassoc { reason } => Mgmt::Disassoc { a1, a2, reason },
         MgmtKind::Other => return None,
@@ -903,4 +908,20 @@ pub fn poll<B: Bus + ?Sized>(
         }
     }
     Ok(out)
+}
+
+// Linux: rtw89_pci_napi_poll (linux-6.6/drivers/net/wireless/realtek/rtw89/pci.c:3704) runs on
+// every interrupt while the chip runs, with or without a BSS: the release reports and the RX
+// queue are taken, C2Hs handled, and mac80211 drops the frames no interface wants. Here: the
+// interface is up without a link (between bring-up and the first join, between joins): a ring
+// left full raises RDU again after every acknowledgement, an MSI storm (desk-minipc-w13 24.10.).
+// Returns the frames dropped; what a join left (backlog, pending, rx_eth) goes too.
+pub fn idle_poll<B: Bus + ?Sized>(
+    bus: &mut B,
+    chip: &mut Chip,
+    sta: &mut Sta,
+    env: &mut dyn StaEnv<B>,
+) -> Rtw89Result<usize> {
+    sta.rx_eth.clear();
+    Ok(rx_frames(bus, chip, sta, env)?.len())
 }

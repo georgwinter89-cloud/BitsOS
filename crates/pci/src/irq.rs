@@ -30,6 +30,8 @@
 //!   `disable_device` (Quiesce, remove) switches the enables off itself and releases the vectors here without
 //!   heap, klog or unbounded locks (`release_quiet`); the set's methods then report `Released`.
 //!   `restore_config` writes the MSI/MSI-X state back after a reset (`restore_locked`).
+//! - **Firmware without MSI (C1):** when the FADT's IAPC_BOOT_ARCH sets NO_MSI (Linux `pci_no_msi()`), every
+//!   request is served polled (or refused when it does not allow polling) with a `msi.firmware_off` event.
 //! - **R8:** a function left untouched by its key and mass storage not bound to `nvme` are refused before
 //!   any access (R8a, R8d); raw MCP writes never reach these capabilities (PC-5's `raw` refusals).
 //!
@@ -276,6 +278,13 @@ static SPREAD: AtomicU32 = AtomicU32::new(0);
 static GUARD: Once<bool> = Once::new();
 static GUARD_WQ: WaitQueue = WaitQueue::new();
 static GUARD_KICK: AtomicBool = AtomicBool::new(false);
+/// ktest hook: answer as if the FADT had NO_MSI (the gate's firmware never sets it).
+pub(crate) static FIRMWARE_NO_MSI_TEST: AtomicBool = AtomicBool::new(false);
+
+/// The firmware forbids MSI and MSI-X (FADT IAPC_BOOT_ARCH NO_MSI, Linux `acpi_pci_init` -> `pci_no_msi`).
+fn firmware_no_msi() -> bool {
+    FIRMWARE_NO_MSI_TEST.load(Ordering::Relaxed) || acpi::tables().and_then(|t| t.fadt.as_ref()).is_some_and(|f| f.no_msi())
+}
 
 fn guard_kick() {
     GUARD_KICK.store(true, Ordering::Release);
@@ -961,10 +970,16 @@ impl PciFunction {
                 None => {}
             }
         }
+        let (want_msix, want_msi) = if firmware_no_msi() && (req.msix || req.msi) {
+            klog::event!(Warn, "pci", "msi.firmware_off", function = f.as_str(), driver = req.name, polled = req.polled; "the firmware (FADT NO_MSI) forbids MSI and MSI-X");
+            (false, false)
+        } else {
+            (req.msix, req.msi)
+        };
         let msi_l = (self.msi_cap != 0).then(|| MsiLayout::read(&Locked, at, self.msi_cap)).flatten();
         let msix_l = (self.msix_cap != 0).then(|| MsixLayout::read(&Locked, at, self.msix_cap)).flatten();
         let mut maps = None;
-        if let (true, Some(l)) = (req.msix, msix_l) {
+        if let (true, Some(l)) = (want_msix, msix_l) {
             match map_msix(self, &l, &node.problems) {
                 Ok(m) => maps = Some(m),
                 Err(why) => klog::event!(Warn, "pci", "msi.fallback", function = f.as_str(), driver = req.name, from = "msix", reason = why),
@@ -1002,14 +1017,14 @@ impl PciFunction {
         };
         let start = SPREAD.fetch_add(req.max.max(1) as u32, Ordering::Relaxed) as usize;
         let mut msix_ok = maps.is_some();
-        let mut msi_ok = req.msi && msi_l.is_some();
+        let mut msi_ok = want_msi && msi_l.is_some();
         let inner = loop {
             let p = msi::plan(
                 req.min,
                 req.max,
                 msix_l.map(|l| (l.size, msix_ok)),
                 if msi_ok { msi_l.map(|l| l.capable_log2) } else { None },
-                (req.msix && msix_ok, req.msi && msi_ok, req.polled),
+                (want_msix && msix_ok, want_msi && msi_ok, req.polled),
             );
             let Some(p) = p else {
                 return refuse(IrqError::NoVectors);

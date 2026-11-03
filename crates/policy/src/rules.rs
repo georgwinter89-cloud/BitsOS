@@ -34,8 +34,8 @@ pub mod dirs {
     pub const ALL: u8 = CONNECT | BIND | LISTEN;
 }
 
-/// `prefix` covers itself and everything below it ("/home/georg" covers "/home/georg/x", not
-/// "/home/georgx"); "" and "/" cover every path. Matching is textual, so callers pass the canonical absolute
+/// `prefix` covers itself and everything below it ("/home/user" covers "/home/user/x", not
+/// "/home/userx"); "" and "/" cover every path. Matching is textual, so callers pass the canonical absolute
 /// path (vfs: `path_of`). A path that is not canonical (relative, empty, "//", "." or ".." components) is
 /// never trusted to miss a rule: it gets the strictest decision of every path rule of the mode and the class
 /// default, and learned rules do not decide it.

@@ -4,8 +4,10 @@
 //! Own small transport instead of the `virtio-drivers` crate: the modern virtio-pci interface (capabilities,
 //! common configuration, split rings) is a few hundred lines, needs no `unsafe` here (registers through
 //! `hal::mmio::IoMem`, ring memory through `mm::dma::DmaBuffer`'s typed accessors), and fits the polled,
-//! lock-light shape `poll_tx` needs. Polled operation: the G0 interrupt stub has no sources yet; one poller
-//! (`hal::vectors::register_poller`) does link watch, TX reclaim and restarts for every card.
+//! lock-light shape `poll_tx` needs. Interrupts: MSI-X through PC-3's `alloc_irqs` (two vectors, configuration
+//! and queues, or one); one poller (`hal::vectors::register_poller`) does link watch, TX reclaim and restarts for
+//! every card; when the vectors are refused (`virtio.irq_fallback`) or stop (storm, release) the stack polls
+//! the card instead (`report_irq`).
 //!
 //! Matches 1AF4:1000 (transitional; QEMU's default on the q35 root bus) and 1AF4:1041 (modern only); both
 //! are driven through the modern interface. A legacy-only device (`disable-modern=on`) is refused with an event.

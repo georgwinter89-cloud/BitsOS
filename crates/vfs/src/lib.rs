@@ -28,18 +28,26 @@ pub mod index;
 pub mod inotify;
 pub mod inode;
 mod kapi;
+pub use kapi::read_secret;
 pub mod memfd;
 mod ktests;
 mod pm_cost_ktest;
 mod fs5_ktests;
 pub mod mmap;
 pub mod mount_ns;
+pub mod mount_fs;
+pub mod mount_ops;
+mod mount_tree;
+pub mod mountinfo;
 pub mod node;
+pub mod overlay;
 pub mod ops;
+mod cache_view;
 pub mod pagecache;
 pub mod pipe;
 pub mod poll;
 pub mod pollsys;
+pub mod proc_instance;
 pub mod pool;
 pub mod preload;
 pub mod random;
@@ -50,8 +58,10 @@ pub mod special;
 pub mod statfs;
 pub mod synth;
 pub mod sys;
+mod sys_page;
 pub mod sys_attr;
 pub mod sys_copy;
+pub mod sys_mount;
 pub mod sysctl;
 pub mod tmpfs;
 pub mod tty;
@@ -67,6 +77,8 @@ mod fixer_tests;
 #[cfg(test)]
 mod more_tests;
 #[cfg(test)]
+mod mnt_tests;
+#[cfg(test)]
 mod fs2_tests;
 #[cfg(test)]
 mod fs5_tests;
@@ -81,7 +93,15 @@ mod fs3_tests;
 #[cfg(test)]
 mod fs4_tests;
 #[cfg(test)]
+mod fs17_tests;
+#[cfg(test)]
 mod fs10_tests;
+#[cfg(test)]
+mod pf3_tests;
+#[cfg(test)]
+mod pf4_tests;
+#[cfg(test)]
+mod pf5_tests;
 #[cfg(test)]
 mod fs13_tests;
 #[cfg(test)]
@@ -93,7 +113,7 @@ pub use dentry::{Dentry, SuperBlock};
 pub use fsops::FsOps;
 pub use fd::{FdTable, FsState, OpenFile, OpenFlags};
 pub use inode::{Cred, Inode};
-pub use mount_ns::{MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_RELATIME, Mount, Path};
+pub use mount_ns::{MNT_LOCKED, MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY, MNT_RELATIME, MNT_UNBINDABLE, Mount, Path};
 pub use node::{File, MountNs, NodeFile};
 pub use ops::{Ctx, OwnFolders, set_own_folders};
 pub use poll::{Events, Pollable};
@@ -162,7 +182,7 @@ pub trait FsFreeze: Send + Sync {
 static ROOT_NS: ksync::Once<Arc<MountNs>> = ksync::Once::new();
 
 /// The boot mount view: tmpfs at `/`. Processes hold an `Arc<MountNs>` (B2) and inherit it; FS-11 gives
-/// programs their own views (`MountNs::copy_view`).
+/// programs their own views (`MountNs::copy_for`).
 pub fn root_ns() -> Arc<MountNs> {
     ROOT_NS.get_or_init(|| Arc::new(MountNs::new_empty())).clone()
 }
@@ -211,7 +231,6 @@ pub fn init(initramfs: Option<&[u8]>) -> Result<usize, &'static str> {
         devnodes = made.devnodes,
         procfiles = made.procfiles,
         procdirs = made.procdirs,
-        ttys_adopted = made.adopted,
         node_failures = made.failed
     );
     result.map(|_| st.files)

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>BR-7 loading</title>
+</head>
+<body>
+<!-- BR-7 (40-download.sh): the page clicks its own download link once it has loaded, then names itself in the
+     title; the scenario then opens Save as (Ctrl+S) on it. br7-download.bin is made by the scenario. -->
+<h1>BR-7: Herunterladen und Speichern unter</h1>
+<p><a id="dl" href="br7-download.bin" download="br7-download.bin">br7-download.bin</a></p>
+<script>
+addEventListener("load", () => {
+  document.getElementById("dl").click();
+  setTimeout(() => { document.title = "BR-7 download page"; }, 300);
+});
+</script>
+</body>
+</html>

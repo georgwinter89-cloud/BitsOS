@@ -1,0 +1,35 @@
+unshare(0) = 0
+unshare(SIGCHLD) = -EINVAL
+unshare(CLONE_PARENT) = -EINVAL
+unshare(CLONE_VFORK) = -EINVAL
+unshare(CLONE_NEWNET) unprivileged = -EPERM
+unshare(CLONE_NEWPID) unprivileged = -EPERM
+unshare(CLONE_NEWUTS) unprivileged = -EPERM
+unshare(CLONE_NEWIPC) unprivileged = -EPERM
+unshare(CLONE_NEWNS) unprivileged = -EPERM
+unshare(CLONE_NEWCGROUP) unprivileged = -EPERM
+unshare(CLONE_FS) = 0
+unshare(CLONE_FILES) = 0
+unshare(CLONE_SYSVSEM) = 0
+unshare(CLONE_THREAD) single-threaded = 0
+unshare(CLONE_SIGHAND) single-threaded = 0
+unshare(CLONE_VM) single-threaded = 0
+outside: CapEff:	0000000000000000
+threaded: unshare(CLONE_NEWUSER) = -EINVAL
+threaded: unshare(CLONE_THREAD) = -EINVAL
+threaded: unshare(CLONE_VM) = -EINVAL
+child: unshare(CLONE_NEWUSER) = 0
+child: uid 65534 euid 65534 gid 65534 egid 65534
+child: CapEff:	000001ffffffffff
+child: nested unshare(CLONE_NEWUSER) with an unmapped euid = -EPERM
+child: unshare(CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWNET|CLONE_NEWPID) = 0
+child: a second unshare(CLONE_NEWPID) before a fork = -EINVAL
+child: sethostname = 0
+child: nodename sx2-uts
+child: unshare(CLONE_NEWUTS) again = 0
+child: nodename after a second uts namespace sx2-uts
+child: unshare(CLONE_FS|CLONE_FILES) = 0
+grandchild: getpid 1 getppid 0
+grandchild: exit 0
+child: exit 0
+parent's nodename unchanged = yes

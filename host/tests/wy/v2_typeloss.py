@@ -62,6 +62,7 @@ def main():
     c = v.connect(300)
     comp = f.COMP = Job(c, "/bin/bitscomp", ["--socket", v.SOCK])
     comp.wait_for(r"backend=fbdev size=1280x800", "bitscomp started on fbdev at 1280x800")
+    v.check_build(c, comp.text)
     f.keys(c, "ctrl+alt+enter")
     (a,) = f.wait_windows(c, 1, "Strg+Alt+Enter opened a foot window")
     f.wait_shells(c, 1, "the first foot's shell is ready")

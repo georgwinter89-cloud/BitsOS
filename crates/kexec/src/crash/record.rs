@@ -8,6 +8,7 @@
 //!         24 boot id [16]   40 uptime ns u64   48 Reload counter u32   52 generation u32
 //!         56 reporting CPU u32   60 CPUs asked u16   62 CPUs that answered u16
 //! 64     body: the report as UTF-8 text lines (message, backtraces, registers, the newest log lines)
+//! ...    INT-W25: driver notes a Reload hands on (`notes`, page_len / 16 bytes right below the marker)
 //! len-64 boot marker (64 bytes): "BITSLAST", boot id [16], generation u32, Reload counter u32, uptime ns u64,
 //!          checksum u32 over bytes 8..40 of the marker; RB-11: 44 checksum u32 over bytes 8..40 and 48..56,
 //!          48 the kernel id (FNV-1a 64 of the KERNEL file) a Reload hands to the next kernel (0: none). A marker
@@ -86,8 +87,13 @@ pub enum RecordError {
     BadChecksum,
 }
 
-/// Bytes the body may take in a page of `page_len`.
+/// Bytes the body may take in a page of `page_len` (INT-W25: the driver notes below the marker are kept free).
 pub fn body_capacity(page_len: usize) -> usize {
+    page_len.saturating_sub(HEADER + MARKER + super::notes::area(page_len))
+}
+
+/// The longest body a reader accepts: a record of a kernel from before the driver notes may reach the marker.
+fn body_limit_read(page_len: usize) -> usize {
     page_len.saturating_sub(HEADER + MARKER)
 }
 
@@ -150,7 +156,7 @@ impl Header {
             cpus_asked: le16(head, 60),
             cpus_answered: le16(head, 62),
         };
-        if le16(head, 10) as usize != HEADER || h.body_len as usize > body_capacity(page_len) {
+        if le16(head, 10) as usize != HEADER || h.body_len as usize > body_limit_read(page_len) {
             return Err(RecordError::BadLength);
         }
         Ok((h, le32(head, 16)))

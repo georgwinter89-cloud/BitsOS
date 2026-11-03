@@ -17,3 +17,6 @@ sched = { path = "../sched" }
 time = { path = "../time" }
 # FS-5: file-backed VMAs (vfs::mmap::MapBacking); vfs sits below mm.
 vfs = { path = "../vfs" }
+
+[lints]
+workspace = true

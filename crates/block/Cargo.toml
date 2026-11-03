@@ -12,3 +12,6 @@ ktest = { path = "../ktest" }
 sched = { path = "../sched" }
 uapi = { path = "../uapi" }
 vfs = { path = "../vfs" }
+
+[lints]
+workspace = true

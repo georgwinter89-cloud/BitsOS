@@ -5,6 +5,9 @@
 loglevel=info
 # What the screen console shows (IN-quiet): console_log=off|error|warn|info|debug|all (default warn = Warn+ plus
 # boot, link, DHCP, MCP, watchdog, init, reload, power, input lines). loglevel= decides the ring and the mirror.
+# Desktop (DS-4): desktop=auto|on|off starts the desktop after boot with the boot screen (auto = on real hardware,
+# off under a hypervisor, so QEMU tests keep the text console; tests that want it set desktop=on).
+# desktop_program=<path> [args] (default /bin/bitscomp). Any key during the boot screen shows the text console.
 # What a kernel panic does after it printed: halt (stay for the serial log) or reboot
 panic=halt
 # CPUs (CP-4b): smp=off keeps the other CPUs offline; cpus=N starts at most N. Default: all (Reload parks them, RB-5b).
@@ -13,3 +16,8 @@ panic=halt
 # Display (DP-1): display_refresh=<Hz>, e.g. 59.95, replaces the 60 Hz vblank estimate until EDID exists.
 # Data volume (FS-8c): data_img_mb=<MiB> size of a new \BITSOS2\data.img (default 2048, 32..4095; 0 = no /data).
 # An existing image is never changed; a new one is made only when 512 MiB of the stick stay free.
+# Compositor build (WY-14): bitscomp=gpu makes /bin/bitscomp hand over to \BITSOS2\bin\bitscomp-gpu (linked against the
+# Mesa tree \BITSOS2\mesa\); rescue (default), or a missing gpu build or tree, keeps /bin/bitscomp. bitscomp --build
+# rescue|gpu overrides it for one start.
+# bitscomp=gles: the gpu build draws with GLES (Mesa's llvmpipe from \BITSOS2\mesa\) and reads the picture back
+# to the screen; if EGL cannot start it draws with Pixman. bitscomp --renderer pixman|gles overrides it.

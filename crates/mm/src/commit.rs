@@ -181,11 +181,6 @@ impl vfs::pool::Commit for TmpfsCommit {
 
 static TMPFS: TmpfsCommit = TmpfsCommit { pages: AtomicU64::new(0), seen: ksync::SpinLock::named("mm.commit.tmpfs", (0, 0, 0)) };
 
-/// Pages tmpfs (incl. shared anonymous memory) holds of the commit.
-pub fn tmpfs_pages() -> u64 {
-    TMPFS.pages.load(Ordering::Relaxed)
-}
-
 /// Core initcall (before `vfs::init` copies the initramfs into tmpfs): tmpfs charges become part of the system's
 /// commit. Whatever the built-in pool already holds is taken over first.
 fn install() -> Result<(), &'static str> {

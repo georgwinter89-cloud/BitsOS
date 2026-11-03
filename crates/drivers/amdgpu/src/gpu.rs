@@ -36,11 +36,6 @@ impl Gpu {
         GPU.get_or_init(build).as_ref()
     }
 
-    /// Already built (never builds): for contexts that must not map or log.
-    pub fn get_now() -> Option<&'static Gpu> {
-        GPU.get().and_then(Option::as_ref)
-    }
-
     pub fn function(&self) -> &str {
         self.regs.function()
     }
@@ -123,7 +118,7 @@ fn build() -> Option<Gpu> {
         }
     }
     let bos = display.as_ref().ok().map(|a| {
-        SpinLock::named("amdgpu.bos", BoManager::new((a.fb_last - a.fb_first).saturating_add(1), bo::reserved_from(a)))
+        SpinLock::named("amdgpu.bos", BoManager::new(bo::carve_size(a), bo::reserved_from(a)))
     });
     Some(Gpu { regs, device: f.device, revision: f.revision, bar0, blocks, display, bos })
 }

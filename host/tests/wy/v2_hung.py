@@ -154,6 +154,7 @@ def main():
     c = v.connect(300)
     comp = Job(c, "/bin/bitscomp", ["--socket", v.SOCK, "--stats", "5"])
     comp.wait_for(r"backend=fbdev size=1280x800", "bitscomp started on fbdev at 1280x800")
+    v.check_build(c, comp.text)
     comp.wait_for(r"MCP tools registered: windows, window_kill", "bitscomp registered windows and window_kill (MC-6)")
     grant = re.search(r"scheduling class (stays Normal|Interactive)[^\n]*", comp.text)
     print(f"note: {grant.group(0) if grant else 'no grant line'}", flush=True)

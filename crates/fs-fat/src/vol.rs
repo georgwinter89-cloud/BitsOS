@@ -109,8 +109,8 @@ pub struct Child {
     pub dir: bool,
     pub size: u64,
     pub read_only: bool,
-    /// Below `\BITSOS2\home\` (owner 1000:1000, 0700/0600).
-    pub home: bool,
+    /// The stick class (`Home`: owner 1000:1000, 0700/0600; `Private`: root's, 0700/0600; else root's, 022).
+    pub class: Class,
     /// UTC seconds: modification, access (date only on FAT), creation.
     pub mtime: i64,
     pub atime: i64,
@@ -280,7 +280,7 @@ impl Volume {
             dir: e.is_dir(),
             size: if e.is_dir() { 0 } else { e.size as u64 },
             read_only: e.attr & ATTR_RO != 0,
-            home: n.class == Class::Home,
+            class: n.class,
             mtime: self.clock.utc(e.wdate, e.wtime),
             atime: self.clock.utc(e.adate, 0),
             ctime: self.clock.utc(e.cdate, e.ctime),

@@ -6,3 +6,6 @@ description = "Versioned, tagged hand-over format between bitsboot, the kernel a
 
 [lib]
 test = true
+
+[lints]
+workspace = true

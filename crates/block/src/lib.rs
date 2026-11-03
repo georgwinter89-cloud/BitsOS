@@ -10,6 +10,8 @@
 //!   (CONFIG `stick_write`), other USB disks (`usb_msd_write`), NVMe (`nvme_write`), plugged-in `WriteGate`s.
 //! - `bdev`: a whole disk as a page-cache file (FS-5's `Backend`).
 //! - `ramdisk`: the RAM disk for tests (limits, error injection, pause, call log).
+//! - `shutdown` (RB-14): the storage stop before a reset or a Reload (disks closed, drained, cache flushed,
+//!   then the layers below: usb-msd, xHCI).
 //!
 //! `configure` hands in the CONFIG reader and the boot stick's identity (vfs-sys calls it from an initcall
 //! with the kernel's BootInfo); until then every switch counts as off and every USB disk as the stick.
@@ -27,15 +29,19 @@ pub mod gpt;
 mod lift;
 mod ktests;
 mod prio_ktests;
+mod shutdown_ktests;
 pub mod policy;
 pub mod prio;
 pub mod queue;
 pub mod ramdisk;
+pub mod shutdown;
 pub mod table;
 pub mod testimg;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod shutdown_tests;
 #[cfg(test)]
 mod prio_tests;
 
@@ -106,6 +112,11 @@ pub fn register_with(dev: Arc<dyn BlockDevice>, kind: DiskKind, gates: Vec<Arc<d
     if duplicate {
         d.stop();
         return Err(BlockError::Invalid);
+    }
+    // RB-14: a disk that appears after the storage stop (a stick plugged in during the reset) stays closed.
+    if shutdown::stopped() {
+        d.close();
+        klog::event!(Info, "block", "shutdown.closed_new", disk = name.clone(); "registered after the storage stop: closed at once");
     }
     GENERATION.fetch_add(1, Ordering::AcqRel);
     REGISTERED.inc();

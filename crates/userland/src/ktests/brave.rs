@@ -1,18 +1,19 @@
 //! BR-2: `\BITSOS2\brave\` (CachyOS's Brave, ~500 MB with its libraries) and its launcher `\BITSOS2\bin\brave` as
-//! the package list names them. Both Safe and rerunnable: they only read the stick and start `--check`, which
-//! writes nothing.
+//! the package list names them. Class Program: on the Mini-PC only (Georg 30.10.: programs are tested on the
+//! Mini-PC, not in QEMU; QEMU images carry no program tree; a missing tree there is a failure). Rerunnable: they
+//! only read the stick and start `--check`, which writes nothing.
 //! - `ul.pkg.brave`: every file's size, the SHA-256 of all but the big ones, the libraries as V2's loader resolves
 //!   them for brave and for what Chromium dlopens, the fontconfig cache against fontconfig's FAT rule, `brave --check`
 //!   as uid 1000 and 0.
 //! - `ul.pkg.brave_fonts`: fontconfig itself (as Brave loads it, through /bin/fc-probe) takes the tree's prebuilt
 //!   cache: it lists the fonts and writes no cache of its own (as uid 1000, so a rescan could only write into a
 //!   scratch HOME, never onto the stick).
-//! - `ul.pkg.brave_fonts_mtime` (QemuOnly: it sets the fonts dir's mtime on the stick): the same with an mtime that
-//!   has nanoseconds, as a cached dir inode reports it on the stick after a push.
+//!   (`ul.pkg.brave_fonts_mtime`, which made a fonts-dir mtime with nanoseconds in QEMU as the Mini-PC's stick
+//!   reports it after a push, is gone with the rule: on the Mini-PC `ul.pkg.brave_fonts` meets that state itself.)
 //! - `ul.pkg.brave_sha`: the SHA-256 of the big files too (the brave binary alone is 328 MB: seconds in QEMU, longer
 //!   from a USB stick, hence its own test).
 
-use super::pkg::{Line, Sha256, TEST_STICK_ID, absent, entries, list, on_stick};
+use super::pkg::{Line, Sha256, TEST_STICK_ID, list, program_tree};
 use super::{SEC, finish, need, read, scratch, start, start_as, text};
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -57,27 +58,16 @@ fn file_ok(l: &Line, hash: bool) -> TestResult {
     Ok(())
 }
 
-/// The tree's list lines, or Ok(None) for a skip (an optional image without the tree, or no launcher on this
-/// stick); the launcher's path with them.
-fn tree_lines(l: &str) -> Result<Option<(Vec<Line<'_>>, String)>, String> {
-    let tree: Vec<Line> = entries(l).into_iter().filter(|e| e.kind == "stick" && e.path.starts_with(TREE)).collect();
-    if tree.is_empty() {
-        absent(l, "no \\BITSOS2\\brave\\ in this image's list (xtask puts it into ktest images whose filter runs ul.pkg.brave)")?;
-        return Ok(None);
-    }
-    let Some(launcher) = on_stick("brave")? else {
-        return Ok(None);
-    };
-    Ok(Some((tree, launcher)))
+/// The tree's list lines and the launcher's path (pkg::program_tree: a missing tree or launcher is a failure).
+fn tree_lines(l: &str) -> Result<(Vec<Line<'_>>, String), String> {
+    program_tree(l, TREE, "brave")
 }
 
 /// Every file against the list (the big ones without SHA-256 here), the licences, the libraries, the fontconfig cache,
 /// then `brave --check` as uid 1000 and as root.
 fn brave() -> TestResult {
     let l = list()?;
-    let Some((tree, launcher)) = tree_lines(&l)? else {
-        return ktest::skip("no brave in \\BITSOS2\\ of this stick, or an optional image");
-    };
+    let (tree, launcher) = tree_lines(&l)?;
     for name in ["README.txt", "brave.txt"] {
         let p = format!("{TREE}LICENSES/{name}");
         kassert!(tree.iter().any(|e| e.path == p), "{p} is not in the image's list (stage again with scripts/stage-v2.sh)");
@@ -133,6 +123,10 @@ fn brave() -> TestResult {
     fontcache(&tree)?;
 
     // The launcher counts the same: distinct "name => path" lines over brave and the dlopened libraries.
+    // BR-6b: the base flags never carry --no-sandbox; only BRAVE_SANDBOX=auto (after a failed probe) or off add it.
+    let script = read(&launcher);
+    let flags = script.split_once("\nFLAGS=\"").and_then(|(_, r)| r.split_once('"')).map(|(f, _)| f);
+    kassert!(flags.is_some_and(|f| !f.contains("--no-sandbox")), "{launcher}: FLAGS= {flags:?} (want no --no-sandbox)");
     let want_libs = format!("brave: libraries: {} found, none missing", found.len());
     for uid in [1000u32, 0] {
         let s = start_as("/bin/sh", &["sh", &launcher, "--check"], None, false, Some(uid))?;
@@ -141,14 +135,14 @@ fn brave() -> TestResult {
         let has = |p: &str| out.lines().any(|x| x.starts_with(p));
         kassert!(code == 0, "brave --check as uid {uid}: exit {code}\n{}", s.both());
         kassert!(out.lines().any(|x| x == "brave: tree /boot/BITSOS2/brave: ok") && out.lines().any(|x| x == want_libs), "uid {uid}, want '{want_libs}':\n{out}");
-        kassert!(has("brave: fonts: ") && has("brave: desktop: ") && has("brave: profile: ") && has("brave: sound: ") && has("brave: running: "), "uid {uid}:\n{out}");
+        kassert!(has("brave: fonts: ") && has("brave: desktop: ") && has("brave: profile: ") && has("brave: sound: ") && has("brave: running: ") && has("brave: sandbox: on"), "uid {uid}:\n{out}");
         let user = if uid == 0 { "brave: user: runs as uid 1000 (started by root: chpst -u 1000:1000)" } else { "brave: user: runs as uid 1000" };
         kassert!(out.lines().any(|x| x == user), "uid {uid}, want '{user}':\n{out}");
     }
     klog::event!(Info, "ul", "pkg.brave", files = tree.len(), hashed_bytes = hashed, sized_bytes = sized, read_ms = read_ms, libraries = found.len());
     Ok(())
 }
-ktest!("ul.pkg.brave", Safe, brave);
+ktest!("ul.pkg.brave", Program, brave);
 
 /// fontconfig's cache for the tree's fonts: valid on V2 only if its `checksum` (FcCache, int at offset 48) is what
 /// fontconfig computes on FAT: an Adler-32 over the directory's entry names (each with its NUL) and d_types, walked
@@ -176,8 +170,7 @@ fn fontcache(tree: &[Line]) -> TestResult {
     }
     let want = a.wrapping_add(b << 16);
     // The dir's own mtime nanoseconds do not take part: fontconfig 2.18 writes checksum_nano 0 and keeps the cache
-    // whatever the dir's nanoseconds are (BR-4a: on the stick a cached dir inode reports 707123246 ns after a push,
-    // and ul.pkg.brave_fonts_mtime gives the dir such an mtime in QEMU).
+    // whatever the dir's nanoseconds are (BR-4a: on the stick a cached dir inode reports 707123246 ns after a push).
     let nsec = vfs::root_ns().lookup(FONTS).map_err(|e| format!("{FONTS}: {e:?}"))?.attr().mtime.nsec;
     klog::event!(Info, "ul", "pkg.brave_fontcache", fonts = names.len(), dir_nsec = nsec);
     let ns = vfs::root_ns();
@@ -198,9 +191,7 @@ fn fontcache(tree: &[Line]) -> TestResult {
 /// The big files' SHA-256 (the others are hashed by `ul.pkg.brave`).
 fn brave_sha() -> TestResult {
     let l = list()?;
-    let Some((tree, _)) = tree_lines(&l)? else {
-        return ktest::skip("no brave in \\BITSOS2\\ of this stick, or an optional image");
-    };
+    let (tree, _) = tree_lines(&l)?;
     let t0 = time::now_ns();
     let mut bytes = 0;
     for e in tree.iter().filter(|e| e.size > HASH_IN_MAIN) {
@@ -210,57 +201,16 @@ fn brave_sha() -> TestResult {
     klog::event!(Info, "ul", "pkg.brave_sha", bytes = bytes, read_ms = (time::now_ns() - t0) / 1_000_000);
     Ok(())
 }
-ktest!("ul.pkg.brave_sha", Safe, brave_sha);
+ktest!("ul.pkg.brave_sha", Program, brave_sha);
 
 /// fontconfig with Brave's FONTCONFIG_FILE, as uid 1000 with a fresh XDG_CACHE_HOME: the fonts are there and no cache
 /// was written, so the prebuilt one was valid (an invalid one makes fontconfig rescan and write its own).
 fn brave_fonts() -> TestResult {
     let l = list()?;
-    let Some((tree, _)) = tree_lines(&l)? else {
-        return ktest::skip("no brave in \\BITSOS2\\ of this stick, or an optional image");
-    };
+    let (tree, _) = tree_lines(&l)?;
     fc_probe(&tree)
 }
-ktest!("ul.pkg.brave_fonts", Safe, brave_fonts);
-
-/// The stick state the desk saw on the Mini-PC (BR-4a): after a push the fonts dir's cached inode reports an mtime
-/// with nanoseconds. A file made and removed in the dir gives it one here (QemuOnly: it writes the stick), then fontconfig
-/// must still take the prebuilt cache.
-fn brave_fonts_mtime() -> TestResult {
-    let l = list()?;
-    let Some((tree, _)) = tree_lines(&l)? else {
-        return ktest::skip("no brave in \\BITSOS2\\ of this stick, or an optional image");
-    };
-    // An entry made and removed again in the cached dir sets its mtime from the clock (vfs touch_mtime), as the push
-    // did; `touch` alone gives 0 ns on vfat. The names stay the same, so the FAT checksum does too.
-    let p = format!("{FONTS}/br4a-mtime-probe");
-    // The stick turns writable only once its identity is decided (see ul.pkg.cobalt_profile): retry for 30 s, then
-    // exit 3 (a skip: no writable stick, nothing to reproduce).
-    let cmd = format!("i=0; until (: > {p}) 2>/dev/null; do i=$((i + 1)); [ $i -ge 30 ] && exit 3; sleep 1; done; exec rm {p}");
-    let r = (|| -> TestResult {
-        let s = start_as("/bin/sh", &["sh", "-c", &cmd], None, false, Some(0))?;
-        let code = finish(&s, 60 * SEC)?;
-        if code == 3 {
-            return ktest::skip("the stick did not turn writable within 30 s");
-        }
-        kassert!(code == 0, "create and remove {p}: exit {code}\n{}", s.both());
-        let nsec = vfs::root_ns().lookup(FONTS).map_err(|e| format!("{FONTS}: {e:?}"))?.attr().mtime.nsec;
-        klog::event!(Info, "ul", "pkg.brave_fonts_mtime", dir_nsec = nsec);
-        // The precondition: without nanoseconds this is ul.pkg.brave_fonts again (1 in 10^9 by chance; always once
-        // vfs or fs-fat round directory times to FAT granularity as Linux vfat does, and then the stick state this
-        // reproduces no longer exists either).
-        if nsec == 0 {
-            return ktest::skip("the fonts dir mtime is FAT-granular (0 ns) after a create and remove: nothing to reproduce");
-        }
-        fc_probe(&tree)
-    })();
-    // Always, also after a failure or a timeout kill: a probe entry left in fonts/ changes the FAT checksum and makes
-    // the prebuilt cache invalid for every later test of this boot.
-    let s = start_as("/bin/sh", &["sh", "-c", &format!("[ -e {p} ] || exit 0; exec rm -f {p}")], None, false, Some(0))?;
-    let cleaned = finish(&s, 30 * SEC).and_then(|c| if c == 0 { Ok(()) } else { Err(format!("rm -f {p}: exit {c}\n{}", s.both())) });
-    r.and(cleaned)
-}
-ktest!("ul.pkg.brave_fonts_mtime", QemuOnly, brave_fonts_mtime);
+ktest!("ul.pkg.brave_fonts", Program, brave_fonts);
 
 fn fc_probe(tree: &[Line]) -> TestResult {
     need("/bin/fc-probe")?;

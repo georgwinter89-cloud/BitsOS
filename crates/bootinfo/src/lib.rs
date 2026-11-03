@@ -210,6 +210,11 @@ impl<'a> BootInfo<'a> {
     pub fn config(&self) -> Option<&'a [u8]> {
         self.find(tag::CONFIG)
     }
+    /// RB-18: where the CONFIG record's text starts, counted from the BootInfo's first byte (the kernel blanks
+    /// the secret values in it, through the physical address it got).
+    pub fn config_offset(&self) -> Option<usize> {
+        self.config().map(|c| c.as_ptr() as usize - self.bytes.as_ptr() as usize)
+    }
     /// The monitor's EDID (DP-3), when the loader found one.
     pub fn edid(&self) -> Option<&'a [u8]> {
         self.find(tag::EDID)

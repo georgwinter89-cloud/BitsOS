@@ -1,0 +1,71 @@
+amdgpu render node: found
+CTX ALLOC = 0
+objects: yes
+-- BO_LIST
+CREATE two = 0, handle 1, rest zero yes
+CREATE empty = 0, handle 2, rest zero yes
+CREATE empty, NULL = 0, handle 3, rest zero yes
+CREATE unknown object = -ENOENT
+CREATE entry size 12 = -EINVAL
+CREATE entry size 4 = -EINVAL
+CREATE entry size 0, none = -EINVAL
+CREATE NULL entries = -EFAULT
+CREATE kernel entries = -EFAULT
+DESTROY 3, entry size 12 = 0, handle 0, rest zero yes
+DESTROY 3 again, NULL entries = 0, handle 0, rest zero yes
+operation 3 = -EINVAL
+operation 99, NULL entries = -EINVAL
+UPDATE 1 = 0, handle 1, rest zero yes
+UPDATE unknown = -ENOENT
+UPDATE 0 = -ENOENT
+UPDATE 1 unknown object = -ENOENT
+UPDATE 1 entry size 12 = -EINVAL
+UPDATE 1 NULL entries = -EFAULT
+UPDATE unknown, NULL entries = -EFAULT
+DESTROY 1 = 0, handle 0, rest zero yes
+DESTROY 1 again = 0, handle 0, rest zero yes
+DESTROY unknown = 0, handle 0, rest zero yes
+CREATE after destroy = 0, handle 1, rest zero yes
+CS list handle and BO_HANDLES = -EINVAL
+-- FENCE_TO_HANDLE
+unknown context = -EINVAL
+unknown context, what 9 = -EINVAL
+not handed out = -EINVAL
+IP 99 = -EINVAL
+compute ring 4 = -EINVAL
+what 3 = -EINVAL
+seq 0, syncobj = 0
+  handle nonzero yes, rest of the union as sent yes
+  SYNCOBJ_WAIT on it = 0
+  SYNCOBJ_DESTROY = 0
+last, syncobj = 0
+seq 0, syncobj fd = 0
+  fd valid yes, cloexec yes, rest as sent yes
+seq 0, sync_file fd = 0
+  cloexec yes, signaled yes, rest as sent yes
+-- INFO GPUVM_FAULT
+fresh fd = 0
+  16 bytes zero yes, byte 16 untouched yes
+8 bytes = 0
+  addr zero yes, status untouched yes
+64 bytes = 0
+bad pointer = -EFAULT
+NULL pointer = -EINVAL
+-- GEM_USERPTR refusals
+unaligned address, size 0 = -EINVAL
+unknown flag, size 0 = -EINVAL
+flag bit 31 = -EINVAL
+ANONONLY and VALIDATE only = -EACCES
+no flags, size 0 = -EACCES
+READONLY, past the mmap offset space = -errno 28
+READONLY, kernel address = -EFAULT
+no flags, kernel address = -EFAULT
+unknown flag, kernel address = -EFAULT
+unaligned kernel address = -EINVAL
+READONLY, kernel address, size 0 = -EFAULT
+READONLY, range wraps = -EFAULT
+READONLY, ends at the user top + 4K = -EFAULT
+READONLY at 0, size 0 = -errno 28
+unmapped argument = -EFAULT
+kernel argument = -EFAULT
+CTX FREE = 0

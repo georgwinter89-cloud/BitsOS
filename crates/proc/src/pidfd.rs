@@ -106,12 +106,19 @@ pub fn process_of(g: &Arc<Group>) -> Option<Arc<Process>> {
     crate::find(g.tgid).filter(|p| Arc::ptr_eq(p.group(), g))
 }
 
-/// AB-7a: `pidfd_show_fdinfo` for `/proc/<pid>/fdinfo`: `Pid:` and `NSpid:` (one pid namespace), -1 once the
+/// AB-7a: `pidfd_show_fdinfo` for `/proc/<pid>/fdinfo`: `Pid:` and `NSpid:` (SX-2: every level), -1 once the
 /// process is reaped. None for other files.
 pub fn fdinfo(f: &OpenFile) -> Option<String> {
     let g = group_of(f)?;
-    let nr: i64 = if process_of(&g).is_some() { g.tgid as i64 } else { -1 };
-    Some(alloc::format!("Pid:\t{nr}\nNSpid:\t{nr}\n"))
+    if process_of(&g).is_none() {
+        return Some("Pid:\t-1\nNSpid:\t-1\n".to_string());
+    }
+    // SX-2: /proc's pid namespace is the initial one; NSpid adds the numbers down to the process's own.
+    let mut ns = alloc::format!("{}", g.tgid);
+    for nr in g.pid_ns.chain(g.tgid).iter().rev() {
+        ns.push_str(&alloc::format!("\t{nr}"));
+    }
+    Some(alloc::format!("Pid:\t{}\nNSpid:\t{ns}\n", g.tgid))
 }
 
 /// pidfds open now (`proc.pidfds` counts every one made).

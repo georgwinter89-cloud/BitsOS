@@ -1,8 +1,8 @@
 //! HD Audio controllers. Owner: SN. Item SN-2: the Mini-PC's FCH HD Audio (1022:15E3, ALC269 analog codec),
 //! the GPU's HDMI/DP audio controller (1002:1640, enumerated only until SN-5's [`hdmi::hdmi_on`] turns the display
 //! side's audio on and makes it stream) and QEMU's intel-hda
-//! (8086:2668, ich9 8086:293E) with hda-duplex, behind `devmodel::audio::AudioDevice`, `Quiesce` and a richer
-//! API for SN-3's mixer ([`Hda`] / [`Controller`]: open on an output, format, start/stop, period callback,
+//! (8086:2668, ich9 8086:293E) with hda-duplex, behind `Quiesce` and the API SN-3's mixer drives
+//! through [`controllers`] ([`Hda`] / [`Controller`]: open on an output, format, start/stop, period callback,
 //! position, delay, jack events).
 //!
 //! Layout: `regs` (registers), `hw` (what the logic needs from the machine), `link` (reset, CORB/RIRB,
@@ -27,6 +27,8 @@ pub mod fake;
 pub mod format;
 pub mod hdmi;
 pub mod hw;
+mod panic;
+pub use panic::{PANIC_HOOK, PanicHook, PanicStop, panic_stop_all};
 mod ktests;
 mod ktests_hdmi;
 pub mod link;
@@ -40,16 +42,20 @@ mod tests;
 mod tests_capture;
 #[cfg(test)]
 mod tests_hdmi;
+#[cfg(test)]
+mod tests_quiesce;
+#[cfg(test)]
+mod tests_shutdown;
 
-pub use ctrl::{Config, Controller, DP_AUDIO_PIN, HdaError, InputInfo, JackFn, Kind, OutputId, OutputInfo, PeriodFn, State, StreamId};
+pub use ctrl::{CodecStop, Config, Controller, DP_AUDIO_PIN, QuiesceResult, HdaError, InputInfo, JackFn, Kind, OutputId, OutputInfo, PeriodFn, State, StreamId};
 pub use mmio_hw::MmioHw;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use devmodel::audio::{AudioDevice, Output as Port, PcmFormat};
-use devmodel::{DevError, Quiesce};
+use devmodel::audio::Output as Port;
+use devmodel::Quiesce;
 use hdacodec::path::OutputKind;
 use ksync::SpinLock;
 
@@ -79,11 +85,6 @@ static DEVICES: SpinLock<Vec<Arc<Hda>>> = SpinLock::named("hda.devices", Vec::ne
 /// Every controller this driver kept, in probe order (`hda0`, `hda1`, ...).
 pub fn controllers() -> Vec<Arc<Hda>> {
     DEVICES.lock().clone()
-}
-
-/// The controllers as `AudioDevice`s (SN-3, SN-4).
-pub fn audio_devices() -> Vec<Arc<dyn AudioDevice>> {
-    controllers().into_iter().map(|d| d as Arc<dyn AudioDevice>).collect()
 }
 
 pub fn is_hda(f: &pci::PciFunction) -> bool {
@@ -120,6 +121,7 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
             thread: core::sync::atomic::AtomicBool::new(false),
         });
         devs.push(dev.clone());
+        panic::PANIC_LIST.add(dev.clone());
         dev
     };
     // Quiesce from here on, also for a controller that failed: its DMA may have been started by a Reload.
@@ -219,7 +221,7 @@ impl Hda {
         g.as_ref().map(|s| (s.mode(), s.count(0)))
     }
 
-    /// The output `AudioDevice::open_stream` picks for a port: a plugged headphone, else line out, else speaker.
+    /// The output snd plays on for a port: a plugged headphone, else line out, else speaker.
     pub fn pick(&self, port: Port) -> Option<OutputId> {
         let outs: Vec<OutputInfo> = self.ctrl.outputs().into_iter().filter(|o| o.port == port && o.playable).collect();
         let rank = |o: &OutputInfo| match (o.kind, o.plugged) {
@@ -232,58 +234,22 @@ impl Hda {
     }
 }
 
-impl AudioDevice for Hda {
-    fn name(&self) -> &str {
-        self.ctrl.name()
-    }
-    fn outputs(&self) -> Vec<Port> {
-        let mut v: Vec<Port> = Vec::new();
-        for o in self.ctrl.outputs() {
-            if !v.contains(&o.port) {
-                v.push(o.port);
-            }
-        }
-        v
-    }
-    fn formats(&self) -> Vec<PcmFormat> {
-        self.pick(Port::Jack).and_then(|id| self.ctrl.outputs().into_iter().find(|o| o.id == id)).map_or_else(Vec::new, |o| o.formats)
-    }
-    fn open_stream(&self, out: Port, fmt: PcmFormat, ring_frames: u32) -> Result<u32, DevError> {
-        let id = self.pick(out).ok_or(if out == Port::Hdmi { DevError::Refused } else { DevError::InvalidArgument })?;
-        let sid = self.ctrl.open(id, fmt, ring_frames, ring_frames / 4).map_err(HdaError::dev)?;
-        self.ctrl.start(sid).map_err(HdaError::dev)?;
-        Ok(sid)
-    }
-    fn write(&self, stream: u32, data: &[u8]) -> Result<usize, DevError> {
-        self.ctrl.write(stream, data).map_err(HdaError::dev)
-    }
-    fn position(&self, stream: u32) -> u64 {
-        self.ctrl.position(stream).unwrap_or(0)
-    }
-    fn close_stream(&self, stream: u32) {
-        let _ = self.ctrl.close(stream);
-    }
-    fn jack_present(&self, out: Port) -> Option<bool> {
-        let states: Vec<Option<bool>> = self.ctrl.outputs().into_iter().filter(|o| o.port == out).map(|o| o.plugged).collect();
-        if states.contains(&Some(true)) {
-            Some(true)
-        } else if states.contains(&Some(false)) {
-            Some(false)
-        } else {
-            None
-        }
-    }
-}
-
 impl Quiesce for Hda {
     fn name(&self) -> &str {
         self.ctrl.name()
     }
     fn quiesce(&self) {
-        self.ctrl.quiesce();
-        // The display side after the GPU controller's DMA has stopped (Linux's off order: samples, then packets).
-        if self.ctrl.kind() == Kind::AtiHdmi {
-            hdmi::quiesce_display();
-        }
+        quiesce_in_order(&self.ctrl, || hdmi::quiesce_display(None));
+    }
+}
+
+/// One controller's Quiesce in the reboot's order (SN-7). The display side comes after the GPU controller's DMA
+/// has stopped and was waited for, with the link still out of reset (Linux: the HDA function shuts down before
+/// amdgpu turns the display's audio off; samples muted, then the packets, the endpoint, the DTO). A stuck engine
+/// does not skip it: bus master is off by then. `display`: the undo (host tests pass a register image).
+pub(crate) fn quiesce_in_order<H: hw::Hw>(ctrl: &Controller<H>, display: impl FnOnce()) {
+    ctrl.quiesce();
+    if ctrl.kind() == Kind::AtiHdmi {
+        display();
     }
 }

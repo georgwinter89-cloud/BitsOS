@@ -1,0 +1,2 @@
+# The WLAN firmware xtask copies onto the stick (host/xtask/src/firmware.rs): the 8852BE in the Mini-PC.
+rtw89/rtw8852b_fw-2.bin

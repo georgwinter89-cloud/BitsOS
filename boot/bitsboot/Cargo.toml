@@ -26,3 +26,7 @@ bootinfo = { path = "../../crates/bootinfo" }
 # returns to the firmware instead of shutting the machine down.
 uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
 log = { version = "0.4", default-features = false }
+zeroize = { version = "=1.9.1", default-features = false }
+
+[lints]
+workspace = true

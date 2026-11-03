@@ -1,6 +1,8 @@
 //! Extended attributes, read (linux-6.6/fs/ext4/xattr.h, xattr.c): in the inode after `i_extra_isize` and in
-//! one shared block (`i_file_acl`, with its reference count). V2's VFS has no xattr calls yet; the volume
-//! answers them for the syscall glue to come (change request in the FS-8a notes) and frees blocks right.
+//! one shared block (`i_file_acl`, with its reference count). V2's VFS has no xattr calls yet (getxattr and the
+//! rest answer ENOSYS); today only inline data reads `system.data` here. The syscalls (read side: ext4, an empty
+//! list or ENODATA for tmpfs/proc; write side through the Tx) are an open FS item (C1, plan/notes/desk-C1.md),
+//! and the volume frees the blocks right.
 
 use crate::crc::crc32c;
 use crate::inode::DiskInode;

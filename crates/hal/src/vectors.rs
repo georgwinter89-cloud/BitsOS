@@ -78,9 +78,18 @@ const fn range_mask(w: usize, lo: u8, hi: u8) -> u64 {
     upper & !((1u64 << a) - 1)
 }
 
-/// Vectors no allocation may hand out: exceptions, the 8259 range, the system vectors and 0xFF.
+/// Vectors no allocation may hand out: exceptions, the 8259 range, `int 0x80` (AB-10a, a DPL-3 gate: a device
+/// interrupt there could not be told from a program's call), the system vectors and 0xFF.
 const fn reserved_word(w: usize) -> u64 {
-    range_mask(w, 0x00, FIRST_DYNAMIC - 1) | range_mask(w, FIRST_SYSTEM, 0xFF)
+    range_mask(w, 0x00, FIRST_DYNAMIC - 1) | range_mask(w, INT80, INT80) | range_mask(w, FIRST_SYSTEM, 0xFF)
+}
+
+/// Linux's IA32_SYSCALL_VECTOR (hal::entry::INT80_VECTOR), inside the dynamic range but never handed out.
+const INT80: u8 = 0x80;
+
+/// The dynamic range without `INT80` (what `dynamic_taken` counts).
+const fn dynamic_word(w: usize) -> u64 {
+    range_mask(w, FIRST_DYNAMIC, LAST_DYNAMIC) & !range_mask(w, INT80, INT80)
 }
 
 /// One CPU's vectors: which are taken, their handlers, and per-vector delivery counts. Taking and giving
@@ -155,9 +164,9 @@ impl CpuVectors {
         self.used[v as usize / 64].load(Ordering::Acquire) & (1u64 << (v % 64)) != 0
     }
 
-    /// Taken vectors in the dynamic range (allocated + reserved by `reserve`).
+    /// Taken vectors in the dynamic range (allocated + reserved by `reserve`; `int 0x80` not counted).
     pub fn dynamic_taken(&self) -> u32 {
-        self.used.iter().enumerate().map(|(w, u)| (u.load(Ordering::Acquire) & range_mask(w, FIRST_DYNAMIC, LAST_DYNAMIC)).count_ones()).sum()
+        self.used.iter().enumerate().map(|(w, u)| (u.load(Ordering::Acquire) & dynamic_word(w)).count_ones()).sum()
     }
 
     fn handler(&self, v: u8) -> usize {
@@ -340,6 +349,10 @@ pub fn apic_spurious_count() -> u64 {
 
 /// Called by the IDT stubs for vectors >= 32 (interrupts off).
 pub(crate) fn dispatch(vector: u8, _frame: &mut TrapFrame) {
+    #[cfg(bitsos_fd_measure)]
+    if _frame.cs & 3 == 0 {
+        crate::prof::note(_frame.rip, crate::prof::KERNEL, 0, 0);
+    }
     let Some(t) = table(crate::percpu::this_cpu()) else {
         NO_TABLE.fetch_add(1, Ordering::Relaxed);
         if vector != SPURIOUS_VECTOR {
@@ -480,25 +493,28 @@ mod tests {
         assert_eq!(range_mask(2, 0x00, 0x2F), 0);
         assert_eq!(reserved_word(0), (1u64 << 48) - 1);
         assert_eq!(reserved_word(3), 0xFFFFu64 << 48);
-        assert_eq!(reserved_word(1) | reserved_word(2), 0);
+        assert_eq!(reserved_word(1), 0);
+        assert_eq!(reserved_word(2), 1, "int 0x80");
+        assert_eq!(dynamic_word(2), u64::MAX - 1);
     }
 
     #[test]
-    fn fresh_table_has_192_dynamic_vectors() {
+    fn fresh_table_has_191_dynamic_vectors() {
         let t = CpuVectors::new();
         assert_eq!(t.dynamic_taken(), 0);
-        for v in [0u8, 0x1F, 0x20, 0x2F, 0xF0, 0xFE, 0xFF] {
+        for v in [0u8, 0x1F, 0x20, 0x2F, 0x80, 0xF0, 0xFE, 0xFF] {
             assert!(t.is_taken(v), "{v:#x} reserved");
         }
         let mut got = Vec::new();
         while let Some(v) = t.claim_lowest(FIRST_DYNAMIC, LAST_DYNAMIC) {
             got.push(v);
         }
-        assert_eq!(got.len(), 192);
+        assert_eq!(got.len(), 191, "0x30-0xEF without int 0x80");
         assert_eq!(got[0], 0x30);
         assert_eq!(*got.last().unwrap(), 0xEF);
-        assert!(got.windows(2).all(|w| w[1] == w[0] + 1), "lowest first, no gaps, no doubles");
-        assert_eq!(t.dynamic_taken(), 192);
+        assert!(!got.contains(&0x80));
+        assert!(got.windows(2).all(|w| w[1] == w[0] + 1 || (w[0], w[1]) == (0x7F, 0x81)), "lowest first, no gaps, no doubles");
+        assert_eq!(t.dynamic_taken(), 191);
         assert!(t.release(0x77));
         assert!(!t.release(0x77), "double release is reported");
         assert_eq!(t.claim_lowest(FIRST_DYNAMIC, LAST_DYNAMIC), Some(0x77));
@@ -531,9 +547,9 @@ mod tests {
             .collect();
         let mut all: Vec<u8> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
         all.sort_unstable();
-        assert_eq!(all.len(), 192);
+        assert_eq!(all.len(), 191);
         all.dedup();
-        assert_eq!(all.len(), 192, "no vector handed out twice");
+        assert_eq!(all.len(), 191, "no vector handed out twice");
     }
 
     fn h(_: u8) {}

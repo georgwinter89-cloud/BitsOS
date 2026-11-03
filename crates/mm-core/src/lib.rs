@@ -12,6 +12,8 @@ extern crate alloc;
 
 mod bitmap;
 pub mod dma;
+pub mod dma_pages;
+pub mod grace;
 pub mod buddy;
 pub mod fixtures;
 mod heap;
@@ -22,6 +24,7 @@ mod meta;
 mod page_frame;
 mod pages;
 mod pcp;
+pub mod rcu_index;
 pub mod reclaim;
 pub mod report;
 pub mod slab;
@@ -43,8 +46,6 @@ pub const PAGE: u64 = 4096;
 /// Largest block: 2^18 frames = 1 GiB, the largest x86 page. A bound of the buddy math (orders 0..=18), not a
 /// limit on how much memory or how many blocks exist (R1).
 pub const MAX_ORDER: u32 = 18;
-/// The G0 name of the frame allocator, kept so `kernel/` builds unchanged; it is the buddy allocator now.
-pub type BumpFrames = BuddyFrames;
 
 /// Where a frame may come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,11 +78,21 @@ pub struct FrameStats {
     pub used_by_kind: [u64; KINDS],
     /// Bytes freed but not reusable. Always 0 since MM-1 (kept for the contract).
     pub leaked_bytes: u64,
+    /// PF-5: bytes waiting for a grace period before they are freed (`grace::pending_bytes`): still counted in
+    /// their owner's `used_by_kind` (a part of it, never of `free_bytes`), reusable after `grace::drain`.
+    pub pending_bytes: u64,
 }
 
 pub trait FrameAlloc: Sync {
     /// 2^order contiguous 4 KiB frames, aligned to their size. Returns the physical address.
     fn alloc(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64>;
+    /// MM-12: as `alloc`, only from what is free right now above the zone's reserve: no drain of the other
+    /// CPUs' lists, no direct reclaim, no OOM path, no failure report. For frames nobody asked for yet (the
+    /// anonymous fault-around), which must never cost memory pressure anything. An allocator without such a
+    /// path refuses.
+    fn alloc_light(&self, _order: u32, _zone: Zone, _kind: Kind) -> Option<u64> {
+        None
+    }
     fn free(&self, phys: u64, order: u32, kind: Kind);
     fn stats(&self) -> FrameStats;
 }
@@ -113,6 +124,13 @@ pub fn alloc_zeroed(kind: Kind) -> Option<u64> {
     alloc_zeroed_block(0, Zone::Normal, kind)
 }
 
+/// One frame of `kind`, zeroed, by `FrameAlloc::alloc_light` (never reclaims; None under pressure).
+pub fn alloc_zeroed_light(kind: Kind) -> Option<u64> {
+    let p = frames()?.alloc_light(0, Zone::Normal, kind)?;
+    zero_frame(p);
+    Some(p)
+}
+
 /// 2^order frames of `kind` from `zone`, zeroed (DMA buffers). The zeroing stays inside mm-core, on a block
 /// it just handed out, so no caller can point it at memory it does not own.
 pub fn alloc_zeroed_block(order: u32, zone: Zone, kind: Kind) -> Option<u64> {
@@ -135,11 +153,43 @@ pub fn free_table_frame(phys: u64) {
     }
 }
 
+/// MM-13: the order of a transparent huge page (2 MiB).
+pub const HUGE_ORDER: u32 = 9;
+
+/// MM-13: a zeroed 2 MiB block of `kind` by `FrameAlloc::alloc_light` (only what is free now: no drain, no
+/// reclaim, no OOM path; None under pressure, the caller then takes 4 KiB pages as Linux's THP fallback does).
+pub fn alloc_zeroed_huge_light(kind: Kind) -> Option<u64> {
+    let p = frames()?.alloc_light(HUGE_ORDER, Zone::Normal, kind)?;
+    for i in 0..1u64 << HUGE_ORDER {
+        zero_frame(p + i * PAGE);
+    }
+    Some(p)
+}
+
+/// MM-13: is `phys` the head of an allocated block of `order` of `Kind::User` right now (a huge page that was
+/// never split)? A lock-free look at the allocator's own state, safe for any address.
+pub fn is_user_block(phys: u64, order: u32) -> bool {
+    boot_buddy().is_some_and(|b| b.run_allocated(phys, 1 << order, Kind::User))
+}
+
+/// MM-13: the allocated `Kind::User` block (phys, order) becomes 2^order order-0 user frames (`Buddy::split_block`).
+/// Only for a block the caller maps alone or under its lock; false: not such a block, nothing changed.
+pub fn split_user_block(phys: u64, order: u32) -> bool {
+    boot_buddy().is_some_and(|b| b.split_block(phys, order, Kind::User))
+}
+
+/// MM-13: 2^order order-0 user frames from `phys` become one block again (`Buddy::merge_block`); only for frames
+/// the caller alone maps. False: not all of them are such frames, nothing changed.
+pub fn merge_user_block(phys: u64, order: u32) -> bool {
+    boot_buddy().is_some_and(|b| b.merge_block(phys, order, Kind::User))
+}
+
 /// Crate-private: only for a frame the caller just got from `frames()` and has not passed on.
 fn zero_frame(phys: u64) {
     #[cfg(target_os = "none")]
-    // SAFETY: the only callers (`alloc_zeroed_block`) pass a frame the allocator just handed them and nobody
-    // else knows yet, RAM reachable through the direct map.
+    // SAFETY: the only callers (`alloc_zeroed_block`, `alloc_zeroed_light`, `alloc_zeroed_huge_light`,
+    // `dma_pages::alloc_runs`) pass a frame of a block the allocator just handed them and nobody else knows yet,
+    // RAM reachable through the direct map (WB: `alloc_runs` zeroes before any retype).
     unsafe {
         core::ptr::write_bytes(hal::phys_to_virt(phys) as *mut u8, 0, PAGE as usize)
     };

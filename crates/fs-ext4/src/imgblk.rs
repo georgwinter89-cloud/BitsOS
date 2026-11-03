@@ -96,6 +96,8 @@ impl BlockDevice for ImageBlock {
         if self._write.is_none() {
             return Ok(());
         }
+        // VS-7: a pool flush from a Background thread (snapshot take, settle) never writes back below Normal.
+        let _f = block::prio::floor(IoPriority::Normal);
         self.file.sync(SyncKind::Fsync).map_err(dev_err)
     }
 }

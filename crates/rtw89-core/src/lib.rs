@@ -44,5 +44,8 @@ pub use error::Rtw89Error;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_desk;
 #[cfg(all(test, feature = "std"))]
 mod tests_tracebus;

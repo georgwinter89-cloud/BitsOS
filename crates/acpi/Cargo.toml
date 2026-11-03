@@ -13,3 +13,6 @@ ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
 time = { path = "../time" }
 mm-core = { path = "../mm-core" }
+
+[lints]
+workspace = true

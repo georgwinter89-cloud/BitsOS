@@ -1,0 +1,11 @@
+PR_SET_NO_NEW_PRIVS = 0
+KILL_PROCESS: signal 31
+KILL_THREAD, only thread: signal 31
+child: main thread goes on after its sibling ended
+KILL_THREAD in a second thread: exit 0
+KILL_PROCESS in a second thread: signal 31
+unknown action 0x10000: signal 31
+strict: prctl answered 0, write works
+strict mode, getpid: signal 9
+strict: seccomp(STRICT) answered 0
+strict mode, exit(3): exit 3

@@ -73,10 +73,17 @@ impl vfs::sys::UserMem for Mem<'_> {
 
 /// One of FS's `vfs::sys` calls with the caller's context (what vfs-sys's `run` builds).
 fn vfs_call(c: &SysCtx<'_>, f: vfs::sys::SysFn) -> i64 {
+    with_sys(c, |s| f(s, c.args))
+}
+
+/// Runs `f` with the `vfs::sys::Sys` of the caller (what `vfs_call` hands FS's calls).
+fn with_sys<R>(c: &SysCtx<'_>, f: impl FnOnce(&vfs::sys::Sys<'_>) -> R) -> R {
     let p = c.proc;
     let mem = Mem(p);
-    let s = vfs::sys::Sys { mem: &mem, fds: &p.fds, ns: &p.ns, cred: p.fs_cred(), subject: p.subject() };
-    f(&s, c.args)
+    let fs = c.thread.fs(p);
+    let ns = p.mount_ns();
+    let s = vfs::sys::Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: p.fs_cred(), subject: p.subject() };
+    f(&s)
 }
 
 /// FS's fcntl for the commands it implements.
@@ -86,42 +93,48 @@ fn vfs_fcntl(c: &SysCtx<'_>) -> i64 {
 
 // ---- close and dup2/dup3 over an open fd: the POSIX locks go (`filp_close` → `locks_remove_posix`) ------
 
-/// `close(fd)`: FS's close, then the caller's POSIX locks on that file go (linux-6.6/fs/open.c `filp_close`).
-/// Registered by the integration patch in place of vfs-sys's `fs_call!(CLOSE, v::close)`.
+/// `close(fd)` (linux-6.6/fs/open.c `close` -> `close_fd` -> `filp_close`): the table hands over the very file
+/// it took out of `fd` (PF-3: one step, `FdTable::close_get`), the caller's POSIX locks on it go, then the
+/// reference is dropped. Registered by the integration patch in place of vfs-sys's `fs_call!(CLOSE, v::close)`.
 pub fn sys_close(c: &mut SysCtx<'_>) -> i64 {
-    let old = c.proc.fds.get(c.args[0] as u32 as usize).ok();
-    let r = vfs_call(c, vfs::sys::close);
-    if r == 0
-        && let Some(f) = old
-    {
-        locks::closed(&c.proc.fds, &f);
+    let fd = c.args[0] as u32 as i32;
+    if fd < 0 {
+        return -EBADF;
     }
-    r
+    match c.proc.fds.close_get(fd as usize) {
+        Ok(f) => {
+            locks::closed(&c.proc.fds, &f);
+            0
+        }
+        Err(e) => -e,
+    }
 }
 
 /// dup2/dup3 that replaced an open fd: `do_dup2` calls `filp_close` on the replaced file whatever it was, also
 /// when it is the very open file now installed there (linux-6.6/fs/file.c:1139), so the caller's POSIX locks
-/// on it go. dup2(fd, fd) replaces nothing.
-fn dup_over(c: &mut SysCtx<'_>, f: vfs::sys::SysFn) -> i64 {
-    let (old, new) = (c.args[0] as u32, c.args[1] as u32);
-    let replaced = if old != new { c.proc.fds.get(new as usize).ok() } else { None };
-    let r = vfs_call(c, f);
-    if r >= 0
-        && let Some(file) = replaced
-    {
-        locks::closed(&c.proc.fds, &file);
+/// on it go. dup2(fd, fd) replaces nothing. PF-3: the replaced file is the one the table step returned.
+fn dup_over(c: &mut SysCtx<'_>, dup2: bool) -> i64 {
+    let a = c.args;
+    let r = with_sys(c, |s| if dup2 { vfs::sys::dup2_take(s, a[0], a[1]) } else { vfs::sys::dup3_take(s, a[0], a[1], a[2]) });
+    match r {
+        Ok((fd, replaced)) => {
+            if let Some(file) = replaced {
+                locks::closed(&c.proc.fds, &file);
+            }
+            fd
+        }
+        Err(e) => -e,
     }
-    r
 }
 
 /// `dup2(old, new)` with the lock release (registered by the integration patch).
 pub fn sys_dup2(c: &mut SysCtx<'_>) -> i64 {
-    dup_over(c, vfs::sys::dup2)
+    dup_over(c, true)
 }
 
 /// `dup3(old, new, flags)` with the lock release (registered by the integration patch).
 pub fn sys_dup3(c: &mut SysCtx<'_>) -> i64 {
-    dup_over(c, vfs::sys::dup3)
+    dup_over(c, false)
 }
 
 const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
@@ -147,9 +160,7 @@ fn sys_close_range(c: &mut SysCtx<'_>) -> i64 {
     for fd in first..=end {
         if flags & CLOSE_RANGE_CLOEXEC != 0 {
             let _ = fds.set_cloexec(fd, true);
-        } else if let Ok(f) = fds.get(fd)
-            && fds.close(fd).is_ok()
-        {
+        } else if let Ok(f) = fds.close_get(fd) {
             locks::closed(fds, &f);
         }
     }

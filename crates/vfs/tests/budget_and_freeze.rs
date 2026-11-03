@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use uapi::errno::*;
 use vfs::abi::{O_CREAT, O_RDWR};
-use vfs::inode::{set_tmpfs_page_limit, tmpfs_pages_used, PAGE};
-use vfs::pool::{system_charged, system_meta, system_used};
+use vfs::inode::{tmpfs_pages_used, PAGE};
+use vfs::pool::{set_system_limit, system_charged, system_meta, system_used};
 use vfs::{Ctx, FsFreeze, MountNs};
 
 static KILLED: AtomicBool = AtomicBool::new(false);
@@ -29,7 +29,7 @@ fn metadata() {
     let ns = MountNs::new_empty();
     let c = Ctx::kernel(&ns);
     let (data0, meta0) = (system_charged(), system_meta());
-    set_tmpfs_page_limit(Some(system_used() + 2));
+    set_system_limit(Some(system_used() + 2));
     let mut made = Vec::new();
     let refused = loop {
         let name = format!("/e{}", made.len());
@@ -56,7 +56,7 @@ fn metadata() {
         c.unlink(None, n.as_bytes()).unwrap();
     }
     assert_eq!(system_meta(), meta0, "every metadata page given back");
-    set_tmpfs_page_limit(None);
+    set_system_limit(None);
 }
 
 /// FS-5, FS-14: tmpfs files are charged page by page when a page is allocated (Linux VM_NORESERVE); holes and a
@@ -69,7 +69,7 @@ fn budget() {
     // (the second file's metadata fits into that page too).
     let f = c.open(None, b"/big", O_CREAT | O_RDWR, 0o644).unwrap();
     let base = system_charged();
-    set_tmpfs_page_limit(Some(system_used() + 4));
+    set_system_limit(Some(system_used() + 4));
     let chunk = vec![7u8; 6 * PAGE as usize];
     assert_eq!(f.write(&chunk).unwrap(), 4 * PAGE as usize, "short write at the pool's end");
     assert_eq!(f.write(b"x").err(), Some(ENOSPC));
@@ -90,7 +90,7 @@ fn budget() {
     drop(g);
     c.unlink(None, b"/second").unwrap();
     assert_eq!(system_charged(), base);
-    set_tmpfs_page_limit(None);
+    set_system_limit(None);
 
     // A mount with its own size (Linux tmpfs size=): ENOSPC there, the system pool untouched.
     let m = vfs::tmpfs::mount_new(&ns, "/shm", 0o1777, Some(3)).unwrap();

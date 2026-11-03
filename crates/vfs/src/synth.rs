@@ -31,6 +31,12 @@ pub trait FileSource: Send + Sync {
     fn may_open(&self, _who: Cred, _write: bool) -> Result<(), Errno> {
         Ok(())
     }
+    /// SX-3b: a file with its own `permission` op instead of the mode bits (Linux `proc_sys_permission`: the
+    /// user namespace limits show 0644 and answer by the caller's capability). `want` is MAY_* bits; None: the
+    /// mode bits decide (`Inode::permission`).
+    fn permission(&self, _who: Cred, _want: u32) -> Option<Result<(), Errno>> {
+        None
+    }
     /// The whole content for `who`, made at each read of an open file at offset 0.
     fn render(&self, who: Cred) -> Result<Vec<u8>, Errno>;
     /// Files read live at an offset instead of a snapshot (binary attributes): their size.
@@ -48,6 +54,12 @@ pub trait FileSource: Send + Sync {
     /// A write at a position, for files where it counts (/proc/<pid>/mem). Default: `write`. AB-7a CR9.
     fn write_at(&self, who: Cred, _pos: u64, data: &[u8]) -> Result<usize, Errno> {
         self.write(who, data)
+    }
+    /// FS-16: whether pwrite/pwritev reach it (Linux FMODE_PWRITE; `opened_for_write` as in `File`). A source
+    /// that Linux serves through `seq_open`/`single_open` (most of /proc/<pid>) says false: pwrite is ESPIPE,
+    /// write(2) at the position stays. Default true (/proc/<pid>/mem, /proc/sys, sysfs attributes).
+    fn positional_write(&self, _opened_for_write: bool) -> bool {
+        true
     }
     /// `st_size` (proc files 0, sysfs attributes one page).
     fn size(&self) -> u64 {
@@ -72,6 +84,11 @@ pub trait DirSource: Send + Sync {
     /// Links stat adds at getattr time (Linux's `proc_task_getattr`: 2 + threads for /proc/<pid>/task).
     fn extra_nlink(&self) -> u32 {
         0
+    }
+    /// SX-3b: this source as it is in a proc instance mounted in pid namespace `ns` (opaque; see
+    /// `proc_instance`). None: the source shows the same in every instance and is shared.
+    fn for_pid_ns(&self, _ns: &Arc<dyn core::any::Any + Send + Sync>) -> Option<Arc<dyn DirSource>> {
+        None
     }
 }
 
@@ -359,6 +376,9 @@ impl File for SynthFile {
     }
     fn seekable(&self) -> bool {
         true
+    }
+    fn positional_write(&self, opened_for_write: bool) -> bool {
+        self.src.positional_write(opened_for_write)
     }
 }
 

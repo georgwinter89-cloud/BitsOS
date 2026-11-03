@@ -18,16 +18,20 @@ use ktest::{TestResult, kassert, ktest};
 use ksync::SpinLock;
 
 fn caller() -> Caller {
-    Caller { pid: 900_006, uid: 1000, gid: 1000, subject: policy::Subject::KERNEL }
+    Caller::new(900_006, 1000, 1000, policy::Subject::KERNEL)
 }
 
 /// Sends one request and reads the dump to its DONE: the messages of type `want` (payloads).
 fn dump(n: &Arc<NetlinkSock>, ty: u16, family: u8, want: u16) -> Result<Vec<Vec<u8>>, String> {
+    dump_as(n, ty, family, want, &caller())
+}
+
+/// `dump` asked by `c` (NW-11: a caller in a network namespace).
+pub(super) fn dump_as(n: &Arc<NetlinkSock>, ty: u16, family: u8, want: u16, c: &Caller) -> Result<Vec<Vec<u8>>, String> {
     let mut m = Msg::new(ty, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &[family]);
     m.set_flags(NLM_F_REQUEST | NLM_F_DUMP);
     let req = m.done();
-    let c = caller();
-    n.send(&mut SliceSource { data: &req, at: 0 }, req.len(), 0, true, None, &c, None).map_err(|e| format!("send: {e}"))?;
+    n.send(&mut SliceSource { data: &req, at: 0 }, req.len(), 0, true, None, c, None).map_err(|e| format!("send: {e}"))?;
     let mut out = Vec::new();
     for _ in 0..64 {
         let mut d = Vec::new();
@@ -57,7 +61,7 @@ fn dump(n: &Arc<NetlinkSock>, ty: u16, family: u8, want: u16) -> Result<Vec<Vec<
     Err(String::from("no NLMSG_DONE"))
 }
 
-fn attr<'a>(payload: &'a [u8], fixed: usize, ty: u16) -> Option<&'a [u8]> {
+pub(super) fn attr<'a>(payload: &'a [u8], fixed: usize, ty: u16) -> Option<&'a [u8]> {
     attrs(&payload[fixed.min(payload.len())..]).into_iter().find(|(t, _)| *t == ty).map(|(_, d)| d)
 }
 
@@ -95,7 +99,7 @@ fn dumps() -> TestResult {
 ktest!("nw.netlink.dumps", Safe, dumps);
 
 /// A program memory of 4 KiB at 0x1000 for the ioctl structs.
-struct Mem(SpinLock<Vec<u8>>);
+pub(super) struct Mem(pub(super) SpinLock<Vec<u8>>);
 
 impl vfs::sys::UserMem for Mem {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
@@ -125,7 +129,7 @@ fn ioctls() -> TestResult {
     let s = st()?;
     let card = configured(s)?;
     let mem = Mem(SpinLock::new(alloc::vec![0; 4096]));
-    let a = Asker { mem: &mem, uid: 1000 };
+    let a = Asker { mem: &mem, caller: caller(), net: None };
     let inet = InetSock::create(2, 0, &caller()).map_err(|e| format!("udp socket: {e}"))?;
     let f = SockFile::new(Kind::Inet(inet)).map_err(|e| format!("{e}"))?;
     let ifr = |name: &[u8], int: u32| {

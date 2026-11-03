@@ -1,0 +1,14 @@
+uid_map = 11
+setgroups = 4
+gid_map = 11
+tmpfs = 0
+open own ns/mnt = 0
+child: unshare mnt = 0
+child: umount copy lazily = 0
+child: fromA after umount = ENOENT
+child: chdir /proc = 0
+child: setns wrong type = -EINVAL
+child: setns back = 0
+child: fromA after setns = yes
+child: cwd = /
+child: exit 0

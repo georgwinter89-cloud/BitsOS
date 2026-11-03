@@ -69,7 +69,7 @@ pub(crate) fn task(c: &SysCtx<'_>, pid: i32) -> Result<(Arc<Process>, u64), i64>
     let (p, k) = if pid == 0 {
         (c.proc.clone(), c.thread.kthread())
     } else {
-        let t = proc::find_thread(pid as u32).ok_or(-ESRCH)?;
+        let t = crate::ns_sys::find_thread(c, pid as u32).ok_or(-ESRCH)?;
         let p = t.group().image().ok_or(-ESRCH)?;
         (p, t.kthread())
     };

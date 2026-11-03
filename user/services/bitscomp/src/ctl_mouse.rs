@@ -11,7 +11,7 @@ use crate::layout::{Place, Rect};
 use crate::menu::item_rect;
 use crate::pointer::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use crate::state::App;
-use smithay::desktop::Window;
+use crate::win::Window;
 
 use crate::{header, tabs, zones};
 
@@ -147,7 +147,16 @@ fn chrome_hot(app: &App, pt: &dyn Fn(i32, i32) -> String) -> String {
     for (i, r) in c.ws_items.iter().take(if c.list_shown { c.ws_shown() } else { 0 }).enumerate() {
         out.push_str(&format!("ws {i} at={} active={} name={:?}\n", mid(*r), i == app.desk.active, app.desk.names[i]));
     }
+    for (i, r) in c.min_items.iter().enumerate().take(if c.list_shown { app.ws.minimized.len() } else { 0 }) {
+        let w = &app.ws.minimized[i].win;
+        out.push_str(&format!("minimized {i} at={} id={} title={:?}\n", mid(*r), crate::ctl::win_id(w), crate::ctl::names(w).1));
+    }
     out.push_str(&format!("wsnew at={}\nhome at={}\n", mid(c.ws_new), mid(c.home)));
+    // DS-3: the Bühne's own parts.
+    if let Some(b) = app.buehne() {
+        out.push_str(&format!("buehne sun={} bell={} feld={}", mid(b.sun), mid(b.bell), mid(b.feld)));
+        out.push_str(&format!(" strip={} more={}\n", b.strip.map_or("-".into(), mid), b.more.map_or("-".into(), mid)));
+    }
     if app.start_shown() {
         let p = app.start_page();
         let can = app.session.offered && app.session.saved.is_some();

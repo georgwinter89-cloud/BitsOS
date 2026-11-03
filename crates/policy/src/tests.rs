@@ -40,22 +40,22 @@ fn default_allows_and_counts() {
 fn path_rules_longest_prefix_and_modes() {
     let mut r = RuleSet::allow_all();
     r.paths = vec![
-        PathRule { prefix: "/home/georg".to_string(), modes: modes::ALL, decision: Decision::Deny },
-        PathRule { prefix: "/home/georg/Downloads/".to_string(), modes: modes::ALL, decision: Decision::Allow },
+        PathRule { prefix: "/home/user".to_string(), modes: modes::ALL, decision: Decision::Deny },
+        PathRule { prefix: "/home/user/Downloads/".to_string(), modes: modes::ALL, decision: Decision::Allow },
         PathRule { prefix: "/etc".to_string(), modes: modes::WRITE | modes::CREATE, decision: Decision::Deny },
     ];
-    assert_eq!(r.decide(&path("/home/georg", false, false)), Decision::Deny);
-    assert_eq!(r.decide(&path("/home/georg/a", false, false)), Decision::Deny);
-    assert_eq!(r.decide(&path("/home/georgx", false, false)), Decision::Allow, "component boundary");
-    assert_eq!(r.decide(&path("/home/georg/Downloads/f", true, true)), Decision::Allow, "longer prefix wins");
+    assert_eq!(r.decide(&path("/home/user", false, false)), Decision::Deny);
+    assert_eq!(r.decide(&path("/home/user/a", false, false)), Decision::Deny);
+    assert_eq!(r.decide(&path("/home/userx", false, false)), Decision::Allow, "component boundary");
+    assert_eq!(r.decide(&path("/home/user/Downloads/f", true, true)), Decision::Allow, "longer prefix wins");
     assert_eq!(r.decide(&path("/etc/passwd", false, false)), Decision::Allow, "reading is not covered");
     assert_eq!(r.decide(&path("/etc/passwd", true, false)), Decision::Deny);
     assert_eq!(r.decide(&path("/etc/new", false, true)), Decision::Deny);
     assert_eq!(r.unconditional(AccessClass::Path), None);
     assert_eq!(r.unconditional(AccessClass::Net), Some(Decision::Allow));
     // Same prefix: the strictest wins.
-    r.paths.push(PathRule { prefix: "/home/georg/Downloads".to_string(), modes: modes::READ, decision: Decision::Ask });
-    assert_eq!(r.decide(&path("/home/georg/Downloads/f", false, false)), Decision::Ask);
+    r.paths.push(PathRule { prefix: "/home/user/Downloads".to_string(), modes: modes::READ, decision: Decision::Ask });
+    assert_eq!(r.decide(&path("/home/user/Downloads/f", false, false)), Decision::Ask);
     // "/" covers everything.
     let mut all = RuleSet::allow_all();
     all.paths.push(PathRule { prefix: "/".to_string(), modes: modes::READ, decision: Decision::Deny });

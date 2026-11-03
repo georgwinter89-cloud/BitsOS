@@ -11,7 +11,8 @@ use uapi::errno::*;
 use vfs::Errno;
 use vfs::sys::{Args, Sys, SysFn, UserMem};
 
-struct ProcMem<'a>(&'a Process);
+/// The calling process's memory for `vfs::sys` (also SX-2's chroot path argument).
+pub(crate) struct ProcMem<'a>(pub(crate) &'a Process);
 
 impl UserMem for ProcMem<'_> {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
@@ -50,18 +51,89 @@ fn current() -> Option<net::sock::Caller> {
     // AB-13: the effective ids (`cred_to_ucred`; root = the CAP_NET_* checks of NW).
     proc::current().map(|p| {
         let k = p.cred();
-        net::sock::Caller { pid: p.pid, uid: k.euid, gid: k.egid, subject: p.subject() }
+        net::sock::Caller::new(p.pid, k.euid, k.egid, p.subject())
     })
 }
 
 static HOOKS: net::sock::Hooks = net::sock::Hooks { interrupted: killed, sigpipe, pid_exists, current };
 
+/// NW-11: a calling program's pid and user namespaces as the socket layer asks for them (`pid_vnr`,
+/// `find_vpid`, `make_kuid`, `from_kuid_munged`, `ns_capable`).
+struct ProcIds {
+    cred: alloc::sync::Arc<proc::cred::Cred>,
+    pid_ns: alloc::sync::Arc<proc::ns::pid::PidNs>,
+    /// The user namespace that owns the caller's network namespace (CAP_NET_* count there).
+    net_owner: alloc::sync::Arc<proc::ns::user::UserNs>,
+}
+
+impl net::sock::Ids for ProcIds {
+    fn capable(&self, cap: u32) -> bool {
+        use net::sock::cap;
+        let ns: &proc::ns::user::UserNs = match cap {
+            cap::NET_ADMIN | cap::NET_BIND_SERVICE | cap::NET_RAW => &self.net_owner,
+            cap::SYS_ADMIN => &self.pid_ns.user_ns,
+            _ => &self.cred.user_ns,
+        };
+        proc::cred::ns_capable_raw(&self.cred, ns, cap)
+    }
+    fn capable_initial(&self, cap: u32) -> bool {
+        // NW-12: `capable` (SIOCSIFTXQLEN): over the initial user namespace whatever the caller's are.
+        proc::cred::ns_capable_raw(&self.cred, proc::ns::user::init_user_ns(), cap)
+    }
+    fn pid_to_kernel(&self, pid: u32) -> Option<u32> {
+        self.pid_ns.id(pid)
+    }
+    fn pid_from_kernel(&self, kpid: u32) -> u32 {
+        self.pid_ns.nr(kpid).unwrap_or(0)
+    }
+    fn uid_to_kernel(&self, uid: u32) -> Option<u32> {
+        self.cred.user_ns.to_kernel(proc::ns::user::MapKind::Uid, uid)
+    }
+    fn gid_to_kernel(&self, gid: u32) -> Option<u32> {
+        self.cred.user_ns.to_kernel(proc::ns::user::MapKind::Gid, gid)
+    }
+    fn uid_from_kernel(&self, kuid: u32) -> u32 {
+        self.cred.user_ns.uid(kuid)
+    }
+    fn gid_from_kernel(&self, kgid: u32) -> u32 {
+        self.cred.user_ns.gid(kgid)
+    }
+}
+
+/// NW-11: the calling program's network namespace view, ids and real/effective/saved uid and gid (for
+/// SCM_CREDENTIALS, `scm_check_creds`); no ids for a program whose namespaces are all the initial ones (the
+/// socket layer then works exactly as without namespaces).
+fn ns_current() -> net::sock::NsNow {
+    let Some(p) = proc::current() else { return net::sock::NsNow::default() };
+    let cred = p.cred();
+    let ids = net::sock::CredIds { uid: [cred.uid, cred.euid, cred.suid], gid: [cred.gid, cred.egid, cred.sgid] };
+    // INT-W20 (NW-11 CR 4, in short): while no namespace besides the initial ones exists, the caller is in the
+    // initial ones; three atomic loads instead of the namespace set's lock.
+    if proc::ns::user::live() == 0 && proc::ns::pid::live() == 0 && proc::ns::misc::live().2 == 0 {
+        return net::sock::NsNow { net: None, ids: None, cred: Some(ids) };
+    }
+    let set = p.nsset();
+    let pid_ns = &p.group().pid_ns;
+    let mut now = net::sock::NsNow { net: set.net.view.clone(), ids: None, cred: Some(ids) };
+    if !(cred.user_ns.is_init() && pid_ns.is_init() && set.net.user_ns.is_init()) {
+        let ids = ProcIds { cred, pid_ns: pid_ns.clone(), net_owner: set.net.user_ns.clone() };
+        now.ids = Some(alloc::sync::Arc::new(ids));
+    }
+    now
+}
+
+static NS_HOOKS: net::sock::NsHooks = net::sock::NsHooks { current: ns_current };
+
+
 fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     net::sock::set_hooks(&HOOKS);
+    net::sock::set_ns_hooks(&NS_HOOKS);
     vfs::dentry::set_interrupt_check(killed);
     let p = c.proc;
     let mem = ProcMem(p);
-    let sys = Sys { mem: &mem, fds: &p.fds, ns: &p.ns, cred: p.fs_cred(), subject: p.subject() };
+    let fs = c.thread.fs(p);
+    let ns = p.mount_ns();
+    let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: p.fs_cred(), subject: p.subject() };
     let a: Args = c.args;
     f(&sys, a)
 }
@@ -69,9 +141,12 @@ fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
 /// NW-6: the interface ioctls of a socket fd, asked by `ioctl.rs` before the file's own ioctl: Some(result) when
 /// `fd` is a socket and `cmd` one of them.
 pub(crate) fn dev_ioctl(c: &mut SysCtx<'_>, fd: usize, cmd: u64, arg: u64) -> Option<i64> {
+    net::sock::set_ns_hooks(&NS_HOOKS);
     let p = c.proc;
     let mem = ProcMem(p);
-    let sys = Sys { mem: &mem, fds: &p.fds, ns: &p.ns, cred: p.fs_cred(), subject: p.subject() };
+    let fs = c.thread.fs(p);
+    let ns = p.mount_ns();
+    let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: p.fs_cred(), subject: p.subject() };
     s::dev_ioctl(&sys, [fd as u64, cmd, arg, 0, 0, 0])
 }
 

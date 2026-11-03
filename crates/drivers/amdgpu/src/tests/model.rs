@@ -57,7 +57,7 @@ fn kms_skips_gated_pipes_and_off_encoders() {
 
 fn manager() -> (attach::Attach, BoManager) {
     let a = attach::gates(&pci(), Some(gop()), &reader(&mini_pc())).unwrap();
-    let m = BoManager::new(a.fb_last - a.fb_first + 1, bo::reserved_from(&a));
+    let m = BoManager::new(bo::carve_size(&a), bo::reserved_from(&a));
     (a, m)
 }
 
@@ -151,9 +151,9 @@ fn ip_blocks() {
 #[test]
 fn writes_text() {
     let w = [
-        dcn::LoggedWrite { seq: 7, offset: 0xEB2C, wrote: 0x80, read: 0x80, masked: false },
-        dcn::LoggedWrite { seq: 8, offset: 0xEB28, wrote: 0x200_0000, read: 0, masked: false },
-        dcn::LoggedWrite { seq: 9, offset: 0x14128, wrote: 1, read: 0x101, masked: true },
+        dcn::LoggedWrite { seq: 7, offset: 0xEB2C, wrote: 0x80, read: 0x80, masked: false, owner: dcn::Owner::Other },
+        dcn::LoggedWrite { seq: 8, offset: 0xEB28, wrote: 0x200_0000, read: 0, masked: false, owner: dcn::Owner::Other },
+        dcn::LoggedWrite { seq: 9, offset: 0x14128, wrote: 1, read: 0x101, masked: true, owner: dcn::Owner::Other },
     ];
     let s = tools::writes_text(9, 1, &w);
     assert_eq!(

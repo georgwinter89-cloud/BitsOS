@@ -7,12 +7,14 @@
 # CONFIG_FEATURE_SH_STANDALONE is not set
 ## V2 has no sendfile yet (ENOSYS); busybox then uses read/write.
 # CONFIG_FEATURE_USE_SENDFILE is not set
-## PID 1 is our init; no second init, getty or power switching from a shell.
+## PID 1 is our init; no second init or getty. UL-7: halt, poweroff and reboot signal it as busybox init's
+## applets do (SIGUSR1, SIGUSR2, SIGTERM; -f calls reboot(2) itself), never through telinit.
 # CONFIG_INIT is not set
 # CONFIG_LINUXRC is not set
-# CONFIG_HALT is not set
-# CONFIG_POWEROFF is not set
-# CONFIG_REBOOT is not set
+CONFIG_HALT=y
+CONFIG_POWEROFF=y
+CONFIG_REBOOT=y
+# CONFIG_FEATURE_CALL_TELINIT is not set
 # CONFIG_GETTY is not set
 # CONFIG_BOOTCHARTD is not set
 ## No tools that format, partition or raw-write disks, poke physical memory, the watchdog, the RTC, I2C or

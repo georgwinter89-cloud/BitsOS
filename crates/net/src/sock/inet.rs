@@ -24,21 +24,25 @@ use crate::conn::Conn;
 use crate::stack::sockets::ProgListener;
 use crate::stack::udp::{PortGuard, SmolUdp};
 use crate::loopback::Side;
+use crate::netns::NetView;
 use crate::stack::Stack;
 use crate::{Ipv4, NetError, SockAddr};
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use ksync::{SpinLock, WaitQueue};
+use ksync::SpinLock;
 use uapi::errno::*;
 use vfs::Errno;
 
 klog::counter!(CONNECT_FAILED, "net.sock.connect_failed");
 
-/// Every AF_INET socket's readiness changes are announced here.
-pub static READY: WaitQueue = WaitQueue::new();
+/// Every AF_INET socket's readiness changes are announced here. A `PollQueue` (NW-10): poll, select and epoll
+/// subscribe to it, so a program sleeping in them wakes with the data; as a plain `WaitQueue` they looked again
+/// only every 10 ms (`vfs::poll::LEGACY_SLICE_NS`), which stalled BusyBox wget for ~9 ms each time its receive
+/// buffer ran dry (the sender then idles with nothing in flight). Readers blocked in recv wait on it as before.
+pub static READY: vfs::poll::PollQueue = vfs::poll::PollQueue::new();
 
 /// Wakes AF_INET waiters (cheap without any).
 pub fn notify() {
@@ -104,11 +108,218 @@ struct PortUse {
     listening: bool,
 }
 
-static TCP_PORTS: SpinLock<BTreeMap<u16, Vec<PortUse>>> = SpinLock::named("net.inet.ports", BTreeMap::new());
+/// NW-11: the TCP ports, loopback UDP receivers and (below the initial namespace) UDP ports of one network
+/// namespace. The initial namespace's are `INIT`; its UDP ports are the stack's table and `inet6::UDP6_PORTS`.
+pub(crate) struct Tables {
+    tcp_ports: SpinLock<BTreeMap<u16, Vec<PortUse>>>,
+    /// Loopback UDP receivers per port and side (false: IPv4 senders, true: AF_INET6 senders to ::1); a
+    /// dual-stack `::` holds both slots, so an IPv6-only socket and an AF_INET one share a port as on Linux.
+    lo_udp: SpinLock<BTreeMap<(u16, bool), Weak<LoUdp>>>,
+    /// UDP ports by side of a namespace below the initial one (`NsUdp`).
+    udp: SpinLock<BTreeSet<(u16, bool)>>,
+}
 
-/// Whether a program socket holds TCP `port` (the stack's ephemeral picker skips it).
+impl Tables {
+    pub(crate) const fn new() -> Tables {
+        Tables {
+            tcp_ports: SpinLock::named("net.inet.ports", BTreeMap::new()),
+            lo_udp: SpinLock::named("net.inet.lo_udp", BTreeMap::new()),
+            udp: SpinLock::named("net.inet.ns_udp", BTreeSet::new()),
+        }
+    }
+
+    fn tcp_bound(&self, port: u16) -> bool {
+        self.tcp_ports.lock().get(&port).is_some_and(|v| !v.is_empty())
+    }
+
+    fn port_add(&self, port: u16, me: PortUse) {
+        self.tcp_ports.lock().entry(port).or_default().push(me);
+    }
+
+    fn port_update(&self, port: u16, id: usize, f: impl FnOnce(&mut PortUse)) {
+        if let Some(u) = self.tcp_ports.lock().get_mut(&port).and_then(|v| v.iter_mut().find(|u| u.id == id)) {
+            f(u);
+        }
+    }
+
+    fn port_release(&self, port: u16, id: usize) {
+        let mut t = self.tcp_ports.lock();
+        if let Some(v) = t.get_mut(&port) {
+            v.retain(|u| u.id != id);
+            if v.is_empty() {
+                t.remove(&port);
+            }
+        }
+    }
+
+    /// Takes `r` off the slots of `port` it still holds.
+    fn lo_unhook(&self, port: u16, r: &Arc<LoUdp>, slots: &[bool]) {
+        let mut t = self.lo_udp.lock();
+        for v6 in slots {
+            if t.get(&(port, *v6)).is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(r))) {
+                t.remove(&(port, *v6));
+            }
+        }
+    }
+
+    /// Delivers a datagram to whoever holds `to.port` on the loopback side `v6`; false when nobody does.
+    fn lo_deliver(&self, data: &[u8], from: SockAddr, to: SockAddr, v6: bool) -> bool {
+        let Some(r) = self.lo_udp.lock().get(&(to.port, v6)).and_then(|w| w.upgrade()) else { return false };
+        // A full receive buffer drops the datagram (Linux counts it as a receive-buffer error).
+        if r.bytes.load(Ordering::Acquire) + data.len() > r.rcvbuf.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut v = Vec::new();
+        if v.try_reserve_exact(data.len()).is_err() {
+            return true;
+        }
+        v.extend_from_slice(data);
+        let mut q = r.q.lock();
+        if q.try_reserve(1).is_err() {
+            return true;
+        }
+        r.bytes.fetch_add(data.len(), Ordering::AcqRel);
+        q.push_back(LoDgram { data: v, from, at: ctl::Arrival { to: to.ip, v6, ifindex: 1, spec: to.ip } });
+        drop(q);
+        notify();
+        true
+    }
+}
+
+static INIT: Tables = Tables::new();
+
+/// Whether a program socket of the initial namespace holds TCP `port` (the stack's ephemeral picker skips it).
 pub(crate) fn tcp_port_bound(port: u16) -> bool {
-    TCP_PORTS.lock().get(&port).is_some_and(|v| !v.is_empty())
+    INIT.tcp_bound(port)
+}
+
+/// `sk_state` numbers /proc/net shows (include/net/tcp_states.h).
+pub(crate) const TCP_ESTABLISHED: u8 = 1;
+pub(crate) const TCP_SYN_SENT: u8 = 2;
+pub(crate) const TCP_CLOSE: u8 = 7;
+pub(crate) const TCP_LISTEN: u8 = 10;
+
+/// NW-12: one line of /proc/net/tcp or /proc/net/udp.
+pub(crate) struct ProcRow {
+    pub(crate) tcp: bool,
+    pub(crate) local: SockAddr,
+    pub(crate) peer: SockAddr,
+    pub(crate) state: u8,
+    /// The owner's kernel uid.
+    pub(crate) uid: u32,
+}
+
+/// NW-11: where a socket's traffic goes: the kernel's stack (the initial namespace) or a namespace's own
+/// loopback (nothing else exists there).
+#[derive(Clone, Copy)]
+enum Place<'a> {
+    Stack(&'static Stack),
+    Ns(&'a Arc<NetView>),
+}
+
+impl<'a> Place<'a> {
+    fn tables(self) -> &'a Tables {
+        match self {
+            Place::Stack(_) => &INIT,
+            Place::Ns(v) => &v.inet,
+        }
+    }
+
+    /// `inet_addr_valid_or_nonlocal` (`v6_lo`: an AF_INET6 socket's ::1). In a namespace, as CachyOS answers
+    /// (`__inet_dev_addr_type`, linux-6.6/net/ipv4/fib_frontend.c:206): before lo's first address (its first UP
+    /// or RTM_NEWADDR/SIOCSIFADDR) there is no local table, so every IPv4 address passes; after it 0.0.0.0,
+    /// broadcast, multicast and the subnets of lo's addresses (a loopback's prefix route is local; they stay
+    /// while lo is down again). ::1 is lo's only while it is UP (`ipv6_chk_addr`).
+    fn local_ok(self, ip: Ipv4, v6_lo: bool) -> bool {
+        match self {
+            Place::Stack(st) => InetSock::local_ok(st, ip),
+            Place::Ns(v) => {
+                v.with_dev(|d| {
+                    if v6_lo {
+                        d.has6()
+                    } else {
+                        !d.table || ip.is_unspecified() || ip == Ipv4::BROADCAST || (224..240).contains(&ip.0[0]) || d.covers(ip.0)
+                    }
+                })
+            }
+        }
+    }
+
+    /// The loopback a TCP connection to 127/8 or ::1 (`v6_lo`) takes. In a namespace whose lo is down or has no
+    /// address for `to`: no route (ENETUNREACH), for ::1 no source address (EADDRNOTAVAIL,
+    /// `ip6_dst_lookup_tail`). (A connection to a lo that was up and is down again hangs on Linux until it times
+    /// out; V2 answers ENETUNREACH at once.)
+    fn lo(self, to: Ipv4, v6_lo: bool) -> Result<&'a crate::loopback::Loopback, Errno> {
+        match self {
+            Place::Stack(st) => Ok(&st.lo),
+            Place::Ns(v) => {
+                let ok = v.with_dev(|d| if v6_lo { d.has6() } else { d.up && d.covers(to.0) });
+                match (ok, v6_lo) {
+                    (true, _) => Ok(&v.lo),
+                    (false, true) => Err(EADDRNOTAVAIL),
+                    (false, false) => Err(ENETUNREACH),
+                }
+            }
+        }
+    }
+
+    /// A datagram in a namespace (`v6_lo`: to ::1): to one of lo's local routes (127/8 after an UP, the
+    /// addresses a program gave it) it is delivered while lo is UP and dropped while it is down (Ok(false), the
+    /// route is still there); without a route: ENETUNREACH; ::1 without lo UP: EADDRNOTAVAIL.
+    fn ns_route(v: &NetView, to: Ipv4, v6_lo: bool) -> Result<bool, Errno> {
+        v.with_dev(|d| {
+            if v6_lo {
+                return if d.has6() { Ok(true) } else { Err(EADDRNOTAVAIL) };
+            }
+            if !d.covers(to.0) {
+                return Err(ENETUNREACH);
+            }
+            Ok(d.up)
+        })
+    }
+}
+
+/// NW-11: a UDP port of a namespace below the initial one, on the slots of its family; given back on drop.
+struct NsUdp {
+    view: Arc<NetView>,
+    port: u16,
+    slots: &'static [bool],
+}
+
+impl NsUdp {
+    /// Takes `port` (0: an ephemeral one) on `slots`: EADDRINUSE when one of them is held.
+    fn take(view: &Arc<NetView>, slots: &'static [bool], port: u16) -> Result<NsUdp, Errno> {
+        let t = &view.inet.udp;
+        let held = |p: u16| {
+            let u = t.lock();
+            slots.iter().any(|s| u.contains(&(p, *s)))
+        };
+        // Bounded (B4): one pass over the ephemeral range at most.
+        for _ in crate::stack::EPHEMERAL {
+            let p = if port != 0 { port } else { view.ephemeral(held).ok_or(EADDRINUSE)? };
+            let mut u = t.lock();
+            if slots.iter().any(|s| u.contains(&(p, *s))) {
+                if port != 0 {
+                    return Err(EADDRINUSE);
+                }
+                continue;
+            }
+            for s in slots {
+                u.insert((p, *s));
+            }
+            return Ok(NsUdp { view: view.clone(), port: p, slots });
+        }
+        Err(EADDRINUSE)
+    }
+}
+
+impl Drop for NsUdp {
+    fn drop(&mut self) {
+        let mut u = self.view.inet.udp.lock();
+        for s in self.slots {
+            u.remove(&(self.port, *s));
+        }
+    }
 }
 
 /// `inet_csk_bind_conflict`: two sockets on one port conflict when their addresses overlap, unless both have
@@ -117,16 +328,22 @@ fn conflict(v: &[PortUse], me: &PortUse) -> bool {
     v.iter().any(|o| o.id != me.id && inet6::overlap((o.ip, o.fam), (me.ip, me.fam)) && !(me.reuse && o.reuse && !o.listening))
 }
 
-/// Takes `port` (0: an ephemeral one) for `me`. Lock order: the stack's port counter before `TCP_PORTS` (its
-/// picker asks `tcp_port_bound`), so a pick happens outside `TCP_PORTS` and is checked again under it.
-fn port_take(st: &Stack, me: PortUse, port: u16) -> Result<u16, Errno> {
-    // Kernel listeners are IPv4 and program ones are in `TCP_PORTS`: an IPv6-only socket asks only the latter.
-    let kernel = |p: u16| me.fam != Fam::Only6 && st.listening_on(me.ip, p);
+/// Takes `port` (0: an ephemeral one) for `me`. Lock order: the port counter (the stack's or the namespace's)
+/// before `tcp_ports` (its picker asks `tcp_bound`), so a pick happens outside `tcp_ports` and is checked again
+/// under it.
+fn port_take(at: Place<'_>, me: PortUse, port: u16) -> Result<u16, Errno> {
+    let tables = at.tables();
+    // Kernel listeners are IPv4 and program ones are in `tcp_ports`: an IPv6-only socket asks only the latter.
+    // A namespace has no kernel listeners.
+    let kernel = |p: u16| match at {
+        Place::Stack(st) => me.fam != Fam::Only6 && st.listening_on(me.ip, p),
+        Place::Ns(_) => false,
+    };
     if port != 0 {
         if kernel(port) {
             return Err(EADDRINUSE);
         }
-        let mut t = TCP_PORTS.lock();
+        let mut t = tables.tcp_ports.lock();
         if t.get(&port).is_some_and(|v| conflict(v, &me)) {
             return Err(EADDRINUSE);
         }
@@ -135,8 +352,13 @@ fn port_take(st: &Stack, me: PortUse, port: u16) -> Result<u16, Errno> {
     }
     // Bounded (B4): one pass over the ephemeral range at most, as the picker itself.
     for _ in crate::stack::EPHEMERAL {
-        let p = st.ephemeral_port(|p| tcp_port_bound(p) || kernel(p)).ok_or(EADDRINUSE)?;
-        let mut t = TCP_PORTS.lock();
+        let taken = |p: u16| tables.tcp_bound(p) || kernel(p);
+        let p = match at {
+            Place::Stack(st) => st.ephemeral_port(taken),
+            Place::Ns(v) => v.ephemeral(taken),
+        }
+        .ok_or(EADDRINUSE)?;
+        let mut t = tables.tcp_ports.lock();
         if t.get(&p).is_some_and(|v| conflict(v, &me)) {
             continue;
         }
@@ -146,30 +368,10 @@ fn port_take(st: &Stack, me: PortUse, port: u16) -> Result<u16, Errno> {
     Err(EADDRINUSE)
 }
 
-fn port_add(port: u16, me: PortUse) {
-    TCP_PORTS.lock().entry(port).or_default().push(me);
-}
-
-fn port_update(port: u16, id: usize, f: impl FnOnce(&mut PortUse)) {
-    if let Some(u) = TCP_PORTS.lock().get_mut(&port).and_then(|v| v.iter_mut().find(|u| u.id == id)) {
-        f(u);
-    }
-}
-
-fn port_release(port: u16, id: usize) {
-    let mut t = TCP_PORTS.lock();
-    if let Some(v) = t.get_mut(&port) {
-        v.retain(|u| u.id != id);
-        if v.is_empty() {
-            t.remove(&port);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------------------
 // UDP on 127.0.0.0/8 (the stack's loopback carries TCP only)
 
-struct LoUdp {
+pub(crate) struct LoUdp {
     q: SpinLock<VecDeque<LoDgram>>,
     bytes: AtomicUsize,
     rcvbuf: AtomicUsize,
@@ -182,10 +384,6 @@ struct LoDgram {
     at: ctl::Arrival,
 }
 
-/// Loopback UDP receivers per port and side (false: IPv4 senders, true: AF_INET6 senders to ::1); a dual-stack
-/// `::` holds both slots, so an IPv6-only socket and an AF_INET one share a port as on Linux.
-static LO_UDP: SpinLock<BTreeMap<(u16, bool), Weak<LoUdp>>> = SpinLock::named("net.inet.lo_udp", BTreeMap::new());
-
 /// The loopback slots a socket of family `fam` holds.
 fn lo_slots(fam: Fam) -> &'static [bool] {
     match fam {
@@ -195,38 +393,6 @@ fn lo_slots(fam: Fam) -> &'static [bool] {
     }
 }
 
-/// Takes `r` off the slots of `port` it still holds.
-fn lo_unhook(port: u16, r: &Arc<LoUdp>, slots: &[bool]) {
-    let mut t = LO_UDP.lock();
-    for v6 in slots {
-        if t.get(&(port, *v6)).is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(r))) {
-            t.remove(&(port, *v6));
-        }
-    }
-}
-
-/// Delivers a datagram to whoever holds `to.port` on the loopback side `v6`; false when nobody does.
-fn lo_deliver(data: &[u8], from: SockAddr, to: SockAddr, v6: bool) -> bool {
-    let Some(r) = LO_UDP.lock().get(&(to.port, v6)).and_then(|w| w.upgrade()) else { return false };
-    // A full receive buffer drops the datagram (Linux counts it as a receive-buffer error).
-    if r.bytes.load(Ordering::Acquire) + data.len() > r.rcvbuf.load(Ordering::Relaxed) {
-        return true;
-    }
-    let mut v = Vec::new();
-    if v.try_reserve_exact(data.len()).is_err() {
-        return true;
-    }
-    v.extend_from_slice(data);
-    let mut q = r.q.lock();
-    if q.try_reserve(1).is_err() {
-        return true;
-    }
-    r.bytes.fetch_add(data.len(), Ordering::AcqRel);
-    q.push_back(LoDgram { data: v, from, at: ctl::Arrival { to: to.ip, v6, ifindex: 1, spec: to.ip } });
-    drop(q);
-    notify();
-    true
-}
 
 // ---------------------------------------------------------------------------------------------------------
 // The socket
@@ -244,7 +410,7 @@ struct TcpSt {
     s: Tcp,
     local: Option<SockAddr>,
     peer: Option<SockAddr>,
-    /// The port this socket holds in `TCP_PORTS`.
+    /// The port this socket holds in its namespace's `tcp_ports`.
     port: Option<u16>,
     err: Errno,
     shutdown: u8,
@@ -263,6 +429,8 @@ struct UdpSt {
     lo: Option<Arc<LoUdp>>,
     /// The port on the IPv6 side (`inet6::UDP6_PORTS`): IPv6-only and dual-stack sockets.
     guard6: Option<inet6::Port6Guard>,
+    /// NW-11: the port of a socket in a namespace below the initial one (instead of `guard`/`guard6`).
+    ns_port: Option<NsUdp>,
     /// Which loopback slots `lo` holds.
     fam: Fam,
     /// The multicast group an AF_INET6 socket was bound to (getsockname shows it).
@@ -329,10 +497,10 @@ impl InetSock {
             SOCK_STREAM if p == 0 || p == IPPROTO_TCP => Proto::Tcp(SpinLock::named("net.inet.tcp", idle_tcp())),
             SOCK_DGRAM if p == 0 || p == IPPROTO_UDP => Proto::Udp(SpinLock::named(
                 "net.inet.udp",
-                UdpSt { local: None, guard: None, smol: None, lo: None, guard6: None, fam: Fam::V4, group6: None, peer: None, err: 0, shutdown: 0, allowed: None, src: None },
+                UdpSt { local: None, guard: None, smol: None, lo: None, guard6: None, ns_port: None, fam: Fam::V4, group6: None, peer: None, err: 0, shutdown: 0, allowed: None, src: None },
             )),
             SOCK_STREAM | SOCK_DGRAM => return Err(EPROTONOSUPPORT),
-            SOCK_RAW if c.uid != 0 => return Err(EPERM),
+            SOCK_RAW if !c.can(super::cap::NET_RAW) => return Err(EPERM),
             SOCK_RAW => return Err(EPROTONOSUPPORT),
             _ => return Err(ESOCKTNOSUPPORT),
         };
@@ -343,7 +511,9 @@ impl InetSock {
         Ok(Arc::new(InetSock {
             proto,
             opts,
-            owner: *c,
+            // Without `ids`: a socket must not keep its creator's cred and namespaces alive; capability checks
+            // use the caller of each call (`sockopt_ns_capable`).
+            owner: Caller { pid: c.pid, uid: c.uid, gid: c.gid, subject: c.subject, net: c.net.clone(), ids: None, cred: c.cred },
             ip_opts: SpinLock::named("net.inet.opts", BTreeMap::new()),
             rd: ksync::Mutex::named("net.inet.read", ()),
             v6: AtomicBool::new(v6),
@@ -354,6 +524,25 @@ impl InetSock {
 
     fn id(&self) -> usize {
         self as *const InetSock as usize
+    }
+
+    /// NW-11: the socket's network namespace (its creator's; None: the initial one).
+    pub(crate) fn net(&self) -> &crate::netns::Net {
+        &self.owner.net
+    }
+
+    fn t(&self) -> &Tables {
+        match &self.owner.net {
+            None => &INIT,
+            Some(v) => &v.inet,
+        }
+    }
+
+    fn place(&self) -> Result<Place<'_>, Errno> {
+        match &self.owner.net {
+            None => Ok(Place::Stack(stack()?)),
+            Some(v) => Ok(Place::Ns(v)),
+        }
     }
 
     pub fn family(&self) -> u16 {
@@ -432,7 +621,7 @@ impl InetSock {
         if !self.is_v6() {
             return self.bind_at(Self::sin(raw, true)?, None, c);
         }
-        let b = self.bind6(raw, c.uid)?;
+        let b = self.bind6(raw, c)?;
         let saved = b.only6.then(|| self.force_v6only());
         let r = self.bind_at(b.at, b.group, c);
         if r.is_err()
@@ -445,11 +634,11 @@ impl InetSock {
 
     /// `bind` once the address is known (`group`: an AF_INET6 UDP socket's multicast group).
     fn bind_at(&self, a: SockAddr, group: Option<[u8; 16]>, c: &Caller) -> Result<(), Errno> {
-        let st = stack()?;
-        if !Self::local_ok(st, a.ip) {
+        let at = self.place()?;
+        if !at.local_ok(a.ip, self.is_v6() && a.ip == LO6) {
             return Err(EADDRNOTAVAIL);
         }
-        if a.port != 0 && a.port < UNPRIVILEGED_PORT_START && c.uid != 0 {
+        if a.port != 0 && a.port < UNPRIVILEGED_PORT_START && !c.can(super::cap::NET_BIND_SERVICE) {
             return Err(EACCES);
         }
         match &self.proto {
@@ -462,11 +651,11 @@ impl InetSock {
                 }
                 self.policy(policy::Access::NetBind { proto: policy::NetProto::Tcp, port: a.port })?;
                 let me = PortUse { id: self.id(), ip: a.ip, fam: self.fam_of(a.ip), reuse: self.reuse(), listening: false };
-                let port = port_take(st, me, a.port)?;
+                let port = port_take(at, me, a.port)?;
                 let mut g = t.lock();
                 if g.port.is_some() {
                     drop(g);
-                    port_release(port, self.id());
+                    self.t().port_release(port, self.id());
                     return Err(EINVAL);
                 }
                 g.port = Some(port);
@@ -478,18 +667,18 @@ impl InetSock {
                     return Err(EINVAL);
                 }
                 self.policy(policy::Access::NetBind { proto: policy::NetProto::Udp, port: a.port })?;
-                self.udp_bind(st, a, group)
+                self.udp_bind(at, a, group)
             }
         }
     }
 
     /// The automatic bind of an unbound UDP socket's first send or connect (`inet_autobind`).
-    fn udp_autobind(&self, u: &SpinLock<UdpSt>, st: &'static Stack) -> Result<(), Errno> {
+    fn udp_autobind(&self, u: &SpinLock<UdpSt>, at: Place<'_>) -> Result<(), Errno> {
         let _b = self.bind_mx.lock();
         if u.lock().local.is_some() {
             return Ok(());
         }
-        self.udp_bind(st, SockAddr { ip: Ipv4::ANY, port: 0 }, None)
+        self.udp_bind(at, SockAddr { ip: Ipv4::ANY, port: 0 }, None)
     }
 
     /// The UDP ports a socket of family `fam` holds: the stack's table (IPv4), `UDP6_PORTS` (IPv6), a dual-stack
@@ -515,20 +704,26 @@ impl InetSock {
     }
 
     /// Called with `bind_mx` held.
-    fn udp_bind(&self, st: &'static Stack, a: SockAddr, group: Option<[u8; 16]>) -> Result<(), Errno> {
+    fn udp_bind(&self, at: Place<'_>, a: SockAddr, group: Option<[u8; 16]>) -> Result<(), Errno> {
         let Proto::Udp(u) = &self.proto else { return Err(EINVAL) };
         let fam = self.fam_of(a.ip);
-        let (guard, guard6) = Self::udp_ports(st, fam, a.port)?;
-        let Some(port) = guard.as_ref().map(|g| g.0).or(guard6.as_ref().map(|g| g.0)) else { return Err(EADDRINUSE) };
-        // An IPv6-only socket hears no IPv4 host: it stays off the cards.
-        let smol = match &guard {
-            Some(g) if !a.ip.is_loopback() && fam != Fam::Only6 => Some(Arc::new(SmolUdp::bind_prog(st, a.ip, g, self.owner.subject).map_err(errno)?)),
+        let (guard, guard6, ns_port) = match at {
+            Place::Stack(st) => {
+                let (g, g6) = Self::udp_ports(st, fam, a.port)?;
+                (g, g6, None)
+            }
+            Place::Ns(v) => (None, None, Some(NsUdp::take(v, lo_slots(fam), a.port)?)),
+        };
+        let Some(port) = guard.as_ref().map(|g| g.0).or(guard6.as_ref().map(|g| g.0)).or(ns_port.as_ref().map(|g| g.port)) else { return Err(EADDRINUSE) };
+        // An IPv6-only socket hears no IPv4 host: it stays off the cards (a namespace has none).
+        let smol = match (&guard, at) {
+            (Some(g), Place::Stack(st)) if !a.ip.is_loopback() && fam != Fam::Only6 => Some(Arc::new(SmolUdp::bind_prog(st, a.ip, g, self.owner.subject).map_err(errno)?)),
             _ => None,
         };
         // A group-bound socket takes the group's datagrams only: none reach it over the loopback.
         let lo = if group.is_none() && (a.ip.is_loopback() || a.ip.is_unspecified()) {
             let r = Arc::new(LoUdp { q: SpinLock::named("net.inet.lo_udp_q", VecDeque::new()), bytes: AtomicUsize::new(0), rcvbuf: AtomicUsize::new(self.opts.rcvbuf()) });
-            let mut t = LO_UDP.lock();
+            let mut t = at.tables().lo_udp.lock();
             for v6 in lo_slots(fam) {
                 t.insert((port, *v6), Arc::downgrade(&r));
             }
@@ -540,13 +735,14 @@ impl InetSock {
         if g.local.is_some() {
             drop(g);
             if let Some(r) = &lo {
-                lo_unhook(port, r, lo_slots(fam));
+                at.tables().lo_unhook(port, r, lo_slots(fam));
             }
             return Err(EINVAL);
         }
         g.local = Some(SockAddr { ip: a.ip, port });
         g.guard = guard;
         g.guard6 = guard6;
+        g.ns_port = ns_port;
         g.fam = fam;
         g.group6 = group;
         g.smol = smol;
@@ -555,6 +751,49 @@ impl InetSock {
     }
 
     /// getsockname / getpeername (`inet_getname`).
+    /// NW-12: what /proc/net/tcp and /proc/net/udp show of this socket (`get_tcp4_sock`, `udp4_format_sock`).
+    /// None for what they leave out: AF_INET6 sockets (tcp6/udp6), TCP sockets that neither listen nor connect
+    /// (only bound ones are not in Linux's listening or established tables), UDP sockets without a port.
+    pub(crate) fn proc_row(&self) -> Option<ProcRow> {
+        if self.is_v6() {
+            return None;
+        }
+        let none = SockAddr { ip: Ipv4::ANY, port: 0 };
+        let (tcp, local, peer, state) = match &self.proto {
+            Proto::Tcp(t) => {
+                // Read-only (no `sync`): a reader must not move another program's socket on. A handshake that
+                // finished shows as the owner's next call will see it; one that failed is closed (`tcp_done`
+                // unhashes it) and not listed.
+                let g = t.lock();
+                let (state, local) = match &g.s {
+                    Tcp::Idle => return None,
+                    Tcp::Listening(_) => (TCP_LISTEN, g.local),
+                    Tcp::Connecting(c) => {
+                        let st = c.state();
+                        if st.error.is_some() {
+                            return None;
+                        }
+                        if st.connecting { (TCP_SYN_SENT, g.local) } else { (TCP_ESTABLISHED, Some(c.local())) }
+                    }
+                    Tcp::Connected(_) => (TCP_ESTABLISHED, g.local),
+                };
+                (true, local.unwrap_or(none), if state == TCP_LISTEN { none } else { g.peer.unwrap_or(none) }, state)
+            }
+            Proto::Udp(u) => {
+                let g = u.lock();
+                let l = g.local.filter(|l| l.port != 0)?;
+                // `inet_rcv_saddr`: a connect of a socket bound to 0.0.0.0 fills in the source it chose.
+                let ip = match g.src {
+                    Some(ip) if l.ip.is_unspecified() => ip,
+                    _ => l.ip,
+                };
+                let state = if g.peer.is_some() { TCP_ESTABLISHED } else { TCP_CLOSE };
+                (false, SockAddr { ip, port: l.port }, g.peer.unwrap_or(none), state)
+            }
+        };
+        Some(ProcRow { tcp, local, peer, state, uid: self.owner.uid })
+    }
+
     pub fn getname(&self, peer: bool) -> Result<Vec<u8>, Errno> {
         let a = match &self.proto {
             Proto::Tcp(t) => {
@@ -638,14 +877,14 @@ impl InetSock {
             }
         }
         if let Some(p) = free {
-            port_release(p, self.id());
+            self.t().port_release(p, self.id());
         }
         drop(gone);
     }
 
     pub fn listen(&self, backlog: usize, _c: &Caller) -> Result<(), Errno> {
         let Proto::Tcp(t) = &self.proto else { return Err(EOPNOTSUPP) };
-        let st = stack()?;
+        let at = self.place()?;
         let _b = self.bind_mx.lock();
         let (local, has_port) = {
             let g = t.lock();
@@ -658,35 +897,41 @@ impl InetSock {
             (g.local.unwrap_or(SockAddr { ip: Ipv4::ANY, port: 0 }), g.port.is_some())
         };
         self.policy(policy::Access::NetListen { port: local.port })?;
-        // Built before `TCP_PORTS` is locked (`fam_of` takes the option lock).
+        // Built before `tcp_ports` is locked (`fam_of` takes the option lock).
         let fam = self.fam_of(local.ip);
         let me = PortUse { id: self.id(), ip: local.ip, fam, reuse: self.reuse(), listening: true };
         let port = if has_port {
             // A listener conflicts with every other user of its port (SO_REUSEADDR does not help there).
-            if TCP_PORTS.lock().get(&local.port).is_some_and(|v| conflict(v, &me)) {
+            if self.t().tcp_ports.lock().get(&local.port).is_some_and(|v| conflict(v, &me)) {
                 return Err(EADDRINUSE);
             }
             local.port
         } else {
-            port_take(st, me, 0)?
+            port_take(at, me, 0)?
         };
         let (rx, tx) = self.bufs();
         // An IPv6-only :: listens on the loopback only (no IPv6 reaches the cards).
-        let (at, side) = match fam {
+        let (on, side) = match fam {
             Fam::V4 => (local.ip, Side::V4),
             Fam::Dual => (local.ip, Side::Both),
             Fam::Only6 => (LO6, Side::V6),
         };
-        let l = match st.listen_prog(SockAddr { ip: at, port }, side, backlog, self.owner.subject, rx, tx) {
+        let made = match at {
+            Place::Stack(st) => st.listen_prog(SockAddr { ip: on, port }, side, backlog, self.owner.subject, rx, tx),
+            Place::Ns(v) => ProgListener::on_loopback(&v.lo, SockAddr { ip: on, port }, side),
+        };
+        let l = match made {
             Ok(l) => l,
             Err(e) => {
                 if !has_port {
-                    port_release(port, self.id());
+                    self.t().port_release(port, self.id());
                 }
                 return Err(errno(e));
             }
         };
-        port_update(port, self.id(), |u| u.listening = true);
+        self.t().port_update(port, self.id(), |u| u.listening = true);
+        // `inet_csk_listen_start` clears the ACK state, pingpong included (inet_connection_sock.c:1247).
+        self.opts.set(flag::PINGPONG, false);
         let mut g = t.lock();
         g.port = Some(port);
         g.local = Some(SockAddr { ip: local.ip, port });
@@ -713,6 +958,8 @@ impl InetSock {
                 if self.opts.has(flag::KEEPALIVE) {
                     conn.set_keepalive(true);
                 }
+                // No PINGPONG here: listen() cleared the listener's (`inet_csk_delack_init`), and an accepted
+                // socket starts with fresh options.
                 let (local, peer) = (conn.local(), conn.peer());
                 let n = InetSock::create_in(self.is_v6(), SOCK_STREAM, 0, &self.owner)?;
                 n.opts.copy_from(&self.opts);
@@ -725,7 +972,7 @@ impl InetSock {
                     g.s = Tcp::Connected(conn);
                     g.port = Some(local.port);
                 }
-                port_add(local.port, PortUse { id: n.id(), ip: local.ip, fam: n.fam_of(local.ip), reuse: self.reuse(), listening: false });
+                self.t().port_add(local.port, PortUse { id: n.id(), ip: local.ip, fam: n.fam_of(local.ip), reuse: self.reuse(), listening: false });
                 return Ok((n, self.name_of(peer)));
             }
             let ready = || {
@@ -755,19 +1002,31 @@ impl InetSock {
                 if to.ip.is_unspecified() {
                     to.ip = Ipv4::LOCALHOST;
                 }
-                let st = stack()?;
-                if !to.ip.is_loopback() && to.ip != Ipv4::BROADCAST && st.route_on(to.ip, self.bound_card()).is_none() {
-                    return Err(ENETUNREACH);
+                let at = self.place()?;
+                match at {
+                    Place::Stack(st) => {
+                        if !to.ip.is_loopback() && to.ip != Ipv4::BROADCAST && st.route_on(to.ip, self.bound_card()).is_none() {
+                            return Err(ENETUNREACH);
+                        }
+                    }
+                    // A namespace routes 127/8 and ::1 only (`ns_route`).
+                    Place::Ns(v) => {
+                        Place::ns_route(v, to.ip, self.is_v6() && to.ip == LO6)?;
+                    }
                 }
                 self.policy(policy::Access::NetConnect { proto: policy::NetProto::Udp, addr: inet6::policy_ip(to.ip), port: to.port })?;
-                self.udp_autobind(u, st)?;
+                self.udp_autobind(u, at)?;
                 // `ip4_datagram_connect` / `ip6_datagram_connect` pick the source now.
                 let src = if to.ip == LO6 {
                     Some(LO6)
                 } else if to.ip.is_loopback() {
                     Some(Ipv4::LOCALHOST)
-                } else {
+                } else if let Place::Stack(st) = at {
                     st.route_on(to.ip, self.bound_card()).and_then(|(i, _)| i.info().addr.map(|(a, _)| a))
+                } else if let Place::Ns(v) = at {
+                    Some(Ipv4(v.with_dev(|d| d.src_for(to.ip.0))))
+                } else {
+                    None
                 };
                 let mut g = u.lock();
                 g.peer = Some(to);
@@ -832,24 +1091,32 @@ impl InetSock {
             if to.ip.is_unspecified() {
                 to.ip = Ipv4::LOCALHOST;
             }
-            let st = stack()?;
+            let at = self.place()?;
             self.policy(policy::Access::NetConnect { proto: policy::NetProto::Tcp, addr: inet6::policy_ip(to.ip), port: to.port })?;
             let bound = t.lock().port;
             let conn: Result<Box<dyn Conn>, NetError> = if to.ip.is_loopback() {
-                if self.is_v6() && to.ip == LO6 {
+                let v6_lo = self.is_v6() && to.ip == LO6;
+                let lo = at.lo(to.ip, v6_lo)?;
+                if v6_lo {
                     // ::1 talks to ::1 on the loopback's IPv6 side: both ends of the pair carry the stand-in.
-                    st.lo.connect_side(to, LO6, true)
+                    lo.connect_side(to, LO6, true)
                 } else {
                     // IPv4 (also an AF_INET program's own 127.0.6.1): the IPv4 side.
-                    st.lo.connect_conn(to)
+                    lo.connect_conn(to)
                 }
-            } else {
+            } else if let Place::Stack(st) = at {
                 let (rx, tx) = self.bufs();
                 crate::stack::tcp::connect_start(st, to, bound, rx, tx, self.owner.subject, self.bound_card()).map(|s| Box::new(s) as Box<dyn Conn>)
+            } else if let Place::Ns(v) = at {
+                // NW-12: lo's other addresses (outside 127/8) are the namespace's loopback too.
+                let lo = at.lo(to.ip, false)?;
+                lo.connect_from(to, Ipv4(v.with_dev(|d| d.src_for(to.ip.0))), false)
+            } else {
+                Err(NetError::Unreachable)
             };
             let conn = match conn {
                 Ok(c) => c,
-                Err(NetError::ConnectionRefused) if to.ip.is_loopback() && nonblock => {
+                Err(NetError::ConnectionRefused) if (to.ip.is_loopback() || matches!(at, Place::Ns(_))) && nonblock => {
                     // A loopback refusal is immediate on Linux too; a non-blocking caller still sees EINPROGRESS
                     // and finds ECONNREFUSED in SO_ERROR.
                     let mut g = t.lock();
@@ -869,10 +1136,14 @@ impl InetSock {
             if self.opts.has(flag::KEEPALIVE) {
                 conn.set_keepalive(true);
             }
+            // TCP_QUICKACK 0 before connect() stays (Linux keeps pingpong over the handshake, tcp_input.c:6348).
+            if self.opts.has(flag::PINGPONG) {
+                conn.set_quickack(false);
+            }
             let local = conn.local();
             let had_port = t.lock().port.is_some();
             if !had_port {
-                port_add(local.port, PortUse { id: self.id(), ip: local.ip, fam: self.fam_of(local.ip), reuse: self.reuse(), listening: false });
+                self.t().port_add(local.port, PortUse { id: self.id(), ip: local.ip, fam: self.fam_of(local.ip), reuse: self.reuse(), listening: false });
             }
             let mut g = t.lock();
             if !had_port {
@@ -1224,27 +1495,39 @@ impl InetSock {
             self.policy(policy::Access::NetConnect { proto: policy::NetProto::Udp, addr: inet6::policy_ip(dest.ip), port: dest.port })?;
             u.lock().allowed = Some(dest);
         }
-        let st = stack()?;
-        self.udp_autobind(u, st)?;
+        let at = self.place()?;
+        // A namespace routes 127/8 and ::1 only; a datagram for a lo that is down is dropped (`ns_route`).
+        let deliver = match at {
+            Place::Ns(v) => Place::ns_route(v, dest.ip, self.is_v6() && dest.ip == LO6)?,
+            Place::Stack(_) => true,
+        };
+        self.udp_autobind(u, at)?;
         let mut data = super::buffer(len)?;
         src.fill(&mut data)?;
+        if !deliver {
+            return Ok(len);
+        }
         let (local, smol, connected) = {
             let g = u.lock();
             (g.local.unwrap_or(SockAddr { ip: Ipv4::ANY, port: 0 }), g.smol.clone(), g.peer == Some(dest))
         };
-        if dest.ip.is_loopback() {
+        if dest.ip.is_loopback() || matches!(at, Place::Ns(_)) {
             // An AF_INET6 socket to ::1 sends from ::1 on the IPv6 side; to 127/8 the source is the bound address
-            // or 127.0.0.1 (an AF_INET program's own 127.0.6.1 included).
+            // or 127.0.0.1 (an AF_INET program's own 127.0.6.1 included); NW-12: to lo's other addresses in a
+            // namespace the route's source.
             let v6 = self.is_v6() && dest.ip == LO6;
             let ip = if v6 {
                 LO6
             } else if local.ip.is_unspecified() || (self.is_v6() && local.ip == LO6) {
-                Ipv4::LOCALHOST
+                match at {
+                    Place::Ns(v) if !dest.ip.is_loopback() => Ipv4(v.with_dev(|d| d.src_for(dest.ip.0))),
+                    _ => Ipv4::LOCALHOST,
+                }
             } else {
                 local.ip
             };
             let from = SockAddr { ip, port: local.port };
-            if !lo_deliver(&data, from, dest, v6) && connected {
+            if !at.tables().lo_deliver(&data, from, dest, v6) && connected {
                 // Linux's ICMP port unreachable reaches a connected socket at once: its next call sees it.
                 u.lock().err = ECONNREFUSED;
                 notify();
@@ -1537,13 +1820,14 @@ impl InetSock {
         })
     }
 
-    /// SO_KEEPALIVE, TCP_NODELAY and SO_RCVBUF reach what exists already.
+    /// SO_KEEPALIVE, TCP_NODELAY, TCP_QUICKACK and SO_RCVBUF reach what exists already.
     pub fn options_changed(&self) {
         match &self.proto {
             Proto::Tcp(t) => {
                 if let Tcp::Connecting(c) | Tcp::Connected(c) = &t.lock().s {
                     c.set_keepalive(self.opts.has(flag::KEEPALIVE));
                     c.set_nodelay(self.opts.has(flag::NODELAY));
+                    c.set_quickack(!self.opts.has(flag::PINGPONG));
                 }
             }
             Proto::Udp(u) => {
@@ -1556,7 +1840,7 @@ impl InetSock {
 
     /// Non-SOL_SOCKET options: SOL_TCP on TCP (`do_tcp_setsockopt`), SOL_UDP on UDP, SOL_IP on both
     /// (`ip_setsockopt`, common options kept and given back). `val`: the first bytes the program gave.
-    pub fn setsockopt(&self, level: u32, name: u32, optlen: usize, val: Result<Vec<u8>, Errno>) -> Result<(), Errno> {
+    pub fn setsockopt(&self, level: u32, name: u32, optlen: usize, val: Result<Vec<u8>, Errno>, c: &Caller) -> Result<(), Errno> {
         let tcp = matches!(self.proto, Proto::Tcp(_));
         let int = |val: Result<Vec<u8>, Errno>| -> Result<i32, Errno> {
             if optlen < 4 {
@@ -1574,7 +1858,11 @@ impl InetSock {
                         self.options_changed();
                     }
                     TCP_CORK => self.opts.set(flag::CORK, v != 0),
-                    TCP_QUICKACK => self.opts.set(flag::QUICKACK, v != 0),
+                    // `__tcp_sock_set_quickack` (linux-6.6/net/ipv4/tcp.c:3259): 0 enters pingpong mode, else leaves it.
+                    TCP_QUICKACK => {
+                        self.opts.set(flag::PINGPONG, v == 0);
+                        self.options_changed();
+                    }
                     TCP_MAXSEG if !(88..=65535).contains(&v) && v != 0 => return Err(EINVAL),
                     TCP_KEEPIDLE | TCP_KEEPINTVL if !(1..=32767).contains(&v) => return Err(EINVAL),
                     TCP_KEEPCNT if !(1..=127).contains(&v) => return Err(EINVAL),
@@ -1600,7 +1888,7 @@ impl InetSock {
                 self.ip_opts.lock().insert((level, name), v);
                 Ok(())
             }
-            SOL_IPV6 if self.is_v6() => self.setsockopt6(name, optlen, val),
+            SOL_IPV6 if self.is_v6() => self.setsockopt6(name, optlen, val, c),
             SOL_UDP if !tcp => {
                 let v = int(val)?;
                 // UDP_CORK (1), UDP_SEGMENT (103), UDP_GRO (104): kept, not acted on.
@@ -1621,7 +1909,7 @@ impl InetSock {
             SOL_TCP if tcp => match name {
                 TCP_NODELAY => self.opts.has(flag::NODELAY) as i32,
                 TCP_CORK => self.opts.has(flag::CORK) as i32,
-                TCP_QUICKACK => self.opts.has(flag::QUICKACK) as i32,
+                TCP_QUICKACK => !self.opts.has(flag::PINGPONG) as i32,
                 TCP_MAXSEG => stored(536),
                 TCP_KEEPIDLE => stored(7200),
                 TCP_KEEPINTVL => stored(75),
@@ -1659,18 +1947,18 @@ impl InetSock {
                 }
                 drop(s);
                 if let Some(p) = port {
-                    port_release(p, self.id());
+                    self.t().port_release(p, self.id());
                 }
             }
             Proto::Udp(u) => {
-                let (lo, smol, guard, guard6, local, fam) = {
+                let (lo, smol, guard, guard6, ns_port, local, fam) = {
                     let mut g = u.lock();
-                    (g.lo.take(), g.smol.take(), g.guard.take(), g.guard6.take(), g.local, g.fam)
+                    (g.lo.take(), g.smol.take(), g.guard.take(), g.guard6.take(), g.ns_port.take(), g.local, g.fam)
                 };
                 if let (Some(a), Some(l)) = (local, &lo) {
-                    lo_unhook(a.port, l, lo_slots(fam));
+                    self.t().lo_unhook(a.port, l, lo_slots(fam));
                 }
-                drop((lo, smol, guard, guard6));
+                drop((lo, smol, guard, guard6, ns_port));
             }
         }
         notify();

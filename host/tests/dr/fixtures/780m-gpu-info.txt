@@ -1,0 +1,6 @@
+# Radeon 780M: the fields of libdrm 2.4.134's amdgpu_query_gpu_info that follow from the captured DEV_INFO
+# (fixtures/780m-info.txt) and GB_ADDR_CONFIG (0x242, the driver's gca_config), as libdrm/info.c prints them.
+G asic_id=0x1900 chip_rev=0xc chip_external_rev=0xd family_id=148 pci_rev_id=0xd5
+G ids_flags=0x1d max_engine_clk=2700000 max_memory_clk=2800000 gpu_counter_freq=99810
+G num_shader_engines=1 num_shader_arrays_per_engine=2 rb_pipes=4 enabled_rb_pipes_mask=0xf num_hw_gfx_contexts=8
+G vram_type=10 vram_bit_width=128 ce_ram_size=0 vce_harvest_config=0 gb_addr_cfg=0x242

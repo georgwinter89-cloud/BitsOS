@@ -259,6 +259,8 @@ fn gather() -> TestResult {
     let frames_before = user_frames();
     let r = (|| -> TestResult {
         let a = lazy()?;
+        // The gather bound counts 4 KiB frames (a 2 MiB entry is one entry).
+        a.test_fail_huge(true);
         for &c in &aps {
             on(c, ap_activate, a.root())?;
         }
@@ -404,6 +406,7 @@ fn cobalt() -> TestResult {
     let w = Arc::new(Work::default());
     let errs = Arc::new(ksync::SpinLock::new(Vec::<String>::new()));
     let decoders = (cpus.len() - 1).clamp(1, 4);
+    let splits0 = crate::thp::SPLIT_PMD.get();
     let (s0, g0, r0, t0) = (tlb::stats(), generation(&a), resched_sent(), time::now_ns());
     let until = t0 + RUN_NS;
     let mut hs = Vec::new();
@@ -422,6 +425,9 @@ fn cobalt() -> TestResult {
     }
     let joined = hs.iter().all(|h| h.join_timeout(60 * SEC));
     let (s1, g1, r1, t1) = (tlb::stats(), generation(&a), resched_sent(), time::now_ns());
+    // MM-13: the decoders' buffers are 2 MiB multiples (huge pages); a DONTNEED of an odd half splits the huge page
+    // it cuts, one round each, as Linux's `pmdp_invalidate` (other spaces' splits may be counted too: more slack).
+    let splits = crate::thp::SPLIT_PMD.get() - splits0;
     kassert!(joined, "a Cobalt-like thread did not finish within 60 s");
     if let Some(x) = errs.lock().first().cloned() {
         return Err(x);
@@ -435,15 +441,15 @@ fn cobalt() -> TestResult {
         irqs_per_cpu_s = per_s(s1.irqs - s0.irqs) / cpus.len() as u64, grants = s1.grants - s0.grants, full_flushes = s1.full_flushes - s0.full_flushes,
         page_flushes = s1.page_flushes - s0.page_flushes, lazy_leaves = s1.lazy_leaves - s0.lazy_leaves, lazy_skips = s1.lazy_skips - s0.lazy_skips,
         lazy_catchups = s1.lazy_catchups - s0.lazy_catchups, kernel = s1.kernel - s0.kernel,
-        resched_ipis_per_s = per_s(r1 - r0), fills = fills, resched = r1 - r0;
+        resched_ipis_per_s = per_s(r1 - r0), fills = fills, resched = r1 - r0, thp_splits = splits;
         "Cobalt-like playback: decoder buffers 2-8 MB at 60 Hz, a deferred-io frame buffer written every frame");
     drop(f);
     drop(a);
     kassert!(frames >= 2 && cycles >= 2, "too little happened: {frames} frames, {cycles} decoder cycles");
     kassert!(s1.give_ups == s0.give_ups, "a shootdown gave up");
     // Each counted cycle or frame may have a round in flight at the start and at the end: one of each as slack.
-    let most = frames + 2 * cycles + 2 + 2 * decoders as u64;
-    kassert!(rounds <= most, "{rounds} rounds for {frames} frames and {cycles} decoder cycles (at most {most}): write faults take rounds");
+    let most = frames + 2 * cycles + splits + 2 + 2 * decoders as u64;
+    kassert!(rounds <= most, "{rounds} rounds for {frames} frames, {cycles} decoder cycles and {splits} huge page splits (at most {most}): write faults take rounds");
     // Checker finding 3: the decoders' fresh pages must not queue on the space's lock with a wake-up each (frame
     // zeroed before the lock): about 0.9 reschedule IPIs per filled page before, 0.05 after (-smp 4). Judged per
     // page, not per second, and only up to 4 CPUs: above, sched's own hand-overs vary too much (SC CR 1).

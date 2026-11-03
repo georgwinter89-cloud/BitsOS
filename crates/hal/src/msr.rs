@@ -81,22 +81,6 @@ pub const fn mc_reg(smca: bool, bank: u32, reg: u32) -> Option<u32> {
         Some(IA32_MC0_CTL + 4 * bank + reg)
     }
 }
-pub const fn mc_ctl(bank: u32) -> u32 {
-    IA32_MC0_CTL + 4 * bank
-}
-pub const fn mc_status(bank: u32) -> u32 {
-    IA32_MC0_CTL + 4 * bank + 1
-}
-pub const fn mc_addr(bank: u32) -> u32 {
-    IA32_MC0_CTL + 4 * bank + 2
-}
-pub const fn mc_misc(bank: u32) -> u32 {
-    IA32_MC0_CTL + 4 * bank + 3
-}
-/// AMD SMCA only (CPUID 0x8000_0007 EBX bit 3).
-pub const fn smca_ipid(bank: u32) -> u32 {
-    AMD_SMCA_BASE + 0x10 * bank + 5
-}
 
 /// MSRs that exist on every x86-64 CPU this kernel accepts (exposed to MCP `msr_read`). The rest of the read
 /// list depends on CPUID (`ReadCaps`).
@@ -125,6 +109,38 @@ pub struct ReadCaps {
     pub hwp: bool,
     /// IA32_PM_ENABLE bit 0 (HWP switched on): IA32_HWP_CAPABILITIES.
     pub hwp_enabled: bool,
+    /// FD-1 measuring build only: which of its extra clock and C-state MSRs exist.
+    #[cfg(bitsos_fd_measure)]
+    pub fd: FdMsrs,
+}
+
+/// FD-1 measuring build: each group of its extra MSRs on its own CPUID evidence (`read` has no fault recovery,
+/// so an MSR the CPU lacks would #GP the kernel).
+#[cfg(bitsos_fd_measure)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FdMsrs {
+    /// CPUID.6:ECX bit 0: APERF/MPERF (0xE7/0xE8).
+    pub aperfmperf: bool,
+    /// AMD and CPUID 0x8000_0008 EBX bit 27 (Linux X86_FEATURE_CPPC, amd-pstate): CPPC MSRs 0xC001_02B0..B4.
+    pub amd_cppc: bool,
+    /// AMD family 0x17 and later: HWCR, P-state limit/control/status/definitions, C-state base address.
+    pub amd_zen: bool,
+}
+
+#[cfg(bitsos_fd_measure)]
+impl FdMsrs {
+    pub fn live() -> Self {
+        use crate::cpu::cpuid;
+        let max = cpuid(0, 0).eax;
+        let max_ext = cpuid(0x8000_0000, 0).eax;
+        let amd = crate::cpu::detect().amd;
+        let (family, _, _) = crate::cpu::decode_fms(cpuid(1, 0).eax);
+        FdMsrs {
+            aperfmperf: max >= 6 && cpuid(6, 0).ecx & 1 != 0,
+            amd_cppc: amd && max_ext >= 0x8000_0008 && cpuid(0x8000_0008, 0).ebx & (1 << 27) != 0,
+            amd_zen: amd && family >= 0x17,
+        }
+    }
 }
 
 /// Intel client models whose RAPL MSRs (0x606, 0x611, 0x639) exist: the hybrid generations from Linux's model
@@ -174,6 +190,8 @@ impl ReadCaps {
             intel_rapl: intel_rapl_model(&v),
             hwp: intel_hwp(&v),
             hwp_enabled: hwp_enabled(&v, &mut |m| read(m)),
+            #[cfg(bitsos_fd_measure)]
+            fd: FdMsrs::live(),
         }
     }
 }
@@ -203,6 +221,14 @@ pub fn access(msr: u32, caps: &ReadCaps) -> Access {
         INTEL_RAPL_POWER_UNIT | INTEL_PKG_ENERGY_STATUS | INTEL_PP0_ENERGY_STATUS => return yes(caps.intel_rapl),
         IA32_PM_ENABLE => return yes(caps.hwp),
         IA32_HWP_CAPABILITIES => return yes(caps.hwp && caps.hwp_enabled),
+        // FD-1 measuring build only: APERF/MPERF, the AMD Zen clock and C-state registers (HWCR, P-state limit,
+        // control, status and definitions, C-state base address) and CPPC (capabilities/enable/request/status).
+        #[cfg(bitsos_fd_measure)]
+        0xE7 | 0xE8 => return yes(caps.fd.aperfmperf),
+        #[cfg(bitsos_fd_measure)]
+        0xC001_0015 | 0xC001_0061..=0xC001_006B | 0xC001_0073 => return yes(caps.fd.amd_zen),
+        #[cfg(bitsos_fd_measure)]
+        0xC001_02B0..=0xC001_02B4 => return yes(caps.fd.amd_cppc),
         _ => {}
     }
     if !caps.mca {
@@ -263,11 +289,15 @@ pub fn read_checked(msr: u32) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn legacy(bank: u32, reg: u32) -> u32 {
+        mc_reg(false, bank, reg).unwrap()
+    }
+
     #[test]
     fn bank_registers() {
-        assert_eq!((mc_ctl(0), mc_status(0), mc_addr(0), mc_misc(0)), (0x400, 0x401, 0x402, 0x403));
-        assert_eq!(mc_status(5), 0x415);
-        assert_eq!(smca_ipid(2), 0xC000_2025);
+        assert_eq!((legacy(0, MC_CTL), legacy(0, MC_STATUS), legacy(0, MC_ADDR), legacy(0, MC_MISC)), (0x400, 0x401, 0x402, 0x403));
+        assert_eq!(legacy(5, MC_STATUS), 0x415);
+        assert_eq!(mc_reg(true, 2, SMCA_IPID), Some(0xC000_2025));
     }
 
     #[test]
@@ -280,11 +310,11 @@ mod tests {
         assert_eq!(access(IA32_MTRRCAP, &none), Access::No, "MTRRCAP needs CPUID MTRR");
         assert_eq!(access(IA32_TSC_AUX, &intel), Access::Yes);
         assert_eq!(access(IA32_MCG_CAP, &intel), Access::Yes);
-        assert_eq!(access(mc_ctl(9), &intel), Access::Yes);
-        assert_eq!(access(mc_status(9), &intel), Access::Yes);
-        assert_eq!(access(mc_addr(9), &intel), Access::IfStatus { status: mc_status(9), valid_bit: crate::cpu::MCI_STATUS_ADDRV });
-        assert_eq!(access(mc_misc(9), &intel), Access::IfStatus { status: mc_status(9), valid_bit: crate::cpu::MCI_STATUS_MISCV });
-        assert_eq!(access(mc_ctl(10), &intel), Access::No, "bank 10 does not exist with 10 banks");
+        assert_eq!(access(legacy(9, MC_CTL), &intel), Access::Yes);
+        assert_eq!(access(legacy(9, MC_STATUS), &intel), Access::Yes);
+        assert_eq!(access(legacy(9, MC_ADDR), &intel), Access::IfStatus { status: legacy(9, MC_STATUS), valid_bit: crate::cpu::MCI_STATUS_ADDRV });
+        assert_eq!(access(legacy(9, MC_MISC), &intel), Access::IfStatus { status: legacy(9, MC_STATUS), valid_bit: crate::cpu::MCI_STATUS_MISCV });
+        assert_eq!(access(IA32_MC0_CTL + 4 * 10, &intel), Access::No, "bank 10 does not exist with 10 banks");
         assert_eq!(access(0x10, &intel), Access::No, "TSC is not on the list");
         assert_eq!(access(AMD_SYSCFG, &intel), Access::No);
         assert_eq!(access(AMD_PKG_ENERGY_STATUS, &intel), Access::No, "RAPL energy needs CPUID rapl");
@@ -326,12 +356,32 @@ mod tests {
     fn smca_layout() {
         let amd = ReadCaps { mtrr: true, tsc_aux: true, mca: true, mca_banks: 40, smca: true, ..Default::default() };
         assert_eq!(mc_reg(true, 2, MC_STATUS), Some(0xC000_2021));
-        assert_eq!(mc_reg(true, 2, SMCA_IPID), Some(smca_ipid(2)));
         assert_eq!(access(0xC000_2021 + 0x10 * 37, &amd), Access::Yes, "bank 38 of 40");
-        assert_eq!(access(smca_ipid(39), &amd), Access::Yes);
+        assert_eq!(access(AMD_SMCA_BASE + 0x10 * 39 + SMCA_IPID, &amd), Access::Yes);
         assert_eq!(access(AMD_SMCA_BASE + 0x10 * 40, &amd), Access::No);
         assert_eq!(access(AMD_SMCA_BASE + 0x10 * 3 + 2, &amd), Access::IfStatus { status: AMD_SMCA_BASE + 0x31, valid_bit: crate::cpu::MCI_STATUS_ADDRV });
         assert_eq!(access(AMD_SMCA_BASE + 4, &amd), Access::No, "MCA_CONFIG is not on the list");
-        assert_eq!(access(mc_status(1), &amd), Access::No, "SMCA CPUs are read at their SMCA addresses");
+        assert_eq!(access(legacy(1, MC_STATUS), &amd), Access::No, "SMCA CPUs are read at their SMCA addresses");
+    }
+
+    /// FD-1's extra MSRs: never on `rapl` alone (Zen 2 has RAPL but no MSR CPPC; guests often lack APERF/MPERF).
+    #[test]
+    fn fd_measure_msrs_need_their_own_cpuid_bits() {
+        let rapl_only = ReadCaps { rapl: true, ..Default::default() };
+        for m in [0xE7, 0xE8, 0xC001_0015, 0xC001_0061, 0xC001_006B, 0xC001_0073, 0xC001_02B0, 0xC001_02B4] {
+            assert_eq!(access(m, &rapl_only), Access::No, "{m:#x} with rapl only");
+        }
+        #[cfg(bitsos_fd_measure)]
+        {
+            let zen2 = ReadCaps { rapl: true, fd: FdMsrs { aperfmperf: true, amd_cppc: false, amd_zen: true }, ..Default::default() };
+            assert_eq!(access(0xC001_02B0, &zen2), Access::No, "no MSR CPPC");
+            assert_eq!(access(0xC001_0063, &zen2), Access::Yes);
+            assert_eq!(access(0xE7, &zen2), Access::Yes);
+            let guest = ReadCaps { fd: FdMsrs { aperfmperf: false, amd_cppc: true, amd_zen: true }, ..Default::default() };
+            assert_eq!(access(0xE8, &guest), Access::No, "no APERF/MPERF");
+            assert_eq!(access(0xC001_02B3, &guest), Access::Yes);
+            let intel = ReadCaps { fd: FdMsrs { aperfmperf: true, amd_cppc: false, amd_zen: false }, ..Default::default() };
+            assert_eq!(access(0xC001_0015, &intel), Access::No, "AMD Zen MSRs only on AMD family 0x17+");
+        }
     }
 }

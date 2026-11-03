@@ -112,6 +112,19 @@ fn drop_grant(pid: u32, why: &'static str) {
     klog::event!(Info, "fbdev", "compositor.revoked", pid = pid, why = why);
 }
 
+/// INT-W17 (MC-9b CR 2): `/proc/bitsos/compositor` (0444) names the process holding this grant, `holder=<pid>`
+/// or `holder=none`, so the installer takes only the real compositor as the one that confirms (MC-9a open point
+/// 2: a second /bin/bitscomp started while the session's is down is not the screen's holder).
+fn proc_render() -> alloc::string::String {
+    let pid = GRANTED.load(Ordering::Acquire);
+    if pid != 0 && proc::find(pid).is_some_and(|p| !p.has_exited()) {
+        alloc::format!("holder={pid}\n")
+    } else {
+        alloc::string::String::from("holder=none\n")
+    }
+}
+vfs::procfile!("/proc/bitsos/compositor", proc_render);
+
 /// The screen went back to the console from `pid` (`Fb::settle`, outside `fbdev.screen`): its grant ends too.
 pub(super) fn handed_back(pid: u32) {
     if pid != 0 && GRANTED.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {

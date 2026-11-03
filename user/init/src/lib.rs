@@ -4,6 +4,9 @@
 
 use std::collections::HashMap;
 
+/// UL-7: restart and power off (busybox's signals, the power socket, R8f's answer).
+pub mod power;
+
 /// Where the kernel shows its network cards and DHCP leases (one line per card, `key=value` fields; written by
 /// the kernel's `userland` crate today, owner NW, see plan/notes/ul-UL-2.md).
 pub const DEFAULT_NET_FILE: &str = "/proc/net/dhcp";

@@ -33,10 +33,11 @@ fn install() -> Result<(), &'static str> {
 }
 kreg::initcall!(kreg::Level::Core, "mm.reclaim", install);
 
-/// (total, free) frames now; None without a frame allocator.
+/// (total, free) frames now; None without a frame allocator. PF-5: frames waiting for a grace period count as
+/// free (`look` drains them first), so kswapd does not reclaim more cache for memory that is about to return.
 fn frames() -> Option<(u64, u64)> {
     let s = mm_core::frames()?.stats();
-    Some((s.total_bytes / mm_core::PAGE, s.free_bytes / mm_core::PAGE))
+    Some((s.total_bytes / mm_core::PAGE, (s.free_bytes + s.pending_bytes) / mm_core::PAGE))
 }
 
 /// The machine's watermarks now (zeros without a frame allocator).
@@ -76,8 +77,15 @@ impl Balancer {
         let runs_before = self.direct.runs;
         self.report_direct();
         let pushed = self.direct.runs != runs_before;
+        // PF-5: what passed its grace period goes back first; below the low watermark the rest is waited for
+        // (bounded) before any page is reclaimed.
+        mm_core::grace::drain();
         let Some((total, mut free)) = frames() else { return 0 };
         let w = mr::watermarks(total);
+        if free < w.low && mm_core::grace::pending_bytes() > 0 {
+            mm_core::grace::expedite();
+            free = frames().map_or(free, |(_, f)| f);
+        }
         if free >= w.low && !(pushed && free < w.high) {
             self.end_episode(free);
             return 0;
@@ -108,6 +116,8 @@ impl Balancer {
                 continue;
             }
             thorough = false;
+            // The pages just taken wait for a grace period (lockless readers): wait for it, then count again.
+            mm_core::grace::expedite();
             sched::yield_now();
             free = frames().map_or(free, |(_, f)| f);
         }

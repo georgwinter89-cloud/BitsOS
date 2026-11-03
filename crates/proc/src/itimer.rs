@@ -70,6 +70,9 @@ fn service() {
     loop {
         let gen0 = GEN.load(Ordering::SeqCst);
         PASSES.inc();
+        // AB-14: the vDSO's page follows a rate change or a new wall time within a second (until the time
+        // crate publishes itself, change request in plan/notes/ab-AB-14.md).
+        crate::vdso::refresh();
         let groups: Vec<Arc<Group>> = ARMED.lock().iter().filter_map(Weak::upgrade).collect();
         let mut wake_at = time::now_ns().saturating_add(MAX_SLEEP_NS);
         for g in &groups {

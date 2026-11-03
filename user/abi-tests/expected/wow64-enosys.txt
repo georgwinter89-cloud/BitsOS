@@ -1,0 +1,3 @@
+int80 nr 500 = -ENOSYS
+int80 nr 1000 = -ENOSYS
+done

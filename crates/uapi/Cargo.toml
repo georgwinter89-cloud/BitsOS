@@ -6,3 +6,6 @@ description = "Linux ABI numbers, structs, errno, ioctl codes (owner: desk/AB)"
 
 [dependencies]
 
+
+[lints]
+workspace = true

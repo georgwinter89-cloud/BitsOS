@@ -262,12 +262,6 @@ impl PciFunction {
         self.untouched
     }
 
-    /// G0 name of `enable_device` (kept so callers compile; the result is logged by `enable_device`).
-    /// New code calls `enable_device` and handles its error.
-    pub fn enable(&self, dma: bool) {
-        let _ = self.enable_device(dma);
-    }
-
     /// Bus master off only (G0; quiesce-safe like `disable_device`, which also switches MSI/MSI-X off).
     pub fn disable_bus_master(&self) {
         let _ = self.disable_with(0, 0);

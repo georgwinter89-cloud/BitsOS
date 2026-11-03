@@ -1,0 +1,27 @@
+outside: NSpid: 1 levels, last is getpid() = yes, first is the global pid = yes
+outside: NStgid: 1 levels, last is getpid() = yes, first is the global pid = yes
+outside: NSpgid: 1 levels
+outside: NSsid: 1 levels
+zygote: getpid 1 getppid 0
+zygote: NSpid: 2 levels, last is getpid() = yes, first is the global pid = yes
+zygote: NStgid: 2 levels, last is getpid() = yes, first is the global pid = yes
+zygote: NSpgid: 2 levels
+zygote: NSsid: 2 levels
+zygote: Tgid is the global pid = yes
+zygote: PPid is the parent's global pid = yes
+zygote: /proc/self names the global pid = yes
+zygote: kill(the outer pid, 0) = -ESRCH
+nested: getpid 1 getppid 0
+nested: NSpid: 3 levels, last is getpid() = yes, first is the global pid = yes
+nested: NStgid: 3 levels, last is getpid() = yes, first is the global pid = yes
+nested: NSpgid: 3 levels
+nested: NSsid: 3 levels
+zygote: waitid(P_PID, 2) = 0
+zygote: the nested child's pid here = 2
+zygote: si_pid 2 si_status 0
+zygote: a sleeper is pid 3
+zygote: kill(3, SIGKILL) = 0
+zygote: sleeper: signal 9
+zygote: kill(-1, 0) with nothing else here = -ESRCH
+zygote: exit 0
+the zygote's global pid is what clone returned = yes

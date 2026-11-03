@@ -1,0 +1,22 @@
+mode outside = 0644
+access W_OK outside = EACCES
+access X_OK outside = EACCES
+open for write outside = EACCES
+uid_map = 11
+setgroups = 4
+gid_map = 11
+mode inside = 0644
+access W_OK inside = EACCES
+access X_OK inside = EACCES
+limit in a new namespace = 2147483647
+open for write inside = ok
+write 3000000000 = EINVAL
+write -1 = EINVAL
+write blank = EINVAL
+write 1 = ok
+write 5 at offset 1 = ok
+limit after the write = 1
+second level = 0
+limit seen from the second level = 2147483647
+third level = -ENOSPC
+nslimit: exit 0

@@ -193,8 +193,9 @@ fn rd(r: &impl Regs, b: u32) -> Result<u32, CursorError> {
     r.read(b).ok_or(CursorError::Reg(FlipError::Read(b)))
 }
 
+/// Every cursor write is the cursor's own (GX-7m2: the picture proof lists them apart).
 fn wr(r: &impl Rw, b: u32, v: u32, check: u32) -> Result<(), CursorError> {
-    r.write(b, v, check).map_err(|e| CursorError::Reg(FlipError::from(e)))
+    r.write_as(b, v, check, crate::dcn::Owner::Cursor).map_err(|e| CursorError::Reg(FlipError::from(e)))
 }
 
 /// The cursor's pipe: HUBP n feeds DPP n, DPP n is MPCC n, MPCCn_MPCC_OPP_ID names the OPP.

@@ -17,6 +17,9 @@ These parts carry code or data derived from other projects and keep those projec
 | `crates/dcn314-regs/src/generated/` | Linux `drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_1_4_*.h`, Copyright 2022 Advanced Micro Devices, Inc. | MIT (notice below) |
 | `crates/rtw89-core/`, `crates/drivers/rtw89/` | Linux `drivers/net/wireless/realtek/rtw89/`, Copyright(c) 2019-2020 Realtek Corporation, `GPL-2.0 OR BSD-3-Clause` | BSD-3-Clause (notice below) |
 | `crates/display/src/font/cp437-8x16.bin` | the CP437 8x16 VGA font from SeaVGABIOS (see `crates/display/src/font/README.md`) | public domain |
+| `crates/drm/src/uapi/` | generated from libdrm's `drm.h`, `drm_mode.h`, `amdgpu_drm.h` (MIT) and Linux's `sync_file.h`, `dma-buf.h` | as their sources: MIT; `sync_file.rs` GPL-1.0+ and `dma_buf.rs` GPL-2.0, both WITH Linux-syscall-note (notices in the files) |
+| `crates/drivers/amdgpu/src/gpucore/gfx11_csb.bin` | the clear-state stream Linux's amdgpu driver writes to the chip, taken from a ring dump | MIT, as that driver |
+| `user/services/bitscomp/fonts/` | Figtree, Bricolage Grotesque, JetBrains Mono | SIL Open Font License 1.1 (`OFL-*.txt` next to the fonts) |
 | `user/sysroot/patches/libcxx/` | LLVM libc++ | Apache-2.0 WITH LLVM-exception |
 | `user/ports/*` | the ported programs (BusyBox, Brave, Cobalt, ...): build recipes and patches for them | each program's own licence; a patch follows the licence of the program it changes |
 

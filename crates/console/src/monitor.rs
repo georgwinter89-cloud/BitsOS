@@ -1,4 +1,4 @@
-//! The built-in monitor command line (A1, until busybox exists): a prompt on the console, one command per line
+//! The built-in monitor command line (A1; the rescue prompt besides busybox's shell): a prompt on the console, one command per line
 //! from the line discipline, commands from a registry so other crates add their own (`console::command!`; the
 //! desk adds `hang` from RB-3, `console-cmds` adds `ps` and `run`).
 //!

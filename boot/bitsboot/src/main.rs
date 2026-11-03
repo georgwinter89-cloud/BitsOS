@@ -30,6 +30,7 @@ extern crate alloc;
 
 mod cpu;
 mod elf;
+mod fch;
 mod files;
 mod generation;
 mod gop;

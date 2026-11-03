@@ -1,6 +1,7 @@
 //! Window management: turns the workspace layout into configures, the space and the keyboard focus.
 
-use smithay::desktop::{Window, WindowSurfaceType};
+use smithay::desktop::WindowSurfaceType;
+use crate::win::Window;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
@@ -47,6 +48,10 @@ pub enum Action {
     Workspaces,
     /// WY-5c: maximise the focused window to the whole screen, and back (a tiled one floats first).
     Maximise,
+    /// WY-12: minimise the focused window (Super+Down, `ctl minimize`).
+    Minimize,
+    /// WY-12: Alt+Tab (1) and Shift+Alt+Tab (-1): the next window; a minimised one is restored.
+    Switch(i32),
 }
 
 impl App {
@@ -92,7 +97,14 @@ impl App {
     /// first configure yet (then that one carries them); returns whether a configure went out.
     pub fn configure(&self, p: &Placement<Window>) -> bool {
         let c = self.content_rect(p.frame);
-        let toplevel = p.win.toplevel().unwrap();
+        // WY-3: an X11 window gets its place through the WM (a ConfigureWindow at the next turn).
+        let Some(toplevel) = p.win.toplevel() else {
+            if let Some(x) = p.win.x11() {
+                x.want_geo.set(Some(smithay::utils::Rectangle::new((c.x, c.y).into(), (c.w, c.h).into())));
+                x.activated.set(p.focused);
+            }
+            return false;
+        };
         toplevel.with_pending_state(|s| s.size = Some((c.w, c.h).into()));
         // A maximised window is `maximized` and tiled on all sides for the client: no shadows, square corners.
         let tiled = p.maximised || p.fullscreen || matches!(p.place, Place::Tiled { .. });
@@ -122,7 +134,7 @@ impl App {
             }
         }
         // A hung client gets no keys: they would only wait in its socket and arrive all at once later.
-        let focus = self.ws.focused().filter(|w| !self.is_hung(w)).and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
+        let focus = self.ws.focused().filter(|w| !self.is_hung(w)).and_then(|w| w.surface());
         let kb = self.seat.get_keyboard().unwrap();
         if kb.current_focus() != focus {
             kb.set_focus(self, focus, SERIAL_COUNTER.next_serial());
@@ -139,12 +151,12 @@ impl App {
             }
         });
         self.space.unmap_elem(w);
-        if let Some(id) = w.toplevel().map(|t| t.wl_surface().id()) {
+        if let Some(id) = w.surface().map(|s| s.id()) {
             self.deco.retain(|(k, _), _| *k != id);
             self.corner_img.retain(|(k, _), _| *k != id);
             self.veil.remove(&id);
         }
-        self.deco_img.retain(|k, _| w.toplevel().is_none_or(|t| *k != t.wl_surface().id()));
+        self.deco_img.retain(|k, _| w.surface().is_none_or(|s| *k != s.id()));
         if self.grab.as_ref().is_some_and(|g| g.window() == Some(w)) {
             self.grab = None;
         }
@@ -166,6 +178,13 @@ impl App {
     pub fn hit(&self, pos: Point<f64, Logical>) -> Hit {
         if let Some(i) = self.suggest_at(pos.x, pos.y) {
             return Hit::Spot(crate::desk::Spot::Suggest(i));
+        }
+        // WY-3: an X11 menu or tooltip lies over everything, where its program put it.
+        for w in self.x_unmanaged().iter().rev() {
+            let at = w.x11().map(|x| x.geo.get().loc).unwrap_or_default();
+            if let Some((s, loc)) = w.surface_under(pos - at.to_f64(), WindowSurfaceType::ALL) {
+                return Hit::Surface(s, (loc + at).to_f64());
+            }
         }
         let placements: Vec<_> = self.placements().into_iter().rev().filter(|p| p.visible).collect();
         if let Some(p) = placements.iter().find(|p| p.fullscreen) {
@@ -281,12 +300,18 @@ impl App {
                 }
             }
             Action::Focus(dir) => self.ws.focus_step(dir),
+            Action::Minimize => {
+                if let Some(w) = focused {
+                    self.minimize(&w, "keys");
+                }
+            }
+            Action::Switch(dir) => self.switch_window(dir),
             Action::Grow(d) => {
                 self.ws.grow_focused(d);
             }
             Action::Close => {
-                if let Some(t) = focused.as_ref().and_then(|w| w.toplevel()) {
-                    t.send_close();
+                if let Some(w) = focused.as_ref() {
+                    crate::xwm::close(w);
                 }
             }
             Action::Kill => {
@@ -378,10 +403,8 @@ impl App {
         // WY-5b: foot gets the theme's colours; only the exec sees it (the session keeps `argv`).
         let foot = crate::foot::is_foot(cmd);
         let foot_file = foot && self.foot_config_arg().map(|a| c.arg(a)).is_some();
-        c.args(args).env("WAYLAND_DISPLAY", &self.socket_name).env_remove("DISPLAY");
-        for (k, v) in &self.spawn_env {
-            c.env(k, v);
-        }
+        c.args(args);
+        child_env(&mut c, &self.socket_name, crate::xwayland::display(self).as_deref(), &self.spawn_env);
         // Never bitscomp's own stdin (a root start's console terminal: not the user's to read or write).
         c.stdin(std::process::Stdio::null());
         // Own process group (pgid = its pid): the SIGTERM/SIGKILL at bitscomp's end goes to the group and so also
@@ -419,5 +442,68 @@ impl App {
             self.foot.retain(|p| alive.contains(&p));
             self.pages_reap();
         }
+    }
+}
+
+/// The environment a started program gets on top of bitscomp's own: our Wayland socket, our X display (WY-3: when
+/// Xwayland is set up; never one bitscomp inherited), none of the gpu build's EGL variables (WY-15: they name the
+/// Mesa tree, which only bitscomp's own glibc may load), then the settings' `spawn_env` (it wins).
+fn child_env(c: &mut std::process::Command, socket: &str, display: Option<&str>, spawn_env: &[(String, String)]) {
+    c.env("WAYLAND_DISPLAY", socket).env_remove("DISPLAY");
+    if let Some(d) = display {
+        c.env("DISPLAY", d);
+    }
+    for k in crate::flavour::GLES_ENV {
+        c.env_remove(k);
+    }
+    for (k, v) in spawn_env {
+        c.env(k, v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_started_program_loses_every_egl_variable() {
+        let mut c = std::process::Command::new("env");
+        // As if bitscomp's own environment had them: an explicit value set earlier is removed as well.
+        for k in crate::flavour::GLES_ENV {
+            c.env(k, "/tree");
+        }
+        super::child_env(&mut c, "wayland-7", None, &[("FOO".into(), "bar".into())]);
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = c.get_envs().collect();
+        for k in crate::flavour::GLES_ENV {
+            assert!(envs.contains(&(OsStr::new(k), None)), "{k} not removed: {envs:?}");
+        }
+        assert!(envs.contains(&(OsStr::new("DISPLAY"), None)));
+        assert!(envs.contains(&(OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wayland-7")))));
+        assert!(envs.contains(&(OsStr::new("FOO"), Some(OsStr::new("bar")))));
+    }
+
+    #[test]
+    fn a_started_program_gets_bitscomps_x_display_only() {
+        let mut c = std::process::Command::new("env");
+        c.env("DISPLAY", ":99");
+        super::child_env(&mut c, "wayland-7", Some(":3"), &[]);
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = c.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("DISPLAY"), Some(OsStr::new(":3")))));
+        let mut c = std::process::Command::new("env");
+        super::child_env(&mut c, "wayland-7", Some(":3"), &[("DISPLAY".into(), ":5".into())]);
+        assert!(c.get_envs().any(|e| e == (OsStr::new("DISPLAY"), Some(OsStr::new(":5")))), "spawn_env wins");
+    }
+
+    #[test]
+    fn a_started_program_really_runs_without_them() {
+        // bitscomp's own environment carries one (as the gpu build's `set_env` does); the child must not see it.
+        let k = crate::flavour::GLES_ENV[0];
+        let mut c = std::process::Command::new("env");
+        c.env(k, "/tree");
+        super::child_env(&mut c, "wayland-7", None, &[]);
+        let Ok(out) = c.output() else { return }; // no `env` on this host: the first test covers the list
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.lines().any(|l| l.starts_with(&format!("{k}="))), "{k} leaked: {text}");
+        assert!(text.lines().any(|l| l == "WAYLAND_DISPLAY=wayland-7"));
     }
 }

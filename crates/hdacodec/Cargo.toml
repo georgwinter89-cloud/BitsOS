@@ -20,3 +20,6 @@ fake = []
 name = "synth"
 required-features = ["synth"]
 
+
+[lints]
+workspace = true

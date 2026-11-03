@@ -23,6 +23,8 @@ pub mod ifview;
 mod ktests;
 pub mod loopback;
 pub mod netdev;
+pub mod netns;
+pub mod procnet;
 pub mod route;
 pub mod sock;
 pub mod stack;

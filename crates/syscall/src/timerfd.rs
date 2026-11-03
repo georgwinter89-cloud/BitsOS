@@ -13,7 +13,8 @@
 //! clock's offset from the monotonic clock at arming time. The alarm clocks (REALTIME_ALARM, BOOTTIME_ALARM)
 //! need CAP_WAKE_ALARM (root) and run on their base clock (V2 never suspends, so there is nothing to wake
 //! from). TFD_TIMER_CANCEL_ON_SET works through `clock_was_set`, which a future clock_settime/settimeofday
-//! calls when the wall clock jumps; V2 has no such call yet, so such a timer is never cancelled today.
+//! calls when the wall clock jumps. Parked (C1): V2 has no such call (an AB item), so only ktests reach it and
+//! such a timer is never cancelled today.
 //!
 //! The file is an anonymous inode (fstat as eventfd's), F_GETFL = O_RDWR plus O_NONBLOCK, lseek answers 0,
 //! write EINVAL (no write operation), pread/pwrite ESPIPE, `/proc/<pid>/fd` shows `anon_inode:[timerfd]`.
@@ -595,9 +596,11 @@ pub(crate) fn set_ticks(c: &SysCtx<'_>, sh: &Shared, arg: u64) -> i64 {
 
 /// `timerfd_clock_was_set` + `clock_was_set` for timerfds: the wall clock jumped. Cancel-on-set timers whose
 /// offset changed report it (one tick, ECANCELED on the next read); REALTIME timers are queued again for their
-/// expiry at the new offset. For a future clock_settime/settimeofday (V2 has neither yet); the ktest
-/// `ab.ab5.timerfd_cancel_on_set` moves the wall clock itself.
+/// expiry at the new offset. Parked (C1): for a future clock_settime/settimeofday (V2 has neither; an AB item),
+/// so only the ktest `ab.ab5.timerfd_cancel_on_set`, which moves the wall clock itself, calls it today.
 pub fn clock_was_set() {
+    // AB-14: the vDSO's REALTIME offset follows at once (Linux's timekeeping updates the vDSO data on a set).
+    proc::vdso::refresh();
     let all: Vec<Arc<Shared>> = OBJECTS.lock().values().map(|(s, _)| s.clone()).collect();
     for sh in all {
         if sh.clock != TfdClock::Realtime {

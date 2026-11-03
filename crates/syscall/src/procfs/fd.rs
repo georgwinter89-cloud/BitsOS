@@ -51,12 +51,13 @@ struct FdLink {
 }
 
 impl MagicLink for FdLink {
-    /// The open file's place, looked up when the walk follows the link (closed meanwhile: ENOENT). Objects
-    /// without a place answer ENXIO, except an open(2) of a pipe end (`open` below).
+    /// The open file's place, looked up when the walk follows the link (closed meanwhile: ENOENT). An object
+    /// without a place (socket, pipe, eventfd, epoll, ...) lands on `anon_place`; opening it through the link is
+    /// ENXIO, except for a pipe end (`open` below).
     fn target(&self) -> Result<vfs::Path, Errno> {
         let (_, p) = self.t.live().map_err(|_| ENOENT)?;
         let f = p.fds.get(self.fd).map_err(|_| ENOENT)?;
-        f.path.clone().ok_or(ENXIO)
+        Ok(f.path.clone().unwrap_or_else(|| anon_place(&f)))
     }
     /// open(2) of a pipe end through the link (AB-7a CR8, for bash `<(cmd)` and `cat /dev/stdin` on a pipe):
     /// Linux jumps to the pipe's pipefs inode (`proc_fd_access_allowed`, then the inode's 0600 owner check) and
@@ -72,13 +73,13 @@ impl MagicLink for FdLink {
         let me_uid = proc::current().map_or(0, |me| me.cred().fsuid);
         match f.file.mode() & uapi::S_IFMT {
             uapi::S_IFIFO => {}
-            // S_IFSOCK: sockfs inodes are 0777, the open itself answers ENXIO (`sock_no_open`), as `target` does.
-            0o140000 => return None,
+            // S_IFSOCK: sockfs inodes are 0777, the open itself answers ENXIO (`sock_no_open`).
+            0o140000 => return Some(Err(ENXIO)),
             // The shared anon inode (eventfd, epoll, timerfd, signalfd, pidfd) is root's and 0600: others fail
             // its permission check (EACCES) before the open's ENXIO (linux-6.6/fs/anon_inodes.c, fs/libfs.c
             // `alloc_anon_inode`).
             _ if me_uid != 0 => return Some(Err(EACCES)),
-            _ => return None,
+            _ => return Some(Err(ENXIO)),
         }
         if !may_read_mm(&p) || (me_uid != 0 && me_uid != f.stat().uid) {
             return Some(Err(EACCES));
@@ -86,6 +87,30 @@ impl MagicLink for FdLink {
         let r = f.file.reopen(flags, me_uid == 0)?;
         Some(r.map(|end| OpenFile::new(end, vfs::OpenFlags::from_linux(flags))))
     }
+}
+
+/// The content of an `anon_place`: nothing (an open through the link never reaches it).
+struct Empty;
+
+impl FileSource for Empty {
+    fn render(&self, _who: vfs::Cred) -> Result<Vec<u8>, Errno> {
+        Ok(Vec::new())
+    }
+}
+
+/// SX-2: where a walk through `/proc/<pid>/fd/<n>` lands for a file without a place of its own (Linux: its
+/// sockfs, pipefs or anon_inodefs dentry, `proc_fd_link`): a nameless file below a private empty view with the
+/// file's type, mode, owner and inode number, so stat(2) and fstatat(2) through the link show what fstat(2)
+/// shows (Chromium's sandboxed zygote fstatat()s every fd in /proc/self/fd, sandbox/linux/services/
+/// proc_util.cc). Its device is the view's.
+fn anon_place(f: &OpenFile) -> vfs::Path {
+    static VIEW: ksync::Once<Arc<vfs::MountNs>> = ksync::Once::new();
+    let root = VIEW.get_or_init(|| Arc::new(vfs::MountNs::new_empty())).root_path();
+    let a = f.stat();
+    let inode = vfs::inode::Inode::new(a.ino, a.mode, vfs::Cred { uid: a.uid, gid: a.gid }, vfs::inode::Data::Synth(Arc::new(Empty)));
+    let name = f.file.link_name().unwrap_or_else(|| String::from(NO_NAME));
+    let dentry = vfs::dentry::Dentry::ephemeral(&root.dentry, name.as_bytes(), inode);
+    vfs::Path { mnt: root.mnt, dentry }
 }
 
 /// `/proc/<pid>/fdinfo`: r-x for everyone; listing and reading need ptrace READ access (EACCES).
@@ -164,5 +189,9 @@ impl FileSource for FdInfo {
     }
     fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
         self.make()
+    }
+    /// FS-16: `seq_fdinfo_open` is `single_open`: pwrite is ESPIPE.
+    fn positional_write(&self, _opened_for_write: bool) -> bool {
+        false
     }
 }

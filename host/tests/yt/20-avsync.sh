@@ -1,4 +1,5 @@
 #!/bin/bash
+# minipc: left the QEMU runs (Georg 30.10., CONTRACTS section 4); its checks run on the Mini-PC by the check list in plan/notes/yt-YT-5.md
 # slow: YT-5: Cobalt plays the click/flash clip (host/tests/yt/avsync/make-clip.sh, 720p30 VP9 + Opus, 20 s) on V2 in
 # QEMU (-smp 4, 4 GB, intel-hda + hda-duplex into a WAV file: nothing plays on the host); the page and clip come
 # from a web server on the host's loopback (port LO+80, QEMU's 10.0.2.2). Then:

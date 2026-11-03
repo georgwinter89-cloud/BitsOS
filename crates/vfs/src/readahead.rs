@@ -112,7 +112,7 @@ fn run(job: Job) {
                 stop = Some("truncated");
                 break;
             }
-            let n = pages_for(g.size).min(last);
+            let n = pages_for(g.size()).min(last);
             if idx >= n {
                 break;
             }
@@ -146,12 +146,12 @@ fn run(job: Job) {
             stop = Some("read failed");
             break;
         }
-        let mut g = inner.lock();
+        let g = inner.lock();
         if g.epoch != job.epoch {
             stop = Some("truncated");
             break;
         }
-        let n = pages_for(g.size);
+        let n = pages_for(g.size());
         let got = pages.len() as u64;
         for (k, p) in pages.into_iter().enumerate() {
             let i = idx + k as u64;
@@ -174,8 +174,8 @@ fn run(job: Job) {
         if !core::mem::take(&mut g.ra.follow) || stop.is_some() {
             return None;
         }
-        let (start, pages, max) = (g.ra.end, pages_for(g.size), job.backend.read_ahead_pages());
-        let (first, count) = g.ra.open(start, pages, max)?;
+        let (start, pages, max) = (g.ra.end, pages_for(g.size()), job.backend.read_ahead_pages());
+        let (first, count) = g.open_ra(start, pages, max)?;
         Some(Job { inner: job.inner.clone(), backend: job.backend.clone(), first, count, epoch: g.epoch })
     });
     PAGES_READ.add(read);

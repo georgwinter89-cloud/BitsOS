@@ -201,3 +201,31 @@ fn grant_only_allows_widening_alone() {
     assert!(!grant_only(ro & !P, ro | W), "not present before");
     assert!(!grant_only(ro, (ro | W) & !P), "not present after");
 }
+
+/// MM-11: Linux's ceiling (linux-6.6/arch/x86/mm/tlb.c:957, :1010): 33 pages still go page by page, 34 flush the
+/// whole context.
+#[test]
+fn ceiling_is_linuxs_33_pages() {
+    assert_eq!(RANGE_PAGES, 33);
+    assert_eq!(published_range(0x40_0000, 0x40_0000 + 33 * 4096, false), (0x40_0000, 0x40_0000 + 33 * 4096));
+    assert_eq!(published_range(0x40_0000, 0x40_0000 + 34 * 4096, false), (0, 0));
+    assert_eq!(plan(0, 1, Some((0x40_0000, 0x40_0000 + 33 * 4096))), Plan::Pages { start: 0x40_0000, pages: 33 });
+}
+
+#[test]
+fn huge_ranges_flush_once_per_entry() {
+    // MM-13: a range of 2 MiB entries is published with bit 0 set and flushed one invlpg per entry.
+    const M2: u64 = 2 << 20;
+    let r = published_huge(0x4000_0000, 0x4000_0000 + 3 * M2);
+    assert_eq!(r, (0x4000_0000 | HUGE_RANGE, 0x4000_0000 + 3 * M2));
+    assert_eq!(plan(0, 1, Some(r)), Plan::Huge { start: 0x4000_0000, count: 3 });
+    assert_eq!(plan(1, 3, Some(r)), Plan::Full, "two generations behind: full as for pages");
+    let max = published_huge(0, RANGE_PAGES * M2);
+    assert_eq!(plan(0, 1, Some(max)), Plan::Huge { start: 0, count: RANGE_PAGES }, "start 0 is a real range");
+    assert_eq!(published_huge(0, (RANGE_PAGES + 1) * M2), (0, 0), "above the ceiling: the whole context");
+    assert_eq!(published_huge(M2, M2), (0, 0), "empty: the whole context, never a no-op");
+    // 13.8 MB (FD-1's frame buffer) in 2 MiB entries is 7 invlpg, in 4 KiB pages a full flush.
+    let fd = published_huge(0x7f00_0000_0000, 0x7f00_0000_0000 + 7 * M2);
+    assert_eq!(plan(0, 1, Some(fd)), Plan::Huge { start: 0x7f00_0000_0000, count: 7 });
+    assert_eq!(plan(0, 1, Some(published_range(0x7f00_0000_0000, 0x7f00_0000_0000 + 7 * M2, false))), Plan::Full);
+}

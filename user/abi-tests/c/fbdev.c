@@ -16,6 +16,17 @@
  *                                fork (the child stores after the parent ended); prints "drawn a=<seed> b=<seed>
  *                                band=0+0 top=<row> double=<0|1> pid=<pid that drew>", or "<how>: unsupported <errno>"
  *   idle                         opens /dev/fb0, prints "idle pid=<pid>", sleeps until killed (never draws)
+ *   frames <seed> <n> <plain|damage|pan|end> <full|box>
+ *                                DP-6: frames into the mapping, each told to the kernel: plain = fsync (the tracked
+ *                                path), damage = FBIO_BITSOS_DAMAGE for the shown window (switched on before the
+ *                                first store), pan = two windows, FBIO_BITSOS_DAMAGE for the hidden one, then
+ *                                FBIOPAN_DISPLAY, end = the warm-up like damage, then BITSOS_DAMAGE_END and the n
+ *                                frames with fsync (tracked again); all but plain also print "rules <4 answers>"
+ *                                first (bad flags, reserved, window, rects pointer). The warm-up (1 frame, 2 with pan) fills every window with
+ *                                pat(seed); then it prints "first pid=<pid>" and waits for SIGUSR1; then n frames,
+ *                                each the whole window (full) or the box (box) with pat(seed + 1 + f); prints
+ *                                "drawn a=<seed> b=<last seed> box=<x>,<y>,<w>,<h> shape=<full|box> top=<row>
+ *                                double=<0|1> pid=<pid>" and holds (or "pan: unsupported <errno>" and exits 0)
  * Pixels are XRGB8888: pat(seed, x, y) below; ktests compute the same picture. */
 #include "abi.h"
 #include <fcntl.h>
@@ -27,6 +38,17 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <signal.h>
+
+/* DP-6: BitsOS's damage report (gopfb fbdev/damage.rs); ENOTTY on Linux. */
+struct bitsos_fb_rect {
+    uint32_t x, y, width, height;
+};
+struct bitsos_fb_damage {
+    uint32_t flags, yoffset, count, reserved;
+    uint64_t rects;
+};
+#define FBIO_BITSOS_DAMAGE _IOW('F', 0xB3, struct bitsos_fb_damage)
 
 static const char *fbname(int e) {
     switch (e) {
@@ -71,6 +93,9 @@ static void abi_facts(void) {
            (unsigned long)FBIO_WAITFORVSYNC);
     printf("FB_ACTIVATE_TEST %d FORCE %d INV_MODE %d KD_TEXT %d VMODE_YWRAP %d\n", FB_ACTIVATE_TEST, FB_ACTIVATE_FORCE,
            FB_ACTIVATE_INV_MODE, FB_ACTIVATE_KD_TEXT, FB_VMODE_YWRAP);
+    /* DP-6: BitsOS's damage report has a number Linux leaves free; on /dev/null below it is ENOTTY on both. */
+    printf("FBIO_BITSOS_DAMAGE = %#lx, struct %zu + rect %zu bytes\n", (unsigned long)FBIO_BITSOS_DAMAGE,
+           sizeof(struct bitsos_fb_damage), sizeof(struct bitsos_fb_rect));
     /* The same calls on files that are no framebuffer: ENOTTY everywhere (the generic ioctl knows none of them). */
     struct fb_var_screeninfo v;
     struct fb_fix_screeninfo f;
@@ -89,6 +114,9 @@ static void abi_facts(void) {
         FB(l, SYS_ioctl, files[i], FBIOPAN_DISPLAY, &v);
         snprintf(l, sizeof l, "%s WAITFORVSYNC", names[i]);
         FB(l, SYS_ioctl, files[i], FBIO_WAITFORVSYNC, &crtc);
+        struct bitsos_fb_damage dmg = {0};
+        snprintf(l, sizeof l, "%s BITSOS_DAMAGE", names[i]);
+        FB(l, SYS_ioctl, files[i], FBIO_BITSOS_DAMAGE, &dmg);
         close(files[i]);
     }
     unlink(path);
@@ -467,6 +495,118 @@ static void store(int seed, const char *how) {
     hold();
 }
 
+static long damage_call(uint32_t flags, uint32_t yoffset, const struct bitsos_fb_rect *r, uint32_t count) {
+    struct bitsos_fb_damage d = {.flags = flags, .yoffset = yoffset, .count = count, .rects = (uintptr_t)r};
+    return ioctl(fd, FBIO_BITSOS_DAMAGE, &d) ? -errno : 0;
+}
+
+static void damage(uint32_t yoffset, const struct bitsos_fb_rect *r, uint32_t count) {
+    long e = damage_call(0, yoffset, r, count);
+    if (e) {
+        printf("damage: %s\n", fbname((int)-e));
+        exit(1);
+    }
+}
+
+static void fill_rect(uint32_t seed, uint32_t top, const struct bitsos_fb_rect *r) {
+    uint32_t stride = fix.line_length / 4;
+    for (uint32_t y = r->y; y < r->y + r->height; y++)
+        for (uint32_t x = r->x; x < r->x + r->width; x++) map[(size_t)(top + y) * stride + x] = pat(seed, x, y);
+}
+
+static void pan_to(uint32_t yoffset) {
+    struct fb_var_screeninfo v = cur;
+    v.yoffset = yoffset;
+    if (ioctl(fd, FBIOPAN_DISPLAY, &v)) {
+        printf("pan: %s\n", fbname(errno));
+        exit(1);
+    }
+}
+
+static void frames(int seed, int n, const char *how, const char *shape) {
+    int plain = !strcmp(how, "plain"), pan = !strcmp(how, "pan"), end = !strcmp(how, "end");
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &usr1, 0);
+    fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fd < 0 || ioctl(fd, FBIOGET_VSCREENINFO, &cur) || ioctl(fd, FBIOGET_FSCREENINFO, &fix)) {
+        printf("fb0: %s\n", fbname(errno));
+        exit(1);
+    }
+    if (pan) {
+        struct fb_var_screeninfo v = cur;
+        v.yres_virtual = 2 * cur.yres;
+        v.yoffset = 0;
+        if (ioctl(fd, FBIOPUT_VSCREENINFO, &v) || v.yres_virtual < 2 * cur.yres) {
+            printf("pan: unsupported %s\n", fbname(errno));
+            exit(0);
+        }
+        cur = v;
+    }
+    map = mmap(0, fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        printf("mmap: %s\n", fbname(errno));
+        exit(1);
+    }
+    uint32_t top = cur.yoffset;
+    struct bitsos_fb_rect full = {0, 0, cur.xres, cur.yres};
+    struct bitsos_fb_rect box = {cur.xres / 8, cur.yres / 6, cur.xres / 4, cur.yres / 8};
+    const struct bitsos_fb_rect *r = !strcmp(shape, "box") ? &box : &full;
+    if (!plain) {
+        long a = damage_call(2, top, 0, 0), b, c = damage_call(0, cur.yres_virtual, 0, 0), d;
+        struct bitsos_fb_damage bad = {.yoffset = top, .reserved = 1};
+        b = ioctl(fd, FBIO_BITSOS_DAMAGE, &bad) ? -errno : 0;
+        /* The bad pointer comes last: it already switches the mode on (the window is copied whole). */
+        d = damage_call(0, top, (const struct bitsos_fb_rect *)8, 1);
+        printf("rules %s %s %s %s\n", fbname((int)-a), fbname((int)-b), fbname((int)-c), fbname((int)-d));
+        damage(top, 0, 0);
+    }
+    if (pan) {
+        for (uint32_t w = 1; w <= 2; w++) {
+            uint32_t at = (w % 2) * cur.yres;
+            fill_rect(seed, at, &full);
+            damage(at, &full, 1);
+            pan_to(at);
+        }
+        top = 0;
+    } else {
+        fill_rect(seed, top, &full);
+        if (plain)
+            fsync(fd);
+        else
+            damage(top, &full, 1);
+    }
+    printf("first pid=%d\n", getpid());
+    fflush(stdout);
+    int sig;
+    sigwait(&usr1, &sig);
+    if (end) {
+        long e = damage_call(1, top, 0, 0);
+        if (e) {
+            printf("end: %s\n", fbname((int)-e));
+            exit(1);
+        }
+    }
+    uint32_t last = seed;
+    for (int f = 0; f < n; f++) {
+        last = seed + 1 + f;
+        uint32_t at = pan ? (top == 0 ? cur.yres : 0) : top;
+        fill_rect(last, at, r);
+        if (plain || end) {
+            fsync(fd);
+        } else {
+            damage(at, r, 1);
+            if (pan) pan_to(at);
+        }
+        top = at;
+    }
+    printf("drawn a=%d b=%u box=%u,%u,%u,%u shape=%s top=%u double=%d pid=%d\n", seed, last, r->x, r->y, r->width,
+           r->height, shape, top, pan, getpid());
+    fflush(stdout);
+    hold();
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         abi_facts();
@@ -486,10 +626,14 @@ int main(int argc, char **argv) {
         fflush(stdout);
         hold();
     }
+    if (!strcmp(argv[1], "frames") && argc >= 6) {
+        frames(atoi(argv[2]), atoi(argv[3]), argv[4], argv[5]);
+        return 0;
+    }
     if (!strcmp(argv[1], "draw") && argc >= 4) {
         draw(atoi(argv[2]), atoi(argv[3]), argc > 4 ? argv[4] : 0);
         return 0;
     }
-    fprintf(stderr, "usage: abi-fbdev [v2 | draw <seed> <frames> [hold|crash] | store <seed> <how> | idle]\n");
+    fprintf(stderr, "usage: abi-fbdev [v2 | draw <seed> <frames> [hold|crash] | store <seed> <how> | idle | frames <seed> <n> <plain|damage|pan|end> <full|box>]\n");
     return 2;
 }

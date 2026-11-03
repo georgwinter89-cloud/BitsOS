@@ -11,7 +11,8 @@ BRAVE=${BRAVE_BIN:-/opt/brave-bin/brave}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 # Short: the compositor's socket path has a length limit.
 RUN=${BITSOS_RUN_DIR:-$CARGO_TARGET_DIR/wy91}
-rm -rf "$RUN"
+# Empties the run dir but keeps output.log (xtask fullrun writes this script's output there).
+mkdir -p "$RUN"; find "$RUN" -mindepth 1 -maxdepth 1 ! -name output.log -exec rm -rf {} +
 mkdir -p "$RUN"
 RUN=$(realpath "$RUN")
 BIN=$CARGO_TARGET_DIR/release/bitscomp
@@ -60,7 +61,7 @@ echo "== bitscomp 1600x900 headless (1280x720 logical at its default scale 1.25)
 "$BIN" --backend headless --size 1600x900 --socket "$SOCK" --mcp none --fixed-status --settings none >"$RUN/bitscomp.log" 2>&1 &
 COMP=$!
 for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/$SOCK.ctl" ] && break; sleep 0.1; done
-FLAGS="--ozone-platform=wayland --disable-gpu --password-store=basic --no-sandbox --disable-breakpad
+FLAGS="--ozone-platform=wayland --disable-gpu --password-store=basic --disable-breakpad
 --disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required"
 # shellcheck disable=SC2086
 setsid bash -c 'echo $$ >"$0"; exec "$@"' "$RUN/pgid" env -i PATH=/usr/bin HOME="$RUN/home" LANG=de_DE.UTF-8 \
@@ -82,7 +83,7 @@ ctl click 800 500 >/dev/null
 wait_for 'fullscreen visible=true focused=true frame=0,0 1280x720 .*title="WY8 Vollbild' 10 ctl list "Brave did not go fullscreen on the page's request"
 grep -q "enters fullscreen on its own request" "$RUN/bitscomp.log" || fail "no log line for Brave's request"
 ok=0
-# Brave's own --no-sandbox info bar stays at the top in its fullscreen; the workspace list (left), Claude's sidebar
+# Brave runs with its sandbox (no info bar at the top); the workspace list (left), Claude's sidebar
 # (right) and the status bar (bottom) must be the page.
 for _ in $(seq 30); do [ "$(pixel 4 450)" = "0 160 0" ] && [ "$(pixel 1595 450)" = "0 160 0" ] && [ "$(pixel 800 897)" = "0 160 0" ] && { ok=1; break; }; sleep 0.2; done
 [ "$ok" = 1 ] || fail "the page does not cover the bars: $(pixel 4 450) / $(pixel 1595 450) / $(pixel 800 897)"

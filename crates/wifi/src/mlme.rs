@@ -10,8 +10,9 @@
 //! an exchange waits at least three RX polls; the handshake gets 8 s, ends with reason 15 when
 //! no PTK came (4-way handshake timeout). The keys go in in wpa_supplicant's order (hostap wpa.c):
 //! 3/4 -> 4/4 out, then the PTK, then the GTK; group 1/2 -> the GTK, then 2/2 out. Not in the JS's
-//! software path but in V1's in-kernel join (join-kit / WlJoin): a deauthentication or
-//! disassociation by the AP during authentication or association ends the join at once.
+//! software path but in V1's in-kernel join (join-kit / WlJoin): a deauthentication by the AP
+//! during association ends the join at once; as mac80211 (WL-9) one during authentication and a
+//! disassociation before association are ignored (the exchange and its retries go on).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -351,6 +352,20 @@ impl Mlme {
                 if a2 == self.bssid && (a1 == self.own || a1 == [0xff; 6]) && p != Phase::Down =>
             {
                 let disassoc = matches!(m, Mgmt::Disassoc { .. });
+                // mac80211 ends a join only where it holds state the frame names: a
+                // deauthentication from association on (assoc_data or associated,
+                // linux-6.6/net/mac80211/mlme.c:3832-3852), a disassociation once associated
+                // (linux-6.6/net/mac80211/mlme.c:3872); earlier the frame can only end an older
+                // session the AP still held for our address (the reason 8 on the first join
+                // after a reboot, 24.10.) and the exchange goes on with its retries.
+                if p == Phase::Auth || (disassoc && p == Phase::Assoc) {
+                    self.events.push(WifiEvent::ApEndIgnored {
+                        phase: p,
+                        reason,
+                        disassoc,
+                    });
+                    return Vec::new();
+                }
                 if p == Phase::Connected {
                     self.close();
                     self.events.push(WifiEvent::EndedByAp { reason, disassoc });

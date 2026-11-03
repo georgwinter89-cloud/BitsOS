@@ -322,3 +322,22 @@ fn safe_mode_writes_nothing() {
     assert!(matches!(choose_read_only(&[], Pin::None, &[]), Choice::Refuse(_)));
     assert_eq!(flag_names(s | flag::UNMARKED), "UNMARKED,SAFE_MODE");
 }
+
+#[test]
+fn a_start_after_a_sync_flood_keeps_the_new_generations_try() {
+    use gen_reason::*;
+    // RB-14 CR-3: [confirmed 40, new 41] starts 40 and writes no TRY; 41 keeps its try.
+    let gens = [g(40, "OK"), g(41, "NEW")];
+    assert_eq!(started(&choose_after_flood(&gens, Pin::None, &[], &[])), (40, FALLBACK_AFTER_TRY, 41, flag::FLOOD_START, false));
+    assert_eq!(started(&choose(&gens, Pin::None, &[], &[])), (41, NEWEST_TRY, 0, 0, true));
+    // Nothing changes where no TRY would be written: the newest confirmed, a pin, a tried generation's fallback.
+    for (gens, pin) in [(vec![g(40, "OK"), g(41, "OK")], Pin::None), (vec![g(40, "OK"), g(41, "NEW")], Pin::Number(40)), (vec![g(40, "OK"), g(41, "TRY")], Pin::None)] {
+        assert_eq!(choose_after_flood(&gens, pin, &[], &[]), choose(&gens, pin, &[], &[]));
+    }
+    // No confirmed generation: the new one still gets its try (else nothing could ever be confirmed).
+    let (n, reason, _, flags, mark) = started(&choose_after_flood(&[g(41, "NEW")], Pin::None, &[], &[]));
+    assert_eq!((n, reason, flags, mark), (41, NEWEST_TRY, 0, true));
+    // The confirmed one has bad files: the loader marks it bad and the new one gets its try.
+    assert_eq!(started(&choose_after_flood(&gens, Pin::None, &[40], &[])), (41, NEWEST_TRY, 0, flag::OTHERS_SKIPPED, true));
+    assert_eq!(flag_names(flag::FLOOD_START), "FLOOD_START");
+}

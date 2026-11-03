@@ -81,7 +81,8 @@ pub(super) fn meminfo(m: &Mem) -> String {
         kb_line(&mut s, k, v);
     }
     s.push_str("HardwareCorrupted:     0 kB\n");
-    for k in ["AnonHugePages", "ShmemHugePages", "ShmemPmdMapped", "FileHugePages", "FilePmdMapped", "CmaTotal", "CmaFree", "Unaccepted"] {
+    kb_line(&mut s, "AnonHugePages", mm::thp::anon_huge_bytes() >> 10);
+    for k in ["ShmemHugePages", "ShmemPmdMapped", "FileHugePages", "FilePmdMapped", "CmaTotal", "CmaFree", "Unaccepted"] {
         kb_line(&mut s, k, 0);
     }
     s.push_str("HugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\n");
@@ -249,7 +250,8 @@ vfs::procfile!("/proc/version", version);
 
 /// `filesystems_proc_show`: the file system types V2's kernel has, in Linux's registration order (ext4 before
 /// vfat, linux-6.6/fs/Makefile:65,77), "nodev" for those without a device. pipefs and sockfs name the objects behind pipe and socket fds (their
-/// `/proc/<pid>/fd` links); V2 has no mount(2) yet, so none of them can be mounted by a program.
+/// `/proc/<pid>/fd` links) and, as on Linux, cannot be mounted by a program (mount(2) knows the types in
+/// `vfs::mount_fs::known`).
 pub(super) fn filesystems() -> String {
     String::from("nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tsockfs\nnodev\tpipefs\n\text4\n\tvfat\n")
 }

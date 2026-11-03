@@ -26,3 +26,6 @@ hdacodec = { path = "../../hdacodec", features = ["fake"] }
 [features]
 # The register-level fake controller (src/fake.rs) for host tests of crates on top of hda (snd).
 fake = []
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 /* MM-5b: madvise, mremap, mincore, shared anonymous memory and V8's 70 GB reservation through the real syscall
  * path (the kernel-side script crates/mm/abi/mm-ops2.txt covers the same calls in more cases). Modes:
- *   advise | remap | shared | file | msync | reserve <MB to commit>
+ *   advise | remap | shared | file | msync | reserve <MB to commit> | zap
  * Prints results, errno names and yes/no relations only (no addresses). No signal handler: nothing here faults. */
 #include "abi.h"
 #include <fcntl.h>
@@ -204,6 +204,81 @@ static void reserve(long mb) {
     SYS("munmap(reserve)", SYS_munmap, base, res);
 }
 
+/* MM-11 fixer: munmap, madvise and mprotect over neighbouring VMAs that share one page table (one 2 MiB span):
+ * the neighbours keep their data, an unmapped range is gone (mincore ENOMEM), DONTNEED zeroes private pages and
+ * keeps shared ones, FREE refuses a shared VMA after handling the ones before it. */
+static void fill(char *m, size_t pages, int tag) {
+    for (size_t i = 0; i < pages; i++) m[i * P] = (char)(tag + i);
+}
+
+static int same(const char *m, size_t pages, int tag) {
+    for (size_t i = 0; i < pages; i++)
+        if (m[i * P] != (char)(tag + i)) return 0;
+    return 1;
+}
+
+static int zero(const char *m, size_t pages) {
+    for (size_t i = 0; i < pages; i++)
+        if (m[i * P]) return 0;
+    return 1;
+}
+
+static char *fixed(char *at, size_t len, int flags) {
+    char *m = mmap(at, len, PROT_READ | PROT_WRITE, flags | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (m != at) {
+        printf("mmap(fixed) = -%s\n", ename(errno));
+        exit(1);
+    }
+    return m;
+}
+
+static void zap(void) {
+    const size_t span = 2ul << 20, n = 16, len = n * P;
+    char *res = map(3 * span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    char *base = (char *)(((unsigned long)res + span - 1) & ~(span - 1));
+    /* A (private), B (shared), C (private) side by side inside one page table. */
+    char *a = fixed(base, len, MAP_PRIVATE), *b = fixed(base + len, len, MAP_SHARED), *c = fixed(base + 2 * len, len, MAP_PRIVATE);
+    fill(a, n, 0x10), fill(b, n, 0x40), fill(c, n, 0x70);
+    SYS("munmap(B)", SYS_munmap, b, len);
+    core_line("mincore(B gone)", b, P);
+    yes("A intact after munmap(B)", same(a, n, 0x10));
+    yes("C intact after munmap(B)", same(c, n, 0x70));
+    b = fixed(b, len, MAP_SHARED);
+    yes("B new reads zero", zero(b, n));
+    fill(b, n, 0x40);
+    SYS("munmap(A tail, B head)", SYS_munmap, a + 8 * P, 16 * P);
+    core_line("mincore(the hole)", a + 8 * P, P);
+    core_line("mincore(A head)", a, 4 * P);
+    yes("A head intact", same(a, 8, 0x10));
+    yes("B tail intact", same(b + 8 * P, 8, 0x48));
+    a = fixed(a + 8 * P, 8 * P, MAP_PRIVATE) - 8 * P;
+    fixed(b, 8 * P, MAP_SHARED);
+    fill(a, n, 0x10), fill(b, n, 0x40);
+    SYS("madvise(DONTNEED A..C)", SYS_madvise, a, 3 * len, MADV_DONTNEED);
+    yes("A reads zero", zero(a, n));
+    yes("B (shared) keeps its data", same(b, n, 0x40));
+    yes("C reads zero", zero(c, n));
+    fill(a, n, 0x10), fill(c, n, 0x70);
+    SYS("madvise(FREE A..C)", SYS_madvise, a, 3 * len, MADV_FREE);
+    yes("B still there after FREE", same(b, n, 0x40));
+    a[0] = 5;
+    yes("a store to A after FREE stays", a[0] == 5);
+    yes("C untouched by a refused FREE", same(c, n, 0x70));
+    SYS("mprotect(read A..C)", SYS_mprotect, a, 3 * len, PROT_READ);
+    yes("C readable after mprotect", same(c, n, 0x70));
+    SYS("mprotect(rw A..C)", SYS_mprotect, a, 3 * len, PROT_READ | PROT_WRITE);
+    fill(c, n, 0x71);
+    yes("C writable again", same(c, n, 0x71));
+    /* A range across the 2 MiB boundary: unmapping the part below keeps the part above. */
+    char *x = fixed(base + span - len, 2 * len, MAP_PRIVATE);
+    fill(x, 2 * n, 0x20);
+    SYS("munmap(below the boundary)", SYS_munmap, x, len);
+    yes("above the boundary intact", same(x + len, n, 0x20 + (int)n));
+    core_line("mincore(below gone)", x, P);
+    SYS("munmap(all)", SYS_munmap, res, 3 * span);
+    core_line("mincore(all gone)", base, P);
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     if (!strcmp(mode, "advise")) advise();
@@ -212,8 +287,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(mode, "file")) file();
     else if (!strcmp(mode, "msync")) msync_args();
     else if (!strcmp(mode, "reserve")) reserve(argc > 2 ? atol(argv[2]) : 256);
+    else if (!strcmp(mode, "zap")) zap();
     else {
-        printf("usage: abi-mm5b advise|remap|shared|file|msync|reserve [MB]\n");
+        printf("usage: abi-mm5b advise|remap|shared|file|msync|reserve [MB]|zap\n");
         return 2;
     }
     return 0;

@@ -6,9 +6,9 @@
 //! rtnetlink allows), and the kernel's notifications to subscribed sockets when a card's link or address changes
 //! (`changed`, called by the stack's poll thread and `set_static`).
 //!
-//! Locks (R5): `bind` (a sleeping mutex per socket, bind and autobind only) > `PORTS` > a socket's `st`;
-//! `MEMBERS` > a socket's `st` (membership is decided under MEMBERS); one socket's `st` at a time; nothing is
-//! built or logged under `st` (answers are made first, then queued). Notification rounds run one at a time
+//! Locks (R5): `bind` (a sleeping mutex per socket, bind and autobind only) > `ports` > a socket's `st`;
+//! a namespace's lo change (`NetView::edit`) > `members` > a socket's `st` (membership is decided under
+//! `members`); one socket's `st` at a time; nothing is built or logged under `st` (answers are made first, then queued). Notification rounds run one at a time
 //! (`changed`, without a lock: a flag pair).
 
 use super::abi::*;
@@ -16,6 +16,7 @@ use super::nlmsg::*;
 use super::rtnl::{self, Action, Dump, NlErr, ReqCtx};
 use super::{Caller, Deadline, Opts, Received, Source, Ucred, wait};
 use crate::ifview;
+use crate::netns::Net;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -95,17 +96,51 @@ pub struct NetlinkSock {
     pub(crate) ty: u32,
     pub(crate) opts: Opts,
     pub(crate) wq: WaitQueue,
-    /// The opener's uid (`file_ns_capable` of the socket's file).
-    opener_uid: u32,
+    /// The opener held CAP_NET_ADMIN (`file_ns_capable` of the socket's file).
+    opener_admin: bool,
+    /// NW-11: the network namespace it was made in (its port ids, groups and interfaces are that namespace's).
+    net: Net,
     bind: Mutex<()>,
     st: SpinLock<St>,
 }
 
-/// Bound sockets by port id (one table: NETLINK_ROUTE is the only protocol).
-static PORTS: RwSpinLock<BTreeMap<u32, Weak<NetlinkSock>>> = RwSpinLock::named("net.netlink.ports", BTreeMap::new());
-/// Sockets with at least one group, by address.
-static MEMBERS: SpinLock<BTreeMap<usize, Weak<NetlinkSock>>> = SpinLock::named("net.netlink.members", BTreeMap::new());
-static MEMBER_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// The netlink sockets of one network namespace (NW-11: port ids and groups are per namespace, as Linux's
+/// `netlink_lookup` keys them by `struct net`); the initial namespace's are `INIT`.
+pub(crate) struct Tables {
+    /// Bound sockets by port id (one table: NETLINK_ROUTE is the only protocol).
+    ports: RwSpinLock<BTreeMap<u32, Weak<NetlinkSock>>>,
+    /// Sockets with at least one group, by address.
+    members: SpinLock<BTreeMap<usize, Weak<NetlinkSock>>>,
+    member_count: AtomicUsize,
+}
+
+impl Tables {
+    pub(crate) const fn new() -> Tables {
+        Tables {
+            ports: RwSpinLock::named("net.netlink.ports", BTreeMap::new()),
+            members: SpinLock::named("net.netlink.members", BTreeMap::new()),
+            member_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn lookup(&self, portid: u32) -> Option<Arc<NetlinkSock>> {
+        self.ports.read().get(&portid).and_then(|w| w.upgrade())
+    }
+
+    fn members(&self) -> Vec<Arc<NetlinkSock>> {
+        self.members.lock().values().filter_map(|w| w.upgrade()).collect()
+    }
+
+    /// `netlink_broadcast` to every member of `group` but the sender: how many took it.
+    fn broadcast(&self, from: Option<u32>, group: u32, data: &[u8], creds: Ucred) -> usize {
+        if group == 0 || group > rtnl::RTNLGRP_MAX || self.member_count.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        self.members().iter().filter(|s| s.deliver_group(data, from.unwrap_or(0), group, creds)).count()
+    }
+}
+
+static INIT: Tables = Tables::new();
 
 klog::counter!(REQUESTS, "net.netlink.requests");
 klog::counter!(OVERRUNS, "net.netlink.overruns");
@@ -129,7 +164,8 @@ impl NetlinkSock {
             ty,
             opts: Opts::new(WMEM_DEFAULT, RMEM_DEFAULT),
             wq: WaitQueue::new(),
-            opener_uid: c.uid,
+            opener_admin: Self::admin(c),
+            net: c.net.clone(),
             bind: Mutex::named("net.netlink.bind", ()),
             st: SpinLock::named(
                 "net.netlink.sock",
@@ -163,10 +199,21 @@ impl NetlinkSock {
         self.st.lock().portid
     }
 
+    pub(crate) fn net(&self) -> &Net {
+        &self.net
+    }
+
+    fn tables(&self) -> &Tables {
+        match &self.net {
+            None => &INIT,
+            Some(v) => &v.netlink,
+        }
+    }
+
     /// `netlink_insert` under the socket's bind lock: EADDRINUSE when the id is taken.
     fn insert(self: &Arc<Self>, portid: u32) -> Result<(), Errno> {
         {
-            let mut t = PORTS.write();
+            let mut t = self.tables().ports.write();
             if t.get(&portid).is_some_and(|w| w.strong_count() > 0) {
                 return Err(EADDRINUSE);
             }
@@ -184,7 +231,8 @@ impl NetlinkSock {
         if self.st.lock().bound {
             return Ok(());
         }
-        if self.insert(c.pid).is_ok() {
+        // `task_tgid_vnr(current)`: the pid as the caller's pid namespace numbers it.
+        if self.insert(c.pid_view()).is_ok() {
             return Ok(());
         }
         let span = (i32::MIN as i64).unsigned_abs() - 4097;
@@ -204,7 +252,7 @@ impl NetlinkSock {
     /// `netlink_allowed` for NETLINK_ROUTE: receiving multicast is open to all (NL_CFG_F_NONROOT_RECV), sending
     /// to a group or another socket needs CAP_NET_ADMIN.
     fn admin(c: &Caller) -> bool {
-        c.uid == 0
+        c.can(super::cap::NET_ADMIN)
     }
 
     /// bind(2).
@@ -249,7 +297,8 @@ impl NetlinkSock {
     /// under MEMBERS (order MEMBERS > st), so two threads joining and leaving at once cannot leave the table
     /// and the socket's groups apart (a stale "member" decided before the lock could be applied last).
     fn sync_member(self: &Arc<Self>) {
-        let mut m = MEMBERS.lock();
+        let t = self.tables();
+        let mut m = t.members.lock();
         let on = {
             let st = self.st.lock();
             st.groups != 0 && !st.released
@@ -257,13 +306,14 @@ impl NetlinkSock {
         let had = m.contains_key(&key(self));
         if on && !had {
             m.insert(key(self), Arc::downgrade(self));
-            MEMBER_COUNT.fetch_add(1, Ordering::AcqRel);
+            t.member_count.fetch_add(1, Ordering::AcqRel);
         } else if !on && had {
             m.remove(&key(self));
-            MEMBER_COUNT.fetch_sub(1, Ordering::AcqRel);
+            t.member_count.fetch_sub(1, Ordering::AcqRel);
         }
         drop(m);
-        if on && !had {
+        // A namespace's changes are announced as they are made (`announce`): no base to take.
+        if on && !had && self.net.is_none() {
             // The first member's view is the base the next change is compared with (a round with no base
             // only takes one).
             changed();
@@ -348,14 +398,14 @@ impl NetlinkSock {
         let creds = creds.unwrap_or(c.ucred());
         let me = self.portid();
         if dst_group != 0 {
-            broadcast(Some(me), dst_group, &data, creds);
+            self.tables().broadcast(Some(me), dst_group, &data, creds);
         }
         if dst_portid == 0 {
             REQUESTS.inc();
             self.kernel_input(&data, c, explicit);
             return Ok(len);
         }
-        let target = lookup(dst_portid).ok_or(ECONNREFUSED)?;
+        let target = self.tables().lookup(dst_portid).ok_or(ECONNREFUSED)?;
         target.unicast_from_user(&data, me, creds, Deadline::new(nonblock || flags & MSG_DONTWAIT != 0, self.opts.sndtimeo.load(Ordering::Relaxed)))?;
         Ok(len)
     }
@@ -367,7 +417,7 @@ impl NetlinkSock {
             let st = self.st.lock();
             (st.portid, st.flags)
         };
-        let ctx = ReqCtx { portid, admin: Self::admin(c) && (explicit || self.opener_uid == 0), strict: flags & nf::STRICT_CHK != 0 };
+        let ctx = ReqCtx { portid, admin: Self::admin(c) && (explicit || self.opener_admin), strict: flags & nf::STRICT_CHK != 0, net: self.net.clone() };
         let mut rest = data;
         while rest.len() >= NLMSG_HDRLEN {
             let Some(h) = Hdr::parse(rest) else { return };
@@ -774,15 +824,16 @@ impl NetlinkSock {
             st.dump = None;
             (st.portid, st.bound)
         };
+        let tables = self.tables();
         if bound {
-            let mut t = PORTS.write();
+            let mut t = tables.ports.write();
             if t.get(&portid).is_some_and(|w| core::ptr::eq(w.as_ptr(), self)) {
                 t.remove(&portid);
             }
         }
-        let mut m = MEMBERS.lock();
+        let mut m = tables.members.lock();
         if m.remove(&key(self)).is_some() {
-            MEMBER_COUNT.fetch_sub(1, Ordering::AcqRel);
+            tables.member_count.fetch_sub(1, Ordering::AcqRel);
         }
         drop(m);
         self.wq.wake_all();
@@ -797,30 +848,24 @@ fn group_mask(group: u32) -> u32 {
     if group == 0 || group > 32 { 0 } else { 1 << (group - 1) }
 }
 
-fn lookup(portid: u32) -> Option<Arc<NetlinkSock>> {
-    PORTS.read().get(&portid).and_then(|w| w.upgrade())
-}
-
-fn members() -> Vec<Arc<NetlinkSock>> {
-    MEMBERS.lock().values().filter_map(|w| w.upgrade()).collect()
-}
-
-/// `netlink_broadcast` to every member of `group` but the sender: how many took it.
-fn broadcast(from: Option<u32>, group: u32, data: &[u8], creds: Ucred) -> usize {
-    if group == 0 || group > rtnl::RTNLGRP_MAX || MEMBER_COUNT.load(Ordering::Acquire) == 0 {
-        return 0;
-    }
-    members().iter().filter(|s| s.deliver_group(data, from.unwrap_or(0), group, creds)).count()
-}
 
 // ---- the kernel's notifications --------------------------------------------------------------------------
 
-/// What the last notification round saw of each interface: (index, flags, addresses).
-type Snap = Vec<(u32, u32, Vec<ifview::Addr>)>;
+/// What the last notification round saw of each interface: (index, (flags, MTU, queue length), IPv4 addresses
+/// without their lifetimes, IPv6 addresses).
+type Snap = Vec<(u32, (u32, u32, u32), Vec<ifview::Addr>, Vec<ifview::Addr6>)>;
 static LAST: SpinLock<Option<Snap>> = SpinLock::named("net.netlink.last", None);
 
 fn snap(links: &[ifview::Link]) -> Snap {
-    links.iter().map(|l| (l.index, l.flags(), l.addrs.iter().map(|a| ifview::Addr { valid_s: 0, preferred_s: 0, ..a.clone() }).collect())).collect()
+    links
+        .iter()
+        .map(|l| (l.index, (l.flags(), l.mtu, l.txqlen), l.addrs.iter().map(|a| ifview::Addr { valid_s: 0, preferred_s: 0, ..a.clone() }).collect(), l.addrs6.clone()))
+        .collect()
+}
+
+/// NW-12: whether two views of the interfaces differ in nothing a notification would carry.
+pub(crate) fn same_view(a: &[ifview::Link], b: &[ifview::Link]) -> bool {
+    snap(a) == snap(b)
 }
 
 /// Only one notification round runs at a time (`changed` may come from the stack's poll thread and from
@@ -852,7 +897,7 @@ pub fn changed() {
 
 /// One notification round (serialised by `changed`); the broadcasts go out in the round, in order.
 fn round() {
-    if MEMBER_COUNT.load(Ordering::Acquire) == 0 {
+    if INIT.member_count.load(Ordering::Acquire) == 0 {
         *LAST.lock() = None;
         return;
     }
@@ -860,15 +905,32 @@ fn round() {
     let now = snap(&links);
     // Without a base (the first member just joined) the round only takes one.
     let Some(before) = LAST.lock().replace(now.clone()) else { return };
+    send_changes(&INIT, &before, &links, &now);
+}
+
+/// NW-11: a namespace's lo changed (`NetView::edit`): its members hear what differs between the views.
+pub(crate) fn announce(t: &Tables, before: &[ifview::Link], after: &[ifview::Link]) {
+    if t.member_count.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    send_changes(t, &snap(before), after, &snap(after));
+}
+
+/// The notifications from snapshot `before` to `links` (whose snapshot is `now`), broadcast in `t`.
+fn send_changes(t: &Tables, before: &Snap, links: &[ifview::Link], now: &Snap) {
     let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
-    for (l, (index, flags, addrs)) in links.iter().zip(now.iter()) {
+    for (l, (index, dev, addrs, addrs6)) in links.iter().zip(now.iter()) {
         let old = before.iter().find(|b| b.0 == *index);
         match old {
             None => out.push((rtnl::RTNLGRP_LINK, rtnl::link_msg(l, rtnl::RTM_NEWLINK, 0, 0, 0, u32::MAX))),
-            Some(o) if o.1 != *flags => out.push((rtnl::RTNLGRP_LINK, rtnl::link_msg(l, rtnl::RTM_NEWLINK, 0, 0, 0, 0))),
+            Some(o) if o.1 != *dev => out.push((rtnl::RTNLGRP_LINK, rtnl::link_msg(l, rtnl::RTM_NEWLINK, 0, 0, 0, 0))),
             _ => {}
         }
-        let gone: Vec<&ifview::Addr> = old.map(|o| o.2.iter().filter(|a| !addrs.contains(a)).collect()).unwrap_or_default();
+        // `__inet_del_ifa` announces a primary's secondaries before the primary itself; an address that stays
+        // with other flags (a promoted secondary) is announced as new only.
+        let key = |a: &ifview::Addr| (a.ip, a.prefix, a.label.clone());
+        let mut gone: Vec<&ifview::Addr> = old.map(|o| o.2.iter().filter(|a| !addrs.iter().any(|b| key(b) == key(a))).collect()).unwrap_or_default();
+        gone.sort_by_key(|a| !a.secondary());
         for a in gone {
             out.push((rtnl::RTNLGRP_IPV4_IFADDR, rtnl::addr_msg(l, a, rtnl::RTM_DELADDR, 0, 0, 0)));
         }
@@ -878,9 +940,15 @@ fn round() {
                 out.push((rtnl::RTNLGRP_IPV4_IFADDR, rtnl::addr_msg(l, a, rtnl::RTM_NEWADDR, 0, 0, 0)));
             }
         }
+        for a in old.map(|o| o.3.iter().filter(|a| !addrs6.contains(a)).collect::<Vec<_>>()).unwrap_or_default() {
+            out.push((rtnl::RTNLGRP_IPV6_IFADDR, rtnl::addr6_msg(l, a, rtnl::RTM_DELADDR, 0, 0, 0)));
+        }
+        for a in addrs6.iter().filter(|a| !old.is_some_and(|o| o.3.contains(a))) {
+            out.push((rtnl::RTNLGRP_IPV6_IFADDR, rtnl::addr6_msg(l, a, rtnl::RTM_NEWADDR, 0, 0, 0)));
+        }
     }
     for (group, m) in out {
-        let n = broadcast(None, group, &m, Ucred::default());
+        let n = t.broadcast(None, group, &m, Ucred::default());
         NOTIFIED.add(n as u64);
         let ty = Hdr::parse(&m).map(|h| h.ty).unwrap_or(0);
         klog::event!(Debug, "net", "netlink.notify", msg_type = ty, group = group, readers = n);
@@ -896,10 +964,10 @@ pub(crate) fn rounds_idle() -> bool {
 /// Is the socket in MEMBERS (host tests).
 #[cfg(test)]
 pub(crate) fn is_member(s: &Arc<NetlinkSock>) -> bool {
-    MEMBERS.lock().contains_key(&key(s))
+    s.tables().members.lock().contains_key(&key(s))
 }
 
 /// Netlink sockets bound now (for `summary` and tests).
 pub fn bound() -> usize {
-    PORTS.read().values().filter(|w| w.strong_count() > 0).count()
+    INIT.ports.read().values().filter(|w| w.strong_count() > 0).count()
 }

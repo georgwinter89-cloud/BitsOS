@@ -127,7 +127,8 @@ impl AmpCaps {
     pub fn steps(self) -> u8 {
         ((self.0 >> 8) & 0x7F) as u8
     }
-    /// Step size in 0.25 dB units, minus one.
+    /// Step size in 0.25 dB units, minus one. (Only tests read it today: the decode of the whole register is
+    /// pinned on purpose, C1.)
     pub fn step_size(self) -> u8 {
         ((self.0 >> 16) & 0x7F) as u8
     }
@@ -228,6 +229,7 @@ impl PinConfig {
         ];
         ALL[((self.0 >> 20) & 0xF) as usize]
     }
+    /// Connection type (only the tests read it, with `association`: the config default's decode is pinned, C1).
     pub fn conn_type(self) -> u8 {
         ((self.0 >> 16) & 0xF) as u8
     }

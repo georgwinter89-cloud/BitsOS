@@ -78,7 +78,7 @@ rows), `evsend.py` sends keys).
 ## On V2 (YT-2)
 
 After a Cobalt rebuild run `scripts/stage-v2.sh`; `cargo xtask image` then puts the tree into
-`\BITSOS2\cobalt\` (ktest images, or any image with `V2_STICK_TREES=1`) and the launcher into
+`\BITSOS2\cobalt\` (only an image with `V2_STICK_TREES=1`: no QEMU run carries it, Georg 30.10.) and the launcher into
 `\BITSOS2\bin\cobalt`. On V2: `cobalt` in the BusyBox shell (over MCP: `/bin/sh /boot/BITSOS2/bin/cobalt`,
 since MCP `run` takes ELF files only). Details and the sign-in rule: `plan/notes/yt-YT-2.md`.
 Started while the desktop runs (e.g. in a foot terminal) it goes on in the background, ends bitscomp through

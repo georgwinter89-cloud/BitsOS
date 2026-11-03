@@ -49,6 +49,7 @@ check "$LOG" 'snd mix.switch from=hda0/jack/0:0x3 to=hda1/jack/0:0x3 mode=make_b
 check "$LOG" 'snd mix.switch from=hda1/jack/0:0x3 to=hda0/jack/0:0x3 mode=make_before_break' "A: switch back"
 check "$LOG" 'snd mix.retired endpoint=hda1' "A: the old output retires after its margin"
 check "$LOG" 'snd client.underrun id=.* name=ktest.starved count=1' "A: a starved client counts its underrun"
+check "$LOG" 'W snd client.xrun id=[0-9]* name=ktest.xrun count=1 period=480 need=[0-9]* got=[0-9]* avail=4800 ring=4800 consumed=480 since_write_us=[0-9]* late_us=[0-9]* late_max_us=[0-9]*' "A: an xrun says period, ring state, writer silence and mixer lateness"
 nocheck "$LOG" ' E snd \| E ksync' "A: no error events"
 wavs A "$W0" "$W1" two switch resample
 

@@ -308,6 +308,10 @@ pub mod ioctl_more {
 
 /// Syscall numbers `uapi::nr` (desk) does not name yet; AB registers them by number.
 pub mod nr_more {
+    /// AB-10a: the TLS/LDT calls (syscall_64.tbl 154/205/211; syscall_32.tbl 123/243/244 reach them by int 0x80).
+    pub const MODIFY_LDT: usize = 154;
+    pub const SET_THREAD_AREA: usize = 205;
+    pub const GET_THREAD_AREA: usize = 211;
     pub const RT_SIGPENDING: usize = 127;
     pub const GETRESUID: usize = 118;
     pub const GETRESGID: usize = 120;
@@ -360,6 +364,25 @@ pub mod nr_more {
     pub const PIDFD_SEND_SIGNAL: usize = 424;
     pub const PIDFD_OPEN: usize = 434;
     pub const PIDFD_GETFD: usize = 438;
+    /// AB-17: another process's memory (Wine's server) and kernel-object comparison (Mesa, Wine).
+    pub const PROCESS_VM_READV: usize = 310;
+    pub const PROCESS_VM_WRITEV: usize = 311;
+    pub const KCMP: usize = 312;
+}
+
+/// AB-17: kcmp types (linux-6.6/include/uapi/linux/kcmp.h:9).
+pub mod kcmp {
+    pub const KCMP_FILE: u32 = 0;
+    pub const KCMP_VM: u32 = 1;
+    pub const KCMP_FILES: u32 = 2;
+    pub const KCMP_FS: u32 = 3;
+    pub const KCMP_SIGHAND: u32 = 4;
+    pub const KCMP_IO: u32 = 5;
+    pub const KCMP_SYSVSEM: u32 = 6;
+    pub const KCMP_EPOLL_TFD: u32 = 7;
+    pub const KCMP_TYPES: u32 = 8;
+    /// `struct kcmp_epoll_slot { __u32 efd, tfd, toff; }` (kcmp.h:21).
+    pub const EPOLL_SLOT_SIZE: usize = 12;
 }
 
 /// AB-12: pidfd flags (linux-6.6/include/uapi/linux/pidfd.h:10).

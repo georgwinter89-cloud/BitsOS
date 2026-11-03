@@ -167,6 +167,7 @@ impl WorkspaceStore {
         n
     }
 
+    /// Entries in the journal (the identity tests check that every change appends exactly one).
     pub fn journal_lines(&self) -> usize {
         fs::File::open(self.dir.join("journal.jsonl")).map(|f| std::io::BufReader::new(f).lines().count()).unwrap_or(0)
     }

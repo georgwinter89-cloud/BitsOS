@@ -1,0 +1,16 @@
+unshare(CLONE_NEWUSER) = 0
+clone(CLONE_VM|CLONE_FS|CLONE_VFORK) = yes
+chroot child: exit 0
+after the trick: open(/proc/self/maps) = -ENOENT
+after the trick: open(/proc/self/cmdline) = -ENOENT
+after the trick: open(/proc/stat) = -ENOENT
+after the trick: open(/sys/devices/system/cpu/online) = -ENOENT
+after the trick: open(/sys/devices/system/cpu/cpu0/tsc_freq_khz) = -ENOENT
+after the trick: open(/bin/sh) = -ENOENT
+after the trick: open(/0) = -ENOENT
+after the trick: open(/../proc) = -ENOENT
+after the trick: stat(/proc) = -ENOENT
+execve(/bin/sh) = -ENOENT
+unshare(CLONE_NEWUSER) chrooted = -EPERM
+chdir(/..) = 0
+chromium's trick: exit 0

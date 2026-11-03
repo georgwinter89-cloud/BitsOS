@@ -11,7 +11,7 @@ hz=100
 pids=
 for d in /proc/[0-9]*; do
   [ "${d#/proc/}" = "$$" ] && continue  # this sh itself: its own arguments name the pattern
-  c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+  c=$(tr '\0' ' ' 2>/dev/null < "$d/cmdline") || continue  # 2>/dev/null first: a pid gone since the glob
   case $c in *"$pat"*) pids="$pids ${d#/proc/}" ;; esac
 done
 [ -n "$pids" ] || { echo "br4-procs: no process matches $pat"; exit 1; }

@@ -1,0 +1,58 @@
+uid_map = 11
+setgroups = 4
+gid_map = 11
+make / rslave = 0
+tmpfs base = 0
+tmpfs a = 0
+make a shared = 0
+bind a to b = 0
+bind a to c = 0
+make c slave = 0
+tmpfs on a/sub = 0
+file in a/sub = 0
+peer b/sub/f = yes
+slave c/sub/f = yes
+tmpfs on c/sub2 = 0
+file in c/sub2 = 0
+a/sub2/g from slave = ENOENT
+-- mountinfo propagation
+0 - / /tmp rw,nosuid,nodev,relatime - tmpfs sxbase rw,uid=1000,gid=1000,inode64
+1 0 / /tmp/a rw,relatime shared:g0 - tmpfs sxa rw,uid=1000,gid=1000,inode64
+2 0 / /tmp/b rw,relatime shared:g0 - tmpfs sxa rw,uid=1000,gid=1000,inode64
+3 0 / /tmp/c rw,relatime master:g0 - tmpfs sxa rw,uid=1000,gid=1000,inode64
+4 1 / /tmp/a/sub rw,relatime shared:g1 - tmpfs sxsub rw,uid=1000,gid=1000,inode64
+5 2 / /tmp/b/sub rw,relatime shared:g1 - tmpfs sxsub rw,uid=1000,gid=1000,inode64
+6 3 / /tmp/c/sub rw,relatime master:g1 - tmpfs sxsub rw,uid=1000,gid=1000,inode64
+7 3 / /tmp/c/sub2 rw,relatime - tmpfs sxonc rw,uid=1000,gid=1000,inode64
+umount a/sub = 0
+peer b/sub/f after = ENOENT
+slave c/sub/f after = ENOENT
+make b private = 0
+tmpfs on a/sub again = 0
+file in a/sub again = 0
+private b/sub/h = ENOENT
+tmpfs u = 0
+make u unbindable = 0
+bind unbindable = -EINVAL
+rbind of the base = 0
+rbind shows a/sub/h = yes
+rbind leaves out u's content = yes
+make a rprivate = 0
+move b to v/b = 0
+move into itself = -ELOOP
+-- mountinfo after
+0 - / /tmp rw,nosuid,nodev,relatime - tmpfs sxbase rw,uid=1000,gid=1000,inode64
+1 0 / /tmp/a rw,relatime - tmpfs sxa rw,uid=1000,gid=1000,inode64
+2 11 / /tmp/v/b rw,relatime - tmpfs sxa rw,uid=1000,gid=1000,inode64
+3 0 / /tmp/c rw,relatime master:g0 - tmpfs sxa rw,uid=1000,gid=1000,inode64
+4 3 / /tmp/c/sub2 rw,relatime - tmpfs sxonc rw,uid=1000,gid=1000,inode64
+5 1 / /tmp/a/sub rw,relatime - tmpfs sxsub2 rw,uid=1000,gid=1000,inode64
+6 3 / /tmp/c/sub rw,relatime master:g1 - tmpfs sxsub2 rw,uid=1000,gid=1000,inode64
+7 0 / /tmp/u rw,relatime unbindable - tmpfs sxu rw,uid=1000,gid=1000,inode64
+8 0 / /tmp/v rw,nosuid,nodev,relatime - tmpfs sxbase rw,uid=1000,gid=1000,inode64
+9 8 / /tmp/v/a rw,relatime shared:g0 - tmpfs sxa rw,uid=1000,gid=1000,inode64
+10 9 / /tmp/v/a/sub rw,relatime shared:g1 - tmpfs sxsub2 rw,uid=1000,gid=1000,inode64
+11 8 / /tmp/v/b rw,relatime - tmpfs sxa rw,uid=1000,gid=1000,inode64
+12 8 / /tmp/v/c rw,relatime master:g0 - tmpfs sxa rw,uid=1000,gid=1000,inode64
+13 12 / /tmp/v/c/sub2 rw,relatime - tmpfs sxonc rw,uid=1000,gid=1000,inode64
+14 12 / /tmp/v/c/sub rw,relatime master:g1 - tmpfs sxsub2 rw,uid=1000,gid=1000,inode64

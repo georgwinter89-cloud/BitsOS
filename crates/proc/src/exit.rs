@@ -81,7 +81,10 @@ fn send_pdeath(from: &Group, children: &[Arc<Process>]) {
             let sig = th.prctl().pdeath_signal();
             if sig != 0 && !c.is_finished() {
                 klog::event!(Debug, "proc", "pdeath", pid = c.pid, tid = th.tid(), signal = sig);
-                let _ = c.send_info(SigInfo::user(sig, uapi::ab::siginfo::SI_USER, from.tgid, from.real_uid()), To::Group, false);
+                let (pid, uid) = from.ids_seen_by(c);
+                // SX-3b (`send_signal_locked`): a parent the child's pid namespace cannot see (bwrap's launcher
+                // above the sandbox's init) forces SIGKILL onto that namespace's init.
+                let _ = c.send_info(SigInfo::user(sig, uapi::ab::siginfo::SI_USER, pid, uid), To::Group, pid == 0);
             }
         }
     }
@@ -118,6 +121,11 @@ fn find_subreaper(table: &[Arc<Process>], g: &Group) -> Option<Arc<Process>> {
             return None;
         }
         let q = table.iter().find(|q| q.pid == pid)?;
+        // SX-2: only ancestors in the same pid namespace (Linux walks while `task_pid(reaper)->level` is the
+        // dying task's level).
+        if !Arc::ptr_eq(&q.pid_ns, &g.pid_ns) {
+            return None;
+        }
         if q.is_child_subreaper() && !q.has_exited() && q.pid != g.tgid {
             return Some(q.clone());
         }
@@ -178,7 +186,7 @@ fn parent_wants(parent: &Process, exit_signal: u32) -> (bool, bool) {
     let a = parent.signals.with(|s| s.action(exit_signal));
     if exit_signal != SIGCHLD {
         // Init never gets a signal it has no handler for (SIGNAL_UNKILLABLE, `sig_task_ignored`).
-        return (false, !(parent.pid == 1 && a.handler == SIG_DFL));
+        return (false, !((parent.pid == 1 || parent.is_ns_init()) && a.handler == SIG_DFL));
     }
     let autoreap = a.handler == SIG_IGN || a.flags & SA_NOCLDWAIT != 0;
     (autoreap, a.handler != SIG_IGN)
@@ -190,6 +198,9 @@ fn parent_wants(parent: &Process, exit_signal: u32) -> (bool, bool) {
 fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
     let st = g.status().unwrap_or(ExitStatus::Exited(0));
     klog::event!(Info, "proc", "exit", pid = g.tgid, program = p.map_or("?", |p| p.name.as_str()), code = st.shell_code(), status = st.describe().as_str());
+    if g.is_ns_init() {
+        zap_ns(g);
+    }
     // Marked under the table lock before looking for sharers: of two CLONE_VM/CLONE_FILES processes ending at
     // once, the later look sees the earlier one released and gives the memory and files back.
     {
@@ -207,8 +218,12 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
         // while it lives, as Linux's `find_new_reaper`/`find_child_reaper` (linux-6.6/kernel/exit.c:583, :623,
         // :688); otherwise to the kernel, and the sweep below collects the zombies among them. A reparented
         // child reports with SIGCHLD from now on (`reparent_leader`).
-        let init = t.iter().find(|q| q.pid == 1 && q.pid != g.tgid && !q.has_exited()).cloned();
-        let new_parent = find_subreaper(&t, g).or(init);
+        // SX-2: in a pid namespace below the initial one its init is the reaper (`find_child_reaper`); when
+        // that init itself ends, the namespace's other members were killed (`zap_ns`) and its children go to
+        // the kernel, which collects them as they end (Linux's dying init reaps them itself).
+        let ns_reaper = if g.pid_ns.is_init() { 1 } else { g.pid_ns.reaper() };
+        let init = if ns_reaper == g.tgid { None } else { t.iter().find(|q| q.pid == ns_reaper && q.pid != g.tgid && !q.has_exited()).cloned() };
+        let new_parent = if ns_reaper == g.tgid { None } else { find_subreaper(&t, g).or(init) };
         let to = new_parent.as_ref().map_or(0, |i| i.pid);
         let mut zombie_for_reaper: Option<Arc<Process>> = None;
         let mut orphans = Vec::new();
@@ -246,7 +261,7 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
         let (reap, send) = parent_wants(pp, sig);
         autoreap = reap;
         if send && !pp.is_finished() {
-            let _ = pp.send_info(child_info(g, sig), To::Group, false);
+            let _ = pp.send_info(child_info(g, sig, pp), To::Group, false);
         }
     }
     // Every ended process without a parent leaves the table: this one when its parent is the kernel, gone, or
@@ -256,7 +271,11 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
         let gone = {
             let mut t = TABLE.lock();
             let i = t.iter().position(|q| q.is_finished() && (q.ppid() == 0 || (q.pid == g.tgid && (parent.is_none() || autoreap))));
-            i.map(|i| t.swap_remove(i))
+            let x = i.map(|i| t.swap_remove(i));
+            if let Some(x) = &x {
+                crate::left_table(x);
+            }
+            x
         };
         match gone {
             Some(x) => drop(x),
@@ -270,17 +289,43 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
     // ending child (`reparent_leader` → `do_notify_parent`).
     if let Some((r, z)) = reaper {
         if parent_wants(&r, SIGCHLD).1 && !r.is_finished() {
-            let _ = r.send_info(child_info(&z, SIGCHLD), To::Group, false);
+            let _ = r.send_info(child_info(&z, SIGCHLD, &r), To::Group, false);
         }
         r.child_event();
     }
     g.complete_done();
 }
 
+/// SX-2 `zap_pid_ns_processes` (linux-6.6/kernel/pid_namespace.c:169): the init of `g`'s pid namespace ended,
+/// so the namespace takes no new member (fork there is ENOMEM from now on) and every other member, in this
+/// namespace and below it, gets SIGKILL. No lock is held across the sends.
+fn zap_ns(g: &Arc<Group>) {
+    let ns = g.pid_ns.clone();
+    ns.disable();
+    let ids = ns.members();
+    let mut n = 0u32;
+    for id in ids {
+        if id == g.tgid {
+            continue;
+        }
+        let target = crate::find(id).map(|p| p.group().clone()).or_else(|| task::find_thread(id).map(|t| t.group().clone()));
+        if let Some(t) = target
+            && !Arc::ptr_eq(&t, g)
+            && !t.is_finished()
+        {
+            t.kill(uapi::ab::signal::SIGKILL);
+            n += 1;
+        }
+    }
+    klog::event!(Info, "ns", "pid.zap", inum = ns.inum, init = g.tgid, killed = n);
+}
+
 /// The SIGCHLD (or clone's exit signal) siginfo of ended group `g` (`do_notify_parent`): CLD_EXITED with the
 /// exit status, CLD_KILLED with the signal (V2 dumps no core: never CLD_DUMPED), the group's CPU time in
 /// clock ticks.
-fn child_info(g: &Group, sig: u32) -> SigInfo {
+/// SX-2: si_pid and si_uid as the receiving parent `to` names them (`task_pid_nr_ns` in its pid namespace,
+/// `from_kuid_munged` in its user namespace).
+fn child_info(g: &Group, sig: u32, to: &Group) -> SigInfo {
     use uapi::ab::siginfo::{CLD_EXITED, CLD_KILLED};
     let (code, status) = match g.status() {
         Some(ExitStatus::Signaled(s)) => (CLD_KILLED, s as i32),
@@ -288,7 +333,8 @@ fn child_info(g: &Group, sig: u32) -> SigInfo {
         None => (CLD_EXITED, 0),
     };
     let t = g.cpu_times();
-    SigInfo::chld(sig, code, g.tgid, g.real_uid(), status, crate::deliver::ticks(t.user_ns), crate::deliver::ticks(t.system_ns))
+    let (pid, uid) = g.ids_seen_by(to);
+    SigInfo::chld(sig, code, pid, uid, status, crate::deliver::ticks(t.user_ns), crate::deliver::ticks(t.system_ns))
 }
 
 /// `kill_orphaned_pgrp` for an ending group `g` (its parent `parent`) and the children it handed over.
@@ -329,6 +375,9 @@ pub enum WaitEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reaped {
     pub pid: u32,
+    /// SX-2: the child's pid as the waiter's pid namespace names it, taken before the reap gives its numbers
+    /// back (`task_pid_vnr` in `wait_task_zombie`); 0 when not visible there.
+    pub vpid: u32,
     pub status: ExitStatus,
     pub uid: u32,
     /// SC-6: the child's CPU time with its own reaped children's (wait4's rusage, Linux `getrusage(p,
@@ -429,7 +478,7 @@ pub fn wait_for(parent: &Arc<Process>, caller_tid: u32, o: &WaitOpts) -> Result<
                 any = true;
                 if c.is_finished() {
                     if o.exited {
-                        found = Some(i);
+                        found = Some((i, parent.vnr(c.pid)));
                         break;
                     }
                     continue;
@@ -441,16 +490,24 @@ pub fn wait_for(parent: &Arc<Process>, caller_tid: u32, o: &WaitOpts) -> Result<
                     break;
                 }
             }
-            let f = found.map(|i| if o.nowait { t[i].clone() } else { t.swap_remove(i) });
+            let f = found.map(|(i, v)| {
+                if o.nowait {
+                    (t[i].clone(), v)
+                } else {
+                    let x = t.swap_remove(i);
+                    crate::left_table(&x);
+                    (x, v)
+                }
+            });
             (f, job, any)
         };
         if let Some((c, e)) = job {
-            let r = Reaped { pid: c.pid, status: ExitStatus::Exited(0), uid: c.real_uid(), times: c.cpu.with_children(), maxrss_pages: c.both_maxrss_pages(&c.mm), event: e };
+            let r = Reaped { pid: c.pid, vpid: parent.vnr(c.pid), status: ExitStatus::Exited(0), uid: c.real_uid(), times: c.cpu.with_children(), maxrss_pages: c.both_maxrss_pages(&c.mm), event: e };
             drop(c);
             return Ok(Some(r));
         }
-        if let Some(c) = found {
-            let r = Reaped { pid: c.pid, status: c.status().unwrap_or(ExitStatus::Exited(0)), uid: c.real_uid(), times: c.cpu.with_children(), maxrss_pages: c.both_maxrss_pages(&c.mm), event: WaitEvent::Ended };
+        if let Some((c, vpid)) = found {
+            let r = Reaped { pid: c.pid, vpid, status: c.status().unwrap_or(ExitStatus::Exited(0)), uid: c.real_uid(), times: c.cpu.with_children(), maxrss_pages: c.both_maxrss_pages(&c.mm), event: WaitEvent::Ended };
             // SC-6: a collected child's times go to the parent's children (`psig->cutime += ...`); WNOWAIT
             // leaves the child as it is and counts nothing.
             if !o.nowait {

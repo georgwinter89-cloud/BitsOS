@@ -1,0 +1,11 @@
+modify_ldt write = 0
+modify_ldt read = 16
+entry 0 present (not all zero): yes
+int80 modify_ldt write = 0
+int80 modify_ldt read = 32
+entry 1 present: yes
+modify_ldt read_default = 128
+modify_ldt bad func = 4294967258
+modify_ldt short = 4294967274
+modify_ldt out of range = 4294967274
+done

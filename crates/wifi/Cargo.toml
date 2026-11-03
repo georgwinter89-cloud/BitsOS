@@ -22,3 +22,6 @@ wifi = { path = ".", features = ["peer"] }
 default = []
 # host tests and fake APs only: the authenticator side of the handshakes (src/peer.rs)
 peer = []
+
+[lints]
+workspace = true

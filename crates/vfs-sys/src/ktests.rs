@@ -144,7 +144,7 @@ ktest!("fs.vfs.freeze", Safe, freeze);
 /// R8: the tmpfs budget is measured from the frame allocator (half of its memory, Linux's tmpfs default) and
 /// covers what is in use (the initramfs copy included).
 fn tmpfs_budget() -> TestResult {
-    let limit = vfs::inode::tmpfs_page_limit();
+    let limit = vfs::pool::system_limit();
     let used = vfs::inode::tmpfs_pages_used();
     kassert!(limit != u64::MAX, "no budget: the frame allocator was not measured");
     kassert!(used < limit, "used {used} pages of {limit}");

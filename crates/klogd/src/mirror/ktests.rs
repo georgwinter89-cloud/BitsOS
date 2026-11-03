@@ -10,20 +10,43 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use devmodel::DevError;
 use devmodel::net::{LinkState, MacAddr, NetDevice};
+use klog::shutdown::TxDone;
 use ksync::SpinLock;
 use ktest::{TestResult, kassert, ktest};
 
 const TARGET: Target = Target { ip: [10, 0, 2, 2], port: 23300 };
 
-/// A card that keeps what `poll_tx` hands it (and refuses when told to).
+/// What the mirror did to a [`FakeCard`], in order (RB-15: frames, then the done question).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardEv {
+    /// `poll_tx` took a frame.
+    Tx,
+    /// `tx_done` asked; the answer.
+    Done(Option<bool>),
+}
+
+/// A card that keeps what `poll_tx` hands it (and refuses when told to), and answers `tx_done` with "not yet"
+/// `busy_asks` times after each frame (`u32::MAX`: never done), or "cannot say" with `unknown`.
 pub struct FakeCard {
     pub frames: SpinLock<Vec<Vec<u8>>>,
     pub refuse: core::sync::atomic::AtomicBool,
+    pub busy_asks: core::sync::atomic::AtomicU32,
+    pub unknown: core::sync::atomic::AtomicBool,
+    left: core::sync::atomic::AtomicU32,
+    pub log: SpinLock<Vec<CardEv>>,
 }
 
 impl FakeCard {
     pub fn new() -> Arc<FakeCard> {
-        Arc::new(FakeCard { frames: SpinLock::new(Vec::new()), refuse: core::sync::atomic::AtomicBool::new(false) })
+        use core::sync::atomic::{AtomicBool, AtomicU32};
+        Arc::new(FakeCard {
+            frames: SpinLock::new(Vec::new()),
+            refuse: AtomicBool::new(false),
+            busy_asks: AtomicU32::new(0),
+            unknown: AtomicBool::new(false),
+            left: AtomicU32::new(0),
+            log: SpinLock::new(Vec::new()),
+        })
     }
     /// The datagrams of every frame, each checked (checksums, addresses).
     pub fn datagrams(&self, src_ip: [u8; 4]) -> Result<Vec<Vec<u8>>, String> {
@@ -60,12 +83,36 @@ impl NetDevice for FakeCard {
             return false;
         }
         self.frames.lock().push(frame.to_vec());
+        self.log.lock().push(CardEv::Tx);
+        let n = self.busy_asks.load(core::sync::atomic::Ordering::Acquire);
+        self.left.store(n, core::sync::atomic::Ordering::Release);
         true
     }
 }
 
+impl TxDone for FakeCard {
+    fn name(&self) -> &str {
+        "fake-mirror0"
+    }
+    fn tx_done(&self) -> Option<bool> {
+        use core::sync::atomic::Ordering;
+        let a = if self.unknown.load(Ordering::Acquire) {
+            None
+        } else {
+            let n = self.left.load(Ordering::Acquire);
+            if n != u32::MAX && n > 0 {
+                self.left.store(n - 1, Ordering::Release);
+            }
+            Some(n == 0)
+        };
+        self.log.lock().push(CardEv::Done(a));
+        a
+    }
+}
+
 pub fn fake_route(card: &Arc<FakeCard>) -> RouteInfo {
-    RouteInfo { card: card.clone(), src_ip: [10, 0, 2, 15], src_mac: [2, 0, 0, 0, 0, 1], dst_mac: wire::ETH_BROADCAST }
+    let done: Arc<dyn TxDone> = card.clone();
+    RouteInfo { card: card.clone(), src_ip: [10, 0, 2, 15], src_mac: [2, 0, 0, 0, 0, 1], dst_mac: wire::ETH_BROADCAST, done: Some(done) }
 }
 
 /// Joins the text of `Log` datagrams, checking that each starts where the previous ended (from `start`).
@@ -144,6 +191,9 @@ ktest!("rb.mirror.framing", Safe, framing);
 /// as klog's, so the ktests logged before this one cannot push the boot out of it; the kernel's own ring is
 /// sized from memory, checked by `rb.mirror.sized`.)
 fn early_buffer() -> TestResult {
+    if klog::Level::Info > klog::level_for("kernel") {
+        return ktest::skip("the kernel's Info start line is not kept at this loglevel");
+    }
     let m = test_mirror(&EARLY, klog::ring_info().bytes.max(64 << 10))?;
     if m.ring_state().4 < klog::ring_info().bytes {
         return ktest::skip("klog's ring grew since the first run in this boot");
@@ -334,6 +384,79 @@ fn emergency_line() -> TestResult {
     Ok(())
 }
 ktest!("rb.mirror.emergency", Safe, emergency_line);
+
+static PAUSE: ksync::OnceRef<Mirror> = ksync::OnceRef::new();
+
+/// RB-15 on a fake card, with the scheduler's sleep: the pause sends what waits raw and waits for the card's
+/// done, the thread's path stays off, a checkpoint sends what came since, the stop (interrupts off) sends the
+/// rest and the end and asks the card last.
+fn pause_fake_card() -> TestResult {
+    use klog::Sink;
+    let card = FakeCard::new();
+    card.busy_asks.store(3, core::sync::atomic::Ordering::Release);
+    let m = test_mirror(&PAUSE, 64 << 10)?;
+    m.set_route(Some(fake_route(&card)));
+    let mut b = [0u8; DGRAM_MAX];
+    m.begin(0xBEEF, 0, [10, 0, 2, 15], &mut b).ok_or("begin")?;
+    m.set_live(true);
+    m.write_line(klog::Level::Info, "[    0.000001] I rb before.pause");
+    let sleep = |ns: u64| sched::sleep_ns(ns);
+    let p = m.pause(&sleep);
+    kassert!(p.was_live && p.frames >= 1 && p.done && !p.thread_busy, "{:?}", p);
+    kassert!(m.is_paused() && !m.sends_normally());
+    m.write_line(klog::Level::Info, "[    0.000002] I rb after.storage");
+    let c = m.checkpoint(&sleep);
+    kassert!(c.frames >= 1 && c.done, "{:?}", c);
+    m.write_line(klog::Level::Info, "[    0.000003] I rb after.park");
+    let r = {
+        let _irq = hal::cpu::IrqGuard::new();
+        m.stop()
+    };
+    kassert!(r.ended && r.done && !r.done_unknown, "{:?}", r);
+    let log = card.log.lock().clone();
+    let last_tx = log.iter().rposition(|e| *e == CardEv::Tx).ok_or("no frame")?;
+    kassert!(log.last() == Some(&CardEv::Done(Some(true))) && last_tx + 1 < log.len(), "{:?}", log);
+    let d = card.datagrams([10, 0, 2, 15])?;
+    kassert!(d.last().is_some_and(|x| x[3] == b'E'), "the end datagram last");
+    let text = log_text(&d[..d.len() - 1], 0xBEEF, 0);
+    // The pause repeats the tail once: the text from 0 appears whole at least once and in order.
+    let all: Vec<u8> = d[..d.len() - 1].iter().flat_map(|x| x[HEAD..].to_vec()).collect();
+    for l in ["I rb before.pause", "I rb after.storage", "I rb after.park"] {
+        kassert!(all.windows(l.len()).any(|w| w == l.as_bytes()), "{} missing; {:?}", l, text.err());
+    }
+    Ok(())
+}
+ktest!("rb.mirror.pause_fake_card", Safe, pause_fake_card);
+
+/// RB-15 on the live mirror (the scenario's listener or the Mini-PC's): pause, a marker line out raw at a
+/// checkpoint with the real card's done (igc), then the thread's path back. Rerunnable; one pause per run.
+fn pause_live() -> TestResult {
+    let Some(m) = live_or_skip()? else { return ktest::skip("no mirror= in CONFIG") };
+    wait_sent(m, 20)?;
+    let route = m.route().ok_or("no route snapshot")?;
+    let name = String::from(route.card.name());
+    kassert!(!name.starts_with("igc") || route.done.is_some(), "{} has no done probe in the route", name);
+    let sleep = |ns: u64| sched::sleep_ns(ns);
+    let p = m.pause(&sleep);
+    let mark = alloc::format!("{:x}", time::now_ns());
+    klog::event!(Warn, "rb", "mirror.pause_live", marker = mark.as_str(), card = name.as_str());
+    // As klog::shutdown::step: the record into the mirror's ring (klogd may be draining right now).
+    let deadline = time::now_ns() + 1_000_000_000;
+    while klog::pending() && time::now_ns() < deadline {
+        if klog::drain_deferred(4096) == 0 {
+            sched::sleep_ms(1);
+        }
+    }
+    let c = m.checkpoint(&sleep);
+    m.unpause();
+    kassert!(p.was_live && !p.thread_busy, "{:?}", p);
+    kassert!(c.frames >= 1 && !c.dropped, "{:?}", c);
+    kassert!(c.done || (c.done_unknown && route.done.is_none()), "the card did not say done: {:?}", c);
+    klog::event!(Warn, "rb", "mirror.pause_live_back", marker = mark.as_str(), frames = c.frames, done = c.done);
+    wait_sent(m, 20)?;
+    Ok(())
+}
+ktest!("rb.mirror.pause_live", Safe, pause_live);
 
 /// The way back after a quiesce whose Reload did not happen (the cards stayed up here): the mirror's quiesce
 /// entry sends the end, `resume` makes the thread start a new view with a new id, and lines flow again. The

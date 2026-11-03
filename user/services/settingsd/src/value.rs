@@ -22,28 +22,37 @@ pub enum Type {
         unit: String,
         word: Option<String>,
     },
-    Choice(Vec<String>),
+    /// One of a fixed set, spelled as declared; any case reads as the declared spelling (an old stored `Light`
+    /// is `light`). `de`: German names of the values for the settings page (WY-9), same order, or empty.
+    Choice {
+        values: Vec<String>,
+        de: Vec<String>,
+    },
     /// `#rrggbb`.
     Color,
     /// Free text up to `max` bytes (a per-key bound the owner declares, so one key cannot fill the stick).
     Text {
         max: usize,
     },
-    /// The kernel's `loglevel=` grammar (crates/klog/src/levels.rs `parse`): `info` or `warn,net=debug`.
+    /// The kernel's `loglevel=` grammar (crates/klog/src/levels.rs `parse`): `info` or `warn,net=debug`. People
+    /// see a choice of the five levels (CL-8: the settings page shows choice pills, not a text field); the CLI, MCP
+    /// and values stored before CL-8 may still carry subsystem parts, so nothing a user set is lost.
     LogSpec,
 }
 
-const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+pub const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+/// German names of LEVELS (and of kernel.console_log's levels), in words Georg reads without the code.
+pub const LEVELS_DE: [&str; 5] = ["Nur Fehler", "Warnungen", "Normal", "Ausführlich", "Alles"];
 
 impl Type {
     pub fn name(&self) -> &'static str {
         match self {
             Type::Bool => "bool",
             Type::Int { .. } => "int",
-            Type::Choice(_) => "choice",
+            Type::Choice { .. } => "choice",
             Type::Color => "color",
             Type::Text { .. } => "text",
-            Type::LogSpec => "logspec",
+            Type::LogSpec => "choice",
         }
     }
 
@@ -86,7 +95,9 @@ impl Type {
     pub fn check(&self, v: Value) -> Result<Value, String> {
         match (self, v) {
             (Type::Bool, v @ Value::Bool(_)) => Ok(v),
-            (Type::Int { word: Some(w), .. }, Value::Text(s)) if s.trim().eq_ignore_ascii_case(w) => Ok(Value::Text(w.clone())),
+            (Type::Int { word: Some(w), .. }, Value::Text(s)) if s.trim().eq_ignore_ascii_case(w) => {
+                Ok(Value::Text(w.clone()))
+            }
             (Type::Int { min, max, unit, .. }, Value::Int(n)) => {
                 if n < *min || n > *max {
                     Err(format!("want {min}..{max}{unit}, got {n}{unit}"))
@@ -94,11 +105,11 @@ impl Type {
                     Ok(Value::Int(n))
                 }
             }
-            (Type::Choice(c), Value::Text(s)) => c
+            (Type::Choice { values, .. }, Value::Text(s)) => values
                 .iter()
                 .find(|x| x.eq_ignore_ascii_case(s.trim()))
                 .map(|x| Value::Text(x.clone()))
-                .ok_or_else(|| format!("want one of {}, got {s:?}", c.join("|"))),
+                .ok_or_else(|| format!("want one of {}, got {s:?}", values.join("|"))),
             (Type::Color, Value::Text(s)) => color(&s).map(Value::Text),
             (Type::Text { max }, Value::Text(s)) => {
                 if s.len() > *max {
@@ -124,9 +135,18 @@ impl Type {
                     None => j,
                 }
             }
-            Type::Choice(c) => j.with("choices", c.iter().map(|x| Json::from(x.as_str())).collect::<Vec<_>>()),
+            Type::Choice { values, de } => {
+                let j = j.with("choices", strs(values.iter().map(String::as_str)));
+                if de.is_empty() { j } else { j.with("choices_de", strs(de.iter().map(String::as_str))) }
+            }
             Type::Text { max } => j.with("max_bytes", *max),
-            Type::LogSpec => j.with("levels", LEVELS.iter().map(|x| Json::from(*x)).collect::<Vec<_>>()),
+            // `grammar` tells a client that knows it that `warn,net=debug` is valid too; `levels` is the pre-CL-8
+            // field, kept for readers of the old schema.
+            Type::LogSpec => j
+                .with("choices", strs(LEVELS.into_iter()))
+                .with("choices_de", strs(LEVELS_DE.into_iter()))
+                .with("grammar", "logspec")
+                .with("levels", strs(LEVELS.into_iter())),
             _ => j,
         }
     }
@@ -144,22 +164,24 @@ impl Type {
                 let word = match j.get("word") {
                     None => None,
                     Some(w) => match w.as_str() {
-                        Some(w) if !w.is_empty() && w.len() <= 16 && w.chars().all(|c| c.is_ascii_alphabetic()) => Some(w.to_string()),
+                        Some(w) if !w.is_empty() && w.len() <= 16 && w.chars().all(|c| c.is_ascii_alphabetic()) => {
+                            Some(w.to_string())
+                        }
                         _ => return Err("int word must be 1..16 letters".into()),
                     },
                 };
                 Type::Int { min, max, unit: j.str("unit").unwrap_or("").to_string(), word }
             }
+            "choice" if j.str("grammar") == Some("logspec") => Type::LogSpec,
             "choice" => {
-                let Some(Json::Arr(a)) = j.get("choices") else { return Err("choice needs choices".into()) };
-                let c: Vec<String> = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
-                if c.is_empty()
-                    || c.len() != a.len()
-                    || c.iter().any(|x| x.is_empty() || x.chars().any(char::is_control))
-                {
-                    return Err("choices must be non-empty strings".into());
-                }
-                Type::Choice(c)
+                let values = names(j.get("choices")).ok_or("choices must be non-empty strings")?;
+                let de = match j.get("choices_de") {
+                    None => Vec::new(),
+                    Some(d) => names(Some(d)).ok_or("choices_de must be non-empty strings")?,
+                };
+                let ty = Type::Choice { values, de };
+                ty.valid()?;
+                ty
             }
             "color" => Type::Color,
             "text" => {
@@ -170,6 +192,39 @@ impl Type {
             other => return Err(format!("unknown type {other:?}")),
         })
     }
+}
+
+impl Type {
+    /// A choice with values (and German names, one per value) that the CLI, a file and the page can carry.
+    pub fn valid(&self) -> Result<(), String> {
+        let bad = |v: &[String]| v.iter().any(|x| x.trim().is_empty() || x.chars().any(char::is_control));
+        match self {
+            Type::Choice { values, .. } if values.is_empty() || bad(values) => {
+                Err("choices must be non-empty strings".into())
+            }
+            // check() matches in any case, so `A` and `a` would be one choice shown as two pills.
+            Type::Choice { values, .. }
+                if values.iter().enumerate().any(|(i, x)| values[..i].iter().any(|y| y.eq_ignore_ascii_case(x))) =>
+            {
+                Err("choices must differ, also in case".into())
+            }
+            Type::Choice { values, de } if !de.is_empty() && (de.len() != values.len() || bad(de)) => {
+                Err(format!("choices_de needs {} non-empty names, one per choice", values.len()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn strs<'a>(it: impl Iterator<Item = &'a str>) -> Json {
+    Json::Arr(it.map(Json::from).collect())
+}
+
+/// A non-empty array of strings (None: missing, empty or not all strings).
+fn names(j: Option<&Json>) -> Option<Vec<String>> {
+    let Some(Json::Arr(a)) = j else { return None };
+    let v: Vec<String> = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+    (!v.is_empty() && v.len() == a.len()).then_some(v)
 }
 
 impl Value {
@@ -216,9 +271,10 @@ fn logspec(s: &str) -> Result<String, String> {
             Some((k, l)) => (Some(k.trim()), l.trim()),
             None => (None, part),
         };
-        if !LEVELS.contains(&l) {
+        // Any case reads as the level (an old `WARN` is `warn`); the kernel itself wants lower case.
+        let Some(l) = LEVELS.into_iter().find(|x| x.eq_ignore_ascii_case(l)) else {
             return Err(format!("bad part {part:?}: want a level of {}", LEVELS.join("|")));
-        }
+        };
         match k {
             Some(k) if k.is_empty() || k.contains(char::is_whitespace) || k.contains('#') => {
                 return Err(format!("bad part {part:?}: want subsystem=level"));

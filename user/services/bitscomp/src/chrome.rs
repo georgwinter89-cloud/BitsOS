@@ -7,7 +7,7 @@
 
 use crate::layout::Rect;
 use crate::reveal::Edge;
-use crate::text::{Font, Weight};
+use crate::text::{Family, Font, Weight};
 use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,11 +24,16 @@ pub enum Part {
     WsFold,
     /// WY-5c: the top bar's workspaces button while the list is folded (it brings the list back).
     WsButton,
+    /// WY-12: an entry of the window list's minimised windows (restores it).
+    Min(usize),
 }
 
 /// A workspace entry with its second line ("2 Kacheln · 3 Tabs"), and the lowest one (name only).
 pub const WS_FULL: i32 = 58;
 pub const WS_LOW: i32 = 30;
+/// WY-12: the minimised windows' heading and entries.
+pub const MIN_HEAD: i32 = 26;
+pub const MIN_ROW: i32 = 38;
 
 /// What the layout depends on besides the theme.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +42,8 @@ pub struct Inputs {
     pub size: (i32, i32),
     pub favourites: Vec<String>,
     pub workspaces: usize,
+    /// WY-12: minimised windows of the shown workspace (the list's lower part).
+    pub minimized: usize,
     /// A folded bar shown over the tiles for a while (pointer against its edge).
     pub reveal: Option<Edge>,
 }
@@ -61,6 +68,9 @@ pub struct Chrome {
     pub ws_title: Rect,
     pub ws_items: Vec<Rect>,
     pub ws_new: Rect,
+    /// WY-12: the "MINIMIERT" heading and one entry per minimised window that fits, above "Startseite".
+    pub min_title: Rect,
+    pub min_items: Vec<Rect>,
     pub home: Rect,
     /// Claude's sidebar when shown (docked or revealed).
     pub side: Option<Rect>,
@@ -77,7 +87,7 @@ pub fn fav_label(addr: &str) -> &str {
 
 /// The favourites bar's text style.
 pub fn fav_font(t: &Theme) -> Font {
-    Font::new(t.fs(13.0), Weight::Regular, t.scale)
+    t.font(Family::Ui, 13.0, Weight::Regular)
 }
 
 /// Logical width of `s` in `f` (measured at the output scale, so it matches what is drawn).
@@ -124,9 +134,18 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
     let item_w = list.w - 24;
     let home = Rect { x: list.x + 12, y: list.y + list.h - 16 - 40, w: item_w, h: 40 };
     let mut iy = ws_title.y + ws_title.h + 6;
+    // WY-12: the minimised windows above "Startseite", as many as leave room for one low workspace entry and
+    // the "+" button; the others are reached by Alt+Tab.
+    let fit = ((home.y - 6 - (iy + WS_LOW + 6 + 52) - MIN_HEAD) / MIN_ROW).max(0) as usize;
+    let shown_min = i.minimized.min(fit);
+    let min_h = if shown_min > 0 { MIN_HEAD + shown_min as i32 * MIN_ROW } else { 0 };
+    let min_title = Rect { x: list.x + 20, y: home.y - 6 - min_h, w: item_w - 8, h: 20 };
+    let min_items = (0..shown_min as i32)
+        .map(|k| Rect { x: list.x + 12, y: min_title.y + MIN_HEAD + k * MIN_ROW, w: item_w, h: MIN_ROW - 4 })
+        .collect();
     // Many workspaces: the entries get lower (name only below `WS_FULL`) until they fit; what still does not fit
     // is reached by Ctrl+Alt+digit and `ctl ws` (`ws_shown`).
-    let room = home.y - 6 - 52 - iy;
+    let room = home.y - 6 - 52 - iy - min_h;
     let n = i.workspaces.max(1) as i32;
     let item_h = (room / n - 6).clamp(WS_LOW, WS_FULL);
     let mut ws_items = Vec::new();
@@ -157,6 +176,8 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
         ws_title,
         ws_items,
         ws_new,
+        min_title,
+        min_items,
         home,
         side,
         side_docked,
@@ -188,8 +209,11 @@ impl Chrome {
             return Some(Part::Ws(i));
         }
         // The "+" button can be pushed below the list's end by many workspaces: then it is not there.
-        if self.ws_new.contains(x, y) && self.ws_new.y + self.ws_new.h <= self.home.y {
+        if self.ws_new.contains(x, y) && self.ws_new.y + self.ws_new.h <= self.list_end() {
             return Some(Part::WsNew);
+        }
+        if let Some(i) = self.min_items.iter().position(|r| r.contains(x, y)) {
+            return Some(Part::Min(i));
         }
         if self.home.contains(x, y) {
             return Some(Part::Home);
@@ -225,7 +249,12 @@ impl Chrome {
 
     /// Workspace entries that fit above the "Startseite" link.
     pub fn ws_shown(&self) -> usize {
-        self.ws_items.iter().take_while(|r| r.y + r.h <= self.home.y - 6).count()
+        self.ws_items.iter().take_while(|r| r.y + r.h <= self.list_end() - 6).count()
+    }
+
+    /// Where the workspace part of the list ends: at the minimised windows (WY-12), else at "Startseite".
+    pub fn list_end(&self) -> i32 {
+        if self.min_items.is_empty() { self.home.y } else { self.min_title.y }
     }
 }
 

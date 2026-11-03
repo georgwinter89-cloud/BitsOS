@@ -26,9 +26,9 @@ pub fn new_fs_as(fstype: &'static str, perm: u32) -> (Arc<SuperBlock>, Arc<Dentr
 }
 
 /// A mount of a new tmpfs (root 0755 like the initramfs root).
-pub fn new_mount(parent: Option<(Arc<Mount>, Arc<Dentry>)>) -> Arc<Mount> {
+pub fn new_mount() -> Arc<Mount> {
     let (sb, root) = new_fs(0o755);
-    Mount::new(sb, root, parent, false)
+    Mount::new(sb, root, false)
 }
 
 /// Mounts a new tmpfs on `path` of `ns` (made when missing) with root permissions `perm` and an optional own

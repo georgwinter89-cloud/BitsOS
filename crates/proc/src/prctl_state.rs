@@ -7,7 +7,8 @@
 //!   PR_IO_FLUSHER, and the credential bits V2 keeps constant otherwise (securebits, the capability bounding
 //!   set). A new task copies its creator's (`dup_task_struct`), except the parent-death signal, which starts at
 //!   0 (`copy_process`), and the default timer slack, which becomes the creator's current slack. execve keeps
-//!   all of them (no set-uid programs in V2) and sets `comm` to the new program's file name.
+//!   all of them (no set-uid programs in V2) and sets `comm` to the new program's file name. SX-1: the seccomp
+//!   mode and filter stack (`seccomp::TaskSeccomp`) live here too and follow the same rules (`copy_seccomp`).
 //! - per address space (Linux `mm->flags`): MMF_DUMPABLE (PR_SET_DUMPABLE; 1 at every execve, as
 //!   `begin_new_exec` sets SUID_DUMP_USER) and MMF_DISABLE_THP (PR_SET_THP_DISABLE; inherited by fork and kept
 //!   across execve, `mmf_init_flags`).
@@ -48,6 +49,7 @@ pub struct TaskPrctl {
     io_flusher: AtomicBool,
     securebits: AtomicU32,
     cap_bset: AtomicU64,
+    seccomp: seccomp::TaskSeccomp,
 }
 
 impl Default for TaskPrctl {
@@ -68,6 +70,7 @@ impl TaskPrctl {
             io_flusher: AtomicBool::new(false),
             securebits: AtomicU32::new(0),
             cap_bset: AtomicU64::new(CAP_FULL_SET),
+            seccomp: seccomp::TaskSeccomp::new(),
         }
     }
     /// A new task made by `from` (fork/clone): everything but the parent-death signal; the default slack is
@@ -83,6 +86,20 @@ impl TaskPrctl {
         self.io_flusher.store(from.io_flusher(), Ordering::Relaxed);
         self.securebits.store(from.securebits(), Ordering::Relaxed);
         self.cap_bset.store(from.cap_bset(), Ordering::Relaxed);
+        self.seccomp.inherit(&from.seccomp);
+    }
+    /// SX-1: `Group::add_thread` under `proc.threads`: the creator's no_new_privs and seccomp stack again, in
+    /// case a TSYNC synced the creator between `inherit` and the insertion. True when the stack changed.
+    pub fn resync_seccomp(&self, from: &TaskPrctl) -> bool {
+        if from.no_new_privs() {
+            self.set_no_new_privs();
+        }
+        self.seccomp.resync(&from.seccomp)
+    }
+    /// SX-1: the seccomp mode and filter stack.
+    #[inline(always)]
+    pub fn seccomp(&self) -> &seccomp::TaskSeccomp {
+        &self.seccomp
     }
     pub fn comm(&self) -> [u8; COMM_LEN] {
         *self.comm.lock()
@@ -137,6 +154,10 @@ impl TaskPrctl {
     }
     pub fn cap_bset(&self) -> u64 {
         self.cap_bset.load(Ordering::Relaxed)
+    }
+    /// SX-2: a new user namespace (or setns into one) gives the full bounding set (`set_cred_user_ns`).
+    pub fn set_full_bset(&self) {
+        self.cap_bset.store(CAP_FULL_SET, Ordering::Relaxed);
     }
     /// PR_CAPBSET_DROP.
     pub fn drop_cap(&self, cap: u64) {
@@ -224,6 +245,12 @@ mod tests {
         assert_eq!(b.timer_slack(), 1234, "the default is the creator's slack");
         assert_eq!(b.comm_str(), "parent");
         assert_eq!(a.cap_bset(), CAP_FULL_SET);
+        assert_eq!(b.seccomp().mode(), 0);
+        let g = seccomp::change();
+        a.seccomp().set_strict(&g).unwrap();
+        let c = TaskPrctl::new();
+        c.inherit(&a);
+        assert_eq!(c.seccomp().mode(), seccomp::consts::MODE_STRICT, "seccomp follows fork/clone");
     }
 
     #[test]

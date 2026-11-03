@@ -1,0 +1,68 @@
+PR_GET_SECCOMP = 0
+PR_GET_NO_NEW_PRIVS = 0
+FILTER(NULL) = -EFAULT
+FILTER(TSYNC, NULL) = -EFAULT
+FILTER(SPEC_ALLOW, NULL) = -EFAULT
+FILTER(LOG, NULL) = -EFAULT
+FILTER(TSYNC_ESRCH, NULL) = -EFAULT
+FILTER(flag 0x40, NULL) = -EINVAL
+FILTER(TSYNC | NEW_LISTENER, NULL) = -EINVAL
+FILTER(WAIT_KILLABLE_RECV, NULL) = -EINVAL
+FILTER(fprog at a kernel address) = -EFAULT
+len 0 without no_new_privs = -EINVAL
+len 4097 without no_new_privs = -EINVAL
+len 1, NULL program, without no_new_privs = -EACCES
+valid without no_new_privs = -EACCES
+PR_SET_SECCOMP(2) without no_new_privs = -EACCES
+PR_SET_SECCOMP(3) = -EINVAL
+PR_SET_SECCOMP(2, NULL) = -EFAULT
+seccomp(op 4) = -EINVAL
+seccomp(STRICT, flags 1) = -EINVAL
+seccomp(STRICT, uargs) = -EINVAL
+ACTION_AVAIL 0x80000000 = 0
+ACTION_AVAIL 0 = 0
+ACTION_AVAIL 0x30000 = 0
+ACTION_AVAIL 0x50000 = 0
+ACTION_AVAIL 0x7fc00000 = 0
+ACTION_AVAIL 0x7ff00000 = 0
+ACTION_AVAIL 0x7ffc0000 = 0
+ACTION_AVAIL 0x7fff0000 = 0
+ACTION_AVAIL 0x10000 = -EOPNOTSUPP
+ACTION_AVAIL 0x50001 = -EOPNOTSUPP
+ACTION_AVAIL flags 1 = -EINVAL
+ACTION_AVAIL NULL = -EFAULT
+NOTIF_SIZES = 0
+sizes: notif 80 resp 24 data 64
+NOTIF_SIZES flags 1 = -EINVAL
+NOTIF_SIZES NULL = -EFAULT
+PR_SET_NO_NEW_PRIVS = 0
+len 1, NULL program = -EINVAL
+program at a kernel address = -EFAULT
+hostile JA past the end = -EINVAL
+hostile JEQ true past the end = -EINVAL
+hostile JEQ false past the end = -EINVAL
+hostile load at 64 = -EINVAL
+hostile load at 2 (unaligned) = -EINVAL
+hostile half-word load = -EINVAL
+hostile byte load = -EINVAL
+hostile indirect load = -EINVAL
+hostile ancillary load = -EINVAL
+hostile division by constant 0 = -EINVAL
+hostile MOD = -EINVAL
+hostile shift by 32 = -EINVAL
+hostile scratch cell 16 = -EINVAL
+hostile scratch read before write = -EINVAL
+hostile no return at the end = -EINVAL
+hostile unknown opcode = -EINVAL
+hostile RET X = -EINVAL
+after the refusals: NoNewPrivs: 1; Seccomp: 0; Seccomp_filters: 0; 
+division by X = 0 is fine (the program answers 0 then) = 0
+length loads, scratch cells = 0
+two filters: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 2; 
+4096-instruction filters added: 7, then -ENOMEM
+3998 more = -ENOMEM
+3997 more = 0
+1 more = -ENOMEM
+full stack: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 10; 
+bound child: exit 0
+division by X = 0 answers KILL_THREAD: signal 31

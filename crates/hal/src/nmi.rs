@@ -231,7 +231,71 @@ fn take_owed(owed: &AtomicU32) -> bool {
     owed.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
 }
 
+/// RB-12: whether this NMI's frame was written over a running NMI's: the interrupted code is the kernel on this
+/// CPU's NMI stack (only an NMI handler runs there), and the CPU pushed this frame in the stack's top page, where
+/// the running NMI's own frame and saved registers were. That happens when an exception inside an NMI handler
+/// returned by `iretq` (which ends NMI blocking) and another NMI came before the handler ended (Linux allows it
+/// and copes in entry_64.S, "nested NMIs"; hal's NMI entry does not). The first NMI's way back is lost then: it
+/// can only loop on its stack, or return with registers and a GS base that are not its own. The 26.10. and
+/// 27.10. #DF crashes on the Mini-PC were not this (CP-8): an NMI from a program that had come back by AMD's
+/// SYSRET saved SS 0x18, its `iretq` raised #GP(0x18) with the program's GS base, and the panic path recursed
+/// into #DF. This check and RB-12's IST shift stay for real nested NMIs. Uses no GS beyond what
+/// `hal_kernel_trap` fixed.
+fn clobbered_nested(frame: &TrapFrame) -> bool {
+    if frame.cs & 3 != 0 {
+        return false;
+    }
+    let Some(s) = crate::gdt::ist_stack(crate::gdt::IST_NMI) else { return false };
+    nested_on(&s, frame as *const TrapFrame as u64, frame.rsp)
+}
+
+/// `clobbered_nested` on numbers (pure; host-tested): the frame at `at` lies in the top page of the NMI stack `s`
+/// and the interrupted rsp lies on that stack too.
+fn nested_on(s: &crate::gdt::IstStack, at: u64, rsp: u64) -> bool {
+    s.contains(rsp) && s.contains(at) && s.top - at <= 4096
+}
+
+#[cold]
+fn nested_panic(f: &TrapFrame) -> ! {
+    panic!(
+        "nested NMI on CPU {}: an NMI came while this CPU's NMI handler still ran (something inside it returned by \
+         iret) and overwrote that handler's saved state; the handler was at rip {:#x} rsp {:#x} (the trap step of the \
+         backtrace below walks its stack)",
+        percpu::this_cpu(),
+        f.rip,
+        f.rsp
+    )
+}
+
+/// Stack the NMI handler may use below its trap frame; a nested NMI lands below it (CR-1 prototype).
+const NMI_WORK: u64 = 6 * 1024;
+
+/// While it lives, this CPU's NMI IST slot points below the running handler (CR-1 prototype).
+struct IstShift(u64);
+
+impl Drop for IstShift {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            crate::gdt::this().set_tss_ist(crate::gdt::IST_NMI, self.0);
+        }
+    }
+}
+
+fn ist_shift(frame: &TrapFrame) -> IstShift {
+    let at = frame as *const TrapFrame as u64;
+    match crate::gdt::ist_stack(crate::gdt::IST_NMI) {
+        Some(s) if s.contains(at) && at - s.bottom > NMI_WORK + 2048 => {
+            IstShift(crate::gdt::this().set_tss_ist(crate::gdt::IST_NMI, (at - NMI_WORK) & !15))
+        }
+        _ => IstShift(0),
+    }
+}
+
 fn nmi_hook(frame: &mut TrapFrame) -> bool {
+    if clobbered_nested(frame) {
+        nested_panic(frame);
+    }
+    let _shift = ist_shift(frame);
     if READY.load(Ordering::Acquire) {
         let me = percpu::this_cpu();
         if let Some(s) = SLOTS.find_for(me) {
@@ -255,6 +319,7 @@ fn nmi_hook(frame: &mut TrapFrame) -> bool {
                         if s.state.compare_exchange(SAVING, SAVED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                             s.answers.fetch_add(1, Ordering::AcqRel);
                         }
+                        nest_test::after_answer(me);
                     }
                     return true;
                 }
@@ -278,6 +343,46 @@ fn nmi_hook(frame: &mut TrapFrame) -> bool {
     // SAFETY: PREV_HOOK holds 0 or the hook `idt::exception_hook` returned at install, an `ExceptionHook`.
     let f: ExceptionHook = unsafe { core::mem::transmute::<usize, ExceptionHook>(prev) };
     f(frame)
+}
+
+/// RB-12 ktest hook (`rb.crash.nmi_nested`; inert, one atomic load per answer, unless a test arms it): the next
+/// sampled NMI on one CPU takes a breakpoint trap whose handler returns by `iretq`, as any fault fixed inside an
+/// NMI handler would. That iret ends the CPU's NMI blocking while it still runs on its NMI stack; the test then
+/// sends a second NMI.
+pub mod nest_test {
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    static CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// 0 idle, 1 armed, 2 the iret happened (the handler waits), 3 released.
+    static STAGE: AtomicU8 = AtomicU8::new(0);
+
+    pub fn arm(cpu: usize) {
+        STAGE.store(1, Ordering::Release);
+        CPU.store(cpu, Ordering::Release);
+    }
+    pub fn stage() -> u8 {
+        STAGE.load(Ordering::Acquire)
+    }
+    pub fn release() {
+        CPU.store(usize::MAX, Ordering::Release);
+        STAGE.store(3, Ordering::Release);
+    }
+
+    pub(super) fn after_answer(me: usize) {
+        if CPU.load(Ordering::Acquire) != me || STAGE.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        CPU.store(usize::MAX, Ordering::Release);
+        // SAFETY: `int3` is a trap: the test's #BP hook accepts it and the CPU resumes at the next instruction; it
+        // touches no memory and no stack beyond the exception frame.
+        unsafe { core::arch::asm!("int3", options(nomem)) };
+        // Bounded: about a second of spins, then back to the interrupted code either way.
+        let mut n: u64 = 0;
+        while STAGE.load(Ordering::Acquire) == 2 && n < 400_000_000 {
+            core::hint::spin_loop();
+            n += 1;
+        }
+    }
 }
 
 fn save(s: &Slot, f: &TrapFrame) {
@@ -545,6 +650,18 @@ mod tests {
             let (k, a) = encode(s);
             assert_eq!(decode(k, a), s);
         }
+    }
+
+    #[test]
+    fn a_frame_over_a_running_nmi_is_seen() {
+        // The NMI stack of the 26.10. crash (CPU 9 of the Mini-PC): guard 0x..ede7000, 16 KiB above it.
+        let s = crate::gdt::IstStack { ist: 2, guard: Some(0xFFFF_E8FF_FEDE_7000), bottom: 0xFFFF_E8FF_FEDE_8000, top: 0xFFFF_E8FF_FEDE_C000 };
+        let at = s.top - 0xb0;
+        assert!(nested_on(&s, at, s.top - 0x900), "pushed at the top while a handler ran deeper on the same stack");
+        assert!(!nested_on(&s, at, 0xFFFF_E8FF_FEF1_0E20), "the interrupted code ran on a thread stack");
+        assert!(!nested_on(&s, at, 0x7fff_0000), "a program's rsp (an NMI in a swapgs window)");
+        assert!(!nested_on(&s, s.top - 0x1900, s.top - 0x2000), "a frame pushed lower down (an entry that shifts the IST)");
+        assert!(!nested_on(&s, 0xFFFF_E8FF_FEF0_0000, s.top - 0x900), "this frame is not on the NMI stack");
     }
 
     #[test]

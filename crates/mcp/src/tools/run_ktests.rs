@@ -1,6 +1,7 @@
 //! `ktest`: runs registered in-kernel tests by name prefix (`spec/net.md` §5.2, the replacement for V1's
 //! `run_asm` probing) under R8e's class rules: on hardware `Safe` and `Display` tests run (R8c: display writes
-//! need no switch since 21.10.); `Audible` is refused, `Wlan` runs only with `wlan=on` in CONFIG (WL-4 CR 3), and `QemuOnly` tests are skipped. Under QEMU (hypervisor bit) every class runs, as at a ktest boot.
+//! need no switch since 21.10.); `Audible` is refused, `Wlan` runs only with `wlan=on` in CONFIG (WL-4 CR 3), and `QemuOnly` tests are skipped. Under QEMU (hypervisor bit) every class runs, as at a ktest boot, but
+//! `Program` (a stick tree's program), which runs only on the Mini-PC (Georg 30.10.).
 //!
 //! One run at a time (tests open ports and hold devices). The run goes in name order and writes each result
 //! line to the call's output, so a long run that outlives its deadline can be followed with `output` and ended
@@ -26,9 +27,10 @@ pub enum Verdict {
 /// The class rule (pure): `hardware` = no hypervisor bit, `wlan_on` = CONFIG `wlan=on` (PC-4's opt-in).
 pub fn verdict(class: Class, hardware: bool, wlan_on: bool) -> Verdict {
     if !hardware {
-        return Verdict::Run;
+        return if class == Class::Program { Verdict::Skip("Program: runs only on the Mini-PC (Georg 30.10.)") } else { Verdict::Run };
     }
     match class {
+        Class::Program => Verdict::Run,
         Class::Safe | Class::Display => Verdict::Run,
         Class::QemuOnly => Verdict::Skip("QemuOnly: runs only under QEMU"),
         Class::Audible => Verdict::Refuse("Audible: makes sound; not over MCP on hardware (R8e)"),
@@ -82,6 +84,15 @@ struct Tally {
 /// Runs the tests matching `filter` with `hardware` and `wlan_on` deciding the class rule; `ctx` gets every line
 /// as output.
 pub(crate) fn run(ctx: &ToolContext, filter: &str, hardware: bool, wlan_on: bool) -> ToolResult {
+    run_with(ctx, filter, hardware, wlan_on, false)
+}
+
+/// MC-8a: what the gate (`/dev/bitsos/mcp`) says for a test that is not Safe.
+pub(crate) const NOT_SAFE: &str = "not Safe: the user-space MCP service starts only Safe-class tests (MC-8a)";
+
+/// `run`; with `safe_only` (the gate) every test of another class than Safe and Program is skipped with `NOT_SAFE`,
+/// also under QEMU.
+pub(crate) fn run_with(ctx: &ToolContext, filter: &str, hardware: bool, wlan_on: bool, safe_only: bool) -> ToolResult {
     let mut tests: Vec<&'static ktest::KtestEntry> = ktest::KTESTS.entries().iter().filter(|t| ktest::matches(filter, t.name)).collect();
     if tests.is_empty() {
         return Err(ToolError::Failed(format!("no ktest matches {filter:?}")));
@@ -102,7 +113,10 @@ pub(crate) fn run(ctx: &ToolContext, filter: &str, hardware: bool, wlan_on: bool
             t.not_run += 1;
             continue;
         }
-        let line = match verdict(e.class, hardware, wlan_on) {
+        // Program tests read a stick tree and start its program as uid 1000, as the Safe ul.pkg tests did before
+        // Georg's rule of 30.10. moved them to the Mini-PC: the user-space service starts them too.
+        let v = if safe_only && !matches!(e.class, Class::Safe | Class::Program) { Verdict::Skip(NOT_SAFE) } else { verdict(e.class, hardware, wlan_on) };
+        let line = match v {
             Verdict::Skip(why) => {
                 t.skipped += 1;
                 format!("skip {}: {why}", e.name)
@@ -155,12 +169,21 @@ pub(crate) fn run(ctx: &ToolContext, filter: &str, hardware: bool, wlan_on: bool
 }
 
 fn ktest_tool(ctx: &ToolContext, args: &Json) -> ToolResult {
+    ktest_call(ctx, args, false)
+}
+
+/// MC-8a: `ktest` as the gate runs it (Safe class only).
+pub(crate) fn ktest_safe_tool(ctx: &ToolContext, args: &Json) -> ToolResult {
+    ktest_call(ctx, args, true)
+}
+
+fn ktest_call(ctx: &ToolContext, args: &Json, safe_only: bool) -> ToolResult {
     let filter = opt_str(args, "filter")?.unwrap_or("");
     if filter.len() > 4096 || filter.chars().any(char::is_control) {
         return Err(bad("filter"));
     }
     let hardware = !hal::cpu::detect().hypervisor;
-    run(ctx, filter, hardware, pci::registry::opted_in("wlan"))
+    run_with(ctx, filter, hardware, pci::registry::opted_in("wlan"), safe_only)
 }
 
 mcp_tool!(
@@ -190,5 +213,12 @@ mod tests {
         assert!(matches!(verdict(Class::Audible, true, true), Verdict::Refuse(_)));
         assert_eq!(verdict(Class::QemuOnly, false, false), Verdict::Run);
         assert_eq!(verdict(Class::Display, false, false), Verdict::Run);
+        // Georg 30.10.: a program tree's tests run on the Mini-PC only, never under QEMU.
+        assert_eq!(verdict(Class::Program, true, false), Verdict::Run);
+        assert!(matches!(verdict(Class::Program, false, false), Verdict::Skip(_)));
+        // The kernel's ktest boot draws the same line.
+        assert!(Class::Program.runs_here(false, false) && !Class::Program.runs_here(true, false) && !Class::Program.runs_here(true, true));
+        assert!(Class::QemuOnly.runs_here(true, false) && !Class::QemuOnly.runs_here(true, true) && !Class::QemuOnly.runs_here(false, false));
+        assert!(Class::Safe.runs_here(false, false) && Class::Safe.runs_here(true, true));
     }
 }

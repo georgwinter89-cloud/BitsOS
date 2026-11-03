@@ -609,25 +609,50 @@ impl Buddy {
     /// `deep`: may take the reserve (always true in effect while no reclaimer is installed: the reserve is 0).
     #[inline(always)]
     fn grab(&self, order: u32, zone: Zone, kind: Kind, deep: bool) -> Option<u64> {
+        for attempt in 0..2 {
+            if let Some(p) = self.take_free(order, zone, kind, deep) {
+                return Some(p);
+            }
+            if attempt == 0 {
+                // PF-5: frames past their grace period go back next to the per-CPU lists (never for the heap,
+                // whose lock may be held: the drops free heap memory).
+                let graced = kind != Kind::Heap && crate::grace::drain() > 0;
+                if self.drain_all() == 0 && !graced {
+                    break;
+                }
+                self.reports().drain();
+            }
+        }
+        None
+    }
+
+    /// PF-5: the last step before out-of-memory: frames that only wait for a grace period are waited for
+    /// (bounded, within the allocation's `budget`, `grace::expedite_with`) and the allocation tried once more,
+    /// the reserve included. Not for the heap here (its magazine lock may be held: the heap drains itself
+    /// after it let go, `KernelHeap::alloc`) and not in an interrupt handler (`expedite` answers 0 there).
+    #[cold]
+    fn alloc_after_grace(&self, order: u32, zone: Zone, kind: Kind, budget: &mut crate::grace::WaitBudget) -> Option<u64> {
+        if kind == Kind::Heap || crate::grace::pending_bytes() == 0 {
+            return None;
+        }
+        crate::grace::expedite_with(budget);
+        self.grab(order, zone, kind, true)
+    }
+
+    /// One pass over the zones of `zone`, from what is free now (this CPU's list, then the buddy lists).
+    #[inline(always)]
+    fn take_free(&self, order: u32, zone: Zone, kind: Kind, deep: bool) -> Option<u64> {
         let tries: &[usize] = match zone {
             Zone::Dma32 => &[0],
             Zone::Normal => &[1, 0],
         };
-        for attempt in 0..2 {
-            for &z in tries {
-                if let Some(pfn) = self.alloc_in(z, order, kind, deep) {
-                    if z != zone_index(zone) {
-                        self.reports().fallback();
-                    }
-                    self.used[kind as usize].fetch_add(1 << order, Relaxed);
-                    return Some(pfn * PAGE);
+        for &z in tries {
+            if let Some(pfn) = self.alloc_in(z, order, kind, deep) {
+                if z != zone_index(zone) {
+                    self.reports().fallback();
                 }
-            }
-            if attempt == 0 {
-                if self.drain_all() == 0 {
-                    break;
-                }
-                self.reports().drain();
+                self.used[kind as usize].fetch_add(1 << order, Relaxed);
+                return Some(pfn * PAGE);
             }
         }
         None
@@ -643,12 +668,24 @@ impl FrameAlloc for Buddy {
         if let Some(p) = self.grab(order, zone, kind, false) {
             return Some(p);
         }
-        // MM-9: only after both attempts and the drain failed (the fast path is unchanged).
-        if let Some(p) = self.alloc_reclaiming(order, zone, kind) {
+        // MM-9: only after both attempts and the drain failed (the fast path is unchanged). PF-5: one wait budget
+        // for the reclaim rounds and the last step (at most one bounded wait runs out per allocation, B4).
+        let mut budget = crate::grace::WaitBudget::default();
+        if let Some(p) = self.alloc_reclaiming(order, zone, kind, &mut budget) {
+            return Some(p);
+        }
+        if let Some(p) = self.alloc_after_grace(order, zone, kind, &mut budget) {
             return Some(p);
         }
         self.reports().alloc_fail(order, zone_index(zone));
         None
+    }
+
+    fn alloc_light(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64> {
+        if order > MAX_ORDER {
+            return None;
+        }
+        self.take_free(order, zone, kind, false)
     }
 
     fn free(&self, phys: u64, order: u32, kind: Kind) {
@@ -666,6 +703,7 @@ impl FrameAlloc for Buddy {
             s.used_by_kind[k] = u.load(Relaxed) * PAGE;
         }
         s.leaked_bytes = self.leaked.load(Relaxed) * PAGE;
+        s.pending_bytes = crate::grace::pending_bytes().min(s.used_by_kind.iter().sum());
         s
     }
 }

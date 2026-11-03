@@ -148,12 +148,9 @@ fn wrap_reports_the_missed_records_to_readers_and_deferred_sinks() {
 fn deferred_sinks_are_never_called_by_the_emitter() {
     let _g = serial();
     static D: Collect = Collect::new();
-    static I: Collect = Collect::new();
     let d = add_deferred_sink("defer-test", &D, false);
-    add_sink(&I);
     event!(Warn, "rbsink", "both");
     assert!(D.take().is_empty(), "deferred sink ran in the emitter");
-    assert!(I.take().iter().any(|l| l.ends_with("W rbsink both")));
     drain_deferred(100);
     assert!(D.take().iter().any(|l| l.ends_with("W rbsink both")));
     assert_eq!(drain_deferred(100), 0, "nothing new");

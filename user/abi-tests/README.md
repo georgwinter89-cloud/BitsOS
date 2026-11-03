@@ -16,8 +16,11 @@ Rules for a program (so a difference always means a kernel difference):
 - print results, errno names and yes/no relations, never pids, addresses, absolute times, CPU or memory
   counts, or anything the host's limits or users decide (lower a limit to a known value first);
 - clean up what it creates (files in `/tmp` named with the pid);
-- never let a signal reach a handler until AB-6 delivers signals in V2;
 - keep stdin small (below 32 KiB).
+
+One deliberate exception: `abi-pfread bench` (PF-1, the read-path benchmark for the desk; plan/notes/fs-PF-1.md)
+prints times, cycles and rates. Only its deterministic `check` mode has a line in `cases.txt`; never add `bench`
+(or `clean`) there.
 
 Commands: `cargo xtask abi-diff` (all), `cargo xtask abi-diff abi-time` (one program's cases),
 `cargo xtask abi-diff --host-only` (CachyOS only, prints the transcripts: for writing a new program).

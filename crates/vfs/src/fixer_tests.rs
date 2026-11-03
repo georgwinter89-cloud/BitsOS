@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use uapi::errno::*;
 
 fn sys_for<'a>(mem: &'a Mem, fds: &'a FdTable, ns: &'a Arc<MountNs>) -> Sys<'a> {
-    Sys { mem, fds, ns, cred: USER, subject: SUBJECT }
+    Sys { mem, fds, fs: alloc::boxed::Box::leak(alloc::boxed::Box::new(crate::fd::FsState::new())), ns, cred: USER, subject: SUBJECT }
 }
 
 fn call(s: &Sys<'_>, nr: usize, a: [u64; 6]) -> i64 {

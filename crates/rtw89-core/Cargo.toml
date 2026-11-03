@@ -71,3 +71,6 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
   "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "socket-udp", "socket-icmp",
   "socket-dhcpv4", "auto-icmp-echo-reply", "iface-neighbor-cache-count-64", "assembler-max-segment-count-8",
 ] }
+
+[lints]
+workspace = true

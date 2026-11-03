@@ -315,12 +315,12 @@ enum Verdict {
     Pass,
 }
 
-fn judge(p: &Arc<crate::pagecache::CachePage>, only_preloaded: bool) -> Verdict {
+fn judge(p: &crate::cache_view::PageRef<'_>, only_preloaded: bool) -> Verdict {
     let st = p.state();
     if only_preloaded && st != PRELOADED {
         return Verdict::Pass;
     }
-    if Arc::strong_count(p) > 1 {
+    if p.strong_count() > 1 {
         return Verdict::Held;
     }
     if p.is_dirty() {
@@ -338,9 +338,16 @@ fn judge(p: &Arc<crate::pagecache::CachePage>, only_preloaded: bool) -> Verdict 
 fn apply(g: &mut Inner, i: u64, v: Verdict, out: &mut Outcome) -> bool {
     match v {
         Verdict::Take(st) => {
-            // The index held the only reference (checked under this lock, which every new reference takes):
-            // dropping it frees the frame now.
-            drop(g.pages.remove(i));
+            // The index holds the only reference (PF-4: checked again under the index's write side, which a
+            // locked reader's new reference waits for; a reader may have taken one since `judge`): dropping it
+            // frees the frame after a grace period (PF-5: lockless readers may still copy from it; the
+            // allocator waits for that before it retries, `grace::expedite`).
+            let Some(page) = g.pages.take_alone(i) else {
+                out.held += 1;
+                return false;
+            };
+            // Never waits here (this cache's lock is held; the allocation or kswapd waits afterwards).
+            page.drop_nowait();
             out.freed += 1;
             if st == PRELOADED {
                 out.preloaded += 1;
@@ -365,7 +372,7 @@ fn sweep_preloaded(g: &mut Inner, want: u64, budget: &mut u64, out: &mut Outcome
     let mut left: Option<u64> = None;
     let mut at_end = false;
     while out.freed < want && *budget > 0 {
-        let Some((i, v)) = g.pages.next_from(pos).map(|(i, p)| (i, judge(p, true))) else {
+        let Some((i, v)) = g.pages.next_with(pos, |_, p| judge(p, true)) else {
             at_end = true;
             break;
         };
@@ -391,8 +398,8 @@ fn sweep_preloaded(g: &mut Inner, want: u64, budget: &mut u64, out: &mut Outcome
 fn clock(g: &mut Inner, want: u64, budget: &mut u64, turns: &mut u64, out: &mut Outcome) {
     let mut pos = g.clock;
     while *turns > 0 && out.freed < want && *budget > 0 {
-        let next = g.pages.next_from(pos).or_else(|| g.pages.next_from(0));
-        let Some((i, v)) = next.map(|(i, p)| (i, judge(p, false))) else {
+        let next = g.pages.next_with(pos, |_, p| judge(p, false)).or_else(|| g.pages.next_with(0, |_, p| judge(p, false)));
+        let Some((i, v)) = next else {
             *turns = 0;
             break;
         };
@@ -496,8 +503,9 @@ pub fn file_pages() -> u64 {
 }
 
 /// `/proc/meminfo` MemAvailable in bytes (`mm_core::reclaim::mem_available` over the frame allocator's numbers
-/// and `file_pages`); 0 without a frame allocator (host tests).
+/// and `file_pages`); 0 without a frame allocator (host tests). PF-5: frames that wait for a grace period count
+/// as free (they left `file_pages` when they left the index, `CachePage::account_out`).
 pub fn mem_available_bytes() -> u64 {
     let Some(s) = mm_core::frames().map(|f| f.stats()) else { return 0 };
-    mm_core::reclaim::mem_available(s.total_bytes, s.free_bytes, file_pages().saturating_mul(4096))
+    mm_core::reclaim::mem_available(s.total_bytes, s.free_bytes.saturating_add(s.pending_bytes), file_pages().saturating_mul(4096))
 }

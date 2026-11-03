@@ -109,7 +109,8 @@ impl Field {
             .saturating_add((n as u64).saturating_mul(self.size as u64))
     }
 
-    /// Whether this field lies inside collection `c` (directly or nested).
+    /// Whether this field lies inside collection `c` (directly or nested). Used by the V1-parity and fuzz tests,
+    /// which pin it on purpose (C1).
     pub fn is_inside(&self, collections: &[Collection], c: usize) -> bool {
         match (self.collection, collections.get(c)) {
             (Some(i), Some(col)) => i >= c && i < col.end,
@@ -160,14 +161,15 @@ impl ReportDescriptor {
         self.reports.iter().filter(move |r| r.kind == kind)
     }
 
-    /// Every field of every report, in declaration order.
+    /// Every field of every report, in declaration order (the V1-parity tests pin V1's order with it, C1).
     pub fn fields_in_order(&self) -> Vec<&Field> {
         let mut all: Vec<&Field> = self.reports.iter().flat_map(|r| r.fields.iter()).collect();
         all.sort_by_key(|f| f.seq);
         all
     }
 
-    /// The first application collection that is a Joystick or Gamepad (Generic Desktop 4 or 5).
+    /// The first application collection that is a Joystick or Gamepad (Generic Desktop 4 or 5): V1's pad, which
+    /// the V1-parity tests pin on purpose (C1).
     pub fn first_gamepad(&self) -> Option<usize> {
         self.collections.iter().position(|c| {
             c.kind == collection::APPLICATION && matches!(c.usage, 0x0001_0004 | 0x0001_0005)

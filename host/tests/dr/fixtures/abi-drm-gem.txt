@@ -1,0 +1,136 @@
+amdgpu render node: found
+CREATE size 0 = -errno 28
+CREATE unknown flag 1<<30 = -EINVAL
+CREATE unknown domain 0x80 = -EINVAL
+CREATE domain bit 32 = -EINVAL
+CREATE GDS always valid = -EINVAL
+CREATE GDS 2^40 entries = -errno 28
+CREATE GTT 2^62 = -ENOMEM
+CREATE VRAM 2^62 = -ENOMEM
+CREATE VRAM|GTT 2^62 = -ENOMEM
+CREATE size 1 align 0 domains 2 flags 0 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=2 flags=0
+CREATE size 4097 align 1 domains 2 flags 0x4 = 0
+  handle > 0: yes
+  info size=8192 align=4096 domains=2 flags=0x4
+CREATE size 12288 align 12288 domains 2 flags 0x80 = 0
+  handle > 0: yes
+  info size=12288 align=12288 domains=2 flags=0x80
+CREATE size 4096 align 65536 domains 4 flags 0x1 = 0
+  handle > 0: yes
+  info size=4096 align=65536 domains=4 flags=0
+CREATE size 4096 align 4096 domains 6 flags 0 = 0
+  handle > 0: yes
+  info size=4096 align=4096 domains=6 flags=0
+CREATE size 4096 align 0 domains 1 flags 0 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=1 flags=0
+CREATE size 4096 align 0 domains 0 flags 0 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=0 flags=0
+CREATE size 4096 align 0 domains 2 flags 0x2 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=2 flags=0x2
+mmap of a file without objects = EINVAL
+MMAP GTT object = 0
+MMAP VRAM object = 0
+offsets at 4 GiB or above, page-aligned, distinct: yes
+MMAP no CPU access = -EPERM
+MMAP no CPU access gives offset 0: yes
+MMAP unknown handle = -ENOENT
+MMAP unknown handle gives 0: yes
+mmap of the GTT object: yes
+new object reads zero: yes
+a CPU fault remembers CPU access: yes
+a second mapping sees the bytes: yes
+mmap of the VRAM object: yes
+VRAM object keeps a byte: yes
+mmap inside an object = EINVAL
+mmap past an object = EINVAL
+mmap of another file's object = EACCES
+mmap of an offset no object has = EINVAL
+WAIT_IDLE idle, timeout 0 = 0
+WAIT_IDLE status=0 domain=0
+WAIT_IDLE idle, no timeout = 0
+WAIT_IDLE status=0
+WAIT_IDLE unknown handle = -ENOENT
+METADATA unknown handle = -ENOENT
+METADATA GET fresh = 0
+METADATA fresh tiling=0 size=0 flags=0 data0=0x5a5a5a5a
+METADATA SET 300 bytes = -EINVAL
+METADATA SET 6 bytes = 0
+METADATA GET = 0
+METADATA tiling=0x1234000000001b size=6 flags=0x5 data0=0x11223344 data1=0x5a5a7788 data2=0x5a5a5a5a
+METADATA SET 0 bytes = 0
+METADATA after clear size=0 flags=0x5 tiling=0
+METADATA unknown op = 0
+OP unknown handle = -ENOENT
+OP unknown op = -EINVAL
+OP GET_GEM_CREATE_INFO kernel pointer = -EFAULT
+OP GET_GEM_CREATE_INFO unmapped pointer = -EFAULT
+METADATA unmapped argument = -EFAULT
+OP unmapped argument = -EFAULT
+OP SET_PLACEMENT VRAM = 0
+OP after SET_PLACEMENT VRAM domains=4
+OP SET_PLACEMENT 0xff = 0
+OP after SET_PLACEMENT 0xff domains=7
+USERPTR unaligned address = -EINVAL
+USERPTR unaligned size = -EINVAL
+USERPTR unknown flag = -EINVAL
+USERPTR writable without REGISTER = -EACCES
+USERPTR size 0 = -errno 28
+GEM_CLOSE = 0
+GEM_CLOSE again = -EINVAL
+METADATA after close = -ENOENT
+PRIME_HANDLE_TO_FD bad flags = -EINVAL
+PRIME_HANDLE_TO_FD unknown handle = -ENOENT
+PRIME_HANDLE_TO_FD = 0
+fd >= 0, close-on-exec: yes
+lseek SEEK_END is the size: yes
+PRIME_HANDLE_TO_FD again (no CLOEXEC) = 0
+two fds, one buffer (same inode): yes
+second fd without close-on-exec: yes
+open for reading and writing: yes
+dma-buf fdinfo size:	12288
+dma-buf fdinfo exp_name:	drm
+SET_NAME_B = 0
+poll idle buffer = 1
+poll revents=0x5
+PRIME_FD_TO_HANDLE own export = 0
+the same handle back: yes
+PRIME_FD_TO_HANDLE second fd = 0
+the same handle again: yes
+PRIME_FD_TO_HANDLE in a second file = 0
+the second file sees the object: yes
+PRIME_FD_TO_HANDLE in the second file again = 0
+same handle in the second file: yes
+mmap of the dma-buf: yes
+mmap of the object through the second file: yes
+both mappings are one memory: yes
+PRIME_FD_TO_HANDLE after every handle went = 0
+a handle again: yes
+WAIT_IDLE on the imported object = 0
+the object kept its bytes: yes
+PRIME_HANDLE_TO_FD read-only = 0
+open for reading only: yes
+writable mmap of a read-only export = EACCES
+a later RDWR export shares the read-only file: yes
+PRIME_HANDLE_TO_FD always-valid object = -EPERM
+PRIME_HANDLE_TO_FD no-CPU object = 0
+mmap of a no-CPU export = EPERM
+PRIME_FD_TO_HANDLE fd -1 = -EBADF
+PRIME_FD_TO_HANDLE /dev/null = -EINVAL
+PRIME_FD_TO_HANDLE pipe = -EINVAL
+PRIME_FD_TO_HANDLE udmabuf = 0
+PRIME_FD_TO_HANDLE udmabuf again = 0
+same handle for the udmabuf: yes
+udmabuf object size=8192 align=4096 domains=2 flags=0
+SET_PLACEMENT VRAM on an import = -EINVAL
+SET_PLACEMENT GTT on an import = 0
+PRIME_HANDLE_TO_FD of the import = 0
+re-export gives the udmabuf itself: yes
+dma-buf fdinfo size:	8192
+dma-buf fdinfo exp_name:	udmabuf
+GEM_FLINK on a render node = -EACCES
+GEM_OPEN on a render node = -EACCES

@@ -47,8 +47,8 @@ pub fn set_commit(c: &'static dyn Commit) {
     klog::event!(Info, "vfs", "pool.commit_hook"; "tmpfs charges now go to the system-wide commit");
 }
 
-/// The built-in system pool (until MM-5b's commit): pages charged by all tmpfs files' data and metadata (the
-/// one counter the limit applies to)...
+/// The built-in system pool (until `set_commit` hands tmpfs to MM-5b's commit at boot; host tests keep it):
+/// pages charged by all tmpfs files' data and metadata (the one counter the limit applies to)...
 static SYS_PAGES: AtomicU64 = AtomicU64::new(0);
 /// ... of them for data ...
 static CHARGED: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +102,7 @@ pub fn limit_for(total: u64) -> u64 {
     ((total - keep) / PAGE).max(1)
 }
 
-/// Tests and FS-1's hook: the system pool's limit in pages (None: measure again).
+/// Test knob (CONTRACTS §7a, tmpfs pool probes): the system pool's limit in pages (None: measure again).
 pub fn set_system_limit(pages: Option<u64>) {
     LIMIT.store(pages.unwrap_or(0), Ordering::Relaxed);
     POOL_FULL.store(false, Ordering::Relaxed);
@@ -113,12 +113,12 @@ pub fn system_limit() -> u64 {
     measured_limit()
 }
 
-/// Pages charged to the system pool by all tmpfs files' data.
+/// Pages charged to the system pool by all tmpfs files' data (test probe, CONTRACTS §7a).
 pub fn system_charged() -> u64 {
     CHARGED.load(Ordering::Relaxed)
 }
 
-/// Pages charged to the system pool for tmpfs metadata (inodes, names).
+/// Pages charged to the system pool for tmpfs metadata (inodes, names) (test probe, CONTRACTS §7a).
 pub fn system_meta() -> u64 {
     META_PAGES.load(Ordering::Relaxed)
 }

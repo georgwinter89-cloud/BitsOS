@@ -12,3 +12,4 @@ __pycache__/
 # the stick ID of your own stick (cargo xtask stick)
 /stick.id
 /plan/
+/user/ports/mesa/out/

@@ -61,15 +61,6 @@ static REPORT: SpinLock<Option<Report>> = SpinLock::named("mm.tables_report", No
 static RAM: SpinLock<Vec<(u64, u64)>> = SpinLock::named("mm.tables_ram", Vec::new());
 /// The GOP framebuffer as the switch found it: (virt, phys, size).
 static FB: SpinLock<Option<(u64, u64, u64)>> = SpinLock::named("mm.tables_fb", None);
-/// The BSP's raw MTRRs the direct map was planned with.
-static MTRR_REGS: SpinLock<Option<hal::pat::MtrrRegs>> = SpinLock::named("mm.tables_mtrrs", None);
-
-/// The BSP's MTRR snapshot the direct map and the vmap large-page decisions rest on (`None` before the switch
-/// or without MTRRs). CP-4 compares each AP's `hal::pat::read_mtrrs()` with it (core.md §11 trap 12).
-pub fn mtrr_snapshot() -> Option<hal::pat::MtrrRegs> {
-    MTRR_REGS.lock().clone()
-}
-
 /// What the switch did (`None` before it).
 pub fn report() -> Option<Report> {
     *REPORT.lock()
@@ -206,7 +197,6 @@ fn build(ram: &[(u64, u64)], all_ram: &[(u64, u64)], sections: Option<&KernelSec
     if let Some(r) = regs {
         klog::event!(Info, "mm", "mtrr", enabled = mtrrs.enabled(), default = mtrr::type_name(mtrrs.default_type()), variable = r.var.len(),
             valid = mtrrs.variable_ranges(), phys_bits = r.phys_bits, tom2 = klog::Hex(r.tom2.unwrap_or(0)));
-        *MTRR_REGS.lock() = Some(r);
     }
     Ok(rep)
 }

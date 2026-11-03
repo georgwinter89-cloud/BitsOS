@@ -19,7 +19,7 @@ use winit::window::{Window, WindowId};
 use super::Backend;
 use super::hostshm::HostShm;
 use crate::input::InputEvent;
-use crate::render::Compositor;
+use crate::render::Picture;
 use crate::state::App;
 
 struct Pump {
@@ -119,13 +119,13 @@ impl Backend for Winit {
                         continue;
                     }
                     if let Some(code) = event.physical_key.to_scancode() {
-                        app.handle_input(InputEvent::Key { code, pressed });
+                        real(app, InputEvent::Key { code, pressed });
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    app.handle_input(InputEvent::Motion { x: position.x, y: position.y })
+                    real(app, InputEvent::Motion { x: position.x, y: position.y })
                 }
-                WindowEvent::MouseInput { state, button, .. } => app.handle_input(InputEvent::Button {
+                WindowEvent::MouseInput { state, button, .. } => real(app, InputEvent::Button {
                     code: button_code(button),
                     pressed: state == ElementState::Pressed,
                 }),
@@ -134,7 +134,7 @@ impl Backend for Winit {
                         MouseScrollDelta::LineDelta(_, y) => -y as f64,
                         MouseScrollDelta::PixelDelta(p) => -p.y / 15.0,
                     };
-                    app.handle_input(InputEvent::Wheel { steps });
+                    real(app, InputEvent::Wheel { steps });
                 }
                 WindowEvent::RedrawRequested => app.needs_frame = true,
                 _ => {}
@@ -148,11 +148,11 @@ impl Backend for Winit {
         }
     }
 
-    fn present(&mut self, comp: &Compositor, damage: &[Rectangle<i32, Physical>]) {
+    fn present(&mut self, comp: &dyn Picture, damage: &[Rectangle<i32, Physical>]) {
         self.shm.present(comp, damage);
     }
 
-    fn flush(&mut self, comp: &Compositor) {
+    fn flush(&mut self, comp: &dyn Picture) {
         self.shm.flush(comp);
     }
 
@@ -169,4 +169,9 @@ impl Backend for Winit {
         // SAFETY: the host connection lives as long as the window, which lives until the process ends.
         Some(unsafe { BorrowedFd::borrow_raw(fd) })
     }
+}
+
+/// The host's own keyboard and mouse (nested on CachyOS): real input.
+fn real(app: &mut App, ev: InputEvent) {
+    app.handle_input_as(ev, crate::input::Origin::Physical);
 }

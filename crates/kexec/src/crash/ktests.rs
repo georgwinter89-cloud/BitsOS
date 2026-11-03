@@ -291,6 +291,9 @@ fn record_page() -> TestResult {
 ktest!("rb.crash.record_page", QemuOnly, record_page);
 
 fn log_tail() -> TestResult {
+    if klog::Level::Info > klog::level_for("crash") {
+        return ktest::skip("crash Info records are not kept at this loglevel");
+    }
     let id = time::now_ns();
     klog::event!(Info, "crash", "ktest.tail", id = id);
     let mut buf = [0u8; 1024];
@@ -358,6 +361,107 @@ fn forced() -> TestResult {
 }
 ktest!("rb.crash.forced", QemuOnly, forced);
 
+// RB-12: the NMI backtrace path under load (kernel threads only; `ktests_nmi_user.rs` has the user-code and the
+// nested-NMI tests). Every other CPU is sampled many rounds while kernel threads sit at a deep stack and threads
+// start and exit: each sample is fresh and bounded and walks kernel addresses only. It passes on the code before
+// RB-12 as well (the walker was already fault-free); it guards the walk, it does not reproduce the 26.10. crash.
+// QemuOnly (many threads, hard sampling).
+static DEEP_SPIN: AtomicBool = AtomicBool::new(false);
+static DEEP_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+// Recurses about `frames` deep (~300 bytes a frame in the debug build: 100 frames stay far from the 64 KiB
+// stack's guard), then spins until released; black_box keeps every frame.
+#[inline(never)]
+fn deep_recurse(frames: u32) {
+    let mut pad = [0u64; 32];
+    core::hint::black_box(&mut pad);
+    if frames > 0 {
+        deep_recurse(frames - 1);
+        core::hint::black_box(&pad);
+        return;
+    }
+    DEEP_LIVE.fetch_add(1, Ordering::AcqRel);
+    let end = time::now_ns() + 10 * SEC;
+    while DEEP_SPIN.load(Ordering::Acquire) && time::now_ns() < end {
+        core::hint::spin_loop();
+    }
+    DEEP_LIVE.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn nmi_sample_stress() -> TestResult {
+    let n = hal::percpu::cpu_count();
+    if n < 2 {
+        return ktest::skip("one CPU: nothing to sample");
+    }
+    if !hal::nmi::prepared() {
+        return Err("the NMI slots were not prepared at boot".into());
+    }
+    // A few threads sitting at a deep kernel stack, spread over the CPUs.
+    DEEP_SPIN.store(true, Ordering::Release);
+    let mut deep = alloc::vec::Vec::new();
+    let me = hal::percpu::this_cpu();
+    // Not on this CPU: a Normal spinner there would starve the sampler.
+    for i in (0..n).filter(|&c| c != me).take(6) {
+        let mut o = sched::SpawnOpts::default();
+        o.cpu = Some(i);
+        o.pin = true;
+        match sched::spawn_with("rb12-deep", sched::Class::Normal, o, move || deep_recurse(100)) {
+            Ok(h) => deep.push(h),
+            Err(e) => {
+                DEEP_SPIN.store(false, Ordering::Release);
+                return Err(format!("spawn deep: {e:?}"));
+            }
+        }
+    }
+    let t0 = time::now_ns();
+    while DEEP_LIVE.load(Ordering::Acquire) < deep.len() && time::now_ns() - t0 < 3 * SEC {
+        sched::sleep_ns(MS);
+    }
+    // Many sample rounds while short-lived threads start and exit under us (thread-exit churn).
+    let mut rounds = 0u32;
+    let mut frames_seen = 0u64;
+    let mut full = 0u64;
+    let res = (|| -> TestResult {
+        for _ in 0..200u32 {
+            let churn = sched::spawn("rb12-churn", sched::Class::Normal, || sched::yield_now());
+            let answered: alloc::vec::Vec<u64> = (0..n).map(hal::nmi::answers).collect();
+            let r = sample_retrying_busy(2 * SEC)?;
+            kassert!(r.asked == n - 1 && r.send_failed == 0, "round {rounds}: {r:?}");
+            for c in (0..n).filter(|&c| c != me) {
+                // A fresh answer of this round, not a sample left from an earlier one.
+                kassert!(hal::nmi::answers(c) > answered[c], "round {rounds}: CPU {c} gave no fresh answer");
+                if let Some(regs) = hal::nmi::regs(c) {
+                    if regs.nsteps == hal::nmi::DEPTH {
+                        full += 1;
+                    }
+                    kassert!(regs.nsteps <= hal::nmi::DEPTH, "CPU {c}: {} steps over the bound", regs.nsteps);
+                    // Every step is a kernel address or the first trap frame; the walk never wandered off.
+                    for s in &regs.steps[..regs.nsteps] {
+                        if let Step::Call(a) | Step::Guess(a) = *s {
+                            kassert!(a >= 0xFFFF_8000_0000_0000, "CPU {c}: non-kernel return {a:#x} in the walk");
+                        }
+                    }
+                    frames_seen += regs.nsteps as u64;
+                }
+            }
+            if let Ok(h) = churn {
+                h.join_timeout(2 * SEC);
+            }
+            rounds += 1;
+        }
+        Ok(())
+    })();
+    DEEP_SPIN.store(false, Ordering::Release);
+    for h in &deep {
+        h.join_timeout(10 * SEC);
+    }
+    res?;
+    klog::event!(Info, "crash", "ktest.nmi_stress", rounds = rounds, frames = frames_seen, full = full, cpus = n);
+    kassert!(full > 0, "no sample reached the walk's bound: the deep threads were never caught deep");
+    Ok(())
+}
+ktest!("rb.crash.nmi_sample_stress", QemuOnly, nmi_sample_stress);
+
 /// With CONFIG `mirror=` the scenario wants the report on its listener: wait (up to 60 s) until klogd says the
 /// mirror is live (DHCP done), so the panic's lines can leave through its emergency path.
 fn wait_for_mirror() -> TestResult {
@@ -397,3 +501,34 @@ fn check_previous(p: &Previous, kind: u64) -> TestResult {
     klog::event!(Info, "crash", "ktest.previous_ok", kind = kind, lines = t.lines().count(), cpus = p.header.cpus_asked + 1);
     Ok(())
 }
+
+/// GX-7f CR-1 (INT-W25): a driver note lands in a slot below the marker, a second one with the same tag replaces
+/// it (no second slot), and the marker stays. Rerunnable: the test tag always reuses its slot and ends empty.
+fn driver_note() -> TestResult {
+    let Some((_, len)) = hal::panic::crash_page() else {
+        return ktest::skip("no crash page in BootInfo");
+    };
+    let len = len as usize;
+    let tag = u32::from_le_bytes(*b"TEST");
+    let before = live_marker()?;
+    let mine = |page: &[u8]| {
+        (0..notes::area(len) / notes::SLOT)
+            .filter_map(|i| {
+                let o = notes::slot_offset(len, record::MARKER, i);
+                notes::parse(&my_boot_id(), &page[o..o + notes::SLOT]).filter(|n| n.tag == tag).map(|n| n.data.to_vec())
+            })
+            .collect::<Vec<_>>()
+    };
+    kassert!(hand_on_note(tag, b"first"), "first note");
+    kassert!(hand_on_note(tag, b"second note"), "replacing note");
+    let mut page = alloc::vec![0u8; len];
+    kassert!(hal::panic::crash_page_read(0, &mut page));
+    let got = mine(&page);
+    kassert!(got == alloc::vec![b"second note".to_vec()], "one slot with the newest note: {got:?}");
+    kassert!(!hand_on_note(tag, &[0u8; notes::MAX_DATA + 1]), "too long");
+    kassert!(!hand_on_note(0, b"x"), "tag 0");
+    kassert!(hand_on_note(tag, &[]), "emptied");
+    kassert!(live_marker()? == before, "the marker stays");
+    Ok(())
+}
+ktest!("rb.crash.driver_note", Safe, driver_note);

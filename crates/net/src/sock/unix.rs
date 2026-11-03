@@ -17,6 +17,7 @@ use super::abi::*;
 use super::addr::{self, UnixName, UnixTarget};
 use super::unix_gc::InFlight;
 use super::{Caller, Deadline, Opts, Received, Source, Ucred, flag, wait};
+use crate::netns::Net;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -135,10 +136,30 @@ pub struct UnixSock {
     pub(crate) opts: Opts,
     /// How often this socket's open file sits in a queue (the collector's count).
     pub(crate) inflight: AtomicUsize,
+    /// NW-11: the network namespace it was made in (abstract names are looked up and bound there).
+    net: Net,
 }
 
-/// Abstract names, one name space per socket type: (type, name bytes) -> socket.
-static ABSTRACT: SpinLock<BTreeMap<(UType, Vec<u8>), Weak<UnixSock>>> = SpinLock::named("net.unix.abstract", BTreeMap::new());
+/// Abstract names of one network namespace, one name space per socket type: (type, name bytes) -> socket
+/// (NW-11: per namespace as Linux's `unix_table` in `struct net`, linux-6.6/net/unix/af_unix.c:370).
+pub(crate) struct Names(SpinLock<BTreeMap<(UType, Vec<u8>), Weak<UnixSock>>>);
+
+impl Names {
+    pub(crate) const fn new() -> Names {
+        Names(SpinLock::named("net.unix.abstract", BTreeMap::new()))
+    }
+}
+
+/// The initial namespace's abstract names.
+static ABSTRACT: Names = Names::new();
+
+/// The abstract names of namespace `net`.
+fn names(net: &Net) -> &SpinLock<BTreeMap<(UType, Vec<u8>), Weak<UnixSock>>> {
+    match net {
+        None => &ABSTRACT.0,
+        Some(v) => &v.unix.0,
+    }
+}
 /// Path names: the socket inode's address -> socket (Linux `unix_find_socket_byinode`).
 static BSD: SpinLock<BTreeMap<usize, Weak<UnixSock>>> = SpinLock::named("net.unix.bsd", BTreeMap::new());
 static AUTO_NEXT: AtomicU32 = AtomicU32::new(0);
@@ -211,7 +232,7 @@ fn mknod_sock(ctx: &vfs::Ctx<'_>, path: &[u8]) -> Result<vfs::Path, Errno> {
             }
             None => {}
         }
-        if dir.mnt.readonly {
+        if dir.mnt.is_readonly() {
             return Err(EROFS);
         }
         if dir.dentry.is_dead_dir() {
@@ -244,7 +265,7 @@ fn mknod_sock(ctx: &vfs::Ctx<'_>, path: &[u8]) -> Result<vfs::Path, Errno> {
 }
 
 /// `unix_find_other`: the socket a name stands for, of type `ty`.
-fn find(name: &UnixName, ty: UType, ctx: Option<&vfs::Ctx<'_>>, caller: &Caller) -> Result<Arc<UnixSock>, Errno> {
+fn find(name: &UnixName, ty: UType, net: &Net, ctx: Option<&vfs::Ctx<'_>>, caller: &Caller) -> Result<Arc<UnixSock>, Errno> {
     if let Some(a) = name.abstract_name() {
         if caller.subject != policy::Subject::KERNEL
             && policy::check(&caller.subject, &policy::Access::NetConnect { proto: policy::NetProto::Unix, addr: policy::IpAddr::V4([0; 4]), port: 0 }).is_err()
@@ -252,7 +273,7 @@ fn find(name: &UnixName, ty: UType, ctx: Option<&vfs::Ctx<'_>>, caller: &Caller)
             return Err(EACCES);
         }
         let _ = a;
-        return ABSTRACT.lock().get(&(ty, name.bytes().to_vec())).and_then(|w| w.upgrade()).ok_or(ECONNREFUSED);
+        return names(net).lock().get(&(ty, name.bytes().to_vec())).and_then(|w| w.upgrade()).ok_or(ECONNREFUSED);
     }
     let ctx = ctx.ok_or(ECONNREFUSED)?;
     let path = name.path().unwrap_or_default();
@@ -282,7 +303,13 @@ fn shown(c: Option<Ucred>) -> Ucred {
 }
 
 impl UnixSock {
+    /// A socket of the initial network namespace.
     pub fn new(ty: UType) -> Arc<UnixSock> {
+        Self::new_in(ty, None)
+    }
+
+    /// A socket of network namespace `net`.
+    pub fn new_in(ty: UType, net: Net) -> Arc<UnixSock> {
         UNIX_MADE.inc();
         Arc::new(UnixSock {
             ty,
@@ -310,12 +337,17 @@ impl UnixSock {
             wmem: AtomicUsize::new(0),
             opts: Opts::new(WMEM_DEFAULT, RMEM_DEFAULT),
             inflight: AtomicUsize::new(0),
+            net,
         })
+    }
+
+    pub(crate) fn net(&self) -> &Net {
+        &self.net
     }
 
     /// `socketpair`: two connected sockets, both with the creator's credentials as peer credentials.
     pub fn pair(ty: UType, caller: &Caller) -> (Arc<UnixSock>, Arc<UnixSock>) {
-        let (a, b) = (UnixSock::new(ty), UnixSock::new(ty));
+        let (a, b) = (UnixSock::new_in(ty, caller.net.clone()), UnixSock::new_in(ty, caller.net.clone()));
         for (x, y) in [(&a, &b), (&b, &a)] {
             let mut s = x.st.lock();
             s.peer = Some(y.clone());
@@ -381,7 +413,7 @@ impl UnixSock {
                 {
                     return Err(EACCES);
                 }
-                let mut t = ABSTRACT.lock();
+                let mut t = names(&self.net).lock();
                 let mut s = self.st.lock();
                 if s.name.is_some() {
                     return Err(EINVAL);
@@ -433,7 +465,7 @@ impl UnixSock {
         let start = AUTO_NEXT.fetch_add(1, Ordering::Relaxed);
         for i in 0..=0xFFFFFu32 {
             let n = UnixName::auto(start.wrapping_add(i) & 0xFFFFF);
-            let mut t = ABSTRACT.lock();
+            let mut t = names(&self.net).lock();
             let key = (self.ty, n.bytes().to_vec());
             if t.get(&key).is_some_and(|w| w.strong_count() > 0) {
                 continue;
@@ -465,6 +497,12 @@ impl UnixSock {
 
     pub fn peercred(&self) -> Option<Ucred> {
         self.st.lock().peercred
+    }
+
+    /// NW-12: what /proc/net/unix shows of this socket (`unix_seq_show`): listening, connected, its name.
+    pub(crate) fn proc_row(&self) -> (bool, bool, Option<Vec<u8>>) {
+        let s = self.st.lock();
+        (s.state == State::Listen, s.state == State::Established, s.name.as_ref().map(|n| n.bytes().to_vec()))
     }
 
     pub fn is_listening(&self) -> bool {
@@ -530,7 +568,7 @@ impl UnixSock {
             Room,
         }
         loop {
-            let other = find(name, self.ty, ctx, caller)?;
+            let other = find(name, self.ty, &self.net, ctx, caller)?;
             let look = {
                 let o = other.st.lock();
                 if o.dead {
@@ -573,7 +611,7 @@ impl UnixSock {
                 let o = other.st.lock();
                 (o.name.clone(), o.path.clone())
             };
-            let embryo = UnixSock::new(self.ty);
+            let embryo = UnixSock::new_in(self.ty, self.net.clone());
             {
                 let mut e = embryo.st.lock();
                 e.peer = Some(self.clone());
@@ -625,7 +663,7 @@ impl UnixSock {
                 self.autobind()?;
             }
             loop {
-                let o = find(&name, self.ty, ctx, caller)?;
+                let o = find(&name, self.ty, &self.net, ctx, caller)?;
                 let mut g = o.st.lock();
                 if g.dead {
                     continue;
@@ -753,7 +791,7 @@ impl UnixSock {
         if let Some(n) = &name
             && n.is_abstract()
         {
-            let mut t = ABSTRACT.lock();
+            let mut t = names(&self.net).lock();
             let key = (self.ty, n.bytes().to_vec());
             if t.get(&key).is_some_and(|w| core::ptr::eq(w.as_ptr(), self)) {
                 t.remove(&key);
@@ -996,7 +1034,7 @@ impl UnixSock {
             let o = match &other {
                 Some(o) => o.clone(),
                 None => match &target {
-                    Some(n) => find(n, self.ty, ctx, &a.caller)?,
+                    Some(n) => find(n, self.ty, &self.net, ctx, &a.caller)?,
                     None => return Err(ECONNRESET),
                 },
             };

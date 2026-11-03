@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const WZ = process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan';
+const WZ = process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`;
 const imp = (rel) => import(pathToFileURL(`${WZ}/${rel}`).href);
 const { FakeDev, R, field, prep } = await imp('kit/rtwdev.mjs');
 const { pciAlloc } = await imp('js/pci.mjs');

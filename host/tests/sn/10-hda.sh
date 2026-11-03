@@ -7,12 +7,16 @@
 #  B: one controller, 16 CPUs, CONFIG hda_irq=off (polled) and hda_snoop=off (UC/WC DMA, or the logged fallback).
 #  C: ich9-intel-hda (8086:293E): Quiesce with a running stream and the restart, a bring-up over a running
 #     stream (QemuOnly tests).
+#  D: SN-7, the reboot's Quiesce order with the mixer streaming silence (QemuOnly).
 set -eu
 cd "$BITSOS_ROOT"
 RUN="$BITSOS_RUN_DIR"
 HERE="$BITSOS_ROOT/host/tests/sn"
 fail=0
 check() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "FAIL $3 (no '$2')"; fail=1; fi; }
+# A log line the ktest also asserts in the kernel (KTEST ok): its absence is reported, not failed. SN-12 fixer: the
+# serial log can lose its last lines when QEMU exits right after `KTEST done` (seen once in section C).
+soft() { if grep -aq -- "$2" "$1"; then echo "ok   $3"; else echo "note $3: no '$2' (log tail lost? the ktest asserts it)"; fi; }
 nocheck() { if grep -aq -- "$2" "$1"; then echo "FAIL $3:"; grep -a -- "$2" "$1" | head -5; fail=1; else echo "ok   $3"; fi; }
 
 boot() { # name smp config-extra log -- qemu args
@@ -69,12 +73,30 @@ nocheck "$LOG" ' E snd ' "B: no error events"
 
 # --- C ---
 LOG="$RUN/c.log"
-boot hda-c 4 "ktest=sn.hda.quiesce,sn.hda.stale" "$LOG" -- \
+boot hda-c 4 "ktest=sn.hda.quiesce,sn.hda.stale,sn.hda.panic_stop" "$LOG" -- \
     -audiodev "wav,id=a0,path=$RUN/hda3.wav,out.frequency=48000" \
     -device ich9-intel-hda,id=h0 -device hda-duplex,bus=h0.0,audiodev=a0
 check "$LOG" 'snd hda.probe .*device=0x293e' "C: ich9-intel-hda bound"
-check "$LOG" 'KTEST done passed=2 failed=0' "C: quiesce and stale pass"
-check "$LOG" 'snd hda.quiesced ctrl=hda0 was=up' "C: quiesce note logged after the fact"
-check "$LOG" 'W snd hda.stale_dma ctrl=hda0 streams=1' "C: running stream found and stopped at bring-up"
+check "$LOG" 'KTEST done passed=3 failed=0' "C: quiesce, stale and panic_stop pass"
+# The ktests assert these themselves (last_quiesce, last_stale, the panic report); the log lines are the record.
+for t in quiesce stale panic_stop; do check "$LOG" "KTEST ok sn.hda.$t " "C: sn.hda.$t"; done
+soft "$LOG" 'snd hda.quiesced ctrl=hda0 was=up' "C: quiesce note logged after the fact"
+# SN-12: the codec's shutdown verbs went out and were answered (QEMU's codec keeps no power state).
+soft "$LOG" 'snd hda.quiesced ctrl=hda0 was=up stuck=false codec=no_power_states' "C: codec shutdown answered"
+soft "$LOG" 'ktest hda.panic_stop ctrl=hda0 was=up stuck=false codec=no_power_states' "C: the panic path's stop"
+soft "$LOG" 'I snd hda.stale_dma ctrl=hda0 streams=1' "C: running stream found and stopped at bring-up"
 nocheck "$LOG" ' E snd ' "C: no error events"
+
+# --- D ---
+# SN-7: the reboot's Quiesce order with the mixer streaming silence (sn.mix.reboot_order, QemuOnly): the stream
+# DMA stays stopped, the mixer closes its output without reaching the controller and opens nothing again.
+LOG="$RUN/d.log"
+boot hda-d 4 "ktest=sn.mix.reboot_order" "$LOG" -- \
+    -audiodev "wav,id=a0,path=$RUN/hda4.wav,out.frequency=48000" \
+    -device intel-hda,id=h0 -device hda-duplex,bus=h0.0,audiodev=a0
+check "$LOG" 'KTEST ok sn.mix.reboot_order ' "D: sn.mix.reboot_order"
+check "$LOG" 'KTEST done passed=1 failed=0 skipped=0' "D: the reboot order passes, not skipped"
+soft "$LOG" 'ktest mix.reboot_order ctrl=hda0 streams_before=1' "D: one stream ran before the Quiesce"
+soft "$LOG" 'snd hda.quiesced ctrl=hda0 was=up stuck=false codec=no_power_states' "D: the engines were seen stopped, the codec shut down"
+nocheck "$LOG" ' E snd ' "D: no error events"
 exit $fail

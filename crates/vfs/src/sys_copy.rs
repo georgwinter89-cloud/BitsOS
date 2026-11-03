@@ -33,7 +33,8 @@ fn rw_at(s: &Sys<'_>, a: Args, pos: i64, flags: u64, write: bool) -> Result<i64,
         return Err(EINVAL);
     }
     let f = s.file(a[0])?;
-    if !f.file.seekable() {
+    // FS-16: FMODE_PREAD/FMODE_PWRITE (a seq_file has only the first).
+    if !f.file.seekable() || (write && !f.file.positional_write(f.can_write())) {
         return Err(ESPIPE);
     }
     let v = iovecs(s, a[1], a[2])?;
@@ -62,8 +63,13 @@ fn rw_at(s: &Sys<'_>, a: Args, pos: i64, flags: u64, write: bool) -> Result<i64,
         let len = len.min(allowed);
         allowed -= len;
         let at = pos + done;
+        // PF-4: a page-cache file's segment goes as pread64's does (no data lock; a fault ends it exactly at
+        // the first faulting user page, which the bounce lost a whole chunk at).
         let r = if !write {
-            read_into(s, base, len, |off, chunk| f.pread(at + off as u64, chunk))
+            match f.file.read_cache() {
+                Some(c) => crate::sys_page::read_cached(s, c, base, len, at),
+                None => read_into(s, base, len, |off, chunk| f.pread(at + off as u64, chunk)),
+            }
         } else if append {
             write_from(s, base, len, |_, chunk| f.pwrite_end(chunk).map(|x| x.0))
         } else {

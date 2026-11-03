@@ -30,6 +30,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 echo "== build bitscomp, settingsd"
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q --offline)
 (cd "$ROOT/user" && cargo build --release -q --offline -p settingsd)
+# WY-14/15: WY_GPU=1 runs this scenario with the gpu build, WY_GPU=gles with its GLES renderer (tools/gpu-host.sh).
+. "$ROOT/host/tests/wy/tools/gpu-host.sh"
 
 PIDS=()
 cleanup() {
@@ -45,9 +47,10 @@ hot() { # pattern, field: "X Y" of that field on the first hot line matching the
     [ -n "$v" ] || fail "no '$2' on a hot line matching '$1'"
     echo "$v"
 }
-reveal() { # hot pattern: the wheel over the (first shown) window's content until a line matches (down, then up)
+reveal() { # hot pattern: the wheel over the (first shown) window's content until a line matches (down, then up;
+    # INT-D1: design v2 put 40 palette, font and look rows into the theme page, so the wheel goes further)
     local xy
-    for steps in $(printf '2 %.0s' $(seq 15)) $(printf -- '-2 %.0s' $(seq 30)); do
+    for steps in $(printf '2 %.0s' $(seq 40)) $(printf -- '-2 %.0s' $(seq 80)); do
         ctl hot | grep -q -- "$1" && return 0
         xy=$(hot '^win ' content)
         ctl pointer $xy >/dev/null
@@ -93,18 +96,21 @@ compare() { # shot name
         $IMG png "$RUN/$1.ppm" "$REF/$1.png"
         echo "reference $1.png written"
     else
-        $IMG diff "$RUN/$1.ppm" "$REF/$1.png" 8 0.0002 || fail "$1 differs from host/tests/wy/ref/$1.png"
+        $IMG diff "$RUN/$1.ppm" "$REF/$1.png" ${GPU_TOL:-8 0.0002} || fail "$1 differs from host/tests/wy/ref/$1.png"
     fi
 }
 same() { $IMG diff "$RUN/$1.ppm" "$RUN/$2.ppm" 0 0 >/dev/null || fail "$1 is not the same picture as $2"; }
 differs() { ! $IMG diff "$RUN/$1.ppm" "$RUN/$2.ppm" 0 0 >/dev/null || fail "$1 looks like $2"; }
 type_keys() { ctl key "$@" >/dev/null; }
 start_comp() { # extra args...
-    "$BIN" --backend headless --size 2000x1125 --socket "$SOCK" --mcp none "$@" >>"$RUN/bitscomp.log" 2>&1 &
+    "${START[@]}" --backend headless --size 2000x1125 --socket "$SOCK" --mcp none "$@" >>"$RUN/bitscomp.log" 2>&1 &
     COMP=$!
     PIDS+=("$COMP")
     for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/$SOCK.ctl" ] && break; sleep 0.1; done
+    gpu_host_check "$RUN/bitscomp.log" "$COMP"
     wait_for "end" ctl list "no control socket"
+    # DS-3: the settings page is checked in the classic preset (theme.layout.preset); without settingsd it is local.
+    ctl set theme.layout.preset classic >/dev/null
 }
 
 echo "== settingsd on the host"
@@ -114,6 +120,7 @@ mkdir -p "$RUN/stick" "$RUN/fallback" "$RUN/sys"
 PIDS+=($!)
 for _ in $(seq 50); do [ -S "$SETTINGS_SOCKET" ] && break; sleep 0.1; done
 [ -S "$SETTINGS_SOCKET" ] || fail "settingsd did not start"
+"$SD" set theme.layout.preset classic >/dev/null || fail "settingsd has no theme.layout.preset (CR DS-3-2)"
 
 echo "== bitscomp 2000x1125 at 125 %, the page einstellungen/aussehen as a tab"
 start_comp --settings "$SETTINGS_SOCKET" --fixed-status
@@ -143,14 +150,14 @@ wait_for 'msg="Akzentfarbe: Geändert"' ctl page "no answer line for the swatch"
 shot amber
 differs amber settings-dark
 click 'page pid=.* undo'
-wait_get theme.accent '#00e5ff'
-wait_for "accent=#00e5ff" ctl theme "Rückgängig did not restore the accent"
+wait_get theme.accent '#7fcfa0'
+wait_for "accent=#7fcfa0" ctl theme "Rückgängig did not restore the accent"
 shot undone
 same undone settings-dark
 
 echo "== the hex field: a colour typed and Enter; a bad one is refused on the page"
 click 'page pid=.* hex'
-wait_for 'edit=hex:"#00e5ff"' ctl page "the hex field did not open"
+wait_for 'edit=hex:"#7fcfa0"' ctl page "the hex field did not open"
 # BackSpace x7, then 3 d d c 9 7 (evdev codes), Enter.
 type_keys 14 14 14 14 14 14 14 4 32 32 46 10 8 28
 wait_get theme.accent '#3ddc97'
@@ -159,7 +166,7 @@ type_keys 14 14 14 14 14 14 14 44 44 28
 wait_for 'msg=error:"Keine gültige Farbe' ctl page "a bad colour gave no error line"
 [ "$(get theme.accent)" = '#3ddc97' ] || fail "a bad colour changed the accent"
 click 'page pid=.* undo'
-wait_get theme.accent '#00e5ff'
+wait_get theme.accent '#7fcfa0'
 
 echo "== a choice, a switch, the scale"
 click 'choice=theme.mode=light'
@@ -199,7 +206,7 @@ click 'page pid=.* undo'
 wait_for 'msg=error:"Akzentfarbe: zuletzt geändert von einem anderen Programm' ctl page "Rückgängig did not refuse a change made elsewhere"
 [ "$(get theme.accent)" = '#b388ff' ] || fail "Rückgängig undid a change made elsewhere"
 settings undo
-wait_get theme.accent '#00e5ff'
+wait_get theme.accent '#7fcfa0'
 ctl pointer $(hot '^win ' content) >/dev/null
 ctl wheel -40 >/dev/null
 wait_for "scroll=0 " ctl page "the wheel did not bring the page's top back"
@@ -214,7 +221,7 @@ ctl stats | grep -q "frames=0 " || fail "frames while idle: $(ctl stats)"
 echo "== einstellungen/aussehen/akzent: a page with the accent row lit (in view: no scroll)"
 ctl address open einstellungen/aussehen/akzent tab >/dev/null
 wait_for "address=einstellungen/aussehen/akzent prefix=theme.accent scroll=0 " ctl page "no page for the accent"
-ctl hot | grep -q "page pid=.* swatch=#3ddc97" || fail "the accent row is not shown"
+ctl hot | grep -q "page pid=.* swatch=#b388ff" || fail "the accent row is not shown"
 wait_for 'visible=true focused=true .*app_id=bitscomp.einstellungen' ctl list "the new page is not the shown tab"
 shot settings-target
 compare settings-target
@@ -224,7 +231,7 @@ wait_for "address=einstellungen/aufbau/statusleiste prefix=theme.layout.statusba
 sleep 0.2
 ctl hot | grep -q "switch=theme.layout.statusbar" || fail "the status bar row is not shown"
 ctl hot | grep -q "page pid=.* undo" || fail "Rückgängig scrolled away"
-ctl hot | grep -q "swatch=#3ddc97" && fail "the swatches should be scrolled under the head"
+ctl hot | grep -q "swatch=#b388ff" && fail "the swatches should be scrolled under the head"
 echo "== the wheel scrolls the page back up"
 xy=$(hot 'switch=theme.layout.statusbar' at)
 ctl pointer $xy >/dev/null
@@ -368,7 +375,7 @@ wait_for 'app_id=bitscomp.einstellungen' ctl list "the page did not map without 
 wait_for "live=false" ctl page "the page claims settingsd"
 click 'swatch=#ffb020'
 wait_for 'msg=error:' ctl page "a click without settingsd gave no error line"
-ctl theme | grep -q "accent=#00e5ff" || fail "the accent changed without settingsd"
+ctl theme | grep -q "accent=#7fcfa0" || fail "the accent changed without settingsd"
 
 if command -v foot >/dev/null; then
     echo "== foot: started with bitscomp's foot.ini, background = paper, the mode switches it while it runs"
@@ -379,7 +386,7 @@ if command -v foot >/dev/null; then
     INI=$(ctl foot | sed -n 's/.*config=\([^ ]*\) ready=true.*/\1/p')
     [ -n "$INI" ] && [ -f "$INI" ] || fail "no foot.ini: $(ctl foot)"
     grep -q "^initial-color-theme=dark" "$INI" || fail "foot.ini is not dark"
-    grep -A1 "^\[colors-dark\]" "$INI" | grep -q "background=131c26" || fail "dark background is not the paper"
+    grep -A1 "^\[colors-dark\]" "$INI" | grep -q "background=1b2520" || fail "dark background is not the paper"
     ctl address open programm/terminal tab >/dev/null
     wait_for 'app_id=foot' ctl list "foot did not map"
     FPID=$(ctl list | sed -n 's/.*app_id=foot .*pid=\([0-9]*\).*/\1/p' | head -1)
@@ -388,16 +395,16 @@ if command -v foot >/dev/null; then
     BODY=$(ctl hot | grep '^win ' | head -1 | sed -n 's/.* body=\([0-9]*\),\([0-9]*\),\([0-9]*\),\([0-9]*\).*/\1 \2 \3 \4/p')
     read -r bx by bw bh <<<"$BODY"
     px() { ctl shot "$RUN/foot.ppm" >/dev/null; $IMG pixel "$RUN/foot.ppm" $((bx + bw / 2)) $((by + bh * 3 / 4)); }
-    [ "$(px)" = "19 28 38" ] || fail "foot's background is $(px), not the dark paper 19 28 38"
+    [ "$(px)" = "27 37 32" ] || fail "foot's background is $(px), not the dark paper 27 37 32"
     settings set theme.mode light
     wait_for "mode=light" ctl theme "light did not arrive"
     grep -q "^initial-color-theme=light" "$INI" || fail "foot.ini did not follow the mode"
-    for _ in $(seq 40); do [ "$(px)" = "255 255 255" ] && break; sleep 0.05; done
-    [ "$(px)" = "255 255 255" ] || fail "the running foot did not switch to light: $(px)"
+    for _ in $(seq 40); do [ "$(px)" = "251 252 250" ] && break; sleep 0.05; done
+    [ "$(px)" = "251 252 250" ] || fail "the running foot did not switch to light: $(px)"
     settings undo
     wait_for "mode=dark" ctl theme "undo did not bring dark back"
-    for _ in $(seq 40); do [ "$(px)" = "19 28 38" ] && break; sleep 0.05; done
-    [ "$(px)" = "19 28 38" ] || fail "the running foot did not switch back to dark: $(px)"
+    for _ in $(seq 40); do [ "$(px)" = "27 37 32" ] && break; sleep 0.05; done
+    [ "$(px)" = "27 37 32" ] || fail "the running foot did not switch back to dark: $(px)"
     echo "== foot: a mode switch right after a start neither ends the new terminal nor misses it"
     ctl address open programm/terminal tab >/dev/null
     settings set theme.mode light
@@ -405,13 +412,13 @@ if command -v foot >/dev/null; then
     FPID2=$(ctl list | sed -n 's/.*app_id=foot .*pid=\([0-9]*\).*/\1/p' | grep -vx "$FPID" | head -1)
     [ -n "$FPID2" ] || fail "the second foot did not map: $(ctl list)"
     wait_for "mode=light" ctl theme "light did not arrive"
-    for _ in $(seq 40); do [ "$(px)" = "255 255 255" ] && break; sleep 0.05; done
-    [ "$(px)" = "255 255 255" ] || fail "the new foot is not light: $(px)"
+    for _ in $(seq 40); do [ "$(px)" = "251 252 250" ] && break; sleep 0.05; done
+    [ "$(px)" = "251 252 250" ] || fail "the new foot is not light: $(px)"
     kill -0 "$FPID" && kill -0 "$FPID2" || fail "a foot ended at the mode switch"
     settings undo
     wait_for "mode=dark" ctl theme "undo did not bring dark back"
-    for _ in $(seq 40); do [ "$(px)" = "19 28 38" ] && break; sleep 0.05; done
-    [ "$(px)" = "19 28 38" ] || fail "the new foot did not switch back to dark: $(px)"
+    for _ in $(seq 40); do [ "$(px)" = "27 37 32" ] && break; sleep 0.05; done
+    [ "$(px)" = "27 37 32" ] || fail "the new foot did not switch back to dark: $(px)"
     kill -0 "$FPID2" || fail "the new foot ended at the switch back"
 else
     echo "SKIP foot part: foot is not installed"

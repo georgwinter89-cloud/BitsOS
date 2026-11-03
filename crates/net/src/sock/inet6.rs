@@ -185,8 +185,9 @@ fn mc_needs_scope(a: &[u8; 16]) -> bool {
     matches!(a[1] & 0x0f, 1 | 2)
 }
 
-fn ifindex_exists(i: u32) -> bool {
-    crate::ifview::links().iter().any(|l| l.index == i)
+/// Whether interface `i` exists in network namespace `net` (NW-11: a namespace has lo only).
+fn ifindex_exists(net: &crate::netns::Net, i: u32) -> bool {
+    crate::ifview::by_index_in(net, i).is_some()
 }
 
 /// How a bound address takes part in the port rules (the socket's family plus IPV6_V6ONLY).
@@ -291,13 +292,13 @@ impl InetSock {
     /// `__inet6_bind` up to the port: what to bind. A specific IPv6 address (::1, a group) makes the socket
     /// IPv6-only, as Linux does; the caller sets that (`force_v6only`) only for the port's taking, and gives the
     /// old value back when the bind fails (`saved_ipv6only`, linux-6.6/net/ipv6/af_inet6.c:395-403).
-    pub(super) fn bind6(&self, raw: &[u8], uid: u32) -> Result<Bind6, Errno> {
+    pub(super) fn bind6(&self, raw: &[u8], c: &super::Caller) -> Result<Bind6, Errno> {
         let s = parse_in6(raw)?;
         let tcp = matches!(self.proto, Proto::Tcp(_));
         if s.addr == V6::Multicast && tcp {
             return Err(EINVAL);
         }
-        if s.port != 0 && s.port < UNPRIVILEGED_PORT_START && uid != 0 {
+        if s.port != 0 && s.port < UNPRIVILEGED_PORT_START && !c.can(crate::sock::cap::NET_BIND_SERVICE) {
             return Err(EACCES);
         }
         if self.is_bound() {
@@ -315,7 +316,7 @@ impl InetSock {
         if scoped && dev == 0 {
             return Err(EINVAL);
         }
-        if s.addr != V6::Any && dev != 0 && !ifindex_exists(dev) {
+        if s.addr != V6::Any && dev != 0 && !ifindex_exists(self.net(), dev) {
             return Err(ENODEV);
         }
         let ip = match s.addr {
@@ -455,7 +456,7 @@ impl InetSock {
 
     /// `do_ipv6_setsockopt` for the options a TCP or UDP socket has. `val`: the first bytes the program gave
     /// (as many as `opt6_len` says the option needs).
-    pub(super) fn setsockopt6(&self, name: u32, optlen: usize, val: Result<Vec<u8>, Errno>) -> Result<(), Errno> {
+    pub(super) fn setsockopt6(&self, name: u32, optlen: usize, val: Result<Vec<u8>, Errno>, c: &crate::sock::Caller) -> Result<(), Errno> {
         let tcp = matches!(self.proto, Proto::Tcp(_));
         if MRT6.contains(&name) {
             return Err(EOPNOTSUPP);
@@ -514,7 +515,7 @@ impl InetSock {
             }
             IPV6_MULTICAST_IF => {
                 int_ok()?;
-                if v != 0 && !ifindex_exists(v as u32) {
+                if v != 0 && !ifindex_exists(self.net(), v as u32) {
                     return Err(ENODEV);
                 }
                 store(name, v)
@@ -571,7 +572,9 @@ impl InetSock {
                 store(name, v)
             }
             IPV6_TRANSPARENT => {
-                if v != 0 && self.owner.uid != 0 {
+                // The calling task's CAP_NET_RAW or CAP_NET_ADMIN over the socket's namespace (`do_ipv6_setsockopt`,
+                // `sockopt_ns_capable`).
+                if v != 0 && !c.can(crate::sock::cap::NET_RAW) && !c.can(crate::sock::cap::NET_ADMIN) {
                     return Err(EPERM);
                 }
                 int_ok()?;
@@ -587,7 +590,7 @@ impl InetSock {
                     return Err(EINVAL);
                 }
                 let idx = u32::from_be(v as u32);
-                if idx != 0 && !ifindex_exists(idx) {
+                if idx != 0 && !ifindex_exists(self.net(), idx) {
                     return Err(EADDRNOTAVAIL);
                 }
                 store(name, idx as i32)
@@ -640,7 +643,7 @@ impl InetSock {
         match &self.proto {
             Proto::Tcp(t) => {
                 if let Some(p) = t.lock().port {
-                    super::port_update(p, self.id(), |u| u.fam = Fam::V4);
+                    self.t().port_update(p, self.id(), |u| u.fam = Fam::V4);
                 }
             }
             Proto::Udp(u) => {
@@ -648,7 +651,7 @@ impl InetSock {
                 if g.fam == Fam::Dual
                     && let (Some(l), Some(r)) = (g.local, &g.lo)
                 {
-                    super::lo_unhook(l.port, r, &[true]);
+                    self.t().lo_unhook(l.port, r, &[true]);
                 }
                 g.fam = Fam::V4;
                 let old = g.guard6.take();
@@ -665,7 +668,7 @@ impl InetSock {
         }
         // The interface is looked up before the list's lock (it asks the stack); the checks, in Linux's order,
         // and the push then happen under one lock.
-        let dev_ok = !join || ifindex == 0 || ifindex_exists(ifindex as u32);
+        let dev_ok = !join || ifindex == 0 || ifindex_exists(self.net(), ifindex as u32);
         let mut g = self.groups6.lock();
         let at = g.iter().position(|x| x.0 == group && (ifindex == 0 || x.1 == ifindex));
         if !join {

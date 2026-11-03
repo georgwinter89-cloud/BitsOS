@@ -12,6 +12,8 @@
 //! values, and each reclaim's RPQ/TX index reads, RPQ buffer clears and index write.
 //! Reads only the golden file (no node); it never skips.
 
+mod common;
+
 use std::path::PathBuf;
 
 use rtw89_core::membus::MemBus;
@@ -23,7 +25,7 @@ use rtw89_core::tables::regs::*;
 fn golden() -> Vec<String> {
     let dir = std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into());
+        .unwrap_or_else(|| common::desk("werkzeuge/plattform/wlan"));
     let p = dir.join("bringup-golden.txt");
     let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     text.lines().map(String::from).collect()

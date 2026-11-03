@@ -1,12 +1,12 @@
 #!/bin/bash
-# UL-4b: procs, evtest, fbtest, memstress, alsa-test on CachyOS, the oracle for user/tools/cases.txt (exit codes
+# UL-4b: procs, evtest, fbtest, memstress on CachyOS, the oracle for user/tools/cases.txt (exit codes
 # and the transcripts in user/tools/expected/). The ul.tools.cases ktest runs the same table on V2.
 # Never opens /dev/input/* or /dev/fb0 here (Georg's keyboard and screen): the evdev/fbdev cases use fake files.
 set -eu
 BITSOS_ROOT="${BITSOS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 cd "$BITSOS_ROOT"
 T="$BITSOS_ROOT/target/user-scenario"
-(cd user && env -u CARGO_TARGET_DIR -u RUSTUP_TOOLCHAIN cargo build -q --offline --release --target x86_64-unknown-linux-musl --target-dir "$T" -p procs -p evtest -p fbtest -p memstress -p alsa-test -p bitspkg)
+(cd user && env -u CARGO_TARGET_DIR -u RUSTUP_TOOLCHAIN cargo build -q --offline --release --target x86_64-unknown-linux-musl --target-dir "$T" -p procs -p evtest -p fbtest -p memstress -p bitspkg)
 BIN="$T/x86_64-unknown-linux-musl/release"
 RUN="$BITSOS_ROOT/target/ul-tools-linux"
 fail=0

@@ -248,6 +248,67 @@ fn bad_rip() -> TestResult {
     })
 }
 
+ktest!("ab.entry.flags_after_return", Safe, flags_after_return);
+/// AB-15: the return to the kernel gives the caller only its IF back (no popfq). A program running with DF, AC
+/// and ID set (NT too, by its own popfq: `execute` never enters with NT) that traps (#UD), single-steps (TF,
+/// #DB) or makes a syscall leaves the caller with DF, AC, TF and NT clear and its own IF, whether the caller ran
+/// with interrupts on or off, by SYSRET and by IRET. After a syscall ID is clear too (FMASK, as Linux); after a
+/// trap it may stay, which means nothing in ring 0.
+fn flags_after_return() -> TestResult {
+    const TF: u64 = 1 << 8;
+    const IF: u64 = 1 << 9;
+    const DF: u64 = 1 << 10;
+    const NT: u64 = 1 << 14;
+    const AC: u64 = 1 << 18;
+    const ID: u64 = 1 << 21;
+    // Without SMAP the trap paths leave AC alone (clac would #UD); AC then only checks alignment in ring 3.
+    let smap = hal::entry::smap_all() == Some(true);
+    const STACK: u64 = 0x50_0000;
+    // 0: ud2; 2: syscall; 4: nop; ud2; 7: NT on (pushfq; or dword [rsp], NT; popfq); ud2; 18: NT on; syscall
+    let mut code = vec![0x0F, 0x0B, 0x0F, 0x05, 0x90, 0x0F, 0x0B];
+    let nt_on = [0x9C, 0x81, 0x0C, 0x24, 0x00, 0x40, 0x00, 0x00, 0x9D];
+    for end in [[0x0F, 0x0B], [0x0F, 0x05]] {
+        code.extend_from_slice(&nt_on);
+        code.extend_from_slice(&end);
+    }
+    let stack = |asp: &AddressSpace| -> TestResult {
+        asp.map_fixed(STACK, 4096, Prot::rw(), VmaKind::Anonymous).map_err(|e| format!("stack: {e:?}"))?;
+        asp.write_loader(STACK, &[0u8; 4096]).map_err(|e| format!("stack: {e:?}"))
+    };
+    in_user_space(&code, stack, || {
+        for irqs_on in [true, false] {
+            // (rip, extra user flags, expected vector: None = the syscall)
+            let rows = [(CODE, TF, Some(6)), (CODE + 2, 0, None), (CODE + 4, TF, Some(1)), (CODE + 7, 0, Some(6)), (CODE + 18, 0, None)];
+            for (rip, extra, want) in rows {
+                for iret in [false, true] {
+                    let _off = (!irqs_on).then(hal::cpu::IrqGuard::new);
+                    let mut ctx = UserContext::new(rip, STACK + 4096);
+                    ctx.regs.rflags = 0x202 | DF | AC | ID | extra;
+                    ctx.regs.rcx = if iret { 0 } else { rip };
+                    ctx.regs.r11 = ctx.regs.rflags;
+                    let r = ctx.execute(true);
+                    let f = hal::entry::kernel_rflags();
+                    let what = format!("irqs_on {irqs_on}, rip {rip:#x}, iret {iret}: {r:?}");
+                    match (r, want) {
+                        (ReturnReason::Trap { vector, .. }, Some(v)) if vector == v => {}
+                        (ReturnReason::Syscall, None) => {}
+                        _ => return Err(format!("{what}: unexpected return (want vector {want:?})")),
+                    }
+                    // TF forces IRET (`sysret_possible`, as Linux): the TF rows take IRET both times.
+                    let by_iret = iret || extra & TF != 0;
+                    kassert!(if by_iret { ctx.stats.iret >= 1 } else { ctx.stats.sysret >= 1 }, "{what}: path {:?}", ctx.stats);
+                    let clear = DF | TF | NT | if smap || want.is_none() { AC } else { 0 } | if want.is_none() { ID } else { 0 };
+                    kassert!(f & clear == 0, "{what}: kernel RFLAGS {f:#x} keep some of {clear:#x}");
+                    kassert!((f & IF != 0) == irqs_on, "{what}: kernel RFLAGS {f:#x}, IF should be {irqs_on}");
+                    kassert!(ctx.regs.rflags & (DF | AC) == DF | AC, "{what}: program flags {:#x} lost DF/AC", ctx.regs.rflags);
+                    kassert!(rip < CODE + 7 || ctx.regs.rflags & NT != 0, "{what}: the program's popfq did not set NT ({:#x})", ctx.regs.rflags);
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // User copies from the kernel side
 
@@ -377,7 +438,20 @@ fn stop_rounds(vector: u8) -> TestResult {
     };
     hal::entry::set_user_irq_hook(None);
     let mut ctx = UserContext::new(CODE, 0);
-    let r = run(&mut ctx)?;
+    // AB-15: the interrupt return to the kernel (no popfq) leaves the caller's IF (off here) and none of the
+    // program's DF, NT, TF (AC too with SMAP, which the interrupt path clears).
+    const USER_FLAGS: u64 = (1 << 10) | (1 << 14) | (1 << 18) | (1 << 21);
+    ctx.regs.rflags |= USER_FLAGS;
+    ctx.regs.r11 = ctx.regs.rflags;
+    let r = {
+        let _irq = hal::cpu::IrqGuard::new();
+        let r = run(&mut ctx)?;
+        let f = hal::entry::kernel_rflags();
+        let clear = (1 << 9) | (1 << 8) | (1 << 10) | (1 << 14) | if hal::entry::smap_all() == Some(true) { 1 << 18 } else { 0 };
+        kassert!(f & clear == 0, "no hook: kernel RFLAGS {f:#x} after the interrupt return keep some of {clear:#x}");
+        r
+    };
+    kassert!(ctx.regs.rflags & (1 << 10) != 0, "no hook: the program's DF was lost ({:#x})", ctx.regs.rflags);
     kassert!(r.is_none() && ctx.regs.rip == CODE && ctx.stats.interrupts == 1, "no hook: {r:?} at {:#x}, {} interrupts", ctx.regs.rip, ctx.stats.interrupts);
     hal::entry::set_user_irq_hook(Some(hook_resume));
     // INT-W9 (GX-3 CR 4): the hook runs after every interrupt in user mode, so a timer tick under load adds a

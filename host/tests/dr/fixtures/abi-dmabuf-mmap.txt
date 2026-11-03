@@ -1,0 +1,12 @@
+udmabuf is a char device = yes
+create = ok
+mmap shared = ok
+memfd sees the dma-buf write = yes
+dma-buf sees the memfd write = yes
+mmap private = EINVAL
+mmap past the end = EINVAL
+mmap last page = ok
+create_list = ok
+list size = 12288
+list page 0 = first, page 2 = second
+after the memfd closed: same pages

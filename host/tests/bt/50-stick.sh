@@ -220,7 +220,7 @@ echo "screen=native" >"$W/v1-config.txt"
 printf 'V1 kernel' >"$W/kernel.bin"
 echo "{guid}" >"$W/guid"
 echo "Georg" >"$W/readme.txt"
-V1_LOADER=/home/georg/BitsOS/BitsOS-Plattform/stick/EFI/BOOT/BOOTX64.EFI  # read-only reference, copied
+V1_LOADER="${BITSOS_V1:-$HOME/BitsOS/BitsOS-Plattform}/stick/EFI/BOOT/BOOTX64.EFI"  # read-only reference, copied
 if [ -f "$V1_LOADER" ]; then cp "$V1_LOADER" "$W/v1-loader.efi"; else printf 'MZ....BitsOS loader on ....' >"$W/v1-loader.efi"; fi
 put "$IMG" "$W/v1-stick.id" BITSOS/STICK.ID
 put "$IMG" "$W/kernel.bin" BITSOS/KERNEL.BIN

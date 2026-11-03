@@ -27,6 +27,8 @@ crypt = { path = "../crates/crypt" }
 devmodel = { path = "../crates/devmodel" }
 display = { path = "../crates/display" }
 amdgpu = { path = "../crates/drivers/amdgpu" }
+# DR-2 (desk change request): the DRM core, its render node and /sys view.
+drm = { path = "../crates/drm" }
 fch-wdt = { path = "../crates/drivers/fch-wdt" }
 gopfb = { path = "../crates/drivers/gopfb" }
 hda = { path = "../crates/drivers/hda" }
@@ -69,3 +71,6 @@ userland = { path = "../crates/userland" }
 vfs = { path = "../crates/vfs" }
 vfs-sys = { path = "../crates/vfs-sys" }
 wifi = { path = "../crates/wifi" }
+
+[lints]
+workspace = true

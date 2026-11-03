@@ -7,3 +7,6 @@ description = "Locks, wait queues, completions (trusted base) (owner: SC)"
 [dependencies]
 hal = { path = "../hal" }
 
+
+[lints]
+workspace = true

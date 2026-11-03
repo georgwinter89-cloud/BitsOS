@@ -1,0 +1,7 @@
+mode direct
+no frame (unmapped): SIGSEGV SI_KERNEL addr-is-planted yes on-alt-stack yes
+frame in the kernel half: SIGSEGV SI_KERNEL addr-is-planted yes on-alt-stack yes
+frame at a non-canonical rsp: SIGSEGV SI_KERNEL addr-is-planted yes on-alt-stack yes
+zeroed frame: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+random frame with an ldt cs: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+done

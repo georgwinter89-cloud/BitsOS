@@ -27,3 +27,6 @@ pci = { path = "../pci" }
 # RB-8 (journal): the node /dev/bitsos/events (devnode!, errno values, the boot id from vfs::random).
 vfs = { path = "../vfs" }
 uapi = { path = "../uapi" }
+
+[lints]
+workspace = true

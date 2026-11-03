@@ -8,6 +8,12 @@
 //!   graveyard and is dropped after a sync generation: by then every CPU finished the interrupt handlers it was
 //!   in, so the last reference is never dropped (and memory never freed) inside a handler.
 //!
+//! - PF-5: whatever waits for a page-cache grace period (`mm_core::grace`: pages and index nodes lockless
+//!   readers may still see). That grace period has its own per-section epochs (no TLB flush, no IPI, idle CPUs
+//!   never delay it, the resched IPI never passes a reader); the reaper only drives it: every pass drains what
+//!   passed, the first item of a batch wakes it (`grace::set_kick`), and a grace period held longer than 1 s is
+//!   reported like a stalled sync generation.
+//!
 //! The work runs in the `reaper` thread (woken after switches that left something behind) and in `reap()` for
 //! callers that need it done now (tests).
 
@@ -28,6 +34,7 @@ static WAITING_SINCE: AtomicU64 = AtomicU64::new(0);
 klog::counter!(pub STACKS_FREED, "sched.stacks_reaped");
 klog::counter!(pub THREADS_FREED, "sched.threads_reaped");
 klog::counter!(pub GRAVES_LEAKED, "sched.graves_leaked");
+klog::counter!(pub GRACE_FREED, "mm.grace.reaped_pages");
 
 /// Makes room in the graveyard for every thread that exists now plus one (`spawn`, before the new thread is
 /// listed), so `bury` never has to allocate. `Err`: no memory (the spawn fails).
@@ -117,6 +124,10 @@ pub(crate) fn pass() -> bool {
     THREADS_FREED.add(gone.len() as u64);
     // The last references of these threads go here: thread context, no scheduler lock held.
     drop(gone);
+    // PF-5: page-cache frames and index nodes past their grace period (thread context, no lock held).
+    GRACE_FREED.add(mm_core::grace::drain() / mm_core::PAGE);
+    // Grace items do not count here: `reap()` is about what threads left behind (the reaper thread keeps
+    // passing while they wait).
     let done = !hal::switch::retired_pending() && !graves_waiting();
     PASS_BUSY.store(false, Ordering::Release);
     done
@@ -143,18 +154,26 @@ pub fn reap() -> bool {
 
 /// The reaper thread (Normal class): sleeps until kicked (or 100 ms), then passes until done; reports a stall.
 pub(crate) fn reaper_loop() {
+    static KICK: fn() = kick;
+    mm_core::grace::set_kick(&KICK);
+    let mut told = mm_core::grace::stats();
     loop {
         WQ.wait_until_timeout(|| KICKED.load(Ordering::Acquire), 100_000_000);
         KICKED.store(false, Ordering::Release);
         let mut tries = 0u32;
         loop {
-            if pass() {
+            if pass() && !mm_core::grace::waiting() {
                 WAITING_SINCE.store(0, Ordering::Relaxed);
                 break;
             }
             let now = time::now_ns();
             let since = WAITING_SINCE.load(Ordering::Relaxed);
             if since == 0 {
+                WAITING_SINCE.store(now, Ordering::Relaxed);
+            } else if now - since > 1_000_000_000 && mm_core::grace::waiting() && !hal::switch::retired_pending() && !graves_waiting() {
+                let gs = mm_core::grace::stats();
+                klog::event!(Warn, "sched", "grace.stalled", epoch = gs.epoch, open_sections = gs.open_sections, waiting = gs.waiting,
+                    pending_kb = gs.pending_bytes / 1024; "page-cache frames waited 1 s for a grace period (a read section that does not end?); retrying");
                 WAITING_SINCE.store(now, Ordering::Relaxed);
             } else if now - since > 1_000_000_000 {
                 let g = hal::switch::sync_generation();
@@ -169,5 +188,15 @@ pub(crate) fn reaper_loop() {
             }
             crate::sleep_ms(2);
         }
+        let gs = mm_core::grace::stats();
+        if gs.timeouts > told.timeouts || gs.leaked > told.leaked {
+            klog::event!(Warn, "sched", "grace.wait_timeout", timeouts = gs.timeouts - told.timeouts, leaked = gs.leaked - told.leaked,
+                open_sections = gs.open_sections, pending_kb = gs.pending_bytes / 1024; "a bounded wait for a page-cache grace period ran out");
+        }
+        if gs.throttled > told.throttled {
+            klog::event!(Debug, "sched", "grace.throttled", times = gs.throttled - told.throttled, pending_kb = gs.pending_bytes / 1024,
+                bound_kb = gs.bound_bytes / 1024; "freers waited for their grace period (pending above the bound)");
+        }
+        told = gs;
     }
 }

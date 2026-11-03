@@ -19,6 +19,10 @@ static JUMPING: AtomicBool = AtomicBool::new(false);
 /// so the machine, now without network, gets reset.
 static JUMP_FAILED_HOOK: ksync::OnceRef<fn()> = ksync::OnceRef::new();
 
+/// RB-17: called (no lock, no allocation, no log) right after the `reload_jump` crumb, before the jump: the
+/// watchdog stops there, so the count it keeps across the jump is that crumb.
+static BEFORE_JUMP_HOOK: ksync::OnceRef<fn()> = ksync::OnceRef::new();
+
 /// True from the Reload's quiesce on (a Quiesce asks: Reload or reboot?).
 pub fn reload_jumping() -> bool {
     JUMPING.load(Ordering::Acquire)
@@ -27,6 +31,11 @@ pub fn reload_jumping() -> bool {
 /// Installs the hook a failed jump calls (the first call wins).
 pub fn set_jump_failed_hook(f: &'static fn()) -> bool {
     JUMP_FAILED_HOOK.set(f)
+}
+
+/// Installs the hook the jump calls right after its last crumb (the first call wins).
+pub fn set_before_jump_hook(f: &'static fn()) -> bool {
+    BEFORE_JUMP_HOOK.set(f)
 }
 
 /// One Reload or install at a time (an install's stick writes and a Reload's quiesce never overlap). The private
@@ -135,6 +144,9 @@ fn unused_apic_ids() -> alloc::vec::Vec<u32> {
     madt.cpus.iter().filter(|c| c.enabled && hal::smp::cpu_of_apic(c.apic_id).is_none()).map(|c| c.apic_id).collect()
 }
 
+/// RB-16: each device's thread-context stop before the CPUs stop (B4).
+const BEFORE_PARK_NS: u64 = 1_000_000_000;
+
 /// The functions enabled with bus master (`pci::dma_enabled`), taken before the stop (locks and heap): after
 /// `quiesce_all` each gets `disable_device` again, which catches a function no registered `Quiesce` covers
 /// (spec §2.4 "clear bus master on what the kernel enabled"). Harmless for those a driver quiesced already.
@@ -205,6 +217,20 @@ fn go_on_boot_cpu(mut st: Staged) {
     } else {
         klog::event!(Info, "kexec", "reload.synced", reload = counter, flushed = synced.flushed, failed = synced.failed);
     }
+    // RB-14: the storage stop (Linux's kexec runs `kernel_restart_prepare` -> `device_shutdown` too,
+    // linux-6.6/kernel/kexec_core.c:1272): every disk closed, drained and its cache flushed, usb-msd starts no
+    // command and xHCI has no bulk transfer in flight, so the jump never cuts a stick command in half. Bounded;
+    // undone on every path below that goes on in this kernel.
+    let storage = block::shutdown::stop_all("reload", block::shutdown::STOP_NS);
+    // RB-16: the thread-context device stops before the CPUs stop (rtw89's chip under its own lock: its thread
+    // may hold that lock across a sleep, and a CPU stopped inside it would leave the Quiesce only bus master
+    // off beside a running chip). Not undone on a refusal below: such a device stays off until the next start.
+    let before_park = devmodel::stop_all_before_park(BEFORE_PARK_NS);
+    if !before_park.is_empty() {
+        let names: alloc::vec::Vec<&str> = before_park.iter().map(|(n, _)| n.as_str()).collect();
+        let held: alloc::vec::Vec<&str> = before_park.iter().filter(|(_, ok)| !ok).map(|(n, _)| n.as_str()).collect();
+        klog::event!(Info, "kexec", "reload.before_park", reload = counter, stopped = names.join(","), not_stopped = held.join(","));
+    }
     // Everything that allocates or takes a lock happens before the stop.
     let unused = unused_apic_ids();
     let dma_fns = dma_functions();
@@ -216,6 +242,9 @@ fn go_on_boot_cpu(mut st: Staged) {
             klog::event!(Error, "kexec", "reload.failed", reload = counter, error = format!("{e:?}"), quiesced = false,
                 guard_deferred = deferred.wrapping_sub(deferred0), stray_ipis = stray.wrapping_sub(stray0);
                 "the other CPUs could not be stopped; those that were run again and this kernel goes on");
+            block::shutdown::resume_all("reload-failed");
+            stay_off(counter, &before_park);
+            klog::crumb::clear();
             return;
         }
     };
@@ -227,6 +256,9 @@ fn go_on_boot_cpu(mut st: Staged) {
         klog::event!(Error, "kexec", "reload.failed", reload = counter, error = why.as_str(), quiesced = false,
             cpus_stopped = cpus.others, by_irq = cpus.by_irq, by_nmi = cpus.by_nmi, park_ipis = cpus.ipis;
             "the other CPUs were released and this kernel goes on");
+        block::shutdown::resume_all("reload-failed");
+        stay_off(counter, &before_park);
+        klog::crumb::clear();
         return;
     }
     let (stray, deferred) = hal::kexec_stub::stray_and_deferred();
@@ -236,14 +268,17 @@ fn go_on_boot_cpu(mut st: Staged) {
         klog::try_event!(Warn, "kexec", "reload.park_retried", reload = counter, park_ipis = cpus.ipis, cpus_stopped = cpus.others,
             guard_deferred = deferred, stray_ipis = stray; "some CPUs needed the park interrupt again");
     }
+    klog::crumb::leave(klog::crumb::Stage::ReloadStopped, "reload");
     let pins = quiet_ioapics();
     let quiet = stopped.quiet(1_000_000_000);
     hal::cpu::disable_interrupts();
-    // spec §2.4: the mirror's last lines go out before the NIC they travel on stops (quiesce_all runs newest
-    // first, which puts the mirror first only by accident of registration order). A second quiesce is a no-op.
-    let mirror = devmodel::quiesce_matching("mirror");
+    // spec §2.4: the mirror's last lines go out before the NIC they travel on stops: RB-16 places both after
+    // every other device (`devmodel::Place::Transport`, the watchdog last), so each device's breadcrumb is on
+    // the listener before its quiesce runs.
     JUMPING.store(true, Ordering::Release);
     let devices = devmodel::quiesce_all();
+    let mirror = devices.iter().any(|d| d == "mirror") as usize;
+    klog::crumb::leave(klog::crumb::Stage::ReloadSweep, "reload");
     let sweep = sweep_bus_master(&dma_fns);
     let lapic = hal::kexec_stub::quiet_local_apic();
     hal::apic::quiet_legacy_pic();
@@ -256,6 +291,8 @@ fn go_on_boot_cpu(mut st: Staged) {
     if !lapic.timer_masked {
         klog::try_event!(Warn, "kexec", "reload.lapic_timer_live"; "xAPIC mode with the LAPIC timer unmasked: it cannot be stopped here (change request hal::apic::quiet_local); the new kernel masks it in its LAPIC set-up before it enables interrupts");
     }
+    // RB-16: the last crumb before the jump's own (20-reload checks that every stage left one).
+    let (crumb_seq, last_crumb) = klog::crumb::last().map_or((0, ""), |(q, st, _)| (q, st.as_str()));
     klog::try_event!(
         Info,
         "kexec",
@@ -281,24 +318,61 @@ fn go_on_boot_cpu(mut st: Staged) {
         guard_deferred = deferred,
         stray_ipis = stray,
         mirror_first = mirror,
+        storage_quiet = storage.quiet,
+        storage_ms = storage.ms,
         bus_master_swept = sweep.left_on,
         bus_master_refused = sweep.refused,
         lint0_extint = extint,
+        crumb_seq = crumb_seq,
+        last_crumb = last_crumb,
         entry = klog::Hex(st.summary.entry)
     );
     klog::drain_deferred(usize::MAX);
-    let e = st.jump();
-    klog::try_event!(Error, "kexec", "reload.failed", reload = counter, error = format!("{e:?}"), quiesced = true; "the devices are quiesced and the other CPUs halted: the machine stays without network until it is reset (watchdog, reboot by hand)");
-    // Not jumping any more: a later quiesce (a reboot by hand) is a reboot's, not a Reload's.
-    JUMPING.store(false, Ordering::Release);
-    if let Some(hook) = JUMP_FAILED_HOOK.get() {
+    jump_tail(BEFORE_JUMP_HOOK.get(), JUMP_FAILED_HOOK.get(), || st.jump(), |e| {
+        klog::try_event!(Error, "kexec", "reload.failed", reload = counter, error = format!("{e:?}"), quiesced = true; "the devices are quiesced and the other CPUs halted: the machine stays without network until it is reset (watchdog, reboot by hand)");
+    });
+}
+
+/// RB-17: the Reload's last steps, in this order: the `reload_jump` crumb, the before-jump hook (the watchdog
+/// stops there, so the count it keeps is that crumb), the jump. Only a jump that returns goes on: `failed` says
+/// so, the flag goes down (a later quiesce is a reboot's) and the failed-jump hook runs (the watchdog armed
+/// again). The hooks come in as arguments so the host test can record the order. No lock, no heap of its own.
+pub(crate) fn jump_tail<E>(before: Option<&fn()>, after_failed: Option<&fn()>, jump: impl FnOnce() -> E, failed: impl FnOnce(&E)) -> E {
+    klog::crumb::leave(klog::crumb::Stage::ReloadJump, "reload");
+    if let Some(hook) = before {
         hook();
     }
+    let e = jump();
+    failed(&e);
+    // Not jumping any more: a later quiesce (a reboot by hand) is a reboot's, not a Reload's.
+    JUMPING.store(false, Ordering::Release);
+    if let Some(hook) = after_failed {
+        hook();
+    }
+    e
+}
+
+/// Host tests: the flag a Reload's quiesce reads, set by hand.
+#[cfg(test)]
+pub(crate) fn set_jumping(on: bool) {
+    JUMPING.store(on, Ordering::Release);
+}
+
+/// RB-16 fixer: a Reload refused after the stop before the park: the devices it stopped are not started again
+/// (rtw89 would need its whole bring-up: firmware, join), so they stay off until the next start; said once.
+fn stay_off(counter: u32, before_park: &[(alloc::string::String, bool)]) {
+    if before_park.is_empty() {
+        return;
+    }
+    let names: alloc::vec::Vec<&str> = before_park.iter().map(|(n, _)| n.as_str()).collect();
+    klog::event!(Warn, "kexec", "reload.devices_stay_off", reload = counter, devices = names.join(",");
+        "stopped before the park for the refused Reload: they come back at the next start (wlan0: no Wi-Fi until then)");
 }
 
 fn reload(ctx: &ToolContext, args: &Json) -> ToolResult {
     let b = bundle_from(args)?;
     let dry = opt_bool(args, "dry_run")?.unwrap_or(false);
+    let force = opt_bool(args, "force")?.unwrap_or(false);
     // A refusal that needs no fetch: the CPU this runs on cannot stop the others.
     if !dry {
         // NotBootCpu is no refusal here: `go` moves to CPU 0 before it checks again.
@@ -336,6 +410,9 @@ fn reload(ctx: &ToolContext, args: &Json) -> ToolResult {
         let cfg = crate::refresh::dry_run(&st);
         return Ok(vec![ToolOutput::Text(format!("reload (dry run, nothing happens): {text}; {cfg}"))]);
     }
+    if !force {
+        crate::refresh::refuse_secret_loss(&st).map_err(ToolError::Refused)?;
+    }
     if !ctx.after_answer(Box::new(move || {
         let _busy = busy;
         go(st)
@@ -360,8 +437,8 @@ mcp_tool!(
     name: "reload",
     owner: "RB",
     safety: Change,
-    description: "Starts a new kernel without a reboot (kexec-like Reload): fetches the bundle over http from the LAN, checks it, answers, stops the other CPUs (they wait for the new kernel), quiesces every device and jumps; CONFIG, the stick record and the crash page are handed on, the Reload counter rises. url: a directory ending in / (fetches KERNEL and INITRD below it, the stick's SYS/<n>/ layout) or the kernel file; initrd: the initramfs URL (default for a file url: keep the running one, which is refused once the kernel released it after unpacking it into tmpfs). dry_run: fetch and check only.",
-    schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"http://<LAN IPv4>[:port]/dir/ (KERNEL + INITRD) or .../KERNEL"},"initrd":{"type":"string","description":"http URL of the initramfs (optional)"},"dry_run":{"type":"boolean","description":"fetch and check, but do not reload"}},"required":["url"]}"#,
+    description: "Starts a new kernel without a reboot (kexec-like Reload): fetches the bundle over http from the LAN, checks it, answers, stops the other CPUs (they wait for the new kernel), quiesces every device and jumps; CONFIG, the stick record and the crash page are handed on, the Reload counter rises. url: a directory ending in / (fetches KERNEL and INITRD below it, the stick's SYS/<n>/ layout) or the kernel file; initrd: the initramfs URL (default for a file url: keep the running one, which is refused once the kernel released it after unpacking it into tmpfs). dry_run: fetch and check only. force: go on even if the new kernel would start without the WLAN passphrase or the token (the stick does not answer); only with the cable in.",
+    schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"http://<LAN IPv4>[:port]/dir/ (KERNEL + INITRD) or .../KERNEL"},"initrd":{"type":"string","description":"http URL of the initramfs (optional)"},"dry_run":{"type":"boolean","description":"fetch and check, but do not reload"},"force":{"type":"boolean","description":"reload even if the new kernel would lose the WLAN passphrase or the token"}},"required":["url"]}"#,
     handler: reload,
 );
 
@@ -369,8 +446,8 @@ fn reload_info(_ctx: &ToolContext, _args: &Json) -> ToolResult {
     let mut t = String::new();
     match boot::facts() {
         Some(f) => t.push_str(&format!(
-            "reload counter {} (0 = started by the firmware)\nTSC handed over: {} Hz (measured by the kernel of Reload {})\ninitramfs {} bytes at {:#x}, fnv {:#018x}\nCONFIG {} bytes, BootInfo {} bytes\n",
-            f.counter, f.tsc_hz_handed, f.tsc_calibrated_at_reload, f.initrd_bytes, f.initrd_phys, f.initrd_fnv, f.config_bytes, f.bootinfo_bytes
+            "reload counter {} (0 = started by the firmware)\nTSC handed over: {} Hz (measured by the kernel of Reload {})\ninitramfs {} bytes at {:#x}, fnv {:#018x}\nCONFIG {} bytes ({} secret values blanked), BootInfo {} bytes\n",
+            f.counter, f.tsc_hz_handed, f.tsc_calibrated_at_reload, f.initrd_bytes, f.initrd_phys, f.initrd_fnv, f.config_bytes, f.secrets_blanked, f.bootinfo_bytes
         )),
         None => t.push_str("unknown: the kernel did not hand its BootInfo to kexec\n"),
     }

@@ -46,18 +46,6 @@ pub fn mounted_ids(pool: &str) -> Result<BTreeSet<u64>, Errno> {
     Ok(table()?.keys().filter(|(p, _)| p == pool).map(|(_, id)| *id).collect())
 }
 
-pub fn is_mounted(pool: &str, id: u64) -> Result<bool, Errno> {
-    Ok(table()?.contains_key(&(String::from(pool), id)))
-}
-
-/// Where snapshot `id` is mounted, if it is (and not just being mounted or unmounted).
-pub fn mounted_at(pool: &str, id: u64) -> Option<String> {
-    match table().ok()?.get(&(String::from(pool), id)) {
-        Some(State::Mounted(r)) => Some(r.at.clone()),
-        _ => None,
-    }
-}
-
 /// Mounts snapshot `id` of the target read-only at `BASE/<id>` of the system view (again: the same place).
 pub fn mount(t: &Target, id: u64) -> Result<String, Errno> {
     mount_at(t, id, vfs::root_ns(), &format!("{BASE}/{id}"))

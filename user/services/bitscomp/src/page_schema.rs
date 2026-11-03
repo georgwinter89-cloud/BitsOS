@@ -194,7 +194,7 @@ pub fn builtin() -> Vec<Spec> {
     let ch = |v: &[&str]| Ty::Choice(v.iter().map(|x| x.to_string()).collect());
     vec![
         s("theme.mode", ch(&["dark", "light"]), "dark", "Helles oder dunkles Design"),
-        s("theme.accent", Ty::Color, "#00e5ff", "Akzentfarbe"),
+        s("theme.accent", Ty::Color, crate::theme::ACCENT, "Akzentfarbe"),
         s("theme.scale", Ty::Int { min: 100, max: 300, unit: "%".into(), word: None }, "125", "Skalierung der Oberfläche"),
         s("theme.motion", ch(&["medium", "calm", "off"]), "medium", "Bewegung"),
         s("theme.effects", ch(&["cheap", "gpu"]), "cheap", "Effektstufe"),

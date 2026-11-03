@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 /// Crates that may contain `unsafe` (V2-PLAN trusted base).
 const TRUSTED: &[&str] = &["hal", "ksync", "mm-core", "kreg"];
+/// INT-W19 (AB-14 CR 6): user-mode code built into a kernel crate (outside its src/ tree) that may use `unsafe`,
+/// with a SAFETY comment per block (CONTRACTS section 2). Every other .rs file outside a crate's src/ must not.
+const USER_MODE_UNSAFE: &[&str] = &["crates/proc/vdso/vdso.rs"];
 
 /// True when the inner attributes at the top of a lib.rs contain `#![forbid(unsafe_code)]`.
 pub fn has_forbid_unsafe(src: &str) -> bool {
@@ -54,6 +57,22 @@ pub fn forbid_unsafe_gate(root: &Path) -> Result<(), String> {
             Ok(_) => bad.push(format!("{} lacks #![forbid(unsafe_code)] at the top", lib.display())),
             Err(_) => eprintln!("xtask: note: {} has no src/lib.rs, not checked", dir.display()),
         }
+        let mut extra = Vec::new();
+        rs_outside_src(&dir, &dir, &mut extra);
+        for f in extra {
+            let rel = f.strip_prefix(root).unwrap_or(&f).to_string_lossy().to_string();
+            match std::fs::read_to_string(&f) {
+                Ok(s) if USER_MODE_UNSAFE.contains(&rel.as_str()) => {
+                    let blocks = s.matches("unsafe {").count() + s.matches("unsafe fn").count();
+                    let safety = s.matches("SAFETY").count();
+                    if safety < blocks {
+                        bad.push(format!("{rel}: {blocks} unsafe block(s) or fn(s) but {safety} SAFETY comment(s)"));
+                    }
+                }
+                Ok(s) if mentions_unsafe(&s) => bad.push(format!("{rel} uses unsafe outside src/ (allowed only in {USER_MODE_UNSAFE:?})")),
+                _ => {}
+            }
+        }
     }
     if bad.is_empty() {
         println!("forbid-unsafe gate: ok");
@@ -64,6 +83,84 @@ pub fn forbid_unsafe_gate(root: &Path) -> Result<(), String> {
         }
         Err(format!("forbid-unsafe gate: {} offender(s)", bad.len()))
     }
+}
+
+/// Every .rs file below `dir` except the crate's own src/ tree and target/ dirs (build scripts' user-mode code).
+fn rs_outside_src(krate: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            let n = e.file_name();
+            if (dir == krate && n == "src") || n == "target" || p.join("Cargo.toml").is_file() {
+                continue;
+            }
+            rs_outside_src(krate, &p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") && !(dir == krate && e.file_name() == "build.rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// True when `src` has the word `unsafe` outside line comments.
+fn mentions_unsafe(src: &str) -> bool {
+    src.lines().any(|l| {
+        let code = l.split("//").next().unwrap_or("");
+        code.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "unsafe")
+    })
+}
+
+/// W22/C1: no home value in the public tree. Every tracked file outside plan/ is searched for the absolute home
+/// path of the user who runs the gate (`$HOME`, e.g. the desk's own): defaults name `$HOME/...` or an environment
+/// variable instead (rb/30-mirror's BITSOS_LISTENER), sample data a neutral home (/home/user). Skipped when HOME
+/// is not an absolute path of at least two components.
+pub fn home_path_gate(root: &Path) -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.trim_end_matches('/');
+    if !home.starts_with('/') || home.matches('/').count() < 2 {
+        println!("home-path gate: skipped (HOME {home:?} is not an absolute home path)");
+        return Ok(());
+    }
+    let out = Command::new("git").arg("-C").arg(root).args(["ls-files", "-z"]).output().map_err(|e| format!("git ls-files: {e}"))?;
+    if !out.status.success() {
+        return Err("git ls-files failed".into());
+    }
+    let mut bad = Vec::new();
+    for f in out.stdout.split(|&b| b == 0).filter(|f| !f.is_empty()) {
+        let rel = String::from_utf8_lossy(f);
+        if rel.starts_with("plan/") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(root.join(&*rel)) else { continue };
+        for line in home_lines(&bytes, home) {
+            bad.push(format!("{rel}:{line}"));
+        }
+    }
+    if bad.is_empty() {
+        println!("home-path gate: ok");
+        Ok(())
+    } else {
+        for b in &bad {
+            println!("home-path gate: OFFENDER {b} names {home}");
+        }
+        Err(format!("home-path gate: {} line(s) name the home {home} (use $HOME/... or an environment variable)", bad.len()))
+    }
+}
+
+/// The 1-based numbers of the lines of `text` that hold `home` as a path (followed by `/`, a quote, a space, the
+/// end or another character that cannot continue a user name).
+fn home_lines(text: &[u8], home: &str) -> Vec<usize> {
+    let h = home.as_bytes();
+    let mut v = Vec::new();
+    for (n, line) in text.split(|&b| b == b'\n').enumerate() {
+        let hit = line.windows(h.len()).enumerate().any(|(i, w)| {
+            w == h && line.get(i + h.len()).is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.'))
+        });
+        if hit {
+            v.push(n + 1);
+        }
+    }
+    v
 }
 
 fn step(name: &str, r: Result<(), String>, results: &mut Vec<(String, bool)>) {
@@ -108,16 +205,284 @@ pub fn run_test(root: &Path, skip_ktest: bool) -> Result<(), String> {
     // Crates with optional fixtures (rtw89's fake chip) fail instead of skipping when this is set.
     c.env("BITSOS_GATE", "1");
     step("host tests", run_status(&mut c, "cargo test (host crates)"), &mut res);
+    // INT-W16 (AC-3 CR): the user workspace's host-testable crates (MCP service glue, Brave's actions with the
+    // staged Brave headless, settingsd). brave-act's end-to-end test needs the shared Brave stage
+    // (stage-v2.sh) and fails without it unless BRAVE_ACT_ALLOW_SKIP=1.
+    // INT-W17 (MC-8a/8b/9a CR 2): the MCP service bitsmcp (gate, TLS, pairing, the seccomp probe on the host's kernel;
+    // its node interop test skips without node) and the installer bitsinstall.
+    // C1: the package manager bitspkg (its settingsd sockets moved to a short folder; red for weeks outside the gate).
+    let mut u = cargo(root);
+    u.current_dir(root.join("user"))
+        .args(["test", "-p", "mcpreg", "-p", "bitsact", "-p", "brave-act", "-p", "settingsd", "-p", "bitsmcp", "-p", "bitsinstall", "-p", "bitspkg"]);
+    step("user host tests", run_status(&mut u, "cargo test (user crates on the host)"), &mut res);
+    // INT-W24 (WY-14 CR): bitscomp's gpu build (`--features gpu`, its own workspace) against the host's /usr as
+    // the Mesa tree, and the gpu build's host scenario (Mesa stage in target/, headless, nothing on the screen).
+    let mut g = cargo(root);
+    g.current_dir(root.join("user/services/bitscomp"))
+        .args(["test", "--release", "--offline", "--locked", "--no-default-features", "--features", "gpu"])
+        .env("BITSCOMP_GPU_ROOT", "/usr")
+        .env("CARGO_TARGET_DIR", root.join("target/bitscomp-gpu"));
+    step("bitscomp gpu tests", run_status(&mut g, "cargo test (bitscomp --features gpu)"), &mut res);
+    let run = root.join("target/xtask/runs/gate-wy97");
+    let _ = std::fs::remove_dir_all(&run);
+    let mut w = Command::new("bash");
+    w.current_dir(root)
+        .arg("host/tests/wy/97-gpu-build.sh")
+        .env("BITSOS_ROOT", root)
+        .env("BITSOS_RUN_DIR", &run)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        // The Mesa stage carries pixman and libxkbcommon since INT-W24 (GM part of WY-14's CRs): a gap is RED.
+        .env("WY_STRICT_TREE", "1")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    step("wy gpu build", run_status(&mut w, "host/tests/wy/97-gpu-build.sh"), &mut res);
+    // INT-W25 (WY-15 CR): the GLES renderer on the host (llvmpipe from the Mesa stage, headless); SKIP and exit 0
+    // without a stage.
+    let run = root.join("target/xtask/runs/gate-wy98");
+    let _ = std::fs::remove_dir_all(&run);
+    let mut w = Command::new("bash");
+    w.current_dir(root)
+        .arg("host/tests/wy/98-gles.sh")
+        .env("BITSOS_ROOT", root)
+        .env("BITSOS_RUN_DIR", &run)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    step("wy gles", run_status(&mut w, "host/tests/wy/98-gles.sh"), &mut res);
+    // INT-W26 (WY-16 CR): linux-dmabuf on the host (udmabuf with Pixman, then GLES from the Mesa stage); SKIP and
+    // exit 0 without /dev/udmabuf, its GLES half SKIPs without a stage.
+    let run = root.join("target/xtask/runs/gate-wy93");
+    let _ = std::fs::remove_dir_all(&run);
+    let mut w = Command::new("bash");
+    w.current_dir(root)
+        .arg("host/tests/wy/93-dmabuf.sh")
+        .env("BITSOS_ROOT", root)
+        .env("BITSOS_RUN_DIR", &run)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    step("wy dmabuf", run_status(&mut w, "host/tests/wy/93-dmabuf.sh"), &mut res);
+    // INT-W27b (WY-3 CR3): bitscomp's X11 window manager against the host's Xwayland in namespaces of its own
+    // (headless); SKIPs and exits 0 without unshare, Xwayland or xdpyinfo.
+    let run = root.join("target/xtask/runs/gate-wy16");
+    let _ = std::fs::remove_dir_all(&run);
+    let mut w = Command::new("bash");
+    w.current_dir(root)
+        .arg("host/tests/wy/16-xwayland.sh")
+        .env("BITSOS_ROOT", root)
+        .env("BITSOS_RUN_DIR", &run)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    step("wy xwayland", run_status(&mut w, "host/tests/wy/16-xwayland.sh"), &mut res);
+    // INT-W28 (GM-1c CR-GM1c-3): the trace tools on the host, no QEMU; the host's render node only sees GET_CAP
+    // and INFO, and the script skips that part without one.
+    let run = root.join("target/xtask/runs/gate-gm30");
+    let _ = std::fs::remove_dir_all(&run);
+    let mut w = Command::new("bash");
+    w.current_dir(root)
+        .arg("host/tests/gm/30-drmtrace-tools.sh")
+        .env("BITSOS_ROOT", root)
+        .env("BITSOS_RUN_DIR", &run)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    step("gm drmtrace tools", run_status(&mut w, "host/tests/gm/30-drmtrace-tools.sh"), &mut res);
     step("forbid-unsafe", forbid_unsafe_gate(root), &mut res);
     step("drop-bounds", crate::dropcheck::drop_bounds_gate(root), &mut res);
+    step("home paths", home_path_gate(root), &mut res);
     if !skip_ktest {
         // INT-W9 (WL-4 CR 5): the gate's image carries the musl programs (/bin/sh, busybox, the ABI-diff set), so
         // the sysroot is built once in a worktree that has none (offline, from the read-only sources).
         step("sysroot", crate::abi_diff::sysroot(root).map(|_| ()), &mut res);
         let extra = gate_audio(root);
         step("ktest", ktest::run_ktests(root, &ktest::KtestOpts { filters: vec![String::new()], timeout: ktest::DEFAULT_TIMEOUT_S, build: BuildOpts::default(), net: "virtio".into(), extra, config: vec![] }), &mut res);
+        // INT-W18b (CP-8 CR-4): the nested-NMI check needs its CONFIG switch, so the plain run skips it. It needs a
+        // second CPU only (rb.crash.nmi_nested), so it runs at the default -smp 2 (LO-1 review 30.10.: at -smp 16
+        // OVMF failed to load bitsboot from the USB stick in about 2 of 3 boots, "No bootable option", whatever the
+        // image; at -smp 2 every boot of 13 measured loaded it).
+        let nest = ktest::KtestOpts {
+            filters: vec!["rb.crash.nmi_nested".into()],
+            timeout: ktest::DEFAULT_TIMEOUT_S,
+            build: BuildOpts::default(),
+            net: "none".into(),
+            extra: vec![],
+            config: vec!["rb_nmi_nest=on".into()],
+        };
+        step("ktest nmi-nested", ktest::run_ktests(root, &nest), &mut res);
+        // INT-W29 (RB-18 CR-6): the plain boot has no secret in CONFIG, so only a boot with made-up ones proves that
+        // the record holds no value and that both reached the kernel first.
+        let secret = ktest::KtestOpts {
+            filters: vec!["kernel.config.secret".into()],
+            timeout: ktest::DEFAULT_TIMEOUT_S,
+            build: BuildOpts::default(),
+            net: "virtio".into(),
+            extra: vec![],
+            config: vec!["token=rb18-fake-token-not-real".into(), "wlan_psk=rb18-fake-psk-not-real".into(), "rb18_expect_blanked=2".into()],
+        };
+        step("ktest config-secret", ktest::run_ktests(root, &secret), &mut res);
+        // INT-W21 (AB-16 CR): the NMI-backtrace storm against hostile sigreturn/iretq is QemuOnly and wants many
+        // CPUs to sample, which the plain run at the default smp does not give.
+        let storm = ktest::KtestOpts {
+            filters: vec!["ab.signal.nmi_storm".into()],
+            timeout: ktest::DEFAULT_TIMEOUT_S,
+            build: BuildOpts::default(),
+            net: "none".into(),
+            extra: vec!["-smp".into(), "16".into()],
+            config: vec![],
+        };
+        step("ktest nmi-storm", ktest::run_ktests(root, &storm), &mut res);
+        // C1 (A1 open point 6): the Mini-PC runs a release kernel and MCP runs the Safe tests on a 64 KiB thread,
+        // so the release build's Safe and Display tests run too, as over MCP (ktest_hw=on), each measured against
+        // 48 KiB (CONTRACTS section 5; a test over it is a red `KTEST note`).
+        step("ktest release", ktest::run_ktests(root, &release_ktest_opts()), &mut res);
     }
+    step("measure build", measure_build(root), &mut res);
+    step("warnings", warnings_gate(root, skip_ktest), &mut res);
     summary(&res)
+}
+
+/// The gate's release run: every Safe and Display test of a release kernel, with the stack budget of MCP's thread.
+fn release_ktest_opts() -> ktest::KtestOpts {
+    ktest::KtestOpts {
+        filters: vec![String::new()],
+        timeout: ktest::DEFAULT_TIMEOUT_S,
+        build: BuildOpts { release: true, ..BuildOpts::default() },
+        net: "virtio".into(),
+        extra: vec![],
+        config: vec!["ktest_hw=on".into(), "ktest_stack=48".into()],
+    }
+}
+
+/// The `warning` lines of a build's output (rustc's and cargo's, the lint summaries included).
+pub fn warning_lines(out: &str) -> Vec<String> {
+    out.lines().map(str::trim_end).filter(|l| l.starts_with("warning")).map(String::from).collect()
+}
+
+/// CONTRACTS §4 (Georg 29.10., INT-W28 post-integration): not one compiler warning in any build the gate made. The
+/// gate's builds again, mostly cached by now, so cargo only replays their diagnostics: the host crates with their
+/// tests, the user workspace with its tests, bitscomp (plain, wyclient, gpu, and its tests with the default
+/// features), ctxd and the Rust ABI programs (own workspaces, with their tests), the measuring kernel and, with the
+/// ktests, the ktest kernel, bitsboot and the user programs. The lean kernels have their own check (sc/30).
+fn warnings_gate(root: &Path, skip_ktest: bool) -> Result<(), String> {
+    let mut builds: Vec<(&str, Command)> = Vec::new();
+    let mut c = cargo(root);
+    c.args(["test", "--workspace", "--exclude", "kernel", "--no-run"]);
+    builds.push(("host crates", c));
+    // C1: every user crate's test cfg, not only the ones the gate runs (init, the tools and services too).
+    let mut c = cargo(root);
+    c.current_dir(root.join("user")).args(["check", "--tests", "--workspace"]);
+    builds.push(("user workspace tests", c));
+    let comp = root.join("user/services/bitscomp");
+    // As the wy scripts build them (their `cargo`, the gate's target dir).
+    for (what, args) in [
+        ("bitscomp", &["build", "--release", "--offline"][..]),
+        ("wyclient", &["build", "--release", "--offline", "-p", "wyclient"][..]),
+        ("bitscomp tests", &["check", "--tests", "--offline", "--workspace"][..]),
+    ] {
+        let mut c = Command::new("cargo");
+        c.current_dir(&comp).args(args).env("CARGO_TARGET_DIR", root.join("target"));
+        builds.push((what, c));
+    }
+    let mut c = cargo(root);
+    c.current_dir(&comp)
+        .args(["test", "--no-run", "--release", "--offline", "--locked", "--no-default-features", "--features", "gpu"])
+        .env("BITSCOMP_GPU_ROOT", "/usr")
+        .env("CARGO_TARGET_DIR", root.join("target/bitscomp-gpu"));
+    builds.push(("bitscomp gpu", c));
+    // Own workspaces outside user/'s (C1): ctxd with its integration tests, and the ABI diff programs in Rust (built
+    // for V2 by `abi-diff` with user/'s stable toolchain).
+    let mut c = Command::new("cargo");
+    c.current_dir(root.join("user/services/ctxd")).args(["check", "--tests", "--offline"]).env("CARGO_TARGET_DIR", root.join("target/ctxd-check"));
+    builds.push(("ctxd tests", c));
+    let mut c = Command::new("cargo");
+    c.current_dir(root.join("user/abi-tests/rust"))
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .args(["check", "--tests", "--offline"])
+        .env("CARGO_TARGET_DIR", root.join("target/abi-rs-check"));
+    builds.push(("abi-rs tests", c));
+    let cfg = std::fs::read_to_string(root.join(".cargo/config.toml")).map_err(|e| format!(".cargo/config.toml: {e}"))?;
+    let mut flags = kernel_rustflags(&cfg);
+    flags.extend(["--cfg".into(), "bitsos_fd_measure".into()]);
+    let mut c = cargo(root);
+    c.args(["build", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .env("CARGO_TARGET_DIR", root.join("target/measure-build"))
+        .env("CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS", flags.join(" "));
+    builds.push(("measure kernel", c));
+    if !skip_ktest {
+        let mut c = cargo(root);
+        c.args(["build", "-p", "kernel", "--target", "x86_64-unknown-none", "--features", "ktest"]);
+        builds.push(("ktest kernel", c));
+        let mut c = cargo(root);
+        c.args(["build", "-p", "bitsboot", "--target", "x86_64-unknown-uefi"]);
+        builds.push(("bitsboot", c));
+        let mut c = Command::new("cargo");
+        c.current_dir(root.join("user"))
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .args(["build", "--manifest-path", "Cargo.toml", "--target", "x86_64-unknown-linux-musl", "--release", "--target-dir"])
+            .arg(root.join("target/user"));
+        builds.push(("user programs", c));
+    }
+    let mut bad = Vec::new();
+    for (what, mut c) in builds {
+        let out = c.output().map_err(|e| format!("{what}: cannot start cargo: {e}"))?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() {
+            return Err(format!("{what}: the build failed ({})", out.status));
+        }
+        let w = warning_lines(&text);
+        eprintln!("xtask: warnings in {what}: {}", w.len());
+        for l in w.iter().take(20) {
+            eprintln!("  {l}");
+        }
+        if !w.is_empty() {
+            bad.push(format!("{what}: {}", w.len()));
+        }
+    }
+    if bad.is_empty() { Ok(()) } else { Err(format!("compiler warnings (CONTRACTS §4): {}", bad.join(", "))) }
+}
+
+/// The kernel target's rustflags from .cargo/config.toml (the quoted words of `[target.x86_64-unknown-none]`'s
+/// `rustflags` array; comments skipped).
+fn kernel_rustflags(config: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    let (mut in_target, mut in_array) = (false, false);
+    for l in config.lines() {
+        let t = l.split('#').next().unwrap_or("").trim();
+        if t.starts_with('[') && !in_array {
+            in_target = t == "[target.x86_64-unknown-none]";
+            continue;
+        }
+        if in_target && t.starts_with("rustflags") {
+            in_array = true;
+        }
+        if in_array {
+            v.extend(t.split('"').skip(1).step_by(2).map(String::from));
+            if t.contains(']') {
+                in_array = false;
+                in_target = false;
+            }
+        }
+    }
+    v
+}
+
+/// INT-W19 (AB-15 CR 7): the kernel with `--cfg bitsos_fd_measure` (FD-1's measuring build) still compiles
+/// (hal::entry::steps, hal::prof, syscall's ab15 ktests). Build only, no run, in a target dir of its own so the
+/// gate's kernel is not rebuilt.
+fn measure_build(root: &Path) -> Result<(), String> {
+    let cfg = std::fs::read_to_string(root.join(".cargo/config.toml")).map_err(|e| format!("measure build: .cargo/config.toml: {e}"))?;
+    let mut flags = kernel_rustflags(&cfg);
+    if flags.is_empty() {
+        return Err("measure build: no kernel rustflags in .cargo/config.toml".into());
+    }
+    flags.extend(["--cfg".into(), "bitsos_fd_measure".into()]);
+    let mut c = cargo(root);
+    c.args(["build", "-q", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .env("CARGO_TARGET_DIR", root.join("target/measure-build"))
+        .env("CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS", flags.join(" "));
+    run_status(&mut c, "cargo build (kernel, --cfg bitsos_fd_measure)")
 }
 
 pub fn cmd_test(root: &Path, mut a: Args) -> Result<(), String> {
@@ -136,11 +501,18 @@ fn is_slow(path: &Path) -> bool {
     std::fs::read_to_string(path).map(|s| s.lines().take(5).any(|l| l.trim_start_matches('#').trim().starts_with("slow") && l.starts_with('#'))).unwrap_or(false)
 }
 
-/// Scenario scripts grouped by lane folder: `host/tests/<lane>/*.sh`.
+/// Georg 30.10., programs only on the Mini-PC: a script that boots a program tree in QEMU says `# minipc: <where its
+/// checks run now>` in its first five lines; no regular QEMU run starts it.
+fn is_minipc(path: &Path) -> bool {
+    std::fs::read_to_string(path).map(|s| s.lines().take(5).any(|l| l.starts_with('#') && l.trim_start_matches('#').trim().starts_with("minipc:"))).unwrap_or(false)
+}
+
+/// Scenario scripts grouped by lane folder: `host/tests/<lane>/*.sh`. Not `host/tests/minipc/` (the desk's runs against
+/// the real machine) and no script marked `# minipc:`.
 fn find_scripts(root: &Path, quick: bool) -> Vec<(String, Vec<Script>)> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(root.join("host/tests")) else { return out };
-    let mut dirs: Vec<_> = rd.flatten().filter(|e| e.path().is_dir()).collect();
+    let mut dirs: Vec<_> = rd.flatten().filter(|e| e.path().is_dir() && e.file_name() != "minipc").collect();
     dirs.sort_by_key(|e| e.file_name());
     for d in dirs {
         let lane = d.file_name().to_string_lossy().to_lowercase();
@@ -148,7 +520,7 @@ fn find_scripts(root: &Path, quick: bool) -> Vec<(String, Vec<Script>)> {
             .map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().map(|x| x == "sh").unwrap_or(false)).collect::<Vec<_>>())
             .unwrap_or_default()
             .into_iter()
-            .filter(|p| !(quick && is_slow(p)))
+            .filter(|p| !(quick && is_slow(p)) && !is_minipc(p))
             .map(|p| Script { lane: lane.clone(), name: p.file_stem().unwrap().to_string_lossy().to_string(), path: p })
             .collect();
         sc.sort_by(|a, b| a.path.cmp(&b.path));
@@ -260,6 +632,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn home_lines_find_the_home_as_a_path_only() {
+        let t = b"a\nx=/home/ann/BitsOS/y\n'/home/ann'\n/home/anna/x\n/home/ann.bak\n$HOME/BitsOS\n/home/ann";
+        assert_eq!(home_lines(t, "/home/ann"), [2, 3, 7]);
+        assert!(home_lines(b"/data/home/1000/Downloads\n", "/home/ann").is_empty());
+    }
+
+    #[test]
+    fn the_tree_names_no_home_outside_plan() {
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+        if std::env::var("HOME").is_ok_and(|h| h.matches('/').count() >= 2) {
+            home_path_gate(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_release_ktest_step_runs_as_mcp_does() {
+        let o = release_ktest_opts();
+        assert!(o.build.release);
+        assert_eq!(o.config, ["ktest_hw=on", "ktest_stack=48"]);
+        assert_eq!(o.filters, [""]);
+    }
+
+    #[test]
+    fn warning_lines_are_found() {
+        let out = "   Compiling a v0.1.0\nwarning: unused import: `x`\n --> a.rs:1:5\nwarning: `a` (lib) generated 1 warning\n    Finished `dev`\n";
+        assert_eq!(warning_lines(out).len(), 2);
+        assert!(warning_lines("    Finished `dev` profile\nerror: no\n").is_empty());
+    }
+
+    #[test]
+    fn kernel_rustflags_from_config() {
+        let cfg = "[build]\nx = 1\n[target.x86_64-unknown-none]\nrustflags = [\n  \"-C\", \"code-model=kernel\",\n  # a \"comment\"\n  \"-C\", \"force-frame-pointers=yes\",\n]\n[target.x86_64-unknown-uefi]\nrustflags = [\"-C\", \"x\"]\n";
+        assert_eq!(kernel_rustflags(cfg), ["-C", "code-model=kernel", "-C", "force-frame-pointers=yes"]);
+        let real = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.cargo/config.toml")).unwrap();
+        assert!(kernel_rustflags(&real).iter().any(|f| f == "code-model=kernel"));
+    }
+
+    #[test]
+    fn unsafe_outside_src_detection() {
+        assert!(mentions_unsafe("fn f() { unsafe { g() } }\n"));
+        assert!(!mentions_unsafe("// unsafe here is only a comment\nfn f() {}\n"));
+        assert!(!mentions_unsafe("fn unsafe_name() {}\n"));
+    }
+
+    #[test]
     fn forbid_unsafe_detection() {
         assert!(has_forbid_unsafe("//! doc\n#![no_std]\n#![forbid(unsafe_code)]\npub fn f() {}\n"));
         assert!(has_forbid_unsafe("#![cfg_attr(not(test), no_std)]\n\n// c\n#![forbid(unsafe_code)]\n"));
@@ -296,6 +713,9 @@ mod tests {
         std::fs::write(d.join("a_ok.sh"), "echo lane=$BITSOS_LANE $BITSOS_PORT_LO-$BITSOS_PORT_HI\ntest -d \"$BITSOS_RUN_DIR\"\n").unwrap();
         std::fs::write(d.join("b_bad.sh"), "exit 3\n").unwrap();
         std::fs::write(d.join("c_slow.sh"), "# slow\nsleep 30\n").unwrap();
+        std::fs::write(d.join("d_tree.sh"), "#!/bin/bash\n# minipc: the check list\nexit 9\n").unwrap();
+        std::fs::create_dir_all(root.join("host/tests/minipc")).unwrap();
+        std::fs::write(root.join("host/tests/minipc/lo.sh"), "exit 9\n").unwrap();
         let chains = find_scripts(&root, false);
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].1.len(), 3);

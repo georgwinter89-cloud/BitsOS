@@ -62,6 +62,10 @@ fn walk(ctx: &ToolContext, ns: &MountNs, root: &Path) -> Result<Vec<(String, Pat
             let name = utf8(&p.dentry.name());
             let r = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             let mount = ns.is_mountpoint(&p);
+            // MC-10: the installer's grants are neither listed nor hashed.
+            if p.dentry.is_dir() && super::access_store_refusal(&super::canonical(ns, &p)).is_some() {
+                continue;
+            }
             if p.dentry.is_dir() && !mount {
                 stack.try_reserve(1).map_err(|_| nomem())?;
                 stack.push((r.clone(), p.clone()));
@@ -128,6 +132,9 @@ fn manifest(ctx: &ToolContext, args: &Json) -> ToolResult {
         Err(e) => return Err(fail(path, e)),
     };
     let canon = canonical(&ns, &root);
+    if let Some(why) = super::access_store_refusal(&canon) {
+        return Err(super::refuse("manifest", path, why));
+    }
     policy_path(ctx, "manifest", &canon, false, false)?;
     if !root.dentry.is_dir() {
         return Err(fail(path, ENOTDIR));

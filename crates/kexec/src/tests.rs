@@ -512,7 +512,9 @@ fn reload_config_takes_the_stick_file_with_its_guards() {
         assert_eq!(o, Outcome::KeptKeys(vec!["nvme_write"]), "{}", String::from_utf8_lossy(f));
         assert_eq!(effective(&c, "nvme_write").as_deref(), Some("off"));
         assert_eq!(effective(&c, "snd_output").as_deref(), Some("hdmi"));
-        assert_eq!(effective(&c, "token").as_deref(), Some("t"));
+        // RB-18: the reader never copies a secret's value.
+        assert_eq!(effective(&c, "token").as_deref(), Some("*"));
+        assert!(c.windows(8).any(|w| w == b"token=t\n"));
         assert!(fs_fat::protect::config_guard(boot, &c).is_ok());
         assert!(!String::from_utf8_lossy(&c).to_ascii_lowercase().contains("nvme_write=on") && !String::from_utf8_lossy(&c).to_ascii_lowercase().contains("nvme_write = on"));
     }
@@ -630,4 +632,215 @@ fn reload_into_another_generation_hands_its_record_on() {
     let nb = BootInfo::parse(&out).unwrap();
     assert_eq!((nb.generation(), nb.config()), (Some(g), Some(&b"a=1\n"[..])));
     assert_eq!(BootInfo::parse(&handover::refresh(&small[..len], 4096, None, None).unwrap()).unwrap().generation(), None);
+}
+
+// ---- RB-17 fixer: the jump's tail in kexec's own order --------------------------------------------------------
+
+static TAIL: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn tail_note(s: String) {
+    TAIL.lock().unwrap().push(s);
+}
+
+/// A keep store that records every crumb it gets (the watchdog's count register in the real kernel).
+struct RecordingKeep;
+impl klog::crumb::Store for RecordingKeep {
+    fn leave(&self, c: &klog::crumb::Crumb<'_>) -> bool {
+        tail_note(std::format!("crumb {} {}", c.stage.as_str(), c.what));
+        true
+    }
+}
+static KEEP: RecordingKeep = RecordingKeep;
+
+fn tail_before() {
+    let last = klog::crumb::last().map(|(_, st, _)| st);
+    tail_note(std::format!("before jumping={} last={:?}", crate::tool::reload_jumping(), last));
+}
+fn tail_after_failed() {
+    tail_note(std::format!("after_failed jumping={}", crate::tool::reload_jumping()));
+}
+
+/// The before-jump hook (the watchdog's stop) runs once, right after the `reload_jump` crumb and before the jump;
+/// a jump that returns reports, takes the flag down and then runs the failed-jump hook (the watchdog armed again),
+/// with no second before-jump hook. A Reload refused before the jump returns earlier in `reload_now` and never
+/// reaches this tail.
+#[test]
+fn the_jump_tail_stops_the_watchdog_after_the_last_crumb_and_rearms_only_after_a_failed_jump() {
+    assert!(klog::crumb::set_keep(&KEEP), "no other kexec host test installs a keep store");
+    static BEFORE: fn() = tail_before;
+    static AFTER: fn() = tail_after_failed;
+    crate::tool::set_jumping(true);
+    let e = crate::tool::jump_tail(Some(&BEFORE), Some(&AFTER), || {
+        tail_note("jump".into());
+        "stub refused"
+    }, |e| tail_note(std::format!("failed {e}")));
+    assert_eq!(e, "stub refused");
+    let got = core::mem::take(&mut *TAIL.lock().unwrap());
+    assert_eq!(got, [
+        "crumb reload_jump reload",
+        "before jumping=true last=Some(ReloadJump)",
+        "jump",
+        "failed stub refused",
+        "after_failed jumping=false",
+    ]);
+    assert!(!crate::tool::reload_jumping(), "a later quiesce is a reboot's");
+    // Without hooks (no watchdog): the crumb and the jump only.
+    crate::tool::set_jumping(true);
+    crate::tool::jump_tail(None, None, || tail_note("jump".into()), |_| tail_note("failed".into()));
+    let got = core::mem::take(&mut *TAIL.lock().unwrap());
+    assert_eq!(got, ["crumb reload_jump reload", "jump", "failed"]);
+    assert!(!crate::tool::reload_jumping());
+}
+
+/// RB-18: the blanking finds every spelling and keeps everything else, byte for byte.
+#[test]
+fn secret_values_are_blanked_in_place() {
+    use crate::secret::{blanked, holds_value, is_secret, value_ranges};
+    let text: &[u8] = b"a=1\ntoken=fake-t\r\n# wlan_psk=fake-old\nwlan_psk = fake#psk # note\nWLAN_PSK=fake-up\n\xef\xbb\xbfclaude_api_key=fake-k\nb=2 # token=fake-c\nnotoken=keep\nempty_secret=keep\ntoken=\n";
+    let out = blanked(text);
+    assert_eq!(out.len(), text.len());
+    assert!(!out.windows(4).any(|w| w == b"fake"), "{}", String::from_utf8_lossy(&out));
+    assert_eq!(
+        out,
+        b"a=1\ntoken=      \r\n# wlan_psk=        \nwlan_psk =                \nWLAN_PSK=       \n\xef\xbb\xbfclaude_api_key=      \nb=2 # token=      \nnotoken=keep\nempty_secret=keep\ntoken=\n"
+    );
+    assert!(holds_value(text));
+    assert!(!holds_value(&out));
+    assert!(value_ranges(b"a=1\nb=2").is_empty());
+    assert!(value_ranges(&out).iter().all(|r| out[r.clone()].iter().all(|&b| b == b' ')), "a second pass finds only spaces");
+    for k in ["token", " wlan_psk ", "CLAUDE_API_KEY", "\u{feff}token"] {
+        assert!(is_secret(k), "{k}");
+    }
+    assert!(!is_secret("token2") && !is_secret("mcp_port") && !is_secret(""));
+}
+
+/// RB-18: the running kernel's boot copy is blanked, so the same file still counts as unchanged and is the
+/// source of the secrets; every path through the choice keeps the file's values and never adds the boot copy's.
+#[test]
+fn reload_config_gets_the_secrets_from_the_stick() {
+    use crate::refresh::{FileNow, Outcome, choose_config, effective};
+    use crate::secret::blanked;
+    let file: &[u8] = b"token=fake-t\nwlan_psk=fake-p\nmcp_port=8765\n";
+    let boot = blanked(file);
+    let t = |s: &[u8]| FileNow::Text(s.to_vec());
+    assert_eq!(choose_config(&boot, t(file)), (Some(file.to_vec()), Outcome::Unchanged));
+    // A file with no secrets at all is the old "unchanged": nothing to hand on.
+    assert_eq!(choose_config(b"a=1\n", t(b"a=1\n")), (None, Outcome::Unchanged));
+    // A key written since the boot: the file as it is, with its secrets.
+    let added: &[u8] = b"token=fake-t\nwlan_psk=fake-p\nmcp_port=8765\nsnd_output=hdmi\n";
+    assert_eq!(choose_config(&boot, t(added)), (Some(added.to_vec()), Outcome::Fresh));
+    // A new passphrase on the stick reaches the new kernel.
+    let changed: &[u8] = b"token=fake-t\nwlan_psk=fake-new\nmcp_port=8765\n";
+    assert_eq!(choose_config(&boot, t(changed)).0.as_deref(), Some(changed));
+    // Kept keys: the merge takes the secrets from the file and only the kept lines from the boot copy.
+    let boot2 = blanked(b"token=fake-t\nwlan_psk=fake-p\nnvme_write=off\n");
+    let (c, o) = choose_config(&boot2, t(b"token=fake-t\nwlan_psk=fake-p\nnvme_write=on\n"));
+    assert_eq!(o, Outcome::KeptKeys(vec!["nvme_write"]));
+    let c = c.unwrap();
+    assert!(c.windows(16).any(|w| w == b"wlan_psk=fake-p\n") && c.windows(13).any(|w| w == b"token=fake-t\n"));
+    assert_eq!(effective(&c, "nvme_write").as_deref(), Some("off"));
+    // Safe mode and a stick that does not answer: the plain choice has no text (the refill below adds the token).
+    let safe = blanked(b"profile=gaming-pc\ntoken=fake-t\n");
+    assert_eq!(choose_config(&safe, t(b"token=fake-t\nb=1\n")), (None, Outcome::SafeMode));
+    assert_eq!(choose_config(&boot, FileNow::Slow), (None, Outcome::Slow));
+    // A secret's value is never copied by the reader: it reads as `*`, empty stays empty.
+    assert_eq!(effective(file, "wlan_psk").as_deref(), Some("*"));
+    assert_eq!(effective(&boot, "wlan_psk").as_deref(), Some(""));
+}
+
+/// RB-18: without a file the token goes on from the running kernel, in place, so the text keeps its size; the
+/// WLAN passphrase cannot, and is named.
+#[test]
+fn reload_without_the_stick_keeps_the_token_and_names_what_is_lost() {
+    use crate::refresh::effective;
+    use crate::secret::{blanked, holds_value, missing, refill};
+    let boot = blanked(b"token=fake-t\nwlan_psk=fake-p\nmcp_port=8765");
+    let live = |k: &str| (k == "token").then(|| String::from("fake-t"));
+    let text = refill(&boot, &live).unwrap();
+    assert_eq!(text, b"token=fake-t\nwlan_psk=      \nmcp_port=8765", "{}", String::from_utf8_lossy(&text));
+    assert_eq!(missing(&boot, &text), vec!["wlan_psk"]);
+    assert_eq!(missing(&boot, &boot), vec!["token", "wlan_psk"]);
+    assert!(missing(&boot, b"token=x\nwlan_psk=y\n").is_empty());
+    // The line the parser read, not an older one or a comment; what stood behind the value stays blank.
+    let many = blanked(b"token=old\n# token=fake-c\ntoken=fake-t # note\r\n");
+    assert_eq!(refill(&many, &live).unwrap(), b"token=   \n# token=      \ntoken=fake-t       \r\n");
+    // The next kernel blanks that line too and a second such Reload works the same way.
+    let next = blanked(&text);
+    assert!(!holds_value(&next));
+    assert_eq!(refill(&next, &live).unwrap(), text);
+    // Nothing to write back: no secret line, no live value, a value already there, a blank too short for the value
+    // (not what this kernel blanked).
+    assert_eq!(refill(b"a=1\n", &live), None);
+    assert_eq!(refill(&boot, &|_| None), None);
+    assert_eq!(refill(&boot, &|_| Some(String::new())), None);
+    assert_eq!(refill(b"token=fake-t\n", &live), None);
+    assert_eq!(refill(b"token=  \n", &live), None);
+    assert_eq!(refill(b"token=\n", &live), None);
+    assert!(missing(b"a=1\n", b"").is_empty());
+    assert_eq!(effective(&text, "mcp_port").as_deref(), Some("8765"));
+}
+
+/// RB-18: a line that never had a value is no loss; `claude_api_key` has no reader; only what the network needs
+/// holds a Reload back.
+#[test]
+fn reload_loss_counts_only_what_had_a_value_and_has_a_reader() {
+    use crate::secret::{blanked, loss_blocks_reload, missing};
+    assert!(missing(b"wlan_psk=\ntoken=\r\n", b"").is_empty(), "empty from the start");
+    assert!(missing(b"# wlan_psk=      \n", b"").is_empty(), "a comment is no value");
+    assert!(missing(&blanked(b"claude_api_key=fake-k\n"), b"").is_empty(), "no reader");
+    assert!(missing(b"wlan_psk=x\nwlan_psk=\n", b"").is_empty(), "the last line wins");
+    assert_eq!(missing(&blanked(b"wlan_psk=x\r\n"), b""), vec!["wlan_psk"]);
+    assert!(!loss_blocks_reload(&[], true));
+    assert!(loss_blocks_reload(&["wlan_psk"], true));
+    assert!(!loss_blocks_reload(&["wlan_psk"], false), "WLAN off: nothing to join");
+    assert!(loss_blocks_reload(&["token"], false));
+}
+
+/// RB-18: no newline at the end of the file, a bare `\r` (an old Mac file): the value goes all the same.
+#[test]
+fn secret_values_at_the_file_end_and_behind_a_bare_cr() {
+    use crate::secret::{blanked, holds_value};
+    assert_eq!(blanked(b"a=1\nwlan_psk=fake"), b"a=1\nwlan_psk=    ");
+    let old_mac: &[u8] = b"a=1\rwlan_psk=fake\rb=2\r";
+    let out = blanked(old_mac);
+    assert_eq!(out, b"a=1\rwlan_psk=        \r", "to the line's end: {}", String::from_utf8_lossy(&out));
+    assert!(holds_value(old_mac) && !holds_value(&out));
+    assert_eq!(blanked(b"token=ab\rcd\r\nb=2\n"), b"token=     \r\nb=2\n");
+}
+
+/// RB-18: a stick file too large for the KEEP block leaves the blanked record: the token goes back into it.
+#[test]
+fn reload_config_too_large_keeps_the_token_from_the_running_kernel() {
+    use crate::refresh::{Outcome, Plan, rebuild_with};
+    use bootinfo::{BootInfo, Writer};
+    let blank: &[u8] = b"token=      \nwlan_psk=      \n";
+    let mut staged = alloc::vec![0u8; 256];
+    let n = {
+        let mut w = Writer::new(&mut staged).unwrap();
+        w.config(blank).unwrap();
+        w.len()
+    };
+    staged.truncate(n);
+    let cap = n + 8;
+    let plan = Plan { config: Some(alloc::vec![b'x'; 200]), outcome: Outcome::Fresh, generation: None, switched: false, boot_bytes: blank.len() };
+    let live = |k: &str| (k == "token").then(|| String::from("fake-t"));
+    let r = rebuild_with(&staged, cap, &plan, &live);
+    assert!(!r.config && r.error.is_some());
+    assert_eq!(BootInfo::parse(&r.bytes.unwrap()).unwrap().config(), Some(&b"token=fake-t\nwlan_psk=      \n"[..]));
+    // Nothing the running kernel could write back and no generation: the staged bytes stay, as before.
+    let r = rebuild_with(&staged, cap, &plan, &|_| None);
+    assert!(r.bytes.is_none() && r.error.is_some());
+}
+
+/// RB-18: the plan's line says what happens to the CONFIG, whichever text goes with the outcome.
+#[test]
+fn reload_plan_lines_tell_the_truth_about_secrets() {
+    use crate::refresh::{Outcome, Plan, Rebuilt, describe};
+    let plan = |config: Option<&[u8]>, outcome| Plan { config: config.map(<[u8]>::to_vec), outcome, generation: None, switched: false, boot_bytes: 40 };
+    let r = |config| Rebuilt { bytes: None, config, generation: false, error: None };
+    assert_eq!(describe(&plan(Some(b"token=fake-t\n"), Outcome::Unchanged), &r(true), 4096), "CONFIG: unchanged since boot (40 bytes)");
+    let slow = describe(&plan(Some(b"token=fake-t\n"), Outcome::Slow), &r(true), 4096);
+    assert_eq!(slow, "CONFIG: the boot copy (40 bytes, boot_copy_slow)");
+    assert!(describe(&plan(Some(b"token=fake-t\n"), Outcome::Fresh), &r(false), 8).contains("does not fit the KEEP block"));
+    assert!(describe(&plan(Some(b"token=fake-t\nx=1\n"), Outcome::Fresh), &r(true), 4096).contains("the stick's CONFIG.TXT (17 bytes, boot copy 40)"));
 }

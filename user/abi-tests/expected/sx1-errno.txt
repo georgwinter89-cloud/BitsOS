@@ -1,0 +1,22 @@
+PR_GET_SECCOMP = 0
+before: NoNewPrivs: 0; Seccomp: 0; Seccomp_filters: 0; 
+PR_SET_NO_NEW_PRIVS = 0
+filter 1 = 0
+getppid = -EPERM
+uname = -errno 5
+getegid (ERRNO 0) = 0
+geteuid (ERRNO 0xffff) = -errno 4095
+getpid runs: yes
+one filter: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+filter 2 = 0
+getppid (newer filter's data) = -EACCES
+uname (ERRNO beats ALLOW) = -errno 5
+getuid under LOG runs: yes
+getgid under ALLOW with data runs: yes
+PR_GET_SECCOMP = 2
+strict after a filter = -EINVAL
+PR_SET_SECCOMP(1) after a filter = -EINVAL
+filter 3 = 0
+getpgid(12345) = -E2BIG
+getpgid(0) runs: yes
+three filters: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 3; 

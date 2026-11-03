@@ -60,12 +60,8 @@ impl Mount {
     }
 }
 
-/// `/proc/self/mountinfo`: field 5 is the mount point (octal escapes), after " - " come the fs type and the
-/// source.
-pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
-    text.lines().filter_map(|l| parse_mount_line(l).map(|(m, _)| m)).collect()
-}
-
+/// One line of `/proc/self/mountinfo`: field 5 is the mount point (octal escapes), after " - " come the fs type and
+/// the source.
 fn parse_mount_line(line: &str) -> Option<(Mount, Option<String>)> {
     let (left, right) = line.split_once(" - ")?;
     let point = left.split(' ').nth(4)?;
@@ -332,10 +328,11 @@ mod tests {
     fn mountinfo_parses_escapes_and_types() {
         let t = "36 35 98:0 / /mnt/my\\040disk rw,noatime master:1 - ntfs3 /dev/nvme0n1p3 rw\n\
                  37 35 98:1 / / rw - ext4 /dev/root rw\n";
-        let m = parse_mountinfo(t);
+        let m: Vec<_> = t.lines().filter_map(parse_mount_line).collect();
         assert_eq!(m.len(), 2);
-        assert_eq!(m[0].point, PathBuf::from("/mnt/my disk"));
-        assert_eq!(m[0].fstype, "ntfs3");
+        assert_eq!(m[0].0.point, PathBuf::from("/mnt/my disk"));
+        assert_eq!(m[0].0.fstype, "ntfs3");
+        assert_eq!(m[0].1.as_deref(), Some("/dev/nvme0n1p3"), "the source feeds the partition type lookup");
     }
 
     #[test]

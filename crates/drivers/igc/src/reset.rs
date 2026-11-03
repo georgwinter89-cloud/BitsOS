@@ -7,7 +7,7 @@ use crate::regs::{self, ctrl, status, Model};
 /// What the reset saw; the caller logs it (B6) where logging is allowed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResetReport {
-    /// STATUS.GIO_MASTER_ENABLE still set after 100 ms (Linux only logs it too and goes on).
+    /// STATUS.GIO_MASTER_ENABLE still set after the GIO bound (Linux only logs it too and goes on).
     pub gio_timeout: bool,
     /// EECD auto-read not reported within 20 ms (QEMU never reports it).
     pub auto_read_timeout: bool,
@@ -23,7 +23,13 @@ pub enum ResetKind {
     Device,
 }
 
-const GIO_WAIT_US: u64 = 100_000;
+/// Linux `igc_disable_pcie_master` (igc_mac.c:27): `MASTER_DISABLE_TIMEOUT` (800) polls 2-3 ms apart. A reset
+/// with master requests still pending is what RB-15 must avoid (the Mini-PC's FCH floods on DMA cut by a reset),
+/// so the quiesce of a reboot or power-off waits Linux's time. A card normally answers in microseconds.
+pub const GIO_WAIT_US: u64 = 1_600_000;
+/// The bound everywhere else (bring-up, a failed card, the quiesce of a Reload or a panic): the wait is a spin,
+/// on the panic path with interrupts off (B4), and these resets are not followed by the platform reset.
+pub const GIO_WAIT_SHORT_US: u64 = 100_000;
 const PRE_RESET_US: u64 = 10_000;
 const AUTO_READ_US: u64 = 20_000;
 const STEP_US: u64 = 100;
@@ -39,14 +45,15 @@ pub fn quiet<H: Hw + ?Sized>(hw: &H, model: Model) {
 /// The reset of Linux `igc_reset_hw_base` in V1's order: PTM off (I226), GIO master disable and its wait, all
 /// causes masked, RCTL = 0, TCTL = PSP, flush, 10 ms, CTRL.RST (or DEV_RST), wait for the NVM auto-read,
 /// masked again.
-pub fn reset<H: Hw + ?Sized>(hw: &H, model: Model, kind: ResetKind) -> ResetReport {
+/// `gio_us` bounds the wait for pending master requests (`GIO_WAIT_US` or `GIO_WAIT_SHORT_US`).
+pub fn reset<H: Hw + ?Sized>(hw: &H, model: Model, kind: ResetKind, gio_us: u64) -> ResetReport {
     let mut r = ResetReport::default();
     if model == Model::I226 {
         // A PTM cycle across the reset hangs the I226; the 82576 has no PTM.
         hw.wr(regs::PTM_CTRL, hw.rd(regs::PTM_CTRL) & regs::PTM_CTRL_KEEP);
     }
     hw.set_bits(regs::CTRL, ctrl::GIO_MASTER_DISABLE);
-    r.gio_timeout = !until(hw, GIO_WAIT_US, STEP_US, || hw.rd(regs::STATUS) & status::GIO_MASTER_ENABLE == 0);
+    r.gio_timeout = !until(hw, gio_us, STEP_US, || hw.rd(regs::STATUS) & status::GIO_MASTER_ENABLE == 0);
     quiet(hw, model);
     hw.wr(regs::RCTL, 0);
     hw.wr(regs::TCTL, regs::TCTL_PSP);

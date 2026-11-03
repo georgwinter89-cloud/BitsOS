@@ -3,8 +3,8 @@
 # `tree brave host:/var/tmp/claude-v2/stage/brave`) from CachyOS's Brave (pacman brave-bin, /opt/brave-bin; read
 # only, nothing is downloaded):
 #   brave, *.pak, icudtl.dat, v8_context_snapshot.bin, libvulkan/libvk_swiftshader, MEIPreload/, ...
-#                      as installed, without: chrome-sandbox (setuid helper; V2 runs Brave with --no-sandbox and FAT
-#                      has no setuid), chrome-management-service (enterprise device trust), libqt5_shim.so and
+#                      as installed, without: chrome-sandbox (setuid helper; FAT has no setuid, and Brave's
+#                      sandbox on V2 is the unprivileged namespace one, BR-6), chrome-management-service (enterprise device trust), libqt5_shim.so and
 #                      libqt6_shim.so (only with --ui-toolkit=qt or a KDE session; their ldd would pull Qt 5 and 6),
 #                      the Debian/AppArmor helpers (apparmor.d/, cron/, default-app-block), the wrapper script
 #                      brave-browser (bitsos/brave replaces it), and every UI language but de, en-US, en-GB
@@ -18,7 +18,21 @@
 #   etc/fonts/         fonts.conf (files/fonts.conf: V2 paths) and the package conf.d rules for these fonts
 #   fontcache/         fontconfig's cache for /boot/BITSOS2/brave/fonts, made by fc-cache against a staged root,
 #                      its directory checksum set to what fontconfig computes on FAT (see fat_checksum below)
-#   share/icons/       the Adwaita cursor theme (libwayland-cursor), hicolor's index.theme
+#   share/icons/       Adwaita 51: the cursors (libwayland-cursor) and the icons GTK's dialogs draw (the file chooser
+#                      of Save as and of a download), every SVG drawn to PNG here (no SVG loader in the tree), with a
+#                      new icon-theme.cache; hicolor's index.theme (the fallback theme; its folders hold app icons)
+#   share/mime/        the shared-mime-info database (update-mime-database of freedesktop.org.xml): gdk-pixbuf picks
+#                      its loader by the content type GIO guesses from it (BR-7: without it GTK aborts on its first
+#                      icon, "Unrecognized image file format")
+#   glycin/glycin-image-rs, share/glycin-loaders/2+/conf.d/
+#                      gdk-pixbuf 2.44's image loader (CachyOS builds it with glycin: png, jpeg, gif, webp, ... are
+#                      built-in modules that run a loader program), its config with Exec= pointing into the tree
+#                      (found through XDG_DATA_DIRS)
+#   libexec/bwrap      files/bwrap: answers glycin as Bubblewrap does without user namespaces, so glycin runs its
+#                      loader without a sandbox (it fails every image when it cannot start bwrap at all); on V2 the
+#                      real /bin/bwrap (SX-3b) wins, so only a run without it uses this one (BR retires it, desk-C1)
+#   etc/gdk-pixbuf/loaders.cache  gdk-pixbuf's module list (GDK_PIXBUF_MODULE_FILE): no module beyond the built-in
+#                      glycin ones, so nothing outside the tree is read
 #   share/glib-2.0/schemas/  GTK 3's GSettings schemas (GTK aborts without org.gtk.Settings.FileChooser)
 #   LICENSES/          Brave's LICENSE and the licence texts of every other package copied here
 # The stage is replaced as a whole (new dir, rename). Run it again after a Brave update (pacman -Syu).
@@ -31,12 +45,14 @@ die() { echo "stage-v2: $*" >&2; exit 1; }
 for f in brave resources.pak icudtl.dat v8_context_snapshot.bin locales/en-US.pak LICENSE; do
   [ -e "$SRC/$f" ] || die "$SRC/$f is missing (pacman -S brave-bin)"
 done
-for t in fc-cache glib-compile-schemas pacman python3; do command -v $t >/dev/null || die "no $t on this host"; done
+for t in fc-cache glib-compile-schemas update-mime-database gtk-encode-symbolic-svg rsvg-convert gtk-update-icon-cache \
+    pacman python3; do command -v $t >/dev/null || die "no $t on this host"; done
 
-NEW=$DEST.new ROOT=$DEST.root
-rm -rf "$NEW" "$ROOT" "$DEST.old"
-mkdir -p "$NEW"
-trap 'rm -rf "$NEW" "$ROOT"' EXIT
+# Work dirs next to the stage (TMPD: the MIME database's and the schemas' sources), all gone at exit, also after die.
+NEW=$DEST.new ROOT=$DEST.root TMPD=$DEST.tmp
+rm -rf "$NEW" "$ROOT" "$TMPD" "$DEST.old"
+mkdir -p "$NEW" "$TMPD"
+trap 'rm -rf "$NEW" "$ROOT" "$TMPD"' EXIT
 
 skip='^(chrome-sandbox|chrome-management-service|libqt5_shim\.so|libqt6_shim\.so|apparmor\.d|cron|default-app-block|brave-browser|locales)$'
 for e in "$SRC"/*; do
@@ -121,14 +137,79 @@ for c in caches:
 print(f"stage-v2: fontconfig cache: {len(names)} fonts, FAT checksum {(a + (b << 16)) & 0xFFFFFFFF:#010x}", file=sys.stderr)
 PY
 
-mkdir -p "$NEW/share/icons/Adwaita" "$NEW/share/icons/hicolor"
-cp -rL /usr/share/icons/Adwaita/cursors "$NEW/share/icons/Adwaita/"
-printf '[Icon Theme]\nName=Adwaita\nComment=The Adwaita cursor theme (BitsOS V2: cursors only)\nInherits=hicolor\nDirectories=\n' \
-  >"$NEW/share/icons/Adwaita/index.theme"
+# BR-7: Adwaita (cursors, icons, index.theme) with every SVG drawn to PNG here, since the tree has no SVG loader
+# (glycin-svg links librsvg, cairo, pango, ... which would fill lib/ with libraries Brave never loads): the symbolic
+# icons GTK's dialogs use as GTK's own encoded `<name>.symbolic.png` (gtk-encode-symbolic-svg, 16 px: GTK 3 takes them
+# before an .svg and recolours them), the other scalable ones as 64 px PNGs (rsvg-convert); icon-theme.cache made
+# again for these files (the host's names .svg files).
+A=$NEW/share/icons/Adwaita
+mkdir -p "$NEW/share/icons/hicolor"
+cp -rL /usr/share/icons/Adwaita "$NEW/share/icons/"
+for f in index.theme cursors/default symbolic/places/folder-symbolic.svg scalable/status/image-missing.svg \
+    16x16/places/folder.png; do
+  [ -e "$A/$f" ] || die "/usr/share/icons/Adwaita/$f is missing (pacman -S adwaita-icon-theme)"
+done
+# shellcheck disable=SC2016
+find "$A/symbolic" -name '*.svg' -print0 \
+  | xargs -0 -P "$(nproc)" -n 16 sh -c 'for f; do gtk-encode-symbolic-svg -o "${f%/*}" "$f" 16x16 || exit 1; done' _ \
+  || die "gtk-encode-symbolic-svg failed"
+# shellcheck disable=SC2016
+find "$A/scalable" -name '*.svg' -print0 \
+  | xargs -0 -P "$(nproc)" -n 16 sh -c 'for f; do rsvg-convert -w 64 -h 64 -o "${f%.svg}.png" "$f" || exit 1; done' _ \
+  || die "rsvg-convert failed"
+n_svg=$(find "$A" -name '*.svg' | wc -l)
+[ "$(find "$A/symbolic" -name '*.symbolic.png' | wc -l)" = "$(find "$A/symbolic" -name '*.svg' | wc -l)" ] \
+  || die "not every symbolic icon was encoded"
+find "$A" -name '*.svg' -delete
+rm -f "$A/icon-theme.cache"
+gtk-update-icon-cache -q -f "$A" || die "gtk-update-icon-cache $A failed"
+echo "stage-v2: Adwaita: $n_svg SVG icons drawn to PNG" >&2
 cp /usr/share/icons/hicolor/index.theme "$NEW/share/icons/hicolor/"
-PKGS="$PKGS $(pacman -Qoq /usr/share/icons/Adwaita/cursors/default) $(pacman -Qoq /usr/share/icons/hicolor/index.theme)"
+PKGS="$PKGS $(pacman -Qoq /usr/share/icons/Adwaita/index.theme) $(pacman -Qoq /usr/share/icons/Adwaita/cursors/default)"
+PKGS="$PKGS $(pacman -Qoq /usr/share/icons/hicolor/index.theme)"
 
-S=$(mktemp -d)
+# BR-7: the MIME database from shared-mime-info's own package file only (not every package's on this host); its
+# source (packages/) is not needed at run time.
+M=$TMPD/mime
+mkdir "$M"
+mkdir "$M/packages"
+cp /usr/share/mime/packages/freedesktop.org.xml "$M/packages/"
+PKGS="$PKGS $(pacman -Qoq /usr/share/mime/packages/freedesktop.org.xml)"
+update-mime-database "$M" >/dev/null 2>&1 || die "update-mime-database $M failed"
+rm -rf "$M/packages"
+[ -s "$M/mime.cache" ] && [ -f "$M/image/png.xml" ] || die "update-mime-database made no mime.cache"
+mkdir -p "$NEW/share"
+cp -r "$M" "$NEW/share/mime"
+rm -rf "$M"
+
+# BR-7: gdk-pixbuf's loaders. libgdk_pixbuf 2.44 (in the initramfs, by ldd of GTK 3) has every format as a built-in
+# glycin module, which runs the loader program glycin's configs name for the content type; without them it has
+# no format at all ("No image loaders are configured"). glycin first asks bwrap for a sandbox: on V2 the real
+# /bin/bwrap; without one files/bwrap answers as Bubblewrap on a kernel without user namespaces, and glycin runs the
+# loader directly. Only glycin-image-rs (png,
+# jpeg, gif, webp, ...; it links libc, libm and libgcc_s only): svg is drawn above, heif and jxl link libheif/libjxl.
+# Outside lib/, which holds only what Brave and the libraries it dlopens load (ul.pkg.brave).
+GL=/usr/lib/glycin-loaders/2+ GC=/usr/share/glycin-loaders/2+/conf.d
+mkdir -p "$NEW/glycin" "$NEW/share/glycin-loaders/2+/conf.d" "$NEW/etc/gdk-pixbuf" "$NEW/libexec"
+cp "$HERE/files/bwrap" "$NEW/libexec/bwrap"
+l=glycin-image-rs
+[ -x "$GL/$l" ] && [ -f "$GC/$l.conf" ] || die "$GL/$l or $GC/$l.conf is missing (pacman -S glycin)"
+cp "$GL/$l" "$NEW/glycin/"
+sed "s|^Exec=$GL/|Exec=$V2/glycin/|" "$GC/$l.conf" >"$NEW/share/glycin-loaders/2+/conf.d/$l.conf"
+! grep '^Exec=' "$NEW/share/glycin-loaders/2+/conf.d/$l.conf" | grep -qv "^Exec=$V2/glycin/$l\$" \
+  || die "$GC/$l.conf names a program outside $GL/$l"
+! ldd "$GL/$l" | grep -v 'linux-vdso\|ld-linux\|libc\.so\|libm\.so\|libgcc_s\.so' | grep -q . \
+  || die "$GL/$l links more than libc, libm and libgcc_s: its libraries would land in lib/"
+grep -q '^\[loader:image/png\]' "$NEW/share/glycin-loaders/2+/conf.d/$l.conf" || die "$l loads no PNG"
+PKGS="$PKGS $(pacman -Qoq "$GL/$l")"
+cat >"$NEW/etc/gdk-pixbuf/loaders.cache" <<TXT
+# GdkPixbuf Image Loader Modules file for BitsOS V2 (GDK_PIXBUF_MODULE_FILE, made by stage-v2.sh).
+# No module here: gdk-pixbuf $(pacman -Q gdk-pixbuf2 | cut -d' ' -f2) has its formats built in (glycin), whose loader
+# program is $V2/glycin/$l, named in $V2/share/glycin-loaders/2+/conf.d/.
+TXT
+
+S=$TMPD/schemas
+mkdir "$S"
 cp /usr/share/glib-2.0/schemas/org.gtk.Settings.*.gschema.xml "$S/"
 PKGS="$PKGS $(pacman -Qoq /usr/share/glib-2.0/schemas/org.gtk.Settings.FileChooser.gschema.xml)"
 mkdir -p "$NEW/share/glib-2.0/schemas"
@@ -154,11 +235,12 @@ Brave $ver (pacman brave-bin from CachyOS, /opt/brave-bin), packaged for BitsOS 
 user/ports/brave-launcher/scripts/stage-v2.sh of the BitsOS V2 tree; started by \\BITSOS2\\bin\\brave.
   brave.txt   Brave's LICENSE (Brave and Chromium; brave://credits lists every third-party part)
   <package>/  the licence texts of the CachyOS package each other file comes from (fonts, GTK 3, NSS, fontconfig
-              rules, cursors). The libraries xtask adds to lib/ have their texts in /usr/share/licenses of V2.
+              rules, the icon themes, the MIME database, the glycin image loaders). The libraries xtask adds
+              to lib/ have their texts in /usr/share/licenses of V2.
 TXT
 
 if [ -e "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
 mv "$NEW" "$DEST"
-rm -rf "$DEST.old"
+rm -rf "$DEST.old" "$TMPD"
 trap - EXIT
 echo "stage-v2: $DEST: $(find "$DEST" -type f | wc -l) files, $(du -sm "$DEST" | cut -f1) MB"

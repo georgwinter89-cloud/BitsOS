@@ -18,7 +18,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 
 use super::evdev_map::{Caps, Decoder, EV_ABS, EV_KEY, EV_REL, KEY_MAX, Out, Range, SYN_DROPPED, moved, placed};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, Origin};
 use crate::state::App;
 
 const DIR: &str = "/dev/input";
@@ -35,7 +35,15 @@ const fn eviocgabs(abs: u16) -> u64 {
 const fn eviocgname(len: usize) -> u64 {
     ioc(2, 0x06, len as u64)
 }
+const fn eviocgphys(len: usize) -> u64 {
+    ioc(2, 0x07, len as u64)
+}
+const EVIOCGID: u64 = ioc(2, 0x02, 8);
 const EVIOCGRAB: u64 = ioc(1, 0x90, 4);
+/// MC-9b (in the kernel since INT-W17, crates/console/src/evdevfs.rs): with 1, this reader no longer gets the events
+/// programs write into the device (evdev_write, marked injected by the kernel), so everything it reads from a real
+/// device is real. Linux has no such request (nr 0xb0 is free in 'E'); a kernel without it answers an error.
+const EVIOC_BITSOS_PHYSICAL: u64 = ioc(1, 0xb0, 4);
 const EVIOCSCLOCKID: u64 = ioc(1, 0xa0, 4);
 
 /// A node by path and inode: a re-made node is a new device.
@@ -113,9 +121,9 @@ fn scan(handle: &LoopHandle<'static, App>, seen: &Shared) -> usize {
             continue;
         }
         match open(&path) {
-            Ok(Some((file, caps, name))) => {
+            Ok(Some((file, caps, name, origin, why))) => {
                 seen.borrow_mut().settle(key.clone());
-                if add(handle, file, caps, &name, key) {
+                if add(handle, file, caps, &name, (origin, why), key) {
                     opened += 1;
                 }
             }
@@ -154,7 +162,10 @@ fn ioctl_val(fd: i32, req: u64, v: libc::c_ulong) -> std::io::Result<()> {
 }
 
 /// Opens and probes one node: Some when it is a keyboard or pointer bitscomp uses.
-fn open(path: &Path) -> std::io::Result<Option<(File, Caps, String)>> {
+/// The device's origin and, for an injected one, why (the log line says it).
+type Counts = (Origin, String);
+
+fn open(path: &Path) -> std::io::Result<Option<(File, Caps, String, Origin, String)>> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
     // SAFETY: a plain open of a NUL-terminated path.
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
@@ -185,28 +196,61 @@ fn open(path: &Path) -> std::io::Result<Option<(File, Caps, String)>> {
         return Ok(None);
     }
     let _ = ioctl_int(fd, EVIOCSCLOCKID, libc::CLOCK_MONOTONIC);
-    Ok(Some((file, caps, name)))
+    let mut id = [0u8; 8];
+    // A device that does not say its bus counts as injected (the safe side), and the log line says why: a passing
+    // EINTR/EAGAIN is asked again a few times first, so a real keyboard is not marked injected by a hiccup.
+    let mut got = ioctl_buf(fd, EVIOCGID, &mut id);
+    for _ in 0..3 {
+        match &got {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) => got = ioctl_buf(fd, EVIOCGID, &mut id),
+            _ => break,
+        }
+    }
+    let mut pb = [0u8; 64];
+    // Linux answers ENOENT for a device without phys (evdev.c str_to_user): an empty phys.
+    let n = ioctl_buf(fd, eviocgphys(pb.len()), &mut pb).unwrap_or(0).max(0) as usize;
+    let phys = String::from_utf8_lossy(&pb[..n.min(pb.len())]).trim_end_matches('\0').to_string();
+    let (origin, why) = match got {
+        Ok(_) => {
+            let bus = u16::from_le_bytes([id[0], id[1]]);
+            let why = super::evdev_map::injected_why(bus, &name, &phys);
+            (super::evdev_map::origin_of(bus, &name, &phys), why.map_or(String::new(), |w| format!("{w}, bus {bus:#04x}")))
+        }
+        Err(e) => {
+            let old = matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::EINVAL));
+            (Origin::Injected, format!("no EVIOCGID ({e}{})", if old { ", the kernel lacks it" } else { "" }))
+        }
+    };
+    Ok(Some((file, caps, name, origin, why)))
 }
 
-fn add(handle: &LoopHandle<'static, App>, file: File, caps: Caps, name: &str, key: Key) -> bool {
+fn add(handle: &LoopHandle<'static, App>, file: File, caps: Caps, name: &str, (origin, why): Counts, key: Key) -> bool {
     let fd = file.as_raw_fd();
     let grab = match ioctl_val(fd, EVIOCGRAB, 1) {
         Ok(()) => "grabbed".to_string(),
         Err(e) => format!("not grabbed: {e}"),
+    };
+    // MC-9b: what this device's input counts as for the installer's dialog (R8c).
+    let counts = match origin {
+        Origin::Injected => format!("counts as injected ({why})"),
+        Origin::Physical => match ioctl_int(fd, EVIOC_BITSOS_PHYSICAL, 1) {
+            Ok(()) => "real, written events filtered".to_string(),
+            Err(e) => format!("real; the kernel does not filter written events ({e})"),
+        },
     };
     let what = match (caps.keyboard, caps.pointer()) {
         (true, true) => "keyboard+pointer",
         (true, false) => "keyboard",
         _ => "pointer",
     };
-    eprintln!("bitscomp: input: {} \"{name}\" {what} ({grab})", key.0.display());
+    eprintln!("bitscomp: input: {} \"{name}\" {what} ({grab}), {counts}", key.0.display());
     let mut dec = Decoder::new(caps);
     let label = key.0.display().to_string();
     let r = handle.insert_source(Generic::new(file, Interest::READ, Mode::Level), move |_, _, app| {
         let mut out = Vec::new();
         let alive = pump(fd, &mut dec, &mut out, &mut app.stats);
         for o in out {
-            deliver(app, o);
+            deliver(app, o, origin);
         }
         if alive {
             return Ok(PostAction::Continue);
@@ -278,7 +322,7 @@ fn mono_us() -> i64 {
     ts.tv_sec * 1_000_000 + ts.tv_nsec / 1000
 }
 
-fn deliver(app: &mut App, o: Out) {
+fn deliver(app: &mut App, o: Out, origin: Origin) {
     let mode = app.output.current_mode().map(|m| m.size).unwrap_or_default();
     let size = (mode.w, mode.h);
     let s = app.theme.scale;
@@ -296,5 +340,5 @@ fn deliver(app: &mut App, o: Out) {
         Out::Wheel { steps } => InputEvent::Wheel { steps },
         Out::HWheel { steps } => InputEvent::HWheel { steps },
     };
-    app.handle_input(ev);
+    app.handle_input_as(ev, origin);
 }

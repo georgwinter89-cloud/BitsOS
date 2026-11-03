@@ -14,3 +14,6 @@ klog = { path = "../klog" }
 ktest = { path = "../ktest" }
 sched = { path = "../sched" }
 time = { path = "../time" }
+
+[lints]
+workspace = true

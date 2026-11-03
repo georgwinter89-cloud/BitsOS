@@ -29,6 +29,9 @@ pub enum Class {
     /// `\BITSOS2\home\` and everything below it: written like `Free`, but owned by the desktop user 1000:1000
     /// with 0700/0600 (YT-2: Cobalt's profile, bitscomp's session).
     Home,
+    /// `\BITSOS2\mcp\` and everything below it (INT-W17, MC-8b CR 3): written like `Free`, but shown root's
+    /// with 0700/0600, so only root reads the MCP service's TLS key, its pairings and the installer's grants.
+    Private,
 }
 
 impl Class {
@@ -42,6 +45,7 @@ impl Class {
             Class::Sys => "SYS",
             Class::Free => "BITSOS2 file",
             Class::Home => "home",
+            Class::Private => "mcp",
         }
     }
 }
@@ -68,6 +72,8 @@ pub fn child_class(parent: Class, name: &[u8], alias: &[u8]) -> Class {
                 Class::Sys
             } else if is(name, alias, b"HOME") {
                 Class::Home
+            } else if is(name, alias, b"MCP") {
+                Class::Private
             } else if is(name, alias, b"CONFIG.TXT") {
                 Class::Config
             } else {
@@ -76,6 +82,7 @@ pub fn child_class(parent: Class, name: &[u8], alias: &[u8]) -> Class {
         }
         Class::Sys => Class::Sys,
         Class::Home => Class::Home,
+        Class::Private => Class::Private,
         Class::Outside => Class::Outside,
         // Below a file nothing exists; below CONFIG.TXT or STICK.ID as a directory (a stick made elsewhere):
         // treat the subtree like its top.
@@ -121,7 +128,7 @@ impl Rules {
             Class::Root | Class::Outside | Class::Bitsos2 => Err(EROFS),
             Class::StickId => Err(EPERM),
             Class::Sys => self.sys_ok(),
-            Class::Config | Class::Free | Class::Home => Ok(()),
+            Class::Config | Class::Free | Class::Home | Class::Private => Ok(()),
         }
     }
     /// Changing the content (or size, or time) of a node of class `c`.
@@ -134,7 +141,7 @@ impl Rules {
             Class::Root | Class::Outside | Class::Bitsos2 => Err(EROFS),
             Class::StickId => Err(EPERM),
             Class::Sys => self.sys_ok(),
-            Class::Config | Class::Free | Class::Home => Ok(()),
+            Class::Config | Class::Free | Class::Home | Class::Private => Ok(()),
         }
     }
     /// The write-back of content `write` admitted earlier (it runs on the flusher's thread, which never holds
@@ -153,7 +160,14 @@ impl Rules {
 }
 
 /// Keys only Georg's own edit may add or change (R8a; MC's GUARDED_KEYS). `wlan` is free since 21.10. (R8d).
-pub const GUARDED_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write"];
+/// MC-10 (Georg 27.10.): `mcp` (who serves MCP) and `mcp_confirmer` (`test` lets a program answer the
+/// installer's dialogs) too.
+pub const GUARDED_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+
+/// MC-10: guarded keys whose value may not even go: dropping `mcp=service` would bring back the kernel's
+/// plain-HTTP server (`mcp=kernel`, the token alone opens everything), which is Georg's rescue setting to write
+/// on the stick himself, never a program's.
+pub const FIXED_KEYS: &[&str] = &["mcp"];
 
 /// CONFIG.TXT names whose values the file tools never show (the kernel's `config::is_secret`, WL-4 CR 4).
 pub const SECRET_KEYS: &[&str] = &["token", "wlan_psk", "claude_api_key"];
@@ -264,7 +278,8 @@ fn effective<'a>(text: &'a [u8], key: &str) -> Option<&'a str> {
 
 /// R8a: the guarded lines of `new` must all be in `old` (dropping one is allowed, adding or changing one is
 /// not), and the value each guarded key has for the parsers (last line wins) must stay as it was or go: a
-/// reordering or a dropped duplicate may not flip `nvme_write=off` / `nvme_write=on`. Err names the key.
+/// reordering or a dropped duplicate may not flip `nvme_write=off` / `nvme_write=on`. A `FIXED_KEYS` value
+/// may not go either (MC-10). Err names the key.
 pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
     let before = guarded_lines(old);
     for line in guarded_lines(new) {
@@ -276,6 +291,11 @@ pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
         if let Some(v) = effective(new, k)
             && effective(old, k) != Some(v)
         {
+            return Err(String::from(k));
+        }
+    }
+    for &k in FIXED_KEYS {
+        if effective(new, k) != effective(old, k) {
             return Err(String::from(k));
         }
     }
@@ -316,6 +336,9 @@ mod tests {
         assert_eq!(child_class(Class::Bitsos2, b"x", b"HOME"), Class::Home, "by alias");
         assert_eq!(child_class(Class::Home, b"SYS", b"SYS"), Class::Home, "inherited");
         assert_eq!(child_class(Class::Free, b"home", b"HOME"), Class::Free, "only directly below BITSOS2");
+        assert_eq!(child_class(Class::Bitsos2, b"Mcp", b"MCP"), Class::Private);
+        assert_eq!(child_class(Class::Private, b"paired", b"PAIRED"), Class::Private, "inherited");
+        assert_eq!(child_class(Class::Free, b"mcp", b"MCP"), Class::Free, "only directly below BITSOS2");
     }
 
     #[test]
@@ -333,6 +356,9 @@ mod tests {
         assert_eq!(r.create(Class::Home, Class::Home), Ok(()));
         assert_eq!(r.write(Class::Home), Ok(()));
         assert_eq!(r.remove(Class::Home), Ok(()));
+        assert_eq!(r.create(Class::Private, Class::Private), Ok(()));
+        assert_eq!(r.write(Class::Private), Ok(()));
+        assert_eq!(r.remove(Class::Private), Ok(()));
         let s = Rules { sys: true, ..r };
         assert_eq!(s.create(Class::Sys, Class::Sys), Ok(()));
         assert_eq!(s.remove(Class::Sys), Ok(()));
@@ -354,6 +380,22 @@ mod tests {
         assert!(config_guard(b"", b"#nvme_write=on\n").is_ok());
         assert!(config_guard(b"wlan=off\n", b"wlan=on\n").is_ok(), "wlan is no guarded key (R8d, 21.10.)");
         assert_eq!(config_guard(b"x=1\n", "\u{feff}stick_write=on\n".as_bytes()), Err(String::from("stick_write")));
+    }
+
+    /// MC-10: `mcp` and `mcp_confirmer` are guarded; `mcp` cannot even be dropped (the rescue `mcp=kernel` is
+    /// Georg's to write on the stick), `mcp_confirmer=test` can (the safe side).
+    #[test]
+    fn mcp_keys_are_guarded() {
+        let k = |s: &str| Err(String::from(s));
+        assert_eq!(config_guard(b"screen=1\n", b"mcp=service\n"), k("mcp"));
+        assert_eq!(config_guard(b"mcp=service\n", b"mcp=kernel\n"), k("mcp"));
+        assert_eq!(config_guard(b"mcp=service\n", b""), k("mcp"), "dropping it would bring the token-only server back");
+        assert_eq!(config_guard(b"mcp=service\n", b"MCP = service\nmcp=both\n"), k("mcp"));
+        assert!(config_guard(b"mcp=service\n", b"mcp=service\nscreen=2\n").is_ok());
+        assert_eq!(config_guard(b"", b"mcp_confirmer=test\n"), k("mcp_confirmer"));
+        assert_eq!(config_guard(b"mcp_confirmer=bitscomp\n", b"mcp_confirmer=test\n"), k("mcp_confirmer"));
+        assert!(config_guard(b"mcp_confirmer=test\n", b"").is_ok(), "dropping test is the safe side");
+        assert!(config_guard(b"", b"").is_ok());
     }
 
     #[test]

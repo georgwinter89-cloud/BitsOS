@@ -191,6 +191,24 @@ pub fn view(nodes: &[Node], info: &dyn Fn(Loc) -> FnInfo, drivers: &[&'static st
         push(file("resource"), txt(resource(n)));
         push(file("irq"), txt(format!("{}\n", fi.irq)));
         push(file("enable"), txt(String::from(if fi.enabled { "1\n" } else { "0\n" })));
+        // DR-2 CR (INT-W23): uevent and the subsystem link, as linux-6.6/drivers/pci/pci-driver.c pci_uevent
+        // and the device core give every function; udev-less user space (libdrm, Mesa) reads them.
+        let mut ue = String::new();
+        if let Some(d) = fi.driver {
+            ue.push_str(&format!("DRIVER={d}\n"));
+        }
+        ue.push_str(&format!(
+            "PCI_CLASS={:04X}\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={}\nMODALIAS={}\n",
+            n.class,
+            n.vendor,
+            n.device,
+            n.subsystem.0,
+            n.subsystem.1,
+            name(n.loc),
+            modalias(n).trim_end()
+        ));
+        push(file("uevent"), txt(ue));
+        push(file("subsystem"), SysKind::Link(rel(&path, "bus/pci")));
         // An untouched function's configuration space is not read beyond the walk (R8d).
         if n.untouched.is_none() {
             push(file("config"), SysKind::Config { loc: n.loc, size: n.space });

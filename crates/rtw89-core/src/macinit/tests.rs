@@ -29,7 +29,7 @@ use crate::trace::{self, Op, OpKind, TraceEntry};
 fn wlan_dir() -> PathBuf {
     std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into())
+        .unwrap_or_else(|| crate::test_desk::desk("werkzeuge/plattform/wlan"))
 }
 
 pub(super) fn fw_file() -> Firmware {

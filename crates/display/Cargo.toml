@@ -8,3 +8,6 @@ description = "RamFrame, fbdev, surfaces, compositor (owner: DP)"
 ksync = { path = "../ksync" }
 klog = { path = "../klog" }
 devmodel = { path = "../devmodel" }
+
+[lints]
+workspace = true

@@ -12,6 +12,9 @@ pub struct Summary {
     pub skips: Vec<(String, String)>,
     pub done: Option<(u32, u32, u32)>,
     pub panic: Option<String>,
+    /// `KTEST note <test>: <text>` lines: the kernel writes one only when something went wrong after a test
+    /// that may still say `ok` (the boot-stack canary was reached, another CPU missed its NMI sample).
+    pub notes: Vec<(String, String)>,
 }
 
 fn field(line: &str, key: &str) -> Option<u32> {
@@ -36,6 +39,9 @@ pub fn parse(log: &str) -> Summary {
         } else if let Some(r) = l.strip_prefix("skip ") {
             let (n, why) = r.split_once(": ").or_else(|| r.strip_suffix(':').map(|n| (n, ""))).unwrap_or((r, ""));
             s.skips.push((n.trim().to_string(), why.trim().to_string()));
+        } else if let Some(r) = l.strip_prefix("note ") {
+            let (n, why) = r.split_once(": ").unwrap_or((r, ""));
+            s.notes.push((n.trim().to_string(), why.trim().to_string()));
         } else if l.starts_with("done") {
             s.done = Some((field(l, "passed=").unwrap_or(0), field(l, "failed=").unwrap_or(0), field(l, "skipped=").unwrap_or(0)));
         } else if let Some(r) = l.strip_prefix("PANIC") {
@@ -52,6 +58,11 @@ impl Summary {
         for (n, w) in &self.fails {
             p.push(format!("FAIL {n}: {w}"));
         }
+        // A note makes the run red: a stack overflow into the boot stack's canary (INT-W28) or a silent CPU
+        // after a test is a defect the test's own `ok` does not see.
+        for (n, w) in &self.notes {
+            p.push(format!("NOTE {n}: {w}"));
+        }
         if let Some(m) = &self.panic {
             p.push(format!("PANIC {m}"));
         }
@@ -67,8 +78,10 @@ impl Summary {
 /// QEMU time for one ktest boot (`--timeout` changes it). INT-A2a2: 120 s was the A1 budget (427 tests, about 85 s
 /// of QEMU); the A2 wave's 649 tests take about 118 s of QEMU on an idle Gaming-PC, so a little desktop load made the
 /// gate red with "no KTEST done line" in whatever test ran at 120 s (us.msd.read/.reset/.write), a budget and not
-/// a hang. 300 s leaves room for the next waves; a real hang still ends in it.
-pub const DEFAULT_TIMEOUT_S: u64 = 300;
+/// a hang. 300 s leaves room for the next waves; a real hang still ends in it. INT-W21 (NW-10, AB-16): 939 tests
+/// take about 285-296 s of QEMU on a loaded Gaming-PC (227 s for 875 on 26.10.), so 300 s was red with 0 failures;
+/// 600 s, the same reasoning again.
+pub const DEFAULT_TIMEOUT_S: u64 = 600;
 
 pub struct KtestOpts {
     pub filters: Vec<String>,
@@ -182,6 +195,22 @@ mod tests {
         assert_eq!(s.fails, vec![("sched::y".to_string(), "expected 3 got 4".to_string())]);
         assert_eq!(s.done, Some((1, 1, 1)));
         assert_eq!(s.problems(), vec!["FAIL sched::y: expected 3 got 4"]);
+    }
+
+    #[test]
+    fn a_canary_note_after_an_ok_is_red() {
+        let s = parse("KTEST start count=1 filter=\nKTEST ok x (1 ms)\nKTEST note x: stack overflow in x: the boot stack (256 KiB) was used into its last 16 KiB (canary 512 bytes)\nKTEST done passed=1 failed=0 skipped=0\n");
+        assert_eq!(s.ok, vec!["x"]);
+        assert_eq!(s.notes.len(), 1);
+        let p = s.problems();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("NOTE x: stack overflow in x:"), "{p:?}");
+    }
+
+    #[test]
+    fn an_nmi_note_is_red() {
+        let s = parse("KTEST start count=1 filter=\nKTEST ok y (1 ms)\nKTEST note y: nmi sample: Timeout\nKTEST done passed=1 failed=0 skipped=0\n");
+        assert_eq!(s.problems(), vec!["NOTE y: nmi sample: Timeout"]);
     }
 
     #[test]

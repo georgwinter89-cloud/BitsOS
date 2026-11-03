@@ -1,0 +1,110 @@
+amdgpu_device_initialize: 0
+== bo 0: size 12289 heap 2 flags 0
+amdgpu_bo_alloc: 0
+amdgpu_bo_cpu_map: 0
+fresh memory reads zero: yes
+amdgpu_bo_set_metadata: 0
+amdgpu_bo_query_info: 0
+info size=16384 align=4096 heap=2 flags=0x1 md flags=3 tiling=0x5500000009 size=8 data=0xcafe,0xf00d
+amdgpu_bo_export kms: 0
+amdgpu_bo_export dma_buf_fd: 0
+kms handle > 0: yes
+dma-buf size by lseek: 16384
+amdgpu_bo_import dma_buf_fd: 0
+import gives the same object: yes, size 12289
+dma-buf map sees the bytes: yes
+amdgpu_bo_wait_for_idle: 0
+busy: no
+amdgpu_va_range_alloc: 0
+amdgpu_bo_va_op MAP: 0
+amdgpu_bo_va_op MAP again: -22
+amdgpu_bo_va_op_raw REPLACE: 0
+amdgpu_bo_va_op_raw CLEAR: 0
+amdgpu_bo_va_op UNMAP after CLEAR: -2
+amdgpu_bo_va_op MAP again: 0
+amdgpu_bo_va_op UNMAP: 0
+amdgpu_va_range_free: 0
+amdgpu_va_range_alloc high: 0
+amdgpu_bo_va_op MAP: 0
+amdgpu_bo_va_op MAP again: -22
+amdgpu_bo_va_op_raw REPLACE: 0
+amdgpu_bo_va_op_raw CLEAR: 0
+amdgpu_bo_va_op UNMAP after CLEAR: -2
+amdgpu_bo_va_op MAP again: 0
+amdgpu_bo_va_op UNMAP: 0
+amdgpu_va_range_free: 0
+amdgpu_bo_cpu_unmap: 0
+amdgpu_bo_free: 0
+== bo 1: size 65536 heap 2 flags 0x4
+amdgpu_bo_alloc: 0
+amdgpu_bo_cpu_map: 0
+fresh memory reads zero: yes
+amdgpu_bo_set_metadata: 0
+amdgpu_bo_query_info: 0
+info size=65536 align=65536 heap=2 flags=0x5 md flags=3 tiling=0x5500000009 size=8 data=0xcafe,0xf00d
+amdgpu_bo_export kms: 0
+amdgpu_bo_export dma_buf_fd: 0
+kms handle > 0: yes
+dma-buf size by lseek: 65536
+amdgpu_bo_import dma_buf_fd: 0
+import gives the same object: yes, size 65536
+dma-buf map sees the bytes: yes
+amdgpu_bo_wait_for_idle: 0
+busy: no
+amdgpu_va_range_alloc: 0
+amdgpu_bo_va_op MAP: 0
+amdgpu_bo_va_op MAP again: -22
+amdgpu_bo_va_op_raw REPLACE: 0
+amdgpu_bo_va_op_raw CLEAR: 0
+amdgpu_bo_va_op UNMAP after CLEAR: -2
+amdgpu_bo_va_op MAP again: 0
+amdgpu_bo_va_op UNMAP: 0
+amdgpu_va_range_free: 0
+amdgpu_va_range_alloc high: 0
+amdgpu_bo_va_op MAP: 0
+amdgpu_bo_va_op MAP again: -22
+amdgpu_bo_va_op_raw REPLACE: 0
+amdgpu_bo_va_op_raw CLEAR: 0
+amdgpu_bo_va_op UNMAP after CLEAR: -2
+amdgpu_bo_va_op MAP again: 0
+amdgpu_bo_va_op UNMAP: 0
+amdgpu_va_range_free: 0
+amdgpu_bo_cpu_unmap: 0
+amdgpu_bo_free: 0
+== bo 2: size 8192 heap 4 flags 0x1
+amdgpu_bo_alloc: 0
+amdgpu_bo_cpu_map: 0
+fresh memory reads zero: yes
+amdgpu_bo_set_metadata: 0
+amdgpu_bo_query_info: 0
+info size=8192 align=4096 heap=4 flags=0x1 md flags=3 tiling=0x5500000009 size=8 data=0xcafe,0xf00d
+amdgpu_bo_export kms: 0
+amdgpu_bo_export dma_buf_fd: 0
+kms handle > 0: yes
+dma-buf size by lseek: 8192
+amdgpu_bo_import dma_buf_fd: 0
+import gives the same object: yes, size 8192
+dma-buf map sees the bytes: yes
+amdgpu_bo_wait_for_idle: 0
+busy: no
+amdgpu_va_range_alloc: 0
+amdgpu_bo_va_op MAP: 0
+amdgpu_bo_va_op MAP again: -22
+amdgpu_bo_va_op_raw REPLACE: 0
+amdgpu_bo_va_op_raw CLEAR: 0
+amdgpu_bo_va_op UNMAP after CLEAR: -2
+amdgpu_bo_va_op MAP again: 0
+amdgpu_bo_va_op UNMAP: 0
+amdgpu_va_range_free: 0
+amdgpu_va_range_alloc high: 0
+amdgpu_bo_va_op MAP: 0
+amdgpu_bo_va_op MAP again: -22
+amdgpu_bo_va_op_raw REPLACE: 0
+amdgpu_bo_va_op_raw CLEAR: 0
+amdgpu_bo_va_op UNMAP after CLEAR: -2
+amdgpu_bo_va_op MAP again: 0
+amdgpu_bo_va_op UNMAP: 0
+amdgpu_va_range_free: 0
+amdgpu_bo_cpu_unmap: 0
+amdgpu_bo_free: 0
+libdrm-bo: ok

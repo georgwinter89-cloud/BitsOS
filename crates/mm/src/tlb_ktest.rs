@@ -39,6 +39,16 @@ pub(crate) fn aps() -> Vec<usize> {
     (1..hal::percpu::cpu_count()).filter(|&c| hal::smp::is_online(c)).collect()
 }
 
+/// Thread switches done so far on each of `cpus`.
+pub(crate) fn switches(cpus: &[usize]) -> Vec<u64> {
+    cpus.iter().map(|&c| hal::switch::switch_count_of(c)).collect()
+}
+
+/// The CPUs of `cpus` that switched threads since `before` (`switches`).
+pub(crate) fn moved(cpus: &[usize], before: &[u64]) -> Vec<usize> {
+    cpus.iter().zip(before).filter(|&(&c, &b)| hal::switch::switch_count_of(c) > b).map(|(&c, _)| c).collect()
+}
+
 pub(crate) fn on(cpu: usize, f: fn(u64) -> u64, arg: u64) -> Result<u64, String> {
     hal::smp::call_on(cpu, f, arg, time::now_ns, SEC).map_err(|x| format!("call_on CPU {cpu}: {x:?}"))
 }
@@ -207,10 +217,18 @@ fn stale_user() -> TestResult {
         let mask = a.loaded_on();
         kassert!(aps.iter().all(|c| mask.contains(c)), "mask {mask:?}, APs {aps:?}");
         let irqs: Vec<u64> = aps.iter().map(|&c| tlb::cpu_irqs(c)).collect();
+        let sw = switches(&aps);
+        let skips0 = tlb::stats().lazy_skips;
         // Page 1 read-only: a write faults on every CPU (present + write), reads still see the content.
         a.sys_mprotect(base + P, P, PROT_READ).map_err(e)?;
-        for (k, &c) in aps.iter().enumerate() {
-            kassert!(tlb::cpu_irqs(c) > irqs[k], "CPU {c} took no shootdown IPI");
+        // MM-11 fixer: since SC-3 an AP runs other threads between two calls; a switch to a kernel thread keeps the
+        // root lazily (and switching back loads it again), so a CPU may rightly take no IPI. Every CPU without one
+        // was skipped as lazy (counted) or switched; the probes below check that none of them kept a stale entry.
+        let missing: Vec<usize> = aps.iter().enumerate().filter(|&(k, &c)| tlb::cpu_irqs(c) <= irqs[k]).map(|(_, &c)| c).collect();
+        let skipped = tlb::stats().lazy_skips - skips0;
+        let switched = moved(&aps, &sw).iter().filter(|c| missing.contains(c)).count() as u64;
+        kassert!(missing.len() as u64 <= skipped + switched, "CPUs {missing:?} took no shootdown IPI ({skipped} lazy skips, {switched} switched)");
+        for &c in &aps {
             WRITE_VAL.store(val(1), SeqCst);
             let w = on(c, ap_write_in, base + P)?;
             kassert!(w & FAULT != 0 && w & (PF_P | PF_W) == PF_P | PF_W, "CPU {c} wrote a read-only page: {w:#x}");
@@ -264,6 +282,8 @@ fn stale_user() -> TestResult {
             catchups = s_kept.lazy_catchups - s_skip.lazy_catchups, ipis = s_kept.ipis - s_skip.ipis, lazy_leaves = s_kept.lazy_leaves - s_skip.lazy_leaves);
         // Freed tables: the far page has a page table (and more) of its own; its unmap asks the lazy CPUs too, and
         // they leave the root (Linux shoots lazy CPUs when tables are freed).
+        // Before the CPUs go lazy: a switch right after `ap_lazy` may already make one an owner again.
+        let sw = switches(&aps);
         for &c in &aps {
             kassert!(on(c, ap_lazy, 0)? == 1, "CPU {c} did not keep the root lazily");
         }
@@ -275,12 +295,24 @@ fn stale_user() -> TestResult {
         kassert!(tables1 < tables0, "the far unmap freed no tables ({tables0} -> {tables1})");
         let left = tlb::stats().lazy_leaves - lazy0;
         kassert!(still == 0 || left >= 1, "{still} lazy CPUs, none left the root lazily ({lazy0} -> {})", tlb::stats().lazy_leaves);
-        kassert!(a.loaded_on().is_empty(), "still in the mask after leaving: {:?}", a.loaded_on());
+        // MM-11 fixer: a CPU still in the mask must have taken the root again through a thread switch (a thread
+        // whose saved root is `a`'s, see above: it flushed as an owner and may be lazy again by now); one that
+        // stayed without a switch kept it although the freed tables asked it to leave. Neither may read the
+        // freed page through its TLB.
+        let kept = a.loaded_on();
+        let moved = moved(&aps, &sw);
+        kassert!(kept.iter().all(|c| moved.contains(c)), "still in the mask after leaving: {kept:?} (switched: {moved:?}, lazy now: {:?})",
+            kept.iter().map(|&c| on(c, ap_is_lazy, 0).unwrap_or(9)).collect::<Vec<_>>());
+        for &c in &kept {
+            let r = on(c, ap_read, far)?;
+            kassert!(on(c, ap_root, 0)? != a.root() || gone(r), "CPU {c} read {r:#x} from the freed far page");
+        }
         for &c in &aps {
             // INT-A2a2: the invariant is "not on a's root any more". The CPU may have run another program's
             // thread meanwhile and sit on that root (gate flake "CPU 1 not on the kernel root after leaving").
             let r = on(c, ap_root, 0)?;
-            kassert!(r != a.root() && (r == kroot || tlb::has_context(r)), "CPU {c} on {r:#x} after leaving (a {:#x}, kernel {kroot:#x})", a.root());
+            kassert!((r != a.root() || kept.contains(&c)) && (r == kroot || r == a.root() || tlb::has_context(r)),
+                "CPU {c} on {r:#x} after leaving (a {:#x}, kernel {kroot:#x})", a.root());
             kassert!(on(c, ap_activate, a.root())? == a.root());
             kassert!(gone(on(c, ap_read, base + 2 * P)?), "CPU {c} reads page 2 after munmap");
             kassert!(on(c, ap_read, base + 3 * P)? == val(3), "CPU {c} page 3 after reload");
@@ -582,10 +614,106 @@ fn resend() -> TestResult {
 }
 ktest!("mm.tlb.resend", Safe, resend);
 
-/// A CPU stuck longer than `GIVE_UP_NS`: the unmap returns, its frames stay out of use until the drop, and
-/// the stuck CPU is back in service once it answers.
+// MM-10: `give_up` holds its AP until the unmap has returned instead of for a fixed time. The old 800 ms
+// window (300 ms over `GIVE_UP_NS`, started before the test thread called munmap) was lost under host load in
+// QEMU: the spin ended first, the AP answered and the round did not give up. The hold runs in a kernel thread
+// pinned on the AP, entered at a scheduling point, so the AP holds no lock the unmap could need (an IPI handler
+// may stop it inside one, INT-A2a2), and the test thread stays on CPU 0 so it is never queued behind the hold.
+
+/// While true the holder spins with interrupts off.
+static HOLD: AtomicBool = AtomicBool::new(false);
+static HOLDING: AtomicBool = AtomicBool::new(false);
+/// The root the holder found loaded after it activated the test's root.
+static HOLD_ROOT: AtomicU64 = AtomicU64::new(0);
+static HOLD_CAPPED: AtomicBool = AtomicBool::new(false);
+/// Bound of a hold the test never let go (B4): far above any give-up wait, also one deferred under load.
+const HOLD_CAP_NS: u64 = 10 * SEC;
+
+/// Spins with interrupts off and without serving requests (a CPU stuck in a long critical section) until the
+/// test lets go, with `root` loaded (not lazily) so the round must wait for this CPU.
+fn hold_cpu(root: u64) {
+    let _irq = hal::cpu::IrqGuard::new();
+    paging::activate(root);
+    HOLD_ROOT.store(paging::current_root(), SeqCst);
+    HOLDING.store(true, SeqCst);
+    let end = time::now_ns().saturating_add(HOLD_CAP_NS);
+    while HOLD.load(SeqCst) {
+        if time::now_ns() >= end {
+            HOLD_CAPPED.store(true, SeqCst);
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    // A kernel thread leaves no user root behind; the request still pending is served once interrupts are on.
+    paging::activate(paging::home_root());
+    HOLDING.store(false, SeqCst);
+}
+
+pub(crate) struct Hold {
+    cpu: usize,
+    thread: sched::JoinHandle,
+    t0: u64,
+}
+
+pub(crate) fn hold(cpu: usize, root: u64) -> Result<Hold, String> {
+    kassert!(!HOLDING.load(SeqCst), "a hold of an earlier test still runs");
+    HOLD.store(true, SeqCst);
+    HOLD_CAPPED.store(false, SeqCst);
+    HOLD_ROOT.store(0, SeqCst);
+    let o = sched::SpawnOpts { cpu: Some(cpu), pin: true, ..sched::SpawnOpts::default() };
+    let thread = sched::spawn_with("mm-tlb-hold", sched::Class::KernelRt, o, move || hold_cpu(root)).map_err(|x| {
+        HOLD.store(false, SeqCst);
+        format!("spawn the holder: {x:?}")
+    })?;
+    let h = Hold { cpu, thread, t0: time::now_ns() };
+    let end = h.t0 + 5 * SEC;
+    while !HOLDING.load(SeqCst) && time::now_ns() < end {
+        sched::sleep_ns(1_000_000);
+    }
+    if !HOLDING.load(SeqCst) {
+        release(h)?;
+        return Err(format!("CPU {cpu} did not start the hold"));
+    }
+    if HOLD_ROOT.load(SeqCst) != root {
+        let seen = HOLD_ROOT.load(SeqCst);
+        release(h)?;
+        return Err(format!("CPU {cpu} holds root {seen:#x}, not the test's {root:#x}"));
+    }
+    Ok(h)
+}
+
+/// Lets go and waits for the holder's end; the hold's length in ns.
+pub(crate) fn release(h: Hold) -> Result<u64, String> {
+    HOLD.store(false, SeqCst);
+    let held = time::now_ns() - h.t0;
+    kassert!(h.thread.join_timeout(5 * SEC), "the hold on CPU {} did not end", h.cpu);
+    kassert!(!HOLD_CAPPED.load(SeqCst), "the hold on CPU {} ran into its {} s bound", h.cpu, HOLD_CAP_NS / SEC);
+    Ok(held)
+}
+
+/// Keeps the test thread on CPU 0 while an AP is held, then gives the old pin back.
+pub(crate) struct OnCpu0(Option<usize>);
+
+impl OnCpu0 {
+    pub(crate) fn take() -> Result<OnCpu0, String> {
+        let prev = sched::current_thread().and_then(|t| t.pinned());
+        kassert!(sched::pin_current(Some(0)), "the test thread could not move to CPU 0");
+        Ok(OnCpu0(prev))
+    }
+}
+
+impl Drop for OnCpu0 {
+    fn drop(&mut self) {
+        sched::pin_current(self.0);
+    }
+}
+
+/// A CPU stuck longer than `GIVE_UP_NS`: the unmap returns while it is still stuck, its frames stay out of use
+/// until the drop, and the stuck CPU is back in service once it answers.
 fn give_up() -> TestResult {
-    let Some(&c) = aps().first() else { return ktest::skip("one CPU") };
+    let Some(&c) = aps().last() else { return ktest::skip("one CPU") };
+    let _cpu0 = OnCpu0::take()?;
+    kassert!(hal::percpu::this_cpu() == 0, "the test thread runs on CPU {}", hal::percpu::this_cpu());
     let frames_before = user_frames();
     let unconfirmed0 = crate::aspace::UNCONFIRMED.get();
     let s0 = tlb::stats();
@@ -595,30 +723,31 @@ fn give_up() -> TestResult {
         for i in 0..4 {
             a.write_u64(base + i * P, val(i)).map_err(e)?;
         }
-        kassert!(on(c, ap_activate, a.root())? == a.root());
-        let v = make_busy(c, tlb::GIVE_UP_NS + 300_000_000, a.root())?;
-        let here = hal::percpu::this_cpu();
+        let h = hold(c, a.root())?;
         let m = a.sys_munmap(base, 2 * P);
         let s1 = tlb::stats();
-        let on_busy = here == c || hal::percpu::this_cpu() == c;
-        let r = wait_flag(&BUSY_DONE, "busy handler end");
-        hal::vectors::free(v);
-        r?;
+        // Still held: the unmap returned while CPU c could not answer, so it gave up (no wall-clock margin).
+        let still = HOLDING.load(SeqCst) && !HOLD_CAPPED.load(SeqCst);
+        let held = release(h)?;
         m.map_err(e)?;
-        if on_busy {
-            // This thread ran on the busy CPU itself (it may migrate since SC-3): the unmap came after the busy end.
-            return ktest::skip("the test thread ran on the busy CPU");
-        }
-        // At least this munmap's give-up: a kernel shootdown of the same 800 ms (a thread's stack reaped meanwhile)
-        // waits for the busy CPU too and may give up as well.
+        kassert!(still, "the hold ended before the unmap returned ({} ms)", held / 1_000_000);
+        // At least this munmap's give-up: a kernel shootdown during the hold (a thread's stack reaped meanwhile)
+        // waits for the held CPU too and may give up as well; it is not an address space's unconfirmed change.
         kassert!(s1.give_ups > s0.give_ups && s1.unanswered > s0.unanswered, "no give-up: {s0:?} -> {s1:?}");
         kassert!(crate::aspace::UNCONFIRMED.get() == unconfirmed0 + 1, "the unmap did not report the missing answer");
         kassert!(s1.stuck_cpus >= 1, "CPU {c} not marked stuck");
         kassert!(user_frames() > frames_before, "the unconfirmed frames went back");
-        // The CPU answers again (it served the pending IPI): no longer stuck, and the next change is confirmed.
+        // The CPU answers again: it serves the request still pending once its interrupts are on, which takes it
+        // out of the stuck set (waited for, so a vCPU descheduled for longer than STUCK_GIVE_UP_NS right after
+        // the hold cannot fail the next change); the next change is confirmed.
+        let end = time::now_ns() + 5 * SEC;
+        while tlb::stats().stuck_cpus != 0 && time::now_ns() < end {
+            sched::sleep_ns(1_000_000);
+        }
         a.sys_munmap(base + 2 * P, P).map_err(e)?;
         let s2 = tlb::stats();
         kassert!(crate::aspace::UNCONFIRMED.get() == unconfirmed0 + 1 && s2.stuck_cpus == 0, "CPU {c} still stuck: {s2:?}");
+        klog::event!(Info, "mm", "ktest.tlb_give_up", cpu = c, held_ms = held / 1_000_000, give_ups = s1.give_ups - s0.give_ups);
     }
     kassert!(user_frames() == frames_before, "frames kept after the drop: {} bytes", user_frames().saturating_sub(frames_before));
     Ok(())
@@ -950,16 +1079,6 @@ fn probe_close() -> TestResult {
 }
 ktest!("mm.tlb.probe_close", Safe, probe_close);
 
-// The test frames are ours (just allocated); DmaRegion has no constructor for a plain frame.
-#[allow(deprecated)]
-fn raw_write(f: u64, off: usize, d: &[u8]) -> bool {
-    hal::dma_buf::write(f, 8192, off, d)
-}
-#[allow(deprecated)]
-fn raw_read(f: u64, off: usize, d: &mut [u8]) -> bool {
-    hal::dma_buf::read(f, 8192, off, d)
-}
-
 /// The safe unmap and retire calls refuse what is not theirs: kernel-half addresses outside vmap (the kernel
 /// image, the direct map) stay mapped, and a frame that is no user root is not written.
 fn refuse_foreign() -> TestResult {
@@ -978,18 +1097,16 @@ fn refuse_foreign() -> TestResult {
     kassert!(paging::unmap_4k(root, va).is_none(), "unmap_4k took a direct-map page");
     kassert!(paging::unmap_kernel_pages(root, va, P, &mut |_| got += 1) == 0 && got == 0, "unmap_kernel_pages took a direct-map page");
     kassert!(paging::translate(root, va) == dm, "direct-map mapping changed");
-    // A frame of ours whose entry 256 has the mark bit set but no context: a bogus retire must leave it alone.
-    let marker = 1u64 << 52 | 0x5A5A;
-    let mut b = [0u8; 8];
-    let ok = raw_write(f, 2048, &marker.to_le_bytes()) && {
-        paging::retire_user_root(f);
-        raw_read(f, 2048, &mut b)
-    };
     if let Some(fa) = mm_core::frames() {
         fa.free(f, 1, mm_core::Kind::Other);
     }
-    kassert!(ok, "raw access to the test frame refused");
-    kassert!(u64::from_le_bytes(b) == marker, "retire_user_root wrote into a frame that is no user root");
+    // A buffer of ours whose entry 256 has the mark bit set but no context: a bogus retire must leave it alone.
+    // A write-back DMA buffer is the safe way to own and write a frame (8 KiB aligned like a user root).
+    let buf = crate::dma::DmaBuffer::alloc(8192, crate::dma::DmaConstraints::dma64().with_align(8192)).map_err(|e| format!("no buffer: {e:?}"))?;
+    let marker = 1u64 << 52 | 0x5A5A;
+    kassert!(buf.write_u64(2048, marker), "write to the test buffer refused");
+    paging::retire_user_root(buf.phys());
+    kassert!(buf.read_u64(2048) == Some(marker), "retire_user_root wrote into a frame that is no user root");
     Ok(())
 }
 ktest!("mm.tlb.refuse_foreign", Safe, refuse_foreign);

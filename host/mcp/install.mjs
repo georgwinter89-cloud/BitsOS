@@ -5,7 +5,7 @@
 //
 //   node install.mjs <BitsOS host[:port]> (--bundle <dir> | --kernel <file> --initrd <file>) --bind <LAN address>
 //        [--me <address>] [--port <8770-8799>] [--dry-run] [--config <file>] [--unpin] [--allow-no-fallback]
-//        [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file <path>]
+//        [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file <path>] [--tls <key store>|auto]
 //
 // --bundle: a directory holding KERNEL and INITRD (e.g. target/xtask/esp-<name>/BITSOS2/SYS/1);
 // --bind: the address of this machine the server listens on (the Gaming-PC's LAN address; 127.0.0.1 for QEMU's
@@ -47,7 +47,7 @@ function fail(why, code = 1) {
   process.exit(code);
 }
 
-const VALUE = ['--bundle', '--kernel', '--initrd', '--bind', '--me', '--port', '--config', '--timeout-ms', '--back-s', '--confirm-s', '--token-file'];
+const VALUE = ['--bundle', '--kernel', '--initrd', '--bind', '--me', '--port', '--config', '--timeout-ms', '--back-s', '--confirm-s', '--token-file', '--tls'];
 const SWITCH = ['--dry-run', '--unpin', '--allow-no-fallback', '--upload', '--reboot'];
 const opts = {}, rest = [];
 for (let i = 2; i < process.argv.length; i++) {
@@ -60,7 +60,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a.startsWith('--')) fail(`unknown option ${a}`, 2);
   else rest.push(a);
 }
-const USAGE = 'usage: node install.mjs <host[:port]> (--bundle DIR | --kernel F --initrd F) --bind A [--me A] [--port 8770-8799] [--dry-run] [--config F] [--unpin] [--allow-no-fallback] [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file F]';
+const USAGE = 'usage: node install.mjs <host[:port]> (--bundle DIR | --kernel F --initrd F) --bind A [--me A] [--port 8770-8799] [--dry-run] [--config F] [--unpin] [--allow-no-fallback] [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file F] [--tls DIR|auto]';
 const [host] = rest;
 if (!host || rest.length > 1) fail(USAGE, 2);
 if (opts.bundle && (opts.kernel || opts.initrd)) fail('--bundle or --kernel/--initrd, not both', 2);
@@ -162,7 +162,7 @@ function parseAnswer(text) {
 // ---- BitsOS ----
 let session;
 try {
-  session = await connect(host, { token });
+  session = await connect(host, { token, tls: opts.tls, tokenFile: opts['token-file'] });
 } catch (e) {
   if (!(e instanceof McpError)) throw e;
   fail(`${e.message}: is BitsOS running with its MCP server (CONFIG.TXT token=...)?`, 2);
@@ -250,12 +250,13 @@ let back = null;
 while (!back && Date.now() - tReboot < backMs) {
   await sleep(1000);
   try {
-    const s = await connect(host, { token, ms: 3000 });
+    const s = await connect(host, { token, ms: 3000, tls: opts.tls, tokenFile: opts['token-file'] });
     const line = await startLine(s);
     if (line !== before) back = { s, line };
   } catch (e) {
     if (!(e instanceof McpError)) throw e;
     if (e.kind === 'token') fail(`the new start refuses the token: ${e.message}`);
+    if (e.kind === 'pin') fail(e.message);
   }
 }
 if (!back) fail(`BitsOS did not answer MCP from a new start within ${backMs / 1000} s after the reboot (the new kernel may hang: the boot after its one try starts the fallback)`);
@@ -275,7 +276,7 @@ for (;;) {
     info = await back.s.call('reload_info', {});
   } catch (e) {
     if (!(e instanceof McpError)) throw e;
-    back.s = await connect(host, { token, ms: 3000 }).catch(() => back.s);
+    back.s = await connect(host, { token, ms: 3000, tls: opts.tls, tokenFile: opts['token-file'] }).catch((e) => { if (e.kind === 'pin') fail(e.message); return back.s; });
     info = null;
   }
   const m = info && /boot confirmation \(RB-6\): ([^\n]*)/.exec(info.text);

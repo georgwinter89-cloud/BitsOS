@@ -2,14 +2,12 @@
 //! keyboard, line discipline) belongs to IN (`crates/console`, IN-3), which sits above `vfs`; it plugs in here
 //! through `ConsoleBackend` and `set_console`.
 //!
-//! Until IN's VT does, a node uses the `File` a `devnode!` of the same path registered (today `console`'s
-//! G0 `ConsoleDev`: writes to the screen, serial and the capture buffer, reads at end of file); `devfs` hands it
-//! over as the node's fallback, so program output looks the same at every merge order. Without either, writes go
-//! to the kernel log (visible on screen and in the mirror) and reads are end of file.
+//! Before the console has set its backend (early boot, host tests), writes go to the kernel log (visible on
+//! screen and in the mirror) and reads are end of file.
 //!
-//! Linux differences, on purpose: `/dev/tty` is the console for every program (Linux: the controlling
-//! terminal, ENXIO without one; BitsOS has one terminal and no sessions yet). Blocking reads wait in bounded
-//! slices and end with EINTR once the program is killed (B4: `abort` below).
+//! Linux differences, on purpose: `/dev/tty` opens the caller's controlling terminal when that is a pty
+//! (IN-7 CR1) and the console otherwise (Linux: ENXIO without a controlling terminal). Blocking reads wait in
+//! bounded slices and end with EINTR once the program is killed (B4: `abort` below).
 
 use crate::node::File;
 use crate::poll::{Events, PollQueue};
@@ -102,16 +100,11 @@ impl Which {
 
 pub struct TtyDev {
     pub which: Which,
-    /// A `devnode!` of the same path (IN's G0 console device) used while no backend is set.
-    fallback: Option<Arc<dyn File>>,
 }
 
 impl TtyDev {
-    pub fn new(which: Which, fallback: Option<Arc<dyn File>>) -> Self {
-        TtyDev { which, fallback }
-    }
-    pub fn has_fallback(&self) -> bool {
-        self.fallback.is_some()
+    pub fn new(which: Which) -> Self {
+        TtyDev { which }
     }
 }
 
@@ -135,22 +128,14 @@ impl File for TtyDev {
         if let Some(c) = console() {
             return c.read_on(self.which, buf, nonblock, &crate::dentry::interrupted);
         }
-        match &self.fallback {
-            Some(f) => f.read_stream(buf, nonblock),
-            None => Ok(0),
-        }
+        Ok(0)
     }
     fn write_stream(&self, buf: &[u8], nonblock: bool) -> Result<usize, Errno> {
         if let Some(c) = console() {
             return c.write_on(self.which, buf, nonblock, &crate::dentry::interrupted);
         }
-        match &self.fallback {
-            Some(f) => f.write_stream(buf, nonblock),
-            None => {
-                log_output(buf);
-                Ok(buf.len())
-            }
-        }
+        log_output(buf);
+        Ok(buf.len())
     }
     fn mode(&self) -> u32 {
         match self.which {
@@ -169,10 +154,7 @@ impl File for TtyDev {
         if let Some(c) = console() {
             return c.ioctl(cmd, arg);
         }
-        match &self.fallback {
-            Some(f) => f.ioctl(cmd, arg),
-            None => Err(ENOTTY),
-        }
+        Err(ENOTTY)
     }
     fn ioctl_user(&self, cmd: u64, arg: u64, mem: &dyn crate::sys::UserMem) -> Option<Result<i64, Errno>> {
         console()?.ioctl_user(cmd, arg, mem)
@@ -184,30 +166,18 @@ impl File for TtyDev {
         console()?.open_ctty(flags)
     }
     fn poll_head(&self) -> Option<&PollQueue> {
-        if let Some(c) = console() {
-            return c.poll_queue();
-        }
-        self.fallback.as_ref().and_then(|f| f.poll_head())
+        console()?.poll_queue()
     }
     fn poll_wait(&self, add: &mut dyn FnMut(&PollQueue)) {
-        if let Some(c) = console() {
-            if let Some(q) = c.poll_queue() {
-                add(q);
-            }
-            return;
-        }
-        if let Some(f) = &self.fallback {
-            f.poll_wait(add);
+        if let Some(q) = console().and_then(|c| c.poll_queue()) {
+            add(q);
         }
     }
     fn events(&self) -> Events {
         if let Some(c) = console() {
             return Events(Events::OUT | if c.has_input() { Events::IN } else { 0 });
         }
-        match &self.fallback {
-            Some(f) => f.events(),
-            // Reads end at once (end of file): readable, as a hung-up terminal.
-            None => Events(Events::OUT | Events::IN),
-        }
+        // Reads end at once (end of file): readable, as a hung-up terminal.
+        Events(Events::OUT | Events::IN)
     }
 }

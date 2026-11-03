@@ -42,9 +42,9 @@ pub const UC_STRICT_RESTORE_SS: u64 = 4;
 /// everything else keeps its current value (IOPL, IF, VM, NT, ID never come from a program).
 pub const FIX_EFLAGS: u64 = 0x0005_0DD5;
 
-/// Linux's own user selectors: a program that writes them into a context it builds means 64-bit user mode.
-pub const LINUX_USER_CS: u16 = 0x33;
-pub const LINUX_USER_DS: u16 = 0x2B;
+/// Linux's user selectors, V2's own since AB-10a (`gdt::USER_CS`/`USER_DS`).
+pub const LINUX_USER_CS: u16 = crate::gdt::USER_CS;
+pub const LINUX_USER_DS: u16 = crate::gdt::USER_DS;
 
 pub const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 pub const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
@@ -184,15 +184,35 @@ pub fn restored_rflags(current: u64, frame: u64) -> u64 {
     (current & !FIX_EFLAGS) | (frame & FIX_EFLAGS)
 }
 
-/// Whether a frame's selectors name 64-bit user mode (V2's own or Linux's numbers): anything else faults at
-/// the return on Linux (or runs 32-bit code, which V2 does not have), so sigreturn treats it as a bad frame.
-/// SS is looked at only with UC_STRICT_RESTORE_SS (otherwise Linux forces it valid, `force_valid_ss`).
+/// Whether a frame's selectors name user mode V2 returns to: 64-bit code (0x33) or, since AB-10a, 32-bit code
+/// (0x23, Wine's WoW64), with SS 0x2b. Anything else faults at the return on Linux (an LDT code segment would
+/// run there; V2 refuses it), so sigreturn treats it as a bad frame. For 64-bit code SS is looked at only with
+/// UC_STRICT_RESTORE_SS (otherwise Linux forces it valid, `force_valid_ss`, only `if user_64bit_mode`); for
+/// 32-bit code always, as Linux's IRET uses it as it is.
 pub fn selectors_ok(cs: u16, ss: u16, uc_flags: u64) -> bool {
+    selector_fault(cs, ss, uc_flags).is_none()
+}
+
+/// The #GP error code the return's IRET would raise for a frame `selectors_ok` refuses (the CPU checks CS
+/// before SS; the code is the selector without its RPL bits, 0 for a null one), None for a good frame. The
+/// program sees it as trap 13 with this error code, as on Linux, where the IRET itself faults.
+pub fn selector_fault(cs: u16, ss: u16, uc_flags: u64) -> Option<u64> {
     let cs = cs | 3;
     let ss = ss | 3;
-    let cs_ok = cs == crate::gdt::USER_CS || cs == LINUX_USER_CS;
-    let ss_ok = uc_flags & UC_STRICT_RESTORE_SS == 0 || ss == crate::gdt::USER_SS || ss == LINUX_USER_DS;
-    cs_ok && ss_ok
+    if cs != crate::gdt::USER_CS && cs != crate::gdt::USER32_CS {
+        return Some((cs & !3) as u64);
+    }
+    let check_ss = uc_flags & UC_STRICT_RESTORE_SS != 0 || cs == crate::gdt::USER32_CS;
+    if check_ss && ss != crate::gdt::USER_DS {
+        return Some((ss & !3) as u64);
+    }
+    None
+}
+
+/// `frame_uc_flags`: UC_STRICT_RESTORE_SS only for a signal that interrupted 64-bit code (linux-6.6/arch/x86/
+/// kernel/signal_64.c), so a 32-bit frame's sigreturn takes its SS as saved.
+pub fn frame_uc_flags(cs: u16) -> u64 {
+    UC_FP_XSTATE | UC_SIGCONTEXT_SS | if cs == crate::gdt::USER_CS { UC_STRICT_RESTORE_SS } else { 0 }
 }
 
 /// A thread's alternate stack as `place` needs it (`sas_ss_sp`, `sas_ss_size`, the stored `sas_ss_flags`).

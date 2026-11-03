@@ -7,6 +7,8 @@
 //! - `bitsvol.enospc`: a pool smaller than its volume; NoSpace through the stacked device, discard, write again.
 //! - `bitsvol.rollback`: rollback to a snapshot and the undo of it.
 //! - `bitsvol.superblock`: damaged newest superblock -> the older one; both damaged -> open fails.
+//! - `bitsvol.commit_time` (VS-7): a flush after 320 KiB of writes flushes before the pool lock and reports its
+//!   fields with the kernel's clock; an idle flush costs nothing. Bumps the global `bitsvol.commit.*` counters by 2.
 
 use crate::memdev::MemDev;
 use crate::model::{RunCfg, Runner, fill, stamp_of};
@@ -86,3 +88,26 @@ ktest!("bitsvol.stack", Safe, stack);
 ktest!("bitsvol.enospc", Safe, crate::checks::enospc_then_discard);
 ktest!("bitsvol.rollback", Safe, crate::checks::rollback_and_undo);
 ktest!("bitsvol.superblock", Safe, crate::checks::damaged_superblock);
+
+fn commit_time() -> TestResult {
+    let dev = Arc::new(MemDev::new("vs7", 512, 4096, 64).ok_or("no memory")?);
+    let mut p = Pool::format(dev.clone(), Config { chunk_size: 4096, quiet: true, ..Config::default() }).map_err(|e| format!("{e:?}"))?;
+    let v = p.create_volume("a", 1 << 20, 1).map_err(|e| format!("{e:?}"))?;
+    p.commit().map_err(|e| format!("{e:?}"))?;
+    let h = PoolHandle::new(p, "ktest-vs7");
+    let vd = h.open_volume(v).map_err(|e| format!("{e:?}"))?;
+    let big = vec![0x5au8; 64 << 10];
+    for i in 0..5u64 {
+        vd.write_blocks(i * 128, &big, false, Normal).map_err(|e| format!("{e:?}"))?;
+    }
+    vd.flush().map_err(|e| format!("{e:?}"))?;
+    let t = h.last_commit();
+    kassert!(t.why == "flush" && t.pre_bytes >= crate::timing::PREFLUSH_BYTES, "flush before the lock: {t:?}");
+    kassert!(t.ns > 0 && t.io.flushes >= 1 && t.io.bytes > 0 && !t.slow(), "fields: {t:?}");
+    vd.flush().map_err(|e| format!("{e:?}"))?;
+    let i = h.last_commit();
+    kassert!(i.pre_bytes == 0 && i.io.flushes == 0 && i.io.covered == 0, "idle flush: {i:?}");
+    klog::event!(Info, "bitsvol", "ktest.commit_time", ns = t.ns, pre_ns = t.pre_ns, pre_bytes = t.pre_bytes, flushes = t.io.flushes, bytes = t.io.bytes);
+    Ok(())
+}
+ktest!("bitsvol.commit_time", Safe, commit_time);

@@ -1,0 +1,15 @@
+maps (read-only): pwrite = -ESPIPE
+maps (read-only): write = -EBADF
+maps: pread of 4 bytes = 4
+comm: pwrite = -ESPIPE
+comm: pwritev = -ESPIPE
+comm: pwritev2 at -1 = 12
+comm: write the same name = 12
+oom_score_adj (no seq_file): pwrite of its own value = yes
+mem: pwrite at the address = yes
+mem: the memory now = abXYefg
+mem: pwrite at address 0 = -errno 5
+unshare(CLONE_NEWUSER) = 0
+uid_map: pwrite at 0 = -ESPIPE
+uid_map: write of the whole line = yes
+uid_map: 33 bytes [0 U 1]

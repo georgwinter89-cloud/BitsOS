@@ -1,0 +1,41 @@
+initial namespace: SIOCGIFINDEX lo = 0
+initial namespace: lo index 1
+unshare(CLONE_NEWUSER|CLONE_NEWNET) = 0
+socket(AF_INET, SOCK_STREAM) = yes
+tcp connect(127.0.0.1) = -ENETUNREACH
+tcp connect(192.0.2.1) = -ENETUNREACH
+tcp connect with a short address = -EINVAL
+tcp listen unbound = 0
+tcp bind(127.0.0.1) = 0
+tcp bind(127.0.0.2) = 0
+tcp bind(0.0.0.0) = 0
+udp bind(127.0.0.1) = 0
+udp bind(0.0.0.0) = 0
+udp sendto(127.0.0.1) = -ENETUNREACH
+udp sendto(192.0.2.1) = -ENETUNREACH
+udp sendmsg(127.0.0.1) = -ENETUNREACH
+udp send unconnected = -errno 89
+udp connect(127.0.0.1) = -ENETUNREACH
+udp6 connect(::1) = -EADDRNOTAVAIL
+tcp6 connect(::1) = -EADDRNOTAVAIL
+udp6 sendto(::1) = -EADDRNOTAVAIL
+udp6 bind(::1) = -EADDRNOTAVAIL
+tcp6 bind(::1) = -EADDRNOTAVAIL
+udp6 bind(::) = 0
+SIOCGIFCONF = 0
+SIOCGIFCONF length 0
+SIOCGIFINDEX lo = 0
+lo index 1
+SIOCGIFINDEX eth0 = -ENODEV
+SIOCGIFFLAGS lo = 0
+lo flags 0x8
+SIOCGIFADDR lo = -EADDRNOTAVAIL
+SIOCGIFFLAGS eth0 = -ENODEV
+SIOCGIFNAME 1 = 0
+index 1 is lo
+SIOCGIFNAME 2 = -ENODEV
+if_nametoindex(lo) = 1
+socketpair(AF_UNIX) = 0
+unix send = 2
+unix recv = 2
+isolated: exit 0

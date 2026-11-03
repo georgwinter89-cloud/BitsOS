@@ -18,10 +18,6 @@ pub struct Mode {
     pub refresh_mhz: u32,
 }
 
-/// A buffer the display can scan out (GX-D3: a buffer object later).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanoutId(pub u64);
-
 /// Completion of a flip; `signalled` once the new buffer is on screen (GOP: at once).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fence {
@@ -45,8 +41,4 @@ pub trait DisplayDevice: Send + Sync {
     fn present(&self, src: &[u32], stride: u32, damage: (u32, u32, u32, u32)) -> Result<Fence, DevError>;
     /// Next vblank (GOP: a timer estimate; DCN: OTG frame counter, later IH).
     fn last_vblank(&self) -> VblankEvent;
-    /// OTG CRC of the scanout (DCN) for tests: "the monitor really got this picture".
-    fn read_crc(&self) -> Option<u32> {
-        None
-    }
 }

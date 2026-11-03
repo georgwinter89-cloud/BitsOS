@@ -10,3 +10,6 @@ hal = { path = "../hal" }
 ksync = { path = "../ksync" }
 kreg = { path = "../kreg" }
 klog = { path = "../klog" }
+
+[lints]
+workspace = true

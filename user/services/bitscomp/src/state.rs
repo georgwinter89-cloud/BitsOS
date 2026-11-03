@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::element::solid::SolidColorBuffer;
-use smithay::desktop::{PopupManager, Space, Window};
+use smithay::desktop::{PopupManager, Space};
+use crate::win::Window;
 use smithay::input::keyboard::{Keycode, XkbConfig};
 use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -124,6 +125,10 @@ pub struct App {
     pub answer: HashMap<smithay::reexports::wayland_server::backend::ClientId, crate::hung::Tracker>,
     /// The xdg_wm_base each client's open ping went out on (`answer`).
     pub pinged: HashMap<smithay::reexports::wayland_server::backend::ClientId, smithay::wayland::shell::xdg::ShellClient>,
+    /// WY-13: clients whose socket had data this turn (`clients::watch`), checked after the display's dispatch.
+    pub unread: Vec<(smithay::reexports::wayland_server::backend::ClientId, crate::clients::Watch)>,
+    /// WY-13: how often the main loop's fd sources fired (`spin::Guard` names them when the loop is busy).
+    pub woke: crate::spin::Woke,
     pub endings: Vec<crate::ending::Ending>,
     /// The grey veil over hung windows and the box with "antwortet nicht" / "Beenden" (by hover and pixel size).
     pub veil: HashMap<ObjectId, SolidColorBuffer>,
@@ -144,6 +149,8 @@ pub struct App {
     /// WY-5b: the settings pages (by the pid of their window's program) and the writer of their changes.
     pub pages: crate::page_app::Pages,
     pub settings_writer: Option<crate::settings_write::Writer>,
+    /// CR DS-3-4: Absicht keys sent to settingsd for registration since it last came up (not sent twice).
+    pub absicht_sent: std::collections::BTreeSet<String>,
     /// WY-5b: foot's colours from the theme.
     pub foot: crate::foot::FootState,
     pub status: crate::status::Status,
@@ -157,6 +164,18 @@ pub struct App {
     pub next_group: u64,
     /// The Interactive class grant on V2 (`grant`); `None` where the kernel does not offer it.
     pub grant: Option<crate::grant::Grant>,
+    /// MC-9b: the installer's overlay, its link and the grants it reported.
+    pub install: crate::install_app::Install,
+    /// The origin of the input event being handled (R8c), and what the control socket's events count as
+    /// (`Injected`; only the headless test path `phys` sets `Physical`).
+    pub input_origin: crate::input::Origin,
+    pub ctl_origin: crate::input::Origin,
+    /// The headless back end runs (test aids of the control socket).
+    pub headless: bool,
+    /// WY-16: client dma-bufs, explicit sync and the buffers waiting to go back after the frame.
+    pub dma: crate::dmabuf::Dma,
+    /// WY-3: the X11 display and Xwayland (started by the first X client).
+    pub xwayland: Option<crate::xwayland::Xwayland>,
 }
 
 impl App {
@@ -248,6 +267,8 @@ impl App {
             requested_size: None,
             answer: HashMap::new(),
             pinged: HashMap::new(),
+            unread: Vec::new(),
+            woke: crate::spin::Woke::default(),
             endings: Vec::new(),
             veil: HashMap::new(),
             hung_img: Vec::new(),
@@ -261,6 +282,7 @@ impl App {
             settings_live: false,
             pages: Default::default(),
             settings_writer: None,
+            absicht_sent: Default::default(),
             foot: Default::default(),
             status: Default::default(),
             session: Default::default(),
@@ -270,6 +292,12 @@ impl App {
             anchors: Default::default(),
             next_group: 0,
             grant: None,
+            install: Default::default(),
+            input_origin: crate::input::Origin::Injected,
+            ctl_origin: crate::input::Origin::Injected,
+            headless: false,
+            dma: crate::dmabuf::Dma::new(),
+            xwayland: None,
         };
         app.space.map_output(&output, (0, 0));
         app.set_mode(size);
@@ -298,13 +326,12 @@ impl App {
         &self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) -> Option<Window> {
-        self.all_windows().into_iter().find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
+        self.all_windows().into_iter().find(|w| w.surface().as_ref() == Some(surface))
     }
 
     /// Every window, also those of the parked workspaces.
     pub fn all_windows(&self) -> Vec<Window> {
-        let mut v: Vec<Window> = self.ws.tiles.iter().flat_map(|t| t.stack.iter().cloned()).collect();
-        v.extend(self.ws.floating.iter().map(|f| f.win.clone()));
+        let mut v: Vec<Window> = self.ws.all_windows().cloned().collect();
         v.extend(self.parked_windows());
         v
     }

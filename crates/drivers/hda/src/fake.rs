@@ -23,6 +23,8 @@ pub enum Ev {
     Enable(bool),
     PciOff,
     PciModify(u8, u32, u32),
+    /// A write to STATESTS (write 1 to clear): the bits written.
+    Statests(u16),
     Alloc(usize, bool),
 }
 
@@ -137,10 +139,22 @@ pub struct FakeHda {
     pub trace: SpinLock<Vec<Ev>>,
     pub amd_wrap: AtomicBool,
     pub corb_dead: AtomicBool,
+    /// The codecs keep no power state (QEMU's): GET_POWER_STATE answers from the dump, never what was set.
+    pub no_power: AtomicBool,
+    /// The codecs report every set power state but stay in D0 (actual state bits 7:4 never follow).
+    pub stays_d0: AtomicBool,
     pub no_uc: AtomicBool,
     /// Engines ignore their stop (RUN/DMA bits and SRST stay); only a link reset stops them.
     pub stuck: AtomicBool,
+    /// Register reads and writes so far (SN-7: none may come after a Quiesce).
+    pub accesses: AtomicU64,
+    /// Runs after every register write, outside the register lock: (offset, value). A test puts a Quiesce
+    /// between a driver call's check and its write with it.
+    pub on_write: SpinLock<Option<WriteHook>>,
 }
+
+/// See [`FakeHda::on_write`].
+pub type WriteHook = Arc<dyn Fn(usize, u64) + Send + Sync>;
 
 impl FakeHda {
     /// `gcap` 0x4401 is QEMU's intel-hda (4 outputs, 4 inputs, 64-bit).
@@ -157,8 +171,12 @@ impl FakeHda {
             trace: SpinLock::new(Vec::new()),
             amd_wrap: AtomicBool::new(false),
             corb_dead: AtomicBool::new(false),
+            no_power: AtomicBool::new(false),
+            stays_d0: AtomicBool::new(false),
             no_uc: AtomicBool::new(false),
             stuck: AtomicBool::new(false),
+            accesses: AtomicU64::new(0),
+            on_write: SpinLock::new(None),
         })
     }
 
@@ -192,6 +210,14 @@ impl FakeHda {
         self.regs.lock().sd[i].ctl |= SD_CTL_RUN as u32;
     }
 
+    /// The fake clock in ns (advanced only by `delay_us`).
+    pub fn clock(&self) -> u64 {
+        self.clock.load(Ordering::Acquire)
+    }
+    /// Codecs report a state change (STATESTS bits), as a codec waking or a hot plug does.
+    pub fn set_statests(&self, bits: u16) {
+        self.regs.lock().statests |= bits;
+    }
     pub fn reg32(&self, off: usize) -> u32 {
         self.read(off, 4) as u32
     }
@@ -273,7 +299,8 @@ impl FakeHda {
             if verb == hdacodec::verb::GET_POWER_STATE
                 && let Some(&p) = c.power.get(&nid)
             {
-                return Some((p as u32) << 4 | p as u32);
+                let actual = if self.stays_d0.load(Ordering::Acquire) { 0 } else { p as u32 };
+                return Some(actual << 4 | p as u32);
             }
             if verb == hdacodec::verb::GET_PIN_SENSE
                 && let Some(&s) = c.sense.get(&nid)
@@ -283,7 +310,7 @@ impl FakeHda {
             return c.dump.get(cad as u8, nid, verb).flatten();
         }
         c.sets.push((nid, verb));
-        if verb >> 8 == 0x705 {
+        if verb >> 8 == 0x705 && !self.no_power.load(Ordering::Acquire) {
             c.power.insert(nid, verb as u8 & 0xF);
         }
         Some(0)
@@ -326,6 +353,14 @@ impl FakeHda {
         let mut r = self.regs.lock();
         if r.gctl & GCTL_UNSOL != 0 && r.rirbctl & RIRBCTL_DMA != 0 {
             self.rirb_push(&mut r, res, RIRB_EX_UNSOL | cad as u32);
+        }
+    }
+
+    /// A raw RIRB entry (a late or stray answer: `ex` bits 3:0 the codec, bit 4 unsolicited), if RIRB DMA runs.
+    pub fn rirb_raw(&self, res: u32, ex: u32) {
+        let mut r = self.regs.lock();
+        if r.rirbctl & RIRBCTL_DMA != 0 {
+            self.rirb_push(&mut r, res, ex);
         }
     }
 
@@ -403,6 +438,7 @@ impl FakeHda {
     }
 
     fn read(&self, off: usize, width: usize) -> u64 {
+        self.accesses.fetch_add(1, Ordering::AcqRel);
         let r = self.regs.lock();
         let reg = |size: usize, v: u64| -> Option<u64> { (width <= size).then_some(v & mask(width)) };
         let v = match off {
@@ -456,6 +492,7 @@ impl FakeHda {
     }
 
     fn write(&self, off: usize, width: usize, v: u64) {
+        self.accesses.fetch_add(1, Ordering::AcqRel);
         let mut r = self.regs.lock();
         let ok = |size: usize| width <= size;
         let m = mask(width);
@@ -475,6 +512,7 @@ impl FakeHda {
                 true
             }
             STATESTS if ok(2) => {
+                self.trace.lock().push(Ev::Statests(v as u16));
                 r.statests &= !(v as u16);
                 true
             }
@@ -629,6 +667,10 @@ impl FakeHda {
         drop(r);
         if !handled {
             self.bad(off, width, true);
+        }
+        let hook = self.on_write.lock().clone();
+        if let Some(h) = hook {
+            h(off, v);
         }
     }
 }

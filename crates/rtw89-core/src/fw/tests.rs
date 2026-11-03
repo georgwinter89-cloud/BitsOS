@@ -26,7 +26,7 @@ use crate::trace::{OpKind, TraceEntry};
 fn wlan_dir() -> PathBuf {
     std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into())
+        .unwrap_or_else(|| crate::test_desk::desk("werkzeuge/plattform/wlan"))
 }
 
 /// The firmware file, read only (spec/wlan.md §2.2); missing fails the test

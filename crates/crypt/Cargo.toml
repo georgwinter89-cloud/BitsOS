@@ -5,6 +5,6 @@ edition = "2024"
 description = "AES-XTS block layer (owner: KS)"
 
 [dependencies]
-devmodel = { path = "../devmodel" }
-klog = { path = "../klog" }
-kreg = { path = "../kreg" }
+
+[lints]
+workspace = true

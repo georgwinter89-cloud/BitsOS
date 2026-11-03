@@ -16,6 +16,7 @@ use bootinfo::{KernelImage, PageTables, PixelFormat, memtype};
 use hal::kexec_stub;
 use mm_core::{Kind, Zone};
 use net::http::{self, HttpError, Options};
+use zeroize::Zeroize;
 
 const PAGE: u64 = 4096;
 /// Memory the running kernel keeps for itself while it stages (it goes on if Reload is refused): a bound on
@@ -344,6 +345,13 @@ pub struct Staged {
     /// RB-9: the GENERATION record the new kernel gets (a Reload into another stick generation); None: the
     /// running one's (RB-10 may still hand it on as confirmed).
     pub(crate) generation: Option<bootinfo::Generation>,
+}
+
+/// RB-18: a Reload that stops after `refresh::apply` leaves no stick secrets in this kernel's freed heap.
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.bootinfo.zeroize();
+    }
 }
 
 impl Staged {

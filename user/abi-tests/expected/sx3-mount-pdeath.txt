@@ -1,0 +1,7 @@
+uid_map = 11
+setgroups = 4
+gid_map = 11
+pdeathsig = 0
+init is pid 1 = yes
+parent: exit 0
+init after the parent's end = signal 9

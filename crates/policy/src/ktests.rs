@@ -247,7 +247,7 @@ ktest!("pm.cache.invalidate", Safe, cache_invalidation);
 /// program while one has rules, and the per-process cache.
 fn cost() -> TestResult {
     const N: u64 = 100_000;
-    let a = Access::Path { path: "/home/georg/.config/BraveSoftware/Brave-Browser/Default/Preferences", write: false, create: false };
+    let a = Access::Path { path: "/home/user/.config/BraveSoftware/Brave-Browser/Default/Preferences", write: false, create: false };
     let time = |f: &dyn Fn()| {
         let t0 = ksync::now_ns().unwrap_or(0);
         for _ in 0..N {
@@ -264,7 +264,7 @@ fn cost() -> TestResult {
         let _ = core::hint::black_box(allows_any(&s, AccessClass::Path));
     });
     let mut r = RuleSet::allow_all();
-    for p in ["/home/georg/Dokumente", "/etc", "/home/georg/.ssh"] {
+    for p in ["/home/user/Dokumente", "/etc", "/home/user/.ssh"] {
         r.paths.push(PathRule { prefix: p.to_string(), modes: modes::ALL, decision: Decision::Deny });
     }
     let _g = Rules::set(P + 11, r);

@@ -1,9 +1,14 @@
-//! The token table (WY-5): every visual value bitscomp uses. Built from the `theme.*` keys of the settings registry
-//! (`settings`, user/services/settingsd/src/builtin.rs) on top of the defaults, which are the values of the mock-up
-//! Georg approved on 21.10.2026 (plan/spec/desktop.md §6, plan/spec/desktop-mockup/). Sizes are CSS px of the
-//! mock-up at 100 % = logical pixels; the output scale (`theme.scale`, 125 %) makes them physical.
+//! The token table (WY-5, DS-1): every visual value bitscomp uses. Built from the `theme.*` keys of the settings
+//! registry (`settings`, user/services/settingsd/src/builtin.rs) on top of the defaults, the design v2 tokens of
+//! 28.10.2026 (`tokens`, plan/spec/desktop.md §0). The first chrome's sizes are CSS px of its mock-up at 100 % =
+//! logical pixels, made physical by the output scale (`theme.scale`, 125 %); the design's are board px (`board`).
+
+mod tokens;
+
+pub use tokens::{ACCENT, BOARD_SCALE, DARK, LIGHT, Shadow, Style};
 
 use crate::settings::Values;
+use crate::text::{Families, Family, Font, Typeface, Weight};
 
 pub type Rgba = [f32; 4];
 
@@ -12,6 +17,23 @@ pub enum Motion {
     Medium,
     Calm,
     Off,
+}
+
+/// theme.effects: the level the user chose. `Gpu` is accepted now and drawn like `Cheap` until a GPU renderer
+/// exists (DS-2; the ambient motion of desktop.md §0 answer 7 comes with it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effects {
+    Cheap,
+    Gpu,
+}
+
+impl Effects {
+    pub fn word(self) -> &'static str {
+        match self {
+            Effects::Cheap => "cheap",
+            Effects::Gpu => "gpu",
+        }
+    }
 }
 
 /// What `theme.layout.*` switches on.
@@ -25,6 +47,26 @@ pub struct Layout {
     /// Claude's sidebar docked on the right (false: folded away, the ring brings it back).
     pub sidebar: bool,
     pub statusbar: bool,
+    /// DS-3: theme.layout.preset, which chrome is drawn.
+    pub preset: Preset,
+}
+
+/// DS-3: the chrome as a preset (Georg 28.10., desktop.md §0 answer 3): the design's Bühne (header with workspace
+/// chips, the stage, the right column, the time strip and the Feld bar) is the default, today's chrome stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    Buehne,
+    Classic,
+}
+
+impl Preset {
+    /// `classic` (also `klassisch`) picks today's chrome; anything else is the Bühne.
+    pub fn parse(s: &str) -> Preset {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "classic" | "klassisch" => Preset::Classic,
+            _ => Preset::Buehne,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,16 +87,43 @@ pub struct Theme {
     pub glow_soft: Rgba,
     /// The accent behind selected things (workspace, suggestion, hovered menu item).
     pub chip: Rgba,
+    /// warnung (errors, data loss) and behind it.
     pub danger: Rgba,
     pub danger_chip: Rgba,
-    /// The ring's "waiting for Georg" colour.
+    /// The ring's "waiting for Georg" colour (kontext-2, the amber).
     pub warm: Rgba,
     pub veil: Rgba,
-    /// Effect level `gpu`: wider glows (still drawn by the CPU until the Radeon driver).
+    /// Design v2 (DS-1): the strong line (focus edges, rulers), the accent's soft tone (behind selected things) and
+    /// the text on it, Claude's colour, the terminal's ground and text, the three context colours and their text.
+    pub line_strong: Rgba,
+    pub accent_soft: Rgba,
+    pub on_accent: Rgba,
+    pub claude: Rgba,
+    pub terminal: Rgba,
+    pub on_terminal: Rgba,
+    pub kontext: [Rgba; 3],
+    pub on_kontext: Rgba,
+    /// shadow-raised, shadow-lifted (board px).
+    pub shadow_raised: Shadow,
+    pub shadow_lifted: Shadow,
+    /// space-1..8 and radius-a, board px after theme.spacing and theme.radius.
+    pub space: [i32; 8],
+    pub radius_card: i32,
+    /// Board px to physical px: `BOARD_SCALE` at the default scale, following theme.scale.
+    pub board: f64,
+    /// The typeface of each family (theme.font.display/ui/mono; an unknown name keeps the design's).
+    pub fonts: Families,
+    /// The chosen effect level (theme.effects).
+    pub effects: Effects,
+    /// Whether the GPU level is drawn: false until a GPU renderer exists, so `gpu` draws exactly like `cheap`
+    /// (DS-2; every `if t.effects_gpu` picks the cheap branch).
     pub effects_gpu: bool,
+    /// theme.scanlines: the design's scanlines, baked only into bitscomp's own ground (dark mode), never over windows.
+    pub scanlines: bool,
     pub motion: Motion,
     pub layout: Layout,
-    /// `theme.font.ui`; only Exo 2 is shipped, another name is noted once and Exo 2 drawn.
+    /// The values of theme.font.display/ui/mono as set (`fonts` holds what is drawn; `font_notes` says why not).
+    pub font_display: String,
     pub font_ui: String,
     pub font_mono: String,
     /// Factor on every text size of the mock-up (theme.font.size / 15).
@@ -125,39 +194,6 @@ pub fn alpha(c: Rgba, a: f32) -> Rgba {
     [c[0] * a, c[1] * a, c[2] * a, c[3] * a]
 }
 
-pub struct Palette {
-    pub bg: &'static str,
-    pub panel: &'static str,
-    pub panel2: &'static str,
-    pub paper: &'static str,
-    pub line: &'static str,
-    pub text: &'static str,
-    pub muted: &'static str,
-}
-
-/// The mock-up's values (Main.dc.html `renderVals`); the settings keys theme.{dark,light}.* default to them.
-pub const DARK: Palette = Palette {
-    bg: "#0b0f14",
-    panel: "#111821",
-    panel2: "#17212c",
-    paper: "#131c26",
-    line: "#26364a",
-    text: "#e6edf3",
-    muted: "#93a4b8",
-};
-pub const LIGHT: Palette = Palette {
-    bg: "#e9eef3",
-    panel: "#ffffff",
-    panel2: "#f2f5f8",
-    paper: "#ffffff",
-    line: "#d3dce6",
-    text: "#101820",
-    muted: "#4d5b6b",
-};
-pub const ACCENT: &str = "#00e5ff";
-const DANGER: &str = "#ff6b6b";
-const WARM: &str = "#ffb020";
-
 /// The default theme for unit tests (one per process).
 #[cfg(test)]
 pub fn test_theme() -> &'static Theme {
@@ -182,12 +218,24 @@ impl Theme {
         let col = |name: &str, d: &str| {
             v.text(&format!("theme.{mode}.{name}")).and_then(hex).unwrap_or_else(|| hex(d).unwrap())
         };
-        let accent = v.text("theme.accent").and_then(hex).unwrap_or_else(|| hex(ACCENT).unwrap());
+        let bg = col("bg", pal.bg);
+        let panel = col("surface", pal.panel);
+        let ink = col("text", pal.text);
+        let line = col("border", pal.line);
+        // The user's accent, if any (`tokens::ACCENT` is settingsd's default and means the mode's own).
+        let user = v.text("theme.accent").and_then(hex).filter(|c| Some(*c) != hex(ACCENT));
+        let (accent, accent_soft, on_accent) = match user {
+            None => (col("accent", pal.accent), col("accent_soft", pal.accent_soft), col("on_accent", pal.on_accent)),
+            Some(a) => (a, soft(a, if dark { bg } else { panel }, dark), on(a)),
+        };
         // theme.glow 60 % (the default) is the mock-up's glow: 18 % alpha dark, 14 % light.
         let glow_k = int("theme.glow", 60, 0, 100) as f32 / 60.0;
         let glow_a = (if dark { 0.18 } else { 0.14 } * glow_k).min(0.4);
-        let chip_a = if dark { 0.14 } else { 0.12 };
-        let bg = col("bg", pal.bg);
+        let kontext =
+            [col("kontext_1", pal.kontext[0]), col("kontext_2", pal.kontext[1]), col("kontext_3", pal.kontext[2])];
+        let (shadow_raised, shadow_lifted) = tokens::shadows(dark, line, ink, hex(pal.lifted_ring).unwrap());
+        let family = |k: &str, d: Typeface| v.text(k).and_then(Typeface::by_name).unwrap_or(d);
+        let design = Families::default();
         let spacing = int("theme.spacing", 8, 0, 64) as f32 / 8.0;
         let sp = |px: i32| (px as f32 * spacing).round() as i32;
         let radius = int("theme.radius", 8, 0, 32) as f32 / 8.0;
@@ -198,45 +246,72 @@ impl Theme {
             workspaces: flag("theme.layout.workspaces_bar", true),
             sidebar: flag("theme.layout.claude_sidebar", true),
             statusbar: flag("theme.layout.statusbar", true),
+            preset: Preset::parse(&text("theme.layout.preset", "buehne")),
         };
+        // DS-3: the Bühne lays its tiles out as the boards' blocks: 24 board px apart, radius-a (28) corners. Board
+        // px in logical px do not depend on theme.scale (`board` / `scale`), so the Bühne keeps its proportions.
+        let buehne = layout.preset == Preset::Buehne;
+        let lb = |px: f32| (px as f64 * BOARD_SCALE / tokens::BOARD_AT_SCALE).round() as i32;
         let tile_bar = if layout.address_top { 0 } else { 34 };
         let tab_row = 38;
-        let danger = hex(DANGER).unwrap();
+        let danger = col("warnung", pal.warnung);
+        let scale = int("theme.scale", 125, 100, 300) as f64 / 100.0;
         Theme {
             dark,
             bg,
-            panel: col("surface", pal.panel),
+            panel,
             panel2: col("surface2", pal.panel2),
             paper: col("paper", pal.paper),
-            line: col("border", pal.line),
-            text: col("text", pal.text),
+            line,
+            text: ink,
             muted: col("text_dim", pal.muted),
             accent,
             glow: alpha(accent, glow_a),
             glow_soft: alpha(accent, glow_a / 2.0),
-            chip: alpha(accent, chip_a),
+            chip: accent_soft,
             danger,
             danger_chip: alpha(danger, 0.14),
-            warm: hex(WARM).unwrap(),
+            warm: kontext[1],
             veil: alpha(bg, 0.8),
-            effects_gpu: text("theme.effects", "cheap") == "gpu",
+            line_strong: col("line_strong", pal.line_strong),
+            accent_soft,
+            on_accent,
+            claude: col("claude", pal.claude),
+            terminal: col("terminal", pal.terminal),
+            on_terminal: col("on_terminal", pal.on_terminal),
+            kontext,
+            on_kontext: col("on_kontext", pal.on_kontext),
+            shadow_raised,
+            shadow_lifted,
+            space: tokens::SPACE.map(sp),
+            radius_card: rad(tokens::RADIUS_CARD),
+            board: BOARD_SCALE * scale / tokens::BOARD_AT_SCALE,
+            fonts: Families {
+                display: family("theme.font.display", design.display),
+                ui: family("theme.font.ui", design.ui),
+                mono: family("theme.font.mono", design.mono),
+            },
+            effects: if text("theme.effects", "cheap") == "gpu" { Effects::Gpu } else { Effects::Cheap },
+            effects_gpu: false,
+            scanlines: flag("theme.scanlines", true),
             motion: match text("theme.motion", "medium").as_str() {
                 "off" => Motion::Off,
                 "calm" => Motion::Calm,
                 _ => Motion::Medium,
             },
             layout,
-            font_ui: text("theme.font.ui", "Exo 2"),
-            font_mono: text("theme.font.mono", "Noto Sans Mono"),
+            font_display: text("theme.font.display", design.display.name()),
+            font_ui: text("theme.font.ui", design.ui.name()),
+            font_mono: text("theme.font.mono", design.mono.name()),
             text_k: int("theme.font.size", 15, 8, 48) as f32 / 15.0,
             top_h: 56,
             fav_h: 34,
             list_w: 212,
             side_w: 300,
             status_h: 32,
-            gap: sp(12),
+            gap: if buehne { lb(24.0 * spacing) } else { sp(12) },
             border: 1,
-            radius: rad(12),
+            radius: if buehne { lb(tokens::RADIUS_CARD as f32 * radius) } else { rad(12) },
             radius_small: rad(8),
             tile_bar,
             tab_row,
@@ -262,7 +337,7 @@ impl Theme {
             menu_dead: 24,
             hung_box_size: (360, 190),
             kill_button_size: (120, 44),
-            scale: int("theme.scale", 125, 100, 300) as f64 / 100.0,
+            scale,
             cursor_size: int("theme.cursor.size", 32, 16, 128) as u32,
         }
     }
@@ -271,102 +346,60 @@ impl Theme {
     pub fn fs(&self, px: f32) -> f32 {
         px * self.text_k
     }
+
+    /// The first chrome's text: mock-up px `px` in the typeface the settings chose for `f`.
+    pub fn font(&self, f: Family, px: f32, w: Weight) -> Font {
+        Font::of(self.fonts.get(f), self.fs(px), w, self.scale)
+    }
+
+    /// A design v2 type style at this output (board px, theme.font.size applies too). This and what follows are
+    /// for the design v2 parts (DS-2..5) and the apply log (CR DS-1-3).
+    pub fn style(&self, s: Style) -> Font {
+        let sp = tokens::spec(s);
+        Font::of(self.fonts.get(sp.family), sp.px * self.text_k, sp.weight, self.board).spaced(sp.track)
+    }
+
+    /// `s` as a style shows it (the labels are uppercase).
+    pub fn label(s: Style, text: &str) -> String {
+        if tokens::spec(s).upper { text.to_uppercase() } else { text.to_string() }
+    }
+
+    /// Board px in logical px (DS-3: the Bühne's geometry; the same at every theme.scale).
+    pub fn bl(&self, px: f32) -> i32 {
+        (px as f64 * self.board / self.scale).round() as i32
+    }
+
+    /// A font at a board px size (DS-3), theme.font.size applied.
+    pub fn bfont(&self, f: Family, px: f32, w: Weight) -> Font {
+        Font::of(self.fonts.get(f), px * self.text_k, w, self.board)
+    }
+
+    /// For the log (B6): each theme.font.* value that names no shipped typeface, and what is drawn instead.
+    pub fn font_notes(&self) -> Vec<String> {
+        [
+            ("display", &self.font_display, self.fonts.display),
+            ("ui", &self.font_ui, self.fonts.ui),
+            ("mono", &self.font_mono, self.fonts.mono),
+        ]
+        .into_iter()
+        .filter(|(_, set, _)| Typeface::by_name(set).is_none())
+        .map(|(k, set, tf)| format!("theme.font.{k} {set:?} is not built in, {} is drawn", tf.name()))
+        .collect()
+    }
+}
+
+/// The soft tone of a user's accent: it over the ground, as the design's accent-soft is to its accent.
+fn soft(a: Rgba, ground: Rgba, dark: bool) -> Rgba {
+    let k = if dark { 0.15 } else { 0.2 };
+    [0, 1, 2, 3].map(|i| if i == 3 { 1.0 } else { ground[i] + (a[i] - ground[i]) * k })
+}
+
+/// Text on a user's accent: the dark mode's on-accent on a bright accent, the light mode's on a deep one.
+fn on(a: Rgba) -> Rgba {
+    let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let y = 0.2126 * lin(a[0]) + 0.7152 * lin(a[1]) + 0.0722 * lin(a[2]);
+    hex(if y > 0.3 { DARK.on_accent } else { LIGHT.on_accent }).unwrap()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_are_the_mockup_values() {
-        let t = Theme::default();
-        assert!(t.dark);
-        assert_eq!(t.bg, hex("#0b0f14").unwrap());
-        assert_eq!(t.accent, hex("#00e5ff").unwrap());
-        assert!((t.glow[3] - 0.18).abs() < 1e-6);
-        assert_eq!(t.scale, 1.25);
-        assert_eq!((t.gap, t.radius, t.header_height), (12, 12, 38));
-    }
-
-    #[test]
-    fn settings_change_mode_accent_and_layout() {
-        let mut v = Values::default();
-        v.set("theme.mode", "light");
-        v.set("theme.accent", "#ffb020");
-        v.set("theme.layout.address_bar", "tile");
-        v.set("theme.scale", "100");
-        let t = Theme::build(&v);
-        assert!(!t.dark);
-        assert_eq!(t.bg, hex(LIGHT.bg).unwrap());
-        assert!((t.glow[3] - 0.14).abs() < 1e-6);
-        assert_eq!(t.accent, hex("#ffb020").unwrap());
-        assert_eq!(t.header_height, 72);
-        assert_eq!(t.scale, 1.0);
-        v.set("theme.accent", "cyan");
-        assert_eq!(Theme::build(&v).accent, hex(ACCENT).unwrap(), "a malformed value falls back to the default");
-    }
-
-    #[test]
-    fn garbage_values_take_the_default_or_are_clamped() {
-        let d = Theme::default();
-        let mut v = Values::default();
-        for (k, x) in [
-            ("theme.accent", "zzz"),
-            ("theme.mode", "foo"),
-            ("theme.scale", "0"),
-            ("theme.font.size", "-5"),
-            ("theme.font.ui", ""),
-            ("theme.spacing", "99999999999999999999"),
-            ("theme.radius", "-1"),
-            ("theme.glow", "1000"),
-            ("theme.motion", "wild"),
-            ("theme.dark.bg", "#12345"),
-            ("theme.dark.text", "#ggg000"),
-            ("theme.dark.border", "#ü1234"),
-            ("theme.layout.address_bar", "sideways"),
-            ("theme.layout.statusbar", "maybe"),
-        ] {
-            v.set(k, x);
-        }
-        let t = Theme::build(&v);
-        assert!(t.dark, "an unknown mode is dark (the default)");
-        assert_eq!((t.accent, t.bg, t.text, t.line), (d.accent, d.bg, d.text, d.line));
-        assert_eq!(t.scale, 1.0, "scale 0 is clamped to 100 %");
-        assert_eq!(t.text_k, 8.0 / 15.0, "font size -5 is clamped to 8");
-        assert_eq!(t.gap, d.gap, "an unreadable number takes the default");
-        assert_eq!(t.radius, 0, "radius -1 is clamped to 0");
-        assert!(t.glow[3] <= 0.4 + 1e-6);
-        assert_eq!(t.motion, Motion::Medium);
-        assert!(t.layout.address_top && t.layout.statusbar);
-        assert_eq!(t.cursor_size, 32, "WY-11: theme.cursor.size defaults to 32 logical px");
-        v.set("theme.scale", "99999");
-        v.set("theme.font.size", "99999");
-        v.set("theme.cursor.size", "99999");
-        let t = Theme::build(&v);
-        assert_eq!((t.scale, t.text_k), (3.0, 48.0 / 15.0), "huge values are clamped");
-        assert_eq!(t.cursor_size, 128);
-    }
-
-    #[test]
-    fn settingsd_defaults_match_the_built_in_ones() {
-        // Without settingsd (nested on CachyOS) and with it the screen must look the same.
-        let src = include_str!("../../settingsd/src/builtin.rs");
-        for (p, mode) in [(&DARK, "dark"), (&LIGHT, "light")] {
-            for c in [p.bg, p.panel, p.panel2, p.paper, p.line, p.text, p.muted] {
-                assert!(src.contains(&format!("\"{c}\"")), "settingsd lacks {mode} colour {c}");
-            }
-        }
-        for k in [
-            "theme.layout.address_bar",
-            "theme.layout.favourites_bar",
-            "theme.layout.workspaces_bar",
-            "theme.layout.claude_sidebar",
-            "theme.layout.statusbar",
-            "desktop.favourites",
-            "claude.name",
-        ] {
-            assert!(src.contains(k), "settingsd lacks {k}");
-        }
-        assert!(src.contains(&format!("text(\"{ACCENT}\")")));
-    }
-}
+mod tests;

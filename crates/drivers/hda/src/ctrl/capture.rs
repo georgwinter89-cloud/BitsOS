@@ -124,6 +124,7 @@ impl<H: Hw> Controller<H> {
             pos: Position::default(),
             written: 0,
             running: false,
+            stop_unseen: false,
             periods_seen: 0,
             callback: None,
             underruns: 0,

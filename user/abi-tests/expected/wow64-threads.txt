@@ -1,0 +1,9 @@
+thread A saw only its own TLS segment: yes
+thread B saw only its own TLS segment: yes
+thread A's slot has its base: yes
+thread B's slot has its base: yes
+main thread gs still null: yes
+main thread's slot 12 untouched: yes
+ldt bytes the thread's write left = 24
+thread's LDT entry 2 seen by main: yes
+done

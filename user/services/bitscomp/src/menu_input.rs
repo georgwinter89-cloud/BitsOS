@@ -1,6 +1,6 @@
 //! Opening the circle menu and picking from it (the geometry is in `menu`).
 
-use smithay::desktop::Window;
+use crate::win::Window;
 
 use crate::grab::Grab;
 use crate::layout::Place;

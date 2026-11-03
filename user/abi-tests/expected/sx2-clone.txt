@@ -1,0 +1,38 @@
+clone(CLONE_NEWUSER|CLONE_FS) = -EINVAL
+clone(CLONE_NEWNS|CLONE_FS) = -EINVAL
+clone(thread|CLONE_NEWUSER) = -EINVAL
+clone(thread|CLONE_NEWPID) = -EINVAL
+clone(CLONE_THREAD without CLONE_SIGHAND) = -EINVAL
+clone(CLONE_SIGHAND without CLONE_VM) = -EINVAL
+clone(CLONE_NEWPID) unprivileged = -EPERM
+clone(CLONE_NEWNET) unprivileged = -EPERM
+probe: uid 65534
+probe: exit 3
+clone(CLONE_NEWUSER) made a child = yes
+init: getpid 1 getppid 0
+init: clone(CLONE_PARENT) = -EINVAL
+member: getpid 2 getppid 1
+member: kill(1, SIGTERM) = 0
+member: kill(1, SIGKILL) = 0
+member: exit 0
+init alive after SIGTERM and SIGKILL from inside = yes
+orphan: getppid 1
+orphan done = yes
+orphan's parent: exit 0
+init reaped the orphan = yes
+init: ends with a member left
+init: exit 7
+the namespace's last member ended with its init = yes
+helper: unshare(CLONE_NEWUSER|CLONE_NEWPID) = 0
+helper: init: exit 0
+helper: fork into the dead namespace = -ENOMEM
+helper: exit 0
+set_tid: unshare(CLONE_NEWUSER) = 0
+set_tid child: getpid 1
+set_tid child: exit 0
+clone3(CLONE_NEWPID, set_tid {1}) made a child = yes
+clone3(CLONE_NEWPID, set_tid {5}) = -EINVAL
+clone3(CLONE_NEWPID, set_tid {1, n}) without CAP_CHECKPOINT_RESTORE outside = -EPERM
+clone3(CLONE_NEWPID, set_tid of 3 levels) = -EINVAL
+clone3(set_tid {1}) in the caller's namespace = -EPERM
+set_tid helper: exit 0

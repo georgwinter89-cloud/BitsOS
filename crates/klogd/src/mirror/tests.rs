@@ -5,19 +5,27 @@
 use super::ktests::{FakeCard, fake_route, log_text};
 use super::wire::{self, DGRAM_MAX, HEAD, Kind, Target};
 use super::Mirror;
+use klog::shutdown::PauseReport;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use klog::{Level, Sink};
 use ksync::SpinLock;
 use net::{NetError, SockAddr, UdpSocket};
 
 const T: Target = Target { ip: [10, 0, 2, 2], port: 23300 };
 const SRC: [u8; 4] = [10, 0, 2, 15];
-static CLOCK: AtomicU64 = AtomicU64::new(5_000_000_000);
+// One fake clock per test thread (RB-15 fixer): the wait bounds below measure it, and tests run in parallel.
+extern crate std;
+std::thread_local! {
+    static CLOCK: core::cell::Cell<u64> = const { core::cell::Cell::new(5_000_000_000) };
+}
 fn clock() -> u64 {
-    CLOCK.fetch_add(1000, Ordering::Relaxed)
+    CLOCK.with(|c| c.replace(c.get() + 1000))
+}
+fn now() -> u64 {
+    CLOCK.with(|c| c.get())
 }
 
 struct FakeSock {
@@ -46,6 +54,8 @@ impl UdpSocket for FakeSock {
 /// What console-listen.mjs prints for one sender's datagrams (log stream; the screen stream likewise).
 struct Listener {
     id: Option<u32>,
+    /// Ended starts: their late datagrams are dropped (console-listen.mjs `retire`).
+    old: Vec<u32>,
     log_next: Option<u64>,
     scr_next: Option<u64>,
     log_line: String,
@@ -55,7 +65,7 @@ struct Listener {
 
 impl Listener {
     fn new() -> Self {
-        Listener { id: None, log_next: None, scr_next: None, log_line: String::new(), scr_line: String::new(), out: Vec::new() }
+        Listener { id: None, old: Vec::new(), log_next: None, scr_next: None, log_line: String::new(), scr_line: String::new(), out: Vec::new() }
     }
     fn take(&mut self, d: &[u8]) {
         let h = wire::parse_head(d).expect("the listener ignores this datagram");
@@ -85,15 +95,23 @@ impl Listener {
                     }
                 }
                 self.out.push(String::from("==== mirror ended ===="));
+                self.old.extend(self.id.take());
             }
             Kind::Log | Kind::Screen => {
-                assert_eq!(Some(h.id), self.id, "a start the listener never saw");
+                if self.old.contains(&h.id) {
+                    return;
+                }
+                if Some(h.id) != self.id {
+                    // RB-16's crumbs after the end: a stream of their own (`text`: next ??= pos).
+                    self.out.push(String::from("==== mirror already running, its start was missed ===="));
+                    (self.id, self.log_next, self.scr_next) = (Some(h.id), None, None);
+                }
                 let (next, line, mark) = if h.kind == Kind::Log {
                     (&mut self.log_next, &mut self.log_line, "log| ")
                 } else {
                     (&mut self.scr_next, &mut self.scr_line, "scr| ")
                 };
-                let n = next.unwrap();
+                let n = *next.get_or_insert(h.pos);
                 let (mut pos, mut bytes) = (h.pos, body);
                 if pos + bytes.len() as u64 <= n {
                     return;
@@ -307,7 +325,7 @@ fn route_snapshots_publish_only_changes_and_stay_two_slots() {
         m.set_route(Some(fake_route(if i % 2 == 0 { &a } else { &b })));
     }
     assert!(routes_to(m, &b));
-    assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (2, 2), "the test's own + one slot each");
+    assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (3, 3), "the test's own + one slot each (the card and its done probe)");
     // The current slot busy on another CPU: the reader takes the one before it and never waits.
     {
         let _busy = m.routes[m.route_cur.load(Ordering::Acquire) & 1].lock();
@@ -370,4 +388,216 @@ fn a_resume_after_a_stop_starts_anew_without_repeats_or_loss() {
     let r = m.stop();
     assert!(r.was_live && r.no_route && !r.ended && !r.timed_out, "{r:?}");
     assert_eq!(m.take_stop_report(), Some(r));
+}
+
+// RB-15: the shutdown's pause, its raw rounds and the card's done.
+
+fn sleep(ns: u64) {
+    CLOCK.with(|c| c.set(c.get() + ns));
+}
+
+/// Only `Tx` and `Done(Some(true))` matter for the order; the "not yet" answers in between are the wait.
+fn last_tx_then_done(card: &FakeCard) -> bool {
+    use super::ktests::CardEv;
+    let log = card.log.lock();
+    let last_tx = log.iter().rposition(|e| *e == CardEv::Tx);
+    let last_done = log.iter().rposition(|e| *e == CardEv::Done(Some(true)));
+    matches!((last_tx, last_done), (Some(t), Some(d)) if d > t && d == log.len() - 1)
+}
+
+#[test]
+fn a_shutdown_pauses_the_thread_sends_raw_at_each_step_and_ends_after_the_card_is_done() {
+    let card = FakeCard::new();
+    card.busy_asks.store(2, Ordering::Release);
+    let m = mirror(64 << 10);
+    let sock = FakeSock::default();
+    m.set_route(Some(fake_route(&card)));
+    start(m, &sock);
+    m.write_line(Level::Info, "sent normally");
+    m.flush(&sock, 10).unwrap();
+    m.write_line(Level::Info, "logged before the pause");
+    let p = m.pause(&sleep);
+    assert!(p.was_live && p.frames >= 1 && p.done && !p.done_unknown && !p.thread_busy && !p.dropped, "{p:?}");
+    assert!(last_tx_then_done(&card), "{:?}", *card.log.lock());
+    assert!(card.log.lock().iter().filter(|e| **e == super::ktests::CardEv::Done(Some(false))).count() >= 2);
+    assert!(m.is_paused() && m.is_live() && !m.sends_normally());
+    // The thread's path is off: nothing through the stack any more.
+    m.write_line(Level::Info, "storage stopped");
+    let before = sock.sent.lock().len();
+    assert_eq!(m.flush(&sock, 10).unwrap(), (0, 0));
+    assert_eq!(sock.sent.lock().len(), before);
+    assert_eq!(m.pause(&sleep), PauseReport::default(), "a second pause does nothing");
+    let c = m.checkpoint(&sleep);
+    assert!(c.was_live && c.frames >= 1 && c.done, "{c:?}");
+    assert!(last_tx_then_done(&card));
+    // Nothing new: a checkpoint sends nothing and needs no wait.
+    let n = card.frames.lock().len();
+    assert!(m.checkpoint(&sleep).done && card.frames.lock().len() == n);
+    m.write_line(Level::Info, "cpus parked");
+    let frames_before_stop = card.frames.lock().len();
+    let r = m.stop();
+    assert!(r.was_live && r.ended && r.done && !r.done_unknown && !r.timed_out, "{r:?}");
+    // The stop after a pause does not repeat the tail again: the line and the end datagram only.
+    assert_eq!(card.frames.lock().len() - frames_before_stop, 2);
+    assert!(last_tx_then_done(&card), "the end datagram, then the done question last");
+    assert!(!m.is_paused(), "a stop clears the pause (a resume starts a normal view)");
+    let mut l = Listener::new();
+    sock.sent.lock().iter().for_each(|d| l.take(d));
+    card.datagrams(SRC).unwrap().iter().for_each(|d| l.take(d));
+    assert_eq!(
+        &l.out[1..],
+        &["log| sent normally", "log| logged before the pause", "log| storage stopped", "log| cpus parked", "==== mirror ended ===="]
+    );
+}
+
+#[test]
+fn a_pause_waits_for_the_thread_inside_its_send_and_gives_up_bounded() {
+    let card = FakeCard::new();
+    let m = mirror(64 << 10);
+    let sock = FakeSock::default();
+    m.set_route(Some(fake_route(&card)));
+    start(m, &sock);
+    // The thread is in `flush` and leaves it after the pause's first sleep.
+    m.busy.fetch_add(1, Ordering::SeqCst);
+    let sleeps = core::cell::Cell::new(0u32);
+    let p = m.pause(&|ns| {
+        if sleeps.replace(sleeps.get() + 1) == 0 {
+            m.busy.fetch_sub(1, Ordering::SeqCst);
+        }
+        sleep(ns)
+    });
+    assert!(p.was_live && !p.thread_busy, "{p:?}");
+    m.unpause();
+    assert!(m.sends_normally());
+    m.write_line(Level::Info, "normal again");
+    assert_eq!(m.flush(&sock, 10).unwrap().0, 1);
+    // A thread that never leaves: the pause goes on after PAUSE_WAIT_NS.
+    m.busy.fetch_add(1, Ordering::SeqCst);
+    let t0 = now();
+    let p = m.pause(&sleep);
+    assert!(p.was_live && p.thread_busy, "{p:?}");
+    assert!(now() - t0 >= super::PAUSE_WAIT_NS);
+    m.busy.fetch_sub(1, Ordering::SeqCst);
+    m.stop();
+}
+
+#[test]
+fn a_card_that_never_finishes_or_cannot_say_costs_a_bounded_wait() {
+    let card = FakeCard::new();
+    card.busy_asks.store(u32::MAX, Ordering::Release);
+    let m = mirror(64 << 10);
+    let sock = FakeSock::default();
+    m.set_route(Some(fake_route(&card)));
+    start(m, &sock);
+    m.write_line(Level::Info, "x");
+    let t0 = now();
+    let r = m.stop();
+    assert!(r.ended && !r.done && !r.done_unknown, "{r:?}");
+    let spent = now() - t0;
+    assert!((super::DONE_NS..super::DONE_NS + super::STOP_NS).contains(&spent), "spent {spent}");
+    assert_eq!(super::StopReport::unpack(r.pack()), r);
+    // A card without an answer: settled by time.
+    card.unknown.store(true, Ordering::Release);
+    assert!(m.resume() && m.take_resume());
+    start(m, &sock);
+    m.write_line(Level::Info, "y");
+    let r = m.stop();
+    assert!(r.ended && !r.done && r.done_unknown, "{r:?}");
+    assert_eq!(super::StopReport::unpack(r.pack()), r);
+    // No probe at all (a card without TxDone): the same.
+    let mut route = fake_route(&card);
+    route.done = None;
+    assert!(m.resume() && m.take_resume());
+    m.set_route(Some(route));
+    start(m, &sock);
+    m.write_line(Level::Info, "z");
+    let r = m.stop();
+    assert!(r.ended && r.done_unknown, "{r:?}");
+}
+
+#[test]
+fn a_pause_before_the_mirror_is_live_keeps_the_thread_quiet_once_it_is() {
+    let card = FakeCard::new();
+    let m = mirror(64 << 10);
+    let sock = FakeSock::default();
+    m.set_route(Some(fake_route(&card)));
+    assert!(!m.pause(&sleep).was_live);
+    assert!(m.is_paused());
+    start(m, &sock);
+    m.write_line(Level::Info, "late start");
+    assert_eq!(m.flush(&sock, 10).unwrap(), (0, 0));
+    assert!(m.checkpoint(&sleep).frames >= 1);
+    assert!(m.stop().ended);
+}
+
+/// RB-15 fixer: the pause asks the card even when it sends nothing raw (the stack and the card's NAPI path may
+/// have queued datagrams just before); a later checkpoint with nothing new does not ask.
+#[test]
+fn the_pause_asks_the_card_even_without_a_raw_frame() {
+    use super::ktests::CardEv;
+    let card = FakeCard::new();
+    let m = mirror(64 << 10);
+    let sock = FakeSock::default();
+    m.set_route(Some(fake_route(&card)));
+    start(m, &sock);
+    let p = m.pause(&sleep);
+    assert!(p.was_live && p.frames == 0 && p.done && !p.done_unknown, "{p:?}");
+    assert_eq!(*card.log.lock(), [CardEv::Done(Some(true))]);
+    let c = m.checkpoint(&sleep);
+    assert!(c.was_live && c.frames == 0 && c.done, "{c:?}");
+    assert_eq!(card.log.lock().len(), 1, "nothing new: not asked again");
+    m.stop();
+}
+
+/// RB-15 fixer: a pause before the mirror is live leaves the flag set (a mirror going live during the shutdown
+/// idles); `unpause` (a failed power-off) takes it back, so a later start sends normally.
+#[test]
+fn a_pause_before_live_is_taken_back_by_unpause() {
+    let m = mirror(64 << 10);
+    let p = m.pause(&sleep);
+    assert!(!p.was_live);
+    assert!(m.is_paused());
+    m.unpause();
+    assert!(!m.is_paused());
+    let sock = FakeSock::default();
+    start(m, &sock);
+    assert!(m.sends_normally());
+    m.stop();
+}
+
+#[test]
+fn crumbs_join_the_screen_stream_then_follow_the_end_under_their_own_id() {
+    use klog::crumb::{Crumb, Stage, Store};
+    let card = FakeCard::new();
+    let m = mirror(64 << 10);
+    let sock = FakeSock::default();
+    assert!(!m.leave(&Crumb { seq: 1, stage: Stage::Test, what: "no-route" }), "no route: nothing sent");
+    m.set_route(Some(fake_route(&card)));
+    start(m, &sock);
+    m.write_line(Level::Info, "sent normally");
+    m.flush(&sock, 10).unwrap();
+    assert!(m.leave(&Crumb { seq: 3, stage: Stage::Device, what: "xhci0" }));
+    assert!(last_tx_then_done(&card), "the card asked until the crumb is out: {:?}", *card.log.lock());
+    let r = m.stop();
+    assert!(r.ended, "{r:?}");
+    assert!(m.crumb_stream().1, "after the end: the crumbs' own stream");
+    assert!(m.leave(&Crumb { seq: 4, stage: Stage::Device, what: "fake-mirror0" }));
+    assert!(m.leave(&Crumb { seq: 5, stage: Stage::Quiesced, what: "" }));
+    let mut l = Listener::new();
+    sock.sent.lock().iter().for_each(|d| l.take(d));
+    card.datagrams(SRC).unwrap().iter().for_each(|d| l.take(d));
+    assert_eq!(
+        &l.out[1..],
+        &[
+            "log| sent normally",
+            "scr| crumb 3 device xhci0",
+            "==== mirror ended ====",
+            "==== mirror already running, its start was missed ====",
+            "scr| crumb 4 device fake-mirror0",
+            "scr| crumb 5 quiesced",
+        ]
+    );
+    // A card that refuses: false, counted.
+    card.refuse.store(true, Ordering::Release);
+    assert!(!m.leave(&Crumb { seq: 6, stage: Stage::Reset, what: "" }));
 }

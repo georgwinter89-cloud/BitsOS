@@ -7,6 +7,8 @@ every registration in crates/*/src (syscall!, syscall_nr!, fs_call!, sock_call!,
 number + "name" forms). Fails (exit 1) when a name Brave calls is unregistered but not in EXPECTED (a registration
 the notes rely on went missing), or when the scan finds implausibly few registrations (the pattern broke).
 A name of EXPECTED that is registered by now only prints a hint to update plan/notes/br-BR-1.md.
+BR-6b: br6-sandbox.txt is the same run with Chromium's own sandbox on (no --no-sandbox); the namespace calls of
+SANDBOX_CALLS it makes are listed as registered, and one without a registration fails.
 """
 import pathlib
 import re
@@ -15,7 +17,9 @@ import sys
 # plan/notes/br-BR-1.md, "Not registered in V2" (fgetxattr/fsetxattr only in the net run).
 # pkey_alloc and pkey_mprotect are registered since INT-W10 (BR-3 CR 4).
 EXPECTED = {"rseq", "landlock_create_ruleset", "fgetxattr", "fsetxattr"}
-REFS = ("br1-local.txt", "br1-net.txt")
+REFS = ("br1-local.txt", "br1-net.txt", "br6-sandbox.txt")
+# The calls only the sandbox makes (SX-1 seccomp, SX-2 namespaces and chroot), host strace of br6-sandbox.txt.
+SANDBOX_CALLS = {"unshare", "chroot", "seccomp", "capset"}
 BY_NAME = re.compile(r"\b(?:syscall|fs_call|sock_call)!\(\s*([A-Z][A-Za-z0-9_]*)\s*,")
 BY_NR = re.compile(r"\b(?:syscall_nr|fs_call|sock_call)!\(\s*[^,()]+,\s*\"([a-z0-9_]+)\"")
 
@@ -57,6 +61,12 @@ def main():
         missing = calls - reg
         missing_all |= missing
         print(f"{name}: {len(calls)} syscalls, unregistered: {' '.join(sorted(missing)) or '-'}")
+        if name == "br6-sandbox.txt":
+            sb = sorted(calls & SANDBOX_CALLS)
+            print(f"{name}: sandbox calls registered: {' '.join(n for n in sb if n in reg) or '-'}")
+            for n in sorted(set(sb) - reg):
+                print(f"FAIL: {n} is called by Brave's sandbox (BR-6) but has no registration")
+                bad = True
         for n in sorted(missing - EXPECTED):
             print(f"FAIL: {n} is called by Brave and the notes count it as registered, but no registration found")
             bad = True

@@ -154,7 +154,7 @@ pub fn unmap_kernel(virt: u64, len: u64, f: &mut dyn FnMut(Unmapped)) -> Result<
         let mut t = Deferred { d, freed: &mut freed, lost: &mut lost };
         walk::unmap(&mut t, root, virt, len, 3, f)
     })??;
-    let o = super::tlb::flush_kernel(virt, virt + len, !freed.is_empty() || lost > 0);
+    let o = super::tlb::flush_kernel_as(virt, virt + len, !freed.is_empty() || lost > 0, super::tlb::Cause::Vmap);
     if !o.confirmed() {
         super::tlb::count_kept(0, freed.len() as u64 + lost);
         return Err(MapError::NeedsShootdown);

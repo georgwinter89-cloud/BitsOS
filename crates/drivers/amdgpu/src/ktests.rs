@@ -402,9 +402,17 @@ mod timer {
     #[derive(Default)]
     struct Scripted {
         deadline: AtomicU64,
+        /// INT-W25 (DR-4 CR): the deadline is set at the timer thread's first look (now + this), so a slow thread
+        /// start on a loaded host never puts the first wake past it (timing is never judged in QEMU).
+        delta: AtomicU64,
         confirmed: AtomicBool,
         expired: AtomicU32,
         expired_at: AtomicU64,
+        /// What happens during the timer's first sleep (0 nothing, 1 confirm, 2 move the deadline): done inside
+        /// the timer thread so the order "deadline changed before the old one is reached" never depends on how
+        /// fast a second thread runs on a loaded host (timing is never judged in QEMU).
+        during_sleep: AtomicU32,
+        slept: AtomicBool,
     }
 
     impl TimerHost for Scripted {
@@ -412,10 +420,21 @@ mod timer {
             time::now_ns()
         }
         fn sleep_ns(&self, ns: u64) {
+            if !self.slept.swap(true, SeqCst) {
+                match self.during_sleep.load(SeqCst) {
+                    1 => self.confirmed.store(true, SeqCst),
+                    2 => self.deadline.store(time::now_ns() + 80_000_000, SeqCst),
+                    _ => {}
+                }
+            }
             sched::sleep_ns(ns);
         }
         fn wake(&self, now_ns: u64) -> Option<Wake> {
-            let d = self.deadline.load(SeqCst);
+            let mut d = self.deadline.load(SeqCst);
+            if d == 0 {
+                d = now_ns + self.delta.load(SeqCst);
+                self.deadline.store(d, SeqCst);
+            }
             Some(if self.confirmed.load(SeqCst) || self.expired.load(SeqCst) > 0 {
                 Wake::Done
             } else if now_ns >= d {
@@ -439,35 +458,30 @@ mod timer {
         fn rolled_back(&self, _to: Size) {}
     }
 
-    fn run(h: &Arc<Scripted>, after: impl FnOnce(&Scripted)) -> ktest::TestResult {
+    fn run(h: &Arc<Scripted>) -> ktest::TestResult {
         let t = h.clone();
         let j = sched::spawn("gx-mode-ktest", sched::Class::Normal, move || run_timer(&*t)).map_err(|e| alloc::format!("spawn: {e:?}"))?;
-        after(h);
         kassert!(j.join_timeout(2_000_000_000), "the timer thread did not end within 2 s");
         Ok(())
     }
 
     fn timer_thread() -> ktest::TestResult {
         let h = Arc::new(Scripted::default());
-        h.deadline.store(time::now_ns() + 30_000_000, SeqCst);
-        run(&h, |_| {})?;
+        h.delta.store(30_000_000, SeqCst);
+        run(&h)?;
         kassert!(h.expired.load(SeqCst) == 1, "rollbacks: {}", h.expired.load(SeqCst));
         kassert!(h.expired_at.load(SeqCst) >= h.deadline.load(SeqCst), "rolled back before the deadline");
 
         let h = Arc::new(Scripted::default());
-        h.deadline.store(time::now_ns() + 300_000_000, SeqCst);
-        run(&h, |h| {
-            sched::sleep_ns(20_000_000);
-            h.confirmed.store(true, SeqCst);
-        })?;
+        h.delta.store(30_000_000, SeqCst);
+        h.during_sleep.store(1, SeqCst);
+        run(&h)?;
         kassert!(h.expired.load(SeqCst) == 0, "a confirmed switch was rolled back");
 
         let h = Arc::new(Scripted::default());
-        h.deadline.store(time::now_ns() + 40_000_000, SeqCst);
-        run(&h, |h| {
-            sched::sleep_ns(10_000_000);
-            h.deadline.store(time::now_ns() + 80_000_000, SeqCst);
-        })?;
+        h.delta.store(40_000_000, SeqCst);
+        h.during_sleep.store(2, SeqCst);
+        run(&h)?;
         kassert!(h.expired.load(SeqCst) == 1, "rollbacks: {}", h.expired.load(SeqCst));
         kassert!(h.expired_at.load(SeqCst) >= h.deadline.load(SeqCst), "the moved deadline did not count");
         Ok(())

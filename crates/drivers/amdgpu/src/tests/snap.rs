@@ -263,6 +263,7 @@ fn volatile_fields_are_exactly() {
         "DMDATA_VM_UNDERFLOW_STATUS",
         "FMT_DOUBLE_BUFFER_REG_UPDATE_PENDING",
         "HUBPREQ_MASTER_UPDATE_LOCK_STATUS",
+        "HUBP_IN_BLANK",
         "HUBP_NO_OUTSTANDING_REQ",
         "HUBP_SEG_ALLOC_ERR_STATUS",
         "HUBP_TIMEOUT_STATUS",

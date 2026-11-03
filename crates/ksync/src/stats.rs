@@ -2,7 +2,8 @@
 //!
 //! Counted for every acquisition (release builds too): taken, contended (had to wait), total and longest wait,
 //! total and longest hold, failed tries, timeouts. Times are TSC ticks, shown in µs once the scheduler gave
-//! the TSC frequency (`set_tsc_hz`). Counters are per class, not per lock (one line per name).
+//! the TSC frequency (`set_tsc_hz`). Counters are per class, not per lock (one line per name); each CPU
+//! counts in its own slot of the class and a read sums them (PF-2, `slots.rs`).
 
 use crate::class::{self, LockClass};
 use crate::order;
@@ -43,19 +44,49 @@ pub struct ClassStats {
 }
 
 fn snap(c: &'static LockClass) -> ClassStats {
-    let s = &c.stats;
+    let s = c.stats.sums();
     ClassStats {
         name: c.name,
         level: c.level,
-        acquired: s.acquired.load(Ordering::Relaxed),
-        contended: s.contended.load(Ordering::Relaxed),
-        wait_ticks: s.wait_ticks.load(Ordering::Relaxed),
-        wait_max_ticks: s.wait_max.load(Ordering::Relaxed),
-        hold_ticks: s.hold_ticks.load(Ordering::Relaxed),
-        hold_max_ticks: s.hold_max.load(Ordering::Relaxed),
-        try_failed: s.try_failed.load(Ordering::Relaxed),
-        timeouts: s.timeouts.load(Ordering::Relaxed),
+        acquired: s.acquired,
+        contended: s.contended,
+        wait_ticks: s.wait_ticks,
+        wait_max_ticks: s.wait_max,
+        hold_ticks: s.hold_ticks,
+        hold_max_ticks: s.hold_max,
+        try_failed: s.try_failed,
+        timeouts: s.timeouts,
     }
+}
+
+/// How one class's acquisitions spread over the CPUs (PF-2 checks): CPUs with a slot, the acquisitions
+/// counted in the shared slot (CPUs without one), and `(cpu, acquired)` for every CPU slot that counted any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spread {
+    pub covered: usize,
+    pub shared: u64,
+    pub cpus: Vec<(usize, u64)>,
+}
+
+/// The per-CPU spread of one class (None if no such class).
+pub fn spread(name: &str) -> Option<Spread> {
+    let mut r = None;
+    class::for_each(|c| {
+        if r.is_none() && c.name == name {
+            let mut sp = Spread { covered: c.stats.covered(), shared: 0, cpus: Vec::new() };
+            c.stats.for_each_slot(|cpu, s| {
+                let n = s.acquired.load(Ordering::Relaxed);
+                match cpu {
+                    None => sp.shared = n,
+                    Some(i) if n > 0 => sp.cpus.push((i, n)),
+                    Some(_) => {}
+                }
+            });
+            sp.cpus.sort_unstable();
+            r = Some(sp);
+        }
+    });
+    r
 }
 
 /// Every class with its counters (allocates).

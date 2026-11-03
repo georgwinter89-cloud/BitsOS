@@ -300,8 +300,11 @@ impl MapBacking for FileMap {
         {
             p.page.set_dirty();
         }
-        // The last pin of a page truncate cut off frees its frame here, outside the pin lock.
-        drop(gone);
+        // The last pin of a page truncate cut off frees its frame here, outside the pin lock (PF-5: after a
+        // grace period; its charge and accounting go now).
+        if let Some(p) = gone {
+            CachePage::release(p.page);
+        }
         true
     }
 

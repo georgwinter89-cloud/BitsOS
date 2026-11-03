@@ -1,0 +1,15 @@
+# SX-3b: lines of bubblewrap's suites that V2 answers differently from CachyOS, read by tap_compare.py:
+# <suite> | <CachyOS line> | <V2 line> | <owner>: <reason>
+# The FUSE lines depend on the recording host having a FUSE mount of the user (CachyOS: a desktop session's);
+# V2 has no FUSE file system, so libtest.sh finds none and skips.
+test-run | ok 2 can bind-mount a FUSE directory with | ok 2 # SKIP no FUSE support | desk: V2 has no FUSE
+test-run | ok 7 can bind-mount a FUSE directory with --unshare-user-try | ok 7 # SKIP no FUSE support | desk: V2 has no FUSE
+test-run | ok 12 can bind-mount a FUSE directory with --unshare-pid | ok 12 # SKIP no FUSE support | desk: V2 has no FUSE
+test-run | ok 17 can bind-mount a FUSE directory with --unshare-user-try --unshare-pid | ok 17 # SKIP no FUSE support | desk: V2 has no FUSE
+test-run | ok 29 pre-exec failure doesn't include exit-code in json-status | ok 29 # SKIP no strace fault injection | desk: no strace on V2 (its fault injection needs ptrace's syscall-exit stops)
+test-run | ok 49 Can bind-mount a socket (/dev/log) onto a socket | ok 49 # SKIP - /dev/log is not a socket, cannot test bubblewrap#409 | UL: V2 has no syslog socket at /dev/log; the kernel side (a socket bound onto a socket) is abi-ns-mount sockbind, same as CachyOS
+test-run | ok 62 --overlay | ok 62 # SKIP no kernel support for unprivileged overlayfs | SX: overlay with an upper layer (copy-up, userxattr) is SX-3's open sub-item (SX-3a CR10); EINVAL with the event overlay.upper_unsupported
+test-run | ok 63 --overlay path escaping | ok 63 # SKIP no kernel support for unprivileged overlayfs | SX: overlay upper layer (SX-3a CR10)
+test-run | ok 64 --tmp-overlay | ok 64 # SKIP no kernel support for unprivileged overlayfs | SX: overlay upper layer (SX-3a CR10)
+test-run | ok 65 --ro-overlay | ok 65 # SKIP no kernel support for unprivileged overlayfs | SX: overlay upper layer (SX-3a CR10; --ro-overlay itself works, the suite gates all five on the probe)
+test-run | ok 66 --overlay-src restrictions | ok 66 # SKIP no kernel support for unprivileged overlayfs | SX: overlay upper layer (SX-3a CR10; option parsing only, gated on the probe)

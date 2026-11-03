@@ -404,6 +404,8 @@ pub struct KernelContext {
     /// The thread's user GS base while it is not running (IA32_KERNEL_GS_BASE holds it while it runs in the
     /// kernel; `swapgs` makes it GS on the way to user mode). Saved and loaded by `switch_to`.
     user_gs: AtomicU64,
+    /// AB-10a: the thread's user selectors, TLS slots and LDT (`entry::segs`), switched by `switch_to`.
+    segs: crate::entry::segs::ThreadSegs,
 }
 
 impl KernelContext {
@@ -426,6 +428,7 @@ impl KernelContext {
             on_cpu: AtomicBool::new(false),
             ext: None,
             user_gs: AtomicU64::new(crate::msr::read(crate::msr::IA32_KERNEL_GS_BASE)),
+            segs: crate::entry::segs::ThreadSegs::new(),
         }
     }
 
@@ -448,6 +451,7 @@ impl KernelContext {
             on_cpu: AtomicBool::new(false),
             ext: None,
             user_gs: AtomicU64::new(0),
+            segs: crate::entry::segs::ThreadSegs::new(),
         }
     }
 
@@ -468,16 +472,8 @@ impl KernelContext {
     pub fn saved_rsp(&self) -> u64 {
         self.rsp.load(Ordering::Relaxed)
     }
-    /// The saved CR3 (`KERNEL_CR3` = the kernel root).
-    pub fn saved_cr3(&self) -> u64 {
-        self.cr3.load(Ordering::Relaxed)
-    }
     pub fn stack_bounds(&self) -> StackBounds {
         self.bounds
-    }
-    /// Whether the stack is still mapped (false after the thread's last switch).
-    pub fn has_stack(&self) -> bool {
-        !self.stack.load(Ordering::Acquire).is_null()
     }
     pub fn xstate(&self) -> Option<&FpuState> {
         self.xstate.as_ref()
@@ -642,6 +638,24 @@ pub fn with_current_ext<R>(f: impl FnOnce(Option<&(dyn Any + Send + Sync)>) -> R
     f(c.ext())
 }
 
+/// AB-10a: `f` with the segment state of the context running on this CPU (None before `init_this_cpu`). The
+/// caller has interrupts off, so the context stays the running one while `f` runs.
+pub(crate) fn with_current_segs<R>(f: impl FnOnce(&crate::entry::segs::ThreadSegs) -> R) -> Option<R> {
+    let _irq = crate::cpu::IrqGuard::new();
+    if !CPUS_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let cpu = CPUS.get_for(crate::percpu::this_cpu())?;
+    let p = cpu.cur_ctx.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: as in `with_current_ext`: interrupts are off until `f` returns, so `p` is the context running on
+    // this CPU and stays alive (held in this CPU's `current` cell) while `f` runs.
+    let c = unsafe { &*p };
+    Some(f(&c.segs))
+}
+
 /// Makes `running` the current context of this CPU (once per CPU, before its first `switch_to`). Returns false
 /// if this CPU already has one or is inside a switch.
 pub fn init_this_cpu(running: Arc<dyn Switchable>) -> bool {
@@ -775,8 +789,10 @@ pub fn switch_to(to: Arc<dyn Switchable>, from_done: bool) -> Result<(), SwitchE
     if !from_done {
         f.user_gs.store(gs_now, Ordering::Relaxed);
     }
+    // AB-10a: selectors, TLS slots and LDT of the next thread; a GS selector load changes the inactive GS base.
+    let gs_loaded = crate::entry::segs::switch(&f.segs, &t.segs, from_done);
     let gs_want = t.user_gs.load(Ordering::Relaxed);
-    if gs_want != gs_now {
+    if gs_want != gs_now || gs_loaded {
         crate::msr::write(crate::msr::IA32_KERNEL_GS_BASE, gs_want);
     }
     match t.cr3.load(Ordering::Relaxed) {
@@ -844,11 +860,6 @@ pub fn current_id() -> u64 {
 pub fn current_stack() -> StackBounds {
     let c = CPUS.get();
     StackBounds { guard: c.guard.load(Ordering::Relaxed), bottom: c.bottom.load(Ordering::Relaxed), top: c.top.load(Ordering::Relaxed) }
-}
-
-/// Switches done on this CPU.
-pub fn switch_count() -> u64 {
-    CPUS.get().switches.load(Ordering::Relaxed)
 }
 
 /// Switches done on `cpu`.

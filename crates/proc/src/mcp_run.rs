@@ -14,8 +14,11 @@
 //! `McpAction("run.elf_b64")` for an image sent along. B4: the tool runs in an MCP worker (class Normal) and
 //! waits in short slices, looking at `stop` each time; the program's writes never block on the capture.
 
+mod caller;
 mod ktests;
 pub(crate) mod progs;
+#[cfg(bitsos_fd_measure)]
+mod prof;
 mod ps;
 mod ps_ktests;
 mod svc_ktests;
@@ -42,8 +45,6 @@ const LIVE_KEEP: usize = 1 << 20;
 /// Most JSON-escaped bytes a stream may take in the answer: two streams of binary output (each byte a
 /// six-byte `\u00XX` escape) would not fit into 4 MB otherwise.
 const SHOW_MAX: usize = 1_750 * 1024;
-/// run's own default deadline (its schema's `timeout_ms.default`).
-pub const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const SLICE_NS: u64 = 50_000_000;
 /// Progress starts this long before the deadline, so the "Still running" answer carries the output so far.
 const LEAD_NS: u64 = 2 * SLICE_NS;
@@ -59,7 +60,9 @@ pub const MCP_PROGRAM: ProgramId = ProgramId(1);
 /// init's and the console shell's PATH (userland INIT_PATH, UL-5): stick programs come last.
 /// WY-1a CR6: XDG_RUNTIME_DIR is the directory init makes for user 1000 (bitscomp's Wayland and control sockets).
 /// UL-6: the console shell's language too (glibc falls back to C when the locale is missing).
-const DEFAULT_ENV: [&str; 4] = ["PATH=/bin:/sbin:/usr/bin:/boot/BITSOS2/bin", "HOME=/", "XDG_RUNTIME_DIR=/run/user/1000", "LANG=de_DE.UTF-8"];
+/// WY-3 CR4: bitscomp holds X display :0 (Xwayland), so X11 programs started over MCP find it.
+const DEFAULT_ENV: [&str; 5] =
+    ["PATH=/bin:/sbin:/usr/bin:/boot/BITSOS2/bin", "HOME=/", "XDG_RUNTIME_DIR=/run/user/1000", "LANG=de_DE.UTF-8", "DISPLAY=:0"];
 /// UL-5: programs on the stick (\\BITSOS2\\bin under FS-7's /boot mount); a bare name not in /bin is looked up here.
 const STICK_BIN: &str = "/boot/BITSOS2/bin";
 /// The name of a program sent as `elf_b64` without a `path`.
@@ -320,7 +323,7 @@ fn set_cwd(p: &crate::Process, dir: &str) -> Result<(), vfs::Errno> {
     if f.mode() & 0o170000 != 0o040000 {
         return Err(uapi::errno::ENOTDIR);
     }
-    p.fds.fs.set_cwd(p.ns.lookup_path(dir.as_bytes(), true)?);
+    p.fs().set_cwd(p.ns.lookup_path(dir.as_bytes(), true)?);
     Ok(())
 }
 
@@ -675,6 +678,9 @@ mcp::mcp_tool!(
 mod tests {
     use super::*;
 
+    /// run's own default deadline: the mcp framework applies its schema's `timeout_ms.default`.
+    const DEFAULT_DEADLINE_MS: u64 = 30_000;
+
     fn p(t: &str) -> Result<Request, ToolError> {
         parse(&Json::parse(t).unwrap())
     }
@@ -684,7 +690,7 @@ mod tests {
         let r = p(r#"{"path":"hello"}"#).unwrap();
         assert_eq!(r.path, "/bin/hello");
         assert_eq!(r.argv, ["hello"]);
-        assert_eq!(r.envp, ["PATH=/bin:/sbin:/usr/bin:/boot/BITSOS2/bin", "HOME=/", "XDG_RUNTIME_DIR=/run/user/1000", "LANG=de_DE.UTF-8"]);
+        assert_eq!(r.envp, ["PATH=/bin:/sbin:/usr/bin:/boot/BITSOS2/bin", "HOME=/", "XDG_RUNTIME_DIR=/run/user/1000", "LANG=de_DE.UTF-8", "DISPLAY=:0"]);
         assert_eq!(r.image, None);
         let r = p(r#"{"path":"/bin/x","args":["-a","b"],"env":{"A":"1"},"stdin":"in","kill_after_ms":5}"#).unwrap();
         assert_eq!(r.argv, ["/bin/x", "-a", "b"]);

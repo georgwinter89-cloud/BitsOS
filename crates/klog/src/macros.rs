@@ -5,19 +5,26 @@
 #[macro_export]
 macro_rules! event {
     ($lvl:ident, $sub:expr, $name:expr $(, $k:ident = $v:expr)* $(,)? $(; $($fmt:tt)+)?) => {{
-        if $crate::Level::$lvl <= $crate::min_level() {
-            // The match keeps every value's temporaries alive until the event is emitted.
-            match ($(&$v,)*) {
-                ($($k,)*) => {
-                    let fields = [$($crate::Field { key: stringify!($k), value: $crate::IntoValue::into_value($k) }),*];
-                    let ev = $crate::Event {
-                        level: $crate::Level::$lvl,
-                        subsystem: $sub,
-                        name: $name,
-                        fields: &fields,
-                        message: $crate::__msg!($($($fmt)+)?),
-                    };
-                    $crate::emit(&ev);
+        let pass = $crate::Level::$lvl <= $crate::min_level();
+        // IN-9: an Info/Warn event below the level still goes on when klog's watch wants it (the boot step list).
+        // Debug/Trace never ask (the first test folds to false), and `$sub`/`$name` are evaluated once, only here.
+        if pass || $crate::__watch_may($crate::Level::$lvl) {
+            let subsystem: &str = $sub;
+            let name: &str = $name;
+            if pass || $crate::__watched(subsystem, name) {
+                // The match keeps every value's temporaries alive until the event is emitted.
+                match ($(&$v,)*) {
+                    ($($k,)*) => {
+                        let fields = [$($crate::Field { key: stringify!($k), value: $crate::IntoValue::into_value($k) }),*];
+                        let ev = $crate::Event {
+                            level: $crate::Level::$lvl,
+                            subsystem,
+                            name,
+                            fields: &fields,
+                            message: $crate::__msg!($($($fmt)+)?),
+                        };
+                        $crate::emit(&ev);
+                    }
                 }
             }
         }

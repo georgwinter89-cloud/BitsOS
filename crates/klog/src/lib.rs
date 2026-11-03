@@ -23,7 +23,7 @@
 //! - `try_event!` is the panic/NMI form: one try of the ring lock, no per-subsystem table, sinks only through
 //!   `Sink::write_emergency` (desk decision, CONTRACTS.md §6a).
 //! - Levels per subsystem from CONFIG `loglevel=warn,net=debug` (`levels`).
-//! - Sinks: serial built in, inline sinks (G0 `add_sink`) and deferred sinks fed by the klogd thread (`sinks`);
+//! - Sinks: serial built in and deferred sinks fed by the klogd thread (`sinks`; C1 removed the unused inline kind);
 //!   until klogd runs (`set_drainer`), deferred sinks are fed in order by the emitter, so the boot is on screen.
 //! - Readers by sequence number with filters (`read`, `read_tail`); MCP `log` lives in the klogd crate because
 //!   `mcp` depends on klog.
@@ -45,6 +45,8 @@ mod config;
 pub mod fields;
 pub mod keys;
 pub mod journal;
+pub mod shutdown;
+pub mod crumb;
 pub mod ratelimit;
 mod reader;
 mod render;
@@ -53,6 +55,7 @@ mod serial;
 mod sinks;
 mod tail;
 pub mod trace;
+mod watch;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -71,9 +74,10 @@ pub use fields::FieldFilter;
 pub use reader::{Filter, Gap, Page, read, read_span, read_tail, read_tail_span};
 pub use render::LINE_BYTES;
 pub use tail::{try_tail_text, try_tail_text_before};
-pub use sinks::{SinkId, add_deferred_sink, add_sink, drain_deferred, drainer, pending, remove_sink, set_drainer};
+pub use sinks::{SinkId, add_deferred_sink, drain_deferred, drainer, pending, remove_sink, set_drainer};
 #[doc(hidden)]
 pub use kreg as __kreg;
+pub use watch::{__watch_may, __watched, set_watch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -308,6 +312,12 @@ pub fn flush_serial(budget: usize) -> usize {
     serial::flush(None, budget)
 }
 
+/// [`flush_serial`], then a bounded wait (`wait_ns`) for a line another CPU is still printing and for the rest
+/// (`serial::settle`). True when serial has everything.
+pub fn flush_serial_settled(wait_ns: u64) -> bool {
+    serial::settle(wait_ns)
+}
+
 /// The panic path's first step: serial gets the stored lines it has not had yet (at most `max`), before the
 /// report, within `serial::EMERGENCY_BUDGET_NS`. No locks waited for, no allocation (`serial::flush_emergency`).
 /// Returns the lines printed.
@@ -327,11 +337,6 @@ pub fn now() -> u64 {
     CLOCK_FN.get().map(|f| f()).unwrap_or(0)
 }
 
-/// Sets the default level (subsystem settings from `set_levels`/`configure` stay).
-pub fn set_min_level(l: Level) {
-    levels::set_default(l);
-}
-
 /// The most verbose level any setting lets through (the `event!` macro's first check).
 pub fn min_level() -> Level {
     levels::most_verbose()
@@ -347,6 +352,11 @@ pub fn set_levels(spec: &str) -> Result<(), String> {
 /// The current level settings as a `loglevel=` value.
 pub fn levels() -> String {
     levels::describe()
+}
+
+/// The level `subsystem`'s records are kept up to now (tests that read their own record back skip below it).
+pub fn level_for(subsystem: &str) -> Level {
+    levels::effective(subsystem, false)
 }
 
 /// Serial output on or off (QEMU: on; the Mini-PC has no COM1, harmless either way).
@@ -367,12 +377,21 @@ pub fn try_emit(ev: &Event<'_>) -> bool {
 
 fn record(ev: &Event<'_>, emergency: bool) -> bool {
     if ev.level > levels::effective(ev.subsystem, emergency) {
+        if !emergency {
+            watch::dropped(ev);
+        }
         return false;
     }
+    record_admitted(ev, emergency)
+}
+
+/// `record` after the level check: also the rate limiter's summary (RB-12), whose level is that of the records it
+/// stands for and is checked against their subsystem's setting, not against "klog"'s.
+pub(crate) fn record_admitted(ev: &Event<'_>, emergency: bool) -> bool {
     let time_ns = now();
     // RB-7a: a storm of one event stops here, before anything is rendered or locked (the panic/NMI path is never
     // limited: the crash report must be whole).
-    if !emergency && !ratelimit::admit(ev.subsystem, ev.name, time_ns) {
+    if !emergency && !ratelimit::admit(ev.subsystem, ev.name, ev.level, time_ns) {
         return false;
     }
     let mut line = render::LineBuf::new();
@@ -421,7 +440,7 @@ fn record(ev: &Event<'_>, emergency: bool) -> bool {
     if emergency {
         sinks::emergency(ev.level, s);
     } else {
-        sinks::inline(ev.level, s);
+        sinks::after_emit();
     }
     stored
 }
@@ -461,8 +480,8 @@ pub struct RingInfo {
     pub levels: String,
     /// The ring lock could not be had in time: the ring fields above are zero, not real.
     pub busy: bool,
-    /// (name, deferred, cursor) of every sink.
-    pub sinks: Vec<(&'static str, bool, u64)>,
+    /// (name, cursor) of every sink.
+    pub sinks: Vec<(&'static str, u64)>,
     /// Longest waits for and holds of the ring lock (`lock_stats`).
     pub lock: LockStats,
 }

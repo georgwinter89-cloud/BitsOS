@@ -213,3 +213,16 @@ fn update_leaves_refuses_part_of_a_large_leaf() {
     assert!(translate(&a, root, 0x80_0000).unwrap().flags.contains(PageFlags::WRITABLE), "checked before any change");
     assert_eq!(update_leaves(&mut a, root, 0x40_0000, 0x80_1000, &mut |_| Some(ro)).unwrap(), 2, "whole leaf inside");
 }
+
+#[test]
+fn small_entries_map_what_the_huge_leaf_maps() {
+    // MM-13: a 2 MiB user leaf (write-combining through PAT, dirty, accessed, NX) split into 4 KiB entries.
+    let flags = PageFlags::USER | PageFlags::WRITABLE | PageFlags::ACCESSED | PageFlags::DIRTY | PageFlags::NX | PageFlags::PAT_4K | PageFlags::PWT;
+    let pde = 0x4000_0000 | leaf_bits(flags, 2);
+    assert!(pde & PAT_LARGE != 0 && pde & PageFlags::HUGE != 0, "the large layout moves PAT to bit 12");
+    for i in [0usize, 1, 255, 511] {
+        let e = small_entry(pde, i);
+        assert_eq!(e & ADDR_MASK, 0x4000_0000 + i as u64 * 4096);
+        assert_eq!(leaf_flags(e, 1), flags | PageFlags::PRESENT, "same rights, type and A/D bits in the 4 KiB layout");
+    }
+}

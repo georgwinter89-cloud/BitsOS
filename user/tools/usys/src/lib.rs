@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::atomic::AtomicU32;
 
 pub mod dev;
+pub mod power;
 pub mod session;
 
 pub mod nr {
@@ -148,6 +149,7 @@ pub struct Errno(pub i32);
 
 pub const EPERM: Errno = Errno(1);
 pub const ENOENT: Errno = Errno(2);
+pub const ESRCH: Errno = Errno(3);
 pub const EINTR: Errno = Errno(4);
 pub const EBADF: Errno = Errno(9);
 pub const ECHILD: Errno = Errno(10);
@@ -337,9 +339,6 @@ pub fn getgid() -> SysResult {
 }
 pub fn getegid() -> SysResult {
     ints(nr::GETEGID, &[])
-}
-pub fn getpgrp() -> SysResult {
-    ints(nr::GETPGRP, &[])
 }
 pub fn getpgid(pid: usize) -> SysResult {
     ints(nr::GETPGID, &[pid])
@@ -756,16 +755,6 @@ pub fn ioctl_fionread(fd: usize) -> SysResult<i32> {
     let mut n = 0i32;
     // SAFETY: FIONREAD writes one int into n.
     ret(unsafe { raw(nr::IOCTL, [fd, 0x541B, &mut n as *mut i32 as usize, 0, 0, 0]) }).map(|_| n)
-}
-/// ioctl(fd, TCGETS) into a 60-byte termios buffer.
-pub fn ioctl_tcgets(fd: usize) -> SysResult<[u8; 60]> {
-    let mut t = [0u8; 60];
-    // SAFETY: TCGETS writes one struct termios (60 bytes on x86-64) into t.
-    ret(unsafe { raw(nr::IOCTL, [fd, 0x5401, t.as_mut_ptr() as usize, 0, 0, 0]) }).map(|_| t)
-}
-/// ioctl with a request number no driver knows (0x5a5a), argument 0.
-pub fn ioctl_unknown(fd: usize) -> SysResult {
-    ints(nr::IOCTL, &[fd, 0x5a5a, 0])
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1327,10 +1316,6 @@ pub fn mount(source: &str, target: &str, fstype: &str, flags: usize, data: Optio
     let dp = d.as_ref().map(|c| c.as_ptr() as usize).unwrap_or(0);
     // SAFETY: four NUL-terminated strings (or NULL), read only.
     ret(unsafe { raw(nr::MOUNT, [s.as_ptr() as usize, t.as_ptr() as usize, f.as_ptr() as usize, flags, dp, 0]) })
-}
-pub fn sethostname(name: &str) -> SysResult {
-    // SAFETY: the kernel reads name.len() bytes.
-    ret(unsafe { raw(nr::SETHOSTNAME, [name.as_ptr() as usize, name.len(), 0, 0, 0, 0]) })
 }
 
 // ---------------------------------------------------------------------------------------------------------

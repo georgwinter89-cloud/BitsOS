@@ -109,6 +109,10 @@ fn sysctl_checks() -> TestResult {
     let threads = text(&tm)?;
     kassert!(threads.trim().parse::<u64>().is_ok_and(|t| t >= 20), "threads-max {threads:?}");
     kassert!(wr(&tm, b"19") == Err(EINVAL) && wr(&tm, threads.as_bytes()) == Ok(threads.len()), "threads-max writes");
+    // yama.ptrace_scope (BR-6: Chromium's Broker row): 1 by default, 0..=3; 3 is never written here (it locks).
+    let ys = format!("{k}/yama/ptrace_scope");
+    kassert!(text(&ys)? == "1\n", "ptrace_scope {:?}", text(&ys));
+    kassert!(wr(&ys, b"4") == Err(EINVAL) && wr(&ys, b"-1") == Err(EINVAL) && wr(&ys, b"1\n") == Ok(2), "ptrace_scope writes");
     let (a, b) = (text(&format!("{k}/random/uuid"))?, text(&format!("{k}/random/uuid"))?);
     kassert!(a.len() == 37 && a.as_bytes()[14] == b'4' && a != b, "uuid {a:?} then {b:?}");
     let boot = text(&format!("{k}/random/boot_id"))?;

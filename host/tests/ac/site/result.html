@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>AC3 result</title></head>
+<body><p id="r"></p>
+<script>
+const q = new URLSearchParams(location.search);
+const t = 'who=' + q.get('who') + ' agree=' + q.get('agree') + ' color=' + q.get('color');
+document.title = 'AC3 result ' + t;
+document.getElementById('r').textContent = t;
+</script></body></html>

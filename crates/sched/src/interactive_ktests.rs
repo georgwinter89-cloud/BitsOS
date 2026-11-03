@@ -272,6 +272,14 @@ fn deadline_run(n: usize, stop: &Arc<AtomicBool>, go: &Arc<AtomicBool>, hs: &mut
     // Three rounds of every CPU's queue (all threads one slice each), at least 100 ms: on 2 CPUs ~1 s.
     let round_ms = (total as u64 / n as u64 + 2) * (crate::SLICE_NS / MS);
     crate::sleep_ms((3 * round_ms).max(100));
+    // RB-17 CR-3: under a hypervisor a busy thread may miss the fixed window (host load); there starvation means
+    // no progress in 10 s. The timing itself is judged on the Mini-PC only.
+    if hal::cpu::live().has("hypervisor") {
+        let t1 = time::now_ns();
+        while (0..BUSY).any(|i| progress[i].load(Ordering::Relaxed) <= mid[i]) && time::now_ns() - t1 < 10 * SEC {
+            crate::sleep_ms(20);
+        }
+    }
     let end: Vec<u64> = progress.iter().map(|p| p.load(Ordering::Relaxed)).collect();
     let v = lat.lock().clone();
     kassert!(v.len() == ROUNDS, "{} of {ROUNDS} wake-ups within 60 s", v.len());

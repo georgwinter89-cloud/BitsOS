@@ -1,0 +1,40 @@
+uid_map of the initial namespace = -EPERM
+uid_map of the initial namespace: 33 bytes [0 other 4294967295]
+unshare(CLONE_NEWUSER) = 0
+access(/proc/self/setgroups) = 0
+access(/proc/self/ns/user) = 0
+uid_map unwritten: 0 bytes 
+setgroups: allow
+gid_map before setgroups deny = -EPERM
+setgroups deny = 4
+setgroups: deny
+uid_map of another id = -EPERM
+uid_map with count 2 = -EPERM
+uid_map bad syntax = -EINVAL
+uid_map with a missing field = -EINVAL
+uid_map with 341 lines = -EINVAL
+uid_map written after lseek(1) = -EINVAL
+gid_map = 9
+gid_map again = -EPERM
+setgroups allow after deny = -EPERM
+setgroups deny after the gid_map = -EPERM
+uid_map = 9
+uid_map again = -EPERM
+uid_map: 33 bytes [0 U 1]
+gid_map: 33 bytes [0 U 1]
+ids: uid 0 euid 0 gid 0 egid 0
+Uid:	0	0	0	0
+Gid:	0	0	0	0
+setgroups(0, NULL) with setgroups denied = -EPERM
+setuid(0) = 0
+setuid(5) unmapped = -EINVAL
+setresgid(0, 0, 0) = 0
+stat(/): uid 65534 gid 65534
+stat(/proc/self): uid 0 gid 0
+statx(/): uid 65534 gid 65534
+chromium's writes: exit 0
+sibling namespace writes the target's uid_map = -EPERM
+sibling: exit 0
+parent namespace writes the target's uid_map = 9
+target: uid 0 after the parent wrote its map
+target: exit 0

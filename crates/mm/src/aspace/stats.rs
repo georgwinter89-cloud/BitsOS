@@ -10,11 +10,12 @@
 //! Linux `page_mapcount`). Device pages count neither in VmRSS nor in smaps (Linux's VM_PFNMAP pages).
 
 use super::counters::Class;
+use super::huge::{HUGE, HUGE_PAGES};
 use super::AsCore;
 use crate::vma::Vma;
 use crate::{share, MmError, PAGE};
 use alloc::vec::Vec;
-use hal::paging::{self, PageFlags};
+use hal::paging::{self, PageFlags, PageSize};
 
 /// Pss values are bytes shifted left by this (Linux `PSS_SHIFT`): `pss >> PSS_SHIFT` bytes, `>> 10` more for kB.
 pub const PSS_SHIFT: u32 = 12;
@@ -95,7 +96,11 @@ impl PageUsage {
     /// One present 4 KiB page of class `c`, mapped by `maps` spaces (Linux `smaps_account` and
     /// `smaps_page_accumulate`: private when one space maps it, Pss = size / mapcount).
     pub(crate) fn account(&mut self, c: Class, maps: u64, young: bool, dirty: bool) {
-        let size = PAGE;
+        self.account_bytes(c, maps, young, dirty, PAGE);
+    }
+
+    /// `account` for `size` bytes mapped by `maps` spaces alike (MM-13: a never-split 2 MiB block).
+    pub(crate) fn account_bytes(&mut self, c: Class, maps: u64, young: bool, dirty: bool, size: u64) {
         let pss = if maps >= 2 { (size << PSS_SHIFT) / maps } else { size << PSS_SHIFT };
         self.resident += size;
         self.referenced += if young { size } else { 0 };
@@ -134,6 +139,19 @@ fn vma_usage(root: u64, v: &Vma, lo: u64, hi: u64) -> PageUsage {
         return u;
     }
     paging::for_each_leaf(root, lo, hi, &mut |l| {
+        // MM-13: a 2 MiB leaf is the program's own memory: one block (one holder) or 512 frames each with its count
+        // (Linux smaps_pmd_entry, task_mmu.c:591, counts per subpage mapcount too).
+        if l.size == PageSize::Size2M {
+            let young = l.flags.contains(PageFlags::ACCESSED);
+            if mm_core::is_user_block(l.phys, mm_core::HUGE_ORDER) {
+                u.account_bytes(Class::Anon, 1, young, true, HUGE);
+            } else {
+                for i in 0..HUGE_PAGES {
+                    u.account(Class::Anon, 1 + share::others(l.phys + i * PAGE) as u64, young, true);
+                }
+            }
+            return;
+        }
         let c = Class::in_vma(l.phys, Some(v));
         let (maps, dirty) = match c {
             Class::Anon => (1 + share::others(l.phys) as u64, true),
@@ -166,6 +184,32 @@ impl AsCore {
         }
     }
 
+    /// MM-13: smaps' AnonHugePages of [start, end): the bytes of the 2 MiB entries there (Linux `anonymous_thp`,
+    /// fs/proc/task_mmu.c:591). A huge entry lies inside one VMA, so the lines of a VMA sum up exactly.
+    pub fn anon_huge_in(&self, start: u64, end: u64) -> u64 {
+        if self.ctr.huge() == 0 {
+            return 0;
+        }
+        let (mut n, mut at, end) = (0, start, end.min(hal::USER_TOP));
+        // In pieces of `USAGE_STEP` per hold of the lock, as the smaps walk (B4).
+        while at < end {
+            let hi = end.min(at.saturating_add(USAGE_STEP) & !(HUGE - 1)).max(at + PAGE);
+            let _g = self.inner.lock();
+            paging::for_each_leaf(self.root, at, hi, &mut |l| {
+                if l.size == PageSize::Size2M && l.virt >= at && l.virt >= start && l.virt + HUGE <= end {
+                    n += HUGE;
+                }
+            });
+            at = hi;
+        }
+        n
+    }
+
+    /// MM-13: smaps_rollup's AnonHugePages: every 2 MiB entry of the space (kept, no walk).
+    pub fn anon_huge_bytes(&self) -> u64 {
+        self.ctr.huge() * HUGE
+    }
+
     /// VmRSS in pages, without the lock.
     pub fn rss_pages(&self) -> u64 {
         self.ctr.rss()
@@ -189,10 +233,16 @@ impl AsCore {
             committed: g.space.committed,
             commit_limit: g.limit,
             vmas: tree.len() as u64,
-            page_tables: paging::count_user_tables(self.root),
+            // MM-13: the deposited tables of the huge pages count as Linux's nr_ptes does.
+            page_tables: paging::count_user_tables(self.root) + g.deposit.len() as u64,
             ..MemStats::default()
         };
         paging::for_each_leaf(self.root, 0, hal::USER_TOP, &mut |u| {
+            if u.size == PageSize::Size2M {
+                s.resident += HUGE_PAGES;
+                s.anon += HUGE_PAGES;
+                return;
+            }
             s.resident += 1;
             match Class::in_vma(u.phys, tree.find(u.virt)) {
                 Class::Anon => s.anon += 1,
@@ -221,7 +271,8 @@ impl AsCore {
             let g = self.inner.lock();
             let Some(v) = g.space.tree.next_from(addr) else { return Ok(()) };
             let lo = addr.max(v.start);
-            let hi = v.end.min(lo.saturating_add(USAGE_STEP));
+            // Pieces end on a 2 MiB boundary (MM-13): a huge leaf is never seen by two pieces.
+            let hi = v.end.min(lo.saturating_add(USAGE_STEP) & !(HUGE - 1));
             let first = v.start >= cur_end;
             if first {
                 cur_end = v.end;

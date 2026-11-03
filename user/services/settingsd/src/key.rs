@@ -124,6 +124,7 @@ impl KeyDef {
         if self.de.trim().is_empty() || self.en.trim().is_empty() {
             return Err("a key needs a German and an English text".into());
         }
+        self.ty.valid()?;
         let d = self.ty.check(self.default.clone()).map_err(|e| format!("default: {e}"))?;
         if d != self.default {
             return Err("default is not in normal form".into());

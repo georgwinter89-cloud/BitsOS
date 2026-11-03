@@ -8,6 +8,7 @@
 #   MODE count : strace -f -c          -o OUT_DIR/count   (counts and errors per syscall)
 #   MODE net   : like trace, URL defaults to https://search.brave.com (the only outside host let through)
 # Brave runs with V2's flags (V2-LANES BR-1); every process started here is stopped by PID / process group.
+# BR_SANDBOX=1 (BR-6): without --no-sandbox, so the trace shows what Chromium's own sandbox asks of the kernel.
 # Exit 0 only if the page reached its marker (title "all-ok", net: "Brave Search"), the trace has Brave's execve
 # and nothing of the process group is left; 1 otherwise. Waits for the marker up to SECS+60 s, then traces at
 # least SECS seconds in all.
@@ -88,6 +89,8 @@ XDG_RUNTIME_DIR=$RUN/xdg "$BIN" --backend headless --size 1280x800 --socket "$SO
 COMP=$!
 for _ in $(seq 50); do [ -S "$RUN/xdg/$SOCK.ctl" ] && break; sleep 0.2; done
 ctl() { XDG_RUNTIME_DIR=$RUN/xdg "$BIN" ctl --socket "$SOCK" "$@"; }
+NOSB=--no-sandbox
+[ "${BR_SANDBOX:-}" != 1 ] || NOSB=
 
 # env -i: what V2 will give Brave (no desktop session, no D-Bus, no PulseAudio, so Chromium falls back to ALSA).
 # setsid makes strace (and so Brave and all its children) one process group to stop at the end. The group id
@@ -97,7 +100,7 @@ setsid bash -c 'echo $$ >"$0"; exec "$@"' "$RUN/pgid" env -i PATH=/usr/bin HOME=
     DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN/xdg/no-bus" PULSE_SERVER="unix:$RUN/xdg/no-pulse" \
     PIPEWIRE_REMOTE="$RUN/xdg/no-pipewire" \
     "${STRACE[@]}" -- "$BRAVE" \
-    --ozone-platform=wayland --disable-gpu --password-store=basic --no-sandbox \
+    --ozone-platform=wayland --disable-gpu --password-store=basic ${NOSB:+"$NOSB"} \
     --disable-breakpad --disable-crash-reporter --no-first-run --no-default-browser-check \
     --user-data-dir="$RUN/profile" --autoplay-policy=no-user-gesture-required \
     --host-resolver-rules="$RULES" "$URL" >"$OUT/brave.log" 2>&1 &

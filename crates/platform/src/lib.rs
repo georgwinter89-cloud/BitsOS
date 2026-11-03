@@ -23,6 +23,7 @@ pub mod timers;
 pub mod tsc;
 
 mod cpu_ktest;
+mod entry_ktest;
 mod smp_ktest;
 mod limit_ktest;
 mod power_ktest;

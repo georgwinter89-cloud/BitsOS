@@ -80,20 +80,22 @@ fn present_full() -> TestResult {
 }
 ktest!("dp.gopfb.present_full", Safe, present_full);
 
-/// The timer estimate: 60 Hz by default, a known refresh replaces it, the sequence never goes back, and
-/// waiting ends at the estimated vblank.
+/// The display's timer estimate (its `VblankClock`, which fbdev's `clock_now` reads through `live_vblank` while
+/// GopFb is the installed display; `last_vblank`, `VblankClock::next`): 60 Hz by default,
+/// a known refresh replaces it, the sequence never goes back, and the next vblank comes when it said.
 fn vblank() -> TestResult {
     let t = Arc::new(RamTarget::new(64 * 4, 0));
     let d = GopFb::new(t, 8, 8, 8, Layout::Bgrx, "ram").map_err(|e| format!("{e:?}"))?;
-    kassert!(d.vblank_period_ns() == 16_666_666 && d.current_mode().refresh_mhz == 0, "default 60 Hz, refresh unknown");
+    kassert!(d.vblank.rate().1 == 16_666_666 && d.current_mode().refresh_mhz == 0, "default 60 Hz, refresh unknown");
     let a = d.last_vblank();
-    let ev = d.wait_vblank(1_000_000_000).ok_or("next vblank further than 1 s")?;
+    let ev = d.vblank.next(time::now_ns());
+    kassert!(ev.sequence > a.sequence && ev.time_ns > a.time_ns, "next {ev:?} after last {a:?}");
+    kassert!(ev.time_ns.saturating_sub(time::now_ns()) <= 1_000_000_000, "next vblank further than 1 s");
+    sched::sleep_ns(ev.time_ns.saturating_sub(time::now_ns()));
     let now = time::now_ns();
-    kassert!(now >= ev.time_ns && ev.sequence > a.sequence, "woke at {now} for vblank {} at {}", ev.sequence, ev.time_ns);
-    kassert!(d.last_vblank().sequence >= ev.sequence);
-    kassert!(d.wait_vblank(0).is_none(), "a zero timeout must not sleep a frame");
+    kassert!(now >= ev.time_ns && d.last_vblank().sequence >= ev.sequence, "at {now}: last {:?}, awaited {ev:?}", d.last_vblank());
     d.set_refresh_mhz(59_950);
-    kassert!(d.vblank_period_ns() == 16_680_567 && d.current_mode().refresh_mhz == 59_950);
+    kassert!(d.vblank.rate().1 == 16_680_567 && d.current_mode().refresh_mhz == 59_950);
     let b = d.last_vblank();
     kassert!(b.sequence >= ev.sequence, "sequence went back across the refresh change");
     if let Some(live) = display::device() {

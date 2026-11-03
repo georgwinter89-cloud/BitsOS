@@ -8,7 +8,8 @@
 
 use super::abi::{SIOCATMARK, SIOCOUTQNSD};
 use super::{Kind, SockFile};
-use crate::ifview::{self, Link};
+use crate::ifview::{self, Addr, Link};
+use crate::netns::NlFail;
 use uapi::errno::*;
 use vfs::sys::UserMem;
 
@@ -83,7 +84,16 @@ const AF_INET: u16 = 2;
 /// Who asks (root has CAP_NET_ADMIN).
 pub struct Asker<'a> {
     pub mem: &'a dyn UserMem,
-    pub uid: u32,
+    pub caller: super::Caller,
+    /// NW-11: the socket's network namespace (`sock_net`): the interfaces asked about are its own.
+    pub net: crate::netns::Net,
+}
+
+impl Asker<'_> {
+    /// CAP_NET_ADMIN over the namespace (`ns_capable(net->user_ns, CAP_NET_ADMIN)`).
+    fn admin(&self) -> bool {
+        self.caller.can(super::cap::NET_ADMIN)
+    }
 }
 
 fn get(a: &Asker<'_>, at: u64, n: usize) -> Result<alloc::vec::Vec<u8>, i64> {
@@ -104,7 +114,7 @@ pub fn ioctl(a: &Asker<'_>, k: &SockFile, cmd: u64, arg: u64) -> Option<i64> {
         c if (SIOCDEVPRIVATE..=SIOCDEVPRIVATE + 15).contains(&c) => dev_ioctl(a, cmd, arg),
         // `sock_ioctl` itself: owner and stamps (the socket's own `File::ioctl`).
         0x8901..=0x8904 | 0x8906 | 0x8907 => return None,
-        SIOCGSKNS => Err(if a.uid == 0 { EOPNOTSUPP } else { EPERM }),
+        SIOCGSKNS => Err(if a.admin() { EOPNOTSUPP } else { EPERM }),
         // `sock_ioctl` hands SIOCIWFIRST..SIOCIWLAST to wext on every socket (net/socket.c:1271-1273).
         0x8B00..=0x8BFF => wext(a, cmd, arg),
         _ => match &k.kind {
@@ -128,7 +138,7 @@ pub fn ioctl(a: &Asker<'_>, k: &SockFile, cmd: u64, arg: u64) -> Option<i64> {
                 _ if is_socket_ioctl(cmd) => dev_ioctl(a, cmd, arg),
                 _ => return None,
             },
-            Kind::Unix(_) if cmd == SIOCUNIXFILE => Err(if a.uid == 0 { EOPNOTSUPP } else { EPERM }),
+            Kind::Unix(_) if cmd == SIOCUNIXFILE => Err(if a.admin() { EOPNOTSUPP } else { EPERM }),
             // `unix_ioctl` answers SIOCATMARK itself.
             Kind::Unix(_) if cmd == SIOCATMARK => return None,
             _ if is_socket_ioctl(cmd) => dev_ioctl(a, cmd, arg),
@@ -153,8 +163,155 @@ fn name_of(r: &mut [u8]) -> (alloc::vec::Vec<u8>, Option<usize>) {
     (r[..colon.unwrap_or(n)].to_vec(), colon)
 }
 
-fn by_name(n: &[u8]) -> Result<Link, i64> {
-    ifview::by_name(n).ok_or(ENODEV)
+fn by_name(a: &Asker<'_>, n: &[u8]) -> Result<Link, i64> {
+    ifview::by_name_in(&a.net, n).ok_or(ENODEV)
+}
+
+/// NW-11: SIOCSIFFLAGS on a namespace's lo (`dev_change_flags` with the short `ifr_flags`): CAP_NET_ADMIN over the
+/// namespace (EPERM), the device (ENODEV). On an AF_INET socket (`inet`) an alias name ("lo:1") means its
+/// address (`devinet_ioctl`: EADDRNOTAVAIL without one, deleted when IFF_UP is clear, NW-12); `dev_ioctl` cuts
+/// the alias off and changes the device. The initial namespace's interfaces are the kernel's: a program changes
+/// none of them.
+fn set_flags(a: &Asker<'_>, name: &[u8], colon: Option<usize>, r: &[u8], inet: bool) -> Result<i64, i64> {
+    let Some(v) = &a.net else { return need_admin(a) };
+    if !a.admin() {
+        return Err(EPERM);
+    }
+    let l = by_name(a, name)?;
+    let flags = u16::from_le_bytes([r[16], r[17]]) as u32;
+    if let (Some(c), true) = (colon, inet) {
+        let mut full = r[..16].to_vec();
+        full[c] = b':';
+        let label = full_name(&full);
+        v.edit("alias", |d| {
+            let i = d.addrs.iter().position(|x| x.label_or(&l.name).as_bytes() == label).ok_or(NlFail(EADDRNOTAVAIL, None))?;
+            if flags & ifview::IFF_UP == 0 {
+                d.delete(i);
+            }
+            Ok(())
+        })
+        .map_err(|e| e.0)?;
+        return Ok(0);
+    }
+    v.change_lo_flags(flags)?;
+    Ok(0)
+}
+
+/// The NUL-terminated name at the start of an ifreq.
+fn full_name(r: &[u8]) -> &[u8] {
+    &r[..r[..16].iter().position(|b| *b == 0).unwrap_or(15)]
+}
+
+/// NW-12: SIOCSIFMTU / SIOCSIFTXQLEN on a namespace's lo (`dev_ifsioc`): CAP_NET_ADMIN (EPERM) before the device
+/// (ENODEV); a negative value is EINVAL (lo has no MTU bounds, `dev_validate_mtu`). SIOCSIFTXQLEN wants
+/// CAP_NET_ADMIN in the initial user namespace (`capable`, linux-6.6/net/core/dev_ioctl.c:753), which the
+/// namespace hook answers from the credentials (`Ids::capable_initial`).
+fn set_dev(a: &Asker<'_>, cmd: u64, name: &[u8], r: &[u8]) -> Result<i64, i64> {
+    let Some(v) = &a.net else { return need_admin(a) };
+    if !a.admin() || (cmd == SIOCSIFTXQLEN && !a.caller.can_initial(super::cap::NET_ADMIN)) {
+        return Err(EPERM);
+    }
+    by_name(a, name)?;
+    let n = i32::from_le_bytes([r[16], r[17], r[18], r[19]]);
+    if n < 0 {
+        return Err(EINVAL);
+    }
+    let mtu = cmd == SIOCSIFMTU;
+    v.edit(if mtu { "mtu" } else { "txqlen" }, |d| {
+        if mtu {
+            if d.mtu != n as u32 {
+                d.set_mtu(n as u32);
+            }
+        } else {
+            d.txqlen = n as u32;
+        }
+        Ok(())
+    })
+    .map_err(|e| e.0)?;
+    Ok(0)
+}
+
+/// `inet_abc_len`: the classful prefix of an address (0 for 0.0.0.0 and 255.255.255.255), None for multicast.
+fn abc_len(ip: [u8; 4]) -> Option<u8> {
+    let h = u32::from_be_bytes(ip);
+    if h == 0 || h == u32::MAX {
+        return Some(0);
+    }
+    match ip[0] {
+        0..=127 => Some(8),
+        128..=191 => Some(16),
+        192..=223 => Some(24),
+        224..=239 => None,
+        _ => Some(32),
+    }
+}
+
+/// NW-12: SIOCSIFADDR / SIOCSIFBRDADDR / SIOCSIFDSTADDR / SIOCSIFNETMASK on a namespace's lo (`devinet_ioctl`,
+/// linux-6.6/net/ipv4/devinet.c:1033): the address is the first one labelled with the ifreq's name (with its
+/// alias); a changed address is deleted (with its secondaries, `inet_del_ifa`) and inserted again. A new
+/// address takes its classful prefix (`inet_abc_len`) and the name as its label; 127/8 is host scope
+/// (`inet_set_ifa`). SIOCSIFDSTADDR (a peer address, which V2 does not keep apart) is EOPNOTSUPP unless it
+/// changes nothing.
+fn set_addr(v: &alloc::sync::Arc<crate::netns::NetView>, cmd: u64, l: &Link, label: &[u8], colon: bool, val: [u8; 4]) -> Result<i64, i64> {
+    let label_s = alloc::string::String::from_utf8_lossy(label).into_owned();
+    // The deletion of the old address stays when the insert fails (`edit_partial`): SIOCSIFADDR answers the
+    // insert's error, SIOCSIFBRDADDR and SIOCSIFNETMASK ignore it (`inet_insert_ifa`'s result is dropped).
+    v.edit_partial("ioctl", |d| {
+        let i = d.addrs.iter().position(|x| x.label_or(&l.name).as_bytes() == label);
+        let Some(i) = i else {
+            if cmd != SIOCSIFADDR {
+                return Err(NlFail(EADDRNOTAVAIL, None));
+            }
+            let prefix = abc_len(val).ok_or(NlFail(EINVAL, None))?;
+            let scope = if val[0] == 127 { ifview::RT_SCOPE_HOST } else { ifview::RT_SCOPE_UNIVERSE };
+            let label = colon.then_some(label_s.clone());
+            return d.insert(Addr { label, ..Addr::plain(val, prefix, scope, ifview::INFINITY, ifview::INFINITY) });
+        };
+        let mut x = d.addrs[i].clone();
+        match cmd {
+            SIOCSIFADDR => {
+                let prefix = abc_len(val).ok_or(NlFail(EINVAL, None))?;
+                if x.ip == val {
+                    return Ok(());
+                }
+                d.delete(i);
+                x.brd = None;
+                x.ip = val;
+                x.prefix = prefix;
+                x.scope = if val[0] == 127 { ifview::RT_SCOPE_HOST } else { ifview::RT_SCOPE_UNIVERSE };
+            }
+            SIOCSIFBRDADDR => {
+                if x.brd.unwrap_or([0; 4]) == val {
+                    return Ok(());
+                }
+                d.delete(i);
+                x.brd = (val != [0; 4]).then_some(val);
+            }
+            SIOCSIFDSTADDR => {
+                if x.ip == val {
+                    return Ok(());
+                }
+                abc_len(val).ok_or(NlFail(EINVAL, None))?;
+                return Err(NlFail(EOPNOTSUPP, None));
+            }
+            _ => {
+                // `bad_mask`: the ones of a netmask are contiguous.
+                let m = u32::from_be_bytes(val);
+                if (!m) & (!m).wrapping_add(1) != 0 {
+                    return Err(NlFail(EINVAL, None));
+                }
+                if x.mask() == val {
+                    return Ok(());
+                }
+                d.delete(i);
+                x.prefix = m.count_ones() as u8;
+            }
+        }
+        let r = d.insert(x);
+        if cmd == SIOCSIFADDR { r } else { Ok(()) }
+    })
+    .map_err(|e| e.0)?;
+    Ok(0)
 }
 
 /// `wext_handle_ioctl` (linux-6.6/net/wireless/wext-core.c:1063-1080, :990-1017, :942-984): the 32-byte
@@ -166,18 +323,18 @@ fn wext(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
     const SIOCGIWENCODEEXT: u64 = 0x8B35;
     let mut r = get(a, arg, 32)?;
     let set = cmd & 1 == 0;
-    if (set || cmd == SIOCGIWENCODE || cmd == SIOCGIWENCODEEXT) && a.uid != 0 {
+    if (set || cmd == SIOCGIWENCODE || cmd == SIOCGIWENCODEEXT) && !a.admin() {
         return Err(EPERM);
     }
     // `__dev_get_by_name` on the whole name: wext cuts no ':' alias, unlike `dev_ioctl`.
     r[15] = 0;
     let n = r[..16].iter().position(|b| *b == 0).unwrap_or(15);
-    by_name(&r[..n])?;
+    by_name(a, &r[..n])?;
     Err(EOPNOTSUPP)
 }
 
 fn need_admin(a: &Asker<'_>) -> Result<i64, i64> {
-    if a.uid == 0 { Err(EOPNOTSUPP) } else { Err(EPERM) }
+    if a.admin() { Err(EOPNOTSUPP) } else { Err(EPERM) }
 }
 
 /// `dev_ioctl` (after `get_user_ifreq`).
@@ -186,7 +343,7 @@ fn dev_ioctl(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
     if cmd == SIOCGIFNAME {
         r[15] = 0;
         let index = i32::from_le_bytes([r[16], r[17], r[18], r[19]]);
-        let l = if index > 0 { ifview::by_index(index as u32) } else { None }.ok_or(ENODEV)?;
+        let l = if index > 0 { ifview::by_index_in(&a.net, index as u32) } else { None }.ok_or(ENODEV)?;
         let n = &l.name.as_bytes()[..l.name.len().min(ifview::IFNAME_MAX)];
         r[..n.len()].copy_from_slice(n);
         r[n.len()] = 0;
@@ -197,12 +354,12 @@ fn dev_ioctl(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
     let put_int = |r: &mut [u8], v: u32| r[16..20].copy_from_slice(&v.to_le_bytes());
     match cmd {
         SIOCGIFHWADDR => {
-            let l = by_name(&name)?;
+            let l = by_name(a, &name)?;
             r[16..18].copy_from_slice(&l.arphrd().to_le_bytes());
             r[18..24].copy_from_slice(&l.mac);
         }
         SIOCGIFFLAGS | SIOCGIFMETRIC | SIOCGIFMTU | SIOCGIFSLAVE | SIOCGIFMAP | SIOCGIFINDEX | SIOCGIFTXQLEN => {
-            let l = by_name(&name)?;
+            let l = by_name(a, &name)?;
             match cmd {
                 // `ifr_flags` is a short: IFF_LOWER_UP (bit 16) does not fit.
                 SIOCGIFFLAGS => r[16..18].copy_from_slice(&(l.flags() as u16).to_le_bytes()),
@@ -212,22 +369,24 @@ fn dev_ioctl(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
                 // `struct ifmap` fields (mem_start, mem_end, base_addr, irq, dma, port): none for these cards.
                 SIOCGIFMAP => r[16..37].fill(0),
                 SIOCGIFINDEX => put_int(&mut r, l.index),
-                _ => put_int(&mut r, ifview::TX_QUEUE_LEN),
+                _ => put_int(&mut r, l.txqlen),
             }
         }
         SIOCETHTOOL => return ethtool(a, &name, &r),
-        SIOCGMIIPHY | SIOCGMIIREG | SIOCSIFNAME | SIOCSIFMAP | SIOCSIFTXQLEN | SIOCSIFFLAGS | SIOCSIFMETRIC | SIOCSIFMTU
+        SIOCSIFFLAGS => return set_flags(a, &name, colon, &r, false),
+        SIOCSIFMTU | SIOCSIFTXQLEN => return set_dev(a, cmd, &name, &r),
+        SIOCGMIIPHY | SIOCGMIIREG | SIOCSIFNAME | SIOCSIFMAP | SIOCSIFMETRIC
         | SIOCSIFHWADDR | SIOCSIFSLAVE | SIOCADDMULTI | SIOCDELMULTI | SIOCSIFHWBROADCAST | SIOCSMIIREG | SIOCBONDENSLAVE
         | SIOCBONDRELEASE | SIOCBONDSETHWADDR | SIOCBONDCHANGEACTIVE | SIOCBRADDIF | SIOCBRDELIF | SIOCSHWTSTAMP => {
             return need_admin(a);
         }
         // Bonding queries, WAN devices, hardware stamps and the private range: no V2 device has them.
         SIOCBONDSLAVEINFOQUERY | SIOCBONDINFOQUERY | SIOCWANDEV | SIOCGHWTSTAMP => {
-            by_name(&name)?;
+            by_name(a, &name)?;
             return Err(EOPNOTSUPP);
         }
         c if (SIOCDEVPRIVATE..=SIOCDEVPRIVATE + 15).contains(&c) => {
-            by_name(&name)?;
+            by_name(a, &name)?;
             return Err(EOPNOTSUPP);
         }
         _ => return Err(ENOTTY),
@@ -243,7 +402,7 @@ fn dev_ioctl(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
 fn ethtool(a: &Asker<'_>, name: &[u8], r: &[u8]) -> Result<i64, i64> {
     let data = u64::from_le_bytes(r[16..24].try_into().unwrap_or([0; 8]));
     let cmd = u32::from_le_bytes(get(a, data, 4)?.try_into().unwrap_or([0; 4]));
-    let l = by_name(name)?;
+    let l = by_name(a, name)?;
     if cmd != ETHTOOL_GLINK {
         return Err(EOPNOTSUPP);
     }
@@ -265,31 +424,33 @@ fn devinet(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
             r[16..32].fill(0);
             r[16..18].copy_from_slice(&AF_INET.to_le_bytes());
         }
-        SIOCSIFFLAGS => return need_admin(a),
+        SIOCSIFFLAGS => return set_flags(a, &name, colon, &r, true),
         SIOCSIFADDR | SIOCSIFBRDADDR | SIOCSIFDSTADDR | SIOCSIFNETMASK => {
-            if a.uid != 0 {
+            if !a.admin() {
                 return Err(EPERM);
             }
             if orig_family != AF_INET {
                 return Err(EINVAL);
             }
-            return Err(EOPNOTSUPP);
+            let Some(v) = &a.net else { return Err(EOPNOTSUPP) };
+            let l = by_name(a, &name)?;
+            if let Some(c) = colon {
+                r[c] = b':';
+            }
+            return set_addr(v, cmd, &l, full_name(&r), colon.is_some(), orig_addr);
         }
         _ => return Err(EINVAL),
     }
-    let l = by_name(&name)?;
+    let l = by_name(a, &name)?;
     if let Some(c) = colon {
         r[c] = b':';
     }
-    // The label is the name with its alias part (`ifa_label`); V2's addresses carry the interface's name.
-    let full_len = r[..16].iter().position(|b| *b == 0).unwrap_or(15);
-    let label_ok = &r[..full_len] == l.name.as_bytes();
-    let ifa = if label_ok {
-        let by_addr = (orig_family == AF_INET).then(|| l.addrs.iter().find(|x| x.ip == orig_addr)).flatten();
-        by_addr.or(l.addrs.first())
-    } else {
-        None
-    };
+    // The label is the name with its alias part (`ifa_label`): first label and address (4.4BSD style), then
+    // the label alone.
+    let full = full_name(&r).to_vec();
+    let labelled = |x: &&Addr| x.label_or(&l.name).as_bytes() == full;
+    let by_addr = (orig_family == AF_INET).then(|| l.addrs.iter().filter(labelled).find(|x| x.ip == orig_addr)).flatten();
+    let ifa = by_addr.or_else(|| l.addrs.iter().find(labelled));
     let ifa = ifa.ok_or(EADDRNOTAVAIL)?;
     let v = match cmd {
         SIOCGIFADDR | SIOCGIFDSTADDR => ifa.ip,
@@ -308,7 +469,7 @@ fn ifconf(a: &Asker<'_>, arg: u64) -> Result<i64, i64> {
     let len = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
     let buf = u64::from_le_bytes(c[8..16].try_into().unwrap_or([0; 8]));
     let mut total: i32 = 0;
-    for l in ifview::links() {
+    for l in ifview::links_in(&a.net) {
         for x in &l.addrs {
             if buf == 0 {
                 total += IFREQ as i32;
@@ -318,8 +479,9 @@ fn ifconf(a: &Asker<'_>, arg: u64) -> Result<i64, i64> {
                 break;
             }
             let mut e = [0u8; IFREQ];
-            let n = l.name.len().min(ifview::IFNAME_MAX);
-            e[..n].copy_from_slice(&l.name.as_bytes()[..n]);
+            let label = x.label_or(&l.name).as_bytes();
+            let n = label.len().min(ifview::IFNAME_MAX);
+            e[..n].copy_from_slice(&label[..n]);
             e[16..18].copy_from_slice(&AF_INET.to_le_bytes());
             e[20..24].copy_from_slice(&x.ip);
             // A buffer address at the top of the address space wraps (as Linux's `pos + total`) and fails the
@@ -341,7 +503,7 @@ fn route(a: &Asker<'_>, arg: u64) -> Result<i64, i64> {
 /// `arp_ioctl`: setting and deleting need CAP_NET_ADMIN; SIOCGARP looks the device up. V2's ARP table lives in
 /// the stack (smoltcp keeps it private): no entry is shown (ENXIO, Linux's answer for an unknown address).
 fn arp(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
-    if cmd != SIOCGARP && a.uid != 0 {
+    if cmd != SIOCGARP && !a.admin() {
         return Err(EPERM);
     }
     let r = get(a, arg, ARPREQ)?;
@@ -358,7 +520,7 @@ fn arp(a: &Asker<'_>, cmd: u64, arg: u64) -> Result<i64, i64> {
     let dev = &r[52..68];
     let n = dev.iter().position(|b| *b == 0).unwrap_or(16);
     if n > 0 {
-        by_name(&dev[..n])?;
+        by_name(a, &dev[..n])?;
     } else if cmd == SIOCGARP {
         return Err(ENODEV);
     }

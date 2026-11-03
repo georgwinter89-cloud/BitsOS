@@ -11,7 +11,8 @@ T="$BITSOS_ROOT/target/user-scenario"
 (cd user && env -u CARGO_TARGET_DIR -u RUSTUP_TOOLCHAIN cargo build -q --offline --release --target x86_64-unknown-linux-musl --target-dir "$T" -p fetch)
 FETCH="$T/x86_64-unknown-linux-musl/release/fetch"
 RUN="$BITSOS_ROOT/target/ul-fetch-linux"
-rm -rf "$RUN"; mkdir -p "$RUN/srv"
+# Empties the run dir but keeps output.log (xtask fullrun writes this script's output there).
+mkdir -p "$RUN"; find "$RUN" -mindepth 1 -maxdepth 1 ! -name output.log -exec rm -rf {} +; mkdir -p "$RUN/srv"
 SPID=""
 stop() { rc=$?; if [ -n "$SPID" ]; then kill "$SPID" 2>/dev/null || true; wait "$SPID" 2>/dev/null || true; fi; exit $rc; }
 trap stop EXIT

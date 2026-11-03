@@ -521,6 +521,14 @@ pub fn next_deadline() -> Option<u64> {
     best
 }
 
+/// FD-1: earliest armed deadline in `cpu`'s own queue (`Some(None)`: none armed), for the idle loop's choice of
+/// sleep depth. `None`: the queue was busy this instant or `cpu` has none; the caller decides without it.
+pub fn next_deadline_on(cpu: usize) -> Option<Option<u64>> {
+    let q = QUEUES.find_for(cpu)?;
+    let g = q.try_lock()?;
+    Some(g.earliest())
+}
+
 /// Armed timers in `cpu`'s queue (`None`: the polled queue) and its programmed deadline.
 pub fn queue_state(cpu: Option<usize>) -> Option<(usize, u64)> {
     let q = match cpu {

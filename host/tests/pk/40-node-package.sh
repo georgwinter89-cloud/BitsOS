@@ -10,7 +10,8 @@ ROOT="${BITSOS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 RUN="${BITSOS_RUN_DIR:-$ROOT/target/xtask/runs/pk-40-node-package}"
 [ -x /usr/bin/node ] || { echo "SKIP: no /usr/bin/node"; exit 0; }
 command -v ldd >/dev/null || { echo "SKIP: no ldd"; exit 0; }
-rm -rf "$RUN"
+# Empties the run dir but keeps output.log (xtask fullrun writes this script's output there).
+mkdir -p "$RUN"; find "$RUN" -mindepth 1 -maxdepth 1 ! -name output.log -exec rm -rf {} +
 mkdir -p "$RUN/src/bin"
 (cd "$ROOT/user" && env -u CARGO_TARGET_DIR -u RUSTUP_TOOLCHAIN cargo build -q --offline --release -p bitspkg --target-dir "$ROOT/target/user-host")
 B="$ROOT/target/user-host/release/bitspkg"

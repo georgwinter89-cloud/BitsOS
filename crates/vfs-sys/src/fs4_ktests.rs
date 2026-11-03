@@ -516,7 +516,7 @@ fn legacy_objects() -> TestResult {
     kassert!(h.join_timeout(5 * SEC), "the helper did not end");
     kassert!(seen, "poll never looked at the object again");
     // The real terminal (a legacy object until IN names its PollQueue): pollable, writable.
-    let tty = OpenFile::anon(Arc::new(vfs::tty::TtyDev::new(vfs::tty::Which::Tty, None)), vfs::abi::O_RDWR);
+    let tty = OpenFile::anon(Arc::new(vfs::tty::TtyDev::new(vfs::tty::Which::Tty)), vfs::abi::O_RDWR);
     let te = epoll::new_epoll();
     add(&te, &tty, 5, Events::OUT, 5)?;
     let mut out: Vec<(u32, u64)> = Vec::new();

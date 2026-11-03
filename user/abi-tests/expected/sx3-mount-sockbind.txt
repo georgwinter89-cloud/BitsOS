@@ -1,0 +1,12 @@
+uid_map = 11
+setgroups = 4
+gid_map = 11
+make / rslave = 0
+tmpfs = 0
+sockets = made
+bind a.sock onto b.sock = 0
+b is a socket = yes
+b is a's inode = yes
+connect b = 0
+a accepted = yes
+umount b = 0

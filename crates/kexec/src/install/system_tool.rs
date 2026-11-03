@@ -183,6 +183,7 @@ fn system_pin(ctx: &ToolContext, args: &Json) -> ToolResult {
     let want = want_from(args)?;
     let now = opt_bool(args, "now")?.unwrap_or(false);
     let dry = opt_bool(args, "dry_run")?.unwrap_or(false);
+    let force = opt_bool(args, "force")?.unwrap_or(false);
     let Some(busy) = Busy::take() else {
         return Err(ToolError::Refused(String::from(
             "a Reload, an install or the boot confirmation's stick write is in progress; try again in a few seconds (nothing on the stick changed)",
@@ -197,6 +198,9 @@ fn system_pin(ctx: &ToolContext, args: &Json) -> ToolResult {
         let cfg = crate::refresh::dry_run(&st);
         t.push_str(&format!(". Reload into generation {} (dry run, nothing happens): {staged}; {cfg}", target.number));
         return Ok(vec![ToolOutput::Text(t)]);
+    }
+    if !force {
+        crate::refresh::refuse_secret_loss(&st).map_err(|e| ToolError::Refused(format!("{t}. No Reload: {e} (nothing on the stick changed)")))?;
     }
     // The jump is armed only once the PIN is on the stick: a failed write leaves this kernel running.
     let armed = Arc::new(AtomicBool::new(false));
@@ -232,7 +236,7 @@ mcp_tool!(
     owner: "RB",
     safety: Change,
     description: "System back to an older generation (B1): n=<number> writes \\BITSOS2\\SYS\\PIN so bitsboot starts that confirmed generation at every start until n=\"off\" removes the pin (or an install with unpin). now=true also goes there at once: a Reload into the generation the next start would take (its KERNEL and INITRD read from the stick; refused for a generation still on trial). dry_run: check and plan only (with now: also stage the Reload).",
-    schema: r#"{"type":"object","properties":{"n":{"description":"generation number, or \"off\"","oneOf":[{"type":"integer","minimum":1},{"type":"string","enum":["off"]}]},"now":{"type":"boolean","description":"Reload into it at once"},"dry_run":{"type":"boolean"},"timeout_ms":{"type":"integer","default":120000}},"required":["n"]}"#,
+    schema: r#"{"type":"object","properties":{"n":{"description":"generation number, or \"off\"","oneOf":[{"type":"integer","minimum":1},{"type":"string","enum":["off"]}]},"now":{"type":"boolean","description":"Reload into it at once"},"dry_run":{"type":"boolean"},"force":{"type":"boolean","description":"with now: reload even if the new kernel would lose the WLAN passphrase or the token"},"timeout_ms":{"type":"integer","default":120000}},"required":["n"]}"#,
     handler: system_pin,
 );
 

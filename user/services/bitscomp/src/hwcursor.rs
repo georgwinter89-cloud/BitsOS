@@ -204,7 +204,7 @@ impl App {
         if let Some(d) = self.cursor_deco {
             return Key::Named(d, px);
         }
-        if self.cursor_hidden {
+        if self.cursor_hidden || self.images.boot.shown() {
             return Key::Hidden;
         }
         if let Some(s) = self.cursor_surface.as_ref().filter(|s| s.is_alive()) {

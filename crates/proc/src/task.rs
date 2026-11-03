@@ -47,7 +47,8 @@ pub struct Thread {
     /// The V2 fault message (R3) of a fault signal not yet taken, with its signal: logged and kept as the
     /// end message when the fault's default action ends the group.
     fault_msg: SpinLock<Option<crate::deliver::FaultNote>>,
-    kt: SpinLock<Option<Arc<sched::Thread>>>,
+    /// Set once when the thread starts (lock-free: the syscall path reads it on every call).
+    kt: ksync::Once<Arc<sched::Thread>>,
     group: Arc<Group>,
     /// `set_tid_address` / CLONE_CHILD_CLEARTID: cleared and futex-woken when the thread ends.
     pub clear_child_tid: AtomicU64,
@@ -67,6 +68,9 @@ pub struct Thread {
     /// Completed by the creator once it copied its scheduling attributes to this thread (fork/clone); the
     /// thread waits for it before its first user instruction.
     attrs_ready: Completion,
+    /// FS-16: its own cwd/root/umask (Linux `task->fs`) once it left its image's: unshare(CLONE_FS), or a
+    /// CLONE_THREAD without CLONE_FS. None = the image's (`Process::image_fs`), shared by the group's threads.
+    own_fs: SpinLock<Option<Arc<vfs::FsState>>>,
 }
 
 impl Thread {
@@ -80,7 +84,7 @@ impl Thread {
             trap: SpinLock::named("proc.trap", [0; 3]),
             restart: SpinLock::named("proc.restart", None),
             fault_msg: SpinLock::named("proc.faultmsg", None),
-            kt: SpinLock::named("proc.kt", None),
+            kt: ksync::Once::new(),
             group: group.clone(),
             clear_child_tid: AtomicU64::new(0),
             robust_list: AtomicU64::new(0),
@@ -91,7 +95,22 @@ impl Thread {
             done: Completion::new(),
             pr: crate::prctl_state::TaskPrctl::new(),
             attrs_ready: Completion::new(),
+            own_fs: SpinLock::named("proc.ownfs", None),
         })
+    }
+    /// FS-16: the file-system state this thread's calls use (Linux `current->fs`): its own, else its image's.
+    /// `p` is the thread's image.
+    pub fn fs(&self, p: &Process) -> Arc<vfs::FsState> {
+        self.own_fs().unwrap_or_else(|| p.image_fs())
+    }
+    pub(crate) fn own_fs(&self) -> Option<Arc<vfs::FsState>> {
+        self.own_fs.lock().clone()
+    }
+    /// Puts `fs` in place as the thread's own state (None: back to the image's); the old one is dropped
+    /// outside the lock (a `Path` may take locks when it goes).
+    pub(crate) fn set_own_fs(&self, fs: Option<Arc<vfs::FsState>>) {
+        let old = core::mem::replace(&mut *self.own_fs.lock(), fs);
+        drop(old);
     }
     /// AB-5: the prctl state of this task (comm, pdeath signal, no_new_privs, timer slack, ...).
     pub fn prctl(&self) -> &crate::prctl_state::TaskPrctl {
@@ -99,6 +118,12 @@ impl Thread {
     }
     pub fn tid(&self) -> u32 {
         self.tid.load(Ordering::Acquire)
+    }
+    /// SX-2: the thread's id as its own pid namespace numbers it (`task_pid_vnr(current)`: gettid, the
+    /// CLONE_CHILD_SETTID word, robust-list owner ids).
+    pub fn vtid(&self) -> u32 {
+        let tid = self.tid();
+        self.group.pid_ns.nr(tid).unwrap_or(tid)
     }
     /// AB-6: the key of this thread's signal part (`signal::To::Thread`).
     pub fn sig_key(&self) -> u64 {
@@ -129,7 +154,8 @@ impl Thread {
     /// A signal to this thread from the kernel on behalf of itself (`send_sig(sig, current, 0)`: SI_USER
     /// with its own pid and uid; FS-3's SIGPIPE).
     pub fn send_signal(&self, sig: u32) -> crate::signal::Sent {
-        let info = crate::signal::SigInfo::user(sig, uapi::ab::siginfo::SI_USER, self.group.tgid, self.group.real_uid());
+        let (pid, uid) = self.group.ids_seen_by(&self.group);
+        let info = crate::signal::SigInfo::user(sig, uapi::ab::siginfo::SI_USER, pid, uid);
         self.group.send_info(info, crate::signal::To::Thread(self.sig_key), false).unwrap_or(crate::signal::Sent::Dropped)
     }
     pub(crate) fn set_trap(&self, trapno: u64, err: u64, cr2: u64) {
@@ -198,7 +224,11 @@ impl Thread {
         self.group.group_exited() || self.exit_requested()
     }
     pub fn cpu_ns(&self) -> u64 {
-        self.kt.lock().as_ref().map_or(0, |k| k.runtime_ns())
+        self.kt.get().map_or(0, |k| k.runtime_ns())
+    }
+    /// The scheduler's thread that runs this one (None before it started).
+    pub fn sched_thread(&self) -> Option<&Arc<sched::Thread>> {
+        self.kt.get()
     }
     /// `do_sigaltstack` on this thread's alternate stack (`sp`: the caller's user stack pointer).
     pub fn sigaltstack(&self, new: Option<AltStack>, sp: u64) -> Result<AltStack, vfs::Errno> {
@@ -222,8 +252,9 @@ impl Thread {
     }
     fn set_kthread(&self, id: u64, kt: Option<Arc<sched::Thread>>) {
         self.kthread.store(id, Ordering::Release);
+        // Both callers (the spawner and the thread itself) name the same scheduler thread; the first one stays.
         if let Some(k) = kt {
-            *self.kt.lock() = Some(k);
+            self.kt.get_or_init(|| k);
         }
     }
 }
@@ -268,26 +299,38 @@ fn tasks_insert(k: u64, t: &Arc<Thread>) {
     TASKS.lock().by_kthread.insert(k, t.clone());
 }
 
-/// The thread leaves both maps (its end).
+/// The thread leaves both maps (its end). SX-2: a thread that is not the leader gives its numbers in the pid
+/// namespaces back (`release_task` of a non-leader); the leader's are the process's, given back at the reap.
 pub(crate) fn unregister(t: &Thread) {
     let mut g = TASKS.lock();
-    if g.by_tid.get(&t.tid()).is_some_and(|x| core::ptr::eq(&**x, t)) {
+    let mine = g.by_tid.get(&t.tid()).is_some_and(|x| core::ptr::eq(&**x, t));
+    if mine {
         g.by_tid.remove(&t.tid());
     }
     let k = t.kthread();
     if g.by_kthread.get(&k).is_some_and(|x| core::ptr::eq(&**x, t)) {
         g.by_kthread.remove(&k);
     }
+    drop(g);
+    if mine && t.tid() != t.group.tgid {
+        t.group.pid_ns.free(t.tid());
+    }
 }
 
 /// execve by a non-leader: the thread takes the leader's id.
 pub(crate) fn retid(t: &Arc<Thread>, tid: u32) {
     let mut g = TASKS.lock();
-    if g.by_tid.get(&t.tid()).is_some_and(|x| Arc::ptr_eq(x, t)) {
-        g.by_tid.remove(&t.tid());
+    let old = t.tid();
+    if g.by_tid.get(&old).is_some_and(|x| Arc::ptr_eq(x, t)) {
+        g.by_tid.remove(&old);
     }
     t.set_tid(tid);
     g.by_tid.insert(tid, t.clone());
+    drop(g);
+    // SX-2: its own numbers go (`exchange_tids` hands it the leader's).
+    if old != tid {
+        t.group.pid_ns.free(old);
+    }
 }
 
 /// SC-5's thread exit protocol (Linux `mm_release`/`exit_robust_list`): walk the robust list at `robust_head`,
@@ -315,7 +358,7 @@ pub(crate) fn release_tid_words(t: &Thread, p: &Arc<Process>, others_see_it: boo
         return;
     }
     match EXIT_RELEASE.get() {
-        Some(f) => f(p, t.tid(), head, ctid, others_see_it),
+        Some(f) => f(p, t.vtid(), head, ctid, others_see_it),
         None => {
             if ctid != 0 && others_see_it {
                 // A fault is ignored, as Linux's `put_user` there.
@@ -326,16 +369,19 @@ pub(crate) fn release_tid_words(t: &Thread, p: &Arc<Process>, others_see_it: boo
 }
 
 /// Starts thread `t` of `p`'s group in user mode at `ctx`. `fpu`: the creator's vector registers (fork and
-/// clone copy them, Linux `fpu_clone`); `child_settid`: CLONE_CHILD_SETTID's address in the new memory.
+/// clone copy them, Linux `fpu_clone`); `segs`: its selectors and TLS slots (AB-10a, `copy_thread`; None for a
+/// new program); `child_settid`: CLONE_CHILD_SETTID's address in the new memory.
 /// `attrs_from`: the creator's kernel thread (fork and clone: its nice, policy and affinity go to the new thread
-/// before it runs user code, SC-6 `copy_attrs`; 0 for programs the kernel starts).
-pub(crate) fn start(p: &Arc<Process>, t: Arc<Thread>, ctx: UserContext, fpu: Option<RegDump>, child_settid: u64, attrs_from: u64) -> Result<(), SpawnError> {
-    p.group().add_thread(&t)?;
+/// before it runs user code, SC-6 `copy_attrs`; 0 for programs the kernel starts). `creator`: the cloning
+/// thread when `t` joins its group (CLONE_THREAD; SX-1 seccomp resync), else None.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start(p: &Arc<Process>, t: Arc<Thread>, ctx: UserContext, fpu: Option<RegDump>, segs: Option<hal::entry::segs::Snapshot>, child_settid: u64, attrs_from: u64, creator: Option<&Thread>) -> Result<(), SpawnError> {
+    p.group().add_thread(&t, creator)?;
     register(&t);
     let tc = t.clone();
     // SC-7a: the thread joins its process's group (the tgid), so an Interactive grant to the process (the
     // program in front, B4) reaches it from its first instruction.
-    match sched::spawn_in_group(&p.name, p.group().class, p.pid as u64, move || run(tc, ctx, fpu, child_settid, attrs_from != 0)) {
+    match sched::spawn_in_group(&p.name, p.group().class, p.pid as u64, move || run(tc, ctx, fpu, segs, child_settid, attrs_from != 0)) {
         Ok(h) => {
             // Only the thread itself enters `TASKS` (in `run`): a spawner inserting it could put back one that
             // already ended. Kicks need only the id.
@@ -360,7 +406,7 @@ pub(crate) fn start(p: &Arc<Process>, t: Arc<Thread>, ctx: UserContext, fpu: Opt
     }
 }
 
-fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, child_settid: u64, copied_attrs: bool) {
+fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, segs: Option<hal::entry::segs::Snapshot>, child_settid: u64, copied_attrs: bool) {
     let k = sched::current_id();
     if copied_attrs {
         // The creator completes it right after spawning this thread (bounded: it never waits for anything).
@@ -379,9 +425,11 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, child_settid:
     if let Some(d) = &fpu {
         hal::xsave::load_user_regs(d);
     }
+    // AB-10a: the creator's selectors and TLS slots, and the image's LDT, before the first instruction.
+    hal::entry::segs::install(segs.unwrap_or_default(), Some(p.ldt.clone()));
     if child_settid != 0 {
         // Linux `schedule_tail`: in the child's own memory, a fault ignored.
-        let _ = p.mm.copy_to_user(child_settid, &t.tid().to_le_bytes());
+        let _ = p.mm.copy_to_user(child_settid, &t.vtid().to_le_bytes());
     }
     // A thread that starts with something to do (a group stop it joined) does it before its first instruction
     // (Linux: `ret_from_fork` → `syscall_exit_to_user_mode`).
@@ -393,9 +441,22 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, child_settid:
         // (None) when the user-IRQ hook asks or none is installed: the loop condition sees an end, and AB-6's
         // delivery a signal.
         // SC-6: the time between the two marks is the program's user time, everything else system time.
-        sched::cputime::user_enter();
+        // INT-W19 (AB-15 CR 1): this thread's own scheduler thread, no Arc clone per mark.
+        match t.sched_thread() {
+            Some(k) => sched::cputime::user_enter_of(k),
+            None => sched::cputime::user_enter(),
+        }
+        #[cfg(bitsos_fd_measure)]
+        hal::entry::steps::mark(hal::entry::steps::ENTER);
         let r = ctx.execute_or_stop(true);
-        sched::cputime::user_exit();
+        #[cfg(bitsos_fd_measure)]
+        hal::entry::steps::mark(hal::entry::steps::EXEC);
+        match t.sched_thread() {
+            Some(k) => sched::cputime::user_exit_of(k),
+            None => sched::cputime::user_exit(),
+        }
+        #[cfg(bitsos_fd_measure)]
+        hal::entry::steps::mark(hal::entry::steps::EXIT);
         let Some(reason) = r else {
             sched::cond_resched();
             crate::deliver::exit_to_user(&t, &mut ctx, None);
@@ -408,12 +469,23 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, child_settid:
                     Some(h) => h(&p, &t, &mut ctx),
                     None => ctx.set_syscall_return(-uapi::errno::ENOSYS),
                 }
-                if t.new_image.swap(false, Ordering::AcqRel)
+                #[cfg(bitsos_fd_measure)]
+                hal::entry::steps::mark(hal::entry::steps::DISPATCH);
+                // Read first: an atomic swap on every syscall is a locked instruction for an exec that is rare.
+                if t.new_image.load(Ordering::Acquire)
+                    && t.new_image.swap(false, Ordering::AcqRel)
                     && let Some(n) = t.group.image()
                 {
                     p = n;
                 }
+                #[cfg(bitsos_fd_measure)]
+                hal::entry::steps::mark(hal::entry::steps::NEW_IMAGE);
             }
+            // AB-10a: `int 0x80`, the 32-bit TLS/LDT calls of Wine's WoW64 (everything else -ENOSYS).
+            ReturnReason::Trap { vector: hal::entry::INT80_VECTOR, .. } => match crate::int80_handler() {
+                Some(h) => h(&p, &t, &mut ctx),
+                None => ctx.set_syscall_return(-uapi::errno::ENOSYS),
+            },
             ReturnReason::Trap { vector: 14, error, cr2 } => {
                 // MM-5a: a page the program may use but never touched gets its frame here.
                 if let Err(why) = p.mm.handle_thread_fault(cr2, error, &mut spurious) {
@@ -428,6 +500,10 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, child_settid:
         }
         // SC-3: a program making syscalls gives way here.
         sched::cond_resched();
+        #[cfg(bitsos_fd_measure)]
+        hal::entry::steps::mark(hal::entry::steps::RESCHED);
+        #[cfg(bitsos_fd_measure)]
+        hal::entry::steps::mark(hal::entry::steps::EMPTY);
     }
     drop(p);
     crate::exit::thread_ends(&t);

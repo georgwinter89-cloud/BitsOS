@@ -87,6 +87,14 @@ pub fn ring_size(v: u8) -> (u8, usize) {
 /// per wait, spinning): runs at probe (a Reload may leave a running controller) and in Quiesce.
 /// Returns whether every engine was seen stopped (or the window reads all ones: the device is gone).
 pub fn stop_all<H: Hw + ?Sized>(hw: &H, descriptors: usize) -> bool {
+    let streams = stop_streams(hw, descriptors);
+    stop_cmd_io(hw) && streams
+}
+
+/// Every stream descriptor's DMA stopped (RUN and its interrupt off, status cleared), controller interrupts off,
+/// then waited for once (1 ms for all). The command rings keep running: Quiesce still talks to the codecs after
+/// it (Linux: the PCMs stop before the codec's shutdown verbs, the rings stop with the chip). -> all stopped.
+pub fn stop_streams<H: Hw + ?Sized>(hw: &H, descriptors: usize) -> bool {
     hw.wr32(INTCTL, 0);
     for i in 0..descriptors {
         let ctl = hw.rd8(sd(i) + SD_CTL);
@@ -95,16 +103,20 @@ pub fn stop_all<H: Hw + ?Sized>(hw: &H, descriptors: usize) -> bool {
         }
         hw.wr8(sd(i) + SD_STS, SD_STS_MASK);
     }
+    until(hw, 1000, 10, false, || (0..descriptors).all(|i| matches!(hw.rd8(sd(i) + SD_CTL), 0xFF) || hw.rd8(sd(i) + SD_CTL) & SD_CTL_RUN == 0))
+}
+
+/// CORB and RIRB DMA off and waited for (1 ms), their status and the controller's interrupt status cleared.
+pub fn stop_cmd_io<H: Hw + ?Sized>(hw: &H) -> bool {
     hw.wr8(RIRBCTL, 0);
     hw.wr8(CORBCTL, 0);
     let rings = until(hw, 1000, 10, false, || {
         let c = hw.rd8(CORBCTL) | hw.rd8(RIRBCTL);
         c == 0xFF || c & (CORBCTL_RUN | RIRBCTL_DMA) == 0
     });
-    let streams = until(hw, 1000, 10, false, || (0..descriptors).all(|i| matches!(hw.rd8(sd(i) + SD_CTL), 0xFF) || hw.rd8(sd(i) + SD_CTL) & SD_CTL_RUN == 0));
     hw.wr8(RIRBSTS, RIRBSTS_MASK);
     hw.wr32(INTSTS, INT_CTRL_EN | INT_ALL_STREAM);
-    rings && streams
+    rings
 }
 
 /// Link reset and codec detection -> the STATESTS mask of codecs that reported. `sleep`: waits may sleep.
@@ -204,10 +216,20 @@ impl<M: Mem> Link<M> {
 
     /// Sends `verb` to node `nid` of codec `cad` and returns the answer.
     pub fn cmd<H: Hw + ?Sized>(&mut self, hw: &H, cad: u8, nid: u8, verb: u32) -> Result<u32, CmdError> {
+        self.send(hw, cad, nid, verb, ANSWER_US, true)
+    }
+
+    /// `cmd` for Quiesce (interrupts off, maybe the panic path): waits at most `answer_us` and never allocates, so
+    /// unsolicited responses that come in between are dropped (counted as strays) instead of queued.
+    pub fn cmd_quiet<H: Hw + ?Sized>(&mut self, hw: &H, cad: u8, nid: u8, verb: u32, answer_us: u64) -> Result<u32, CmdError> {
+        self.send(hw, cad, nid, verb, answer_us, false)
+    }
+
+    fn send<H: Hw + ?Sized>(&mut self, hw: &H, cad: u8, nid: u8, verb: u32, answer_us: u64, keep: bool) -> Result<u32, CmdError> {
         let word = hdacodec::verb::command(cad, nid, verb).ok_or(CmdError::Bad)?;
         let r = match self.mode {
-            Mode::Rings => self.cmd_rings(hw, cad, word),
-            Mode::Immediate => self.cmd_immediate(hw, word),
+            Mode::Rings => self.cmd_rings(hw, cad, word, answer_us, keep),
+            Mode::Immediate => self.cmd_immediate(hw, word, answer_us),
         };
         if r == Err(CmdError::Timeout) {
             self.timeouts += 1;
@@ -215,12 +237,12 @@ impl<M: Mem> Link<M> {
         r
     }
 
-    fn cmd_rings<H: Hw + ?Sized>(&mut self, hw: &H, cad: u8, word: u32) -> Result<u32, CmdError> {
+    fn cmd_rings<H: Hw + ?Sized>(&mut self, hw: &H, cad: u8, word: u32, answer_us: u64, keep: bool) -> Result<u32, CmdError> {
         if self.rings.is_none() {
             return Err(CmdError::Bad);
         }
         // Collect what came before (unsolicited, late answers) so the next answer is ours.
-        self.drain(hw, None);
+        self.drain_into(hw, None, keep);
         let Some(mem) = self.rings.as_ref() else { return Err(CmdError::Bad) };
         let wp = (self.corb_wp + 1) % self.corb_n;
         if !mem.wr32(wp * 4, word) {
@@ -230,9 +252,9 @@ impl<M: Mem> Link<M> {
         self.corb_wp = wp;
         hw.wr16(CORBWP, wp as u16);
         let mut answer = None;
-        let ok = until(hw, ANSWER_US, 2, false, || {
+        let ok = until(hw, answer_us, 2, false, || {
             if answer.is_none() {
-                answer = self.drain(hw, Some(cad));
+                answer = self.drain_into(hw, Some(cad), keep);
             }
             answer.is_some()
         });
@@ -246,6 +268,11 @@ impl<M: Mem> Link<M> {
     /// Reads new RIRB entries: unsolicited ones go to `unsol`; the first solicited one from `want` is
     /// returned (others are strays). Also clears the RIRB status (QEMU passes no further answer before).
     pub fn drain<H: Hw + ?Sized>(&mut self, hw: &H, want: Option<u8>) -> Option<u32> {
+        self.drain_into(hw, want, true)
+    }
+
+    /// `drain`; `keep` false drops unsolicited responses (no allocation) and counts them as strays.
+    fn drain_into<H: Hw + ?Sized>(&mut self, hw: &H, want: Option<u8>, keep: bool) -> Option<u32> {
         let Some(mem) = self.rings.as_ref() else { return None };
         let wp = hw.rd16(RIRBWP);
         if wp == 0xFFFF {
@@ -258,9 +285,9 @@ impl<M: Mem> Link<M> {
             let off = RIRB_OFF + self.rirb_rp * 8;
             let (Some(res), Some(ex)) = (mem.rd32(off), mem.rd32(off + 4)) else { break };
             let from = (ex & 0xF) as u8;
-            if ex & RIRB_EX_UNSOL != 0 {
+            if ex & RIRB_EX_UNSOL != 0 && keep {
                 self.unsol.push(Unsol { cad: from, res });
-            } else if got.is_none() && want == Some(from) {
+            } else if ex & RIRB_EX_UNSOL == 0 && got.is_none() && want == Some(from) {
                 got = Some(res);
             } else {
                 self.strays += 1;
@@ -270,14 +297,14 @@ impl<M: Mem> Link<M> {
         got
     }
 
-    fn cmd_immediate<H: Hw + ?Sized>(&mut self, hw: &H, word: u32) -> Result<u32, CmdError> {
+    fn cmd_immediate<H: Hw + ?Sized>(&mut self, hw: &H, word: u32, answer_us: u64) -> Result<u32, CmdError> {
         if !until(hw, 1000, 2, false, || hw.rd16(ICS) & ICS_BUSY == 0) {
             return Err(if hw.rd16(ICS) == 0xFFFF { CmdError::Gone } else { CmdError::Timeout });
         }
         hw.wr16(ICS, hw.rd16(ICS) | ICS_VALID);
         hw.wr32(IC, word);
         hw.wr16(ICS, (hw.rd16(ICS) & !ICS_VALID) | ICS_BUSY);
-        if !until(hw, ANSWER_US, 2, false, || hw.rd16(ICS) & ICS_VALID != 0) {
+        if !until(hw, answer_us, 2, false, || hw.rd16(ICS) & ICS_VALID != 0) {
             return Err(CmdError::Timeout);
         }
         Ok(hw.rd32(IR))

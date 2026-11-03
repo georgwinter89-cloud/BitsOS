@@ -27,6 +27,7 @@ use uefi::Status;
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::mem::memory_map::{MemoryDescriptor, MemoryMap, MemoryMapMeta, MemoryMapMut, MemoryMapRefMut};
 use uefi::table::cfg::ConfigTableEntry;
+use zeroize::Zeroize;
 
 /// Crash records sit at the same place on every boot when this page is free (V2 crash page, `spec/core.md` 10.3).
 const CRASH_PAGE_WANTED: u64 = 0x1F00_0000;
@@ -123,7 +124,7 @@ struct Jump {
     fb_stride: u64,
 }
 
-pub fn hand_over(l: Loaded) -> R<Infallible> {
+pub fn hand_over(mut l: Loaded) -> R<Infallible> {
     let stack = mem::alloc(memtype::BITS_KERNEL, AllocateType::AnyPages, STACK_SIZE / PAGE, "the kernel stack")?;
     // Not zeroed: a crash record from the previous boot must survive.
     let crash = keep_page(AllocateType::Address(CRASH_PAGE_WANTED), "the crash page")
@@ -210,6 +211,8 @@ pub fn hand_over(l: Loaded) -> R<Infallible> {
         wr(w.module(&Module { kind: m.kind, phys: m.phys, size: m.size, name: &m.name }))?;
     }
     wr(w.config(&l.config))?;
+    // RB-18: the BootInfo's copy is the one the kernel blanks; this one would stay in free RAM.
+    l.config.zeroize();
     let s = &l.stick;
     let mut block0 = [0u8; 96];
     let n = s.block0.len().min(96);

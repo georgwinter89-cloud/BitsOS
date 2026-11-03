@@ -22,6 +22,9 @@ impl App {
     /// The spot under (x, y) besides the suggestions (`hit` asks those first, then floating windows): the chrome,
     /// then the start page.
     pub fn spot_at(&self, x: f64, y: f64) -> Option<Spot> {
+        if let Some(p) = self.buehne_spot(x, y) {
+            return Some(Spot::Buehne(p));
+        }
         let ch = self.chrome();
         if let Some(p) = ch.hit(x, y) {
             return Some(Spot::Chrome(p));
@@ -70,8 +73,15 @@ impl App {
             // No tab has a history yet (the address layer comes later): the buttons are shown as not available.
             Spot::Chrome(Part::Back | Part::Forward) => {}
             Spot::Chrome(Part::Fav(i)) => {
-                if let Some(a) = self.desk.favourites.get(i).cloned() {
+                if let Some(a) = self.desk.favourites.get(i).cloned()
+                    && !self.restore_program(&a)
+                {
                     self.open_address(&a, Where::Tab, None);
+                }
+            }
+            Spot::Chrome(Part::Min(i)) => {
+                if let Some(w) = self.ws.minimized.get(i).map(|m| m.win.clone()) {
+                    self.unminimize(&w, "window list");
                 }
             }
             Spot::Chrome(Part::Ws(i)) => self.act(Action::Workspace(i)),
@@ -90,6 +100,7 @@ impl App {
                 }
             }
             Spot::Start(p) => self.start_act(p),
+            Spot::Buehne(p) => self.buehne_act(p),
             Spot::Page(pid, part) => self.page_act(pid, part),
         }
     }
@@ -99,13 +110,18 @@ impl App {
         match p {
             S::Restore => self.session_restore(),
             S::New => self.session_new(),
+            // WY-12: a launcher tile brings back its program's minimised window before it starts another one.
             S::Fav(i) => {
-                if let Some(a) = self.desk.favourites.get(i).cloned() {
+                if let Some(a) = self.desk.favourites.get(i).cloned()
+                    && !self.restore_program(&a)
+                {
                     self.open_address(&a, Where::Tile, None);
                 }
             }
             S::Recent(i) => {
-                if let Some(r) = self.session.recent.get(i).map(|r| r.addr.clone()) {
+                if let Some(r) = self.session.recent.get(i).map(|r| r.addr.clone())
+                    && !self.restore_program(&r)
+                {
                     self.open_address(&r, Where::Tile, None);
                 }
             }

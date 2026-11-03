@@ -1,5 +1,5 @@
 //! The driver side of mac80211 for one managed station on the RTL8852B (JS js/sta.mjs and its
-//! sta-*.mjs, WZ = /home/georg/BitsOS/werkzeuge/plattform/wlan): rtw89 mac80211.c's ops and the
+//! sta-*.mjs, WZ = $WLAN_TOOLS, default $HOME/BitsOS/werkzeuge/plattform/wlan): rtw89 mac80211.c's ops and the
 //! core.c rtw89_core_* functions they call, the CAM, the station H2Cs, rate adaptation, the
 //! software scan, the join and the link's RX path, the 2-second track work. The 802.11 logic
 //! that does not depend on the chip (the join's state machine, the WPA2 handshakes, the RSN

@@ -1,0 +1,108 @@
+amdgpu render node: found
+INFO DEV_INFO = 0
+  bottom page aligned and below 4 GiB: yes
+  high half from the hole's end: yes
+objects: yes
+-- checks
+MAP below the bottom = -EINVAL
+MAP at 0 = -EINVAL
+MAP in the hole = -EINVAL
+MAP last hole page = -EINVAL
+MAP at the high top = -EINVAL
+MAP across the high top = -EINVAL
+MAP overflowing size = -EINVAL
+MAP bad range, unknown handle = -EINVAL
+MAP unknown flag 1<<20 = -EINVAL
+MAP PRT|READ = -EINVAL
+op 0 = -EINVAL
+op 5 = -EINVAL
+MAP unknown handle = -ENOENT
+UNMAP unknown handle = -ENOENT
+MAP unaligned va = -EINVAL
+MAP unaligned offset = -EINVAL
+MAP unaligned size = -EINVAL
+MAP size 0 = -EINVAL
+MAP past the object = -EINVAL
+MAP huge offset = -EINVAL
+MAP PRT huge offset = -EINVAL
+GEM_VA without memory = -EFAULT
+GEM_VA 40-byte without memory = -EFAULT
+VM without memory = -EFAULT
+-- map and unmap
+MAP at the bottom = 0
+UNMAP at the bottom = 0
+MAP at 64 KiB = 0
+UNMAP at 64 KiB = 0
+MAP just below 2 MiB = 0
+UNMAP just below 2 MiB = 0
+MAP last page below the high top = 0
+UNMAP it = 0
+MAP 8 pages = 0
+MAP overlapping the end = -EINVAL
+MAP overlapping the start = -EINVAL
+MAP part of the object elsewhere = 0
+MAP in the high half = 0
+UNMAP high half = 0
+UNMAP not at a start = -ENOENT
+UNMAP by another object = -ENOENT
+second fd: UNMAP = -ENOENT
+-- clear and replace
+CLEAR pages 2-3 = 0
+UNMAP the cleared part = -ENOENT
+MAP into the hole it left = 0
+UNMAP that = 0
+UNMAP the piece after = 0
+UNMAP the piece before = 0
+UNMAP it again = -ENOENT
+CLEAR over nothing = 0
+MAP 4 pages again = 0
+REPLACE the middle = 0
+UNMAP the replaced start by a = -ENOENT
+UNMAP it by b = 0
+UNMAP a's last piece = 0
+UNMAP a's first piece = 0
+REPLACE past the object = -EINVAL
+REPLACE over nothing = 0
+UNMAP it = 0
+CLEAR unaligned = -EINVAL
+CLEAR size 0 = -EINVAL
+-- PRT and delay
+MAP PRT 1 GiB = 0
+MAP PRT|DELAY = 0
+REPLACE a page of it = 0
+UNMAP PRT by an object = -ENOENT
+UNMAP PRT = 0
+UNMAP PRT after the page = 0
+UNMAP the page = 0
+UNMAP PRT|DELAY = 0
+MAP DELAY_UPDATE = 0
+UNMAP DELAY_UPDATE = 0
+-- forms
+MAP 40-byte form = 0
+UNMAP with an unknown out-syncobj = -ENOENT
+SYNCOBJ_CREATE = 0
+UNMAP with an out-syncobj = 0
+MAP 48-byte caller = 0
+UNMAP 56-byte caller, unknown out-syncobj = -ENOENT
+UNMAP 56-byte caller = 0
+-- close
+MAP b = 0
+GEM_CLOSE b = 0
+UNMAP by the closed handle = -ENOENT
+MAP a new object where b was = 0
+second fd: same address = 0
+-- VM
+VM flags 1 = -EINVAL
+VM op 0 = -EINVAL
+VM op 3 = -EINVAL
+UNRESERVE without reserve = 0
+RESERVE_VMID = 0
+RESERVE_VMID again = 0
+second fd: RESERVE_VMID = -ENOENT
+UNRESERVE_VMID = 0
+UNRESERVE_VMID again = 0
+second fd: RESERVE_VMID now = 0
+first fd: UNRESERVE without holding it = 0
+first fd: RESERVE_VMID = -ENOENT
+first fd: after the holder closed = 0
+UNRESERVE_VMID = 0

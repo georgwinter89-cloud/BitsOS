@@ -31,6 +31,9 @@ scenario script found here. Scripts are how a lane proves a QEMU-level behaviour
 - Use `cargo xtask image` / `cargo xtask qemu --name <unique>` (names must be unique per script, e.g. the script
   name) so parallel scripts do not share an image. QEMU is always started through `xtask qemu`, which refuses host
   disks, passthrough and ports outside the lane's range; never call `qemu-system-x86_64` directly from a script.
+- A script that boots a program tree (Brave, LibreOffice, Cobalt, ...) carries `# minipc: <where its checks run now>`
+  in its first five lines and no run starts it (Georg 30.10., CONTRACTS section 4); `host/tests/minipc/` holds the desk's
+  scripts against the real Mini-PC and is no lane folder.
 - Scripts never touch the stick, a block device, the Mini-PC or another lane's folder.
 
 ## Minimal example

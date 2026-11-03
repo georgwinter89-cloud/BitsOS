@@ -4,7 +4,7 @@
 //! is resolved here: a connection shows the name only if its own program asked for it.
 //!
 //! A name is remembered per program (its ProgramId; BitsOS's own programs, which all share ProgramId 0, per
-//! process) and address. How many are kept is a setting (`set_dns_keep`), the oldest goes first.
+//! process) and address. How many are kept is fixed (`dns_keep`, 4096; PM-3 may make it a setting), the oldest goes first.
 //! The answer is parsed by RFC 1035 §4.1: header, the first question's name (the name the program asked for),
 //! A/AAAA records of that name or of a CNAME chain from it. Hostile input has bounds that real answers never
 //! reach (they are guards against loops and floods, not counts of things): compression pointers are followed at
@@ -17,7 +17,6 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use ksync::SpinLock;
 
 /// Pointers followed for one name (RFC 1035 names are at most 255 bytes, so a real one needs far fewer).
@@ -198,14 +197,10 @@ impl Names {
 }
 
 static NAMES: SpinLock<Names> = SpinLock::named("policy.dns", Names::new());
-static KEEP: AtomicUsize = AtomicUsize::new(4096);
-
-pub fn set_dns_keep(n: usize) {
-    KEEP.store(n.max(1), Ordering::Relaxed);
-}
+const KEEP: usize = 4096;
 
 pub fn dns_keep() -> usize {
-    KEEP.load(Ordering::Relaxed)
+    KEEP
 }
 
 /// Names remembered now (all programs).

@@ -129,11 +129,6 @@ pub fn outputs(codec: &Codec) -> Vec<Output> {
     out
 }
 
-/// The path from `pin` to a fitting converter within `depth` widgets, if any.
-pub fn find_path(group: &FunctionGroup, pin: Nid, ati: bool, depth: u8) -> Option<Vec<Hop>> {
-    Search::new(group, ati, depth).run(pin)
-}
-
 /// A converter V1 would play on: stereo, 48 kHz 16 bit. AMD's HDMI converters report less than
 /// they take, so any converter fits there (V1 `dac_fits`, Linux `patch_hdmi.c`).
 fn converter_fits(w: &Widget, ati: bool) -> bool {

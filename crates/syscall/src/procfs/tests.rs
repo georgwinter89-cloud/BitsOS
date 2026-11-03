@@ -3,7 +3,6 @@
 use super::fd::fdinfo_head;
 use super::maps::{image_lines, line, share_of};
 use mm::PageUsage;
-use super::mounts::{Row, format_rows};
 use super::stat::{bitmap_hex, bitmap_list, sigset};
 use super::text::{badness_points, format_limits, parse_int};
 use alloc::string::String;
@@ -146,29 +145,7 @@ fn image_vma_usage_split_degenerate() {
     assert_eq!((parts[0], parts[1]), (PageUsage::default(), odd));
 }
 
-#[test]
-fn mount_lines() {
-    let pseudo = vfs::MNT_NOSUID | vfs::MNT_NODEV | vfs::MNT_NOEXEC | vfs::MNT_RELATIME;
-    let rows = [
-        Row { id: 1, parent: 1, dev: 0x10, point: b"/".to_vec(), fstype: "tmpfs".into(), source: "tmpfs".into(), readonly: false, flags: vfs::MNT_RELATIME, options: ",mode=755,inode64".into() },
-        Row { id: 5, parent: 1, dev: 0x803, point: b"/mnt/a b#".to_vec(), fstype: "vfat".into(), source: "/dev/x#1".into(), readonly: true, flags: vfs::MNT_RELATIME, options: ",fmask=0022".into() },
-        Row { id: 6, parent: 1, dev: 0x11, point: b"/proc".to_vec(), fstype: "proc".into(), source: "proc".into(), readonly: false, flags: pseudo, options: String::new() },
-        Row { id: 7, parent: 1, dev: 0x12, point: b"/dev".to_vec(), fstype: "devtmpfs".into(), source: "devtmpfs".into(), readonly: false, flags: vfs::MNT_NOSUID, options: ",mode=755,inode64".into() },
-    ];
-    assert_eq!(
-        format_rows(&rows, false),
-        "tmpfs / tmpfs rw,relatime,mode=755,inode64 0 0\n/dev/x\\0431 /mnt/a\\040b# vfat ro,relatime,fmask=0022 0 0\n\
-         proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\ndevtmpfs /dev devtmpfs rw,nosuid,mode=755,inode64 0 0\n"
-    );
-    assert_eq!(
-        format_rows(&rows, true),
-        "1 1 0:16 / / rw,relatime - tmpfs tmpfs rw,mode=755,inode64\n5 1 8:3 / /mnt/a\\040b# ro,relatime - vfat /dev/x\\0431 ro,fmask=0022\n\
-         6 1 0:17 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n7 1 0:18 / /dev rw,nosuid - devtmpfs devtmpfs rw,mode=755,inode64\n"
-    );
-    // show_mnt_opts' last entry (linux-6.6/fs/proc_namespace.c:73).
-    let r = [Row { id: 2, parent: 1, dev: 0x13, point: b"/s".to_vec(), fstype: "tmpfs".into(), source: "tmpfs".into(), readonly: false, flags: vfs::MNT_RELATIME | vfs::MNT_NOSYMFOLLOW, options: String::new() }];
-    assert_eq!(format_rows(&r, false), "tmpfs /s tmpfs rw,relatime,nosymfollow 0 0\n");
-}
+// INT-W26: the mount line formats moved to vfs::mountinfo with SX-3a's glue (CR1); tested there.
 
 #[test]
 fn fdinfo_head_lines() {
@@ -393,6 +370,9 @@ fn sysctl_and_net_writes_as_linux() {
         carrier_down: 0,
         stats: Default::default(),
         addrs: vec![],
+        addrs6: vec![],
+        txqlen: 1000,
+        admin_flags: net::ifview::IFF_UP,
     };
     assert_eq!(store_result("mtu", &card, 1500), Ok(()));
     assert_eq!(store_result("mtu", &card, 9000), Err(EOPNOTSUPP));
@@ -413,4 +393,20 @@ fn sysctl_and_net_writes_as_linux() {
     let root = vfs::Cred { uid: 0, gid: 0 };
     assert_eq!(uevent_store(root, b"change\n"), Ok(7));
     assert_eq!(uevent_store(root, b"explode"), Err(EINVAL));
+}
+
+/// FS-16: which /proc files keep pwrite (Linux FMODE_PWRITE): `mem_open`/`__mem_open` files (mem, environ, auxv),
+/// cmdline and oom_score_adj (no seq_file) keep it; the seq_file ones (`single_open`, `seq_open`) lose it.
+#[test]
+fn positional_write_like_fmode_pwrite() {
+    use super::{PidFile, Target, What};
+    use vfs::synth::FileSource;
+    let t = || Target { g: alloc::sync::Weak::new(), tgid: 1, tid: 1, whole: true, ns: proc::ns::pid::init_pid_ns().clone() };
+    assert!(super::mem::Mem(t()).positional_write(true), "/proc/<pid>/mem keeps pwrite (mem_rw)");
+    for w in [What::Cmdline, What::Environ, What::Auxv, What::OomScoreAdj] {
+        assert!(PidFile { t: t(), what: w }.positional_write(true));
+    }
+    for w in [What::Comm, What::Maps, What::Status, What::Stat, What::Mounts, What::Smaps, What::Cgroup] {
+        assert!(!PidFile { t: t(), what: w }.positional_write(true));
+    }
 }

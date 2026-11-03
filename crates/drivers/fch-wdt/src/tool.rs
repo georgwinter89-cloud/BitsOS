@@ -30,6 +30,25 @@ pub fn lines(backtrace: bool) -> Vec<String> {
     if let Some(b) = system::boot_status() {
         out.push(format!("boot control={:#x} count={} fired={} was_running={}", b.ctl, b.count, b.fired, b.was_running));
     }
+    // RB-14: why this start happened, so the desk reads a sync flood without searching the log.
+    if let Some(v) = system::reset_status() {
+        out.push(format!("last reset value={v:#x} reasons={} sync_flood={}", crate::regs::s5_reset_reasons(v), crate::regs::is_sync_flood(v)));
+    }
+    // RB-16: how far the previous shutdown got (the count register's breadcrumb), and this boot's last crumb.
+    if let Some(p) = system::previous_crumb() {
+        out.push(format!("previous shutdown: {}", p.text()));
+    }
+    out.push(format!(
+        "crumbs: keep store {} this boot's last {}",
+        match system::crumb_base() {
+            0 => String::from("off (no armed watchdog, or no room for the range);"),
+            b => format!("count register, range {b}..{};", crate::crumb::end(b) - 1),
+        },
+        match klog::crumb::last() {
+            Some((seq, stage, what)) => format!("crumb {seq} {} {what}", stage.as_str()),
+            None => String::from("none"),
+        }
+    ));
     if let Some(d) = system::system() {
         let now = d.now();
         let r = d.regs();

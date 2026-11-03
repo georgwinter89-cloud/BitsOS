@@ -1,12 +1,15 @@
-//! Drawing the start page of `start` (Start.dc.html, WY-5) into one image of the work area.
+//! Drawing the start page of `start` (Start.dc.html, WY-5) into one image of the work area. DS-2: no ground of
+//! its own (the wallpaper shows through), the cards are glass with the design's shadows, the lit card glows softly,
+//! and the two big cards carry the HUD brackets.
 
 use crate::canvas::Canvas;
 use crate::chrome_draw::{Px, font};
+use crate::deco::hud::{self, Glass};
 use crate::layout::Rect;
 use crate::start::{Page, Part};
 use crate::status::Block;
 use crate::text::Weight;
-use crate::theme::Theme;
+use crate::theme::{Theme, alpha};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StartLook {
@@ -47,17 +50,33 @@ pub fn draw(l: &StartLook, t: &Theme) -> Canvas {
     let p = Px::new(l.work, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.clear(t.bg);
     let pg = &l.page;
+    // The shadows first, so none falls on a card drawn before it: lifted under the two big cards, raised under
+    // the smaller ones (CSS paints each only outside its own box).
+    for r in [pg.restore, pg.new] {
+        hud::shadow(&mut c, p.b(r), p.v(16.0), &t.shadow_lifted, t);
+    }
+    let recent_frame = (!pg.recents.is_empty()).then(|| {
+        let first = pg.recents[0];
+        let last = pg.recents[pg.recents.len().min(l.recent.len()).max(1) - 1];
+        Rect { x: first.x, y: first.y, w: first.w, h: last.y + last.h - first.y }
+    });
+    let blocks_shown = !pg.blocks.is_empty() && !l.blocks.is_empty();
+    let small_cards = pg.favs.iter().take(l.favs.len()).chain(recent_frame.iter());
+    for r in small_cards.chain(pg.blocks.iter().take(if blocks_shown { l.blocks.len() } else { 0 })) {
+        hud::shadow(&mut c, p.b(*r), p.v(12.0), &t.shadow_raised, t);
+    }
+    let fill = |hover: bool| if hover { alpha(t.panel2, 0.85) } else { hud::glass(t, Glass::Card) };
     let label = font(t, 13.0, Weight::SemiBold).spaced(0.14);
     c.text_fit(&label, p.r(pg.date), &l.date, t.accent);
     c.text_fit(&font(t, 40.0, Weight::Light), p.r(pg.greet), &l.greet, t.text);
     let card = |c: &mut Canvas, r: Rect, lit: bool, hover: bool| {
         let b = p.b(r);
         if lit {
+            hud::glow_soft(c, b, p.v(16.0), t);
             c.glow(b, p.v(16.0), if t.effects_gpu { 6 } else { 2 }, t.glow);
         }
-        c.rrect(b, p.v(16.0), if hover { t.panel2 } else { t.panel });
+        c.rrect(b, p.v(16.0), fill(hover));
         c.rrect_line(b, p.v(16.0), p.line(), if lit { t.accent } else { t.line });
     };
     let (title, sub) = (font(t, 22.0, Weight::SemiBold), font(t, 14.0, Weight::Regular));
@@ -86,13 +105,18 @@ pub fn draw(l: &StartLook, t: &Theme) -> Canvas {
     c.line((ix + 27.0 * k, iy + 17.0 * k), (ix + 27.0 * k, iy + 37.0 * k), 2.5 * k, t.text);
     c.line((ix + 17.0 * k, iy + 27.0 * k), (ix + 37.0 * k, iy + 27.0 * k), 2.5 * k, t.text);
     text_of(&mut c, pg.new, "Neue Sitzung", "Ein leerer Arbeitsraum mit einem Terminal", false);
+    // The HUD brackets around the pair: the start page's stage.
+    let (a, b) = (p.b(pg.restore), p.b(pg.new));
+    let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+    let stage = crate::canvas::Box2 { x: x0, y: y0, w: (a.x + a.w).max(b.x + b.w) - x0, h: (a.y + a.h).max(b.y + b.h) - y0 };
+    hud::brackets(&mut c, stage, t);
 
     let head = font(t, 13.0, Weight::SemiBold).spaced(0.14);
     c.text_fit(&head, p.r(pg.fav_head), "FAVORITEN", t.muted);
     let (mark, name, small) = (font(t, 15.0, Weight::SemiBold), font(t, 15.0, Weight::Medium), font(t, 12.0, Weight::Regular));
     for (i, (r, (n, a))) in pg.favs.iter().zip(&l.favs).enumerate() {
         let b = p.b(*r);
-        c.rrect(b, p.v(12.0), if l.hover == Some(Part::Fav(i)) { t.panel2 } else { t.panel });
+        c.rrect(b, p.v(12.0), fill(l.hover == Some(Part::Fav(i))));
         c.rrect_line(b, p.v(12.0), p.line(), if l.hover == Some(Part::Fav(i)) { t.accent } else { t.line });
         let m = Rect { x: r.x + 16, y: r.y + 16, w: 32, h: 32 };
         c.rrect(p.b(m), p.v(8.0), t.chip);
@@ -103,12 +127,10 @@ pub fn draw(l: &StartLook, t: &Theme) -> Canvas {
         c.text_fit(&small, p.r(Rect { y: r.y + 80, h: 16, ..inner }), a, t.muted);
     }
     c.text_fit(&head, p.r(pg.recent_head), "ZULETZT BENUTZT", t.muted);
-    if !pg.recents.is_empty() {
+    if let Some(frame) = recent_frame {
         let first = pg.recents[0];
-        let last = pg.recents[pg.recents.len().min(l.recent.len()).max(1) - 1];
-        let frame = Rect { x: first.x, y: first.y, w: first.w, h: last.y + last.h - first.y };
         let fb = p.b(frame);
-        c.rrect(fb, p.v(12.0), t.panel);
+        c.rrect(fb, p.v(12.0), fill(false));
         let kind = font(t, 11.0, Weight::SemiBold).spaced(0.08);
         for (i, (r, (k, n, when))) in pg.recents.iter().zip(&l.recent).enumerate() {
             let rr = p.r(*r);
@@ -130,12 +152,12 @@ pub fn draw(l: &StartLook, t: &Theme) -> Canvas {
         }
         c.rrect_line(fb, p.v(12.0), p.line(), t.line);
     }
-    if !pg.blocks.is_empty() && !l.blocks.is_empty() {
+    if blocks_shown {
         c.text_fit(&head, p.r(pg.blocks_head), "BAUSTEINE", t.muted);
         let big = font(t, 26.0, Weight::SemiBold);
         for (r, (ti, v, sm)) in pg.blocks.iter().zip(&l.blocks) {
             let b = p.b(*r);
-            c.rrect(b, p.v(12.0), t.panel);
+            c.rrect(b, p.v(12.0), fill(false));
             c.rrect_line(b, p.v(12.0), p.line(), t.line);
             let inner = Rect { x: r.x + 14, w: r.w - 28, ..*r };
             c.text_fit(&small, p.r(Rect { y: r.y + 14, h: 16, ..inner }), ti, t.muted);

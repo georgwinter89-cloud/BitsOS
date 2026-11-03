@@ -1,0 +1,16 @@
+mode iret
+iretq own selectors: returned
+iretq ss null: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq ss rpl 0: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq ss code selector: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq ss ldt selector: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq ss beyond the gdt: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq cs data selector: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq cs rpl 0: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq cs null: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq cs ldt selector: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq rip non-canonical: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+iretq rip kernel half: fault signal yes on-alt-stack yes
+iretq rflags iopl 3: iopl after it 0
+iretq rflags iopl 3: returned
+done

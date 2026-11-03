@@ -9,6 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use uapi::errno::*;
 use vfs::{Ctx, Path};
+use zeroize::Zeroize;
 
 /// One read buffer of `stat`'s hash (a bound on memory, not a count).
 const HASH_CHUNK: usize = 64 * 1024;
@@ -19,6 +20,10 @@ pub(crate) const HASH_MAX_DEFAULT: u64 = 256 * 1024 * 1024;
 fn lookup(path: &str, follow: bool) -> Result<(alloc::sync::Arc<vfs::MountNs>, Path), ToolError> {
     let ns = vfs::root_ns();
     let p = Ctx::kernel(&ns).lookup(None, path.as_bytes(), follow).map_err(|e| fail(path, e))?;
+    // MC-10: by the place it resolves to (a link or `..` does not get around it).
+    if let Some(why) = super::access_store_refusal(&canonical(&ns, &p)) {
+        return Err(super::refuse("files", path, why));
+    }
     Ok((ns, p))
 }
 
@@ -28,7 +33,11 @@ fn config_view(canon: &str, p: &Path) -> Option<Result<Vec<u8>, i64>> {
     if !canon.eq_ignore_ascii_case("/boot/BITSOS2/CONFIG.TXT") {
         return None;
     }
-    Some(read_range(p, 0, fs_fat::protect::CONFIG_MAX).map(|d| fs_fat::protect::redact_config(&d)))
+    Some(vfs::read_secret(p, fs_fat::protect::CONFIG_MAX as usize).map(|mut d| {
+        let shown = fs_fat::protect::redact_config(&d);
+        d.zeroize();
+        shown
+    }))
 }
 
 /// Reads up to `want` bytes at `offset` of a file node (stops early at its end).

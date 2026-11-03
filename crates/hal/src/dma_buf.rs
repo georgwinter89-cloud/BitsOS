@@ -8,11 +8,11 @@
 //! (`cpu_addr`) is the region's own mapping, never derived from the device address, so UC/WC buffers and a
 //! later IOMMU keep the accessors right.
 //!
-//! Known gap until CP switches (change request in plan/notes/mm-MM-4.md): the free functions `read`/`write`
-//! taking a raw `(phys, len)` are the G0 helpers `acpi` still uses for firmware tables and its own test
-//! frames. They are safe functions over memory the caller merely names, so the guarantee above does not hold
-//! for them; they are deprecated (new callers get a warning) and bounded to the direct map (never the vmap,
-//! MMIO or image windows). `write` goes when CP switches; the table reader becomes a bounded read-only helper.
+//! Raw physical reads (change request in plan/notes/mm-MM-4.md, done INT-W28 post-integration): `read_ram` is
+//! the bounded read-only helper for RAM the caller has checked against the memory map (acpi's firmware tables,
+//! MCP `read_phys`); it never writes and is bounded to the direct map (never the vmap, MMIO or image windows).
+//! There is no raw physical write: code that writes memory owns it through a `DmaRegion` (C1 removed the G0
+//! `write(phys, len, ..)` helper).
 
 use crate::paging::CacheType;
 
@@ -160,30 +160,18 @@ fn in_direct_map(phys: u64, len: usize) -> bool {
     phys.checked_add(len as u64).is_some_and(|e| e <= crate::VMAP_BASE - crate::DIRECT_MAP_BASE)
 }
 
-/// G0 helper (acpi only, see the module doc): reads RAM at a raw physical address through the direct map.
-#[deprecated(note = "raw physical access; use DmaRegion (change request in plan/notes/mm-MM-4.md)")]
-pub fn read(phys: u64, len: usize, off: usize, out: &mut [u8]) -> bool {
-    if off.checked_add(out.len()).is_none_or(|e| e > len) || !in_direct_map(phys, len) {
+/// Reads `out.len()` bytes of RAM at a raw physical address through the direct map (volatile, byte by byte:
+/// firmware or a device may change it). False when the range reaches past the direct map. The caller checks the
+/// range is RAM in the memory map (a hole in the direct map is not mapped); see the module doc.
+pub fn read_ram(phys: u64, out: &mut [u8]) -> bool {
+    if !in_direct_map(phys, out.len()) {
         return false;
     }
-    let src = (crate::phys_to_virt(phys) as usize + off) as *const u8;
+    let src = crate::phys_to_virt(phys) as usize as *const u8;
     for (i, b) in out.iter_mut().enumerate() {
-        // SAFETY: trust by convention (G0): the caller names direct-mapped RAM it may read (checked bounds).
+        // SAFETY: the range lies inside the direct map (checked above) and the caller checked it is RAM, which
+        // the direct map maps present and readable; a volatile byte read of RAM has no side effect.
         *b = unsafe { src.add(i).read_volatile() };
-    }
-    true
-}
-
-/// G0 helper (acpi's test frames only, see the module doc): writes RAM at a raw physical address.
-#[deprecated(note = "raw physical access; use DmaRegion (change request in plan/notes/mm-MM-4.md)")]
-pub fn write(phys: u64, len: usize, off: usize, data: &[u8]) -> bool {
-    if off.checked_add(data.len()).is_none_or(|e| e > len) || !in_direct_map(phys, len) {
-        return false;
-    }
-    let dst = (crate::phys_to_virt(phys) as usize + off) as *mut u8;
-    for (i, b) in data.iter().enumerate() {
-        // SAFETY: trust by convention (G0): the caller names frames it owns (checked bounds).
-        unsafe { dst.add(i).write_volatile(*b) };
     }
     true
 }
@@ -218,14 +206,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn raw_helpers_stay_inside_the_direct_map() {
+    fn raw_read_stays_inside_the_direct_map() {
         let span = crate::VMAP_BASE - crate::DIRECT_MAP_BASE;
         let mut b = [0u8; 1];
-        assert!(!read(span, 1, 0, &mut b), "first byte past the direct map");
-        assert!(!read(span - 1, 2, 0, &mut b), "range reaching past it");
-        assert!(!write(u64::MAX, 1, 0, &[1]), "overflow");
-        assert!(!write(0, 1, 1, &[1]), "offset past len");
+        assert!(!read_ram(span, &mut b), "first byte past the direct map");
+        assert!(!read_ram(span - 1, &mut [0u8; 2]), "range reaching past it");
+        assert!(!read_ram(u64::MAX, &mut b), "overflow");
     }
 
     #[test]

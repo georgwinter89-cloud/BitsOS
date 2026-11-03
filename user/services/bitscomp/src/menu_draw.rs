@@ -5,14 +5,14 @@
 use crate::canvas::{Box2, Canvas};
 use crate::layout::Rect;
 use crate::menu::{Items, RING_IN, RING_OUT, extent, item_rect};
-use crate::text::{Font, Weight};
+use crate::text::{Family, Font, Weight};
 use crate::theme::{Theme, alpha};
 
 /// Text padding inside an item.
 pub const ITEM_PAD: i32 = 10;
 
 pub fn item_font(t: &Theme) -> Font {
-    Font::new(t.fs(13.0), Weight::Regular, t.scale)
+    t.font(Family::Ui, 13.0, Weight::Regular)
 }
 
 pub fn menu(items: &Items, hover: Option<usize>, t: &Theme) -> Canvas {

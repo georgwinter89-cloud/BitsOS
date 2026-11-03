@@ -579,6 +579,7 @@ pub(crate) fn read_all(h: &Handle) -> Vec<(u16, u16, i32)> {
 
 #[test]
 fn evdev_read_and_ioctls() {
+    let _serial = crate::tests_in6::latency_serial(); // its reads feed the program latency slot
     static S: EvdevSink = EvdevSink::new();
     let k = keyboard_on(&S, "test kbd");
     let h = Handle::open(&k).unwrap();
@@ -654,6 +655,7 @@ fn evdev_read_and_ioctls() {
 
 #[test]
 fn evdev_grab_and_unplug() {
+    let _serial = crate::tests_in6::latency_serial(); // its reads feed the program latency slot
     static S: EvdevSink = EvdevSink::new();
     let k = keyboard_on(&S, "grab kbd");
     let vt = S.subscribe("test vt");
@@ -688,6 +690,7 @@ fn evdev_grab_and_unplug() {
 
 #[test]
 fn evdev_masks_and_abs() {
+    let _serial = crate::tests_in6::latency_serial(); // its reads feed the program latency slot
     static S: EvdevSink = EvdevSink::new();
     let mut caps = Caps::default();
     caps.keys.insert(0x110);
@@ -726,4 +729,43 @@ fn evdev_masks_and_abs() {
     assert_eq!(m.at(400, 8), [0xFF; 8], "no key mask set: all bits");
     drop(h);
     d.unregister(3);
+}
+
+/// INT-W17 (MC-9b CR 1): EVIOC_BITSOS_PHYSICAL per open file: with 1 the client reads what the device sent but
+/// not what a program wrote into the node; 0 gives both again; any other value is EINVAL.
+#[test]
+fn evdev_physical_only_drops_written_events() {
+    let _serial = crate::tests_in6::latency_serial(); // its reads feed the program latency slot
+    static S: EvdevSink = EvdevSink::new();
+    let k = keyboard_on(&S, "physical kbd");
+    let real = Handle::open(&k).unwrap();
+    let all = Handle::open(&k).unwrap();
+    let m = Mem::new();
+    assert_eq!(ioc::EVIOC_BITSOS_PHYSICAL, 0x4004_45b0);
+    m.put(0, &2i32.to_le_bytes());
+    assert_eq!(real.ioctl(ioc::EVIOC_BITSOS_PHYSICAL, BASE, &m), Err(EINVAL));
+    assert_eq!(real.ioctl(ioc::EVIOC_BITSOS_PHYSICAL, 0x10, &m), Err(EFAULT));
+    m.put(0, &1i32.to_le_bytes());
+    assert_eq!(real.ioctl(ioc::EVIOC_BITSOS_PHYSICAL, BASE, &m), Ok(0));
+    let written = |code: u16, value: i32| {
+        let mut w = [0u8; EVENT_SIZE * 2];
+        w[16..18].copy_from_slice(&EV_KEY.to_le_bytes());
+        w[18..20].copy_from_slice(&code.to_le_bytes());
+        w[20..24].copy_from_slice(&value.to_le_bytes());
+        w[EVENT_SIZE + 16..EVENT_SIZE + 18].copy_from_slice(&EV_SYN.to_le_bytes());
+        assert_eq!(all.write(&w), Ok(EVENT_SIZE * 2));
+    };
+    k.emit(5, &[(EV_KEY, 30, 1), (EV_SYN, SYN_REPORT, 0)]);
+    written(31, 1);
+    written(31, 0);
+    k.emit(6, &[(EV_KEY, 30, 0), (EV_SYN, SYN_REPORT, 0)]);
+    assert_eq!(read_all(&real), [(EV_KEY, 30, 1), (EV_SYN, SYN_REPORT, 0), (EV_KEY, 30, 0), (EV_SYN, SYN_REPORT, 0)], "only what the device sent");
+    assert_eq!(read_all(&all).iter().filter(|e| e.0 == EV_KEY).count(), 4, "the other client reads both");
+    m.put(0, &0i32.to_le_bytes());
+    assert_eq!(real.ioctl(ioc::EVIOC_BITSOS_PHYSICAL, BASE, &m), Ok(0));
+    written(31, 1);
+    written(31, 0);
+    assert_eq!(read_all(&real), [(EV_KEY, 31, 1), (EV_SYN, SYN_REPORT, 0), (EV_KEY, 31, 0), (EV_SYN, SYN_REPORT, 0)], "0: written events again");
+    drop((real, all));
+    k.unregister(7);
 }

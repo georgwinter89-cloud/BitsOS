@@ -175,12 +175,12 @@ pub(super) fn render_stat(t: &Target, g: &Group, p: &Process, th: Option<&Thread
     let mut s = format!(
         "{pid} ({comm}) {st} {ppid} {pgrp} {sid} 0 -1 {flags} 0 0 0 0 {ut} {stt} {cut} {cst} {prio} {nice} {threads} 0 {start} {vsize} {rss} {rsslim} \
          {scode} {ecode} {sstack} 0 0 {pend} {blk} {ign} {cgt} {wchan} 0 0 {exit_signal} {cpu} {rt} {policy} 0 0 0",
-        pid = t.tid,
+        pid = t.nr(t.tid),
         comm = comm_of(p, th),
         st = &state[..1],
-        ppid = g.ppid(),
-        pgrp = g.pgid(),
-        sid = g.sid(),
+        ppid = t.nr(g.ppid()),
+        pgrp = t.nr(g.pgid()),
+        sid = t.nr(g.sid()),
         ut = clock_t(utime),
         stt = clock_t(stime),
         cut = clock_t(ch.user_ns),
@@ -210,29 +210,53 @@ pub(super) fn render_status(t: &Target, g: &Group, p: &Process, th: Option<&Thre
     let alive = !g.is_finished();
     let mut s = String::new();
     let k = p.cred();
-    let groups: String = k.groups.iter().enumerate().map(|(i, g)| if i == 0 { format!("{g}") } else { format!(" {g}") }).collect();
+    // SX-2: ids as the reader's user namespace names them (`seq_user_ns`); the NS* lines list the number in
+    // every pid namespace from /proc's (SX-3b: the instance's) down to the process's own (`task_state`).
+    let rns = proc::current().map_or_else(|| proc::ns::user::init_user_ns().clone(), |me| me.cred().user_ns.clone());
+    let (u, gi) = (|x: u32| rns.uid(x), |x: u32| rns.gid(x));
+    let groups: String = k.groups.iter().enumerate().map(|(i, g)| if i == 0 { format!("{}", gi(*g)) } else { format!(" {}", gi(*g)) }).collect();
+    // One number per level of the process's own pid (`pid->numbers[g].ns`), 0 where `id` is not visible there
+    // (a pgid or sid from outside the namespace).
+    let mut levels: alloc::vec::Vec<&proc::ns::pid::PidNs> = alloc::vec::Vec::new();
+    let mut cur: &proc::ns::pid::PidNs = &g.pid_ns;
+    while cur.level > t.ns.level && levels.try_reserve(1).is_ok() {
+        levels.push(cur);
+        match &cur.parent {
+            Some(up) => cur = up,
+            None => break,
+        }
+    }
+    let ns_line = |id: u32| {
+        let mut l = format!("{}", t.nr(id));
+        for n in levels.iter().rev() {
+            let _ = write!(l, "\t{}", n.nr(id).unwrap_or(0));
+        }
+        l
+    };
     let _ = write!(
         s,
         "Name:\t{name}\nUmask:\t{umask:04o}\nState:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
          Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fds}\nGroups:\t{groups} \n\
-         NStgid:\t{tgid}\nNSpid:\t{pid}\nNSpgid:\t{pgid}\nNSsid:\t{sid}\nKthread:\t0\n",
-        k.uid,
-        k.euid,
-        k.suid,
-        k.fsuid,
-        k.gid,
-        k.egid,
-        k.sgid,
-        k.fsgid,
+         NStgid:\t{nstgid}\nNSpid:\t{nspid}\nNSpgid:\t{nspgid}\nNSsid:\t{nssid}\nKthread:\t0\n",
+        u(k.uid),
+        u(k.euid),
+        u(k.suid),
+        u(k.fsuid),
+        gi(k.gid),
+        gi(k.egid),
+        gi(k.sgid),
+        gi(k.fsgid),
+        nstgid = ns_line(g.tgid),
+        nspid = ns_line(t.tid),
+        nspgid = ns_line(g.pgid()),
+        nssid = ns_line(g.sid()),
         name = escape_name(&comm_of(p, th)),
-        umask = p.fds.fs.umask(),
+        umask = th.map_or_else(|| p.fs(), |t| t.fs(p)).umask(),
         state = state(g, th, st.as_ref(), &sig),
-        tgid = g.tgid,
-        pid = t.tid,
-        ppid = g.ppid(),
+        tgid = t.nr(g.tgid),
+        pid = t.nr(t.tid),
+        ppid = t.nr(g.ppid()),
         fds = p.fds.capacity(),
-        pgid = g.pgid(),
-        sid = g.sid(),
     );
     if alive {
         let m = mem_of(p);
@@ -268,11 +292,13 @@ pub(super) fn render_status(t: &Target, g: &Group, p: &Process, th: Option<&Thre
     let bset = th.map_or(CAP_FULL, |t| t.prctl().cap_bset());
     let (prm, eff) = proc::cred::cap_sets(&k, bset);
     let nnp = th.is_some_and(|t| t.prctl().no_new_privs()) as u8;
+    // SX-1: `task_seccomp` (linux-6.6/fs/proc/array.c): the thread's mode and its filter count.
+    let (sc, scf) = th.map_or((0, 0), |t| (t.prctl().seccomp().mode(), t.prctl().seccomp().filter_count()));
     let _ = write!(
         s,
         "Threads:\t{threads}\nSigQ:\t{q}/{qlim}\nSigPnd:\t{pnd}\nShdPnd:\t{shd}\nSigBlk:\t{blk}\nSigIgn:\t{ign}\nSigCgt:\t{cgt}\n\
          CapInh:\t0000000000000000\nCapPrm:\t{prm:016x}\nCapEff:\t{eff:016x}\nCapBnd:\t{bset:016x}\nCapAmb:\t0000000000000000\n\
-         NoNewPrivs:\t{nnp}\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tnot vulnerable\n\
+         NoNewPrivs:\t{nnp}\nSeccomp:\t{sc}\nSeccomp_filters:\t{scf}\nSpeculation_Store_Bypass:\tnot vulnerable\n\
          SpeculationIndirectBranch:\tnot affected\n",
         threads = g.thread_count(),
         q = sig.queued,

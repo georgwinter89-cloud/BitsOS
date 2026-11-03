@@ -333,7 +333,8 @@ fn quiesce_then_bring_up_again() {
     assert_eq!(c.state(), State::Quiesced);
     assert!(!f.sd(OUT0).running());
     assert_eq!(f.reg32(INTCTL), 0);
-    assert_eq!(f.reg32(GCTL) & GCTL_CRST, 0);
+    // SN-7: Linux's shutdown order, the link stays out of reset (tests_quiesce.rs has the rest).
+    assert_ne!(f.reg32(GCTL) & GCTL_CRST, 0);
     assert!(f.has(&Ev::PciOff) && !f.bus_master());
     // The slot stays until the next bring-up, but only for winding down: no start, no write.
     assert_eq!(c.write(sid, &[0; 4]), Err(HdaError::NotUp));

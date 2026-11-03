@@ -103,6 +103,8 @@ fn truncate_keeps_pinned_pages_alive() {
     assert!(w.upgrade().is_some(), "still mapped: kept");
     assert_eq!(map.backing.get_page(1, false), Err(PageFault::Bus));
     assert!(map.backing.put_page(phys));
+    // PF-5: the index's reference left through the grace queue; the reaper drains it in the kernel.
+    mm_core::grace::expedite();
     assert!(w.upgrade().is_none(), "unmapped: freed");
     assert_eq!(m.sb.pool.used(), 1, "and its charge went with it");
     // Growing again reads zeros there (a new page), not the old content.
@@ -370,6 +372,7 @@ fn truncated_mapped_pages_stay_charged() {
             assert!(map.backing.put_page(p));
         }
     }
+    mm_core::grace::expedite();
     assert_eq!(pool.used(), 0, "unmapped: every carried charge went back");
     inode.truncate(4 * P).unwrap();
     assert_eq!(pool.used(), 0, "growing charges nothing");

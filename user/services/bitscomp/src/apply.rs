@@ -20,6 +20,7 @@ impl App {
                 self.page_model_set(crate::page_schema::model(&specs));
                 self.settings_live = true;
                 self.apply_settings("list");
+                self.absicht_register();
             }
             Msg::Changed(k, v) => {
                 // WY-5c: the echo of a fold that a newer fold of the same bar already overtook.
@@ -37,6 +38,7 @@ impl App {
             Msg::Place(dir) => self.session_place(dir),
             Msg::Lost => {
                 self.settings_live = false;
+                self.absicht_sent.clear();
                 self.page_dialogs_drop(None, "der Einstellungsdienst antwortet nicht");
             }
         }
@@ -61,8 +63,10 @@ impl App {
             self.desk.reveal.clear();
         }
         if *self.theme != t {
-            if t.font_ui != self.theme.font_ui && t.font_ui != "Exo 2" {
-                eprintln!("bitscomp: theme.font.ui {:?}: only Exo 2 is shipped, it stays", t.font_ui);
+            if t.font_notes() != self.theme.font_notes() {
+                for note in t.font_notes() {
+                    eprintln!("bitscomp: {note}");
+                }
             }
             let rescale = t.scale != self.theme.scale;
             // WY-11: a new pointer size: a new image (the scale changes it by itself) and the programs' XCURSOR_SIZE.

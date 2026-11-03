@@ -24,3 +24,6 @@ kreg = { path = "../kreg" }
 ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
 uapi = { path = "../uapi" }
+
+[lints]
+workspace = true

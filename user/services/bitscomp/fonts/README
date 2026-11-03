@@ -1,3 +1,10 @@
 Exo 2 (weights 300-700), static TTFs from Google Fonts (fonts.gstatic.com, Exo 2 v26), downloaded 21.10.2026 with Georg's OK.
-
 Licensed under the SIL Open Font License 1.1 (text in OFL.txt).
+
+Design v2 (plan/spec/desktop-v2), downloaded 28.10.2026 with Georg's OK from github.com/google/fonts (main, ofl/):
+- Bricolage Grotesque 500, 600: static instances (opsz 48, wdth 100) of BricolageGrotesque[opsz,wdth,wght].ttf,
+  made with fontTools varLib.instancer (the renderer cannot apply variable axes). OFL-BricolageGrotesque.txt.
+- Figtree 400-700: static instances of Figtree[wght].ttf. OFL-Figtree.txt.
+- JetBrains Mono 400-600: static instances of JetBrainsMono[wght].ttf. OFL-JetBrainsMono.txt.
+All SIL Open Font License 1.1, no Reserved Font Name. Not in any of them: U+2713 U+2717 (check, cross); Bricolage and
+Figtree also lack U+25BE U+25B8 U+25CF (triangles, dot): draw those as icons.

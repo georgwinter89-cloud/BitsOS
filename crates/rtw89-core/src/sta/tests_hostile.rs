@@ -63,8 +63,9 @@ fn assoc_resp() -> Vec<u8> {
     ])
 }
 
+// the AP's: addr3 (the BSSID) is its sender
 fn deauth() -> Vec<u8> {
-    ieee::deauth(&AP, &OWN, 2, 3)
+    cat(&[&ieee::hdr(0x00c0, &OWN, &AP, &AP, 3), &hx("0200")])
 }
 
 fn disassoc() -> Vec<u8> {
@@ -166,4 +167,19 @@ fn frames_from_the_air_never_panic_the_station() {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), all.len(), "one entry per BSSID");
+}
+
+// mac80211 takes a deauthentication or disassociation only when its BSSID is its sender
+// (linux-6.6/net/mac80211/mlme.c:3828, :3876); one from our AP's address naming another BSSID
+// never reaches the MLME
+#[test]
+fn deauth_with_another_bssid_is_not_the_aps() {
+    let other = [0x02, 0, 0, 0, 0, 0x99];
+    for f in [
+        cat(&[&ieee::hdr(0x00c0, &OWN, &AP, &other, 3), &hx("0200")]),
+        cat(&[&ieee::hdr(0x00a0, &OWN, &AP, &other, 4), &hx("0800")]),
+    ] {
+        assert_eq!(mgmt_of(&f), None);
+    }
+    assert!(mgmt_of(&deauth()).is_some() && mgmt_of(&disassoc()).is_some());
 }

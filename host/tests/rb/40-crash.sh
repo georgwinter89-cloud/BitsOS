@@ -8,9 +8,15 @@
 #           survived (marker=kept), `crash previous` and its lines logged, rb.crash.forced checks the record.
 #           The listener (console-listen.mjs, unchanged) gets the report lines through the mirror's emergency
 #           path and the next boot's `crash previous`.
+#           RB-13: before its reset the panic halts and resets the stick's controller (qemu-xhci, usb-storage,
+#           bootindex 0): `crash xhci.stopped ... halted=true reset=true ready=true` in boot 1 and in the record
+#           boot 2 logs, and QEMU's own trace (usb_xhci_run/stop/reset, cpu_reset) shows the controller stopped
+#           and reset after it last ran and before the machine reset; boot 2 comes from the stick again.
 #   part 2, a kernel #GP (fatal exception): panic_delay=300, so the guest waits, and the scenario resets it
 #           through QMP system_reset. The backtrace crosses the trap frame (`crash trap ... vector=13`) into
-#           rb_crash_level_three; boot 2 sees exception=true.
+#           rb_crash_level_three; boot 2 sees exception=true. RB-13: the controller is stopped here too, before
+#           the delay, and the record names it.
+#   part 3, panic=halt (RB-13): the halt leaves the devices alone: no xHCI stop, watchdog grace or reset step.
 # Needs the desk's panic handler to call kexec::crash::report (change request 1 in plan/notes/rb-RB-2.md);
 # without it the scenario says SKIPPED, and BITSOS_RB_CRASH=required turns that into RED.
 # Ports: the listener on LO+310 (never 6666).
@@ -21,7 +27,8 @@ mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 LO="${BITSOS_PORT_LO:-23000}"
 PORT=$((LO + 310))
-LISTENER=/home/georg/BitsOS/BitsOS-Plattform/console-listen.mjs
+# V1's host listener, unchanged (BITSOS_LISTENER overrides where V1 lies; no home value in the public tree).
+LISTENER="${BITSOS_LISTENER:-$HOME/BitsOS/BitsOS-Plattform/console-listen.mjs}"
 SMP="${RB_SMP:-4}"
 
 if ! grep -q "kexec::crash::report(info)" kernel/src/main.rs; then
@@ -41,7 +48,7 @@ cleanup() {
     for p in $LPID $QPID; do
         if kill -0 "$p" 2> /dev/null; then kill "$p" 2> /dev/null || true; wait "$p" 2> /dev/null || true; fi
     done
-    for n in rb-crash-panic rb-crash-fault; do
+    for n in rb-crash-panic rb-crash-fault rb-crash-halt; do
         f="target/xtask/qemu-$n.pid"
         [ -f "$f" ] && q=$(head -1 "$f") && tr '\0' ' ' < "/proc/$q/cmdline" 2> /dev/null | grep -Eq -- "-name v2-[A-Za-z0-9]+-$n( |$)" && kill "$q" 2> /dev/null || true
     done
@@ -102,6 +109,17 @@ check_report() { # $1 = boot-1 log, $2 = kind
     echo "ok: boot 1 ($2): $((SMP - 1)) CPUs stopped by NMI with registers, levels three/two/one at lines $three/$two/$one, record written"
 }
 
+# RB-13: QEMU's trace: at the machine reset after the panic (the last group of `cpu_reset 0`), the controller's
+# last events are run (kernel 1), stop (the halt), reset (the HCRST); a panic without the stop ends on `run`.
+check_xhci_trace() { # $1 = QEMU trace file
+    local last
+    last=$(awk '/^cpu_reset 0$/ { if (!incpu) seen = ev; incpu = 1; next } /^cpu_reset / { next }
+        /^usb_xhci_(run|stop|reset)/ { incpu = 0; e = $1; sub(/^usb_xhci_/, "", e); ev = (ev == "" ? e : ev " " e) }
+        END { n = split(seen, a, " "); if (n >= 3) print a[n-2], a[n-1], a[n]; else print seen }' "$1")
+    [ "$last" = "run stop reset" ] || red "QEMU's trace: before the machine reset the controller's last events were '$last', not 'run stop reset'" "$1"
+    echo "ok: QEMU trace: the stick's controller was halted and reset (HCRST) after it last ran, before the machine reset"
+}
+
 check_next_boot() { # $1 = boot-2 log, $2 = exception true|false
     local b="$1"
     has "$b" "I crash page phys=0x[0-9a-f]+ bytes=[0-9]+ marker=kept " "the boot marker did not survive the warm reset"
@@ -121,13 +139,25 @@ MIRROR=""
 cargo xtask image --name $NAME --ktest --config-extra "ktest=rb.crash.forced;rb_crash_panic=panic;panic=reboot;panic_delay=1$MIRROR" | tail -1
 host/tests/rb/ksyms.sh $NAME ktest
 [ "$LISTEN" = yes ] && listen "$OUT"
-cargo xtask qemu --name $NAME --smp $SMP --net user --timeout 300 --serial-log "$LOG" -- -action reboot=reset > "$LOG.qemu" 2>&1 ||
+TRACE="$RUN_DIR/panic.trace"
+rm -f "$TRACE"
+cargo xtask qemu --name $NAME --smp $SMP --net user --timeout 300 --serial-log "$LOG" -- -action reboot=reset \
+    -trace usb_xhci_run -trace usb_xhci_stop -trace usb_xhci_reset -trace cpu_reset -D "$TRACE" > "$LOG.qemu" 2>&1 ||
     red "part 1: QEMU did not end with PASS ($(tail -1 "$LOG.qemu"))" "$LOG"
 [ "$LISTEN" = yes ] && stop_listen
 split_boots "$LOG" "$RUN_DIR/panic"
 check_report "$RUN_DIR/panic.boot1" panic
+has "$RUN_DIR/panic.boot1" "E crash xhci.stopped ctrl=xhci0 halted=true reset=true ready=true gone=false " "RB-13: the panic did not halt and reset the stick's controller"
+order=$(grep -anE "E crash (xhci.stopped|reboot in_s=1|reset.step n=1 )" "$RUN_DIR/panic.boot1" | cut -d: -f1 | tr '\n' ' ')
+[ "$(echo $order | wc -w)" = 3 ] && [ "$(echo $order | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$order" ] ||
+    red "RB-13: not in the order xhci.stopped, reboot, reset.step (lines $order)" "$RUN_DIR/panic.boot1"
 has "$RUN_DIR/panic.boot1" "E crash reboot in_s=1 " "no reboot announced"
+check_xhci_trace "$TRACE"
 check_next_boot "$RUN_DIR/panic.boot2" false
+has "$RUN_DIR/panic.boot2" "^bitsboot: BitsOS V2 loader" "boot 2 did not start from the stick's loader"
+has "$RUN_DIR/panic.boot2" "I crash previous.line .*xhci0: halted=true reset=true ready=true" "RB-13: the record does not name the controller's halt and reset"
+has "$RUN_DIR/panic.boot2" "I crash previous.line .*reset: .*0xCF9 hard \(0x6\), 0xCF9 full \(0xe\), 8042, triple fault" "RB-13: the record does not name the reset order"
+echo "ok: RB-13: controller halted and reset before the reset (record and trace), boot 2 from the stick"
 if [ "$LISTEN" = yes ]; then
     has "$OUT" "E kernel panic \| panicked at " "the panic line did not reach the listener"
     has "$OUT" "E crash frame cpu=0 .*rb_crash_level_three" "the backtrace did not reach the listener"
@@ -161,5 +191,27 @@ QPID=""
 split_boots "$LOG" "$RUN_DIR/fault"
 check_report "$RUN_DIR/fault.boot1" fault
 check_next_boot "$RUN_DIR/fault.boot2" true
+# RB-13 fixer: the fault path (closest to the Mini-PC's #GP of 27.10.) stops the controller as well, before the
+# delay, and the record names it.
+has "$RUN_DIR/fault.boot1" "E crash xhci.stopped ctrl=xhci0 halted=true reset=true ready=true gone=false " "RB-13: the #GP panic did not halt and reset the stick's controller"
+order=$(grep -anE "E crash (xhci.stopped|reboot in_s=300 )" "$RUN_DIR/fault.boot1" | cut -d: -f1 | tr '\n' ' ')
+[ "$(echo $order | wc -w)" = 2 ] && [ "$(echo $order | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$order" ] ||
+    red "RB-13: #GP panic: not in the order xhci.stopped, reboot (lines $order)" "$RUN_DIR/fault.boot1"
+has "$RUN_DIR/fault.boot2" "I crash previous.line .*xhci0: halted=true reset=true ready=true" "RB-13: the #GP record does not name the controller's halt and reset"
+echo "ok: RB-13: #GP panic: controller halted and reset before the delay, named in the record"
+
+# --- Part 3 (RB-13 fixer): panic=halt leaves the devices as the panic found them ---
+NAME=rb-crash-halt
+LOG="$RUN_DIR/halt.serial"
+rm -f "$LOG"
+cargo xtask image --name $NAME --ktest --config-extra "ktest=rb.crash.forced;rb_crash_panic=panic;panic=halt" | tail -1
+host/tests/rb/ksyms.sh $NAME ktest
+# A halt under QEMU leaves with the panic exit code: xtask reports that as not PASS, which is expected here.
+cargo xtask qemu --name $NAME --smp $SMP --net user --timeout 180 --serial-log "$LOG" > "$LOG.qemu" 2>&1 || true
+has "$LOG" "E crash halt qemu_exit=true" "part 3: panic=halt did not halt"
+if grep -aqE "E crash (xhci.stopped|reset.order|reset.step|watchdog.grace|reboot )" "$LOG"; then
+    red "RB-13: panic=halt ran the reboot's clean-up (xHCI stop, watchdog grace or reset steps)" "$LOG"
+fi
+echo "ok: RB-13: panic=halt: no xHCI stop, no watchdog grace, no reset step"
 
 echo "GREEN: panic path (NMI stop with registers of $((SMP - 1)) CPUs, backtraces with symbols, a #GP trap frame crossed, crash record across a guest reset and a QMP system_reset, mirror lines)"

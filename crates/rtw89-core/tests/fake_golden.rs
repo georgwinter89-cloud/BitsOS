@@ -4,6 +4,8 @@
 //! RTW89_SKIP_FAKE=1 skips (with a line on stderr; refused under BITSOS_GATE or CI),
 //! anything else missing fails.
 
+mod common;
+
 use std::io::{BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -81,7 +83,7 @@ fn efuse_log_mac() -> Vec<u8> {
 fn wlan_dir() -> PathBuf {
     std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into())
+        .unwrap_or_else(|| common::desk("werkzeuge/plattform/wlan"))
 }
 
 /// The line goes to the real stderr, past the test harness's capture, so a skip is always seen
@@ -1269,3 +1271,6 @@ mod fault;
 
 #[path = "fake_golden/drv.rs"]
 mod drv;
+
+#[path = "fake_golden/irq.rs"]
+mod irq;

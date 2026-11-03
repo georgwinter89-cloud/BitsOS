@@ -97,7 +97,7 @@ fn through_the_vfs() {
 
 #[test]
 fn loop_image_on_another_file_system() {
-    let s = Scratch::new();
+    let s = Scratch::alone();
     let img = mkfs(&s, "32M", &["-b", "4096"], None);
     let ns = vfs::MountNs::new_empty();
     ns.mkdir_p("/boot/BITSOS2").unwrap();

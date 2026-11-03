@@ -5,7 +5,7 @@
 //! Exo 2 plus a monospace, scale 125 %, motion medium with a calm setting, effect level cheap until the GPU path.
 
 use crate::key::{Applier, KeyDef, Restart, Safety};
-use crate::value::{Type, Value};
+use crate::value::{LEVELS_DE, Type, Value};
 
 fn def(name: &str, ty: Type, default: Value, de: &str, en: &str, applier: Applier, restart: Restart) -> KeyDef {
     KeyDef {
@@ -21,8 +21,12 @@ fn def(name: &str, ty: Type, default: Value, de: &str, en: &str, applier: Applie
     }
 }
 
-fn choice(c: &[&str]) -> Type {
-    Type::Choice(c.iter().map(|s| s.to_string()).collect())
+/// (value, German name) pairs: every built-in choice names its values for the settings page (CL-8, WY-9/1).
+fn choice(c: &[(&str, &str)]) -> Type {
+    Type::Choice {
+        values: c.iter().map(|p| p.0.to_string()).collect(),
+        de: c.iter().map(|p| p.1.to_string()).collect(),
+    }
 }
 fn int(min: i64, max: i64, unit: &str) -> Type {
     Type::Int { min, max, unit: unit.into(), word: None }
@@ -37,21 +41,40 @@ pub fn theme() -> Vec<KeyDef> {
         def(name, ty, default, de, en, comp(), Restart::None)
     };
     let mut v = vec![
-        t("theme.mode", choice(&["dark", "light"]), text("dark"), "Helles oder dunkles Design", "Light or dark look"),
+        t(
+            "theme.mode",
+            choice(&[("dark", "Dunkel"), ("light", "Hell")]),
+            text("dark"),
+            "Helles oder dunkles Design",
+            "Light or dark look",
+        ),
         t(
             "theme.accent",
             Type::Color,
-            text("#00e5ff"),
-            "Akzentfarbe (Standard: holografisches Cyan)",
-            "Accent colour (default: holographic cyan)",
+            text("#7fcfa0"),
+            "Akzentfarbe für hell und dunkel (Standard Moos: folgt dem Modus)",
+            "Accent colour for light and dark (default moss: follows the mode)",
         ),
-        t("theme.font.ui", Type::Text { max: 64 }, text("Exo 2"), "Schrift der Oberfläche", "Interface font"),
+        t(
+            "theme.font.display",
+            Type::Text { max: 64 },
+            text("Bricolage Grotesque"),
+            "Schrift für Überschriften (auch: Figtree, JetBrains Mono, Exo 2)",
+            "Font for headlines (also: Figtree, JetBrains Mono, Exo 2)",
+        ),
+        t(
+            "theme.font.ui",
+            Type::Text { max: 64 },
+            text("Figtree"),
+            "Schrift der Oberfläche (auch: Exo 2, Bricolage Grotesque, JetBrains Mono)",
+            "Interface font (also: Exo 2, Bricolage Grotesque, JetBrains Mono)",
+        ),
         t(
             "theme.font.mono",
             Type::Text { max: 64 },
-            text("Noto Sans Mono"),
-            "Schrift für Code und Terminals",
-            "Font for code and terminals",
+            text("JetBrains Mono"),
+            "Schrift für Beschriftungen und Adressen",
+            "Font for labels and addresses",
         ),
         t(
             "theme.font.size",
@@ -78,14 +101,14 @@ pub fn theme() -> Vec<KeyDef> {
         ),
         t(
             "theme.effects",
-            choice(&["cheap", "gpu"]),
+            choice(&[("cheap", "Sparsam"), ("gpu", "GPU")]),
             text("cheap"),
             "Effektstufe: sparsam (ohne Grafiktreiber) oder GPU",
             "Effect level: cheap (no GPU driver) or GPU",
         ),
         t(
             "theme.motion",
-            choice(&["medium", "calm", "off"]),
+            choice(&[("medium", "Mittel"), ("calm", "Ruhig"), ("off", "Aus")]),
             text("medium"),
             "Bewegung: mittel, ruhig oder aus",
             "Motion: medium, calm or off",
@@ -97,17 +120,37 @@ pub fn theme() -> Vec<KeyDef> {
             "Stärke des holografischen Leuchtens",
             "Strength of the holographic glow",
         ),
+        t(
+            "theme.scanlines",
+            Type::Bool,
+            Value::Bool(true),
+            "Feine Rasterlinien im dunklen Hintergrund (nie über Fenstern)",
+            "Fine scanlines in the dark background (never over windows)",
+        ),
     ];
-    // Neutral palettes per mode, the values of the mock-up Georg approved on 21.10.2026 (plan/spec/desktop.md §6,
-    // WY-5); the accent is shared. bitscomp's built-in defaults are the same (its test reads this file).
-    let palette: [(&str, &str, &str, &str, &str); 7] = [
-        ("bg", "#0b0f14", "#e9eef3", "Hintergrund", "Background"),
-        ("surface", "#111821", "#ffffff", "Leisten und Kacheln", "Bars and tiles"),
-        ("surface2", "#17212c", "#f2f5f8", "Zweite Fläche (Reiterleiste, Felder)", "Second surface (tab strip, fields)"),
-        ("paper", "#131c26", "#ffffff", "Gezeigter Reiter", "Shown tab"),
-        ("text", "#e6edf3", "#101820", "Text", "Text"),
-        ("text_dim", "#93a4b8", "#4d5b6b", "Nebentext", "Secondary text"),
-        ("border", "#26364a", "#d3dce6", "Rahmenlinien", "Border lines"),
+    // The palettes of design v2 (Georg 28.10.2026, plan/spec/desktop.md §0): "Absicht dunkel" and "Absicht" (hell).
+    // bitscomp's built-in defaults are the same (its test reads this file). theme.{mode}.accent is the mode's own
+    // accent; theme.accent above, when set to another colour, replaces it in both modes.
+    let palette: [(&str, &str, &str, &str, &str); 19] = [
+        ("bg", "#121a16", "#e3e7e3", "Hintergrund", "Background"),
+        ("surface", "#1b2520", "#fbfcfa", "Leisten und Kacheln", "Bars and tiles"),
+        ("surface2", "#0c120f", "#d5dbd5", "Vertiefte Fläche (Felder)", "Sunken surface (fields)"),
+        ("paper", "#1b2520", "#fbfcfa", "Gezeigter Reiter", "Shown tab"),
+        ("text", "#e8eee9", "#15201a", "Text", "Text"),
+        ("text_dim", "#a3b0a8", "#4e5b52", "Nebentext", "Secondary text"),
+        ("border", "#2b3731", "#c3cbc3", "Rahmenlinien", "Border lines"),
+        ("line_strong", "#6b7a71", "#6f7b71", "Kräftige Linien", "Strong lines"),
+        ("accent", "#7fcfa0", "#2f6b4f", "Eigene Akzentfarbe des Modus", "The mode's own accent"),
+        ("accent_soft", "#1f3a2c", "#cfe3d6", "Akzent, sanft (hinter Ausgewähltem)", "Soft accent (behind selections)"),
+        ("on_accent", "#0f1712", "#fbfcfa", "Text auf dem Akzent", "Text on the accent"),
+        ("claude", "#7fcfa0", "#2f6b4f", "Farbe des Assistenten", "The assistant's colour"),
+        ("warnung", "#ff7b6b", "#b3261e", "Warnungen und Fehler", "Warnings and errors"),
+        ("terminal", "#0a0f0c", "#15201a", "Terminal-Hintergrund", "Terminal background"),
+        ("on_terminal", "#d5e2da", "#e8eee9", "Terminal-Text", "Terminal text"),
+        ("kontext_1", "#d9765b", "#e2694b", "Kontextfarbe 1", "Context colour 1"),
+        ("kontext_2", "#e3bd5f", "#f2c14e", "Kontextfarbe 2 (auch: wartet)", "Context colour 2 (also: waiting)"),
+        ("kontext_3", "#86afd9", "#8db9e6", "Kontextfarbe 3", "Context colour 3"),
+        ("on_kontext", "#121a16", "#15201a", "Text auf Kontextfarben", "Text on context colours"),
     ];
     for (mode, de_mode, en_mode, dark) in [("dark", "dunkel", "dark", true), ("light", "hell", "light", false)] {
         for (name, d, l, de, en) in palette {
@@ -132,8 +175,15 @@ pub fn layout() -> Vec<KeyDef> {
     };
     vec![
         t(
+            "theme.layout.preset",
+            choice(&[("buehne", "Bühne"), ("classic", "Klassisch")]),
+            text("buehne"),
+            "Aufbau des Bildschirms: Bühne (Kopfleiste, Bühne, Verlauf) oder klassisch (Leisten wie bisher)",
+            "Screen layout: Bühne (header, stage, history strip) or classic (the bars as before)",
+        ),
+        t(
             "theme.layout.address_bar",
-            choice(&["top", "tile"]),
+            choice(&[("top", "Oben"), ("tile", "Pro Kachel")]),
             text("top"),
             "Adresszeile: eine oben oder eine pro Kachel",
             "Address bar: one at the top or one per tile",
@@ -184,16 +234,25 @@ pub fn kernel() -> Vec<KeyDef> {
     vec![
         def(
             "kernel.loglevel",
+            // CL-8: shown as a choice of the five levels; warn,net=debug still works from the CLI and MCP.
             Type::LogSpec,
             text("info"),
-            "Was der Kern protokolliert (z. B. info oder warn,net=debug)",
-            "What the kernel logs (e.g. info or warn,net=debug)",
+            "Wie viel der Kern protokolliert",
+            "How much the kernel logs",
             k("loglevel", Some("loglevel")),
             Restart::None,
         ),
         def(
             "kernel.console_log",
-            choice(&["off", "error", "warn", "info", "debug", "all"]),
+            // The console's own filter (crates/console/src/logfilter.rs): off and all, no trace.
+            choice(&[
+                ("off", "Aus"),
+                ("error", LEVELS_DE[0]),
+                ("warn", LEVELS_DE[1]),
+                ("info", LEVELS_DE[2]),
+                ("debug", LEVELS_DE[3]),
+                ("all", LEVELS_DE[4]),
+            ]),
             text("warn"),
             "Welche Kernmeldungen die Konsole zeigt",
             "Which kernel messages the console shows",
@@ -202,17 +261,27 @@ pub fn kernel() -> Vec<KeyDef> {
         ),
         def(
             "kernel.console_font",
-            choice(&["noto", "vga"]),
+            choice(&[("noto", "Noto"), ("vga", "VGA")]),
             text("noto"),
             "Schrift der Textkonsole",
             "Font of the text console",
             k("console_font", None),
             Restart::Reboot,
         ),
+        // SC-9: CONFIG idle= (sched::cstate::configure); deep uses the firmware's C2/C3 when the plan allows them.
+        def(
+            "kernel.idle",
+            choice(&[("deep", "Tiefe Schlafzustände (spart Strom)"), ("c1", "Nur leichter Schlaf (wie früher)")]),
+            text("deep"),
+            "Wie tief untätige Prozessorkerne schlafen",
+            "How deep idle processor cores sleep",
+            k("idle", None),
+            Restart::Reboot,
+        ),
         // SN-10: hdmi-off is an action (MCP snd, the console), not a stored value, so it is not a choice here.
         def(
             "kernel.snd_output",
-            choice(&["auto", "jack", "hdmi", "usb"]),
+            choice(&[("auto", "Automatisch"), ("jack", "Klinke"), ("hdmi", "HDMI"), ("usb", "USB")]),
             text("auto"),
             "Wo der Ton spielt (auto folgt den Steckern; hdmi schaltet HDMI-Ton ein)",
             "Where sound plays (auto follows the plugs; hdmi turns HDMI sound on)",
@@ -257,7 +326,7 @@ pub fn own() -> Vec<KeyDef> {
         ),
         def(
             "settings.language",
-            choice(&["de", "en"]),
+            choice(&[("de", "Deutsch"), ("en", "Englisch")]),
             text("de"),
             "Sprache der Beschreibungen",
             "Language of the descriptions",

@@ -188,10 +188,6 @@ impl Trb {
     pub fn status_stage(dir_in: bool) -> Trb {
         Trb { param: 0, status: 0, control: (ty::STATUS as u32) << 10 | IOC | if dir_in { DIR_IN } else { 0 } }
     }
-    /// One Normal TRB with IOC and ISP (an interrupt IN transfer of `len` bytes).
-    pub fn normal_in(buf: u64, len: u32) -> Trb {
-        Trb::normal(buf, len, 0, true, true)
-    }
     /// A Normal TRB of a TD: `td_size` = packets left in the TD after this TRB (xHCI 4.11.2.4, at most 31);
     /// `last` gets IOC, every other one CH; IN TRBs get ISP so a short packet ends the TD with an event.
     pub fn normal(buf: u64, len: u32, td_size: u32, last: bool, dir_in: bool) -> Trb {

@@ -1,0 +1,69 @@
+# bubblewrap 0.13.1 test-run on Linux 7.3.0-4-cachyos, recorded by user/ports/bubblewrap/tests/record-host.sh
+ok 1 Help works
+ok 2 can bind-mount a FUSE directory with 
+ok 3 can mount /proc with 
+ok 4 can unshare network, create new /dev with 
+ok 5 cannot read /etc/shadow with 
+ok 6 cannot read /root/.bashrc with 
+ok 7 can bind-mount a FUSE directory with --unshare-user-try
+ok 8 can mount /proc with --unshare-user-try
+ok 9 can unshare network, create new /dev with --unshare-user-try
+ok 10 cannot read /etc/shadow with --unshare-user-try
+ok 11 cannot read /root/.bashrc with --unshare-user-try
+ok 12 can bind-mount a FUSE directory with --unshare-pid
+ok 13 can mount /proc with --unshare-pid
+ok 14 can unshare network, create new /dev with --unshare-pid
+ok 15 cannot read /etc/shadow with --unshare-pid
+ok 16 cannot read /root/.bashrc with --unshare-pid
+ok 17 can bind-mount a FUSE directory with --unshare-user-try --unshare-pid
+ok 18 can mount /proc with --unshare-user-try --unshare-pid
+ok 19 can unshare network, create new /dev with --unshare-user-try --unshare-pid
+ok 20 cannot read /etc/shadow with --unshare-user-try --unshare-pid
+ok 21 cannot read /root/.bashrc with --unshare-user-try --unshare-pid
+ok 22 --symlink works
+ok 23 --symlink is idempotent
+ok 24 --symlink doesn't overwrite a conflicting symlink
+ok 25 all expected devices were created
+ok 26 can run as pid 1
+ok 27 info and json-status fd
+ok 28 namespace id info in info and json-status fd
+ok 29 pre-exec failure doesn't include exit-code in json-status
+ok 30 exec failure doesn't include exit-code in json-status
+ok 31 can mount /proc recursively
+ok 32 can pivot to new rootfs recursively
+ok 33 can disable nested userns
+ok 34 error prefixing
+ok 35 empty path arguments are rejected
+ok 36 we have no caps as uid != 0
+ok 37 die with parent --die-with-parent
+ok 38 die with parent --die-with-parent --unshare-pid
+ok 39 we can parse arguments from a fd
+ok 40 we can run with --
+ok 41 we can run an inadvisable executable name with --
+ok 42 options like --dev-bind are defanged by --
+ok 43 bind-mount of / exposes real /tmp
+ok 44 bind-mount of /tmp exposes real /tmp
+ok 45 bind-mount of /tmp onto /mnt exposes real /tmp
+ok 46 we can mount another directory onto /tmp
+ok 47 we can mount another directory inside /tmp
+ok 48 Files and directories created as mount points have expected permissions
+ok 49 Can bind-mount a socket (/dev/log) onto a socket
+ok 50 Directories created explicitly have expected permissions
+ok 51 Directories created as parents have expected permissions
+ok 52 tmpfs has expected permissions
+ok 53 tmpfs has expected size
+ok 54 files have expected permissions
+ok 55 bogus tmpfs size not allowed
+ok 56 --perms and --size only allowed once
+ok 57 environment manipulation
+ok 58 argv0 manipulation
+ok 59 bind-fd
+ok 60 warning logged for redundant --chdir
+ok 61 --level-prefix
+ok 62 --overlay
+ok 63 --overlay path escaping
+ok 64 --tmp-overlay
+ok 65 --ro-overlay
+ok 66 --overlay-src restrictions
+ok 67 Accepts --not-a-security-boundary
+1..67

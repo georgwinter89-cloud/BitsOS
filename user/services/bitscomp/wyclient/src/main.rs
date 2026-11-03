@@ -12,7 +12,9 @@
 //! after start it stops answering pings (prints `ignoring pings` once) but keeps reading; `--stop MS`: at MS ms it
 //! prints `stopping` and stops itself with SIGSTOP (reads nothing any more); `--noread MS`: at MS ms it prints
 //! `not reading` and never reads its socket again, but keeps running (B4's bounded output queue);
-//! `--ignore-term`: ignores SIGTERM, so only SIGKILL ends it.
+//! `--ignore-term`: ignores SIGTERM, so only SIGKILL ends it. WY-13: `--drop-pong N` answers every ping but the
+//! N-th (prints `dropped pong of ping N` and, at the next ping it answers, `answered ping M after the drop`);
+//! `--wrong-pong` answers every ping with the serial plus one (prints `wrong pong for ping N`).
 //! WY-8: after every `configure W H` a line `states fullscreen=F maximized=M activated=A` (0/1, the xdg states of
 //! that configure). As a browser does it, F11 asks for fullscreen and back, Esc leaves fullscreen and F10 asks to
 //! be maximised and back; `--fullscreen` asks for it before the first commit (the first configure must then be
@@ -20,8 +22,18 @@
 //! the focus, or a hung one); `--unfullscreen` sends unset_fullscreen before the first commit; F9 asks 20 times for
 //! fullscreen and back at once (ends with back).
 //! WY-11: `--cursor NAME|hidden|surface` sets the pointer on every enter (`cursor`).
+//! WY-12: as Chromium does it, F8 (or `--minimize-at MS`, MS ms after start) sends set_minimized (`asked
+//! minimize`) and from then on draws nothing until a configure with `activated` comes; that one is drawn in the
+//! next colour (`resumed colour=RRGGBB`), so a test sees the frame after the restore on the screen.
+//! WY-12 fixer: `--minimized` sends set_minimized before the first commit (`asked minimize before commit`) and
+//! draws as usual (the compositor ignores it: nothing is on the screen yet).
+//! WY-16: `--dmabuf [--modifier HEX] [--syncobj [--acquire-delay MS] [--syncobj-break KIND]]`: the buffers are
+//! udmabuf dma-bufs, with explicit sync on request (`dma.rs`).
 
 mod cursor;
+mod dma;
+#[path = "../../src/drm_sync.rs"]
+mod drm_sync;
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
@@ -53,6 +65,11 @@ struct State {
     done: bool,
     anim: Option<Anim>,
     hang_at: Option<Instant>,
+    /// WY-13: the ping (counted from 1) whose pong is dropped, and the pings seen so far.
+    drop_pong: Option<u64>,
+    pings: u64,
+    /// WY-13 fixer: answers every ping with a wrong serial (a pong the compositor must not count).
+    wrong_pong: bool,
     ignoring: bool,
     top: Option<xdg_toplevel::XdgToplevel>,
     /// (fullscreen, maximized, activated) of the configure being received, then of the last one.
@@ -62,6 +79,10 @@ struct State {
     cursor: Option<String>,
     shape_mgr: Option<wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     cursor_surface: Option<wl_surface::WlSurface>,
+    /// WY-12: asked to be minimised and not activated since: no drawing.
+    minimized: bool,
+    /// WY-16: `--dmabuf`.
+    dma: Option<dma::Dma>,
 }
 
 /// `--animate`: two buffers, each used again only after its release.
@@ -147,13 +168,22 @@ impl State {
     fn frame(&mut self, qh: &QueueHandle<State>) {
         let (w, h) = self.size;
         let s = self.surface.clone().unwrap();
+        // WY-16: with explicit sync a buffer is free again once its release point has signalled.
+        let busy: Vec<usize> = self.anim.as_ref().unwrap().bufs.iter().enumerate().filter(|b| b.1.1).map(|b| b.0).collect();
+        for i in busy {
+            if self.dma.as_ref().is_some_and(|d| d.syncobj) && self.dma_released(i) {
+                self.anim.as_mut().unwrap().bufs[i].1 = false;
+            }
+        }
         let anim = self.anim.as_mut().unwrap();
         let free = (0..anim.bufs.len()).map(|i| (anim.next + i) % anim.bufs.len()).find(|&i| !anim.bufs[i].1);
         match free {
             Some(i) => {
                 anim.bufs[i].1 = true;
                 anim.next = i + 1;
-                s.attach(Some(&anim.bufs[i].0), 0, 0);
+                let b = anim.bufs[i].0.clone();
+                self.dma_points(i);
+                s.attach(Some(&b), 0, 0);
                 s.damage_buffer(0, 0, w, h);
             }
             None => anim.starved += 1,
@@ -171,7 +201,8 @@ impl State {
         if now >= anim.report_at {
             let n = anim.gaps_ms.len();
             let (p50, p99, max) = percentiles(&mut anim.gaps_ms);
-            println!("frames n={n} p50_ms={p50:.1} p99_ms={p99:.1} max_ms={max:.1} released={} starved={}", anim.released, anim.starved);
+            let sync = self.dma.as_ref().filter(|d| d.syncobj).map_or(String::new(), |d| format!(" sync_released={}", d.sync_released));
+            println!("frames n={n} p50_ms={p50:.1} p99_ms={p99:.1} max_ms={max:.1} released={} starved={}{sync}", anim.released, anim.starved);
             anim.gaps_ms.clear();
             anim.report_at = now + Duration::from_secs(2);
         }
@@ -179,6 +210,13 @@ impl State {
     }
 
     fn draw(&mut self, qh: &QueueHandle<State>) -> std::io::Result<()> {
+        if self.dma.is_some() {
+            return self.dma_request(if self.anim.is_some() { 2 } else { 1 }, qh);
+        }
+        self.draw_shm(qh)
+    }
+
+    fn draw_shm(&mut self, qh: &QueueHandle<State>) -> std::io::Result<()> {
         if self.anim.is_some() {
             let first = self.anim.as_ref().unwrap().bufs.is_empty();
             self.make_anim_buffers(qh)?;
@@ -217,13 +255,21 @@ fn main() {
     let mut title = "wyclient".to_string();
     let mut pattern = 0usize;
     let (mut animate, mut hang, mut stop, mut noread, mut ignore_term) = (false, None, None, None, false);
-    let (mut fullscreen, mut unfullscreen, mut fs_at) = (false, false, None);
+    let (mut fullscreen, mut unfullscreen, mut fs_at, mut min_at) = (false, false, None, None);
+    let mut minimized = false;
     let mut cursor = None;
+    let mut drop_pong = None;
+    let mut wrong_pong = false;
+    let mut dma: Option<dma::Dma> = None;
     let mut it = args.iter();
     let ms = |v: &String| v.parse::<u64>().ok().map(Duration::from_millis);
     while let Some(a) = it.next() {
         if a == "--animate" {
             animate = true;
+            continue;
+        }
+        if a == "--wrong-pong" {
+            wrong_pong = true;
             continue;
         }
         if a == "--ignore-term" {
@@ -238,6 +284,18 @@ fn main() {
             unfullscreen = true;
             continue;
         }
+        if a == "--minimized" {
+            minimized = true;
+            continue;
+        }
+        if a == "--dmabuf" {
+            dma.get_or_insert_with(Default::default);
+            continue;
+        }
+        if a == "--syncobj" {
+            dma.get_or_insert_with(Default::default).syncobj = true;
+            continue;
+        }
         match (a.as_str(), it.next()) {
             ("--title", Some(v)) => title = v.clone(),
             ("--pattern", Some(v)) => pattern = v.parse().unwrap_or(0),
@@ -245,9 +303,25 @@ fn main() {
             ("--stop", Some(v)) if ms(v).is_some() => stop = ms(v),
             ("--noread", Some(v)) if ms(v).is_some() => noread = ms(v),
             ("--fullscreen-at", Some(v)) if ms(v).is_some() => fs_at = ms(v),
+            ("--minimize-at", Some(v)) if ms(v).is_some() => min_at = ms(v),
+            ("--drop-pong", Some(v)) if v.parse::<u64>().is_ok_and(|n| n > 0) => drop_pong = v.parse().ok(),
+            ("--modifier", Some(v)) if u64::from_str_radix(v.trim_start_matches("0x"), 16).is_ok() => {
+                dma.get_or_insert_with(Default::default).modifier = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(0)
+            }
+            ("--acquire-delay", Some(v)) if ms(v).is_some() => dma.get_or_insert_with(Default::default).acquire_delay = ms(v),
+            ("--syncobj-break", Some(v)) if ["no-release", "shm", "conflict", "flood", "destroy-waiting"].contains(&v.as_str()) => {
+                let d = dma.get_or_insert_with(Default::default);
+                if v == "destroy-waiting" {
+                    d.acquire_delay = d.acquire_delay.or(Some(Duration::from_millis(1000)));
+                }
+                d.brk = Some(v.clone())
+            }
+            ("--dmabuf-bad", Some(v)) if ["stride", "memfd", "oversize"].contains(&v.as_str()) => {
+                dma.get_or_insert_with(Default::default).bad = Some(v.clone())
+            }
             ("--cursor", Some(v)) if ["hidden", "surface", "big"].contains(&v.as_str()) || cursor::shape(v).is_some() => cursor = Some(v.clone()),
             _ => {
-                eprintln!("usage: wyclient [--title T] [--pattern N] [--animate] [--hang MS] [--stop MS] [--noread MS] [--ignore-term] [--fullscreen] [--unfullscreen] [--fullscreen-at MS] [--cursor NAME|hidden|surface|big]");
+                eprintln!("usage: wyclient [--title T] [--pattern N] [--animate] [--hang MS] [--stop MS] [--noread MS] [--ignore-term] [--fullscreen] [--unfullscreen] [--fullscreen-at MS] [--minimize-at MS] [--minimized] [--cursor NAME|hidden|surface|big] [--drop-pong N] [--wrong-pong] [--dmabuf] [--modifier HEX] [--syncobj] [--acquire-delay MS] [--syncobj-break no-release|shm|conflict|flood|destroy-waiting] [--dmabuf-bad stride|memfd|oversize]");
                 std::process::exit(2);
             }
         }
@@ -274,7 +348,10 @@ fn main() {
     conn.display().get_registry(&qh, ());
     let mut st = State { colour: COLOURS[pattern % COLOURS.len()], size: (400, 300), ..State::default() };
     st.hang_at = hang.map(|d| start + d);
+    st.drop_pong = drop_pong;
+    st.wrong_pong = wrong_pong;
     st.cursor = cursor;
+    st.dma = dma;
     st.anim = animate.then(|| Anim {
         bufs: Vec::new(),
         next: 0,
@@ -293,6 +370,10 @@ fn main() {
         std::process::exit(1);
     };
     let surface = comp.create_surface(&qh, ());
+    st.surface = Some(surface.clone());
+    if st.dma.is_some() {
+        st.dma_setup(&conn, &mut queue, &qh);
+    }
     let xdg = wm.get_xdg_surface(&surface, &qh, ());
     let top = xdg.get_toplevel(&qh, ());
     top.set_title(title);
@@ -303,6 +384,10 @@ fn main() {
     if unfullscreen {
         top.unset_fullscreen();
     }
+    if minimized {
+        top.set_minimized();
+        println!("asked minimize before commit");
+    }
     st.top = Some(top);
     surface.commit();
     st.surface = Some(surface);
@@ -310,6 +395,7 @@ fn main() {
     println!("ready");
     let noread_at = noread.map(|d| start + d);
     let mut ask_at = fs_at.map(|d| start + d);
+    let mut minimize_at = min_at.map(|d| start + d);
     while !st.done {
         if noread_at.is_some_and(|t| Instant::now() >= t) {
             println!("not reading");
@@ -325,7 +411,11 @@ fn main() {
             top.set_fullscreen(None);
             println!("asked fullscreen (timer)");
         }
-        let r = match [noread_at, ask_at].into_iter().flatten().min() {
+        if minimize_at.is_some_and(|t| Instant::now() >= t) {
+            minimize_at = None;
+            st.ask_minimize();
+        }
+        let r = match [noread_at, ask_at, minimize_at].into_iter().flatten().min() {
             // Wake by the deadline even when nothing arrives.
             Some(t) => {
                 let _ = conn.flush();
@@ -353,7 +443,18 @@ fn main() {
 impl State {
     /// WY-8: the keys a browser keeps for itself (evdev codes): F11 fullscreen and back, Esc out of fullscreen,
     /// F10 maximised and back.
-    fn own_key(&self, key: u32) {
+    /// WY-12: set_minimized, then no drawing until `activated` comes again.
+    fn ask_minimize(&mut self) {
+        let Some(top) = &self.top else { return };
+        top.set_minimized();
+        self.minimized = true;
+        println!("asked minimize");
+    }
+
+    fn own_key(&mut self, key: u32) {
+        if key == 66 {
+            return self.ask_minimize();
+        }
         let Some(top) = &self.top else { return };
         let (fullscreen, maximized, _) = self.states;
         match key {
@@ -385,6 +486,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "xdg_wm_base" => st.wm = Some(reg.bind(name, 1, qh, ())),
                 "wl_seat" => st.seat = Some(reg.bind(name, version.min(5), qh, ())),
                 "wp_cursor_shape_manager_v1" => st.shape_mgr = Some(reg.bind(name, 1, qh, ())),
+                "zwp_linux_dmabuf_v1" if st.dma.is_some() => st.dma.as_mut().unwrap().global = Some(reg.bind(name, version.min(4), qh, ())),
+                "wp_linux_drm_syncobj_manager_v1" if st.dma.is_some() => {
+                    st.dma.as_mut().unwrap().sync_mgr = Some(reg.bind(name, 1, qh, ()))
+                }
                 _ => {}
             }
         }
@@ -400,6 +505,20 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
                     println!("ignoring pings");
                 }
                 return;
+            }
+            st.pings += 1;
+            if st.wrong_pong {
+                println!("wrong pong for ping {}", st.pings);
+                wm.pong(serial.wrapping_add(1));
+                return;
+            }
+            match st.drop_pong {
+                Some(n) if st.pings == n => {
+                    println!("dropped pong of ping {n}");
+                    return;
+                }
+                Some(n) if st.pings == n + 1 => println!("answered ping {} after the drop", st.pings),
+                _ => {}
             }
             wm.pong(serial);
         }
@@ -418,6 +537,15 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
             st.states = st.pending_states;
             let b = |v: bool| v as u8;
             println!("states fullscreen={} maximized={} activated={}", b(st.states.0), b(st.states.1), b(st.states.2));
+            if st.minimized {
+                if !st.states.2 {
+                    return;
+                }
+                st.minimized = false;
+                let next = COLOURS.iter().position(|c| *c == st.colour).map_or(0, |i| (i + 1) % COLOURS.len());
+                st.colour = COLOURS[next];
+                println!("resumed colour={:06x}", st.colour);
+            }
             if let Err(e) = st.draw(qh) {
                 eprintln!("wyclient: draw: {e}");
                 std::process::exit(1);
@@ -526,10 +654,15 @@ delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 
 impl Dispatch<wl_buffer::WlBuffer, u8> for State {
-    fn event(st: &mut Self, _: &wl_buffer::WlBuffer, ev: wl_buffer::Event, k: &u8, _: &Connection, _: &QueueHandle<Self>) {
+    fn event(st: &mut Self, buf: &wl_buffer::WlBuffer, ev: wl_buffer::Event, _: &u8, _: &Connection, _: &QueueHandle<Self>) {
+        // WY-16: found by the object (dma-bufs the compositor made all carry 0); with explicit sync only the
+        // release point frees a buffer (wl_buffer.release is undefined then), the event is just counted.
+        let explicit = st.dma.as_ref().is_some_and(|d| d.syncobj);
         if let (wl_buffer::Event::Release, Some(a)) = (ev, st.anim.as_mut()) {
             a.released += 1;
-            if let Some(b) = a.bufs.get_mut(*k as usize) {
+            if let Some(b) = a.bufs.iter_mut().find(|b| &b.0 == buf)
+                && !explicit
+            {
                 b.1 = false;
             }
         }

@@ -12,7 +12,8 @@ PORT=$((${BITSOS_PORT_LO:-31000} + 40))
 STAGE=${BRAVE_STAGE:-/var/tmp/claude-v2/stage/brave}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 BB=$ROOT/user/ports/busybox/out/busybox
-rm -rf "$RUN"; mkdir -p "$RUN"
+# Empties the run dir but keeps output.log (xtask fullrun writes this script's output there).
+mkdir -p "$RUN"; find "$RUN" -mindepth 1 -maxdepth 1 ! -name output.log -exec rm -rf {} +
 fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }

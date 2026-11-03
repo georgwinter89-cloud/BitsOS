@@ -240,12 +240,12 @@ grep -q "push: home: 2 files uploaded .*, 0 removed, 0 unchanged; /boot/BITSOS2/
 grep -q "into the user's home" "$RUN_DIR/home1.out" || fail "move_tree did not say it went into the home"
 for d in /boot/BITSOS2/home/.cobalt /boot/BITSOS2/home/.cobalt/storage; do owner_is "$d" 1000 0700; done
 for f in /boot/BITSOS2/home/.cobalt/storage/a.db /boot/BITSOS2/home/.cobalt/cache.bin; do owner_is "$f" 1000 0600; done
-CALL write_file '{"path":"/boot/BITSOS2/home/georg-keep.txt","text":"mine"}' > /dev/null || fail "cannot write into the home"
+CALL write_file '{"path":"/boot/BITSOS2/home/user-keep.txt","text":"mine"}' > /dev/null || fail "cannot write into the home"
 echo "profile b" > "$H/.cobalt/storage/a.db"
 "${PUSH[@]}" --tree "$H" --name Home. --home | tee "$RUN_DIR/home2.out" | grep -v "^  "
 grep -q "push: home: 1 files uploaded .*, 0 removed, 1 unchanged; .*files only on BitsOS kept" "$RUN_DIR/home2.out" || fail "second --home push"
 grep -q "^  remove " "$RUN_DIR/home2.out" && fail "--home planned a removal"
-CALL stat '{"path":"/boot/BITSOS2/home/georg-keep.txt"}' > /dev/null 2>&1 || fail "--home removed a file only the home had"
+CALL stat '{"path":"/boot/BITSOS2/home/user-keep.txt"}' > /dev/null 2>&1 || fail "--home removed a file only the home had"
 owner_is /boot/BITSOS2/home/.cobalt/storage/a.db 1000 0600
 head -c 1000 /dev/urandom >> "$H/.cobalt/cache.bin"
 "${PUSH[@]}" --file "$H/.cobalt/cache.bin" --to /boot/BITSOS2/home/.cobalt/cache.bin --home | tee "$RUN_DIR/home3.out" | grep -v "^  "
@@ -275,8 +275,8 @@ mkdir -p "$RUN_DIR/back"
 mcopy -s -i "$IMG" ::/BITSOS2/mcpushtest "$RUN_DIR/back/"
 diff -r "$T" "$RUN_DIR/back/mcpushtest" > "$RUN_DIR/diff.out" || { head "$RUN_DIR/diff.out"; fail "the package on the image differs from the tree"; }
 mcopy -s -i "$IMG" ::/BITSOS2/home "$RUN_DIR/back/"
-diff -r -x georg-keep.txt "$H" "$RUN_DIR/back/home" > "$RUN_DIR/diff-home.out" || { head "$RUN_DIR/diff-home.out"; fail "the home on the image differs from the tree"; }
-[ "$(mtype -i "$IMG" ::/BITSOS2/home/georg-keep.txt)" = mine ] || fail "georg-keep.txt is not on the image"
+diff -r -x user-keep.txt "$H" "$RUN_DIR/back/home" > "$RUN_DIR/diff-home.out" || { head "$RUN_DIR/diff-home.out"; fail "the home on the image differs from the tree"; }
+[ "$(mtype -i "$IMG" ::/BITSOS2/home/user-keep.txt)" = mine ] || fail "user-keep.txt is not on the image"
 mdir -b -i "$IMG" ::/BITSOS2 | grep -qi "\.push-\|mcpushw" && fail "a staging tree or the measurement package is left"
 mtype -i "$IMG" ::/EFI/BOOT/BOOTX64.EFI | cmp -s - "$RUN_DIR/loader.before" || fail "\\EFI\\BOOT\\BOOTX64.EFI changed"
 mtype -i "$IMG" ::/BITSOS2/CONFIG.TXT | cmp -s - "$RUN_DIR/config.before" || fail "CONFIG.TXT changed"

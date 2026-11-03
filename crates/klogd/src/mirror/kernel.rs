@@ -110,7 +110,9 @@ pub fn find_route(t: Target) -> Option<(RouteInfo, String)> {
     let s = list.get(pick.index)?;
     let (addr, _) = s.info.addr?;
     let card = net::netdev::by_name(&s.name)?;
-    Some((RouteInfo { card, src_ip: addr.0, src_mac: s.mac, dst_mac: wire::ETH_BROADCAST }, s.name.clone()))
+    // RB-15: the card's "everything sent", asked before the quiesce goes on (None: a card without one).
+    let done = klog::shutdown::tx_done_probe(&s.name);
+    Some((RouteInfo { card, src_ip: addr.0, src_mac: s.mac, dst_mac: wire::ETH_BROADCAST, done }, s.name.clone()))
 }
 
 fn bind() -> Result<alloc::boxed::Box<dyn UdpSocket>, NetError> {
@@ -212,7 +214,15 @@ fn run(m: &'static Mirror) {
             // Once only: the quiesce entry stays registered across stops and resumes.
             registered = true;
             devmodel::register_quiesce(Arc::new(MirrorQuiesce(m)));
+            // RB-15: the reboot and power-off paths pause it before the storage stop and the park.
+            klog::shutdown::set_mirror(m);
+            // RB-16: the breadcrumbs' wire store.
+            klog::crumb::set_wire(m);
         }
+        // RB-16: the mirror and the card it sends on are quiesced after every other device (the watchdog
+        // last), so each device's breadcrumb is on the listener before its quiesce runs.
+        devmodel::set_place("mirror", devmodel::Place::Transport);
+        devmodel::set_place(&l.ifname, devmodel::Place::Transport);
         klog::event!(
             Info,
             "klog",
@@ -246,7 +256,8 @@ fn run(m: &'static Mirror) {
 
 fn log_stop(r: StopReport) {
     if r.ended {
-        klog::event!(Info, "klog", "mirror.stopped", ended = true, frames = r.frames, dropped = r.dropped);
+        klog::event!(Info, "klog", "mirror.stopped", ended = true, frames = r.frames, dropped = r.dropped, card_done = r.done,
+            card_done_unknown = r.done_unknown);
     } else {
         klog::event!(
             Warn,
@@ -262,11 +273,24 @@ fn log_stop(r: StopReport) {
     }
 }
 
-/// 4. Follow the ring until a quiesce stops the mirror.
+/// 4. Follow the ring until a quiesce stops the mirror. While a reboot or power-off has it paused (RB-15) the
+/// thread sends nothing: the shutdown's steps send raw.
 fn follow(m: &'static Mirror, sock: &dyn UdpSocket) {
     let mut next_route = time::now_ns() + ROUTE_REFRESH_NS;
     let mut failing = false;
+    let mut paused = false;
     while m.is_live() {
+        if m.is_paused() {
+            if !paused {
+                paused = true;
+                klog::event!(Info, "klog", "mirror.paused"; "a shutdown sends the rest raw");
+            }
+            m.wait_kick(IDLE_NS);
+            continue;
+        }
+        if core::mem::take(&mut paused) {
+            klog::event!(Info, "klog", "mirror.unpaused");
+        }
         if time::now_ns() >= next_route {
             next_route = time::now_ns() + ROUTE_REFRESH_NS;
             let r = find_route(m.target());

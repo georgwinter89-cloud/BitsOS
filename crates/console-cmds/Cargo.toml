@@ -21,3 +21,6 @@ hda = { path = "../drivers/hda" }
 # IN-6: the pointer-over-a-program ktest with a real fbdev program (DP's fb0 node owner, the screen's picture).
 display = { path = "../display" }
 gopfb = { path = "../drivers/gopfb" }
+
+[lints]
+workspace = true

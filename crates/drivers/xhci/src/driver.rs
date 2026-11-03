@@ -2,14 +2,15 @@
 //! `mm::dma`, `time` clock, PCI bus master), per controller an event thread, a completion thread and a hotplug
 //! worker, and the poller.
 //!
-//! Polled for now (no MSI-X before PC-3): the poller (`hal::vectors::register_poller`, called from the idle loop)
+//! Polled for now: the poller (`hal::vectors::register_poller`, called from the idle loop)
 //! only looks whether an event ring has something, notes the time (`Controller::interrupt`: the input stamp) and
 //! wakes that controller's event thread (class KernelRt since US-ev, B4: it drains the ring, hands pipe reports
 //! to their sinks, sleeps with a 100 ms deadline and checks the controller's health on each round). Transfer ends
 //! (usb-msd's chained callbacks) go to the `{name}-done` thread (class Normal), so input never waits behind
-//! storage work and storage work never runs at KernelRt. PC-3 replaces the
-//! poller by MSI-X: interrupter 0 is prepared (IMOD set at start), the vector's handler calls
-//! `Controller::interrupt`, which wakes the same thread. The hotplug worker (class Normal) sleeps until a port
+//! storage work and storage work never runs at KernelRt. PC-3's `alloc_irqs` exists now, but the switch to MSI-X
+//! is an open US item (C1 left it for a wave with a Mini-PC check: it changes the keyboard's path): interrupter 0
+//! is prepared (IMOD set at start), the vector's handler is to call `Controller::interrupt`, which wakes the same
+//! thread, with the poller kept as the fallback (as nvme's `nvme_irq=off`). The hotplug worker (class Normal) sleeps until a port
 //! change, a hub report or a debounce deadline wakes it (at most `HOTPLUG_TICK_NS`).
 //!
 //! PCI (PC-2, V1 `xhcipci.asm` order): `disable_device` first (MSI/MSI-X and bus master off: a controller a
@@ -115,6 +116,17 @@ pub fn controllers() -> Vec<Arc<Xhci>> {
     CONTROLLERS.lock().clone()
 }
 
+/// RB-13 (the panic path's function here, granted to RB): `Controller::panic_stop` on every controller in probe
+/// order, `each` told the name and the result; returns how many. Walks `PANIC_LIST`, not `CONTROLLERS` (a CPU
+/// the panic stopped may hold that lock for good, e.g. an idle CPU in `poll_all`). `now` is the panic path's
+/// TSC clock. No lock, heap, klog or sleep.
+pub fn panic_stop_all(now: &dyn Fn() -> u64, each: &mut dyn FnMut(&str, crate::hc::PanicStop)) -> usize {
+    PANIC_LIST.for_each(&mut |c| each(c.name.as_str(), c.panic_stop(now)))
+}
+
+/// Every probed controller, for `panic_stop_all` (RB-13 fixer: lock-free, filled next to `CONTROLLERS`).
+static PANIC_LIST: crate::hc::PanicList<Arc<Xhci>> = crate::hc::PanicList::new();
+
 /// MSI/MSI-X and bus master off, then D0, memory decoding, INTx off (bus master only after the reset).
 fn prepare_pci(f: &pci::PciFunction) -> Result<(), String> {
     f.disable_device_logged();
@@ -159,8 +171,10 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
     }
     let c = Arc::new(Controller::new(name.clone(), env, caps, ext).with_quirks(quirks));
     list.push(c.clone());
+    PANIC_LIST.add(c.clone());
     drop(list);
     devmodel::register_quiesce(c.clone());
+    crate::shutdown::register_once();
     // B4 (US-ev): the event ring and pipe reports (input) on KernelRt; transfer ends (usb-msd's callbacks) on a
     // Normal thread of their own, so input never waits behind storage and storage never runs at KernelRt.
     let t = c.clone();

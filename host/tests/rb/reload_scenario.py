@@ -32,6 +32,7 @@ import time
 SELFTEST = sys.argv[1:2] == ["--selftest"]
 if not SELFTEST:
     PORT, TOKEN, LOG, BUNDLES, GUEST_HTTP = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+    RB18_PSK = os.environ["RB18_PSK"]
     CPUS = int(sys.argv[6]) if len(sys.argv) > 6 else 1
 else:
     LOG = os.devnull
@@ -210,6 +211,9 @@ def reload_once(c, k, base_files, hz0, expect_counter, keys=(), source="unchange
     need(rc and rc.group(1) == source, f"reload {k}: CONFIG.TXT read from the stick again before the jump (source={rc.group(1) if rc else '?'}, want {source})")
     need(int(m.group(1)) == expect_counter and "igc" in m.group(2) and "xhci" in m.group(2),
          f"reload {k}: jump with counter {expect_counter}, igc and xhci quiesced ({m.group(2)})")
+    # RB-14: storage was stopped (every disk drained and flushed, usb-msd and xHCI idle) before the jump.
+    need(re.search(r"\bstorage_quiet=true\b", m.group(9)) and re.search(r"block shutdown\.done why=\"?reload\"? .*quiet=true", serial()[start:pos]),
+         f"reload {k}: storage quiet before the jump (block shutdown.done why=reload quiet=true, storage_quiet=true)")
     o = CPUS - 1
     stopped = tuple(int(m.group(i)) for i in range(3, 9))
     need(stopped == (o, o, 0, o, o, 0), f"reload {k}: {o} APs parked by IPI, halted and sent INIT "
@@ -257,7 +261,20 @@ def reload_once(c, k, base_files, hz0, expect_counter, keys=(), source="unchange
          f"reload {k}: TSC re-check against the HPET logged only ({m.group(1)}, {m.group(4)} ppm over {m.group(5)} ms)" if m else
          f"reload {k}: TSC re-check line", t)
     need(newest_after(logged(c, "time", "tsc.rehandover"), s0) is None, f"reload {k}: no rate change under QEMU")
+    secrets_out_of_the_record(c, f"reload {k}")
     return c, pos
+
+
+def secrets_out_of_the_record(c, where):
+    """RB-18: the token and the (made-up) passphrase were blanked in this kernel's CONFIG record, read from RAM by
+    kernel.config.secret, and the passphrase still reached the take-once store (the summary names it)."""
+    err, t = call(c, "ktest", {"filter": "kernel.config.secret", "timeout_ms": 60000})
+    need(not err and "passed=1" in t, f"{where}: kernel.config.secret green", t)
+    err, t = call(c, "reload_info")
+    need(not err and "(2 secret values blanked)" in t, f"{where}: two secret values blanked in the record", t)
+    starts = logged(c, "kernel", "start")
+    v = newest_after(logged(c, "kernel", "config"), starts[-1][0])
+    need(v and "wlan_psk=***" in v and "token=***" in v, f"{where}: both secrets arrived from CONFIG.TXT", v)
 
 
 def free_mb(text):
@@ -276,6 +293,7 @@ def main():
     m = re.search(r"smp (?:done|not_started) (\S.*)", boot)
     need(m and (CPUS == 1 or f"cpus={CPUS} " in m.group(1)), f"first boot: {CPUS} CPUs online", m.group(0) if m else "no smp line")
     print(f"first boot: {base_files} initramfs files, TSC {hz0} Hz, {free0} MiB free, {CPUS} CPUs", flush=True)
+    secrets_out_of_the_record(c, "first boot")
 
     # Refusals over MCP: wrong scheme, not LAN, a dry run that fetches and checks but stays.
     err, t = call(c, "reload", {"url": f"ftp://10.0.2.2:{GUEST_HTTP}/1/"})
@@ -326,10 +344,12 @@ def main():
     need(not err and "passed=1" in t, "squeezed the running kernel's free memory", t)
     err, t = call(c, "reload_info")
     m = re.search(r"free for a Reload now: (\d+) MiB", t)
-    # 20-reload.sh squeezes to rb_squeeze_mb=256 (40 until wave 2, 128 until wave 4, 192 until INT-W15: the test
-    # bundle's initramfs grew to ~26 MB, then ~46 MB with WY-1b's foot, then ~77 MB with WY-11's Adwaita cursor
-    # theme, and it must fit in one piece among the squeeze's leftovers).
-    need(m and int(m.group(1)) < 264, f"reload_info: only {m.group(1) if m else '?'} MiB to spare", t)
+    # 20-reload.sh squeezes to rb_squeeze_mb=$RB_SQUEEZE_MB, 384 (40 until wave 2, 128 until wave 4, 192 until
+    # INT-W15, 256 until INT-W27b: the test bundle's initramfs grew to ~26 MB, then ~46 MB with WY-1b's foot, ~77 MB
+    # with WY-11's Adwaita cursor theme, ~92 MB with SX-3b's bwrap and the whole glibc set, and it must fit in one
+    # piece among the squeeze's leftovers).
+    squeeze = int(os.environ.get("RB_SQUEEZE_MB", "384"))
+    need(m and int(m.group(1)) < squeeze + 8, f"reload_info: only {m.group(1) if m else '?'} MiB to spare", t)
     c, pos = reload_once(c, 11, base_files, hz0, 11)
     after = free_mb(serial()[serial().rfind("BitsOS V2 kernel: entry"):])
     need(abs(after - free0) <= 16, f"under pressure: the new kernel has {after} MiB free again (first boot {free0})")
@@ -347,6 +367,7 @@ def main():
     err, t = call(c, "version")
     need(not err and "BitsOS V2" in t, "MCP still answers", t)
     need(TOKEN not in serial(), "the token never appears in the log (R8i)")
+    need(RB18_PSK not in serial(), "the passphrase never appears in the log (RB-18)")
     print(f"rb reload: green (refusals, dry run, 10 reloads (settingsd's CONFIG.TXT keys written before 2 and 6 handed on) with igb + xhci and {CPUS} CPUs, one under memory pressure, one refused for memory)")
 
 

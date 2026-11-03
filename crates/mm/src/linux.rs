@@ -98,6 +98,8 @@ pub fn plan_madvise(start: u64, len_in: u64, behavior: u64) -> Result<Option<(u6
 }
 
 /// Linux's window for `MAP_32BIT` (x86-64: the second GiB).
+/// MM-13: the alignment of anonymous mappings whose length is a multiple of it.
+const HUGE: u64 = crate::thp::HPAGE_PMD_SIZE;
 const MAP_32BIT_LO: u64 = 0x4000_0000;
 const MAP_32BIT_HI: u64 = 0x8000_0000;
 
@@ -170,6 +172,9 @@ pub struct MmapPlan {
     /// Linux VM_ACCOUNT: a private writable mapping, charged to the commit (MAP_NORESERVE ignored, mode 2).
     /// File mappings: decided after the file check (`MAP_SHARED_VALIDATE` is shared too).
     pub account: bool,
+    /// MAP_STACK: VM_NOHUGEPAGE (Linux since 6.7, CachyOS); MAP_GROWSDOWN: VM_GROWSDOWN. Both: no fault-around.
+    pub nohugepage: bool,
+    pub growsdown: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,7 +249,14 @@ impl Space {
         if (off >> 12).checked_add(len >> 12).is_none() {
             return Err(Errno::Overflow);
         }
-        let start = self.place(hint, len, fixed, flags & MAP_32BIT != 0)?;
+        // MM-13: Linux since 6.7 (CachyOS 7.x, checked on the host: lengths that are 2 MiB multiples only, MAP_STACK
+        // and MAP_NORESERVE too, PR_SET_THP_DISABLE and the THP mode do not matter) gives private anonymous mappings
+        // without an address a 2 MiB-aligned start (`__get_unmapped_area` -> `thp_get_unmapped_area_vmflags`).
+        let thp_align = !file && !fixed && addr == 0 && flags & (MAP_TYPE | MAP_32BIT) == MAP_PRIVATE && len.is_multiple_of(HUGE);
+        let start = match thp_align.then(|| self.place_huge(len)).flatten() {
+            Some(s) => s,
+            None => self.place(hint, len, fixed, flags & MAP_32BIT != 0)?,
+        };
         if start > TASK_SIZE - len {
             return Err(Errno::NoMem);
         }
@@ -267,7 +279,18 @@ impl Space {
         };
         let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE;
         let prot = Prot::from_linux(prot);
-        Ok(MmapPlan { addr: start, len, prot, replaces: overlaps, populate, shared, account: !shared && prot.write })
+        let (nohugepage, growsdown) = (flags & MAP_STACK != 0, flags & MAP_GROWSDOWN != 0);
+        Ok(MmapPlan { addr: start, len, prot, replaces: overlaps, populate, shared, account: !shared && prot.write, nohugepage, growsdown })
+    }
+
+    /// MM-13: `__thp_get_unmapped_area` (linux-6.6/mm/huge_memory.c:632, used for anonymous memory since 6.7):
+    /// the top-down search asks for 2 MiB more and the mapping takes the first 2 MiB boundary of the gap found,
+    /// or the gap's top when its start is aligned already. None: no such gap, the plain search decides.
+    fn place_huge(&self, len: u64) -> Option<u64> {
+        let pad = len.checked_add(HUGE).filter(|&p| p <= TASK_SIZE - MMAP_MIN_ADDR)?;
+        let ret = self.tree.gap_topdown(pad, MMAP_MIN_ADDR, self.mmap_top)?;
+        let off_sub = ret.wrapping_neg() & (HUGE - 1);
+        Some(if off_sub == 0 { ret + HUGE } else { ret + off_sub })
     }
 
     /// `__get_unmapped_area` + `arch_get_unmapped_area_topdown`.
@@ -305,7 +328,7 @@ impl Space {
         if plan.replaces {
             self.commit_munmap(plan.addr, end)?;
         }
-        let flags = VmaFlags { account: plan.account, ..VmaFlags::default() };
+        let flags = VmaFlags { account: plan.account, nohugepage: plan.nohugepage, growsdown: plan.growsdown, ..VmaFlags::default() };
         self.tree.insert(Vma { start: plan.addr, end, prot: plan.prot, kind, file, flags }).map_err(|_| Errno::NoMem)?;
         if plan.account {
             self.committed += plan.len / PAGE;

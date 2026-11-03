@@ -24,7 +24,7 @@ const FLIPPACE: &str = "/bin/abi-flippace";
 fn edid_rate() -> TestResult {
     let t = Arc::new(RamTarget::new(640 * 480 * 4, 0));
     let d = GopFb::new(t, 640, 480, 640, Layout::Bgrx, "ram").map_err(|e| format!("{e:?}"))?;
-    kassert!(d.vblank_rate() == (60_000, 16_666_666, RefreshSource::Default) && d.current_mode().refresh_mhz == 0, "{:?}", d.vblank_rate());
+    kassert!(d.vblank.rate() == (60_000, 16_666_666, RefreshSource::Default) && d.current_mode().refresh_mhz == 0, "{:?}", d.vblank.rate());
     // VGA 640x480: 25.175 MHz (stored as 25.17), 800 x 525.
     let vga = sample::dtd(2517, 640, 160, 480, 45, 16, 96, 10, 2, 0x18);
     let fhd = sample::dtd(14850, 1920, 280, 1080, 45, 88, 44, 4, 5, 0x1e);
@@ -36,11 +36,11 @@ fn edid_rate() -> TestResult {
     // 640x480 at 59.93 Hz in the base block and at 72.81 Hz (31.5 MHz, 832 x 520) after it: GOP may run either.
     let vga72 = sample::dtd(3150, 640, 192, 480, 40, 24, 40, 9, 3, 0x18);
     kassert!(!d.apply_edid(&sample::edid(&[vga, vga72], 0)), "an EDID with two rates at 640x480 was taken");
-    kassert!(d.vblank_rate().2 == RefreshSource::Default, "a refused EDID changed the rate: {:?}", d.vblank_rate());
+    kassert!(d.vblank.rate().2 == RefreshSource::Default, "a refused EDID changed the rate: {:?}", d.vblank.rate());
     let before = d.last_vblank();
     kassert!(d.apply_edid(&sample::edid(&[fhd, vga], 0)), "the 640x480 timing was not found");
     // 25,170,000 / (800 * 525) = 59.9286 Hz; 420,000 / 25.17 MHz = 16,686,532.38 ns.
-    kassert!(d.vblank_rate() == (59_929, 16_686_532, RefreshSource::Edid), "EDID rate {:?}", d.vblank_rate());
+    kassert!(d.vblank.rate() == (59_929, 16_686_532, RefreshSource::Edid), "EDID rate {:?}", d.vblank.rate());
     kassert!(d.current_mode().refresh_mhz == 59_929);
     kassert!(d.last_vblank().sequence >= before.sequence, "the sequence went back at the switch");
     let a = d.last_vblank();
@@ -49,10 +49,10 @@ fn edid_rate() -> TestResult {
     kassert!((b.time_ns - a.time_ns) % 16_686_532 == 0 && b.sequence > a.sequence, "vblanks {a:?} -> {b:?} not on the EDID period");
     let cfg = |k: &str| (k == "display_refresh").then(|| String::from("59.95"));
     d.apply_config(&cfg);
-    kassert!(d.vblank_rate() == (59_950, 16_680_567, RefreshSource::Config), "CONFIG over EDID: {:?}", d.vblank_rate());
+    kassert!(d.vblank.rate() == (59_950, 16_680_567, RefreshSource::Config), "CONFIG over EDID: {:?}", d.vblank.rate());
     // An EDID that comes after CONFIG (another boot order, a Reload) does not replace the explicit rate.
     kassert!(!d.apply_edid(&sample::edid(&[vga], 0)), "an EDID replaced CONFIG");
-    kassert!(d.vblank_rate() == (59_950, 16_680_567, RefreshSource::Config), "EDID after CONFIG: {:?}", d.vblank_rate());
+    kassert!(d.vblank.rate() == (59_950, 16_680_567, RefreshSource::Config), "EDID after CONFIG: {:?}", d.vblank.rate());
     Ok(())
 }
 ktest!("dp.pacing.edid", Safe, edid_rate);

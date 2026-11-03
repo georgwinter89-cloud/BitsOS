@@ -55,8 +55,9 @@ pub struct Model {
 }
 
 pub const FAVOURITES: &str = "desktop.favourites";
-/// The mock-up's accent swatches (Details.dc.html), lower case as settingsd stores colours.
-pub const SWATCHES: [&str; 4] = ["#00e5ff", "#ffb020", "#b388ff", "#3ddc97"];
+/// The accent swatches, lower case as settingsd stores colours: design v2's moss green (the default, INT-D1) first,
+/// then the mock-up's (Details.dc.html) cyan, amber and violet (its mint green is too close to the moss).
+pub const SWATCHES: [&str; 4] = ["#7fcfa0", "#00e5ff", "#ffb020", "#b388ff"];
 pub const SCALE_STEP: i64 = 25;
 
 /// German address words and the key words they stand for (desktop.md §1a: German words, English accepted).

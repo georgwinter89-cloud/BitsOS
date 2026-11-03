@@ -220,14 +220,11 @@ impl Device {
         if let Some(s) = run.safety
             && (s.powered_off || s.was_master)
         {
-            log.push(DevEvent::new(
-                Level::Warn,
-                "chip.found_on",
-                format!(
-                    "the chip was left on (bus master {}, MAC state {}): switched off first",
-                    s.was_master, s.mac_state
-                ),
-            ));
+            // a handled state (a Reload or a warm boot left the chip on), not a fault (WL-9)
+            log.push(events::found_on(format!(
+                "the chip was left on (bus master {}, MAC state {}): switched off first",
+                s.was_master, s.mac_state
+            )));
         }
         at(Stage::Firmware, run.partial_init(bus, fw))?;
         at(Stage::Firmware, run.fwdl_look(bus))?;
@@ -440,10 +437,10 @@ fn drain_parts(
     rfk2: &mut Rfk2State,
     log: &mut Vec<DevEvent>,
 ) {
-    events::module(log, "btc.event", btc.take_events());
-    events::module(log, "chan.event", chan.take_events());
-    events::module(log, "rfk.event", rfk.take_events());
-    events::module(log, "rfk2.event", rfk2.take_events());
+    events::part(log, "btc.event", btc.take_events());
+    events::part(log, "chan.event", chan.take_events());
+    events::part(log, "rfk.event", rfk.take_events());
+    events::part(log, "rfk2.event", rfk2.take_events());
 }
 
 /// aa:bb:cc:dd:ee:ff

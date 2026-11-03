@@ -5,7 +5,7 @@
 // served initramfs (size and FNV-1a 64). --count N does that N times in a row, with the time of each round.
 //
 //   node reload.mjs <BitsOS host[:port]> [--name <n>] [--no-build] [--kernel <file> --initrd <file>]
-//        [--bind <address>] [--port <p>] [--me <address>] [--count N] [--back-s S] [--token-file <path>]
+//        [--bind <address>] [--port <p>] [--me <address>] [--count N] [--back-s S] [--token-file <path>] [--tls <key store>|auto]
 //
 // --name: the image name for `cargo xtask image` (default reload); --no-build serves what the last build of
 // that name left in target/xtask/esp-<n>/BITSOS2/SYS/<newest>/; --kernel/--initrd serve given files instead.
@@ -33,7 +33,7 @@ function fail(why, code = 1) {
 }
 
 const opts = {}, rest = [];
-const FLAGS = ['--name', '--kernel', '--initrd', '--bind', '--port', '--me', '--count', '--back-s', '--token-file'];
+const FLAGS = ['--name', '--kernel', '--initrd', '--bind', '--port', '--me', '--count', '--back-s', '--token-file', '--tls'];
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (FLAGS.includes(a)) opts[a.slice(2)] = process.argv[++i] ?? '';
@@ -42,7 +42,7 @@ for (let i = 2; i < process.argv.length; i++) {
 }
 const [host] = rest;
 if (!host || rest.length > 1 || Boolean(opts.kernel) !== Boolean(opts.initrd)) {
-  fail('usage: node reload.mjs <host[:port]> [--name n] [--no-build] [--kernel F --initrd F] [--bind A] [--port P] [--me A] [--count N] [--back-s S] [--token-file F]', 2);
+  fail('usage: node reload.mjs <host[:port]> [--name n] [--no-build] [--kernel F --initrd F] [--bind A] [--port P] [--me A] [--count N] [--back-s S] [--token-file F] [--tls DIR|auto]', 2);
 }
 const name = opts.name ?? 'reload';
 const port = Number(opts.port ?? 25410);
@@ -112,7 +112,7 @@ async function startFacts(session) {
 
 let session;
 try {
-  session = await connect(host, { token });
+  session = await connect(host, { token, tls: opts.tls, tokenFile: opts['token-file'] });
 } catch (e) {
   if (!(e instanceof McpError)) throw e;
   server.close();
@@ -142,7 +142,7 @@ for (let round = 1; round <= count; round++) {
   while (!back && Date.now() - tWait < backMs) {
     await sleep(500);
     try {
-      const s = await connect(host, { token, ms: 3000 });
+      const s = await connect(host, { token, ms: 3000, tls: opts.tls, tokenFile: opts['token-file'] });
       const f = await startFacts(s);
       // INT-W7: `version` and `reload_info` are two requests; the old kernel may still answer the first while it
       // writes back before its jump (seen once: version from the old start, counter from the new). Once the
@@ -150,6 +150,7 @@ for (let round = 1; round <= count; round++) {
       if (f.counter !== before.counter) back = { s, f: await startFacts(s) };
     } catch (e) {
       if (e instanceof McpError && e.kind === 'token') { server.close(); fail(`round ${round}: the new kernel refuses the token: ${e.message}`); }
+      if (e instanceof McpError && e.kind === 'pin') { server.close(); fail(`round ${round}: ${e.message}`); }
     }
   }
   if (!back) { server.close(); fail(`round ${round}: BitsOS did not answer MCP with a new start within ${backMs / 1000} s (fetched: ${fetches.join(', ') || 'nothing'})`); }

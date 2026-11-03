@@ -1,0 +1,6 @@
+chdir(/) = 0
+thread: unshare(CLONE_FS) = 0
+thread: chdir(/proc) = 0
+thread: umask(027) was 022
+exec: getcwd /proc, umask 027
+child: exit 0

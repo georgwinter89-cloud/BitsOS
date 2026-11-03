@@ -4,8 +4,8 @@
 //! SIGHUP when the session leader is gone).
 //!
 //! The console sits below `proc`, so it reaches processes through `Procs`, installed by `console-cmds` (above
-//! `proc`). Until AB-6's signal delivery, a signal reaches a process through `Process::send_signal` (AB-3: default
-//! actions; a handled signal stays pending until AB-6 delivers it). "The caller's controlling terminal is this
+//! `proc`). A signal reaches a process through `Process::send_signal` (default actions, or the handler at the
+//! process's next return to user mode). "The caller's controlling terminal is this
 //! tty" is "the caller's session is the tty's session" (Linux keeps it per process; only TIOCNOTTY by a non-leader
 //! differs, see `notty`). With IN-7's ptys there are several terminals; a session holds at most one of them
 //! (`pty::session_has_tty`, checked by TIOCSCTTY and the slave's open).
@@ -73,6 +73,11 @@ pub trait Procs: Sync {
     /// A member of `pgrp` finished a group stop (SIGSTOP and friends).
     fn pgrp_stopped(&self, _pgrp: u32) -> bool {
         false
+    }
+    /// IN-8: who is calling, for the per-program latency summary: its process's pid and the calling thread's comm
+    /// (`TASK_COMM_LEN` bytes, NUL-padded, as `/proc/<tid>/comm`); None in kernel threads.
+    fn reader(&self) -> Option<(u32, [u8; 16])> {
+        None
     }
 }
 

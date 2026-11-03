@@ -79,8 +79,9 @@ fn pid_files() -> TestResult {
         let dir = format!("/proc/{pid}");
         let names: Vec<String> = ns.list_dir(&dir).map_err(|e| format!("list {dir}: {e}"))?.into_iter().map(|(n, _)| String::from_utf8_lossy(&n).into_owned()).collect();
         let want = [
-            "task", "fd", "fdinfo", "environ", "auxv", "status", "personality", "limits", "comm", "cmdline", "stat", "statm", "maps", "mem", "cwd", "root",
-            "exe", "mounts", "mountinfo", "smaps", "smaps_rollup", "cgroup", "oom_score", "oom_score_adj",
+            "task", "fd", "fdinfo", "ns", "net", "environ", "auxv", "status", "personality", "limits", "comm", "cmdline", "stat", "statm", "maps", "mem", "cwd",
+            "root", "exe", "mounts", "mountinfo", "smaps", "smaps_rollup", "cgroup", "oom_score", "oom_score_adj", "uid_map", "gid_map", "projid_map",
+            "setgroups",
         ];
         kassert!(names.iter().map(String::as_str).eq(want.iter().copied()), "{dir} lists {names:?}");
         let stat = text(&format!("{dir}/stat"))?;

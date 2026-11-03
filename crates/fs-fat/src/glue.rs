@@ -25,10 +25,20 @@ fn time(secs: i64) -> Time {
 /// The desktop user that owns `\BITSOS2\home\` (YT-2), like a vfat mount with uid=1000,gid=1000.
 pub const HOME_OWNER: Cred = Cred { uid: 1000, gid: 1000 };
 
-/// The umask a node shows: 022 (Linux vfat's default), below `\BITSOS2\home\` dmask 077 / fmask 177
+/// Who owns a node of class `c` and whether it is kept to its owner (dmask 077 / fmask 177): `\BITSOS2\home\`
+/// is the desktop user's, `\BITSOS2\mcp\` root's alone (INT-W17, MC-8b CR 3: the TLS key, pairings, grants).
+fn keep(c: Class) -> (Cred, bool) {
+    match c {
+        Class::Home => (HOME_OWNER, true),
+        Class::Private => (Cred::ROOT, true),
+        _ => (Cred::ROOT, false),
+    }
+}
+
+/// The umask a node shows: 022 (Linux vfat's default), for a kept class dmask 077 / fmask 177
 /// (linux-6.6/fs/fat/inode.c:518 `fat_make_mode` with those mount options).
-fn mask(home: bool, dir: bool) -> u32 {
-    match (home, dir) {
+fn mask(kept: bool, dir: bool) -> u32 {
+    match (kept, dir) {
         (false, _) => 0o022,
         (true, true) => 0o077,
         (true, false) => 0o177,
@@ -37,16 +47,17 @@ fn mask(home: bool, dir: bool) -> u32 {
 
 /// The inode of a FAT node: directories 0755, files 0755 (programs in `\BITSOS2\bin` run), 0555 with the
 /// read-only attribute (Linux vfat with the default umask 022 shows the same). Below `\BITSOS2\home\`: owner
-/// 1000:1000, directories 0700, files 0600 (0400 read-only).
+/// 1000:1000, directories 0700, files 0600 (0400 read-only); below `\BITSOS2\mcp\` the same modes, owner root.
 pub fn inode_of(vol: &Arc<Volume>, c: &Child) -> Arc<Inode> {
-    let m = mask(c.home, c.dir);
+    let (owner, kept) = keep(c.class);
+    let m = mask(kept, c.dir);
     let (mode, data) = if c.dir {
         (uapi::S_IFDIR | (0o777 & !m), Data::Dir)
     } else {
-        let perm = if c.home { 0o666 } else { 0o777 } & !m & if c.read_only { !0o222 } else { !0 };
+        let perm = if kept { 0o666 } else { 0o777 } & !m & if c.read_only { !0o222 } else { !0 };
         (uapi::S_IFREG | perm, Data::External(Box::new(Ops(FatFile::new(vol.clone(), c.ino, c.size)))))
     };
-    let i = Inode::new(c.ino, mode, if c.home { HOME_OWNER } else { Cred::ROOT }, data);
+    let i = Inode::new(c.ino, mode, owner, data);
     i.meta.set_times(time(c.atime), time(c.mtime), time(c.mtime), time(c.ctime));
     i
 }
@@ -75,16 +86,16 @@ impl FatOps {
         let mut work = alloc::vec![moved.clone()];
         while let Some(d) = work.pop() {
             let Ok(class) = self.vol.class(d.inode.meta.ino) else { continue };
-            let (home, dir) = (class == Class::Home, d.is_dir());
+            let dir = d.is_dir();
+            let (owner, kept) = keep(class);
             let m = &d.inode.meta;
-            let owner = if home { HOME_OWNER } else { Cred::ROOT };
             let ro = !dir && m.mode() & 0o200 == 0;
-            let base: u32 = if dir || !home { 0o777 } else { 0o666 };
-            let perm = base & !mask(home, dir) & if ro { !0o222 } else { !0 };
+            let base: u32 = if dir || !kept { 0o777 } else { 0o666 };
+            let perm = base & !mask(kept, dir) & if ro { !0o222 } else { !0 };
             if m.uid() != owner.uid || m.gid() != owner.gid || m.mode() & 0o7777 != perm {
                 m.set_owner(owner.uid, owner.gid);
                 m.set_perm(perm);
-                klog::event!(Debug, "fat", "rename.reowner", ino = m.ino, home = home, mode = perm);
+                klog::event!(Debug, "fat", "rename.reowner", ino = m.ino, class = class.as_str(), mode = perm);
             }
             if dir {
                 work.extend(d.cached_children());
@@ -181,17 +192,17 @@ impl vfs::FsOps for FatOps {
     /// rounded as FAT keeps them (ctime follows mtime, a ctime-only change is ignored; the root's times stay).
     fn setattr(&self, d: &Dentry, a: &mut SetAttr) -> Result<(), i64> {
         let ino = d.inode.meta.ino;
-        let home = self.vol.class(ino)? == Class::Home;
-        let owner = if home { HOME_OWNER } else { Cred::ROOT };
+        let class = self.vol.class(ino)?;
+        let (owner, kept) = keep(class);
         if (a.valid & ATTR_UID != 0 && a.uid != owner.uid) || (a.valid & ATTR_GID != 0 && a.gid != owner.gid) || (a.valid & ATTR_MODE != 0 && a.mode & !0o777 != 0) {
-            klog::event!(Debug, "fat", "setattr.eperm", ino = ino, valid = a.valid, home = home; "vfat keeps its fixed owner and no suid/sgid/sticky bits");
+            klog::event!(Debug, "fat", "setattr.eperm", ino = ino, valid = a.valid, class = class.as_str(); "vfat keeps its fixed owner and no suid/sgid/sticky bits");
             return Err(EPERM);
         }
         // The owner it already has: nothing to store (fat_setattr accepts uid == sbi->options.fs_uid).
         a.valid &= !(ATTR_UID | ATTR_GID);
         let mut ro = None;
         if a.valid & ATTR_MODE != 0 {
-            let perm = a.mode & 0o777 & !mask(home, d.is_dir());
+            let perm = a.mode & 0o777 & !mask(kept, d.is_dir());
             let cur = d.inode.meta.mode() & 0o777;
             let w_ok = if d.is_dir() { perm & 0o222 == 0o200 } else { perm & 0o222 == 0 || perm & 0o222 == 0o200 };
             if perm & 0o555 != cur & 0o555 || !w_ok {

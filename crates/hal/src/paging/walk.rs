@@ -12,6 +12,11 @@ pub trait Tables {
     /// A zeroed table frame.
     fn alloc_table(&mut self) -> Option<u64>;
     fn free_table(&mut self, table: u64);
+    /// Whether an emptied table that maps [start, start + len) may be freed (MM-11: a user unmap frees only tables
+    /// no neighbouring VMA shares, Linux's `free_pgtables` floor and ceiling; madvise and reclaim free none).
+    fn may_free(&self, _start: u64, _len: u64) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,6 +92,13 @@ pub(super) fn leaf_flags(e: u64, level: u32) -> u64 {
     }
     let pat = if e & PAT_LARGE != 0 { PageFlags::PAT_4K } else { 0 };
     (e & !ADDR_MASK & !PageFlags::HUGE) | pat
+}
+
+/// MM-13: entry `i` (0..512) of the page table that maps what the 2 MiB leaf entry `pde` maps, 4 KiB at a time:
+/// the frame at offset i * 4 KiB with the same rights, memory type and accessed/dirty bits (Linux
+/// `__split_huge_pmd_locked`, linux-6.6/mm/huge_memory.c:2066, copies them into every pte).
+pub fn small_entry(pde: u64, i: usize) -> u64 {
+    (leaf_phys(pde, 2) + i as u64 * 4096) | leaf_bits(leaf_flags(pde, 2), 1)
 }
 
 /// Physical frame of a leaf entry at `level`.
@@ -243,7 +255,7 @@ fn walk_unmap(t: &mut impl Tables, table: u64, level: u32, base: u64, lo: u64, h
         }
         let child = e & ADDR_MASK;
         walk_unmap(t, child, level - 1, s, lo, hi, high, free_below, f, st);
-        if level - 1 < free_below && (0..512).all(|j| t.read(child, j) == 0) {
+        if level - 1 < free_below && t.may_free(high | s, sz) && (0..512).all(|j| t.read(child, j) == 0) {
             t.write(table, i, 0);
             t.free_table(child);
             st.tables_freed += 1;

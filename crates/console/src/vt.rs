@@ -62,7 +62,8 @@ fn with_vt<R>(f: impl FnOnce(&mut Vt) -> R) -> Option<R> {
 /// a program has the screen (KD_GRAPHICS) nothing is drawn: the model keeps changing and is drawn whole when the
 /// VT takes the screen back.
 fn redraw(v: &mut Vt) {
-    if graphics() {
+    // DS-4: the boot screen is the picture until it ends (`show_text` draws the model whole then).
+    if graphics() || crate::bootscreen::active() {
         v.screen.full = true;
         return;
     }
@@ -100,12 +101,25 @@ fn present_as(path: Path) {
 static GRAPHICS: AtomicBool = AtomicBool::new(false);
 /// The process that set KD_GRAPHICS (0 = the kernel or none): when it ends, the VT takes the screen back.
 static KD_OWNER: AtomicU32 = AtomicU32::new(0);
+/// The last process that took the screen (kept after it ends): DS-4's desktop start tells "took the screen, then
+/// ended" from "ended before it took the screen" even when `reclaim` already reset `KD_OWNER`.
+static LAST_KD_OWNER: AtomicU32 = AtomicU32::new(0);
 static KB_MODE: AtomicU8 = AtomicU8::new(crate::termios::ioc::K_UNICODE as u8);
 static KB_OWNER: AtomicU32 = AtomicU32::new(0);
 
 /// A program has the screen (KD_GRAPHICS): the VT draws nothing and types nothing for the keyboard.
 pub fn graphics() -> bool {
     GRAPHICS.load(Ordering::Acquire)
+}
+
+/// The process that has the screen now (0 = none or the kernel).
+pub fn kd_owner() -> u32 {
+    KD_OWNER.load(Ordering::Acquire)
+}
+
+/// `pid` took the screen (KD_GRAPHICS) and was the last to do so, whether or not it still has it.
+pub fn took_screen(pid: u32) -> bool {
+    pid != 0 && LAST_KD_OWNER.load(Ordering::Acquire) == pid
 }
 
 /// KDGETMODE.
@@ -132,12 +146,19 @@ fn set_kd_mode_if(on: bool, owner: Option<u32>, expect: Option<u32>) -> bool {
             return false;
         }
         KD_OWNER.store(if on { owner.unwrap_or(0) } else { 0 }, Ordering::Release);
+        if on && let Some(o) = owner {
+            LAST_KD_OWNER.store(o, Ordering::Release);
+        }
         GRAPHICS.swap(on, Ordering::AcqRel) != on
     };
     if !changed {
         return true;
     }
     klog::event!(Info, "console", "vt.mode", mode = if on { "graphics" } else { "text" }, owner = owner.unwrap_or(0));
+    if on {
+        // DS-4: the program (the desktop) has the screen; DS-5 continues the step list from /proc/bitsos/boot.
+        crate::bootscreen::stop("handover", true);
+    }
     if !on {
         // The arrow drawn over the program's picture: that spot comes back from the console frame too.
         if let Some(r) = crate::pointer_over::forget() {
@@ -151,6 +172,21 @@ fn set_kd_mode_if(on: bool, owner: Option<u32>, expect: Option<u32>) -> bool {
         present();
     }
     true
+}
+
+/// ktest `in.boot.emergency`: runs `f` while this CPU holds the VT (as another CPU might at a panic).
+pub(crate) fn with_vt_held(f: impl FnOnce()) -> Option<()> {
+    with_vt(|_| f())
+}
+
+/// DS-4: the boot screen ended to the text console: the whole model is drawn (it kept changing meanwhile).
+pub fn show_text() {
+    with_vt(|v| {
+        v.screen.full = true;
+        v.last_cursor = None;
+        redraw(v);
+    });
+    present();
 }
 
 /// DP-2: a fullscreen program (fbdev) takes the screen; `owner` its pid.
@@ -253,6 +289,8 @@ pub fn write_line(line: &str, attr_fg: u8) {
 /// Panic/NMI path: no wait, no allocation, the model untouched. Draws at the cursor straight into the frame,
 /// scrolling the pixels when the bottom is reached.
 pub fn write_emergency(line: &str, attr_fg: u8) {
+    // DS-4: a panic during the boot screen shows the text console (the model as it is, then the panic lines).
+    let boot = crate::bootscreen::end_for_panic();
     let Some(mut g) = VT.try_lock() else { return };
     let Some(v) = g.as_mut() else { return };
     let (font, cols, rows) = (v.font, v.screen.cols, v.screen.rows);
@@ -260,6 +298,12 @@ pub fn write_emergency(line: &str, attr_fg: u8) {
     let attr = attr_fg & 15;
     let drew = display::try_with_frame(|f| {
         v.pointer.hide(f);
+        if boot {
+            f.fill(f.full(), screen::PALETTE[screen::BG_INDEX as usize]);
+            for r in 0..rows {
+                render::draw_row(f, &font, &v.screen, r);
+            }
+        }
         let newline = |row: &mut u32, f: &mut display::RamFrame| {
             if *row + 1 < rows {
                 *row += 1;
@@ -281,6 +325,9 @@ pub fn write_emergency(line: &str, attr_fg: u8) {
         newline(&mut row, f);
     });
     if drew.is_some() {
+        if boot {
+            crate::bootscreen::panic_repainted();
+        }
         // The model no longer matches the pixels; the next normal write redraws everything.
         v.screen.full = true;
         v.screen.row = row;
@@ -471,6 +518,13 @@ fn move_pointer(to: impl FnOnce(i64, i64, i64, i64) -> (i64, i64)) {
             return Moved::No;
         }
         let epoch = crate::pointer_over::generation();
+        if crate::bootscreen::active() && !graphics() {
+            // DS-4: no arrow over the boot screen; it shows where the pointer is once the text console is back.
+            v.pointer.x = x;
+            v.pointer.y = y;
+            v.pointer.visible = true;
+            return Moved::No;
+        }
         if graphics() {
             // The console frame is not shown: its arrow comes out (drawn again when the VT takes the screen back).
             let stale = v.pointer.drawn_at();
@@ -631,6 +685,12 @@ impl Input {
         }
         let m = self.mods();
         if keymap::is_modifier(c) {
+            return;
+        }
+        // DS-4: any key ends the boot screen and shows the text console (the key itself types nothing).
+        if crate::bootscreen::stop("key", false) {
+            self.repeat.stop();
+            show_text();
             return;
         }
         if m.shift && (c == code::PAGEUP || c == code::PAGEDOWN) {

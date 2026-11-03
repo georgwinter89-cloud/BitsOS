@@ -31,6 +31,9 @@ pub fn heap_ready() {
     HEAP_READY.store(true, Ordering::Release);
 }
 
+/// One cache line (or more) per CPU (PF-2): the records of later CPUs lie side by side in a chunk, and
+/// every spin lock writes its CPU's `preempt`, so unaligned records made neighbouring CPUs share a line.
+#[repr(align(64))]
 pub(crate) struct CpuSync {
     /// Inside ksync's own bookkeeping on this CPU: a lock taken meanwhile (by the allocator the bookkeeping
     /// calls, or by an NMI) is not tracked, so the bookkeeping never re-enters itself.
@@ -118,9 +121,25 @@ mod imp {
         f(None)
     }
 
-    /// Makes sure CPUs 0..n have records. Allocates: call before those CPUs take any lock (CP-4, before the APs
-    /// start), never from inside a lock.
+    /// The index of the CPU this runs on (the statistics slot, PF-2).
+    #[inline]
+    pub fn cpu_index() -> usize {
+        hal::percpu::this_cpu()
+    }
+
+    /// The kernel's CPU count comes from `prepare_cpus` only.
+    pub fn cpu_slots_seen() -> usize {
+        0
+    }
+
+    /// Makes sure CPUs 0..n have records and every lock class has statistics slots for them. Allocates: call
+    /// before those CPUs take any lock (CP-4, before the APs start), never from inside a lock.
     pub fn prepare_cpus(n: usize) {
+        prepare_records(n);
+        crate::slots::cover_all(n);
+    }
+
+    fn prepare_records(n: usize) {
         loop {
             let have = COVERED.load(Ordering::Acquire);
             if n <= have {
@@ -149,8 +168,43 @@ mod imp {
 #[cfg(not(target_os = "none"))]
 mod imp {
     use super::CpuSync;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::vec::Vec;
+
+    /// A host thread's "CPU" index for the statistics slots: handed out densely and given back when the
+    /// thread ends, so the indices stay near the number of threads alive at once.
+    struct Index(usize);
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    impl Index {
+        fn take() -> Index {
+            let reused = FREE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            Index(reused.unwrap_or_else(|| NEXT.fetch_add(1, Ordering::Relaxed)))
+        }
+    }
+
+    impl Drop for Index {
+        fn drop(&mut self) {
+            FREE.lock().unwrap_or_else(|e| e.into_inner()).push(self.0);
+        }
+    }
+
     std::thread_local! {
         static CPU: CpuSync = const { CpuSync::new() };
+        static INDEX: Index = Index::take();
+    }
+
+    /// This thread's index; `usize::MAX` (the shared slot) while the thread is being torn down.
+    pub fn cpu_index() -> usize {
+        INDEX.try_with(|i| i.0).unwrap_or(usize::MAX)
+    }
+
+    /// Host indices handed out so far: classes cover them when they may allocate.
+    pub fn cpu_slots_seen() -> usize {
+        NEXT.load(Ordering::Relaxed)
     }
     pub fn with_cpu<R>(f: impl FnOnce(Option<&CpuSync>) -> R) -> R {
         let mut f = Some(f);
@@ -160,10 +214,13 @@ mod imp {
             Err(_) => (f.take().expect("not called yet"))(None),
         }
     }
-    pub fn prepare_cpus(_n: usize) {}
+    /// Host: no records to make (thread-local); covers the statistics slots of every class.
+    pub fn prepare_cpus(n: usize) {
+        crate::slots::cover_all(n);
+    }
 }
 
-pub(crate) use imp::with_cpu;
+pub(crate) use imp::{cpu_index, cpu_slots_seen, with_cpu};
 pub use imp::prepare_cpus;
 
 /// Interrupts off for ksync's bookkeeping (restored on drop). Keeps the bookkeeping on one CPU: no interrupt,

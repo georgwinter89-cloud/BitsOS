@@ -69,17 +69,8 @@ pub(crate) fn realtime_ns() -> u64 {
 /// every time until the base changes, so `timerfd::clock_was_set` can tell a jump from no jump (two reads of
 /// `realtime_ns() - now_ns()` differ by the time between them). Matches `realtime_ns` (0 without a wall time).
 pub(crate) fn realtime_offset_ns() -> i64 {
-    use time::wall::Base;
-    let (base, tz, ..) = time::wall::state();
-    let off: i128 = match base {
-        Base::None => 0,
-        Base::Rtc { local, mono_ns } => match u64::try_from(tz.to_utc(&local)) {
-            Ok(s) => s.saturating_mul(1_000_000_000) as i128 - mono_ns as i128,
-            Err(_) => 0,
-        },
-        Base::Set { utc_ns, mono_ns } => utc_ns as i128 - mono_ns as i128,
-    };
-    off.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    // AB-14: one definition for the syscalls and the vDSO's page.
+    proc::vdso::realtime_offset_ns()
 }
 
 fn read_ns(c: &SysCtx<'_>, clock: Clock) -> Result<u64, i64> {

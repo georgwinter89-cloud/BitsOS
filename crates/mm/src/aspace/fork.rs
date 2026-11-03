@@ -10,14 +10,18 @@
 //! Commit: the child is charged every accounted VMA it gets (Linux charges `vma_pages` per VM_ACCOUNT VMA in
 //! `dup_mmap`), all before anything is copied: ENOMEM refuses the fork and the parent is unchanged.
 //!
-//! Huge pages: MM maps program memory only in 4 KiB pages (no transparent huge pages), so there is nothing to
-//! split; a large user leaf would be a bug and refuses the fork (ENOMEM, Error event) instead of sharing part of it.
+//! Huge pages (MM-13, Linux `copy_huge_pmd`, linux-6.6/mm/huge_memory.c:1062): a 2 MiB leaf stays a 2 MiB leaf in
+//! both spaces, read-only; its frames are split into 512 order-0 frames first (still mapped by the parent's 2 MiB
+//! entry), each shared with its own count, so either side can later split its entry and copy single pages, or
+//! take the 2 MiB back writable once it holds all 512 alone (`huge.rs`). The child takes a page table for its
+//! later split (Linux allocates the child's deposit too); PR_SET_THP_DISABLE goes to the child.
 
+use super::huge::{own_huge, HUGE_PAGES};
 use super::{AddressSpace, AsCore, Class, Counters, Fill, Inner};
 use crate::vma::Vma;
 use crate::{commit, share, MmError, PAGE};
 use alloc::vec::Vec;
-use hal::paging::{self, PageFlags, PageSize};
+use hal::paging::{self, PageFlags, PageSize, Unmapped};
 
 klog::counter!(FORKS, "mm.as.forks");
 klog::counter!(FORK_SHARED, "mm.as.fork_shared_pages");
@@ -72,8 +76,9 @@ impl AsCore {
         // Its counters hold what was mapped, also after a failure half-way (Linux dup_mm: hiwater_rss = rss and
         // hiwater_vm = total_vm of the child; the tree's peak is its size, built by inserts only).
         let ctr = Counters::default();
-        let mut done = built && self.copy_pages(&g, &kept, root, &ctr);
+        let mut done = built && self.copy_pages(&g, &kept, root, &ctr, &mut c.deposit);
         let child = AddressSpace::from_inner(root, c, ctr);
+        child.set_thp_disabled(self.thp_disabled());
         for v in &kept {
             if let Some(d) = v.file.as_ref().and_then(|f| f.device.as_ref()) {
                 done &= d.add_space(&child.me);
@@ -94,19 +99,19 @@ impl AsCore {
 
     /// The child's page tables under `root` for the private VMAs in `kept` (shared copy-on-write, or copied for an
     /// eager space). False: out of memory (or a large user leaf); what was mapped stays for the child's drop.
-    fn copy_pages(&self, g: &Inner, kept: &[&Vma], root: u64, ctr: &Counters) -> bool {
+    fn copy_pages(&self, g: &Inner, kept: &[&Vma], root: u64, ctr: &Counters, deposit: &mut Vec<u64>) -> bool {
         let Some((lo, hi)) = kept.iter().filter(|v| copies_pages(v)).fold(None, |r: Option<(u64, u64)>, v| Some(r.map_or((v.start, v.end), |(a, b)| (a.min(v.start), b.max(v.end))))) else {
             return true;
         };
         let tree = &g.space.tree;
         let cow = g.fill == Fill::OnFault;
-        let own = |phys: u64| mm_core::is_user_frame(phys);
+        let own = |u: &Unmapped| if u.size == PageSize::Size2M { own_huge(u.phys) } else { mm_core::is_user_frame(u.phys) };
         if cow {
             // The parent's writable program frames become read-only everywhere first (one shootdown for all), so
             // no store lands in a frame after the child shares it. A CPU that does not answer is logged; its
             // pending IPI still flushes before it runs the parent's code again.
-            let r = paging::protect_user(self.root, lo, hi - lo, &mut |u| {
-                let shareable = u.flags.contains(PageFlags::WRITABLE) && own(u.phys) && tree.find(u.virt).is_some_and(copies_pages);
+            let r = paging::protect_user(self.root, lo, hi - lo, paging::tlb::Cause::Fork, &mut |u| {
+                let shareable = u.flags.contains(PageFlags::WRITABLE) && own(&u) && tree.find(u.virt).is_some_and(copies_pages);
                 shareable.then_some(PageFlags(u.flags.0 & !PageFlags::WRITABLE))
             });
             match r {
@@ -126,11 +131,21 @@ impl AsCore {
         let (mut ok, mut shared, mut copied) = (true, 0u64, 0u64);
         let fail_after = g.fork_fail_after;
         paging::for_each_leaf(self.root, lo, hi, &mut |u| {
-            if !ok || !own(u.phys) || !tree.find(u.virt).is_some_and(copies_pages) {
+            if !ok || !own(&u) || !tree.find(u.virt).is_some_and(copies_pages) {
+                return;
+            }
+            if u.size == PageSize::Size2M {
+                let injected = fail_after.is_some_and(|n| shared + copied + HUGE_PAGES > n);
+                ok = cow && !injected && Self::share_huge(&u, root, ctr, deposit);
+                if ok {
+                    shared += HUGE_PAGES;
+                } else if !cow {
+                    klog::event!(Error, "mm", "as.fork_large_leaf", virt = klog::Hex(u.virt); "a 2 MiB page in an eager space: MM never makes one there");
+                }
                 return;
             }
             if u.size != PageSize::Size4K {
-                klog::event!(Error, "mm", "as.fork_large_leaf", virt = klog::Hex(u.virt); "a large user page: MM maps program memory in 4 KiB pages only");
+                klog::event!(Error, "mm", "as.fork_large_leaf", virt = klog::Hex(u.virt); "a 1 GiB user page: MM never maps one");
                 ok = false;
                 return;
             }
@@ -172,5 +187,46 @@ impl AsCore {
         FORK_COPIED.add(copied);
         klog::event!(Debug, "mm", "as.forked", shared = shared, copied = copied, pages = (hi - lo) / PAGE, ok = ok);
         ok
+    }
+
+    /// The parent's 2 MiB leaf `u` for the child under `root`: its frames as 512 shared order-0 frames, the child's
+    /// entry read-only with a page table deposited for its split. False: no memory (nothing left changed but the
+    /// frames' split, which the parent's own entry does not mind).
+    fn share_huge(u: &Unmapped, root: u64, ctr: &Counters, deposit: &mut Vec<u64>) -> bool {
+        let head = u.phys;
+        if mm_core::split_user_block(head, mm_core::HUGE_ORDER) {
+            crate::thp::block_gone();
+            crate::thp::SPLIT_PAGE.inc();
+        }
+        let n = (0..HUGE_PAGES).take_while(|&i| share::share(head + i * PAGE)).count() as u64;
+        let undo = |n: u64| (0..n).for_each(|i| {
+            let _ = share::release(head + i * PAGE);
+        });
+        if n < HUGE_PAGES || deposit.try_reserve(1).is_err() {
+            undo(n);
+            return false;
+        }
+        let mut alloc_table = || {
+            let t = mm_core::alloc_table_frame();
+            ctr.tables_added(t.is_some() as u64);
+            t
+        };
+        let Some(t) = alloc_table() else {
+            undo(n);
+            return false;
+        };
+        if paging::map_user_2m(root, u.virt, head, PageFlags(u.flags.0 & !PageFlags::WRITABLE), &mut alloc_table).is_err() {
+            undo(n);
+            ctr.tables_freed(1);
+            if let Some(fa) = mm_core::frames() {
+                fa.free(t, 0, mm_core::Kind::PageTable);
+            }
+            return false;
+        }
+        deposit.push(t);
+        ctr.add(Class::Anon, HUGE_PAGES);
+        ctr.huge_add(1);
+        crate::thp::FORK_SHARED.inc();
+        true
     }
 }

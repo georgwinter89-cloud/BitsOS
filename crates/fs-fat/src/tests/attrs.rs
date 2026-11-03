@@ -157,6 +157,40 @@ fn stick_home_belongs_to_user_1000() {
     assert_eq!(ns.lookup_path(b"/boot/BITSOS2/bin/home", false).unwrap().attr().uid, 0);
 }
 
+/// INT-W17 (MC-8b CR 3): `\BITSOS2\mcp\` (the MCP service's TLS key, its pairings, the installer's grants) is
+/// root's with 0700/0600, like vfat with dmask=077,fmask=177: no other user reads `server.key`.
+#[test]
+fn stick_mcp_is_root_only() {
+    use vfs::abi::{O_CREAT, O_RDONLY, O_WRONLY};
+    let dir = scratch("attrs-mcp");
+    let dev = Arc::new(crate::MemDev::new(stick_image(&dir, true), 512));
+    let vol = mount_stick(&dev);
+    let ns = view(&vol);
+    let root = Ctx::kernel(&ns);
+    root.mkdir(None, b"/boot/BITSOS2/mcp", 0o755).unwrap();
+    root.mkdir(None, b"/boot/BITSOS2/mcp/paired", 0o755).unwrap();
+    root.open(None, b"/boot/BITSOS2/mcp/server.key", O_CREAT | O_WRONLY, 0o644).unwrap().pwrite(0, b"key").unwrap();
+    let st = |p: &str| {
+        let a = ns.lookup_path(p.as_bytes(), false).unwrap().attr();
+        (a.uid, a.gid, a.mode & 0o7777)
+    };
+    assert_eq!(st("/boot/BITSOS2/mcp"), (0, 0, 0o700));
+    assert_eq!(st("/boot/BITSOS2/MCP/paired"), (0, 0, 0o700), "by its alias MCP, whatever the case");
+    assert_eq!(st("/boot/BITSOS2/mcp/server.key"), (0, 0, 0o600));
+    assert_eq!(ns.read_file("/boot/BITSOS2/mcp/server.key", 16).unwrap(), b"key");
+    let user = Ctx { cred: Cred { uid: 1000, gid: 1000 }, ..Ctx::kernel(&ns) };
+    assert_eq!(user.open(None, b"/boot/BITSOS2/mcp/server.key", O_RDONLY, 0).err(), Some(EACCES));
+    let svc = Ctx { cred: Cred { uid: 961, gid: 961 }, ..Ctx::kernel(&ns) };
+    assert_eq!(svc.open(None, b"/boot/BITSOS2/mcp/paired/x.der", O_CREAT | O_WRONLY, 0o644).err(), Some(EACCES));
+    // Root keeps it root's; a mode without w is the read-only attribute (0400).
+    assert_eq!(set(&root, "/boot/BITSOS2/mcp/server.key", |m| setattr::chown(m, Cred::ROOT, 1000, 1000)), Err(EPERM));
+    set(&root, "/boot/BITSOS2/mcp/server.key", |_| setattr::chmod(0o644)).unwrap();
+    assert_eq!(mode(&ns, "/boot/BITSOS2/mcp/server.key"), 0o600);
+    // Only directly below \BITSOS2\: an "mcp" deeper down is an ordinary directory.
+    root.mkdir(None, b"/boot/BITSOS2/bin/mcp", 0o755).unwrap();
+    assert_eq!(st("/boot/BITSOS2/bin/mcp"), (0, 0, 0o755));
+}
+
 /// INT-W7 (MC-push CR 4 to FS): a rename into or out of `\BITSOS2\home\` gives the moved node and its cached
 /// subtree the owner and mode of the new place at once, not only after the next mount.
 #[test]

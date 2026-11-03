@@ -1,0 +1,35 @@
+net: readlink type net:, stat inode is the number = yes
+uts: readlink type uts:, stat inode is the number = yes
+ipc: readlink type ipc:, stat inode is the number = yes
+pid: readlink type pid:, stat inode is the number = yes
+pid_for_children: readlink type pid:, stat inode is the number = yes
+user: readlink type user:, stat inode is the number = yes
+mnt: readlink type mnt:, stat inode is the number = yes
+pid and pid_for_children are one namespace = yes
+user differs from net = yes
+opened = yes
+an open ns file is the same inode = yes
+setns(-1, 0) = -EBADF
+setns(a regular file, 0) = -EINVAL
+setns(net, CLONE_NEWUTS) = -EINVAL
+setns(own user, CLONE_NEWUSER) = -EINVAL
+setns(own uts, 0) unprivileged = -EPERM
+setns(own net, CLONE_NEWNET) unprivileged = -EPERM
+setns(own pid, CLONE_NEWPID) unprivileged = -EPERM
+write to an ns file = -EBADF
+child: unshare(CLONE_NEWUSER|CLONE_NEWUTS) = 0
+child: sethostname(first) = 0
+child: unshare(CLONE_NEWUTS) = 0
+child: sethostname(second) = 0
+child: setns(first uts, CLONE_NEWUTS) = 0
+child: nodename first
+child: setns(own user namespace) = -EINVAL
+child: setns(the parent's user namespace) = -EPERM
+child: setns(first uts, CLONE_NEWNET) = -EINVAL
+child: ns/user differs from the parent's = yes
+child: exit 0
+helper: open the target's ns/user = yes
+helper: setns(the target's user namespace) = 0
+helper: uid 65534, in the target's namespace = yes
+helper: exit 0
+target: exit 0

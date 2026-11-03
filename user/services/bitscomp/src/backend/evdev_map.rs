@@ -79,6 +79,33 @@ impl Caps {
     }
 }
 
+/// linux-6.6/include/uapi/linux/input.h BUS_VIRTUAL: uinput's default, virtio-input's, and V2's MCP devices.
+pub const BUS_VIRTUAL: u16 = 0x06;
+
+/// MC-9b (R8c): whether a device's events can be real keys and clicks. MCP's injected keyboard and pointer
+/// (crates/console evdevfs `register_mcp_devices`: "BitsOS MCP keyboard"/"pointer", phys mcp/input0/1,
+/// BUS_VIRTUAL) and any other virtual device (uinput, should V2 get it) count as injected; the bitscomp reader
+/// cannot see the kernel's per-event flag, so the device decides.
+///
+/// A bare BUS_VIRTUAL device stays injected on purpose: on V2 only MCP and the ktest fakes have that bus, and a
+/// virtual device elsewhere (uinput: a key remapper, Steam input) is a program writing input, whose creator also
+/// picks its name, phys and ids, so no list of "trusted" virtual devices could tell it from Claude's. A QEMU
+/// virtio keyboard counts as injected too (a real yes in QEMU needs a PS/2 or USB keyboard).
+pub fn origin_of(bus: u16, name: &str, phys: &str) -> crate::input::Origin {
+    if injected_why(bus, name, phys).is_some() { crate::input::Origin::Injected } else { crate::input::Origin::Physical }
+}
+
+/// Why `origin_of` counts a device as injected (for the log line of each device), None for a real one.
+pub fn injected_why(bus: u16, name: &str, phys: &str) -> Option<&'static str> {
+    if phys.starts_with("mcp/") || name.starts_with("BitsOS MCP") {
+        Some("MCP device")
+    } else if bus == BUS_VIRTUAL {
+        Some("virtual bus")
+    } else {
+        None
+    }
+}
+
 /// One device's events after a SYN_REPORT, in output-independent form.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Out {

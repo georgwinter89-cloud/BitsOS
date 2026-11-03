@@ -91,7 +91,7 @@ impl PhysMem for KernelMem<'_> {
             let buf = &mut out[done..done + n];
             if self.map.covers(page, page + PAGE, is_ram) {
                 // RAM is in the direct map (bitsboot maps every RAM type, ACPI reclaim and NVS included).
-                if !hal::dma_buf::read(page, PAGE as usize, off, buf) {
+                if !hal::dma_buf::read_ram(page + off as u64, buf) {
                     return Err(MemError::OutOfRange);
                 }
             } else if self.map.covers(page, page + PAGE, is_reserved) {

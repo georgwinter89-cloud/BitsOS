@@ -311,7 +311,7 @@ ktest!("contract.b5_mcp_tool", Safe, mcp_registry);
 fn registries_present() -> TestResult {
     kassert!(syscall::SYSCALLS.len() >= 20, "wave-A stubs registered");
     // INT-A1: FS-2's devfs makes its own nodes (null, zero, console, ...) and the console plugs in through
-    // `vfs::tty::set_console`, so no crate needs `devnode!` today; the registry stays for driver nodes.
+    // `vfs::tty::set_console`; `devnode!` is for driver nodes (ptmx, snd, fb0, ...).
     let _ = vfs::DEVNODES.len();
     for n in ["/dev/null", "/dev/console", "/dev/tty"] {
         kassert!(vfs::root_ns().open(n).is_ok(), "{n} missing in devfs");

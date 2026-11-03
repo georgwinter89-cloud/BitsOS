@@ -162,12 +162,49 @@ impl Dog {
     }
 
     /// Keeps the chip armed with `secs` from now and stops the kicks (before a reboot: a safety net while the
-    /// machine resets and the next kernel boots).
-    pub fn grace(&self, secs: u32) {
+    /// machine resets and the next kernel boots). True when the chip ran and got the count; false when it was
+    /// stopped (nothing written: it will not reset the machine).
+    pub fn grace(&self, secs: u32) -> bool {
         self.armed.store(false, Ordering::Release);
         let _g = self.exclusive();
         if regs::running(&*self.regs) {
             regs::set_count_and_kick(&*self.regs, secs);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// RB-16: a breadcrumb's code into the counter (`crumb`): while the counter runs it counts from now (the
+    /// code is the timeout until the next crumb or the grace). RB-17: a stopped chip only takes the value for
+    /// its next kick and keeps reading the count it stopped with (the Mini-PC after a Reload, desk 28.10.), so
+    /// the crumb is written but not kept: false. No lock, no log, no clock (Quiesce with interrupts off).
+    pub fn crumb(&self, code: u32) -> bool {
+        let _g = self.exclusive();
+        if regs::running(&*self.regs) {
+            regs::set_count_and_kick(&*self.regs, code);
+            true
+        } else {
+            self.regs.count_write(code.clamp(1, regs::MAX_SECONDS));
+            false
+        }
+    }
+
+    /// RB-17: no more kicks, the chip keeps counting from its last kick (a Reload's quiesce: the crumbs up to
+    /// the jump still land, each counting from now; [`Dog::stop`] follows right before the jump). True when
+    /// the chip runs. No lock, no log (Quiesce with interrupts off).
+    pub fn hold(&self) -> bool {
+        self.armed.store(false, Ordering::Release);
+        let _g = self.exclusive();
+        regs::running(&*self.regs)
+    }
+
+    /// RB-16: the normal timeout back after crumbs of a shutdown that did not end the kernel (only while the
+    /// kicker owns the chip; a grace or a stop stays).
+    pub fn restore_timeout(&self) {
+        if self.armed() {
+            let _g = self.exclusive();
+            regs::set_count_and_kick(&*self.regs, self.timeout_s);
         }
     }
 
@@ -203,7 +240,6 @@ impl Dog {
         let me = self.cpus.this_cpu();
         let n = self.cells.len().min(self.cpus.count());
         let mut r = Round::default();
-        let mut all = true;
         for (c, cell) in self.cells.iter().enumerate().take(n) {
             let s = self.cpus.sample(c);
             let (mut t, l, want_probe) = live::judge(cell.load(), s, c == me, now, self.policy);
@@ -224,9 +260,11 @@ impl Dog {
             }
             if !l.alive() {
                 r.stalled += 1;
-                all = false;
             }
         }
+        // The kick decision is `live::all_alive` over this round's verdicts (the cells hold them now; `checking`
+        // keeps every other round out), so the host-tested rule is the one the watchdog runs.
+        let all = live::all_alive(self.cells.iter().take(n).map(|cell| Live::from_code(cell.live.load(Ordering::Acquire))));
         self.checks.fetch_add(1, Ordering::Relaxed);
         self.probes.fetch_add(r.probes as u64, Ordering::Relaxed);
         self.last_check_ns.store(now, Ordering::Release);

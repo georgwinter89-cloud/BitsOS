@@ -1,8 +1,9 @@
 #!/bin/bash
+# minipc: left the QEMU runs (Georg 30.10., CONTRACTS section 4); its checks run on the Mini-PC by the check list in plan/notes/br-BR-3.md
 # slow
 # BR-3: Brave on V2 (QEMU -smp 4, 6 GiB, 1280x800 GOP) in bitscomp's fbdev backend, started by the stick's launcher
-# (\BITSOS2\bin\brave, tree \BITSOS2\brave\ from user/ports/brave-launcher/scripts/stage-v2.sh) as uid 1000 with
-# --no-sandbox. Pages come from an HTTP server on the host (127.0.0.1, seen from the guest as 10.0.2.2 on QEMU's
+# (\BITSOS2\bin\brave, tree \BITSOS2\brave\ from user/ports/brave-launcher/scripts/stage-v2.sh) as uid 1000, in
+# its own sandbox (BR-6b: on by default, no fallback; RED without it; 50-sandbox.sh checks chrome://sandbox). Pages come from an HTTP server on the host (127.0.0.1, seen from the guest as 10.0.2.2 on QEMU's
 # user network, by the name br3.test; every other name is NOTFOUND: no internet). render.html is compared with the
 # host's picture (tools/reference.sh: headless bitscomp, the same tree and flags); index.html runs BR-1's subsystem
 # checks; the profile goes onto the stick as a tar and comes back. Brave's log, faults and ENOSYS are checked

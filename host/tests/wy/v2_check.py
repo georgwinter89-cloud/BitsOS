@@ -89,6 +89,60 @@ class Job:
         print(f"ok: {what}", flush=True)
 
 
+# WY-14: WY_GPU=1 (tools/gpu-image.sh): CONFIG.TXT bitscomp=gpu, so /bin/bitscomp hands over to the gpu build.
+# WY_GPU=bare|notree (fallback cases): the gpu build cannot load (a tree without libpixman-1, no Mesa tree); its check-build fails
+# and the rescue build runs on.
+# WY-15: WY_GPU=gles: CONFIG.TXT bitscomp=gles, the gpu build draws with GLES (llvmpipe) and reads the picture back.
+GPU = os.environ.get("WY_GPU") in ("1", "gles")
+GLES = os.environ.get("WY_GPU") == "gles"
+FALLBACK = os.environ.get("WY_GPU") in ("bare", "notree")
+GPU_EXE = "/boot/BITSOS2/bin/bitscomp-gpu"
+MESA_LIB = "/boot/BITSOS2/mesa/lib/"
+
+
+def shell(c, cmd, timeout_ms=10000):
+    _, t, _ = call(c, "run", {"path": "/bin/sh", "args": ["-c", cmd], "env": ENV, "timeout_ms": timeout_ms})
+    m = re.search(r"--- stdout \(\d+ bytes\) ---\n(.*?)--- stderr", t, re.S)
+    return m.group(1) if m else t
+
+
+def check_build(c, text, deep=True):
+    """WY-14: the start line names the build. Without WY_GPU the rescue build runs (no EGL probe); with it the gpu
+    build after the hand-over, its libEGL.so.1 loadable, and (deep: its /proc files readable) its executable and every
+    library it maps from the stick's Mesa tree, none from the initramfs."""
+    m = re.search(r"pid=(\d+) backend=\S+ size=\S+ refresh_us=\d+ build=(\w+) renderer=(\w+) egl=(\w+)", text)
+    need(m is not None, "bitscomp names its build on the start line", text[-2000:])
+    pid, got = m.group(1), m.groups()[1:]
+    want = ("gpu", "gles" if GLES else "pixman", "loadable") if GPU else ("rescue", "pixman", "off")
+    need(got == want, "build={} renderer={} egl={}".format(*want), m.group(0))
+    if FALLBACK:
+        need("check-build" in text and "the rescue build runs on" in text and "handing over" not in text,
+             f"CONFIG.TXT bitscomp=gpu with WY_GPU={os.environ['WY_GPU']}: the check failed, the rescue build runs on",
+             text[-2000:])
+        line = next((l for l in text.splitlines() if "the rescue build runs on" in l), "")
+        print("fallback:", line.strip(), flush=True)
+        return
+    if not GPU:
+        return
+    need(f"handing over to {GPU_EXE}" in text, f"CONFIG.TXT bitscomp={'gles' if GLES else 'gpu'}: /bin/bitscomp handed over", text[-2000:])
+    if GLES:
+        m = re.search(r"renderer gles: (GL_RENDERER=llvmpipe[^;\n]*)", text)
+        need(m is not None, "GLES draws with llvmpipe", text[-2000:])
+        print("gles:", m.group(1), flush=True)
+    if not deep:
+        return
+    out = shell(c, f"readlink /proc/{pid}/exe; cat /proc/{pid}/maps").splitlines()
+    need(bool(out) and out[0].strip() == GPU_EXE, f"pid {pid} runs {GPU_EXE}", "\n".join(out[:5]))
+    libs = sorted({w[5] for w in (l.split() for l in out[1:]) if len(w) >= 6 and re.search(r"\.so(\.\d+)*$", w[5])})
+    need(bool(libs) and all(p.startswith(MESA_LIB) for p in libs), "every library of the gpu build is the Mesa tree's", "\n".join(libs))
+    comm = shell(c, f"cat /proc/{pid}/comm").strip()
+    need(comm == "bitscomp", "the gpu build's command name is bitscomp (PR_SET_NAME)", comm)
+    if GLES:
+        names = " ".join(libs)
+        need(all(n in names for n in ("/libEGL.so.1", "/libEGL_mesa.so.0", "/libgallium")), "EGL and llvmpipe come from the Mesa tree", names)
+    print("gpu build libraries:", " ".join(p.rsplit("/", 1)[1] for p in libs), flush=True)
+
+
 def ctl(c, *words):
     _, text, _ = call(c, "run", {"path": "/bin/bitscomp", "args": ["ctl", "--socket", SOCK, *words], "env": ENV, "timeout_ms": 20000})
     return text
@@ -224,6 +278,7 @@ def main():
     # default one window, so both paths draw the screen the checks compare.
     comp = Job(c, "/bin/bitscomp", ["--socket", SOCK, "--stats", "5", "--fixed-status", "--fb-pan"])
     comp.wait_for(r"WAYLAND_DISPLAY=wayland-1 .*backend=fbdev size=1280x800", "bitscomp started on fbdev at 1280x800")
+    check_build(c, comp.text)
     need("fbdev: /dev/fb0 1280x800" in comp.text, "bitscomp mapped /dev/fb0", comp.text[-2000:])
     need("two windows (pan)" in comp.text, "--fb-pan: two windows shown by pan", comp.text[-2000:])
     need("pan to window" not in comp.text, "no pan refused", comp.text[-2000:])
@@ -351,13 +406,15 @@ def main():
     console_back(c, q, 5, "after SIGTERM")
 
     # From the BusyBox shell on the console: bitscomp's terminal goes to KD_GRAPHICS, Ctrl+Alt+Q gives it back.
-    bg = bytes(ref[(rh - 1) * rw * 3 + (rw - 1) * 3:][:3])
+    # INT-D1: design v2's ground is a wallpaper (dot grid, glow, vignette), not one colour: bitscomp has the screen
+    # when most of it differs from the console picture just before the command (tolerance below the ground's step).
+    _, _, console_px = screen(c, "the console before bitscomp")
     call(c, "send_keys", {"text": "bitscomp --socket wayland-3\n"})
     end = time.time() + 20
     while True:
         _, text, _ = call(c, "ps", {})
-        _, _, px = screen(c, "bitscomp from the shell")
-        if "bitscomp --socket wayland-3" in text and count(px, bg) > len(px) // 6:
+        w3, _, px = screen(c, "bitscomp from the shell")
+        if "bitscomp --socket wayland-3" in text and differing(px, console_px, w3, tol=6) > len(px) // 3 // 2:
             break
         if time.time() > end:
             raise SystemExit(f"RED: bitscomp from the shell did not take the screen\n{text}")

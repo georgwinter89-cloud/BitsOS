@@ -58,8 +58,9 @@ def main():
     print("ok: settingsd's MCP tools are there", flush=True)
     comp = Job(c, "/bin/bitscomp", ["--socket", v.SOCK, "--fixed-status"])
     comp.wait_for(r"backend=fbdev size=1280x800", "bitscomp started on fbdev at 1280x800")
+    v.check_build(c, comp.text)
     wait_theme(c, r"settingsd=true", "bitscomp reads V2's settingsd", 20)
-    need("mode=dark accent=#00e5ff" in ctl(c, "theme"), "the default theme is the mock-up's", ctl(c, "theme"))
+    need("mode=dark accent=#7fcfa0" in ctl(c, "theme"), "the default theme is the mock-up's", ctl(c, "theme"))
     for n, title in enumerate(["one", "two"]):
         Job(c, "/bin/wyclient", ["--title", title, "--pattern", str(n)])
         end = time.time() + 20
@@ -82,7 +83,7 @@ def main():
     compare(c, q, 3, "accent.ppm", box, "accent")
 
     setting(c, "settings_undo", {"n": 2})
-    wait_theme(c, r"mode=dark accent=#00e5ff", "settings_undo restored dark and cyan", 5)
+    wait_theme(c, r"mode=dark accent=#7fcfa0", "settings_undo restored dark and green", 5)
     back = compare(c, q, 4, "ref.ppm", box, "undone")
     need(differing(back, dark, 1280, box, tol=0) == 0, "undo gives the first picture back exactly")
     out = ctl(c, "quit")

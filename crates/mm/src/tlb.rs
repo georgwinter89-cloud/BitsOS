@@ -37,6 +37,40 @@ klog::counter!(pub ROUNDS, "mm.tlb.rounds");
 klog::counter!(pub SLOW_ROUNDS, "mm.tlb.slow_rounds");
 klog::counter!(pub RESENT_ROUNDS, "mm.tlb.resent_rounds");
 klog::counter!(pub RESENDS, "mm.tlb.resends");
+// MM-11: shootdown IPIs sent and taken (summed over the CPUs), and the IPIs sent per cause (`tlb::Cause::ALL`
+// order), for MCP `metrics {"name":"mm.tlb."}` during a video.
+klog::counter!(pub IPIS, "mm.tlb.ipis");
+klog::counter!(pub IRQS, "mm.tlb.irqs");
+klog::counter!(IPIS_MUNMAP, "mm.tlb.ipis.munmap");
+klog::counter!(IPIS_MAP_FIXED, "mm.tlb.ipis.map_fixed");
+klog::counter!(IPIS_MREMAP, "mm.tlb.ipis.mremap");
+klog::counter!(IPIS_MPROTECT, "mm.tlb.ipis.mprotect");
+klog::counter!(IPIS_MADVISE, "mm.tlb.ipis.madvise");
+klog::counter!(IPIS_COW, "mm.tlb.ipis.cow");
+klog::counter!(IPIS_FAULT, "mm.tlb.ipis.fault");
+klog::counter!(IPIS_RECLAIM, "mm.tlb.ipis.reclaim");
+klog::counter!(IPIS_FORK, "mm.tlb.ipis.fork");
+klog::counter!(IPIS_DEVICE, "mm.tlb.ipis.device");
+klog::counter!(IPIS_EXIT, "mm.tlb.ipis.exit");
+klog::counter!(IPIS_VMAP, "mm.tlb.ipis.vmap");
+klog::counter!(IPIS_KERNEL, "mm.tlb.ipis.kernel");
+klog::counter!(IPIS_OTHER, "mm.tlb.ipis.other");
+static IPIS_BY: [&klog::metrics::Counter; tlb::CAUSES] = [
+    &IPIS_MUNMAP,
+    &IPIS_MAP_FIXED,
+    &IPIS_MREMAP,
+    &IPIS_MPROTECT,
+    &IPIS_MADVISE,
+    &IPIS_COW,
+    &IPIS_FAULT,
+    &IPIS_RECLAIM,
+    &IPIS_FORK,
+    &IPIS_DEVICE,
+    &IPIS_EXIT,
+    &IPIS_VMAP,
+    &IPIS_KERNEL,
+    &IPIS_OTHER,
+];
 
 /// The CPU that took longest from a shootdown IPI's send to its answer since the last call, and that time in
 /// ns (None: no CPU was asked, or the TSC rate is unknown).
@@ -83,6 +117,11 @@ pub(crate) fn report() {
     SLOW_ROUNDS.add(now.slow.saturating_sub(before.slow));
     RESENT_ROUNDS.add((now.resent_once + now.several).saturating_sub(before.resent_once + before.several));
     RESENDS.add(now.resends.saturating_sub(before.resends));
+    IPIS.add(now.ipis.saturating_sub(before.ipis));
+    IRQS.add(now.irqs.saturating_sub(before.irqs));
+    for (i, c) in IPIS_BY.iter().enumerate() {
+        c.add(now.by_cause[i].ipis.saturating_sub(before.by_cause[i].ipis));
+    }
     // Read every second, so each event names the slowest round and CPU of its own second.
     let slowest = tlb::take_slowest();
     let late = slowest_answer();
@@ -161,10 +200,38 @@ pub(crate) fn stats_event(s: &TlbStats) {
         pcid_flushed = s.pcid_flushed, pcid_evictions = s.pcid_evictions, lazy_entries = s.lazy_entries,
         lazy_leaves = s.lazy_leaves, lazy_skips = s.lazy_skips, lazy_catchups = s.lazy_catchups, lazy_drops = s.lazy_drops, dying_leaves = s.dying_leaves, kept_pages = s.kept_pages, kept_tables = s.kept_tables,
         rounds = s.rounds, slow = s.slow, resent_once = s.resent_once, several = s.several, wait_lt10us = s.wait_hist[0],
-        wait_lt100us = s.wait_hist[1], wait_lt1ms = s.wait_hist[2], wait_lt10ms = s.wait_hist[3], wait_ge10ms = s.wait_hist[4]);
+        wait_lt100us = s.wait_hist[1], wait_lt1ms = s.wait_hist[2], wait_lt10ms = s.wait_hist[3], wait_ge10ms = s.wait_hist[4],
+        gather_early = s.gather_early);
+    causes_event(s);
+}
+
+/// MM-11: the shootdowns by cause since boot, each as flushes/rounds/ipis/tables (tables: flushes that freed page
+/// tables, which ask CPUs holding the root lazily too).
+pub(crate) fn causes_event(s: &TlbStats) {
+    let f = |c: tlb::Cause| {
+        let x = s.by_cause[c as usize];
+        alloc::format!("{}/{}/{}/{}", x.flushes, x.rounds, x.ipis, x.tables)
+    };
+    use tlb::Cause as C;
+    klog::event!(Info, "mm", "tlb.causes", munmap = f(C::Munmap), map_fixed = f(C::MapFixed), mremap = f(C::Mremap), mprotect = f(C::Mprotect),
+        madvise = f(C::Madvise), cow = f(C::Cow), fault = f(C::Fault), reclaim = f(C::Reclaim), fork = f(C::Fork), device = f(C::Device),
+        exit = f(C::Exit), vmap = f(C::Vmap), kernel = f(C::Kernel), other = f(C::Other);
+        "TLB shootdowns by cause since boot: flushes/rounds/ipis/tables");
 }
 
 /// Totals since boot (`hal::paging::tlb::stats`).
 pub fn stats() -> TlbStats {
     tlb::stats()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipi_counters_follow_the_cause_order() {
+        for (c, k) in tlb::Cause::ALL.iter().zip(IPIS_BY.iter()) {
+            assert_eq!(k.name, alloc::format!("mm.tlb.ipis.{}", c.name()));
+        }
+    }
 }

@@ -65,6 +65,11 @@ pub(crate) struct CpuSched {
     pub heartbeat: AtomicU64,
     /// SC-4 (RB-3): the last idle entry, `timers::pack_idle(time, IF)` (0: never idle).
     pub idle_entry: AtomicU64,
+    /// FD-1: expected length of this CPU's next idle period (ns; `cstate::predict`).
+    pub idle_predicted: AtomicU64,
+    /// SC-9: this CPU lacks ARAT or an invariant TSC although the boot CPU (whose CPUID made the idle plan)
+    /// has them: it stays in C1 (`cstate::check_cpu`).
+    pub idle_c1_only: AtomicBool,
 }
 
 impl CpuSched {
@@ -106,6 +111,8 @@ impl CpuSched {
             sleep: Once::new(),
             heartbeat: AtomicU64::new(0),
             idle_entry: AtomicU64::new(0),
+            idle_predicted: AtomicU64::new(0),
+            idle_c1_only: AtomicBool::new(false),
         }
     }
 
@@ -266,6 +273,17 @@ pub(crate) fn send_resched(cpu: usize) {
         && hal::apic::send_ipi(hal::apic::IpiDest::Physical(apic), hal::apic::IpiKind::Fixed(v)).is_ok()
     {
         RESCHED_SENT.inc();
+    }
+}
+
+/// FD-1 measuring build: interrupts every busy CPU once (the reschedule IPI without a request), so
+/// `hal::prof` samples whatever user code runs there.
+#[cfg(bitsos_fd_measure)]
+pub fn prof_kick() {
+    for c in online() {
+        if !c.in_idle.load(Ordering::Acquire) {
+            send_resched(c.cpu);
+        }
     }
 }
 

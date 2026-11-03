@@ -92,6 +92,9 @@ impl InodeOps for Ops {
     fn size(&self) -> u64 {
         self.0.cache.size()
     }
+    fn read_cache(&self) -> Option<&PageCache> {
+        Some(&self.0.cache)
+    }
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         self.0.cache.read_at(pos, buf)
     }

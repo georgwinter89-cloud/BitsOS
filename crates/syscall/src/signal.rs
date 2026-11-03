@@ -4,7 +4,7 @@
 //! pause (:4588), rt_sigtimedwait (:3683), rt_sigqueueinfo (:4058), rt_tgsigqueueinfo (:4104). The state and
 //! its rules live in `proc::signal`, delivery in `proc::deliver`, the thread's part in `proc::sigapi`.
 
-use proc::cred::{Cap, Cred, capable};
+use proc::cred::{Cap, Cred};
 use crate::SysCtx;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -126,7 +126,22 @@ pub(crate) fn send(c: &SysCtx<'_>, target: &Arc<Process>, sig: i32, info: SigInf
         return Err(-EPERM);
     }
     if sig != 0 && !target.is_finished() {
-        let how = target.send_info(info, to, false).map_err(|e| -e)?;
+        // SX-2 (`send_signal_locked`): si_uid in the target's user namespace; a sender the target's pid
+        // namespace cannot see (an ancestor's process) shows as pid 0 and forces SIGKILL/SIGSTOP onto a
+        // namespace's init.
+        let mut info = info;
+        let visible = target.pid_ns.nr(c.proc.pid).is_some();
+        if info.has_sender() {
+            let me = c.proc.cred();
+            let tns = target.cred().user_ns.clone();
+            let uid = if alloc::sync::Arc::ptr_eq(&me.user_ns, &tns) {
+                info.uid()
+            } else {
+                me.user_ns.to_kernel(proc::ns::user::MapKind::Uid, info.uid()).map_or(proc::ns::user::OVERFLOW_ID, |k| tns.uid(k))
+            };
+            info.set_sender(if visible { info.pid() } else { 0 }, uid);
+        }
+        let how = target.send_info(info, to, !visible).map_err(|e| -e)?;
         if target.pid == 1 && how == proc::signal::Sent::Dropped {
             klog::event!(Info, "syscall", "signal.ignored_by_init", from = c.proc.pid, signal = uapi::ab::signal_names::name(sig as u32));
         } else if target.pid != c.proc.pid {
@@ -140,12 +155,14 @@ pub(crate) fn send(c: &SysCtx<'_>, target: &Arc<Process>, sig: i32, info: SigInf
 /// the same process, or linux-6.6/kernel/signal.c:779 `kill_ok_by_cred` (the sender's real or effective uid
 /// is the target's real or saved uid, or CAP_KILL).
 pub(crate) fn may_signal(pid: u32, me: &Cred, target_pid: u32, t: &Cred) -> bool {
-    pid == target_pid || me.euid == t.suid || me.euid == t.uid || me.uid == t.suid || me.uid == t.uid || capable(me, Cap::Kill)
+    pid == target_pid || me.euid == t.suid || me.euid == t.uid || me.uid == t.suid || me.uid == t.uid || proc::cred::ns_capable(me, &t.user_ns, Cap::Kill)
 }
 
 /// kill(2)'s siginfo (`prepare_kill_siginfo`): SI_USER (SI_TKILL) with the caller's pid and uid.
 pub(crate) fn kill_info(c: &SysCtx<'_>, sig: i32, code: i32) -> SigInfo {
-    SigInfo::user(sig.max(0) as u32, code, c.proc.pid, c.proc.cred().uid)
+    // SX-2: the sender's pid and uid as its own namespaces name them (`task_tgid_vnr`, `from_kuid_munged`).
+    let me = c.proc.cred();
+    SigInfo::user(sig.max(0) as u32, code, c.proc.vpid(), crate::ns_sys::uid_view(&me, me.uid))
 }
 
 /// The processes of group `pgid` (live and zombies, as Linux's pid lists).
@@ -166,29 +183,32 @@ fn kill_group(c: &SysCtx<'_>, members: &[Arc<Process>], sig: i32) -> i64 {
     if success { 0 } else { ret }
 }
 
-/// The process a pid names (a thread's id names its whole process: `kill_pid_info` sends to the group).
-fn process_of(pid: u32) -> Option<Arc<Process>> {
-    proc::find(pid).or_else(|| proc::find_thread(pid).and_then(|t| t.group().image()))
+/// The process a pid names in the caller's pid namespace (a thread's id names its whole process:
+/// `kill_pid_info` sends to the group).
+fn process_of(c: &SysCtx<'_>, pid: u32) -> Option<Arc<Process>> {
+    crate::ns_sys::find(c, pid).or_else(|| crate::ns_sys::find_thread(c, pid).and_then(|t| t.group().image()))
 }
 
 fn sys_kill(c: &mut SysCtx<'_>) -> i64 {
     let pid = c.args[0] as i32;
     let sig = c.args[1] as i32;
     if pid > 0 {
-        let Some(t) = process_of(pid as u32) else { return -ESRCH };
+        let Some(t) = process_of(c, pid as u32) else { return -ESRCH };
         return send(c, &t, sig, kill_info(c, sig, SI_USER), To::Group).err().unwrap_or(0);
     }
     if pid == i32::MIN {
         return -ESRCH;
     }
     if pid != -1 {
-        let pgid = if pid == 0 { c.proc.pgid() } else { (-pid) as u32 };
+        let pgid = if pid == 0 { Some(c.proc.pgid()) } else { crate::ns_sys::id(c, (-pid) as u32) };
+        let Some(pgid) = pgid else { return -ESRCH };
         return kill_group(c, &group(pgid), sig);
     }
     // -1: every process except pid 1 and the caller; EPERM answers do not count as the result.
     let mut count = 0;
     let mut ret = 0;
-    for p in proc::processes().iter().filter(|p| p.pid > 1 && p.pid != c.proc.pid) {
+    // SX-2: the processes the caller's pid namespace shows, but its init (`task_pid_vnr(p) > 1`).
+    for p in proc::processes().iter().filter(|p| c.proc.vnr(p.pid) > 1 && p.pid != c.proc.pid) {
         count += 1;
         if let Err(e) = send(c, p, sig, kill_info(c, sig, SI_USER), To::Group)
             && e != -EPERM
@@ -203,8 +223,8 @@ crate::syscall!(KILL, sys_kill);
 /// `do_send_specific`: thread `tid`, in process `tgid` when given; the signal goes to that thread
 /// (PIDTYPE_PID). A thread that is gone is ESRCH.
 fn send_specific(c: &SysCtx<'_>, tgid: i32, tid: i32, sig: i32, info: SigInfo) -> i64 {
-    let Some(t) = proc::find_thread(tid as u32) else { return -ESRCH };
-    if tgid > 0 && t.group().tgid != tgid as u32 {
+    let Some(t) = crate::ns_sys::find_thread(c, tid as u32) else { return -ESRCH };
+    if tgid > 0 && Some(t.group().tgid) != crate::ns_sys::id(c, tgid as u32) {
         return -ESRCH;
     }
     let Some(p) = t.group().image() else { return -ESRCH };
@@ -254,11 +274,11 @@ fn sys_rt_sigqueueinfo(c: &mut SysCtx<'_>) -> i64 {
     let (pid, sig) = (c.args[0] as i32, c.args[1] as i32);
     // `task_pid_vnr(current) != pid` (kernel/signal.c do_rt_sigqueueinfo): the calling thread's id, so a
     // non-leader thread naming its own process gets EPERM for a forged si_code.
-    let info = match user_info(c, sig, c.args[2], pid > 0 && pid as u32 == c.thread.tid()) {
+    let info = match user_info(c, sig, c.args[2], pid > 0 && pid as u32 == c.thread.vtid()) {
         Ok(i) => i,
         Err(e) => return e,
     };
-    let Some(t) = (pid > 0).then(|| process_of(pid as u32)).flatten() else { return -ESRCH };
+    let Some(t) = (pid > 0).then(|| process_of(c, pid as u32)).flatten() else { return -ESRCH };
     send(c, &t, sig, info, To::Group).err().unwrap_or(0)
 }
 crate::syscall_nr!(uapi::ab::nr_more::RT_SIGQUEUEINFO, "rt_sigqueueinfo", sys_rt_sigqueueinfo);
@@ -270,7 +290,7 @@ fn sys_rt_tgsigqueueinfo(c: &mut SysCtx<'_>) -> i64 {
         return -EINVAL;
     }
     // `task_pid_vnr(current) != pid`: the calling thread's own id.
-    let info = match user_info(c, sig, c.args[3], tid as u32 == c.thread.tid()) {
+    let info = match user_info(c, sig, c.args[3], tid as u32 == c.thread.vtid()) {
         Ok(i) => i,
         Err(e) => return e,
     };

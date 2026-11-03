@@ -26,3 +26,14 @@ time = { path = "../../time" }
 sched = { path = "../../sched" }
 # GX-4: the `mode` monitor command (console::command!) and the confirmation prompt on the screen.
 console = { path = "../../console" }
+# GX-7a: the firmware loader reads the stick's /boot/BITSOS2/firmware through the VFS.
+vfs = { path = "../../vfs" }
+# GX-7b: the firmware memory map (which carve-out ranges are reserved) and IVRS (the IOMMU's registers).
+acpi = { path = "../../acpi" }
+# GX-7h: GART entries, PDEs and the table-store traits (pure, GR-owned).
+amdgpu-fmt = { path = "../../amdgpu-fmt" }
+# GX-7i: rung 3 copies into pinned system pages (MM-14 DmaPages) bound in the GART.
+mm = { path = "../../mm" }
+
+[lints]
+workspace = true

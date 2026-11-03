@@ -61,14 +61,15 @@ pub(crate) struct Prog {
     pub cred: Cred,
     pub pid: u32,
     next: StdMutex<u64>,
+    fs: vfs::FsState,
 }
 
 impl Prog {
     pub fn new(ns: &Arc<MountNs>, pid: u32, uid: u32) -> Prog {
-        Prog { mem: Mem(StdMutex::new(alloc::vec![0; SIZE])), fds: FdTable::new(), ns: ns.clone(), cred: Cred { uid, gid: uid }, pid, next: StdMutex::new(BASE) }
+        Prog { mem: Mem(StdMutex::new(alloc::vec![0; SIZE])), fds: FdTable::new(), ns: ns.clone(), cred: Cred { uid, gid: uid }, pid, next: StdMutex::new(BASE), fs: vfs::FsState::new() }
     }
     pub fn sys(&self) -> Sys<'_> {
-        Sys { mem: &self.mem, fds: &self.fds, ns: &self.ns, cred: self.cred, subject: policy::Subject { program: policy::ProgramId(1), pid: self.pid, uid: self.cred.uid } }
+        Sys { mem: &self.mem, fds: &self.fds, fs: &self.fs, ns: &self.ns, cred: self.cred, subject: policy::Subject { program: policy::ProgramId(1), pid: self.pid, uid: self.cred.uid } }
     }
     pub fn call(&self, f: vfs::sys::SysFn, a: [u64; 6]) -> i64 {
         f(&self.sys(), a)
@@ -808,5 +809,74 @@ fn a_unix_stream_in_a_nested_epoll_wakes_the_outer_one_every_time() {
         assert_eq!(p.recv(s0, 8, 0).0, 1);
         assert!(wait(&inner).is_empty(), "round {round}: drained");
         assert!(wait(&outer).is_empty(), "round {round}: outer after the drain");
+    }
+}
+
+/// FS-17 (bitscomp's hung clients, 27.10.): a compositor thread with the socket in an inner epoll (level, read
+/// to EAGAIN, so its item goes stale on the inner ready list) inside a level-triggered outer epoll, and a client
+/// thread answering every ping at once from another CPU. A peer's write landing while the outer epoll looks at
+/// the inner one must never be lost: a lost one shows as an outer wait that runs into its 5 s guard.
+#[test]
+fn nested_epoll_ping_pong_over_a_unix_stream_never_loses_a_wake() {
+    use vfs::epoll::{new_epoll, Epoll, EPOLLET, EPOLL_CTL_ADD};
+    const ROUNDS: u32 = 50_000;
+    for (inner_ev, outer_ev) in [(E::IN, E::IN), (E::IN | EPOLLET, E::IN | EPOLLET), (E::IN, E::IN | EPOLLET)] {
+        let ns = ns();
+        let p = Prog::new(&ns, 11, 1000);
+        let (s0, s1) = p.pair(SOCK_STREAM);
+        p.set_nonblock(s0);
+        let (f0, f1) = (p.fds.get(s0 as usize).unwrap(), p.fds.get(s1 as usize).unwrap());
+        let (inner, outer) = (new_epoll(), new_epoll());
+        Epoll::ctl(&outer, EPOLL_CTL_ADD, &inner, 50, (outer_ev, 9), false).unwrap();
+        Epoll::ctl(&inner, EPOLL_CTL_ADD, &f0, s0 as i32, (inner_ev, 1), false).unwrap();
+        let client = {
+            let f1 = f1.clone();
+            std::thread::spawn(move || {
+                let mut b = [0u8; 64];
+                let mut n = 0u32;
+                while n < ROUNDS {
+                    match f1.file.read_stream(&mut b, false) {
+                        Ok(0) | Err(_) => return n,
+                        Ok(k) => {
+                            for _ in 0..k {
+                                assert_eq!(f1.file.write_stream(b"p", false), Ok(1));
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                n
+            })
+        };
+        // Host tests have no kernel clock for epoll's own timeouts: the guard polls (Some(0)) by the host clock.
+        let wait = |ep: &Arc<vfs::OpenFile>| {
+            let mut v: Vec<(u32, u64)> = Vec::new();
+            ep.file.as_epoll().unwrap().wait(&mut v, 8, Some(0), &|| false).unwrap();
+            v
+        };
+        let mut b = [0u8; 64];
+        for round in 0..ROUNDS {
+            assert_eq!(f0.file.write_stream(b"q", false), Ok(1));
+            let t0 = std::time::Instant::now();
+            let mut got = 0;
+            while got == 0 {
+                let ev = wait(&outer);
+                if ev.is_empty() {
+                    assert!(t0.elapsed().as_secs() < 5, "{inner_ev:#x} in {outer_ev:#x}: round {round}: the pong's wake was lost");
+                    std::hint::spin_loop();
+                    continue;
+                }
+                // One inner harvest per outer event (Smithay's Mode::Level source), then read to EAGAIN.
+                if !wait(&inner).is_empty() {
+                    while let Ok(k) = f0.file.read_stream(&mut b, true) {
+                        got += k;
+                    }
+                }
+            }
+            assert_eq!(got, 1, "round {round}");
+        }
+        drop(f0);
+        p.fds.close(s0 as usize).unwrap();
+        assert_eq!(client.join().unwrap(), ROUNDS);
     }
 }

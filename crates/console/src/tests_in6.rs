@@ -140,8 +140,17 @@ fn after_present_draws_the_arrow_on_top_of_a_program_frame() {
     assert_eq!(pointer_over::drawn_at(), None, "forgotten when the console takes the screen back");
 }
 
+extern crate std;
+/// The latency numbers are global: the tests that record into them run one at a time.
+pub(crate) static LATENCY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn latency_serial() -> std::sync::MutexGuard<'static, ()> {
+    LATENCY_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn percentiles_from_the_histogram() {
+    let _serial = latency_serial();
     let mut s = Vec::new();
     for us in [100u64, 200, 300, 400, 30_000] {
         s.push(Sample { path: Path::Pointer, arrival_ns: 1_000, picked_ns: 2_000, start_ns: 1_000 + us * 1000, done_ns: 2_000 + us * 1000 });
@@ -174,7 +183,19 @@ fn percentiles_from_the_histogram() {
     latency::record(s[0]);
     assert_eq!(latency::report().1.len(), 2, "keeps the newest `keep` frames");
     latency::set_keep(latency::KEEP_DEFAULT);
+    // IN-8: a program's late frame is counted like any other, but does not advance BitsOS's warning count.
+    let late_owned = latency::late_owned();
+    let who = latency::Reader { pid: 7, comm: *b"player\0\0\0\0\0\0\0\0\0\0" };
+    latency::record_as(Sample { path: Path::Program, arrival_ns: 1_000, picked_ns: 2_000, start_ns: 40_001_000, done_ns: 41_000_000 }, who);
+    let (paths, _) = latency::report();
+    let p = &paths[Path::Program as usize].1;
+    assert_eq!((p.frames, p.over_budget), (1, 1), "the measurement is kept");
+    assert_eq!(latency::late_owned(), late_owned, "no warning for a program's own drawing");
+    let (windows, _) = latency::programs();
+    let w = windows.iter().find(|w| w.who == who).expect("the program's window");
+    assert_eq!((w.frames, w.late, w.worst_ns), (1, 1, 40_000_000));
     latency::reset();
+    assert!(latency::programs().0.is_empty(), "reset forgets the windows");
 }
 
 #[test]

@@ -1,0 +1,2 @@
+# Known DIFF cases of `cargo xtask abi-diff` for PF-3's program (abi-fdrace): "<case>: <owner>: <why>".
+abi-fdrace unshare: AB: close_range(CLOSE_RANGE_UNSHARE) from a thread closes the fd for the whole process; Linux gives the calling thread a private table first (linux-6.6/fs/file.c:763 __close_range -> unshare_fd), so the main thread keeps it. V2's threads share Process::fds and have no table of their own (PF-3 CR 4)

@@ -8,7 +8,7 @@
 //! The order (outermost first): request locks that drive a driver's bring-up (snd.output) > driver bring-up locks
 //! (hda.hdmi, rtw89.core) > PCI's sleeping pci.enable > pci.cfg > pci.ecam (and hal's 0xCF8 pair, not a
 //! ksync lock) > per-subsystem locks > ksync's wait-queue lock > leaves (pci.state, pci.devices) > **sched** >
-//! klog (sinks, the console/display locks the sinks take, ring) > heap > frames.
+//! klog (sinks, the console/display locks the sinks take, ring) > mm.grace > heap > frames.
 //!
 //! **sched is inside every subsystem lock, not outside** (SC-2, open point for the desk): a thread that holds a
 //! `Mutex` and sleeps or yields takes the scheduler's lock with the mutex held, and so does every wake-up
@@ -53,6 +53,9 @@ pub const KLOG_SINKS: u16 = 780;
 pub const SINK_TARGETS: u16 = 790;
 /// The klog ring.
 pub const KLOG: u16 = 800;
+/// PF-5's grace queue (`mm.grace`, INT-W27): just outside the allocator. Its holder pushes or pops one item and
+/// may grow the queue (heap); freers take it under vfs.inode.index, allocation paths only try it.
+pub const GRACE: u16 = 890;
 /// The allocator: heap, then frames under it (the heap grows from the frame allocator).
 pub const ALLOC: u16 = 900;
 pub const FRAMES: u16 = 910;
@@ -63,7 +66,7 @@ const FRAMES_ZONE: u16 = FRAMES + 1;
 const FRAMES_MODULES: u16 = FRAMES + 2;
 
 /// Exact names (static classes; allocator locks must be here).
-pub(crate) static TABLE: [LockClass; 22] = [
+pub(crate) static TABLE: [LockClass; 23] = [
     LockClass::fixed("sched", SCHED, false),
     LockClass::fixed("pci.enable", PCI_ENABLE, false),
     LockClass::fixed("pci.cfg", PCI_CFG, false),
@@ -83,6 +86,8 @@ pub(crate) static TABLE: [LockClass; 22] = [
     LockClass::fixed("frames.dma32", FRAMES_ZONE, true),
     LockClass::fixed("frames.normal", FRAMES_ZONE, true),
     LockClass::fixed("frames.modules", FRAMES_MODULES, true),
+    // PF-5 change request (INT-W27): vfs.inode.index > mm.grace > heap > frames.
+    LockClass::fixed("mm.grace", GRACE, false),
     // DP-2's VT sync mutex (INT-A2a): an outer sleeping lock under which the VT's hooks take the console's own
     // locks and present; not one of the sink targets its `display.` prefix would make it.
     LockClass::fixed("display.vt", SUBSYSTEM, false),
@@ -126,6 +131,7 @@ pub fn level_name(l: u16) -> &'static str {
         LEAF => "leaf",
         SCHED => "sched",
         KLOG_SINKS..=KLOG => "klog",
+        GRACE => "grace",
         ALLOC..=FRAMES_MODULES => "alloc",
         _ => "other",
     }

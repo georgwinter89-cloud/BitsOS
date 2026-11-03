@@ -9,3 +9,6 @@ hal = { path = "../hal" }
 ksync = { path = "../ksync" }
 bootinfo = { path = "../bootinfo" }
 klog = { path = "../klog" }
+
+[lints]
+workspace = true

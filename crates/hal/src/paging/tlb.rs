@@ -56,6 +56,7 @@ use crate::cpu::IrqGuard;
 use crate::percpu::{self, PerCpu};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 
+pub use super::tlb_cause::{Cause, CauseStats, CAUSES};
 pub use super::tlb_plan::{RANGE_PAGES, WAIT_BOUNDS_NS, WAIT_BUCKETS, ticks_to_ns};
 
 /// The system vector of the shootdown IPI (CP-3's system range; 0xF0 timer, 0xF1 SMP_CALL).
@@ -324,6 +325,14 @@ fn inc(c: &AtomicU64) {
     c.fetch_add(1, Relaxed);
 }
 
+/// MM-11 fixer: rounds a user unmap took before its end because its gather could not grow (`GATHER_MAX` frames,
+/// or no heap for more): Linux's `tlb_flush_mmu` on a full batch (linux-6.6/mm/mmu_gather.c:297).
+static GATHER_EARLY: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn count_gather_early() {
+    inc(&GATHER_EARLY);
+}
+
 /// Totals since boot (statistics for `mm`'s report and the ktests).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TlbStats {
@@ -399,6 +408,10 @@ pub struct TlbStats {
     pub several: u64,
     /// Rounds by wait (`tlb_plan::WAIT_BOUNDS_NS`: below 10 µs, 100 µs, 1 ms, 10 ms, and above).
     pub wait_hist: [u64; tlb_plan::WAIT_BUCKETS],
+    /// MM-11: flushes, rounds, IPIs and table-freeing flushes per cause (`Cause::ALL` order).
+    pub by_cause: [CauseStats; CAUSES],
+    /// MM-11 fixer: rounds of user unmaps taken before the unmap's end (a full gather, `count_gather_early`).
+    pub gather_early: u64,
 }
 
 pub fn stats() -> TlbStats {
@@ -452,6 +465,8 @@ pub fn stats() -> TlbStats {
         resent_once: l(&C.resent_once),
         several: l(&C.several),
         wait_hist: core::array::from_fn(|i| l(&C.wait_hist[i])),
+        by_cause: super::tlb_cause::by_cause(),
+        gather_early: l(&GATHER_EARLY),
     }
 }
 
@@ -960,7 +975,8 @@ fn enable_pcid(c: &CpuTlb) -> bool {
 /// is no kernel root, so `switch_root` would refuse it and load the kernel root, which lacks the identity-mapped
 /// stub page: the jump then faulted on the stub's address (Mini-PC 20.10., after INT-A2a2's refusal). Safe to
 /// load here because every other CPU is stopped and interrupts are off: no `leave` can free it under this CPU,
-/// and this kernel's Rust code never runs again.
+/// and this kernel's Rust code never runs again. Only the bare-metal `kexec_stub::jump` calls it.
+#[cfg(target_os = "none")]
 pub(crate) fn load_for_jump(root: u64) {
     if crate::BARE_METAL {
         imp::write_cr3(root);
@@ -1131,6 +1147,10 @@ fn apply_kernel(p: Plan) {
             (0..pages).for_each(|i| super::flush_page(start + i * 4096));
             inc(&C.page_flushes);
         }
+        Plan::Huge { start, count } => {
+            (0..count).for_each(|i| super::flush_page(start + i * (2 << 20)));
+            inc(&C.page_flushes);
+        }
         Plan::Full => flush_everything(),
     }
 }
@@ -1140,6 +1160,10 @@ fn apply_user(p: Plan) {
         Plan::Nothing => {}
         Plan::Pages { start, pages } => {
             (0..pages).for_each(|i| super::flush_page(start + i * 4096));
+            inc(&C.page_flushes);
+        }
+        Plan::Huge { start, count } => {
+            (0..count).for_each(|i| super::flush_page(start + i * (2 << 20)));
             inc(&C.page_flushes);
         }
         Plan::Full => {
@@ -1324,15 +1348,27 @@ fn finish(out: Outcome) -> Outcome {
 /// `tables` (page tables of `root` were freed) lazy CPUs are asked too and leave the root, as in Linux: a freed
 /// table must not stay reachable by a speculative walk. A root without a context is flushed on this CPU only (no
 /// other CPU can hold it).
-pub fn flush_user(root: u64, start: u64, end: u64, full: bool, tables: bool) -> Outcome {
+/// `cause` is what asked for it (`TlbStats::by_cause`).
+pub fn flush_user(root: u64, start: u64, end: u64, full: bool, tables: bool, cause: Cause) -> Outcome {
+    flush_user_published(root, tlb_plan::published_range(start, end, full), tables, cause)
+}
+
+/// MM-13: `flush_user` for a change of only 2 MiB entries in [start, end) (a huge page split, unmapped or
+/// protected): one `invlpg` per entry instead of a whole-context flush (`tlb_plan::published_huge`).
+pub fn flush_user_huge(root: u64, start: u64, end: u64, cause: Cause) -> Outcome {
+    flush_user_published(root, tlb_plan::published_huge(start, end), false, cause)
+}
+
+fn flush_user_published(root: u64, range: (u64, u64), tables: bool, cause: Cause) -> Outcome {
     if !crate::BARE_METAL {
         return Outcome::default();
     }
     let Some(x) = ctx_of(root) else {
         if super::current_root() == root {
             let _irq = IrqGuard::new();
-            apply_user(tlb_plan::plan(0, 1, Some(tlb_plan::published_range(start, end, full))));
+            apply_user(tlb_plan::plan(0, 1, Some(range)));
         }
+        super::tlb_cause::count(cause, &Outcome::default(), tables);
         return Outcome::default();
     };
     let _irq = IrqGuard::new();
@@ -1340,7 +1376,7 @@ pub fn flush_user(root: u64, start: u64, end: u64, full: bool, tables: bool) -> 
     let c = CPUS.get();
     acquire(&x.busy, c);
     let g = x.generation.load(SeqCst) + 1;
-    x.info.publish(g, tlb_plan::published_range(start, end, full));
+    x.info.publish(g, range);
     x.generation.store(g, SeqCst);
     inc(&C.user);
     service(c);
@@ -1364,6 +1400,7 @@ pub fn flush_user(root: u64, start: u64, end: u64, full: bool, tables: bool) -> 
     if skips.get() > 0 {
         C.lazy_skips.fetch_add(skips.get(), Relaxed);
     }
+    super::tlb_cause::count(cause, &out, tables);
     out
 }
 
@@ -1389,12 +1426,19 @@ pub fn leave(root: u64) -> Outcome {
         cpu_tlb(cpu).is_none_or(|t| tlb_plan::user_acked(xa, t.entering.load(SeqCst), t.loaded.load(SeqCst), 0, false, g, Ask::Leave))
     });
     x.busy.store(0, SeqCst);
+    super::tlb_cause::count(Cause::Exit, &out, true);
     out
 }
 
 /// After a change of kernel-half mappings in [start, end) (`full`: or page tables were freed): every online
-/// CPU drops the old translations before this returns, unless the outcome says otherwise.
+/// CPU drops the old translations before this returns, unless the outcome says otherwise. Counted as
+/// `Cause::Kernel`; `flush_kernel_as` names another cause.
 pub fn flush_kernel(start: u64, end: u64, full: bool) -> Outcome {
+    flush_kernel_as(start, end, full, Cause::Kernel)
+}
+
+/// `flush_kernel` for `cause` (`TlbStats::by_cause`).
+pub fn flush_kernel_as(start: u64, end: u64, full: bool, cause: Cause) -> Outcome {
     if !crate::BARE_METAL {
         return Outcome::default();
     }
@@ -1413,6 +1457,7 @@ pub fn flush_kernel(start: u64, end: u64, full: bool) -> Outcome {
         &|cpu, _| cpu_tlb(cpu).is_none_or(|t| t.kernel_synced.load(SeqCst) >= g),
     );
     KERNEL.busy.store(0, SeqCst);
+    super::tlb_cause::count(cause, &out, full);
     out
 }
 

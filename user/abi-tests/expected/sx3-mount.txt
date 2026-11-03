@@ -1,0 +1,67 @@
+uid_map = 11
+setgroups = 4
+gid_map = 11
+getpid = 1
+make / rslave = 0
+tmpfs base = 0
+chdir base = 0
+mkdir newroot = 0
+mkdir oldroot = 0
+bind newroot = 0
+pivot_root base = 0
+chdir / = 0
+old root under /oldroot = yes
+mkdir proc = 0
+proc = 0
+mkdir dev = 0
+dev tmpfs = 0
+dev/null file = 0
+bind dev/null = 0
+mkdir pts = 0
+devpts = 0
+ptmx link = 0
+mkdir mqueue = 0
+mqueue = 0
+mkdir data = 0
+data tmpfs = 0
+mkdir ro = 0
+bind data = 0
+remount ro = 0
+write data = 0
+write ro = -EROFS
+ro shows data = yes
+remount locked proc without nosuid = -EPERM
+remount locked proc keeping it = 0
+umount locked proc = -EINVAL
+umount busy oldroot = -EBUSY
+umount oldroot lazily = 0
+oldroot empty = ENOENT
+chdir newroot = 0
+pivot_root . . = 0
+umount . lazily = 0
+chdir / = 0
+getcwd = /
+/proc/self = yes
+/newroot = ENOENT
+/data/x = yes
+ptmx = chr 5:2 666
+ns/mnt link = mnt:[...]
+-- mountinfo container
+0 - /newroot / rw,nosuid,nodev,relatime - tmpfs sxbase rw,uid=1000,gid=1000,inode64
+1 0 / /proc rw,nosuid,nodev,noexec,relatime - proc sxproc rw
+2 0 / /dev rw,nosuid,nodev,relatime - tmpfs sxdev rw,mode=755,uid=1000,gid=1000,inode64
+host /dev/null
+3 2 / /dev/pts rw,nosuid,noexec,relatime - devpts sxpts rw,mode=620,ptmxmode=666
+4 2 / /dev/mqueue rw,relatime - mqueue sxmq rw
+5 0 / /data rw,nosuid,nodev,relatime - tmpfs sxdata rw,size=1024k,uid=1000,gid=1000,inode64
+6 0 / /ro ro,nosuid,nodev,relatime - tmpfs sxdata rw,size=1024k,uid=1000,gid=1000,inode64
+-- mounts
+sxbase / tmpfs rw,nosuid,nodev,relatime,uid=1000,gid=1000,inode64
+sxproc /proc proc rw,nosuid,nodev,noexec,relatime
+sxdev /dev tmpfs rw,nosuid,nodev,relatime,mode=755,uid=1000,gid=1000,inode64
+host /dev/null
+sxpts /dev/pts devpts rw,nosuid,noexec,relatime,mode=620,ptmxmode=666
+sxmq /dev/mqueue mqueue rw,relatime
+sxdata /data tmpfs rw,nosuid,nodev,relatime,size=1024k,uid=1000,gid=1000,inode64
+sxdata /ro tmpfs ro,nosuid,nodev,relatime,size=1024k,uid=1000,gid=1000,inode64
+container: exit 0

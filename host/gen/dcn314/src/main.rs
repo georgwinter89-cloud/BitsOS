@@ -2,7 +2,7 @@
 //!
 //!   cargo run --offline -- [--root <BitsOS dir>] [--out <crate dir>] [--check]
 //!
-//! --root defaults to $BITSOS_ROOT or /home/georg/BitsOS (inputs are read-only there);
+//! --root defaults to $BITSOS_ROOT or $HOME/BitsOS, the folder that holds werkzeuge/ (inputs are read-only there);
 //! --out defaults to crates/dcn314-regs of the tree this generator lives in.
 //! --check writes nothing and fails if the files on disk differ from a fresh run.
 
@@ -56,12 +56,19 @@ pub fn generate(offset_h: &[u8], sh_mask_h: &[u8], p1: &[u8]) -> Result<Output, 
     })
 }
 
+/// $BITSOS_ROOT, else `$HOME/BitsOS` (the desk's layout; no home value in the public tree).
+fn default_root() -> PathBuf {
+    std::env::var_os("BITSOS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("BitsOS"))
+}
+
 fn read(p: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
 fn run() -> Result<(), String> {
-    let mut root = std::env::var_os("BITSOS_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/home/georg/BitsOS"));
+    let mut root = default_root();
     let mut out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates/dcn314-regs");
     let mut check = false;
     let mut args = std::env::args().skip(1);
@@ -155,7 +162,7 @@ mod tests {
 
     /// The real Linux headers; missing inputs fail unless DCN314_ALLOW_SKIP=1 (machine without werkzeuge).
     fn real_inputs() -> Option<[Vec<u8>; 3]> {
-        let root = std::env::var_os("BITSOS_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/home/georg/BitsOS"));
+        let root = default_root();
         let dcn = root.join(DCN_DIR);
         let r = (|| Ok::<_, String>([
             read(&dcn.join("dcn_3_1_4_offset.h"))?,

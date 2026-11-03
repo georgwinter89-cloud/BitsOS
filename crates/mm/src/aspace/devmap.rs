@@ -40,7 +40,7 @@ impl AsCore {
                 continue;
             }
             let (s, e) = (v.start + (lo - f.pgoff) * PAGE, v.start + (hi - f.pgoff + 1) * PAGE);
-            let r = paging::protect_user(self.root, s, e - s, &mut |u| {
+            let r = paging::protect_user(self.root, s, e - s, paging::tlb::Cause::Device, &mut |u| {
                 u.flags.contains(PageFlags::WRITABLE).then_some(PageFlags(u.flags.0 & !PageFlags::WRITABLE | (u.flags.0 & CACHE_BITS)))
             });
             match r {

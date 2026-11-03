@@ -103,6 +103,8 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
     card.set_restart_worker(*WORKER.get_or_init(start_worker));
     // Quiesce from here on, even for a card that failed: a retry may bring it up later.
     devmodel::register_quiesce(card.clone());
+    // RB-15: the console mirror asks the card whether its frames are sent before the quiesce goes on.
+    klog::shutdown::register_tx_done(card.clone());
     match card.start() {
         Ok(()) => {}
         Err(e) if e.fatal() => return Err(e.text()),
@@ -221,6 +223,15 @@ impl<H: hw::Hw> NetDevice for Card<H> {
     }
     fn stats(&self) -> NetStats {
         Card::stats(self)
+    }
+}
+
+impl<H: hw::Hw> klog::shutdown::TxDone for Card<H> {
+    fn name(&self) -> &str {
+        Card::name(self)
+    }
+    fn tx_done(&self) -> Option<bool> {
+        Card::tx_done(self)
     }
 }
 

@@ -85,8 +85,9 @@ fn halt(cs: &CpuSched) {
     HALTS.inc();
     // A halt is an idle entry with interrupts on (`sti; hlt` below): what RB-3's watchdog counts as alive.
     cs.record_idle(time::now_ns(), true);
-    // `sti; hlt`: an interrupt arriving after the checks above still ends the halt (the sti shadow).
-    hal::cpu::enable_and_halt();
+    // `sti; hlt` or FD-1's deeper state entered with interrupts off: an interrupt arriving after the checks
+    // above still ends the sleep.
+    crate::cstate::sleep(cs);
     cs.halted.store(false, Ordering::SeqCst);
 }
 

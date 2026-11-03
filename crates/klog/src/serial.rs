@@ -99,6 +99,25 @@ pub fn flush(own: Option<(u64, &str)>, budget: usize) -> usize {
     }
 }
 
+/// `flush`, then waits at most `wait_ns` (klog's clock) until no CPU is printing and serial has every stored
+/// line: a printer on another CPU may be in the middle of a line when `flush` gives up at once (SN-12 change
+/// request, INT-W23: a ktest boot's serial log ended in `[ `). True when settled. Spins; for the end of a
+/// ktest boot or a halt, never for normal code. Without a clock (0) it does not wait.
+pub fn settle(wait_ns: u64) -> bool {
+    let t0 = crate::now();
+    loop {
+        flush(None, usize::MAX);
+        if PRINTER.load(Ordering::SeqCst) == 0 && !pending() {
+            return true;
+        }
+        let now = crate::now();
+        if now == 0 || now.saturating_sub(t0) >= wait_ns {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// The printer's loop (caller holds `PRINTER`). True if the ring stayed busy (try again later).
 fn print_some(own: Option<(u64, &str)>, budget: usize, printed: &mut usize) -> bool {
     while *printed < budget {

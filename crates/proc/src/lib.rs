@@ -40,12 +40,14 @@ mod exec;
 mod exit;
 mod group;
 mod image;
+pub mod vdso;
 pub mod procinfo;
 pub mod itimer;
 pub mod job;
 mod ktests;
 mod ktests_ab4;
 mod ktests_ab8;
+mod ktests_ab14;
 pub mod load;
 pub mod locks;
 mod mcp_run;
@@ -59,7 +61,9 @@ pub mod status;
 pub mod stdio;
 mod task;
 pub mod wait;
+pub mod ns;
 
+pub use mcp_run::MCP_PROGRAM;
 pub use clone::{CloneArgs, clone, forks_total};
 pub use exec::{ArgList, ExecRequest, ExecTarget, execve};
 pub use exit::{MmPin, Reaped, WaitEvent, WaitOpts, pin_mm, wait_child, wait_for};
@@ -119,7 +123,13 @@ pub struct Process {
     pub saved_auxv: SpinLock<Vec<u64>>,
     /// AB-7a: the image's layout and executable for /proc (Linux `mm->{start_code.., exe_file}`). fork copies it.
     pub image_info: SpinLock<procinfo::ImageInfo>,
+    /// FS-16: the cwd/root/umask its threads share (Linux `fs_struct`); a thread that took its own keeps it in
+    /// `Thread::own_fs`. Apart from `fds`: CLONE_FS shares this, CLONE_FILES the table.
+    fs: SpinLock<Arc<vfs::FsState>>,
     group: Arc<Group>,
+    /// AB-10a: the address space's LDT (modify_ldt; Linux `mm->context.ldt`): shared with a CLONE_VM child,
+    /// copied by fork, new at execve. Every thread of the image holds it in its kernel context.
+    pub ldt: Arc<hal::entry::segs::LdtSlot>,
 }
 
 impl core::ops::Deref for Process {
@@ -130,6 +140,20 @@ impl core::ops::Deref for Process {
 }
 
 impl Process {
+    /// FS-16: the cwd/root/umask /proc shows for this process (`/proc/<pid>/{cwd,root}`, `Umask:`): the leader
+    /// thread's (its own after unshare(CLONE_FS)), else the one its threads share. Calls use `Thread::fs`.
+    pub fn fs(&self) -> Arc<vfs::FsState> {
+        task::find_thread(self.pid).filter(|t| Arc::ptr_eq(t.group(), &self.group)).and_then(|t| t.own_fs()).unwrap_or_else(|| self.image_fs())
+    }
+    /// The state the image's threads share unless they took their own.
+    pub(crate) fn image_fs(&self) -> Arc<vfs::FsState> {
+        self.fs.lock().clone()
+    }
+    /// Puts `fs` in place for the image's threads; the old state is dropped outside the lock.
+    pub(crate) fn set_image_fs(&self, fs: Arc<vfs::FsState>) {
+        let old = core::mem::replace(&mut *self.fs.lock(), fs);
+        drop(old);
+    }
     pub fn subject(&self) -> Subject {
         Subject { program: self.program, pid: self.pid, uid: self.cred().euid }
     }
@@ -153,6 +177,19 @@ pub fn set_syscall_handler(h: SyscallHandler) {
 
 pub(crate) fn syscall_handler() -> Option<&'static SyscallHandler> {
     HANDLER.get()
+}
+
+static INT80: OnceRef<SyscallHandler> = OnceRef::new();
+static INT80_SLOT: ksync::Once<SyscallHandler> = ksync::Once::new();
+
+/// AB-10a: what answers `int 0x80` (the 32-bit TLS/LDT calls), installed once by the `syscall` crate.
+pub fn set_int80_handler(h: SyscallHandler) {
+    let r: &'static SyscallHandler = INT80_SLOT.get_or_init(|| h);
+    INT80.set(r);
+}
+
+pub(crate) fn int80_handler() -> Option<&'static SyscallHandler> {
+    INT80.get()
 }
 
 /// Kernel init (called by `syscall::init`): lets user copies that fault on a page the program has not touched
@@ -259,11 +296,14 @@ fn next_id(table: &[Arc<Process>]) -> Option<u32> {
 
 /// Puts a new process image into the table under a fresh id (or `want`: pid 1, clone3's set_tid). `make` runs
 /// under the table lock and sees the table (fork reads its parent's ids there, consistent with an exit's
-/// reparenting, which runs under the same lock).
-pub(crate) fn insert_new(make: impl FnOnce(u32, &[Arc<Process>]) -> Arc<Process>, want: Option<u32>) -> Result<Arc<Process>, SpawnError> {
+/// reparenting, which runs under the same lock). SX-2: `pid_ns` is the namespace the process's pid lives in;
+/// below the initial one the global id is always fresh and `want` names the number in `pid_ns` (ENOMEM once
+/// that namespace's init has ended, EEXIST when the wanted number is taken).
+pub(crate) fn insert_new(make: impl FnOnce(u32, &[Arc<Process>]) -> Arc<Process>, want: Option<u32>, pid_ns: &Arc<ns::pid::PidNs>) -> Result<Arc<Process>, SpawnError> {
     let mut t = TABLE.lock();
     t.try_reserve(1).map_err(|_| SpawnError::NoMemory)?;
-    let pid = match want {
+    let global_want = if pid_ns.is_init() { want } else { None };
+    let pid = match global_want {
         Some(w) => {
             if id_in_use(&t, w) {
                 return Err(SpawnError::Io(if w == 1 { uapi::errno::EBUSY } else { uapi::errno::EEXIST }));
@@ -272,9 +312,16 @@ pub(crate) fn insert_new(make: impl FnOnce(u32, &[Arc<Process>]) -> Arc<Process>
         }
         None => next_id(&t).ok_or(SpawnError::NoPid)?,
     };
+    pid_ns.alloc(pid, want.filter(|_| !pid_ns.is_init()), true).map_err(SpawnError::Io)?;
     let p = make(pid, &t);
     t.push(p.clone());
     Ok(p)
+}
+
+/// SX-2: a process leaving the table gives its numbers in the pid namespaces back (`free_pid`). Called with
+/// the table lock held.
+pub(crate) fn left_table(p: &Process) {
+    p.pid_ns.free(p.pid);
 }
 
 /// A fresh id for a new thread of an existing group.
@@ -283,11 +330,23 @@ pub(crate) fn new_tid() -> Option<u32> {
     next_id(&t)
 }
 
+/// SX-2: a fresh global id for a new thread whose group lives in `pid_ns` (not the initial one), with its
+/// numbers there (`want`: clone3's set_tid for the innermost level), in one table critical section like
+/// `insert_new`: EAGAIN without a free id, else what `PidNs::alloc` answers.
+pub(crate) fn new_tid_in(pid_ns: &Arc<ns::pid::PidNs>, want: Option<u32>) -> Result<u32, vfs::Errno> {
+    let t = TABLE.lock();
+    let tid = next_id(&t).ok_or(uapi::errno::EAGAIN)?;
+    pid_ns.alloc(tid, want, false)?;
+    Ok(tid)
+}
+
 /// Takes `pid` out of the table (the caller drops it, outside the lock).
 pub(crate) fn remove(pid: u32) -> Option<Arc<Process>> {
     let mut t = TABLE.lock();
     let i = t.iter().position(|q| q.pid == pid)?;
-    Some(t.swap_remove(i))
+    let p = t.swap_remove(i);
+    left_table(&p);
+    Some(p)
 }
 
 /// Replaces the table entry of `new.pid` with the new image; returns the old one.
@@ -309,6 +368,20 @@ pub(crate) fn mm_shared(mm: &Arc<AddressSpace>, except: u32) -> bool {
 /// CLONE_THREAD); see `mm_shared`.
 pub fn fds_shared(fds: &Arc<FdTable>, except: u32) -> bool {
     TABLE.lock().iter().any(|q| q.pid != except && !q.is_released() && Arc::ptr_eq(&q.fds, fds))
+}
+
+/// FS-16: the calling thread's cwd/root/umask (`current->fs`; None in kernel threads).
+pub fn current_fs() -> Option<Arc<vfs::FsState>> {
+    let t = current_thread()?;
+    current().map(|p| t.fs(&p))
+}
+
+/// SX-2/FS-16: whether a process other than `except` that still runs its image uses this file-system state (its
+/// image's or one of its threads' own; CLONE_FS): Linux's `fs->users != 1` across processes. The caller counts its
+/// own group's threads. The processes are collected first, their states looked at outside `proc.table`.
+pub fn fs_shared(fs: &Arc<vfs::FsState>, except: u32) -> bool {
+    let others: Vec<Arc<Process>> = TABLE.lock().iter().filter(|q| q.pid != except && !q.is_released()).cloned().collect();
+    others.iter().any(|q| Arc::ptr_eq(&q.image_fs(), fs) || q.threads().iter().any(|t| t.own_fs().is_some_and(|o| Arc::ptr_eq(&o, fs))))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,14 +574,15 @@ fn spawn_inner(path: &str, src: image::Source<'_>, o: &SpawnOptions<'_>, exe: Op
                 Some(q) => (q.pid, q.pgid(), q.sid(), false),
                 None => (0, pid, pid, true),
             };
-            let ids = group::Ids { tgid: pid, ppid, pgid, sid, session_leader: leader, creator_tid: ppid, cred: cred.clone() };
+            let ids = group::Ids { tgid: pid, ppid, pgid, sid, session_leader: leader, creator_tid: ppid, cred: cred.clone(), pid_ns: ns::pid::init_pid_ns().clone(), nsset: ns::set::init_set().clone() };
             // AB-6: init (pid 1) is SIGNAL_UNKILLABLE: no signal it has no handler for reaches it.
             let sigs = signal::SignalState::default();
             sigs.raw(|s| s.unkillable = pid == 1);
             let g = Group::new(ids, uapi::ab::signal::SIGCHLD, o.class, sigs, rlimit::Limits::new(ram_pages), time::now_ns());
-            make_image(pid, base_name(path), String::from(path), args, o.program, &cred, mm, fds, ns, g)
+            make_image(pid, base_name(path), String::from(path), args, o.program, &cred, mm, fds, Arc::new(vfs::FsState::new()), ns, g, hal::entry::segs::LdtSlot::new())
         },
         o.pid1.then_some(1),
+        ns::pid::init_pid_ns(),
     )?;
     p.group.set_image(&p);
     *p.saved_auxv.lock() = l.auxv;
@@ -522,7 +596,7 @@ fn spawn_inner(path: &str, src: image::Source<'_>, o: &SpawnOptions<'_>, exe: Op
     klog::event!(Info, "proc", "spawn", pid = p.pid, ppid = p.ppid(), path = path, entry = klog::Hex(l.entry), pie = elf.is_pie, bias = klog::Hex(l.bias), interp_base = klog::Hex(l.interp_base), program = o.program.0);
     let t = Thread::new(p.pid, &p.group);
     t.prctl().set_comm(prctl_state::comm_of(p.name.as_bytes()));
-    if let Err(e) = task::start(&p, t, UserContext::new(l.entry, l.rsp), None, 0, 0) {
+    if let Err(e) = task::start(&p, t, UserContext::new(l.entry, l.rsp), None, None, 0, 0, None) {
         klog::event!(Warn, "proc", "spawn.no_thread", pid = p.pid, path = path);
         drop(remove(p.pid));
         return Err(e);
@@ -547,10 +621,12 @@ pub(crate) fn make_image(
     cred: &cred::Cred,
     mm: Arc<AddressSpace>,
     fds: Arc<FdTable>,
+    fs: Arc<vfs::FsState>,
     ns: Arc<MountNs>,
     group: Arc<Group>,
+    ldt: Arc<hal::entry::segs::LdtSlot>,
 ) -> Arc<Process> {
-    Arc::new(Process { pid, name, path, argv, program, uid: cred.euid, gid: cred.egid, mm, fds, ns, mm_flags: prctl_state::MmFlags::new(), saved_auxv: SpinLock::named("proc.auxv", Vec::new()), image_info: SpinLock::named("proc.image", procinfo::ImageInfo::default()), group })
+    Arc::new(Process { pid, name, path, argv, program, uid: cred.euid, gid: cred.egid, mm, fds, ns, mm_flags: prctl_state::MmFlags::new(), saved_auxv: SpinLock::named("proc.auxv", Vec::new()), image_info: SpinLock::named("proc.image", procinfo::ImageInfo::default()), fs: SpinLock::named("proc.fs", fs), group, ldt })
 }
 
 /// Random bytes for AT_RANDOM and getrandom: FS-2's ChaCha20 generator (seeded from RDSEED/RDRAND, never

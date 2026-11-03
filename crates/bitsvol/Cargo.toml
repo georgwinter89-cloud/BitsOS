@@ -10,3 +10,6 @@ klog = { path = "../klog" }
 kreg = { path = "../kreg" }
 ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
+
+[lints]
+workspace = true

@@ -252,7 +252,10 @@ fn space_report_counts_shared_content_once() {
 
     let (code, out, _) = run(&root, &["space"], None);
     assert_eq!(code, 0);
-    for want in ["demo: package ", "  version 2.0 current: ", "  cache 1", " in Default/Cache, fontcache", "store unused: 1 files, 6 bytes", "data without program: other"] {
+    // The cache's size includes its folders' own sizes, which differ by file system (4096 each here): the line
+    // is checked against the number the report computed, not a fixed first digit.
+    let cache = format!("  cache {} bytes", dd.cache.bytes);
+    for want in ["demo: package ", "  version 2.0 current: ", &cache, " in Default/Cache, fontcache", "store unused: 1 files, 6 bytes", "data without program: other"] {
         assert!(out.contains(want), "space missed {want:?}:\n{out}");
     }
     let (code, out, _) = run(&root, &["space", "demo"], None);

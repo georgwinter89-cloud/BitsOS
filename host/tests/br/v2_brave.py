@@ -36,10 +36,28 @@ def extra(ip):
     return ["--test-type", f"--host-resolver-rules=MAP {HOST} {ip}, MAP * ~NOTFOUND",
             f"--unsafely-treat-insecure-origin-as-secure={BASE}"]
 
-# ENOSYS Brave is known to meet without its sandbox (plan/notes/br-BR-1.md, br-BR-3.md): rseq (AB-8 contract),
+# ENOSYS Brave is known to meet with or without its sandbox (plan/notes/br-BR-1.md, br-BR-3.md, br-BR-6.md): rseq (AB-8 contract),
 # landlock_create_ruleset (Chromium goes on without it), ptrace (crashpad's handler). The pkey calls answer since
 # INT-W10 (BR-3 CR 4).
 KNOWN_ENOSYS = {101: "ptrace", 334: "rseq", 444: "landlock_create_ruleset"}
+def sandbox_line(text, need_on=False):
+    """BR-6/6b: the launcher's last `sandbox:` line (a start Chromium refused says a second one). Since SX-2 the
+    sandbox is on by default; off is accepted only for BRAVE_SANDBOX=off (a deliberate look without). A kernel
+    without the namespace calls (the probe's unshare gets ENOSYS), a failing or hanging namespace call, Chromium's
+    "No usable sandbox!" (`sandbox: missing`) or the auto fallback (`sandbox: off`) are RED."""
+    lines = re.findall(r"^brave: sandbox: .*$", text, re.M)
+    line = lines[-1] if lines else "brave: no sandbox line"
+    print(line, flush=True)
+    need(lines, "the launcher says whether Brave runs in its sandbox", text[-2000:])
+    if line.startswith("brave: sandbox: on"):
+        return True
+    need(not need_on, "Brave runs in its own sandbox (BR-6)", line)
+    no_sx2 = "unshare" in line and "Function not implemented" in line
+    need(not no_sx2, "the kernel has the namespace calls of Chromium's sandbox (SX-2): unshare is ENOSYS", line)
+    need("BRAVE_SANDBOX=off" in line, "Brave runs in its own sandbox unless BRAVE_SANDBOX=off (BR-6b)", line)
+    return False
+
+
 # Differing pixels (any channel off by more than 24) between V2's and the host's picture: the page itself (below
 # Brave's bars, PAGE box) must be the same; the whole screen may differ a little, since Brave's own bars draw their
 # text in another size on V2 (an open point in plan/notes/br-BR-3.md). Measured 22.10.: page 0, screen 1.53 %.
@@ -149,6 +167,8 @@ def main():
         raise
     print(f"Brave: render.html ready {time.time() - t0:.1f} s after the start (QEMU, not judged)", flush=True)
     need("profile: new" in b.poll(), "a new profile (tar mode: none on the stick yet)", b.text[-2000:])
+    # BR-6: on (SX-2 in), or off only without SX-2 (the probe's unshare ENOSYS) or by BRAVE_SANDBOX=off.
+    sandbox_line(b.text)
     print("with Brave: " + call(c, "ps", {})[1].splitlines()[0], flush=True)
     ctl(c, "max")
     w, h, px = still(q, 100)

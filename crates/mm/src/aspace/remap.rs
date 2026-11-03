@@ -8,11 +8,12 @@
 //! its charge). Device VMAs (Linux VM_DONTEXPAND|VM_PFNMAP) move but do not grow (EFAULT) and refuse
 //! MREMAP_DONTUNMAP (EINVAL).
 
+use super::huge::{HUGE, HUGE_PAGES};
 use super::{AsCore, Inner};
 use crate::linux::{Errno, Space, MMAP_MIN_ADDR, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, TASK_SIZE};
 use crate::vma::Vma;
 use crate::{commit, PAGE};
-use hal::paging::{self, Released};
+use hal::paging::{self, tlb, PageSize, Released};
 
 klog::counter!(REMAP_MOVES, "mm.as.remap_moves");
 klog::counter!(REMAP_MOVED_PAGES, "mm.as.remap_moved_pages");
@@ -64,7 +65,7 @@ impl AsCore {
                 // new_len <= TASK_SIZE and addr is in a VMA, so this cannot wrap; wrapping_add keeps a hostile
                 // length from ever overflow-panicking the kernel should the checks above change (Linux wraps too).
                 let (s, e) = g.space.plan_munmap(addr.wrapping_add(new_len), old_len - new_len)?;
-                self.remove_range(&mut g, s, e)?;
+                self.remove_range(&mut g, s, e, tlb::Cause::Mremap)?;
             }
             return Ok(addr);
         }
@@ -89,12 +90,12 @@ impl AsCore {
         }
         if flags & MREMAP_FIXED != 0 {
             let (s, e) = g.space.plan_munmap(new_addr, new_len)?;
-            self.remove_range(g, s, e)?;
+            self.remove_range(g, s, e, tlb::Cause::Mremap)?;
         }
         let mut old_len = old_len;
         if old_len > new_len {
             let (s, e) = g.space.plan_munmap(addr.wrapping_add(new_len), old_len - new_len)?;
-            self.remove_range(g, s, e)?;
+            self.remove_range(g, s, e, tlb::Cause::Mremap)?;
             old_len = new_len;
         }
         let v = resize_check(&g.space, addr, old_len, new_len, flags)?;
@@ -174,10 +175,26 @@ impl AsCore {
 
     /// Moves the page entries of [old, old + len) to [to, to + len): frames keep their owners (nothing copied or
     /// freed), the old entries are shot down and emptied tables freed. On a missing page table it puts back what
-    /// it moved and answers ENOMEM.
+    /// it moved and answers ENOMEM. MM-13: a 2 MiB leaf moves whole when `to` has `old`'s offset in 2 MiB and its
+    /// new slot is empty (Linux `move_huge_pmd`, mm/mremap.c:558); one the range cuts, or with another offset, or
+    /// whose new slot holds a page table, is split first and moves page by page.
     fn move_pages(&self, g: &mut Inner, old: u64, to: u64, len: u64) -> Result<(), Errno> {
         if len == 0 {
             return Ok(());
+        }
+        if self.ctr.huge() > 0 {
+            self.split_edges(g, old, old + len, tlb::Cause::Mremap);
+            if (to ^ old) & (HUGE - 1) != 0 {
+                self.split_range(g, old, old + len, tlb::Cause::Mremap);
+            } else {
+                let mut va = old.next_multiple_of(HUGE);
+                while va + HUGE <= old + len {
+                    if !paging::huge_slot_free(self.root, to + (va - old)) {
+                        self.split_huge_at(g, va, tlb::Cause::Mremap);
+                    }
+                    va += HUGE;
+                }
+            }
         }
         let mut failed = false;
         let mut moved = 0u64;
@@ -185,19 +202,25 @@ impl AsCore {
             if failed {
                 return;
             }
-            if paging::map_user_4k(self.root, to + (u.virt - old), u.phys, u.flags, &mut || self.alloc_table()).is_err() {
+            let dst = to + (u.virt - old);
+            let (r, n) = if u.size == PageSize::Size2M {
+                (paging::map_user_2m(self.root, dst, u.phys, u.flags, &mut || self.alloc_table()), HUGE_PAGES)
+            } else {
+                (paging::map_user_4k(self.root, dst, u.phys, u.flags, &mut || self.alloc_table()), 1)
+            };
+            if r.is_err() {
                 failed = true;
             } else {
-                moved += 1;
+                moved += n;
             }
         });
         // Take out one side's entries without freeing the frames (they live on at the other side).
         let from = if failed { to } else { old };
         let (d, l, ctr) = (&mut g.deferred, &mut g.lost, &self.ctr);
-        let r = paging::unmap_user(self.root, from, len, &mut |r: Released| {
+        let r = paging::unmap_user(self.root, from, len, tlb::Cause::Mremap, &mut |r: Released| {
             if r.table {
                 ctr.tables_freed(1);
-                Self::give_back(&r, &super::Owner::Device, d, l);
+                Self::give_back(&r, &super::Owner::Device(None), d, l);
             }
         });
         if r.as_ref().is_ok_and(|u| !u.outcome.confirmed()) {

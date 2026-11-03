@@ -76,6 +76,12 @@ impl Mixer {
     pub fn clients(&self) -> alloc::vec::Vec<crate::mixer::ClientInfo> {
         self.sh.client_infos()
     }
+    /// This mixer's Quiesce as `mixer()` registers it for the kernel's (ktest `sn.mix.reboot_order` runs it on a
+    /// private mixer, without the registry).
+    pub(crate) fn quiesce_handle(&self) -> MixQuiesce {
+        MixQuiesce(Arc::downgrade(&self.sh))
+    }
+
     /// The thread was told to end (`stop`, or Quiesce before a Reload).
     pub fn stopped(&self) -> bool {
         self.sh.stop.load(Ordering::Acquire)
@@ -116,13 +122,23 @@ impl Mixer {
 
 fn run<B: Backend>(mut core: Core<B>, sh: Arc<Shared>) {
     loop {
-        if sh.stop.load(Ordering::Acquire) {
-            core.shutdown();
+        if stop_seen(&mut core, &sh) {
             return;
         }
         let t = core.step(time::now_ns());
+        core.sleeping_until(time::now_ns().saturating_add(t));
         sh.wake.wait_until_timeout(|| sh.take_kick() || sh.stop.load(Ordering::Acquire), t);
     }
+}
+
+/// The stop flag (a test's `stop` or [`MixQuiesce`]) seen: every output closed. After hda's Quiesce these
+/// closes touch no register any more (SN-7) and nothing opens again: the thread returns right after.
+pub(crate) fn stop_seen<B: Backend>(core: &mut Core<B>, sh: &Shared) -> bool {
+    if !sh.stop.load(Ordering::Acquire) {
+        return false;
+    }
+    core.shutdown();
+    true
 }
 
 static GLOBAL: SpinLock<Option<Arc<Mixer>>> = SpinLock::named("snd.mixer", None);
@@ -209,8 +225,10 @@ pub(crate) fn set_target_from(t: Target, source: &'static str) -> Result<(), all
 
 /// Quiesce for the kernel's mixer: only raises the stop flag. No wake and no join, because Quiesce runs with
 /// interrupts off, maybe on the panic path, where a run queue lock may be held; the thread sees the flag at its
-/// next timed wake (at most one period) and closes its outputs, which hda then refuses as NotUp.
-struct MixQuiesce(alloc::sync::Weak<Shared>);
+/// next timed wake (at most one period) and closes its outputs. Registered after hda's controllers, so it runs
+/// first; when the thread gets to its closes (in the reboot's reset sleeps) hda is quiesced: start, write and
+/// open answer NotUp, stop and close touch no register (SN-7, host test `reboot_order_*` in `tests_hda.rs`).
+pub(crate) struct MixQuiesce(pub(crate) alloc::sync::Weak<Shared>);
 
 impl devmodel::Quiesce for MixQuiesce {
     fn name(&self) -> &str {

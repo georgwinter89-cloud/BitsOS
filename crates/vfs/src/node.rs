@@ -29,12 +29,24 @@ pub trait File: Send + Sync {
     fn seekable(&self) -> bool {
         false
     }
+    /// FS-16: Linux's FMODE_PWRITE, whether pwrite64/pwritev/pwritev2 may name a position (else ESPIPE before
+    /// any other check, linux-6.6/fs/read_write.c `ksys_pwrite64`, `do_pwritev`). seq_file files clear it
+    /// (fs/seq_file.c `seq_open`); write(2) at the file position still works there. `opened_for_write`: the
+    /// open file may write (kernfs gives the mode back only then). Default: `seekable`.
+    fn positional_write(&self, _opened_for_write: bool) -> bool {
+        self.seekable()
+    }
     fn events(&self) -> Events {
         Events(Events::IN | Events::OUT)
     }
     /// fsync/fdatasync: EINVAL for objects without one, as Linux.
     fn fsync(&self) -> Result<(), Errno> {
         Err(EINVAL)
+    }
+    /// PF-4: the page cache whose `read_at` is exactly this file's `read_at` (a regular file's content), so
+    /// read/pread copy from its pages straight to the program; None: reads go through `read_at`.
+    fn read_cache(&self) -> Option<&crate::pagecache::PageCache> {
+        None
     }
     /// read(2) on an object without a position (devices, pipes): `nonblock` is the fd's O_NONBLOCK. Objects
     /// that may wait (a terminal) wait here, in bounded slices that look at `dentry::interrupted()`.
@@ -130,6 +142,10 @@ pub trait File: Send + Sync {
     fn as_epoll(&self) -> Option<&crate::epoll::Epoll> {
         None
     }
+    /// DR-3: the eventfd behind an eventfd file, for kernel signalers (Linux `eventfd_ctx_fdget`).
+    fn as_eventfd(&self) -> Option<&crate::eventfd::EventFd> {
+        None
+    }
     /// FS-4: `events()` is already Linux's whole mask (eventfd, epoll: no RDNORM/WRNORM where Linux has none).
     /// False: the VFS adds RDNORM to IN and WRNORM to OUT (`poll::file_mask`), as most Linux files report.
     fn poll_exact(&self) -> bool {
@@ -137,6 +153,17 @@ pub trait File: Send + Sync {
     }
     /// What `/proc/<pid>/fd/<n>` shows for an object without a path (`pipe:[ino]`, `anon_inode:[eventfd]`).
     fn link_name(&self) -> Option<String> {
+        None
+    }
+    /// DR-5 (CR-DR5-1): the device mapping `mmap` uses for a file without a device number (a dma-buf fd): an
+    /// `Arc<mm::device::DeviceMap>` as `Any`, since the VFS cannot name MM's type. None: the usual rules.
+    fn device_map(&self) -> Option<Arc<dyn core::any::Any + Send + Sync>> {
+        None
+    }
+    /// DR-6 (CR-DR6-1): the device mapping for an `mmap` of `pages` pages at page offset `pgoff`, for a file whose
+    /// mappable memory depends on the offset (a DRM render node's GEM objects, Linux `drm_gem_mmap`). None: ask
+    /// `device_map`. Some(Err(e)): the mmap fails with `e` (Linux's `f_op->mmap` answer).
+    fn device_map_at(&self, _pgoff: u64, _pages: u64) -> Option<Result<Arc<dyn core::any::Any + Send + Sync>, Errno>> {
         None
     }
 }
@@ -236,6 +263,9 @@ impl File for RegFile {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<usize, Errno> {
         self.inode.read_at(pos, buf)
     }
+    fn read_cache(&self) -> Option<&crate::pagecache::PageCache> {
+        self.inode.read_cache()
+    }
     fn write_at(&self, pos: u64, buf: &[u8]) -> Result<usize, Errno> {
         crate::inode::check_limit(pos, buf.len())?;
         let n = buf.len().min((crate::abi::MAX_FILE_SIZE - pos) as usize);
@@ -325,6 +355,10 @@ impl File for ProcFile {
     }
     fn seekable(&self) -> bool {
         true
+    }
+    /// `proc_create_single` files are `single_open` seq files (no pwrite); kernfs read-only attributes too.
+    fn positional_write(&self, _opened_for_write: bool) -> bool {
+        false
     }
 }
 
@@ -419,6 +453,9 @@ impl File for NodeFile {
     }
     fn seekable(&self) -> bool {
         self.file.seekable()
+    }
+    fn positional_write(&self, opened_for_write: bool) -> bool {
+        self.file.positional_write(opened_for_write)
     }
     fn events(&self) -> Events {
         self.file.events()

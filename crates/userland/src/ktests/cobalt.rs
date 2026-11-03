@@ -1,10 +1,11 @@
 //! YT-2: `\BITSOS2\cobalt\` (Cobalt for YouTube TV, ~155 MB) and its launcher `\BITSOS2\bin\cobalt` as the
 //! package list names them.
-//! - `ul.pkg.cobalt` (Safe, rerunnable): only reads the stick and starts `--check`, which writes nothing.
+//! - `ul.pkg.cobalt` (Program: on the Mini-PC only, Georg 30.10.; rerunnable): only reads the stick and starts
+//!   `--check`, which writes nothing.
 //! - `ul.pkg.cobalt_profile` (QemuOnly: it writes the stick): the launcher's sign-in round trip on V2's vfat
 //!   with a stub Cobalt, into a scratch home `\BITSOS2\YTKHOME\` that it removes again.
 
-use super::pkg::{Line, Sha256, TEST_STICK_ID, absent, entries, list, on_stick};
+use super::pkg::{Line, Sha256, TEST_STICK_ID, list, on_stick, program_tree};
 use super::{SEC, finish, read, scratch, start, start_as, text, wait_for};
 use alloc::format;
 use alloc::string::String;
@@ -44,14 +45,9 @@ fn file_ok(l: &Line) -> TestResult {
 /// libraries from `cobalt/lib`, the rest from /usr/lib; then `cobalt --check` as uid 1000 and as root.
 fn cobalt() -> TestResult {
     let l = list()?;
-    let all = entries(&l);
-    let tree: Vec<&Line> = all.iter().filter(|e| e.kind == "stick" && e.path.starts_with(TREE)).collect();
-    if tree.is_empty() {
-        return absent(&l, "no \\BITSOS2\\cobalt\\ in this image's list");
-    }
-    let Some(launcher) = on_stick("cobalt")? else {
-        return ktest::skip("no cobalt in \\BITSOS2\\bin of this stick (xtask stick does not copy the package yet), or an optional image");
-    };
+    // Georg 30.10.: on the Mini-PC only; a missing tree or launcher is a failure (pkg::program_tree).
+    let (lines, launcher) = program_tree(&l, TREE, "cobalt")?;
+    let tree: Vec<&Line> = lines.iter().collect();
     // YT-5 CR (INT-W7): the licence texts are part of the package (LICENSES/, made by stage-v2.sh).
     for name in ["README.txt", "libcobalt.txt", "loader_app.txt", "fonts.txt", "ffmpeg.txt"] {
         let p = format!("{TREE}LICENSES/{name}");
@@ -122,7 +118,7 @@ fn cobalt() -> TestResult {
     klog::event!(Info, "ul", "pkg.cobalt", files = tree.len(), bytes = bytes, read_ms = read_ms, libraries = found.len(), boot_rw = boot_rw);
     Ok(())
 }
-ktest!("ul.pkg.cobalt", Safe, cobalt);
+ktest!("ul.pkg.cobalt", Program, cobalt);
 
 /// The scratch home on the stick (under `\BITSOS2\`, writable for root; never the real `HOME`).
 const KHOME: &str = "/boot/BITSOS2/YTKHOME";

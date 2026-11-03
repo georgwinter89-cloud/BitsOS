@@ -1,5 +1,5 @@
 //! AB-8: the dynamic programs of the ABI diff. `user/abi-tests/dyn/*.c` are built with the host's gcc against
-//! CachyOS's glibc (`dyn-<stem>`, PIE, PT_INTERP `/lib64/ld-linux-x86-64.so.2`), CachyOS's own `ls` and `cat`
+//! CachyOS's glibc (`dyn-<stem>`, PIE, PT_INTERP `/lib64/ld-linux-x86-64.so.2`; `*-static.c` as static-PIE), CachyOS's own `ls` and `cat`
 //! are copied unchanged (`dyn-ls`, `dyn-cat`), and the libraries `ldd` lists for them (the loader, libc.so.6,
 //! libcap.so.2) go into the image's `/bin` under their sonames. On V2 they belong to `/lib64` and `/usr/lib`:
 //! until the image puts them there (UL-5, desk change request in plan/notes/ab-AB-8.md) the harness writes
@@ -43,7 +43,11 @@ fn try_build(root: &Path, out: &Path) -> Result<Vec<(String, PathBuf)>, String> 
         let name = format!("dyn-{}", s.file_stem().unwrap_or_default().to_string_lossy());
         let exe = out.join(&name);
         let mut c = Command::new("gcc");
-        c.args(["-O2", "-Wall", "-Werror", "-std=gnu11", "-pthread", "-fPIE", "-pie"]).arg(format!("-I{}", root.join("user/abi-tests/c").display())).arg("-o").arg(&exe).arg(&s);
+        // AB-14: `<stem>-static.c` is a static-PIE glibc program (glibc's own vDSO set-up without ld.so).
+        let link: &[&str] = if name.ends_with("-static") { &["-static-pie"] } else { &["-fPIE", "-pie"] };
+        c.args(["-O2", "-Wall", "-Werror", "-std=gnu11", "-pthread"]).args(link).arg(format!("-I{}", root.join("user/abi-tests/c").display())).arg("-o").arg(&exe).arg(&s);
+        // DR-2 CR (INT-W23): a first line `// abi-dyn-link: -ldrm -ldrm_amdgpu` adds libraries (only -l flags).
+        c.args(link_flags(&std::fs::read_to_string(&s).unwrap_or_default())?);
         run_status(&mut c, &format!("building {name} (host gcc, glibc)"))?;
         progs.push((name, exe));
     }
@@ -67,6 +71,18 @@ fn try_build(root: &Path, out: &Path) -> Result<Vec<(String, PathBuf)>, String> 
     }
     progs.extend(libs);
     Ok(progs)
+}
+
+/// The extra libraries a dyn program names on its first line (`// abi-dyn-link: -lfoo -lbar`); anything but a
+/// `-l<name>` flag is refused, so a source file cannot change how the others are built.
+fn link_flags(src: &str) -> Result<Vec<String>, String> {
+    let Some(rest) = src.lines().next().and_then(|l| l.strip_prefix("// abi-dyn-link:")) else { return Ok(Vec::new()) };
+    rest.split_whitespace()
+        .map(|f| {
+            let ok = f.len() > 2 && f.starts_with("-l") && f[2..].chars().all(|c| c.is_ascii_alphanumeric() || "_+-.".contains(c));
+            if ok { Ok(f.to_string()) } else { Err(format!("abi-dyn-link: {f:?} is not a -l<library> flag")) }
+        })
+        .collect()
 }
 
 /// `ldd exe`: (soname, the real file) for every library and the loader; the vDSO has no file.
@@ -154,5 +170,13 @@ mod tests {
         assert!(is_lib("libc.so.6") && is_lib("ld-linux-x86-64.so.2") && !is_lib("dyn-ls"));
         assert_eq!(lib_path("ld-linux-x86-64.so.2"), "/lib64/ld-linux-x86-64.so.2");
         assert_eq!(lib_path("libcap.so.2"), "/usr/lib/libcap.so.2");
+    }
+
+    #[test]
+    fn dyn_link_line() {
+        assert!(link_flags("#include <stdio.h>\n").unwrap().is_empty());
+        assert_eq!(link_flags("// abi-dyn-link: -ldrm -ldrm_amdgpu\nint x;").unwrap(), ["-ldrm", "-ldrm_amdgpu"]);
+        assert!(link_flags("// abi-dyn-link: -ldrm -Wl,-rpath,/x\n").is_err());
+        assert!(link_flags("// abi-dyn-link: -l\n").is_err());
     }
 }

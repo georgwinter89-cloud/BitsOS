@@ -28,12 +28,16 @@
 //! event. The drop makes every CPU that still has the root loaded (lazily) leave it before anything is freed.
 //! An unconfirmed `mprotect` downgrade returns success, as on Linux (which waits without a bound instead): the
 //! IPI stays pending in the silent CPU's local APIC and flushes before that CPU runs user code again.
+//! MM-11: one munmap, madvise or hole punch gathers every VMA's pages into one round (`Zap`, Linux's mmu_gather);
+//! munmap frees only page tables no neighbouring VMA shares, madvise and reclaim free none, so most rounds skip
+//! the CPUs that hold the root lazily; every shootdown carries its cause (`tlb::stats().by_cause`).
 
 mod advise;
 pub(crate) mod counters;
 mod devmap;
 pub(crate) mod fault;
 mod fork;
+mod huge;
 mod remap;
 pub mod rmap;
 mod shm;
@@ -50,7 +54,7 @@ use crate::{share, MmError, MMAP_TOP, PAGE};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::Deref;
-use hal::paging::{self, PageFlags, Released};
+use hal::paging::{self, tlb, PageFlags, PageSize, Released};
 use ksync::Mutex;
 use vfs::mmap::{MapBacking, Mapped};
 
@@ -75,13 +79,19 @@ klog::counter!(DEFERRED_FRAMES, "mm.as.frames_deferred");
 klog::counter!(pub(crate) UNCONFIRMED, "mm.as.shootdowns_unconfirmed");
 klog::counter!(pub(crate) AS_LEAKED, "mm.as.tables_leaked");
 klog::counter!(FRAMES_LOST, "mm.as.frames_lost");
+klog::counter!(pub(crate) DEVICE_KEPT, "mm.as.device_backings_kept");
 
 /// A frame or table whose shootdown a CPU did not confirm, freed at the drop.
 enum Deferred {
     Frame(u64),
+    /// MM-13: a 2 MiB leaf's frame (`huge::release_huge`).
+    Huge(u64),
     Table(u64),
     /// A file mapping's page: handed back to its backing (which the entry keeps alive) at the drop.
     FilePage(u64, Arc<dyn MapBacking>),
+    /// MM-14: a device mapping's backing whose page a CPU may still reach through an unconfirmed translation:
+    /// kept (with the device's frames behind it, e.g. pinned DMA pages) until the space's root is retired.
+    Keep(Arc<dyn MapBacking>),
 }
 
 /// Who owns the frames of a range that is being unmapped.
@@ -92,12 +102,36 @@ pub(crate) enum Owner {
     /// Page-cache frames go back to the backing; a frame it does not know is a private copy (the program's).
     /// The flag: shared anonymous memory (its frames count as RssShmem, a file's as RssFile).
     File(Arc<dyn MapBacking>, bool),
-    /// A device's frames: never freed here.
-    Device,
+    /// A device's frames: never freed here. The backing (None: only tables are handed back) is kept alive
+    /// when a shootdown is not confirmed, so the device's frames cannot be freed under a stale translation.
+    Device(Option<Arc<dyn MapBacking>>),
 }
 
 /// The file and device parts of a range: (start, end, owner) per VMA, collected before the tree changes.
 pub(crate) type Segs = Vec<(u64, u64, Owner)>;
+
+/// MM-11: one mmu_gather of the space (`paging::UserGather`) and the owners of what it holds: tag 0 is the
+/// program's own memory, tag i the i-th file or device piece. Ended by `AsCore::zap_end` (one round).
+pub(crate) struct Zap {
+    gather: paging::UserGather,
+    /// MM-13: the cause of the round, also for the splits of huge pages the ranges cut.
+    cause: tlb::Cause,
+    owners: Vec<Owner>,
+    lost_before: u64,
+    start: u64,
+    end: u64,
+}
+
+impl Zap {
+    pub(crate) fn begin(a: &AsCore, g: &Inner, cause: tlb::Cause) -> Zap {
+        Zap { gather: paging::UserGather::new(a.root, cause), cause, owners: Vec::new(), lost_before: g.lost, start: u64::MAX, end: 0 }
+    }
+
+    /// The owner of tag `tag` (`anon`: an `Owner::Anon` of the caller's).
+    fn owner<'a>(owners: &'a [Owner], tag: u32, anon: &'a Owner) -> &'a Owner {
+        tag.checked_sub(1).and_then(|i| owners.get(i as usize)).unwrap_or(anon)
+    }
+}
 
 pub(crate) struct Inner {
     pub(crate) space: Space,
@@ -109,11 +143,28 @@ pub(crate) struct Inner {
     limit: Option<u64>,
     /// ktest hook: a fork of this space fails after mapping this many pages in the child (the late-failure path).
     fork_fail_after: Option<u64>,
+    /// ktest hook: a fault-around round finds no frame after this many pages (MM-12, memory running out).
+    pub(crate) around_fail_after: Option<u64>,
+    /// MM-13: one page table per 2 MiB leaf this space maps, for its split (Linux `pgtable_trans_huge_deposit`;
+    /// counted in the space's tables). Taken by a split, freed when the leaf goes whole.
+    pub(crate) deposit: Vec<u64>,
+    /// ktest hook (MM-13): no 2 MiB block for this space's faults.
+    pub(crate) huge_fail: bool,
 }
 
 impl Inner {
     fn new(fill: Fill) -> Inner {
-        Inner { space: Space::new(MMAP_TOP), fill, deferred: Vec::new(), lost: 0, limit: None, fork_fail_after: None }
+        Inner {
+            space: Space::new(MMAP_TOP),
+            fill,
+            deferred: Vec::new(),
+            lost: 0,
+            limit: None,
+            fork_fail_after: None,
+            around_fail_after: None,
+            deposit: Vec::new(),
+            huge_fail: false,
+        }
     }
 
     /// Charges `pages` more (`pending` already charged in this call) against this space's limit and the system's.
@@ -166,6 +217,8 @@ pub struct AsCore {
     /// MM-tlb2 fixer: whether the last fault on a missing page ended as an anonymous fill; only then does the
     /// next one zero a frame before taking `inner` (a run of file or device faults zeroes nothing in vain).
     anon_hint: core::sync::atomic::AtomicBool,
+    /// MM-13: PR_SET_THP_DISABLE (`set_thp_disabled`).
+    thp_off: core::sync::atomic::AtomicBool,
 }
 
 /// The 8 KiB block of a user root: the PML4 and its TLB context (`hal::paging::new_user_root`).
@@ -188,12 +241,13 @@ pub(crate) fn read_only(p: Prot) -> PageFlags {
 /// Must a read-only present page of VMA `v` stay read-only when the VMA becomes writable? Yes for page-cache
 /// frames of private mappings and frames another space still shares (their first write copies), and for pages
 /// whose writes a file or device tracks (their first write marks them dirty). A program's own frame that only
-/// this space maps can simply become writable (Linux `can_change_pte_writable`).
-pub(crate) fn keep_read_only(v: &Vma, phys: u64) -> bool {
+/// this space maps can simply become writable (Linux `can_change_pte_writable`); `size` is the leaf's (MM-13: a
+/// 2 MiB leaf only as a never-split block).
+pub(crate) fn keep_read_only(v: &Vma, phys: u64, size: PageSize) -> bool {
     match &v.file {
         Some(f) if f.device.is_some() => true,
         Some(f) if f.shared => f.backing.track_dirty(),
-        _ => !(mm_core::is_user_frame(phys) && share::exclusive(phys)),
+        _ => !huge::own_exclusive(phys, size),
     }
 }
 
@@ -239,7 +293,14 @@ impl AddressSpace {
     }
 
     fn from_inner(root: u64, inner: Inner, ctr: Counters) -> Self {
-        let core = Arc::new_cyclic(|me| AsCore { root, inner: Mutex::named("mm.as", inner), me: me.clone(), ctr, anon_hint: core::sync::atomic::AtomicBool::new(true) });
+        let core = Arc::new_cyclic(|me| AsCore {
+            root,
+            inner: Mutex::named("mm.as", inner),
+            me: me.clone(),
+            ctr,
+            anon_hint: core::sync::atomic::AtomicBool::new(true),
+            thp_off: core::sync::atomic::AtomicBool::new(false),
+        });
         AddressSpace { core }
     }
 }
@@ -260,6 +321,11 @@ impl AsCore {
     }
 
     /// The CPUs that have this root loaded now (lazily too): the targets of its shootdowns.
+    /// MM-11 fixer: this space's shootdown rounds and IPIs so far (munmap, madvise, reclaim, mprotect).
+    pub(crate) fn shootdowns(&self) -> (u64, u64) {
+        self.ctr.shots()
+    }
+
     pub fn loaded_on(&self) -> Vec<usize> {
         let mut v = Vec::new();
         paging::tlb::cpus_with(self.root, &mut |c| {
@@ -304,7 +370,8 @@ impl AsCore {
     }
 
     /// This space's own commit limit in pages (None: only the system's). A space already above it keeps what it
-    /// has; only new charges are refused.
+    /// has; only new charges are refused. Unwired hook (C1, CONTRACTS §7a): only ktests set it until an AB item
+    /// maps RLIMIT_DATA onto it.
     pub fn set_commit_limit(&self, pages: Option<u64>) {
         self.inner.lock().limit = pages;
     }
@@ -320,6 +387,13 @@ impl AsCore {
         self.inner.lock().fork_fail_after = pages;
     }
 
+    /// ktests only: every fault-around round of this space gets no frame after `pages` pages, as when free
+    /// memory ends during the round. None switches it off.
+    #[doc(hidden)]
+    pub fn test_fail_around_after(&self, pages: Option<u64>) {
+        self.inner.lock().around_fail_after = pages;
+    }
+
     /// Frees an unmapped frame or emptied table whose shootdown was confirmed (a file page goes back to its
     /// backing, a device's frame stays the device's), or queues it for the drop. Never allocates by the size of
     /// the range: only the queue of the unconfirmed case grows (one entry per frame), and a full kernel heap
@@ -333,24 +407,45 @@ impl AsCore {
                 return;
             }
             match owner {
-                Owner::Device => {}
+                Owner::Device(_) => {}
                 Owner::File(b, _) => {
                     if !b.put_page(r.phys) {
                         release_user(r.phys);
                     }
                 }
+                Owner::Anon if r.size == PageSize::Size2M => huge::release_huge(r.phys),
                 Owner::Anon => release_user(r.phys),
             }
             return;
         }
-        if !r.table && matches!(owner, Owner::Device) {
-            return;
+        if !r.table {
+            if let Owner::Device(b) = owner {
+                // One keep per backing is enough: the pages of one unmap come in a row, so only the last entry is
+                // compared (O(1) per page; a table entry in between only costs one more keep). With the kernel
+                // heap full the backing gets a reference that never drops instead (no allocation): its frames are
+                // then kept forever, counted as lost, never freed under a translation a CPU may still hold.
+                let Some(b) = b else { return };
+                if matches!(deferred.last(), Some(Deferred::Keep(k)) if Arc::ptr_eq(k, b)) {
+                    return;
+                }
+                if deferred.try_reserve(1).is_ok() {
+                    DEFERRED_FRAMES.inc();
+                    deferred.push(Deferred::Keep(b.clone()));
+                } else {
+                    core::mem::forget(b.clone());
+                    DEVICE_KEPT.inc();
+                    FRAMES_LOST.inc();
+                    *lost += 1;
+                }
+                return;
+            }
         }
         if deferred.try_reserve(1).is_ok() {
             DEFERRED_FRAMES.inc();
             deferred.push(match (r.table, owner) {
                 (true, _) => Deferred::Table(r.phys),
                 (false, Owner::File(b, _)) => Deferred::FilePage(r.phys, b.clone()),
+                (false, _) if r.size == PageSize::Size2M => Deferred::Huge(r.phys),
                 (false, _) => Deferred::Frame(r.phys),
             });
         } else {
@@ -365,7 +460,7 @@ impl AsCore {
         for x in g.space.tree.overlapping(start, end) {
             if let Some(f) = &x.file {
                 v.try_reserve(1).map_err(|_| Errno::NoMem)?;
-                let owner = if f.device.is_some() { Owner::Device } else { Owner::File(f.backing.clone(), x.kind == VmaKind::Anonymous) };
+                let owner = if f.device.is_some() { Owner::Device(Some(f.backing.clone())) } else { Owner::File(f.backing.clone(), x.kind == VmaKind::Anonymous) };
                 v.push((x.start.max(start), x.end.min(end), owner));
             }
         }
@@ -373,41 +468,98 @@ impl AsCore {
     }
 
     /// Removes the pages of [start, end) and gives their frames and emptied tables back once the shootdown that
-    /// covers them is confirmed (`unmap_user`: rounds of up to 512 frames, tables after the last). The file and
-    /// device segments go first, each with its owner; what is left is the program's own memory.
-    pub(crate) fn unmap_pages(&self, g: &mut Inner, start: u64, end: u64, segs: &Segs) {
-        for (s, e, o) in segs {
-            self.unmap_one(g, *s, *e, o);
-        }
-        self.unmap_one(g, start, end, &Owner::Anon);
+    /// covers them is confirmed: one round for the whole range (`Zap`), tables after it. The file and device
+    /// segments go first, each with its owner; what is left is the program's own memory. Page tables are freed
+    /// only inside `free` (`paging::UserGather::unmap`).
+    pub(crate) fn unmap_pages(&self, g: &mut Inner, start: u64, end: u64, segs: &Segs, cause: tlb::Cause, free: (u64, u64)) {
+        let mut z = Zap::begin(self, g, cause);
+        self.zap_pages(g, &mut z, start, end, segs, free);
+        self.zap_end(g, z);
     }
 
-    fn unmap_one(&self, g: &mut Inner, start: u64, end: u64, owner: &Owner) {
-        let lost_before = g.lost;
-        let (d, l, ctr) = (&mut g.deferred, &mut g.lost, &self.ctr);
-        // The counters go down as each entry goes (classified before `give_back` may free the frame), also for
-        // the frames of an unconfirmed round that wait in `deferred`: the space no longer maps them.
-        let r = paging::unmap_user(self.root, start, end - start, &mut |r: Released| {
-            if r.table {
+    /// `unmap_pages` into a zap another range may join (madvise over several VMAs).
+    pub(crate) fn zap_pages(&self, g: &mut Inner, z: &mut Zap, start: u64, end: u64, segs: &Segs, free: (u64, u64)) {
+        for (s, e, o) in segs {
+            self.zap(g, z, *s, *e, o, free);
+        }
+        self.zap(g, z, start, end, &Owner::Anon, free);
+    }
+
+    /// What a round hands back: the counters go down as each entry goes (classified before `give_back` may free
+    /// the frame), also for the frames of an unconfirmed round that wait in `deferred`: the space no longer maps
+    /// them.
+    /// MM-13: a 2 MiB leaf counts 512 pages, and its deposited page table goes (never reachable: freed at once).
+    fn hand_back(ctr: &Counters, deferred: &mut Vec<Deferred>, deposit: &mut Vec<u64>, lost: &mut u64, r: &Released, owner: &Owner) {
+        if r.table {
+            ctr.tables_freed(1);
+        } else if r.size == PageSize::Size2M {
+            ctr.sub(Class::Anon, huge::HUGE_PAGES);
+            ctr.huge_sub(1);
+            if let Some(t) = deposit.pop() {
                 ctr.tables_freed(1);
-            } else {
-                let c = Class::of(r.phys, owner);
-                ctr.sub(c, 1);
-                if c.cached() {
-                    share::unmap_file(r.phys);
+                if let Some(fa) = mm_core::frames() {
+                    fa.free(t, 0, mm_core::Kind::PageTable);
                 }
             }
-            Self::give_back(&r, owner, d, l)
-        });
-        match r {
-            Err(e) => klog::event!(Error, "mm", "as.unmap_failed", start = klog::Hex(start), end = klog::Hex(end), error = alloc::format!("{e:?}")),
-            Ok(u) if !u.outcome.confirmed() => {
-                UNCONFIRMED.inc();
-                klog::event!(Warn, "mm", "as.shootdown_unconfirmed", root = klog::Hex(self.root), start = klog::Hex(start), end = klog::Hex(end),
-                    cpus = u.outcome.unanswered, resends = u.outcome.resends, not_ready = u.outcome.not_ready;
-                    "a CPU did not answer the TLB shootdown: the unmapped frames stay out of use until the address space ends");
+        } else {
+            let c = Class::of(r.phys, owner);
+            ctr.sub(c, 1);
+            if c.cached() {
+                share::unmap_file(r.phys);
             }
-            Ok(_) => {}
+        }
+        Self::give_back(r, owner, deferred, lost)
+    }
+
+    /// Takes [start, end) of `owner` into `z`.
+    pub(crate) fn zap(&self, g: &mut Inner, z: &mut Zap, start: u64, end: u64, owner: &Owner, free: (u64, u64)) {
+        if start >= end {
+            return;
+        }
+        if matches!(owner, Owner::Anon) {
+            self.split_edges(g, start, end, z.cause);
+        }
+        (z.start, z.end) = (z.start.min(start), z.end.max(end));
+        let Zap { gather, owners, .. } = z;
+        let (d, l, ctr, anon, dep) = (&mut g.deferred, &mut g.lost, &self.ctr, Owner::Anon, &mut g.deposit);
+        let tag = match owner {
+            Owner::Anon => Some(0),
+            _ if owners.try_reserve(1).is_ok() => {
+                owners.push(owner.clone());
+                Some(owners.len() as u32)
+            }
+            _ => None,
+        };
+        let r = match tag {
+            Some(tag) => {
+                let owners = &*owners;
+                gather.unmap(start, end - start, tag, free, &mut |r, t| Self::hand_back(ctr, d, dep, l, &r, Zap::owner(owners, t, &anon)))
+            }
+            None => {
+                // No room for another owner: what is gathered goes in a round now, then this range alone.
+                gather.flush(&mut |r, t| Self::hand_back(ctr, d, dep, l, &r, Zap::owner(owners, t, &anon)));
+                owners.clear();
+                let r = gather.unmap(start, end - start, 1, free, &mut |r, t| Self::hand_back(ctr, d, dep, l, &r, if t == 0 { &anon } else { owner }));
+                gather.flush(&mut |r, t| Self::hand_back(ctr, d, dep, l, &r, if t == 0 { &anon } else { owner }));
+                r
+            }
+        };
+        if let Err(e) = r {
+            klog::event!(Error, "mm", "as.unmap_failed", start = klog::Hex(start), end = klog::Hex(end), error = alloc::format!("{e:?}"));
+        }
+    }
+
+    /// The zap's last round: frames, then emptied tables, handed back.
+    pub(crate) fn zap_end(&self, g: &mut Inner, z: Zap) {
+        let Zap { gather, owners, lost_before, start, end, .. } = z;
+        let (d, l, ctr, anon, dep) = (&mut g.deferred, &mut g.lost, &self.ctr, Owner::Anon, &mut g.deposit);
+        let u = gather.finish(&mut |r, t| Self::hand_back(ctr, d, dep, l, &r, Zap::owner(&owners, t, &anon)));
+        ctr.shot(u.shootdowns as u64, u.outcome.ipis as u64);
+        if !u.outcome.confirmed() {
+            UNCONFIRMED.inc();
+            klog::event!(Warn, "mm", "as.shootdown_unconfirmed", root = klog::Hex(self.root), start = klog::Hex(start), end = klog::Hex(end),
+                cpus = u.outcome.unanswered, resends = u.outcome.resends, not_ready = u.outcome.not_ready;
+                "a CPU did not answer the TLB shootdown: the unmapped frames stay out of use until the address space ends");
         }
         if g.lost > lost_before {
             klog::event!(Warn, "mm", "as.frames_lost", root = klog::Hex(self.root), frames = g.lost - lost_before;
@@ -416,11 +568,14 @@ impl AsCore {
     }
 
     /// Removes [start, end) from the tree and its pages, giving the commit back (munmap, MAP_FIXED, mremap).
-    pub(crate) fn remove_range(&self, g: &mut Inner, start: u64, end: u64) -> Result<(), Errno> {
+    /// `cause`: munmap, MAP_FIXED or mremap (`tlb::stats().by_cause`). Page tables go only where no neighbouring
+    /// VMA shares them (Linux `free_pgtables`).
+    pub(crate) fn remove_range(&self, g: &mut Inner, start: u64, end: u64, cause: tlb::Cause) -> Result<(), Errno> {
         let segs = Self::segments(g, start, end)?;
         let before = g.space.committed;
         if g.space.commit_munmap(start, end)? {
-            self.unmap_pages(g, start, end, &segs);
+            let free = g.space.tree.gap_around(start, end);
+            self.unmap_pages(g, start, end, &segs, cause, free);
             self.rmap_forget(g, &segs);
         }
         g.settle(before, 0);
@@ -433,7 +588,7 @@ impl AsCore {
         // Linux's order (mm/mmap.c:2693-2702): what MAP_FIXED replaces goes first, then the charge; a refused
         // charge leaves the old mapping gone.
         if plan.replaces {
-            self.remove_range(g, plan.addr, end)?;
+            self.remove_range(g, plan.addr, end, tlb::Cause::MapFixed)?;
         }
         // MM-rmap: the file's reverse-map entry first (a refusal changes nothing more than MAP_FIXED did).
         let key = file.as_ref().and_then(rmap::key_of);
@@ -464,7 +619,7 @@ impl AsCore {
             && let Err(e) = self.populate(g, plan.addr, end, true)
             && g.fill == Fill::Eager
         {
-            let _ = self.remove_range(g, plan.addr, end);
+            let _ = self.remove_range(g, plan.addr, end, tlb::Cause::Munmap);
             klog::event!(Warn, "mm", "as.populate_failed", addr = klog::Hex(plan.addr), len = plan.len, reason = e.text(), replaced = plan.replaces;
                 "mmap refused with ENOMEM; with replaced=true the old mapping there is gone too (as on Linux)");
             return Err(Errno::NoMem);
@@ -498,7 +653,7 @@ impl AsCore {
     pub fn sys_munmap(&self, addr: u64, len: u64) -> Result<(), Errno> {
         let mut g = self.inner.lock();
         let (start, end) = g.space.plan_munmap(addr, len)?;
-        self.remove_range(&mut g, start, end)
+        self.remove_range(&mut g, start, end, tlb::Cause::Munmap)
     }
 
     pub fn sys_mprotect(&self, addr: u64, len: u64, prot: u64) -> Result<(), Errno> {
@@ -523,7 +678,7 @@ impl AsCore {
             }
         }
         if p.applied_end > p.start {
-            if g.fill == Fill::Eager && p.prot.accessible() && self.populate(&g, p.start, p.applied_end, false).is_err() {
+            if g.fill == Fill::Eager && p.prot.accessible() && self.populate(&mut g, p.start, p.applied_end, false).is_err() {
                 commit::uncharge(charged);
                 return Err(Errno::NoMem);
             }
@@ -533,13 +688,19 @@ impl AsCore {
                 return Err(e);
             }
             g.settle(before, charged);
+            // MM-13: a 2 MiB leaf the range cuts becomes 4 KiB entries first (Linux change_pmd_range, mprotect.c:393).
+            self.split_edges(&mut g, p.start, p.applied_end, tlb::Cause::Mprotect);
             let (fl, ro, tree) = (page_flags(p.prot), read_only(p.prot), &g.space.tree);
             let mut leaf = |u: hal::paging::Unmapped| {
-                let keep = p.prot.write && !u.flags.contains(PageFlags::WRITABLE) && tree.find(u.virt).is_some_and(|v| keep_read_only(v, u.phys));
+                let keep = p.prot.write && !u.flags.contains(PageFlags::WRITABLE) && tree.find(u.virt).is_some_and(|v| keep_read_only(v, u.phys, u.size));
                 // The accessed and dirty bits stay (smaps' Referenced and Dirty, as Linux's mprotect keeps them).
                 Some(PageFlags((if keep { ro } else { fl }).0 | (u.flags.0 & (CACHE_BITS | PageFlags::ACCESSED | PageFlags::DIRTY))))
             };
-            match paging::protect_user(self.root, p.start, p.applied_end - p.start, &mut leaf) {
+            let r = paging::protect_user(self.root, p.start, p.applied_end - p.start, tlb::Cause::Mprotect, &mut leaf);
+            if let Ok((n, o)) = &r {
+                self.ctr.shot((*n > 0) as u64, o.ipis as u64);
+            }
+            match r {
                 Err(e) => klog::event!(Error, "mm", "as.protect_failed", start = klog::Hex(p.start), error = alloc::format!("{e:?}")),
                 Ok((_, o)) if !o.confirmed() => {
                     UNCONFIRMED.inc();
@@ -639,13 +800,14 @@ impl AsCore {
         g.settle(before, need);
         if let BrkPlan::Move { unmap, map, .. } = plan {
             if let Some((s, e)) = unmap {
-                self.unmap_pages(&mut g, s, e, &Vec::new());
+                let free = g.space.tree.gap_around(s, e);
+                self.unmap_pages(&mut g, s, e, &Vec::new(), tlb::Cause::Munmap, free);
             }
             if let Some((s, e)) = map
                 && g.fill == Fill::Eager
-                && self.populate(&g, s, e, true).is_err()
+                && self.populate(&mut g, s, e, true).is_err()
             {
-                let _ = self.remove_range(&mut g, s, e);
+                let _ = self.remove_range(&mut g, s, e, tlb::Cause::Munmap);
                 g.space.brk = old;
                 klog::event!(Warn, "mm", "as.brk_populate_failed", from = klog::Hex(s), to = klog::Hex(e));
                 return old;
@@ -665,7 +827,7 @@ impl AsCore {
         if !g.space.tree.is_free(start, end) {
             return Err(MmError::Exists);
         }
-        let plan = MmapPlan { addr: start, len, prot, replaces: false, populate: false, shared: false, account: prot.write };
+        let plan = MmapPlan { addr: start, len, prot, replaces: false, populate: false, shared: false, account: prot.write, nohugepage: false, growsdown: false };
         self.mmap_locked(&mut g, &plan, kind, None).map(|_| ()).map_err(to_mm)
     }
 
@@ -693,6 +855,25 @@ impl AsCore {
     }
 }
 
+/// MM-14: what a leaked address space keeps of its device mappings: one reference that never drops on the
+/// backing of every device VMA and of every queued keep, so their frames (pinned DMA pages behind a device map)
+/// are never freed or retyped while a CPU may still walk the kept tables. Never allocates (an `Arc` count).
+/// Returns how many backings it kept.
+fn keep_device_backings<'a>(files: impl Iterator<Item = &'a FileRef>, deferred: &[Deferred]) -> u64 {
+    let mut kept = 0;
+    for f in files.filter(|f| f.device.is_some()) {
+        core::mem::forget(f.backing.clone());
+        kept += 1;
+    }
+    for d in deferred {
+        if let Deferred::Keep(b) = d {
+            core::mem::forget(b.clone());
+            kept += 1;
+        }
+    }
+    kept
+}
+
 /// Why a dying address space must be kept instead of freed (None: free it). `still_loaded`: this CPU could
 /// not leave the root (no kernel root to load); `confirmed`: every other CPU that had it loaded left it.
 pub(crate) fn drop_verdict(still_loaded: bool, confirmed: bool) -> Option<&'static str> {
@@ -717,9 +898,14 @@ impl Drop for AsCore {
         commit::uncharge(g.space.committed);
         if let Some(why) = drop_verdict(paging::current_root() == root, o.confirmed()) {
             AS_LEAKED.inc();
-            klog::event!(Warn, "mm", "as.drop_leaked", root = klog::Hex(root), reason = why, vmas = g.space.tree.len(), cpus = o.unanswered;
-                "address space tables and frames kept out of use instead of freed");
-            // The file pages stay pinned by their mappings (whose `Drop` keeps pinned frames out of use).
+            // The VMAs and the queue drop after this return: a device backing they hold last would free its frames
+            // (and retype them back to WB) under the kept tables, so each gets a reference that never drops.
+            let devices = keep_device_backings(g.space.tree.iter().filter_map(|v| v.file.as_ref()), &g.deferred);
+            DEVICE_KEPT.add(devices);
+            klog::event!(Warn, "mm", "as.drop_leaked", root = klog::Hex(root), reason = why, vmas = g.space.tree.len(), cpus = o.unanswered,
+                devices = devices; "address space tables and frames kept out of use instead of freed");
+            // The file pages stay pinned by their mappings (whose `Drop` keeps pinned frames out of use), the
+            // device frames by the references kept above.
             return;
         }
         let fa = mm_core::frames();
@@ -728,7 +914,12 @@ impl Drop for AsCore {
         let (mut found, mut tables) = ([0u64; 4], 0u64);
         paging::teardown_user_half(
             root,
-            &mut |va, pa, _fl| match {
+            &mut |va, pa, _fl, size| match {
+                if size == PageSize::Size2M {
+                    found[Class::Anon as usize] += huge::HUGE_PAGES;
+                    huge::release_huge(pa);
+                    return;
+                }
                 let v = tree.find(va);
                 found[Class::in_vma(pa, v) as usize] += 1;
                 v.and_then(|v| v.file.as_ref())
@@ -753,13 +944,21 @@ impl Drop for AsCore {
                 }
             },
         );
+        for t in g.deposit.drain(..) {
+            tables += 1;
+            if let Some(fa) = fa {
+                fa.free(t, 0, mm_core::Kind::PageTable);
+            }
+        }
         self.ctr.check_teardown(root, &found, tables);
         paging::retire_user_root(root);
         if let Some(fa) = fa {
             for d in g.deferred.drain(..) {
                 match d {
                     Deferred::Frame(p) => release_user(p),
+                    Deferred::Huge(p) => huge::release_huge(p),
                     Deferred::Table(p) => fa.free(p, 0, mm_core::Kind::PageTable),
+                    Deferred::Keep(_) => {}
                     Deferred::FilePage(p, b) => {
                         if !b.put_page(p) {
                             release_user(p);

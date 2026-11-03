@@ -176,3 +176,31 @@ fn busy_caches_get_more_rounds_then_the_reserve() {
     }
     b.check().unwrap();
 }
+
+#[test]
+fn light_allocations_never_reclaim() {
+    let (b, h) = full();
+    let reserve = b.reserve_frames()[0];
+    // MM-12: everything is cache: the light path refuses without a reclaim round, a drain or a failure report.
+    assert_eq!(b.alloc_light(0, Zone::Normal, Kind::User), None);
+    assert!(h.calls.lock().unwrap().is_empty(), "no reclaim round for a light allocation");
+    assert_eq!(b.direct_reclaim(), DirectStats::default());
+    // Frames come back outside reclaim: the light path takes the ones above the reserve and stops there.
+    let back: Vec<u64> = (0..reserve + 36).filter_map(|_| h.frames.lock().unwrap().pop()).collect();
+    for p in back {
+        b.free(p, 0, Kind::PageCache);
+    }
+    b.drain_all();
+    let got: Vec<u64> = core::iter::from_fn(|| b.alloc_light(0, Zone::Normal, Kind::User)).collect();
+    assert_eq!(got.len() as u64, 36, "only what lies above the reserve");
+    assert!(h.calls.lock().unwrap().is_empty(), "still no reclaim round");
+    assert_eq!(b.alloc_light(crate::MAX_ORDER + 1, Zone::Normal, Kind::User), None);
+    // A normal allocation at the same point still gets its frame (the reserve is there, reclaim behind it).
+    let p = b.alloc(0, Zone::Normal, Kind::User).expect("a normal allocation reclaims");
+    assert_eq!(h.calls.lock().unwrap().len(), 1);
+    b.free(p, 0, Kind::User);
+    for q in got {
+        b.free(q, 0, Kind::User);
+    }
+    b.check().unwrap();
+}

@@ -1,0 +1,134 @@
+node is a character device: yes
+node mode 666 major 10
+read device = -EINVAL
+write device = -EINVAL
+unknown command on device = -ENOTTY
+SEM_READ on device = -ENOTTY
+CREATE_SEM bad pointer = -EFAULT
+create sem count>max = -EINVAL
+object fd >= 0: yes
+F_GETFD 1 F_GETFL 2
+link anon_inode:ntsync
+fstat type 0 perm 600
+sem new: ret 0 count 1 max 2
+release 1 = 0
+release 1 previous 1
+release past max = -EOVERFLOW
+release past max leaves 1
+release overflow = -EOVERFLOW
+release bad pointer = -EFAULT
+SEM_READ bad pointer = -EFAULT
+EVENT_SET on sem = -EINVAL
+MUTEX_READ on sem = -EINVAL
+CREATE_SEM on object = -ENOTTY
+WAIT_ANY on object = -ENOTTY
+unknown command on object = -ENOTTY
+sem now: ret 0 count 2 max 2
+wait sem 1 = 0 index 0
+wait sem 2 = 0 index 0
+wait sem empty = -ETIMEDOUT
+sem after waits: ret 0 count 0 max 2
+create mutex count without owner = -EINVAL
+create mutex owner without count = -EINVAL
+object fd >= 0: yes
+F_GETFD 1 F_GETFL 2
+link anon_inode:ntsync
+fstat type 0 perm 600
+mutex new: ret 0 owner 5 count 2
+unlock owner 0 = -EINVAL
+unlock by other = -EPERM
+unlock 1 = 0
+unlock 1 previous 2
+unlock 2 = 0
+unlock 2 previous 1
+mutex free: ret 0 owner 0 count 0
+unlock free = -EPERM
+unlock bad pointer = -EFAULT
+wait mutex owner 7 = 0 index 0
+wait mutex owner 7 again = 0 index 0
+wait mutex owner 8 = -ETIMEDOUT
+mutex owned twice: ret 0 owner 7 count 2
+kill owner 0 = -EINVAL
+kill by other = -EPERM
+kill bad pointer = -EFAULT
+kill owner = 0
+mutex abandoned: ret EOWNERDEAD owner 0 count 0
+kill abandoned = -EPERM
+wait abandoned owner 8 = -EOWNERDEAD index 0
+mutex taken after abandon: ret 0 owner 8 count 1
+SEM_RELEASE on mutex = -EINVAL
+EVENT_RESET on mutex = -EINVAL
+wait mutex owner 0 = -EINVAL
+mutex after owner 0: ret 0 owner 0 count 0
+object fd >= 0: yes
+F_GETFD 1 F_GETFL 2
+link anon_inode:ntsync
+fstat type 0 perm 600
+auto new: ret 0 manual 0 signaled 1
+manual new: ret 0 manual 1 signaled 0
+wait auto = 0 index 0
+auto after wait: ret 0 manual 0 signaled 0
+wait auto again = -ETIMEDOUT
+set = 0
+set previous 0
+set again = 0
+set again previous 1
+reset = 0
+reset previous 1
+reset again = 0
+reset again previous 0
+pulse = 0
+pulse previous 0
+manual after pulse: ret 0 manual 1 signaled 0
+set bad pointer = -EFAULT
+manual after set with bad pointer: ret 0 manual 1 signaled 1
+wait manual 1 = 0 index 0
+wait manual 2 = 0 index 0
+reset bad pointer = -EFAULT
+manual after reset with bad pointer: ret 0 manual 1 signaled 0
+EVENT_READ bad pointer = -EFAULT
+SEM_RELEASE on event = -EINVAL
+MUTEX_KILL on event = -EINVAL
+wait pad = -EINVAL
+wait unknown flag = -EINVAL
+wait 65 objects = -EINVAL
+wait 64 objects = -ETIMEDOUT
+wait objs bad pointer = -EFAULT
+wait 0 objects bad pointer = -ETIMEDOUT
+wait owner 0 bad pointer = -EINVAL
+wait_all owner 0 bad pointer = -EINVAL
+wait 65 objects bad pointer = -EINVAL
+wait pad bad pointer = -EINVAL
+wait args bad pointer = -EFAULT
+wait_all args bad pointer = -EFAULT
+wait_all 64 same objects = -EINVAL
+wait closed fd = -EINVAL
+wait stdout = -EINVAL
+wait device fd = -EINVAL
+wait alert closed fd = -EINVAL
+wait nothing = -ETIMEDOUT
+wait_all nothing = 0 index 0
+wait on other device = -EINVAL
+wait_any duplicates = 0 index 1
+wait_all duplicates = -EINVAL
+wait_all alert duplicate = -EINVAL
+wait_any alert = 0 index 1
+wait_any object before alert = 0 index 0
+wait_any only alert = 0 index 0
+wait_all one missing = -ETIMEDOUT
+sem after failed wait_all: ret 0 count 2 max 10
+mutex after failed wait_all: ret 0 owner 0 count 0
+wait_all one missing, alert = 0 index 3
+sem after alert wait_all: ret 0 count 2 max 10
+wait_all = 0 index 0
+sem after wait_all: ret 0 count 1 max 10
+mutex after wait_all: ret 0 owner 4 count 1
+auto after wait_all: ret 0 manual 0 signaled 0
+wait_all mutex of other owner = -ETIMEDOUT
+wait_all mutex own again = 0 index 0
+mutex after second wait_all: ret 0 owner 4 count 2
+wait timeout 1 = -ETIMEDOUT
+wait realtime past = -ETIMEDOUT
+wait_all realtime past = -ETIMEDOUT
+wait signaled realtime past = 0 index 0
+written back: ret 0 index 0 count 1 owner 3 timeout 0

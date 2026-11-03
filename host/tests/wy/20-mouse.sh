@@ -21,6 +21,8 @@ fi
 
 echo "== build"
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q)
+# WY-14: WY_GPU=1 runs this scenario with the gpu build (tools/gpu-host.sh).
+. "$ROOT/host/tests/wy/tools/gpu-host.sh"
 
 COMP=""
 cleanup() {
@@ -56,8 +58,9 @@ width() { ctl list | grep -- "$1" | head -1 | sed -n 's/.* \([0-9]*\)x[0-9]* .*/
 height() { ctl list | grep -- "$1" | head -1 | sed -n 's/.* [0-9]*x\([0-9]*\) .*/\1/p'; }
 
 echo "== start (headless 1280x800) with three terminals A B C"
-"$BIN" --backend headless --size 1600x1000 --socket "$SOCK" >"$RUN/bitscomp-mouse.log" 2>&1 &
+"${START[@]}" --backend headless --size 1600x1000 --socket "$SOCK" >"$RUN/bitscomp-mouse.log" 2>&1 &
 COMP=$!
+gpu_host_check "$RUN/bitscomp-mouse.log" "$COMP"
 for _ in $(seq 25); do [ -S "$XDG_RUNTIME_DIR/$SOCK.ctl" ] && break; sleep 0.2; done
 # WY-5: the work area lies inside the chrome; Claude's sidebar folded leaves the stacked tabs room for two tabs.
 ctl sidebar | grep -q folded || fail "the sidebar did not fold"

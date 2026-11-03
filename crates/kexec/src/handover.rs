@@ -7,6 +7,7 @@
 //! then and the running generation's reason as its markers say (`crate::refresh` decides both).
 
 use alloc::vec::Vec;
+use zeroize::Zeroize;
 use bootinfo::{BootInfo, Generation, KernelImage, MemDesc, Module, PageTables, Reload, Tsc, WriteError, Writer, module_kind, tag, tsc_source};
 
 pub struct NewBoot<'a> {
@@ -143,7 +144,21 @@ pub fn refresh(staged: &[u8], capacity: usize, config: Option<&[u8]>, generation
     let mut buf = Vec::new();
     buf.try_reserve_exact(capacity).map_err(|_| BuildError::NoMemory { capacity })?;
     buf.resize(capacity, 0);
-    let mut w = Writer::new(&mut buf)?;
+    match write_refreshed(&old, &mut buf, config, generation) {
+        Ok(len) => {
+            buf.truncate(len);
+            Ok(buf)
+        }
+        Err(e) => {
+            // RB-18: a part-written buffer can hold the stick's secrets.
+            buf.zeroize();
+            Err(e)
+        }
+    }
+}
+
+fn write_refreshed(old: &BootInfo<'_>, buf: &mut [u8], config: Option<&[u8]>, generation: Option<Generation>) -> Result<usize, BuildError> {
+    let mut w = Writer::new(buf)?;
     let mut config_done = config.is_none();
     // RB-9: a Reload into another generation hands its record on also when the running kernel had none.
     let mut generation_done = generation.is_none();
@@ -173,9 +188,7 @@ pub fn refresh(staged: &[u8], capacity: usize, config: Option<&[u8]>, generation
     if let (false, Some(g)) = (generation_done, generation) {
         w.generation(g)?;
     }
-    let len = w.len();
-    buf.truncate(len);
-    Ok(buf)
+    Ok(w.len())
 }
 
 fn bootinfo_module_kind(p: &[u8]) -> Option<u32> {

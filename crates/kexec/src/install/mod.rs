@@ -121,7 +121,7 @@ impl Stick for FatStick<'_> {
     }
     fn config(&self) -> Result<Option<Vec<u8>>, i64> {
         let path = format!("{}{CONFIG_PATH}", self.0.mount);
-        match self.0.ns.read_file(&path, fs_fat::protect::CONFIG_MAX as usize) {
+        match self.0.ns.read_secret_file(&path, fs_fat::protect::CONFIG_MAX as usize) {
             Ok(t) => Ok(Some(t)),
             Err(uapi::errno::ENOENT) => Ok(None),
             Err(e) => Err(e),

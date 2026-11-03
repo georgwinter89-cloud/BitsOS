@@ -11,7 +11,8 @@ RUN="${BITSOS_RUN_DIR:-$ROOT/target/xtask/runs/pk-30-brave-package}"
 STAGE="${BRAVE_STAGE:-/var/tmp/claude-v2/stage/brave}"
 [ -x "$STAGE/brave" ] || { echo "SKIP: no Brave stick tree at $STAGE (user/ports/brave-launcher/scripts/stage-v2.sh)"; exit 0; }
 command -v ldd >/dev/null || { echo "SKIP: no ldd"; exit 0; }
-rm -rf "$RUN"
+# Empties the run dir but keeps output.log (xtask fullrun writes this script's output there).
+mkdir -p "$RUN"; find "$RUN" -mindepth 1 -maxdepth 1 ! -name output.log -exec rm -rf {} +
 mkdir -p "$RUN"
 (cd "$ROOT/user" && env -u CARGO_TARGET_DIR -u RUSTUP_TOOLCHAIN cargo build -q --offline --release -p bitspkg --target-dir "$ROOT/target/user-host")
 B="$ROOT/target/user-host/release/bitspkg"

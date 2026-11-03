@@ -1,4 +1,5 @@
-//! GX-D3: the buffer-object manager over the UMA carve-out ("VRAM"; 8 GB at GPU 0x80_0000_0000 on the Mini-PC).
+//! GX-D3: the buffer-object manager over the UMA carve-out ("VRAM"; at GPU 0x80_0000_0000 on the Mini-PC, its size is
+//! whatever the BIOS was set to: MEMSIZE, 512 MiB on 27.10., 8 GB as Georg usually sets it; never a fixed size).
 //! Handles, size, placement, reference counts, mmap offsets; reserved ranges (the GOP framebuffer, the DMCUB's
 //! windows, the IP discovery blob) are never handed out. Scanout buffers are plain BOs: GX-3 adopts the GOP
 //! framebuffer as BO "gop" and creates its back buffer at the place the attach gates checked (`create_at`).
@@ -103,6 +104,10 @@ impl BoManager {
     }
     pub fn reserved(&self) -> &[Reserved] {
         &self.reserved
+    }
+    /// Every range not free: the reserved ones and every BO's (carve-out offsets).
+    pub fn used(&self) -> impl Iterator<Item = Range<u64>> + '_ {
+        self.reserved.iter().map(|r| r.range.clone()).chain(self.bos.values().map(|b| b.range.clone()))
     }
     pub fn free_bytes(&self) -> u64 {
         self.free.iter().map(|(s, e)| e - s).sum()
@@ -265,20 +270,28 @@ impl BoManager {
     }
 }
 
+/// The carve-out's size: MEMSIZE (Linux's `real_vram_size`, gmc_v11_0.c:708, nbio_v7_7.c:60), clipped to the
+/// display hub's FB location range (the GPU cannot reach past it). GX-7b: the manager's size was the FB range
+/// alone; a BIOS that programs a range wider than MEMSIZE would then have handed out memory past the carve-out.
+pub fn carve_size(a: &crate::attach::Attach) -> u64 {
+    (u64::from(a.memsize_mb) << 20).min((a.fb_last - a.fb_first).saturating_add(1))
+}
+
 /// The reserved ranges of the carve-out from what the attach found: the GOP framebuffer (A0), the DMCUB's
-/// windows that lie in graphics memory, and the discovery blob's top 64 KiB.
+/// windows that lie in graphics memory, and the discovery blob's top 64 KiB (of MEMSIZE, wherever that ends).
 pub fn reserved_from(a: &crate::attach::Attach) -> Vec<Reserved> {
-    let size = (a.fb_last - a.fb_first).saturating_add(1);
+    let size = carve_size(a);
     let mut v = alloc::vec![Reserved { name: String::from("gop"), range: a.a0_offset..a.a0_offset + a.bytes }];
     for w in &a.windows {
         if w.last < a.fb_first || w.first > a.fb_last {
             continue;
         }
         let s = w.first.max(a.fb_first) - a.fb_first;
-        let e = w.last.min(a.fb_last) - a.fb_first + 1;
-        v.push(Reserved { name: alloc::format!("dmcub {}", w.name), range: s..e });
+        let e = (w.last.min(a.fb_last) - a.fb_first + 1).min(size);
+        if s < e {
+            v.push(Reserved { name: alloc::format!("dmcub {}", w.name), range: s..e });
+        }
     }
-    let mem = (u64::from(a.memsize_mb) << 20).min(size);
-    v.push(Reserved { name: String::from("discovery"), range: mem.saturating_sub(DISCOVERY_RESERVE)..mem });
+    v.push(Reserved { name: String::from("discovery"), range: size.saturating_sub(DISCOVERY_RESERVE)..size });
     v
 }

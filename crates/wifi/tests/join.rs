@@ -173,6 +173,132 @@ fn deauth_after_association_request() {
     );
 }
 
+// WL-9: the first join after a reboot met the AP's deauthentication (reason 8) during
+// authentication. mac80211 ignores it there (no assoc_data, not associated) and a
+// disassociation before association; the exchange goes on and the AP's answer is taken.
+#[test]
+fn early_end_by_the_ap_is_ignored_as_mac80211() {
+    let (mut m, _) = start(0);
+    let a = m.frame(
+        &Mgmt::Deauth {
+            a1: SPA,
+            a2: AA,
+            reason: 8,
+        },
+        3,
+    );
+    assert!(
+        a.is_empty(),
+        "no failure during authentication: {:?}",
+        names(&a)
+    );
+    assert_eq!(m.phase(), Phase::Auth);
+    let ev: Vec<String> = m
+        .events()
+        .iter()
+        .map(|e| format!("{} {e}", e.name()))
+        .collect();
+    assert!(
+        ev.iter().any(|e| e
+            == "join.ap_end_ignored deauthentication by the AP during authentication ignored (as mac80211), reason 8"),
+        "{ev:?}"
+    );
+    // the AP's own answer (or the next try after 200 ms) goes on with the join
+    assert_eq!(names(&m.frame(&auth_ok(), 5)), ["assoc 1"]);
+    let a = m.frame(
+        &Mgmt::Disassoc {
+            a1: SPA,
+            a2: AA,
+            reason: 8,
+        },
+        6,
+    );
+    assert!(
+        a.is_empty(),
+        "a disassociation before association: {:?}",
+        names(&a)
+    );
+    assert_eq!(m.phase(), Phase::Assoc);
+    let a = m.frame(&assoc_ok(), 7);
+    assert_eq!(m.phase(), Phase::Handshake, "{:?}", names(&a));
+    // the retry after an ignored deauthentication still comes by the timer
+    let (mut m, _) = start(0);
+    m.frame(
+        &Mgmt::Deauth {
+            a1: BC,
+            a2: AA,
+            reason: 8,
+        },
+        1,
+    );
+    let mut t = 0;
+    let a = loop {
+        t += 10;
+        let a = m.poll_done(t);
+        if !a.is_empty() {
+            break a;
+        }
+    };
+    assert_eq!(names(&a), ["auth 2"]);
+}
+
+// The edges of the ignore rule: deauthentications in a row during authentication never hold the
+// join (the auth timeout still ends it after three tries), one between the AP's auth answer and
+// its association response still fails the join at once (mac80211 holds assoc_data then)
+#[test]
+fn ignored_ends_by_the_ap_have_edges() {
+    let (mut m, _) = start(0);
+    let mut t = 0;
+    let mut sent = 1;
+    let fail = loop {
+        t += 10;
+        let d = m.frame(
+            &Mgmt::Deauth {
+                a1: SPA,
+                a2: AA,
+                reason: 8,
+            },
+            t,
+        );
+        assert!(d.is_empty(), "{:?}", names(&d));
+        let a = m.poll_done(t);
+        match a.first() {
+            None => {}
+            Some(Action::SendAuth { .. }) => sent += 1,
+            Some(Action::Failed { why, deauth }) => break (*why, *deauth),
+            Some(_) => unreachable!(),
+        }
+        assert!(t < 10_000, "the join hangs on ignored deauthentications");
+    };
+    assert_eq!(fail, (JoinFailure::AuthTimeout, None));
+    assert_eq!(sent, 3);
+    // auth answered: a deauthentication now ends the join, a disassociation does not
+    let (mut m, _) = start(0);
+    assert_eq!(names(&m.frame(&auth_ok(), 5)), ["assoc 1"]);
+    let a = m.frame(
+        &Mgmt::Disassoc {
+            a1: SPA,
+            a2: AA,
+            reason: 8,
+        },
+        6,
+    );
+    assert!(a.is_empty() && m.phase() == Phase::Assoc, "{:?}", names(&a));
+    let a = m.frame(
+        &Mgmt::Deauth {
+            a1: BC,
+            a2: AA,
+            reason: 8,
+        },
+        7,
+    );
+    assert_eq!(
+        names(&a),
+        ["failed: deauthenticated by the AP during association, reason 8 (None)"]
+    );
+    assert_eq!(m.phase(), Phase::Down);
+}
+
 #[test]
 fn no_answer() {
     let (mut m, _) = start(0);
@@ -439,4 +565,34 @@ fn supervisor_rhythm() {
     assert!(ev.contains(&"joining again in 60000 ms (try 8): the join failed".to_string()));
     assert_eq!(ev.last().unwrap(), "WLAN off");
     assert!(matches!(WifiEvent::Off, WifiEvent::Off));
+
+    // switched on: the first join at once; when it fails the next 2 s later, then the rhythm
+    let mut f = Supervisor::default();
+    f.on(0);
+    assert!(f.tick(0));
+    f.join_failed(500);
+    assert_eq!(
+        f.next_wake(),
+        Some(2500),
+        "the first join after switching on: retried in 2 s"
+    );
+    assert!(f.tick(2500));
+    f.join_failed(3000);
+    assert_eq!(f.next_wake(), Some(13000), "then 10 s");
+    let ev: Vec<String> = f.take_events().iter().map(|e| e.to_string()).collect();
+    assert!(
+        ev.contains(&"joining again in 2000 ms (try 2): the join failed".to_string()),
+        "{ev:?}"
+    );
+    // after a link went up and was lost, a failure keeps the rhythm's 10 s
+    assert!(f.tick(13000));
+    f.joined();
+    f.link_lost(20000, LinkLoss::BeaconLoss);
+    assert!(f.tick(22000));
+    f.join_failed(23000);
+    assert_eq!(
+        f.next_wake(),
+        Some(33000),
+        "after a loss the rhythm as before"
+    );
 }

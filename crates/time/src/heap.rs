@@ -22,7 +22,6 @@ impl<T: Keyed> Default for Heap<T> {
     }
 }
 
-#[allow(dead_code)] // `is_empty`, `iter`, `reserve_total`: the tests and later callers
 impl<T: Keyed> Heap<T> {
     pub const fn new() -> Self {
         Heap { v: Vec::new() }
@@ -30,15 +29,8 @@ impl<T: Keyed> Heap<T> {
     pub fn len(&self) -> usize {
         self.v.len()
     }
-    pub fn is_empty(&self) -> bool {
-        self.v.is_empty()
-    }
     pub fn capacity(&self) -> usize {
         self.v.capacity()
-    }
-    /// Makes room for `n` elements in total (allocates; thread context).
-    pub fn reserve_total(&mut self, n: usize) -> bool {
-        n <= self.v.capacity() || self.v.try_reserve(n - self.v.len()).is_ok()
     }
     /// Moves the elements into `v` (empty, with room for them; positions stay) and returns the old storage, now
     /// empty, for the caller to free outside its lock. A `v` that is too small or not empty comes back unused.
@@ -83,9 +75,6 @@ impl<T: Keyed> Heap<T> {
         let p = self.up(pos);
         self.down(p);
     }
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.v.iter()
-    }
 
     fn swap(&mut self, a: usize, b: usize) {
         self.v.swap(a, b);
@@ -127,6 +116,16 @@ mod tests {
     use super::*;
     use alloc::rc::Rc;
     use core::cell::Cell;
+
+    // Test-only views (the timer code grows the heap through `replace_storage` and never walks it).
+    impl<T: Keyed> Heap<T> {
+        fn reserve_total(&mut self, n: usize) -> bool {
+            n <= self.v.capacity() || self.v.try_reserve(n - self.v.len()).is_ok()
+        }
+        fn iter(&self) -> impl Iterator<Item = &T> {
+            self.v.iter()
+        }
+    }
 
     struct E {
         k: Cell<(u64, u64)>,

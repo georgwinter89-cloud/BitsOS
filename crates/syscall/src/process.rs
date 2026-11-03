@@ -50,7 +50,7 @@ fn sys_wait4(c: &mut SysCtx<'_>) -> i64 {
         return -e;
     }
     let sel = match Select::from_linux(pid as i32) {
-        Ok(s) => s,
+        Ok(s) => global_sel(c, s),
         Err(e) => return -e,
     };
     let r = match proc::wait_for(c.proc, c.thread.tid(), &opts_from(options, sel, true)) {
@@ -64,9 +64,29 @@ fn sys_wait4(c: &mut SysCtx<'_>) -> i64 {
     if rusage != 0 && c.proc.mm.copy_to_user(rusage, &crate::cputime_sys::rusage_bytes(crate::cputime_sys::reaped_times(&r), r.maxrss_pages * 4)).is_err() {
         return -EFAULT;
     }
-    r.pid as i64
+    r.vpid as i64
 }
 crate::syscall!(WAIT4, sys_wait4);
+
+/// SX-2: a selection by number as the caller's pid namespace names it, made global (a number the namespace
+/// does not know selects nobody: ECHILD, as `find_get_pid` finding none).
+fn global_sel(c: &SysCtx<'_>, s: Select) -> Select {
+    let g = |nr: u32| crate::ns_sys::id(c, nr).unwrap_or(0);
+    match s {
+        Select::Pid(nr) => Select::Pid(g(nr)),
+        Select::Group(nr) => Select::Group(g(nr)),
+        other => other,
+    }
+}
+
+/// SX-2: a pid argument of the job-control calls as a global id (0 and negatives unchanged; a number the
+/// caller's namespace does not know becomes one no process has, so the call answers ESRCH).
+fn global_arg(c: &SysCtx<'_>, nr: i32) -> i32 {
+    if nr <= 0 {
+        return nr;
+    }
+    crate::ns_sys::id(c, nr as u32).map_or(i32::MAX, |g| g as i32)
+}
 
 /// waitid's id and type: `Select`, whether the pidfd it came through is O_NONBLOCK and the pidfd's process
 /// (held for the wait, so the address its selection names stays its own), or the errno
@@ -82,7 +102,7 @@ pub(crate) fn waitid_select(c: &SysCtx<'_>, which: u32, id: i32) -> Result<(Sele
         let sel = Select::Exact { pid: g.tgid, group: Arc::as_ptr(&g) as usize };
         return Ok((sel, status & uapi::ab::pidfd::PIDFD_NONBLOCK != 0, Some(g)));
     }
-    waitid_plain(c, which, id).map(|s| (s, false, None))
+    waitid_plain(c, which, id).map(|s| (global_sel(c, s), false, None))
 }
 
 fn waitid_plain(c: &SysCtx<'_>, which: u32, id: i32) -> Result<Select, i64> {
@@ -99,7 +119,13 @@ fn waitid_plain(c: &SysCtx<'_>, which: u32, id: i32) -> Result<Select, i64> {
 
 /// The six `siginfo_t` fields waitid writes (si_signo, si_errno, si_code, si_pid, si_uid, si_status) for what
 /// it found (`None`: WNOHANG and nothing ended: zeros).
+#[cfg(test)]
 pub(crate) fn waitid_info(r: Option<&proc::Reaped>) -> [(u64, u32); 6] {
+    waitid_info_seen(r, |p| p, |u| u)
+}
+
+/// `waitid_info` with si_pid and si_uid as the waiter names them (SX-2).
+pub(crate) fn waitid_info_seen(r: Option<&proc::Reaped>, pid_of: impl Fn(u32) -> u32, uid_of: impl Fn(u32) -> u32) -> [(u64, u32); 6] {
     let (signo, code, pid, uid, status) = match r {
         None => (0, 0, 0, 0, 0),
         Some(r) => match (r.event, r.status) {
@@ -109,6 +135,7 @@ pub(crate) fn waitid_info(r: Option<&proc::Reaped>) -> [(u64, u32); 6] {
             (proc::WaitEvent::Ended, ExitStatus::Signaled(s)) => (uapi::ab::signal::SIGCHLD, CLD_KILLED as u32, r.pid, r.uid, s),
         },
     };
+    let (pid, uid) = if r.is_some() { (pid_of(pid), uid_of(uid)) } else { (0, 0) };
     [(0, signo), (4, 0), (8, code), (16, pid), (20, uid), (24, status)]
 }
 
@@ -153,7 +180,8 @@ fn sys_waitid(c: &mut SysCtx<'_>) -> i64 {
         if !waitid_infop_ok(infop) {
             return -EFAULT;
         }
-        for (off, v) in waitid_info(r.as_ref()) {
+        let me = c.proc.cred();
+        for (off, v) in waitid_info_seen(r.as_ref(), |_| r.as_ref().map_or(0, |r| r.vpid), |u| crate::ns_sys::uid_view(&me, u)) {
             if c.proc.mm.copy_to_user(infop + off, &v.to_le_bytes()).is_err() {
                 return -EFAULT;
             }
@@ -163,34 +191,38 @@ fn sys_waitid(c: &mut SysCtx<'_>) -> i64 {
 }
 crate::syscall_nr!(uapi::ab::nr_more::WAITID, "waitid", sys_waitid);
 
+/// The parent as the caller's pid namespace numbers it (`task_tgid_vnr(real_parent)`: 0 for a namespace's init).
 fn sys_getppid(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.ppid() as i64
+    crate::ns_sys::vnr(c, c.proc.ppid()) as i64
 }
 crate::syscall!(GETPPID, sys_getppid);
 
 fn sys_getpgrp(c: &mut SysCtx<'_>) -> i64 {
-    c.proc.pgid() as i64
+    crate::ns_sys::vnr(c, c.proc.pgid()) as i64
 }
 crate::syscall!(GETPGRP, sys_getpgrp);
 
 /// `getpgid(pid)`: 0 = the caller; another pid (or a thread id) must exist (ESRCH otherwise).
 fn sys_getpgid(c: &mut SysCtx<'_>) -> i64 {
-    proc::job::getpgid(c.proc, c.args[0] as i32).map(|g| g as i64).unwrap_or_else(|e| -e)
+    let pid = global_arg(c, c.args[0] as i32);
+    proc::job::getpgid(c.proc, pid).map(|g| crate::ns_sys::vnr(c, g) as i64).unwrap_or_else(|e| -e)
 }
 crate::syscall!(GETPGID, sys_getpgid);
 
 fn sys_setpgid(c: &mut SysCtx<'_>) -> i64 {
-    proc::job::setpgid(c.proc, c.args[0] as i32, c.args[1] as i32).map(|_| 0).unwrap_or_else(|e| -e)
+    let (pid, pgid) = (global_arg(c, c.args[0] as i32), global_arg(c, c.args[1] as i32));
+    proc::job::setpgid(c.proc, pid, pgid).map(|_| 0).unwrap_or_else(|e| -e)
 }
 crate::syscall!(SETPGID, sys_setpgid);
 
 fn sys_setsid(c: &mut SysCtx<'_>) -> i64 {
-    proc::job::setsid(c.proc).map(|s| s as i64).unwrap_or_else(|e| -e)
+    proc::job::setsid(c.proc).map(|s| crate::ns_sys::vnr(c, s) as i64).unwrap_or_else(|e| -e)
 }
 crate::syscall!(SETSID, sys_setsid);
 
 fn sys_getsid(c: &mut SysCtx<'_>) -> i64 {
-    proc::job::getsid(c.proc, c.args[0] as i32).map(|s| s as i64).unwrap_or_else(|e| -e)
+    let pid = global_arg(c, c.args[0] as i32);
+    proc::job::getsid(c.proc, pid).map(|s| crate::ns_sys::vnr(c, s) as i64).unwrap_or_else(|e| -e)
 }
 crate::syscall_nr!(uapi::ab::nr_more::GETSID, "getsid", sys_getsid);
 
@@ -200,10 +232,10 @@ mod tests {
 
     #[test]
     fn waitid_writes_linux_siginfo_fields() {
-        let r = proc::Reaped { pid: 42, status: ExitStatus::Exited(3), uid: 1000, times: Default::default(), maxrss_pages: 0, event: proc::WaitEvent::Ended };
+        let r = proc::Reaped { pid: 42, vpid: 42, status: ExitStatus::Exited(3), uid: 1000, times: Default::default(), maxrss_pages: 0, event: proc::WaitEvent::Ended };
         assert_eq!(waitid_info(Some(&r)), [(0, 17), (4, 0), (8, 1), (16, 42), (20, 1000), (24, 3)]);
-        let k = proc::Reaped { pid: 7, status: ExitStatus::Signaled(9), uid: 0, times: Default::default(), maxrss_pages: 0, event: proc::WaitEvent::Ended };
-        let st = proc::Reaped { pid: 7, status: ExitStatus::Exited(0), uid: 0, times: Default::default(), maxrss_pages: 0, event: proc::WaitEvent::Stopped(19) };
+        let k = proc::Reaped { pid: 7, vpid: 7, status: ExitStatus::Signaled(9), uid: 0, times: Default::default(), maxrss_pages: 0, event: proc::WaitEvent::Ended };
+        let st = proc::Reaped { pid: 7, vpid: 7, status: ExitStatus::Exited(0), uid: 0, times: Default::default(), maxrss_pages: 0, event: proc::WaitEvent::Stopped(19) };
         assert_eq!(waitid_info(Some(&st))[2], (8, 5), "CLD_STOPPED");
         assert_eq!(waitid_info(Some(&st))[5], (24, 19));
         assert_eq!(st.wait_status(), 0x137f, "WIFSTOPPED, WSTOPSIG 19");

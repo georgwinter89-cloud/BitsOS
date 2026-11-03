@@ -1,5 +1,5 @@
-//! Ring-3 smoke test (V2-PLAN §9.1 point 7): a static musl C program and a Rust std program run against the
-//! wave-A stubs and print their line.
+//! Ring-3 smoke test (V2-PLAN §9.1 point 7): a static musl C program and a Rust std program run as real
+//! processes and print their line.
 
 use alloc::string::String;
 
@@ -31,7 +31,9 @@ fn hello_c() -> ktest::TestResult {
 }
 ktest::ktest!("smoke.hello_c", Safe, hello_c);
 
-/// Normal (non-ktest) boot: run both programs once so the picture shows ring 3 working.
+/// Normal (non-ktest) boot: run both programs once so the picture shows ring 3 working. The everyday stick
+/// kernel (`bitsos_no_ktests`) skips them, as its only caller in main.rs does.
+#[cfg(not(bitsos_no_ktests))]
 pub fn run_at_boot() {
     for (p, e) in [HELLO_C, HELLO_RS] {
         match run(p, e) {

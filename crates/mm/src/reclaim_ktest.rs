@@ -174,7 +174,29 @@ fn commit_room() -> u64 {
 
 /// Fills memory with a file's clean pages, then writes more program memory than is free: every page arrives
 /// (direct and background reclaim take the file's pages back), no allocation fails, the file reads right again.
+///
+/// C1 (desk decision): direct reclaim is bounded on purpose (CONTRACTS §4: try-locks only, a fixed number of
+/// looks), so under QEMU a descheduled vCPU that holds a cache or reclaim lock can make the tries run out and an
+/// allocation fail although clean pages exist. The bounds are not widened for QEMU's sake: a run that ran out of
+/// memory drops its address space and file and runs once more (`mm ktest.retry`); two in a row stay red. The
+/// test is QemuOnly (it fills all memory), so no memory-pressure test runs on the Mini-PC.
 fn pressure() -> TestResult {
+    match pressure_once() {
+        Err(e) if out_of_memory(&e) => {
+            klog::event!(Warn, "mm", "ktest.retry", test = "mm.reclaim.pressure", reason = e.as_str(); "one more try (bounded reclaim under QEMU)");
+            pressure_once()
+        }
+        r => r,
+    }
+}
+
+/// A failure of `pressure_once` that says memory ran out (a program page, a file read with ENOMEM, a failed
+/// direct reclaim or frame allocation), not a wrong value.
+fn out_of_memory(e: &str) -> bool {
+    e.contains("NoMemory") || e.ends_with(": 12") || e.contains("allocations failed") || e.contains("frame allocation failed")
+}
+
+fn pressure_once() -> TestResult {
     if let Some(s) = small_machine() {
         return s;
     }

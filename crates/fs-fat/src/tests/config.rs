@@ -105,3 +105,71 @@ fn fragments_of_two_writers_never_meet() {
     }
     assert!(met == 300, "every round one writer must be refused ({met} of 300)");
 }
+
+/// RB-18 CR-2: a kernel read of CONFIG.TXT leaves no page of it in the cache, the next read comes from the stick; an
+/// unwritten change stays until it is written, and a sync takes the pages too.
+#[test]
+fn secret_read_leaves_no_page_in_the_cache() {
+    let (dir, dev) = stick("cfg-secret", b"screen=1\ntoken=rb18-fake-token\n");
+    let vol = mount_stick(&dev);
+    let ns = view(&vol);
+    let c = Ctx::kernel(&ns);
+    let pages = || {
+        let d = ns.lookup(CFG_S).unwrap();
+        match &d.inode.data {
+            vfs::inode::Data::External(ops) => ops.page_cache().unwrap().pages(),
+            _ => panic!("CONFIG.TXT is a FAT file"),
+        }
+    };
+    let text = ns.read_file(CFG_S, 1 << 16).unwrap();
+    assert!(pages() >= 1, "read_file goes through the cache");
+    assert_eq!(ns.read_secret_file(CFG_S, 1 << 16).unwrap(), text);
+    assert_eq!(pages(), 0);
+    assert_eq!(ns.read_secret_file(CFG_S, 1 << 16).unwrap(), text, "read back from the stick");
+    assert_eq!(ns.read_secret_file(CFG_S, text.len()).unwrap(), text, "exactly at the limit");
+    assert_eq!(ns.read_secret_file(CFG_S, text.len() - 1).err(), Some(EFBIG));
+    assert_eq!(ns.read_secret_file("/boot/BITSOS2/NONE.TXT", 16).err(), Some(ENOENT));
+    assert_eq!(ns.read_secret_file("/boot/BITSOS2", 16).err(), Some(EISDIR));
+
+    let f = c.open(None, CFG, O_WRONLY | O_APPEND, 0).unwrap();
+    f.write(b"a=1\n").unwrap();
+    let mut want = text.clone();
+    want.extend_from_slice(b"a=1\n");
+    assert_eq!(ns.read_secret_file(CFG_S, 1 << 16).unwrap(), want, "the change is read");
+    assert!(pages() >= 1, "unwritten: its page stays");
+    assert_eq!(ns.read_file(CFG_S, 1 << 16).unwrap(), want);
+    ns.lookup(CFG_S).unwrap().inode.sync(SyncKind::Fsync).unwrap();
+    assert_eq!(pages(), 0, "a sync takes them");
+    drop(f);
+    assert_eq!(ns.read_secret_file(CFG_S, 1 << 16).unwrap(), want, "and it is on the stick");
+    drop(ns);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RB-18 CR-2: the bytes a shrink left past the length are zeroed too.
+#[test]
+fn wipe_reaches_the_whole_capacity() {
+    let mut b = crate::file::Buf::reserved(32, true).unwrap();
+    b.bytes.extend_from_slice(b"token=rb18-fake-token\n");
+    b.bytes.truncate(0);
+    b.wipe();
+    assert_eq!(b.bytes.len(), b.bytes.capacity());
+    assert!(b.bytes.capacity() >= 32 && b.bytes.iter().all(|&x| x == 0));
+}
+
+/// RB-18 CR-2: the guards' copies changed shape, a shrink and a growth still leave the right text.
+#[test]
+fn truncate_shrinks_and_grows_the_text() {
+    let (dir, dev) = stick("cfg-trunc", b"screen=1\ntoken=rb18-fake-token\n");
+    let vol = mount_stick(&dev);
+    let ns = view(&vol);
+    let c = Ctx::kernel(&ns);
+    c.truncate(None, CFG, 9).unwrap();
+    assert_eq!(ns.read_file(CFG_S, 1 << 16).unwrap(), b"screen=1\n");
+    c.truncate(None, CFG, 12).unwrap();
+    assert_eq!(ns.read_file(CFG_S, 1 << 16).unwrap(), b"screen=1\n\0\0\0");
+    c.truncate(None, CFG, 0).unwrap();
+    assert_eq!(ns.read_file(CFG_S, 1 << 16).unwrap(), b"");
+    drop(ns);
+    std::fs::remove_dir_all(&dir).ok();
+}

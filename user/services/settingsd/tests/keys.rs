@@ -15,7 +15,7 @@ fn sample(d: &KeyDef) -> Value {
         (Type::Int { min, max, .. }, Value::Int(n)) => Value::Int(if n == max { *min } else { *max }),
         // A word default (kernel.preload.max_mb = all): a number is the change.
         (Type::Int { min, word: Some(_), .. }, Value::Text(_)) => Value::Int(*min),
-        (Type::Choice(c), v) => Value::Text(c.iter().find(|x| Value::Text((*x).clone()) != *v).unwrap().clone()),
+        (Type::Choice { values: c, .. }, v) => Value::Text(c.iter().find(|x| Value::Text((*x).clone()) != *v).unwrap().clone()),
         (Type::Color, _) => Value::Text("#123abc".into()),
         (Type::Text { .. }, _) => Value::Text("Test Font".into()),
         (Type::LogSpec, _) => Value::Text("warn,net=debug".into()),
@@ -33,6 +33,7 @@ fn builtins_are_valid_and_named_for_wy5() {
     for want in [
         "theme.mode",
         "theme.accent",
+        "theme.font.display",
         "theme.font.ui",
         "theme.font.mono",
         "theme.scale",
@@ -42,6 +43,7 @@ fn builtins_are_valid_and_named_for_wy5() {
         "theme.light.bg",
         "kernel.loglevel",
         "kernel.console_log",
+        "kernel.idle",
         "kernel.snd_output",
         "kernel.preload.enabled",
         "kernel.preload.max_mb",
@@ -208,6 +210,12 @@ fn config_edit_rules() {
     assert!(guard::config_guard(b"stick_write=off\n", b"").is_ok());
     assert!(guard::config_guard(b"wlan=off\n", b"wlan=on\n").is_ok());
     assert!(guard::config_guard(b"nvme_write=off\n", b"\xef\xbb\xbfnvme_write=on\n").is_err());
+    // MC-10: mcp and mcp_confirmer are guarded; mcp may not even be dropped.
+    assert_eq!(guard::config_guard(b"", b"mcp=service\n").unwrap_err(), "mcp");
+    assert_eq!(guard::config_guard(b"mcp=service\n", b"").unwrap_err(), "mcp");
+    assert_eq!(guard::config_guard(b"", b"mcp_confirmer=test\n").unwrap_err(), "mcp_confirmer");
+    assert!(guard::config_guard(b"mcp_confirmer=test\nmcp=service\n", b"mcp=service\n").is_ok());
+    assert!(guard::edit_config("mcp=service\n", "mcp", Some("kernel")).is_err());
 }
 
 #[test]

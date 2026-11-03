@@ -35,6 +35,7 @@ mod ktests_ev;
 pub mod link;
 pub mod quirks;
 pub mod scsi;
+mod shutdown;
 pub mod usblink;
 
 #[cfg(test)]
@@ -82,11 +83,6 @@ pub fn disks() -> Vec<Arc<UsbDisk>> {
     ATTACHED.lock().iter().flat_map(|a| a.disks.iter().cloned()).collect()
 }
 
-/// The same as `C: BlockDevice`s.
-pub fn block_devices() -> Vec<Arc<dyn BlockDevice>> {
-    disks().into_iter().map(|d| d as Arc<dyn BlockDevice>).collect()
-}
-
 pub fn find(name: &str) -> Option<Arc<UsbDisk>> {
     disks().into_iter().find(|d| d.name() == name)
 }
@@ -124,6 +120,7 @@ fn probe(dev: &Arc<Device>, f: &Interface) -> Result<(), String> {
     let writes = block::usb_writes_possible();
     let link = UsbLink::new(dev.clone(), f.number, ep_in, ep_out).map_err(|e| format!("no DMA memory: {}", e.as_str()))?;
     let storage = Arc::new(Storage::new(link, max, writes, q.ignore_residue).with_speed(dev.speed().as_str()));
+    shutdown::attach(&storage);
     ATTACHED.lock().push(Attached { device: dev.id, interface: f.number, storage: storage.clone(), disks: Vec::new() });
     DEVICES.inc();
     klog::event!(Info, "usb", "msd.attached", device = storage.path.clone(), vendor = klog::Hex(dev.vendor() as u64),

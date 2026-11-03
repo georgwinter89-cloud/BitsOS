@@ -33,6 +33,8 @@ fi
 
 echo "== build"
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q --workspace)
+# WY-14/15: WY_GPU=1 runs this scenario with the gpu build, WY_GPU=gles with its GLES renderer (tools/gpu-host.sh).
+. "$ROOT/host/tests/wy/tools/gpu-host.sh"
 
 COMP=""
 CL=""
@@ -42,11 +44,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Every wait for bitscomp or the client polls every 0.1 s for at most 25 s (W27/W28: 5 s failed under the gate's
+# load); a wait that is met returns at once. WY_WAIT_TICKS changes the bound.
+TICKS=${WY_WAIT_TICKS:-250}
 ctl() { "$BIN" ctl --socket "$SOCK" "$@"; }
 fail() { echo "FAIL: $*"; ctl cursor || true; ctl list || true; exit 1; }
 field() { ctl "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
 need() { # what, pattern on `ctl cursor`
-    for _ in $(seq 50); do
+    for _ in $(seq "$TICKS"); do
         ctl cursor | grep -q -- "$2" && return 0
         sleep 0.1
     done
@@ -63,10 +68,10 @@ settle() { # until no frame is drawn for 0.4 s (the window's opening animation i
     fail "bitscomp never went idle"
 }
 start() { # pointer mode
-    "$BIN" --backend headless --size 1600x1000 --socket "$SOCK" --pointer "$1" --mcp none --settings none \
+    "${START[@]}" --backend headless --size 1600x1000 --socket "$SOCK" --pointer "$1" --mcp none --settings none \
         --fixed-status >"$RUN/bitscomp-cursor-$1.log" 2>&1 &
     COMP=$!
-    for _ in $(seq 50); do ctl list >/dev/null 2>&1 && return 0; sleep 0.1; done
+    for _ in $(seq "$TICKS"); do ctl list >/dev/null 2>&1 && { gpu_host_check "$RUN/bitscomp-cursor-$1.log" "$COMP"; return 0; }; sleep 0.1; done
     fail "bitscomp did not start"
 }
 client() { # --cursor value, more wyclient flags
@@ -74,12 +79,23 @@ client() { # --cursor value, more wyclient flags
     WAYLAND_DISPLAY=$SOCK "$CLIENT" --cursor "$@" >"$RUN/wyclient-$1.log" 2>&1 &
     CL=$!
     # This client's window (by pid: the one before may still be listed for a moment).
-    for _ in $(seq 50); do ctl list | grep -q "app_id=wyclient .*pid=$CL " && break; sleep 0.1; done
+    for _ in $(seq "$TICKS"); do ctl list | grep -q "app_id=wyclient .*pid=$CL " && break; sleep 0.1; done
     ctl list | grep -q "app_id=wyclient .*pid=$CL " || fail "no wyclient window"
-    # Out and back in: the enter is where the client sets its pointer.
-    ctl pointer 5 5 >/dev/null
-    ctl pointer 600 400 >/dev/null
-    for _ in $(seq 50); do grep -q "cursor set $1" "$RUN/wyclient-$1.log" && return 0; sleep 0.1; done
+    # Out and back in: the enter is where the client sets its pointer. C1: in about 1 of 2 runs (the unchanged
+    # script too, whatever the wait's length) the new window gets no `pointer enter` from this out-and-in although
+    # it is listed under 600,400; bitscomp then sends none until the next motion (WY item, plan/KNOWN-REDS.md). So
+    # the out-and-in is repeated every second while the client has seen no pointer enter at all (never after one:
+    # each enter makes it set its cursor again, which would move the surface case's hotspot).
+    local i
+    for i in $(seq "$TICKS"); do
+        if [ $((i % 10)) = 1 ] && ! grep -q "^pointer enter" "$RUN/wyclient-$1.log"; then
+            [ "$i" -gt 1 ] && echo "   (no pointer enter yet for wyclient $1: out and in again)"
+            ctl pointer 5 5 >/dev/null
+            ctl pointer 600 400 >/dev/null
+        fi
+        grep -q "cursor set $1" "$RUN/wyclient-$1.log" && return 0
+        sleep 0.1
+    done
     fail "wyclient did not set its cursor $1"
 }
 reenter() { # out of the window and back in: the client sets its pointer again
@@ -123,12 +139,12 @@ need "back in the window: the client's text again" "shape=text image=48x48 "
 
 echo "== 1b. the starting mark beside the hardware pointer"
 ctl spawn sleep 3 >/dev/null
-for _ in $(seq 50); do ctl stats | grep -q " launching=1 " && break; sleep 0.1; done
+for _ in $(seq "$TICKS"); do ctl stats | grep -q " launching=1 " && break; sleep 0.1; done
 ctl stats | grep -q " launching=1 " || fail "a windowless start does not carry the starting mark"
 read -r m f <<<"$(moves_frames 5 600 400)"
 [ "$m" -eq 5 ] && [ "$f" -ge 1 ] || fail "with the mark showing, 5 motions made $m moves and $f frames (want 5 and >= 1)"
 echo "   mark showing: 5 moves on the hardware, $f frames for the mark"
-for _ in $(seq 60); do ctl stats | grep -q " launching=0 " && break; sleep 0.1; done
+for _ in $(seq "$TICKS"); do ctl stats | grep -q " launching=0 " && break; sleep 0.1; done
 
 echo "== 1c. an animating client: every motion moves the cursor itself, frames or not"
 client text --animate
@@ -147,7 +163,7 @@ h1=$(hot_of surface)
 need "the client's cursor surface at the output scale" "mode=hw hw=true shape=surface image=40x40 hot=$h1 "
 n=$(grep -c "cursor set surface" "$RUN/wyclient-surface.log")
 reenter
-for _ in $(seq 50); do [ "$(grep -c "cursor set surface" "$RUN/wyclient-surface.log")" -gt "$n" ] && break; sleep 0.1; done
+for _ in $(seq "$TICKS"); do [ "$(grep -c "cursor set surface" "$RUN/wyclient-surface.log")" -gt "$n" ] && break; sleep 0.1; done
 h2=$(hot_of surface)
 [ "$h1" != "$h2" ] || fail "wyclient did not change its hotspot ($h1)"
 need "a new hotspot on the same surface (no commit) is uploaded" "mode=hw hw=true shape=surface image=40x40 hot=$h2 "

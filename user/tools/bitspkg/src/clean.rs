@@ -89,9 +89,39 @@ impl Hook for Ledger {
     }
 }
 
+/// A short private folder for test sockets, removed when dropped: `$TMPDIR/bpk-<pid>-<n>`. A socket address holds
+/// 107 bytes of path (settings.rs SUN_PATH), and a folder under cargo's target dir is longer than that in every
+/// normal checkout (C1: `target/user-scenario/x86_64-unknown-linux-musl/tmp/bitspkg/...` measured 115-118).
+pub struct SockDir(PathBuf);
+
+impl SockDir {
+    pub fn new() -> Result<SockDir, String> {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("bpk-{}-{n}", std::process::id()));
+        fsx::remove_tree(&d)?;
+        fs::create_dir_all(&d).map_err(|e| fsx::err(&d, e))?;
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).map_err(|e| fsx::err(&d, e))?;
+        Ok(SockDir(d))
+    }
+
+    pub fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for SockDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// settingsd's server on a thread of this process, its files in `dir`, its socket `sock`.
 pub fn start_settingsd(dir: &Path, sock: &Path) -> Result<(), String> {
     use settingsd::{events::Events, registry::Registry, server, store::Paths};
+    if sock.as_os_str().len() >= crate::settings::SUN_PATH {
+        return Err(format!("settingsd socket path {} is longer than a Unix socket address holds ({} bytes)", sock.display(), crate::settings::SUN_PATH - 1));
+    }
     for d in ["stick", "fallback", "sys"] {
         fs::create_dir_all(dir.join(d)).map_err(|e| fsx::err(&dir.join(d), e))?;
     }
@@ -122,7 +152,8 @@ pub fn round_trip(work: &Path) -> Result<Vec<String>, String> {
     let mut ok = Vec::new();
     let mut need = |c: bool, what: String| if c { ok.push(what); Ok(()) } else { Err(format!("no leftovers: {what}: failed")) };
     fsx::remove_tree(work)?;
-    let (top, run) = (work.join("tree"), work.join("run"));
+    // The sockets live in a short folder of their own (SockDir), outside the tree the round trip compares.
+    let (top, run) = (work.join("tree"), SockDir::new()?);
     let pkg = work.join("pkg");
     put(&work.join("src/package.toml"), SPEC, 0o644)?;
     put(&work.join("src/bin/run"), PROGRAM, 0o755)?;

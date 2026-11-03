@@ -16,6 +16,10 @@ default = ["nested"]
 # The nested back end (a window in the host's Wayland session): winit, wayland-client through libwayland.
 # The V2 build leaves it out, so neither winit nor libwayland-client are linked or dlopened there.
 nested = ["dep:winit", "wayland-client/system", "wayland-client/dlopen", "dep:wayland-sys", "dep:memmap2"]
+# WY-14: the gpu build (`bitscomp-gpu` on the stick): linked against the Mesa tree's own glibc (build.rs: the tree's
+# loader and a DT_RPATH to its lib/), so Smithay can dlopen the tree's libEGL (WY-15). No crate of its own yet; it
+# draws with Pixman like the rescue build. Works with and without `nested`.
+gpu = ["smithay/renderer_gl"]
 
 # Exact pins (listed with licenses in plan/notes/wy-WY-0.md; downloads covered by Georg's OK of 20.10.).
 [dependencies]

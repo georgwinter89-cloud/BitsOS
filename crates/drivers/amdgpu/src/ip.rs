@@ -23,6 +23,15 @@ pub enum IpKind {
     Mmhub,
     /// Interrupt handler ring (OSSSYS).
     Ih,
+    /// GX-6: the further kinds the discovery table reports (Linux `HDP_HWIP`, `ATHUB_HWIP`, ...).
+    Hdp,
+    Athub,
+    Smuio,
+    Df,
+    Umc,
+    Lsdma,
+    /// A hardware ID with no kind here: kept with its number, never dropped.
+    Other(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -98,6 +107,38 @@ pub fn mark_dcn_measured(blocks: &mut Vec<IpBlock>) {
             blocks.push(IpBlock { kind: IpKind::Dcn, instance: 0, version: v(3, 1, 4), source: Source::Measured(WHY) })
         }
     }
+}
+
+/// GX-6: the blocks as the discovery table reports them (`Source::Discovery`), every entry kept. SDMA engines
+/// are numbered across SDMA0..3 (slot + instance); Linux folds NBIF into NBIO and UVD/VCN into one kind.
+pub fn from_discovery(d: &crate::gpucore::disc::Discovery) -> Vec<IpBlock> {
+    use crate::gpucore::hwid as h;
+    d.ips
+        .iter()
+        .map(|e| {
+            let (kind, instance) = match e.hw_id {
+                h::GC => (IpKind::Gc, e.instance),
+                h::DMU => (IpKind::Dcn, e.instance),
+                h::VCN => (IpKind::Vcn, e.instance),
+                h::MP0 => (IpKind::Mp0, e.instance),
+                h::MP1 => (IpKind::Mp1, e.instance),
+                h::NBIF => (IpKind::Nbio, e.instance),
+                h::MMHUB => (IpKind::Mmhub, e.instance),
+                h::OSSSYS => (IpKind::Ih, e.instance),
+                h::HDP => (IpKind::Hdp, e.instance),
+                h::ATHUB => (IpKind::Athub, e.instance),
+                h::SMUIO => (IpKind::Smuio, e.instance),
+                h::DF => (IpKind::Df, e.instance),
+                h::UMC => (IpKind::Umc, e.instance),
+                h::LSDMA => (IpKind::Lsdma, e.instance),
+                id => match h::sdma_slot(id) {
+                    Some(slot) => (IpKind::Sdma, slot.saturating_add(e.instance)),
+                    None => (IpKind::Other(id), e.instance),
+                },
+            };
+            IpBlock { kind, instance, version: e.version, source: Source::Discovery }
+        })
+        .collect()
 }
 
 pub fn block(blocks: &[IpBlock], kind: IpKind) -> Option<&IpBlock> {

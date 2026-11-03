@@ -122,6 +122,29 @@ fn mapped_and_dirty_pages_stay() {
     assert_eq!(r.shrink(1000, Mode::Background, true).freed, 4, "unmapped now: they go");
 }
 
+/// RB-18: clean pages leave at once, marked to be zeroed; mapped and dirty ones stay, marked; tmpfs keeps its content.
+#[test]
+fn forget_clean_takes_what_nothing_else_needs() {
+    let (c, b) = file(8);
+    read_all(&c, 8);
+    let pin = c.page_for_map(1, false).unwrap();
+    let held = c.cached(2).unwrap();
+    c.write_at(3 * P, &[7u8; P as usize]).unwrap();
+    let dirty = c.cached(3).unwrap();
+    assert_eq!(c.forget_clean(), 3);
+    assert_eq!(c.pages(), 3);
+    assert!(pin.wipe.load(Ordering::Acquire) && held.wipe.load(Ordering::Acquire) && dirty.wipe.load(Ordering::Acquire));
+    assert!(c.cached(3).is_some_and(|p| p.is_dirty()), "unwritten data stays");
+    drop((pin, held, dirty));
+    let before = b.reads.load(Ordering::Relaxed);
+    read_all(&c, 1);
+    assert!(b.reads.load(Ordering::Relaxed) > before, "reads back from the backend");
+    let t = PageCache::tmpfs(Arc::new(crate::pool::Pool::new("rb18-forget")));
+    t.write_at(0, &[1u8; 16]).unwrap();
+    assert_eq!(t.forget_clean(), 1, "a tmpfs file's cache is its content");
+    assert_eq!(t.pages(), 1);
+}
+
 #[test]
 fn direct_reclaim_never_waits_for_a_lock() {
     let (c, _b) = file(8);

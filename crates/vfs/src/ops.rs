@@ -255,7 +255,7 @@ impl<'a> Ctx<'a> {
                     None => {
                         self.fixed_create(&dir, CreateKind::File)?;
                         self.may_create(&dir)?;
-                        if dir.mnt.readonly {
+                        if dir.mnt.is_readonly() {
                             return Err(EROFS);
                         }
                         // Asked before the names lock: an `ask` rule may wait for an answer (B4).
@@ -298,7 +298,7 @@ impl<'a> Ctx<'a> {
                 }
                 _ => {}
             }
-            if want & MAY_WRITE != 0 && found.mnt.readonly && matches!(ftype, uapi::S_IFREG | uapi::S_IFDIR | uapi::S_IFLNK) {
+            if want & MAY_WRITE != 0 && found.mnt.is_readonly() && matches!(ftype, uapi::S_IFREG | uapi::S_IFDIR | uapi::S_IFLNK) {
                 return Err(EROFS);
             }
             if want & MAY_WRITE != 0
@@ -307,7 +307,7 @@ impl<'a> Ctx<'a> {
                 o.may_write(&d)?;
             }
             if want != 0 {
-                d.inode.meta.permission(self.cred, kind_bits(want))?;
+                d.inode.permission(self.cred, kind_bits(want))?;
             }
             if !path_only {
                 self.policy(&found, None, want & MAY_WRITE != 0, false)?;
@@ -347,7 +347,7 @@ impl<'a> Ctx<'a> {
         if !dir.dentry.is_dir() {
             return Err(ENOTDIR);
         }
-        if dir.mnt.readonly {
+        if dir.mnt.is_readonly() {
             return Err(EROFS);
         }
         self.may_create(&dir)?;
@@ -393,7 +393,7 @@ impl<'a> Ctx<'a> {
         if last.trailing && !want_dir {
             return Err(ENOENT);
         }
-        if dir.mnt.readonly {
+        if dir.mnt.is_readonly() {
             return Err(EROFS);
         }
         self.may_create(dir)
@@ -506,18 +506,26 @@ impl<'a> Ctx<'a> {
         if last.trailing {
             return Err(ENOENT);
         }
+        // Linux's order (linux-6.6/fs/namei.c do_linkat): filename_create's EROFS, the EXDEV of two mounts (a
+        // bind of the same file system counts as another), may_linkat's EPERM, then vfs_link's may_create.
+        if dir.mnt.is_readonly() {
+            return Err(EROFS);
+        }
         if !Arc::ptr_eq(&old.mnt, &dir.mnt) {
             return Err(EXDEV);
         }
-        if dir.mnt.readonly {
-            return Err(EROFS);
-        }
-        self.may_create(&dir)?;
         let m = &old.dentry.inode.meta;
-        // fs.protected_hardlinks=1: only the owner (or root) links a file it could not open read-write.
-        if self.cred.uid != 0 && self.cred.uid != m.uid() && (m.file_type() != uapi::S_IFREG || m.permission(self.cred, MAY_READ | MAY_WRITE).is_err()) {
+        // fs.protected_hardlinks=1 (`safe_hardlink_source`, namei.c:1145): only the owner (or root) links a file
+        // that is not a regular file it could open read-write, a setuid file or a setgid group-executable one.
+        let mode = m.mode();
+        let unsafe_source = m.file_type() != uapi::S_IFREG
+            || mode & 0o4000 != 0
+            || mode & 0o2010 == 0o2010
+            || m.permission(self.cred, MAY_READ | MAY_WRITE).is_err();
+        if self.cred.uid != 0 && self.cred.uid != m.uid() && unsafe_source {
             return Err(EPERM);
         }
+        self.may_create(&dir)?;
         if old.dentry.is_dir() {
             return Err(EPERM);
         }
@@ -538,7 +546,7 @@ impl<'a> Ctx<'a> {
         if last.kind != LastKind::Normal {
             return Err(EISDIR);
         }
-        if dir.mnt.readonly {
+        if dir.mnt.is_readonly() {
             return Err(EROFS);
         }
         Self::check_name(&dir, &last.name)?;
@@ -585,7 +593,7 @@ impl<'a> Ctx<'a> {
             LastKind::Root => return Err(EBUSY),
             LastKind::Normal => {}
         }
-        if dir.mnt.readonly {
+        if dir.mnt.is_readonly() {
             return Err(EROFS);
         }
         Self::check_name(&dir, &last.name)?;
@@ -647,7 +655,7 @@ impl<'a> Ctx<'a> {
         if nlast.kind != LastKind::Normal {
             return Err(if flags & abi::RENAME_NOREPLACE != 0 { EEXIST } else { EBUSY });
         }
-        if odir.mnt.readonly {
+        if odir.mnt.is_readonly() {
             return Err(EROFS);
         }
         Self::check_name(&odir, &olast.name)?;
@@ -801,7 +809,7 @@ impl<'a> Ctx<'a> {
         if mode & abi::X_OK != 0 && m.file_type() == uapi::S_IFREG && p.noexec() {
             return Err(EACCES);
         }
-        if mode & abi::W_OK != 0 && p.mnt.readonly && matches!(m.file_type(), uapi::S_IFREG | uapi::S_IFDIR | uapi::S_IFLNK) {
+        if mode & abi::W_OK != 0 && p.mnt.is_readonly() && matches!(m.file_type(), uapi::S_IFREG | uapi::S_IFDIR | uapi::S_IFLNK) {
             return Err(EROFS);
         }
         if mode & abi::W_OK != 0
@@ -809,7 +817,7 @@ impl<'a> Ctx<'a> {
         {
             o.may_write(&p.dentry)?;
         }
-        m.permission(self.cred, mode & 7)
+        p.dentry.inode.permission(self.cred, (mode & 7) | crate::inode::MAY_ACCESS)
     }
 
     /// truncate(path, len) (`len` already checked >= 0).
@@ -822,13 +830,13 @@ impl<'a> Ctx<'a> {
         if !i.is_reg() {
             return Err(EINVAL);
         }
-        if p.mnt.readonly {
+        if p.mnt.is_readonly() {
             return Err(EROFS);
         }
         if let Some(o) = &p.dentry.sb.ops {
             o.may_write(&p.dentry)?;
         }
-        i.meta.permission(self.cred, MAY_WRITE)?;
+        i.permission(self.cred, MAY_WRITE)?;
         // `vfs_truncate`: get_write_access (ETXTBSY for a running program's file).
         let _w = i.get_write_access()?;
         self.policy(&p, None, true, false)?;

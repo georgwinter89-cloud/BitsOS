@@ -1,0 +1,16 @@
+set_thread_area (64-bit) = -ENOSYS
+get_thread_area (64-bit) = -ENOSYS
+int80 set_thread_area alloc = 0
+entry is a TLS slot 12-14: yes
+int80 get_thread_area = 0
+base read back: yes
+limit read back: yes
+32-bit flag read back: yes
+pages flag read back: yes
+int80 set_thread_area fixed = 0
+new base read back: yes
+int80 set_thread_area out of range = -EINVAL
+int80 set_thread_area code seg = -EINVAL
+int80 set_thread_area EFAULT = -EFAULT
+int80 set_thread_area clear = 0
+done

@@ -86,6 +86,17 @@ pub struct VmaFlags {
     pub dontfork: bool,
     /// VM_WIPEONFORK (MADV_WIPEONFORK): the child gets it empty.
     pub wipeonfork: bool,
+    /// VM_RAND_READ (MADV_RANDOM): accessed at random; no anonymous fault-around (MM-12).
+    pub rand_read: bool,
+    /// VM_SEQ_READ (MADV_SEQUENTIAL): accessed in order (kept for Linux's flags; fault-around stays on).
+    pub seq_read: bool,
+    /// VM_HUGEPAGE (MADV_HUGEPAGE): huge pages also in THP mode `madvise` (MM-13, `thp::mode_allows`).
+    pub hugepage: bool,
+    /// VM_NOHUGEPAGE (MADV_NOHUGEPAGE, and MAP_STACK as Linux since 6.7 does for thread stacks): no anonymous
+    /// fault-around (MM-12) and no huge pages (MM-13).
+    pub nohugepage: bool,
+    /// VM_GROWSDOWN (MAP_GROWSDOWN; V2 grows no such VMA): a stack, so no anonymous fault-around (MM-12).
+    pub growsdown: bool,
 }
 
 impl FileRef {
@@ -203,6 +214,16 @@ impl VmaTree {
     /// The first VMA that ends above `addr` (contains it or lies above it).
     pub fn next_from(&self, addr: u64) -> Option<&Vma> {
         self.v.get(self.first_ending_above(addr))
+    }
+
+    /// The free gap around [start, end) (which no VMA overlaps): the end of the VMA below and the start of the
+    /// one above (0 and `u64::MAX` when there is none); Linux's `free_pgtables` floor and ceiling (MM-11).
+    pub fn gap_around(&self, start: u64, end: u64) -> (u64, u64) {
+        let i = self.first_ending_above(start);
+        let floor = if i > 0 { self.v[i - 1].end.min(start) } else { 0 };
+        let j = self.v.partition_point(|x| x.start < end);
+        let ceiling = self.v.get(j).map_or(u64::MAX, |x| x.start.max(end));
+        (floor, ceiling)
     }
 
     /// The VMAs overlapping [start, end).

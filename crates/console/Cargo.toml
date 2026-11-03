@@ -25,3 +25,11 @@ mm-core = { path = "../mm-core" }
 net = { path = "../net" }
 # IN-3: the console font (named in plan/spec/rust-ecosystem.md §2.5). Only the sizes and ranges the console uses.
 noto-sans-mono-bitmap = { version = "=0.3.2", default-features = false, features = ["regular", "size_16", "size_24", "size_32", "unicode-basic-latin", "unicode-latin-1-supplement"] }
+
+# DS-4: the boot screen's glyph atlases and ring are rasterised on the host at build time (build.rs), never in the
+# kernel (plan/spec/rust-ecosystem.md §2.5 names fontdue; the version bitscomp uses, already in the cargo cache).
+[build-dependencies]
+fontdue = { version = "=0.9.5", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

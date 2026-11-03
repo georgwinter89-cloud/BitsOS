@@ -316,10 +316,6 @@ impl Store {
         serde_json::from_slice(&b).map_err(|e| format!("catalog: {e}"))
     }
 
-    pub fn file_sum(path: &Path) -> io::Result<String> {
-        Ok(sum(&fs::read(path)?))
-    }
-
     pub fn bytes_sum(b: &[u8]) -> String {
         sum(b)
     }

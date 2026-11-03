@@ -6,13 +6,16 @@
 //! `run <path> [args]` starts a static Linux program with stdin/stdout/stderr on `/dev/console` and makes the
 //! console its controlling terminal with the program's group in the foreground (what a shell does with setsid +
 //! TIOCSCTTY + tcsetpgrp), so Ctrl+C, Ctrl+\ and Ctrl+Z reach it as SIGINT, SIGQUIT and SIGTSTP from the line
-//! discipline (until AB-6 a signal with a handler stays pending; default actions end the program at once).
+//! discipline (a handler runs at the program's next return to user mode; default actions end it at once).
 //! Afterwards the terminal settings it changed are restored and the console takes screen and keyboard back.
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+mod desktop;
+#[cfg(test)]
+mod tests_desktop;
 mod ktests;
 mod ktests_in6;
 mod ktests_pty;
@@ -29,8 +32,8 @@ use proc::{ExitStatus, Process};
 pub const CONSOLE_PROGRAM: policy::ProgramId = policy::ProgramId(2);
 const SLICE_NS: u64 = 100_000_000;
 /// Ctrl+C presses (VINTR with ISIG) after which `run` stops waiting for SIGINT to work and ends the program with
-/// SIGKILL: the first is SIGINT as on Linux, the third means the program is not listening (a handler that stays
-/// pending until AB-6, a blocked or ignored SIGINT). The console is Georg's only way in on bare metal.
+/// SIGKILL: the first is SIGINT as on Linux, the third means the program is not listening (a handler that does
+/// not end it, a blocked or ignored SIGINT). The console is Georg's only way in on bare metal.
 const KILL_AFTER_INTERRUPTS: u64 = 3;
 const SIGKILL: u32 = 9;
 
@@ -186,6 +189,11 @@ impl console::jobs::Procs for ProcHook {
     }
     fn pgrp_stopped(&self, pgrp: u32) -> bool {
         proc::job::pgrp_has_stopped(pgrp)
+    }
+    fn reader(&self) -> Option<(u32, [u8; 16])> {
+        let t = proc::current_thread()?;
+        let pid = t.group().image().map_or(t.tid(), |p| p.pid);
+        Some((pid, t.prctl().comm()))
     }
     /// `will_become_orphaned_pgrp` (linux-6.6/kernel/exit.c:326): members whose parent is init (pid 1), the
     /// kernel (0) or gone (Linux re-parents those to init) do not count.

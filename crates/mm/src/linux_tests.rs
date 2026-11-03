@@ -205,3 +205,50 @@ fn madvise_checks_in_linux_order() {
     }
     assert!(!madv::valid(26) && !madv::valid(102), "MADV_GUARD_* (7.x) are not offered");
 }
+
+#[test]
+fn map_stack_and_growsdown_mark_the_vma() {
+    // MM-12: a stack the program maps itself gets no fault-around; a MAP_STACK VMA does not merge with plain
+    // anonymous memory next to it (Linux since 6.7: VM_NOHUGEPAGE differs).
+    let mut s = Space::new(TASK_SIZE);
+    let a = map(&mut s, 0x2000_0000, 4 * P, RW, AP | MAP_FIXED).unwrap();
+    let b = map(&mut s, a + 4 * P, 4 * P, RW, AP | MAP_FIXED | MAP_STACK).unwrap();
+    let c = map(&mut s, b + 4 * P, 4 * P, RW, AP | MAP_FIXED | MAP_GROWSDOWN).unwrap();
+    let fl = |x: u64| s.tree.find(x).unwrap().flags;
+    assert!(!fl(a).nohugepage && !fl(a).growsdown);
+    assert!(fl(b).nohugepage && !fl(b).growsdown, "MAP_STACK is VM_NOHUGEPAGE");
+    assert!(fl(c).growsdown && !fl(c).nohugepage, "MAP_GROWSDOWN is VM_GROWSDOWN");
+    assert_eq!(s.tree.find(a).unwrap().end, b, "plain and MAP_STACK memory stay apart");
+    assert_eq!(s.tree.find(b).unwrap().end, c, "and MAP_GROWSDOWN memory too");
+}
+
+#[test]
+fn anonymous_two_mib_multiples_get_aligned_addresses() {
+    // MM-13: CachyOS 7.x (checked on the host) aligns private anonymous mappings without an address whose length is
+    // a multiple of 2 MiB; other lengths, hints, MAP_FIXED, MAP_32BIT and MAP_SHARED keep the plain search.
+    const M2: u64 = 2 << 20;
+    let mut s = Space::new(TOP);
+    let a = map(&mut s, 0, 4 * P, RW, AP).unwrap();
+    assert_eq!(a, TOP - 4 * P, "a small mapping takes the top");
+    let b = map(&mut s, 0, M2, RW, AP).unwrap();
+    assert_eq!(b % M2, 0);
+    assert_eq!(b, (TOP - 4 * P - M2) & !(M2 - 1), "the first boundary below the gap's top");
+    let c = map(&mut s, 0, 4 * M2, RW, AP | MAP_STACK | MAP_NORESERVE).unwrap();
+    assert_eq!((c % M2, c + 4 * M2), (0, b), "MAP_STACK and MAP_NORESERVE align too; right below the last");
+    let d = map(&mut s, 0, 3 << 20, RW, AP).unwrap();
+    assert_eq!(d, c - (3 << 20), "3 MiB is no multiple: the plain search");
+    let e = map(&mut s, 0, M2 + P, RW, AP).unwrap();
+    assert_eq!(e, d - M2 - P, "2 MiB + 4 KiB neither");
+    let f = map(&mut s, 0x1234_5000, M2, RW, AP).unwrap();
+    assert_eq!(f, 0x1234_5000, "a free hint is kept (Linux aligns only without an address)");
+    let g = map(&mut s, 0, M2, PROT_NONE_, AP).unwrap();
+    assert_eq!(g % M2, 0, "the rights do not matter");
+    let h = s.plan_mmap(0, M2, RW, AP | MAP_32BIT, 0).unwrap().addr;
+    assert!(h + M2 <= 0x8000_0000, "MAP_32BIT keeps its own search");
+    // A gap with an aligned start: the mapping takes its top (`ret + size`).
+    let mut t = Space::new(0x10_0000_0000);
+    map(&mut t, 0x10_0000_0000 - M2, M2, RW, AP | MAP_FIXED).unwrap();
+    let x = map(&mut t, 0, M2, RW, AP).unwrap();
+    assert_eq!(x, 0x10_0000_0000 - 2 * M2, "an aligned gap top");
+}
+const PROT_NONE_: u64 = 0;

@@ -3,9 +3,9 @@
 //! counts as having answered, and what the waiting initiator does next.
 
 /// Up to this many pages a flush invalidates page by page (`invlpg`); a larger range, a range not known any
-/// more or more than one missed generation flushes the whole context instead (Linux's
-/// `tlb_single_page_flush_ceiling` is 33).
-pub const RANGE_PAGES: u64 = 32;
+/// more or more than one missed generation flushes the whole context instead (MM-11: Linux's
+/// `tlb_single_page_flush_ceiling`, linux-6.6/arch/x86/mm/tlb.c:957 and :1010, a range over 33 pages is full).
+pub const RANGE_PAGES: u64 = 33;
 
 /// How a CPU brings its TLB from generation `synced` to `generation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,8 +13,16 @@ pub enum Plan {
     Nothing,
     /// `invlpg` for `pages` pages from `start`.
     Pages { start: u64, pages: u64 },
+    /// MM-13: `invlpg` once per 2 MiB entry, `count` of them from `start` (one invlpg drops a whole large entry;
+    /// Linux's `flush_tlb_mm_range` with `stride_shift` = PMD_SHIFT, the ceiling counted in entries).
+    Huge { start: u64, count: u64 },
     Full,
 }
+
+/// Bytes of a 2 MiB entry.
+const HUGE: u64 = 2 << 20;
+/// Bit 0 of a published start (starts are page aligned) marks a range of only 2 MiB entries (`published_huge`).
+pub const HUGE_RANGE: u64 = 1;
 
 /// `range`: the range published with `generation` (None: a full flush was asked for, or the range was overwritten
 /// by a later change while this CPU read it). Only a CPU exactly one generation behind can use the range.
@@ -26,9 +34,19 @@ pub fn plan(synced: u64, generation: u64, range: Option<(u64, u64)>) -> Plan {
         return Plan::Full;
     }
     match range {
+        Some((s, e)) if s & HUGE_RANGE != 0 => {
+            let s = s & !(HUGE - 1);
+            if e > s && (e - s).div_ceil(HUGE) <= RANGE_PAGES { Plan::Huge { start: s, count: (e - s).div_ceil(HUGE) } } else { Plan::Full }
+        }
         Some((s, e)) if e > s && (e - s).div_ceil(4096) <= RANGE_PAGES => Plan::Pages { start: s & !0xFFF, pages: (e - (s & !0xFFF)).div_ceil(4096) },
         _ => Plan::Full,
     }
+}
+
+/// MM-13: the range an initiator publishes when [start, end) holds only 2 MiB entries: up to `RANGE_PAGES`
+/// entries are flushed one `invlpg` each, more flush the whole context ((0, 0)).
+pub fn published_huge(start: u64, end: u64) -> (u64, u64) {
+    if end <= start || (end - start).div_ceil(HUGE) > RANGE_PAGES { (0, 0) } else { ((start & !(HUGE - 1)) | HUGE_RANGE, end) }
 }
 
 /// The range an initiator publishes: (0, 0) stands for "whole context".

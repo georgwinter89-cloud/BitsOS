@@ -158,6 +158,39 @@ impl DirSource for RandomDir {
     }
 }
 
+/// `kernel.yama.ptrace_scope` (linux-6.6/security/yama/yama_lsm.c:27,432): default 1 (relational). V2 has no
+/// ptrace(2), so no attach exists; the attach-mode checks that do (pidfd_getfd, process_vm_readv/writev:
+/// `Process::may_ptrace`) do not apply the scope yet (they act as scope 0 would; C1: an AB item, V2-LANES AB-18).
+/// The value answers readers such as Chromium's sandbox check; a write needs CAP_SYS_PTRACE
+/// (checked before the number, :437), takes 0..=3, and once 3 is set nothing lower is accepted (:440-443).
+static PTRACE_SCOPE: AtomicU64 = AtomicU64::new(1);
+const YAMA_SCOPE_NO_ATTACH: u64 = 3;
+
+fn set_ptrace_scope(data: &[u8]) -> Result<usize, Errno> {
+    if proc::current().is_some_and(|me| !me.capable(proc::cred::Cap::SysPtrace)) {
+        klog::event!(Info, "syscall", "sysctl.denied", knob = "yama.ptrace_scope");
+        return Err(EPERM);
+    }
+    if data.is_empty() {
+        return Ok(0);
+    }
+    if let Some(v) = vfs::sysctl::parse_ulong(data)? {
+        let min = if PTRACE_SCOPE.load(Ordering::Relaxed) == YAMA_SCOPE_NO_ATTACH { YAMA_SCOPE_NO_ATTACH } else { 0 };
+        store("yama.ptrace_scope", &PTRACE_SCOPE, v, min..=YAMA_SCOPE_NO_ATTACH)?;
+    }
+    Ok(data.len())
+}
+
+struct YamaDir;
+
+impl DirSource for YamaDir {
+    fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
+        let scope = Live::new(0, || Ok(alloc::format!("{}\n", PTRACE_SCOPE.load(Ordering::Relaxed))))
+            .writable(|_who: Cred, data: &[u8]| set_ptrace_scope(data));
+        Ok(alloc::vec![SynthEntry::file("ptrace_scope", 0o644, Arc::new(scope)).cookie(1)])
+    }
+}
+
 struct KernelDir;
 
 impl DirSource for KernelDir {
@@ -181,6 +214,7 @@ impl DirSource for KernelDir {
             SynthEntry::file("tainted", 0o644, knob(tainted, set_tainted)),
             SynthEntry::file("threads-max", 0o644, knob(threads_max, set_threads_max)),
             SynthEntry::file("version", 0o444, fixed(crate::info::VERSION)),
+            SynthEntry::dir("yama", Arc::new(YamaDir)),
         ];
         for (i, e) in v.iter_mut().enumerate() {
             e.cookie = i as u64 + 1;
@@ -284,3 +318,96 @@ fn vm_dir() -> Arc<dyn DirSource> {
     Arc::new(VmDir)
 }
 vfs::procdir!("/proc/sys/vm", vm_dir);
+
+/// SX-3b: `/proc/sys/user` (linux-6.6/kernel/ucount.c `user_table`): the namespace limits of the reader's user
+/// namespace, the kinds V2 counts (`proc::ns::count`). stat shows the table's 0644 owned by root, as Linux; access
+/// is `set_permissions` through the file's own permission op (`proc_sys_permission`): read and write for a
+/// caller with CAP_SYS_RESOURCE over its own user namespace, read only for everyone else, never exec.
+const USER_LIMITS: [(&str, proc::ns::count::Counted); 6] = {
+    use proc::ns::count::Counted::*;
+    [
+        ("max_ipc_namespaces", Ipc),
+        ("max_mnt_namespaces", Mnt),
+        ("max_net_namespaces", Net),
+        ("max_pid_namespaces", Pid),
+        ("max_user_namespaces", User),
+        ("max_uts_namespaces", Uts),
+    ]
+};
+
+/// The reader's user namespace and whether it may change its limits.
+fn reader_user_ns() -> (Arc<proc::ns::user::UserNs>, bool) {
+    match proc::current() {
+        Some(me) => {
+            let c = me.cred();
+            let may = proc::cred::ns_capable(&c, &c.user_ns, proc::cred::Cap::SysResource);
+            (c.user_ns.clone(), may)
+        }
+        None => (proc::ns::user::init_user_ns().clone(), true),
+    }
+}
+
+struct NsLimit(proc::ns::count::Counted);
+
+impl vfs::synth::FileSource for NsLimit {
+    /// `test_perm` with `set_permissions`' mode (linux-6.6/fs/proc/proc_sysctl.c:416, kernel/ucount.c:40): the
+    /// mode is the same for owner, group and others, so only the capability counts.
+    /// access(2) (MAY_ACCESS) asks with the real ids, whose capabilities count only for the namespace's root
+    /// uid (linux-6.6/fs/open.c:420 `access_override_creds`; AT_EACCESS keeps them).
+    fn permission(&self, _who: Cred, want: u32) -> Option<Result<(), Errno>> {
+        use vfs::inode::{MAY_ACCESS, MAY_EXEC, MAY_WRITE};
+        let may_write = || {
+            let Some(me) = proc::current() else { return true };
+            let c = me.cred();
+            let caps_kept = want & MAY_ACCESS == 0 || c.user_ns.uid(c.uid) == 0;
+            caps_kept && proc::cred::ns_capable(&c, &c.user_ns, proc::cred::Cap::SysResource)
+        };
+        let denied = want & MAY_EXEC != 0 || (want & MAY_WRITE != 0 && !may_write());
+        Some(if denied { Err(EACCES) } else { Ok(()) })
+    }
+    fn may_open(&self, _who: Cred, write: bool) -> Result<(), Errno> {
+        if write && !reader_user_ns().1 {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(alloc::format!("{}\n", reader_user_ns().0.limits.get(self.0)).into_bytes())
+    }
+    fn write(&self, who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        self.write_at(who, 0, data)
+    }
+    /// `proc_dointvec_minmax` with 0..=INT_MAX (linux-6.6/kernel/sysctl.c:471 `__do_proc_dointvec`): a write at a
+    /// non-zero position changes nothing and counts as written (SYSCTL_WRITES_STRICT, the default: `goto out`
+    /// keeps `*lenp`); one made only of white space is EINVAL.
+    fn write_at(&self, _who: Cred, pos: u64, data: &[u8]) -> Result<usize, Errno> {
+        let (ns, may) = reader_user_ns();
+        if !may {
+            return Err(EPERM);
+        }
+        if data.is_empty() || pos != 0 {
+            return Ok(data.len());
+        }
+        let v = vfs::sysctl::parse_ulong(data)?.ok_or(EINVAL)?;
+        ns.limits.set(self.0, v)?;
+        klog::event!(Info, "syscall", "sysctl.ns_limit", kind = self.0.name(), value = v, userns = ns.inum);
+        Ok(data.len())
+    }
+}
+
+struct UserDir;
+
+impl DirSource for UserDir {
+    fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
+        let mut v: Vec<SynthEntry> = USER_LIMITS.iter().map(|&(name, kind)| SynthEntry::file(name, 0o644, Arc::new(NsLimit(kind)))).collect();
+        for (i, e) in v.iter_mut().enumerate() {
+            e.cookie = i as u64 + 1;
+        }
+        Ok(v)
+    }
+}
+
+fn user_dir() -> Arc<dyn DirSource> {
+    Arc::new(UserDir)
+}
+vfs::procdir!("/proc/sys/user", user_dir);

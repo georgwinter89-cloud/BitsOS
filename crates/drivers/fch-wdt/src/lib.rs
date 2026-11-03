@@ -16,6 +16,7 @@ extern crate alloc;
 
 mod cmd;
 pub mod config;
+pub mod crumb;
 pub mod dog;
 mod ktests;
 pub mod live;

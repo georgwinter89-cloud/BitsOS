@@ -499,9 +499,6 @@ impl Drop for ScanoutGuard {
     }
 }
 
-/// Keeps a shared handle type for back ends that want `Arc`.
-pub type DeviceArc = Arc<dyn DisplayDevice>;
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

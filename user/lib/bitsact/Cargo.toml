@@ -1,0 +1,9 @@
+[package]
+name = "bitsact"
+version = "0.1.0"
+edition = "2024"
+description = "AC: actions of BitsOS programs as MCP tools (on mcpreg): typed arguments, calls on threads with cancel and deadline, the permission gate for change actions (settingsd keys), B6 events"
+publish = false
+
+[dependencies]
+mcpreg = { path = "../mcpreg" }

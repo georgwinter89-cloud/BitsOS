@@ -12,7 +12,7 @@ use wayland_client::protocol::{wl_buffer, wl_registry, wl_shm, wl_shm_pool, wl_s
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 
 use super::copy_rects;
-use crate::render::Compositor;
+use crate::render::Picture;
 
 const MAX_BUFFERS: usize = 3;
 
@@ -76,7 +76,7 @@ impl HostShm {
         Ok(Buf { buffer, map, stale: vec![Rectangle::from_size((w, h).into())] })
     }
 
-    pub fn present(&mut self, comp: &Compositor, damage: &[Rectangle<i32, Physical>]) {
+    pub fn present(&mut self, comp: &dyn Picture, damage: &[Rectangle<i32, Physical>]) {
         if comp.size() != self.size {
             for b in self.bufs.drain(..) {
                 b.buffer.destroy();
@@ -94,7 +94,7 @@ impl HostShm {
         self.flush(comp);
     }
 
-    pub fn flush(&mut self, comp: &Compositor) {
+    pub fn flush(&mut self, comp: &dyn Picture) {
         let _ = self.queue.dispatch_pending(&mut self.shared);
         if !self.dirty || comp.size() != self.size {
             return;

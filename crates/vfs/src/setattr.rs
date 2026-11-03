@@ -205,7 +205,7 @@ impl Ctx<'_> {
     /// Linux's own answers (EPERM, EACCES) come before the B3 question, which may wait and so is asked
     /// without the lock; the checks run again under it.
     pub fn setattr(&self, p: &Path, build: impl Fn(&Meta) -> SetAttr) -> Result<(), Errno> {
-        if p.mnt.readonly {
+        if p.mnt.is_readonly() {
             return Err(EROFS);
         }
         let i = &p.dentry.inode;

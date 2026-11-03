@@ -6,7 +6,8 @@ use super::sys_net::{net_class, net_devices};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use vfs::Errno;
-use vfs::synth::{DirSource, SynthEntry};
+use vfs::inode::Cred;
+use vfs::synth::{DirSource, FileSource, SynthEntry};
 
 /// A fixed directory of named subdirectories (sysfs mode 0755).
 struct Fixed(&'static [(&'static str, fn() -> Arc<dyn DirSource>)]);
@@ -33,7 +34,58 @@ fn class() -> Arc<dyn DirSource> {
     Arc::new(Fixed(&[("net", net_class)]))
 }
 
+/// MM-13: `/sys/kernel/mm/transparent_hugepage/enabled` (Linux `enabled_show`/`enabled_store`, mode 0644; a word
+/// other than always/madvise/never is EINVAL).
+struct ThpEnabled;
+
+impl FileSource for ThpEnabled {
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(mm::thp::enabled_text().as_bytes().to_vec())
+    }
+    fn write(&self, _who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        mm::thp::store(data).map(|_| data.len()).map_err(|_| uapi::errno::EINVAL)
+    }
+    fn size(&self) -> u64 {
+        4096
+    }
+}
+
+/// MM-13: `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size` (mode 0444).
+struct ThpPmdSize;
+
+impl FileSource for ThpPmdSize {
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(mm::thp::hpage_pmd_size_text().as_bytes().to_vec())
+    }
+    fn size(&self) -> u64 {
+        4096
+    }
+}
+
+struct ThpDir;
+
+impl DirSource for ThpDir {
+    fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
+        Ok(alloc::vec![
+            SynthEntry::file("enabled", 0o644, Arc::new(ThpEnabled)).cookie(1),
+            SynthEntry::file("hpage_pmd_size", 0o444, Arc::new(ThpPmdSize)).cookie(2),
+        ])
+    }
+}
+
+fn transparent_hugepage() -> Arc<dyn DirSource> {
+    Arc::new(ThpDir)
+}
+
+fn kernel_mm() -> Arc<dyn DirSource> {
+    Arc::new(Fixed(&[("transparent_hugepage", transparent_hugepage)]))
+}
+
+fn kernel() -> Arc<dyn DirSource> {
+    Arc::new(Fixed(&[("mm", kernel_mm)]))
+}
+
 fn sys_root() -> Arc<dyn DirSource> {
-    Arc::new(Fixed(&[("class", class), ("devices", devices)]))
+    Arc::new(Fixed(&[("class", class), ("devices", devices), ("kernel", kernel)]))
 }
 vfs::procdir!("/sys", sys_root);

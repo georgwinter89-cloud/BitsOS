@@ -161,6 +161,10 @@ def main():
 
     keys = ctl(c, "list")["keys"]
     need(len(keys) >= 25, f"{len(keys)} keys listed")
+    # CL-8: the kernel's log level is a choice with German names (the settings page shows pills, not a field).
+    ls = ctl(c, "describe", "kernel.loglevel")["key"]["schema"]
+    need(ls.get("type") == "choice" and ls.get("choices") == ["error", "warn", "info", "debug", "trace"]
+         and len(ls.get("choices_de", [])) == 5, "kernel.loglevel is a choice of five levels with German names", ls)
     for k in keys:
         d = ctl(c, "describe", k["key"])["key"]
         v = sample(d)
@@ -173,7 +177,9 @@ def main():
             raise SystemExit(f"RED: get {d['key']} after set: {g}")
         if d["applier"]["by"] == "kernel":
             cfg = read_file(c, "/boot/BITSOS2/CONFIG.TXT")
-            line = f"{d['applier']['config']}={v}"
+            # Value::show: a bool is on/off in CONFIG.TXT (kernel.preload.enabled), not Python's True/False.
+            shown = ("on" if v else "off") if isinstance(v, bool) else v
+            line = f"{d['applier']['config']}={shown}"
             if line not in (cfg or "").splitlines():
                 raise SystemExit(f"RED: {line} not in CONFIG.TXT: {cfg}")
         u = ctl(c, "undo")

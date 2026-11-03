@@ -3,7 +3,7 @@
 use smithay::utils::{Physical, Rectangle};
 
 use super::{Backend, copy_rects};
-use crate::render::Compositor;
+use crate::render::Picture;
 use crate::state::App;
 
 pub struct Headless {
@@ -41,7 +41,7 @@ impl Backend for Headless {
         (self.pointer == "fake").then(|| Box::new(crate::hwcursor::Fake::default()) as Box<dyn crate::hwcursor::HwCursor>)
     }
 
-    fn present(&mut self, comp: &Compositor, damage: &[Rectangle<i32, Physical>]) {
+    fn present(&mut self, comp: &dyn Picture, damage: &[Rectangle<i32, Physical>]) {
         if comp.size() == self.size {
             copy_rects(comp, &mut self.fb, self.size.0 as usize, damage);
         }

@@ -494,11 +494,11 @@ impl Pool {
             done += n;
             off += n as u64;
             if self.dirty_pages >= self.cfg.commit_dirty_pages {
-                self.commit()?;
+                self.commit_at(prio)?;
             }
         }
         if fua {
-            self.commit()?;
+            self.commit_at(prio)?;
         }
         Ok(())
     }

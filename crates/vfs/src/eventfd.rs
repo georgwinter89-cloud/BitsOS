@@ -34,7 +34,8 @@ klog::counter!(EVENTFDS, "vfs.eventfds");
 static ANON_DEV: ksync::Once<u64> = ksync::Once::new();
 static ANON_INODE: ksync::Once<Meta> = ksync::Once::new();
 
-pub(crate) fn anon_attr() -> Attr {
+/// Public since INT-W24 (DR-3): drm's syncobj and sync_file fds share this inode in fstat, as on Linux.
+pub fn anon_attr() -> Attr {
     let dev = *ANON_DEV.get_or_init(crate::dentry::anon_dev);
     ANON_INODE.get_or_init(|| Meta::new(1, 0o600, Cred::ROOT)).attr(dev)
 }
@@ -238,6 +239,9 @@ impl File for EventFd {
     }
     fn link_name(&self) -> Option<String> {
         Some(String::from("anon_inode:[eventfd]"))
+    }
+    fn as_eventfd(&self) -> Option<&EventFd> {
+        Some(self)
     }
 }
 

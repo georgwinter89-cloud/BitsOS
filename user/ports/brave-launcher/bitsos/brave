@@ -4,14 +4,18 @@
 #   brave [URL] [-- Brave arguments]   start in the desktop; ends when Brave ends (Ctrl+Q or its window's close)
 #   brave --check                      check the tree, libraries, fonts, desktop, user and profile; start nothing
 # Brave is a Wayland client: it needs the desktop. It never runs as root: started by root (console, MCP as root) it
-# runs as uid 1000 (BusyBox chpst -u 1000:1000), and refuses to start if root cannot hand over. Its sandbox is off
-# (--no-sandbox: V2 has no seccomp and user namespaces yet, SX-1..3).
+# runs as uid 1000 (BusyBox chpst -u 1000:1000), and refuses to start if root cannot hand over. It runs in its own
+# sandbox (BR-6): seccomp-bpf (SX-1) and user, PID and network namespaces (SX-2), without the setuid helper
+# chrome-sandbox (not in the tree). Every start probes the namespaces first and says the result (`sandbox: on ...`, or
+# `sandbox: missing ...` on a kernel without them, where Chromium ends at once with "No usable sandbox!"); by default
+# (BRAVE_SANDBOX=on, BR-6b) it never adds --no-sandbox. BRAVE_SANDBOX=auto falls back to --no-sandbox, saying so.
 # The profile (bookmarks, cookies, settings): on the data volume, /data/appdata/brave, when one is mounted writable
 # at /data (ext4, FS-8); else as one file on the stick, \BITSOS2\home\brave_profile.tar (+ the copy before it, .old),
 # unpacked into RAM at the start and packed back after a clean end, as Cobalt's sign-in: FAT holds neither the
 # SingletonLock symlink nor SQLite's locks. The page cache stays in RAM then. The first start on a data volume
 # takes the stick's tar profile over into the empty /data/appdata/brave once and renames it .imported (INT-W11).
 # One Brave per profile: a second `brave URL` hands the URL to the running one (Chromium's own singleton).
+# Downloads (BR-7) go to /data/home/1000/Downloads on the data volume, else to HOME's Downloads (RAM).
 # The BRAVE_* settings exist for host/tests/br/20-launcher.sh (a fake tree and mount table on the build host).
 MNT=${BRAVE_MOUNT:-/boot}
 T=${BRAVE_TREE:-$MNT/BITSOS2/brave}
@@ -19,6 +23,7 @@ P=${BRAVE_HOME:-$MNT/BITSOS2/home}
 PROF=$P/brave_profile.tar
 DATA=${BRAVE_DATA:-/data}
 PD=$DATA/appdata/brave
+DL_DATA=$DATA/home/1000/Downloads
 # The kernel's line about /data (FS-8c): waiting, creating, mounted pool|plain rw|ro, skipped/failed <why>.
 STATE=${BRAVE_DATA_STATE:-/run/bitsos/data-state}
 MOUNTS=${BRAVE_MOUNTS:-/proc/self/mounts}
@@ -30,19 +35,24 @@ PATH=${BRAVE_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
 export PATH
 UID_NOW=$(id -u 2>/dev/null)
 # The flags of BR-1's run on CachyOS (plan/notes/br-BR-1.md), which V2 is measured against.
-FLAGS="--ozone-platform=wayland --disable-gpu --password-store=basic --no-sandbox --disable-breakpad
+FLAGS="--ozone-platform=wayland --disable-gpu --password-store=basic --disable-breakpad
 --disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required"
 # Dark or light as the desktop (settingsd theme.mode, Georg 23.10.): Chromium has no portal here to ask, so the
 # browser and web pages' prefers-color-scheme follow --force-dark-mode; a change applies at Brave's next start.
 THEME=${BRAVE_THEME-$(settings get theme.mode 2>/dev/null)}
 [ "$THEME" != dark ] || FLAGS="$FLAGS --force-dark-mode"
 
+# BR-6/6b: on (the default since SX-2: probed and said, never --no-sandbox), auto (probed, --no-sandbox when the probe
+# or Chromium finds no sandbox: for an older kernel), off (always --no-sandbox, for a look without).
+SANDBOX=${BRAVE_SANDBOX:-on}
+
 say() { echo "brave: $*"; }
 case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
 
 tree_ok() {
   for f in brave resources.pak icudtl.dat v8_context_snapshot.bin locales/en-US.pak lib/libgtk-3.so.0 \
-      etc/fonts/fonts.conf share/glib-2.0/schemas/gschemas.compiled; do
+      etc/fonts/fonts.conf share/glib-2.0/schemas/gschemas.compiled share/mime/mime.cache share/icons/Adwaita/index.theme \
+      etc/gdk-pixbuf/loaders.cache glycin/glycin-image-rs share/glycin-loaders/2+/conf.d/glycin-image-rs.conf libexec/bwrap; do
     [ -e "$T/$f" ] || { say "tree $T: $f is missing (copy \\BITSOS2\\brave\\ to the stick)"; return 1; }
   done
 }
@@ -112,6 +122,69 @@ as_user() {
 # shellcheck disable=SC2086
 u() { $DROP "$@"; }
 
+# BR-6: the kernel calls of Chromium's namespace sandbox as Brave's user (its zygote: a new user namespace with
+# setgroups denied and the user's own id mapped, new PID and network namespaces, a child as pid 1 there, chroot in
+# it), made once by BusyBox (unshare -r writes setgroups "deny", uid_map and gid_map with the caller's own id, count
+# 1, as Chromium's do; chroot / needs CAP_SYS_CHROOT in the new namespace). 10 s at most (B4): a hanging kernel
+# call means no sandbox. A running Brave keeps its own choice (a hand-over is a second Chromium start: same flags).
+# The probe is only a prefilter that names the cause (Chromium's zygote does its chroot from a CLONE_FS child, not
+# as BusyBox does); Chromium's own verdict comes after the start (sandbox_retry). Sets SB_WHY; says the line. With
+# BRAVE_SANDBOX=on a failed probe adds nothing (`sandbox: missing`): Chromium then judges, and ends at once if it
+# finds no sandbox.
+SB_PROBE_SECS=${BRAVE_SANDBOX_SECS:-10}
+sandbox_line() {
+  SB_WHY=
+  case $SANDBOX in
+    off) SB_WHY="BRAVE_SANDBOX=off" ;;
+    *)
+      if b=$(running); then
+        bp=${b%% *}
+        if tr '\0 ' '\n\n' <"/proc/$bp/cmdline" 2>/dev/null | grep -qx -- --no-sandbox; then
+          SB_WHY="as the running Brave (pid $bp)"
+        else
+          say "sandbox: on (as the running Brave, pid $bp)"
+          return 0
+        fi
+      else
+        sc=no
+        ! grep -q '^Seccomp:' /proc/self/status 2>/dev/null || sc=yes
+        out=$(u timeout "$SB_PROBE_SECS" unshare -r -p -n -f chroot / /bin/sh -c : 2>&1)
+        src=$?
+        if [ $src = 0 ]; then
+          say "sandbox: on (user, PID and network namespaces; the kernel names seccomp in /proc: $sc)"
+          return 0
+        fi
+        # BusyBox timeout ends with 128+SIGTERM, coreutils timeout with 124: both mean the time ran out.
+        case $src in 124|143) out="no answer within $SB_PROBE_SECS s" ;; esac
+        SB_WHY="no user, PID and network namespace for uid $(u id -u 2>/dev/null || echo "$UID_NOW"): $(echo "${out:-unshare failed (code $src)}" | head -n 1)"
+        if [ "$SANDBOX" = on ]; then
+          say "sandbox: missing ($SB_WHY; BRAVE_SANDBOX=$SANDBOX adds no --no-sandbox: Chromium decides)"
+          return 1
+        fi
+      fi ;;
+  esac
+  FLAGS="$FLAGS --no-sandbox"
+  say "sandbox: off (--no-sandbox; $SB_WHY)"
+}
+# BR-6: the probe passed, but Chromium found no usable sandbox (its own calls differ from BusyBox's: clone with the
+# namespace flags, the CLONE_FS chroot to /proc/self/fdinfo/, a nested PID namespace per renderer): Brave ended at
+# once with that FATAL line. With BRAVE_SANDBOX=auto Brave starts once more with --no-sandbox, saying why (the first
+# log is kept as brave-nosandbox.log); with BRAVE_SANDBOX=on (the default) it stays ended and the launcher says why,
+# in German too (Georg reads it). Returns 0 when a new start is due.
+sandbox_retry() {
+  sbl=$(grep -m 1 'No usable sandbox' "$1" 2>/dev/null) || return 1
+  if [ "$SANDBOX" != auto ]; then
+    say "sandbox: missing (Chromium: ${sbl#*] }; BRAVE_SANDBOX=$SANDBOX: Brave stays ended)"
+    say "Brave findet keine Sandbox (Namensraeume im Kern): nicht gestartet. BRAVE_SANDBOX=auto startet es ohne."
+    return 1
+  fi
+  [ -z "$SB_WHY" ] || return 1
+  u cp "$1" "${1%.log}-nosandbox.log" 2>/dev/null || :
+  SB_WHY="Chromium: ${sbl#*] }"
+  FLAGS="$FLAGS --no-sandbox"
+  say "sandbox: off (--no-sandbox; $SB_WHY); starting again"
+}
+
 # The desktop as Brave's user can reach it (root's own bitscomp is not uid 1000's).
 desk_line() {
   if ! find_desk; then say "desktop: $why"; return 1; fi
@@ -170,6 +243,42 @@ data_dir() {
   [ "$UID_NOW" = 0 ] || { say "cannot make $PD"; return 1; }
   mkdir -p "$DATA/appdata" && { [ -e "$PD" ] || { mkdir "$PD" && chown 1000:1000 "$PD" && chmod 700 "$PD"; }; } \
     && [ ! -L "$PD" ] && [ "$(stat -c %u "$PD")" = 1000 ] || { say "$PD is not uid 1000's own directory"; return 1; }
+}
+
+# BR-7: the downloads folder: uid 1000's own on the data volume (root makes /data/home/1000 if a volume older
+# than FS-8c lacks it; never through a link), else HOME's (RAM, gone at the next boot). Chromium and GLib (GTK's
+# "Downloads" place) take it from xdg-user-dirs' file $HOME/.config/user-dirs.dirs, written at every start (HOME is in
+# RAM). Sets DL.
+data_home() {
+  h=$DATA/home/1000
+  if [ ! -e "$h" ] && [ ! -L "$h" ]; then
+    # Made 0700 at once (no other user can enter it before the chown); a failed chown takes it away again, so the
+    # next start tries anew instead of finding a root-owned folder forever. uid 1000 makes it itself if it may.
+    if [ "$UID_NOW" = 0 ]; then
+      mkdir -p "$DATA/home" && [ ! -L "$DATA/home" ] && mkdir -m 700 "$h" || return 1
+      chown -h 1000:1000 "$h" || { rmdir "$h"; say "downloads: chown of $h failed (taken away again)"; return 1; }
+    else
+      [ ! -L "$DATA/home" ] && mkdir -m 700 "$h" 2>/dev/null || return 1
+    fi
+  fi
+  [ ! -L "$h" ] && [ "$(stat -c %u "$h" 2>/dev/null)" = 1000 ] && [ ! -L "$DL_DATA" ] && u mkdir -p "$DL_DATA" && u test -w "$DL_DATA"
+}
+# BR-7: glycin (GTK's image loaders) takes the first bwrap on Brave's PATH; the tree's stand-in comes last there, so a
+# real bwrap wins without a change here (on V2 /bin/bwrap since SX-3b). Said at every start and in --check.
+loaders_line() {
+  lb=$(PATH="$PATH:$T/libexec" command -v bwrap)
+  if [ "$lb" = "$T/libexec/bwrap" ]; then say "image loaders: without a sandbox (the tree's bwrap stand-in; no real bwrap on PATH)"
+  else say "image loaders: sandbox by ${lb:-no bwrap at all}"; fi
+}
+downloads() {
+  DL=$RUN/home/Downloads
+  if [ "$MODE" = data ]; then
+    if data_home; then DL=$DL_DATA; else say "downloads: $DL_DATA cannot be made (not uid 1000's own folder?)"; fi
+  fi
+  # shellcheck disable=SC2016
+  u mkdir -p "$DL" "$RUN/home/.config" && u sh -c 'printf "XDG_DOWNLOAD_DIR=\"%s\"\n" "$1" >"$2/user-dirs.dirs"' _ "$DL" "$RUN/home/.config" \
+    || { say "downloads: cannot set $DL"; return 1; }
+  if [ "$DL" = "$DL_DATA" ]; then say "downloads: $DL (data volume)"; else say "downloads: $DL (in RAM: gone at the next boot)"; fi
 }
 
 # Once: the stick's tar profile (else the copy before it) into the empty data folder; the tar becomes .imported
@@ -276,15 +385,19 @@ lock_profile() {
 unlock() { [ -z "$LOCKED" ] || u rm -rf "$LOCK"; LOCKED=; }
 
 # Brave with BR-1's flags in a clean environment, as BR-1 measured on CachyOS; the rest points into the tree:
-# libraries, fontconfig, cursors, GTK's schemas (memory backend: no dconf), no D-Bus, PulseAudio or accessibility bus
+# libraries, fontconfig, cursors and icons, GTK's schemas (memory backend: no dconf), the MIME database and
+# gdk-pixbuf's loaders (BR-7: glycin's loader program from the tree; a real bwrap on PATH, /bin/bwrap on V2, comes
+# first; $T/libexec/bwrap, last, tells glycin without one that no sandbox can be made, so it runs the loader
+# directly; Chromium's own sandbox does not depend on it), no D-Bus, PulseAudio or accessibility bus
 # (Chromium then uses ALSA). run_brave LOG ARGS: replaces the calling shell (call it with & or as the last step).
 # shellcheck disable=SC2086,SC2016
 run_brave() {
   log=$1; shift
-  exec env -i PATH="$PATH" HOME="$RUN/home" LANG="${LANG:-de_DE.UTF-8}" ${TZ:+TZ=$TZ} \
+  exec env -i PATH="$PATH:$T/libexec" HOME="$RUN/home" LANG="${LANG:-de_DE.UTF-8}" ${TZ:+TZ=$TZ} \
     XDG_RUNTIME_DIR="${WD%/*}" WAYLAND_DISPLAY="${WD##*/}" LD_LIBRARY_PATH="$T/lib" \
     FONTCONFIG_FILE="$T/etc/fonts/fonts.conf" XCURSOR_PATH="$T/share/icons" XCURSOR_THEME=Adwaita XCURSOR_SIZE="${XCURSOR_SIZE:-32}" \
     XDG_DATA_DIRS="$T/share:/usr/share" GSETTINGS_SCHEMA_DIR="$T/share/glib-2.0/schemas" GSETTINGS_BACKEND=memory \
+    GDK_PIXBUF_MODULE_FILE="$T/etc/gdk-pixbuf/loaders.cache" \
     GTK_USE_PORTAL=0 NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: \
     PULSE_SERVER=none $DROP sh -c 'exec "$@" >"$0" 2>&1' "$log" "$T/brave" $FLAGS "$@"
 }
@@ -310,10 +423,13 @@ case "$1" in
     [ $rc = 0 ] && { libs_ok || rc=1; }
     fonts_line
     desk_line || true
+    [ -n "$NOROOT" ] || sandbox_line || rc=1
     if [ -n "$DROP" ]; then say "user: runs as uid 1000 (started by root: $DROP)"
     elif [ -z "$NOROOT" ]; then say "user: runs as uid $UID_NOW"
     else say "user: runs as uid 0: refused, $NOROOT"; rc=1; fi
     profile_line
+    loaders_line
+    if [ "$MODE" = data ]; then say "downloads: $DL_DATA (data volume)"; else say "downloads: $RUN/home/Downloads (in RAM)"; fi
     if b=$(running); then say "running: pid ${b%% *} (profile ${b#* }); a start hands its URL to it"; else say "running: no"; fi
     if [ -r "$ALSA_SYS" ]; then say "sound: ALSA configuration $ALSA_SYS"; else say "sound: no ALSA configuration ($ALSA_SYS)"; fi
     exit $rc ;;
@@ -326,6 +442,7 @@ if [ -n "$NOROOT" ]; then
 fi
 tree_ok || exit 1
 desk_line || exit 1
+sandbox_line
 if [ -n "$1" ] && [ "$1" != "--" ]; then URL=$1; shift; fi
 [ "$1" != "--" ] || shift
 if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
@@ -356,16 +473,21 @@ case $MODE in
   *) say "profile: in RAM only: $why"; PROFILE=$RUN/profile; CACHE="--disk-cache-dir=$RUN/cache" ;;
 esac
 u mkdir -p "$PROFILE" || { say "cannot make $PROFILE"; exit 1; }
+downloads || :
+loaders_line
 LOG=$RUN/brave.log
 say "starting ${URL:-the start page} (log $LOG)"
 START=$(date +%s)
-# shellcheck disable=SC2086
-run_brave "$LOG" "--user-data-dir=$PROFILE" $CACHE ${URL:+"$URL"} "$@" &
-CHILD=$!
-sig=
-trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
-wait $CHILD
-rc=$?
+while :; do
+  # shellcheck disable=SC2086
+  run_brave "$LOG" "--user-data-dir=$PROFILE" $CACHE ${URL:+"$URL"} "$@" &
+  CHILD=$!
+  sig=
+  trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+  wait $CHILD
+  rc=$?
+  [ -z "$sig" ] && [ $rc != 0 ] && sandbox_retry "$LOG" || break
+done
 killed=
 if [ -n "$sig" ]; then
   # Brave's own end on SIGTERM flushes its databases; after 10 s it is killed.

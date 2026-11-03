@@ -22,7 +22,12 @@ const F48: PcmFormat = PcmFormat { rate: 48000, channels: 2, bits: 16 };
 const OUT0: usize = 4;
 const HP: &str = "hda0/jack/0:0x15";
 
+/// The controller and its name (the endpoint's `dev`).
 struct OnFake(Arc<Controller<FakeHw>>);
+
+fn hp_on(dev: &str) -> Endpoint {
+    Endpoint { dev: dev.into(), port: Port::Jack, cad: 0, pin: 0x15 }
+}
 
 fn hp() -> Endpoint {
     Endpoint { dev: "hda0".into(), port: Port::Jack, cad: 0, pin: 0x15 }
@@ -30,10 +35,10 @@ fn hp() -> Endpoint {
 
 impl Backend for OnFake {
     fn resolve(&mut self, _: &Target) -> Option<Endpoint> {
-        Some(hp())
+        Some(hp_on(self.0.name()))
     }
     fn endpoints(&mut self) -> Vec<Endpoint> {
-        alloc::vec![hp()]
+        alloc::vec![hp_on(self.0.name())]
     }
     fn open(&mut self, e: &Endpoint, ring: u32, period: u32, wake: WakeFn, _: u64) -> Result<Box<dyn Stream>, OutError> {
         open_on(self.0.clone(), e, ring, period, wake)
@@ -53,9 +58,13 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        Rig::named("hda0")
+    }
+    /// A controller of its own name: the klog checks find its lines among the other tests'.
+    fn named(name: &str) -> Rig {
         let f = FakeHda::new(0x4401);
         f.add_codec(0, ALC269);
-        let c = Arc::new(Controller::new("hda0".into(), Kind::Intel, FakeHw(f.clone()), hda::Config::default()));
+        let c = Arc::new(Controller::new(name.into(), Kind::Intel, FakeHw(f.clone()), hda::Config::default()));
         c.bring_up().unwrap();
         let sh = Arc::new(Shared::new());
         let core = Core::new(OnFake(c.clone()), sh.clone(), Config::latency_ms(40));
@@ -103,6 +112,125 @@ fn quiesce_mid_stream_falls_back_to_null_and_recovers() {
     drop(x);
     r.ms(2500);
     assert_eq!(r.sh.status().streams, 0, "the idle output did not close");
+}
+
+/// SN-13 (w25): with no client the mixer closes its output after `idle_ns` and the controller's stream with it
+/// (open_streams 0, the descriptor stopped); the controller itself stays up (Linux with CachyOS's power_save=0 on
+/// mains, PipeWire's idle suspend closes the PCM only), so the next client opens without a restart.
+#[test]
+fn idle_mixer_leaves_no_stream_open_on_the_controller() {
+    let mut r = Rig::new();
+    let x = client::open(&r.sh, F48, 9600, "video").unwrap();
+    assert_eq!(x.write(&[0u8; 9600 * 4]), Ok(9600 * 4));
+    x.start();
+    r.ms(100);
+    assert_eq!(r.c.open_streams(), 1);
+    assert!(r.f.sd(OUT0).running());
+    drop(x);
+    r.ms(2600);
+    assert_eq!(r.sh.status().streams, 0);
+    assert_eq!(r.c.open_streams(), 0, "a stream left open on the controller");
+    assert!(!r.f.sd(OUT0).running(), "stream DMA with no client");
+    assert_eq!(r.c.state(), hda::State::Up, "the controller stays up");
+    let y = client::open(&r.sh, F48, 9600, "next").unwrap();
+    assert_eq!(y.write(&[0u8; 4800 * 4]), Ok(4800 * 4));
+    y.start();
+    r.ms(30);
+    assert_eq!(r.c.open_streams(), 1, "reopened at once");
+}
+
+/// SN-7: the reboot's Quiesce order (`devmodel::quiesce_all`, newest first): the mixer's flag, then hda's
+/// controller. The mixer's next round (during the reset's sleeps) closes its output without one register
+/// access, nothing opens or starts again, the stream DMA stays stopped, and the link is left out of reset.
+#[test]
+fn reboot_order_closes_without_touching_the_controller() {
+    use devmodel::Quiesce;
+    let mut r = Rig::new();
+    // Silence, as the muted video streams it.
+    let x = client::open(&r.sh, F48, 96000, "video").unwrap();
+    assert_eq!(x.write(&[0u8; 360_000]), Ok(360_000));
+    x.start();
+    r.ms(200);
+    assert_eq!(r.sh.status().endpoint.as_deref(), Some(HP));
+    assert!(r.f.sd(OUT0).running());
+    let q = crate::thread::MixQuiesce(Arc::downgrade(&r.sh));
+    assert_eq!(q.name(), "snd/mix");
+    q.quiesce();
+    r.c.quiesce();
+    assert!(!r.f.sd(OUT0).running(), "stream DMA after Quiesce");
+    let n = r.f.accesses.load(core::sync::atomic::Ordering::Acquire);
+    // The thread's next wake: the flag, every output closed.
+    assert!(crate::thread::stop_seen(&mut r.core, &r.sh));
+    assert_eq!(r.sh.status().streams, 0, "an output still open");
+    assert_eq!(r.f.accesses.load(core::sync::atomic::Ordering::Acquire), n, "a register access after Quiesce");
+    assert!(!r.f.sd(OUT0).running());
+    assert_ne!(r.f.reg32(hda::regs::GCTL) & hda::regs::GCTL_CRST, 0);
+    drop(x);
+}
+
+/// The klog lines of controller `ctrl` named `names` since `seq`.
+fn hda_lines(seq: u64, ctrl: &str, names: &[&str]) -> Vec<alloc::string::String> {
+    let tag = alloc::format!("ctrl={ctrl} ");
+    klog::read_since(seq, 1 << 20)
+        .into_iter()
+        .filter(|r| names.contains(&r.name) && alloc::format!("{} ", r.text).contains(&tag))
+        .map(|r| r.render())
+        .collect()
+}
+
+/// SN-13 (w25): after Quiesce the mixer's last round (the reboot's reset sleeps) closes its output without one log
+/// line from hda (the console mirror's traffic in the reset window preceded the floods, desk 28.10.); before it, a
+/// close logs `hda.close` as always (the control: the check sees the lines when they are there).
+#[test]
+fn closes_after_quiesce_log_nothing() {
+    const QUIET: &[&str] = &["hda.close", "hda.stop", "hda.close_stuck", "hda.dma_kept"];
+    klog::heap_ready();
+    // The control: an idle close on a controller that is up logs `hda.close`.
+    let mut a = Rig::named("hda-sn13-up");
+    let seq = klog::next_seq();
+    let x = client::open(&a.sh, F48, 9600, "video").unwrap();
+    assert_eq!(x.write(&[0u8; 9600 * 4]), Ok(9600 * 4));
+    x.start();
+    a.ms(100);
+    drop(x);
+    a.ms(2600);
+    assert_eq!(a.c.open_streams(), 0);
+    let up = hda_lines(seq, "hda-sn13-up", &["hda.close"]);
+    assert_eq!(up.len(), 1, "{up:?}");
+    // Quiesced under a playing output: the mixer's closes log nothing.
+    let mut r = Rig::named("hda-sn13-q");
+    let x = client::open(&r.sh, F48, 96000, "video").unwrap();
+    assert_eq!(x.write(&[0u8; 360_000]), Ok(360_000));
+    x.start();
+    r.ms(200);
+    assert!(r.f.sd(OUT0).running());
+    r.c.quiesce();
+    let seq = klog::next_seq();
+    drop(x);
+    r.ms(3000);
+    assert_eq!(r.sh.status().streams, 0, "an output still open");
+    assert_eq!(r.c.open_streams(), 0, "a stream left open on the controller");
+    let quiet = hda_lines(seq, "hda-sn13-q", QUIET);
+    assert!(quiet.is_empty(), "lines after Quiesce: {quiet:?}");
+}
+
+/// SN-7: Quiesce without the mixer's flag first (a Quiesce from elsewhere): the mixer keeps retrying its
+/// target, every retry is refused before a register access, the stream never runs again.
+#[test]
+fn quiesced_controller_is_never_restarted_by_the_mixer() {
+    let mut r = Rig::new();
+    let x = client::open(&r.sh, F48, 96000, "video").unwrap();
+    assert_eq!(x.write(&[0u8; 360_000]), Ok(360_000));
+    x.start();
+    r.ms(200);
+    assert!(r.f.sd(OUT0).running());
+    r.c.quiesce();
+    let n = r.f.accesses.load(core::sync::atomic::Ordering::Acquire);
+    r.ms(3000);
+    assert!(!r.f.sd(OUT0).running(), "the mixer started the stream again");
+    assert_eq!(r.f.accesses.load(core::sync::atomic::Ordering::Acquire), n, "a register access after Quiesce");
+    assert_eq!(r.sh.status().endpoint, None);
+    drop(x);
 }
 
 const AA01: &str = include_str!("../../hdacodec/fixtures/aa01-synthetic.txt");

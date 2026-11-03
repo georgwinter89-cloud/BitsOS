@@ -20,3 +20,6 @@ policy = { path = "../../policy" }
 proc = { path = "../../proc" }
 uapi = { path = "../../uapi" }
 vfs = { path = "../../vfs" }
+
+[lints]
+workspace = true

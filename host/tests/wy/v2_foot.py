@@ -225,6 +225,7 @@ def main():
     print("memory after the probe: " + call(c, "ps", {})[1].splitlines()[0], flush=True)
     comp = COMP = Job(c, "/bin/bitscomp", ["--socket", v.SOCK, "--stats", "5"])
     comp.wait_for(r"backend=fbdev size=1280x800", "bitscomp started on fbdev at 1280x800")
+    v.check_build(c, comp.text)
     need(re.search(r"started programs also get SHELL=/bin/sh LC_CTYPE=C\.UTF-8 XDG_CACHE_HOME=/tmp/wy/cache", comp.text) is not None,
          "bitscomp fills the started programs' environment (shell, locale, font cache)", comp.text[-2000:])
 

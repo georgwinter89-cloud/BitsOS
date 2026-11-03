@@ -169,7 +169,7 @@ fn fs_ext4_data_boot() -> TestResult {
         kassert!(ph == Phase::Mounted { pool: true, writable: false, created: false }, "read-only stick: {ph:?}");
         let m = m.ok_or("read-only stick: nothing mounted")?;
         let path = ns.lookup_path(b"/d", true).map_err(e)?;
-        kassert!(path.mnt.readonly, "/d is read-only");
+        kassert!(path.mnt.is_readonly(), "/d is read-only");
         check(&ns, "/d", ino)?;
         vfs::writeback::Flush::stop(&*m.vol).map_err(e)?;
         unmount(&ns, "/d", &m)?;
@@ -204,7 +204,7 @@ fn fs_ext4_data() -> TestResult {
     // What /proc/mounts shows for it (procfs renders the same fields): the mount's source and rw/ro.
     let p = ns.lookup_path(data::AT.as_bytes(), true).map_err(e)?;
     let source = p.dentry.sb.source();
-    kassert!(p.is_mount_root() && p.mnt.readonly == !writable, "/data mount root {} readonly {}", p.is_mount_root(), p.mnt.readonly);
+    kassert!(p.is_mount_root() && p.mnt.is_readonly() == !writable, "/data mount root {} readonly {}", p.is_mount_root(), p.mnt.is_readonly());
     kassert!(source == if pool { "/dev/mapper/data" } else { "/dev/loop0" }, "/data source {source}");
     if writable {
         for (p, uid) in [("/data/appdata", data::UID), ("/data/home/1000", data::UID)] {

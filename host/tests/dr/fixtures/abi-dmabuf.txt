@@ -1,0 +1,74 @@
+udmabuf is a char device = yes
+create without F_SEAL_SHRINK = -EINVAL
+create with F_SEAL_WRITE = -EINVAL
+create offset unaligned = -EINVAL
+create size unaligned = -EINVAL
+create size 0 = -EINVAL
+create past the memfd's end = -EINVAL
+create from a pipe = -EBADFD
+create from fd -1 = -EBADFD
+create from a closed fd = -EBADFD
+create bad pointer = -EFAULT
+udmabuf unknown ioctl = -ENOTTY
+create_list count 0 = -EINVAL
+create = ok
+create cloexec at offset = ok
+cloexec fd flags = 1
+two buffers have two inodes = yes
+fstat mode = 0600, size = 16384, blocks = 32, nlink = 1
+fd flags = 0
+fl accmode = 2
+lseek SEEK_END 0 = 16384
+lseek SEEK_SET 0 = 0
+lseek SEEK_CUR 0 = -EINVAL
+lseek SEEK_END 1 = -EINVAL
+lseek SEEK_SET 4096 = -EINVAL
+read = -EINVAL
+write = -EINVAL
+link = /dmabuf:
+fdinfo size:	16384
+fdinfo count:	1
+fdinfo exp_name:	udmabuf
+sync end before start = -EINVAL
+sync flags 0 = -EINVAL
+sync flags END only = -EINVAL
+sync unknown flag = -EINVAL
+sync start rw = ok
+sync end rw = ok
+sync start read = ok
+sync end write = ok
+sync bad pointer = -EFAULT
+dma-buf unknown ioctl = -ENOTTY
+poll = 1, revents = 0x5
+export flags 0 = -EINVAL
+export flags 7 = -EINVAL
+export bad pointer = -EFAULT
+export write = ok
+export fd flags = 1
+export sync_file info = ok
+export status = 1, num_fences = 1
+export poll = 1
+import read = ok
+import write = ok
+import flags 0 = -EINVAL
+import flags 9 = -EINVAL
+import fd -1 = -EINVAL
+import a dma-buf fd = -EINVAL
+poll after import = 1, revents = 0x5
+set_name_b = ok
+link named = /dmabuf:abi-name
+fdinfo size:	16384
+fdinfo count:	1
+fdinfo exp_name:	udmabuf
+fdinfo name:	abi-name
+set_name_a = ok
+fdinfo size:	16384
+fdinfo count:	1
+fdinfo exp_name:	udmabuf
+fdinfo name:	second
+set_name bad pointer = -EFAULT
+set_name 32 bytes no NUL = -EINVAL
+set_name 31 bytes = ok
+link long name = /dmabuf:nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
+create_list = ok
+list size = 12288

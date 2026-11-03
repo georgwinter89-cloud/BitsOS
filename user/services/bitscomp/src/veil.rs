@@ -8,17 +8,16 @@ use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
-use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::desktop::Window;
+use crate::win::Window;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Physical, Point, Scale};
 
 use crate::canvas::{Box2, Canvas};
 use crate::header::px_rect;
 use crate::layout::{Placement, Rect};
-use crate::render::CompElement;
+use crate::render::{CompElement, CompRenderer};
 use crate::state::App;
-use crate::text::{Font, Weight};
+use crate::text::{Family, Font, Weight};
 use crate::theme::Theme;
 use crate::zones::Part;
 
@@ -59,9 +58,9 @@ pub fn wait_button(body: Rect, t: &Theme) -> Rect {
 
 fn fonts(t: &Theme) -> (Font, Font, Font) {
     (
-        Font::new(t.fs(20.0), Weight::SemiBold, t.scale),
-        Font::new(t.fs(14.0), Weight::Regular, t.scale),
-        Font::new(t.fs(15.0), Weight::Regular, t.scale),
+        t.font(Family::Ui, 20.0, Weight::SemiBold),
+        t.font(Family::Ui, 14.0, Weight::Regular),
+        t.font(Family::Ui, 15.0, Weight::Regular),
     )
 }
 
@@ -110,8 +109,8 @@ pub fn shown(app: &App, w: &Window) -> bool {
 const HUNG_IMG_KEEP: usize = 8;
 
 /// The veil and the box of a hung window, topmost first (they go above the window's own elements).
-pub fn elements(app: &mut App, pixman: &mut PixmanRenderer, p: &Placement<Window>) -> Vec<CompElement> {
-    let Some(id) = p.win.toplevel().map(|t| t.wl_surface().id()) else { return Vec::new() };
+pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, p: &Placement<Window>) -> Vec<CompElement<R>> {
+    let Some(id) = p.win.surface().map(|s| s.id()) else { return Vec::new() };
     if !shown(app, &p.win) {
         return Vec::new();
     }
@@ -135,7 +134,7 @@ pub fn elements(app: &mut App, pixman: &mut PixmanRenderer, p: &Placement<Window
         }
     };
     let buf = &app.hung_img[at].1;
-    let mut out: Vec<CompElement> = crate::deco::image(pixman, buf, b, (px.w, px.h), s).into_iter().collect();
+    let mut out: Vec<CompElement<R>> = crate::deco::image(renderer, buf, b, (px.w, px.h), s).into_iter().collect();
     let veil = app.veil.entry(id).or_insert_with(|| SolidColorBuffer::new((1, 1), t.veil));
     veil.update((body.w, body.h), t.veil);
     let loc: Point<i32, Physical> = Point::from(((body.x as f64 * s).round() as i32, (body.y as f64 * s).round() as i32));

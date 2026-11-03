@@ -13,7 +13,7 @@
 // Reads only; writes nothing but stdout.
 import { pathToFileURL } from 'node:url';
 
-const WZ = process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan';
+const WZ = process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`;
 const imp = (rel) => import(pathToFileURL(`${WZ}/${rel}`).href);
 const { useStubs } = await imp('js/test-rfk1-stubs.mjs');
 useStubs();

@@ -60,7 +60,7 @@ impl Buddy {
     }
 
     #[cold]
-    pub(super) fn alloc_reclaiming(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64> {
+    pub(super) fn alloc_reclaiming(&self, order: u32, zone: Zone, kind: Kind, budget: &mut crate::grace::WaitBudget) -> Option<u64> {
         if !reclaim::direct_allowed(kind) {
             return None;
         }
@@ -77,6 +77,10 @@ impl Buddy {
             let o = r.reclaim(want, thorough);
             freed += o.freed;
             if o.freed > 0 {
+                // PF-5: reclaimed pages wait for a grace period (lockless readers may still copy from them);
+                // the allocation waits for it (bounded, once per allocation: `budget`), so reclaim frees what it
+                // reports instead of reclaiming more in the next round.
+                crate::grace::expedite_with(budget);
                 got = self.grab(order, zone, kind, false);
                 if got.is_some() {
                     break;

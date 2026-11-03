@@ -50,6 +50,25 @@ pub const PATH_MAX: usize = 4096;
 /// Top-level trees whose nodes the kernel makes (device nodes, proc and sys files).
 pub const KERNEL_TREES: &[&str] = &["dev", "proc", "sys"];
 
+/// MC-10: where the installer keeps the full-access grants (bitsinstall `access_store`, root-only on /data).
+/// The file tools never read, list, hash or write there, so no MCP tool can see, create or extend a grant.
+pub const ACCESS_STORE: &str = "/data/bitsos-access";
+
+/// MC-10 fixer: the installer's notes on the stick that decide who may get full access: the keys Georg paired at
+/// the keyboard and the revoke noted when /data did not take it (bitsinstall `access::CONFIRMED_NAME`/`TOMB_NAME`).
+pub const ACCESS_NOTES: &[&str] = &["/boot/BITSOS2/mcp/confirmed", "/boot/BITSOS2/mcp/access-revoked"];
+
+/// Why the file tools do not reach `canon` (an absolute canonical path), if it is the grants' place.
+pub fn access_store_refusal(canon: &str) -> Option<String> {
+    // The stick is FAT: any case names the same file.
+    let under = |base: &str| canon.len() >= base.len() && canon.is_char_boundary(base.len()) && canon[..base.len()].eq_ignore_ascii_case(base) && {
+        let r = &canon[base.len()..];
+        r.is_empty() || r.starts_with('/') || r.starts_with('.')
+    };
+    let inside = canon.strip_prefix(ACCESS_STORE).is_some_and(|r| r.is_empty() || r.starts_with('/')) || ACCESS_NOTES.iter().any(|n| under(n));
+    inside.then(|| format!("{canon} holds the installer's full-access grants (MC-10): no MCP tool reads or writes them; only Georg at the keyboard sets one"))
+}
+
 /// A path argument: absolute, at most PATH_MAX bytes, no NUL.
 pub(crate) fn path_arg<'a>(args: &'a crate::Json, key: &str) -> Result<&'a str, ToolError> {
     let p = opt_str(args, key)?.ok_or_else(|| bad(key))?;
@@ -249,7 +268,7 @@ fn dir_refusal(ns: &MountNs, dir: &Path, name: &[u8]) -> Option<String> {
             ));
         }
     }
-    if dir.mnt.readonly {
+    if dir.mnt.is_readonly() {
         return Some(format!("{canon} is mounted read-only"));
     }
     None

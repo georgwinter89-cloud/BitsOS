@@ -18,10 +18,10 @@
 # This script runs the JS module tests of the ported modules, so a broken oracle shows here and not as a puzzling
 # Rust diff, then the node-based rtw89-core tests (never with RTW89_SKIP_FAKE). Host only: no QEMU, no ports, no
 # hardware.
-# The WLAN tree (WLAN_TOOLS, default /home/georg/BitsOS/werkzeuge/plattform/wlan) is only read.
+# The WLAN tree (WLAN_TOOLS, default $HOME/BitsOS/werkzeuge/plattform/wlan) is only read.
 set -euo pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
-WZ="${WLAN_TOOLS:-/home/georg/BitsOS/werkzeuge/plattform/wlan}"
+WZ="${WLAN_TOOLS:-$HOME/BitsOS/werkzeuge/plattform/wlan}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/wl-10-rtw89-oracles}"
 mkdir -p "$RUN_DIR"
 unset RTW89_SKIP_FAKE

@@ -33,6 +33,8 @@ fn e<T: core::fmt::Debug>(x: T) -> String {
 fn lazy_fill() -> TestResult {
     let a = lazy()?;
     let m = a.sys_mmap(0, 64 * P, RW, AP, 0).map_err(e)?;
+    // Page-exact fills: MADV_RANDOM switches the write fault's 64 KiB fault-around off (MM-12, mm.as.around).
+    a.sys_madvise(m, 64 * P, crate::linux::madv::RANDOM).map_err(e)?;
     kassert!(a.resident_pages() == 0, "{} pages filled at mmap", a.resident_pages());
     a.copy_to_user(m + 3 * P + 10, b"lazy").map_err(e)?;
     kassert!(a.resident_pages() == 1 && present(&a, m + 3 * P), "a copy fills exactly its page");
@@ -245,8 +247,11 @@ fn user_touch_in(a: AddressSpace) -> TestResult {
     kassert!(sum == 0x3333, "the program read {sum:#x} back (want 0x3333)");
     kassert!(t.heap == Some((0x77, USER_HEAP)), "heap report {:?}", t.heap);
     kassert!(t.end == Some((base + 0x4000, FaultReason::ProtNone)), "ended with {:?}", t.end);
-    kassert!(t.fills >= 4, "only {} faults filled pages (three mmap pages and the heap page)", t.fills);
-    kassert!(paging::count_user_leaves(a.root(), base, base + 0x10000) == 3, "only the touched pages have frames");
+    // MM-12: the first write fills the 64 KiB block (the first mapping of a fresh space is 64 KiB aligned); the
+    // heap's three pages hold no whole block (page by page).
+    kassert!(t.fills >= 2, "only {} faults filled pages (the mmap block and the heap)", t.fills);
+    let leaves = paging::count_user_leaves(a.root(), base, base + 0x10000);
+    kassert!(leaves == 16, "{leaves} of 16 pages of the block at {base:#x} have frames");
     kassert!(a.read_u64(base + 0x8000).map_err(e)? == 0x2222);
     Ok(())
 }
@@ -350,6 +355,8 @@ fn frees() -> TestResult {
     let user = || fa.stats().used_by_kind[mm_core::Kind::User as usize];
     let before = user();
     let a = lazy()?;
+    // 4 KiB frames counted one by one (huge pages: mm.thp.*).
+    a.test_fail_huge(true);
     let m = a.sys_mmap(0, 4 << 20, RW, AP, 0).map_err(e)?;
     for i in 0..64 {
         a.write_u64(m + i * 16 * P, i).map_err(e)?;
@@ -509,7 +516,7 @@ fn user_leaves_not_global() -> TestResult {
     let (phys, fl) = paging::translate(a.root(), m).ok_or("page 0 not mapped")?;
     paging::replace_user_4k(a.root(), m, phys, global(fl)).map_err(e)?;
     kassert!(g(m) == Some(false), "replace_user_4k left GLOBAL set");
-    paging::protect_user(a.root(), m, P, &mut |u| Some(global(u.flags))).map_err(e)?;
+    paging::protect_user(a.root(), m, P, paging::tlb::Cause::Other, &mut |u| Some(global(u.flags))).map_err(e)?;
     kassert!(g(m) == Some(false), "protect_user left GLOBAL set");
     let f = mm_core::alloc_zeroed(mm_core::Kind::User).ok_or("no frame")?;
     if paging::map_user_4k(a.root(), m + P, f, global(PageFlags::user(true, false)), &mut || a.alloc_table()).is_err() {

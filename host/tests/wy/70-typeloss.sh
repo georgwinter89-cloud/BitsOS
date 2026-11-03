@@ -17,9 +17,12 @@ TOKEN="typeloss-scenario-token-91c3"
 LOG="$RUN_DIR/serial.log"
 QMP="$RUN_DIR/qmp.sock"
 NAME=wy-typeloss
+WY_GPU_CFG=$(bash host/tests/wy/tools/gpu-image.sh config)
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=${WY_LOGLEVEL:-warn};screen=1280x800"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=${WY_LOGLEVEL:-warn};screen=1280x800$WY_GPU_CFG"
+# WY-14: WY_GPU=1 runs this scenario with the gpu build (CONFIG.TXT bitscomp=gpu, tools/gpu-image.sh).
+bash host/tests/wy/tools/gpu-image.sh image "$NAME"
 rm -f "$LOG" "$QMP"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 900 --serial-log "$LOG" \
     -- -smp 4 -qmp "unix:$QMP,server=on,wait=off" > "$RUN_DIR/qemu.out" 2>&1 &

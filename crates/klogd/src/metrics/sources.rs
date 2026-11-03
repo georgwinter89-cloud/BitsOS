@@ -78,6 +78,16 @@ impl Sources {
             Ok(esu) => read_checked(AMD_PKG_ENERGY_STATUS).map(|e| (e as u32, esu)),
             Err(_) => None,
         };
-        Reading { now_ns, cpus, procs, mem, nets, disks, counters: klog::metrics::snapshot().collect(), temps, pkg_energy, cost_ns }
+        // hal cannot use klog's counters (klog sits above it): its user-copy counters join them here.
+        let u = hal::usercopy::stats();
+        let mut counters: alloc::vec::Vec<(&'static str, u64)> = klog::metrics::snapshot().collect();
+        counters.extend([
+            ("hal.usercopy.fast_faults", u.fast_faults),
+            ("hal.usercopy.resolved", u.resolved),
+            ("hal.usercopy.walks", u.walks),
+            ("hal.usercopy.hook_replaced", u.hook_replaced),
+            ("hal.usercopy.nofault_short", u.nofault_short),
+        ]);
+        Reading { now_ns, cpus, procs, mem, nets, disks, counters, temps, pkg_energy, cost_ns }
     }
 }

@@ -25,7 +25,7 @@ const IN: u32 = Events::IN;
 const OUT: u32 = Events::OUT;
 
 fn sys_for<'a>(mem: &'a Mem, fds: &'a FdTable, ns: &'a Arc<MountNs>) -> Sys<'a> {
-    Sys { mem, fds, ns, cred: USER, subject: SUBJECT }
+    Sys { mem, fds, fs: alloc::boxed::Box::leak(alloc::boxed::Box::new(crate::fd::FsState::new())), ns, cred: USER, subject: SUBJECT }
 }
 
 struct H<'a> {
@@ -975,11 +975,10 @@ fn a_pending_signal_ends_only_waits_without_events() {
             true
         }
     }
-    use crate::sys::UserMem;
     let (ns, fds) = program_view();
     let mem = Mem::new();
     let sm = SigMem(&mem);
-    let s = Sys { mem: &sm, fds: &fds, ns: &ns, cred: USER, subject: SUBJECT };
+    let s = Sys { mem: &sm, fds: &fds, fs: &crate::fd::FsState::new(), ns: &ns, cred: USER, subject: SUBJECT };
     let h = H { s, mem: &mem };
     let ep = h.epoll();
     let (p0, p1) = h.pipe();

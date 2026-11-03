@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn paths_outside_target_are_refused() {
-        bad("-drive file=/home/georg/disk.img,format=raw", "outside-worktree");
+        bad("-drive file=/home/user/disk.img,format=raw", "outside-worktree");
         bad("-drive file=/work/v2/other/disk.img", "outside-worktree");
         bad("-drive file=/work/v2/target/../stick.img", "outside-worktree");
         bad("-kernel /tmp/kernel", "outside-worktree");
@@ -616,6 +616,6 @@ mod tests {
         bad("-device hda-duplex,bus=h0.0", "audio-default");
         bad("-device driver=usb-audio", "audio-default");
         bad("-soundhw hda", "audio-default");
-        bad("-audiodev wav,id=a0,path=/home/georg/a.wav", "outside-worktree");
+        bad("-audiodev wav,id=a0,path=/home/user/a.wav", "outside-worktree");
     }
 }

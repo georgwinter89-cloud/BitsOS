@@ -222,11 +222,13 @@ fn plays_on(s: &Status, dev: &str) -> bool {
     s.endpoint.as_deref().is_some_and(|e| e.strip_prefix(dev).is_some_and(|r| r.starts_with('/')))
 }
 
-/// How long `hdmi-off` waits for the mixer to leave the GPU controller: twice what a retiring output takes to
-/// drain (lead + drain margin) plus four periods, from CONFIG `snd_latency_ms`.
+/// How long `hdmi-off` waits for the mixer to leave the GPU controller: longer than the retiring output's own
+/// deadline ([`Config::retire_ns`](crate::mixer::Config::retire_ns), from CONFIG `snd_latency_ms`), which starts
+/// only when the mixer has switched (up to a period after the target moved) and is checked once per period, so a
+/// stream whose position stopped is closed by the mixer before this wait gives up: plus four periods and 10 ms of
+/// scheduling slack.
 pub fn leave_bound_ns(c: &crate::mixer::Config) -> u64 {
-    let frames = c.lead as u64 + c.drain_margin as u64 + 4 * c.period as u64;
-    2 * frames * 1_000_000_000 / crate::resample::OUT_RATE as u64
+    c.retire_ns() + 4 * c.period_ns() + 10_000_000
 }
 
 /// Make before break for `hdmi-off`: the target was moved off HDMI, so wait (bounded) until the mixer has
@@ -371,12 +373,19 @@ pub fn status_lines() -> Vec<String> {
         None => out.push(String::from("mixer=idle playing=none (starts with the first client)")),
     }
     match hda::hdmi::gpu_controller() {
-        Some(d) => out.push(format!(
-            "hdmi display={} controller={} streaming={}",
-            display_name(hda::hdmi::display_state_now()),
-            d.ctrl.name(),
-            if d.ctrl.read_only() { "no" } else { "yes" }
-        )),
+        // `streaming` is the controller's mode (HDMI sound on: the controller may stream), `open_streams` its DMA
+        // streams now: an idle mixer closes its output after `idle_ns` and the controller stays on (SN-13 w25);
+        // `pme_*` what the display SMU said to the last on/off's UpdatePmeRestore.
+        Some(d) => {
+            let (pme_on, pme_off) = hda::hdmi::pme_last();
+            out.push(format!(
+                "hdmi display={} controller={} streaming={} open_streams={} pme_on={pme_on} pme_off={pme_off}",
+                display_name(hda::hdmi::display_state_now()),
+                d.ctrl.name(),
+                if d.ctrl.read_only() { "no" } else { "yes" },
+                d.ctrl.open_streams()
+            ))
+        }
         None => out.push(String::from("hdmi display=absent (no GPU HD Audio function)")),
     }
     let mark = |name: &str| if playing.as_deref() == Some(name) { " *" } else { "" };

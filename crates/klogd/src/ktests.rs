@@ -99,13 +99,23 @@ ktest!("rb.log.ring_sized", Safe, ring_sized_from_memory);
 // ---- RB-klog: every CPU logs at once while a slow sink is attached ----------------------------------------
 
 /// A deferred sink that needs `SLOW_NS` per storm line (a framebuffer scroll, a busy network card).
+///
+/// RB-17: it takes only the lines of the current storm (`run`). A try that failed leaves its sink node fed for a
+/// while after `remove_sink` (a drain already under way finishes its budget: up to 512 lines of 50 us), so under
+/// a loaded host the retry's sink got the failed try's lines mixed in ("the sink's lines differ from the ring's
+/// order", gx gate 28.10., right after `ktest.retry` "lost 11 records").
 struct Slow {
     lines: SpinLock<Vec<String>>,
     lost: AtomicU64,
+    run: AtomicU64,
+}
+/// The `r=` field of a storm line.
+fn storm_run(line: &str) -> Option<u64> {
+    line.split(" r=").nth(1)?.split(' ').next()?.parse().ok()
 }
 impl Sink for Slow {
     fn write_line(&self, _l: Level, line: &str) {
-        if !line.contains(" rbstorm e ") {
+        if !line.contains(" rbstorm e ") || storm_run(line) != Some(self.run.load(Ordering::Acquire)) {
             return;
         }
         let until = time::now_ns() + SLOW_NS;
@@ -118,7 +128,7 @@ impl Sink for Slow {
         self.lost.fetch_add(records, Ordering::Relaxed);
     }
 }
-static SLOW: Slow = Slow { lines: SpinLock::new(Vec::new()), lost: AtomicU64::new(0) };
+static SLOW: Slow = Slow { lines: SpinLock::new(Vec::new()), lost: AtomicU64::new(0), run: AtomicU64::new(0) };
 const SLOW_NS: u64 = 50_000;
 /// Events per storm in all (about 150 KiB of the ring, which is 1 MiB under QEMU's 2 GiB: the storm must not
 /// push the boot out of it, `rb.mirror.early_buffer` compares the boot), split over the CPUs.
@@ -169,6 +179,7 @@ struct Storm {
 /// handler or an `IrqSpinLock` holder would).
 fn storm() -> Result<Storm, String> {
     let cpus = sched::wait_cpus_online(2_000_000_000).max(1);
+    let run = SLOW.run.fetch_add(1, Ordering::AcqRel) + 1;
     {
         let mut l = SLOW.lines.lock();
         l.clear();
@@ -192,9 +203,9 @@ fn storm() -> Result<Storm, String> {
             for i in 0..n {
                 if i % 2 == 1 {
                     let _irq = hal::cpu::IrqGuard::new();
-                    klog::event!(Info, "rbstorm", "e", c = c, i = i);
+                    klog::event!(Info, "rbstorm", "e", r = run, c = c, i = i);
                 } else {
-                    klog::event!(Info, "rbstorm", "e", c = c, i = i);
+                    klog::event!(Info, "rbstorm", "e", r = run, c = c, i = i);
                 }
             }
         })
@@ -215,15 +226,18 @@ fn check_ring(s: &Storm) -> Result<Vec<String>, String> {
     kassert!(s.lost == 0 && page.missed() == 0, "lost {} records, gaps {:?}", s.lost, page.gaps);
     let lines: Vec<String> = page.records.iter().map(|r| r.render()).collect();
     per_cpu_complete(&lines, s.cpus)?;
-    // Generous under QEMU (a vCPU holding the ring may be descheduled by the host); tight on real hardware,
-    // where a hold is one record copied in or a small batch copied out. Interrupts-off waiters queue for the
-    // ring (KLock tickets, INT-A1e), so their wait is about one hold per CPU ahead: 16 CPUs x 5 us is ~80 us,
-    // and 300 us leaves room without hiding an unfair lock (the Mini-PC measured 370 us before the queue).
-    let (wait_limit, hold_limit) = if hal::cpu::detect().hypervisor { (1_000_000, 1_000_000) } else { (300_000, 100_000) };
+    // Timing is judged on the Mini-PC only (CONTRACTS §4): there a hold is one record copied in or a small batch
+    // copied out, and interrupts-off waiters queue for the ring (KLock tickets, INT-A1e), so their wait is about
+    // one hold per CPU ahead: 16 CPUs x 5 us is ~80 us, and 300 us leaves room without hiding an unfair lock (the
+    // Mini-PC measured 370 us before the queue). Under QEMU a vCPU holding the ring may be descheduled by the
+    // host for any time: the numbers are only logged (`report`), the functional checks above and the timeouts
+    // stay.
     let st = s.stats;
     kassert!(st.timeouts == 0, "{:?}", st);
-    kassert!(st.irqoff_wait_max_ns < wait_limit, "interrupts-off wait {} us: {:?}", st.irqoff_wait_max_ns / 1000, st);
-    kassert!(st.hold_max_ns < hold_limit, "ring held {} us: {:?}", st.hold_max_ns / 1000, st);
+    if !hal::cpu::detect().hypervisor {
+        kassert!(st.irqoff_wait_max_ns < 300_000, "interrupts-off wait {} us: {:?}", st.irqoff_wait_max_ns / 1000, st);
+        kassert!(st.hold_max_ns < 100_000, "ring held {} us: {:?}", st.hold_max_ns / 1000, st);
+    }
     Ok(lines)
 }
 
@@ -261,6 +275,9 @@ fn storm_with_klogd() -> TestResult {
 }
 
 /// Under QEMU a loaded host may stop a vCPU that holds the ring for milliseconds: one more try before failing.
+/// C1: the wait/hold limits are no longer judged there, but a stall longer than `IRQOFF_WAIT_NS` (klog lock.rs,
+/// 2 ms) still makes an interrupts-off emitter give up (a timeout, a record dropped), which the checks catch: that
+/// bound is the product's, not the test's, so the one retry stays for it.
 fn tries(f: fn() -> TestResult) -> TestResult {
     match f() {
         Err(e) if hal::cpu::detect().hypervisor && !e.starts_with("\u{1}skip:") => {
@@ -292,7 +309,9 @@ fn storm_without_klogd() -> TestResult {
         let ms = wait_sink(lines.len(), time::now_ns())?;
         kassert!(SLOW.lost.load(Ordering::Relaxed) == 0, "the sink was told of {} lost records", SLOW.lost.load(Ordering::Relaxed));
         let got = SLOW.lines.lock().clone();
-        kassert!(got == lines, "the sink's lines differ from the ring's order");
+        let first = got.iter().zip(&lines).position(|(a, b)| a != b);
+        kassert!(got == lines, "the sink's lines differ from the ring's order: {} vs {} lines, first difference at {:?}: {:?} vs {:?}",
+            got.len(), lines.len(), first, first.and_then(|i| got.get(i)), first.and_then(|i| lines.get(i)));
         report("emitters", &s, ms);
         Ok(())
     })();
@@ -304,3 +323,33 @@ fn smp_storm_early() -> TestResult {
     tries(storm_without_klogd)
 }
 ktest!("rb.klog.smp_storm_early", QemuOnly, smp_storm_early);
+
+/// RB-17 fixer: the slow sink of a storm takes only its own run's lines, deterministically: a failed try's
+/// drain that still feeds the node after `remove_sink` (stale `r=`), a line without a run and other lines are
+/// dropped, `r=17` is not run 1. Its own `Slow`, not `SLOW` (no storm runs beside it); nothing is logged.
+fn storm_sink_takes_only_its_run() -> TestResult {
+    let sink = Slow { lines: SpinLock::new(Vec::new()), lost: AtomicU64::new(0), run: AtomicU64::new(1) };
+    let line = |r: &str, i: u32| alloc::format!("[    1.000000] I cpu0 rbstorm e {r}c=0 i={i}");
+    let fed = [
+        line("r=0 ", 0),
+        line("r=1 ", 0),
+        line("r=17 ", 1),
+        line("", 2),
+        String::from("[    1.000000] I cpu0 rbstorm other r=1 c=0 i=3"),
+        line("r=1 ", 1),
+    ];
+    for l in &fed {
+        sink.write_line(Level::Info, l);
+    }
+    let got = sink.lines.lock().clone();
+    kassert!(got == [fed[1].clone(), fed[5].clone()], "the sink kept {:?}", got);
+    // The next try: its run number, the last try's lines left behind.
+    sink.run.store(2, Ordering::Release);
+    sink.lines.lock().clear();
+    sink.write_line(Level::Info, &fed[5]);
+    sink.write_line(Level::Info, &line("r=2 ", 0));
+    let got = sink.lines.lock().clone();
+    kassert!(got.len() == 1 && storm_run(&got[0]) == Some(2) && storm_key(&got[0]) == Some((0, 0)), "the retry's sink kept {:?}", got);
+    Ok(())
+}
+ktest!("rb.klog.storm_sink_run", Safe, storm_sink_takes_only_its_run);

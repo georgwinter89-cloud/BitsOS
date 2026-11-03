@@ -1,0 +1,18 @@
+int80 dirty high rax set_thread_area = 0
+int80 dirty high rbx get_thread_area = 0
+dirty high rbx read the low buffer: yes
+int80 nr -1 = -ENOSYS
+int80 nr 0x7fffffff = -ENOSYS
+int80 nr 0x80000000 = -ENOSYS
+int80 modify_ldt write EFAULT = 4294967282
+int80 modify_ldt read EFAULT = 0
+int80 get_thread_area EFAULT = -EFAULT
+modify_ldt write EFAULT = 4294967282
+modify_ldt read EFAULT = 0
+int80 get_thread_area entry 11 = -EINVAL
+int80 get_thread_area entry 15 = -EINVAL
+modify_ldt write conforming code = 4294967274
+modify_ldt write not present = 0
+loading a not-present LDT selector: SIGBUS
+loading an LDT selector beyond its end: SIGSEGV
+done

@@ -521,6 +521,15 @@ mod imp {
         unsafe { asm!("mov {}, cr4", out(reg) v, options(nomem, nostack, preserves_flags)) };
         v
     }
+    #[inline(always)]
+    pub fn rdgsbase() -> u64 {
+        let v;
+        // SAFETY: reads the GS base register, no memory access, no side effects. Without CR4.FSGSBASE it raises
+        // #UD, an ordinary kernel fault (a panic, not undefined behaviour); its one caller, `idt::gs_fault_suspect`,
+        // runs it only while `idt::arm_gs_base_check` holds (FSGSBASE on every CPU that loaded the IDT).
+        unsafe { asm!("rdgsbase {}", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
     pub fn write_cr4(v: u64) {
         // SAFETY: only `init_this_cpu` writes CR4, with `cr4_wanted`: feature bits CPUID reported, the bits
         // that cannot change in long mode kept as found.
@@ -635,6 +644,9 @@ mod imp {
     pub fn read_cr4() -> u64 {
         0
     }
+    pub fn rdgsbase() -> u64 {
+        u64::MAX
+    }
     pub fn write_cr4(_: u64) {}
     pub fn xgetbv(_: u32) -> u64 {
         0
@@ -665,6 +677,7 @@ mod imp {
 }
 
 pub use imp::{enable_and_halt, halt, interrupts_enabled, read_cr0, read_cr2, read_cr3, read_cr4};
+pub(crate) use imp::rdgsbase;
 
 /// Writes every modified cache line of this CPU back to memory (before a power-off: some chipsets lose dirty
 /// lines on the S5 transition). Slow (milliseconds); no other effect.

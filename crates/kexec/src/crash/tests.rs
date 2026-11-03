@@ -69,9 +69,10 @@ fn a_record_round_trips_and_damage_is_seen() {
     assert_eq!(record::decode(&p).unwrap_err(), RecordError::BadLength);
     assert_eq!(record::decode(&page[..10]).unwrap_err(), RecordError::NoMagic);
     // The body never reaches the marker.
-    assert_eq!(record::body_capacity(4096), 4096 - 128);
-    assert!(record::encode(&mut page, &header(), &vec![b'x'; 4096 - 127]).is_none());
-    assert!(record::encode(&mut page, &header(), &vec![b'x'; 4096 - 128]).is_some());
+    // The body never reaches the driver notes (256 bytes below the marker in a 4 KiB page).
+    assert_eq!(record::body_capacity(4096), 4096 - 128 - 256);
+    assert!(record::encode(&mut page, &header(), &vec![b'x'; 4096 - 383]).is_none());
+    assert!(record::encode(&mut page, &header(), &vec![b'x'; 4096 - 384]).is_some());
     // Marking it reported keeps it valid (the boot side rewrites only the header).
     let (h, b) = record::decode(&page).unwrap();
     let marked = Header { flags: h.flags | flags::REPORTED, ..h };
@@ -284,4 +285,85 @@ fn a_reload_hands_the_next_kernel_id_in_the_marker() {
     assert_eq!(record::handed_kernel(MarkerFound::Kept, Some(&m), 1), None, "an earlier boot's");
     assert_eq!(record::handed_kernel(same, Some(&old), 1), None, "an older kernel handed nothing");
     assert_eq!(record::handed_kernel(same, None, 1), None);
+}
+
+/// RB-12: the 26.10. walk shape (a #PF recursion) after the 40 printed steps folds into one repeat, and the
+/// outermost steps (the first fault and its callers) are printed.
+#[test]
+fn a_recursion_after_the_printed_steps_is_folded() {
+    let pf = Step::Trap { vector: 14, error: 0, rip: 0xFFFF_FFFF_805C_EF89, user: false };
+    let ktrap = Step::Call(0xFFFF_FFFF_801E_8ED1);
+    let first = Step::Trap { vector: 14, error: 0, rip: 0xFFFF_FFFF_8000_1234, user: false };
+    let mut raw = Vec::new();
+    for _ in 0..30 {
+        raw.push(pf);
+        raw.push(ktrap);
+    }
+    raw.push(first);
+    raw.push(Step::Call(0xFFFF_FFFF_8000_5000));
+    raw.push(Step::Call(0xFFFF_FFFF_8000_6000));
+    let mut f = Fold::new(40, 40);
+    let mut printed = Vec::new();
+    let mut repeats = Vec::new();
+    for s in &raw {
+        if let Folded::Print { n, step, repeat } = f.step(*s, None) {
+            repeats.extend(repeat);
+            printed.push((n, step));
+        }
+    }
+    repeats.extend(f.take());
+    assert_eq!(repeats, [(40, 20)], "steps 40..59 repeat the pair before them");
+    assert_eq!(printed, [(60, first), (61, Step::Call(0xFFFF_FFFF_8000_5000)), (62, Step::Call(0xFFFF_FFFF_8000_6000))]);
+    assert_eq!(f.steps(), 63);
+    // A walk that never repeats prints everything after the skipped part.
+    let mut f = Fold::new(1, 1);
+    let out: Vec<Folded> = [ktrap, first, pf].iter().map(|s| f.step(*s, None)).collect();
+    assert_eq!(out[0], Folded::Nothing);
+    assert_eq!(out[1], Folded::Print { n: 1, step: first, repeat: None });
+    assert_eq!(out[2], Folded::Print { n: 2, step: pf, repeat: None });
+}
+
+// RB-13
+
+#[test]
+fn watchdog_counts_past_the_panic_reset() {
+    assert_eq!(watchdog_secs(90), 90 + WATCHDOG_MARGIN_S as u32);
+    assert_eq!(watchdog_secs(0), WATCHDOG_MARGIN_S as u32);
+    assert_eq!(watchdog_secs(MAX_DELAY_S), (MAX_DELAY_S + WATCHDOG_MARGIN_S) as u32);
+    assert_eq!(watchdog_secs(u64::MAX), 0xFFFF, "the chip's 16-bit count");
+    // The 27.10. crash: panic_delay=90 against the watchdog's 30 s, so the watchdog reset first.
+    assert!(watchdog_secs(90) as u64 > 90);
+}
+
+#[test]
+fn panic_resets_in_the_mcp_reboot_order() {
+    // After the FADT register (taken by `reset_machine` itself), the plan's 0xCF9 codes, 8042, triple fault.
+    let plan = acpi::power::reboot_plan(None);
+    let cf9: Vec<u8> = plan.steps.iter().filter_map(|s| if let acpi::power::Step::Cf9 { code } = s { Some(*code) } else { None }).collect();
+    assert_eq!(cf9, hal::panic::LAST_RESORT_CF9.to_vec());
+    let tail: Vec<bool> = plan.steps.iter().map(|s| matches!(s, acpi::power::Step::Kbc { .. } | acpi::power::Step::TripleFault)).collect();
+    assert_eq!(tail, [false, false, true, true], "0xCF9 hard, full, then 8042 and triple fault");
+    assert_eq!(LAST_RESORTS, "0xCF9 hard (0x6), 0xCF9 full (0xe), 8042, triple fault");
+    assert_eq!(hal::panic::LAST_RESORT_CF9, [0x6, 0xE]);
+}
+
+#[test]
+fn reset_order_line_without_a_fadt_register() {
+    let mut b = Buf::<160>::new();
+    describe_reset(&mut b);
+    assert_eq!(b.as_str(), LAST_RESORTS);
+}
+
+/// INT-W25: a record of a kernel from before the driver notes may reach the marker; it still decodes.
+#[test]
+fn an_older_record_up_to_the_marker_still_decodes() {
+    let mut page = vec![0u8; 4096];
+    let body = vec![b'y'; 4096 - 128];
+    let h = Header { body_len: body.len() as u32, ..header() };
+    page[64..64 + body.len()].copy_from_slice(&body);
+    let mut f = h.sum_start();
+    f.update(&body);
+    page[..64].copy_from_slice(&h.bytes(f.finish()));
+    let (got, b) = record::decode(&page).unwrap();
+    assert_eq!((got.body_len as usize, b.len()), (4096 - 128, 4096 - 128));
 }

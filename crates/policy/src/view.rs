@@ -363,15 +363,12 @@ fn ended(c: &Conn, t: u64) -> (u64, u64) {
 }
 
 /// How long a live entry made from a record (no socket holds it) waits for its Closed record before the view
-/// ends it as lost: a caller that never sends Closed must not leave live entries forever. A setting.
-static LOST_NS: AtomicU64 = AtomicU64::new(30 * 60 * 1_000_000_000);
-
-pub fn set_record_live_ns(ns: u64) {
-    LOST_NS.store(ns.max(1), Ordering::Relaxed);
-}
+/// ends it as lost: a caller that never sends Closed must not leave live entries forever. Fixed at 30 min (PM-3
+/// may make it a setting).
+const LOST_NS: u64 = 30 * 60 * 1_000_000_000;
 
 pub fn record_live_ns() -> u64 {
-    LOST_NS.load(Ordering::Relaxed)
+    LOST_NS
 }
 
 /// Ends record-made live entries older than `record_live_ns` (a few per call; runs on each new record and each

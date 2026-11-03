@@ -1,0 +1,14 @@
+[package]
+name = "brave-act"
+version = "0.1.0"
+edition = "2024"
+description = "AC-3: Brave's actions for Claude (open_url, tabs, read_page, screenshot_tab, click_link, fill_form, download) over the DevTools protocol on a pipe (--remote-debugging-pipe)"
+publish = false
+
+[dependencies]
+bitsact = { path = "../../../lib/bitsact" }
+mcpreg = { path = "../../../lib/mcpreg" }
+
+[[bin]]
+name = "brave-act"
+path = "src/main.rs"

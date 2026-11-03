@@ -81,6 +81,8 @@ def main():
          "the console shell is root")
     wait("bitscomp says it runs as uid 1000", 60, lambda: "now running as uid 1000 gid 1000" in log(c))
     text = wait("bitscomp started on fbdev", 30, lambda: (lambda t: t if "backend=fbdev" in t else None)(log(c)))
+    # WY-14: the dropped bitscomp is not dumpable, so its /proc files are not read here (deep=False).
+    v.check_build(c, text, deep=False)
     pid = sh(c, "pidof bitscomp").split()[0]
     uid, gid, groups = ids(c, pid)
     need((uid, gid, groups) == ("1000 1000 1000 1000", "1000 1000 1000 1000", "1000"),

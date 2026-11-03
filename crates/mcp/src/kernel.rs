@@ -9,6 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use mcp_wire::gate::Mode;
 use net::{Ipv4, SockAddr, TcpStream};
 
 pub struct KernelEnv;
@@ -38,15 +39,77 @@ impl Env for KernelEnv {
 /// `ToolContext::deadline_ns`: past it (+ 0.25 s) the client gets "Still running (call n)", the worker stays
 /// inside the tool until it returns, and `output`/`stop` reach the call. Call `crate::set_boot_info` before, so
 /// `hw_info` and `reboot` can name the running generation.
+///
+/// MC-8a: `mcp=kernel|both|service` (default `kernel`, today's behaviour) also arms the gate for the user-space
+/// service (`gate`, `/dev/bitsos/mcp`) with `both` (the service on `mcp_port`+1) and `service` (the service on
+/// `mcp_port`, this server not started: the handle is then the gate's, without a listener).
 pub fn start_kernel(config: &dyn Fn(&str) -> Option<String>) -> Result<ServerHandle, StartError> {
     crate::boot::set_profile(config);
+    let mode = mode_from(config);
     let cfg = ServerConfig::from_config(config).inspect_err(|e| {
         klog::event!(Error, "mcp", "server.start_failed", reason = format!("{e:?}"); "MCP needs token= (8 to 127 characters) in CONFIG.TXT");
     })?;
     let sock = net::stack().ok_or(StartError::NoStack)?;
     // MC-6: user-space services' tools; without the socket the server still serves its own tools.
     let services = crate::svc::start_kernel(TOOLS.entries());
+    let gate = arm_gate(&cfg, mode, services.clone(), confirmer_from(config));
+    if !mode.kernel_serves()
+        && let Some(sh) = gate
+    {
+        klog::event!(Info, "mcp", "server.not_started", reason = "mcp=service", port = cfg.addr.port; "the user-space service bitsmcp serves MCP; the kernel keeps the gate and the console mirror");
+        return Ok(ServerHandle::of(sh));
+    }
     server::start_with(sock, Arc::new(KernelEnv), cfg, TOOLS.entries(), services)
+}
+
+/// MC-9a: CONFIG.TXT `mcp_confirmer=test` lets `bitsinstall test-confirmer` answer the installer's dialogs
+/// (QEMU scenarios); anything else, or nothing, is the session's bitscomp. `/proc/bitsos/mcp` names it.
+fn confirmer_from(config: &dyn Fn(&str) -> Option<String>) -> bool {
+    match config("mcp_confirmer").as_deref().map(str::trim) {
+        None | Some("bitscomp") => false,
+        Some("test") => {
+            klog::event!(Warn, "mcp", "installer.test_confirmer"; "mcp_confirmer=test: installer dialogs are answered by a test program, not a person");
+            true
+        }
+        Some(v) => {
+            klog::event!(Warn, "mcp", "config.bad_value", key = "mcp_confirmer", value = v.chars().take(32).collect::<String>(), used = "bitscomp"; "mcp_confirmer= takes bitscomp or test");
+            false
+        }
+    }
+}
+
+/// CONFIG.TXT `mcp=` (B6: a value that is not used is said so).
+fn mode_from(config: &dyn Fn(&str) -> Option<String>) -> Mode {
+    match config("mcp") {
+        None => Mode::Kernel,
+        Some(v) => Mode::parse(&v).unwrap_or_else(|| {
+            klog::event!(Warn, "mcp", "config.bad_value", key = "mcp", value = v.chars().take(32).collect::<String>(), used = "kernel"; "mcp= takes kernel, both or service");
+            Mode::Kernel
+        }),
+    }
+}
+
+/// Arms the gate for `mode` (nothing for `kernel`); its call machinery for `start_kernel`'s handle.
+fn arm_gate(cfg: &ServerConfig, mode: Mode, services: Option<Arc<crate::svc::Registry>>, test_confirmer: bool) -> Option<Arc<crate::server::Shared>> {
+    if !mode.service_serves() {
+        crate::gate::set_mode(Mode::Kernel, 0);
+        return None;
+    }
+    let Some(port) = mode.service_port(cfg.addr.port) else {
+        klog::event!(Error, "mcp", "gate.not_armed", mode = mode.name(), port = cfg.addr.port; "no port for the service above mcp_port 65535; the kernel's server alone serves");
+        return None;
+    };
+    if !server::token_ok(&cfg.token) {
+        // The kernel's server refuses such a token too (`server.start_failed`).
+        return None;
+    }
+    let mut gcfg = cfg.clone();
+    gcfg.addr.port = port;
+    // MC-9a: the installer's executable is measured now, before init or any other program runs.
+    let g = crate::gate::Gate::new(gcfg, Arc::new(KernelEnv), TOOLS.entries(), services, mode).measure_installer();
+    let sh = g.shared();
+    crate::gate::arm(g, test_confirmer);
+    Some(sh)
 }
 
 // ---------------------------------------------------------------------------------------------------------

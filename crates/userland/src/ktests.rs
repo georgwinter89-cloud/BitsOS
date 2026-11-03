@@ -23,6 +23,7 @@ mod bb;
 mod brave;
 mod cobalt;
 mod fetch;
+mod office;
 mod pkg;
 mod settings;
 mod tools;

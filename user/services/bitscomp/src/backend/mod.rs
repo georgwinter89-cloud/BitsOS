@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use smithay::utils::{Physical, Rectangle};
 
-use crate::render::Compositor;
+use crate::render::Picture;
 use crate::state::App;
 
 pub mod evdev;
@@ -35,9 +35,9 @@ pub trait Backend {
     /// Moves pending input and window events into the app (never blocks).
     fn dispatch(&mut self, app: &mut App);
     /// Copies the damaged parts of the composed frame out.
-    fn present(&mut self, comp: &Compositor, damage: &[Rectangle<i32, Physical>]);
+    fn present(&mut self, comp: &dyn Picture, damage: &[Rectangle<i32, Physical>]);
     /// Shows damage a previous `present` had to hold back (called every loop turn).
-    fn flush(&mut self, _comp: &Compositor) {}
+    fn flush(&mut self, _comp: &dyn Picture) {}
     /// An fd that becomes readable when `dispatch` has work, so the loop can sleep instead of polling.
     fn wake_fd(&self) -> Option<BorrowedFd<'static>> {
         None
@@ -57,11 +57,9 @@ pub trait Backend {
 }
 
 /// Copies rectangles of the shadow image into `dst` (same format, `dst_stride` in pixels).
-pub fn copy_rects(comp: &Compositor, dst: &mut [u32], dst_stride: usize, rects: &[Rectangle<i32, Physical>]) {
+pub fn copy_rects(comp: &dyn Picture, dst: &mut [u32], dst_stride: usize, rects: &[Rectangle<i32, Physical>]) {
     let (w, h) = comp.size();
-    let stride = comp.shadow.stride() / 4;
-    // SAFETY: the shadow image is ours and `stride * h` u32 long; it is not rendered into meanwhile.
-    let src = unsafe { std::slice::from_raw_parts(comp.shadow.data(), stride * h as usize) };
+    let (src, stride) = comp.pixels();
     for r in rects {
         let x0 = r.loc.x.clamp(0, w) as usize;
         let x1 = (r.loc.x + r.size.w).clamp(0, w) as usize;

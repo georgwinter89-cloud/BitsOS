@@ -196,3 +196,23 @@ fn seen_retries_then_gives_up_and_forgets_vanished_nodes() {
     s.settle(k.clone());
     assert!(!s.wants(&k));
 }
+
+#[test]
+fn mcp_and_virtual_devices_count_as_injected() {
+    use crate::input::Origin;
+    // As crates/console evdevfs registers MCP's devices (BUS_VIRTUAL, vendor 0, phys mcp/input0/1).
+    assert_eq!(origin_of(BUS_VIRTUAL, "BitsOS MCP keyboard", "mcp/input0"), Origin::Injected);
+    assert_eq!(origin_of(BUS_VIRTUAL, "BitsOS MCP pointer", "mcp/input1"), Origin::Injected);
+    // Each mark alone is enough: a renamed or re-bussed MCP device stays injected, uinput's default bus too.
+    assert_eq!(origin_of(0x03, "BitsOS MCP keyboard", ""), Origin::Injected);
+    assert_eq!(origin_of(0x03, "x", "mcp/input7"), Origin::Injected);
+    assert_eq!(origin_of(BUS_VIRTUAL, "uinput keyboard", ""), Origin::Injected);
+    // A USB keyboard and mouse, PS/2 (BUS_I8042 0x11), Bluetooth (0x05) are real.
+    assert_eq!(origin_of(0x03, "Logitech USB Keyboard", "usb-0000:05:00.3-1/input0"), Origin::Physical);
+    assert_eq!(origin_of(0x11, "AT Translated Set 2 keyboard", "isa0060/serio0/input0"), Origin::Physical);
+    assert_eq!(origin_of(0x05, "MX Master", ""), Origin::Physical);
+    // The log line names why a device counts as injected.
+    assert_eq!(injected_why(BUS_VIRTUAL, "BitsOS MCP keyboard", "mcp/input0"), Some("MCP device"));
+    assert_eq!(injected_why(BUS_VIRTUAL, "keyd virtual keyboard", ""), Some("virtual bus"));
+    assert_eq!(injected_why(0x03, "Logitech USB Keyboard", "usb-0000:05:00.3-1/input0"), None);
+}

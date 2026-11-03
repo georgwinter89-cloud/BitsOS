@@ -1,0 +1,11 @@
+uid_map of child = 11
+setgroups of child = 4
+gid_map of child = 11
+open child's ns/mnt = 5
+setns into it from outside = -EPERM
+child: own mount namespace = yes
+child: tmpfs = 0
+child: file = 0
+child: sees it = yes
+child: exit 0
+parent: child's file = ENOENT

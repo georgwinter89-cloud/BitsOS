@@ -1,0 +1,5 @@
+cs is 0x33: yes
+ss is 0x2b: yes
+bad far return faulted: yes
+fault was SIGSEGV: yes
+done

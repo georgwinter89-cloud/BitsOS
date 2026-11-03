@@ -1,0 +1,20 @@
+PR_SET_NO_NEW_PRIVS = 0
+filter TRAP getppid = 0
+SIGSYS: signo 31 code 1 errno 0x42 syscall 110 arch x86_64
+  si_call_addr is the interrupted RIP: yes
+  RAX holds the call's number: yes
+  RDI holds the first argument: yes
+  RSI holds the second argument: yes
+getppid -> 4242, traps 1
+filter ERRNO getppid = 0
+SIGSYS: signo 31 code 1 errno 0x42 syscall 110 arch x86_64
+  si_call_addr is the interrupted RIP: yes
+  RAX holds the call's number: yes
+  RDI holds the first argument: yes
+  RSI holds the second argument: yes
+getppid (TRAP beats ERRNO) -> 4243, traps 2
+child: SIGSYS blocked
+TRAP with SIGSYS blocked: signal 31
+child: SIGSYS ignored
+TRAP with SIGSYS ignored: signal 31
+TRAP with SIGSYS default: signal 31

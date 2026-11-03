@@ -1,0 +1,14 @@
+cs in 32-bit code = 0x23
+32-bit int80 set_thread_area = 0
+32-bit int80 entry is a TLS slot: yes
+32-bit int80 nr 1000 = -ENOSYS
+TLS selector reads its segment: yes
+modify_ldt write data segment = 0
+LDT selector 0x7 reads its segment: yes
+fault frame rip is in the 32-bit code: yes
+fault frame cs = 0x23
+fault frame ss = 0x2b
+cs after sigreturn = 0x23
+timer signal reached 32-bit code: yes
+timer frame cs = 0x23
+done

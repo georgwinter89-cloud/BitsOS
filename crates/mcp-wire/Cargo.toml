@@ -1,0 +1,13 @@
+[package]
+name = "mcp-wire"
+version = "0.1.0"
+edition = "2024"
+description = "MCP wire protocol shared by the kernel's server and the user-space service bitsmcp (owner: MC): HTTP head, JSON, JSON-RPC answers, argument check, the gate protocol of /dev/bitsos/mcp"
+publish = false
+
+# No dependencies on purpose: the kernel (no_std + alloc) and the musl service (std, user/ workspace on the stable
+# toolchain) both build it.
+[dependencies]
+
+[lints]
+workspace = true

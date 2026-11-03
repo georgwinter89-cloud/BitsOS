@@ -157,14 +157,49 @@ fn mmd_rw<H: Hw + ?Sized>(hw: &H, model: Model, dev: u16, reg: u16, set: Option<
 /// What the PHY reset did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhyReset {
-    Done,
+    /// PHPM showed reset complete this many microseconds after PHY_RST was released.
+    Done { us: u32 },
     /// MANC blocks PHY resets (management owns the PHY); skipped.
     Blocked,
-    /// PHPM never reported completion within 10 ms (Linux goes on as well).
-    NoCompletion,
+    /// PHPM never showed reset complete within `RESET_WAIT_US`, but the PHY answers MDIC with its ID, so it
+    /// is out of reset (one reading of the Mini-PC's boots before NW-9, where both links worked). Linux goes on
+    /// silently either way.
+    Unconfirmed { phpm: u32 },
+    /// Neither PHPM nor the PHY: no reset complete and no readable PHY ID. A real timeout.
+    NoCompletion { phpm: u32 },
 }
 
-/// I226 PHY reset (Linux `igc_phy_hw_reset`, `V1:igcphy.asm:67-92`), PHY0 held by the caller.
+impl PhyReset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PhyReset::Done { .. } => "done",
+            PhyReset::Blocked => "blocked",
+            PhyReset::Unconfirmed { .. } => "unconfirmed",
+            PhyReset::NoCompletion { .. } => "timeout",
+        }
+    }
+}
+
+/// PHY_RST held this long (Linux `reset_delay_us` is 100, V1 "100 us at least"; 1 ms is what the links have
+/// worked with since NW-2).
+const RESET_HOLD_US: u64 = 1_000;
+/// Linux leaves the PHY 100-150 us after the release before it looks ("SW should guarantee 100us").
+const RESET_SETTLE_US: u64 = 100;
+/// The first part of the wait samples PHPM back to back as Linux does (`udelay(1)` per read), so a completion
+/// bit that shows only briefly is not stepped over.
+const RESET_FAST_US: u64 = 2_000;
+const RESET_FAST_STEP_US: u64 = 1;
+/// The whole wait from the release. Linux counts 10000 reads with `udelay(1)` each (about 10-30 ms with the
+/// MMIO read time); 50 ms leaves room for a slow PHY. PHY0 is held meanwhile (the firmware waits up to 1 s).
+/// The waits go through `hw.delay_us`, so the caller decides: the restart worker's `Sleepy` sleeps the 100 us
+/// steps, the first start at probe spins them as it spins all its waits (bounded, as the 1 s semaphore wait).
+const RESET_WAIT_US: u64 = 50_000;
+const RESET_STEP_US: u64 = 100;
+const RESET_AFTER_US: u64 = 1_000;
+
+/// I226 PHY reset (Linux `igc_phy_hw_reset`, linux-6.6/drivers/net/ethernet/intel/igc/igc_phy.c:163-208,
+/// `V1:igcphy.asm:67-92`), PHY0 held by the caller. Completion is PHPM bit 8; when it never shows, the PHY ID
+/// (Linux `igc_get_phy_id`) tells a PHY that is out of reset from one that is not.
 pub fn reset<H: Hw + ?Sized>(hw: &H) -> PhyReset {
     if hw.rd(regs::MANC) & regs::MANC_BLK_PHY_RST != 0 {
         return PhyReset::Blocked;
@@ -172,13 +207,24 @@ pub fn reset<H: Hw + ?Sized>(hw: &H) -> PhyReset {
     let c = hw.rd(regs::CTRL);
     hw.wr(regs::CTRL, c | regs::ctrl::PHY_RST);
     hw.flush();
-    hw.delay_us(1_000);
+    hw.delay_us(RESET_HOLD_US);
     hw.wr(regs::CTRL, c & !regs::ctrl::PHY_RST);
     hw.flush();
-    hw.delay_us(1_000);
-    let done = until(hw, 10_000, 100, || hw.rd(regs::PHPM) & regs::PHPM_RST_COMPL != 0);
-    hw.delay_us(1_000);
-    if done { PhyReset::Done } else { PhyReset::NoCompletion }
+    let t0 = hw.now_ns();
+    hw.delay_us(RESET_SETTLE_US);
+    let complete = || hw.rd(regs::PHPM) & regs::PHPM_RST_COMPL != 0;
+    let done = until(hw, RESET_FAST_US, RESET_FAST_STEP_US, complete)
+        || until(hw, RESET_WAIT_US - RESET_FAST_US - RESET_SETTLE_US, RESET_STEP_US, complete);
+    let us = u32::try_from(hw.now_ns().saturating_sub(t0) / 1000).unwrap_or(u32::MAX);
+    hw.delay_us(RESET_AFTER_US);
+    if done {
+        return PhyReset::Done { us };
+    }
+    let phpm = hw.rd(regs::PHPM);
+    match read(hw, Model::I226, phy::ID1) {
+        Ok(id) if id != 0 && id != 0xFFFF => PhyReset::Unconfirmed { phpm },
+        _ => PhyReset::NoCompletion { phpm },
+    }
 }
 
 /// The advertisement Linux writes (`igc_phy_setup_autoneg` with `IGC_ALL_SPEED_DUPLEX_2500`): 10/100 half and

@@ -98,7 +98,8 @@ fn alloc_free() -> R {
     kassert!(again.vector <= a.vector, "the lowest free vector comes back first ({:#x} > {:#x})", again.vector, a.vector);
     vectors::free(again);
     vectors::free(b);
-    // Fill CPU 0 to the last vector: 192 dynamic vectors per CPU is x86, not a limit of ours.
+    // Fill CPU 0 to the last vector: 191 dynamic vectors per CPU (0x30-0xEF without int 0x80's 0x80, reserved
+    // since AB-10a), not a limit of ours.
     let mut all = Vec::new();
     loop {
         match vectors::alloc(h, Some(0)) {
@@ -116,7 +117,7 @@ fn alloc_free() -> R {
     for v in all {
         vectors::free(v);
     }
-    kassert!(n as u32 + taken0 == 192, "filled {n} + {taken0} taken before != 192");
+    kassert!(n as u32 + taken0 == 191, "filled {n} + {taken0} taken before != 191");
     kassert!(vectors::stats(0).map(|s| s.dynamic_taken) == Some(taken0), "every vector came back");
     kassert!(vectors::reserve(0, vectors::SPURIOUS_VECTOR) == Err(vectors::VectorError::NotInRange));
     kassert!(vectors::register_system(0x40, h) == Err(vectors::VectorError::NotInRange));

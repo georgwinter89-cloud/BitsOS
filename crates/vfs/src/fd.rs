@@ -4,8 +4,7 @@
 //! it was opened by name, the place it was found (`Path`, for fstat, getdents64, fchdir and *at calls).
 //! `FdTable` maps numbers to open files with a close-on-exec bit per number; it grows on demand up to the
 //! process's RLIMIT_NOFILE (default 1024, ceiling `NR_OPEN` like Linux: R1 says this is the only limit).
-//! The table also carries the process's file-system state (cwd, umask; Linux's `fs_struct`) until AB-4's
-//! clone splits CLONE_FS from CLONE_FILES.
+//! The file-system state (cwd, root, umask; Linux's `fs_struct`) is `FsState`, apart from the table (FS-16).
 
 use crate::abi::{self, Attr};
 use crate::inode::{Data, Inode};
@@ -17,6 +16,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use ksync::{Mutex, SpinLock};
+use mm_core::grace::{self, Retire};
+use mm_core::rcu_index::RcuIndex;
 use uapi::errno::*;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -348,22 +349,98 @@ impl Drop for OpenFile {
     }
 }
 
-/// The process's file-system state (Linux `fs_struct`).
+/// A thread's file-system state (Linux `fs_struct`, linux-6.6/include/linux/fs_struct.h): working directory, root
+/// and umask. FS-16: it lives apart from the fd table, as in Linux (kernel/fork.c `copy_fs`/`copy_files`): the
+/// process layer holds it behind an `Arc` per thread, CLONE_FS shares it, a clone without CLONE_FS and
+/// unshare(CLONE_FS) take a `copy` (`copy_fs_struct`); CLONE_FILES shares only the fd table.
 pub struct FsState {
     cwd: SpinLock<Option<Path>>,
+    /// chroot(2)'s root (None = the view's root).
+    root: SpinLock<Option<Path>>,
     umask: AtomicU32,
+    /// SX-3a: the mount view its cwd and root were last placed in (0: not yet). A state entering a view copied
+    /// from that one has its places moved onto the copies (`enter`), as `copy_mnt_ns` moves the copier's.
+    view: AtomicU64,
 }
 
 impl FsState {
     pub fn new() -> Self {
-        FsState { cwd: SpinLock::named("vfs.fs.cwd", None), umask: AtomicU32::new(0o022) }
+        FsState { cwd: SpinLock::named("vfs.fs.cwd", None), root: SpinLock::named("vfs.fs.root", None), umask: AtomicU32::new(0o022), view: AtomicU64::new(0) }
     }
-    /// The working directory (None = the view's root).
+    /// `copy_fs_struct`: the same cwd, root and umask, from now on independent.
+    pub fn copy(&self) -> Self {
+        let t = FsState::new();
+        *t.cwd.lock() = self.cwd();
+        *t.root.lock() = self.root();
+        t.set_umask(self.umask());
+        t.view.store(self.view.load(Ordering::Acquire), Ordering::Release);
+        t
+    }
+    /// SX-3a: this state is used in view `ns`. Coming from the view `ns` was copied from (a clone with
+    /// CLONE_NEWNS, another thread's unshare), its cwd and root move onto the copies of their mounts; a state
+    /// never placed takes `ns` as its view. A state already in a copy keeps its places when used with the view
+    /// it came from (a caller that still passes the boot view).
+    pub fn enter(&self, ns: &crate::MountNs) {
+        let was = self.view.load(Ordering::Acquire);
+        if was == ns.id {
+            return;
+        }
+        if ns.source_id() == Some(was) {
+            self.move_into(ns);
+        } else if was == 0 {
+            self.view.store(ns.id, Ordering::Release);
+        }
+    }
+    /// `copy_mnt_ns`'s second pass for this state: cwd and root onto the copies in `ns` (places on mounts
+    /// `ns` has no copy of stay), then `ns` is its view.
+    pub fn move_into(&self, ns: &crate::MountNs) {
+        let root = self.root().and_then(|p| ns.translate(&p));
+        let cwd = self.cwd().and_then(|p| ns.translate(&p));
+        if let Some(r) = root {
+            self.set_root(r);
+        }
+        if let Some(c) = cwd {
+            self.set_cwd(c);
+        }
+        self.view.store(ns.id, Ordering::Release);
+    }
+    /// SX-3a: setns(2) into a view and pivot_root(2)'s `chroot_fs_refs`: root and cwd set at once.
+    pub fn place(&self, ns: &crate::MountNs, root: Path, cwd: Path) {
+        self.set_root(root);
+        self.set_cwd(cwd);
+        self.view.store(ns.id, Ordering::Release);
+    }
+    /// `chroot_fs_refs` for this state: root and cwd that are `old` become `new`, compared and replaced under
+    /// both locks at once (Linux `fs->lock`), so a chroot or chdir racing with it is neither lost nor half
+    /// applied. Returns how many of the two were replaced; the old places are dropped after the locks.
+    pub fn replace_refs(&self, old: &Path, new: &Path) -> usize {
+        let mut gone: Vec<Path> = Vec::new();
+        {
+            let mut root = self.root.lock();
+            let mut cwd = self.cwd.lock();
+            for slot in [&mut *root, &mut *cwd] {
+                if slot.as_ref().is_some_and(|p| p.same(old)) {
+                    gone.extend(slot.replace(new.clone()));
+                }
+            }
+        }
+        gone.len()
+    }
+    /// The working directory (None = the root).
     pub fn cwd(&self) -> Option<Path> {
         self.cwd.lock().clone()
     }
     pub fn set_cwd(&self, p: Path) {
         let old = self.cwd.lock().replace(p);
+        drop(old);
+    }
+    /// The process's root (None = its mount view's root).
+    pub fn root(&self) -> Option<Path> {
+        self.root.lock().clone()
+    }
+    /// `set_fs_root`; the old root is dropped outside the lock.
+    pub fn set_root(&self, p: Path) {
+        let old = self.root.lock().replace(p);
         drop(old);
     }
     pub fn umask(&self) -> u32 {
@@ -390,6 +467,46 @@ struct Slot {
     cloexec: bool,
 }
 
+/// PF-3b: what a look-up without the table lock finds at a number: the file, without keeping it open (the
+/// strong reference is the table's `Slot`, dropped at close at once; only this memory waits for a grace period,
+/// as Linux's RCU-freed `struct file`).
+struct Pub {
+    file: Weak<OpenFile>,
+}
+
+/// A view entry taken out under the table lock, dropped after it (its drop hands it to the grace queue).
+type Late = Option<Retire<Pub>>;
+
+/// Several `Late` entries (close-on-exec, exit). Without room for one more, that one drops in place, as before
+/// PF-6's fixer (a bounded wait only when the grace queue has no room either).
+struct LateMany(Vec<Retire<Pub>>);
+
+impl LateMany {
+    fn new() -> LateMany {
+        LateMany(Vec::new())
+    }
+    fn keep(&mut self, r: Late) {
+        if let Some(r) = r {
+            if self.0.try_reserve(1).is_ok() {
+                self.0.push(r);
+            } else {
+                drop(r);
+            }
+        }
+    }
+}
+
+klog::counter!(VIEW_NOROOM, "vfs.fd.view_noroom");
+/// The first fallback is reported (B6), later ones only counted.
+static VIEW_NOROOM_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Look-ups of one table that took its lock (tests and ktests; the lockless ones count nothing: no line other
+/// CPUs write).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LookupStats {
+    pub locked: u64,
+}
+
 pub struct FdTable {
     fds: SpinLock<Vec<Option<Slot>>>,
     /// Lowest number that might be free (Linux `next_fd`).
@@ -397,14 +514,66 @@ pub struct FdTable {
     /// The highest number ever taken (FS-4: Linux's `max_fds` follows it, select caps its `n` there).
     high: AtomicUsize,
     limit: AtomicUsize,
-    pub fs: FsState,
+    /// PF-3b: the published files by number, read with no lock inside a grace section (`get`; Linux reads
+    /// `fdt->fd[]` under RCU, linux-6.6/fs/file.c:888-900). Changed only under `fds`, right after the slot, so
+    /// it never holds a file the slot does not; a number it lacks (no room for a node, a reserved number) is
+    /// looked up under the lock.
+    view: RcuIndex<Pub>,
+    locked: AtomicU64,
+    /// Tests: the view stays empty, every look-up takes the lock.
+    #[cfg(test)]
+    unviewed: bool,
 }
 
 pub const DEFAULT_NOFILE: usize = abi::NOFILE_DEFAULT;
 
 impl FdTable {
     pub fn new() -> Self {
-        FdTable { fds: SpinLock::named("vfs.fds", Vec::new()), hint: AtomicUsize::new(0), high: AtomicUsize::new(0), limit: AtomicUsize::new(DEFAULT_NOFILE), fs: FsState::new() }
+        FdTable {
+            fds: SpinLock::named("vfs.fds", Vec::new()),
+            hint: AtomicUsize::new(0),
+            high: AtomicUsize::new(0),
+            limit: AtomicUsize::new(DEFAULT_NOFILE),
+            view: RcuIndex::named("vfs.fds.view"),
+            locked: AtomicU64::new(0),
+            #[cfg(test)]
+            unviewed: false,
+        }
+    }
+    /// A table whose lockless view stays empty (as after its nodes found no room): every look-up locks.
+    #[cfg(test)]
+    pub(crate) fn new_unviewed() -> Self {
+        let mut t = FdTable::new();
+        t.unviewed = true;
+        t
+    }
+    /// Under `fds`: `fd` now holds `f` (published) for lockless look-ups. Without room for the view's nodes the
+    /// number leaves the view instead (the locked look-up finds it), never keeping an older file there. Returns
+    /// the entry it replaced: the caller drops it after the table lock (`Late`), because handing it to the
+    /// grace queue may wait a bounded grace period when the queue has no room (PF-6 fixer).
+    #[must_use]
+    fn show(&self, fd: usize, f: &Arc<OpenFile>) -> Late {
+        let mut w = self.view.write();
+        #[cfg(test)]
+        if self.unviewed {
+            return w.remove(fd as u64);
+        }
+        match w.insert(fd as u64, Arc::new(Pub { file: Arc::downgrade(f) })) {
+            Ok(old) => old,
+            Err(_) => {
+                VIEW_NOROOM.inc();
+                if !VIEW_NOROOM_SEEN.swap(true, Ordering::Relaxed) {
+                    klog::event!(Warn, "vfs", "fd.view_noroom", fd = fd as u64; "no room for the lockless fd view: this number is looked up under the table lock");
+                }
+                w.remove(fd as u64)
+            }
+        }
+    }
+    /// Under `fds`: `fd` no longer holds a published file. Returns the entry for the caller to drop after the
+    /// table lock, as `show`.
+    #[must_use]
+    fn hide(&self, fd: usize) -> Late {
+        self.view.write().remove(fd as u64)
     }
     /// Lowest free fd >= `min` (Linux semantics): EMFILE at RLIMIT_NOFILE, ENOMEM if the table cannot grow.
     pub fn install_flags(&self, f: Arc<OpenFile>, min: usize, cloexec: bool) -> Result<usize, Errno> {
@@ -449,10 +618,12 @@ impl FdTable {
     /// Publishes a reserved fd (`fd_install`). A number that is not reserved (closed meanwhile by an exit) is
     /// left alone and `f` is released.
     pub fn commit(&self, fd: usize, f: Arc<OpenFile>) {
+        let mut late = None;
         let unused = {
             let mut fds = self.fds.lock();
             match fds.get_mut(fd) {
                 Some(Some(slot)) if slot.file.is_none() => {
+                    late = self.show(fd, &f);
                     slot.file = Some(f);
                     None
                 }
@@ -463,6 +634,7 @@ impl FdTable {
             klog::event!(Warn, "vfs", "fd.commit_unreserved", fd = fd; "an fd to publish was not reserved (closed meanwhile): its file is released");
         }
         drop(unused);
+        drop(late);
     }
     /// Gives a reserved fd back (`put_unused_fd`); a published fd is left alone.
     pub fn unreserve(&self, fd: usize) {
@@ -489,11 +661,14 @@ impl FdTable {
                     return Err(EMFILE);
                 }
                 if i < fds.len() {
+                    let late = f.as_ref().and_then(|f| self.show(i, f));
                     fds[i] = Some(Slot { file: f, cloexec });
                     self.high.fetch_max(i, Ordering::Relaxed);
                     if min == 0 {
                         self.hint.store(i + 1, Ordering::Relaxed);
                     }
+                    drop(fds);
+                    drop(late);
                     return Ok(i);
                 }
                 (i + 1).max(fds.len() * 2).min(limit)
@@ -508,6 +683,10 @@ impl FdTable {
             let len = self.fds.lock().len();
             if len >= want {
                 return Ok(());
+            }
+            #[cfg(test)]
+            if crate::pf3_tests::grow_fails() {
+                return Err(ENOMEM);
             }
             let mut v: Vec<Option<Slot>> = Vec::new();
             v.try_reserve_exact(want).map_err(|_| ENOMEM)?;
@@ -558,6 +737,7 @@ impl FdTable {
             return Err(EBADF);
         }
         self.grow_to(fd + 1)?;
+        let late;
         let old = {
             let mut fds = self.fds.lock();
             // Tables never shrink, so the slot exists after `grow_to`.
@@ -566,20 +746,44 @@ impl FdTable {
                 Some(Some(s)) if s.file.is_none() => return Err(EBUSY),
                 Some(slot) => {
                     self.high.fetch_max(fd, Ordering::Relaxed);
-                    slot.replace(Slot { file: Some(f), cloexec })
+                    let old = slot.replace(Slot { file: Some(f.clone()), cloexec });
+                    late = self.show(fd, &f);
+                    old
                 }
                 None => return Err(ENOMEM),
             }
         };
         // The replaced file is released outside the table lock (its last close may wake or take locks).
         drop(old);
+        drop(late);
         Ok(())
     }
     pub fn install_at(&self, fd: usize, f: Arc<OpenFile>) -> Result<(), Errno> {
         self.install_at_flags(fd, f, false)
     }
+    /// The open file at `fd` (`fget_raw`), with a reference of its own. PF-3b: first without the table lock
+    /// (Linux `__fget_files_rcu`, linux-6.6/fs/file.c:888-900): inside a grace section the view's entry, its file
+    /// taken with `Weak::upgrade` (inc-not-zero: a file whose last reference went never comes back). The load of
+    /// the entry is the moment the look-up answers for: the entry names one file (its memory is not reused while
+    /// the section lives), and every change of the number replaces or removes the entry under the table lock,
+    /// after the slot, so no other look-up sees the number in between. Linux reads the slot a second time because
+    /// its `struct file` memory may be another file by then (SLAB_TYPESAFE_BY_RCU); a `Weak` cannot. Else (a
+    /// number the view lacks, or the file just went) the locked look-up.
     pub fn get(&self, fd: usize) -> Result<Arc<OpenFile>, Errno> {
-        self.fds.lock().get(fd).and_then(|s| s.as_ref()).and_then(|s| s.file.clone()).ok_or(EBADF)
+        if let Some(f) = self.get_lockless(fd) {
+            return Ok(f);
+        }
+        self.locked.fetch_add(1, Ordering::Relaxed);
+        let fds = self.fds.lock();
+        fds.get(fd).and_then(|s| s.as_ref()).and_then(|s| s.file.clone()).ok_or(EBADF)
+    }
+    fn get_lockless(&self, fd: usize) -> Option<Arc<OpenFile>> {
+        let s = grace::enter()?;
+        self.view.get(&s, fd as u64)?.file.upgrade()
+    }
+    /// Look-ups of this table that took its lock (PF-3 tests and ktests).
+    pub fn lookup_stats(&self) -> LookupStats {
+        LookupStats { locked: self.locked.load(Ordering::Relaxed) }
     }
     pub fn cloexec(&self, fd: usize) -> Result<bool, Errno> {
         self.fds.lock().get(fd).and_then(|s| s.as_ref()).filter(|s| s.file.is_some()).map(|s| s.cloexec).ok_or(EBADF)
@@ -594,42 +798,97 @@ impl FdTable {
         }
     }
     pub fn close(&self, fd: usize) -> Result<(), Errno> {
-        // The hint changes only under the table lock ("every number below it is taken").
-        let old = {
-            let mut fds = self.fds.lock();
-            let old = match fds.get_mut(fd) {
-                Some(slot @ Some(_)) if slot.as_ref().is_some_and(|s| s.file.is_some()) => slot.take(),
-                _ => return Err(EBADF),
-            };
-            if fd < self.hint.load(Ordering::Relaxed) {
-                self.hint.store(fd, Ordering::Relaxed);
-            }
-            old
-        };
-        drop(old);
-        Ok(())
+        self.close_get(fd).map(drop)
     }
-    /// execve: closes every close-on-exec fd (AB-4 calls it).
-    pub fn close_on_exec(&self) {
-        let gone: Vec<Slot> = {
-            let mut fds = self.fds.lock();
-            self.hint.store(0, Ordering::Relaxed);
-            fds.iter_mut().filter(|s| s.as_ref().is_some_and(|s| s.cloexec && s.file.is_some())).filter_map(|s| s.take()).collect()
+    /// close(2)'s table half (Linux `close_fd_get_file` / `pick_file`): takes the file out of `fd` and hands it
+    /// to the caller, who does `filp_close`'s work (the POSIX locks) on the very file that left the table and
+    /// then drops it, so a racing dup2 or open on the same number cannot make it act on another file. EBADF for
+    /// a free number and for one a call in progress reserved.
+    pub fn close_get(&self, fd: usize) -> Result<Arc<OpenFile>, Errno> {
+        // Declared before the guard, so it drops after the lock.
+        let late;
+        // The hint changes only under the table lock ("every number below it is taken").
+        let mut fds = self.fds.lock();
+        let Some(slot) = fds.get_mut(fd).filter(|s| s.as_ref().is_some_and(|s| s.file.is_some())) else {
+            return Err(EBADF);
         };
-        drop(gone);
+        let file = slot.take().and_then(|s| s.file).ok_or(EBADF)?;
+        late = self.hide(fd);
+        if fd < self.hint.load(Ordering::Relaxed) {
+            self.hint.store(fd, Ordering::Relaxed);
+        }
+        drop(fds);
+        drop(late);
+        // Returned (and so dropped) outside the lock: the last close may wake or take locks.
+        Ok(file)
+    }
+    /// dup2/dup3's table half (Linux `ksys_dup3` + `do_dup2`, linux-6.6/fs/file.c:1266, :1105): `old`'s file
+    /// (an O_PATH one too) goes to `new` with its own close-on-exec flag. The look-up of `old` and the
+    /// replacement are one step under the table lock, so a close of `old` racing with it comes either before
+    /// (EBADF, nothing changed) or after (the copy stays). Returns what `new` held before, for the caller's
+    /// `filp_close` (its POSIX locks go) and drop outside the lock. EBADF at or above the limit and for a free
+    /// or reserved `old`; EBUSY when a call in progress reserved `new`; ENOMEM when the table cannot grow to
+    /// `new` (only after `old` was found, the order of `ksys_dup3`). The table grows to `new` before `old` is
+    /// looked up, as `ksys_dup3` runs `expand_files` before `files_lookup_fd_locked` (file.c:1247-1248): a
+    /// dup2 of a closed fd to a high number below the limit leaves the table as long as Linux leaves it.
+    pub fn dup_to(&self, old: usize, new: usize, cloexec: bool) -> Result<Option<Arc<OpenFile>>, Errno> {
+        if new >= self.limit() {
+            return Err(EBADF);
+        }
+        let grown = self.grow_to(new + 1);
+        // Declared before the guard, so it drops after the lock.
+        let late;
+        let mut fds = self.fds.lock();
+        let f = fds.get(old).and_then(|s| s.as_ref()).and_then(|s| s.file.clone()).ok_or(EBADF)?;
+        grown?;
+        // Tables never shrink, so after a successful `grow_to` the slot exists.
+        let slot = fds.get_mut(new).ok_or(ENOMEM)?;
+        if slot.as_ref().is_some_and(|s| s.file.is_none()) {
+            return Err(EBUSY);
+        }
+        self.high.fetch_max(new, Ordering::Relaxed);
+        let replaced = slot.replace(Slot { file: Some(f.clone()), cloexec }).and_then(|s| s.file);
+        late = self.show(new, &f);
+        drop(fds);
+        drop(late);
+        Ok(replaced)
+    }
+    /// execve: closes every close-on-exec fd (AB-4 calls it) and returns the files that left, in one pass under
+    /// the table lock (Linux `do_close_on_exec` calls `filp_close` on each: the caller drops their POSIX locks
+    /// and then the files, outside the lock).
+    pub fn close_on_exec(&self) -> Vec<Arc<OpenFile>> {
+        let mut late = LateMany::new();
+        let mut fds = self.fds.lock();
+        self.hint.store(0, Ordering::Relaxed);
+        let mut out = Vec::new();
+        for (i, s) in fds.iter_mut().enumerate() {
+            if s.as_ref().is_some_and(|s| s.cloexec && s.file.is_some())
+                && let Some(f) = s.take().and_then(|s| s.file)
+            {
+                late.keep(self.hide(i));
+                out.push(f);
+            }
+        }
+        drop(fds);
+        drop(late);
+        out
     }
     /// exit (Linux `exit_files`): closes every fd at once, so pipe readers see EOF and writers EPIPE when a
     /// program ends, not only when its process object is freed (FS-3 change request to AB: call it when the
     /// process ends). The table stays usable (empty).
     pub fn close_all(&self) {
+        let mut late = LateMany::new();
         let gone: Vec<Slot> = {
             let mut fds = self.fds.lock();
             self.hint.store(0, Ordering::Relaxed);
+            self.view.write().drain_from(0, &mut |_, r| late.keep(Some(r)));
             fds.iter_mut().filter_map(|s| s.take()).collect()
         };
         drop(gone);
+        drop(late);
     }
-    /// fork: a copy sharing the open files (positions are shared, as Linux), same limit, cwd and umask.
+    /// fork (`dup_fd`) and execve's `unshare_files`: a copy sharing the open files (positions are shared, as
+    /// Linux) with the same limit. The file-system state is not part of the table (`FsState`).
     pub fn duplicate(&self) -> Result<FdTable, Errno> {
         let t = FdTable::new();
         // Allocated outside the source's spin lock; under it only the slots are cloned (Linux `dup_fd`).
@@ -647,12 +906,16 @@ impl FdTable {
         };
         // The child's table is sized by its highest open number (`sane_fdtable_size`).
         t.high.store(copy.iter().rposition(|s| s.is_some()).unwrap_or(0), Ordering::Relaxed);
-        *t.fds.lock() = copy;
-        t.set_limit(self.limit());
-        if let Some(c) = self.fs.cwd() {
-            t.fs.set_cwd(c);
+        let mut fds = t.fds.lock();
+        for (i, s) in copy.iter().enumerate() {
+            if let Some(f) = s.as_ref().and_then(|s| s.file.as_ref()) {
+                // A fresh table: nothing to replace, so nothing waits under the lock.
+                drop(t.show(i, f));
+            }
         }
-        t.fs.set_umask(self.fs.umask());
+        *fds = copy;
+        drop(fds);
+        t.set_limit(self.limit());
         Ok(t)
     }
     /// RLIMIT_NOFILE (soft). Values above `NR_OPEN` are clamped (prlimit refuses them earlier with EPERM).
@@ -763,6 +1026,21 @@ mod tests {
         t.unreserve(0);
         assert!(t.get(0).is_ok());
         assert_eq!(t.install(of()).unwrap(), 3);
+    }
+
+    /// FS-16: `copy` (copy_fs_struct) keeps cwd, root and umask; afterwards the two states are independent.
+    #[test]
+    fn fs_state_copy_lives_apart() {
+        let ns = MountNs::new_empty();
+        ns.create_file("/d", 0o644, alloc::vec![]).unwrap();
+        let a = FsState::new();
+        a.set_umask(0o077);
+        a.set_root(ns.root_path());
+        a.set_cwd(ns.root_path());
+        let b = a.copy();
+        assert!(b.umask() == 0o077 && b.root().is_some() && b.cwd().is_some(), "copy_fs_struct keeps cwd, root and umask");
+        assert_eq!(a.set_umask(0o022), 0o077);
+        assert!(b.umask() == 0o077 && FsState::new().umask() == 0o022 && FsState::new().root().is_none(), "then lives apart");
     }
 }
 

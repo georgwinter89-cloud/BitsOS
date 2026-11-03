@@ -1,15 +1,19 @@
 //! Drawing the chrome of `chrome` (Main.dc.html, WY-5): each bar is one image at output resolution, redrawn only
 //! when what it shows changes (`chrome_render` keeps them). Sizes are the mock-up's CSS px.
 
+pub mod buehne;
+pub mod strip;
+
 use crate::canvas::{Box2, Canvas, Glyph, glyph_into};
 use crate::chrome::{Chrome, Part, fav_font, fav_label};
+use crate::deco::hud::{self, Glass};
 use crate::desk::Ring;
 use crate::header::px_rect;
 use crate::layout::Rect;
 use crate::status::Block;
 use crate::suggest::Row;
-use crate::text::{Font, Weight};
-use crate::theme::Theme;
+use crate::text::{Family, Font, Weight};
+use crate::theme::{Style, Theme, alpha};
 
 /// Logical rects to pixels of an image whose top left is `origin` (logical).
 pub struct Px {
@@ -40,7 +44,12 @@ impl Px {
 }
 
 pub fn font(t: &Theme, px: f32, w: Weight) -> Font {
-    Font::new(t.fs(px), w, t.scale)
+    t.font(Family::Ui, px, w)
+}
+
+/// The boards' uppercase mono label (`.lbl`: JetBrains Mono 500, 11 board px, 0.08 em) for the chrome's captions.
+fn label(t: &Theme) -> Font {
+    t.style(Style::Label)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,7 +60,6 @@ pub struct TopLook {
     pub text: String,
     pub cursor: Option<String>,
     pub hover: Option<Part>,
-    pub ring: Ring,
     /// The context chip slot (none until the context service, CX-6).
     pub context: Option<String>,
 }
@@ -61,7 +69,8 @@ pub fn top(l: &TopLook, t: &Theme) -> Canvas {
     let p = Px::new(c0.top, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.clear(t.panel);
+    // DS-2: glass over the wallpaper (the top bar is never over windows).
+    c.clear(hud::glass(t, Glass::Bar));
     let bottom = p.r(Rect { y: c0.top.y + c0.top.h - 1, h: 1, ..c0.top });
     c.fill(0, bottom.y, w, bottom.h.max(1), t.line);
     // The mark: the mock-up's ring with a core, and "BitsOS".
@@ -69,7 +78,8 @@ pub fn top(l: &TopLook, t: &Theme) -> Canvas {
     let (mx, my) = (m.x as f32 + p.v(13.0), m.y as f32 + p.v(13.0));
     c.ring(mx, my, p.v(10.0), p.v(2.0), t.accent);
     c.disc(mx, my, p.v(4.0), t.accent);
-    let brand = font(t, 18.0, Weight::SemiBold).spaced(0.04);
+    // The wordmark is set in the display face, as on the Main board.
+    let brand = t.font(Family::Display, 18.0, Weight::SemiBold).spaced(-0.01);
     c.text_fit(&brand, Rect { x: m.x + p.v(34.0) as i32, w: m.w - p.v(34.0) as i32, ..m }, "BitsOS", t.text);
     // WY-5c: the folded workspace list's button, left of the mark.
     if let Some(r) = c0.ws_button {
@@ -98,7 +108,7 @@ pub fn top(l: &TopLook, t: &Theme) -> Canvas {
     let mut x = ar.x + p.v(14.0) as i32;
     let right = ar.x + ar.w - p.v(14.0) as i32;
     if let Some(ctx) = &l.context {
-        let lab = font(t, 12.0, Weight::SemiBold).spaced(0.08);
+        let lab = label(t);
         x += c.text_fit(&lab, Rect { x, w: right - x, ..ar }, "KONTEXT", t.accent) + p.v(10.0) as i32;
         let chip = font(t, 13.0, Weight::Regular);
         let cw = chip.width(ctx) + p.v(20.0) as i32;
@@ -125,13 +135,41 @@ pub fn top(l: &TopLook, t: &Theme) -> Canvas {
         let cx = (x + f16.width(before)) as f32 + 1.0;
         c.line((cx, ar.y as f32 + p.v(10.0)), (cx, (ar.y + ar.h) as f32 - p.v(10.0)), p.v(1.5), t.accent);
     }
-    // The ring button: Claude's ring, small; it folds the sidebar in and out.
+    // The ring button: Claude's ring, small; it folds the sidebar in and out. The ring itself is its own sprite
+    // over this image (`ring_sprite`), so a busy ring redraws only itself.
     let rb = p.r(c0.ring);
     if l.hover == Some(Part::Ring) {
         c.disc(rb.x as f32 + rb.w as f32 / 2.0, rb.y as f32 + rb.h as f32 / 2.0, rb.w as f32 / 2.0, t.chip);
     }
-    crate::ring::draw(&mut c, rb.x as f32 + rb.w as f32 / 2.0, rb.y as f32 + rb.h as f32 / 2.0, p.v(40.0) * 48.0 / 44.0 * 0.9, l.ring, 0.0, t);
     c
+}
+
+/// Claude's ring as a small image of its own (DS-2): `rect` is its button (logical), `box_px` the mock-up's box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RingLook {
+    pub rect: Rect,
+    pub ring: Ring,
+    /// The busy step (`anim::RingClock`), 0 when still.
+    pub step: u32,
+    /// The mock-up box in logical px (the top bar's 40 * 48/44 * 0.9, the sidebar's 44 * 48/44 * 0.92).
+    pub size: f32,
+    pub theme: u64,
+}
+
+pub fn ring_sprite(l: &RingLook, t: &Theme) -> Canvas {
+    let p = Px::new(l.rect, t.scale);
+    let (w, h) = p.size();
+    let mut c = Canvas::new(w, h);
+    crate::ring::draw(&mut c, w as f32 / 2.0, h as f32 / 2.0, p.v(l.size), l.ring, l.step, t);
+    c
+}
+
+/// The top bar ring's mock-up box (logical px).
+pub const TOP_RING: f32 = 40.0 * 48.0 / 44.0 * 0.9;
+/// The sidebar ring's box and its place in the sidebar.
+pub const SIDE_RING: f32 = 44.0 * 48.0 / 44.0 * 0.92;
+pub fn side_ring_rect(side: Rect) -> Rect {
+    Rect { x: side.x + 16, y: side.y + 18, w: 44, h: 44 }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,7 +185,7 @@ pub fn favs(l: &FavLook, t: &Theme) -> Canvas {
     let p = Px::new(bar, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.clear(t.panel);
+    c.clear(hud::glass(t, Glass::Bar));
     let line = p.r(Rect { y: bar.y + bar.h - 1, h: 1, ..bar });
     c.fill(0, line.y, w, line.h.max(1), t.line);
     let f = fav_font(t);
@@ -167,6 +205,8 @@ pub struct ListLook {
     pub theme: u64,
     /// Name and "2 Kacheln · 3 Tabs" per workspace.
     pub entries: Vec<(String, String)>,
+    /// WY-12: the minimised windows' names (title, else program), oldest first.
+    pub minimized: Vec<String>,
     pub active: usize,
     pub hover: Option<Part>,
 }
@@ -176,11 +216,11 @@ pub fn list(l: &ListLook, t: &Theme) -> Canvas {
     let p = Px::new(c0.list, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.clear(t.panel);
+    // Glass when docked over the wallpaper; revealed over the tiles it is the same colour, solid.
+    c.clear(hud::glass_for(t, Glass::Bar, !c0.list_docked));
     let edge = p.r(Rect { x: c0.list.x + c0.list.w - 1, w: 1, ..c0.list });
     c.fill(edge.x, 0, edge.w.max(1), h, t.line);
-    let head = font(t, 11.0, Weight::SemiBold).spaced(0.12);
-    c.text_fit(&head, p.r(c0.ws_title), "ARBEITSRÄUME", t.muted);
+    c.text_fit(&label(t), p.r(c0.ws_title), "ARBEITSRÄUME", t.muted);
     // WY-5c: the fold button at the list's top edge; on a list revealed over the tiles it pins the list.
     let fb = p.b(c0.ws_fold);
     let on = l.hover == Some(Part::WsFold);
@@ -209,7 +249,7 @@ pub fn list(l: &ListLook, t: &Theme) -> Canvas {
             c.text_fit(if active { &name_on } else { &name }, inner, n, t.text);
         }
     }
-    if c0.ws_new.y + c0.ws_new.h <= c0.home.y {
+    if c0.ws_new.y + c0.ws_new.h <= c0.list_end() {
         let b = p.b(c0.ws_new);
         if l.hover == Some(Part::WsNew) {
             c.rrect(b, p.v(10.0), t.panel2);
@@ -217,6 +257,19 @@ pub fn list(l: &ListLook, t: &Theme) -> Canvas {
         dashed(&mut c, b, p.v(10.0), p.line(), t, if l.hover == Some(Part::WsNew) { t.panel2 } else { t.panel });
         let r = p.r(Rect { x: c0.ws_new.x + 12, w: c0.ws_new.w - 24, ..c0.ws_new });
         c.text_fit(&font(t, 14.0, Weight::Regular), r, "+ Neuer Arbeitsraum", t.muted);
+    }
+    if !c0.min_items.is_empty() {
+        c.text_fit(&label(t), p.r(c0.min_title), "MINIMIERT", t.muted);
+    }
+    for (i, (r, n)) in c0.min_items.iter().zip(&l.minimized).enumerate() {
+        let b = p.b(*r);
+        if l.hover == Some(Part::Min(i)) {
+            c.rrect(b, p.v(10.0), t.panel2);
+        }
+        let ib = Box2 { x: b.x + p.v(8.0), y: b.y + (b.h - p.v(18.0)) / 2.0, w: p.v(18.0), h: p.v(18.0) };
+        glyph_into(&mut c, Glyph::Restore, ib, t.muted);
+        let tx = r.x + 34;
+        c.text_fit(&name, p.r(Rect { x: tx, w: r.x + r.w - 8 - tx, ..*r }), n, t.text);
     }
     let hb = p.r(c0.home);
     if l.hover == Some(Part::Home) {
@@ -252,6 +305,8 @@ pub struct SideLook {
     pub theme: u64,
     pub name: String,
     pub ring: Ring,
+    /// Revealed over the tiles: solid glass.
+    pub solid: bool,
 }
 
 /// The line the sidebar shows until the conversation comes (CL-3): no made-up chat.
@@ -263,14 +318,13 @@ pub fn side(l: &SideLook, t: &Theme) -> Canvas {
     let p = Px::new(l.rect, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.clear(t.panel);
+    c.clear(hud::glass_for(t, Glass::Bar, l.solid));
     c.fill(0, 0, p.line().round() as i32, h, t.line);
     let r = l.rect;
-    let ring = p.r(Rect { x: r.x + 16, y: r.y + 18, w: 44, h: 44 });
-    crate::ring::draw(&mut c, ring.x as f32 + ring.w as f32 / 2.0, ring.y as f32 + ring.h as f32 / 2.0, p.v(44.0) * 48.0 / 44.0 * 0.92, l.ring, 0.0, t);
+    // The ring is its own sprite over this image (`ring_sprite` at `side_ring_rect`).
     let tx = r.x + 16 + 44 + 12;
     c.text_fit(&font(t, 16.0, Weight::SemiBold), p.r(Rect { x: tx, y: r.y + 20, w: r.w - (tx - r.x) - 16, h: 22 }), &l.name, t.text);
-    let state = font(t, 12.0, Weight::Regular).spaced(0.06);
+    let state = label(t);
     c.text_fit(&state, p.r(Rect { x: tx, y: r.y + 42, w: r.w - (tx - r.x) - 16, h: 16 }), l.ring.word(), t.accent);
     let note = Rect { x: r.x + 16, y: r.y + 18 + 44 + 14, w: r.w - 32, h: 0 };
     let f = font(t, 14.0, Weight::Regular);
@@ -278,7 +332,12 @@ pub fn side(l: &SideLook, t: &Theme) -> Canvas {
     let lh = p.v(21.0) as i32;
     let nb = p.r(Rect { h: 24, ..note });
     let bh = lines.len() as i32 * lh + p.v(24.0) as i32;
-    c.rrect(Box2 { h: bh as f32, ..Box2::of(nb) }, p.v(12.0), t.panel2);
+    // The Randnotiz card (Main.dc.html's aside): raised shadow, accent-soft glass, accent edge, HUD brackets.
+    let card = Box2 { h: bh as f32, ..Box2::of(nb) };
+    hud::shadow(&mut c, card, p.v(12.0), &t.shadow_raised, t);
+    c.rrect(card, p.v(12.0), alpha(t.accent_soft, 0.75));
+    c.rrect_line(card, p.v(12.0), p.line(), alpha(t.accent, 0.35));
+    hud::brackets(&mut c, card, t);
     for (i, line) in lines.iter().enumerate() {
         c.text(&f, nb.x + p.v(14.0) as i32, nb.y + p.v(12.0) as i32 + i as i32 * lh + (lh - f.height()) / 2, line, t.text);
     }
@@ -306,6 +365,8 @@ pub struct StatusLook {
     pub theme: u64,
     pub blocks: Vec<Block>,
     pub clock: String,
+    /// MC-9b: "Claude darf: installieren bis 08:00" while a grant runs.
+    pub grant: Option<String>,
 }
 
 /// Logical pixels above the status bar its image covers, for the glow lines going up.
@@ -317,7 +378,7 @@ pub fn status(l: &StatusLook, t: &Theme) -> Canvas {
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
     let bar = p.r(l.rect);
-    c.fill(0, bar.y, w, h - bar.y, t.panel);
+    c.fill(0, bar.y, w, h - bar.y, hud::glass(t, Glass::Bar));
     let line = p.line().round() as i32;
     c.fill(0, bar.y, w, line, t.accent);
     for (i, a) in [t.glow, t.glow_soft].into_iter().enumerate() {
@@ -327,7 +388,17 @@ pub fn status(l: &StatusLook, t: &Theme) -> Canvas {
     let value = font(t, 13.0, Weight::Medium);
     let mut x = bar.x + p.v(16.0) as i32;
     let right = bar.x + bar.w - p.v(16.0) as i32;
-    let clock_w = label.width(&l.clock);
+    let mut clock_w = label.width(&l.clock);
+    if let Some(g) = &l.grant {
+        // A chip in the "waiting for Georg" colour left of the clock: visible while the grant runs.
+        let gw = value.width(g).min((right - x) / 2).max(0);
+        let chip = Rect { x: right - clock_w - p.v(22.0) as i32 - gw - p.v(20.0) as i32, w: gw + p.v(20.0) as i32, ..bar };
+        let b = crate::canvas::Box2 { x: chip.x as f32, y: chip.y as f32 + p.v(5.0), w: chip.w as f32, h: chip.h as f32 - p.v(10.0) };
+        c.rrect(b, p.v(8.0), alpha(t.warm, 0.22));
+        c.rrect_line(b, p.v(8.0), p.line(), t.warm);
+        c.text_mid(&value, chip, g, t.text);
+        clock_w += chip.w + p.v(22.0) as i32;
+    }
     for b in &l.blocks {
         let need = label.width(&b.label) + p.v(5.0) as i32 + value.width(&b.value);
         if x + need > right - clock_w - p.v(22.0) as i32 {
@@ -336,7 +407,8 @@ pub fn status(l: &StatusLook, t: &Theme) -> Canvas {
         x += c.text_fit(&label, Rect { x, w: need, ..bar }, &b.label, t.muted) + p.v(5.0) as i32;
         x += c.text_fit(&value, Rect { x, w: need, ..bar }, &b.value, t.text) + p.v(22.0) as i32;
     }
-    c.text_right(&label, Rect { x: right - clock_w, w: clock_w, ..bar }, &l.clock, t.text);
+    let cw = label.width(&l.clock);
+    c.text_right(&label, Rect { x: right - cw, w: cw, ..bar }, &l.clock, t.text);
     c
 }
 
@@ -356,11 +428,11 @@ pub fn suggest(l: &SuggestLook, t: &Theme) -> Canvas {
     let mut c = Canvas::new(w, h);
     let all = Box2 { x: 0.0, y: 0.0, w: w as f32, h: h as f32 };
     c.rrect(all, p.v(12.0), t.panel);
-    let head = font(t, 11.0, Weight::SemiBold).spaced(0.12);
+    let head = label(t);
     let (name, addr) = (font(t, 15.0, Weight::Regular), font(t, 12.0, Weight::Regular));
     for (i, ((hd, r), row)) in l.rows.iter().zip(&l.items).enumerate() {
         if let Some(hr) = hd {
-            c.text_fit(&head, p.r(Rect { x: hr.x + 14, y: hr.y + 8, w: hr.w - 28, h: hr.h - 8 }), row.group, t.muted);
+            c.text_fit(&head, p.r(Rect { x: hr.x + 14, y: hr.y + 8, w: hr.w - 28, h: hr.h - 8 }), &Theme::label(Style::Label, row.group), t.muted);
         }
         let rr = p.r(*r);
         if l.pick == Some(i) || l.hover == Some(i) {

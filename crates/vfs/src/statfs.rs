@@ -99,6 +99,8 @@ pub fn of(sb: &SuperBlock, readonly: bool) -> Result<StatFs, Errno> {
             "proc" => StatFs::simple(PROC_SUPER_MAGIC),
             "sysfs" => StatFs::simple(SYSFS_MAGIC),
             "devpts" => StatFs::simple(DEVPTS_SUPER_MAGIC),
+            // SX-3a: `MQUEUE_MAGIC`.
+            "mqueue" => StatFs::simple(0x1980_0202),
             "tmpfs" | "devtmpfs" => tmpfs(sb),
             other => {
                 // A pseudo file system without its magic here: simple_statfs with type 0, never tmpfs's.

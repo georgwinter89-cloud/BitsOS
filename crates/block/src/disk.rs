@@ -157,6 +157,14 @@ struct Queue {
     /// Queued and in-flight requests.
     reqs: Vec<Arc<Req>>,
     stopped: bool,
+    /// RB-14: closed by the storage stop before a reset (`shutdown`): new requests are held back (`held`), the
+    /// dispatcher runs on for what was queued before, `reopen` undoes it.
+    closed: bool,
+    /// RB-14: requests submitted while closed, oldest first. They never reach the device before `reopen` queues
+    /// them; their waiters keep their own deadline (`cancel` takes them out), `stop` fails them with `Gone`.
+    /// Held rather than refused: a Reload that does not jump resumes, and a write refused in the stop's few
+    /// milliseconds would have turned ext4 read-only (errors=remount-ro) for the rest of the boot.
+    held: Vec<(Entry, Arc<Req>)>,
 }
 
 struct TableState {
@@ -231,6 +239,10 @@ pub struct Disk {
     stats: Stats,
     /// One bit per refusal reason already logged (one `write.refused` event per reason and disk).
     logged: AtomicU32,
+    /// RB-14: a write completed since boot / since the last completed flush, and when the last one completed.
+    written: AtomicBool,
+    dirty: AtomicBool,
+    last_write_ns: AtomicU64,
 }
 
 /// A queued request; `wait` gives its data back (the bytes read, or the buffer written).
@@ -288,7 +300,7 @@ impl Disk {
             dev,
             kind,
             block_size: info.block_size,
-            q: SpinLock::named("block.queue", Queue { elev: Elevator::new(), reqs: Vec::new(), stopped: false }),
+            q: SpinLock::named("block.queue", Queue { elev: Elevator::new(), reqs: Vec::new(), stopped: false, closed: false, held: Vec::new() }),
             work: WaitQueue::new(),
             next_id: AtomicU64::new(1),
             table: SpinLock::named("block.table", TableState { scan: Scan::default(), blocks: info.blocks, stick: StickMatch::Unknown }),
@@ -300,6 +312,9 @@ impl Disk {
             timeout_ns: AtomicU64::new(DEFAULT_TIMEOUT_NS),
             stats: Stats::default(),
             logged: AtomicU32::new(0),
+            written: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            last_write_ns: AtomicU64::new(0),
         });
         d.start(dispatch);
         d.rescan();
@@ -518,10 +533,21 @@ impl Disk {
             if q.stopped {
                 return Err(BlockError::Gone);
             }
+            let entry = Entry { id, kind, lba, blocks, prio, at_ns: now() };
+            if q.closed {
+                if q.held.try_reserve(1).is_err() {
+                    return Err(BlockError::NoMemory);
+                }
+                q.held.push((entry, req.clone()));
+                drop(q);
+                SUBMITTED.inc();
+                self.stats.requests.fetch_add(1, Ordering::Relaxed);
+                return Ok(Ticket { disk: self.clone(), req });
+            }
             if q.reqs.try_reserve(1).is_err() {
                 return Err(BlockError::NoMemory);
             }
-            if q.elev.push(Entry { id, kind, lba, blocks, prio, at_ns: now() }).is_err() {
+            if q.elev.push(entry).is_err() {
                 return Err(BlockError::NoMemory);
             }
             q.reqs.push(req.clone());
@@ -579,7 +605,8 @@ impl Disk {
         self.submit(Kind::Write { fua, preflush: false }, lba, 0, Data::Pages(segs), prio)?.wait().map(|_| ())
     }
 
-    /// The device cache flushed, then `data` written ("flush with data", a journal commit).
+    /// The device cache flushed, then `data` written ("flush with data", a journal commit). Tests only until NV-2
+    /// makes /data on NVMe writable and ext4's disk commit uses it (FS-8b open point 2, C1).
     pub fn write_preflush(self: &Arc<Self>, lba: u64, data: Vec<u8>, fua: bool, prio: IoPriority) -> Result<(), BlockError> {
         self.submit(Kind::Write { fua, preflush: true }, lba, 0, Data::Bytes(data), prio)?.wait().map(|_| ())
     }
@@ -701,7 +728,11 @@ impl Disk {
             if self.dispatching.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 self.drain();
                 self.dispatching.store(false, Ordering::Release);
-                continue;
+                if req.done.is_done() {
+                    return true;
+                }
+                // Not queued at all (RB-14: held back by a closed disk): wait out the deadline below, do not
+                // spin on an empty queue.
             }
             // Without a clock (host) the deadline counts polls instead.
             let elapsed = match ksync::now_ns() {
@@ -728,7 +759,9 @@ impl Disk {
             if r {
                 q.reqs.retain(|x| x.id != req.id);
             }
-            r
+            let before = q.held.len();
+            q.held.retain(|(e, _)| e.id != req.id);
+            r || q.held.len() != before
         };
         if removed {
             TIMEOUTS.inc();
@@ -791,6 +824,7 @@ impl Disk {
 
     fn done(&self, req: &Arc<Req>, r: Result<(), BlockError>) {
         if r.is_ok() {
+            self.note_done(req.kind);
             let bytes = req.blocks * self.block_size as u64;
             match req.kind {
                 Kind::Read => self.stats.read_bytes.fetch_add(bytes, Ordering::Relaxed),
@@ -888,10 +922,14 @@ impl Disk {
             q.stopped = true;
         }
         self.fail_queued();
+        let held = core::mem::take(&mut self.q.lock().held);
+        for (_, r) in &held {
+            self.finish(r, Err(BlockError::Gone));
+        }
         self.work.wake_all();
     }
 
-    fn fail_queued(&self) {
+    fn fail_queued(&self) -> usize {
         let failed: Vec<Arc<Req>> = {
             let mut q = self.q.lock();
             let ids: Vec<u64> = q.elev.entries().iter().map(|e| e.id).collect();
@@ -907,6 +945,96 @@ impl Disk {
         for r in &failed {
             self.finish(r, Err(BlockError::Gone));
         }
+        failed.len()
+    }
+
+    // ---- RB-14: the storage stop before a reset (`crate::shutdown`)
+
+    /// What a completed request leaves for the stop: a write makes the device cache dirty (a FUA write is
+    /// durable itself but leaves the others as they were), a flush cleans it. One dispatcher (or one inline
+    /// waiter) runs the batches one at a time, so no write completes while a flush is at the device.
+    fn note_done(&self, kind: Kind) {
+        match kind {
+            Kind::Write { fua, .. } => {
+                self.written.store(true, Ordering::Release);
+                self.last_write_ns.store(now(), Ordering::Release);
+                if !fua {
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+            Kind::Flush => self.dirty.store(false, Ordering::Release),
+            Kind::Read | Kind::Discard => {}
+        }
+    }
+
+    /// Holds new requests back from now on (they wait for `reopen`); what is queued still runs. Returns
+    /// (queued, at the device).
+    pub fn close(&self) -> (usize, usize) {
+        let mut q = self.q.lock();
+        q.closed = true;
+        let queued = q.elev.entries().len();
+        (queued, q.reqs.len().saturating_sub(queued))
+    }
+
+    /// Takes requests again (a Reload that did not happen, ktests): the held ones are queued in their order.
+    pub fn reopen(&self) {
+        let mut lost: Vec<Arc<Req>> = Vec::new();
+        let queued = {
+            let mut q = self.q.lock();
+            q.closed = false;
+            let held = core::mem::take(&mut q.held);
+            let n = held.len();
+            for (e, r) in held {
+                if q.reqs.try_reserve(1).is_err() || q.elev.push(e).is_err() {
+                    let _ = lost.try_reserve(1).map(|()| lost.push(r));
+                    continue;
+                }
+                q.reqs.push(r);
+            }
+            n
+        };
+        for r in &lost {
+            self.finish(r, Err(BlockError::NoMemory));
+        }
+        if queued > 0 && self.mode.load(Ordering::Acquire) == MODE_THREAD {
+            self.work.wake_all();
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.q.lock().closed
+    }
+
+    /// (queued, at the device): requests not answered yet (without the ones held back by `close`).
+    pub fn pending(&self) -> (usize, usize) {
+        let q = self.q.lock();
+        let queued = q.elev.entries().len();
+        (queued, q.reqs.len().saturating_sub(queued))
+    }
+
+    /// Fails what is still queued (not at the device, not held) with `Gone`; returns how many.
+    pub fn fail_waiting(&self) -> usize {
+        self.fail_queued()
+    }
+
+    /// (a write completed since boot, a write completed after the last flush, when the last write completed).
+    pub fn write_state(&self) -> (bool, bool, u64) {
+        (self.written.load(Ordering::Acquire), self.dirty.load(Ordering::Acquire), self.last_write_ns.load(Ordering::Acquire))
+    }
+
+    /// Requests held back by `close`.
+    pub fn held(&self) -> usize {
+        self.q.lock().held.len()
+    }
+
+    /// The stop's cache flush (Linux `sd_shutdown` -> `sd_sync_cache`): straight to the device, past the closed
+    /// queue. Only after `pending` read (0, 0): nothing of this disk is at the device then.
+    pub fn shutdown_flush(&self) -> Result<(), BlockError> {
+        let r = self.dev.flush().map_err(BlockError::from_dev);
+        if r.is_ok() {
+            self.dirty.store(false, Ordering::Release);
+        }
+        r
     }
 }
 

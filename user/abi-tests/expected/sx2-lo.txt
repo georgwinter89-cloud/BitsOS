@@ -1,0 +1,105 @@
+initial namespace: /proc/net/tcp yes
+unshare(CLONE_NEWUSER|CLONE_NEWNET) = 0
+/proc/net/dev: 3 lines, width plain: Inter-|   Receive                                                |  Transmit
+  dev lo: 16 fields, counters zero yes
+/proc/net/route: 0 lines, width plain: 
+/proc/net/tcp: 1 lines, width padded:   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+/proc/net/udp: 1 lines, width padded:    sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+/proc/net/unix: 1 lines, width plain: Num       RefCount Protocol Flags    Type St Inode Path
+/proc/net/dhcp: -ENOENT
+/proc/net/if_inet6:
+/sys/class/net/lo/mtu: 65536
+down: RTM_NEWADDR 198.51.100.1/24 = 0
+down: bind 198.51.100.1 = 0
+down: bind 198.51.100.7 = -EADDRNOTAVAIL
+down: bind 127.0.0.1 = -EADDRNOTAVAIL
+down: sendto 198.51.100.1 = 1
+down: sendto 198.51.100.7 = -ENETUNREACH
+RTM_NEWADDR 198.51.100.1/24 again = -EEXIST
+RTM_NEWADDR 198.51.100.1/24 replace = 0
+RTM_NEWADDR prefix 33 = -EINVAL
+SIOCSIFFLAGS lo up = 0
+IPv4 after up:
+  127.0.0.1/8 scope 254 flags 0x80 label lo proto -1
+  198.51.100.1/24 scope 0 flags 0x80 label lo proto -1
+IPv6 after up:
+  ::1/128 scope 254 flags 0x80 label - proto 1
+/proc/net/if_inet6:
+  00000000000000000000000000000001 01 80 10 80       lo
+SIOCGIFADDR lo = 0
+  127.0.0.1
+SIOCGIFNETMASK lo = 0
+  255.0.0.0
+up: bind 198.51.100.7 = 0
+up: bind 127.0.0.9 = 0
+up: bind 10.0.0.1 = -EADDRNOTAVAIL
+SIOCSIFADDR lo:1 192.0.2.9 = 0
+SIOCSIFNETMASK lo:1 255.255.255.128 = 0
+SIOCSIFNETMASK lo:1 255.0.255.0 = -EINVAL
+SIOCGIFADDR lo:1 = 0
+  192.0.2.9
+SIOCGIFNETMASK lo:1 = 0
+  255.255.255.128
+SIOCSIFADDR lo:2 224.0.0.9 = -EINVAL
+SIOCSIFBRDADDR lo:3 (no such alias) = -EADDRNOTAVAIL
+RTM_NEWADDR 127.0.0.2/8 host = 0
+RTM_NEWADDR 127.0.0.3/8 global = -EINVAL
+IPv4 with aliases:
+  127.0.0.1/8 scope 254 flags 0x80 label lo proto -1
+  198.51.100.1/24 scope 0 flags 0x80 label lo proto -1
+  192.0.2.9/25 scope 0 flags 0x80 label lo:1 proto -1
+  127.0.0.2/8 scope 254 flags 0x81 label lo proto -1
+SIOCSIFADDR lo:4 192.0.2.44 = 0
+SIOCSIFADDR lo:4 127.0.0.2 (taken) = -EEXIST
+SIOCGIFADDR lo:4 = -EADDRNOTAVAIL
+bind 0.0.0.0:24601 = 0
+sendto 192.0.2.77:24601 = 2
+recvfrom = 2
+  from 192.0.2.9
+tcp bind 127.0.0.1:24602 = 0
+tcp listen = 0
+unix bind @abi-ns-lo = 0
+unix listen = 0
+/proc/net/tcp rows:
+  0100007F:601A 00000000:0000 st 0A uid 65534
+/proc/net/udp rows:
+  00000000:6019 00000000:0000 st 07 uid 65534
+/proc/net/unix rows:
+  flags 00010000 type 0001 st 01 path @abi-ns-lo
+/proc/net/route: 1 lines, width padded: Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT
+SIOCSIFFLAGS lo:1 down = 0
+SIOCSIFFLAGS lo:1 down again = -EADDRNOTAVAIL
+RTM_DELADDR 127.0.0.1/8 = 0
+RTM_DELADDR 127.0.0.1/8 again = -EADDRNOTAVAIL
+IPv4 after the deletions:
+  127.0.0.2/8 scope 254 flags 0x80 label lo proto -1
+  198.51.100.1/24 scope 0 flags 0x80 label lo proto -1
+bind 127.0.0.9 without 127.0.0.1/8 = 0
+SIOCSIFTXQLEN lo 5 = -EPERM
+SIOCGIFTXQLEN lo = 0
+  qlen 1000
+SIOCSIFMTU lo -1 = -EINVAL
+SIOCSIFMTU lo 60 = 0
+IPv4 at MTU 60:
+IPv6 at MTU 60:
+RTM_NEWADDR at MTU 60 = -errno 105
+SIOCSIFMTU lo 1500 = 0
+SIOCGIFMTU lo = 0
+  mtu 1500
+IPv4 at MTU 1500:
+IPv6 at MTU 1500:
+SIOCSIFFLAGS lo down = 0
+IPv6 down:
+/proc/net/if_inet6:
+SIOCSIFFLAGS lo up = 0
+IPv4 up again:
+  127.0.0.1/8 scope 254 flags 0x80 label lo proto -1
+IPv6 up again:
+  ::1/128 scope 254 flags 0x80 label - proto 1
+SIOCSIFFLAGS lo down = 0
+down again: bind 127.0.0.9 = 0
+down again: sendto 127.0.0.9 = 1
+/sys/class/net/lo/mtu: 65536
+/proc/self/net/dev is /proc/net/dev: yes
+the parent's net/dev lists more cards: yes
+inside: exit 0

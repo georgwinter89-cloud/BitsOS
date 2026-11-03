@@ -6,26 +6,30 @@
 //!   reads zero for anonymous memory, the file's content for a file mapping. The commit stays (Linux).
 //! - FREE: anonymous memory only (else EINVAL); freed at once (Linux frees lazily under memory pressure, V2 has
 //!   no reclaim, so it gives the memory back now; the content after FREE is undefined on both).
-//! - WILLNEED, COLD, PAGEOUT, NORMAL/RANDOM/SEQUENTIAL, MERGEABLE/UNMERGEABLE, HUGEPAGE/NOHUGEPAGE, DONTDUMP/DODUMP:
-//!   accepted (no swap, no KSM, no huge pages, no core dumps in V2), with Linux's refusals for device VMAs.
+//! - WILLNEED, COLD, PAGEOUT, MERGEABLE/UNMERGEABLE, DONTDUMP/DODUMP: accepted (no swap, no KSM, no core dumps in
+//!   V2), with Linux's refusals for device VMAs.
+//! - NORMAL/RANDOM/SEQUENTIAL: Linux's VM_RAND_READ/VM_SEQ_READ, HUGEPAGE/NOHUGEPAGE: VM_HUGEPAGE/VM_NOHUGEPAGE
+//!   (split at the range like Linux; MM-13: a huge page the split cuts is split first; HUGEPAGE is what mode
+//!   `madvise` asks for, NOHUGEPAGE keeps the VMA page by page). RANDOM and NOHUGEPAGE switch the anonymous
+//!   fault-around (MM-12) off for the VMA; NORMAL, SEQUENTIAL and HUGEPAGE leave it on.
 //! - DONTFORK/DOFORK, WIPEONFORK/KEEPONFORK: VMA flags `fork` obeys (split at the range like Linux).
 //! - POPULATE_READ/WRITE: faults the pages in (a write breaks copy-on-write); EINVAL without the right, EFAULT
 //!   for a page past the end of a file.
 //! - REMOVE: EINVAL/EACCES as Linux; on a shared mapping of a writable fd the cached pages of the range are
 //!   zeroed, so every mapping and read(2) sees zeros as after Linux's hole punch; the frames stay until the page
 //!   cache can punch holes (FS change request), the file size stays.
-//! - COLLAPSE: EINVAL (no huge pages). HWPOISON/SOFT_OFFLINE: EPERM (`plan_madvise`).
+//! - COLLAPSE: EINVAL (MM-13 has no khugepaged and no synchronous collapse). HWPOISON/SOFT_OFFLINE: EPERM (`plan_madvise`).
 //!
 //! Device VMAs count as Linux's VM_PFNMAP|VM_IO|VM_DONTEXPAND: DONTNEED/FREE/COLD/PAGEOUT/POPULATE, DOFORK and
 //! DODUMP are EINVAL there.
 
-use super::{AsCore, Inner};
+use super::{AsCore, Inner, Zap};
 use crate::fault::FaultReason;
 use crate::linux::{madv, plan_madvise, Errno};
 use crate::vma::Vma;
 use crate::PAGE;
 use alloc::vec::Vec;
-use hal::paging::{self, PageFlags};
+use hal::paging::{self, tlb, PageFlags};
 
 klog::counter!(DONTNEED_CALLS, "mm.as.dontneed_calls");
 
@@ -66,6 +70,18 @@ impl AsCore {
     pub fn sys_madvise(&self, start: u64, len: u64, behavior: u64) -> Result<(), Errno> {
         let Some((start, end)) = plan_madvise(start, len, behavior)? else { return Ok(()) };
         let mut g = self.inner.lock();
+        // MM-11: what DONTNEED and FREE take out of every VMA of the call goes in one round, also when a later
+        // VMA ends the walk with an error (the earlier ones changed, as in Linux's `madvise_walk_vmas`).
+        let zaps = matches!(behavior, madv::DONTNEED | madv::DONTNEED_LOCKED | madv::FREE);
+        let mut z = zaps.then(|| Zap::begin(self, &g, tlb::Cause::Madvise));
+        let r = self.advise_range(&mut g, start, end, behavior, z.as_mut());
+        if let Some(z) = z {
+            self.zap_end(&mut g, z);
+        }
+        r
+    }
+
+    fn advise_range(&self, g: &mut Inner, start: u64, end: u64, behavior: u64, mut z: Option<&mut Zap>) -> Result<(), Errno> {
         let mut at = start;
         let mut unmapped = false;
         loop {
@@ -78,7 +94,7 @@ impl AsCore {
                 }
             }
             let to = v.end.min(end);
-            self.advise_one(&mut g, &v, at, to, behavior)?;
+            self.advise_one(g, &v, at, to, behavior, z.as_deref_mut())?;
             at = to;
             if at >= end {
                 break;
@@ -87,16 +103,26 @@ impl AsCore {
         if unmapped { Err(Errno::NoMem) } else { Ok(()) }
     }
 
-    fn advise_one(&self, g: &mut Inner, v: &Vma, s: u64, e: u64, behavior: u64) -> Result<(), Errno> {
+    fn advise_one(&self, g: &mut Inner, v: &Vma, s: u64, e: u64, behavior: u64, z: Option<&mut Zap>) -> Result<(), Errno> {
         let device = v.file.as_ref().is_some_and(|f| f.device.is_some());
-        let set = |g: &mut Inner, f: &mut dyn FnMut(&mut Vma)| g.space.tree.update(s, e, f).map_err(|_| Errno::Again);
+        // MM-13: advice that splits the VMA at an unaligned address splits the 2 MiB leaf there first (Linux
+        // `__split_vma` -> `vma_adjust_trans_huge`), so a huge leaf never spans two VMAs.
+        let set = |g: &mut Inner, f: &mut dyn FnMut(&mut Vma)| {
+            self.split_edges(g, s, e, tlb::Cause::Madvise);
+            g.space.tree.update(s, e, f).map_err(|_| Errno::Again)
+        };
         match behavior {
             madv::DONTNEED | madv::DONTNEED_LOCKED | madv::FREE => {
                 if device || (behavior == madv::FREE && v.file.is_some()) {
                     return Err(Errno::Inval);
                 }
                 let segs = Self::segments(g, s, e)?;
-                self.unmap_pages(g, s, e, &segs);
+                // The VMA stays: no page table is freed (Linux's `zap_page_range_single`), so the round need not
+                // ask CPUs that hold the space lazily.
+                match z {
+                    Some(z) => self.zap_pages(g, z, s, e, &segs, (0, 0)),
+                    None => self.unmap_pages(g, s, e, &segs, tlb::Cause::Madvise, (0, 0)),
+                }
                 DONTNEED_CALLS.inc();
                 Ok(())
             }
@@ -114,6 +140,13 @@ impl AsCore {
                 }
             },
             madv::DODUMP if device => Err(Errno::Inval),
+            // linux-6.6/mm/madvise.c:1049-1057: each one clears the other.
+            madv::NORMAL => set(g, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (false, false)),
+            madv::RANDOM => set(g, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (true, false)),
+            madv::SEQUENTIAL => set(g, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (false, true)),
+            // linux-6.6/mm/khugepaged.c:352-373 (`hugepage_madvise`).
+            madv::HUGEPAGE => set(g, &mut |x| (x.flags.hugepage, x.flags.nohugepage) = (true, false)),
+            madv::NOHUGEPAGE => set(g, &mut |x| (x.flags.hugepage, x.flags.nohugepage) = (false, true)),
             madv::DONTFORK => set(g, &mut |x| x.flags.dontfork = true),
             madv::DOFORK if device => Err(Errno::Inval),
             madv::DOFORK => set(g, &mut |x| x.flags.dontfork = false),
@@ -139,6 +172,13 @@ impl AsCore {
         let mut va = s;
         while va < e {
             match paging::translate(self.root, va) {
+                // MM-13: a written aligned 2 MiB takes a huge page, as Linux's populate faults do.
+                None if write
+                    && let Some(base) = self.huge_base(g, v, va)
+                    && self.fill_huge_now(g, base, v) =>
+                {
+                    continue
+                }
                 None => self.fill_at(va, v, write).map_err(err)?,
                 Some((phys, fl)) if write && !fl.contains(PageFlags::WRITABLE) => self.write_present(g, va, v, phys).map_err(err)?,
                 Some(_) => {}

@@ -4,6 +4,7 @@
 //! and wakes a reader blocked in another thread. Every connection is recorded for the connection view (B3).
 
 use super::iface::{self, Iface};
+use super::quickack::{Mode, QuickAck};
 use super::wake::{SockWake, WAKE_SLICE_NS};
 use super::Stack;
 use crate::{NetError, SockAddr, TcpStream};
@@ -25,6 +26,14 @@ pub const CONNECT_TX: usize = 128 * 1024;
 pub const FETCH_RX: usize = 1024 * 1024;
 /// No progress for this long ends a connection with RST (V1 `tcpstall.asm`: 30 s).
 const STALL_S: u64 = 30;
+/// smoltcp's delayed ACK (its `ACK_DELAY_DEFAULT`), what an outgoing connection returns to after quick mode.
+const ACK_DELAY: Duration = Duration::from_millis(10);
+
+fn ack_delay(m: Mode) -> Option<Duration> {
+    if m == Mode::Quick { None } else { Some(ACK_DELAY) }
+}
+
+klog::counter!(QUICKACK_AGAIN, "net.tcp.quickack_again");
 
 /// V1 `tcpstall.asm`, spec §2.4: 30 s **without progress** end a connection, i.e. a handshake or data the peer
 /// does not acknowledge. smoltcp's timeout counts from the peer's last packet whenever it is set, so an idle
@@ -68,8 +77,8 @@ pub(crate) fn tune(s: &mut stcp::Socket<'static>) {
 
 /// Listening sockets (services: MCP) also ACK at once instead of after smoltcp's 10 ms: a client that still uses
 /// Nagle sends the tail of a request only after our ACK of the segment before (node/Windows), and an answer must
-/// not wait for that. Costs one bare ACK per request segment; outgoing connections (downloads) keep the delay,
-/// which halves the ACKs of a bulk transfer.
+/// not wait for that. Costs one bare ACK per request segment; outgoing connections (downloads) ACK at once only
+/// in Linux's quick mode (NW-10, `quickack`) and keep the delay after it, which halves the ACKs of a bulk transfer.
 pub(crate) fn tune_listen(s: &mut stcp::Socket<'static>) {
     tune(s);
     s.set_ack_delay(None);
@@ -107,6 +116,8 @@ pub struct SmolStream {
     established: AtomicBool,
     /// When the SYN left (a connect that ends after the stall time failed by timeout).
     started_ns: AtomicU64,
+    /// NW-10: Linux's quick-ACK mode of an outgoing connection (None: accepted ones ACK at once, `tune_listen`).
+    quick: Option<QuickAck>,
 }
 
 /// B3: the connection view's entry opens once (Opened or Accepted, with its event record) and ends with the
@@ -131,7 +142,7 @@ fn addr(e: IpEndpoint) -> SockAddr {
 }
 
 impl SmolStream {
-    fn new(stack: &'static Stack, iface: Arc<Iface>, handle: SocketHandle, local: SockAddr, peer: SockAddr, kept: bool) -> Self {
+    fn new(stack: &'static Stack, iface: Arc<Iface>, handle: SocketHandle, local: SockAddr, peer: SockAddr, kept: bool, quick: bool) -> Self {
         let wake = SockWake::new(stack.wakes.clone());
         SmolStream {
             waker: Waker::from(wake.clone()),
@@ -150,12 +161,24 @@ impl SmolStream {
             subject: ksync::SpinLock::named("net.tcp.owner", policy::Subject::KERNEL),
             established: AtomicBool::new(false),
             started_ns: AtomicU64::new(stack.now()),
+            quick: quick.then(|| QuickAck::new(stack.now())),
         }
+    }
+
+    /// NW-10: the reader took `n` bytes from `s` (this connection, under the card's lock): quick mode ends after
+    /// its budget and starts again after a quiet spell. Decided and set under the one lock, so with two readers
+    /// the delay set last is the state decided last (checker NW-10).
+    fn took(&self, s: &mut stcp::Socket<'static>, n: usize) {
+        let Some(q) = &self.quick else { return };
+        if q.took(n as u64, self.stack.now()) {
+            QUICKACK_AGAIN.inc();
+        }
+        s.set_ack_delay(ack_delay(q.mode()));
     }
 
     /// A connection a listening socket completed (called by the card's poll, under its lock).
     pub(crate) fn accepted(stack: &'static Stack, iface: Arc<Iface>, handle: SocketHandle, local: SockAddr, peer: SockAddr, kept: bool, owner: policy::Subject) -> Self {
-        let s = Self::new(stack, iface, handle, local, peer, kept);
+        let s = Self::new(stack, iface, handle, local, peer, kept, false);
         s.own(owner);
         s.established.store(true, Ordering::Release);
         record(policy::ConnKind::Accepted, &s);
@@ -186,7 +209,9 @@ impl SmolStream {
                 self.fin_seen.store(true, Ordering::Release);
             }
             if s.can_recv() {
-                return s.recv_slice(buf).map(Some).map_err(|_| NetError::ConnectionReset);
+                let n = s.recv_slice(buf).map_err(|_| NetError::ConnectionReset)?;
+                self.took(s, n);
+                return Ok(Some(n));
             }
             match s.state() {
                 State::Closed if !self.fin_seen.load(Ordering::Acquire) => Err(NetError::ConnectionReset),
@@ -420,6 +445,8 @@ pub(crate) fn connect_start(stack: &'static Stack, to: SockAddr, local_port: Opt
                 }
             },
         };
+        // NW-10: quick mode from the first segment on (`quickack`).
+        sock.set_ack_delay(None);
         if sock.connect(inner.iface.context(), (iface::v4(to.ip), to.port), port).is_err() {
             // No source address on the card (the lease went in between).
             return Err(NetError::Unreachable);
@@ -428,7 +455,7 @@ pub(crate) fn connect_start(stack: &'static Stack, to: SockAddr, local_port: Opt
         (inner.sockets.add(sock), SockAddr { ip: local_ip, port })
     };
     super::TCP_CONNECTS.inc();
-    let s = SmolStream::new(stack, ifc, handle, local, to, false);
+    let s = SmolStream::new(stack, ifc, handle, local, to, false, true);
     s.own(owner);
     stack.kick();
     Ok(s)
@@ -478,6 +505,9 @@ impl crate::conn::Conn for SmolStream {
                     break;
                 }
                 done += k;
+            }
+            if done > 0 {
+                self.took(s, done);
             }
             done
         });
@@ -568,6 +598,21 @@ impl crate::conn::Conn for SmolStream {
 
     fn set_nodelay(&self, on: bool) {
         self.with(|s| s.set_nagle_enabled(!on));
+    }
+
+    /// TCP_QUICKACK (`__tcp_sock_set_quickack`, linux-6.6/net/ipv4/tcp.c:3259): 0 enters pingpong mode (delayed
+    /// ACKs), 1 leaves it. An outgoing connection keeps its quick budget; an accepted one goes between ACK at once
+    /// (`tune_listen`) and the delayed ACK. Linux sends an ACK that is due at once when it leaves pingpong; smoltcp
+    /// (pinned) keeps a running delayed-ACK timer, so that ACK goes out when the timer ends (10 ms at most).
+    fn set_quickack(&self, on: bool) {
+        self.with(|s| match &self.quick {
+            Some(q) => {
+                q.set_pingpong(!on);
+                s.set_ack_delay(ack_delay(q.mode()));
+            }
+            None => s.set_ack_delay(if on { None } else { Some(ACK_DELAY) }),
+        });
+        self.stack.kick();
     }
 
     fn set_keepalive(&self, on: bool) {

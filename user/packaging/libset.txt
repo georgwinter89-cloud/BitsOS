@@ -14,3 +14,18 @@ librt.so.1           always
 libgcc_s.so.1        always
 # Always (UL-5 fixer): C++ programs put on the stick or written over MCP later (Node, Brave, PK-4) need it.
 libstdc++.so.6       always
+# INT-W27b (SX-3c CR1): the rest of CachyOS's glibc package (1.5 MB), so a runtime that brings its own libraries on
+# top of the host's glibc finds every one (pressure-vessel's libgio links libresolv) and name services work as there.
+libanl.so.1          always
+libBrokenLocale.so.1 always
+libc_malloc_debug.so.0 always
+libmvec.so.1         always
+libnsl.so.1          always
+libnss_compat.so.2   always
+libnss_db.so.2       always
+libnss_dns.so.2      always
+libnss_files.so.2    always
+libnss_hesiod.so.2   always
+libresolv.so.2       always
+libthread_db.so.1    always
+libutil.so.1         always

@@ -30,3 +30,6 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
 [target.'cfg(target_os = "none")'.dependencies]
 ktest = { path = "../ktest" }
 mm-core = { path = "../mm-core" }
+
+[lints]
+workspace = true

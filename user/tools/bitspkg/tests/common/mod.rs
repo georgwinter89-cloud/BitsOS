@@ -16,6 +16,12 @@ pub fn tmp(name: &str) -> PathBuf {
     d
 }
 
+/// A short private folder for one test's Unix sockets (removed when dropped): a socket path under the cargo
+/// tmpdir is too long for sun_path in a normal checkout.
+pub fn sock_dir() -> bitspkg::clean::SockDir {
+    bitspkg::clean::SockDir::new().unwrap()
+}
+
 pub fn make_writable(p: &Path) {
     if let Ok(md) = fs::symlink_metadata(p)
         && md.is_dir()

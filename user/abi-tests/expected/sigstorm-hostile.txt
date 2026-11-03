@@ -1,0 +1,28 @@
+mode hostile
+cs data selector: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+cs null: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+cs ldt selector: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+cs beyond the gdt: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+cs rpl 0: returned
+ss null (strict): SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+ss code selector (strict): SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+ss ldt selector (strict): SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+ss beyond the gdt (strict): SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+ss null (not strict): ss after return is the old one yes
+ss null (not strict): returned
+ss code selector (not strict): ss after return is the old one yes
+ss code selector (not strict): returned
+rip non-canonical: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+rip non-canonical, handler returns through it: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes refaults with the register kept 2
+rip non-canonical high: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes
+rip non-canonical high, handler returns through it: SIGSEGV SI_KERNEL trap 13 addr-is-planted yes on-alt-stack yes refaults with the register kept 2
+rip kernel half: fault signal yes on-alt-stack yes
+rsp non-canonical: SIGBUS SI_KERNEL trap 12 addr-is-planted yes on-alt-stack yes
+rsp non-canonical, handler returns through it: SIGBUS SI_KERNEL trap 12 addr-is-planted yes on-alt-stack yes refaults with the register kept 2
+rsp kernel half: fault signal yes on-alt-stack yes
+rsp unmapped: SIGSEGV SEGV_MAPERR trap 14 addr-is-planted no on-alt-stack yes
+fpstate kernel half: SIGSEGV SI_KERNEL addr-is-planted yes on-alt-stack yes
+fpstate unmapped: SIGSEGV SI_KERNEL addr-is-planted yes on-alt-stack yes
+rflags iopl 3: iopl after return 0
+rflags iopl 3: returned
+done

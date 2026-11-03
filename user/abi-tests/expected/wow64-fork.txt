@@ -1,0 +1,5 @@
+child: inherited entry 0 yes
+child: rewrote its own entry 0 yes
+parent ldt read after the child = 16
+parent's entry 0 kept its base: yes
+done

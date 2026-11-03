@@ -8,10 +8,16 @@
 //! a back-off. Every failure is logged and retried; init never exits (`--once` is for tests only) and catches a
 //! panic in a round instead of dying.
 //!
+//! UL-7 (`shutdown.rs`): as PID 1 it takes busybox's halt/poweroff/reboot signals and the desktop's power socket,
+//! ends every program (SIGTERM, a bounded wait, SIGKILL), syncs and calls reboot(2); a power-off only after
+//! the kernel's R8f judgement (`/proc/bitsos/power`) allows it.
+//!
 //! Log lines start with "init: " and go to stdout (the console) and to /dev/kmsg when the kernel has one.
 #![forbid(unsafe_code)]
 
 use initlib::{Backoff, Card, Dedup, Opts};
+
+mod shutdown;
 use std::panic::AssertUnwindSafe;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -43,6 +49,17 @@ struct Init {
     bitsjournal: Option<Shell>,
     bitsjournal_next: Instant,
     bitsjournal_backoff: Backoff,
+    /// MC-8a: the user-space MCP service (`/bin/bitsmcp serve`) under CONFIG.TXT mcp=both|service, restarted with
+    /// its own back-off; `bitsmcp_wanted` comes from the first successful read of /proc/bitsos/mcp (it holds for
+    /// the boot).
+    bitsmcp: Option<Shell>,
+    bitsmcp_next: Instant,
+    bitsmcp_backoff: Backoff,
+    bitsmcp_wanted: Option<bool>,
+    /// MC-9a: the installer (`/bin/bitsinstall serve`), wanted like bitsmcp, with its own back-off.
+    bitsinstall: Option<Shell>,
+    bitsinstall_next: Instant,
+    bitsinstall_backoff: Backoff,
     born: Instant,
     reaped: u64,
     /// `\BITSOS2\home\` on the stick exists (made or found); until then tried once per round.
@@ -101,6 +118,13 @@ impl Init {
             bitsjournal: None,
             bitsjournal_next: Instant::now(),
             bitsjournal_backoff: Backoff::default(),
+            bitsmcp: None,
+            bitsmcp_next: Instant::now(),
+            bitsmcp_backoff: Backoff::default(),
+            bitsmcp_wanted: None,
+            bitsinstall: None,
+            bitsinstall_next: Instant::now(),
+            bitsinstall_backoff: Backoff::default(),
             born: Instant::now(),
             reaped: 0,
             home_done: false,
@@ -286,6 +310,8 @@ impl Init {
     /// One round: reap, /etc from the DHCP view, the shell.
     fn round(&mut self) {
         self.reap();
+        self.bitsmcp();
+        self.bitsinstall();
         self.network_files();
         self.settingsd();
         self.bitssnap();
@@ -336,6 +362,20 @@ impl Init {
                         let delay = self.bitssnap_backoff.next(ran.as_millis() as u64);
                         self.bitssnap_next = Instant::now() + Duration::from_millis(delay);
                         self.log(&format!("bitssnap (pid {pid}) ended: {what} after {} s; next start in {} s", ran.as_secs(), delay / 1000));
+                        continue;
+                    }
+                    if let Some(bi) = self.bitsinstall.take_if(|bi| bi.pid == pid) {
+                        let ran = bi.started.elapsed();
+                        let delay = self.bitsinstall_backoff.next(ran.as_millis() as u64);
+                        self.bitsinstall_next = Instant::now() + Duration::from_millis(delay);
+                        self.log(&format!("bitsinstall (pid {pid}) ended: {what} after {} s; next start in {} s", ran.as_secs(), delay / 1000));
+                        continue;
+                    }
+                    if let Some(bm) = self.bitsmcp.take_if(|bm| bm.pid == pid) {
+                        let ran = bm.started.elapsed();
+                        let delay = self.bitsmcp_backoff.next(ran.as_millis() as u64);
+                        self.bitsmcp_next = Instant::now() + Duration::from_millis(delay);
+                        self.log(&format!("bitsmcp (pid {pid}) ended: {what} after {} s; next start in {} s", ran.as_secs(), delay / 1000));
                         continue;
                     }
                     if let Some(bj) = self.bitsjournal.take_if(|bj| bj.pid == pid) {
@@ -428,6 +468,7 @@ impl Init {
         }
         self.dedup.clear("nobitssnap");
         let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
         cmd.arg("serve").env_clear().env("PATH", SHELL_PATH).env("HOME", "/root").current_dir(self.opts.at("/"));
         cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         match cmd.spawn() {
@@ -446,6 +487,98 @@ impl Init {
         }
     }
 
+    /// MC-8a: starts `/bin/bitsmcp serve` (uid 0: it opens the root-only gate, then gives root up itself; no
+    /// terminal, it logs to /dev/kmsg) when /proc/bitsos/mcp says mode=both or mode=service, first thing in a
+    /// round (MCP is the desk's way in), and restarts it with a back-off when it ends. Only as pid 1.
+    fn bitsmcp(&mut self) {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || self.bitsmcp.is_some() || Instant::now() < self.bitsmcp_next {
+            return;
+        }
+        // Only a successful read decides (the mode holds for the boot); a failed one is retried in a second.
+        let wanted = match self.bitsmcp_wanted {
+            Some(w) => w,
+            None => match std::fs::read_to_string("/proc/bitsos/mcp") {
+                Ok(t) => {
+                    let w = t.split_whitespace().any(|w| w == "mode=both" || w == "mode=service");
+                    self.dedup.clear("bitsmcpmode");
+                    if !w {
+                        self.log(&format!("no MCP service: /proc/bitsos/mcp says {} (the kernel serves MCP)", t.trim()));
+                    }
+                    self.bitsmcp_wanted = Some(w);
+                    w
+                }
+                Err(e) => {
+                    self.log_repeat("bitsmcpmode", &format!("cannot read /proc/bitsos/mcp ({e}); retrying in 1 s"));
+                    self.bitsmcp_next = Instant::now() + Duration::from_secs(1);
+                    return;
+                }
+            },
+        };
+        if !wanted {
+            self.bitsmcp_next = Instant::now() + Duration::from_secs(24 * 3600);
+            return;
+        }
+        let path = self.opts.at("/bin/bitsmcp");
+        if !usys::stat(&path).is_ok_and(|s| s.file_type() == "regular" && s.mode & 0o111 != 0) {
+            self.log_repeat("nobitsmcp", &format!("no {path}: CONFIG.TXT asks for the user-space MCP service"));
+            self.bitsmcp_next = Instant::now() + Duration::from_secs(60);
+            return;
+        }
+        self.dedup.clear("nobitsmcp");
+        let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
+        cmd.arg("serve").env_clear().env("PATH", SHELL_PATH).current_dir(self.opts.at("/"));
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id() as usize;
+                drop(child);
+                self.dedup.clear("bitsmcpspawn");
+                self.log(&format!("started the MCP service {path} (pid {pid})"));
+                self.bitsmcp = Some(Shell { pid, path, started: Instant::now() });
+            }
+            Err(e) => {
+                let delay = self.bitsmcp_backoff.next(0);
+                self.bitsmcp_next = Instant::now() + Duration::from_millis(delay);
+                self.log_repeat("bitsmcpspawn", &format!("cannot start {path} ({e}); retrying in {} s", delay / 1000));
+            }
+        }
+    }
+
+    /// MC-9a: starts `/bin/bitsinstall serve` (uid 0: the kernel gives the installer's role only to the boot's
+    /// /bin/bitsinstall running as root; no terminal, it logs to /dev/kmsg) whenever bitsmcp is wanted (mode=both
+    /// or mode=service, read by `bitsmcp()`), and restarts it with a back-off. Only as pid 1.
+    fn bitsinstall(&mut self) {
+        if self.bitsmcp_wanted != Some(true) || self.bitsinstall.is_some() || Instant::now() < self.bitsinstall_next {
+            return;
+        }
+        let path = self.opts.at("/bin/bitsinstall");
+        if !usys::stat(&path).is_ok_and(|s| s.file_type() == "regular" && s.mode & 0o111 != 0) {
+            self.log_repeat("nobitsinstall", &format!("no {path}: install requests through the MCP service are refused"));
+            self.bitsinstall_next = Instant::now() + Duration::from_secs(60);
+            return;
+        }
+        self.dedup.clear("nobitsinstall");
+        let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
+        cmd.arg("serve").env_clear().env("PATH", SHELL_PATH).current_dir(self.opts.at("/"));
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id() as usize;
+                drop(child);
+                self.dedup.clear("bitsinstallspawn");
+                self.log(&format!("started the installer {path} (pid {pid})"));
+                self.bitsinstall = Some(Shell { pid, path, started: Instant::now() });
+            }
+            Err(e) => {
+                let delay = self.bitsinstall_backoff.next(0);
+                self.bitsinstall_next = Instant::now() + Duration::from_millis(delay);
+                self.log_repeat("bitsinstallspawn", &format!("cannot start {path} ({e}); retrying in {} s", delay / 1000));
+            }
+        }
+    }
+
     /// RB-8: starts `/bin/bitsjournal serve` (uid 0, no terminal; it logs to /dev/kmsg and waits by itself until
     /// /data is writable) once settingsd was started, and restarts it with a back-off. Only as pid 1.
     fn bitsjournal(&mut self) {
@@ -460,6 +593,7 @@ impl Init {
         }
         self.dedup.clear("nobitsjournal");
         let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
         cmd.arg("serve").env_clear().env("PATH", SHELL_PATH).env("HOME", "/root").current_dir(self.opts.at("/"));
         cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         match cmd.spawn() {
@@ -500,6 +634,7 @@ impl Init {
             return;
         }
         let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
         cmd.arg("serve").env_clear().env("PATH", SHELL_PATH).env("HOME", "/root").current_dir(self.opts.at("/"));
         if let Some(lang) = self.lang() {
             cmd.env("LANG", lang);
@@ -540,6 +675,7 @@ impl Init {
         };
         self.dedup.clear("noshell");
         let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
         if path.ends_with("/busybox") {
             cmd.arg("sh");
         }
@@ -634,7 +770,11 @@ fn write_if_changed(path: &str, text: &str) -> std::io::Result<bool> {
 }
 
 fn main() {
-    let opts = Opts::parse(std::env::args().skip(1));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--power") {
+        usys::exit_group(shutdown::client(args.get(1).map_or("status", String::as_str)));
+    }
+    let opts = Opts::parse(args);
     let interval = Duration::from_millis(opts.interval_ms);
     let once = opts.once;
     let mut init = Init::new(opts);
@@ -642,6 +782,8 @@ fn main() {
         init.log("the start-up panicked; going on with the main loop");
     }
     let mut panics = 0u64;
+    // UL-7: only the system's init takes busybox's halt/poweroff/reboot signals and the power socket.
+    let mut power = (init.opts.root.is_empty() && !once && std::process::id() == 1).then(|| shutdown::Waker::new(&mut init));
     loop {
         if std::panic::catch_unwind(AssertUnwindSafe(|| init.round())).is_err() {
             panics += 1;
@@ -652,7 +794,11 @@ fn main() {
             init.log(&format!("one round done (--once, reaped {r}); exiting as asked"));
             usys::exit_group(0);
         }
-        if let Some(why) = pause(interval) {
+        if let Some(w) = power.as_mut() {
+            if let Some((action, from)) = w.wait(&mut init, interval) {
+                shutdown::shut_down(&mut init, action, &from);
+            }
+        } else if let Some(why) = pause(interval) {
             init.log_repeat("pause", &format!("nanosleep failed ({why}); pausing with poll/sched_yield instead"));
         }
     }

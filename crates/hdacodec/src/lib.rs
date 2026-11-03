@@ -18,6 +18,7 @@ extern crate std;
 pub mod ati;
 pub mod caps;
 pub mod conn;
+pub mod dcnsmu;
 pub mod dpaudio;
 #[cfg(any(test, feature = "fake"))]
 pub mod dpaudio_fake;

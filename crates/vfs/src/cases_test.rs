@@ -885,7 +885,7 @@ fn dev_cases() {
     let (ns, fds) = program_view();
     crate::fs2_tests::fake_system(&ns);
     let mem = Mem { bytes: RefCell::new(Vec::new()) };
-    let s = Sys { mem: &mem, fds: &fds, ns: &ns, cred: USER, subject: SUBJECT };
+    let s = Sys { mem: &mem, fds: &fds, fs: &crate::fd::FsState::new(), ns: &ns, cred: USER, subject: SUBJECT };
     let mut r = Runner { s, mem: &mem, base: "/tmp/dev-cases-100".to_string(), vars: [0; 26] };
     r.sc(95, [0o22, 0, 0, 0, 0]);
     let b = mem.cstr(r.base.as_bytes());
@@ -932,7 +932,7 @@ fn sys_cases() {
     // A second file system, as on Linux and in the boot view (copy_file_range's EXDEV case).
     crate::tmpfs::mount_new(&ns, "/dev/shm", 0o1777, None).unwrap();
     let mem = Mem { bytes: RefCell::new(Vec::new()) };
-    let s = Sys { mem: &mem, fds: &fds, ns: &ns, cred: USER, subject: SUBJECT };
+    let s = Sys { mem: &mem, fds: &fds, fs: &crate::fd::FsState::new(), ns: &ns, cred: USER, subject: SUBJECT };
     let mut r = Runner { s, mem: &mem, base: "/tmp/fs-cases-100".to_string(), vars: [0; 26] };
     // The runner's start: umask 022, make the base, enter it.
     r.sc(95, [0o22, 0, 0, 0, 0]);

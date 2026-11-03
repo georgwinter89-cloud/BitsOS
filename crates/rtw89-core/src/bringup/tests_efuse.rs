@@ -20,7 +20,7 @@ use crate::trace::{OpKind, TraceEntry};
 fn wz() -> PathBuf {
     std::env::var_os("WLAN_TOOLS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/georg/BitsOS/werkzeuge/plattform/wlan".into())
+        .unwrap_or_else(|| crate::test_desk::desk("werkzeuge/plattform/wlan"))
 }
 fn kit(f: &str) -> Vec<u8> {
     std::fs::read(wz().join("kit").join(f)).expect("the kit's efuse dumps")

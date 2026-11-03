@@ -306,8 +306,11 @@ impl Volume {
             }
         } else if size > old {
             self.zero_range(&mut st, ino, old, size.min(chain.len() as u64 * cb))?;
-            let from = chain.len() as u64 * cb;
-            self.grow_with_data(&mut st, ino, size, (0, 0), from, &[], from)?;
+            // A growth inside the last cluster needs none.
+            if need > chain.len() {
+                let from = chain.len() as u64 * cb;
+                self.grow_with_data(&mut st, ino, size, (0, 0), from, &[], from)?;
+            }
             Self::node_mut(&mut st, ino)?.e.size = size as u32;
             self.stamp_write(&mut st, ino)?;
             self.write_entry(&mut st, ino)?;
@@ -323,13 +326,8 @@ impl Volume {
         self.set_entry(ino, None, mtime, atime)
     }
 
-    /// FS-1b chmod (`fat_setattr` after `fat_sanitize_mode`, linux-6.6/fs/fat/file.c:421): the read-only
-    /// attribute follows the owner's w bit (`fat_make_attrs`). Unchanged: nothing written.
-    pub fn set_read_only_attr(&self, ino: u64, ro: bool) -> Result<(), i64> {
-        self.set_entry(ino, Some(ro), None, None)
-    }
-
-    /// FS-1b setattr in one step: the read-only attribute (None: kept) and the times, checked by the rules
+    /// FS-1b setattr in one step (chmod: `fat_setattr` after `fat_sanitize_mode`, linux-6.6/fs/fat/file.c:421, the
+    /// read-only attribute follows the owner's w bit, `fat_make_attrs`): the read-only attribute (None: kept) and the times, checked by the rules
     /// once and written as one sector, so a refusal leaves the entry as it was (no half-done change).
     pub fn set_entry(&self, ino: u64, ro: Option<bool>, mtime: Option<i64>, atime: Option<i64>) -> Result<(), i64> {
         let mut st = self.lock()?;

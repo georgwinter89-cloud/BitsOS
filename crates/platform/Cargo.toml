@@ -14,7 +14,13 @@ kreg = { path = "../kreg" }
 ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
 mm-core = { path = "../mm-core" }
+# CP-8: the NMI ktests run user programs in address spaces of their own.
+mm = { path = "../mm" }
 sched = { path = "../sched" }
 time = { path = "../time" }
+block = { path = "../block" }
 # INT-A2a (FS-7 CR1): write-back before reboot/poweroff.
 vfs = { path = "../vfs" }
+
+[lints]
+workspace = true

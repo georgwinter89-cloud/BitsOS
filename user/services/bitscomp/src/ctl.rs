@@ -13,7 +13,7 @@ use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 
 use crate::input::InputEvent;
 use crate::layout::Place;
-use crate::render::Compositor;
+use crate::render::Picture;
 use crate::state::App;
 use crate::wm::Action;
 
@@ -100,7 +100,7 @@ pub fn send(socket_name: &str, cmd: &str) -> std::io::Result<String> {
     Ok(out)
 }
 
-pub fn run_queue(app: &mut App, comp: &Compositor) {
+pub fn run_queue(app: &mut App, comp: &dyn Picture) {
     // `bench` runs over many turns (`bench.rs`); a second one waits in the queue for the first.
     // A screenshot waits for the start animation and an unfolding menu (WY-5), so it shows the settled look.
     let moving = app.anim.running(crate::pacer::now(), &app.theme);
@@ -119,11 +119,30 @@ pub fn run_queue(app: &mut App, comp: &Compositor) {
 /// each unacknowledged configure until the client goes).
 const FLOOD_MAX: u32 = 200_000;
 
-fn execute(app: &mut App, comp: &Compositor, cmd: &str) -> Result<String, String> {
+fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, String> {
     let words: Vec<&str> = cmd.split_whitespace().collect();
     let num = |i: usize| -> Result<f64, String> {
         words.get(i).ok_or("missing number")?.parse::<f64>().map_err(|e| e.to_string())
     };
+    // MC-9b test path of the headless build: `phys COMMAND...` runs a key/pointer command as input from a real
+    // device. It does not exist in the V2 build (no `nested` feature) nor with another back end: there the
+    // control socket's input is always injected and can never answer the installer.
+    if words.first() == Some(&"phys") {
+        if !(cfg!(feature = "nested") && app.headless) {
+            return Err("phys: only in the headless test build".into());
+        }
+        let rest = words[1..].join(" ");
+        if !matches!(words.get(1).copied(), Some("key" | "pointer" | "press" | "release" | "click" | "wheel")) {
+            return Err("usage: phys key|pointer|press|release|click|wheel ...".into());
+        }
+        app.ctl_origin = crate::input::Origin::Physical;
+        let r = execute(app, comp, &rest);
+        app.ctl_origin = crate::input::Origin::Injected;
+        return r;
+    }
+    if words.first() == Some(&"install") {
+        return app.install_ctl(&words);
+    }
     if let Some(r) = crate::ctl_mouse::execute(app, &words) {
         return r;
     }
@@ -132,6 +151,8 @@ fn execute(app: &mut App, comp: &Compositor, cmd: &str) -> Result<String, String
     }
     match words.first().copied().unwrap_or("") {
         "list" => Ok(list(app)),
+        // WY-3: the X11 display: its number, Xwayland's state and pid, X11 windows, the clipboard bridge.
+        "xwayland" => Ok(app.xwayland.as_ref().map_or_else(|| "xwayland off".to_string(), |x| x.describe())),
         // WY-11: the pointer's mode (hw/software), shape, image, counters and the input-to-move delay.
         "cursor" => match words.get(1).copied() {
             // Test aid (headless `--pointer fake` only): the next N door calls fail with ERRNO.
@@ -144,7 +165,7 @@ fn execute(app: &mut App, comp: &Compositor, cmd: &str) -> Result<String, String
         "stats" => {
             // WY-7: how programs start and how many still wait for their window (read here only, no loop cost).
             let how = if crate::spawn::trampoline().is_some() { "trampoline" } else { "fork" };
-            let r = format!("{} output={}x{} launching={} spawn={how}", app.stats.report(), comp.size().0, comp.size().1, app.launches.count());
+            let r = format!("{} output={}x{} launching={} spawn={how} build={} renderer={}", app.stats.report(), comp.size().0, comp.size().1, app.launches.count(), crate::flavour::name(), comp.renderer());
             if words.get(1) == Some(&"reset") {
                 app.stats = Default::default();
             }
@@ -177,6 +198,19 @@ fn execute(app: &mut App, comp: &Compositor, cmd: &str) -> Result<String, String
         "grow" => run(app, Action::Grow(0.25)),
         "shrink" => run(app, Action::Grow(-0.25)),
         "close" => run(app, Action::Close),
+        // WY-12: minimize [ID] (the focused window without ID), unminimize ID, switch [-1] (Alt+Tab).
+        "minimize" => {
+            let w = match words.get(1) {
+                Some(id) => window(app, id)?,
+                None => app.ws.focused().cloned().ok_or("no focused window")?,
+            };
+            if app.minimize(&w, "ctl") { Ok("ok".into()) } else { Err(format!("window {} is not shown", win_id(&w))) }
+        }
+        "unminimize" => {
+            let w = window(app, words.get(1).ok_or("usage: unminimize ID")?)?;
+            if app.unminimize(&w, "ctl") { Ok("ok".into()) } else { Err(format!("window {} is not minimised here", win_id(&w))) }
+        }
+        "switch" => run(app, Action::Switch(num(1).unwrap_or(1.0) as i32)),
         // kill [ID]: end a window's program (the focused one without ID), as "Programm beenden" does.
         "kill" => {
             let w = match words.get(1) {
@@ -228,6 +262,11 @@ fn execute(app: &mut App, comp: &Compositor, cmd: &str) -> Result<String, String
     }
 }
 
+fn window(app: &App, id: &str) -> Result<crate::win::Window, String> {
+    let n: u64 = id.parse().map_err(|_| format!("bad window id {id}"))?;
+    app.all_windows().into_iter().find(|w| win_id(w) == n).ok_or(format!("no window {n}"))
+}
+
 fn run(app: &mut App, a: Action) -> Result<String, String> {
     app.act(a);
     Ok(format!("{a:?}"))
@@ -246,7 +285,7 @@ fn list(app: &App) -> String {
         // WY-8: a fullscreen window's frame lies around the screen; its client part is what it covers.
         let (r, fs) = if p.fullscreen { (app.content_rect(p.frame), " fullscreen") } else { (p.frame, "") };
         out.push_str(&format!(
-            "{place}{fs} visible={} focused={} frame={},{} {}x{} id={} app_id={app_id} title={title:?} pid={} hung={} ws={}\n",
+            "{place}{fs} visible={} focused={} frame={},{} {}x{} id={} app_id={app_id} title={title:?} pid={} hung={} ws={}{}\n",
             p.visible,
             p.focused,
             r.x,
@@ -256,9 +295,11 @@ fn list(app: &App) -> String {
             win_id(&p.win),
             app.pid_of(&p.win),
             app.is_hung(&p.win),
-            app.desk.active + 1
+            app.desk.active + 1,
+            p.win.x11().map(|x| format!(" x11=0x{:x}", x.xid)).unwrap_or_default()
         ));
     }
+    out.push_str(&app.minimized_lines());
     out.push_str("end");
     out
 }
@@ -266,24 +307,26 @@ fn list(app: &App) -> String {
 struct WinId(u64);
 
 /// A number for a window that stays for its life and is never reused (protocol ids are per client).
-pub fn win_id(w: &smithay::desktop::Window) -> u64 {
+pub fn win_id(w: &crate::win::Window) -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     w.user_data().get_or_insert(|| WinId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))).0
 }
 
-pub fn names(w: &smithay::desktop::Window) -> (String, String) {
-    let t = w.toplevel().unwrap();
+pub fn names(w: &crate::win::Window) -> (String, String) {
+    // WY-3: an X11 window's app id is its WM_CLASS class, its title _NET_WM_NAME (else WM_NAME).
+    let Some(t) = w.toplevel() else {
+        let x = w.x11().expect("a window is a toplevel or an X11 window");
+        return (x.class.borrow().clone(), x.title.borrow().clone());
+    };
     smithay::wayland::compositor::with_states(t.wl_surface(), |s| {
         let d = s.data_map.get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>().unwrap().lock().unwrap();
         (d.app_id.clone().unwrap_or_default(), d.title.clone().unwrap_or_default())
     })
 }
 
-fn write_ppm(comp: &Compositor, path: &str) -> std::io::Result<()> {
+fn write_ppm(comp: &dyn Picture, path: &str) -> std::io::Result<()> {
     let (w, h) = comp.size();
-    let stride = comp.shadow.stride() / 4;
-    // SAFETY: the shadow image is ours, alive, and `stride * h` u32 long; nothing renders meanwhile.
-    let px = unsafe { std::slice::from_raw_parts(comp.shadow.data(), stride * h as usize) };
+    let (px, stride) = comp.pixels();
     let mut buf = format!("P6\n{w} {h}\n255\n").into_bytes();
     for y in 0..h as usize {
         for &p in &px[y * stride..y * stride + w as usize] {

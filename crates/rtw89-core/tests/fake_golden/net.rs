@@ -1,6 +1,6 @@
 //! The WLAN as the network card, end to end on the host (V1's wlan-net-test.mjs, its first boot
 //! ported; no QEMU): the Rust station on V1's fake chip, the fake AP bridged to V1's LAN
-//! (net-lan.mjs through wlan-fake.mjs's lanBridge, UDP on 127.0.0.1:28400/28401 or the next free pair, the WL port
+//! (net-lan.mjs through wlan-fake.mjs's lanBridge, UDP on the 400th and 401st port of the lane or the next free pair, the lane's port
 //! range), smoltcp as the IP side. The supervisor scans and joins (wifi's state machine and
 //! supplicant, the fake network's test passphrase), then: DHCP (192.168.77.20), ping of the
 //! router, DNS of a LAN name, an HTTP page byte for byte, a group rekey while linked (a broadcast
@@ -31,18 +31,24 @@ use super::life::Life;
 use super::sta::{FAKE_PASS, SSID};
 use super::*;
 
-/// The LAN's UDP port (and the next): WL_LAN_PORT, else the first pair from 28400 up that is free
-/// now (both in the WL range 28000-28499; another run of this test, e.g. a second session in the
-/// lane, may hold 28400: the fake would die with EADDRINUSE)
+/// The first port of the running lane's range of 500 (V2-LANES section 6), WL's without a lane.
+fn lane_lo() -> u16 {
+    std::env::var("BITSOS_PORT_LO").map_or(28000, |s| s.parse().expect("BITSOS_PORT_LO"))
+}
+
+/// The LAN's UDP port (and the next): WL_LAN_PORT, else the first pair from the lane's 400th port up
+/// that is free now (another run of this test, e.g. a second session in the lane, may hold the
+/// first: the fake would die with EADDRINUSE)
 fn lan_port() -> String {
     if let Ok(p) = std::env::var("WL_LAN_PORT") {
         return p;
     }
+    let first = lane_lo() + 400;
     let free = |p: u16| std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok();
-    (28400u16..28498)
+    (first..first + 98)
         .step_by(2)
         .find(|&p| free(p) && free(p + 1))
-        .unwrap_or(28400)
+        .unwrap_or(first)
         .to_string()
 }
 const ROUTER: Ipv4Address = Ipv4Address::new(192, 168, 77, 1);
@@ -302,10 +308,11 @@ fn wlan_as_netdev_on_the_fake_ap_and_lan() {
         return;
     }
     let port = lan_port();
-    let p: u32 = port.parse().expect("WL_LAN_PORT");
+    let p: u16 = port.parse().expect("WL_LAN_PORT");
+    let lo = lane_lo();
     assert!(
-        (28000..28499).contains(&p),
-        "the LAN port {p} is outside WL's range"
+        (lo..lo + 499).contains(&p),
+        "the LAN port {p} is outside the lane's range from {lo}"
     );
     let mut l = Life::with_flags("net", &["--lan", &port]);
     l.env.real = Some(Instant::now());

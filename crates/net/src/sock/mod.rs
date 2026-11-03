@@ -12,6 +12,11 @@
 //! - [`sys`]: the syscalls on an abstract user memory (`vfs::sys::Sys`), host-tested; `crates/syscall`'s
 //!   `socket.rs` registers them.
 //!
+//! NW-11: every socket belongs to the network namespace it was made in (`Caller::net`, see
+//! [`crate::netns`]): the initial one keeps the tables above unchanged; a namespace below it has its own lo,
+//! ports, abstract names and netlink ids. Credentials are kept in kernel ids and read in the reader's pid and
+//! user namespaces (`Caller::ids`).
+//!
 //! An fd's `File` is a [`SockFile`]; dropping it (the last open file description going away) is Linux's
 //! `sock_release`. The syscalls find the socket behind an `Arc<dyn File>` through a table keyed by the object's
 //! address (the VFS `File` trait has no downcast; change request to FS).
@@ -40,18 +45,139 @@ use ksync::{RwSpinLock, WaitQueue};
 use uapi::errno::*;
 use vfs::{Errno, Events, File, Pollable};
 
-/// Who makes a socket call (credentials for SO_PEERCRED / SCM_CREDENTIALS, the B3 subject).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Who makes a socket call (credentials for SO_PEERCRED / SCM_CREDENTIALS, the B3 subject). `pid`, `uid` and
+/// `gid` are kernel ids (the initial namespaces' numbers); NW-11: `net` is the caller's network namespace and
+/// `ids` how it names processes and ids (both `None`: the initial namespaces).
+#[derive(Clone)]
 pub struct Caller {
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
     pub subject: policy::Subject,
+    pub net: crate::netns::Net,
+    pub ids: Option<Arc<dyn Ids>>,
+    /// The real, effective and saved uid and gid (kernel ids) that `scm_check_creds` accepts as the sender's
+    /// own; `Caller::new` gives all three as `uid`/`gid`, the namespace hook the process's own.
+    pub cred: CredIds,
+}
+
+/// Real, effective and saved ids, in this order (kernel numbers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CredIds {
+    pub uid: [u32; 3],
+    pub gid: [u32; 3],
+}
+
+/// NW-11: a caller's pid and user namespaces, as the syscall glue knows them (proc's objects stay above net).
+/// Translations follow Linux: `pid_vnr`/`find_vpid`, `make_kuid`/`from_kuid_munged`.
+pub trait Ids: Send + Sync {
+    /// Linux capability number `cap` where it counts for this caller: CAP_NET_ADMIN, CAP_NET_BIND_SERVICE and
+    /// CAP_NET_RAW over the user namespace that owns its network namespace, CAP_SYS_ADMIN over the one that
+    /// owns its pid namespace, CAP_SETUID and CAP_SETGID in its own.
+    fn capable(&self, cap: u32) -> bool;
+    /// Linux capability number `cap` over the initial user namespace (`capable`, e.g. SIOCSIFTXQLEN). The
+    /// default answers no, the safe side for a hook that does not know (NW-12 CR: the kernel's hook answers it
+    /// from the credentials).
+    fn capable_initial(&self, _cap: u32) -> bool {
+        false
+    }
+    /// A pid as the caller names it -> the kernel pid (None: no such process in its pid namespace).
+    fn pid_to_kernel(&self, pid: u32) -> Option<u32>;
+    /// A kernel pid as the caller sees it (0: not visible from its pid namespace).
+    fn pid_from_kernel(&self, kpid: u32) -> u32;
+    /// A uid/gid as the caller names it -> the kernel id (None: not mapped).
+    fn uid_to_kernel(&self, uid: u32) -> Option<u32>;
+    fn gid_to_kernel(&self, gid: u32) -> Option<u32>;
+    /// A kernel uid/gid as the caller sees it (the overflow id 65534 when not mapped).
+    fn uid_from_kernel(&self, kuid: u32) -> u32;
+    fn gid_from_kernel(&self, kgid: u32) -> u32;
+}
+
+/// Linux capability numbers the socket layer asks for.
+pub mod cap {
+    pub const SETGID: u32 = 6;
+    pub const SETUID: u32 = 7;
+    pub const NET_BIND_SERVICE: u32 = 10;
+    pub const NET_ADMIN: u32 = 12;
+    pub const NET_RAW: u32 = 13;
+    pub const SYS_ADMIN: u32 = 21;
 }
 
 impl Caller {
+    /// A caller in the initial namespaces (root is uid 0).
+    pub const fn new(pid: u32, uid: u32, gid: u32, subject: policy::Subject) -> Caller {
+        Caller { pid, uid, gid, subject, net: None, ids: None, cred: CredIds { uid: [uid; 3], gid: [gid; 3] } }
+    }
+
+    /// The kernel itself (pid 0, root, the initial namespaces).
+    pub const KERNEL: Caller = Caller::new(0, 0, 0, policy::Subject::KERNEL);
+
     pub fn ucred(&self) -> Ucred {
         Ucred { pid: self.pid, uid: self.uid, gid: self.gid }
+    }
+
+    /// Whether the caller holds capability `cap` (`cap::*`) where the socket layer asks for it.
+    pub fn can(&self, cap: u32) -> bool {
+        match &self.ids {
+            None => self.uid == 0,
+            Some(i) => i.capable(cap),
+        }
+    }
+
+    /// `capable(cap)`: over the initial user namespace, whatever namespace the caller's network namespace has.
+    pub fn can_initial(&self, cap: u32) -> bool {
+        match &self.ids {
+            None => self.uid == 0,
+            Some(i) => i.capable_initial(cap),
+        }
+    }
+
+    /// The caller's own pid as it names it (`task_tgid_vnr(current)`).
+    pub fn pid_view(&self) -> u32 {
+        match &self.ids {
+            None => self.pid,
+            Some(i) => i.pid_from_kernel(self.pid),
+        }
+    }
+
+    /// Kernel credentials as this caller reads them (`scm_set_cred`'s `pid_vnr` and `cred_to_ucred`'s
+    /// `from_kuid_munged`): SCM_CREDENTIALS received and SO_PEERCRED. -1 (no credentials) stays -1.
+    pub fn view_of(&self, k: Ucred) -> Ucred {
+        match &self.ids {
+            None => k,
+            Some(i) => Ucred {
+                pid: if k.pid == 0 { 0 } else { i.pid_from_kernel(k.pid) },
+                uid: if k.uid == u32::MAX { k.uid } else { i.uid_from_kernel(k.uid) },
+                gid: if k.gid == u32::MAX { k.gid } else { i.gid_from_kernel(k.gid) },
+            },
+        }
+    }
+}
+
+impl PartialEq for Caller {
+    fn eq(&self, o: &Caller) -> bool {
+        let ids = match (&self.ids, &o.ids) {
+            (None, None) => true,
+            (Some(a), Some(b)) => core::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+            _ => false,
+        };
+        self.pid == o.pid && self.uid == o.uid && self.gid == o.gid && self.subject == o.subject && self.cred == o.cred && crate::netns::same(&self.net, &o.net) && ids
+    }
+}
+
+impl Eq for Caller {}
+
+impl core::fmt::Debug for Caller {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Caller")
+            .field("pid", &self.pid)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .field("subject", &self.subject)
+            .field("net", &self.net)
+            .field("ids", &self.ids.is_some())
+            .field("cred", &self.cred)
+            .finish()
     }
 }
 
@@ -107,7 +233,51 @@ pub(crate) fn pid_exists(pid: u32) -> bool {
 
 /// The calling program, or the kernel itself (pid 0, root).
 pub(crate) fn current() -> Caller {
-    HOOKS.get().and_then(|h| (h.current)()).unwrap_or(Caller { pid: 0, uid: 0, gid: 0, subject: policy::Subject::KERNEL })
+    match HOOKS.get().and_then(|h| (h.current)()) {
+        Some(c) if c.net.is_none() && c.ids.is_none() => with_ns(c),
+        Some(c) => c,
+        None => Caller::KERNEL,
+    }
+}
+
+/// NW-11: where the calling program's namespaces come from (installed by the syscall glue, `set_ns_hooks`).
+pub struct NsHooks {
+    /// The calling program's network namespace view and its ids (`(None, None)`: the initial namespaces, the
+    /// fast answer for every program outside a sandbox).
+    pub current: fn() -> NsNow,
+}
+
+/// What the namespace hook knows of the calling program.
+#[derive(Default)]
+pub struct NsNow {
+    pub net: crate::netns::Net,
+    pub ids: Option<Arc<dyn Ids>>,
+    /// The process's real, effective and saved ids (None: no process, the caller's `uid`/`gid` stay).
+    pub cred: Option<CredIds>,
+}
+
+static NS_HOOKS: ksync::OnceRef<NsHooks> = ksync::OnceRef::new();
+
+pub fn set_ns_hooks(h: &'static NsHooks) {
+    NS_HOOKS.set(h);
+}
+
+/// NW-12: the calling program's namespaces as the hook gives them (the initial ones without it).
+pub fn ns_now() -> NsNow {
+    NS_HOOKS.get().map(|h| (h.current)()).unwrap_or_default()
+}
+
+/// `c` with the calling program's namespaces (unchanged without the hook: host tests, the kernel's own calls).
+pub(crate) fn with_ns(mut c: Caller) -> Caller {
+    if let Some(h) = NS_HOOKS.get() {
+        let n = (h.current)();
+        c.net = n.net;
+        c.ids = n.ids;
+        if let Some(k) = n.cred {
+            c.cred = k;
+        }
+    }
+    c
 }
 
 /// Monotonic nanoseconds (the kernel clock; the process clock in host tests).
@@ -242,7 +412,8 @@ pub mod flag {
     pub const DEBUG: u32 = 256;
     pub const NODELAY: u32 = 512;
     pub const CORK: u32 = 1024;
-    pub const QUICKACK: u32 = 2048;
+    /// TCP_QUICKACK 0: Linux's pingpong mode (getsockopt says !pingpong, so a fresh socket says 1).
+    pub const PINGPONG: u32 = 2048;
     /// SO_TIMESTAMP* (`SOCK_RCVTSTAMP`, `SOCK_RCVTSTAMPNS`, `SOCK_TSTAMP_NEW`): stored and shown by getsockopt;
     /// V2 attaches no SCM_TIMESTAMP control message yet.
     pub const RCVTSTAMP: u32 = 4096;
@@ -310,7 +481,14 @@ pub struct SockFile {
     released: AtomicBool,
 }
 
-static TABLE: RwSpinLock<BTreeMap<usize, Weak<SockFile>>> = RwSpinLock::named("net.sock.table", BTreeMap::new());
+/// Every socket by address, with its network namespace's key (NW-12: /proc/net picks a namespace's sockets
+/// without touching the others').
+static TABLE: RwSpinLock<BTreeMap<usize, (Weak<SockFile>, usize)>> = RwSpinLock::named("net.sock.table", BTreeMap::new());
+
+/// A namespace as a table key: its view's address, 0 for the initial one.
+fn net_key(n: &crate::netns::Net) -> usize {
+    n.as_ref().map_or(0, |v| Arc::as_ptr(v) as usize)
+}
 
 klog::counter!(SOCKETS_MADE, "net.sock.made");
 klog::counter!(SOCKETS_FREED, "net.sock.freed");
@@ -326,9 +504,18 @@ impl SockFile {
         // The socket's own small allocations (this `Arc`, the table node) are infallible like every other small
         // kernel object; R2's ENOMEM applies to what a program sizes (queues and buffers, `buffer`). The table
         // goes when FS gives `File` a downcast (change request), and with it the only reason to return Result.
-        TABLE.write().insert(key, Arc::downgrade(&f));
+        let nk = net_key(f.net());
+        TABLE.write().insert(key, (Arc::downgrade(&f), nk));
         SOCKETS_MADE.inc();
         Ok(f)
+    }
+
+    /// NW-12: the open sockets of network namespace `net` (for /proc/net), in table order.
+    pub(crate) fn all_in(net: &crate::netns::Net) -> Vec<Arc<SockFile>> {
+        let nk = net_key(net);
+        let all: Vec<Arc<SockFile>> = TABLE.read().values().filter(|(_, k)| *k == nk).filter_map(|(w, _)| w.upgrade()).collect();
+        // Dropped outside the table's lock: a socket closed meanwhile is released here (`SockFile`'s drop).
+        all.into_iter().filter(|f| !f.released.load(Ordering::Acquire) && crate::netns::same(f.net(), net)).collect()
     }
 
     /// The socket behind an open file (None: not a socket, ENOTSOCK).
@@ -336,7 +523,16 @@ impl SockFile {
         if f.mode() & uapi::S_IFMT != vfs::abi::S_IFSOCK {
             return None;
         }
-        TABLE.read().get(&key_of(f)).and_then(|w| w.upgrade())
+        TABLE.read().get(&key_of(f)).and_then(|(w, _)| w.upgrade())
+    }
+
+    /// NW-11: the socket's network namespace (`sock_net`).
+    pub(crate) fn net(&self) -> &crate::netns::Net {
+        match &self.kind {
+            Kind::Unix(u) => u.net(),
+            Kind::Inet(i) => i.net(),
+            Kind::Netlink(n) => n.net(),
+        }
     }
 
     pub fn unix(&self) -> Option<&Arc<unix::UnixSock>> {
@@ -409,12 +605,13 @@ impl File for SockFile {
     /// AF_UNIX stream and seqpacket sockets name their queue (woken on data, hang-up, a connection and the own
     /// charge dropping: every change of IN/OUT/HUP). Datagram sockets also become writable when a peer's queue
     /// drains (Linux's peer_wake relay), which wakes no queue of theirs: they stay looked at every 10 ms, as
-    /// inet and netlink sockets.
+    /// netlink sockets. AF_INET sockets name the shared `inet::READY` (NW-10), which every change of any of
+    /// them wakes (the stack's rounds, loopback, accept queues).
     fn poll_wait(&self, add: &mut dyn FnMut(&vfs::poll::PollQueue)) {
-        if let Kind::Unix(u) = &self.kind
-            && u.ty != unix::UType::Dgram
-        {
-            add(&u.wq);
+        match &self.kind {
+            Kind::Unix(u) if u.ty != unix::UType::Dgram => add(&u.wq),
+            Kind::Inet(_) => add(&inet::READY),
+            _ => {}
         }
     }
     fn read_at(&self, _pos: u64, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -578,3 +775,5 @@ mod tests_inet;
 mod tests_inet6;
 #[cfg(test)]
 mod tests_netlink;
+#[cfg(test)]
+mod tests_netns;

@@ -51,6 +51,16 @@ pub struct KernelHeap {
 }
 
 /// Pages and page alignment of a large block.
+/// PF-5: before the heap answers null, what waits for a grace period comes back (frames of evicted pages,
+/// index nodes): the buddy never drains for `Kind::Heap` (the magazine lock may be held there), here no heap
+/// lock is held. Bounded (`grace::expedite`); with a spin lock held (the grace queue's own lock included: it
+/// grows its queue from the heap) the drain only tries the queue lock.
+fn regain_grace() {
+    if crate::grace::waiting() {
+        crate::grace::expedite();
+    }
+}
+
 fn large_shape(size: usize, align: usize) -> (u64, u64) {
     ((size as u64).div_ceil(PAGE), (align as u64 / PAGE).max(1))
 }
@@ -239,6 +249,7 @@ impl KernelHeap {
                 }
             }
             if attempt == 0 {
+                regain_grace();
                 self.shrink();
             }
         }
@@ -276,6 +287,7 @@ impl KernelHeap {
                 return v;
             }
             if attempt == 0 {
+                regain_grace();
                 self.shrink();
             }
         }

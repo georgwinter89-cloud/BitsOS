@@ -66,6 +66,12 @@ pub struct SuperBlock {
     /// AB-7c: the file system's own options as Linux's `show_options` prints them (each with a leading comma,
     /// e.g. ",mode=755,inode64"); empty for none. Set by the mounter.
     options: ksync::SpinLock<alloc::string::String>,
+    /// SX-3a: the file system itself is read-only (Linux `sb_rdonly`, the super options' "ro"); a mount can be
+    /// read-only on its own (`MNT_READONLY`).
+    ro: AtomicBool,
+    /// SX-3a: the user namespace it was made in (Linux `s_user_ns`), as the process layer's object; None: the
+    /// initial one. Remounting it needs CAP_SYS_ADMIN there.
+    owner: ksync::SpinLock<Option<Arc<dyn core::any::Any + Send + Sync>>>,
 }
 
 impl SuperBlock {
@@ -100,7 +106,24 @@ impl SuperBlock {
             load_lock: Mutex::named("vfs.sb.load", ()),
             source: ksync::SpinLock::named("vfs.sb.source", None),
             options: ksync::SpinLock::named("vfs.sb.options", alloc::string::String::new()),
+            ro: AtomicBool::new(false),
+            owner: ksync::SpinLock::named("vfs.sb.owner", None),
         })
+    }
+    /// SX-3a: `sb_rdonly`.
+    pub fn is_ro(&self) -> bool {
+        self.ro.load(Ordering::Acquire)
+    }
+    pub fn set_ro(&self, ro: bool) {
+        self.ro.store(ro, Ordering::Release);
+    }
+    /// SX-3a: `s_user_ns` (None: the initial user namespace).
+    pub fn owner(&self) -> Option<Arc<dyn core::any::Any + Send + Sync>> {
+        self.owner.lock().clone()
+    }
+    pub fn set_owner(&self, o: Arc<dyn core::any::Any + Send + Sync>) {
+        let old = self.owner.lock().replace(o);
+        drop(old);
     }
     /// The mount source (`mnt_devname`): what `set_source` gave, else the type's name.
     pub fn source(&self) -> alloc::string::String {
@@ -289,8 +312,9 @@ pub struct Dentry {
     /// Its children are in the tree (always, except for directories of a file system with `FsOps` that were
     /// not looked into yet).
     loaded: AtomicBool,
-    /// Its name's metadata charge (`DENTRY_BYTES` plus the name), given back with the dentry.
-    charge: Option<crate::pool::MetaCharge>,
+    /// Its name's metadata charge (`DENTRY_BYTES` plus the name), given back with the dentry: held only for its
+    /// `Drop` (MetaCharge returns the bytes), hence never read.
+    _charge: Option<crate::pool::MetaCharge>,
 }
 
 impl Dentry {
@@ -353,7 +377,7 @@ impl Dentry {
             dir: SpinLock::named("vfs.dentry.dir", DirMap { next_seq: 1, ..Default::default() }),
             mounted: AtomicU32::new(0),
             loaded: AtomicBool::new(true),
-            charge,
+            _charge: charge,
         })
     }
     /// The charge of a new name in this directory's file system (ENOSPC when its pool refuses).

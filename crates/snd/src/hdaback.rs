@@ -198,6 +198,11 @@ impl<D: Holder> Stream for HdaStream<D> {
         let _ = self.d.ctrl().stop(self.sid);
     }
     fn position(&mut self, _now: u64) -> Result<u64, OutError> {
+        // A quiesced controller still answers (frozen, without a register read: SN-7); the mixer leaves it at
+        // once instead of waiting for a write that a full ring never makes.
+        if self.d.ctrl().state() == hda::State::Quiesced {
+            return Err(OutError::Gone);
+        }
         self.d.ctrl().position(self.sid).map_err(map)
     }
     fn ring_frames(&self) -> u32 {

@@ -7,6 +7,7 @@
 mod hardening;
 mod lifeline;
 mod netlink;
+mod netns;
 mod parallel;
 mod sha256;
 
@@ -183,6 +184,78 @@ fn loopback_full_pipe() -> TestResult {
     Ok(())
 }
 ktest!("nw.stack.loopback_full_pipe", Safe, loopback_full_pipe);
+
+/// NW-10 fixer: poll and epoll on an AF_INET socket sleep on `inet::READY` (no 10 ms looks, `vfs.poll.legacy_items`)
+/// and wake there on data and on the peer's FIN. A non-legacy epoll never looks again by itself, so a missing wake
+/// ends its 4 s wait without the event. Loopback only; every socket goes with the test (rerunnable).
+fn sock_poll_wake() -> TestResult {
+    // Twice: the port and the sockets come back (the Mini-PC runs Safe tests again in one boot).
+    poll_wake_once()?;
+    poll_wake_once()
+}
+
+fn poll_wake_once() -> TestResult {
+    use crate::sock::{abi::*, addr::encode_in, inet::InetSock, sys, Caller, Kind, SockFile};
+    let c = Caller::KERNEL;
+    let inet = |k: Kind| -> Result<Arc<InetSock>, String> {
+        match k {
+            Kind::Inet(i) => Ok(i),
+            _ => Err(String::from("not an AF_INET socket")),
+        }
+    };
+    let at = encode_in(lo_at(LO_PORT + 5));
+    let l = inet(sys::create(AF_INET as u64, SOCK_STREAM, 0, &c).map_err(e)?)?;
+    l.bind(&at, &c).map_err(e)?;
+    l.listen(2, &c).map_err(e)?;
+    let cli = inet(sys::create(AF_INET as u64, SOCK_STREAM, 0, &c).map_err(e)?)?;
+    cli.connect(&at, &c, false).map_err(e)?;
+    let (a, _) = l.accept(false, &c).map_err(e)?;
+    let af = sys::open_file(SockFile::new(Kind::Inet(a)).map_err(e)?, 0);
+    let mut named = 0;
+    let mut other = false;
+    af.file.poll_wait(&mut |q| {
+        named += 1;
+        other |= !core::ptr::eq(q, &crate::sock::inet::READY);
+    });
+    kassert!(named == 1 && !other, "an AF_INET socket names inet::READY alone ({named} queues)");
+    let ep = vfs::epoll::new_epoll();
+    vfs::epoll::Epoll::ctl(&ep, vfs::epoll::EPOLL_CTL_ADD, &af, 3, (vfs::Events::IN | vfs::Events::RDHUP, 3), false).map_err(e)?;
+    // Data from the peer.
+    let got = epoll_after(&ep, || {
+        let _ = cli.send(&mut crate::sock::SliceSource { data: b"wake", at: 0 }, 4, 0, false, None);
+    })?;
+    kassert!(got & vfs::Events::IN != 0, "no EPOLLIN after data (mask {got:#x})");
+    let mut b = [0u8; 8];
+    kassert!(af.file.read_at(0, &mut b) == Ok(4), "the 4 bytes");
+    // The peer's FIN.
+    let got = epoll_after(&ep, || {
+        let _ = cli.shutdown(SHUT_WR);
+    })?;
+    kassert!(got & (vfs::Events::IN | vfs::Events::RDHUP) == vfs::Events::IN | vfs::Events::RDHUP, "no EPOLLIN|EPOLLRDHUP after the FIN (mask {got:#x})");
+    Ok(())
+}
+
+/// An epoll wait of at most 4 s in its own thread, `trigger` while it sleeps: the mask it came back with (0: none).
+fn epoll_after(ep: &Arc<vfs::OpenFile>, trigger: impl FnOnce()) -> Result<u32, String> {
+    let out = Arc::new(ksync::SpinLock::new(None));
+    let (ep2, o) = (ep.clone(), out.clone());
+    let h = sched::spawn("ktest-epoll", sched::Class::Normal, move || {
+        let mut v: Vec<(u32, u64)> = Vec::new();
+        let r = ep2.file.as_epoll().map(|x| x.wait(&mut v, 4, Some(vfs::poll::now() + 4 * SEC), &|| false));
+        *o.lock() = Some((r.is_some_and(|r| r.is_ok()), v.first().map_or(0, |x| x.0)));
+    })
+    .map_err(e)?;
+    sched::sleep_ns(SEC / 20);
+    trigger();
+    kassert!(h.join_timeout(6 * SEC), "the epoll wait did not end");
+    sched::reap();
+    let r = *out.lock();
+    match r {
+        Some((true, m)) => Ok(m),
+        _ => Err(format!("epoll wait failed: {r:?}")),
+    }
+}
+ktest!("nw.sock.poll_wake", Safe, sock_poll_wake);
 
 // ---------------------------------------------------------------------------------------------------------
 // With the scenario's host partners (QEMU only: they talk to 10.0.2.2).

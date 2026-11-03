@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use ksync::SpinLock;
 use uapi::errno::*;
 
@@ -44,6 +44,23 @@ pub fn current_cred() -> Option<Cred> {
     CURRENT_CRED.get().and_then(|f| f())
 }
 
+static ID_VIEW: ksync::Once<fn(u32, u32) -> (u32, u32)> = ksync::Once::new();
+
+/// SX-2 (granted glue): how the calling program sees a file's owner, uid and gid, in its user namespace
+/// (stat's `from_kuid_munged(current_user_ns(), ..)`, fs/stat.c `cp_new_stat`; 65534 when unmapped). vfs-sys
+/// installs the process layer's; without it (host tests, the kernel) the ids stay as they are.
+pub fn set_id_view(f: fn(u32, u32) -> (u32, u32)) {
+    ID_VIEW.get_or_init(|| f);
+}
+
+/// The caller's view of kernel ids (uid, gid); see `set_id_view`.
+pub fn id_view(uid: u32, gid: u32) -> (u32, u32) {
+    match ID_VIEW.get() {
+        Some(f) => f(uid, gid),
+        None => (uid, gid),
+    }
+}
+
 /// Linux `in_group_p` (linux-6.6/kernel/groups.c): the fs gid or one of the supplementary groups.
 pub fn in_group(cred: Cred, gid: u32) -> bool {
     cred.gid == gid || GROUP_CHECK.get().is_some_and(|f| f(cred, gid))
@@ -57,6 +74,10 @@ impl Cred {
 pub const MAY_EXEC: u32 = 1;
 pub const MAY_WRITE: u32 = 2;
 pub const MAY_READ: u32 = 4;
+/// Linux `MAY_ACCESS` (include/linux/fs.h:99): the check is access(2)'s with its real-id credentials, which carry
+/// no capability unless the real uid is its user namespace's root (`access_override_creds`). The mode bits
+/// ignore it; a synthetic file's own permission op (`FileSource::permission`) may look at it.
+pub const MAY_ACCESS: u32 = 0x10;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Times {
@@ -66,8 +87,6 @@ struct Times {
     btime: Time,
 }
 
-/// The time stamp for new events: monotonic since boot (V2 has no wall clock yet; clock_gettime answers the
-/// same clock, so programs see consistent values).
 /// The clock file times come from (INT-A1: the kernel installs the wall clock, so file times agree with
 /// CLOCK_REALTIME); without one, the monotonic clock since boot.
 static CLOCK: ksync::Once<fn() -> u64> = ksync::Once::new();
@@ -242,16 +261,6 @@ impl Meta {
     }
 }
 
-/// FS-1's names for the tmpfs budget, kept for their callers: since FS-5 the system pool of `pool` (R2).
-pub fn set_tmpfs_page_limit(pages: Option<u64>) {
-    crate::pool::set_system_limit(pages);
-}
-
-/// The system pool's limit in pages (u64::MAX when there is no frame allocator to measure).
-pub fn tmpfs_page_limit() -> u64 {
-    crate::pool::system_limit()
-}
-
 /// Frames tmpfs files hold now (all instances; `/proc/meminfo` Shmem).
 pub fn tmpfs_pages_used() -> u64 {
     crate::pagecache::tmpfs_frames()
@@ -261,6 +270,11 @@ pub fn tmpfs_pages_used() -> u64 {
 pub trait InodeOps: Send + Sync {
     /// The file's page cache, when its content goes through one (FS-6..8; then it can be mapped).
     fn page_cache(&self) -> Option<&PageCache> {
+        None
+    }
+    /// PF-4: the page cache when `read_at` is nothing but its `read_at` (then read/pread copy from its pages
+    /// straight to the program); None (the default) keeps every read on `read_at`.
+    fn read_cache(&self) -> Option<&PageCache> {
         None
     }
     fn size(&self) -> u64;
@@ -347,15 +361,22 @@ impl Drop for DenyWrite {
     }
 }
 
-static ALLOCATED: AtomicU64 = AtomicU64::new(0);
-
 impl Inode {
+    /// The permission check of a node (Linux `inode_permission`): a synthetic file with its own permission op
+    /// answers itself (`FileSource::permission`, SX-3b: /proc/sys/user), every other node by its mode bits.
+    pub fn permission(&self, cred: Cred, want: u32) -> Result<(), Errno> {
+        if let Data::Synth(f) = &self.data
+            && let Some(r) = f.permission(cred, want)
+        {
+            return r;
+        }
+        self.meta.permission(cred, want)
+    }
     pub fn new(ino: u64, mode: u32, cred: Cred, data: Data) -> Arc<Inode> {
         Self::with_charge(ino, mode, cred, data, None)
     }
     /// An inode that holds `charge` (its metadata in its file system's pool) until it is freed.
     pub fn with_charge(ino: u64, mode: u32, cred: Cred, data: Data, charge: Option<crate::pool::MetaCharge>) -> Arc<Inode> {
-        ALLOCATED.fetch_add(1, Ordering::Relaxed);
         Arc::new(Inode { meta: Meta::new(ino, mode, cred), data, linkable: AtomicBool::new(false), immutable: AtomicBool::new(false), _charge: charge, magic: None, write_count: AtomicI64::new(0), marks: Default::default() })
     }
     /// FS-15: one more link (`shmem_link` + `inc_nlink`): a tmpfs non-directory that had a name already takes
@@ -384,7 +405,6 @@ impl Inode {
     }
     /// FS-10: a magic link showing `text` (proc's fd links; `st_size` 64 as Linux's `proc_fd_instantiate`).
     pub fn new_magic(ino: u64, mode: u32, cred: Cred, text: Vec<u8>, magic: Arc<dyn crate::synth::MagicLink>) -> Arc<Inode> {
-        ALLOCATED.fetch_add(1, Ordering::Relaxed);
         Arc::new(Inode {
             meta: Meta::new(ino, mode, cred),
             data: Data::Symlink(text),
@@ -483,6 +503,14 @@ impl Inode {
             btime: t.btime,
             mnt_id: 0,
             mount_root: false,
+        }
+    }
+    /// PF-4: the cache `read_at` reads from, when it reads nothing else (`File::read_cache`).
+    pub fn read_cache(&self) -> Option<&PageCache> {
+        match &self.data {
+            Data::Reg(c) => Some(c),
+            Data::External(o) => o.read_cache(),
+            _ => None,
         }
     }
     pub fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -648,11 +676,6 @@ pub fn check_limit(pos: u64, _len: usize) -> Result<(), Errno> {
     if pos >= abi::MAX_FILE_SIZE { Err(EFBIG) } else { Ok(()) }
 }
 
-/// Inodes ever created (for the `vfs root.ready` event and tests).
-pub fn allocated() -> u64 {
-    ALLOCATED.load(Ordering::Relaxed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +716,34 @@ mod tests {
         assert_eq!(m.permission(Cred { uid: 11, gid: 21 }, MAY_READ), Err(EACCES));
         assert!(m.permission(Cred::ROOT, MAY_READ | MAY_WRITE).is_ok());
         assert_eq!(m.permission(Cred::ROOT, MAY_EXEC), Err(EACCES));
+    }
+
+    /// SX-3b fixer: a synthetic file with its own permission op answers instead of its mode bits (0644 root's
+    /// file writable by uid 1000 here, never for access(2)'s MAY_ACCESS); one without keeps the mode bits.
+    #[test]
+    fn synthetic_permission_op() {
+        struct Own;
+        impl crate::synth::FileSource for Own {
+            fn render(&self, _who: Cred) -> Result<alloc::vec::Vec<u8>, Errno> {
+                Ok(alloc::vec::Vec::new())
+            }
+            fn permission(&self, _who: Cred, want: u32) -> Option<Result<(), Errno>> {
+                Some(if want & MAY_ACCESS != 0 { Err(EACCES) } else { Ok(()) })
+            }
+        }
+        struct Plain;
+        impl crate::synth::FileSource for Plain {
+            fn render(&self, _who: Cred) -> Result<alloc::vec::Vec<u8>, Errno> {
+                Ok(alloc::vec::Vec::new())
+            }
+        }
+        let user = Cred { uid: 1000, gid: 1000 };
+        let own = Inode::new(1, uapi::S_IFREG | 0o644, Cred::ROOT, Data::Synth(Arc::new(Own)));
+        assert_eq!(own.permission(user, MAY_WRITE), Ok(()));
+        assert_eq!(own.permission(user, MAY_WRITE | MAY_ACCESS), Err(EACCES));
+        assert_eq!(own.meta.permission(user, MAY_WRITE), Err(EACCES), "the mode bits alone say no");
+        let plain = Inode::new(2, uapi::S_IFREG | 0o644, Cred::ROOT, Data::Synth(Arc::new(Plain)));
+        assert_eq!(plain.permission(user, MAY_WRITE), Err(EACCES));
+        assert_eq!(plain.permission(user, MAY_READ | MAY_ACCESS), Ok(()));
     }
 }

@@ -4,7 +4,6 @@
 //! Module ownership (V2-LANES §2): cpu, gdt, idt, apic, smp, trampoline, msr, percpu, vectors -> CP;
 //! paging, dma, pat -> MM; switch, xsave -> SC; mmio, portio, msi -> PC; nmi, panic, kexec_stub -> RB;
 //! entry, usercopy, signal_frame -> AB; serial and this file -> desk; drv_<lane> -> that driver lane.
-//! The G0 versions are crude but have the final API shape.
 //!
 //! Host builds (`cargo test` on CachyOS): privileged code is compiled only for `target_os = "none"`; the host
 //! gets harmless shims so the crates above can be unit-tested.
@@ -31,6 +30,8 @@ pub mod pat;
 pub mod percpu;
 mod percpu_free;
 pub mod portio;
+#[cfg(bitsos_fd_measure)]
+pub mod prof;
 pub mod serial;
 pub mod signal_frame;
 pub mod smp;

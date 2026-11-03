@@ -1,0 +1,15 @@
+socketpair = 0
+passcred = 0
+unshare = 0
+uid_map = 8
+setgroups = 4
+gid_map = 8
+peercred = 0
+peercred inside: pid parent yes uid 0 gid 0
+send own = 1
+send uid 5 = -EINVAL
+send other pid = -EPERM
+child: exit 0
+recv = 1
+outside: pid child yes uid real yes gid real yes
+recv more = -EAGAIN

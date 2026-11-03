@@ -2,7 +2,7 @@
 //! `MM_FILEPAGES`, `MM_SHMEMPAGES`, plus V2's device pages), the RSS high-water mark (`hiwater_rss`) and the
 //! page tables of the user half (`mm_pgtables_bytes`). Changed where entries come and go: a fill
 //! (`fault::fill_at`), a swap (`fault::swap_page`: copy-on-write, a private file copy, a device page change), an
-//! unmap (`unmap_one`, per released entry), a page-table allocation (`alloc_table`) or release (`Released.table`),
+//! unmap (`hand_back`, per released entry), a page-table allocation (`alloc_table`) or release (`Released.table`),
 //! the fork's copy. Moves (`mremap`) change nothing. The drop needs none of them.
 //!
 //! All writers hold the space's lock (or own a space nobody sees yet), so the atomics only make the readers
@@ -29,7 +29,7 @@ impl Class {
     /// (a private copy inside a file VMA too), a device VMA's page is the device's.
     pub(crate) fn of(phys: u64, owner: &Owner) -> Class {
         match owner {
-            Owner::Device => Class::Device,
+            Owner::Device(_) => Class::Device,
             Owner::Anon => Class::Anon,
             Owner::File(..) if mm_core::is_user_frame(phys) => Class::Anon,
             Owner::File(_, true) => Class::Shmem,
@@ -53,9 +53,25 @@ pub(crate) struct Counters {
     tables: AtomicU64,
     /// Underflows of this space's counts (the global `UNDERFLOWS` sums all spaces; a test asks its own space).
     underflows: AtomicU64,
+    /// MM-11 fixer: this space's shootdown rounds and IPIs (with resends) of munmap/madvise/reclaim zaps and
+    /// mprotect, so a test counts its own space's IPIs while other programs run (the global counters mix them).
+    rounds: AtomicU64,
+    ipis: AtomicU64,
+    /// MM-13: 2 MiB entries mapped now (their 512 pages each are in `pages` too; smaps' AnonHugePages).
+    huge: AtomicU64,
 }
 
 impl Counters {
+    pub(crate) fn shot(&self, rounds: u64, ipis: u64) {
+        self.rounds.fetch_add(rounds, Relaxed);
+        self.ipis.fetch_add(ipis, Relaxed);
+    }
+
+    /// (rounds, IPIs) so far (`shot`).
+    pub(crate) fn shots(&self) -> (u64, u64) {
+        (self.rounds.load(Relaxed), self.ipis.load(Relaxed))
+    }
+
     pub(crate) fn add(&self, c: Class, n: u64) {
         self.pages[c as usize].fetch_add(n, Relaxed);
         if c != Class::Device {
@@ -73,6 +89,18 @@ impl Counters {
             self.add(new, 1);
             self.sub(old, 1);
         }
+    }
+
+    pub(crate) fn huge_add(&self, n: u64) {
+        self.huge.fetch_add(n, Relaxed);
+    }
+
+    pub(crate) fn huge_sub(&self, n: u64) {
+        self.take(&self.huge, n, "huge");
+    }
+
+    pub(crate) fn huge(&self) -> u64 {
+        self.huge.load(Relaxed)
     }
 
     pub(crate) fn tables_added(&self, n: u64) {

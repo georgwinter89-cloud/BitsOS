@@ -14,20 +14,58 @@ struct Listener {
 }
 
 /// A program's listening socket on the stack (NW-5): connections are taken without waiting; dropping it closes
-/// the port like a kernel listener.
-pub struct ProgListener(Listener);
+/// the port like a kernel listener. NW-11: in a network namespace below the initial one it listens on that
+/// namespace's loopback only.
+pub struct ProgListener(Prog);
+
+enum Prog {
+    Stack(Listener),
+    Lo(LoListener),
+}
+
+/// A listener on a namespace's loopback: its accept queue sits in the loopback's port table until it closes.
+struct LoListener {
+    queue: Arc<AcceptQueue>,
+}
+
+impl Drop for LoListener {
+    fn drop(&mut self) {
+        // A closed queue is a free port in the loopback's table; a connection pushed meanwhile is reset.
+        self.queue.close();
+    }
+}
 
 impl ProgListener {
-    pub fn try_accept(&self) -> Option<Box<dyn crate::conn::Conn>> {
-        let c = self.0.shared.queue.try_pop();
-        if c.is_some() {
-            // Room in the backlog again: the poll thread refills the listening sockets.
-            self.0.stack.kick();
+    /// Listens on loopback `lo` (127/8 and 0.0.0.0 listeners hear it; another address hears nothing there).
+    pub(crate) fn on_loopback(lo: &crate::loopback::Loopback, addr: SockAddr, side: Side) -> Result<ProgListener, NetError> {
+        if addr.port == 0 {
+            return Err(NetError::Other);
         }
-        c
+        let queue = Arc::new(AcceptQueue::new());
+        if addr.ip.is_unspecified() || addr.ip.is_loopback() {
+            lo.register_side(addr.port, side, &queue)?;
+        }
+        Ok(ProgListener(Prog::Lo(LoListener { queue })))
+    }
+
+    pub fn try_accept(&self) -> Option<Box<dyn crate::conn::Conn>> {
+        match &self.0 {
+            Prog::Stack(l) => {
+                let c = l.shared.queue.try_pop();
+                if c.is_some() {
+                    // Room in the backlog again: the poll thread refills the listening sockets.
+                    l.stack.kick();
+                }
+                c
+            }
+            Prog::Lo(l) => l.queue.try_pop(),
+        }
     }
     pub fn pending(&self) -> usize {
-        self.0.shared.queue.len()
+        match &self.0 {
+            Prog::Stack(l) => l.shared.queue.len(),
+            Prog::Lo(l) => l.queue.len(),
+        }
     }
 }
 
@@ -102,7 +140,7 @@ impl Stack {
     }
 
     /// A listener that also takes peers outside the private networks. Not reachable through `KSocket` (B8: no
-    /// BitsOS service listens publicly); for tests that need the difference.
+    /// BitsOS service listens publicly); a deliberate test-only escape hatch (ktests and host tests only, C1).
     pub fn tcp_listen_public(&self, addr: SockAddr, backlog: usize) -> Result<Box<dyn TcpListener>, NetError> {
         self.listen_with(addr, backlog, false, false)
     }
@@ -114,7 +152,7 @@ impl Stack {
     /// A program's listener (NW-5): private networks only like every listener of this stack, its owner named in
     /// the records of what it accepts, `rx`/`tx` buffer sizes for its connections.
     pub(crate) fn listen_prog(&self, addr: SockAddr, side: Side, backlog: usize, owner: policy::Subject, rx: usize, tx: usize) -> Result<ProgListener, NetError> {
-        self.listen_inner(addr, side, backlog, true, false, owner, Some((rx, tx))).map(|l| ProgListener(l))
+        self.listen_inner(addr, side, backlog, true, false, owner, Some((rx, tx))).map(|l| ProgListener(Prog::Stack(l)))
     }
 
     fn listen_inner(&self, addr: SockAddr, side: Side, backlog: usize, private_only: bool, reserve: bool, owner: policy::Subject, prog: Option<(usize, usize)>) -> Result<Listener, NetError> {

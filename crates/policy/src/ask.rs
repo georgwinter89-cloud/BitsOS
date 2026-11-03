@@ -23,7 +23,7 @@ pub struct AskInfo {
     pub id: u64,
     pub subject: Subject,
     pub class: AccessClass,
-    /// The access in words ("Datei /home/georg/x lesen").
+    /// The access in words ("Datei /home/user/x lesen").
     pub what: String,
     /// On the wait clock (`ksync::now_ns`, host: process clock).
     pub timeout_ns: u64,

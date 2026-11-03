@@ -19,7 +19,8 @@ mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 LO="${BITSOS_PORT_LO:-23000}"
 PORT=$((LO + 300))
-LISTENER=/home/georg/BitsOS/BitsOS-Plattform/console-listen.mjs
+# V1's host listener, unchanged (BITSOS_LISTENER overrides where V1 lies; no home value in the public tree).
+LISTENER="${BITSOS_LISTENER:-$HOME/BitsOS/BitsOS-Plattform/console-listen.mjs}"
 BOOT_LINE="BdsDxe: loading"
 
 if ! command -v node > /dev/null; then

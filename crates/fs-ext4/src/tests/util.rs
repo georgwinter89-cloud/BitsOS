@@ -20,21 +20,56 @@ pub fn now() -> Time {
     Time { sec: 1_700_000_100 + (n / 1000) as i64, nsec: ((n % 1000) * 1_000_000) as u32 }
 }
 
+/// `vfs::writeback::sync_all`/`flush_all` and `mount::sync_all` act on every volume of this test process (the
+/// process-global lists), so a parallel test's pass can flush, commit, empty the log of or stop another test's
+/// volume (C1, KNOWN-REDS: `dirty` set again after a `stop`, a log emptied before a replay test reads it, a
+/// failure counted from a volume a cut test breaks on purpose). A test that runs such a pass holds `SYNC`
+/// alone (`global_sync`, `Scratch::alone`); every other test with a volume holds it shared (`Scratch::new`,
+/// `shared_sync`), so the passes never meet another test's volume.
+static SYNC: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Held for a test's whole body (one of the two is set).
+pub struct SyncGuard {
+    _shared: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _alone: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+}
+
+pub fn shared_sync() -> SyncGuard {
+    SyncGuard { _shared: Some(SYNC.read().unwrap_or_else(|e| e.into_inner())), _alone: None }
+}
+
+pub fn global_sync() -> SyncGuard {
+    SyncGuard { _shared: None, _alone: Some(SYNC.write().unwrap_or_else(|e| e.into_inner())) }
+}
+
 pub fn opts() -> Options {
     Options { writable: true, now }
 }
 
 /// A scratch directory below the target directory, removed with the value.
-pub struct Scratch(pub PathBuf);
+pub struct Scratch {
+    dir: PathBuf,
+    _sync: SyncGuard,
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 impl Scratch {
+    /// A scratch directory for a test whose volumes no global pass may touch (shared `SYNC`).
     pub fn new() -> Scratch {
+        Scratch::with(shared_sync())
+    }
+
+    /// A scratch directory for a test that runs a global pass itself (`SYNC` alone).
+    pub fn alone() -> Scratch {
+        Scratch::with(global_sync())
+    }
+
+    fn with(g: SyncGuard) -> Scratch {
         let base = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| {
             let exe = std::env::current_exe().unwrap();
             exe.ancestors().find(|a| a.file_name().is_some_and(|n| n == "target")).map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir)
@@ -42,10 +77,10 @@ impl Scratch {
         let d = base.join("fs-ext4-tests").join(format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        Scratch(d)
+        Scratch { dir: d, _sync: g }
     }
     pub fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
+        self.dir.join(name)
     }
 }
 

@@ -14,7 +14,9 @@
 //!
 //! Kept: contents, owners, modes (setuid/setgid too: owner before mode, as chown clears them,
 //! linux-6.6/fs/attr.c setattr_should_drop_suidgid), times, symlinks, hard links inside the copied tree, holes
-//! of sparse files. Not copied but named in the report: sockets, FIFOs, device nodes (V2 has no mknod yet).
+//! of sparse files. Not copied but named in the report (`not_restored`): sockets, FIFOs and device nodes, on
+//! purpose (desk C1): a socket node is dead after a restore, a FIFO holds no data (whoever uses it makes it
+//! again), and a restore running as root must not make device nodes from a volume uid-1000 programs shape.
 //! Extended attributes: V2 has no xattr calls yet, so no program can have set any.
 //!
 //! A restore cut off (crash, kill, Reload) leaves its hidden copy; `/data/.bitssnap-restoring` lists the copies
@@ -68,8 +70,8 @@ pub struct Report {
     pub links: u64,
     /// Extra names of a file already copied (hard links kept as such).
     pub hardlinks: u64,
-    /// Sockets, FIFOs and device nodes: not copied (`special` names them, the answer lists them as
-    /// not_restored; V2 has no mknod yet, and a socket node is dead after a restore anyway).
+    /// Sockets, FIFOs and device nodes: not copied, on purpose (module doc); `special` names them, the answer
+    /// lists them as not_restored.
     pub skipped: u64,
     pub special: Vec<String>,
     pub bytes: u64,

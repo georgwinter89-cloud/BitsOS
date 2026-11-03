@@ -110,7 +110,10 @@ fn initial_stack(pie: bool) -> TestResult {
     let (p, out) = start_as(path, &img, &argv, None, true, uid)?;
     let e = elf::Elf::parse(&img, hal::USER_TOP)?;
     let plan = load::plan(&e, mm::MMAP_TOP, crate::STACK_TOP - crate::STACK_SIZE - crate::image::STACK_GAP)?;
-    let aux_list = crate::image::auxv(&e, &plan, 0, &crate::cred::Cred::new(uid, uid));
+    // AB-14: the vDSO's address is mm's choice (the first free slot below the program); the list needs it.
+    let vdso = p.saved_auxv.lock().chunks(2).find(|c| c.first() == Some(&AT_SYSINFO_EHDR)).and_then(|c| c.get(1).copied());
+    kassert!(vdso.is_some(), "no AT_SYSINFO_EHDR");
+    let aux_list = crate::image::auxv(&e, &plan, 0, vdso, &crate::cred::Cred::new(uid, uid));
     let a: Vec<&[u8]> = argv.iter().map(|s| s.as_bytes()).collect();
     let env: [&[u8]; 2] = [b"HOME=/", b"AB2=yes"];
     let rsp = stack::build(crate::STACK_TOP, crate::STACK_SIZE, &a, &env, path.as_bytes(), [0; 16], &aux_list).map_err(|_| "stack build")?.rsp;
@@ -130,7 +133,7 @@ fn initial_stack(pie: bool) -> TestResult {
     kassert!(parsed.argv == want_argv, "argv {:?}", parsed.argv);
     kassert!(parsed.envp == [b"HOME=/".to_vec(), b"AB2=yes".to_vec()], "envp {:?}", parsed.envp);
     let keys: Vec<u64> = parsed.auxv.iter().map(|(k, _)| *k).collect();
-    let linux_order = [AT_MINSIGSTKSZ, AT_HWCAP, AT_PAGESZ, AT_CLKTCK, AT_PHDR, AT_PHENT, AT_PHNUM, AT_BASE, AT_FLAGS, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE, AT_RANDOM, AT_HWCAP2, AT_EXECFN, AT_PLATFORM];
+    let linux_order = [AT_SYSINFO_EHDR, AT_MINSIGSTKSZ, AT_HWCAP, AT_PAGESZ, AT_CLKTCK, AT_PHDR, AT_PHENT, AT_PHNUM, AT_BASE, AT_FLAGS, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE, AT_RANDOM, AT_HWCAP2, AT_EXECFN, AT_PLATFORM];
     kassert!(keys == linux_order, "auxv keys {keys:?}");
     let aux = |k: u64| parsed.auxv.iter().find(|(x, _)| *x == k).map(|(_, v)| *v).unwrap_or(u64::MAX);
     let base = if pie { 0 } else { 0x40_0000 };

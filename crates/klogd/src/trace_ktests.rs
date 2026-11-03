@@ -150,6 +150,41 @@ fn ratelimit() -> TestResult {
 }
 ktest!("rb.events.ratelimit", Safe, ratelimit);
 
+/// RB-12: a storm of Debug records (sched's pi.boost/pi.unboost on the Mini-PC) is summarised at Debug, not as
+/// a warning; nothing real is hidden (every suppressed record is still counted). Debug is switched on for the
+/// test's own subsystem only, and the boot's level settings come back afterwards. Rerunnable (Safe).
+fn ratelimit_level() -> TestResult {
+    let spec = klog::levels();
+    klog::set_levels(&alloc::format!("{spec},rbrld=debug")).map_err(|e| alloc::format!("levels: {e}"))?;
+    let r = ratelimit_level_on();
+    let back = klog::set_levels(&spec);
+    r?;
+    back.map_err(|e| alloc::format!("levels back to {spec}: {e}"))
+}
+
+fn ratelimit_level_on() -> TestResult {
+    let before = klog::ratelimit::get();
+    klog::ratelimit::set(20, 5);
+    let start = klog::next_seq();
+    for i in 0..200u32 {
+        klog::event!(Debug, "rbrld", "dflood", i = i);
+    }
+    klog::ratelimit::set(before.0, before.1);
+    let kept = stored(start, "rbrld") as u64;
+    let sum = reported(start, "rbrld", 200 - kept);
+    let levels: Vec<klog::Level> = klog::read(start, usize::MAX, &klog::Filter { subsystem: Some("klog"), name: Some("ratelimit.suppressed"), ..klog::Filter::ALL })
+        .records
+        .iter()
+        .filter(|r| klog::fields::value_of(&r.text, "subsystem") == Some("rbrld"))
+        .map(|r| r.level)
+        .collect();
+    kassert!(kept <= 22, "{kept} of 200 stored at a limit of 20");
+    kassert!(sum == 200 - kept, "klogd reported {sum} suppressed, want {}", 200 - kept);
+    kassert!(!levels.is_empty() && levels.iter().all(|l| *l == klog::Level::Debug), "summary levels {levels:?}, want Debug");
+    Ok(())
+}
+ktest!("rb.events.ratelimit_level", Safe, ratelimit_level);
+
 /// Every CPU logs one event as fast as it can: the ring gets about the burst, not the storm, and every record
 /// is either stored or reported as suppressed.
 fn storm_bounded() -> TestResult {

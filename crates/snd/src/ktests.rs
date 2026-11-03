@@ -63,7 +63,7 @@ pub(crate) fn wait(cond: impl Fn() -> bool, ns: u64) -> bool {
 
 ktest!("sn.mix.null", Safe, null);
 /// A private mixer thread on the null output (by the clock): two clients (44.1 and 48 kHz) drain completely,
-/// a starved one counts its underrun, the thread is KernelRt. Touches no hardware.
+/// a starved one counts its underrun, a stop-on-underrun one xruns, the thread is KernelRt. Touches no hardware.
 fn null() -> TestResult {
     let m = Mixer::spawn("snd/mix-test", Config::latency_ms(40), |_| NoOutputs).map_err(err("spawn"))?;
     let r = (|| -> TestResult {
@@ -84,6 +84,13 @@ fn null() -> TestResult {
         z.start();
         kassert!(wait(|| z.underruns().0 >= 1, SLACK_NS), "no underrun counted");
         kassert!(z.underruns().1 > 0 && z.state() == State::Running);
+        // SN-12: a stop-on-underrun client xruns; its event carries period, ring state and both latenesses.
+        let w = m.open(F48, 4800, "ktest.xrun").map_err(err("open xrun"))?;
+        w.set_stop_on_underrun(true);
+        kassert!(w.write(&bytes(&testsig::frames(testsig::a, 0, 480))) == Ok(480 * 4));
+        w.start();
+        kassert!(wait(|| w.state() == State::Xrun, SLACK_NS), "no xrun: {}", w.state().name());
+        kassert!(w.underruns().0 == 1 && w.position() == 480, "xrun {:?} at {}", w.underruns(), w.position());
         let st = m.status();
         kassert!(st.endpoint.is_none() && st.mixed >= (ny as u64), "status {st:?}");
         klog::event!(Info, "ktest", "mix.null", mixed = st.mixed, played = st.played, hw_underruns = st.hw_underruns, starved = z.underruns().0,
@@ -183,7 +190,7 @@ pub(crate) fn fixed(dev: &str) -> Target {
 /// The client `sn.mix.leave_running` left (closed by the next mixer test).
 static LEFT: ksync::SpinLock<Vec<crate::Playback>> = ksync::SpinLock::named("snd.ktest_left", Vec::new());
 
-fn release_left() {
+pub(crate) fn release_left() {
     let old = core::mem::take(&mut *LEFT.lock());
     drop(old);
 }

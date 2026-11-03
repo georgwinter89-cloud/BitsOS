@@ -36,7 +36,7 @@ impl QemuOpts {
     pub fn new(name: &str) -> QemuOpts {
         QemuOpts {
             name: name.into(), smp: 2, mem: "2G".into(), net: "none".into(), hostfwd: vec![], res: None,
-            display: "none".into(), timeout: 60, serial_log: None, extra: vec![], echo: true, boot_retries: 2,
+            display: "none".into(), timeout: 60, serial_log: None, extra: vec![], echo: true, boot_retries: 3,
         }
     }
 
@@ -140,27 +140,92 @@ pub fn run(root: &Path, o: &QemuOpts) -> Result<RunResult, String> {
     let mut attempt = 0;
     loop {
         let r = run_once(root, o, &lane, &x, &img, &log)?;
-        if !r.stalled || attempt >= o.boot_retries {
+        if !r.stalled || attempt >= retries(o.boot_retries, r.gave_up) {
             if r.stalled {
                 eprintln!("xtask: firmware stall on every try ({} boots): no `bitsboot:` line in {}", attempt + 1, log.display());
             }
             return Ok(RunResult { exit: r.exit, timed_out: r.timed_out, log });
         }
         attempt += 1;
-        eprintln!("xtask: OVMF stalled before bitsboot (no `bitsboot:` line); boot retry {attempt} of {}", o.boot_retries);
+        if r.gave_up {
+            eprintln!("xtask: OVMF found nothing to boot (no `bitsboot:` line); boot retry {attempt} of {}", retries(o.boot_retries, true));
+        } else {
+            eprintln!("xtask: OVMF stalled before bitsboot (no `bitsboot:` line); boot retry {attempt} of {}", o.boot_retries);
+        }
     }
+}
+
+/// LO-1 review: OVMF's "No bootable option" (its USB stick "Not Found") comes within seconds and is a coin toss at
+/// many vCPUs (measured 30.10.: about 1 in 3 boots loads bitsboot at -smp 16, the image does not matter), so such a
+/// boot is retried more often than a slow stall: it costs seconds, not the stall bound. A bound for one run, not a
+/// count of things (R1). `--boot-retries 0` stays 0.
+const FIRMWARE_MISS_RETRIES: u32 = 11;
+
+fn retries(boot_retries: u32, gave_up: bool) -> u32 {
+    if gave_up && boot_retries > 0 { boot_retries.max(FIRMWARE_MISS_RETRIES) } else { boot_retries }
 }
 
 /// OVMF variables saved from a boot that reached bitsboot (see `run_once`).
 const SEED_VARS: &str = "ovmf-vars-seed.fd";
 
-/// The firmware never reached bitsboot within this time: a stall, not a kernel problem.
-const STALL_SECS: u64 = 25;
+/// The firmware never reached bitsboot within `stall_secs`: a stall, not a kernel problem. OVMF brings every vCPU
+/// up before bitsboot runs, slower with more of them and slower still on a busy host (W28: -smp 16 under the gate's
+/// load was judged a stall), so the bound grows with both: 25 s + 3 s per vCPU, times the host's load per CPU
+/// (1-minute average, counted from 1, at most 3).
+fn stall_secs(smp: u32, load_per_cpu: f64) -> u64 {
+    let base = 25 + 3 * u64::from(smp);
+    let factor = if load_per_cpu.is_finite() { load_per_cpu.clamp(1.0, 3.0) } else { 1.0 };
+    (base as f64 * factor).ceil() as u64
+}
+
+/// The host's 1-minute load average per CPU (0 when /proc/loadavg cannot be read).
+fn host_load_per_cpu() -> f64 {
+    let load = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()));
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    load.map_or(0.0, |l| l / cpus)
+}
+
+/// Whether this boot's variables become the seed every later boot copies: only from a boot that reached bitsboot
+/// and only once, so a stalled boot's state never reaches a retry (each retry copies the seed afresh).
+fn keep_as_seed(stalled: bool, seed_exists: bool, reached: bool) -> bool {
+    !stalled && !seed_exists && reached
+}
 
 struct Once {
     exit: Option<i32>,
     timed_out: bool,
     stalled: bool,
+    /// The stall was OVMF saying it found nothing to boot.
+    gave_up: bool,
+}
+
+/// OVMF's last word when no boot option loaded (BdsDxe), with no `bitsboot:` before it: bitsboot never ran. (After
+/// bitsboot ran and returned, as with an image without a system, the same line follows a `bitsboot:` line.)
+fn firmware_gave_up(log: &Path) -> bool {
+    std::fs::read(log).is_ok_and(|b| gave_up(&b))
+}
+
+fn gave_up(b: &[u8]) -> bool {
+    let find = |n: &[u8]| b.windows(n.len()).position(|w| w == n);
+    match (find(b"No bootable option or device was found"), find(b"bitsboot:")) {
+        (Some(_), None) => true,
+        (Some(nb), Some(bb)) => nb < bb,
+        _ => false,
+    }
+}
+
+/// The vCPUs QEMU gets: QemuOpts::smp, or a later `-smp N` among the extra arguments (the gate's NMI steps pass it
+/// there), which QEMU takes over the first.
+fn vcpus(o: &QemuOpts) -> u32 {
+    let mut n = o.smp;
+    for w in o.extra.windows(2) {
+        if w[0] == "-smp"
+            && let Some(v) = w[1].split(',').next().and_then(|x| x.trim_start_matches("cpus=").parse().ok())
+        {
+            n = v;
+        }
+    }
+    n
 }
 
 fn reached_bitsboot(log: &Path) -> bool {
@@ -189,11 +254,13 @@ fn run_once(root: &Path, o: &QemuOpts, lane: &str, x: &Path, img: &Path, log: &P
     let _ = std::fs::write(&pidfile, format!("{pid}\n"));
     eprintln!("xtask: qemu pid {pid} (lane {lane}, name v2-{lane}-{}), timeout {} s, log {}", o.name, o.timeout, log.display());
 
+    let stall = stall_secs(vcpus(o), host_load_per_cpu());
     let start = Instant::now();
     let mut echoed: u64 = 0;
     let mut timed_out = false;
     let mut seen_loader = false;
     let mut stalled = false;
+    let mut gave_up = false;
     let status = loop {
         if o.echo {
             echo_new(log, &mut echoed);
@@ -202,7 +269,16 @@ fn run_once(root: &Path, o: &QemuOpts, lane: &str, x: &Path, img: &Path, log: &P
             stalled = !reached_bitsboot(log);
             break Some(st);
         }
-        if !seen_loader && start.elapsed() >= Duration::from_secs(STALL_SECS.min(o.timeout)) {
+        // LO-1 review: OVMF said it found nothing to boot (its "Not Found" for the USB stick at many vCPUs): it never
+        // tries again by itself, so the boot is a stall now, not after the whole bound.
+        if !seen_loader && firmware_gave_up(log) {
+            stalled = true;
+            gave_up = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        if !seen_loader && start.elapsed() >= Duration::from_secs(stall.min(o.timeout)) {
             seen_loader = reached_bitsboot(log);
             if !seen_loader {
                 stalled = true;
@@ -224,13 +300,13 @@ fn run_once(root: &Path, o: &QemuOpts, lane: &str, x: &Path, img: &Path, log: &P
         echo_new(log, &mut echoed);
     }
     let _ = std::fs::remove_file(&pidfile);
-    if !stalled && !seed.is_file() && reached_bitsboot(log) {
+    if keep_as_seed(stalled, seed.is_file(), reached_bitsboot(log)) {
         let tmp = x.join(format!("{SEED_VARS}.{}", std::process::id()));
         if std::fs::copy(&vars, &tmp).is_ok() {
             let _ = std::fs::rename(&tmp, &seed);
         }
     }
-    Ok(Once { exit: status.and_then(|s| s.code()), timed_out: timed_out || (stalled && status.is_none()), stalled })
+    Ok(Once { exit: status.and_then(|s| s.code()), timed_out: timed_out || (stalled && status.is_none()), stalled, gave_up })
 }
 
 fn echo_new(log: &Path, pos: &mut u64) {
@@ -278,6 +354,40 @@ pub fn cmd_qemu(root: &Path, mut a: Args) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_bound_grows_with_vcpus_and_load() {
+        assert_eq!(stall_secs(2, 0.0), 31, "an idle host, 2 vCPUs");
+        assert_eq!(stall_secs(16, 0.5), 73, "16 vCPUs: 25 + 48");
+        assert_eq!(stall_secs(16, 2.0), 146, "twice as many runnable tasks as CPUs");
+        assert_eq!(stall_secs(16, 50.0), 219, "at most three times");
+        assert_eq!(stall_secs(4, f64::NAN), 37);
+    }
+
+    #[test]
+    fn firmware_gave_up_only_without_bitsboot_first() {
+        assert!(gave_up(b"BdsDxe: failed to load Boot0002 ...: Not Found\r\nBdsDxe: No bootable option or device was found.\r\n"));
+        assert!(!gave_up(b"bitsboot: cannot start BitsOS\r\nBdsDxe: No bootable option or device was found.\r\n"), "bitsboot ran");
+        assert!(!gave_up(b"BdsDxe: loading Boot0002\r\nbitsboot: v2\r\n"));
+        assert!(!gave_up(b""));
+        let mut o = QemuOpts::new("t");
+        assert_eq!(vcpus(&o), o.smp);
+        o.extra = ["-device", "x", "-smp", "16"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(vcpus(&o), 16, "the gate's -smp among the extra arguments");
+        o.extra = ["-smp", "cpus=8,sockets=1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(vcpus(&o), 8);
+        assert_eq!((retries(3, false), retries(3, true), retries(0, true)), (3, FIRMWARE_MISS_RETRIES, 0));
+    }
+
+    #[test]
+    fn three_boot_retries_from_a_seed_no_stall_wrote() {
+        assert_eq!(QemuOpts::new("t").boot_retries, 3, "W28: two retries were not enough at -smp 16");
+        assert!(keep_as_seed(false, false, true));
+        assert!(!keep_as_seed(true, false, false), "a stalled boot's variables never become the seed");
+        assert!(!keep_as_seed(true, false, true));
+        assert!(!keep_as_seed(false, true, true), "the seed is written once");
+        assert!(!keep_as_seed(false, false, false));
+    }
 
     #[test]
     fn exit_codes_map() {

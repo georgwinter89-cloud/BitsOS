@@ -1,4 +1,4 @@
-//! UL-4b: the tools in `user/tools` (procs, evtest, fbtest, memstress, alsa-test) on V2.
+//! UL-4b: the tools in `user/tools` (procs, evtest, fbtest, memstress) on V2.
 //! - `ul.tools.cases`: every line of `user/tools/cases.txt` (CachyOS answers the same table in
 //!   `host/tests/ul/40-tools-linux.sh`): exit codes and, where named, stdout equal to CachyOS's transcript.
 //! - `ul.tools.procs`: the listing has its header and a line for the procs process itself; `--probe` names
@@ -31,7 +31,6 @@ fn expected(name: &str) -> Option<&'static str> {
         "memstress-commit-mmap.txt" => include_str!("../../../../user/tools/expected/memstress-commit-mmap.txt"),
         "memstress-rules.txt" => include_str!("../../../../user/tools/expected/memstress-rules.txt"),
         "memstress-replay.txt" => include_str!("../../../../user/tools/expected/memstress-replay.txt"),
-        "alsa-test.txt" => include_str!("../../../../user/tools/expected/alsa-test.txt"),
         _ => return None,
     })
 }
@@ -48,7 +47,7 @@ fn run(argv: &[&str], timeout_s: u64) -> Result<(i32, String, String), String> {
 }
 
 fn cases() -> TestResult {
-    for p in ["procs", "evtest", "fbtest", "memstress", "alsa-test"] {
+    for p in ["procs", "evtest", "fbtest", "memstress"] {
         need(&format!("/bin/{p}"))?;
     }
     let mut n = 0;

@@ -605,3 +605,27 @@ fn a_run_stops_after_the_first_command_that_is_not_clean() {
     assert!(!bot::clean(&c, &Ran { cbw: XferResult::ok(30), ..ran }));
     assert_eq!(BotError::Transport("x").as_str(), "x");
 }
+
+// ---- RB-14: the storage stop before a reset
+
+#[test]
+fn a_stop_waits_for_the_command_under_way_and_then_no_command_starts() {
+    let (dev, s, d) = setup_with(vec![Lun::new(512, 4096)], 120 * 1024, true);
+    let d = &d[0];
+    d.write_blocks(3, &[5; 512], false, P).unwrap();
+    let sent = || dev.with(|st| st.cdbs.len());
+    // A command holds the device (the gate): the stop cannot call it idle before its deadline.
+    let held = s.gate().acquire(P, 0).unwrap();
+    assert!(!s.stop_io(0, &|| 0), "busy at the deadline");
+    assert!(s.is_stopped());
+    drop(held);
+    assert!(s.stop_io(0, &|| 0), "idle once the command ended");
+    let before = sent();
+    assert_eq!(read(d, 3, 1), Err(DevError::Gone));
+    assert_eq!(d.write_blocks(3, &[6; 512], false, P), Err(DevError::Gone));
+    assert_eq!(d.flush(), Err(DevError::Gone));
+    assert_eq!(sent(), before, "nothing reached the device after the stop");
+    assert!(!d.is_gone(), "stopped is not gone: the disk stays registered");
+    s.resume_io();
+    assert_eq!(read(d, 3, 1).unwrap(), vec![5; 512]);
+}

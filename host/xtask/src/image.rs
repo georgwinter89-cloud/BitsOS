@@ -106,7 +106,22 @@ fn is_elf(p: &Path) -> bool {
 }
 
 /// Test-only programs a V2_LEAN image leaves out (the ABI-diff set is skipped as a whole).
-const LEAN_DROP: &[&str] = &["hello", "hello-rs", "abi-a", "abi-b", "abi-c", "alsa-test", "evtest", "fbtest", "mcp-fakesvc", "memstress", "stress"];
+const LEAN_DROP: &[&str] = &["hello", "hello-rs", "abi-a", "abi-b", "abi-c", "evtest", "fbtest", "mcp-fakesvc", "memstress", "stress"];
+
+/// The `executable` paths of cargo's `compiler-artifact` messages (`--message-format=json`); cargo writes paths
+/// as JSON strings, so a backslash or quote in a path is escaped and such a path is skipped (none in the tree).
+fn built_executables(json_lines: &str) -> Vec<PathBuf> {
+    const KEY: &str = "\"executable\":\"";
+    json_lines
+        .lines()
+        .filter(|l| l.contains("\"reason\":\"compiler-artifact\""))
+        .filter_map(|l| {
+            let rest = &l[l.find(KEY)? + KEY.len()..];
+            let path = &rest[..rest.find('"')?];
+            (!path.contains('\\')).then(|| PathBuf::from(path))
+        })
+        .collect()
+}
 
 fn build_user(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let user = root.join("user");
@@ -118,19 +133,25 @@ fn build_user(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
         c.current_dir(&user)
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("RUSTUP_TOOLCHAIN")
-            .args(["build", "--manifest-path", "Cargo.toml", "--target", "x86_64-unknown-linux-musl", "--release", "--target-dir"])
-            .arg(&tdir);
-        run_status(&mut c, "building user programs")?;
-        let rel = tdir.join("x86_64-unknown-linux-musl/release");
-        if let Ok(rd) = std::fs::read_dir(&rel) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let name = e.file_name().to_string_lossy().to_string();
-                if p.is_file() && p.extension().is_none() && !name.starts_with('.') && is_elf(&p) {
-                    out.push((name, p));
-                }
+            .args(["build", "--manifest-path", "Cargo.toml", "--target", "x86_64-unknown-linux-musl", "--release"])
+            .args(["--message-format=json-render-diagnostics", "--target-dir"])
+            .arg(&tdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        eprintln!("xtask: building user programs");
+        let o = c.output().map_err(|e| format!("building user programs: cannot start: {e}"))?;
+        if !o.status.success() {
+            return Err(format!("building user programs: failed ({})", o.status));
+        }
+        // Only the programs this build produced (C1): the release folder keeps the binaries of crates that were
+        // deleted since (alsa-test), and a folder listing put them into every image.
+        for p in built_executables(&String::from_utf8_lossy(&o.stdout)) {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if p.is_file() && !name.is_empty() && is_elf(&p) && !out.iter().any(|(n, _)| *n == name) {
+                out.push((name, p));
             }
         }
+        out.sort();
     } else {
         eprintln!("xtask: no user/Cargo.toml yet, skipping Rust user programs");
     }
@@ -164,6 +185,12 @@ fn build_user(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
             out.retain(|(n, _)| n != "busybox");
             out.push(("busybox".to_string(), bb));
         }
+        // INT-W27b (SX-3b CR2): bubblewrap 0.13.1 as /bin/bwrap (138 KB, static-pie), for the Steam container and
+        // Brave's launcher (a real bwrap on PATH wins over its stand-in); also in the lean image.
+        if let Some(bw) = build_port(root, "bubblewrap", "bwrap") {
+            out.retain(|(n, _)| n != "bwrap");
+            out.push(("bwrap".to_string(), bw));
+        }
     }
     out.sort();
     Ok(out)
@@ -173,20 +200,26 @@ fn build_user(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 /// README says how the one tarball gets into the download cache). Missing tarball or a failed build: not in the
 /// image, with a note; the ul.bb.* ktests then skip.
 fn build_busybox(root: &Path) -> Option<PathBuf> {
-    let dir = root.join("user/ports/busybox");
+    build_port(root, "busybox", "busybox")
+}
+
+/// A program `out/<bin>` of user/ports/<port> made by its idempotent, offline build.sh (V2_OFFLINE=1), or None with
+/// a note (missing tarball, failed build).
+fn build_port(root: &Path, port: &str, bin: &str) -> Option<PathBuf> {
+    let dir = root.join("user/ports").join(port);
     if !dir.join("build.sh").is_file() {
         return None;
     }
     let o = Command::new("sh").arg(dir.join("build.sh")).env("V2_OFFLINE", "1").output();
     match o {
-        Ok(o) if o.status.success() => Some(dir.join("out/busybox")),
+        Ok(o) if o.status.success() && dir.join("out").join(bin).is_file() => Some(dir.join("out").join(bin)),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
-            eprintln!("xtask: note: busybox not in the image: {}", err.lines().last().unwrap_or("build.sh failed"));
+            eprintln!("xtask: note: {bin} not in the image: {}", err.lines().last().unwrap_or("build.sh failed"));
             None
         }
         Err(e) => {
-            eprintln!("xtask: note: busybox not in the image: {e}");
+            eprintln!("xtask: note: {bin} not in the image: {e}");
             None
         }
     }
@@ -382,16 +415,19 @@ pub fn make_image_from(root: &Path, o: &ImageOpts, art: &Artefacts) -> Result<Pa
     std::fs::write(sys.join("INITRD"), initrd_bytes_for(root, &art.programs, &art.kernel)?).map_err(|e| e.to_string())?;
     std::fs::write(esp.join("BITSOS2/CONFIG.TXT"), config_text(&o.config_extra)).map_err(|e| e.to_string())?;
     std::fs::write(esp.join("BITSOS2/STICK.ID"), TEST_STICK_ID).map_err(|e| e.to_string())?;
-    // UL-5: the manifest's stick programs in \BITSOS2\bin (V2: /boot/BITSOS2/bin); YT-2's trees as `tree_wanted`
-    // says, so the other scenario images stay small.
+    // UL-5: the manifest's stick programs in \BITSOS2\bin (V2: /boot/BITSOS2/bin); YT-2's trees only when
+    // `tree_wanted` says so (V2_STICK_TREES: Georg 30.10., programs are tested on the Mini-PC only).
     let env = std::env::var("V2_STICK_TREES").ok();
-    for (rel, p) in art.stick.iter().filter(|(rel, _)| !package::is_tree_file(rel) || tree_wanted(rel, o, env.as_deref())) {
+    for (rel, p) in art.stick.iter().filter(|(rel, _)| !package::is_tree_file(rel) || tree_wanted(rel, env.as_deref())) {
         let to = esp.join(rel);
         if let Some(d) = to.parent() {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
         cp(p, to)?;
     }
+    // GX-7a: the GPU firmware the amdgpu modules need, decompressed from the host's linux-firmware-amdgpu, with
+    // its licence (crate::firmware; never in git).
+    crate::firmware::copy(root, &esp)?;
 
     let img = x.join(format!("{}.img", o.name));
     let _ = std::fs::remove_file(&img);
@@ -410,23 +446,18 @@ pub fn make_image_from(root: &Path, o: &ImageOpts, art: &Artefacts) -> Result<Pa
     Ok(img)
 }
 
-/// Whether the tree file `rel` (`BITSOS2/<tree>/...`) goes into image `o`: every tree with V2_STICK_TREES=1, the
-/// named ones with V2_STICK_TREES=<tree>,<tree>; else only in a ktest image whose filter (comma-separated prefixes,
-/// empty = all) can run the tree's own tests, named `ul.pkg.<tree>*` (BR-2: the gate's all-tests image and
-/// `ktest ul.pkg` carry Brave's 500 MB and Cobalt's 190 MB; a scenario image for rb.mirror or cp.irq does not).
-fn tree_wanted(rel: &str, o: &ImageOpts, env: Option<&str>) -> bool {
+/// Whether the tree file `rel` (`BITSOS2/<tree>/...`) goes into an image: only with V2_STICK_TREES=1 (every tree)
+/// or V2_STICK_TREES=<tree>,<tree> (the named ones), i.e. an image made for a stick or by hand. Georg 30.10.:
+/// "Programme werden nur noch am Mini PC getestet und nicht mehr in QEMU": the gate's ktest images, every `cargo
+/// xtask ktest` and the scenario images carry no program tree (the program tests have the class Program, which
+/// QEMU never runs).
+fn tree_wanted(rel: &str, env: Option<&str>) -> bool {
     let tree = rel.split('/').nth(1).unwrap_or("");
     match env.map(str::trim) {
-        Some("1") => return true,
-        Some(l) if l.split(',').any(|n| n.trim().eq_ignore_ascii_case(tree)) => return true,
-        _ => {}
+        Some("1") => true,
+        Some(l) => l.split(',').any(|n| n.trim().eq_ignore_ascii_case(tree)),
+        None => false,
     }
-    if !o.build.ktest {
-        return false;
-    }
-    let filter = o.config_extra.iter().rev().find_map(|e| e.strip_prefix("ktest=")).unwrap_or("").trim();
-    let own = format!("ul.pkg.{}", tree.to_ascii_lowercase());
-    filter.is_empty() || filter.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| own.starts_with(p) || p.starts_with(&own))
 }
 
 /// Bytes of every file below `dir`.
@@ -463,6 +494,18 @@ pub fn cmd_build(root: &Path, mut a: Args) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_built_executables_go_into_the_image() {
+        let j = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"usys"},"executable":null}"#, "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"init"},"executable":"/t/release/init","fresh":true}"#, "\n",
+            r#"{"reason":"build-script-executed","package_id":"x"}"#, "\n",
+            r#"{"reason":"compiler-artifact","executable":"/t/release/odd\\"name"}"#, "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        assert_eq!(built_executables(j), [PathBuf::from("/t/release/init")]);
+    }
 
     #[test]
     fn config_has_defaults_then_extras() {
@@ -519,29 +562,23 @@ mod tests {
         assert!(top.contains("CONFIG.TXT") && top.contains("STICK.ID"), "{top}");
         let cfg = Command::new("mtype").arg("-i").arg(&img).arg("::/BITSOS2/CONFIG.TXT").output().unwrap();
         assert!(String::from_utf8_lossy(&cfg.stdout).contains("ktest=mm"));
-        // YT-2: a tree only in a ktest image (or with V2_STICK_TREES=1).
+        // Georg 30.10.: no tree without V2_STICK_TREES, a ktest image included.
         assert!(!top.contains("tree"), "{top}");
         let o = ImageOpts { name: "t2".into(), generation: 1, config_extra: vec![], build: BuildOpts { release: false, ktest: true } };
         let img = make_image_from(&root, &o, &art).unwrap();
-        let out = Command::new("mdir").args(["-b", "-i"]).arg(&img).arg("::/BITSOS2/tree/app").output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).contains("x"), "{}", String::from_utf8_lossy(&out.stdout));
+        let out = Command::new("mdir").args(["-b", "-i"]).arg(&img).arg("::/BITSOS2").output().unwrap();
+        assert!(!String::from_utf8_lossy(&out.stdout).to_lowercase().contains("tree"), "{}", String::from_utf8_lossy(&out.stdout));
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// BR-2: which images carry a tree.
+    /// Georg 30.10.: a tree goes only into an image V2_STICK_TREES names, never by a ktest filter.
     #[test]
-    fn trees_only_where_their_tests_run() {
-        let img = |ktest: bool, extra: &[&str]| ImageOpts { name: "t".into(), generation: 1, config_extra: extra.iter().map(|s| s.to_string()).collect(), build: BuildOpts { release: false, ktest } };
+    fn trees_only_with_v2_stick_trees() {
         let f = "BITSOS2/brave/lib/libgtk-3.so.0";
-        for extra in [&[][..], &["ktest="], &["ktest=ul"], &["ktest=ul.pkg"], &["ktest=ul.pkg.brave"], &["ktest=ul.pkg.brave_sha"], &["loglevel=info", "ktest=cp.irq, ul.pkg.b"]] {
-            assert!(tree_wanted(f, &img(true, extra), None), "{extra:?}");
-        }
-        for extra in [&["ktest=rb.mirror"][..], &["ktest=ul.pkg.cobalt"], &["ktest=ul.pkg.stick,cp"]] {
-            assert!(!tree_wanted(f, &img(true, extra), None), "{extra:?}");
-        }
-        assert!(!tree_wanted(f, &img(false, &[]), None) && !tree_wanted(f, &img(false, &[]), Some("cobalt")));
-        assert!(tree_wanted(f, &img(false, &[]), Some("1")) && tree_wanted(f, &img(false, &[]), Some("cobalt, Brave")));
-        assert!(tree_wanted("BITSOS2/cobalt/loader_app", &img(true, &["ktest=ul.pkg.cobalt_profile"]), None));
+        assert!(!tree_wanted(f, None), "no ktest or scenario image carries a tree by itself");
+        assert!(tree_wanted(f, Some("1")) && tree_wanted(f, Some("cobalt, Brave")));
+        assert!(!tree_wanted(f, Some("cobalt")) && !tree_wanted(f, Some("")));
+        assert!(tree_wanted("BITSOS2/libreoffice/program/soffice.bin", Some("libreoffice")));
     }
 
     /// UL-5: the same inputs give the same initramfs bytes, the package list is sorted by path and complete

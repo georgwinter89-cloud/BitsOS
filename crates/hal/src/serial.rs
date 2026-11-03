@@ -249,10 +249,6 @@ pub fn write_bytes_unlocked(s: &[u8]) {
     }
 }
 
-pub fn write_byte(b: u8) {
-    write_bytes(&[b]);
-}
-
 /// Whole lines from several CPUs (klog's lines, the ktest protocol lines xtask parses) stay apart: the CPU tag
 /// (index + 1) of the line's writer, 0 = free.
 static LINE: AtomicUsize = AtomicUsize::new(0);

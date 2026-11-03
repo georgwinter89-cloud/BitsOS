@@ -123,6 +123,10 @@ pub fn render(cpus: &[CpuStat], threads: Option<&[ThreadStat]>, max: usize, duty
     if let Some(l) = inter {
         s += l;
     }
+    if inter.is_some() {
+        s += &idle_line();
+        s += "\n";
+    }
     if !counters.is_empty() {
         s += "counters";
         for (n, v) in counters {
@@ -134,6 +138,24 @@ pub fn render(cpus: &[CpuStat], threads: Option<&[ThreadStat]>, max: usize, duty
 }
 
 
+
+/// FD-1/SC-9: the idle loop's sleep depth, the deep states it may use and, if none, why.
+pub(crate) fn idle_line() -> String {
+    use sched::cstate;
+    let mut s = format!("idle mode={} factor={} states=C1", cstate::mode().name(), cstate::residency_factor());
+    let Some(p) = cstate::current_plan() else { return s };
+    for d in &p.deep {
+        s += &format!(",C{}@io:{:#x}/{}us{}", d.kind, d.port, d.latency_ns / 1000, if d.bm_check { "/bm" } else { "" });
+    }
+    if let Some(why) = p.c1_only {
+        s += &format!(" c1_only={}", why.name());
+    }
+    if !p.refused.is_empty() {
+        s += &format!(" refused={}", p.refused.len());
+    }
+    s += &format!(" bm_demotions={}", cstate::BM_DEMOTIONS.get());
+    s
+}
 
 fn tool(_ctx: &ToolContext, args: &Json) -> ToolResult {
     let bad = |n: &str| ToolError::BadArgument(String::from(n));
@@ -232,7 +254,8 @@ mod tests {
         assert_eq!(lines[5], "threads=1 shown=1");
         assert_eq!(lines[7], "7 worker kernel_rt running 1 1 60 12 2 9 5 7 5 batch set 3 4 42 2500");
         assert_eq!(lines[8], "interactive focus=42 grants=42:compositor,focus,77:input waits=4 avg_us=1000 max_us=2500 recent_max_us=900 late=1 late_ms=20");
-        assert_eq!(lines[9], "counters sched.ticks_fired=3 sched.halts=9");
+        assert_eq!(lines[9], "idle mode=auto factor=4 states=C1", "no _CST read on the host");
+        assert_eq!(lines[10], "counters sched.ticks_fired=3 sched.halts=9");
         assert!(!render(&cpus, None, 10, None, &[], None).contains("threads="));
         assert!(!render(&cpus, None, 10, None, &[], None).contains("counters"));
     }

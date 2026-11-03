@@ -1,0 +1,20 @@
+chroot(/) unprivileged = -EPERM
+chroot(NULL) = -EFAULT
+chroot(a kernel address) = -EFAULT
+chroot("") = -ENOENT
+chroot(/nonexistent) = -ENOENT
+chroot(/proc/self/status) = -ENOTDIR
+chroot(/proc/self/status/x) = -ENOTDIR
+unshare(CLONE_NEWUSER) = 0
+chdir(/proc/self) = 0
+chroot(/proc) = 0
+stat(/self/status) = 0
+stat(/../self) = 0
+readlink(/self/root) = /
+getcwd before chdir(/) is /<pid> below the new root = yes
+chdir(/) = 0
+getcwd = /
+open(/self/status) relative to the new root = 0
+unshare(CLONE_NEWUSER) chrooted = -EPERM
+chroot(/) again = 0
+plain chroot: exit 0

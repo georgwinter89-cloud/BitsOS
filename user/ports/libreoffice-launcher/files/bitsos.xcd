@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LO-1: BitsOS V2's defaults for LibreOffice (\BITSOS2\libreoffice\share\registry\bitsos.xcd, read with the
+     package's own .xcd files). The user's own settings in the profile win over these. No tip of the day and no
+     "Welcome to LibreOffice" dialog or "What's new" bar at the first start: LibreOffice opens straight to the
+     document (the welcome dialog sat on top of the first window and kept it from closing in QEMU). -->
+<oor:data xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:oor="http://openoffice.org/2001/registry">
+  <dependency file="main"/>
+  <oor:component-data oor:name="Setup" oor:package="org.openoffice">
+    <node oor:name="Product">
+      <prop oor:name="WhatsNew" oor:op="fuse">
+        <value>false</value>
+      </prop>
+      <prop oor:name="WhatsNewDialog" oor:op="fuse">
+        <value>false</value>
+      </prop>
+    </node>
+  </oor:component-data>
+  <oor:component-data oor:name="Common" oor:package="org.openoffice.Office">
+    <node oor:name="Misc">
+      <prop oor:name="ShowTipOfTheDay" oor:op="fuse">
+        <value>false</value>
+      </prop>
+    </node>
+  </oor:component-data>
+</oor:data>

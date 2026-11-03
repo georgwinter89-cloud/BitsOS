@@ -3,7 +3,7 @@
 // side's neighbour calls can be compared where they happen. Reads nothing, writes nothing.
 import { pathToFileURL } from 'node:url';
 
-const WZ = process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan';
+const WZ = process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`;
 const { R, prep } = await import(pathToFileURL(`${WZ}/kit/rtwdev.mjs`).href);
 
 // rtw89_btc_ntfy_wl_rfk (coex.c:9466) under b-btc's name: only recorded

@@ -53,6 +53,15 @@ impl SigInfo {
     pub fn uid(&self) -> u32 {
         self.get32(20)
     }
+    /// SX-2: the sender's ids as the receiver's namespaces name them (`send_signal_locked`'s fix-up).
+    pub fn set_sender(&mut self, pid: u32, uid: u32) {
+        self.put32(16, pid);
+        self.put32(20, uid);
+    }
+    /// `has_si_pid_and_uid`: kill, child and real-time layouts carry the sender's pid and uid.
+    pub fn has_sender(&self) -> bool {
+        matches!(layout(self.signo(), self.code()), Layout::Kill | Layout::Chld | Layout::Rt)
+    }
     /// `SEND_SIG_NOINFO` / kill(2): SI_USER (or SI_TKILL / SI_QUEUE ...) with the sender's pid and uid.
     pub fn user(sig: u32, code: i32, pid: u32, uid: u32) -> SigInfo {
         let mut s = SigInfo::new(sig, code);

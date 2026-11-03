@@ -30,3 +30,6 @@ kexec = { path = "../kexec" }
 
 [dev-dependencies]
 hda = { path = "../drivers/hda", features = ["fake"] }
+
+[lints]
+workspace = true

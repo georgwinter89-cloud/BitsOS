@@ -9,9 +9,9 @@
 //! stress: 16 workers (threads), 2 s, total=12998765432, distinct cpus=16 [0-15]
 //! ```
 //!
-//! Without threads (a kernel that answers clone with ENOSYS: BitsOS until AB-4) the first spawn fails; stress
-//! then says so and counts in its one thread, so N copies started side by side (the `ul.stress.procs` ktest)
-//! show the same thing per process. Exit 0 when every worker counted, 1 otherwise.
+//! When a thread cannot start (clone refused: RLIMIT_NPROC, no memory) stress says so and counts in the threads
+//! it has, at least its own; `-t 1` copies started side by side (the `ul.stress.procs` ktest) count one thread
+//! per process. Exit 0 when every worker counted, 1 otherwise.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
@@ -72,8 +72,8 @@ fn main() {
             _ => usage(),
         }
     }
-    // Default: the CPUs in the affinity mask; without sched_getaffinity (BitsOS until AB-5) the processor blocks
-    // of /proc/cpuinfo.
+    // Default: the CPUs in the affinity mask; if sched_getaffinity fails or gives an empty mask, the processor
+    // blocks of /proc/cpuinfo.
     let n = threads.unwrap_or_else(|| {
         let mask = usys::sched_getaffinity(0, 512).unwrap_or_default();
         let from_mask: usize = mask.iter().map(|b| b.count_ones() as usize).sum();

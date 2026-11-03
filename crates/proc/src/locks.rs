@@ -630,23 +630,6 @@ pub fn closed_files(fds: &Arc<FdTable>, files: &[Arc<OpenFile>]) {
     }
 }
 
-/// The open files of `fds` that close-on-exec will close (taken before it does).
-pub fn cloexec_files(fds: &FdTable) -> Vec<Arc<OpenFile>> {
-    let mut v = Vec::new();
-    if POSIX_LOCKS.load(Ordering::Relaxed) == 0 {
-        return v;
-    }
-    for fd in 0..fds.capacity() {
-        if fds.cloexec(fd) == Ok(true)
-            && let Ok(f) = fds.get(fd)
-            && v.try_reserve(1).is_ok()
-        {
-            v.push(f);
-        }
-    }
-    v
-}
-
 /// The end of fd table `fds` (`exit_files` → every `filp_close`): all its POSIX locks go.
 pub fn release_owner(fds: &Arc<FdTable>) {
     if POSIX_LOCKS.load(Ordering::Relaxed) == 0 {

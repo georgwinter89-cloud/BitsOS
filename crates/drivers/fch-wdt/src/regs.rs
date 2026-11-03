@@ -37,6 +37,14 @@ pub const S5_RESET_REASONS: [(u32, &str); 21] = [
     (28, "reserved_28"), (29, "fch_mp1_warm_reset_handshake_failed"), (30, "parity_error"), (31, "sync_flood_software"),
 ];
 
+/// RB-14: the sync-flood bits (27 `sync_flood_error`, 31 `sync_flood_software`): the data fabric stopped the
+/// machine on an uncorrected error (an MCA bank of the boot CPU usually names it, `cpu mca.record`).
+pub const S5_SYNC_FLOOD: u32 = 1 << 27 | 1 << 31;
+
+pub fn is_sync_flood(v: u32) -> bool {
+    v != u32::MAX && v & S5_SYNC_FLOOD != 0
+}
+
 /// The four bytes of `S5_RESET_STATUS` through the PM window.
 pub fn s5_reset_status(r: &dyn Regs) -> u32 {
     (0..4).fold(0, |v, i| v | (r.pm_read8(PM_S5_RESET_STATUS + i) as u32) << (8 * i))
@@ -99,10 +107,19 @@ impl Regs for Mmio {
 /// A register block in memory that behaves like the chip where the driver can see it: FIRED is write-1-to-clear,
 /// DISABLED is read only, a TRIGGER write is a kick (counted, reads back 0) and the counter "expires" when it
 /// runs longer than its count without a kick (`would_fire`, with the test's clock).
+///
+/// RB-17: the count register is two things, as on the Mini-PC: a write sets the value a kick loads, a read
+/// returns the counter (`tco_timer_get_timeleft` reads the time left from it, linux-6.6/drivers/watchdog/
+/// sp5100_tco.c:160). The counter takes the written value only at a kick of a running chip, so a stopped chip
+/// keeps reading what it had: after a Reload the Mini-PC read the crumb of the watchdog's own Quiesce, not the two
+/// crumbs written after its stop (desk 28.10.).
 pub struct Fake {
     pm: [AtomicU8; 8],
     ctl: AtomicU32,
+    /// What the count register reads: the counter.
     count: AtomicU32,
+    /// What it was written: the next kick loads it.
+    reload: AtomicU32,
     kicks: AtomicU64,
     last_kick_ns: AtomicU64,
     writes: AtomicU64,
@@ -119,6 +136,7 @@ impl Fake {
             pm: [const { AtomicU8::new(0) }; 8],
             ctl: AtomicU32::new(if fired { FIRED } else { 0 } | if disabled { DISABLED } else { 0 } | POWEROFF),
             count: AtomicU32::new(0),
+            reload: AtomicU32::new(0),
             kicks: AtomicU64::new(0),
             last_kick_ns: AtomicU64::new(0),
             writes: AtomicU64::new(0),
@@ -142,8 +160,13 @@ impl Fake {
     pub fn ctl(&self) -> u32 {
         self.ctl.load(Ordering::Acquire)
     }
+    /// The counter (what the count register reads).
     pub fn count(&self) -> u32 {
         self.count.load(Ordering::Acquire)
+    }
+    /// The last value written to the count register (the next kick loads it).
+    pub fn reload_value(&self) -> u32 {
+        self.reload.load(Ordering::Acquire)
     }
     pub fn writes(&self) -> u64 {
         self.writes.load(Ordering::Acquire)
@@ -181,6 +204,7 @@ impl Regs for Fake {
             new |= FIRED;
         }
         if v & TRIGGER != 0 && new & RUN != 0 {
+            self.count.store(self.reload.load(Ordering::Acquire), Ordering::Release);
             self.kicks.fetch_add(1, Ordering::AcqRel);
             self.last_kick_ns.store(self.now(), Ordering::Release);
         }
@@ -193,7 +217,7 @@ impl Regs for Fake {
         self.count.load(Ordering::Acquire)
     }
     fn count_write(&self, v: u32) {
-        self.count.store(v & MAX_SECONDS, Ordering::Release);
+        self.reload.store(v & MAX_SECONDS, Ordering::Release);
     }
 }
 

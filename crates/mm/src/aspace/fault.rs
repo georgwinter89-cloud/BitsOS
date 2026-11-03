@@ -6,6 +6,7 @@
 //! another space: copied, or taken back writable once this space is its last holder; Linux `do_wp_page`), the
 //! first write to a private file page (copied), the dirty mark of a tracked shared file page or device page.
 
+use super::huge::{self, HUGE};
 use super::{keep_read_only, page_flags, read_only, AsCore, Class, Inner, Owner, CACHE_BITS, UNCONFIRMED};
 use crate::fault::{self, Access, FaultReason, SpuriousRun};
 use crate::vma::{Prot, Vma, VmaKind};
@@ -26,6 +27,22 @@ klog::counter!(FILE_COPIES, "mm.as.file_copies");
 klog::counter!(pub(crate) COW_COPIES, "mm.as.cow_copies");
 klog::counter!(pub(crate) COW_REUSED, "mm.as.cow_reused");
 klog::counter!(DEVICE_FILLS, "mm.as.device_fills");
+klog::counter!(AROUND_FILLS, "mm.as.around_fills");
+klog::counter!(AROUND_SHORT, "mm.as.around_short");
+/// Pages per fault-around block: 64 KiB, Linux's default `fault_around_bytes` (linux-6.6/mm/memory.c:4445).
+const AROUND_PAGES: u64 = 16;
+
+/// MM-13: the 2 MiB block of one fault, made without the space's lock.
+enum Block {
+    /// Not asked for yet.
+    Untried,
+    /// Zeroed, not mapped yet.
+    Made(u64),
+    /// None was free (or the VMA no longer wants one): 4 KiB pages.
+    Refused,
+    /// Mapped: the fault is served.
+    Mapped,
+}
 
 /// What a user copy needs from a page.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,10 +69,20 @@ pub(crate) fn file_fault(e: PageFault) -> FaultReason {
 /// Who owns the frame a VMA maps at a page (for handing an old frame back).
 fn owner_of(v: &Vma) -> Owner {
     match &v.file {
-        Some(f) if f.device.is_some() => Owner::Device,
+        Some(f) if f.device.is_some() => Owner::Device(Some(f.backing.clone())),
         Some(f) => Owner::File(f.backing.clone(), v.kind == VmaKind::Anonymous),
         None => Owner::Anon,
     }
+}
+
+/// Whether a write fault in `v` fills its 64 KiB block (MM-12): private anonymous memory charged to the commit
+/// (heap, ELF data and bss, mmap); not a stack (the main stack's VMA, MAP_GROWSDOWN, and MAP_STACK through
+/// VM_NOHUGEPAGE: they grow a page at a time from the top); not where the program asked for page-exact memory
+/// (MADV_RANDOM, MADV_NOHUGEPAGE: the block stands in for Linux's huge pages, which NOHUGEPAGE switches off).
+/// Shared anonymous memory, file and device VMAs have a file. A guard range is PROT_NONE: no write fault.
+fn around(v: &Vma) -> bool {
+    let f = v.flags;
+    v.file.is_none() && f.account && v.kind != VmaKind::Stack && !f.growsdown && !f.nohugepage && !f.rand_read
 }
 
 impl AsCore {
@@ -162,6 +189,20 @@ impl AsCore {
     /// dirty mark, a tracked shared file's dirty mark, or copy-on-write (a frame only this space holds is simply
     /// made writable again).
     pub(crate) fn write_present(&self, g: &mut Inner, page: u64, v: &Vma, phys: u64) -> Result<(), FaultReason> {
+        // MM-13: a 2 MiB leaf becomes writable whole when this space alone holds its frames, else it is split and
+        // the 4 KiB page is handled below.
+        if let Some(l) = paging::translate_leaf(self.root, page).filter(|l| l.size == PageSize::Size2M) {
+            if self.huge_write(g, page, v, l)? {
+                return Ok(());
+            }
+            let phys = paging::translate(self.root, page).ok_or(FaultReason::Repeated)?.0;
+            return self.write_small(g, page, v, phys);
+        }
+        self.write_small(g, page, v, phys)
+    }
+
+    /// `write_present` of a 4 KiB leaf.
+    fn write_small(&self, g: &mut Inner, page: u64, v: &Vma, phys: u64) -> Result<(), FaultReason> {
         // Only rights are added here (same frame): no shootdown round (MM-tlb2, `paging::grant_user`); a change of
         // the memory type falls back to one.
         let set = |fl: PageFlags| paging::grant_user(self.root, page, PAGE, &mut |_| Some(fl)).map(|_| ()).map_err(|_| FaultReason::Repeated);
@@ -189,15 +230,28 @@ impl AsCore {
 
     /// Gives every page of [start, end) that lies in an accessible VMA a frame (eager fill, MAP_POPULATE,
     /// and before an mprotect makes a range accessible in eager mode: then with the VMA's current rights).
-    pub(crate) fn populate(&self, g: &Inner, start: u64, end: u64, only_accessible: bool) -> Result<(), FaultReason> {
-        for v in g.space.tree.overlapping(start, end) {
+    /// MM-13: an aligned 2 MiB of a VMA that may have huge pages takes one (Linux's populate write-faults a
+    /// writable private mapping, `populate_vma_page_range`, and so gets THP).
+    pub(crate) fn populate(&self, g: &mut Inner, start: u64, end: u64, only_accessible: bool) -> Result<(), FaultReason> {
+        let mut at = start;
+        while at < end {
+            let Some(v) = g.space.tree.next_from(at).filter(|v| v.start < end).cloned() else { break };
+            at = v.end;
             if only_accessible && !v.prot.accessible() {
                 continue;
             }
             let mut va = v.start.max(start);
             while va < v.end.min(end) {
                 if paging::translate(self.root, va).is_none() {
-                    match self.fill_at(va, v, false) {
+                    if va.is_multiple_of(HUGE)
+                        && va + HUGE <= end
+                        && let Some(base) = self.huge_base(g, &v, va)
+                        && self.fill_huge_now(g, base, &v)
+                    {
+                        va += HUGE;
+                        continue;
+                    }
+                    match self.fill_at(va, &v, false) {
                         // A file page past the end of the file stays empty (it would be SIGBUS on access).
                         Err(FaultReason::Bus) => break,
                         r => r?,
@@ -249,31 +303,95 @@ impl AsCore {
         // pages keep turning out anonymous; an unused one turns the hint off until the next anonymous fill.
         let want = error & 1 == 0 && self.anon_hint.load(Relaxed);
         let mut spare = if want { mm_core::alloc_zeroed(mm_core::Kind::User) } else { None };
-        let r = self.fault_with(addr, error, run, &mut spare);
+        // MM-13: a write fault that may take a 2 MiB page asks for its block once (`None`): zeroed here, without
+        // the lock, then the fault looks again (another thread may have served the range meanwhile).
+        let mut block = Block::Untried;
+        let r = loop {
+            match self.fault_with(addr, error, run, &mut spare, &mut block) {
+                Some(r) => break r,
+                None => {
+                    block = match mm_core::alloc_zeroed_huge_light(mm_core::Kind::User) {
+                        Some(f) => Block::Made(f),
+                        None => {
+                            crate::thp::FAULT_FALLBACK.inc();
+                            Block::Refused
+                        }
+                    }
+                }
+            }
+        };
+        if let Block::Made(f) = block {
+            huge::free_block(f);
+            crate::thp::UNUSED.inc();
+        }
         if let Some(f) = spare {
             super::free_user(f);
-            self.anon_hint.store(false, Relaxed);
-            SPARE_UNUSED.inc();
+            // A huge page took the fault: the next missing page is likely anonymous still.
+            if !matches!(block, Block::Mapped) {
+                self.anon_hint.store(false, Relaxed);
+                SPARE_UNUSED.inc();
+            }
         }
         r
     }
 
-    fn fault_with(&self, addr: u64, error: u64, run: &mut SpuriousRun, spare: &mut Option<u64>) -> Result<(), FaultReason> {
+    /// One look at the fault under the lock; None: a 2 MiB block is wanted first (`fault_locked`).
+    fn fault_with(&self, addr: u64, error: u64, run: &mut SpuriousRun, spare: &mut Option<u64>, block: &mut Block) -> Option<Result<(), FaultReason>> {
         let mut g = self.inner.lock();
         let vma = g.space.tree.find(addr).cloned();
-        let access = fault::check(error, vma.as_ref().map(|v| v.prot))?;
-        let Some(v) = vma else { return Err(FaultReason::NotMapped) };
+        let access = match fault::check(error, vma.as_ref().map(|v| v.prot)) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(e)),
+        };
+        let Some(v) = vma else { return Some(Err(FaultReason::NotMapped)) };
         let page = addr & !(PAGE - 1);
-        let Some((phys, fl)) = paging::translate(self.root, page) else {
+        if access == Access::Write
+            && paging::translate(self.root, page).is_none()
+            && let Some(base) = self.huge_base(&g, &v, page)
+        {
+            match core::mem::replace(block, Block::Refused) {
+                Block::Untried if g.huge_fail => crate::thp::FAULT_FALLBACK.inc(),
+                Block::Untried => {
+                    *block = Block::Untried;
+                    return None;
+                }
+                Block::Made(f) => match self.map_huge(&mut g, base, &v, f) {
+                    Ok(()) => {
+                        *block = Block::Mapped;
+                        run.reset();
+                        FAULT_FILLS.inc();
+                        return Some(Ok(()));
+                    }
+                    Err(f) => {
+                        huge::free_block(f);
+                        crate::thp::FAULT_FALLBACK.inc();
+                    }
+                },
+                Block::Refused | Block::Mapped => {}
+            }
+        }
+        Some(self.fault_page(&mut g, addr, error, page, &v, access, run, spare))
+    }
+
+    /// The fault on the 4 KiB page `page` (MM-5a..MM-12).
+    #[allow(clippy::too_many_arguments)]
+    fn fault_page(&self, g: &mut Inner, addr: u64, error: u64, page: u64, v: &Vma, access: Access, run: &mut SpuriousRun, spare: &mut Option<u64>) -> Result<(), FaultReason> {
+        let Some(l) = paging::translate_leaf(self.root, page) else {
             run.reset();
             self.fill_at_with(page, &v, access == Access::Write, spare)?;
             FAULT_FILLS.inc();
+            // MM-13: the block stands in for a huge page, so it follows the THP switches too (mode, PR_SET_THP_DISABLE:
+            // Linux then fills page by page); it stays where no huge page fits (a cut 2 MiB, no free block).
+            if access == Access::Write && around(&v) && !self.thp_disabled() && crate::thp::mode_allows(v.flags.hugepage, v.flags.nohugepage) {
+                self.fault_around(g, page, &v);
+            }
             return Ok(());
         };
+        let (phys, fl) = (l.phys, l.flags);
         // A write to a page kept read-only on purpose: copy-on-write, a private file copy, a dirty mark.
         if access == Access::Write && fl.contains(PageFlags::USER) && !fl.contains(PageFlags::WRITABLE) {
             run.reset();
-            return self.write_present(&mut g, page, &v, phys);
+            return self.write_present(g, page, &v, phys);
         }
         // Present: another thread filled it while this one waited for the lock, a translation this CPU cached
         // before the entry changed, or an entry behind its VMA.
@@ -287,9 +405,10 @@ impl AsCore {
             // invlpg drops this address in the current PCID, which is this space's on this CPU (no KPTI).
             paging::flush_page(page);
         } else {
-            let base = if !fl.contains(PageFlags::WRITABLE) && keep_read_only(&v, phys) { read_only(v.prot) } else { page_flags(v.prot) };
+            let base = if !fl.contains(PageFlags::WRITABLE) && keep_read_only(&v, phys, l.size) { read_only(v.prot) } else { page_flags(v.prot) };
             let want = PageFlags(base.0 | (fl.0 & CACHE_BITS));
-            if let Ok((_, o)) = paging::grant_user(self.root, page, PAGE, &mut |_| Some(want))
+            // The whole leaf (MM-13: a 2 MiB one too, never a part of it).
+            if let Ok((_, o)) = paging::grant_user(self.root, l.page_virt, l.size.bytes(), &mut |_| Some(want))
                 && !o.confirmed()
             {
                 UNCONFIRMED.inc();
@@ -299,6 +418,58 @@ impl AsCore {
             }
         }
         Ok(())
+    }
+
+    /// MM-12 (FD-1): after a write fault filled a page of a VMA `around` accepts, the other missing pages of its
+    /// aligned 64 KiB block get zeroed frames too when the whole block lies inside the VMA (Linux's rule for a
+    /// huge page, `transhuge_vma_suitable`, linux-6.6/include/linux/huge_mm.h:100: small or cut VMAs, a heap of a
+    /// few pages, the ends of a mapping stay page by page, as on Linux), so a program writing a fresh buffer front to
+    /// back pays the fault entry, the space lock and the walk once per block instead of per page (Chromium's
+    /// software compositor: a new 13.8 MB layer per video frame). Linux reaches the same with transparent huge
+    /// pages (CachyOS: `always`, 2 MiB at a time); its own fault-around (`do_fault_around`, memory.c:4504) is
+    /// for file pages. Frames come from `alloc_zeroed_light`: only memory free now, never reclaim or the OOM
+    /// path for pages nobody touched; the first refusal ends the round quietly (the faulting page is in).
+    /// Nothing is charged: `around` takes only VM_ACCOUNT VMAs, whose every page the mapping charged.
+    /// No TLB flush: every entry made here was not present (x86 caches no not-present translation).
+    fn fault_around(&self, g: &Inner, page: u64, v: &Vma) {
+        let (lo, hi) = (page & !(AROUND_PAGES * PAGE - 1), (page & !(AROUND_PAGES * PAGE - 1)) + AROUND_PAGES * PAGE);
+        if lo < v.start || hi > v.end {
+            return;
+        }
+        // One walk for the block (it lies in one page table): bit i = page lo + i*PAGE is present.
+        let mut present = 0u32;
+        paging::for_each_leaf(self.root, lo, hi, &mut |l| {
+            let (s, e) = (l.virt.max(lo), (l.virt + l.size.bytes()).min(hi));
+            let mut a = s;
+            while a < e {
+                present |= 1 << ((a - lo) / PAGE);
+                a += PAGE;
+            }
+        });
+        present |= 1 << ((page - lo) / PAGE);
+        let mut n = 0;
+        let mut short = false;
+        let mut va = lo;
+        while va < hi {
+            if present & 1 << ((va - lo) / PAGE) == 0 {
+                let mut f = match g.around_fail_after {
+                    Some(k) if n >= k => None,
+                    _ => mm_core::alloc_zeroed_light(mm_core::Kind::User),
+                };
+                if f.is_none() || self.fill_page(va, v.prot, &mut f).is_err() {
+                    short = true;
+                    break;
+                }
+                n += 1;
+            }
+            va += PAGE;
+        }
+        AROUND_FILLS.add(n);
+        if short {
+            // Handled: the faulting page is in, the rest fills when touched (by the normal, reclaiming path).
+            AROUND_SHORT.inc();
+            klog::event!(Debug, "mm", "as.around_short", addr = klog::Hex(page), filled = n);
+        }
     }
 
     /// Makes [addr, addr+len) ready for a copy: fills missing pages the VMAs allow (file pages from their file,
@@ -315,8 +486,9 @@ impl AsCore {
             _ => MmError::Fault,
         };
         while va < end {
-            match paging::translate(self.root, va) {
-                Some((phys, fl)) => {
+            match paging::translate_leaf(self.root, va) {
+                Some(l) => {
+                    let (phys, fl) = (l.phys, l.flags);
                     if !fl.contains(PageFlags::USER) {
                         return Err(MmError::Fault);
                     }
@@ -327,6 +499,15 @@ impl AsCore {
                                 return Err(MmError::Fault);
                             }
                             self.write_present(g, va, &v, phys).map_err(to_mm)?;
+                        } else if l.size == PageSize::Size2M {
+                            // MM-13: the loader's write through a read-only 2 MiB leaf another space shares: split it,
+                            // then the 4 KiB rule below copies the page.
+                            if v.private() && !huge::own_exclusive(phys, l.size) {
+                                if !self.split_huge_at(g, va, tlb::Cause::Cow) {
+                                    return Err(MmError::NoMemory);
+                                }
+                                continue;
+                            }
                         } else if v.private() && !(mm_core::is_user_frame(phys) && share::exclusive(phys)) {
                             // The loader writes through read-only pages: never into a frame another space or
                             // the page cache holds.
@@ -342,6 +523,14 @@ impl AsCore {
                     };
                     if !allowed {
                         return Err(MmError::Fault);
+                    }
+                    // MM-13: a write into fresh memory takes a huge page as the program's own fault would.
+                    if need == Need::Write
+                        && let Some(base) = self.huge_base(g, &v, va)
+                        && self.fill_huge_now(g, base, &v)
+                    {
+                        COPY_FILLS.inc();
+                        continue;
                     }
                     self.fill_at(va, &v, need == Need::Write).map_err(to_mm)?;
                     COPY_FILLS.inc();
@@ -390,6 +579,101 @@ impl AsCore {
             off += n;
         }
         Ok(())
+    }
+
+    /// PF-6 (fs-PF-4 CR 2): copies the page-cache frame parts `(frame, off, n)` back to back to user memory from
+    /// `dst`, straight from each frame (no buffer in between when this thread owns the space here; else through a
+    /// small stack buffer, `frame_via_buffer`), taking `mm.as` once for the whole call and filling
+    /// user pages as `copy_to_user` does. Returns the bytes that reached the program: all, or exactly those before
+    /// the first user page that cannot be written (Linux's short `copy_page_to_iter`, linux-6.6/lib/iov_iter.c:
+    /// the read ends there). A part that leaves its frame ends the copy too. Never call it under a page-cache
+    /// lock (`vfs.inode.index`: `mm.as` is outside it, CONTRACTS §4).
+    pub fn copy_frames_to_user(&self, dst: u64, parts: &[(&mm_core::PageFrame, usize, usize)]) -> usize {
+        let total = parts.iter().try_fold(0usize, |t, p| t.checked_add(p.2));
+        let Some(total) = total.filter(|&t| t > 0) else { return 0 };
+        let mut g = self.inner.lock();
+        let ok = self.ensure_prefix(&mut g, dst, total, Need::Write);
+        let root = self.root;
+        let owns = tlb::owns_here(root);
+        let mut done = 0usize;
+        for &(frame, off, n) in parts {
+            if done >= ok {
+                break;
+            }
+            let n = n.min(ok - done);
+            let Some(at) = dst.checked_add(done as u64) else { break };
+            // Straight from the frame when this thread owns the space here (the fast path); the rest (not owned,
+            // the fast path closed) through a small kernel buffer, under the `mm.as` held here, which the walk
+            // needs (a walker is no TLB holder).
+            let mut got = if owns { frame.copy_to_user(root, off, n, at) } else { 0 };
+            if got < n {
+                got += Self::frame_via_buffer(root, owns, frame, off + got, n - got, at + got as u64);
+            }
+            done += got;
+            if got < n {
+                break;
+            }
+        }
+        drop(g);
+        done
+    }
+
+    /// `copy_frames_to_user`'s other way, under `mm.as`: `n` bytes of `frame` from `off` to `at` through a stack
+    /// buffer and `copy_to_user` (fast path or table walk; for a thread that does not own `root`, the walk with
+    /// interrupts off, `tlb::without_lazy`). A chunk never crosses a user page, so a failed chunk is a page that
+    /// cannot be written: the bytes before it count.
+    fn frame_via_buffer(root: u64, owns: bool, frame: &mm_core::PageFrame, off: usize, n: usize, at: u64) -> usize {
+        let mut buf = [0u8; 512];
+        let mut k = 0usize;
+        while k < n {
+            let a = at + k as u64;
+            let c = page_chunk(a, n - k).min(buf.len());
+            if !frame.read(off + k, &mut buf[..c]) {
+                break;
+            }
+            let s = &buf[..c];
+            let r = if owns { hal::usercopy::copy_to_user(root, a, s) } else { tlb::without_lazy(root, || hal::usercopy::copy_to_user(root, a, s)) };
+            if r.is_err() {
+                break;
+            }
+            k += c;
+        }
+        k
+    }
+
+    /// PF-6 (fs-PF-5 CR 2): `copy_to_user` that takes no lock and never handles a fault (Linux
+    /// `copy_to_user_nofault`): for lockless readers inside a grace section, and as the first try of a copy whose
+    /// user pages are usually present. Only a thread that owns this space here (CR3 holds it, not lazily) copies;
+    /// otherwise, and at the first user page not present and writable, it ends: the bytes before count, the
+    /// caller's locked path (`copy_to_user`, which fills pages) does the rest.
+    pub fn copy_to_user_nofault(&self, dst: u64, src: &[u8]) -> usize {
+        if !tlb::owns_here(self.root) {
+            return 0;
+        }
+        hal::usercopy::copy_to_user_nofault(self.root, dst, src)
+    }
+
+    /// `copy_to_user_nofault` straight from a page-cache frame (`n` bytes from `off`).
+    pub fn copy_frame_to_user_nofault(&self, dst: u64, frame: &mm_core::PageFrame, off: usize, n: usize) -> usize {
+        if !tlb::owns_here(self.root) {
+            return 0;
+        }
+        frame.copy_to_user_nofault(self.root, off, n, dst)
+    }
+
+    /// `ensure` page by page: the bytes from `addr` (at most `len`) whose user pages are ready for `need`, up to
+    /// the first page that is not.
+    fn ensure_prefix(&self, g: &mut Inner, addr: u64, len: usize, need: Need) -> usize {
+        let mut done = 0usize;
+        while done < len {
+            let Some(a) = addr.checked_add(done as u64) else { break };
+            let k = page_chunk(a, len - done);
+            if self.ensure(g, a, k, need).is_err() {
+                break;
+            }
+            done += k;
+        }
+        done
     }
 
     /// Reads a NUL-terminated string of at most `max` bytes (without the NUL); pages after the NUL stay

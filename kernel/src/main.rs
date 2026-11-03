@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod config;
 mod earlycon;
+mod bootstack;
 mod bt_edid;
 mod follow;
 mod contracts;
@@ -69,10 +70,12 @@ _start:
 
     .section .bss.boot_stack, "aw", @nobits
     .p2align 4
+    .global boot_stack_bottom
 boot_stack_bottom:
-    .skip 131072
+    .skip {boot_stack}
 boot_stack_top:
 "#,
+    boot_stack = const bootstack::SIZE,
     options(att_syntax)
 );
 
@@ -132,7 +135,20 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     mm_core::set_frame_allocator(frames);
     stage("frame allocator ready");
     klog::heap_ready();
+    // IN-9: the boot step list and the desktop start see their events at every loglevel (from before `kernel
+    // start`, which comes after `klog::configure` applies CONFIG loglevel=).
+    klog::set_watch(console::bootscreen::step_wanted, console::bootscreen::step_line);
     config::init(bi.config());
+    // RB-18: spaces over the secret values in the CONFIG record, the one write to this block while the kernel runs.
+    kexec::boot::blank_config(&bi, bootinfo_phys);
+    // SAFETY: as at the top of this function, and the write is done: every slice over the CONFIG record made before
+    // it ends here, the BootInfo below is the only way to it from now on. `mm` and earlycon's references cover other
+    // records.
+    let bi: BootInfo<'static> = unsafe {
+        let head = core::slice::from_raw_parts(bootinfo_virt as *const u8, bootinfo::HEADER_SIZE);
+        let total = BootInfo::peek_total_size(head).unwrap_or_else(|| early_fail("BootInfo: bad header"));
+        BootInfo::parse(core::slice::from_raw_parts(bootinfo_virt as *const u8, total)).unwrap_or_else(|_| early_fail("BootInfo: parse error"))
+    };
     // RB-5a: Reload hands this BootInfo on (its KEEP block is rewritten in place for the next kernel). Before
     // MM-2's switch below, so kexec records the boot page-table root with the reload stub page.
     kexec::set_boot_info(bi, bootinfo_phys);
@@ -191,6 +207,10 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     klog::event!(Info, "mm", "frames", total_mb = st.0 / (1 << 20), free_mb = st.1 / (1 << 20), nx = features.nx, smep = features.smep, smap = features.smap, avx512 = features.avx512f);
 
     stage("clock, ACPI and interrupts done");
+    sched::cstate::configure(&config::get);
+    mm::thp::configure(&config::get);
+    // DR-2 (desk change request): CONFIG drm=auto|fake|off, read before drm::boot.
+    drm::configure(&config::get);
     sched::init();
     stage("scheduler ready");
 
@@ -268,9 +288,22 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     // WL-4 CR 4: the WLAN passphrase only through the take-once store (before the drivers bind).
     static SECRET_FN: fn(&str, &mut dyn FnMut(&[u8])) -> bool = config::take_secret;
     net::set_secret_source(&SECRET_FN);
+    // SN-12 CR (INT-W23): a panic with reboot stops the sound controllers next to xHCI (kexec cannot depend on hda).
+    let _ = kexec::crash::set_sound_hook(&hda::PANIC_HOOK);
+    // GX-7f CR-2 (INT-W25): amdgpu's PSP stop note crosses a Reload in the crash page's driver-note slots. Every
+    // boot, GPU or not: it reads the inherited note and registers the Quiesce hook that hands it on.
+    amdgpu::psplive::bind_note_io(amdgpu::psplive::NoteIo {
+        put: kexec::crash::hand_on_note,
+        take: kexec::crash::note_from_last,
+        // GX-7i2 CR-1: a Reload hands the boot id on in the marker, so "nothing handed on" can tell a firmware start.
+        from_reload: || kexec::crash::marker().is_some_and(|(f, _)| f == kexec::crash::record::MarkerFound::SameBoot),
+    });
     pci::scan();
     let (bound, skipped) = pci::bind_drivers();
     klog::event!(Info, "pci", "drivers", bound = bound, skipped_opt_in = skipped);
+    // DR-2 (desk change request): the DRM boot devices (drm=fake: the fake GPU and /dev/dri/renderD128), after
+    // vfs::init (the node goes into /dev) and the PCI drivers (a hardware backend registers there later).
+    drm::boot();
     // BT-edid (SN-5 CR3): the monitor's EDID from the loader (every Reload carries the record on) names the DP
     // audio sink; without one hda announces a generic stereo LPCM sink. Independent of the framebuffer.
     if let Some(edid) = bi.edid() {
@@ -324,16 +357,25 @@ fn configure_serial() {
 fn run_ktests() -> ! {
     let filter = config::get("ktest").unwrap_or_default();
     // CONFIG `ktest_hw=on`: only Safe and Display tests, as on the Mini-PC over MCP (QemuOnly ones skip there).
+    // Program tests (a stick tree's program) run only without a hypervisor: on the Mini-PC (Georg 30.10.).
     let hw = config::get("ktest_hw").as_deref() == Some("on");
-    let allowed = |c| matches!(c, ktest::Class::Safe | ktest::Class::Display) || (hal::cpu::detect().hypervisor && !hw);
+    let hypervisor = hal::cpu::detect().hypervisor;
+    let allowed = |c: ktest::Class| c.runs_here(hypervisor, hw);
     // CONFIG `ktest_nmi_check=on`: after each test, every other CPU must answer an NMI sample (desk fix/nmi).
+    // INT-W28 (GX-7m CR): a canary at the boot stack's low end; a test that reaches it is named after it ran.
+    // CONFIG `ktest_stack=<KiB>`: each test's stack use measured against that budget (bootstack's module doc).
+    bootstack::measure(config::get("ktest_stack").and_then(|v| v.trim().parse().ok()).unwrap_or(0));
     let sum = if config::get("ktest_nmi_check").as_deref() == Some("on") {
-        ktest::run_checked(&filter, allowed, time::now_ns, nmi_check)
+        ktest::run_checked(&filter, allowed, time::now_ns, |n| match (bootstack::check_after(n), nmi_check(n)) {
+            (Some(a), Some(b)) => Some(alloc::format!("{a}; {b}")),
+            (a, b) => a.or(b),
+        })
     } else {
-        ktest::run(&filter, allowed, time::now_ns)
+        ktest::run_checked(&filter, allowed, time::now_ns, bootstack::check_after)
     };
     // RB-klog CR2: serial lines a storm left to klogd reach the log before QEMU exits (diagnostics only).
-    klog::flush_serial(usize::MAX);
+    // SN-12 CR (INT-W23): and a line klogd is printing on another CPU (bounded, 100 ms).
+    let _ = klog::flush_serial_settled(100_000_000);
     hal::panic::qemu_exit(if sum.failed == 0 { hal::panic::EXIT_PASS } else { hal::panic::EXIT_FAIL });
     hal::panic::halt_forever()
 }
@@ -404,6 +446,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let me = hal::percpu::this_cpu();
     use core::fmt::Write;
     let mut w = hal::serial::Writer;
+    // INT-W28 (GX-7m CR): a boot-stack overflow is named first, before anything that allocates, since the
+    // overflow may have damaged the statics the rest of the report reads.
+    if bootstack::damaged() != 0 {
+        let _ = write!(w, "\nBitsOS V2: stack overflow in {} (boot stack canary damaged)\n", ktest::current().unwrap_or("boot"));
+    }
     match PANIC_CPU.compare_exchange(usize::MAX, me, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {}
         Err(c) if c == me => {

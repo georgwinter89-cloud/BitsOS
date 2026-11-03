@@ -78,6 +78,10 @@ pub mod ioc {
     pub const EVIOCGMASK: u64 = ior(0x92, 16);
     pub const EVIOCSMASK: u64 = iow(0x93, 16);
     pub const EVIOCSCLOCKID: u64 = iow(0xa0, 4);
+    /// BitsOS's own request (INT-W17, MC-9b CR 1; Linux leaves nr 0xb0 of 'E' unused and answers EINVAL): with 1
+    /// this open file no longer gets the events programs wrote into the device (`evdev_write`, `injected`) nor
+    /// their repeats, so what it reads from a real device is real (R8c, the installer's dialog); 0 gets all again.
+    pub const EVIOC_BITSOS_PHYSICAL: u64 = iow(0xb0, 4);
     pub const EVIOCSFF_NR: u64 = 0x80;
     /// Variable-length reads: `EVIOCGNAME(len)` = `ior(NAME, len)`.
     pub const NAME: u64 = 0x06;
@@ -374,6 +378,8 @@ pub struct Queue {
     /// The sink's id of this listener (the grab check of a repeat).
     id: AtomicU64,
     rep: SpinLock<Rep>,
+    /// EVIOC_BITSOS_PHYSICAL: events marked injected (written by programs) never enter this ring.
+    physical: AtomicBool,
 }
 
 /// The key that repeats and when next (None: nothing repeats).
@@ -394,9 +400,15 @@ fn note_clamps((n, behind): (u64, u64)) {
 
 klog::counter!(OVERFLOWS, "input.evdev_overflows");
 klog::counter!(LOST, "input.evdev_lost");
+klog::counter!(FILTERED, "input.evdev_written_filtered");
 
 impl Listener for Queue {
     fn push(&self, ev: InputEvent) {
+        if ev.injected && self.physical.load(Ordering::Acquire) {
+            // Not this client's: neither the event nor the repeat it would start.
+            FILTERED.inc();
+            return;
+        }
         let (wake, clamps, before, after) = {
             let mut ring = self.ring.lock();
             let before = ring.losses();
@@ -447,6 +459,14 @@ impl Queue {
     pub fn repeat_due(&self, now: u64) -> Option<u64> {
         let r = *self.rep.lock();
         let (key, injected) = r.key?;
+        if injected && self.physical.load(Ordering::Acquire) {
+            // A written key's repeat that began before EVIOC_BITSOS_PHYSICAL was set ends here for this client.
+            let mut cur = self.rep.lock();
+            if cur.key == Some((key, injected)) {
+                cur.key = None;
+            }
+            return cur.key.map(|_| cur.next_ns);
+        }
         if now < r.next_ns {
             return Some(r.next_ns);
         }
@@ -512,6 +532,7 @@ impl Handle {
             dev: dev.clone(),
             id: AtomicU64::new(0),
             rep: SpinLock::named("evdev.repeat", Rep::default()),
+            physical: AtomicBool::new(false),
         });
         let id = dev.sink().attach(q.clone());
         q.id.store(id, Ordering::Release);
@@ -558,7 +579,12 @@ impl Handle {
                 n += EVENT_SIZE;
             }
             if n > 0 {
-                crate::latency::program_read(first, time::now_ns());
+                // IN-8: the reader, not the opener (a description is shared across fork and dup, comm changes
+                // on execve and PR_SET_NAME); a kernel thread reads as the opener.
+                crate::latency::program_read(first, time::now_ns(), || {
+                    let (pid, comm) = jobs::procs().reader().unwrap_or((self.subject.pid, [0; crate::latency::program::COMM_LEN]));
+                    crate::latency::Reader { pid, comm }
+                });
                 self.dev.sink().reader_took();
                 return Ok(n);
             }
@@ -695,6 +721,19 @@ impl Handle {
                     _ => return Err(EINVAL),
                 };
                 self.q.ring.lock().set_clock(c, time::now_ns());
+                return Ok(0);
+            }
+            EVIOC_BITSOS_PHYSICAL => {
+                let mut b = [0u8; 4];
+                get(&mut b)?;
+                let on = match i32::from_le_bytes(b) {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(EINVAL),
+                };
+                if self.q.physical.swap(on, Ordering::AcqRel) != on {
+                    klog::event!(Info, "input", "evdev.physical_only", client = self.id, device = dev.event_id(), on = on, pid = self.subject.pid);
+                }
                 return Ok(0);
             }
             EVIOCGKEYCODE | EVIOCSKEYCODE => {

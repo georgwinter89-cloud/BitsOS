@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """IN-4 scenario: the console terminal typed on through QEMU's USB keyboard (QMP send-key = physical keys).
 
-Usage: tty_check.py <host port> <token> <qmp socket> <run dir>
-Steps: the monitor's `run /bin/abi-rawtty raw` puts the console in raw mode; a, b and q typed on the keyboard
-arrive as 61 62 71, the VTIME read times out, the settings are restored and the prompt comes back; then
-`run /bin/abi-rawtty wait` blocks in a canonical read and Ctrl+C ends it with SIGINT (exit code 130); the evdev
-nodes of MCP's devices and of the USB keyboard and mouse exist (MCP `log`). Exit status 0 = green."""
+Usage: tty_check.py shell|monitor <host port> <token> <qmp socket> <run dir>
+shell (a normal boot: init keeps BusyBox ash on the console since UL-3a, prompt `/ # `): `/bin/abi-rawtty raw`
+typed at the shell puts the console in raw mode; a, b and q typed on the keyboard arrive as 61 62 71, the VTIME
+read times out, the settings are restored and the shell's prompt comes back; then `/bin/abi-rawtty wait` blocks in
+a canonical read and Ctrl+C ends it with SIGINT (the shell's `echo $?` says 130); the evdev nodes of MCP's devices
+and of the USB keyboard and mouse exist (MCP `log`).
+monitor (CONFIG init=off: no session holds the console, so the kernel monitor `bits>` reads it): the same two
+programs started with the monitor's `run`; the monitor reports `exit code 130` for the Ctrl+C.
+Exit status 0 = green."""
 import http.client
 import json
 import re
@@ -13,13 +17,14 @@ import socket
 import sys
 import time
 
-PORT, TOKEN, QMP_PATH, RUN_DIR = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+MODE, PORT, TOKEN, QMP_PATH, RUN_DIR = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 next_id = 0
 
 # Characters this test types -> QEMU qcodes (US key positions on the German layout: y and z swapped, '/' is
 # Shift+7, '-' sits where the US slash is).
 KEYS = {c: [c] for c in "abcdefghijklmnopqrstuvwx"}
-KEYS.update({"y": ["z"], "z": ["y"], " ": ["spc"], "/": ["shift", "7"], "-": ["slash"], "\n": ["ret"]})
+KEYS.update({"y": ["z"], "z": ["y"], " ": ["spc"], "/": ["shift", "7"], "-": ["slash"], "\n": ["ret"],
+             "$": ["shift", "4"], "?": ["shift", "minus"], "=": ["shift", "0"]})
 
 
 def need(cond, what, detail=""):
@@ -111,14 +116,32 @@ class Qmp:
             self.keys(*KEYS[ch])
 
 
-def main():
-    c = connect(240)
-    q = Qmp(QMP_PATH)
-    wait_screen(c, ["bits>"], "the monitor's prompt")
-    tool(c, "send_keys", {"text": "log level off\n"})
-    time.sleep(0.5)
-    q.keys("ctrl", "u")
-    q.type("run /bin/abi-rawtty raw\n")
+# BusyBox ash's prompt for root in /, and the monitor's (crates/console/src/monitor.rs PROMPT), as console_check.py.
+SHELL_PROMPT = "/ # "
+MONITOR_PROMPT = "bits> "
+
+
+def last_row(t):
+    """The last non-empty screen row from MCP's text mode (after its header line)."""
+    rows = [r for r in (t.split("\n", 1)[1].split("\n") if "\n" in t else []) if r.strip()]
+    return rows[-1].rstrip() if rows else ""
+
+
+def wait_prompt(c, prompt, what, timeout=20):
+    """Waits until the prompt is the last line on the screen (a fresh prompt after a program ended)."""
+    end = time.time() + timeout
+    t = ""
+    while time.time() < end:
+        t = screen_text(c)
+        if last_row(t) == prompt.rstrip():
+            print(f"ok: {what}")
+            return t
+        time.sleep(0.3)
+    raise SystemExit(f"RED: {what}: the last line is not {prompt.rstrip()!r}\n{t}")
+
+
+def raw_and_ctrl_c(c, q, prompt, start):
+    q.type(start + "/bin/abi-rawtty raw\n")
     wait_screen(c, ["raw: icanon 0 echo 0 isig 0 opost 0", "ready"], "the program set raw mode")
     for k in "abq":
         q.keys(k)
@@ -128,17 +151,47 @@ def main():
     got = [w for m in re.finditer(r"got \d+:((?: [0-9a-f]{2})+)", t) for w in m.group(1).split()]
     need(got == ["61", "62", "71"], "physical keys arrived raw as 61 62 71", t)
     need("timed read = 0 after a wait" in t, "VMIN 0 VTIME 2 timed out with 0 bytes", t)
-    wait_screen(c, ["bits> "], "the prompt is back")
-    q.type("run /bin/abi-rawtty wait\n")
+    wait_prompt(c, prompt, "the prompt is back")
+    q.type(start + "/bin/abi-rawtty wait\n")
     wait_screen(c, ["waiting"], "the program waits in a canonical read")
     time.sleep(0.3)
     q.keys("ctrl", "c")
+    return wait_screen(c, ["^C"], "Ctrl+C was echoed")
+
+
+def shell(c, q):
+    wait_screen(c, [SHELL_PROMPT.rstrip()], "the console shell's prompt", timeout=60)
+    time.sleep(1)
+    # The console's default level (warn) keeps Info lines off the screen already; off makes the screen the
+    # programs' own (the monitor's `log level` is not reachable while the shell holds the console).
+    tool(c, "send_keys", {"text": "echo off > /sys/bitsos/console_log\n"})
+    wait_prompt(c, SHELL_PROMPT, "the shell took the console_log line")
+    t = raw_and_ctrl_c(c, q, SHELL_PROMPT, "")
+    need("read returned" not in t, "the read never returned data", t)
+    wait_prompt(c, SHELL_PROMPT, "the shell's prompt is back after Ctrl+C")
+    q.type("echo status=$?\n")
+    wait_screen(c, ["status=130"], "the shell saw exit status 130 (SIGINT)")
+
+
+def monitor(c, q):
+    wait_screen(c, [MONITOR_PROMPT.rstrip()], "the monitor's prompt (init=off)", timeout=60)
+    tool(c, "send_keys", {"text": "log level off\n"})
+    time.sleep(0.5)
+    q.keys("ctrl", "u")
+    raw_and_ctrl_c(c, q, MONITOR_PROMPT, "run ")
     t = wait_screen(c, ["^C", "exit code 130"], "Ctrl+C ended it with SIGINT (130)")
     need("read returned" not in t, "the read never returned data", t)
+
+
+def main():
+    c = connect(240)
+    q = Qmp(QMP_PATH)
+    {"shell": shell, "monitor": monitor}[MODE](c, q)
     log = tool(c, "log", {"subsystem": "input", "name": "evdev.node", "max": 200})
     for n in ("BitsOS MCP keyboard", "BitsOS MCP pointer"):
         need(n in log, f"evdev node for {n}", log)
     need(log.count(" evdev.node ") >= 4, "evdev nodes for the USB keyboard and mouse too", log)
+    print(f"in tty ({MODE}): green")
 
 
 if __name__ == "__main__":

@@ -10,3 +10,6 @@ klog = { path = "../klog" }
 # ktests only: the ask ktests answer from a second thread.
 ktest = { path = "../ktest" }
 sched = { path = "../sched" }
+
+[lints]
+workspace = true

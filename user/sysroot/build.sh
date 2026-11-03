@@ -12,8 +12,8 @@ OUT=$HERE/out
 SYSROOT=$OUT/sysroot
 SRC=$OUT/src
 BLD=$OUT/build
-MUSL_SRC=${V2_MUSL_SRC:-/home/georg/BitsOS/werkzeuge/plattform/clib/fremd/musl}
-LLVM_SRC=${V2_LLVM_SRC:-/home/georg/BitsOS/werkzeuge/plattform/clib/fremd/llvm-project}
+MUSL_SRC=${V2_MUSL_SRC:-$HOME/BitsOS/werkzeuge/plattform/clib/fremd/musl}
+LLVM_SRC=${V2_LLVM_SRC:-$HOME/BitsOS/werkzeuge/plattform/clib/fremd/llvm-project}
 JOBS=${V2_JOBS:-8}
 # The Gaming-PC stays usable while this runs: 1..8 jobs (ninja -j0 would mean unlimited).
 [[ $JOBS =~ ^[0-9]+$ ]] && (( JOBS >= 1 )) || JOBS=8

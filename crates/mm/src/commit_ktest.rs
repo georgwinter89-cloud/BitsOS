@@ -193,7 +193,11 @@ fn reserve_70g() -> TestResult {
     kassert!(a.committed_pages() == commit / P, "commit {} pages", a.committed_pages());
     a.write_u64(base, 1).map_err(e)?;
     a.write_u64(base + commit - 8, 2).map_err(e)?;
-    kassert!(a.resident_pages() == 2 && user() - frames0 == 2 * P, "touched pages only: {} resident", a.resident_pages());
+    // MM-13: a touch takes a 2 MiB page where the aligned 2 MiB lies inside the committed part (THP always).
+    let leaf = |va: u64| paging::translate_leaf(a.root(), va).map_or(0, |l| l.size.bytes() / P);
+    let want = leaf(base) + leaf(base + commit - 8);
+    kassert!(want >= 2 && a.resident_pages() == want && user() - frames0 == want * P, "touched pages only: {} resident, {want} expected", a.resident_pages());
+    kassert!(a.committed_pages() == commit / P, "huge pages changed the commit: {} pages", a.committed_pages());
     kassert!(a.read_u64(base + RES - P).is_err(), "the reserve's tail is still PROT_NONE");
     a.sys_munmap(base, RES).map_err(e)?;
     kassert!(a.committed_pages() == 0 && user() == frames0, "all back");

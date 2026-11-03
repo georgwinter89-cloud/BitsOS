@@ -725,7 +725,7 @@ fn boot(root: &Path, progs: &[(String, PathBuf)], port: u16, timeout: u64, smp: 
     let io = ImageOpts {
         name: NAME.into(),
         generation: 1,
-        config_extra: vec![format!("token={TOKEN}"), format!("mcp_port={GUEST_MCP_PORT}"), "loglevel=info".into()],
+        config_extra: vec![format!("token={TOKEN}"), format!("mcp_port={GUEST_MCP_PORT}"), "loglevel=info".into(), "drm=fake".into()],
         build: BuildOpts::default(),
     };
     image::make_image_from(root, &io, &art)?;

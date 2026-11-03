@@ -1,0 +1,52 @@
+amdgpu_device_initialize: 0
+amdgpu_cs_ctx_create2 LOW: 0
+amdgpu_cs_ctx_create2 NORMAL: 0
+amdgpu_cs_query_reset_state2: 0
+reset flags: 0
+submit_raw2 no chunks: -22
+submit_raw2 unknown BO list: -2
+sequence untouched: yes
+submit_raw2 GFX ring 1: -22
+amdgpu_cs_create_syncobj2: 0
+submit_raw2 in-syncobj without fence: -22
+submit_raw2 out-syncobj: -2
+amdgpu_cs_syncobj_signal: 0
+submit_raw2 signaled in-syncobj: -2
+amdgpu_cs_destroy_syncobj: 0
+query_fence_status seq 0: 0
+expired: 1
+query_fence_status last: 0
+expired: 1
+query_fence_status not submitted: -22
+query_fence_status compute ring 3: 0
+query_fence_status compute ring 4: -22
+amdgpu_cs_wait_fences all: 0
+status 1
+amdgpu_cs_wait_fences any: 0
+status 1 first 0
+amdgpu_cs_wait_fences any, one not submitted: 0
+status 1 first 0
+amdgpu_cs_wait_fences all, one not submitted: -22
+amdgpu_bo_alloc: 0
+amdgpu_bo_alloc 2: 0
+amdgpu_bo_list_create_raw: 0
+list handle: 1
+submit_raw2 list handle and BO_HANDLES: -22
+amdgpu_bo_list_destroy_raw: 0
+amdgpu_bo_list_destroy_raw again: 0
+submit_raw2 destroyed BO list: -2
+amdgpu_bo_list_create: 0
+amdgpu_bo_list_update: 0
+amdgpu_bo_list_destroy: 0
+amdgpu_cs_fence_to_handle syncobj: 0
+amdgpu_cs_syncobj_wait on it: 0
+amdgpu_cs_destroy_syncobj it: 0
+amdgpu_cs_fence_to_handle sync_file: 0
+sync_file fd: yes
+amdgpu_cs_fence_to_handle what 3: -22
+amdgpu_cs_fence_to_handle not submitted: -22
+amdgpu_bo_free: 0
+amdgpu_bo_free 2: 0
+amdgpu_cs_ctx_free: 0
+amdgpu_cs_ctx_free LOW: 0
+libdrm-cs: ok

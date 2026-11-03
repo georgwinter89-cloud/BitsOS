@@ -1,6 +1,6 @@
 //! CONFIG `smp=` and `cpus=` (CP-4b; pure, host-tested): how many CPUs the bring-up may have online.
 //!
-//! - `smp=off` keeps the APs offline (one CPU), e.g. so RB-5a's single-CPU Reload works until RB-5b parks APs;
+//! - `smp=off` keeps the APs offline (one CPU, a debugging and rescue setting; Reload parks APs since RB-5b);
 //!   `smp=on` (the default) starts every CPU the MADT lists. A number is no `smp=` value (`smp=1` could mean "on"
 //!   or "one CPU"): it is not understood, so one CPU runs and the warning points to `cpus=N`.
 //! - `cpus=N` starts at most N CPUs, the BSP included (a debugging limit, like Linux `maxcpus=`); `cpus=0`

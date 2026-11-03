@@ -1,10 +1,10 @@
 //! What the ext4 code reads and writes: a volume as bytes in whole blocks of the file system. In the kernel a
-//! `block::Disk` (`DiskDev`) or a file of another file system (`ImageDev`, the loop image `\BITSOS2\data.img`
+//! `block::Disk` through its page cache (`CachedDiskDev`) or a file of another file system (`ImageDev`, the loop image `\BITSOS2\data.img`
 //! on the boot stick's FAT); in host tests an image in memory that records every write in order (the cut-power
 //! tests replay the first k of them) and fails on demand.
 //!
 //! ext4 keeps no block cache of its own: an image file has its own page cache below, and a disk mount gets one
-//! by `block::bdev::DiskFile` (`CachedDiskDev`, FS-8c); `DiskDev` is the uncached path (each call one request).
+//! by `block::bdev::DiskFile` (`CachedDiskDev`, FS-8c). C1 removed the uncached `DiskDev` (no caller).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -173,57 +173,6 @@ pub(crate) fn write_part(bs: u64, at: u64, data: &[u8], read: impl Fn(u64, &mut 
     let o = (at - first) as usize;
     tmp[o..o + data.len()].copy_from_slice(data);
     write(first, &tmp)
-}
-
-/// A partition (or a whole disk) of a `block::Disk` from block `start`: each call waits for its request, so
-/// the order of the ext4 code's writes is the order they reach the device.
-pub struct DiskDev {
-    disk: Arc<Disk>,
-    start: u64,
-    bytes: u64,
-    bs: u64,
-    lift: Lift,
-}
-
-impl DiskDev {
-    pub fn new(disk: Arc<Disk>, start: u64, blocks: u64) -> DiskDev {
-        let bs = disk.block_size() as u64;
-        DiskDev { disk, start, bytes: blocks * bs, bs, lift: Lift::new() }
-    }
-    fn lba(&self, at: u64, len: usize) -> Result<u64, i64> {
-        if at % self.bs != 0 || len as u64 % self.bs != 0 || at.checked_add(len as u64).is_none_or(|e| e > self.bytes) {
-            return Err(EIO);
-        }
-        Ok(self.start + at / self.bs)
-    }
-    fn read_whole(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
-        let lba = self.lba(at, buf.len())?;
-        self.disk.read(lba, buf, self.lift.prio()).map_err(|e| e.errno())
-    }
-}
-
-impl Dev for DiskDev {
-    fn size(&self) -> u64 {
-        self.bytes
-    }
-    fn read(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
-        read_part(self.bs, at, buf, |a, b| self.read_whole(a, b))
-    }
-    fn write(&self, at: u64, data: &[u8]) -> Result<(), i64> {
-        write_part(self.bs, at, data, |a, b| self.read_whole(a, b), |a, d| {
-            let lba = self.lba(a, d.len())?;
-            self.disk.write(lba, d, false, self.lift.prio()).map_err(|e| e.errno())
-        })
-    }
-    fn flush(&self) -> Result<(), i64> {
-        self.disk.flush(self.lift.prio()).map_err(|e| e.errno())
-    }
-    fn settle(&self) -> Result<(), i64> {
-        self.disk.settle().map_err(|e| e.errno())
-    }
-    fn lift(&self) -> Option<&Lift> {
-        Some(&self.lift)
-    }
 }
 
 /// A partition (or a whole disk) of a `block::Disk` through the disk's page cache (`block::bdev::DiskFile`,

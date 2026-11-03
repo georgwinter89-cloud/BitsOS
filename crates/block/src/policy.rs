@@ -11,6 +11,12 @@
 //!    other USB disk only with CONFIG `usb_msd_write=on` (a test switch); NVMe only with `nvme_write=on`
 //!    (NV's gate checks it too); a stacked device (partition, crypt, bitsvol on top of a `Disk`) passes here
 //!    because its writes go through the lower `Disk` and its hook; anything else is refused.
+//!
+//! MC-10 (Georg 27.10.): besides `nvme_write=on`, NVMe writes open for a while when Georg ticks "auch interne
+//! Platte (NVMe) beschreiben" in the full-access dialog at the real keyboard: the MCP gate calls
+//! `open_nvme_until` with the grant's end (monotonic) and `close_nvme` when it ends or is revoked. That only
+//! changes what `switches().nvme_write` answers; steps 1 and 2 come first, so a disk with a Windows or EFI
+//! partition table stays refused whatever was ticked (R8).
 
 use crate::error::Refusal;
 use crate::queue::Kind;
@@ -18,6 +24,7 @@ use crate::table::Verdict;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use ksync::SpinLock;
 
 /// What a registered device is (decides the rule in step 3).
@@ -168,10 +175,58 @@ fn on(f: Option<fn(&str) -> Option<String>>, key: &str) -> bool {
     f.and_then(|f| f(key)).is_some_and(|v| v.trim() == "on")
 }
 
-/// The switches now (all off before `configure`: the safe side).
+/// The switches now (all off before `configure`: the safe side). `nvme_write` is CONFIG's or the run-time
+/// opener's (MC-10).
 pub fn switches() -> Switches {
     let f = FACTS.lock().config;
-    Switches { stick_write: on(f, "stick_write"), usb_msd_write: on(f, "usb_msd_write"), nvme_write: on(f, "nvme_write") }
+    Switches { stick_write: on(f, "stick_write"), usb_msd_write: on(f, "usb_msd_write"), nvme_write: on(f, "nvme_write") || nvme_open_now() }
+}
+
+/// MC-10: the run-time NVMe opener's end (monotonic ns; 0: closed).
+static NVME_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the opener holds at `now` (pure: host-tested).
+pub fn runtime_open(until_ns: u64, now_ns: u64) -> bool {
+    until_ns != 0 && now_ns < until_ns
+}
+
+fn nvme_open_now() -> bool {
+    let until = NVME_UNTIL.load(Ordering::Acquire);
+    if until == 0 {
+        return false;
+    }
+    let now = ksync::now_ns().unwrap_or(u64::MAX);
+    if runtime_open(until, now) {
+        return true;
+    }
+    // Its time ran out: closed once, said once.
+    if NVME_UNTIL.compare_exchange(until, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        klog::event!(Info, "block", "nvme.runtime_closed", reason = "expired"; "the NVMe write gate opened by the full-access grant closed at its end");
+    }
+    false
+}
+
+/// MC-10: opens NVMe writes until `until_ns` (monotonic) for the full-access grant Georg ticked at the keyboard;
+/// a later call replaces the end. Only the MCP gate calls it (the installer's table). Windows/EFI disks stay
+/// refused (`decide` step 2).
+pub fn open_nvme_until(until_ns: u64, why: &str) {
+    let old = NVME_UNTIL.swap(until_ns.max(1), Ordering::AcqRel);
+    if old != until_ns.max(1) {
+        let left = until_ns.saturating_sub(ksync::now_ns().unwrap_or(0)) / 1_000_000_000;
+        klog::event!(Warn, "block", "nvme.runtime_opened", left_s = left, reason = why; "NVMe writes open for the full-access grant (nvme_write in CONFIG.TXT unchanged)");
+    }
+}
+
+/// MC-10: closes what `open_nvme_until` opened (a revoked or ended grant); nothing when it was not open.
+pub fn close_nvme(why: &str) {
+    if NVME_UNTIL.swap(0, Ordering::AcqRel) != 0 {
+        klog::event!(Info, "block", "nvme.runtime_closed", reason = why; "the NVMe write gate opened by the full-access grant is closed");
+    }
+}
+
+/// Whether the run-time opener holds now (for ktests and `/proc` texts).
+pub fn nvme_runtime_open() -> bool {
+    nvme_open_now()
 }
 
 /// Whether any USB disk could take a write under the current switches. usb-msd asks this when a device
@@ -253,6 +308,21 @@ mod tests {
         assert_eq!(opened(ro, StickMatch::Yes, true), Err(Refusal::DeviceReadOnly));
         let other = decide(Usb, false, &CLEAN, StickMatch::No, Switches::default());
         assert_eq!(opened(other, StickMatch::No, true), Err(Refusal::UsbWritesOff));
+    }
+
+    /// MC-10: the run-time opener counts only until its end, and a Windows/EFI disk stays refused when it is open.
+    #[test]
+    fn the_runtime_nvme_opener_is_bounded_and_never_opens_windows() {
+        assert!(!runtime_open(0, 5), "0 is closed");
+        assert!(runtime_open(100, 99) && !runtime_open(100, 100));
+        let open = sw(false, false, runtime_open(100, 50));
+        assert_eq!(decide(Nvme, false, &CLEAN, StickMatch::No, open), Ok(()));
+        let closed = sw(false, false, runtime_open(100, 150));
+        assert_eq!(decide(Nvme, false, &CLEAN, StickMatch::No, closed), Err(Refusal::NvmeWritesOff));
+        for v in [Verdict::Windows("ntfs".into()), Verdict::Efi("esp".into()), Verdict::Unknown("x".into())] {
+            assert!(decide(Nvme, false, &v, StickMatch::No, open).is_err(), "{v:?} stays refused with the gate open");
+        }
+        assert_eq!(decide(Nvme, true, &CLEAN, StickMatch::No, open), Err(Refusal::DeviceReadOnly));
     }
 
     #[test]

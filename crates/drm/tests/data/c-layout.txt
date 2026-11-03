@@ -1,0 +1,1520 @@
+type drm_clip_rect 8 2
+field drm_clip_rect x1 0
+field drm_clip_rect y1 2
+field drm_clip_rect x2 4
+field drm_clip_rect y2 6
+type drm_drawable_info 16 8
+field drm_drawable_info num_rects 0
+field drm_drawable_info rects 8
+type drm_tex_region 8 4
+field drm_tex_region next 0
+field drm_tex_region prev 1
+field drm_tex_region in_use 2
+field drm_tex_region padding 3
+field drm_tex_region age 4
+type drm_hw_lock 64 4
+field drm_hw_lock lock 0
+field drm_hw_lock padding 4
+type drm_version 64 8
+field drm_version version_major 0
+field drm_version version_minor 4
+field drm_version version_patchlevel 8
+field drm_version name_len 16
+field drm_version name 24
+field drm_version date_len 32
+field drm_version date 40
+field drm_version desc_len 48
+field drm_version desc 56
+type drm_unique 16 8
+field drm_unique unique_len 0
+field drm_unique unique 8
+type drm_list 16 8
+field drm_list count 0
+field drm_list version 8
+type drm_block 4 4
+field drm_block unused 0
+type drm_control 8 4
+field drm_control func 0
+field drm_control irq 4
+type drm_ctx_priv_map 16 8
+field drm_ctx_priv_map ctx_id 0
+field drm_ctx_priv_map handle 8
+type drm_map 40 8
+field drm_map offset 0
+field drm_map size 8
+field drm_map type 16
+field drm_map flags 20
+field drm_map handle 24
+field drm_map mtrr 32
+type drm_client 40 8
+field drm_client idx 0
+field drm_client auth 4
+field drm_client pid 8
+field drm_client uid 16
+field drm_client magic 24
+field drm_client iocs 32
+type drm_stats 248 8
+field drm_stats count 0
+field drm_stats data 8
+type drm_stats__data 16 8
+field drm_stats__data value 0
+field drm_stats__data type 8
+type drm_lock 8 4
+field drm_lock context 0
+field drm_lock flags 4
+type drm_buf_desc 32 8
+field drm_buf_desc count 0
+field drm_buf_desc size 4
+field drm_buf_desc low_mark 8
+field drm_buf_desc high_mark 12
+field drm_buf_desc flags 16
+field drm_buf_desc agp_start 24
+type drm_buf_info 16 8
+field drm_buf_info count 0
+field drm_buf_info list 8
+type drm_buf_free 16 8
+field drm_buf_free count 0
+field drm_buf_free list 8
+type drm_buf_pub 24 8
+field drm_buf_pub idx 0
+field drm_buf_pub total 4
+field drm_buf_pub used 8
+field drm_buf_pub address 16
+type drm_buf_map 24 8
+field drm_buf_map count 0
+field drm_buf_map virtual 8
+field drm_buf_map list 16
+type drm_dma 64 8
+field drm_dma context 0
+field drm_dma send_count 4
+field drm_dma send_indices 8
+field drm_dma send_sizes 16
+field drm_dma flags 24
+field drm_dma request_count 28
+field drm_dma request_size 32
+field drm_dma request_indices 40
+field drm_dma request_sizes 48
+field drm_dma granted_count 56
+type drm_ctx 8 4
+field drm_ctx handle 0
+field drm_ctx flags 4
+type drm_ctx_res 16 8
+field drm_ctx_res count 0
+field drm_ctx_res contexts 8
+type drm_draw 4 4
+field drm_draw handle 0
+type drm_update_draw 24 8
+field drm_update_draw handle 0
+field drm_update_draw type 4
+field drm_update_draw num 8
+field drm_update_draw data 16
+type drm_auth 4 4
+field drm_auth magic 0
+type drm_irq_busid 16 4
+field drm_irq_busid irq 0
+field drm_irq_busid busnum 4
+field drm_irq_busid devnum 8
+field drm_irq_busid funcnum 12
+type drm_wait_vblank_request 16 8
+field drm_wait_vblank_request type 0
+field drm_wait_vblank_request sequence 4
+field drm_wait_vblank_request signal 8
+type drm_wait_vblank_reply 24 8
+field drm_wait_vblank_reply type 0
+field drm_wait_vblank_reply sequence 4
+field drm_wait_vblank_reply tval_sec 8
+field drm_wait_vblank_reply tval_usec 16
+type drm_wait_vblank 24 8
+field drm_wait_vblank request 0
+field drm_wait_vblank reply 0
+type drm_modeset_ctl 8 4
+field drm_modeset_ctl crtc 0
+field drm_modeset_ctl cmd 4
+type drm_agp_mode 8 8
+field drm_agp_mode mode 0
+type drm_agp_buffer 32 8
+field drm_agp_buffer size 0
+field drm_agp_buffer handle 8
+field drm_agp_buffer type 16
+field drm_agp_buffer physical 24
+type drm_agp_binding 16 8
+field drm_agp_binding handle 0
+field drm_agp_binding offset 8
+type drm_agp_info 56 8
+field drm_agp_info agp_version_major 0
+field drm_agp_info agp_version_minor 4
+field drm_agp_info mode 8
+field drm_agp_info aperture_base 16
+field drm_agp_info aperture_size 24
+field drm_agp_info memory_allowed 32
+field drm_agp_info memory_used 40
+field drm_agp_info id_vendor 48
+field drm_agp_info id_device 50
+type drm_scatter_gather 16 8
+field drm_scatter_gather size 0
+field drm_scatter_gather handle 8
+type drm_set_version 16 4
+field drm_set_version drm_di_major 0
+field drm_set_version drm_di_minor 4
+field drm_set_version drm_dd_major 8
+field drm_set_version drm_dd_minor 12
+type drm_gem_close 8 4
+field drm_gem_close handle 0
+field drm_gem_close pad 4
+type drm_gem_flink 8 4
+field drm_gem_flink handle 0
+field drm_gem_flink name 4
+type drm_gem_open 16 8
+field drm_gem_open name 0
+field drm_gem_open handle 4
+field drm_gem_open size 8
+type drm_gem_change_handle 8 4
+field drm_gem_change_handle handle 0
+field drm_gem_change_handle new_handle 4
+type drm_get_cap 16 8
+field drm_get_cap capability 0
+field drm_get_cap value 8
+type drm_set_client_cap 16 8
+field drm_set_client_cap capability 0
+field drm_set_client_cap value 8
+type drm_prime_handle 12 4
+field drm_prime_handle handle 0
+field drm_prime_handle flags 4
+field drm_prime_handle fd 8
+type drm_syncobj_create 8 4
+field drm_syncobj_create handle 0
+field drm_syncobj_create flags 4
+type drm_syncobj_destroy 8 4
+field drm_syncobj_destroy handle 0
+field drm_syncobj_destroy pad 4
+type drm_syncobj_handle 24 8
+field drm_syncobj_handle handle 0
+field drm_syncobj_handle flags 4
+field drm_syncobj_handle fd 8
+field drm_syncobj_handle pad 12
+field drm_syncobj_handle point 16
+type drm_syncobj_transfer 32 8
+field drm_syncobj_transfer src_handle 0
+field drm_syncobj_transfer dst_handle 4
+field drm_syncobj_transfer src_point 8
+field drm_syncobj_transfer dst_point 16
+field drm_syncobj_transfer flags 24
+field drm_syncobj_transfer pad 28
+type drm_syncobj_wait 40 8
+field drm_syncobj_wait handles 0
+field drm_syncobj_wait timeout_nsec 8
+field drm_syncobj_wait count_handles 16
+field drm_syncobj_wait flags 20
+field drm_syncobj_wait first_signaled 24
+field drm_syncobj_wait pad 28
+field drm_syncobj_wait deadline_nsec 32
+type drm_syncobj_timeline_wait 48 8
+field drm_syncobj_timeline_wait handles 0
+field drm_syncobj_timeline_wait points 8
+field drm_syncobj_timeline_wait timeout_nsec 16
+field drm_syncobj_timeline_wait count_handles 24
+field drm_syncobj_timeline_wait flags 28
+field drm_syncobj_timeline_wait first_signaled 32
+field drm_syncobj_timeline_wait pad 36
+field drm_syncobj_timeline_wait deadline_nsec 40
+type drm_syncobj_eventfd 24 8
+field drm_syncobj_eventfd handle 0
+field drm_syncobj_eventfd flags 4
+field drm_syncobj_eventfd point 8
+field drm_syncobj_eventfd fd 16
+field drm_syncobj_eventfd pad 20
+type drm_syncobj_array 16 8
+field drm_syncobj_array handles 0
+field drm_syncobj_array count_handles 8
+field drm_syncobj_array pad 12
+type drm_syncobj_timeline_array 24 8
+field drm_syncobj_timeline_array handles 0
+field drm_syncobj_timeline_array points 8
+field drm_syncobj_timeline_array count_handles 16
+field drm_syncobj_timeline_array flags 20
+type drm_crtc_get_sequence 24 8
+field drm_crtc_get_sequence crtc_id 0
+field drm_crtc_get_sequence active 4
+field drm_crtc_get_sequence sequence 8
+field drm_crtc_get_sequence sequence_ns 16
+type drm_crtc_queue_sequence 24 8
+field drm_crtc_queue_sequence crtc_id 0
+field drm_crtc_queue_sequence flags 4
+field drm_crtc_queue_sequence sequence 8
+field drm_crtc_queue_sequence user_data 16
+type drm_set_client_name 16 8
+field drm_set_client_name name_len 0
+field drm_set_client_name name 8
+type drm_mode_modeinfo 68 4
+field drm_mode_modeinfo clock 0
+field drm_mode_modeinfo hdisplay 4
+field drm_mode_modeinfo hsync_start 6
+field drm_mode_modeinfo hsync_end 8
+field drm_mode_modeinfo htotal 10
+field drm_mode_modeinfo hskew 12
+field drm_mode_modeinfo vdisplay 14
+field drm_mode_modeinfo vsync_start 16
+field drm_mode_modeinfo vsync_end 18
+field drm_mode_modeinfo vtotal 20
+field drm_mode_modeinfo vscan 22
+field drm_mode_modeinfo vrefresh 24
+field drm_mode_modeinfo flags 28
+field drm_mode_modeinfo type 32
+field drm_mode_modeinfo name 36
+type drm_mode_card_res 64 8
+field drm_mode_card_res fb_id_ptr 0
+field drm_mode_card_res crtc_id_ptr 8
+field drm_mode_card_res connector_id_ptr 16
+field drm_mode_card_res encoder_id_ptr 24
+field drm_mode_card_res count_fbs 32
+field drm_mode_card_res count_crtcs 36
+field drm_mode_card_res count_connectors 40
+field drm_mode_card_res count_encoders 44
+field drm_mode_card_res min_width 48
+field drm_mode_card_res max_width 52
+field drm_mode_card_res min_height 56
+field drm_mode_card_res max_height 60
+type drm_mode_crtc 104 8
+field drm_mode_crtc set_connectors_ptr 0
+field drm_mode_crtc count_connectors 8
+field drm_mode_crtc crtc_id 12
+field drm_mode_crtc fb_id 16
+field drm_mode_crtc x 20
+field drm_mode_crtc y 24
+field drm_mode_crtc gamma_size 28
+field drm_mode_crtc mode_valid 32
+field drm_mode_crtc mode 36
+type drm_mode_set_plane 48 4
+field drm_mode_set_plane plane_id 0
+field drm_mode_set_plane crtc_id 4
+field drm_mode_set_plane fb_id 8
+field drm_mode_set_plane flags 12
+field drm_mode_set_plane crtc_x 16
+field drm_mode_set_plane crtc_y 20
+field drm_mode_set_plane crtc_w 24
+field drm_mode_set_plane crtc_h 28
+field drm_mode_set_plane src_x 32
+field drm_mode_set_plane src_y 36
+field drm_mode_set_plane src_h 40
+field drm_mode_set_plane src_w 44
+type drm_mode_get_plane 32 8
+field drm_mode_get_plane plane_id 0
+field drm_mode_get_plane crtc_id 4
+field drm_mode_get_plane fb_id 8
+field drm_mode_get_plane possible_crtcs 12
+field drm_mode_get_plane gamma_size 16
+field drm_mode_get_plane count_format_types 20
+field drm_mode_get_plane format_type_ptr 24
+type drm_mode_get_plane_res 16 8
+field drm_mode_get_plane_res plane_id_ptr 0
+field drm_mode_get_plane_res count_planes 8
+type drm_mode_get_encoder 20 4
+field drm_mode_get_encoder encoder_id 0
+field drm_mode_get_encoder encoder_type 4
+field drm_mode_get_encoder crtc_id 8
+field drm_mode_get_encoder possible_crtcs 12
+field drm_mode_get_encoder possible_clones 16
+type drm_mode_get_connector 80 8
+field drm_mode_get_connector encoders_ptr 0
+field drm_mode_get_connector modes_ptr 8
+field drm_mode_get_connector props_ptr 16
+field drm_mode_get_connector prop_values_ptr 24
+field drm_mode_get_connector count_modes 32
+field drm_mode_get_connector count_props 36
+field drm_mode_get_connector count_encoders 40
+field drm_mode_get_connector encoder_id 44
+field drm_mode_get_connector connector_id 48
+field drm_mode_get_connector connector_type 52
+field drm_mode_get_connector connector_type_id 56
+field drm_mode_get_connector connection 60
+field drm_mode_get_connector mm_width 64
+field drm_mode_get_connector mm_height 68
+field drm_mode_get_connector subpixel 72
+field drm_mode_get_connector pad 76
+type drm_mode_get_property 64 8
+field drm_mode_get_property values_ptr 0
+field drm_mode_get_property enum_blob_ptr 8
+field drm_mode_get_property prop_id 16
+field drm_mode_get_property flags 20
+field drm_mode_get_property name 24
+field drm_mode_get_property count_values 56
+field drm_mode_get_property count_enum_blobs 60
+type drm_mode_connector_set_property 16 8
+field drm_mode_connector_set_property value 0
+field drm_mode_connector_set_property prop_id 8
+field drm_mode_connector_set_property connector_id 12
+type drm_mode_obj_get_properties 32 8
+field drm_mode_obj_get_properties props_ptr 0
+field drm_mode_obj_get_properties prop_values_ptr 8
+field drm_mode_obj_get_properties count_props 16
+field drm_mode_obj_get_properties obj_id 20
+field drm_mode_obj_get_properties obj_type 24
+type drm_mode_obj_set_property 24 8
+field drm_mode_obj_set_property value 0
+field drm_mode_obj_set_property prop_id 8
+field drm_mode_obj_set_property obj_id 12
+field drm_mode_obj_set_property obj_type 16
+type drm_mode_get_blob 16 8
+field drm_mode_get_blob blob_id 0
+field drm_mode_get_blob length 4
+field drm_mode_get_blob data 8
+type drm_mode_fb_cmd 28 4
+field drm_mode_fb_cmd fb_id 0
+field drm_mode_fb_cmd width 4
+field drm_mode_fb_cmd height 8
+field drm_mode_fb_cmd pitch 12
+field drm_mode_fb_cmd bpp 16
+field drm_mode_fb_cmd depth 20
+field drm_mode_fb_cmd handle 24
+type drm_mode_fb_cmd2 104 8
+field drm_mode_fb_cmd2 fb_id 0
+field drm_mode_fb_cmd2 width 4
+field drm_mode_fb_cmd2 height 8
+field drm_mode_fb_cmd2 pixel_format 12
+field drm_mode_fb_cmd2 flags 16
+field drm_mode_fb_cmd2 handles 20
+field drm_mode_fb_cmd2 pitches 36
+field drm_mode_fb_cmd2 offsets 52
+field drm_mode_fb_cmd2 modifier 72
+type drm_mode_fb_dirty_cmd 24 8
+field drm_mode_fb_dirty_cmd fb_id 0
+field drm_mode_fb_dirty_cmd flags 4
+field drm_mode_fb_dirty_cmd color 8
+field drm_mode_fb_dirty_cmd num_clips 12
+field drm_mode_fb_dirty_cmd clips_ptr 16
+type drm_mode_mode_cmd 72 4
+field drm_mode_mode_cmd connector_id 0
+field drm_mode_mode_cmd mode 4
+type drm_mode_cursor 28 4
+field drm_mode_cursor flags 0
+field drm_mode_cursor crtc_id 4
+field drm_mode_cursor x 8
+field drm_mode_cursor y 12
+field drm_mode_cursor width 16
+field drm_mode_cursor height 20
+field drm_mode_cursor handle 24
+type drm_mode_cursor2 36 4
+field drm_mode_cursor2 flags 0
+field drm_mode_cursor2 crtc_id 4
+field drm_mode_cursor2 x 8
+field drm_mode_cursor2 y 12
+field drm_mode_cursor2 width 16
+field drm_mode_cursor2 height 20
+field drm_mode_cursor2 handle 24
+field drm_mode_cursor2 hot_x 28
+field drm_mode_cursor2 hot_y 32
+type drm_mode_crtc_lut 32 8
+field drm_mode_crtc_lut crtc_id 0
+field drm_mode_crtc_lut gamma_size 4
+field drm_mode_crtc_lut red 8
+field drm_mode_crtc_lut green 16
+field drm_mode_crtc_lut blue 24
+type drm_mode_crtc_page_flip 24 8
+field drm_mode_crtc_page_flip crtc_id 0
+field drm_mode_crtc_page_flip fb_id 4
+field drm_mode_crtc_page_flip flags 8
+field drm_mode_crtc_page_flip reserved 12
+field drm_mode_crtc_page_flip user_data 16
+type drm_mode_create_dumb 32 8
+field drm_mode_create_dumb height 0
+field drm_mode_create_dumb width 4
+field drm_mode_create_dumb bpp 8
+field drm_mode_create_dumb flags 12
+field drm_mode_create_dumb handle 16
+field drm_mode_create_dumb pitch 20
+field drm_mode_create_dumb size 24
+type drm_mode_map_dumb 16 8
+field drm_mode_map_dumb handle 0
+field drm_mode_map_dumb pad 4
+field drm_mode_map_dumb offset 8
+type drm_mode_destroy_dumb 4 4
+field drm_mode_destroy_dumb handle 0
+type drm_mode_atomic 56 8
+field drm_mode_atomic flags 0
+field drm_mode_atomic count_objs 4
+field drm_mode_atomic objs_ptr 8
+field drm_mode_atomic count_props_ptr 16
+field drm_mode_atomic props_ptr 24
+field drm_mode_atomic prop_values_ptr 32
+field drm_mode_atomic reserved 40
+field drm_mode_atomic user_data 48
+type drm_mode_create_blob 16 8
+field drm_mode_create_blob data 0
+field drm_mode_create_blob length 8
+field drm_mode_create_blob blob_id 12
+type drm_mode_destroy_blob 4 4
+field drm_mode_destroy_blob blob_id 0
+type drm_mode_create_lease 24 8
+field drm_mode_create_lease object_ids 0
+field drm_mode_create_lease object_count 8
+field drm_mode_create_lease flags 12
+field drm_mode_create_lease lessee_id 16
+field drm_mode_create_lease fd 20
+type drm_mode_list_lessees 16 8
+field drm_mode_list_lessees count_lessees 0
+field drm_mode_list_lessees pad 4
+field drm_mode_list_lessees lessees_ptr 8
+type drm_mode_get_lease 16 8
+field drm_mode_get_lease count_objects 0
+field drm_mode_get_lease pad 4
+field drm_mode_get_lease objects_ptr 8
+type drm_mode_revoke_lease 4 4
+field drm_mode_revoke_lease lessee_id 0
+type drm_mode_closefb 8 4
+field drm_mode_closefb fb_id 0
+field drm_mode_closefb pad 4
+type drm_event 8 4
+field drm_event type 0
+field drm_event length 4
+type drm_event_vblank 32 8
+field drm_event_vblank base 0
+field drm_event_vblank user_data 8
+field drm_event_vblank tv_sec 16
+field drm_event_vblank tv_usec 20
+field drm_event_vblank sequence 24
+field drm_event_vblank crtc_id 28
+type drm_event_crtc_sequence 32 8
+field drm_event_crtc_sequence base 0
+field drm_event_crtc_sequence user_data 8
+field drm_event_crtc_sequence time_ns 16
+field drm_event_crtc_sequence sequence 24
+type drm_amdgpu_gem_create_in 32 8
+field drm_amdgpu_gem_create_in bo_size 0
+field drm_amdgpu_gem_create_in alignment 8
+field drm_amdgpu_gem_create_in domains 16
+field drm_amdgpu_gem_create_in domain_flags 24
+type drm_amdgpu_gem_create_out 8 4
+field drm_amdgpu_gem_create_out handle 0
+field drm_amdgpu_gem_create_out _pad 4
+type drm_amdgpu_gem_create 32 8
+field drm_amdgpu_gem_create in 0
+field drm_amdgpu_gem_create out 0
+type drm_amdgpu_bo_list_in 24 8
+field drm_amdgpu_bo_list_in operation 0
+field drm_amdgpu_bo_list_in list_handle 4
+field drm_amdgpu_bo_list_in bo_number 8
+field drm_amdgpu_bo_list_in bo_info_size 12
+field drm_amdgpu_bo_list_in bo_info_ptr 16
+type drm_amdgpu_bo_list_entry 8 4
+field drm_amdgpu_bo_list_entry bo_handle 0
+field drm_amdgpu_bo_list_entry bo_priority 4
+type drm_amdgpu_bo_list_out 8 4
+field drm_amdgpu_bo_list_out list_handle 0
+field drm_amdgpu_bo_list_out _pad 4
+type drm_amdgpu_bo_list 24 8
+field drm_amdgpu_bo_list in 0
+field drm_amdgpu_bo_list out 0
+type drm_amdgpu_ctx_in 16 4
+field drm_amdgpu_ctx_in op 0
+field drm_amdgpu_ctx_in flags 4
+field drm_amdgpu_ctx_in ctx_id 8
+field drm_amdgpu_ctx_in priority 12
+type drm_amdgpu_ctx_out 16 8
+field drm_amdgpu_ctx_out alloc 0
+field drm_amdgpu_ctx_out state 0
+field drm_amdgpu_ctx_out pstate 0
+type drm_amdgpu_ctx_out__alloc 8 4
+field drm_amdgpu_ctx_out__alloc ctx_id 0
+field drm_amdgpu_ctx_out__alloc _pad 4
+type drm_amdgpu_ctx_out__state 16 8
+field drm_amdgpu_ctx_out__state flags 0
+field drm_amdgpu_ctx_out__state hangs 8
+field drm_amdgpu_ctx_out__state reset_status 12
+type drm_amdgpu_ctx_out__pstate 8 4
+field drm_amdgpu_ctx_out__pstate flags 0
+field drm_amdgpu_ctx_out__pstate _pad 4
+type drm_amdgpu_ctx 16 8
+field drm_amdgpu_ctx in 0
+field drm_amdgpu_ctx out 0
+type drm_amdgpu_userq_in 72 8
+field drm_amdgpu_userq_in op 0
+field drm_amdgpu_userq_in queue_id 4
+field drm_amdgpu_userq_in ip_type 8
+field drm_amdgpu_userq_in doorbell_handle 12
+field drm_amdgpu_userq_in doorbell_offset 16
+field drm_amdgpu_userq_in flags 20
+field drm_amdgpu_userq_in queue_va 24
+field drm_amdgpu_userq_in queue_size 32
+field drm_amdgpu_userq_in rptr_va 40
+field drm_amdgpu_userq_in wptr_va 48
+field drm_amdgpu_userq_in mqd 56
+field drm_amdgpu_userq_in mqd_size 64
+type drm_amdgpu_userq_out 8 4
+field drm_amdgpu_userq_out queue_id 0
+field drm_amdgpu_userq_out _pad 4
+type drm_amdgpu_userq 72 8
+field drm_amdgpu_userq in 0
+field drm_amdgpu_userq out 0
+type drm_amdgpu_userq_mqd_gfx11 16 8
+field drm_amdgpu_userq_mqd_gfx11 shadow_va 0
+field drm_amdgpu_userq_mqd_gfx11 csa_va 8
+type drm_amdgpu_userq_mqd_sdma_gfx11 8 8
+field drm_amdgpu_userq_mqd_sdma_gfx11 csa_va 0
+type drm_amdgpu_userq_mqd_compute_gfx11 8 8
+field drm_amdgpu_userq_mqd_compute_gfx11 eop_va 0
+type drm_amdgpu_userq_signal 48 8
+field drm_amdgpu_userq_signal queue_id 0
+field drm_amdgpu_userq_signal pad 4
+field drm_amdgpu_userq_signal syncobj_handles 8
+field drm_amdgpu_userq_signal num_syncobj_handles 16
+field drm_amdgpu_userq_signal bo_read_handles 24
+field drm_amdgpu_userq_signal bo_write_handles 32
+field drm_amdgpu_userq_signal num_bo_read_handles 40
+field drm_amdgpu_userq_signal num_bo_write_handles 44
+type drm_amdgpu_userq_fence_info 16 8
+field drm_amdgpu_userq_fence_info va 0
+field drm_amdgpu_userq_fence_info value 8
+type drm_amdgpu_userq_wait 72 8
+field drm_amdgpu_userq_wait waitq_id 0
+field drm_amdgpu_userq_wait pad 4
+field drm_amdgpu_userq_wait syncobj_handles 8
+field drm_amdgpu_userq_wait syncobj_timeline_handles 16
+field drm_amdgpu_userq_wait syncobj_timeline_points 24
+field drm_amdgpu_userq_wait bo_read_handles 32
+field drm_amdgpu_userq_wait bo_write_handles 40
+field drm_amdgpu_userq_wait num_syncobj_timeline_handles 48
+field drm_amdgpu_userq_wait num_fences 50
+field drm_amdgpu_userq_wait num_syncobj_handles 52
+field drm_amdgpu_userq_wait num_bo_read_handles 56
+field drm_amdgpu_userq_wait num_bo_write_handles 60
+field drm_amdgpu_userq_wait out_fences 64
+type drm_amdgpu_vm_in 8 4
+field drm_amdgpu_vm_in op 0
+field drm_amdgpu_vm_in flags 4
+type drm_amdgpu_vm_out 8 8
+field drm_amdgpu_vm_out flags 0
+type drm_amdgpu_vm 8 8
+field drm_amdgpu_vm in 0
+field drm_amdgpu_vm out 0
+type drm_amdgpu_sched_in 16 4
+field drm_amdgpu_sched_in op 0
+field drm_amdgpu_sched_in fd 4
+field drm_amdgpu_sched_in priority 8
+field drm_amdgpu_sched_in ctx_id 12
+type drm_amdgpu_sched 16 4
+field drm_amdgpu_sched in 0
+type drm_amdgpu_gem_userptr 24 8
+field drm_amdgpu_gem_userptr addr 0
+field drm_amdgpu_gem_userptr size 8
+field drm_amdgpu_gem_userptr flags 16
+field drm_amdgpu_gem_userptr handle 20
+type drm_amdgpu_gem_metadata 288 8
+field drm_amdgpu_gem_metadata handle 0
+field drm_amdgpu_gem_metadata op 4
+field drm_amdgpu_gem_metadata data 8
+type drm_amdgpu_gem_metadata__data 280 8
+field drm_amdgpu_gem_metadata__data flags 0
+field drm_amdgpu_gem_metadata__data tiling_info 8
+field drm_amdgpu_gem_metadata__data data_size_bytes 16
+field drm_amdgpu_gem_metadata__data data 20
+type drm_amdgpu_gem_mmap_in 8 4
+field drm_amdgpu_gem_mmap_in handle 0
+field drm_amdgpu_gem_mmap_in _pad 4
+type drm_amdgpu_gem_mmap_out 8 8
+field drm_amdgpu_gem_mmap_out addr_ptr 0
+type drm_amdgpu_gem_mmap 8 8
+field drm_amdgpu_gem_mmap in 0
+field drm_amdgpu_gem_mmap out 0
+type drm_amdgpu_gem_wait_idle_in 16 8
+field drm_amdgpu_gem_wait_idle_in handle 0
+field drm_amdgpu_gem_wait_idle_in flags 4
+field drm_amdgpu_gem_wait_idle_in timeout 8
+type drm_amdgpu_gem_wait_idle_out 8 4
+field drm_amdgpu_gem_wait_idle_out status 0
+field drm_amdgpu_gem_wait_idle_out domain 4
+type drm_amdgpu_gem_wait_idle 16 8
+field drm_amdgpu_gem_wait_idle in 0
+field drm_amdgpu_gem_wait_idle out 0
+type drm_amdgpu_wait_cs_in 32 8
+field drm_amdgpu_wait_cs_in handle 0
+field drm_amdgpu_wait_cs_in timeout 8
+field drm_amdgpu_wait_cs_in ip_type 16
+field drm_amdgpu_wait_cs_in ip_instance 20
+field drm_amdgpu_wait_cs_in ring 24
+field drm_amdgpu_wait_cs_in ctx_id 28
+type drm_amdgpu_wait_cs_out 8 8
+field drm_amdgpu_wait_cs_out status 0
+type drm_amdgpu_wait_cs 32 8
+field drm_amdgpu_wait_cs in 0
+field drm_amdgpu_wait_cs out 0
+type drm_amdgpu_fence 24 8
+field drm_amdgpu_fence ctx_id 0
+field drm_amdgpu_fence ip_type 4
+field drm_amdgpu_fence ip_instance 8
+field drm_amdgpu_fence ring 12
+field drm_amdgpu_fence seq_no 16
+type drm_amdgpu_wait_fences_in 24 8
+field drm_amdgpu_wait_fences_in fences 0
+field drm_amdgpu_wait_fences_in fence_count 8
+field drm_amdgpu_wait_fences_in wait_all 12
+field drm_amdgpu_wait_fences_in timeout_ns 16
+type drm_amdgpu_wait_fences_out 8 4
+field drm_amdgpu_wait_fences_out status 0
+field drm_amdgpu_wait_fences_out first_signaled 4
+type drm_amdgpu_wait_fences 24 8
+field drm_amdgpu_wait_fences in 0
+field drm_amdgpu_wait_fences out 0
+type drm_amdgpu_gem_op 16 8
+field drm_amdgpu_gem_op handle 0
+field drm_amdgpu_gem_op op 4
+field drm_amdgpu_gem_op value 8
+type drm_amdgpu_gem_va 64 8
+field drm_amdgpu_gem_va handle 0
+field drm_amdgpu_gem_va _pad 4
+field drm_amdgpu_gem_va operation 8
+field drm_amdgpu_gem_va flags 12
+field drm_amdgpu_gem_va va_address 16
+field drm_amdgpu_gem_va offset_in_bo 24
+field drm_amdgpu_gem_va map_size 32
+field drm_amdgpu_gem_va vm_timeline_point 40
+field drm_amdgpu_gem_va vm_timeline_syncobj_out 48
+field drm_amdgpu_gem_va num_syncobj_handles 52
+field drm_amdgpu_gem_va input_fence_syncobj_handles 56
+type drm_amdgpu_cs_chunk 16 8
+field drm_amdgpu_cs_chunk chunk_id 0
+field drm_amdgpu_cs_chunk length_dw 4
+field drm_amdgpu_cs_chunk chunk_data 8
+type drm_amdgpu_cs_in 24 8
+field drm_amdgpu_cs_in ctx_id 0
+field drm_amdgpu_cs_in bo_list_handle 4
+field drm_amdgpu_cs_in num_chunks 8
+field drm_amdgpu_cs_in flags 12
+field drm_amdgpu_cs_in chunks 16
+type drm_amdgpu_cs_out 8 8
+field drm_amdgpu_cs_out handle 0
+type drm_amdgpu_cs 24 8
+field drm_amdgpu_cs in 0
+field drm_amdgpu_cs out 0
+type drm_amdgpu_cs_chunk_ib 32 8
+field drm_amdgpu_cs_chunk_ib _pad 0
+field drm_amdgpu_cs_chunk_ib flags 4
+field drm_amdgpu_cs_chunk_ib va_start 8
+field drm_amdgpu_cs_chunk_ib ib_bytes 16
+field drm_amdgpu_cs_chunk_ib ip_type 20
+field drm_amdgpu_cs_chunk_ib ip_instance 24
+field drm_amdgpu_cs_chunk_ib ring 28
+type drm_amdgpu_cs_chunk_dep 24 8
+field drm_amdgpu_cs_chunk_dep ip_type 0
+field drm_amdgpu_cs_chunk_dep ip_instance 4
+field drm_amdgpu_cs_chunk_dep ring 8
+field drm_amdgpu_cs_chunk_dep ctx_id 12
+field drm_amdgpu_cs_chunk_dep handle 16
+type drm_amdgpu_cs_chunk_fence 8 4
+field drm_amdgpu_cs_chunk_fence handle 0
+field drm_amdgpu_cs_chunk_fence offset 4
+type drm_amdgpu_cs_chunk_sem 4 4
+field drm_amdgpu_cs_chunk_sem handle 0
+type drm_amdgpu_cs_chunk_syncobj 16 8
+field drm_amdgpu_cs_chunk_syncobj handle 0
+field drm_amdgpu_cs_chunk_syncobj flags 4
+field drm_amdgpu_cs_chunk_syncobj point 8
+type drm_amdgpu_fence_to_handle 32 8
+field drm_amdgpu_fence_to_handle in 0
+field drm_amdgpu_fence_to_handle out 0
+type drm_amdgpu_fence_to_handle__in 32 8
+field drm_amdgpu_fence_to_handle__in fence 0
+field drm_amdgpu_fence_to_handle__in what 24
+field drm_amdgpu_fence_to_handle__in pad 28
+type drm_amdgpu_fence_to_handle__out 4 4
+field drm_amdgpu_fence_to_handle__out handle 0
+type drm_amdgpu_cs_chunk_data 32 8
+field drm_amdgpu_cs_chunk_data anon0 0
+field drm_amdgpu_cs_chunk_data__anon0 ib_data 0
+field drm_amdgpu_cs_chunk_data__anon0 fence_data 0
+type drm_amdgpu_cs_chunk_cp_gfx_shadow 32 8
+field drm_amdgpu_cs_chunk_cp_gfx_shadow shadow_va 0
+field drm_amdgpu_cs_chunk_cp_gfx_shadow csa_va 8
+field drm_amdgpu_cs_chunk_cp_gfx_shadow gds_va 16
+field drm_amdgpu_cs_chunk_cp_gfx_shadow flags 24
+type drm_amdgpu_query_fw 16 4
+field drm_amdgpu_query_fw fw_type 0
+field drm_amdgpu_query_fw ip_instance 4
+field drm_amdgpu_query_fw index 8
+field drm_amdgpu_query_fw _pad 12
+type drm_amdgpu_info 32 8
+field drm_amdgpu_info return_pointer 0
+field drm_amdgpu_info return_size 8
+field drm_amdgpu_info query 12
+field drm_amdgpu_info anon0 16
+field drm_amdgpu_info__anon0 mode_crtc 0
+field drm_amdgpu_info__anon0 query_hw_ip 0
+field drm_amdgpu_info__anon0 read_mmr_reg 0
+field drm_amdgpu_info__anon0 query_fw 0
+field drm_amdgpu_info__anon0 vbios_info 0
+field drm_amdgpu_info__anon0 sensor_info 0
+field drm_amdgpu_info__anon0 video_cap 0
+type drm_amdgpu_info__mode_crtc 8 4
+field drm_amdgpu_info__mode_crtc id 0
+field drm_amdgpu_info__mode_crtc _pad 4
+type drm_amdgpu_info__query_hw_ip 8 4
+field drm_amdgpu_info__query_hw_ip type 0
+field drm_amdgpu_info__query_hw_ip ip_instance 4
+type drm_amdgpu_info__read_mmr_reg 16 4
+field drm_amdgpu_info__read_mmr_reg dword_offset 0
+field drm_amdgpu_info__read_mmr_reg count 4
+field drm_amdgpu_info__read_mmr_reg instance 8
+field drm_amdgpu_info__read_mmr_reg flags 12
+type drm_amdgpu_info__vbios_info 8 4
+field drm_amdgpu_info__vbios_info type 0
+field drm_amdgpu_info__vbios_info offset 4
+type drm_amdgpu_info__sensor_info 4 4
+field drm_amdgpu_info__sensor_info type 0
+type drm_amdgpu_info__video_cap 4 4
+field drm_amdgpu_info__video_cap type 0
+type drm_amdgpu_info_gds 32 4
+field drm_amdgpu_info_gds gds_gfx_partition_size 0
+field drm_amdgpu_info_gds compute_partition_size 4
+field drm_amdgpu_info_gds gds_total_size 8
+field drm_amdgpu_info_gds gws_per_gfx_partition 12
+field drm_amdgpu_info_gds gws_per_compute_partition 16
+field drm_amdgpu_info_gds oa_per_gfx_partition 20
+field drm_amdgpu_info_gds oa_per_compute_partition 24
+field drm_amdgpu_info_gds _pad 28
+type drm_amdgpu_info_vram_gtt 24 8
+field drm_amdgpu_info_vram_gtt vram_size 0
+field drm_amdgpu_info_vram_gtt vram_cpu_accessible_size 8
+field drm_amdgpu_info_vram_gtt gtt_size 16
+type drm_amdgpu_heap_info 32 8
+field drm_amdgpu_heap_info total_heap_size 0
+field drm_amdgpu_heap_info usable_heap_size 8
+field drm_amdgpu_heap_info heap_usage 16
+field drm_amdgpu_heap_info max_allocation 24
+type drm_amdgpu_memory_info 96 8
+field drm_amdgpu_memory_info vram 0
+field drm_amdgpu_memory_info cpu_accessible_vram 32
+field drm_amdgpu_memory_info gtt 64
+type drm_amdgpu_info_firmware 8 4
+field drm_amdgpu_info_firmware ver 0
+field drm_amdgpu_info_firmware feature 4
+type drm_amdgpu_info_vbios 200 4
+field drm_amdgpu_info_vbios name 0
+field drm_amdgpu_info_vbios vbios_pn 64
+field drm_amdgpu_info_vbios version 128
+field drm_amdgpu_info_vbios pad 132
+field drm_amdgpu_info_vbios vbios_ver_str 136
+field drm_amdgpu_info_vbios date 168
+type drm_amdgpu_info_device 448 8
+field drm_amdgpu_info_device device_id 0
+field drm_amdgpu_info_device chip_rev 4
+field drm_amdgpu_info_device external_rev 8
+field drm_amdgpu_info_device pci_rev 12
+field drm_amdgpu_info_device family 16
+field drm_amdgpu_info_device num_shader_engines 20
+field drm_amdgpu_info_device num_shader_arrays_per_engine 24
+field drm_amdgpu_info_device gpu_counter_freq 28
+field drm_amdgpu_info_device max_engine_clock 32
+field drm_amdgpu_info_device max_memory_clock 40
+field drm_amdgpu_info_device cu_active_number 48
+field drm_amdgpu_info_device cu_ao_mask 52
+field drm_amdgpu_info_device cu_bitmap 56
+field drm_amdgpu_info_device enabled_rb_pipes_mask 120
+field drm_amdgpu_info_device num_rb_pipes 124
+field drm_amdgpu_info_device num_hw_gfx_contexts 128
+field drm_amdgpu_info_device pcie_gen 132
+field drm_amdgpu_info_device ids_flags 136
+field drm_amdgpu_info_device virtual_address_offset 144
+field drm_amdgpu_info_device virtual_address_max 152
+field drm_amdgpu_info_device virtual_address_alignment 160
+field drm_amdgpu_info_device pte_fragment_size 164
+field drm_amdgpu_info_device gart_page_size 168
+field drm_amdgpu_info_device ce_ram_size 172
+field drm_amdgpu_info_device vram_type 176
+field drm_amdgpu_info_device vram_bit_width 180
+field drm_amdgpu_info_device vce_harvest_config 184
+field drm_amdgpu_info_device gc_double_offchip_lds_buf 188
+field drm_amdgpu_info_device prim_buf_gpu_addr 192
+field drm_amdgpu_info_device pos_buf_gpu_addr 200
+field drm_amdgpu_info_device cntl_sb_buf_gpu_addr 208
+field drm_amdgpu_info_device param_buf_gpu_addr 216
+field drm_amdgpu_info_device prim_buf_size 224
+field drm_amdgpu_info_device pos_buf_size 228
+field drm_amdgpu_info_device cntl_sb_buf_size 232
+field drm_amdgpu_info_device param_buf_size 236
+field drm_amdgpu_info_device wave_front_size 240
+field drm_amdgpu_info_device num_shader_visible_vgprs 244
+field drm_amdgpu_info_device num_cu_per_sh 248
+field drm_amdgpu_info_device num_tcc_blocks 252
+field drm_amdgpu_info_device gs_vgt_table_depth 256
+field drm_amdgpu_info_device gs_prim_buffer_depth 260
+field drm_amdgpu_info_device max_gs_waves_per_vgt 264
+field drm_amdgpu_info_device pcie_num_lanes 268
+field drm_amdgpu_info_device cu_ao_bitmap 272
+field drm_amdgpu_info_device high_va_offset 336
+field drm_amdgpu_info_device high_va_max 344
+field drm_amdgpu_info_device pa_sc_tile_steering_override 352
+field drm_amdgpu_info_device tcc_disabled_mask 360
+field drm_amdgpu_info_device min_engine_clock 368
+field drm_amdgpu_info_device min_memory_clock 376
+field drm_amdgpu_info_device tcp_cache_size 384
+field drm_amdgpu_info_device num_sqc_per_wgp 388
+field drm_amdgpu_info_device sqc_data_cache_size 392
+field drm_amdgpu_info_device sqc_inst_cache_size 396
+field drm_amdgpu_info_device gl1c_cache_size 400
+field drm_amdgpu_info_device gl2c_cache_size 404
+field drm_amdgpu_info_device mall_size 408
+field drm_amdgpu_info_device enabled_rb_pipes_mask_hi 416
+field drm_amdgpu_info_device shadow_size 420
+field drm_amdgpu_info_device shadow_alignment 424
+field drm_amdgpu_info_device csa_size 428
+field drm_amdgpu_info_device csa_alignment 432
+field drm_amdgpu_info_device userq_ip_mask 436
+field drm_amdgpu_info_device pad 440
+type drm_amdgpu_info_hw_ip 32 8
+field drm_amdgpu_info_hw_ip hw_ip_version_major 0
+field drm_amdgpu_info_hw_ip hw_ip_version_minor 4
+field drm_amdgpu_info_hw_ip capabilities_flags 8
+field drm_amdgpu_info_hw_ip ib_start_alignment 16
+field drm_amdgpu_info_hw_ip ib_size_alignment 20
+field drm_amdgpu_info_hw_ip available_rings 24
+field drm_amdgpu_info_hw_ip ip_discovery_version 28
+type drm_amdgpu_info_uq_fw_areas_gfx 16 4
+field drm_amdgpu_info_uq_fw_areas_gfx shadow_size 0
+field drm_amdgpu_info_uq_fw_areas_gfx shadow_alignment 4
+field drm_amdgpu_info_uq_fw_areas_gfx csa_size 8
+field drm_amdgpu_info_uq_fw_areas_gfx csa_alignment 12
+type drm_amdgpu_info_uq_fw_areas 16 4
+field drm_amdgpu_info_uq_fw_areas anon0 0
+field drm_amdgpu_info_uq_fw_areas__anon0 gfx 0
+type drm_amdgpu_info_num_handles 8 4
+field drm_amdgpu_info_num_handles uvd_max_handles 0
+field drm_amdgpu_info_num_handles uvd_used_handles 4
+type drm_amdgpu_info_vce_clock_table_entry 16 4
+field drm_amdgpu_info_vce_clock_table_entry sclk 0
+field drm_amdgpu_info_vce_clock_table_entry mclk 4
+field drm_amdgpu_info_vce_clock_table_entry eclk 8
+field drm_amdgpu_info_vce_clock_table_entry pad 12
+type drm_amdgpu_info_vce_clock_table 104 4
+field drm_amdgpu_info_vce_clock_table entries 0
+field drm_amdgpu_info_vce_clock_table num_valid_entries 96
+field drm_amdgpu_info_vce_clock_table pad 100
+type drm_amdgpu_info_video_codec_info 24 4
+field drm_amdgpu_info_video_codec_info valid 0
+field drm_amdgpu_info_video_codec_info max_width 4
+field drm_amdgpu_info_video_codec_info max_height 8
+field drm_amdgpu_info_video_codec_info max_pixels_per_frame 12
+field drm_amdgpu_info_video_codec_info max_level 16
+field drm_amdgpu_info_video_codec_info pad 20
+type drm_amdgpu_info_video_caps 192 4
+field drm_amdgpu_info_video_caps codec_info 0
+type drm_amdgpu_info_gpuvm_fault 16 8
+field drm_amdgpu_info_gpuvm_fault addr 0
+field drm_amdgpu_info_gpuvm_fault status 8
+field drm_amdgpu_info_gpuvm_fault vmhub 12
+type sync_merge_data 48 4
+field sync_merge_data name 0
+field sync_merge_data fd2 32
+field sync_merge_data fence 36
+field sync_merge_data flags 40
+field sync_merge_data pad 44
+type sync_fence_info 80 8
+field sync_fence_info obj_name 0
+field sync_fence_info driver_name 32
+field sync_fence_info status 64
+field sync_fence_info flags 68
+field sync_fence_info timestamp_ns 72
+type sync_file_info 56 8
+field sync_file_info name 0
+field sync_file_info status 32
+field sync_file_info flags 36
+field sync_file_info num_fences 40
+field sync_file_info pad 44
+field sync_file_info sync_fence_info 48
+type sync_set_deadline 16 8
+field sync_set_deadline deadline_ns 0
+field sync_set_deadline pad 8
+type dma_buf_sync 8 8
+field dma_buf_sync flags 0
+type dma_buf_export_sync_file 8 4
+field dma_buf_export_sync_file flags 0
+field dma_buf_export_sync_file fd 4
+type dma_buf_import_sync_file 8 4
+field dma_buf_import_sync_file flags 0
+field dma_buf_import_sync_file fd 4
+const DRM_MIN_ORDER 5
+const DRM_MAX_ORDER 22
+const DRM_RAM_PERCENT 10
+const _DRM_LOCK_HELD 2147483648
+const _DRM_LOCK_CONT 1073741824
+const _DRM_VBLANK_HIGH_CRTC_SHIFT 1
+const _DRM_VBLANK_TYPES_MASK 1
+const _DRM_VBLANK_FLAGS_MASK 1946157056
+const _DRM_PRE_MODESET 1
+const _DRM_POST_MODESET 2
+const DRM_CAP_DUMB_BUFFER 1
+const DRM_CAP_VBLANK_HIGH_CRTC 2
+const DRM_CAP_DUMB_PREFERRED_DEPTH 3
+const DRM_CAP_DUMB_PREFER_SHADOW 4
+const DRM_CAP_PRIME 5
+const DRM_PRIME_CAP_IMPORT 1
+const DRM_PRIME_CAP_EXPORT 2
+const DRM_CAP_TIMESTAMP_MONOTONIC 6
+const DRM_CAP_ASYNC_PAGE_FLIP 7
+const DRM_CAP_CURSOR_WIDTH 8
+const DRM_CAP_CURSOR_HEIGHT 9
+const DRM_CAP_ADDFB2_MODIFIERS 16
+const DRM_CAP_PAGE_FLIP_TARGET 17
+const DRM_CAP_CRTC_IN_VBLANK_EVENT 18
+const DRM_CAP_SYNCOBJ 19
+const DRM_CAP_SYNCOBJ_TIMELINE 20
+const DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP 21
+const DRM_CLIENT_CAP_STEREO_3D 1
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
+const DRM_CLIENT_CAP_ATOMIC 3
+const DRM_CLIENT_CAP_ASPECT_RATIO 4
+const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS 5
+const DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT 6
+const DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE 7
+const DRM_RDWR 2
+const DRM_CLOEXEC 524288
+const DRM_SYNCOBJ_CREATE_SIGNALED 1
+const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE 1
+const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE 2
+const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE 1
+const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE 2
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL 1
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT 2
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE 4
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE 8
+const DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED 1
+const DRM_CRTC_SEQUENCE_RELATIVE 1
+const DRM_CRTC_SEQUENCE_NEXT_ON_MISS 2
+const DRM_CLIENT_NAME_MAX_LEN 64
+const DRM_IOCTL_BASE 100
+const DRM_IOCTL_VERSION 3225445376
+const DRM_IOCTL_GET_UNIQUE 3222299649
+const DRM_IOCTL_GET_MAGIC 2147771394
+const DRM_IOCTL_IRQ_BUSID 3222299651
+const DRM_IOCTL_GET_MAP 3223872516
+const DRM_IOCTL_GET_CLIENT 3223872517
+const DRM_IOCTL_GET_STATS 2163762182
+const DRM_IOCTL_SET_VERSION 3222299655
+const DRM_IOCTL_MODESET_CTL 1074291720
+const DRM_IOCTL_GEM_CLOSE 1074291721
+const DRM_IOCTL_GEM_FLINK 3221775370
+const DRM_IOCTL_GEM_OPEN 3222299659
+const DRM_IOCTL_GET_CAP 3222299660
+const DRM_IOCTL_SET_CLIENT_CAP 1074816013
+const DRM_IOCTL_SET_UNIQUE 1074816016
+const DRM_IOCTL_AUTH_MAGIC 1074029585
+const DRM_IOCTL_BLOCK 3221513234
+const DRM_IOCTL_UNBLOCK 3221513235
+const DRM_IOCTL_CONTROL 1074291732
+const DRM_IOCTL_ADD_MAP 3223872533
+const DRM_IOCTL_ADD_BUFS 3223348246
+const DRM_IOCTL_MARK_BUFS 1075864599
+const DRM_IOCTL_INFO_BUFS 3222299672
+const DRM_IOCTL_MAP_BUFS 3222823961
+const DRM_IOCTL_FREE_BUFS 1074816026
+const DRM_IOCTL_RM_MAP 1076388891
+const DRM_IOCTL_SET_SAREA_CTX 1074816028
+const DRM_IOCTL_GET_SAREA_CTX 3222299677
+const DRM_IOCTL_SET_MASTER 25630
+const DRM_IOCTL_DROP_MASTER 25631
+const DRM_IOCTL_ADD_CTX 3221775392
+const DRM_IOCTL_RM_CTX 3221775393
+const DRM_IOCTL_MOD_CTX 1074291746
+const DRM_IOCTL_GET_CTX 3221775395
+const DRM_IOCTL_SWITCH_CTX 1074291748
+const DRM_IOCTL_NEW_CTX 1074291749
+const DRM_IOCTL_RES_CTX 3222299686
+const DRM_IOCTL_ADD_DRAW 3221513255
+const DRM_IOCTL_RM_DRAW 3221513256
+const DRM_IOCTL_DMA 3225445417
+const DRM_IOCTL_LOCK 1074291754
+const DRM_IOCTL_UNLOCK 1074291755
+const DRM_IOCTL_FINISH 1074291756
+const DRM_IOCTL_PRIME_HANDLE_TO_FD 3222037549
+const DRM_IOCTL_PRIME_FD_TO_HANDLE 3222037550
+const DRM_IOCTL_AGP_ACQUIRE 25648
+const DRM_IOCTL_AGP_RELEASE 25649
+const DRM_IOCTL_AGP_ENABLE 1074291762
+const DRM_IOCTL_AGP_INFO 2151179315
+const DRM_IOCTL_AGP_ALLOC 3223348276
+const DRM_IOCTL_AGP_FREE 1075864629
+const DRM_IOCTL_AGP_BIND 1074816054
+const DRM_IOCTL_AGP_UNBIND 1074816055
+const DRM_IOCTL_SG_ALLOC 3222299704
+const DRM_IOCTL_SG_FREE 1074816057
+const DRM_IOCTL_WAIT_VBLANK 3222823994
+const DRM_IOCTL_CRTC_GET_SEQUENCE 3222823995
+const DRM_IOCTL_CRTC_QUEUE_SEQUENCE 3222823996
+const DRM_IOCTL_UPDATE_DRAW 1075340351
+const DRM_IOCTL_MODE_GETRESOURCES 3225445536
+const DRM_IOCTL_MODE_GETCRTC 3228066977
+const DRM_IOCTL_MODE_SETCRTC 3228066978
+const DRM_IOCTL_MODE_CURSOR 3223086243
+const DRM_IOCTL_MODE_GETGAMMA 3223348388
+const DRM_IOCTL_MODE_SETGAMMA 3223348389
+const DRM_IOCTL_MODE_GETENCODER 3222561958
+const DRM_IOCTL_MODE_GETCONNECTOR 3226494119
+const DRM_IOCTL_MODE_ATTACHMODE 3225969832
+const DRM_IOCTL_MODE_DETACHMODE 3225969833
+const DRM_IOCTL_MODE_GETPROPERTY 3225445546
+const DRM_IOCTL_MODE_SETPROPERTY 3222299819
+const DRM_IOCTL_MODE_GETPROPBLOB 3222299820
+const DRM_IOCTL_MODE_GETFB 3223086253
+const DRM_IOCTL_MODE_ADDFB 3223086254
+const DRM_IOCTL_MODE_RMFB 3221513391
+const DRM_IOCTL_MODE_PAGE_FLIP 3222824112
+const DRM_IOCTL_MODE_DIRTYFB 3222824113
+const DRM_IOCTL_MODE_CREATE_DUMB 3223348402
+const DRM_IOCTL_MODE_MAP_DUMB 3222299827
+const DRM_IOCTL_MODE_DESTROY_DUMB 3221513396
+const DRM_IOCTL_MODE_GETPLANERESOURCES 3222299829
+const DRM_IOCTL_MODE_GETPLANE 3223348406
+const DRM_IOCTL_MODE_SETPLANE 3224396983
+const DRM_IOCTL_MODE_ADDFB2 3228067000
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES 3223348409
+const DRM_IOCTL_MODE_OBJ_SETPROPERTY 3222824122
+const DRM_IOCTL_MODE_CURSOR2 3223610555
+const DRM_IOCTL_MODE_ATOMIC 3224921276
+const DRM_IOCTL_MODE_CREATEPROPBLOB 3222299837
+const DRM_IOCTL_MODE_DESTROYPROPBLOB 3221513406
+const DRM_IOCTL_SYNCOBJ_CREATE 3221775551
+const DRM_IOCTL_SYNCOBJ_DESTROY 3221775552
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD 3222824129
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE 3222824130
+const DRM_IOCTL_SYNCOBJ_WAIT 3223872707
+const DRM_IOCTL_SYNCOBJ_RESET 3222299844
+const DRM_IOCTL_SYNCOBJ_SIGNAL 3222299845
+const DRM_IOCTL_MODE_CREATE_LEASE 3222824134
+const DRM_IOCTL_MODE_LIST_LESSEES 3222299847
+const DRM_IOCTL_MODE_GET_LEASE 3222299848
+const DRM_IOCTL_MODE_REVOKE_LEASE 3221513417
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT 3224397002
+const DRM_IOCTL_SYNCOBJ_QUERY 3222824139
+const DRM_IOCTL_SYNCOBJ_TRANSFER 3223348428
+const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL 3222824141
+const DRM_IOCTL_MODE_GETFB2 3228067022
+const DRM_IOCTL_SYNCOBJ_EVENTFD 3222824143
+const DRM_IOCTL_MODE_CLOSEFB 3221775568
+const DRM_IOCTL_SET_CLIENT_NAME 3222299857
+const DRM_IOCTL_GEM_CHANGE_HANDLE 3221775570
+const DRM_COMMAND_BASE 64
+const DRM_COMMAND_END 160
+const DRM_EVENT_VBLANK 1
+const DRM_EVENT_FLIP_COMPLETE 2
+const DRM_EVENT_CRTC_SEQUENCE 3
+const DRM_AMDGPU_GEM_CREATE 0
+const DRM_AMDGPU_GEM_MMAP 1
+const DRM_AMDGPU_CTX 2
+const DRM_AMDGPU_BO_LIST 3
+const DRM_AMDGPU_CS 4
+const DRM_AMDGPU_INFO 5
+const DRM_AMDGPU_GEM_METADATA 6
+const DRM_AMDGPU_GEM_WAIT_IDLE 7
+const DRM_AMDGPU_GEM_VA 8
+const DRM_AMDGPU_WAIT_CS 9
+const DRM_AMDGPU_GEM_OP 16
+const DRM_AMDGPU_GEM_USERPTR 17
+const DRM_AMDGPU_WAIT_FENCES 18
+const DRM_AMDGPU_VM 19
+const DRM_AMDGPU_FENCE_TO_HANDLE 20
+const DRM_AMDGPU_SCHED 21
+const DRM_AMDGPU_USERQ 22
+const DRM_AMDGPU_USERQ_SIGNAL 23
+const DRM_AMDGPU_USERQ_WAIT 24
+const DRM_IOCTL_AMDGPU_GEM_CREATE 3223348288
+const DRM_IOCTL_AMDGPU_GEM_MMAP 3221775425
+const DRM_IOCTL_AMDGPU_CTX 3222299714
+const DRM_IOCTL_AMDGPU_BO_LIST 3222824003
+const DRM_IOCTL_AMDGPU_CS 3222824004
+const DRM_IOCTL_AMDGPU_INFO 1075864645
+const DRM_IOCTL_AMDGPU_GEM_METADATA 3240125510
+const DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE 3222299719
+const DRM_IOCTL_AMDGPU_GEM_VA 1077961800
+const DRM_IOCTL_AMDGPU_WAIT_CS 3223348297
+const DRM_IOCTL_AMDGPU_GEM_OP 3222299728
+const DRM_IOCTL_AMDGPU_GEM_USERPTR 3222824017
+const DRM_IOCTL_AMDGPU_WAIT_FENCES 3222824018
+const DRM_IOCTL_AMDGPU_VM 3221775443
+const DRM_IOCTL_AMDGPU_FENCE_TO_HANDLE 3223348308
+const DRM_IOCTL_AMDGPU_SCHED 1074816085
+const DRM_IOCTL_AMDGPU_USERQ 3225969750
+const DRM_IOCTL_AMDGPU_USERQ_SIGNAL 3224396887
+const DRM_IOCTL_AMDGPU_USERQ_WAIT 3225969752
+const AMDGPU_GEM_DOMAIN_CPU 1
+const AMDGPU_GEM_DOMAIN_GTT 2
+const AMDGPU_GEM_DOMAIN_VRAM 4
+const AMDGPU_GEM_DOMAIN_GDS 8
+const AMDGPU_GEM_DOMAIN_GWS 16
+const AMDGPU_GEM_DOMAIN_OA 32
+const AMDGPU_GEM_DOMAIN_DOORBELL 64
+const AMDGPU_GEM_DOMAIN_MASK 127
+const AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED 1
+const AMDGPU_GEM_CREATE_NO_CPU_ACCESS 2
+const AMDGPU_GEM_CREATE_CPU_GTT_USWC 4
+const AMDGPU_GEM_CREATE_VRAM_CLEARED 8
+const AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS 32
+const AMDGPU_GEM_CREATE_VM_ALWAYS_VALID 64
+const AMDGPU_GEM_CREATE_EXPLICIT_SYNC 128
+const AMDGPU_GEM_CREATE_CP_MQD_GFX9 256
+const AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE 512
+const AMDGPU_GEM_CREATE_ENCRYPTED 1024
+const AMDGPU_GEM_CREATE_PREEMPTIBLE 2048
+const AMDGPU_GEM_CREATE_DISCARDABLE 4096
+const AMDGPU_GEM_CREATE_COHERENT 8192
+const AMDGPU_GEM_CREATE_UNCACHED 16384
+const AMDGPU_GEM_CREATE_EXT_COHERENT 32768
+const AMDGPU_BO_LIST_OP_CREATE 0
+const AMDGPU_BO_LIST_OP_DESTROY 1
+const AMDGPU_BO_LIST_OP_UPDATE 2
+const AMDGPU_CTX_OP_ALLOC_CTX 1
+const AMDGPU_CTX_OP_FREE_CTX 2
+const AMDGPU_CTX_OP_QUERY_STATE 3
+const AMDGPU_CTX_OP_QUERY_STATE2 4
+const AMDGPU_CTX_OP_GET_STABLE_PSTATE 5
+const AMDGPU_CTX_OP_SET_STABLE_PSTATE 6
+const AMDGPU_CTX_NO_RESET 0
+const AMDGPU_CTX_GUILTY_RESET 1
+const AMDGPU_CTX_INNOCENT_RESET 2
+const AMDGPU_CTX_UNKNOWN_RESET 3
+const AMDGPU_CTX_QUERY2_FLAGS_RESET 1
+const AMDGPU_CTX_QUERY2_FLAGS_VRAMLOST 2
+const AMDGPU_CTX_QUERY2_FLAGS_GUILTY 4
+const AMDGPU_CTX_QUERY2_FLAGS_RAS_CE 8
+const AMDGPU_CTX_QUERY2_FLAGS_RAS_UE 16
+const AMDGPU_CTX_QUERY2_FLAGS_RESET_IN_PROGRESS 32
+const AMDGPU_CTX_PRIORITY_UNSET -2048
+const AMDGPU_CTX_PRIORITY_VERY_LOW -1023
+const AMDGPU_CTX_PRIORITY_LOW -512
+const AMDGPU_CTX_PRIORITY_NORMAL 0
+const AMDGPU_CTX_PRIORITY_HIGH 512
+const AMDGPU_CTX_PRIORITY_VERY_HIGH 1023
+const AMDGPU_CTX_STABLE_PSTATE_FLAGS_MASK 15
+const AMDGPU_CTX_STABLE_PSTATE_NONE 0
+const AMDGPU_CTX_STABLE_PSTATE_STANDARD 1
+const AMDGPU_CTX_STABLE_PSTATE_MIN_SCLK 2
+const AMDGPU_CTX_STABLE_PSTATE_MIN_MCLK 3
+const AMDGPU_CTX_STABLE_PSTATE_PEAK 4
+const AMDGPU_USERQ_OP_CREATE 1
+const AMDGPU_USERQ_OP_FREE 2
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_MASK 3
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_SHIFT 0
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_NORMAL_LOW 0
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_LOW 1
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_NORMAL_HIGH 2
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_HIGH 3
+const AMDGPU_USERQ_CREATE_FLAGS_QUEUE_SECURE 4
+const AMDGPU_VM_OP_RESERVE_VMID 1
+const AMDGPU_VM_OP_UNRESERVE_VMID 2
+const AMDGPU_SCHED_OP_PROCESS_PRIORITY_OVERRIDE 1
+const AMDGPU_SCHED_OP_CONTEXT_PRIORITY_OVERRIDE 2
+const AMDGPU_GEM_USERPTR_READONLY 1
+const AMDGPU_GEM_USERPTR_ANONONLY 2
+const AMDGPU_GEM_USERPTR_VALIDATE 4
+const AMDGPU_GEM_USERPTR_REGISTER 8
+const AMDGPU_TILING_ARRAY_MODE_SHIFT 0
+const AMDGPU_TILING_ARRAY_MODE_MASK 15
+const AMDGPU_TILING_PIPE_CONFIG_SHIFT 4
+const AMDGPU_TILING_PIPE_CONFIG_MASK 31
+const AMDGPU_TILING_TILE_SPLIT_SHIFT 9
+const AMDGPU_TILING_TILE_SPLIT_MASK 7
+const AMDGPU_TILING_MICRO_TILE_MODE_SHIFT 12
+const AMDGPU_TILING_MICRO_TILE_MODE_MASK 7
+const AMDGPU_TILING_BANK_WIDTH_SHIFT 15
+const AMDGPU_TILING_BANK_WIDTH_MASK 3
+const AMDGPU_TILING_BANK_HEIGHT_SHIFT 17
+const AMDGPU_TILING_BANK_HEIGHT_MASK 3
+const AMDGPU_TILING_MACRO_TILE_ASPECT_SHIFT 19
+const AMDGPU_TILING_MACRO_TILE_ASPECT_MASK 3
+const AMDGPU_TILING_NUM_BANKS_SHIFT 21
+const AMDGPU_TILING_NUM_BANKS_MASK 3
+const AMDGPU_TILING_SWIZZLE_MODE_SHIFT 0
+const AMDGPU_TILING_SWIZZLE_MODE_MASK 31
+const AMDGPU_TILING_DCC_OFFSET_256B_SHIFT 5
+const AMDGPU_TILING_DCC_OFFSET_256B_MASK 16777215
+const AMDGPU_TILING_DCC_PITCH_MAX_SHIFT 29
+const AMDGPU_TILING_DCC_PITCH_MAX_MASK 16383
+const AMDGPU_TILING_DCC_INDEPENDENT_64B_SHIFT 43
+const AMDGPU_TILING_DCC_INDEPENDENT_64B_MASK 1
+const AMDGPU_TILING_DCC_INDEPENDENT_128B_SHIFT 44
+const AMDGPU_TILING_DCC_INDEPENDENT_128B_MASK 1
+const AMDGPU_TILING_SCANOUT_SHIFT 63
+const AMDGPU_TILING_SCANOUT_MASK 1
+const AMDGPU_TILING_GFX12_SWIZZLE_MODE_SHIFT 0
+const AMDGPU_TILING_GFX12_SWIZZLE_MODE_MASK 7
+const AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_SHIFT 3
+const AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_MASK 3
+const AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_SHIFT 5
+const AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_MASK 7
+const AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_SHIFT 8
+const AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_MASK 63
+const AMDGPU_GEM_METADATA_OP_SET_METADATA 1
+const AMDGPU_GEM_METADATA_OP_GET_METADATA 2
+const AMDGPU_GEM_OP_GET_GEM_CREATE_INFO 0
+const AMDGPU_GEM_OP_SET_PLACEMENT 1
+const AMDGPU_VA_OP_MAP 1
+const AMDGPU_VA_OP_UNMAP 2
+const AMDGPU_VA_OP_CLEAR 3
+const AMDGPU_VA_OP_REPLACE 4
+const AMDGPU_VM_DELAY_UPDATE 1
+const AMDGPU_VM_PAGE_READABLE 2
+const AMDGPU_VM_PAGE_WRITEABLE 4
+const AMDGPU_VM_PAGE_EXECUTABLE 8
+const AMDGPU_VM_PAGE_PRT 16
+const AMDGPU_VM_MTYPE_MASK 480
+const AMDGPU_VM_MTYPE_DEFAULT 0
+const AMDGPU_VM_MTYPE_NC 32
+const AMDGPU_VM_MTYPE_WC 64
+const AMDGPU_VM_MTYPE_CC 96
+const AMDGPU_VM_MTYPE_UC 128
+const AMDGPU_VM_MTYPE_RW 160
+const AMDGPU_VM_PAGE_NOALLOC 512
+const AMDGPU_HW_IP_GFX 0
+const AMDGPU_HW_IP_COMPUTE 1
+const AMDGPU_HW_IP_DMA 2
+const AMDGPU_HW_IP_UVD 3
+const AMDGPU_HW_IP_VCE 4
+const AMDGPU_HW_IP_UVD_ENC 5
+const AMDGPU_HW_IP_VCN_DEC 6
+const AMDGPU_HW_IP_VCN_ENC 7
+const AMDGPU_HW_IP_VCN_JPEG 8
+const AMDGPU_HW_IP_VPE 9
+const AMDGPU_HW_IP_NUM 10
+const AMDGPU_HW_IP_INSTANCE_MAX_COUNT 1
+const AMDGPU_CHUNK_ID_IB 1
+const AMDGPU_CHUNK_ID_FENCE 2
+const AMDGPU_CHUNK_ID_DEPENDENCIES 3
+const AMDGPU_CHUNK_ID_SYNCOBJ_IN 4
+const AMDGPU_CHUNK_ID_SYNCOBJ_OUT 5
+const AMDGPU_CHUNK_ID_BO_HANDLES 6
+const AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES 7
+const AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT 8
+const AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL 9
+const AMDGPU_CHUNK_ID_CP_GFX_SHADOW 10
+const AMDGPU_IB_FLAG_CE 1
+const AMDGPU_IB_FLAG_PREAMBLE 2
+const AMDGPU_IB_FLAG_PREEMPT 4
+const AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE 8
+const AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID 16
+const AMDGPU_IB_FLAGS_SECURE 32
+const AMDGPU_IB_FLAG_EMIT_MEM_SYNC 64
+const AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ 0
+const AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ_FD 1
+const AMDGPU_FENCE_TO_HANDLE_GET_SYNC_FILE_FD 2
+const AMDGPU_CS_CHUNK_CP_GFX_SHADOW_FLAGS_INIT_SHADOW 1
+const AMDGPU_IDS_FLAGS_FUSION 1
+const AMDGPU_IDS_FLAGS_PREEMPTION 2
+const AMDGPU_IDS_FLAGS_TMZ 4
+const AMDGPU_IDS_FLAGS_CONFORMANT_TRUNC_COORD 8
+const AMDGPU_IDS_FLAGS_MODE_MASK 768
+const AMDGPU_IDS_FLAGS_MODE_SHIFT 8
+const AMDGPU_IDS_FLAGS_MODE_PF 0
+const AMDGPU_IDS_FLAGS_MODE_VF 1
+const AMDGPU_IDS_FLAGS_MODE_PT 2
+const AMDGPU_INFO_ACCEL_WORKING 0
+const AMDGPU_INFO_CRTC_FROM_ID 1
+const AMDGPU_INFO_HW_IP_INFO 2
+const AMDGPU_INFO_HW_IP_COUNT 3
+const AMDGPU_INFO_TIMESTAMP 5
+const AMDGPU_INFO_FW_VERSION 14
+const AMDGPU_INFO_FW_VCE 1
+const AMDGPU_INFO_FW_UVD 2
+const AMDGPU_INFO_FW_GMC 3
+const AMDGPU_INFO_FW_GFX_ME 4
+const AMDGPU_INFO_FW_GFX_PFP 5
+const AMDGPU_INFO_FW_GFX_CE 6
+const AMDGPU_INFO_FW_GFX_RLC 7
+const AMDGPU_INFO_FW_GFX_MEC 8
+const AMDGPU_INFO_FW_SMC 10
+const AMDGPU_INFO_FW_SDMA 11
+const AMDGPU_INFO_FW_SOS 12
+const AMDGPU_INFO_FW_ASD 13
+const AMDGPU_INFO_FW_VCN 14
+const AMDGPU_INFO_FW_GFX_RLC_RESTORE_LIST_CNTL 15
+const AMDGPU_INFO_FW_GFX_RLC_RESTORE_LIST_GPM_MEM 16
+const AMDGPU_INFO_FW_GFX_RLC_RESTORE_LIST_SRM_MEM 17
+const AMDGPU_INFO_FW_DMCU 18
+const AMDGPU_INFO_FW_TA 19
+const AMDGPU_INFO_FW_DMCUB 20
+const AMDGPU_INFO_FW_TOC 21
+const AMDGPU_INFO_FW_CAP 22
+const AMDGPU_INFO_FW_GFX_RLCP 23
+const AMDGPU_INFO_FW_GFX_RLCV 24
+const AMDGPU_INFO_FW_MES_KIQ 25
+const AMDGPU_INFO_FW_MES 26
+const AMDGPU_INFO_FW_IMU 27
+const AMDGPU_INFO_FW_VPE 28
+const AMDGPU_INFO_NUM_BYTES_MOVED 15
+const AMDGPU_INFO_VRAM_USAGE 16
+const AMDGPU_INFO_GTT_USAGE 17
+const AMDGPU_INFO_GDS_CONFIG 19
+const AMDGPU_INFO_VRAM_GTT 20
+const AMDGPU_INFO_READ_MMR_REG 21
+const AMDGPU_INFO_DEV_INFO 22
+const AMDGPU_INFO_VIS_VRAM_USAGE 23
+const AMDGPU_INFO_NUM_EVICTIONS 24
+const AMDGPU_INFO_MEMORY 25
+const AMDGPU_INFO_VCE_CLOCK_TABLE 26
+const AMDGPU_INFO_VBIOS 27
+const AMDGPU_INFO_VBIOS_SIZE 1
+const AMDGPU_INFO_VBIOS_IMAGE 2
+const AMDGPU_INFO_VBIOS_INFO 3
+const AMDGPU_INFO_NUM_HANDLES 28
+const AMDGPU_INFO_SENSOR 29
+const AMDGPU_INFO_SENSOR_GFX_SCLK 1
+const AMDGPU_INFO_SENSOR_GFX_MCLK 2
+const AMDGPU_INFO_SENSOR_GPU_TEMP 3
+const AMDGPU_INFO_SENSOR_GPU_LOAD 4
+const AMDGPU_INFO_SENSOR_GPU_AVG_POWER 5
+const AMDGPU_INFO_SENSOR_VDDNB 6
+const AMDGPU_INFO_SENSOR_VDDGFX 7
+const AMDGPU_INFO_SENSOR_STABLE_PSTATE_GFX_SCLK 8
+const AMDGPU_INFO_SENSOR_STABLE_PSTATE_GFX_MCLK 9
+const AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_SCLK 10
+const AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_MCLK 11
+const AMDGPU_INFO_SENSOR_GPU_INPUT_POWER 12
+const AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS 30
+const AMDGPU_INFO_VRAM_LOST_COUNTER 31
+const AMDGPU_INFO_RAS_ENABLED_FEATURES 32
+const AMDGPU_INFO_RAS_ENABLED_UMC 1
+const AMDGPU_INFO_RAS_ENABLED_SDMA 2
+const AMDGPU_INFO_RAS_ENABLED_GFX 4
+const AMDGPU_INFO_RAS_ENABLED_MMHUB 8
+const AMDGPU_INFO_RAS_ENABLED_ATHUB 16
+const AMDGPU_INFO_RAS_ENABLED_PCIE 32
+const AMDGPU_INFO_RAS_ENABLED_HDP 64
+const AMDGPU_INFO_RAS_ENABLED_XGMI 128
+const AMDGPU_INFO_RAS_ENABLED_DF 256
+const AMDGPU_INFO_RAS_ENABLED_SMN 512
+const AMDGPU_INFO_RAS_ENABLED_SEM 1024
+const AMDGPU_INFO_RAS_ENABLED_MP0 2048
+const AMDGPU_INFO_RAS_ENABLED_MP1 4096
+const AMDGPU_INFO_RAS_ENABLED_FUSE 8192
+const AMDGPU_INFO_VIDEO_CAPS 33
+const AMDGPU_INFO_VIDEO_CAPS_DECODE 0
+const AMDGPU_INFO_VIDEO_CAPS_ENCODE 1
+const AMDGPU_INFO_MAX_IBS 34
+const AMDGPU_INFO_GPUVM_FAULT 35
+const AMDGPU_INFO_UQ_FW_AREAS 36
+const AMDGPU_INFO_MMR_SE_INDEX_SHIFT 0
+const AMDGPU_INFO_MMR_SE_INDEX_MASK 255
+const AMDGPU_INFO_MMR_SH_INDEX_SHIFT 8
+const AMDGPU_INFO_MMR_SH_INDEX_MASK 255
+const AMDGPU_VRAM_TYPE_UNKNOWN 0
+const AMDGPU_VRAM_TYPE_GDDR1 1
+const AMDGPU_VRAM_TYPE_DDR2 2
+const AMDGPU_VRAM_TYPE_GDDR3 3
+const AMDGPU_VRAM_TYPE_GDDR4 4
+const AMDGPU_VRAM_TYPE_GDDR5 5
+const AMDGPU_VRAM_TYPE_HBM 6
+const AMDGPU_VRAM_TYPE_DDR3 7
+const AMDGPU_VRAM_TYPE_DDR4 8
+const AMDGPU_VRAM_TYPE_GDDR6 9
+const AMDGPU_VRAM_TYPE_DDR5 10
+const AMDGPU_VRAM_TYPE_LPDDR4 11
+const AMDGPU_VRAM_TYPE_LPDDR5 12
+const AMDGPU_VCE_CLOCK_TABLE_ENTRIES 6
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG2 0
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4 1
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VC1 2
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC 3
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC 4
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_JPEG 5
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VP9 6
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1 7
+const AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_COUNT 8
+const AMDGPU_VMHUB_TYPE_MASK 255
+const AMDGPU_VMHUB_TYPE_SHIFT 0
+const AMDGPU_VMHUB_TYPE_GFX 0
+const AMDGPU_VMHUB_TYPE_MM0 1
+const AMDGPU_VMHUB_TYPE_MM1 2
+const AMDGPU_VMHUB_IDX_MASK 65280
+const AMDGPU_VMHUB_IDX_SHIFT 8
+const AMDGPU_FAMILY_UNKNOWN 0
+const AMDGPU_FAMILY_SI 110
+const AMDGPU_FAMILY_CI 120
+const AMDGPU_FAMILY_KV 125
+const AMDGPU_FAMILY_VI 130
+const AMDGPU_FAMILY_CZ 135
+const AMDGPU_FAMILY_AI 141
+const AMDGPU_FAMILY_RV 142
+const AMDGPU_FAMILY_NV 143
+const AMDGPU_FAMILY_VGH 144
+const AMDGPU_FAMILY_GC_11_0_0 145
+const AMDGPU_FAMILY_YC 146
+const AMDGPU_FAMILY_GC_11_0_1 148
+const AMDGPU_FAMILY_GC_10_3_6 149
+const AMDGPU_FAMILY_GC_10_3_7 151
+const AMDGPU_FAMILY_GC_11_5_0 150
+const AMDGPU_FAMILY_GC_12_0_0 152
+const SYNC_IOC_MAGIC 62
+const SYNC_IOC_MERGE 3224387075
+const SYNC_IOC_FILE_INFO 3224911364
+const SYNC_IOC_SET_DEADLINE 1074806277
+const DMA_BUF_SYNC_READ 1
+const DMA_BUF_SYNC_WRITE 2
+const DMA_BUF_SYNC_RW 3
+const DMA_BUF_SYNC_START 0
+const DMA_BUF_SYNC_END 4
+const DMA_BUF_SYNC_VALID_FLAGS_MASK 7
+const DMA_BUF_NAME_LEN 32
+const DMA_BUF_BASE 98
+const DMA_BUF_IOCTL_SYNC 1074291200
+const DMA_BUF_SET_NAME 1074291201
+const DMA_BUF_SET_NAME_A 1074029057
+const DMA_BUF_SET_NAME_B 1074291201
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE 3221774850
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE 1074291203
+const DRM_ADD_COMMAND 0
+const DRM_RM_COMMAND 1
+const DRM_INST_HANDLER 2
+const DRM_UNINST_HANDLER 3
+const _DRM_FRAME_BUFFER 0
+const _DRM_REGISTERS 1
+const _DRM_SHM 2
+const _DRM_AGP 3
+const _DRM_SCATTER_GATHER 4
+const _DRM_CONSISTENT 5
+const _DRM_RESTRICTED 1
+const _DRM_READ_ONLY 2
+const _DRM_LOCKED 4
+const _DRM_KERNEL 8
+const _DRM_WRITE_COMBINING 16
+const _DRM_CONTAINS_LOCK 32
+const _DRM_REMOVABLE 64
+const _DRM_DRIVER 128
+const _DRM_STAT_LOCK 0
+const _DRM_STAT_OPENS 1
+const _DRM_STAT_CLOSES 2
+const _DRM_STAT_IOCTLS 3
+const _DRM_STAT_LOCKS 4
+const _DRM_STAT_UNLOCKS 5
+const _DRM_STAT_VALUE 6
+const _DRM_STAT_BYTE 7
+const _DRM_STAT_COUNT 8
+const _DRM_STAT_IRQ 9
+const _DRM_STAT_PRIMARY 10
+const _DRM_STAT_SECONDARY 11
+const _DRM_STAT_DMA 12
+const _DRM_STAT_SPECIAL 13
+const _DRM_STAT_MISSED 14
+const _DRM_LOCK_READY 1
+const _DRM_LOCK_QUIESCENT 2
+const _DRM_LOCK_FLUSH 4
+const _DRM_LOCK_FLUSH_ALL 8
+const _DRM_HALT_ALL_QUEUES 16
+const _DRM_HALT_CUR_QUEUES 32
+const _DRM_DMA_BLOCK 1
+const _DRM_DMA_WHILE_LOCKED 2
+const _DRM_DMA_PRIORITY 4
+const _DRM_DMA_WAIT 16
+const _DRM_DMA_SMALLER_OK 32
+const _DRM_DMA_LARGER_OK 64
+const _DRM_PAGE_ALIGN 1
+const _DRM_AGP_BUFFER 2
+const _DRM_SG_BUFFER 4
+const _DRM_FB_BUFFER 8
+const _DRM_PCI_BUFFER_RO 16
+const _DRM_CONTEXT_PRESERVED 1
+const _DRM_CONTEXT_2DONLY 2
+const DRM_DRAWABLE_CLIPRECTS 0
+const _DRM_VBLANK_ABSOLUTE 0
+const _DRM_VBLANK_RELATIVE 1
+const _DRM_VBLANK_HIGH_CRTC_MASK 62
+const _DRM_VBLANK_EVENT 67108864
+const _DRM_VBLANK_FLIP 134217728
+const _DRM_VBLANK_NEXTONMISS 268435456
+const _DRM_VBLANK_SECONDARY 536870912
+const _DRM_VBLANK_SIGNAL 1073741824

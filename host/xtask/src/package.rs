@@ -67,8 +67,10 @@ pub enum Source {
     Host(PathBuf),
     Gcc(PathBuf),
     Gxx(PathBuf),
-    /// WY-1a: the binary of the same name from the cargo package in this directory (`compile`).
-    Cargo(PathBuf),
+    /// WY-1a: the binary of the same name from the cargo package in this directory (`compile`). WY-14
+    /// (`cargo:dir+feat[+feat]`): with features, the binary named like the directory, built with those
+    /// features, copied out under the entry's name (`stick bitscomp-gpu cargo:user/services/bitscomp+gpu`).
+    Cargo(PathBuf, Vec<String>),
     /// YT-2: a file of this repository copied unchanged (a launcher script).
     File(PathBuf),
     /// UL-6: a glibc locale directory made by the host's `localedef -i <input> -f <charmap> --no-archive` (only
@@ -133,7 +135,16 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Item>, String> {
             Some(("host", p)) if p.starts_with('/') => Source::Host(p.into()),
             Some(("gcc", p)) if rel(p) => Source::Gcc(p.into()),
             Some(("g++", p)) if rel(p) => Source::Gxx(p.into()),
-            Some(("cargo", p)) if rel(p) => Source::Cargo(p.into()),
+            Some(("cargo", p)) if rel(p.split('+').next().unwrap_or("")) => {
+                let mut parts = p.split('+');
+                let dir = parts.next().unwrap_or("");
+                let feats: Vec<String> = parts.map(String::from).collect();
+                let feat_ok = |f: &String| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                if !feats.iter().all(feat_ok) {
+                    return Err(format!("{at}: source '{src}': cargo:rel/dir or cargo:rel/dir+feature[+feature]"));
+                }
+                Source::Cargo(dir.into(), feats)
+            }
             Some(("file", p)) if rel(p) => Source::File(p.into()),
             Some(("localedef", p)) if place == Place::Data => {
                 let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "_@.-".contains(c));
@@ -198,6 +209,26 @@ pub fn is_dynamic(elf: &[u8]) -> bool {
     })
 }
 
+/// WY-14: the program interpreter (PT_INTERP) of a 64-bit ELF, if it has one.
+pub fn interp(elf: &[u8]) -> Option<String> {
+    if elf.len() < 64 || !elf.starts_with(b"\x7fELF") || elf[4] != 2 {
+        return None;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([elf[o], elf[o + 1]]) as usize;
+    let u64_at = |o: usize| elf.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])) as usize);
+    let phoff = u64_at(0x20)?;
+    let (ent, num) = (u16_at(0x36), u16_at(0x38));
+    (0..num).find_map(|i| {
+        let o = phoff.saturating_add(i * ent);
+        if elf.get(o..o.saturating_add(4))? != 3u32.to_le_bytes() {
+            return None;
+        }
+        let (off, len) = (u64_at(o + 8)?, u64_at(o + 32)?);
+        let raw = elf.get(off..off.checked_add(len)?)?;
+        Some(String::from_utf8_lossy(raw.split(|&b| b == 0).next().unwrap_or(&[])).into_owned())
+    })
+}
+
 /// BR-2: an ELF shared object (ET_DYN with a PT_DYNAMIC and no PT_INTERP): a library, not a program.
 pub fn is_shared_lib(elf: &[u8]) -> bool {
     if elf.len() < 64 || !elf.starts_with(b"\x7fELF") || elf[4] != 2 || u16::from_le_bytes([elf[0x10], elf[0x11]]) != 3 {
@@ -218,10 +249,15 @@ pub fn ldd(file: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 /// `ldd` with LD_LIBRARY_PATH=`lib_path` (BR-2: a tree's library finds its neighbours in the tree's lib/ as the
 /// launcher's LD_LIBRARY_PATH or an RPATH $ORIGIN does on V2).
 pub fn ldd_in(file: &Path, lib_path: Option<&Path>) -> Result<Vec<(String, PathBuf)>, String> {
+    ldd_paths(file, lib_path.as_slice())
+}
+
+/// `ldd` with LD_LIBRARY_PATH=`lib_paths` joined by ':' (none: no LD_LIBRARY_PATH).
+pub fn ldd_paths(file: &Path, lib_paths: &[&Path]) -> Result<Vec<(String, PathBuf)>, String> {
     let mut c = Command::new("ldd");
     c.arg(file).env("LC_ALL", "C");
-    if let Some(p) = lib_path {
-        c.env("LD_LIBRARY_PATH", p);
+    if !lib_paths.is_empty() {
+        c.env("LD_LIBRARY_PATH", std::env::join_paths(lib_paths).map_err(|e| format!("LD_LIBRARY_PATH: {e}"))?);
     }
     let o = c.output().map_err(|e| format!("ldd: {e}"))?;
     if !o.status.success() {
@@ -312,7 +348,9 @@ pub fn stick_dir(root: &Path) -> PathBuf {
 /// (x86_64-unknown-linux-gnu, CachyOS glibc, dynamic): release, without the package's default features (bitscomp's
 /// `nested` back end stays out), stripped, x86-64-v3 (R10), from the lock and the local cache only (`--locked
 /// --offline`, no download), in the package's directory so its rust-toolchain file applies, own target directory.
-fn cargo_build(root: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
+/// WY-14: `features` non-empty builds the binary named like `dir`'s last component with `--features`, in its own
+/// target directory (pkg/cargo-<features>), because its output has the same name as the build without them.
+fn cargo_build(root: &Path, dir: &Path, name: &str, features: &[String]) -> Result<PathBuf, String> {
     let pkg = root.join(dir);
     if !pkg.join("Cargo.toml").is_file() {
         return Err(format!("{}: no Cargo.toml", pkg.display()));
@@ -320,11 +358,18 @@ fn cargo_build(root: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !have_tool("cargo") {
         return Err("no cargo on this host".into());
     }
-    let tdir = xdir(root).join("pkg/cargo");
+    let (tdir, bin) = if features.is_empty() {
+        (xdir(root).join("pkg/cargo"), name.to_string())
+    } else {
+        let bin = dir.file_name().and_then(|n| n.to_str()).ok_or_else(|| format!("{}: no directory name", dir.display()))?;
+        (xdir(root).join(format!("pkg/cargo-{}", features.join("-"))), bin.to_string())
+    };
     let mut c = Command::new("cargo");
-    c.current_dir(&pkg)
-        .args(["build", "--release", "--locked", "--offline", "--no-default-features", "-q", "--bin", name, "--manifest-path"])
-        .arg(pkg.join("Cargo.toml"));
+    c.current_dir(&pkg).args(["build", "--release", "--locked", "--offline", "--no-default-features", "-q"]);
+    if !features.is_empty() {
+        c.arg("--features").arg(features.join(","));
+    }
+    c.arg("--bin").arg(&bin).arg("--manifest-path").arg(pkg.join("Cargo.toml"));
     for v in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTC_WRAPPER", "RUSTDOC", "RUSTFLAGS", "CARGO_BUILD_TARGET", "CARGO_MANIFEST_DIR"] {
         c.env_remove(v);
     }
@@ -333,14 +378,14 @@ fn cargo_build(root: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
         .env("CARGO_PROFILE_RELEASE_STRIP", "symbols")
         .env("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=x86-64-v3");
     run_status(&mut c, &format!("building {name} (cargo, CachyOS glibc, {})", dir.display()))?;
-    Ok(tdir.join("release").join(name))
+    Ok(tdir.join("release").join(bin))
 }
 
 fn compile(root: &Path, item: &Item, out: &Path) -> Result<PathBuf, String> {
     let (cc, std, src) = match &item.source {
         Source::Gcc(p) => ("gcc", "-std=gnu11", root.join(p)),
         Source::Gxx(p) => ("g++", "-std=c++17", root.join(p)),
-        Source::Cargo(p) => return cargo_build(root, p, &item.name),
+        Source::Cargo(p, f) => return cargo_build(root, p, &item.name, f),
         Source::File(p) => {
             let f = root.join(p);
             return if f.is_file() { Ok(f) } else { Err(format!("{} is not in this repository", f.display())) };
@@ -367,10 +412,15 @@ pub fn build(root: &Path, programs: &[(String, PathBuf)]) -> Result<Built, Strin
     };
     let out = xdir(root).join("pkg/bin");
     let sdir = stick_dir(root);
-    let _ = std::fs::remove_dir_all(&sdir);
     for d in [&out, &sdir] {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
+    // INT-W20: parallel scenario chains (`fullrun`) build images at once. One build at a time compiles and fills
+    // pkg/; the stick folder is never emptied and its files land by rename, so a chain still copying the files of
+    // its own build (image.rs, after this lock) never finds one missing or half written (wave 16: "No such file").
+    let lock_path = xdir(root).join("pkg/build.lock");
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    lock.lock().map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
     let mut b = Built::default();
     for it in items.iter().filter(|i| i.place != Place::Data && i.place != Place::Tree) {
         if programs.iter().any(|(n, _)| *n == it.name) {
@@ -389,7 +439,7 @@ pub fn build(root: &Path, programs: &[(String, PathBuf)]) -> Result<Built, Strin
             Place::Data | Place::Tree => {}
             Place::Stick => {
                 let dst = sdir.join(&it.name);
-                std::fs::copy(&file, &dst).map_err(|e| format!("copy {} -> {}: {e}", file.display(), dst.display()))?;
+                put_whole(&file, &dst)?;
                 b.stick.push((format!("{STICK_BIN}/{}", it.name), dst));
             }
         }
@@ -410,9 +460,28 @@ pub fn build(root: &Path, programs: &[(String, PathBuf)]) -> Result<Built, Strin
     let mut kinds: Vec<(&str, String, PathBuf)> = b.stick.iter().map(|(r, f)| ("prog", r.clone(), f.clone())).collect();
     trees(&items, programs.iter().chain(&b.initrd), &mut kinds)?;
     b.stick = kinds.iter().map(|(_, r, f)| (r.clone(), f.clone())).collect();
+    // What an earlier manifest put there and this one does not (and leftovers of a build that was stopped).
+    if let Ok(rd) = std::fs::read_dir(&sdir) {
+        for e in rd.flatten() {
+            if !b.stick.iter().any(|(_, f)| *f == e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let list: String = kinds.iter().map(|(k, r, f)| format!("{k}\t{r}\t{}\n", f.display())).collect();
-    std::fs::write(stick_list(root), list).map_err(|e| format!("{}: {e}", stick_list(root).display()))?;
+    let tmp = stick_list(root).with_extension(format!("list.tmp{}", std::process::id()));
+    std::fs::write(&tmp, list).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, stick_list(root)).map_err(|e| format!("{}: {e}", stick_list(root).display()))?;
+    drop(lock);
     Ok(b)
+}
+
+/// Copies `from` to `to` by a temporary file and a rename: a reader opening `to` sees the old file or the new
+/// one, never a missing or partly written one.
+fn put_whole(from: &Path, to: &Path) -> Result<(), String> {
+    let tmp = to.with_file_name(format!(".{}.tmp{}", to.file_name().and_then(|n| n.to_str()).unwrap_or("x"), std::process::id()));
+    std::fs::copy(from, &tmp).map_err(|e| format!("copy {} -> {}: {e}", from.display(), tmp.display()))?;
+    std::fs::rename(&tmp, to).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), to.display()))
 }
 
 /// YT-2: the manifest's trees with the libraries their programs need beyond `set` (the initramfs's programs and
@@ -461,7 +530,13 @@ fn lib_set<'a>(root: &Path, progs: impl Iterator<Item = &'a (String, PathBuf)>) 
     };
     let mut set: BTreeMap<String, PathBuf> = BTreeMap::new();
     for (n, f) in progs {
-        if lib_dest(n).is_some() || !std::fs::read(f).is_ok_and(|b| is_dynamic(&b)) {
+        let Ok(elf) = std::fs::read(f) else { continue };
+        if lib_dest(n).is_some() || !is_dynamic(&elf) {
+            continue;
+        }
+        // WY-14: a program linked against a stick tree's own loader (bitscomp-gpu: the Mesa tree's glibc) brings
+        // its libraries with that tree; the host's ldd cannot run it.
+        if interp(&elf).is_some_and(|i| i.starts_with("/boot/BITSOS2/")) {
             continue;
         }
         for (so, real) in ldd(f).map_err(|e| format!("{n}: {e}"))? {
@@ -590,7 +665,7 @@ pub fn initrd_extra(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<c
         // AB-8's copies (abi_dyn) are not pacman's files: ask about the host file with the same bytes.
         let host = find_lib(n).filter(|h| std::fs::read(h).ok().as_deref() == Some(&data[..])).unwrap_or_else(|| f.clone());
         let o = origin(&host, &mut cache);
-        licence_texts(&o, &mut lic_files, &mut lic_missing);
+        licence_texts(root, &o, &mut lic_files, &mut lic_missing);
         libs.push(line("lib", &format!("/{dest}"), &data, Some(&o)));
     }
     libs.sort();
@@ -607,7 +682,7 @@ pub fn initrd_extra(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<c
     match std::fs::read(CA_HOST) {
         Ok(data) => {
             let o = origin(Path::new(CA_HOST), &mut cache);
-            licence_texts(&o, &mut lic_files, &mut lic_missing);
+            licence_texts(root, &o, &mut lic_files, &mut lic_missing);
             lines.push(line("data", &format!("/{CA_DEST}"), &data, Some(&o)));
             v.push(cpio::file(CA_DEST, 0o644, data));
         }
@@ -649,7 +724,7 @@ pub fn initrd_extra(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<c
         for (dest, host) in files {
             let data = std::fs::read(&host).map_err(|e| format!("{}: {e}", host.display()))?;
             let o = origin(owner.as_deref().unwrap_or(&host), &mut cache);
-            licence_texts(&o, &mut lic_files, &mut lic_missing);
+            licence_texts(root, &o, &mut lic_files, &mut lic_missing);
             let l = line("data", &dest, &data, Some(&o));
             let sha = l.split_whitespace().nth(3).unwrap_or_default().to_string();
             lines.push(l);
@@ -673,7 +748,7 @@ pub fn initrd_extra(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<c
         let Ok(data) = std::fs::read(host) else { continue };
         let o = (kind == "lib").then(|| origin(Path::new(host), &mut cache));
         if let Some(o) = &o {
-            licence_texts(o, &mut lic_files, &mut lic_missing);
+            licence_texts(root, o, &mut lic_files, &mut lic_missing);
         }
         lines.push(line("stick", &format!("/boot/{rel}"), &data, o.as_ref()));
     }
@@ -774,11 +849,22 @@ fn data_files(src: &Path, dest: &str, out: &mut Vec<(String, PathBuf)>) -> Resul
 /// The package's own licence files (`/usr/share/licenses/<package>/`) and the SPDX texts its licences name. A
 /// pacman licence entry with no text at all (neither the package's files nor one SPDX text of its terms) goes to
 /// `missing` (CachyOS ships no glibc licence directory; its LGPL/GPL texts come from the `licenses` package).
-fn licence_texts(o: &Origin, into: &mut BTreeMap<String, Vec<u8>>, missing: &mut BTreeSet<String>) {
-    let base = Path::new("/usr/share/licenses");
+fn licence_texts(root: &Path, o: &Origin, into: &mut BTreeMap<String, Vec<u8>>, missing: &mut BTreeSet<String>) {
+    licence_texts_from(o, &root.join(LICENCES), into, missing)
+}
+
+/// LO-1: the licence folders of named packages that install none (e2fsprogs, libassuan), kept in the repository; a
+/// package's own host folder comes first, and there is no repository fallback for SPDX texts in general (a package
+/// naming MIT without a folder of its own still fails).
+pub const LICENCES: &str = "user/packaging/licences";
+
+fn licence_texts_from(o: &Origin, extra: &Path, into: &mut BTreeMap<String, Vec<u8>>, missing: &mut BTreeSet<String>) {
+    let host = Path::new("/usr/share/licenses");
     let mut own = false;
+    let pkg_dir = [host, extra].into_iter().map(|b| b.join(&o.package)).find(|d| d.is_dir());
     if o.package != "-"
-        && let Ok(rd) = std::fs::read_dir(base.join(&o.package))
+        && let Some(dir) = pkg_dir
+        && let Ok(rd) = std::fs::read_dir(dir)
     {
         for e in rd.flatten() {
             if let Ok(data) = std::fs::read(e.path()) {
@@ -791,9 +877,9 @@ fn licence_texts(o: &Origin, into: &mut BTreeMap<String, Vec<u8>>, missing: &mut
         let mut found = false;
         for id in entry.split_whitespace().filter(|t| !matches!(*t, "WITH" | "OR" | "AND")) {
             let id = legacy_spdx(id.trim_matches(|c| c == '(' || c == ')'));
-            for (from, to) in [(base.join(format!("spdx/{id}.txt")), format!("usr/share/licenses/spdx/{id}.txt")), (base.join(format!("spdx/exceptions/{id}.txt")), format!("usr/share/licenses/spdx/exceptions/{id}.txt"))] {
-                if let Ok(data) = std::fs::read(&from) {
-                    into.insert(to, data);
+            for rel in [format!("spdx/{id}.txt"), format!("spdx/exceptions/{id}.txt")] {
+                if let Ok(data) = std::fs::read(host.join(&rel)) {
+                    into.insert(format!("usr/share/licenses/{rel}"), data);
                     found = true;
                 }
             }
@@ -891,15 +977,28 @@ mod tests {
     }
 
     #[test]
+    fn interp_reads_pt_interp() {
+        // WY-14: a host program names the host loader; garbage and a static-looking header name none.
+        if let Ok(elf) = std::fs::read("/usr/bin/env") {
+            assert!(interp(&elf).is_some_and(|i| i.starts_with('/') && i.contains("ld-linux")), "{:?}", interp(&elf));
+        }
+        assert_eq!(interp(b"not an elf"), None);
+        assert_eq!(interp(&[0u8; 64]), None);
+    }
+
+    #[test]
     fn manifest_parses_and_refuses() {
         let m = parse_manifest("# c\n\ninitrd a  g++:user/x.cc # why\nstick b host:/usr/bin/b\n").unwrap();
         assert_eq!(m[0], Item { place: Place::Initrd, name: "a".into(), source: Source::Gxx("user/x.cc".into()) });
         assert_eq!(m[1], Item { place: Place::Stick, name: "b".into(), source: Source::Host("/usr/bin/b".into()) });
         // WY-1a: a cargo-built program and data at an absolute V2 path.
         let m = parse_manifest("stick c cargo:user/services/c\ndata /usr/share/d/e host:/usr/share/e\n").unwrap();
-        assert_eq!(m[0], Item { place: Place::Stick, name: "c".into(), source: Source::Cargo("user/services/c".into()) });
+        assert_eq!(m[0], Item { place: Place::Stick, name: "c".into(), source: Source::Cargo("user/services/c".into(), vec![]) });
         assert_eq!(m[1], Item { place: Place::Data, name: "/usr/share/d/e".into(), source: Source::Host("/usr/share/e".into()) });
-        for bad in ["data rel host:/x", "data / host:/x", "data /a/../b host:/x", "data /a//b host:/x", "data /a cargo:x", "initrd a cargo:/abs", "initrd a cargo:../up"] {
+        // WY-14: features after '+'.
+        let m = parse_manifest("stick c-gpu cargo:user/services/c+gpu+x_y\n").unwrap();
+        assert_eq!(m[0].source, Source::Cargo("user/services/c".into(), vec!["gpu".into(), "x_y".into()]));
+        for bad in ["data rel host:/x", "data / host:/x", "data /a/../b host:/x", "data /a//b host:/x", "data /a cargo:x", "initrd a cargo:/abs", "initrd a cargo:../up", "stick a cargo:x+", "stick a cargo:x+a b", "stick a cargo:x+g/h"] {
             assert!(parse_manifest(bad).is_err(), "{bad}");
         }
         for bad in ["usb a host:/x", "initrd a/b host:/x", "initrd libz.so.1 host:/x", "initrd a host:x", "initrd a gcc:../x.c", "initrd a gcc:/x.c", "initrd a", "initrd a host:/x\nstick a host:/y"] {
@@ -963,6 +1062,35 @@ mod tests {
         assert!(!is_tree_file("BITSOS2/bin/ninja") && is_tree_file("BITSOS2/cobalt/loader_app") && is_tree_file("BITSOS2/binx/a"));
     }
 
+    /// LO-1: a package without a licence folder takes the repository's folder of that name; SPDX texts never come from
+    /// the repository. A fake repository root and package names, so the host's own folders do not matter.
+    #[test]
+    fn licences_the_host_lacks_come_from_the_repository() {
+        let root = std::env::temp_dir().join(format!("xt-lic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(LICENCES).join("bitsos-lo1-fake")).unwrap();
+        std::fs::create_dir_all(root.join(LICENCES).join("spdx")).unwrap();
+        std::fs::write(root.join(LICENCES).join("bitsos-lo1-fake/NOTICE.txt"), "fake").unwrap();
+        std::fs::write(root.join(LICENCES).join("spdx/BitsOS-LO1-Fake.txt"), "fake").unwrap();
+        let o = Origin { package: "bitsos-lo1-fake".into(), version: "1".into(), licenses: vec!["GPL".into(), "MIT".into()] };
+        let (mut into, mut missing) = (BTreeMap::new(), BTreeSet::new());
+        licence_texts(&root, &o, &mut into, &mut missing);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(into.get("usr/share/licenses/bitsos-lo1-fake/NOTICE.txt").map(Vec::as_slice), Some(&b"fake"[..]));
+        let o = Origin { package: "bitsos-lo1-none".into(), version: "1".into(), licenses: vec!["BitsOS-LO1-Fake".into()] };
+        let (mut into, mut missing) = (BTreeMap::new(), BTreeSet::new());
+        licence_texts(&root, &o, &mut into, &mut missing);
+        assert!(into.is_empty(), "an SPDX text from the repository: {:?}", into.keys());
+        assert_eq!(missing.into_iter().collect::<Vec<_>>(), ["bitsos-lo1-none (BitsOS-LO1-Fake)"]);
+        let _ = std::fs::remove_dir_all(&root);
+        // The repository's own folders, for the packages LibreOffice's libraries bring.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(LICENCES);
+        for f in ["e2fsprogs/com_err-SIPB.txt", "e2fsprogs/README.txt", "libassuan/FSFULLR.txt"] {
+            assert!(repo.join(f).is_file(), "{f}");
+        }
+        assert!(!repo.join("spdx").exists(), "no general SPDX fallback in the repository");
+    }
+
     /// BR-2: libidn2's pacman licences `GPL2  LGPL3` find their SPDX texts.
     #[test]
     fn legacy_licence_names() {
@@ -970,7 +1098,7 @@ mod tests {
         assert_eq!(legacy_spdx("MIT"), "MIT");
         let o = Origin { package: "-".into(), version: "-".into(), licenses: vec!["GPL2  LGPL3".into()] };
         let (mut into, mut missing) = (BTreeMap::new(), BTreeSet::new());
-        licence_texts(&o, &mut into, &mut missing);
+        licence_texts(Path::new("."), &o, &mut into, &mut missing);
         if Path::new("/usr/share/licenses/spdx/GPL-2.0-only.txt").exists() {
             assert!(missing.is_empty() && into.contains_key("usr/share/licenses/spdx/GPL-2.0-only.txt"), "{missing:?}");
         }

@@ -14,12 +14,12 @@
 //! unmapper without any of its own locks (before `vfs.inode.data`), so the order stays `vfs.file.pos` > `mm.as`
 //! > `mm.rmap`, `vfs.inode.data`, `vfs.map.pins` (R5).
 
-use super::{AsCore, Inner, Owner};
+use super::{AsCore, Inner, Owner, Zap};
 use crate::vma::{FileRef, VmaKind};
 use crate::PAGE;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use hal::paging;
+use hal::paging::{self, tlb};
 use ksync::SpinLock;
 use vfs::mmap::Unmapper;
 use vfs::Inode;
@@ -140,6 +140,9 @@ impl AsCore {
         let mut g = self.inner.lock();
         let mut found = false;
         let mut at = 0u64;
+        // MM-11: every VMA's pages of the call in one round; no page table is freed (the VMAs stay, Linux's
+        // `zap_page_range_single`).
+        let mut z = Zap::begin(self, &g, tlb::Cause::Reclaim);
         // One VMA at a time by address (a clone holds only Arcs: no allocation, and the tree may be read again
         // after each unmap, which changes page tables only).
         while let Some(v) = g.space.tree.next_from(at).cloned() {
@@ -155,19 +158,20 @@ impl AsCore {
             let (s, e) = (v.start + (lo - f.pgoff) * PAGE, v.start + (hi - f.pgoff + 1) * PAGE);
             let owner = Owner::File(f.backing.clone(), v.kind == VmaKind::Anonymous);
             if even_cows || !v.private() {
-                self.unmap_one(&mut g, s, e, &owner);
+                self.zap(&mut g, &mut z, s, e, &owner, (0, 0));
             } else {
-                self.unmap_cache_frames(&mut g, s, e, &owner);
+                self.zap_cache_frames(&mut g, &mut z, s, e, &owner);
             }
         }
+        self.zap_end(&mut g, z);
         if !found {
             remove(key, self);
         }
     }
 
-    /// A private VMA's hole punch: only the entries that map page-cache frames go (runs of them, one shootdown
-    /// per run); the program's private copies keep their data (Linux `zap_details.even_cows = false`).
-    fn unmap_cache_frames(&self, g: &mut Inner, s: u64, e: u64, owner: &Owner) {
+    /// A private VMA's hole punch: only the entries that map page-cache frames go (runs of them, all in the
+    /// caller's round); the program's private copies keep their data (Linux `zap_details.even_cows = false`).
+    fn zap_cache_frames(&self, g: &mut Inner, z: &mut Zap, s: u64, e: u64, owner: &Owner) {
         let mut run: Option<u64> = None;
         let mut va = s;
         while va < e {
@@ -175,7 +179,7 @@ impl AsCore {
             match (cached, run) {
                 (true, None) => run = Some(va),
                 (false, Some(r)) => {
-                    self.unmap_one(g, r, va, owner);
+                    self.zap(g, z, r, va, owner, (0, 0));
                     run = None;
                 }
                 _ => {}
@@ -183,7 +187,7 @@ impl AsCore {
             va += PAGE;
         }
         if let Some(r) = run {
-            self.unmap_one(g, r, e, owner);
+            self.zap(g, z, r, e, owner, (0, 0));
         }
     }
 }

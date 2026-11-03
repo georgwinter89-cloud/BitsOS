@@ -8,8 +8,7 @@ use std::collections::HashMap;
 
 use mcpreg::Json;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::desktop::Window;
+use crate::win::Window;
 use smithay::input::keyboard::{Keysym, ModifiersState};
 
 use crate::address::{Edit, Where};
@@ -19,7 +18,7 @@ use crate::header::px_rect;
 use crate::layout::Rect;
 use crate::page::{self, FAVOURITES, Inputs, Kind, Layout, Part, Row, SWATCHES, part_name};
 use crate::page_draw::{FieldLook, PageLook};
-use crate::render::CompElement;
+use crate::render::{CompElement, CompRenderer};
 use crate::settings_write::{Ask, Done, Req};
 use crate::state::App;
 
@@ -61,7 +60,7 @@ pub fn argv(address: &str) -> Vec<String> {
 
 fn is_page_argv(argv: &[&str]) -> Option<String> {
     let name = std::path::Path::new(argv.first()?).file_name()?.to_str()?;
-    (name == "bitscomp" && argv.get(1) == Some(&"page")).then(|| argv.get(2).copied().unwrap_or("einstellungen").to_string())
+    (matches!(name, "bitscomp" | "bitscomp-gpu") && argv.get(1) == Some(&"page")).then(|| argv.get(2).copied().unwrap_or("einstellungen").to_string())
 }
 
 fn label(app: &App, key: &str) -> String {
@@ -159,7 +158,7 @@ impl App {
     }
 
     /// The page of `pid` drawn over its window's content `c` (logical pixels).
-    pub fn page_elements(&mut self, pixman: &mut PixmanRenderer, pid: u32, c: Rect) -> Vec<CompElement> {
+    pub fn page_elements<R: CompRenderer>(&mut self, renderer: &mut R, pid: u32, c: Rect) -> Vec<CompElement<R>> {
         if c.w <= 0 || c.h <= 0 {
             return Vec::new();
         }
@@ -172,7 +171,7 @@ impl App {
         }
         let buf = &s.image.as_ref().unwrap().1;
         let p = px_rect(c, t.scale);
-        image_a(pixman, buf, c, (p.w, p.h), t.scale, 1.0).into_iter().collect()
+        image_a(renderer, buf, c, (p.w, p.h), t.scale, 1.0).into_iter().collect()
     }
 
     /// The spot on page window `w` at (x, y), when the point is in its content.

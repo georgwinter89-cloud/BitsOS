@@ -15,3 +15,6 @@ ktest = { path = "../../ktest" }
 pci = { path = "../../pci" }
 sched = { path = "../../sched" }
 time = { path = "../../time" }
+
+[lints]
+workspace = true

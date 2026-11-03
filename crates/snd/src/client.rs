@@ -99,6 +99,9 @@ pub struct Client {
     pub(crate) consumed: AtomicU64,
     pub(crate) underruns: AtomicU64,
     pub(crate) silence: AtomicU64,
+    /// Clock (ns) of the owner's last write that took frames (0: none yet): an xrun reports how long the
+    /// writer had been silent (SN-12, the 24.10. YouTube xruns).
+    pub(crate) wrote_at: AtomicU64,
     /// Bumped by `drop_pending`: the mixer then forgets the filter history.
     pub(crate) reset_gen: AtomicU64,
     pub(crate) space: WaitQueue,
@@ -138,6 +141,7 @@ impl Client {
             consumed: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
             silence: AtomicU64::new(0),
+            wrote_at: AtomicU64::new(0),
             reset_gen: AtomicU64::new(0),
             space: WaitQueue::new(),
             done: WaitQueue::new(),
@@ -203,6 +207,7 @@ impl Playback {
                 break;
             }
         }
+        self.wrote(done);
         Ok(done * 2 * ch)
     }
 
@@ -219,7 +224,14 @@ impl Playback {
                 break;
             }
         }
+        self.wrote(done);
         Ok(done)
+    }
+
+    fn wrote(&self, frames: usize) {
+        if frames > 0 {
+            self.0.wrote_at.store(self.0.shared.now(), Ordering::Release);
+        }
     }
 
     fn writable(&self) -> Result<(), SndError> {
@@ -338,7 +350,8 @@ impl Playback {
         ring + filt + out * c.fmt.rate as u64 / resample::OUT_RATE as u64
     }
 
-    /// Per-channel Q15 gain (`UNITY` = 0 dB); values above unity are clamped.
+    /// Per-channel Q15 gain (`UNITY` = 0 dB); values above unity are clamped. Only tests set it today: the hook
+    /// for a later per-application volume (C1, CONTRACTS §7a).
     pub fn set_volume(&self, g: [u32; 2]) {
         for (a, v) in self.0.gain.iter().zip(g) {
             a.store(v.min(UNITY), Ordering::Release);

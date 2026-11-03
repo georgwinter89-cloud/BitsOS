@@ -1,0 +1,66 @@
+#!/bin/sh
+# GM-1a: starts a program of the Mesa tree (scripts/stage-v2.sh) with the tree's own glibc loader, libraries and
+# driver manifests. Every path comes from where this script lies, so the tree works wherever it is copied
+# (\BITSOS2\mesa\ on the stick, the stage directory on the host).
+#   run PROGRAM [ARGS]   a program of bin/ (vulkaninfo, vkcube, eglinfo, eglgears_wayland, es2gears_wayland) or a path
+#   run --check          every library of the tree resolves inside the tree; says the drivers and render nodes
+#   MESA_VK_DRIVERS="radeon_icd"   only these Vulkan drivers of the tree (default: lvp_icd radeon_icd)
+# The programs are started through the tree's loader, not their PT_INTERP: V2's /usr/lib loader belongs to the
+# initramfs glibc, which must never meet the tree's libc.so.6. Without /dev/dri only the software drivers work
+# (llvmpipe for GL/EGL, lavapipe for Vulkan); RADV and radeonsi find no device and step aside.
+T=$(cd "$(dirname "$0")" && pwd)
+L=$T/lib
+LD=$L/ld-linux-x86-64.so.2
+ICD=$T/share/vulkan/icd.d
+export LD_LIBRARY_PATH="$L"
+# VK_DRIVER_FILES is the loader's name since 1.3.207; VK_ICD_FILENAMES the older one (both: the same list).
+# MESA_VK_DRIVERS picks the tree's drivers by name (lvp_icd, radeon_icd; default both), never a path outside it.
+VK_DRIVER_FILES=
+for d in ${MESA_VK_DRIVERS:-lvp_icd radeon_icd}; do
+  case $d in */*|.*) echo "mesa: MESA_VK_DRIVERS: '$d' is not a driver name of the tree" >&2; exit 2 ;; esac
+  VK_DRIVER_FILES="$VK_DRIVER_FILES${VK_DRIVER_FILES:+:}$ICD/$d.json"
+done
+export VK_DRIVER_FILES
+export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+# Layers only from the tree (it has none): a host's implicit layers (Mesa's device_select, anti_lag) would load the
+# host's libraries next to the tree's glibc.
+export VK_IMPLICIT_LAYER_PATH="$T/share/vulkan/implicit_layer.d"
+export VK_LAYER_PATH="$T/share/vulkan/explicit_layer.d"
+export __EGL_VENDOR_LIBRARY_FILENAMES="$T/share/glvnd/egl_vendor.d/50_mesa.json"
+export LIBGL_DRIVERS_PATH="$L/dri"
+export GBM_BACKENDS_PATH="$L/gbm"
+export DRIRC_CONFIGDIR="$T/share/drirc.d"
+# libdrm_amdgpu (2.4.134) looks for amdgpu.ids in each directory of this list before its built-in /usr/share/libdrm
+# (V2 has no /usr/share); the tree's own directory comes first, a caller's list after it.
+export AMDGPU_ASIC_ID_TABLE_PATHS="$T/share/libdrm${AMDGPU_ASIC_ID_TABLE_PATHS:+:$AMDGPU_ASIC_ID_TABLE_PATHS}"
+
+say() { echo "mesa: $*"; }
+
+check() {
+  rc=0 n=0
+  for f in "$T"/bin/* "$L"/*.so* "$L"/gbm/* "$L"/dri/*; do
+    [ "$f" != "$LD" ] || continue
+    out=$("$LD" --inhibit-cache --library-path "$L" --list "$f" 2>&1) || { say "${f#"$T"/}: the loader failed: $out"; rc=1; continue; }
+    miss=$(echo "$out" | grep "not found")
+    [ -z "$miss" ] || { say "${f#"$T"/}: missing $(echo "$miss" | sed 's/^[[:space:]]*//; s/ =>.*//' | tr '\n' ' ')"; rc=1; }
+    n=$((n + 1))
+  done
+  [ $rc != 0 ] || say "libraries: $n programs and libraries resolve inside $L"
+  for j in "$ICD"/*.json "$__EGL_VENDOR_LIBRARY_FILENAMES"; do
+    so=$(sed -n 's/.*"library_path" *: *"\([^"]*\)".*/\1/p' "$j")
+    if [ -f "$L/$so" ]; then say "driver ${j##*/}: $so"; else say "driver ${j##*/}: $so is missing"; rc=1; fi
+  done
+  if [ -d /dev/dri ]; then say "render nodes: $(ls /dev/dri | tr '\n' ' ')"
+  else say "render nodes: none (/dev/dri missing): software drivers only (llvmpipe, lavapipe)"; fi
+  return $rc
+}
+
+case $1 in
+  ''|-h|--help) sed -n '5,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --check) check; exit ;;
+  */*) P=$1 ;;
+  *) P=$T/bin/$1 ;;
+esac
+shift
+[ -f "$P" ] || { say "no program $P"; exit 127; }
+exec "$LD" --inhibit-cache --library-path "$L" --argv0 "$P" "$P" "$@"

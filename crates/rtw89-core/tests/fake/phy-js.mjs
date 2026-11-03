@@ -12,7 +12,7 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-const WZ = process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan';
+const WZ = process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`;
 const imp = (rel) => import(pathToFileURL(`${WZ}/${rel}`).href);
 const { FakeDev, R, BB, prep, field, RtwError } = await imp('kit/rtwdev.mjs');
 const { phyMask32, phyR32Mask } = await imp('kit/phyio.mjs');

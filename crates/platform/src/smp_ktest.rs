@@ -23,6 +23,8 @@ ktest!("cp.smp.ap_registers", Safe, ap_registers);
 ktest!("cp.smp.mtrr", Safe, mtrr);
 ktest!("cp.smp.mtrr_copy", QemuOnly, mtrr_copy);
 ktest!("cp.smp.ipi_every_cpu", Safe, ipi_every_cpu);
+// INT-W21 (AB-16 CR): every CPU runs with a null LDTR (BSP, APs, and the kernel after a Reload).
+ktest!("cp.entry.ldtr_null", Safe, ldtr_null);
 ktest!("cp.smp.call_every_cpu", Safe, call_every_cpu);
 ktest!("cp.smp.percpu", Safe, percpu_values);
 ktest!("cp.smp.ist_stacks", Safe, ist_stacks);
@@ -534,6 +536,18 @@ fn tsc_offsets_hardware() -> R {
         let r = o.up.iter().find(|r| r.cpu as usize == c).ok_or_else(|| format!("cpu {c}: no record"))?;
         let t = r.tsc.ok_or_else(|| format!("cpu {c}: no TSC round came back"))?;
         kassert!(t.magnitude() <= crate::tsc::CHECK_TICKS, "cpu {c}: TSC offset {} ticks (best {}, rtt {}, TSC_ADJUST {:?})", t.median, t.best, t.min_rtt, r.tsc_adjust);
+    }
+    Ok(())
+}
+
+fn read_ldtr(_: u64) -> u64 {
+    hal::gdt::ldtr() as u64
+}
+
+fn ldtr_null() -> R {
+    for c in 0..percpu::cpu_count() {
+        let sel = call(c, read_ldtr, 0)?;
+        kassert!(sel == 0, "cpu {c}: LDTR selector {sel:#x}, wanted the null selector (lldt 0 in gdt::load)");
     }
     Ok(())
 }

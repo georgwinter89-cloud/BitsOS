@@ -222,11 +222,11 @@ mod tests {
         let mut v = Values::default();
         let i = ini(&v);
         assert!(i.contains("initial-color-theme=dark"));
-        assert_eq!(get(&i, "colors-dark", "background"), "131c26");
-        assert_eq!(get(&i, "colors-dark", "foreground"), "e6edf3");
-        assert_eq!(get(&i, "colors-dark", "cursor"), "131c26 00e5ff");
-        assert_eq!(get(&i, "colors-light", "background"), "ffffff");
-        assert_eq!(get(&i, "colors-light", "foreground"), "101820");
+        assert_eq!(get(&i, "colors-dark", "background"), "1b2520");
+        assert_eq!(get(&i, "colors-dark", "foreground"), "e8eee9");
+        assert_eq!(get(&i, "colors-dark", "cursor"), "1b2520 7fcfa0");
+        assert_eq!(get(&i, "colors-light", "background"), "fbfcfa");
+        assert_eq!(get(&i, "colors-light", "foreground"), "15201a");
         assert_eq!(get(&i, "colors-light", "regular1"), ANSI_LIGHT[1]);
         assert_eq!(get(&i, "colors-dark", "bright7"), ANSI_DARK[15]);
         v.set("theme.mode", "light");
@@ -234,7 +234,7 @@ mod tests {
         v.set("theme.dark.paper", "#202020");
         let i = ini(&v);
         assert!(i.contains("initial-color-theme=light"));
-        assert_eq!(get(&i, "colors-light", "cursor"), "ffffff ffb020");
+        assert_eq!(get(&i, "colors-light", "cursor"), "fbfcfa ffb020");
         assert_eq!(get(&i, "colors-dark", "background"), "202020");
     }
 

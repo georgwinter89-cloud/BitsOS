@@ -16,3 +16,10 @@ ktest = { path = "../ktest" }
 sched = { path = "../sched" }
 time = { path = "../time" }
 uapi = { path = "../uapi" }
+zeroize = { version = "=1.9.1", default-features = false }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+policy = { path = "../policy" }

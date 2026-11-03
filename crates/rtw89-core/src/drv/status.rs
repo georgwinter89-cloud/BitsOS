@@ -137,13 +137,14 @@ impl Status {
                 st.rx_frames, st.rx_bytes, st.tx_frames, st.tx_bytes, st.tx_dropped, st.rx_dropped
             ),
             format!(
-                "joins={} join_failures={} link_losses={} chip_restarts={} fw_repaired={} rx_unavailable={}",
+                "joins={} join_failures={} link_losses={} chip_restarts={} fw_repaired={} rx_unavailable={} rx_idle={}",
                 st.joins,
                 st.join_failures,
                 st.link_losses,
                 st.restarts,
                 st.fw_repaired,
-                st.rx_unavailable
+                st.rx_unavailable,
+                st.rx_idle
             ),
             format!("last_error={}", opt(self.last_error.clone())),
         ]

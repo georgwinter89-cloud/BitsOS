@@ -67,6 +67,18 @@ impl Step {
     pub fn declared(&self) -> bool {
         matches!(self, Step::FadtIo { .. } | Step::FadtCf9 { .. } | Step::FadtMem { .. } | Step::Kbc { declared: true })
     }
+    /// RB-17: the crumb left right before this step's reset write, so the next start knows which write reset
+    /// the machine. The triple fault writes nothing and leaves none.
+    pub fn crumb(&self) -> Option<klog::crumb::Stage> {
+        use klog::crumb::Stage;
+        Some(match *self {
+            Step::FadtIo { .. } | Step::FadtCf9 { .. } | Step::FadtMem { .. } => Stage::ResetFadt,
+            Step::Cf9 { code } if code == hal::cpu::reset::CF9_CODE_FULL => Stage::ResetCf9Full,
+            Step::Cf9 { .. } => Stage::ResetCf9Hard,
+            Step::Kbc { .. } => Stage::ResetKbc,
+            Step::TripleFault => return None,
+        })
+    }
 }
 
 /// The reset paths in order, and the ones this machine does not offer (with why).
@@ -173,6 +185,9 @@ pub fn reboot(plan: &RebootPlan, wait: &dyn Fn(u64)) -> ! {
         klog::event!(Info, "power", "reboot.step", n = i + 1, method = what.as_str());
         if matches!(s, Step::TripleFault) {
             klog::flush_emergency();
+        }
+        if let Some(c) = s.crumb() {
+            klog::crumb::leave(c, "reboot");
         }
         if !try_step(s) {
             klog::event!(Warn, "power", "reboot.refused", method = what.as_str(); "the register guard or port check refused this path");
@@ -454,6 +469,20 @@ mod tests {
         assert_eq!(reboot_plan(Some(&f)).steps[0], Step::FadtMem { addr: 0xFED8_0000, value: 0xE });
         f.reset = Some(ResetReg { reg: Gas { space: Space::PciConfig, bit_width: 8, bit_offset: 0, access_size: 1, address: 0x1_0000 }, value: 1 });
         assert_eq!(reboot_plan(Some(&f)).steps[0], HARD, "PCI config space reset register: skipped");
+    }
+
+    #[test]
+    fn reset_writes_leave_their_crumbs() {
+        use klog::crumb::Stage;
+        let mut f = minipc();
+        f.reset = Some(ResetReg { reg: Gas { space: Space::Io, bit_width: 8, bit_offset: 0, access_size: 1, address: 0xCF9 }, value: 6 });
+        f.boot_arch |= boot_arch::I8042;
+        let crumbs: alloc::vec::Vec<_> = reboot_plan(Some(&f)).steps.iter().map(Step::crumb).collect();
+        assert_eq!(
+            crumbs,
+            alloc::vec![Some(Stage::ResetFadt), Some(Stage::ResetCf9Hard), Some(Stage::ResetCf9Full), Some(Stage::ResetKbc), None]
+        );
+        assert!(crumbs.iter().flatten().all(|c| c.ends_a_shutdown()), "every reset crumb ends a shutdown");
     }
 
     #[test]

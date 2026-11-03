@@ -20,7 +20,7 @@ pub const DEFAULT_SOCKET: &str = "/run/bitsos/settings.sock";
 /// A CLI tool of class Normal: every answer is waited for at most this long (B4: no unbounded wait).
 const TIMEOUT: Duration = Duration::from_secs(10);
 const ANSWER_MAX: u64 = 1 << 20;
-const SUN_PATH: usize = 108;
+pub(crate) const SUN_PATH: usize = 108;
 
 pub struct Settings {
     pub socket: PathBuf,

@@ -94,6 +94,7 @@ fn mkfs_volume_journal_replays_clean() {
 
 #[test]
 fn mkfs_cut_leaves_nothing_mountable_or_a_clean_volume() {
+    let _sync = shared_sync();
     let dev = MemDev::new(vec![0u8; 32 << 20]);
     dev.record();
     format(&dev, &opts_for(true)).unwrap();

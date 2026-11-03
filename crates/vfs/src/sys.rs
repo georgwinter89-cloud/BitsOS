@@ -3,7 +3,7 @@
 //! six raw arguments and returns the value or -errno, with Linux's argument checks and error order.
 
 use crate::abi::{self, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, MAX_RW_COUNT, PATH_MAX};
-use crate::fd::{FdTable, OpenFile};
+use crate::fd::{FdTable, FsState, OpenFile};
 use crate::inode::Cred;
 use crate::mount_ns::{MountNs, Path};
 use crate::ops::{self, Ctx};
@@ -11,6 +11,12 @@ use crate::Errno;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use uapi::errno::*;
+
+/// `UserMem::write_page`'s default (the page through a stack buffer and `write`), for implementers whose page has
+/// no frame (PF-6: `vfs-sys::ProcMem` with a heap page).
+pub fn write_page_through_stack<M: UserMem + ?Sized>(m: &M, addr: u64, page: &crate::pagecache::CachePage, off: usize, n: usize) -> usize {
+    crate::sys_page::through_stack(m, addr, page, off, n)
+}
 
 /// The calling program's memory.
 pub trait UserMem {
@@ -20,6 +26,35 @@ pub trait UserMem {
     fn write(&self, addr: u64, data: &[u8]) -> bool;
     /// A NUL-terminated string of fewer than `max` bytes: EFAULT, or ENAMETOOLONG without a NUL in `max`.
     fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno>;
+    /// PF-4: whether `write_page` copies straight from the page-cache frame to the program (then reads copy
+    /// page by page with no buffer); false (the default): reads gather pages into one buffer per user copy.
+    fn direct_page_copy(&self) -> bool {
+        false
+    }
+    /// PF-4: copies the `n` bytes of the cache page `page` from `off` (inside the page) to user memory at
+    /// `addr`; returns the bytes that reached it, fewer only on a fault: then exactly the bytes before the first
+    /// user page that faulted (Linux's short `copy_to_user`). Used when `direct_page_copy`; the default goes
+    /// through a stack buffer and `write` (the kernel's `vfs-sys::ProcMem` copies from the frame itself, PF-6).
+    fn write_page(&self, addr: u64, page: &crate::pagecache::CachePage, off: usize, n: usize) -> usize {
+        crate::sys_page::through_stack(self, addr, page, off, n)
+    }
+    /// PF-5: whether `write_page_nofault` copies (then a read with `direct_page_copy` copies cached pages to the
+    /// program inside a lockless read section); false (the default): such reads take the locked path.
+    fn nofault_page_copy(&self) -> bool {
+        false
+    }
+    /// PF-5: `write_page` (`page` None: `n` zero bytes) without handling a fault: it runs inside a read section
+    /// (no sleep), so a user page that is not present and writable ends the copy (Linux's
+    /// `copy_to_user_nofault` under `pagefault_disable`). Returns the bytes copied, exactly those before the
+    /// first user page it could not write; the read goes on from there on the locked path, which may fault.
+    fn write_page_nofault(&self, _addr: u64, _page: Option<&crate::pagecache::CachePage>, _off: usize, _n: usize) -> usize {
+        0
+    }
+    /// PF-4: `n` (at most a page) zero bytes to user memory at `addr` (a hole of a tmpfs file), counted as
+    /// `write_page` counts.
+    fn write_zeros(&self, addr: u64, n: usize) -> usize {
+        crate::sys_page::write_counted(self, addr, &crate::sys_page::ZEROS[..n.min(crate::frame::PAGE)])
+    }
     /// FS-4: whether the calling program is being ended (a kill; Linux `fatal_signal_pending`): poll/select/epoll
     /// waits end with EINTR, an epoll harvest too. The caller's process, also when a kernel thread makes the call
     /// for it (ktests).
@@ -32,8 +67,8 @@ pub trait UserMem {
         None
     }
     /// FS-4: whether a signal waits for its handler (Linux `signal_pending`): a wait that found no event ends
-    /// with EINTR (events first). False until AB-6 delivers signals to handlers (an EINTR for a signal that is
-    /// never delivered would make the program spin).
+    /// with EINTR (events first). The default (no process behind the call: host tests) says no; vfs-sys
+    /// answers for the calling thread.
     fn signal_pending(&self) -> bool {
         false
     }
@@ -53,6 +88,8 @@ pub trait UserMem {
 pub struct Sys<'a> {
     pub mem: &'a dyn UserMem,
     pub fds: &'a FdTable,
+    /// FS-16: the calling thread's cwd, root and umask (Linux `current->fs`), apart from its fd table.
+    pub fs: &'a FsState,
     pub ns: &'a Arc<MountNs>,
     pub cred: Cred,
     pub subject: policy::Subject,
@@ -208,9 +245,15 @@ fn fd_of(a: u64) -> Result<usize, Errno> {
 
 impl<'a> Sys<'a> {
     pub fn ctx(&self) -> Ctx<'a> {
-        let root = self.ns.root_path();
-        let cwd = self.fds.fs.cwd().unwrap_or_else(|| root.clone());
-        Ctx { ns: self.ns, root, cwd, cred: self.cred, umask: self.fds.fs.umask(), subject: self.subject }
+        let fs = self.fs;
+        // SX-3a: a state that comes from the view this one was copied from moves onto the copies first.
+        if MountNs::copies_exist() {
+            fs.enter(self.ns);
+        }
+        // SX-2: chroot's root; the cwd stays where it was (None = the view's root, also after a chroot).
+        let root = fs.root().unwrap_or_else(|| self.ns.root_path());
+        let cwd = fs.cwd().unwrap_or_else(|| self.ns.root_path());
+        Ctx { ns: self.ns, root, cwd, cred: self.cred, umask: fs.umask(), subject: self.subject }
     }
     /// A path argument (`getname`): EFAULT, ENAMETOOLONG at PATH_MAX, ENOENT when empty unless allowed.
     pub(crate) fn path(&self, ptr: u64, allow_empty: bool) -> Result<Vec<u8>, Errno> {
@@ -336,7 +379,10 @@ pub(crate) fn file_read(s: &Sys<'_>, f: &OpenFile, buf: u64, count: u64) -> Resu
     }
     f.with_pos(|pos| {
         let start = *pos;
-        let r = read_into(s, buf, count, |off, chunk| f.file.read_at(start + off as u64, chunk));
+        let r = match f.file.read_cache() {
+            Some(c) => crate::sys_page::read_cached(s, c, buf, count, start),
+            None => read_into(s, buf, count, |off, chunk| f.file.read_at(start + off as u64, chunk)),
+        };
         if let Ok(n) = r {
             *pos = start + n as u64;
         }
@@ -403,7 +449,11 @@ pub fn pread64(s: &Sys<'_>, a: Args) -> i64 {
         if !access_ok(a[1], a[2]) {
             return Err(EFAULT);
         }
-        notify_rw(&f, read_into(s, a[1], a[2], |done, chunk| f.pread(off as u64 + done as u64, chunk)), false)
+        let r = match f.file.read_cache() {
+            Some(c) => crate::sys_page::read_cached(s, c, a[1], a[2], off as u64),
+            None => read_into(s, a[1], a[2], |done, chunk| f.pread(off as u64 + done as u64, chunk)),
+        };
+        notify_rw(&f, r, false)
     })())
 }
 
@@ -414,7 +464,8 @@ pub fn pwrite64(s: &Sys<'_>, a: Args) -> i64 {
     }
     ret((|| {
         let f = s.file(a[0])?;
-        if !f.file.seekable() {
+        // FS-16: FMODE_PWRITE (`ksys_pwrite64`): seq_file files have none.
+        if !f.file.seekable() || !f.file.positional_write(f.can_write()) {
             return Err(ESPIPE);
         }
         if !f.can_write() {
@@ -611,7 +662,9 @@ pub fn dup(s: &Sys<'_>, a: Args) -> i64 {
     ret(s.raw(a[0]).and_then(|f| s.fds.install_flags(f, 0, false)).map(|fd| fd as i64))
 }
 
-fn dup3_inner(s: &Sys<'_>, old: u64, new: u64, flags: u64) -> Result<i64, Errno> {
+/// dup3 (`ksys_dup3`, linux-6.6/fs/file.c:1266): the new fd and the file it replaced, which the syscall glue
+/// `filp_close`s (POSIX locks) and drops. The look-up of `old` and the install are one table step (`dup_to`).
+pub fn dup3_take(s: &Sys<'_>, old: u64, new: u64, flags: u64) -> Result<(i64, Option<Arc<OpenFile>>), Errno> {
     if flags & !abi::O_CLOEXEC != 0 {
         return Err(EINVAL);
     }
@@ -619,23 +672,24 @@ fn dup3_inner(s: &Sys<'_>, old: u64, new: u64, flags: u64) -> Result<i64, Errno>
         return Err(EINVAL);
     }
     let n = fd_of(new)?;
-    if n >= s.fds.limit() {
-        return Err(EBADF);
+    let replaced = s.fds.dup_to(fd_of(old)?, n, flags & abi::O_CLOEXEC != 0)?;
+    Ok((n as i64, replaced))
+}
+
+/// dup2 (`ksys_dup2`): dup2(fd, fd) answers fd when it is open and replaces nothing; else dup3 without flags.
+pub fn dup2_take(s: &Sys<'_>, old: u64, new: u64) -> Result<(i64, Option<Arc<OpenFile>>), Errno> {
+    if old as u32 == new as u32 {
+        return s.raw(old).map(|_| (new as u32 as i64, None));
     }
-    let f = s.raw(old)?;
-    s.fds.install_at_flags(n, f, flags & abi::O_CLOEXEC != 0)?;
-    Ok(n as i64)
+    dup3_take(s, old, new, 0)
 }
 
 pub fn dup2(s: &Sys<'_>, a: Args) -> i64 {
-    if a[0] as u32 == a[1] as u32 {
-        return ret(s.raw(a[0]).map(|_| a[1] as u32 as i64));
-    }
-    ret(dup3_inner(s, a[0], a[1], 0))
+    ret(dup2_take(s, a[0], a[1]).map(|(fd, _)| fd))
 }
 
 pub fn dup3(s: &Sys<'_>, a: Args) -> i64 {
-    ret(dup3_inner(s, a[0], a[1], a[2]))
+    ret(dup3_take(s, a[0], a[1], a[2]).map(|(fd, _)| fd))
 }
 
 pub fn fcntl(s: &Sys<'_>, a: Args) -> i64 {
@@ -759,7 +813,8 @@ pub(crate) fn at_lookup(s: &Sys<'_>, dirfd: u64, path: u64, flags: u64, follow_d
 }
 
 fn put_stat(s: &Sys<'_>, buf: u64, a: &abi::Attr) -> Result<i64, Errno> {
-    s.copy_out(buf, &abi::stat_bytes(a)).map(|_| 0)
+    let (uid, gid) = crate::inode::id_view(a.uid, a.gid);
+    s.copy_out(buf, &abi::stat_bytes(&abi::Attr { uid, gid, ..*a })).map(|_| 0)
 }
 
 pub fn stat(s: &Sys<'_>, a: Args) -> i64 {
@@ -812,7 +867,8 @@ pub fn statx(s: &Sys<'_>, a: Args) -> i64 {
                 at_lookup(s, a[0], a[1], flags, true)?.attr()
             }
         };
-        s.copy_out(a[4], &abi::statx_bytes(&attr, mask)).map(|_| 0)
+        let (uid, gid) = crate::inode::id_view(attr.uid, attr.gid);
+        s.copy_out(a[4], &abi::statx_bytes(&abi::Attr { uid, gid, ..attr }, mask)).map(|_| 0)
     })())
 }
 
@@ -833,10 +889,12 @@ fn do_access(s: &Sys<'_>, dirfd: u64, path: u64, mode: u64, flags: u64) -> Resul
     if mode as u32 & abi::X_OK != 0 && m.file_type() == uapi::S_IFREG && p.noexec() {
         return Err(EACCES);
     }
-    if mode as u32 & abi::W_OK != 0 && p.mnt.readonly && matches!(m.file_type(), uapi::S_IFREG | uapi::S_IFDIR | uapi::S_IFLNK) {
+    if mode as u32 & abi::W_OK != 0 && p.mnt.is_readonly() && matches!(m.file_type(), uapi::S_IFREG | uapi::S_IFDIR | uapi::S_IFLNK) {
         return Err(EROFS);
     }
-    m.permission(s.cred, mode as u32).map(|_| 0)
+    // AT_EACCESS: the effective credentials as they are (Linux skips `access_override_creds`).
+    let how = if flags & abi::AT_EACCESS != 0 { 0 } else { crate::inode::MAY_ACCESS };
+    p.dentry.inode.permission(s.cred, mode as u32 | how).map(|_| 0)
 }
 
 pub fn access(s: &Sys<'_>, a: Args) -> i64 {
@@ -949,9 +1007,12 @@ fn do_link(s: &Sys<'_>, od: u64, op: u64, nd: u64, np: u64, flags: u64) -> Resul
     if flags & !(abi::AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
-    // AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH; without it Linux answers ENOENT for the empty name.
-    let allow_empty = flags & AT_EMPTY_PATH != 0 && s.cred.uid == 0;
-    let o = s.path(op, allow_empty)?;
+    // AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH: without it Linux answers ENOENT before it reads any name, also for
+    // a name that is not empty (linux-6.6/fs/namei.c:4648).
+    if flags & AT_EMPTY_PATH != 0 && s.cred.uid != 0 {
+        return Err(ENOENT);
+    }
+    let o = s.path(op, flags & AT_EMPTY_PATH != 0)?;
     let old = if o.is_empty() {
         s.empty_target(od)?
     } else {
@@ -1090,7 +1151,7 @@ pub fn getcwd(s: &Sys<'_>, a: Args) -> i64 {
             Some(p) => p,
             None => {
                 let mut v = b"(unreachable)".to_vec();
-                v.extend_from_slice(&c.cwd.dentry.path_in_fs().concat());
+                v.extend_from_slice(&crate::mount_ns::path_to_top(&c.cwd));
                 v
             }
         };
@@ -1110,7 +1171,7 @@ pub fn chdir(s: &Sys<'_>, a: Args) -> i64 {
     ret((|| {
         let p = s.path(a[0], false)?;
         let t = s.ctx().chdir_target(None, &p)?;
-        s.fds.fs.set_cwd(t);
+        s.fs.set_cwd(t);
         Ok(0)
     })())
 }
@@ -1120,13 +1181,13 @@ pub fn fchdir(s: &Sys<'_>, a: Args) -> i64 {
         let f = s.raw(a[0])?;
         let p = f.path.clone().ok_or(ENOTDIR)?;
         Ctx::dir_usable(&p, s.cred)?;
-        s.fds.fs.set_cwd(p);
+        s.fs.set_cwd(p);
         Ok(0)
     })())
 }
 
 pub fn umask(s: &Sys<'_>, a: Args) -> i64 {
-    s.fds.fs.set_umask(a[0] as u32 & 0o777) as i64
+    s.fs.set_umask(a[0] as u32 & 0o777) as i64
 }
 
 // ---- pipes, FIFOs, eventfd (FS-3) -----------------------------------------------------------------------

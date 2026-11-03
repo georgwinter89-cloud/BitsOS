@@ -6,3 +6,6 @@ description = "Trusted base: CPU, paging primitives, port/MMIO, per-CPU, entry s
 
 [dependencies]
 bootinfo = { path = "../bootinfo" }
+
+[lints]
+workspace = true

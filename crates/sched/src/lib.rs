@@ -51,13 +51,19 @@ mod attr_ktests;
 mod balance;
 mod cpus;
 pub mod cputime;
+pub mod cstate;
+mod cstate_ktests;
+#[cfg(bitsos_fd_measure)]
+pub use cpus::prof_kick;
 pub mod futex;
+pub mod ntsync;
 mod guard;
 mod idle;
 pub mod interactive;
 mod interactive_ktests;
 mod ktests;
 mod lock_ktests;
+mod lock_stats_ktests;
 pub mod pi;
 mod pi_ktests;
 pub mod place;
@@ -317,10 +323,6 @@ impl Thread {
     pub fn class(&self) -> Class {
         Class::from_u8(self.class.load(Ordering::Relaxed))
     }
-    /// The class it was spawned with.
-    pub fn base_class(&self) -> Class {
-        self.base
-    }
     /// Its thread group (the tgid for a user thread, 0 for a kernel thread).
     pub fn group(&self) -> u64 {
         self.group.load(Ordering::Relaxed)
@@ -434,6 +436,7 @@ pub fn init() {
     ksync::lockdep::prepare_irq_context();
     let vector = cpus::register_resched();
     timers::init(cs);
+    cstate::init();
     match spawn_inner("idle/0", Class::Background, SpawnOpts::default(), 0, Box::new(|| {
         idle::idle_loop(0);
     }), Some(cs.cpu)) {
@@ -517,6 +520,7 @@ fn ap_entry(cpu: usize) -> ! {
     t.set_exec_start(now);
     let Some(cs) = cpus::of(cpu) else { park(cpu, "no per-CPU state") };
     timers::init_cpu(cs);
+    cstate::check_cpu(cs);
     if let Some(topo) = hal::smp::topology(cpu) {
         let _ = cs.topo.get_or_init(|| topo);
     }
@@ -892,11 +896,6 @@ pub fn irq_exit_preempt(interrupted_if: bool) -> bool {
 }
 klog::counter!(PREEMPTIONS, "sched.irq_preemptions");
 
-/// Keeps the caller on its CPU and unpreempted (by `irq_exit_preempt`) while the guard lives.
-pub fn preempt_disable() -> ksync::PreemptGuard {
-    ksync::PreemptGuard::new()
-}
-
 /// Sleeps at least `ns` nanoseconds (ended by the sleep timer, `timers`; costs nothing while asleep).
 pub fn sleep_ns(ns: u64) {
     let until = time::now_ns().saturating_add(ns);
@@ -915,27 +914,6 @@ pub fn sleep_ms(ms: u64) {
     sleep_ns(ms.saturating_mul(1_000_000))
 }
 
-/// Sets the calling thread's KernelRt priority (1..=99; it matters only for KernelRt threads). It applies at
-/// once: a thread that lowers itself below a waiting KernelRt thread of its CPU gives way (Linux
-/// `sched_setscheduler`). Only the caller can change its own priority, and a running thread is in no queue, so
-/// nothing has to be requeued; raising it needs no check (it runs already).
-pub fn set_rt_priority(prio: u8) {
-    let Some(t) = current_thread() else { return };
-    let p = prio.clamp(1, RT_PRIO_MAX);
-    let old = t.rt_prio.swap(p, Ordering::Relaxed);
-    if t.class() != Class::KernelRt || !STARTED.load(Ordering::Acquire) {
-        return;
-    }
-    let _irq = hal::cpu::IrqGuard::new();
-    let cs = cpus::this();
-    cs.curr_prio.store(p, Ordering::Relaxed);
-    drop(t);
-    if p < old && !hal::percpu::in_hard_irq() && ksync::preempt_count() == 0 && cs.rq.lock().best_rt_prio().is_some_and(|b| b > p) {
-        // A refused switch was rolled back: the caller runs on and gives way at its next preemption point.
-        cs.need_resched.store(true, Ordering::Relaxed);
-        let _ = run::schedule(Leave::Preempt);
-    }
-}
 
 /// Pins the calling thread to `cpu` (None: free again) and moves it there. False if `cpu` is not online.
 pub fn pin_current(cpu: Option<usize>) -> bool {

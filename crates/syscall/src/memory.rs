@@ -27,9 +27,12 @@ fn sys_mmap(c: &mut SysCtx<'_>) -> i64 {
         if flags & 0x4_0000 != 0 {
             return -EINVAL; // MAP_HUGETLB
         }
-        // MM-5b: a registered device file (fbdev, GPU surfaces) maps through its fault hook.
-        if let Some(map) = mm::device::lookup(&f) {
-            return c.proc.mm.sys_mmap_device(addr, len, prot, flags, off, &f, &map).map(|a| a as i64).unwrap_or_else(|e| -e);
+        // MM-5b: a registered device file (fbdev, GPU surfaces) maps through its fault hook; DR-6 (CR-DR6-1): a
+        // file whose memory depends on the offset (a render node's GEM objects) answers for the range.
+        match mm::device::lookup_at(&f, off >> 12, len.div_ceil(4096)) {
+            Some(Ok(map)) => return c.proc.mm.sys_mmap_device(addr, len, prot, flags, off, &f, &map).map(|a| a as i64).unwrap_or_else(|e| -e),
+            Some(Err(e)) => return -e,
+            None => {}
         }
         let r = c.proc.mm.sys_mmap_file(addr, len, prot, flags, off, &mut |len| vfs::mmap::check(&f, prot, flags, off >> 12, len));
         return r.map(|a| a as i64).unwrap_or_else(|e| -e);
@@ -135,9 +138,13 @@ fn sys_arch_prctl(c: &mut SysCtx<'_>) -> i64 {
             if c.args[1] >= hal::USER_TOP {
                 return -EPERM;
             }
+            // AB-10a: the selector becomes 0 as in `do_arch_prctl_64` (`loadseg(FS, 0)`), so a WoW64 thread that
+            // loaded a TLS selector and goes back to a 64-bit base keeps that base across context switches.
             if option == ARCH_SET_FS {
+                hal::entry::segs::clear_selector(false);
                 c.user.fs_base = c.args[1];
             } else {
+                hal::entry::segs::clear_selector(true);
                 c.user.gs_base = c.args[1];
             }
             0

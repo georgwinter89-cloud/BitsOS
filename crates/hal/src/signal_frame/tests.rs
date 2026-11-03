@@ -43,9 +43,23 @@ fn rflags_and_selectors() {
     assert_eq!(restored & 0x3000, 0, "IOPL never from the frame");
     assert!(selectors_ok(0x33, 0x2b, UC_STRICT_RESTORE_SS), "Linux user selectors");
     assert!(selectors_ok(crate::gdt::USER_CS, crate::gdt::USER_SS, UC_STRICT_RESTORE_SS), "V2's own");
+    // AB-10a: 32-bit code (0x23) comes back, and then its SS counts even without strict.
+    assert!(selectors_ok(0x23, 0x2b, 0));
+    assert!(selectors_ok(0x23, 0x2b, UC_STRICT_RESTORE_SS));
+    assert_eq!(selector_fault(0x23, 0x0f, 0), Some(0x0c), "an ldt SS under 32-bit code");
+    assert_eq!(selector_fault(0x23, 0, 0), Some(0), "a null SS under 32-bit code");
+    assert_eq!(selector_fault(0x1b, 0x2b, 0), Some(0x18), "V1's old data slot is no code segment");
+    assert_eq!(selector_fault(0x2b, 0x2b, 0), Some(0x28), "a data selector as CS");
+    assert_eq!(frame_uc_flags(0x33), UC_FP_XSTATE | UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS);
+    assert_eq!(frame_uc_flags(0x23), UC_FP_XSTATE | UC_SIGCONTEXT_SS);
     assert!(!selectors_ok(0x08, 0x2b, UC_STRICT_RESTORE_SS), "kernel CS refused");
     assert!(!selectors_ok(0x33, 0x10, UC_STRICT_RESTORE_SS), "kernel SS refused under strict");
     assert!(selectors_ok(0x33, 0x10, 0), "without strict, SS is not checked (forced valid)");
+    assert_eq!(selector_fault(0x0c, 0x2b, UC_STRICT_RESTORE_SS), Some(0x0c), "an ldt CS: its selector");
+    assert_eq!(selector_fault(0, 0x2b, UC_STRICT_RESTORE_SS), Some(0), "a null CS: #GP(0)");
+    assert_eq!(selector_fault(0x0c, 0xfff8, UC_STRICT_RESTORE_SS), Some(0x0c), "CS is checked before SS");
+    assert_eq!(selector_fault(0x33, 0xfffb, UC_STRICT_RESTORE_SS), Some(0xfff8), "a bad SS under strict");
+    assert_eq!(selector_fault(0x33, 0x2b, UC_STRICT_RESTORE_SS), None);
 }
 
 #[test]

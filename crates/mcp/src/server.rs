@@ -226,6 +226,16 @@ impl Shared {
     }
 }
 
+impl Shared {
+    /// MC-8a: the server's call machinery without a listener, for the gate (`/dev/bitsos/mcp`): workers,
+    /// deadlines, "Still running", `output`/`stop` over its own calls only. `cfg.addr` names the service's port.
+    pub(crate) fn headless(mut cfg: ServerConfig, env: Arc<dyn Env>, tools: &'static [ToolEntry], services: Option<Arc<crate::svc::Registry>>) -> Arc<Shared> {
+        cfg.conns = cfg.conns.max(MIN_CONNS);
+        let local = cfg.addr;
+        Arc::new(Shared { cfg, env, tools, stop: AtomicBool::new(false), threads: AtomicUsize::new(0), slots: SpinLock::named("mcp.slots", Vec::new()), local, pool: Pool::new(), calls: SpinLock::named("mcp.calls", Vec::new()), next_call: AtomicU64::new(1), services, svc_waiting: AtomicUsize::new(0) })
+    }
+}
+
 /// A running server. Dropping the handle leaves the server running; `stop` ends it.
 #[derive(Clone)]
 pub struct ServerHandle {
@@ -233,6 +243,10 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// MC-8a: the handle of a listener-less `Shared` (the gate's under `mcp=service`).
+    pub(crate) fn of(sh: Arc<Shared>) -> ServerHandle {
+        ServerHandle { sh }
+    }
     pub fn local(&self) -> SockAddr {
         self.sh.local
     }

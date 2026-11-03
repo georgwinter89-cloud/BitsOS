@@ -1,4 +1,5 @@
 #!/bin/bash
+# minipc: left the QEMU runs (Georg 30.10., CONTRACTS section 4); its checks run on the Mini-PC by the check list in plan/notes/yt-YT-4a.md
 # slow: YT-4a: Starboard's conformance suite nplb on V2 in QEMU (-smp 4, 4 GB, intel-hda + hda-duplex into a WAV
 # file: nothing plays on the host), its pass count against the recorded floor (nplb-floor.txt).
 # The image: `cargo xtask image` with V2_STICK_TREES=cobalt (the Cobalt tree in \BITSOS2\cobalt\), then nplb's stage

@@ -144,17 +144,19 @@ impl Meta {
 
     /// The lock was not taken after `before`/`before_try` (try failed, timeout).
     pub fn abandoned(&self, c: &'static LockClass, timeout: bool) {
+        let s = c.stats.here();
         if timeout {
-            c.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+            s.timeouts.fetch_add(1, Ordering::Relaxed);
         } else {
-            c.stats.try_failed.fetch_add(1, Ordering::Relaxed);
+            s.try_failed.fetch_add(1, Ordering::Relaxed);
         }
         Self::uncount_alloc(c);
     }
 
     /// The lock is taken; `wait_ticks` is Some when it had to wait.
     pub fn acquired(&self, c: &'static LockClass, addr: usize, kind: LockKind, wait_ticks: Option<u64>) -> Acq {
-        let s = &c.stats;
+        // PF-2: this CPU's slot of the class, so CPUs taking different locks of one class share no line.
+        let s = c.stats.here();
         s.acquired.fetch_add(1, Ordering::Relaxed);
         if let Some(w) = wait_ticks {
             s.contended.fetch_add(1, Ordering::Relaxed);
@@ -180,7 +182,7 @@ impl Meta {
     /// `unlock` stores the lock word, then the allocator count goes down.
     pub fn release(&self, a: Acq, addr: usize, unlock: impl FnOnce()) {
         let held = ticks().wrapping_sub(a.t0);
-        let s = &a.class.stats;
+        let s = a.class.stats.here();
         s.hold_ticks.fetch_add(held, Ordering::Relaxed);
         s.hold_max.fetch_max(held, Ordering::Relaxed);
         #[cfg(debug_assertions)]

@@ -36,7 +36,7 @@ fn settings() -> TestResult {
         let (c, out) = client(&sock, &["undo"])?;
         kassert!(c == 0, "undo exited {c}:\n{out}");
         let (c, out) = client(&sock, &["get", "theme.accent"])?;
-        kassert!(c == 0 && out.starts_with("#00e5ff"), "get after undo exited {c}:\n{out}");
+        kassert!(c == 0 && out.starts_with("#7fcfa0"), "get after undo exited {c}:\n{out}");
         let (c, out) = client(&sock, &["set", "wlan", "on"])?;
         kassert!(c == 1, "set wlan on exited {c} (want 1, an R8 switch is no key):\n{out}");
         kassert!(!d.p.has_exited(), "settingsd ended: {:?}\n{}", d.p.status(), d.both());

@@ -1,9 +1,9 @@
 //! AB-7b: the host and domain name (linux-6.6/kernel/sys.c `sethostname` :1343, `setdomainname` :1395,
-//! kernel/utsname_sysctl.c): one name pair for the whole system (V2 has no UTS namespaces), read by uname(2)
-//! and `/proc/sys/kernel/{hostname,domainname}`, changed by root through the two calls or those files.
+//! kernel/utsname_sysctl.c): read by uname(2) and `/proc/sys/kernel/{hostname,domainname}`, changed by root
+//! through the two calls or those files. SX-2: the pair is the calling process's UTS namespace's
+//! (`proc::ns::misc::UtsNs`; kernel threads and the boot use the initial one).
 
 use crate::SysCtx;
-use ksync::SpinLock;
 use uapi::errno::*;
 
 /// `__NEW_UTS_LEN`: the ABI's field size (65 bytes with the NUL).
@@ -20,31 +20,32 @@ const fn field(s: &str) -> [u8; UTS_LEN + 1] {
     f
 }
 
-/// (nodename, domainname), NUL-padded.
-static NAMES: SpinLock<[[u8; UTS_LEN + 1]; 2]> = SpinLock::named("ab.uts", [field("bitsos"), field("(none)")]);
+/// The UTS namespace of the calling process (the initial one outside a process).
+fn current_uts() -> alloc::sync::Arc<proc::ns::misc::UtsNs> {
+    proc::current().map_or_else(|| proc::ns::misc::init_uts().clone(), |p| p.nsset().uts.clone())
+}
 
 pub(crate) const HOST: usize = 0;
 pub(crate) const DOMAIN: usize = 1;
 
 /// One name up to its first NUL.
 pub(crate) fn name(which: usize) -> alloc::vec::Vec<u8> {
-    let f = NAMES.lock()[which];
+    let f = current_uts().names()[which & 1];
     let n = f.iter().position(|&b| b == 0).unwrap_or(UTS_LEN);
     f[..n].to_vec()
 }
 
 /// Sets a name (the caller checked privilege and length): the bytes, the rest zeroed (`memcpy` + `memset`).
 pub(crate) fn set(which: usize, v: &[u8]) {
-    let mut f = [0u8; UTS_LEN + 1];
     let n = v.len().min(UTS_LEN);
-    f[..n].copy_from_slice(&v[..n]);
-    NAMES.lock()[which] = f;
-    klog::event!(Info, "syscall", "uts.set", which = which, len = n);
+    let ns = current_uts();
+    ns.set(which, &v[..n]);
+    klog::event!(Info, "syscall", "uts.set", which = which, len = n, ns = ns.inum);
 }
 
 /// `struct new_utsname`: sysname, nodename, release, version, machine, domainname (65 bytes each).
 pub(crate) fn bytes() -> [u8; 390] {
-    let names = *NAMES.lock();
+    let names = current_uts().names();
     let mut b = [0u8; 390];
     let fixed = [field("Linux"), names[HOST], field(crate::info::RELEASE), field(crate::info::VERSION), field("x86_64"), names[DOMAIN]];
     for (i, f) in fixed.iter().enumerate() {
@@ -75,11 +76,12 @@ fn set_from_user(c: &mut SysCtx<'_>, which: usize) -> i64 {
     0
 }
 
-/// `ns_capable(uts_ns->user_ns, CAP_SYS_ADMIN)`: `proc::cred::capable` within the thread's bounding set (as
-/// `/proc/<pid>/status` shows it, AB-7a).
+/// `ns_capable(uts_ns->user_ns, CAP_SYS_ADMIN)` within the thread's bounding set (as `/proc/<pid>/status`
+/// shows it, AB-7a).
 pub(crate) fn sys_admin(c: &SysCtx<'_>) -> bool {
     use proc::cred::Cap;
-    c.proc.capable(Cap::SysAdmin) && c.thread.prctl().cap_bset() & (1u64 << Cap::SysAdmin as u32) != 0
+    let uts = c.proc.nsset().uts.clone();
+    proc::cred::ns_capable(&c.proc.cred(), &uts.user_ns, Cap::SysAdmin) && c.thread.prctl().cap_bset() & (1u64 << Cap::SysAdmin as u32) != 0
 }
 
 fn sys_sethostname(c: &mut SysCtx<'_>) -> i64 {

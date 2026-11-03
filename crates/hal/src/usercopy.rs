@@ -19,6 +19,12 @@
 //!   USER (+ WRITABLE for writes), copy through the direct map. `copy_to_user_force` (the loader writing
 //!   read-only text) always walks.
 //!
+//! PF-6 adds two counted copies to user memory for the file read path, both through the fast path only (0 when
+//! it is not open; never a walk, whose direct-map write needs the address-space lock and may alias a page-cache
+//! source): `copy_to_user_partial_raw` (the bytes before the first page that cannot be written, resolver
+//! included) and `copy_to_user_nofault[_raw]` (no resolver, no lock), each also from a raw kernel source so that
+//! mm-core can copy straight from a page-cache frame.
+//!
 //! A fault on the kernel side of a copy is a kernel bug and is not fixed up (the #PF fixup only accepts a fault
 //! address below `USER_TOP` at the copy instruction).
 
@@ -40,6 +46,7 @@ static FAST_FAULTS: AtomicU64 = AtomicU64::new(0);
 static RESOLVED: AtomicU64 = AtomicU64::new(0);
 static WALKS: AtomicU64 = AtomicU64::new(0);
 static HOOK_REPLACED: AtomicU64 = AtomicU64::new(0);
+static NOFAULT_SHORT: AtomicU64 = AtomicU64::new(0);
 
 /// Counters (rare events only; the fast path itself counts nothing).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,6 +62,9 @@ pub struct Stats {
     /// Copies that walked because another #PF hook had replaced the fixup (should stay 0; CP change request
     /// to call the fixup from `hal_kernel_trap` directly).
     pub hook_replaced: u64,
+    /// PF-6: no-fault copies a user page ended early (the caller's locked path then goes on; a program's own
+    /// buffer, so a count and no event). Only the short path counts.
+    pub nofault_short: u64,
 }
 
 pub fn stats() -> Stats {
@@ -64,6 +74,7 @@ pub fn stats() -> Stats {
         walks: WALKS.load(Ordering::Relaxed),
         fast_path: FIXUP_ON.load(Ordering::Acquire),
         hook_replaced: HOOK_REPLACED.load(Ordering::Relaxed),
+        nofault_short: NOFAULT_SHORT.load(Ordering::Relaxed),
     }
 }
 
@@ -144,6 +155,12 @@ enum Op {
 
 /// The fast copy with retries after the resolver. `user..user+len` is checked to lie below USER_TOP.
 fn fast(user: u64, len: usize, op: Op) -> Result<(), Efault> {
+    if fast_counted(user, len, op) == len { Ok(()) } else { Err(Efault) }
+}
+
+/// `fast` answering the bytes done: all of `len`, or those before the address the resolver could not make
+/// present (PF-6's partial copy).
+fn fast_counted(user: u64, len: usize, op: Op) -> usize {
     // The same gate as the entry's clac (true only when every CPU that ran init_syscall has CR4.SMAP, so
     // stac/clac cannot #UD here); `fast_ok` made sure the decision exists. Not `cpu::smap_enabled()`, which is
     // the last CPU's CR4.
@@ -163,27 +180,27 @@ fn fast(user: u64, len: usize, op: Op) -> Result<(), Efault> {
             Op::Zero => unsafe { imp::zero(u as *mut u8, n, smap) },
         };
         if left == 0 {
-            return Ok(());
+            return len;
         }
         done = len - left.min(len);
         FAST_FAULTS.fetch_add(1, Ordering::Relaxed);
         let at = user + done as u64;
         if at == last_fault {
-            return Err(Efault);
+            return done;
         }
         last_fault = at;
         let r = RESOLVER.load(Ordering::Acquire);
         if r == 0 {
-            return Err(Efault);
+            return done;
         }
         // SAFETY: only `set_fault_resolver` stores non-zero values, always a valid FaultResolver.
         let resolve: FaultResolver = unsafe { core::mem::transmute::<usize, FaultResolver>(r) };
         if !resolve(at, !matches!(op, Op::FromUser(_))) {
-            return Err(Efault);
+            return done;
         }
         RESOLVED.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(())
+    len
 }
 
 fn for_each_page(root: u64, addr: u64, len: usize, write: bool, mut f: impl FnMut(u64, usize, usize)) -> Result<(), Efault> {
@@ -232,6 +249,61 @@ pub fn copy_to_user(root: u64, dst: u64, src: &[u8]) -> Result<(), Efault> {
         // SAFETY: as copy_from_user, writable user frame.
         unsafe { core::ptr::copy_nonoverlapping(src[off..].as_ptr(), crate::phys_to_virt(pa) as *mut u8, n) }
     })
+}
+
+/// PF-6: `copy_to_user` with a partial count for the read path (Linux's short `copy_to_user`), through the fast
+/// path only: the bytes that reached user memory, all of `len` or exactly those before the first user page
+/// that cannot be written even after the fault resolver ran (the fast path's retries as `copy_to_user`). 0 for
+/// a range that leaves user space and when the fast path is not open for `root` (`fast_ok`: not the loaded,
+/// owned root, the fixup not first for #PF, SMAP not decided, a host build): the caller copies another way
+/// (MM's `copy_frames_to_user` through a kernel buffer and `copy_to_user`).
+///
+/// No page walk on purpose (PF-6 fixer): a walk writes through the direct map to the frame it found, which is
+/// sound only while the caller holds `root`'s address-space lock (a walker is no TLB holder, so an unmap
+/// does not wait for it), and the source may be a page-cache frame that is the very destination frame (a
+/// program reading a file into its own shared mapping of the same page). The fast path writes through the
+/// loaded root's user mapping, which an unmap shoots down and waits for, and its `rep movsb` is assembly, not a
+/// Rust copy, so a source that aliases the destination is only a byte copy onto itself.
+///
+/// # Safety
+/// `src` must be valid for reads of `len` bytes for the whole call (the caller keeps its source alive; a page
+/// that a program maps and writes meanwhile, even the destination itself, is allowed: the copy is a plain byte
+/// copy, never a Rust value). The resolver may sleep: not inside a grace section or under a spin lock.
+pub unsafe fn copy_to_user_partial_raw(root: u64, dst: u64, src: *const u8, len: usize) -> usize {
+    if len == 0 || check(dst, len).is_err() || !fast_ok(root) {
+        return 0;
+    }
+    fast_counted(dst, len, Op::ToUser(src))
+}
+
+/// PF-6: a copy to user memory that never handles a fault (Linux `copy_to_user_nofault`,
+/// linux-6.6/mm/maccess.c:221: `pagefault_disable` around `__copy_to_user_inatomic`): for a lockless reader
+/// inside a grace section, which must not sleep, take a lock or run the fault resolver. One `rep movsb` through
+/// the user mapping of the loaded `root`; a fault (a page not present or not writable) ends it at the exception
+/// fixup and the bytes before it count, exactly those before the first user page that cannot be written. 0 when
+/// the fast path is not open for `root` (not the loaded root, held lazily, the fixup not first for #PF, SMAP not
+/// decided, a kernel root, a host build): the caller's locked path does the copy. Takes no lock, never waits.
+///
+/// # Safety
+/// As `copy_to_user_partial_raw`.
+pub unsafe fn copy_to_user_nofault_raw(root: u64, dst: u64, src: *const u8, len: usize) -> usize {
+    if len == 0 || check(dst, len).is_err() || !fast_ok(root) {
+        return 0;
+    }
+    let smap = crate::entry::smap_all().unwrap_or(false);
+    // SAFETY: dst..dst+len is below USER_TOP (checked) in the loaded address space (`fast_ok`), whose faults the
+    // #PF fixup turns into a short count; src is valid for len bytes (the caller's contract).
+    let left = unsafe { imp::copy(dst as *mut u8, src, len, smap) };
+    if left != 0 {
+        NOFAULT_SHORT.fetch_add(1, Ordering::Relaxed);
+    }
+    len - left.min(len)
+}
+
+/// `copy_to_user_nofault_raw` from a kernel slice.
+pub fn copy_to_user_nofault(root: u64, dst: u64, src: &[u8]) -> usize {
+    // SAFETY: the slice is valid for its length for the whole call.
+    unsafe { copy_to_user_nofault_raw(root, dst, src.as_ptr(), src.len()) }
 }
 
 /// As `copy_to_user` but also into read-only user pages (program loading); still only USER pages. Always
@@ -425,5 +497,20 @@ mod tests {
     fn host_build_has_no_fast_path() {
         install_fixup();
         assert!(!stats().fast_path);
+    }
+
+    /// PF-6: without the fast path neither counted copy copies anything (the caller's locked path does it; the
+    /// partial copy never walks), and both refuse ranges outside user space before touching anything.
+    #[test]
+    fn counted_copies_refuse_what_they_cannot_do() {
+        let b = [1u8; 8];
+        assert_eq!(copy_to_user_nofault(0, 0x40_0000, &b), 0);
+        assert_eq!(copy_to_user_nofault(0, 0xFFFF_8880_0000_0000, &b), 0);
+        // SAFETY: `b` is valid for its 8 bytes for every call; a refused copy touches nothing.
+        let partial = |dst: u64, n: usize| unsafe { copy_to_user_partial_raw(0, dst, b.as_ptr(), n) };
+        assert_eq!(partial(0xFFFF_8880_0000_0000, 8), 0);
+        assert_eq!(partial(u64::MAX - 3, 8), 0);
+        assert_eq!(partial(0x40_0000, 0), 0);
+        assert_eq!(partial(0x40_0000, 8), 0, "no walk without the fast path");
     }
 }

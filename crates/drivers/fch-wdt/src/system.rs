@@ -100,6 +100,53 @@ static REPORT: WaitQueue = WaitQueue::new();
 static REPORTER: AtomicBool = AtomicBool::new(false);
 static QUIESCE_REGISTERED: AtomicBool = AtomicBool::new(false);
 static HANG: AtomicU32 = AtomicU32::new(0);
+/// RB-14: `S5_RESET_STATUS` as this start read it (low 32 bits), `RESET_STATUS_READ` once read.
+static RESET_STATUS: AtomicU64 = AtomicU64::new(0);
+const RESET_STATUS_READ: u64 = 1 << 32;
+/// RB-16: the crumb range of this start's configuration (`crumb::base`; 0 = no store) and the crumb the
+/// previous start left in the count register (read before this start arms the chip).
+static CRUMB_BASE: AtomicU32 = AtomicU32::new(0);
+static PREVIOUS: Once<crate::crumb::Previous> = Once::new();
+
+/// RB-16: what the count register said at this start about the previous shutdown (None on the fake, before
+/// the start, without the FCH block).
+pub fn previous_crumb() -> Option<&'static crate::crumb::Previous> {
+    PREVIOUS.get()
+}
+
+/// RB-16: the first count of the crumb range (0: no keep store).
+pub fn crumb_base() -> u32 {
+    CRUMB_BASE.load(Ordering::Acquire)
+}
+
+/// The keep store (`klog::crumb::set_keep`): the system dog's count register.
+struct KeepStore;
+static KEEP_STORE: KeepStore = KeepStore;
+
+impl klog::crumb::Store for KeepStore {
+    fn leave(&self, c: &klog::crumb::Crumb<'_>) -> bool {
+        let Some(d) = SYSTEM.get() else { return false };
+        let Some(code) = crate::crumb::code(crate::crumb::id(c.stage, c.what), crumb_base()) else { return false };
+        d.crumb(code)
+    }
+    fn clear(&self) {
+        if let Some(d) = SYSTEM.get() {
+            d.restore_timeout();
+        }
+    }
+}
+
+/// RB-14: why the last start happened (`S5_RESET_STATUS` as this start read it; None before the watchdog's start,
+/// on a machine without the FCH block, and on the fake).
+pub fn reset_status() -> Option<u32> {
+    let v = RESET_STATUS.load(Ordering::Acquire);
+    (v & RESET_STATUS_READ != 0).then_some(v as u32)
+}
+
+/// RB-14: this start follows an AMD sync flood (for drivers that should be careful on such a start).
+pub fn after_sync_flood() -> bool {
+    reset_status().is_some_and(regs::is_sync_flood)
+}
 
 pub fn state() -> State {
     State::from(STATE.load(Ordering::Acquire))
@@ -282,8 +329,24 @@ fn boot_with(r: Box<dyn Regs>, cfg: Config) {
         mmio_en = pm4 & regs::PM4_MMIOEN != 0, fake = on_fake());
     if !on_fake() {
         let s5 = regs::s5_reset_status(&*r);
+        RESET_STATUS.store(s5 as u64 | RESET_STATUS_READ, Ordering::Release);
         klog::event!(Info, "watchdog", "reset_status", value = klog::Hex(s5 as u64), reasons = regs::s5_reset_reasons(s5).as_str();
             "FCH S5_RESET_STATUS: why the last start happened (sticky, not cleared)");
+        // RB-16: the count the previous start's last breadcrumb left (before `arm` overwrites it).
+        let prev = PREVIOUS.get_or_init(|| crate::crumb::Previous::read_with(st.count, crate::crumb::base(cfg.timeout_s, cfg.grace_s), st.was_running));
+        let text = prev.text();
+        klog::event!(Info, "watchdog", "last_crumb", count = prev.count, base = prev.base, found = prev.id.is_some(); "{}", text.as_str());
+        if regs::is_sync_flood(s5) {
+            // RB-14: the start after a flood is the one that died early on the Mini-PC (27.10.); said loudly so the
+            // journal and the mirror carry it, with the MCA records the boot CPU logged before (`cpu mca.record`).
+            // RB-16: with the step or device the previous shutdown had reached.
+            klog::event!(Warn, "watchdog", "after_sync_flood", value = klog::Hex(s5 as u64), reasons = regs::s5_reset_reasons(s5).as_str(),
+                last_crumb = text.as_str();
+                "the last start ended in an AMD sync flood (an uncorrected fabric error), not in the reset that was asked for");
+        } else if prev.incomplete() {
+            klog::event!(Warn, "watchdog", "shutdown_incomplete", last_crumb = text.as_str();
+                "the previous shutdown did not reach its reset (a hang or a cut inside it)");
+        }
     }
     if st.fired {
         klog::event!(Warn, "watchdog", "fired", control = klog::Hex(st.ctl as u64); "the last start ended by the watchdog (FIRED was set; now cleared)");
@@ -322,6 +385,9 @@ fn go(dog: &'static Dog, cfg: &Config) {
     }
     QUIESCED.store(false, Ordering::Release);
     set_state(State::Armed);
+    // RB-16: the count register keeps the breadcrumbs across the reset.
+    CRUMB_BASE.store(crate::crumb::base(cfg.timeout_s, cfg.grace_s), Ordering::Release);
+    klog::crumb::set_keep(&KEEP_STORE);
     if !REPORTER.swap(true, Ordering::AcqRel) {
         let opts = sched::SpawnOpts { rt_prio: 90, ..sched::SpawnOpts::default() };
         if sched::spawn_with("wdt.report", sched::Class::KernelRt, opts, reporter).is_err() {
@@ -331,8 +397,14 @@ fn go(dog: &'static Dog, cfg: &Config) {
     }
     if !QUIESCE_REGISTERED.swap(true, Ordering::AcqRel) {
         devmodel::register_quiesce(Arc::new(WdtQuiesce));
+        // RB-16: last of all (its grace covers everything before the reset), after the mirror's transport.
+        devmodel::set_place("fch-wdt", devmodel::Place::Final);
         static HOOK: fn() = after_failed_jump;
         kexec::tool::set_jump_failed_hook(&HOOK);
+        static BEFORE_JUMP: fn() = before_jump;
+        kexec::tool::set_before_jump_hook(&BEFORE_JUMP);
+        static PANIC: kexec::crash::WatchdogHook = panic_grace;
+        kexec::crash::set_watchdog_hook(&PANIC);
     }
     let t = TIMER.get_or_init(|| time::HrTimer::new(tick, 0));
     t.arm_in(PERIOD_NS);
@@ -478,8 +550,53 @@ impl devmodel::Quiesce for WdtQuiesce {
     }
     /// No lock, no log (the Reload path runs it with interrupts off and the other CPUs parked).
     fn quiesce(&self) {
-        quiesce_now(kexec::tool::reload_jumping());
+        if kexec::tool::reload_jumping() {
+            quiesce_for_jump();
+        } else {
+            quiesce_now(false);
+        }
     }
+}
+
+/// RB-17: set by a Reload's quiesce that holds the chip for the stop at the jump ([`stop_at_jump`]).
+static STOP_AT_JUMP: AtomicBool = AtomicBool::new(false);
+
+/// RB-17: a Reload's quiesce. With `watchdog_reload=grace` as [`quiesce_now`]. Otherwise the chip is held
+/// (no kicks, still counting) instead of stopped: a stopped chip keeps the count it stopped with, so the crumbs
+/// after this one (`reload_sweep`, `reload_jump`) would not reach the next start (on the Mini-PC it read this
+/// Quiesce's own crumb, `device fch-wdt`, after every Reload). kexec's before-jump hook stops it right after the
+/// `reload_jump` crumb. Until then a hang between here and the jump is reset by the crumbs' own counts (minutes);
+/// before RB-17 it stayed hung. Returns the state it left. No lock, no log.
+pub fn quiesce_for_jump() -> State {
+    if CONFIG.get().is_some_and(|c| c.reload_grace) {
+        return quiesce_now(true);
+    }
+    QUIESCED.store(true, Ordering::Release);
+    let Some(d) = SYSTEM.get() else { return state() };
+    if !d.armed() && state() != State::Armed {
+        return state();
+    }
+    if d.hold() {
+        STOP_AT_JUMP.store(true, Ordering::Release);
+        set_state(State::Grace);
+    } else {
+        d.stop();
+        set_state(State::Stopped);
+    }
+    state()
+}
+
+/// RB-17: kexec's hook right after the `reload_jump` crumb: the held chip stops, the count it reads is that
+/// crumb's. A no-op without a held chip (grace, a stop, no watchdog). Returns whether it stopped one. No lock,
+/// no log, no heap (interrupts off, the other CPUs halted).
+pub fn stop_at_jump() -> bool {
+    if !STOP_AT_JUMP.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    let Some(d) = SYSTEM.get() else { return false };
+    d.stop();
+    set_state(State::Stopped);
+    true
 }
 
 /// `reload`: true on a Reload's way out. Returns the state it left.
@@ -492,7 +609,7 @@ pub fn quiesce_now(reload: bool) -> State {
         return state();
     }
     if keep {
-        d.grace(grace);
+        let _ = d.grace(grace);
         set_state(State::Grace);
     } else {
         d.stop();
@@ -501,9 +618,13 @@ pub fn quiesce_now(reload: bool) -> State {
     state()
 }
 
+fn before_jump() {
+    stop_at_jump();
+}
+
 /// kexec's hook after a failed jump: devices quiesced, other CPUs halted. Armed without kicks so the reset
 /// brings the machine back. No lock (try_event only).
-fn after_failed_jump() {
+pub(crate) fn after_failed_jump() {
     let Some(d) = SYSTEM.get() else { return };
     if d.arm_unkicked().is_ok() {
         set_state(State::Grace);
@@ -511,11 +632,33 @@ fn after_failed_jump() {
     }
 }
 
+/// kexec's panic hook (RB-13): the chip counts from `secs` without kicks (the CPUs are stopped), so the panic's
+/// own reset, due earlier, comes first and the watchdog resets only if that one fails. Before RB-13 the 30 s
+/// timeout ran out during a 90 s `panic_delay` (27.10.). No lock (the dog's exclusive flag is tried), no heap,
+/// no log (the panic path logs the answer).
+pub(crate) fn panic_grace(secs: u32) -> kexec::crash::Watchdog {
+    let Some(d) = SYSTEM.get() else { return kexec::crash::Watchdog::Absent };
+    if !d.armed() && state() != State::Armed {
+        return kexec::crash::Watchdog::NotArmed;
+    }
+    let secs = secs.clamp(1, regs::MAX_SECONDS);
+    QUIESCED.store(true, Ordering::Release);
+    // RB-13 fixer: only a running chip that took the count is reported as counting (the record must not claim a
+    // safety net a stopped chip does not give).
+    if !d.grace(secs) {
+        set_state(State::Stopped);
+        return kexec::crash::Watchdog::NotArmed;
+    }
+    set_state(State::Grace);
+    kexec::crash::Watchdog::Grace { secs }
+}
+
 /// Arms the system dog again after a Quiesce (tests; a later `Quiesce::resume`).
 pub fn resume() -> Result<(), ChipError> {
     let Some(d) = SYSTEM.get() else { return Err(ChipError::NoChip) };
     let cfg = CONFIG.get().copied().unwrap_or_else(|| read_config().0);
     d.arm()?;
+    STOP_AT_JUMP.store(false, Ordering::Release);
     QUIESCED.store(false, Ordering::Release);
     set_state(State::Armed);
     if let Some(t) = TIMER.get() {

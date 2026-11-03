@@ -27,6 +27,7 @@ mod crc;
 pub mod device;
 pub mod error;
 mod ktests;
+pub mod timing;
 pub mod layout;
 pub mod memdev;
 pub mod model;

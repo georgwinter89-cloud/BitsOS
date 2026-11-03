@@ -191,12 +191,14 @@ impl App {
                 let mut list = String::new();
                 // The shown workspace's windows, then those of the parked ones (not visible).
                 let mut all: Vec<Json> = self.placements().iter().map(|p| self.window_json(p, self.desk.active)).collect();
+                all.extend(self.ws.minimized.iter().map(|m| self.minimized_json(&m.win, self.desk.active)));
                 for (i, ws) in self.desk.parked.iter().enumerate().filter(|(i, _)| *i != self.desk.active) {
                     for mut p in ws.arrange(self.area(), self.area_full(), self.theme.gap) {
                         p.visible = false;
                         p.focused = false;
                         all.push(self.window_json(&p, i));
                     }
+                    all.extend(ws.minimized.iter().map(|m| self.minimized_json(&m.win, i)));
                 }
                 Json::Arr(all).write_to(&mut list);
                 Reply::text(list)
@@ -213,7 +215,7 @@ impl App {
         }
     }
 
-    fn window_json(&self, p: &crate::layout::Placement<smithay::desktop::Window>, ws: usize) -> Json {
+    fn window_json(&self, p: &crate::layout::Placement<crate::win::Window>, ws: usize) -> Json {
         let (app_id, title) = crate::ctl::names(&p.win);
         let num = |v: f64| Json::Num(v);
         let (tile, page, floating) = match p.place {
@@ -235,6 +237,27 @@ impl App {
             ("focused", Json::Bool(p.focused)),
             // WY-8: the client's own fullscreen (on a parked workspace: covers the screen once it is shown).
             ("fullscreen", Json::Bool(p.fullscreen)),
+            ("minimized", Json::Bool(false)),
+        ])
+    }
+
+    /// WY-12: a minimised window: in no tile, not visible, restorable (window list, Alt+Tab, launcher tile).
+    fn minimized_json(&self, w: &crate::win::Window, ws: usize) -> Json {
+        let (app_id, title) = crate::ctl::names(w);
+        Json::obj(vec![
+            ("id", Json::Num(crate::ctl::win_id(w) as f64)),
+            ("title", Json::str(&title)),
+            ("app_id", Json::str(&app_id)),
+            ("pid", Json::Num(self.pid_of(w) as f64)),
+            ("hung", Json::Bool(self.is_hung(w))),
+            ("workspace", Json::Num(ws as f64)),
+            ("tile", Json::Null),
+            ("page", Json::Num(0.0)),
+            ("floating", Json::Bool(false)),
+            ("visible", Json::Bool(false)),
+            ("focused", Json::Bool(false)),
+            ("fullscreen", Json::Bool(false)),
+            ("minimized", Json::Bool(true)),
         ])
     }
 }

@@ -111,8 +111,60 @@ fn a_storm_of_one_event_is_cut_to_the_burst_and_reported() {
     let rep = read(s0, usize::MAX, &Filter { subsystem: Some("klog"), name: Some("ratelimit."), ..Filter::ALL });
     let line = rep.records.iter().find(|r| r.text.contains("subsystem=rbrl")).expect("summary").render();
     assert!(line.contains("event=flood count=4"), "{line}");
+    let sum = rep.records.iter().find(|r| r.text.contains("subsystem=rbrl")).unwrap();
+    assert_eq!(sum.level, Level::Warn, "a Warn storm keeps a Warn summary");
     assert_eq!(ratelimit::sweep(), 0, "counts are cleared");
     ratelimit::set(before.0, before.1);
+}
+
+#[test]
+fn a_debug_storm_is_summarised_at_debug() {
+    let _g = serial_limited();
+    host_clock();
+    let before = ratelimit::get();
+    let lv = crate::levels();
+    set_levels("trace").unwrap();
+    ratelimit::set(5, 1);
+    for i in 0..30u32 {
+        event!(Debug, "rbrl", "dflood", i = i);
+    }
+    for i in 0..30u32 {
+        event!(Trace, "rbrl", "tflood", i = i);
+    }
+    let s0 = next_seq();
+    assert!(ratelimit::sweep() >= 48);
+    let rep = read(s0, usize::MAX, &Filter { subsystem: Some("klog"), name: Some("ratelimit."), ..Filter::ALL });
+    let lvl = |ev: &str| rep.records.iter().find(|r| r.text.contains(ev)).map(|r| r.level);
+    assert_eq!(lvl("event=dflood"), Some(Level::Debug), "pi.boost-like Debug records get a Debug summary");
+    assert_eq!(lvl("event=tflood"), Some(Level::Trace));
+    assert!(rep.records.iter().all(|r| r.level != Level::Warn || !r.text.contains("flood")), "no Warn for them");
+    set_levels(&lv).unwrap();
+    ratelimit::set(before.0, before.1);
+}
+
+#[test]
+fn the_summary_level_is_the_most_severe_kept() {
+    let w = ratelimit::count_one(ratelimit::count_one(0, Level::Debug), Level::Info);
+    assert_eq!(ratelimit::unpack(w), (2, Some(Level::Info)));
+    let w = ratelimit::count_one(w, Level::Trace);
+    assert_eq!(ratelimit::unpack(w), (3, Some(Level::Info)), "a milder record keeps the most severe level");
+    assert_eq!(ratelimit::unpack(ratelimit::count_one(0, Level::Error)), (1, Some(Level::Error)));
+    assert_eq!(ratelimit::unpack(5), (5, None), "a bare count has no level");
+    let full = ratelimit::count_one(ratelimit::COUNT_MASK, Level::Warn);
+    assert_eq!(ratelimit::unpack(full).0, ratelimit::COUNT_MASK, "the count saturates, the level stays");
+}
+
+#[test]
+fn a_bare_count_is_summarised_at_info() {
+    let _g = serial_limited();
+    host_clock();
+    let (_, k) = keys::lookup("rbrl", "bare");
+    k.suppressed.store(3, core::sync::atomic::Ordering::Relaxed);
+    let s0 = next_seq();
+    assert_eq!(ratelimit::report(k), 3);
+    let rep = read(s0, usize::MAX, &Filter { subsystem: Some("klog"), name: Some("ratelimit."), ..Filter::ALL });
+    let r = rep.records.iter().find(|r| r.text.contains("event=bare")).expect("summary");
+    assert_eq!(r.level, Level::Info);
 }
 
 #[test]

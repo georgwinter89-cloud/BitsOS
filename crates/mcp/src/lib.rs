@@ -17,26 +17,29 @@
 //! grid) and `send_keys`/`send_mouse` (events into `console::evdev`, always flagged `injected`, R8c) in `tools`.
 //! MC-6: tools registered by user-space services through `/run/bitsos/mcp.sock` (`svc`), listed and called next
 //! to the built-in ones (`catalog`).
+//! MC-8a: the protocol code (HTTP head, JSON, JSON-RPC answers, the argument check) lives in `mcp_wire`, shared
+//! with the user-space MCP service bitsmcp; the kernel's narrow interface for that service is the gate
+//! (`gate`, `/dev/bitsos/mcp`), armed under CONFIG.TXT `mcp=both|service` (default `kernel`: today's server only).
 #![cfg_attr(target_os = "none", no_std)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-pub mod b64;
+pub use mcp_wire::b64;
 mod deflate;
 mod boot;
 pub mod bounded;
 mod calls;
 pub mod catalog;
 mod conn;
+/// MC-8a: `/dev/bitsos/mcp`, the narrow interface of the user-space MCP service.
+pub mod gate;
 #[cfg(not(target_os = "none"))]
 pub mod host;
-pub mod http;
-pub mod json;
+pub use mcp_wire::{http, json};
 mod kernel;
 pub mod png;
 pub mod rpc;
-mod schema;
 pub mod server;
 /// MC-push: SHA-256 for `manifest`.
 pub mod sha256;
@@ -55,17 +58,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 pub use json::Json;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Safety {
-    Read,
-    Change,
-    DeleteOverwrite,
-}
+pub use mcp_wire::Safety;
 
 /// What a tool call knows about itself. Its methods (`calls.rs`) reach the call behind it: `output` (progress
 /// text for the `output` tool), `stop_requested`, `expired`, `remaining_ns`, `after_answer`, `call_id`.
 pub struct ToolContext {
-    /// Who calls (MCP clients act as BitsOS itself for now; per-client identity comes with MC-6/PM).
+    /// Who calls: always `Subject::KERNEL` today (a client is only its token, Georg's), so the tools' B3 checks
+    /// cannot refuse; MC-7's per-call policy passes the caller's own subject (CONTRACTS §7a).
     pub caller: policy::Subject,
     /// Absolute monotonic deadline (ns). The handler runs in a worker thread; past the deadline (+ 0.25 s) the
     /// caller gets "Still running (call n)" and the result waits for `output`; a tool that loops should look at
@@ -73,24 +72,7 @@ pub struct ToolContext {
     pub deadline_ns: u64,
 }
 
-#[derive(Clone, Debug)]
-pub enum ToolOutput {
-    Text(String),
-    /// PNG bytes (the server base64-encodes them as MCP image content).
-    Png(Vec<u8>),
-    Json(Json),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolError {
-    /// A bad or missing argument (JSON-RPC -32602 with the argument's name).
-    BadArgument(String),
-    /// Refused by a safety rule or Georg's policy.
-    Refused(String),
-    Failed(String),
-}
-
-pub type ToolResult = Result<Vec<ToolOutput>, ToolError>;
+pub use mcp_wire::{ToolError, ToolOutput, ToolResult};
 
 pub struct ToolEntry {
     pub name: &'static str,

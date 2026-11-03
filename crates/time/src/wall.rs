@@ -1,6 +1,7 @@
 //! The wall clock (spec/core.md §7.3): UTC for CLOCK_REALTIME = the RTC's local time at boot, converted with
-//! CONFIG `tz=` (default Europe/Berlin), plus the monotonic time since that read. Later NTP or
-//! `clock_settime` replaces the base with `set_realtime`. The RTC itself is never written (Windows owns it).
+//! CONFIG `tz=` (default Europe/Berlin), plus the monotonic time since that read. `set_realtime` replaces the
+//! base; only ktests call it today (C1: clock_settime/settimeofday are parked as an AB item, R9 gives no NTP
+//! source), so the wall clock never jumps at run time. The RTC itself is never written (Windows owns it).
 
 use crate::rtc::{self, RtcError};
 use crate::tz::{self, DateTime, Tz};
@@ -37,14 +38,19 @@ pub fn read_rtc(century_reg: u8, declared_absent: bool) -> Result<DateTime, RtcE
         }
         Err(e) => w.rtc_error = Some(e),
     }
+    drop(w);
+    crate::published();
     r
 }
 
 /// Sets the zone (CONFIG `tz=`).
 pub fn set_tz(tz: Tz) {
-    let mut w = WALL.lock();
-    w.tz = tz;
-    w.tz_named = true;
+    {
+        let mut w = WALL.lock();
+        w.tz = tz;
+        w.tz_named = true;
+    }
+    crate::published();
 }
 
 pub fn tz() -> Tz {
@@ -68,10 +74,11 @@ pub fn realtime_ns() -> Option<u64> {
     }
 }
 
-/// Sets UTC now (NTP, `clock_settime` later). The RTC stays untouched.
+/// Sets UTC now (only ktests today; the parked clock_settime/settimeofday later). The RTC stays untouched.
 pub fn set_realtime(utc_ns: u64) {
     let mono = crate::now_ns();
     WALL.lock().base = Base::Set { utc_ns, mono_ns: mono };
+    crate::published();
 }
 
 /// Minutes east of UTC now ("the kernel answers minutes east of UTC", YK-3); the standard offset without a
@@ -87,13 +94,6 @@ pub fn utc_offset_minutes() -> i32 {
 /// UTC now as a date (`None` without a wall time).
 pub fn utc_now() -> Option<DateTime> {
     realtime_ns().map(|ns| DateTime::from_unix((ns / 1_000_000_000) as i64))
-}
-
-/// Local now as a date.
-pub fn local_now() -> Option<DateTime> {
-    let ns = realtime_ns()?;
-    let s = (ns / 1_000_000_000) as i64;
-    Some(DateTime::from_unix(s + utc_offset_minutes() as i64 * 60))
 }
 
 /// What the wall clock rests on, the zone, whether `tz=` named it, and the last RTC error.

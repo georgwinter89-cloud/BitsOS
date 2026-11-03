@@ -19,4 +19,8 @@ sched = { path = "../../sched" }
 net = { path = "../../net" }
 mcp = { path = "../../mcp" }
 vfs = { path = "../../vfs" }
+fs-fat = { path = "../../fs-fat" }
 ktest = { path = "../../ktest" }
+
+[lints]
+workspace = true

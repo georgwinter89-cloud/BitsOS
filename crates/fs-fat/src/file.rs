@@ -8,14 +8,50 @@
 use crate::protect::{self, Class};
 use crate::vol::Volume;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use uapi::errno::*;
 use vfs::inode::InodeOps;
 use vfs::pagecache::{Backend, CachePage, PageCache, SyncKind};
+use zeroize::Zeroize;
 
 const PAGE: u64 = 4096;
+
+/// A heap buffer that may hold CONFIG.TXT's text (RB-18 CR-2): when `secret`, zeroed on every way out, the `?`s
+/// included. Never grown: a move would leave the old buffer unzeroed, so the capacity is reserved first.
+pub(crate) struct Buf {
+    pub(crate) bytes: Vec<u8>,
+    secret: bool,
+}
+
+impl Buf {
+    pub(crate) fn reserved(capacity: usize, secret: bool) -> Result<Self, i64> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity).map_err(|_| ENOMEM)?;
+        Ok(Self { bytes, secret })
+    }
+
+    fn zeroed(len: usize, secret: bool) -> Result<Self, i64> {
+        let mut b = Self::reserved(len, secret)?;
+        b.bytes.resize(len, 0);
+        Ok(b)
+    }
+
+    /// The whole capacity, also what a shrink left past the length: the tree builds zeroize without `alloc`, where
+    /// `Vec::zeroize` is the slice's and stops at the length (a truncate to 0 would zero nothing).
+    pub(crate) fn wipe(&mut self) {
+        self.bytes.resize(self.bytes.capacity(), 0);
+        self.bytes.as_mut_slice().zeroize();
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        if self.secret {
+            self.wipe();
+        }
+    }
+}
 
 pub struct FatFile {
     pub vol: Arc<Volume>,
@@ -59,16 +95,13 @@ impl FatFile {
     }
 
     /// The whole cached content of CONFIG.TXT (EFBIG above `CONFIG_MAX`: never a huge copy).
-    fn whole(&self) -> Result<Vec<u8>, i64> {
+    fn whole(&self) -> Result<Buf, i64> {
         if self.cache.size() > protect::CONFIG_MAX {
             return Err(self.vol.refused("config.size", self.ino, EFBIG));
         }
-        let size = self.cache.size() as usize;
-        let mut v = Vec::new();
-        v.try_reserve_exact(size).map_err(|_| ENOMEM)?;
-        v.resize(size, 0);
-        let n = self.cache.read_at(0, &mut v)?;
-        v.truncate(n);
+        let mut v = Buf::zeroed(self.cache.size() as usize, true)?;
+        let n = self.cache.read_at(0, &mut v.bytes)?;
+        v.bytes.truncate(n);
         Ok(v)
     }
 
@@ -117,6 +150,9 @@ impl InodeOps for Ops {
     fn size(&self) -> u64 {
         self.0.cache.size()
     }
+    fn read_cache(&self) -> Option<&PageCache> {
+        Some(&self.0.cache)
+    }
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         self.0.cache.read_at(pos, buf)
     }
@@ -134,14 +170,13 @@ impl InodeOps for Ops {
                 return Err(f.vol.refused("config.size", f.ino, EFBIG));
             }
             let old = f.whole()?;
-            let mut new = Vec::new();
-            new.try_reserve_exact(old.len().max(end as usize)).map_err(|_| ENOMEM)?;
-            new.extend_from_slice(&old);
-            if new.len() < end as usize {
-                new.resize(end as usize, 0);
+            let mut new = Buf::reserved(old.bytes.len().max(end as usize), true)?;
+            new.bytes.extend_from_slice(&old.bytes);
+            if new.bytes.len() < end as usize {
+                new.bytes.resize(end as usize, 0);
             }
-            new[pos as usize..end as usize].copy_from_slice(&buf[..n]);
-            f.guard(&old, &new)?;
+            new.bytes[pos as usize..end as usize].copy_from_slice(&buf[..n]);
+            f.guard(&old.bytes, &new.bytes)?;
             Some(g)
         } else {
             None
@@ -187,13 +222,11 @@ impl InodeOps for Ops {
             if size > protect::CONFIG_MAX {
                 return Err(f.vol.refused("config.size", f.ino, EFBIG));
             }
-            let mut new = f.whole()?;
-            let old = new.clone();
-            if (size as usize) > new.len() {
-                new.try_reserve_exact(size as usize - new.len()).map_err(|_| ENOMEM)?;
-            }
-            new.resize(size as usize, 0);
-            f.guard(&old, &new)?;
+            let old = f.whole()?;
+            let mut new = Buf::reserved(size as usize, true)?;
+            new.bytes.extend_from_slice(&old.bytes[..old.bytes.len().min(size as usize)]);
+            new.bytes.resize(size as usize, 0);
+            f.guard(&old.bytes, &new.bytes)?;
             Some(g)
         } else {
             None
@@ -211,7 +244,12 @@ impl InodeOps for Ops {
     fn sync(&self, why: SyncKind) -> Result<(), i64> {
         self.0.cache.sync_all(why)?;
         self.0.vol.commit(self.0.ino)?;
-        self.0.vol.sync(why.durable())
+        self.0.vol.sync(why.durable())?;
+        // RB-18: the file's text, secrets included, stays on the stick only.
+        if self.0.is_config() {
+            self.0.cache.forget_clean();
+        }
+        Ok(())
     }
     fn blocks(&self) -> u64 {
         self.0.vol.blocks(self.0.ino)
@@ -228,11 +266,9 @@ impl Backend for Data {
     /// One `read_data` for the whole run (one USB command per 1 MiB extent), copied into the pages.
     fn read_pages(&self, first: u64, pages: &[Arc<CachePage>]) -> Result<(), i64> {
         let len = pages.len() * PAGE as usize;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(len).map_err(|_| ENOMEM)?;
-        buf.resize(len, 0);
-        self.vol.read_data(self.ino, first * PAGE, &mut buf)?;
-        for (p, b) in pages.iter().zip(buf.chunks(PAGE as usize)) {
+        let mut buf = Buf::zeroed(len, self.vol.class(self.ino) == Ok(Class::Config))?;
+        self.vol.read_data(self.ino, first * PAGE, &mut buf.bytes)?;
+        for (p, b) in pages.iter().zip(buf.bytes.chunks(PAGE as usize)) {
             p.write(0, b);
         }
         Ok(())
@@ -243,16 +279,14 @@ impl Backend for Data {
             return Ok(());
         }
         let len = ((pages.len() as u64 * PAGE).min(size - off)) as usize;
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| ENOMEM)?;
-        data.resize(len, 0);
+        let mut data = Buf::zeroed(len, self.vol.class(self.ino) == Ok(Class::Config))?;
         for (i, p) in pages.iter().enumerate() {
             let at = i * PAGE as usize;
             if at >= len {
                 break;
             }
             let n = (len - at).min(PAGE as usize);
-            p.read(0, &mut data[at..at + n]);
+            p.read(0, &mut data.bytes[at..at + n]);
         }
         if let Some(f) = self.file.upgrade()
             && f.is_config()
@@ -262,19 +296,19 @@ impl Backend for Data {
             if disk_size > protect::CONFIG_MAX {
                 return Err(EFBIG);
             }
-            let mut old = vec![0u8; (disk_size as usize).div_ceil(PAGE as usize) * PAGE as usize];
-            for (i, chunk) in old.chunks_mut(PAGE as usize).enumerate() {
+            let mut old = Buf::zeroed((disk_size as usize).div_ceil(PAGE as usize) * PAGE as usize, true)?;
+            for (i, chunk) in old.bytes.chunks_mut(PAGE as usize).enumerate() {
                 self.vol.read_data(self.ino, i as u64 * PAGE, chunk)?;
             }
-            old.truncate(disk_size as usize);
-            if let Err(e) = protect::config_guard(&old, &new) {
+            old.bytes.truncate(disk_size as usize);
+            if let Err(e) = protect::config_guard(&old.bytes, &new.bytes) {
                 if !f.guard_logged.swap(true, Ordering::Relaxed) {
                     klog::event!(Warn, "fat", "config.writeback_refused", key = e; "CONFIG.TXT pages changed through a mapping would add or change a guarded line: not written");
                 }
                 return Err(EPERM);
             }
         }
-        self.vol.write_data(self.ino, off, &data, size)
+        self.vol.write_data(self.ino, off, &data.bytes, size)
     }
     fn commit(&self, why: SyncKind) -> Result<(), i64> {
         self.vol.commit(self.ino)?;

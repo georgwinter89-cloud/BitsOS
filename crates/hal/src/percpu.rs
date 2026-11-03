@@ -145,9 +145,11 @@ fn gs_read(off: usize) -> u64 {
     let v: u64;
     // SAFETY (every arm): after init_bsp (and on an AP after install_this_cpu, its first act in the kernel) the
     // kernel GS base points at this CPU's CpuLocal. Kernel Rust code runs with the kernel GS: the user GS is live
-    // only inside entry.rs's swapgs windows, where interrupts are off, and the exceptions that ignore IF there
-    // (NMI, #DF, #MC) switch to the kernel GS first (`paranoid_gs_enter`, from `idt::hal_kernel_trap`); #DB is
-    // not covered, as the kernel sets no hardware breakpoints. Every offset is a field of the block. One
+    // only inside entry.rs's swapgs windows, before the stubs' iretq to user mode and inside idt.rs's GS probes
+    // (`probe_load_with_gs`, `probe_iret_with_foreign_gs`), where interrupts are off;
+    // the exceptions that ignore IF (NMI, #DF, #MC, from either mode) and #NP/#SS/#GP/#PF raised in those windows
+    // switch to the kernel GS first (`paranoid_gs_enter`, from `idt::hal_kernel_trap`); #DB is not covered, as
+    // the kernel sets no hardware breakpoints. Every offset is a field of the block. One
     // instruction, so no migration can split it.
     unsafe {
         match off {
@@ -188,9 +190,10 @@ impl Drop for ParanoidGs {
     }
 }
 
-/// Linux's paranoid entry with FSGSBASE, for NMI, #DF and #MC from kernel mode: those can arrive inside entry.rs's
-/// swapgs windows (after `syscall` before its `swapgs`, or after the return path's `swapgs` before `iretq`), where
-/// the GS base is the user's, which `wrgsbase` lets a program set to anything canonical. The CPU is found by its
+/// Linux's paranoid entry with FSGSBASE, for NMI, #DF and #MC from either mode (no `swapgs` for them, CP-8) and
+/// for faults in the return-to-user windows (`idt::in_user_gs_window`): they can arrive in user mode or inside
+/// entry.rs's swapgs windows (after `syscall` before its `swapgs`, or after the return path's `swapgs` before
+/// `iretq`), where the GS base is the user's, which `wrgsbase` lets a program set to anything canonical. The CPU is found by its
 /// APIC ID (hardware, not user state); when the GS base is not that CPU's block, the block is written and the old
 /// value comes back when the guard drops. Uses no GS, no lock and no allocation. A CPU that is not online yet (an
 /// AP in its set-up, where no user code ever ran) is left as it is.

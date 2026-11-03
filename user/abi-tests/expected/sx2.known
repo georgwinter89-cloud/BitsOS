@@ -1,0 +1,3 @@
+# Known DIFF cases of `cargo xtask abi-diff` for SX-2's programs (abi-ns-*): "<case>: <owner>: <why>".
+# ktest ab.sx2.programs compares V2 with expected/sx2-*.txt (for the trick: Linux 6.6's answers, see below).
+abi-ns-chroot trick: desk: under a root that is the fdinfo directory of an ended task Linux 6.6 answers ENOENT to every lookup and 0 to chdir("/..") (linux-6.6/fs/proc/fd.c proc_lookupfd_common; the fdinfo inode has no permission op), as V2 does; CachyOS 7.3 answers ESRCH. Remove when the reference moves past 6.6

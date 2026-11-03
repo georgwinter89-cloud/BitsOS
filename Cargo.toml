@@ -3,11 +3,14 @@
 resolver = "3"
 members = [
   "crates/acpi",
+  "crates/amdgpu-fmt",
   "crates/dcn314-regs",
   "crates/hdacodec",
   "crates/hidparse",
   "crates/rtw89-core",
   "host/gen/dcn314",
+  "crates/drm",
+  "host/gen/drm",
   "crates/bitsvol",
   "crates/block",
   "crates/bootinfo",
@@ -68,6 +71,10 @@ members = [
 default-members = ["host/xtask"]
 exclude = ["user"]
 
+# The kernel's own cfgs (lean stick kernel, FD-1 measuring build): every member opts in with `[lints] workspace = true`,
+# so a build with or without them warns about nothing (INT-W18, SC-9 change request).
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bitsos_no_ktests)', 'cfg(bitsos_fd_measure)'] }
 
 [profile.dev]
 panic = "abort"

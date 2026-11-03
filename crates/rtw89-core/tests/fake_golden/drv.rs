@@ -476,15 +476,19 @@ fn failures_until(d: &mut Drv, until_ms: u64, what: &str) -> Vec<u64> {
 }
 
 /// The supervisor's rhythm between failed joins (wifi::supervisor::Rhythm): switched on, join 1
-/// comes at once, joins 2-7 10 s after the failure before them, then every 60 s (the 2 s first
-/// wait is only after a lost link). Each gap: at least the wait, at most that plus one join.
+/// comes at once, join 2 2 s after its failure (WL-9), joins 3-7 10 s after the failure before
+/// them, then every 60 s. Each gap: at least the wait, at most that plus one join.
 fn assert_rhythm(at: &[u64], what: &str) {
     let rhythm = wifi::supervisor::Rhythm::default();
     assert!(at.len() >= 8, "{what}: only {} failed joins: {at:?}", at.len());
     assert_eq!(rhythm.delay(8), rhythm.long_ms);
     for (i, w) in at.windows(2).enumerate() {
         let gap = w[1] - w[0];
-        let want = rhythm.delay(i as u32 + 2);
+        let want = if i == 0 {
+            rhythm.first_ms
+        } else {
+            rhythm.delay(i as u32 + 2)
+        };
         assert!(
             gap >= want && gap <= want + 10_000,
             "{what}: gap {i} is {gap} ms, the rhythm waits {want} ms: {at:?}"
@@ -526,6 +530,9 @@ fn driver_join_failures_on_the_fake() {
     assert!(d.env.now - t0 < 5_000, "stop took {} ms", d.env.now - t0);
     assert!(d.r.dev.is_none());
     assert_eq!(Status::of(&d.r).state, "off");
+    // every failed join is in the log (the first held until the second failed, WL-9)
+    let logged = d.log.iter().filter(|l| l.starts_with("join.failed ")).count();
+    assert_eq!(logged as u64, n, "join.failed lines vs failures: {:#?}", d.log);
     let pmk = wifi::crypto::psk(wrong, SSID).unwrap().expose().to_vec();
     let mut texts = d.log.clone();
     texts.push(format!("{:?}", d.r));

@@ -20,6 +20,7 @@ mod fd;
 mod maps;
 mod mem;
 mod mounts;
+mod ns;
 mod stat;
 mod sys_cache;
 mod sys_cpu;
@@ -34,6 +35,7 @@ mod tests;
 use alloc::format;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use proc::ns::pid::PidNs;
 use proc::{Group, Process, Thread};
 use uapi::errno::*;
 use vfs::synth::{DirSource, FileSource, MagicLink, SynthEntry};
@@ -45,22 +47,31 @@ const THREAD_SELF_COOKIE: u64 = 2;
 const MOUNTS_COOKIE: u64 = 3;
 const PID_COOKIE: u64 = 16;
 
-struct PidRoot;
-
-fn pid_dir(g: &Arc<Group>, p: &Process, tid: u32) -> SynthEntry {
-    let t = Target { g: Arc::downgrade(g), tgid: g.tgid, tid, whole: true };
-    owned(SynthEntry::dir(&format!("{tid}"), Arc::new(PidDir(t))), p, true).cookie(PID_COOKIE + tid as u64).immutable()
+/// The process part of one proc instance: the pid namespace it was mounted in (SX-3b; the boot /proc has the
+/// initial one). Directory names, `self`, `thread-self` and the ids inside are that namespace's numbers
+/// (linux-6.6/fs/proc/base.c `proc_pid_lookup`/`proc_pid_readdir` with `proc_pid_ns(sb)`).
+struct PidRoot {
+    ns: Arc<PidNs>,
 }
 
-fn self_link() -> Option<SynthEntry> {
-    proc::current().map(|me| SynthEntry::link("self", &format!("{}", me.pid)).cookie(SELF_COOKIE))
+fn pid_dir(ns: &Arc<PidNs>, g: &Arc<Group>, p: &Process, tid: u32) -> Option<SynthEntry> {
+    let nr = ns.nr(tid)?;
+    let t = Target { g: Arc::downgrade(g), tgid: g.tgid, tid, whole: true, ns: ns.clone() };
+    Some(owned(SynthEntry::dir(&format!("{nr}"), Arc::new(PidDir(t))), p, true).cookie(PID_COOKIE + nr as u64).immutable())
+}
+
+/// `/proc/self` (linux-6.6/fs/proc/self.c): the reader's pid in the instance's namespace; missing for a reader
+/// the namespace does not number (Linux: the link reads ENOENT) and for kernel threads.
+fn self_link(ns: &PidNs) -> Option<SynthEntry> {
+    let nr = ns.nr(proc::current()?.pid)?;
+    Some(SynthEntry::link("self", &format!("{nr}")).cookie(SELF_COOKIE))
 }
 
 /// `/proc/thread-self` (linux-6.6/fs/proc/thread_self.c): `<pid>/task/<tid>` of the reader.
-fn thread_self_link() -> Option<SynthEntry> {
+fn thread_self_link(ns: &PidNs) -> Option<SynthEntry> {
     let t = proc::current_thread()?;
-    let tgid = t.group().tgid;
-    Some(SynthEntry::link("thread-self", &format!("{tgid}/task/{}", t.tid())).cookie(THREAD_SELF_COOKIE))
+    let (tgid, tid) = (ns.nr(t.group().tgid)?, ns.nr(t.tid())?);
+    Some(SynthEntry::link("thread-self", &format!("{tgid}/task/{tid}")).cookie(THREAD_SELF_COOKIE))
 }
 
 /// `/proc/mounts` -> `self/mounts` (linux-6.6/fs/proc/root.c:291 `proc_symlink("mounts", NULL, "self/mounts")`),
@@ -72,38 +83,50 @@ fn mounts_link() -> SynthEntry {
 impl DirSource for PidRoot {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         let mut out = Vec::new();
-        out.extend(self_link());
-        out.extend(thread_self_link());
+        out.extend(self_link(&self.ns));
+        out.extend(thread_self_link(&self.ns));
         out.push(mounts_link());
-        let mut ps = proc::processes();
+        let mut ps: Vec<(u32, Arc<Process>)> = if self.ns.is_init() {
+            proc::processes().into_iter().map(|p| (p.pid, p)).collect()
+        } else {
+            // The namespace's members (and those of namespaces below it); a member that is a thread is shown
+            // through its group only.
+            self.ns.try_members()?.into_iter().filter_map(|id| proc::find(id).filter(|p| p.pid == id)).filter_map(|p| Some((self.ns.nr(p.pid)?, p))).collect()
+        };
         // proc's table is in creation order, which is pid order until pids wrap: the stable sort is one pass then.
-        ps.sort_by_key(|p| p.pid);
-        out.extend(ps.iter().map(|p| pid_dir(p.group(), p, p.pid)));
+        ps.sort_by_key(|(nr, _)| *nr);
+        out.extend(ps.iter().filter_map(|(_, p)| pid_dir(&self.ns, p.group(), p, p.pid)));
         Ok(out)
+    }
+    /// SX-3b: a proc mount in another pid namespace (`vfs::proc_instance`) shows that namespace's numbers.
+    fn for_pid_ns(&self, ns: &Arc<dyn core::any::Any + Send + Sync>) -> Option<Arc<dyn DirSource>> {
+        let ns = ns.clone().downcast::<PidNs>().ok()?;
+        Some(Arc::new(PidRoot { ns }))
     }
     fn lookup(&self, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
         match name {
             // Kernel threads have no process: both links are missing for them.
-            b"self" => return Ok(self_link()),
-            b"thread-self" => return Ok(thread_self_link()),
+            b"self" => return Ok(self_link(&self.ns)),
+            b"thread-self" => return Ok(thread_self_link(&self.ns)),
             b"mounts" => return Ok(Some(mounts_link())),
             _ => {}
         }
-        let Some(id) = vfs::synth::name_to_int(name) else { return Ok(None) };
+        let Some(nr) = vfs::synth::name_to_int(name) else { return Ok(None) };
+        let Some(id) = self.ns.id(nr) else { return Ok(None) };
         if let Some(p) = proc::find(id) {
-            return Ok(Some(pid_dir(p.group(), &p, id)));
+            return Ok(pid_dir(&self.ns, p.group(), &p, id));
         }
         // `proc_pid_lookup` finds any task: a thread's id names a (hidden) directory of its group.
         Ok(proc::find_thread(id).and_then(|t| {
             let g = t.group().clone();
             let p = g.image()?;
-            Some(pid_dir(&g, &p, id))
+            pid_dir(&self.ns, &g, &p, id)
         }))
     }
 }
 
 fn pid_root() -> Arc<dyn DirSource> {
-    Arc::new(PidRoot)
+    Arc::new(PidRoot { ns: proc::ns::pid::init_pid_ns().clone() })
 }
 vfs::procdir!("/proc", pid_root);
 
@@ -115,9 +138,15 @@ pub(super) struct Target {
     tgid: u32,
     tid: u32,
     whole: bool,
+    /// SX-3b: the pid namespace of the proc instance the directory is in (its numbers are shown).
+    ns: Arc<PidNs>,
 }
 
 impl Target {
+    /// Global id `id` as the instance's namespace numbers it (0: not visible there).
+    fn nr(&self, id: u32) -> u32 {
+        self.ns.nr(id).unwrap_or(0)
+    }
     fn group(&self) -> Result<Arc<Group>, Errno> {
         self.g.upgrade().ok_or(ESRCH)
     }
@@ -151,12 +180,14 @@ pub(super) fn may_read_mm(p: &Process) -> bool {
 
 /// The reader's mount view (paths in links and maps are shown relative to the reader's root, as `d_path`).
 pub(super) fn reader_ns() -> Arc<vfs::MountNs> {
-    proc::current().map_or_else(vfs::root_ns, |me| me.ns.clone())
+    proc::current().map_or_else(vfs::root_ns, |me| me.mount_ns())
 }
 
 pub(super) fn d_path(path: &vfs::Path) -> Vec<u8> {
     let ns = reader_ns();
-    ns.d_path(&ns.root_path(), path)
+    // SX-2: relative to the reader's root (chroot), as `d_path` with `current->fs->root`.
+    let root = proc::current_fs().and_then(|fs| fs.root()).unwrap_or_else(|| ns.root_path());
+    ns.d_path(&root, path)
 }
 
 /// One file of a process directory.
@@ -186,6 +217,11 @@ enum Item {
     Task,
     Fd,
     FdInfo,
+    /// SX-2: `ns/` and the user namespace files.
+    Ns,
+    /// INT-W21 (NW-12 CR 2): `net/`, the task's network namespace as the reader sees it.
+    Net,
+    IdMap(ns::MapWhich),
     Link(LinkKind),
     File(What, u32),
     Mem,
@@ -199,10 +235,12 @@ enum LinkKind {
 }
 
 /// `tgid_base_stuff`'s order (the subset V2 has); `task` only in the process view.
-const ITEMS: [(&str, Item); 24] = [
+const ITEMS: [(&str, Item); 30] = [
     ("task", Item::Task),
     ("fd", Item::Fd),
     ("fdinfo", Item::FdInfo),
+    ("ns", Item::Ns),
+    ("net", Item::Net),
     ("environ", Item::File(What::Environ, 0o400)),
     ("auxv", Item::File(What::Auxv, 0o400)),
     ("status", Item::File(What::Status, 0o444)),
@@ -224,6 +262,10 @@ const ITEMS: [(&str, Item); 24] = [
     ("cgroup", Item::File(What::Cgroup, 0o444)),
     ("oom_score", Item::File(What::OomScore, 0o444)),
     ("oom_score_adj", Item::File(What::OomScoreAdj, 0o644)),
+    ("uid_map", Item::IdMap(ns::MapWhich::Map(proc::ns::user::MapKind::Uid))),
+    ("gid_map", Item::IdMap(ns::MapWhich::Map(proc::ns::user::MapKind::Gid))),
+    ("projid_map", Item::IdMap(ns::MapWhich::Map(proc::ns::user::MapKind::Projid))),
+    ("setgroups", Item::IdMap(ns::MapWhich::Setgroups)),
 ];
 
 fn make_entry(t: &Target, p: &Arc<Process>, i: usize, name: &str, item: Item) -> Option<SynthEntry> {
@@ -242,6 +284,22 @@ fn make_entry(t: &Target, p: &Arc<Process>, i: usize, name: &str, item: Item) ->
             // at a lookup inside; the mode stays r-x for everyone, as Linux shows it.
             own(SynthEntry::dir(name, Arc::new(fd::FdInfoDir(t.clone()))))
         }
+        Item::Ns => {
+            // dr-x--x--x (`DIR("ns", S_IRUSR|S_IXUGO, ..)`).
+            let mut e = own(SynthEntry::dir(name, Arc::new(ns::NsDir(t.clone()))));
+            e.perm = 0o511;
+            e
+        }
+        Item::Net => {
+            // dr-xr-xr-x (`DIR("net", S_IRUGO|S_IXUGO, ..)`, linux-6.6/fs/proc/base.c; `proc_tgid_net_lookup`
+            // takes the task's namespace). The files show uids as the reader names them, as /proc/net does.
+            let net = p.nsset().net.view.clone();
+            let ids = net::procnet::Reader::current().ids;
+            let mut e = own(SynthEntry::dir(name, net::procnet::dir_of(net::procnet::Reader { net, ids })));
+            e.perm = 0o555;
+            e
+        }
+        Item::IdMap(w) => own(SynthEntry::file(name, 0o644, Arc::new(ns::MapFile::new(t.clone(), w)))),
         Item::Link(k) => own(link_entry(t, p, name, k)),
         Item::Mem => own(SynthEntry::file(name, 0o600, Arc::new(mem::Mem(t.clone())))),
         Item::File(what, perm) => own(SynthEntry::file(name, perm, Arc::new(PidFile { t: t.clone(), what }))),
@@ -269,7 +327,7 @@ struct LinkTo {
 
 impl LinkTo {
     fn place(&self) -> Result<vfs::Path, Errno> {
-        let (_, p) = self.t.live().map_err(|_| ENOENT)?;
+        let (g, p) = self.t.live().map_err(|_| ENOENT)?;
         if !may_read_mm(&p) {
             return Err(EACCES);
         }
@@ -277,8 +335,9 @@ impl LinkTo {
             return Err(ENOENT);
         }
         match self.k {
-            LinkKind::Cwd => Ok(p.fds.fs.cwd().unwrap_or_else(|| p.ns.root_path())),
-            LinkKind::Root => Ok(p.ns.root_path()),
+            // FS-16: the viewed thread's state (`get_task_root`/`get_fs_pwd` of the task).
+            LinkKind::Cwd => Ok(self.t.thread(&g).map_or_else(|| p.fs(), |t| t.fs(&p)).cwd().unwrap_or_else(|| p.mount_ns().root_path())),
+            LinkKind::Root => Ok(self.t.thread(&g).map_or_else(|| p.fs(), |t| t.fs(&p)).root().unwrap_or_else(|| p.mount_ns().root_path())),
             LinkKind::Exe => p.image_info.lock().exe.clone().ok_or(ENOENT),
         }
     }
@@ -312,7 +371,7 @@ fn dir_lookup(t: &Target, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
 /// `pid_entry_nlink` (linux-6.6/fs/proc/base.c:158-167): the links stat adds for the table's directories
 /// (`/proc/<pid>` base.c:3426-3429, `/proc/<pid>/task/<tid>` base.c:3926-3929; `task` only in the process view).
 fn dir_items(whole: bool) -> u32 {
-    ITEMS.iter().filter(|(_, it)| matches!(it, Item::Fd | Item::FdInfo) || (whole && matches!(it, Item::Task))).count() as u32
+    ITEMS.iter().filter(|(_, it)| matches!(it, Item::Fd | Item::FdInfo | Item::Ns | Item::Net) || (whole && matches!(it, Item::Task))).count() as u32
 }
 
 /// `/proc/<pid>`.
@@ -335,8 +394,9 @@ struct TaskDir(Target);
 
 impl TaskDir {
     fn entry(&self, p: &Process, tid: u32) -> SynthEntry {
-        let t = Target { g: self.0.g.clone(), tgid: self.0.tgid, tid, whole: false };
-        owned(SynthEntry::dir(&format!("{tid}"), Arc::new(TidDir(t))), p, true).cookie(tid as u64 + 1).immutable()
+        let nr = self.0.nr(tid);
+        let t = Target { g: self.0.g.clone(), tgid: self.0.tgid, tid, whole: false, ns: self.0.ns.clone() };
+        owned(SynthEntry::dir(&format!("{nr}"), Arc::new(TidDir(t))), p, true).cookie(nr as u64 + 1).immutable()
     }
 }
 
@@ -346,13 +406,13 @@ impl DirSource for TaskDir {
     }
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         let (g, p) = self.0.live()?;
-        let mut tids: Vec<u32> = g.threads().iter().map(|t| t.tid()).collect();
+        let mut tids: Vec<(u32, u32)> = g.threads().iter().filter_map(|t| Some((self.0.ns.nr(t.tid())?, t.tid()))).collect();
         tids.sort_unstable();
-        Ok(tids.into_iter().map(|tid| self.entry(&p, tid)).collect())
+        Ok(tids.into_iter().map(|(_, tid)| self.entry(&p, tid)).collect())
     }
     fn lookup(&self, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
         let (g, p) = self.0.live()?;
-        let Some(tid) = vfs::synth::name_to_int(name) else { return Ok(None) };
+        let Some(tid) = vfs::synth::name_to_int(name).and_then(|nr| self.0.ns.id(nr)) else { return Ok(None) };
         Ok(g.threads().iter().any(|t| t.tid() == tid).then(|| self.entry(&p, tid)))
     }
 }
@@ -423,6 +483,11 @@ impl FileSource for PidFile {
             What::OomScoreAdj => text::write_oom_score_adj(&g, data, text::writer_has_sys_resource()),
             _ => Err(EIO),
         }
+    }
+    /// FS-16: everything but cmdline, environ, auxv and oom_score_adj is a seq_file in Linux (`proc_single_open`,
+    /// `comm_open`, `seq_open` of maps/mounts: FMODE_PWRITE cleared, pwrite ESPIPE; linux-6.6/fs/proc/base.c).
+    fn positional_write(&self, _opened_for_write: bool) -> bool {
+        matches!(self.what, What::Cmdline | What::Environ | What::Auxv | What::OomScoreAdj)
     }
 }
 

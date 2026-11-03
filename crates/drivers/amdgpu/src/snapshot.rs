@@ -73,11 +73,19 @@ fn pipe_of(name: &str) -> Option<u8> {
     (d.is_ascii_digit() && rest.as_bytes().get(1) == Some(&b'_')).then_some(d - b'0')
 }
 
-/// Whether `byte` may be read at all by the snapshot: never the NBIO aliases, the AZ pair, past the display window.
+/// GX-7m2: the pipe whose cursor `byte` belongs to (CURSOR0_n_ and CNVC_CURn_ registers), for the picture proof.
+pub fn cursor_pipe(byte: u32) -> Option<u8> {
+    let n = name(byte);
+    if n.starts_with("CURSOR0_") || n.starts_with("CNVC_CUR") { pipe_of(n) } else { None }
+}
+
+/// Whether `byte` may be read at all by the snapshot: never the NBIO aliases, the AZ pair, the MM_INDEX window, past
+/// the display window.
 pub fn readable(byte: u32) -> bool {
     !bar5::NBIO_RSMU_ALIAS.contains(&byte)
         && byte != crate::dcn::AZ_ENDPOINT_INDEX
         && byte != crate::dcn::AZ_ENDPOINT_DATA
+        && !matches!(byte, crate::dcn::MM_INDEX | crate::dcn::MM_DATA | crate::dcn::MM_INDEX_HI)
         && byte % 4 == 0
         && byte < regs::DISPLAY_WINDOW_END
 }
@@ -303,6 +311,9 @@ pub enum Rule {
 fn volatile_field(f: &str) -> bool {
     const STATUS: &[&str] = &["UNDERFLOW", "TIMEOUT", "ERR", "LOCK", "PWAIT", "INT_STATUS"];
     f.ends_with("PENDING")
+        // GX-7m2: HUBP_IN_BLANK (read only) follows the raster: 0 -> 1 between two snapshots of a quiet screen
+        // (29.10., a gfx_ring run); HUBP_BLANK_EN, the control, stays compared.
+        || f.ends_with("_IN_BLANK")
         || f.contains("OCCURRED")
         || f.contains("NO_OUTSTANDING")
         || f.contains("MEM_PWR_STATE")

@@ -2,11 +2,19 @@
 //! thread in the caller's group (CLONE_THREAD) or a new process with a copied (fork) or shared (CLONE_VM,
 //! vfork) address space.
 //!
-//! V2's limits, each refused with EINVAL and an event (Linux accepts them): namespaces (a kernel built without
-//! them answers EINVAL too), CLONE_INTO_CGROUP, and a CLONE_THREAD without
-//! CLONE_FILES and CLONE_FS (the fd table and cwd belong to the group's image; no libc asks for that). Two
-//! approximations, recorded in plan/notes/ab-AB-4.md: CLONE_SIGHAND without CLONE_THREAD copies the actions
-//! instead of sharing them, and CLONE_FS without CLONE_FILES copies the cwd.
+//! SX-2: CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET, CLONE_NEWUTS and CLONE_NEWIPC make namespaces
+//! (`ns::set::for_clone`); the child's pid lives in the new pid namespace and the caller gets the child's number
+//! in its own.
+//!
+//! SX-3a: CLONE_NEWNS copies the caller's mount namespace (`ns::set`), and the child enters its own view before
+//! its first file call (`ns::set::enter_child_view`).
+//!
+//! V2's limits, each refused with EINVAL and an event (Linux accepts them): cgroup and time namespaces
+//! (`ns::set`; a kernel built without them answers EINVAL too), CLONE_INTO_CGROUP, and a CLONE_THREAD without
+//! CLONE_FILES (the fd table belongs to the group's image; no libc asks for that). One approximation, recorded in
+//! plan/notes/ab-AB-4.md: CLONE_SIGHAND without CLONE_THREAD copies the actions instead of sharing them.
+//! FS-16: the cwd, root and umask (`vfs::FsState`) are apart from the fd table as in Linux (`copy_fs` and
+//! `copy_files`): CLONE_FS shares them, else the child gets a copy; a thread without CLONE_FS takes its own.
 
 use crate::cred::{Cap, capable};
 use crate::group::{Group, Ids};
@@ -40,7 +48,8 @@ pub struct CloneArgs {
     pub child_tid: u64,
     pub tls: u64,
     pub pidfd: u64,
-    /// clone3's set_tid: its first entry and how many were given (V2 has one pid namespace, so one at most).
+    /// clone3's set_tid: its first entry (the number in the child's own pid namespace) and how many were given
+    /// (V2 honours one: the innermost level).
     pub set_tid: Option<i32>,
     pub set_tid_count: u64,
 }
@@ -65,24 +74,22 @@ fn check(p: &Process, a: &CloneArgs) -> Result<(), Errno> {
     if f & CLONE_SIGHAND != 0 && f & CLONE_VM == 0 {
         return Err(EINVAL);
     }
-    // Init (SIGNAL_UNKILLABLE) must not make siblings: nobody would reap them.
-    if f & CLONE_PARENT != 0 && p.pid == 1 {
+    // Init and a pid namespace's init (SIGNAL_UNKILLABLE) must not make siblings: nobody would reap them.
+    if f & CLONE_PARENT != 0 && (p.pid == 1 || p.is_ns_init()) {
         return Err(EINVAL);
     }
-    if f & CLONE_THREAD != 0 && f & (CLONE_NEWUSER | CLONE_NEWPID) != 0 {
+    // A thread stays in its group's pid and user namespace (also after an unshare(CLONE_NEWPID)).
+    if f & CLONE_THREAD != 0 && (f & (CLONE_NEWUSER | CLONE_NEWPID) != 0 || !Arc::ptr_eq(&p.pid_ns, &p.nsset().pid_for_children)) {
         return Err(EINVAL);
     }
     if f & CLONE_PIDFD != 0 && f & (CLONE_DETACHED | CLONE_THREAD) != 0 {
         return Err(EINVAL);
     }
-    if f & CLONE_NAMESPACES != 0 {
-        return Err(refuse(p, f, "namespaces"));
-    }
     if f & CLONE_INTO_CGROUP != 0 {
         return Err(refuse(p, f, "cgroups"));
     }
-    if f & CLONE_THREAD != 0 && f & (CLONE_FILES | CLONE_FS) != CLONE_FILES | CLONE_FS {
-        return Err(refuse(p, f, "thread with its own files or cwd"));
+    if f & CLONE_THREAD != 0 && f & CLONE_FILES == 0 {
+        return Err(refuse(p, f, "thread with its own files"));
     }
     Ok(())
 }
@@ -121,33 +128,60 @@ pub fn clone(p: &Arc<Process>, t: &Arc<Thread>, ctx: &UserContext, a: &CloneArgs
         klog::event!(Info, "proc", "clone.nproc", pid = p.pid, uid = cred.uid);
         return Err(EAGAIN);
     }
-    let want = wanted_tid(p, a)?;
+    // SX-2 (`copy_creds`, `copy_namespaces`): the child's credentials (a new user namespace first) and set;
+    // a thread keeps the group's.
+    let (child_cred, child_set) = if a.flags & CLONE_THREAD != 0 {
+        (cred.clone(), None)
+    } else {
+        let c = if a.flags & CLONE_NEWUSER != 0 { Arc::new(crate::ns::set::new_user_cred(&cred, p.chrooted(t))?) } else { cred.clone() };
+        let set = crate::ns::set::for_clone(p.pid, &p.nsset(), a.flags, &c, &p.pid_ns)?;
+        (c, Some(set))
+    };
+    let target_ns = child_set.as_ref().map_or_else(|| p.pid_ns.clone(), |s| s.pid_for_children.clone());
+    let want = wanted_tid(p, a, &target_ns)?;
     let cctx = child_context(ctx, a)?;
     // The caller's vector registers go to the child (Linux `fpu_clone`): a compiler may keep values in them
     // across the syscall instruction.
     let fpu = Some(hal::xsave::read_user_regs());
+    // AB-10a (`copy_thread`): the caller's selectors and TLS slots; CLONE_SETTLS from 64-bit code gives FS 0.
+    let segs = hal::entry::segs::snapshot(a.flags & CLONE_SETTLS != 0);
     let settid = if a.flags & CLONE_CHILD_SETTID != 0 { a.child_tid } else { 0 };
     if a.flags & CLONE_THREAD != 0 {
-        return new_thread(p, t, a, want, cctx, fpu, settid);
+        return new_thread(p, t, a, want, cctx, (fpu, segs), settid);
     }
-    new_process(p, t, a, want, cctx, fpu, settid)
+    let set = child_set.unwrap_or_else(|| p.nsset());
+    new_process(p, t, a, want, cctx, (fpu, segs), settid, child_cred, set)
 }
 
-/// clone3's set_tid as Linux's `alloc_pid` checks it: one namespace level, 1..pid_max, a running init unless
-/// it asks for 1, CAP_CHECKPOINT_RESTORE (root); EEXIST comes when the id is taken.
-fn wanted_tid(p: &Process, a: &CloneArgs) -> Result<Option<u32>, Errno> {
-    if a.set_tid_count > 1 {
+/// clone3's set_tid as Linux's `alloc_pid` checks it for the child's pid namespace `ns`: no more entries than
+/// levels (and V2 honours one), 1..pid_max, a running init unless it asks for 1, CAP_CHECKPOINT_RESTORE (or
+/// CAP_SYS_ADMIN) in the namespace's user namespace (`checkpoint_restore_ns_capable`); EEXIST comes when the id
+/// is taken.
+fn wanted_tid(p: &Process, a: &CloneArgs, ns: &crate::ns::pid::PidNs) -> Result<Option<u32>, Errno> {
+    if a.set_tid_count > ns.level as u64 + 1 {
         return Err(EINVAL);
     }
     let Some(t) = a.set_tid else { return Ok(None) };
     if t < 1 || t as u32 >= crate::pid_max() {
         return Err(EINVAL);
     }
-    if t != 1 && crate::find(1).is_none_or(|i| i.is_finished()) {
+    let reaper_runs = if ns.is_init() { crate::find(1).is_some_and(|i| !i.is_finished()) } else { ns.reaper() != 0 };
+    if t != 1 && !reaper_runs {
         return Err(EINVAL);
     }
-    if !p.capable(Cap::CheckpointRestore) {
+    let c = p.cred();
+    let may = |user_ns: &crate::ns::user::UserNs| crate::cred::ns_capable(&c, user_ns, Cap::CheckpointRestore) || crate::cred::ns_capable(&c, user_ns, Cap::SysAdmin);
+    if !may(&ns.user_ns) {
         return Err(EPERM);
+    }
+    if a.set_tid_count > 1 {
+        // The next level out (`alloc_pid` walks outwards): EPERM without the capability there, as Linux; with it,
+        // V2 refuses (desk decision: set_tid names the innermost level only).
+        if ns.parent.as_ref().is_some_and(|o| !may(&o.user_ns)) {
+            return Err(EPERM);
+        }
+        klog::event!(Info, "proc", "clone.unsupported", pid = p.pid, what = "set_tid for more than one pid namespace level");
+        return Err(EINVAL);
     }
     Ok(Some(t as u32))
 }
@@ -158,14 +192,23 @@ fn child_alt_stack(t: &Thread, flags: u64) -> crate::signal::AltStack {
     if flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0 { crate::signal::AltStack::DISABLED } else { t.alt_stack() }
 }
 
-fn new_thread(p: &Arc<Process>, t: &Thread, a: &CloneArgs, want: Option<u32>, cctx: UserContext, fpu: Option<hal::xsave::RegDump>, settid: u64) -> Result<u32, Errno> {
+/// The creator's vector registers and segment state, for the child's first instruction.
+type Inherit = (Option<hal::xsave::RegDump>, hal::entry::segs::Snapshot);
+
+fn new_thread(p: &Arc<Process>, t: &Thread, a: &CloneArgs, want: Option<u32>, cctx: UserContext, (fpu, segs): Inherit, settid: u64) -> Result<u32, Errno> {
+    let in_init = p.pid_ns.is_init();
     let tid = match want {
-        Some(w) if crate::find(w).is_some() || task::find_thread(w).is_some() => return Err(EEXIST),
-        Some(w) => w,
-        None => crate::new_tid().ok_or(EAGAIN)?,
+        Some(w) if in_init && (crate::find(w).is_some() || task::find_thread(w).is_some()) => return Err(EEXIST),
+        Some(w) if in_init => w,
+        _ if in_init => crate::new_tid().ok_or(EAGAIN)?,
+        // SX-2: the id and its numbers in the group's pid namespaces together (set_tid names the innermost).
+        _ => crate::new_tid_in(&p.pid_ns, want)?,
     };
+    let vtid = p.vnr(tid);
     let th = Thread::new(tid, p.group());
     th.prctl().inherit(t.prctl());
+    // FS-16 (`copy_fs`): CLONE_FS shares the creator's state (its own, or the image's); else a copy of it.
+    th.set_own_fs(if a.flags & CLONE_FS != 0 { t.own_fs() } else { Some(Arc::new(t.fs(p).copy())) });
     th.set_alt_stack(child_alt_stack(t, a.flags));
     // AB-6: the creator's blocked mask (`dup_task_struct`), nothing pending.
     th.set_start_mask(t.blocked());
@@ -173,12 +216,15 @@ fn new_thread(p: &Arc<Process>, t: &Thread, a: &CloneArgs, want: Option<u32>, cc
         th.clear_child_tid.store(a.child_tid, core::sync::atomic::Ordering::Release);
     }
     if a.flags & CLONE_PARENT_SETTID != 0 {
-        let _ = p.mm.copy_to_user(a.parent_tid, &tid.to_le_bytes());
+        let _ = p.mm.copy_to_user(a.parent_tid, &vtid.to_le_bytes());
     }
-    task::start(p, th, cctx, fpu, settid, t.kthread()).map_err(|e| if e == SpawnError::NoMemory { EAGAIN } else { e.errno() })?;
+    if let Err(e) = task::start(p, th, cctx, fpu, Some(segs), settid, t.kthread(), Some(t)) {
+        p.pid_ns.free(tid);
+        return Err(if e == SpawnError::NoMemory { EAGAIN } else { e.errno() });
+    }
     THREADS.inc();
     klog::event!(Debug, "proc", "clone.thread", pid = p.pid, tid = tid, flags = klog::Hex(a.flags));
-    Ok(tid)
+    Ok(vtid)
 }
 
 /// `copy_process`'s CLONE_PIDFD step (linux-6.6/kernel/fork.c:2531): an fd of the caller's table reserved
@@ -195,13 +241,21 @@ fn reserve_pidfd(p: &Process, child: &Process, uaddr: u64) -> Result<usize, Errn
     Ok(fd)
 }
 
-fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u32>, cctx: UserContext, fpu: Option<hal::xsave::RegDump>, settid: u64) -> Result<u32, Errno> {
+#[allow(clippy::too_many_arguments)]
+fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u32>, cctx: UserContext, (fpu, segs): Inherit, settid: u64, cred: Arc<crate::cred::Cred>, set: Arc<crate::ns::set::NsSet>) -> Result<u32, Errno> {
     let f = a.flags;
     let vm = f & CLONE_VM != 0;
     let vfork = f & CLONE_VFORK != 0;
     // MM-5b's copy-on-write fork (ENOMEM also when the strict commit refuses the child's memory, as Linux).
     let mm = if vm { p.mm.clone() } else { Arc::new(p.mm.fork().map_err(|_| ENOMEM)?) };
+    // AB-10a: the LDT belongs to the address space (`ldt_dup_context` copies it on fork).
+    let ldt = if vm { p.ldt.clone() } else { p.ldt.fork_copy().ok_or(ENOMEM)? };
+    // FS-16 (`copy_files`, `copy_fs`): the fd table and the cwd/root/umask are shared or copied independently;
+    // the state is the calling thread's.
     let fds = if f & CLONE_FILES != 0 { p.fds.clone() } else { Arc::new(p.fds.duplicate()?) };
+    let fs = if f & CLONE_FS != 0 { t.fs(p) } else { Arc::new(t.fs(p).copy()) };
+    // SX-3a (`copy_mnt_ns` with the child's `new_fs`): a child in a new mount namespace starts in its view.
+    crate::ns::set::enter_child_view(&set, &p.nsset(), &fs);
     let signals = crate::signal::SignalState::new(p.signals.with(|s| s.for_child(f & CLONE_CLEAR_SIGHAND != 0)));
     let limits = p.limits.copy();
     let parent_of_caller = f & CLONE_PARENT != 0;
@@ -212,8 +266,9 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
     argv.try_reserve(p.argv.len()).map_err(|_| ENOMEM)?;
     argv.extend(p.argv.iter().cloned());
     let (pgid, sid, ctty, ns) = (p.pgid(), p.sid(), p.ctty(), p.ns.clone());
-    // AB-13: the child starts with the caller's credentials (`copy_creds`; shared until either changes them).
-    let cred = p.cred();
+    // AB-13: the child starts with the caller's credentials (`copy_creds`; shared until either changes them),
+    // SX-2: or those of its new user namespace (`cred`).
+    let child_pid_ns = set.pid_for_children.clone();
     let child = crate::insert_new(
         |pid, table| {
             // CLONE_PARENT: the caller's parent gets the child, which then reports with the caller's own exit
@@ -228,15 +283,23 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
                 let init = table.iter().find(|q| q.pid == 1 && !q.is_released()).map_or(0, |i| i.pid);
                 (init, if exit_signal != 0 { uapi::ab::signal::SIGCHLD } else { 0 })
             };
-            let ids = Ids { tgid: pid, ppid, pgid, sid, session_leader: false, creator_tid: creator, cred: cred.clone() };
+            let ids = Ids { tgid: pid, ppid, pgid, sid, session_leader: false, creator_tid: creator, cred: cred.clone(), pid_ns: child_pid_ns.clone(), nsset: set.clone() };
             let g = Group::new(ids, exit_signal, p.class, signals, limits, time::now_ns());
             g.set_ctty(ctty);
-            make_image(pid, name, path, argv, p.program, &cred, mm, fds, ns, g)
+            make_image(pid, name, path, argv, p.program, &cred, mm, fds, fs, ns, g, ldt)
         },
         want,
+        &child_pid_ns,
     )
     .map_err(|e| e.errno())?;
     child.group().set_image(&child);
+    // SX-2: a pid namespace's init is SIGNAL_UNKILLABLE (`copy_process`: `is_child_reaper`).
+    if child.is_ns_init() {
+        child.signals.raw(|s| s.unkillable = true);
+        klog::event!(Info, "ns", "pid.init", inum = child_pid_ns.inum, pid = child.pid);
+    }
+    // The child's number as the caller names it (`pid_vnr`): its own pid namespace is the caller's or one below.
+    let vpid = p.vnr(child.pid);
     child.mm_flags.copy_from(&p.mm_flags);
     // `dup_mm` copies `saved_auxv` with the rest of the mm.
     let aux = p.saved_auxv.lock().clone();
@@ -262,18 +325,22 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
     child.release();
     let th = Thread::new(child.pid, child.group());
     th.prctl().inherit(t.prctl());
+    // `set_cred_user_ns`: a new user namespace gives the full bounding set.
+    if f & CLONE_NEWUSER != 0 {
+        th.prctl().set_full_bset();
+    }
     th.set_alt_stack(child_alt_stack(t, f));
     th.set_start_mask(t.blocked());
     if f & CLONE_CHILD_CLEARTID != 0 {
         th.clear_child_tid.store(a.child_tid, core::sync::atomic::Ordering::Release);
     }
     if f & CLONE_PARENT_SETTID != 0 {
-        let _ = p.mm.copy_to_user(a.parent_tid, &child.pid.to_le_bytes());
+        let _ = p.mm.copy_to_user(a.parent_tid, &vpid.to_le_bytes());
     }
     // FS-13: a forked child reads for its parent's preload session (Brave's zygote children). Before the start
     // (FS-15 AB-1): once running, the child may fault in pages on another CPU, and those belong to the session.
     vfs::preload::forked(p.pid, child.pid);
-    if let Err(e) = task::start(&child, th, cctx, fpu, settid, t.kthread()) {
+    if let Err(e) = task::start(&child, th, cctx, fpu, Some(segs), settid, t.kthread(), None) {
         klog::event!(Warn, "proc", "clone.no_thread", pid = p.pid, child = child.pid);
         if let Some(fd) = pidfd {
             p.fds.unreserve(fd);
@@ -290,14 +357,13 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
     if vfork {
         // Linux `wait_for_vfork_done`: killable; the child's execve or end completes it.
         let g = child.group().clone();
-        let pid = child.pid;
         drop(child);
         while !g.vfork_done.wait_timeout(100_000_000) {
             if p.has_exited() {
                 break;
             }
         }
-        return Ok(pid);
+        return Ok(vpid);
     }
-    Ok(child.pid)
+    Ok(vpid)
 }

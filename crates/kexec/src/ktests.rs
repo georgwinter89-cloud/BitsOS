@@ -162,9 +162,7 @@ fn need_boot_info() -> Result<(BootInfo<'static>, u64), String> {
 }
 
 fn http_refusals() -> TestResult {
-    if need_boot_info().is_err() {
-        return ktest::skip("the kernel does not call kexec::set_boot_info (desk change request of RB-5a)");
-    }
+    need_boot_info()?;
     let initrd = vec![0x42u8; 3000];
     let srv = Server::start(
         23051,
@@ -209,10 +207,7 @@ ktest!("rb.reload.http_refusals", Safe, http_refusals);
 
 /// Stages the small synthetic kernel (dry run) and checks everything the new kernel would get.
 fn stage_synthetic() -> TestResult {
-    let (bi, bi_phys) = match need_boot_info() {
-        Ok(b) => b,
-        Err(e) => return ktest::skip(&e),
-    };
+    let (bi, bi_phys) = need_boot_info()?;
     let initrd: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
     let kernel = testkit::small_kernel();
     let srv = Server::start(23052, vec![("/k", ok_body(&kernel)), ("/i", ok_body(&initrd))])?;
@@ -312,10 +307,7 @@ ktest!("rb.reload.stage_synthetic", Safe, stage_synthetic);
 /// RB-10 (Safe, rerunnable, reads the stick only): the staged BootInfo refreshed as at the jump keeps every
 /// record but CONFIG, passes the jump's checks, and a CONFIG that does not fit the KEEP block is refused.
 fn config_refresh() -> TestResult {
-    let (bi, _) = match need_boot_info() {
-        Ok(b) => b,
-        Err(e) => return ktest::skip(&e),
-    };
+    let (bi, _) = need_boot_info()?;
     let kernel = testkit::small_kernel();
     let initrd: Vec<u8> = (0..4096u32).map(|i| (i % 13) as u8).collect();
     let srv = Server::start(23053, vec![("/k", ok_body(&kernel)), ("/i", ok_body(&initrd))])?;
@@ -381,13 +373,30 @@ fn refresh_fallbacks(st: &mut stage::Staged, before: &[u8], big: Vec<u8>) -> Tes
 }
 ktest!("rb.reload.config_refresh", Safe, config_refresh);
 
+/// RB-18: the blanking on real RAM, through the physical address, on a frame of its own (the boot record's own
+/// check is `kernel.config.secret`, which rb/20-reload.sh runs with a token and a passphrase in CONFIG.TXT).
+fn secret_blanked_in_ram() -> TestResult {
+    let text: &[u8] = b"a=1\ntoken=fake-rb18-t\r\nwlan_psk=fake-rb18-p#x\nb=2\n";
+    let f = mm_core::frames().ok_or("no frame allocator")?;
+    let phys = f.alloc(0, mm_core::Zone::Normal, mm_core::Kind::Other).ok_or("no frame")?;
+    kassert!(hal::kexec_stub::write_phys(phys, text), "write");
+    let n = boot::blank_record(phys, text.len());
+    let mut now = alloc::vec![0u8; text.len()];
+    let read = hal::kexec_stub::read_phys(phys, &mut now);
+    f.free(phys, 0, mm_core::Kind::Other);
+    kassert!(read, "read back");
+    kassert!(n == 2, "two values blanked");
+    kassert!(now == crate::secret::blanked(text), "the bytes in RAM are the blanked text");
+    kassert!(!crate::secret::holds_value(&now) && !now.windows(4).any(|w| w == b"fake"), "no value left");
+    kassert!(now.starts_with(b"a=1\ntoken=") && now.ends_with(b"\nb=2\n") && now.len() == text.len(), "the other lines and the size stay");
+    Ok(())
+}
+ktest!("rb.reload.secret_blanked", Safe, secret_blanked_in_ram);
+
 /// The jump's page-table root works for a thread on a vmap stack too (the MCP server's threads; the boot thread
 /// runs on the kernel image's stack, which every root maps): found when bitsboot's root was used after MM-2.
 fn stub_ready_on_thread() -> TestResult {
-    let (bi, _) = match need_boot_info() {
-        Ok(b) => b,
-        Err(e) => return ktest::skip(&e),
-    };
+    let (bi, _) = need_boot_info()?;
     let stub = bi.reload_stub().ok_or("no stub")?.phys;
     static RESULT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     RESULT.store(0, Ordering::Release);
@@ -405,22 +414,45 @@ fn stub_ready_on_thread() -> TestResult {
 }
 ktest!("rb.reload.stub_ready_on_thread", Safe, stub_ready_on_thread);
 
-/// Takes frames until only `target` bytes are free (kept for good: the scenario's memory pressure).
-fn squeeze_to(key: &str) -> TestResult {
-    let Some(mb) = boot::config(key).and_then(|v| v.parse::<u64>().ok()) else {
-        return ktest::skip(&format!("CONFIG {key}= not set (only the Reload scenario squeezes memory)"));
-    };
-    let f = mm_core::frames().ok_or("no frame allocator")?;
-    let target = mb << 20;
+/// Takes the largest blocks that fit until only `target` bytes are free; `got` sees each block (order, phys).
+fn take_frames(f: &dyn mm_core::FrameAlloc, target: u64, mut got: impl FnMut(u32, u64)) -> u64 {
     let mut taken = 0u64;
     for order in (0..=9u32).rev() {
         while f.stats().free_bytes >= target + (4096u64 << order) {
-            if f.alloc(order, mm_core::Zone::Normal, mm_core::Kind::Other).is_none() {
-                break;
-            }
+            let Some(phys) = f.alloc(order, mm_core::Zone::Normal, mm_core::Kind::Other) else { break };
+            got(order, phys);
             taken += 4096 << order;
         }
     }
+    taken
+}
+
+/// A run without the scenario's CONFIG line: the same taking on 64 MiB, which all come back (rerunnable, the tests
+/// after it keep their memory). The pressure itself is rb/20-reload.sh's, which sets the line and needs `passed=1`.
+fn rehearse_squeeze(key: &str, f: &dyn mm_core::FrameAlloc) -> TestResult {
+    const TRIAL: u64 = 64 << 20;
+    let before = f.stats().free_bytes;
+    kassert!(before >= 2 * TRIAL, "only {before} bytes free");
+    let mut kept = Vec::with_capacity(64);
+    let taken = take_frames(f, before - TRIAL, |order, phys| kept.push((order, phys)));
+    let low = f.stats().free_bytes;
+    for (order, phys) in kept.drain(..) {
+        f.free(phys, order, mm_core::Kind::Other);
+    }
+    let after = f.stats().free_bytes;
+    klog::event!(Info, "kexec", "ktest.squeeze_rehearsed", key = key, taken_mb = taken >> 20, low_kb = low >> 10, after_kb = after >> 10);
+    kassert!(taken >= TRIAL - (4 << 20), "took only {taken} of {TRIAL} bytes");
+    kassert!(after + (4 << 20) >= before, "free {before} before, {after} after giving all back");
+    Ok(())
+}
+
+/// Takes frames until only `target` bytes are free (kept for good: the scenario's memory pressure).
+fn squeeze_to(key: &str) -> TestResult {
+    let f = mm_core::frames().ok_or("no frame allocator")?;
+    let Some(v) = boot::config(key) else { return rehearse_squeeze(key, f) };
+    let mb = v.parse::<u64>().map_err(|_| format!("CONFIG {key}={v} is no number"))?;
+    let target = mb << 20;
+    let taken = take_frames(f, target, |_, _| {});
     let free = f.stats().free_bytes;
     klog::event!(Info, "kexec", "ktest.squeezed", key = key, taken_mb = taken >> 20, free_kb = free >> 10);
     kassert!(free < target + (8 << 10) || taken == 0, "free {free} after squeezing to {target}");

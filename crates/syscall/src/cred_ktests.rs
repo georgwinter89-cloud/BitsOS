@@ -222,7 +222,7 @@ fn chpst() -> TestResult {
 
 ktest!("ab.cred.caps", Safe, caps);
 /// capget/capset over the ids (kernel/capability.c): root's sets, the version handshake, a seteuid that
-/// keeps the permitted set, and capset that only keeps the current sets (V2 stores none).
+/// keeps the permitted set, and capset as Linux's `cap_capset` (SX-2 stores the sets).
 fn caps() -> TestResult {
     const V3: u32 = 0x2008_0522;
     let full = proc::prctl_state::CAP_FULL_SET;
@@ -245,7 +245,8 @@ fn caps() -> TestResult {
     expect("bad version, NULL data", t.call(CAPGET, &[t.a(0), 0]), 0)?;
     t.put(0, &[V3.to_le_bytes(), 0x7fff_fff0u32.to_le_bytes()].concat());
     expect("no such task", t.call(CAPGET, &[t.a(0), t.a(16)]), -ESRCH)?;
-    // capset: the same sets succeed; a lowering is refused (no stored sets); another pid is EPERM.
+    // capset: the same sets succeed; a lowering is stored as on Linux (SX-2: Chromium drops its capabilities),
+    // the effective set may grow again within the permitted one; another pid is EPERM.
     let set = |t: &mut T, pid: u32, s: [u64; 3]| {
         let mut b = [V3.to_le_bytes(), pid.to_le_bytes()].concat();
         for i in 0..2 {
@@ -257,7 +258,9 @@ fn caps() -> TestResult {
         t.call(CAPSET, &[t.a(0), t.a(8)])
     };
     expect("capset same", set(&mut t, 0, [full, full, 0]), 0)?;
-    expect("capset lower", set(&mut t, 0, [0, full, 0]), -EPERM)?;
+    expect("capset lower", set(&mut t, 0, [0, full, 0]), 0)?;
+    kassert!(get(&mut t, 0)? == [0, full, 0], "after the lowering");
+    expect("capset raise within permitted", set(&mut t, 0, [full, full, 0]), 0)?;
     expect("capset other pid", set(&mut t, u.p.pid, [full, full, 0]), -EPERM)?;
     expect("user capset raise", set(&mut u, 0, [0, 1, 0]), -EPERM)?;
     // seteuid(1000): effective empty, permitted kept (the saved uid is 0); back to root restores it.

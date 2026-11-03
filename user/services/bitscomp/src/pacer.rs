@@ -45,11 +45,12 @@ impl Pacer {
         Ok(Pacer { fd: unsafe { OwnedFd::from_raw_fd(fd) }, armed: None })
     }
 
-    /// Wakes the loop at `at` (absolute CLOCK_MONOTONIC); `None` disarms.
-    pub fn arm(&mut self, at: Option<Duration>) {
+    /// Wakes the loop at `at` (absolute CLOCK_MONOTONIC); `None` disarms. True when the kernel was told
+    /// (`ctl stats` timer_sets; a time already past is set again every turn, `spin` names its source).
+    pub fn arm(&mut self, at: Option<Duration>) -> bool {
         // Unchanged and still ahead: nothing to tell the kernel (the loop turns often).
         if self.armed == at && at.is_none_or(|t| t > now()) {
-            return;
+            return false;
         }
         self.armed = at;
         // A zero it_value disarms; an absolute time in the past fires at once.
@@ -59,10 +60,12 @@ impl Pacer {
             it_value: libc::timespec { tv_sec: t.as_secs() as i64, tv_nsec: t.subsec_nanos() as i64 },
         };
         // SAFETY: `spec` lives across the call; the old value is not asked for.
-        let r = unsafe { libc::timerfd_settime(self.fd.as_raw_fd(), libc::TFD_TIMER_ABSTIME, &spec, std::ptr::null_mut()) };
+        let r =
+            unsafe { libc::timerfd_settime(self.fd.as_raw_fd(), libc::TFD_TIMER_ABSTIME, &spec, std::ptr::null_mut()) };
         if r < 0 {
             eprintln!("bitscomp: pacer: timerfd_settime: {}", std::io::Error::last_os_error());
         }
+        true
     }
 
     pub fn fd(&self) -> BorrowedFd<'_> {

@@ -1,0 +1,6 @@
+chdir(/) = 0
+threaded: unshare(CLONE_FS) = 0
+threaded: chdir(/proc) = 0
+threaded: umask(077) was 022
+caller: getcwd /proc, umask 077
+other thread: getcwd /, umask 022

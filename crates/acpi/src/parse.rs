@@ -5,8 +5,8 @@
 use crate::bytes::u32_at;
 use crate::mem::{self, Loaded, Metered, PhysMem, TableError, PARSE_BUDGET};
 use crate::rsdp::{self, Rsdp, RsdpError};
-use crate::sdt::{self, Header, Signature, HEADER_LEN};
-use crate::{fadt, hpet, ivrs, madt, mcfg, s5, srat, Acpi, Note, Notes, RootKind, TableInfo};
+use crate::sdt::{self, Signature, HEADER_LEN};
+use crate::{cst, fadt, hpet, ivrs, madt, mcfg, s5, srat, Acpi, Note, Notes, RootKind, TableInfo};
 use alloc::vec::Vec;
 
 /// Tables copied and parsed (the first good one of each signature counts, as in V1 and Linux).
@@ -223,7 +223,7 @@ fn use_table(t: &Loaded, a: &mut Acpi) -> bool {
 }
 
 /// The DSDT the FADT names (used even with a bad checksum, as ACPICA does, but noted), then `\_S5` in it
-/// or in the first SSDT with a good checksum that has one (V1 `s5_find`).
+/// or in the first SSDT with a good checksum that has one (V1 `s5_find`); FD-1: `_CST` the same way.
 fn dsdt_and_s5(mem: &mut dyn PhysMem, a: &mut Acpi) {
     let Some(dsdt) = a.fadt.as_ref().map(|f| f.dsdt).filter(|&d| d != 0) else {
         return;
@@ -234,9 +234,16 @@ fn dsdt_and_s5(mem: &mut dyn PhysMem, a: &mut Acpi) {
                 a.notes.push(Note::table(sdt::DSDT, dsdt, "bad_checksum", 0));
             }
             a.dsdt = Some(TableInfo { phys: dsdt, header: t.header, checksum_ok: Some(t.checksum_ok), used: true });
+            if a.cst.is_none()
+                && let Some(c) = cst::find(&t.bytes)
+            {
+                a.cst = Some((c, sdt::DSDT, dsdt));
+            }
             if let Some(s) = s5::find(&t.bytes) {
                 a.s5 = Some((s, sdt::DSDT, dsdt));
-                return;
+                if a.cst.is_some() {
+                    return;
+                }
             }
         }
         Err(e) => a.notes.push(Note::table(sdt::DSDT, dsdt, e.name(), detail(&e))),
@@ -252,8 +259,17 @@ fn dsdt_and_s5(mem: &mut dyn PhysMem, a: &mut Acpi) {
         }
         match mem::load(mem, phys, Some(sdt::SSDT)) {
             Ok(t) if t.checksum_ok => {
-                if let Some(s) = s5::find(&t.bytes) {
+                if a.cst.is_none()
+                    && let Some(c) = cst::find(&t.bytes)
+                {
+                    a.cst = Some((c, sdt::SSDT, phys));
+                }
+                if a.s5.is_none()
+                    && let Some(s) = s5::find(&t.bytes)
+                {
                     a.s5 = Some((s, sdt::SSDT, phys));
+                }
+                if a.s5.is_some() && a.cst.is_some() {
                     return;
                 }
             }
@@ -271,8 +287,3 @@ fn detail(e: &TableError) -> u64 {
     }
 }
 
-impl Header {
-    pub fn signature_text(&self) -> alloc::string::String {
-        crate::bytes::text(&self.signature)
-    }
-}

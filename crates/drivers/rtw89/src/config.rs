@@ -104,6 +104,35 @@ pub fn fw_paths(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     v
 }
 
+/// How long the firmware loop waits for the boot stick's mount before a missing file is a
+/// warning (fs-ext4's STICK_WAIT_MS: USB and the stick's write decision settle within it), and
+/// its step: the loop looks at `quiesced` before every try, so at least once per step
+pub const STICK_WAIT_MS: u64 = 120_000;
+pub const STICK_STEP_MS: u64 = 1_000;
+
+/// What the firmware loop does after a try found no file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FwMiss {
+    /// wait up to STICK_STEP_MS for the stick's mount; `say`: log `fw.wait_stick` (Info) first
+    WaitStick { say: bool },
+    /// try again after `sleep_ms`; `warn`: log `fw.missing` (Warn) first
+    Retry { warn: bool, sleep_ms: u64 },
+}
+
+// USB enumerates after the PCI probe (WL-9: fw.missing at 0.97 s on 24.10.): until the boot
+// stick is mounted, for at most STICK_WAIT_MS, a missing file is no fault yet. `waited_ms`: the
+// stick wait so far; `tries`: the tries since the stick came (or the wait ended).
+pub fn fw_miss(stick_mounted: bool, waited_ms: u64, tries: u64) -> FwMiss {
+    if !stick_mounted && waited_ms < STICK_WAIT_MS {
+        return FwMiss::WaitStick { say: waited_ms == 0 };
+    }
+    // every second for 30 s, then every 10 s; a warning on the first try and every 30th
+    FwMiss::Retry {
+        warn: tries == 0 || tries.is_multiple_of(30),
+        sleep_ms: if tries + 1 < 30 { 1_000 } else { 10_000 },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +140,26 @@ mod tests {
 
     fn cfg<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| String::from(*v))
+    }
+
+    #[test]
+    fn firmware_waits_for_the_stick_then_warns() {
+        // no stick yet: Info once, no warning, for the whole bounded wait
+        assert_eq!(fw_miss(false, 0, 0), FwMiss::WaitStick { say: true });
+        let mut w = STICK_STEP_MS;
+        while w < STICK_WAIT_MS {
+            assert_eq!(fw_miss(false, w, 0), FwMiss::WaitStick { say: false });
+            w += STICK_STEP_MS;
+        }
+        // the wait is over without a stick: a warning
+        assert_eq!(fw_miss(false, STICK_WAIT_MS, 0), FwMiss::Retry { warn: true, sleep_ms: 1_000 });
+        // the stick is there and the file is not: a warning at once, whatever the wait
+        assert_eq!(fw_miss(true, 0, 0), FwMiss::Retry { warn: true, sleep_ms: 1_000 });
+        assert_eq!(fw_miss(true, 5_000, 1), FwMiss::Retry { warn: false, sleep_ms: 1_000 });
+        assert_eq!(fw_miss(true, 0, 29), FwMiss::Retry { warn: false, sleep_ms: 10_000 });
+        assert_eq!(fw_miss(true, 0, 30), FwMiss::Retry { warn: true, sleep_ms: 10_000 });
+        // quiesce is looked at before every try: a step stays short
+        assert!(STICK_STEP_MS <= 1_000 && STICK_WAIT_MS.is_multiple_of(STICK_STEP_MS));
     }
 
     #[test]

@@ -270,12 +270,15 @@ fn dog_kicks_only_when_all_alive() {
     let r = d.check();
     assert!(r.kicked && d.take_news());
     // Grace before a reboot: armed, count 240, no more kicks.
-    d.grace(240);
+    assert!(d.grace(240), "a running chip takes the grace count");
     let k = fake.kicks();
     d.check();
     assert_eq!((fake.count(), fake.kicks(), fake.running()), (240, k, true));
     d.stop();
     assert!(!fake.running());
+    // RB-13 fixer: a stopped chip gets no count, and grace says so (the panic record must not claim a safety net).
+    assert!(!d.grace(120), "grace on a stopped chip wrote nothing");
+    assert!(!fake.running() && fake.count() != 120);
 }
 
 /// A block whose control read is slow: widens the window between a kick's read and its write.
@@ -415,5 +418,180 @@ fn hang_only_when_armed() {
     assert!(hang_refusal(State::Armed).is_none());
     for st in [State::NotStarted, State::Starting, State::Absent, State::Off, State::Unusable, State::Stopped, State::Grace] {
         assert!(hang_refusal(st).is_some_and(|t| t.contains(st.name())), "{st:?}");
+    }
+}
+
+/// RB-14: the two sync-flood bits name a flood; the reset that was asked for (0xCF9 6) does not, nor all ones.
+#[test]
+fn sync_flood_bits() {
+    use crate::regs::{is_sync_flood, s5_reset_reasons};
+    assert!(is_sync_flood(1 << 27));
+    assert!(is_sync_flood(1 << 31 | 1 << 19));
+    assert!(!is_sync_flood(1 << 19));
+    assert!(!is_sync_flood(0));
+    assert!(!is_sync_flood(u32::MAX), "a window that reads all ones says nothing");
+    assert_eq!(s5_reset_reasons(1 << 27), "sync_flood_error");
+    assert_eq!(s5_reset_reasons(1 << 19), "cf9_6");
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// RB-16: breadcrumbs in the count register
+
+#[test]
+fn a_crumb_is_the_timeout_while_the_chip_runs_and_not_kept_when_it_is_stopped() {
+    use crate::crumb::{self, Previous};
+    use klog::crumb::Stage;
+    let t = Arc::new(Table::default());
+    *t.cpus.lock().unwrap() = vec![s(1, true, true)];
+    let fake = Arc::new(Fake::new(false, false, Some(dog_clock)));
+    let d = Dog::new(Box::new(fake.clone()), Box::new(FakeCpus(t.clone())), dog_clock, pol(), 30);
+    d.arm().unwrap();
+    let base = crumb::base(30, 240);
+    let code = crumb::code(crumb::id(Stage::Device, "wlan0"), base).unwrap();
+    let k = fake.kicks();
+    assert!(d.crumb(code));
+    assert_eq!((fake.count(), fake.kicks()), (code, k + 1), "counted from now");
+    // A shutdown that did not end the kernel: the normal timeout back.
+    d.restore_timeout();
+    assert_eq!(fake.count(), 30);
+    // The grace (the watchdog's own Quiesce), then the reset's crumb: still running, counted from now.
+    assert!(d.grace(240));
+    let reset = crumb::code(Stage::Reset as u16, base).unwrap();
+    d.crumb(reset);
+    assert_eq!(fake.count(), reset);
+    d.restore_timeout();
+    assert_eq!(fake.count(), reset, "not armed any more (grace): nothing restored");
+    // RB-17: stopped, the chip only takes the value for its next kick and reads what it stopped with (the
+    // Mini-PC after a Reload before RB-17: the watchdog's own crumb, not the jump's).
+    d.stop();
+    let k = fake.kicks();
+    let jump = crumb::code(Stage::ReloadJump as u16, base).unwrap();
+    assert!(!d.crumb(jump), "not kept: reported as such");
+    assert_eq!((fake.count(), fake.reload_value(), fake.kicks()), (reset, jump, k));
+    let st = regs::read_and_clear_fired(&*fake);
+    assert_eq!(Previous::read(st.count, base).id, Some(Stage::Reset as u16));
+}
+
+/// The crumbs of a Reload's way out, in kexec's order, on a dog that `quiesce` (the watchdog's Reload
+/// Quiesce) either stops at once (RB-16) or holds until the jump (RB-17). Returns the count the next start reads.
+fn reload_way_out(fake: &Arc<Fake>, hold: bool) -> u32 {
+    use crate::crumb;
+    use klog::crumb::Stage;
+    let t = Arc::new(Table::default());
+    *t.cpus.lock().unwrap() = vec![s(1, true, true)];
+    let d = Dog::new(Box::new(fake.clone()), Box::new(FakeCpus(t.clone())), dog_clock, pol(), 30);
+    d.arm().unwrap();
+    let base = crumb::base(30, 240);
+    let leave = |stage: Stage, what: &str| d.crumb(crumb::code(crumb::id(stage, what), base).unwrap());
+    leave(Stage::ReloadStopped, "reload");
+    leave(Stage::Quiesce, "reload");
+    for dev in ["nvme0", "xhci0", "mirror", "igc0", "fch-wdt"] {
+        leave(Stage::Device, dev);
+        if dev == "fch-wdt" {
+            if hold {
+                assert!(d.hold());
+            } else {
+                d.stop();
+            }
+        }
+    }
+    leave(Stage::Quiesced, "");
+    leave(Stage::ReloadSweep, "reload");
+    leave(Stage::ReloadJump, "reload");
+    if hold {
+        d.stop();
+    }
+    regs::read_and_clear_fired(&**fake).count
+}
+
+#[test]
+fn a_clean_reload_reads_as_reached_its_end_at_the_next_start() {
+    use crate::crumb::{self, Previous};
+    use klog::crumb::Stage;
+    let base = crumb::base(30, 240);
+    // RB-16's order on the chip's count register: the next start read the watchdog's own crumb (Mini-PC 28.10.).
+    let fake = Arc::new(Fake::new(false, false, Some(dog_clock)));
+    let p = Previous::read(reload_way_out(&fake, false), base);
+    assert_eq!(p.id, Some(crumb::id(Stage::Device, "fch-wdt")));
+    assert!(p.incomplete() && p.text().contains("stopped there"), "{}", p.text());
+    // RB-17: held through the last crumbs, stopped after the jump's: a clean Reload is never incomplete.
+    let fake = Arc::new(Fake::new(false, false, Some(dog_clock)));
+    let count = reload_way_out(&fake, true);
+    assert!(!fake.running(), "stopped before the jump");
+    for drift in 0..3 {
+        // The next start reads the stopped counter (a second or two of drift at most before the stop).
+        let p = Previous::read_with(count - drift, base, false);
+        assert_eq!(p.id, Some(Stage::ReloadJump as u16), "drift {drift}");
+        assert!(!p.incomplete() && p.text().contains("reload_jump") && p.text().contains("reached its end"), "{}", p.text());
+    }
+}
+
+/// Its own clock: `dog_kicks_only_when_all_alive` moves `DOG_CLOCK` while the tests run in parallel.
+static HOLD_CLOCK: AtomicU64 = AtomicU64::new(1);
+fn hold_clock() -> u64 {
+    HOLD_CLOCK.load(Ordering::SeqCst)
+}
+
+/// RB-17 fixer: the paths around the held Reload besides the clean one. A hang between the Quiesce and the jump
+/// (held, never stopped) is reset after the last crumb's count and gets no kick; a jump that failed after the
+/// stop is armed again without kicks (`after_failed_jump`'s call) and resets after the timeout; with
+/// `watchdog_reload=grace` the crumbs land counted from now and the next start reads them as "about", never
+/// incomplete.
+#[test]
+fn a_held_reload_resets_a_hang_rearms_after_a_failed_jump_and_grace_stays_about() {
+    use crate::crumb::{self, Previous};
+    use klog::crumb::Stage;
+    let base = crumb::base(30, 240);
+    let sweep = crumb::code(Stage::ReloadSweep as u16, base).unwrap();
+    let jump = crumb::code(Stage::ReloadJump as u16, base).unwrap();
+    let t = Arc::new(Table::default());
+    *t.cpus.lock().unwrap() = vec![s(1, true, true)];
+    let fake = Arc::new(Fake::new(false, false, Some(hold_clock)));
+    let d = Dog::new(Box::new(fake.clone()), Box::new(FakeCpus(t.clone())), hold_clock, pol(), 30);
+    d.arm().unwrap();
+    // The hang: held, the sweep's crumb counts from now, the jump never comes.
+    assert!(d.hold(), "a running chip is held");
+    let t0 = hold_clock();
+    assert!(d.crumb(sweep), "held: the crumb is kept");
+    let k = fake.kicks();
+    HOLD_CLOCK.store(t0 + 60 * SEC, Ordering::SeqCst);
+    d.check();
+    assert_eq!((fake.kicks(), fake.running(), fake.count()), (k, true, sweep), "held: no kicks, still counting");
+    assert!(!fake.would_fire(t0 + (sweep as u64 - 1) * SEC), "not before the crumb's count");
+    assert!(fake.would_fire(t0 + (sweep as u64 + 1) * SEC), "the hang is reset after {sweep} s");
+    assert!((5 * 60..=12 * 60).contains(&sweep), "minutes, not seconds: {sweep}");
+    // The jump failed after the hook's stop: armed again without kicks, reset after the normal timeout.
+    d.crumb(jump);
+    d.stop();
+    assert!(!fake.running());
+    let t1 = hold_clock();
+    d.arm_unkicked().unwrap();
+    assert!(fake.running() && fake.count() == 30 && !d.armed(), "re-armed, not kicked by the dog");
+    let k = fake.kicks();
+    HOLD_CLOCK.store(t1 + 20 * SEC, Ordering::SeqCst);
+    d.check();
+    assert_eq!(fake.kicks(), k, "no kicks after the failed jump");
+    assert!(!fake.would_fire(t1 + 29 * SEC) && fake.would_fire(t1 + 31 * SEC));
+    // A failed jump without the stop (no hook ran): the same re-arm on a held chip.
+    let fake = Arc::new(Fake::new(false, false, Some(hold_clock)));
+    let d = Dog::new(Box::new(fake.clone()), Box::new(FakeCpus(t.clone())), hold_clock, pol(), 30);
+    d.arm().unwrap();
+    assert!(d.hold());
+    d.arm_unkicked().unwrap();
+    assert!(fake.running() && fake.count() == 30);
+    // watchdog_reload=grace: the grace instead of the hold, the crumbs after it land, the counter runs into the
+    // next start (read with `running`): "about", never "stopped there".
+    let fake = Arc::new(Fake::new(false, false, Some(hold_clock)));
+    let d = Dog::new(Box::new(fake.clone()), Box::new(FakeCpus(t.clone())), hold_clock, pol(), 30);
+    d.arm().unwrap();
+    assert!(d.grace(240));
+    let dev = crumb::code(crumb::id(Stage::Device, "fch-wdt"), base).unwrap();
+    for code in [dev, sweep, jump] {
+        assert!(d.crumb(code), "running under the grace: kept");
+    }
+    assert!(fake.running() && fake.count() == jump);
+    for count in [jump, jump - 3, dev] {
+        let p = Previous::read_with(count, base, true);
+        assert!(!p.incomplete() && p.text().contains("about "), "{}", p.text());
     }
 }

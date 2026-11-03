@@ -10,8 +10,7 @@
 //! PR_CAPBSET_READ/DROP, PR_GET/SET_SECUREBITS, PR_GET/SET_KEEPCAPS, PR_CAP_AMBIENT, PR_SET_PTRACER,
 //! PR_SET/GET_IO_FLUSHER, PR_GET_SPECULATION_CTRL/SET (V2 does no per-task speculation control: "not
 //! affected" / ENXIO), PR_SET_SYSCALL_USER_DISPATCH off, PR_SET_MM_MAP_SIZE.
-//! Refused like a kernel without the feature (EINVAL, logged once each): PR_SET_SECCOMP (SX lane),
-//! PR_SET_SYSCALL_USER_DISPATCH on, PR_SET/GET_MDWE (needs MM to refuse W+X), PR_SET_VMA (anonymous VMA
+//! Refused like a kernel without the feature (EINVAL, logged once each): PR_SET_SYSCALL_USER_DISPATCH on, PR_SET/GET_MDWE (needs MM to refuse W+X), PR_SET_VMA (anonymous VMA
 //! names), PR_SCHED_CORE, PR_SET/GET_MEMORY_MERGE (no KSM); arch options of other CPUs EINVAL as on x86.
 
 use crate::SysCtx;
@@ -126,7 +125,7 @@ fn lsm_prctl(c: &SysCtx<'_>, option: i32, a: [u64; 4]) -> Option<i64> {
         PR_SET_PTRACER => {
             if arg2 == 0 || arg2 == u64::MAX || arg2 as i32 == -1 {
                 0
-            } else if proc::find_thread(arg2 as u32).is_some() {
+            } else if crate::ns_sys::find_thread(c, arg2 as u32).is_some() {
                 0
             } else {
                 -EINVAL
@@ -172,8 +171,9 @@ fn sys_prctl(c: &mut SysCtx<'_>) -> i64 {
         }
         PR_SET_NAME => set_name(c, arg2),
         PR_GET_NAME => c.proc.mm.copy_to_user(arg2, &pr.comm()).map(|_| 0).unwrap_or(-EFAULT),
-        PR_GET_SECCOMP => 0,
-        PR_SET_SECCOMP => not_built(c, option, 0, "seccomp"),
+        // SX-1: `prctl_get_seccomp` / `prctl_set_seccomp`.
+        PR_GET_SECCOMP => pr.seccomp().mode() as i64,
+        PR_SET_SECCOMP => crate::seccomp_sys::prctl_set(c, arg2, arg3),
         // `GET_TSC_CTL`: rdtsc is always allowed in V2.
         PR_GET_TSC => put_i32(c, arg2, PR_TSC_ENABLE),
         PR_SET_TSC => {
@@ -245,6 +245,8 @@ fn sys_prctl(c: &mut SysCtx<'_>) -> i64 {
                 return -EINVAL;
             }
             c.proc.mm_flags.set_thp_disabled(arg2 != 0);
+            // MM-13: the address space's switch (Linux MMF_DISABLE_THP is in the mm itself).
+            c.proc.mm.set_thp_disabled(arg2 != 0);
             0
         }
         PR_MPX_ENABLE_MANAGEMENT | PR_MPX_DISABLE_MANAGEMENT => -EINVAL,

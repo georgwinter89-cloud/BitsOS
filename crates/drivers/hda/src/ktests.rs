@@ -237,8 +237,8 @@ fn play() -> TestResult {
 }
 
 ktest!("sn.hda.quiesce", QemuOnly, quiesce);
-/// Quiesce with a stream running: every DMA stops, the link is in reset, bus master is off; then the
-/// controller comes up again and plays (the Reload path without a Reload).
+/// Quiesce with a stream running: every DMA stops, the link stays out of reset (Linux's shutdown, SN-7), bus
+/// master is off; then the controller comes up again and plays (the Reload path without a Reload).
 fn quiesce() -> TestResult {
     release_left();
     let list = match players() {
@@ -253,12 +253,64 @@ fn quiesce() -> TestResult {
         let running = (0..c.gcap().total()).filter(|&i| c.hw.rd8(sd(i) + SD_CTL) & SD_CTL_RUN != 0).count();
         kassert!(running == 0, "{running} descriptors still running");
         kassert!(c.hw.rd8(CORBCTL) & CORBCTL_RUN == 0 && c.hw.rd8(RIRBCTL) & RIRBCTL_DMA == 0, "rings still running");
-        kassert!(c.hw.rd32(GCTL) & GCTL_CRST == 0, "link not in reset");
+        kassert!(c.hw.rd32(GCTL) & GCTL_CRST != 0, "link reset by Quiesce");
         kassert!(c.hw.pci().command() & 0x4 == 0, "bus master still on");
         kassert!(c.state() == crate::State::Quiesced);
+        // SN-12 fixer: the note's content asserted here, not only in the log (the serial log may lose its tail).
+        let q = c.last_quiesce().ok_or("no quiesce note")?;
+        kassert!(q.was == crate::State::Up && !q.stuck, "{q:?}");
+        kassert!(matches!(q.codec, crate::CodecStop::Done | crate::CodecStop::NoPowerStates), "codec {:?}", q.codec);
         d.restart().map_err(|e| format!("restart: {e}"))?;
         kassert!(c.position(sid) == Err(HdaError::NoSuchStream), "old stream survived the restart");
         let sid = c.open(out, F48, 4096, 1024).map_err(|e| format!("open after restart: {e:?}"))?;
+        c.write(sid, &signal::bytes(0, 4096, false)).map_err(|e| format!("{e:?}"))?;
+        c.start(sid).map_err(|e| format!("{e:?}"))?;
+        let t0 = time::now_ns();
+        while c.position(sid).unwrap_or(0) < 1024 {
+            kassert!(time::now_ns() - t0 < SLACK_NS, "no progress after restart");
+            sched::sleep_ns(5_000_000);
+        }
+        c.close(sid).map_err(|e| format!("{e:?}"))?;
+    }
+    Ok(())
+}
+
+ktest!("sn.hda.panic_stop", QemuOnly, panic_stop);
+/// SN-12: the panic path's stop (`panic_stop_all`, on the lock-free list and a given clock) with a stream running:
+/// the codec's shutdown verbs answered (stream tags cleared, D3 asked), every DMA stopped, rings off, link out of
+/// reset, bus master off; then every controller comes up again and plays.
+fn panic_stop() -> TestResult {
+    release_left();
+    let list = match players() {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    for (d, out) in &list {
+        let sid = d.ctrl.open(*out, F48, 4096, 1024).map_err(|e| format!("open: {e:?}"))?;
+        d.ctrl.start(sid).map_err(|e| format!("start: {e:?}"))?;
+    }
+    let mut seen = Vec::new();
+    let n = crate::panic_stop_all(&time::now_ns_unlocked, &mut |name, r| seen.push((String::from(name), r)));
+    kassert!(n == crate::controllers().len(), "{n} of {} controllers stopped", crate::controllers().len());
+    for (d, _) in &list {
+        let c = &d.ctrl;
+        let Some((_, r)) = seen.iter().find(|(name, _)| name == c.name()) else { return Err(format!("{}: not reported", c.name())) };
+        klog::event!(Info, "ktest", "hda.panic_stop", ctrl = c.name(), was = r.ctrl.was.name(), stuck = r.ctrl.stuck,
+            codec = r.ctrl.codec.name(), display = r.display.is_some());
+        kassert!(r.ctrl.was == crate::State::Up && !r.ctrl.stuck, "{}: {:?}", c.name(), r.ctrl);
+        kassert!(matches!(r.ctrl.codec, crate::CodecStop::Done | crate::CodecStop::NoPowerStates), "{}: codec {:?}", c.name(), r.ctrl.codec);
+        let running = (0..c.gcap().total()).filter(|&i| c.hw.rd8(sd(i) + SD_CTL) & SD_CTL_RUN != 0).count();
+        kassert!(running == 0, "{running} descriptors still running");
+        kassert!(c.hw.rd8(CORBCTL) & CORBCTL_RUN == 0 && c.hw.rd8(RIRBCTL) & RIRBCTL_DMA == 0, "rings still running");
+        kassert!(c.hw.rd32(GCTL) & GCTL_CRST != 0, "link reset on the panic path");
+        kassert!(c.hw.pci().command() & 0x4 == 0, "bus master still on");
+    }
+    for d in crate::controllers().iter().filter(|d| d.ctrl.state() == crate::State::Quiesced) {
+        d.restart().map_err(|e| format!("restart {}: {e}", d.ctrl.name()))?;
+    }
+    for (d, out) in &list {
+        let c = &d.ctrl;
+        let sid = c.open(*out, F48, 4096, 1024).map_err(|e| format!("open after restart: {e:?}"))?;
         c.write(sid, &signal::bytes(0, 4096, false)).map_err(|e| format!("{e:?}"))?;
         c.start(sid).map_err(|e| format!("{e:?}"))?;
         let t0 = time::now_ns();
@@ -285,6 +337,10 @@ fn stale() -> TestResult {
         c.start(sid).map_err(|e| format!("{e:?}"))?;
         let _ = c.hw.pci().disable_device();
         d.restart().map_err(|e| format!("restart: {e}"))?;
+        // SN-12 fixer: the bring-up itself found the stream and the rings running (`hda.stale_dma`).
+        let (streams, rings) = c.last_stale();
+        klog::event!(Info, "ktest", "hda.stale", ctrl = c.name(), streams = streams, rings = rings);
+        kassert!(streams == 1 && rings, "bring-up found streams={streams} rings={rings}");
         let running = (0..c.gcap().total()).filter(|&i| c.hw.rd8(sd(i) + SD_CTL) & SD_CTL_RUN != 0).count();
         kassert!(running == 0, "{running} descriptors running after bring-up");
         kassert!(c.state() == crate::State::Up);

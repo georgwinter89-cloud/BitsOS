@@ -9,6 +9,7 @@
 
 use crate::error::VolError;
 use crate::pool::Pool;
+use crate::timing::{self, CommitTime};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -33,9 +34,6 @@ fn clock_ns() -> u64 {
     let f = *CLOCK.lock();
     f.map_or(0, |f| f())
 }
-
-/// A flush that holds the pool lock longer than this is logged (commit time = what other I/O waits).
-const SLOW_COMMIT_NS: u64 = 1_000_000_000;
 
 /// Closed devices whose busy count the pool has not dropped yet. `ids` always has room for `live` entries,
 /// so a close never allocates.
@@ -65,6 +63,14 @@ pub struct PoolHandle {
     /// The snapshot of a scheduled rollback an open could not carry out (0: none): it stays scheduled, and the
     /// snapshots tools say so instead of only the log (a system restore's generation changed without it).
     rollback_failed: AtomicU64,
+    /// The pool's device, for the flush before a commit (`timed`).
+    dev: Arc<dyn BlockDevice>,
+    /// The pool's volume bytes not yet flushed (`Pool::owed_counter`): the pool's own count, so a commit the
+    /// pool started itself (`commit_dirty_pages`, a FUA write) or one under a bare `lock` clears it too.
+    owed: Arc<AtomicU64>,
+    /// The longest commit an event reported and the last commit (VS-7, `timing::record`).
+    longest: AtomicU64,
+    last: SpinLock<CommitTime>,
 }
 
 impl PoolHandle {
@@ -74,7 +80,10 @@ impl PoolHandle {
 
     /// As `new`, with another bound for lock waits (tests).
     pub fn with_wait(pool: Pool, name: &str, wait_ns: u64) -> Arc<PoolHandle> {
+        let (dev, owed) = (pool.device().clone(), pool.owed_counter());
         Arc::new(PoolHandle {
+            dev,
+            owed,
             pool: Mutex::named("bitsvol.pool", pool),
             releases: SpinLock::named("bitsvol.releases", Releases { ids: Vec::new(), live: 0 }),
             name: name.into(),
@@ -85,6 +94,8 @@ impl PoolHandle {
             durable: AtomicU64::new(0),
             window_closed: WaitQueue::new(),
             rollback_failed: AtomicU64::new(0),
+            longest: AtomicU64::new(0),
+            last: SpinLock::named("bitsvol.last_commit", CommitTime::default()),
         })
     }
 
@@ -123,8 +134,48 @@ impl PoolHandle {
     /// A pool commit that also marks every flush deferred before it as durable (`settle`). A take's commit
     /// after the thaw goes through here.
     pub fn commit(&self) -> Result<(), DevError> {
+        self.timed("commit", |p| p.commit())
+    }
+
+    /// The last commit of this pool through its handle (flush, FUA write, `commit`) as it was measured.
+    pub fn last_commit(&self) -> CommitTime {
+        *self.last.lock()
+    }
+
+    /// Runs a commit under the pool lock and measures it (`timing::record`: counters, events). Six clock reads
+    /// and two counter snapshots per commit, which already costs one or two device flushes.
+    ///
+    /// With `PREFLUSH_BYTES` or more of volume writes not yet flushed, the device is flushed first without the pool
+    /// lock: on an image file that flush is the fsync that writes the volume's data back (2 s for 4 MiB on a
+    /// 2 MiB/s stick), and every read of the pool would wait for it under the lock. The commit's own barrier
+    /// still runs and then only finds the metadata and what was written meanwhile. dm-thin flushes its data
+    /// device before each metadata commit too (linux-6.6/drivers/md/dm-thin.c:3216, called from
+    /// dm-thin-metadata.c:899), under its metadata lock; here the pool lock also serialises the data's reads.
+    fn timed(&self, why: &'static str, f: impl FnOnce(&mut Pool) -> crate::error::Result<()>) -> Result<(), DevError> {
+        let d = |a: Option<u64>, b: Option<u64>| a.zip(b).map_or(0, |(a, b)| b.saturating_sub(a));
+        let pre_bytes = self.owed.load(Ordering::Acquire);
+        let (mut pre_ns, mut pre) = (0, 0);
+        if pre_bytes >= timing::PREFLUSH_BYTES {
+            let a = timing::now();
+            match self.dev.flush() {
+                Ok(()) => pre = pre_bytes,
+                Err(e) => klog::event!(Warn, "bitsvol", "commit.preflush_failed", pool = self.name.clone(), error = alloc::format!("{e:?}"); "the commit's own flush follows"),
+            }
+            pre_ns = d(a, timing::now());
+        }
+        let asked = timing::now();
         let mut p = self.lock()?;
-        self.commit_locked(&mut p, |p| p.commit())
+        let t0 = timing::now();
+        p.flushed_outside(pre);
+        let before = p.io_stats();
+        let r = self.commit_locked(&mut p, f);
+        let io = p.io_stats().since(&before);
+        let t1 = timing::now();
+        drop(p);
+        let t = CommitTime { why, lock_wait_ns: d(asked, t0), ns: d(t0, t1), pre_ns, pre_bytes: pre, io };
+        *self.last.lock() = t;
+        timing::record(&self.name, &self.longest, &t);
+        r
     }
 
     /// Runs `f` (a commit) with the pool locked; on success the flushes deferred before the lock was taken are
@@ -264,23 +315,6 @@ impl Drop for VolumeDevice {
     }
 }
 
-impl VolumeDevice {
-    /// Runs a commit under the pool lock; one that holds the lock longer than `SLOW_COMMIT_NS` is logged
-    /// (two clock reads per commit, which already costs two device flushes).
-    fn timed_commit(&self, f: impl FnOnce(&mut Pool) -> crate::error::Result<()>) -> Result<(), DevError> {
-        let mut p = self.h.lock()?;
-        let t0 = ksync::now_ns();
-        let r = self.h.commit_locked(&mut p, f);
-        if let (Some(a), Some(b)) = (t0, ksync::now_ns()) {
-            let ns = b.saturating_sub(a);
-            if ns > SLOW_COMMIT_NS {
-                klog::event!(Warn, "bitsvol", "commit.slow", pool = self.h.name.clone(), ns = ns);
-            }
-        }
-        r
-    }
-}
-
 /// An open snapshot window; dropping it ends the deferral at once and the copy window with the next pool lock.
 pub struct Window(Arc<PoolHandle>);
 
@@ -309,13 +343,13 @@ impl BlockDevice for VolumeDevice {
         if !fua {
             return self.h.lock()?.write(self.id, lba, buf, false, prio).map_err(VolError::to_dev);
         }
-        self.timed_commit(|p| p.write(self.id, lba, buf, true, prio))
+        self.h.timed("fua", |p| p.write(self.id, lba, buf, true, prio))
     }
     fn flush(&self) -> Result<(), DevError> {
         if self.h.defer_now(self.id) {
             return Ok(());
         }
-        self.timed_commit(|p| p.commit())
+        self.h.timed("flush", |p| p.commit())
     }
     /// fsync's answer after a flush that a snapshot's freeze held back (VS-2b CR 3).
     fn settle(&self) -> Result<(), DevError> {

@@ -1,5 +1,9 @@
-//! GDT, TSS and the IST stacks (owner: CP). Selector layout is a contract (SYSCALL/SYSRET depend on it):
-//! 0x08 kernel code, 0x10 kernel data, 0x18 user data (0x1B), 0x20 user code (0x23), 0x28 TSS (16 bytes).
+//! GDT, TSS and the IST stacks (owner: CP). Selector layout is a contract (SYSCALL/SYSRET depend on it), since
+//! AB-10a Linux's 64-bit one for everything a program sees (linux-6.6/arch/x86/include/asm/segment.h:165-220):
+//! 0x08 kernel code, 0x10 kernel data, 0x23 32-bit user code (`__USER32_CS`), 0x2B user data (`__USER_DS`),
+//! 0x33 64-bit user code (`__USER_CS`), 0x40 TSS (16 bytes), 0x50 LDT (16 bytes, present only while a thread
+//! of a process with an LDT runs), 0x63/0x6B/0x73 the three TLS slots of the running thread (`set_thread_area`).
+//! Wine's WoW64 hard-codes 0x23 as its 32-bit code selector and reads the 64-bit ones from `%cs`/`%ss`.
 //!
 //! IST stacks (spec/core.md §6.2): #DF (IST1), NMI (IST2) and #MC (IST3) run on their own stacks, so a kernel
 //! stack overflow or an NMI at any instant still has a good stack. Every CPU has its own GDT and TSS
@@ -15,9 +19,25 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_SS: u16 = 0x10;
-pub const USER_SS: u16 = 0x18 | 3;
-pub const USER_CS: u16 = 0x20 | 3;
-pub const TSS_SEL: u16 = 0x28;
+/// 32-bit user code (compatibility mode), the SYSRET base of STAR.
+pub const USER32_CS: u16 = 0x20 | 3;
+/// User data and stack: SS of every program, DS/ES of 32-bit code.
+pub const USER_DS: u16 = 0x28 | 3;
+pub const USER_SS: u16 = USER_DS;
+/// 64-bit user code.
+pub const USER_CS: u16 = 0x30 | 3;
+pub const TSS_SEL: u16 = 0x40;
+pub const LDT_SEL: u16 = 0x50;
+/// GDT index of the first TLS slot (`GDT_ENTRY_TLS_MIN`), three of them.
+pub const TLS_FIRST: usize = 12;
+pub const TLS_ENTRIES: usize = 3;
+/// Slots in each CPU's GDT (Linux has 16 too; 15, its CPU-number segment, stays empty).
+pub const GDT_ENTRIES: usize = 16;
+const TSS_SLOT: usize = 8;
+const LDT_SLOT: usize = 10;
+/// The LDT limit V2 always loads: the whole architectural table (8192 entries). Entries a program never wrote
+/// are zero, which faults like a selector beyond Linux's shorter limit (#GP with the selector).
+pub const LDT_LIMIT: u64 = 8192 * 8 - 1;
 
 /// IST indices (1-based as in the IDT gate).
 pub const IST_DOUBLE_FAULT: u8 = 1;
@@ -61,25 +81,36 @@ struct AlignedTss(Tss);
 /// Byte offset of `ist[0]` in the TSS.
 const TSS_IST_OFFSET: usize = 36;
 
-/// One CPU's descriptor tables: GDT (7 slots, the TSS descriptor takes two), TSS and what its IST slots hold.
+/// One CPU's descriptor tables: GDT (16 slots, the TSS and LDT descriptors take two each), TSS and what its IST
+/// slots hold.
 pub struct CpuGdt {
-    gdt: UnsafeCell<[u64; 7]>,
+    /// The descriptors as atomics (the same layout as `[u64; GDT_ENTRIES]`, what `lgdt` points at): since AB-10a
+    /// the owning CPU rewrites TLS and LDT slots at every switch while `entry` may read them from any CPU.
+    gdt: [AtomicU64; GDT_ENTRIES],
     tss: UnsafeCell<AlignedTss>,
     /// Per used IST slot: (guard or 0, bottom, top).
     ist: [[AtomicU64; 3]; 3],
+    /// Base of the LDT this CPU's LDTR holds (0: the null LDTR). Only the owning CPU writes it.
+    ldt_base: AtomicU64,
+    /// The LDT generation (`entry::segs`) this CPU last compared with its running thread's LDT.
+    pub(crate) ldt_seen: AtomicU64,
 }
 
-// SAFETY: `gdt` and the TSS are written only before the tables are loaded (`init`, `new_ap_tables`), then by the
-// owning CPU (`set_rsp0`, one store, interrupts off at its callers) and by `install_guarded_ist` (one aligned
-// store per IST slot within one cache line, interrupts off). Other CPUs only read the atomics in `ist`.
+// SAFETY: the GDT slots are atomics (any CPU may read them; only the owning CPU stores, `fill` before loading and
+// `set_tls_entry`/`load_ldt` after). The TSS is written only before the tables are loaded (`init`,
+// `new_ap_tables`), then by the owning CPU (`set_rsp0`, one store, interrupts off at its callers) and by
+// `install_guarded_ist` (one aligned store per IST slot within one cache line, interrupts off). Other CPUs read
+// only atomics.
 unsafe impl Sync for CpuGdt {}
 
 impl CpuGdt {
     const fn new() -> CpuGdt {
         CpuGdt {
-            gdt: UnsafeCell::new([0; 7]),
+            gdt: [const { AtomicU64::new(0) }; GDT_ENTRIES],
             tss: UnsafeCell::new(AlignedTss(Tss::new([0; 7]))),
             ist: [const { [const { AtomicU64::new(0) }; 3] }; 3],
+            ldt_base: AtomicU64::new(0),
+            ldt_seen: AtomicU64::new(0),
         }
     }
 
@@ -91,23 +122,19 @@ impl CpuGdt {
     fn fill(&self, ist: [u64; 7]) {
         // SAFETY: the caller guarantees the tables are not loaded yet (no CPU reads them), and this is the only
         // writer at this point (BSP start-up or a fresh AP table set).
-        unsafe {
-            self.tss.get().write(AlignedTss(Tss::new(ist)));
-            let tss_addr = self.tss_base() as u64;
-            let limit = (core::mem::size_of::<Tss>() - 1) as u64;
-            let gdt = &mut *self.gdt.get();
-            gdt[0] = 0;
-            gdt[1] = seg(0x9A, 0xA); // kernel code: present, ring 0, exec/read; L=1
-            gdt[2] = seg(0x92, 0xC); // kernel data
-            gdt[3] = seg(0xF2, 0xC); // user data (ring 3)
-            gdt[4] = seg(0xFA, 0xA); // user code (ring 3, L=1)
-            // TSS descriptor; base bits 24-31 matter (a truncated TSS base once reset V1 in a loop).
-            gdt[5] = (limit & 0xFFFF)
-                | ((tss_addr & 0xFF_FFFF) << 16)
-                | (0x89 << 40)
-                | (((limit >> 16) & 0xF) << 48)
-                | (((tss_addr >> 24) & 0xFF) << 56);
-            gdt[6] = tss_addr >> 32;
+        unsafe { self.tss.get().write(AlignedTss(Tss::new(ist))) };
+        let tss_addr = self.tss_base() as u64;
+        let limit = (core::mem::size_of::<Tss>() - 1) as u64;
+        let mut gdt = [0u64; GDT_ENTRIES];
+        gdt[1] = seg(0x9A, 0xA); // kernel code: present, ring 0, exec/read; L=1
+        gdt[2] = seg(0x92, 0xC); // kernel data
+        gdt[4] = seg(0xFA, 0xC); // 32-bit user code (ring 3, D=1, 4 GiB)
+        gdt[5] = seg(0xF2, 0xC); // user data (ring 3)
+        gdt[6] = seg(0xFA, 0xA); // 64-bit user code (ring 3, L=1)
+        // TSS descriptor; base bits 24-31 matter (a truncated TSS base once reset V1 in a loop).
+        [gdt[TSS_SLOT], gdt[TSS_SLOT + 1]] = system_desc(tss_addr, limit, 0x89);
+        for (slot, d) in self.gdt.iter().zip(gdt) {
+            slot.store(d, Ordering::Relaxed);
         }
     }
 
@@ -136,14 +163,66 @@ impl CpuGdt {
         unsafe { self.tss_base().add(TSS_IST_OFFSET + 8 * (ist as usize - 1)).cast::<u64>().read_unaligned() }
     }
 
+    /// Points IST slot `ist` (1..=7) of this TSS at `top`; returns the old value (0 for a slot out of range).
+    /// For the NMI hook (RB-12): while an NMI runs, a nested one must land below it, not on its saved state.
+    pub fn set_tss_ist(&self, ist: u8, top: u64) -> u64 {
+        if !(1..=7).contains(&ist) {
+            return 0;
+        }
+        let old = self.tss_ist(ist);
+        // SAFETY: inside this TSS (as `tss_ist`); one 8-byte store, and only this CPU's own NMI/#DF/#MC delivery
+        // reads the slot, which cannot split an instruction.
+        unsafe { self.tss_base().add(TSS_IST_OFFSET + 8 * (ist as usize - 1)).cast::<u64>().write_unaligned(top) };
+        old
+    }
+
     /// Address of the TSS (tests compare it with what `str`/the descriptor say).
     pub fn tss_addr(&self) -> u64 {
         self.tss_base() as u64
+    }
+
+    /// The descriptor in GDT slot `i` (0 beyond the table): what a selector load on this CPU reads there.
+    pub fn entry(&self, i: usize) -> u64 {
+        if i >= GDT_ENTRIES {
+            return 0;
+        }
+        self.gdt[i].load(Ordering::Relaxed)
+    }
+
+    /// Writes TLS slot `i` (0..TLS_ENTRIES) with `desc`. Only the owning CPU with interrupts off (AB-10a: the
+    /// running thread's slots, `entry::segs`): this CPU reads a GDT slot only when it loads a selector itself.
+    pub(crate) fn set_tls_entry(&self, i: usize, desc: u64) {
+        if i < TLS_ENTRIES {
+            // One 8-byte store by the owning CPU, which cannot be in the middle of a selector load while it runs this.
+            self.gdt[TLS_FIRST + i].store(desc, Ordering::Relaxed);
+        }
+    }
+
+    /// Base of the LDT this CPU has loaded (0: the null LDTR).
+    pub fn ldt_base(&self) -> u64 {
+        self.ldt_base.load(Ordering::Relaxed)
+    }
+
+    /// Points this CPU's LDTR at a table of 8192 descriptors at `base` (kernel memory), or loads the null LDTR
+    /// for 0. Only the owning CPU (`this()`), interrupts off.
+    pub(crate) fn load_ldt(&self, base: u64) {
+        let [lo, hi] = if base == 0 { [0, 0] } else { system_desc(base, LDT_LIMIT, 0x82) };
+        // Stores by the owning CPU, which reads the slots only at the `lldt` below.
+        self.gdt[LDT_SLOT].store(lo, Ordering::Relaxed);
+        self.gdt[LDT_SLOT + 1].store(hi, Ordering::Relaxed);
+        imp::lldt(if base == 0 { 0 } else { LDT_SEL });
+        self.ldt_base.store(base, Ordering::Relaxed);
     }
 }
 
 const fn seg(access: u64, flags: u64) -> u64 {
     (access << 40) | (flags << 52) | (0xF << 48) | 0xFFFF
+}
+
+/// A 16-byte system descriptor (TSS 0x89, LDT 0x82): present, ring 0, base and limit split as the CPU wants.
+const fn system_desc(base: u64, limit: u64, access: u64) -> [u64; 2] {
+    let lo = (limit & 0xFFFF) | ((base & 0xFF_FFFF) << 16) | (access << 40) | (((limit >> 16) & 0xF) << 48) | (((base >> 24) & 0xFF) << 56);
+    [lo, base >> 32]
 }
 
 static BSP: CpuGdt = CpuGdt::new();
@@ -270,23 +349,29 @@ mod imp {
     unsafe impl Sync for BootStacks {}
     static BOOT_IST: BootStacks = BootStacks(UnsafeCell::new([Stack([0; BOOT_IST_STACK]), Stack([0; BOOT_IST_STACK]), Stack([0; BOOT_IST_STACK])]));
 
-    /// Loads `t` on this CPU: lgdt, data segments, a far return into the new CS, ltr.
+    /// Loads `t` on this CPU: lgdt, data segments, a far return into the new CS, ltr, a null LDTR.
     pub fn load(t: &'static CpuGdt) {
         #[repr(C, packed)]
         struct Ptr {
             limit: u16,
             base: u64,
         }
-        let ptr = Ptr { limit: (7 * 8 - 1) as u16, base: t.gdt.get() as u64 };
-        // SAFETY: `t` was filled by `fill` (kernel code/data selectors at 0x08/0x10, an available TSS at 0x28) and
+        let ptr = Ptr { limit: (GDT_ENTRIES * 8 - 1) as u16, base: t.gdt.as_ptr() as u64 };
+        // DS and ES are null as Linux's 64-bit programs start (`start_thread`); AB-10a's context switch keeps a
+        // program's own DS/ES/FS/GS selectors per thread from then on (`entry::segs`).
+        // SAFETY: `t` was filled by `fill` (kernel code/data selectors at 0x08/0x10, an available TSS at 0x40) and
         // lives forever ('static); the far return reloads CS with the same kernel code selector, so execution
         // continues at the next instruction. Interrupts are off at both callers (BSP start-up, AP start-up).
+        // `lldt` with selector 0 loads a null LDTR (AB-16 CR, INT-W21): every TI=1 selector a program puts into
+        // a sigreturn or iretq frame then raises #GP instead of the CPU reading a descriptor from whatever base
+        // and limit firmware or the previous kernel (Reload) left in LDTR, as Linux's clear_LDT does
+        // (linux-6.6/arch/x86/kernel/cpu/common.c:2283, arch/x86/include/asm/mmu_context.h:80).
         unsafe {
             core::arch::asm!(
                 "lgdt [{p}]",
                 "mov ax, {ds}",
-                "mov ds, ax", "mov es, ax", "mov ss, ax",
-                "xor eax, eax", "mov fs, ax", "mov gs, ax",
+                "mov ss, ax",
+                "xor eax, eax", "mov ds, ax", "mov es, ax", "mov fs, ax", "mov gs, ax",
                 "push {cs}",
                 "lea rax, [rip + 2f]",
                 "push rax",
@@ -294,6 +379,8 @@ mod imp {
                 "2:",
                 "mov ax, {tss}",
                 "ltr ax",
+                "xor eax, eax",
+                "lldt ax",
                 p = in(reg) &ptr,
                 ds = const KERNEL_SS,
                 cs = const KERNEL_CS as u64,
@@ -301,6 +388,23 @@ mod imp {
                 out("rax") _,
             );
         }
+    }
+
+    /// This CPU's LDTR selector (`sldt`): 0 once `load` ran.
+    pub fn ldtr() -> u16 {
+        let sel: u16;
+        // SAFETY: `sldt` only stores the LDTR selector into a register; it changes no state and cannot fault in
+        // ring 0 (no UMIP check there).
+        unsafe { core::arch::asm!("sldt {0:x}", out(reg) sel, options(nomem, nostack, preserves_flags)) };
+        sel
+    }
+
+    /// `lldt sel` on this CPU (0 or LDT_SEL, after `load_ldt` wrote the descriptor).
+    pub fn lldt(sel: u16) {
+        // SAFETY: `sel` is the null selector or LDT_SEL, whose slot `load_ldt` just filled with a present LDT
+        // descriptor of this CPU's loaded GDT, so `lldt` cannot fault; it changes only where this CPU looks up
+        // TI=1 selectors.
+        unsafe { core::arch::asm!("lldt {0:x}", in(reg) sel, options(nostack, preserves_flags)) };
     }
 
     pub fn init() {
@@ -410,6 +514,10 @@ mod imp {
     }
     #[allow(dead_code)]
     pub fn load(_t: &'static CpuGdt) {}
+    pub fn ldtr() -> u16 {
+        0
+    }
+    pub fn lldt(_sel: u16) {}
     pub fn install_guarded_ist(
         _alloc_stack_page: &mut dyn FnMut() -> Option<u64>,
         _free_stack_page: &mut dyn FnMut(u64),
@@ -446,6 +554,8 @@ pub use imp::install_guarded_ist;
 pub use imp::new_ap_tables;
 #[allow(unused_imports)]
 pub(crate) use imp::load;
+/// This CPU's LDTR selector; 0 (null) on every CPU once its tables are loaded (host builds: 0).
+pub use imp::ldtr;
 
 #[cfg(test)]
 mod tests {
@@ -497,13 +607,44 @@ mod tests {
         assert_eq!(t.tss_ist(3), 0x3000);
         assert_eq!(t.tss_ist(0), 0);
         assert_eq!(t.tss_ist(8), 0);
-        // SAFETY: test-local tables, not loaded anywhere.
-        let gdt = unsafe { &*t.gdt.get() };
+        let gdt: [u64; GDT_ENTRIES] = core::array::from_fn(|i| t.entry(i));
         assert_eq!(gdt[1] >> 40 & 0xFF, 0x9A);
-        assert_eq!(gdt[5] >> 40 & 0xFF, 0x89, "available 64-bit TSS");
-        let base = (gdt[5] >> 16 & 0xFF_FFFF) | (gdt[5] >> 56 & 0xFF) << 24 | gdt[6] << 32;
+        assert_eq!(gdt[8] >> 40 & 0xFF, 0x89, "available 64-bit TSS");
+        let base = (gdt[8] >> 16 & 0xFF_FFFF) | (gdt[8] >> 56 & 0xFF) << 24 | gdt[9] << 32;
         assert_eq!(base, t.tss_addr());
+        assert_eq!(TSS_SEL as usize, TSS_SLOT * 8);
+        assert_eq!(LDT_SEL as usize, LDT_SLOT * 8);
         t.record(1, &IstStack { ist: 2, guard: Some(0x10), bottom: 0x20, top: 0x30 });
         assert_eq!(t.ist_stacks()[1], IstStack { ist: 2, guard: Some(0x10), bottom: 0x20, top: 0x30 });
+    }
+
+    /// AB-10a: Linux's user selectors (segment.h:192-217) and their descriptors.
+    #[test]
+    fn linux_user_layout() {
+        assert_eq!((USER32_CS, USER_DS, USER_CS), (0x23, 0x2b, 0x33));
+        assert_eq!(TLS_FIRST * 8 + 3, 0x63);
+        // SYSRET: CS = base + 16, SS = base + 8 from STAR[63:48] = USER32_CS.
+        assert_eq!((USER32_CS + 16, USER32_CS + 8), (USER_CS, USER_DS));
+        let t = CpuGdt::new();
+        t.fill([0; 7]);
+        let (c32, d, c64) = (t.entry(4), t.entry(5), t.entry(6));
+        assert_eq!((c32 >> 40 & 0xFF, c32 >> 53 & 1, c32 >> 54 & 1), (0xFA, 0, 1), "32-bit code: L=0, D=1");
+        assert_eq!(d >> 40 & 0xFF, 0xF2);
+        assert_eq!((c64 >> 40 & 0xFF, c64 >> 53 & 1, c64 >> 54 & 1), (0xFA, 1, 0), "64-bit code: L=1, D=0");
+        for i in [0, 3, 7, 10, 11, 12, 13, 14, 15] {
+            assert_eq!(t.entry(i), 0, "slot {i} empty");
+        }
+        assert_eq!(t.entry(GDT_ENTRIES), 0);
+        t.set_tls_entry(1, 0x1234);
+        t.set_tls_entry(3, 0x9999);
+        assert_eq!((t.entry(13), t.entry(15)), (0x1234, 0));
+        t.load_ldt(0xFFFF_8000_1234_5000);
+        let (lo, hi) = (t.entry(10), t.entry(11));
+        assert_eq!(lo >> 40 & 0xFF, 0x82, "present LDT");
+        assert_eq!((lo & 0xFFFF) | (lo >> 48 & 0xF) << 16, LDT_LIMIT);
+        assert_eq!((lo >> 16 & 0xFF_FFFF) | (lo >> 56 & 0xFF) << 24 | hi << 32, 0xFFFF_8000_1234_5000);
+        assert_eq!(t.ldt_base(), 0xFFFF_8000_1234_5000);
+        t.load_ldt(0);
+        assert_eq!((t.entry(10), t.entry(11), t.ldt_base()), (0, 0, 0));
     }
 }

@@ -75,6 +75,8 @@ const SCAN: u8 = 2;
 klog::counter!(EPOLLS, "vfs.epolls");
 klog::counter!(EPOLL_ITEMS, "vfs.epoll.items");
 klog::counter!(EPOLL_NO_ROOM, "vfs.epoll.no_room");
+// FS-17: looks at a watched epoll that found a stale item woken during the look and looked again.
+klog::counter!(EPOLL_LOOK_AGAIN, "vfs.epoll.look_again");
 
 /// Serialises the loop and path checks of nested epolls (`epnested_mutex`).
 static NEST: Mutex<()> = Mutex::named("vfs.epoll.nest", ());
@@ -107,6 +109,9 @@ pub(crate) struct EpItem {
     /// IDLE / READY / SCAN, changed under `ep.ready`.
     state: AtomicU8,
     rearm: AtomicBool,
+    /// Callbacks so far (bumped under `ep.ready`): `readiness` takes a stale item off the ready list only when no
+    /// callback came since its look (FS-17).
+    wakes: AtomicU64,
     /// Taken out (DEL, close, the epoll's end): callbacks and harvests pass it by.
     dead: AtomicBool,
     /// The file names no `PollQueue` but may change: looked at again by every sleeping epoll_wait slice.
@@ -197,6 +202,7 @@ impl EpInner {
     fn queue(&self, it: &EpItem, depth: u32) -> bool {
         {
             let mut r = self.ready.lock();
+            it.wakes.fetch_add(1, Ordering::SeqCst);
             match it.state.load(Ordering::SeqCst) {
                 IDLE => {
                     if r.len() < r.capacity() {
@@ -270,13 +276,17 @@ impl EpInner {
     /// front of it that are not are taken off. Needs no mutex (module doc): Linux waits for `ep->mtx` while a
     /// harvest has the items; here an answer "not ready" given during a harvest is made good by a wake of `pq`
     /// when the harvest puts items back (`owed`), and a harvest that ran during the look makes it look again.
+    /// FS-17: Linux looks with the items on its scan list, so a callback during the look puts the item back
+    /// (`ovflist`); here the look keeps each item's callback count, and an item that was woken after its look
+    /// stays on the list and is looked at again (taking it off lost the wake of a peer's write that landed
+    /// between the look and the cleanup: the epoll fd showed not readable with the socket full, bitscomp 27.10.).
     fn readiness(&self) -> u32 {
         const READY_MASK: u32 = Events::IN | Events::RDNORM;
         for _ in 0..4 {
             if self.lost.load(Ordering::SeqCst) {
                 return READY_MASK;
             }
-            let (snap, seen_gen): (Vec<Arc<EpItem>>, u64) = loop {
+            let (snap, seen_gen): (Vec<(Arc<EpItem>, u64)>, u64) = loop {
                 let n = {
                     let r = self.ready.lock();
                     if r.is_empty() {
@@ -296,12 +306,12 @@ impl EpInner {
                 if r.len() > n {
                     continue;
                 }
-                v.extend(r.iter().cloned());
+                v.extend(r.iter().map(|it| (it.clone(), it.wakes.load(Ordering::SeqCst))));
                 break (v, self.scan_gen.load(Ordering::SeqCst));
             };
             let mut found = false;
             let mut stale = 0;
-            for it in &snap {
+            for (it, _) in &snap {
                 if !it.dead.load(Ordering::SeqCst) && it.poll() != 0 {
                     found = true;
                     break;
@@ -312,10 +322,16 @@ impl EpInner {
                 return READY_MASK;
             }
             let mut gone: Vec<Arc<EpItem>> = Vec::new();
+            let mut woken = 0usize;
             let settled = {
                 let mut r = self.ready.lock();
                 if gone.try_reserve_exact(stale).is_ok() {
-                    for it in &snap[..stale] {
+                    for (it, seen) in &snap[..stale] {
+                        if it.wakes.load(Ordering::SeqCst) != *seen {
+                            // Woken after its look: it may be ready now (stays, looked at again).
+                            woken += 1;
+                            continue;
+                        }
                         if it.state.load(Ordering::SeqCst) == READY
                             && let Some(pos) = r.iter().position(|x| Arc::ptr_eq(x, it))
                             && let Some(x) = r.remove(pos)
@@ -325,7 +341,10 @@ impl EpInner {
                         }
                     }
                 }
-                if self.in_scan.load(Ordering::SeqCst) {
+                if woken > 0 {
+                    EPOLL_LOOK_AGAIN.inc();
+                    false
+                } else if self.in_scan.load(Ordering::SeqCst) {
                     self.owed.store(true, Ordering::SeqCst);
                     true
                 } else {
@@ -337,7 +356,8 @@ impl EpInner {
             if settled {
                 return 0;
             }
-            // A harvest started and ended during the look: the items it put back were not in the snapshot.
+            // A harvest started and ended during the look (the items it put back were not in the snapshot), or a
+            // stale item was woken after its look.
         }
         // Harvests one after another all the time: say ready (spurious at worst, never a lost wake-up).
         READY_MASK
@@ -543,6 +563,15 @@ impl Epoll {
         })
     }
 
+    /// AB-17 (kcmp KCMP_EPOLL_TFD): the open file of the `toff`-th item watching fd `tfd`, walking the items in
+    /// key order (file address, fd) as `ep_find_tfd` does (linux-6.6/fs/eventpoll.c:1048). None: no such item
+    /// (Linux's ENOENT), or its open file is already going away.
+    pub fn target(&self, tfd: i32, toff: u64) -> Option<Arc<OpenFile>> {
+        let items = self.inner.items.lock();
+        let it = items.iter().filter(|it| it.key.1 == tfd && !it.dead.load(Ordering::SeqCst)).nth(usize::try_from(toff).ok()?)?;
+        it.owner.upgrade()
+    }
+
     /// Items now (tests, diagnostics).
     pub fn len(&self) -> usize {
         self.inner.items.lock().len()
@@ -672,6 +701,7 @@ impl Epoll {
             data: AtomicU64::new(event.1),
             state: AtomicU8::new(IDLE),
             rearm: AtomicBool::new(false),
+            wakes: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             legacy,
             last: AtomicU32::new(0),

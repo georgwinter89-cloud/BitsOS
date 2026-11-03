@@ -3,13 +3,13 @@
 //! on the focused tile), per-tab close, "+N", the float and close buttons, and with `theme.layout.address_bar =
 //! tile` the tile's own address bar above the tabs. Redrawn only when its `Look` changes.
 
-use smithay::desktop::Window;
+use crate::win::Window;
 
 use crate::canvas::{Box2, Canvas, Glyph, glyph_into};
 use crate::layout::{Place, Rect};
 use crate::state::App;
 use crate::tabs;
-use crate::text::{Font, Weight};
+use crate::text::{Family, Font, Weight};
 use crate::theme::{Theme, alpha};
 use crate::zones::{self, Part};
 
@@ -70,7 +70,7 @@ pub fn tile_address_rect(f: Rect, t: &Theme) -> Rect {
 }
 
 pub fn tab_font(t: &Theme) -> Font {
-    Font::new(t.fs(13.0), Weight::Regular, t.scale)
+    t.font(Family::Ui, 13.0, Weight::Regular)
 }
 
 pub fn draw(look: &Look, t: &Theme) -> Canvas {

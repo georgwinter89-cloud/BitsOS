@@ -4,7 +4,7 @@
 // check suite of the MCP server itself is host/tests/mcp/echt.mjs.
 //
 //   node echt.mjs <host[:port]> <local ELF> [program arguments ...] [--to <path>] [--keep]
-//        [--timeout-ms N] [--stdin-file <file>] [--expect-exit N] [--token-file <path>]
+//        [--timeout-ms N] [--stdin-file <file>] [--expect-exit N] [--token-file <path>] [--tls <key store>|auto]
 //
 // --to: where the program goes on BitsOS (default /tmp/echt/<file name>); --keep leaves it there (default:
 // deleted after the run). --timeout-ms: run's deadline (default 30000; a program still running then is
@@ -19,13 +19,13 @@ import { connect, McpError, readToken, upload } from './mcp-call.mjs';
 const opts = {}, rest = [];
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
-  if (['--to', '--timeout-ms', '--stdin-file', '--expect-exit', '--token-file'].includes(a)) opts[a.slice(2)] = process.argv[++i] ?? '';
+  if (['--to', '--timeout-ms', '--stdin-file', '--expect-exit', '--token-file', '--tls'].includes(a)) opts[a.slice(2)] = process.argv[++i] ?? '';
   else if (a === '--keep') opts.keep = true;
   else rest.push(a);
 }
 const [host, elfFile, ...progArgs] = rest;
 if (!host || !elfFile) {
-  console.error('usage: node echt.mjs <host[:port]> <local ELF> [args ...] [--to <path>] [--keep] [--timeout-ms N] [--stdin-file F] [--expect-exit N] [--token-file F]');
+  console.error('usage: node echt.mjs <host[:port]> <local ELF> [args ...] [--to <path>] [--keep] [--timeout-ms N] [--stdin-file F] [--expect-exit N] [--token-file F] [--tls DIR|auto]');
   process.exit(2);
 }
 const name = basename(elfFile);
@@ -41,7 +41,7 @@ if (elf.length < 64 || elf.toString('latin1', 0, 4) !== '\x7fELF' || elf[4] !== 
 }
 
 async function main() {
-  const session = await connect(host, { token: readToken(opts['token-file']) });
+  const session = await connect(host, { token: readToken(opts['token-file']), tls: opts.tls, tokenFile: opts['token-file'] });
   let up;
   try {
     up = await upload(session, elf, to, { mode: '0755', parents: true });

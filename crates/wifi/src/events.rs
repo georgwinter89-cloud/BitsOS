@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::eapol::{Bad, Got};
-use crate::mlme::JoinFailure;
+use crate::mlme::{JoinFailure, Phase};
 
 /// How many events a log keeps by default before the oldest go. Not a resource count (R1): a
 /// caller sets its own with `set_cap`.
@@ -128,6 +128,13 @@ pub enum WifiEvent {
         reason: u16,
         disassoc: bool,
     },
+    /// the AP's deauthentication or disassociation came where mac80211 ignores it (no state of
+    /// this join it could end yet): the exchange goes on
+    ApEndIgnored {
+        phase: Phase,
+        reason: u16,
+        disassoc: bool,
+    },
     /// the supervisor's next join, `in_ms` from now (`attempt` since the link was lost)
     RejoinScheduled {
         attempt: u32,
@@ -172,6 +179,20 @@ impl fmt::Display for WifiEvent {
                     "deauthentication"
                 }
             ),
+            WifiEvent::ApEndIgnored {
+                phase,
+                reason,
+                disassoc,
+            } => write!(
+                f,
+                "{} by the AP during {} ignored (as mac80211), reason {reason}",
+                if *disassoc {
+                    "disassociation"
+                } else {
+                    "deauthentication"
+                },
+                phase.as_str()
+            ),
             WifiEvent::RejoinScheduled {
                 attempt,
                 in_ms,
@@ -203,6 +224,7 @@ impl WifiEvent {
             WifiEvent::Connected { .. } => "link.up",
             WifiEvent::JoinFailed { .. } => "join.failed",
             WifiEvent::EndedByAp { .. } => "link.ended",
+            WifiEvent::ApEndIgnored { .. } => "join.ap_end_ignored",
             WifiEvent::RejoinScheduled { .. } => "rejoin.scheduled",
             WifiEvent::RejoinStart { .. } => "rejoin.start",
             WifiEvent::LinkUp => "supervisor.up",

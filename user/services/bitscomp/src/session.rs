@@ -330,12 +330,23 @@ impl App {
     /// What is open now, as a session.
     pub fn session_now(&self) -> Saved {
         let mut spaces = Vec::new();
+        let seen = std::cell::RefCell::new(std::collections::HashSet::new());
         for i in 0..self.ws_count() {
             let ws = if i == self.desk.active { &self.ws } else { &self.desk.parked[i] };
-            let argv = |w: &smithay::desktop::Window| self.restart_argv(self.pid_of(w));
+            // LO-1: one argv per started program: windows of one launcher's program (two LibreOffice windows of one
+            // soffice.bin) restart it once, not once per window.
+            let argv = |w: &crate::win::Window| {
+                let pid = self.pid_of(w);
+                match self.restart_key(pid) {
+                    Some(k) if !seen.borrow_mut().insert(k) => None,
+                    _ => self.restart_argv(pid),
+                }
+            };
             let mut tiles: Vec<Vec<Vec<String>>> =
                 ws.tiles.iter().map(|t| t.stack.iter().filter_map(argv).collect()).collect();
             tiles.extend(ws.floating.iter().filter_map(|f| argv(&f.win)).map(|a| vec![a]));
+            // WY-12: a minimised window comes back as a tile of its own (a new start shows it again).
+            tiles.extend(ws.minimized.iter().filter_map(|m| argv(&m.win)).map(|a| vec![a]));
             tiles.retain(|t: &Vec<Vec<String>>| !t.is_empty());
             spaces.push(Space { name: self.desk.names[i].clone(), tiles });
         }
@@ -345,10 +356,17 @@ impl App {
     /// What restarts the program of `pid`: the argv bitscomp started it with, else only its program name (another
     /// client's arguments are not ours to store).
     fn restart_argv(&self, pid: i32) -> Option<Vec<String>> {
-        if let Some(a) = u32::try_from(pid).ok().and_then(|p| self.spawned.get(&p)) {
-            return Some(a.clone());
+        // LO-1: a launcher's program restarts by the launcher's argv (soffice.bin is in its process group).
+        if let Some(k) = self.restart_key(pid) {
+            return self.spawned.get(&k).cloned();
         }
         crate::ending::cmdline(pid).and_then(|v| v.into_iter().next()).filter(|c| !c.is_empty()).map(|c| vec![c])
+    }
+
+    /// The program bitscomp started that `pid` belongs to: itself, else its process group's leader (a launcher).
+    fn restart_key(&self, pid: i32) -> Option<u32> {
+        let p = u32::try_from(pid).ok()?;
+        [p, Self::group_of(p)].into_iter().find(|k| self.spawned.contains_key(k))
     }
 
     /// Saves when due (and something changed since the last write); returns the next deadline.
@@ -415,6 +433,7 @@ impl App {
             }
         }
         self.ws_switch(base + saved.active.min(saved.spaces.len().saturating_sub(1)));
+        self.absicht_register();
         self.chrome_dirty();
         self.session_dirty();
     }

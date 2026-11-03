@@ -70,6 +70,7 @@ pub enum State {
     Failed = 3,
 }
 
+
 impl State {
     fn from(v: u8) -> State {
         match v {
@@ -103,19 +104,6 @@ pub enum HdaError {
     NoMemory,
     /// The codec did not answer while the path was set up.
     Codec,
-}
-
-impl HdaError {
-    pub fn dev(self) -> devmodel::DevError {
-        use devmodel::DevError as D;
-        match self {
-            HdaError::NotUp => D::Gone,
-            HdaError::Refused | HdaError::Busy => D::Refused,
-            HdaError::NoSuchOutput | HdaError::NoSuchStream | HdaError::BadFormat => D::InvalidArgument,
-            HdaError::NoMemory => D::NoMemory,
-            HdaError::Codec => D::Io,
-        }
-    }
 }
 
 /// An output of this controller: codec address and pin node.
@@ -156,6 +144,9 @@ pub struct CodecEntry {
     pub tags: Vec<(u8, u8)>,
     /// Microphones and line inputs with their ADC paths (SN-9).
     pub inputs: Vec<hdacodec::input::Input>,
+    /// The codec's shutdown verbs (`hdacodec::setup::shutdown`), built at bring-up: Quiesce sends them without
+    /// allocating (SN-12).
+    pub shutdown: Vec<Action>,
 }
 
 struct Slot<M: Mem> {
@@ -173,6 +164,9 @@ struct Slot<M: Mem> {
     pos: Position,
     written: u64,
     running: bool,
+    /// `start` took its run bit back after a Quiesce without waiting for the engine: a quiesced close keeps the
+    /// buffers (the engine was never seen stopped).
+    stop_unseen: bool,
     periods_seen: u64,
     callback: Option<PeriodFn>,
     underruns: u64,
@@ -196,6 +190,10 @@ const JACK_POLL_NS: u64 = 1_000_000_000;
 
 mod capture;
 pub use capture::InputInfo;
+mod quiesce;
+pub use quiesce::{CodecStop, QuiesceResult};
+#[cfg(test)]
+pub(crate) use quiesce::{NoteKind, note_kind as quiesce_note_kind};
 
 /// The ATI codec pin of AZ endpoint 0 (`atihdmi_port2pin`: port * 2 + 3), the one SN-5's display side feeds to
 /// DIG0 (the DP SST link to the Mini-PC's DP->HDMI converter).
@@ -220,8 +218,17 @@ pub struct Controller<H: Hw> {
     irqs: AtomicU64,
     /// Completion interrupts are armed (MSI): BDL entries carry IOC, INTCTL has the streams.
     irq_driven: AtomicBool,
-    /// Quiesce does not log (it may run on the panic path): bit 7 = note present, low bits = state before.
+    /// Quiesce does not log (it may run on the panic path): bit 7 = note present, bit 6 = an engine was not
+    /// seen stopped ([`NOTE_STUCK`]), low bits = state before.
     quiesce_note: AtomicU8,
+    /// The last Quiesce's note word, kept after the note is logged ([`Controller::last_quiesce`], ktests).
+    quiesce_last: AtomicU8,
+    /// The last Quiesce did not see every DMA engine stopped: a `close` while quiesced keeps the stream's
+    /// buffers (freed after the next confirmed link reset) instead of reading the engine again.
+    quiesce_stuck: AtomicBool,
+    /// What the last bring-up found running and stopped: stream descriptors, the command rings (ktests).
+    stale_streams: AtomicU32,
+    stale_rings: AtomicBool,
     /// DMA buffers an engine may still use (a stop that was not confirmed): held until the next confirmed link
     /// reset, which resets every DMA engine (HDA spec 3.3.7 CRST), so they are never freed under a live engine.
     kept: SpinLock<Vec<H::Mem>>,
@@ -266,6 +273,10 @@ impl<H: Hw> Controller<H> {
             irqs: AtomicU64::new(0),
             irq_driven: AtomicBool::new(false),
             quiesce_note: AtomicU8::new(0),
+            quiesce_last: AtomicU8::new(0),
+            quiesce_stuck: AtomicBool::new(false),
+            stale_streams: AtomicU32::new(0),
+            stale_rings: AtomicBool::new(false),
             kept: SpinLock::named("hda.kept", Vec::new()),
             streaming: AtomicBool::new(!kind.enumerate_only()),
         }
@@ -323,6 +334,11 @@ impl<H: Hw> Controller<H> {
         self.link.lock().as_ref().map_or((0, 0), |l| (l.timeouts, l.strays))
     }
 
+    /// What the last bring-up found running and stopped first (`hda.stale_dma`): stream descriptors, rings.
+    pub fn last_stale(&self) -> (u32, bool) {
+        (self.stale_streams.load(Ordering::Acquire), self.stale_rings.load(Ordering::Acquire))
+    }
+
     /// Brings the controller up from whatever state it is in. Thread context; may sleep.
     pub fn bring_up(&self) -> Result<(), String> {
         let r = self.bring_up_inner();
@@ -349,8 +365,10 @@ impl<H: Hw> Controller<H> {
         let was_running = (0..total).filter(|&i| hw.rd8(sd(i) + SD_CTL) & SD_CTL_RUN != 0).count();
         let rings_running = hw.rd8(CORBCTL) & CORBCTL_RUN != 0 || hw.rd8(RIRBCTL) & RIRBCTL_DMA != 0;
         let stopped = link::stop_all(hw, total);
+        self.stale_streams.store(was_running as u32, Ordering::Release);
+        self.stale_rings.store(rings_running, Ordering::Release);
         if was_running > 0 || rings_running {
-            klog::event!(Warn, "snd", "hda.stale_dma", ctrl = self.name.as_str(), streams = was_running, rings = rings_running, stopped = stopped;
+            klog::event!(Info, "snd", "hda.stale_dma", ctrl = self.name.as_str(), streams = was_running, rings = rings_running, stopped = stopped;
                 "streams or command rings were running before bring-up (Reload, firmware): stopped");
         }
         if !stopped {
@@ -455,7 +473,7 @@ impl<H: Hw> Controller<H> {
                     }
                     Err(e) => {
                         if let Some(m) = l.stop_rings(&self.hw) {
-                            self.keep(m, "rings");
+                            self.keep(m, "rings", false);
                         }
                         klog::event!(Warn, "snd", "hda.rings_fallback", ctrl = self.name.as_str(), error = alloc::format!("{e:?}");
                             "CORB/RIRB gave no answer: immediate commands");
@@ -471,15 +489,22 @@ impl<H: Hw> Controller<H> {
     }
 
     /// Holds a buffer whose engine did not confirm its stop until the next link reset.
-    fn keep(&self, m: H::Mem, what: &str) {
-        klog::event!(Warn, "snd", "hda.dma_kept", ctrl = self.name.as_str(), what = what, bytes = m.size();
-            "the engine did not stop: buffer held until the next link reset");
+    fn keep(&self, m: H::Mem, what: &str, quiet: bool) {
+        if !quiet {
+            klog::event!(Warn, "snd", "hda.dma_kept", ctrl = self.name.as_str(), what = what, bytes = m.size();
+                "the engine did not stop: buffer held until the next link reset");
+        }
         self.kept.lock().push(m);
     }
 
     /// Buffers held for a stuck engine (tests).
     pub fn kept_buffers(&self) -> usize {
         self.kept.lock().len()
+    }
+
+    /// Streams open now (SN-13 w25: the `snd` status tells "HDMI sound on" (`streaming`) from a DMA stream).
+    pub fn open_streams(&self) -> usize {
+        self.slots.lock().iter().flatten().count()
     }
 
     fn first_codec(&self) -> u8 {
@@ -534,7 +559,8 @@ impl<H: Hw> Controller<H> {
                 kind = if i.kind == hdacodec::input::InputKind::Mic { "mic" } else { "line" }, fixed = i.fixed, path = chain.join("-").as_str(),
                 jack = i.jack.is_some());
         }
-        Some(CodecEntry { cad, model, outputs, dump, tags, inputs })
+        let shutdown = setup::shutdown(&model);
+        Some(CodecEntry { cad, model, outputs, dump, tags, inputs, shutdown })
     }
 
     /// Reads the plug state; `read_only`: no execute verb (the GPU controller is only read).
@@ -653,6 +679,7 @@ impl<H: Hw> Controller<H> {
             pos: Position::default(),
             written: 0,
             running: false,
+            stop_unseen: false,
             periods_seen: 0,
             callback: None,
             underruns: 0,
@@ -751,19 +778,36 @@ impl<H: Hw> Controller<H> {
         self.with_slot(sid, true, |s, desc| {
             if !s.running {
                 stream::run(&self.hw, desc, true, ioc);
+                // Quiesce takes no lock: one that came between the check above and the run bit has already
+                // stopped the engines, so this start is taken back at once (SN-7: nothing runs after Quiesce).
+                if self.state() != State::Up {
+                    stream::run(&self.hw, desc, false, false);
+                    // Not waited for (Quiesce's stop_all may have passed this descriptor already).
+                    s.stop_unseen = true;
+                    return Err(HdaError::NotUp);
+                }
                 s.running = true;
+                // Running again on an Up controller: a later Quiesce stops and waits for it.
+                s.stop_unseen = false;
                 klog::event!(Debug, "snd", "hda.start", ctrl = self.name.as_str(), stream = sid, written = s.written);
             }
-        })
+            Ok(())
+        })?
     }
 
     pub fn stop(&self, sid: StreamId) -> Result<(), HdaError> {
+        let quiesced = self.quiesced();
         self.with_slot(sid, false, |s, desc| {
             if s.running {
-                Self::update_pos(&self.hw, s, desc);
-                stream::run(&self.hw, desc, false, false);
+                // Quiesced: the engine was stopped there; the registers are not touched again.
+                if !quiesced {
+                    Self::update_pos(&self.hw, s, desc);
+                    stream::run(&self.hw, desc, false, false);
+                }
                 s.running = false;
-                klog::event!(Debug, "snd", "hda.stop", ctrl = self.name.as_str(), stream = sid, played = s.pos.played / s.layout.frame_bytes as u64);
+                if !quiesced {
+                    klog::event!(Debug, "snd", "hda.stop", ctrl = self.name.as_str(), stream = sid, played = s.pos.played / s.layout.frame_bytes as u64);
+                }
             }
         })
     }
@@ -778,12 +822,19 @@ impl<H: Hw> Controller<H> {
             return Err(HdaError::NoSuchStream);
         };
         let desc = self.desc_of(n);
-        stream::run(&self.hw, desc, false, false);
-        let reset_ok = stream::reset(&self.hw, desc);
-        let ctl = self.hw.rd8(sd(desc) + SD_CTL);
-        let running = ctl != 0xFF && ctl & SD_CTL_RUN != 0;
+        // Quiesced: Quiesce stopped the engine and saw whether it stopped; no register access after it (SN-7).
+        let quiesced = self.quiesced();
+        let (reset_ok, ctl, running) = if quiesced {
+            let unseen = x.as_ref().is_some_and(|s| s.stop_unseen);
+            (false, 0, unseen || self.quiesce_stuck.load(Ordering::Acquire))
+        } else {
+            stream::run(&self.hw, desc, false, false);
+            let reset_ok = stream::reset(&self.hw, desc);
+            let ctl = self.hw.rd8(sd(desc) + SD_CTL);
+            (reset_ok, ctl, ctl != 0xFF && ctl & SD_CTL_RUN != 0)
+        };
         let Some(s) = x.take() else { return Err(HdaError::NoSuchStream) };
-        // A quiesced controller has its link in reset: no codec to talk to (bring-up sets the codec up anew).
+        // A quiesced controller has its command rings off: no codec to talk to (bring-up sets the codec up anew).
         if self.state() == State::Up {
             if let Err(e) = self.clear_converter(s.out.cad, s.converter) {
                 klog::event!(Warn, "snd", "hda.close_codec_failed", ctrl = self.name.as_str(), stream = sid,
@@ -791,12 +842,19 @@ impl<H: Hw> Controller<H> {
             }
         }
         drop(slots);
-        klog::event!(Info, "snd", "hda.close", ctrl = self.name.as_str(), stream = sid, played = s.pos.played / s.layout.frame_bytes as u64,
-            underruns = s.underruns, lpib_bogus = s.pos.bogus, reset = reset_ok);
+        // SN-13 (w25): after a Quiesce the closes come from the mixer's last round, during a reboot's reset sleeps:
+        // no log line there (the console mirror's traffic at the reset preceded the floods, desk 28.10.); the
+        // Quiesce note (`hda.quiesced`, `stuck`) and `kept_buffers` say what matters.
+        if !quiesced {
+            klog::event!(Info, "snd", "hda.close", ctrl = self.name.as_str(), stream = sid, played = s.pos.played / s.layout.frame_bytes as u64,
+                underruns = s.underruns, lpib_bogus = s.pos.bogus, reset = reset_ok, quiesced = quiesced);
+        }
         if running {
-            klog::event!(Warn, "snd", "hda.close_stuck", ctrl = self.name.as_str(), stream = sid, desc = desc, ctl = klog::Hex(ctl as u64));
-            self.keep(s._bdl, "bdl");
-            self.keep(s.data, "ring");
+            if !quiesced {
+                klog::event!(Warn, "snd", "hda.close_stuck", ctrl = self.name.as_str(), stream = sid, desc = desc, ctl = klog::Hex(ctl as u64));
+            }
+            self.keep(s._bdl, "bdl", quiesced);
+            self.keep(s.data, "ring", quiesced);
         }
         Ok(())
     }
@@ -808,8 +866,9 @@ impl<H: Hw> Controller<H> {
 
     /// Frames the hardware has played since the stream was opened.
     pub fn position(&self, sid: StreamId) -> Result<u64, HdaError> {
+        let quiesced = self.quiesced();
         self.with_slot(sid, false, |s, desc| {
-            if s.running {
+            if s.running && !quiesced {
                 Self::update_pos(&self.hw, s, desc);
             }
             s.pos.played / s.layout.frame_bytes as u64
@@ -820,14 +879,16 @@ impl<H: Hw> Controller<H> {
     /// (AMD: 32 frames, less right after start, Linux `azx_get_pos_fifo`; others: the descriptor's FIFOS).
     pub fn delay(&self, sid: StreamId) -> Result<u32, HdaError> {
         let fifo = self.kind.fifo_frames();
+        let quiesced = self.quiesced();
         self.with_slot(sid, false, |s, desc| {
-            if s.running {
+            if s.running && !quiesced {
                 Self::update_pos(&self.hw, s, desc);
             }
             let fb = s.layout.frame_bytes as u64;
             let queued = s.written.saturating_sub(s.pos.played) / fb;
             let hw = match fifo {
                 Some(f) => (f as u64).min(s.pos.played / fb),
+                None if quiesced => 0,
                 None => {
                     let fifos = self.hw.rd16(sd(desc) + SD_FIFOS);
                     if fifos == 0xFFFF { 0 } else { (fifos as u64 + 1) / fb }
@@ -1018,26 +1079,6 @@ impl<H: Hw> Controller<H> {
         l.cmd(&self.hw, cad, nid, verb)
     }
 
-    /// Stop for Reload, reboot and panic: every stream and the rings stopped, interrupts off, the link in
-    /// reset, then MSI and bus master off. Lock-free, bounded, no klog; the event comes from a note later.
-    pub fn quiesce(&self) {
-        let was = self.state.swap(State::Quiesced as u8, Ordering::AcqRel);
-        self.irq_driven.store(false, Ordering::Release);
-        let hw = &self.hw;
-        if hw.rd32(GCTL) != !0 {
-            link::stop_all(hw, self.gcap.total());
-            hw.wr32(GCTL, hw.rd32(GCTL) & !(GCTL_CRST | GCTL_UNSOL));
-        }
-        hw.pci_off();
-        self.quiesce_note.store(0x80 | was, Ordering::Release);
-    }
-
-    fn log_quiesce_note(&self) {
-        let n = self.quiesce_note.swap(0, Ordering::AcqRel);
-        if n & 0x80 != 0 {
-            klog::event!(Info, "snd", "hda.quiesced", ctrl = self.name.as_str(), was = State::from(n & 0x7F).name());
-        }
-    }
 }
 
 pub fn kind_name(k: OutputKind) -> &'static str {

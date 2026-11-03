@@ -7,6 +7,7 @@ fn inputs(size: (i32, i32), workspaces: usize) -> Inputs {
         size,
         favourites: vec!["programm/terminal".into(), "einstellungen/aussehen".into()],
         workspaces,
+        minimized: 0,
         reveal: None,
     }
 }
@@ -162,4 +163,27 @@ fn only_folded_bars_have_an_edge() {
     assert_eq!(c.edge_at(2047.2, 500.0), Some(Edge::Right));
     assert_eq!(c.edge_at(0.0, 20.0), None, "the top bar's edge is not the list's");
     assert_eq!(c.edge_at(0.0, 1140.0), None, "nor the status bar's");
+}
+
+#[test]
+fn minimised_windows_are_listed_above_the_start_link_and_hit() {
+    let t = theme(&[]);
+    let base = layout(&t, &inputs((2048, 1152), 2));
+    assert!(base.min_items.is_empty());
+    let c = layout(&t, &Inputs { minimized: 2, ..inputs((2048, 1152), 2) });
+    assert_eq!(c.min_items.len(), 2);
+    let mid = |r: Rect| ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
+    for (i, r) in c.min_items.iter().enumerate() {
+        assert!(r.y + r.h <= c.home.y && r.y >= c.min_title.y + c.min_title.h, "entry {i} under its heading");
+        let (x, y) = mid(*r);
+        assert_eq!(c.hit(x, y), Some(Part::Min(i)));
+    }
+    assert_eq!(c.ws_shown(), 2, "the workspaces still fit");
+    assert!(c.ws_new.y + c.ws_new.h <= c.min_title.y, "the + button stays above the heading");
+    let (x, y) = mid(c.ws_new);
+    assert_eq!(c.hit(x, y), Some(Part::WsNew));
+    // Very many: only what leaves room for a workspace entry and the + button; Alt+Tab reaches the rest.
+    let many = layout(&t, &Inputs { minimized: 500, ..inputs((1280, 800), 1) });
+    assert!(!many.min_items.is_empty() && many.min_items.len() < 500);
+    assert_eq!(many.ws_shown(), 1);
 }

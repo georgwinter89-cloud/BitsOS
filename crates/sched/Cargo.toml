@@ -14,3 +14,8 @@ acpi = { path = "../acpi" }
 ktest = { path = "../ktest" }
 kreg = { path = "../kreg" }
 uapi = { path = "../uapi" }
+
+# The kernel's own cfgs (lean stick kernel, FD-1 measuring build), so a build with or without them warns about
+# nothing.
+[lints]
+workspace = true

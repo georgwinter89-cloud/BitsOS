@@ -13,3 +13,7 @@ hal = { path = "../hal" }
 ktest = { path = "../ktest" }
 policy = { path = "../policy" }
 uapi = { path = "../uapi" }
+zeroize = { version = "=1.9.1", default-features = false }
+
+[lints]
+workspace = true

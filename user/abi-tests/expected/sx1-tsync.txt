@@ -1,0 +1,20 @@
+  worker: PR_GET_NO_NEW_PRIVS = 0
+PR_SET_NO_NEW_PRIVS = 0
+main: PR_GET_NO_NEW_PRIVS = 1
+  worker: PR_GET_NO_NEW_PRIVS = 0
+TSYNC filter = 0
+main: getppid = -EPERM
+  worker: PR_GET_NO_NEW_PRIVS = 1
+  worker: getppid = -EPERM
+  worker status: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+  worker: PR_GET_NO_NEW_PRIVS = 1
+  worker: own filter = 0
+TSYNC with a sibling's own filter answers that sibling's tid: yes
+TSYNC | TSYNC_ESRCH = -EFAULT
+TSYNC | TSYNC_ESRCH filter = -ESRCH
+main after the refused TSYNC: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+filter without TSYNC = 0
+main: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 2; 
+  worker status: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+TSYNC after that sibling ended = 0
+  worker status: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 3; 

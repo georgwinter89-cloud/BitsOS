@@ -1,4 +1,5 @@
 #!/bin/bash
+# minipc: left the QEMU runs (Georg 30.10., CONTRACTS section 4); its checks run on the Mini-PC by the check list in plan/notes/yt-YT-6.md
 # slow: YT-6: Cobalt started from the console shell, as Georg starts it. The console shell is init's (uid 0); MCP's
 # own programs are uid 1000, so the scenario types into the console through MCP's keyboard (send_keys).
 #   1. `cobalt URL` in the console shell: the launcher hands over to uid 1000 (chpst, AB-13's credentials) and says

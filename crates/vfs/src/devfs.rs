@@ -4,8 +4,8 @@
 //! Nodes come from three registries (link-time, no shared table): `devnode!` (a device's `File`), `procfile!`
 //! (a text made per open, at any path under `/proc` or `/sys`) and `procdir!` (a computed directory attached at
 //! a path: the process directories, PCI's sysfs view). FS's own devices are built in here and created first, so
-//! a second registration of the same path elsewhere is refused deterministically (`vfs devnode.duplicate`);
-//! the terminals take a registration of their path as their fallback (`tty`).
+//! a second registration of the same path elsewhere is refused deterministically (`vfs devnode.duplicate`),
+//! the terminals' paths included (they reach the console through `tty::set_console`).
 //!
 //! The memory devices follow drivers/char/mem.c and drivers/char/random.c of Linux 6.6: null (1:3), zero
 //! (1:5), full (1:7), random (1:8), urandom (1:9), all 0666, lseek answers 0 and leaves nothing to seek.
@@ -142,8 +142,6 @@ pub struct Populated {
     pub devnodes: usize,
     pub procfiles: usize,
     pub procdirs: usize,
-    /// Terminal nodes that use a registered device as their fallback.
-    pub adopted: usize,
     pub failed: usize,
 }
 
@@ -199,9 +197,8 @@ pub fn populate_from(ns: &MountNs, devnodes: &[crate::DevNodeEntry], procfiles: 
     st
 }
 
-/// FS's own devices, then every registered one. A terminal path registered by `devnode!` (IN's G0 console
-/// device) becomes that terminal node's fallback until IN's VT sets the `tty` backend; any other registration
-/// of a path that exists already is refused (`vfs devnode.duplicate`), the first one wins.
+/// FS's own devices (the terminals among them), then every registered one. A registration of a path that exists
+/// already is refused (`vfs devnode.duplicate`), the first one wins.
 pub fn make_devices(ns: &MountNs, registered: &[crate::DevNodeEntry], st: &mut Populated) {
     for (path, f) in mem_devices() {
         match ns.create_device(path, f) {
@@ -214,12 +211,7 @@ pub fn make_devices(ns: &MountNs, registered: &[crate::DevNodeEntry], st: &mut P
     }
     for (which, uid, gid) in TTYS {
         let path = which.path();
-        let fallback = registered.iter().find(|d| d.path == path).map(|d| (d.make)());
-        if fallback.is_some() {
-            st.adopted += 1;
-            klog::event!(Info, "vfs", "devnode.adopted", path = path; "the registered device serves this terminal until a console backend is set");
-        }
-        match ns.create_device(path, Arc::new(TtyDev::new(which, fallback))) {
+        match ns.create_device(path, Arc::new(TtyDev::new(which))) {
             Ok(d) => {
                 d.inode.meta.set_owner(uid, gid);
                 st.devnodes += 1;
@@ -233,12 +225,6 @@ pub fn make_devices(ns: &MountNs, registered: &[crate::DevNodeEntry], st: &mut P
     let builtin = builtin_paths();
     let mut seen: Vec<&'static str> = Vec::new();
     for d in registered {
-        let tty = TTYS.iter().any(|t| t.0.path() == d.path);
-        if tty && !seen.contains(&d.path) {
-            // Adopted above (the first registration of the path).
-            seen.push(d.path);
-            continue;
-        }
         if builtin.contains(&d.path) || seen.contains(&d.path) {
             st.failed += 1;
             klog::event!(Warn, "vfs", "devnode.duplicate", path = d.path; "a node of this path exists already; this registration is not used");

@@ -1,0 +1,13 @@
+PR_SET_NO_NEW_PRIVS = 0
+filter = 0
+child: getppid = -EPERM
+child: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+child: own filter = 0
+child: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 2; 
+fork child: exit 0
+parent: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+after execve:
+  getppid = -EPERM
+  PR_GET_SECCOMP = 2
+  status: NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 1; 
+exec child: exit 0

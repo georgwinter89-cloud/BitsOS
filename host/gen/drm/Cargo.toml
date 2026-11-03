@@ -1,0 +1,12 @@
+[package]
+name = "drm-gen"
+version = "0.1.0"
+edition = "2024"
+description = "Generates crates/drm/src/uapi from the libdrm 2.4.134 and Linux uAPI headers (owner: DR)"
+publish = false
+
+
+[dependencies]
+
+[lints]
+workspace = true

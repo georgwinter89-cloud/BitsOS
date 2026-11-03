@@ -1,6 +1,8 @@
-//! Raw test frames for the drivers' own checks (virtio-net, igc: ARP to the gateway, DHCP DISCOVER to QEMU's
-//! user network) before the stack exists (NW-3 brings smoltcp). Builders and bounds-checked parsers; nothing here
-//! panics on any input.
+//! Raw test frames for the drivers' own ktests (virtio-net, igc: ARP to the gateway, DHCP DISCOVER to QEMU's
+//! user network), written before the stack existed (NW-3 brought smoltcp). Only those ktests use them; the stack
+//! never does. Not cfg-gated (C1): ktests compile in every build (`bitsos_no_ktests` only drops their
+//! registration), and two driver crates share them. Builders and bounds-checked parsers; nothing here panics on
+//! any input.
 
 use alloc::vec::Vec;
 

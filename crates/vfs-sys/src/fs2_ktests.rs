@@ -142,7 +142,7 @@ fn pci_view() -> TestResult {
 ktest!("fs.sys.pci_view", Safe, pci_view);
 
 /// `/dev/console` reaches the screen console: a write shows up in the console's capture (through IN's
-/// backend once it is set, through the adopted G0 console device before).
+/// backend, set at boot).
 fn console_out() -> TestResult {
     let ns = vfs::root_ns();
     let n = RUN.fetch_add(1, Ordering::Relaxed);

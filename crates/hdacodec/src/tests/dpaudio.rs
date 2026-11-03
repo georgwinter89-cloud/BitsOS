@@ -233,9 +233,35 @@ fn from_other_values() {
     let mut i = fresh(&j);
     assert_eq!(dpaudio::on(&mut i, &iiyama()), Ok(On::Written { writes: 48 }));
     i.same(&model(&j)).unwrap();
+    // Off from junk: the firmware's values, but DP_SEC_CNTL keeps the fields that are not audio and with them
+    // the master switch (Linux `enc1_se_disable_dp_audio`): one write more.
     let mut i = fresh(&junk());
+    assert_eq!(dpaudio::off(&mut i), Ok(Off { writes: 42, mismatched: 0 }));
+    let mut want = firmware();
+    let sec = junk().g(Loc::Bar(dpaudio::DP_SEC_CNTL));
+    want.s(Loc::Bar(dpaudio::DP_SEC_CNTL), sec & !dpaudio::DP_SEC_AUDIO | dpaudio::DP_SEC_STREAM_ENABLE);
+    i.same(&want).unwrap();
+}
+
+/// SN-12: DP_SEC_CNTL is shared with the infoframe senders (GSP0-7, MPG). Audio on, then a GSP sender switched on by
+/// the display owner: off takes only the audio fields away and leaves STREAM_ENABLE on for the sender; without one
+/// the register ends at 0 as before (the measured case).
+#[test]
+fn off_keeps_other_secondary_packets() {
+    let fw = firmware();
+    let mut i = fresh(&fw);
+    dpaudio::on(&mut i, &iiyama()).unwrap();
+    let on = i.g(Loc::Bar(dpaudio::DP_SEC_CNTL));
+    assert_eq!(on, 0x1111, "audio on: STREAM, ASP, ATP, AIP");
+    i.s(Loc::Bar(dpaudio::DP_SEC_CNTL), on | 0x10_0000); // GSP0 (an HDR or VSC packet) from the display owner
+    assert_eq!(dpaudio::off(&mut i), Ok(Off { writes: 42, mismatched: 0 }));
+    assert_eq!(i.g(Loc::Bar(dpaudio::DP_SEC_CNTL)), 0x10_0001, "the GSP sender keeps STREAM_ENABLE");
+    let mut i = fresh(&fw);
+    dpaudio::on(&mut i, &iiyama()).unwrap();
+    i.log.clear();
     assert_eq!(dpaudio::off(&mut i), Ok(Off { writes: 41, mismatched: 0 }));
-    i.same(&firmware()).unwrap();
+    assert_eq!(i.g(Loc::Bar(dpaudio::DP_SEC_CNTL)), 0);
+    assert_eq!(i.log[1], (Loc::Bar(dpaudio::DP_SEC_CNTL), 0), "packets off right after the samples are muted");
 }
 
 /// What makes each gate fail alone (dpaudio-test.mjs GATES).
@@ -508,4 +534,28 @@ fn sense_reads_only_the_link_gates() {
     }
     let mut i = Image { attached: false, ..Default::default() };
     assert_eq!(dpaudio::sense(&mut i), Sense::Absent);
+}
+
+/// SN-13 (w25): `on_with` runs its hook once, after the endpoint's enable and before the first packet write
+/// (Linux 6.6: az_enable, the PME message, then the packets); the writes are the same 48 in the same order.
+#[test]
+fn on_with_runs_between_enable_and_packets() {
+    let fw = firmware();
+    let mut i = fresh(&fw);
+    let mut at = None;
+    let r = dpaudio::on_with(&mut i, &iiyama(), |img| at = Some(img.written()));
+    assert_eq!(r, Ok(On::Written { writes: 48 }));
+    let before = dpaudio::on_writes(&iiyama()).iter().filter(|w| w.stage <= 4).count();
+    assert_eq!(at, Some(before));
+    let last = i.log[before - 1];
+    assert_eq!(last.0, Loc::Ep(0x54), "stage 4 ends on HOT_PLUG_CONTROL");
+    assert_eq!(i.log[before].0, Loc::Bar(0x155C0), "stage 5 starts with DIG0_AFMT_CNTL");
+    let (_, writes) = model_with(&fw, &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(i.log, writes);
+    // Already on, or no engine: the hook never runs.
+    let mut ran = false;
+    assert_eq!(dpaudio::on_with(&mut i, &iiyama(), |_| ran = true), Ok(On::AlreadyOn));
+    let mut none = Image::default();
+    assert_eq!(dpaudio::on_with(&mut none, &iiyama(), |_| ran = true), Err(OnError::NoEngine));
+    assert!(!ran);
 }

@@ -13,7 +13,7 @@
 //! - F_SEAL_WRITE: write(2) is EPERM, a new writable MAP_SHARED mapping is EPERM, a read-only one cannot get
 //!   PROT_WRITE by mprotect (EACCES); adding it is EBUSY while a shared mapping that may write exists;
 //! - F_SEAL_FUTURE_WRITE: the same for new writes and mappings, existing writable mappings keep writing;
-//! - F_SEAL_EXEC: the exec bits may not change (chmod; V2 has no chmod yet, `check_mode_change` is its hook);
+//! - F_SEAL_EXEC: the exec bits may not change (chmod and friends call `check_mode_change`, setattr.rs);
 //!   added to a file with an exec bit it brings the four seals above along (W^X);
 //! - F_SEAL_SEAL: no more seals.
 //!
@@ -159,7 +159,7 @@ static SHM: ksync::Once<Arc<Mount>> = ksync::Once::new();
 pub fn shm_mount() -> Arc<Mount> {
     SHM.get_or_init(|| {
         let (sb, root) = crate::tmpfs::new_fs(0o1777);
-        Mount::new(sb, root, None, false)
+        Mount::new(sb, root, false)
     })
     .clone()
 }

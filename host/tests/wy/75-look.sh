@@ -30,6 +30,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 echo "== build bitscomp, wyclient, settingsd"
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q --offline && cargo build --release -q --offline -p wyclient)
 (cd "$ROOT/user" && cargo build --release -q --offline -p settingsd)
+# WY-14/15: WY_GPU=1 runs this scenario with the gpu build, WY_GPU=gles with its GLES renderer (tools/gpu-host.sh).
+. "$ROOT/host/tests/wy/tools/gpu-host.sh"
 
 PIDS=()
 cleanup() {
@@ -62,16 +64,20 @@ compare() { # shot name
     else
         # Same host, same binary: the pictures are equal; the small tolerance only absorbs rounding. A missing glow
         # line or a wrong border colour differs by far more than 0.02 % of the pixels.
-        $IMG diff "$RUN/$1.ppm" "$REF/$1.png" 8 0.0002 || fail "$1 differs from host/tests/wy/ref/$1.png"
+        $IMG diff "$RUN/$1.ppm" "$REF/$1.png" ${GPU_TOL:-8 0.0002} || fail "$1 differs from host/tests/wy/ref/$1.png"
     fi
 }
 start_comp() { # size, extra args...
     local size=$1
     shift
-    "$BIN" --backend headless --size "$size" --socket "$SOCK" --mcp none "$@" >"$RUN/bitscomp-$size.log" 2>&1 &
+    "${START[@]}" --backend headless --size "$size" --socket "$SOCK" --mcp none "$@" >"$RUN/bitscomp-$size.log" 2>&1 &
     COMP=$!
     PIDS+=("$COMP")
     for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/$SOCK.ctl" ] && break; sleep 0.1; done
+    gpu_host_check "$RUN/bitscomp-$size.log" "$COMP"
+    # DS-3: WY-5's look is the classic preset now (theme.layout.preset); without settingsd it is set locally.
+    wait_for "end" ctl list "no control socket"
+    ctl set theme.layout.preset classic >/dev/null
 }
 
 echo "== settingsd on the host"
@@ -81,6 +87,7 @@ mkdir -p "$RUN/stick" "$RUN/fallback" "$RUN/sys"
 PIDS+=($!)
 for _ in $(seq 50); do [ -S "$SETTINGS_SOCKET" ] && break; sleep 0.1; done
 [ -S "$SETTINGS_SOCKET" ] || fail "settingsd did not start"
+"$SD" set theme.layout.preset classic >/dev/null || fail "settingsd has no theme.layout.preset (CR DS-3-2)"
 
 echo "== bitscomp 2000x1125 at 125 % (the mock-up's 1600x900), fixed status values"
 start_comp 2000x1125 --settings "$SETTINGS_SOCKET" --fixed-status
@@ -119,7 +126,7 @@ compare accent
 echo "== undo twice: dark and cyan again, the same picture as before"
 settings undo
 settings undo
-wait_for "mode=dark accent=#00e5ff" ctl theme "undo did not restore the theme"
+wait_for "mode=dark accent=#7fcfa0" ctl theme "undo did not restore the theme"
 sleep 0.2
 ctl shot "$RUN/undone.ppm" >/dev/null
 $IMG diff "$RUN/undone.ppm" "$RUN/dark.ppm" 0 0 || fail "undo did not restore the same picture"
@@ -127,7 +134,7 @@ $IMG diff "$RUN/undone.ppm" "$RUN/dark.ppm" 0 0 || fail "undo did not restore th
 echo "== a malformed accent: settingsd refuses it, bitscomp keeps running and its picture"
 "$SD" set theme.accent nonsense >/dev/null 2>&1 && fail "settingsd took the accent 'nonsense'"
 sleep 0.3
-ctl theme | grep -q "mode=dark accent=#00e5ff" || fail "the theme changed after a refused value: $(ctl theme)"
+ctl theme | grep -q "mode=dark accent=#7fcfa0" || fail "the theme changed after a refused value: $(ctl theme)"
 ctl shot "$RUN/kept.ppm" >/dev/null
 $IMG diff "$RUN/kept.ppm" "$RUN/dark.ppm" 0 0 || fail "the picture changed after a refused value"
 

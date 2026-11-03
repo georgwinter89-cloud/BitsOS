@@ -31,7 +31,7 @@
 // Reads only: V1 (BITSOS_V1) and the WLAN tools (WLAN_TOOLS, wlan-tools.mjs).
 import { pathToFileURL } from 'node:url';
 
-const V1 = process.env.BITSOS_V1 ?? '/home/georg/BitsOS/BitsOS-Plattform';
+const V1 = process.env.BITSOS_V1 ?? `${process.env.HOME}/BitsOS/BitsOS-Plattform`;
 const { fakeChip, file } = await import(pathToFileURL(`${V1}/wlan-fake.mjs`).href);
 const { wlanImport } = await import(pathToFileURL(`${V1}/wlan-tools.mjs`).href);
 const { FakeMiniPc } = await wlanImport('js/bringup-fake.mjs');

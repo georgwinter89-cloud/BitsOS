@@ -15,6 +15,8 @@ static STRIDE: AtomicU32 = AtomicU32::new(0);
 static COLS: AtomicU32 = AtomicU32::new(0);
 static ROWS: AtomicU32 = AtomicU32::new(0);
 static SCALE: AtomicU32 = AtomicU32::new(1);
+static WIDTH: AtomicU32 = AtomicU32::new(0);
+static HEIGHT: AtomicU32 = AtomicU32::new(0);
 static COL: AtomicU32 = AtomicU32::new(0);
 static ROW: AtomicU32 = AtomicU32::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -26,8 +28,13 @@ pub fn init(bi: &BootInfo<'_>) {
         return;
     }
     let scale = if fb.width >= 1920 { 2 } else { 1 };
-    BASE.store(fb.virt, Ordering::Relaxed);
+    if fb.stride < fb.width {
+        return;
+    }
+    WIDTH.store(fb.width, Ordering::Relaxed);
+    HEIGHT.store(fb.height, Ordering::Relaxed);
     STRIDE.store(fb.stride, Ordering::Relaxed);
+    BASE.store(fb.virt, Ordering::Relaxed);
     SCALE.store(scale, Ordering::Relaxed);
     COLS.store(fb.width / (8 * scale), Ordering::Relaxed);
     ROWS.store(fb.height / (16 * scale), Ordering::Relaxed);
@@ -68,12 +75,12 @@ fn put(b: u8) {
         b'\r' => col = 0,
         b'\n' => {
             col = 0;
-            row += 1;
+            row = row.saturating_add(1);
         }
         _ => {
             if col >= cols {
                 col = 0;
-                row += 1;
+                row = row.saturating_add(1);
             }
             if row >= rows {
                 row = 0;
@@ -96,15 +103,32 @@ fn put(b: u8) {
 }
 
 fn px(x: u32, y: u32, v: u32) {
-    let off = (y as u64 * STRIDE.load(Ordering::Relaxed) as u64 + x as u64) * 4;
-    // SAFETY: x < width and y < height of the framebuffer bitsboot mapped at BASE (record checked in `init`;
-    // callers stay inside COLS x ROWS cells); a volatile 4-byte store into device memory.
-    unsafe { core::ptr::write_volatile((BASE.load(Ordering::Relaxed) + off) as *mut u32, v) };
+    // INT-W28 (GX-7j3 CR): a pixel outside the framebuffer is dropped, never written. The panic path draws
+    // here too, possibly after the state it reads was damaged (a boot-stack overflow ran over these statics
+    // once), and a second panic in here would hide the first one's text.
+    if x >= WIDTH.load(Ordering::Relaxed) || y >= HEIGHT.load(Ordering::Relaxed) {
+        return;
+    }
+    let base = BASE.load(Ordering::Relaxed);
+    let Some(addr) = (y as u64)
+        .checked_mul(STRIDE.load(Ordering::Relaxed) as u64)
+        .and_then(|o| o.checked_add(x as u64))
+        .and_then(|o| o.checked_mul(4))
+        .and_then(|o| base.checked_add(o))
+    else {
+        return;
+    };
+    if base == 0 {
+        return;
+    }
+    // SAFETY: x < width and y < height (checked above) of the framebuffer bitsboot mapped at BASE with
+    // stride >= width (record checked in `init`); a volatile 4-byte store into device memory.
+    unsafe { core::ptr::write_volatile(addr as *mut u32, v) };
 }
 
 fn glyph(col: u32, row: u32, ch: u8) {
-    let s = SCALE.load(Ordering::Relaxed);
-    let (x0, y0) = (col * 8 * s, row * 16 * s);
+    let s = SCALE.load(Ordering::Relaxed).clamp(1, 4);
+    let (x0, y0) = (col.saturating_mul(8 * s), row.saturating_mul(16 * s));
     let rows = &FONT[ch as usize * 16..ch as usize * 16 + 16];
     for (gy, bits) in rows.iter().enumerate() {
         for gx in 0..8u32 {
@@ -112,7 +136,7 @@ fn glyph(col: u32, row: u32, ch: u8) {
             let v = if on { 0x00FF_FFFF } else { 0 };
             for dy in 0..s {
                 for dx in 0..s {
-                    px(x0 + gx * s + dx, y0 + gy as u32 * s + dy, v);
+                    px(x0.saturating_add(gx * s + dx), y0.saturating_add(gy as u32 * s + dy), v);
                 }
             }
         }

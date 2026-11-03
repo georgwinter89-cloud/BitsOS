@@ -364,6 +364,12 @@ impl Loopback {
         if !to.ip.is_loopback() || !me.is_loopback() {
             return Err(NetError::Unreachable);
         }
+        self.connect_from(to, me, v6)
+    }
+
+    /// NW-12: `connect_side` without the 127/8 check, for a namespace's own loopback, which also carries the
+    /// other addresses a program gave its lo.
+    pub fn connect_from(&self, to: SockAddr, me: Ipv4, v6: bool) -> Result<Box<dyn crate::conn::Conn>, NetError> {
         let queue = self.listeners.lock().get(&(to.port, v6)).and_then(live).ok_or(NetError::ConnectionRefused)?;
         let port = {
             let mut p = self.next_port.lock();

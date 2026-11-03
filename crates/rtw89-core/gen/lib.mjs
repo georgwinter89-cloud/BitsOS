@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 // WLAN_TOOLS=<plattform/wlan> overrides, as V1's wlan-tools.mjs
-export const WZ = (process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan').replace(/\/$/, '');
+export const WZ = (process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`).replace(/\/$/, '');
 export const wzUrl = (rel) => pathToFileURL(`${WZ}/${rel}`);
 export const wzImport = (rel) => import(wzUrl(rel).href);
 export const jsText = (file) => readFileSync(new URL(`js/${file}`, wzUrl('')), 'utf8');

@@ -186,14 +186,14 @@ fn put_statfs(s: &Sys<'_>, buf: u64, st: &crate::statfs::StatFs) -> Result<i64, 
 }
 
 pub fn statfs(s: &Sys<'_>, a: Args) -> i64 {
-    ret(at_lookup(s, AT_FDCWD as u64, a[0], 0, true).and_then(|p| put_statfs(s, a[1], &crate::statfs::of(&p.dentry.sb, p.mnt.readonly)?)))
+    ret(at_lookup(s, AT_FDCWD as u64, a[0], 0, true).and_then(|p| put_statfs(s, a[1], &crate::statfs::of(&p.dentry.sb, p.mnt.is_readonly())?)))
 }
 
 pub fn fstatfs(s: &Sys<'_>, a: Args) -> i64 {
     ret((|| {
         let f = s.raw(a[0])?;
         let st = match &f.path {
-            Some(p) => crate::statfs::of(&p.dentry.sb, p.mnt.readonly)?,
+            Some(p) => crate::statfs::of(&p.dentry.sb, p.mnt.is_readonly())?,
             None => crate::statfs::of_object(f.file.mode()),
         };
         put_statfs(s, a[1], &st)

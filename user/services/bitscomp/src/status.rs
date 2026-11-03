@@ -30,6 +30,10 @@ pub struct Status {
     /// Test mode (`--fixed-status`): fixed values, nothing is read, so screenshots compare.
     pub fixed: bool,
     next: Option<Duration>,
+    /// DS-2: the busy ring's step clock (its frames wake through `due`/`tick`, the status bar's wake source).
+    pub ring: crate::anim::RingClock,
+    /// DS-5: while the boot scene is up, when it reads `/proc/bitsos/boot` again (its frame sets the next one).
+    pub boot_poll: Option<Duration>,
 }
 
 /// (busy, total, cpu count) from /proc/stat's text.
@@ -210,11 +214,21 @@ impl Status {
 
     /// When the next sample is due (`pacer` time); `None` in test mode.
     pub fn due(&self) -> Option<Duration> {
-        if self.fixed { None } else { Some(self.next.unwrap_or(Duration::ZERO)) }
+        let sample = if self.fixed { None } else { Some(self.next.unwrap_or(Duration::ZERO)) };
+        [sample, self.ring.due(), self.boot_poll].into_iter().flatten().min()
     }
 
-    /// Reads the sources when due; true when anything shown changed.
+    /// Reads the sources when due, and steps the busy ring; true when anything shown changed.
     pub fn tick(&mut self, now: Duration) -> bool {
+        let ring = self.ring.tick(now);
+        let boot = self.boot_poll.is_some_and(|t| now >= t);
+        if boot {
+            self.boot_poll = None;
+        }
+        self.sample(now) || ring || boot
+    }
+
+    fn sample(&mut self, now: Duration) -> bool {
         if self.fixed || self.next.is_some_and(|n| now < n) {
             return false;
         }

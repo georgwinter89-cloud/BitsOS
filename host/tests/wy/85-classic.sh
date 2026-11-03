@@ -31,6 +31,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 echo "== build bitscomp, wyclient, settingsd"
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q --offline && cargo build --release -q --offline -p wyclient)
 (cd "$ROOT/user" && cargo build --release -q --offline -p settingsd)
+# WY-14/15: WY_GPU=1 runs this scenario with the gpu build, WY_GPU=gles with its GLES renderer (tools/gpu-host.sh).
+. "$ROOT/host/tests/wy/tools/gpu-host.sh"
 
 PIDS=()
 cleanup() {
@@ -64,16 +66,19 @@ compare() { # shot name
         $IMG png "$RUN/$1.ppm" "$REF/$1.png"
         echo "reference $1.png written"
     else
-        $IMG diff "$RUN/$1.ppm" "$REF/$1.png" 8 0.0002 || fail "$1 differs from host/tests/wy/ref/$1.png"
+        $IMG diff "$RUN/$1.ppm" "$REF/$1.png" ${GPU_TOL:-8 0.0002} || fail "$1 differs from host/tests/wy/ref/$1.png"
     fi
 }
 shot() { sleep 0.2; ctl shot "$RUN/$1.ppm" >/dev/null; compare "$1"; }
 start_comp() { # extra args...
-    "$BIN" --backend headless --size 2000x1125 --socket "$SOCK" --mcp none --fixed-status "$@" >>"$RUN/bitscomp.log" 2>&1 &
+    "${START[@]}" --backend headless --size 2000x1125 --socket "$SOCK" --mcp none --fixed-status "$@" >>"$RUN/bitscomp.log" 2>&1 &
     COMP=$!
     PIDS+=("$COMP")
     for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/$SOCK.ctl" ] && break; sleep 0.1; done
+    gpu_host_check "$RUN/bitscomp.log" "$COMP"
     wait_for "end" ctl list "no control socket"
+    # DS-3: the classic chrome is a preset now (theme.layout.preset); without settingsd it is set locally.
+    ctl set theme.layout.preset classic >/dev/null
 }
 stop_comp() { kill "$COMP"; wait "$COMP" 2>/dev/null || true; rm -f "$XDG_RUNTIME_DIR/$SOCK.ctl"; }
 
@@ -84,6 +89,7 @@ mkdir -p "$RUN/stick" "$RUN/fallback" "$RUN/sys"
 PIDS+=($!)
 for _ in $(seq 50); do [ -S "$SETTINGS_SOCKET" ] && break; sleep 0.1; done
 [ -S "$SETTINGS_SOCKET" ] || fail "settingsd did not start"
+"$SD" set theme.layout.preset classic >/dev/null || fail "settingsd has no theme.layout.preset (CR DS-3-2)"
 get() { "$SD" get "$1"; }
 
 echo "== bitscomp 2000x1125 (1600x900 logical), two tiles, a third window floats"

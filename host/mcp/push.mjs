@@ -3,7 +3,7 @@
 // replaces a working one; an interrupted push is finished by running the same command again.
 //
 //   node push.mjs <BitsOS host[:port]> --tree <dir> --bind <LAN address> [--name <package>] [--home] [--me <address>]
-//        [--port <8770-8799>] [--via fetch|write] [--dry-run] [--timeout-ms N] [--wait-ms N] [--token-file <path>]
+//        [--port <8770-8799>] [--via fetch|write] [--dry-run] [--timeout-ms N] [--wait-ms N] [--token-file <path>] [--tls <key store>|auto]
 //   node push.mjs <BitsOS host[:port]> --file <local file> --to /boot/BITSOS2/<package>/<path> --bind ... (the same options)
 //
 // --tree: the package as `cargo xtask image` or the YT stage script leaves it, e.g.
@@ -48,7 +48,7 @@ if (process.env.BITSOS_PUSH_PORTS) {
   if (!m || Number(m[1]) < 1024 || Number(m[2]) > 65535 || Number(m[1]) > Number(m[2])) fail(`BITSOS_PUSH_PORTS=${process.env.BITSOS_PUSH_PORTS}: want <lo>-<hi> within 1024-65535`, 2);
   [PORT_LO, PORT_HI] = [Number(m[1]), Number(m[2])];
 }
-const VALUE = ['--tree', '--file', '--to', '--name', '--bind', '--me', '--port', '--via', '--timeout-ms', '--wait-ms', '--token-file', '--root'];
+const VALUE = ['--tree', '--file', '--to', '--name', '--bind', '--me', '--port', '--via', '--timeout-ms', '--wait-ms', '--token-file', '--root', '--tls'];
 const SWITCH = ['--dry-run', '--home'];
 const opts = {}, rest = [];
 for (let i = 2; i < process.argv.length; i++) {
@@ -61,7 +61,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a.startsWith('--')) fail(`unknown option ${a}`, 2);
   else rest.push(a);
 }
-const USAGE = 'usage: node push.mjs <host[:port]> (--tree DIR [--name N] [--home] | --file F --to PATH [--home]) --bind A [--me A] [--port 8770-8799] [--via fetch|write] [--dry-run] [--timeout-ms N] [--wait-ms N] [--token-file F]';
+const USAGE = 'usage: node push.mjs <host[:port]> (--tree DIR [--name N] [--home] | --file F --to PATH [--home]) --bind A [--me A] [--port 8770-8799] [--via fetch|write] [--dry-run] [--timeout-ms N] [--wait-ms N] [--token-file F] [--tls DIR|auto]';
 const [host] = rest;
 const fileMode = opts.file !== undefined;
 if (!host || rest.length > 1 || fileMode === (opts.tree !== undefined)) fail(USAGE, 2);
@@ -132,7 +132,7 @@ console.log(`${fileMode ? 'file' : 'tree'}: ${tree}: ${local.files.length} files
 let token;
 try { token = readToken(opts['token-file']); } catch (e) { fail(e.message, 2); }
 let session;
-try { session = await connect(host, { token }); } catch (e) {
+try { session = await connect(host, { token, tls: opts.tls, tokenFile: opts['token-file'] }); } catch (e) {
   if (!(e instanceof McpError)) throw e;
   fail(`${e.message}: is BitsOS running with its MCP server (CONFIG.TXT token=...)?`, 2);
 }

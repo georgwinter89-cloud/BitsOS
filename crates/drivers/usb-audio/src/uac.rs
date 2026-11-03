@@ -260,13 +260,6 @@ impl Control {
             _ => None,
         })
     }
-
-    pub fn input_terminal(&self, id: u8) -> Option<&InputTerminal> {
-        match self.unit(id) {
-            Some(Unit::It(t)) => Some(t),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

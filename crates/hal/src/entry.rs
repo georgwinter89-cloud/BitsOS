@@ -27,9 +27,26 @@
 //!   After each one the optional `set_user_irq_hook` hook runs in thread context (the preemption point SC-3
 //!   wants); `execute_or_stop` returns to its caller when the hook asks for it (or when no hook is installed),
 //!   so a loop like proc's can notice a kill while the program never makes a syscall (B4). NMI, #MC and #DF
-//!   from user mode run the kernel's handling (`idt::hal_kernel_trap`, on their IST stack) and return to the
-//!   program with `iretq` directly: going back through the kernel would leave NMIs blocked until some later
-//!   `iretq`.
+//!   from user mode never come here (CP-8): idt.rs's stubs keep them on their IST stack, run
+//!   `idt::hal_kernel_trap` without `swapgs` (this CPU's GS base is found by APIC ID,
+//!   `percpu::paranoid_gs_enter`) and return to the program with their own `iretq`; going back through the
+//!   kernel would leave NMIs blocked until some later `iretq`.
+//! - **One block for the user-GS code**: `[hal_user_execute, hal_syscall_entry)` holds every instruction of the
+//!   return paths that runs with the user's GS base (the sysretq and iretq returns and their `wrgsbase`).
+//!   `idt::in_user_gs_window` relies on that order; `idt::user_gs_window_check` (`cp.trap.user_gs_window`)
+//!   checks it.
+//! - **STAR**: the SYSRET base is `__USER32_CS` (0x23) with its RPL 3, as Linux writes it: `sysretq` gives CS
+//!   0x33 and SS 0x2b. Intel's SYSRET forces RPL 3 into SS, AMD's loads `base + 8` as it is; with an RPL-0 base
+//!   AMD left programs with an RPL-0 SS, which an NMI saved and the stubs' `iretq` refused with #GP in ring 0
+//!   (CP-8, the Mini-PC crashes of 26. and 27.10.).
+//! - **32-bit code (AB-10a, Wine's WoW64)**: a program may far-jump to 0x23 and run compatibility-mode code.
+//!   `UserContext::cs` keeps the code selector it entered the kernel with (0x23 or 0x33; SS is always 0x2b), a
+//!   0x23 context goes back by `iretq`, never `sysretq`. Its only way into the kernel besides faults and
+//!   interrupts is `int 0x80` (DPL-3 gate, vector reserved), which comes back as `ReturnReason::Trap` with
+//!   vector `INT80_VECTOR` and is answered for the TLS/LDT calls only (crates/syscall); SYSCALL from 32-bit code
+//!   is #UD on Intel and answers -ENOSYS through CSTAR on AMD (`hal_syscall32`, as Linux's `ignore_sysret`).
+//!   The user DS/ES/FS/GS selectors, the three TLS descriptors and the process LDT travel with the thread in
+//!   `switch_to` (`segs`). Every other code selector (an LDT code segment) is refused at the return (#GP).
 //!
 //! Signal frames (AB-6, note from SC-1): a thread's user FPU state is `sched::Thread::fpu()` (compacted XSAVES
 //! format in xsaves mode). The frame on the user stack uses the standard (non-compacted) format, and the image a
@@ -82,7 +99,7 @@ pub struct EntryStats {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct UserContext {
     pub regs: GeneralRegs,
     /// User FS base: written on every entry, read back on every return (wrfsbase in user code is kept).
@@ -93,8 +110,35 @@ pub struct UserContext {
     reason: u64,
     /// User GS base, handled like `fs_base` (it waits in IA32_KERNEL_GS_BASE while the kernel runs).
     pub gs_base: u64,
+    /// AB-10a: the code selector the program entered the kernel from (USER_CS, or USER32_CS for 32-bit code)
+    /// and its stack selector; the return checks both (`refuse_entry`).
+    pub cs: u16,
+    pub ss: u16,
+    _sel_pad: u32,
     pub stats: EntryStats,
 }
+
+impl Default for UserContext {
+    fn default() -> Self {
+        UserContext {
+            regs: GeneralRegs::default(),
+            fs_base: 0,
+            trap_vector: 0,
+            trap_error: 0,
+            trap_cr2: 0,
+            reason: 0,
+            gs_base: 0,
+            cs: crate::gdt::USER_CS,
+            ss: crate::gdt::USER_DS,
+            _sel_pad: 0,
+            stats: EntryStats::default(),
+        }
+    }
+}
+
+/// The vector of `int 0x80` (a DPL-3 gate; no device gets it): `ReturnReason::Trap` with this vector is the
+/// program's 32-bit system call, not an exception.
+pub const INT80_VECTOR: u8 = 0x80;
 
 const REASON_SYSCALL: u64 = 1;
 const REASON_IRQ: u64 = 3;
@@ -173,12 +217,12 @@ impl UserContext {
     pub fn execute_or_stop(&mut self, interrupts_on: bool) -> Option<ReturnReason> {
         loop {
             self.regs.rflags = (self.regs.rflags & USER_RFLAGS) | 0x2 | if interrupts_on { RFLAGS_IF } else { 0 };
-            if let Some(vector) = self.refuse_entry() {
+            if let Some((vector, error)) = self.refuse_entry() {
                 // The return to user would fault in ring 0 after swapgs; the program gets it as its own fault.
                 self.trap_vector = vector as u64;
-                self.trap_error = 0;
+                self.trap_error = error;
                 self.trap_cr2 = 0;
-                return Some(ReturnReason::Trap { vector, error: 0, cr2: 0 });
+                return Some(ReturnReason::Trap { vector, error, cr2: 0 });
             }
             let sysret = self.sysret_possible();
             if sysret {
@@ -186,12 +230,26 @@ impl UserContext {
             } else {
                 self.stats.iret += 1;
             }
-            imp::execute(self, sysret);
+            {
+                // AB-10a: an LDT another thread of the process created since this CPU last looked (one load and
+                // compare unless one did). Interrupts stay off from the check to the return to user, so a kick
+                // sent after it stays pending and brings the thread back here at once instead of being taken
+                // in ring 0 and lost (the user code then runs with IF from `regs.rflags`).
+                let _irq = crate::cpu::IrqGuard::new();
+                segs::sync_ldt();
+                imp::execute(self, sysret);
+            }
             match self.reason {
-                REASON_SYSCALL => return Some(ReturnReason::Syscall),
+                REASON_SYSCALL => {
+                    #[cfg(bitsos_fd_measure)]
+                    crate::prof::syscall(self.regs.rax);
+                    return Some(ReturnReason::Syscall);
+                }
                 REASON_IRQ => {
                     self.stats.interrupts += 1;
                     USER_IRQS.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(bitsos_fd_measure)]
+                    crate::prof::note(self.regs.rip, self.fs_base, self.regs.rsi, self.regs.rdi);
                     let h = USER_IRQ_HOOK.load(Ordering::Acquire);
                     if h == 0 {
                         return None;
@@ -207,19 +265,32 @@ impl UserContext {
         }
     }
 
-    /// The fault the program gets instead of entering, when the return to user would load something that
-    /// faults in ring 0: rip outside the canonical lower half (#GP), a non-canonical rsp (#SS, what its next
-    /// stack access would raise), a non-canonical FS or GS base (#GP). Counted in `stats`.
-    fn refuse_entry(&mut self) -> Option<u8> {
+    /// The fault (vector, error code) the program gets instead of entering, when the return to user would load
+    /// something that faults in ring 0: rip outside the canonical lower half (#GP), a non-canonical rsp (#SS,
+    /// what its next stack access would raise), a non-canonical FS or GS base (#GP). Counted in `stats`. AB-10a:
+    /// a code selector other than 0x33 and 0x23 or a stack selector other than 0x2b (#GP with the selector, as
+    /// Linux's faulting IRET shows it), and 32-bit code at a rip above 4 GiB (#GP(0)).
+    fn refuse_entry(&mut self) -> Option<(u8, u64)> {
+        use crate::gdt::{USER32_CS, USER_CS, USER_DS};
         if self.regs.rip >= CANONICAL_LOW_END {
             self.stats.bad_rip += 1;
-            Some(VECTOR_GP)
+            Some((VECTOR_GP, 0))
         } else if !canonical(self.regs.rsp) {
             self.stats.bad_stack += 1;
-            Some(VECTOR_SS)
+            Some((VECTOR_SS, 0))
         } else if !canonical(self.fs_base) || !canonical(self.gs_base) {
             self.stats.bad_base += 1;
-            Some(VECTOR_GP)
+            Some((VECTOR_GP, 0))
+        } else if self.cs != USER_CS && self.cs != USER32_CS {
+            self.stats.bad_rip += 1;
+            Some((VECTOR_GP, (self.cs & !3) as u64))
+        } else if self.ss | 3 != USER_DS {
+            // An RPL-0 0x28 is AMD's SYSRET SS (STAR quirk, CP-8): the same segment, it goes back as 0x2b.
+            self.stats.bad_stack += 1;
+            Some((VECTOR_GP, (self.ss & !3) as u64))
+        } else if self.cs == USER32_CS && self.regs.rip > u32::MAX as u64 {
+            self.stats.bad_rip += 1;
+            Some((VECTOR_GP, 0))
         } else {
             None
         }
@@ -230,7 +301,7 @@ impl UserContext {
     /// (the next instruction could lie in non-canonical space) take the IRET path.
     fn sysret_possible(&self) -> bool {
         let r = &self.regs;
-        r.rcx == r.rip && r.r11 == r.rflags && r.rip < crate::USER_TOP && r.rflags & (RFLAGS_TF | RFLAGS_RF) == 0
+        self.cs == crate::gdt::USER_CS && r.rcx == r.rip && r.r11 == r.rflags && r.rip < crate::USER_TOP && r.rflags & (RFLAGS_TF | RFLAGS_RF) == 0
     }
 }
 
@@ -255,6 +326,14 @@ pub fn init_syscall() {
     imp::init_syscall()
 }
 
+/// Test only (`cp.entry.sysret_ss`): runs `f` with this CPU's STAR SYSRET base as it was before CP-8 (RPL 0,
+/// 0x10), interrupts off, then writes the normal STAR back. It shows on the hardware what SYSRET does with a
+/// base without RPL: Intel forces SS RPL 3 (0x1b), AMD loads 0x18. `f` must run its program with
+/// `execute(false)`, so no interrupt can come and the thread cannot move to another CPU meanwhile.
+pub fn with_sysret_base_rpl0<R>(f: impl FnOnce() -> R) -> R {
+    imp::with_sysret_base_rpl0(f)
+}
+
 /// Whether programs may use rdfsbase/wrfsbase/rdgsbase/wrgsbase (AT_HWCAP2 bit 1, HWCAP2_FSGSBASE): the
 /// instructions are enabled and the kernel keeps what they write.
 pub fn user_fsgsbase() -> bool {
@@ -266,6 +345,25 @@ pub fn user_fsgsbase() -> bool {
 /// cannot #UD; a CPU with SMAP on while this is false only makes its fast user copies fail with EFAULT.
 pub fn smap_all() -> Option<bool> {
     FLAGS_READY.load(Ordering::Acquire).then(|| HAL_ENTRY_SMAP.load(Ordering::Acquire) != 0)
+}
+
+/// `index` when it is below `size`, else 0, without a branch the CPU could predict past: a bounds check the
+/// processor speculates through cannot hand a later load an index chosen by a program (Spectre v1; Linux's
+/// `array_index_nospec` on the syscall number, linux-6.6/arch/x86/entry/common.c:48).
+#[inline(always)]
+pub fn index_nospec(index: usize, size: usize) -> usize {
+    let mask: usize;
+    // SAFETY: arithmetic on registers only (cmp sets CF when index < size; sbb turns it into all ones).
+    unsafe { core::arch::asm!("cmp {i}, {s}", "sbb {m}, {m}", i = in(reg) index, s = in(reg) size, m = lateout(reg) mask, options(pure, nomem, nostack)) };
+    index & mask
+}
+
+/// The kernel's RFLAGS now (tests: what `execute` leaves its caller).
+pub fn kernel_rflags() -> u64 {
+    let f: u64;
+    // SAFETY: pushfq/pop reads RFLAGS through two balanced stack operations; nothing else changes.
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) f) };
+    f
 }
 
 /// Interrupts taken while user code ran (all CPUs, since boot).
@@ -386,6 +484,7 @@ mod imp {
     unsafe extern "C" {
         fn hal_user_execute(ctx: *mut UserContext, sysret: u64);
         fn hal_syscall_entry();
+        fn hal_syscall32();
     }
 
     pub fn execute(ctx: &mut UserContext, sysret: bool) {
@@ -399,15 +498,33 @@ mod imp {
         unsafe { hal_user_execute(ctx as *mut UserContext, sysret as u64) };
     }
 
+    /// STAR: [47:32] kernel CS (SS = +8), [63:48] base for SYSRET (64-bit CS = +16 | 3; SS = +8, with RPL 3
+    /// only on Intel unless the base carries it, so it does: `__USER32_CS` 0x23, as Linux writes it,
+    /// linux-6.6/arch/x86/kernel/cpu/common.c:2074). The test variant without RPL is 0x20 (AMD's SS 0x28).
+    fn star(rpl3: bool) -> u64 {
+        let base = (crate::gdt::USER32_CS as u64 & !3) | if rpl3 { 3 } else { 0 };
+        ((crate::gdt::KERNEL_CS as u64) << 32) | (base << 48)
+    }
+
+    pub fn with_sysret_base_rpl0<R>(f: impl FnOnce() -> R) -> R {
+        let _irq = crate::cpu::IrqGuard::new();
+        msr::write(msr::IA32_STAR, star(false));
+        let r = f();
+        msr::write(msr::IA32_STAR, star(true));
+        r
+    }
+
     pub fn init_syscall() {
         let efer = msr::read(msr::IA32_EFER);
         msr::write(msr::IA32_EFER, efer | msr::EFER_SCE);
-        // STAR: [47:32] kernel CS (SS = +8), [63:48] base for SYSRET (CS = +16 | 3, SS = +8 | 3).
-        let star = ((crate::gdt::KERNEL_CS as u64) << 32) | (((crate::gdt::USER_SS as u64 & !3) - 8) << 48);
-        msr::write(msr::IA32_STAR, star);
+        msr::write(msr::IA32_STAR, star(true));
         msr::write(msr::IA32_LSTAR, hal_syscall_entry as *const () as u64);
-        // Mask IF, DF, TF, AC, NT on entry.
-        msr::write(msr::IA32_FMASK, (1 << 9) | (1 << 10) | (1 << 8) | (1 << 18) | (1 << 14));
+        // AB-10a: SYSCALL from 32-bit code (AMD only; Intel raises #UD) answers -ENOSYS at once: V2 has no
+        // 32-bit system calls besides int 0x80's three.
+        msr::write(msr::IA32_CSTAR, hal_syscall32 as *const () as u64);
+        // Mask IF, DF, TF, AC, NT and ID on entry (ID as Linux's syscall_init does: since AB-15 the return to
+        // the kernel keeps the syscall-masked RFLAGS instead of popping the caller's).
+        msr::write(msr::IA32_FMASK, (1 << 9) | (1 << 10) | (1 << 8) | (1 << 18) | (1 << 14) | (1 << 21));
     }
 
     /// Called from the assembly with the kernel rsp to use as rsp0.
@@ -418,7 +535,8 @@ mod imp {
 }
 
 // Offsets: UserContext (HAL_UC_*, checked by the layout test), CpuLocal (8 kernel rsp, 16 user rsp scratch,
-// 24 *UserContext), TrapFrame (HAL_TF_*, idt.rs). Selectors: user SS 0x1b, user CS 0x23, kernel SS 0x10.
+// 24 *UserContext), TrapFrame (HAL_TF_*, idt.rs). Selectors: user SS 0x2b, user CS from UserContext (0x33 or
+// 0x23, checked by `refuse_entry`), kernel SS 0x10.
 #[cfg(target_os = "none")]
 core::arch::global_asm!(
     r#"
@@ -446,6 +564,8 @@ core::arch::global_asm!(
     .set HAL_UC_CR2, 168
     .set HAL_UC_REASON, 176
     .set HAL_UC_GSBASE, 184
+    .set HAL_UC_CS, 192
+    .set HAL_UC_SS, 194
 
     .set HAL_TF_R15, 0
     .set HAL_TF_R14, 8
@@ -465,8 +585,10 @@ core::arch::global_asm!(
     .set HAL_TF_VECTOR, 120
     .set HAL_TF_ERROR, 128
     .set HAL_TF_RIP, 136
+    .set HAL_TF_CS, 144
     .set HAL_TF_RFLAGS, 152
     .set HAL_TF_RSP, 160
+    .set HAL_TF_SS, 168
 
     .text
     # hal_user_execute(ctx: rdi, sysret: rsi)
@@ -474,7 +596,7 @@ core::arch::global_asm!(
 hal_user_execute:
     pushfq
     # No interrupt between here and the return to user: one inside the swapgs window would run with the user
-    # GS base. hal_return_to_kernel's popfq gives the caller its IF back.
+    # GS base. hal_return_to_kernel gives the caller its IF back.
     cli
     pushq %rbp
     pushq %rbx
@@ -544,10 +666,11 @@ hal_user_execute:
     sysretq
 
 hal_user_iret:
-    pushq $0x1b
+    pushq $0x2b
     pushq HAL_UC_RSP(%rdi)
     pushq HAL_UC_RFLAGS(%rdi)
-    pushq $0x23
+    movzwl HAL_UC_CS(%rdi), %eax
+    pushq %rax
     pushq HAL_UC_RIP(%rdi)
     movq HAL_UC_GSBASE(%rdi), %rcx
     swapgs
@@ -602,8 +725,22 @@ hal_return_to_kernel:
     popq %r12
     popq %rbx
     popq %rbp
-    popfq
+    # AB-15: only the caller's IF comes back (popfq is microcoded and costs twice this on the null-syscall
+    # path). The rest of RFLAGS needs no restoring: SYSCALL's FMASK cleared IF DF TF AC NT ID, interrupt delivery
+    # TF and NT, and both ways from a user trap clear DF and AC themselves (cld/clac above and below).
+    testl $0x200, (%rsp)
+    leaq 8(%rsp), %rsp
+    jz 8f
+    sti
+8:
     ret
+
+    # AB-10a: CSTAR, SYSCALL from 32-bit code (AMD). Ring 0 on the user's stack and GS with IF=0 (FMASK): only
+    # the answer, then back to 32-bit code (CS 0x23, SS 0x2b from STAR), as Linux's ignore_sysret.
+    .global hal_syscall32
+hal_syscall32:
+    movl $-38, %eax
+    sysretl
 
     .global hal_syscall_entry
 hal_syscall_entry:
@@ -632,18 +769,14 @@ hal_syscall_entry:
     movq %r11, HAL_UC_RFLAGS(%rdi)
     movq %gs:16, %rax
     movq %rax, HAL_UC_RSP(%rdi)
+    # SYSCALL comes only from 64-bit code (LSTAR): CS 0x33, SS 0x2b in one store.
+    movl $0x002b0033, HAL_UC_CS(%rdi)
     movq $1, HAL_UC_REASON(%rdi)
     jmp hal_return_to_kernel
 
     # From hal_trap_common with a TrapFrame at rsp whose CS is the user's; GS is still the user's.
     .global hal_trap_from_user
 hal_trap_from_user:
-    cmpq $2, HAL_TF_VECTOR(%rsp)
-    je hal_trap_from_user_paranoid
-    cmpq $18, HAL_TF_VECTOR(%rsp)
-    je hal_trap_from_user_paranoid
-    cmpq $8, HAL_TF_VECTOR(%rsp)
-    je hal_trap_from_user_paranoid
     # CR2 first (r8 is saved in the frame): an NMI or #MC can come at any instruction, and a #PF inside its
     # handler would overwrite CR2 (Linux saves it around NMIs; CP change request for hal_kernel_trap).
     xorl %r8d, %r8d
@@ -693,8 +826,15 @@ hal_trap_from_user:
     movq %rcx, HAL_UC_RFLAGS(%rax)
     movq HAL_TF_RSP(%rsp), %rcx
     movq %rcx, HAL_UC_RSP(%rax)
+    movq HAL_TF_CS(%rsp), %rcx
+    movw %cx, HAL_UC_CS(%rax)
+    movq HAL_TF_SS(%rsp), %rcx
+    movw %cx, HAL_UC_SS(%rax)
     cmpq $32, HAL_TF_VECTOR(%rsp)
     jb 8f
+    # int 0x80 (the reserved vector, DPL 3): the program's 32-bit call, handled as an exception is.
+    cmpq $0x80, HAL_TF_VECTOR(%rsp)
+    je 8f
     # An interrupt: handled here (EOI included), then back to execute(), which resumes the program.
     movq %rax, %rbx
     cmpb $0, HAL_ENTRY_SMAP(%rip)
@@ -708,39 +848,17 @@ hal_trap_from_user:
     movq $3, HAL_UC_REASON(%rdi)
     jmp hal_return_to_kernel
 8:
+    # An exception: the program's DF and AC are still set if it set them (hal_return_to_kernel does not
+    # restore RFLAGS whole).
+    cmpb $0, HAL_ENTRY_SMAP(%rip)
+    je 11f
+    clac
+11:
+    cld
     movq %r8, HAL_UC_CR2(%rax)
     movq $2, HAL_UC_REASON(%rax)
     movq %rax, %rdi
     jmp hal_return_to_kernel
-
-    # NMI, #MC, #DF from user mode: the kernel's handling on the IST stack, then iretq straight back.
-hal_trap_from_user_paranoid:
-    swapgs
-    cmpb $0, HAL_ENTRY_SMAP(%rip)
-    je 1f
-    clac
-1:
-    movq %rsp, %rdi
-    cld
-    call hal_kernel_trap
-    swapgs
-    popq %r15
-    popq %r14
-    popq %r13
-    popq %r12
-    popq %r11
-    popq %r10
-    popq %r9
-    popq %r8
-    popq %rbp
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    popq %rcx
-    popq %rbx
-    popq %rax
-    addq $16, %rsp
-    iretq
 "#,
     options(att_syntax)
 );
@@ -752,9 +870,17 @@ mod imp {
         panic!("user mode exists only in the kernel build");
     }
     pub fn init_syscall() {}
+    pub fn with_sysret_base_rpl0<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }
 
 pub mod ab4_progs;
+/// AB-10a: user segment state per thread (selectors, TLS slots, the process LDT).
+pub mod segs;
+/// AB-15: syscall-path step costs (measuring build only).
+#[cfg(bitsos_fd_measure)]
+pub mod steps;
 
 /// Machine code of AB's ktest programs (`crates/syscall/src/ktests.rs`), assembled here because only the
 /// trusted base may name assembly symbols. Position-independent; each ends in `exit_group(code)`, where 0 means
@@ -1535,6 +1661,12 @@ hal_tp_flood_end:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn index_nospec_masks_out_of_range() {
+        for (i, n, want) in [(0, 1, 0), (5, 6, 5), (6, 6, 0), (7, 6, 0), (usize::MAX, 6, 0), (3, 0, 0), (usize::MAX - 1, usize::MAX, usize::MAX - 1)] {
+            assert_eq!(super::index_nospec(i, n), want, "index {i} size {n}");
+        }
+    }
     use super::*;
     #[test]
     fn layout_matches_assembly_offsets() {
@@ -1551,6 +1683,10 @@ mod tests {
         assert_eq!(core::mem::offset_of!(UserContext, trap_cr2), 168);
         assert_eq!(core::mem::offset_of!(UserContext, reason), 176);
         assert_eq!(core::mem::offset_of!(UserContext, gs_base), 184);
+        assert_eq!(core::mem::offset_of!(UserContext, cs), 192);
+        assert_eq!(core::mem::offset_of!(UserContext, ss), 194);
+        assert_eq!(core::mem::offset_of!(crate::idt::TrapFrame, cs), 144);
+        assert_eq!(core::mem::offset_of!(crate::idt::TrapFrame, ss), 168);
         assert_eq!(core::mem::offset_of!(percpu::CpuLocal, kernel_rsp), percpu::CL_KERNEL_RSP);
         assert_eq!(core::mem::offset_of!(percpu::CpuLocal, user_rsp_scratch), percpu::CL_USER_RSP);
         assert_eq!(core::mem::offset_of!(percpu::CpuLocal, user_ctx), percpu::CL_USER_CTX);
@@ -1561,8 +1697,12 @@ mod tests {
         assert_eq!(core::mem::offset_of!(crate::idt::TrapFrame, rflags), 152);
         assert_eq!(core::mem::offset_of!(crate::idt::TrapFrame, rsp), 160);
         assert_eq!(crate::gdt::KERNEL_SS, 0x10);
-        assert_eq!(crate::gdt::USER_SS, 0x1b);
-        assert_eq!(crate::gdt::USER_CS, 0x23);
+        assert_eq!(crate::gdt::USER_SS, 0x2b);
+        assert_eq!(crate::gdt::USER_CS, 0x33);
+        assert_eq!(crate::gdt::USER32_CS, 0x23);
+        // The syscall entry's one store of CS and SS.
+        let c = UserContext::default();
+        assert_eq!((c.cs as u32) | (c.ss as u32) << 16, 0x002b_0033);
     }
 
     fn after_syscall(rip: u64, rflags: u64) -> UserContext {
@@ -1591,29 +1731,51 @@ mod tests {
         assert!(!after_syscall(CANONICAL_LOW_END, 0x246).sysret_possible());
         assert!(!after_syscall(0xFFFF_8000_0000_0000, 0x246).sysret_possible());
         assert!(after_syscall(crate::USER_TOP - 16, 0x246).sysret_possible());
+        // AB-10a: 32-bit code always goes back by IRET (sysretq returns to 64-bit mode).
+        let mut c = after_syscall(0x40_1000, 0x246);
+        c.cs = crate::gdt::USER32_CS;
+        assert!(!c.sysret_possible());
     }
 
     /// The host `imp::execute` panics, so every case here proves the state never reaches the return to user.
     #[test]
     fn state_that_faults_in_ring_0_never_enters() {
         let base = UserContext::new(0x40_1000, 0x7FFF_0000);
-        let cases: [(fn(&mut UserContext), u8); 7] = [
-            (|c| c.regs.rip = CANONICAL_LOW_END, VECTOR_GP),
-            (|c| c.regs.rsp = 0x8000_0000_0000_0000, VECTOR_SS),
-            (|c| c.regs.rsp = 0x0000_8000_0000_0000, VECTOR_SS),
-            (|c| c.fs_base = 0x8000_0000_0000_0000, VECTOR_GP),
-            (|c| c.gs_base = 0x0001_0000_0000_0000, VECTOR_GP),
-            (|c| c.fs_base = 0xFFFF_7FFF_FFFF_FFFF, VECTOR_GP),
-            (|c| c.gs_base = 0x0000_8000_0000_1000, VECTOR_GP),
+        let cases: [(fn(&mut UserContext), u8, u64); 13] = [
+            (|c| c.regs.rip = CANONICAL_LOW_END, VECTOR_GP, 0),
+            (|c| c.regs.rsp = 0x8000_0000_0000_0000, VECTOR_SS, 0),
+            (|c| c.regs.rsp = 0x0000_8000_0000_0000, VECTOR_SS, 0),
+            (|c| c.fs_base = 0x8000_0000_0000_0000, VECTOR_GP, 0),
+            (|c| c.gs_base = 0x0001_0000_0000_0000, VECTOR_GP, 0),
+            (|c| c.fs_base = 0xFFFF_7FFF_FFFF_FFFF, VECTOR_GP, 0),
+            (|c| c.gs_base = 0x0000_8000_0000_1000, VECTOR_GP, 0),
+            // AB-10a: selectors the return must not load, and 32-bit code above 4 GiB.
+            (|c| c.cs = 0x0f, VECTOR_GP, 0x0c),
+            (|c| c.cs = 0x2b, VECTOR_GP, 0x28),
+            (|c| c.cs = 0x08, VECTOR_GP, 0x08),
+            (|c| c.ss = 0x0f, VECTOR_GP, 0x0c),
+            (|c| c.ss = 0x63, VECTOR_GP, 0x60),
+            (|c| {
+                c.cs = crate::gdt::USER32_CS;
+                c.regs.rip = 0x1_0000_0000;
+            }, VECTOR_GP, 0),
         ];
-        for (i, (set, want)) in cases.iter().enumerate() {
+        for (i, (set, want, err)) in cases.iter().enumerate() {
             let mut c = base;
             set(&mut c);
-            assert_eq!(c.execute(true), ReturnReason::Trap { vector: *want, error: 0, cr2: 0 }, "case {i}");
+            assert_eq!(c.execute(true), ReturnReason::Trap { vector: *want, error: *err, cr2: 0 }, "case {i}");
             assert_eq!(c.trap_vector, *want as u64);
+            assert_eq!(c.trap_error, *err);
             assert_eq!(c.stats.sysret + c.stats.iret, 0, "case {i} reached the return to user");
             assert_eq!(c.stats.bad_rip + c.stats.bad_stack + c.stats.bad_base, 1);
         }
+        // AMD's RPL-0 SYSRET SS names the same segment and goes back as 0x2b.
+        let mut c = base;
+        c.ss = 0x28;
+        assert_eq!(c.refuse_entry(), None);
+        c.cs = crate::gdt::USER32_CS;
+        c.regs.rip = 0xFFFF_F000;
+        assert_eq!(c.refuse_entry(), None);
     }
 
     #[test]

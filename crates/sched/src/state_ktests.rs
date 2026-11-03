@@ -68,7 +68,7 @@ fn rt_lowered() -> R {
         });
         let Ok(b) = b else { return };
         let before = u64::from(d.load(Ordering::Acquire));
-        crate::set_rt_priority(30);
+        set_rt_priority(30);
         let after = u64::from(d.load(Ordering::Acquire));
         s.store(before << 1 | after, Ordering::Release);
         b.join_timeout(5 * SEC);
@@ -80,4 +80,27 @@ fn rt_lowered() -> R {
     kassert!(v >> 1 == 0, "B ran before A lowered its priority");
     kassert!(v & 1 == 1, "B did not run when A lowered its priority below it");
     Ok(())
+}
+
+/// The ktest's way to change the calling thread's KernelRt priority (no kernel code changes it at run time; C1
+/// moved it here from lib.rs) (1..=99; it matters only for KernelRt threads). It applies at
+/// once: a thread that lowers itself below a waiting KernelRt thread of its CPU gives way (Linux
+/// `sched_setscheduler`). Only the caller can change its own priority, and a running thread is in no queue, so
+/// nothing has to be requeued; raising it needs no check (it runs already).
+fn set_rt_priority(prio: u8) {
+    let Some(t) = crate::current_thread() else { return };
+    let p = prio.clamp(1, crate::RT_PRIO_MAX);
+    let old = t.rt_prio.swap(p, Ordering::Relaxed);
+    if t.class() != Class::KernelRt || !crate::STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let _irq = hal::cpu::IrqGuard::new();
+    let cs = crate::cpus::this();
+    cs.curr_prio.store(p, Ordering::Relaxed);
+    drop(t);
+    if p < old && !hal::percpu::in_hard_irq() && ksync::preempt_count() == 0 && cs.rq.lock().best_rt_prio().is_some_and(|b| b > p) {
+        // A refused switch was rolled back: the caller runs on and gives way at its next preemption point.
+        cs.need_resched.store(true, Ordering::Relaxed);
+        let _ = crate::run::schedule(crate::Leave::Preempt);
+    }
 }

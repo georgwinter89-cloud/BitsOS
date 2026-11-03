@@ -54,7 +54,7 @@ fn noexec_scope_decides_the_default_and_can_require_noexec() {
     let ns = Arc::new(MountNs::new_empty());
     let fds = FdTable::new();
     let mem = Mem(RefCell::new(Vec::new()));
-    let s = Sys { mem: &mem, fds: &fds, ns: &ns, cred: Cred { uid: 1000, gid: 1000 }, subject: policy::Subject::KERNEL };
+    let s = Sys { mem: &mem, fds: &fds, fs: &vfs::FsState::new(), ns: &ns, cred: Cred { uid: 1000, gid: 1000 }, subject: policy::Subject::KERNEL };
     let make = |flags: u32| call(&s, 319, [mem.cstr(b"scope"), flags as u64, 0, 0, 0, 0]);
     let seals = |fd: i64| call(&s, 72, [fd as u64, F_GET_SEALS, 0, 0, 0, 0]);
     assert_eq!(noexec_scope(), 0);

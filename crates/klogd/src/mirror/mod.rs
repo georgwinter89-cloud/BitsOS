@@ -15,11 +15,18 @@
 //!   snapshot the thread keeps); if the lock is held (the panic interrupted its holder) the line goes alone in
 //!   the screen stream (`S`, its own positions), which the listener shows as a `scr|` line. `flush_emergency`
 //!   then gives the card `SETTLE_NS` to send.
+//! - **Pause** (RB-15, a reboot or power-off: `klog::shutdown`): before the storage stop and the CPU park the
+//!   thread leaves the stack (it finishes the datagram it is in, then idles), the stack gets a moment for what
+//!   it queued, and from then on what is logged goes out on the raw path at each shutdown step, the stack's
+//!   last 8 KiB repeated once. After each raw round the mirror asks the card (`klog::shutdown::TxDone`) until it
+//!   has sent everything: no mirror datagram is half-way through smoltcp or the card's NAPI path when the CPUs
+//!   are parked, and none is in the card's DMA when the reset comes (the Mini-PC's FCH answers a reset with
+//!   PCIe DMA in flight with a sync flood, desk 28.10.).
 //! - **Quiesce** (Reload, reboot): what waits and the end datagram (`E`) go out through `poll_tx` (interrupts are
-//!   off there, the stack's thread no longer runs), then the mirror is off; registered once live, so it comes
-//!   before the network cards in `quiesce_all` (newest first). `Mirror::resume` (for RB-5b's way back after a
-//!   failed Reload, once the cards run again) lets the thread start a new listener view (new `B`, new id)
-//!   from where the stop ended.
+//!   off there, the stack's thread no longer runs), the card is asked until it has sent them, then the mirror is
+//!   off; registered once live, so it comes before the network cards in `quiesce_all` (newest first).
+//!   `Mirror::resume` (for RB-5b's way back after a failed Reload, once the cards run again) lets the thread
+//!   start a new listener view (new `B`, new id) from where the stop ended.
 //!
 //! Locks: one `IrqSpinLock` ("klog.mirror", klog's level) around the ring, held only to copy bytes; the
 //! emergency path only tries it. The route snapshot lives in two slots ("klog.mirror.route", never held
@@ -30,6 +37,7 @@
 //! `[... n records lost]` line.
 
 pub mod buf;
+mod crumbs;
 #[cfg(target_os = "none")]
 mod kernel;
 pub mod ktests;
@@ -39,6 +47,7 @@ use alloc::sync::Arc;
 use buf::ByteRing;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use devmodel::net::NetDevice;
+use klog::shutdown::{MirrorHook, PauseReport, TxDone};
 use klog::{Level, Sink};
 use ksync::{IrqSpinLock, OnceRef, WaitQueue};
 use net::{Ipv4, NetError, SockAddr, UdpSocket};
@@ -51,6 +60,16 @@ pub use kernel::kick;
 pub const SETTLE_NS: u64 = 20_000_000;
 /// Quiesce: everything waiting plus the end datagram within this time (V1 `MIRROR_STOP_MS`).
 pub const STOP_NS: u64 = 200_000_000;
+/// Pause: how long the thread may take to finish the datagram it is sending.
+pub const PAUSE_WAIT_NS: u64 = 200_000_000;
+/// Pause: the stack's moment for the datagrams the thread queued (its own thread still runs then).
+pub const STACK_SETTLE_NS: u64 = 20_000_000;
+/// How long the card may take to report the raw frames sent (TDH == TDT, every descriptor written back).
+pub const DONE_NS: u64 = 100_000_000;
+/// After the card said done: the last frame's way from the card's FIFO to the wire.
+pub const DONE_SETTLE_NS: u64 = 1_000_000;
+/// Between two looks at a busy ring lock, a refusing card or a card not yet done.
+const RAW_RETRY_NS: u64 = 50_000;
 /// The first emergency send after a quiet second also repeats this much of what already went out: datagrams
 /// the stack queued but its thread never sent (a panic stops it). The listener drops what it has already.
 pub const RESEND_TAIL: u64 = 8 << 10;
@@ -68,6 +87,10 @@ klog::counter!(EMERGENCY_DROPPED, "mirror.emergency_dropped");
 klog::counter!(EMERGENCY_SCREEN, "mirror.emergency_screen_lines");
 klog::counter!(STOPS, "mirror.stops");
 klog::counter!(STOP_FAILURES, "mirror.stops_without_end");
+klog::counter!(PAUSES, "mirror.pauses");
+klog::counter!(PAUSE_THREAD_BUSY, "mirror.pause_thread_busy");
+klog::counter!(DONE_TIMEOUTS, "mirror.card_done_timeouts");
+klog::counter!(DONE_UNKNOWN, "mirror.card_done_unknown");
 
 /// Where emergency frames go out: the card routing picked for the listener, our address and MACs.
 #[derive(Clone)]
@@ -77,6 +100,8 @@ pub struct RouteInfo {
     pub src_mac: [u8; 6],
     /// The next hop's MAC when known, else Ethernet broadcast (change request to NW in the notes).
     pub dst_mac: [u8; 6],
+    /// The card's "everything sent" (RB-15; None: this card cannot say, the mirror settles by time).
+    pub done: Option<Arc<dyn TxDone>>,
 }
 
 impl RouteInfo {
@@ -85,6 +110,7 @@ impl RouteInfo {
             && self.src_ip == o.src_ip
             && self.src_mac == o.src_mac
             && self.dst_mac == o.dst_mac
+            && self.done.is_some() == o.done.is_some()
     }
 }
 
@@ -109,12 +135,18 @@ pub struct Mirror {
     /// The last stop's report, packed (`StopReport::pack`), 0 = none waiting: a Quiesce never logs (CONTRACTS,
     /// PC-2), so the thread logs it when it runs again.
     stop_note: AtomicU64,
+    /// RB-15: the normal path is off (a reboot or power-off is under way); lines go out raw at its steps.
+    paused: AtomicBool,
+    /// `flush` calls in progress (the pause waits for 0).
+    busy: AtomicU32,
     ip_id: AtomicU32,
     recent: [AtomicU64; RECENT],
     recent_next: AtomicUsize,
     last_emergency_ns: AtomicU64,
     kicked: AtomicBool,
     wq: WaitQueue,
+    /// RB-16: positions of the breadcrumb stream that follows the end datagram (`crumbs`).
+    crumb_pos: AtomicU64,
 }
 
 fn fnv(s: &str) -> u64 {
@@ -146,17 +178,30 @@ pub struct StopReport {
     pub no_route: bool,
     /// `STOP_NS` ran out before the end datagram went out.
     pub timed_out: bool,
+    /// The card said it had sent the frames (else `DONE_NS` ran out or it could not say).
+    pub done: bool,
+    /// The card could not say (no probe, not running): the mirror settled by time.
+    pub done_unknown: bool,
 }
 
 impl StopReport {
     fn pack(&self) -> u64 {
-        let flags = [self.was_live, self.ended, self.dropped, self.no_route, self.timed_out];
+        let flags = [self.was_live, self.ended, self.dropped, self.no_route, self.timed_out, self.done, self.done_unknown];
         let bits = flags.iter().enumerate().fold(0u64, |a, (i, &f)| a | (f as u64) << i);
         (self.frames as u64) << 32 | bits
     }
     fn unpack(v: u64) -> StopReport {
         let f = |i: u32| v >> i & 1 == 1;
-        StopReport { was_live: f(0), ended: f(1), dropped: f(2), no_route: f(3), timed_out: f(4), frames: (v >> 32) as u32 }
+        StopReport {
+            was_live: f(0),
+            ended: f(1),
+            dropped: f(2),
+            no_route: f(3),
+            timed_out: f(4),
+            done: f(5),
+            done_unknown: f(6),
+            frames: (v >> 32) as u32,
+        }
     }
 }
 
@@ -175,12 +220,15 @@ impl Mirror {
             stopped: AtomicBool::new(false),
             resume_req: AtomicBool::new(false),
             stop_note: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            busy: AtomicU32::new(0),
             ip_id: AtomicU32::new(0),
             recent: [const { AtomicU64::new(0) }; RECENT],
             recent_next: AtomicUsize::new(0),
             last_emergency_ns: AtomicU64::new(0),
             kicked: AtomicBool::new(false),
             wq: WaitQueue::new(),
+            crumb_pos: AtomicU64::new(0),
         })
     }
 
@@ -189,6 +237,14 @@ impl Mirror {
     }
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::Acquire)
+    }
+    /// RB-15: a reboot or power-off paused the normal path.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+    /// The thread sends through the stack (live and not paused).
+    pub fn sends_normally(&self) -> bool {
+        self.is_live() && !self.is_paused()
     }
     pub fn id(&self) -> u32 {
         self.id.load(Ordering::Acquire)
@@ -215,6 +271,7 @@ impl Mirror {
         self.live.store(false, Ordering::Release);
         self.stopped.store(false, Ordering::Release);
         self.resume_req.store(false, Ordering::Release);
+        self.paused.store(false, Ordering::SeqCst);
         self.st.lock().ring.clear();
         self.scr_pos.store(0, Ordering::Release);
         self.last_emergency_ns.store(0, Ordering::Release);
@@ -289,10 +346,20 @@ impl Mirror {
 
     /// Sends what waits through `sock`, at most `budget` datagrams. Returns the datagrams sent and the bytes
     /// lost to overwriting meanwhile; a send error stops it (what failed stays waiting).
+    /// A pause waits for it to return; it checks for one before every datagram.
     pub fn flush(&self, sock: &dyn UdpSocket, budget: usize) -> Result<(usize, u64), NetError> {
+        struct Busy<'a>(&'a AtomicU32);
+        impl Drop for Busy<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        // SeqCst with the pause's store and load: either this sees the pause, or the pause sees it busy.
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = Busy(&self.busy);
         let mut buf = [0u8; DGRAM_MAX];
         let (mut sent, mut lost) = (0, 0);
-        while sent < budget && self.is_live() {
+        while sent < budget && self.sends_normally() {
             let (n, end) = {
                 let mut g = self.st.lock();
                 lost += g.ring.skip_overwritten();
@@ -475,10 +542,129 @@ impl Mirror {
         }
     }
 
-    /// Quiesce: what waits and the end datagram out through `poll_tx` within `STOP_NS`, then off (V1
-    /// `mirror_stop`). Interrupts are off and the stack's thread does not run any more. The end datagram names
-    /// the end the raw path reached, so a line appended meanwhile is not shown as lost (after a resume it goes
-    /// out under the new start; on a real Reload it is gone either way).
+    /// Everything waiting from the ring's `sent` (with `tail`: the last `RESEND_TAIL` again) out raw by
+    /// `deadline`; a busy ring lock or a refusing card is retried after `wait(RAW_RETRY_NS)`. Returns the end the
+    /// ring reached (everything before it is out), None if the deadline came first.
+    fn raw_rest(&self, r: &RouteInfo, mut tail: bool, deadline: u64, wait: &dyn Fn(u64), rep: &mut EmergencyReport) -> Option<u64> {
+        loop {
+            let from = self.st.try_lock().map(|mut g| {
+                LOST_BYTES.add(g.ring.skip_overwritten());
+                if tail { g.ring.sent().saturating_sub(RESEND_TAIL) } else { g.ring.sent() }
+            });
+            if let Some(from) = from
+                && let Some(end) = self.send_raw(r, from, rep)
+            {
+                return Some(end);
+            }
+            // Only the first try repeats the tail; send_raw marks what went out, so the next try goes on.
+            tail = from.is_none() && tail;
+            if (self.clock)() >= deadline {
+                return None;
+            }
+            wait(RAW_RETRY_NS);
+        }
+    }
+
+    /// Asks the route's card until it has sent everything (`DONE_NS` at most), then the frame's way to the wire.
+    /// Returns (done, unknown); a card that cannot say gets `SETTLE_NS` instead.
+    fn wait_done(&self, r: &RouteInfo, wait: &dyn Fn(u64)) -> (bool, bool) {
+        let deadline = (self.clock)().saturating_add(DONE_NS);
+        let done = loop {
+            match r.done.as_ref().and_then(|p| p.tx_done()) {
+                Some(true) => break Some(true),
+                None => break None,
+                Some(false) if (self.clock)() >= deadline => break Some(false),
+                Some(false) => wait(RAW_RETRY_NS),
+            }
+        };
+        match done {
+            Some(true) => {
+                wait(DONE_SETTLE_NS);
+                (true, false)
+            }
+            Some(false) => {
+                DONE_TIMEOUTS.inc();
+                wait(SETTLE_NS);
+                (false, false)
+            }
+            None => {
+                DONE_UNKNOWN.inc();
+                wait(SETTLE_NS);
+                (false, true)
+            }
+        }
+    }
+
+    /// RB-15 step 1 (thread context, `sleep` may sleep): the normal path off, the thread out of its send, the
+    /// stack's moment for what the thread queued, then what waits out raw (the stack's tail once more: what it
+    /// still held when its card stops is not lost; the listener drops what it has), and the card's done.
+    pub fn pause(&self, sleep: &dyn Fn(u64)) -> PauseReport {
+        let mut out = PauseReport::default();
+        // Set even before the mirror is live: a thread that goes live during the shutdown then idles too. A
+        // shutdown that does not end in a reset (a failed power-off) takes it back with `unpause`.
+        if self.paused.swap(true, Ordering::SeqCst) || !self.is_live() {
+            return out;
+        }
+        out.was_live = true;
+        PAUSES.inc();
+        let t0 = (self.clock)();
+        while self.busy.load(Ordering::SeqCst) > 0 {
+            if (self.clock)().saturating_sub(t0) >= PAUSE_WAIT_NS {
+                out.thread_busy = true;
+                PAUSE_THREAD_BUSY.inc();
+                break;
+            }
+            sleep(1_000_000);
+        }
+        sleep(STACK_SETTLE_NS);
+        self.raw_round(true, sleep, &mut out);
+        out
+    }
+
+    /// After a shutdown step (thread context): what was logged since the last round out raw, the card's done.
+    /// Nothing when the mirror is not paused (or stopped).
+    pub fn checkpoint(&self, sleep: &dyn Fn(u64)) -> PauseReport {
+        let mut out = PauseReport::default();
+        if !self.is_live() || !self.is_paused() {
+            return out;
+        }
+        out.was_live = true;
+        self.raw_round(false, sleep, &mut out);
+        out
+    }
+
+    fn raw_round(&self, tail: bool, sleep: &dyn Fn(u64), out: &mut PauseReport) {
+        let Some(r) = self.route() else {
+            out.done_unknown = true;
+            return;
+        };
+        let mut rep = EmergencyReport::default();
+        let deadline = (self.clock)().saturating_add(STOP_NS);
+        let _ = self.raw_rest(&r, tail, deadline, sleep, &mut rep);
+        out.frames = rep.frames;
+        out.dropped = rep.dropped;
+        // At the pause the card is asked even when nothing went out raw: the stack and the card's NAPI path
+        // may have queued datagrams just before it (RB-15 fixer). A later checkpoint that sent nothing has
+        // nothing new in the card (the pause or the round before asked already).
+        if rep.frames > 0 || tail {
+            (out.done, out.done_unknown) = self.wait_done(&r, sleep);
+        } else {
+            out.done = true;
+        }
+    }
+
+    /// The normal path back (a power-off that did not reach the quiesce; tests): the thread sends again.
+    pub fn unpause(&self) {
+        if self.paused.swap(false, Ordering::SeqCst) {
+            self.kick();
+        }
+    }
+
+    /// Quiesce: what waits and the end datagram out through `poll_tx` within `STOP_NS`, then the card asked until
+    /// it has sent them (RB-15: the reset must not meet them in its DMA), then off (V1 `mirror_stop`). Interrupts
+    /// are off and the stack's thread does not run any more. The end datagram names the end the raw path
+    /// reached, so a line appended meanwhile is not shown as lost (after a resume it goes out under the new
+    /// start; on a real Reload it is gone either way).
     pub fn stop(&self) -> StopReport {
         let out = self.stop_inner();
         if out.was_live {
@@ -497,40 +683,40 @@ impl Mirror {
         if !self.live.swap(false, Ordering::AcqRel) {
             return out;
         }
+        // A pause repeated the stack's tail already; without one (Reload, a panic's quiesce) the stop does.
+        let tail = !self.paused.swap(false, Ordering::SeqCst);
         out.was_live = true;
         self.stopped.store(true, Ordering::Release);
         let Some(r) = self.route() else {
             out.no_route = true;
             return out;
         };
-        let deadline = (self.clock)().saturating_add(STOP_NS);
+        let clock = self.clock;
+        let spin = |ns: u64| drop_wait(clock, ns);
+        let deadline = clock().saturating_add(STOP_NS);
         let mut rep = EmergencyReport::default();
-        let mut tail = true;
-        while (self.clock)() < deadline {
-            let from = self.st.try_lock().map(|mut g| {
-                LOST_BYTES.add(g.ring.skip_overwritten());
-                if tail { g.ring.sent().saturating_sub(RESEND_TAIL) } else { g.ring.sent() }
-            });
-            if let Some(from) = from
-                && let Some(log_end) = self.send_raw(&r, from, &mut rep)
-            {
-                let mut f = [0u8; FRAME_MAX];
-                if let Some(n) = wire::end(&mut f[FRAME_HEAD..], self.id(), self.scr_pos.load(Ordering::Acquire), log_end)
-                    && self.send_frame(&r, &mut f, n)
-                {
-                    out.ended = true;
-                    break;
-                }
-            }
-            // The ring's lock was busy or the card's ring full: it frees descriptors as it sends.
+        let mut tail = tail;
+        while let Some(log_end) = self.raw_rest(&r, tail, deadline, &spin, &mut rep) {
             tail = false;
-            drop_wait(self.clock, 50_000);
+            let mut f = [0u8; FRAME_MAX];
+            if let Some(n) = wire::end(&mut f[FRAME_HEAD..], self.id(), self.scr_pos.load(Ordering::Acquire), log_end)
+                && self.send_frame(&r, &mut f, n)
+            {
+                out.ended = true;
+                break;
+            }
+            // The card's ring full: it frees descriptors as it sends.
+            rep.dropped = true;
+            if clock() >= deadline {
+                break;
+            }
+            spin(RAW_RETRY_NS);
         }
         out.timed_out = !out.ended;
         out.frames = rep.frames + out.ended as u32;
         out.dropped = rep.dropped;
         if out.frames > 0 {
-            drop_wait(self.clock, SETTLE_NS);
+            (out.done, out.done_unknown) = self.wait_done(&r, &spin);
         }
         out
     }
@@ -567,6 +753,18 @@ pub fn mirror() -> Option<&'static Mirror> {
 
 /// The `devmodel::Quiesce` face of the mirror (registered when it goes live).
 pub struct MirrorQuiesce(pub &'static Mirror);
+
+impl MirrorHook for Mirror {
+    fn pause(&self, sleep: &dyn Fn(u64)) -> PauseReport {
+        Mirror::pause(self, sleep)
+    }
+    fn checkpoint(&self, sleep: &dyn Fn(u64)) -> PauseReport {
+        Mirror::checkpoint(self, sleep)
+    }
+    fn unpause(&self) {
+        Mirror::unpause(self)
+    }
+}
 
 impl devmodel::Quiesce for MirrorQuiesce {
     fn name(&self) -> &str {

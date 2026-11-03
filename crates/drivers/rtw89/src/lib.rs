@@ -86,6 +86,8 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
         Some(Core { bus, runner: None }),
     ));
     devmodel::register_quiesce(card.clone());
+    // RB-16: the chip stopped under its own lock before a reboot, power-off or Reload parks the CPUs.
+    devmodel::register_stop_before_park(card.clone());
     CARDS.lock().push(card.clone());
     let opts = sched::SpawnOpts { rt_prio: RT_PRIO, ..sched::SpawnOpts::default() };
     let c = card.clone();

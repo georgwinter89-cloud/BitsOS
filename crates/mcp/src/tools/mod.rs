@@ -18,7 +18,7 @@ mod net_info;
 pub(crate) mod pc;
 mod phys;
 mod reboot;
-mod run_ktests;
+pub(crate) mod run_ktests;
 pub mod screen;
 
 pub use phys::{PHYS_MAX, phys_check};

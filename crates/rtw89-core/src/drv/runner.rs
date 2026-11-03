@@ -26,7 +26,7 @@ use wifi::scan::Bss;
 use wifi::supervisor::{Rhythm, SvState};
 
 use super::device::{DevConfig, Device};
-use super::events::{DevEvent, Level};
+use super::events::{DevEvent, Level, QuietRetry};
 use super::health::{self, FwHealth, Health, Verdict};
 
 /// RX poll period while linked without MSI (spec/wlan.md §3: MSI on the chip is untested)
@@ -55,6 +55,8 @@ pub struct Stats {
     pub fw_repaired: u64,
     /// MSI said the RX ring had no free buffer (RDU)
     pub rx_unavailable: u64,
+    /// frames taken and dropped while the interface had no link (WL-9)
+    pub rx_idle: u64,
 }
 
 /// What a turn gave the network side
@@ -86,6 +88,8 @@ pub struct Runner {
     pub last_scan: Vec<Bss>,
     /// MSI: the masks the chip gets after each bring-up (`None`: polled)
     pub irq: Option<Masks>,
+    /// the first failed join of a rhythm, held until the next join (WL-9)
+    quiet: QuietRetry,
 }
 
 impl core::fmt::Debug for Runner {
@@ -132,6 +136,7 @@ impl Runner {
             log: Vec::new(),
             last_scan: Vec::new(),
             irq: None,
+            quiet: QuietRetry::default(),
         }
     }
 
@@ -145,6 +150,7 @@ impl Runner {
 
     /// The network to join (CONFIG.TXT); `None`: none. The old one (and its PMK) goes.
     pub fn set_network(&mut self, cfg: Option<WlanCfg>, now: u64) {
+        self.quiet.flush(&mut self.log);
         self.wlan = cfg.map(|c| {
             let mut w = Wlan::new(c);
             w.sup.on(now);
@@ -197,6 +203,7 @@ impl Runner {
         v: Verdict,
         out: &mut TurnOut,
     ) {
+        self.quiet.flush(&mut self.log);
         let now = env.now_ms(bus);
         let text = format!("{v}");
         self.say(
@@ -254,6 +261,7 @@ impl Runner {
         let mut out = TurnOut::default();
         let now = env.now_ms(bus);
         let logged = self.log.len();
+        let fails = self.stats.join_failures;
         if self.dev.is_none() {
             self.drop_tx(tx);
             if self.up_at.is_some_and(|t| now >= t) {
@@ -277,6 +285,11 @@ impl Runner {
         if let Some(d) = self.dev.as_mut() {
             d.take_events(&mut self.log);
         }
+        let failed = self.stats.join_failures != fails;
+        let first = self.wlan.as_ref().is_some_and(|w| w.sup.attempt() == 1);
+        let joined = out.link == Some(true);
+        self.quiet
+            .after_turn(&mut self.log, logged, failed, first, joined);
         self.stats.rx_dropped += self.log[logged.min(self.log.len())..]
             .iter()
             .filter(|e| e.name == "rx.dropped")
@@ -373,6 +386,18 @@ impl Runner {
                 self.link_down(now, why, out);
                 if why == LinkLoss::ChipFailed {
                     return Some(Verdict::LinkChipError);
+                }
+            }
+        }
+        let dev = self.dev.as_mut()?;
+        if dev.sta.state == LinkState::Up {
+            // no link: the rings are taken every turn all the same (a full RX ring storms, WL-9)
+            let (mut chip, sta) = dev.parts();
+            match link::idle_poll(bus, &mut chip, sta, env) {
+                Ok(n) => self.stats.rx_idle += n as u64,
+                Err(e) => {
+                    self.say(Level::Warn, "rx.idle_failed", format!("{e:?}"));
+                    return self.chip_error(bus, &e, now);
                 }
             }
         }
@@ -474,6 +499,7 @@ impl Runner {
 
     /// Leave and stay off (no rejoin until `join`); the CH12 copies of the keys are wiped
     pub fn leave<B: Bus + ?Sized>(&mut self, bus: &mut B, env: &mut dyn StaEnv<B>) -> TurnOut {
+        self.quiet.flush(&mut self.log);
         let mut out = TurnOut::default();
         let now = env.now_ms(bus);
         if self.link.take().is_some() {
@@ -545,6 +571,7 @@ impl Runner {
     /// The clean way down (Reboot by the console, driver unload): leave, remove the interface,
     /// btc off, flushes, power off. The chip is down afterwards and stays down.
     pub fn stop<B: Bus + ?Sized>(&mut self, bus: &mut B, env: &mut dyn StaEnv<B>) {
+        self.quiet.flush(&mut self.log);
         if let Some(w) = self.wlan.as_mut() {
             w.sup.off();
         }

@@ -26,6 +26,7 @@ ktest!("sn.dpaudio.absent", Safe, absent);
 fn absent() -> TestResult {
     let before = write_calls();
     let sel_before = index_selects();
+    let smu_before = hdmi::smu_writes();
     let st = display_state();
     let gpu = gpu_controller();
     klog::event!(Info, "ktest", "dpaudio.state", state = state_name(st), attached = DcnRegs::attached().is_some(),
@@ -40,6 +41,7 @@ fn absent() -> TestResult {
         kassert!(write_calls() == before, "{} writes reached DcnRegs", write_calls() - before);
         // SN-13 moved paired EP_INDEX writes to their own counter; without an engine there is none of either.
         kassert!(index_selects() == sel_before, "{} index selects reached DcnRegs", index_selects() - sel_before);
+        kassert!(hdmi::smu_writes() == smu_before, "{} SMU mailbox writes without an engine", hdmi::smu_writes() - smu_before);
         if let Some(d) = &gpu {
             kassert!(d.ctrl.read_only(), "{} streams without a display side", d.ctrl.name());
         }
@@ -68,14 +70,26 @@ fn ready() -> Result<(), TestResult> {
 /// HDMI sound off and checked: the GPU controller back to enumerate-only, the 41-write undo, then every register
 /// the undo wrote reads back as the firmware had it (saved-5.json) in the bits the undo checks.
 fn off_checked() -> TestResult {
+    let smu0 = hdmi::smu_writes();
     let o = hdmi::hdmi_off()?;
     kassert!(o.mismatched == 0, "{} writes did not read back", o.mismatched);
+    // SN-13 (w25): Linux's UpdatePmeRestore after the packets are off, answered by the PMFW (3 mailbox writes).
+    let pme = hdmi::pme_last().1;
+    klog::event!(Info, "ktest", "dpaudio.pme", when = "off", result = pme, smu_writes = hdmi::smu_writes() - smu0);
+    kassert!(pme == "ok", "UpdatePmeRestore after off: {pme}");
     kassert!(display_state() == State::Off, "state {:?} after off", display_state());
     let now = hdmi::undo_registers()?;
     // A register the undo writes twice (a step value, then the saved one) is checked against its last write only.
     let undo = &dpaudio::UNDO;
     for (i, (w, (loc, v))) in undo.iter().zip(now).enumerate() {
         if undo[i + 1..].iter().any(|later| later.loc == w.loc) {
+            continue;
+        }
+        // DP_SEC_CNTL as Linux leaves it (SN-12): no audio field, and the master switch only for another sender.
+        if loc == dpaudio::Loc::Bar(dpaudio::DP_SEC_CNTL) {
+            let audio = dpaudio::DP_SEC_AUDIO & !dpaudio::DP_SEC_STREAM_ENABLE;
+            kassert!(v & audio == 0, "DP_SEC_CNTL {v:#x}: an audio packet still on");
+            kassert!(v == 0 || v & dpaudio::DP_SEC_STREAM_ENABLE != 0, "DP_SEC_CNTL {v:#x}: a sender without its master switch");
             continue;
         }
         kassert!((v ^ w.or) & w.check == 0, "{loc:?} reads {v:#x}, the firmware had {:#x}", w.or);
@@ -92,7 +106,14 @@ fn on() -> TestResult {
         return r;
     }
     let was_on = display_state() == State::On;
+    let smu0 = hdmi::smu_writes();
     hdmi::hdmi_on()?;
+    if !was_on {
+        // SN-13 (w25): the display side was written: UpdatePmeRestore between the endpoint's enable and the packets.
+        let pme = hdmi::pme_last().0;
+        klog::event!(Info, "ktest", "dpaudio.pme", when = "on", result = pme, smu_writes = hdmi::smu_writes() - smu0);
+        kassert!(pme == "ok", "UpdatePmeRestore at on: {pme}");
+    }
     let r = playable();
     if !was_on {
         off_checked()?;

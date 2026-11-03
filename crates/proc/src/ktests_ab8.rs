@@ -24,7 +24,7 @@ fn lib_path(name: &str) -> String {
 
 /// Links the library set in /bin to /lib64 and /usr/lib where nothing is yet; Err(skip) when the image has no
 /// dynamic programs.
-fn link_libs() -> Result<(), TestResult> {
+pub(crate) fn link_libs() -> Result<(), TestResult> {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/dyn-hello").is_err() {
         return Err(ktest::skip("no dynamic programs in this image (built without the host's gcc or the musl sysroot)"));
@@ -48,7 +48,7 @@ fn link_libs() -> Result<(), TestResult> {
 }
 
 /// Runs `path` with `argv` and `stdin`: (status, stdout, stderr).
-fn run(path: &str, argv: &[&str], stdin: &[u8]) -> Result<(ExitStatus, String, String), String> {
+pub(crate) fn run(path: &str, argv: &[&str], stdin: &[u8]) -> Result<(ExitStatus, String, String), String> {
     let out = Capture::new(1 << 20);
     let err = Capture::new(1 << 16);
     let env = ["PATH=/bin", "HOME=/", "ABI_TEST=1"];
@@ -62,7 +62,7 @@ fn run(path: &str, argv: &[&str], stdin: &[u8]) -> Result<(ExitStatus, String, S
 }
 
 /// A program's own yes/no checks: exit 0, `last` as the last line, no line ending in ": no".
-fn checks(path: &str, argv: &[&str], last: &str) -> TestResult {
+pub(crate) fn checks(path: &str, argv: &[&str], last: &str) -> TestResult {
     let (st, out, err) = run(path, argv, b"")?;
     kassert!(st == ExitStatus::Exited(0), "{path} {argv:?}: {}; stdout {out:?} stderr {err:?}", st.describe());
     kassert!(out.lines().last() == Some(last), "{path} {argv:?}: last line {:?}; stderr {err:?}", out.lines().last());
@@ -148,7 +148,10 @@ fn layout() -> TestResult {
     let base = aux(&auxv, AT_BASE).unwrap_or(0);
     kassert!(aux(&auxv, AT_ENTRY) == Some(plan.entry), "AT_ENTRY {:?} plan {:#x}", aux(&auxv, AT_ENTRY), plan.entry);
     kassert!(aux(&auxv, AT_PHDR) == Some(plan.phdr), "AT_PHDR {:?}", aux(&auxv, AT_PHDR));
-    kassert!(aux(&auxv, AT_SYSINFO_EHDR).is_none(), "no vDSO before AB-9");
+    // AB-14: the vDSO sits below the loader (mapped after it, top-down), [vvar] right before it.
+    let vdso = aux(&auxv, AT_SYSINFO_EHDR).unwrap_or(0);
+    kassert!(vdso != 0 && vdso < base, "AT_SYSINFO_EHDR {vdso:#x}, loader {base:#x}");
+    kassert!(vmas.iter().any(|v| v.end == vdso && v.end - v.start == 4096 && v.prot.read && !v.prot.write && !v.prot.exec), "no read-only vvar page before the vDSO: {vmas:?}");
     kassert!(base != 0 && base < mm::MMAP_TOP && mm::MMAP_TOP - base < (4 << 20), "AT_BASE {base:#x}: the loader top-down below the mmap base");
     kassert!(brk == plan.end, "break {brk:#x}, image end {:#x}", plan.end);
     // Program and loader are file mappings (no copied Image memory), the first program page at its address.

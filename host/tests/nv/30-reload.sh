@@ -33,7 +33,10 @@ python3 -I "$NV/mkimg.py" pattern "$RUN_DIR/k4.img" $((8 << 20)) 2
 WIN=$(sum "$RUN_DIR/win.img")
 K4=$(sum "$RUN_DIR/k4.img")
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;rb_squeeze_mb=192;rb_choke_mb=10;nvme_busy=on"
+# C1 (INT-W27b): squeezed like rb/20-reload.sh, so the test bundle's initramfs still fits in one piece (192 refuses
+# the reload as 256 did in W27b).
+export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-384}
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;rb_squeeze_mb=$RB_SQUEEZE_MB;rb_choke_mb=10;nvme_busy=on"
 BUNDLES="$RUN_DIR/bundles"
 rm -rf "$BUNDLES"
 mkdir -p "$BUNDLES/base"

@@ -255,6 +255,36 @@ fn mutex_lock_timeout() {
 }
 
 #[test]
+fn abandoned_counts_over_cpu_slots() {
+    // PF-2: failed try_locks and timeouts from several "CPUs" (host threads) land in their own slots and are
+    // summed exactly when read.
+    install();
+    ksync::prepare_cpus(64);
+    let m = Arc::new(Mutex::named("t.hooks.abandon_slots", ()));
+    let g = m.lock();
+    let hs: Vec<_> = (0..4)
+        .map(|_| {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    assert!(m.try_lock().is_none());
+                }
+                assert!(m.lock_timeout(2_000_000).is_none());
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    drop(g);
+    let st = stats::class("t.hooks.abandon_slots").unwrap();
+    assert_eq!(st.try_failed, 100, "{st:?}");
+    assert_eq!(st.timeouts, 4, "{st:?}");
+    assert_eq!(st.acquired, 1, "{st:?}");
+    assert!(stats::spread("t.hooks.abandon_slots").unwrap().covered >= 4);
+}
+
+#[test]
 fn completion_wakes_all_and_times_out() {
     install();
     let c = Arc::new(Completion::new());

@@ -91,11 +91,17 @@ pub enum ExecTarget {
     NoPath,
 }
 
-/// The process's view for path walks: its mount view, root, cwd and credentials.
-fn view(p: &Process) -> Ctx<'_> {
-    let root = p.ns.root_path();
-    let cwd = p.fds.fs.cwd().unwrap_or_else(|| root.clone());
-    Ctx { ns: &p.ns, root, cwd, cred: p.fs_cred(), umask: p.fds.fs.umask(), subject: p.subject() }
+/// The calling thread's view for path walks: its mount view, root, cwd and credentials.
+fn view<'a>(p: &Process, ns: &'a Arc<vfs::MountNs>, t: &Thread) -> Ctx<'a> {
+    let fs = t.fs(p);
+    // SX-3a: the mount namespace's view (a state from the view it was copied from moves over first).
+    if vfs::MountNs::copies_exist() {
+        fs.enter(ns);
+    }
+    // SX-2: the process root (chroot) for absolute names; the cwd stays where it was.
+    let root = fs.root().unwrap_or_else(|| ns.root_path());
+    let cwd = fs.cwd().unwrap_or_else(|| ns.root_path());
+    Ctx { ns, root, cwd, cred: p.fs_cred(), umask: fs.umask(), subject: p.subject() }
 }
 
 /// `bprm->filename`: what AT_EXECFN and the new `comm` are made of.
@@ -283,7 +289,8 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     if r.flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
-    let c = view(p);
+    let ns = p.mount_ns();
+    let c = view(p, &ns, t);
     let fname = filename(r.dirfd, &r.path);
     let mut argv = r.argv.clone();
     let (mut file, mut f, mut deny) = open_exec(p, &c, lookup(p, &c, r.dirfd, &r.path, r.flags)?)?;
@@ -403,8 +410,8 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     let fds = own_fds.map_or_else(|| p.fds.clone(), Arc::new);
     // AB-5: the POSIX record locks of the files close-on-exec closes go with them (`filp_close` →
     // `locks_remove_posix`).
-    let closing = crate::locks::cloexec_files(&fds);
-    fds.close_on_exec();
+    // PF-3 CR 2 (INT-W27): one pass under the table lock; what it closed is what loses its locks.
+    let closing = fds.close_on_exec();
     crate::locks::closed_files(&fds, &closing);
     drop(closing);
     // `flush_signal_handlers` and `exit_itimers` (begin_new_exec): the POSIX timers go, the itimers stay.
@@ -420,8 +427,15 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     // image loads changes only that sibling, which de_thread then ends. V2 keeps one set per group, so the
     // snapshot is what restores Linux's result (and keeps the auxv ids the same as the committed ones).
     g.set_cred(cred.clone());
-    let new = crate::make_image(p.pid, name, exe, args, p.program, &cred, Arc::new(mm), fds, p.ns.clone(), g.clone());
+    // `unshare_files` leaves `fs_struct` alone: the thread's state (its own, or the image's) goes on as the new
+    // image's, which its only thread now shares.
+    let fs = t.fs(p);
+    // AB-10a: the new address space has no LDT (`destroy_context_ldt` with the old mm).
+    let new = crate::make_image(p.pid, name, exe, args, p.program, &cred, Arc::new(mm), fds, fs, p.ns.clone(), g.clone(), hal::entry::segs::LdtSlot::new());
+    t.set_own_fs(None);
     new.mm_flags.for_exec(&p.mm_flags);
+    // MM-13: PR_SET_THP_DISABLE survives exec (Linux MMF_INIT_MASK); the new image's space gets it.
+    new.mm.set_thp_disabled(new.mm_flags.thp_disabled());
     // `begin_new_exec`: dumpable again only when the effective ids are the real ones (else `suid_dumpable`, 0).
     if cred.euid != cred.uid || cred.egid != cred.gid {
         new.mm_flags.set_dumpable(0);
@@ -445,6 +459,8 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     drop(old_deny);
     drop(old);
     *ctx = UserContext::new(l.entry, l.rsp);
+    // AB-10a (`flush_thread` + `start_thread`): no TLS slots, null DS/ES/FS/GS, the new image's (empty) LDT.
+    hal::entry::segs::install(hal::entry::segs::Snapshot::default(), Some(new.ldt.clone()));
     clean_fpu();
     t.new_image.store(true, Ordering::Release);
     EXECS.inc();

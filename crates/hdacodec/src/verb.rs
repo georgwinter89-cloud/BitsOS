@@ -66,6 +66,7 @@ pub const ATI_SET_MULTICHANNEL_MODE: u16 = 0x789;
 
 // Payload bits.
 pub const PWRST_D0: u8 = 0x00;
+pub const PWRST_D3: u8 = 0x03;
 pub const PINCTL_OUT_EN: u8 = 0x40;
 pub const PINCTL_HP_EN: u8 = 0x80;
 pub const EAPD_ENABLE: u8 = 0x02;

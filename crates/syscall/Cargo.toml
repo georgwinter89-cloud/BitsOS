@@ -6,11 +6,14 @@ description = "Linux syscall dispatch (owner: AB)"
 
 [dependencies]
 proc = { path = "../proc" }
+seccomp = { path = "../seccomp" }
 console = { path = "../console" }
 vfs = { path = "../vfs" }
 block = { path = "../block" }
 # NW-5: the socket syscalls (glue granted to NW, src/socket.rs).
 net = { path = "../net" }
+# UL-7: reboot(2) restarts and powers off through CP-5's platform functions (granted to UL, src/reboot.rs).
+platform = { path = "../platform" }
 uapi = { path = "../uapi" }
 kreg = { path = "../kreg" }
 klog = { path = "../klog" }
@@ -22,3 +25,6 @@ time = { path = "../time" }
 ksync = { path = "../ksync" }
 policy = { path = "../policy" }
 ktest = { path = "../ktest" }
+
+[lints]
+workspace = true

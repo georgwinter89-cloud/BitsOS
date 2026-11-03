@@ -67,11 +67,6 @@ fn recompute_most(overrides: &[(String, Level)]) {
     MOST.store(most, Ordering::Relaxed);
 }
 
-pub fn set_default(l: Level) {
-    DEFAULT.store(l as u8, Ordering::Relaxed);
-    recompute_most(&OVERRIDES.read());
-}
-
 pub fn default() -> Level {
     from_u8(DEFAULT.load(Ordering::Relaxed))
 }

@@ -37,9 +37,11 @@ impl Buddy {
                     return Some(pfn * PAGE);
                 }
             }
-            // Frames parked in the per-CPU lists may be the ones below the limit.
+            // Frames parked in the per-CPU lists may be the ones below the limit, and so may frames that wait
+            // for a grace period (PF-5: a contiguous allocation waits for them, bounded, before it fails).
             if attempt == 0 {
-                if self.drain_all() == 0 {
+                let graced = kind != Kind::Heap && (crate::grace::drain() > 0 || crate::grace::expedite() > 0);
+                if self.drain_all() == 0 && !graced {
                     break;
                 }
                 self.reports().drain();

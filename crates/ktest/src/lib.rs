@@ -28,6 +28,23 @@ pub enum Class {
     Wlan,
     /// Only meaningful or only safe under QEMU (e.g. a real #DF); shows as `skip` on hardware.
     QemuOnly,
+    /// A program from its own stick tree (Brave, LibreOffice, Cobalt, ...): runs only on the Mini-PC, never under
+    /// QEMU (Georg 30.10.: "Programme werden nur noch am Mini PC getestet und nicht mehr in QEMU"); under QEMU it
+    /// shows as "class Program not allowed here", a test of another run.
+    Program,
+}
+
+impl Class {
+    /// Whether a test of this class runs at all on a machine with (`hypervisor`) or without the hypervisor bit, as
+    /// the kernel's ktest boot and MCP's `ktest` tool both decide it; `hw` = run as on hardware (CONFIG ktest_hw=on).
+    /// Audible and Wlan have further rules on hardware (MCP's verdict); this is the class line only.
+    pub fn runs_here(self, hypervisor: bool, hw: bool) -> bool {
+        match self {
+            Class::Safe | Class::Display => true,
+            Class::Program => !hypervisor,
+            Class::QemuOnly | Class::Audible | Class::Wlan => hypervisor && !hw,
+        }
+    }
 }
 
 pub type TestResult = Result<(), String>;
@@ -95,6 +112,15 @@ fn line(s: &str) {
     hal::serial::write_line(s.as_bytes());
 }
 
+/// INT-W28 (GX-7m CR): which test runs now (index into `KTESTS` + 1; 0 = none), so the panic path can name it.
+static CURRENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The test running now, if any (the panic path's "stack overflow in <test>").
+pub fn current() -> Option<&'static str> {
+    let i = CURRENT.load(core::sync::atomic::Ordering::Relaxed);
+    KTESTS.entries().get(i.checked_sub(1)?).map(|e| e.name)
+}
+
 /// Runs the matching tests in name order. `allowed(class)` decides which classes may run here.
 pub fn run(filter: &str, allowed: impl Fn(Class) -> bool, now_ns: fn() -> u64) -> Summary {
     run_checked(filter, allowed, now_ns, |_| None)
@@ -116,7 +142,11 @@ pub fn run_checked(filter: &str, allowed: impl Fn(Class) -> bool, now_ns: fn() -
             sum.skipped += 1;
         } else {
             let start = now_ns();
-            match (t.func)() {
+            let idx = KTESTS.entries().iter().position(|e| core::ptr::eq(e, t)).map_or(0, |i| i + 1);
+            CURRENT.store(idx, core::sync::atomic::Ordering::Relaxed);
+            let r = (t.func)();
+            CURRENT.store(0, core::sync::atomic::Ordering::Relaxed);
+            match r {
                 Ok(()) => {
                     let _ = write!(s, "KTEST ok {} ({} ms)", t.name, (now_ns() - start) / 1_000_000);
                     sum.passed += 1;

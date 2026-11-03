@@ -102,7 +102,7 @@ fn profile_work(ns: &vfs::MountNs) {
 
 #[test]
 fn pool_image_on_another_file_system_through_the_vfs() {
-    let s = Scratch::new();
+    let s = Scratch::alone();
     let (ns, file) = image_ns(96);
     data::format_pool(Arc::new(ImageBlock::new("data.img", file.clone(), true).unwrap()), b"bitsdata").unwrap();
     {
@@ -197,6 +197,7 @@ fn place<'a>(image: &'a str, temp: &'a str, at: &'a str, pool: &'a str) -> data:
 
 #[test]
 fn bring_up_removes_a_leftover_before_the_room_check_then_makes_mounts_and_mounts_read_only() {
+    let _sync = global_sync();
     let ns = vfs::MountNs::new_empty();
     ns.mkdir_p("/stick").unwrap();
     let p = place("/stick/data.img", "/stick/data.img.new", "/d", "hostbring");
@@ -229,7 +230,7 @@ fn bring_up_removes_a_leftover_before_the_room_check_then_makes_mounts_and_mount
     let (ph, m) = data::bring_up(&ns, &p, false, 32, &|| 0, &|_| panic!("no creation on a read-only stick"));
     assert_eq!(ph, data::Phase::Mounted { pool: true, writable: false, created: false });
     let path = ns.lookup_path(b"/d", true).unwrap();
-    assert!(path.is_mount_root() && path.mnt.readonly, "/d is a read-only mount");
+    assert!(path.is_mount_root() && path.mnt.is_readonly(), "/d is a read-only mount");
     assert_eq!(ns.read_file("/d/home/1000/kept", 64).unwrap(), b"boot 1");
     assert_eq!(c.mkdir(None, b"/d/x", 0o755).err(), Some(crate::errno::EROFS));
     assert_eq!(vfs::writeback::Flush::stop(&*m.as_ref().unwrap().vol), Ok(true));
@@ -240,6 +241,7 @@ fn bring_up_removes_a_leftover_before_the_room_check_then_makes_mounts_and_mount
 
 #[test]
 fn bring_up_skips_without_room_and_a_read_only_stick_never_creates() {
+    let _sync = shared_sync();
     let ns = vfs::MountNs::new_empty();
     ns.mkdir_p("/stick").unwrap();
     let p = place("/stick/data.img", "/stick/data.img.new", "/d", "hostskip");
@@ -255,6 +257,7 @@ fn bring_up_skips_without_room_and_a_read_only_stick_never_creates() {
 
 #[test]
 fn hostile_images_are_left_as_they_are_and_not_mounted() {
+    let _sync = shared_sync();
     let ns = vfs::MountNs::new_empty();
     ns.mkdir_p("/stick").unwrap();
     let p = place("/stick/data.img", "/stick/data.img.new", "/d", "hosthostile");
@@ -292,6 +295,7 @@ fn fill_pattern(b: &mut [u8]) {
 
 #[test]
 fn a_plain_ext4_image_mounts_as_a_loop_image() {
+    let _sync = shared_sync();
     let ns = vfs::MountNs::new_empty();
     ns.mkdir_p("/stick").unwrap();
     let p = place("/stick/data.img", "/stick/data.img.new", "/d", "hostplain");
@@ -311,6 +315,7 @@ fn a_plain_ext4_image_mounts_as_a_loop_image() {
 
 #[test]
 fn user_dirs_gives_an_empty_root_owned_folder_to_the_user_and_keeps_a_used_one() {
+    let _sync = shared_sync();
     let ns = vfs::MountNs::new_empty();
     let dev = Arc::new(crate::MemDev::new(vec![0u8; 16 << 20]));
     crate::mkfs::format(&*dev, &super::mkfs::opts_for(true)).unwrap();
@@ -331,6 +336,7 @@ fn user_dirs_gives_an_empty_root_owned_folder_to_the_user_and_keeps_a_used_one()
 
 #[test]
 fn stop_on_a_frozen_volume_returns_at_once_and_does_nothing() {
+    let _sync = global_sync();
     let ns = vfs::MountNs::new_empty();
     let dev = Arc::new(crate::MemDev::new(vec![0u8; 16 << 20]));
     crate::mkfs::format(&*dev, &super::mkfs::opts_for(true)).unwrap();

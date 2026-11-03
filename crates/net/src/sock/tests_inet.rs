@@ -227,3 +227,170 @@ fn tcp_shutdown_against_blocked_calls() {
         p.close(fd);
     }
 }
+
+/// NW-10: poll, select and epoll subscribe to AF_INET sockets' queue (`inet::READY`), so a sleeper wakes with the
+/// data instead of at the next 10 ms look (BusyBox wget stalled ~9 ms each time its buffer ran dry). An epoll
+/// sleeping with a long timeout returns the socket once data arrives.
+#[test]
+fn inet_sockets_wake_poll_and_epoll() {
+    use vfs::epoll::{new_epoll, EPOLL_CTL_ADD};
+    stack();
+    let ns = ns();
+    let p = Prog::new(&ns, 31, 1000);
+    let srv = p.socket(AF_INET, SOCK_STREAM) as u64;
+    assert_eq!(bind(&p, srv, &any(24659)), 0);
+    assert_eq!(p.call(sys::listen, [srv, 8, 0, 0, 0, 0]), 0);
+    let cli = p.socket(AF_INET, SOCK_STREAM) as u64;
+    assert_eq!(connect(&p, cli, &lo(24659)), 0);
+    let s = p.call(sys::accept4, [srv, 0, 0, SOCK_NONBLOCK, 0, 0]);
+    assert!(s >= 0, "accept {s}");
+    let f = p.fds.get(s as usize).unwrap();
+    let mut named = 0;
+    f.file.poll_wait(&mut |q| {
+        assert!(core::ptr::eq(q, &super::inet::READY), "an AF_INET socket names inet::READY");
+        named += 1;
+    });
+    assert_eq!(named, 1, "exactly one queue");
+    let ep = new_epoll();
+    vfs::epoll::Epoll::ctl(&ep, EPOLL_CTL_ADD, &f, s as i32, (E::IN, 7), false).unwrap();
+    let sleeper = {
+        let ep = ep.clone();
+        std::thread::spawn(move || {
+            let mut v: Vec<(u32, u64)> = Vec::new();
+            ep.file.as_epoll().unwrap().wait(&mut v, 8, Some(10_000_000_000), &|| false).unwrap();
+            v
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert_eq!(p.send(cli, b"data", 0), 4);
+    let got = sleeper.join().unwrap();
+    assert_eq!(got.len(), 1, "woken with the socket: {got:?}");
+    assert!(got[0].0 & E::IN != 0 && got[0].1 == 7, "{got:?}");
+    assert_eq!(p.recv(s as u64, 8, 0).0, 4);
+    p.close(s as u64);
+    p.close(cli);
+    p.close(srv);
+}
+
+/// An epoll item for `fd` and a thread waiting on it for 20 s. AF_INET sockets name `inet::READY` and the epoll
+/// never looks again by itself, so the thread comes back with an event only when READY woke it.
+fn sleeper(p: &Prog, fd: u64, mask: u32) -> std::thread::JoinHandle<Vec<(u32, u64)>> {
+    use vfs::epoll::{new_epoll, EPOLL_CTL_ADD};
+    let f = p.fds.get(fd as usize).unwrap();
+    let mut named = 0;
+    f.file.poll_wait(&mut |q| {
+        assert!(core::ptr::eq(q, &super::inet::READY));
+        named += 1;
+    });
+    assert_eq!(named, 1, "an AF_INET socket names inet::READY (no 10 ms looks)");
+    let ep = new_epoll();
+    vfs::epoll::Epoll::ctl(&ep, EPOLL_CTL_ADD, &f, fd as i32, (mask, fd), false).unwrap();
+    std::thread::spawn(move || {
+        let mut v: Vec<(u32, u64)> = Vec::new();
+        let end = vfs::poll::now() + 20_000_000_000;
+        ep.file.as_epoll().unwrap().wait(&mut v, 8, Some(end), &|| false).unwrap();
+        v
+    })
+}
+
+fn woken(h: std::thread::JoinHandle<Vec<(u32, u64)>>, want: u32, what: &str) {
+    let got = h.join().unwrap();
+    assert!(got.len() == 1 && got[0].0 & want == want, "{what}: {got:?} (want {want:#x})");
+}
+
+/// NW-10 fixer: epoll on AF_INET sockets wakes on every change, not only on data: a non-blocking connect that
+/// completes (EPOLLOUT), the peer's FIN (EPOLLIN|EPOLLRDHUP), a reset (EPOLLERR|EPOLLHUP), a UDP datagram, and
+/// room to send again (EPOLLOUT).
+#[test]
+fn inet_epoll_wakes_on_every_change() {
+    stack();
+    let ns = ns();
+    let p = Prog::new(&ns, 33, 1000);
+    let srv = p.socket(AF_INET, SOCK_STREAM) as u64;
+    assert_eq!(bind(&p, srv, &any(24690)), 0);
+    assert_eq!(p.call(sys::listen, [srv, 8, 0, 0, 0, 0]), 0);
+    let pair = || {
+        let c = p.socket(AF_INET, SOCK_STREAM) as u64;
+        assert_eq!(connect(&p, c, &lo(24690)), 0);
+        let s = p.call(sys::accept4, [srv, 0, 0, SOCK_NONBLOCK, 0, 0]);
+        assert!(s >= 0, "accept {s}");
+        (c, s as u64)
+    };
+    // A non-blocking connect (it may be done before the item is added: then the first look finds it).
+    let n = p.call(sys::socket, [AF_INET as u64, (SOCK_STREAM as u64) | SOCK_NONBLOCK, 0, 0, 0, 0]) as u64;
+    assert_eq!(connect(&p, n, &lo(24690)), -EINPROGRESS);
+    woken(sleeper(&p, n, E::OUT), E::OUT, "connect done");
+    let ns_ = p.call(sys::accept4, [srv, 0, 0, SOCK_NONBLOCK, 0, 0]);
+    assert!(ns_ >= 0);
+    // The peer's FIN.
+    let (c, s) = pair();
+    assert_eq!(p.events(s) & (E::IN | E::RDHUP), 0);
+    let h = sleeper(&p, s, E::IN | E::RDHUP);
+    assert_eq!(p.call(sys::shutdown, [c, SHUT_WR, 0, 0, 0, 0]), 0);
+    woken(h, E::IN | E::RDHUP, "FIN");
+    // A reset: SO_LINGER 0 s, then close.
+    let (c2, s2) = pair();
+    assert_eq!(p.events(s2) & (E::ERR | E::HUP), 0);
+    let h = sleeper(&p, s2, E::IN);
+    let linger = p.put(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(p.call(sys::setsockopt, [c2, SOL_SOCKET as u64, SO_LINGER as u64, linger, 8, 0]), 0);
+    p.close(c2);
+    woken(h, E::ERR | E::HUP, "reset");
+    // A UDP datagram.
+    let u = p.socket(AF_INET, SOCK_DGRAM) as u64;
+    let v = p.socket(AF_INET, SOCK_DGRAM) as u64;
+    assert_eq!(bind(&p, u, &lo(24691)), 0);
+    assert_eq!(p.events(u) & E::IN, 0);
+    let h = sleeper(&p, u, E::IN);
+    assert_eq!(p.sendto(v, b"dgram", &lo(24691)), 5);
+    woken(h, E::IN, "datagram");
+    // Room to send again after the peer read.
+    let (c3, s3) = pair();
+    p.set_nonblock(c3);
+    let chunk = alloc::vec![3u8; 64 * 1024];
+    let mut idle = 0;
+    while idle < 5 {
+        if p.send(c3, &chunk, 0) == -EAGAIN {
+            idle += 1;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        } else {
+            idle = 0;
+        }
+    }
+    assert_eq!(p.events(c3) & E::OUT, 0, "the send side is full");
+    let h = sleeper(&p, c3, E::OUT);
+    while p.recv(s3, 64 * 1024, MSG_DONTWAIT).0 > 0 {}
+    woken(h, E::OUT, "room to send");
+    for fd in [n, ns_ as u64, c, s, s2, u, v, c3, s3, srv] {
+        p.close(fd);
+    }
+}
+
+/// NW-10 fixer: TCP_QUICKACK reads back !pingpong as on Linux (1 on a fresh socket, `do_tcp_getsockopt`
+/// linux-6.6/net/ipv4/tcp.c:4023); 0 and 1 switch it, and listen() clears it.
+#[test]
+fn tcp_quickack_reads_back_as_linux() {
+    stack();
+    let ns = ns();
+    let p = Prog::new(&ns, 34, 1000);
+    let t = p.socket(AF_INET, SOCK_STREAM) as u64;
+    assert_eq!(p.getopt_int(t, SOL_TCP, TCP_QUICKACK), 1, "fresh: not in pingpong mode");
+    assert_eq!(p.setopt_int(t, SOL_TCP, TCP_QUICKACK, 0), 0);
+    assert_eq!(p.getopt_int(t, SOL_TCP, TCP_QUICKACK), 0);
+    assert_eq!(p.setopt_int(t, SOL_TCP, TCP_QUICKACK, 2), 0);
+    assert_eq!(p.getopt_int(t, SOL_TCP, TCP_QUICKACK), 1, "any non-zero value leaves pingpong");
+    assert_eq!(p.setopt_int(t, SOL_TCP, TCP_QUICKACK, 0), 0);
+    assert_eq!(bind(&p, t, &any(24692)), 0);
+    assert_eq!(p.call(sys::listen, [t, 2, 0, 0, 0, 0]), 0);
+    assert_eq!(p.getopt_int(t, SOL_TCP, TCP_QUICKACK), 1, "listen clears the ACK state");
+    let c = p.socket(AF_INET, SOCK_STREAM) as u64;
+    assert_eq!(p.setopt_int(c, SOL_TCP, TCP_QUICKACK, 0), 0);
+    assert_eq!(connect(&p, c, &lo(24692)), 0);
+    assert_eq!(p.getopt_int(c, SOL_TCP, TCP_QUICKACK), 0, "kept over connect");
+    let a = p.call(sys::accept4, [t, 0, 0, 0, 0, 0]);
+    assert!(a >= 0);
+    assert_eq!(p.getopt_int(a as u64, SOL_TCP, TCP_QUICKACK), 1, "an accepted socket starts fresh");
+    for fd in [t, c, a as u64] {
+        p.close(fd);
+    }
+}

@@ -1,0 +1,10 @@
+# GM-1c: properties where RADV on V2's fake 780M (staged Mesa 26.2.5) and on a real 780M under Linux (Mesa 26.1.6)
+# are known to differ: `section/key | here | real | why`. A difference not listed here fails T0; a listed one that
+# is gone is reported, so the line can go.
+VkPhysicalDeviceDrmPropertiesEXT/hasPrimary | false | true | the fake has no primary node (/dev/dri/card0): CR-GM1c-4
+VkPhysicalDeviceVulkan12Properties/subminor | 5 | 0 | Mesa version (driverInfo 26.2.5 against 26.1.6)
+VkPhysicalDeviceVulkan12Properties/patch | 3 | 0 | Mesa version (conformance version)
+VkPhysicalDeviceCooperativeMatrixFeaturesKHR/cooperativeMatrixRobustBufferAccess | false | true | Mesa version
+VkPhysicalDeviceVulkan11Features/protectedMemory | true | false | Mesa version (newer RADV enables it)
+VkPhysicalDeviceVulkan14Features/pipelineProtectedAccess | true | false | Mesa version (follows protectedMemory)
+VkPhysicalDeviceVulkan14Features/hostImageCopy | true | false | Mesa version (newer RADV enables it)

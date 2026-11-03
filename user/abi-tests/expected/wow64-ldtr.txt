@@ -1,0 +1,5 @@
+pinned to one CPU: yes
+child made its LDT: yes
+an LDT selector faulted every time in the process without an LDT: yes
+the child kept its LDT selector across the switches: yes
+done

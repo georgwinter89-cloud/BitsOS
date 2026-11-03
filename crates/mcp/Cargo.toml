@@ -5,6 +5,9 @@ edition = "2024"
 description = "MCP kernel service, tool registry (owner: MC)"
 
 [dependencies]
+zeroize = { version = "=1.9.1", default-features = false }
+# MC-8a: the pure protocol (HTTP head, JSON, JSON-RPC, the gate), shared with the user-space service bitsmcp.
+mcp-wire = { path = "../mcp-wire" }
 net = { path = "../net" }
 ksync = { path = "../ksync" }
 klog = { path = "../klog" }
@@ -12,6 +15,8 @@ kreg = { path = "../kreg" }
 sched = { path = "../sched" }
 policy = { path = "../policy" }
 time = { path = "../time" }
+# MC-10: a full-access grant with Georg's NVMe tick opens the block layer's run-time NVMe gate.
+block = { path = "../block" }
 ktest = { path = "../ktest" }
 acpi = { path = "../acpi" }
 bootinfo = { path = "../bootinfo" }
@@ -31,3 +36,6 @@ bitsboot = { path = "../../boot/bitsboot" }
 # V2-LANES MC-3 names it for screen's PNG (no_std + alloc, pinned). Its inflate reads the PNG back in the
 # tests; the deflate side is src/deflate.rs (miniz's compressor needs more than a 64 KiB kernel stack, see there).
 miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+
+[lints]
+workspace = true

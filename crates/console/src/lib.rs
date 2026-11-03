@@ -17,6 +17,11 @@
 
 extern crate alloc;
 
+pub mod bootart;
+pub mod bootdraw;
+pub mod bootscreen;
+pub mod bootsteps;
+pub mod stepdetail;
 pub mod evdev;
 pub mod evdevfs;
 pub mod evrepeat;
@@ -45,6 +50,7 @@ pub mod utf8;
 pub mod vt;
 
 mod ktests;
+mod ktests_boot;
 #[doc(hidden)]
 pub mod ktests_in4;
 mod ktests_pty;
@@ -52,11 +58,17 @@ mod ktests_in6;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_boot;
+#[cfg(test)]
+mod tests_watch;
+#[cfg(test)]
 mod tests_in4;
 #[cfg(test)]
 mod tests_in4b;
 #[cfg(test)]
 mod tests_in6;
+#[cfg(test)]
+mod tests_in8;
 #[cfg(test)]
 mod tests_pty;
 #[cfg(test)]
@@ -178,9 +190,13 @@ pub(crate) fn attach_log() {
 
 /// CONFIG keys of the console (the kernel calls this right after `init`): `console_font=vga|noto`,
 /// `console_scrollback=<rows>`, `console_log=off|error|warn|info|debug|all` (default warn; IN-3's name
-/// `console_loglevel` is still read when `console_log` is not set). Attaches the log sink at the end.
+/// `console_loglevel` is still read when `console_log` is not set), DS-4's `desktop=auto|on|off` (default auto: on
+/// real hardware the console shows the boot screen and starts the desktop, under a hypervisor it keeps the text
+/// console) and `desktop_program=<path> [args]` (default /bin/bitscomp). Attaches the log sink at the end.
 pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
     configure_keys(get);
+    // DS-4: `desktop=` and the boot screen, before the log sink so the replayed lines only go into the text model.
+    bootscreen::configure(get);
     attach_log();
 }
 

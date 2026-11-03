@@ -4,7 +4,7 @@
 // (rtw89_phy_write_rf_a), so the scenario's onPoll can make it time out.
 import { pathToFileURL } from 'node:url';
 
-const WZ = process.env.WLAN_TOOLS ?? '/home/georg/BitsOS/werkzeuge/plattform/wlan';
+const WZ = process.env.WLAN_TOOLS ?? `${process.env.HOME}/BitsOS/werkzeuge/plattform/wlan`;
 const { R, BB } = await import(pathToFileURL(`${WZ}/kit/rtwdev.mjs`).href);
 
 const mark = (d, name, ch) => (d.calls ??= []).push([name, d.trace.length + d.q.list.length, ch]);

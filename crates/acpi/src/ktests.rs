@@ -39,31 +39,25 @@ impl PciView for NoPci {
     }
 }
 
-/// 64 KiB of our own frames below 4 GiB (the RSDT holds 32-bit addresses), freed on drop.
-struct Frames(u64);
-const ORDER: u32 = 4;
-const SPAN: u64 = 4096 << ORDER;
+/// 64 KiB of our own frames below 4 GiB (the RSDT holds 32-bit addresses), written through their DMA region
+/// (mm-core's DMA allocation: zeroed, write-back, freed on drop); `.0` is the physical base.
+struct Frames(u64, mm_core::dma::DmaBlock);
+const SPAN: u64 = 64 * 1024;
 
 impl Frames {
     fn new() -> Result<Frames, alloc::string::String> {
-        let fa = mm_core::frames().ok_or("no frame allocator")?;
-        fa.alloc(ORDER, mm_core::Zone::Dma32, mm_core::Kind::Other).map(Frames).ok_or_else(|| "no 64 KiB below 4 GiB".into())
+        let b = mm_core::dma::alloc(SPAN as usize, SPAN, 1 << 32, hal::paging::CacheType::WriteBack)
+            .map_err(|e| alloc::format!("no 64 KiB below 4 GiB: {e:?}"))?;
+        Ok(Frames(b.region().phys(), b))
     }
     fn write(&self, world: &FakeMem) -> R {
         kassert!(off::SPAN <= SPAN);
-        kassert!(hal::dma_buf::write(self.0, SPAN as usize, 0, &vec![0u8; SPAN as usize]));
+        let r = self.1.region();
+        kassert!(r.fill(0, SPAN as usize, 0));
         for (at, b) in &world.blobs {
-            kassert!(hal::dma_buf::write(self.0, SPAN as usize, (at - self.0) as usize, b), "blob at {at:#x}");
+            kassert!(r.copy_in((at - self.0) as usize, b), "blob at {at:#x}");
         }
         Ok(())
-    }
-}
-
-impl Drop for Frames {
-    fn drop(&mut self) {
-        if let Some(fa) = mm_core::frames() {
-            fa.free(self.0, ORDER, mm_core::Kind::Other);
-        }
     }
 }
 

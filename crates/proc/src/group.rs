@@ -37,6 +37,9 @@ pub(crate) struct Ids {
     pub creator_tid: u32,
     /// AB-13: the credentials it starts with (fork: a copy of the parent's; spawn: `SpawnOptions`).
     pub cred: Arc<crate::cred::Cred>,
+    /// SX-2: the pid namespace its pid lives in and its namespace set.
+    pub pid_ns: Arc<crate::ns::pid::PidNs>,
+    pub nsset: Arc<crate::ns::set::NsSet>,
 }
 
 pub struct Group {
@@ -47,6 +50,10 @@ pub struct Group {
     pub(crate) owner_uid: AtomicU32,
     /// AB-13: the group's credentials (`cred.rs`); replaced whole by `Process::change_cred`.
     pub(crate) cred: SpinLock<Arc<crate::cred::Cred>>,
+    /// SX-2: the pid namespace the group's ids live in (`task_active_pid_ns`, fixed for its life).
+    pub pid_ns: Arc<crate::ns::pid::PidNs>,
+    /// SX-2: its other namespaces (`nsproxy`, per group: see `ns`'s module doc); replaced whole.
+    nsset: SpinLock<Arc<crate::ns::set::NsSet>>,
     /// Parent pid; 0 = the kernel. An orphan gets init (pid 1) while it runs, else the kernel.
     ppid: AtomicU32,
     pgid: AtomicU32,
@@ -124,6 +131,8 @@ impl Group {
             tgid: ids.tgid,
             owner_uid: AtomicU32::new(ids.cred.uid),
             cred: SpinLock::named("proc.cred", ids.cred),
+            pid_ns: ids.pid_ns,
+            nsset: SpinLock::named("proc.nsset", ids.nsset),
             ppid: AtomicU32::new(ids.ppid),
             pgid: AtomicU32::new(ids.pgid),
             sid: AtomicU32::new(ids.sid),
@@ -164,6 +173,34 @@ impl Group {
     }
 
     // ---- ids ------------------------------------------------------------------------------------------
+
+    /// SX-2: the namespace set now (a snapshot; unshare and setns replace it whole).
+    pub fn nsset(&self) -> Arc<crate::ns::set::NsSet> {
+        self.nsset.lock().clone()
+    }
+    /// The old set is dropped after the lock (its last reference may free namespaces).
+    pub(crate) fn set_nsset(&self, s: Arc<crate::ns::set::NsSet>) {
+        let old = core::mem::replace(&mut *self.nsset.lock(), s);
+        drop(old);
+    }
+    /// SX-2: global id `id` as this group's pid namespace numbers it (0: not visible from here; Linux
+    /// `pid_nr_ns(.., task_active_pid_ns(current))`).
+    pub fn vnr(&self, id: u32) -> u32 {
+        self.pid_ns.nr(id).unwrap_or(0)
+    }
+    /// SX-2: the group's own pid as it sees it (`task_tgid_vnr(current)`).
+    pub fn vpid(&self) -> u32 {
+        self.vnr(self.tgid)
+    }
+    /// SX-2: this group's pid and real uid as group `to` names them in a siginfo (its pid namespace: 0 when
+    /// not visible there; its user namespace: the overflow id when unmapped).
+    pub fn ids_seen_by(&self, to: &Group) -> (u32, u32) {
+        (to.vnr(self.tgid), to.cred().user_ns.uid(self.real_uid()))
+    }
+    /// SX-2: whether the group is the init of a pid namespace below the initial one (SIGNAL_UNKILLABLE there).
+    pub fn is_ns_init(&self) -> bool {
+        !self.pid_ns.is_init() && self.pid_ns.nr(self.tgid) == Some(1)
+    }
 
     /// Parent pid (0: the kernel).
     pub fn ppid(&self) -> u32 {
@@ -241,14 +278,21 @@ impl Group {
     }
     /// Adds a thread; refused (EINTR) when the group is ending or a sibling's execve is ending the others.
     /// AB-6: its part of the signal state starts with the mask its creator gave it (`Thread::start_mask`).
-    pub(crate) fn add_thread(&self, t: &Arc<Thread>) -> Result<(), crate::SpawnError> {
-        {
+    /// `creator`: the thread that cloned `t` into this group (CLONE_THREAD), None for a group's first thread.
+    pub(crate) fn add_thread(&self, t: &Arc<Thread>, creator: Option<&Thread>) -> Result<(), crate::SpawnError> {
+        let resynced = {
             let mut th = self.threads.lock();
             if self.exited.load(Ordering::Acquire) || self.dethreading() {
                 return Err(crate::SpawnError::Io(uapi::errno::EINTR));
             }
             th.try_reserve(1).map_err(|_| crate::SpawnError::NoMemory)?;
+            // SX-1: under the lock TSYNC's walk takes, so either a walk sees `t` or `t` sees the synced creator.
+            let r = creator.is_some_and(|c| t.prctl().resync_seccomp(c.prctl()));
             th.push(t.clone());
+            r
+        };
+        if resynced {
+            klog::event!(Info, "seccomp", "clone.resync", pid = self.tgid, tid = t.tid());
         }
         self.signals.raw(|s| s.add_thread(t.sig_key(), t.tid(), t.start_mask(), t.sig_flag(), t.kthread_cell()));
         Ok(())

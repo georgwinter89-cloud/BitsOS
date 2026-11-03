@@ -41,7 +41,7 @@ path = "var/cache"
 
 [[permission]]
 kind = "path"
-path = "/home/georg/Downloads"
+path = "/data/home/1000/Downloads"
 write = true
 create = true
 why = "saves downloads"
