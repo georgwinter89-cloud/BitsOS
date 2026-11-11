@@ -267,7 +267,7 @@ impl VmAddrs {
             v.extend(self.lut(n));
         }
         if let Some(m) = self.hqd {
-            v.extend([M::CpHqdActive, M::CpHqdError, M::CpHqdPqRptr, M::CpcUtcl1Error, M::CpcUtcl1Status, M::CpCpcStatus, M::CpCpcStalledStat1].into_iter().filter_map(|r| m.byte(r)));
+            v.extend([M::CpHqdActive, M::CpHqdError, M::CpHqdPqRptr, M::CpcUtcl1Error, M::CpcUtcl1Status, M::CpCpcStatus, M::CpCpcStalledStat1, M::CpGfxHqdActive].into_iter().filter_map(|r| m.byte(r)));
         }
         v
     }
@@ -282,7 +282,7 @@ impl VmAddrs {
         }
         v.extend([R::FaultCntl, R::Req(CPU_ENGINE)].into_iter().filter_map(|r| self.hub.byte(r)));
         if let Some(m) = self.hqd {
-            v.extend([M::CpHqdDequeueRequest, M::SpiComputeQueueReset, M::CpcUtcl1Error].into_iter().filter_map(|r| m.byte(r)));
+            v.extend([M::CpHqdDequeueRequest, M::SpiComputeQueueReset, M::CpcUtcl1Error, M::SqCmd, M::CpGfxHqdDequeueRequest].into_iter().filter_map(|r| m.byte(r)));
             v.extend(m.gfx(gfx11::R::GrbmGfxCntl));
         }
         v
@@ -553,7 +553,7 @@ pub fn sdma_flush(out: &mut Vec<u32>, a: &VmAddrs, vmid: u8, pd: u64, eng: u8, p
 }
 
 /// SDMA 0's kept queue as the CPU drives it after `until=sdma` (doorbell mode, the stage's last rung).
-pub(super) struct SdmaQ {
+pub(crate) struct SdmaQ {
     ring: Ring,
     base: u64,
     rptr_mc: u64,
@@ -582,7 +582,7 @@ impl SdmaQ {
         hw.store_barrier();
         let ok = hw.doorbell_write64(sdma6::DOORBELL_DW, p);
         doorbells.push((sdma6::DOORBELL_DW, p, ok));
-        klog::event!(Info, "gx", "vm.doorbell", index = sdma6::DOORBELL_DW, value = klog::Hex(p), accepted = ok);
+        klog::event!(Debug, "gx", "vm.doorbell", index = sdma6::DOORBELL_DW, value = klog::Hex(p), accepted = ok);
         if !ok {
             return Err(VmError::NoDoorbell);
         }
@@ -616,25 +616,78 @@ fn rung_event(name: &'static str, ok: bool, wptr: u64, rptr: Option<u64>, polls:
     }
 }
 
-/// One queue of the stage.
-pub(super) enum Queue {
+/// One queue of the stage, and of the backend's jobs (`hw::rings`).
+pub(crate) enum Queue {
     Pm4 { q: PmQueue, gfx: bool },
     Sdma(SdmaQ),
 }
 
 impl Queue {
-    pub(super) fn submit(&mut self, hw: &mut dyn Hw, ndw: u64, build: impl FnOnce(&mut Ring) -> Result<(), RingError>, doorbells: &mut Vec<(u32, u64, bool)>) -> Result<u64, VmError> {
+    pub(crate) fn submit(&mut self, hw: &mut dyn Hw, ndw: u64, build: impl FnOnce(&mut Ring) -> Result<(), RingError>, doorbells: &mut Vec<(u32, u64, bool)>) -> Result<u64, VmError> {
         match self {
             Queue::Pm4 { q, .. } => q.submit(hw, ndw, build, doorbells).map_err(mem_err),
             Queue::Sdma(s) => s.submit(hw, ndw, build, doorbells),
         }
     }
 
-    pub(super) fn wait(&mut self, hw: &mut dyn Hw, us: u64, name: &'static str, wptr: u64, done: &mut dyn FnMut(&mut dyn Hw) -> bool) -> Rung {
+    pub(crate) fn wait(&mut self, hw: &mut dyn Hw, us: u64, name: &'static str, wptr: u64, done: &mut dyn FnMut(&mut dyn Hw) -> bool) -> Rung {
         match self {
             Queue::Pm4 { q, .. } => q.wait(hw, us, name, wptr, done),
             Queue::Sdma(s) => s.wait(hw, us, name, wptr, done),
         }
+    }
+
+    fn ring(&self) -> &Ring {
+        match self {
+            Queue::Pm4 { q, .. } => &q.ring,
+            Queue::Sdma(s) => &s.ring,
+        }
+    }
+
+    /// The committed write pointer (dword counter).
+    pub(crate) fn wptr(&self) -> u64 {
+        self.ring().wptr()
+    }
+
+    pub(crate) fn size_dw(&self) -> u64 {
+        self.ring().size_dw()
+    }
+
+    pub(crate) fn kind(&self) -> Kind {
+        self.ring().kind()
+    }
+
+    /// What a frame of `ndw` dwords takes of the ring, its padding included.
+    pub(crate) fn fits(&self, ndw: u64, rptr: u64) -> bool {
+        let a = self.kind().ring_align_dw();
+        let n = ndw.saturating_add(a - 1) & !(a - 1);
+        self.ring().free_dw(rptr).is_ok_and(|f| n <= f)
+    }
+
+    /// The read pointer a submission checks its space against (the job path's watch knows it, not `wait`).
+    pub(crate) fn set_rptr(&mut self, dw: u64) {
+        match self {
+            Queue::Pm4 { q, .. } => q.rptr_dw = dw,
+            Queue::Sdma(s) => s.rptr_dw = dw,
+        }
+    }
+
+    /// The read pointer as the engine last wrote it back, in the hardware's form.
+    pub(crate) fn rptr_hw(&self, hw: &mut dyn Hw) -> Option<u64> {
+        match self {
+            Queue::Pm4 { q, .. } => q.rptr_wb.and_then(|r| mes::rd32(hw, r)).map(u64::from),
+            Queue::Sdma(s) => mes::rd64(hw, s.rptr_mc),
+        }
+    }
+
+    /// The whole ring, for a hang's dump.
+    pub(crate) fn words(&self, hw: &mut dyn Hw) -> Option<Vec<u32>> {
+        let base = match self {
+            Queue::Pm4 { q, .. } => q.base,
+            Queue::Sdma(s) => s.base,
+        };
+        let mut b = alloc::vec![0u8; self.size_dw() as usize * 4];
+        hw.mem_read(base, &mut b).then(|| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 }
 
@@ -730,7 +783,7 @@ pub(super) fn ctx_base(hw: &mut dyn Hw, a: &VmAddrs, vmid: u8) -> Option<u64> {
 
 /// gmc_v11_0_process_interrupt's clear: L2_PROTECTION_FAULT_CNTL bit 0 set (WREG32_P(cntl, 1, ~1)), then the
 /// status read back (GFXHUB: after a dummy read). Returns the status after.
-pub(super) fn clear_fault<H: Hw>(owner: &mut Bringup<Watch<H>>, a: &VmAddrs, us: u64) -> Result<Option<u32>, VmError> {
+pub(crate) fn clear_fault<H: Hw>(owner: &mut Bringup<Watch<H>>, a: &VmAddrs, us: u64) -> Result<Option<u32>, VmError> {
     let b = a.hub.byte(R::FaultCntl).ok_or(VmError::NoAddress)?;
     let v = owner.reg_read(b).ok_or(VmError::Read { byte: b })?;
     let e = owner.write_blind(b, v | gmc11::f::FAULT_CLEAR_STATUS);
@@ -923,6 +976,20 @@ pub(super) fn sdma_queue(hw: &mut dyn Hw, s: &SdmaSide, found: &mut Vec<(&'stati
         }
         _ => Err(VmError::NotIdle { queue: name, rptr: rp, wptr: wp }),
     }
+}
+
+/// GX-8b: the three kernel queues the backend's jobs run on, as a kept chain left them: idle, at their write pointers.
+/// Nothing is written.
+pub(crate) fn kept_queues(hw: &mut dyn Hw, inp: &VmInputs) -> Result<[Queue; 3], VmError> {
+    let (l, g) = (inp.mes, inp.gfx);
+    if [l.compute_state, l.gfx_state].iter().any(|&s| matches!(mes::rd64(hw, s), Some(mes::COMPUTE_UNMAPPED | mes::COMPUTE_STUCK))) {
+        return Err(VmError::ComputeUnmapped);
+    }
+    let mut found = Vec::new();
+    let gfx = pm4_queue(hw, Q::Gfx.name(), g.ring, gfx11::RING_DW * 4, g.rptr, g.wptr, gfx11::DOORBELL_DW, true, &mut found)?;
+    let compute = pm4_queue(hw, Q::Compute.name(), l.compute_ring, mes::COMPUTE_RING_BYTES, l.comp_rptr, l.comp_wptr, mes11::COMPUTE_DOORBELL_DW, false, &mut found)?;
+    let side = inp.sdma.as_ref().ok_or(VmError::NoAddress)?;
+    Ok([gfx, compute, sdma_queue(hw, side, &mut found)?])
 }
 
 /// The process queue removed first (REMOVE_QUEUE, when MES answered its ADD_QUEUE), then context n's base and LUT

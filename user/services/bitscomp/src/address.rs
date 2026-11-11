@@ -314,12 +314,23 @@ impl App {
         if addr.is_empty() {
             return;
         }
+        // PK-L1a: a program of the library starts with its own Exec (stick launchers, packages, Terminal).
+        if let Some(e) = self.library.by_address(addr).filter(|e| !e.exec.is_empty()) {
+            let (exec, a) = (e.argv(), e.address.clone());
+            let _ = self.open_program(exec, w, tile);
+            self.recent_add(&a);
+            return;
+        }
         match resolve(addr) {
-            Open::Terminal => self.open_program(crate::terminal::TERMINAL.iter().map(|s| s.to_string()).collect(), w, tile),
+            Open::Terminal => {
+                let _ = self.open_program(crate::terminal::TERMINAL.iter().map(|s| s.to_string()).collect(), w, tile);
+            }
             Open::Office(_) if !std::path::Path::new(OFFICE_LAUNCHER).is_file() => {
                 return self.notice("LibreOffice ist nicht auf dem Stick (\\BITSOS2\\libreoffice\\ und \\BITSOS2\\bin\\libreoffice fehlen)");
             }
-            Open::Office(o) => self.open_program(o.argv(), w, tile),
+            Open::Office(o) => {
+                let _ = self.open_program(o.argv(), w, tile);
+            }
             // WY-5b: bitscomp's own settings page (its prefix comes from the address again).
             Open::Settings(_) => self.open_page(&normalise(addr), w, tile),
             Open::Web(a) => self.notice(format!("Webseiten kann BitsOS noch nicht öffnen: {a}")),
@@ -330,18 +341,21 @@ impl App {
         }
     }
 
-    /// Starts a program whose first window goes into a new tab of the focused (or given) tile, or a new tile.
-    pub fn open_program(&mut self, argv: Vec<String>, w: Where, tile: Option<usize>) {
+    /// Starts a program whose first window goes into a new tab of the focused (or given) tile, or a new tile; its
+    /// pid, or None when it could not be started (PK-L1b: the library says so).
+    pub fn open_program(&mut self, argv: Vec<String>, w: Where, tile: Option<usize>) -> Option<u32> {
         let target = match (w, tile) {
             (Where::Tile, _) => None,
             (Where::Tab, Some(t)) => self.ws.tiles.get(t).map(|t| t.stack[t.top].clone()),
             (Where::Tab, None) => self.ws.focused().cloned(),
         };
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        if let Some(pid) = self.spawn(&refs) {
+        let pid = self.spawn(&refs);
+        if let Some(pid) = pid {
             self.pending_open.push((pid, target, argv));
         }
         self.desk.start_forced = false;
+        pid
     }
 }
 

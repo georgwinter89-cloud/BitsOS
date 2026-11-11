@@ -78,8 +78,9 @@ fn a_host_without_interrupt_times_stamps_on_arrival() {
     let desc = DeviceDescriptor::parse(&[18, 1, 0, 2, 0, 0, 0, 8, 0x34, 0x12, 0x78, 0x56, 0, 1, 0, 0, 0, 1]).unwrap();
     let place = Place { root_port: 1, route: 0, depth: 0, speed: Speed::Full, parent: None, tt: None };
     let dev = Arc::new(Device {
-        id: 1, host: host.clone(), slot: HcSlot(1), address: 1, place, desc, config: None,
-        gone: AtomicBool::new(false), bind_lock: Mutex::named("t.bind", ()), alts: Default::default(),
+        id: 1, host: host.clone(), slot: HcSlot(1), address: 1.into(), place, desc, config: None,
+        gone: AtomicBool::new(false), bind_lock: Mutex::named("t.bind", ()), alts: Default::default(), reset: Default::default(),
+        serial: ksync::SpinLock::named("t.serial", None),
     });
     let got = Arc::new(StdMutex::new(Vec::new()));
     let g = got.clone();

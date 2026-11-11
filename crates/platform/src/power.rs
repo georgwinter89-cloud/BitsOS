@@ -123,9 +123,18 @@ fn stop_and_quiesce(what: &'static str, reboot: bool) -> klog::shutdown::Ended<h
     )
 }
 
+/// The plan for the reset after the storage stop: the full reset first when a layer asked for it (US-R).
+pub fn plan_after_stop(plan: power::RebootPlan) -> power::RebootPlan {
+    if !block::shutdown::cold_reset_asked() {
+        return plan;
+    }
+    klog::event!(Warn, "power", "reboot.cold_first"; "a device was not well at the stop: the full reset comes first");
+    plan.cold_first()
+}
+
 /// Resets the machine through every path of this machine's reboot plan, the triple fault last. Never returns.
 pub fn reboot() -> ! {
     sync_before("reboot");
     let _ended = stop_and_quiesce("reboot", true);
-    power::reboot(&power::live_reboot_plan(), &wait)
+    power::reboot(&plan_after_stop(power::live_reboot_plan()), &wait)
 }

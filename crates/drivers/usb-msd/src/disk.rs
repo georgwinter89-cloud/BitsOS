@@ -11,7 +11,8 @@
 //! Requests: split into commands of at most the device's transfer limit (`quirks::max_bytes`), up to
 //! `CHAIN_BYTES` of them chained in one run of the link (one wake-up per run, K-2); between runs the device is
 //! handed to the waiting request of the highest priority (`Gate`, B4). Errors: a transport error was already
-//! followed by reset recovery in the BOT layer and the command is tried again (`ATTEMPTS` per position); a
+//! followed by reset recovery in the BOT layer and the command is tried again (`ATTEMPTS` per position, and as
+//! long as the ladder of recoveries in `escalate` has something left: in-flight requests survive it, US-R); a
 //! failed command gets REQUEST SENSE and `scsi::classify` decides: UNIT ATTENTION retried (medium change: size
 //! read again, new generation, and on removable media the request fails as Linux does), NOT READY waits, no
 //! medium / write protected / illegal / medium errors end the request. An unplugged device ends every request
@@ -47,8 +48,11 @@ pub const ATTEMPTS: u32 = 3;
 /// Data moved by one run of chained commands; between runs a request of higher priority may take the device.
 pub const CHAIN_BYTES: usize = 1 << 20;
 /// How long a request waits for the device before it gives up (B4: no unbounded wait). A run of 1 MiB with
-/// every retry at the CSW timeout stays well below it.
+/// every retry at the CSW timeout stays well below it, and so does a wedged stick's whole ladder (`escalate`).
 pub const GATE_TIMEOUT_NS: u64 = 120_000 * MS;
+
+/// A look at a device's state before a machine reset; a command holding it this long is a sick device already.
+const UNHEALTHY_LOOK_NS: u64 = 10 * MS;
 
 klog::counter!(READS, "usb.msd.reads");
 klog::counter!(WRITES, "usb.msd.writes");
@@ -273,6 +277,15 @@ impl<L: Link> Storage<L> {
         }
     }
 
+    /// US-R: the device was not well when its I/O stopped (`stop_io` false: a command never ended; or recoveries
+    /// were under way): a firmware reading it next must get it from a reset.
+    pub fn unhealthy(&self) -> bool {
+        match self.io.lock_timeout(UNHEALTHY_LOOK_NS) {
+            Some(io) => io.bot.unhealthy(),
+            None => true,
+        }
+    }
+
     /// Undoes `stop_io` (a Reload that did not jump, ktests).
     pub fn resume_io(&self) {
         self.stopped.store(false, Ordering::Release);
@@ -351,20 +364,36 @@ impl<L: Link> Io<L> {
     /// One command, tried again after a transport error (reset recovery done by the BOT layer), REQUEST SENSE
     /// after a failure. `Err` only for `Gone` or a transport that keeps failing.
     pub fn command(&mut self, lun: u8, cdb: Cdb, dir: Dir, data: Option<Request>) -> Result<Reply, DevError> {
-        let mut last = DevError::Io;
-        for _ in 0..ATTEMPTS {
+        let mut tries = 0;
+        loop {
             let op = Op { lun, cdb, dir, data: data.clone() };
             match self.bot.command(op) {
                 Ok(o) if o.passed => return Ok(Reply::Good(o)),
-                Ok(_) => return self.request_sense(lun).map(Reply::Check).map_err(map_bot),
+                Ok(_) => {
+                    let after_reset = self.bot.just_reset();
+                    match self.request_sense(lun) {
+                        Ok(s) if after_reset && s.key == scsi::key::UNIT_ATTENTION && tries < ATTEMPTS => tries += 1,
+                        Ok(s) => return Ok(Reply::Check(s)),
+                        Err(BotError::Gone) => return Err(DevError::Gone),
+                        Err(e) => {
+                            tries += 1;
+                            if tries >= ATTEMPTS && !self.bot.recovering() {
+                                return Err(map_bot(e));
+                            }
+                        }
+                    }
+                }
                 Err(BotError::Gone) => return Err(DevError::Gone),
                 Err(e) => {
                     RETRIES.inc();
-                    last = map_bot(e);
+                    tries += 1;
+                    // The bound: `ATTEMPTS`, or the ladder of recoveries while it still has something to try.
+                    if tries >= ATTEMPTS && !self.bot.recovering() {
+                        return Err(map_bot(e));
+                    }
                 }
             }
         }
-        Err(last)
     }
 
     /// A command with a data-in answer of at most `len` bytes into a fresh buffer; UNIT ATTENTION and
@@ -419,6 +448,8 @@ pub struct MsdDisk<L: Link> {
     info: SpinLock<UnitInfo>,
     /// Bumped at every medium change (and when a medium appears): the file system above must look again.
     generation: AtomicU64,
+    /// The device's port resets this unit's capacity has been compared after (`same_medium_after_reset`).
+    resets_checked: AtomicU64,
 }
 
 /// Bring-up outcome of the readiness wait.
@@ -432,7 +463,8 @@ enum Ready {
 impl<L: Link> MsdDisk<L> {
     fn new(storage: Arc<Storage<L>>, lun: u8) -> MsdDisk<L> {
         let n = NEXT_DISK.fetch_add(1, Ordering::Relaxed);
-        MsdDisk { name: format!("msd{n}"), lun, storage, info: SpinLock::named("usb.msd.unit", UnitInfo::default()), generation: AtomicU64::new(0) }
+        MsdDisk { name: format!("msd{n}"), lun, storage, info: SpinLock::named("usb.msd.unit", UnitInfo::default()), generation: AtomicU64::new(0),
+            resets_checked: AtomicU64::new(0) }
     }
 
     pub fn lun(&self) -> u8 {
@@ -720,10 +752,48 @@ impl<L: Link> MsdDisk<L> {
         Ok(())
     }
 
+    /// After a port reset, before the next data moves: is this still the medium the file system above knows? The
+    /// descriptors and the serial were compared with the device (`usb_core::reset`); this is the unit behind them (a
+    /// card reader's other card). Another capacity is a medium change: the file system must look again. The same
+    /// capacity lets the reset's UNIT ATTENTION "medium may have changed" pass (`run_once`); Linux would fail that I/O,
+    /// here it would be an error on /boot for a stall. A card of the same size swapped in that moment goes unseen.
+    fn same_medium_after_reset(&self, io: &mut Io<L>) -> Result<(), DevError> {
+        let resets = io.bot.stats.port_resets;
+        if self.resets_checked.load(Ordering::Acquire) == resets {
+            return Ok(());
+        }
+        let (medium, blocks, block_size) = {
+            let i = self.info.lock();
+            (i.medium, i.blocks, i.block_size)
+        };
+        let answer = |r: Result<Result<Vec<u8>, Sense>, DevError>| match r {
+            Err(DevError::Gone) => Err(DevError::Gone),
+            Ok(Ok(b)) => Ok(Some(b)),
+            _ => Ok(None),
+        };
+        let mut cap = if medium { answer(io.ask(self.lun, scsi::read_capacity10(), 8))?.and_then(|b| Capacity::parse10(&b)) } else { None };
+        if cap.is_some_and(|c| c.needs16()) {
+            cap = answer(io.ask(self.lun, scsi::read_capacity16(), 32))?.and_then(|b| Capacity::parse16(&b));
+        }
+        if medium && cap.is_none() {
+            return Ok(()); // no answer that says anything yet: asked again before the next run
+        }
+        self.resets_checked.store(resets, Ordering::Release);
+        if cap.is_some_and(|c| (c.blocks(), c.block_size) != (blocks, block_size)) {
+            klog::event!(Warn, "usb", "msd.other_medium_after_reset", disk = self.name.clone(), device = self.storage.path.clone(), lun = self.lun,
+                blocks = blocks, block_size = block_size);
+            self.medium_changed(io)?;
+            IO_ERRORS.inc();
+            return Err(DevError::Io);
+        }
+        Ok(())
+    }
+
     /// One run from block `done` on; returns the blocks done after it (all of them = finished).
     #[allow(clippy::too_many_arguments)]
     fn run_once(&self, io: &mut Io<L>, write: bool, lba: u64, data: &mut Data<'_>, bs: usize, total: u64, done: u64, fua: bool,
                 attempts: &mut u32) -> Result<u64, DevError> {
+        self.same_medium_after_reset(io)?;
         let per_cmd = (self.storage.max_bytes / bs).max(1) as u64;
         let chain = (CHAIN_BYTES.max(self.storage.max_bytes) / bs).max(1) as u64;
         let left = total - done;
@@ -782,6 +852,7 @@ impl<L: Link> MsdDisk<L> {
             *good += whole;
             Ok(whole as usize * bs == cmd_len)
         };
+        let transport = f.is_err();
         let verdict = match f {
             Ok(o) if o.passed => {
                 klog::event!(Debug, "usb", "msd.short", disk = self.name.clone(), lba = at_lba, moved = o.moved, residue = o.residue);
@@ -789,8 +860,24 @@ impl<L: Link> MsdDisk<L> {
                 Action::Retry
             }
             Ok(o) => {
-                let s = io.request_sense(self.lun).map_err(map_bot)?;
-                let a = scsi::classify(s);
+                let after_reset = io.bot.just_reset();
+                let s = match io.request_sense(self.lun) {
+                    Ok(s) => s,
+                    Err(BotError::Gone) => {
+                        self.storage.set_gone();
+                        return Err(DevError::Gone);
+                    }
+                    // The transport failed on the way to the sense (recovery done or under way): goes again.
+                    Err(_) => Sense { key: scsi::key::ABORTED_COMMAND, asc: 0, ascq: 0 },
+                };
+                let a = match scsi::classify(s) {
+                    // Our own port reset says "the medium may have changed" on some sticks: the disk behind it is
+                    // the one the descriptors, the serial and the capacity just showed (`same_medium_after_reset`).
+                    // Taken for a change, it would fail the request on a removable medium and have the file system
+                    // look again, all for a stall (US-R).
+                    Action::MediumChanged if after_reset => Action::Retry,
+                    a => a,
+                };
                 if a != Action::Retry && a != Action::Done {
                     klog::event!(Info, "usb", "msd.check_condition", disk = self.name.clone(), lba = at_lba, write = write,
                         key = klog::Hex(s.key as u64), asc = klog::Hex(s.asc as u64), ascq = klog::Hex(s.ascq as u64),
@@ -820,12 +907,14 @@ impl<L: Link> MsdDisk<L> {
             Action::Retry | Action::WaitRetry | Action::Done => {
                 // `good` includes what `keep` took from the failed command: a run that moved the request on
                 // starts the count for the new position (`ATTEMPTS` per position; review INT-A1d drivers 1).
-                if good > 0 {
+                // A port reset starts it over too: the device was set up anew (US-R).
+                if good > 0 || io.bot.take_port_reset() {
                     *attempts = 0;
                 }
                 *attempts += 1;
                 RETRIES.inc();
-                if *attempts >= ATTEMPTS {
+                // A transport error while recoveries still climb is no failure yet: the ladder is its bound.
+                if *attempts >= ATTEMPTS && !(transport && io.bot.recovering()) {
                     IO_ERRORS.inc();
                     klog::event!(Warn, "usb", "msd.io_failed", disk = self.name.clone(), lba = at_lba, write = write, tries = *attempts);
                     return Err(DevError::Io);

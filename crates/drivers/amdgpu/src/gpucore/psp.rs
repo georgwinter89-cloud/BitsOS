@@ -439,27 +439,34 @@ pub enum Until {
     /// GX-7m: a test VM in the rings (`gpucore::vmring`): on the live chip it continues a passed `GfxMes` of this
     /// boot (its MES-mapped queues and a kept SDMA 0 queue); the fake engine runs `Sdma`, then `GfxMes`, then it.
     Vm,
+    /// GX-8a: the fake engine's chain under the hardware backend, the two stages of `BACKEND_STAGES` in one run, kept.
+    /// Only the fakes get it: the live tool runs the stages one by one (`psplive::backend`).
+    Backend,
 }
 
 impl Until {
+    /// What `until=backend` runs on the live chip, in order, and so what `Backend` must stand for on the fakes
+    /// (`tests/psp.rs` holds the two together).
+    pub const BACKEND_STAGES: [Until; 2] = [Until::Sdma, Until::GfxMes];
+
     /// The run loads the firmware (M2 or more).
     pub fn loads_fw(self) -> bool {
-        matches!(self, Until::Fw | Until::Gfx | Until::Gart | Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm)
+        matches!(self, Until::Fw | Until::Gfx | Until::Gart | Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm | Until::Backend)
     }
 
     /// The run powers GC (the SMU/GC stage).
     pub fn runs_gc(self) -> bool {
-        matches!(self, Until::Gfx | Until::Gart | Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm)
+        matches!(self, Until::Gfx | Until::Gart | Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm | Until::Backend)
     }
 
     /// GX-7i: the run programs the GART (the GMC stage).
     pub fn runs_gmc(self) -> bool {
-        matches!(self, Until::Gart | Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm)
+        matches!(self, Until::Gart | Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm | Until::Backend)
     }
 
     /// GX-7j: a stage that runs after a passed GMC stage (SDMA or the GFX ring) and continues a kept run.
     pub fn after_gart(self) -> bool {
-        matches!(self, Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm)
+        matches!(self, Until::Sdma | Until::GfxRing | Until::Mes | Until::GfxMes | Until::Vm | Until::Backend)
     }
 
     /// GX-7k: the run starts MES (the GFX stage in its `mes` order first).
@@ -475,16 +482,16 @@ impl Until {
     /// GX-7m: the fake engine's chain for `Vm` (the live chip continues a kept gfx_mes instead): SDMA, the GFX stage
     /// in the MES order, MES with the queues, then the VM stage.
     pub fn fake_chain_sdma(self) -> bool {
-        matches!(self, Until::Sdma | Until::Vm)
+        matches!(self, Until::Sdma | Until::Vm | Until::Backend)
     }
 
     pub fn fake_chain_mes(self) -> bool {
-        self.runs_mes() || self == Until::Vm
+        self.runs_mes() || matches!(self, Until::Vm | Until::Backend)
     }
 
     /// MES maps the compute ring and GFX ring 0 in this run (`mesq`).
     pub fn maps_queues(self) -> bool {
-        matches!(self, Until::GfxMes | Until::Vm)
+        matches!(self, Until::GfxMes | Until::Vm | Until::Backend)
     }
 }
 

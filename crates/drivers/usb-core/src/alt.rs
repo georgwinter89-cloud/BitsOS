@@ -34,6 +34,14 @@ struct AltState {
     broken: Vec<(u8, u8)>,
 }
 
+impl Alts {
+    /// Every interface runs its default alternate setting (what a reset in place brings back).
+    pub(crate) fn all_default(&self) -> bool {
+        let s = self.cur.lock();
+        s.set.is_empty() && s.broken.is_empty()
+    }
+}
+
 impl Default for Alts {
     fn default() -> Self {
         Alts { cur: SpinLock::named("usb.alts", AltState::default()), op: Mutex::named("usb.alt_op", ()) }

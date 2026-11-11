@@ -78,6 +78,9 @@ pub enum Hang {
     Unsupported { header: u32 },
     /// A field value the packet does not allow (misaligned address, reserved value).
     BadField { header: u32, what: &'static str },
+    /// An IB address above the hole without its upper bits, on a queue that wants them
+    /// ([`Engine::refuse_non_canonical_ibs`]).
+    NotCanonicalIb { addr: u64 },
     IbTooDeep { depth: usize },
     /// One packet moves more bytes, or is longer, than a whole run may.
     TooLarge { header: u32 },
@@ -184,6 +187,8 @@ pub struct Engine {
     /// The waiting packet whose write half (WAIT_REG_MEM write-wait, SDMA HDP-flush request) already
     /// ran: a retry only compares again, so the register is written and reported once per packet.
     armed: Option<Where>,
+    /// [`Engine::refuse_non_canonical_ibs`].
+    canonical_ibs: bool,
 }
 
 /// Why [`Engine::new`] refused.
@@ -203,7 +208,12 @@ impl Engine {
         if !ring_dw.is_power_of_two() || ring_base & 0xFF != 0 || ring_base.checked_add(bytes).is_none() {
             return Err(EngineError::BadRing);
         }
-        Ok(Engine { isa, ring_base, ring_dw, rptr: start, stack: Vec::new(), halted: None, limits, armed: None })
+        Ok(Engine { isa, ring_base, ring_dw, rptr: start, stack: Vec::new(), halted: None, limits, armed: None, canonical_ibs: false })
+    }
+    /// A compute queue (MEC): a PM4 INDIRECT_BUFFER whose address is not sign-extended from bit 47 halts the engine,
+    /// as CP_HQD_ERROR.SUA_ERROR does on the 780M (measured 4.11.; gfx_v11_0_ring_emit_ib_compute writes it unmasked).
+    pub fn refuse_non_canonical_ibs(&mut self) {
+        self.canonical_ibs = true;
     }
     pub fn isa(&self) -> Isa {
         self.isa
@@ -351,6 +361,14 @@ impl Engine {
                 Isa::Pm4 => exec_pm4(bus, vmid, &buf, &mut events, &mut bytes_left, self.limits.max_bytes, armed),
                 Isa::Sdma => exec_sdma(bus, vmid, &buf, &mut events, &mut bytes_left, self.limits.max_bytes, armed),
             };
+            let step = match step {
+                // The decoder keeps 48 address bits, so this reads the packet's own words.
+                Step::Call { .. } if self.canonical_ibs && self.isa == Isa::Pm4 => {
+                    let addr = u64::from(buf[2]) << 32 | u64::from(buf[1] & !3);
+                    if addr >> 47 == 0 || addr >> 47 == 0x1_ffff { step } else { Step::Hang(Hang::NotCanonicalIb { addr }) }
+                }
+                s => s,
+            };
             self.armed = match step {
                 Step::Wait(_) => Some(at),
                 _ => None,
@@ -491,6 +509,9 @@ fn pm4_no_effect(opcode: u8) -> bool {
             | NUM_INSTANCES
             | INDEX_BASE
             | INDEX_BUFFER_SIZE
+            // GM-1d CR-GM1d-3: RADV loads context registers from memory (nvd.h:378), reached by one deqp case; state
+            // for shaders the model does not execute, like the packets above.
+            | LOAD_CONTEXT_REG_INDEX
     )
 }
 

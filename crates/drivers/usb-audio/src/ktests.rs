@@ -1,6 +1,6 @@
 //! In-kernel tests of the binding (no sound): `sn.usb.bound` (every bound function, its settings made at
 //! probe) and `sn.usb.capture` (records 1 s from the first microphone, e.g. the JBL's chat mic; QEMU's
-//! usb-audio has none: skip). Both `Safe` and rerunnable. Playback tests are in `snd` (`sn.usb.tone`,
+//! usb-audio has none: a failure). Both `Safe` and rerunnable. Playback tests are in `snd` (`sn.usb.tone`,
 //! `sn.usb.unplug`), through the mixer.
 
 use alloc::format;
@@ -31,12 +31,12 @@ pub fn settle() {
     SETTLED.store(true, Ordering::Release);
 }
 
-ktest!("sn.usb.bound", Safe, bound);
+ktest!("sn.usb.bound", Run("sn/50-usbaudio"), bound);
 fn bound() -> TestResult {
     settle();
     let f = crate::dev::functions();
     if f.is_empty() {
-        return ktest::skip("no USB audio device bound (QEMU: -device usb-audio on a qemu-xhci)");
+        return ktest::fail("no USB audio device bound (QEMU: -device usb-audio on a qemu-xhci)");
     }
     for x in &f {
         for s in &x.playback {
@@ -51,11 +51,11 @@ fn bound() -> TestResult {
     Ok(())
 }
 
-ktest!("sn.usb.capture", Safe, capture);
+ktest!("sn.usb.capture", WithGeorg, capture);
 fn capture() -> TestResult {
     settle();
     let Some(i) = crate::inputs().into_iter().next() else {
-        return ktest::skip("no USB microphone (QEMU's usb-audio has none)");
+        return ktest::fail("no USB microphone (QEMU's usb-audio has none)");
     };
     let h = crate::open_capture(&i.key, i.iface, 48_000, None).map_err(|e| format!("open: {e:?}"))?;
     // A second open of the same input is refused: its close would set the interface to 0 under the first.
@@ -78,7 +78,7 @@ fn capture() -> TestResult {
     Ok(())
 }
 
-ktest!("sn.usb.mute", Safe, mute);
+ktest!("sn.usb.mute", Run("sn/50-usbaudio"), mute);
 /// Two threads flip the wanted mute and apply it 20 times each, racing: the hardware ends as the last state
 /// asked for (read back with GET_CUR where the feature unit answers), then the state before the test returns.
 fn mute() -> TestResult {
@@ -86,7 +86,7 @@ fn mute() -> TestResult {
     settle();
     let f = crate::dev::functions();
     if f.iter().all(|x| x.playback.is_empty()) {
-        return ktest::skip("no USB audio output (QEMU: -device usb-audio on a qemu-xhci)");
+        return ktest::fail("no USB audio output (QEMU: -device usb-audio on a qemu-xhci)");
     }
     let before = crate::hw_mute();
     let want = Arc::new(AtomicBool::new(before));

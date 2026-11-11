@@ -18,7 +18,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use devmodel::DevError;
 use devmodel::block::{BlockDevice, IoPriority};
+use ksync::Mutex;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -85,7 +87,8 @@ pub struct Pool {
     pub(crate) ppc: u64,
     /// Chunks holding the superblock slots (pages 0 and 1): one, or two for 4 KiB chunks.
     pub(crate) first: u64,
-    dev_max: u64,
+    /// Largest device request in bytes.
+    pub(crate) dev_max: u64,
     discard_ok: bool,
     pub(crate) cfg: Config,
     pub(crate) reserve: u64,
@@ -111,15 +114,20 @@ pub struct Pool {
     pub(crate) busy: BTreeMap<u64, u64>,
     pub(crate) dropped: u64,
     pub(crate) leaks: u64,
-    io: Barriers,
+    io: Arc<Barriers>,
     /// The volume of an open copy window (`begin_copy_window`).
     pub(crate) window: Option<u64>,
+    /// BL-2: grows before chunks or pages freed by a commit can be given out again (`release`); a read that mapped
+    /// its chunks under the pool lock and read them without it is still good if this did not move meanwhile.
+    reuse: Arc<AtomicU64>,
 }
 
 /// The device barriers this pool asked for (cache flushes and FUA writes: on a USB stick without DPOFUA and on an
 /// image file each FUA write is a write plus a flush), for the snapshot pause's breakdown (VS-2b) and the commit
 /// times (VS-7, `Pool::io_stats`).
-struct Barriers {
+pub(crate) struct Barriers {
+    /// One flush at a time (`flush`).
+    flushing: Mutex<()>,
     count: AtomicU64,
     ns: AtomicU64,
     /// Something was written (not FUA) since the last flush; true at open (writes before it are unknown).
@@ -137,7 +145,7 @@ struct Barriers {
 impl Default for Barriers {
     fn default() -> Self {
         let z = || AtomicU64::new(0);
-        Barriers { count: z(), ns: z(), unflushed: AtomicBool::new(true), owed: Arc::new(z()), covered: z(), meta_bytes: z(), meta_ns: z() }
+        Barriers { flushing: Mutex::named("bitsvol.flush", ()), count: z(), ns: z(), unflushed: AtomicBool::new(true), owed: Arc::new(z()), covered: z(), meta_bytes: z(), meta_ns: z() }
     }
 }
 
@@ -147,6 +155,35 @@ impl Barriers {
         if let (Some(a), Some(b)) = (t0, crate::timing::now()) {
             self.ns.fetch_add(b.saturating_sub(a), Ordering::Relaxed);
         }
+    }
+    /// The device's cache flush, counted; none when nothing was written since the last one. One at a time, with
+    /// or without the pool lock (`PoolHandle::flush_volume`): whoever finds `unflushed` off returns only after the
+    /// flush that turned it off has ended, and a failed one turns it on again for the next in line. Writers set
+    /// it after the device took their write, so a flush that finds it off had every finished write before it began.
+    pub(crate) fn flush(&self, dev: &Arc<dyn BlockDevice>) -> Result<()> {
+        let _one = self.flushing.lock_timeout(crate::device::IO_WAIT_NS).ok_or(VolError::from(DevError::Timeout))?;
+        if !self.unflushed.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let owed = self.owed.swap(0, Ordering::AcqRel);
+        let t0 = crate::timing::now();
+        let r = dev.flush();
+        self.add(t0);
+        if r.is_err() {
+            self.unflushed.store(true, Ordering::Release);
+            self.owed.fetch_add(owed, Ordering::AcqRel);
+        } else {
+            self.covered.fetch_add(owed, Ordering::Relaxed);
+        }
+        Ok(r?)
+    }
+    /// Returns when no flush runs (bounded as `flush`).
+    pub(crate) fn wait_flush(&self) {
+        drop(self.flushing.lock_timeout(crate::device::IO_WAIT_NS));
+    }
+    pub(crate) fn stats(&self) -> crate::timing::IoStats {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        crate::timing::IoStats { flushes: g(&self.count), flush_ns: g(&self.ns), bytes: g(&self.meta_bytes), write_ns: g(&self.meta_ns), covered: g(&self.covered) }
     }
     fn wrote(&self, bytes: usize) {
         self.owed.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -221,8 +258,9 @@ impl Pool {
             busy: BTreeMap::new(),
             dropped: 0,
             leaks: 0,
-            io: Barriers::default(),
+            io: Arc::new(Barriers::default()),
             window: None,
+            reuse: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -248,16 +286,18 @@ impl Pool {
     }
     /// The device side of the commits since open (VS-7; `IoStats::since` gives one commit's part).
     pub fn io_stats(&self) -> crate::timing::IoStats {
-        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        crate::timing::IoStats {
-            flushes: g(&self.io.count),
-            flush_ns: g(&self.io.ns),
-            bytes: g(&self.io.meta_bytes),
-            write_ns: g(&self.io.meta_ns),
-            covered: g(&self.io.covered),
-        }
+        self.io.stats()
+    }
+    /// The barrier state, for the handle's flush without the pool lock (`PoolHandle::flush_volume`).
+    pub(crate) fn barrier_state(&self) -> Arc<Barriers> {
+        self.io.clone()
     }
     /// Volume bytes written since the last barrier began, readable without the pool lock (VS-7, `PoolHandle`).
+    /// BL-2: the reuse count (`reuse`), shared with the handle's lock-free readers.
+    pub(crate) fn reuse_counter(&self) -> Arc<AtomicU64> {
+        self.reuse.clone()
+    }
+
     pub(crate) fn owed_counter(&self) -> Arc<AtomicU64> {
         self.io.owed.clone()
     }
@@ -266,22 +306,9 @@ impl Pool {
     pub(crate) fn flushed_outside(&self, bytes: u64) {
         let _ = self.io.owed.try_update(Ordering::AcqRel, Ordering::Acquire, |o| Some(o.saturating_sub(bytes)));
     }
-    /// The device's cache flush, counted; none when nothing was written since the last one.
+    /// `Barriers::flush` of this pool's device.
     pub(crate) fn barrier(&self) -> Result<()> {
-        if !self.io.unflushed.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let owed = self.io.owed.swap(0, Ordering::AcqRel);
-        let t0 = crate::timing::now();
-        let r = self.dev.flush();
-        self.io.add(t0);
-        if r.is_err() {
-            self.io.unflushed.store(true, Ordering::Release);
-            self.io.owed.fetch_add(owed, Ordering::AcqRel);
-        } else {
-            self.io.covered.fetch_add(owed, Ordering::Relaxed);
-        }
-        Ok(r?)
+        self.io.flush(&self.dev)
     }
     pub fn generation(&self) -> u64 {
         self.committed_gen
@@ -364,20 +391,25 @@ impl Pool {
 
     pub(crate) fn io_write(&self, off: u64, buf: &[u8], fua: bool, prio: IoPriority) -> Result<()> {
         let t0 = if fua { crate::timing::now() } else { None };
-        if !fua {
-            self.io.unflushed.store(true, Ordering::Release);
-            self.io.wrote(buf.len());
-        }
         let mut done = 0usize;
-        while done < buf.len() {
+        let mut r = Ok(());
+        while done < buf.len() && r.is_ok() {
             let n = (buf.len() - done).min(self.dev_max as usize);
-            self.dev.write_blocks((off + done as u64) / self.bs, &buf[done..done + n], fua, prio)?;
+            r = self.dev.write_blocks((off + done as u64) / self.bs, &buf[done..done + n], fua, prio);
             done += n;
         }
         if fua {
-            self.io.add(t0);
+            if r.is_ok() {
+                self.io.add(t0);
+            }
+        } else {
+            // After the device took it, failed or not: a flush without the pool lock (`Barriers::flush`) can run at
+            // any moment of this write. Marked before it, that flush would clear the mark and miss the write, and
+            // this write's own fsync would find nothing to flush.
+            self.io.wrote(buf.len());
+            self.io.unflushed.store(true, Ordering::Release);
         }
-        Ok(())
+        Ok(r?)
     }
 
     // ---- metadata pages ----
@@ -487,7 +519,10 @@ impl Pool {
                 // Allocated in this transaction: no committed tree names it, so it is free at once.
                 Some(cp) if cp.dirty => {
                     self.dirty_pages -= 1;
-                    self.free_page(p);
+                    if self.free_page(p).is_some() {
+                        // A whole chunk back in the pool at once: the reuse count moves as for every free chunk.
+                        self.reuse.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 _ => self.pend_pages.push(p),
             }
@@ -529,6 +564,9 @@ impl Pool {
         self.crefs.inc(c)
     }
 
+    /// BL-2 invariant (lock-free reads, `device::VolumeDevice::read_mapped`): a data chunk a reader may have
+    /// mapped is handed out again only after the reuse count moved. Every path to a free chunk goes through
+    /// `release` (which bumps it) or `unalloc_chunk` (which bumps it too); a new one must do the same.
     pub(crate) fn chunk_dec(&mut self, c: u64) -> Result<()> {
         if c < self.first || self.meta.contains_key(&c) {
             return Err(VolError::Corrupt("data reference to a metadata chunk"));
@@ -545,6 +583,9 @@ impl Pool {
         if self.crefs.dec(c)? != 0 {
             return Err(VolError::Corrupt("unmapped chunk still referenced"));
         }
+        // Nothing maps it now, but say so to the lock-free readers anyway (a failed write only: rare and cheap),
+        // so the invariant above never rests on who mapped what in between.
+        self.reuse.fetch_add(1, Ordering::SeqCst);
         self.free += 1;
         Ok(())
     }
@@ -555,7 +596,7 @@ impl Pool {
 
     // ---- commit ----
 
-    fn meta_dirty(&self) -> bool {
+    pub(crate) fn meta_dirty(&self) -> bool {
         self.dirty_pages > 0 || self.table_dirty || self.has_pending() || self.vols.values().any(|v| v.dirty)
     }
 
@@ -572,8 +613,6 @@ impl Pool {
             return self.barrier();
         }
         let generation = self.committed_gen + 1;
-        // The pages below are written before the barrier asks whether anything was.
-        self.io.unflushed.store(true, Ordering::Release);
         for v in self.vols.values_mut().filter(|v| v.dirty) {
             match self.cache.get_mut(&v.rec_page) {
                 Some(c) if c.dirty => v.rec.encode(&mut c.data),
@@ -601,6 +640,8 @@ impl Pool {
         if !run.is_empty() {
             Self::write_run(&self.dev, &self.io, (self.bs, self.dev_max), run_start, &run, prio)?;
         }
+        // Only now, as in `io_write`: a flush without the pool lock that began during the runs may have missed them.
+        self.io.unflushed.store(true, Ordering::Release);
         self.barrier()?;
         let sb = Super {
             block_size: self.bs as u32,
@@ -665,6 +706,10 @@ impl Pool {
     /// After a durable commit: freed chunks and pages become usable, empty metadata chunks return to the pool
     /// and freed chunks are discarded on the device below.
     fn release(&mut self) -> u64 {
+        if !self.pend_chunks.is_empty() || !self.pend_pages.is_empty() {
+            // Before anything freed can be allocated again: a reader without the lock sees it after its read.
+            self.reuse.fetch_add(1, Ordering::SeqCst);
+        }
         let mut gone = core::mem::take(&mut self.pend_chunks);
         for &c in &gone {
             self.pend_set.remove(&c);

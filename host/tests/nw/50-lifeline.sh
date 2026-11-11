@@ -1,5 +1,6 @@
 #!/bin/bash
 # slow
+# time-limit: 1500
 # NW-4: the MCP lifeline on the real kernel stack, on both QEMU cards (virtio-net, then igb), each driven by MSI-X.
 # Boot A (normal boot, token, -smp 4, QMP): the MCP reserve under pressure (the guest's ktest nw.reserve.pressure
 # holds 1,000 connections to a host sink and refuses all socket memory; MCP still takes 3 side by side and answers
@@ -14,8 +15,9 @@ RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/nw-50-lifeline}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 HERE="$(pwd)/host/tests/nw"
-FWD=24540        # host port -> guest 8765 (MCP)
-SINK=24541       # the reserve test's sink (guest: 10.0.2.2:24541)
+PORTS=$(python3 -I "$HERE/ports.py" 2)
+FWD=$PORTS              # host port -> guest 8765 (MCP)
+SINK=$((PORTS + 1))     # the reserve test's sink (guest: 10.0.2.2:$SINK)
 TOKEN="nw4-lifeline-token-5c1e"
 BOOT_LINE="BdsDxe: loading"
 CARDS="${NW4_CARDS:-virtio igb}"
@@ -38,7 +40,7 @@ wait_line() { # $1 = pattern, $2 = file, $3 = seconds
 }
 boot() { # $1 = name, $2 = card, $3 = log, $4 = extra config; one retry after a firmware stall
     NAME="$1"
-    cargo xtask image --name "$1" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info$4"
+    cargo xtask image --name "$1" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;net_test_sink=$SINK$4"
     for attempt in 1 2; do
         rm -f "$RUN_DIR/qmp.sock" "$3"
         cargo xtask qemu --name "$1" --net "$2" --smp 4 --hostfwd "$FWD:8765" --timeout 600 --serial-log "$3" -- \
@@ -87,4 +89,6 @@ for card in $CARDS; do
     stop_own
     common_checks "$LOG" "$card"
 done
+# TS-1: this test ends the boot (or answers over MCP), so it prints no `KTEST ok` on the serial line: the ledger reads it here.
+printf 'KTEST ok nw.reserve.pressure (over MCP)\nKTEST ok nw.busy.spin (over MCP)\n' >> "$RUN_DIR/ledger.txt"
 echo "nw lifeline: green ($CARDS: MSI-X, reserve under pressure, busy CPU, cable 10 s, transport cases)"

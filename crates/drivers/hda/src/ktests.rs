@@ -1,6 +1,6 @@
 //! In-kernel tests (SN-2). Under QEMU with `-device intel-hda -device hda-duplex,audiodev=..` and a `wav`
 //! audiodev (`host/tests/sn/10-hda.sh`, `cargo xtask ktest sn.hda -- ..`); without a controller every test
-//! ends as `KTEST skip` (the gate has none).
+//! ends as `KTEST FAIL` (the gate has none).
 //! On the Mini-PC: `sn.hda.probe`, `sn.hda.dump` and `sn.hda.jack` are `Safe` (they read what bring-up kept
 //! and the pin-sense verbs; the GPU controller is never touched by them); `sn.hda.play` makes sound
 //! (`Audible`: refused there unless Georg allows); the restart tests are `QemuOnly`.
@@ -27,7 +27,7 @@ fn controllers() -> Result<Vec<Arc<Hda>>, TestResult> {
         return Err(if pci::devices().iter().any(crate::is_hda) {
             Err("an HD Audio function is present but the driver kept none (see hda.probe_failed)".into())
         } else {
-            ktest::skip("no HD Audio controller in this machine")
+            ktest::fail("no HD Audio controller in this machine")
         });
     }
     Ok(list)
@@ -37,7 +37,7 @@ fn controllers() -> Result<Vec<Arc<Hda>>, TestResult> {
 fn players() -> Result<Vec<(Arc<Hda>, OutputId)>, TestResult> {
     let v: Vec<(Arc<Hda>, OutputId)> = controllers()?.into_iter().filter_map(|d| d.pick(Port::Jack).map(|o| (d, o))).collect();
     if v.is_empty() {
-        return Err(ktest::skip("no controller with a playable analog output"));
+        return Err(ktest::fail("no controller with a playable analog output"));
     }
     Ok(v)
 }
@@ -105,7 +105,7 @@ fn dump() -> TestResult {
     Ok(())
 }
 
-ktest!("sn.hda.jack", Safe, jack);
+ktest!("sn.hda.jack", Hardware, jack);
 /// Reads each sensing pin of the playable controllers again and compares with the state the driver keeps.
 fn jack() -> TestResult {
     let list = match controllers() {
@@ -131,7 +131,7 @@ fn jack() -> TestResult {
         }
     }
     if pins == 0 {
-        return ktest::skip("no output with presence detect (QEMU's hda-duplex has none)");
+        return ktest::fail("no output with presence detect (QEMU's hda-duplex has none)");
     }
     Ok(())
 }

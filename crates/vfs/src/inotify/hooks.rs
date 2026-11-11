@@ -11,7 +11,7 @@
 //!   ACCESS, MODIFY, OPEN, CLOSE_WRITE / CLOSE_NOWRITE of an open file (IN_EXCL_UNLINK watches skip unlinked
 //!   names). Both go to the parent directory's watches with the name first, then to the inode's own.
 
-use super::{active, inode_removed, send, Ev};
+use super::{active, inode_removed, parent_quiet, send, Ev};
 use super::{IN_ATTRIB, IN_CREATE, IN_DELETE, IN_ISDIR, IN_MODIFY, IN_MOVED_FROM, IN_MOVED_TO, IN_MOVE_SELF};
 use crate::dentry::Dentry;
 use crate::fd::OpenFile;
@@ -51,7 +51,8 @@ pub(crate) fn inode_event(inode: &Inode, mask: u32) {
 /// `fsnotify_parent`: the parent's watches with the name, then the dentry's own. `path`: an open file's event
 /// (IN_EXCL_UNLINK applies).
 fn dentry_event(d: &Arc<Dentry>, mask: u32, path: bool) {
-    if !active() {
+    // PF-7: with nobody watching it or its parent no event can go anywhere: no lock, no name, no parent reference.
+    if !active() || (d.inode.marks.is_empty() && parent_quiet(d)) {
         return;
     }
     let mask = mask | isdir(&d.inode);

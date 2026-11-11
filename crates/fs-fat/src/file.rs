@@ -274,6 +274,31 @@ impl Backend for Data {
         Ok(())
     }
     fn write_run(&self, first: u64, pages: &[Arc<CachePage>], size: u64) -> Result<(), i64> {
+        let run_end = first + pages.len() as u64;
+        for (k, part) in pages.chunks(WRITE_STEP_PAGES).enumerate() {
+            let at = first + (k * WRITE_STEP_PAGES) as u64;
+            let step_end = at + part.len() as u64;
+            // `write_data` zero-fills every new cluster up to the length it is told, so a step that named the file's
+            // final length would write zeros where the next steps write the data: twice the bytes on the stick.
+            // Each step but the last grows the file only to its own end, and never below what the file has.
+            let through = if step_end == run_end { size } else { (step_end * PAGE).max(self.vol.disk_size(self.ino)?).min(size) };
+            self.write_step(at, part, through)?;
+        }
+        Ok(())
+    }
+    fn commit(&self, why: SyncKind) -> Result<(), i64> {
+        self.vol.commit(self.ino)?;
+        if why.durable() { self.vol.sync(true) } else { Ok(()) }
+    }
+}
+
+/// The buffer's size in a write-back: a run can be the whole file, and a file of hundreds of MiB would then need one
+/// block that long from the buddy allocator (INT-W31: a 388 MiB KERNEL at 4 GiB RAM, ENOMEM with 2 GiB free).
+const WRITE_STEP_PAGES: usize = 4096;
+
+impl Data {
+    /// One step of `write_run` through one buffer; the file is `size` bytes long after it.
+    fn write_step(&self, first: u64, pages: &[Arc<CachePage>], size: u64) -> Result<(), i64> {
         let off = first * PAGE;
         if off >= size {
             return Ok(());
@@ -309,9 +334,5 @@ impl Backend for Data {
             }
         }
         self.vol.write_data(self.ino, off, &data.bytes, size)
-    }
-    fn commit(&self, why: SyncKind) -> Result<(), i64> {
-        self.vol.commit(self.ino)?;
-        if why.durable() { self.vol.sync(true) } else { Ok(()) }
     }
 }

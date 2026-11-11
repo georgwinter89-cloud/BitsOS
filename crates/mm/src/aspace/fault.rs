@@ -9,13 +9,13 @@
 use super::huge::{self, HUGE};
 use super::{keep_read_only, page_flags, read_only, AsCore, Class, Inner, Owner, CACHE_BITS, UNCONFIRMED};
 use crate::fault::{self, Access, FaultReason, SpuriousRun};
-use crate::vma::{Prot, Vma, VmaKind};
+use crate::vma::{FileRef, Prot, Vma, VmaKind};
 use crate::{share, MmError, PAGE};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering::Relaxed;
 use hal::paging::{self, tlb, PageFlags, PageSize, Released};
 use ksync::MutexGuard;
-use vfs::pagecache::PageFault;
+use vfs::pagecache::{MapHint, PageCache, PageFault};
 
 klog::counter!(FAULT_FILLS, "mm.as.fault_fills");
 klog::counter!(FAULT_SPURIOUS, "mm.as.fault_spurious");
@@ -29,6 +29,8 @@ klog::counter!(pub(crate) COW_REUSED, "mm.as.cow_reused");
 klog::counter!(DEVICE_FILLS, "mm.as.device_fills");
 klog::counter!(AROUND_FILLS, "mm.as.around_fills");
 klog::counter!(AROUND_SHORT, "mm.as.around_short");
+// BL-4: file pages a read fault mapped beside its own (`file_fault_around`).
+klog::counter!(FILE_AROUND, "mm.as.file_around");
 /// Pages per fault-around block: 64 KiB, Linux's default `fault_around_bytes` (linux-6.6/mm/memory.c:4445).
 const AROUND_PAGES: u64 = 16;
 
@@ -36,6 +38,8 @@ const AROUND_PAGES: u64 = 16;
 enum Block {
     /// Not asked for yet.
     Untried,
+    /// Wanted for a VMA with (true) or without MADV_HUGEPAGE: `fault_locked` asks for it without the lock.
+    Wanted(bool),
     /// Zeroed, not mapped yet.
     Made(u64),
     /// None was free (or the VMA no longer wants one): 4 KiB pages.
@@ -63,6 +67,50 @@ pub(crate) fn file_fault(e: PageFault) -> FaultReason {
     match e {
         PageFault::Bus | PageFault::Io => FaultReason::Bus,
         PageFault::NoMemory => FaultReason::NoMemory,
+    }
+}
+
+/// BL-4: the page cache behind a plain file mapping (not a device, not a SysV segment's or another backing's).
+fn file_cache(f: &FileRef) -> Option<&PageCache> {
+    if f.device.is_some() {
+        return None;
+    }
+    f.backing.file()?.inode().page_cache()
+}
+
+/// BL-4: read-ahead for a fault on file page `pgoff` of `v` (linux-7/mm/filemap.c:3555 `filemap_fault`: sync or
+/// async mmap read-ahead before the page is taken; `PageCache::fault_ra`), with the VMA's hints: MADV_RANDOM,
+/// MADV_SEQUENTIAL, PROT_EXEC and its file range.
+fn file_ra(v: &Vma, f: &FileRef, pgoff: u64) {
+    let Some(c) = file_cache(f) else { return };
+    let first = f.pgoff;
+    let h = MapHint { random: v.flags.rand_read, sequential: v.flags.seq_read, exec: v.prot.exec, first, end: first + (v.end - v.start) / PAGE };
+    c.fault_ra(pgoff, &h);
+}
+
+/// BL-4 (fixer): whether a fault at `page` of `v` reads the file (a plain file VMA whose page is not cached yet):
+/// that read-ahead then runs without the space's lock (`file_ra_unlocked`).
+fn file_ra_reads(v: &Vma, page: u64) -> bool {
+    let (Some(f), Some(pgoff)) = (&v.file, v.pgoff_at(page)) else { return false };
+    file_cache(f).is_some_and(|c| c.reads_for_fault(pgoff))
+}
+
+/// BL-4 (fixer): the fault's sync read-ahead before the space's lock is taken again (linux-7/mm/filemap.c
+/// `maybe_unlock_mmap_for_io`: Linux drops mmap_lock for the read and retries the fault), so the other threads
+/// of the program fault and map meanwhile (B4). `v` is the fault's own copy of the VMA: its file stays referenced
+/// even if the range is unmapped meanwhile; the retried fault looks at the space again.
+fn file_ra_unlocked(v: &Vma, page: u64) {
+    if let (Some(f), Some(pgoff)) = (&v.file, v.pgoff_at(page)) {
+        file_ra(v, f, pgoff);
+    }
+}
+
+/// BL-4 (fixer): MADV_WILLNEED on file VMA `v` for [s, e) (linux-7/mm/madvise.c:290 `madvise_willneed`:
+/// `vfs_fadvise(POSIX_FADV_WILLNEED)` on the mapped file range): queues the range's read-ahead, never waits.
+pub(super) fn file_will_need(v: &Vma, s: u64, e: u64) {
+    let (Some(f), Some(pgoff)) = (&v.file, v.pgoff_at(s)) else { return };
+    if let Some(c) = file_cache(f) {
+        c.will_need(pgoff.saturating_mul(PAGE), e.saturating_sub(s));
     }
 }
 
@@ -105,11 +153,12 @@ impl AsCore {
     /// page-cache frame (shared, or private and only read) or a private copy of it (a private write); for a
     /// device VMA the device's page with its memory type.
     pub(crate) fn fill_at(&self, va: u64, v: &Vma, write: bool) -> Result<(), FaultReason> {
-        self.fill_at_with(va, v, write, &mut None)
+        self.fill_at_with(va, v, write, &mut None, true)
     }
 
-    /// `fill_at`, an anonymous page taking `spare` (a zeroed frame made before the lock) when there is one.
-    fn fill_at_with(&self, va: u64, v: &Vma, write: bool, spare: &mut Option<u64>) -> Result<(), FaultReason> {
+    /// `fill_at`, an anonymous page taking `spare` (a zeroed frame made before the lock) when there is one;
+    /// `ra`: a file page's read-ahead still has to run (false: the fault ran it before the lock, `fault_with`).
+    fn fill_at_with(&self, va: u64, v: &Vma, write: bool, spare: &mut Option<u64>, ra: bool) -> Result<(), FaultReason> {
         let (Some(f), Some(pgoff)) = (&v.file, v.pgoff_at(va)) else { return self.fill_page(va, v.prot, spare) };
         if let Some(d) = &f.device {
             let pg = d.fault(pgoff, write).map_err(file_fault)?;
@@ -118,6 +167,9 @@ impl AsCore {
             self.ctr.add(Class::Device, 1);
             DEVICE_FILLS.inc();
             return Ok(());
+        }
+        if ra {
+            file_ra(v, f, pgoff);
         }
         if f.shared || !write {
             let phys = f.backing.get_page(pgoff, write && f.shared).map_err(file_fault)?;
@@ -307,16 +359,11 @@ impl AsCore {
         // the lock, then the fault looks again (another thread may have served the range meanwhile).
         let mut block = Block::Untried;
         let r = loop {
-            match self.fault_with(addr, error, run, &mut spare, &mut block) {
+            match self.fault_with(addr, error, run, &mut spare, &mut block, false) {
                 Some(r) => break r,
                 None => {
-                    block = match mm_core::alloc_zeroed_huge_light(mm_core::Kind::User) {
-                        Some(f) => Block::Made(f),
-                        None => {
-                            crate::thp::FAULT_FALLBACK.inc();
-                            Block::Refused
-                        }
-                    }
+                    let madvised = matches!(block, Block::Wanted(true));
+                    block = crate::thp::fault_block(madvised, true).map_or(Block::Refused, Block::Made);
                 }
             }
         };
@@ -336,7 +383,8 @@ impl AsCore {
     }
 
     /// One look at the fault under the lock; None: a 2 MiB block is wanted first (`fault_locked`).
-    fn fault_with(&self, addr: u64, error: u64, run: &mut SpuriousRun, spare: &mut Option<u64>, block: &mut Block) -> Option<Result<(), FaultReason>> {
+    /// `ra_done`: this fault's file read-ahead ran already (`file_ra_unlocked`).
+    fn fault_with(&self, addr: u64, error: u64, run: &mut SpuriousRun, spare: &mut Option<u64>, block: &mut Block, ra_done: bool) -> Option<Result<(), FaultReason>> {
         let mut g = self.inner.lock();
         let vma = g.space.tree.find(addr).cloned();
         let access = match fault::check(error, vma.as_ref().map(|v| v.prot)) {
@@ -345,6 +393,11 @@ impl AsCore {
         };
         let Some(v) = vma else { return Some(Err(FaultReason::NotMapped)) };
         let page = addr & !(PAGE - 1);
+        if !ra_done && file_ra_reads(&v, page) && paging::translate(self.root, page).is_none() {
+            drop(g);
+            file_ra_unlocked(&v, page);
+            return self.fault_with(addr, error, run, spare, block, true);
+        }
         if access == Access::Write
             && paging::translate(self.root, page).is_none()
             && let Some(base) = self.huge_base(&g, &v, page)
@@ -352,7 +405,7 @@ impl AsCore {
             match core::mem::replace(block, Block::Refused) {
                 Block::Untried if g.huge_fail => crate::thp::FAULT_FALLBACK.inc(),
                 Block::Untried => {
-                    *block = Block::Untried;
+                    *block = Block::Wanted(v.flags.hugepage);
                     return None;
                 }
                 Block::Made(f) => match self.map_huge(&mut g, base, &v, f) {
@@ -367,23 +420,25 @@ impl AsCore {
                         crate::thp::FAULT_FALLBACK.inc();
                     }
                 },
-                Block::Refused | Block::Mapped => {}
+                Block::Wanted(_) | Block::Refused | Block::Mapped => {}
             }
         }
-        Some(self.fault_page(&mut g, addr, error, page, &v, access, run, spare))
+        Some(self.fault_page(&mut g, addr, error, page, &v, access, run, spare, ra_done))
     }
 
     /// The fault on the 4 KiB page `page` (MM-5a..MM-12).
     #[allow(clippy::too_many_arguments)]
-    fn fault_page(&self, g: &mut Inner, addr: u64, error: u64, page: u64, v: &Vma, access: Access, run: &mut SpuriousRun, spare: &mut Option<u64>) -> Result<(), FaultReason> {
+    fn fault_page(&self, g: &mut Inner, addr: u64, error: u64, page: u64, v: &Vma, access: Access, run: &mut SpuriousRun, spare: &mut Option<u64>, ra_done: bool) -> Result<(), FaultReason> {
         let Some(l) = paging::translate_leaf(self.root, page) else {
             run.reset();
-            self.fill_at_with(page, &v, access == Access::Write, spare)?;
+            self.fill_at_with(page, &v, access == Access::Write, spare, !ra_done)?;
             FAULT_FILLS.inc();
             // MM-13: the block stands in for a huge page, so it follows the THP switches too (mode, PR_SET_THP_DISABLE:
             // Linux then fills page by page); it stays where no huge page fits (a cut 2 MiB, no free block).
             if access == Access::Write && around(&v) && !self.thp_disabled() && crate::thp::mode_allows(v.flags.hugepage, v.flags.nohugepage) {
                 self.fault_around(g, page, &v);
+            } else if access != Access::Write {
+                self.file_fault_around(page, &v);
             }
             return Ok(());
         };
@@ -470,6 +525,53 @@ impl AsCore {
             AROUND_SHORT.inc();
             klog::event!(Debug, "mm", "as.around_short", addr = klog::Hex(page), filled = n);
         }
+    }
+
+    /// BL-4: after a read fault filled a page of a file VMA, the other missing pages of its aligned 64 KiB block
+    /// (inside the VMA) that the page cache holds now are mapped too (linux-7/mm/memory.c:5934 `do_fault_around`
+    /// with `fault_around_bytes` 64 KiB, mm/filemap.c:3899 `filemap_map_pages`): no I/O, no wait, pages not
+    /// cached or the read-ahead mark are left to their own fault (`PageCache::ready_for_map`). Each page gets what
+    /// a read fault of it gets (`fill_at_with`: read-only when private or dirty-tracked) and its pin. A page
+    /// reclaimed between the look and the pin is read as its own fault would read it (rare: reclaim takes only
+    /// pages nobody holds). No TLB flush: every entry made here was not present.
+    fn file_fault_around(&self, page: u64, v: &Vma) {
+        let Some(f) = &v.file else { return };
+        let Some(c) = file_cache(f) else { return };
+        let lo = (page & !(AROUND_PAGES * PAGE - 1)).max(v.start);
+        let hi = ((page & !(AROUND_PAGES * PAGE - 1)) + AROUND_PAGES * PAGE).min(v.end);
+        let mut present = 0u32;
+        paging::for_each_leaf(self.root, lo, hi, &mut |l| {
+            let (s, e) = (l.virt.max(lo), (l.virt + l.size.bytes()).min(hi));
+            let mut a = s;
+            while a < e {
+                present |= 1 << ((a - lo) / PAGE);
+                a += PAGE;
+            }
+        });
+        present |= 1 << ((page - lo) / PAGE);
+        let ro = !f.shared || f.backing.track_dirty();
+        let fl = if ro { read_only(v.prot) } else { page_flags(v.prot) };
+        let owner = owner_of(v);
+        let mut n = 0;
+        let mut va = lo;
+        while va < hi {
+            let Some(pgoff) = v.pgoff_at(va) else { break };
+            if present & 1 << ((va - lo) / PAGE) == 0 && c.ready_for_map(pgoff) {
+                let Ok(phys) = f.backing.get_page(pgoff, false) else { break };
+                if paging::map_user_4k(self.root, va, phys, fl, &mut || self.alloc_table()).is_err() {
+                    f.backing.put_page(phys);
+                    break;
+                }
+                let k = Class::of(phys, &owner);
+                self.ctr.add(k, 1);
+                if k.cached() {
+                    share::map_file(phys);
+                }
+                n += 1;
+            }
+            va += PAGE;
+        }
+        FILE_AROUND.add(n);
     }
 
     /// Makes [addr, addr+len) ready for a copy: fills missing pages the VMAs allow (file pages from their file,

@@ -25,7 +25,7 @@ ktest!("in.boot.steps", Safe, live_steps);
 /// probe points, and what it costs here.
 fn draw_private() -> TestResult {
     if !crate::bootart::ready() {
-        return ktest::skip("built without the boot screen fonts");
+        return ktest::fail("built without the boot screen fonts");
     }
     let mut f = display::RamFrame::try_new(2560, 1440).ok_or("no memory for a 2560x1440 frame")?;
     let scene = Scene::new(2560, 1440).ok_or("scene does not fit 2560x1440")?;
@@ -103,7 +103,7 @@ impl Drop for Restore {
 /// whose level drops Info (`loglevel=error|warn`), the steps that only Info lines settle are settled anyway.
 fn watch_below_level() -> TestResult {
     if !klog::metrics::snapshot().any(|(n, _)| n == "klog.watched") {
-        return ktest::skip("klog has no watch yet (change request IN-9 CR-1)");
+        return ktest::fail("klog has no watch yet (change request IN-9 CR-1)");
     }
     let (n0, bad0) = crate::bootscreen::watched_lines();
     let before = klog::levels();

@@ -1,0 +1,13 @@
+GM-8: SDL2 only gives a window a buffer in the output's real pixels when it asks for them (SDL3's branch above does). On a
+scaled desktop the game would otherwise draw at the logical size and bitscomp would stretch it.
+--- a/Quake/gl_vidsdl.c
++++ b/Quake/gl_vidsdl.c
+@@ -574,6 +574,8 @@
+ 
+ #ifdef USE_SDL3
+ 		flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
++#else
++		flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+ #endif
+ 
+ 		if (vid_borderless.value)

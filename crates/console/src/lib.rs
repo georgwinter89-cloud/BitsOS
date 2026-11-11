@@ -170,6 +170,8 @@ pub fn init() {
     vfs::tty::set_console(&CONSOLE_DEV);
     // IN-4: MCP's injected keyboard and pointer get their /dev/input/eventN like real devices.
     evdevfs::register_mcp_devices();
+    // Here, in thread context, rather than at the first event (an interrupt may bring it).
+    evdev::sink().make_room();
     // DP-2 CR 2a (INT-A2a, answers IN-4 CR6): display tells the VT when a program takes or gives back the scanout
     // (only from `display::sync_vt`, never under a display or fbdev lock).
     display::set_vt_hooks(&VT_HOOKS);

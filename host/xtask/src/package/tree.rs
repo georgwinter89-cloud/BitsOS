@@ -15,7 +15,7 @@
 //! directory that differ only in case (a directory and a file included). A link is followed; a dangling one is an
 //! error.
 
-use super::{interp, is_dynamic, is_shared_lib, ldd, ldd_paths};
+use super::{interp, is_dynamic, is_shared_lib, ldd_report, no_host_lib};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -86,15 +86,21 @@ fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) -
     Ok(())
 }
 
+/// Where a stick tree lies on V2.
+const STICK_TREES: &str = "/boot/BITSOS2/";
+
 /// The libraries `ldd` names for the tree's dynamic programs, and (BR-2) for the shared libraries the stage put into
 /// the tree's lib/ because a program dlopens them (Brave's GTK 3: its own needs come along, found next to it first),
-/// that are neither in `have` (the initramfs set's sonames) nor files of the tree itself: (soname, host file),
-/// sorted by soname.
-pub fn libs(src: &Path, files: &[(String, PathBuf)], have: &BTreeSet<String>) -> Result<Vec<(String, PathBuf)>, String> {
+/// that are neither in `have` (the initramfs set's sonames) nor files of the tree itself nor carried by another
+/// staged tree the loader searches (`reached_trees`; `staged`: the manifest's trees by lowercase name): (soname, host
+/// file), sorted by soname.
+pub fn libs(src: &Path, files: &[(String, PathBuf)], have: &BTreeSet<String>, staged: &BTreeMap<String, PathBuf>) -> Result<Vec<(String, PathBuf)>, String> {
     let inside = std::fs::canonicalize(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let own_lib = inside.join(LIB_DIR);
     let mut want: BTreeMap<String, PathBuf> = BTreeMap::new();
     let heads: Vec<(&String, &PathBuf, Vec<u8>)> = files.iter().filter_map(|(r, f)| read_head(f).map(|h| (r, f, h))).collect();
+    let others = reached_trees(&inside, heads.iter().map(|(_, f, h)| (f.as_path(), h.as_slice())), staged);
+    let carried = |so: &str| others.iter().any(|d| d.join(so).is_file());
     // INT-W27b (WY-3 CR2): programs run by another stick tree's loader (the Xwayland tree on the Mesa tree's glibc)
     // find their libraries in the trees, as the tree's build script checks; the host's ldd cannot run them, and its
     // libraries must not shadow the trees' in lib/. A tree with only such programs brings its lib/ itself, too.
@@ -106,7 +112,7 @@ pub fn libs(src: &Path, files: &[(String, PathBuf)], have: &BTreeSet<String>) ->
             if on_stick(&head) {
                 continue;
             }
-            ldd(f)
+            ldd_report(f, &[])
         } else if own_loader {
             continue;
         } else if is_shared_lib(&head) && (rel.starts_with(&format!("{LIB_DIR}/")) || origin_path(f, &head)) {
@@ -114,17 +120,48 @@ pub fn libs(src: &Path, files: &[(String, PathBuf)], have: &BTreeSet<String>) ->
             // plugin of the program in that folder, whose libraries are loaded before it (Firebird's program/intl/
             // libfbintl.so links program/libfbclient.so.2). Found there, a need is the tree's own and stays out.
             let above = f.parent().and_then(Path::parent).filter(|p| p.starts_with(src) && *p != src);
-            ldd_paths(f, &[own_lib.as_path()].into_iter().chain(above).collect::<Vec<_>>())
+            ldd_report(f, &[own_lib.as_path()].into_iter().chain(above).collect::<Vec<_>>())
         } else {
             continue;
         };
-        for (so, real) in found.map_err(|e| format!("{rel}: {e}"))? {
-            if !have.contains(&so) && !real.starts_with(&inside) {
+        let (found, not_found) = found.map_err(|e| format!("{rel}: {e}"))?;
+        // A need another tree carries is loaded from that tree on V2 (and may be a version the host has not).
+        if let Some(name) = not_found.iter().find(|n| !carried(n)) {
+            return Err(format!("{rel}: {}", no_host_lib(name)));
+        }
+        for (so, real) in found {
+            if !have.contains(&so) && !real.starts_with(&inside) && !carried(&so) {
                 want.entry(so).or_insert(real);
             }
         }
     }
     Ok(want.into_iter().collect())
+}
+
+/// The host directories of other staged trees that V2's loader searches for this tree's libraries: every
+/// `/boot/BITSOS2/<tree>/<dir>` an ELF file of the tree names in its DT_RPATH or DT_RUNPATH, and the folder of a
+/// PT_INTERP there (that loader's own lib/), mapped to `<staged tree>/<dir>`. A DT_RPATH of a program applies to every
+/// library it loads, so the set is the whole tree's (Xwayland: bin/Xwayland's RPATH and the tree's `run` both name
+/// xwayland/lib then mesa/lib; the clients run through `run` on the Mesa loader with the same --library-path).
+/// Names of trees the manifest does not stage reach nothing.
+fn reached_trees<'a>(inside: &Path, heads: impl Iterator<Item = (&'a Path, &'a [u8])>, staged: &BTreeMap<String, PathBuf>) -> Vec<PathBuf> {
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for (f, head) in heads {
+        let mut paths: Vec<String> = std::fs::File::open(f).ok().and_then(|file| search_paths(&file, head)).map(|p| p.split(':').map(String::from).collect()).unwrap_or_default();
+        if let Some(i) = interp(head) {
+            paths.extend(Path::new(&i).parent().map(|p| p.to_string_lossy().into_owned()));
+        }
+        for p in paths {
+            let Some(rest) = p.strip_prefix(STICK_TREES) else { continue };
+            let (name, sub) = rest.split_once('/').unwrap_or((rest, ""));
+            let Some(src) = staged.get(&name.to_lowercase()) else { continue };
+            let Ok(src) = std::fs::canonicalize(src) else { continue };
+            if src != inside {
+                dirs.insert(src.join(sub.trim_end_matches('/')));
+            }
+        }
+    }
+    dirs.into_iter().collect()
 }
 
 /// LO-1: whether the 64-bit ELF `f` (its first bytes in `head`) has a RUNPATH or RPATH naming `$ORIGIN`.
@@ -193,6 +230,7 @@ fn read_head(f: &Path) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::ldd;
 
     #[test]
     fn names() {
@@ -277,9 +315,9 @@ mod tests {
         if let Some(x) = &extra {
             have.remove(x);
         }
-        let got: Vec<String> = libs(&d, &fs, &have).unwrap().into_iter().map(|(s, _)| s).collect();
+        let got: Vec<String> = libs(&d, &fs, &have, &BTreeMap::new()).unwrap().into_iter().map(|(s, _)| s).collect();
         assert_eq!(got, extra.into_iter().collect::<Vec<_>>());
-        assert!(libs(&d, &fs, &all).unwrap().is_empty());
+        assert!(libs(&d, &fs, &all, &BTreeMap::new()).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -304,11 +342,11 @@ mod tests {
         std::fs::write(d.join("prog"), &elf).unwrap();
         std::fs::copy(&cxx, d.join("lib/libstdc++.so.6")).unwrap();
         let fs = files(&d).unwrap();
-        assert!(libs(&d, &fs, &BTreeSet::new()).unwrap().is_empty());
+        assert!(libs(&d, &fs, &BTreeSet::new(), &BTreeMap::new()).unwrap().is_empty());
         // A host program beside it brings its own needs (and the lib/ libraries theirs) again.
         std::fs::copy(&ls, d.join("ls")).unwrap();
         let fs = files(&d).unwrap();
-        assert!(libs(&d, &fs, &BTreeSet::new()).unwrap().iter().any(|(s, _)| s == "libc.so.6"));
+        assert!(libs(&d, &fs, &BTreeSet::new(), &BTreeMap::new()).unwrap().iter().any(|(s, _)| s == "libc.so.6"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -336,26 +374,65 @@ mod tests {
         let rp = search_paths(&file, &head);
         assert!(rp.as_deref().is_some_and(|p| p.contains("$ORIGIN")), "{rp:?}");
         assert!(origin_path(&near, &head));
-        let got: Vec<String> = libs(&t, &files(&t).unwrap(), &have).unwrap().into_iter().map(|(s, _)| s).collect();
+        let got: Vec<String> = libs(&t, &files(&t).unwrap(), &have, &BTreeMap::new()).unwrap().into_iter().map(|(s, _)| s).collect();
         assert_eq!(got, ["libm.so.6"]);
         // In a subfolder, its $ORIGIN does not reach libm-user.so in the folder above: as Firebird's intl/ library
         // there, that is the tree's own (its host program loaded it first).
         let deep = t.join("prog/intl/libn.so");
         cc(&["-shared", "-fPIC", "-o", deep.to_str().unwrap(), "n.c", "-L", t.join("prog").to_str().unwrap(), "-lm-user", "-Wl,-rpath,$ORIGIN"]);
-        let got: Vec<String> = libs(&t, &files(&t).unwrap(), &have).unwrap().into_iter().map(|(s, _)| s).collect();
+        let got: Vec<String> = libs(&t, &files(&t).unwrap(), &have, &BTreeMap::new()).unwrap().into_iter().map(|(s, _)| s).collect();
         assert_eq!(got, ["libm.so.6"]);
         // The same name in an unrelated folder of the tree is no excuse: neither its folder, its RUNPATH nor the
         // folder above reaches it, so the library cannot be loaded and the tree is refused.
         std::fs::create_dir_all(t.join("other")).unwrap();
         std::fs::rename(&near, t.join("other/libm-user.so")).unwrap();
-        let e = libs(&t, &files(&t).unwrap(), &have).unwrap_err();
+        let e = libs(&t, &files(&t).unwrap(), &have, &BTreeMap::new()).unwrap_err();
         assert!(e.contains("libm-user.so"), "{e}");
         std::fs::rename(t.join("other/libm-user.so"), &near).unwrap();
         // Without an $ORIGIN path a library outside lib/ is not looked at.
         std::fs::remove_file(&deep).unwrap();
         cc(&["-shared", "-fPIC", "-o", near.to_str().unwrap(), "m.c", "-lm"]);
         assert!(!origin_path(&near, &read_head(&near).unwrap()));
-        assert!(libs(&t, &files(&t).unwrap(), &have).unwrap().is_empty());
+        assert!(libs(&t, &files(&t).unwrap(), &have, &BTreeMap::new()).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A need of a tree's library that another staged tree carries, in a folder the library's RUNPATH names on the
+    /// stick (Xwayland's libGLX_mesa.so.0 and the Mesa tree's libgallium), is that tree's: no error although the host
+    /// lacks it, and nothing copied, even for a need the host has. One that no reached tree carries stays an error.
+    #[test]
+    fn libs_carried_by_another_tree() {
+        assert!(super::super::have_tool("gcc") && super::super::have_tool("ldd"), "gcc and ldd are on every build host");
+        let d = scratch("carried");
+        let (b, t, m) = (d.join("build"), d.join("x"), d.join("m"));
+        for dir in [&b, &t.join("lib"), &m.join("lib")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(b.join("need.c"), "int need(void) { return 1; }\n").unwrap();
+        std::fs::write(b.join("user.c"), "#include <math.h>\nint need(void);\ndouble user(double x) { return cos(x) + need(); }\n").unwrap();
+        let cc = |args: &[&str]| {
+            let o = std::process::Command::new("gcc").args(args).current_dir(&b).output().unwrap();
+            assert!(o.status.success(), "gcc {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        cc(&["-shared", "-fPIC", "-o", "libneed.so", "need.c", "-Wl,-soname,libneed.so"]);
+        let user = t.join("lib/libuser.so");
+        cc(&["-shared", "-fPIC", "-o", user.to_str().unwrap(), "user.c", "-L.", "-lneed", "-lm", "-Wl,-rpath,/boot/BITSOS2/m/lib"]);
+        let have: BTreeSet<String> = ["libc.so.6", "ld-linux-x86-64.so.2"].into_iter().map(String::from).collect();
+        let staged = |name: &str| BTreeMap::from([(name.to_string(), m.clone())]);
+        let fs = files(&t).unwrap();
+        // Nobody carries libneed.so: the host has none, so the tree is refused.
+        let e = libs(&t, &fs, &have, &BTreeMap::new()).unwrap_err();
+        assert!(e.contains("needs libneed.so, which this host does not have"), "{e}");
+        // A staged tree the RUNPATH does not name does not count, nor one whose lib/ lacks the file.
+        assert!(libs(&t, &fs, &have, &staged("other")).unwrap_err().contains("libneed.so"));
+        assert!(libs(&t, &fs, &have, &staged("m")).unwrap_err().contains("libneed.so"));
+        // The m tree carries it: found there on V2; libm.so.6 still comes from the host.
+        std::fs::copy(b.join("libneed.so"), m.join("lib/libneed.so")).unwrap();
+        let got: Vec<String> = libs(&t, &fs, &have, &staged("m")).unwrap().into_iter().map(|(s, _)| s).collect();
+        assert_eq!(got, ["libm.so.6"]);
+        // Once the m tree carries libm.so.6 too, the host's copy would only shadow it.
+        std::fs::write(m.join("lib/libm.so.6"), b"m tree").unwrap();
+        assert!(libs(&t, &fs, &have, &staged("m")).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -376,12 +453,12 @@ mod tests {
         std::fs::create_dir_all(d.join("other")).unwrap();
         std::fs::copy(&cxx, d.join("other/libstdc++.so.6")).unwrap();
         let have: BTreeSet<String> = ["libc.so.6", "ld-linux-x86-64.so.2"].into_iter().map(String::from).collect();
-        assert!(libs(&d, &files(&d).unwrap(), &have).unwrap().is_empty(), "outside lib/");
+        assert!(libs(&d, &files(&d).unwrap(), &have, &BTreeMap::new()).unwrap().is_empty(), "outside lib/");
         std::fs::copy(&cxx, d.join("lib/libstdc++.so.6")).unwrap();
-        let got: Vec<String> = libs(&d, &files(&d).unwrap(), &have).unwrap().into_iter().map(|(s, _)| s).collect();
+        let got: Vec<String> = libs(&d, &files(&d).unwrap(), &have, &BTreeMap::new()).unwrap().into_iter().map(|(s, _)| s).collect();
         assert!(got.contains(&"libm.so.6".to_string()) && got.contains(&"libgcc_s.so.1".to_string()), "{got:?}");
         std::fs::copy(&gcc, d.join("lib/libgcc_s.so.1")).unwrap();
-        let got: Vec<String> = libs(&d, &files(&d).unwrap(), &have).unwrap().into_iter().map(|(s, _)| s).collect();
+        let got: Vec<String> = libs(&d, &files(&d).unwrap(), &have, &BTreeMap::new()).unwrap().into_iter().map(|(s, _)| s).collect();
         assert!(got.contains(&"libm.so.6".to_string()) && !got.contains(&"libgcc_s.so.1".to_string()), "{got:?}");
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -30,10 +30,10 @@ impl Buddy {
         for attempt in 0..2 {
             for &z in tries {
                 let mut zs = self.zones[z].lock();
-                if let Some((ri, pfn)) = self.take_block_below(z, &mut zs, order, limit_pfn) {
+                if let Some((ri, pfn)) = self.take_block_below(z, &mut zs, order, limit_pfn, kind) {
                     self.set_meta(&self.regions[ri], pfn, Meta::new(State::Alloc, order, kind as usize));
-                    drop(zs);
                     self.used[kind as usize].fetch_add(1 << order, Relaxed);
+                    drop(zs);
                     return Some(pfn * PAGE);
                 }
             }
@@ -47,6 +47,7 @@ impl Buddy {
                 self.reports().drain();
             }
         }
+        self.want_kswapd(order);
         self.reports().alloc_fail(order, tries[0]);
         None
     }

@@ -93,7 +93,7 @@ fn sum_of(data: &[u8]) -> u64 {
 /// Each wait kind of fs-epoll sleeps until the kernel writes into its stdin (twice), then reads to EOF.
 fn programs_wait() -> TestResult {
     if !have_prog() {
-        return ktest::skip("/bin/fs-epoll is not in this image (xtask builds host/tests/fs/progs into every image)");
+        return ktest::fail("/bin/fs-epoll is not in this image (xtask builds host/tests/fs/progs into every image)");
     }
     for kind in ["epoll", "epoll-et", "poll", "ppoll", "select", "pselect"] {
         let (r, w) = vfs::pipe::kernel_pipe();
@@ -121,7 +121,7 @@ ktest!("fs.epoll.programs_wait", Safe, programs_wait);
 /// A program asleep in epoll_wait(-1) on a pipe nobody writes is ended by a kill within a wait slice.
 fn kill_wakes_waiter() -> TestResult {
     if !have_prog() {
-        return ktest::skip("/bin/fs-epoll is not in this image");
+        return ktest::fail("/bin/fs-epoll is not in this image");
     }
     let (r, w) = vfs::pipe::kernel_pipe();
     let out = proc::stdio::Capture::new(4096);
@@ -537,7 +537,7 @@ ktest!("fs.epoll.legacy_objects", Safe, legacy_objects);
 /// `host/tests/fs/epoll-sigwait-linux.txt` (also the ABI case `abi-epoll sigwait`).
 fn signal_interrupts() -> TestResult {
     if !have_prog() {
-        return ktest::skip("/bin/fs-epoll is not in this image");
+        return ktest::fail("/bin/fs-epoll is not in this image");
     }
     const LINUX: &str = include_str!("../../../host/tests/fs/epoll-sigwait-linux.txt");
     let (r, w) = vfs::pipe::kernel_pipe();

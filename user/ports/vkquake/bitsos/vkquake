@@ -1,0 +1,188 @@
+#!/bin/sh
+# GM-8: `vkquake` starts vkQuake on BitsOS V2 fullscreen in the running desktop (bitscomp), at the desktop's own size: the
+# window asks bitscomp for fullscreen, nothing changes the display's mode (GX-D9, Wayland has no such request). Lives in
+# \BITSOS2\bin\ (on PATH), the game in \BITSOS2\vkquake\ (manifest `tree vkquake`, user/ports/vkquake/scripts/stage-v2.sh),
+# on the glibc, Vulkan loader and RADV of \BITSOS2\mesa\.
+#   vkquake [ARGS]       the game; every argument goes to vkQuake unchanged (`-nosound`, `+map start`)
+#   vkquake -dedicated 1 [ARGS]   its server, no window, no sound, no GPU, no desktop needed
+#   vkquake --check      check the tree, libraries, drivers, device nodes, desktop, user, home and sound; start and write nothing
+#   vkquake --env        print the environment the game gets (one VAR=value per line); start nothing
+# Keys and mouse come from the desktop, a pad from /dev/input (SDL's joystick interface on evdev), sound through ALSA.
+# Vulkan only on the chip: MESA_VK_DRIVERS (default radeon_icd) picks the Mesa tree's drivers, so without a render node the
+# game says so instead of drawing on the CPU. Never as root: started by root (MCP as root) it runs as uid 1000 (BusyBox
+# chpst, the same process, so its pid stays the one bitscomp lists). HOME is /data/home/1000 when the data volume has it
+# (config and saves in ~/.vkquake stay), else in RAM (gone at the next boot; the launcher says so).
+# The VKQ_* settings exist for tests: a tree, Mesa tree, data folder, RAM folder, device folder and home of their own.
+T=${VKQ_TREE:-/boot/BITSOS2/vkquake}
+M=${VKQ_MESA:-${T%/*}/mesa}
+L=$T/lib:$M/lib
+LD=$M/lib/ld-linux-x86-64.so.2
+ICD=$M/share/vulkan/icd.d
+DATA_HOME=${VKQ_DATA:-/data}/home/1000
+ALSA_SYS=${VKQ_ALSA_SYS:-/usr/share/alsa/alsa.conf}
+USER_RUN=${VKQ_USER_RUN:-/run/user/1000}
+TMP=${VKQ_TMP:-/tmp}
+DEV=${VKQ_DEV:-/dev}
+PATH=${VKQ_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
+export PATH
+UID_NOW=$(id -u 2>/dev/null)
+
+say() { echo "vkquake: $*"; }
+case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
+
+tree_ok() {
+  for f in bin/vkquake lib/libSDL2-2.0.so.0 lib/libasound.so.2 id1/pak0.pak id1/pak1.pak; do
+    [ -e "$T/$f" ] || { say "tree $T: $f is missing (copy \\BITSOS2\\vkquake\\ to the stick)"; return 1; }
+  done
+  for f in lib/ld-linux-x86-64.so.2 lib/libvulkan.so.1 lib/libvulkan_radeon.so; do
+    [ -e "$M/$f" ] || { say "tree $M: $f is missing (copy \\BITSOS2\\mesa\\ to the stick)"; return 1; }
+  done
+}
+
+# The Mesa tree's loader lists each program and library from the two trees' lib/ only.
+libs_ok() {
+  rc=0 n=0
+  for f in "$T"/bin/* "$T"/lib/*; do
+    out=$("$LD" --inhibit-cache --library-path "$L" --list "$f" 2>&1) || { say "${f#"$T"/}: the loader failed: $out"; rc=1; continue; }
+    miss=$(echo "$out" | grep "not found")
+    [ -z "$miss" ] || { say "${f#"$T"/}: missing $(echo "$miss" | sed 's/^[[:space:]]*//; s/ =>.*//' | tr '\n' ' ')"; rc=1; }
+    n=$((n + 1))
+  done
+  [ $rc != 0 ] || say "libraries: $n programs and libraries resolve inside $T/lib and $M/lib"
+  return $rc
+}
+
+drivers() {
+  VK_DRIVER_FILES=
+  for d in ${MESA_VK_DRIVERS:-radeon_icd}; do
+    case $d in */*|.*) say "MESA_VK_DRIVERS: '$d' is not a driver name of the Mesa tree"; return 1 ;; esac
+    [ -f "$ICD/$d.json" ] || { say "driver $d: $ICD/$d.json is missing"; return 1; }
+    VK_DRIVER_FILES="$VK_DRIVER_FILES${VK_DRIVER_FILES:+:}$ICD/$d.json"
+  done
+}
+
+# The desktop's own process (bitscomp's helpers `bitscomp page/ctl ...` are not desktops); sets WD (the Wayland socket's
+# path) or why. As Brave's and LibreOffice's launchers find it.
+find_desk() {
+  WD= why=
+  if [ -n "$WAYLAND_DISPLAY" ] && [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    WD=$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
+    return 0
+  fi
+  ps_=
+  for p in $(pidof bitscomp); do
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+      *" page "* | *" ctl "* | *" page" | *" ctl") ;;
+      *) ps_="$ps_ $p" ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  set -- $ps_
+  [ $# -gt 0 ] || { why="none runs (start the desktop first)"; return 1; }
+  [ $# = 1 ] || { why="$# desktops run"; return 1; }
+  sock=wayland-bits-0 prev=
+  for a in $(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null); do
+    [ "$prev" != --socket ] || sock=$a
+    prev=$a
+  done
+  xdg=$(tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -n 1)
+  [ -n "$xdg" ] || { why="its XDG_RUNTIME_DIR cannot be read (/proc/$1/environ)"; return 1; }
+  WD=$xdg/$sock
+  [ -S "$WD" ] || { why="its socket $WD is missing"; WD=; return 1; }
+}
+
+# The uid the game runs as: the caller's, never root's (DROP = root's hand-over to uid 1000, NOROOT = why it fails).
+as_user() {
+  DROP= NOROOT=
+  [ "$UID_NOW" = 0 ] || return 0
+  out=$(chpst -u 1000:1000 id -u 2>&1)
+  if [ "$out" = 1000 ]; then DROP="chpst -u 1000:1000"; return 0; fi
+  NOROOT="root cannot hand over to uid 1000 (chpst -u 1000:1000: $(echo "${out:-no answer}" | head -n 1))"
+}
+# shellcheck disable=SC2086
+u() { $DROP "$@"; }
+
+# Sets H and says where: the user's real home, else a folder in RAM. A start makes the RAM folder, --check only looks.
+home_dir() {
+  H=$RUN/home HOME_WHY=
+  if [ -n "$VKQ_HOME" ]; then H=$VKQ_HOME; HOME_WHY="VKQ_HOME"; return 0; fi
+  if [ -d "$DATA_HOME" ] && [ ! -L "$DATA_HOME" ] && u test -w "$DATA_HOME"; then H=$DATA_HOME; return 0; fi
+  HOME_WHY="in RAM: config and saves are gone at the next boot; no writable $DATA_HOME"
+}
+home_line() { if [ -z "$HOME_WHY" ]; then say "home: $H (data volume; config and saves stay)"; else say "home: $H ($HOME_WHY)"; fi; }
+
+# The game's user must be able to open the nodes, not only to see them: chpst's hand-over keeps no extra group. Today render
+# and sound nodes are 0666 and evdev's belong to uid 1000; a change there is named here, not later as "no Vulkan device".
+nodes_ok() {
+  bad=0
+  for n in "$DEV"/dri/renderD* "$DEV"/snd/pcmC*p "$DEV"/input/event*; do
+    [ -e "$n" ] || continue
+    if ! { u test -r "$n" && u test -w "$n"; }; then say "$n cannot be opened as the game's user (mode or group)"; bad=1; fi
+  done
+  return $bad
+}
+
+# A RAM home may lie under $TMP (no runtime folder), a path anyone can make first: it must be this user's own real folder.
+own_run() {
+  [ "$H" = "$RUN/home" ] || return 0
+  u mkdir -p -m 700 "$RUN" || { say "cannot make $RUN"; return 1; }
+  if [ -L "$RUN" ] || ! u test -O "$RUN"; then say "$RUN is not this user's own folder: nothing started"; return 1; fi
+}
+
+# The program in a clean environment pointing into the trees. `game_env PROGRAM ARGS` replaces this shell: the pid stays.
+# shellcheck disable=SC2086
+game_env() {
+  exec env -i PATH="$PATH" HOME="$H" LANG=C ${WD:+XDG_RUNTIME_DIR="${WD%/*}"} ${WD:+WAYLAND_DISPLAY="${WD##*/}"} \
+    SDL_VIDEODRIVER=wayland SDL_AUDIODRIVER=alsa SDL_VIDEO_WAYLAND_WMCLASS=vkquake LD_LIBRARY_PATH="$L" \
+    VK_DRIVER_FILES="$VK_DRIVER_FILES" VK_ICD_FILENAMES="$VK_DRIVER_FILES" VK_IMPLICIT_LAYER_PATH="$M/share/vulkan/implicit_layer.d" \
+    VK_LAYER_PATH="$M/share/vulkan/explicit_layer.d" DRIRC_CONFIGDIR="$M/share/drirc.d" AMDGPU_ASIC_ID_TABLE_PATHS="$M/share/libdrm" "$@"
+}
+
+as_user
+if [ -n "$DROP" ]; then RUN=$USER_RUN/vkquake
+elif [ "$UID_NOW" != 0 ] && [ -n "$XDG_RUNTIME_DIR" ]; then RUN=$XDG_RUNTIME_DIR/vkquake
+else RUN=$TMP/vkquake-$UID_NOW; fi
+
+case "$1" in
+  -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --check)
+    rc=0
+    if tree_ok; then say "tree $T: ok ($(head -n 1 "$T/VERSION.txt" 2>/dev/null | cut -d' ' -f1,2))"; libs_ok || rc=1; else rc=1; fi
+    if drivers; then say "drivers: ${MESA_VK_DRIVERS:-radeon_icd}"; else rc=1; fi
+    if [ -d "$DEV/dri" ]; then say "render nodes: $(ls "$DEV/dri" | tr '\n' ' ')"; else say "render nodes: none ($DEV/dri missing): the game cannot start on the chip"; fi
+    nodes_ok || rc=1
+    if find_desk; then say "desktop: $WD"; else say "desktop: $why"; fi
+    if [ -n "$DROP" ]; then say "user: runs as uid 1000 (started by root: $DROP)"
+    elif [ -z "$NOROOT" ]; then say "user: runs as uid $UID_NOW"
+    else say "user: runs as uid 0: refused, $NOROOT"; rc=1; fi
+    home_dir
+    home_line
+    if [ -r "$ALSA_SYS" ]; then say "sound: ALSA configuration $ALSA_SYS"; else say "sound: no ALSA configuration ($ALSA_SYS): the game plays without sound"; fi
+    exit $rc ;;
+  --env)
+    find_desk || WD=
+    home_dir
+    drivers || exit 1
+    game_env env ;;
+esac
+
+if [ -n "$NOROOT" ]; then
+  say "vkQuake startet nicht als root: $NOROOT. Bitte als Benutzer 1000 starten."
+  say "vkQuake does not run as root: $NOROOT. Start it as user 1000."
+  exit 1
+fi
+tree_ok || exit 1
+drivers || exit 1
+WD= VID=-current
+for a in "$@"; do [ "$a" != -dedicated ] || VID=; done
+if [ -n "$VID" ] && ! find_desk; then say "desktop: $why"; exit 1; fi
+if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
+  mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; exit 1; }
+fi
+home_dir
+home_line
+own_run || exit 1
+u mkdir -p "$H" || { say "cannot make $H"; exit 1; }
+# `exec` all the way down: the pid that bitscomp's window list names is this script's (the checks match by it).
+# shellcheck disable=SC2086
+game_env $DROP "$LD" --inhibit-cache --library-path "$L" --argv0 "$T/bin/vkquake" "$T/bin/vkquake" -basedir "$T" $VID "$@"

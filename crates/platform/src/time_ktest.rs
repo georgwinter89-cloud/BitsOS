@@ -16,6 +16,7 @@ use time::HrTimer;
 type R = ktest::TestResult;
 
 ktest!("cp.time.calibration", Safe, calibration);
+ktest!("cp.time.clock_vs_hpet", Hardware, clock_vs_hpet);
 ktest!("cp.time.recheck_wrong_rate", Safe, recheck_wrong_rate);
 ktest!("cp.time.monotonic_cpus", Safe, monotonic_cpus);
 ktest!("cp.time.lapic_every_cpu", Safe, lapic_every_cpu);
@@ -53,21 +54,10 @@ fn online() -> Vec<usize> {
     (0..percpu::cpu_count()).collect()
 }
 
-/// The TSC rate is plausible, the HPET gave it on hardware, and the clock agrees with the HPET over 200 ms.
-fn calibration() -> R {
-    wait_recheck()?;
-    let c = time::calibration().ok_or("time::calibrate never ran (acpi::init)")?;
-    kassert!((time::clock::MIN_HZ..=time::clock::MAX_HZ).contains(&c.hz), "rate {} Hz", c.hz);
-    kassert!(time::tsc_hz() == c.hz, "clock runs at {} Hz, calibration said {}", time::tsc_hz(), c.hz);
-    kassert!(time::source() == c.source.code(), "source code {} vs {:?}", time::source(), c.source);
-    if !hypervisor() {
-        kassert!(matches!(c.source, time::Source::Hpet | time::Source::Reload(_)), "on hardware the HPET gives the rate (spec §7.1), got {:?} ({:?})", c.source, c.tried);
-    }
+/// The clock against the HPET over 200 ms, in ppm; the event carries what the judge of a failure needs. `None`: no HPET.
+fn clock_vs_hpet_ppm(c: &time::Calibration) -> Result<Option<i64>, String> {
     let Some(p0) = clock_hpet_pair() else {
-        if hypervisor() {
-            return Err(String::from("QEMU's q35 has an HPET: it should have started"));
-        }
-        return ktest::skip("no HPET to compare the clock with");
+        return Ok(None);
     };
     sched::sleep_ns(200 * MS);
     let p1 = clock_hpet_pair().ok_or("HPET gone")?;
@@ -77,10 +67,46 @@ fn calibration() -> R {
     klog::event!(Info, "cp", "ktest.clock_vs_hpet", ppm = ppm, clock_us = (clock_ns / 1000) as u64, hpet_us = (hpet_ns / 1000) as u64,
         source = c.source.name(), tsc_hz = c.hz, invariant = c.invariant_tsc, span0_ns = p0.span_ns, span1_ns = p1.span_ns,
         recheck = c.recheck.map(|r| r.outcome.name()).unwrap_or("none"), recheck_ppm = c.recheck.map(|r| r.ppm).unwrap_or(0));
-    // Hardware: each end is the tightest of several back-to-back reads with interrupts off (D2 of INT-A1d: one
-    // pair split by 28 us of something else read as -140 ppm); a microsecond of read jitter is 5 ppm.
-    let limit = if hypervisor() { 50_000 } else { 100 };
-    kassert!(ppm.abs() <= limit, "clock vs HPET: {ppm} ppm over 200 ms (limit {limit})");
+    Ok(Some(ppm))
+}
+
+/// The TSC rate is plausible, the HPET gave it on hardware, and the clock runs at the HPET's rate at all: a wrong rate
+/// is off in every try, a host under load (QEMU: -105503 ppm seen, a stolen vCPU between two reads) in one of them.
+/// The fine limit is `clock_vs_hpet`, on the machine that can keep it.
+fn calibration() -> R {
+    wait_recheck()?;
+    let c = time::calibration().ok_or("time::calibrate never ran (acpi::init)")?;
+    kassert!((time::clock::MIN_HZ..=time::clock::MAX_HZ).contains(&c.hz), "rate {} Hz", c.hz);
+    kassert!(time::tsc_hz() == c.hz, "clock runs at {} Hz, calibration said {}", time::tsc_hz(), c.hz);
+    kassert!(time::source() == c.source.code(), "source code {} vs {:?}", time::source(), c.source);
+    if !hypervisor() {
+        kassert!(matches!(c.source, time::Source::Hpet | time::Source::Reload(_)), "on hardware the HPET gives the rate (spec §7.1), got {:?} ({:?})", c.source, c.tried);
+    }
+    let mut best = i64::MAX;
+    for _ in 0..3 {
+        match clock_vs_hpet_ppm(&c)? {
+            Some(ppm) => best = best.min(ppm.abs()),
+            None if hypervisor() => return Err(String::from("QEMU's q35 has an HPET: it should have started")),
+            None => return ktest::fail("no HPET to compare the clock with"),
+        }
+        if best <= 200_000 {
+            return Ok(());
+        }
+    }
+    Err(format!("clock vs HPET: {best} ppm at best in 3 tries over 200 ms (limit 200000): the clock runs at another rate"))
+}
+
+/// The clock agrees with the HPET to 100 ppm over 200 ms. Each end is the tightest of several back-to-back reads with
+/// interrupts off (D2 of INT-A1d: one pair split by 28 us of something else read as -140 ppm); a microsecond of read
+/// jitter is 5 ppm. Class Hardware: timing is judged only there (CONTRACTS section 4; QEMU's old limit of 50000 ppm went
+/// red in the gate, CR-GM1d-6).
+fn clock_vs_hpet() -> R {
+    wait_recheck()?;
+    let c = time::calibration().ok_or("time::calibrate never ran (acpi::init)")?;
+    let Some(ppm) = clock_vs_hpet_ppm(&c)? else {
+        return ktest::fail("no HPET to compare the clock with");
+    };
+    kassert!(ppm.abs() <= 100, "clock vs HPET: {ppm} ppm over 200 ms (limit 100)");
     Ok(())
 }
 
@@ -106,7 +132,7 @@ fn recheck_wrong_rate() -> R {
         if hypervisor() {
             return Err(String::from("QEMU's q35 has an HPET: it should have started"));
         }
-        return ktest::skip("no HPET to re-check against");
+        return ktest::fail("no HPET to re-check against");
     }
     let (good_hz, good_src) = (c.hz, c.source);
     let wrong = good_hz + good_hz / 1_000_000 * 300;
@@ -132,7 +158,7 @@ fn recheck_wrong_rate() -> R {
         ppm = r.ppm, good_hz = good_hz, span_ms = r.span_ns / 1_000_000);
     kassert!(r.handed_hz == wrong, "handed {} Hz, the test set {}", r.handed_hz, wrong);
     if hypervisor() && r.outcome != time::recheck::Outcome::Corrected {
-        return ktest::skip(&format!("the hypervisor's HPET and TSC disagree: {:?}", r));
+        return ktest::fail(&format!("the hypervisor's HPET and TSC disagree: {:?}", r));
     }
     kassert!(r.outcome == time::recheck::Outcome::Corrected, "a 300 ppm error was not corrected: {:?}", r);
     kassert!(hz_after == r.measured_hz && src_after == time::Source::Hpet.code(), "the clock runs at {hz_after} Hz (source {src_after}) after the correction to {}", r.measured_hz);
@@ -206,7 +232,7 @@ fn record_cpu(slot: usize) {
 /// Every online CPU's LAPIC timer runs and fires a timer armed there, on that CPU, from its interrupt.
 fn lapic_every_cpu() -> R {
     if time::lapic::config() == time::lapic::Config::Poll {
-        return ktest::skip("hrtimer=poll");
+        return ktest::fail("hrtimer=poll");
     }
     let cpus = online();
     FIRED_ON.cover_possible();
@@ -416,11 +442,11 @@ fn hrtimer_cancel_rearm() -> R {
 /// window, because the tick fires there by interrupt and the interrupt exit switches (CP-5 + SC-3/SC-4).
 fn preempt_busy() -> R {
     if !hal::vectors::irq_exit_hook_installed() {
-        return ktest::skip("no preemption at interrupt exit: sched::timers::tick_preempts() is false (change request 1 in plan/notes/cp-CP-5.md)");
+        return ktest::fail("no preemption at interrupt exit: sched::timers::tick_preempts() is false (change request 1 in plan/notes/cp-CP-5.md)");
     }
     let cpus = online();
     if cpus.len() < 2 {
-        return ktest::skip("needs two CPUs (one to spin on, one to watch)");
+        return ktest::fail("needs two CPUs (one to spin on, one to watch)");
     }
     let target = *cpus.last().ok_or("no CPU")?;
     let me = sched::current_cpu();
@@ -480,11 +506,11 @@ fn preempt_busy() -> R {
 /// at least half of them (hardware; a quarter under QEMU) — other threads wake CPUs now and then.
 fn idle_halts() -> R {
     if !time::interrupt_driven() {
-        return ktest::skip("timers are polled (hrtimer=poll or a CPU without a LAPIC timer)");
+        return ktest::fail("timers are polled (hrtimer=poll or a CPU without a LAPIC timer)");
     }
     let cpus = online();
     if cpus.len() < 2 {
-        return ktest::skip("needs a second CPU to watch");
+        return ktest::fail("needs a second CPU to watch");
     }
     let me = sched::current_cpu();
     const SAMPLES: u32 = 40;
@@ -504,7 +530,7 @@ fn idle_halts() -> R {
     let shares: Vec<String> = cpus.iter().map(|&c| format!("{c}:{}", halted[c])).collect();
     klog::event!(Info, "cp", "ktest.idle_halts", cpus = cpus.len(), duty_samples = duty, samples = SAMPLES, halted = shares.join(","));
     if duty > SAMPLES / 2 {
-        return ktest::skip(&format!("a CPU held poll duty in {duty} of {SAMPLES} samples: SC's idle loop still spins for the pollers (change request 1 in plan/notes/cp-CP-5.md)"));
+        return ktest::fail(&format!("a CPU held poll duty in {duty} of {SAMPLES} samples: SC's idle loop still spins for the pollers (change request 1 in plan/notes/cp-CP-5.md)"));
     }
     let need = if hypervisor() { SAMPLES / 4 } else { SAMPLES / 2 };
     let low: Vec<usize> = cpus.iter().copied().filter(|&c| c != me && halted[c] < need).collect();
@@ -519,7 +545,7 @@ fn wall_clock() -> R {
         if hypervisor() {
             return Err(format!("no wall clock under QEMU (RTC error {err:?})"));
         }
-        return ktest::skip(&format!("no RTC: {err:?}"));
+        return ktest::fail(&format!("no RTC: {err:?}"));
     };
     kassert!((2024..=2100).contains(&utc.year), "UTC year {}", utc.year);
     let off = time::wall::utc_offset_minutes();

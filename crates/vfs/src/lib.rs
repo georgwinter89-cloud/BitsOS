@@ -44,6 +44,7 @@ pub mod overlay;
 pub mod ops;
 mod cache_view;
 pub mod pagecache;
+pub mod pcpu;
 pub mod pipe;
 pub mod poll;
 pub mod pollsys;
@@ -61,6 +62,7 @@ pub mod sys;
 mod sys_page;
 pub mod sys_attr;
 pub mod sys_copy;
+pub mod sys_xattr;
 pub mod sys_mount;
 pub mod sysctl;
 pub mod tmpfs;
@@ -82,6 +84,8 @@ mod mnt_tests;
 mod fs2_tests;
 #[cfg(test)]
 mod fs5_tests;
+#[cfg(test)]
+mod cut_tests;
 #[cfg(test)]
 mod fs12_tests;
 #[cfg(test)]
@@ -108,6 +112,8 @@ mod fs13_tests;
 mod fs13_preload_tests;
 #[cfg(test)]
 mod mm9_reclaim_tests;
+#[cfg(test)]
+mod bl0_tests;
 
 pub use dentry::{Dentry, SuperBlock};
 pub use fsops::FsOps;
@@ -134,10 +140,12 @@ pub struct DevNodeEntry {
 kreg::declare!(pub DEVNODES: DevNodeEntry = "devnode");
 
 /// A synthetic /proc or /sys file: `vfs::procfile!("/proc/meminfo", render_meminfo);` (text made per open; the
-/// path may be anywhere, `/proc/...` and `/sys/...` land on those file systems).
+/// path may be anywhere, `/proc/...` and `/sys/...` land on those file systems). The mode is 0444 unless the
+/// owner names one: `vfs::procfile!("/proc/pagetypeinfo", render, 0o400);` (Linux's root-only files).
 pub struct ProcFileEntry {
     pub path: &'static str,
     pub render: fn() -> alloc::string::String,
+    pub mode: u32,
 }
 kreg::declare!(pub PROCFILES: ProcFileEntry = "procfile");
 
@@ -152,6 +160,8 @@ kreg::declare!(pub PROCDIRS: ProcDirEntry = "procdir");
 
 #[doc(hidden)]
 pub use kreg as __kreg;
+#[doc(hidden)]
+pub use klog as __klog;
 
 #[macro_export]
 macro_rules! devnode {
@@ -168,7 +178,10 @@ macro_rules! procdir {
 #[macro_export]
 macro_rules! procfile {
     ($path:literal, $render:path) => {
-        $crate::__kreg::register!("procfile", $crate::ProcFileEntry, $crate::ProcFileEntry { path: $path, render: $render });
+        $crate::procfile!($path, $render, 0o444);
+    };
+    ($path:literal, $render:path, $mode:expr) => {
+        $crate::__kreg::register!("procfile", $crate::ProcFileEntry, $crate::ProcFileEntry { path: $path, render: $render, mode: $mode });
     };
 }
 
@@ -214,6 +227,12 @@ pub fn init(initramfs: Option<&[u8]>) -> Result<usize, &'static str> {
     // /dev/shm (POSIX shared memory, Chromium's shm files): a tmpfs on the devtmpfs, 1777 as on Linux.
     if let Err(e) = tmpfs::mount_new(&ns, "/dev/shm", 0o1777, None).map(|m| m.set_flags(MNT_NOSUID | MNT_NODEV)) {
         klog::event!(Warn, "vfs", "shm.failed", errno = e; "no /dev/shm: shm_open fails in programs");
+    }
+    // What udev and systemd leave in every Linux's /dev: bash's `<(cmd)` opens /dev/fd/63.
+    for (link, target) in [("/dev/fd", "/proc/self/fd"), ("/dev/stdin", "/proc/self/fd/0"), ("/dev/stdout", "/proc/self/fd/1"), ("/dev/stderr", "/proc/self/fd/2")] {
+        if let Err(e) = ns.create_symlink(link, target) {
+            klog::event!(Warn, "vfs", "dev_link.failed", errno = e; "a link of /dev is missing");
+        }
     }
     klog::event!(
         Info,

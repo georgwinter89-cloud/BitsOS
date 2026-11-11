@@ -9,7 +9,8 @@ use crate::pagecache::SyncKind;
 use crate::Errno;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use ksync::SpinLock;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use ksync::{Spare, SpinLock, WaitQueue};
 use uapi::errno::*;
 
 /// Something with dirty data to write back (a file with a backend, later a whole file system).
@@ -39,18 +40,29 @@ klog::counter!(FLUSH_ERRORS, "vfs.writeback.errors");
 
 /// Registers `w` for background write-back (ENOMEM when the list cannot grow).
 pub fn register(w: Weak<dyn Flush>) -> Result<(), Errno> {
-    let mut l = LIST.lock();
-    l.try_reserve(1).map_err(|_| ENOMEM)?;
-    l.push(w);
-    Ok(())
+    push_grown(&LIST, w)
+}
+
+/// `w` onto a list behind a spin lock. The list grows with the lock dropped (`ksync::Spare`): under it the heap can
+/// neither reclaim nor use single frames, and with 260 000 files registered (Mini-PC 11.11.2026, after Steam had
+/// checked a game) the next doubling was 8 MiB in one piece.
+fn push_grown(list: &SpinLock<Vec<Weak<dyn Flush>>>, w: Weak<dyn Flush>) -> Result<(), Errno> {
+    let mut spare = Spare::new();
+    loop {
+        let mut l = list.lock();
+        if !spare.fits(&mut *l, 1) {
+            drop(l);
+            spare.grow().map_err(|()| ENOMEM)?;
+            continue;
+        }
+        l.push(w);
+        return Ok(());
+    }
 }
 
 /// Registers a whole file system (ENOMEM when the list cannot grow): every pass flushes it after the files.
 pub fn register_fs(w: Weak<dyn Flush>) -> Result<(), Errno> {
-    let mut l = FS_LIST.lock();
-    l.try_reserve(1).map_err(|_| ENOMEM)?;
-    l.push(w);
-    Ok(())
+    push_grown(&FS_LIST, w)
 }
 
 /// Everything durable and every file system clean, before the devices stop: every file's dirty pages, every
@@ -82,9 +94,26 @@ pub fn sync_durable() -> Pass {
 }
 
 fn live_fs() -> Vec<Arc<dyn Flush>> {
-    let mut l = FS_LIST.lock();
-    l.retain(|w| w.strong_count() > 0);
-    l.iter().filter_map(Weak::upgrade).collect()
+    live_of(&FS_LIST).unwrap_or_default()
+}
+
+/// The live objects of a list. The answer's room is made with the lock dropped (as `push_grown`: one pass of the
+/// flusher asked for 4 MiB in one piece under the spin lock, was refused and wrote nothing); the list may grow
+/// meanwhile, then the room is made again. None: no memory.
+fn live_of(list: &SpinLock<Vec<Weak<dyn Flush>>>) -> Option<Vec<Arc<dyn Flush>>> {
+    let mut v: Vec<Arc<dyn Flush>> = Vec::new();
+    loop {
+        let need = {
+            let mut l = list.lock();
+            l.retain(|w| w.strong_count() > 0);
+            if l.len() <= v.capacity() {
+                v.extend(l.iter().filter_map(Weak::upgrade));
+                return Some(v);
+            }
+            l.len()
+        };
+        v.try_reserve_exact(need).ok()?;
+    }
 }
 
 /// Registered objects still alive (files and file systems).
@@ -99,17 +128,73 @@ pub struct Pass {
     pub failed: usize,
 }
 
+/// FS-STALL round 5: the flusher (`vfs-sys`) waits here between passes: its period, or sooner when a writer over the
+/// dirty limit asks for a pass (`balance_dirty`).
+pub fn wait_for_work(period_ns: u64) {
+    WORK.wait_until_timeout(|| KICKED.load(Ordering::Acquire), period_ns);
+    KICKED.store(false, Ordering::Release);
+}
+
+/// After a pass of the flusher: writers waiting for one go on.
+pub fn pass_done() {
+    PASSES.fetch_add(1, Ordering::AcqRel);
+    DONE.wake_all();
+}
+
+/// Asks the flusher for a pass now.
+pub fn kick() {
+    if !KICKED.swap(true, Ordering::AcqRel) {
+        WORK.wake_all();
+    }
+}
+
+static KICKED: AtomicBool = AtomicBool::new(false);
+static PASSES: AtomicU64 = AtomicU64::new(0);
+static WORK: WaitQueue = WaitQueue::new();
+static DONE: WaitQueue = WaitQueue::new();
+
+/// What a writer over the dirty limit does (`balance_dirty`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Balance {
+    /// Under the limit: nothing.
+    Go,
+    /// Its own file holds a large share of the dirty pages: it writes that file back itself.
+    WriteOwn,
+    /// It waited for the flusher (kicked), at most a pause in proportion to what it dirtied.
+    Waited,
+}
+
+/// The longest a writer waits for the flusher per write (Linux's `MAX_PAUSE`, 200 ms).
+const MAX_PAUSE_NS: u64 = 200_000_000;
+/// Pause per page the write dirtied (about 1 GB/s of write-back).
+const PAUSE_PER_PAGE_NS: u64 = 4_000;
+
+/// `balance_dirty_pages`, small: under the limit nothing; over it, a writer whose file holds a quarter or more of
+/// the dirty pages writes it back itself (its own pace is the disk's), any other writer kicks the flusher and waits
+/// for its pass, at most in proportion to the pages it dirtied (a 100-byte write waits microseconds, not a commit).
+/// Never a commit or a device flush per write. `own`: the writer's file's dirty pages (`PageCache::own_dirty`).
+pub fn balance_dirty(own: u64, dirtied: u64) -> Balance {
+    if !crate::pagecache::dirty_over_limit() {
+        return Balance::Go;
+    }
+    let total = crate::pagecache::dirty_pages_total();
+    if own.saturating_mul(4) >= total {
+        return Balance::WriteOwn;
+    }
+    let seen = PASSES.load(Ordering::Acquire);
+    kick();
+    let pause = dirtied.max(1).saturating_mul(PAUSE_PER_PAGE_NS).min(MAX_PAUSE_NS);
+    DONE.wait_until_timeout(|| PASSES.load(Ordering::Acquire) != seen || !crate::pagecache::dirty_over_limit(), pause);
+    BALANCE_WAITS.inc();
+    Balance::Waited
+}
+
+klog::counter!(BALANCE_WAITS, "vfs.dirty_balance_waits");
+
 /// Writes back every registered object (outside the list lock; the backends may sleep on their devices).
 pub fn flush_all(why: SyncKind) -> Pass {
-    let live: Vec<Arc<dyn Flush>> = {
-        let mut l = LIST.lock();
-        l.retain(|w| w.strong_count() > 0);
-        let mut v = Vec::new();
-        if v.try_reserve(l.len()).is_err() {
-            return Pass { flushed: 0, failed: 1 };
-        }
-        v.extend(l.iter().filter_map(Weak::upgrade));
-        v
+    let Some(live) = live_of(&LIST) else {
+        return Pass { flushed: 0, failed: 1 };
     };
     // Whole file systems after their files (FS-7: FAT's entries, FSInfo and the stick's cache flush).
     let fs = live_fs();

@@ -36,6 +36,7 @@ macro_rules! atoms {
 atoms!(
     WM_PROTOCOLS, WM_DELETE_WINDOW, WM_TAKE_FOCUS, WM_STATE, WL_SURFACE_ID, UTF8_STRING, CLIPBOARD, TARGETS,
     TIMESTAMP, INCR, TEXT, _NET_WM_NAME, _NET_WM_PID, _NET_SUPPORTED, _NET_SUPPORTING_WM_CHECK, _NET_ACTIVE_WINDOW,
+    _NET_WM_STATE, _NET_WM_STATE_FULLSCREEN,
     _BITSCOMP_SELECTION, _BITSCOMP_TIME, MIME_TEXT_UTF8, MIME_TEXT, WM_S0,
 );
 
@@ -69,6 +70,8 @@ pub struct Xwm {
     xfixes: u8,
     pub xfixes_event: u8,
     xres: u8,
+    /// WY-3b: the X server offers DRI3: glamor came up (Xwayland falls back to software on its own otherwise).
+    pub dri3: bool,
     pub client: Client,
     wins: HashMap<u32, Rc<XState>>,
     mapped: HashSet<u32>,
@@ -105,7 +108,7 @@ impl Xwm {
         for (i, n) in Atoms::NAMES.iter().enumerate() {
             conn.send(xp::intern_atom(atom_name(n)), Some(Want::Atom(i)));
         }
-        for e in ["Composite", "XFIXES", "X-Resource"] {
+        for e in ["Composite", "XFIXES", "X-Resource", "DRI3"] {
             conn.send(xp::query_extension(e), Some(Want::Ext(e)));
         }
         conn.flush();
@@ -115,11 +118,12 @@ impl Xwm {
             root: 0,
             wm_win: 0,
             ready: false,
-            left: Atoms::NAMES.len() + 3,
+            left: Atoms::NAMES.len() + 4,
             composite: 0,
             xfixes: 0,
             xfixes_event: 0,
             xres: 0,
+            dri3: false,
             client,
             wins: HashMap::new(),
             mapped: HashSet::new(),
@@ -188,6 +192,7 @@ impl Xwm {
                     "Composite" if present => self.composite = op,
                     "XFIXES" if present => (self.xfixes, self.xfixes_event) = (op, ev),
                     "X-Resource" if present => self.xres = op,
+                    "DRI3" => self.dri3 = present,
                     _ => eprintln!("bitscomp: xwm: the X server has no {name} extension"),
                 }
                 self.counted(app);
@@ -231,7 +236,7 @@ impl Xwm {
         self.send(xp::change_property32(wm, a._NET_SUPPORTING_WM_CHECK, xp::ATOM_WINDOW, &[wm]), None);
         self.send(xp::change_property32(root, a._NET_SUPPORTING_WM_CHECK, xp::ATOM_WINDOW, &[wm]), None);
         self.send(xp::change_property(wm, a._NET_WM_NAME, a.UTF8_STRING, 8, b"bitscomp"), None);
-        let supported = [a._NET_WM_NAME, a._NET_WM_PID, a._NET_SUPPORTING_WM_CHECK, a._NET_ACTIVE_WINDOW];
+        let supported = [a._NET_WM_NAME, a._NET_WM_PID, a._NET_SUPPORTING_WM_CHECK, a._NET_ACTIVE_WINDOW, a._NET_WM_STATE, a._NET_WM_STATE_FULLSCREEN];
         self.send(xp::change_property32(root, a._NET_SUPPORTED, xp::ATOM_ATOM, &supported), None);
         if self.xfixes != 0 {
             self.send(xp::ext_query_version(self.xfixes, 5, 0), Some(Want::Ignore));
@@ -242,6 +247,7 @@ impl Xwm {
         self.ready = true;
         self.conn.flush();
         eprintln!("bitscomp: xwm: window manager ready (composite {} xfixes {} xres {})", self.composite, self.xfixes, self.xres);
+        eprintln!("bitscomp: xwm: DRI3 is {}", if self.dri3 { "offered" } else { "not offered" });
         app.needs_frame = true;
     }
 
@@ -318,6 +324,10 @@ impl Xwm {
                 if ty == self.atoms.WL_SURFACE_ID {
                     self.ids.insert(u32_at(e, 12), win);
                     self.match_ids(app);
+                } else if ty == self.atoms._NET_WM_STATE
+                    && [u32_at(e, 16), u32_at(e, 20)].contains(&self.atoms._NET_WM_STATE_FULLSCREEN)
+                {
+                    self.state_message(app, win, u32_at(e, 12));
                 }
             }
             xp::SELECTION_REQUEST | xp::SELECTION_NOTIFY | xp::SELECTION_CLEAR => crate::xsel::event(self, app, e),
@@ -326,14 +336,46 @@ impl Xwm {
         }
     }
 
+    /// EWMH `_NET_WM_STATE`: 0 remove, 1 add, 2 toggle. Before the window shows, it is remembered for `try_show`.
+    fn state_message(&mut self, app: &mut App, win: u32, action: u32) {
+        let Some(x) = self.wins.get(&win).cloned() else { return };
+        let Some(w) = self.shown.get(&win).cloned() else {
+            x.wants_full.set(match action {
+                0 => false,
+                1 => true,
+                _ => !x.wants_full.get(),
+            });
+            return;
+        };
+        let on = match action {
+            0 => false,
+            1 => true,
+            _ => !app.ws.is_fullscreen(&w),
+        };
+        app.window_fullscreen(&w, on);
+    }
+
+    /// What a window hears of its state: every way out of fullscreen (the focus moved, a key) ends here too.
+    fn tell_states(&mut self, app: &App) {
+        let a = self.atoms.clone();
+        let told: Vec<(u32, bool)> = self.shown.iter().filter(|(_, w)| w.x11().is_some_and(|x| !x.override_redirect && x.full_told.get() != app.ws.is_fullscreen(w))).map(|(id, w)| (*id, app.ws.is_fullscreen(w))).collect();
+        for (id, on) in told {
+            let values = if on { &[a._NET_WM_STATE_FULLSCREEN][..] } else { &[][..] };
+            self.send(xp::change_property32(id, a._NET_WM_STATE, xp::ATOM_ATOM, values), None);
+            if let Some(x) = self.wins.get(&id) {
+                x.full_told.set(on);
+            }
+        }
+    }
+
     fn tracked(&self, atom: u32) -> bool {
         let a = &self.atoms;
-        [xp::ATOM_WM_CLASS, xp::ATOM_WM_NAME, a._NET_WM_NAME, a.WM_PROTOCOLS, xp::ATOM_WM_TRANSIENT_FOR, xp::ATOM_WM_HINTS].contains(&atom)
+        [xp::ATOM_WM_CLASS, xp::ATOM_WM_NAME, a._NET_WM_NAME, a.WM_PROTOCOLS, a._NET_WM_STATE, xp::ATOM_WM_TRANSIENT_FOR, xp::ATOM_WM_HINTS].contains(&atom)
     }
 
     fn read_props(&mut self, w: u32) {
         let a = self.atoms.clone();
-        for atom in [xp::ATOM_WM_CLASS, a._NET_WM_NAME, xp::ATOM_WM_NAME, a.WM_PROTOCOLS, xp::ATOM_WM_TRANSIENT_FOR, xp::ATOM_WM_HINTS, a._NET_WM_PID] {
+        for atom in [xp::ATOM_WM_CLASS, a._NET_WM_NAME, xp::ATOM_WM_NAME, a.WM_PROTOCOLS, a._NET_WM_STATE, xp::ATOM_WM_TRANSIENT_FOR, xp::ATOM_WM_HINTS, a._NET_WM_PID] {
             self.send(xp::get_property(false, w, atom, 1024), Some(Want::Prop(w, atom)));
         }
         if self.xres != 0 {
@@ -404,6 +446,11 @@ impl Xwm {
             x.takes_focus.set(list.contains(&a.WM_TAKE_FOCUS));
         } else if atom == xp::ATOM_WM_TRANSIENT_FOR {
             x.transient_for.set(p.u32s().first().copied().unwrap_or(0));
+        } else if atom == a._NET_WM_STATE {
+            // A client's state for its map (EWMH); once it shows, the state is bitscomp's to write.
+            if !self.shown.contains_key(&win) {
+                x.wants_full.set(p.u32s().contains(&a._NET_WM_STATE_FULLSCREEN));
+            }
         } else if atom == xp::ATOM_WM_HINTS {
             // ICCCM 4.1.2.4: flags bit 0 (InputHint) says whether the second field (input) counts.
             let v = p.u32s();
@@ -463,8 +510,11 @@ impl Xwm {
             x.claimed_pid.get(),
             crate::ctl::win_id(&win)
         );
-        app.place_new(win);
+        app.place_new(win.clone());
         app.layout_dirty = true;
+        if x.wants_full.get() {
+            app.window_fullscreen(&win, true);
+        }
         if x.pid.get() > 0 {
             app.x11_mapped(x.pid.get());
         }
@@ -493,6 +543,7 @@ impl Xwm {
             self.conn.flush();
             return;
         }
+        self.tell_states(app);
         let a = self.atoms.clone();
         let wins: Vec<(u32, Window)> = self.shown.iter().map(|(k, v)| (*k, v.clone())).collect();
         for (w, win) in wins {

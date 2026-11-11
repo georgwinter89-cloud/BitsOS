@@ -1,7 +1,7 @@
 //! DS-4 host tests of the desktop start's decisions (`desktop.rs`): waiting for init, one start's outcome and
 //! what follows it (the 3-failure fallback without QEMU).
 
-use crate::desktop::{ATTEMPTS, InitWait, Next, Outcome, TAKE_SCREEN_NS, WAIT_INIT_NS, init_wait, next, poll};
+use crate::desktop::{ATTEMPTS, Hold, InitWait, Next, Outcome, TAKE_SCREEN_NS, WAIT_INIT_NS, hold_wait, init_wait, next, poll};
 use console::bootsteps::Init;
 
 /// Runs the start loop's decisions over one outcome per attempt; returns what ended it and the attempts used.
@@ -61,4 +61,14 @@ fn init_off_given_up_or_late_means_no_desktop() {
     assert_eq!(init_wait(Init::Running, false, 1), InitWait::Wait);
     assert_eq!(init_wait(Init::Running, false, WAIT_INIT_NS + 1), InitWait::Timeout);
     assert_eq!(init_wait(Init::Unknown, false, WAIT_INIT_NS + 1), InitWait::Timeout);
+}
+
+/// GX-8c: a driver's hold keeps the start back to its bound, no longer.
+#[test]
+fn hold() {
+    assert_eq!(hold_wait(None, 0), Hold::Free);
+    assert_eq!(hold_wait(None, u64::MAX), Hold::Free);
+    assert_eq!(hold_wait(Some(100), 0), Hold::Wait);
+    assert_eq!(hold_wait(Some(100), 100), Hold::Wait);
+    assert_eq!(hold_wait(Some(100), 101), Hold::Over);
 }

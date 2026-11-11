@@ -1,0 +1,93 @@
+semget no key = -ENOENT
+semget negative = -EINVAL
+semget over semmsl = -EINVAL
+semget zero create = -EINVAL
+semget private zero = -EINVAL
+semget create = 0
+semget again = 0
+semget zero nsems finds = 0
+semget excl = -EEXIST
+semget more = -EINVAL
+semget writable mode ok = 0
+second id = 1
+IPC_STAT = 0
+stat key 51c0de00 mode 640 nsems 3 uid 0 gid 0 cuid 0 cgid 0 seq 0 otime0 1 ctime 1
+IPC_STAT fault = -EFAULT
+IPC_STAT stale = -EINVAL
+IPC_STAT negative = -EINVAL
+bad cmd = -EINVAL
+old IPC_64 cmd = -EINVAL
+IPC_INFO = 1
+info 1024000000 32000 1024000000 1024000000 32000 500 500 20 32767 32767 (max 1)
+SEM_INFO = 1
+sem_info usz 2 aem 4
+IPC_INFO fault = -EFAULT
+SEM_STAT index 0 = 0
+SEM_STAT index 2 = -EINVAL
+SEM_STAT_ANY index 1 = 1
+SETVAL = 0
+GETVAL = 7
+GETVAL other = 0
+GETVAL bad num = -EINVAL
+GETVAL negative num = -EINVAL
+SETVAL range = -ERANGE
+SETVAL negative = -ERANGE
+SETVAL max = 0
+SETVAL bad num = -EINVAL
+GETPID is me: yes
+GETPID untouched = 0
+GETNCNT = 0
+GETZCNT = 0
+SETALL = 0
+GETALL = 0
+all 1 2 3
+GETALL fault = -EFAULT
+SETALL fault = -EFAULT
+SETALL range = -ERANGE
+GETVAL after refused SETALL = 1
+all or nothing EAGAIN = -EAGAIN
+GETALL unchanged = 0
+all 1 2 3
+list goes = 0
+GETALL = 0
+all 0 0 4
+otime stat = 0
+otime set 1
+nsops 0 = -EINVAL
+nsops over = -E2BIG
+bad array = -EFAULT
+negative id = -EINVAL
+bad id = -EINVAL
+EFBIG = -EFBIG
+ERANGE = 0
+same semaphore twice = -ERANGE
+twice, second blocks = -ERANGE
+value rolled back = 32767
+zero wait NOWAIT nonzero = 0
+zero NOWAIT = -EAGAIN
+timed out = -EAGAIN
+bad timespec = -EINVAL
+negative timespec = -EINVAL
+timespec fault = -EFAULT
+bad timespec, nsops first = -EINVAL
+timed, can go = 0
+IPC_SET mode 0 = 0
+IPC_SET fault = -EFAULT
+semget no rights = -EACCES
+semget flag 0 passes = 0
+GETVAL no rights = -EACCES
+SETVAL no rights = -EACCES
+GETALL no rights = -EACCES
+SETALL no rights = -EACCES
+IPC_STAT no rights = -EACCES
+SEM_STAT no rights = -EACCES
+SEM_STAT_ANY no rights = 0
+semop no rights = -EACCES
+IPC_SET unmapped uid = -EINVAL
+IPC_RMID = 0
+IPC_RMID again = -EINVAL
+key free again = -ENOENT
+key made again = 2
+new id differs: 1
+old id after reuse = -EINVAL
+id after cycling 32778

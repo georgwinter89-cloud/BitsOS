@@ -15,15 +15,15 @@ use ktest::{kassert, ktest};
 
 type R = ktest::TestResult;
 
-ktest!("pc.optin.command_unchanged", Safe, optin_command_unchanged);
-ktest!("pc.optin.net_drivers_off", Safe, net_drivers_off);
+ktest!("pc.optin.command_unchanged", QemuAll, optin_command_unchanged);
+ktest!("pc.optin.net_drivers_off", Run("pc/30-bind"), net_drivers_off);
 ktest!("pc.bind.one_per_function", Safe, one_per_function);
 ktest!("pc.bind.order", QemuOnly, bind_order);
 ktest!("pc.bind.remove_reprobe", QemuOnly, remove_reprobe);
 ktest!("pc.bind.busy", QemuOnly, busy_refusals);
 ktest!("pc.bind.gone_during_probe", QemuOnly, gone_during_probe);
 ktest!("pc.rescan.keeps_bound", Safe, rescan_keeps_bound);
-ktest!("pc.storage.raw_write_refused", Safe, storage_raw_write_refused);
+ktest!("pc.storage.raw_write_refused", QemuAll, storage_raw_write_refused);
 ktest!("pc.sysfs.view", Safe, sysfs_view);
 
 /// q35's ICH9 LPC bridge (00:1f.0, class 06 01 00): no BitsOS driver matches it.
@@ -40,7 +40,7 @@ fn optin_command_unchanged() -> R {
     let nodes = crate::tree();
     let opted_out: Vec<&Node> = nodes.iter().filter(|n| n.untouched.is_some()).collect();
     if opted_out.is_empty() {
-        return ktest::skip("no function is untouched on this machine (no WLAN, no test key)");
+        return ktest::fail("no function is untouched on this machine (no WLAN, no test key)");
     }
     for n in opted_out {
         let f = n.function();
@@ -61,15 +61,15 @@ fn optin_command_unchanged() -> R {
 
 /// BT-5 safe mode: with `net_drivers=off` every network-class function (QEMU: the virtio-net card) is
 /// untouched by that key, keeps the command register the firmware left and has no driver. Without the key
-/// it skips; run it with `cargo xtask ktest pc.optin --config-extra net_drivers=off`.
+/// it fails; run it with `cargo xtask ktest pc.optin --config-extra net_drivers=off`.
 fn net_drivers_off() -> R {
     if !registry::net_kept_off(0x02_00_00, registry::config_value("net_drivers").as_deref()) {
-        return ktest::skip("net_drivers is not off in this boot's CONFIG");
+        return ktest::fail("net_drivers is not off in this boot's CONFIG");
     }
     let nodes = crate::tree();
     let nets: Vec<&Node> = nodes.iter().filter(|n| n.class >> 16 == 0x02).collect();
     if nets.is_empty() {
-        return ktest::skip("no network-class function on this machine");
+        return ktest::fail("no network-class function on this machine");
     }
     for n in nets {
         kassert!(n.untouched == Some("net_drivers") || n.untouched == Some("wlan"), "{} untouched by {:?}", n.loc, n.untouched);
@@ -98,7 +98,7 @@ fn check_order(n: &Node, b: &crate::Binding, cands: &[Candidate]) -> R {
 fn one_per_function() -> R {
     let all = crate::bindings();
     if all.is_empty() {
-        return ktest::skip("no driver bound on this machine");
+        return ktest::fail("no driver bound on this machine");
     }
     let cands = registry::registered();
     kassert!(registry::duplicates(&cands).is_empty(), "duplicate driver names: {:?}", registry::duplicates(&cands));
@@ -165,7 +165,7 @@ fn reset() {
 /// Exact ID before class, a narrow class before a wide one, whatever order the list has; one driver only;
 /// a second probe is refused without calling any driver; a failed probe hands over to the next driver.
 fn bind_order() -> R {
-    let Some(n) = lpc() else { return ktest::skip("no free ICH9 LPC bridge (QEMU q35 only)") };
+    let Some(n) = lpc() else { return ktest::fail("no free ICH9 LPC bridge (QEMU q35 only)") };
     reset();
     let cands = [
         Candidate { name: "ktest-wide", matches: &[Match::Class { class: 0x06_00_00, mask: 0xFF_00_00 }], opt_in_key: None, probe: wide_probe },
@@ -232,7 +232,7 @@ fn nohook_probe(_: &PciFunction) -> Result<(), String> {
 /// frees the record; the function can be probed again (a fresh record); a driver without a remove hook
 /// cannot be removed.
 fn remove_reprobe() -> R {
-    let Some(n) = lpc() else { return ktest::skip("no free ICH9 LPC bridge (QEMU q35 only)") };
+    let Some(n) = lpc() else { return ktest::fail("no free ICH9 LPC bridge (QEMU q35 only)") };
     let at = n.loc;
     let f = n.function();
     let orig = f.command();
@@ -293,7 +293,7 @@ fn busy_probe(f: &PciFunction) -> Result<(), String> {
 /// The `Busy` contract: `remove` and `probe` of a function whose probe runs, `remove` and `enable_device`
 /// from inside its remove hook, and a second `rescan` while one runs are all refused at once.
 fn busy_refusals() -> R {
-    let Some(n) = lpc() else { return ktest::skip("no free ICH9 LPC bridge (QEMU q35 only)") };
+    let Some(n) = lpc() else { return ktest::fail("no free ICH9 LPC bridge (QEMU q35 only)") };
     let at = n.loc;
     let f = n.function();
     let orig = f.command();
@@ -343,7 +343,7 @@ fn vanishing_probe(f: &PciFunction) -> Result<(), String> {
 /// A function that vanishes during its own probe: the rescan's removal is deferred, and the probe's end
 /// runs the hook and frees the record instead of binding a driver to a function that is not there.
 fn gone_during_probe() -> R {
-    let Some(n) = lpc() else { return ktest::skip("no free ICH9 LPC bridge (QEMU q35 only)") };
+    let Some(n) = lpc() else { return ktest::fail("no free ICH9 LPC bridge (QEMU q35 only)") };
     let at = n.loc;
     let f = n.function();
     GONE_ACTION.store(0, Ordering::SeqCst);
@@ -403,7 +403,7 @@ fn storage_raw_write_refused() -> R {
         .filter(|n| n.is_storage() && n.untouched.is_none() && bind::bound_driver(n.loc) != Some(crate::optin::STORAGE_DRIVER))
         .collect();
     if disks.is_empty() {
-        return ktest::skip("no mass-storage function without the NVMe driver");
+        return ktest::fail("no mass-storage function without the NVMe driver");
     }
     for n in disks {
         let f = n.function();

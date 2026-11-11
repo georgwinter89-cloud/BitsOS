@@ -124,14 +124,14 @@ fn stamps() -> TestResult {
     kassert!(settle(), "USB did not settle");
     let pipes = start_pipes()?;
     if pipes.is_empty() {
-        return ktest::skip("no unbound HID device (usbhid_raw=on, scenario us/60-ev.sh)");
+        return ktest::fail("no unbound HID device (usbhid_raw=on, scenario us/60-ev.sh)");
     }
     // `check` names the pipe that fell short if 10 s were not enough.
     until(10_000 * MS, || pipes.iter().all(|p| p.flow.reports.load(Ordering::Acquire) >= 200));
     stop_pipes(&pipes);
     check(&pipes, 200)
 }
-ktest!("us.ev.stamps", QemuOnly, stamps);
+ktest!("us.ev.stamps", Run("us/60-ev"), stamps);
 
 // ---- us.ev.flood_read
 
@@ -154,11 +154,11 @@ fn read_span(d: &UsbDisk) -> Result<(u32, u64), String> {
 
 fn flood_read() -> TestResult {
     kassert!(settle(), "USB did not settle");
-    let Some(d) = ready_disks().into_iter().next() else { return ktest::skip("no USB disk with a medium") };
+    let Some(d) = ready_disks().into_iter().next() else { return ktest::fail("no USB disk with a medium") };
     let (crc_quiet, quiet) = read_span(&d)?;
     let pipes = start_pipes()?;
     if pipes.is_empty() {
-        return ktest::skip("no unbound HID device (usbhid_raw=on, scenario us/60-ev.sh)");
+        return ktest::fail("no unbound HID device (usbhid_raw=on, scenario us/60-ev.sh)");
     }
     let before: u64 = pipes.iter().map(|p| p.flow.reports.load(Ordering::Acquire)).sum();
     let r = read_span(&d);
@@ -171,4 +171,4 @@ fn flood_read() -> TestResult {
     kassert!(during > 0, "no report arrived while the stick was read");
     check(&pipes, 1)
 }
-ktest!("us.ev.flood_read", QemuOnly, flood_read);
+ktest!("us.ev.flood_read", Run("us/60-ev"), flood_read);

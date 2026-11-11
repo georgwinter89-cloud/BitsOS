@@ -2,12 +2,12 @@
 # WY-8 with the real browser on the host (headless back end, nothing on the screen): Brave 1.97.59 from
 # /opt/brave-bin with the stick launcher's flags and a fresh profile under the run dir. A page whose whole body is a
 # "video" that goes fullscreen on a click (requestFullscreen, as YouTube's button does): Brave asks bitscomp,
-# covers the whole screen, Esc gives it back; F11 (Brave's own browser fullscreen) the same. Skips without Brave.
+# covers the whole screen, Esc gives it back; F11 (Brave's own browser fullscreen) the same. Red without Brave.
 set -euo pipefail
 
 ROOT=${BITSOS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
 BRAVE=${BRAVE_BIN:-/opt/brave-bin/brave}
-[ -x "$BRAVE" ] || { echo "SKIP (not run, counts as green): no Brave at $BRAVE"; exit 0; }
+[ -x "$BRAVE" ] || { echo "FAIL: no Brave at $BRAVE (no test is skipped, Georg 30.10.)"; exit 1; }
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 # Short: the compositor's socket path has a length limit.
 RUN=${BITSOS_RUN_DIR:-$CARGO_TARGET_DIR/wy91}

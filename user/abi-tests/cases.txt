@@ -114,6 +114,12 @@ abi-wow64 fork
 abi-wow64 exec
 abi-wow64 hostile
 abi-wow64 ldtr
+abi-wine reserve
+abi-wine faults
+abi-wine gs
+abi-wine suspend
+abi-wine fsync
+abi-wine seccomp
 abi-sig2 signalfd
 abi-sig2 restart
 abi-sig2 suspend
@@ -247,10 +253,17 @@ abi-drm-va
 abi-drm-cs
 # DR-9: BO_LIST, FENCE_TO_HANDLE, INFO GPUVM_FAULT (CachyOS: the real GPU, no job ever exists; V2: the fake).
 abi-drm-list
+# GX-8b: real jobs on the rings, only with the word `run`: never on CachyOS's GPU, so the plain run here says that and leaves.
+abi-drm-jobs
 abi-ntsync
 abi-ntsync threads
 # PF-1: read path check only (plan/notes/fs-PF-1.md); `abi-pfread bench` measures and never goes here
 abi-pfread check
+# PF-7: the credentials, the cwd and the fd count from the very next call (plan/notes/fs-PF-7.md)
+abi-pfcalls ids
+abi-pfcalls idsns
+abi-pfcalls cwd
+abi-pfcalls fds
 # PF-4: read/pread into a buffer whose later part faults stop at that page, every byte checked (fs-PF-4.md)
 abi-pffault
 # PF-3: close and dup2/dup3 against threads using the same numbers (plan/notes/fs-PF-3.md)
@@ -261,3 +274,23 @@ abi-fdrace locks
 abi-fdrace exec
 abi-fdrace range
 abi-fdrace unshare
+abi-sysv-sem basic
+abi-sysv-sem order
+abi-sysv-sem signals
+abi-sysv-sem undo
+abi-sysv-sem undoexec
+abi-sysv-sem seccomp
+abi-sysv-sem plain
+abi-sysv-shm basic
+abi-sysv-shm attach
+abi-sysv-shm life
+abi-sysv-shm exec
+abi-sysv-shm limits
+abi-sysv-shm plain
+abi-sysv-msg basic
+abi-sysv-msg block
+abi-sysv-msg plain
+abi-sysv-ns ns
+abi-sysv-ns proc
+abi-sysv-ns plainproc
+abi-fadvise

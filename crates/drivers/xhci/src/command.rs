@@ -2,7 +2,7 @@
 //! without an answer aborts the ring (CRCR.CA), which is then set up afresh so only that command fails (V1
 //! `xhcicmd.asm`). A controller that halted, reports HSE or does not stop its ring is parked.
 
-use crate::hc::{CmdCompletion, CmdError, Controller, Env, Source, State, ABORT_NS, CMD_GATE_NS, CMD_NS, FALLBACK_NS, MS};
+use crate::hc::{CmdCompletion, CmdError, Controller, Env, Source, State, ABORT_NS, CMD_GATE_NS, CMD_NS, FALLBACK_NS, LATE_LOOK_NS, MS};
 use crate::regs::{self, crcr, sts};
 use crate::trb::{cc, Trb};
 use alloc::format;
@@ -71,6 +71,18 @@ impl<E: Env> Controller<E> {
         self.process_events(Source::Waiter);
         if let Some(d) = self.take_done() {
             return result(d);
+        }
+        // The clock alone does not decide (US-R): the event thread may be draining right now.
+        let late = self.now().saturating_add(LATE_LOOK_NS);
+        while self.now() < late {
+            self.wait_for_done(start, late - self.now());
+            if let Some(d) = self.take_done() {
+                return result(d);
+            }
+            if self.state() != State::Running {
+                self.clear_pending();
+                return Err(CmdError::ControllerFailed);
+            }
         }
         self.abort(trb.trb_type())
     }

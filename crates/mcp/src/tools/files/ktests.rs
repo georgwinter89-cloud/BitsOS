@@ -103,6 +103,7 @@ fn files_refusals() -> TestResult {
         refused(c, "delete", r#"{"path":"/"}"#, "does not name an entry")?;
         c.ok("write_file", &format!(r#"{{"path":"{d}/CONFIG.TXT","text":"token=x\n","parents":true}}"#))?;
         refused(c, "write_file", &format!(r#"{{"path":"{d}/CONFIG.TXT","text":"nvme_write=on\n","append":true}}"#), "R8a")?;
+        refused(c, "write_file", &format!(r#"{{"path":"{d}/CONFIG.TXT","text":"nvme_data=S:G:1:2\n","append":true}}"#), "R8a")?;
         refused(c, "write_file", &format!(r#"{{"path":"{d}/CONFIG.TXT","text":"stick_write=on"}}"#), "R8a")?;
         let j = json(c, "read_file", &format!(r#"{{"path":"{d}/CONFIG.TXT","encoding":"text"}}"#))?;
         kassert!(j.get("text").and_then(Json::as_str) == Some("token=x\n"), "unchanged: {}", j.to_string());
@@ -136,7 +137,7 @@ ktest!("mc.files.refusals", Safe, files_refusals);
 fn config_redacted() -> TestResult {
     const CFG: &str = "/boot/BITSOS2/CONFIG.TXT";
     let Ok(raw) = vfs::root_ns().read_file(CFG, 1 << 20) else {
-        return ktest::skip("no /boot/BITSOS2/CONFIG.TXT");
+        return ktest::fail("no /boot/BITSOS2/CONFIG.TXT");
     };
     let want = fs_fat::protect::redact_config(&raw);
     with_server(PORT, TOOLS.entries(), |c| {

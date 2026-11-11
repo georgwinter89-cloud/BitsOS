@@ -22,7 +22,7 @@ const MASK: u32 = libc::IN_CREATE | libc::IN_ATTRIB | libc::IN_DELETE | libc::IN
 
 /// Starts watching `dir`: `scan` runs on every change and returns whether a node waits for another try.
 pub fn watch(handle: &LoopHandle<'static, App>, dir: &str, scan: Rc<dyn Fn() -> bool>) -> Result<(), String> {
-    match inotify(dir) {
+    match inotify(dir, MASK) {
         Ok(file) => {
             let retry = Rc::new(Cell::new(false));
             let (h, s, r) = (handle.clone(), scan.clone(), retry.clone());
@@ -56,7 +56,8 @@ pub fn watch(handle: &LoopHandle<'static, App>, dir: &str, scan: Rc<dyn Fn() -> 
     }
 }
 
-fn inotify(dir: &str) -> std::io::Result<File> {
+/// An inotify instance (non-blocking) watching `dir` for `mask`; PK-L1a's library watches its folders with it too.
+pub fn inotify(dir: &str, mask: u32) -> std::io::Result<File> {
     // SAFETY: plain syscalls; the fd is owned by the File from here on.
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
     if fd < 0 {
@@ -66,7 +67,7 @@ fn inotify(dir: &str) -> std::io::Result<File> {
     let file = unsafe { File::from_raw_fd(fd) };
     let path = CString::new(dir).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: `path` is a valid C string for the call's duration.
-    if unsafe { libc::inotify_add_watch(fd, path.as_ptr(), MASK) } < 0 {
+    if unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(file)
@@ -74,7 +75,7 @@ fn inotify(dir: &str) -> std::io::Result<File> {
 
 /// Reads every queued event (their content does not matter: the scan looks at the directory); true when the
 /// watch ended (IN_IGNORED: the directory went away).
-fn drain(fd: i32) -> bool {
+pub fn drain(fd: i32) -> bool {
     let mut buf = [0u8; 4096];
     let mut gone = false;
     loop {

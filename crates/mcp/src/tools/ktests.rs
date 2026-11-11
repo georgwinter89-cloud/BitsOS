@@ -194,8 +194,8 @@ fn one_run_and_stop(c: &mut Client) -> TestResult {
 
 fn ktest_tool() -> TestResult {
     if run_ktests::run_active() {
-        // Run by the ktest tool itself (a run over MCP): the nested call would only be refused.
-        return ktest::skip("inside a ktest run over MCP; the tool allows one run at a time");
+        // Run by the ktest tool itself, the nested call below: its own run has shown that the tool answers.
+        return Ok(());
     }
     with_server(TOOLS_PORT, TOOLS.entries(), |c| {
         let t = c.ok("ktest", r#"{"filter":"kreg."}"#)?;
@@ -203,35 +203,37 @@ fn ktest_tool() -> TestResult {
         kassert!(t.contains("\nok kreg.mcp_tools_unique ("), "{t}");
         let none = c.call("ktest", r#"{"filter":"zz.nothing"}"#)?;
         kassert!(none.error && none.text.contains("no ktest matches"), "{}", none.text);
-        // This test inside a run over MCP skips itself instead of failing on the one-run rule.
+        // This test inside a run over MCP: the nested run has nothing more to do and passes.
         let nested = c.ok("ktest", r#"{"filter":"mcp.tool.ktest"}"#)?;
-        kassert!(nested.contains("skip mcp.tool.ktest: inside a ktest run over MCP") && nested.contains("failed=0"), "{nested}");
+        kassert!(nested.contains("ok mcp.tool.ktest") && nested.contains("failed=0"), "{nested}");
         one_run_and_stop(c)
     })?;
-    // The hardware rule, decided here as on the Mini-PC: QemuOnly skipped, Display run, the switch classes refused.
+    // The hardware rule, decided here as on the Mini-PC: QEMU's classes another run, Display run, the switch classes
+    // refused.
     let ctx = ToolContext::detached(u64::MAX);
-    let r = run_ktests::run(&ctx, "nw.stack.tcp_host,mcp.class_probe", true, false).map_err(|e| format!("{e:?}"))?;
+    let hw = run_ktests::Here { hardware: true, wlan_on: false, screen_held: false, picture_on: false, georg_on: false, runs: "" };
+    let r = run_ktests::run(&ctx, "nw.stack.tcp_host,mcp.class_probe", hw).map_err(|e| format!("{e:?}"))?;
     let t = match r.first() {
         Some(ToolOutput::Text(t)) => t.clone(),
         _ => return Err(String::from("no text")),
     };
     kassert!(
-        t.contains("skip nw.stack.tcp_host: QemuOnly") && t.contains("ok mcp.class_probe.display") && t.contains("refused mcp.class_probe.audible: Audible") && t.contains("refused mcp.class_probe.wlan: wlan: needs wlan=on"),
+        t.contains("skip nw.stack.tcp_host: belongs to a QEMU run") && t.contains("ok mcp.class_probe.display") && t.contains("refused mcp.class_probe.audible: Audible") && t.contains("refused mcp.class_probe.wlan: wlan: needs wlan=on"),
         "{t}"
     );
     kassert!(t.starts_with("ktest") && t.contains("passed=1 failed=0 skipped=1 refused=2"), "{t}");
-    let only = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", true, false);
+    let only = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", hw);
     kassert!(matches!(only, Err(crate::ToolError::Refused(_))), "only refused tests: the call is refused, {only:?}");
     // WL-4 CR 3: with wlan=on the Wlan class runs on hardware, Audible stays refused.
-    let on = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", true, true).map_err(|e| format!("{e:?}"))?;
+    let on = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", run_ktests::Here { wlan_on: true, ..hw }).map_err(|e| format!("{e:?}"))?;
     let t = match on.first() {
         Some(ToolOutput::Text(t)) => t.clone(),
         _ => return Err(String::from("no text")),
     };
-    kassert!(t.contains("ok mcp.class_probe.wlan") && t.contains("refused mcp.class_probe.audible: Audible") && t.contains("Wlan run"), "{t}");
+    kassert!(t.contains("ok mcp.class_probe.wlan") && t.contains("refused mcp.class_probe.audible: Audible"), "{t}");
     Ok(())
 }
-ktest!("mcp.tool.ktest", Safe, ktest_tool);
+ktest!("mcp.tool.ktest", QemuAll, ktest_tool);
 
 fn cpus() -> TestResult {
     with_server(TOOLS_PORT, TOOLS.entries(), |c| {

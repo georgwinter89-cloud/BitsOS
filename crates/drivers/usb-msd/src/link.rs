@@ -54,8 +54,12 @@ pub const CBW_TIMEOUT_NS: u64 = 5_000_000_000;
 pub const CSW_TIMEOUT_NS: u64 = 20_000_000_000;
 pub const DATA_TIMEOUT_PER_64K_NS: u64 = 10_000_000_000;
 
+/// The most a data phase may take (Linux's 30 s per command, sd.h SD_TIMEOUT). US-R: 10 s per 64 KiB alone would give a
+/// 1 MiB command 160 s, more than the gate's and the block layer's 120 s; a phase that moves is not timed out anyway.
+pub const DATA_TIMEOUT_MAX_NS: u64 = 30_000_000_000;
+
 pub fn data_timeout_ns(len: usize) -> u64 {
-    (len.div_ceil(65536).max(1) as u64).saturating_mul(DATA_TIMEOUT_PER_64K_NS)
+    (len.div_ceil(65536).max(1) as u64).saturating_mul(DATA_TIMEOUT_PER_64K_NS).min(DATA_TIMEOUT_MAX_NS)
 }
 
 pub trait Link: Send + Sync {
@@ -71,6 +75,18 @@ pub trait Link: Send + Sync {
     fn abort_all(&self);
     /// Bulk-Only Mass Storage Reset (class request FFh to the interface).
     fn bot_reset(&self) -> Result<(), UsbError>;
+    /// The device's port reset and the device set up again in place: the same device, its endpoints at toggle 0,
+    /// everything queued ended (`usb_core::reset`). `power`: its port's power off and on first where that exists.
+    /// `wait_ns`: the longest this call waits for it. `Gone`: another device is there or none. `Invalid`: this cannot
+    /// be done on this device at all.
+    fn port_reset(&self, _power: bool, _wait_ns: u64) -> Result<(), UsbError> {
+        Err(UsbError::Invalid("no port reset on this link"))
+    }
+    /// Nothing more to try: asks for the device to be detached and its port enumerated afresh. False: this link
+    /// cannot do that, the device stays and the next command starts over.
+    fn give_up(&self) -> bool {
+        false
+    }
     /// GET MAX LUN (class request FEh): the highest LUN.
     fn max_lun(&self) -> Result<u8, UsbError>;
     /// The device was detached.

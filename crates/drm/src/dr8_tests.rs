@@ -363,6 +363,27 @@ fn dr8_priority_orders_ready_jobs() {
 }
 
 #[test]
+fn dr8_compute_refuses_a_nested_ib_without_its_upper_bits() {
+    const HIGH: u64 = 0xffff_8000_0010_0000;
+    let run = |ip: u32, hi: u32| {
+        let fx = Fx::new();
+        let c = ctx_alloc(&fx, 0, 0, ME).unwrap();
+        let inner = fx.create_in(0, 4096, 0, GTT, 0).unwrap();
+        map(&fx, 0, inner, HIGH, 4096, RW);
+        let mut p = Vec::new();
+        pm4::write_data(&mut p, pm4::dst_sel::MEM, OUT, 0, &[0xabcd]).unwrap();
+        let b: Vec<u8> = p.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(fx.f(0).drm_file().bo(inner).unwrap().write(0, &b));
+        let (h, dw) = setup(&fx, 0, &[pm4::packet3(pm4::op::INDIRECT_BUFFER, 2), HIGH as u32, hi, p.len() as u32]);
+        cs(&fx, c, &[ib(ip, 0, V, dw, 0)]).unwrap();
+        (fx.gpu.cs_stats().1, read(&fx, h, 0x800, 4) == 0xabcdu32.to_le_bytes())
+    };
+    assert_eq!(run(AMDGPU_HW_IP_COMPUTE, 0xffff_8000), (0, true), "sign-extended, as RADV writes it");
+    assert_eq!(run(AMDGPU_HW_IP_COMPUTE, 0x8000), (1, false), "no upper bits: CP_HQD_ERROR.SUA_ERROR on the MEC");
+    assert_eq!(run(AMDGPU_HW_IP_GFX, 0x8000), (0, true), "the GFX queue takes both");
+}
+
+#[test]
 fn dr8_hang_makes_the_context_guilty() {
     let fx = Fx::new();
     let c = ctx_alloc(&fx, 0, 0, ME).unwrap();
@@ -391,6 +412,25 @@ fn dr8_hang_makes_the_context_guilty() {
     let seq = cs(&fx, c4, &[ib(0, 0, V + 0x10_0000, p.len() as u32, 0)]).unwrap();
     assert_eq!(wait_cs(&fx, c4, 0, 0, seq, 0), Err(ETIME), "write to a read-only page");
     assert_eq!(read(&fx, ro, 0x100, 4), [0; 4]);
+    let _ = h;
+}
+
+/// WY-21: `drm_fake_hang=lose`: the hang ends the device as an unrecoverable one on the chip: no new file, no submission.
+#[test]
+fn dr8_a_hang_can_end_the_fake_device() {
+    let fx = Fx::new();
+    fx.gpu.lose_on_hang(true);
+    let c = ctx_alloc(&fx, 0, 0, ME).unwrap();
+    // An unknown PM4 opcode halts the CP.
+    let (h, _) = setup(&fx, 0, &[0xc000_ff00, 0]);
+    assert!(!fx.gpu.lost());
+    let seq = cs(&fx, c, &[ib(0, 0, V, 2, 0)]).unwrap();
+    assert_eq!(wait_cs(&fx, c, 0, 0, seq, 0), Err(ETIME));
+    assert!(fx.gpu.lost());
+    let fresh = ctx_alloc(&fx, 0, 0, ME).unwrap();
+    assert_eq!(cs(&fx, fresh, &[ib(0, 0, V, 2, 0)]), Err(ENODEV), "a lost device takes no job");
+    let opened = crate::node::open_device(fx.dev.clone(), crate::file::MinorKind::Render, false).map(|_| ());
+    assert_eq!(opened, Err(ENODEV), "a lost device takes no new file");
     let _ = h;
 }
 

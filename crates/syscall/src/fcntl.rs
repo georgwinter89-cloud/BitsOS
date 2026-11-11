@@ -80,9 +80,10 @@ fn vfs_call(c: &SysCtx<'_>, f: vfs::sys::SysFn) -> i64 {
 fn with_sys<R>(c: &SysCtx<'_>, f: impl FnOnce(&vfs::sys::Sys<'_>) -> R) -> R {
     let p = c.proc;
     let mem = Mem(p);
-    let fs = c.thread.fs(p);
-    let ns = p.mount_ns();
-    let s = vfs::sys::Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: p.fs_cred(), subject: p.subject() };
+    let fs = proc::ThreadFs::new(c.thread, p);
+    let mut held = None;
+    let ns = p.mount_view(&mut held);
+    let s = vfs::sys::Sys { mem: &mem, fds: &p.fds, fs: &fs, ns, cred: p.fs_cred(), subject: p.subject() };
     f(&s)
 }
 

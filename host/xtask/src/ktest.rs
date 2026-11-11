@@ -66,6 +66,13 @@ impl Summary {
         if let Some(m) = &self.panic {
             p.push(format!("PANIC {m}"));
         }
+        // Georg 30.10.: a test of another run is the only `skip` there is. Any other reason is a test that ended
+        // itself as skipped: not passed, not a run (TS-1).
+        for (n, w) in &self.skips {
+            if !crate::ledger::is_other_run(w) {
+                p.push(format!("SKIP {n}: {w} (a test that cannot do its work is FAIL)"));
+            }
+        }
         match self.done {
             None => p.push("no `KTEST done` line".into()),
             Some((_, f, _)) if f > 0 && self.fails.is_empty() => p.push(format!("done line says failed={f}")),
@@ -103,8 +110,55 @@ fn label(f: &str, i: usize, n: usize) -> String {
     format!("ktest-{i}-{}", if clean.is_empty() { "all".into() } else { clean })
 }
 
+/// Two HDA controllers with a duplex codec each, playing into WAV files of the run (never the host's sound
+/// devices), so the sound ktests (sn.hda.*, sn.mix.two/switch/resample) have their device (SN-2 CR 4, SN-3 CR 1).
+/// Every `xtask ktest` boot has them: inside its run a test without its device is FAIL.
+fn audio_args(root: &Path, name: &str) -> Vec<String> {
+    let dir = root.join("target/xtask/runs/gate-audio");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut v = Vec::new();
+    for i in 0..2 {
+        let wav = dir.join(format!("{name}{i}.wav"));
+        let _ = std::fs::remove_file(&wav);
+        v.extend([
+            "-audiodev".to_string(),
+            format!("wav,id=a{i},path={},out.frequency=48000,out.channels=2,out.format=s16", wav.display()),
+            "-device".to_string(),
+            format!("intel-hda,id=h{i}"),
+            "-device".to_string(),
+            format!("hda-duplex,bus=h{i}.0,audiodev=a{i},mixer=off"),
+        ]);
+    }
+    v
+}
+
+/// One line per kind of class for the tests of other runs: they are many, and their names are in the log.
+fn other_runs_line(s: &Summary) -> Option<String> {
+    let mut m: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for (_, w) in &s.skips {
+        if let Some(c) = w.strip_prefix("class ").and_then(|c| c.strip_suffix(" belongs to another run")) {
+            *m.entry(c).or_insert(0) += 1;
+        }
+    }
+    if m.is_empty() {
+        return None;
+    }
+    Some(m.iter().map(|(c, n)| format!("{c} {n}")).collect::<Vec<_>>().join(", "))
+}
+
 /// Returns Ok when every instance is green.
 pub fn run_ktests(root: &Path, o: &KtestOpts) -> Result<(), String> {
+    run_ktests_summaries(root, o).1
+}
+
+/// `run_ktests`, with what each boot said (the gate's ledger counts them).
+pub fn run_ktests_summaries(root: &Path, o: &KtestOpts) -> (Vec<Summary>, Result<(), String>) {
+    let mut sums = Vec::new();
+    let r = run_boots(root, o, &mut sums);
+    (sums, r)
+}
+
+fn run_boots(root: &Path, o: &KtestOpts, sums: &mut Vec<Summary>) -> Result<(), String> {
     let mut b = o.build;
     b.ktest = true;
     let art = image::build(root, b)?;
@@ -120,6 +174,7 @@ pub fn run_ktests(root: &Path, o: &KtestOpts) -> Result<(), String> {
         // A USB keyboard and tablet on the stick's controller, so the US transfer ktests (us.xfer.timeout,
         // us.xfer.hid_pipes) run in every gate (US-3 change request); extra arguments come after them.
         q.extra = ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-tablet,bus=xhci.0"].iter().map(|s| s.to_string()).collect();
+        q.extra.extend(audio_args(root, &name));
         q.extra.extend(o.extra.iter().cloned());
         q.echo = n == 1;
         let root = root.to_path_buf();
@@ -150,8 +205,8 @@ pub fn run_ktests(root: &Path, o: &KtestOpts) -> Result<(), String> {
             Some((p, f, k)) => println!("ktest {name} filter {fl}: passed={p} failed={f} skipped={k}"),
             None => println!("ktest {name} filter {fl}: ok={} fail={} skip={} (no done line)", s.ok.len(), s.fails.len(), s.skips.len()),
         }
-        for (n, w) in &s.skips {
-            println!("  skip {n}: {w}");
+        if let Some(l) = other_runs_line(&s) {
+            println!("  belongs to another run: {l}");
         }
         for p in &problems {
             println!("  RED: {p}");
@@ -160,6 +215,7 @@ pub fn run_ktests(root: &Path, o: &KtestOpts) -> Result<(), String> {
             println!("  log: {}", r.log.display());
             red = true;
         }
+        sums.push(s);
     }
     if red { Err("ktest: red".into()) } else { println!("ktest: green"); Ok(()) }
 }
@@ -184,17 +240,32 @@ pub fn cmd_ktest(root: &Path, mut a: Args) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const GOOD: &str = "BdsDxe: loading\r\nKTEST start count=3 filter=\r\nKTEST ok mm::alloc (2 ms)\nKTEST skip hw::x: needs hardware\nKTEST FAIL sched::y: expected 3 got 4\nKTEST done passed=1 failed=1 skipped=1\n";
+    const GOOD: &str = "BdsDxe: loading\r\nKTEST start count=3 filter=\r\nKTEST ok mm::alloc (2 ms)\nKTEST skip hw::x: class Hardware belongs to another run\nKTEST FAIL sched::y: expected 3 got 4\nKTEST done passed=1 failed=1 skipped=1\n";
 
     #[test]
     fn parses_all_line_kinds() {
         let s = parse(GOOD);
         assert_eq!(s.started, Some((3, String::new())));
         assert_eq!(s.ok, vec!["mm::alloc"]);
-        assert_eq!(s.skips, vec![("hw::x".to_string(), "needs hardware".to_string())]);
+        assert_eq!(s.skips, vec![("hw::x".to_string(), "class Hardware belongs to another run".to_string())]);
         assert_eq!(s.fails, vec![("sched::y".to_string(), "expected 3 got 4".to_string())]);
         assert_eq!(s.done, Some((1, 1, 1)));
         assert_eq!(s.problems(), vec!["FAIL sched::y: expected 3 got 4"]);
+    }
+
+    #[test]
+    fn a_test_that_skips_itself_is_red() {
+        let s = parse("KTEST start count=2 filter=\nKTEST ok a (1 ms)\nKTEST skip b: no igb card\nKTEST done passed=1 failed=0 skipped=1\n");
+        let p = s.problems();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("SKIP b: no igb card"), "{p:?}");
+    }
+
+    #[test]
+    fn other_runs_are_counted_by_class() {
+        let s = parse("KTEST skip a: class Program belongs to another run\nKTEST skip b: class Program belongs to another run\nKTEST skip c: class Run(\"x/y\") belongs to another run\nKTEST done passed=0 failed=0 skipped=3\n");
+        assert!(s.problems().is_empty());
+        assert_eq!(other_runs_line(&s).unwrap(), "Program 2, Run(\"x/y\") 1");
     }
 
     #[test]

@@ -58,6 +58,9 @@ pub(crate) struct Shared {
     /// FS-12: `Ra::mark` as a reader without the data lock sees it (`NO_MARK`: none): a read that reaches it
     /// takes the data lock for the read-ahead bookkeeping (`ra_note`), every other cached read does not.
     pub(crate) ra_mark: AtomicU64,
+    /// FS-STALL: this cache's id in `reclaim`'s table (0: not reclaimable, e.g. tmpfs): every page put in notes
+    /// (id, index) as its frame's owner, so the heap can free a block by its frames (`reclaim::reclaim_frame`).
+    pub(crate) owner_id: AtomicU64,
 }
 
 /// One look-up of `read_direct`'s locked path: the size then, and the pages from `first` on (None: not cached).
@@ -182,7 +185,12 @@ impl Pages {
             seq: AtomicU64::new(0),
             ra_next: AtomicU64::new(0),
             ra_mark: AtomicU64::new(NO_MARK),
+            owner_id: AtomicU64::new(0),
         }))
+    }
+    /// One more handle on the same index (the empty one every dropped file's state shares).
+    pub(crate) fn handle(&self) -> Pages {
+        Pages(self.0.clone())
     }
     /// The shared part, for a reader that holds no data lock.
     pub(crate) fn shared(&self) -> Arc<Shared> {
@@ -201,11 +209,33 @@ impl Pages {
         self.0.get(i)
     }
     pub(crate) fn prepare(&self, i: u64) -> Result<(), NoRoom> {
-        self.0.index.write().prepare(i).map_err(|_| NoRoom)
+        drop(self.prepared(i)?);
+        Ok(())
+    }
+    /// The write side with the path to `i` built, its nodes allocated with the lock released (`Spare`): the heap
+    /// never allocates under `vfs.inode.index` (a spin lock: it could not take page cache back there).
+    fn prepared(&self, i: u64) -> Result<mm_core::rcu_index::Locked<'_, CachePage, ksync::WriteGuard<'_, ()>>, NoRoom> {
+        let mut spare = mm_core::rcu_index::Spare::new();
+        // Each round adds one node; a path is at most a root and one node per level.
+        for _ in 0..24 {
+            let mut w = self.0.index.write();
+            if w.prepare_from(i, &mut spare).is_ok() {
+                return Ok(w);
+            }
+            drop(w);
+            spare.grow().map_err(|_| NoRoom)?;
+        }
+        Err(NoRoom)
     }
     /// Inserts `v` at `i`; the page that was there, if any, leaves after the lock (through a grace period).
     pub(crate) fn insert(&self, i: u64, v: Arc<CachePage>) -> Result<(), NoRoom> {
-        let old = self.0.index.write().insert(i, v).map_err(|_| NoRoom)?;
+        let id = self.0.owner_id.load(Ordering::Relaxed);
+        if id != 0
+            && let Some(phys) = v.phys()
+        {
+            mm_core::reclaim::set_frame_owner(phys, crate::reclaim::owner_word(id, i));
+        }
+        let old = self.prepared(i)?.insert_prepared(i, v).map_err(|_| NoRoom)?;
         drop(old.map(|r| Gone(Some(r))));
         Ok(())
     }
@@ -225,7 +255,15 @@ impl Pages {
     /// then, for the caller to drop (its frame goes back after a grace period); None when it is missing or held
     /// (a mapping, a locked read). Lockless readers hold no reference: the grace period covers them.
     pub(crate) fn take_alone(&self, i: u64) -> Option<Gone> {
-        let mut w = self.0.index.write();
+        let w = self.0.index.write();
+        self.take_alone_in(w, i)
+    }
+    /// `take_alone` for reclaim: None also when the write side is taken (never waits for it).
+    pub(crate) fn try_take_alone(&self, i: u64) -> Option<Gone> {
+        let w = self.0.index.try_write()?;
+        self.take_alone_in(w, i)
+    }
+    fn take_alone_in<'a>(&'a self, mut w: mm_core::rcu_index::Locked<'a, CachePage, ksync::WriteGuard<'a, ()>>, i: u64) -> Option<Gone> {
         if !w.get(i).is_some_and(|p| p.strong_count() == 1) {
             return None;
         }
@@ -255,11 +293,12 @@ impl Pages {
     pub(crate) fn for_each(&self, f: &mut dyn FnMut(u64, &PageRef<'_>) -> bool) {
         self.0.index.read().for_each(f)
     }
-    /// Takes every page from `from` on out; `f` runs under the write side (keep or count them, take no lock;
-    /// a `Gone` dropped there only goes to the grace queue).
-    pub(crate) fn drain_from(&self, from: u64, f: &mut dyn FnMut(u64, Gone)) {
+    /// Takes pages from `from` on out, at most `max` a call; true while some are left. `f` runs under the write
+    /// side (keep or count them, take no lock, ask the heap for nothing; a `Gone` dropped there only goes to the
+    /// grace queue). Between two steps the caller is outside the write side and may free what a step handed it.
+    pub(crate) fn drain_some(&self, from: u64, max: usize, f: &mut dyn FnMut(u64, Gone)) -> bool {
         let mut w = self.0.index.write();
-        self.0.changing(|| w.drain_from(from, &mut |i, r| f(i, Gone(Some(r)))))
+        self.0.changing(|| w.drain_some(from, max, &mut |i, r| f(i, Gone(Some(r)))))
     }
     /// The size readers see (the data lock's `Inner::size` is set with it, `Inner::set_size`).
     pub(crate) fn set_size(&self, size: u64) {

@@ -59,9 +59,8 @@ echo "ok: drmtrace.so, drmreplay and drmhostile build with -Werror"
 
 NODE=/dev/dri/renderD128
 if [ ! -c "$NODE" ] || [ ! -r "$NODE" ]; then
-    echo "SKIP: no readable $NODE on this host: drmhostile --host and drmreplay not run"
-    echo "GREEN: drmtrace tools (without a render node)"
-    exit 0
+    echo "RED: no readable $NODE on this host: drmhostile --host and drmreplay cannot run"
+    exit 1
 fi
 mkdir "$RUN_DIR/t"
 expect 0 env DRMTRACE_FILE="$RUN_DIR/t/trace-%p.txt" LD_PRELOAD="$RUN_DIR/drmtrace.so" timeout 120 "$RUN_DIR/drmhostile" --host --node "$NODE"
@@ -84,4 +83,7 @@ expect 1 "$RUN_DIR/drmreplay" --quiet --node "$NODE" "$RUN_DIR/head-cut.txt"
 grep -q "not made: damaged" "$RUN_DIR/out.txt" && grep -q ", 1 damaged" "$RUN_DIR/out.txt" \
     || red "replay of a cut trace: $(cat "$RUN_DIR/out.txt")"
 echo "ok: drmreplay plays the hostile trace (nothing differs) and calls a cut line damaged (exit 1)"
+# GM-1d: the Mini-PC run's parsers (vulkaninfo, deqp-vk, the MCP picture) on made-up input.
+python3 -I -B host/tests/gm/tools/test_vkdiff.py > "$RUN_DIR/vkdiff.txt" || { cat "$RUN_DIR/vkdiff.txt"; echo "RED: test_vkdiff.py"; exit 1; }
+echo "ok: vkdiff.py and vk_check.py's picture reader"
 echo "GREEN: drmtrace tools"

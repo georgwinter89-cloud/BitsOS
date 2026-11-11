@@ -63,7 +63,7 @@ fn gone(c: &mut Client, n: u64) -> TestResult {
 /// Until CP-5's timer a CPU busy with a program that never makes a syscall is interrupted only by another CPU
 /// (the poll-duty CPU fires its tick, `nudge` preempts it); with one CPU nobody would.
 pub(super) fn needs_two_cpus() -> Option<TestResult> {
-    (sched::online_cpus() < 2).then(|| ktest::skip("a program that never makes a syscall needs a second CPU until CP-5's timer"))
+    (sched::online_cpus() < 2).then(|| ktest::fail("a program that never makes a syscall needs a second CPU until CP-5's timer"))
 }
 
 /// Pins this test's thread to CPU 0 (as the MCP `ktest` tool runs every test) until dropped, then gives it its

@@ -1,6 +1,6 @@
 //! NW-4 ktests that only mean something while MCP runs (a normal boot with `token=`, the scenario
 //! `host/tests/nw/50-lifeline.sh` calls them through MCP's `ktest` tool; on the Mini-PC the desk does). In a ktest
-//! boot there is no MCP listener and they skip.
+//! boot there is no MCP listener and they fail.
 
 use super::{configured, st, SEC, SLIRP_GW};
 use crate::{Ipv4, KSocket, NetError, SockAddr, TcpStream};
@@ -9,8 +9,12 @@ use alloc::format;
 use alloc::vec::Vec;
 use ktest::{kassert, ktest, TestResult};
 
-/// The scenario's sink: a host server that takes and holds every connection (reached as 10.0.2.2).
-const SINK: SockAddr = SockAddr { ip: SLIRP_GW, port: 24541 };
+/// The scenario's sink: a host server that takes and holds every connection (reached as 10.0.2.2), on a free port of
+/// the run that 50-lifeline.sh gives as `net_test_sink=<port>` in CONFIG.
+fn sink() -> Option<SockAddr> {
+    let port = crate::config("net_test_sink")?.trim().parse().ok()?;
+    Some(SockAddr { ip: SLIRP_GW, port })
+}
 /// How many connections "the program" holds (V2-PLAN §6: 1,000).
 const CONNS: usize = 1000;
 const PLAIN_PORT: u16 = 24986;
@@ -28,25 +32,26 @@ fn mcp_listens(s: &crate::stack::Stack) -> bool {
 fn pressure() -> TestResult {
     let s = st()?;
     if configured(s)?.is_none() {
-        return ktest::skip("no network card");
+        return ktest::fail("no network card");
     }
     if !mcp_listens(s) {
-        return ktest::skip("MCP does not listen (ktest boot): host/tests/nw/50-lifeline.sh calls this over MCP");
+        return ktest::fail("MCP does not listen (ktest boot): host/tests/nw/50-lifeline.sh calls this over MCP");
     }
-    let first = match s.tcp_connect_sized(SINK, Some(3 * SEC), 4096, 4096) {
+    let Some(to) = sink() else { return ktest::fail("no CONFIG net_test_sink (host/tests/nw/50-lifeline.sh sets it)") };
+    let first = match s.tcp_connect_sized(to, Some(3 * SEC), 4096, 4096) {
         Ok(c) => c,
-        Err(_) => return ktest::skip("no sink on 10.0.2.2:24541 (host/tests/nw/50-lifeline.sh starts one)"),
+        Err(_) => return ktest::fail("no sink on 10.0.2.2 (host/tests/nw/50-lifeline.sh starts one and sets CONFIG net_test_sink)"),
     };
     let mut conns: Vec<Box<dyn TcpStream>> = Vec::new();
     conns.try_reserve(CONNS).map_err(|_| "no memory for the connection list")?;
     conns.push(first);
     while conns.len() < CONNS {
-        let c = s.tcp_connect_sized(SINK, Some(10 * SEC), 4096, 4096).map_err(|x| format!("connection {}: {x:?}", conns.len() + 1))?;
+        let c = s.tcp_connect_sized(to, Some(10 * SEC), 4096, 4096).map_err(|x| format!("connection {}: {x:?}", conns.len() + 1))?;
         conns.push(c);
     }
     s.inject_no_memory(u32::MAX, None);
     let r = (|| -> TestResult {
-        let more = s.tcp_connect_sized(SINK, Some(2 * SEC), 4096, 4096);
+        let more = s.tcp_connect_sized(to, Some(2 * SEC), 4096, 4096);
         kassert!(more.as_ref().err() == Some(&NetError::NoMemory), "connection 1,001 without memory: {:?}", more.as_ref().err());
         let l = s.tcp_listen(SockAddr { ip: Ipv4::ANY, port: PLAIN_PORT }, 2);
         kassert!(l.as_ref().err() == Some(&NetError::NoMemory), "a new listener without memory: {:?}", l.as_ref().err());
@@ -66,14 +71,14 @@ fn pressure() -> TestResult {
     drop(conns);
     r
 }
-ktest!("nw.reserve.pressure", QemuOnly, pressure);
+ktest!("nw.reserve.pressure", Run("nw/50-lifeline"), pressure);
 
 /// k1-check (spec net.md §5.2): this CPU computes 20 s without ever yielding while the network keeps answering
 /// from the others (ping, MCP on another connection; the host or the Mini-PC check list watches). Only over MCP.
 fn busy_spin() -> TestResult {
     let s = st()?;
     if !mcp_listens(s) {
-        return ktest::skip("MCP does not listen (ktest boot): run it over MCP while pinging and calling log");
+        return ktest::fail("MCP does not listen (ktest boot): run it over MCP while pinging and calling log");
     }
     let start = time::now_ns();
     let end = start + 20 * SEC;
@@ -85,4 +90,4 @@ fn busy_spin() -> TestResult {
     klog::event!(Info, "net", "ktest.busy_spin", ms = (time::now_ns() - start) / 1_000_000, loops = n);
     Ok(())
 }
-ktest!("nw.busy.spin", Safe, busy_spin);
+ktest!("nw.busy.spin", Run("nw/50-lifeline"), busy_spin);

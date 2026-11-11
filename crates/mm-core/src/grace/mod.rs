@@ -34,6 +34,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::marker::PhantomData;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::compiler_fence;
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering::*};
 use ksync::PreemptGuard;
 
@@ -41,7 +43,7 @@ mod queue;
 mod retire;
 
 pub use queue::{
-    bound_bytes, bound_for_test, defer_arc, defer_box, drain, expedite, expedite_with, kick, pending_bytes, set_kick, stats, waiting,
+    bound_bytes, bound_for_test, defer_arc, defer_arc_nowait, defer_box, drain, expedite, expedite_with, kick, pending_bytes, set_kick, stats, waiting,
     BoundOverride, GraceStats, WaitBudget,
 };
 pub use retire::Retire;
@@ -158,9 +160,16 @@ pub fn enter() -> Option<Section> {
     let slot = claim(me)?;
     let home = if per_cpu_ready() { slot_at(me) } else { None };
     if let Some(h) = home {
-        h.depth.fetch_add(1, Relaxed);
+        depth_add(h, 1);
     }
     Some(Section { slot, home, _cpu: cpu, _not_send: PhantomData })
+}
+
+/// PF-7: `depth` is written only by its CPU, with preemption off. An interrupt between the load and the store has
+/// closed its own section before it returns, so the store writes what the word holds: no locked instruction (a
+/// section is part of every read syscall, twice).
+fn depth_add(h: &Slot, d: u32) {
+    h.depth.store(h.depth.load(Relaxed).wrapping_add(d), Relaxed);
 }
 
 /// Takes a free slot (`hint` first: this CPU's, always free unless sections nest) and pins it at the current
@@ -178,9 +187,16 @@ fn claim(hint: usize) -> Option<&'static Slot> {
             }
             continue;
         };
-        // Pinned at the epoch read before the store; make it the epoch after the fence, so that what the
-        // section loads afterwards is never older than the epoch it is counted in.
+        // Pinned at the epoch read before the store; make it the epoch after the store, so that what the
+        // section loads afterwards is never older than the epoch it is counted in. PF-7: the store and the loads
+        // after it need the order store-then-load. The locked compare-exchange (and `xchg`, the SeqCst store) is
+        // already that barrier on x86-64: Linux's `smp_mb__after_atomic` is empty for the same reason
+        // (linux-6.6/arch/x86/include/asm/barrier.h); an `mfence` on top cost 33 cycles per section. A host of
+        // another architecture keeps the fence.
         loop {
+            #[cfg(target_arch = "x86_64")]
+            compiler_fence(SeqCst);
+            #[cfg(not(target_arch = "x86_64"))]
             fence(SeqCst);
             let now = EPOCH.load(SeqCst);
             if now == e {
@@ -209,7 +225,7 @@ impl Drop for Section {
         self.slot.word.store(0, Release);
         // Preemption is still off (the guard drops after this): the same CPU as at `enter`.
         if let Some(h) = self.home {
-            h.depth.fetch_sub(1, Relaxed);
+            depth_add(h, u32::MAX);
         }
     }
 }

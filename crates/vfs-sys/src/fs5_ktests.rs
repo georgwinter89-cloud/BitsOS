@@ -50,7 +50,7 @@ fn run_mode(mode: &str) -> Result<(String, String), String> {
 
 fn programs() -> TestResult {
     if vfs::root_ns().lookup("/bin/fs-mmap").is_err() {
-        return ktest::skip("/bin/fs-mmap is not in this image (xtask's build_c of host/tests/fs/progs, FS-1 change request 3)");
+        return ktest::fail("/bin/fs-mmap is not in this image (xtask's build_c of host/tests/fs/progs, FS-1 change request 3)");
     }
     let bs = blocks();
     kassert!(bs.len() == 7, "mmap-linux.txt has {} blocks", bs.len());
@@ -58,7 +58,7 @@ fn programs() -> TestResult {
     for (mode, end, lines) in bs {
         let (got_end, text) = run_mode(mode)?;
         if mode == "shm" && text.contains("both mapped: no") {
-            return ktest::skip("mmap of a file answers an error: MM's file VMAs (FS-5 change request 1) are not in this kernel");
+            return ktest::fail("mmap of a file answers an error: MM's file VMAs (FS-5 change request 1) are not in this kernel");
         }
         let got: Vec<&str> = text.lines().collect();
         if got_end != end || got != lines {

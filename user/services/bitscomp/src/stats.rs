@@ -8,6 +8,9 @@ pub struct Stats {
     pub empty_frames: u64,
     pub commits: u64,
     pub render: Duration,
+    /// Parts of `render`: the elements with their images, and the effects' work before the draw.
+    pub build: Duration,
+    pub prepare: Duration,
     pub present: Duration,
     pub damaged_px: u64,
     /// SYN_REPORTs read from evdev and their summed age (event time to bitscomp reading it, CLOCK_MONOTONIC).
@@ -41,11 +44,13 @@ impl Stats {
     pub fn report(&self) -> String {
         let n = self.frames.max(1) as f64;
         format!(
-            "frames={} empty={} commits={} render_avg_ms={:.3} present_avg_ms={:.3} damaged_mpx_avg={:.3} input_reports={} input_age_avg_ms={:.3} input_dropped={} key_presses={} keys_forwarded={} loop_turns={} past_wakes={} timer_sets={} unread_reads={} dmabuf_imported={} dmabuf_failed={} acquire_waits={} held_buffers={} release_points={} acquire_pending={} held_now={}",
+            "frames={} empty={} commits={} render_avg_ms={:.3} build_avg_ms={:.3} prepare_avg_ms={:.3} present_avg_ms={:.3} damaged_mpx_avg={:.3} input_reports={} input_age_avg_ms={:.3} input_dropped={} key_presses={} keys_forwarded={} loop_turns={} past_wakes={} timer_sets={} unread_reads={} dmabuf_imported={} dmabuf_failed={} acquire_waits={} held_buffers={} release_points={} acquire_pending={} held_now={}",
             self.frames,
             self.empty_frames,
             self.commits,
             self.render.as_secs_f64() * 1e3 / n,
+            self.build.as_secs_f64() * 1e3 / n,
+            self.prepare.as_secs_f64() * 1e3 / n,
             self.present.as_secs_f64() * 1e3 / n,
             self.damaged_px as f64 / n / 1e6,
             self.input_events,

@@ -426,7 +426,7 @@ pub fn scrollback_bytes(rows: usize, cols: u32) -> u64 {
 /// and an allocation failure later in a log line must not be possible to ask for.
 pub fn set_scrollback(rows: usize) -> Result<(), alloc::string::String> {
     // Asked before `console.vt` is taken (no allocator statistics under the VT's lock).
-    let room = mm_core::frames().map(|fr| fr.stats().free_bytes / SCROLLBACK_SHARE);
+    let room = mm_core::frames().map(|fr| fr.stats().usable_free_bytes() / SCROLLBACK_SHARE);
     let r = with_vt(|v| {
         let cols = [Face::Vga, Face::Noto].iter().map(|&f| v.width / Font::for_mode(f, v.width, v.height).w.max(1)).max().unwrap_or(v.screen.cols);
         let need = scrollback_bytes(rows, cols.max(v.screen.cols));

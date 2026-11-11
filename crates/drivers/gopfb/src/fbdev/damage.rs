@@ -247,6 +247,10 @@ pub(super) fn ioctl(fb: &Fb, arg: u64, io: &dyn UserIo, who: Option<&Arc<Process
         fb.end_damage(&mut scr, "end");
         return Ok(Vec::new());
     }
+    // WY-17: the holder draws straight into the scanout buffers: fb0's memory holds none of it, nothing to copy.
+    if fb.direct.drawing() {
+        return Ok(Vec::new());
+    }
     let top = fb.yoffset.load(Ordering::Acquire);
     let first = fb.shared.damage_pid.swap(me.pid, Ordering::AcqRel) != me.pid;
     if first {

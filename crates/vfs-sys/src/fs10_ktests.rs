@@ -7,7 +7,7 @@
 //!   AB-4's fork), the compositor maps it read-only and sees frame 1, then frame 2 through the shared pages.
 //!   Each half's lines must equal the client:/compositor: lines of the wl-fork run on CachyOS.
 //! - `fs.memfd.wl_fork`, `fs.memfd.wl_socket`: the same path in one program (fork-inherited fd; socketpair with
-//!   SCM_RIGHTS), compared with their CachyOS blocks; they skip while fork / AF_UNIX answer ENOSYS.
+//!   SCM_RIGHTS), compared with their CachyOS blocks; they fail while fork / AF_UNIX answer ENOSYS.
 //! - `fs.memfd.seal_race` (fixer): F_ADD_SEALS(F_SEAL_WRITE) against writable shared mappings and writes made
 //!   on other CPUs at the same time (`-- -smp 16`): granted only with no counted mapping, no write after it.
 //! Safe and rerunnable: programs still running when a test ends are killed; the memfds die with them.
@@ -27,7 +27,7 @@ const LINUX: &str = include_str!("../../../host/tests/fs/memfd-linux.txt");
 fn have_prog() -> Result<(), TestResult> {
     match vfs::root_ns().lookup(PROG) {
         Ok(_) => Ok(()),
-        Err(_) => Err(ktest::skip("/bin/fs-memfd is not in this image (xtask builds host/tests/fs/progs into every image)")),
+        Err(_) => Err(ktest::fail("/bin/fs-memfd is not in this image (xtask builds host/tests/fs/progs into every image)")),
     }
 }
 
@@ -137,7 +137,7 @@ fn one_mode(mode: &str, skip_on: &[&str]) -> TestResult {
     let got_end = end_line(&p, 60 * SEC, mode)?;
     let text = String::from_utf8_lossy(&out.contents()).into_owned();
     if let Some(l) = text.lines().find(|l| skip_on.iter().any(|s| l.starts_with(s))) {
-        return ktest::skip(&format!("{mode}: {l} (needs AB-4's fork and NW-5's AF_UNIX; fs.memfd.wl_shm covers the path meanwhile)"));
+        return ktest::fail(&format!("{mode}: {l} (needs AB-4's fork and NW-5's AF_UNIX; fs.memfd.wl_shm covers the path meanwhile)"));
     }
     compare(mode, &got_end, &text, end, &lines)
 }

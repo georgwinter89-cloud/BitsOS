@@ -674,6 +674,12 @@ fn a_long_chain_in_flight_closes_without_recursion() {
         q.close(pb);
     });
     t.unwrap().join().expect("closing the chain's head on a 128 KiB stack");
+    // A collection run by a parallel test may have found the rest of the chain unreachable and purged it on
+    // its own thread; that thread finishes the freeing, so the count reaches 0 shortly after, not at once.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while first.strong_count() > 0 && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert_eq!(first.strong_count(), 0, "the whole chain went with its head");
 }
 

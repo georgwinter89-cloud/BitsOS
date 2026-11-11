@@ -45,7 +45,7 @@ fn write_copy(bytes: &[u8]) -> Result<(), String> {
 /// The boot's /bin/bitsinstall as root passes; as another user, another program, a copy, a changed file or a
 /// caller without an executable does not. Safe: it only reads /bin and writes its own file below /tmp.
 fn identity_test() -> TestResult {
-    let Some(m) = Measured::of(identity::EXE) else { return ktest::skip("no /bin/bitsinstall in this image") };
+    let Some(m) = Measured::of(identity::EXE) else { return ktest::fail("no /bin/bitsinstall in this image") };
     let probe = ["bitsinstall", "claim-probe", "--node", "/nonexistent-mc9a"];
     let real = started(identity::EXE, &probe, 0)?;
     let pid = real.pid;

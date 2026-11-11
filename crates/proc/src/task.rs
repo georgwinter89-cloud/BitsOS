@@ -71,6 +71,29 @@ pub struct Thread {
     /// FS-16: its own cwd/root/umask (Linux `task->fs`) once it left its image's: unshare(CLONE_FS), or a
     /// CLONE_THREAD without CLONE_FS. None = the image's (`Process::image_fs`), shared by the group's threads.
     own_fs: SpinLock<Option<Arc<vfs::FsState>>>,
+    /// SX-IPC: its SEM_UNDO list and the namespaces it made segments in.
+    ipc: crate::ipc::ThreadIpc,
+}
+
+/// PF-7: a syscall's view of the calling thread's cwd/root/umask (`vfs::sys::Sys::fs`): taken from the thread (and
+/// its `proc.fs`, the line all the program's threads share) at the first use and held to the end of the call; a call
+/// that never asks, as read on an fd, pays nothing.
+pub struct ThreadFs<'a> {
+    thread: &'a Thread,
+    image: &'a Process,
+    held: core::cell::OnceCell<Arc<vfs::FsState>>,
+}
+
+impl<'a> ThreadFs<'a> {
+    pub fn new(thread: &'a Thread, image: &'a Process) -> Self {
+        ThreadFs { thread, image, held: core::cell::OnceCell::new() }
+    }
+}
+
+impl vfs::sys::FsSource for ThreadFs<'_> {
+    fn state(&self) -> &vfs::FsState {
+        self.held.get_or_init(|| self.thread.fs(self.image))
+    }
 }
 
 impl Thread {
@@ -96,7 +119,12 @@ impl Thread {
             pr: crate::prctl_state::TaskPrctl::new(),
             attrs_ready: Completion::new(),
             own_fs: SpinLock::named("proc.ownfs", None),
+            ipc: crate::ipc::ThreadIpc::new(),
         })
+    }
+    /// SX-IPC: what this thread holds of SysV IPC.
+    pub fn ipc(&self) -> &crate::ipc::ThreadIpc {
+        &self.ipc
     }
     /// FS-16: the file-system state this thread's calls use (Linux `current->fs`): its own, else its image's.
     /// `p` is the thread's image.
@@ -436,6 +464,8 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, segs: Option<
     crate::deliver::exit_to_user(&t, &mut ctx, None);
     // This thread's own run of faults on already valid pages (threads racing for a page never add up).
     let mut spurious = mm::fault::SpuriousRun::default();
+    // PF-7: syscalls since the scheduler's housekeeping last ran on this path (`cond_resched`).
+    let mut since_housekeeping = 0u32;
     while !t.should_stop() {
         // Interrupts stay on while the program runs (AB-1). `execute_or_stop` handles them and comes back here
         // (None) when the user-IRQ hook asks or none is installed: the loop condition sees an end, and AB-6's
@@ -498,8 +528,14 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, segs: Option<
                 crate::deliver::exit_to_user(&t, &mut ctx, None);
             }
         }
-        // SC-3: a program making syscalls gives way here.
-        sched::cond_resched();
+        // SC-3: a program making syscalls gives way here. PF-7: the flags on each call; the clock, the heartbeat and
+        // the housekeeping of `cond_resched` (three-quarters of its cost) every `HOUSEKEEP_EVERY` calls, bounded by the
+        // tick when calls take long.
+        since_housekeeping += 1;
+        if since_housekeeping >= HOUSEKEEP_EVERY || sched::resched_wanted() {
+            since_housekeeping = 0;
+            sched::cond_resched();
+        }
         #[cfg(bitsos_fd_measure)]
         hal::entry::steps::mark(hal::entry::steps::RESCHED);
         #[cfg(bitsos_fd_measure)]
@@ -508,6 +544,9 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, segs: Option<
     drop(p);
     crate::exit::thread_ends(&t);
 }
+
+/// See the run loop: at some 100 000 fast syscalls per 100 ms the slowest case is one look per 64 us.
+const HOUSEKEEP_EVERY: u32 = 64;
 
 /// Live threads whose group runs as `uid` (Linux counts RLIMIT_NPROC in tasks per real uid).
 pub(crate) fn threads_of_uid(uid: u32) -> u64 {

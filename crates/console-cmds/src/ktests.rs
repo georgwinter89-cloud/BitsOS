@@ -1,7 +1,7 @@
 //! ktests of `ps` and `run` through the monitor (no keyboard: `monitor::execute` directly), and IN-4's programs
 //! on the console terminal: a raw-mode program reading injected keys, Ctrl+C ending the foreground program with
 //! SIGINT, and the evdev program reading MCP's keyboard. The programs come from `user/abi-tests` (in `/bin` when
-//! the image carries them; a missing one is a skip).
+//! the image carries them; a missing one is a failure).
 
 use alloc::format;
 use alloc::string::String;
@@ -19,7 +19,7 @@ const SEC: u64 = 1_000_000_000;
 fn run_hello() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     if vfs::root_ns().lookup("/bin/hello").is_err() {
-        return ktest::skip("no /bin/hello in the initramfs");
+        return ktest::fail("no /bin/hello in the initramfs");
     }
     let before = console::captured().len();
     let (ok, out) = console::monitor::execute("run /bin/hello", false, false);
@@ -101,7 +101,7 @@ impl Drop for OnConsole {
 fn program_raw() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     if vfs::root_ns().lookup("/bin/abi-rawtty").is_err() {
-        return ktest::skip("no /bin/abi-rawtty (user/abi-tests not in this image)");
+        return ktest::fail("no /bin/abi-rawtty (user/abi-tests not in this image)");
     }
     let saved = console::tty().termios();
     let r = (|| -> TestResult {
@@ -127,14 +127,14 @@ fn program_raw() -> TestResult {
     console::tty().set_termios(saved, false);
     r
 }
-ktest!("in.tty.program_raw", Safe, program_raw);
+ktest!("in.tty.program_raw", Screen, program_raw);
 
 /// Ctrl+C on the console ends the foreground program with SIGINT (ISIG through the process hook); its blocked
 /// canonical read never returns data.
 fn program_isig() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     if vfs::root_ns().lookup("/bin/abi-rawtty").is_err() {
-        return ktest::skip("no /bin/abi-rawtty (user/abi-tests not in this image)");
+        return ktest::fail("no /bin/abi-rawtty (user/abi-tests not in this image)");
     }
     let p = OnConsole::start("/bin/abi-rawtty", &["abi-rawtty", "wait"])?;
     p.wait_for("waiting")?;
@@ -145,15 +145,15 @@ fn program_isig() -> TestResult {
     kassert!(!p.text().contains("read returned"), "{}", p.text());
     Ok(())
 }
-ktest!("in.tty.program_isig", Safe, program_isig);
+ktest!("in.tty.program_isig", Screen, program_isig);
 
 /// `abi-evdev v2`: the MCP keyboard's node through the syscalls, compared with the transcript written from
 /// linux-6.6/drivers/input/evdev.c. Needs the integration patch (per-open clients, `ioctl_user` return values):
-/// without it EVIOCGNAME answers 0 and the test says so as a skip.
+/// without it EVIOCGNAME answers 0 and the test says so as a failure.
 fn evdev_program() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     if vfs::root_ns().lookup("/bin/abi-evdev").is_err() {
-        return ktest::skip("no /bin/abi-evdev (user/abi-tests not in this image)");
+        return ktest::fail("no /bin/abi-evdev (user/abi-tests not in this image)");
     }
     console::evdevfs::sync();
     let out = Capture::new(1 << 16);
@@ -175,7 +175,7 @@ fn evdev_program() -> TestResult {
     }
     let got = text();
     if got.contains("EVIOCGNAME(256) = 0\n") {
-        return ktest::skip("the integration patch (plan/notes/in-IN-4-integration.patch) is not applied: ioctl return values and per-open clients are missing");
+        return ktest::fail("the integration patch (plan/notes/in-IN-4-integration.patch) is not applied: ioctl return values and per-open clients are missing");
     }
     let want = include_str!("../../../user/abi-tests/expected/in4-evdev.txt");
     for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
@@ -184,4 +184,4 @@ fn evdev_program() -> TestResult {
     kassert!(got.lines().count() == want.lines().count(), "{} lines, want {}:\n{got}", got.lines().count(), want.lines().count());
     Ok(())
 }
-ktest!("in.evdev.program", Safe, evdev_program);
+ktest!("in.evdev.program", Screen, evdev_program);

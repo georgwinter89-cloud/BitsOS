@@ -2,8 +2,8 @@
 //!
 //! RAM disk (class Safe, rerunnable: every disk is the test's own; the registry test unregisters its disk):
 //! - `contract.block_device`: the G0 contract on the RAM disk.
-//! - `block.ram.queue`: the dispatcher thread; while the device is held busy, adjacent requests queue up and
-//!   reach it merged up to its limit, in priority order, and every waiter is woken with its own bytes.
+//! - `block.ram.queue`: dispatching by the waiters (BL-2); while the device is held busy, adjacent requests queue
+//!   up and reach it merged up to its limit, in priority order, and every waiter is woken with its own bytes.
 //! - `block.ram.aging`: a Background request that waited two aging steps goes before a fresh Interactive one.
 //! - `block.ram.timeout`: a request that cannot reach the device times out (taken out of the queue), one the
 //!   device holds too (its answer dropped); the disk works on afterwards.
@@ -94,10 +94,18 @@ fn bytes(r: Result<Data, BlockError>) -> Result<Vec<u8>, String> {
     }
 }
 
+/// BL-2: there is no dispatcher thread; a helper thread dispatches what is queued (`Disk::run_queue`), as a waiter
+/// would, so the test thread can keep its tickets and queue more while the device holds one.
+pub(crate) fn dispatch_aside(d: &Arc<Disk>) -> Result<(), String> {
+    let d = d.clone();
+    sched::spawn("blk-ktest-run", sched::Class::Normal, move || d.run_queue()).map(|_| ()).map_err(e)
+}
+
 /// Submits `first` and waits until the device holds it (paused), so what follows queues up.
 fn hold(r: &RamDisk, d: &Arc<Disk>, lba: u64) -> Result<crate::Ticket, String> {
     r.pause();
     let t = read_ticket(d, lba, 1, Normal)?;
+    dispatch_aside(d)?;
     if !until(2000, || r.holding()) {
         r.resume();
         return Err("the device never got the first request".into());
@@ -405,7 +413,7 @@ fn scenario_disks() -> Vec<(Arc<Disk>, Header)> {
 fn usb_stick() -> TestResult {
     let disks = usb_disks();
     if disks.is_empty() {
-        return ktest::skip("no USB disk registered");
+        return ktest::fail("no USB disk registered");
     }
     if !crate::configured() {
         return Err("block::configure never ran (vfs-sys's block.boot_facts initcall)".into());
@@ -415,7 +423,7 @@ fn usb_stick() -> TestResult {
     if ident.and_then(|s| s.block0).is_none() {
         // Without the loader's block 0 every USB disk counts as the stick.
         kassert!(disks.iter().all(|d| d.stick() == StickMatch::Unknown));
-        return ktest::skip("the loader could not read the stick's block 0: every USB disk is treated as the stick");
+        return ktest::fail("the loader could not read the stick's block 0: every USB disk is treated as the stick");
     }
     kassert!(sticks.len() == 1, "{} disks match the boot stick (want 1)", sticks.len());
     let s = sticks[0];
@@ -432,7 +440,7 @@ fn usb_stick() -> TestResult {
         return Ok(());
     }
     if sw.stick_write {
-        return ktest::skip("stick_write=on: the stick takes writes");
+        return ktest::fail("stick_write=on: the stick takes writes");
     }
     kassert!(s.write_policy() == Err(stick_refusal(s)), "{}: {:?}", s.name(), s.write_policy());
     // Under the device's own read-only answer the stick rule holds too.
@@ -451,10 +459,10 @@ ktest!("block.usb.stick", Safe, usb_stick);
 
 fn usb_stick_write() -> TestResult {
     let Some(s) = usb_disks().into_iter().find(|d| d.stick() == StickMatch::Yes) else {
-        return ktest::skip("no USB disk recognised as the boot stick");
+        return ktest::fail("no USB disk recognised as the boot stick");
     };
     if policy::switches().stick_write && !s.stick_opened() {
-        return ktest::skip("stick_write=on");
+        return ktest::fail("stick_write=on");
     }
     let own = s.read_vec(0, s.block_size() as usize, Normal).map_err(e)?;
     let before = s.stats().dispatches;
@@ -471,7 +479,7 @@ ktest!("block.usb.stick_write", QemuOnly, usb_stick_write);
 fn usb_read() -> TestResult {
     let disks = scenario_disks();
     if disks.is_empty() {
-        return ktest::skip("no scenario disk (host/tests/fs/20-block.sh)");
+        return ktest::fail("no scenario disk (host/tests/fs/20-block.sh)");
     }
     for (d, h) in &disks {
         if h.flags & F_EIO != 0 {
@@ -506,11 +514,11 @@ fn usb_read() -> TestResult {
     }
     Ok(())
 }
-ktest!("block.usb.read", QemuOnly, usb_read);
+ktest!("block.usb.read", Run("fs/20-block"), usb_read);
 
 fn usb_write() -> TestResult {
     let Some((d, h)) = scenario_disks().into_iter().find(|(_, h)| h.flags & F_SCRATCH != 0) else {
-        return ktest::skip("no scratch disk (host/tests/fs/20-block.sh)");
+        return ktest::fail("no scratch disk (host/tests/fs/20-block.sh)");
     };
     if !policy::switches().usb_msd_write {
         kassert!(d.write(h.a, &vec![0; 512], false, Normal) == Err(BlockError::ReadOnly(Refusal::UsbWritesOff)));
@@ -536,11 +544,11 @@ fn usb_write() -> TestResult {
     klog::event!(Info, "block", "ktest.usb_written", disk = String::from(d.name()), lba = h.a, blocks = n, requests = s.requests, merged = s.merged);
     Ok(())
 }
-ktest!("block.usb.write", QemuOnly, usb_write);
+ktest!("block.usb.write", Run("fs/20-block"), usb_write);
 
 fn usb_eio() -> TestResult {
     let Some((d, h)) = scenario_disks().into_iter().find(|(_, h)| h.flags & F_EIO != 0) else {
-        return ktest::skip("no blkdebug disk (host/tests/fs/20-block.sh)");
+        return ktest::fail("no blkdebug disk (host/tests/fs/20-block.sh)");
     };
     let bs = d.block_size() as u64;
     kassert!(bs == 512);
@@ -568,7 +576,7 @@ fn usb_eio() -> TestResult {
         merge_retries = d.stats().merge_retries);
     Ok(())
 }
-ktest!("block.usb.eio", QemuOnly, usb_eio);
+ktest!("block.usb.eio", Run("fs/20-block"), usb_eio);
 
 fn spattern_block(lba: u64) -> Vec<u8> {
     (0..512).map(|i| spattern(lba * 512 + i)).collect()
@@ -578,7 +586,7 @@ fn usb_windows() -> TestResult {
     let disks = usb_disks();
     let win: Vec<_> = disks.iter().filter(|d| matches!(d.scan().verdict(), table::Verdict::Windows(_))).collect();
     if win.is_empty() {
-        return ktest::skip("no USB disk with a Windows partition (host/tests/fs/20-block.sh)");
+        return ktest::fail("no USB disk with a Windows partition (host/tests/fs/20-block.sh)");
     }
     for d in win {
         let scan = d.scan();
@@ -596,4 +604,4 @@ fn usb_windows() -> TestResult {
     }
     Ok(())
 }
-ktest!("block.usb.windows", QemuOnly, usb_windows);
+ktest!("block.usb.windows", Run("fs/20-block"), usb_windows);

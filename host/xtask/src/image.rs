@@ -37,6 +37,16 @@ pub struct Artefacts {
 }
 
 pub fn build(root: &Path, o: BuildOpts) -> Result<Artefacts, String> {
+    build_with(root, o, lean_env())
+}
+
+/// V2_LEAN=1 (desk 24.10., Georg's "richtige Endfassung"): the everyday stick image without test programs.
+fn lean_env() -> bool {
+    std::env::var_os("V2_LEAN").is_some()
+}
+
+/// `build` with the lean choice made by the caller (`release-assets` always builds the lean image).
+pub fn build_with(root: &Path, o: BuildOpts, lean: bool) -> Result<Artefacts, String> {
     let kernel = build_kernel(root, o)?;
     println!("kernel:   {}", kernel.display());
 
@@ -49,7 +59,7 @@ pub fn build(root: &Path, o: BuildOpts) -> Result<Artefacts, String> {
     let bitsboot = root.join("target/x86_64-unknown-uefi").join(o.profile()).join("bitsboot.efi");
     println!("bitsboot: {}", bitsboot.display());
 
-    let (programs, stick) = build_packaged(root)?;
+    let (programs, stick) = build_packaged(root, lean)?;
     for (n, p) in &programs {
         let at = package::lib_dest(n).unwrap_or_else(|| format!("bin/{n}"));
         println!("user:     /{at} <- {}", p.display());
@@ -64,8 +74,8 @@ pub fn build(root: &Path, o: BuildOpts) -> Result<Artefacts, String> {
 }
 
 /// The user programs plus the package (UL-5): the manifest's programs and the glibc library set, sorted.
-fn build_packaged(root: &Path) -> Result<(Vec<(String, PathBuf)>, Vec<(String, PathBuf)>), String> {
-    let mut programs = build_user(root)?;
+fn build_packaged(root: &Path, lean: bool) -> Result<(Vec<(String, PathBuf)>, Vec<(String, PathBuf)>), String> {
+    let mut programs = build_user(root, lean)?;
     let pkg = package::build(root, &programs)?;
     programs.extend(pkg.initrd);
     programs.sort();
@@ -123,7 +133,7 @@ fn built_executables(json_lines: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn build_user(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+fn build_user(root: &Path, lean: bool) -> Result<Vec<(String, PathBuf)>, String> {
     let user = root.join("user");
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     if user.join("Cargo.toml").is_file() {
@@ -161,8 +171,6 @@ fn build_user(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     // when it is already built (`cargo xtask abi-diff` builds it once) or V2_SYSROOT names one, so a plain build
     // never starts the long sysroot build. A failure leaves them out with a warning.
     let sysroot_ready = std::env::var_os("V2_SYSROOT").is_some() || root.join("user/sysroot/out/sysroot/usr/lib/libc.a").is_file();
-    // V2_LEAN=1 (desk 24.10., Georg's "richtige Endfassung"): the everyday stick image without test programs.
-    let lean = std::env::var_os("V2_LEAN").is_some();
     if lean {
         out.retain(|(n, _)| !LEAN_DROP.contains(&n.as_str()));
     }
@@ -341,7 +349,7 @@ pub fn cmd_initrd(root: &Path, mut a: Args) -> Result<(), String> {
     let lock = a.flag("--lock");
     let o = BuildOpts::parse(&mut a);
     a.positionals()?;
-    let (programs, stick) = build_packaged(root)?;
+    let (programs, stick) = build_packaged(root, lean_env())?;
     let _ = o;
     std::fs::create_dir_all(out.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
     let entries = initrd_entries(root, &programs)?;
@@ -399,6 +407,46 @@ pub fn make_image(root: &Path, o: &ImageOpts) -> Result<PathBuf, String> {
     make_image_from(root, o, &art)
 }
 
+/// TS-1: a scenario's boots say which run they are (`ktest_run=`, the classes Run and RunHw), unless the script names
+/// one itself. The runner sets BITSOS_KTEST_RUN to `<folder>/<script>`; a script may name a run it shares with another.
+fn with_run(extra: &[String]) -> Vec<String> {
+    let mut v = extra.to_vec();
+    if let Ok(run) = std::env::var("BITSOS_KTEST_RUN")
+        && !run.is_empty()
+        && !v.iter().any(|l| l.starts_with("ktest_run="))
+    {
+        v.push(format!("ktest_run={run}"));
+    }
+    v
+}
+
+/// TS-1: each tree on the stick carries its own list of files (`PKGLIST.TXT`), made from what was just copied: the
+/// tree's tests compare the stick with this list, not with the image's, which is built from the host's files of that
+/// day (Mini-PC 3.11.: libfribidi updated since the tree was copied).
+fn tree_lists<'a>(esp: &Path, rels: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    for (tree, text) in tree_list_texts(rels.map(|r| (r, esp.join(r))))? {
+        std::fs::write(esp.join(&tree).join("PKGLIST.TXT"), text).map_err(|e| format!("{tree}/PKGLIST.TXT: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Each tree's `PKGLIST.TXT` (`BITSOS2/<tree>` -> text) for its files (path below the stick's root, file with
+/// the bytes), in the order given: `release-assets` packs the same list `xtask image` writes.
+pub fn tree_list_texts<'a>(files: impl Iterator<Item = (&'a str, PathBuf)>) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut trees: std::collections::BTreeMap<String, String> = Default::default();
+    for (rel, file) in files {
+        // BITSOS2/<tree>/<path>
+        let mut parts = rel.match_indices('/').map(|(i, _)| i);
+        if let Some(end) = parts.nth(1) {
+            let data = std::fs::read(&file).map_err(|e| format!("{rel}: {e}"))?;
+            let text = trees.entry(rel[..end].to_string()).or_default();
+            text.push_str(&package::list_line("stick", &format!("/boot/{rel}"), &data));
+            text.push('\n');
+        }
+    }
+    Ok(trees)
+}
+
 pub fn make_image_from(root: &Path, o: &ImageOpts, art: &Artefacts) -> Result<PathBuf, String> {
     safe_name(&o.name)?;
     let x = xdir(root);
@@ -413,7 +461,7 @@ pub fn make_image_from(root: &Path, o: &ImageOpts, art: &Artefacts) -> Result<Pa
     cp(&art.bitsboot, boot.join("BOOTX64.EFI"))?;
     cp(&art.kernel, sys.join("KERNEL"))?;
     std::fs::write(sys.join("INITRD"), initrd_bytes_for(root, &art.programs, &art.kernel)?).map_err(|e| e.to_string())?;
-    std::fs::write(esp.join("BITSOS2/CONFIG.TXT"), config_text(&o.config_extra)).map_err(|e| e.to_string())?;
+    std::fs::write(esp.join("BITSOS2/CONFIG.TXT"), config_text(&with_run(&o.config_extra))).map_err(|e| e.to_string())?;
     std::fs::write(esp.join("BITSOS2/STICK.ID"), TEST_STICK_ID).map_err(|e| e.to_string())?;
     // UL-5: the manifest's stick programs in \BITSOS2\bin (V2: /boot/BITSOS2/bin); YT-2's trees only when
     // `tree_wanted` says so (V2_STICK_TREES: Georg 30.10., programs are tested on the Mini-PC only).
@@ -425,6 +473,7 @@ pub fn make_image_from(root: &Path, o: &ImageOpts, art: &Artefacts) -> Result<Pa
         }
         cp(p, to)?;
     }
+    tree_lists(&esp, art.stick.iter().map(|(rel, _)| rel.as_str()).filter(|rel| package::is_tree_file(rel) && tree_wanted(rel, env.as_deref())))?;
     // GX-7a: the GPU firmware the amdgpu modules need, decompressed from the host's linux-firmware-amdgpu, with
     // its licence (crate::firmware; never in git).
     crate::firmware::copy(root, &esp)?;
@@ -576,6 +625,13 @@ mod tests {
     fn trees_only_with_v2_stick_trees() {
         let f = "BITSOS2/brave/lib/libgtk-3.so.0";
         assert!(!tree_wanted(f, None), "no ktest or scenario image carries a tree by itself");
+        let d = std::env::temp_dir().join(format!("xt-treelist-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("BITSOS2/brave/lib")).unwrap();
+        std::fs::write(d.join("BITSOS2/brave/lib/a.so"), b"abc").unwrap();
+        tree_lists(&d, ["BITSOS2/brave/lib/a.so"].into_iter()).unwrap();
+        let l = std::fs::read_to_string(d.join("BITSOS2/brave/PKGLIST.TXT")).unwrap();
+        assert_eq!(l, "stick /boot/BITSOS2/brave/lib/a.so 3 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n");
+        let _ = std::fs::remove_dir_all(&d);
         assert!(tree_wanted(f, Some("1")) && tree_wanted(f, Some("cobalt, Brave")));
         assert!(!tree_wanted(f, Some("cobalt")) && !tree_wanted(f, Some("")));
         assert!(tree_wanted("BITSOS2/libreoffice/program/soffice.bin", Some("libreoffice")));

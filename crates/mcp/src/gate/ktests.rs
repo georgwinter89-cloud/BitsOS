@@ -131,7 +131,7 @@ fn grant_caller() -> Result<u32, String> {
 /// the block layer: this runs on the Mini-PC) until the grant's end, and an empty table closes both.
 fn grant() -> TestResult {
     let Some(wall) = time::wall::realtime_ns().map(|ns| (ns / 1_000_000_000) as i64) else {
-        return ktest::skip("no wall clock (RTC) in this boot: no grant is taken without one");
+        return ktest::fail("no wall clock (RTC) in this boot: no grant is taken without one");
     };
     let mut cfg = ServerConfig::new(TOKEN);
     cfg.addr.port = 8767;
@@ -169,10 +169,10 @@ ktest!("mcp.gate.grant", Safe, grant);
 /// live, closed by the empty table. QemuOnly: it opens NVMe writes for a moment.
 fn grant_block() -> TestResult {
     let Some(wall) = time::wall::realtime_ns().map(|ns| (ns / 1_000_000_000) as i64) else {
-        return ktest::skip("no wall clock (RTC) in this boot");
+        return ktest::fail("no wall clock (RTC) in this boot");
     };
     if block::policy::nvme_runtime_open() {
-        return ktest::skip("the run-time NVMe gate is open already (a live grant): not touched");
+        return ktest::fail("the run-time NVMe gate is open already (a live grant): not touched");
     }
     let t = access::Table::new();
     let gr = mcp_wire::access::Grant { client: "c3".repeat(32), until: wall + 60, set_at: wall, nvme: true };

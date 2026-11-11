@@ -1,7 +1,7 @@
 #!/bin/bash
 # slow
 # WY-16 on V2 in QEMU (-smp 4, 1280x800 GOP, drm=fake: the fake GPU's render node 226:128 with DR-3's sync objects):
-# bitscomp through MCP `run` (fbdev/evdev) advertises zwp_linux_dmabuf_v1 (main device 226:128, XRGB8888 LINEAR
+# bitscomp through MCP `run` (fbdev/evdev) advertises zwp_linux_dmabuf_v1 (no main device, WY-17b; XRGB8888 LINEAR
 # first) and wp_linux_drm_syncobj_manager_v1 on /dev/dri/renderD128; wyclient --dmabuf makes its buffers with V2's
 # /dev/udmabuf (DR-5) and its window looks like a wl_shm window's (MCP screen of the two runs within tolerance);
 # a non-linear modifier is answered `failed`; with explicit sync an animating client gets its buffers back through

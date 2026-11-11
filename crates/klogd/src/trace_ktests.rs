@@ -192,7 +192,7 @@ fn storm_bounded() -> TestResult {
     let cpus = sched::wait_cpus_online(2_000_000_000).max(1);
     let (burst, rate) = klog::ratelimit::get();
     if rate == 0 {
-        return ktest::skip("rate limits are off (CONFIG log_ratelimit=off)");
+        return ktest::fail("rate limits are off (CONFIG log_ratelimit=off)");
     }
     let lost0 = klog::lost();
     let start = klog::next_seq();
@@ -230,7 +230,7 @@ ktest!("rb.events.storm_bounded", Safe, storm_bounded);
 /// The `events` tool merges log records and trace entries and filters them by time, level, subsystem, fields.
 fn filters() -> TestResult {
     if !klog::trace::enabled(Kind::Mark) {
-        return ktest::skip("trace kind mark is off (CONFIG trace=)");
+        return ktest::fail("trace kind mark is off (CONFIG trace=)");
     }
     let t0 = klog::now();
     let tm = klog::ktests::with_trace("rbev", || {
@@ -283,7 +283,7 @@ ktest!("rb.events.filters", Safe, filters);
 fn hooks() -> TestResult {
     let hz = klog::trace::tsc_hz();
     if hz == 0 {
-        return ktest::skip("no TSC rate set (klogd not started)");
+        return ktest::fail("no TSC rate set (klogd not started)");
     }
     let lim = klog::trace::limits();
     let kinds = klog::trace::kinds();

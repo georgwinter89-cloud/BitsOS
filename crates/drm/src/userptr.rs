@@ -249,6 +249,10 @@ impl Exporter for UserptrMem {
     fn page_phys(&self, page: u64) -> Option<u64> {
         self.with(|p| p.page_phys(page)).flatten()
     }
+    /// The pages of now; a revalidation replaces them (`get_pages`), so a page table must hold these, not this.
+    fn frames(&self) -> Option<Arc<dyn Exporter>> {
+        self.pages.lock().clone()
+    }
     fn read(&self, off: u64, out: &mut [u8]) -> bool {
         self.with(|p| p.read(off, out)).unwrap_or(false)
     }

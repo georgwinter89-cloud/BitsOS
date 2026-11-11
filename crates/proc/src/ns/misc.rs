@@ -3,8 +3,8 @@
 //!
 //! - UTS (linux-6.6/kernel/utsname.c `copy_utsname`): a copy of the creator's host and domain name; the
 //!   syscall crate's `uts` reads and writes the caller's.
-//! - IPC (ipc/namespace.c): V2 has no SysV IPC or POSIX message queues (Chromium shares memory through
-//!   memfds), so an IPC namespace has nothing in it but works for unshare, clone, setns and `/proc`.
+//! - IPC (linux-7.3.1/ipc/namespace.c): an IPC namespace holds its SysV semaphores, segments and queues
+//!   (`crate::ipc::Tables`) and they go with it; V2 has no POSIX message queues.
 //! - Network (net/core/net_namespace.c `copy_net_ns`): a new namespace has only `lo`, down and without an
 //!   address, which is where Linux leaves it. `is_init` tells the socket glue which rules apply.
 
@@ -73,6 +73,8 @@ pub struct IpcNs {
     pub user_ns: Arc<UserNs>,
     init: bool,
     _charge: Option<Charge>,
+    /// SX-IPC: its semaphores, segments, queues and limits.
+    pub tables: crate::ipc::Tables,
 }
 
 impl Drop for IpcNs {
@@ -118,7 +120,7 @@ pub fn init_uts() -> &'static Arc<UtsNs> {
 }
 
 pub fn init_ipc() -> &'static Arc<IpcNs> {
-    INIT_IPC.get_or_init(|| Arc::new(IpcNs { inum: super::INIT_IPC_INUM, user_ns: super::user::init_user_ns().clone(), init: true, _charge: None }))
+    INIT_IPC.get_or_init(|| Arc::new(IpcNs { inum: super::INIT_IPC_INUM, user_ns: super::user::init_user_ns().clone(), init: true, _charge: None, tables: crate::ipc::Tables::new() }))
 }
 
 pub fn init_net() -> &'static Arc<NetNs> {
@@ -137,7 +139,7 @@ pub(crate) fn new_uts(from: &UtsNs, user_ns: &Arc<UserNs>, euid: u32) -> Result<
 pub(crate) fn new_ipc(user_ns: &Arc<UserNs>, euid: u32) -> Result<Arc<IpcNs>, Errno> {
     let c = count::charge(Counted::Ipc, user_ns, euid)?;
     LIVE_IPC.fetch_add(1, Ordering::Relaxed);
-    Ok(Arc::new(IpcNs { inum: super::alloc_inum(), user_ns: user_ns.clone(), init: false, _charge: Some(c) }))
+    Ok(Arc::new(IpcNs { inum: super::alloc_inum(), user_ns: user_ns.clone(), init: false, _charge: Some(c), tables: crate::ipc::Tables::new() }))
 }
 
 /// `copy_net_ns` (ENOSPC past `max_net_namespaces`).

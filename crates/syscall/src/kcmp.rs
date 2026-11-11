@@ -13,8 +13,9 @@
 //! - KCMP_VM: the address space; KCMP_FILES: the fd table; KCMP_FS: the thread's cwd/root/umask state;
 //! - KCMP_SIGHAND: the signal actions, which V2 keeps per thread group (CLONE_SIGHAND without CLONE_THREAD
 //!   copies them, plan/notes/ab-AB-4.md), so the group; it stays until the reap, as `sighand` does;
-//! - KCMP_IO and KCMP_SYSVSEM: V2 has no I/O contexts and no SysV semaphore undo lists, so every task has
-//!   NULL there, which is also Linux's answer for tasks that never used ioprio or SEM_UNDO: equal;
+//! - KCMP_SYSVSEM compares undo lists (SX-IPC; two tasks without one compare equal, as Linux's NULLs);
+//! - KCMP_IO: V2 has no I/O contexts, so every task has NULL there, Linux's answer for tasks that never used
+//!   ioprio: equal;
 //! - KCMP_EPOLL_TFD: Linux's EFAULT (the slot), EBADF (idx1, the epoll fd) and EINVAL (not an epoll, an
 //!   O_PATH fd too) come first; then the `toff`-th item watching `tfd` (`vfs::epoll::Epoll::target`, INT-W24),
 //!   ENOENT without one, compared with idx1's open file as KCMP_FILE.
@@ -42,7 +43,8 @@ fn sys_kcmp(c: &mut SysCtx<'_>) -> i64 {
         KCMP_FILES => kcmp_ptr(t1.live(|p, _| Arc::as_ptr(&p.fds) as usize), t2.live(|p, _| Arc::as_ptr(&p.fds) as usize), ty),
         KCMP_FS => kcmp_ptr(t1.live(|p, t| Arc::as_ptr(&t.fs(p)) as usize), t2.live(|p, t| Arc::as_ptr(&t.fs(p)) as usize), ty),
         KCMP_SIGHAND => kcmp_ptr(Arc::as_ptr(t1.p.group()) as usize, Arc::as_ptr(t2.p.group()) as usize, ty),
-        KCMP_IO | KCMP_SYSVSEM => kcmp_ptr(0, 0, ty),
+        KCMP_IO => kcmp_ptr(0, 0, ty),
+        KCMP_SYSVSEM => kcmp_ptr(t1.live(|_, t| t.ipc().undo.list_ptr()), t2.live(|_, t| t.ipc().undo.list_ptr()), ty),
         KCMP_EPOLL_TFD => epoll_target(c, &t1, &t2, idx1, idx2),
         _ => -EINVAL,
     }

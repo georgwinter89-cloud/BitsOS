@@ -1,0 +1,56 @@
+mode faults
+read of PROT_NONE: signal 11 code 2 trap 14 on alt stack yes
+  err: present 0 write 0 user 1 fetch 0
+  Wine's ExceptionInformation[0] = 0
+  si_addr and cr2 are the address: yes
+  rip at the instruction: yes
+write to PROT_READ: signal 11 code 2 trap 14 on alt stack yes
+  err: present 0 write 1 user 1 fetch 0
+  Wine's ExceptionInformation[0] = 1
+  si_addr and cr2 are the address: yes
+  rip at the instruction: yes
+read of an unmapped page: signal 11 code 1 trap 14 on alt stack yes
+  err: present 0 write 0 user 1 fetch 0
+  Wine's ExceptionInformation[0] = 0
+  si_addr and cr2 are the address: yes
+  rip at the instruction: yes
+call into PROT_READ|PROT_WRITE: signal 11 code 2 trap 14 on alt stack yes
+  err: present 1 write 0 user 1 fetch 1
+  si_addr and cr2 are the address: yes
+write watch: one fault, store done after it: yes
+cli: signal 11 code 128 trap 13 on alt stack yes
+  err = 0, Wine's interrupt = no
+  si_addr is 0: yes
+  rip at the instruction: yes
+hlt: signal 11 code 128 trap 13 on alt stack yes
+  err = 0, Wine's interrupt = no
+  si_addr is 0: yes
+  rip at the instruction: yes
+in: signal 11 code 128 trap 13 on alt stack yes
+  err = 0, Wine's interrupt = no
+  si_addr is 0: yes
+  rip at the instruction: yes
+int 0x29 (__fastfail): signal 11 code 128 trap 13 on alt stack yes
+  err = 0x14a, Wine's interrupt = yes
+  si_addr is 0: yes
+  rip at the instruction: yes
+int 0x2c (assertion): signal 11 code 128 trap 13 on alt stack yes
+  err = 0x162, Wine's interrupt = yes
+  si_addr is 0: yes
+  rip at the instruction: yes
+int 0x2d (debug service): signal 11 code 128 trap 13 on alt stack yes
+  err = 0x16a, Wine's interrupt = yes
+  si_addr is 0: yes
+  rip at the instruction: yes
+int 0x2e: signal 11 code 128 trap 13 on alt stack yes
+  err = 0x172, Wine's interrupt = yes
+  si_addr is 0: yes
+  rip at the instruction: yes
+int3: signal 5 code 128 trap 3 on alt stack yes
+  rip after the int3: yes
+ud2: signal 4 code 2 trap 6 on alt stack yes
+  si_addr is the instruction, rip at it: yes
+divide by zero: signal 8 code 1 trap 0 on alt stack yes
+  si_addr is the instruction, rip at it: yes
+syscall 0xffff = -ENOSYS
+done

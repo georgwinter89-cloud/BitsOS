@@ -86,6 +86,19 @@ pub enum Fault {
     StallCbw,
 }
 
+/// A stick that stopped answering altogether (endpoint 0 too): each transfer runs into its time, until the named
+/// thing happens to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wedge {
+    UntilPortReset,
+    /// Survives this many port resets without power (a warm reset does nothing for it), only power helps.
+    UntilPower,
+    /// For good; even power does nothing. A port reset runs into its whole wait.
+    Dead,
+    /// Port resets pass, each after its whole wait, and nothing gets through after them either.
+    ResetsOnly,
+}
+
 #[derive(Clone)]
 pub struct Lun {
     pub block_size: usize,
@@ -166,6 +179,17 @@ pub struct State {
     pub poisoned: bool,
     /// Buffers above 64 bytes handed out.
     pub allocs: u32,
+    pub wedged: Option<Wedge>,
+    /// The link offers a port reset (the other tests run without one: their device has nothing above Bulk-Only).
+    pub port_resets: bool,
+    /// The next port resets fail this many times though the device is reachable.
+    pub port_failures_left: u32,
+    /// The next commands (CBWs) fail in their time this many times, whatever the resets did.
+    pub fail_cbws: u32,
+    /// `give_up` was called.
+    pub gave_up: u32,
+    /// The data phases of this many next READs never end (one bad sector); commands without data still work.
+    pub hang_reads: u32,
 }
 
 pub struct SimDev {
@@ -198,6 +222,12 @@ impl SimDev {
                 alloc_limit: None,
                 poisoned: false,
                 allocs: 0,
+                wedged: None,
+                port_resets: false,
+                port_failures_left: 0,
+                fail_cbws: 0,
+                gave_up: 0,
+                hang_reads: 0,
             }),
         })
     }
@@ -440,6 +470,10 @@ impl State {
         cdb.copy_from_slice(&b[15..31]);
         self.log.push(alloc::format!("cbw {:02x} lun {lun} len {len}", cdb[0]));
         let answer = self.execute(lun, &cdb, len);
+        if self.hang_reads > 0 && matches!(cdb[0], op::READ_10 | op::READ_16) && matches!(answer, Answer::In(_)) {
+            self.hang_reads -= 1;
+            self.faults.push_front(Fault::Timeout(Stage::Data));
+        }
         let tag_out = if take_fault(self, |f| *f == Fault::WrongTag).is_some() { tag.wrapping_add(1) } else { tag };
         let status_ok = if take_fault(self, |f| *f == Fault::PhaseError).is_some() { 2 } else { 0 };
         self.phase = match answer {
@@ -597,6 +631,15 @@ impl Link for SimLink {
     }
     fn bulk(&self, dir_in: bool, req: Request, _timeout_ns: u64) -> XferResult {
         let mut s = self.0.st.lock().unwrap();
+        if s.wedged.is_some() {
+            s.now += crate::link::CBW_TIMEOUT_NS;
+            return XferResult::failed(UsbError::Timeout, 0);
+        }
+        if !dir_in && s.fail_cbws > 0 && req.len == 31 {
+            s.fail_cbws -= 1;
+            s.now += crate::link::CBW_TIMEOUT_NS;
+            return XferResult::failed(UsbError::Timeout, 0);
+        }
         if dir_in {
             let (r, bytes) = s.bulk_in(req.len);
             if !req.buf.write(req.offset, &bytes) {
@@ -616,6 +659,9 @@ impl Link for SimLink {
         if s.gone {
             return Err(UsbError::Gone);
         }
+        if s.wedged.is_some() {
+            return Err(UsbError::Timeout);
+        }
         s.log.push(if dir_in { "clear in".into() } else { "clear out".into() });
         if !s.need_reset {
             if dir_in {
@@ -629,10 +675,59 @@ impl Link for SimLink {
     fn abort_all(&self) {
         self.0.with(|s| s.log.push("abort".into()));
     }
+    fn port_reset(&self, power: bool, wait_ns: u64) -> Result<(), UsbError> {
+        let mut s = self.0.st.lock().unwrap();
+        if s.gone {
+            return Err(UsbError::Gone);
+        }
+        if !s.port_resets {
+            return Err(UsbError::Invalid("no port reset on this link"));
+        }
+        s.log.push(if power { "port reset power".into() } else { "port reset".into() });
+        s.now += crate::link::CBW_TIMEOUT_NS / 5;
+        if s.port_failures_left > 0 {
+            s.port_failures_left -= 1;
+            return Err(UsbError::Timeout);
+        }
+        match s.wedged {
+            Some(Wedge::Dead) => {
+                s.now += wait_ns;
+                return Err(UsbError::Timeout);
+            }
+            Some(Wedge::ResetsOnly) => {
+                s.now += wait_ns;
+                return Ok(());
+            }
+            Some(Wedge::UntilPower) if !power => return Err(UsbError::Timeout),
+            _ => s.wedged = None,
+        }
+        s.need_reset = false;
+        s.halted_in = false;
+        s.halted_out = false;
+        s.phase = Phase::Cbw;
+        // A device fresh from a reset says so on its next media command (some of them: "medium may have changed").
+        for l in s.luns.iter_mut() {
+            if l.pending.is_empty() {
+                l.pending.push_back(Sense { key: 6, asc: 0x28, ascq: 0 });
+            }
+        }
+        Ok(())
+    }
+    fn give_up(&self) -> bool {
+        let mut s = self.0.st.lock().unwrap();
+        s.gave_up += 1;
+        s.log.push("give up".into());
+        s.port_resets
+    }
     fn bot_reset(&self) -> Result<(), UsbError> {
         let mut s = self.0.st.lock().unwrap();
         if s.gone {
             return Err(UsbError::Gone);
+        }
+        if s.wedged.is_some() {
+            s.log.push("reset failed".into());
+            s.now += crate::link::CBW_TIMEOUT_NS;
+            return Err(UsbError::Timeout);
         }
         if s.reset_failures_left > 0 {
             s.reset_failures_left -= 1;

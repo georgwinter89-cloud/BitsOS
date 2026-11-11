@@ -438,6 +438,7 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     new.mm.set_thp_disabled(new.mm_flags.thp_disabled());
     // `begin_new_exec`: dumpable again only when the effective ids are the real ones (else `suid_dumpable`, 0).
     if cred.euid != cred.uid || cred.egid != cred.gid {
+        t.prctl().clear_personality_on_setid();
         new.mm_flags.set_dumpable(0);
     }
     *new.saved_auxv.lock() = core::mem::take(&mut l.auxv);

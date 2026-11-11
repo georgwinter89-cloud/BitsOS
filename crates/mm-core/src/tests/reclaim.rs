@@ -204,3 +204,83 @@ fn light_allocations_never_reclaim() {
     }
     b.check().unwrap();
 }
+
+/// FS-STALL (the Mini-PC's panic: a heap allocation of 75600 bytes failed beside 20 GB of clean page cache): with
+/// every frame held as clean cache, a large and a small heap allocation take cache pages back instead of failing.
+#[test]
+fn heap_allocations_take_cache_pages_back() {
+    let b = super::heap::host_buddy(8);
+    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(false) }));
+    while let Some(p) = b.alloc(0, Zone::Normal, Kind::PageCache) {
+        h.frames.lock().unwrap().push(p);
+    }
+    assert!(b.set_reclaimer(h));
+    let heap = super::heap::heap(Some(b), None, 0);
+    let before = reclaim::HEAP_RESCUED.get();
+    let big = super::heap::lay(75_600, 8);
+    let p = heap.alloc(big);
+    assert!(!p.is_null(), "a 75600-byte block with the memory all clean cache");
+    let q = heap.alloc(super::heap::lay(200, 8));
+    assert!(!q.is_null(), "a small block with the memory all clean cache");
+    assert!(!h.calls.lock().unwrap().is_empty(), "the heap asked the cache");
+    assert!(reclaim::HEAP_RESCUED.get() > before);
+    super::heap::free_block(heap, p, big);
+    super::heap::free_block(heap, q, super::heap::lay(200, 8));
+    // Nothing left to take: the heap answers null (the caller's error), after asking.
+    h.frames.lock().unwrap().clear();
+    let mut held = Vec::new();
+    loop {
+        let r = heap.alloc(big);
+        if r.is_null() {
+            break;
+        }
+        held.push(r);
+    }
+    for r in held {
+        super::heap::free_block(heap, r, big);
+    }
+}
+
+/// Review R3: an allocation the cache cannot help (nothing to give, every round "busy") ends after a bounded number
+/// of rounds, sharing one grace budget, instead of asking again and again.
+#[test]
+fn a_heap_allocation_asks_the_cache_a_bounded_number_of_times() {
+    let b = super::heap::host_buddy(4);
+    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(true) }));
+    let mut held = Vec::new();
+    while let Some(p) = b.alloc(0, Zone::Normal, Kind::User) {
+        held.push(p);
+    }
+    assert!(b.set_reclaimer(h));
+    let heap = super::heap::heap(Some(b), None, 0);
+    let p = heap.alloc(super::heap::lay(75_600, 8));
+    assert!(p.is_null());
+    let calls = h.calls.lock().unwrap().len();
+    assert!(calls > 0 && calls <= 32 * reclaim::ROUNDS as usize, "{calls} reclaim calls for one allocation");
+}
+
+/// What the outer allocation's reclaim needs on the way (a grace queue chunk, vmap bookkeeping, an interrupt
+/// handler's block) is not held to the outer one's patience: the slot is paused, then back.
+#[test]
+fn a_nested_allocation_pauses_the_outer_keep() {
+    let outer = crate::reclaim::keep_reserve().unwrap();
+    assert!(outer.held() && crate::reclaim::keeps_reserve());
+    {
+        let inner = crate::reclaim::keep_reserve().unwrap();
+        assert!(!inner.held() && !crate::reclaim::keeps_reserve());
+    }
+    assert!(crate::reclaim::keeps_reserve());
+    drop(outer);
+    assert!(!crate::reclaim::keeps_reserve());
+}
+
+/// A thread inside reclaim takes the reserve at once (PF_MEMALLOC): no slot, no patience.
+#[test]
+fn a_reclaiming_thread_keeps_nothing() {
+    let inside = crate::reclaim::enter().unwrap();
+    assert!(crate::reclaim::reclaiming());
+    assert!(crate::reclaim::keep_reserve().is_none() && !crate::reclaim::keeps_reserve());
+    drop(inside);
+    assert!(!crate::reclaim::reclaiming());
+    assert!(crate::reclaim::keep_reserve().is_some_and(|k| k.held()));
+}

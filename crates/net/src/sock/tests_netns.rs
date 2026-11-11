@@ -800,7 +800,13 @@ fn proc_net_of_a_namespace() {
     assert_eq!(p.call(sys::bind, [x, at, name.len() as u64, 0, 0, 0]), 0);
     assert_eq!(p.call(sys::listen, [x, 1, 0, 0, 0, 0]), 0);
     let unix = render(Kind::Unix, &reader);
-    assert!(unix.ends_with(": 00000002 00000000 00010000 0001 01     0 @nw12\n"), "{unix}");
+    assert!(unix.contains(": 00000002 00000000 00010000 0001 01 ") && unix.ends_with(" @nw12\n"), "{unix}");
+    // The inode column names the socket: what a program finds at /proc/<pid>/fd as socket:[ino].
+    let ino = tcp.lines().nth(1).unwrap().split_whitespace().nth(9).unwrap();
+    assert!(ino.parse::<u64>().unwrap() > 0, "{tcp}");
+    let file = p.fds.get(t as usize).unwrap();
+    assert_eq!(file.file.link_name().unwrap(), alloc::format!("socket:[{ino}]"));
+    assert_eq!(alloc::format!("{}", file.stat().ino), ino);
     // The initial namespace sees none of them.
     let init_r = Reader { net: None, ids: None };
     assert!(!render(Kind::Unix, &init_r).contains("@nw12"));

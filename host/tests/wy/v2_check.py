@@ -287,7 +287,7 @@ def main():
     need(re.search(r"\"BitsOS MCP pointer\" pointer \(grabbed\)", comp.text) is not None, "MCP's pointer opened and grabbed", comp.text[-2000:])
     need("no inotify on" not in comp.text, "bitscomp watches /dev/input with inotify (FS-14), no 1 s rescan", comp.text[-2000:])
 
-    one = Job(c, "/bin/wyclient", ["--title", "one", "--pattern", "0"])
+    one = Job(c, "/bin/wyclient", ["--title", "one", "--pattern", "0", "--relative"])
     one.wait_for(r"configure \d+ \d+\n(.|\n)*configure", "client one configured by bitscomp")
     two = Job(c, "/bin/wyclient", ["--title", "two", "--pattern", "1"])
     two.wait_for(r"configure \d+ \d+\n(.|\n)*configure", "client two configured by bitscomp")
@@ -336,6 +336,8 @@ def main():
     one.wait_for(r"axis vertical 15\.0", "client one got one wheel step down")
     call(c, "send_mouse", {"dx": 40, "dy": 0})
     one.wait_for(r"motion \d+ \d+", "client one got a relative motion")
+    # WY-20: the same report for mouse look, accelerated and as the device counted it.
+    one.wait_for(r"relative [\d.]+ 0\.00 40\.00 0\.00", "client one got it through zwp_relative_pointer_v1")
 
     # WY-8: a client's own fullscreen on V2's fbdev: F11 through the kernel's keyboard reaches the focused client
     # one, which asks for it (as Brave does); it covers the whole screen (no bars, not two), Esc gives the tile back.

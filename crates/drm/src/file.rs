@@ -155,7 +155,7 @@ impl DrmFile {
     }
     /// The last close (`drm_gem_release`): every handle goes; objects are released outside the lock.
     pub fn release_handles(&self) -> usize {
-        let all: Vec<_> = self.handles.lock().drain();
+        let all = self.handles.lock().drain();
         let bufs = self.gem.prime_clear();
         self.gem.changed();
         for (_, o) in &all {

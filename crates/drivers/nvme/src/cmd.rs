@@ -1,9 +1,9 @@
-//! The command builder (R8a, NV-1): the only way to make a submission entry. Its opcode sets hold no command
-//! that changes media or the controller's configuration beyond its own queues: on the I/O side only Flush and
-//! Read (Write 01h, Write Uncorrectable 04h, Write Zeroes 08h, Dataset Management 09h, Copy 19h, the zone
-//! sends 79h/7Dh do not exist
-//! here), on the admin side only queue set-up, Identify, Get Log Page, Get Features and Set Features for the
-//! queue count (Format NVM, Sanitize, namespace management, firmware download/commit are not implemented).
+//! The command builder (R8a, NV-1, NV-2p): the only way to make a submission entry. On the I/O side Flush, Read
+//! and, only with a `WriteWindow` and only inside it, Write and Dataset Management (Write Uncorrectable 04h, Write
+//! Zeroes 08h, Copy 19h, the zone sends 79h/7Dh do not exist here); on the admin side only queue set-up, Identify,
+//! Abort (BL-1: a timed-out I/O command), Get Log Page, Get Features and Set Features for the queue count (Format NVM, Sanitize, namespace management,
+//! firmware download/commit are not implemented). The window check is the last thing before a command exists, so
+//! no bug above can write outside it.
 //! Admin and I/O commands are different types, so an admin opcode (01h = Create I/O SQ) can never be placed
 //! in an I/O queue, where the same byte means Write.
 //! Opcodes: linux-6.6/include/linux/nvme.h:821-840 (I/O), :1136-1165 (admin).
@@ -15,6 +15,7 @@ pub enum AdminOp {
     CreateSq = 0x01,
     GetLogPage = 0x02,
     CreateCq = 0x05,
+    Abort = 0x08,
     Identify = 0x06,
     SetFeatures = 0x09,
     GetFeatures = 0x0A,
@@ -25,17 +26,29 @@ pub enum AdminOp {
 #[repr(u8)]
 pub enum IoOp {
     Flush = 0x00,
+    Write = 0x01,
     Read = 0x02,
+    Dsm = 0x09,
 }
 
-pub const ADMIN_OPS: [AdminOp; 6] =
-    [AdminOp::CreateSq, AdminOp::GetLogPage, AdminOp::CreateCq, AdminOp::Identify, AdminOp::SetFeatures, AdminOp::GetFeatures];
-pub const IO_OPS: [IoOp; 2] = [IoOp::Flush, IoOp::Read];
+pub const ADMIN_OPS: [AdminOp; 7] =
+    [AdminOp::CreateSq, AdminOp::GetLogPage, AdminOp::CreateCq, AdminOp::Abort, AdminOp::Identify, AdminOp::SetFeatures, AdminOp::GetFeatures];
+pub const IO_OPS: [IoOp; 4] = [IoOp::Flush, IoOp::Write, IoOp::Read, IoOp::Dsm];
 
 /// I/O opcodes that change media (NVM command set): Write, Write Uncorrectable, Write Zeroes, Dataset
-/// Management, Copy, Zone Management Send, Zone Append. The ktest and host tests assert none of them was
-/// ever placed in a queue.
+/// Management, Copy, Zone Management Send, Zone Append. Without an armed window none of them is ever placed in
+/// a queue (the ktest and host tests assert it).
 pub const MEDIA_WRITE_IO_OPS: [u8; 7] = [0x01, 0x04, 0x08, 0x09, 0x19, 0x79, 0x7D];
+/// Of those, the ones the builder has no constructor for at all.
+pub const NEVER_BUILT_IO_OPS: [u8; 5] = [0x04, 0x08, 0x19, 0x79, 0x7D];
+/// CDW12 bit 30, Force Unit Access (linux-6.6/include/linux/nvme.h `NVME_RW_FUA` = 1 << 14 in the upper half).
+pub const CDW12_FUA: u32 = 1 << 30;
+/// CDW11 bit 2 of Dataset Management: deallocate (nvme.h `NVME_DSMGMT_AD`).
+pub const DSM_DEALLOCATE: u32 = 1 << 2;
+/// Identify Controller ONCS bit 2: Dataset Management supported (nvme.h `NVME_CTRL_ONCS_DSM`).
+pub const ONCS_DSM: u16 = 1 << 2;
+/// One Dataset Management range (nvme.h `struct nvme_dsm_range`).
+pub const DSM_RANGE_BYTES: usize = 16;
 /// Admin opcodes that change media or firmware (never built): FW commit/download, namespace management and
 /// attachment, Format NVM, Security Send, Sanitize.
 pub const MEDIA_WRITE_ADMIN_OPS: [u8; 7] = [0x10, 0x11, 0x0D, 0x15, 0x80, 0x81, 0x84];
@@ -127,6 +140,11 @@ impl AdminCmd {
         let v = (sq.max(1) - 1) as u32 | ((cq.max(1) - 1) as u32) << 16;
         admin(AdminOp::SetFeatures, 0, 0, [FEAT_NUM_QUEUES as u32, v, 0, 0, 0, 0])
     }
+    /// Abort the command `cid` of submission queue `sqid` (CDW10: SQID 15:0, CID 31:16; completion dword 0 bit 0
+    /// set = not aborted). Linux `nvme_timeout`, linux-7/drivers/nvme/host/pci.c:1886.
+    pub fn abort(sqid: u16, cid: u16) -> AdminCmd {
+        admin(AdminOp::Abort, 0, 0, [sqid as u32 | (cid as u32) << 16, 0, 0, 0, 0, 0])
+    }
     /// Create I/O CQ: physically contiguous (PC), interrupts enabled on `vector` when `ien`.
     pub fn create_cq(qid: u16, depth: u16, prp1: u64, vector: u16, ien: bool) -> AdminCmd {
         let cdw10 = qid as u32 | ((depth as u32 - 1) << 16);
@@ -141,7 +159,70 @@ impl AdminCmd {
     }
 }
 
+/// The only blocks of namespace `nsid` a media-changing command may name (NV-2p): `gpt::window`'s checked window and,
+/// while /boot lies there, the ESP `nvme_boot=` names (`with_boot`). Without one no such command can be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteWindow {
+    nsid: u32,
+    first: u64,
+    blocks: u64,
+    boot: Option<(u64, u64)>,
+}
+
+impl WriteWindow {
+    pub(crate) fn new(nsid: u32, first: u64, blocks: u64) -> WriteWindow {
+        WriteWindow { nsid, first, blocks, boot: None }
+    }
+    /// The same window with the boot ESP's beside it. None when the two overlap (a doubt refuses).
+    pub(crate) fn with_boot(self, first: u64, blocks: u64) -> Option<WriteWindow> {
+        let apart = first.checked_add(blocks).is_some_and(|e| e <= self.first) || self.first.saturating_add(self.blocks) <= first;
+        (blocks > 0 && apart).then_some(WriteWindow { boot: Some((first, blocks)), ..self })
+    }
+    pub(crate) fn without_boot(self) -> WriteWindow {
+        WriteWindow { boot: None, ..self }
+    }
+    pub fn range(&self) -> (u64, u64) {
+        (self.first, self.blocks)
+    }
+    pub fn boot(&self) -> Option<(u64, u64)> {
+        self.boot
+    }
+    pub fn nsid(&self) -> u32 {
+        self.nsid
+    }
+    /// The request lies inside one of the two ranges (never across both: they are apart).
+    pub fn range_holds(&self, nsid: u32, lba: u64, blocks: u64) -> bool {
+        let inside = |w| block::gpt::window::inside(w, lba, blocks);
+        nsid == self.nsid && (inside((self.first, self.blocks)) || self.boot.is_some_and(inside))
+    }
+}
+
+/// One deallocate range's bytes (context attributes 0, NLB, SLBA; nvme.h `struct nvme_dsm_range`).
+pub fn dsm_range(lba: u64, blocks: u32) -> [u8; DSM_RANGE_BYTES] {
+    let mut b = [0u8; DSM_RANGE_BYTES];
+    b[4..8].copy_from_slice(&blocks.to_le_bytes());
+    b[8..16].copy_from_slice(&lba.to_le_bytes());
+    b
+}
+
 impl IoCmd {
+    /// Write `blocks` (1..=65536) from the PRPs to `lba`. None outside `w`: no such command exists.
+    pub fn write(w: &WriteWindow, nsid: u32, lba: u64, blocks: u32, prp1: u64, prp2: u64, fua: bool) -> Option<IoCmd> {
+        if !(1..=65536).contains(&blocks) || !w.range_holds(nsid, lba, blocks as u64) {
+            return None;
+        }
+        let cdw12 = (blocks - 1) | if fua { CDW12_FUA } else { 0 };
+        Some(IoCmd(Sqe { opcode: IoOp::Write as u8, nsid, prp1, prp2, cdw: [lba as u32, (lba >> 32) as u32, cdw12, 0, 0, 0] }))
+    }
+    /// Dataset Management, deallocate, one range whose bytes (`dsm_range(lba, blocks)`) lie in the page at
+    /// `prp1`; the caller puts them there. None outside `w`.
+    pub fn deallocate(w: &WriteWindow, nsid: u32, lba: u64, blocks: u32, prp1: u64) -> Option<IoCmd> {
+        if blocks == 0 || !w.range_holds(nsid, lba, blocks as u64) {
+            return None;
+        }
+        // CDW10: number of ranges, 0-based.
+        Some(IoCmd(Sqe { opcode: IoOp::Dsm as u8, nsid, prp1, prp2: 0, cdw: [0, DSM_DEALLOCATE, 0, 0, 0, 0] }))
+    }
     /// Read `blocks` (1..=65536) logical blocks from `lba` into the PRPs.
     pub fn read(nsid: u32, lba: u64, blocks: u32, prp1: u64, prp2: u64) -> IoCmd {
         let nlb = blocks.clamp(1, 65536) - 1;

@@ -138,6 +138,14 @@ pub struct FwSeen {
 pub struct FakeGpu {
     pub a: Addrs,
     pub hostile: Hostile,
+    /// GX-9a: a job whose waves in this VMID hold it: a kill of them runs this (the test frees what the job waits for).
+    pub sq_release: Option<(u8, alloc::sync::Arc<dyn Fn() + Send + Sync>)>,
+    /// GX-8b: this many doorbell writes do not land (the BAR's mapping gone); the caller is told.
+    pub refuse_doorbells: u32,
+    /// GX-9b: runs once, at the next look at the clock (a CPU coming in between two steps of the code under test).
+    pub on_now: Option<alloc::boxed::Box<dyn FnMut() + Send>>,
+    /// GX-9b: messages taken when HDP was last flushed.
+    pub hdp_flushed_at: Option<usize>,
     pub now: u64,
     pub latency_us: u64,
     pub fb_mc: u64,
@@ -190,6 +198,8 @@ pub struct FakeGpu {
     pub gfx: super::gfxfake::GfxFake,
     /// GX-7k: MES (`mesfake`): both pipes, the KIQ, the scheduler's API, the queues it maps.
     pub mes: super::mesfake::MesFake,
+    /// GX-7n: the IH ring (`ihfake`).
+    pub ih: super::ihfake::IhFake,
 }
 
 const PAGE: u64 = 4096;
@@ -221,6 +231,10 @@ impl FakeGpu {
         let mut f = FakeGpu {
             a,
             hostile,
+            refuse_doorbells: 0,
+            sq_release: None,
+            on_now: None,
+            hdp_flushed_at: None,
             now: 0,
             latency_us: 50,
             fb_mc: FB_MC,
@@ -259,6 +273,7 @@ impl FakeGpu {
             sdma: super::sdmafake::SdmaFake::new(d),
             gfx: super::gfxfake::GfxFake::new(d),
             mes: super::mesfake::MesFake::new(d),
+            ih: super::ihfake::IhFake::new(d),
         };
         f.gfx.cold_gc(&mut f.gc);
         crate::gpucore::fakechip::cold_image(&mut f, d);
@@ -307,11 +322,13 @@ impl FakeGpu {
     fn sdma_kick(&mut self) {
         let hostile = self.sdma.hostile;
         let sys = self.sdma.sys.clone();
+        let host = self.sdma.host.clone();
         let mut writes = core::mem::take(&mut self.sdma.gpu_writes);
         let mut bus = super::sdmafake::FakeBus {
             hubs: &mut self.hubs,
             mem: &mut self.mem,
             sys: &sys,
+            host: host.as_deref(),
             fb_mc: self.fb_mc,
             fb_phys: self.fb_phys,
             fb_size: self.fb_size,
@@ -321,17 +338,20 @@ impl FakeGpu {
         };
         self.sdma.kick(&mut bus);
         self.sdma.gpu_writes = writes;
+        self.ih_collect();
     }
 
     /// GX-7j: the CP runs ring 0 on this fake's memory (GFXHUB VMID 0) and GC's registers.
     fn gfx_kick(&mut self) {
         let sys = self.sdma.sys.clone();
+        let host = self.sdma.host.clone();
         let mut writes = core::mem::take(&mut self.gfx.gpu_writes);
         let hostile = self.gfx.hostile;
         let mem = super::sdmafake::FakeBus {
             hubs: &mut self.hubs,
             mem: &mut self.mem,
             sys: &sys,
+            host: host.as_deref(),
             fb_mc: self.fb_mc,
             fb_phys: self.fb_phys,
             fb_size: self.fb_size,
@@ -342,6 +362,7 @@ impl FakeGpu {
         let mut bus = super::gfxfake::GfxBus { mem, gc: &mut self.gc, hostile };
         self.gfx.kick(&mut bus);
         self.gfx.gpu_writes = writes;
+        self.ih_collect();
     }
 
     /// GX-7k: MES runs what a doorbell moved (its KIQ, its scheduler, a mapped queue) on this fake's memory
@@ -358,6 +379,7 @@ impl FakeGpu {
 
     fn mes_kick_as(&mut self, what: super::mesfake::Rang, value: u64, cid: u32, gfx: bool, mec: bool) {
         let sys = self.sdma.sys.clone();
+        let host = self.sdma.host.clone();
         let mut writes = core::mem::take(&mut self.gfx.gpu_writes);
         let gfx_runs = gfx && self.gfx.get(crate::ipmod::gfx11::R::CpMeCntl) & crate::ipmod::gfx11::f::GFX_HALTS == 0 && !self.gfx.stuck();
         let mec_runs = mec && !self.gfx.mec_halted();
@@ -365,6 +387,7 @@ impl FakeGpu {
             hubs: &mut self.hubs,
             mem: &mut self.mem,
             sys: &sys,
+            host: host.as_deref(),
             fb_mc: self.fb_mc,
             fb_phys: self.fb_phys,
             fb_size: self.fb_size,
@@ -375,6 +398,114 @@ impl FakeGpu {
         let mut bus = super::gfxfake::GfxBus { mem, gc: &mut self.gc, hostile: super::gfxfake::GfxHostile::None };
         self.mes.kick(&mut bus, what, value, gfx_runs, mec_runs);
         self.gfx.gpu_writes = writes;
+        self.ih_collect();
+    }
+
+    /// GX-7n: the queues MES mapped look at their memory again (the chip's WAIT_REG_MEM keeps polling; the interpreter has
+    /// to be asked).
+    pub fn rerun_legacy(&mut self) {
+        self.mes_kick(super::mesfake::Rang::Legacy, 0);
+    }
+
+    /// GX-7n: an entry on the ring, as an engine's or a test's. False: the ring is off.
+    pub fn ih_raise(&mut self, e: &crate::ipmod::ih6::Iv) -> bool {
+        use crate::ipmod::ih6::{self, f};
+        let Some(a) = self.ih.a else { return false };
+        let cntl = self.reg(a.cntl);
+        if cntl & f::RB_ENABLE == 0 {
+            self.ih.refused += 1;
+            return false;
+        }
+        let base = u64::from(self.reg(a.base)) << 8 | u64::from(self.reg(a.base_hi) & 0xff) << 40;
+        let wb = u64::from(self.reg(a.wptr_lo)) | u64::from(self.reg(a.wptr_hi) & 0xffff) << 32;
+        let bytes: Vec<u8> = e.encode().iter().flat_map(|w| w.to_le_bytes()).collect();
+        if !self.poke(base + u64::from(self.ih.wptr), &bytes) {
+            self.ih.refused += 1;
+            return false;
+        }
+        let next = (self.ih.wptr + ih6::ENTRY_BYTES) & (ih6::RING_BYTES - 1);
+        self.ih.overflow |= next == self.ih.rptr && cntl & f::WPTR_OVERFLOW_ENABLE != 0;
+        self.ih.wptr = next;
+        self.ih.written += 1;
+        if cntl & f::WPTR_WRITEBACK_ENABLE != 0 {
+            let v = next | u32::from(self.ih.overflow);
+            let _ = self.poke(wb, &v.to_le_bytes());
+        }
+        if cntl & f::ENABLE_INTR != 0 {
+            self.ih.send();
+        }
+        true
+    }
+
+    /// GX-7n: what the engines raised since the last look, with their enable bits on; a GFXHUB fault likewise.
+    fn ih_collect(&mut self) {
+        use crate::gpucore::ih::{TIME_STAMP_INT_ENABLE, TRAP_ENABLE, VM_FAULT_INTERRUPTS};
+        use crate::ipmod::ih6::{CLIENT_GFX, CLIENT_GRBM_CP, SRC_CP_EOP, SRC_SDMA_TRAP, SRC_UTCL2_FAULT};
+        use amdgpu_fmt::sim::{Event, IntSrc};
+        let Some(a) = self.ih.a else { return };
+        let ints = |evs: &[Event], seen: usize| -> Vec<IntSrc> { evs.iter().skip(seen).filter_map(|e| if let Event::Interrupt { src, .. } = e { Some(*src) } else { None }).collect() };
+        let new_sdma = ints(&self.sdma.events, self.ih.seen[0]);
+        let new_gfx = ints(&self.gfx.events, self.ih.seen[1]);
+        let new_mes = ints(&self.mes.events, self.ih.seen[2]);
+        let seen_faults = self.ih.seen[3];
+        self.ih.seen = [self.sdma.events.len(), self.gfx.events.len(), self.mes.events.len(), self.hubs.faults.len()];
+        if self.reg_read(a.sdma0_cntl).unwrap_or(0) & TRAP_ENABLE != 0 {
+            for s in &new_sdma {
+                if *s == IntSrc::Trap {
+                    self.ih_raise(&super::ihfake::iv(CLIENT_GFX, SRC_SDMA_TRAP, 0, 0, 0));
+                }
+            }
+        }
+        // Which pipe a queue of MES's is on is the firmware's: any of the enabled bits lets it through.
+        let ring0 = self.reg_read(a.cp_int_ring0).unwrap_or(0) & TIME_STAMP_INT_ENABLE != 0;
+        let me1 = a.cp_me1_pipe.iter().all(|&p| self.reg_read(p).unwrap_or(0) & TIME_STAMP_INT_ENABLE != 0);
+        for s in new_gfx.iter().chain(&new_mes) {
+            if *s == IntSrc::EndOfPipe && ring0 && me1 {
+                self.ih_raise(&super::ihfake::iv(CLIENT_GRBM_CP, SRC_CP_EOP, 0, 0, 0));
+            }
+        }
+        let faults: Vec<super::hubfake::Faulted> = self.hubs.faults.iter().skip(seen_faults).copied().collect();
+        for x in faults {
+            if x.hub == crate::ipmod::gmc11::Hub::Gfx && self.reg_read(a.gc_ctx[usize::from(x.vmid) & 15]).unwrap_or(0) & VM_FAULT_INTERRUPTS != 0 {
+                self.ih_raise(&super::ihfake::iv(CLIENT_GFX, SRC_UTCL2_FAULT, 0, x.vmid, (x.mc >> 12) as u32));
+            }
+        }
+    }
+
+    /// GX-7n: the view the IH thread has past the chain.
+    pub fn ih_entry(&self, off: u32, out: &mut [u32; 8]) -> bool {
+        let Some(a) = self.ih.a else { return false };
+        let base = u64::from(self.reg(a.base)) << 8 | u64::from(self.reg(a.base_hi) & 0xff) << 40;
+        let mut b = [0u8; 32];
+        if !self.peek(base + u64::from(off), &mut b) {
+            return false;
+        }
+        for (o, c) in out.iter_mut().zip(b.chunks_exact(4)) {
+            *o = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        true
+    }
+
+    pub fn ih_wptr_wb(&self) -> Option<u32> {
+        let a = self.ih.a?;
+        let wb = u64::from(self.reg(a.wptr_lo)) | u64::from(self.reg(a.wptr_hi) & 0xffff) << 32;
+        let mut b = [0u8; 4];
+        self.peek(wb, &mut b).then(|| u32::from_le_bytes(b))
+    }
+
+    /// The doorbell of ih_v6_0_set_rptr, with its conditions: the aperture, IH_DOORBELL_RPTR, the range.
+    fn ih_doorbell(&mut self, value: u32) {
+        use crate::ipmod::ih6::{self, f};
+        let Some(a) = self.ih.a else { return };
+        let aper = self.sdma.addrs.and_then(|x| x.nbio).is_some_and(|n| self.regs.get(&n.aper_en).is_some_and(|v| v & 1 != 0));
+        let on = self.reg(a.doorbell_rptr) & f::DOORBELL_ENABLE != 0;
+        let range = self.sdma.port.get(&a.range).copied().unwrap_or(0);
+        if !(aper && on && range == ih6::doorbell_range(range)) {
+            return;
+        }
+        if self.ih.set_rptr(value) && self.reg(a.cntl) & f::RPTR_REARM != 0 && self.reg(a.cntl) & f::ENABLE_INTR != 0 {
+            self.ih.send();
+        }
     }
 
     /// A KM ring an earlier kernel left: live at `mc` with `size` bytes, write and read pointer at `wptr`.
@@ -438,6 +569,29 @@ impl FakeGpu {
         true
     }
 
+    /// GX-8a: `len` bytes from the page-aligned `mc` to zero, as the backend wipes a VRAM object, seen by the same
+    /// records as `mem_write`: a wipe of many GiB costs no fake memory.
+    pub fn wipe(&mut self, mc: u64, len: u64) -> bool {
+        if !self.in_fb(mc, len as usize) || mc % PAGE != 0 || len % PAGE != 0 {
+            return false;
+        }
+        if self.guard.mem_class(mc, len as usize).is_some() {
+            self.scanout_writes.push((mc, len as usize));
+        }
+        if let Some((tmc, size)) = self.tmr
+            && mc < tmc + u64::from(size)
+            && mc.saturating_add(len) > tmc
+        {
+            self.tmr_writes.push((mc, len as usize));
+            return false;
+        }
+        let pages: alloc::vec::Vec<u64> = self.mem.range(mc / PAGE..(mc + len) / PAGE).map(|(k, _)| *k).collect();
+        for p in pages {
+            self.mem.remove(&p);
+        }
+        true
+    }
+
     fn poke(&mut self, mc: u64, data: &[u8]) -> bool {
         if !self.in_fb(mc, data.len()) {
             return false;
@@ -478,6 +632,10 @@ impl FakeGpu {
 
     fn tick(&mut self) {
         self.smu.tick(self.now);
+        // GX-9b: PMFW writes its tables itself: no CPU store for the watchers to judge.
+        for (mc, bytes) in core::mem::take(&mut self.smu.table_writes) {
+            self.poke(mc, &bytes);
+        }
         for ev in core::mem::take(&mut self.smu.events) {
             self.gc.smu_event(ev, self.now);
         }
@@ -661,6 +819,7 @@ impl Hw for FakeGpu {
             Hostile::Wptr(v) if byte == a.c2pmsg_67 && self.wptr_writes > 0 => v,
             Hostile::WptrKept(v) if byte == a.c2pmsg_67 && self.wptr_writes == 0 => v,
             _ if byte == a.c2pmsg_67 => self.wptr,
+            _ if self.ih.owns_ptr(byte) => self.ih.read_ptr(byte),
             // SDMA0 lives in GC: gated with it.
             _ if self.sdma.owns_gc(byte) && self.gc.power != super::gcfake::Power::On => self.gc.read(byte).unwrap_or(u32::MAX),
             _ if self.sdma.owns_gc(byte) || self.sdma.owns_port(byte) => self.sdma.read(byte),
@@ -715,6 +874,25 @@ impl Hw for FakeGpu {
         let a = self.a;
         if byte == self.smn_window.0 {
             self.smn_index = value;
+        } else if self.ih.is_cntl(byte) {
+            use crate::ipmod::ih6::f;
+            if value & f::WPTR_OVERFLOW_CLEAR != 0 {
+                self.ih.overflow = false;
+            }
+            if value & f::RB_ENABLE == 0 {
+                self.ih.off();
+            }
+            self.regs.insert(byte, value & !f::WPTR_OVERFLOW_CLEAR);
+        } else if self.ih.owns_ptr(byte) {
+            if self.ih.a.is_some_and(|x| byte == x.wptr) {
+                self.ih.wptr = value & (crate::ipmod::ih6::RING_BYTES - 1) & !1;
+                self.ih.overflow = false;
+            } else if self.ih.set_rptr(value) {
+                let cntl = self.ih.a.map_or(0, |x| self.reg(x.cntl));
+                if cntl & crate::ipmod::ih6::f::RPTR_REARM != 0 && cntl & crate::ipmod::ih6::f::ENABLE_INTR != 0 {
+                    self.ih.send();
+                }
+            }
         } else if self.smu.write(byte, value, self.now) {
             // PMFW takes the message now: its effect on GC starts now, its answer comes later.
             for ev in core::mem::take(&mut self.smu.events) {
@@ -738,6 +916,11 @@ impl Hw for FakeGpu {
             self.gc.write(byte, value);
         } else if self.mes.owns(byte) {
             self.mes.write(byte, value);
+            // GX-9a: the waves that held the job are gone: the CP goes on.
+            if self.mes.byte_of_sq(byte) && let Some((vmid, go)) = self.sq_release.clone() && value == crate::ipmod::mes11::f::sq_kill(vmid) {
+                go();
+                self.rerun_legacy();
+            }
         } else if self.hubs.lut_owns(byte) {
             self.hubs.lut_write(byte, value);
         } else if let Some(h) = self.hubs.owns(byte) {
@@ -796,10 +979,25 @@ impl Hw for FakeGpu {
     }
 
     fn now_us(&mut self) -> u64 {
+        if let Some(mut hook) = self.on_now.take() {
+            hook();
+        }
         self.now
     }
 
+    fn flush_hdp(&mut self) {
+        self.hdp_flushed_at = Some(self.smu.taken.len());
+    }
+
     fn doorbell_write64(&mut self, index_dw: u32, value: u64) -> bool {
+        if self.refuse_doorbells > 0 {
+            self.refuse_doorbells -= 1;
+            return false;
+        }
+        if index_dw == crate::ipmod::ih6::DOORBELL_DW {
+            self.ih_doorbell(value as u32);
+            return true;
+        }
         let aper = self.sdma.addrs.and_then(|a| a.nbio).is_some_and(|n| self.regs.get(&n.aper_en).is_some_and(|v| v & 1 != 0));
         if self.gc.power == super::gcfake::Power::On && self.mes.has_doorbell(index_dw) {
             // GX-7k: MES's rings and the queues it mapped (GFX ring 0's doorbell too, once MES-mapped).

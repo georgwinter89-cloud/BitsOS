@@ -1,0 +1,44 @@
+[package]
+name = "bitsos-install"
+version = "0.1.0"
+edition = "2024"
+description = "Puts a BitsOS release onto a USB stick: chooses the stick, asks the questions, fetches and checks the release"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "bitsos_install"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsos-install"
+path = "src/main.rs"
+
+[dependencies]
+fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
+ruzstd = { version = "=0.8.1", default-features = false, features = ["std"] }
+lzma-rs = { version = "=0.3.0", default-features = false }
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+getrandom = "=0.3.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Ioctl",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The kernel's own FAT code and partition-table check judge what the installer writes.
+fs-fat = { path = "../../crates/fs-fat" }
+block = { path = "../../crates/block" }

@@ -6,6 +6,7 @@
 
 use crate::desc::Interface;
 use crate::device::Device;
+use crate::host::UsbError;
 use crate::hub;
 use crate::place::DeviceId;
 use alloc::string::String;
@@ -56,6 +57,9 @@ struct Binding {
 static DEVICES: SpinLock<Vec<Arc<Device>>> = SpinLock::named("usb.devices", Vec::new());
 static DRIVERS: SpinLock<Vec<&'static UsbDriver>> = SpinLock::named("usb.drivers", Vec::new());
 static BINDINGS: SpinLock<Vec<Binding>> = SpinLock::named("usb.bindings", Vec::new());
+/// Drivers that cope with their device being reset under them (`reset.rs`): their transfers end with `Cancelled`,
+/// they send them again; nothing else of theirs depends on the device's state.
+static RESET_AWARE: SpinLock<Vec<&'static str>> = SpinLock::named("usb.reset_aware", Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Bumped at every attach and detach (tests and tools watch it).
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +97,21 @@ pub fn find(id: DeviceId) -> Option<Arc<Device>> {
 /// (interface, driver name) of every binding of a device.
 pub fn bindings_of(id: DeviceId) -> Vec<(u8, &'static str)> {
     BINDINGS.lock().iter().filter(|b| b.device == id).map(|b| (b.interface, b.driver.name)).collect()
+}
+
+/// `driver` survives a reset of its device in place (Linux: its `pre_reset`/`post_reset`). A device with any other
+/// driver on it is never reset in place: it is detached and enumerated afresh (Linux unbinds such drivers).
+pub fn declare_reset_aware(driver: &'static str) {
+    let mut l = RESET_AWARE.lock();
+    if !l.contains(&driver) {
+        l.push(driver);
+    }
+}
+
+/// Every driver bound to the device survives a reset in place (no driver bound: nothing that could mind).
+pub fn survives_reset(id: DeviceId) -> bool {
+    let aware = RESET_AWARE.lock();
+    bindings_of(id).iter().all(|(_, d)| aware.contains(d))
 }
 
 /// Registers a class driver and offers it every interface no driver has yet.
@@ -192,6 +211,7 @@ pub fn detach(dev: &Arc<Device>) {
     if dev.gone.swap(true, Ordering::AcqRel) {
         return;
     }
+    dev.reset.fail_queued(UsbError::Gone);
     // Children first: a hub's devices are gone with it.
     if let Some(h) = hub::remove(dev.id) {
         for c in h.take_children() {

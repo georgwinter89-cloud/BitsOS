@@ -4,7 +4,7 @@
 //! - `cp.acpi.reserved_read`: the `hal::mmio` path for firmware-reserved memory (the HPET page as a
 //!   stand-in), and the guard keeping a read out of an "ECAM" window.
 //! - `cp.acpi.live.*`: the machine's own tables as `acpi::init` read them. Without the kernel hook (desk
-//!   change request CP-2/1) they end as `KTEST skip` (and a Warn event), never as a pass.
+//!   change request CP-2/1) they end as `KTEST FAIL` (and a Warn event), never as a pass.
 
 use crate::guard::{BarRange, PciFn, PciUnreadable, PciView, Refusal};
 use crate::kmem::KernelMem;
@@ -146,14 +146,14 @@ fn reserved_read() -> R {
     Ok(())
 }
 
-/// The live tables, or a `KTEST skip` when the kernel never called `acpi::init` (desk change request
-/// CP-2/1): the live checks then report as skipped, never as passed.
+/// The live tables, or a `KTEST FAIL` when the kernel never called `acpi::init` (desk change request
+/// CP-2/1): the live checks then report as failed, never as passed.
 fn live() -> Result<&'static Acpi, alloc::string::String> {
     match live::tables() {
         Some(t) => Ok(t),
         None => {
             klog::event!(Warn, "acpi", "ktest.no_init"; "acpi::init was not called by the kernel (desk change request CP-2/1); live checks skipped");
-            Err(ktest::skip("acpi::init not called by the kernel (desk change request CP-2/1)").err().unwrap_or_default())
+            Err(ktest::fail("acpi::init not called by the kernel (desk change request CP-2/1)").err().unwrap_or_default())
         }
     }
 }

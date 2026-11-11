@@ -16,7 +16,7 @@ use crate::jbd2::{self, gb32, Jsb, Layout, Tag};
 use alloc::vec::Vec;
 
 /// Where the journal's blocks lie on the volume: (first journal block, first volume block, count) runs.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Map {
     pub runs: Vec<(u32, u64, u32)>,
 }

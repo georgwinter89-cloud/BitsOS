@@ -1,6 +1,6 @@
 //! In-kernel tests (NW-2) on QEMU's `-device igb` (82576): `cargo xtask ktest --net igb nw.igc` and the
 //! scenario script `host/tests/nw/20-igb.sh` (QEMU user network: 10.0.2.2 answers ARP, its DHCP server offers
-//! 10.0.2.x). Without an igb card every test ends as `KTEST skip` (the gate boots with virtio-net).
+//! 10.0.2.x). Without an igb card every test ends as `KTEST FAIL` (the gate boots with virtio-net).
 //! On the Mini-PC only `nw.igc.probe` and `nw.igc.status` run (`Safe`: they only look). Everything that talks to
 //! QEMU's user network (10.0.2.2), restarts a card (that cuts the MCP link for seconds) or plays firmware on the
 //! PHY semaphore is `QemuOnly`.
@@ -70,7 +70,7 @@ macro_rules! card {
     ($need_link:expr) => {
         match card($need_link)? {
             Got::Card(d) => d,
-            Got::Skip(why) => return ktest::skip(why),
+            Got::Skip(why) => return ktest::fail(why),
         }
     };
 }
@@ -158,7 +158,7 @@ fn probe() -> TestResult {
     kassert!(hal::vectors::pollers().any(|p| p == "igc"), "poller registered");
     Ok(())
 }
-ktest!("nw.igc.probe", Safe, probe);
+ktest!("nw.igc.probe", RunHw("nw/20-igb"), probe);
 
 /// NW-4: the card runs on MSI-X (two vectors: link causes on 0, queue 0 on 1) through PC-3; INTx stays off; the
 /// stack is told the card is interrupt-driven; a ping to the leased router raises the queue vector's count and
@@ -168,7 +168,7 @@ fn irq() -> TestResult {
     let d = card!(true);
     if d.irq_setup() == "polled" {
         if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-            return ktest::skip("net_irq=off: polled by request");
+            return ktest::fail("net_irq=off: polled by request");
         }
         return Err(format!("{} runs polled: no MSI-X or MSI (see igc.irq_fallback / pci msi.refused)", d.name()));
     }
@@ -193,7 +193,7 @@ fn irq() -> TestResult {
     let st = net::stack::kernel().ok_or("no kernel stack")?;
     st.wait_configured(30_000_000_000);
     let Some(router) = st.interfaces().iter().find(|i| i.name == d.name()).and_then(|i| i.info.router) else {
-        return ktest::skip("the card has no lease with a router yet");
+        return ktest::fail("the card has no lease with a router yet");
     };
     let before = hw.irq_stats().map(|x| x.1).unwrap_or_default();
     let mut rtts = alloc::vec::Vec::new();
@@ -213,7 +213,7 @@ fn irq() -> TestResult {
     }
     Ok(())
 }
-ktest!("nw.igc.irq", Safe, irq);
+ktest!("nw.igc.irq", RunHw("nw/20-igb"), irq);
 
 /// Every card's state, link, STATUS and counters as `ktest.igc_status` events (the Mini-PC check list reads
 /// them: link 1000 full duplex, STATUS 0x280683, frames counted, 0 missed). Passes when every card runs and at
@@ -231,7 +231,7 @@ fn status() -> TestResult {
     kassert!(d.link().up);
     Ok(())
 }
-ktest!("nw.igc.status", Safe, status);
+ktest!("nw.igc.status", RunHw("nw/20-igb"), status);
 
 fn arp() -> TestResult {
     // NW-3: the stack keeps away from the cards while this test sends and receives raw frames.
@@ -245,7 +245,7 @@ fn arp() -> TestResult {
     kassert!(klog::metrics::snapshot().any(|(n, v)| n == "net.igc.rx_frames" && v > 0), "rx counter");
     Ok(())
 }
-ktest!("nw.igc.arp", QemuOnly, arp);
+ktest!("nw.igc.arp", Run("nw/20-igb"), arp);
 
 fn dhcp() -> TestResult {
     // NW-3: the stack keeps away from the cards while this test sends and receives raw frames.
@@ -270,7 +270,7 @@ fn dhcp() -> TestResult {
         ip = format!("{}.{}.{}.{}", o.your_ip[0], o.your_ip[1], o.your_ip[2], o.your_ip[3]));
     Ok(())
 }
-ktest!("nw.igc.dhcp", QemuOnly, dhcp);
+ktest!("nw.igc.dhcp", Run("nw/20-igb"), dhcp);
 
 fn poll_tx() -> TestResult {
     // NW-3: the stack keeps away from the cards while this test sends and receives raw frames.
@@ -285,7 +285,7 @@ fn poll_tx() -> TestResult {
     kassert!(d.poll_tx(&req), "works again once the lock is free");
     Ok(())
 }
-ktest!("nw.igc.poll_tx", QemuOnly, poll_tx);
+ktest!("nw.igc.poll_tx", Run("nw/20-igb"), poll_tx);
 
 /// Thousands of frames of every size through the ring (it wraps many times; ring-full answers are retried),
 /// a 14-byte frame among them (padded to 17), and every descriptor comes back.
@@ -327,7 +327,7 @@ fn burst() -> TestResult {
     klog::event!(Info, "net", "ktest.burst", ifname = d.name(), frames = n, ring_full_retries = full);
     Ok(())
 }
-ktest!("nw.igc.burst", QemuOnly, burst);
+ktest!("nw.igc.burst", Run("nw/20-igb"), burst);
 
 fn robust() -> TestResult {
     // NW-3: the stack keeps away from the cards while this test sends and receives raw frames.
@@ -356,7 +356,7 @@ fn robust() -> TestResult {
     arp_gateway(&d, false)?;
     Ok(())
 }
-ktest!("nw.igc.robust", QemuOnly, robust);
+ktest!("nw.igc.robust", Run("nw/20-igb"), robust);
 
 fn quiesce() -> TestResult {
     // NW-3: the stack keeps away from the cards while this test sends and receives raw frames.
@@ -399,7 +399,7 @@ fn quiesce() -> TestResult {
     arp_gateway(&d, false)?;
     Ok(())
 }
-ktest!("nw.igc.quiesce", QemuOnly, quiesce);
+ktest!("nw.igc.quiesce", Run("nw/20-igb"), quiesce);
 
 /// The restart path as the running kernel takes it: a failure, then nothing but sleeping here. The poller
 /// (idle thread) queues the retry, the `igc.restart` worker runs it with sleeping waits; the card comes back
@@ -430,7 +430,7 @@ fn worker_restart() -> TestResult {
     arp_gateway(&d, false)?;
     Ok(())
 }
-ktest!("nw.igc.worker_restart", QemuOnly, worker_restart);
+ktest!("nw.igc.worker_restart", Run("nw/20-igb"), worker_restart);
 
 /// nic-test boot 1: a firmware (or a previous kernel) left bus master, receive, transmit and DRV_LOAD on with
 /// rings pointing at memory that is not ours. The bring-up stops all of it before anything else and comes up.
@@ -452,7 +452,7 @@ fn firmware_left_on() -> TestResult {
     arp_gateway(&d, false)?;
     Ok(())
 }
-ktest!("nw.igc.firmware_left_on", QemuOnly, firmware_left_on);
+ktest!("nw.igc.firmware_left_on", Run("nw/20-igb"), firmware_left_on);
 
 /// V1 `nicpci.asm`: a link retrain left BAR0/BAR1 at 0 on the running I226. NW-3b's bring-up writes the header
 /// back through PC-2's `restore_config` (from the copy the last `enable_device` saved) before memory decoding
@@ -480,7 +480,7 @@ fn bars_lost() -> TestResult {
     arp_gateway(&d, false)?;
     Ok(())
 }
-ktest!("nw.igc.bars_lost", QemuOnly, bars_lost);
+ktest!("nw.igc.bars_lost", Run("nw/20-igb"), bars_lost);
 
 /// igb-test: the I226's PHY semaphore paths on QEMU's SWSM/SW_FW_SYNC, which behave as the I226's (V1 measured
 /// it): free, held by the "firmware" (bit 17 set by us), SMBI left set by a read, our own bit left set.
@@ -523,7 +523,7 @@ fn semaphore() -> TestResult {
     clean();
     Ok(())
 }
-ktest!("nw.igc.semaphore", QemuOnly, semaphore);
+ktest!("nw.igc.semaphore", Run("nw/20-igb"), semaphore);
 
 /// igb-test: the whole bring-up as an I226 on QEMU's 82576. Its PHY address 0 is an MDIC error there, so it
 /// must fail, after running the I226-only steps (packet buffer values, the erratum bit), and leave nothing
@@ -533,7 +533,7 @@ fn i226_path() -> TestResult {
     let _cards = net::stack::hold_cards();
     let d = card!(false);
     if d.model() != Model::I82576 {
-        return ktest::skip("runs the I226 steps on QEMU's 82576 only");
+        return ktest::fail("runs the I226 steps on QEMU's 82576 only");
     }
     Quiesce::quiesce(&*d);
     let hw = crate::MmioHw::map(d.hw().pci())?;
@@ -552,7 +552,7 @@ fn i226_path() -> TestResult {
     arp_gateway(&d, false)?;
     Ok(())
 }
-ktest!("nw.igc.i226_path", QemuOnly, i226_path);
+ktest!("nw.igc.i226_path", Run("nw/20-igb"), i226_path);
 
 /// Cable pull through QMP (`20-igb.sh`): `ktest.link_wait` -> `set_link off`, `ktest.link_down_seen` ->
 /// `set_link on`. Skips unless the card has the scenario's MAC.
@@ -561,7 +561,7 @@ fn link_qmp() -> TestResult {
     let _cards = net::stack::hold_cards();
     let d = card!(true);
     if d.mac_bytes() != QMP_MAC {
-        return ktest::skip("not the QMP scenario card (host/tests/nw/20-igb.sh)");
+        return ktest::fail("not the QMP scenario card (host/tests/nw/20-igb.sh)");
     }
     let seq = klog::next_seq();
     klog::event!(Info, "net", "ktest.link_wait"; "waiting for QMP set_link off");
@@ -575,7 +575,7 @@ fn link_qmp() -> TestResult {
     kassert!(ev.iter().any(|r| r.name == "link.down") && ev.iter().any(|r| r.name == "link.up"), "link events");
     Ok(())
 }
-ktest!("nw.igc.link_qmp", QemuOnly, link_qmp);
+ktest!("nw.igc.link_qmp", Run("nw/20-igb"), link_qmp);
 
 /// nic-test boots 1/7: two cards, the first without link (the script switches its link off through QMP before
 /// the kernel starts). Both run; the second carries traffic; the first refuses frames, then gets its link when
@@ -585,7 +585,7 @@ fn two_cards() -> TestResult {
     let _cards = net::stack::hold_cards();
     let list = crate::devices();
     let Some(first) = list.first().filter(|c| c.mac_bytes() == TWO_FIRST_MAC).cloned() else {
-        return ktest::skip("not the two-card scenario (host/tests/nw/20-igb.sh)");
+        return ktest::fail("not the two-card scenario (host/tests/nw/20-igb.sh)");
     };
     kassert!(list.len() == 2, "{} cards", list.len());
     let second = list[1].clone();
@@ -610,4 +610,4 @@ fn two_cards() -> TestResult {
     arp_gateway(&first, false)?;
     Ok(())
 }
-ktest!("nw.igc.two_cards", QemuOnly, two_cards);
+ktest!("nw.igc.two_cards", Run("nw/20-igb"), two_cards);

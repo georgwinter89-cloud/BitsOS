@@ -1,17 +1,20 @@
-//! NVMe, read side (NV-1; V2-PLAN §8a.8, R8a). Owner: NV.
+//! NVMe (NV-1, NV-2p; V2-PLAN §8a.8, R8a). Owner: NV.
 //!
-//! Internal NVMe stays read-only until NV-2 builds the write path: the write gate around it (`block::policy`'s
-//! `nvme_write`, MC-10's full-access tick) is live safety scaffolding that nothing behind it reads yet (C1).
+//! Read-only unless CONFIG's `nvme_write=on` and `nvme_data=` name one checked partition (`window`, Georg 5.11.2026):
+//! then Write and Dataset Management work inside exactly that range and nowhere else (`cmd::WriteWindow`). MC-10's
+//! full-access tick opens no window. `setup` is bitsdisk's keyboard-only way to that partition.
 //!
-//! - `regs`, `cmd`, `queue`, `prp`, `ident`: registers, the command builder (no media-writing opcode exists),
+//! - `regs`, `cmd`, `queue`, `prp`, `ident`: registers, the command builder (media-changing commands only inside a `WriteWindow`),
 //!   the ring logic, PRP lists and the Identify/SMART layouts, as plain logic (host-tested);
-//! - `ctrl::Controller<H>`: bring-up, admin and I/O queue (polled first, then the MSI-X vector), Read, Flush,
-//!   Get Log Page, recovery after a timeout, Quiesce; `mmio_hw::MmioHw` is the kernel's `Hw`, `fake` (tests)
-//!   a register-level fake controller;
-//! - `ns::NsDevice`: a namespace as `C: BlockDevice` (read-only), registered with FS-6's block layer as
-//!   `DiskKind::Nvme`; its partitions (`gpt`) as `DiskKind::Stacked` disks on top, so every write passes the
-//!   whole disk's refusal hook (no `nvme_write`, Windows/EFI partitions);
-//! - `tool`: the `nvme` MCP tool (read-only); `ktests`: `nv.*`.
+//! - `ctrl::Controller<H>`: bring-up, admin queue, recovery after a timeout, Quiesce; `mq` + `io` (BL-1): one I/O
+//!   queue pair per CPU (or per vector), tags with many commands in flight, completions reaped in each queue's
+//!   interrupt hook, PRP lists and bounce pages per command from the queue's pool, DMA straight to the caller's memory
+//!   where the device reaches it, Abort then reset after a timeout; `mmio_hw::MmioHw` is the kernel's `Hw`, `fake`
+//!   (tests) a register-level fake controller;
+//! - `ns::NsDevice`: a namespace as `C: BlockDevice` (read-only without a window), registered with FS-6's block layer as
+//!   `DiskKind::Nvme`; its partitions (`gpt`) as `DiskKind::Stacked` disks on top, each through its own
+//!   `Disk::part_port`, so a write passes the whole disk's hook and only the window's partition takes any;
+//! - `tool`: the MCP tools `nvme` (read-only) and `data_move`; `ktests`: `nv.*`.
 //!
 //! Probe maps BAR0 and starts a thread per controller (`nvme-init:<name>`, class Normal) that brings it up and
 //! registers its disks: the block layer reads each partition table through the new queue, which waits.
@@ -30,17 +33,27 @@ mod fake;
 pub use block::gpt;
 pub mod hw;
 pub mod ident;
+mod io;
 mod ktests;
+mod ktests_boot;
+mod ktests_mq;
+mod ktests_stack;
+mod ktests_window;
 mod mmio_hw;
+mod mq;
 pub mod ns;
 pub mod prp;
 pub mod queue;
 pub mod regs;
+pub mod setup;
+mod typed;
+pub mod window;
 #[cfg(test)]
 mod tests;
 mod tool;
 
-pub use ctrl::{CmdError, Config, Controller, Info, Namespace, State};
+pub use ctrl::{CmdError, Config, Controller, Info, Namespace, QueueInfo, State};
+pub use io::QueueStats;
 pub use mmio_hw::MmioHw;
 
 use alloc::format;
@@ -56,7 +69,8 @@ use ksync::SpinLock;
 pub type Nvme = Controller<MmioHw>;
 
 /// NVM Express by class (01h/08h/02h), as Linux matches PCI_CLASS_STORAGE_EXPRESS (drivers/nvme/host/pci.c).
-static MATCHES: [pci::Match; 1] = [pci::Match::Class { class: 0x01_08_02, mask: 0xFF_FF_FF }];
+const CLASS_NVME: u32 = 0x01_08_02;
+static MATCHES: [pci::Match; 1] = [pci::Match::Class { class: CLASS_NVME, mask: 0xFF_FF_FF }];
 
 pci::pci_driver!(pci::DriverEntry { name: "nvme", matches: &MATCHES, opt_in_key: None, probe });
 
@@ -70,6 +84,8 @@ static DEVICES: SpinLock<Vec<Entry>> = SpinLock::named("nvme.devices", Vec::new(
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 /// Controllers whose bring-up thread has not finished yet.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
+/// Controllers offered to `probe`, whatever became of them.
+static PROBED: AtomicUsize = AtomicUsize::new(0);
 
 /// Every controller probed, in probe order.
 pub fn controllers() -> Vec<Arc<Nvme>> {
@@ -91,6 +107,21 @@ pub fn settle(timeout_ns: u64) -> bool {
         sched::sleep_ns(5_000_000);
     }
     true
+}
+
+/// Whether no controller of this boot is still to come: the scan is done, each NVMe function of the tree was offered to
+/// `probe` and every bring-up ended. No fixed wait: a machine has as many as its tree says.
+pub(crate) fn looked_at_all() -> bool {
+    // PROBED first: `probe` counts PENDING before it, so a function seen as offered is seen as pending too.
+    let probed = PROBED.load(Ordering::Acquire);
+    let pending = PENDING.load(Ordering::Acquire);
+    let tree = pci::tree();
+    let functions = tree.iter().filter(|n| n.class == CLASS_NVME && n.untouched.is_none()).count();
+    all_seen(!tree.is_empty(), functions, probed, pending)
+}
+
+fn all_seen(scanned: bool, functions: usize, probed: usize, pending: usize) -> bool {
+    scanned && probed >= functions && pending == 0
 }
 
 /// The test images' bytes (host/tests/nv makes them the same way, the fake too): byte at offset `off` of an
@@ -124,8 +155,11 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
     // kernel must DMA nowhere until its queues are ours (PC-2 `disable_device`).
     let _ = f.disable_device();
     klog::event!(Info, "nvme", "probe", function = function.as_str(), vendor = klog::Hex(f.vendor as u64), device = klog::Hex(f.device as u64));
+    PENDING.fetch_add(1, Ordering::AcqRel);
+    PROBED.fetch_add(1, Ordering::AcqRel);
     let hw = MmioHw::map(f).map_err(|e| {
         klog::event!(Error, "nvme", "probe_failed", function = function.as_str(), error = e.as_str());
+        PENDING.fetch_sub(1, Ordering::AcqRel);
         e
     })?;
     let name = format!("nvme{}", NEXT.fetch_add(1, Ordering::AcqRel));
@@ -138,7 +172,6 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
             remove(&c);
         }
     });
-    PENDING.fetch_add(1, Ordering::AcqRel);
     let c = ctrl.clone();
     let job = move || {
         let up = c.start().is_ok();
@@ -146,6 +179,7 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
             register_disks(&c);
         }
         PENDING.fetch_sub(1, Ordering::AcqRel);
+        window::all_looked();
         if up && pci::registry::opted_in("nvme_busy") {
             busy(&c);
         }
@@ -198,13 +232,16 @@ pub fn register_disks(c: &Arc<Nvme>) {
             }
         };
         names.push(String::from(disk.name()));
-        let lower: Arc<dyn BlockDevice> = Arc::new(block::DiskDevice(disk.clone()));
+        // NV-2p: decided before the partitions exist, so the window's partition is writable from its first look.
+        let armed = window::boot_disk(c, ns.nsid, &disk);
         let scan = disk.scan();
-        let (parts, bad) = gpt::partitions(&lower, disk.name(), &scan.parts);
-        for b in bad {
-            klog::event!(Warn, "nvme", "part.skipped", disk = String::from(disk.name()), why = b);
-        }
-        for p in parts {
+        for (first, blocks, kind, number) in &scan.parts {
+            // Each partition goes through its own port: only the one whose range the armed window is takes writes.
+            let lower: Arc<dyn BlockDevice> = Arc::new(disk.part_port(*first, *blocks));
+            let Some(p) = gpt::Partition::new(lower, disk.name(), *first, *blocks, *number, kind) else {
+                klog::event!(Warn, "nvme", "part.skipped", disk = String::from(disk.name()), why = format!("{} at {first}+{blocks} outside the disk", gpt::part_name(disk.name(), *number)));
+                continue;
+            };
             let (num, first, blocks) = (p.number, p.first, p.blocks);
             match block::register(Arc::new(p), block::DiskKind::Stacked) {
                 Ok(d) => {
@@ -213,6 +250,10 @@ pub fn register_disks(c: &Arc<Nvme>) {
                 }
                 Err(e) => klog::event!(Warn, "nvme", "part.register_failed", disk = String::from(disk.name()), number = num, error = e.as_str()),
             }
+        }
+        // Said only now: /data's thread looks for the partition's disk as soon as this is known.
+        if let Some(w) = armed {
+            window::publish_armed(disk.name(), w.number);
         }
     }
     if let Some(e) = DEVICES.lock().iter_mut().find(|e| Arc::ptr_eq(&e.ctrl, c)) {
@@ -225,6 +266,7 @@ pub fn unregister_disks(c: &Arc<Nvme>) {
     let names: Vec<String> = DEVICES.lock().iter_mut().find(|e| Arc::ptr_eq(&e.ctrl, c)).map(|e| core::mem::take(&mut e.disks)).unwrap_or_default();
     for n in names.iter().rev() {
         block::unregister(n);
+        window::forget(n);
     }
 }
 

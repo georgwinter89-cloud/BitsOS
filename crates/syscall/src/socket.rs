@@ -131,9 +131,10 @@ fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     vfs::dentry::set_interrupt_check(killed);
     let p = c.proc;
     let mem = ProcMem(p);
-    let fs = c.thread.fs(p);
-    let ns = p.mount_ns();
-    let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: p.fs_cred(), subject: p.subject() };
+    let fs = proc::ThreadFs::new(c.thread, p);
+    let mut held = None;
+    let ns = p.mount_view(&mut held);
+    let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns, cred: p.fs_cred(), subject: p.subject() };
     let a: Args = c.args;
     f(&sys, a)
 }
@@ -144,9 +145,10 @@ pub(crate) fn dev_ioctl(c: &mut SysCtx<'_>, fd: usize, cmd: u64, arg: u64) -> Op
     net::sock::set_ns_hooks(&NS_HOOKS);
     let p = c.proc;
     let mem = ProcMem(p);
-    let fs = c.thread.fs(p);
-    let ns = p.mount_ns();
-    let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: p.fs_cred(), subject: p.subject() };
+    let fs = proc::ThreadFs::new(c.thread, p);
+    let mut held = None;
+    let ns = p.mount_view(&mut held);
+    let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns, cred: p.fs_cred(), subject: p.subject() };
     s::dev_ioctl(&sys, [fd as u64, cmd, arg, 0, 0, 0])
 }
 

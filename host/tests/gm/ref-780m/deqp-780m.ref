@@ -1,0 +1,48 @@
+# derived: vk_check.py says so in its output while this line stands; a capture has no such line.
+# GM-1d: what deqp-vk's subset must answer on the real 780M. Not a capture yet: no Linux run of the subset on the chip
+# exists (the host's GPU drives the desk's display and gets no jobs, the Mini-PC's CachyOS live run predates this).
+# Made so: every case a device with the capture's features can run must Pass; RADV of this same Mesa says on the fake
+# 780M (vulkaninfo equal to the chip's, host/tests/gm/40-vk-proof.sh checks it each run) that it supports every case.
+# A capture on CachyOS replaces this file: vkdiff.py deqp-ref <deqp-vk's stdout>.
+dEQP-VK.api.copy_and_blit.copy_commands2.buffer_to_buffer.partial Pass
+dEQP-VK.api.copy_and_blit.copy_commands2.buffer_to_buffer.regions Pass
+dEQP-VK.api.fill_and_update_buffer.dedicated_alloc.fill_buffer_first_one Pass
+dEQP-VK.api.smoke.asm_triangle_no_opname Pass
+dEQP-VK.api.smoke.asm_triangle Pass
+dEQP-VK.api.smoke.compute Pass
+dEQP-VK.api.smoke.create_sampler Pass
+dEQP-VK.api.smoke.create_shader Pass
+dEQP-VK.api.smoke.transfer Pass
+dEQP-VK.api.smoke.triangle Pass
+dEQP-VK.api.smoke.unused_resolve_attachment Pass
+dEQP-VK.compute.pipeline.basic.empty_shader Pass
+dEQP-VK.compute.pipeline.basic.empty_workgroup_all Pass
+dEQP-VK.draw.renderpass.simple_draw.simple_draw_instanced_triangle_list Pass
+dEQP-VK.draw.renderpass.simple_draw.simple_draw_triangle_list Pass
+dEQP-VK.draw.renderpass.simple_draw.simple_draw_triangle_strip Pass
+dEQP-VK.info.build Pass
+dEQP-VK.info.device_extensions Pass
+dEQP-VK.info.device_features Pass
+dEQP-VK.info.device_mandatory_features Pass
+dEQP-VK.info.device_memory_properties Pass
+dEQP-VK.info.device Pass
+dEQP-VK.info.device_properties Pass
+dEQP-VK.info.device_queue_family_properties Pass
+dEQP-VK.info.instance_extensions Pass
+dEQP-VK.info.memory_limits Pass
+dEQP-VK.memory.allocation.basic.percent_1.forward.count_12 Pass
+dEQP-VK.memory.allocation.basic.percent_1.mixed.count_12 Pass
+dEQP-VK.memory.allocation.basic.size_64.forward.count_100 Pass
+dEQP-VK.memory.allocation.basic.size_64.forward.count_1 Pass
+dEQP-VK.memory.mapping.dedicated_alloc.buffer.full.1048577.flush Pass
+dEQP-VK.memory.mapping.suballocation.full.1048577.flush Pass
+dEQP-VK.memory.mapping.suballocation.full.1048577.invalidate Pass
+dEQP-VK.pipeline.monolithic.timestamp.calibrated.host_domain_test Pass
+dEQP-VK.query_pool.occlusion_query.basic_conservative Pass
+dEQP-VK.synchronization.basic.binary_semaphore.chain Pass
+dEQP-VK.synchronization.basic.binary_semaphore.one_queue Pass
+dEQP-VK.synchronization.basic.event.device_set_reset Pass
+dEQP-VK.synchronization.basic.event.host_set_reset Pass
+dEQP-VK.synchronization.basic.fence.empty_submit Pass
+dEQP-VK.synchronization.basic.fence.multi Pass
+dEQP-VK.synchronization.basic.fence.one Pass

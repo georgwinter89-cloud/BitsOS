@@ -58,7 +58,7 @@ impl MemStats {
 }
 
 /// smaps numbers of one VMA or of several summed (smaps_rollup). Sizes in bytes, Pss values in bytes <<
-/// `PSS_SHIFT` (Linux `struct mem_size_stats`; fields V2 never has, as Swap, Locked or huge pages, are 0 there).
+/// `PSS_SHIFT` (Linux `struct mem_size_stats`; fields V2 never has, as Swap or huge pages, are 0 there).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageUsage {
     /// Rss.
@@ -68,6 +68,8 @@ pub struct PageUsage {
     pub pss_anon: u64,
     pub pss_file: u64,
     pub pss_shmem: u64,
+    /// Pss of VM_LOCKED VMAs (`pss_locked`, smaps' `Locked:`).
+    pub pss_locked: u64,
     pub shared_clean: u64,
     pub shared_dirty: u64,
     pub private_clean: u64,
@@ -85,6 +87,7 @@ impl PageUsage {
         self.pss_anon += o.pss_anon;
         self.pss_file += o.pss_file;
         self.pss_shmem += o.pss_shmem;
+        self.pss_locked += o.pss_locked;
         self.shared_clean += o.shared_clean;
         self.shared_dirty += o.shared_dirty;
         self.private_clean += o.private_clean;
@@ -159,6 +162,9 @@ fn vma_usage(root: u64, v: &Vma, lo: u64, hi: u64) -> PageUsage {
         };
         u.account(c, maps, l.flags.contains(PageFlags::ACCESSED), dirty);
     });
+    if v.flags.locked {
+        u.pss_locked = u.pss;
+    }
     u
 }
 

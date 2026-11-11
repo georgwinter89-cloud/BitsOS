@@ -629,3 +629,259 @@ fn a_stop_waits_for_the_command_under_way_and_then_no_command_starts() {
     s.resume_io();
     assert_eq!(read(d, 3, 1).unwrap(), vec![5; 512]);
 }
+
+// ---- US-R: recoveries beyond the Bulk-Only reset
+
+fn wedge_setup(w: crate::sim::Wedge) -> (Arc<SimDev>, Arc<crate::disk::MsdDisk<SimLink>>) {
+    let (dev, d) = setup(Lun::new(512, 4096));
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    dev.with(|s| {
+        s.port_resets = true;
+        s.wedged = Some(w);
+    });
+    (dev, d)
+}
+
+#[test]
+fn a_wedged_stick_costs_a_port_reset_and_the_read_under_way_survives() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPortReset);
+    let t0 = dev.with(|s| s.now);
+    assert_eq!(read(&d, 100, 16).unwrap(), expect(100, 16, 512), "the request survives");
+    let st = d.storage().with_io(P, |io| io.bot.stats).unwrap();
+    assert_eq!((st.port_resets, st.reset_failures), (1, 1));
+    assert_eq!(dev.log_has("reset failed"), 1, "Bulk-Only reset first");
+    assert_eq!(dev.log_has("port reset"), 1);
+    assert_eq!(dev.with(|s| s.gave_up), 0);
+    assert!(!d.is_gone());
+    assert!(!d.storage().with_io(P, |io| io.bot.unhealthy()).unwrap(), "well again");
+    // Its time stays well inside the gate's bound.
+    assert!(dev.with(|s| s.now) - t0 < crate::disk::GATE_TIMEOUT_NS / 2);
+    // The next trouble starts at the bottom again: Bulk-Only reset first.
+    dev.with(|s| s.log.clear());
+    dev.fault(Fault::PhaseError);
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    assert_eq!((dev.log_has("reset"), dev.log_has("port reset")), (1, 0));
+}
+
+#[test]
+fn medium_may_have_changed_after_our_own_port_reset_is_no_medium_change() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPortReset);
+    let g = d.generation();
+    assert_eq!(read(&d, 8, 8).unwrap(), expect(8, 8, 512));
+    assert_eq!(d.generation(), g, "the file system above has nothing to look at");
+    // Without a port reset in sight the same sense is a medium change: the request fails on removable media.
+    dev.with(|s| s.luns[0].pending.push_back(Sense { key: 6, asc: 0x28, ascq: 0 }));
+    assert_eq!(read(&d, 8, 8), Err(DevError::Io));
+    assert_ne!(d.generation(), g);
+}
+
+#[test]
+fn a_stick_that_passes_its_resets_but_fails_its_commands_climbs_the_ladder() {
+    let (dev, d) = setup(Lun::new(512, 4096));
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    dev.with(|s| {
+        s.port_resets = true;
+        s.fail_cbws = 3;
+    });
+    assert_eq!(read(&d, 100, 16).unwrap(), expect(100, 16, 512));
+    let lines = dev.with(|s| s.log.iter().filter(|l| matches!(l.as_str(), "reset" | "port reset" | "port reset power")).cloned().collect::<Vec<_>>());
+    assert_eq!(lines, ["reset", "port reset", "port reset"], "one rung per failed command");
+    assert_eq!(dev.with(|s| s.gave_up), 0);
+}
+
+#[test]
+fn only_power_brings_this_stick_back_and_the_last_rung_has_it() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPower);
+    assert_eq!(read(&d, 100, 16).unwrap(), expect(100, 16, 512));
+    assert_eq!(dev.log_has("port reset power"), 1);
+    assert_eq!(dev.log_has("port reset"), 3, "two without power, one with");
+    assert_eq!(dev.with(|s| s.gave_up), 0);
+}
+
+#[test]
+fn only_after_the_whole_ladder_does_it_give_up_and_everything_ends_at_once_from_then_on() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::Dead);
+    let t0 = dev.with(|s| s.now);
+    assert_eq!(read(&d, 100, 16), Err(DevError::Io));
+    assert_eq!(dev.with(|s| s.gave_up), 1);
+    let log = dev.with(|s| s.log.clone());
+    let order: Vec<&str> = log.iter().map(|l| l.as_str()).filter(|l| l.contains("reset") || *l == "give up").collect();
+    assert_eq!(order, ["reset failed", "port reset", "port reset", "port reset power", "give up"]);
+    assert!(dev.with(|s| s.now) - t0 < crate::disk::GATE_TIMEOUT_NS, "the gate's bound holds");
+    // The worker detaches it soon; until then a request costs nothing more.
+    let t1 = dev.with(|s| s.now);
+    assert_eq!(read(&d, 100, 16), Err(DevError::Io));
+    assert_eq!(dev.with(|s| s.gave_up), 1, "asked once");
+    assert_eq!(dev.with(|s| s.now), t1);
+    assert!(d.storage().with_io(P, |io| io.bot.unhealthy()).unwrap());
+}
+
+#[test]
+fn a_port_reset_that_fails_once_goes_on_up_the_ladder_at_once() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPortReset);
+    dev.with(|s| s.port_failures_left = 1);
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    let st = d.storage().with_io(P, |io| io.bot.stats).unwrap();
+    assert_eq!((st.port_reset_failures, st.port_resets), (1, 1));
+}
+
+#[test]
+fn unplugged_during_the_ladder_ends_with_gone() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::Dead);
+    dev.with(|s| s.gone = true);
+    assert_eq!(read(&d, 0, 8), Err(DevError::Gone));
+    assert_eq!(dev.with(|s| s.gave_up), 0);
+}
+
+#[test]
+fn the_sense_after_a_transport_error_is_retried_not_failed() {
+    let (dev, d) = setup(Lun::new(512, 4096));
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    // The READ fails with a sense, and the REQUEST SENSE's CBW goes into its timeout: recovery, then all again.
+    dev.with(|s| s.port_resets = true);
+    dev.fault(Fault::Check(Sense { key: 6, asc: 0x29, ascq: 0 }));
+    dev.fault(Fault::Timeout(Stage::Cbw));
+    assert_eq!(read(&d, 8, 8).unwrap(), expect(8, 8, 512));
+}
+
+#[test]
+fn a_flush_survives_a_wedge_too() {
+    let (dev, _s, ds) = setup_with(vec![Lun::new(512, 4096)], 65536, true);
+    let d = &ds[0];
+    d.write_blocks(0, &[7u8; 512], false, P).unwrap();
+    dev.with(|s| {
+        s.port_resets = true;
+        s.wedged = Some(crate::sim::Wedge::UntilPortReset);
+    });
+    d.flush().unwrap();
+    d.write_blocks(1, &[8u8; 512], true, P).unwrap();
+    assert_eq!(dev.log_has("port reset"), 1);
+}
+
+#[test]
+fn a_device_counts_as_sick_for_the_stop_until_a_command_passed_again() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPortReset);
+    assert!(!d.storage().unhealthy());
+    // Ended up in the ladder: sick.
+    dev.with(|s| s.port_failures_left = 100);
+    assert_eq!(read(&d, 0, 8), Err(DevError::Io));
+    assert!(d.storage().unhealthy());
+    // A stop waiting for a command that never ended counts as sick too (`stop_storages`); idle and well does not.
+    let (_dev, d) = setup(Lun::new(512, 4096));
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    assert!(!d.storage().unhealthy());
+}
+
+// The longest a wedged stick holds its gate: the stage that ran out first (the longest there is, with the abort's grace)
+// plus everything the ladder does; others behind the gate wait at most `GATE_TIMEOUT_NS`.
+#[test]
+fn a_wedged_stick_holds_its_gate_under_the_timeout() {
+    const FIRST_STAGE: u64 = crate::link::DATA_TIMEOUT_MAX_NS + 2_000_000_000;
+    for w in [crate::sim::Wedge::Dead, crate::sim::Wedge::ResetsOnly] {
+        let (dev, d) = wedge_setup(w);
+        let t0 = dev.with(|s| s.now);
+        assert_eq!(read(&d, 100, 16), Err(DevError::Io));
+        let ladder = dev.with(|s| s.now) - t0;
+        assert_eq!(dev.with(|s| s.gave_up), 1, "{w:?} ends in giving up");
+        assert_eq!(dev.log_has("port reset power"), 1, "{w:?}: the power rung is not left out");
+        assert!(FIRST_STAGE + ladder < crate::disk::GATE_TIMEOUT_NS, "{w:?}: {} s", (FIRST_STAGE + ladder) / 1_000_000_000);
+    }
+    assert!(crate::link::data_timeout_ns(1 << 20) <= crate::link::DATA_TIMEOUT_MAX_NS);
+}
+
+#[test]
+fn after_the_power_rung_a_passed_command_starts_the_ladder_over() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPower);
+    assert_eq!(read(&d, 100, 16).unwrap(), expect(100, 16, 512));
+    assert!(!d.storage().unhealthy());
+    dev.with(|s| s.log.clear());
+    dev.fault(Fault::PhaseError);
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    assert_eq!((dev.log_has("reset"), dev.log_has("port reset")), (1, 0), "the bottom rung again");
+}
+
+#[test]
+fn a_medium_error_never_leaves_the_bottom_of_the_ladder() {
+    let (dev, d) = setup(Lun::new(512, 4096));
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    dev.with(|s| s.port_resets = true);
+    for _ in 0..8 {
+        dev.fault(Fault::Check(Sense { key: 3, asc: 0x11, ascq: 0 }));
+    }
+    for _ in 0..8 {
+        assert_eq!(read(&d, 8, 8), Err(DevError::Io));
+    }
+    let st = d.storage().with_io(P, |io| io.bot.stats).unwrap();
+    assert_eq!((st.resets, st.port_resets, st.transport_errors), (0, 0, 0));
+    assert_eq!(dev.with(|s| s.gave_up), 0);
+    assert!(!d.storage().unhealthy());
+    dev.with(|s| s.faults.clear());
+    assert_eq!(read(&d, 8, 8).unwrap(), expect(8, 8, 512));
+}
+
+#[test]
+fn a_sector_that_hangs_costs_its_request_and_not_the_disk() {
+    let (dev, _s, ds) = setup_with(vec![Lun::new(512, 4096)], 1 << 20, false);
+    let d = &ds[0];
+    assert_eq!(read(d, 0, 8).unwrap(), expect(0, 8, 512));
+    dev.with(|s| {
+        s.port_resets = true;
+        s.hang_reads = 1000;
+    });
+    // The device answers after each reset: this one request has its three attempts, a rung after each, and each data
+    // phase at its longest. No power, nothing given up: those are for a device that stopped answering.
+    let t0 = dev.with(|s| s.now);
+    assert_eq!(read(d, 8, 2048), Err(DevError::Io));
+    assert!(dev.with(|s| s.now) - t0 < crate::disk::GATE_TIMEOUT_NS);
+    assert!(dev.with(|s| s.now) - t0 > crate::link::DATA_TIMEOUT_MAX_NS, "the sector's own time");
+    assert_eq!(dev.log_has("port reset"), 2);
+    assert_eq!(dev.log_has("port reset power"), 0);
+    assert_eq!(dev.with(|s| s.gave_up), 0);
+    assert!(!d.is_gone());
+    assert!(d.storage().unhealthy(), "not known to be well until a command passes");
+    // Another sector works, and the ladder is at its bottom again.
+    dev.with(|s| s.hang_reads = 0);
+    assert_eq!(read(d, 100, 8).unwrap(), expect(100, 8, 512));
+    assert!(!d.storage().unhealthy());
+    dev.with(|s| s.log.clear());
+    dev.fault(Fault::PhaseError);
+    assert_eq!(read(d, 0, 8).unwrap(), expect(0, 8, 512));
+    assert_eq!(dev.log_has("port reset"), 0);
+}
+
+#[test]
+fn a_stick_that_answers_but_hangs_on_every_read_still_climbs_request_by_request() {
+    let (dev, d) = setup(Lun::new(512, 4096));
+    assert_eq!(read(&d, 0, 8).unwrap(), expect(0, 8, 512));
+    dev.with(|s| {
+        s.port_resets = true;
+        s.hang_reads = 1000;
+    });
+    for _ in 0..6 {
+        assert_eq!(read(&d, 8, 8), Err(DevError::Io));
+    }
+    assert_eq!(dev.log_has("port reset power"), 1);
+    assert_eq!(dev.with(|s| s.gave_up), 1);
+}
+
+#[test]
+fn another_capacity_after_a_port_reset_is_a_medium_change() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPortReset);
+    let g = d.generation();
+    dev.with(|s| s.luns[0].blocks = 2048);
+    assert_eq!(read(&d, 8, 8), Err(DevError::Io));
+    assert_ne!(d.generation(), g, "the file system has to look again");
+    assert_eq!(read(&d, 8, 8).unwrap(), expect(8, 8, 512), "the new medium works");
+    assert_eq!(dev.log_has("port reset"), 1);
+}
+
+#[test]
+fn the_same_capacity_after_a_port_reset_is_asked_once() {
+    let (dev, d) = wedge_setup(crate::sim::Wedge::UntilPortReset);
+    let g = d.generation();
+    dev.with(|s| s.cdbs.clear());
+    assert_eq!(read(&d, 8, 8).unwrap(), expect(8, 8, 512));
+    assert_eq!(read(&d, 16, 8).unwrap(), expect(16, 8, 512));
+    assert_eq!(dev.opcodes().iter().filter(|o| **o == scsi::op::READ_CAPACITY_10).count(), 1);
+    assert_eq!(d.generation(), g);
+}

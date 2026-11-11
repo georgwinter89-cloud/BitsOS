@@ -128,7 +128,7 @@ ktest::ktest!("gx.snapshot.rerun", Safe, snapshot_rerun);
 /// a visible plane on it, and the GOP framebuffer reserved in the BO manager.
 fn attach_stable() -> ktest::TestResult {
     let Some(g) = Gpu::get() else {
-        return ktest::skip("no AMD display function (QEMU)");
+        return ktest::fail("no AMD display function (QEMU)");
     };
     let (a, b) = (g.check_display(), g.check_display());
     kassert!(a.as_ref().map_err(|e| e.why) == b.as_ref().map_err(|e| e.why), "verdict changed: {a:?} / {b:?}");
@@ -155,7 +155,7 @@ fn attach_stable() -> ktest::TestResult {
     );
     Ok(())
 }
-ktest::ktest!("gx.attach.stable", Safe, attach_stable);
+ktest::ktest!("gx.attach.stable", Hardware, attach_stable);
 
 /// GX-3: the flip engine is installed into gopfb's fbdev, `dcn_flip` is GX's (safety Change) and checks its
 /// arguments before anything else; without an AMD display (QEMU) nothing flips and fbdev copies.
@@ -184,17 +184,17 @@ ktest::ktest!("gx.flip.installed", Safe, flip_installed);
 /// the OTG lock is never left set, no write reads back different; the console gets the screen back.
 fn flip_frames() -> ktest::TestResult {
     if DcnRegs::attached().is_none() {
-        return ktest::skip("no AMD display function (QEMU)");
+        return ktest::fail("no AMD display function (QEMU)");
     }
     let s = crate::live::attach().ok_or("display attached but not taken over for flips (see dcn flip.off)")?;
     if !s.active() && !s.rearm() {
         return Err(String::from("the surface fell back and A0 is not settled").into());
     }
     let Some((w, h, base)) = display::snapshot() else {
-        return ktest::skip("no console picture");
+        return ktest::fail("no console picture");
     };
     let Ok(guard) = display::take_scanout("gx.ktest.flip") else {
-        return ktest::skip("the screen is held by a program");
+        return ktest::fail("the screen is held by a program");
     };
     let (_, bad0) = dcn::write_counts();
     let before = s.state();
@@ -219,7 +219,7 @@ fn flip_frames() -> ktest::TestResult {
     kassert!(dcn::write_counts().1 == bad0, "a flip write read back different (dcn_writes)");
     Ok(())
 }
-ktest::ktest!("gx.flip.frames", Safe, flip_frames);
+ktest::ktest!("gx.flip.frames", Picture, flip_frames);
 
 /// GX-4: `display_mode` is GX's (safety Change), checks its arguments and the request text before anything else;
 /// the console command `mode` is registered. QEMU: no engine, so every switch is refused with that reason and the
@@ -259,7 +259,7 @@ ktest::ktest!("gx.mode.tool", Safe, mode_tool);
 /// scaler check only while no switch has written).
 fn mode_gates() -> ktest::TestResult {
     if DcnRegs::attached().is_none() {
-        return ktest::skip("no AMD display function (QEMU)");
+        return ktest::fail("no AMD display function (QEMU)");
     }
     let s = crate::live::attach().ok_or("display attached but not taken over (see dcn flip.off)")?;
     let boot = s.mode_boot();
@@ -276,7 +276,7 @@ fn mode_gates() -> ktest::TestResult {
         Err(g) => Err(format!("a switch would be refused: {g}").into()),
     }
 }
-ktest::ktest!("gx.mode.gates", Safe, mode_gates);
+ktest::ktest!("gx.mode.gates", Hardware, mode_gates);
 
 /// GX-4 on the Mini-PC: one switch to a listed size below the link's (`mode::trial`: the largest with the link's
 /// aspect, else the largest) and straight back (`undo`): both land, the viewport reads the size each time, every
@@ -284,26 +284,26 @@ ktest::ktest!("gx.mode.gates", Safe, mode_gates);
 /// Skipped while a program holds the screen or a switch waits for a confirmation (rerunnable).
 fn mode_roundtrip() -> ktest::TestResult {
     if DcnRegs::attached().is_none() {
-        return ktest::skip("no AMD display function (QEMU)");
+        return ktest::fail("no AMD display function (QEMU)");
     }
     let s = crate::live::attach().ok_or("display attached but not taken over (see dcn flip.off)")?;
     if display::scanout_holder().is_some() {
-        return ktest::skip("the screen is held by a program");
+        return ktest::fail("the screen is held by a program");
     }
     let state = call("display_mode", "{}").map_err(|e| format!("{e:?}"))?;
     if state.contains("waiting for a confirmation") || state.contains("BLOCKED") {
-        return ktest::skip("a switch waits for a confirmation or the switch is blocked");
+        return ktest::fail("a switch waits for a confirmation or the switch is blocked");
     }
     let (w, h) = s.size();
     let home = s.mode_boot().map_or(crate::mode::Size::new(w, h), |(_, h)| h);
     if (w, h) != (home.w, home.h) {
-        return ktest::skip("a confirmed switch shows another size than the boot one");
+        return ktest::fail("a confirmed switch shows another size than the boot one");
     }
     let (list, src) = crate::modeset::offered(home);
     let p = *s.pipes().first().ok_or("no pipe")?;
     let link = crate::mode::Size::of_dim(crate::mode::read(s.regs(), &p).map_err(|e| format!("{e:?}"))?.recout);
     let Some(to) = crate::mode::trial(&list, home, link) else {
-        return ktest::skip("no smaller mode on offer");
+        return ktest::fail("no smaller mode on offer");
     };
     klog::event!(Info, "dcn", "mode.trial", size = format!("{to}"), source = src.name(); "round trip through a listed mode");
     let before = crate::mode::read(s.regs(), &p).map_err(|e| format!("{e:?}"))?;
@@ -320,7 +320,7 @@ fn mode_roundtrip() -> ktest::TestResult {
     kassert!(dcn::write_counts().1 == bad0, "a mode write read back different (dcn_writes)");
     Ok(())
 }
-ktest::ktest!("gx.mode.roundtrip", Safe, mode_roundtrip);
+ktest::ktest!("gx.mode.roundtrip", Picture, mode_roundtrip);
 
 struct NoUser;
 impl gopfb::fbdev::abi::UserIo for NoUser {
@@ -345,16 +345,16 @@ fn fb0_var() -> Result<[u32; 4], String> {
 /// and the VT grid show the new size. QemuOnly: on the Mini-PC the software side must not move without the engine.
 fn mode_follow() -> ktest::TestResult {
     let Some(f) = crate::modeset::follower() else {
-        return ktest::skip("no follower installed (GX-4 change request 1 not applied)");
+        return ktest::fail("no follower installed (GX-4 change request 1 not applied)");
     };
     if DcnRegs::attached().is_some() {
-        return ktest::skip("a display engine runs: the software side follows it only");
+        return ktest::fail("a display engine runs: the software side follows it only");
     }
     let Some((w0, h0, _)) = display::snapshot() else {
-        return ktest::skip("no display or the screen is held");
+        return ktest::fail("no display or the screen is held");
     };
     if display::scanout_holder().is_some() {
-        return ktest::skip("the screen is held by a program");
+        return ktest::fail("the screen is held by a program");
     }
     let (w1, h1) = ((w0 * 3 / 4) & !7, (h0 * 3 / 4) & !7);
     kassert!(w1 >= crate::mode::MIN.w && h1 >= crate::mode::MIN.h, "boot size {w0}x{h0} too small for the test");

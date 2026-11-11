@@ -179,7 +179,7 @@ fn opts(irq_ns: u64, nmi_ns: Option<u64>) -> StopOptions {
 /// a kernel TLB shootdown is answered by the parked CPUs; released, every worker moves again.
 fn park_beside_work() -> TestResult {
     if aps().is_empty() {
-        return ktest::skip("one CPU: nothing to park");
+        return ktest::fail("one CPU: nothing to park");
     }
     let _boot = OnBootCpu::take()?;
     let n = aps().len();
@@ -235,7 +235,7 @@ fn always() -> bool {
 /// never parks (its park guard says "not now", no NMI step). The CPUs answer afterwards and the thread is back
 /// where it was.
 fn refusals_go_on() -> TestResult {
-    let Some(&k) = aps().last() else { return ktest::skip("one CPU: nothing to park") };
+    let Some(&k) = aps().last() else { return ktest::fail("one CPU: nothing to park") };
     let _boot = OnBootCpu::take()?;
     // Busy: a stop of its own holds the CPUs.
     let held = kexec_stub::stop_others(&opts(5 * SEC, None)).map_err(|e| format!("first stop: {e:?}"))?;
@@ -268,7 +268,7 @@ ktest!("rb.quiesce.refusals_go_on", Safe, refusals_go_on);
 /// An AP that parks only by NMI (its guard defers every IPI) makes the shutdown refuse the park (it may hold a
 /// lock) and release the CPUs. QEMU only, like `rb.reload.nmi_parks_stuck_ap`.
 fn nmi_refused() -> TestResult {
-    let Some(&k) = aps().last() else { return ktest::skip("one CPU: nothing to park") };
+    let Some(&k) = aps().last() else { return ktest::fail("one CPU: nothing to park") };
     let _boot = OnBootCpu::take()?;
     let prev = kexec_stub::park_guard();
     DEFER.store(k, Ordering::Release);
@@ -310,10 +310,10 @@ fn wait(ns: u64) {
 /// Comes back only when the power-off failed.
 fn qemu_action() -> TestResult {
     let Some(what) = crate::boot::config("rb_quiesce_test") else {
-        return ktest::skip("CONFIG rb_quiesce_test= not set (host/tests/rb/60-reboot-park.sh sets it)");
+        return ktest::fail("CONFIG rb_quiesce_test= not set (host/tests/rb/60-reboot-park.sh sets it)");
     };
     if !hal::cpu::detect().hypervisor {
-        return ktest::skip("QEMU only");
+        return ktest::fail("QEMU only");
     }
     let load = Load::start(120 * SEC)?;
     load.all_moving(5 * SEC)?;
@@ -337,17 +337,17 @@ fn qemu_action() -> TestResult {
         other => Err(format!("rb_quiesce_test={other}: reboot, poweroff, platform-reboot or platform-poweroff")),
     }
 }
-ktest!("rb.quiesce.qemu_action", QemuOnly, qemu_action);
+ktest!("rb.quiesce.qemu_action", Run("rb/60-reboot-park"), qemu_action);
 
 /// CONFIG `rb_quiesce_load_s=N` only (the scenario's MCP run): a busy worker on every AP for N seconds and the
 /// test device armed, then returns, so the next MCP `reboot` quiesces beside (or, with RB-quiesce's glue, after
 /// parking) running work. Rerunnable: a second call while the workers run is a no-op.
 fn load_for_mcp() -> TestResult {
     let Some(secs) = crate::boot::config("rb_quiesce_load_s").and_then(|v| v.trim().parse::<u64>().ok()) else {
-        return ktest::skip("CONFIG rb_quiesce_load_s= not set (host/tests/rb/60-reboot-park.sh sets it)");
+        return ktest::fail("CONFIG rb_quiesce_load_s= not set (host/tests/rb/60-reboot-park.sh sets it)");
     };
     if aps().is_empty() {
-        return ktest::skip("one CPU: no AP to load");
+        return ktest::fail("one CPU: no AP to load");
     }
     if RUNNING.load(Ordering::Acquire) != 0 {
         return Ok(());
@@ -361,13 +361,13 @@ fn load_for_mcp() -> TestResult {
     core::mem::forget(load);
     Ok(())
 }
-ktest!("rb.quiesce.load_for_mcp", Safe, load_for_mcp);
+ktest!("rb.quiesce.load_for_mcp", Run("rb/60-reboot-park"), load_for_mcp);
 
 /// A load past its end leaves the test Quiesce a no-op (a detached `load_for_mcp` never disarms it, and the
 /// device stays registered for the boot).
 fn expired_is_noop() -> TestResult {
     if aps().is_empty() {
-        return ktest::skip("one CPU: no AP to load");
+        return ktest::fail("one CPU: no AP to load");
     }
     let mut load = Load::start(100 * MS)?;
     load.arm();

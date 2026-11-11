@@ -52,6 +52,11 @@ pub const TO_MASTER_MAX: usize = crate::ldisc::BUF_SIZE + 8192;
 /// Echoes may use this much more than `TO_MASTER_MAX` (n_tty's echo buffer, which keeps echoes the master has no
 /// room for; beyond it n_tty discards them, linux-6.6/drivers/tty/n_tty.c:736). Slave output never uses it.
 pub const ECHO_ROOM: usize = crate::ldisc::BUF_SIZE;
+/// The slave-to-master queue's length from the start: its bound, the echo's room, and room for the characters
+/// by which concurrent `commit`s exceed their reservations. Both of a pty's queues are made whole with the pty
+/// and never grow under their spin locks, where the heap can neither reclaim nor fall back to single frames
+/// (a large block there brought the kernel down on the Mini-PC, 11.11.2026; see net's `sock::unix::fill`).
+const TO_MASTER_CAP: usize = TO_MASTER_MAX + ECHO_ROOM + 4096;
 /// How long a blocked read or write sleeps before it asks whether its program is being ended (B4).
 pub(crate) const SLICE_NS: u64 = 50_000_000;
 /// Bytes handed to the line discipline per step (its lock is held for one step).
@@ -210,12 +215,12 @@ pub struct Pair {
 impl Pair {
     fn new() -> Arc<Pair> {
         let index = reserve_index();
-        let out = Arc::new(ToMaster { buf: SpinLock::named("pty.to_master", VecDeque::new()), rq: PollQueue::new(), room: PollQueue::new(), reserved: AtomicUsize::new(0), dev: new_encode_dev(PTS_MAJOR, index) });
+        let out = Arc::new(ToMaster { buf: SpinLock::named("pty.to_master", VecDeque::with_capacity(TO_MASTER_CAP)), rq: PollQueue::new(), room: PollQueue::new(), reserved: AtomicUsize::new(0), dev: new_encode_dev(PTS_MAJOR, index) });
         let pair = Arc::new(Pair {
             index,
             tty: Tty::with_port(Termios::pty(), out.clone()),
             out,
-            pending: SpinLock::named("pty.pending", (VecDeque::new(), 0)),
+            pending: SpinLock::named("pty.pending", (VecDeque::with_capacity(TO_SLAVE_MAX), 0)),
             in_room: PollQueue::new(),
             st: SpinLock::named("pty.state", State { master_open: true, locked: true, ..State::default() }),
             feeding: AtomicBool::new(false),

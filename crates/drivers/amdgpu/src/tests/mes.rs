@@ -23,6 +23,11 @@ fn failures_end_halted() {
 }
 
 #[test]
+fn a_halt_that_did_not_take_is_no_proof() {
+    k::check_halt_proof(&fakechip::discovery_780m()).unwrap();
+}
+
+#[test]
 fn again_stop_quiesce_and_stale_hqds() {
     k::check_again(&fakechip::discovery_780m()).unwrap();
 }

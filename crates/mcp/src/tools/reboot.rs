@@ -79,7 +79,7 @@ fn reset(p: RebootPlan) {
             klog::event!(Info, "mcp", "reboot.quiesced", devices = devices.join(","));
         },
     );
-    power::reboot(&p, &sleep)
+    power::reboot(&platform::power::plan_after_stop(p), &sleep)
 }
 
 /// The answer's text (pure; host-tested).

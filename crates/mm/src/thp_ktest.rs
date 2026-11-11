@@ -9,6 +9,7 @@ use crate::tlb_ktest::{ap_activate, ap_read_in, ap_write_in, aps, on, FAULT, PRO
 use crate::{share, AddressSpace, Fill, MemStats, Prot, VmaKind};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering::SeqCst;
 use hal::paging::{self, tlb, PageFlags, PageSize};
 use ktest::{kassert, ktest, TestResult};
@@ -56,23 +57,60 @@ fn counted(a: &AddressSpace, what: &str) -> Result<MemStats, String> {
 }
 
 /// A write fault at `va` that should map a huge page: false when no 2 MiB block was free (a fragmented machine;
-/// the fallback has its own test), and the caller skips.
+/// the fallback has its own test), and the caller fails.
 fn first_huge(a: &AddressSpace, va: u64) -> Result<bool, String> {
     write_fault(a, va)?;
     Ok(huge(a, va))
 }
 
+/// Free 2 MiB blocks `room` asks compaction for (the tests map up to four huge pages at once).
+const ROOM_BLOCKS: usize = 8;
+
+/// W35 MM-3: earlier tests (the reclaim and file system load tests) leave memory full of clean file cache, spread
+/// over the 2 MiB blocks. The tests that need huge pages ask direct compaction for `ROOM_BLOCKS` free blocks (it
+/// drops clean cache out of Movable pageblocks until MM-2 moves pages), up to 2 s, instead of dropping the whole
+/// cache as before; the heap's empty slabs and what waits for a grace period go back first. The blocks are held
+/// while more are made, then freed for the test.
+fn room() {
+    mm_core::HEAP.shrink();
+    mm_core::grace::expedite();
+    let (Some(f), Some(b)) = (mm_core::frames(), mm_core::boot_buddy()) else { return };
+    let mut held: Vec<u64> = Vec::new();
+    if held.try_reserve_exact(ROOM_BLOCKS).is_err() {
+        return;
+    }
+    let t0 = time::now_ns();
+    while held.len() < ROOM_BLOCKS && time::now_ns() - t0 < 2_000_000_000 {
+        if let Some(p) = f.alloc_light(mm_core::HUGE_ORDER, mm_core::Zone::Normal, mm_core::Kind::Other) {
+            held.push(p);
+            continue;
+        }
+        // Deferred after a failure, or nothing to clear right now: try again shortly.
+        if !b.compact_direct(mm_core::HUGE_ORDER) {
+            sched::sleep_ms(10);
+        }
+    }
+    for p in held {
+        f.free(p, mm_core::HUGE_ORDER, mm_core::Kind::Other);
+    }
+}
+
 /// The fault took 4 KiB pages where a huge page was wanted: a skip only when no 2 MiB block is free right now (a
 /// fragmented machine), a failure when one is (the huge path broke; a silent skip would hide it).
 fn no_block() -> TestResult {
-    let Some(f) = mm_core::frames() else { return ktest::skip("no frame allocator") };
+    let Some(f) = mm_core::frames() else { return ktest::fail("no frame allocator") };
     match f.alloc_light(mm_core::HUGE_ORDER, mm_core::Zone::Normal, mm_core::Kind::User) {
         Some(p) => {
             f.free(p, mm_core::HUGE_ORDER, mm_core::Kind::User);
             Err(String::from("a 2 MiB block is free, but the fault took 4 KiB pages"))
         }
-        None => ktest::skip("no free 2 MiB block"),
+        None => Err(format!("no free 2 MiB block: {}", census())),
     }
+}
+
+/// What holds the 2 MiB blocks now (the failure explains itself in the gate's output).
+fn census() -> String {
+    mm_core::block_census(mm_core::HUGE_ORDER).map_or(String::from("no boot allocator"), |c| format!("{c}"))
 }
 
 /// Writes `tag + i` into the first word of every 4 KiB page of [m, m + len).
@@ -104,6 +142,7 @@ impl Drop for ModeBack {
 /// RSS, AnonHugePages, no new commit, its page table deposited (VmPTE); a read fault, a cut 2 MiB, MADV_NOHUGEPAGE,
 /// MAP_STACK, a stack VMA and an eager space stay page by page; munmap gives everything back.
 fn fault() -> TestResult {
+    room();
     let before = user();
     {
         let a = lazy()?;
@@ -194,6 +233,7 @@ ktest!("mm.thp.fallback", Safe, fallback);
 /// Every path that cuts a huge page splits it into 4 KiB entries over the same frames (content kept, counters
 /// equal the walk, the deposited table used, nothing charged), and a whole one goes without a split.
 fn split() -> TestResult {
+    room();
     let before = user();
     {
         let a = lazy()?;
@@ -262,6 +302,7 @@ ktest!("mm.thp.split", Safe, split);
 /// fork keeps 2 MiB entries in both spaces, read-only over 512 shared frames; a write splits the writer's entry and
 /// copies one page; once a space holds all 512 alone again, a write merges them and keeps the 2 MiB entry.
 fn fork() -> TestResult {
+    room();
     let before = user();
     {
         let a = lazy()?;
@@ -321,6 +362,7 @@ ktest!("mm.thp.fork", Safe, fork);
 /// keeps both 2 MiB entries, its data, its commit and counters, no frame stays shared or held; a write then takes
 /// each entry back writable and whole (merged), and a fork works again.
 fn fork_refused() -> TestResult {
+    room();
     let before = user();
     {
         let a = lazy()?;
@@ -369,6 +411,76 @@ fn fork_refused() -> TestResult {
 }
 ktest!("mm.thp.fork_refused", Safe, fork_refused);
 
+/// Takes every free block of order 9 or more, so the next fault finds no free 2 MiB block (unless one is freed or
+/// cleared meanwhile: the caller looks at what the fault got).
+fn take_huge_blocks(f: &dyn mm_core::FrameAlloc, held: &mut Vec<(u64, u32)>) {
+    for order in (mm_core::HUGE_ORDER..=mm_core::MAX_ORDER).rev() {
+        while held.len() < held.capacity() {
+            let Some(p) = f.alloc_light(order, mm_core::Zone::Normal, mm_core::Kind::Other) else { break };
+            held.push((p, order));
+        }
+    }
+}
+
+/// Without a free 2 MiB block (`thp::steps`, defrag `madvise`, the default): a fault outside MADV_HUGEPAGE never
+/// stalls, wakes kcompactd for order 9 and takes 4 KiB pages; inside, it compacts directly and maps a huge page
+/// exactly when that made a block, else wakes kcompactd too. Each case is tried on up
+/// to four fresh 2 MiB, as a block someone frees between the take and the fault serves the fault directly.
+fn defrag() -> TestResult {
+    let Some(f) = mm_core::frames() else { return ktest::fail("no frame allocator") };
+    let before = user();
+    let mut held: Vec<(u64, u32)> = Vec::new();
+    if held.try_reserve_exact((f.stats().total_bytes / M2) as usize + 64).is_err() {
+        return ktest::fail("no room for the list of held blocks");
+    }
+    let r = (|| -> TestResult {
+        let a = lazy()?;
+        let m = a.sys_mmap(BASE, 8 * M2, RW, AP | MAP_FIXED, 0).map_err(e)?;
+        a.sys_madvise(m + 4 * M2, 4 * M2, madv::HUGEPAGE).map_err(e)?;
+        let mut plain = false;
+        for k in 0..4 {
+            take_huge_blocks(f, &mut held);
+            let (noted, stalls) = (mm_core::compact::wakes_asked(), thp::DIRECT_STALL.get());
+            write_fault(&a, m + k * M2)?;
+            if huge(&a, m + k * M2) {
+                continue;
+            }
+            kassert!(mm_core::compact::wakes_asked() > noted, "without MADV_HUGEPAGE: kcompactd not woken for order 9");
+            kassert!(thp::DIRECT_STALL.get() == stalls, "a fault without MADV_HUGEPAGE stalled for a block");
+            plain = true;
+            break;
+        }
+        kassert!(plain, "a 2 MiB block came free before each of four faults without MADV_HUGEPAGE");
+        let mut madvised = false;
+        for k in 4..8 {
+            take_huge_blocks(f, &mut held);
+            let (noted, stalls, allocs) = (mm_core::compact::wakes_asked(), thp::DIRECT_STALL.get(), thp::DIRECT_ALLOC.get());
+            write_fault(&a, m + k * M2)?;
+            let (got, stalled, made) = (huge(&a, m + k * M2), thp::DIRECT_STALL.get() > stalls, thp::DIRECT_ALLOC.get() > allocs);
+            if got && !stalled {
+                continue;
+            }
+            kassert!(stalled, "MADV_HUGEPAGE: 4 KiB pages without the direct step");
+            kassert!(got == made, "MADV_HUGEPAGE: huge page {got}, direct step made a block {made}");
+            kassert!(got || mm_core::compact::wakes_asked() > noted, "MADV_HUGEPAGE: the direct step failed and kcompactd was not woken");
+            klog::event!(Info, "mm", "ktest.thp_defrag", direct_huge = got, held_blocks = held.len(), census = census().as_str());
+            madvised = true;
+            break;
+        }
+        kassert!(madvised, "a 2 MiB block came free before each of four faults with MADV_HUGEPAGE");
+        counted(&a, "defrag")?;
+        Ok(())
+    })();
+    for (p, o) in held {
+        f.free(p, o, mm_core::Kind::Other);
+    }
+    r?;
+    kassert!(user() == before, "{} bytes of user frames not back", user().saturating_sub(before));
+    Ok(())
+}
+// QEMU only: it holds every free 2 MiB block for a moment and makes compaction clear cache for order 9.
+ktest!("mm.thp.defrag", QemuOnly, defrag);
+
 /// The modes of /sys/kernel/mm/transparent_hugepage/enabled and PR_SET_THP_DISABLE (system-wide switch: QEMU only).
 fn modes() -> TestResult {
     let _back = ModeBack(thp::mode());
@@ -404,6 +516,7 @@ ktest!("mm.thp.modes", QemuOnly, modes);
 /// the unmap) and the APs then fault on the hole and read the rest right; an mprotect of a part stops their
 /// writes there; a munmap of whole huge pages is one round of 2 MiB invalidations.
 fn tlb_all() -> TestResult {
+    room();
     let aps = aps();
     let before = user();
     let _probes = paging::probe::user_probes().map_err(e)?;
@@ -460,6 +573,7 @@ ktest!("mm.thp.tlb", Safe, tlb_all);
 /// before MM-13). Correctness only in QEMU: the faults per frame, the content, every frame back; us per frame of
 /// both for the Mini-PC (`ktest.thp_fd1`).
 fn fd1_frames() -> TestResult {
+    room();
     const LEN: u64 = 13_800_000;
     const FRAMES: u64 = 30;
     let before = user();
@@ -478,7 +592,10 @@ fn fd1_frames() -> TestResult {
                     faults += 1;
                 }
             }
-            huge_pages += a.huge_pages();
+            // Per frame: earlier tests can leave memory fragmented, so some frames find no free 2 MiB block.
+            let h = a.huge_pages();
+            kassert!(h == 0 || h >= 5, "frame {f}: {h} huge pages; {}", census());
+            huge_pages += h;
             a.write_u64(m + LEN - 8, f).map_err(e)?;
             kassert!(a.read_u64(m + LEN - 8).map_err(e)? == f && a.read_u64(m + LEN / 2).map_err(e)? == 0, "frame {f}: content");
             a.sys_munmap(m, LEN).map_err(e)?;
@@ -490,8 +607,8 @@ fn fd1_frames() -> TestResult {
     a.test_fail_huge(false);
     counted(&a, "fd1")?;
     kassert!(a.resident_pages() == 0 && user() == before, "frames not back: {} bytes", user().saturating_sub(before));
-    // An unaligned 13.8 MB mapping holds at least 5 whole aligned 2 MiB; the rest is 4 KiB with fault-around.
-    kassert!(huge_pages == 0 || huge_pages >= 5 * FRAMES, "{huge_pages} huge pages in {FRAMES} frames");
+    // An unaligned 13.8 MB mapping holds at least 5 whole aligned 2 MiB (checked per frame above); the rest is
+    // 4 KiB with fault-around.
     kassert!(faults <= faults4k && huge4k == 0, "{faults} faults with huge pages, {faults4k} without ({huge4k} huge pages there)");
     kassert!(faults4k < FRAMES * (pages / 16 + 64), "{faults4k} faults for {FRAMES} frames of {pages} pages");
     klog::event!(Info, "mm", "ktest.thp_fd1", frames = FRAMES, pages_per_frame = pages, faults_per_frame = faults / FRAMES,
@@ -499,4 +616,5 @@ fn fd1_frames() -> TestResult {
         around_us_per_frame = ns4k / FRAMES / 1000);
     Ok(())
 }
-ktest!("mm.thp.fd1", Safe, fd1_frames);
+// Only with the desktop stopped: it compares all user frames of the machine, and a running desktop moves them too (4.11., W30 round).
+ktest!("mm.thp.fd1", Screen, fd1_frames);

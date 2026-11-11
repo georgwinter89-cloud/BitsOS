@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Inner part of fb-e2e.sh (runs inside the container).
-if [ ! -d /lane ]; then echo "SKIP: runs inside the cobalt-yt-v2 container (started by fb-e2e.sh)"; exit 0; fi
+# helper
+# Inner part of fb-e2e.sh (runs inside the container); fb-e2e.sh is the scenario and names the run.
+if [ ! -d /lane ]; then echo "RED: runs inside the cobalt-yt-v2 container, started by fb-e2e.sh"; exit 1; fi
 . /lane/user/ports/cobalt-launcher/scripts/yt-env.sh
 R=$RUNS/fb-e2e; rm -rf "$R"; mkdir -p "$R/home"
 fail=0

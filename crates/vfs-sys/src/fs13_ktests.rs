@@ -155,7 +155,7 @@ pub(crate) fn compare_with(got: &[&str], lines: &[&str], pending_list: &[(&str, 
 
 fn programs() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("/bin/fs-mountflags is not in this image (xtask builds host/tests/fs/progs into every image)");
+        return ktest::fail("/bin/fs-mountflags is not in this image (xtask builds host/tests/fs/progs into every image)");
     }
     let (end, lines) = linux_block().ok_or("mountflags-linux.txt has no tmpfs block")?;
     let m = NoexecMount::new()?;
@@ -190,9 +190,9 @@ fn boot_mounts() -> TestResult {
     }
     let t = ns.lookup_path(b"/tmp", true).map_err(|e| format!("/tmp: {e}"))?;
     kassert!(t.nodev() && t.nosuid(), "/tmp is not nosuid,nodev");
-    let Ok(b) = ns.lookup_path(b"/boot", true) else { return ktest::skip("no /boot (no boot stick mounted)") };
+    let Ok(b) = ns.lookup_path(b"/boot", true) else { return ktest::fail("no /boot (no boot stick mounted)") };
     if !b.is_mount_root() || b.mnt.sb.fstype != "vfat" {
-        return ktest::skip("/boot is no vfat mount here (no boot stick)");
+        return ktest::fail("/boot is no vfat mount here (no boot stick)");
     }
     kassert!(!b.noexec() && !b.nodev(), "/boot: flags {:#x}: busybox in /boot/BITSOS2/bin could not run", b.mnt.flags());
     let src = b.mnt.sb.source();

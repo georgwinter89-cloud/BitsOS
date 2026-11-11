@@ -68,6 +68,7 @@ pub mod pi;
 mod pi_ktests;
 pub mod place;
 mod reap;
+mod reap_watch;
 pub mod rq;
 mod run;
 mod sleepers;
@@ -845,6 +846,17 @@ pub fn need_resched() -> bool {
     cs.need_resched.load(Ordering::Relaxed) || cs.slice_expired(time::now_ns())
 }
 
+/// PF-7 (AB-15 CR 3): the look on a syscall's way out, Linux's TIF_NEED_RESCHED test: a reschedule was asked for or
+/// an interrupt placed a wake-up here. No clock (`need_resched` reads one for the slice, which the tick watches).
+#[inline]
+pub fn resched_wanted() -> bool {
+    if !STARTED.load(Ordering::Acquire) {
+        return false;
+    }
+    let cs = cpus::this();
+    cs.need_resched.load(Ordering::Relaxed) || cs.wake_head.load(Ordering::Relaxed) != 0
+}
+
 /// A voluntary preemption point for long loops in kernel code: does the scheduler's housekeeping now and then
 /// and switches if `need_resched()`. Returns whether it switched. Call with no spin lock held (it does nothing
 /// then) and never from an interrupt handler.
@@ -1195,43 +1207,52 @@ pub struct ThreadStat {
     pub wait_max_ns: u64,
 }
 
+/// Every thread's numbers; empty when the heap cannot hold the list (a few hundred threads make it a block above
+/// 32 KiB, and the callers can be in contexts where only a contiguous run serves it).
 pub fn thread_stats() -> Vec<ThreadStat> {
-    threads_detail()
+    let all = table::snapshot();
+    let mut v = Vec::new();
+    if v.try_reserve_exact(all.len()).is_err() {
+        return v;
+    }
+    v.extend(all.iter().map(|t| stat_of(t)));
+    v
 }
 
-fn threads_detail() -> Vec<ThreadStat> {
-    table::snapshot()
-        .iter()
-        .map(|t| {
-            let ct = t.cpu_times();
-            ThreadStat {
-                id: t.id,
-                name: t.name.clone(),
-                class: t.class(),
-                group: t.group(),
-                state: match t.state() {
-                    State::Runnable => "runnable",
-                    State::Running | State::Blocking => "running",
-                    State::Blocked => "sleeping",
-                    State::Dead => "dead",
-                },
-                cpu: t.last_cpu(),
-                pinned: t.pinned(),
-                rt_prio: if t.policy().is_rt() { t.user_rt.load(Ordering::Relaxed) } else { t.rt_prio() },
-                runtime_ns: ct.total_ns(),
-                migrations: t.migrations(),
-                wakeups: t.wakeups.load(Ordering::Relaxed),
-                user_ns: ct.user_ns,
-                system_ns: ct.system_ns,
-                nvcsw: ct.nvcsw,
-                nivcsw: ct.nivcsw,
-                nice: t.nice(),
-                policy: t.policy(),
-                affinity_all: t.affine_all.load(Ordering::Acquire),
-                wait_max_ns: t.interactive_wait_max(),
-            }
-        })
-        .collect()
+/// One thread's numbers. /proc/<pid>/stat reads one: a list of every thread per read cost O(threads) memory each
+/// time, and under `top` it was the panic of 6.11.2026 (85880 bytes not available).
+pub fn thread_stat(id: u64) -> Option<ThreadStat> {
+    table::get(id).map(|t| stat_of(&t))
+}
+
+fn stat_of(t: &Thread) -> ThreadStat {
+    let ct = t.cpu_times();
+    ThreadStat {
+        id: t.id,
+        name: t.name.clone(),
+        class: t.class(),
+        group: t.group(),
+        state: match t.state() {
+            State::Runnable => "runnable",
+            State::Running | State::Blocking => "running",
+            State::Blocked => "sleeping",
+            State::Dead => "dead",
+        },
+        cpu: t.last_cpu(),
+        pinned: t.pinned(),
+        rt_prio: if t.policy().is_rt() { t.user_rt.load(Ordering::Relaxed) } else { t.rt_prio() },
+        runtime_ns: ct.total_ns(),
+        migrations: t.migrations(),
+        wakeups: t.wakeups.load(Ordering::Relaxed),
+        user_ns: ct.user_ns,
+        system_ns: ct.system_ns,
+        nvcsw: ct.nvcsw,
+        nivcsw: ct.nivcsw,
+        nice: t.nice(),
+        policy: t.policy(),
+        affinity_all: t.affine_all.load(Ordering::Acquire),
+        wait_max_ns: t.interactive_wait_max(),
+    }
 }
 
 /// The scheduler's counters (`sched.*`: sleep timer, ticks, fallbacks, halts, ...), sorted by name.

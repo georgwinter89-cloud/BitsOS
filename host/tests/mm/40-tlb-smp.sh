@@ -9,14 +9,17 @@ RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/mm-40-tlb-smp}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 ROUNDS="${MM_TLB_ROUNDS:-2}"
-TESTS="mm.,contract.address_space,contract.frame_alloc"
+# Not the reclaim tests (for small RAM: 60-reclaim.sh, the 2G gate); give_up_device leaves its own unconfirmed shootdown (plain gate).
+TESTS="mm.,-mm.reclaim.dirty_pressure,-mm.reclaim.mapped_exec,-mm.reclaim.pressure,-mm.tlb.give_up_device,contract.address_space,contract.frame_alloc"
 fail=0
 
 run() { # $1 = name, $2.. = extra QEMU arguments
     local name="$1"
     shift
     local log="$RUN_DIR/$name.log"
-    cargo xtask image --name "$name" --ktest --config-extra "ktest=$TESTS;loglevel=info"
+    local filter="$TESTS"
+    case "$name" in *nopcid*) filter="$TESTS,-mm.tlb.pcid" ;; esac
+    cargo xtask image --name "$name" --ktest --config-extra "ktest=$filter;loglevel=info"
     cargo xtask qemu --name "$name" --smp 16 --mem 4G --timeout 300 --serial-log "$log" -- "$@" || true
     touch "$log"
     grep -a "KTEST FAIL\|KTEST PANIC\|KTEST done\|ktest.tlb\|tlb.ready\|tlb.give_up\|as.drop_leaked\|vmap.quarantined" "$log" || true
@@ -30,7 +33,7 @@ run() { # $1 = name, $2.. = extra QEMU arguments
     grep -aq "ktest.cow_smp aps=15" "$log" || { echo "RED: $name: mm.cow.smp_tlb did not run with 15 APs"; fail=1; }
     # Only the deliberate give-up test may leave an unconfirmed shootdown; nothing leaks or stays quarantined.
     [ "$(grep -ac "as.shootdown_unconfirmed" "$log")" -le 1 ] || { echo "RED: $name: unconfirmed shootdowns outside mm.tlb.give_up"; fail=1; }
-    if grep -aq "as.drop_leaked\|vmap.quarantined\|vmap.kva_quarantined" "$log"; then echo "RED: $name: leak or quarantine"; fail=1; fi
+    if grep -a "as.drop_leaked\|vmap.quarantined\|vmap.kva_quarantined" "$log" | grep -avq "reason=shootdown_unconfirmed"; then echo "RED: $name: leak or quarantine"; fail=1; fi
 }
 
 for r in $(seq 1 "$ROUNDS"); do

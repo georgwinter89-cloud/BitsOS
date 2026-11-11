@@ -15,6 +15,7 @@ devmodel = { path = "../devmodel" }
 klog = { path = "../klog" }
 kreg = { path = "../kreg" }
 ksync = { path = "../ksync" }
+mm-core = { path = "../mm-core" }
 ktest = { path = "../ktest" }
 uapi = { path = "../uapi" }
 miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }

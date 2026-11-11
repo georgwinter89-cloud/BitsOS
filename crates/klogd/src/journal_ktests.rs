@@ -112,7 +112,7 @@ fn trace_and_metrics_arrive() -> TestResult {
     }, 20)?;
     kassert!(t.is_some() || !rings, "trace mark not read");
     if !rounds {
-        return ktest::skip("no metric rounds (metrics=off or the sampler did not run yet)");
+        return ktest::fail("no metric rounds (metrics=off or the sampler did not run yet)");
     }
     let m = m.ok_or("no metric round read")?;
     kassert!(m.split(' ').nth(4).is_some_and(|kv| kv.contains('=')), "{}", m);
@@ -124,7 +124,7 @@ fn ack_and_drain() -> TestResult {
     // With the real bitsjournal attached (the Mini-PC), acking here would tell a Reload that records are on /data
     // which the service has not written: the ack part runs only without it.
     if klog::journal::attached() != 0 {
-        return ktest::skip("bitsjournal is attached: a test ack would claim records durable that it has not written");
+        return ktest::fail("bitsjournal is attached: a test ack would claim records durable that it has not written");
     }
     let r = devevents::open_for_test();
     // Drain the backlog so the flush request is the next line.
@@ -161,7 +161,8 @@ fn ack_and_drain() -> TestResult {
     kassert!(klog::journal::wait_drained("ktest", 1_000_000_000, &|_| panic!("no wait")) == klog::journal::Drain::NoJournal);
     Ok(())
 }
-ktest!("rb.journal.drain", Safe, ack_and_drain);
+// Not on the machine: bitsjournal is attached there, and a test ack would claim records durable it has not written.
+ktest!("rb.journal.drain", QemuAll, ack_and_drain);
 
 /// The heartbeat names the reader's own position, poll says readable only with something new, lseek as
 /// devkmsg_llseek, a second blocking read of the same file waits instead of EAGAIN.
@@ -225,9 +226,9 @@ ktest!("rb.journal.cost", Safe, cost_per_event);
 
 fn reach_back_without_journal() -> TestResult {
     if crate::journal::present() {
-        return ktest::skip("bitsjournal runs: the ring fallback is not used");
+        return ktest::fail("bitsjournal runs: the ring fallback is not used");
     }
-    let Some(now) = time::wall::realtime_ns() else { return ktest::skip("no wall clock") };
+    let Some(now) = time::wall::realtime_ns() else { return ktest::fail("no wall clock") };
     klog::ktests::with_trace("rbjournal", || klog::event!(Info, "rbjournal", "t.back"))?;
     let since = now / 1_000_000_000 - 30;
     let a = tool::call_tool("events", &alloc::format!(r#"{{"since":"{since}","subsystem":"rbjournal","name":"t.back"}}"#)).map_err(|e| alloc::format!("{e:?}"))?;
@@ -237,4 +238,4 @@ fn reach_back_without_journal() -> TestResult {
     kassert!(tool::call_tool("events", r#"{"since":"25:99"}"#) == Err(mcp::ToolError::BadArgument(String::from("since"))));
     Ok(())
 }
-ktest!("rb.journal.reach_back", Safe, reach_back_without_journal);
+ktest!("rb.journal.reach_back", QemuAll, reach_back_without_journal);

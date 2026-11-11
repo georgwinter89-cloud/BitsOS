@@ -194,7 +194,7 @@ fn libc_programs() -> TestResult {
     // Skipped only when the image carries no ABI programs at all (built without UL-1's sysroot). When it carries
     // the others (AB-3's /bin/abi-ids), a missing AB-4 program is a build failure the gate must show.
     if missing.len() == progs.len() && ns.lookup("/bin/abi-ids").is_err() {
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     kassert!(missing.is_empty(), "the image has ABI programs but not {missing:?} (did it fail to build?)");
     for (path, last) in progs {

@@ -148,7 +148,7 @@ fn program_mmap() -> TestResult {
     let b = udmabuf::build(Some(&fds), &[Item { memfd: n, offset: 0, size: P }]).map_err(|e| format!("build: errno {e}"))?;
     let of = OpenFile::anon(b, vfs::abi::O_RDWR);
     if mm::device::lookup(&of).is_none() {
-        return ktest::skip("MM cannot map dma-buf fds yet (CR-DR5-1/2, plan/notes/dr-DR-5.md)");
+        return ktest::fail("MM cannot map dma-buf fds yet (CR-DR5-1/2, plan/notes/dr-DR-5.md)");
     }
     run(&["abi-dmabuf", "mmap"], EXPECTED_MMAP)
 }
@@ -156,7 +156,7 @@ ktest!("dr.dmabuf.program_mmap", Safe, program_mmap);
 
 fn run(argv: &[&str], expected: &str) -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     let out = proc::stdio::Capture::new(1 << 16);
     let env = ["HOME=/", "PATH=/bin", "ABI_TEST=1"];

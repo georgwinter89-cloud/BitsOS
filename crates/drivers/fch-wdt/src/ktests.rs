@@ -162,7 +162,7 @@ impl Drop for OnCpu0 {
 fn spin_stalls() -> TestResult {
     let n = hal::percpu::cpu_count();
     if n < 2 || sched::online_cpus() < 2 {
-        return ktest::skip("one CPU: nothing to stall");
+        return ktest::fail("one CPU: nothing to stall");
     }
     let k = n - 1;
     // On CPU 0 for the test: from CPU k itself `call_on` would run the spin inline (8 s, interrupts off) and
@@ -216,11 +216,11 @@ ktest!("rb.wdt.start", Safe, start_verdict);
 /// stopped at the end (so `hang` refuses again).
 fn system_fake() -> TestResult {
     if !hal::cpu::detect().hypervisor {
-        return ktest::skip("only under a hypervisor (the real chip is the system's)");
+        return ktest::fail("only under a hypervisor (the real chip is the system's)");
     }
     let st = wait_started();
     if system::system().is_some() && !system::on_fake() {
-        return ktest::skip("a real watchdog runs");
+        return ktest::fail("a real watchdog runs");
     }
     let _ = st;
     let fake = Arc::new(Fake::new(true, false, Some(time::now_ns)));
@@ -316,11 +316,11 @@ fn crumb_in_the_count() -> TestResult {
         let fake = Arc::new(Fake::new(false, false, Some(time::now_ns)));
         kassert!(system::start_fake(Box::new(fake)) || system::on_fake(), "the fake system dog did not start");
     }
-    let Some(d) = system::system() else { return ktest::skip(&format!("no system watchdog ({})", st.name())) };
+    let Some(d) = system::system() else { return ktest::fail(&format!("no system watchdog ({})", st.name())) };
     let stopped_before = system::state() != State::Armed;
     if stopped_before {
         if !system::on_fake() {
-            return ktest::skip(&format!("the real watchdog is {} (not armed): nothing to write into", system::state().name()));
+            return ktest::fail(&format!("the real watchdog is {} (not armed): nothing to write into", system::state().name()));
         }
         system::resume().map_err(|e| e.text())?;
     }

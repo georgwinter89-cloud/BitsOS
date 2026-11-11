@@ -14,12 +14,12 @@ use pci::Loc;
 ktest!("pc.tool.registry", Safe, registry);
 ktest!("pc.tool.read_host_bridge", Safe, read_host_bridge);
 ktest!("pc.tool.storage_refused", Safe, storage_refused);
-ktest!("pc.tool.untouched_refused", Safe, untouched_refused);
-ktest!("pc.tool.dcn_refused", Safe, dcn_refused);
+ktest!("pc.tool.untouched_refused", QemuAll, untouched_refused);
+ktest!("pc.tool.dcn_refused", Hardware, dcn_refused);
 ktest!("pc.tool.core_regs_refused", Safe, core_regs_refused);
 ktest!("pc.tool.hostile_args", Safe, hostile_args);
 ktest!("pc.tool.rescan", Safe, rescan);
-ktest!("pc.tool.testdev", QemuOnly, testdev);
+ktest!("pc.tool.testdev", Run("pc/40-raw"), testdev);
 
 struct Reply {
     error: bool,
@@ -107,7 +107,7 @@ fn storage_refused() -> TestResult {
     let all = pci::devices();
     let disks: Vec<_> = all.iter().filter(|f| f.class >> 16 == 0x01).collect();
     if disks.is_empty() {
-        return ktest::skip("no mass storage function on this machine");
+        return ktest::fail("no mass storage function on this machine");
     }
     for f in disks {
         let at = loc(f.loc());
@@ -138,7 +138,7 @@ fn storage_refused() -> TestResult {
 fn untouched_refused() -> TestResult {
     let nodes: Vec<pci::Node> = pci::tree().into_iter().filter(|n| n.untouched.is_some()).collect();
     if nodes.is_empty() {
-        return ktest::skip("no untouched function on this machine");
+        return ktest::fail("no untouched function on this machine");
     }
     for n in nodes {
         let at = loc(n.loc);
@@ -165,7 +165,7 @@ fn dcn_refused() -> TestResult {
         kassert!(r == Err(pci::raw::Refusal::IndexPair), "{}: {r:?}", g.loc);
     }
     if gpus.is_empty() {
-        return ktest::skip("no Radeon here (the made-up one is checked by pc.raw.guards)");
+        return ktest::fail("no Radeon here (the made-up one is checked by pc.raw.guards)");
     }
     Ok(())
 }
@@ -197,7 +197,7 @@ fn core_regs_refused() -> TestResult {
         }
     }
     if seen == 0 {
-        return ktest::skip("no function a raw write may reach");
+        return ktest::fail("no function a raw write may reach");
     }
     klog::event!(Info, "pci", "ktest.core_regs", refused = seen);
     Ok(())
@@ -227,7 +227,7 @@ fn rescan() -> TestResult {
 /// offset to hit and counts hits; one mmio_write there counts once.
 fn testdev() -> TestResult {
     let Some(f) = pci::devices().into_iter().find(|f| f.vendor == 0x1B36 && f.device == 0x0005) else {
-        return ktest::skip("no pci-testdev (host/tests/pc/40-raw.sh adds one)");
+        return ktest::fail("no pci-testdev (host/tests/pc/40-raw.sh adds one)");
     };
     let at = loc(f.loc());
     let read = |off: u64, w: u8| -> Result<u64, String> {

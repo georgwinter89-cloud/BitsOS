@@ -114,7 +114,7 @@ fn enosys_log_once() -> TestResult {
 ktest!("ab.entry.fsgsbase_kept", Safe, fsgsbase_kept);
 fn fsgsbase_kept() -> TestResult {
     if !hal::entry::user_fsgsbase() {
-        return ktest::skip("CR4.FSGSBASE is off: programs cannot use wrfsbase");
+        return ktest::fail("CR4.FSGSBASE is off: programs cannot use wrfsbase");
     }
     // Two instances with different bases sleep in turns, so each one's bases are switched out and back in.
     let a = start("ab-fsgs-1", test_programs::fsgsbase())?;
@@ -155,7 +155,7 @@ ktest!("ab.entry.user_interrupts", Safe, user_interrupts);
 /// FS/GS base intact, and `execute` returns only at the program's syscall. Odd rounds take SYSRET.
 fn user_interrupts() -> TestResult {
     if !hal::entry::user_fsgsbase() {
-        return ktest::skip("CR4.FSGSBASE is off: the test program checks its bases with rdfsbase");
+        return ktest::fail("CR4.FSGSBASE is off: the test program checks its bases with rdfsbase");
     }
     in_user_space(test_programs::register_loop(), |_| Ok(()), || {
         let cpu = hal::percpu::this_cpu();
@@ -353,7 +353,7 @@ fn fast_checks(asp: &Arc<AddressSpace>) -> TestResult {
     let root = asp.root();
     let s0 = uc::stats();
     if !s0.fast_path {
-        return ktest::skip("the user-copy fast path is not installed");
+        return ktest::fail("the user-copy fast path is not installed");
     }
     let mut b = [0u8; 6];
     uc::copy_from_user(root, &mut b, HOLE - 6).map_err(|_| "fast read failed")?;
@@ -501,7 +501,7 @@ ktest!("ab.entry.bad_stack_interrupted", Safe, bad_stack_interrupted);
 fn bad_stack_interrupted() -> TestResult {
     let me = hal::percpu::this_cpu();
     let Some(helper) = (0..hal::percpu::cpu_count()).find(|&c| c != me && hal::smp::is_online(c)) else {
-        return ktest::skip("needs a second CPU online");
+        return ktest::fail("needs a second CPU online");
     };
     let apic = hal::smp::apic_id(me).ok_or("no APIC ID for this CPU")?;
     in_user_space(&BAD_RSP_SPIN, |_| Ok(()), || {
@@ -530,7 +530,7 @@ fn bad_stack_round(helper: usize, apic: u32, vector: u8) -> TestResult {
         }
     }
     if !started {
-        return ktest::skip("the helper CPU never took the call");
+        return ktest::fail("the helper CPU never took the call");
     }
     let mut ctx = UserContext::new(CODE, 0x7000_0000);
     let mut stops = 0u32;
@@ -564,7 +564,7 @@ fn kernel_root_walks() -> TestResult {
     use hal::usercopy as uc;
     let root = hal::paging::current_root();
     if root != hal::switch::kernel_root() && Some(root) != hal::paging::kernel_root() {
-        return ktest::skip("this thread does not run on a kernel root");
+        return ktest::fail("this thread does not run on a kernel root");
     }
     // A supervisor-only page of the kernel root below 4 GiB if there is one (2 MiB steps), else a low address.
     let supervisor = (1..2048u64).map(|i| i << 21).find(|&va| matches!(hal::paging::translate(root, va), Some((_, f)) if !f.contains(hal::paging::PageFlags::USER)));

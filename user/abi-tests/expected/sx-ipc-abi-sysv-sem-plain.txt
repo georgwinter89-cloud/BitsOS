@@ -1,0 +1,4 @@
+semget works: yes
+semop = 0
+GETVAL = 1
+IPC_RMID = 0

@@ -41,8 +41,9 @@ fn no_writes(c: &Controller<FakeHw>, hw: &FakeHw) {
 #[test]
 fn builder_has_no_media_writing_opcode() {
     for op in cmd::IO_OPS {
-        assert!(!MEDIA_WRITE_IO_OPS.contains(&(op as u8)), "{op:?}");
+        assert!(!cmd::NEVER_BUILT_IO_OPS.contains(&(op as u8)), "{op:?}");
     }
+    assert!(cmd::NEVER_BUILT_IO_OPS.iter().all(|o| MEDIA_WRITE_IO_OPS.contains(o)));
     for op in cmd::ADMIN_OPS {
         assert!(!MEDIA_WRITE_ADMIN_OPS.contains(&(op as u8)), "{op:?}");
     }
@@ -116,14 +117,22 @@ fn ring_phase_and_cid_wrap() {
 #[test]
 fn prp_cases() {
     let p = regs::PAGE as u64;
-    assert_eq!(prp::plan(0x10000, 512, 0x9000).unwrap(), prp::Prps { prp1: 0x10000, prp2: 0, list_len: 0 });
-    assert_eq!(prp::plan(0x10000, 8192, 0x9000).unwrap(), prp::Prps { prp1: 0x10000, prp2: 0x10000 + p, list_len: 0 });
-    assert_eq!(prp::plan(0x10000, 8193, 0x9000).unwrap(), prp::Prps { prp1: 0x10000, prp2: 0x9000, list_len: 2 });
-    assert_eq!(prp::list_entry(0x10000, 1), 0x10000 + 2 * p);
-    assert!(prp::plan(0x10001, 512, 0).is_none());
-    assert!(prp::plan(0x10000, 0, 0).is_none());
-    assert!(prp::plan(0x10000, prp::max_bytes() + 1, 0).is_none());
-    assert_eq!(prp::plan(0x10000, prp::max_bytes(), 0x9000).unwrap().list_len, regs::PAGE / 8);
+    assert_eq!(prp::plan(0x10000, 512, 0, 0x9000).unwrap(), prp::Prps { prp1: 0x10000, prp2: 0, list_len: 0 });
+    assert_eq!(prp::plan(0x10000, 8192, 0x10000 + p, 0x9000).unwrap(), prp::Prps { prp1: 0x10000, prp2: 0x10000 + p, list_len: 0 });
+    assert_eq!(prp::plan(0x10000, 8193, 0x10000 + p, 0x9000).unwrap(), prp::Prps { prp1: 0x10000, prp2: 0x9000, list_len: 2 });
+    assert_eq!(prp::contig_page(0x10000, 2), 0x10000 + 2 * p);
+    // BL-1: a start inside a page (the caller's own memory): one page more, the later ones page aligned.
+    assert_eq!(prp::pages(0x10200, 4096), 2);
+    assert_eq!(prp::contig_page(0x10200, 1), 0x11000);
+    assert_eq!(prp::plan(0x10200, 4096, 0x11000, 0x9000).unwrap(), prp::Prps { prp1: 0x10200, prp2: 0x11000, list_len: 0 });
+    assert_eq!(prp::plan(0x10200, 8192, 0x11000, 0x9000).unwrap().list_len, 2);
+    assert!(prp::plan(0x10200, 4096, 0x11200, 0x9000).is_none(), "the second page must be page aligned");
+    assert!(prp::plan(0x10002, 512, 0, 0).is_none(), "PRP1 is dword aligned");
+    assert!(prp::plan(0x10000, 0, 0, 0).is_none());
+    assert!(prp::plan(0x10000, prp::max_bytes() + 1, 0, 0).is_none());
+    assert_eq!(prp::plan(0x10000, prp::max_bytes(), 0, 0x9000).unwrap().list_len, regs::PAGE / 8);
+    assert!(prp::plan(0x10200, prp::max_bytes(), 0, 0x9000).is_none(), "one list page is too short");
+    assert!(prp::plan(0x10200, prp::max_bytes() - regs::PAGE, 0, 0x9000).is_some());
 }
 
 #[test]
@@ -219,17 +228,37 @@ fn namespace_device_is_read_only() {
 #[test]
 fn lost_completion_resets_and_retries_once() {
     let (c, hw) = up(vec![fake::ns(1, 9, 1024)]);
+    let ld = |a: &core::sync::atomic::AtomicU64| a.load(core::sync::atomic::Ordering::Relaxed);
+    // BL-1 (Linux nvme_timeout): the timeout sends Abort; the aborted command comes back and is placed once more,
+    // no reset.
     hw.st.lock().inject.drop_io = 1;
     let mut b = vec![0u8; 4096];
     c.read(1, 8, &mut b, true).unwrap();
     assert_eq!(b[0], fake::pattern(1, 8 * 512));
-    let ld = |a: &core::sync::atomic::AtomicU64| a.load(core::sync::atomic::Ordering::Relaxed);
-    assert_eq!(ld(&c.stats.timeouts), 1);
-    assert_eq!(ld(&c.stats.resets), 1);
+    assert_eq!((ld(&c.stats.timeouts), ld(&c.stats.aborts), ld(&c.stats.resets)), (1, 1, 0));
+    assert_eq!(hw.st.lock().enables, 1);
+    // An Abort that leaves the command out (QEMU): reset, set-up again, the command once more.
+    {
+        let mut st = hw.st.lock();
+        st.inject.drop_io = 1;
+        st.inject.abort_ignored = true;
+    }
+    c.read(1, 8, &mut b, true).unwrap();
+    assert_eq!(b[0], fake::pattern(1, 8 * 512));
+    // Two waits ran out (before and after the Abort).
+    assert_eq!((ld(&c.stats.timeouts), ld(&c.stats.aborts), ld(&c.stats.resets)), (3, 2, 1));
     assert_eq!(hw.st.lock().enables, 2);
-    // Two lost in a row: the retry also times out, the error reaches the caller, the controller still works.
+    // Two lost in a row: the retry also times out and the error reaches the caller. That command may still run on the
+    // controller: it is stopped and stays down until a real restart (the next command would reuse its pages).
     hw.st.lock().inject.drop_io = 2;
     assert_eq!(c.read(1, 8, &mut b, true), Err(CmdError::Timeout));
+    assert_eq!(c.state(), State::Failed);
+    assert_eq!(hw.st.lock().cc & regs::CC_EN, 0, "the controller is off");
+    assert!(hw.st.lock().pci_offs > 0, "bus master off");
+    let before = hw.st.lock().seen_io.len();
+    assert_eq!(c.read(1, 8, &mut b, true), Err(CmdError::NotReady));
+    assert_eq!(hw.st.lock().seen_io.len(), before, "nothing is queued next to an abandoned command");
+    c.restart().unwrap();
     c.read(1, 8, &mut b, true).unwrap();
     no_writes(&c, &hw);
 }
@@ -309,6 +338,12 @@ fn fatal_status_and_gone_device() {
     hw.st.lock().inject.gone = true;
     hw.st.lock().inject.drop_io = 1;
     assert_eq!(c.read(1, 0, &mut b, true), Err(CmdError::Gone));
+    // Given up as any other lost command (BL-1 fixer): stopped, Failed, the next read fails at once.
+    assert_eq!(c.state(), State::Failed);
+    assert!(!hw.st.lock().bus_master);
+    let seen = hw.st.lock().seen_io.len();
+    assert_eq!(c.read(1, 0, &mut b, true), Err(CmdError::NotReady));
+    assert_eq!(hw.st.lock().seen_io.len(), seen);
     c.quiesce();
 }
 
@@ -349,15 +384,22 @@ fn polled_mode_and_small_queues_wrap() {
     no_writes(&c, &hw);
 }
 
+/// BL-1: the bounce is single pages from the queue's pool (no large contiguous buffer), so short contiguous DMA
+/// memory no longer shrinks the transfers: only the queues need contiguous memory.
 #[test]
 fn short_dma_memory_gives_smaller_transfers() {
     let (c, hw) = ctrl(vec![fake::ns(1, 9, 4096)]);
     hw.st.lock().fail_alloc_above = Some(64 * 1024);
     c.start().unwrap();
-    assert_eq!(c.info().max_transfer, 64 * 1024);
+    assert_eq!(c.info().max_transfer, 128 * 1024);
     let mut b = vec![0u8; 200 * 1024];
     c.read(1, 1, &mut b, true).unwrap();
     assert_eq!(b[199 * 1024], fake::pattern(1, 512 + 199 * 1024));
+    // Queue memory beyond the limit: no I/O queue, the start fails with a reason.
+    let (c, hw) = ctrl(vec![fake::ns(1, 9, 4096)]);
+    hw.st.lock().fail_alloc_above = Some(32 * 1024);
+    let e = c.start().unwrap_err();
+    assert!(e.contains("queue memory"), "{e}");
 }
 
 #[test]
@@ -522,7 +564,8 @@ fn hostile_completions_are_skipped_or_recovered() {
     c.read(1, 8, &mut b, true).unwrap();
     assert_eq!(b[0], fake::pattern(1, 8 * 512));
     assert!(ld(&c.stats.stale) >= 1);
-    assert_eq!(ld(&c.stats.resets), 1);
+    // The stranger is skipped; the command's own completion never came: aborted and placed once more.
+    assert_eq!((ld(&c.stats.aborts), ld(&c.stats.resets)), (1, 0));
     hw.st.lock().inject.bad_sq_head = 5;
     for i in 0..5 {
         c.read(1, i * 8, &mut b, true).unwrap();
@@ -540,6 +583,10 @@ fn hostile_completions_are_skipped_or_recovered() {
         c.read(1, i % 1000, &mut b[..512], true).unwrap();
     }
     assert_eq!(c.state(), State::Ready);
-    assert_eq!(ld(&c.stats.resets), 1);
+    assert_eq!(ld(&c.stats.resets), 0);
     no_writes(&c, &hw);
 }
+
+mod window;
+mod mq;
+mod frames;

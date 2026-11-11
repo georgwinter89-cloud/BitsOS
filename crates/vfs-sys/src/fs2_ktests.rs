@@ -24,7 +24,7 @@ fn text(path: &str) -> Result<String, String> {
 fn pid_files() -> TestResult {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/hello").is_err() {
-        return ktest::skip("/bin/hello is not in this image");
+        return ktest::fail("/bin/hello is not in this image");
     }
     // A kernel thread has no process: /proc/self is missing for it, as for Linux's kernel threads.
     kassert!(ns.lookup("/proc/self").err() == Some(ENOENT), "/proc/self exists for a kernel thread");
@@ -119,7 +119,7 @@ fn pci_view() -> TestResult {
     let ns = vfs::root_ns();
     let nodes = pci::tree();
     if nodes.is_empty() {
-        return ktest::skip("no PCI functions were scanned");
+        return ktest::fail("no PCI functions were scanned");
     }
     let sys = ns.lookup_path(b"/sys", true).map_err(|e| format!("/sys: {e}"))?;
     kassert!(sys.mnt.sb.fstype == "sysfs", "/sys is {}", sys.mnt.sb.fstype);
@@ -166,7 +166,7 @@ ktest!("fs.dev.console_out", Safe, console_out);
 fn dev_cases() -> TestResult {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/fs-cases").is_err() {
-        return ktest::skip("/bin/fs-cases is not in this image (xtask change request 3 in plan/notes/fs-FS-1.md)");
+        return ktest::fail("/bin/fs-cases is not in this image (xtask change request 3 in plan/notes/fs-FS-1.md)");
     }
     let n = RUN.fetch_add(1, Ordering::Relaxed);
     let cases = format!("/tmp/dev-cases-{n}.txt");

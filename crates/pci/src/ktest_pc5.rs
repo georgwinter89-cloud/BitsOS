@@ -19,7 +19,7 @@ use ktest::{kassert, ktest};
 type R = ktest::TestResult;
 
 ktest!("pc.aspm.fake", Safe, aspm_fake);
-ktest!("pc.aspm.i226", Safe, aspm_i226);
+ktest!("pc.aspm.i226", Hardware, aspm_i226);
 ktest!("pc.aspm.kernel_path", QemuOnly, aspm_kernel_path);
 ktest!("pc.pcie.saved_regs", Safe, saved_regs);
 ktest!("pc.pcie.restore_ctl2", QemuOnly, restore_ctl2);
@@ -169,7 +169,7 @@ fn aspm_i226() -> R {
         seen += 1;
     }
     if seen == 0 {
-        return ktest::skip("no enabled I226 with L1 PM Substates on both ends of its link");
+        return ktest::fail("no enabled I226 with L1 PM Substates on both ends of its link");
     }
     Ok(())
 }
@@ -199,7 +199,7 @@ fn aspm_kernel_path() -> R {
         done += 1;
     }
     if done == 0 {
-        return ktest::skip("no PCIe card behind a root port, no untouched and no storage function");
+        return ktest::fail("no PCIe card behind a root port, no untouched and no storage function");
     }
     Ok(())
 }
@@ -223,7 +223,7 @@ fn saved_regs() -> R {
         checked += 1;
     }
     if checked == 0 {
-        return ktest::skip("no PCIe function on this machine");
+        return ktest::fail("no PCIe function on this machine");
     }
     Ok(())
 }
@@ -256,7 +256,7 @@ fn restore_ctl2() -> R {
         done += lost_and_restored(n, o, "slot_ctl", &flips)?;
     }
     if done == 0 {
-        return ktest::skip("no PCIe function with a writable Device Control 2 and no root port with a slot");
+        return ktest::fail("no PCIe function with a writable Device Control 2 and no root port with a slot");
     }
     Ok(())
 }

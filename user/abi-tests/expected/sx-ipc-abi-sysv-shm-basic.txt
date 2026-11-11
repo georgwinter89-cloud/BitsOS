@@ -1,0 +1,48 @@
+shmget no key = -ENOENT
+shmget size 0 create = -EINVAL
+shmget private size 0 = -EINVAL
+shmget size past SHMMAX = -EINVAL
+shmget create = 0
+shmget again = 0
+shmget smaller = 0
+shmget size 0 finds = 0
+shmget larger = -EINVAL
+shmget excl = -EEXIST
+second id = 1
+IPC_STAT = 0
+stat key 51c0de00 mode 640 size 10000 uid 0 gid 0 cuid 0 cgid 0 seq 0 atime0 1 dtime0 1 ctime 1 cpid me 1 lpid 0 nattch 0
+IPC_STAT fault = -EFAULT
+IPC_STAT stale = -EINVAL
+negative id = -EINVAL
+negative cmd = -EINVAL
+bad cmd = -EINVAL
+IPC_INFO = 1
+info max 18446744073692774399 min 1 mni 4096 seg 4096 all 18446744073692774399 (idx 1)
+IPC_INFO fault = -EFAULT
+SHM_INFO = 1
+shm_info used 2 tot 4 rss 0 swp 0
+SHM_STAT index 0 = 0
+SHM_STAT free index = -EINVAL
+SHM_STAT_ANY index 1 = 1
+IPC_SET = 0
+IPC_SET fault = -EFAULT
+attach rw on 0444 = EACCES
+attach rdonly on 0444 = address
+shmdt = 0
+IPC_SET 0 = 0
+stat no rights = -EACCES
+SHM_STAT no rights = -EACCES
+SHM_STAT_ANY no rights = 0
+shmget wants rights = -EACCES
+attach no rights = EACCES
+SHM_LOCK = 0
+SHM_STAT_ANY shows it = 0
+locked bit 1
+SHM_LOCK twice = 0
+SHM_UNLOCK = 0
+SHM_UNLOCK twice = 0
+SHM_LOCK without a limit = -EPERM
+SHM_UNLOCK without a limit = 0
+IPC_RMID = 0
+IPC_RMID again = -EINVAL
+key free = -ENOENT

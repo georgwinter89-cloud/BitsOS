@@ -270,6 +270,11 @@ impl App {
         if let Some(i) = self.desk.fold_sent.iter().position(|(k, _, _)| k == key) {
             self.desk.fold_sent.remove(i);
         }
+        // PK-L1b: a pin from the library that settingsd refused stays on this screen only.
+        if key == crate::page::FAVOURITES {
+            eprintln!("bitscomp: library: settingsd refused the favourites: they stay local until a restart");
+            return self.notice("Favoriten nicht gespeichert: der Einstellungsdienst hat abgelehnt (gilt nur bis zum Neustart).");
+        }
         eprintln!("bitscomp: {key} not kept in settingsd: the fold stays local");
     }
 

@@ -607,6 +607,45 @@ static void frames(int seed, int n, const char *how, const char *shape) {
     hold();
 }
 
+/* WY-17: what a program can do with a scanout window as a file, with Linux's answers for a dma-buf
+ * (linux-6.6/drivers/dma-buf/dma-buf.c: dma_buf_llseek, dma_buf_mmap_internal, dma_buf_ioctl). V2 only: Linux has no
+ * FBIO_BITSOS_SCANOUT. One line for dp.fbdev.scanout_engine. */
+struct bitsos_fb_scanout {
+    uint32_t op, window;
+    int32_t fd;
+    uint32_t flags, width, height, stride, fourcc;
+    uint64_t offset, size;
+};
+#define FBIO_BITSOS_SCANOUT _IOWR('F', 0xB4, struct bitsos_fb_scanout)
+#define WY17_DMA_BUF_IOCTL_SYNC _IOW('b', 0, uint64_t)
+
+static void scanout_file(void) {
+    struct bitsos_fb_scanout a = {.op = 1, .fd = -1};
+    fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fd < 0 || ioctl(fd, FBIO_BITSOS_SCANOUT, &a) < 0) {
+        printf("scanout-file export errno=%d\n", errno);
+        return;
+    }
+    int end_ok = lseek(a.fd, 0, SEEK_END) == (off_t)a.size;
+    errno = 0;
+    int cur = lseek(a.fd, 0, SEEK_CUR) == -1 ? errno : 0;
+    volatile uint32_t *p = mmap(0, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
+    int mapped = p != MAP_FAILED, stored = 0;
+    if (mapped) {
+        uint32_t keep = p[0];
+        p[0] = 0x00123456;
+        stored = p[0] == 0x00123456;
+        p[0] = keep;
+    }
+    errno = 0;
+    int beyond = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, a.size) == MAP_FAILED ? errno : 0;
+    uint64_t sync = 3; /* DMA_BUF_SYNC_START | RW */
+    int synced = ioctl(a.fd, WY17_DMA_BUF_IOCTL_SYNC, &sync);
+    errno = 0;
+    int unknown = ioctl(a.fd, _IO('b', 0x7f)) < 0 ? errno : 0;
+    printf("scanout-file flags=%u end=%d cur=%d mapped=%d stored=%d beyond=%d sync=%d unknown=%d\n", a.flags, end_ok, cur, mapped, stored, beyond, synced, unknown);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         abi_facts();
@@ -626,6 +665,10 @@ int main(int argc, char **argv) {
         fflush(stdout);
         hold();
     }
+    if (!strcmp(argv[1], "scanout-file")) {
+        scanout_file();
+        return 0;
+    }
     if (!strcmp(argv[1], "frames") && argc >= 6) {
         frames(atoi(argv[2]), atoi(argv[3]), argv[4], argv[5]);
         return 0;
@@ -634,6 +677,6 @@ int main(int argc, char **argv) {
         draw(atoi(argv[2]), atoi(argv[3]), argc > 4 ? argv[4] : 0);
         return 0;
     }
-    fprintf(stderr, "usage: abi-fbdev [v2 | draw <seed> <frames> [hold|crash] | store <seed> <how> | idle | frames <seed> <n> <plain|damage|pan|end> <full|box>]\n");
+    fprintf(stderr, "usage: abi-fbdev [v2 | draw <seed> <frames> [hold|crash] | store <seed> <how> | idle | scanout-file | frames <seed> <n> <plain|damage|pan|end> <full|box>]\n");
     return 2;
 }

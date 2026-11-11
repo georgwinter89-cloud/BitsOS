@@ -52,7 +52,7 @@ fn read_all(v: &Volume, dir: u32, depth: u32) {
     }
 }
 
-fn check_disk(s: &Scratch, img: Vec<u8>, what: &str) {
+pub(super) fn check_disk(s: &Scratch, img: Vec<u8>, what: &str) {
     // V2's own mount of the cut disk: no panic, orphan cleanup, reading everything.
     let dev = Arc::new(MemDev::new(img.clone()));
     if let Ok(v) = Volume::mount(dev.clone(), opts()) {
@@ -105,6 +105,11 @@ fn a_device_that_stops_turns_the_volume_read_only() {
         dev.stop_after(k);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| changes(&v)));
         assert!(r.is_err(), "the sequence must fail once the device stops");
+        // A file's data that cannot be written is EIO for that write and changes nothing the disk describes (Linux
+        // keeps such a volume writable too); the first change of the volume's own blocks after it stops the volume.
+        if v.writable() {
+            assert!(v.create(ROOT, b"probe", 0o100644, 0, 0, Kind::Reg).is_err(), "a change went through on a stopped device ({k} writes)");
+        }
         assert!(!v.writable(), "a failed write turns the volume read-only");
         assert_eq!(v.create(ROOT, b"after", 0o100644, 0, 0, Kind::Reg).err(), Some(crate::errno::EROFS));
         check_disk(&s, dev.image(), &format!("device stopped after {k} writes"));

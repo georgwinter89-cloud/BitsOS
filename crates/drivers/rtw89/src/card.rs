@@ -138,8 +138,11 @@ impl Card {
             function,
             pci,
             core: Mutex::named("rtw89.core", core),
-            txq: SpinLock::named("rtw89.txq", VecDeque::new()),
-            rxq: SpinLock::named("rtw89.rxq", VecDeque::new()),
+            // Both queues get their full length here and never grow under their spin locks, where the heap can
+            // neither reclaim nor fall back to single frames (a large block there brought the kernel down on
+            // the Mini-PC, 11.11.2026; see net's `sock::unix::fill`).
+            txq: SpinLock::named("rtw89.txq", VecDeque::with_capacity(txq_max())),
+            rxq: SpinLock::named("rtw89.rxq", VecDeque::with_capacity(rxq_max())),
             status: SpinLock::named("rtw89.status", Status::default()),
             phase: SpinLock::named("rtw89.phase", String::from("starting")),
             cmds: SpinLock::named("rtw89.cmds", VecDeque::new()),
@@ -207,30 +210,58 @@ impl Card {
             self.tx_no_link.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        // Copied before the lock; a refused frame's copy goes after it.
+        let mut copy = Some(frame.to_vec());
         {
             let mut q = self.txq.lock();
-            if q.len() >= txq_max() {
-                self.tx_refused.fetch_add(1, Ordering::Relaxed);
-                return Err(devmodel::DevError::Timeout);
+            if q.len() < txq_max() {
+                q.extend(copy.take());
             }
-            q.push_back(frame.to_vec());
+        }
+        if copy.is_some() {
+            self.tx_refused.fetch_add(1, Ordering::Relaxed);
+            return Err(devmodel::DevError::Timeout);
         }
         self.tx_queued.fetch_add(1, Ordering::Relaxed);
         self.kick();
         Ok(())
     }
 
+    /// The thread's frames it could not send go back in front of what the stack queued meanwhile. `left` comes
+    /// back empty, with the queue's former memory; room for the merge is made with the lock dropped.
+    fn requeue_tx(&self, left: &mut VecDeque<Vec<u8>>) {
+        loop {
+            let more = {
+                let mut q = self.txq.lock();
+                if left.capacity() - left.len() >= q.len() {
+                    left.extend(q.drain(..));
+                    core::mem::swap(&mut *q, left);
+                    return;
+                }
+                q.len()
+            };
+            left.reserve(more);
+        }
+    }
+
     /// Frames from the thread for the stack (the oldest go past `rxq_max`)
-    pub fn deliver(&self, frames: Vec<Vec<u8>>) {
+    pub fn deliver(&self, mut frames: Vec<Vec<u8>>) {
         if frames.is_empty() {
             return;
         }
+        let max = rxq_max();
         {
             let mut q = self.rxq.lock();
-            q.extend(frames);
-            while q.len() > rxq_max() {
-                q.pop_front();
-                self.rx_overflow.fetch_add(1, Ordering::Relaxed);
+            // The oldest goes before each push, so the queue stays within the length it was made with; the
+            // dropped frames take the new ones' places in `frames` and are freed after the lock.
+            for f in frames.iter_mut() {
+                let old = if q.len() >= max {
+                    self.rx_overflow.fetch_add(1, Ordering::Relaxed);
+                    q.pop_front().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                q.push_back(core::mem::replace(f, old));
             }
         }
         net::netdev::irq_wake();
@@ -475,6 +506,8 @@ fn service(card: &Card) {
     let mut status_at = 0u64;
     let mut irq_seen = card.irq_count.load(Ordering::Acquire);
     let mut env = KEnv;
+    // Empty between turns: swapped with the card's queue, so both keep their memory.
+    let mut tx: VecDeque<Vec<u8>> = VecDeque::with_capacity(txq_max());
     loop {
         if card.quiesced.load(Ordering::Acquire) {
             card.set_phase("quiesced");
@@ -503,16 +536,13 @@ fn service(card: &Card) {
             if by_irq {
                 r.irq_ack(bus, now_ms());
             }
-            let mut tx = core::mem::take(&mut *card.txq.lock());
+            core::mem::swap(&mut *card.txq.lock(), &mut tx);
             let out = r.turn(bus, &mut env, &mut tx);
             if by_irq {
                 r.irq_rearm(bus);
             }
             if !tx.is_empty() {
-                let mut q = card.txq.lock();
-                while let Some(f) = tx.pop_back() {
-                    q.push_front(f);
-                }
+                card.requeue_tx(&mut tx);
             }
             changed |= out.link.is_some() || !r.log.is_empty();
             card.set_link(&out);

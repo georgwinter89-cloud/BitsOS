@@ -39,6 +39,7 @@ mod mutex;
 pub mod order;
 mod raw;
 mod slots;
+pub mod spare;
 mod spin;
 pub mod stats;
 pub mod user_word;
@@ -50,6 +51,7 @@ pub use lockdep::{LockKind, Violation, ViolationKind};
 pub use mutex::{Mutex, MutexGuard};
 pub use spin::{IrqSpinLock, IrqSpinLockGuard, ReadGuard, RwSpinLock, SpinLock, SpinLockGuard, WriteGuard};
 pub use raw::set_slow_wait_hook;
+pub use spare::Spare;
 pub use stats::set_tsc_hz;
 pub use wait::{Completion, WaitQueue, clockless_timeouts};
 

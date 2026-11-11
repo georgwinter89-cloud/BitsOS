@@ -96,8 +96,9 @@ pub enum Offer {
 
 /// The narrow set (MC-8a brief): hw_info and metrics, events and the kernel ring, Safe-class ktests with their
 /// `output`/`stop`, and the start's identity (`version`, `reload_info`, `system_list`: read-only, what a desk
-/// round needs to follow an install or Reload).
-const GATE: &[&str] = &["events", "hw_info", "ktest", "log", "metrics", "output", "reload_info", "stop", "system_list", "version"];
+/// round needs to follow an install or Reload). `gpu` (GX-9b): the clocks and limits, class Read, one read-only
+/// table transfer from the SMU.
+const GATE: &[&str] = &["events", "gpu", "hw_info", "ktest", "log", "metrics", "output", "reload_info", "stop", "system_list", "version"];
 // MC-9a: `nvme_gate` (opening the NVMe write gate at run time) has no tool yet; named here so that it goes to the
 // installer, never through the gate, once one is registered.
 const INSTALLER: &[&str] = &["install_kernel", "install_system", "nvme_gate", "reboot", "reload", "system_pin"];
@@ -105,7 +106,7 @@ const RAW: &[&str] = &["dcn_cursor", "dcn_flip", "dcn_snapshot", "dcn_writes", "
 const PROCESSES: &[&str] = &["kill", "ps", "run"];
 const FILES: &[&str] = &["delete", "fetch", "list_dir", "manifest", "move_tree", "read_file", "stat", "write_file"];
 const CONSOLE: &[&str] = &["screen", "send_keys", "send_mouse"];
-const DEVICES: &[&str] = &["crash_test", "display_mode", "hang", "preload", "sched_focus", "snd", "wlan"];
+const DEVICES: &[&str] = &["crash_test", "data_move", "display_mode", "hang", "preload", "sched_focus", "snd", "wlan"];
 const OTHER: &[&str] = &["connections", "cpus", "crash_info", "input", "latency", "locks", "net_info", "nvme", "sched", "watchdog"];
 
 const WHY_RAW: &str = "raw memory, registers, MMIO or PCI config space never go through the user-space MCP service";

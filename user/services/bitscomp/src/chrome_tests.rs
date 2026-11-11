@@ -85,7 +85,7 @@ fn layout_keys_and_the_fold_give_the_room_to_the_work_area() {
 fn hits_find_the_parts_and_leave_the_work_area_alone() {
     let c = layout(&theme(&[]), &inputs((2048, 1152), 2));
     let mid = |r: Rect| ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
-    for (r, p) in [(c.address, Part::Address), (c.back, Part::Back), (c.ring, Part::Ring), (c.ws_items[1], Part::Ws(1)), (c.ws_new, Part::WsNew), (c.home, Part::Home), (c.fav_items[0], Part::Fav(0))] {
+    for (r, p) in [(c.address, Part::Address), (c.back, Part::Back), (c.programs, Part::Programs), (c.ring, Part::Ring), (c.ws_items[1], Part::Ws(1)), (c.ws_new, Part::WsNew), (c.home, Part::Home), (c.fav_items[0], Part::Fav(0))] {
         let (x, y) = mid(r);
         assert_eq!(c.hit(x, y), Some(p));
     }

@@ -8,7 +8,7 @@ cd "$BITSOS_ROOT"
 RUN="$BITSOS_RUN_DIR"
 NAME="$BITSOS_LANE-bind"
 LOG="$RUN/serial.log"
-cargo xtask image --name "$NAME" --ktest --config-extra "ktest=pc.bind,pc.rescan,pc.sysfs,pc.optin,pc.storage,pc.scan.tree,contract.pci;loglevel=info"
+cargo xtask image --name "$NAME" --ktest --config-extra "ktest=pc.bind,pc.rescan,pc.sysfs,pc.optin,-pc.optin.net_drivers_off,pc.storage,pc.scan.tree,contract.pci;loglevel=info"
 cargo xtask qemu --name "$NAME" --timeout 120 --net virtio --serial-log "$LOG" -- \
     -device pcie-root-port,id=rp1,chassis=1,slot=1 \
     -device e1000e,bus=rp1 \
@@ -21,6 +21,10 @@ touch "$LOG"
 fail=0
 check() { if grep -aq -- "$1" "$LOG"; then echo "ok   $2"; else echo "FAIL $2 (no '$1')"; fail=1; fi; }
 grep -a "KTEST" "$LOG" || true
+# pc.optin.net_drivers_off's run: its own boot with the switch off (TS-1).
+cargo xtask image --name "$NAME-off" --ktest --config-extra "ktest=pc.optin.net_drivers_off;net_drivers=off;loglevel=info"
+cargo xtask qemu --name "$NAME-off" --timeout 120 --net virtio --serial-log "$RUN/off.log" > "$RUN/off.out" 2>&1 || true
+grep -aq 'KTEST ok pc.optin.net_drivers_off' "$RUN/off.log" || { echo "FAIL pc.optin.net_drivers_off"; grep -a KTEST "$RUN/off.log" || true; exit 1; }
 check 'KTEST done passed=[0-9]* failed=0' "no ktest failed"
 for t in pc.bind.order pc.bind.remove_reprobe pc.bind.busy pc.bind.gone_during_probe pc.bind.one_per_function pc.rescan.keeps_bound pc.sysfs.view \
          pc.optin.command_unchanged pc.storage.raw_write_refused contract.pci_registry_optin; do

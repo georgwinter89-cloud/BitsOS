@@ -183,7 +183,7 @@ fn snapshot() -> Result<Snapshot, String> {
     .map_err(|e| format!("listing the stick: errno {e}"))
 }
 
-/// Ok(None): the test skips (no stick in this run).
+/// Ok(None): the test fails (no stick in this run).
 fn stick() -> Result<Option<Arc<fs_fat::Volume>>, String> {
     match fs_fat::stick::wait_mounted(40_000) {
         Some(v) => Ok(Some(v)),
@@ -245,7 +245,7 @@ fn install_dry_run() -> TestResult {
     let t = crate::find("install_kernel").ok_or("install_kernel is not registered (RB-6 is not in this kernel)")?;
     kassert!(t.owner == "RB" && t.safety == Safety::Change, "install_kernel: owner {} safety {:?}", t.owner, t.safety);
     if stick()?.is_none() {
-        return ktest::skip("no boot stick in this run (no USB disk recognised as the stick)");
+        return ktest::fail("no boot stick in this run (no USB disk recognised as the stick)");
     }
     let before = snapshot()?;
     let top = before.0.iter().map(|g| g.n).max().unwrap_or(0);
@@ -297,10 +297,10 @@ const NO_PATHS: &str = "install_kernel has no kernel_path/initrd_path: apply pla
 /// answer, and the refusals of that source; the stick is the same before and after.
 fn install_paths_dry_run() -> TestResult {
     if !has_paths() {
-        return ktest::skip(NO_PATHS);
+        return ktest::fail(NO_PATHS);
     }
     if stick()?.is_none() {
-        return ktest::skip("no boot stick in this run (no USB disk recognised as the stick)");
+        return ktest::fail("no boot stick in this run (no USB disk recognised as the stick)");
     }
     let before = snapshot()?;
     let top = before.0.iter().map(|g| g.n).max().unwrap_or(0);
@@ -382,7 +382,7 @@ fn read_all(c: &mut Client, path: &str) -> Result<Vec<u8>, String> {
 }
 
 fn install_over_mcp() -> TestResult {
-    let Some(vol) = stick()? else { return ktest::skip("no boot stick in this run") };
+    let Some(vol) = stick()? else { return ktest::fail("no boot stick in this run") };
     kassert!(vol.writable(), "the stick is read-only: {}", fs_fat::stick::last_reason().unwrap_or("?"));
     let before = snapshot()?;
     let top = before.0.iter().map(|g| g.n).max().ok_or("the stick holds no generation")?;
@@ -420,9 +420,9 @@ ktest!("mc.install.over_mcp", QemuOnly, install_over_mcp);
 /// both files on the stick byte for byte; the stick is put back afterwards.
 fn install_paths_over_mcp() -> TestResult {
     if !has_paths() {
-        return ktest::skip(NO_PATHS);
+        return ktest::fail(NO_PATHS);
     }
-    let Some(vol) = stick()? else { return ktest::skip("no boot stick in this run") };
+    let Some(vol) = stick()? else { return ktest::fail("no boot stick in this run") };
     kassert!(vol.writable(), "the stick is read-only: {}", fs_fat::stick::last_reason().unwrap_or("?"));
     let before = snapshot()?;
     let top = before.0.iter().map(|g| g.n).max().ok_or("the stick holds no generation")?;

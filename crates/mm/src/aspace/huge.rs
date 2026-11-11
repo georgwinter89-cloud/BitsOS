@@ -3,11 +3,12 @@
 //! A write fault, a user copy's write or MAP_POPULATE / MADV_POPULATE_WRITE on a missing page whose aligned
 //! 2 MiB lies wholly inside a private anonymous VMA (heap, ELF data and bss, mmap; not a stack, not
 //! MAP_GROWSDOWN, not MADV_NOHUGEPAGE / MAP_STACK, not after PR_SET_THP_DISABLE, by the mode of `thp`) and whose
-//! page-directory slot is empty takes one zeroed 2 MiB block (buddy order 9, `alloc_zeroed_huge_light`: only
-//! what is free now, never reclaim) and maps it with one 2 MiB entry (`huge_base`, `map_huge`; Linux
-//! `do_huge_pmd_anonymous_page`:774 with `transhuge_vma_suitable`, huge_mm.h:100). Without a free block the fault
-//! takes 4 KiB pages and the 64 KiB fault-around (Linux's VM_FAULT_FALLBACK). The fault path zeroes the block
-//! without the space's lock and looks again (MM-tlb2's rule for the 4 KiB spare frame).
+//! page-directory slot is empty takes one zeroed 2 MiB block (buddy order 9, `thp::fault_block`: what is free now;
+//! missing, it asks kswapd for one, and a fault in a MADV_HUGEPAGE VMA clears one itself first) and maps it with
+//! one 2 MiB entry (`huge_base`, `map_huge`; Linux `do_huge_pmd_anonymous_page` with `transhuge_vma_suitable`).
+//! Without a free block the fault takes 4 KiB pages and the 64 KiB fault-around (Linux's VM_FAULT_FALLBACK). The
+//! fault path makes the block without the space's lock and looks again (MM-tlb2's rule for the 4 KiB spare frame);
+//! user copies and MAP_POPULATE, under the lock, never take the direct step.
 //!
 //! Frames: a mapped huge frame is either one never-split block (only this space maps it) or 512 order-0 user
 //! frames with their own share counts (`mm_core::split_user_block`): a fork splits the block's frames (not the
@@ -144,9 +145,12 @@ impl AsCore {
     /// A huge page at `base` of `v` made under the lock (user copies, MAP_POPULATE, MADV_POPULATE_WRITE: the
     /// call's own thread waits for it anyway). False: no free block (or the hook says so), the caller fills 4 KiB.
     pub(crate) fn fill_huge_now(&self, g: &mut Inner, base: u64, v: &Vma) -> bool {
-        let f = if g.huge_fail { None } else { mm_core::alloc_zeroed_huge_light(mm_core::Kind::User) };
+        // Under the space's lock: never the direct step (its compaction and grace wait stay out of the lock).
+        let f = if g.huge_fail { None } else { thp::fault_block(false, false) };
         let Some(f) = f else {
-            thp::FAULT_FALLBACK.inc();
+            if g.huge_fail {
+                thp::FAULT_FALLBACK.inc();
+            }
             return false;
         };
         match self.map_huge(g, base, v, f) {

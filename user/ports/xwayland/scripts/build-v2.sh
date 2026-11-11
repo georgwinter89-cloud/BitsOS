@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# WY-3: builds the Xwayland tree for BitsOS V2 (\BITSOS2\xwayland\ on the stick) from the X.Org source releases,
-# in software (no glamor, no DRI3, no GLX: glamor comes with WY-3b once Mesa runs on the 780M).
+# WY-3: builds the Xwayland tree for BitsOS V2 (\BITSOS2\xwayland\ on the stick) from the X.Org source releases.
+# WY-3b: with glamor, DRI3 and GLX, on the Mesa tree's libraries; bitscomp starts it with XWAYLAND_NO_GLAMOR=1 when it
+# cannot use them (user/services/bitscomp/src/xwayland.rs).
 #   bin/Xwayland, bin/xkbcomp   built here; PT_INTERP is the Mesa tree's loader and DT_RPATH
 #                               $XW_ROOT/lib:$MESA_ROOT/lib, so they run with the Mesa tree's glibc as bitscomp's
 #                               gpu build does (never the initramfs glibc)
-#   lib/                        the libraries they link that the Mesa tree lacks (the host's files, by soname)
+#   lib/                        the libraries they link that the Mesa tree lacks (the host's files, by soname), and
+#                               libGLX_mesa.so.0, which an X11 GL client's libGLX loads by name
+#   clients/                    glxgears, glxinfo, xdpyinfo from the distribution's signed packages, for the Mini-PC's
+#                               x11gpu.sh (they would be on nobody's stick otherwise); started by `run`
+#   run                         starts a program of clients/ or a path with both trees' loader, libraries and drivers
 #   share/X11/xkb/              xkeyboard-config's data (xkbcomp compiles the keymaps bitscomp sends)
 #   LICENSES/                   the licence texts; SOURCES.txt what was built from what
 #   test/bin, test/lib          XW_TEST=1 only: the test clients (xterm, xeyes, xclock, xdpyinfo, xinput, xrandr,
@@ -41,6 +46,10 @@ SOURCES=(
 )
 TEST_PKGS="xterm xorg-xeyes xorg-xclock xorg-xdpyinfo xorg-xinput xorg-xrandr xclip wl-clipboard"
 TEST_BINS="xterm xeyes xclock xdpyinfo xinput xrandr xclip wl-copy wl-paste"
+# WY-3b: on the stick (x11gpu.sh needs them there): package|program...
+CLIENTS=("mesa-utils|glxgears glxinfo" "xorg-xdpyinfo|xdpyinfo")
+# What an X11 GL client's libGLX loads by name, so nothing lists it as needed.
+DLOPEN="libGLX_mesa.so.0"
 
 mkdir -p "$DL" "$WORK/src" "$WORK/pkg" "$WORK/dl"
 fetch() {
@@ -100,10 +109,11 @@ export PKG_CONFIG_PATH=$DEPS/share/pkgconfig:$DEPS/lib/pkgconfig
 
 LINK="-Wl,--dynamic-linker=$MESA_ROOT/lib/ld-linux-x86-64.so.2 -Wl,--disable-new-dtags -Wl,-rpath,$XW_ROOT/lib:$MESA_ROOT/lib"
 B=$WORK/b-xwayland
-if [ ! -f "$B/hw/xwayland/Xwayland" ]; then
+# A build dir of the software tree (WY-3) would give the old binary without a word: the option that changes marks it.
+if [ ! -f "$B/hw/xwayland/Xwayland" ] || [ ! -f "$B/wy3b-glamor" ]; then
   rm -rf "$B"
   $MESON setup "$B" "$WORK/src/xwayland-24.1.14" --buildtype=release --prefix="$XW_ROOT" \
-    -Dglamor=false -Ddri3=false -Ddrm=false -Dglx=false -Dlibdecor=false -Dxwayland_ei=false -Dxvfb=false \
+    -Dglamor=true -Ddri3=true -Ddrm=true -Dglx=true -Dlibdecor=false -Dxwayland_ei=false -Dxvfb=false \
     -Dsecure-rpc=false -Dxdmcp=false -Dxdm-auth-1=false -Dlisten_tcp=false -Dsystemd_notify=false \
     -Dxselinux=false -Dlibunwind=false -Ddocs=false -Ddevel-docs=false -Ddocs-pdf=false -Dsha1=libnettle \
     -Dxkb_dir="$XW_ROOT/share/X11/xkb" -Dxkb_bin_dir="$XW_ROOT/bin" -Dxkb_output_dir=/tmp \
@@ -114,6 +124,7 @@ if [ ! -f "$B/hw/xwayland/Xwayland" ]; then
   # test programs on the host, where the tree's loader does not exist.
   cmd=$(ninja -C "$B" -t commands hw/xwayland/Xwayland | tail -n 1)
   (cd "$B" && eval "$cmd $LINK") || die "linking Xwayland for the tree failed"
+  touch "$B/wy3b-glamor"
 fi
 K=$WORK/src/xkbcomp-1.5.0
 if [ ! -f "$K/xkbcomp" ]; then
@@ -154,6 +165,32 @@ walk() {
   done
 }
 walk "$NEW/lib" "$NEW/bin/Xwayland" "$NEW/bin/xkbcomp"
+# WY-3b: libepoxy dlopens the Mesa tree's libEGL and libGL by name, so Xwayland's RPATH finds them.
+for so in $DLOPEN; do
+  [ -f "$STAGE/lib/$so" ] && continue
+  src=/usr/lib/$so
+  [ -f "$src" ] || die "$so: neither in the Mesa stage nor on the host"
+  # The host's Mesa must be the stage's: else `walk` would add the host's whole driver next to the tree's.
+  for g in $(needed "$src" | grep '^libgallium'); do
+    [ -f "$STAGE/lib/$g" ] || die "$so needs $g, the stage has another Mesa (user/ports/mesa/scripts/stage-stick.sh again)"
+  done
+  cp -L "$src" "$NEW/lib/$so"
+  owner=$(q -Qoq "$src" || echo unknown)
+  [ -d "/usr/share/licenses/$owner" ] && [ ! -d "$NEW/LICENSES/$owner" ] && cp -rL "/usr/share/licenses/$owner" "$NEW/LICENSES/"
+  echo "$so $owner" >>"$NEW/LIBS.txt"
+  walk "$NEW/lib" "$NEW/lib/$so"
+done
+mkdir -p "$NEW/clients"
+for c in "${CLIENTS[@]}"; do
+  d=$(pkg "${c%%|*}")
+  for b in ${c#*|}; do
+    [ -f "$d/usr/bin/$b" ] || die "no $b in the package ${c%%|*}"
+    cp "$d/usr/bin/$b" "$NEW/clients/"
+  done
+  [ -d "$d/usr/share/licenses/${c%%|*}" ] && cp -r "$d/usr/share/licenses/${c%%|*}" "$NEW/LICENSES/"
+done
+walk "$NEW/lib" "$NEW"/clients/*
+cp "$HERE/bitsos/run" "$NEW/run"
 
 if [ "${XW_TEST:-0}" = 1 ]; then
   mkdir -p "$NEW/test/bin" "$NEW/test/lib"
@@ -168,7 +205,7 @@ fi
 
 # Checks: the tree's loader resolves both programs inside the two trees; no two names fold together on FAT.
 LD=$STAGE/lib/ld-linux-x86-64.so.2
-for b in "$NEW"/bin/Xwayland "$NEW"/bin/xkbcomp "$NEW"/test/bin/*; do
+for b in "$NEW"/bin/Xwayland "$NEW"/bin/xkbcomp "$NEW"/lib/libGLX_mesa.so.0 "$NEW"/clients/* "$NEW"/test/bin/*; do
   [ -f "$b" ] || continue
   lp=$NEW/lib:$STAGE/lib; case $b in */test/*) lp=$NEW/test/lib:$lp ;; esac
   out=$("$LD" --inhibit-cache --library-path "$lp" --list "$b" 2>&1) || die "the tree's loader cannot load $b: $out"

@@ -131,7 +131,7 @@ fn one_image_is_mounted_once() {
     mount::mount_image(&ns, "/boot/data.img", "/data", opts()).unwrap();
 }
 
-fn fresh_ns(s: &Scratch, size: &str, extra: &[&str]) -> (Arc<crate::MemDev>, vfs::MountNs, Arc<crate::Volume>, Arc<vfs::mount_ns::Mount>) {
+pub(super) fn fresh_ns(s: &Scratch, size: &str, extra: &[&str]) -> (Arc<crate::MemDev>, vfs::MountNs, Arc<crate::Volume>, Arc<vfs::mount_ns::Mount>) {
     let img = mkfs(s, size, extra, None);
     let dev = Arc::new(crate::MemDev::new(img));
     let ns = vfs::MountNs::new_empty();
@@ -304,6 +304,39 @@ fn root_reserve_is_for_root() {
     assert_clean(&s, &dev.image(), "root wrote into the reserve");
     let (_d2, v2) = mount(dev.image());
     assert_eq!(v2.stat(lookup(&v2, "/root")).unwrap().size(), root);
+}
+
+/// One run of root's far into the reserve, written back in steps smaller than the reserve, then a short run with the
+/// volume already below it: each was promised its blocks, so each gets them (a step asked to leave the reserve minus
+/// its own promise ran out with the page cache full of promised data).
+#[test]
+fn promises_into_the_reserve_hold_in_steps() {
+    vfs::inode::set_current_cred(test_cred);
+    let s = Scratch::new();
+    let (dev, ns, vol, _m) = fresh_ns(&s, "96M", &["-b", "4096", "-m", "30"]);
+    let c = Ctx::kernel(&ns);
+    AS.with(|a| a.set(Some(vfs::inode::Cred::ROOT)));
+    let free = vol.statfs().unwrap().bfree;
+    let len = ((free - 512) * 4096) as usize;
+    let f = c.open(None, b"/data/big", O_WRONLY | O_CREAT, 0o644).unwrap();
+    let mut at = 0;
+    let chunk = vec![0x5Au8; 1 << 20];
+    while at < len {
+        at += f.pwrite(at as u64, &chunk[..(len - at).min(chunk.len())]).unwrap();
+    }
+    drop(f);
+    sync_tree(&ns, "/data");
+    let small = c.open(None, b"/data/small", O_WRONLY | O_CREAT, 0o644).unwrap();
+    small.pwrite(0, &vec![0x6Bu8; 64 << 10]).unwrap();
+    drop(small);
+    sync_tree(&ns, "/data");
+    AS.with(|a| a.set(None));
+    assert_eq!(vol.st.lock().reserved, 0, "promises left over");
+    vol.sync_fs().unwrap();
+    assert_clean(&s, &dev.image(), "root wrote into the reserve in steps");
+    let (_d2, v2) = mount(dev.image());
+    assert_eq!(v2.stat(lookup(&v2, "/big")).unwrap().size(), len as u64);
+    assert_eq!(v2.stat(lookup(&v2, "/small")).unwrap().size(), 64 << 10);
 }
 
 /// B1/VS-2 through the VFS: `FsFreeze::freeze` of the mounted ext4 writes the dirty pages back, commits and

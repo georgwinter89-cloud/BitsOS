@@ -275,6 +275,7 @@ impl SeatHandler for App {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        self.lock.keyboard_on(focused);
         let client = focused.and_then(|s| self.dh.get_client(s.id()).ok());
         let pid = client.as_ref().and_then(|c| c.get_data::<ClientState>().map(|d| d.pid)).unwrap_or(0);
         if self.grant.as_mut().is_some_and(|g| g.focus(pid).is_err()) {
@@ -377,6 +378,12 @@ impl App {
     /// covers the screen only once its workspace is shown.
     fn client_fullscreen(&mut self, surface: &ToplevelSurface, on: bool) -> bool {
         let Some(w) = self.find_window(surface.wl_surface()) else { return false };
+        self.window_fullscreen(&w, on)
+    }
+
+    /// The same for either kind of window (an X11 one asks through `_NET_WM_STATE`).
+    pub(crate) fn window_fullscreen(&mut self, w: &Window, on: bool) -> bool {
+        let w = w.clone();
         let id = crate::ctl::win_id(&w);
         if on && (self.ws.is_minimized(&w) || self.desk.parked.iter().any(|ws| ws.is_minimized(&w))) {
             // Hidden: it is told its state as it is (not fullscreen, not activated) and stays minimised.

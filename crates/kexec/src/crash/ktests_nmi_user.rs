@@ -103,7 +103,7 @@ fn sample(wait_ns: u64) -> Result<hal::nmi::Round, alloc::string::String> {
 fn nmi_user_stress() -> TestResult {
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU: nothing to sample");
+        return ktest::fail("one CPU: nothing to sample");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());
@@ -186,11 +186,11 @@ fn bp_hook(f: &mut hal::idt::TrapFrame) -> bool {
 /// (`nmi.nested` panic naming the interrupted rip). Survives only once the NMI entry is nesting-safe (CR-1).
 fn nmi_nested() -> TestResult {
     if crate::boot::config("rb_nmi_nest").as_deref() != Some("on") {
-        return ktest::skip("CONFIG rb_nmi_nest=on not set (the nested NMI may end the boot)");
+        return ktest::fail("CONFIG rb_nmi_nest=on not set (the nested NMI may end the boot)");
     }
     let n = hal::percpu::cpu_count();
     if n < 2 || !hal::nmi::prepared() {
-        return ktest::skip("needs a second CPU and the NMI slots");
+        return ktest::fail("needs a second CPU and the NMI slots");
     }
     let me = hal::percpu::this_cpu();
     let target = (0..n).find(|&c| c != me).ok_or("no other CPU")?;
@@ -230,4 +230,4 @@ fn nmi_nested() -> TestResult {
     klog::event!(Info, "crash", "ktest.nmi_nested", target = target, survived = true);
     Ok(())
 }
-ktest!("rb.crash.nmi_nested", QemuOnly, nmi_nested);
+ktest!("rb.crash.nmi_nested", Run("gate/nmi-nested"), nmi_nested);

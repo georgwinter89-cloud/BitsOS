@@ -17,7 +17,17 @@ panic=halt
 # Data volume (FS-8c): data_img_mb=<MiB> size of a new \BITSOS2\data.img (default 2048, 32..4095; 0 = no /data).
 # An existing image is never changed; a new one is made only when 512 MiB of the stick stay free.
 # Compositor build (WY-14): bitscomp=gpu makes /bin/bitscomp hand over to \BITSOS2\bin\bitscomp-gpu (linked against the
-# Mesa tree \BITSOS2\mesa\); rescue (default), or a missing gpu build or tree, keeps /bin/bitscomp. bitscomp --build
+# Mesa tree \BITSOS2\mesa\); rescue, or a missing gpu build or tree, keeps /bin/bitscomp. bitscomp --build
 # rescue|gpu overrides it for one start.
 # bitscomp=gles: the gpu build draws with GLES (Mesa's llvmpipe from \BITSOS2\mesa\) and reads the picture back
 # to the screen; if EGL cannot start it draws with Pixman. bitscomp --renderer pixman|gles overrides it.
+# WY-21: bitscomp=auto (the default) draws with GLES on the GPU when its render node opens and the gpu build's check
+# passes, else with the rescue build's Pixman. The rescue build waits beside the gpu build: when the GPU is lost
+# (a new open of the node answers ENODEV, a GL reset, a frame that never ends) or the gpu build crashes, the
+# desktop goes on in Pixman with its workspaces and the programs restarted; it never stays a frozen picture.
+bitscomp=auto
+# GPU at boot (GX-8c, WY-21): gpu=on (the default) brings the Radeon 780M up by itself, as gx_bringup until=backend,
+# within 30 s; the desktop waits for it. A failure, or a machine without the chip, leaves the desktop on Pixman.
+# gpu=off keeps the chip down (gx_bringup still brings it up by hand). Test only: drm=fake gives QEMU a fake GPU, and
+# drm_fake_hang=lose makes a hang on it end the device as an unrecoverable one does on the chip.
+gpu=on

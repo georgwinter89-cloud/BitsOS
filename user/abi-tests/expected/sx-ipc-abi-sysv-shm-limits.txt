@@ -1,0 +1,23 @@
+MEMLOCK 4 MiB = 0
+huge bad size log = -EINVAL
+huge without a pool = -EPERM
+huge 2M without a pool = -EPERM
+huge over MEMLOCK = -EPERM
+huge 2M over MEMLOCK = -EPERM
+SHM_LOCK within the limit = 0
+SHM_LOCK over the limit = -ENOMEM
+SHM_UNLOCK first = 0
+big without room = -ENOMEM
+big NORESERVE = 2
+SHM_INFO = 2
+tot 268435459 rss 0
+remove = 0
+no-caps root writes shmmax = 5
+over shmmax = -EINVAL
+at shmmax = 3
+shmall = 2
+over shmall = 4
+shmall back = 21
+shmmni = 2
+over shmmni = -ENOSPC
+over shmmni = -ENOSPC

@@ -126,6 +126,8 @@ pub struct Steps {
     pub generation: u64,
     pub kernel_ready: bool,
     pub init: Init,
+    /// GX-8c: the chip's bring-up at boot runs (`gx boot.start` until its end).
+    pub gpu_boot: bool,
     /// Changes so far (the screen draws when it moved; `/proc/bitsos/boot` shows it).
     pub seq: u64,
 }
@@ -176,6 +178,18 @@ macro_rules! d {
     };
 }
 
+/// The MCP row when the server did not start: with why, if the line says (`reason=`, or `error=` as the kernel's own
+/// `mcp.not_started` writes it), and without empty parentheses if it does not. klog quotes a value with spaces, so it is
+/// read whole (`klog::fields::value_of`); a value with nothing the boot screen can draw counts as none (`Detail` drops
+/// control characters, the atlas what it lacks).
+fn not_started(l: &Line<'_>) -> Detail {
+    let why = |key| klog::fields::value_of(l.rest, key).map(|v| v.trim_matches('"')).filter(|v| v.chars().any(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\\')));
+    match why("reason").or_else(|| why("error")) {
+        Some(why) => d!("nicht gestartet ({why})"),
+        None => Detail::from("nicht gestartet"),
+    }
+}
+
 fn mb(v: Option<&str>) -> Detail {
     let n: u64 = v.and_then(|s| s.parse().ok()).unwrap_or(0);
     if n >= 10 * 1024 {
@@ -193,6 +207,7 @@ impl Steps {
             generation: 0,
             kernel_ready: false,
             init: Init::Unknown,
+            gpu_boot: false,
             seq: 0,
         }
     }
@@ -252,12 +267,31 @@ impl Steps {
             ("snd", n) if err => (Key::Sound, Update::Fail(Detail::from(n))),
             ("dcn", "attached") => (Key::Gpu, Update::Run(Detail::from("anzeige gefunden"))),
             ("gx", "state.classified") => (Key::Gpu, Update::Run(Detail::from("gpu wird geprüft"))),
+            // GX-8c: CONFIG gpu=on. The row is settled by the end of the whole run, not by GC's boot on the way.
+            ("gx", "boot.start") => {
+                self.gpu_boot = true;
+                (Key::Gpu, Update::Run(Detail::from("gpu startet")))
+            }
+            ("gx", "boot.no_chip") => (Key::Gpu, Update::Skip(Detail::from("keine amd-gpu"))),
+            ("gx", "boot.up") => {
+                self.gpu_boot = false;
+                (Key::Gpu, Update::Done(d!("gpu bereit, renderD{}", f("minor"))))
+            }
+            ("gx", "boot.failed") => {
+                self.gpu_boot = false;
+                if f("stop") == "not_needed" {
+                    (Key::Gpu, Update::Fail(d!("nicht gestartet ({}), ohne gpu", f("stage"))))
+                } else {
+                    (Key::Gpu, Update::Fail(d!("gestoppt bei {}, ohne gpu", f("stage"))))
+                }
+            }
+            ("gx", "gfx.booted") if self.gpu_boot => (Key::Gpu, Update::Run(Detail::from("gpu gestartet"))),
             ("gx", "gfx.booted") => (Key::Gpu, Update::Done(Detail::from("gpu gestartet"))),
             ("gx", n) | ("dcn", n) if err => (Key::Gpu, Update::Fail(Detail::from(n))),
             ("mcp", "server.start") => (Key::Mcp, Update::Done(d!("port {}", f("port")))),
             // CONFIG mcp=service: the kernel keeps the gate, the user-space service bitsmcp (started by init) serves.
             ("mcp", "server.not_started") => (Key::Mcp, Update::Done(Detail::from("über den dienst bitsmcp"))),
-            ("mcp", "server.start_failed") | ("kernel", "mcp.not_started") => (Key::Mcp, Update::Fail(d!("nicht gestartet ({})", f("reason")))),
+            ("mcp", "server.start_failed") | ("kernel", "mcp.not_started") => (Key::Mcp, Update::Fail(not_started(l))),
             ("ul", "init.start") => {
                 self.init = Init::Running;
                 (Key::Services, Update::Done(d!("init läuft (pid {})", f("pid"))))
@@ -273,6 +307,7 @@ impl Steps {
             }
             ("console", "desktop.off") => (Key::Desktop, Update::Skip(Detail::from("desktop=off"))),
             ("console", "desktop.wait") => (Key::Desktop, Update::Run(Detail::from("wartet auf init"))),
+            ("console", "desktop.held") => (Key::Desktop, Update::Run(Detail::from("wartet auf die gpu"))),
             ("console", "desktop.start") => (Key::Desktop, Update::Run(d!("{} startet (versuch {})", f("program"), f("attempt")))),
             ("console", "desktop.failed") => (Key::Desktop, Update::Run(d!("versuch {}: {}", f("attempt"), why(f("reason"))))),
             ("console", "desktop.up") => (Key::Desktop, Update::Done(d!("{} läuft", f("program")))),
@@ -301,12 +336,12 @@ impl Steps {
             "wlan" => name == "netdev.registered",
             "snd" => matches!(name, "hda.probe" | "hda.output"),
             "dcn" => name == "attached",
-            "gx" => matches!(name, "state.classified" | "gfx.booted"),
+            "gx" => matches!(name, "state.classified" | "gfx.booted" | "boot.start" | "boot.no_chip" | "boot.up" | "boot.failed"),
             "mcp" => matches!(name, "server.start" | "server.not_started" | "server.start_failed"),
             "ul" => matches!(name, "init.start" | "init.off" | "init.died" | "init.given_up"),
             "console" => matches!(
                 name,
-                "desktop.off" | "desktop.wait" | "desktop.start" | "desktop.failed" | "desktop.up" | "desktop.given_up"
+                "desktop.off" | "desktop.wait" | "desktop.held" | "desktop.start" | "desktop.failed" | "desktop.up" | "desktop.given_up"
                     | "desktop.ended" | "desktop.slow" | "desktop.no_init"
             ),
             // The ktest `in.boot.watch` checks the path without touching the live list (`map` ignores it).

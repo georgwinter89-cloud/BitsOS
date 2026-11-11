@@ -1,7 +1,7 @@
 //! PC-1 ktests. All but `pc.ecam.q35_window` are `Safe`: they read configuration space and compare with
 //! what the scan recorded; the only write attempts go to untouched functions and are refused before they
 //! reach the device. Tests whose hardware is missing say `skip` (the topology ones need the extra QEMU
-//! devices of `host/tests/pc/10-topology.sh`; on the Mini-PC they skip).
+//! devices of `host/tests/pc/10-topology.sh`; on the Mini-PC they fail).
 //!
 //! Two test drivers are registered with QEMU-only IDs (ICH9 SMBus and AHCI), so on real hardware they
 //! match nothing.
@@ -23,13 +23,13 @@ ktest!("pc.scan.tree", Safe, scan_tree);
 ktest!("pc.scan.ecam", Safe, scan_ecam);
 ktest!("pc.ecam.q35_window", QemuOnly, q35_window);
 ktest!("pc.bars.restored", Safe, bars_restored);
-ktest!("pc.untouched.key_off", Safe, untouched_key_off);
-ktest!("pc.untouched.wlan", Safe, untouched_wlan);
-ktest!("pc.storage.nvme_only", Safe, storage_nvme_only);
+ktest!("pc.untouched.key_off", QemuAll, untouched_key_off);
+ktest!("pc.untouched.wlan", Hardware, untouched_wlan);
+ktest!("pc.storage.nvme_only", QemuAll, storage_nvme_only);
 ktest!("pc.guard.storage_bar", Safe, guard_storage_bar);
 ktest!("pc.topo.multifunction", Safe, topo_multifunction);
-ktest!("pc.topo.root_port", Safe, topo_root_port);
-ktest!("pc.topo.bridge_chain", Safe, topo_bridge_chain);
+ktest!("pc.topo.root_port", Run("pc/10-topology"), topo_root_port);
+ktest!("pc.topo.bridge_chain", Run("pc/10-topology"), topo_bridge_chain);
 ktest!("pc.cf8.writer", Safe, cf8_writer_owned);
 
 const ICH9_SMBUS: (u16, u16) = (0x8086, 0x2930);
@@ -100,11 +100,11 @@ fn scan_tree() -> R {
 /// ECAM is in use whenever the firmware has an MCFG, and every PCIe function then reaches 4 KiB.
 fn scan_ecam() -> R {
     let Some(t) = acpi::tables() else {
-        return ktest::skip("acpi::init was not called (desk change request CP-2/1): PCI runs on the 0xCF8 fallback");
+        return ktest::fail("acpi::init was not called (desk change request CP-2/1): PCI runs on the 0xCF8 fallback");
     };
     if t.mcfg.is_empty() {
         kassert!(crate::method() == "cf8");
-        return ktest::skip("no MCFG on this machine");
+        return ktest::fail("no MCFG on this machine");
     }
     kassert!(crate::method() == "ecam", "MCFG present but method {}", crate::method());
     for n in crate::tree() {
@@ -126,12 +126,12 @@ fn q35_window() -> R {
     let hb = crate::Loc::new(0, 0, 0, 0);
     let id = cf8.read32(hb, 0);
     if (id as u16, (id >> 16) as u16) != Q35_MCH {
-        return ktest::skip("not a q35 machine");
+        return ktest::fail("not a q35 machine");
     }
     let lo = cf8.read32(hb, 0x60);
     let hi = cf8.read32(hb, 0x64);
     if lo & 1 == 0 {
-        return ktest::skip("PCIEXBAR disabled");
+        return ktest::fail("PCIEXBAR disabled");
     }
     let (buses, mask): (u16, u64) = match (lo >> 1) & 3 {
         0 => (256, 0xF_F000_0000),
@@ -188,7 +188,7 @@ fn bars_restored() -> R {
 /// register as the firmware left it.
 fn untouched_key_off() -> R {
     let nodes = crate::tree();
-    let Some(i) = find(&nodes, ICH9_SMBUS) else { return ktest::skip("no ICH9 SMBus (QEMU q35 only)") };
+    let Some(i) = find(&nodes, ICH9_SMBUS) else { return ktest::fail("no ICH9 SMBus (QEMU q35 only)") };
     let n = &nodes[i];
     kassert!(n.untouched == Some("ktest_untouched"), "untouched = {:?}", n.untouched);
     kassert!(n.bars.is_none(), "an untouched function was sized");
@@ -206,10 +206,14 @@ fn untouched_wlan() -> R {
     let nodes = crate::tree();
     let is_wlan = |n: &Node| crate::optin::CORE_OPT_IN.iter().any(|(m, _)| m.hits(n.vendor, n.device, n.class));
     if !nodes.iter().any(is_wlan) {
-        return ktest::skip("no wireless controller");
+        return ktest::fail("no wireless controller");
     }
+    // The Mini-PC's usual CONFIG has wlan=on: then the opt-in is what this test sees.
     if crate::registry::opted_in("wlan") {
-        return ktest::skip("wlan=on: the WLAN may be touched");
+        for n in nodes.iter().filter(|n| is_wlan(n)) {
+            kassert!(n.untouched != Some("wlan"), "{}: wlan=on, still untouched", n.loc);
+        }
+        return Ok(());
     }
     for (i, n) in nodes.iter().enumerate() {
         if is_wlan(n) {
@@ -233,7 +237,7 @@ fn untouched_wlan() -> R {
 /// test driver that must never be probed.
 fn storage_nvme_only() -> R {
     let nodes = crate::tree();
-    let Some(i) = find(&nodes, ICH9_AHCI) else { return ktest::skip("no ICH9 AHCI (QEMU q35 only)") };
+    let Some(i) = find(&nodes, ICH9_AHCI) else { return ktest::fail("no ICH9 AHCI (QEMU q35 only)") };
     kassert!(nodes[i].is_storage());
     kassert!(STORAGE_PROBES.load(Ordering::SeqCst) == 0, "a non-NVMe driver was bound to mass storage");
     kassert!(!crate::optin::may_bind("ktest-storage", &nodes[i]) && crate::optin::may_bind("nvme", &nodes[i]));
@@ -243,7 +247,7 @@ fn storage_nvme_only() -> R {
 /// CP-2's register guard now sees PC's device list: a mass-storage BAR is refused.
 fn guard_storage_bar() -> R {
     if acpi::tables().is_none() {
-        return ktest::skip("acpi::init was not called (desk change request CP-2/1): the guard has no memory map");
+        return ktest::fail("acpi::init was not called (desk change request CP-2/1): the guard has no memory map");
     }
     let nodes = crate::tree();
     let bar = nodes
@@ -252,7 +256,7 @@ fn guard_storage_bar() -> R {
         .filter_map(|n| n.bars)
         .flat_map(|b| b.into_iter().flatten())
         .find(|b| matches!(b, Bar::Mem { .. }) && b.assigned());
-    let Some(bar) = bar else { return ktest::skip("no mass-storage memory BAR") };
+    let Some(bar) = bar else { return ktest::fail("no mass-storage memory BAR") };
     let r = acpi::check_mem(bar.start(), 4);
     kassert!(r == Err(acpi::guard::Refusal::StorageBar), "guard said {:?} for storage BAR {:#x}", r, bar.start());
     Ok(())
@@ -263,7 +267,7 @@ fn topo_multifunction() -> R {
     let nodes = crate::tree();
     let same_dev = |a: &Node, b: &Node| (a.loc.segment, a.loc.bus, a.loc.dev) == (b.loc.segment, b.loc.bus, b.loc.dev);
     let Some(f0) = nodes.iter().find(|n| n.loc.func == 0 && n.multifunction() && nodes.iter().any(|m| m.loc.func != 0 && same_dev(m, n))) else {
-        return ktest::skip("no multi-function device");
+        return ktest::fail("no multi-function device");
     };
     for m in nodes.iter().filter(|m| same_dev(m, f0)) {
         kassert!(m.parent == f0.parent, "{} and {} have different parents", m.loc, f0.loc);
@@ -274,7 +278,7 @@ fn topo_multifunction() -> R {
 /// `-device pcie-root-port,id=rp1 -device igb,bus=rp1`: the igb below a root port, its BARs and MSI-X.
 fn topo_root_port() -> R {
     let nodes = crate::tree();
-    let Some(i) = find(&nodes, IGB) else { return ktest::skip("no igb card (host/tests/pc/10-topology.sh adds one)") };
+    let Some(i) = find(&nodes, IGB) else { return ktest::fail("no igb card (host/tests/pc/10-topology.sh adds one)") };
     let n = &nodes[i];
     let p = n.parent.ok_or("igb on a root bus, not below a root port")?;
     let rp = &nodes[p];
@@ -298,7 +302,7 @@ fn topo_root_port() -> R {
 /// A pci-bridge chain with QEMU's pci-testdev at the end (`membar` = a 64-bit prefetchable BAR2).
 fn topo_bridge_chain() -> R {
     let nodes = crate::tree();
-    let Some(i) = find(&nodes, PCI_TESTDEV) else { return ktest::skip("no pci-testdev (host/tests/pc/10-topology.sh adds one)") };
+    let Some(i) = find(&nodes, PCI_TESTDEV) else { return ktest::fail("no pci-testdev (host/tests/pc/10-topology.sh adds one)") };
     let chain = ancestors(&nodes, i);
     kassert!(chain.len() >= 3, "pci-testdev only {} bridges deep", chain.len());
     for w in chain.windows(2) {

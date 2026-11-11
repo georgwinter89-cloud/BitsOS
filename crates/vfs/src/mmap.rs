@@ -63,6 +63,18 @@ pub trait MapBacking: Send + Sync {
     fn file(&self) -> Option<&FileMap> {
         None
     }
+    /// SX-IPC, Linux's `vm_ops->open` and `close`: a VMA of this backing came to be (insert, split, fork's copy) or
+    /// went. A SysV segment counts its attachments with them. Called with the address space's lock held.
+    fn vma_open(&self) {}
+    fn vma_close(&self) {}
+    /// Whether two neighbouring VMAs of it may become one (a backing with a close op: no, `is_mergeable_vma`).
+    fn mergeable(&self) -> bool {
+        true
+    }
+    /// A SysV segment's size (`shmdt` finds its VMAs by it); None for everything else.
+    fn sysv_segment_size(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// MM-rmap (FS-14 change request 1): MM's reverse map, which removes a file's pages from every mapping

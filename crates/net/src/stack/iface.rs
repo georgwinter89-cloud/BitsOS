@@ -225,6 +225,8 @@ impl Iface {
         let now = instant(now_ns);
         let link = self.dev.link();
         let mtu = self.dev.mtu().max(576);
+        // Before the guard: what the round leaves of it goes after the unlock.
+        let mut stock = self.premake(stack, listeners, true);
         let mut g = self.inner.lock();
         let inner = &mut *g;
 
@@ -388,7 +390,7 @@ impl Iface {
 
         // Listeners: connections that completed the handshake go to their accept queue; sockets are refilled
         // up to the backlog; a dropped listener's sockets go.
-        self.listeners(stack, inner, now_ns, listeners, &mut rep);
+        self.listeners(stack, inner, now_ns, listeners, &mut stock, &mut rep);
 
         // Orphans: gone once closed (an abort's RST has left: no endpoint any more) or after their deadline. A
         // kept socket goes back to the stack's pool (the MCP reserve), every other one is freed.
@@ -416,7 +418,7 @@ impl Iface {
         rep
     }
 
-    fn listeners(self: &Arc<Self>, stack: &'static Stack, inner: &mut Inner, now_ns: u64, live: &[Arc<ListenShared>], rep: &mut Report) {
+    fn listeners(self: &Arc<Self>, stack: &'static Stack, inner: &mut Inner, now_ns: u64, live: &[Arc<ListenShared>], stock: &mut [Stock<'_>], rep: &mut Report) {
         let mut i = 0;
         while i < inner.listen.len() {
             let ls = &inner.listen[i];
@@ -453,10 +455,11 @@ impl Iface {
             }
         }
         let mut short = false;
-        for l in live {
+        // (No stock: nothing was missing when the round began.)
+        for (l, stock) in live.iter().zip(stock) {
             // Connections taken from the card this round reach the queue only after the card's lock is gone.
             let handed = rep.accepted.iter().filter(|(q, _)| Arc::ptr_eq(q, &l.queue)).count();
-            short |= refill(stack, inner, l, handed, true).short;
+            short |= refill(inner, l, handed, stock).short;
         }
         if short != inner.listen_short {
             inner.listen_short = short;
@@ -497,9 +500,65 @@ impl Iface {
     }
 
     /// A new listener: its listening sockets exist on this card before `tcp_listen` returns (as many as memory
-    /// allows; the poll rounds refill the rest).
+    /// allows; the poll rounds refill the rest). The sockets are made with no lock held: the poll thread
+    /// (KernelRt) never waits for a program's allocation (B4), it leaves the listener alone while it is
+    /// `settling`.
     pub(crate) fn add_listener(&self, stack: &Stack, l: &Arc<ListenShared>) -> Refill {
-        refill(stack, &mut self.inner.lock(), l, 0, false)
+        let mut stock = self.premake(stack, core::slice::from_ref(l), false);
+        let Some(stock) = stock.first_mut() else { return Refill::default() };
+        refill(&mut self.inner.lock(), l, 0, stock)
+    }
+
+    /// The listening sockets each of `live` is missing on this card, made before the card's lock is taken:
+    /// under it the heap can neither reclaim nor fall back to single frames, so the buffers (64 + 256 KiB)
+    /// were refused whenever no free run was at hand (see `sock::unix`'s `fill`). `refill` takes them; what
+    /// a round does not use goes when the stock is dropped. Empty when nothing is missing: a quiet round
+    /// allocates nothing (the `Poller`'s rule). Stops at the first buffer the heap refuses (R2).
+    /// `background` (the poll round): listeners still `settling` are their creator's, and after a refusal the
+    /// heap is asked again only after `Stack::bg_alloc_open`'s pause (NW-7); a program's own `listen` always asks.
+    fn premake<'a>(&self, stack: &'a Stack, live: &[Arc<ListenShared>], background: bool) -> Vec<Stock<'a>> {
+        let missing = |inner: &Inner, l: &Arc<ListenShared>| {
+            if background && l.settling.load(Ordering::Acquire) {
+                return 0;
+            }
+            let (have, want) = wanted(inner, l, 0);
+            want.saturating_sub(have)
+        };
+        {
+            let g = self.inner.lock();
+            if !live.iter().any(|l| missing(&g, l) > 0) {
+                return Vec::new();
+            }
+        }
+        let mut out = Vec::with_capacity(live.len());
+        {
+            let g = self.inner.lock();
+            out.extend(live.iter().map(|l| Stock { stack, kept: l.reserve, socks: Vec::new(), missing: missing(&g, l), short: false }));
+        }
+        for (l, st) in live.iter().zip(&mut out) {
+            let (rx, tx) = l.prog.unwrap_or((tcp::LISTEN_RX, tcp::LISTEN_TX));
+            while st.socks.len() < st.missing {
+                let made = if l.reserve {
+                    stack.take_kept()
+                } else if background && !stack.bg_alloc_open() {
+                    Err(NetError::NoMemory)
+                } else {
+                    let m = tcp::new_socket(stack, rx, tx);
+                    if background {
+                        stack.bg_alloc_done(m.is_ok());
+                    }
+                    m
+                };
+                match made {
+                    Ok(s) => st.socks.push(s),
+                    Err(_) => {
+                        st.short = true;
+                        break;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A dropped listener: its sockets go at once (kept ones back to the pool); a handshake in progress is reset.
@@ -555,44 +614,56 @@ pub(crate) struct Refill {
     pub short: bool,
 }
 
-/// Keeps `backlog + SYN_SPARE` connections possible for `l` on this card: listening sockets, handshakes in
-/// progress and the accept queue together (bounded: a SYN beyond that gets RST). `handed`: connections on their
-/// way to the queue (taken from this card in this round, not yet pushed). Stops at the first buffer the heap
-/// refuses (R2); the next round tries again. A reserved listener (the MCP reserve) takes its sockets from the
-/// stack's kept pool first: they were made while memory was there and come back after each connection, so a
-/// heap that a program (or a thousand connections) emptied still leaves MCP its listening sockets.
-/// `background` (the poll round): after a refusal the heap is asked again only after `Stack::bg_alloc_open`'s
-/// pause (NW-7); a program's own `listen` always asks.
-fn refill(stack: &Stack, inner: &mut Inner, l: &Arc<ListenShared>, handed: usize, background: bool) -> Refill {
-    let mut have = inner.listen.iter().filter(|s| Arc::ptr_eq(&s.l, l)).count();
-    if l.queue.is_closed() {
-        return Refill { have, short: false };
-    }
-    let mut want = listen_want(l).saturating_sub(l.queue.len() + handed);
-    if l.prog.is_some() {
-        want = want.min(PROG_PRECREATE);
-    }
-    while have < want {
-        let (rx, tx) = l.prog.unwrap_or((tcp::LISTEN_RX, tcp::LISTEN_TX));
-        let made = if l.reserve {
-            stack.take_kept()
-        } else if background && !stack.bg_alloc_open() {
-            Err(NetError::NoMemory)
-        } else {
-            let m = tcp::new_socket(stack, rx, tx);
-            if background {
-                stack.bg_alloc_done(m.is_ok());
+/// One listener's sockets from `Iface::premake`. Dropped after the card's lock is gone: an unused kept socket
+/// goes back to the stack's pool (`kept_made` stays exact), the others are freed.
+pub(crate) struct Stock<'a> {
+    stack: &'a Stack,
+    kept: bool,
+    socks: Vec<stcp::Socket<'static>>,
+    missing: usize,
+    /// The heap refused a buffer before `missing` sockets were made.
+    short: bool,
+}
+
+impl Drop for Stock<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            for s in self.socks.drain(..) {
+                self.stack.give_back(s);
             }
-            m
-        };
-        let Ok(mut s) = made else {
-            return Refill { have, short: true };
+        }
+    }
+}
+
+/// `l`'s sockets on this card and how many it wants there (0 once its queue is closed): listening sockets,
+/// handshakes in progress and the accept queue together keep `backlog + SYN_SPARE` connections possible
+/// (bounded: a SYN beyond that gets RST). `handed`: connections on their way to the queue (taken from this
+/// card in this round, not yet pushed).
+fn wanted(inner: &Inner, l: &Arc<ListenShared>, handed: usize) -> (usize, usize) {
+    let have = inner.listen.iter().filter(|s| Arc::ptr_eq(&s.l, l)).count();
+    if l.queue.is_closed() {
+        return (have, 0);
+    }
+    let want = listen_want(l).saturating_sub(l.queue.len() + handed);
+    (have, if l.prog.is_some() { want.min(PROG_PRECREATE) } else { want })
+}
+
+/// Brings `l` up to what it wants on this card (`wanted`) with the sockets of `stock` (`Iface::premake`). Short
+/// when the stock ran out because the heap refused a buffer; the next round tries again. A reserved listener
+/// (the MCP reserve) has its sockets from the stack's kept pool first: they were made while memory was there
+/// and come back after each connection, so a heap that a program (or a thousand connections) emptied still
+/// leaves MCP its listening sockets.
+fn refill(inner: &mut Inner, l: &Arc<ListenShared>, handed: usize, stock: &mut Stock<'_>) -> Refill {
+    let (mut have, want) = wanted(inner, l, handed);
+    while have < want {
+        let Some(mut s) = stock.socks.pop() else {
+            return Refill { have, short: stock.short };
         };
         tcp::tune_listen(&mut s);
         let ep = IpListenEndpoint { addr: (!l.ip.is_unspecified()).then(|| v4(l.ip).into()), port: l.port };
         if s.listen(ep).is_err() {
             if l.reserve {
-                stack.give_back(s);
+                stock.stack.give_back(s);
             }
             break;
         }

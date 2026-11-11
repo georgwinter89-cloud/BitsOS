@@ -66,7 +66,7 @@ fn sweep_session(sid: u32) -> usize {
 
 fn case(name: &str, script: &str, expected: &str, known: &str) -> TestResult {
     if vfs::root_ns().lookup("/bin/busybox").is_err() || vfs::root_ns().lookup("/bin/sh").is_err() {
-        return ktest::skip("no /bin/busybox in this image (user/ports/busybox/build.sh did not run where the image was built)");
+        return ktest::fail("no /bin/busybox in this image (user/ports/busybox/build.sh did not run where the image was built)");
     }
     let dir = scratch(name);
     let k = PORTS.fetch_add(1, Ordering::Relaxed) % 200;
@@ -308,7 +308,7 @@ fn session_keys(sh: &Arc<Process>, err: &Capture) -> TestResult {
 /// QemuOnly: it takes the console from whoever has it, which on the Mini-PC is Georg's shell.
 fn console_shell() -> TestResult {
     if vfs::root_ns().lookup("/bin/busybox").is_err() {
-        return ktest::skip("no /bin/busybox in this image");
+        return ktest::fail("no /bin/busybox in this image");
     }
     let boot = BootShell::pause()?;
     let err = Capture::new(1 << 16);

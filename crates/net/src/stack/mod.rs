@@ -103,6 +103,9 @@ pub struct ListenShared {
     /// `iface::PROG_PRECREATE` listening sockets made ahead per card (its backlog is still honoured: refills
     /// come every round while the accept queue is below the backlog).
     pub prog: Option<(usize, usize)>,
+    /// Its creator is still giving it its first sockets (`Iface::add_listener`, made with no lock held): the
+    /// poll rounds leave it alone until then, so the two never both make the sockets it is missing.
+    pub settling: AtomicBool,
 }
 
 /// One card as `interfaces()` reports it.
@@ -771,6 +774,10 @@ impl Poller {
             return Round { next_ns: None, busy: false, woke: false };
         }
         POLL_ROUNDS.inc();
+        // The round's own allocations (listener sockets made ahead, the kept spares) take a refusal and try again
+        // after `bg_alloc_open`'s pause: the heap must not hold the round for its patient bound.
+        #[cfg(target_os = "none")]
+        let _short = mm_core::reclaim::hurry();
         st.sync_devices();
         let mut new_card = false;
         {

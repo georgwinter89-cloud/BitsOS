@@ -51,6 +51,8 @@ pub struct Buehne {
     /// The "+N" chip when not every chip fits.
     pub more: Option<Rect>,
     pub ws_new: Rect,
+    /// PK-L1b: the "Programme" button left of the address.
+    pub programs: Rect,
     /// The read-only context address.
     pub address: Rect,
     /// Where the address suggestions hang (Super+L): under the address, at least SUGGEST_MIN wide, no height.
@@ -176,7 +178,8 @@ pub fn layout(t: &Theme, i: &Inputs) -> Buehne {
         r
     });
     let ws_new = Rect { x, y: cy, w: new_w, h: b(CHIP_H) };
-    let ax = ws_new.x + ws_new.w + b(24.0);
+    let programs = Rect { x: ws_new.x + ws_new.w + b(24.0), y: mid(b(36.0)), w: b(36.0), h: b(36.0) };
+    let ax = programs.x + programs.w + b(12.0);
     let address = Rect { x: ax, y: mid(b(36.0)), w: (blocks.x - b(24.0) - ax).max(1), h: b(36.0) };
     let sw = address.w.max(b(SUGGEST_MIN)).min(w);
     let suggest = Rect { x: address.x.min(w - sw).max(0), y: header.h, w: sw, h: 0 };
@@ -247,6 +250,7 @@ pub fn layout(t: &Theme, i: &Inputs) -> Buehne {
         shown,
         more,
         ws_new,
+        programs,
         address,
         suggest,
         blocks,
@@ -288,6 +292,7 @@ impl Buehne {
             mark: self.mark,
             back: gone(h),
             forward: gone(h),
+            programs: self.programs,
             address: self.suggest,
             ring: self.ring,
             favs: None,

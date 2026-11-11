@@ -7,6 +7,7 @@ use crate::device::Device;
 use crate::enumerate::{enumerate, Scheme};
 use crate::host::{Host, UsbError};
 use crate::place::Place;
+use crate::reset::{self, Ended, ResetKind};
 use crate::speed::Speed;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -19,6 +20,11 @@ klog::counter!(PORTS_GIVEN_UP, "usb.ports_given_up");
 pub const DEBOUNCE_NS: u64 = 100_000_000;
 /// A device fresh from its reset may fail the first time (V1: each attach is tried twice).
 pub const ATTACH_TRIES: usize = 2;
+/// A port given up on is tried again after this long, then twice as long each time (US-R: a device that stalled
+/// for a while must not need a replug). Only a pause: there is no last try. Linux has no such retry (a replug is
+/// its way), but its device stays on the bus; here it would have cost the boot disk for good.
+pub const RETRY_FIRST_NS: u64 = 5_000_000_000;
+pub const RETRY_MAX_NS: u64 = 300_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PortStatus {
@@ -52,9 +58,20 @@ pub trait Ports {
     /// Resets the port (USB 2) or brings its link up (USB 3, warm reset if needed), waits the recovery time and
     /// returns the device's speed once the port is enabled.
     fn reset(&self, port: u8) -> Result<Speed, UsbError>;
+    /// A reset of a port that has a device on it (US-R; `reset` may only wait for a USB 3 link that is coming up
+    /// anyway). `warm`: a warm reset where the port has that (SuperSpeed); returns the speed like `reset`.
+    fn reset_device(&self, port: u8, _warm: bool) -> Result<Speed, UsbError> {
+        self.reset(port)
+    }
+    /// Switches the port's power off and on again and returns once it is back. False: this port cannot.
+    fn power_cycle(&self, _port: u8) -> bool {
+        false
+    }
     /// Switches a port off whose device failed every try, so its address-0 device cannot answer for the next
     /// one (hubs; root ports are left alone: PED is never written).
     fn disable(&self, port: u8);
+    /// Undoes `disable` where a look at the port would not find the device otherwise (a SuperSpeed hub port).
+    fn enable_again(&self, _port: u8) {}
     fn place(&self, port: u8, speed: Speed) -> Result<Place, UsbError>;
 }
 
@@ -65,6 +82,8 @@ struct PortState {
     since: Option<u64>,
     /// Never looked at since the hub came (or the controller restarted): whatever is there is new.
     fresh: bool,
+    /// The port was given up on: when it is tried again, and the pause that was (`RETRY_FIRST_NS`).
+    retry: Option<(u64, u64)>,
 }
 
 pub struct PortSet {
@@ -119,8 +138,27 @@ impl PortSet {
         if !fresh && st.connected && !st.connect_change && !dropped {
             return None; // the same device: a change of another kind
         }
+        // US-R: a reset is due or the device can be reset in place: its port's trouble costs it that reset, and the
+        // reset finds out whether the same device is still there (Linux `port_event` for SS.Inactive).
+        if let Some(c) = p.child.as_ref().filter(|_| st.connected) {
+            if c.reset_pending() {
+                return None;
+            }
+            let bound = !crate::registry::bindings_of(c.id).is_empty();
+            if dropped && !st.connect_change && bound && c.can_reset_in_place() && c.queue_reset(ResetKind::Recover, true).is_ok() {
+                klog::event!(Warn, "usb", "port.disabled_under_device", hub = label.as_str(), port = port, recover = true;
+                    "the port lost its enable with a device on it; resetting that device in place");
+                return None;
+            }
+        }
+        // A port in its pause (`RETRY_FIRST_NS`) that shows nothing: switched off by us, or the device left, which
+        // the next try finds out. Only a device that shows up ends the pause early.
+        if p.retry.is_some() && !st.connected {
+            return None;
+        }
         let old = p.child.take();
         p.since = st.connected.then_some(now);
+        p.retry = None;
         if st.connected {
             klog::event!(Debug, "usb", "port.connect", hub = label.as_str(), port = port, raw = klog::Hex(st.raw as u64),
                 fresh = fresh, replaced = old.is_some());
@@ -128,7 +166,7 @@ impl PortSet {
             klog::event!(Debug, "usb", "port.disconnect", hub = label.as_str(), port = port, raw = klog::Hex(st.raw as u64));
         }
         if dropped {
-            klog::event!(Warn, "usb", "port.disabled_under_device", hub = label.as_str(), port = port;
+            klog::event!(Warn, "usb", "port.disabled_under_device", hub = label.as_str(), port = port, recover = false;
                 "the port lost its enable with a device on it; enumerating it afresh");
         }
         old
@@ -147,18 +185,61 @@ impl PortSet {
                 }
             }
         }
+        self.run_resets(host, ports, now, &mut out);
         let mut next: Option<u64> = None;
         for port in 1..=self.ports.len() as u8 {
+            self.look_again(ports, port, host.now_ns());
             let Some(since) = self.ports[port as usize - 1].since else { continue };
             let due = since.saturating_add(DEBOUNCE_NS);
             if host.now_ns() < due {
                 next = Some(next.map_or(due, |n| n.min(due)));
                 continue;
             }
-            self.ports[port as usize - 1].since = None;
-            self.ports[port as usize - 1].child = attach(host, ports, port);
+            let p = &mut self.ports[port as usize - 1];
+            p.since = None;
+            let pause = p.retry.map_or(0, |(_, pause)| pause);
+            p.retry = None;
+            // Asked before: `attach` may switch the port off, and a port in SS.Disabled shows no connection.
+            let there = matches!(ports.status(port), Ok(st) if st.connected);
+            p.child = attach(host, ports, port);
+            if p.child.is_none() && there {
+                let pause = if pause == 0 { RETRY_FIRST_NS } else { pause.saturating_mul(2).min(RETRY_MAX_NS) };
+                p.retry = Some((host.now_ns().saturating_add(pause), pause));
+            }
         }
         (out, next)
+    }
+
+    /// Resets asked of the devices on these ports (`reset.rs`): the worker's turn is the one moment no change of
+    /// these ports is being looked at. A device that has to go goes through the ordinary detach and its port is
+    /// looked at afresh.
+    fn run_resets(&mut self, host: &Arc<dyn Host>, ports: &dyn Ports, now: u64, out: &mut Vec<Arc<Device>>) {
+        for port in 1..=self.ports.len() as u8 {
+            let i = port as usize - 1;
+            let Some(job) = self.ports[i].child.as_ref().and_then(|c| c.take_reset()) else { continue };
+            let Some(c) = self.ports[i].child.clone() else { continue };
+            match reset::run(host, ports, port, &c, &job) {
+                Ended::Kept(r) => job.finish(r),
+                Ended::Lost => {
+                    self.ports[i].child = None;
+                    self.ports[i].since = matches!(ports.status(port), Ok(st) if st.connected).then_some(now);
+                    out.push(c);
+                    job.finish(Err(UsbError::Gone));
+                }
+            }
+        }
+    }
+
+    /// A port given up on: its pause is over, its device gets another turn through the debounce.
+    fn look_again(&mut self, ports: &dyn Ports, port: u8, now: u64) {
+        let p = &mut self.ports[port as usize - 1];
+        if !p.retry.is_some_and(|(at, _)| now >= at) || p.since.is_some() || p.child.is_some() {
+            return;
+        }
+        ports.enable_again(port);
+        klog::event!(Info, "usb", "port.retry", hub = ports.label().as_str(), port = port;
+            "the pause after giving this port up is over; trying its device again");
+        p.since = Some(now);
     }
 }
 
@@ -201,7 +282,7 @@ fn attach(host: &Arc<dyn Host>, ports: &dyn Ports, port: u8) -> Option<Arc<Devic
     }
     PORTS_GIVEN_UP.inc();
     klog::event!(Error, "usb", "port.given_up", hub = label.as_str(), port = port, error = last.as_str(), code = enum_code(last);
-        "the device failed every try; port left off until it is replugged");
+        "the device failed every try; the port is tried again after a pause");
     ports.disable(port);
     None
 }

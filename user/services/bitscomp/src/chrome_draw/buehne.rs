@@ -35,6 +35,8 @@ pub struct HeaderLook {
     pub hover: Option<Hover>,
     /// Notices waiting (the bell's badge; none until there are notices).
     pub notices: usize,
+    /// PK-L1b: the library is open (its button is lit).
+    pub library: bool,
 }
 
 /// Board px to this image's pixels.
@@ -54,7 +56,10 @@ pub fn header(l: &HeaderLook, t: &Theme) -> Canvas {
     let m = p.r(g.mark);
     let (mx, my) = (m.x as f32 + 13.0 * kk, m.y as f32 + m.h as f32 / 2.0);
     c.ring(mx, my, 10.0 * kk, 2.2 * kk, t.text);
-    c.disc(mx, my, 3.6 * kk, t.accent);
+    // WY-19b: at the gpu level the core breathes (`fx::plan::mark`).
+    if !t.effects_gpu {
+        c.disc(mx, my, 3.6 * kk, t.accent);
+    }
     let brand = t.bfont(Family::Display, 17.0, Weight::SemiBold).spaced(-0.01);
     let bx = m.x + (36.0 * kk) as i32;
     c.text_fit(&brand, Rect { x: bx, w: m.x + m.w - bx, ..m }, "BitsOS", t.text);
@@ -81,6 +86,12 @@ pub fn header(l: &HeaderLook, t: &Theme) -> Canvas {
     for (dx, dy) in [(1.0, 0.0), (0.0, 1.0)] {
         c.line((cx - 6.0 * kk * dx, cy - 6.0 * kk * dy), (cx + 6.0 * kk * dx, cy + 6.0 * kk * dy), 1.6 * kk, col);
     }
+    // PK-L1b: the "Programme" button (the library), lit while it is open.
+    let pb = p.b(g.programs);
+    let lit = l.library || l.hover == Some(Hover::Chrome(C::Programs));
+    c.rrect(pb, pb.w / 4.0, if l.library { t.accent_soft } else { t.panel2 });
+    c.rrect_line(pb, pb.w / 4.0, kk, if l.library { t.accent } else if lit { t.line_strong } else { t.line });
+    crate::canvas::glyph_into(&mut c, crate::canvas::Glyph::Programs, pb.inset(pb.w / 5.0), if l.library { t.accent } else { t.text });
     address(&mut c, &p, l, t);
     blocks(&mut c, p.r(g.blocks), &l.blocks, t);
     // Claude's ring (its own sprite lies over this image), the sun and the bell.
@@ -255,7 +266,10 @@ pub fn headline(l: &HeadlineLook, t: &Theme) -> Canvas {
     let p = Px::new(l.rect, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.disc(4.0 * kk, 8.0 * kk, 4.0 * kk, t.accent);
+    // WY-19b: at the gpu level the dot pulses (`fx::plan::headline_dot`).
+    if !t.effects_gpu {
+        c.disc(4.0 * kk, 8.0 * kk, 4.0 * kk, t.accent);
+    }
     let lab = t.style(Style::Label);
     let label = Theme::label(Style::Label, &format!("Absicht · kontext/{}", l.slug));
     let x = (18.0 * kk) as i32;
@@ -288,7 +302,7 @@ pub fn padded(r: Rect, t: &Theme, keep_left: i32) -> Rect {
 pub fn frame(c: &mut Canvas, b: Box2, t: &Theme, brackets: bool) {
     let kk = k(t);
     let r = t.radius_card as f32 * kk;
-    hud::shadow(c, b, r, &t.shadow_raised, t);
+    hud::panel_shadow(c, b, r, &t.shadow_raised, t);
     c.rrect(b, r, hud::glass(t, Glass::Card));
     c.rrect_line(b, r, kk, alpha(t.accent, 0.18));
     if brackets {

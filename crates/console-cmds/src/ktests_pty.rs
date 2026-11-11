@@ -36,7 +36,7 @@ fn run(case: &str) -> Result<String, String> {
 
 fn program_jobs() -> TestResult {
     let out = match run("jobs") {
-        Err(e) if e == "skip" => return ktest::skip("no /bin/abi-pty (user/abi-tests not in this image)"),
+        Err(e) if e == "skip" => return ktest::fail("no /bin/abi-pty (user/abi-tests not in this image)"),
         r => r?,
     };
     for want in ["c t t y   m i n e   f g   m i n e", "w r o n l y   o p e n   c t t y   n o", "b g   r e a d   - 1   e r r n o   5", "w i n c h   2 4 x 8 0", "master TIOCGPGRP is the child: yes", "child: signaled 1 sig 2"] {
@@ -48,7 +48,7 @@ ktest!("in.pty.program_jobs", Safe, program_jobs);
 
 fn program_hangup() -> TestResult {
     let out = match run("hangup") {
-        Err(e) if e == "skip" => return ktest::skip("no /bin/abi-pty (user/abi-tests not in this image)"),
+        Err(e) if e == "skip" => return ktest::fail("no /bin/abi-pty (user/abi-tests not in this image)"),
         r => r?,
     };
     let want = "hup: read 0 write -1 errno 5 poll 0x1d node gone 1 ioctl -1 errno 5\nchild exit 0\n";
@@ -59,7 +59,7 @@ ktest!("in.pty.program_hangup", Safe, program_hangup);
 
 fn program_basics() -> TestResult {
     let out = match run("basics") {
-        Err(e) if e == "skip" => return ktest::skip("no /bin/abi-pty (user/abi-tests not in this image)"),
+        Err(e) if e == "skip" => return ktest::fail("no /bin/abi-pty (user/abi-tests not in this image)"),
         r => r?,
     };
     let want = include_str!("../../../user/abi-tests/expected/pty-basics.txt");
@@ -74,7 +74,7 @@ ktest!("in.pty.program_basics", Safe, program_basics);
 /// INT-A2b (IN-7 CR1): `/dev/tty` of a session whose controlling terminal is a pty opens that pty.
 fn program_devtty() -> TestResult {
     let out = match run("devtty") {
-        Err(e) if e == "skip" => return ktest::skip("no /bin/abi-pty (user/abi-tests not in this image)"),
+        Err(e) if e == "skip" => return ktest::fail("no /bin/abi-pty (user/abi-tests not in this image)"),
         r => r?,
     };
     for want in ["d e v t t y   o p e n   o k   s i d   m i n e   y e s", "v i a   / d e v / t t y"] {
@@ -87,7 +87,7 @@ ktest!("in.pty.program_devtty", Safe, program_devtty);
 /// INT-A2b (IN-7 CR2): TIOCGPTPEER through `sys_ioctl` (the lines CachyOS prints for `abi-pty peer`).
 fn program_peer() -> TestResult {
     let out = match run("peer") {
-        Err(e) if e == "skip" => return ktest::skip("no /bin/abi-pty (user/abi-tests not in this image)"),
+        Err(e) if e == "skip" => return ktest::fail("no /bin/abi-pty (user/abi-tests not in this image)"),
         r => r?,
     };
     let want = "locked: errno 5\npeer: opened cloexec 1\nsame node: 1\nread-only peer: access mode 0\nmaster reads (4): h i \\r \\n\non the slave: -1 errno 5\non /dev/null: -1 ENOTTY\n";

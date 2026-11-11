@@ -138,14 +138,14 @@ fn tty_ioctls() -> TestResult {
     t.set_termios(saved, false);
     r
 }
-ktest!("in.tty.ioctls", Safe, tty_ioctls);
+ktest!("in.tty.ioctls", Screen, tty_ioctls);
 
 /// Keys typed (injected) through the VT reach a raw terminal as a Linux console sends them; K_MEDIUMRAW and
 /// K_RAW give key codes and scancodes; K_OFF and KD_GRAPHICS type nothing (focus).
 fn raw_input() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
     if display::device().is_none() {
-        return ktest::skip("no display device (no VT)");
+        return ktest::fail("no display device (no VT)");
     }
     let t = crate::tty();
     let saved = t.termios();
@@ -189,7 +189,7 @@ fn raw_input() -> TestResult {
     t.flush();
     r
 }
-ktest!("in.tty.raw_input", Safe, raw_input);
+ktest!("in.tty.raw_input", Screen, raw_input);
 
 /// VMIN 0 / VTIME 1 waits about 100 ms and returns 0; VMIN 0 / VTIME 0 returns at once (a private terminal).
 fn vtime() -> TestResult {
@@ -225,7 +225,7 @@ ktest!("in.tty.vtime", Safe, vtime);
 fn kd_mode() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
     if display::device().is_none() {
-        return ktest::skip("no display device");
+        return ktest::fail("no display device");
     }
     let r = (|| -> TestResult {
         vt::set_kd_mode(true, None);
@@ -246,7 +246,7 @@ fn kd_mode() -> TestResult {
     vt::set_kd_mode(false, None);
     r
 }
-ktest!("in.tty.kd_mode", Safe, kd_mode);
+ktest!("in.tty.kd_mode", Screen, kd_mode);
 
 fn mcp_keyboard() -> Result<Arc<evdev::InputDevice>, String> {
     evdev::devices().into_iter().find(|d| d.alias == Some(INJECT_KEYBOARD)).ok_or_else(|| String::from("no MCP keyboard device"))
@@ -308,7 +308,7 @@ fn mcp_node() -> TestResult {
     let _ = h.ioctl(ioc::EVIOCGRAB, 0, &m);
     r
 }
-ktest!("in.evdev.mcp_node", Safe, mcp_node);
+ktest!("in.evdev.mcp_node", Screen, mcp_node);
 
 /// desk fix typeloss: 2500 strokes (10000 events) injected as MCP does (`push_paced`, from another thread)
 /// into a /dev/input reader of MCP's keyboard that reads slowly (16 events, then 1 ms) lose nothing: no
@@ -370,7 +370,7 @@ fn paced_burst() -> TestResult {
     let _ = h.ioctl(ioc::EVIOCGRAB, 0, &m);
     r
 }
-ktest!("in.evdev.paced_burst", Safe, paced_burst);
+ktest!("in.evdev.paced_burst", Screen, paced_burst);
 
 /// A key held on a device with EV_REP repeats to its evdev reader (value 2, SYN_REPORT value 1) through the
 /// `evdev-repeat` thread, also while grabbed, and stops at the release. Safe: MCP's keyboard, grabbed, so the
@@ -409,7 +409,7 @@ fn repeat() -> TestResult {
     let _ = h.ioctl(ioc::EVIOCGRAB, 0, &m);
     r
 }
-ktest!("in.evdev.repeat", Safe, repeat);
+ktest!("in.evdev.repeat", Screen, repeat);
 
 /// A fake keyboard gets its node at once, a reader that does not read gets SYN_DROPPED, the node goes when the
 /// device goes and an open client answers ENODEV. QemuOnly: it registers a device.

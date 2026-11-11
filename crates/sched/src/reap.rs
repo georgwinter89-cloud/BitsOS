@@ -11,16 +11,17 @@
 //! - PF-5: whatever waits for a page-cache grace period (`mm_core::grace`: pages and index nodes lockless
 //!   readers may still see). That grace period has its own per-section epochs (no TLB flush, no IPI, idle CPUs
 //!   never delay it, the resched IPI never passes a reader); the reaper only drives it: every pass drains what
-//!   passed, the first item of a batch wakes it (`grace::set_kick`), and a grace period held longer than 1 s is
-//!   reported like a stalled sync generation.
+//!   passed, the first item of a batch wakes it (`grace::set_kick`), and a grace epoch that does not advance for
+//!   1 s while frames wait is reported like a sync generation that does not pass for 1 s (`reap_watch`).
 //!
 //! The work runs in the `reaper` thread (woken after switches that left something behind) and in `reap()` for
 //! callers that need it done now (tests).
 
+use crate::reap_watch::Watch;
 use crate::Thread;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use ksync::{IrqSpinLock, WaitQueue};
 
 /// Exited threads and the sync generation they wait for (0: not assigned yet).
@@ -28,20 +29,28 @@ static GRAVES: IrqSpinLock<Vec<(u64, Arc<Thread>)>> = IrqSpinLock::named("sched"
 static WQ: WaitQueue = WaitQueue::new();
 static KICKED: AtomicBool = AtomicBool::new(false);
 static PASS_BUSY: AtomicBool = AtomicBool::new(false);
-/// Since when the oldest pending work waits (0: nothing pending), for the stall report.
-static WAITING_SINCE: AtomicU64 = AtomicU64::new(0);
+/// A sync generation not passed, or a grace epoch not advanced while frames wait, this long is a stall.
+const STALL_NS: u64 = 1_000_000_000;
 
 klog::counter!(pub STACKS_FREED, "sched.stacks_reaped");
 klog::counter!(pub THREADS_FREED, "sched.threads_reaped");
 klog::counter!(pub GRAVES_LEAKED, "sched.graves_leaked");
 klog::counter!(pub GRACE_FREED, "mm.grace.reaped_pages");
+klog::counter!(pub REAP_STALLS, "sched.reap_stalls");
 
 /// Makes room in the graveyard for every thread that exists now plus one (`spawn`, before the new thread is
 /// listed), so `bury` never has to allocate. `Err`: no memory (the spawn fails).
 pub(crate) fn reserve_grave() -> Result<(), ()> {
     let threads = crate::table::len() + 1;
-    // Capacity for len + threads: a no-op when it is there already.
-    GRAVES.lock().try_reserve(threads).map_err(|_| ())
+    // Capacity for len + threads: a no-op when it is there already, else made with the lock dropped and swapped
+    // in (`sleepers::reserve`).
+    let mut spare = ksync::Spare::new();
+    loop {
+        if spare.fits(&mut *GRAVES.lock(), threads) {
+            return Ok(());
+        }
+        spare.grow()?;
+    }
 }
 
 /// An exited thread's record (from `after_switch`; interrupts off, thread context). The room was reserved at
@@ -157,30 +166,32 @@ pub(crate) fn reaper_loop() {
     static KICK: fn() = kick;
     mm_core::grace::set_kick(&KICK);
     let mut told = mm_core::grace::stats();
+    let (mut sync, mut grace) = (Watch::default(), Watch::default());
     loop {
         WQ.wait_until_timeout(|| KICKED.load(Ordering::Acquire), 100_000_000);
         KICKED.store(false, Ordering::Release);
         let mut tries = 0u32;
         loop {
             if pass() && !mm_core::grace::waiting() {
-                WAITING_SINCE.store(0, Ordering::Relaxed);
+                sync.clear();
+                grace.clear();
                 break;
             }
             let now = time::now_ns();
-            let since = WAITING_SINCE.load(Ordering::Relaxed);
-            if since == 0 {
-                WAITING_SINCE.store(now, Ordering::Relaxed);
-            } else if now - since > 1_000_000_000 && mm_core::grace::waiting() && !hal::switch::retired_pending() && !graves_waiting() {
-                let gs = mm_core::grace::stats();
-                klog::event!(Warn, "sched", "grace.stalled", epoch = gs.epoch, open_sections = gs.open_sections, waiting = gs.waiting,
-                    pending_kb = gs.pending_bytes / 1024; "page-cache frames waited 1 s for a grace period (a read section that does not end?); retrying");
-                WAITING_SINCE.store(now, Ordering::Relaxed);
-            } else if now - since > 1_000_000_000 {
-                let g = hal::switch::sync_generation();
+            // The generation watched stays watched until it passed (newer ones are requested meanwhile).
+            let g = sync.watched().filter(|&w| !hal::switch::sync_passed(w)).unwrap_or_else(hal::switch::sync_generation);
+            if let Some(waited) = sync.stalled(g, !hal::switch::sync_passed(g), now, STALL_NS) {
                 let lagging: Vec<usize> = hal::switch::sync_lagging(g).collect();
-                klog::event!(Warn, "sched", "reap.stalled", generation = g, lagging = alloc::format!("{lagging:?}"),
+                REAP_STALLS.inc();
+                klog::event!(Warn, "sched", "reap.stalled", generation = g, lagging = alloc::format!("{lagging:?}"), waited_ms = waited / 1_000_000,
                     stacks = hal::switch::retired_count(); "CPUs did not pass a quiescent point for 1 s (interrupts off?); retrying");
-                WAITING_SINCE.store(now, Ordering::Relaxed);
+            }
+            let epoch = mm_core::grace::epoch();
+            if let Some(waited) = grace.stalled(epoch, mm_core::grace::waiting(), now, STALL_NS) {
+                let gs = mm_core::grace::stats();
+                klog::event!(Warn, "sched", "grace.stalled", epoch = epoch, open_sections = gs.open_sections, waiting = gs.waiting,
+                    pending_kb = gs.pending_bytes / 1024, waited_ms = waited / 1_000_000;
+                    "page-cache frames waited 1 s for a grace period (a read section that does not end?); retrying");
             }
             tries += 1;
             if tries > 50 {

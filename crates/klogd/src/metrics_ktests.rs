@@ -109,7 +109,7 @@ fn temps() -> TestResult {
     let z = loop {
         match Zen::detect() {
             Ok(z) => break z,
-            Err(Probe::Absent(why)) => return ktest::skip(why),
+            Err(Probe::Absent(why)) => return ktest::fail(why),
             Err(Probe::Again) if time::now_ns() < until => sched::sleep_ms(1),
             Err(Probe::Again) => return Err("SMN busy for 1 s".into()),
         }
@@ -128,13 +128,13 @@ fn temps() -> TestResult {
     klog::event!(Info, "rb", "ktest.temps", values = t.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(","));
     Ok(())
 }
-ktest!("rb.metrics.temps", Safe, temps);
+ktest!("rb.metrics.temps", Hardware, temps);
 
 /// RAPL package power over 500 ms between 0.1 and 200 W (Mini-PC; QEMU has no RAPL).
 fn rapl() -> TestResult {
     let src = Sources::detect();
     if let Err(why) = src.esu {
-        return ktest::skip(why);
+        return ktest::fail(why);
     }
     let mut store = Store::new(1 << 16);
     let mut m = Sampler::default();
@@ -146,4 +146,4 @@ fn rapl() -> TestResult {
     klog::event!(Info, "rb", "ktest.rapl", mw = mw);
     Ok(())
 }
-ktest!("rb.metrics.rapl", Safe, rapl);
+ktest!("rb.metrics.rapl", Hardware, rapl);

@@ -51,7 +51,7 @@ fn until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) -> TestResult {
 /// The fake must be in the image (it is, whenever the user workspace was built).
 fn present() -> Option<TestResult> {
     let ns = vfs::root_ns();
-    vfs::Ctx::kernel(&ns).lookup(None, FAKE.as_bytes(), true).is_err().then(|| ktest::skip("/bin/mcp-fakesvc is not in this image (user/lib/mcpreg not built)"))
+    vfs::Ctx::kernel(&ns).lookup(None, FAKE.as_bytes(), true).is_err().then(|| ktest::fail("/bin/mcp-fakesvc is not in this image (user/lib/mcpreg not built)"))
 }
 
 /// Runs `f` with a started fake; ends the fake on every way out.

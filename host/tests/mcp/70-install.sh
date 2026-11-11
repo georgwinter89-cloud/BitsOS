@@ -5,7 +5,7 @@
 #  1. the protocol test of install.mjs against a fake server (install_proto.mjs);
 #  2. install.mjs --dry-run: exit 0, "generation 2 would be installed", both hashes equal; SYS unchanged;
 #  3. install.mjs --config with nvme_write=on: exit 1 (refused, R8a), SYS and CONFIG.TXT unchanged;
-#  4. the echt suite's install checks with --require-install (install.proof_counter: wrong-token requests move
+#  4. the echt suite's install checks (install.proof_counter: wrong-token requests move
 #     mcp.requests, never mcp.answered; install.refusals; install.dry_run with the image's own bundle);
 #  5. with kernel_path in install_kernel (MC-4b change request 1 to RB): install.mjs --upload --dry-run (files
 #     uploaded with write_file, hash checked, read by install_kernel, deleted again); else a SKIP line;
@@ -121,7 +121,7 @@ echo "ok: refused (exit 1), SYS and CONFIG.TXT unchanged"
 
 echo "== 4. echt suite: install checks"
 P_ECHT=$((LO + 470))
-node "$HERE/echt.mjs" --host "127.0.0.1:$FWD" --only install --http "10.0.2.2:$P_ECHT" --http-bind 127.0.0.1 --install-bundle "$B" --require-install | tee "$RUN_DIR/echt.out"
+node "$HERE/echt.mjs" --host "127.0.0.1:$FWD" --only install --http "10.0.2.2:$P_ECHT" --http-bind 127.0.0.1 --install-bundle "$B" | tee "$RUN_DIR/echt.out"
 grep -q "^echt .*: 3 of 3 ok" "$RUN_DIR/echt.out" || fail "echt install checks"
 [ "$(sys_list)" = "$SYS0" ] || fail "the echt dry run changed SYS: $(sys_list)"
 

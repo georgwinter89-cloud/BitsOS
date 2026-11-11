@@ -349,7 +349,7 @@ impl Parser<'_> {
     /// the jobs wait for the last page-table update.
     fn vm_handling(&mut self) -> Result<Arc<dyn crate::gpu::GpuVm>, Errno> {
         let vm = &self.ctx.file.vm;
-        vm.backend(self.gpu)?;
+        vm.backend(self.gpu, self.ctx.file.client_id())?;
         vm.flush()?;
         if let Some(f) = vm.last_update() {
             self.add_dep(f)?;

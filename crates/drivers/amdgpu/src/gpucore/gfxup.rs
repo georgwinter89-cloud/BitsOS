@@ -79,6 +79,10 @@ pub struct GcAddrs {
     pub smuio_misc: Option<u32>,
     /// GX-7j3: RLC_CNTL (the unload's RLC stop, gfx_v11_0_rlc_stop).
     pub rlc_cntl: u32,
+    /// GX-9b: gfx_v11_cntl_pg's registers.
+    pub rlc_safe_mode: u32,
+    pub rlc_pg_cntl: u32,
+    pub rlc_pg_delay_3: u32,
 }
 
 impl GcAddrs {
@@ -90,19 +94,22 @@ impl GcAddrs {
             cp_stat: gc(gfx11::CP_STAT)?,
             smuio_misc: d.reg(hwid::SMUIO, 0, SMUIO_GFX_MISC_CNTL.0, SMUIO_GFX_MISC_CNTL.1).and_then(|x| x.checked_mul(4)),
             rlc_cntl: gc(gfx11::RLC_CNTL)?,
+            rlc_safe_mode: gc(gfx11::RLC_SAFE_MODE)?,
+            rlc_pg_cntl: gc(gfx11::RLC_PG_CNTL)?,
+            rlc_pg_delay_3: gc(gfx11::RLC_PG_DELAY_3)?,
         })
     }
 
     /// Every register this stage (and the unload) reads.
     pub fn readable(&self) -> Vec<u32> {
-        let mut v = alloc::vec![self.imu_flags, self.bootload, self.cp_stat, self.rlc_cntl];
+        let mut v = alloc::vec![self.imu_flags, self.bootload, self.cp_stat, self.rlc_cntl, self.rlc_safe_mode, self.rlc_pg_cntl];
         v.extend(self.smuio_misc);
         v
     }
 
-    /// The one GC register the unload writes (RLC_CNTL.RLC_ENABLE_F32 cleared).
-    pub fn writable(&self) -> [u32; 1] {
-        [self.rlc_cntl]
+    /// The GC registers this owner writes: the unload's RLC_CNTL.RLC_ENABLE_F32 and GX-9b's gfx_v11_cntl_pg.
+    pub fn writable(&self) -> [u32; 4] {
+        [self.rlc_cntl, self.rlc_safe_mode, self.rlc_pg_cntl, self.rlc_pg_delay_3]
     }
 }
 

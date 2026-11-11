@@ -124,7 +124,7 @@ impl Budget {
             return self.stop(Stop::Reclaim);
         }
         match mm_core::frames().map(|f| f.stats()) {
-            Some(s) if s.free_bytes >= self.floor_bytes => {}
+            Some(s) if s.usable_free_bytes() >= self.floor_bytes => {}
             _ => return self.stop(Stop::Memory),
         }
         // B4: Background yields to a waiting reader, bounded.

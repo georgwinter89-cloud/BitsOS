@@ -186,22 +186,32 @@ impl FileVm {
     /// `amdgpu_gem_object_open`: a handle of this file names `bo` (bo_va found or added).
     pub(crate) fn bo_open(&self, bo: &Arc<Bo>) {
         let k = key(bo);
-        let old = {
+        let mut spare = ksync::Spare::new();
+        let mut may_grow = true;
+        let old = loop {
             let mut g = self.st.lock();
             if g.released {
                 return;
             }
             // A bo_va left without handles under memory pressure: Linux would have removed it at the close, so
-            // the new handle starts without its mappings when there is room for their unmap jobs now.
+            // the new handle starts without its mappings when there is room for their unmap jobs now (made
+            // with the lock dropped, `ksync::spare`).
             let old = match g.bos.get(&k) {
-                Some(v) if v.handles == 0 => {
-                    g.orphans = g.orphans.saturating_sub(1);
-                    take_bo_va(&mut g, k).ok().flatten()
-                }
+                Some(v) if v.handles == 0 => match take_bo_va(&mut g, k, &mut spare) {
+                    Err(()) if may_grow => {
+                        drop(g);
+                        may_grow = spare.grow().is_ok();
+                        continue;
+                    }
+                    taken => {
+                        g.orphans = g.orphans.saturating_sub(1);
+                        taken.ok().flatten()
+                    }
+                },
                 _ => None,
             };
             g.bos.entry(k).and_modify(|v| v.handles += 1).or_insert_with(|| BoVa { bo: bo.clone(), handles: 1, maps: BTreeSet::new() });
-            old
+            break old;
         };
         drop(old);
     }
@@ -210,27 +220,46 @@ impl FileVm {
     /// jobs run at once (amdgpu_vm_bo_del + amdgpu_vm_clear_freed, which also clears delayed unmaps). Called without the file's other locks.
     pub(crate) fn bo_close(&self, bo: &Bo) {
         let k = key(bo);
-        let queued = {
+        let mut spare = ksync::Spare::new();
+        let mut first = true;
+        let queued = loop {
             let mut g = self.st.lock();
             let Some(v) = g.bos.get_mut(&k) else { return };
-            v.handles = v.handles.saturating_sub(1);
+            if first {
+                v.handles = v.handles.saturating_sub(1);
+            }
+            // (A later round: reopened while the room was made, the new handle keeps the bo_va.)
             if v.handles > 0 {
                 return;
             }
             let n = v.maps.len();
             let pending = !g.queue.is_empty();
-            let Ok(v) = take_bo_va(&mut g, k) else {
-                // Without room for the jobs the mappings stay for now (their memory stays held, nothing is freed
-                // under the GPU); the next flush or the last close finishes the bo_va.
-                g.orphans += 1;
-                drop(g);
-                klog::event!(Warn, "drm", "vm.close_deferred", mappings = n; "no memory for the unmap jobs: the mappings go at the next update");
-                return;
-            };
-            drop(g);
-            // The bo_va's reference to the object goes outside the lock.
-            drop(v);
-            n > 0 || pending
+            match take_bo_va(&mut g, k, &mut spare) {
+                Ok(v) => {
+                    if !first {
+                        g.orphans = g.orphans.saturating_sub(1);
+                    }
+                    drop(g);
+                    // The bo_va's reference to the object goes outside the lock.
+                    drop(v);
+                    break n > 0 || pending;
+                }
+                Err(()) => {
+                    // The queue's room is made with the lock dropped (`ksync::spare`). Until then the bo_va
+                    // counts as an orphan, so a `bo_open` or a flush in between finds it as one. Without memory
+                    // for the room it stays one: the mappings stay for now (their memory stays held, nothing is
+                    // freed under the GPU); the next flush or the last close finishes the bo_va.
+                    if first {
+                        g.orphans += 1;
+                        first = false;
+                    }
+                    drop(g);
+                    if spare.grow().is_err() {
+                        klog::event!(Warn, "drm", "vm.close_deferred", mappings = n; "no memory for the unmap jobs: the mappings go at the next update");
+                        return;
+                    }
+                }
+            }
         };
         if queued && let Err(e) = self.flush() {
             klog::event!(Warn, "drm", "vm.update_failed", errno = e, op = "close"; "page-table update at GEM_CLOSE failed; it runs again at the next update");
@@ -238,10 +267,10 @@ impl FileVm {
     }
 
     /// The backend's VM, made at the first use.
-    pub(crate) fn backend(&self, gpu: &dyn GpuDevice) -> Result<(), Errno> {
+    pub(crate) fn backend(&self, gpu: &dyn GpuDevice, client: u64) -> Result<(), Errno> {
         let mut b = self.backend.lock();
         if b.is_none() {
-            match gpu.vm_create() {
+            match gpu.vm_create(client) {
                 Ok(vm) => {
                     klog::event!(Debug, "drm", "vm.created");
                     *b = Some(vm);
@@ -327,8 +356,9 @@ impl FileVm {
     /// Finishes the bo_vas that `bo_close` left without room for their jobs (one at a time: each object's last
     /// reference may go outside the lock).
     fn finish_orphans(&self) {
+        let mut spare = ksync::Spare::new();
         loop {
-            let v = {
+            let taken = {
                 let mut g = self.st.lock();
                 if g.orphans == 0 {
                     return;
@@ -337,15 +367,21 @@ impl FileVm {
                     g.orphans = 0;
                     return;
                 };
-                match take_bo_va(&mut g, k) {
-                    Ok(v) => {
-                        g.orphans -= 1;
-                        v
-                    }
-                    Err(()) => return,
+                let taken = take_bo_va(&mut g, k, &mut spare);
+                if taken.is_ok() {
+                    g.orphans -= 1;
                 }
+                taken
             };
-            drop(v);
+            match taken {
+                Ok(v) => drop(v),
+                // The queue's room is made here, with the lock dropped; without memory the orphans stay.
+                Err(()) => {
+                    if spare.grow().is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -417,10 +453,37 @@ fn owner_set(g: &mut State, o: Owner) -> Option<&mut BTreeSet<u64>> {
     }
 }
 
-/// Removes the bo_va of `k` and queues the unmap of its mappings; Err without room for the jobs.
-fn take_bo_va(g: &mut State, k: usize) -> Result<Option<BoVa>, ()> {
+/// The job queue grows with `st` dropped: under a spin lock the heap can neither reclaim nor fall back to single
+/// frames, and `try_reserve` there answered ENOMEM although memory was there (see `ksync::spare`).
+type Room = ksync::Spare<VecDeque<PtOp>>;
+
+/// `vm.st` locked, `check` passed and room for `n` more jobs in the queue; `check` runs again whenever the
+/// lock was dropped for the room.
+fn lock_with_room<'a>(vm: &'a FileVm, room: &mut Room, n: usize, check: impl Fn(&State) -> Result<(), Errno>) -> Result<ksync::SpinLockGuard<'a, State>, Errno> {
+    loop {
+        let mut g = vm.st.lock();
+        check(&g)?;
+        if room.fits(&mut g.queue, n) {
+            return Ok(g);
+        }
+        drop(g);
+        room.grow().map_err(|_| ENOMEM)?;
+    }
+}
+
+/// The handle closed since the lookup (amdgpu_vm_bo_find: ENOENT).
+fn bo_known(g: &State, owner: Owner) -> Result<(), Errno> {
+    match owner {
+        Owner::Bo(k) if !g.bos.contains_key(&k) => Err(ENOENT),
+        _ => Ok(()),
+    }
+}
+
+/// Removes the bo_va of `k` and queues the unmap of its mappings; Err without room for the jobs (the caller
+/// lets `room` grow with the lock dropped, or leaves the bo_va).
+fn take_bo_va(g: &mut State, k: usize, room: &mut Room) -> Result<Option<BoVa>, ()> {
     let n = g.bos.get(&k).map_or(0, |v| v.maps.len());
-    if n > 0 && g.queue.try_reserve(n).is_err() {
+    if n > 0 && !room.fits(&mut g.queue, n) {
         return Err(());
     }
     let Some(v) = g.bos.remove(&k) else { return Ok(None) };
@@ -501,14 +564,8 @@ pub(crate) fn map(vm: &FileVm, owner: Owner, bo: Option<&Arc<Bo>>, va: u64, offs
         },
         None => PtOp::Prt { va, pages: e - s + 1, flags: op_flags },
     };
-    let mut g = vm.st.lock();
-    // The handle closed since the lookup (amdgpu_vm_bo_find: ENOENT).
-    if let Owner::Bo(k) = owner
-        && !g.bos.contains_key(&k)
-    {
-        return Err(ENOENT);
-    }
-    g.queue.try_reserve(2).map_err(|_| ENOMEM)?;
+    let mut room = Room::new();
+    let mut g = lock_with_room(vm, &mut room, 2, |g| bo_known(g, owner))?;
     if replace {
         if clear_range(&mut g, s, e) {
             g.queue.push_back(PtOp::Clear { va, pages: e - s + 1 });
@@ -527,17 +584,14 @@ pub(crate) fn map(vm: &FileVm, owner: Owner, bo: Option<&Arc<Bo>>, va: u64, offs
 /// UNMAP: the whole mapping of this bo_va that starts at the page of `va` (amdgpu_vm.c:1645).
 pub(crate) fn unmap(vm: &FileVm, owner: Owner, va: u64) -> Result<(), Errno> {
     let s = va >> PAGE_SHIFT;
-    let mut g = vm.st.lock();
-    if let Owner::Bo(k) = owner
-        && !g.bos.contains_key(&k)
-    {
-        return Err(ENOENT);
-    }
-    match g.maps.get(&s) {
-        Some(m) if m.owner == owner => {}
-        _ => return Err(ENOENT),
-    }
-    g.queue.try_reserve(1).map_err(|_| ENOMEM)?;
+    let mut room = Room::new();
+    let mut g = lock_with_room(vm, &mut room, 1, |g| {
+        bo_known(g, owner)?;
+        match g.maps.get(&s) {
+            Some(m) if m.owner == owner => Ok(()),
+            _ => Err(ENOENT),
+        }
+    })?;
     let m = remove(&mut g, s).ok_or(ENOENT)?;
     g.queue.push_back(PtOp::Clear { va: s << PAGE_SHIFT, pages: m.last - s + 1 });
     Ok(())
@@ -552,8 +606,8 @@ pub(crate) fn clear(vm: &FileVm, va: u64, size: u64) -> Result<(), Errno> {
     }
     let end = va.checked_add(size).filter(|&e| e > va).ok_or(EINVAL)?;
     let (s, e) = (va >> PAGE_SHIFT, (end - 1) >> PAGE_SHIFT);
-    let mut g = vm.st.lock();
-    g.queue.try_reserve(1).map_err(|_| ENOMEM)?;
+    let mut room = Room::new();
+    let mut g = lock_with_room(vm, &mut room, 1, |_| Ok(()))?;
     if clear_range(&mut g, s, e) {
         g.queue.push_back(PtOp::Clear { va: s << PAGE_SHIFT, pages: e - s + 1 });
     }

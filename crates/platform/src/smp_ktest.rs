@@ -1,5 +1,5 @@
 //! CP-4 ktests (all `Safe`: they only read the APs' own registers through `hal::smp::call_on` and send fixed
-//! IPIs to CPUs CP started). With one CPU (no AP planned) they skip. Limits are generous and functional; timing
+//! IPIs to CPUs CP started). With one CPU (no AP planned) they fail. Limits are generous and functional; timing
 //! is judged only on the Mini-PC (from the `cpu ap.up` / `cpu ap.tsc` events).
 
 use crate::report;
@@ -32,9 +32,9 @@ ktest!("cp.smp.boot_stacks", Safe, boot_stacks);
 ktest!("cp.smp.vectors", Safe, per_cpu_vectors);
 ktest!("cp.smp.tsc_offsets", Safe, tsc_offsets);
 ktest!("cp.smp.apic_map", Safe, apic_map);
-ktest!("cp.smp.call_owners", Safe, call_owners);
+ktest!("cp.smp.call_owners", RunHw("cp/50-smp"), call_owners);
 ktest!("cp.smp.start_guards", Safe, start_guards);
-ktest!("cp.smp.tsc_offsets_hardware", Safe, tsc_offsets_hardware);
+ktest!("cp.smp.tsc_offsets_hardware", Hardware, tsc_offsets_hardware);
 
 const CALL_NS: u64 = 1_000_000_000;
 
@@ -44,7 +44,7 @@ fn aps() -> Result<Vec<usize>, String> {
     let v: Vec<usize> = (1..percpu::cpu_count()).collect();
     if v.is_empty() {
         let why = o.not_started.unwrap_or("the MADT lists one CPU");
-        return Err(ktest::skip(&format!("no AP: {why}")).unwrap_err());
+        return Err(ktest::fail(&format!("no AP: {why}")).unwrap_err());
     }
     Ok(v)
 }
@@ -57,12 +57,12 @@ fn all_up() -> R {
     let o = outcome().ok_or("the bring-up initcall did not run")?;
     if let Some(why) = o.not_started {
         if o.limit.bsp_only() {
-            return ktest::skip(why);
+            return ktest::fail(why);
         }
         // Not started at all is only fine where there is nothing to start (or CONFIG asked for one CPU).
         let madt_cpus = acpi::tables().and_then(|a| a.madt.as_ref()).map_or(1, |m| m.enabled_cpus());
         kassert!(madt_cpus <= 1, "bring-up did not start ({why}) but the MADT lists {madt_cpus} CPUs");
-        return ktest::skip(why);
+        return ktest::fail(why);
     }
     kassert!(o.failed.is_empty(), "{} AP(s) failed: {:?}", o.failed.len(), o.failed.iter().map(|f| (f.apic_id, report::stage_name(f.stage), f.reason)).collect::<Vec<_>>());
     kassert!(o.up.len() + o.failed.len() + o.held_back == o.planned, "{} of {} APs up, {} failed, {} held back by CONFIG cpus=", o.up.len(), o.planned, o.failed.len(), o.held_back);
@@ -73,7 +73,7 @@ fn all_up() -> R {
         kassert!(smp::is_online(r.cpu as usize));
     }
     if o.planned == 0 {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     Ok(())
 }
@@ -102,7 +102,7 @@ fn topology() -> R {
     kassert!(hybrid || caps.iter().all(|&c| c == smp::CAPACITY_SCALE), "non-uniform capacity without the hybrid bit: {caps:?}");
     kassert!(hybrid || smp::max_perf() == 0, "HWP number read on a non-hybrid CPU");
     if n == 1 {
-        return ktest::skip("one CPU: only the BSP's topology checked");
+        return ktest::fail("one CPU: only the BSP's topology checked");
     }
     Ok(())
 }
@@ -188,7 +188,7 @@ fn ap_registers() -> R {
 
 fn mtrr() -> R {
     let aps = aps()?;
-    let Some(bsp) = cpu::mtrr_state() else { return ktest::skip("no CPUID MTRR") };
+    let Some(bsp) = cpu::mtrr_state() else { return ktest::fail("no CPUID MTRR") };
     let o = outcome().ok_or("no outcome")?;
     for c in aps {
         let def = call(c, read_reg, R_MSR | hal::msr::IA32_MTRR_DEF_TYPE as u64)?;
@@ -233,7 +233,7 @@ fn mtrr_copy() -> R {
     let bsp = smp::bsp_mtrr().ok_or("no BSP MTRR snapshot")?;
     let vcnt = (bsp.cap & 0xFF) as u32;
     let unused = (0..vcnt).map(|i| 0x200 + 2 * i).find(|&base| bsp.ranges.iter().any(|&(m, v)| m == base + 1 && v & (1 << 11) == 0));
-    let Some(base_msr) = unused else { return ktest::skip("every variable MTRR is in use") };
+    let Some(base_msr) = unused else { return ktest::fail("every variable MTRR is in use") };
     let old = bsp.ranges.iter().find(|r| r.0 == base_msr).map(|r| r.1).ok_or("base not in the snapshot")?;
     POKE_MSR.store(base_msr as u64, Ordering::Release);
     POKE_VAL.store(old ^ (1 << 20), Ordering::Release);
@@ -402,7 +402,7 @@ fn apic_map() -> R {
     kassert!(smp::apic_id(n).is_none(), "a CPU beyond cpu_count has an APIC ID");
     kassert!(Some(ids[0]) == apic::id(), "BSP's APIC ID");
     if n == 1 {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     Ok(())
 }
@@ -460,7 +460,7 @@ fn hammer(x: u64) -> u64 {
 fn call_owners() -> R {
     let aps = aps()?;
     if aps.len() < 2 {
-        return ktest::skip("needs two APs (-smp 3 or more)");
+        return ktest::fail("needs two APs (-smp 3 or more)");
     }
     let (helper, target) = (aps[0], aps[1]);
     HAMMER_DONE.store(0, Ordering::Release);
@@ -528,7 +528,7 @@ fn start_guards() -> R {
 /// The Mini-PC check (spec §6.1): every AP's TSC offset within 38 ticks of the BSP's. Hardware only.
 fn tsc_offsets_hardware() -> R {
     if cpu::detect().hypervisor {
-        return ktest::skip("timing is never judged under a hypervisor");
+        return ktest::fail("timing is never judged under a hypervisor");
     }
     let aps = aps()?;
     let o = outcome().ok_or("no outcome")?;

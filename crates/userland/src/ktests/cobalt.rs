@@ -5,7 +5,7 @@
 //! - `ul.pkg.cobalt_profile` (QemuOnly: it writes the stick): the launcher's sign-in round trip on V2's vfat
 //!   with a stub Cobalt, into a scratch home `\BITSOS2\YTKHOME\` that it removes again.
 
-use super::pkg::{Line, Sha256, TEST_STICK_ID, list, on_stick, program_tree};
+use super::pkg::{Line, Sha256, TEST_STICK_ID, list, on_stick, program_tree, tree_list};
 use super::{SEC, finish, read, scratch, start, start_as, text, wait_for};
 use alloc::format;
 use alloc::string::String;
@@ -46,12 +46,13 @@ fn file_ok(l: &Line) -> TestResult {
 fn cobalt() -> TestResult {
     let l = list()?;
     // Georg 30.10.: on the Mini-PC only; a missing tree or launcher is a failure (pkg::program_tree).
-    let (lines, launcher) = program_tree(&l, TREE, "cobalt")?;
+    let own = tree_list(TREE)?;
+    let (lines, launcher) = program_tree(&l, &own, TREE, "cobalt")?;
     let tree: Vec<&Line> = lines.iter().collect();
     // YT-5 CR (INT-W7): the licence texts are part of the package (LICENSES/, made by stage-v2.sh).
     for name in ["README.txt", "libcobalt.txt", "loader_app.txt", "fonts.txt", "ffmpeg.txt"] {
         let p = format!("{TREE}LICENSES/{name}");
-        kassert!(tree.iter().any(|e| e.path == p), "{p} is not in the image's list (stage again with scripts/stage-v2.sh)");
+        kassert!(tree.iter().any(|e| e.path == p), "{p} is not in the tree's list (stage again with scripts/stage-v2.sh)");
     }
     let id = read("/boot/BITSOS2/STICK.ID").trim().to_ascii_lowercase();
     let t0 = time::now_ns();
@@ -138,13 +139,13 @@ fn launch(launcher: &str, d: &str) -> Result<String, String> {
 /// wiped, the copy before (.old) taken when the copy is gone (an interrupted swap).
 fn cobalt_profile() -> TestResult {
     let Some(launcher) = on_stick("cobalt")? else {
-        return ktest::skip("no cobalt in \\BITSOS2\\bin of this stick, or an optional image");
+        return ktest::fail("no cobalt in \\BITSOS2\\bin of this stick, or an optional image");
     };
     // ktest boots mount no /proc and the stick turns writable only once its identity is decided: wait for a
     // write to succeed, then hand the launcher a mount table that says so (its /proc/mounts rule is host-tested).
     let ns = vfs::root_ns();
     if !wait_for(30 * SEC, || ns.mkdir_p(KHOME).is_ok()) {
-        return ktest::skip("the stick does not take writes below \\BITSOS2\\ (identity not confirmed)");
+        return ktest::fail("the stick does not take writes below \\BITSOS2\\ (identity not confirmed)");
     }
     let d = scratch("cobalt");
     ns.mkdir_p(&format!("{d}/tree/app/cobalt/lib")).map_err(|e| format!("mkdir {d}: {e:?}"))?;

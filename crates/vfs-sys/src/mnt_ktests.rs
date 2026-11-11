@@ -189,12 +189,12 @@ fn programs() -> TestResult {
         if have("/bin/abi-ids") {
             return Err(String::from("the image has ABI programs but not /bin/abi-ns-mount (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     // /proc/<pid>/mountinfo shows the caller's own view only with AB's procfs glue (SX-3a CR 1).
     let (_, probe) = run("probe")?;
     if probe.contains("own view in mountinfo = no") {
-        return ktest::skip("procfs still renders the boot view (change request SX-3a CR 1 not applied)");
+        return ktest::fail("procfs still renders the boot view (change request SX-3a CR 1 not applied)");
     }
     for (arg, want) in cases {
         let (code, text) = run(arg)?;
@@ -208,7 +208,7 @@ fn programs() -> TestResult {
 ktest!("sx.mnt.lifetime", Safe, lifetime);
 fn lifetime() -> TestResult {
     if !have(PROG) {
-        return ktest::skip("no /bin/abi-ns-mount in this image");
+        return ktest::fail("no /bin/abi-ns-mount in this image");
     }
     let before = proc::ns::mnt::live();
     let (code, _) = run("prop")?;
@@ -256,11 +256,11 @@ ktest!("sx.mnt.pdeath", Safe, pdeath);
 /// plan/notes/sx-SX-3b-glue.patch) is not applied: the init then keeps running and the program kills it.
 fn pdeath() -> TestResult {
     if !have(PROG) {
-        return ktest::skip("no /bin/abi-ns-mount in this image");
+        return ktest::fail("no /bin/abi-ns-mount in this image");
     }
     let (code, text) = run("pdeath")?;
     if text.contains("still running after 5 s") {
-        return ktest::skip("the parent-death signal does not reach a pid-namespace init (SX-3b CR1, crates/proc/src/exit.rs send_pdeath, not applied)");
+        return ktest::fail("the parent-death signal does not reach a pid-namespace init (SX-3b CR1, crates/proc/src/exit.rs send_pdeath, not applied)");
     }
     let d = diff(&text, include_str!("../../../user/abi-tests/expected/sx3-mount-pdeath.txt"));
     kassert!(code == 0 && d.is_empty(), "{PROG} pdeath differs from the expected transcript (exit {code}):\n{}", d.join("\n"));
@@ -275,7 +275,7 @@ ktest!("sx.bwrap.smoke", Safe, bwrap_smoke);
 fn bwrap_smoke() -> TestResult {
     const BWRAP: &str = "/bin/bwrap";
     if !have(BWRAP) {
-        return ktest::skip("no /bin/bwrap in this image (SX-3b CR2 not applied)");
+        return ktest::fail("no /bin/bwrap in this image (SX-3b CR2 not applied)");
     }
     let argv = [BWRAP, "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-user", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "/bin/sh", "-c", "echo pid=$$; readlink /proc/self; test -d /proc/1 && echo proc=own"];
     let (code, text) = run_argv(&argv)?;

@@ -110,7 +110,7 @@ fn cnr_stuck_parks_the_controller() {
     assert!(c.reason().contains("CNR"));
     let m = env.model();
     assert!(!m.bus_master && m.usbcmd & cmd::RS == 0);
-    assert!(m.time >= crate::hc::RESET_NS, "waited the full second");
+    assert!(m.time >= crate::hc::RESET_NS, "waited its full time");
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn command_abort_reinits_the_ring() {
     env.model().drop_commands = 1;
     let t0 = env.now_ns();
     assert_eq!(c.noop(), Err(CmdError::Timeout));
-    assert!(env.now_ns() - t0 >= crate::hc::CMD_NS, "waited the full second");
+    assert!(env.now_ns() - t0 >= crate::hc::CMD_NS, "waited its full time");
     assert!(env.model().ca_written);
     assert_eq!(c.state(), State::Running, "only the command failed");
     assert_eq!(c.stats.timeouts.load(Ordering::Relaxed), 1);

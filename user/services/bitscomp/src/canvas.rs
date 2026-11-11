@@ -235,8 +235,13 @@ impl Canvas {
         self.px[(y * self.w + x) as usize]
     }
 
+    /// The picture as premultiplied Argb8888 bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.px.iter().flat_map(|p| p.to_le_bytes()).collect()
+    }
+
     pub fn into_buffer(self) -> MemoryRenderBuffer {
-        let bytes: Vec<u8> = self.px.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let bytes = self.bytes();
         MemoryRenderBuffer::from_slice(&bytes, Fourcc::Argb8888, (self.w, self.h), 1, Transform::Normal, None)
     }
 }
@@ -260,6 +265,8 @@ pub enum Glyph {
     Fold,
     /// The same button on a revealed list: keep it (dock it again).
     Pin,
+    /// PK-L1b: the top bar's "Programme" button: a grid of nine small squares.
+    Programs,
 }
 
 /// The glyph alone, over whatever `c` holds, in the square `b`.
@@ -269,6 +276,13 @@ pub fn glyph_into(c: &mut Canvas, glyph: Glyph, b: Box2, fg: Rgba) {
     let p = |fx: f32, fy: f32| (x0 + fx * s, y0 + fy * s);
     let th = (s / 12.0).max(1.2);
     match glyph {
+        Glyph::Programs => {
+            let d = s * 0.16;
+            for k in 0..9 {
+                let (cx, cy) = p(0.28 + 0.22 * (k % 3) as f32, 0.28 + 0.22 * (k / 3) as f32);
+                c.rrect(Box2 { x: cx - d / 2.0, y: cy - d / 2.0, w: d, h: d }, d * 0.25, fg);
+            }
+        }
         Glyph::Close => {
             c.line(p(0.3, 0.3), p(0.7, 0.7), th, fg);
             c.line(p(0.7, 0.3), p(0.3, 0.7), th, fg);

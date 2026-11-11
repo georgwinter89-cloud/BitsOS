@@ -19,7 +19,7 @@ use crate::netdev::WlanNet;
 
 fn untouched() -> TestResult {
     if pci::registry::opted_in("wlan") {
-        return ktest::skip("wlan=on: the driver may attach (wl.chip.status checks it)");
+        return ktest::fail("wlan=on: the driver may attach (wl.chip.status checks it)");
     }
     kassert!(crate::cards().is_empty(), "a card attached without wlan=on");
     kassert!(
@@ -28,7 +28,7 @@ fn untouched() -> TestResult {
     );
     Ok(())
 }
-ktest!("wl.untouched", Safe, untouched);
+ktest!("wl.untouched", QemuAll, untouched);
 
 fn glue() -> TestResult {
     let c = Arc::new(Card::new(String::from("wlan-test"), String::from("-"), None, None));
@@ -107,7 +107,7 @@ ktest!("wl.tool.args", Safe, tool_refuses_psk);
 /// Without an attached card every action answers at once (no panic, no wait)
 fn tool_no_card() -> TestResult {
     if !crate::cards().is_empty() {
-        return ktest::skip("a card is attached (wl.chip.status checks it)");
+        return ktest::fail("a card is attached (wl.chip.status checks it)");
     }
     let ctx = mcp::ToolContext::detached(time::now_ns().saturating_add(5_000_000_000));
     for a in ["status", "scan", "join", "leave"] {
@@ -121,7 +121,7 @@ fn tool_no_card() -> TestResult {
     }
     Ok(())
 }
-ktest!("wl.tool.no_card", Safe, tool_no_card);
+ktest!("wl.tool.no_card", QemuAll, tool_no_card);
 
 /// A command the thread does not take in time is taken back (a retry never piles up stale ones)
 fn command_taken_back() -> TestResult {
@@ -154,7 +154,7 @@ ktest!("wl.quiesce.lock_held", Safe, quiesce_lock_held);
 fn chip_status() -> TestResult {
     let cards = crate::cards();
     let Some(c) = cards.first() else {
-        return ktest::skip("no RTL8852BE attached (wlan=on and the Mini-PC's 04:00.0 are needed)");
+        return ktest::fail("no RTL8852BE attached (wlan=on and the Mini-PC's 04:00.0 are needed)");
     };
     let lines = crate::tool::status_lines(c);
     let text = lines.join("\n");
@@ -166,4 +166,4 @@ fn chip_status() -> TestResult {
     kassert!(phase == "running", "driver thread: {}", phase);
     Ok(())
 }
-ktest!("wl.chip.status", Wlan, chip_status);
+ktest!("wl.chip.status", Hardware, chip_status);

@@ -1,0 +1,6 @@
+segment = 0
+two attaches: nattch 2 mode 600 key 51c0de03
+after exec: nattch 2 mode 600 key 51c0de03
+no segment left in maps: yes
+exec child exit 0
+child's gone: nattch 2 mode 600 key 51c0de03

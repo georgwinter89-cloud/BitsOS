@@ -86,7 +86,7 @@ fn starting<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Option<CompElem
 
 fn pointer<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
     // DS-5: no pointer over the boot scene (the kernel's picture has none; it shows with the desktop).
-    if (app.cursor_hidden && app.cursor_deco.is_none()) || app.images.boot.shown() {
+    if (app.cursor_hidden && app.cursor_deco.is_none()) || app.images.boot.shown() || app.lock.hides() {
         return Vec::new();
     }
     let s = app.theme.scale;

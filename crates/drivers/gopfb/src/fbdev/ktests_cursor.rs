@@ -56,17 +56,17 @@ ktest!("dp.fbdev.cursor", Safe, refusals);
 const CURSOR_PROGRAM: &str = "/bin/abi-fbcursor";
 
 /// `abi-fbcursor v2`: the refusals in order from a program (sys_ioctl, copy_from_user). The expected line holds
-/// only without a hardware cursor; with one the test skips (the program would take the screen from bitscomp).
+/// only without a hardware cursor; with one the test fails (the program would take the screen from bitscomp).
 fn program() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     if flip::get().is_some_and(|f| f.cursor_ready()) {
-        return ktest::skip("a hardware cursor is present: the expected line is the one without (QEMU)");
+        return ktest::fail("a hardware cursor is present: the expected line is the one without (QEMU)");
     }
     let fb = fb()?;
     if vfs::root_ns().lookup(CURSOR_PROGRAM).is_err() {
-        return ktest::skip("/bin/abi-fbcursor is not in this image (user/abi-tests need the musl sysroot)");
+        return ktest::fail("/bin/abi-fbcursor is not in this image (user/abi-tests need the musl sysroot)");
     }
     super::fix_node_owner();
     let s = start_at(CURSOR_PROGRAM, &["abi-fbcursor", "v2"])?;
@@ -78,4 +78,4 @@ fn program() -> TestResult {
     handed_back(fb, "abi-fbcursor v2 ended")?;
     Ok(())
 }
-ktest!("dp.fbdev.cursor.program", Safe, program);
+ktest!("dp.fbdev.cursor.program", QemuAll, program);

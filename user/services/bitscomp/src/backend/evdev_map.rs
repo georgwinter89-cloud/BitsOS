@@ -18,6 +18,8 @@ pub const REL_WHEEL_HI_RES: u16 = 11;
 pub const REL_HWHEEL_HI_RES: u16 = 12;
 pub const ABS_X: u16 = 0;
 pub const ABS_Y: u16 = 1;
+const ABS_THROTTLE: u16 = 6;
+const ABS_WHEEL: u16 = 8;
 pub const KEY_A: u16 = 30;
 pub const KEY_Z: u16 = 44;
 pub const BTN_MISC: u16 = 0x100;
@@ -46,6 +48,8 @@ pub struct Caps {
     pub hwheel: bool,
     pub hwheel_hi: bool,
     pub abs: Option<(Range, Range)>,
+    /// PK-L1c: a gamepad or joystick (never also a keyboard or pointer: such a device stays what it was).
+    pub pad: bool,
 }
 
 fn bit(bits: &[u8], n: u16) -> bool {
@@ -56,7 +60,7 @@ impl Caps {
     /// From the EV_KEY, EV_REL and EV_ABS bitmaps (bytes as EVIOCGBIT fills them) and the X/Y ranges.
     pub fn from_bits(keys: &[u8], rel: &[u8], abs_bits: &[u8], abs: Option<(Range, Range)>) -> Caps {
         let has_abs = bit(abs_bits, ABS_X) && bit(abs_bits, ABS_Y);
-        Caps {
+        let mut c = Caps {
             keyboard: bit(keys, KEY_A) && bit(keys, KEY_Z),
             buttons: (BTN_LEFT..=BTN_TASK).any(|b| bit(keys, b)),
             rel_xy: bit(rel, REL_X) && bit(rel, REL_Y),
@@ -66,17 +70,45 @@ impl Caps {
             hwheel_hi: bit(rel, REL_HWHEEL_HI_RES),
             // A joystick or pad has X/Y too but no left button or touch: not a pointer.
             abs: if has_abs && (bit(keys, BTN_LEFT) || bit(keys, BTN_TOUCH)) { abs } else { None },
-        }
+            pad: false,
+        };
+        c.pad = !c.keyboard && !c.pointer() && is_pad(keys, abs_bits);
+        c
     }
 
     pub fn pointer(&self) -> bool {
         self.rel_xy || self.abs.is_some()
     }
 
-    /// Worth opening: a keyboard or a pointer (pads, sensors, power buttons are left to others).
+    /// Worth opening: a keyboard, a pointer or a pad (sensors, power buttons are left to others).
     pub fn wanted(&self) -> bool {
-        self.keyboard || self.pointer()
+        self.keyboard || self.pointer() || self.pad
     }
+
+    /// Whether bitscomp grabs the device (EVIOCGRAB). A pad never: Steam, SDL and games read the same node, and
+    /// the kernel gives every ungrabbed reader every event (crates/console/src/evdev.rs).
+    pub fn grabs(&self) -> bool {
+        !self.pad
+    }
+}
+
+/// PK-L1c, after linux-6.6/drivers/input/joydev.c `joydev_match`: a pad has BTN_SOUTH or a button of the gamepad
+/// block (BTN_GAMEPAD..BTN_THUMBR), or one of the joystick block (BTN_JOYSTICK..BTN_DEAD) with X/Y axes, a hat, or
+/// joydev's wheel or throttle axis (racing wheels, flight sticks; joydev also takes bare axes, but without buttons
+/// there is nothing to press). Touchpads (BTN_TOUCH) and tablets (BTN_DIGI: joydev tests that one bit) are not.
+pub fn is_pad(keys: &[u8], abs_bits: &[u8]) -> bool {
+    use crate::pad::{ABS_HAT0X, BTN_DEAD, BTN_DIGI, BTN_JOYSTICK, BTN_SOUTH, BTN_THUMBR};
+    if bit(keys, BTN_TOUCH) || bit(keys, BTN_DIGI) {
+        return false;
+    }
+    let gamepad = (BTN_SOUTH..=BTN_THUMBR).any(|b| bit(keys, b));
+    let axes = (bit(abs_bits, ABS_X) && bit(abs_bits, ABS_Y)) || bit(abs_bits, ABS_HAT0X) || bit(abs_bits, ABS_THROTTLE) || bit(abs_bits, ABS_WHEEL);
+    gamepad || ((BTN_JOYSTICK..=BTN_DEAD).any(|b| bit(keys, b)) && axes)
+}
+
+/// The EV_KEY codes set in a bitmap (a pad's buttons, for its mapping).
+pub fn codes(keys: &[u8]) -> Vec<u16> {
+    (0..=KEY_MAX).filter(|&c| bit(keys, c)).collect()
 }
 
 /// linux-6.6/include/uapi/linux/input.h BUS_VIRTUAL: uinput's default, virtio-input's, and V2's MCP devices.

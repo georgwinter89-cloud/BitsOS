@@ -9,14 +9,15 @@
 //! 3. by kind: RAM disks may be written; a USB disk that is (or, while the boot stick's identity is not known,
 //!    might be) the boot stick only with CONFIG `stick_write=on` (FS-7 will allow `\BITSOS2\` instead); any
 //!    other USB disk only with CONFIG `usb_msd_write=on` (a test switch); NVMe only with `nvme_write=on`
-//!    (NV's gate checks it too); a stacked device (partition, crypt, bitsvol on top of a `Disk`) passes here
+//!    (NV's gate checks it too) and only through a window (`nvme_data=`, gpt/window.rs); a stacked device (partition, crypt, bitsvol on top of a `Disk`) passes here
 //!    because its writes go through the lower `Disk` and its hook; anything else is refused.
 //!
 //! MC-10 (Georg 27.10.): besides `nvme_write=on`, NVMe writes open for a while when Georg ticks "auch interne
 //! Platte (NVMe) beschreiben" in the full-access dialog at the real keyboard: the MCP gate calls
 //! `open_nvme_until` with the grant's end (monotonic) and `close_nvme` when it ends or is revoked. That only
 //! changes what `switches().nvme_write` answers; steps 1 and 2 come first, so a disk with a Windows or EFI
-//! partition table stays refused whatever was ticked (R8).
+//! partition table stays refused whatever was ticked (R8). NV-2p (Georg 5.11.): the tick opens nothing by itself, an
+//! NVMe write needs a window (gpt/window.rs), and the window reads CONFIG's own `nvme_write`, not this switch.
 
 use crate::error::Refusal;
 use crate::queue::Kind;
@@ -161,6 +162,8 @@ pub struct StickIdentity {
     /// `\BITSOS2\STICK.ID` as the loader read it (16 bytes from 32 hex digits; None when missing or only V1's
     /// `\BITSOS\STICK.ID` was there). FS-7 compares it with the volume's own file before writing.
     pub id: Option<[u8; 16]>,
+    /// The loader's device path names an NVMe controller (`NVMe(`): the boot volume is a partition there, no USB stick.
+    pub nvme: bool,
 }
 
 pub(crate) struct Facts {
@@ -233,10 +236,14 @@ pub fn nvme_runtime_open() -> bool {
 /// attaches (its own last line of defence: with both switches off every USB unit refuses writes itself too).
 pub fn usb_writes_possible() -> bool {
     let s = switches();
-    // FS-7: the identified boot stick takes writes through the FAT layer's gate (its block 0 and STICK.ID
-    // known): its unit must not refuse them itself. Other USB disks stay refused by the hook (`UsbWritesOff`).
-    let fat_stick = stick_identity().is_some_and(|i| i.block0.is_some() && i.id.is_some());
-    s.stick_write || s.usb_msd_write || fat_stick
+    s.stick_write || s.usb_msd_write || stick_takes_fat_writes(stick_identity())
+}
+
+/// FS-7: the identified boot stick takes writes through the FAT layer's gate (its block 0 and STICK.ID known): its
+/// unit must not refuse them itself. A boot volume on the NVMe is no USB disk: every USB unit keeps refusing, and
+/// the hook (`UsbWritesOff`) is not the only layer left (pure: host-tested).
+pub fn stick_takes_fat_writes(i: Option<StickIdentity>) -> bool {
+    i.is_some_and(|i| i.block0.is_some() && i.id.is_some() && !i.nvme)
 }
 
 pub fn stick_identity() -> Option<StickIdentity> {
@@ -279,6 +286,18 @@ mod tests {
                 assert_eq!(decide(kind, true, &CLEAN, stick, all), Err(Refusal::DeviceReadOnly));
             }
         }
+    }
+
+    #[test]
+    fn only_a_usb_boot_stick_keeps_its_unit_writable() {
+        let id = |block0: bool, id: bool, nvme: bool| {
+            Some(StickIdentity { block0: block0.then_some([0x55; crate::table::FIRST_BYTES]), usb: None, id: id.then_some([7; 16]), nvme })
+        };
+        assert!(stick_takes_fat_writes(id(true, true, false)), "the identified stick");
+        assert!(!stick_takes_fat_writes(id(true, true, true)), "/boot on the NVMe: the stick beside is an ordinary disk");
+        assert!(!stick_takes_fat_writes(id(false, true, false)));
+        assert!(!stick_takes_fat_writes(id(true, false, false)));
+        assert!(!stick_takes_fat_writes(None));
     }
 
     #[test]

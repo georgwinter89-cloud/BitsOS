@@ -187,13 +187,22 @@ impl Fence {
 
     fn add_cb(&self, cb: Arc<dyn FenceCb>) -> Option<u64> {
         let Kind::Plain { cbs } = &self.kind else { return None };
-        let mut l = cbs.lock();
-        if self.signaled.load(Ordering::Relaxed) {
-            return None;
+        // A job's fence gets one callback per buffer of its submission: the list grows with its lock dropped
+        // (`ksync::spare`).
+        let mut spare = ksync::Spare::new();
+        loop {
+            let mut l = cbs.lock();
+            if self.signaled.load(Ordering::Relaxed) {
+                return None;
+            }
+            if spare.fits(&mut *l, 1) {
+                let id = CB_IDS.fetch_add(1, Ordering::Relaxed);
+                l.push((id, cb));
+                return Some(id);
+            }
+            drop(l);
+            spare.must_grow();
         }
-        let id = CB_IDS.fetch_add(1, Ordering::Relaxed);
-        l.push((id, cb));
-        Some(id)
     }
 
     fn remove_cb(&self, id: u64) {

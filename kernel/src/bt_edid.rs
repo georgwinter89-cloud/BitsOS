@@ -28,7 +28,7 @@ fn arrived() -> TestResult {
         _ => {}
     }
     let Some(e) = edid else {
-        return ktest::skip("no EDID from the firmware");
+        return ktest::fail("no EDID from the firmware");
     };
     kassert!(e.len() >= 128 && e.len() % 128 == 0, "EDID of {} B is not whole blocks", e.len());
     kassert!(e[..8] == [0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0], "EDID header {:02x?}", &e[..8]);
@@ -44,4 +44,4 @@ fn arrived() -> TestResult {
     kassert!(sink.is_ok(), "hda refuses the EDID: {sink:?}");
     Ok(())
 }
-ktest::ktest!("bt.edid.arrived", Safe, arrived);
+ktest::ktest!("bt.edid.arrived", Hardware, arrived);

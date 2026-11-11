@@ -117,6 +117,33 @@ pub struct Scan {
     pub incomplete: bool,
     /// The first partition start that could not be read ("what at LBA n"), for the verdict's text.
     pub unreadable: Option<String>,
+    /// What the GPT says beyond `parts` (NV-2p's window check: unique GUIDs, usable range, backup agreement).
+    pub gpt: Option<GptFacts>,
+}
+
+/// One used GPT entry as it stands on the disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GptEntry {
+    /// The slot, as Linux numbers it (efi.c:738).
+    pub number: u32,
+    /// Partition type GUID, on-disk bytes.
+    pub kind: [u8; 16],
+    /// Unique partition GUID, on-disk bytes.
+    pub unique: [u8; 16],
+    pub first: u64,
+    pub last: u64,
+}
+
+/// The table the scan used, and whether the other copy says the same.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GptFacts {
+    pub disk_guid: [u8; 16],
+    pub first_usable: u64,
+    pub last_usable: u64,
+    pub entries: Vec<GptEntry>,
+    /// None: primary and backup are both valid and agree (headers and entry arrays). Some: what differs. A doubt
+    /// about a window, never about a read (Linux uses either copy, efi.c:581-640).
+    pub disagreement: Option<String>,
 }
 
 impl Scan {
@@ -169,6 +196,23 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// The on-disk bytes of a GUID text, any case; None when it is not `8-4-4-4-12` hex digits.
+pub fn guid_parse(t: &str) -> Option<[u8; 16]> {
+    let parts: Vec<&str> = t.trim().split('-').collect();
+    if parts.len() != 5 || [8, 4, 4, 4, 12].iter().zip(&parts).any(|(n, p)| p.len() != *n || !p.bytes().all(|c| c.is_ascii_hexdigit())) {
+        return None;
+    }
+    let a = u32::from_str_radix(parts[0], 16).ok()?;
+    let b = u16::from_str_radix(parts[1], 16).ok()?;
+    let c = u16::from_str_radix(parts[2], 16).ok()?;
+    let mut d = [0u8; 8];
+    let rest = [parts[3], parts[4]].concat();
+    for (i, x) in d.iter_mut().enumerate() {
+        *x = u8::from_str_radix(&rest[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(guid(a, b, c, d))
 }
 
 fn u16_at(b: &[u8], i: usize) -> u16 {
@@ -238,6 +282,7 @@ pub fn scan(read: &mut dyn FnMut(u64, u64) -> Option<Vec<u8>>, bs: u32, total: u
     }
     if gpt_announced || sig_at_1 {
         let primary = b1.and_then(|b| gpt_header(&b, 1, bs, total));
+        let from_primary = primary.is_some();
         let hdr = match primary {
             Some(h) => Some(h),
             None => {
@@ -260,6 +305,13 @@ pub fn scan(read: &mut dyn FnMut(u64, u64) -> Option<Vec<u8>>, bs: u32, total: u
             return s;
         }
         s.scheme = Some(Scheme::Gpt);
+        let mut facts = GptFacts {
+            disk_guid: h.disk_guid,
+            first_usable: h.first_usable,
+            last_usable: h.last_usable,
+            entries: Vec::new(),
+            disagreement: if from_primary { backup_disagreement(read, &h, &arr[..bytes as usize], bs, total) } else { Some("the primary header is not valid".into()) },
+        };
         for i in 0..h.count as usize {
             let e = &arr[i * h.size as usize..i * h.size as usize + 128];
             let mut t = [0u8; 16];
@@ -268,6 +320,9 @@ pub fn scan(read: &mut dyn FnMut(u64, u64) -> Option<Vec<u8>>, bs: u32, total: u
                 continue;
             }
             let (first, last) = (u64_at(e, 32), u64_at(e, 40));
+            let mut unique = [0u8; 16];
+            unique.copy_from_slice(&e[16..32]);
+            facts.entries.push(GptEntry { number: (i + 1) as u32, kind: t, unique, first, last });
             let what = format!("GPT {}", i + 1);
             if t == GUID_EFI_SYSTEM {
                 s.efi.push(format!("{what}: EFI System at LBA {first}"));
@@ -279,6 +334,7 @@ pub fn scan(read: &mut dyn FnMut(u64, u64) -> Option<Vec<u8>>, bs: u32, total: u
             s.parts.push((first, blocks, format!("{what} {}", guid_text(&t)), (i + 1) as u32));
             check_first(&mut s, read, total, &what, first);
         }
+        s.gpt = Some(facts);
     }
     if s.scheme.is_none() {
         s.scheme = Some(Scheme::None);
@@ -291,6 +347,34 @@ struct GptHeader {
     count: u32,
     size: u32,
     entries_crc: u32,
+    alternate: u64,
+    first_usable: u64,
+    last_usable: u64,
+    disk_guid: [u8; 16],
+}
+
+/// What the backup copy says differently from the valid primary `h` and its entry array `arr`. The backup must be
+/// the disk's last block (Windows and Linux write it there), point back at LBA 1, and hold the same table.
+fn backup_disagreement(read: &mut dyn FnMut(u64, u64) -> Option<Vec<u8>>, h: &GptHeader, arr: &[u8], bs: u32, total: u64) -> Option<String> {
+    let last = total - 1;
+    if h.alternate != last {
+        return Some(format!("the primary names the backup at LBA {}, the disk ends at {last}", h.alternate));
+    }
+    let Some(b) = read(last, 1).and_then(|b| gpt_header(&b, last, bs, total)) else {
+        return Some(String::from("the backup header is missing or not valid"));
+    };
+    if b.alternate != 1 {
+        return Some(format!("the backup names the primary at LBA {}", b.alternate));
+    }
+    if b.disk_guid != h.disk_guid || b.first_usable != h.first_usable || b.last_usable != h.last_usable || b.count != h.count || b.size != h.size || b.entries_crc != h.entries_crc {
+        return Some(String::from("the backup header differs from the primary"));
+    }
+    let bytes = arr.len() as u64;
+    match read(b.entries_lba, bytes.div_ceil(bs as u64)) {
+        Some(a) if a.len() as u64 >= bytes && a[..arr.len()] == *arr => None,
+        Some(_) => Some(String::from("the backup entry array differs from the primary")),
+        None => Some(String::from("the backup entry array is unreadable")),
+    }
 }
 
 /// `is_gpt_valid` (efi.c:335-433) on one header block read from `lba`.
@@ -323,10 +407,13 @@ fn gpt_header(b: &[u8], lba: u64, bs: u32, total: u64) -> Option<GptHeader> {
     if bytes > GPT_ENTRIES_MAX_BYTES || entries_lba >= total || entries_lba + bytes.div_ceil(bs as u64) > total {
         return None;
     }
-    Some(GptHeader { entries_lba, count, size, entries_crc: u32_at(b, 88) })
+    let mut disk_guid = [0u8; 16];
+    disk_guid.copy_from_slice(&b[56..72]);
+    Some(GptHeader { entries_lba, count, size, entries_crc: u32_at(b, 88), alternate: u64_at(b, 32), first_usable, last_usable, disk_guid })
 }
 
-fn guid_text(g: &[u8; 16]) -> String {
+/// The GUID text (upper case) of on-disk bytes, as Windows and `gdisk` print it.
+pub fn guid_text(g: &[u8; 16]) -> String {
     format!(
         "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         u32_at(g, 0),

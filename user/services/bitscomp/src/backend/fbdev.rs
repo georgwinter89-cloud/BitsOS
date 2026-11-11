@@ -7,6 +7,7 @@
 //! whole window); the bookkeeping is `flip::Flip`. Either way the mapping is RAM,
 //! so bitscomp's copy (timed in `stats.present`) never touches write-combined memory itself. Pacing:
 //! FBIO_BITSOS_PACING (V2 only, ENOTTY on Linux) gives the scanout's period and vblank grid for the frame timer.
+//! WY-17: with a GPU renderer the windows go out as dma-bufs (`scanout`): `present` then copies nothing, only flips.
 //! Later the DP-4 surface device replaces fbdev.
 
 use std::fs::File;
@@ -17,7 +18,7 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::utils::{Physical, Rectangle};
 
 use super::flip::{Flip, Refused};
-use super::{Backend, copy_rects, evdev, vt};
+use super::{Backend, copy_rects, evdev, scanout, vt};
 use crate::render::Picture;
 use crate::state::App;
 
@@ -51,6 +52,13 @@ pub struct Fbdev {
     /// GX-3 CR 2: `var` is the screeninfo to pan with, `flip` which window is drawn and shown.
     var: [u8; VAR_WORDS * 4],
     flip: Flip,
+    /// WY-17: the device has room for two windows (whether or not this one copies into both).
+    two_fit: bool,
+    /// WY-8: this run was asked for two windows when it copies.
+    pan_asked: bool,
+    /// WY-17: the renderer draws into the windows itself; `left`: that ended since the main loop last asked.
+    direct: bool,
+    left: bool,
     /// DP-6: the kernel takes damage reports (false after the first refusal: ENOTTY on Linux, then never again).
     damage: bool,
     /// Dropped after the mapping (fields drop in order after `Drop::drop`): the console comes back last.
@@ -90,7 +98,8 @@ impl Fbdev {
         }
         let ypanstep = u16::from_le_bytes([fb[42], fb[43]]) as usize;
         // fb_pan_display refuses yoffset > 0 without a ypanstep that divides it (linux-6.6 fbmem.c:713).
-        let halves = pan && var(YRES_VIRTUAL) as usize >= 2 * h && fix(24) >= 2 * line * h && ypanstep != 0 && h % ypanstep == 0;
+        let two_fit = var(YRES_VIRTUAL) as usize >= 2 * h && fix(24) >= 2 * line * h && ypanstep != 0 && h % ypanstep == 0;
+        let halves = pan && two_fit;
         // Two windows when yres_virtual allows: drawn alternately, shown by FBIOPAN_DISPLAY (a real flip on V2 with
         // GX-3); else only the first. Starts on the first.
         let yoffset = var(YOFFSET);
@@ -118,6 +127,10 @@ impl Fbdev {
             stride_px: line / 4,
             var: vb,
             flip: Flip::new(halves),
+            two_fit,
+            pan_asked: halves,
+            direct: false,
+            left: false,
             damage: true,
             _console: console,
         };
@@ -158,6 +171,29 @@ impl Fbdev {
         }
     }
 
+    /// WY-17: back to copying into fb0's memory, for good: said once. The first frame after it is whole (the renderer
+    /// draws everything again, and both windows are copied whole as at the start).
+    fn leave_direct(&mut self, why: &str) {
+        eprintln!("bitscomp: scanout: back to readback: {why}");
+        match scanout::end(self.file.as_raw_fd()) {
+            Ok(()) => {}
+            // The screen went back: the hold's end put the view home, and the next store takes it again.
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            // It went back and a pan took it again (nothing exported any more): the view is where that pan left it.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                let _ = self.pan(0);
+            }
+            Err(e) => eprintln!("bitscomp: scanout: end refused: {e}"),
+        }
+        self.direct = false;
+        self.left = true;
+        self.flip = Flip::new(self.pan_asked);
+        // The kernel put the view on the first window: one window copies whole once, two as at the start.
+        if !self.pan_asked {
+            self.flip.moved_to(0);
+        }
+    }
+
     /// FBIOPAN_DISPLAY to window `w`; once more when a signal interrupted the wait for the flip.
     fn pan(&mut self, w: usize) -> std::io::Result<()> {
         let yoffset = (w * self.size.1 as usize) as u32;
@@ -172,8 +208,12 @@ impl Fbdev {
 
 impl Drop for Fbdev {
     fn drop(&mut self) {
+        // WY-17: the scanout buffers are the picture until the console draws: no pan to a window fb0 never held.
+        if self.direct {
+            let _ = scanout::end(self.file.as_raw_fd());
+        }
         // The console draws into the first window: the screen goes back there (an error changes nothing now).
-        if self.flip.shown() != 0 {
+        else if self.flip.shown() != 0 {
             let _ = self.pan(0);
         }
         // SAFETY: our mapping from `new`, unmapped once; nothing points into it any more.
@@ -191,6 +231,17 @@ impl Backend for Fbdev {
 
     fn present(&mut self, comp: &dyn Picture, damage: &[Rectangle<i32, Physical>]) {
         if comp.size() != self.size {
+            return;
+        }
+        if self.direct {
+            // The frame is drawn and finished in the hidden window: only the flip is left (without an engine the
+            // kernel copies the rectangles into its frame, as for a copied frame).
+            let w = self.flip.back();
+            self.report(w, damage);
+            match self.pan(w) {
+                Ok(()) => self.flip.landed(&[]),
+                Err(e) => self.leave_direct(&format!("pan to window {w} refused: {e}")),
+            }
             return;
         }
         // SAFETY: the mapping is `map_len` bytes, page-aligned, ours until drop; only this thread writes it.
@@ -228,6 +279,44 @@ impl Backend for Fbdev {
 
     fn hw_cursor(&mut self) -> Option<Box<dyn crate::hwcursor::HwCursor>> {
         super::fbcursor::FbCursor::new(&self.file).map(|c| Box::new(c) as Box<dyn crate::hwcursor::HwCursor>)
+    }
+
+    fn scanout_windows(&mut self) -> Result<scanout::Windows, String> {
+        if !self.two_fit {
+            return Err("fb0 has room for one window".into());
+        }
+        scanout::export(self.file.as_raw_fd(), self.size)
+    }
+
+    fn scanout_on(&mut self) {
+        self.direct = true;
+        self.flip = Flip::new(true);
+    }
+
+    fn scanout_frame(&mut self) -> Option<scanout::Aim> {
+        if !self.direct {
+            return None;
+        }
+        match scanout::begin(self.file.as_raw_fd()) {
+            Ok((w, whole)) => {
+                let (window, age) = self.flip.aim(w, whole);
+                Some(scanout::Aim { window, age })
+            }
+            Err(e) => {
+                self.leave_direct(&format!("the kernel names no window: {e}"));
+                None
+            }
+        }
+    }
+
+    fn scanout_lost(&mut self, why: &str) {
+        if self.direct {
+            self.leave_direct(why);
+        }
+    }
+
+    fn scanout_left(&mut self) -> bool {
+        std::mem::take(&mut self.left)
     }
 
     fn pacing(&self) -> Option<(Duration, Duration)> {

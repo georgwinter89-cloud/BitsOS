@@ -10,6 +10,8 @@ use crate::sb::{self, Geo};
 use crate::tx::Tx;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::vec;
 use alloc::vec::Vec;
 use crate::errno::*;
@@ -24,6 +26,8 @@ pub struct Node {
     /// File pages promised blocks by `write_at` that the write-back has not allocated yet (ENOSPC at write):
     /// page -> blocks promised.
     pub reserved: BTreeMap<u64, u32>,
+    /// `di`'s st_blocks for stat without the volume lock (the file's ops object holds it too, FS-STALL).
+    pub blocks: Arc<AtomicU64>,
 }
 
 pub struct State {
@@ -45,7 +49,17 @@ pub struct State {
     pub dirty: bool,
     /// Frozen for a snapshot (VS-2): no change reaches the disk until the thaw.
     pub frozen: bool,
+    /// Set when a failed write stopped the volume (`failed`), read without the lock (`Volume::writable`).
+    pub stopped: Arc<AtomicBool>,
+    /// FS-STALL: a read-only call that must not wait for the device under the lock: a block the device's cache does
+    /// not hold ends it with `MISS` (noted in `miss`), the caller reads it with the lock released and asks again.
+    pub no_io: Cell<bool>,
+    pub miss: Cell<Option<(u64, usize)>>,
 }
+
+/// The internal errno of a read that stopped at a block not in the device's cache (`State::no_io`); never leaves the
+/// volume (`Volume::read_op`).
+pub const MISS: i64 = -1;
 
 impl State {
     pub fn bs(&self) -> usize {
@@ -59,8 +73,13 @@ impl State {
         if let Some(d) = tx.and_then(|t| t.get(blk)) {
             return Ok(d.to_vec());
         }
-        if let Some(d) = self.jnl.as_ref().and_then(|j| j.run.blocks.get(&blk)) {
-            return Ok(d.clone());
+        if let Some(j) = self.jnl.as_ref() {
+            if let Some(d) = j.run.blocks.get(&blk) {
+                return Ok(d.clone());
+            }
+            if let Some(d) = j.committing.as_ref().and_then(|c| c.blocks.get(&blk)) {
+                return Ok(d.clone());
+            }
         }
         self.read_block(blk)
     }
@@ -72,8 +91,18 @@ impl State {
         let mut b = Vec::new();
         b.try_reserve_exact(self.bs()).map_err(|_| ENOMEM)?;
         b.resize(self.bs(), 0);
-        self.dev.read(blk * self.geo.bs, &mut b)?;
+        self.dev_read(blk * self.geo.bs, &mut b)?;
         Ok(b)
+    }
+    fn dev_read(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
+        if !self.no_io.get() {
+            return self.dev.read(at, buf);
+        }
+        if self.dev.read_cached(at, buf)? {
+            return Ok(());
+        }
+        self.miss.set(Some((at, buf.len())));
+        Err(MISS)
     }
     /// Reads `n` consecutive blocks into `buf` (file data).
     pub fn read_blocks(&self, blk: u64, buf: &mut [u8]) -> Result<(), i64> {
@@ -81,11 +110,13 @@ impl State {
         if blk.checked_add(n).is_none_or(|e| e > self.geo.blocks) {
             return Err(EUCLEAN);
         }
-        self.dev.read(blk * self.geo.bs, buf)?;
-        // Metadata of the running journal transaction (directory blocks, slow symlinks) is not home yet.
+        self.dev_read(blk * self.geo.bs, buf)?;
+        // Metadata of the running journal transaction and of the one in flight (directory blocks, slow symlinks)
+        // is not home yet; the running one is newer.
         if let Some(j) = self.jnl.as_ref() {
             let bs = self.geo.bs as usize;
-            for (b, d) in j.run.blocks.range(blk..blk + n) {
+            let flight = j.committing.as_ref().map(|c| c.blocks.range(blk..blk + n));
+            for (b, d) in flight.into_iter().flatten().chain(j.run.blocks.range(blk..blk + n)) {
                 let at = (*b - blk) as usize * bs;
                 let end = (at + bs).min(buf.len());
                 buf[at..end].copy_from_slice(&d[..end - at]);
@@ -151,6 +182,7 @@ impl State {
         if let Some(n) = self.nodes.get_mut(&di.ino) {
             tx.undo_nodes.entry(di.ino).or_insert_with(|| n.di.raw.clone());
             n.di = di.clone();
+            n.blocks.store(di.blocks512(&self.geo), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -182,6 +214,7 @@ impl State {
         for (ino, raw) in tx.undo_nodes {
             if let Some(n) = self.nodes.get_mut(&ino) {
                 n.di.raw = raw;
+                n.blocks.store(n.di.blocks512(&self.geo), Ordering::Relaxed);
             }
         }
     }
@@ -189,9 +222,27 @@ impl State {
     pub fn failed(&mut self, e: i64) -> i64 {
         if self.writable {
             self.writable = false;
+            self.stopped.store(true, Ordering::Release);
             klog::event!(Error, "ext4", "write.failed", errno = e; "volume now read-only (errors=remount-ro)");
         }
-        e
+        if e == ETIMEDOUT { EIO } else { e }
+    }
+    /// VS-H CR 5, "a slow pool must not turn into a read-only /data": a commit that failed on the device's timeout
+    /// wrote nothing a later commit cannot write again, so the volume stays writable and the caller answers EIO.
+    /// False for a media error and for a volume another step already stopped: those go to `failed`.
+    /// `Dev::take_timed_out` was forgotten when the commit began (`timeout_begin`), so an older data write's timeout
+    /// does not excuse this failure.
+    pub fn just_slow(&mut self, e: i64) -> bool {
+        // ETIMEDOUT: the failed request itself timed out (`CachedDiskDev`); the device-wide flag only for devices
+        // that cannot say so per request.
+        if self.writable && (e == ETIMEDOUT || (e == EIO && self.dev.take_timed_out())) {
+            klog::event!(Warn, "ext4", "commit.timeout", errno = e; "the device timed out; the volume stays writable, the next commit writes it again");
+            return true;
+        }
+        false
+    }
+    pub fn timeout_begin(&self) {
+        let _ = self.dev.take_timed_out();
     }
     pub fn set_free(&mut self, tx: &mut Tx, blocks: u64, inodes: u32) {
         self.save_sb(tx);
@@ -234,8 +285,17 @@ impl State {
             return Err(EBUSY);
         }
         let before = if self.dirty { None } else { tx.undo_sb.clone() };
+        self.timeout_begin();
         let r = self.ensure_dirty_from(before).and_then(|()| if self.jnl.is_some() { self.join_tx(&mut tx) } else { self.commit_inner(&mut tx) });
-        r.map_err(|e| self.failed(e))
+        let Err(e) = r else { return Ok(()) };
+        // With a journal, a failure here left this transaction out of the running one (`join` commits the running
+        // one before it adds to it; a write around the log stops the volume itself): forgotten like a frozen
+        // volume's. Without a journal its blocks may be half written, so it stops the volume whatever the cause.
+        if self.jnl.is_some() && self.just_slow(e) {
+            self.abort(tx);
+            return Err(if e == ETIMEDOUT { EIO } else { e });
+        }
+        Err(self.failed(e))
     }
     /// The blocks of `tx` in FS-8a's order (early, descriptors, superblock, the rest).
     fn tx_blocks(&mut self, tx: &mut Tx, sb_block: bool) -> Result<Vec<(u64, Vec<u8>)>, i64> {

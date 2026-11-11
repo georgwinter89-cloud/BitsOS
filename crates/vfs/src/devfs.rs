@@ -177,7 +177,7 @@ pub fn populate_from(ns: &MountNs, devnodes: &[crate::DevNodeEntry], procfiles: 
     }
     make_devices(ns, devnodes, &mut st);
     for p in procfiles {
-        match ns.create_proc(p.path, p.render) {
+        match ns.create_proc_mode(p.path, p.render, p.mode) {
             Ok(_) => st.procfiles += 1,
             Err(e) => {
                 st.failed += 1;

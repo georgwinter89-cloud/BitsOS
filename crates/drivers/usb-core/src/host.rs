@@ -73,6 +73,23 @@ pub struct HubParams {
     pub multi_tt: bool,
 }
 
+/// What the controller itself says about an endpoint at one moment (`Host::look_endpoint`, US-R).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpLook {
+    /// Transfer events the controller reported for this endpoint so far.
+    pub events: u64,
+    /// The TR Dequeue Pointer of its output context; 0 = not read this time. A controller need not update it
+    /// while the endpoint runs (xHCI 4.8.3), so a change means it moved and no change means nothing.
+    pub dequeue: u64,
+}
+
+impl EpLook {
+    /// The endpoint did something between `earlier` and this look.
+    pub fn moved_since(&self, earlier: &EpLook) -> bool {
+        self.events != earlier.events || (self.dequeue != 0 && earlier.dequeue != 0 && self.dequeue != earlier.dequeue)
+    }
+}
+
 pub trait Host: Send + Sync {
     fn name(&self) -> &str;
     fn now_ns(&self) -> u64;
@@ -129,6 +146,17 @@ pub trait Host: Send + Sync {
     /// supported.
     fn submit_iso(&self, _slot: HcSlot, _ep: u8, _req: IsoRequest, _urb: Arc<IsoUrb>) -> Result<(), UsbError> {
         Err(UsbError::Invalid("this host has no isochronous transfers"))
+    }
+    /// Hands on every event the controller has written, then says what it knows about `ep` (address). `None`:
+    /// this host cannot tell (the default), the device or the endpoint is gone. Never waits behind a transfer.
+    fn look_endpoint(&self, _slot: HcSlot, _ep: u8) -> Option<EpLook> {
+        None
+    }
+    /// The device's port was just reset (US-R, Linux `xhci_discover_or_reset_device`): the slot stays but goes back
+    /// to its Default state, every transfer ends with `Cancelled`, every endpoint but 0 is forgotten. `set_address`
+    /// comes next, then `configure` again. The handle stays valid. The default: not supported.
+    fn reset_slot(&self, _slot: HcSlot) -> Result<(), UsbError> {
+        Err(UsbError::Invalid("this host cannot reset a device in place"))
     }
     /// The device is gone or given up: Disable Slot, its contexts and rings freed, pipes stopped.
     fn release(&self, slot: HcSlot);

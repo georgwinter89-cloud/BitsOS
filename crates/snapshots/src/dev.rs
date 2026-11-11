@@ -29,7 +29,9 @@
 //!
 //! Errors: ENODEV no /data, EOPNOTSUPP /data is a plain ext4 image, EROFS /data is read-only, EINVAL a bad line
 //! or an id that is not a snapshot of /data, ENOENT no such snapshot, EBUSY frozen/mounted/another operation,
-//! ENOSPC the pool is full, ETIMEDOUT the pool's lock.
+//! ENOSPC the pool is full, ETIMEDOUT the pool's lock. "Another operation" means 60 s of waiting ended without a
+//! turn, as can happen during a long burst of deletes (each delete takes its turn again at once): nothing was
+//! done, and the caller tries again (`bitssnap serve` does, after 20 s).
 
 use crate::{Target, mounts};
 use alloc::format;

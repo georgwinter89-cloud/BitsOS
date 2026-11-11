@@ -1,0 +1,6 @@
+shmget works: yes
+attached: yes
+zero: yes
+RMID = 0
+still there: yes
+detach = 0

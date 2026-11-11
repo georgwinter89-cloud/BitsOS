@@ -3,14 +3,15 @@
 //! MM-1: a buddy allocator (`buddy`) over the BootInfo memory map with zones DMA32/NORMAL, per-CPU lists for
 //! single frames, owner kinds, statistics and refused bad frees; its tables are sized from the map and carved
 //! from the pool (R1). MM-3: the kernel heap (`heap`) is slab caches (`slab`) for the size classes 8..2048
-//! with per-CPU magazines (`mags`) and exact page runs above; named `SlabCache`s for kernel objects; the
-//! seed chunk serves before the frame allocator exists (`pages`). Every allocation names its owner kind
-//! (YK-1 rule 3).
+//! with per-CPU magazines (`mags`) and exact page runs above (or single frames in the vmap area, `scatter`);
+//! named `SlabCache`s for kernel objects; the seed chunk serves before the frame allocator exists (`pages`).
+//! Every allocation names its owner kind (YK-1 rule 3).
 #![no_std]
 
 extern crate alloc;
 
 mod bitmap;
+pub mod compact;
 pub mod dma;
 pub mod dma_pages;
 pub mod grace;
@@ -27,18 +28,20 @@ mod pcp;
 pub mod rcu_index;
 pub mod reclaim;
 pub mod report;
+mod scatter;
 pub mod slab;
 #[cfg(test)]
 mod tests;
 
-pub use buddy::{boot_buddy, Buddy, BuddyFrames, BuildError, ReleaseError, Storage, ZoneInfo, ORDERS};
-pub use heap::{GlobalHeap, KernelHeap, HEAP};
+pub use buddy::{boot_buddy, BlockCensus, BlockHolder, Buddy, BuddyFrames, BuildError, CompactStats, MigrateType, ReleaseError, Storage, ZoneInfo, MIGRATE_TYPES, ORDERS, PAGEBLOCK_FRAMES, PAGEBLOCK_ORDER};
+pub use heap::{GlobalHeap, KernelHeap, OrderWant, HEAP, MAX_WANTED};
 pub use heap_stats::{HeapStats, PROBE_REFUSALS};
 pub use page_frame::PageFrame;
 pub use pages::SeedStats;
 pub use slab::{CacheStats, CheckError, SlabBox, SlabCache};
 pub use map::{MapRange, RangeUse};
 pub use report::{flush_reports, BadFree};
+pub use scatter::{Scatter, ScatterStats, COSTLY_ORDER};
 
 use ksync::OnceRef;
 
@@ -81,6 +84,16 @@ pub struct FrameStats {
     /// PF-5: bytes waiting for a grace period before they are freed (`grace::pending_bytes`): still counted in
     /// their owner's `used_by_kind` (a part of it, never of `free_bytes`), reusable after `grace::drain`.
     pub pending_bytes: u64,
+    /// Of `free_bytes`, the HighAtomic reserve (`buddy::highatomic`): free only for allocations that cannot reclaim.
+    pub highatomic_free_bytes: u64,
+}
+
+impl FrameStats {
+    /// Free memory an ordinary allocation can get (Linux `__zone_watermark_unusable_free` taken off): what the
+    /// watermarks, MemAvailable and every "is there room" question go by.
+    pub fn usable_free_bytes(&self) -> u64 {
+        self.free_bytes.saturating_sub(self.highatomic_free_bytes)
+    }
 }
 
 pub trait FrameAlloc: Sync {
@@ -164,6 +177,12 @@ pub fn alloc_zeroed_huge_light(kind: Kind) -> Option<u64> {
         zero_frame(p + i * PAGE);
     }
     Some(p)
+}
+
+/// What holds the aligned blocks of `order` of the boot allocator now (`Buddy::census`; None before it exists): the
+/// message of a test or event that found no free block of the order.
+pub fn block_census(order: u32) -> Option<BlockCensus> {
+    boot_buddy().map(|b| b.census(order))
 }
 
 /// MM-13: is `phys` the head of an allocated block of `order` of `Kind::User` right now (a huge page that was

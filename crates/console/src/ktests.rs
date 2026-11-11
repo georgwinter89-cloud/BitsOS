@@ -40,16 +40,16 @@ fn settle() -> Result<(), String> {
     Ok(())
 }
 
-fn skip_without_display() -> Option<TestResult> {
+fn fail_without_display() -> Option<TestResult> {
     if display::device().is_none() {
-        return Some(ktest::skip("no display device (no GOP framebuffer)"));
+        return Some(ktest::fail("no display device (no GOP framebuffer)"));
     }
     None
 }
 
 /// Text written to the console is in the VT's grid and its pixels are exactly the model's (`render::cell_pixel`).
 fn grid_and_pixels() -> TestResult {
-    if let Some(s) = skip_without_display() {
+    if let Some(s) = fail_without_display() {
         return s;
     }
     let marker = alloc::format!("in.console.grid Grüße {{@}} [x] € {}", time::now_ns() % 1_000_003);
@@ -79,7 +79,7 @@ fn grid_and_pixels() -> TestResult {
     }
     Ok(())
 }
-ktest!("in.console.grid", Safe, grid_and_pixels);
+ktest!("in.console.grid", Screen, grid_and_pixels);
 
 /// reboot and poweroff refuse injected lines, directly and typed through the VT and the monitor thread.
 fn injected_reboot_refused() -> TestResult {
@@ -111,7 +111,7 @@ fn injected_reboot_refused() -> TestResult {
     }
     Ok(())
 }
-ktest!("in.console.injected_reboot_refused", Safe, injected_reboot_refused);
+ktest!("in.console.injected_reboot_refused", Screen, injected_reboot_refused);
 
 fn fake(name: &str, keys: &[u16], rel: &[u16]) -> alloc::sync::Arc<evdev::InputDevice> {
     let mut caps = Caps::default();
@@ -158,7 +158,7 @@ ktest!("in.console.repeat", QemuOnly, repeat);
 /// and made-up times (no waiting). QemuOnly: it types into the real console's line.
 fn repeat_takeover() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
-    if let Some(s) = skip_without_display() {
+    if let Some(s) = fail_without_display() {
         return s;
     }
     const DEV: u32 = 0xFFFF_FE00;
@@ -183,7 +183,7 @@ ktest!("in.console.repeat_takeover", QemuOnly, repeat_takeover);
 
 /// A relative mouse moves the pointer, clamped to the screen; the arrow is drawn there.
 fn pointer() -> TestResult {
-    if let Some(s) = skip_without_display() {
+    if let Some(s) = fail_without_display() {
         return s;
     }
     let m = fake("ktest pointer mouse", &[0x110], &[0, 1]);
@@ -206,7 +206,7 @@ fn pointer() -> TestResult {
     m.unregister(time::now_ns());
     r
 }
-ktest!("in.console.pointer", Safe, pointer);
+ktest!("in.console.pointer", Screen, pointer);
 
 fn wait_pointer(x: u32, y: u32) -> TestResult {
     let end = time::now_ns() + WAIT_NS;
@@ -241,7 +241,7 @@ fn wait_grid(needle: &str) -> Result<alloc::vec::Vec<String>, String> {
 /// erased again (Ctrl+U, injected like MCP's `send_keys`).
 fn quiet_console() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
-    if let Some(s) = skip_without_display() {
+    if let Some(s) = fail_without_display() {
         return s;
     }
     let level = crate::log_level();
@@ -284,7 +284,7 @@ fn quiet_console() -> TestResult {
     r?;
     restored.map_err(|e| alloc::format!("klog levels not restored: {e}"))
 }
-ktest!("in.console.quiet", Safe, quiet_console);
+ktest!("in.console.quiet", Screen, quiet_console);
 
 /// The line discipline on its own instance: cooked editing, Ctrl+C, Ctrl+D, raw bytes.
 fn tty_cooked_raw() -> TestResult {

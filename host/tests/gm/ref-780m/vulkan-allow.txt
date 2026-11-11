@@ -1,0 +1,28 @@
+# GM-1d: differences of `vulkaninfo` on V2 from the real 780M's capture (vulkan.ref) that are known: `key | here | real | why`.
+# key, here and real may be fnmatch patterns. A difference not listed fails host/tests/minipc/vk.sh; a listed one that
+# is gone is reported, so the line can go.
+# Mesa 26.2.5 (the stage) against 26.1.6 (the capture); seen on the fake 780M, whose kernel answers equal the real one's.
+type heap=1 flags=0x0021 | 4 | absent | Mesa version: protected memory types (newer RADV enables protectedMemory)
+type heap=0 flags=0x0020 | 2 | absent | Mesa version: protected memory types
+queue QUEUE_COMPUTE_BIT QUEUE_GRAPHICS_BIT QUEUE_PROTECTED_BIT QUEUE_SPARSE_BINDING_BIT QUEUE_TRANSFER_BIT | count=1 ts=64 | absent | Mesa version: the same family as protected capable
+queue QUEUE_COMPUTE_BIT QUEUE_GRAPHICS_BIT QUEUE_SPARSE_BINDING_BIT QUEUE_TRANSFER_BIT | absent | count=1 ts=64 | Mesa version: the family has QUEUE_PROTECTED_BIT now
+queue QUEUE_COMPUTE_BIT QUEUE_SPARSE_BINDING_BIT QUEUE_TRANSFER_BIT | count=1 ts=64 | count=4 ts=64 | hardware backend: this driver runs one kernel compute ring (comp_1.0.0), Linux four; the fake answers as Linux, so there the difference is gone
+ext VK_EXT_descriptor_heap | 1 | absent | Mesa version
+ext VK_EXT_host_image_copy | 1 | absent | Mesa version (hostImageCopy in allow.txt)
+ext VK_EXT_image_compression_control_swapchain | 1 | absent | Mesa version
+ext VK_EXT_pipeline_protected_access | 1 | absent | Mesa version (pipelineProtectedAccess in allow.txt)
+ext VK_KHR_device_fault | 1 | absent | Mesa version
+ext VK_KHR_extended_flags | 1 | absent | Mesa version
+ext VK_KHR_maintenance11 | 1 | absent | Mesa version
+ext VK_KHR_performance_query | 1 | absent | Mesa version
+ext VK_KHR_shader_abort | 1 | absent | Mesa version
+ext VK_KHR_shader_constant_data | 1 | absent | Mesa version
+ext VK_KHR_shader_fma | 1 | absent | Mesa version
+# VCN: the capture's video queues. The fake answers as the real chip with VCN up; RADV's timestamp bits there follow Mesa's
+# version. On the hardware backend VCN comes with GX-8v (wave 31): until then the families and extensions are absent.
+queue QUEUE_VIDEO_DECODE_BIT_KHR | count=1 ts=64 | count=1 ts=0 | Mesa version: video queues report timestamps
+queue QUEUE_VIDEO_ENCODE_BIT_KHR | count=1 ts=64 | count=1 ts=0 | Mesa version: video queues report timestamps
+queue QUEUE_VIDEO_DECODE_BIT_KHR | absent | * | no VCN before GX-8v
+queue QUEUE_VIDEO_ENCODE_BIT_KHR | absent | * | no VCN before GX-8v
+ext VK_KHR_video_* | absent | * | no VCN before GX-8v
+ext VK_VALVE_video_encode_rgb_conversion | absent | 1 | no VCN before GX-8v

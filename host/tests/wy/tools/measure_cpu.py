@@ -94,7 +94,7 @@ def main():
     scenes = [
         ("static", [["brave", *BRAVE_FLAGS, f"--user-data-dir={profile}", f"http://127.0.0.1:{PORT}/"], ["foot", "sh"]]),
         ("scroll", [["brave", *BRAVE_FLAGS, f"--user-data-dir={profile}", f"http://127.0.0.1:{PORT}/?scroll=4"]]),
-        ("terminal", [["foot", "sh", "-c", f"while :; do cat {ROOT}/plan/V2-PLAN.md; done"]]),
+        ("terminal", [["foot", "sh", "-c", f"while :; do cat {os.path.abspath(__file__)}; done"]]),
     ]
     try:
         for name, clients in scenes:

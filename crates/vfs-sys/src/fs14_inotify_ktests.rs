@@ -74,7 +74,7 @@ fn one_mode(mode: &str) -> TestResult {
 
 fn programs() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("/bin/fs-inotify is not in this image (xtask builds host/tests/fs/progs into every image)");
+        return ktest::fail("/bin/fs-inotify is not in this image (xtask builds host/tests/fs/progs into every image)");
     }
     for mode in ["checks", "dir", "self", "wait"] {
         one_mode(mode)?;

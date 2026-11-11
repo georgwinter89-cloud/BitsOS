@@ -1,6 +1,6 @@
 //! `dp.fbscene.screendump` (QemuOnly): an fbdev program's picture equals MCP `screen`'s picture equals what
 //! QEMU shows (host/tests/dp/20-fbdev.sh with DP-1's scene_check.py). Runs only when the scenario attaches COM2
-//! (the DPSCENE protocol of `crate::scene`); otherwise it skips.
+//! (the DPSCENE protocol of `crate::scene`); otherwise it fails.
 //!
 //! `abi-fbdev draw` paints double-buffered frames, pans, then stores into the shown buffer and writes a band with
 //! pwrite. The kernel checks `display::snapshot()` (MCP `screen`'s source) against the program's pattern, then
@@ -14,9 +14,9 @@ use ktest::{kassert, ktest, TestResult};
 
 fn scene() -> TestResult {
     if !crate::scene::com2_present() {
-        return ktest::skip("no COM2 handshake port: only host/tests/dp/20-fbdev.sh runs this scene");
+        return ktest::fail("no COM2 handshake port: only host/tests/dp/20-fbdev.sh runs this scene");
     }
-    let Some((fbi, _)) = live() else { return ktest::skip("no GOP framebuffer") };
+    let Some((fbi, _)) = live() else { return ktest::fail("no GOP framebuffer") };
     let fb = fb()?;
     need_program()?;
     super::fix_node_owner();
@@ -36,4 +36,4 @@ fn scene() -> TestResult {
     crate::scene::com2_write("DPSCENE done\n");
     Ok(())
 }
-ktest!("dp.fbscene.screendump", QemuOnly, scene);
+ktest!("dp.fbscene.screendump", Run("dp/20-fbdev"), scene);

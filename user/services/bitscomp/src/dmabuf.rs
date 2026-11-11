@@ -1,9 +1,10 @@
 //! WY-16 (gx-scout-mesa.md step C2): client dma-bufs. zwp_linux_dmabuf_v1 version 4 with a default feedback
-//! whose main device is the render node (226:128, what Mesa's WSI compares with its own node's rdev,
-//! gx-scout-uapi.md §6) and whose one tranche lists the renderer's formats, LINEAR first (`table`). Pixman imports a
-//! LINEAR buffer by mmap (DR-5's dma-buf mmap); GLES through an EGL image. Every import is checked by the renderer
-//! before the client gets its wl_buffer (`Composer::dmabuf_turn`), so a buffer the renderer cannot read (a
-//! non-linear modifier under Pixman, a bad stride) is `failed`, never a crash at draw time.
+//! whose main device is the render node for a GPU renderer (226:128, what Mesa's WSI compares with its own node's
+//! rdev, gx-scout-uapi.md §6) and none (0:0) for a renderer reading by CPU (`advertised`), and whose one tranche lists
+//! the renderer's formats, LINEAR first (`table`). Pixman imports a LINEAR buffer by mmap (DR-5's dma-buf mmap);
+//! GLES through an EGL image. Every import is checked by the renderer before the client gets its wl_buffer
+//! (`Composer::dmabuf_turn`), so a buffer the renderer cannot read (a non-linear modifier under Pixman, a bad
+//! stride) is `failed`, never a crash at draw time.
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Format, Fourcc, Modifier};
@@ -23,6 +24,10 @@ pub const RENDER_RDEV: (u32, u32) = (226, 128);
 pub struct Dma {
     pub state: DmabufState,
     pub global: Option<DmabufGlobal>,
+    /// WY-21: globals of renderers that drew before (`renew`, version 3 only).
+    pub retired: Vec<DmabufGlobal>,
+    /// The global has a default feedback (version 4), which `renew` changes in place.
+    pub feedback: bool,
     /// Imports waiting for the renderer's check (the main loop's next `dmabuf_turn`).
     pub pending: Vec<(Dmabuf, ImportNotifier)>,
     /// A wl_buffer was destroyed: the renderer's cache drops its mapping or EGL image at the next turn, not only
@@ -36,6 +41,11 @@ pub struct Dma {
     /// The last frame's GPU work had not finished within the renderer's wait (`CompRenderer::gpu_idle`): held
     /// buffers stay held until it has.
     pub gpu_busy: bool,
+    /// `--main-device render`: `advertised` names the render node under a CPU-reading renderer too.
+    pub main_render: bool,
+    /// WY-3b: what `init` found, for Xwayland's glamor: the main device named (0: none) and how the renderer reads.
+    pub main_device: u64,
+    pub reads_by_cpu: bool,
 }
 
 impl Dma {
@@ -43,12 +53,17 @@ impl Dma {
         Dma {
             state: DmabufState::new(),
             global: None,
+            retired: Vec::new(),
+            feedback: false,
             pending: Vec::new(),
             cleanup_due: false,
             hold: Default::default(),
             sync: None,
             map_probe: false,
             gpu_busy: false,
+            main_render: false,
+            main_device: 0,
+            reads_by_cpu: true,
         }
     }
 }
@@ -73,9 +88,9 @@ pub fn table(formats: impl IntoIterator<Item = Format>) -> Vec<Format> {
     v
 }
 
-/// The main device and the node it was found at: the render node when it exists as a char device, else the
+/// The render node's number and where it was found: the render node when it exists as a char device, else the
 /// first renderD* (sorted), else 226:128 without a node.
-pub fn main_device() -> (u64, Option<String>) {
+pub fn render_device() -> (u64, Option<String>) {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let is_char = |p: &str| std::fs::metadata(p).ok().filter(|m| m.file_type().is_char_device()).map(|m| m.rdev());
     if let Some(rdev) = is_char(RENDER_NODE) {
@@ -92,6 +107,23 @@ pub fn main_device() -> (u64, Option<String>) {
         }
     }
     (libc::makedev(RENDER_RDEV.0, RENDER_RDEV.1), None)
+}
+
+/// The main device the default feedback names (WY-17b, CR-GM1d-2 way b). A renderer reading by CPU (Pixman, llvmpipe's
+/// GLES) can only map a buffer in memory the CPU may touch, and RADV's swapchain images on the same GPU are VRAM with
+/// NO_CPU_ACCESS: mapping them is EPERM, as on Linux, and every Vulkan window would fail. So such a renderer names no
+/// device, 0:0: Mesa's WSI then finds no same_gpu (wsi_common_wayland.c, display->same_gpu; 0 also means "not
+/// advertised" to its pick_format_from_surface_dmabuf_feedback) and hands over a linear copy in GTT
+/// (wsi_common_drm.c, prime_select_buffer_memory_type refuses DEVICE_LOCAL), which maps. `render_node` (`--main-device
+/// render`) names the node anyway, for a test of a client's path that needs it.
+pub fn advertised(reads_by_cpu: bool, render_node: bool, rdev: u64) -> u64 {
+    if reads_by_cpu && !render_node { 0 } else { rdev }
+}
+
+/// Whether a GL renderer string means a software rasteriser, which reads client buffers by CPU like Pixman.
+#[cfg(any(test, feature = "gpu"))]
+pub fn software_gl(gl: &str) -> bool {
+    ["llvmpipe", "softpipe", "swrast"].iter().any(|n| gl.contains(n))
 }
 
 /// What a CPU reader (llvmpipe's mmap import) can take: one-plane formats of known pixel size, LINEAR or implicit.
@@ -201,6 +233,42 @@ pub fn probe(buf: &Dmabuf, map: bool) -> Result<(), String> {
 /// Makes the dma-buf global (version 4, default feedback) for the renderer's formats, and the syncobj global
 /// when the render node has timelines and eventfds. Called once, after the first compositor exists.
 pub fn init(app: &mut App, comp: &dyn crate::render::Composer, handle: smithay::reexports::calloop::LoopHandle<'static, App>) {
+    advertise(app, comp);
+    // The node stays for the syncobj global: explicit sync does not depend on which device renders.
+    let node = render_device().1;
+    app.dma.sync = crate::syncobj::Syncobj::start(&app.dh.clone(), node.as_deref(), handle);
+}
+
+/// WY-21: another renderer took over (`main.rs` `leave_gpu`). The global stays; its default feedback and every
+/// surface's feedback say what the new renderer takes (main device, format table), so a client already bound hears it
+/// and allocates its next buffers to fit (Mesa's EGL and Vulkan WSI follow a feedback's `done`). A buffer made before
+/// it heard can still be refused by the new renderer: a `create_immed` that fails ends that client, as linux-dmabuf
+/// says. Without feedback (a version 3 global) the old global is hidden and a new one made.
+pub fn renew(app: &mut App, comp: &dyn crate::render::Composer) {
+    (app.dma.main_device, app.dma.reads_by_cpu) = (0, comp.reads_by_cpu());
+    advertise_as(app, comp, true);
+}
+
+fn advertise(app: &mut App, comp: &dyn crate::render::Composer) {
+    advertise_as(app, comp, false);
+}
+
+/// The new feedback to every surface that asked for one (Smithay's own default reaches only the default feedbacks).
+fn tell_surfaces(app: &App, feedback: &smithay::wayland::dmabuf::DmabufFeedback) -> usize {
+    use smithay::wayland::dmabuf::SurfaceDmabufFeedbackState;
+    let mut n = 0;
+    for w in app.all_windows().into_iter().chain(app.x_unmanaged()) {
+        w.with_surfaces(|_, data| {
+            if let Some(f) = SurfaceDmabufFeedbackState::from_states(data) {
+                f.set_feedback(feedback);
+                n += 1;
+            }
+        });
+    }
+    n
+}
+
+fn advertise_as(app: &mut App, comp: &dyn crate::render::Composer, renew: bool) {
     app.dma.map_probe = comp.maps_dmabufs();
     // A renderer that reads by CPU gets only what `check_layout` lets through: no entry the client must fail on.
     let cpu = app.dma.map_probe;
@@ -210,11 +278,31 @@ pub fn init(app: &mut App, comp: &dyn crate::render::Composer, handle: smithay::
         eprintln!("bitscomp: dmabuf: renderer {renderer} imports no dma-buf format: no zwp_linux_dmabuf_v1 (clients use wl_shm)");
         return;
     }
-    let (dev, node) = main_device();
+    let (rdev, node) = render_device();
+    let dev = advertised(comp.reads_by_cpu(), app.dma.main_render, rdev);
+    (app.dma.main_device, app.dma.reads_by_cpu) = (dev, comp.reads_by_cpu());
+    let shown = if dev == 0 { "none" } else { node.as_deref().unwrap_or("no node") };
     let dh: DisplayHandle = app.dh.clone();
     let names: Vec<String> = formats.iter().take(8).map(|f| fourcc_name(*f)).collect();
     let more = formats.len().saturating_sub(names.len());
-    let global = match DmabufFeedbackBuilder::new(dev, formats.iter().copied()).build() {
+    let built = DmabufFeedbackBuilder::new(dev, formats.iter().copied()).build();
+    if renew && let (Ok(feedback), Some(g), true) = (&built, app.dma.global, app.dma.feedback) {
+        app.dma.state.set_default_feedback(&g, feedback);
+        let n = tell_surfaces(app, feedback);
+        eprintln!(
+            "bitscomp: dmabuf: the feedback now for renderer {renderer}, main device {}:{} ({shown}), {} formats (default and {n} surfaces)",
+            libc::major(dev),
+            libc::minor(dev),
+            formats.len()
+        );
+        return;
+    }
+    if renew && let Some(g) = app.dma.global.take() {
+        app.dma.state.disable_global::<App>(&dh, &g);
+        app.dma.retired.push(g);
+    }
+    app.dma.feedback = built.is_ok();
+    let global = match built {
         Ok(feedback) => app.dma.state.create_global_with_default_feedback::<App>(&dh, &feedback),
         Err(e) => {
             // The table is a sealed memfd; without it clients still get the v3 format list (Mesa needs >= 3).
@@ -224,15 +312,16 @@ pub fn init(app: &mut App, comp: &dyn crate::render::Composer, handle: smithay::
     };
     app.dma.global = Some(global);
     eprintln!(
-        "bitscomp: dmabuf: zwp_linux_dmabuf_v1 for renderer {renderer}, main device {}:{} ({}), {} formats: {}{}",
+        "bitscomp: dmabuf: zwp_linux_dmabuf_v1 for renderer {renderer}, main device {}:{} ({shown}), {} formats: {}{}",
         libc::major(dev),
         libc::minor(dev),
-        node.as_deref().unwrap_or("no node"),
         formats.len(),
         names.join(" "),
         if more > 0 { format!(" and {more} more") } else { String::new() }
     );
-    app.dma.sync = crate::syncobj::Syncobj::start(&dh, node.as_deref(), handle);
+    if dev == 0 {
+        eprintln!("bitscomp: dmabuf: no main device: renderer {renderer} reads by CPU, a GPU client hands over a linear copy it can map");
+    }
 }
 
 impl App {
@@ -350,8 +439,22 @@ mod tests {
     }
 
     #[test]
-    fn main_device_is_a_render_node_number() {
-        let (dev, node) = main_device();
+    fn only_a_gpu_renderer_names_a_main_device() {
+        let rdev = libc::makedev(226, 128);
+        // Pixman and llvmpipe's GLES: no device, whatever the machine has. RADV then makes a copy they can map.
+        assert_eq!(advertised(true, false, rdev), 0);
+        assert_eq!((libc::major(0), libc::minor(0)), (0, 0));
+        // GLES on the chip imports RADV's VRAM images itself.
+        assert_eq!(advertised(false, false, rdev), rdev);
+        assert_eq!(advertised(true, true, rdev), rdev);
+        // What decides for GLES: the renderer string, so llvmpipe counts as CPU and radeonsi names the node (WY-17).
+        assert_eq!(advertised(software_gl("Mesa / llvmpipe (LLVM 20.1.8, 256 bits)"), false, rdev), 0);
+        assert_eq!(advertised(software_gl("AMD / AMD Radeon 780M Graphics (radeonsi, phoenix, LLVM 20.1.8, DRM 3.57)"), false, rdev), rdev);
+    }
+
+    #[test]
+    fn the_render_device_is_a_render_node_number() {
+        let (dev, node) = render_device();
         assert_eq!(libc::major(dev), 226);
         if node.is_none() {
             assert_eq!(libc::minor(dev), 128);

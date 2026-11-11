@@ -197,23 +197,133 @@ pub struct UnmapStats {
 /// (1 = PT, 2 = PD, 3 = PDPT) that end up empty are freed and their entry cleared; the kernel passes 3 so the
 /// PDPTs that every root shares stay. `f` sees each removed leaf; the caller flushes TLBs.
 pub fn unmap(t: &mut impl Tables, root: u64, virt: u64, len: u64, free_below: u32, f: &mut dyn FnMut(Unmapped)) -> Result<UnmapStats, MapError> {
+    let (lo, hi, high) = unmap_range(virt, len)?;
+    if lo == hi {
+        return Ok(UnmapStats::default());
+    }
+    check_partial(t, root, 4, 0, lo, hi)?;
+    let mut st = UnmapStats::default();
+    walk_unmap(t, root, 4, 0, lo, hi, high, free_below, f, &mut st);
+    Ok(st)
+}
+
+/// [lo, hi) of an unmap with the sign-extension bits cut off (walks use those) and the bits themselves, to add back
+/// for the callback. `lo == hi` for an empty range.
+fn unmap_range(virt: u64, len: u64) -> Result<(u64, u64, u64), MapError> {
     if virt & 0xFFF != 0 || len & 0xFFF != 0 {
         return Err(MapError::NotAligned);
     }
     let end = virt.checked_add(len).ok_or(MapError::NotAligned)?;
     if len == 0 {
-        return Ok(UnmapStats::default());
+        return Ok((0, 0, 0));
     }
     // Canonical addresses: walk with the sign-extension bits cut off, add them back for the callback.
     let high = virt & 0xFFFF_0000_0000_0000;
     if (end - 1) & 0xFFFF_0000_0000_0000 != high {
         return Err(MapError::NotAligned);
     }
-    let (lo, hi) = (virt & 0xFFFF_FFFF_FFFF, ((end - 1) & 0xFFFF_FFFF_FFFF) + 1);
-    check_partial(t, root, 4, 0, lo, hi)?;
-    let mut st = UnmapStats::default();
-    walk_unmap(t, root, 4, 0, lo, hi, high, free_below, f, &mut st);
-    Ok(st)
+    Ok((virt & 0xFFFF_FFFF_FFFF, ((end - 1) & 0xFFFF_FFFF_FFFF) + 1, high))
+}
+
+/// `unmap` of one range in short steps, so a lock can be let go between them (`kernel::unmap_kernel`): `check` once,
+/// `step` until `done`, then `finish`. A step ends at the next 2 MiB boundary, so it clears at most one page table; where
+/// the entries say nothing lies there (empty slots, a 1 GiB leaf) it runs on to the end of them, so a leaf comes off in one
+/// step and an empty stretch costs one step. Between the steps nothing but the owner of the range may change the range
+/// itself.
+pub(super) struct UnmapSlices {
+    start: u64,
+    next: u64,
+    hi: u64,
+    high: u64,
+}
+
+impl UnmapSlices {
+    pub(super) fn new(virt: u64, len: u64) -> Result<UnmapSlices, MapError> {
+        let (lo, hi, high) = unmap_range(virt, len)?;
+        Ok(UnmapSlices { start: lo, next: lo, hi, high })
+    }
+
+    pub(super) fn done(&self) -> bool {
+        self.next >= self.hi
+    }
+
+    /// The range lies inside one 2 MiB, so the first `step` takes all of it.
+    pub(super) fn one_step(&self) -> bool {
+        self.done() || self.start / span(2) == (self.hi - 1) / span(2)
+    }
+
+    /// `PartialHugePage` when a large leaf sticks out of the range, as `check_partial` says for the whole of it, but
+    /// in two short walks: a leaf that overlaps the range and sticks out holds its first or its last byte. A range of
+    /// 4 KiB leaves would otherwise cost a read per leaf here, in one piece.
+    pub(super) fn check(&self, t: &impl Tables, root: u64) -> Result<(), MapError> {
+        if self.done() {
+            return Ok(());
+        }
+        for at in [self.start, self.hi - 1] {
+            if let Some((s, sz)) = large_leaf_at(t, root, at) {
+                if s < self.start || s + sz > self.hi {
+                    return Err(MapError::PartialHugePage);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The next step: frees what it empties as far as `t.may_free` allows.
+    pub(super) fn step(&mut self, t: &mut impl Tables, root: u64, free_below: u32, f: &mut dyn FnMut(Unmapped), st: &mut UnmapStats) {
+        if self.done() {
+            return;
+        }
+        let end = step_end(t, root, self.next).min(self.hi);
+        walk_unmap(t, root, 4, 0, self.next, end, self.high, free_below, f, st);
+        self.next = end;
+    }
+
+    /// Walks the two ends of the range once more: the tables a `may_free` kept back there (they reach past the range)
+    /// are empty by now, and only they can be. Clears nothing, so it costs two paths through the tables.
+    pub(super) fn finish(&self, t: &mut impl Tables, root: u64, free_below: u32, st: &mut UnmapStats) {
+        if self.start >= self.hi {
+            return;
+        }
+        for at in [self.start, self.hi - 1] {
+            walk_unmap(t, root, 4, 0, at, at + 1, self.high, free_below, &mut |_| {}, st);
+        }
+    }
+}
+
+/// Start and size of the large leaf that holds `at`, if one does.
+fn large_leaf_at(t: &impl Tables, root: u64, at: u64) -> Option<(u64, u64)> {
+    let mut table = root;
+    for level in (2..=4).rev() {
+        let e = t.read(table, index(at, level));
+        if e & PageFlags::PRESENT == 0 {
+            return None;
+        }
+        if e & PageFlags::HUGE != 0 && level <= 3 {
+            return Some((at & !(span(level) - 1), span(level)));
+        }
+        table = e & ADDR_MASK;
+    }
+    None
+}
+
+/// Where the step that starts at `at` ends: see `UnmapSlices`.
+fn step_end(t: &impl Tables, root: u64, at: u64) -> u64 {
+    let end_of = |level| (at | (span(level) - 1)) + 1;
+    let top = t.read(root, index(at, 4));
+    if top & PageFlags::PRESENT == 0 {
+        return end_of(4);
+    }
+    let e = t.read(top & ADDR_MASK, index(at, 3));
+    if e & PageFlags::PRESENT == 0 || e & PageFlags::HUGE != 0 {
+        return end_of(3);
+    }
+    let pd = e & ADDR_MASK;
+    if t.read(pd, index(at, 2)) & PageFlags::PRESENT != 0 {
+        return end_of(2);
+    }
+    let free = (index(at, 2) + 1..512).take_while(|&i| t.read(pd, i) & PageFlags::PRESENT == 0).count() as u64;
+    end_of(2) + free * span(2)
 }
 
 fn check_partial(t: &impl Tables, table: u64, level: u32, base: u64, lo: u64, hi: u64) -> Result<(), MapError> {

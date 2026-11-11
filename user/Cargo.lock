@@ -23,6 +23,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitsdisk"
+version = "0.1.0"
+
+[[package]]
 name = "bitsinstall"
 version = "0.1.0"
 dependencies = [
@@ -70,6 +74,10 @@ dependencies = [
  "settingsd",
  "usys",
 ]
+
+[[package]]
+name = "blkbench"
+version = "0.1.0"
 
 [[package]]
 name = "block-buffer"
@@ -237,6 +245,13 @@ name = "procs"
 version = "0.1.0"
 dependencies = [
  "usys",
+]
+
+[[package]]
+name = "reaper"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

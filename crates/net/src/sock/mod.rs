@@ -479,7 +479,11 @@ pub(crate) enum Kind {
 pub struct SockFile {
     pub(crate) kind: Kind,
     released: AtomicBool,
+    /// `SOCK_INODE(sock)->i_ino`: programs find a connection's owner by it, from /proc/net/tcp to /proc/<pid>/fd.
+    ino: u64,
 }
+
+static NEXT_INO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(10000);
 
 /// Every socket by address, with its network namespace's key (NW-12: /proc/net picks a namespace's sockets
 /// without touching the others').
@@ -499,7 +503,8 @@ fn key_of<T: ?Sized>(a: &Arc<T>) -> usize {
 
 impl SockFile {
     pub(crate) fn new(kind: Kind) -> Result<Arc<SockFile>, Errno> {
-        let f = Arc::new(SockFile { kind, released: AtomicBool::new(false) });
+        let ino = NEXT_INO.fetch_add(1, Ordering::Relaxed);
+        let f = Arc::new(SockFile { kind, released: AtomicBool::new(false), ino });
         let key = key_of(&f);
         // The socket's own small allocations (this `Arc`, the table node) are infallible like every other small
         // kernel object; R2's ENOMEM applies to what a program sizes (queues and buffers, `buffer`). The table
@@ -510,10 +515,29 @@ impl SockFile {
         Ok(f)
     }
 
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+
     /// NW-12: the open sockets of network namespace `net` (for /proc/net), in table order.
     pub(crate) fn all_in(net: &crate::netns::Net) -> Vec<Arc<SockFile>> {
         let nk = net_key(net);
-        let all: Vec<Arc<SockFile>> = TABLE.read().values().filter(|(_, k)| *k == nk).filter_map(|(w, _)| w.upgrade()).collect();
+        // The list's memory is made with the table's lock dropped (`unix::fill`'s reason); a table that grew
+        // meanwhile asks again.
+        let mut all: Vec<Arc<SockFile>> = Vec::new();
+        loop {
+            let want = {
+                let t = TABLE.read();
+                let mine = || t.values().filter(|(_, k)| *k == nk);
+                let n = mine().count();
+                if n <= all.capacity() {
+                    all.extend(mine().filter_map(|(w, _)| w.upgrade()));
+                    break;
+                }
+                n
+            };
+            all.reserve_exact(want);
+        }
         // Dropped outside the table's lock: a socket closed meanwhile is released here (`SockFile`'s drop).
         all.into_iter().filter(|f| !f.released.load(Ordering::Acquire) && crate::netns::same(f.net(), net)).collect()
     }
@@ -622,6 +646,12 @@ impl File for SockFile {
     }
     fn mode(&self) -> u32 {
         vfs::abi::S_IFSOCK | 0o777
+    }
+    fn attr(&self) -> Option<vfs::abi::Attr> {
+        Some(vfs::abi::Attr { ino: self.ino, mode: self.mode(), nlink: 1, blksize: 4096, uid: 1000, gid: 1000, ..Default::default() })
+    }
+    fn link_name(&self) -> Option<alloc::string::String> {
+        Some(alloc::format!("socket:[{}]", self.ino))
     }
     fn events(&self) -> Events {
         Events(self.events_now())

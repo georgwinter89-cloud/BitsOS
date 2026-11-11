@@ -6,7 +6,7 @@
 //!   renderers fault its 328 MB binary; the next such file is read with read() in 4 KiB pieces. The stick
 //!   disk's read bytes (`usb.msd.read_bytes` on the Mini-PC) grow by at most 1.2 x the bytes that were not
 //!   cached; a warm pass over both files reads (almost) nothing. A rerun picks files still cold; when every
-//!   big file is cached already it skips (reboot for a cold measurement).
+//!   big file is cached already it fails (reboot for a cold measurement).
 
 use alloc::format;
 use alloc::string::String;
@@ -79,7 +79,7 @@ fn fault_all(map: Arc<vfs::mmap::FileMap>, n: u64, order: impl Fn(u64) -> u64) -
 fn fat_cold() -> TestResult {
     if crate::stick::wait_mounted(40_000).is_none() {
         klog::event!(Info, "fat", "ktest.cold_skipped", reason = "no boot stick mounted");
-        return ktest::skip("no boot stick mounted");
+        return ktest::fail("no boot stick mounted");
     }
     let disk = block::disks().into_iter().find(|d| d.kind() == block::DiskKind::Usb && d.stick() == block::StickMatch::Yes);
     kassert!(disk.is_some(), "no USB disk matches the stick");
@@ -88,7 +88,7 @@ fn fat_cold() -> TestResult {
     let Some((exe_path, exe_size, exe_cached)) = cands.first().cloned() else {
         klog::event!(Info, "fat", "ktest.cold_skipped", reason = "no cold file", files_1_512mib = seen;
             "every file of 1..512 MiB on the stick is cached: run the test right after a reboot");
-        return ktest::skip("no cold file of 1..512 MiB on the stick (all cached: reboot for a cold measurement)");
+        return ktest::fail("no cold file of 1..512 MiB on the stick (all cached: reboot for a cold measurement)");
     };
     let c = Ctx::kernel(&ns);
     let exe = c.open(None, exe_path.as_bytes(), O_RDONLY, 0).map_err(|x| format!("{exe_path}: {x}"))?;

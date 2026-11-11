@@ -10,15 +10,18 @@
 # MCP's `ktest` runs nw.stack.fetch_parallel (64 downloads at once against stack_server.py, every SHA-256 checked)
 # while MCP is asked every 200 ms.
 set -eu
+export BITSOS_KTEST_RUN=nw/60-sockets,nw/30-stack # its MCP step runs nw.stack.fetch_parallel too
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/nw-60-sockets}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 HERE="$(pwd)/host/tests/nw"
-HTTP_PORT=24560     # stack_server.py (UDP echo +1, TCP echo +2), the guest's 10.0.2.2
-LAN_PORT=24570      # k3_lan.py
-QEMU_PORT=24571     # QEMU's end of the dgram cable
-FWD=24572           # host -> guest MCP
+PORTS=$(python3 -I "$HERE/ports.py" 7)
+HTTP_PORT=$PORTS            # stack_server.py (UDP echo +1, TCP echo +2), the guest's 10.0.2.2
+LAN_PORT=$((PORTS + 3))     # k3_lan.py
+QEMU_PORT=$((PORTS + 4))    # QEMU's end of the dgram cable
+FWD=$((PORTS + 5))          # host -> guest MCP
+SERVER_FWD=$((PORTS + 6))   # stack_server.py's unused inbound partner
 TOKEN="nw5-sockets-token-7a2d"
 BOOT_LINE="BdsDxe: loading"
 
@@ -46,7 +49,7 @@ wait_line() { # $1 = pattern, $2 = file, $3 = seconds
 
 head -c $((16 * 1024 * 1024)) /dev/urandom > "$RUN_DIR/file.bin"
 rm -f "$RUN_DIR/http.log" "$RUN_DIR/lan.log"
-python3 -I "$HERE/stack_server.py" "$HTTP_PORT" "$RUN_DIR/file.bin" 24579 "$RUN_DIR" &
+python3 -I "$HERE/stack_server.py" "$HTTP_PORT" "$RUN_DIR/file.bin" "$SERVER_FWD" "$RUN_DIR" &
 SPID=$!
 python3 -I "$HERE/k3_lan.py" "$LAN_PORT" "$QEMU_PORT" "$RUN_DIR/lan.log" &
 LPID=$!
@@ -54,6 +57,11 @@ for _ in $(seq 1 50); do
     python3 -I -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$HTTP_PORT" 2>/dev/null && break
     sleep 0.1
 done
+
+# A partner that lost its bind ends at once; the guest must not go on against someone else's.
+sleep 0.5
+kill -0 "$SPID" 2>/dev/null || red "stack_server.py did not start (port $HTTP_PORT taken?)"
+kill -0 "$LPID" 2>/dev/null || red "k3_lan.py did not start (port $LAN_PORT taken?)"
 
 ktest_boot() { # $1 = card, $2 = with the fake LAN (yes|no)
     local card="$1" lan="$2" log="$RUN_DIR/ktest-$1.log" extra=()
@@ -64,6 +72,7 @@ ktest_boot() { # $1 = card, $2 = with the fake LAN (yes|no)
         extra=(-netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$QEMU_PORT,remote.type=inet,remote.host=127.0.0.1,remote.port=$LAN_PORT"
                -device "virtio-net-pci,netdev=lan,mac=52:54:00:4e:57:35")
     fi
+    [ "$lan" = yes ] || cfg="${cfg/ktest=nw.sock;/ktest=nw.sock,-nw.sock.k3_lan;}"
     cargo xtask image --name "$NAME" --ktest --config-extra "$cfg"
     for attempt in 1 2; do
         rm -f "$log"
@@ -82,11 +91,6 @@ ktest_boot() { # $1 = card, $2 = with the fake LAN (yes|no)
     [ "$lan" = yes ] && want="$want k3_lan"
     for t in $want; do grep -aq "KTEST ok nw.sock.$t " "$log" || red "$card: nw.sock.$t did not pass"; done
     if grep -a "KTEST \(FAIL\|PANIC\)" "$log"; then red "$card: a test failed"; fi
-    if [ "$lan" = no ]; then
-        grep -a "KTEST skip" "$log" | grep -v "nw.sock.k3_lan" && red "$card: a test skipped"
-    elif grep -aq "KTEST skip" "$log"; then
-        red "$card: a test skipped"
-    fi
     true
 }
 

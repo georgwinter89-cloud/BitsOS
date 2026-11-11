@@ -421,7 +421,7 @@ if command -v foot >/dev/null; then
     [ "$(px)" = "27 37 32" ] || fail "the new foot did not switch back to dark: $(px)"
     kill -0 "$FPID2" || fail "the new foot ended at the switch back"
 else
-    echo "SKIP foot part: foot is not installed"
+    fail "foot is not installed (no test is skipped, Georg 30.10.)"
 fi
 
 echo "PASS: settings page (references, swatch, hex, choice, switch, scale, favourites, undo, own undo only, jump, schema rows: kernel.snd_output hdmi, number step and range, WY-10 confirm dialog: cancel, Esc, early Enter, page clear, Ändern, typed, undo; offline), foot colours"

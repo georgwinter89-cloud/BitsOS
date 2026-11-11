@@ -263,13 +263,26 @@ impl Fake {
 
     fn store(&self, frames: impl Iterator<Item = [i16; 2]>) {
         let cap = self.cap.load(Ordering::Acquire).max(1) as usize;
-        let mut q = self.q.lock();
+        // The ring gets its whole length with the lock dropped (see `ksync::spare`), once; without the memory
+        // it takes what fits.
+        let mut spare = ksync::Spare::new();
+        let mut q = loop {
+            let mut q = self.q.lock();
+            let missing = cap.saturating_sub(q.len());
+            if spare.fits(&mut *q, missing) {
+                break q;
+            }
+            drop(q);
+            if spare.grow().is_err() {
+                break self.q.lock();
+            }
+        };
         for f in frames {
             if q.len() >= cap {
                 q.pop_front();
                 self.overruns.fetch_add(1, Ordering::AcqRel);
             }
-            if q.try_reserve(1).is_err() {
+            if q.len() == q.capacity() {
                 break;
             }
             q.push_back(f);

@@ -15,11 +15,11 @@ use ktest::{kassert, ktest};
 
 type R = ktest::TestResult;
 
-ktest!("pc.enable.bridges", QemuOnly, enable_bridges);
-ktest!("pc.enable.wake", QemuOnly, enable_wake);
-ktest!("pc.enable.msi_stale", QemuOnly, enable_msi_stale);
-ktest!("pc.enable.restore", QemuOnly, enable_restore);
-ktest!("pc.enable.refused", Safe, enable_refused);
+ktest!("pc.enable.bridges", Run("pc/20-enable"), enable_bridges);
+ktest!("pc.enable.wake", Run("pc/20-enable"), enable_wake);
+ktest!("pc.enable.msi_stale", Run("pc/20-enable"), enable_msi_stale);
+ktest!("pc.enable.restore", Run("pc/20-enable"), enable_restore);
+ktest!("pc.enable.refused", QemuAll, enable_refused);
 ktest!("pc.enable.dma_path", Safe, enable_dma_path);
 
 const IGB: (u16, u16) = (0x8086, 0x10C9);
@@ -53,7 +53,7 @@ fn has_field(text: &str, key: &str, value: &str) -> bool {
 fn enable_bridges() -> R {
     let targets: Vec<Node> = spare(&[PCI_TESTDEV, E1000E, IGB]).into_iter().filter(|n| n.parent.is_some()).collect();
     if targets.is_empty() {
-        return ktest::skip("no driverless e1000e, igb or pci-testdev behind a bridge (host/tests/pc/20-enable.sh adds them)");
+        return ktest::fail("no driverless e1000e, igb or pci-testdev behind a bridge (host/tests/pc/20-enable.sh adds them)");
     }
     for n in targets {
         let f = n.function();
@@ -136,7 +136,7 @@ fn enable_wake() -> R {
         f.set_command(orig);
     }
     if tried == 0 {
-        return ktest::skip("no test device whose PMCSR accepts D3hot");
+        return ktest::fail("no test device whose PMCSR accepts D3hot");
     }
     Ok(())
 }
@@ -144,7 +144,7 @@ fn enable_wake() -> R {
 /// MSI and MSI-X enables left on (as a previous kernel would) are cleared by `enable_device`; bus master
 /// stays off throughout, so nothing can be delivered.
 fn enable_msi_stale() -> R {
-    let Some(n) = spare(&[E1000E, IGB]).into_iter().next() else { return ktest::skip("no driverless e1000e or igb (host/tests/pc/20-enable.sh adds one)") };
+    let Some(n) = spare(&[E1000E, IGB]).into_iter().next() else { return ktest::fail("no driverless e1000e or igb (host/tests/pc/20-enable.sh adds one)") };
     let f = n.function();
     let fname = format!("{}", n.loc);
     let orig = f.command();
@@ -162,7 +162,7 @@ fn enable_msi_stale() -> R {
     }
     if set == 0 {
         f.set_command(orig);
-        return ktest::skip("test card without MSI/MSI-X capability");
+        return ktest::fail("test card without MSI/MSI-X capability");
     }
     let seq = klog::next_seq();
     let r = f.enable_device(false).map_err(|e| format!("{fname}: {e}"))?;
@@ -193,7 +193,7 @@ fn enable_msi_stale() -> R {
 /// the scan saw it, the command register as after the enable, each dword logged.
 fn enable_restore() -> R {
     let Some(n) = spare(&[E1000E, IGB, PCI_TESTDEV]).into_iter().find(|n| n.bars.is_some_and(|b| matches!(b[0], Some(Bar::Mem { .. })))) else {
-        return ktest::skip("no test device with a memory BAR0");
+        return ktest::fail("no test device with a memory BAR0");
     };
     let f = n.function();
     let fname = format!("{}", n.loc);
@@ -243,7 +243,7 @@ fn enable_refused() -> R {
         checked += 1;
     }
     if checked == 0 {
-        return ktest::skip("no untouched test function and no mass storage");
+        return ktest::fail("no untouched test function and no mass storage");
     }
     Ok(())
 }
@@ -253,7 +253,7 @@ fn enable_refused() -> R {
 fn enable_dma_path() -> R {
     let locs = crate::dma_enabled();
     if locs.is_empty() {
-        return ktest::skip("no function enabled for DMA yet");
+        return ktest::fail("no function enabled for DMA yet");
     }
     let devs = crate::devices();
     for at in locs {

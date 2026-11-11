@@ -13,6 +13,11 @@ TREE=$1 BIN=$2 GPU_ROOT=${3:-/boot/BITSOS2/mesa}
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 ROOT=$PWD
 STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$STAGE" ]; then
+    # A worktree has no out/: the manifest's `tree mesa`, as dr/20 does; an empty answer keeps the path above.
+    _m=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' "$ROOT/user/packaging/manifest.txt")
+    [ -z "$_m" ] || STAGE=$_m
+fi
 [ -f "$STAGE/lib/ld-linux-x86-64.so.2" ] || { echo "RED: no staged Mesa in $STAGE (bash user/ports/mesa/scripts/stage-v2.sh)"; exit 1; }
 # WY_GPU_NESTED=1: the gpu build with the `nested` feature too (the host scenarios' test paths, e.g. `ctl phys`).
 FEAT=gpu TD=${CARGO_TARGET_DIR:-$ROOT/target}/wy-gpu

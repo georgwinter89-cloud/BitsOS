@@ -156,7 +156,7 @@ fn read_test() -> TestResult {
     kassert!(settle(), "USB did not settle");
     let disks = ready_disks();
     if disks.is_empty() {
-        return ktest::skip("no USB disk with a medium");
+        return ktest::fail("no USB disk with a medium");
     }
     for d in disks {
         read_one(&d)?;
@@ -272,11 +272,11 @@ fn write_test() -> TestResult {
     }
     klog::event!(Info, "usb", "ktest.msd_write", written = wrote, refused = refused);
     if wrote + refused == 0 {
-        return ktest::skip("no writable scratch disk and no read-only disk");
+        return ktest::fail("no writable scratch disk and no read-only disk");
     }
     Ok(())
 }
-ktest!("us.msd.write", QemuOnly, write_test);
+ktest!("us.msd.write", Run("us/50-msd"), write_test);
 
 // ---- us.msd.sense
 
@@ -291,7 +291,7 @@ fn resets(d: &UsbDisk) -> u64 {
 
 fn sense_test() -> TestResult {
     kassert!(settle(), "USB did not settle");
-    let Some(d) = pick() else { return ktest::skip("no USB disk with a medium") };
+    let Some(d) = pick() else { return ktest::fail("no USB disk with a medium") };
     let info = d.info();
     let r0 = resets(&d);
     if info.blocks < 0xFFFF_FFFF {
@@ -314,7 +314,7 @@ ktest!("us.msd.sense", QemuOnly, sense_test);
 
 fn reset_test() -> TestResult {
     kassert!(settle(), "USB did not settle");
-    let Some(d) = pick() else { return ktest::skip("no USB disk with a medium") };
+    let Some(d) = pick() else { return ktest::fail("no USB disk with a medium") };
     let bs = d.info().block_size as usize;
     let before = read(&d, 0, 64 * bs)?;
     let r0 = resets(&d);
@@ -353,15 +353,15 @@ fn luns_test() -> TestResult {
         klog::event!(Info, "usb", "ktest.msd_luns", device = s.path.clone(), luns = format!("{ids:?}"));
         return Ok(());
     }
-    ktest::skip("no device with several LUNs (scenario: usb-bot with two scsi-hd)")
+    ktest::fail("no device with several LUNs (scenario: usb-bot with two scsi-hd)")
 }
-ktest!("us.msd.luns", QemuOnly, luns_test);
+ktest!("us.msd.luns", Run("us/50-msd"), luns_test);
 
 // ---- us.msd.unplug
 
 fn unplug_test() -> TestResult {
     if !pci::registry::opted_in("usb_msd_unplug_test") {
-        return ktest::skip("scenario only: host/tests/us/50-msd.sh pulls the device (usb_msd_unplug_test=on)");
+        return ktest::fail("scenario only: host/tests/us/50-msd.sh pulls the device (usb_msd_unplug_test=on)");
     }
     kassert!(settle(), "USB did not settle");
     let d = ready_disks().into_iter().find(|d| header(d).is_some_and(|h| h.flags & F_UNPLUG != 0)).ok_or("no unplug disk")?;
@@ -396,13 +396,13 @@ fn unplug_test() -> TestResult {
     kassert!(d.flush() == Err(DevError::Gone));
     Ok(())
 }
-ktest!("us.msd.unplug", QemuOnly, unplug_test);
+ktest!("us.msd.unplug", Run("us/50-msd"), unplug_test);
 
 // ---- us.msd.medium
 
 fn medium_test() -> TestResult {
     if !pci::registry::opted_in("usb_msd_medium_test") {
-        return ktest::skip("scenario only: host/tests/us/50-msd.sh ejects and changes the medium (usb_msd_medium_test=on)");
+        return ktest::fail("scenario only: host/tests/us/50-msd.sh ejects and changes the medium (usb_msd_medium_test=on)");
     }
     kassert!(settle(), "USB did not settle");
     let d = ready_disks().into_iter().find(|d| header(d).is_some_and(|h| h.flags & F_MEDIUM != 0)).ok_or("no medium-change disk")?;
@@ -439,4 +439,4 @@ fn medium_test() -> TestResult {
         generation = d.generation());
     Ok(())
 }
-ktest!("us.msd.medium", QemuOnly, medium_test);
+ktest!("us.msd.medium", Run("us/50-msd"), medium_test);

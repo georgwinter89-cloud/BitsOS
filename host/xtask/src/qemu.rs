@@ -30,6 +30,9 @@ pub struct QemuOpts {
     pub echo: bool,
     /// Extra boots when OVMF stalls before bitsboot runs (the usb-storage flake on the Gaming-PC).
     pub boot_retries: u32,
+    /// `--boot nvme`: the stick stays plugged in without a boot index, an NVMe device among the extra arguments
+    /// carries `bootindex=0` (bitsboot from an NVMe ESP, NV's boot scenario).
+    pub boot_nvme: bool,
 }
 
 impl QemuOpts {
@@ -37,6 +40,7 @@ impl QemuOpts {
         QemuOpts {
             name: name.into(), smp: 2, mem: "2G".into(), net: "none".into(), hostfwd: vec![], res: None,
             display: "none".into(), timeout: 60, serial_log: None, extra: vec![], echo: true, boot_retries: 3,
+            boot_nvme: false,
         }
     }
 
@@ -57,6 +61,11 @@ impl QemuOpts {
         if let Some(v) = a.num("--timeout")? { o.timeout = v; }
         if let Some(v) = a.num("--boot-retries")? { o.boot_retries = v; }
         o.serial_log = a.value("--serial-log")?.map(PathBuf::from);
+        match a.value("--boot")?.as_deref() {
+            None | Some("stick") => {}
+            Some("nvme") => o.boot_nvme = true,
+            Some(other) => return Err(format!("--boot {other}: want stick|nvme")),
+        }
         o.extra = a.extra.clone();
         Ok(o)
     }
@@ -84,7 +93,14 @@ pub fn assemble(root: &Path, lane: &str, o: &QemuOpts, vars: &Path, img: &Path, 
     add(&["-drive", &format!("if=pflash,format=raw,file={}", vars.display())]);
     add(&["-device", "qemu-xhci,id=xhci"]);
     add(&["-drive", &format!("if=none,id=stick,format=raw,file={}", img.display())]);
-    add(&["-device", "usb-storage,bus=xhci.0,drive=stick,removable=on,bootindex=0"]);
+    if o.boot_nvme {
+        if !o.extra.iter().any(|x| x.starts_with("nvme,") && x.contains("bootindex=0")) {
+            return Err("--boot nvme needs an NVMe -device with bootindex=0 among the extra arguments".into());
+        }
+        add(&["-device", "usb-storage,bus=xhci.0,drive=stick,removable=on"]);
+    } else {
+        add(&["-device", "usb-storage,bus=xhci.0,drive=stick,removable=on,bootindex=0"]);
+    }
     add(&["-serial", &format!("file:{}", log.display())]);
     add(&["-monitor", "none"]);
     match o.display.as_str() {
@@ -144,6 +160,8 @@ pub fn run(root: &Path, o: &QemuOpts) -> Result<RunResult, String> {
             if r.stalled {
                 eprintln!("xtask: firmware stall on every try ({} boots): no `bitsboot:` line in {}", attempt + 1, log.display());
             }
+            // TS-1: whoever started this boot, the gate's ledger gets to see which tests it ran.
+            crate::ledger::record_boot(root, &o.name, &String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default()));
             return Ok(RunResult { exit: r.exit, timed_out: r.timed_out, log });
         }
         attempt += 1;
@@ -362,6 +380,18 @@ mod tests {
         assert_eq!(stall_secs(16, 2.0), 146, "twice as many runnable tasks as CPUs");
         assert_eq!(stall_secs(16, 50.0), 219, "at most three times");
         assert_eq!(stall_secs(4, f64::NAN), 37);
+    }
+
+    #[test]
+    fn boot_from_nvme_keeps_the_stick_without_a_boot_index() {
+        let (root, vars, img, log) = (Path::new("/w"), Path::new("/w/v.fd"), Path::new("/w/s.img"), Path::new("/w/l"));
+        let stick = |o: &QemuOpts| assemble(root, "nv", o, vars, img, log).map(|a| a.into_iter().find(|x| x.starts_with("usb-storage")));
+        let mut o = QemuOpts::new("t");
+        assert_eq!(stick(&o).unwrap().as_deref(), Some("usb-storage,bus=xhci.0,drive=stick,removable=on,bootindex=0"));
+        o.boot_nvme = true;
+        assert!(stick(&o).is_err(), "no NVMe device to boot");
+        o.extra = ["-device", "nvme,id=n0,serial=x,drive=nv0,bootindex=0"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(stick(&o).unwrap().as_deref(), Some("usb-storage,bus=xhci.0,drive=stick,removable=on"));
     }
 
     #[test]

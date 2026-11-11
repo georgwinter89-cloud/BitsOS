@@ -50,3 +50,4 @@ if [ -e "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
 mv "$NEW" "$DEST"
 rm -rf "$DEST.old"
 echo "stage-v2: $DEST: $(find "$DEST" -type f | wc -l) files, $(du -sm "$DEST" | cut -f1) MB"
+echo "stage-v2: not for the stick as it is, it has no PKGLIST.TXT: V2_STICK_TREES=cobalt cargo xtask image --name cobalt-tree, then push target/xtask/esp-cobalt-tree/BITSOS2/cobalt (host/tests/minipc/README.md)"

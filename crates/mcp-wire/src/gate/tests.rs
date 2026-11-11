@@ -89,6 +89,9 @@ fn offer_table() {
     }
     assert_eq!(known_dropped("run"), Some(WHY_PROCESSES));
     assert_eq!(known_dropped("sched"), Some(WHY_OTHER));
+    // NV-2p: the one copy to the SSD as root needs a live full-access grant.
+    assert_eq!(known_dropped("data_move"), Some(WHY_DEVICES));
+    assert_eq!(offer_for("data_move", true), Offer::Gate);
     assert_eq!(known_dropped("hw_info"), None);
     assert_eq!(known_dropped("typo_tool"), None);
     let args = Json::parse(r#"{"pid":1}"#).unwrap();

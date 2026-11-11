@@ -1,0 +1,5 @@
+GFX job that never ends = -ETIME
+the context's QUERY_STATE2 = 0
+  flags: reset 1 guilty 1
+a new context's CS on another ring = 0
+done

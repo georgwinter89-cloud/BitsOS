@@ -2,7 +2,9 @@
 //! map shape, built in the kernel with heap-held tables). The heap's own ktests are in `heap_ktest`.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ktest::{kassert, ktest, TestResult};
 use mm_core::map::{normalize, MapRange, RangeUse, LOW_RESERVED};
 use mm_core::{boot_buddy, Buddy, BuddyFrames, FrameAlloc, Kind, Storage, Zone, MAX_ORDER, PAGE};
@@ -129,6 +131,71 @@ fn cycles() -> TestResult {
     sched::run_exclusive(10_000_000_000, cycles_quiet).map_err(|e| alloc::format!("{e:?}"))?
 }
 
+/// One allocate-and-free round after another until `stop`, in orders the per-CPU lists and the buddy lists both serve.
+fn churn(b: &'static Buddy, stop: &AtomicBool, rounds: &AtomicU64) {
+    let mut held = [(0u64, 0u32); 8];
+    while !stop.load(Ordering::Relaxed) {
+        let mut n = 0;
+        for order in [0, 0, 0, 1, 0, 2, 0, 3] {
+            if let Some(p) = b.alloc(order, Zone::Normal, Kind::Other) {
+                held[n] = (p, order);
+                n += 1;
+            }
+        }
+        for &(p, o) in &held[..n] {
+            b.free(p, o, Kind::Other);
+        }
+        rounds.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `check` holds the other CPUs wherever they are: a thread stopped in the middle of an allocation or a free must not
+/// read as a disagreement (a block's state, `used` and its list move together, INT-W30: the first gate's red
+/// `mm.frames.all_orders`, "allocated blocks disagree with used_by_kind").
+fn check_under_load() -> TestResult {
+    let b = buddy()?;
+    sched::wait_cpus_online(5_000_000_000);
+    let me = sched::current_cpu();
+    let others: Vec<usize> = (0..hal::percpu::cpu_count()).filter(|&c| c != me).collect();
+    if others.is_empty() {
+        return ktest::fail("needs a second CPU to allocate while the first checks");
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let rounds = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::new();
+    for &cpu in &others {
+        let (s, r) = (stop.clone(), rounds.clone());
+        let opts = sched::SpawnOpts { cpu: Some(cpu), pin: true, rt_prio: sched::RT_PRIO_DEFAULT };
+        threads.push(sched::spawn_with("mm-frames-churn", sched::Class::Normal, opts, move || churn(b, &s, &r)).map_err(|e| alloc::format!("spawn: {e:?}"))?);
+    }
+    let mut out = Ok(());
+    for round in 0..12 {
+        sched::sleep_ns(10_000_000);
+        match sched::run_exclusive(10_000_000_000, || b.check()) {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => {
+                out = Err(alloc::format!("round {round}: {why}"));
+                break;
+            }
+            Err(e) => {
+                out = Err(alloc::format!("round {round}: {e:?}"));
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::Release);
+    for t in threads {
+        kassert!(t.join_timeout(30_000_000_000), "an allocating thread did not finish in 30 s");
+    }
+    sched::reap();
+    klog::event!(Info, "mm", "ktest.frames_check_under_load", cpus = others.len(), rounds = rounds.load(Ordering::Relaxed));
+    out?;
+    kassert!(rounds.load(Ordering::Relaxed) > 0, "the other CPUs allocated nothing");
+    Ok(())
+}
+// Not on the machine: holding every CPU for seconds timed out the boot stick's transfers there (3.11., W30 round).
+ktest!("mm.frames.check_under_load", QemuAll, check_under_load);
+
 fn cycles_quiet() -> TestResult {
     let b = buddy()?;
     let mut live: Vec<(u64, u32)> = Vec::with_capacity(4096);
@@ -142,6 +209,7 @@ fn cycles_quiet() -> TestResult {
         x ^= x << 17;
         x % n
     };
+    let t0 = time::now_ns();
     for _ in 0..20_000 {
         if live.is_empty() || (live.len() < 4096 && rnd(2) == 0) {
             let order = if rnd(3) == 0 { rnd(7) as u32 } else { 0 };
@@ -154,6 +222,7 @@ fn cycles_quiet() -> TestResult {
             b.free(p, o, Kind::Other);
         }
     }
+    klog::event!(Info, "mm", "ktest.frames_cycles", ops = 20_000u64, ns = time::now_ns() - t0);
     sorted.extend_from_slice(&live);
     sorted.sort_unstable();
     for w in sorted.windows(2) {
@@ -192,7 +261,7 @@ ktest!("mm.frames.dma32_below_4g", Safe, dma32_below_4g);
 fn normal_above_4g() -> TestResult {
     let b = buddy()?;
     if b.zone_info(1).managed_frames == 0 {
-        return ktest::skip("no RAM above 4 GiB (QEMU -m below ~3.5G); host/tests/mm runs this with 6G");
+        return ktest::fail("no RAM above 4 GiB (QEMU -m below ~3.5G); host/tests/mm runs this with 6G");
     }
     for order in [0, 9] {
         let p = b.alloc(order, Zone::Normal, Kind::Other).ok_or("NORMAL allocation failed")?;
@@ -201,7 +270,7 @@ fn normal_above_4g() -> TestResult {
     }
     Ok(())
 }
-ktest!("mm.frames.normal_above_4g", Safe, normal_above_4g);
+ktest!("mm.frames.normal_above_4g", RunHw("mm/10-frames-sizes"), normal_above_4g);
 
 fn pcp_drain() -> TestResult {
     // SC-3: other CPUs allocate concurrently; the counters are compared with them held (sched::run_exclusive).

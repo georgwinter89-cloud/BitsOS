@@ -46,4 +46,6 @@ check "$RUN/reboot-events.txt" '"event": "RESET".*"reason": "guest-reset"' "rebo
 check "$RUN/reboot.log" 'power reboot.step n=1 method="FADT reset register I/O 0xcf9' "reboot: the FADT reset register first"
 n=$(grep -ac 'kernel start' "$RUN/reboot.log" || true)
 if [ "${n:-0}" -ge 2 ]; then echo "ok   reboot: the machine came back ($n kernel starts)"; else echo "FAIL reboot: $n kernel start(s), wanted 2"; fail=1; fi
+# TS-1: this test ends the boot (or answers over MCP), so it prints no `KTEST ok` on the serial line: the ledger reads it here.
+[ "$fail" != 0 ] || echo "KTEST ok cp.power.qemu_action (checked by this script)" >> "$RUN/ledger.txt"
 exit $fail

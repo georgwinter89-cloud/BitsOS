@@ -19,6 +19,9 @@ use vfs::Errno;
 /// group. The group's current image is used, not the one the loop held (an execve may have just replaced it).
 pub(crate) fn thread_ends(t: &Arc<Thread>) {
     let g = t.group();
+    // `exit_sem` and `exit_shm` of `do_exit`: before anyone can see the group finished (a parent's wait sees the undo
+    // done, as on Linux).
+    crate::ipc::thread_exit(t);
     // SC-6: off the live list first, then the time goes to the group (a reader never counts it twice; see
     // `Group::cpu_times`), before anyone can collect the group.
     let (last, cld) = g.remove_thread(t);

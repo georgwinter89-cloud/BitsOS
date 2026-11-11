@@ -6,7 +6,7 @@
 //! - `data_boot` (Safe, RAM): the boot steps (`data::bring_up`) on a tmpfs "stick" of a private view: a
 //!   leftover `.new` removed before the room check, the image made and mounted, mounted again (not remade),
 //!   then mounted read-only as on a read-only stick without a byte of the image changing (rerunnable).
-//! - `data` (Safe, reads only): the boot mount of `\BITSOS2\data.img` at /data (skip when there is none):
+//! - `data` (Safe, reads only): the boot mount of `\BITSOS2\data.img` at /data (a failure when there is none):
 //!   ext4 type, rw/ro as the stick, the user folders' owners, the mount's source (/proc/mounts' first field).
 //! - `data_write` (QemuOnly): files, a symlink lock, rename over and fsync in /data/ktest-fs8c; a counter
 //!   file there counts the boots that wrote it (host/tests/fs/50-data.sh checks 1, then 2), then
@@ -87,7 +87,10 @@ fn fs_ext4_mkfs() -> TestResult {
     drop(ns);
     drop(v);
     let ns2 = vfs::MountNs::new_empty();
-    mount::mount_dev(Arc::new(MemDev::new(dev.image())), None, &ns2, "/x", Options::default()).map_err(e)?;
+    // Moved, not copied when the volume let go of it: 48 MB in one piece may not be there after the memory-filling
+    // QemuOnly tests of this run.
+    let img = Arc::try_unwrap(dev).map(MemDev::into_image).unwrap_or_else(|d| d.image());
+    mount::mount_dev(Arc::new(MemDev::new(img)), None, &ns2, "/x", Options::default()).map_err(e)?;
     check(&ns2, "/x", ino)?;
     klog::event!(Info, "ext4", "ktest.mkfs", blocks = made.blocks, groups = made.groups, journal = made.journal_blocks);
     Ok(())
@@ -185,10 +188,10 @@ ktest!("fs.ext4.data_boot", Safe, fs_ext4_data_boot);
 fn boot_mount() -> Result<(bool, bool, bool), TestResult> {
     match data::wait_done(120_000) {
         Phase::Mounted { pool, writable, created } => Ok((pool, writable, created)),
-        Phase::Skipped(why) => Err(ktest::skip(why)),
+        Phase::Skipped(why) => Err(ktest::fail(why)),
         Phase::Failed(why) => Err(Err(format!("/data not mounted: {why}"))),
         // A first boot on a real stick zero-fills 2 GiB for minutes: not a failure of this test.
-        Phase::Creating => Err(ktest::skip("data.img is still being made (see the ext4 data.grow events)")),
+        Phase::Creating => Err(ktest::fail("data.img is still being made (see the ext4 data.grow events)")),
         Phase::Waiting => Err(Err(String::from("/data: still waiting for the boot stick after 120 s"))),
     }
 }
@@ -221,7 +224,7 @@ fn fs_ext4_data() -> TestResult {
     klog::event!(Info, "ext4", "ktest.data", pool = pool, writable = writable, created = created, free_blocks = st.bfree, source = source.as_str());
     Ok(())
 }
-ktest!("fs.ext4.data", Safe, fs_ext4_data);
+ktest!("fs.ext4.data", RunHw("fs/50-data"), fs_ext4_data);
 
 fn fs_ext4_data_write() -> TestResult {
     let (_, writable, created) = match boot_mount() {
@@ -229,7 +232,7 @@ fn fs_ext4_data_write() -> TestResult {
         Err(r) => return r,
     };
     if !writable {
-        return ktest::skip("/data is read-only (the stick is)");
+        return ktest::fail("/data is read-only (the stick is)");
     }
     let ns = vfs::root_ns();
     let c = Ctx::kernel(&ns);
@@ -251,4 +254,4 @@ fn fs_ext4_data_write() -> TestResult {
     klog::event!(Info, "ext4", "ktest.data_write", boots = boots, created = created);
     Ok(())
 }
-ktest!("fs.ext4.data_write", QemuOnly, fs_ext4_data_write);
+ktest!("fs.ext4.data_write", Run("fs/50-data"), fs_ext4_data_write);

@@ -153,8 +153,9 @@ impl State {
             self.set_free(tx, fb, fi);
             return Ok((self.geo.group_start(g) + first, len));
         }
-        if self.jnl.as_ref().is_some_and(|j| !j.run.busy.is_empty()) {
-            // Only blocks freed in the running journal transaction are left: commit it, then they are free.
+        if self.jnl.as_ref().is_some_and(|j| !j.run.busy.is_empty() || j.committing.as_ref().is_some_and(|c| !c.busy.is_empty())) {
+            // Only blocks freed in the running (or the committing) journal transaction are left: commit it, then they
+            // are free.
             klog::event!(Info, "ext4", "alloc.commit_for_busy", want = want);
             self.jcommit()?;
             return self.alloc_blocks(tx, goal, want, keep);
@@ -283,6 +284,9 @@ impl State {
         let mut v: Vec<(u64, u64)> = tx.freed.iter().map(|&(s, n)| (s, s + n)).filter(|&(s, e)| s < end && e > start).collect();
         if let Some(j) = self.jnl.as_ref() {
             v.extend(j.run.busy_in(start, end));
+            if let Some(c) = &j.committing {
+                v.extend(c.busy_in(start, end));
+            }
         }
         v
     }

@@ -6,8 +6,10 @@ mod dropcheck;
 mod firmware;
 mod image;
 mod ktest;
+mod ledger;
 mod qemu;
 mod refuse;
+mod release;
 mod serve;
 mod stick;
 mod suite;
@@ -21,11 +23,12 @@ const USAGE: &str = "usage: cargo xtask <command>
   initrd [--out F] [--lock]
   image [--name N] [--gen G] [--config-extra \"k=v;k2=v2\"] [--release] [--ktest]
   qemu [--name N] [--smp N] [--mem M] [--net none|user|igb|virtio] [--hostfwd H:G]... [--res WxH]
-       [--display none|gtk] [--timeout S] [--serial-log F] [--boot-retries N] [-- extra qemu args]
+       [--display none|gtk] [--timeout S] [--serial-log F] [--boot-retries N] [--boot stick|nvme] [-- extra qemu args]
   ktest [FILTER] [--split f1,f2,...] [--timeout S] [--config-extra \"k=v;k2=v2\"] [--release]
   test [--no-ktest]
   fullrun [--quick] [--script-timeout S]
   stick --target <mountpoint> [--write] [--retire-v1 | --bundle D | --build | --confirm N | --prune ...] (cargo xtask stick --help)
+  release-assets --version V [--out D] [--trees a,b|none] [--no-installer] (cargo xtask release-assets --help)
   serve --dir D --port P
   abi-diff [FILTER] [--host-only | --remote HOST:PORT --token T] [--port P] [--timeout S] [--smp N]
   deps
@@ -48,8 +51,10 @@ fn main() {
         "ktest" => ktest::cmd_ktest(&root, a),
         "test" => suite::cmd_test(&root, a),
         "fullrun" => suite::cmd_fullrun(&root, a),
+        "scenario" => suite::cmd_scenario(&root, a),
         "stick" => stick::cmd_stick(&root, a),
         "serve" => serve::cmd_serve(&root, a),
+        "release-assets" => release::cmd_release_assets(&root, a),
         "deps" => deps::cmd_deps(&root, a),
         "toolchain" => suite::cmd_toolchain(&root, a),
         "abi-diff" => abi_diff::cmd_abi_diff(&root, a),

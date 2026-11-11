@@ -25,6 +25,53 @@ struct Seg {
 /// Largest single request to the device (bytes).
 const IO_MAX: usize = 1 << 20;
 
+/// A file read's pieces in order (`State::read_plan`): FS-STALL maps under the volume lock and reads after it.
+pub struct ReadPlan {
+    pieces: Vec<Piece>,
+    total: usize,
+}
+
+/// `len` bytes of the read: at disk block `p`, `in_blk` bytes into it; None reads zeros (a hole, an unwritten extent).
+struct Piece {
+    len: usize,
+    at: Option<(u64, usize)>,
+}
+
+impl ReadPlan {
+    /// BL-3: the pieces in file order as (bytes, Some((disk block, bytes into it)) or None for zeros). One piece is
+    /// one extent's contiguous run (at most `IO_MAX`), so it is one device request.
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = (usize, Option<(u64, usize)>)> + '_ {
+        self.pieces.iter().map(|p| (p.len, p.at))
+    }
+    /// Bytes the plan covers (the read cut at the file's size).
+    pub(crate) fn total(&self) -> usize {
+        self.total
+    }
+}
+
+/// Carries out a read plan into `buf` through `read(block, bytes)` (whole blocks); returns the count.
+pub fn read_by_plan(plan: &ReadPlan, bs: u64, buf: &mut [u8], read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+    let mut done = 0usize;
+    let mut tmp = Vec::new();
+    for pc in &plan.pieces {
+        let dst = &mut buf[done..done + pc.len];
+        match pc.at {
+            None => dst.fill(0),
+            Some((p, 0)) if pc.len % bs as usize == 0 => read(p, dst)?,
+            Some((p, in_blk)) => {
+                let blocks = (in_blk + pc.len).div_ceil(bs as usize);
+                tmp.clear();
+                tmp.try_reserve(blocks * bs as usize).map_err(|_| ENOMEM)?;
+                tmp.resize(blocks * bs as usize, 0);
+                read(p, &mut tmp)?;
+                dst.copy_from_slice(&tmp[in_blk..in_blk + pc.len]);
+            }
+        }
+        done += pc.len;
+    }
+    Ok(plan.total)
+}
+
 impl State {
     /// Where file block `l` lies: Some((disk block, blocks mapped from it, unwritten)) or None and the hole's
     /// length (u64::MAX: to the end).
@@ -49,48 +96,46 @@ impl State {
 
     /// Reads file bytes at `off` (up to the size); returns the count.
     pub fn read_file(&self, di: &DiskInode, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        if di.flags() & FL_INLINE_DATA != 0 {
-            return crate::inline::read(self, di, off, buf);
+        match self.read_plan(di, off, buf.len())? {
+            None => crate::inline::read(self, di, off, buf),
+            Some(plan) => read_by_plan(&plan, self.geo.bs, buf, &mut |p, dst| self.read_blocks(p, dst)),
         }
+    }
+
+    /// Where the bytes of a read of `len` at `off` lie (None: inline data, read through the inode).
+    pub fn read_plan(&self, di: &DiskInode, off: u64, len: usize) -> Result<Option<ReadPlan>, i64> {
+        if di.flags() & FL_INLINE_DATA != 0 {
+            return Ok(None);
+        }
+        let mut plan = ReadPlan { pieces: Vec::new(), total: 0 };
         let size = di.size();
         if off >= size {
-            return Ok(0);
+            return Ok(Some(plan));
         }
-        let total = buf.len().min((size - off) as usize);
+        let total = len.min((size - off) as usize);
         let bs = self.geo.bs;
         let mut done = 0usize;
-        let mut tmp = Vec::new();
         while done < total {
             let pos = off + done as u64;
             let l = pos / bs;
             let in_blk = (pos % bs) as usize;
             let left = total - done;
-            match self.map_at(None, di, l)? {
+            let piece = match self.map_at(None, di, l)? {
                 Ok((p, n, unwritten)) => {
                     let span = ((n * bs) as usize - in_blk).min(left).min(IO_MAX);
-                    let dst = &mut buf[done..done + span];
-                    if unwritten {
-                        dst.fill(0);
-                    } else if in_blk == 0 && span % bs as usize == 0 {
-                        self.read_blocks(p, dst)?;
-                    } else {
-                        let blocks = (in_blk + span).div_ceil(bs as usize);
-                        tmp.clear();
-                        tmp.resize(blocks * bs as usize, 0);
-                        self.read_blocks(p, &mut tmp)?;
-                        dst.copy_from_slice(&tmp[in_blk..in_blk + span]);
-                    }
-                    done += span;
+                    Piece { len: span, at: (!unwritten).then_some((p, in_blk)) }
                 }
                 Err(hole) => {
                     let span = (hole.saturating_mul(bs).saturating_sub(in_blk as u64)).min(left as u64) as usize;
-                    let span = span.max(1).min(left);
-                    buf[done..done + span].fill(0);
-                    done += span;
+                    Piece { len: span.max(1).min(left), at: None }
                 }
-            }
+            };
+            done += piece.len;
+            plan.pieces.try_reserve(1).map_err(|_| ENOMEM)?;
+            plan.pieces.push(piece);
         }
-        Ok(total)
+        plan.total = total;
+        Ok(Some(plan))
     }
 
     /// Turns a block-mapped (ext2/ext3) file, directory or slow symlink into an extent tree before V2
@@ -298,14 +343,18 @@ impl State {
                 let cnt = ((s.n - b) as usize).min(IO_MAX / bs as usize);
                 let end = (at + cnt * bs as usize).min(data.len());
                 let src = &data[at..end];
-                if src.len() % bs as usize == 0 {
-                    self.write_blocks(s.p + b, src)?;
-                } else {
+                // The whole blocks straight from the caller's buffer; only a short last block goes through a copy
+                // of one block (a copy of the whole piece was up to 1 MiB from the heap, inside write-back).
+                let whole = src.len() / bs as usize * bs as usize;
+                if whole > 0 {
+                    self.write_blocks(s.p + b, &src[..whole])?;
+                }
+                if whole < src.len() {
                     pad.clear();
-                    pad.extend_from_slice(src);
-                    pad.resize(src.len().div_ceil(bs as usize) * bs as usize, 0);
+                    pad.extend_from_slice(&src[whole..]);
+                    pad.resize(bs as usize, 0);
                     let p = core::mem::take(&mut pad);
-                    self.write_blocks(s.p + b, &p)?;
+                    self.write_blocks(s.p + b + whole as u64 / bs, &p)?;
                     pad = p;
                 }
                 b += cnt as u64;

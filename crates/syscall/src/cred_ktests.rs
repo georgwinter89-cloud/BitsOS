@@ -204,7 +204,7 @@ ktest!("ab.cred.chpst", Safe, chpst);
 /// `su`-like drop from a root shell whose own ids stay root (fork copies, execve keeps the dropped ids).
 fn chpst() -> TestResult {
     if !crate::ab7_ktests::have("/bin/busybox") {
-        return ktest::skip("no /bin/busybox in this image");
+        return ktest::fail("no /bin/busybox in this image");
     }
     let (code, out) = busybox(&["busybox", "chpst", "-u", "1000:1000", "id"], 0)?;
     let out = without_names(&out);
@@ -277,7 +277,7 @@ ktest!("ab.cred.inherit", Safe, inherit);
 /// in it (`__synccall`) against V2's one set per group.
 fn inherit() -> TestResult {
     if !crate::ab7_ktests::have("/bin/abi-cred") {
-        return ktest::skip("no /bin/abi-cred in this image (no musl sysroot when it was built)");
+        return ktest::fail("no /bin/abi-cred in this image (no musl sysroot when it was built)");
     }
     let (code, out) = run("/bin/abi-cred", &["/bin/abi-cred", "root"], 0)?;
     let want = "setgroups = 0\nsetresgid(7, 8, 9) = 0\nsetresuid(2000, 1000, 0) = 0\n\
@@ -290,7 +290,7 @@ fn inherit() -> TestResult {
 
 /// Whether FS has applied change requests 2 and 3 of plan/notes/ab-AB-13.md (file checks on fsuid/fsgid and
 /// the supplementary groups). The desk sets it to true in the same integration; until then a difference
-/// in `ab.cred.files` is a skip that names the gap, afterwards it is a failure.
+/// in `ab.cred.files` is a failure that names the gap, afterwards it is a failure.
 const FS_CR_MERGED: bool = true;
 
 ktest!("ab.cred.files", Safe, files);
@@ -298,7 +298,7 @@ ktest!("ab.cred.files", Safe, files);
 /// fs/namei.c `acl_permission_check`, kernel/groups.c `in_group_p`).
 fn files() -> TestResult {
     if !crate::ab7_ktests::have("/bin/abi-cred") {
-        return ktest::skip("no /bin/abi-cred in this image (no musl sysroot when it was built)");
+        return ktest::fail("no /bin/abi-cred in this image (no musl sysroot when it was built)");
     }
     let (code, out) = run("/bin/abi-cred", &["/bin/abi-cred", "files"], 0)?;
     let want = "files made: yes\nfsuid 1000: root's 0600 file = -EACCES\nfsuid 0: root's 0600 file = 0\n\
@@ -309,7 +309,7 @@ fn files() -> TestResult {
     }
     if !FS_CR_MERGED && code == 0 && out.starts_with("files made: yes\n") {
         klog::event!(Warn, "ktest", "cred.files_gap", lines = out.lines().count(); "file checks still use the exec-time ids");
-        return ktest::skip("FS change requests 2+3 of ab-AB-13.md not applied: file checks use the exec-time uid/gid, no supplementary groups");
+        return ktest::fail("FS change requests 2+3 of ab-AB-13.md not applied: file checks use the exec-time uid/gid, no supplementary groups");
     }
     Err(format!("abi-cred files: exit {code}\n{out}"))
 }

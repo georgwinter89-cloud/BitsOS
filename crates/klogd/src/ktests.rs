@@ -89,7 +89,7 @@ fn ring_sized_from_memory() -> TestResult {
     let info = klog::ring_info();
     kassert!(!info.early);
     if info.sized_by_config {
-        return ktest::skip("CONFIG log_buf= chose the size");
+        return ktest::fail("CONFIG log_buf= chose the size");
     }
     kassert!(info.bytes == klog::ring_size(klog::ring_bytes_for_memory(total)), "{} MB RAM: {:?}", total >> 20, info);
     Ok(())

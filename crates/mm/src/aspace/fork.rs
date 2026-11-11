@@ -69,7 +69,10 @@ impl AsCore {
         let mut built = c.space.tree.reserve(kept.len()).is_ok();
         for v in &kept {
             if built {
-                built = c.space.tree.insert((*v).clone()).is_ok();
+                // `dup_mmap`: mlock is not inherited.
+                let mut v = (*v).clone();
+                (v.flags.locked, v.flags.lock_onfault) = (false, false);
+                built = c.space.tree.insert(v).is_ok();
             }
         }
         // From here the child cleans up after itself (its drop gives the charge, shared frames and tables back).

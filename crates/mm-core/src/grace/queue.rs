@@ -5,7 +5,7 @@ use super::{cookie, in_section, open_sections, passed, synchronize, try_advance,
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering::*};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use ksync::{OnceRef, SpinLock};
 
 pub(super) struct Deferred {
@@ -30,7 +30,76 @@ impl Deferred {
     }
 }
 
-static QUEUE: SpinLock<VecDeque<Deferred>> = SpinLock::named("mm.grace", VecDeque::new());
+/// Items in one block of the queue: one page of them.
+const BLOCK: usize = crate::PAGE as usize / core::mem::size_of::<Deferred>();
+
+/// The waiting items, oldest first, in blocks of one page. One `VecDeque` of all of them doubled at 2.6, 5 and
+/// 10 MiB in one run, exactly when memory is full of frames that wait here: the growth failed under the queue's
+/// lock, where nothing could drain, and index nodes freed under a spin lock were leaked. Thousands of leaked nodes,
+/// allocated all over memory while a file was cached, left no free block above 8 MiB for the machine's whole
+/// life (PF-7 fixer: `mm.reclaim.dirty_pressure`, then ENOMEM for 9 MiB reads; plan/notes/fs-PF-7.md).
+struct Queue {
+    /// No block in here is empty. An entry costs 32 bytes per page of items, so this `VecDeque` stays small.
+    blocks: VecDeque<VecDeque<Deferred>>,
+    /// The last block that ran empty: a queue that keeps going from empty to one item allocates nothing.
+    spare: Option<VecDeque<Deferred>>,
+}
+
+impl Queue {
+    const fn new() -> Queue {
+        Queue { blocks: VecDeque::new(), spare: None }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Whether `push_back` has room now, after taking a block if it must: the spare, or `fresh` (allocated by the
+    /// caller before it took the lock). Err: a new block is needed and `fresh` has none (the caller allocates it
+    /// with the lock released and comes again); Ok(false): no memory for the list of blocks.
+    fn room(&mut self, fresh: &mut Option<VecDeque<Deferred>>) -> Result<bool, ()> {
+        if self.blocks.back().is_some_and(|b| b.len() < BLOCK) {
+            return Ok(true);
+        }
+        let Some(block) = self.spare.take().or_else(|| fresh.take()) else { return Err(()) };
+        if self.blocks.try_reserve(1).is_err() {
+            self.spare = Some(block);
+            return Ok(false);
+        }
+        self.blocks.push_back(block);
+        Ok(true)
+    }
+
+    /// After `room` answered true: within the block's capacity, nothing allocates.
+    fn push_back(&mut self, d: Deferred) {
+        if let Some(b) = self.blocks.back_mut() {
+            b.push_back(d);
+        }
+    }
+
+    fn front_cookie(&self) -> Option<u64> {
+        self.blocks.front().and_then(|b| b.front()).map(|d| d.cookie)
+    }
+
+    /// The oldest item, and a block that ran empty and is not kept, for the caller to drop after the lock.
+    fn pop_front(&mut self) -> (Option<Deferred>, Option<VecDeque<Deferred>>) {
+        let Some(b) = self.blocks.front_mut() else { return (None, None) };
+        let d = b.pop_front();
+        if !b.is_empty() {
+            return (d, None);
+        }
+        let empty = self.blocks.pop_front();
+        if self.spare.is_none() {
+            self.spare = empty;
+            return (d, None);
+        }
+        (d, empty)
+    }
+}
+
+static QUEUE: SpinLock<Queue> = SpinLock::named("mm.grace", Queue::new());
+/// One drain for room at a time: a drop in that drain that defers and finds no room either takes the old road.
+static ROOM_DRAIN: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static HELD: AtomicU64 = AtomicU64::new(0);
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -59,22 +128,19 @@ pub(super) unsafe fn drop_arc<T>(p: *mut ()) {
 /// `wait`: the freer may pay the back-pressure (`after_push`); false for freers that run under another
 /// cache's lock (reclaim: the allocation that called it waits instead).
 pub(super) fn push(d: Deferred, wait: bool) {
-    {
-        let mut q = QUEUE.lock();
-        if q.try_reserve(1).is_ok() {
-            let d = Deferred { cookie: cookie(), ..d };
-            PENDING.fetch_add(d.bytes, Relaxed);
-            HELD.fetch_add(d.held, Relaxed);
-            WAITING.fetch_add(1, Relaxed);
-            let first = q.is_empty();
-            q.push_back(d);
-            drop(q);
-            if wait {
-                after_push(first);
-            }
-            return;
+    let Err(d) = enqueue(d, wait) else { return };
+    // No page for a block with the queue's lock held, where nothing drains; what waits may be what the page would
+    // come from. Drains already run under a freer's spin lock (the heap's last step before out-of-memory).
+    let d = if ROOM_DRAIN.swap(true, Acquire) {
+        d
+    } else {
+        drain();
+        ROOM_DRAIN.store(false, Release);
+        match enqueue(d, wait) {
+            Ok(()) => return,
+            Err(d) => d,
         }
-    }
+    };
     // No room in the queue. INT-W28 (PF-6 CR): a freer under a spin lock (rcu_index's writers under
     // vfs.fds.view or vfs.inode.index) never waits here; the item is leaked, counted, rather than freed early.
     if ksync::preempt_count() != 0 || hal::percpu::in_hard_irq() {
@@ -92,6 +158,45 @@ pub(super) fn push(d: Deferred, wait: bool) {
     }
 }
 
+/// `d` into the queue, stamped under its lock; back to the caller when there is no room.
+fn enqueue(d: Deferred, wait: bool) -> Result<(), Deferred> {
+    // A block's page is never allocated under `mm.grace` (FS-STALL review R1: an allocation there that reclaimed
+    // would free into this queue and spin on its own lock).
+    let mut fresh: Option<VecDeque<Deferred>> = None;
+    let mut q = loop {
+        let mut q = QUEUE.lock();
+        match q.room(&mut fresh) {
+            Ok(true) => break q,
+            Ok(false) => return Err(d),
+            Err(()) if fresh.is_none() => {
+                drop(q);
+                let mut b = VecDeque::new();
+                if b.try_reserve_exact(BLOCK).is_err() {
+                    return Err(d);
+                }
+                fresh = Some(b);
+            }
+            Err(()) => return Err(d),
+        }
+    };
+    // A block allocated for nothing (another freer made room meanwhile) is the spare, or goes after the lock.
+    if q.spare.is_none() {
+        q.spare = fresh.take();
+    }
+    let first = q.is_empty();
+    let d = Deferred { cookie: cookie(), ..d };
+    PENDING.fetch_add(d.bytes, Relaxed);
+    HELD.fetch_add(d.held, Relaxed);
+    WAITING.fetch_add(1, Relaxed);
+    q.push_back(d);
+    drop(q);
+    drop(fresh);
+    if wait {
+        after_push(first);
+    }
+    Ok(())
+}
+
 /// Drops `b` after a grace period. `bytes`: frames its drop frees (counted as pending meanwhile).
 pub fn defer_box<T: Send + Sync + 'static>(b: Box<T>, bytes: u64) {
     let held = core::mem::size_of::<T>() as u64;
@@ -101,6 +206,11 @@ pub fn defer_box<T: Send + Sync + 'static>(b: Box<T>, bytes: u64) {
 /// Drops this reference after a grace period. `bytes`: frames its drop frees, if it is the last one.
 pub fn defer_arc<T: Send + Sync + 'static>(a: Arc<T>, bytes: u64) {
     push(Deferred { cookie: 0, ptr: Arc::into_raw(a) as *mut (), drop: drop_arc::<T>, bytes, held: arc_held::<T>() }, true);
+}
+
+/// `defer_arc` that never waits (reclaim, inside an allocation).
+pub fn defer_arc_nowait<T: Send + Sync + 'static>(a: Arc<T>, bytes: u64) {
+    push(Deferred { cookie: 0, ptr: Arc::into_raw(a) as *mut (), drop: drop_arc::<T>, bytes, held: arc_held::<T>() }, false);
 }
 
 /// Frees what is past its grace period (advancing the epoch once if it can); never waits. Returns the bytes
@@ -121,15 +231,16 @@ fn drain_with(wait_lock: bool) -> u64 {
     }
     let mut freed = 0u64;
     loop {
-        let d = {
+        let (d, empty) = {
             let q = if wait_lock { Some(QUEUE.lock()) } else { QUEUE.try_lock() };
             let Some(mut q) = q else { break };
             // Cookies grow along the queue (stamped under its lock): the first that has not passed ends it.
-            match q.front() {
-                Some(d) if passed(d.cookie) => q.pop_front(),
-                _ => None,
+            match q.front_cookie() {
+                Some(c) if passed(c) => q.pop_front(),
+                _ => (None, None),
             }
         };
+        drop(empty);
         let Some(d) = d else { break };
         PENDING.fetch_sub(d.bytes, Relaxed);
         HELD.fetch_sub(d.held, Relaxed);
@@ -279,5 +390,52 @@ pub fn set_kick(f: &'static (dyn Fn() + Sync)) {
 pub fn kick() {
     if let Some(f) = KICK.get() {
         f();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe fn nothing(_: *mut ()) {}
+
+    fn item(cookie: u64) -> Deferred {
+        Deferred { cookie, ptr: core::ptr::null_mut(), drop: nothing, bytes: 0, held: 0 }
+    }
+
+    /// Blocks of one page, in order; none of them grows; an empty queue keeps one block and frees the rest.
+    #[test]
+    fn the_queue_takes_a_page_at_a_time_in_order() {
+        const _: () = assert!(BLOCK * core::mem::size_of::<Deferred>() <= crate::PAGE as usize && BLOCK > 1);
+        let mut q = Queue::new();
+        assert!(q.is_empty() && q.front_cookie().is_none());
+        let n = BLOCK as u64 * 3 + 1;
+        for c in 0..n {
+            let mut fresh = None;
+            if q.room(&mut fresh).is_err() {
+                let mut b = VecDeque::new();
+                b.try_reserve_exact(BLOCK).unwrap();
+                fresh = Some(b);
+                assert_eq!(q.room(&mut fresh), Ok(true));
+            }
+            q.push_back(item(c));
+        }
+        assert_eq!(q.blocks.len(), 4);
+        assert!(q.blocks.iter().all(|b| b.capacity() == BLOCK), "a block never grows");
+        let mut freed = 0;
+        for c in 0..n {
+            assert_eq!(q.front_cookie(), Some(c));
+            let (d, empty) = q.pop_front();
+            assert_eq!(d.map(|d| d.cookie), Some(c));
+            freed += usize::from(empty.is_some());
+        }
+        assert!(q.is_empty() && q.front_cookie().is_none());
+        assert!(q.pop_front().0.is_none());
+        assert_eq!(freed, 3, "one of the four stays as the spare");
+        let spare = q.spare.as_ref().map(|b| b.as_slices().0.as_ptr());
+        assert!(spare.is_some());
+        assert_eq!(q.room(&mut None), Ok(true), "the spare serves without an allocation");
+        q.push_back(item(1));
+        assert_eq!(q.blocks.front().map(|b| b.as_slices().0.as_ptr()), spare, "from empty to one item allocates nothing");
     }
 }

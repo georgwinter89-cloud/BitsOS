@@ -41,6 +41,8 @@ pub mod gmc;
 pub mod handoff;
 pub mod hubfake;
 pub mod hwid;
+pub mod ih;
+pub mod ihfake;
 pub mod mes;
 pub mod mesfake;
 pub mod mesq;

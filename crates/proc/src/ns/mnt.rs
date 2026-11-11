@@ -102,8 +102,35 @@ impl Process {
     pub fn mount_ns(&self) -> Arc<MountNs> {
         self.nsset().mnt.view.clone()
     }
+    /// PF-7: `mount_ns` for a syscall, borrowed: a program in the boot view (the machine's usual case, whatever views
+    /// others have copied) uses the one it holds, without `proc.nsset` and the view's count. `held` keeps the view
+    /// alive otherwise.
+    pub fn mount_view<'a>(&'a self, held: &'a mut Option<Arc<MountNs>>) -> &'a Arc<MountNs> {
+        if self.group().view_copied() { held.insert(self.mount_ns()) } else { &self.ns }
+    }
     /// The process's mount namespace.
     pub fn mnt_ns(&self) -> Arc<MntNs> {
         self.nsset().mnt.clone()
+    }
+}
+
+/// PF-7: a syscall's mount view (`vfs::sys::Sys::ns`): `Process::mount_view` asked at the first use and kept to the end
+/// of the call, so a call that never asks, as read on an fd, pays nothing, also in a copied view; and one call never
+/// sees two views when another thread unshares meanwhile.
+pub struct CallView<'a> {
+    image: &'a Process,
+    copy: core::cell::OnceCell<Option<Arc<MountNs>>>,
+}
+
+impl<'a> CallView<'a> {
+    pub fn new(image: &'a Process) -> Self {
+        CallView { image, copy: core::cell::OnceCell::new() }
+    }
+}
+
+impl vfs::sys::ViewSource for CallView<'_> {
+    fn view(&self) -> &Arc<MountNs> {
+        let copy = self.copy.get_or_init(|| self.image.group().view_copied().then(|| self.image.mount_ns()));
+        copy.as_ref().unwrap_or(&self.image.ns)
     }
 }

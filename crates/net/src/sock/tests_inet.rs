@@ -161,6 +161,7 @@ fn udp_over_loopback() {
     assert_eq!(&from[4..8], &[127, 0, 0, 1]);
     assert_eq!(p.recv(a, 8, MSG_DONTWAIT).0, -EAGAIN, "the rest of a datagram is gone");
     p.sendto(b, b"twelve bytes", &lo(24610));
+    assert_eq!(p.recv(a, 6, MSG_PEEK), (6, b"twelve".to_vec()), "a peek leaves the datagram queued");
     let (r, _, _, fl) = p.recvmsg(a, 4, 0, 0);
     assert_eq!(r, 4);
     assert!(fl & MSG_TRUNC != 0);

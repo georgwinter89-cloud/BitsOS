@@ -24,7 +24,8 @@ pub mod config;
 pub mod dma;
 pub mod kbus;
 mod ktests;
-#[cfg(test)]
+// The lock checker exists only with debug_assertions (ksync lockdep.rs); a release run has no proof to give.
+#[cfg(all(test, debug_assertions))]
 mod lock_order;
 pub mod netdev;
 pub mod tool;

@@ -340,7 +340,8 @@ fn ctx_blame_without_a_counter_move() {
     };
     let before = fx.gpu.reset_counter();
     let c = crate::ctx::lookup(fx.file().drm_file(), 1).unwrap();
-    c.blame(&*fx.gpu);
+    let e = c.entity(&*fx.gpu, AMDGPU_HW_IP_GFX, 0, 0).unwrap();
+    e.job.blame(fx.gpu.reset_counter());
     assert_eq!(fx.gpu.reset_counter(), before);
     let told = (AMDGPU_CTX_QUERY2_FLAGS_RESET | AMDGPU_CTX_QUERY2_FLAGS_GUILTY) as u64;
     assert_eq!(state(AMDGPU_CTX_OP_QUERY_STATE2, 1).0, told);
@@ -350,7 +351,7 @@ fn ctx_blame_without_a_counter_move() {
     assert_eq!(state(AMDGPU_CTX_OP_QUERY_STATE2, 2).0, 0, "the other context was not touched");
     assert_eq!(state(AMDGPU_CTX_OP_QUERY_STATE, 2).1, AMDGPU_CTX_NO_RESET);
     // A real reset after it: the snapshot was off already, the rule holds.
-    c.blame(&*fx.gpu);
+    e.job.blame(fx.gpu.reset_counter());
     fx.gpu.reset(false);
     assert_eq!(state(AMDGPU_CTX_OP_QUERY_STATE2, 2).0, AMDGPU_CTX_QUERY2_FLAGS_RESET as u64);
     assert_eq!(state(AMDGPU_CTX_OP_QUERY_STATE2, 1).0, told);

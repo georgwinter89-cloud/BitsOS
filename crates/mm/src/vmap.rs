@@ -11,7 +11,8 @@
 //! nothing mapped) for code that maps its own pages there, kernel stacks first; crates below `mm` reach them
 //! through `hal::paging::reserve_kernel_va`/`release_kernel_va`. `release` unmaps what is left and frees the
 //! page tables that became empty once every CPU confirmed the shootdown; otherwise it quarantines the range
-//! like a window.
+//! like a window. The kernel heap's scattered blocks (`scatter`) are such reservations, made and released
+//! without events (`reserve_quiet`, `release_quiet`).
 //!
 //! Locking: one sleeping `ksync::Mutex` guards the windows. Mapping and dropping a window may wait for it,
 //! so neither happens in interrupt context or in a no-wait section of a KernelRt/Interactive thread (B4).
@@ -28,6 +29,10 @@ use hal::paging::{self, CacheType, PageFlags, PageSize, UnmapStats, VmapError};
 use ksync::{Mutex, SpinLock};
 
 const M2: u64 = 2 << 20;
+/// Reservations (kernel stacks, the heap's scattered blocks) and free ranges the lists hold without growing.
+/// They grow under spin locks, where the heap only has contiguous runs to offer, which fragmentation takes
+/// away first: reserved once at boot instead.
+const ROOM: usize = 8192;
 /// Unmapped bytes below every window.
 pub const GUARD: u64 = 4096;
 
@@ -70,6 +75,7 @@ klog::counter!(VMAP_QUARANTINED, "mm.vmap.quarantined");
 /// registers it as hal's device mapper.
 pub(crate) fn init(lo: u64, hi: u64, taken: &[(u64, u64)], ram: Vec<(u64, u64)>, mtrrs: Mtrrs) {
     let mut space = VaSpace::new(lo, hi);
+    let room = space.reserve_room(ROOM) && KVA.lock().live.try_reserve(ROOM).is_ok();
     let mut kept = 0u64;
     for &(s, e) in taken {
         let (s, e) = (s.max(lo), e.min(hi));
@@ -85,7 +91,7 @@ pub(crate) fn init(lo: u64, hi: u64, taken: &[(u64, u64)], ram: Vec<(u64, u64)>,
     if !paging::set_kernel_va(reserve, release) {
         klog::event!(Error, "mm", "vmap.kva_taken"; "hal's kernel-VA hook was installed already");
     }
-    klog::event!(Info, "mm", "vmap.ready", lo = klog::Hex(lo), hi = klog::Hex(hi), adopted_kb = kept >> 10);
+    klog::event!(Info, "mm", "vmap.ready", lo = klog::Hex(lo), hi = klog::Hex(hi), adopted_kb = kept >> 10, room = room);
 }
 
 /// A device window owned by the caller; dropping it unmaps the window. Drop it only where waiting is allowed
@@ -407,7 +413,7 @@ klog::counter!(KVA_RESERVES, "mm.vmap.kva_reserves");
 klog::counter!(RANGES_LOST, "mm.vmap.ranges_lost");
 
 /// Why `reserve` failed (reported after the locks are released).
-enum KvaFail {
+pub(crate) enum KvaFail {
     NotReady,
     NoHeap,
     NoSpace,
@@ -418,6 +424,23 @@ enum KvaFail {
 /// used up or the kernel heap has no room for the bookkeeping.
 pub fn reserve(len: u64) -> Option<u64> {
     let len = len.checked_add(0xFFF)? & !0xFFF;
+    match reserve_quiet(len) {
+        Ok(body) => Some(body),
+        Err(KvaFail::NotReady) => None,
+        Err(KvaFail::NoHeap) => {
+            klog::event!(Warn, "mm", "vmap.kva_no_heap", len = len; "no heap for the reservation list; reservation refused");
+            None
+        }
+        Err(KvaFail::NoSpace) => {
+            klog::event!(Warn, "mm", "vmap.kva_no_space", len = len, free = space_free().0);
+            None
+        }
+    }
+}
+
+/// `reserve` of `len` bytes (a page multiple) without any event: the kernel heap's scattered blocks (`scatter`)
+/// reserve from inside an allocation, where klog must not be called.
+pub(crate) fn reserve_quiet(len: u64) -> Result<u64, KvaFail> {
     let r = {
         let mut k = KVA.lock();
         if k.live.try_reserve(1).is_err() {
@@ -437,21 +460,10 @@ pub fn reserve(len: u64) -> Option<u64> {
             }
         }
     };
-    match r {
-        Ok(body) => {
-            KVA_RESERVES.inc();
-            Some(body)
-        }
-        Err(KvaFail::NotReady) => None,
-        Err(KvaFail::NoHeap) => {
-            klog::event!(Warn, "mm", "vmap.kva_no_heap", len = len; "no heap for the reservation list; reservation refused");
-            None
-        }
-        Err(KvaFail::NoSpace) => {
-            klog::event!(Warn, "mm", "vmap.kva_no_space", len = len, free = space_free().0);
-            None
-        }
+    if r.is_ok() {
+        KVA_RESERVES.inc();
     }
+    r
 }
 
 /// Keeps a released range out of use; false when even the quarantine list has no room (the range is then
@@ -472,31 +484,46 @@ fn kva_quarantine(k: &mut Kva, r: Reservation) -> bool {
 /// reservation.
 pub fn release(base: u64, len: u64) -> bool {
     let len = len.saturating_add(0xFFF) & !0xFFF;
+    match release_quiet(base, len, &mut |_, _| {}) {
+        None => {
+            klog::event!(Warn, "mm", "vmap.kva_bad_release", base = klog::Hex(base), len = len; "not a live reservation; nothing changed");
+            false
+        }
+        Some(Ok(stat)) => {
+            klog::event!(Debug, "mm", "vmap.kva_release", base = klog::Hex(base), len = len, leaves = stat.leaves, tables_freed = stat.tables_freed);
+            true
+        }
+        Some(Err((e, kept))) => {
+            klog::event!(Info, "mm", "vmap.kva_quarantined", base = klog::Hex(base), len = len, error = alloc::format!("{e:?}"), listed = kept;
+                "kept out of use: the TLB shootdown was not confirmed; retried by mm.report");
+            false
+        }
+    }
+}
+
+/// `release` of `len` bytes (a page multiple) without any event. `before` sees the range once it is taken off
+/// the live list (so it was a live reservation of exactly `len`), before the rest is unmapped. None: not a live
+/// reservation, nothing changed; `Err`: kept out of use (and whether the quarantine list took it).
+pub(crate) fn release_quiet(base: u64, len: u64, before: &mut dyn FnMut(u64, u64)) -> Option<Result<UnmapStats, (paging::MapError, bool)>> {
     let r = {
         let mut k = KVA.lock();
         match k.live.binary_search_by_key(&base, |x| x.body) {
             Ok(i) if k.live[i].end - k.live[i].body == len => Some(k.live.remove(i)),
             _ => None,
         }
-    };
-    let Some(r) = r else {
-        klog::event!(Warn, "mm", "vmap.kva_bad_release", base = klog::Hex(base), len = len; "not a live reservation; nothing changed");
-        return false;
-    };
-    match paging::unmap_kernel(r.body, r.end - r.body, &mut |_| {}) {
+    }?;
+    before(r.body, r.end - r.body);
+    Some(match paging::unmap_kernel(r.body, r.end - r.body, &mut |_| {}) {
         Ok(stat) => {
             give_back(&r);
-            klog::event!(Debug, "mm", "vmap.kva_release", base = klog::Hex(base), len = len, leaves = stat.leaves, tables_freed = stat.tables_freed);
-            true
+            Ok(stat)
         }
         Err(e) => {
             let kept = kva_quarantine(&mut KVA.lock(), r);
             VMAP_QUARANTINED.inc();
-            klog::event!(Info, "mm", "vmap.kva_quarantined", base = klog::Hex(base), len = len, error = alloc::format!("{e:?}"), listed = kept;
-                "kept out of use: the TLB shootdown was not confirmed; retried by mm.report");
-            false
+            Err((e, kept))
         }
-    }
+    })
 }
 
 /// Live plain reservations and quarantined ones.

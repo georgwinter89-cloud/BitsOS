@@ -126,6 +126,11 @@ impl Entry {
     }
 }
 
+/// BL-2: whether `e` must wait for one of `busy` (older requests at the device) by the order rule.
+pub fn held_by(busy: &[Entry], e: &Entry) -> bool {
+    busy.iter().any(|o| o.orders_before(e))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Largest merged read/write in blocks (at least 1).
@@ -148,7 +153,7 @@ pub struct Batch {
     pub aged: bool,
 }
 
-fn class(p: IoPriority) -> u8 {
+pub(crate) fn class(p: IoPriority) -> u8 {
     match p {
         IoPriority::Interactive => 0,
         IoPriority::Normal => 1,
@@ -238,18 +243,41 @@ impl Elevator {
         &self.entries
     }
 
+    /// BL-2 fix: the class request `id` competes in now (None: not queued).
+    pub fn class_of(&self, id: u64, now_ns: u64, age_ns: u64) -> Option<u8> {
+        self.entries.iter().find(|e| e.id == id).map(|e| effective(e, now_ns, age_ns))
+    }
+
+    /// BL-2 fix: the best class among the requests that can go now beside `busy` (what `pick_with` serves next;
+    /// an older request the best one waits for inherits it). None: nothing can go.
+    pub fn best_class(&self, now_ns: u64, age_ns: u64, busy: &[Entry]) -> Option<u8> {
+        self.entries.iter().filter(|e| !held_by(busy, e)).map(|e| effective(e, now_ns, age_ns)).min()
+    }
+
     /// Chooses the next batch and takes its members out of the queue. None: the queue is empty.
     /// `Some(Err(e))`: no memory for the batch's working lists; the chosen request `e` is taken out anyway
     /// (the caller fails it with ENOMEM), so every call makes progress and a dispatcher never spins on a
     /// queue it cannot serve.
     pub fn pick(&mut self, now_ns: u64, lim: &Limits) -> Option<Result<Batch, Entry>> {
+        self.pick_with(now_ns, lim, &[], &|_| true)
+    }
+
+    /// BL-2: `pick` beside what the device has now (`busy`, older than everything queued): a request one of them
+    /// orders before waits (the order rule across a device's slots), and so does every merge candidate it holds
+    /// back. `accept` is asked about the chosen request before anything is taken: false leaves the queue as it
+    /// was (a dispatcher that only takes reads into frames beside its first batch). None: nothing can go now.
+    pub fn pick_with(&mut self, now_ns: u64, lim: &Limits, busy: &[Entry], accept: &dyn Fn(&Entry) -> bool) -> Option<Result<Batch, Entry>> {
         let age = lim.age_ns;
-        let mut c = (0..self.entries.len()).min_by_key(|&i| (effective(&self.entries[i], now_ns, age), self.entries[i].id))?;
+        let held = |e: &Entry| busy.iter().any(|o| o.orders_before(e));
+        let mut c = (0..self.entries.len()).filter(|&i| !held(&self.entries[i])).min_by_key(|&i| (effective(&self.entries[i], now_ns, age), self.entries[i].id))?;
         // The class of the best request: one it waits for inherits it (the device hears this priority).
         let wanted = effective(&self.entries[c], now_ns, age);
         // An older request it overlaps (with a write involved) goes first; the oldest such, repeatedly.
         while let Some(i) = self.entries[..c].iter().position(|o| o.orders_before(&self.entries[c])) {
             c = i;
+        }
+        if held(&self.entries[c]) || !accept(&self.entries[c]) {
+            return None;
         }
         let head = self.entries[c];
         let aged = effective(&head, now_ns, age) < class(head.prio);
@@ -280,8 +308,9 @@ impl Elevator {
                         && e.kind.merges_with(head.kind)
                         && (e.lba == end || e.end() == lba)
                         && (end - lba).checked_add(e.blocks).is_some_and(|n| n <= limit)
-                        // Not past an older overlapping request that stays behind.
+                        // Not past an older overlapping request that stays behind, nor one at the device.
                         && !self.entries[..i].iter().enumerate().any(|(j, o)| !take.contains(&j) && o.orders_before(e))
+                        && !held(e)
                 });
                 let Some(i) = found else { break };
                 if take.try_reserve(1).is_err() {
@@ -595,5 +624,30 @@ mod tests {
         assert_eq!(foreground_queued(), base + 1);
         drop(q);
         assert_eq!(foreground_queued(), base);
+    }
+
+    /// BL-2: beside what the device has, a younger request it overlaps with a write involved waits, as merge
+    /// candidates do; `accept` false leaves the queue as it was.
+    #[test]
+    fn pick_with_keeps_the_order_across_slots() {
+        let mut q = Elevator::new();
+        for x in [e(2, Kind::Read, 10, 4, Interactive, 0), e(3, Kind::Read, 14, 4, Normal, 0), e(4, Kind::Read, 100, 1, Background, 0)] {
+            q.push(x).unwrap();
+        }
+        let busy = [e(1, W, 12, 1, Normal, 0)];
+        assert!(held_by(&busy, &e(9, Kind::Read, 12, 1, Normal, 0)) && !held_by(&busy, &e(9, Kind::Read, 13, 1, Normal, 0)));
+        // 10..14 overlaps the write at the device: the Interactive request waits, 14..18 goes alone (no merge with
+        // the held one in front of it).
+        let b = q.pick_with(0, &lim(64), &busy, &|_| true).unwrap().unwrap();
+        assert_eq!((b.lba, b.blocks, b.members.len()), (14, 4, 1));
+        // Refused by `accept`: nothing taken.
+        assert!(q.pick_with(0, &lim(64), &[], &|_| false).is_none());
+        assert_eq!(q.len(), 2);
+        // Beside a read at the device the Interactive request goes.
+        let b = q.pick_with(0, &lim(64), &[e(1, Kind::Read, 12, 1, Normal, 0)], &|_| true).unwrap().unwrap();
+        assert_eq!((b.lba, b.blocks), (10, 4));
+        // Everything held: nothing can go, the queue stays.
+        assert!(q.pick_with(0, &lim(64), &[e(1, W, 0, 1000, Normal, 0)], &|_| true).is_none());
+        assert_eq!(q.len(), 1);
     }
 }

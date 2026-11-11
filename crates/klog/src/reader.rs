@@ -93,9 +93,14 @@ struct Batch {
 }
 
 impl Batch {
-    /// Allocates; call outside the lock.
-    fn new() -> Self {
-        Batch { hdrs: Vec::with_capacity(BATCH), text: Vec::with_capacity(BATCH_TEXT), gaps: Vec::with_capacity(BATCH) }
+    /// Allocates; call outside the lock. None when memory is out (FS-STALL: klogd's drain panicked here on a full
+    /// machine): the read answers busy and the caller comes again.
+    fn new() -> Option<Self> {
+        let mut b = Batch { hdrs: Vec::new(), text: Vec::new(), gaps: Vec::new() };
+        b.hdrs.try_reserve_exact(BATCH).ok()?;
+        b.text.try_reserve_exact(BATCH_TEXT).ok()?;
+        b.gaps.try_reserve_exact(BATCH).ok()?;
+        Some(b)
     }
     fn clear(&mut self) {
         self.hdrs.clear();
@@ -161,7 +166,10 @@ pub fn read_span(since: u64, max: usize, f: &Filter<'_>, from_ns: u64, to_ns: u6
         return page;
     }
     let mut expected = since;
-    let mut b = Batch::new();
+    let Some(mut b) = Batch::new() else {
+        page.busy = true;
+        return page;
+    };
     loop {
         b.clear();
         let (seq_now, at_end) = {
@@ -229,7 +237,11 @@ pub fn read_tail_span(max: usize, f: &Filter<'_>, from_ns: u64, to_ns: u64) -> P
     let mut page = Page::default();
     let mut out: Vec<Record> = Vec::new();
     let mut pos: Option<u64> = None;
-    let mut b = Batch::new();
+    let Some(mut b) = Batch::new() else {
+        page.busy = true;
+        page.next = crate::next_seq();
+        return page;
+    };
     while out.len() < max {
         b.clear();
         let done = {

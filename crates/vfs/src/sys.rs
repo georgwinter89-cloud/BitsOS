@@ -84,13 +84,57 @@ pub trait UserMem {
     fn restore_sigmask(&self, _old: u64, _temp: u64, _interrupted: bool) {}
 }
 
+/// PF-7: where a call finds the calling thread's cwd, root and umask. The kernel's source (`proc::ThreadFs`) looks
+/// them up at the first use: read, write and every other call on an fd never touch the state its threads share.
+pub trait FsSource {
+    fn state(&self) -> &FsState;
+}
+
+impl FsSource for FsState {
+    fn state(&self) -> &FsState {
+        self
+    }
+}
+
+impl FsSource for Arc<FsState> {
+    fn state(&self) -> &FsState {
+        self
+    }
+}
+
+impl core::ops::Deref for dyn FsSource + '_ {
+    type Target = FsState;
+    fn deref(&self) -> &FsState {
+        self.state()
+    }
+}
+
+/// PF-7: where a call finds its mount view. The kernel's source (`proc::ns::mnt::CallView`) asks at the first use, so
+/// read, write and every other call on an fd never touch what a program's threads share for it.
+pub trait ViewSource {
+    fn view(&self) -> &Arc<MountNs>;
+}
+
+impl ViewSource for Arc<MountNs> {
+    fn view(&self) -> &Arc<MountNs> {
+        self
+    }
+}
+
+impl core::ops::Deref for dyn ViewSource + '_ {
+    type Target = Arc<MountNs>;
+    fn deref(&self) -> &Arc<MountNs> {
+        self.view()
+    }
+}
+
 /// Everything a file syscall needs from its caller.
 pub struct Sys<'a> {
     pub mem: &'a dyn UserMem,
     pub fds: &'a FdTable,
     /// FS-16: the calling thread's cwd, root and umask (Linux `current->fs`), apart from its fd table.
-    pub fs: &'a FsState,
-    pub ns: &'a Arc<MountNs>,
+    pub fs: &'a dyn FsSource,
+    pub ns: &'a dyn ViewSource,
     pub cred: Cred,
     pub subject: policy::Subject,
 }
@@ -264,7 +308,7 @@ impl<'a> Sys<'a> {
         Ok(p)
     }
     /// An fd for I/O (`fdget`): O_PATH files count as bad.
-    pub(crate) fn file(&self, fd: u64) -> Result<Arc<OpenFile>, Errno> {
+    pub fn file(&self, fd: u64) -> Result<Arc<OpenFile>, Errno> {
         let f = self.fds.get(fd_of(fd)?)?;
         if f.is_path_only() { Err(EBADF) } else { Ok(f) }
     }
@@ -426,11 +470,22 @@ pub(crate) fn notify_rw(f: &OpenFile, r: Result<i64, Errno>, write: bool) -> Res
 }
 
 pub fn read(s: &Sys<'_>, a: Args) -> i64 {
-    ret(s.file(a[0]).and_then(|f| notify_rw(&f, file_read(s, &f, a[1], a[2]), false)))
+    read_file(s, s.file(a[0]), a)
 }
 
 pub fn write(s: &Sys<'_>, a: Args) -> i64 {
-    ret(s.file(a[0]).and_then(|f| notify_rw(&f, file_write(s, &f, a[1], a[2]), true)))
+    write_file(s, s.file(a[0]), a)
+}
+
+/// PF-7: `read` with the look-up of `a[0]` done by the caller (`Sys::file`): the kernel's entry asks first whether
+/// the fd is a socket, and each look-up is a grace section and a count on the file's shared line.
+pub fn read_file(s: &Sys<'_>, f: Result<Arc<OpenFile>, Errno>, a: Args) -> i64 {
+    ret(f.and_then(|f| notify_rw(&f, file_read(s, &f, a[1], a[2]), false)))
+}
+
+/// `write` with the look-up done by the caller (`read_file`).
+pub fn write_file(s: &Sys<'_>, f: Result<Arc<OpenFile>, Errno>, a: Args) -> i64 {
+    ret(f.and_then(|f| notify_rw(&f, file_write(s, &f, a[1], a[2]), true)))
 }
 
 pub fn pread64(s: &Sys<'_>, a: Args) -> i64 {
@@ -517,7 +572,12 @@ pub fn readv(s: &Sys<'_>, a: Args) -> i64 {
 
 /// readv with `extra` status flags for a stream's `read_iter` (FS-1b: preadv2's RWF_NOWAIT is O_NONBLOCK).
 pub(crate) fn readv_with(s: &Sys<'_>, a: Args, extra: u64) -> i64 {
-    let f = match s.file(a[0]) {
+    readv_file(s, s.file(a[0]), a, extra)
+}
+
+/// `readv` with the look-up done by the caller (`read_file`).
+pub fn readv_file(s: &Sys<'_>, f: Result<Arc<OpenFile>, Errno>, a: Args, extra: u64) -> i64 {
+    let f = match f {
         Ok(f) => f,
         Err(e) => return -e,
     };
@@ -525,7 +585,6 @@ pub(crate) fn readv_with(s: &Sys<'_>, a: Args, extra: u64) -> i64 {
 }
 
 fn readv_inner(s: &Sys<'_>, f: &Arc<OpenFile>, a: Args, extra: u64) -> Result<i64, Errno> {
-    let f = f.clone();
     (|| {
         let v = iovecs(s, a[1], a[2])?;
         if !f.can_read() {
@@ -565,7 +624,12 @@ pub fn writev(s: &Sys<'_>, a: Args) -> i64 {
 }
 
 pub(crate) fn writev_with(s: &Sys<'_>, a: Args, extra: u64) -> i64 {
-    let f = match s.file(a[0]) {
+    writev_file(s, s.file(a[0]), a, extra)
+}
+
+/// `writev` with the look-up done by the caller (`read_file`).
+pub fn writev_file(s: &Sys<'_>, f: Result<Arc<OpenFile>, Errno>, a: Args, extra: u64) -> i64 {
+    let f = match f {
         Ok(f) => f,
         Err(e) => return -e,
     };
@@ -573,7 +637,6 @@ pub(crate) fn writev_with(s: &Sys<'_>, a: Args, extra: u64) -> i64 {
 }
 
 fn writev_inner(s: &Sys<'_>, f: &Arc<OpenFile>, a: Args, extra: u64) -> Result<i64, Errno> {
-    let f = f.clone();
     (|| {
         let v = iovecs(s, a[1], a[2])?;
         if !f.can_write() {

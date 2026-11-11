@@ -9,7 +9,7 @@ type R = ktest::TestResult;
 
 ktest!("cp.power.reboot_plan", Safe, reboot_plan);
 ktest!("cp.power.poweroff_plan", Safe, poweroff_plan);
-ktest!("cp.power.qemu_action", QemuOnly, qemu_action);
+ktest!("cp.power.qemu_action", Run("cp/60-power"), qemu_action);
 
 fn hypervisor() -> bool {
     hal::cpu::live().has("hypervisor")
@@ -46,10 +46,10 @@ fn poweroff_plan() -> R {
 /// back only when it failed.
 fn qemu_action() -> R {
     let Some(what) = acpi::cpu_keys().and_then(|k| k.power_test.clone()) else {
-        return ktest::skip("CONFIG cp_power_test= not set (host/tests/cp/60-power.sh sets it)");
+        return ktest::fail("CONFIG cp_power_test= not set (host/tests/cp/60-power.sh sets it)");
     };
     if !hypervisor() {
-        return ktest::skip("QEMU only");
+        return ktest::fail("QEMU only");
     }
     match what.trim() {
         "poweroff" => Err(format!("power-off came back: {:?}", crate::power::poweroff())),

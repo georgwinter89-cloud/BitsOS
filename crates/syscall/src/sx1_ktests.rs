@@ -246,7 +246,7 @@ fn programs() -> TestResult {
         if have("/bin/abi-ids") {
             return Err(String::from("the image has ABI programs but not /bin/abi-seccomp (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     let modes: [(&str, &str); 7] = [
         ("errno", include_str!("../../../user/abi-tests/expected/sx1-errno.txt")),

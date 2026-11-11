@@ -201,6 +201,10 @@ impl App {
 
     fn cursor_key(&self) -> Key {
         let px = self.cursor_px();
+        // WY-20: before bitscomp's own shapes too: nothing of bitscomp's is under a locked pointer.
+        if self.lock.hides() {
+            return Key::Hidden;
+        }
         if let Some(d) = self.cursor_deco {
             return Key::Named(d, px);
         }

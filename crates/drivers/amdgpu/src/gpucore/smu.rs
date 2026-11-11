@@ -11,6 +11,9 @@
 //! display's clocks and power (DCN has its own mailbox 67/83/91 on the same firmware, dcn314_smu.c): a message
 //! that changes clocks, Z-states, DF states or power limits is refused before anything is written (GX-D9).
 //!
+//! GX-9b: the running driver (`dpm`) has a list of its own, `allowed_running`: GFX's clock limits, the read-only tables
+//! and AllowGfxOff; no bring-up stage can send them.
+//!
 //! GX-7j3: the one writer of this mailbox is this module (`Smu` for the stages, `send_quiet` for the stop and the
 //! Quiesce); the display's mailbox (67/83/91) belongs to DMCUB and the sound driver's VBIOSSMC messages.
 
@@ -32,6 +35,23 @@ pub fn allowed(id: u32, arg: u32) -> bool {
     ALLOWED.contains(&id) && (id != msg::GFX_DEVICE_DRIVER_RESET || arg == smu13::RESET_MODE_2)
 }
 
+/// GX-9b: what the running driver may send on top of `allowed` (`send_running`), on a GC that passed bring-up: the
+/// driver table's address and its two read-only transfers (DpmClocks 4, SmuMetrics 7, argument half 0, never
+/// Dram2Smu), the feature mask, AllowGfxOff and the GFX clock's two limits in plain MHz (smu_v13_0_4_ppt.c:841-889;
+/// an argument with upper bits names no frequency here). Nothing of FCLK, SOCCLK, VCN, Z-states, power limits; no
+/// bring-up stage reaches this list: `Smu::send` and `send_quiet` stay on `ALLOWED`.
+pub fn allowed_running(id: u32, arg: u32) -> bool {
+    allowed(id, arg)
+        || match id {
+            msg::GET_ENABLED_SMU_FEATURES => arg <= 1,
+            msg::SET_DRIVER_DRAM_ADDR_HIGH | msg::SET_DRIVER_DRAM_ADDR_LOW => true,
+            msg::TRANSFER_TABLE_SMU2DRAM => arg == crate::dpm_table::TABLE_DPMCLOCKS || arg == crate::dpm_table::TABLE_SMU_METRICS,
+            msg::ALLOW_GFXOFF => arg == 0,
+            msg::SET_HARD_MIN_GFXCLK | msg::SET_SOFT_MAX_GFXCLK => arg != 0 && arg <= 0xffff,
+            _ => false,
+        }
+}
+
 /// Linux's waits: 2 s for the pre-poll and for an answer (`usec_timeout * 20` rounds of 1 us, smu_cmn.c:112).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmuTimeouts {
@@ -43,6 +63,9 @@ impl SmuTimeouts {
     pub const LINUX: SmuTimeouts = SmuTimeouts { pre_poll_us: 2_000_000, answer_us: 2_000_000 };
     /// The Quiesce hook's bound (interrupts off, other CPUs parked): the PSP's Quiesce waits (100 ms) for each.
     pub const QUIESCE: SmuTimeouts = SmuTimeouts { pre_poll_us: 100_000, answer_us: 100_000 };
+    /// GX-9b: the running driver: its messages go out under the chain's lock on the job path (B4), and every answer
+    /// of the capture came within 31 ms; a late one is seen by the next pre-poll.
+    pub const RUNNING: SmuTimeouts = SmuTimeouts { pre_poll_us: 250_000, answer_us: 250_000 };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +272,20 @@ pub fn send_quiet(hw: &mut dyn Hw, a: &Addrs, t: SmuTimeouts, id: u32, arg: u32)
     if !allowed(id, arg) {
         return Err(SmuError::Forbidden { id, arg });
     }
+    handshake(hw, a, t, id, arg)
+}
+
+/// GX-9b: `send_quiet` on the running driver's list.
+pub fn send_running(hw: &mut dyn Hw, a: &Addrs, t: SmuTimeouts, id: u32, arg: u32) -> Result<u32, SmuError> {
+    if !allowed_running(id, arg) {
+        klog::event!(Error, "gx", "smu.forbidden", id = klog::Hex(u64::from(id)), arg = klog::Hex(u64::from(arg)), name = smu13::msg_name(id);
+            "not on the running driver's list");
+        return Err(SmuError::Forbidden { id, arg });
+    }
+    handshake(hw, a, t, id, arg)
+}
+
+fn handshake(hw: &mut dyn Hw, a: &Addrs, t: SmuTimeouts, id: u32, arg: u32) -> Result<u32, SmuError> {
     let r = hw.reg_read(a.resp).ok_or(SmuError::Read { byte: a.resp })?;
     let m = hw.reg_read(a.msg).ok_or(SmuError::Read { byte: a.msg })?;
     if !(r == resp::NONE && m == 0) {

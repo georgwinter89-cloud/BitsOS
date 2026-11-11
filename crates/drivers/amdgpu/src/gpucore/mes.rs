@@ -75,8 +75,9 @@ pub const KIQ_RING_BYTES: u64 = 0x10_0000;
 pub const SCHED_RING_BYTES: u64 = 0x4000;
 pub const COMPUTE_RING_BYTES: u64 = 0x2000;
 
-/// GX-7m3: the slot `Layout::compute_state`, what the VM stage's recovery left of the compute ring. In the BO, as the
-/// stop's ring position is: a stop needs no state of the run, and every MES run zeroes it (the ring mapped afresh).
+/// GX-7m3: the slot `Layout::compute_state`, what the VM stage's recovery left of the compute ring (GX-9a: `gfx_state`, the
+/// same of GFX ring 0). In the BO, as the stop's ring position is: a stop needs no state of the run, and every MES run
+/// zeroes it (the ring mapped afresh).
 /// Mapped: 0. MES answered its REMOVE_QUEUE, the HQD is off, it is not mapped again:
 pub const COMPUTE_UNMAPPED: u64 = 1;
 /// MES holds no record of it, and its HQD is active or in an unknown state: no firmware owns it (stranded).
@@ -223,6 +224,8 @@ pub struct Layout {
     pub comp_fence64: u64,
     /// `COMPUTE_UNMAPPED`, `COMPUTE_STUCK`, else mapped.
     pub compute_state: u64,
+    /// GX-9a: the same values for GFX ring 0.
+    pub gfx_state: u64,
     pub misc_buf: u64,
     pub comp_ib_target: u64,
 }
@@ -261,6 +264,7 @@ impl Layout {
             comp_fence_ib: slot()?,
             comp_fence64: slot()?,
             compute_state: slot()?,
+            gfx_state: slot()?,
             misc_buf: t,
             comp_ib_target: t + 0x40,
         })
@@ -784,7 +788,7 @@ impl PmQueue {
         hw.store_barrier();
         let ok = hw.doorbell_write64(self.doorbell, new);
         doorbells.push((self.doorbell, new, ok));
-        klog::event!(Info, "gx", "mes.doorbell", index = self.doorbell, value = klog::Hex(new), accepted = ok);
+        klog::event!(Debug, "gx", "mes.doorbell", index = self.doorbell, value = klog::Hex(new), accepted = ok);
         if !ok {
             return Err(MesError::NoDoorbell);
         }
@@ -1131,6 +1135,9 @@ pub struct Stopped {
     pub ok: bool,
     pub lines: Vec<String>,
     pub stranded: Vec<&'static str>,
+    /// The halt's writes landed and CP_MES_CNTL reads back not running. A stranded queue does not change this: the CP's
+    /// halt covers its HQD.
+    pub mes_halted: bool,
 }
 
 /// unmap_legacy_queue (REMOVE_QUEUE) of `queues` in order, on the scheduler ring at the position the BO holds
@@ -1192,20 +1199,28 @@ pub fn stop<H: Hw>(owner: &mut Bringup<Watch<H>>, a: &MesAddrs, bo_mc: Option<u6
     } else if let (true, Some(l)) = (queues, bo_mc.and_then(Layout::new)) {
         // GX-7m3: MES no longer holds a compute ring the VM stage's recovery unmapped: no second REMOVE_QUEUE (its answer
         // is unknown, and a frame that hangs would leave GFX ring 0 unmapped too).
-        let state = rd64(owner, l.compute_state);
-        let gone = matches!(state, Some(COMPUTE_UNMAPPED | COMPUTE_STUCK));
-        if gone {
-            out.lines.push(format!("stop: the {}: no REMOVE_QUEUE (the VM stage's recovery unmapped it, MES holds no record of it)", LEGACY[0].0));
+        let states = [rd64(owner, l.compute_state), rd64(owner, l.gfx_state)];
+        let mut held = Vec::new();
+        for (q, state) in LEGACY.iter().zip(states) {
+            if matches!(state, Some(COMPUTE_UNMAPPED | COMPUTE_STUCK)) {
+                out.lines.push(format!("stop: the {}: no REMOVE_QUEUE (a recovery unmapped it, MES holds no record of it)", q.0));
+            } else {
+                held.push(*q);
+            }
         }
-        out.stranded = unmap(owner, &l, if gone { &LEGACY[1..] } else { &LEGACY[..] }, &mut out.lines);
-        if state == Some(COMPUTE_STUCK) {
-            out.stranded.insert(0, LEGACY[0].0);
+        out.stranded = unmap(owner, &l, &held, &mut out.lines);
+        for (q, state) in LEGACY.iter().zip(states).rev() {
+            if state == Some(COMPUTE_STUCK) {
+                out.stranded.insert(0, q.0);
+            }
         }
         out.ok = out.stranded.is_empty();
     }
     let res = halt_logged(owner, a);
     out.ok &= res.is_ok();
     let after = a.byte(M::CpMesCntl).and_then(|b| owner.reg_read(b));
+    out.mes_halted = res.is_ok() && after.is_some_and(|v| !mes11::cntl_running(v));
+    out.ok &= out.mes_halted;
     out.lines.push(format!("stop: MES pipes dequeued and MES halted (CP_MES_CNTL {} -> {}){}", hx32(cntl), hx32(after), match res {
         Ok(()) => String::new(),
         Err(e) => format!(": {e:?}"),

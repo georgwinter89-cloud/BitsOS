@@ -622,7 +622,7 @@ ktest!("ab.ab5.timerfd_cancel_on_set", QemuOnly, timerfd_cancel_on_set);
 /// moved.
 fn timerfd_cancel_on_set() -> TestResult {
     if time::wall::realtime_ns().is_none() {
-        return ktest::skip("no wall clock in this boot");
+        return ktest::fail("no wall clock in this boot");
     }
     const H: u64 = 3600 * SEC;
     let mut t = T::new("ab5-tfd-cancel")?;
@@ -753,7 +753,7 @@ fn programs() -> TestResult {
         if have("/bin/abi-ids") {
             return Err(String::from("the image has ABI programs but not /bin/abi-ab5 (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     let modes: [(&str, &str); 5] = [
         ("timerfd", include_str!("../../../user/abi-tests/expected/ab5-timerfd.txt")),

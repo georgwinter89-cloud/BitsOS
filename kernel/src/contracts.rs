@@ -221,7 +221,7 @@ fn console_ramframe() -> TestResult {
     kassert!(px.iter().any(|&p| p == console::FG), "text pixels in the RAM frame");
     Ok(())
 }
-ktest!("contract.console_ramframe", Safe, console_ramframe);
+ktest!("contract.console_ramframe", Screen, console_ramframe);
 
 fn evdev() -> TestResult {
     // IN-2a CR1 / IN-3 CR3: real HID devices feed the sink too, so drain first and find the injected press; then
@@ -256,7 +256,7 @@ fn metrics() -> TestResult {
     loop {
         let names = klogd::metrics::with_store(1_000_000_000, |s| ["cpu.all.busy", "metrics.cost", "mem.total"].iter().all(|n| s.has(n)));
         match names {
-            None => return ktest::skip("metrics=off"),
+            None => return ktest::fail("metrics=off"),
             Some(true) => return Ok(()),
             Some(false) if time::now_ns() < until => sched::sleep_ms(200),
             Some(false) => return Err("cpu.all.busy/metrics.cost/mem.total missing after 3 periods".into()),

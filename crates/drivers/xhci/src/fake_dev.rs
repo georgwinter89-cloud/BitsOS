@@ -12,12 +12,22 @@ pub struct FakeHubPort {
     pub powered: bool,
     pub enabled: bool,
     pub change: u16,
+    /// SuperSpeed: the link was put in SS.Disabled (no connection shows until RxDetect).
+    pub ss_off: bool,
 }
 
 pub struct FakeHub {
     pub ss: bool,
     pub ports: Vec<FakeHubPort>,
     pub desc: Vec<u8>,
+}
+
+/// A device that does not answer on endpoint 0 or its bulk endpoints until the named thing happens to its port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wedge {
+    UntilWarm,
+    /// Only losing its power brings it back.
+    UntilPower,
 }
 
 pub struct FakeDev {
@@ -29,12 +39,15 @@ pub struct FakeDev {
     pub configured: u8,
     pub alt: u8,
     pub hub_depth: Option<u16>,
+    /// String descriptors by index (index 0: the language list).
+    pub strings: BTreeMap<u8, Vec<u8>>,
     /// Setup packets seen, in order.
     pub requests: Vec<u64>,
     /// bRequest values answered with STALL.
     pub stall: Vec<u8>,
     /// Never answers on endpoint 0 (no event: the host times out).
     pub hang: bool,
+    pub wedged: Option<Wedge>,
     /// Address Device fails with a transaction error this many times.
     pub fail_addresses: usize,
     /// SET_ADDRESS straight after the reset (Address Device BSR 0 on a fresh slot) fails this many times; after
@@ -149,9 +162,11 @@ impl FakeDev {
             configured: 0,
             alt: 0,
             hub_depth: None,
+            strings: BTreeMap::new(),
             requests: Vec::new(),
             stall: Vec::new(),
             hang: false,
+            wedged: None,
             fail_addresses: 0,
             fail_direct_addresses: 0,
             reports: VecDeque::new(),
@@ -228,7 +243,7 @@ impl FakeDev {
         let mut d = FakeDev::new(speed, device_desc(if ss { 0x0300 } else { 0x0200 }, 9, proto, mps0, 0x0409, 0x55AA), config_desc(&body, 1));
         // wHubCharacteristics: TT think time 2 (bits 6:5) on a high speed hub; bPwrOn2PwrGood 50 (100 ms).
         let desc = if ss { vec![12, 0x2A, n, 0, 0, 50, 0, 0, 0, 0, 0, 0] } else { vec![9, 0x29, n, 0x40, 0, 50, 100, 0, 0xFF] };
-        let ports = (0..n).map(|_| FakeHubPort { dev: None, powered: false, enabled: false, change: 0 }).collect();
+        let ports = (0..n).map(|_| FakeHubPort { dev: None, powered: false, enabled: false, change: 0, ss_off: false }).collect();
         d.hub = Some(FakeHub { ss, ports, desc });
         d
     }
@@ -237,7 +252,7 @@ impl FakeDev {
         let mut s = 0u16;
         if p.powered {
             s |= if hub.ss { 1 << 9 } else { 1 << 8 };
-            if let Some(d) = p.dev.as_ref() {
+            if let Some(d) = p.dev.as_ref().filter(|_| !p.ss_off) {
                 s |= 1;
                 if p.enabled {
                     s |= 2;
@@ -266,6 +281,7 @@ impl FakeDev {
             (0x80, 6) => match (val >> 8) as u8 {
                 1 => Ok(self.device.clone()),
                 2 => Ok(self.config.clone()),
+                3 => self.strings.get(&(val as u8)).cloned().ok_or(()),
                 _ => Err(()),
             },
             (0x00, 9) => {
@@ -319,7 +335,16 @@ impl FakeDev {
                         p.enabled = true;
                         p.change |= if val == 28 { 0x20 } else { 0x10 };
                     }
-                    5 if ss && (idx >> 8) == 4 => p.enabled = false,
+                    5 if ss && (idx >> 8) == 4 => {
+                        p.enabled = false;
+                        p.ss_off = true;
+                    }
+                    5 if ss && (idx >> 8) == 5 => {
+                        p.ss_off = false;
+                        if p.dev.is_some() {
+                            p.change |= 1;
+                        }
+                    }
                     _ => {}
                 }
                 Ok(vec![])

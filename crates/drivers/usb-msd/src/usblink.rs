@@ -4,8 +4,10 @@
 //! completion callback queues the data phase (a device may stall IN tokens that come before its command: QEMU's
 //! does), the data's callback queues the CSW (QEMU's usb-storage loses a CSW packet queued while data is in
 //! flight), and a clean CSW's callback queues the next command's CBW. A whole run of commands costs the waiting
-//! thread one wake-up. A stage that does not finish in its time (CBW 5 s, data 10 s per 64 KiB, CSW 20 s) ends
-//! the run: both endpoints aborted, the stage reported as `Timeout`, and the BOT layer does reset recovery.
+//! thread one wake-up. A stage that does not finish in its time (CBW 5 s, data 10 s per 64 KiB, CSW 20 s) and whose
+//! endpoint the controller shows standing still (`Device::still_moving`: US-R, the clock runs on while every CPU
+//! stands still) ends the run: both endpoints aborted, the stage reported as `Timeout`, and the BOT layer does reset
+//! recovery.
 
 use crate::bot;
 use crate::link::{Cmd, Dir, Link, Ran, CBW_TIMEOUT_NS, CSW_TIMEOUT_NS};
@@ -14,15 +16,16 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ksync::{SpinLock, WaitQueue};
-use usb_core::{Buffer, Device, Request, Setup, UsbError, XferResult};
+use usb_core::{Buffer, Device, Request, ResetKind, Setup, UsbError, XferResult};
 
 /// How long a run waits for the callbacks of an aborted stage before it gives the run up.
 const ABORT_GRACE_NS: u64 = 2_000_000_000;
 
 klog::counter!(RUNS, "usb.msd.runs");
 klog::counter!(STAGE_TIMEOUTS, "usb.msd.stage_timeouts");
+klog::counter!(STAGES_LATE, "usb.msd.stages_late");
 
 pub struct UsbLink {
     dev: Arc<Device>,
@@ -33,18 +36,28 @@ pub struct UsbLink {
     small: SpinLock<Buffer>,
     /// A run was given up with transfers outstanding (`Link::take_poisoned`).
     poisoned: AtomicBool,
+    /// Fault injection of the scenario `us/55-recover`: this many Bulk-Only resets and port resets fail at once.
+    /// Looked at only on those two rare paths.
+    fail_bot_resets: AtomicU32,
+    fail_port_resets: AtomicU32,
 }
 
 impl UsbLink {
     pub fn new(dev: Arc<Device>, iface: u8, ep_in: u8, ep_out: u8) -> Result<UsbLink, UsbError> {
         let small = dev.alloc_buffer(64)?;
-        Ok(UsbLink { dev, iface, ep_in, ep_out, small: SpinLock::named("usb.msd.small", small), poisoned: AtomicBool::new(false) })
+        Ok(UsbLink { dev, iface, ep_in, ep_out, small: SpinLock::named("usb.msd.small", small), poisoned: AtomicBool::new(false),
+            fail_bot_resets: AtomicU32::new(0), fail_port_resets: AtomicU32::new(0) })
     }
     pub fn device(&self) -> &Arc<Device> {
         &self.dev
     }
     pub fn endpoints(&self) -> (u8, u8) {
         (self.ep_in, self.ep_out)
+    }
+    /// ktests: the next `bot` Bulk-Only resets and `port` port resets fail without touching the device.
+    pub fn inject_reset_failures(&self, bot: u32, port: u32) {
+        self.fail_bot_resets.store(bot, Ordering::Release);
+        self.fail_port_resets.store(port, Ordering::Release);
     }
     /// Sends raw bytes on bulk OUT (ktests: a broken CBW to drive reset recovery).
     pub fn raw_out(&self, bytes: &[u8]) -> Result<usize, UsbError> {
@@ -79,7 +92,23 @@ struct Chain {
     wq: WaitQueue,
 }
 
+fn take_one(n: &AtomicU32) -> bool {
+    let v = n.load(Ordering::Acquire);
+    v > 0 && n.compare_exchange(v, v - 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 impl Chain {
+    /// The endpoint the stage under way sits on.
+    fn stage_ep(&self, s: &ChainState) -> u8 {
+        let (i, stage) = s.stage;
+        match stage {
+            Stage::Cbw => self.ep_out,
+            Stage::Csw => self.ep_in,
+            Stage::Data if self.cmds[i].dir == Dir::In => self.ep_in,
+            Stage::Data => self.ep_out,
+        }
+    }
+
     fn finish(&self) {
         self.st.lock().done = true;
         self.wq.wake_all();
@@ -202,7 +231,19 @@ impl Link for UsbLink {
         let _ = self.dev.abort(self.ep_in);
         let _ = self.dev.abort(self.ep_out);
     }
+    fn port_reset(&self, power: bool, wait_ns: u64) -> Result<(), UsbError> {
+        if take_one(&self.fail_port_resets) {
+            return Err(UsbError::Timeout);
+        }
+        self.dev.reset_device(if power { ResetKind::RecoverPower } else { ResetKind::Recover }, wait_ns)
+    }
+    fn give_up(&self) -> bool {
+        self.dev.start_reset(ResetKind::Redetect).is_ok()
+    }
     fn bot_reset(&self) -> Result<(), UsbError> {
+        if take_one(&self.fail_bot_resets) {
+            return Err(UsbError::Timeout);
+        }
         self.dev.control_out(Setup::new(0x21, 0xFF, 0, self.iface as u16, 0), &[]).map(|_| ())
     }
     fn max_lun(&self) -> Result<u8, UsbError> {
@@ -249,17 +290,33 @@ impl Link for UsbLink {
         });
         chain.start(0);
         // Only `done` wakes the waiter (one wake-up per run). When a stage's time is up the waiter looks whether
-        // anything moved meanwhile and waits again for the stage now under way; nothing moved = timeout.
+        // anything moved meanwhile and waits again for the stage now under way; nothing moved = the controller is
+        // asked (the clock alone does not decide, US-R); it too shows nothing moving = timeout.
         let mut timed_out = false;
+        let mut last = None;
         loop {
-            let (p0, t) = {
+            let (p0, t, ep0) = {
                 let s = chain.st.lock();
-                (s.progress, s.stage_timeout)
+                (s.progress, s.stage_timeout, chain.stage_ep(&s))
             };
             if chain.wq.wait_until_timeout(|| chain.st.lock().done, t) {
                 break;
             }
             if chain.st.lock().progress != p0 {
+                last = None;
+                continue;
+            }
+            let moved = self.dev.still_moving(ep0, &mut last, &|ns| {
+                chain.wq.wait_until_timeout(|| {
+                    let s = chain.st.lock();
+                    s.done || s.progress != p0
+                }, ns)
+            });
+            if moved {
+                STAGES_LATE.inc();
+                let (i, stage) = chain.st.lock().stage;
+                klog::event!(Info, "usb", "msd.stage_late", device = self.name(), command = i, stage = format!("{stage:?}");
+                    "its time ran out but the controller shows it moving: no timeout");
                 continue;
             }
             timed_out = true;

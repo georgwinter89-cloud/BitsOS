@@ -144,12 +144,26 @@ impl Pool {
 
     /// Drops one reference to the subtree at `p`; pages and chunks left without any are freed.
     pub(crate) fn drop_tree(&mut self, p: u64, level: u32, tree: Tree) -> Result<()> {
-        if self.page_rc(p)? > 1 {
-            self.page_dec(p)?;
-            return Ok(());
-        }
+        let mut todo: Vec<(u64, u32)> = Vec::new();
+        todo.try_reserve(1).map_err(|_| VolError::NoMemory)?;
+        todo.push((p, level));
+        self.drop_steps(&mut todo, tree, u64::MAX)
+    }
+
+    /// Works on `todo`, subtrees (page, level) that each hold one reference, until none is left or `pages` pages
+    /// were opened (each may be a device read); a page still shared only loses a count. Between two calls `todo`
+    /// owns its references like any tree, so the pool may serve, write and commit in between.
+    pub(crate) fn drop_steps(&mut self, todo: &mut Vec<(u64, u32)>, tree: Tree, pages: u64) -> Result<()> {
+        let mut left = pages;
         let mut kids: Vec<u64> = Vec::new();
-        {
+        while left > 0 {
+            let Some((p, level)) = todo.pop() else { return Ok(()) };
+            if self.page_rc(p)? > 1 {
+                self.page_dec(p)?;
+                continue;
+            }
+            left -= 1;
+            kids.clear();
             let n = if level > 0 { INNER_FANOUT } else { LEAF_FANOUT };
             kids.try_reserve(n as usize).map_err(|_| VolError::NoMemory)?;
             let b = self.checked_page(p, level, tree)?;
@@ -159,15 +173,19 @@ impl Pool {
                     kids.push(c);
                 }
             }
-        }
-        self.page_dec(p)?;
-        for c in kids {
-            match (level, tree) {
-                (0, Tree::Map) => self.chunk_dec(c)?,
-                (0, Tree::Table) => {
-                    self.page_dec(c)?;
+            self.page_dec(p)?;
+            if level > 0 {
+                todo.try_reserve(kids.len()).map_err(|_| VolError::NoMemory)?;
+                todo.extend(kids.iter().map(|&c| (c, level - 1)));
+                continue;
+            }
+            for &c in &kids {
+                match tree {
+                    Tree::Map => self.chunk_dec(c)?,
+                    Tree::Table => {
+                        self.page_dec(c)?;
+                    }
                 }
-                _ => self.drop_tree(c, level - 1, tree)?,
             }
         }
         Ok(())

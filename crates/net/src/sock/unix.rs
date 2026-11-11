@@ -95,6 +95,26 @@ pub(crate) struct Packet {
     _charge: Option<Charge>,
 }
 
+/// Copies `src` into `buf` if it fits without allocating; false asks the caller to `grow` first.
+///
+/// The receive paths copy out of the queue under `st`, a spin lock, where the heap can neither reclaim nor fall
+/// back to single frames: a 36 KiB copy allocated there found no free run during a large download and brought
+/// the kernel down (Mini-PC, 11.11.2026). The buffer is made outside the lock instead, where the heap may wait.
+pub(super) fn fill(buf: &mut Vec<u8>, src: &[u8]) -> bool {
+    if buf.capacity() < src.len() {
+        return false;
+    }
+    buf.clear();
+    buf.extend_from_slice(src);
+    true
+}
+
+/// Makes room for `n` bytes; called with no spin lock held.
+pub(super) fn grow(buf: &mut Vec<u8>, n: usize) -> Result<(), Errno> {
+    buf.clear();
+    buf.try_reserve_exact(n).map_err(|_| ENOMEM)
+}
+
 impl Packet {
     fn left(&self) -> usize {
         self.data.len() - self.consumed
@@ -621,18 +641,23 @@ impl UnixSock {
                 e.path = lpath;
                 e.embryo = true;
             }
-            let pushed = {
+            // The listener's queue grows with its `st` dropped (`ksync::spare`); every round looks again.
+            let mut spare = ksync::Spare::new();
+            let pushed = loop {
                 let mut o = other.st.lock();
                 if o.dead || o.state != State::Listen || o.shutdown & RCV_SHUTDOWN != 0 || o.q.len() > o.backlog {
-                    None
-                } else if o.q.try_reserve(1).is_err() {
-                    drop(o);
-                    embryo.forget();
-                    return Err(ENOMEM);
-                } else {
-                    o.q.push_back(Packet { data: Vec::new(), consumed: 0, from: None, creds: None, files: None, conn: Some(embryo.clone()), _charge: None });
-                    Some(o.peercred)
+                    break None;
                 }
+                if !spare.fits(&mut o.q, 1) {
+                    drop(o);
+                    if spare.grow().is_err() {
+                        embryo.forget();
+                        return Err(ENOMEM);
+                    }
+                    continue;
+                }
+                o.q.push_back(Packet { data: Vec::new(), consumed: 0, from: None, creds: None, files: None, conn: Some(embryo.clone()), _charge: None });
+                break Some(o.peercred);
             };
             match pushed {
                 Some(cred) => {
@@ -845,18 +870,27 @@ impl UnixSock {
 
     /// Unix sockets whose open files sit in this socket's queue (and in its embryos' queues).
     pub(crate) fn inflight_children(&self) -> Vec<Arc<UnixSock>> {
-        let mut out = Vec::new();
-        let mut embryos = Vec::new();
-        {
-            let s = self.st.lock();
-            for pk in &s.q {
-                if let Some(f) = &pk.files {
-                    out.extend(f.files_unix());
+        // Room for both lists is made with `st` dropped (see `fill`); a queue that grew meanwhile asks again.
+        let mut out: Vec<Arc<UnixSock>> = Vec::new();
+        let mut embryos: Vec<Arc<UnixSock>> = Vec::new();
+        loop {
+            let (files, conns) = {
+                let s = self.st.lock();
+                let files: usize = s.q.iter().filter_map(|pk| pk.files.as_ref()).map(InFlight::len).sum();
+                let conns = s.q.iter().filter(|pk| pk.conn.is_some()).count();
+                if files <= out.capacity() && conns <= embryos.capacity() {
+                    for pk in &s.q {
+                        if let Some(f) = &pk.files {
+                            f.sockets_into(&mut out);
+                        }
+                        embryos.extend(pk.conn.iter().cloned());
+                    }
+                    break;
                 }
-                if let Some(e) = &pk.conn {
-                    embryos.push(e.clone());
-                }
-            }
+                (files, conns)
+            };
+            out.reserve_exact(files);
+            embryos.reserve_exact(conns);
         }
         for e in embryos {
             out.extend(e.inflight_children());
@@ -971,17 +1005,23 @@ impl UnixSock {
             let from = self.st.lock().name.clone();
             let charge = self.charge(size);
             let mut pk = Packet { data, consumed: 0, from, creds: None, files: files.take(), conn: None, _charge: Some(charge) };
-            let refused = {
+            // The peer's queue grows with its `st` dropped (`ksync::spare`); every round looks again.
+            let mut spare = ksync::Spare::new();
+            let refused = loop {
                 let mut o = peer.st.lock();
                 if o.dead || o.shutdown & RCV_SHUTDOWN != 0 {
-                    Some(Ok(pk))
-                } else if o.q.try_reserve(1).is_err() {
-                    Some(Err(pk))
-                } else {
-                    pk.creds = self.creds_for(a.creds, &o, &peer, &a.caller);
-                    o.q.push_back(pk);
-                    None
+                    break Some(Ok(pk));
                 }
+                if !spare.fits(&mut o.q, 1) {
+                    drop(o);
+                    if spare.grow().is_err() {
+                        break Some(Err(pk));
+                    }
+                    continue;
+                }
+                pk.creds = self.creds_for(a.creds, &o, &peer, &a.caller);
+                o.q.push_back(pk);
+                break None;
             };
             match refused {
                 Some(Ok(pk)) => {
@@ -1030,6 +1070,8 @@ impl UnixSock {
         let from = self.st.lock().name.clone();
         let charge = self.charge(len);
         let mut pk = Some(Packet { data, consumed: 0, from, creds: None, files, conn: None, _charge: Some(charge) });
+        // The receiver's queue grows with its `st` dropped (`ksync::spare`); the round after looks again.
+        let mut spare = ksync::Spare::new();
         loop {
             let o = match &other {
                 Some(o) => o.clone(),
@@ -1042,6 +1084,7 @@ impl UnixSock {
                 Done,
                 Dead,
                 Full,
+                Grow,
             }
             let next = {
                 let mut g = o.st.lock();
@@ -1057,8 +1100,9 @@ impl UnixSock {
                     && g.q.len() > g.backlog
                 {
                     Next::Full
+                } else if !spare.fits(&mut g.q, 1) {
+                    Next::Grow
                 } else {
-                    g.q.try_reserve(1).map_err(|_| ENOMEM)?;
                     let mut p = pk.take().ok_or(EINVAL)?;
                     p.creds = self.creds_for(a.creds, &g, &o, &a.caller);
                     g.q.push_back(p);
@@ -1070,6 +1114,7 @@ impl UnixSock {
                     o.wake();
                     return Ok(len);
                 }
+                Next::Grow => spare.grow().map_err(|_| ENOMEM)?,
                 Next::Dead => {
                     if self.ty == UType::SeqPacket {
                         return Err(EPIPE);
@@ -1123,10 +1168,12 @@ impl UnixSock {
     fn dgram_recv(&self, size: usize, flags: u32, dl: Deadline, sink: &mut dyn FnMut(&[u8]) -> Result<(), Errno>, want_from: bool) -> Result<Received, Errno> {
         let peek = flags & MSG_PEEK != 0;
         let _io = self.io.lock();
+        let mut buf: Vec<u8> = Vec::new();
         let got = loop {
             enum Look {
                 Got(Packet),
-                Peeked(Vec<u8>, usize, Option<UnixName>, Option<Ucred>, Vec<Arc<OpenFile>>),
+                Peeked(usize, Option<UnixName>, Option<Ucred>, Vec<Arc<OpenFile>>),
+                Grow(usize),
                 Empty,
             }
             let look = {
@@ -1138,10 +1185,11 @@ impl UnixSock {
                     match s.q.front() {
                         Some(p) => {
                             let n = size.min(p.data.len());
-                            let mut d = Vec::new();
-                            d.try_reserve_exact(n).map_err(|_| ENOMEM)?;
-                            d.extend_from_slice(&p.data[..n]);
-                            Look::Peeked(d, p.data.len(), p.from.clone(), p.creds, p.files.as_ref().map(|f| f.peek()).unwrap_or_default())
+                            if !fill(&mut buf, &p.data[..n]) {
+                                Look::Grow(n)
+                            } else {
+                                Look::Peeked(p.data.len(), p.from.clone(), p.creds, p.files.as_ref().map(|f| f.peek()).unwrap_or_default())
+                            }
                         }
                         None => Look::Empty,
                     }
@@ -1163,9 +1211,13 @@ impl UnixSock {
                     let Packet { from, creds, files, .. } = p;
                     break (n, len, from, creds, files.map(|f| f.take()).unwrap_or_default());
                 }
-                Look::Peeked(d, len, from, creds, files) => {
-                    sink(&d)?;
-                    break (d.len(), len, from, creds, files);
+                Look::Peeked(len, from, creds, files) => {
+                    sink(&buf)?;
+                    break (buf.len(), len, from, creds, files);
+                }
+                Look::Grow(n) => {
+                    grow(&mut buf, n)?;
+                    continue;
                 }
                 Look::Empty => {}
             }
@@ -1219,12 +1271,14 @@ impl UnixSock {
         // Peeking walks the queue: packet index and offset inside it.
         let (mut pi, mut poff) = (0usize, 0usize);
         let mut err: Option<i64> = None;
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             if copied >= size && size > 0 {
                 break;
             }
             enum Step {
-                Chunk(Vec<u8>, Option<Ucred>, Option<UnixName>, bool),
+                Chunk(Option<Ucred>, Option<UnixName>, bool),
+                Grow(usize),
                 Stop,
                 Wait,
             }
@@ -1256,12 +1310,12 @@ impl UnixSock {
                                 } else {
                                     let off = if peek { p.consumed + poff } else { p.consumed };
                                     let n = (p.data.len() - off).min(size - copied);
-                                    Step::Chunk(p.data[off..off + n].to_vec(), p.creds, p.from.clone(), p.files.is_some())
+                                    if fill(&mut buf, &p.data[off..off + n]) { Step::Chunk(p.creds, p.from.clone(), p.files.is_some()) } else { Step::Grow(n) }
                                 }
                             } else {
                                 let off = if peek { p.consumed + poff } else { p.consumed };
                                 let n = (p.data.len() - off).min(size - copied);
-                                Step::Chunk(p.data[off..off + n].to_vec(), p.creds, p.from.clone(), p.files.is_some())
+                                if fill(&mut buf, &p.data[off..off + n]) { Step::Chunk(p.creds, p.from.clone(), p.files.is_some()) } else { Step::Grow(n) }
                             }
                         }
                     }
@@ -1294,14 +1348,22 @@ impl UnixSock {
                     io = Some(self.io.lock());
                     continue;
                 }
-                Step::Chunk(bytes, pc, pfrom, has_files) => {
+                Step::Grow(n) => {
+                    if let Err(e) = grow(&mut buf, n) {
+                        err = Some(e);
+                        break;
+                    }
+                    continue;
+                }
+                Step::Chunk(pc, pfrom, has_files) => {
+                    let bytes = &buf[..];
                     if creds.is_none() && passcred {
                         creds = Some(pc);
                     }
                     if want_from && from.is_none() {
                         from = pfrom.map(|f| f.bytes().to_vec());
                     }
-                    if let Err(e) = sink(&bytes) {
+                    if let Err(e) = sink(bytes) {
                         if copied == 0 {
                             err = Some(e);
                         }
@@ -1410,11 +1472,5 @@ impl UnixSock {
     /// SIOCOUTQ: what this socket has queued at others (with the per-packet overhead, as Linux's truesize).
     pub fn outq(&self) -> usize {
         self.wmem.load(Ordering::Acquire)
-    }
-}
-
-impl InFlight {
-    fn files_unix(&self) -> Vec<Arc<UnixSock>> {
-        self.sockets()
     }
 }

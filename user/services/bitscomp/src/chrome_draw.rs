@@ -60,6 +60,8 @@ pub struct TopLook {
     pub text: String,
     pub cursor: Option<String>,
     pub hover: Option<Part>,
+    /// PK-L1b: the library is open (its button is lit).
+    pub library: bool,
     /// The context chip slot (none until the context service, CX-6).
     pub context: Option<String>,
 }
@@ -96,6 +98,11 @@ pub fn top(l: &TopLook, t: &Theme) -> Canvas {
         c.rrect_line(b, p.v(8.0), p.line(), if l.hover == Some(part) { t.muted } else { t.line });
         glyph_into(&mut c, g, b.inset(p.v(6.0)), t.muted);
     }
+    // PK-L1b: the "Programme" button (the library), lit while it is open.
+    let pb = p.b(c0.programs);
+    c.rrect(pb, p.v(8.0), if l.library { t.accent_soft } else { t.panel2 });
+    c.rrect_line(pb, p.v(8.0), p.line(), if l.library { t.accent } else if l.hover == Some(Part::Programs) { t.muted } else { t.line });
+    glyph_into(&mut c, Glyph::Programs, pb.inset(p.v(6.0)), if l.library { t.accent } else { t.text });
     let a = p.b(c0.address);
     let top_mode = t.layout.address_top;
     let lit = top_mode || l.cursor.is_some() || l.hover == Some(Part::Address);

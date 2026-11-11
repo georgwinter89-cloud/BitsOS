@@ -6,8 +6,7 @@
 //!
 //! The namespace is taken when a name is looked up (at open), so an open file keeps showing the namespace it
 //! was opened in after its reader moved (Linux's seq files keep their `struct net`). What V2 does not keep shows
-//! Linux's value for an idle socket: queues 0, no timer, socket inode 0 (V2's sockets have no inode numbers),
-//! the kernel pointer as `%pK` prints it without CAP_SYSLOG (zeros).
+//! Linux's value for an idle socket: queues 0, no timer, the kernel pointer as `%pK` prints it without CAP_SYSLOG (zeros).
 //!
 //! A read takes a short reference to each socket of the namespace and changes none of them (no state is synced
 //! for its owner). A socket whose program closes it during the read is released when the read drops that
@@ -153,10 +152,10 @@ pub fn route(routes: Vec<ifview::Route4>) -> String {
 /// the port (Linux's table size depends on the memory).
 fn inet(tcp: bool, r: &Reader) -> String {
     let mut s = String::new();
-    let rows = SockFile::all_in(&r.net).into_iter().filter_map(|f| f.inet().and_then(|i| i.proc_row())).filter(|x| x.tcp == tcp);
+    let rows = SockFile::all_in(&r.net).into_iter().filter_map(|f| f.inet().and_then(|i| i.proc_row()).map(|x| (x, f.ino()))).filter(|(x, _)| x.tcp == tcp);
     if tcp {
         padded(&mut s, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode", 149);
-        for (n, x) in rows.enumerate() {
+        for (n, (x, ino)) in rows.enumerate() {
             let listen = x.state == crate::sock::inet::TCP_LISTEN;
             // rto, ato, quick/pingpong, cwnd, ssthresh (or the fastopen queue of a listener) of a fresh socket.
             let tail = if listen { "100 0 0 10 0" } else { "20 4 0 10 -1" };
@@ -175,7 +174,7 @@ fn inet(tcp: bool, r: &Reader) -> String {
                 0,
                 r.uid(x.uid),
                 0,
-                0,
+                ino,
                 1,
                 0,
                 tail
@@ -184,7 +183,7 @@ fn inet(tcp: bool, r: &Reader) -> String {
         }
     } else {
         padded(&mut s, "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops", 127);
-        for x in rows {
+        for (x, ino) in rows {
             let line = format!(
                 "{:5}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {}",
                 x.local.port,
@@ -200,7 +199,7 @@ fn inet(tcp: bool, r: &Reader) -> String {
                 0,
                 r.uid(x.uid),
                 0,
-                0,
+                ino,
                 2,
                 0,
                 0
@@ -230,7 +229,7 @@ fn unix(r: &Reader) -> String {
             if listen { SO_ACCEPTCON } else { 0 },
             u.ty.linux(),
             if connected { SS_CONNECTED } else { SS_UNCONNECTED },
-            0
+            f.ino()
         );
         if let Some(n) = name {
             s.push_str(&unix_path(&n));

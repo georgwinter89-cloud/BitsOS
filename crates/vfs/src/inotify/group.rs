@@ -10,7 +10,7 @@
 //!   faults is lost (EFAULT, or the bytes so far).
 //! - **wd** (`idr_alloc_cyclic(.., 1, 0)`): the next free number after the last one handed out, from 1.
 
-use super::{sys, Watch, ACTIVE, EVENT_SIZE, IN_IGNORED, IN_Q_OVERFLOW, OVERFLOWS};
+use super::{sys, Watch, WATCHING, EVENT_SIZE, IN_IGNORED, IN_Q_OVERFLOW, OVERFLOWS};
 use crate::abi::{self, Attr};
 use crate::inode::Inode;
 use crate::node::{File, IoSink};
@@ -89,45 +89,51 @@ impl Group {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        {
+        // The queue (up to `max_events` records) grows with its lock dropped: under a spin lock the heap can
+        // neither reclaim nor fall back to single frames, and `try_reserve` there lost events although memory
+        // was there (see `ksync::spare`). Every round looks at the queue again.
+        let mut spare = ksync::Spare::new();
+        loop {
             let mut q = self.q.lock();
-            if q.ev.len() >= self.max_events {
-                if q.overflow_queued {
-                    return;
+            let full = q.ev.len() >= self.max_events;
+            if full && q.overflow_queued || !full && q.ev.back().is_some_and(|l| l.same(wd, mask, name)) {
+                return;
+            }
+            // One record goes in below: the event or the overflow mark.
+            if !spare.fits(&mut q.ev, 1) {
+                drop(q);
+                if spare.grow().is_err() {
+                    break;
                 }
+                continue;
+            }
+            if full {
                 if !self.push_overflow(&mut q) {
                     return;
                 }
-            } else if q.ev.back().is_some_and(|l| l.same(wd, mask, name)) {
-                return;
-            } else {
-                let name = match name {
-                    Some(n) => {
-                        let mut v = Vec::new();
-                        if v.try_reserve_exact(n.len()).is_err() {
-                            self.push_overflow(&mut q);
-                            drop(q);
-                            self.wq.wake_one();
-                            return;
-                        }
-                        v.extend_from_slice(n);
-                        Some(v.into_boxed_slice())
-                    }
-                    None => None,
-                };
-                if q.ev.try_reserve(1).is_err() {
-                    self.push_overflow(&mut q);
-                } else {
-                    q.ev.push_back(Event { wd, mask, cookie, name });
-                }
+                break;
             }
+            let name = match name {
+                Some(n) => {
+                    let mut v = Vec::new();
+                    if v.try_reserve_exact(n.len()).is_err() {
+                        self.push_overflow(&mut q);
+                        break;
+                    }
+                    v.extend_from_slice(n);
+                    Some(v.into_boxed_slice())
+                }
+                None => None,
+            };
+            q.ev.push_back(Event { wd, mask, cookie, name });
+            break;
         }
         self.wq.wake_one();
     }
 
-    /// The one overflow event (if not queued already and if there is room for its record).
+    /// The one overflow event (if not queued already and if there is room for its record: `queue` made it).
     fn push_overflow(&self, q: &mut Queue) -> bool {
-        if q.overflow_queued || q.ev.try_reserve(1).is_err() {
+        if q.overflow_queued || q.ev.len() == q.ev.capacity() {
             return false;
         }
         OVERFLOWS.inc();
@@ -217,6 +223,7 @@ impl Group {
             }
             let old = w.mask();
             w.mask.store(if mask & IN_MASK_ADD != 0 { old | bits } else { bits }, Ordering::Release);
+            inode.marks.mask_changed();
             return Ok(w.wd);
         }
         sys::take_watch(self.uid)?;
@@ -229,7 +236,6 @@ impl Group {
             sys::give_watch(self.uid);
             return Err(e);
         }
-        ACTIVE.fetch_add(1, Ordering::Relaxed);
         t.by_wd.insert(wd, (w, inode.clone()));
         t.last_wd = wd;
         Ok(wd)
@@ -248,7 +254,7 @@ impl Group {
     }
 
     /// inotify_rm_watch: EINVAL for a wd it does not have.
-    pub(crate) fn remove_watch(&self, wd: i32) -> Result<(), Errno> {
+    pub fn remove_watch(&self, wd: i32) -> Result<(), Errno> {
         let (w, inode) = self.table.lock().by_wd.get(&wd).cloned().ok_or(EINVAL)?;
         super::end(&w, &inode);
         Ok(())
@@ -279,7 +285,7 @@ impl Drop for Group {
         for (_, (w, inode)) in t {
             if !w.dead.swap(true, Ordering::AcqRel) {
                 inode.marks.remove(&w);
-                ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                WATCHING.active.fetch_sub(1, Ordering::Relaxed);
                 sys::give_watch(self.uid);
             }
         }

@@ -49,6 +49,8 @@ pub struct TaskPrctl {
     io_flusher: AtomicBool,
     securebits: AtomicU32,
     cap_bset: AtomicU64,
+    /// GM-2a CR 4: `current->personality` (personality(2), /proc/<pid>/personality).
+    personality: AtomicU32,
     seccomp: seccomp::TaskSeccomp,
 }
 
@@ -70,6 +72,7 @@ impl TaskPrctl {
             io_flusher: AtomicBool::new(false),
             securebits: AtomicU32::new(0),
             cap_bset: AtomicU64::new(CAP_FULL_SET),
+            personality: AtomicU32::new(0),
             seccomp: seccomp::TaskSeccomp::new(),
         }
     }
@@ -86,6 +89,7 @@ impl TaskPrctl {
         self.io_flusher.store(from.io_flusher(), Ordering::Relaxed);
         self.securebits.store(from.securebits(), Ordering::Relaxed);
         self.cap_bset.store(from.cap_bset(), Ordering::Relaxed);
+        self.personality.store(from.personality(), Ordering::Relaxed);
         self.seccomp.inherit(&from.seccomp);
     }
     /// SX-1: `Group::add_thread` under `proc.threads`: the creator's no_new_privs and seccomp stack again, in
@@ -118,6 +122,17 @@ impl TaskPrctl {
     }
     pub fn set_pdeath_signal(&self, s: u32) {
         self.pdeath_signal.store(s, Ordering::Release);
+    }
+    pub fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Relaxed)
+    }
+    pub fn set_personality(&self, p: u32) {
+        self.personality.store(p, Ordering::Relaxed);
+    }
+    /// `begin_new_exec` with set-id bits: `me->personality &= ~bprm->per_clear` (`PER_CLEAR_ON_SETID`:
+    /// READ_IMPLIES_EXEC, ADDR_NO_RANDOMIZE, ADDR_COMPAT_LAYOUT, MMAP_PAGE_ZERO; linux-6.6/include/uapi/linux/personality.h).
+    pub fn clear_personality_on_setid(&self) {
+        self.personality.fetch_and(!0x0074_0000, Ordering::Relaxed);
     }
     pub fn no_new_privs(&self) -> bool {
         self.no_new_privs.load(Ordering::Acquire)

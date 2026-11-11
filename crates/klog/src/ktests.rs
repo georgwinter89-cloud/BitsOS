@@ -51,7 +51,7 @@ ktest!("rb.klog.early_ring_survives", Safe, early_survives);
 /// (only NMI/#MC can, and they use try_event!).
 fn ring_masks_irqs() -> TestResult {
     if !hal::cpu::interrupts_enabled() {
-        return ktest::skip("interrupts are off in the test runner, nothing to mask");
+        return ktest::fail("interrupts are off in the test runner, nothing to mask");
     }
     let inside = crate::__with_ring_held(hal::cpu::interrupts_enabled);
     kassert!(!inside, "interrupts were on while the ring was held");

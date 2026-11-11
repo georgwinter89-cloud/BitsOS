@@ -3,7 +3,7 @@
 # `irq enabled` and `kernel ready`, QEMU's HMP `info lapic` and `info pic` are compared with the MADT and the
 # kernel's `irq route` events (apic_check.py): every routed pin (SCI, PS/2) with the MADT's trigger/polarity,
 # its vector and the BSP as destination, masked until an owner installs a handler; every other pin masked,
-# SVR 0x1FF, LINT0 masked, NMI on LINT1, LVT timer masked, both 8259s masked at 0x20/0x28. Needs the kernel hooks (desk change requests CP-2/1, CP-3/1).
+# SVR 0x1FF, LINT0 masked, NMI on LINT1, LVT timer on its vector, both 8259s masked at 0x20/0x28. Needs the kernel hooks (desk change requests CP-2/1, CP-3/1).
 set -eu
 cd "$BITSOS_ROOT"
 RUN="$BITSOS_RUN_DIR"

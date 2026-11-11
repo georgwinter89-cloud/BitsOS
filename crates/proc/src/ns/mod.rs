@@ -5,7 +5,7 @@
 //! - `pid`: pid namespaces; every process and thread keeps its one global id (TABLE/TASKS, procfs) and gets a
 //!   number in each pid namespace from its own up to the first level below the initial one, where programs see
 //!   it (`getpid`, `fork`'s answer, `kill`'s argument, wait results, si_pid).
-//! - `misc`: UTS (its own host and domain name), IPC (empty: V2 has no SysV IPC), network (only `lo`; the
+//! - `misc`: UTS (its own host and domain name), IPC (its SysV tables, `crate::ipc`), network (only `lo`; the
 //!   socket rules live in the syscall glue until NW's per-namespace views exist).
 //! - `mnt` (SX-3a): mount namespaces around FS's views (`vfs::MountNs`).
 //! - `NsSet` (Linux `nsproxy`): what a group's members use and its children get.

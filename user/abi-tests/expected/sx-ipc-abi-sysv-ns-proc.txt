@@ -1,0 +1,78 @@
+/proc/sys/kernel/sem: 32000	1024000000	500	32000
+mode 644 uid 0
+/proc/sys/kernel/shmmax: 18446744073692774399
+mode 644 uid 0
+/proc/sys/kernel/shmall: 18446744073692774399
+mode 644 uid 0
+/proc/sys/kernel/shmmni: 4096
+mode 644 uid 0
+/proc/sys/kernel/msgmax: 8192
+mode 644 uid 0
+/proc/sys/kernel/msgmnb: 16384
+mode 644 uid 0
+/proc/sys/kernel/msgmni: 32000
+mode 644 uid 0
+/proc/sys/kernel/shm_rmid_forced: 0
+mode 644 uid 0
+/proc/sys/kernel/auto_msgmni: 0
+mode 644 uid 0
+/proc/sys/kernel/sem_next_id: -1
+mode 444 uid 0
+/proc/sys/kernel/shm_next_id: -1
+mode 444 uid 0
+/proc/sys/kernel/msg_next_id: -1
+mode 444 uid 0
+/proc/sysvipc/sem:        key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime
+/proc/sysvipc/shm:        key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap
+/proc/sysvipc/msg:        key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime
+ids 0 0 0
+sem 1371594240 0 640 3 0 0 0 0 otime0 1 ctime 1
+sem line len 84
+shm line len 169
+shm 1371594240 0 604 5000 me 1 lp 0 nat 0 0 0 0 0 rss 0 swp 0
+msg line len 119
+msg 1371594240 0 620 2 1 me 1 lr 0 0 0 0 0
+msgmax = 4
+/proc/sys/kernel/msgmax: 100
+over the new msgmax = -EINVAL
+msgmax negative = -EINVAL
+msgmax junk = -EINVAL
+msgmax blank = -EINVAL
+msgmax too big = -EINVAL
+msgmni over IPCMNI = -EINVAL
+msgmni at IPCMNI = 6
+shmmni over IPCMNI = -EINVAL
+msgmnb = 3
+new queue qbytes 64
+sem two values = 6
+/proc/sys/kernel/sem: 11	22	500	32000
+over semmsl = -EINVAL
+sem four values = 8
+/proc/sys/kernel/sem: 2	4	3	5
+over semmns = -ENOSPC
+over semopm = -E2BIG
+sem semmni range = -ERANGE
+/proc/sys/kernel/sem: 9	9	9	5
+sem negative = 3
+/proc/sys/kernel/sem: -5	9	9	5
+sem bad = -EINVAL
+forced range = -EINVAL
+auto_msgmni = 2
+/proc/sys/kernel/auto_msgmni: 0
+auto_msgmni range = -EINVAL
+shmmax hex = 7
+/proc/sys/kernel/shmmax: 4096
+shm_next_id = 6
+/proc/sys/kernel/shm_next_id: 98304
+takes the asked id = 98305
+/proc/sys/kernel/shm_next_id: -1
+sem_next_id bad = -EINVAL
+unshare = 0
+/proc/sys/kernel/msgmax: 8192
+/proc/sysvipc/sem:        key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime
+no-caps root still the owner = 4
+next_id wants a capability = -EACCES
+access W msgmax 0
+access X msgmax -1
+access W sysvipc -1
+sysvipc read only = -EACCES

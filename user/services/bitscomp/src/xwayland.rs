@@ -4,14 +4,25 @@
 //! and `-displayfd` to say when it is ready. Programs bitscomp starts get DISPLAY=:<n>. When Xwayland ends, its
 //! windows go and the sockets wait for the next client; three ends within 2 s of their starts in a row close the
 //! display until bitscomp restarts (B6: every step is a line).
+//!
+//! WY-3b: glamor and DRI3 when bitscomp itself draws on the chip and names a render node that opens (`choose`), with the
+//! Mesa tree's EGL variables for Xwayland alone; else XWAYLAND_NO_GLAMOR, the software Xwayland of WY-3. A glamor start that
+//! ends quickly or misses its deadline does not count against the display: the next start is in software, and the
+//! client waiting in the socket's queue is served by it. While a glamor Xwayland runs, a helper thread looks at the node
+//! every `NODE_LOOK` (a lost device answers a new open with ENODEV, drivers/amdgpu `hw/mod.rs`): new windows would never
+//! get a buffer there, so Xwayland ends and the next client gets the software one. Only an answer that says the device
+//! is gone does that (`NodeLook`); bitscomp short of fds says nothing about the node. The open is off the loop: a driver
+//! that blocks in it costs the look, not the desktop.
 
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use smithay::reexports::calloop::channel::{self, Sender};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
@@ -28,6 +39,162 @@ const QUICK_END: Duration = Duration::from_secs(2);
 const QUICK_ENDS_MAX: u32 = 3;
 /// How long Xwayland may take from its start to serving the display (displayfd written and WM_S0 taken).
 const READY_DEADLINE: Duration = Duration::from_secs(10);
+/// The same with glamor: it also starts EGL and the driver, read from the stick the first time (`flavour::CHECK_TIMEOUT_GLES`).
+const READY_DEADLINE_GLAMOR: Duration = Duration::from_secs(30);
+/// How often the render node is looked at while a glamor Xwayland runs: one open and close, nothing else.
+const NODE_LOOK: Duration = Duration::from_secs(5);
+/// How long a start waits for the look at the node, on the loop; only a driver that blocks in its open ever takes this long.
+const START_LOOK: Duration = Duration::from_secs(1);
+
+/// `--xwayland-glamor`: `Auto` decides by `choose`; `Force` is a test's: glamor whatever draws, watching the file named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Glamor {
+    Auto,
+    Off,
+    Force(String),
+}
+
+impl Glamor {
+    pub fn parse(v: &str) -> Option<Glamor> {
+        match v {
+            "auto" => Some(Glamor::Auto),
+            "off" => Some(Glamor::Off),
+            _ => v.strip_prefix("force:").filter(|p| !p.is_empty()).map(|p| Glamor::Force(p.into())),
+        }
+    }
+}
+
+/// What the next start depends on (`inputs`).
+#[derive(Clone, Debug, Default)]
+struct Inputs {
+    /// A start with glamor that failed, or a node that was lost, until bitscomp restarts.
+    given_up: Option<String>,
+    /// The gpu build's Mesa tree; the rescue build has none.
+    tree: Option<String>,
+    reads_by_cpu: bool,
+    /// What linux-dmabuf names (`dmabuf::advertised`): 0 means Xwayland would find no device.
+    main_device: u64,
+    node: Option<String>,
+    /// Why `node` will not do for this start, when a look says so (`NodeLook::bars_a_start`).
+    node_error: Option<String>,
+}
+
+/// The render node for a start with glamor, or why that start has none. Glamor's buffers are the chip's own memory, which
+/// a renderer reading by CPU cannot map (WY-17b), so `--main-device render` under Pixman stays in software too.
+fn choose(want: &Glamor, i: &Inputs) -> Result<String, String> {
+    match want {
+        Glamor::Off => return Err("--xwayland-glamor off".into()),
+        Glamor::Force(p) if i.given_up.is_none() => return Ok(p.clone()),
+        _ => {}
+    }
+    if let Some(why) = &i.given_up {
+        return Err(why.clone());
+    }
+    if i.tree.is_none() {
+        return Err("this build has no Mesa tree".into());
+    }
+    if i.reads_by_cpu {
+        return Err("the renderer reads by CPU".into());
+    }
+    if i.main_device == 0 {
+        return Err("linux-dmabuf names no main device".into());
+    }
+    let Some(node) = &i.node else { return Err("no render node".into()) };
+    if let Some(e) = &i.node_error {
+        return Err(format!("{node} does not open: {e}"));
+    }
+    Ok(node.clone())
+}
+
+/// What a new open of the node says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NodeLook {
+    Opens,
+    /// The device is lost or unplugged (a lost device takes no new file; an unplugged node is gone).
+    Gone(String),
+    /// It is there and will not open (EACCES, or no answer in time): Xwayland's own open would meet the same.
+    Refused(String),
+    /// bitscomp's own shortage or a passing state (EMFILE, ENOMEM, EBUSY): nothing about the device.
+    Unsure(String),
+}
+
+impl NodeLook {
+    fn of(e: &std::io::Error) -> NodeLook {
+        let text = e.to_string();
+        match e.raw_os_error() {
+            Some(libc::ENODEV | libc::ENXIO | libc::ENOENT) => NodeLook::Gone(text),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EAGAIN | libc::EBUSY | libc::EINTR) => NodeLook::Unsure(text),
+            _ => NodeLook::Refused(text),
+        }
+    }
+
+    /// For a start: `Unsure` does not bar glamor, a glamor start that does fail costs a client nothing.
+    fn bars_a_start(&self) -> Option<&str> {
+        match self {
+            NodeLook::Gone(e) | NodeLook::Refused(e) => Some(e),
+            NodeLook::Opens | NodeLook::Unsure(_) => None,
+        }
+    }
+}
+
+fn node_look(node: &str) -> NodeLook {
+    match std::fs::OpenOptions::new().read(true).write(true).open(node) {
+        Ok(_) => NodeLook::Opens,
+        Err(e) => NodeLook::of(&e),
+    }
+}
+
+/// `look` on a thread of its own, waited for at most `limit`: the loop never waits on a driver without a bound.
+fn look_within(limit: Duration, look: impl FnOnce() -> NodeLook + Send + 'static) -> NodeLook {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("bitscomp-xw-node".into()).spawn(move || {
+        let _ = tx.send(look());
+    });
+    if let Err(e) = spawned {
+        return NodeLook::Unsure(format!("no thread for the look: {e}"));
+    }
+    rx.recv_timeout(limit).unwrap_or_else(|_| NodeLook::Refused(format!("no answer within {} ms", limit.as_millis())))
+}
+
+/// What one look means for the running Xwayland that was started with glamor.
+#[derive(Debug, PartialEq, Eq)]
+enum Watch {
+    Keep,
+    /// Xwayland is serving without DRI3: it fell back itself, there is nothing left to watch.
+    FellBack,
+    Lost(String),
+}
+
+fn watch_step(fell_back: bool, look: &NodeLook) -> Watch {
+    match look {
+        _ if fell_back => Watch::FellBack,
+        NodeLook::Gone(e) => Watch::Lost(e.clone()),
+        NodeLook::Opens | NodeLook::Refused(_) | NodeLook::Unsure(_) => Watch::Keep,
+    }
+}
+
+/// The helper of `watch_node`. It ends when the look's source is gone (`send` fails) or `stop` is set.
+fn look_every(node: &str, tx: &Sender<NodeLook>, stop: &AtomicBool) {
+    loop {
+        std::thread::sleep(NODE_LOOK);
+        if stop.load(Ordering::Acquire) || tx.send(node_look(node)).is_err() {
+            return;
+        }
+    }
+}
+
+/// The Mesa tree's variables for Xwayland's EGL and GBM, on the real chip: `child_env` keeps them from every other program.
+#[cfg(feature = "gpu")]
+fn mesa_env(tree: &str) -> Vec<(&'static str, String)> {
+    let mut v = crate::render_gl::env_values(tree, false);
+    v.push(("AMDGPU_ASIC_ID_TABLE_PATHS", format!("{tree}/share/libdrm")));
+    v
+}
+
+#[cfg(not(feature = "gpu"))]
+fn mesa_env(_tree: &str) -> Vec<(&'static str, String)> {
+    Vec::new()
+}
 
 pub struct Xwayland {
     pub display: u32,
@@ -47,6 +214,15 @@ pub struct Xwayland {
     failed: bool,
     /// The start that missed READY_DEADLINE (set by its timer, ended by `turn`).
     stuck: bool,
+    glamor: Glamor,
+    /// Why glamor is over until bitscomp restarts.
+    given_up: Option<String>,
+    /// The node the running Xwayland was started on with glamor.
+    glamor_node: Option<String>,
+    /// Why the running (or last) Xwayland has no glamor.
+    no_glamor: String,
+    /// The node's look says it is gone (set by its timer, ended by `turn`).
+    node_lost: bool,
 }
 
 /// The restart budget after one end of Xwayland: the new count of quick ends in a row, and whether the display
@@ -57,7 +233,7 @@ fn budget(quick_ends: u32, quick: bool) -> (u32, bool) {
 }
 
 /// The display's sockets and lock, or None (no Xwayland at `exe`, or no free display).
-pub fn setup(handle: &LoopHandle<'static, App>, exe: &str) -> Option<Xwayland> {
+pub fn setup(handle: &LoopHandle<'static, App>, exe: &str, glamor: Glamor) -> Option<Xwayland> {
     if exe == "none" {
         return None;
     }
@@ -103,6 +279,11 @@ pub fn setup(handle: &LoopHandle<'static, App>, exe: &str) -> Option<Xwayland> {
         starts: 0,
         failed: false,
         stuck: false,
+        glamor,
+        given_up: None,
+        glamor_node: None,
+        no_glamor: String::new(),
+        node_lost: false,
     };
     for l in &xw.listeners {
         let Ok(fd) = l.as_fd().try_clone_to_owned() else { continue };
@@ -222,7 +403,81 @@ fn inherit(fd: i32) {
 }
 
 impl Xwayland {
+    /// What decides this start, looked at now: a node may have gone since the last one.
+    fn inputs(&self, app: &App) -> Inputs {
+        let (_, node) = crate::dmabuf::render_device();
+        let look = node.clone().map(|n| look_within(START_LOOK, move || node_look(&n)));
+        if let Some(NodeLook::Unsure(e)) = &look {
+            eprintln!("bitscomp: xwayland: the look at the render node says nothing about it ({e}): glamor is tried");
+        }
+        let node_error = look.as_ref().and_then(NodeLook::bars_a_start).map(String::from);
+        Inputs {
+            given_up: self.given_up.clone(),
+            tree: crate::flavour::tree_root().map(String::from),
+            reads_by_cpu: app.dma.reads_by_cpu,
+            main_device: app.dma.main_device,
+            node,
+            node_error,
+        }
+    }
+
+    /// Looks at the node while this start of glamor runs; gone: `turn` ends this Xwayland.
+    fn watch_node(&mut self, start: u32, node: String) {
+        let (tx, rx) = channel::channel::<NodeLook>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_look = stop.clone();
+        let watched = node.clone();
+        let mut said = String::new();
+        let look = self.handle.insert_source(rx, move |ev, _, app: &mut App| {
+            let channel::Event::Msg(look) = ev else { return };
+            let Some(xw) = app.xwayland.as_mut().filter(|x| x.starts == start && x.child.is_some() && x.glamor_node.is_some()) else {
+                stop.store(true, Ordering::Release);
+                return;
+            };
+            let fell_back = xw.wm.as_ref().is_some_and(|w| w.ready && !w.dri3);
+            match watch_step(fell_back, &look) {
+                Watch::Keep => {
+                    let now = match &look {
+                        NodeLook::Refused(e) | NodeLook::Unsure(e) => e.as_str(),
+                        _ => "",
+                    };
+                    if now != said && !now.is_empty() {
+                        eprintln!("bitscomp: xwayland: the look at {node} answers \"{now}\": not a lost device, this Xwayland stays");
+                    }
+                    said = now.to_string();
+                }
+                Watch::FellBack => {
+                    eprintln!("bitscomp: xwayland: asked for glamor on {node}, but no DRI3 is offered: it fell back to software");
+                    xw.glamor_node = None;
+                    xw.no_glamor = "Xwayland fell back to software".into();
+                    stop.store(true, Ordering::Release);
+                }
+                Watch::Lost(e) => {
+                    let why = format!("{node} was lost: {e}");
+                    eprintln!("bitscomp: xwayland: {why}: this Xwayland ends, the next X11 client gets a software one");
+                    xw.given_up = Some(why);
+                    xw.node_lost = true;
+                    app.needs_frame = true;
+                    stop.store(true, Ordering::Release);
+                }
+            }
+        });
+        match look {
+            Ok(t) => self.sources.push(t),
+            Err(e) => {
+                eprintln!("bitscomp: xwayland: no look at {e}: a lost render node is not noticed");
+                return;
+            }
+        }
+        let helper = std::thread::Builder::new().name("bitscomp-xw-look".into()).spawn(move || look_every(&watched, &tx, &stop_look));
+        if let Err(e) = helper {
+            eprintln!("bitscomp: xwayland: no thread for the look at the node ({e}): a lost render node is not noticed");
+        }
+    }
+
     fn spawn(&mut self, app: &mut App) -> std::io::Result<()> {
+        let inputs = self.inputs(app);
+        let glamor = choose(&self.glamor, &inputs);
         let (wl_ours, wl_theirs) = UnixStream::pair()?;
         let (wm_ours, wm_theirs) = UnixStream::pair()?;
         let mut fds = [0 as libc::c_int; 2];
@@ -247,6 +502,18 @@ impl Xwayland {
         c.env("WAYLAND_SOCKET", wl_theirs.as_raw_fd().to_string()).env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY");
         for k in crate::flavour::GLES_ENV {
             c.env_remove(k);
+        }
+        // The variable, not `-glamor off`: a tree built without glamor (the stage before WY-3b) refuses the option and ends.
+        match (&glamor, &inputs.tree) {
+            (Err(_), _) => {
+                c.env("XWAYLAND_NO_GLAMOR", "1");
+            }
+            (Ok(_), Some(tree)) => {
+                c.env_remove("XWAYLAND_NO_GLAMOR").envs(mesa_env(tree));
+            }
+            (Ok(_), None) => {
+                c.env_remove("XWAYLAND_NO_GLAMOR");
+            }
         }
         c.stdin(std::process::Stdio::null());
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
@@ -274,6 +541,20 @@ impl Xwayland {
         self.started = Some(Instant::now());
         self.ready_ms = None;
         self.stuck = false;
+        self.node_lost = false;
+        let deadline_after = if glamor.is_ok() { READY_DEADLINE_GLAMOR } else { READY_DEADLINE };
+        match &glamor {
+            Ok(node) => {
+                eprintln!("bitscomp: xwayland: this start with glamor on {node}");
+                self.glamor_node = Some(node.clone());
+                self.no_glamor.clear();
+            }
+            Err(why) => {
+                eprintln!("bitscomp: xwayland: this start in software: {why}");
+                self.glamor_node = None;
+                self.no_glamor.clone_from(why);
+            }
+        }
         let data = ClientState { pid, start: crate::ending::start_time(pid), ..Default::default() };
         let client = app.dh.insert_client(wl_ours, Arc::new(data)).map_err(std::io::Error::other)?;
         let mut wm = Xwm::new(wm_ours, client)?;
@@ -333,13 +614,13 @@ impl Xwayland {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.sources.push(t);
         let start = self.starts;
-        let deadline = self.handle.insert_source(Timer::from_duration(READY_DEADLINE), move |_, _, app: &mut App| {
+        let deadline = self.handle.insert_source(Timer::from_duration(deadline_after), move |_, _, app: &mut App| {
             if let Some(xw) = app.xwayland.as_mut()
                 && xw.starts == start
                 && xw.child.is_some()
                 && !(xw.ready_ms.is_some() && xw.wm.as_ref().is_some_and(|w| w.ready))
             {
-                eprintln!("bitscomp: xwayland: pid {pid} is not ready {} s after its start: ended", READY_DEADLINE.as_secs());
+                eprintln!("bitscomp: xwayland: pid {pid} is not ready {} s after its start: ended", deadline_after.as_secs());
                 xw.stuck = true;
                 app.needs_frame = true;
             }
@@ -347,6 +628,9 @@ impl Xwayland {
         });
         if let Err(e) = deadline {
             eprintln!("bitscomp: xwayland: no start deadline ({e}): a hung start is not noticed");
+        }
+        if let Some(node) = self.glamor_node.clone() {
+            self.watch_node(start, node);
         }
         eprintln!("bitscomp: xwayland: started {} :{} (pid {pid}, start {})", self.exe.display(), self.display, self.starts);
         Ok(())
@@ -362,6 +646,7 @@ impl Xwayland {
             let _ = c.wait();
         }
         self.stuck = false;
+        self.node_lost = false;
         if let Some(mut wm) = self.wm.take() {
             wm.forget_all(app);
             app.dh.backend_handle().kill_client(wm.client.id(), DisconnectReason::ConnectionClosed);
@@ -370,6 +655,18 @@ impl Xwayland {
             self.handle.remove(t);
         }
         let quick = !clean || self.started.is_some_and(|s| s.elapsed() < QUICK_END);
+        let node = self.glamor_node.take();
+        if let Some(node) = node.filter(|_| quick) {
+            // The driver or the node, not the display: the next start is the software one and the budget starts over.
+            let why = format!("a start with glamor on {node} failed");
+            eprintln!("bitscomp: xwayland: {why}: the next start is in software");
+            self.given_up.get_or_insert(why);
+            self.quick_ends = 0;
+            for t in &self.tokens {
+                let _ = self.handle.enable(t);
+            }
+            return;
+        }
         let (n, off) = budget(self.quick_ends, quick);
         self.quick_ends = n;
         if off {
@@ -405,8 +702,15 @@ impl Xwayland {
         };
         let pid = self.child.as_ref().map_or(0, |c| c.id());
         let (windows, sel) = self.wm.as_ref().map_or((0, String::from("clipboard=none")), |w| (w.windows(), w.sel.describe()));
+        let dri3 = self.wm.as_ref().is_some_and(|w| w.dri3);
+        let glamor = match (&self.glamor_node, &self.given_up) {
+            (Some(n), _) => format!("glamor={n}"),
+            (None, Some(why)) => format!("glamor=off why={why:?}"),
+            (None, None) if self.no_glamor.is_empty() => "glamor=unknown".into(),
+            (None, None) => format!("glamor=off why={:?}", self.no_glamor),
+        };
         format!(
-            "xwayland display=:{} state={state} pid={pid} starts={} ready_ms={} windows={windows} {sel}",
+            "xwayland display=:{} state={state} pid={pid} starts={} ready_ms={} windows={windows} {sel} dri3={dri3} {glamor}",
             self.display,
             self.starts,
             self.ready_ms.map_or(-1, |m| m as i64)
@@ -431,6 +735,9 @@ pub fn turn(app: &mut App) {
     };
     let lost = xw.child.is_some() && xw.wm.as_ref().is_some_and(|w| w.conn.closed);
     if gone {
+        xw.ended(app, true);
+    } else if xw.node_lost {
+        eprintln!("bitscomp: xwayland: pid {pid} ends: its render node is lost");
         xw.ended(app, true);
     } else if xw.stuck {
         // Not serving the display in time: every X client would hang in its setup. Always a quick end.
@@ -484,6 +791,100 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gpu() -> Inputs {
+        Inputs { tree: Some("/t".into()), main_device: 0xe280, node: Some("/dev/dri/renderD128".into()), ..Default::default() }
+    }
+
+    #[test]
+    fn glamor_only_when_bitscomp_draws_on_a_node_that_opens() {
+        assert_eq!(choose(&Glamor::Auto, &gpu()), Ok("/dev/dri/renderD128".to_string()));
+        let no = |f: fn(&mut Inputs), why: &str| {
+            let mut i = gpu();
+            f(&mut i);
+            let got = choose(&Glamor::Auto, &i).unwrap_err();
+            assert!(got.contains(why), "{got}");
+        };
+        no(|i| i.tree = None, "no Mesa tree");
+        no(|i| i.reads_by_cpu = true, "reads by CPU");
+        no(|i| i.main_device = 0, "no main device");
+        no(|i| i.node = None, "no render node");
+        no(|i| i.node_error = Some("No such device".into()), "does not open: No such device");
+        no(|i| i.given_up = Some("a start with glamor failed".into()), "failed");
+        assert!(choose(&Glamor::Off, &gpu()).is_err());
+    }
+
+    #[test]
+    fn a_forced_glamor_still_gives_up() {
+        let force = Glamor::Force("/x".into());
+        assert_eq!(choose(&force, &Inputs::default()), Ok("/x".to_string()));
+        let bad = Inputs { given_up: Some("lost".into()), ..Default::default() };
+        assert_eq!(choose(&force, &bad), Err("lost".to_string()));
+    }
+
+    #[test]
+    fn the_switch_parses() {
+        assert_eq!(Glamor::parse("auto"), Some(Glamor::Auto));
+        assert_eq!(Glamor::parse("off"), Some(Glamor::Off));
+        assert_eq!(Glamor::parse("force:/n"), Some(Glamor::Force("/n".into())));
+        assert_eq!(Glamor::parse("force:"), None);
+        assert_eq!(Glamor::parse("on"), None);
+    }
+
+    #[test]
+    fn a_node_that_does_not_open_says_so() {
+        assert_eq!(node_look("/dev/null"), NodeLook::Opens);
+        assert!(matches!(node_look("/nonexistent/renderD128"), NodeLook::Gone(_)));
+        // EISDIR: it is there and will not open, the device is not lost.
+        assert!(matches!(node_look("/"), NodeLook::Refused(_)));
+    }
+
+    fn look_of(errno: i32) -> NodeLook {
+        NodeLook::of(&std::io::Error::from_raw_os_error(errno))
+    }
+
+    #[test]
+    fn only_an_answer_that_the_device_is_gone_ends_xwayland() {
+        for e in [libc::ENODEV, libc::ENXIO, libc::ENOENT] {
+            assert!(matches!(watch_step(false, &look_of(e)), Watch::Lost(_)), "errno {e}");
+        }
+        for e in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EAGAIN, libc::EBUSY, libc::EINTR, libc::EACCES, libc::EIO] {
+            assert_eq!(watch_step(false, &look_of(e)), Watch::Keep, "errno {e}");
+        }
+        assert_eq!(watch_step(false, &NodeLook::Opens), Watch::Keep);
+        assert_eq!(watch_step(true, &NodeLook::Opens), Watch::FellBack);
+        // Fallen back itself, the software Xwayland has nothing to do with the node any more.
+        assert_eq!(watch_step(true, &look_of(libc::ENODEV)), Watch::FellBack);
+    }
+
+    #[test]
+    fn a_start_is_barred_by_a_node_that_will_not_open_not_by_our_shortage() {
+        assert_eq!(NodeLook::Opens.bars_a_start(), None);
+        for e in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EBUSY] {
+            assert_eq!(look_of(e).bars_a_start(), None, "errno {e}");
+        }
+        for e in [libc::ENODEV, libc::ENOENT, libc::EACCES] {
+            assert!(look_of(e).bars_a_start().is_some(), "errno {e}");
+        }
+    }
+
+    #[test]
+    fn a_look_that_blocks_costs_the_loop_only_its_limit() {
+        let look = look_within(Duration::from_millis(10), || {
+            std::thread::sleep(Duration::from_secs(2));
+            NodeLook::Opens
+        });
+        assert!(matches!(&look, NodeLook::Refused(e) if e.contains("no answer")), "{look:?}");
+        assert!(look.bars_a_start().is_some());
+        assert_eq!(look_within(Duration::from_secs(60), || NodeLook::Opens), NodeLook::Opens);
+    }
+
+    #[test]
+    fn the_helper_ends_with_its_source() {
+        let (tx, rx) = channel::channel::<NodeLook>();
+        drop(rx);
+        assert!(tx.send(NodeLook::Opens).is_err());
+    }
 
     #[test]
     fn three_quick_ends_in_a_row_switch_the_display_off() {

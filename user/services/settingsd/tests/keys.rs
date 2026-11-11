@@ -169,7 +169,7 @@ fn r8_switches_are_never_keys() {
         "# Georg's file\r\nwlan=off\r\nnvme_write=off\r\nstick_write=off\r\nusb_msd_write = off\r\nloglevel=info\r\n";
     std::fs::write(env.paths.stick.join("CONFIG.TXT"), guarded).unwrap();
     let (mut r, _) = env.open();
-    for k in ["nvme_write", "stick_write", "usb_msd_write", "kernel.stick_write", "net.nvme_write", "x.Usb_Msd_Write"] {
+    for k in ["nvme_write", "nvme_data", "stick_write", "usb_msd_write", "kernel.stick_write", "net.nvme_write", "disk.nvme_data", "x.Usb_Msd_Write"] {
         assert_eq!(r.set(k, &s("on"), &WHO).unwrap_err().code, "refused_r8", "{k}");
         assert_eq!(r.get(k, None).unwrap_err().code, "refused_r8", "{k}");
     }

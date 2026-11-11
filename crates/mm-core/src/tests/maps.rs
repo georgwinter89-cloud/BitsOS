@@ -66,7 +66,9 @@ fn minipc_map_through_bootinfo() {
     assert!((24_300..=24_450).contains(&mb), "hw_info memory: about 24,400 MB usable, got {mb} MB");
     assert_eq!(s.free_bytes + s.used_by_kind.iter().sum::<u64>(), s.total_bytes);
     let (ms, me) = b.meta_range();
-    assert!(me - ms < s.total_bytes / 1000, "tables below 0.1 % of RAM: {} KiB", (me - ms) >> 10);
+    // FS-STALL: one owner word per frame (8 bytes, the page cache's note for the heap's block clearing) on top of
+    // the frame states and bitmaps: about 0.2 % (Linux's struct page is 1.6 %).
+    assert!(me - ms < s.total_bytes * 3 / 1000, "tables below 0.3 % of RAM: {} KiB", (me - ms) >> 10);
     assert!(ms >= 0x1_0000_0000 && me <= 0x6_5E20_0000, "carved from the big block");
     let dma32 = (b.zone_info(0).managed_frames * PAGE) >> 20;
     assert!((2_300..=2_400).contains(&dma32), "DMA32 ~2.3 GB, got {dma32} MB");

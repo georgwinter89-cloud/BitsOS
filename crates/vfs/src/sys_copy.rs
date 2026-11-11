@@ -353,9 +353,11 @@ pub fn copy_file_range(s: &Sys<'_>, a: Args) -> i64 {
     })())
 }
 
-/// fadvise64 (`generic_fadvise`): accepted for files (V2 keeps its page cache by its own rules); WILLNEED
-/// queues the range for the Background read-ahead (FS-12, `PageCache::will_need`); ESPIPE on a FIFO or pipe,
-/// EINVAL for a negative length or an unknown advice.
+/// fadvise64 (`generic_fadvise`, linux-7/mm/fadvise.c:31): accepted for files; WILLNEED queues the range for
+/// the Background read-ahead (FS-12, `PageCache::will_need`); DONTNEED (BL-0) writes the range's dirty pages
+/// back and drops its clean whole pages (`PageCache::dont_need`); NORMAL/RANDOM/SEQUENTIAL (BL-4) set the
+/// read-ahead hint (`PageCache::advise`; per inode, Linux keeps it per open file); NOREUSE changes nothing.
+/// ESPIPE on a FIFO or pipe, EINVAL for a negative offset or length or an unknown advice.
 pub fn fadvise64(s: &Sys<'_>, a: Args) -> i64 {
     ret((|| {
         let f = s.file(a[0])?;
@@ -363,20 +365,30 @@ pub fn fadvise64(s: &Sys<'_>, a: Args) -> i64 {
         if mode & uapi::S_IFMT == uapi::S_IFIFO {
             return Err(ESPIPE);
         }
-        if (a[2] as i64) < 0 || a[3] as u32 > 5 {
+        if (a[1] as i64) < 0 || (a[2] as i64) < 0 || a[3] as u32 > 5 {
             return Err(EINVAL);
         }
-        if a[3] as u32 == POSIX_FADV_WILLNEED
-            && let Some(pc) = f.inode().and_then(|i| i.page_cache())
-        {
-            pc.will_need(a[1], a[2]);
+        let pc = f.inode().and_then(|i| i.page_cache());
+        match (a[3] as u32, pc) {
+            (POSIX_FADV_NORMAL, Some(pc)) => pc.advise(crate::pagecache::Advice::Normal),
+            (POSIX_FADV_RANDOM, Some(pc)) => pc.advise(crate::pagecache::Advice::Random),
+            (POSIX_FADV_SEQUENTIAL, Some(pc)) => pc.advise(crate::pagecache::Advice::Sequential),
+            (POSIX_FADV_WILLNEED, Some(pc)) => pc.will_need(a[1], a[2]),
+            (POSIX_FADV_DONTNEED, Some(pc)) => {
+                pc.dont_need(a[1], a[2]);
+            }
+            _ => {}
         }
         Ok(0)
     })())
 }
 
-/// linux-6.6/include/uapi/linux/fadvise.h
+/// linux-7/include/uapi/linux/fadvise.h
+const POSIX_FADV_NORMAL: u32 = 0;
+const POSIX_FADV_RANDOM: u32 = 1;
+const POSIX_FADV_SEQUENTIAL: u32 = 2;
 const POSIX_FADV_WILLNEED: u32 = 3;
+const POSIX_FADV_DONTNEED: u32 = 4;
 
 pub const CALLS: &[(usize, &str, SysFn)] = &[
     (40, "sendfile", sendfile),

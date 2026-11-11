@@ -1,5 +1,6 @@
 #!/bin/bash
 # slow
+# time-limit: 1500
 # RB-quiesce: reboot and power-off with busy work on 15 APs (QEMU -smp 16, KVM). The other CPUs are parked before
 # the drivers' quiesce (hal::kexec_stub::park_for_shutdown, Reload's stop): the test device's Quiesce
 # (kexec quiesce_ktests.rs) logs `rb quiesce.test cpu=0 others_ran=0 lock_ok=true` when it ran on CPU 0 while
@@ -239,4 +240,6 @@ if grep -Eq 'klog::crumb::leave\(' crates/acpi/src/power.rs && grep -q 'fn crumb
 else
     missing_glue "reboot: crates/acpi/src/power.rs leaves no crumb before its reset writes yet (RB-17 CR-2)"
 fi
+# TS-1: this test ends the boot (or answers over MCP), so it prints no `KTEST ok` on the serial line: the ledger reads it here.
+[ "$fail" != 0 ] || printf 'KTEST ok rb.quiesce.qemu_action (checked by this script)\nKTEST ok rb.quiesce.load_for_mcp (checked by this script)\n' >> "$RUN/ledger.txt"
 exit $fail

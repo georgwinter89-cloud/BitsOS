@@ -79,7 +79,7 @@ fn bo_list_cs() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.bo_list.cs", Safe, bo_list_cs);
+ktest!("dr.bo_list.cs", QemuAll, bo_list_cs);
 
 fn fence_to_handle() -> TestResult {
     own_device(|dev, gpu| {
@@ -112,7 +112,7 @@ fn fence_to_handle() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.fence.to_handle", Safe, fence_to_handle);
+ktest!("dr.fence.to_handle", QemuAll, fence_to_handle);
 
 fn unmap_waits() -> TestResult {
     own_device(|dev, gpu| {
@@ -135,7 +135,7 @@ fn unmap_waits() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.vm.unmap_waits", Safe, unmap_waits);
+ktest!("dr.vm.unmap_waits", QemuAll, unmap_waits);
 
 fn fault_query() -> TestResult {
     own_device(|dev, _gpu| {
@@ -157,7 +157,7 @@ fn fault_query() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.vm.fault_query", Safe, fault_query);
+ktest!("dr.vm.fault_query", QemuAll, fault_query);
 
 fn userptr() -> TestResult {
     own_device(|dev, gpu| {
@@ -194,7 +194,7 @@ fn userptr() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.userptr.fake", Safe, userptr);
+ktest!("dr.userptr.fake", QemuAll, userptr);
 
 fn gpu_shared(g: &FakeGpu) -> &crate::gpu::GpuShared {
     crate::gpu::GpuDevice::shared(g)
@@ -285,7 +285,7 @@ fn fuzz() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.fuzz.ioctls", Safe, fuzz);
+ktest!("dr.fuzz.ioctls", QemuAll, fuzz);
 
 const PROG: &str = "/bin/abi-drm-list";
 const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-list.txt");
@@ -293,11 +293,11 @@ const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-lis
 /// The ABI program on V2: every line as on CachyOS.
 fn abi_program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let out = proc::stdio::Capture::new(1 << 16);
@@ -320,4 +320,4 @@ fn abi_program() -> TestResult {
         before.check()
     })
 }
-ktest!("dr.list.program", Safe, abi_program);
+ktest!("dr.list.program", QemuAll, abi_program);

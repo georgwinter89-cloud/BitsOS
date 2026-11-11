@@ -119,7 +119,7 @@ fail() { echo "RED: $*"; exit 1; }
 drv() { echo "-drive if=none,id=$1,format=raw,file=$RUN_DIR/$2"; }
 cargo xtask image --name "$NAME" --ktest \
     --config-extra "ktest=us.msd;usb_msd_write=on;usb_msd_unplug_test=on;usb_msd_medium_test=on;loglevel=info"
-for attempt in 1 2; do
+for attempt in 1 2 3; do
     rm -f "$SOCK" "$LOG"
     # shellcheck disable=SC2046
     cargo xtask qemu --name "$NAME" --timeout 420 --serial-log "$LOG" -- \
@@ -136,10 +136,10 @@ for attempt in 1 2; do
         -device usb-storage,bus=xb.0,port=4,drive=dunp,id=unp \
         -qmp "unix:$SOCK,server=on,wait=off" &
     QPID=$!
-    if wait_line "$BOOT_LINE" "$LOG" 60; then break; fi
+    if wait_line "$BOOT_LINE" "$LOG" 90; then break; fi
     echo "note: attempt $attempt: firmware never reached the boot loader, retrying"
     stop_own
-    [ "$attempt" = 2 ] && fail "$NAME never booted"
+    [ "$attempt" = 3 ] && fail "$NAME never booted"
 done
 
 # us.msd.medium: eject, then a new (bigger) medium.

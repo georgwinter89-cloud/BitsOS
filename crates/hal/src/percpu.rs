@@ -32,6 +32,8 @@ pub struct CpuLocal {
     pub gdt: u64,
     /// Hard-IRQ nesting depth (`vectors::dispatch`).
     pub irq_depth: u64,
+    /// ksync's preemption blockers on this CPU (spin locks and `PreemptGuard`s held; Linux `__preempt_count`).
+    pub preempt: u64,
 }
 
 pub const CL_SELF: usize = 0;
@@ -42,6 +44,7 @@ pub const CL_CPU_INDEX: usize = 32;
 pub const CL_CURRENT: usize = 40;
 pub const CL_GDT: usize = 48;
 pub const CL_IRQ_DEPTH: usize = 56;
+pub const CL_PREEMPT: usize = 64;
 
 /// One block per cache line, so two CPUs never share a line of their GS blocks.
 #[repr(C, align(64))]
@@ -52,7 +55,7 @@ struct LocalCell(UnsafeCell<CpuLocal>);
 unsafe impl Sync for LocalCell {}
 
 const fn empty_local() -> CpuLocal {
-    CpuLocal { self_ptr: 0, kernel_rsp: 0, user_rsp_scratch: 0, user_ctx: 0, cpu_index: 0, current: 0, gdt: 0, irq_depth: 0 }
+    CpuLocal { self_ptr: 0, kernel_rsp: 0, user_rsp_scratch: 0, user_ctx: 0, cpu_index: 0, current: 0, gdt: 0, irq_depth: 0, preempt: 0 }
 }
 
 static BSP_LOCAL: LocalCell = LocalCell(UnsafeCell::new(empty_local()));
@@ -158,6 +161,7 @@ fn gs_read(off: usize) -> u64 {
             CL_CURRENT => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_CURRENT, options(nostack, readonly, preserves_flags)),
             CL_GDT => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_GDT, options(nostack, readonly, preserves_flags)),
             CL_IRQ_DEPTH => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_IRQ_DEPTH, options(nostack, readonly, preserves_flags)),
+            CL_PREEMPT => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_PREEMPT, options(nostack, readonly, preserves_flags)),
             _ => v = 0,
         }
     }
@@ -174,6 +178,7 @@ fn gs_read(off: usize) -> u64 {
         CL_CURRENT => l.current,
         CL_GDT => l.gdt,
         CL_IRQ_DEPTH => l.irq_depth,
+        CL_PREEMPT => l.preempt,
         _ => 0,
     }
 }
@@ -304,6 +309,65 @@ pub fn set_current(v: u64) {
     // SAFETY: host: one CPU, the static block.
     unsafe {
         (*BSP_LOCAL.0.get()).current = v
+    };
+}
+
+/// One more preemption blocker on this CPU, in one instruction (Linux `preempt_count_add`, `incl %gs:`): no interrupt
+/// and no move to another CPU can split it, so no interrupts off and no locked instruction, on every spin lock.
+#[inline]
+pub fn preempt_inc() {
+    if !GS_READY.load(Ordering::Acquire) {
+        // SAFETY: before GS exists only the BSP runs, on its own block.
+        unsafe { (*BSP_LOCAL.0.get()).preempt += 1 };
+        return;
+    }
+    #[cfg(target_os = "none")]
+    // SAFETY: this CPU's own block through GS (see gs_read); one instruction.
+    unsafe {
+        core::arch::asm!("inc qword ptr gs:[{o}]", o = const CL_PREEMPT, options(nostack))
+    };
+}
+
+/// Undoes `preempt_inc`, never below 0. While the count is above 0 this thread cannot move, and an interrupt between
+/// the read and the instruction leaves the count as it found it.
+#[inline]
+pub fn preempt_dec() {
+    if !GS_READY.load(Ordering::Acquire) {
+        // SAFETY: before GS exists only the BSP runs, on its own block.
+        unsafe {
+            let l = &mut *BSP_LOCAL.0.get();
+            l.preempt = l.preempt.saturating_sub(1);
+        }
+        return;
+    }
+    #[cfg(target_os = "none")]
+    if gs_read(CL_PREEMPT) != 0 {
+        // SAFETY: this CPU's own block through GS (see gs_read); one instruction.
+        unsafe { core::arch::asm!("dec qword ptr gs:[{o}]", o = const CL_PREEMPT, options(nostack)) };
+    }
+}
+
+/// Preemption blockers on this CPU.
+#[inline]
+pub fn preempt_count() -> u64 {
+    if !GS_READY.load(Ordering::Acquire) {
+        // SAFETY: before GS exists only the BSP runs; a plain load of its own block.
+        return unsafe { (*BSP_LOCAL.0.get()).preempt };
+    }
+    gs_read(CL_PREEMPT)
+}
+
+/// Sets the count (the scheduler moves it with the thread across a switch, interrupts off).
+pub fn preempt_set(v: u64) {
+    if !GS_READY.load(Ordering::Acquire) {
+        // SAFETY: before GS exists only the BSP runs, on its own block.
+        unsafe { (*BSP_LOCAL.0.get()).preempt = v };
+        return;
+    }
+    #[cfg(target_os = "none")]
+    // SAFETY: this CPU's own block through GS (see gs_read); one instruction.
+    unsafe {
+        core::arch::asm!("mov gs:[{o}], {v}", v = in(reg) v, o = const CL_PREEMPT, options(nostack, preserves_flags))
     };
 }
 

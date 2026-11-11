@@ -1,0 +1,6 @@
+#!/bin/sh
+# GM-1d: the Mesa tree's programs from anywhere on the stick's PATH (\BITSOS2\bin\mesa-run): `mesa-run vulkaninfo
+# --summary`, `mesa-run vkcube --wsi wayland`, `mesa-run --check`, or a path (`mesa-run /boot/BITSOS2/deqp/deqp-vk ...`).
+# The tree's own `run` sets the glibc stage's environment (loader, libraries, driver manifests); MESA_VK_DRIVERS
+# chooses the Vulkan driver (radeon_icd, lvp_icd).
+exec /bin/sh /boot/BITSOS2/mesa/run "$@"

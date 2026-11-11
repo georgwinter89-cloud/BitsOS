@@ -90,7 +90,11 @@ impl BuddyFrames {
             return BuddyFrames(Holder::Boot(first));
         }
         let me = match Buddy::build("frames", ranges, Storage::Carve, true) {
-            Ok(b) => b,
+            Ok(b) => {
+                // Now, while memory is whole: later no pageblock may be free (`highatomic`).
+                b.reserve_highatomic();
+                b
+            }
             Err(e) => {
                 klog::event!(Error, "mm", "frames.no_metadata_room", error = alloc::format!("{e:?}"); "no free run holds the allocator's tables; no frames");
                 Buddy::empty("frames")

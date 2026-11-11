@@ -252,6 +252,9 @@ pub mod rlimit {
     /// `INR_OPEN_CUR` / `INR_OPEN_MAX` (include/uapi/linux/fs.h).
     pub const INR_OPEN_CUR: u64 = 1024;
     pub const INR_OPEN_MAX: u64 = 4096;
+    /// systemd's `DefaultLimitNOFILE` hard limit (since v240; soft stays 1024 for select()): what CachyOS gives
+    /// every program. Proton's ntsync and esync hold one fd per Windows sync object, and games make thousands.
+    pub const SYSTEM_NOFILE_MAX: u64 = 524_288;
     /// `MLOCK_LIMIT`, `MQ_BYTES_MAX`.
     pub const MLOCK_LIMIT: u64 = 8 << 20;
     pub const MQ_BYTES_MAX: u64 = 819_200;
@@ -605,4 +608,109 @@ pub mod prctl {
     pub const PR_SPEC_L1D_FLUSH: u64 = 2;
     pub const PR_SYS_DISPATCH_OFF: u64 = 0;
     pub const PR_SYS_DISPATCH_ON: u64 = 1;
+}
+
+/// SX-IPC: SysV IPC's ABI on x86-64 (linux-7.3.1/include/uapi/linux/{ipc,sem,shm,msg}.h, ipc/util.h, ipc/shm.c:49,
+/// arch/x86/include/uapi/asm/{sembuf,shmbuf,msgbuf}.h).
+pub mod sysv {
+    pub const NR_SHMGET: usize = 29;
+    pub const NR_SHMAT: usize = 30;
+    pub const NR_SHMCTL: usize = 31;
+    pub const NR_SEMGET: usize = 64;
+    pub const NR_SEMOP: usize = 65;
+    pub const NR_SEMCTL: usize = 66;
+    pub const NR_SHMDT: usize = 67;
+    pub const NR_MSGGET: usize = 68;
+    pub const NR_MSGSND: usize = 69;
+    pub const NR_MSGRCV: usize = 70;
+    pub const NR_MSGCTL: usize = 71;
+    pub const NR_SEMTIMEDOP: usize = 220;
+
+    pub const ENOMSG: i64 = 42;
+    pub const EIDRM: i64 = 43;
+
+    pub const IPC_PRIVATE: i32 = 0;
+    pub const IPC_CREAT: i32 = 0o1000;
+    pub const IPC_EXCL: i32 = 0o2000;
+    pub const IPC_NOWAIT: i32 = 0o4000;
+    pub const IPC_RMID: i32 = 0;
+    pub const IPC_SET: i32 = 1;
+    pub const IPC_STAT: i32 = 2;
+    pub const IPC_INFO: i32 = 3;
+    pub const S_IRUGO: i32 = 0o444;
+    pub const S_IWUGO: i32 = 0o222;
+    pub const S_IXUGO: i32 = 0o111;
+    /// `struct ipc64_perm`.
+    pub const PERM64_SIZE: usize = 48;
+
+    pub const GETPID: i32 = 11;
+    pub const GETVAL: i32 = 12;
+    pub const GETALL: i32 = 13;
+    pub const GETNCNT: i32 = 14;
+    pub const GETZCNT: i32 = 15;
+    pub const SETVAL: i32 = 16;
+    pub const SETALL: i32 = 17;
+    pub const SEM_STAT: i32 = 18;
+    pub const SEM_INFO: i32 = 19;
+    pub const SEM_STAT_ANY: i32 = 20;
+    pub const SEM_UNDO: i16 = 0x1000;
+    pub const SEMMNI: i32 = 32000;
+    pub const SEMMSL: i32 = 32000;
+    pub const SEMMNS: i32 = SEMMNI * SEMMSL;
+    pub const SEMOPM: i32 = 500;
+    pub const SEMVMX: i32 = 32767;
+    pub const SEMAEM: i32 = SEMVMX;
+    pub const SEMUME: i32 = SEMOPM;
+    pub const SEMMNU: i32 = SEMMNS;
+    pub const SEMMAP: i32 = SEMMNS;
+    pub const SEMUSZ: i32 = 20;
+    /// Places in `sem_ctls`.
+    pub const SC_SEMMSL: usize = 0;
+    pub const SC_SEMMNS: usize = 1;
+    pub const SC_SEMOPM: usize = 2;
+    pub const SC_SEMMNI: usize = 3;
+    /// `struct semid64_ds`.
+    pub const SEMID64_SIZE: usize = 104;
+
+    pub const SHM_DEST: u32 = 0o1000;
+    pub const SHM_LOCKED: u32 = 0o2000;
+    pub const SHM_HUGETLB: i32 = 0o4000;
+    pub const SHM_NORESERVE: i32 = 0o10000;
+    pub const SHM_HUGE_SHIFT: i32 = 26;
+    pub const SHM_HUGE_MASK: i32 = 0x3f;
+    pub const SHM_RDONLY: i32 = 0o10000;
+    pub const SHM_RND: i32 = 0o20000;
+    pub const SHM_REMAP: i32 = 0o40000;
+    pub const SHM_EXEC: i32 = 0o100000;
+    pub const SHM_LOCK: i32 = 11;
+    pub const SHM_UNLOCK: i32 = 12;
+    pub const SHM_STAT: i32 = 13;
+    pub const SHM_INFO: i32 = 14;
+    pub const SHM_STAT_ANY: i32 = 15;
+    pub const SHMMIN: u64 = 1;
+    pub const SHMMNI: i32 = 4096;
+    pub const SHMMAX: u64 = u64::MAX - (1 << 24);
+    pub const SHMALL: u64 = u64::MAX - (1 << 24);
+    /// `struct shmid64_ds`, `struct shminfo64`, `struct shm_info`.
+    pub const SHMID64_SIZE: usize = 112;
+    pub const SHMINFO64_SIZE: usize = 72;
+    pub const SHM_INFO_SIZE: usize = 48;
+
+    pub const MSG_NOERROR: i32 = 0o10000;
+    pub const MSG_EXCEPT: i32 = 0o20000;
+    pub const MSG_COPY: i32 = 0o40000;
+    pub const MSG_STAT: i32 = 11;
+    pub const MSG_INFO: i32 = 12;
+    pub const MSG_STAT_ANY: i32 = 13;
+    pub const MSGMNI: i32 = 32000;
+    pub const MSGMAX: i32 = 8192;
+    pub const MSGMNB: i32 = 16384;
+    pub const MSGPOOL: i32 = 512000;
+    pub const MSGTQL: i32 = MSGMNB;
+    pub const MSGMAP: i32 = MSGMNB;
+    pub const MSGSSZ: i32 = 16;
+    pub const MSGSEG: u16 = 0xffff;
+    /// `struct msqid64_ds`, `struct msginfo`.
+    pub const MSQID64_SIZE: usize = 120;
+    pub const MSGINFO_SIZE: usize = 32;
 }

@@ -70,7 +70,7 @@ fn quad(b: &[u8], at: usize) -> u64 {
 /// now, the sequence moving on across FBIO_WAITFORVSYNC.
 fn ioctl() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     let io = super::CallerIo(None);
@@ -140,12 +140,12 @@ fn has_line(got: &str, start: &str) -> TestResult {
 /// ioctl: the period is measured from the waits alone).
 fn program() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     if vfs::root_ns().lookup(FLIPPACE).is_err() {
         // Images built without the musl sysroot have no user/abi-tests (MC-5b, RB-7a requests).
-        return ktest::skip("/bin/abi-flippace is not in this image (user/abi-tests need the musl sysroot)");
+        return ktest::fail("/bin/abi-flippace is not in this image (user/abi-tests need the musl sysroot)");
     }
     super::fix_node_owner();
     let (mhz, period, source) = vblank_rate();
@@ -184,4 +184,4 @@ fn program() -> TestResult {
     klog::event!(Info, "dp", "ktest.flippace", refresh_mhz = mhz, period_ns = period, source = source.name());
     Ok(())
 }
-ktest!("dp.pacing.flippace", Safe, program);
+ktest!("dp.pacing.flippace", Screen, program);

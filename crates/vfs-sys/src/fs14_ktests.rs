@@ -78,7 +78,7 @@ fn compare(mode: &str, args: &[&str], pending: &[(&str, &str, &str)]) -> TestRes
 }
 
 fn have_prog() -> Option<TestResult> {
-    vfs::root_ns().lookup(PROG).is_err().then(|| ktest::skip("/bin/fs-memfd-lazy is not in this image (xtask builds host/tests/fs/progs into every image)"))
+    vfs::root_ns().lookup(PROG).is_err().then(|| ktest::fail("/bin/fs-memfd-lazy is not in this image (xtask builds host/tests/fs/progs into every image)"))
 }
 
 fn programs() -> TestResult {

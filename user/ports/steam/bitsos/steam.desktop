@@ -1,0 +1,10 @@
+# PK-L1a: the program library's entry for the stick launcher (\BITSOS2\bin\<launcher>, started through /bin/sh).
+# No icon: the program's own is a trademark; the library shows the fallback (first letter) until lane DS draws one.
+[Desktop Entry]
+Type=Application
+Name=Steam
+GenericName[de]=Spiele
+Exec=steam
+Categories=Game;
+Keywords[de]=Spiele;Valve;
+StartupWMClass=steam

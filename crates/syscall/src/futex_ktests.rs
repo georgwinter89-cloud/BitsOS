@@ -666,7 +666,7 @@ fn finish(p: &Arc<Process>, out: &proc::stdio::Capture, ns: u64) -> Result<i32, 
 ktest!("sc.futex.abi", Safe, abi);
 fn abi() -> TestResult {
     if !have("/bin/abi-futex") {
-        return ktest::skip("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let (p, out) = run("/bin/abi-futex", &["abi-futex"], false)?;
     let code = finish(&p, &out, 60 * SEC)?;
@@ -695,7 +695,7 @@ fn procs64() -> TestResult {
     const N: usize = 64;
     const ITERS: &str = "2000";
     if !have("/bin/abi-futex") {
-        return ktest::skip("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let path = format!("/dev/shm/sc-fx-{}-{}", RUN.fetch_add(1, Ordering::Relaxed), time::now_ns() % 1_000_000);
     let mut ps = Vec::new();
@@ -728,13 +728,13 @@ fn procs64() -> TestResult {
 ktest!("sc.futex.abi_multi", Safe, abi_multi);
 fn abi_multi() -> TestResult {
     if !have("/bin/abi-futex") {
-        return ktest::skip("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let (p, out) = run("/bin/abi-futex", &["abi-futex", "multi"], false)?;
     let code = finish(&p, &out, 60 * SEC)?;
     let got = text(&out);
     if got.lines().nth(1).is_some_and(|l| l.starts_with("create") && l.contains("EAGAIN")) {
-        return ktest::skip("clone with the thread flags is not there yet (AB-4): pthread_create gives EAGAIN");
+        return ktest::fail("clone with the thread flags is not there yet (AB-4): pthread_create gives EAGAIN");
     }
     let want = include_str!("../../../user/abi-tests/expected/futex-multi.txt");
     kassert!(got == want && code == 0, "abi-futex multi differs from CachyOS (exit {code}):\ngot:\n{got}want:\n{want}");
@@ -747,7 +747,7 @@ fn abi_multi() -> TestResult {
 ktest!("sc.futex.abi_pi", Safe, abi_pi);
 fn abi_pi() -> TestResult {
     if !have("/bin/abi-futex") {
-        return ktest::skip("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let (p, out) = run("/bin/abi-futex", &["abi-futex", "pi"], false)?;
     let code = finish(&p, &out, 60 * SEC)?;
@@ -771,7 +771,7 @@ fn abi_pi() -> TestResult {
 ktest!("sc.futex.exit_robust", Safe, exit_robust);
 fn exit_robust() -> TestResult {
     if !have("/bin/abi-futex") {
-        return ktest::skip("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-futex is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let path = format!("/dev/shm/sc-fx-rob-{}-{}", RUN.fetch_add(1, Ordering::Relaxed), time::now_ns() % 1_000_000);
     let (p, out) = run("/bin/abi-futex", &["abi-futex", "robust-die", &path], false)?;
@@ -789,7 +789,7 @@ fn exit_robust() -> TestResult {
         return Ok(());
     }
     if !walked {
-        return ktest::skip("the robust list was not walked at process end: AB-4 does not call syscall::futex::exit_release yet (SC-5 CR 1)");
+        return ktest::fail("the robust list was not walked at process end: AB-4 does not call syscall::futex::exit_release yet (SC-5 CR 1)");
     }
     Err(format!("robust list walked at the end, but the word is wrong (exit {code}): {got}"))
 }
@@ -798,7 +798,7 @@ fn exit_robust() -> TestResult {
 ktest!("sc.futex.pthread", Safe, pthread);
 fn pthread() -> TestResult {
     if !have("/bin/abi-pthread") {
-        return ktest::skip("/bin/abi-pthread is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-pthread is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let cases: [(&str, &str); 8] = [
         ("mutex", "mutex: 8 threads x 20000 = 160000\n"),
@@ -816,7 +816,7 @@ fn pthread() -> TestResult {
         let code = finish(&p, &out, 120 * SEC)?;
         let got = text(&out);
         if got.starts_with("create") && got.contains("EAGAIN") {
-            return ktest::skip("clone with the thread flags is not there yet (AB-4): pthread_create gives EAGAIN");
+            return ktest::fail("clone with the thread flags is not there yet (AB-4): pthread_create gives EAGAIN");
         }
         if got != want || code != 0 {
             bad.push(format!("{mode}: exit {code}, got:\n{got}want:\n{want}"));

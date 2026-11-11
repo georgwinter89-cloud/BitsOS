@@ -3,14 +3,22 @@
 extern crate std;
 
 mod basic;
+mod census;
+mod compact;
+mod compact_bench;
 mod dma_pages;
 mod grace;
+mod grouping;
+mod grouping_bench;
 mod guards;
 mod heap;
 mod heap_guard;
+mod highatomic;
 mod limit;
 mod maps;
+mod order;
 mod reclaim;
+mod scatter;
 mod stress;
 
 use crate::{BuddyFrames, FrameAlloc, Kind, MapRange, RangeUse, Storage, Zone, PAGE};

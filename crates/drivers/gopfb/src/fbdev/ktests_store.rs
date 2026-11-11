@@ -79,7 +79,7 @@ fn shows(fb: &Fb, d: &Drawn, pid: u32) -> TestResult {
 /// Runs `abi-fbdev store <seed> <how>`, checks the screen shows it, ends every process it started.
 fn store_case(seed: u32, how: &str) -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -98,7 +98,7 @@ fn store_case(seed: u32, how: &str) -> TestResult {
             klog::event!(Info, "dp", "ktest.fbdev_store", case = how, pid = pid, program = s.p.pid);
             Ok(())
         }
-        None => ktest::skip("the kernel has no threads/fork yet (AB-4): abi-fbdev says unsupported"),
+        None => ktest::fail("the kernel has no threads/fork yet (AB-4): abi-fbdev says unsupported"),
     }
 }
 
@@ -106,32 +106,32 @@ fn store_case(seed: u32, how: &str) -> TestResult {
 fn unmap() -> TestResult {
     store_case(21, "unmap")
 }
-ktest!("dp.fbdev.unmap", Safe, unmap);
+ktest!("dp.fbdev.unmap", Screen, unmap);
 
 /// Stores, fsync, PROT_READ, PROT_READ|WRITE, stores again: the second stores are still tracked (device pages
 /// stay read-only across mprotect until a store faults) and reach the screen without an fsync.
 fn mprotect() -> TestResult {
     store_case(23, "mprotect")
 }
-ktest!("dp.fbdev.mprotect", Safe, mprotect);
+ktest!("dp.fbdev.mprotect", Screen, mprotect);
 
 /// A second thread's stores take the screen (`proc::current` names the process for any thread).
 fn thread() -> TestResult {
     store_case(25, "thread")
 }
-ktest!("dp.fbdev.thread", Safe, thread);
+ktest!("dp.fbdev.thread", Screen, thread);
 
 /// The parent drew and ended; its forked child's stores take the screen again.
 fn fork() -> TestResult {
     store_case(27, "fork")
 }
-ktest!("dp.fbdev.fork", Safe, fork);
+ktest!("dp.fbdev.fork", Screen, fork);
 
 /// A kernel owner holds the screen while a program stores (its claim is refused); once the owner lets go, the
 /// program's next store claims again (the pages were write-protected anew) and the screen shows it.
 fn rearm() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -159,13 +159,13 @@ fn rearm() -> TestResult {
     klog::event!(Info, "dp", "ktest.fbdev_rearm", rearms = stats().rearms - before.rearms, takes = stats().takes - before.takes);
     Ok(())
 }
-ktest!("dp.fbdev.rearm", Safe, rearm);
+ktest!("dp.fbdev.rearm", Screen, rearm);
 
 /// KD_GRAPHICS (`display::request_scanout_for`): a program that opened fb0 but never stored gets the screen at
 /// once; the console stops presenting; it comes back when the program ends. Ended pids are refused.
 fn graphics() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -199,4 +199,4 @@ fn graphics() -> TestResult {
     kassert!(console_back(fb, 0), "holder {} after the refused request", fb.holder_pid());
     Ok(())
 }
-ktest!("dp.fbdev.graphics", Safe, graphics);
+ktest!("dp.fbdev.graphics", Screen, graphics);

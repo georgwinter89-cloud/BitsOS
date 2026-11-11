@@ -14,12 +14,22 @@ use crate::map::{self, MapRange, Plan, PlanError, DMA32_END_PFN};
 use crate::meta::{self, Meta, State};
 use crate::pcp::{self, PcpCpu};
 
+mod census;
 mod check;
+mod compact;
 mod exact;
+mod group;
 mod handle;
+mod highatomic;
 mod limit;
+mod order;
 mod reclaim;
+pub use census::{BlockCensus, BlockHolder, FEW, HOLDERS};
 pub use exact::exact_order;
+pub(crate) use group::{count_steal, count_whole_block, pageblocks, side_words, PB};
+pub use group::{MigrateType, MIGRATE_TYPES, PAGEBLOCK_FRAMES, PAGEBLOCK_ORDER, PCP_TYPES};
+pub use highatomic::reserve_pageblocks;
+pub use compact::{extfrag_for_order, fragmentation_index, CompactStats, Control, How, Status};
 #[cfg(test)]
 pub(crate) use exact::pieces;
 pub use handle::{boot_buddy, BuddyFrames};
@@ -64,7 +74,16 @@ struct Region {
     end: u64,
     zone: usize,
     meta_off: usize,
+    /// W35 MM-1: free blocks below the pageblock order, one bitmap per order and migrate type (`Region::map`).
+    typed: Vec<HBitmap>,
+    /// Free blocks from the pageblock order up, one bitmap per order (no type: whole free pageblocks).
     maps: Vec<HBitmap>,
+    /// The pageblocks' migrate types, 2 bits each (`group`).
+    pb_off: usize,
+    /// W35 MM-3: the pageblocks' compaction skip hints, 1 bit each, right after the types (`compact`).
+    skip_off: usize,
+    /// One word per frame: its owner as the page cache noted it (`owner`).
+    owner_off: usize,
 }
 
 impl Region {
@@ -80,6 +99,14 @@ impl Region {
 struct ZoneState {
     free_frames: u64,
     free_blocks: [u64; ORDERS],
+    /// Free blocks per migrate type and order (from the pageblock order up: by the head's pageblock, for the
+    /// /proc/pagetypeinfo view; the sum per order is `free_blocks`).
+    by_type: [[u64; ORDERS]; MIGRATE_TYPES],
+    /// Pageblocks per migrate type.
+    pageblocks: [u64; MIGRATE_TYPES],
+    /// Free frames of the HighAtomic pageblocks (Linux `nr_free_highatomic`): part of `free_frames`, usable only
+    /// by the allocations `highatomic` lets in.
+    free_highatomic: u64,
 }
 
 /// Per-zone numbers (`hw_info memory`, fragmentation view, tests).
@@ -90,6 +117,12 @@ pub struct ZoneInfo {
     pub free_frames: u64,
     pub cached_frames: u64,
     pub free_blocks: [u64; ORDERS],
+    /// W35 MM-1: `free_blocks` by migrate type (`MigrateType as usize`; /proc/pagetypeinfo).
+    pub free_by_type: [[u64; ORDERS]; MIGRATE_TYPES],
+    /// W35 MM-1: pageblocks per migrate type.
+    pub pageblocks: [u64; MIGRATE_TYPES],
+    /// Of `free_frames`, those in HighAtomic pageblocks (`highatomic`): not free for an ordinary allocation.
+    pub free_highatomic: u64,
 }
 
 /// How a staged allocator stores its metadata.
@@ -149,6 +182,11 @@ pub struct Buddy {
     reserve: [AtomicU64; ZONES],
     /// MM-9: reserve hits that skip the light reclaim round (one found nothing just before).
     skip: AtomicU64,
+    /// W35 MM-3: the migrator (MM-2; without one compaction drops clean cache, `compact::DropClean`).
+    migrator: ksync::OnceRef<dyn crate::compact::Migrate>,
+    /// W35 MM-3: per-zone compaction state (cached scanner positions, deferral).
+    compact: [compact::ZoneCompact; ZONES],
+    compact_counts: compact::CompactCounters,
 }
 
 impl Buddy {
@@ -157,7 +195,7 @@ impl Buddy {
     }
 
     fn assemble(name: &'static str, blob: Blob, regions: Vec<Region>, carve: (u64, u64), global: bool) -> Self {
-        let zs = ZoneState { free_frames: 0, free_blocks: [0; ORDERS] };
+        let zs = ZoneState { free_frames: 0, free_blocks: [0; ORDERS], by_type: [[0; ORDERS]; MIGRATE_TYPES], pageblocks: [0; MIGRATE_TYPES], free_highatomic: 0 };
         let me = Buddy {
             name,
             blob,
@@ -180,6 +218,9 @@ impl Buddy {
             direct: crate::reclaim::DirectCounters::new(),
             reserve: [const { AtomicU64::new(0) }; ZONES],
             skip: AtomicU64::new(0),
+            migrator: ksync::OnceRef::new(),
+            compact: [const { compact::ZoneCompact::new() }; ZONES],
+            compact_counts: compact::CompactCounters::new(),
         };
         // Create the per-CPU lists now, while the heap may be used: later the allocator runs under the
         // heap's lock, and a lazy init there would re-enter the heap.
@@ -195,16 +236,26 @@ impl Buddy {
         for &(s, e) in &plan.regions {
             let meta_off = off;
             off += meta::words_for(e - s);
-            let mut maps = Vec::with_capacity(ORDERS);
+            let (mut typed, mut maps) = (Vec::with_capacity(PB * MIGRATE_TYPES), Vec::with_capacity(ORDERS - PB));
             for k in 0..=MAX_ORDER {
                 let bits = map::blocks(s, e, k);
-                maps.push(HBitmap::new(bits, off));
-                off += crate::bitmap::words_for(bits);
+                let copies = if (k as usize) < PB { MIGRATE_TYPES } else { 1 };
+                for _ in 0..copies {
+                    let m = HBitmap::new(bits, off);
+                    if (k as usize) < PB { typed.push(m) } else { maps.push(m) }
+                    off += crate::bitmap::words_for(bits);
+                }
             }
-            regions.push(Region { start: s, end: e, zone: if s < DMA32_END_PFN { 0 } else { 1 }, meta_off, maps });
+            let pb_off = off;
+            let skip_off = off + group::type_words(s, e);
+            off += side_words(s, e);
+            let owner_off = off;
+            off += (e - s) as usize;
+            regions.push(Region { start: s, end: e, zone: if s < DMA32_END_PFN { 0 } else { 1 }, meta_off, typed, maps, pb_off, skip_off, owner_off });
         }
         let carve = plan.carve.unwrap_or((0, 0));
         let mut me = Self::assemble(name, blob, regions, carve, global);
+        me.count_pageblocks();
         me.input = ranges.to_vec();
         *me.modules.lock() = plan.modules.clone();
         me.used[Kind::Other as usize].store(carve.1 - carve.0, Relaxed);
@@ -243,6 +294,7 @@ impl Buddy {
         let modules_kb = (self.modules.lock().iter().map(|m| m.1 - m.0).sum::<u64>() * PAGE) >> 10;
         klog::event!(Info, "mm", "frames.init", allocator = self.name, total_mb = mb(z[0].managed_frames + z[1].managed_frames),
             free_mb = mb(z[0].free_frames + z[1].free_frames), dma32_mb = mb(z[0].managed_frames), normal_mb = mb(z[1].managed_frames),
+            highatomic_kb = ((z[0].free_highatomic + z[1].free_highatomic) * PAGE) >> 10,
             regions = self.regions.len(), meta_kb = (self.meta_frames * PAGE) >> 10,
             modules_kb = modules_kb, max_order = MAX_ORDER;
             "buddy allocator ready");
@@ -281,6 +333,19 @@ impl Buddy {
         self.regions.iter().filter(move |r| r.zone == zone)
     }
 
+    /// FS-STALL: what the page cache noted for frame `phys` (`set_owner`; 0: nothing). A hint: the frame may have
+    /// been freed and reused since, so the reader checks that the page it names still has this frame.
+    pub fn owner(&self, phys: u64) -> u64 {
+        let pfn = phys / PAGE;
+        self.region_of(pfn).map_or(0, |r| self.blob()[r.owner_off + (pfn - r.start) as usize].load(Relaxed))
+    }
+    pub fn set_owner(&self, phys: u64, v: u64) {
+        let pfn = phys / PAGE;
+        if let Some(r) = self.region_of(pfn) {
+            self.blob()[r.owner_off + (pfn - r.start) as usize].store(v, Relaxed);
+        }
+    }
+
     fn get_meta(&self, r: &Region, pfn: u64) -> Meta {
         meta::get(&self.blob()[r.meta_off..], pfn - r.start)
     }
@@ -293,23 +358,38 @@ impl Buddy {
 
     // ---- buddy core (zone lock held) ----
 
+    /// The block goes into the bitmap of its pageblock's type (`group`; untyped from the pageblock order up).
     fn insert_free(&self, r: &Region, zs: &mut ZoneState, pfn: u64, order: u32) {
-        r.maps[order as usize].set(self.blob(), r.bit(pfn, order));
+        let mt = self.pb_type(r, pfn);
+        r.map(order, mt).set(self.blob(), r.bit(pfn, order));
         self.set_meta(r, pfn, Meta::new(State::Free, order, 0));
         zs.free_blocks[order as usize] += 1;
+        zs.by_type[mt as usize][order as usize] += 1;
         zs.free_frames += 1 << order;
+        if mt == MigrateType::HighAtomic {
+            self.reserve_moved(zs, 1 << order, true);
+        }
     }
 
+    /// The type read here is the one `insert_free` read: a pageblock changes type only with its free blocks moved
+    /// (`group::move_free`) or while it holds no free block.
     fn remove_free(&self, r: &Region, zs: &mut ZoneState, pfn: u64, order: u32) {
-        r.maps[order as usize].clear(self.blob(), r.bit(pfn, order));
+        let mt = self.pb_type(r, pfn);
+        r.map(order, mt).clear(self.blob(), r.bit(pfn, order));
         self.set_meta(r, pfn, Meta::NONE);
         zs.free_blocks[order as usize] -= 1;
+        zs.by_type[mt as usize][order as usize] -= 1;
         zs.free_frames -= 1 << order;
+        if mt == MigrateType::HighAtomic {
+            self.reserve_moved(zs, 1 << order, false);
+        }
     }
 
     /// Puts a block whose head reads `NONE` back, merging with free buddies.
     fn free_block(&self, r: &Region, zs: &mut ZoneState, mut pfn: u64, mut order: u32) {
-        while order < MAX_ORDER {
+        // A pageblock of the reserve never becomes one free pageblock: in the untyped lists anyone could take it.
+        let top = if self.pb_type(r, pfn) == MigrateType::HighAtomic { PAGEBLOCK_ORDER - 1 } else { MAX_ORDER };
+        while order < top {
             let buddy = pfn ^ (1 << order);
             if !r.holds(buddy, order) || self.get_meta(r, buddy) != Meta::new(State::Free, order, 0) {
                 break;
@@ -321,35 +401,15 @@ impl Buddy {
         self.insert_free(r, zs, pfn, order);
     }
 
-    /// Takes a free block of exactly `order` from the zone (splitting a bigger one); its head reads `NONE`.
-    fn take_block(&self, zone: usize, zs: &mut ZoneState, order: u32) -> Option<(usize, u64)> {
-        self.take_block_below(zone, zs, order, u64::MAX)
+    /// Takes a free block of exactly `order` for `kind` from the zone (its own migrate type first, `group`); its
+    /// head reads `NONE`.
+    fn take_block(&self, zone: usize, zs: &mut ZoneState, order: u32, kind: Kind) -> Option<(usize, u64)> {
+        self.take_block_below(zone, zs, order, u64::MAX, kind)
     }
 
-    /// `take_block` for a block that ends at or below frame `limit_pfn` (DMA address limits). Each region's
-    /// bitmap gives its lowest free block of an order, so a region whose lowest one ends above the limit has
-    /// none below it at that order.
-    fn take_block_below(&self, zone: usize, zs: &mut ZoneState, order: u32, limit_pfn: u64) -> Option<(usize, u64)> {
-        for o in order..=MAX_ORDER {
-            if zs.free_blocks[o as usize] == 0 {
-                continue;
-            }
-            for (ri, r) in self.regions.iter().enumerate().filter(|(_, r)| r.zone == zone && r.start < limit_pfn) {
-                let Some(b) = r.maps[o as usize].first(self.blob()) else { continue };
-                let pfn = ((r.start >> o) + b) << o;
-                if pfn + (1 << order) > limit_pfn {
-                    continue;
-                }
-                self.remove_free(r, zs, pfn, o);
-                let mut cur = o;
-                while cur > order {
-                    cur -= 1;
-                    self.insert_free(r, zs, pfn + (1 << cur), cur);
-                }
-                return Some((ri, pfn));
-            }
-        }
-        None
+    /// `take_block` for a block that ends at or below frame `limit_pfn` (DMA address limits).
+    fn take_block_below(&self, zone: usize, zs: &mut ZoneState, order: u32, limit_pfn: u64, kind: Kind) -> Option<(usize, u64)> {
+        self.rmqueue(zone, zs, order, MigrateType::of(kind), limit_pfn, true).map(|(ri, pfn, _)| (ri, pfn))
     }
 
     /// Adds free frames [s, e) (pfn) in maximal aligned blocks; they may span regions of both zones.
@@ -381,7 +441,7 @@ impl Buddy {
         if !deep && self.below_reserve(zone, &zs, kind) {
             return None;
         }
-        let (ri, pfn) = self.take_block(zone, &mut zs, order)?;
+        let (ri, pfn) = self.take_block(zone, &mut zs, order, kind)?;
         self.set_meta(&self.regions[ri], pfn, Meta::new(State::Alloc, order, kind as usize));
         Some(pfn)
     }
@@ -389,7 +449,8 @@ impl Buddy {
     // ---- per-CPU lists (order 0) ----
 
     fn pcp_alloc(&self, cpu: &PcpCpu, zone: usize, kind: Kind, deep: bool) -> Option<u64> {
-        let mut list = cpu.lists[zone].lock();
+        let mt = MigrateType::of(kind);
+        let mut list = cpu.lists[zone][mt as usize].lock();
         if list.is_empty() {
             let mut zs = self.zones[zone].lock();
             if !deep && self.below_reserve(zone, &zs, kind) {
@@ -399,17 +460,23 @@ impl Buddy {
             // next hits of any kind would take it without asking (16 lists x BATCH is more than the reserve of a
             // small machine): it stops at the reserve; below it, a kernel kind or a deep allocation takes only
             // the frame it needs, program and cache memory go to direct reclaim first.
-            let above = zs.free_frames.saturating_sub(self.reserve[zone].load(Relaxed));
+            let above = zs.usable_free().saturating_sub(self.reserve[zone].load(Relaxed));
             let n = match (pcp::BATCH as u64).min(above) as usize {
                 0 if !deep && crate::reclaim::direct_allowed(kind) => return None,
                 0 => 1,
                 n => n,
             };
+            // W35 MM-1: the list of a type refills from that type's pageblocks (or one it claimed whole); a frame
+            // stolen from another type's pageblock is taken alone and only into an empty list, so a batch never
+            // spreads one type into another.
             for _ in 0..n {
-                let Some((ri, pfn)) = self.take_block(zone, &mut zs, 0) else { break };
+                let Some((ri, pfn, took)) = self.rmqueue(zone, &mut zs, 0, mt, u64::MAX, list.is_empty()) else { break };
                 self.set_meta(&self.regions[ri], pfn, Meta::new(State::Cached, 0, 0));
                 list.push(pfn);
                 self.cached[zone].fetch_add(1, Relaxed);
+                if took == group::Took::Stolen {
+                    break;
+                }
             }
         }
         while let Some(pfn) = list.pop() {
@@ -459,10 +526,12 @@ impl Buddy {
     pub fn drain_all(&self) -> u64 {
         let mut moved = 0;
         for cpu in self.pcp.iter_existing() {
-            for (zone, l) in cpu.lists.iter().enumerate() {
-                let mut list = l.lock();
-                let n = list.len();
-                moved += self.pcp_return(&mut list, zone, n);
+            for (zone, lists) in cpu.lists.iter().enumerate() {
+                for l in lists {
+                    let mut list = l.lock();
+                    let n = list.len();
+                    moved += self.pcp_return(&mut list, zone, n);
+                }
             }
         }
         moved
@@ -550,9 +619,15 @@ impl Buddy {
     #[cfg(test)]
     pub(crate) fn corrupt_cached_frame(&self, zone: usize) -> Option<u64> {
         let cpu = self.pcp.get_for(0)?;
-        let pfn = *cpu.lists[zone].lock().last()?;
+        let pfn = cpu.lists[zone].iter().find_map(|l| l.lock().last().copied())?;
         self.set_meta(self.region_of(pfn)?, pfn, Meta::NONE);
         Some(pfn * PAGE)
+    }
+
+    /// W35 MM-1: the migrate type of the pageblock holding `phys` (None outside every region).
+    pub fn pageblock_type(&self, phys: u64) -> Option<MigrateType> {
+        let pfn = phys / PAGE;
+        self.region_of(pfn).map(|r| self.pb_type(r, pfn))
     }
 
     pub fn zone_info(&self, zone: usize) -> ZoneInfo {
@@ -563,6 +638,9 @@ impl Buddy {
             free_frames: zs.free_frames,
             cached_frames: self.cached[zone].load(Relaxed),
             free_blocks: zs.free_blocks,
+            free_by_type: zs.by_type,
+            pageblocks: zs.pageblocks,
+            free_highatomic: zs.free_highatomic,
         }
     }
 }
@@ -571,18 +649,27 @@ impl Buddy {
     /// `FrameAlloc::free` of a block carrying owner tag `tag` (the heap's slabs and run pieces); false if
     /// refused (counted as a bad free, nothing changed).
     pub(crate) fn free_tagged(&self, phys: u64, order: u32, kind: Kind, tag: u8) -> bool {
+        // The block's state, `used` and the list it goes to move together for anyone who stops the other CPUs to compare
+        // them (`check` under `run_exclusive`): a thread preempted on the way would read as a disagreement there, a
+        // claimed block in no list as cached after a drain or as neither free nor used.
+        let moving = ksync::PreemptGuard::new();
         let (r, pfn, owner) = match self.claim(phys, order, kind, tag) {
             Ok(c) => c,
             Err(why) => {
+                drop(moving);
                 self.reports().bad_free(phys, order, kind as usize, why);
                 return false;
             }
         };
         self.used[owner].fetch_sub(1 << order, Relaxed);
+        // Linux `free_frozen_pages`: the list of the frame's pageblock type, not of the kind it was freed as. A frame
+        // of the reserve goes straight back to it: Linux parks it on the Movable list, where anyone takes it next.
+        let mt = self.pb_type(r, pfn);
         if order == 0
+            && mt != MigrateType::HighAtomic
             && let Some(cpu) = self.pcp.find_for(hal::percpu::this_cpu())
         {
-            let mut list = cpu.lists[r.zone].lock();
+            let mut list = cpu.lists[r.zone][mt as usize].lock();
             if list.len() < list.capacity() {
                 list.push(pfn);
                 self.cached[r.zone].fetch_add(1, Relaxed);
@@ -595,6 +682,7 @@ impl Buddy {
         }
         // No list, or list full (cannot happen with HIGH < capacity): straight to the buddy lists.
         if order == 0 && self.cas_meta(r, pfn, Meta::new(State::Cached, 0, 0), Meta::NONE).is_err() {
+            drop(moving);
             self.quarantine(pfn);
             return true;
         }
@@ -647,11 +735,14 @@ impl Buddy {
             Zone::Normal => &[1, 0],
         };
         for &z in tries {
+            // As in `free_tagged`: the block's state and `used` move together.
+            let counted = ksync::PreemptGuard::new();
             if let Some(pfn) = self.alloc_in(z, order, kind, deep) {
+                self.used[kind as usize].fetch_add(1 << order, Relaxed);
+                drop(counted);
                 if z != zone_index(zone) {
                     self.reports().fallback();
                 }
-                self.used[kind as usize].fetch_add(1 << order, Relaxed);
                 return Some(pfn * PAGE);
             }
         }
@@ -668,6 +759,7 @@ impl FrameAlloc for Buddy {
         if let Some(p) = self.grab(order, zone, kind, false) {
             return Some(p);
         }
+        self.want_kswapd(order);
         // MM-9: only after both attempts and the drain failed (the fast path is unchanged). PF-5: one wait budget
         // for the reclaim rounds and the last step (at most one bounded wait runs out per allocation, B4).
         let mut budget = crate::grace::WaitBudget::default();
@@ -677,7 +769,14 @@ impl FrameAlloc for Buddy {
         if let Some(p) = self.alloc_after_grace(order, zone, kind, &mut budget) {
             return Some(p);
         }
-        self.reports().alloc_fail(order, zone_index(zone));
+        if let Some(p) = self.alloc_highatomic(order, zone, kind) {
+            return Some(p);
+        }
+        // A heap try that left the reserve alone is not a failure yet: the heap reclaims and comes again, its last
+        // try may take the reserve (`reclaim::keep_reserve`); that one is counted if it fails.
+        if !(kind == Kind::Heap && crate::reclaim::keeps_reserve()) {
+            self.reports().alloc_fail(order, zone_index(zone));
+        }
         None
     }
 
@@ -698,6 +797,7 @@ impl FrameAlloc for Buddy {
             let i = self.zone_info(z);
             s.total_bytes += i.managed_frames * PAGE;
             s.free_bytes += (i.free_frames + i.cached_frames) * PAGE;
+            s.highatomic_free_bytes += i.free_highatomic * PAGE;
         }
         for (k, u) in self.used.iter().enumerate() {
             s.used_by_kind[k] = u.load(Relaxed) * PAGE;

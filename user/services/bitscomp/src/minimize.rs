@@ -192,7 +192,10 @@ impl App {
     /// A launcher tile (start page, favourites bar) restores the newest minimised window of its program on the
     /// shown workspace; false if there is none (the tile then starts the program as before).
     pub fn restore_program(&mut self, addr: &str) -> bool {
-        let found = self.ws.minimized.iter().rev().map(|m| m.win.clone()).find(|w| launches(addr, &names(w).0));
+        // PK-L1a: a library program's windows are also known by its StartupWMClass.
+        let entry = self.library.by_address(addr).cloned();
+        let ids: Vec<String> = self.ws.minimized.iter().map(|m| names(&m.win).0).collect();
+        let found = newest_of(addr, entry.as_ref(), &ids).map(|i| self.ws.minimized[i].win.clone());
         found.is_some_and(|w| self.unminimize(&w, "launcher tile"))
     }
 
@@ -213,9 +216,29 @@ impl App {
     }
 }
 
+/// The launcher rule's pick: the newest of the minimised windows (`app_ids`, oldest first) that `addr`'s program
+/// owns, by its address or its library entry's StartupWMClass.
+pub fn newest_of(addr: &str, entry: Option<&crate::library::Entry>, app_ids: &[String]) -> Option<usize> {
+    app_ids.iter().rposition(|id| launches(addr, id) || entry.is_some_and(|e| e.owns(id)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::launches;
+    use super::{launches, newest_of};
+
+    #[test]
+    fn launcher_tile_restores_the_newest_window_by_startup_wm_class() {
+        // A program whose windows' app_id is not its address word: only StartupWMClass ties them together.
+        let mut notes = crate::library::Index::builtin().entries[0].clone();
+        notes.id = "notes".into();
+        notes.address = "programm/notes".into();
+        notes.wm_class = "org.example.Notizen".into();
+        let ids: Vec<String> = ["org.example.Notizen", "foot", "Org.Example.Notizen", "foot"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(newest_of("programm/notes", Some(&notes), &ids), Some(2), "the newest Notizen window, foot left alone");
+        assert_eq!(newest_of("programm/notes", None, &ids), None, "without the entry the address alone finds none");
+        assert_eq!(newest_of("programm/terminal", None, &ids), Some(3));
+        assert_eq!(newest_of("programm/notes", Some(&notes), &[]), None);
+    }
 
     #[test]
     fn launcher_addresses_match_their_programs() {

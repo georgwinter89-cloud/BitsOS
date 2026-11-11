@@ -192,11 +192,11 @@ ktest!("rb.mirror.framing", Safe, framing);
 /// sized from memory, checked by `rb.mirror.sized`.)
 fn early_buffer() -> TestResult {
     if klog::Level::Info > klog::level_for("kernel") {
-        return ktest::skip("the kernel's Info start line is not kept at this loglevel");
+        return ktest::fail("the kernel's Info start line is not kept at this loglevel");
     }
     let m = test_mirror(&EARLY, klog::ring_info().bytes.max(64 << 10))?;
     if m.ring_state().4 < klog::ring_info().bytes {
-        return ktest::skip("klog's ring grew since the first run in this boot");
+        return ktest::fail("klog's ring grew since the first run in this boot");
     }
     let id = klog::add_deferred_sink("ktest-mirror", m, true);
     let mark = alloc::format!("{}", time::now_ns());
@@ -217,7 +217,7 @@ fn early_buffer() -> TestResult {
     let page = klog::read(0, 64, &klog::Filter::ALL);
     let first = page.records.first().ok_or("klog is empty")?;
     if first.seq != 0 || !page.gaps.is_empty() {
-        return ktest::skip("klog's own ring no longer holds the start of the boot");
+        return ktest::fail("klog's own ring no longer holds the start of the boot");
     }
     let mut expect = Vec::new();
     for r in &page.records {
@@ -237,7 +237,7 @@ fn early_buffer() -> TestResult {
     kassert!(text.windows(17).any(|w| w == b"I kernel start ve"), "the kernel's start line (before DHCP) is buffered");
     Ok(())
 }
-ktest!("rb.mirror.early_buffer", Safe, early_buffer);
+ktest!("rb.mirror.early_buffer", Run("rb/30-mirror"), early_buffer);
 
 /// The emergency path with interrupts off on a fake card: unsent text and the line as raw frames, the line
 /// alone in the screen stream while the ring is held, no second copy from klogd, the end datagram on stop.
@@ -355,7 +355,7 @@ fn counter(name: &str) -> u64 {
 }
 
 fn live() -> TestResult {
-    let Some(m) = live_or_skip()? else { return ktest::skip("no mirror= in CONFIG") };
+    let Some(m) = live_or_skip()? else { return ktest::fail("no mirror= in CONFIG") };
     klog::event!(Warn, "rb", "mirror.live_test", id = klog::Hex(m.id() as u64));
     wait_sent(m, 20)?;
     // Loss and send errors are the scenario's business (its listener shows them); on the Mini-PC a cable that
@@ -366,10 +366,10 @@ fn live() -> TestResult {
     kassert!(m.route().is_some(), "no route snapshot for the emergency path");
     Ok(())
 }
-ktest!("rb.mirror.live", Safe, live);
+ktest!("rb.mirror.live", Run("rb/30-mirror"), live);
 
 fn emergency_line() -> TestResult {
-    let Some(m) = live_or_skip()? else { return ktest::skip("no mirror= in CONFIG") };
+    let Some(m) = live_or_skip()? else { return ktest::fail("no mirror= in CONFIG") };
     wait_sent(m, 20)?;
     let before = counter("mirror.emergency_frames");
     let mark = alloc::format!("{:x}", time::now_ns());
@@ -383,7 +383,7 @@ fn emergency_line() -> TestResult {
     wait_sent(m, 20)?;
     Ok(())
 }
-ktest!("rb.mirror.emergency", Safe, emergency_line);
+ktest!("rb.mirror.emergency", Run("rb/30-mirror"), emergency_line);
 
 static PAUSE: ksync::OnceRef<Mirror> = ksync::OnceRef::new();
 
@@ -431,7 +431,7 @@ ktest!("rb.mirror.pause_fake_card", Safe, pause_fake_card);
 /// RB-15 on the live mirror (the scenario's listener or the Mini-PC's): pause, a marker line out raw at a
 /// checkpoint with the real card's done (igc), then the thread's path back. Rerunnable; one pause per run.
 fn pause_live() -> TestResult {
-    let Some(m) = live_or_skip()? else { return ktest::skip("no mirror= in CONFIG") };
+    let Some(m) = live_or_skip()? else { return ktest::fail("no mirror= in CONFIG") };
     wait_sent(m, 20)?;
     let route = m.route().ok_or("no route snapshot")?;
     let name = String::from(route.card.name());
@@ -456,13 +456,13 @@ fn pause_live() -> TestResult {
     wait_sent(m, 20)?;
     Ok(())
 }
-ktest!("rb.mirror.pause_live", Safe, pause_live);
+ktest!("rb.mirror.pause_live", Run("rb/30-mirror"), pause_live);
 
 /// The way back after a quiesce whose Reload did not happen (the cards stayed up here): the mirror's quiesce
 /// entry sends the end, `resume` makes the thread start a new view with a new id, and lines flow again. The
 /// scenario's listener sees "mirror ended", a second start and the marker line after it, with nothing twice.
 fn restart() -> TestResult {
-    let Some(m) = live_or_skip()? else { return ktest::skip("no mirror= in CONFIG") };
+    let Some(m) = live_or_skip()? else { return ktest::fail("no mirror= in CONFIG") };
     wait_sent(m, 20)?;
     let old = m.id();
     let n = devmodel::quiesce_matching("mirror");
@@ -481,17 +481,17 @@ fn restart() -> TestResult {
     kassert!(m.route().is_some(), "no route snapshot after the restart");
     Ok(())
 }
-ktest!("rb.mirror.restart", Safe, restart);
+ktest!("rb.mirror.restart", Run("rb/30-mirror"), restart);
 
 /// A real panic after the boot went out (only with CONFIG `rb_mirror_panic=on`): the scenario looks for its
 /// line on the listener, which only the panic path (`try_event!` + `poll_tx`) can send.
 fn forced_panic() -> TestResult {
     if kexec::boot::config("rb_mirror_panic").as_deref() != Some("on") {
-        return ktest::skip("CONFIG rb_mirror_panic=on not set");
+        return ktest::fail("CONFIG rb_mirror_panic=on not set");
     }
     let m = kernel_mirror_live(60)?;
     klog::event!(Warn, "rb", "mirror.panic_next");
     wait_sent(m, 20)?;
     panic!("rb.mirror forced panic marker={:x}", m.id());
 }
-ktest!("rb.mirror.forced_panic", QemuOnly, forced_panic);
+ktest!("rb.mirror.forced_panic", Run("rb/30-mirror"), forced_panic);

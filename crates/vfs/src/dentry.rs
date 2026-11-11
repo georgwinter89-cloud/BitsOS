@@ -312,6 +312,10 @@ pub struct Dentry {
     /// Its children are in the tree (always, except for directories of a file system with `FsOps` that were
     /// not looked into yet).
     loaded: AtomicBool,
+    /// PF-7: the inotify generation at which its parent was last seen with no watch on its children (0: not seen since the
+    /// dentry came or moved). Written under `link`, so a move's reset cannot be overwritten by a look at the old
+    /// parent.
+    parent_quiet: AtomicU64,
     /// Its name's metadata charge (`DENTRY_BYTES` plus the name), given back with the dentry: held only for its
     /// `Drop` (MetaCharge returns the bytes), hence never read.
     _charge: Option<crate::pool::MetaCharge>,
@@ -377,6 +381,7 @@ impl Dentry {
             dir: SpinLock::named("vfs.dentry.dir", DirMap { next_seq: 1, ..Default::default() }),
             mounted: AtomicU32::new(0),
             loaded: AtomicBool::new(true),
+            parent_quiet: AtomicU64::new(0),
             _charge: charge,
         })
     }
@@ -416,6 +421,19 @@ impl Dentry {
     pub fn is_unlinked(&self) -> bool {
         self.link.lock().unlinked
     }
+    /// PF-7 (`inotify::parent_quiet`): whether no watch on its parent asks for its events, as of inotify generation
+    /// `generation`.
+    pub(crate) fn parent_quiet_at(&self, generation: u64) -> bool {
+        if self.parent_quiet.load(Ordering::Acquire) == generation {
+            return true;
+        }
+        let l = self.link.lock();
+        let quiet = l.parent.as_ref().is_none_or(|p| !p.inode.marks.watches_children());
+        if quiet {
+            self.parent_quiet.store(generation, Ordering::Release);
+        }
+        quiet
+    }
     pub fn is_dead_dir(&self) -> bool {
         self.dir.lock().dead
     }
@@ -437,12 +455,40 @@ impl Dentry {
     /// The children in the cache now, without loading the directory (INT-W7: fs-fat refreshes the owner and
     /// mode of a moved subtree; what is not cached yet is loaded later with the right ones).
     pub fn cached_children(&self) -> Vec<Arc<Dentry>> {
-        self.dir.lock().by_name.values().cloned().collect()
+        let mut out = Vec::new();
+        loop {
+            let want = {
+                let d = self.dir.lock();
+                if d.by_name.len() <= out.capacity() {
+                    out.extend(d.by_name.values().cloned());
+                    return out;
+                }
+                d.by_name.len()
+            };
+            out.reserve_exact(want);
+        }
     }
     /// Children in listing order starting at sequence number `from` (inclusive), at most `max`.
+    ///
+    /// The list's room is made with the directory's lock dropped (here and in `cached_children`): under a spin
+    /// lock the heap can neither reclaim nor fall back to single frames, and the list of a large directory
+    /// made there brings the kernel down when no free run is at hand (Mini-PC, 11.11.2026; see `ksync::spare`).
+    /// A directory that grew meanwhile asks again.
     pub fn children_from(self: &Arc<Self>, from: u64, max: usize) -> Vec<(u64, Arc<Dentry>)> {
         self.load_quiet();
-        self.dir.lock().by_seq.range(from..).take(max).map(|(s, d)| (*s, d.clone())).collect()
+        let mut out = Vec::new();
+        loop {
+            let want = {
+                let d = self.dir.lock();
+                let want = d.by_seq.len().min(max);
+                if want <= out.capacity() {
+                    out.extend(d.by_seq.range(from..).take(max).map(|(s, d)| (*s, d.clone())));
+                    return out;
+                }
+                want
+            };
+            out.reserve_exact(want);
+        }
     }
     /// stat of this dentry's inode.
     pub fn attr(&self) -> crate::abi::Attr {
@@ -621,6 +667,7 @@ impl Dentry {
             l.name = name.to_vec();
             l.seq = seq;
             l.unlinked = false;
+            d.parent_quiet.store(0, Ordering::Release);
             l.parent.replace(self.clone())
         };
         drop(old_parent);

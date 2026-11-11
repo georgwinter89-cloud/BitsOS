@@ -24,7 +24,7 @@ fn have_prog() -> bool {
 }
 
 fn skip_no_prog() -> TestResult {
-    ktest::skip("/bin/fs-pipe is not in this image (xtask builds host/tests/fs/progs into every image)")
+    ktest::fail("/bin/fs-pipe is not in this image (xtask builds host/tests/fs/progs into every image)")
 }
 
 struct Io {

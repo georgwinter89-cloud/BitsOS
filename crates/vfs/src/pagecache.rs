@@ -59,6 +59,129 @@ klog::counter!(FILL_WAITS, "vfs.cache.fill_waits");
 klog::counter!(FILL_WAIT_TIMEOUTS, "vfs.cache.fill_wait_timeouts");
 klog::counter!(FILL_WAIT_PAST_BG, "vfs.cache.fill_wait_past_preload");
 klog::counter!(FILL_WINDOW_ERRORS, "vfs.cache.fill_window_errors");
+// BL-0: POSIX_FADV_DONTNEED and drop_caches (not on the read path: shared counters).
+klog::counter!(DONTNEED_DROPPED, "vfs.dontneed.dropped");
+klog::counter!(DONTNEED_KEPT, "vfs.dontneed.kept");
+klog::counter!(DONTNEED_WB_ERRORS, "vfs.dontneed.writeback_errors");
+// BL-0: a reader's miss read from the backend in its own context (Linux `page_cache_sync_ra`), per CPU.
+crate::pcpu_counter!(pub(crate) RA_SYNC, "vfs.readahead.sync", crate::pcpu::EVENTS_BATCH);
+// BL-4: misses read as asked, without a window (a standalone random read, POSIX_FADV_RANDOM, MADV_RANDOM), and the
+// mapping faults' windows (`fault_ra`).
+crate::pcpu_counter!(RA_RANDOM, "vfs.readahead.random", crate::pcpu::EVENTS_BATCH);
+crate::pcpu_counter!(RA_MMAP_SYNC, "vfs.readahead.mmap_sync", crate::pcpu::EVENTS_BATCH);
+crate::pcpu_counter!(RA_MMAP_ASYNC, "vfs.readahead.mmap_async", crate::pcpu::EVENTS_BATCH);
+klog::counter!(RA_LOTSAMISS, "vfs.readahead.mmap_lotsamiss");
+/// Linux MMAP_LOTSAMISS (mm/filemap.c:3275): a file whose mapping faults miss this much more than they hit gets no
+/// mmap read-around any more.
+const MMAP_LOTSAMISS: u32 = 100;
+
+/// What an invalidation did (`PageCache::dont_need`, `reclaim::drop_caches`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Invalidated {
+    /// Pages that left the cache (their frames after a grace period).
+    pub dropped: u64,
+    /// Pages of the range that stayed: dirty, mapped, held by a read or a request.
+    pub kept: u64,
+}
+
+/// Pages one hold of `vfs.inode.data` looks at in `invalidate_clean` (Linux takes a batch and reschedules).
+const INVALIDATE_CHUNK: u32 = 512;
+/// Pages a truncate takes out of the index per step (`PageCache::truncate`): the list of one step is 8 KiB.
+const CUT_STEP: usize = 1024;
+
+/// BL-0 (`invalidate_mapping_pages`, linux-7/mm/truncate.c:534 `mapping_try_invalidate` with
+/// `mapping_evict_folio` :325): takes the clean pages of file pages `[first, last]` that only the index holds out
+/// of the cache, `INVALIDATE_CHUNK` pages per hold of the data lock. A page that stays is marked COLD, so reclaim
+/// takes it first once it is free (`deactivate_file_folio`). `take_alone` decides under the index's write side, so
+/// a mapped page, one a locked read copies from or a block request holds stays; lockless readers hold no
+/// reference, so a page that goes is dropped through PF-5's grace queue (`drop_nowait`), never wiped. Writers go
+/// through this lock, so a page seen clean here stays clean until it is taken.
+pub(crate) fn invalidate_clean(inner: &Mutex<Inner>, first: u64, last: u64) -> Invalidated {
+    let mut out = Invalidated::default();
+    let mut at = first;
+    loop {
+        let g = inner.lock();
+        for _ in 0..INVALIDATE_CHUNK {
+            let Some((i, dirty)) = g.pages.next_with(at, |i, p| {
+                if i <= last {
+                    p.set_state(COLD);
+                }
+                p.is_dirty()
+            }) else {
+                return out;
+            };
+            if i > last {
+                return out;
+            }
+            match if dirty { None } else { g.pages.take_alone(i) } {
+                Some(page) => {
+                    page.drop_nowait();
+                    out.dropped += 1;
+                }
+                None => out.kept += 1,
+            }
+            if i >= last {
+                return out;
+            }
+            at = i + 1;
+        }
+        drop(g);
+    }
+}
+
+/// FS-STALL round 4: dirty pages of block file systems and disks now (tmpfs pages are not written back). There was
+/// no bound on them: a download filled memory with pages reclaim cannot take (`dirty_over_limit`).
+static DIRTY_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// Dirty pages of block file systems and disks now.
+pub fn dirty_pages_total() -> u64 {
+    DIRTY_PAGES.load(Ordering::Relaxed)
+}
+
+/// Whether dirty pages exceed a fifth of memory (Linux's `vm.dirty_ratio`, 20 %): a writer then writes back
+/// before it dirties more (`balance_dirty_pages`; ext4's `write_at`).
+pub fn dirty_over_limit() -> bool {
+    let dirty = DIRTY_PAGES.load(Ordering::Relaxed);
+    #[cfg(not(bitsos_no_ktests))]
+    {
+        let test = DIRTY_LIMIT_TEST.load(Ordering::Relaxed);
+        if test != 0 {
+            return dirty > test;
+        }
+    }
+    // Cheap first: a fifth of memory is never below this many pages on a machine V2 runs on.
+    if dirty < 16 * 1024 {
+        return false;
+    }
+    let mut total = TOTAL_PAGES.load(Ordering::Relaxed);
+    if total == 0 {
+        total = mm_core::frames().map_or(0, |f| f.stats().total_bytes / P);
+        TOTAL_PAGES.store(total, Ordering::Relaxed);
+    }
+    total > 0 && dirty > total / 5
+}
+
+static TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(bitsos_no_ktests))]
+static DIRTY_LIMIT_TEST: AtomicU64 = AtomicU64::new(0);
+
+/// ktests: the dirty limit is `pages` until the guard drops (a test machine's disk cannot hold a fifth of memory).
+/// Not in the lean kernel.
+#[cfg(not(bitsos_no_ktests))]
+pub fn dirty_limit_for_test(pages: u64) -> DirtyLimitOverride {
+    DIRTY_LIMIT_TEST.store(pages.max(1), Ordering::Relaxed);
+    DirtyLimitOverride(())
+}
+
+#[cfg(not(bitsos_no_ktests))]
+pub struct DirtyLimitOverride(());
+
+#[cfg(not(bitsos_no_ktests))]
+impl Drop for DirtyLimitOverride {
+    fn drop(&mut self) {
+        DIRTY_LIMIT_TEST.store(0, Ordering::Relaxed);
+    }
+}
 
 /// Frames held by the page cache now.
 pub fn frames_held() -> u64 {
@@ -143,7 +266,23 @@ impl CachePage {
         self.dirty.load(Ordering::Acquire)
     }
     pub fn set_dirty(&self) {
-        self.dirty.store(true, Ordering::Release);
+        self.make_dirty();
+    }
+    /// `set_dirty`; whether the page was clean before.
+    fn make_dirty(&self) -> bool {
+        let fresh = !self.dirty.swap(true, Ordering::AcqRel);
+        if fresh && self.pool.is_none() {
+            DIRTY_PAGES.fetch_add(1, Ordering::Relaxed);
+        }
+        fresh
+    }
+    /// Clears the dirty flag (a write-back took the page); whether it was set.
+    fn take_dirty(&self) -> bool {
+        let was = self.dirty.swap(false, Ordering::AcqRel);
+        if was && self.pool.is_none() {
+            DIRTY_PAGES.fetch_sub(1, Ordering::Relaxed);
+        }
+        was
     }
     /// MM-9: a read, write or mapping used the page (Linux `folio_mark_accessed`); a load first, so a hot page's
     /// cache line is not written on every access.
@@ -194,6 +333,9 @@ impl CachePage {
 
 impl Drop for CachePage {
     fn drop(&mut self) {
+        if *self.dirty.get_mut() && self.pool.is_none() {
+            DIRTY_PAGES.fetch_sub(1, Ordering::Relaxed);
+        }
         if *self.wipe.get_mut() {
             self.frame.zero_from(0);
         }
@@ -247,6 +389,11 @@ pub trait Backend: Send + Sync {
     fn read_ahead_pages(&self) -> u64 {
         0
     }
+    /// BL-4: the device's largest request in pages (Linux `bdi->io_pages`, max_sectors): a read asking for more
+    /// than `read_ahead_pages` gets a window up to this (`readahead::max_pages`). 0: as `read_ahead_pages`.
+    fn io_pages(&self) -> u64 {
+        0
+    }
     /// FS-14b: how many pages one missed page brings into the cache in one device request (the missed page
     /// and its neighbours, all of them kept: `PageCache::fill_with`); 1 = the missed page alone. A read() that
     /// wants more pages than this gets them in the same request, up to `MAX_WINDOW`.
@@ -288,9 +435,15 @@ pub(crate) enum Reach {
     /// read(): the page and the pages after it that the call still wants, at least the backend's window
     /// (linux-6.6/mm/filemap.c `filemap_get_pages` -> `page_cache_sync_readahead`).
     Forward(u64),
+    /// BL-3: read() of a page whose page before is not cached, on a backend with its own read-ahead and a window:
+    /// only the pages the call wants (linux-7/mm/readahead.c:630 "Standalone, small random read. Read as is"), not
+    /// the window.
+    Request(u64),
     /// A mapping's fault: the backend's window around the page (linux-6.6/mm/filemap.c:3195
     /// `do_sync_mmap_readahead`, "mmap read-around": start = pgoff - ra_pages / 2, size = ra_pages).
     Around,
+    /// BL-4: the read-ahead window [first, first + len) the missed page lies in (`readahead::Window`).
+    Window(u64, u64),
 }
 
 /// Why a mapping could not get a page.
@@ -331,6 +484,9 @@ pub(crate) struct Inner {
     pub(crate) clock: u64,
     /// MM-9: the lowest page that may still be an unused preloaded one (None: none).
     pub(crate) preload_at: Option<u64>,
+    /// FS-STALL round 5: pages `write` made dirty that no write-back took yet (a mapping's are not counted): this
+    /// file's share of the dirty pages, for `writeback::balance_dirty`.
+    own_dirty: u64,
 }
 
 impl Inner {
@@ -341,12 +497,6 @@ impl Inner {
     fn set_size(&mut self, size: u64) {
         self.size = size;
         self.pages.set_size(size);
-    }
-    /// FS-12: opens the next read-ahead window (`Ra::open`) and shows its mark to readers without this lock.
-    pub(crate) fn open_ra(&mut self, start: u64, pages: u64, max: u64) -> Option<(u64, u64)> {
-        let r = self.ra.open(start, pages, max);
-        self.sync_mark();
-        r
     }
     fn sync_mark(&self) {
         self.pages.ra().ra_mark.store(self.ra.mark.unwrap_or(NO_MARK), Ordering::Release);
@@ -363,37 +513,104 @@ impl Inner {
     pub(crate) fn free(&self, idx: u64) -> bool {
         !self.pages.contains(idx) && !self.in_flight(idx)
     }
+    /// BL-4: notes a read-ahead job's pages as being read (false: the list cannot grow).
+    pub(crate) fn note_reading(&mut self, r: (u64, u64, bool)) -> bool {
+        if self.reading.try_reserve(1).is_err() {
+            return false;
+        }
+        self.reading.push(r);
+        true
+    }
+    /// BL-4: the note of `note_reading` goes.
+    pub(crate) fn end_reading(&mut self, r: (u64, u64, bool)) {
+        if let Some(at) = self.reading.iter().position(|&x| x == r) {
+            self.reading.swap_remove(at);
+        }
+    }
+    /// BL-4: makes `w` the file's window and shows its mark (`Window::mark_in`) to readers without this lock.
+    fn set_window(&mut self, w: readahead::Window, pages: u64) {
+        self.ra.win = w;
+        self.ra.mark = w.mark_in(pages);
+        self.sync_mark();
+    }
+    /// BL-4: `page_cache_async_ra` at the mark: opens the window after the last (`Window::next`, at most `max`)
+    /// for a file of `pages` pages and marks the file `queued`: (first, count), None at the end of the file.
+    pub(crate) fn open_next(&mut self, pages: u64, max: u64) -> Option<(u64, u64)> {
+        if self.ra.random || max == 0 {
+            return None;
+        }
+        let w = self.ra.win.next(max);
+        if w.start >= pages || w.size == 0 {
+            self.ra.mark = None;
+            self.sync_mark();
+            return None;
+        }
+        self.set_window(w, pages);
+        self.ra.queued = true;
+        Some((w.start, w.size.min(pages - w.start)))
+    }
 }
 
-/// FS-12: the read-ahead state of one file (`readahead`).
+/// FS-12, BL-4: the read-ahead state of one file (Linux `file_ra_state`; per file here, per open file there: see
+/// plan/notes/bl-BL-4.md).
 #[derive(Default)]
 pub(crate) struct Ra {
-    /// The last window (pages; 0 = none yet).
-    win: u64,
-    /// Reaching this page queues the next window (first page of the last one; None after it was reached).
+    /// The last window (size 0 = none yet).
+    win: readahead::Window,
+    /// `win`'s PG_readahead page (None: none, or a reader reached it); mirrored to readers without the data
+    /// lock (`sync_mark`).
     mark: Option<u64>,
-    /// The first page after the last queued window.
-    pub(crate) end: u64,
     /// A job of this file is queued or running.
     pub(crate) queued: bool,
     /// The reader reached `mark` while the job was still queued or running: the job queues the next window
     /// when it ends (`readahead::run`), so a reader faster than the disk keeps the pipeline going.
     pub(crate) follow: bool,
+    /// POSIX_FADV_RANDOM (Linux FMODE_RANDOM): misses read what they ask for, no window.
+    random: bool,
+    /// POSIX_FADV_SEQUENTIAL: twice the backend's window (Linux `f_ra.ra_pages = bdi->ra_pages * 2`).
+    double: bool,
 }
 
-impl Ra {
-    /// Opens the window after `start` (doubling the last one up to `max`) for a file of `pages` pages:
-    /// (first, count), with the mark on its first page and the file marked `queued`.
-    pub(crate) fn open(&mut self, start: u64, pages: u64, max: u64) -> Option<(u64, u64)> {
-        if start >= pages || max == 0 {
-            return None;
-        }
-        let win = if self.win == 0 { readahead::INIT_PAGES } else { self.win.saturating_mul(2) }.min(max);
-        self.win = win;
-        self.mark = Some(start);
-        self.end = start.saturating_add(win);
-        self.queued = true;
-        Some((start, win))
+/// BL-4: posix_fadvise advice that changes read-ahead (linux-7/mm/fadvise.c:79-95).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Advice {
+    /// POSIX_FADV_NORMAL: the backend's window, random off.
+    Normal,
+    /// POSIX_FADV_RANDOM: no window (the window size stays for a later NORMAL or SEQUENTIAL).
+    Random,
+    /// POSIX_FADV_SEQUENTIAL: twice the backend's window, random off.
+    Sequential,
+}
+
+/// BL-4: what a mapping's fault tells read-ahead (Linux `vmf->vma->vm_flags` and the VMA's file range).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MapHint {
+    /// MADV_RANDOM (VM_RAND_READ).
+    pub random: bool,
+    /// MADV_SEQUENTIAL (VM_SEQ_READ).
+    pub sequential: bool,
+    /// PROT_EXEC (VM_EXEC): code is read forward from the fault, inside the VMA, without a mark.
+    pub exec: bool,
+    /// The VMA's file pages [first, end).
+    pub first: u64,
+    pub end: u64,
+}
+
+/// FS-14b, BL-4: fills (and read-ahead jobs) that ended, and the threads that wait for one (`fill_with`). Shared
+/// with the jobs (`readahead::Job`), which note their pages in `Inner::reading` like a fill.
+pub(crate) struct FillDone {
+    fills: AtomicU64,
+    wq: WaitQueue,
+}
+
+impl FillDone {
+    /// Under `vfs.inode.data`, when a fill's note leaves `Inner::reading`.
+    pub(crate) fn ended(&self) {
+        self.fills.fetch_add(1, Ordering::AcqRel);
+    }
+    /// After the data lock is dropped.
+    pub(crate) fn wake(&self) {
+        self.wq.wake_all();
     }
 }
 
@@ -412,7 +629,7 @@ impl Reading<'_> {
         {
             g.reading.swap_remove(at);
         }
-        self.cache.fills.fetch_add(1, Ordering::AcqRel);
+        self.cache.done.ended();
     }
 }
 
@@ -422,7 +639,7 @@ impl Drop for Reading<'_> {
             let mut g = self.cache.inner.lock();
             self.end_locked(&mut g);
             drop(g);
-            self.cache.fill_wq.wake_all();
+            self.cache.done.wake();
         }
     }
 }
@@ -458,12 +675,21 @@ pub struct PageCache {
     sync_lock: Mutex<()>,
     /// FS-12: the backend's read-ahead maximum (pages; 0 = none).
     ra_max: u64,
+    /// BL-3: the byte where the last read(2) of the file ended (u64::MAX: none yet), Linux's `ra->prev_pos`
+    /// (linux-7/mm/filemap.c:2897; per open file there, per file here: a hint only, two readers of one file may
+    /// mislead it into one window more or less).
+    prev_pos: AtomicU64,
     /// FS-14b: fills that ended (under `vfs.inode.data`), and the threads that wait for one (`fill_with`).
-    fills: AtomicU64,
-    fill_wq: WaitQueue,
+    done: Arc<FillDone>,
+    /// BL-4: the backend's largest request (`Backend::io_pages`; 0: as `ra_max`).
+    io_pages: u64,
+    /// BL-4: Linux `ra->mmap_miss`: mapping faults that missed minus those that hit (at most 10 x MMAP_LOTSAMISS).
+    mmap_miss: AtomicU32,
     /// FS-15 fixer F2: never given to another cache (an address is, once this one is freed); the preload recorder
     /// keys its files by it.
     ident: u64,
+    /// FS-STALL: this cache's id for frame owners (`reclaim::register`; 0: none).
+    owner_id: u64,
     /// Host tests: a write-back batch takes at most `batch_cap - 1` pages, as if memory ran out (0 = no cap).
     #[cfg(test)]
     pub(crate) batch_cap: core::sync::atomic::AtomicUsize,
@@ -504,24 +730,26 @@ impl PageCache {
         let sealable = pool.is_some() && backend.is_none();
         let pages = Pages::new(size);
         let view = pages.shared();
-        let inner = Arc::new(Mutex::named("vfs.inode.data", Inner { size, charged: 0, pages, seals: if sealable { F_SEAL_SEAL } else { 0 }, writable_maps: 0, epoch: 0, ra: Ra::default(), reading: Vec::new(), clock: 0, preload_at: None }));
+        let inner = Arc::new(Mutex::named("vfs.inode.data", Inner { size, charged: 0, pages, seals: if sealable { F_SEAL_SEAL } else { 0 }, writable_maps: 0, epoch: 0, ra: Ra::default(), reading: Vec::new(), clock: 0, preload_at: None, own_dirty: 0 }));
         // MM-9: a block file system's clean pages can be read again, so reclaim may take them; tmpfs pages
         // (the pool's) never go (no swap).
-        if Self::may_reclaim(&pool, &backend) {
-            crate::reclaim::register(&inner);
-        }
+        let owner_id = if Self::may_reclaim(&pool, &backend) { crate::reclaim::register(&inner) } else { 0 };
+        view.owner_id.store(owner_id, Ordering::Relaxed);
         PageCache {
             inner,
             view,
             ra_max: backend.as_ref().map_or(0, |b| b.read_ahead_pages()),
+            io_pages: backend.as_ref().map_or(0, |b| b.io_pages()),
+            prev_pos: AtomicU64::new(u64::MAX),
             lazy,
             sealable,
             pool,
             backend,
             sync_lock: Mutex::named("vfs.cache.sync", ()),
-            fills: AtomicU64::new(0),
-            fill_wq: WaitQueue::new(),
+            done: Arc::new(FillDone { fills: AtomicU64::new(0), wq: WaitQueue::new() }),
+            mmap_miss: AtomicU32::new(0),
             ident: NEXT_IDENT.fetch_add(1, Ordering::Relaxed),
+            owner_id,
             #[cfg(test)]
             batch_cap: core::sync::atomic::AtomicUsize::new(0),
         }
@@ -726,10 +954,13 @@ impl PageCache {
     /// `over_bg`: pages only the preload reads count as free (a foreground miss that stopped waiting for it).
     fn window(g: &Inner, idx: u64, reach: Reach, win: u64, over_bg: bool) -> (u64, u64) {
         let n = pages_for(g.size);
-        let (back, len) = match reach {
+        let (back, len, cap) = match reach {
             Reach::One => return (idx, idx + 1),
-            Reach::Forward(want) => (0, want.max(win)),
-            Reach::Around => (win / 2, win),
+            Reach::Forward(want) => (0, want.max(win), u64::MAX),
+            Reach::Request(want) => (0, want, u64::MAX),
+            Reach::Around => (win / 2, win, u64::MAX),
+            // BL-4: exactly the window's pages (the ones of it that are free and contiguous with `idx`).
+            Reach::Window(first, len) => (idx - first.min(idx), len, first.min(idx).saturating_add(len).max(idx + 1)),
         };
         let len = len.clamp(1, MAX_WINDOW);
         let lowest = idx.saturating_sub(back);
@@ -739,7 +970,7 @@ impl PageCache {
             first -= 1;
         }
         let mut end = idx + 1;
-        while end < n && end - first < len && free(end) {
+        while end < n && end < cap && end - first < len && free(end) {
             end += 1;
         }
         (first, end)
@@ -772,11 +1003,11 @@ impl PageCache {
             }
             if !alone && !past_bg && g.in_flight(idx) {
                 let short = !bg && g.in_flight_bg_only(idx);
-                let seen = self.fills.load(Ordering::Acquire);
+                let seen = self.done.fills.load(Ordering::Acquire);
                 drop(g);
                 FILL_WAITS.inc();
                 let limit = if short { BG_FILL_WAIT_NS } else { FILL_WAIT_NS };
-                if !self.fill_wq.wait_until_timeout(|| self.fills.load(Ordering::Acquire) != seen, limit) {
+                if !self.done.wq.wait_until_timeout(|| self.done.fills.load(Ordering::Acquire) != seen, limit) {
                     if short {
                         FILL_WAIT_PAST_BG.inc();
                         past_bg = true;
@@ -798,6 +1029,9 @@ impl PageCache {
         let mut done = Reading { cache: self, range: Some((first, end, bg)) };
         let (mut start, mut pages) = self.alloc_run(first, end, idx)?;
         FILL_READS.inc();
+        if !bg {
+            RA_SYNC.inc();
+        }
         if let Err(e) = b.read_pages(start, &pages) {
             if pages.len() <= 1 {
                 return Err(e);
@@ -842,7 +1076,7 @@ impl PageCache {
         }
         done.end_locked(&mut g);
         drop(g);
-        self.fill_wq.wake_all();
+        self.done.wake();
         // FS-13: what this caller read from the device, for its program's preload record (the preload's own
         // reads are not a program's).
         if !bg {
@@ -902,60 +1136,273 @@ impl PageCache {
         }
     }
 
-    /// FS-12: read-ahead bookkeeping of one step of `read_direct` that touched pages `[first, end)` and
-    /// stopped at `missing` (`cont`: the step continues the same read). Returns the job to queue, if any (the
-    /// file is marked `queued` then).
-    fn ra_note(&self, g: &mut Inner, first: u64, end: u64, missing: Option<u64>, cont: bool) -> Option<readahead::Job> {
-        let seq = cont || first == 0 || first == self.view.ra_next.load(Ordering::Relaxed);
-        let mut window = None;
-        if g.ra.mark.is_some_and(|m| m >= first && m < end) {
-            g.ra.mark = None;
-            if g.ra.queued {
-                g.ra.follow = true;
-            } else {
-                window = Some(g.ra.end);
-            }
+    /// FS-12, BL-4: a read or a fault that touched pages `[first, end)` reached the mark: opens the next window
+    /// (`Inner::open_next`) and returns its job; while the file's job still runs, that job opens it when it ends
+    /// (`Ra::follow`).
+    fn ra_note(&self, g: &mut Inner, first: u64, end: u64) -> Option<readahead::Job> {
+        if !g.ra.mark.is_some_and(|m| m >= first && m < end) {
+            return None;
         }
-        if let Some(idx) = missing {
-            if !seq {
-                g.ra.win = 0;
-                g.ra.mark = None;
-                g.ra.follow = false;
-            } else if !g.ra.queued && window.is_none() {
-                window = Some(idx + 1);
-            }
+        g.ra.mark = None;
+        if g.ra.queued {
+            g.ra.follow = true;
+            g.sync_mark();
+            return None;
         }
-        self.view.ra_next.store(end, Ordering::Relaxed);
         let pages = pages_for(g.size);
-        let opened = window.and_then(|w| g.open_ra(w, pages, self.ra_max));
+        let max = self.ra_pages(g);
+        let opened = g.open_next(pages, max);
         g.sync_mark();
-        let (first, count) = opened?;
-        Some(readahead::Job { inner: Arc::downgrade(&self.inner), backend: self.backend.clone()?, first, count, epoch: g.epoch })
+        let w = opened?;
+        Some(readahead::Job::new(Arc::downgrade(&self.inner), self.backend.clone()?, self.done.clone(), w, g.epoch, max))
     }
 
-    /// FS-12 for one step of `read_direct`: a step of cached pages that does not reach the mark only notes where
-    /// it ended (no data lock); a miss or the mark takes the lock for `ra_note` and queues its job.
-    fn ra_step(&self, first: u64, end: u64, missing: Option<u64>, cont: bool) {
-        if self.ra_max == 0 || !readahead::active() {
+    /// The window limit for this file now: the backend's, twice that after POSIX_FADV_SEQUENTIAL.
+    fn ra_pages(&self, g: &Inner) -> u64 {
+        let ra = if g.ra.double { self.ra_max.saturating_mul(2) } else { self.ra_max };
+        ra.min(MAX_WINDOW)
+    }
+
+    /// FS-12 for one step of a read that touched pages `[first, end)`: a step that does not reach the mark only
+    /// notes where it ended (no data lock); the mark takes the lock for `ra_note` and queues its job.
+    fn ra_step(&self, first: u64, end: u64) {
+        // A step that touched no page (a miss right at its start) says nothing about where the reader is.
+        if self.ra_max == 0 || end <= first {
             return;
         }
         let mark = self.view.mark();
-        if missing.is_none() && !(mark != NO_MARK && mark >= first && mark < end) {
-            self.view.ra_next.store(end, Ordering::Relaxed);
+        if !(mark != NO_MARK && mark >= first && mark < end) || !readahead::active() {
+            // PF-7: readers of one place write nothing here; this word sits with what every reader loads.
+            if self.view.ra_next.load(Ordering::Relaxed) != end {
+                self.view.ra_next.store(end, Ordering::Relaxed);
+            }
             return;
         }
         let mut g = self.inner.lock();
-        let job = self.ra_note(&mut g, first, end, missing, cont);
+        let job = self.ra_note(&mut g, first, end);
+        self.view.ra_next.store(end, Ordering::Relaxed);
         drop(g);
         if let Some(j) = job {
-            let range = (j.first, j.first + j.count);
-            if readahead::queue(j) {
-                // FS-13: the read-ahead thread reads these for this reader's program.
-                crate::preload::note_fill(self, range.0, range.1);
-            } else {
-                self.inner.lock().ra.queued = false;
+            self.queue_job(j);
+        }
+    }
+
+    /// Queues a read-ahead job of this file (FS-13: noted for the reader's program's preload record).
+    fn queue_job(&self, j: readahead::Job) {
+        let range = (j.first, j.first + j.count);
+        if readahead::queue(j) {
+            crate::preload::note_fill(self, range.0, range.1);
+        } else {
+            self.inner.lock().ra.queued = false;
+        }
+    }
+
+    /// BL-4: `page_cache_prev_miss` (linux-7/mm/filemap.c): the cached pages right before `idx`, at most `max`, and
+    /// whether they reach back to page 0.
+    fn history(g: &Inner, idx: u64, max: u64) -> (u64, bool) {
+        let mut n = 0;
+        let mut i = idx;
+        while n < max {
+            if i == 0 {
+                return (n, true);
+            }
+            i -= 1;
+            if !g.pages.contains(i) {
+                return (n, false);
+            }
+            n += 1;
+        }
+        (n, false)
+    }
+
+    /// BL-4: `page_cache_sync_ra` (linux-7/mm/readahead.c:577) for a miss at `idx` of a read that wants `req` pages
+    /// from there (`cont`: the miss lies inside the read). Sets the file's window and returns what the fill reads:
+    /// the window, or the request alone for a standalone random read and after POSIX_FADV_RANDOM. The window is
+    /// at least the backend's (`Backend::read_window`, FS-14b) and its mark stays where Linux puts it.
+    /// Sequential: the file start, an oversized read, inside the read, where the last read(2) ended (or in its
+    /// last page) or where the last read step ended (BL-3: the end of the last read keeps a stream sequential
+    /// whose history pages went: fadvise DONTNEED after each piece, drop_caches, reclaim).
+    fn sync_window(&self, g: &mut Inner, idx: u64, req: u64, cont: bool) -> Option<readahead::Window> {
+        if g.ra.random {
+            return None;
+        }
+        let max = readahead::max_pages(self.ra_pages(g), self.io_pages, req);
+        let prev = self.prev_pos.load(Ordering::Relaxed);
+        let after_last = prev != u64::MAX && idx.wrapping_sub(prev / P) <= 1;
+        let w = if idx == 0 || cont || req > max || after_last || idx == self.view.ra_next.load(Ordering::Relaxed) {
+            readahead::Window::sync_seq(idx, req, max)
+        } else {
+            let (contig, from_start) = Self::history(g, idx, max);
+            readahead::Window::sync_history(idx, req, contig, from_start, max)?
+        };
+        let w = w.at_least(self.read_window().min(max.max(1)));
+        g.set_window(w, pages_for(g.size));
+        Some(w)
+    }
+
+    /// The reach of the fill for a read(2) miss at `idx` wanting `req` pages (`sync_window`; without read-ahead
+    /// in the backend the request and the backend's window, as before BL-4).
+    fn miss_reach(&self, idx: u64, req: u64, cont: bool) -> Reach {
+        if self.ra_max == 0 {
+            return Reach::Forward(req);
+        }
+        let mut g = self.inner.lock();
+        // Being read already (a job's window or another reader's fill: Linux finds the locked folio in the cache,
+        // filemap.c `filemap_get_pages`): no new window, the fill waits for that read; reaching the mark there
+        // starts the next window as a cached page would.
+        if g.in_flight(idx) {
+            let job = if readahead::active() { self.ra_note(&mut g, idx, idx + 1) } else { None };
+            drop(g);
+            if let Some(j) = job {
+                self.queue_job(j);
+            }
+            return Reach::Request(req);
+        }
+        match self.sync_window(&mut g, idx, req, cont) {
+            Some(w) => Reach::Window(w.start, w.size),
+            None => {
+                RA_RANDOM.inc();
+                Reach::Request(req)
             }
         }
+    }
+
+    /// BL-4: read-ahead for a mapping's fault on file page `pgoff` (linux-7/mm/filemap.c:3555 `filemap_fault`),
+    /// before MM takes the page (`page_for_map`, which then finds it cached). A cached page: `do_async_mmap_readahead`
+    /// (:3452): the mark starts the next window, a hit counts against `mmap_miss`. A missing page:
+    /// `do_sync_mmap_readahead` (:3329): MADV_RANDOM reads the page alone; MADV_SEQUENTIAL the read path's window;
+    /// code (PROT_EXEC) `ra_pages` forward from the page inside the VMA, without a mark; else the read-around
+    /// window (`ra_pages` centred on the page, a quarter of it async), unless the file's faults miss far more
+    /// than they hit (`MMAP_LOTSAMISS`: the page alone). MM runs a missing page's call without the faulting
+    /// space's lock (`reads_for_fault`; Linux `maybe_unlock_mmap_for_io`); the async window never waits (a job).
+    /// A backend without read-ahead reads the page's window as `page_for_map` would (`Reach::Around`).
+    pub fn fault_ra(&self, pgoff: u64, h: &MapHint) {
+        if self.backend.is_none() {
+            return;
+        }
+        if self.ra_max == 0 {
+            if self.view.get(pgoff).is_none() {
+                // An error here is the fault's: `page_for_map` reads the page again and answers it.
+                let _ = self.fill_with(pgoff, Reach::Around);
+            }
+            return;
+        }
+        if self.view.get(pgoff).is_some() {
+            if h.random {
+                return;
+            }
+            if !h.sequential && !h.exec {
+                let m = self.mmap_miss.load(Ordering::Relaxed);
+                if m > 0 {
+                    self.mmap_miss.store(m - 1, Ordering::Relaxed);
+                }
+            }
+            if self.view.mark() == pgoff && readahead::active() {
+                let mut g = self.inner.lock();
+                let job = self.ra_note(&mut g, pgoff, pgoff + 1);
+                drop(g);
+                if let Some(j) = job {
+                    RA_MMAP_ASYNC.inc();
+                    self.queue_job(j);
+                }
+            }
+            return;
+        }
+        if h.random && !h.exec {
+            RA_RANDOM.inc();
+            let _ = self.fill_with(pgoff, Reach::One);
+            return;
+        }
+        let mut g = self.inner.lock();
+        let pages = pages_for(g.size);
+        if pgoff >= pages {
+            return;
+        }
+        // Being read (see `miss_reach`): its mark starts the next window; the fault waits for that read here,
+        // without the space's lock (`fill_with` waits for a running fill), not in `page_for_map`.
+        if g.in_flight(pgoff) {
+            let job = if h.random || !readahead::active() { None } else { self.ra_note(&mut g, pgoff, pgoff + 1) };
+            drop(g);
+            if let Some(j) = job {
+                RA_MMAP_ASYNC.inc();
+                self.queue_job(j);
+            }
+            let _ = self.fill_with(pgoff, Reach::One);
+            return;
+        }
+        let ra = self.ra_pages(&g);
+        // MADV_SEQUENTIAL is `page_cache_sync_ra(ra_pages)`: where it finds no stream (a standalone read, or
+        // POSIX_FADV_RANDOM) it still reads `ra_pages` forward, without a window (readahead.c:603, :640).
+        let mut alone = Reach::One;
+        let w = if h.sequential {
+            alone = Reach::Request(ra);
+            self.sync_window(&mut g, pgoff, ra, false)
+        } else if h.exec {
+            let start = pgoff.max(h.first);
+            let end = start.saturating_add(ra).min(h.end.max(start + 1));
+            let w = readahead::Window { start, size: end - start, async_size: 0 };
+            g.set_window(w, pages);
+            Some(w)
+        } else {
+            let m = self.mmap_miss.load(Ordering::Relaxed);
+            if m < MMAP_LOTSAMISS * 10 {
+                self.mmap_miss.store(m + 1, Ordering::Relaxed);
+            }
+            if m + 1 > MMAP_LOTSAMISS {
+                RA_LOTSAMISS.add(1);
+                if m == MMAP_LOTSAMISS {
+                    klog::event!(Debug, "vfs", "readahead.mmap_lotsamiss", cache = self.ident, page = pgoff; "this file's mapping faults miss far more than they hit: no read-around");
+                }
+                None
+            } else {
+                let w = readahead::Window { start: pgoff.saturating_sub(ra / 2), size: ra, async_size: ra / 4 };
+                g.set_window(w, pages);
+                Some(w)
+            }
+        };
+        drop(g);
+        let reach = match w {
+            Some(w) => {
+                RA_MMAP_SYNC.inc();
+                Reach::Window(w.start, w.size)
+            }
+            None => alone,
+        };
+        // An error here is the fault's: `page_for_map` reads the page again and answers it.
+        let _ = self.fill_with(pgoff, reach);
+    }
+
+    /// BL-4 (fixer): whether a mapping's fault on file page `pgoff` reads the file (`fault_ra` then waits for the
+    /// device): the file has a backend and the page is not cached. MM then calls `fault_ra` without its lock.
+    pub fn reads_for_fault(&self, pgoff: u64) -> bool {
+        self.backend.is_some() && self.view.get(pgoff).is_none()
+    }
+
+    /// BL-4 (fault-around, linux-7/mm/filemap.c:3899 `filemap_map_pages`): whether a mapping may map file page
+    /// `pgoff` without a fault: cached now and not the read-ahead mark (whose fault starts the next window).
+    pub fn ready_for_map(&self, pgoff: u64) -> bool {
+        self.view.mark() != pgoff && self.view.get(pgoff).is_some()
+    }
+
+    /// BL-4: posix_fadvise NORMAL, RANDOM and SEQUENTIAL (linux-7/mm/fadvise.c:79-95), for every reader of the
+    /// file (per open file in Linux). RANDOM also drops the mark, so no window starts from an old one.
+    pub fn advise(&self, a: Advice) {
+        if self.ra_max == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        match a {
+            Advice::Normal => (g.ra.random, g.ra.double) = (false, false),
+            Advice::Random => {
+                g.ra.random = true;
+                g.ra.mark = None;
+                g.ra.follow = false;
+                g.sync_mark();
+            }
+            Advice::Sequential => (g.ra.random, g.ra.double) = (false, true),
+        }
+        drop(g);
+        klog::event!(Debug, "vfs", "readahead.advice", cache = self.ident, advice = a as u8);
     }
 
     /// Reads into `buf` at `pos` (kernel callers, the bounce path of the read syscalls): cached pages lockless
@@ -1002,7 +1449,7 @@ impl PageCache {
             let here = pos + done as u64;
             let (n, stop) = self.view.quick(here, len - done, backend, &mut |p, off, k, d| sink(p, off, k, done + d));
             if n > 0 {
-                self.ra_step(here / P, (here + n as u64).div_ceil(P), None, done > 0);
+                self.ra_step(here / P, (here + n as u64).div_ceil(P));
             }
             done += n;
             match stop {
@@ -1026,6 +1473,22 @@ impl PageCache {
     /// (`fill_with`, as before) and the step looked up again. Ok((bytes, short)): `short` when the sink took
     /// fewer bytes than offered (a user fault): the read ends there. Err only when nothing was read.
     pub fn read_direct(&self, pos: u64, len: usize, sink: &mut ReadSink<'_>) -> Result<(usize, bool), Errno> {
+        let r = self.read_direct_steps(pos, len, sink);
+        // Only for a backend with its own read-ahead (the rule below), and only when the page changes: parallel
+        // readers of one file (PF-4) do not write the line for every read.
+        if let Ok((done, _)) = r
+            && done > 0
+            && self.ra_max > 0
+        {
+            let end = pos + done as u64;
+            if self.prev_pos.load(Ordering::Relaxed) / P != end / P {
+                self.prev_pos.store(end, Ordering::Relaxed);
+            }
+        }
+        r
+    }
+
+    fn read_direct_steps(&self, pos: u64, len: usize, sink: &mut ReadSink<'_>) -> Result<(usize, bool), Errno> {
         let end = pos.saturating_add(len as u64);
         let mut done = 0usize;
         loop {
@@ -1033,7 +1496,7 @@ impl PageCache {
             if done == len {
                 return Ok((done, false));
             }
-            let (first, cont) = (here / P, done > 0);
+            let first = here / P;
             let snap = self.view.snap(first, end, self.backend.is_some());
             if here >= snap.size {
                 return Ok((done, false));
@@ -1057,17 +1520,18 @@ impl PageCache {
             let missing = snap.missing.filter(|_| done < n);
             drop(snap);
             let stop = missing.unwrap_or_else(|| (pos + done as u64).div_ceil(P));
-            self.ra_step(first, stop, missing, cont);
+            self.ra_step(first, stop);
             let Some(idx) = missing else {
                 if done >= n {
                     return Ok((done, false));
                 }
                 continue;
             };
-            // A backend with the background read-ahead (FS-12, ext4) keeps the page-by-page fill: the job
-            // already reads the pages after `idx`, and a long fill here would race it for the same pages.
-            let want = if self.ra_max > 0 { 1 } else { (pos + n as u64).div_ceil(P).saturating_sub(idx) };
-            if let Err(e) = self.fill_with(idx, Reach::Forward(want)) {
+            // BL-4: the miss reads its window here (`miss_reach`, Linux `page_cache_sync_ra`); a backend without
+            // read-ahead (FAT) reads the pages the call wants and its window (FS-14b).
+            let req = (pos + n as u64).div_ceil(P).saturating_sub(idx).max(1);
+            let reach = self.miss_reach(idx, req, done > 0);
+            if let Err(e) = self.fill_with(idx, reach) {
                 return if done == 0 { Err(e) } else { Ok((done, false)) };
             }
         }
@@ -1135,7 +1599,9 @@ impl PageCache {
                     page.touch();
                     page.write(off, &buf[done..done + k]);
                     if self.backend.is_some() {
-                        page.set_dirty();
+                        if page.make_dirty() {
+                            g.own_dirty += 1;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1220,26 +1686,39 @@ impl PageCache {
             // without this lock never finds a cut-off page missing inside the old size (it would read zeros).
             g.set_size(size);
             let keep = pages_for(size);
+            // The pages leave the index in steps, and each step's pages are freed before the next. The room for a
+            // step is made here, once: the drain's callback runs under the index's write side (a spin lock), where
+            // the heap can neither reclaim nor use single frames. 11.11.2026, Mini-PC, a full page cache: one list
+            // for all pages grew in the callback, and past 2 MiB every further page was one refused request
+            // (70 000 a second for seconds, under this lock) while Steam cut its download's files.
             let mut cut: Vec<Gone> = Vec::new();
+            let step = if cut.try_reserve_exact(CUT_STEP).is_ok() { CUT_STEP } else { 1 };
             let mut carried = 0u64;
             let (pool_file, lazy) = (self.pool.is_some(), self.lazy);
-            // Dropped after the lock (a page's last reference frees its frame, which never needs this lock,
-            // but keeps the section short).
-            g.pages.drain_from(keep, &mut |_, p| {
-                // A pool page some mapping still pins keeps its frame: it keeps one page of the charge too and
-                // gives it back when its last pin goes, so the pool bound holds for frames really held (R2).
-                // No new reference can appear once it left the index, so a count of 1 stays 1.
-                // A lazy file's page carries its charge already.
-                if pool_file && p.strong_count() > 1 {
-                    if !lazy {
-                        p.carries_charge.store(true, Ordering::Release);
+            loop {
+                let more = g.pages.drain_some(keep, step, &mut |_, p| {
+                    // A pool page some mapping still pins keeps its frame: it keeps one page of the charge too and
+                    // gives it back when its last pin goes, so the pool bound holds for frames really held (R2).
+                    // No new reference can appear once it left the index, so a count of 1 stays 1.
+                    // A lazy file's page carries its charge already.
+                    if pool_file && p.strong_count() > 1 {
+                        if !lazy {
+                            p.carries_charge.store(true, Ordering::Release);
+                        }
+                        carried += 1;
                     }
-                    carried += 1;
+                    // Without room (no memory for the step's list) the page goes to the grace queue from here.
+                    if cut.len() < cut.capacity() {
+                        cut.push(p);
+                    }
+                });
+                // Outside the write side: a page's last reference frees its frame after a grace period, and above
+                // the queue's bound this thread waits for it (as `empty_dropped` does under this lock).
+                cut.clear();
+                if !more {
+                    break;
                 }
-                if cut.try_reserve(1).is_ok() {
-                    cut.push(p);
-                }
-            });
+            }
             if carried > 0 {
                 if !lazy {
                     g.charged = g.charged.saturating_sub(carried);
@@ -1256,7 +1735,6 @@ impl PageCache {
             g.set_size(size);
             self.settle_charge(&mut g);
             drop(g);
-            drop(cut);
             return Ok(());
         }
         g.set_size(size);
@@ -1544,11 +2022,62 @@ impl PageCache {
             return;
         }
         g.ra.queued = true;
-        let job = readahead::Job { inner: Arc::downgrade(&self.inner), backend, first, count: end - first, epoch: g.epoch };
+        let job = readahead::Job::new(Arc::downgrade(&self.inner), backend, self.done.clone(), (first, end - first), g.epoch, self.ra_pages(&g));
         drop(g);
         if !readahead::queue(job) {
             self.inner.lock().ra.queued = false;
         }
+    }
+
+    /// BL-0: posix_fadvise(POSIX_FADV_DONTNEED) (linux-7/mm/fadvise.c:113-167 `generic_fadvise`) of
+    /// `[offset, offset + len)`, len 0 to the end; both at most `i64::MAX` (the caller refuses negative ones).
+    /// 1. The dirty pages of the range are written back (`filemap_flush_range`). V2's backends write synchronously,
+    ///    so the start of the write-back is the write itself, at Background priority; its error is not the call's
+    ///    (Linux ignores it too) and the page stays dirty.
+    /// 2. The clean pages among the *whole* pages of the range leave the cache (`mapping_try_invalidate`,
+    ///    linux-7/mm/truncate.c:534): a partial first or last page stays, unless the range ends at a page end or at
+    ///    the file's end (fadvise.c:120-145).
+    ///
+    /// What stays (`invalidate_clean`): tmpfs files' pages (their cache is their content; Linux's shmem has the
+    /// no-op backing device, whose advice is ignored), dirty pages, mapped ones, pages a locked read or a block
+    /// request holds, and pages being read in (not in the index yet).
+    pub fn dont_need(&self, offset: u64, len: u64) -> Invalidated {
+        if self.backend.is_none() {
+            return Invalidated::default();
+        }
+        let max = i64::MAX as u64;
+        let sum = offset.saturating_add(len);
+        let endbyte = if len == 0 || sum > max { max } else { sum - 1 };
+        let size = self.size();
+        let pages = pages_for(size);
+        if pages == 0 || offset / P >= pages {
+            return Invalidated::default();
+        }
+        let last_page = (endbyte / P).min(pages - 1);
+        if let Err(e) = self.sync_range(offset / P, last_page, SyncKind::Background) {
+            DONTNEED_WB_ERRORS.inc();
+            klog::event!(Info, "vfs", "fadvise.writeback_failed", errno = e; "POSIX_FADV_DONTNEED: the dirty pages stay");
+        }
+        let first = offset.div_ceil(P);
+        let mut end = endbyte / P;
+        if endbyte % P != P - 1 && endbyte != size.wrapping_sub(1) {
+            if end == 0 {
+                return Invalidated::default();
+            }
+            end -= 1;
+        }
+        let end = end.min(pages - 1);
+        if end < first {
+            return Invalidated::default();
+        }
+        let out = invalidate_clean(&self.inner, first, end);
+        if out.dropped > 0 {
+            // The frames are free when the call returns, as Linux's (bounded wait for the grace period, no lock held).
+            mm_core::grace::expedite();
+        }
+        DONTNEED_DROPPED.add(out.dropped);
+        DONTNEED_KEPT.add(out.kept);
+        out
     }
 
     /// FS-13: the preload's read of file pages `[first, end)`: each missing page is filled through the normal
@@ -1587,6 +2116,11 @@ impl PageCache {
         self.view.get(pgoff)
     }
 
+    /// Pages `write` dirtied that no write-back took yet (cheap; `dirty_pages` counts exactly).
+    pub fn own_dirty(&self) -> u64 {
+        self.inner.lock().own_dirty
+    }
+
     /// Dirty pages now.
     pub fn dirty_pages(&self) -> u64 {
         let g = self.inner.lock();
@@ -1609,37 +2143,56 @@ impl PageCache {
     /// - no memory to collect the dirty pages: they are collected and written in batches as memory allows;
     ///   when not even one page fits, ENOMEM after `commit` of what was written (never a silent Ok).
     pub fn sync_range(&self, first: u64, last: u64, why: SyncKind) -> Result<(), Errno> {
+        if self.backend.is_none() {
+            return Ok(());
+        }
+        let one = self.sync_lock.lock();
+        self.sync_ranges_locked(&one, &[(first, last)], why)
+    }
+
+    /// FS-STALL: this cache's write-back lock, for an owner that picks the pages to write while no other write-back
+    /// runs (`sync_ranges_locked`).
+    pub fn lock_sync(&self) -> ksync::MutexGuard<'_, ()> {
+        self.sync_lock.lock()
+    }
+
+    /// `sync_range` over several [first, last] ranges in one write-back (one `begin`, one `commit`), under
+    /// `lock_sync`'s guard: ext4's device knows the pages it dirtied and writes them back without a walk over every
+    /// page of the disk's cache, which held `vfs.inode.data` (and so every metadata write of the volume) for as long.
+    pub fn sync_ranges_locked(&self, _one: &ksync::MutexGuard<'_, ()>, ranges: &[(u64, u64)], why: SyncKind) -> Result<(), Errno> {
         let Some(b) = &self.backend else { return Ok(()) };
-        let _one = self.sync_lock.lock();
-        let mut at = Some(first);
         let mut begun = false;
         let mut err = None;
-        while let Some(start) = at.filter(|&a| a <= last) {
-            let batch = self.collect_dirty(start, last);
-            if batch.pages.is_empty() {
-                if batch.oom {
-                    err = Some(ENOMEM);
-                    klog::event!(Warn, "vfs", "cache.writeback_nomem", first = start;
-                        "no memory to collect dirty pages for write-back: they stay dirty, the call answers ENOMEM");
-                }
-                break;
-            }
-            if !begun {
-                if let Err(e) = b.begin(why) {
-                    for p in &batch.pages {
-                        p.set_dirty();
+        'ranges: for &(first, last) in ranges {
+            let mut at = Some(first);
+            while let Some(start) = at.filter(|&a| a <= last) {
+                let batch = self.collect_dirty(start, last);
+                if batch.pages.is_empty() {
+                    if batch.oom {
+                        err = Some(ENOMEM);
+                        klog::event!(Warn, "vfs", "cache.writeback_nomem", first = start;
+                            "no memory to collect dirty pages for write-back: they stay dirty, the call answers ENOMEM");
+                        break 'ranges;
                     }
-                    klog::event!(Warn, "vfs", "cache.writeback_begin_failed", pages = batch.pages.len(), errno = e;
-                        "the file system refused to begin a write-back: the pages stay dirty");
-                    return Err(e);
+                    break;
                 }
-                begun = true;
+                if !begun {
+                    if let Err(e) = b.begin(why) {
+                        for p in &batch.pages {
+                            p.set_dirty();
+                        }
+                        klog::event!(Warn, "vfs", "cache.writeback_begin_failed", pages = batch.pages.len(), errno = e;
+                            "the file system refused to begin a write-back: the pages stay dirty");
+                        return Err(e);
+                    }
+                    begun = true;
+                }
+                if let Err(e) = Self::write_runs(&**b, &batch) {
+                    err = Some(e);
+                    break 'ranges;
+                }
+                at = batch.next;
             }
-            if let Err(e) = Self::write_runs(&**b, &batch) {
-                err = Some(e);
-                break;
-            }
-            at = batch.next;
         }
         if !begun {
             return err.map_or(Ok(()), Err);
@@ -1656,7 +2209,7 @@ impl PageCache {
     /// lost). Room is reserved before a flag is cleared, so a page that does not fit stays dirty; `next` is
     /// where the next batch starts then (None: the range is done).
     fn collect_dirty(&self, start: u64, last: u64) -> Batch {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         let mut batch = Batch { idx: Vec::new(), pages: Vec::new(), size: g.size, next: None, oom: false };
         let mut at = start;
         while at <= last {
@@ -1674,7 +2227,8 @@ impl PageCache {
                     batch.next = Some(i);
                     break;
                 }
-                if p.dirty.swap(false, Ordering::AcqRel) {
+                if p.take_dirty() {
+                    g.own_dirty = g.own_dirty.saturating_sub(1);
                     batch.idx.push(i);
                     batch.pages.push(p.clone());
                 }
@@ -1747,11 +2301,28 @@ fn seal_write_limit(seals: u32, pos: u64, len: usize, size: u64) -> Result<usize
     if done == 0 { Err(EPERM) } else { Ok(done) }
 }
 
+/// The index the state of every dropped file keeps in place of its own (`PageCache`'s drop). It stays empty:
+/// no file reaches it, and a read-ahead job that still holds such a state finds another epoch and no size.
+static NO_PAGES: ksync::Once<Pages> = ksync::Once::new();
+
 impl Drop for PageCache {
     fn drop(&mut self) {
-        let g = self.inner.lock();
+        crate::reclaim::unregister(self.owner_id);
+        let mut g = self.inner.lock();
         if let Some(pool) = &self.pool {
             pool.uncharge(g.charged);
+        }
+        // The pages go with the file (Linux `evict` -> `truncate_inode_pages_final`), not with the state: a
+        // reclaimer's visit holds the state (`reclaim::Ring::walk`; kswapd's scan of a big file takes many
+        // milliseconds) and leaves a reference in the grace queue (`reclaim::release`). A file dropped meanwhile
+        // kept all its memory until both were gone, and whoever drained that queue then tore it down. So the
+        // state gets the empty index, and the file's own one drops with `view` right after this, at once: no
+        // reader is left (they borrow this cache) and everyone else reaches the pages through the state, under
+        // this lock. Only where reclaim lists the cache: no other state has a holder that lasts.
+        if self.reclaimable() {
+            g.epoch = g.epoch.wrapping_add(1);
+            g.size = 0;
+            g.pages = NO_PAGES.get_or_init(|| Pages::new(0)).handle();
         }
     }
 }

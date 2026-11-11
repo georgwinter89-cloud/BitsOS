@@ -1,0 +1,7 @@
+# GM-2a: what the steam stage is pinned to. Only names and hashes live here; none of Valve's files are in git.
+# launcher: https://repo.steampowered.com/steam/archive/stable/<file>, the deb Valve publishes for Debian and Ubuntu.
+# manifest: https://client-update.steamstatic.com/<file>. The URL always gives the newest, so the pinned copy is the
+# one in the download cache; every zip it names is checked against the manifest's own sha2.
+# STEAM_REPIN=1 bash scripts/stage-v2.sh takes the newest manifest and rewrites this file.
+launcher steam-launcher_1.0.0.87_amd64.deb 765aba9a0ed339a50226ceb614fcc9879a991ba184098bc8de920efb12c714a4
+manifest steam_client_publicbeta_ubuntu12 1792108788 770f28733379d0de12d7aa7510d8aaec0779d9f12f2ae5a49416f4c9de4c5c85

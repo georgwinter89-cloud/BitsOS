@@ -2,8 +2,8 @@
 # WY-16 on the host (headless back end, nothing on the screen): client dma-bufs and explicit sync, with Pixman (the
 # rescue build) and GLES (the gpu build on the Mesa stage's llvmpipe, as 98). wyclient --dmabuf makes its buffers
 # from /dev/udmabuf (memfd pages) and hands them over with zwp_linux_dmabuf_v1 version 4. Proves, for both
-# renderers: the default feedback names the render node (main device 226:128 here) and a table that starts with
-# XRGB8888 LINEAR; a dma-buf window shows the very picture of a wl_shm window (Pixman: byte for byte; GLES: within
+# renderers (both read by CPU here, WY-17b): the default feedback names no main device (0:0; `--main-device render`
+# names the node) and a table that starts with XRGB8888 LINEAR; a dma-buf window shows the very picture of a wl_shm window (Pixman: byte for byte; GLES: within
 # img.py's tolerance); a non-linear modifier is answered `failed` and bitscomp stays up; with explicit sync
 # (wp_linux_drm_syncobj_v1 on the render node) an animating client gets every buffer back through its release
 # points (sync_released grows, nothing starves) and a commit whose acquire point signals 1.5 s late shows its first
@@ -11,9 +11,9 @@
 # the client; buffers with rows shorter than their width or no dma-buf at all are `failed`, rows past the end
 # out_of_bounds; 500 commits with acquire points that never signal cost bitscomp no fd each and go with their
 # client; a waiting commit whose buffer was destroyed applies harmlessly. Then the stage's Mesa clients (lavapipe vkcube --wsi wayland, llvmpipe eglgears_wayland) run against
-# bitscomp with the dma-buf global present. Needs /dev/udmabuf (SKIP without it); the GLES half and the Mesa
-# clients need the Mesa stage (they SKIP alone without it); explicit sync needs a render node with syncobj
-# timelines (else that part says SKIP). Only syncobj objects are made on the render node: no GPU work.
+# bitscomp with the dma-buf global present. Needs /dev/udmabuf (RED without it); the GLES half and the Mesa
+# clients need the Mesa stage (RED without it); explicit sync needs a render node with syncobj
+# timelines (RED without one). Only syncobj objects are made on the render node: no GPU work.
 set -euo pipefail
 
 ROOT=${BITSOS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -31,12 +31,17 @@ unset DISPLAY WAYLAND_DISPLAY
 
 fail() { echo "FAIL: $*"; exit 1; }
 
-[ -r /dev/udmabuf ] && [ -w /dev/udmabuf ] || { echo "SKIP: not run: /dev/udmabuf is not usable here"; exit 0; }
+[ -r /dev/udmabuf ] && [ -w /dev/udmabuf ] || { echo "RED: /dev/udmabuf is not usable here"; exit 1; }
 
 echo "== build the rescue build and wyclient"
 (cd user/services/bitscomp && cargo build --release -q --offline && cargo build --release -q --offline -p wyclient)
 
 STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$STAGE" ]; then
+    # A worktree has no out/: the manifest's `tree mesa`, as dr/20 does; an empty answer keeps the path above.
+    _m=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' "$ROOT/user/packaging/manifest.txt")
+    [ -z "$_m" ] || STAGE=$_m
+fi
 [ -f "$STAGE/lib/ld-linux-x86-64.so.2" ] || STAGE=$CARGO_TARGET_DIR/wy-mesa-out/mesa
 GPU=
 if [ -f "$STAGE/lib/ld-linux-x86-64.so.2" ]; then
@@ -45,7 +50,8 @@ if [ -f "$STAGE/lib/ld-linux-x86-64.so.2" ]; then
     MESA_STAGE=$STAGE bash host/tests/wy/tools/gpu-tree.sh "$RUN/tree" "$GPU" "$RUN/tree" >"$RUN/tree.out" 2>&1 \
         || fail "gpu-tree.sh: $(tail -5 "$RUN/tree.out")"
 else
-    echo "SKIP (GLES half and Mesa clients): no Mesa stage"
+    echo "RED (GLES half and Mesa clients): no Mesa stage"
+    exit 1
 fi
 
 PIDS=()
@@ -111,14 +117,15 @@ round() {
 
     echo "== $r: the same window from dma-bufs"
     compositor "$r-dma" "$@"
-    grep -q "dmabuf: zwp_linux_dmabuf_v1 for renderer $r, main device 226:" "$LOG" || fail "$r: no dma-buf global: $(grep dmabuf "$LOG")"
+    grep -q "dmabuf: zwp_linux_dmabuf_v1 for renderer $r, main device 0:0 (none), " "$LOG" || fail "$r: no dma-buf global without a main device: $(grep dmabuf "$LOG")"
+    grep -q "dmabuf: no main device: renderer $r reads by CPU" "$LOG" || fail "$r: no line saying why: $(grep dmabuf "$LOG")"
     client "$RUN/$r-dma.out" --title one --pattern 0 --dmabuf
     mapped one
     sleep 3
     ctl shot "$RUN/$r-dma.ppm" >/dev/null
     local fb
     fb=$(grep "^dmabuf feedback" "$RUN/$r-dma.out") || fail "$r: no feedback line: $(head -5 "$RUN/$r-dma.out")"
-    echo "$fb" | grep -Eq "main_device=226:[0-9]+ formats=[1-9][0-9]* first=XR24:LINEAR tranches=1 " || fail "$r: feedback: $fb"
+    echo "$fb" | grep -Eq "main_device=0:0 formats=[1-9][0-9]* first=XR24:LINEAR tranches=1 " || fail "$r: feedback: $fb"
     grep -q "^dmabuf created 0" "$RUN/$r-dma.out" || fail "$r: no buffer created: $(cat "$RUN/$r-dma.out")"
     echo "ok: $r: $fb"
     same "$RUN/$r-shm.ppm" "$RUN/$r-dma.ppm" "$r: the dma-buf window looks like the wl_shm one" "$how"
@@ -150,15 +157,15 @@ round() {
     ctl quit >/dev/null 2>&1 || true
 
     if [ "$SYNC" = 0 ]; then
-        echo "SKIP ($r explicit sync): no render node here"
-        return
+        echo "RED ($r explicit sync): no render node here"
+        exit 1
     fi
     echo "== $r: explicit sync"
     compositor "$r-sync" "$@"
     grep -q "syncobj: wp_linux_drm_syncobj_manager_v1 on /dev/dri/renderD" "$LOG" || {
-        echo "SKIP ($r explicit sync): $(grep 'syncobj:' "$LOG")"
+        echo "RED ($r explicit sync): $(grep 'syncobj:' "$LOG")"
         ctl quit >/dev/null 2>&1 || true
-        return
+        exit 1
     }
     client "$RUN/$r-anim.out" --title anim --dmabuf --syncobj --animate
     mapped anim
@@ -223,6 +230,24 @@ round() {
 }
 
 round pixman exact "$BIN"
+
+echo "== --main-device render names the node also under Pixman, and explicit sync stays either way"
+compositor pixman-node "$BIN" --main-device render
+grep -q "dmabuf: zwp_linux_dmabuf_v1 for renderer pixman, main device 226:" "$LOG" || fail "--main-device render: $(grep dmabuf "$LOG")"
+grep -q "dmabuf: no main device" "$LOG" && fail "--main-device render: still says no main device: $(grep dmabuf "$LOG")"
+client "$RUN/pixman-node.out" --title one --pattern 0 --dmabuf
+mapped one
+fb=$(grep -m1 "^dmabuf feedback" "$RUN/pixman-node.out") || fail "--main-device render: no feedback line: $(head -5 "$RUN/pixman-node.out")"
+echo "$fb" | grep -Eq "main_device=226:[0-9]+ " || fail "--main-device render: feedback: $fb"
+echo "ok: --main-device render: $fb"
+ctl quit >/dev/null 2>&1 || true
+
+echo "== vk_check.py's presenting line against a headless Pixman bitscomp"
+compositor pixman-vk "$BIN"
+python3 -I host/tests/wy/tools/vk_presenting.py "$BIN" "$WYC" "$SOCK" || fail "vk_check presenting"
+python3 -I host/tests/wy/tools/vk_presenting.py "$BIN" "$WYC" "$SOCK" --refuse || fail "vk_check presenting with a refused buffer"
+alive "vk_check"
+ctl quit >/dev/null 2>&1 || true
 grep -q " build=rescue renderer=pixman " "$RUN/pixman-dma.log" || fail "rescue start line: $(grep WAYLAND_DISPLAY "$RUN/pixman-dma.log")"
 
 if [ -n "$GPU" ]; then
@@ -242,4 +267,4 @@ if [ -n "$GPU" ]; then
     ctl quit >/dev/null 2>&1 || true
 fi
 
-echo "GREEN: dma-buf windows (udmabuf, LINEAR, feedback 226:x) and explicit sync work with Pixman${GPU:+ and GLES}"
+echo "GREEN: dma-buf windows (udmabuf, LINEAR, feedback without a main device) and explicit sync work with Pixman${GPU:+ and GLES}"

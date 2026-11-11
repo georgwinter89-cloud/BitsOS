@@ -16,7 +16,7 @@ pids=()
 stop_load() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; pids=(); }
 trap stop_load EXIT
 
-cargo xtask image --name "$NAME" --ktest --config-extra "ktest=mm.tlb.give_up;loglevel=info"
+cargo xtask image --name "$NAME" --ktest --config-extra "ktest=mm.tlb.give_up,-mm.tlb.give_up_device;loglevel=info"
 for _ in $(seq 1 "$LOAD"); do
     (while :; do :; done) &
     pids+=("$!")

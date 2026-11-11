@@ -421,7 +421,7 @@ fn procnet() -> TestResult {
     let name = un.getname(false).map_err(|e| format!("getname: {e}"))?;
     let path = crate::procnet::unix_path(&name);
     let unix = render(P::Unix, &r);
-    let want = format!(": 00000002 00000000 00010000 0001 01     0{path}\n");
+    let want = format!(": 00000002 00000000 00010000 0001 01 {:5}{path}\n", _fx.ino());
     kassert!(unix.lines().count() == 2 && path.starts_with(" @") && unix.ends_with(&want), "unix: {unix}");
     let dev = render(P::Dev, &r);
     kassert!(dev.lines().count() == 3 && dev.lines().nth(2).is_some_and(|x| x.starts_with("    lo:")), "dev: {dev}");

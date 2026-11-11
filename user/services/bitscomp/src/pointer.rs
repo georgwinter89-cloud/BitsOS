@@ -30,6 +30,10 @@ impl App {
             // MC-9b: no window has the pointer (nor its own cursor image) while the overlay is shown.
             self.install_motion();
             self.cursor_deco = Some(CursorIcon::Default);
+        } else if self.lib.open && self.menu.is_none() {
+            // PK-L1b: no window has the pointer while the library is open.
+            self.library_motion();
+            self.cursor_deco = Some(CursorIcon::Default);
         } else if let Some(m) = &self.menu {
             let hover = match menu::hit(m.centre, &m.items, &self.theme, pos.x, pos.y) {
                 MenuHit::Item(d) => Some(d),
@@ -82,6 +86,7 @@ impl App {
                 _ => Some(CursorIcon::Default),
             };
         }
+        self.lock.pointer_over(focus.clone());
         let ptr = self.seat.get_pointer().unwrap();
         ptr.motion(self, focus, &MotionEvent { location: pos, serial: SERIAL_COUNTER.next_serial(), time });
         ptr.frame(self);
@@ -97,6 +102,12 @@ impl App {
         }
         if !pressed && self.install.buttons.remove(&code) {
             return;
+        }
+        // PK-L1b: the open library keeps every press (the middle one too) and so its release; its circle menu
+        // takes the usual way.
+        if pressed && self.lib.open && self.menu.is_none() {
+            self.swallowed.insert(code);
+            return self.library_press(code);
         }
         let kept = if code == BTN_MIDDLE {
             false
@@ -286,6 +297,9 @@ impl App {
 
     /// The wheel on a tile's header turns its pages; elsewhere it goes to the client.
     pub(crate) fn wheel(&mut self, steps: f64, time: u32) {
+        if self.lib.open {
+            return self.library_wheel(steps);
+        }
         if let Hit::Spot(crate::desk::Spot::Page(pid, _)) = self.hit(self.pointer) {
             return self.page_scroll(pid, steps);
         }
@@ -304,7 +318,7 @@ impl App {
         ptr.frame(self);
     }
 
-    fn window_of_surface(&self, s: &WlSurface) -> Option<Window> {
+    pub(crate) fn window_of_surface(&self, s: &WlSurface) -> Option<Window> {
         let mut root = s.clone();
         while let Some(p) = smithay::wayland::compositor::get_parent(&root) {
             root = p;

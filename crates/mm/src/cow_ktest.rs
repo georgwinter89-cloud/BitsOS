@@ -102,7 +102,7 @@ fn fork_shared() -> TestResult {
     const PATH: &[u8] = b"/tmp/.mm-cow-file";
     let ns = vfs::root_ns();
     if ns.lookup("/tmp").is_err() || ns.lookup("/dev/shm").is_err() {
-        return ktest::skip("no /tmp or /dev/shm in this image");
+        return ktest::fail("no /tmp or /dev/shm in this image");
     }
     let before = user();
     let f = ns.open_flags(PATH, O_RDWR | O_CREAT, 0o600).map_err(e)?;
@@ -224,7 +224,7 @@ ktest!("mm.cow.fork_refused", Safe, fork_refused);
 fn smp_fork() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let before = user();
     let leaked = crate::aspace::AS_LEAKED.get();

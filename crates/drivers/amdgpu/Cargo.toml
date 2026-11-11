@@ -34,6 +34,12 @@ acpi = { path = "../../acpi" }
 amdgpu-fmt = { path = "../../amdgpu-fmt" }
 # GX-7i: rung 3 copies into pinned system pages (MM-14 DmaPages) bound in the GART.
 mm = { path = "../../mm" }
+proc = { path = "../../proc" }
+# GX-8a: the hardware backend behind the amdgpu uAPI; managed RAM for the GTT size; Linux's errno values (renamed,
+# as in drm: `drm::uapi` is the DRM user API).
+drm = { path = "../../drm" }
+mm-core = { path = "../../mm-core" }
+linux = { package = "uapi", path = "../../uapi" }
 
 [lints]
 workspace = true

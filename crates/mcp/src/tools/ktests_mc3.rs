@@ -57,7 +57,7 @@ fn shot_matches(c: &mut Client, args: &str, cut: impl Fn(&[u32], u32) -> Vec<u32
 
 fn screen_png() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display device (no GOP framebuffer)");
+        return ktest::fail("no display device (no GOP framebuffer)");
     }
     console::console().write_str("mcp.screen.png: this line is in the picture\n", console::FG);
     let (fw, fh) = display::with_frame(|f| (f.width, f.height)).ok_or("no frame")?;
@@ -97,7 +97,7 @@ ktest!("mcp.screen.png", Safe, screen_png);
 
 fn screen_text() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display device (no GOP framebuffer)");
+        return ktest::fail("no display device (no GOP framebuffer)");
     }
     let marker = format!("mcp.screen.text {{marker}} {}", time::now_ns() % 1_000_000_007);
     console::console().write_str(&marker, console::FG);
@@ -117,7 +117,7 @@ ktest!("mcp.screen.text", Safe, screen_text);
 /// screen (restored afterwards from a snapshot).
 fn screen_too_big() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display device (no GOP framebuffer)");
+        return ktest::fail("no display device (no GOP framebuffer)");
     }
     let (fw, fh, saved) = display::snapshot().ok_or("no frame")?;
     let paint = |src: &dyn Fn(u32, u32) -> u32| {
@@ -203,7 +203,7 @@ fn send_over_mcp() -> TestResult {
         got.push(e);
     }
     if got.is_empty() && sink.dropped() == dropped_before {
-        return ktest::skip("an input reader took the events before the test could look (IN-3)");
+        return ktest::fail("an input reader took the events before the test could look (IN-3)");
     }
     let strip = |v: &[InputEvent]| v.iter().map(|e| (e.device, e.kind, e.code, e.value, e.injected)).collect::<Vec<_>>();
     let want: Vec<InputEvent> = want_k.iter().chain(want_m.iter()).copied().collect();

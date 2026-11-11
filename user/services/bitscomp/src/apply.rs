@@ -52,7 +52,9 @@ impl App {
             .unwrap_or_else(|| DEFAULT_FAVOURITES.iter().map(|s| s.to_string()).collect());
         self.desk.claude_name =
             v.text("claude.name").map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Claude").to_string();
-        let t = Theme::build(v);
+        let mut t = Theme::build(v);
+        // WY-19: whether the gpu level is drawn is the renderer's to say (`fx_follow`), not a setting's.
+        t.effects_gpu = t.effects == crate::theme::Effects::Gpu && self.theme.effects_gpu;
         // A bar docked again (by anyone) ends its reveal.
         let docked = match self.desk.reveal.shown {
             Some(crate::reveal::Edge::Left) => t.layout.workspaces,
@@ -85,6 +87,9 @@ impl App {
                 t.layout.sidebar,
                 t.layout.statusbar
             );
+            if t.effects != self.theme.effects {
+                eprintln!("bitscomp: effects: level chosen: {}", t.effects.word());
+            }
             self.theme = Rc::new(t);
             self.theme_gen += 1;
             self.deco_img.clear();

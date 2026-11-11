@@ -1,5 +1,6 @@
 #!/bin/bash
 # slow
+# time-limit: 2400
 # VS-2: snapshots of /data on a real boot (QEMU, 4 CPUs), one stick image of this run only (256 MiB data.img:
 # CONFIG data_img_mb=256; the FAT image is made larger than xtask makes it so there is room).
 #  1. Boot 1, ktest=snap.load alone: 100 snapshots while a writer rewrites, renames over and fsyncs; every
@@ -19,6 +20,9 @@ BOOT_LINE="BdsDxe: loading"
 NAME=vs-snap
 IMG="target/xtask/$NAME.img"
 fail() { echo "RED: $*"; exit 1; }
+# VS-H: where the script is when a bound ends it. W32a gate 1 read as a hang of the guest because its log just stopped;
+# it was the gate's 1200 s, of which 18.5 min had gone before boot 2 began.
+stage() { echo "vs/30 at ${SECONDS} s: $* ($(date +%H:%M:%S))"; }
 for t in mcopy mtype mkfs.fat e2fsck; do command -v $t > /dev/null || { echo "SKIP: $t missing"; exit 0; }; done
 
 QPID=""
@@ -49,6 +53,7 @@ boot() {
     QPID=""
 }
 
+stage "script start, building"
 cargo build -q -p bitsvol --example export
 EXPORT="${CARGO_TARGET_DIR:-target}/debug/examples/export"
 [ -x "$EXPORT" ] || fail "no export example at $EXPORT"
@@ -92,6 +97,7 @@ mkfs.fat -F 32 -n BITSOS -C "$IMG" "$kib" > /dev/null
 mcopy -s -i "$IMG" "target/xtask/esp-$NAME/EFI" "target/xtask/esp-$NAME/BITSOS2" ::/
 
 # ---- boot 1: 100 snapshots under load, kept ----
+stage "image ready, boot 1"
 LOG="$RUN_DIR/serial-1.log"
 boot "$LOG"
 grep -a "KTEST\|snap load\.\|ext4 data\.mounted\|snap take_failed\|snap freeze_failed" "$LOG" || true
@@ -101,6 +107,7 @@ grep -aq "snap load.pauses snapshots=100 .*kept=true" "$LOG" || fail "boot 1: no
 grep -aq "KTEST done passed=1 failed=0" "$LOG" || fail "boot 1: ktests not green"
 taken=$(grep -ac "snap taken pool=data " "$LOG" || true)
 [ "$taken" -ge 100 ] || fail "boot 1: only $taken snap taken events"
+stage "boot 1 ended, checking its snapshots"
 check_pool boot1 vsload 100
 
 # ---- boot 2: all snap. tests on the same stick ----
@@ -110,16 +117,21 @@ sed -i 's/^ktest=snap\.load$/ktest=snap.,ab.fsfreeze/' "$RUN_DIR/config.txt"
 grep -q '^ktest=snap\.,ab\.fsfreeze$' "$RUN_DIR/config.txt" || fail "CONFIG.TXT has no ktest=snap.load line to change"
 mcopy -o -i "$IMG" "$RUN_DIR/config.txt" ::BITSOS2/CONFIG.TXT
 LOG="$RUN_DIR/serial-2.log"
+stage "boot 2"
 boot "$LOG"
+stage "boot 2 ended"
 grep -a "KTEST\|snap load\.\|snap take_failed\|snap freeze_failed\|bitssnap:" "$LOG" || true
 grep -aq "ext4 data.mounted at=/data pool=true writable=true created=false" "$LOG" || fail "boot 2: /data not mounted from boot 1's pool"
-for t in snap.data snap.load snap.private snap.rename_over snap.rollback snap.user ab.fsfreeze; do
+for t in snap.data snap.delete_writable snap.delete_yields snap.flush_leaves_io snap.load snap.private snap.rename_over snap.rollback snap.user ab.fsfreeze; do
     grep -aq "KTEST ok $t " "$LOG" || fail "boot 2: $t"
 done
-# INT-W13: VS-3 added snap.rollback to the snap. filter (8 tests).
-grep -aq "KTEST done passed=8 failed=0" "$LOG" || fail "boot 2: ktests not green"
+# INT-W13: VS-3 added snap.rollback to the snap. filter; VS-H snap.delete_writable, snap.delete_yields and snap.flush_leaves_io (11 tests).
+grep -aq "KTEST done passed=11 failed=0" "$LOG" || fail "boot 2: ktests not green"
 # Boot 1's 100 snapshots hold space now: snap.load sizes its run by the free space (about 100 again).
 grep -aEq "snap load.pauses snapshots=[0-9]{2,3} .*kept=false" "$LOG" || fail "boot 2: snap.load did not run (deleting its own)"
+grep -aq "snap delete_under_writes .* errors=0" "$LOG" || fail "boot 2: no /data writer through snap.load's deletes"
+if grep -aq "volume now read-only" "$LOG"; then fail "boot 2: /data went read-only"; fi
 check_pool boot2 vsload 100
 grep -a "snap load.pauses" "$RUN_DIR"/serial-*.log | sed 's/^/pauses (QEMU, not judged): /'
+stage "done"
 echo "GREEN: 100 snapshots under load e2fsck clean, kept across a reboot; bitssnap take/restore/undo on V2"

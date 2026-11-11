@@ -18,6 +18,17 @@ fn spec(r: Ring) -> (f32, f32, f32) {
     }
 }
 
+/// WY-19b: the dash along the arc in the mock-up's 48 px box, for the ring the gpu level turns.
+pub fn dash(r: Ring) -> (f32, f32) {
+    let (on, off, _) = spec(r);
+    (on, off)
+}
+
+/// WY-19b: whether the sprite itself moves: at the gpu level the shader turns the dash, only listening's core is left.
+pub fn sprite_moves(r: Ring, t: &Theme) -> bool {
+    moves(r) && (!t.effects_gpu || r == Ring::Listening)
+}
+
 /// The German line under the state (the mock-up's hints).
 pub fn hint(r: Ring) -> &'static str {
     match r {
@@ -59,9 +70,11 @@ pub fn draw(c: &mut Canvas, cx: f32, cy: f32, size: f32, r: Ring, step: u32, t: 
     let dash = Some((on * k, off * k, 17.0 * k * std::f32::consts::FRAC_PI_2 + phase));
     // The baked stroke glow (feGaussianBlur in the design), at theme.glow's strength.
     let g = t.glow[3];
-    c.arc(cx, cy, 17.0 * k, 11.0 * k, dash, alpha(colour, 0.6 * g));
-    c.arc(cx, cy, 17.0 * k, 7.0 * k, dash, alpha(colour, 0.9 * g));
-    c.arc(cx, cy, 17.0 * k, 3.0 * k, dash, colour);
+    if !t.effects_gpu {
+        c.arc(cx, cy, 17.0 * k, 11.0 * k, dash, alpha(colour, 0.6 * g));
+        c.arc(cx, cy, 17.0 * k, 7.0 * k, dash, alpha(colour, 0.9 * g));
+        c.arc(cx, cy, 17.0 * k, 3.0 * k, dash, colour);
+    }
     c.ring(cx, cy, 22.0 * k, k.max(1.0), alpha(colour, 0.3));
     c.disc(cx, cy, core * k, alpha(colour, 0.8));
 }
@@ -69,6 +82,19 @@ pub fn draw(c: &mut Canvas, cx: f32, cy: f32, size: f32, r: Ring, step: u32, t: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_the_gpu_level_the_shader_has_the_dash_and_only_listening_steps_its_sprite() {
+        let cheap = crate::theme::test_theme();
+        let gpu = Theme { effects_gpu: true, ..cheap.clone() };
+        let mut c = Canvas::new(60, 60);
+        draw(&mut c, 30.0, 30.0, 48.0, Ring::Idle, 0, &gpu);
+        // On the dash's radius straight up the cheap sprite has ink; the gpu one has only the outer ring and the core.
+        assert_eq!(c.pixel(30, 13) >> 24, 0, "no dash in the sprite");
+        assert!(c.pixel(30, 30) >> 24 > 150, "the core stays");
+        assert!(!sprite_moves(Ring::Thinking, &gpu) && sprite_moves(Ring::Listening, &gpu));
+        assert!(sprite_moves(Ring::Thinking, cheap) && !sprite_moves(Ring::Idle, cheap));
+    }
 
     #[test]
     fn every_state_draws_ink_and_waiting_is_warm() {

@@ -4,6 +4,11 @@
 //! Bulk-Only transfer of a stick is on the bus when the host controller halts. Linux's usb-storage has no
 //! shutdown hook of its own (linux-6.6/drivers/usb/storage/usb.c: suspend only); the SCSI disk above it syncs,
 //! and on a restart it does not stop the unit (drivers/scsi/sd.c:3853-3859), nor does this.
+//!
+//! US-R: a device that is not well at this point (a command never ended, a recovery under way or given up) gets a
+//! clean stop on top: its port's power off and on where the port can do that, and a warm reset, so that the firmware
+//! finds it fresh from a reset. 3.11.: a stick wedged by a stall stayed wedged through the machine's warm reset and
+//! the firmware booted Windows. A healthy stick is left as it is: that is the path every reboot so far has proved.
 
 use crate::disk::Storage;
 use crate::usblink::UsbLink;
@@ -13,8 +18,27 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use block::shutdown::{LayerNote, Stage, Stop};
 use ksync::Once;
+use usb_core::ResetKind;
 
 struct MsdStop;
+
+/// What the clean stop of a sick device may take at most, whatever the stop's budget left: a wedged stick has spent
+/// that budget on its flush by now, and this is the reset that decides whether the firmware finds it.
+const CLEAN_STOP_NS: u64 = 3_000_000_000;
+
+klog::counter!(CLEAN_STOPS, "usb.msd.clean_stops");
+
+/// A sick device's clean stop. A stick can stay wedged through any reset that leaves its power on, and a port's power
+/// switch may do nothing on this board: a machine reset that drops the ports' power is what surely helps
+/// (`block::shutdown::ask_cold_reset`, which the reset paths read).
+fn clean_stop(s: &Arc<Storage<UsbLink>>) {
+    block::shutdown::ask_cold_reset();
+    CLEAN_STOPS.inc();
+    let Some(dev) = crate::device_of(s) else { return };
+    let r = dev.reset_device(ResetKind::ForFirmware, CLEAN_STOP_NS);
+    klog::event!(Warn, "usb", "msd.clean_stop", device = s.path.clone(), ok = r.is_ok(), error = r.err().map_or("", |e| e.as_str());
+        "this device was not well; its port was reset for the firmware");
+}
 
 fn now() -> u64 {
     ksync::now_ns().unwrap_or(0)
@@ -29,6 +53,9 @@ pub(crate) fn stop_storages(list: &[Arc<Storage<UsbLink>>], deadline_ns: u64) ->
         klog::event!(Info, "usb", "msd.stopped", device = s.path.clone(), idle = idle, waited_ms = now().saturating_sub(t) / 1_000_000);
         if !idle {
             busy.push(s.path.clone());
+        }
+        if !idle || s.unhealthy() {
+            clean_stop(s);
         }
     }
     let detail = if busy.is_empty() { format!("devices={}", list.len()) } else { format!("devices={} busy={}", list.len(), busy.join(",")) };

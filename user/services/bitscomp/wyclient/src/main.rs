@@ -2,13 +2,14 @@
 //! buffer is a known picture (a solid colour by `--pattern N` with a white 64x64 square in the middle, 1:1 buffer
 //! pixels) and prints one line per keyboard and pointer event it receives, so a test sees what reached it.
 //!
-//! wyclient [--title T] [--pattern N] [--animate] [--hang MS] [--stop MS] [--noread MS] [--ignore-term]
+//! wyclient [--title T] [--pattern N] [--animate] [--draw-ms MS] [--hang MS] [--stop MS] [--noread MS] [--ignore-term]
 //! Lines: `ready`, `configure W H`, `keymap bytes=N symbols=S`, `enter keyboard`, `key CODE pressed|released`
 //! (evdev code), `mods D L K G`, `pointer enter X Y`, `motion X Y`, `button CODE pressed|released`,
 //! `axis vertical|horizontal V`, `close`.
 //! WY-4: `--animate` draws a new frame on every frame callback from two buffers it reuses only after the
 //! compositor released them, and every 2 s prints `frames n=N p50_ms=A p99_ms=B max_ms=C released=R starved=S`
-//! (the callback intervals it saw; starved = callbacks with both buffers still held). `--hang MS`: from MS ms
+//! (the callback intervals it saw; starved = callbacks with both buffers still held). `--draw-ms MS` (WY-21): each
+//! animation frame takes MS ms between the callback and the commit, as a GPU client's draw does. `--hang MS`: from MS ms
 //! after start it stops answering pings (prints `ignoring pings` once) but keeps reading; `--stop MS`: at MS ms it
 //! prints `stopping` and stops itself with SIGSTOP (reads nothing any more); `--noread MS`: at MS ms it prints
 //! `not reading` and never reads its socket again, but keeps running (B4's bounded output queue);
@@ -29,9 +30,12 @@
 //! draws as usual (the compositor ignores it: nothing is on the screen yet).
 //! WY-16: `--dmabuf [--modifier HEX] [--syncobj [--acquire-delay MS] [--syncobj-break KIND]]`: the buffers are
 //! udmabuf dma-bufs, with explicit sync on request (`dma.rs`).
+//! WY-20: `--relative`, `--lock persistent|oneshot`, `--confine persistent|oneshot`, `--region X,Y,W,H`, `--hint X,Y`:
+//! mouse look's protocols and their lines (`lock.rs`).
 
 mod cursor;
 mod dma;
+mod lock;
 #[path = "../../src/drm_sync.rs"]
 mod drm_sync;
 
@@ -83,6 +87,8 @@ struct State {
     minimized: bool,
     /// WY-16: `--dmabuf`.
     dma: Option<dma::Dma>,
+    /// WY-20: `--relative`, `--lock`, `--confine`.
+    lock: lock::Lock,
 }
 
 /// `--animate`: two buffers, each used again only after its release.
@@ -94,6 +100,7 @@ struct Anim {
     report_at: Instant,
     released: u64,
     starved: u64,
+    draw: Option<Duration>,
 }
 
 /// p50, p99 and max of the intervals (ms); zeros for none.
@@ -206,6 +213,9 @@ impl State {
             anim.gaps_ms.clear();
             anim.report_at = now + Duration::from_secs(2);
         }
+        if let Some(d) = anim.draw {
+            std::thread::sleep(d);
+        }
         self.frame(qh);
     }
 
@@ -253,17 +263,25 @@ impl State {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut title = "wyclient".to_string();
+    // PK-L1b: `--app-id ID` (a fake launcher's window: Writer's libreoffice-writer, Brave's brave-browser).
+    let mut app_id = "wyclient".to_string();
     let mut pattern = 0usize;
     let (mut animate, mut hang, mut stop, mut noread, mut ignore_term) = (false, None, None, None, false);
+    let mut draw = None;
     let (mut fullscreen, mut unfullscreen, mut fs_at, mut min_at) = (false, false, None, None);
     let mut minimized = false;
     let mut cursor = None;
+    let mut lock_opts = lock::Lock::default();
     let mut drop_pong = None;
     let mut wrong_pong = false;
     let mut dma: Option<dma::Dma> = None;
     let mut it = args.iter();
     let ms = |v: &String| v.parse::<u64>().ok().map(Duration::from_millis);
     while let Some(a) = it.next() {
+        if a == "--relative" {
+            lock_opts.relative = true;
+            continue;
+        }
         if a == "--animate" {
             animate = true;
             continue;
@@ -298,8 +316,10 @@ fn main() {
         }
         match (a.as_str(), it.next()) {
             ("--title", Some(v)) => title = v.clone(),
+            ("--app-id", Some(v)) => app_id = v.clone(),
             ("--pattern", Some(v)) => pattern = v.parse().unwrap_or(0),
             ("--hang", Some(v)) if ms(v).is_some() => hang = ms(v),
+            ("--draw-ms", Some(v)) if ms(v).is_some() => draw = ms(v),
             ("--stop", Some(v)) if ms(v).is_some() => stop = ms(v),
             ("--noread", Some(v)) if ms(v).is_some() => noread = ms(v),
             ("--fullscreen-at", Some(v)) if ms(v).is_some() => fs_at = ms(v),
@@ -319,9 +339,13 @@ fn main() {
             ("--dmabuf-bad", Some(v)) if ["stride", "memfd", "oversize"].contains(&v.as_str()) => {
                 dma.get_or_insert_with(Default::default).bad = Some(v.clone())
             }
+            ("--lock", Some(v)) if lock::lifetime(v).is_some() => lock_opts.lock = lock::lifetime(v),
+            ("--confine", Some(v)) if lock::lifetime(v).is_some() => lock_opts.confine = lock::lifetime(v),
+            ("--region", Some(v)) if lock::numbers::<4>(v).is_some() => lock_opts.region = lock::numbers::<4>(v),
+            ("--hint", Some(v)) if lock::numbers::<2>(v).is_some() => lock_opts.hint = lock::numbers::<2>(v).map(|[x, y]| (f64::from(x), f64::from(y))),
             ("--cursor", Some(v)) if ["hidden", "surface", "big"].contains(&v.as_str()) || cursor::shape(v).is_some() => cursor = Some(v.clone()),
             _ => {
-                eprintln!("usage: wyclient [--title T] [--pattern N] [--animate] [--hang MS] [--stop MS] [--noread MS] [--ignore-term] [--fullscreen] [--unfullscreen] [--fullscreen-at MS] [--minimize-at MS] [--minimized] [--cursor NAME|hidden|surface|big] [--drop-pong N] [--wrong-pong] [--dmabuf] [--modifier HEX] [--syncobj] [--acquire-delay MS] [--syncobj-break no-release|shm|conflict|flood|destroy-waiting] [--dmabuf-bad stride|memfd|oversize]");
+                eprintln!("usage: wyclient [--title T] [--pattern N] [--animate] [--draw-ms MS] [--hang MS] [--stop MS] [--noread MS] [--ignore-term] [--fullscreen] [--unfullscreen] [--fullscreen-at MS] [--minimize-at MS] [--minimized] [--cursor NAME|hidden|surface|big] [--drop-pong N] [--wrong-pong] [--dmabuf] [--modifier HEX] [--syncobj] [--acquire-delay MS] [--syncobj-break no-release|shm|conflict|flood|destroy-waiting] [--dmabuf-bad stride|memfd|oversize] [--relative] [--lock|--confine persistent|oneshot] [--region X,Y,W,H] [--hint X,Y]");
                 std::process::exit(2);
             }
         }
@@ -351,6 +375,7 @@ fn main() {
     st.drop_pong = drop_pong;
     st.wrong_pong = wrong_pong;
     st.cursor = cursor;
+    st.lock = lock_opts;
     st.dma = dma;
     st.anim = animate.then(|| Anim {
         bufs: Vec::new(),
@@ -360,6 +385,7 @@ fn main() {
         report_at: Instant::now() + Duration::from_secs(2),
         released: 0,
         starved: 0,
+        draw,
     });
     if let Err(e) = queue.roundtrip(&mut st) {
         eprintln!("wyclient: {e}");
@@ -377,7 +403,7 @@ fn main() {
     let xdg = wm.get_xdg_surface(&surface, &qh, ());
     let top = xdg.get_toplevel(&qh, ());
     top.set_title(title);
-    top.set_app_id("wyclient".into());
+    top.set_app_id(app_id);
     if fullscreen {
         top.set_fullscreen(None);
     }
@@ -393,6 +419,7 @@ fn main() {
     st.surface = Some(surface);
     st.xdg = Some(xdg);
     println!("ready");
+    lock::ask(&mut st, &qh);
     let noread_at = noread.map(|d| start + d);
     let mut ask_at = fs_at.map(|d| start + d);
     let mut minimize_at = min_at.map(|d| start + d);
@@ -455,6 +482,9 @@ impl State {
         if key == 66 {
             return self.ask_minimize();
         }
+        if key == 65 {
+            return lock::destroy(self);
+        }
         let Some(top) = &self.top else { return };
         let (fullscreen, maximized, _) = self.states;
         match key {
@@ -486,6 +516,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "xdg_wm_base" => st.wm = Some(reg.bind(name, 1, qh, ())),
                 "wl_seat" => st.seat = Some(reg.bind(name, version.min(5), qh, ())),
                 "wp_cursor_shape_manager_v1" => st.shape_mgr = Some(reg.bind(name, 1, qh, ())),
+                "zwp_relative_pointer_manager_v1" => st.lock.relative_mgr = Some(reg.bind(name, 1, qh, ())),
+                "zwp_pointer_constraints_v1" => st.lock.constraints = Some(reg.bind(name, 1, qh, ())),
                 "zwp_linux_dmabuf_v1" if st.dma.is_some() => st.dma.as_mut().unwrap().global = Some(reg.bind(name, version.min(4), qh, ())),
                 "wp_linux_drm_syncobj_manager_v1" if st.dma.is_some() => {
                     st.dma.as_mut().unwrap().sync_mgr = Some(reg.bind(name, 1, qh, ()))
@@ -570,13 +602,14 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
 }
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
-    fn event(_: &mut Self, seat: &wl_seat::WlSeat, ev: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+    fn event(st: &mut Self, seat: &wl_seat::WlSeat, ev: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(c) } = ev {
             if c.contains(wl_seat::Capability::Keyboard) {
                 seat.get_keyboard(qh, ());
             }
             if c.contains(wl_seat::Capability::Pointer) {
-                seat.get_pointer(qh, ());
+                st.lock.pointer = Some(seat.get_pointer(qh, ()));
+                lock::ask(st, qh);
             }
         }
     }

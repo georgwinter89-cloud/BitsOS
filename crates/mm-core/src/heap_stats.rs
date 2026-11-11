@@ -5,6 +5,7 @@
 
 use crate::heap::KernelHeap;
 use crate::pages::SeedStats;
+use crate::scatter::ScatterStats;
 use crate::slab::geo::NCLASSES;
 use crate::slab::{CacheStats, CheckError};
 use crate::{Kind, KINDS, PAGE};
@@ -34,6 +35,8 @@ pub struct HeapStats {
     /// Bytes of named-cache slabs per kind.
     pub named_slab_by_kind: [u64; KINDS],
     pub seed: SeedStats,
+    /// Large blocks of single frames in the vmap area (`scatter`; counted in `large_*` while users hold them).
+    pub scatter: ScatterStats,
 }
 
 impl KernelHeap {
@@ -53,7 +56,10 @@ impl KernelHeap {
         s.requested_bytes = self.requested.load(Relaxed);
         s.large_bytes = self.large_bytes.load(Relaxed);
         s.large_blocks = self.large_blocks.load(Relaxed);
+        s.scatter = self.scatter_stats();
         s.held_by_kind = self.src().held();
+        // Scattered blocks take their frames from the frame allocator directly, not through the page source.
+        s.held_by_kind[Kind::Heap as usize] += s.scatter.held_bytes;
         s.live_by_kind[Kind::Heap as usize] = s.live_bytes + s.large_bytes;
         if core::ptr::eq(self, &crate::heap::HEAP) {
             crate::slab::for_each_cache(|c| {
@@ -68,7 +74,8 @@ impl KernelHeap {
 
     /// Walks every magazine and slab: each parked object is taken and not live, each slab's bitmaps match its
     /// header, list and the cache counters, taken = live + parked per class, and the bytes held from the
-    /// buddy allocator = class slabs outside the seed + large blocks + named-cache slabs outside the seed.
+    /// buddy allocator = class slabs outside the seed + large page runs (scattered blocks are not) +
+    /// named-cache slabs outside the seed.
     /// Exact while no other CPU allocates (the ktests run on one CPU).
     pub fn check(&self) -> Result<(), CheckError> {
         let mut parked = [0u64; NCLASSES];
@@ -106,7 +113,8 @@ impl KernelHeap {
         named?;
         let held = self.src().held();
         let mut want = buddy_slab_bytes;
-        want[Kind::Heap as usize] += self.large_bytes.load(Relaxed) - self.seed_large_bytes();
+        let sc = self.scatter_stats();
+        want[Kind::Heap as usize] += self.large_bytes.load(Relaxed) - self.seed_large_bytes() - (sc.held_bytes - sc.waiting_bytes);
         for k in 0..KINDS {
             if held[k] != want[k] {
                 return Err(CheckError::Counter { what: "bytes held from the buddy allocator", counted: held[k], walked: want[k] });

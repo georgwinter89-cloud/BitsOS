@@ -49,6 +49,41 @@ impl Drop for Node {
     }
 }
 
+/// Index nodes allocated ahead, outside the index's lock (`Locked::prepare_from`); the unused ones are freed with it.
+pub struct Spare {
+    nodes: alloc::vec::Vec<*mut Node>,
+}
+
+impl Spare {
+    pub const fn new() -> Spare {
+        Spare { nodes: alloc::vec::Vec::new() }
+    }
+    /// One more node (NoRoom: no memory).
+    pub fn grow(&mut self) -> Result<(), NoRoom> {
+        self.nodes.try_reserve(1).map_err(|_| NoRoom)?;
+        self.nodes.push(new_node()?);
+        Ok(())
+    }
+}
+
+impl Default for Spare {
+    fn default() -> Spare {
+        Spare::new()
+    }
+}
+
+impl Drop for Spare {
+    fn drop(&mut self) {
+        for n in self.nodes.drain(..) {
+            // SAFETY: from `new_node` (Box::into_raw), never published: owned here alone.
+            drop(unsafe { alloc::boxed::Box::from_raw(n) });
+        }
+    }
+}
+
+// SAFETY: the nodes are unpublished heap blocks owned by the Spare alone.
+unsafe impl Send for Spare {}
+
 fn new_node() -> Result<*mut Node, NoRoom> {
     let n = grace::try_box(Node { slots: [const { AtomicPtr::new(core::ptr::null_mut()) }; FAN] }).ok_or(NoRoom)?;
     Ok(alloc::boxed::Box::into_raw(n))
@@ -184,6 +219,10 @@ impl<T: Send + Sync + 'static> RcuIndex<T> {
     pub fn write(&self) -> Locked<'_, T, WriteGuard<'_, ()>> {
         Locked { ix: self, _g: self.lock.write() }
     }
+    /// `write` without waiting (reclaim: the reader holding the read side may be the thread it interrupted).
+    pub fn try_write(&self) -> Option<Locked<'_, T, WriteGuard<'_, ()>>> {
+        self.lock.try_write().map(|g| Locked { ix: self, _g: g })
+    }
 
     /// The first present index at or after `from` (u128: the top level of an 11-level tree spans more than
     /// 64 bits).
@@ -307,6 +346,17 @@ impl<'a, T: Send + Sync + 'static> Locked<'a, T, WriteGuard<'a, ()>> {
     /// Room for an insert at `i`: grows the tree and makes the nodes on the way (all fallible). After `Ok`,
     /// `insert(i, ..)` cannot fail.
     pub fn prepare(&mut self, i: u64) -> Result<(), NoRoom> {
+        self.prepare_by(i, &mut new_node)
+    }
+
+    /// `prepare` with nodes from `spare` only (NoRoom: `spare` ran out; the caller grows it with this lock
+    /// released and asks again: what was built stays). FS-STALL review: no allocation under the index's spin lock,
+    /// where the heap may not take page cache back.
+    pub fn prepare_from(&mut self, i: u64, spare: &mut Spare) -> Result<(), NoRoom> {
+        self.prepare_by(i, &mut || spare.nodes.pop().ok_or(NoRoom))
+    }
+
+    fn prepare_by(&mut self, i: u64, new_node: &mut dyn FnMut() -> Result<*mut Node, NoRoom>) -> Result<(), NoRoom> {
         // A new root is made at the height `i` needs and published once (never an empty root that is published
         // and replaced at once).
         let mut r = match self.ix.root() {
@@ -358,6 +408,11 @@ impl<'a, T: Send + Sync + 'static> Locked<'a, T, WriteGuard<'a, ()>> {
     /// account and defer).
     pub fn insert(&mut self, i: u64, v: Arc<T>) -> Result<Option<Retire<T>>, NoRoom> {
         self.prepare(i)?;
+        self.insert_prepared(i, v)
+    }
+
+    /// `insert` after `prepare`/`prepare_from` for `i` (NoRoom only when that was not done).
+    pub fn insert_prepared(&mut self, i: u64, v: Arc<T>) -> Result<Option<Retire<T>>, NoRoom> {
         let slot = self.ix.leaf_slot(i).ok_or(NoRoom)?;
         let old = slot.swap(Arc::into_raw(v) as *mut (), AcqRel);
         if old.is_null() {
@@ -431,6 +486,17 @@ impl<'a, T: Send + Sync + 'static> Locked<'a, T, WriteGuard<'a, ()>> {
                 f(i, v);
             }
         }
+    }
+
+    /// `drain_from` for at most `max` entries; true while entries at or after `from` are left.
+    pub fn drain_some(&mut self, from: u64, max: usize, f: &mut dyn FnMut(u64, Retire<T>)) -> bool {
+        for _ in 0..max {
+            let Some((i, _)) = self.ix.next_raw(from) else { return false };
+            if let Some(v) = self.remove(i) {
+                f(i, v);
+            }
+        }
+        self.ix.next_raw(from).is_some()
     }
 }
 

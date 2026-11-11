@@ -150,6 +150,9 @@ pub struct Session {
     pub due: Option<Duration>,
     /// A window has opened or the offer was used: a session read later is not offered any more.
     taken: bool,
+    /// WY-21: the rescue build took over from the gpu build started at this time (unix seconds): the first session
+    /// read that was saved since comes back at once, without the start page's offer.
+    pub restore_since: Option<i64>,
     last_written: String,
     jobs: Option<mpsc::Sender<Job>>,
 }
@@ -305,7 +308,14 @@ impl App {
                 }
                 if let Some((saved, recent)) = text.as_deref().and_then(decode) {
                     eprintln!("bitscomp: session {}: {} workspaces, {} recent", p.display(), saved.spaces.len(), recent.len());
+                    let back = self.session.restore_since.is_some_and(|t| saved.when >= t);
                     self.session.loaded(saved);
+                    if back && self.session.offered {
+                        self.session.restore_since = None;
+                        let (tiles, pages) = self.session.saved.as_ref().map_or((0, 0), Saved::counts);
+                        eprintln!("bitscomp: session: the gpu build's session comes back ({tiles} tiles, {pages} programs)");
+                        self.session_restore();
+                    }
                     for r in recent {
                         if !self.session.recent.iter().any(|x| x.addr == r.addr) {
                             self.session.recent.push(r);

@@ -20,6 +20,8 @@ policy = { path = "../../policy" }
 proc = { path = "../../proc" }
 uapi = { path = "../../uapi" }
 vfs = { path = "../../vfs" }
+# WY-17: fbdev hands its windows and the scanout buffers out as dma-bufs.
+drm = { path = "../../drm" }
 
 [lints]
 workspace = true

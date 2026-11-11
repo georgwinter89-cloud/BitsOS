@@ -161,7 +161,7 @@ fn stick_install() -> TestResult {
     let Some(_vol) = fs_fat::stick::wait_mounted(40_000) else {
         return match fs_fat::stick::last_reason() {
             Some(r) => Err(format!("the boot stick was not mounted: {r}")),
-            None => ktest::skip("no boot stick (no USB disk recognised as the stick)"),
+            None => ktest::fail("no boot stick (no USB disk recognised as the stick)"),
         };
     };
     let _l = crate::install::LOCK.lock_timeout(60_000 * MS).ok_or("the install lock is held")?;
@@ -183,7 +183,8 @@ fn stick_install() -> TestResult {
         })
         .map_err(e)?;
         kassert!(until(2000, || started.load(Ordering::Acquire)), "the writer did not start");
-        sched::sleep_ns(30 * MS);
+        // Bounded; if nothing shows, `caught` below says so.
+        let _ = until(2000, || xhci::controllers().iter().any(|c| !c.activity().storage_idle()));
         let sum = block::shutdown::stop_all("ktest-stick", block::shutdown::STOP_NS);
         let caught = result.lock().is_none();
         let busy: Vec<String> = xhci::controllers().iter().map(|c| c.activity()).filter(|a| !a.storage_idle()).map(|a| a.describe()).collect();

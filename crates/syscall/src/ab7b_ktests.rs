@@ -349,14 +349,16 @@ impl vfs::pagecache::Backend for Zeroes {
 ktest!("ab7.sys.meminfo_available", Safe, meminfo_available);
 /// MM-9 CR1: MemAvailable counts the clean file cache (si_mem_available, linux-6.6/mm/show_mem.c:32). The file
 /// is big enough that what stays cached (half of it, at most the low watermark) and the reserve (the high
-/// watermark) still leave MemAvailable above MemFree. Its pages go when the cache is dropped (rerunnable).
+/// watermark) still leave MemAvailable above MemFree, which counts the HighAtomic reserve while MemAvailable does
+/// not. Its pages go when the cache is dropped (rerunnable).
 fn meminfo_available() -> TestResult {
     const P: u64 = 4096;
     let w = mm::reclaim::watermarks();
-    let pages = (2 * (w.high + w.low) + 4096).max(4096);
-    let free = mm_core::frames().map_or(0, |f| f.stats().free_bytes) / P;
+    let s = mm_core::frames().map(|f| f.stats()).unwrap_or_default();
+    let pages = (2 * (w.high + w.low) + s.highatomic_free_bytes / P + 4096).max(4096);
+    let free = s.usable_free_bytes() / P;
     if free < 4 * pages {
-        return ktest::skip("too little free memory for the test file");
+        return ktest::fail("too little free memory for the test file");
     }
     let c = vfs::pagecache::PageCache::with_backend(Arc::new(Zeroes), pages * P);
     let mut b = [0u8; 8];

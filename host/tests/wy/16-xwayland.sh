@@ -17,13 +17,22 @@ case $RUN in /tmp|/tmp/*) echo "FAIL: the run directory $RUN lies under /tmp (hi
 BIN=$CARGO_TARGET_DIR/release/bitscomp
 XW=${XWAYLAND:-/usr/bin/Xwayland}
 TREE=$CARGO_TARGET_DIR/wy-xwayland/xwayland/test
+# The test clients are this test's other half (windows, clipboard): no skip without them (Georg 30.10.), they are built.
+if [ ! -x "$TREE/bin/xeyes" ]; then
+    STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+    # A worktree has no out/: the manifest's `tree mesa`, as gpu-image.sh does.
+    [ -n "${MESA_STAGE:-}" ] || [ -d "$STAGE" ] || STAGE=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' user/packaging/manifest.txt)
+    [ -f "$STAGE/lib/ld-linux-x86-64.so.2" ] || { echo "RED: no test clients in $TREE and no Mesa stage in $STAGE to build them with"; exit 1; }
+    mkdir -p "$RUN"
+    XW_TEST=1 MESA_STAGE=$STAGE bash user/ports/xwayland/scripts/build-v2.sh >"$RUN/build.txt" 2>&1 || { tail -20 "$RUN/build.txt"; echo "RED: the test clients do not build"; exit 1; }
+fi
 
 for t in "$XW" xdpyinfo xrandr unshare; do
-    command -v "$t" >/dev/null || { echo "SKIP: no $t on this host"; exit 0; }
+    command -v "$t" >/dev/null || { echo "RED: no $t on this host"; exit 1; }
 done
 if ! unshare -Urnm true 2>/dev/null; then
-    echo "SKIP: no unprivileged user namespaces here (the test needs a private /tmp)"
-    exit 0
+    echo "RED: no unprivileged user namespaces here (the test needs a private /tmp)"
+    exit 1
 fi
 (cd "$ROOT/user/services/bitscomp" && cargo build --release -q --offline)
 
@@ -53,9 +62,12 @@ echo "ok: the first X11 client started Xwayland; xdpyinfo answers"
 timeout 20 xrandr >xrandr.txt 2>&1 && grep -Eq "^BITS-1 connected [0-9]+x[0-9]+\+0\+0" xrandr.txt || fail "xrandr: $(cat xrandr.txt)"
 echo "ok: xrandr shows BITS-1"
 # A program bitscomp starts (as from the Feld or the launcher) gets the display.
+# The file goes first: an earlier run's in the same directory passed the wait at once, and the check then read it just as
+# the new program had truncated it (the red of WY-3b, with the right value in its own message). The value is what is waited for.
+rm -f spawned-display.txt
 printf 'printf %%s "$DISPLAY" >%s/spawned-display.txt\n' "$RUN" >spawn.sh
 ctl spawn /bin/sh "$RUN/spawn.sh" >/dev/null
-for _ in $(seq 25); do [ -s spawned-display.txt ] && break; sleep 0.2; done
+for _ in $(seq 100); do [ "$(cat spawned-display.txt 2>/dev/null)" = ":0" ] && break; sleep 0.2; done
 [ "$(cat spawned-display.txt 2>/dev/null)" = ":0" ] || fail "a program bitscomp started sees DISPLAY='$(cat spawned-display.txt 2>/dev/null)'"
 echo "ok: programs bitscomp starts get DISPLAY=:0"
 # An Xwayland that ends at once, and one that never gets ready: a second bitscomp (display :1) gives up after
@@ -83,13 +95,16 @@ negative() { # name, fake Xwayland body, seconds an X client may take
 }
 negative exits 'exit 1' 10
 negative hangs 'exec sleep 120' 45
-if [ ! -x "$TREE/bin/xeyes" ]; then
-    echo "note: no test clients in $TREE (XW_TEST=1 user/ports/xwayland/scripts/build-v2.sh): windows and clipboard not checked here"
-    kill $C; wait $C 2>/dev/null; exit 0
-fi
 "${X[@]}" "$TREE/bin/xeyes" 2>/dev/null & E=$!
 for _ in $(seq 50); do ctl list | grep -q "app_id=XEyes .* x11=0x" && break; sleep 0.2; done
 ctl list | grep -q "focused=true.*app_id=XEyes .* x11=0x" || fail "xeyes is not a focused window of the desk"
+# EWMH: a game asks for fullscreen by a message to the root window and hears the answer in _NET_WM_STATE.
+xid=$(ctl list | sed -n 's/.*app_id=XEyes .* x11=\(0x[0-9a-f]*\).*/\1/p')
+[ "$(python3 -I "$ROOT/host/tests/wy/x11-fullscreen.py" "$xid" 1)" = fullscreen ] || fail "_NET_WM_STATE does not say fullscreen"
+ctl list | grep -q "fullscreen.*app_id=XEyes" || fail "xeyes did not go fullscreen: $(ctl list)"
+[ "$(python3 -I "$ROOT/host/tests/wy/x11-fullscreen.py" "$xid" 0)" = "not fullscreen" ] || fail "_NET_WM_STATE still says fullscreen"
+ctl list | grep -q "fullscreen.*app_id=XEyes" && fail "xeyes stayed fullscreen: $(ctl list)"
+echo "ok: an X11 window enters and leaves fullscreen through _NET_WM_STATE"
 echo "ok: xeyes is a window: $(ctl list | grep XEyes)"
 timeout 20 "${X[@]}" "$TREE/bin/xinput" list >xinput.txt 2>&1 && grep -q "xwayland-pointer" xinput.txt && grep -q "xwayland-keyboard" xinput.txt || fail "xinput: $(cat xinput.txt)"
 echo "ok: xinput list shows Xwayland's seat devices"
@@ -141,5 +156,5 @@ ctl xwayland
 kill $C; wait $C 2>/dev/null
 exit 0
 INNER
-RUN=$RUN BIN=$BIN XW=$XW TREE=$TREE unshare -Urnm bash "$RUN/inner.sh"
+ROOT=$ROOT RUN=$RUN BIN=$BIN XW=$XW TREE=$TREE unshare -Urnm bash "$RUN/inner.sh"
 echo "GREEN: X11 window manager against the host's Xwayland"

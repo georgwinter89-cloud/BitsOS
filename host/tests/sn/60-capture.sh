@@ -21,9 +21,14 @@ NAME="$LANE-capture"
 LOG="$RUN/capture.log"
 
 if [ ! -x /usr/bin/aplay ] || [ ! -f /usr/share/alsa/alsa.conf ]; then
-    echo "SKIP: no alsa-utils/alsa-lib on this host (aplay and alsa.conf are packaged from it)"
-    exit 0
+    echo "FAIL: no alsa-utils/alsa-lib on this host (aplay and alsa.conf are packaged from it)"
+    exit 1
 fi
+# sn.cap.system's run (TS-1): only this audiodev gives the input side something to record.
+cargo xtask image --name "$NAME-kt" --ktest --config-extra "ktest=sn.cap.system;loglevel=info"
+cargo xtask qemu --name "$NAME-kt" --timeout 120 --smp 2 --serial-log "$RUN/ktest.log" -- \
+    -audiodev "none,id=a0" -device intel-hda,id=h0 -device hda-duplex,bus=h0.0,audiodev=a0,mixer=off > "$RUN/ktest.out" 2>&1 || true
+grep -aq "KTEST ok sn.cap.system" "$RUN/ktest.log" || { grep -a "KTEST" "$RUN/ktest.log" | head; echo "FAIL: sn.cap.system"; exit 1; }
 cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info"
 stop_qemu "$NAME"
 rm -f "$LOG"

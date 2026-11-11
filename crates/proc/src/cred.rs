@@ -28,7 +28,7 @@ use crate::ns::user::{MapKind, UserNs, init_user_ns};
 use crate::task::Thread;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use uapi::errno::*;
 use vfs::Errno;
 
@@ -88,6 +88,8 @@ pub enum Cap {
     NetBindService = 10,
     NetAdmin = 12,
     NetRaw = 13,
+    IpcLock = 14,
+    IpcOwner = 15,
     SysChroot = 18,
     SysPtrace = 19,
     SysAdmin = 21,
@@ -398,16 +400,124 @@ pub fn current_in_group(cred: vfs::Cred, gid: u32) -> bool {
     })
 }
 
+/// The ids every file call asks for: path walks, permission checks and the policy's subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallIds {
+    pub fs: vfs::Cred,
+    pub euid: u32,
+}
+
+impl CallIds {
+    fn of(c: &Cred) -> CallIds {
+        CallIds { fs: c.fs(), euid: c.euid }
+    }
+}
+
+/// PF-7: `CallIds` without `proc.cred` and without the `Arc<Cred>` count, the two lines all of a program's threads
+/// wrote on each syscall. Linux reads `current_cred()`, a pointer of its own task nobody else writes; here the
+/// credentials are per group, so the ids are published under a sequence number (fs/fs_struct's seqcount idea). On a
+/// line of its own: nothing else in `Group` may make these reads miss.
+#[repr(align(64))]
+pub(crate) struct PublishedIds {
+    seq: AtomicU32,
+    /// fsuid in the low half, fsgid in the high half.
+    fs: AtomicU64,
+    euid: AtomicU32,
+    /// Not an id, but read as often and as rarely written (`Group::set_nsset`), so it shares the line.
+    view_copied: AtomicBool,
+}
+
+klog::counter!(IDS_LOCKED, "proc.cred.ids_locked");
+
+/// Rounds a reader tries before it takes the lock: a writer stays inside for three stores, so running out means
+/// set*id calls without end in another thread (the reader must still finish, B4).
+const PUBLISHED_TRIES: u32 = 64;
+
+impl PublishedIds {
+    pub(crate) fn new(c: &Cred, view_copied: bool) -> Self {
+        PublishedIds { seq: AtomicU32::new(0), fs: AtomicU64::new(Self::fs_word(c)), euid: AtomicU32::new(c.euid), view_copied: AtomicBool::new(view_copied) }
+    }
+
+    pub(crate) fn view_copied(&self) -> bool {
+        self.view_copied.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_view_copied(&self, copied: bool) {
+        self.view_copied.store(copied, Ordering::Release);
+    }
+
+    fn fs_word(c: &Cred) -> u64 {
+        u64::from(c.fsuid) | (u64::from(c.fsgid) << 32)
+    }
+
+    /// Under `proc.cred`, which makes it the only writer.
+    fn publish(&self, c: &Cred) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.fs.store(Self::fs_word(c), Ordering::Relaxed);
+        self.euid.store(c.euid, Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Ids of one published set, None when writers kept it busy.
+    fn read(&self) -> Option<CallIds> {
+        for _ in 0..PUBLISHED_TRIES {
+            let s = self.seq.load(Ordering::Acquire);
+            if s & 1 == 0 {
+                let fs = self.fs.load(Ordering::Relaxed);
+                let euid = self.euid.load(Ordering::Relaxed);
+                fence(Ordering::Acquire);
+                if self.seq.load(Ordering::Relaxed) == s {
+                    return Some(CallIds { fs: vfs::Cred { uid: fs as u32, gid: (fs >> 32) as u32 }, euid });
+                }
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+}
+
+/// Tests only (`published_ids_held_for_test`): the ids count as being written until it drops.
+pub struct HeldIds<'a>(&'a PublishedIds);
+
+impl Drop for HeldIds<'_> {
+    fn drop(&mut self) {
+        self.0.seq.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Calls that found the published ids busy and took `proc.cred` (`Group::call_ids`).
+pub fn ids_locked() -> u64 {
+    IDS_LOCKED.get()
+}
+
 impl Group {
+    /// Tests only: `call_ids` finds the ids busy, so it takes its locked way, while this lives. The group must make
+    /// no credential change meanwhile. Never in kernel code paths.
+    pub fn published_ids_held_for_test(&self) -> HeldIds<'_> {
+        self.published_ids.seq.fetch_add(1, Ordering::AcqRel);
+        HeldIds(&self.published_ids)
+    }
+
     /// The group's credentials now (a snapshot; set*id replaces the whole set).
     pub fn cred(&self) -> Arc<Cred> {
         self.cred.lock().clone()
+    }
+
+    /// PF-7: what a file call needs of the credentials, consistent with one set, with no write to any shared line.
+    pub fn call_ids(&self) -> CallIds {
+        self.published_ids.read().unwrap_or_else(|| {
+            IDS_LOCKED.inc();
+            CallIds::of(&self.cred.lock())
+        })
     }
 
     /// Puts `c` in place without `commit_creds`' side effects (execve's own rules apply there; fork's copy).
     pub(crate) fn set_cred(&self, c: Arc<Cred>) {
         let mut l = self.cred.lock();
         self.owner_uid.store(c.uid, Ordering::Release);
+        self.published_ids.publish(&c);
         *l = c;
     }
 
@@ -425,7 +535,7 @@ impl Process {
 
     /// What path walks and file checks of this process use (fsuid, fsgid; `current_fsuid()`).
     pub fn fs_cred(&self) -> vfs::Cred {
-        self.cred().fs()
+        self.group().call_ids().fs
     }
 
     /// `capable(cap)` for this process (`capable` above: the one place).
@@ -461,6 +571,7 @@ impl Process {
             fix_setuid(&c, &mut new);
             let new = Arc::new(new);
             g.owner_uid.store(new.uid, Ordering::Release);
+            g.published_ids.publish(&new);
             (core::mem::replace(&mut *c, new.clone()), new)
         };
         if old.euid != new.euid || old.egid != new.egid || old.fsuid != new.fsuid || old.fsgid != new.fsgid {
@@ -475,6 +586,35 @@ impl Process {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_ids_are_one_set_under_a_writer() {
+        extern crate std;
+        use core::sync::atomic::AtomicBool;
+        let set = |n: u32| Cred { fsuid: n, fsgid: n, euid: n, ..Cred::new(n, n) };
+        let ids = Arc::new(PublishedIds::new(&set(1), false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (ids, stop) = (ids.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(c) = ids.read() {
+                            assert!(c.fs.uid == c.fs.gid && c.fs.uid == c.euid, "a torn set: {c:?}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for n in 0..200_000 {
+            ids.publish(&set(n % 7 + 1));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(ids.read(), Some(CallIds::of(&set(199_999 % 7 + 1))));
+    }
 
     fn c(r: u32, e: u32, s: u32) -> Cred {
         Cred { uid: r, euid: e, suid: s, fsuid: e, ..Cred::new(r, r) }

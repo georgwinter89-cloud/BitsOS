@@ -1,0 +1,55 @@
+amdgpu render node: found
+first fd: objects mapped: yes
+second fd: objects mapped: yes
+-- first fd
+SDMA WRITE_LINEAR = 0
+  user fence holds its number: yes
+  the CPU reads it: yes
+GFX NOP, WRITE_DATA, RELEASE_MEM = 0
+  user fence holds its number: yes
+  the CPU reads the write: yes
+  the CPU reads the release: yes
+compute NOP, WRITE_DATA, RELEASE_MEM = 0
+  user fence holds its number: yes
+  the CPU reads the write: yes
+  the CPU reads the release: yes
+SDMA into VRAM = 0
+  user fence holds its number: yes
+SDMA COPY_LINEAR out of VRAM = 0
+  user fence holds its number: yes
+  the CPU reads VRAM's value: yes
+GFX job after a job it depends on = 0
+  both ran: yes
+-- two VMs, one VA
+second fd writes the same VA = 0
+  user fence holds its number: yes
+  it reads its own: yes
+  the first fd's page is unmoved: yes
+-- a fault on one fd
+GFX write to an unmapped page = 0
+  user fence holds its number: yes
+the same context's next GFX job = 0
+  user fence holds its number: yes
+  it ran: yes
+  the fault is the second fd's: yes
+  the first fd has none: yes
+first fd's GFX job meanwhile = 0
+  user fence holds its number: yes
+  it ran: yes
+SDMA write to an unmapped page = 0
+  user fence holds its number: yes
+the same context's next SDMA job = 0
+  user fence holds its number: yes
+  it ran: yes
+-- a fault on the compute ring
+compute write to an unmapped page = -ETIME
+the context's QUERY_STATE2 = 0
+  flags: reset 1 guilty 1
+the guilty context's next CS = -ECANCELED
+first fd's compute job after it = 0
+  user fence holds its number: yes
+  it ran: yes
+second fd's new context on the compute ring = 0
+  user fence holds its number: yes
+  it ran: yes
+done

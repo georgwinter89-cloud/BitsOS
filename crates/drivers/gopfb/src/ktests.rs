@@ -24,7 +24,7 @@ ktest!("dp.gopfb.bad_input", Safe, bad_input);
 
 /// The live window is MM-2's vmap mapping with PAT write-combining, over the whole framebuffer.
 fn wc_window() -> TestResult {
-    let Some((fb, target)) = live() else { return ktest::skip("no GOP framebuffer (headless)") };
+    let Some((fb, target)) = live() else { return ktest::fail("no GOP framebuffer (headless)") };
     let Some((virt, phys)) = target.window() else {
         return Err("the framebuffer is drawn through bitsboot's mapping, not a vmap WC window (see the gopfb map.fallback event)".into());
     };
@@ -51,7 +51,7 @@ ktest!("dp.gopfb.wc_window", Safe, wc_window);
 /// Full-frame presents on the real screen (the Mini-PC check: about 1.7 ms at 1440p). Timing is logged,
 /// judged only with a generous limit here.
 fn present_full() -> TestResult {
-    let Some(dev) = display::device() else { return ktest::skip("no display") };
+    let Some(dev) = display::device() else { return ktest::fail("no display") };
     let m = dev.current_mode();
     let mut g = display::take_scanout("dp.gopfb.present_full").map_err(|e| format!("{e:?}"))?;
     let mut f = RamFrame::new(m.width, m.height);
@@ -78,7 +78,7 @@ fn present_full() -> TestResult {
     kassert!(max < 5_000_000_000, "a full present took {} ms", max / 1_000_000);
     Ok(())
 }
-ktest!("dp.gopfb.present_full", Safe, present_full);
+ktest!("dp.gopfb.present_full", Screen, present_full);
 
 /// The display's timer estimate (its `VblankClock`, which fbdev's `clock_now` reads through `live_vblank` while
 /// GopFb is the installed display; `last_vblank`, `VblankClock::next`): 60 Hz by default,
@@ -110,7 +110,7 @@ ktest!("dp.gopfb.vblank", Safe, vblank);
 
 /// The console stops presenting while another owner holds the screen and gets it back whole.
 fn handover() -> TestResult {
-    let Some((w, h)) = display::with_frame(|f| (f.width, f.height)) else { return ktest::skip("no display") };
+    let Some((w, h)) = display::with_frame(|f| (f.width, f.height)) else { return ktest::fail("no display") };
     let s0 = display::stats();
     let g = display::take_scanout("dp.display.handover").map_err(|e| format!("{e:?}"))?;
     kassert!(display::scanout_owner() == Some("dp.display.handover"));
@@ -125,12 +125,12 @@ fn handover() -> TestResult {
     kassert!(display::scanout_owner().is_none());
     Ok(())
 }
-ktest!("dp.display.handover", Safe, handover);
+ktest!("dp.display.handover", Screen, handover);
 
 /// MCP's frame copy: allocated outside `display.frame`, the size of the device's mode; a second display
 /// device is refused and leaves the installed one in place.
 fn snapshot_and_device() -> TestResult {
-    let Some(dev) = display::device() else { return ktest::skip("no display (headless)") };
+    let Some(dev) = display::device() else { return ktest::fail("no display (headless)") };
     let m = dev.current_mode();
     let (w, h, px) = display::snapshot().ok_or("snapshot returned None with a display installed")?;
     kassert!((w, h) == (m.width, m.height), "snapshot {w}x{h}, mode {}x{}", m.width, m.height);

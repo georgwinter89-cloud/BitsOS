@@ -399,9 +399,11 @@ fn ids_limits_random() -> TestResult {
     expect("get_robust_list(no pid)", t.call(nr::GET_ROBUST_LIST, &[4_000_000, t.a(700), t.a(708)]), -ESRCH)?;
     expect("get_robust_list bad len ptr", t.call(nr::GET_ROBUST_LIST, &[0, t.a(700), 0x10]), -EFAULT)?;
 
-    // Limits: Linux's defaults, its rules, and RLIMIT_NOFILE reaching the fd table.
+    // Limits: Linux's defaults (NOFILE's ceiling systemd's, the kernel starts this process), its rules, and
+    // RLIMIT_NOFILE reaching the fd table.
+    let sys_max = uapi::ab::rlimit::SYSTEM_NOFILE_MAX;
     expect("prlimit64 NOFILE read", t.call(nr::PRLIMIT64, &[0, 7, 0, t.a(800)]), 0)?;
-    kassert!(t.u64_at(800) == 1024 && t.u64_at(808) == 4096, "NOFILE {} {}", t.u64_at(800), t.u64_at(808));
+    kassert!(t.u64_at(800) == 1024 && t.u64_at(808) == sys_max, "NOFILE {} {}", t.u64_at(800), t.u64_at(808));
     expect("getrlimit STACK", t.call(nr::GETRLIMIT, &[3, t.a(800)]), 0)?;
     kassert!(t.u64_at(800) == 8 << 20 && t.u64_at(808) == u64::MAX, "STACK limits");
     expect("getrlimit 16", t.call(nr::GETRLIMIT, &[16, t.a(800)]), -EINVAL)?;
@@ -411,14 +413,14 @@ fn ids_limits_random() -> TestResult {
     };
     lim(&t, 816, 300, 200);
     expect("prlimit64 cur > max", t.call(nr::PRLIMIT64, &[0, 7, t.a(816), 0]), -EINVAL)?;
-    lim(&t, 816, 300, 8192);
+    lim(&t, 816, 300, sys_max + 1);
     expect("prlimit64 raise the hard limit", t.call(nr::PRLIMIT64, &[0, 7, t.a(816), 0]), -EPERM)?;
     lim(&t, 816, 300, (1 << 20) + 1);
     expect("prlimit64 above nr_open", t.call(nr::PRLIMIT64, &[0, 7, t.a(816), 0]), -EPERM)?;
     expect("prlimit64 bad new", t.call(nr::PRLIMIT64, &[0, 7, 0x10, 0]), -EFAULT)?;
     lim(&t, 816, 300, 2048);
     expect("prlimit64 NOFILE 300/2048", t.call(nr::PRLIMIT64, &[0, 7, t.a(816), t.a(800)]), 0)?;
-    kassert!(t.u64_at(800) == 1024 && t.u64_at(808) == 4096, "old value");
+    kassert!(t.u64_at(800) == 1024 && t.u64_at(808) == sys_max, "old value");
     kassert!(t.p.fds.limit() == 300, "fd table limit {}", t.p.fds.limit());
     lim(&t, 816, 100, 2048);
     expect("setrlimit NOFILE 100", t.call(nr::SETRLIMIT, &[7, t.a(816)]), 0)?;

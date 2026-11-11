@@ -271,6 +271,12 @@ fn requests_acks_and_dumps() {
     assert!(one(req(NLMSG_NOOP, NLM_F_REQUEST, 12, &[])).is_empty());
     let a = one(req(RTM_GETLINK, NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP, 13, &[]));
     assert_eq!(err_of(&a[0]), 0, "no payload byte: ignored, acked");
+    // A peek copies the datagram and leaves it queued.
+    p.send(s, &req(RTM_GETLINK, NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP, 15, &[]), 0);
+    let (r, peeked) = p.recv(s, 65536, MSG_DONTWAIT | MSG_PEEK);
+    assert_eq!((r, p.recv(s, 8, MSG_DONTWAIT | MSG_PEEK).1.as_slice()), (36, &peeked[..8]), "cut to the buffer");
+    assert_eq!(recv_now(&p, s, 65536), (r, peeked));
+    assert_eq!(recv_now(&p, s, 16).0, -EAGAIN);
     let a = one(req(0x7fff, NLM_F_REQUEST | NLM_F_ACK, 14, &[0; 16]));
     assert_eq!((err_of(&a[0]), a[0].0.len, a[0].0.flags), (-(EOPNOTSUPP as i32), 52, 0), "the request comes back");
     let a = one(req(RTM_DELADDR, NLM_F_REQUEST, 15, &[0; 16]));

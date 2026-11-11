@@ -22,6 +22,7 @@ use crate::chrome::{self, Chrome, Part};
 use crate::chrome_draw::{self as draw, FavLook, ListLook, RingLook, STATUS_GLOW, SideLook, StatusLook, SuggestLook, TopLook};
 use crate::deco::image_a;
 use crate::desk::Spot;
+use crate::fx::plan as fx;
 use crate::header::px_rect;
 use crate::layout::Rect;
 use crate::render::{CompElement, CompRenderer};
@@ -36,6 +37,8 @@ pub struct Images {
     side: Option<(SideLook, MemoryRenderBuffer)>,
     status: Option<(StatusLook, MemoryRenderBuffer)>,
     start: Option<(StartLook, MemoryRenderBuffer)>,
+    start_blocks: Option<(StartLook, MemoryRenderBuffer)>,
+    start_hover: Option<(StartLook, MemoryRenderBuffer)>,
     suggest: Option<(SuggestLook, MemoryRenderBuffer)>,
     notice: Option<((String, Rect, u64), MemoryRenderBuffer)>,
     top_ring: Option<(RingLook, MemoryRenderBuffer)>,
@@ -222,15 +225,18 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
         cursor: edit_top.map(|e| e.before().to_string()),
         hover,
         context: None,
+        library: app.lib.open,
     };
     // The busy ring's step: the same for both rings; asks for the next step's frame only while it moves.
     let ring = app.desk.ring;
-    let step = app.status.ring.shown(crate::ring::moves(ring), now, &t);
+    let step = app.status.ring.shown(crate::ring::sprite_moves(ring, &t), now, &t);
     let rl = RingLook { rect: ch.ring, ring, step, size: draw::TOP_RING, theme: tg };
+    out.extend(fx::ring(app, "ring-top", ch.ring, draw::TOP_RING, ring, -glide).map(CompElement::from));
     let rbuf = cached(&mut app.images.top_ring, &rl, |l| draw::ring_sprite(l, &t));
     put(renderer, rbuf, ch.ring, -glide, &mut out);
     let buf = cached(&mut app.images.top, &look, |l| draw::top(l, &t));
     put(renderer, buf, ch.top, -glide, &mut out);
+    out.extend(fx::bar(app, "bar-top", ch.top).map(CompElement::from));
     if let Some(bar) = ch.favs {
         let fh = match hover {
             Some(Part::Fav(i)) => Some(i),
@@ -248,12 +254,14 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
     // A revealed bar lies over the tiles: it comes before (above) the start page and the tiles.
     if let Some(r) = ch.side {
         let rr = draw::side_ring_rect(r);
+        out.extend(fx::ring(app, "ring-side", rr, draw::SIDE_RING, ring, 0.0).map(CompElement::from));
         let rl = RingLook { rect: rr, ring, step, size: draw::SIDE_RING, theme: tg };
         let rbuf = cached(&mut app.images.side_ring, &rl, |l| draw::ring_sprite(l, &t));
         put(renderer, rbuf, rr, 0.0, &mut out);
         let look = SideLook { rect: r, theme: tg, name: app.desk.claude_name.clone(), ring, solid: !ch.side_docked };
         let buf = cached(&mut app.images.side, &look, |l| draw::side(l, &t));
         put(renderer, buf, r, 0.0, &mut out);
+        out.extend(fx::bar(app, "bar-side", r).map(CompElement::from));
     }
     if !ch.list_shown {
         app.images.list = None;
@@ -269,11 +277,26 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
         let look = ListLook { chrome: ch.clone(), theme: tg, entries, minimized, active: app.desk.active, hover };
         let buf = cached(&mut app.images.list, &look, |l| draw::list(l, &t));
         put(renderer, buf, ch.list, 0.0, &mut out);
+        out.extend(fx::bar(app, "bar-list", ch.list).map(CompElement::from));
     }
     if app.start_shown() {
-        let look = app.start_look(tg);
-        let buf = cached(&mut app.images.start, &look, |l| start_draw::draw(l, &t));
-        put(renderer, buf, ch.work, 0.0, &mut out);
+        start_page(app, renderer, ch.work, alpha, &mut out);
     }
     out
+}
+
+/// The start page's images, topmost first: the part under the pointer, the blocks, the page.
+fn start_page<R: CompRenderer>(app: &mut App, renderer: &mut R, work: Rect, alpha: f32, out: &mut Vec<CompElement<R>>) {
+    let t = app.theme.clone();
+    let look = app.start_look(app.theme_gen);
+    if let Some(r) = start_draw::hover_rect(&look) {
+        let buf = cached(&mut app.images.start_hover, &start_draw::hover_look(&look), |l| start_draw::draw_hover(l, &t, r));
+        put(renderer, buf, r, 0.0, t.scale, alpha, out);
+    }
+    if let Some(r) = start_draw::blocks_rect(&look) {
+        let buf = cached(&mut app.images.start_blocks, &start_draw::blocks_look(&look), |l| start_draw::draw_blocks(l, &t, r));
+        put(renderer, buf, r, 0.0, t.scale, alpha, out);
+    }
+    let buf = cached(&mut app.images.start, &start_draw::base_look(&look), |l| start_draw::draw(l, &t));
+    put(renderer, buf, work, 0.0, t.scale, alpha, out);
 }

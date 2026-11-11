@@ -42,7 +42,7 @@ fn programs() -> TestResult {
         if have("/bin/abi-ids") {
             return Err(String::from("the image has ABI programs but not /bin/abi-wow64 (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     let modes: [(&str, &str); 10] = [
         ("tls", include_str!("../../../user/abi-tests/expected/wow64-tls.txt")),

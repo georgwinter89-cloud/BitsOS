@@ -9,8 +9,9 @@
 # rescue build hands over for `--build gles` and for CONFIG.TXT `bitscomp=gles` (then with `--renderer gles`
 # added); a program bitscomp starts gets none of the EGL variables; a tree whose EGL vendor file is missing makes
 # the gpu build draw with Pixman (byte for byte the rescue picture) and the rescue build keep running when it
-# would hand over. Prints the render cost per frame of both renderers here (numbers only; QEMU and the Mini-PC
-# measure their own). Needs the Mesa stage ("SKIP:" and exit 0 when it cannot be made, as 97).
+# would hand over. WY-21: the context is robust; after the hand-over a stuck main loop (`ctl stall`) is ended by the
+# gpu build's stall watch and the waiting rescue build draws on. Prints the render cost per frame of both renderers here (numbers only; QEMU and the Mini-PC
+# measure their own). Needs the Mesa stage (RED when it cannot be made, as 97; Georg 30.10.: a test that cannot work is not green).
 set -euo pipefail
 
 ROOT=${BITSOS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -29,12 +30,17 @@ unset DISPLAY WAYLAND_DISPLAY
 fail() { echo "FAIL: $*"; exit 1; }
 
 STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$STAGE" ]; then
+    # A worktree has no out/: the manifest's `tree mesa`, as dr/20 does; an empty answer keeps the path above.
+    _m=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' "$ROOT/user/packaging/manifest.txt")
+    [ -z "$_m" ] || STAGE=$_m
+fi
 if [ ! -f "$STAGE/lib/ld-linux-x86-64.so.2" ]; then
     STAGE=$CARGO_TARGET_DIR/wy-mesa-out/mesa
     if [ ! -f "$STAGE/lib/ld-linux-x86-64.so.2" ]; then
         echo "== stage the Mesa tree into $STAGE"
         MESA_OUT=$CARGO_TARGET_DIR/wy-mesa-out bash user/ports/mesa/scripts/stage-v2.sh >"$RUN/stage.out" 2>&1 \
-            || { echo "SKIP: not run: no Mesa stage ($(tail -1 "$RUN/stage.out"))"; exit 0; }
+            || { echo "RED: no Mesa stage ($(tail -1 "$RUN/stage.out"))"; exit 1; }
     fi
 fi
 export MESA_STAGE=$STAGE
@@ -76,6 +82,8 @@ desktop() {
     ctl "$name" stats >"$RUN/$name.stats"
 }
 quit() { ctl "$1" quit >/dev/null 2>&1 || true; }
+# The compositor's pid from its start line (after a hand-over the gpu build, the child of the pid in $1.pid).
+start_pid() { sed -n 's/^WAYLAND_DISPLAY=.* pid=\([0-9]*\) backend=.*/\1/p' "$RUN/$1.log" | head -1; }
 same() { # A B what: within the screenshot tolerance
     $IMG diff "$1" "$2" >"$RUN/diff.out" 2>&1 || fail "$3: the GLES picture differs from Pixman's: $(cat "$RUN/diff.out")"
     echo "ok: $3: $(cat "$RUN/diff.out")"
@@ -153,15 +161,30 @@ echo "== hand-over: the rescue build with --build gles"
 desktop over "$BIN" --build gles --gpu-exe "$GPU"
 pid=$(cat "$RUN/over.pid")
 grep -q "build gpu, renderer gles (--build gles): handing over to $GPU" "$RUN/over.log" || fail "no hand-over line: $(head -5 "$RUN/over.log")"
-grep -q " pid=$pid .* build=gpu renderer=gles egl=loadable$" "$RUN/over.log" || fail "after the hand-over: $(grep WAYLAND_DISPLAY "$RUN/over.log")"
-[ "$(readlink "/proc/$pid/exe")" = "$GPU" ] || fail "pid $pid runs $(readlink "/proc/$pid/exe")"
+# WY-21: the gpu build runs as the waiting rescue build's child.
+gpid=$(start_pid over)
+grep -q " pid=$gpid .* build=gpu renderer=gles egl=loadable$" "$RUN/over.log" || fail "after the hand-over: $(grep WAYLAND_DISPLAY "$RUN/over.log")"
+[ "$(readlink "/proc/$gpid/exe")" = "$GPU" ] || fail "pid $gpid runs $(readlink "/proc/$gpid/exe")"
+[ "$(awk '/^PPid:/ {print $2}' "/proc/$gpid/status")" = "$pid" ] || fail "the gpu build $gpid is not the child of the rescue build $pid"
+grep -q "renderer gles: .*robust context" "$RUN/over.log" || fail "no robust context: $(grep 'renderer gles' "$RUN/over.log")"
 same "$RUN/pixman.ppm" "$RUN/over.ppm" "after the hand-over"
+echo "== WY-21: a stuck main loop (ctl stall): the stall watch ends the gpu build, the rescue build takes over"
+ctl over stall 30 >/dev/null 2>&1 &
+PIDS+=("$!")
+for _ in $(seq 200); do grep -q "the gpu build gave the GPU up: the rescue build takes the screen" "$RUN/over.log" && break; sleep 0.1; done
+grep -q "gpu: a present has not returned for [0-9]* ms .*ending with 75" "$RUN/over.log" || fail "no stall line: $(tail -5 "$RUN/over.log")"
+grep -q "the gpu build gave the GPU up: the rescue build takes the screen" "$RUN/over.log" || fail "no takeover: $(tail -5 "$RUN/over.log")"
+for _ in $(seq 100); do grep -q " pid=$pid .* build=rescue renderer=pixman" "$RUN/over.log" && break; sleep 0.1; done
+grep -q " pid=$pid .* build=rescue renderer=pixman egl=off$" "$RUN/over.log" || fail "the rescue build did not start: $(tail -5 "$RUN/over.log")"
+kill -0 "$gpid" 2>/dev/null && fail "the gpu build $gpid still runs"
+ctl over stats | grep -q " build=rescue renderer=pixman" || fail "ctl stats after the takeover: $(ctl over stats)"
+echo "ok: $(grep -o 'a present has not returned for [0-9]* ms' "$RUN/over.log"), the rescue build (pid $pid) draws"
 quit over
 
 echo "== CONFIG.TXT bitscomp=gles (CRLF): the hand-over adds --renderer gles"
 printf 'loglevel=warn\r\nbitscomp=gles\r\n' >"$RUN/gles.txt"
 desktop conf "$BIN" --config "$RUN/gles.txt" --gpu-exe "$GPU"
-pid=$(cat "$RUN/conf.pid")
+pid=$(start_pid conf)
 grep -q "build gpu, renderer gles (CONFIG.TXT bitscomp=gles): handing over to $GPU" "$RUN/conf.log" || fail "conf: $(head -5 "$RUN/conf.log")"
 grep -q " build=gpu renderer=gles egl=loadable$" "$RUN/conf.log" || fail "conf start line: $(grep WAYLAND_DISPLAY "$RUN/conf.log")"
 tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q -- "--renderer gles" || fail "conf: no --renderer gles in $(tr '\0' ' ' <"/proc/$pid/cmdline")"

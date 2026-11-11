@@ -1,6 +1,6 @@
 //! Input on V2 without udev or libinput (WY-1a decision, notes wy-WY-1a.md): bitscomp opens `/dev/input/event*`
-//! itself, probes each with EVIOCGBIT/EVIOCGABS (linux-6.6/drivers/input/evdev.c `evdev_do_ioctl`), grabs it
-//! (EVIOCGRAB: the VT gets nothing while bitscomp runs), reads whole `struct input_event`s and turns them into
+//! itself, probes each with EVIOCGBIT/EVIOCGABS (linux-6.6/drivers/input/evdev.c `evdev_do_ioctl`), grabs keyboards
+//! and pointers (EVIOCGRAB: the VT gets nothing while bitscomp runs; PK-L1c: pads are never grabbed), reads whole `struct input_event`s and turns them into
 //! `InputEvent`s through `evdev_map`. Hot plug: a node that goes away answers ENODEV (its held keys are released,
 //! the source removed); new nodes are found by an inotify watch on `/dev/input` (`hotplug`; once a second where
 //! inotify is missing). Timestamps are asked on CLOCK_MONOTONIC (EVIOCSCLOCKID), bitscomp's one
@@ -17,7 +17,7 @@ use std::rc::Rc;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 
-use super::evdev_map::{Caps, Decoder, EV_ABS, EV_KEY, EV_REL, KEY_MAX, Out, Range, SYN_DROPPED, moved, placed};
+use super::evdev_map::{Caps, Decoder, EV_ABS, EV_KEY, EV_REL, KEY_MAX, Out, Range, SYN_DROPPED, placed};
 use crate::input::{InputEvent, Origin};
 use crate::state::App;
 
@@ -121,9 +121,10 @@ fn scan(handle: &LoopHandle<'static, App>, seen: &Shared) -> usize {
             continue;
         }
         match open(&path) {
-            Ok(Some((file, caps, name, origin, why))) => {
+            Ok(Some(p)) => {
                 seen.borrow_mut().settle(key.clone());
-                if add(handle, file, caps, &name, (origin, why), key) {
+                let ok = if !p.caps.grabs() { add_pad(handle, p, key) } else { add(handle, p.file, p.caps, &p.name, (p.origin, p.why), key) };
+                if ok {
                     opened += 1;
                 }
             }
@@ -161,11 +162,26 @@ fn ioctl_val(fd: i32, req: u64, v: libc::c_ulong) -> std::io::Result<()> {
     if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
-/// Opens and probes one node: Some when it is a keyboard or pointer bitscomp uses.
+/// Opens and probes one node: Some when it is a keyboard, pointer or pad bitscomp uses.
 /// The device's origin and, for an injected one, why (the log line says it).
 type Counts = (Origin, String);
 
-fn open(path: &Path) -> std::io::Result<Option<(File, Caps, String, Origin, String)>> {
+/// What `open` learnt of a device bitscomp uses.
+struct Probe {
+    file: File,
+    caps: Caps,
+    name: String,
+    origin: Origin,
+    why: String,
+    /// PK-L1c, pads only: EV_KEY codes, vendor:product, the left stick's axes.
+    keys: Vec<u16>,
+    id: (u16, u16),
+    stick: (Option<crate::pad::Axis>, Option<crate::pad::Axis>),
+    /// The values of the stick's X/Y and the hat's X/Y when opened.
+    rest: (Option<i32>, Option<i32>, (i32, i32)),
+}
+
+fn open(path: &Path) -> std::io::Result<Option<Probe>> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
     // SAFETY: a plain open of a NUL-terminated path.
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
@@ -181,12 +197,15 @@ fn open(path: &Path) -> std::io::Result<Option<(File, Caps, String, Origin, Stri
     // A device without relative or absolute axes answers with zero bytes: the bitmaps stay empty.
     let _ = ioctl_buf(fd, eviocgbit(EV_REL, rel.len()), &mut rel);
     let _ = ioctl_buf(fd, eviocgbit(EV_ABS, abs.len()), &mut abs);
-    let range = |axis: u16| -> Option<Range> {
+    // struct input_absinfo: value, minimum, maximum, fuzz, flat, resolution.
+    let absfull = |axis: u16| -> Option<(crate::pad::Axis, i32)> {
         let mut info = [0u8; 24];
         ioctl_buf(fd, eviocgabs(axis), &mut info).ok()?;
         let at = |i: usize| i32::from_le_bytes([info[i], info[i + 1], info[i + 2], info[i + 3]]);
-        Some(Range { min: at(4), max: at(8) })
+        Some((crate::pad::Axis { min: at(4), max: at(8), flat: at(16) }, at(0)))
     };
+    let absinfo = |axis: u16| absfull(axis).map(|(a, _)| a);
+    let range = |axis: u16| absinfo(axis).map(|a| Range { min: a.min, max: a.max });
     let ranges = range(0).zip(range(1));
     let caps = Caps::from_bits(&keys, &rel, &abs, ranges);
     let mut nb = [0u8; 128];
@@ -221,7 +240,17 @@ fn open(path: &Path) -> std::io::Result<Option<(File, Caps, String, Origin, Stri
             (Origin::Injected, format!("no EVIOCGID ({e}{})", if old { ", the kernel lacks it" } else { "" }))
         }
     };
-    Ok(Some((file, caps, name, origin, why)))
+    let has = |a: u16| abs.get(a as usize / 8).is_some_and(|b| b & (1 << (a % 8)) != 0);
+    let (pad_keys, stick, rest) = if caps.pad {
+        let (x, y) = (has(0).then(|| absfull(0)).flatten(), has(1).then(|| absfull(1)).flatten());
+        let hat = |a: u16| has(a).then(|| absfull(a)).flatten().map_or(0, |(_, v)| v);
+        let rest = (x.map(|(_, v)| v), y.map(|(_, v)| v), (hat(crate::pad::ABS_HAT0X), hat(crate::pad::ABS_HAT0Y)));
+        (super::evdev_map::codes(&keys), (x.map(|(a, _)| a), y.map(|(a, _)| a)), rest)
+    } else {
+        (Vec::new(), (None, None), (None, None, (0, 0)))
+    };
+    let ids = (u16::from_le_bytes([id[2], id[3]]), u16::from_le_bytes([id[4], id[5]]));
+    Ok(Some(Probe { file, caps, name, origin, why, keys: pad_keys, id: ids, stick, rest }))
 }
 
 fn add(handle: &LoopHandle<'static, App>, file: File, caps: Caps, name: &str, (origin, why): Counts, key: Key) -> bool {
@@ -262,17 +291,62 @@ fn add(handle: &LoopHandle<'static, App>, file: File, caps: Caps, name: &str, (o
     r.is_ok()
 }
 
+/// PK-L1c: a pad is read but never grabbed (Steam, games and SDL read the same node; the kernel gives every
+/// ungrabbed reader every event, crates/console/src/evdev.rs). Its raw events go to `App::pad_feed`; its state
+/// lives in `App::pads` (registered on the loop's next turn, or by its first events, whichever comes first).
+fn add_pad(handle: &LoopHandle<'static, App>, p: Probe, key: Key) -> bool {
+    let fd = p.file.as_raw_fd();
+    let counts = match p.origin {
+        Origin::Injected => format!("counts as injected ({})", p.why),
+        Origin::Physical => match ioctl_int(fd, EVIOC_BITSOS_PHYSICAL, 1) {
+            Ok(()) => "real, written events filtered".to_string(),
+            Err(e) => format!("real; the kernel does not filter written events ({e})"),
+        },
+    };
+    let label = key.0.display().to_string();
+    let id = crate::pad_app::next_id();
+    let mut dev = crate::pad_app::PadDev::new(&label, &p.name, p.id, &p.keys, p.stick, p.origin);
+    dev.pad.seed(p.rest.0, p.rest.1, p.rest.2);
+    eprintln!("bitscomp: input: {label} \"{}\" pad (not grabbed: programs read it too), {counts}", p.name);
+    let plug = Rc::new(RefCell::new(Some(dev)));
+    let (first, unread) = (plug.clone(), plug.clone());
+    let r = handle.insert_source(Generic::new(p.file, Interest::READ, Mode::Level), move |_, _, app| {
+        if let Some(d) = plug.borrow_mut().take() {
+            app.pad_plug(id, d);
+        }
+        let mut evs = Vec::new();
+        let alive = read_some(fd, &mut |ty, code, value| evs.push((ty, code, value)), &mut app.stats);
+        app.pad_feed(id, &evs);
+        if alive {
+            return Ok(PostAction::Continue);
+        }
+        app.pad_gone(id);
+        Ok(PostAction::Remove)
+    });
+    if let Err(e) = r {
+        unread.borrow_mut().take();
+        eprintln!("bitscomp: input: {label}: pad not read: {e}");
+        return false;
+    }
+    handle.insert_idle(move |app| {
+        if let Some(d) = first.borrow_mut().take() {
+            app.pad_plug(id, d);
+        }
+    });
+    true
+}
+
 /// Reads what the device has, at most `MAX_READS` times; false when it is gone (ENODEV, end of file, any other
 /// error), and then every key and button it held is released in `out`.
 pub fn pump(fd: i32, dec: &mut Decoder, out: &mut Vec<Out>, stats: &mut crate::stats::Stats) -> bool {
-    let alive = read_some(fd, dec, out, stats);
+    let alive = read_some(fd, &mut |ty, code, value| dec.feed(ty, code, value, out), stats);
     if !alive {
         dec.release_all(out);
     }
     alive
 }
 
-fn read_some(fd: i32, dec: &mut Decoder, out: &mut Vec<Out>, stats: &mut crate::stats::Stats) -> bool {
+fn read_some(fd: i32, feed: &mut dyn FnMut(u16, u16, i32), stats: &mut crate::stats::Stats) -> bool {
     let mut buf = [0u8; 24 * 64];
     for _ in 0..MAX_READS {
         // SAFETY: `buf` is valid for writes of its length; `fd` is the source's open file.
@@ -309,7 +383,7 @@ fn read_some(fd: i32, dec: &mut Decoder, out: &mut Vec<Out>, stats: &mut crate::
             if ty == 1 && value == 1 {
                 stats.key_presses += 1;
             }
-            dec.feed(ty, code, value, out);
+            feed(ty, code, value);
         }
     }
     true
@@ -325,14 +399,10 @@ fn mono_us() -> i64 {
 fn deliver(app: &mut App, o: Out, origin: Origin) {
     let mode = app.output.current_mode().map(|m| m.size).unwrap_or_default();
     let size = (mode.w, mode.h);
-    let s = app.theme.scale;
     let ev = match o {
         Out::Key { code, pressed } => InputEvent::Key { code, pressed },
         Out::Button { code, pressed } => InputEvent::Button { code, pressed },
-        Out::Rel { dx, dy } => {
-            let (x, y) = moved((app.pointer.x * s, app.pointer.y * s), (dx, dy), size);
-            InputEvent::Motion { x, y }
-        }
+        Out::Rel { dx, dy } => crate::lock::relative_event(app, dx, dy),
         Out::Abs { fx, fy } => {
             let (x, y) = placed(fx, fy, size);
             InputEvent::Motion { x, y }

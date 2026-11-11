@@ -1,0 +1,3 @@
+after exec = 9
+exec child exit 0
+undone after exec's end = 0

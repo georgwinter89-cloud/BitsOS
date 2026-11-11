@@ -92,6 +92,8 @@ pub struct EvdevSink {
     clamped: AtomicU64,
     /// `push_paced` waits here for a reader to take events (`reader_took`).
     room_wq: WaitQueue,
+    /// `make_room` has run.
+    roomy: AtomicBool,
 }
 
 /// Who holds a device's grab, and whether the device moves a pointer (`Caps::moves_pointer`: IN-6b's switch).
@@ -335,7 +337,37 @@ impl EvdevSink {
             last_ns: AtomicU64::new(0),
             clamped: AtomicU64::new(0),
             room_wq: WaitQueue::new(),
+            roomy: AtomicBool::new(false),
         }
+    }
+
+    /// Gives the ring and the look-back window their full length, once: at init for the machine's sink, else
+    /// before the first event. They never grow under their spin locks, where the heap can neither reclaim nor
+    /// fall back to single frames (a large block there brought the kernel down on the Mini-PC, 11.11.2026; see
+    /// net's `sock::unix::fill`). Without the memory they stay as long as they are and take what fits.
+    pub fn make_room(&self) {
+        if self.roomy.load(Ordering::Acquire) {
+            return;
+        }
+        let (mut ring, mut recent) = (VecDeque::new(), VecDeque::new());
+        if ring.try_reserve_exact(MAX_PENDING).is_err() || recent.try_reserve_exact(RECENT).is_err() {
+            return;
+        }
+        {
+            let mut q = self.q.lock();
+            if q.ring.capacity() < MAX_PENDING {
+                ring.extend(q.ring.drain(..));
+                core::mem::swap(&mut q.ring, &mut ring);
+            }
+        }
+        {
+            let mut r = self.recent.lock();
+            if r.capacity() < RECENT {
+                recent.extend(r.drain(..));
+                core::mem::swap(&mut *r, &mut recent);
+            }
+        }
+        self.roomy.store(true, Ordering::Release);
     }
 
     /// An event from MCP or a ktest (`injected`: one time per packet, the sink's clock when the caller's is
@@ -361,6 +393,7 @@ impl EvdevSink {
 
     /// Queues the event; true when it toggled a lock (the caller notifies, outside its own locks).
     fn push_quiet(&self, ev: InputEvent, src: Source) -> bool {
+        self.make_room();
         let edge = self.held.lock().apply(&ev);
         let (ev, dropped, behind) = {
             let mut q = self.q.lock();
@@ -371,11 +404,15 @@ impl EvdevSink {
                 _ => ev,
             };
             let (ev, behind) = monotonic(&self.last_ns, ev);
-            let full = q.ring.len() >= MAX_PENDING;
+            // Never beyond the length `make_room` gave it; a ring without memory keeps nothing and drops nothing.
+            let cap = q.ring.capacity().min(MAX_PENDING);
+            let full = cap > 0 && q.ring.len() >= cap;
             if full {
                 q.ring.pop_front();
             }
-            q.ring.push_back(ev);
+            if q.ring.len() < cap {
+                q.ring.push_back(ev);
+            }
             // IN-6b: the clients' lock is taken before the ring's is let go, so every reader gets the events in
             // the sink's order with the sink's times (two pushers on two CPUs used to reach a reader the other
             // way round, and each reader clamped and counted the same event again).
@@ -411,10 +448,12 @@ impl EvdevSink {
         {
             let mut r = self.recent.lock();
             let seq = self.seq.fetch_add(1, Ordering::AcqRel);
-            if r.len() >= RECENT {
+            if r.len() >= RECENT.min(r.capacity()) {
                 r.pop_front();
             }
-            r.push_back((seq, ev));
+            if r.len() < r.capacity() {
+                r.push_back((seq, ev));
+            }
         }
         self.wq.wake_all();
         let bit = match (edge, ev.kind, ev.code) {
@@ -436,7 +475,8 @@ impl EvdevSink {
     pub fn subscribe(&self, name: &'static str) -> Arc<Client> {
         let c = Arc::new(Client {
             name,
-            q: SpinLock::named("evdev.client", VecDeque::new()),
+            // Its full length now: `push` runs under the sink's spin locks (see `make_room`).
+            q: SpinLock::named("evdev.client", VecDeque::with_capacity(MAX_PENDING)),
             dropped: AtomicU64::new(0),
             resync: AtomicBool::new(false),
             wq: WaitQueue::new(),

@@ -44,6 +44,38 @@ class XJob(v.Job):
         self.n, self.text = int(m.group(1)), text
 
 
+class XRun(v.Job):
+    """A program of a tree's `run` that keeps running."""
+
+    def __init__(self, c, runner, *words, **env):
+        self.c = c
+        _, text, _ = call(c, "run", {"path": "/bin/sh", "args": [runner, *words], "env": dict(XENV, **env), "timeout_ms": 1500})
+        m = re.search(r"\(call (\d+)\)", text)
+        need(m is not None, f"{' '.join(words)} keeps running", text)
+        self.n, self.text = int(m.group(1)), text
+
+    def stop(self):
+        call(self.c, "stop", {"call": self.n})
+
+
+def xrunner(c, runner, *words, timeout_ms=30000):
+    _, text, _ = call(c, "run", {"path": "/bin/sh", "args": [runner, *words], "env": XENV, "timeout_ms": timeout_ms})
+    return text
+
+
+def stats(c):
+    return {k: int(x) for k, x in re.findall(r"\b(commits|dmabuf_failed)=(\d+)", ctl(c, "stats"))}
+
+
+def wait_title(c, title, secs=60):
+    end = time.time() + secs
+    while f'title="{title}"' not in ctl(c, "list"):
+        if time.time() > end:
+            raise SystemExit(f"RED: no window {title}\n{ctl(c, 'list')}")
+        time.sleep(0.5)
+    print(f"ok: {title} is a window of the desk", flush=True)
+
+
 def ctl(c, *words):
     _, text, _ = call(c, "run", {"path": "/bin/bitscomp", "args": ["ctl", "--socket", SOCK, *words], "env": v.ENV, "timeout_ms": 20000})
     return text
@@ -93,6 +125,9 @@ def main():
     need("X.Org version: 24.1.14" in t and "dimensions:" in t, "xdpyinfo answers (Xwayland 24.1.14)", t[-1500:])
     need(re.search(r"Composite|XFIXES", t) is not None and "XInputExtension" in t and "RANDR" in t,
          "xdpyinfo lists Composite, XFIXES, XInputExtension and RANDR", t[-2500:])
+    # WY-3b: this boot has no render node: the software Xwayland, as bitscomp says.
+    comp.wait_for(r"xwayland: this start in software: ", "no render node: this start is in software")
+    need("    DRI3\n" not in t, "xdpyinfo lists no DRI3 without a node", t[-2500:])
 
     t = xrun(c, "xrandr")
     m = re.search(r"BITS-1 connected (\d+)x(\d+)\+0\+0", t)
@@ -144,6 +179,21 @@ def main():
         time.sleep(0.5)
     t = xrun(c, "xclip", "-selection", "clipboard", "-o")
     need("Grüße von Wayland" in t, "xclip -o reads what wl-copy copied (Wayland -> X11)", t[-1500:])
+
+    # WY-3b: without a node an X11 Vulkan client takes lavapipe's software path and still gets its window; a GL client is
+    # told there is no GL by the server (no provider without glamor) and does not hang it.
+    before = stats(c)
+    cube = XRun(c, "/boot/BITSOS2/mesa/run", "vkcube", "--wsi", "xcb", MESA_VK_DRIVERS="lvp_icd")
+    wait_title(c, "Vkcube X11")
+    time.sleep(3)
+    after = stats(c)
+    need(after["commits"] > before["commits"] + 3 and after["dmabuf_failed"] == before["dmabuf_failed"],
+         f"vkcube --wsi xcb on lavapipe presents without a node ({before} -> {after})", cube.poll()[-1500:])
+    cube.stop()
+    t = xrunner(c, "/boot/BITSOS2/xwayland/run", "glxinfo", "-B")
+    print("glxinfo without a node:", " | ".join(t.splitlines()[-4:])[:300], flush=True)
+    need("ended:" in t, "glxinfo ends without a node", t[-1500:])
+    need("X.Org version: 24.1.14" in xrun(c, "xdpyinfo"), "Xwayland still answers after the GL client")
 
     # Close through bitscomp: the focused window (xterm) gets WM_DELETE_WINDOW and ends.
     ctl(c, "close")

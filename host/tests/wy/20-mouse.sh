@@ -15,8 +15,8 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-$RUN}
 unset DISPLAY
 
 if ! command -v foot >/dev/null; then
-    echo "SKIP: foot is not installed"
-    exit 0
+    echo "FAIL: foot is not installed (a test that cannot do its work is FAIL)"
+    exit 1
 fi
 
 echo "== build"

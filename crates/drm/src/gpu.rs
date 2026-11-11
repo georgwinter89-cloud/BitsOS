@@ -1,5 +1,5 @@
 //! DR-4: the `GpuDevice` trait between the amdgpu user API (INFO, CTX; `info`, `ctx`) and a GPU behind it: the
-//! fake now (`fake::FakeGpu` with the 780M's captured profile), the amdgpu hardware backend later (GX-8). The
+//! fake (`fake::FakeGpu` with the 780M's captured profile) or the amdgpu hardware backend (`amdgpu::hw`, GX-8). The
 //! uAPI code reads the chip's fixed facts from a `ChipProfile` and the changing state (memory, counters, clocks,
 //! registers) through the trait; a backend answers in the units Linux 6.6 hands to user space.
 
@@ -203,6 +203,10 @@ pub trait GpuDevice: Send + Sync {
     fn dev_info(&self) -> drm_amdgpu_info_device {
         self.profile().dev_info
     }
+    /// GX-8a: `AMDGPU_INFO_FW_VERSION`; a backend answers what it really loaded.
+    fn firmware(&self, fw_type: u32, index: u32) -> Option<Firmware> {
+        self.profile().firmware(fw_type, index).copied()
+    }
     /// Rings of HW IP type `ty` that are ready.
     fn rings_ready(&self, ty: u32) -> u32 {
         self.profile().hw_ip(ty).map(|h| h.rings).unwrap_or(0)
@@ -236,8 +240,10 @@ pub trait GpuDevice: Send + Sync {
     fn bo_memory(&self, place: BoPlace, pages: u64, align_pages: u32, wc: bool, owner: &Arc<PinOwner>) -> Result<Arc<dyn Exporter>, Errno>;
     /// DR-7: the page tables of a new client VM (`amdgpu_vm_init`), 48-bit, empty. Dropping the last `Arc` is
     /// `amdgpu_vm_fini`: the backend frees the tables and lets go of every memory its mappings hold once no job
-    /// of the VM runs any more. Without a VM backend the uAPI answers GEM_VA with this error.
-    fn vm_create(&self) -> Result<Arc<dyn GpuVm>, Errno> {
+    /// of the VM runs any more. Without a VM backend the uAPI answers GEM_VA with this error. GX-8a: `client` is the
+    /// file's client id, what `GpuShared::reserved_vmid_owner` names (a backend gives that file's jobs the reserved
+    /// VMID).
+    fn vm_create(&self, _client: u64) -> Result<Arc<dyn GpuVm>, Errno> {
         Err(linux::errno::ENODEV)
     }
     /// DR-8: queues a command submission (`drm_sched_entity_push_job` for each job) under the contract of
@@ -299,9 +305,9 @@ pub struct VmUpdate {
     pub fence: Option<Arc<crate::fence::Fence>>,
 }
 
-/// DR-7: a client VM's page tables in a backend (the fake builds GFX 11 tables in memory; GX-8 writes them by
-/// SDMA). Like every `GpuDevice` call it answers at once: a backend that needs the GPU queues the job and hands
-/// back its fence. The uAPI calls it with none of its own locks held but the file's VM update lock, so ops of
+/// DR-7: a client VM's page tables in a backend (the fake builds GFX 11 tables in memory; GX-8a writes them in the
+/// carve-out with the CPU). Like every `GpuDevice` call it answers at once: a backend that needs the GPU queues the
+/// job and hands back its fence. The uAPI calls it with none of its own locks held but the file's VM update lock, so ops of
 /// one VM run in the order the ioctls queued them.
 pub trait GpuVm: Send + Sync {
     /// Runs `ops` in order and stops at the first one it cannot do.
@@ -310,8 +316,7 @@ pub trait GpuVm: Send + Sync {
     /// of this VM after this one (Linux: the page-table job syncs to the VM root's fences, `amdgpu_vm_clear_freed`
     /// with AMDGPU_SYNC_EQ_OWNER): an UNMAP does not pull the memory away under a job queued before it. The
     /// answer still comes at once; `fence` signals when the ops ran. The default ignores `deps` (right only for a
-    /// backend whose page-table writes queue behind the VM's jobs anyway); the fake defers, GX-8 makes them
-    /// dependencies of its SDMA job.
+    /// backend whose page-table writes queue behind the VM's jobs anyway); the fake and GX-8a defer.
     fn update_after(&self, ops: &[PtOp], deps: &[Arc<crate::fence::Fence>]) -> VmUpdate {
         let _ = deps;
         self.update(ops)
@@ -322,6 +327,10 @@ pub trait GpuVm: Send + Sync {
     }
     /// The fake's VM (tests read its translations and tables).
     fn as_fake(&self) -> Option<&crate::fake_vm::FakeVm> {
+        None
+    }
+    /// GX-8a: the backend's own VM (its jobs and its tests need the concrete type).
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }
 }

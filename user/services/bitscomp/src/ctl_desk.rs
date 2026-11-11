@@ -7,6 +7,7 @@
 //! pointer at its edge does) | bars (the two side bars: docked, folded or revealed)
 //! theme (the applied theme in one line) | set KEY VALUE | unset KEY (a local settings value, as if settingsd sent it)
 //! start (show the start page) | session (what would be saved) | restore
+//! library (PK-L1a: the program index, one line per program) | library search QUERY (best match first)
 
 use crate::address::Where;
 use crate::desk::Ring;
@@ -136,6 +137,22 @@ pub fn execute(app: &mut App, words: &[&str], line: &str) -> Option<Result<Strin
             app.session_restore();
             Ok("ok".into())
         }
+        // PK-L1a: the program index, A-Z or best match first (`id\tname\tsource\ticon-state\texec` per line).
+        "library" => match words.get(1).copied() {
+            None => Ok(crate::library::Index::lines(&app.library.matches(""))),
+            Some("search") if words.len() > 2 => Ok(crate::library::Index::lines(&app.library.matches(&rest(2)))),
+            // PK-L1b: the overlay, for tests and the desk's check over MCP.
+            Some("open") => {
+                app.library_open("ctl");
+                Ok(app.library_state())
+            }
+            Some("close") => {
+                app.library_close("ctl");
+                Ok(app.library_state())
+            }
+            Some("state") => Ok(app.library_state()),
+            _ => Err("library [search QUERY | open | close | state]".into()),
+        },
         _ => return None,
     };
     Some(r)

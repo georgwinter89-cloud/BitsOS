@@ -491,6 +491,25 @@ fn priorities_decide_the_order() {
     assert_eq!(prios, [Interactive, Normal, Background]);
 }
 
+/// VS-H CR 5: a stacked device's timeout stays a timeout on its way through a `Disk`, and the disk can tell it from
+/// a media error; programs see EIO for both.
+#[test]
+fn a_timeout_stays_apart_from_a_media_error() {
+    assert_eq!(BlockError::from_dev(DevError::Timeout), BlockError::Timeout);
+    assert_eq!(BlockError::Timeout.errno(), uapi::errno::EIO);
+    let r = ram(1024, 64);
+    let d = open(&r);
+    r.inject(Fault { write: false, lba: 13, blocks: 1, error: DevError::Timeout, times: Some(1) });
+    assert_eq!(submit_read(&d, 13, 1, Normal).wait().err(), Some(BlockError::Timeout));
+    assert!(d.take_timed_out(), "the disk tells a timeout");
+    assert!(!d.take_timed_out(), "and forgets it");
+    r.inject(Fault { write: false, lba: 14, blocks: 1, error: DevError::Timeout, times: Some(1) });
+    assert!(submit_read(&d, 14, 1, Normal).wait().is_err());
+    r.inject(Fault { write: false, lba: 15, blocks: 1, error: DevError::Io, times: Some(1) });
+    assert_eq!(submit_read(&d, 15, 1, Normal).wait().err(), Some(BlockError::Io));
+    assert!(!d.take_timed_out(), "the last failure was a media error");
+}
+
 #[test]
 fn an_error_in_a_merged_batch_fails_only_its_request() {
     let r = ram(1024, 64);
@@ -649,4 +668,238 @@ fn read_pages_scatters_the_same_bytes_as_page_by_page_reads_in_fewer_requests() 
     // A run that starts past the end reads nothing.
     f.read_pages(8, &run[..1]).unwrap();
     assert_eq!(reads(&r) - base, by_page + by_run);
+}
+
+#[test]
+fn the_named_boot_partition_is_the_one_esp_a_window_disk_may_hold() {
+    use crate::gpt::window::{Key, Why, check_table};
+    use alloc::string::String;
+    // The Lexar since 6.11.2026: Windows data, BitsOS's boot partition made in Windows, the BitsOS window.
+    let parts = [(table::GUID_MS_BASIC_DATA, 2048, 4095), (table::GUID_EFI_SYSTEM, 4096, 5119), (table::GUID_MS_BASIC_DATA, 5120, 8000)];
+    let img = testimg::gpt(512, 8192, &parts);
+    let s = scan_of(&img, 512);
+    let g = s.gpt.as_ref().unwrap();
+    let key_of = |n: usize| Key { serial: String::from("LEXAR"), guid: g.entries[n].unique, first: g.entries[n].first, blocks: g.entries[n].last - g.entries[n].first + 1 };
+    let (data, esp) = (key_of(2), key_of(1));
+    let check = |e: Option<&Key>| check_table(&data.guid, 8192, &s, &data, e).map(|e| e.number);
+    let Err(Why::Efi(text)) = check(None) else { panic!("no nvme_boot: refused as before") };
+    assert!(text.ends_with(&alloc::format!("nvme_boot={} names it if it is BitsOS's own", esp.render().unwrap())), "{text}");
+    assert_eq!(check(Some(&esp)), Ok(3), "the named one is allowed");
+    for bad in [
+        Key { serial: String::from("OTHER"), ..esp.clone() },
+        Key { guid: g.entries[0].unique, ..esp.clone() },
+        Key { first: esp.first + 1, ..esp.clone() },
+        Key { blocks: esp.blocks - 1, ..esp.clone() },
+        data.clone(),
+    ] {
+        assert!(matches!(check(Some(&bad)), Err(Why::Efi(_))), "{bad:?}");
+    }
+    // A second ESP the key does not name.
+    let two = [(table::GUID_EFI_SYSTEM, 2048, 4095), (table::GUID_EFI_SYSTEM, 4096, 5119), (table::GUID_MS_BASIC_DATA, 5120, 8000)];
+    let s2 = scan_of(&testimg::gpt(512, 8192, &two), 512);
+    let g2 = s2.gpt.as_ref().unwrap();
+    let k2 = |n: usize| Key { serial: String::from("LEXAR"), guid: g2.entries[n].unique, first: g2.entries[n].first, blocks: g2.entries[n].last - g2.entries[n].first + 1 };
+    assert!(matches!(check_table(&k2(2).guid, 8192, &s2, &k2(2), Some(&k2(1))), Err(Why::Efi(_))));
+}
+
+#[test]
+fn a_window_beside_the_named_boot_partition_writes_and_survives_a_rescan() {
+    use devmodel::block::BlockDevice;
+    let lexar = [(table::GUID_MS_BASIC_DATA, 2048, 4095), (table::GUID_EFI_SYSTEM, 4096, 5119), (table::GUID_MS_BASIC_DATA, 5120, 8000)];
+    let (win, esp) = ((5120, 2881), Some((4096, 1024)));
+    let b = [1u8; 512];
+    let d = open(&Arc::new(RamDisk::from_image("lexar", 512, testimg::gpt(512, 8192, &lexar), false)));
+    d.arm_window(win.0, win.1, esp);
+    let port = d.part_port(win.0, win.1);
+    port.write_blocks(win.0, &b, false, Normal).unwrap();
+    d.rescan();
+    assert_eq!(d.window(), Some(win), "the named ESP does not end the window");
+    port.write_blocks(win.0 + 1, &b, false, Normal).unwrap();
+    assert!(d.part_port(4096, 1024).write_blocks(4096, &b, false, Normal).is_err(), "the ESP itself takes no write");
+    assert!(d.write(4096, &b, false, Normal).is_err(), "nor the whole disk");
+    // Armed without naming it, or naming another place: refused, and a rescan ends the window.
+    for other in [None, Some((4096, 1023)), Some((2048, 2048))] {
+        d.arm_window(win.0, win.1, other);
+        assert!(port.write_blocks(win.0, &b, false, Normal).is_err(), "{other:?}");
+        d.rescan();
+        assert_eq!(d.window(), None, "{other:?}");
+    }
+    // A second ESP on the disk refuses even with the first one named.
+    let two = [(table::GUID_EFI_SYSTEM, 2048, 4095), (table::GUID_EFI_SYSTEM, 4096, 5119), (table::GUID_MS_BASIC_DATA, 5120, 8000)];
+    let d = open(&Arc::new(RamDisk::from_image("two", 512, testimg::gpt(512, 8192, &two), false)));
+    d.arm_window(win.0, win.1, esp);
+    assert!(d.part_port(win.0, win.1).write_blocks(win.0, &b, false, Normal).is_err());
+}
+
+/// The controller's side in the tests: what it was told, and whether it agrees to open.
+struct Lower {
+    agree: core::sync::atomic::AtomicBool,
+    open: ksync::SpinLock<Option<(u64, u64)>>,
+}
+impl crate::disk::LowerWindow for Lower {
+    fn open_boot(&self, first: u64, blocks: u64) -> bool {
+        let ok = self.agree.load(core::sync::atomic::Ordering::Relaxed);
+        if ok {
+            *self.open.lock() = Some((first, blocks));
+        }
+        ok
+    }
+    fn close_boot(&self) {
+        *self.open.lock() = None;
+    }
+}
+
+/// The Lexar booted from its ESP (6.11.2026): MSR, Windows, the ESP nvme_boot= names, the bitsvol window.
+const LEXAR: [([u8; 16], u64, u64); 4] =
+    [(table::GUID_MS_RESERVED, 34, 2047), (table::GUID_MS_BASIC_DATA, 2048, 4095), (table::GUID_EFI_SYSTEM, 4096, 5119), (table::GUID_MS_BASIC_DATA, 5120, 8000)];
+
+#[test]
+fn the_boot_esp_gets_a_second_window_of_its_own() {
+    use devmodel::block::BlockDevice;
+    let (win, esp) = ((5120, 2881), (4096, 1024));
+    let b = [1u8; 512];
+    let r = Arc::new(RamDisk::from_image("lexar", 512, testimg::gpt(512, 8192, &LEXAR), false));
+    let d = Disk::open(r.clone(), DiskKind::Nvme, Dispatch::Inline).unwrap();
+    let lower = Arc::new(Lower { agree: core::sync::atomic::AtomicBool::new(false), open: ksync::SpinLock::new(None) });
+    d.set_lower(lower.clone());
+    assert_eq!(d.open_boot_window(esp.0, esp.1), Err("no nvme_data= window is armed on this disk"));
+    d.arm_window(win.0, win.1, Some(esp));
+    let (eport, dport) = (d.part_port(esp.0, esp.1), d.part_port(win.0, win.1));
+    assert!(eport.info().read_only, "shut until fs-fat opens it");
+    assert!(eport.write_blocks(4096 + 10, &b, false, Normal).is_err());
+    assert!(d.open_boot_window(esp.0, esp.1 - 1).is_err(), "only exactly the named ESP");
+    assert!(d.open_boot_window(2048, 2048).is_err(), "never a Windows partition");
+    assert_eq!(d.open_boot_window(esp.0, esp.1), Err("the controller did not open the boot partition's window"));
+    assert_eq!(d.boot_window(), None);
+    lower.agree.store(true, core::sync::atomic::Ordering::Relaxed);
+    d.open_boot_window(esp.0, esp.1).unwrap();
+    assert_eq!((d.boot_window(), *lower.open.lock()), (Some(esp), Some(esp)));
+    assert!(!eport.info().read_only);
+    r.record();
+    eport.write_blocks(4096, &b, false, Normal).unwrap();
+    eport.write_blocks(5119, &b, false, Normal).unwrap();
+    dport.write_blocks(5120, &b, false, Normal).unwrap();
+    dport.write_blocks(8000, &b, false, Normal).unwrap();
+    // Around and between: the last Windows block, the first data block through the ESP's port, both across the edge.
+    for (lba, n) in [(4095u64, 1u64), (4095, 2), (5120, 1), (5119, 2), (0, 1), (1, 1)] {
+        assert!(eport.write_blocks(lba, &vec![1u8; 512 * n as usize], false, Normal).is_err(), "ESP port {lba}+{n}");
+    }
+    for (lba, n) in [(5119u64, 1u64), (5119, 2), (4096, 1), (8001, 1)] {
+        assert!(dport.write_blocks(lba, &vec![1u8; 512 * n as usize], false, Normal).is_err(), "data port {lba}+{n}");
+    }
+    for (first, blocks) in [(34u64, 2014u64), (2048, 2048)] {
+        assert!(d.part_port(first, blocks).write_blocks(first, &b, false, Normal).is_err(), "Windows partition at {first}");
+    }
+    for lba in [0u64, 1, 2047, 2048, 4096, 5120, 8191] {
+        assert!(d.write(lba, &b, false, Normal).is_err(), "the whole disk at {lba}");
+    }
+    let wrote: Vec<u64> = r.calls().iter().filter(|c| matches!(c.op, CallOp::Write { .. })).map(|c| c.lba).collect();
+    assert_eq!(wrote, [4096, 5119, 5120, 8000], "nothing else reached the device");
+    // The table goes on matching: both stay. Disarming closes both layers.
+    d.rescan();
+    assert_eq!((d.window(), d.boot_window()), (Some(win), Some(esp)));
+    d.disarm_window();
+    assert_eq!((d.boot_window(), *lower.open.lock()), (None, None));
+    assert!(eport.write_blocks(4096, &b, false, Normal).is_err());
+    // A table that no longer names the ESP: a rescan ends both windows.
+    d.arm_window(win.0, win.1, Some(esp));
+    d.open_boot_window(esp.0, esp.1).unwrap();
+    let moved = [LEXAR[0], LEXAR[1], (table::GUID_EFI_SYSTEM, 4096, 5000), LEXAR[3]];
+    r.write_blocks(0, &testimg::gpt(512, 8192, &moved)[..34 * 512], false, Normal).unwrap();
+    d.rescan();
+    assert_eq!((d.window(), d.boot_window(), *lower.open.lock()), (None, None, None));
+}
+
+/// /boot's FAT gate sits on the ESP's own stacked disk: nvme_data's partition, stacked on the same namespace, never
+/// asks it.
+#[test]
+fn the_boot_volumes_gate_is_its_partitions_alone() {
+    let (win, esp) = ((5120, 2881), (4096, 1024));
+    let b = [1u8; 512];
+    let r = Arc::new(RamDisk::from_image("lexar", 512, testimg::gpt(512, 8192, &LEXAR), false));
+    let d = Disk::open(r, DiskKind::Nvme, Dispatch::Inline).unwrap();
+    d.arm_window(win.0, win.1, Some(esp));
+    d.open_boot_window(esp.0, esp.1).unwrap();
+    let stack = |first, blocks, n| {
+        let p = crate::gpt::Partition::new(Arc::new(d.part_port(first, blocks)), "nvme0n1", first, blocks, n, "x").unwrap();
+        Disk::open(Arc::new(p), DiskKind::Stacked, Dispatch::Inline).unwrap()
+    };
+    let (boot, data) = (stack(esp.0, esp.1, 3), stack(win.0, win.1, 4));
+    boot.add_gate(Arc::new(Never));
+    assert!(boot.write(10, &b, false, Normal).is_err(), "the boot partition's own gate refuses");
+    data.write(10, &b, false, Normal).unwrap();
+    data.write(win.1 - 1, &b, false, Normal).unwrap();
+    assert!(data.write(win.1, &b, false, Normal).is_err(), "past the partition");
+    let open = stack(esp.0, esp.1, 3);
+    open.write(0, &b, false, Normal).unwrap();
+    assert!(!open.dev_info().read_only);
+}
+
+/// A hybrid MBR entry (0Bh, not EFh) mirroring the ESP after the window was armed: its stacked disk's port would be
+/// the boot window's, so the boot window stays shut.
+#[test]
+fn the_boot_window_needs_the_esps_range_to_be_one_partitions() {
+    use devmodel::block::BlockDevice;
+    let (win, esp) = ((5120, 2881), (4096, 1024));
+    let r = Arc::new(RamDisk::from_image("lexar", 512, testimg::gpt(512, 8192, &LEXAR), false));
+    let d = Disk::open(r.clone(), DiskKind::Nvme, Dispatch::Inline).unwrap();
+    d.arm_window(win.0, win.1, Some(esp));
+    let mut mbr = d.read_vec(0, 512, Normal).unwrap();
+    let e = &mut mbr[446 + 16..446 + 32];
+    e[4] = 0x0B;
+    e[8..12].copy_from_slice(&(esp.0 as u32).to_le_bytes());
+    e[12..16].copy_from_slice(&(esp.1 as u32).to_le_bytes());
+    r.write_blocks(0, &mbr, false, Normal).unwrap();
+    d.rescan();
+    assert_eq!(d.scan().parts.iter().filter(|p| (p.0, p.1) == esp).count(), 2, "the scan lists the mirror");
+    assert_eq!(d.open_boot_window(esp.0, esp.1), Err("not exactly one partition of the disk has the boot partition's range"));
+    assert_eq!(d.boot_window(), None);
+}
+
+#[test]
+fn frame_writes_through_a_port_meet_the_same_window_rules_per_request() {
+    // BL-2 fix: write_frames through PartPort goes through `check_port` per request, with the same answer as
+    // write_blocks, and a refused write never reaches the device (NV-2p, the boot window, foreign ESPs).
+    use crate::frames::HeapFrames;
+    use devmodel::block::{BlockDevice, IoBuf};
+    let (win, esp) = ((5120, 2881), (4096, 1024));
+    let fr = |n: u64| IoBuf::new(Arc::new(HeapFrames::new(vec![7u8; 512 * n as usize])));
+    let r = Arc::new(RamDisk::from_image("lexar", 512, testimg::gpt(512, 8192, &LEXAR), false));
+    let d = Disk::open(r.clone(), DiskKind::Nvme, Dispatch::Inline).unwrap();
+    let lower = Arc::new(Lower { agree: core::sync::atomic::AtomicBool::new(true), open: ksync::SpinLock::new(None) });
+    d.set_lower(lower);
+    let (eport, dport) = (d.part_port(esp.0, esp.1), d.part_port(win.0, win.1));
+    let same = |p: &crate::disk::PartPort, lba: u64, n: u64, what: &str| {
+        let a = p.write_blocks(lba, &vec![7u8; 512 * n as usize], false, Normal);
+        let b = p.write_frames(lba, &fr(n), false, Normal);
+        assert_eq!(a, b, "{what}: {lba}+{n}");
+        b
+    };
+    r.record();
+    // Not armed: refused.
+    assert!(same(&dport, win.0, 1, "no window").is_err());
+    d.arm_window(win.0, win.1, Some(esp));
+    // The ESP is shut until its own window opens; outside and across the edges: refused.
+    assert!(same(&eport, 4096 + 10, 1, "shut ESP").is_err());
+    for (lba, n) in [(5119u64, 1u64), (5119, 2), (4096, 1), (8001, 1)] {
+        assert!(same(&dport, lba, n, "data port").is_err());
+    }
+    for (first, blocks) in [(34u64, 2014u64), (2048, 2048)] {
+        assert!(same(&d.part_port(first, blocks), first, 1, "Windows").is_err());
+    }
+    assert!(r.calls().iter().all(|c| !matches!(c.op, CallOp::Write { .. })), "nothing refused reached the device");
+    // Inside: both kinds land.
+    d.open_boot_window(esp.0, esp.1).unwrap();
+    assert!(same(&dport, 5120, 2, "inside").is_ok());
+    assert!(same(&eport, 5118, 2, "inside the ESP").is_ok());
+    for (lba, n) in [(4095u64, 2u64), (5119, 2)] {
+        assert!(same(&eport, lba, n, "ESP edge").is_err());
+    }
+    let wrote: Vec<(u64, u64)> = r.calls().iter().filter(|c| matches!(c.op, CallOp::Write { .. })).map(|c| (c.lba, c.blocks)).collect();
+    assert_eq!(wrote, [(5120, 2), (5120, 2), (5118, 2), (5118, 2)], "only the writes inside the windows");
+    // A foreign second ESP refuses frame writes too.
+    let two = [(table::GUID_EFI_SYSTEM, 2048, 4095), (table::GUID_EFI_SYSTEM, 4096, 5119), (table::GUID_MS_BASIC_DATA, 5120, 8000)];
+    let d2 = open(&Arc::new(RamDisk::from_image("two", 512, testimg::gpt(512, 8192, &two), false)));
+    d2.arm_window(win.0, win.1, Some(esp));
+    assert!(same(&d2.part_port(win.0, win.1), win.0, 1, "foreign ESP").is_err());
 }

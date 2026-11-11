@@ -252,7 +252,7 @@ impl HubFake {
         self.fault_vm(hub, 0, mc, write, cid, kind);
     }
 
-    fn fault_vm(&mut self, hub: Hub, vmid: u8, mc: u64, write: bool, cid: u32, kind: u32) {
+    pub(crate) fn fault_vm(&mut self, hub: Hub, vmid: u8, mc: u64, write: bool, cid: u32, kind: u32) {
         let old = self.get(hub, R::FaultStatus);
         let status = if old != 0 { old | 1 } else { kind | (cid & 0x1ff) << 9 | u32::from(write) << 18 | u32::from(vmid & 0xf) << 20 };
         if self.hostile == HubHostile::FaultUnrecorded {

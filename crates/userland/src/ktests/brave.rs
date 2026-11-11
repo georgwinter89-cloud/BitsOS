@@ -13,7 +13,7 @@
 //! - `ul.pkg.brave_sha`: the SHA-256 of the big files too (the brave binary alone is 328 MB: seconds in QEMU, longer
 //!   from a USB stick, hence its own test).
 
-use super::pkg::{Line, Sha256, TEST_STICK_ID, list, program_tree};
+use super::pkg::{Line, Sha256, TEST_STICK_ID, list, program_tree, tree_list};
 use super::{SEC, finish, need, read, scratch, start, start_as, text};
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -59,18 +59,19 @@ fn file_ok(l: &Line, hash: bool) -> TestResult {
 }
 
 /// The tree's list lines and the launcher's path (pkg::program_tree: a missing tree or launcher is a failure).
-fn tree_lines(l: &str) -> Result<(Vec<Line<'_>>, String), String> {
-    program_tree(l, TREE, "brave")
+fn tree_lines<'a>(l: &str, own: &'a str) -> Result<(Vec<Line<'a>>, String), String> {
+    program_tree(l, own, TREE, "brave")
 }
 
 /// Every file against the list (the big ones without SHA-256 here), the licences, the libraries, the fontconfig cache,
 /// then `brave --check` as uid 1000 and as root.
 fn brave() -> TestResult {
     let l = list()?;
-    let (tree, launcher) = tree_lines(&l)?;
+    let own = tree_list(TREE)?;
+    let (tree, launcher) = tree_lines(&l, &own)?;
     for name in ["README.txt", "brave.txt"] {
         let p = format!("{TREE}LICENSES/{name}");
-        kassert!(tree.iter().any(|e| e.path == p), "{p} is not in the image's list (stage again with scripts/stage-v2.sh)");
+        kassert!(tree.iter().any(|e| e.path == p), "{p} is not in the tree's list (stage again with scripts/stage-v2.sh)");
     }
     for pkg in ["gtk3", "nss", "noto-fonts", "noto-fonts-emoji", "ttf-dejavu", "fontconfig"] {
         let p = format!("{TREE}LICENSES/{pkg}/");
@@ -191,7 +192,8 @@ fn fontcache(tree: &[Line]) -> TestResult {
 /// The big files' SHA-256 (the others are hashed by `ul.pkg.brave`).
 fn brave_sha() -> TestResult {
     let l = list()?;
-    let (tree, _) = tree_lines(&l)?;
+    let own = tree_list(TREE)?;
+    let (tree, _) = tree_lines(&l, &own)?;
     let t0 = time::now_ns();
     let mut bytes = 0;
     for e in tree.iter().filter(|e| e.size > HASH_IN_MAIN) {
@@ -207,7 +209,8 @@ ktest!("ul.pkg.brave_sha", Program, brave_sha);
 /// was written, so the prebuilt one was valid (an invalid one makes fontconfig rescan and write its own).
 fn brave_fonts() -> TestResult {
     let l = list()?;
-    let (tree, _) = tree_lines(&l)?;
+    let own = tree_list(TREE)?;
+    let (tree, _) = tree_lines(&l, &own)?;
     fc_probe(&tree)
 }
 ktest!("ul.pkg.brave_fonts", Program, brave_fonts);

@@ -23,7 +23,7 @@ ktest!("sched.tick.only_when_busy", Safe, tick_only_when_busy);
 ktest!("sched.tick.remote_enqueue", Safe, tick_remote_enqueue);
 ktest!("sched.tick.slices_spinners", Safe, tick_slices_spinners);
 ktest!("sched.heartbeat.all_cpus", Safe, heartbeat_all_cpus);
-ktest!("sched.heartbeat.probe_halted", Safe, heartbeat_probe_halted);
+ktest!("sched.heartbeat.probe_halted", RunHw("sc/20-smp"), heartbeat_probe_halted);
 ktest!("sched.idle.record_if", Safe, idle_record);
 ktest!("sched.timer.sleep_beside_stuck_cpu", QemuOnly, sleep_beside_stuck_cpu);
 
@@ -231,7 +231,7 @@ fn wait_timeout_many() -> R {
 fn tick_only_when_busy() -> R {
     let n = crate::wait_cpus_online(5 * SEC);
     if n < 2 {
-        return ktest::skip("needs two CPUs (the tick of a busy CPU is fired by the polling one until CP-5)");
+        return ktest::fail("needs two CPUs (the tick of a busy CPU is fired by the polling one until CP-5)");
     }
     let target = *online().last().ok_or("no CPU")?;
     let home = *online().iter().find(|&&c| c != target).ok_or("no second CPU")?;
@@ -310,7 +310,12 @@ fn heartbeat_all_cpus() -> R {
         }
         kassert!(crate::heartbeat(c).unwrap_or(0) != hb, "CPU {c} did not answer a probe within 2 s");
     }
-    kassert!(!crate::probe_cpu(me), "probing the own CPU must be refused");
+    let refused = {
+        // The thread may have moved since `me` was read: the CPU it runs on now, held still for the call.
+        let _still = ksync::PreemptGuard::new();
+        !crate::probe_cpu(hal::percpu::this_cpu())
+    };
+    kassert!(refused, "probing the own CPU must be refused");
     let ran = Arc::new(AtomicUsize::new(0));
     let mut hs = Vec::new();
     for &c in &cpus {
@@ -349,11 +354,13 @@ fn idle_record() -> R {
     while !missing.is_empty() && time::now_ns() - t0 < 5 * SEC {
         // Sleeping lets this CPU go idle too.
         crate::sleep_ms(2);
-        let now = time::now_ns();
         let mut left = Vec::new();
         for &c in &missing {
             match crate::last_idle_entry(c) {
                 Some(e) if e.at_ns >= t0 => {
+                    // Read after the entry: that CPU may enter idle at any moment. A millisecond for vCPU clocks that
+                    // differ (seen in QEMU: 20 ns); a garbage time still fails.
+                    let now = time::now_ns() + 1_000_000;
                     kassert!(e.at_ns <= now, "CPU {c}: idle entry {} ns in the future", e.at_ns - now);
                     kassert!(e.interrupts_on, "CPU {c} went idle with interrupts off at {} ns", e.at_ns);
                     if e.halted_now && e.idle_now {
@@ -400,7 +407,7 @@ fn spinner(stop: Arc<AtomicBool>, count: Arc<AtomicU64>, limit_ns: u64) -> impl 
 fn tick_remote_enqueue() -> R {
     let n = crate::wait_cpus_online(5 * SEC);
     if n < 2 {
-        return ktest::skip("needs two CPUs (a busy CPU and one that places work on it)");
+        return ktest::fail("needs two CPUs (a busy CPU and one that places work on it)");
     }
     let target = *online().last().ok_or("no CPU")?;
     let home = *online().iter().find(|&&c| c != target).ok_or("no second CPU")?;
@@ -456,11 +463,11 @@ fn tick_remote_enqueue() -> R {
 /// tick only sets the switch request and the first spinner keeps the CPU).
 fn tick_slices_spinners() -> R {
     if !timers::tick_preempts() {
-        return ktest::skip("needs CP-5: the tick fires on its CPU by interrupt and the interrupt exit preempts");
+        return ktest::fail("needs CP-5: the tick fires on its CPU by interrupt and the interrupt exit preempts");
     }
     let n = crate::wait_cpus_online(5 * SEC);
     if n < 2 {
-        return ktest::skip("needs two CPUs (one to spin on, one to watch)");
+        return ktest::fail("needs two CPUs (one to spin on, one to watch)");
     }
     let target = *online().last().ok_or("no CPU")?;
     let home = *online().iter().find(|&&c| c != target).ok_or("no second CPU")?;
@@ -492,7 +499,7 @@ fn tick_slices_spinners() -> R {
 fn heartbeat_probe_halted() -> R {
     let n = crate::wait_cpus_online(5 * SEC);
     if n < 3 {
-        return ktest::skip("needs three CPUs (this one, the poll-duty one, and one that halts)");
+        return ktest::fail("needs three CPUs (this one, the poll-duty one, and one that halts)");
     }
     let me = current_cpu();
     let t0 = time::now_ns();
@@ -520,7 +527,7 @@ fn heartbeat_probe_halted() -> R {
     }
     klog::event!(Info, "sched", "ktest.probe_halted", cpus = n, probed = tried, answered = answered);
     if answered == 0 {
-        return ktest::skip("no CPU halted within 5 s");
+        return ktest::fail("no CPU halted within 5 s");
     }
     Ok(())
 }
@@ -535,7 +542,7 @@ static STUCK_SPINS: AtomicBool = AtomicBool::new(false);
 fn sleep_beside_stuck_cpu() -> R {
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let k = n - 1;
     let _pin = crate::pin_for_now(0).ok_or("CPU 0 is not online")?;

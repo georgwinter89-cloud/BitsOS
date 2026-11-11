@@ -25,6 +25,7 @@ pub mod loopback;
 pub mod netdev;
 pub mod netns;
 pub mod procnet;
+mod ring;
 pub mod route;
 pub mod sock;
 pub mod stack;
@@ -139,7 +140,8 @@ pub fn set_stack(s: &'static dyn KSocket) {
 
 static CONFIG: ksync::OnceRef<dyn Fn(&str) -> Option<alloc::string::String> + Sync> = ksync::OnceRef::new();
 
-/// A CONFIG.TXT value (None before `init` or when the key is missing). Keys read by NW: `net_test_url`.
+/// A CONFIG.TXT value (None before `init` or when the key is missing). Keys read by NW's tests: `net_test_url`,
+/// `net_test_host`, `net_test_sink`.
 pub fn config(key: &str) -> Option<alloc::string::String> {
     CONFIG.get().and_then(|f| f(key))
 }

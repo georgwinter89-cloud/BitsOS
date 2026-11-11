@@ -52,8 +52,15 @@ pub fn take(app: &mut App, comp: &dyn Picture, run: &mut Option<Run>) {
         hot: Duration::ZERO,
         paced: Duration::ZERO,
         due: crate::pacer::now(),
-        out: format!("bench size={w}x{h} n={n}"),
+        out: format!("bench size={w}x{h} n={n}{}", if comp.draws_direct() { " scanout=direct" } else { "" }),
     });
+}
+
+/// WY-17: frames that go straight to the scanout have nothing to copy: a `present` would flip to the older window.
+fn copy(comp: &dyn Picture, backend: &mut dyn Backend, rect: &[Rectangle<i32, Physical>]) {
+    if !comp.draws_direct() {
+        backend.present(comp, rect);
+    }
 }
 
 /// One turn's share of the bench; the answer goes out when the last set is done. Returns when the loop must wake
@@ -69,7 +76,7 @@ pub fn step(app: &mut App, comp: &dyn Picture, backend: &mut dyn Backend, run: &
     if r.hot_done < r.n {
         for _ in 0..HOT_PER_TURN.min(r.n - r.hot_done) {
             let t = Instant::now();
-            backend.present(comp, &rect);
+            copy(comp, backend, &rect);
             r.hot += t.elapsed();
             r.hot_done += 1;
         }
@@ -80,7 +87,7 @@ pub fn step(app: &mut App, comp: &dyn Picture, backend: &mut dyn Backend, run: &
         return Some(r.due);
     }
     let t = Instant::now();
-    backend.present(comp, &rect);
+    copy(comp, backend, &rect);
     r.paced += t.elapsed();
     r.paced_done += 1;
     r.due += period;

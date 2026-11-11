@@ -26,6 +26,8 @@ pub const KILL_WAIT_MS: u64 = 2_000;
 /// The desktop's user (bitscomp after it gave root up) and the one program of that user the socket serves.
 pub const DESKTOP_UID: u32 = 1000;
 pub const DESKTOP_EXE: &str = "/bin/bitscomp";
+/// WY-21: the desktop on the GPU is this program (bitscomp's gpu build, beside the Mesa tree on the stick).
+pub const DESKTOP_GPU_EXE: &str = "/boot/BITSOS2/bin/bitscomp-gpu";
 /// A request line is at most this long ("poweroff\n" and friends).
 pub const REQUEST_MAX: usize = 64;
 
@@ -108,12 +110,12 @@ pub fn parse_request(line: &str) -> Option<Request> {
     }
 }
 
-/// Who may ask over the socket: root, and the desktop user only through /bin/bitscomp (which asks only after
+/// Who may ask over the socket: root, and the desktop user only through bitscomp, either build (which asks only after
 /// real input, R8f; the kernel's judgement still decides a power-off).
 pub fn peer_allowed(uid: u32, exe: Option<&str>) -> Result<(), String> {
     match (uid, exe) {
         (0, _) => Ok(()),
-        (DESKTOP_UID, Some(DESKTOP_EXE)) => Ok(()),
+        (DESKTOP_UID, Some(DESKTOP_EXE | DESKTOP_GPU_EXE)) => Ok(()),
         (DESKTOP_UID, e) => Err(format!("user {DESKTOP_UID} asks only through {DESKTOP_EXE} (this is {})", e.unwrap_or("unknown"))),
         (u, _) => Err(format!("user {u} may not restart or power off")),
     }
@@ -170,6 +172,7 @@ mod tests {
         assert_eq!(parse_request("shutdown -h now"), None);
         assert_eq!(peer_allowed(0, None), Ok(()));
         assert_eq!(peer_allowed(1000, Some("/bin/bitscomp")), Ok(()));
+        assert_eq!(peer_allowed(1000, Some("/boot/BITSOS2/bin/bitscomp-gpu")), Ok(()));
         assert!(peer_allowed(1000, Some("/bin/sh")).is_err());
         assert!(peer_allowed(1000, None).is_err());
         assert!(peer_allowed(65534, Some("/bin/bitscomp")).is_err());

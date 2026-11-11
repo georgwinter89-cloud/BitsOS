@@ -68,13 +68,14 @@ def main():
     comp = compositor(c, "wayland-2")
     m = re.search(r"dmabuf: zwp_linux_dmabuf_v1 for renderer (\w+), main device (\d+):(\d+) \((\S+)\), (\d+) formats: (\S+)", comp.text)
     need(m is not None, "bitscomp advertises zwp_linux_dmabuf_v1", comp.text[-2500:])
-    need(m.groups()[:4] == (renderer, "226", "128", "/dev/dri/renderD128") and m.group(6) == "XR24:LINEAR",
-         f"renderer {renderer}, main device 226:128 (/dev/dri/renderD128), XRGB8888 LINEAR first", m.group(0))
+    # Both read by CPU here (Pixman, GLES on llvmpipe), WY-17b; the syncobj global stays on the node.
+    need(m.groups()[:4] == (renderer, "0", "0", "none") and m.group(6) == "XR24:LINEAR",
+         f"renderer {renderer}, no main device (0:0), XRGB8888 LINEAR first", m.group(0))
     sync = "syncobj: wp_linux_drm_syncobj_manager_v1 on /dev/dri/renderD128" in comp.text
     need(sync, "explicit sync on the fake GPU's render node", comp.text[-2500:])
 
     one = Job(c, "/bin/wyclient", ["--title", "one", "--pattern", "0", "--dmabuf"], sock="wayland-2")
-    one.wait_for(r"dmabuf feedback main_device=226:128 formats=\d+ first=XR24:LINEAR tranches=1", "the client read the feedback")
+    one.wait_for(r"dmabuf feedback main_device=0:0 formats=\d+ first=XR24:LINEAR tranches=1", "the client read the feedback")
     one.wait_for(r"dmabuf created 0", "the udmabuf buffer was taken")
     mapped(c, "wayland-2", "one")
     time.sleep(3)

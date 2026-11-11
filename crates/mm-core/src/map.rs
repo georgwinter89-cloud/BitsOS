@@ -122,9 +122,15 @@ pub fn blocks(s: u64, e: u64, k: u32) -> u64 {
     ((e - 1) >> k) - (s >> k) + 1
 }
 
-/// Metadata words for one region: the frame states plus a bitmap per order.
+/// Words of a region: frame metadata, the order bitmaps (below the pageblock order one per migrate type, W35
+/// MM-1), the pageblocks' types, and one owner word per frame (FS-STALL: the page cache's note of which cache page
+/// a frame holds, `Buddy::owner`). Must match `Buddy::build`'s layout.
 pub fn region_words(s: u64, e: u64) -> usize {
-    meta::words_for(e - s) + (0..=MAX_ORDER).map(|k| bitmap::words_for(blocks(s, e, k))).sum::<usize>()
+    let copies = |k: u32| if (k as usize) < crate::buddy::PB { crate::buddy::MIGRATE_TYPES } else { 1 };
+    meta::words_for(e - s)
+        + (0..=MAX_ORDER).map(|k| copies(k) * bitmap::words_for(blocks(s, e, k))).sum::<usize>()
+        + crate::buddy::side_words(s, e)
+        + (e - s) as usize
 }
 
 #[derive(Debug, Default)]

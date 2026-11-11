@@ -54,7 +54,7 @@ fn no_memory() -> TestResult {
     let s = st()?;
     if crate::netdev::devices().is_empty() {
         // Without a card no socket buffer is asked for (loopback only): nothing to refuse.
-        return ktest::skip("no network card (--net none)");
+        return ktest::fail("no network card (--net none)");
     }
     let me = Some(sched::current_id());
     let (before, injected) = (stack::NO_MEMORY.get(), stack::NO_MEMORY_INJECTED.get());

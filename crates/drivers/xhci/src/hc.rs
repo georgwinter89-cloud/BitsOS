@@ -33,14 +33,19 @@ pub const HCRST_QUIET_NS: u64 = MS;
 /// linux-6.6/drivers/usb/host/xhci.h:233).
 pub const PANIC_RESET_NS: u64 = 250 * MS;
 pub const BIOS_NS: u64 = 1000 * MS;
-/// A command waits at most this long, then the command ring is aborted (V1 `XH_CMD_MS`).
-pub const CMD_NS: u64 = 1000 * MS;
+/// A command waits at most this long, then the command ring is aborted: 5 s as Linux's XHCI_CMD_DEFAULT_TIMEOUT
+/// (linux-6.6/drivers/usb/host/xhci.h:1580). V1 had 1 s; US-R: a wedged stick's Address Device may take longer, and an
+/// abort for that would fail the reset that was about to bring it back.
+pub const CMD_NS: u64 = 5000 * MS;
 pub const ABORT_NS: u64 = 1000 * MS;
 /// How long a caller waits for its turn on the command ring (one command at a time, each bounded).
 pub const CMD_GATE_NS: u64 = 3 * CMD_NS + ABORT_NS;
 /// A waiter drains the event ring itself when the event thread has not answered within this time (early boot,
 /// a thread that is not scheduled); normally the event thread does it.
 pub const FALLBACK_NS: u64 = 20 * MS;
+/// A command or control transfer whose time ran out gets this much more for its answer (US-R): while every CPU
+/// stood still the clock ran on, and when they come back the waiter's timer and the event thread race.
+pub const LATE_LOOK_NS: u64 = 250 * MS;
 /// ERDP is advanced inside a long batch every this many events, so the controller never sees the ring full.
 pub const ERDP_EVERY: usize = 64;
 /// Segment parameters (sizes of rings, not limits on counts of things; R1).
@@ -496,7 +501,7 @@ impl<E: Env> Controller<E> {
                 self.kick();
                 klog::event!(Info, "usb", "xhci.up", ctrl = self.name.as_str(), version = klog::Hex(self.caps.version as u64),
                     slots = self.caps.max_slots, ports = self.caps.max_ports, context_bytes = self.caps.csz.bytes(),
-                    scratchpads = self.caps.scratchpads, event_segments = segs, ac64 = self.caps.ac64,
+                    scratchpads = self.caps.scratchpads, event_segments = segs, ac64 = self.caps.ac64, ppc = self.caps.ppc,
                     took_us = (self.now().saturating_sub(t0)) / 1000);
                 Ok(())
             }

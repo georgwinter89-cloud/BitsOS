@@ -156,6 +156,8 @@ pub struct App {
     pub status: crate::status::Status,
     pub session: crate::session::Session,
     pub anim: crate::anim::Anim,
+    /// WY-19: the gpu effect level's state.
+    pub fx: crate::fx::Fx,
     /// Programs opened from the address bar or the start page: pid, the window whose stack gets the new tab
     /// (`None`: a new tile), argv.
     pub pending_open: Vec<(u32, Option<Window>, Vec<String>)>,
@@ -172,10 +174,20 @@ pub struct App {
     pub ctl_origin: crate::input::Origin,
     /// The headless back end runs (test aids of the control socket).
     pub headless: bool,
+    /// WY-21: `ctl stall`: how long the next present waits.
+    pub stall: Option<std::time::Duration>,
     /// WY-16: client dma-bufs, explicit sync and the buffers waiting to go back after the frame.
     pub dma: crate::dmabuf::Dma,
     /// WY-3: the X11 display and Xwayland (started by the first X client).
     pub xwayland: Option<crate::xwayland::Xwayland>,
+    /// WY-20: relative motion and the pointer's lock or confinement.
+    pub lock: crate::lock::Lock,
+    /// PK-L1a: the program library's index (built-in until the first scan; swapped whole by `library::start`).
+    pub library: std::sync::Arc<crate::library::Index>,
+    /// PK-L1b: the library's overlay and the Win-alone key.
+    pub lib: crate::library_ui::Overlay,
+    /// PK-L1c: the pads (never grabbed) and their state machines.
+    pub pads: crate::pad_app::Pads,
 }
 
 impl App {
@@ -194,6 +206,7 @@ impl App {
         let presentation_state = PresentationState::new::<App>(&dh, clock.id() as u32);
         // WY-11: wp_cursor_shape_v1, so browsers name their pointer shapes and bitscomp draws them from its theme.
         let cursor_shape_state = smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh);
+        let lock = crate::lock::Lock::new(&dh);
 
         let mut seat = seat_state.new_wl_seat(&dh, "seat0");
         // German keyboard (V2-PLAN §8a.2).
@@ -287,6 +300,7 @@ impl App {
             status: Default::default(),
             session: Default::default(),
             anim: Default::default(),
+            fx: Default::default(),
             pending_open: Vec::new(),
             restoring: Vec::new(),
             anchors: Default::default(),
@@ -296,8 +310,13 @@ impl App {
             input_origin: crate::input::Origin::Injected,
             ctl_origin: crate::input::Origin::Injected,
             headless: false,
+            stall: None,
             dma: crate::dmabuf::Dma::new(),
             xwayland: None,
+            lock,
+            library: std::sync::Arc::new(crate::library::Index::builtin()),
+            lib: Default::default(),
+            pads: Default::default(),
         };
         app.space.map_output(&output, (0, 0));
         app.set_mode(size);

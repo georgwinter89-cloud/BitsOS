@@ -30,12 +30,14 @@ extern crate std;
 
 pub mod bot;
 pub mod disk;
+pub mod escalate;
 mod ktests;
 mod ktests_ev;
+mod ktests_recover;
 pub mod link;
 pub mod quirks;
 pub mod scsi;
-mod shutdown;
+pub mod shutdown;
 pub mod usblink;
 
 #[cfg(test)]
@@ -102,6 +104,17 @@ pub fn storages() -> Vec<Arc<Storage<UsbLink>>> {
     ATTACHED.lock().iter().map(|a| a.storage.clone()).collect()
 }
 
+/// The USB device behind a storage (the shutdown's clean stop; `None` once it left).
+pub(crate) fn device_of(s: &Arc<Storage<UsbLink>>) -> Option<Arc<Device>> {
+    let id = ATTACHED.lock().iter().find(|a| Arc::ptr_eq(&a.storage, s)).map(|a| a.device)?;
+    usb_core::registry::find(id)
+}
+
+/// The USB device behind a disk (ktests).
+pub(crate) fn device_of_disk(d: &UsbDisk) -> Option<Arc<Device>> {
+    device_of(d.storage())
+}
+
 fn bulk_endpoints(f: &Interface) -> Option<(u8, u8)> {
     let ep_in = f.endpoints.iter().find(|e| e.kind() == EpKind::Bulk && e.is_in())?.address;
     let ep_out = f.endpoints.iter().find(|e| e.kind() == EpKind::Bulk && !e.is_in())?.address;
@@ -112,6 +125,10 @@ fn probe(dev: &Arc<Device>, f: &Interface) -> Result<(), String> {
     if pci::registry::opted_in("usb_msd_skip") {
         return Err("usb_msd_skip=on".into());
     }
+    // US-R: a reset of the device in place costs this driver only its transfers under way, which end `Cancelled`
+    // and go again.
+    usb_core::registry::declare_reset_aware(DRIVER.name);
+    dev.remember_serial();
     let (ep_in, ep_out) = bulk_endpoints(f).ok_or_else(|| String::from("no bulk IN and OUT endpoint"))?;
     let q = quirks::lookup(dev.vendor(), dev.product(), dev.desc.device);
     let max = quirks::max_bytes(dev.speed(), q);

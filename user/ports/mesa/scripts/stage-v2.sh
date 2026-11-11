@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GM-1a: builds the Mesa tree for BitsOS V2 (\BITSOS2\mesa\ on the stick) from the host's pacman packages: Mesa
 # (llvmpipe, the radeonsi/RADV drivers, EGL, GBM), lavapipe and RADV (vulkan-swrast, vulkan-radeon), libglvnd, the
-# Vulkan loader, vulkan-tools (vulkaninfo, vkcube), mesa-utils (eglinfo, eglgears_wayland, es2gears_wayland) and every
+# Vulkan loader, vulkan-tools (vulkaninfo, vkcube), mesa-utils (eglinfo, the Wayland and pbuffer demos, vkgears) and every
 # library they and their drivers link, glibc and its loader included. The tree carries its own glibc, so it never
 # mixes with the system's libraries; `run` (bitsos/run) starts a program with the tree's loader.
 #   bin/            the programs
@@ -31,10 +31,11 @@ for t in pacman readelf bsdtar gpgv curl; do command -v $t >/dev/null || die "no
 # WY-14: pixman (libpixman-1.so.0) and libxkbcommon (libxkbcommon.so.0) for the gpu build of bitscomp, named on their own
 # (libxkbcommon came only as a dependency of vulkan-tools before).
 SEED="mesa vulkan-swrast vulkan-radeon libglvnd vulkan-icd-loader vulkan-tools mesa-utils libdrm wayland glibc gcc-libs pixman libxkbcommon"
-PROGS="vulkaninfo vkcube eglinfo eglgears_wayland es2gears_wayland"
+# GM-1d: of mesa-utils everything that needs no KMS (eglkms) and, since WY-3b, the X11 programs of glxgears and glxinfo.
+PROGS="vulkaninfo vkcube vkgears eglinfo eglgears_wayland egltri_wayland es2gears_wayland peglgears glxgears glxinfo"
 # Loaded with dlopen, so no program names them: the Vulkan ICDs (by the loader), Mesa's EGL vendor (by glvnd),
-# GBM's backend, the GLES library eglinfo probes.
-DLOPEN="libvulkan.so.1 libvulkan_lvp.so libvulkan_radeon.so libEGL_mesa.so.0 libGLESv2.so.2 libGL.so.1 libwayland-egl.so.1"
+# GBM's backend, the GLES library eglinfo probes, Mesa's GLX vendor (WY-3b: any X11 GL program needs it next to libGLX).
+DLOPEN="libvulkan.so.1 libvulkan_lvp.so libvulkan_radeon.so libEGL_mesa.so.0 libGLX_mesa.so.0 libGLESv2.so.2 libGL.so.1 libwayland-egl.so.1"
 # WY-14 (INT-W24): what bitscomp's gpu build links beyond the programs above (no program here names them), resolved
 # the same way.
 EXTRA_SONAMES="libpixman-1.so.0 libxkbcommon.so.0"

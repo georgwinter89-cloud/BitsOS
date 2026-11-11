@@ -168,6 +168,7 @@ pub fn take(t: &Target, label: &str, auto: bool, if_changed: bool) -> Result<Tak
     // over every file, then the file system's own commit and checkpoint.
     let p0 = now();
     let _ = vfs::writeback::flush_all(vfs::pagecache::SyncKind::Background);
+    let p1 = now();
     if let Some(o) = &t.sb.ops
         && let Err(e) = o.sync()
     {
@@ -224,7 +225,7 @@ pub fn take(t: &Target, label: &str, auto: bool, if_changed: bool) -> Result<Tak
     if new {
         TAKEN.fetch_add(1, Ordering::Relaxed);
         klog::event!(Info, "snap", "taken", pool = t.pool_name.as_str(), id = id, auto = auto, label = label,
-            preflush_us = taken.preflush_ns / 1000, freeze_us = taken.freeze_ns / 1000, snap_us = taken.snap_ns / 1000, pause_us = taken.pause_ns / 1000,
+            preflush_us = taken.preflush_ns / 1000, wb_us = p1.saturating_sub(p0) / 1000, freeze_us = taken.freeze_ns / 1000, snap_us = taken.snap_ns / 1000, pause_us = taken.pause_ns / 1000,
             commit_us = taken.commit_ns / 1000, barriers = taken.pause_barriers, barrier_us = taken.pause_barrier_ns / 1000);
     } else {
         UNCHANGED.fetch_add(1, Ordering::Relaxed);
@@ -283,7 +284,7 @@ const SIZE_STEP_PAGES: u64 = 64;
 fn exclusive_bytes(t: &Target, id: u64) -> Result<u64, Errno> {
     let (mut chunks, mut from) = (0u64, 0u64);
     loop {
-        let mut p = t.pool.lock().map_err(dev_errno)?;
+        let mut p = t.pool.lock_behind().map_err(dev_errno)?;
         let chunk = p.chunk_size() as u64;
         let (n, next) = p.exclusive_chunks_step(id, from, SIZE_STEP_PAGES).map_err(vol_errno)?;
         drop(p);
@@ -339,9 +340,8 @@ fn own_snapshot(p: &bitsvol::Pool, t: &Target, id: u64) -> Result<bitsvol::Volum
 /// Deletes snapshot `id` of the target (never the volume itself: EINVAL; mounted: EBUSY).
 pub fn delete(t: &Target, id: u64) -> Result<(), Errno> {
     let _ops = ops()?;
-    let mut p = t.pool.lock().map_err(dev_errno)?;
-    let v = own_snapshot(&p, t, id)?;
-    p.delete(id).map_err(vol_errno).inspect_err(|&e| klog::event!(Warn, "snap", "delete_failed", id = id, errno = e))?;
+    let v = own_snapshot(&*t.pool.lock().map_err(dev_errno)?, t, id)?;
+    t.pool.delete(id).map_err(vol_errno).inspect_err(|&e| klog::event!(Warn, "snap", "delete_failed", id = id, errno = e))?;
     klog::event!(Info, "snap", "deleted", pool = t.pool_name.as_str(), id = id, auto = v.auto, created_ns = v.created_ns);
     Ok(())
 }

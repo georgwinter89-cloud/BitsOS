@@ -1,0 +1,24 @@
+#!/bin/sh
+# WY-3b: starts a program of this tree's clients/ (glxgears, glxinfo, xdpyinfo) or a path, as the Mesa tree's run does,
+# with this tree's lib/ before the Mesa tree's: libGLX_mesa.so.0 lies here, and libGLX finds it by name. Both trees lie
+# side by side (\BITSOS2\xwayland\ and \BITSOS2\mesa\ on the stick, the stage directory on the host). The caller
+# sets DISPLAY; DRI_PRIME and the like are not touched.
+T=$(cd "$(dirname "$0")" && pwd)
+M=$(dirname "$T")/mesa
+L=$T/lib:$M/lib
+LD=$M/lib/ld-linux-x86-64.so.2
+[ -f "$LD" ] || { echo "xwayland run: no Mesa tree next to $T" >&2; exit 127; }
+export LD_LIBRARY_PATH="$L"
+export __EGL_VENDOR_LIBRARY_FILENAMES="$M/share/glvnd/egl_vendor.d/50_mesa.json"
+export LIBGL_DRIVERS_PATH="$M/lib/dri"
+export GBM_BACKENDS_PATH="$M/lib/gbm"
+export DRIRC_CONFIGDIR="$M/share/drirc.d"
+export AMDGPU_ASIC_ID_TABLE_PATHS="$M/share/libdrm${AMDGPU_ASIC_ID_TABLE_PATHS:+:$AMDGPU_ASIC_ID_TABLE_PATHS}"
+case $1 in
+  '') echo "xwayland run: run PROGRAM [ARGS]" >&2; exit 2 ;;
+  */*) P=$1 ;;
+  *) P=$T/clients/$1 ;;
+esac
+shift
+[ -f "$P" ] || { echo "xwayland run: no program $P" >&2; exit 127; }
+exec "$LD" --inhibit-cache --library-path "$L" --argv0 "$P" "$P" "$@"

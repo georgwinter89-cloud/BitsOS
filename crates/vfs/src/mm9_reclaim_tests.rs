@@ -157,6 +157,29 @@ fn direct_reclaim_never_waits_for_a_lock() {
     assert_eq!(r.shrink(8, Mode::Direct, true).freed, 8);
 }
 
+/// A file dropped while a reclaimer still holds its state (a visit that runs, as `Ring::walk`'s, or the
+/// reference `release` left in the grace queue): the pages go at the drop, not when the reclaimer lets go, and
+/// nothing can be put into the state any more.
+#[test]
+fn a_dropped_cache_gives_its_pages_back_under_a_reclaimer() {
+    let (c, _b) = file(600);
+    read_all(&c, 600);
+    c.write_at(5 * P, &5u64.to_le_bytes()).unwrap();
+    let pin = c.cached(7).unwrap();
+    let held = c.inner_arc().clone();
+    assert_eq!(held.lock().pages.len(), 600);
+    mm_core::grace::defer_arc_nowait(held.clone(), 0);
+    drop(c);
+    assert_eq!(Arc::strong_count(&pin), 1, "the index still holds the page: the frames stayed with the reclaimer's reference");
+    let g = held.lock();
+    assert_eq!((g.pages.len(), g.size()), (0, 0));
+    drop(g);
+    // The next file's pages are its own (the dropped states share one empty index).
+    let (d, _b) = file(8);
+    read_all(&d, 8);
+    assert_eq!((d.pages(), held.lock().pages.len()), (8, 0));
+}
+
 #[test]
 fn dead_caches_leave_the_ring() {
     let (c, _b) = file(4);

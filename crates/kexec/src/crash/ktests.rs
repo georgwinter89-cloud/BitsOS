@@ -74,7 +74,7 @@ ktest!("rb.crash.backtrace", Safe, backtrace);
 /// With a symbol table (scenario boots and bundles that carry `boot/kernel.syms`): it names this build.
 fn symbol_table() -> TestResult {
     let Some((t, src)) = symbols() else {
-        return ktest::skip("no symbol table in this boot (boot/kernel.syms in the initramfs or fw/KSYMS)");
+        return ktest::fail("no symbol table in this boot (boot/kernel.syms in the initramfs or fw/KSYMS)");
     };
     kassert!(symbols::matches_build(t, symbols::rb_ksyms_anchor as fn() -> u64 as usize as u64), "anchor");
     let r = report as fn(&core::panic::PanicInfo<'_>) -> ! as usize as u64;
@@ -147,7 +147,7 @@ fn sample_round(k: usize) -> TestResult {
 fn nmi_sample() -> TestResult {
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU: nothing to sample");
+        return ktest::fail("one CPU: nothing to sample");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());
@@ -173,7 +173,7 @@ ktest!("rb.crash.nmi_sample", Safe, nmi_sample);
 fn nmi_sample_after_paused() -> TestResult {
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU: nothing to sample");
+        return ktest::fail("one CPU: nothing to sample");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());
@@ -209,7 +209,7 @@ fn sample_retrying_busy(wait_ns: u64) -> Result<hal::nmi::Round, alloc::string::
 /// boot's marker at its end.
 fn record_format() -> TestResult {
     let Some((_, len)) = hal::panic::crash_page() else {
-        return ktest::skip("no crash page in BootInfo");
+        return ktest::fail("no crash page in BootInfo");
     };
     let len = len as usize;
     let mut page = alloc::vec![0u8; len];
@@ -240,7 +240,7 @@ fn live_marker() -> Result<Marker, alloc::string::String> {
 /// marker of an earlier boot, which the next boot never reads an id from).
 fn kernel_id_handoff() -> TestResult {
     if hal::panic::crash_page().is_none() {
-        return ktest::skip("no crash page in BootInfo");
+        return ktest::fail("no crash page in BootInfo");
     }
     let before = live_marker()?;
     kassert!(before.next_kernel == 0, "a kernel id is left in the marker: {before:?}");
@@ -266,10 +266,10 @@ ktest!("rb.crash.kernel_id_handoff", Safe, kernel_id_handoff);
 /// page may hold a real record, and a panic on another CPU in between would be overwritten by the restore).
 fn record_page() -> TestResult {
     let Some((_, len)) = hal::panic::crash_page() else {
-        return ktest::skip("no crash page in BootInfo");
+        return ktest::fail("no crash page in BootInfo");
     };
     if previous().is_some_and(|p| !p.reported_before) {
-        return ktest::skip("the page holds the crash record the boot before left (kept as it is)");
+        return ktest::fail("the page holds the crash record the boot before left (kept as it is)");
     }
     let len = len as usize;
     let mut saved = alloc::vec![0u8; len];
@@ -292,7 +292,7 @@ ktest!("rb.crash.record_page", QemuOnly, record_page);
 
 fn log_tail() -> TestResult {
     if klog::Level::Info > klog::level_for("crash") {
-        return ktest::skip("crash Info records are not kept at this loglevel");
+        return ktest::fail("crash Info records are not kept at this loglevel");
     }
     let id = time::now_ns();
     klog::event!(Info, "crash", "ktest.tail", id = id);
@@ -341,7 +341,7 @@ fn forced() -> TestResult {
     let kind = match boot::config("rb_crash_panic").as_deref() {
         Some("panic") => 0,
         Some("fault") => 1,
-        _ => return ktest::skip("CONFIG rb_crash_panic=panic|fault not set"),
+        _ => return ktest::fail("CONFIG rb_crash_panic=panic|fault not set"),
     };
     let sign = if kind == 0 { "rb.crash forced kind=panic" } else { ": kernel general protection (#GP) at rip" };
     match previous() {
@@ -359,7 +359,7 @@ fn forced() -> TestResult {
         }
     }
 }
-ktest!("rb.crash.forced", QemuOnly, forced);
+ktest!("rb.crash.forced", Run("rb/40-crash"), forced);
 
 // RB-12: the NMI backtrace path under load (kernel threads only; `ktests_nmi_user.rs` has the user-code and the
 // nested-NMI tests). Every other CPU is sampled many rounds while kernel threads sit at a deep stack and threads
@@ -391,7 +391,7 @@ fn deep_recurse(frames: u32) {
 fn nmi_sample_stress() -> TestResult {
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU: nothing to sample");
+        return ktest::fail("one CPU: nothing to sample");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());
@@ -478,6 +478,13 @@ fn wait_for_mirror() -> TestResult {
     Ok(())
 }
 
+/// The record's log part has the line logged before the forced panic, or says the ring was busy (INT-W32a: a CPU
+/// stopped while it read the ring leaves it so, seen once under load).
+pub(super) fn log_tail_told(t: &str) -> bool {
+    let Some((_, tail)) = t.split_once("log:\n") else { return false };
+    tail.lines().next() == Some(LOG_BUSY) || tail.lines().any(|l| l.contains("W crash ktest.forcing "))
+}
+
 fn check_previous(p: &Previous, kind: u64) -> TestResult {
     let t = &p.text;
     let line_with = |s: &str| t.lines().position(|l| l.contains(s));
@@ -493,7 +500,7 @@ fn check_previous(p: &Previous, kind: u64) -> TestResult {
     for c in (0..p.header.cpus_asked as usize + 1).filter(|&c| c != p.header.cpu as usize) {
         kassert!(line_with(&format!("cpu {c}: rip ")).or(line_with(&format!("cpu {c}: like cpu "))).is_some(), "registers of CPU {c}:\n{t}");
     }
-    kassert!(line_with("log:").is_some() && line_with("W crash ktest.forcing ").is_some(), "log tail up to the panic:\n{t}");
+    kassert!(log_tail_told(t), "log tail up to the panic:\n{t}");
     kassert!(p.header.flags & flags::CUT == 0, "the record was cut:\n{t}");
     kassert!(matches!(marker(), Some((MarkerFound::Kept, _))), "the boot marker survived the warm reset: {:?}", marker());
     let logged = klog::tail(4000).iter().any(|r| r.subsystem == "crash" && r.name == "previous");
@@ -506,7 +513,7 @@ fn check_previous(p: &Previous, kind: u64) -> TestResult {
 /// it (no second slot), and the marker stays. Rerunnable: the test tag always reuses its slot and ends empty.
 fn driver_note() -> TestResult {
     let Some((_, len)) = hal::panic::crash_page() else {
-        return ktest::skip("no crash page in BootInfo");
+        return ktest::fail("no crash page in BootInfo");
     };
     let len = len as usize;
     let tag = u32::from_le_bytes(*b"TEST");

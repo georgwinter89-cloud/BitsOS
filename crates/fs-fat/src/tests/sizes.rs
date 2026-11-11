@@ -185,3 +185,107 @@ fn config_rewrites_keep_one_size_and_the_view_is_shorter() {
     sync(&ns, &vol, CF);
     disk_agrees(&dir, &dev, CF, 179, true, false);
 }
+
+/// A run longer than one write-back buffer (`WRITE_STEP_PAGES`): every byte on the stick, each step at its place.
+#[test]
+fn a_run_longer_than_one_buffer_lands_whole() {
+    let dir = scratch("sizes-step");
+    let img = mkfs(&dir, 40, 1, "BITSOS");
+    mkdir(&img, "/BITSOS2");
+    let dev = load(&img);
+    let vol = mount_plain(&dev);
+    let ns = view(&vol);
+    let want = pattern(17 * 1024 * 1024 + 123, 7);
+    const A: &str = "/BITSOS2/big.bin";
+    let a = format!("/boot{A}");
+    let c = Ctx::kernel(&ns);
+    let f = c.open(None, a.as_bytes(), vfs::abi::O_WRONLY | vfs::abi::O_CREAT, 0o644).unwrap();
+    assert_eq!(f.write(&want).unwrap(), want.len());
+    drop(f);
+    sync(&ns, &vol, A);
+    let vol2 = mount_plain(&dev);
+    let ns2 = view(&vol2);
+    let f = Ctx::kernel(&ns2).open(None, a.as_bytes(), O_RDONLY, 0).unwrap();
+    let mut got = std::vec![0u8; want.len()];
+    let mut at = 0;
+    while at < got.len() {
+        let n = f.pread(at as u64, &mut got[at..]).unwrap();
+        assert!(n > 0, "the file ends at {at}");
+        at += n;
+    }
+    assert!(got == want, "the file differs after the remount");
+    assert_clean(&dir, &dev.image());
+}
+
+/// A file read back whole from a fresh mount of `dev`.
+fn read_back(dev: &std::sync::Arc<crate::MemDev>, path: &str, len: usize) -> std::vec::Vec<u8> {
+    let vol = mount_plain(dev);
+    let ns = view(&vol);
+    let f = Ctx::kernel(&ns).open(None, path.as_bytes(), O_RDONLY, 0).unwrap();
+    assert_eq!(f.stat().size, len as u64, "the size of {path}");
+    let mut got = std::vec![0u8; len];
+    let mut at = 0;
+    while at < got.len() {
+        let n = f.pread(at as u64, &mut got[at..]).unwrap();
+        assert!(n > 0, "the file ends at {at}");
+        at += n;
+    }
+    got
+}
+
+/// The steps of a long run write each byte once: an early step that made room for the whole file wrote zeros over
+/// all of it first, so a stick took twice the time and twice the wear for a 388 MiB KERNEL (INT-W31's first
+/// `write_run`, which a test on the content alone could not see). Rewriting part of a longer file leaves its length.
+#[test]
+fn the_steps_of_a_long_run_write_each_byte_once() {
+    let dir = scratch("sizes-once");
+    let img = mkfs(&dir, 120, 1, "BITSOS");
+    mkdir(&img, "/BITSOS2");
+    let dev = load(&img);
+    let vol = mount_plain(&dev);
+    let ns = view(&vol);
+    const A: &str = "/BITSOS2/big.bin";
+    let a = format!("/boot{A}");
+    let c = Ctx::kernel(&ns);
+    let mut want = pattern(49 * 1024 * 1024 + 123, 11);
+
+    // A new file, four steps.
+    let f = c.open(None, a.as_bytes(), vfs::abi::O_WRONLY | vfs::abi::O_CREAT, 0o644).unwrap();
+    assert_eq!(f.write(&want).unwrap(), want.len());
+    drop(f);
+    let before = dev.written_bytes();
+    sync(&ns, &vol, A);
+    let written = dev.written_bytes() - before;
+    let limit = want.len() as u64 / 20 * 21;
+    assert!(written <= limit, "{written} bytes on the device for a file of {}", want.len());
+    assert!(written >= want.len() as u64, "only {written} bytes on the device");
+
+    // The same file, its first 20 MiB again: two steps, the first ends far below the file's end.
+    let part = pattern(20 * 1024 * 1024, 12);
+    want[..part.len()].copy_from_slice(&part);
+    let f = c.open(None, a.as_bytes(), O_WRONLY, 0).unwrap();
+    assert_eq!(f.write(&part).unwrap(), part.len());
+    drop(f);
+    let before = dev.written_bytes();
+    sync(&ns, &vol, A);
+    let written = dev.written_bytes() - before;
+    assert!(written <= part.len() as u64 / 20 * 21, "{written} bytes on the device to rewrite {}", part.len());
+    assert!(read_back(&dev, &a, want.len()) == want, "the rewritten file differs after the remount");
+
+    // A short file growing long: the old cluster is rewritten in place, the rest comes in steps.
+    let short = pattern(1000, 13);
+    let f = c.open(None, a.as_bytes(), O_WRONLY | O_TRUNC, 0).unwrap();
+    assert_eq!(f.write(&short).unwrap(), short.len());
+    sync(&ns, &vol, A);
+    let more = pattern(35 * 1024 * 1024, 14);
+    assert_eq!(f.write(&more).unwrap(), more.len());
+    drop(f);
+    let before = dev.written_bytes();
+    sync(&ns, &vol, A);
+    let written = dev.written_bytes() - before;
+    assert!(written <= more.len() as u64 / 20 * 21, "{written} bytes on the device to grow by {}", more.len());
+    let mut all = short;
+    all.extend_from_slice(&more);
+    assert!(read_back(&dev, &a, all.len()) == all, "the grown file differs after the remount");
+    assert_clean(&dir, &dev.image());
+}

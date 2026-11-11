@@ -1,5 +1,6 @@
 //! The kernel heap behind `GlobalAlloc` (MM-3): slab caches for the size classes 8..2048 bytes with per-CPU
-//! magazines in front, exact page runs from the buddy allocator for everything bigger or aligned above 2 KiB.
+//! magazines in front, exact page runs from the buddy allocator for everything bigger or aligned above 2 KiB,
+//! and above the costly size single frames in the vmap area when the run is not free (`scatter`).
 //!
 //! Small: `class_of(size, align)` picks the class; the CPU's magazine serves it, refilled with half a
 //! magazine from the class cache when empty, and a full magazine gives its oldest half back on free
@@ -9,18 +10,29 @@
 //! gets null (R2: ENOMEM to the asker, nobody else is touched). Before the frame allocator exists the seed
 //! chunk serves slabs and large blocks (`pages`).
 //!
+//! A block above `COSTLY_ORDER` (32 KiB) aligned to at most a page may be virtually contiguous only (Linux's
+//! kvmalloc): where reclaim may run, a failed run goes to `scatter` before the reclaim rounds, which then serve
+//! both; the hook is called with no heap lock held. Nobody may take the physical address of such a block
+//! (`virt_to_phys` refuses the vmap area); DMA buffers come from `mm::dma`. A missing run notes its order for
+//! kswapd, which makes a free block of it in the background (`large`).
+//!
 //! Every allocation is charged to an owner kind: the heap's frames to `Kind::Heap`, named caches to theirs
 //! (`slab::SlabCache`). Lock order (never klog or the scheduler while held, R5): `heap.mags` ->
 //! `heap.cache` -> `heap.seed` -> frames (per-CPU list -> zone). The heap never calls klog; troubles are
 //! counted in `report` and turned into events by the `mm.report` thread. A panic first calls
 //! `enter_emergency`, after which the heap takes no lock at all (core.md 10.3).
 
+mod large;
+
+use large::large_shape;
+pub use large::{OrderWant, MAX_WANTED};
 use crate::mags::{MagSlots, CAP};
 use crate::pages::PageSrc;
 use crate::report::Reports;
+use crate::scatter::ScatterState;
 use crate::slab::cache::{Cache, KEEP_EMPTY};
 use crate::slab::geo::{class_of, geometry, CLASSES, NCLASSES};
-use crate::{Kind, PAGE};
+use crate::Kind;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
@@ -39,7 +51,7 @@ pub struct KernelHeap {
     pub(crate) classes: [Cache; NCLASSES],
     pub(crate) mags: MagSlots,
     /// The heap's own named caches are only shrunk with the kernel heap (host-test heaps leave them alone).
-    global: bool,
+    pub(crate) global: bool,
     /// Set by the panic path: from then on the heap takes no lock (`enter_emergency`).
     emergency: AtomicBool,
     /// Bytes users asked for and still hold (layout sizes).
@@ -48,21 +60,54 @@ pub struct KernelHeap {
     pub(crate) large_blocks: AtomicU64,
     /// Pages of large blocks carved from the seed (before the frame allocator existed) still held.
     pub(crate) seed_large: AtomicU64,
+    pub(crate) scatter: ScatterState,
+    want: OrderWant,
 }
 
-/// Pages and page alignment of a large block.
-/// PF-5: before the heap answers null, what waits for a grace period comes back (frames of evicted pages,
-/// index nodes): the buddy never drains for `Kind::Heap` (the magazine lock may be held there), here no heap
-/// lock is held. Bounded (`grace::expedite`); with a spin lock held (the grace queue's own lock included: it
-/// grows its queue from the heap) the drain only tries the queue lock.
-fn regain_grace() {
-    if crate::grace::waiting() {
-        crate::grace::expedite();
+/// Page-cache reclaim rounds of a heap allocation that found no frames, before it answers null (the Rust
+/// allocation error then panics the kernel: FS-STALL's Mini-PC crash). Each round that freed nothing ends them;
+/// many, because other allocations (read-ahead filling the cache again) may take what one round freed before
+/// the heap's retry.
+const HEAP_RECLAIM_TRIES: u32 = 32;
+/// Tries an allocation makes while it leaves the min-watermark reserve to callers that cannot reclaim: the plain
+/// try, one after the heap's own caches gave back, one after a reclaim round. Then it takes the reserve and only
+/// stays patient if that fails too. Mini-PC 11.11.2026, generation 115: with the cache full the free count sits
+/// under the min watermark for seconds (cache and program allocations dip into it after their rounds), and
+/// allocations that kept the reserve for their whole patience held `mm.as`, `nvme.io` and others for 2 s
+/// (lock statistics: hold_max 2000 ms on a dozen classes), sound and picture stalling with them.
+const KEEP_TRIES: u32 = 3;
+/// The order `regain` asks reclaim to free room for when a slab is missing.
+const SLAB_ORDER_HINT: u32 = 2;
+
+/// How long one heap allocation may spend taking page cache back before it answers null, where it may not wait
+/// (a spin lock is held: `reclaim_for` does nothing there, the bound is for the tries themselves).
+const REGAIN_NS: u64 = 20_000_000;
+/// The same where the caller may wait (`reclaim::context_allows`). Linux never fails such an allocation up to the
+/// costly order (`__alloc_pages_slowpath` retries: `should_reclaim_retry`); here null panics the kernel, so the
+/// heap keeps trying for as long as a stall is still better than a crash. Mini-PC 11.11.2026: with 23 GB of
+/// clean page cache and sixteen CPUs reading, a 17 KiB block gave up after 20 ms.
+const REGAIN_PATIENT_NS: u64 = 2_000_000_000;
+/// The pause before the next try when a patient round found nothing to take (kswapd and the reclaimers on other
+/// CPUs free frames meanwhile).
+const PATIENT_WAIT_US: u64 = 500;
+/// Blocks up to this order (1 MiB) get the patience: what kernel code allocates without a way to fail. A larger
+/// request (a buffer sized by a caller) answers null after `REGAIN_NS` as before, so it cannot stall for seconds.
+const PATIENT_ORDER: u32 = 8;
+
+/// One allocation's reclaim state (`KernelHeap::regain`).
+#[derive(Default)]
+struct Regain {
+    grace: crate::grace::WaitBudget,
+    until: Option<u64>,
+}
+
+/// Spins `us` microseconds, not past `until`.
+fn spin_until(until: u64, us: u64) {
+    let Some(t0) = ksync::now_ns() else { return };
+    let end = t0.saturating_add(us * 1000).min(until);
+    while ksync::now_ns().is_some_and(|t| t < end) {
+        core::hint::spin_loop();
     }
-}
-
-fn large_shape(size: usize, align: usize) -> (u64, u64) {
-    ((size as u64).div_ceil(PAGE), (align as u64 / PAGE).max(1))
 }
 
 impl KernelHeap {
@@ -89,6 +134,8 @@ impl KernelHeap {
             large_bytes: AtomicU64::new(0),
             large_blocks: AtomicU64::new(0),
             seed_large: AtomicU64::new(0),
+            scatter: ScatterState::new(),
+            want: OrderWant::new(),
         }
     }
 
@@ -222,38 +269,57 @@ impl KernelHeap {
     }
 
     fn small_alloc(&self, c: usize) -> usize {
-        let cache = &self.classes[c];
-        for attempt in 0..2 {
-            if let Some(m) = self.mags.this() {
-                let mut g = m.lock();
-                let mag = &mut g[c];
-                if mag.is_empty() {
-                    cache.take(&self.src, CAP[c] / 2, &mut |o| {
-                        mag.push(o);
-                    });
-                }
-                while let Some(o) = mag.pop() {
-                    if cache.mark_live(o) {
-                        return o;
-                    }
-                    self.reports().heap_corrupt(o);
-                }
-            } else {
-                let mut got = 0;
-                cache.take(&self.src, 1, &mut |o| got = o);
-                if got != 0 {
-                    if cache.mark_live(got) {
-                        return got;
-                    }
-                    self.reports().heap_corrupt(got);
-                }
+        let mut regain = Regain::default();
+        // Where it may reclaim, the heap leaves the reserve to callers that cannot (spin-lock holders) until its
+        // last try (round 2: a console write under its spin locks found no frame at all, the heap's big blocks had
+        // taken the reserve); Linux's GFP_KERNEL keeps the min watermark the same way.
+        let mut keep = crate::reclaim::keep_reserve();
+        for attempt in 0u32.. {
+            if attempt == KEEP_TRIES && keep.as_ref().is_some_and(crate::reclaim::Keep::held) {
+                keep = None;
             }
-            if attempt == 0 {
-                regain_grace();
-                self.shrink();
+            if let Some(o) = self.small_try(c) {
+                return o;
+            }
+            // A slab is a block of a few frames: the same small order for every class.
+            if !self.regain(&mut regain, attempt, SLAB_ORDER_HINT) {
+                break;
             }
         }
+        if keep.as_ref().is_some_and(crate::reclaim::Keep::held) {
+            drop(keep);
+            return self.small_try(c).unwrap_or(0);
+        }
         0
+    }
+
+    fn small_try(&self, c: usize) -> Option<usize> {
+        let cache = &self.classes[c];
+        if let Some(m) = self.mags.this() {
+            let mut g = m.lock();
+            let mag = &mut g[c];
+            if mag.is_empty() {
+                cache.take(&self.src, CAP[c] / 2, &mut |o| {
+                    mag.push(o);
+                });
+            }
+            while let Some(o) = mag.pop() {
+                if cache.mark_live(o) {
+                    return Some(o);
+                }
+                self.reports().heap_corrupt(o);
+            }
+        } else {
+            let mut got = 0;
+            cache.take(&self.src, 1, &mut |o| got = o);
+            if got != 0 {
+                if cache.mark_live(got) {
+                    return Some(got);
+                }
+                self.reports().heap_corrupt(got);
+            }
+        }
+        None
     }
 
     fn small_free(&self, c: usize, v: usize) -> bool {
@@ -275,36 +341,46 @@ impl KernelHeap {
         true
     }
 
-    fn large_alloc(&self, size: usize, align: usize) -> usize {
-        let (pages, align_pages) = large_shape(size, align);
-        for attempt in 0..2 {
-            if let Some(v) = self.src.alloc_run(pages, align_pages, Kind::Heap) {
-                self.large_bytes.fetch_add(pages * PAGE, Relaxed);
-                self.large_blocks.fetch_add(1, Relaxed);
-                if self.src.in_seed(v) {
-                    self.seed_large.fetch_add(pages, Relaxed);
+    /// Between two tries of an allocation that found no frames: first what waits for a grace period and the
+    /// empty slabs, then clean page cache (`HEAP_RECLAIM_TRIES` rounds). False: nothing more to try.
+    /// All tries of one allocation share `r`: one grace wait budget and one deadline (`REGAIN_NS`), so the
+    /// allocation spends at most that long here however many rounds it makes (FS-STALL review R3).
+    fn regain(&self, r: &mut Regain, attempt: u32, order: u32) -> bool {
+        if attempt == 0 {
+            // Under the shared budget, and waiting only where reclaim may (round 2 item 5: a spin lock may be
+            // `mm.grace` itself); elsewhere only what already passed its grace period.
+            if crate::grace::waiting() {
+                if crate::reclaim::context_allows() {
+                    crate::grace::expedite_with(&mut r.grace);
+                } else {
+                    crate::grace::drain();
                 }
-                return v;
             }
-            if attempt == 0 {
-                regain_grace();
-                self.shrink();
-            }
+            self.shrink();
+            self.drain_scattered();
+            return true;
         }
-        0
-    }
-
-    fn large_free(&self, v: usize, size: usize, align: usize) -> bool {
-        let (pages, align_pages) = large_shape(size, align);
-        let seed = self.src.in_seed(v);
-        if v == 0 || !(v as u64).is_multiple_of(align_pages * PAGE) || !self.src.free_run(v, pages, Kind::Heap) {
+        let now = ksync::now_ns();
+        // Patient only with a clock: the deadline is what ends the tries then.
+        let patient = now.is_some() && order <= PATIENT_ORDER && crate::reclaim::context_allows() && !crate::reclaim::hurried() && !crate::reclaim::reclaiming();
+        let span = if patient { REGAIN_PATIENT_NS } else { REGAIN_NS };
+        let until = *r.until.get_or_insert(now.map_or(u64::MAX, |t| t.saturating_add(span)));
+        if now.is_some_and(|t| t >= until) || (!patient && attempt >= 1 + HEAP_RECLAIM_TRIES) {
             return false;
         }
-        if seed {
-            self.seed_large.fetch_sub(pages, Relaxed);
+        if !self.src.reclaim_for(order, &mut r.grace) {
+            if !patient {
+                return false;
+            }
+            spin_until(until, PATIENT_WAIT_US);
+            return true;
         }
-        self.large_bytes.fetch_sub(pages * PAGE, Relaxed);
-        self.large_blocks.fetch_sub(1, Relaxed);
+        // Later tries wait a little first: a cache another CPU holds is free again, the frames others freed are back.
+        // A patient allocation makes many rounds: the pause grows to a few milliseconds, so one that is stuck
+        // does not keep the zone and cache locks busy for everyone else.
+        if attempt > 2 {
+            spin_until(until, u64::from(attempt.min(4 * HEAP_RECLAIM_TRIES)) * 30);
+        }
         true
     }
 
@@ -347,8 +423,9 @@ pub struct GlobalHeap;
 // SAFETY: alloc returns null or a block of at least `layout.size()` bytes aligned to `layout.align()` that no
 // live block overlaps: a slab object is handed out only while its `live` bit was clear and stays out until
 // its free clears it (class objects are aligned to their class, `class_of` picks a class aligned enough);
-// a large block is an exact page run owned until its dealloc. dealloc gets the layout alloc was called with
-// (GlobalAlloc rule), so `class_of` sends it down the same path; anything else is refused and counted.
+// a large block is an exact page run, or a scattered block of its own mapped frames, owned until its dealloc.
+// dealloc gets the layout alloc was called with (GlobalAlloc rule), so `class_of` sends it down the same path
+// (a scattered block by its address); anything else is refused and counted.
 // realloc keeps the block only when the new layout maps to the same class or page run.
 unsafe impl GlobalAlloc for GlobalHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

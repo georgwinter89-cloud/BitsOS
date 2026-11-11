@@ -367,3 +367,29 @@ fn an_older_record_up_to_the_marker_still_decodes() {
     let (got, b) = record::decode(&page).unwrap();
     assert_eq!((got.body_len as usize, b.len()), (4096 - 128, 4096 - 128));
 }
+
+/// INT-W32a's post-integration check: the record the panic path really writes with a busy ring, and the crash ktest's
+/// answer to it. Host: one registration of the crash page for this test binary; only this test registers it.
+#[test]
+fn a_busy_ring_is_said_in_the_record_and_the_crash_test_takes_it() {
+    let mut buf = vec![0u8; 8192];
+    let mut w = bootinfo::Writer::new(&mut buf).unwrap();
+    let keep = bootinfo::MemDesc { ty: bootinfo::memtype::BITS_KEEP, phys: 0x1F00_0000, virt: 0, pages: 1, attr: 0 };
+    w.memory_map([keep].into_iter()).unwrap();
+    w.crash_page(bootinfo::PhysRange { phys: 0x1F00_0000, size: 4096 }).unwrap();
+    let n = w.len();
+    hal::panic::set_crash_page(&bootinfo::BootInfo::parse(&buf[..n]).unwrap()).unwrap();
+
+    let mut page = Page::open();
+    assert!(page.on);
+    assert_eq!(klog::__with_ring_held(|| page.log_tail(u64::MAX)), 0);
+    let mut body = vec![0u8; (page.off - record::HEADER as u64) as usize];
+    assert!(hal::panic::crash_page_read(record::HEADER as u64, &mut body));
+    let text = core::str::from_utf8(&body).unwrap();
+    assert_eq!(text, "log:\n(log ring busy)\n");
+    assert!(ktests::log_tail_told(text));
+
+    assert!(ktests::log_tail_told("cpu 1: rip 0\nlog:\n[    1.000000] W crash ktest.forcing \n"));
+    assert!(!ktests::log_tail_told("log:\n[    1.000000] I other line\n"), "a log without the forcing line");
+    assert!(!ktests::log_tail_told("(log ring busy)\n"), "no log part");
+}

@@ -84,7 +84,8 @@ impl BlockError {
     pub fn from_dev(e: DevError) -> BlockError {
         match e {
             DevError::Gone => BlockError::Gone,
-            DevError::Timeout | DevError::Io => BlockError::Io,
+            DevError::Timeout => BlockError::Timeout,
+            DevError::Io => BlockError::Io,
             DevError::Refused => BlockError::ReadOnly(Refusal::DeviceReadOnly),
             DevError::NoMemory => BlockError::NoMemory,
             DevError::Unsupported => BlockError::Unsupported,

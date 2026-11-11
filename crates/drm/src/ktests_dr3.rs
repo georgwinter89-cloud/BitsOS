@@ -1,6 +1,6 @@
 //! DR-3 in-kernel tests (Safe, rerunnable): syncobj ioctls on an open of the device with a fresh fd table, a
 //! wait woken by a kernel thread signaling the fake's ring, an unplug ending a wait, sync_file poll, and the
-//! ABI program `/bin/abi-drm-syncobj`. On hardware without a fake (the Mini-PC) they skip, as DR-2's do.
+//! ABI program `/bin/abi-drm-syncobj`. On hardware without a fake (the Mini-PC) they fail, as DR-2's do.
 
 use crate::device;
 use crate::fake::FakeGpu;
@@ -91,11 +91,11 @@ fn basics() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.syncobj.basics", Safe, basics);
+ktest!("dr.syncobj.basics", QemuAll, basics);
 
 fn ring_wait() -> TestResult {
     with_dev!(d, {
-        let Some(fake) = d.dev.driver().as_fake() else { return ktest::skip("not the fake GPU") };
+        let Some(fake) = d.dev.driver().as_fake() else { return ktest::fail("not the fake GPU") };
         let t = T::new(&d.dev)?;
         let h = t.create(0)?;
         let f = fake.ring().emit();
@@ -125,12 +125,12 @@ fn ring_wait() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.syncobj.ring_wait", Safe, ring_wait);
+ktest!("dr.syncobj.ring_wait", QemuAll, ring_wait);
 
 fn unplug_wakes() -> TestResult {
     // Its own device: only under a hypervisor, where a second fake may come and go.
     if !hal::serial::under_hypervisor() {
-        return ktest::skip("adds a fake device: only under a hypervisor");
+        return ktest::fail("adds a fake device: only under a hypervisor");
     }
     let dev = crate::add_device(Arc::new(FakeGpu::at(0xd5, 0))).map_err(|e| format!("add: errno {e}"))?;
     let r = (|| -> TestResult {
@@ -157,13 +157,13 @@ fn unplug_wakes() -> TestResult {
     crate::remove_device(&dev);
     r
 }
-ktest!("dr.syncobj.unplug", Safe, unplug_wakes);
+ktest!("dr.syncobj.unplug", QemuAll, unplug_wakes);
 
 const PROG: &str = "/bin/abi-drm-syncobj";
 
 fn program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     with_dev!(_d, { run_program() })
 }
@@ -189,5 +189,5 @@ fn run_program() -> TestResult {
     kassert!(text.contains("wait for submit, signaled by a thread = 0\n"), "{text}");
     Ok(())
 }
-ktest!("dr.syncobj.program", Safe, program);
+ktest!("dr.syncobj.program", QemuAll, program);
 

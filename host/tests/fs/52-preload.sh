@@ -7,6 +7,7 @@
 # then reads (almost) nothing from the stick. The fs.preload.* ktests run in that kernel too (an Interactive read
 # during a preload pass is not delayed beyond the FS-12 limit), then MCP `preload clear` empties the record.
 set -eu
+export BITSOS_KTEST_RUN=fs/50-data # shares the data volume's tests with fs/50-data
 export LC_ALL=C
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 if ! grep -q "vfs::preload::exec_started" crates/proc/src/exec.rs; then

@@ -3,9 +3,7 @@
 # default) at the Mini-PC's 2560x1440. ds_buehne.py checks the behaviour (chips, read-only context address, the
 # Absicht headline, the right column's fold, Startseite, minimised windows, the sun with CR DS-3-1, 0 frames when
 # still, classic as a preset); ds_reference.py draws the pictures, compared with host/tests/ds/ref/buehne-*.png
-# (DS_UPDATE_REF=1 writes them). The stage under the tiles needs CR DS-2-1 (render.rs draws the wallpaper layer):
-# without it the picture comparison says SKIP, every behaviour check still runs. DS_REQUIRE_CRS=1 (the desk, once
-# CR DS-2-1 and CR DS-3-1 are applied) turns both skips (pictures, the sun's click) into failures.
+# (DS_UPDATE_REF=1 writes them). Every check is a hard one.
 set -euo pipefail
 
 ROOT=${BITSOS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -46,21 +44,16 @@ $IMG diff "$SHOTS/buehne-dark.ppm" "$SHOTS/buehne-light.ppm" >/dev/null && fail 
 $IMG diff "$SHOTS/buehne-dark.ppm" "$SHOTS/buehne-classic.ppm" >/dev/null && fail "classic looks like the Bühne"
 echo "ok: the Bühne follows the mode and differs from classic"
 
-if ! grep -q "wallpaper::elements" "$ROOT/user/services/bitscomp/src/render.rs"; then
-    [ "${DS_REQUIRE_CRS:-0}" = 1 ] && fail "DS_REQUIRE_CRS=1 but CR DS-2-1 is not applied (render.rs draws no stage)"
-    echo "SKIP: reference pictures (CR DS-2-1 not applied: render.rs draws no wallpaper and no stage)"
-else
-    for s in buehne-dark buehne-absicht buehne-light buehne-start buehne-menu; do
-        if [ "${DS_UPDATE_REF:-0}" = 1 ]; then
-            mkdir -p "$REF"
-            $IMG png "$SHOTS/$s.ppm" "$REF/$s.png"
-            echo "reference $s.png written"
-        else
-            $IMG diff "$SHOTS/$s.ppm" "$REF/$s.png" || fail "$s differs from host/tests/ds/ref/$s.png"
-        fi
-    done
-    # Classic keeps today's look exactly: the same picture as 10-look's classic dark reference.
-    [ "${DS_UPDATE_REF:-0}" = 1 ] || $IMG diff "$SHOTS/buehne-classic.ppm" "$REF/dark.png" || fail "classic differs from host/tests/ds/ref/dark.png"
-    echo "ok: reference pictures"
-fi
+for s in buehne-dark buehne-absicht buehne-light buehne-start buehne-menu; do
+    if [ "${DS_UPDATE_REF:-0}" = 1 ]; then
+        mkdir -p "$REF"
+        $IMG png "$SHOTS/$s.ppm" "$REF/$s.png"
+        echo "reference $s.png written"
+    else
+        $IMG diff "$SHOTS/$s.ppm" "$REF/$s.png" || fail "$s differs from host/tests/ds/ref/$s.png"
+    fi
+done
+# Classic keeps today's look exactly: the same picture as 10-look's classic dark reference.
+[ "${DS_UPDATE_REF:-0}" = 1 ] || $IMG diff "$SHOTS/buehne-classic.ppm" "$REF/dark.png" || fail "classic differs from host/tests/ds/ref/dark.png"
+echo "ok: reference pictures"
 echo "GREEN: the Bühne preset on the host"

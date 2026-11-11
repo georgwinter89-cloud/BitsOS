@@ -474,19 +474,28 @@ impl NetlinkSock {
     /// is over SO_RCVBUF or congested.
     fn kernel_unicast(&self, data: Vec<u8>, group: u32) -> Result<(), i64> {
         let truesize = data.len() + SKB_OVERHEAD;
-        let mut st = self.st.lock();
-        if st.released {
-            return Err(ECONNREFUSED);
+        // The queue grows with `st` dropped (`ksync::spare`); every round looks at the socket again.
+        let mut spare = ksync::Spare::new();
+        loop {
+            let mut st = self.st.lock();
+            if st.released {
+                return Err(ECONNREFUSED);
+            }
+            if st.rmem > self.opts.rcvbuf() || st.congested {
+                let report = Self::overrun(&mut st);
+                drop(st);
+                self.overrun_done(report);
+                return Err(EAGAIN);
+            }
+            if !spare.fits(&mut st.q, 1) {
+                drop(st);
+                spare.grow().map_err(|_| ENOBUFS)?;
+                continue;
+            }
+            st.rmem += truesize;
+            st.q.push_back(Pkt { data, from: 0, group, creds: Ucred::default(), truesize });
+            break;
         }
-        if st.rmem > self.opts.rcvbuf() || st.congested {
-            let report = Self::overrun(&mut st);
-            drop(st);
-            self.overrun_done(report);
-            return Err(EAGAIN);
-        }
-        st.rmem += truesize;
-        st.q.push_back(Pkt { data, from: 0, group, creds: Ucred::default(), truesize });
-        drop(st);
         self.wq.wake_all();
         Ok(())
     }
@@ -530,37 +539,63 @@ impl NetlinkSock {
         let mut v = Vec::new();
         v.try_reserve_exact(data.len()).map_err(|_| ENOBUFS)?;
         v.extend_from_slice(data);
-        let mut st = self.st.lock();
-        if st.released {
-            return Err(ECONNREFUSED);
+        let mut spare = ksync::Spare::new();
+        loop {
+            let mut st = self.st.lock();
+            if st.released {
+                return Err(ECONNREFUSED);
+            }
+            if !spare.fits(&mut st.q, 1) {
+                drop(st);
+                spare.grow().map_err(|_| ENOBUFS)?;
+                continue;
+            }
+            st.rmem += v.len() + SKB_OVERHEAD;
+            st.q.push_back(Pkt { truesize: v.len() + SKB_OVERHEAD, data: v, from, group: 0, creds });
+            break;
         }
-        st.rmem += v.len() + SKB_OVERHEAD;
-        st.q.push_back(Pkt { truesize: v.len() + SKB_OVERHEAD, data: v, from, group: 0, creds });
-        drop(st);
         self.wq.wake_all();
         Ok(())
     }
 
     /// A broadcast datagram (`do_one_broadcast`): skipped by the sender, dropped with an overrun when full.
     fn deliver_group(&self, data: &[u8], from: u32, group: u32, creds: Ucred) -> bool {
-        let mut st = self.st.lock();
-        if st.released || st.groups & (1u64 << (group - 1)) == 0 || (from != 0 && st.portid == from) {
-            return false;
+        // The copy and the queue's room are made with `st` dropped, once the socket turned out to want the
+        // datagram; every round looks at the socket again.
+        let mut copy: Option<Vec<u8>> = None;
+        let mut spare = ksync::Spare::new();
+        loop {
+            let mut st = self.st.lock();
+            if st.released || st.groups & (1u64 << (group - 1)) == 0 || (from != 0 && st.portid == from) {
+                return false;
+            }
+            if st.rmem > self.opts.rcvbuf() || st.congested {
+                let r = Self::overrun(&mut st);
+                drop(st);
+                self.overrun_done(r);
+                return false;
+            }
+            if !spare.fits(&mut st.q, 1) {
+                drop(st);
+                if spare.grow().is_err() {
+                    return false;
+                }
+                continue;
+            }
+            let Some(v) = copy.take() else {
+                drop(st);
+                let mut v = Vec::new();
+                if v.try_reserve_exact(data.len()).is_err() {
+                    return false;
+                }
+                v.extend_from_slice(data);
+                copy = Some(v);
+                continue;
+            };
+            st.rmem += v.len() + SKB_OVERHEAD;
+            st.q.push_back(Pkt { truesize: v.len() + SKB_OVERHEAD, data: v, from, group, creds });
+            break;
         }
-        if st.rmem > self.opts.rcvbuf() || st.congested {
-            let r = Self::overrun(&mut st);
-            drop(st);
-            self.overrun_done(r);
-            return false;
-        }
-        let mut v = Vec::new();
-        if v.try_reserve_exact(data.len()).is_err() {
-            return false;
-        }
-        v.extend_from_slice(data);
-        st.rmem += v.len() + SKB_OVERHEAD;
-        st.q.push_back(Pkt { truesize: v.len() + SKB_OVERHEAD, data: v, from, group, creds });
-        drop(st);
         self.wq.wake_all();
         true
     }
@@ -583,17 +618,35 @@ impl NetlinkSock {
     /// `netlink_dump`: one datagram of the running dump, as large as the reader's buffers have been (at least a
     /// page), with NLMSG_DONE once nothing is left (in a datagram of its own after the last messages).
     fn dump_step(&self) -> Result<(), i64> {
-        let mut st = self.st.lock();
-        let rcvbuf = self.opts.rcvbuf();
-        if st.rmem >= rcvbuf {
-            return Err(ENOBUFS);
-        }
+        // The datagram's memory (Linux allocates the whole skb as well) and the queue's room are made with
+        // `st` dropped, see `unix::fill`; every round looks at the socket again.
+        let mut skb: Vec<u8> = Vec::new();
+        let mut spare = ksync::Spare::new();
+        let mut st = loop {
+            let mut st = self.st.lock();
+            if st.rmem >= self.opts.rcvbuf() {
+                return Err(ENOBUFS);
+            }
+            let Some(d) = st.dump.as_ref() else { return Ok(()) };
+            // Room for NLMSG_DONE with its text, which may follow the messages.
+            let want = GOODSIZE.max(st.max_recvmsg_len) + NLMSG_HDRLEN + 8 + align(d.done_msg.map_or(0, |t| t.len() + 1));
+            if skb.capacity() < want {
+                drop(st);
+                skb.try_reserve_exact(want).map_err(|_| ENOBUFS)?;
+                continue;
+            }
+            if !spare.fits(&mut st.q, 1) {
+                drop(st);
+                spare.grow().map_err(|_| ENOBUFS)?;
+                continue;
+            }
+            break st;
+        };
         let cap = GOODSIZE.max(st.max_recvmsg_len);
         let (pid, ext) = (st.dump_pid, st.flags & nf::EXT_ACK != 0);
         // Another reader of the same socket may have finished the dump in between: nothing to do (Linux's
         // unlocked `cb_running` look would report EINVAL to this reader; a race, not an error of the program).
         let Some(d) = st.dump.as_mut() else { return Ok(()) };
-        let mut skb: Vec<u8> = Vec::new();
         if d.done_errno > 0 {
             while let Some(m) = d.msgs.front() {
                 if skb.len() + m.len() > cap {
@@ -662,16 +715,25 @@ impl NetlinkSock {
                 return Err(EAGAIN);
             }
         }
-        let mut st = self.st.lock();
-        let p = if flags & MSG_PEEK != 0 {
-            st.q.front().map(|p| (p.data.clone(), p.from, p.group, p.creds))
-        } else {
-            st.q.pop_front().map(|p| {
+        // A peek copies with a buffer made outside `st` (`unix::fill`); taking hands over the datagram's own.
+        let mut buf: Vec<u8> = Vec::new();
+        let (mut st, data, len, from, group, creds) = loop {
+            let mut st = self.st.lock();
+            if flags & MSG_PEEK == 0 {
+                let Some(p) = st.q.pop_front() else { return Err(EAGAIN) };
                 st.rmem = st.rmem.saturating_sub(p.truesize);
-                (p.data, p.from, p.group, p.creds)
-            })
+                let len = p.data.len();
+                break (st, p.data, len, p.from, p.group, p.creds);
+            }
+            let Some(p) = st.q.front() else { return Err(EAGAIN) };
+            let n = p.data.len().min(size);
+            if super::unix::fill(&mut buf, &p.data[..n]) {
+                let head = (p.data.len(), p.from, p.group, p.creds);
+                break (st, buf, head.0, head.1, head.2, head.3);
+            }
+            drop(st);
+            super::unix::grow(&mut buf, n)?;
         };
-        let Some((data, from, group, creds)) = p else { return Err(EAGAIN) };
         // `netlink_rcv_wake`: an empty queue ends a congestion, and a socket that is not congested wakes the
         // senders waiting for room (a root program's unicast in `unicast_from_user`).
         if st.rmem == 0 {
@@ -685,14 +747,14 @@ impl NetlinkSock {
         if wake_senders {
             self.wq.wake_all();
         }
-        let n = data.len().min(size);
+        let n = len.min(size);
         let copied = sink(&data[..n]);
         if run_dump && let Err(e) = self.dump_step() {
             self.set_error(e);
         }
         copied?;
-        let mut r = Received { n: if flags & MSG_TRUNC != 0 { data.len() } else { n }, ..Default::default() };
-        if n < data.len() {
+        let mut r = Received { n: if flags & MSG_TRUNC != 0 { len } else { n }, ..Default::default() };
+        if n < len {
             r.flags |= MSG_TRUNC;
         }
         let mut name = alloc::vec![0u8; SOCKADDR_NL];

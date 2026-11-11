@@ -42,6 +42,7 @@ mod usbhost;
 mod xfer;
 pub mod queue;
 pub mod quirks;
+mod recover;
 pub mod mem;
 pub mod regs;
 pub mod ring;
@@ -64,6 +65,8 @@ mod tests_usb;
 mod tests_xfer;
 #[cfg(test)]
 mod tests_fixes;
+#[cfg(test)]
+mod tests_recover;
 #[cfg(test)]
 mod tests_panic;
 #[cfg(test)]

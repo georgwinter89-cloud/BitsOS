@@ -1,0 +1,7 @@
+[package]
+name = "blkbench"
+version = "0.1.0"
+edition = "2024"
+description = "BL-0: read-path measurements (cold proof, sequential, random, small files, mmap); the same static binary on V2 and CachyOS"
+
+[dependencies]

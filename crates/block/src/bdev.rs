@@ -29,11 +29,14 @@ pub struct DiskFile {
     background: AtomicU32,
     /// Durable write-backs under way (fsync, fdatasync, msync): their runs go as Normal.
     durable: AtomicU32,
+    /// The errno of a write or flush that timed out: EIO, or ETIMEDOUT for an owner that tells a timeout from a
+    /// media error per request (ext4's device, FS-STALL review E5: the disk's flag is shared by every request).
+    timeout_errno: i64,
 }
 
 impl DiskFile {
     pub fn new(disk: Arc<Disk>) -> Arc<DiskFile> {
-        Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0) })
+        Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::EIO })
     }
 
     /// The disk's size in bytes.
@@ -46,6 +49,34 @@ impl DiskFile {
         let f = DiskFile::new(disk);
         let size = f.size();
         PageCache::for_block_device(f, size)
+    }
+
+    /// `page_cache` whose write-back answers ETIMEDOUT for a request that timed out (EIO for other failures).
+    pub fn page_cache_telling_timeouts(disk: Arc<Disk>) -> PageCache {
+        let f = Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::ETIMEDOUT });
+        let size = f.size();
+        PageCache::for_block_device(f, size)
+    }
+
+    fn write_part(&self, first: u64, pages: &[Arc<CachePage>], _size: u64) -> Result<(), i64> {
+        let Some((lba, _)) = self.span(first) else { return Ok(()) };
+        let mut segs: Vec<PageSeg> = Vec::new();
+        segs.try_reserve_exact(pages.len()).map_err(|_| uapi::errno::ENOMEM)?;
+        for (i, p) in pages.iter().enumerate() {
+            match self.span(first + i as u64) {
+                Some((_, len)) => segs.push(PageSeg { page: p.clone(), off: 0, len }),
+                None => break,
+            }
+        }
+        if segs.is_empty() {
+            return Ok(());
+        }
+        let prio = self.run_priority();
+        self.disk.write_pages(lba, segs, false, prio).map_err(|e| self.write_errno(e))
+    }
+
+    fn write_errno(&self, e: BlockError) -> i64 {
+        if e == BlockError::Timeout { self.timeout_errno } else { e.errno() }
     }
 
     fn count(&self, why: SyncKind) -> &AtomicU32 {
@@ -76,6 +107,9 @@ impl DiskFile {
     }
 }
 
+/// Pages of one write request of a cache write-back (1 MiB).
+const WRITE_RUN_PAGES: usize = 256;
+
 fn errno(e: BlockError) -> i64 {
     e.errno()
 }
@@ -83,6 +117,10 @@ fn errno(e: BlockError) -> i64 {
 impl Backend for DiskFile {
     fn read_ahead_pages(&self) -> u64 {
         vfs::readahead::DEFAULT_PAGES
+    }
+    /// BL-4 CR 4: reads above `read_ahead_pages` get one window up to the device's request size.
+    fn io_pages(&self) -> u64 {
+        self.disk.request_pages()
     }
 
     fn read_page(&self, pgoff: u64, page: &Arc<CachePage>) -> Result<(), i64> {
@@ -112,21 +150,13 @@ impl Backend for DiskFile {
         Ok(())
     }
 
-    fn write_run(&self, first: u64, pages: &[Arc<CachePage>], _size: u64) -> Result<(), i64> {
-        let Some((lba, _)) = self.span(first) else { return Ok(()) };
-        let mut segs: Vec<PageSeg> = Vec::new();
-        segs.try_reserve_exact(pages.len()).map_err(|_| uapi::errno::ENOMEM)?;
-        for (i, p) in pages.iter().enumerate() {
-            match self.span(first + i as u64) {
-                Some((_, len)) => segs.push(PageSeg { page: p.clone(), off: 0, len }),
-                None => break,
-            }
+    /// A run goes as requests of at most `WRITE_RUN_PAGES` (FS-STALL round 4: a dirty run of 28154 pages was one
+    /// 110 MB request, whose page list and bounce buffer the heap of a full machine could not give).
+    fn write_run(&self, first: u64, pages: &[Arc<CachePage>], size: u64) -> Result<(), i64> {
+        for (k, part) in pages.chunks(WRITE_RUN_PAGES).enumerate() {
+            self.write_part(first + (k * WRITE_RUN_PAGES) as u64, part, size)?;
         }
-        if segs.is_empty() {
-            return Ok(());
-        }
-        let prio = self.run_priority();
-        self.disk.write_pages(lba, segs, false, prio).map_err(errno)
+        Ok(())
     }
 
     fn commit(&self, why: SyncKind) -> Result<(), i64> {
@@ -140,7 +170,7 @@ impl Backend for DiskFile {
             }
         }
         if why.durable() && self.disk.dev_info().has_volatile_cache {
-            self.disk.flush(crate::prio::higher(IoPriority::Normal, crate::prio::current())).map_err(errno)?;
+            self.disk.flush(crate::prio::higher(IoPriority::Normal, crate::prio::current())).map_err(|e| self.write_errno(e))?;
         }
         Ok(())
     }

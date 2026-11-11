@@ -90,8 +90,7 @@ try:
     lum = lambda x, y: sum(dark[(y * w + x) * 3:(y * w + x) * 3 + 3])
     row = round((wy + wh) * 1.25) - 4
     vals = [lum(x, row) for x in range(round(wx * 1.25), round((wx + ww) * 1.25))]
-    if os.environ.get("DS_HUD_WALLPAPER", "1") == "1":
-        need(len(set(vals)) > 3, f"the ground under the tiles is the wallpaper, not one flat colour ({len(set(vals))} values)")
+    need(len(set(vals)) > 3, f"the ground under the tiles is the wallpaper, not one flat colour ({len(set(vals))} values)")
 
     ctl("set", "theme.effects", "gpu")
     time.sleep(0.4)

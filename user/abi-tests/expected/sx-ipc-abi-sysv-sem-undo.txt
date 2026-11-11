@@ -1,0 +1,39 @@
+child +3 undo = 0
+seen in child = 3
+child ended: exit 0
+undone = 0
+GETPID is not me: yes
+child +2 undo = 0
+child killed: signal 9
+undone after SIGKILL = 0
+child +5 undo = 0
+child sem1 +1 undo = 0
+parent-like take = 0
+sem 1 stays = 1
+child with reset: exit 0
+SETVAL cleared its adjustment = 3
+sem 1 undone = 0
+my +3 undo = 0
+fork child takes one with undo = 0
+fork child: exit 0
+child's -1 given back, mine stays = 3
+child +4 undo = 0
+unshare(CLONE_SYSVSEM) = 0
+undone at once = 3
+child +1 undo = 0
+unsharing child: exit 0
+after unshare child = 3
+thread +6 undo = 0
+after the thread ended (shared list) = 6
+main +1 undo = 0
+threads: exit 0
+thread's and main's undone = 0
+adj +32767 = 0
+cleared by SETVAL so fine = 0
+plain +1 = 0
+over the range = -ERANGE
+value unchanged = 32767
+undo twice = 0
+IPC_RMID with adjustments = 0
+fork child takes one with undo = -EINVAL
+nothing left to undo: exit 0

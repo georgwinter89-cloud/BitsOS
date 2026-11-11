@@ -294,12 +294,90 @@ fn set_swappiness(v: u64) -> Result<(), Errno> {
     store("swappiness", &SWAPPINESS, v, 0..=200)
 }
 
+/// BL-0: `/proc/sys/vm/drop_caches` (linux-7/fs/drop_caches.c:78, mode 0200, `proc_dointvec_minmax` 1..=4). Write
+/// only, for root alone: Linux's `proc_sys_permission` (`test_perm`) gives root the owner bits and everyone else
+/// the other bits, so root may only write and nobody else may open it. The work is `vfs::reclaim::drop_caches`.
+struct DropCaches;
+
+impl vfs::synth::FileSource for DropCaches {
+    fn permission(&self, who: Cred, want: u32) -> Option<Result<(), Errno>> {
+        use vfs::inode::{MAY_EXEC, MAY_READ, MAY_WRITE};
+        let allowed = if who.uid == 0 { MAY_WRITE } else { 0 };
+        Some(if want & (MAY_READ | MAY_WRITE | MAY_EXEC) & !allowed == 0 { Ok(()) } else { Err(EACCES) })
+    }
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(Vec::new())
+    }
+    fn write(&self, _who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let Some(v) = vfs::sysctl::parse_ulong(data)? else { return Ok(data.len()) };
+        if !(1..=4).contains(&v) {
+            klog::event!(Info, "syscall", "sysctl.out_of_range", knob = "drop_caches", asked = v);
+            return Err(EINVAL);
+        }
+        let (comm, pid) = match proc::current_thread() {
+            Some(t) => (t.prctl().comm_str(), proc::current().map_or(0, |p| p.pid as u64)),
+            None => (String::from("kernel"), 0),
+        };
+        vfs::reclaim::drop_caches(v, &comm, pid);
+        Ok(data.len())
+    }
+}
+
+/// W35 MM-3: `compact_memory` (Linux `sysctl_compaction_handler`, mode 0200): writing 1 compacts every zone in the
+/// writer's context (`mm::compact::compact_memory`); any other number is EINVAL. Reads as 0 where the mode lets one.
+fn compact_memory() -> u64 {
+    0
+}
+
+fn set_compact_memory(v: u64) -> Result<(), Errno> {
+    if v != 1 {
+        return Err(EINVAL);
+    }
+    mm::compact::compact_memory();
+    Ok(())
+}
+
+/// W35 MM-3: `compaction_proactiveness` (0..=100, default 20; 0 turns kcompactd's proactive work off).
+fn compaction_proactiveness() -> u64 {
+    u64::from(mm_core::compact::proactiveness())
+}
+
+fn set_compaction_proactiveness(v: u64) -> Result<(), Errno> {
+    if mm_core::compact::set_proactiveness(v) { Ok(()) } else { Err(EINVAL) }
+}
+
+/// W35 MM-3: `extfrag_threshold` (0..=1000, default 500).
+fn extfrag_threshold() -> u64 {
+    u64::from(mm_core::compact::extfrag_threshold())
+}
+
+fn set_extfrag_threshold(v: u64) -> Result<(), Errno> {
+    if mm_core::compact::set_extfrag_threshold(v) { Ok(()) } else { Err(EINVAL) }
+}
+
+/// W35 MM-3: `compact_unevictable_allowed` (0..=1, default 1; kept: no migrator moves mlocked pages yet).
+fn compact_unevictable_allowed() -> u64 {
+    u64::from(mm_core::compact::unevictable_allowed())
+}
+
+fn set_compact_unevictable_allowed(v: u64) -> Result<(), Errno> {
+    if mm_core::compact::set_unevictable_allowed(v) { Ok(()) } else { Err(EINVAL) }
+}
+
 struct VmDir;
 
 impl DirSource for VmDir {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         let knob = |get: fn() -> u64, set: fn(u64) -> Result<(), Errno>| Arc::new(Knob { get, set, uint: false });
         let mut v = alloc::vec![
+            SynthEntry::file("compact_memory", 0o200, knob(compact_memory, set_compact_memory)),
+            SynthEntry::file("compact_unevictable_allowed", 0o644, knob(compact_unevictable_allowed, set_compact_unevictable_allowed)),
+            SynthEntry::file("compaction_proactiveness", 0o644, knob(compaction_proactiveness, set_compaction_proactiveness)),
+            SynthEntry::file("drop_caches", 0o200, Arc::new(DropCaches)),
+            SynthEntry::file("extfrag_threshold", 0o644, knob(extfrag_threshold, set_extfrag_threshold)),
             SynthEntry::file("max_map_count", 0o644, knob(max_map_count, set_max_map_count)),
             SynthEntry::file("mmap_min_addr", 0o644, knob(mmap_min_addr, set_mmap_min_addr)),
             SynthEntry::file("overcommit_kbytes", 0o644, knob(overcommit_kbytes, set_overcommit_kbytes)),
@@ -411,3 +489,31 @@ fn user_dir() -> Arc<dyn DirSource> {
     Arc::new(UserDir)
 }
 vfs::procdir!("/proc/sys/user", user_dir);
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    /// W35 MM-3: Linux's ranges and defaults (CachyOS 7.3.1 reads extfrag_threshold 500, compact_unevictable_allowed 1;
+    /// its compaction_proactiveness is 0 by CachyOS's choice, Linux's and BitsOS's default is 20).
+    #[test]
+    fn compaction_knobs_keep_linux_ranges() {
+        assert_eq!((extfrag_threshold(), compact_unevictable_allowed(), compact_memory()), (500, 1, 0));
+        assert_eq!(compaction_proactiveness(), 20);
+        assert_eq!(set_compaction_proactiveness(101), Err(EINVAL));
+        assert_eq!(set_extfrag_threshold(1001), Err(EINVAL));
+        assert_eq!(set_compact_unevictable_allowed(2), Err(EINVAL));
+        assert_eq!(set_compact_memory(0), Err(EINVAL));
+        assert_eq!(set_compact_memory(2), Err(EINVAL));
+        assert_eq!(set_compact_memory(1), Ok(()), "no boot allocator on the host: nothing to compact, no error");
+        assert_eq!(set_extfrag_threshold(1000), Ok(()));
+        assert_eq!(extfrag_threshold(), 1000);
+        assert_eq!(set_extfrag_threshold(500), Ok(()));
+        let entries = VmDir.entries().unwrap();
+        let mode = |n: &str| entries.iter().find(|e| e.name == n.as_bytes()).map(|e| e.perm & 0o777);
+        assert_eq!(mode("compact_memory"), Some(0o200), "write-only as Linux");
+        assert_eq!(mode("compaction_proactiveness"), Some(0o644));
+        assert_eq!(mode("extfrag_threshold"), Some(0o644));
+        assert_eq!(mode("compact_unevictable_allowed"), Some(0o644));
+    }
+}

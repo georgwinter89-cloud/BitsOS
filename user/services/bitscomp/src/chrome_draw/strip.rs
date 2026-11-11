@@ -43,7 +43,7 @@ pub fn strip(l: &StripLook, t: &Theme, area: Rect) -> Canvas {
     let mut c = Canvas::new(w, h);
     let b = p.b(l.rect);
     let r = t.radius_card as f32 * kk;
-    hud::shadow(&mut c, b, r, &t.shadow_raised, t);
+    hud::panel_shadow(&mut c, b, r, &t.shadow_raised, t);
     c.rrect(b, r, hud::glass(t, Glass::Bar));
     c.rrect_line(b, r, kk, alpha(t.accent, 0.18));
     hud::brackets(&mut c, b, t);
@@ -204,13 +204,16 @@ pub fn bottom(l: &BottomLook, t: &Theme, area: Rect) -> Canvas {
 fn feld(c: &mut Canvas, b: Box2, t: &Theme, hover: bool) {
     let kk = k(t);
     let r = b.h / 2.0;
-    hud::shadow(c, b, r, &t.shadow_lifted, t);
-    hud::glow_soft(c, b, r, t);
+    hud::panel_shadow(c, b, r, &t.shadow_lifted, t);
+    hud::panel_glow(c, b, r, t);
     c.rrect(b, r, alpha(t.panel, 0.78));
     c.rrect_line(Box2 { x: b.x - kk, y: b.y - kk, w: b.w + 2.0 * kk, h: b.h + 2.0 * kk }, r + kk, kk, alpha(t.accent, if hover { 0.7 } else { 0.45 }));
     let cy = b.y + b.h / 2.0;
     let ix = b.x + 22.0 * kk + 13.0 * kk;
-    c.ring(ix, cy, 9.0 * kk, 2.4 * kk, t.accent);
+    // WY-19b: at the gpu level the ring breathes (`fx::plan::feld_ring`).
+    if !t.effects_gpu {
+        c.ring(ix, cy, 9.0 * kk, 2.4 * kk, t.accent);
+    }
     c.disc(ix, cy, 3.0 * kk, t.accent);
     let cx = ix + 13.0 * kk + 14.0 * kk;
     c.fill(cx as i32, (cy - 11.0 * kk) as i32, (2.0 * kk).round() as i32, (22.0 * kk) as i32, t.accent);
@@ -242,8 +245,8 @@ pub fn stage(stage: Rect, t: &Theme, area: Rect) -> Canvas {
     let mut c = Canvas::new(w, h);
     let b = p.b(stage);
     let r = t.radius_card as f32 * kk;
-    hud::shadow(&mut c, b, r, &t.shadow_lifted, t);
-    hud::glow_soft(&mut c, b, r, t);
+    hud::panel_shadow(&mut c, b, r, &t.shadow_lifted, t);
+    hud::panel_glow(&mut c, b, r, t);
     c.rrect(b, r, hud::glass(t, Glass::Card));
     c.rrect_line(b, r, kk, alpha(t.accent, 0.18));
     hud::brackets(&mut c, b, t);

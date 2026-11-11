@@ -94,7 +94,7 @@ fn devices() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     kassert!(settled(), "USB devices did not settle in 15 s");
     if let Some(key) = iface::left_raw() {
-        return ktest::skip(&format!("CONFIG {key}=on leaves HID devices unbound"));
+        return ktest::fail(&format!("CONFIG {key}=on leaves HID devices unbound"));
     }
     let (mut seen, mut refused) = (0, 0);
     let refusals = iface::refusals();
@@ -133,7 +133,7 @@ fn devices() -> TestResult {
         }
     }
     if seen == 0 {
-        return ktest::skip("no USB HID device plugged in");
+        return ktest::fail("no USB HID device plugged in");
     }
     klog::event!(Info, "input", "ktest.hid_devices", interfaces = seen, refused = refused);
     Ok(())
@@ -150,7 +150,7 @@ fn qemu_devices() -> TestResult {
     kassert!(settled(), "USB devices did not settle");
     let found = until(5000 * MS, || qemu_keyboard().is_some());
     if !found && !registry::devices().iter().any(|d| d.vendor() == QEMU_VENDOR) {
-        return ktest::skip("no QEMU usb-kbd (xtask ktest adds usb-kbd and usb-tablet)");
+        return ktest::fail("no QEMU usb-kbd (xtask ktest adds usb-kbd and usb-tablet)");
     }
     let k = qemu_keyboard().ok_or("usb-kbd not bound")?;
     kassert!(k.protocol == iface::Protocol::Report, "keyboard in {} protocol", k.protocol.as_str());
@@ -174,7 +174,7 @@ ktest!("in.hid.qemu_devices", QemuOnly, qemu_devices);
 fn leds_follow_locks() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     kassert!(settled(), "USB devices did not settle");
-    let Some(k) = qemu_keyboard() else { return ktest::skip("no bound QEMU usb-kbd") };
+    let Some(k) = qemu_keyboard() else { return ktest::fail("no bound QEMU usb-kbd") };
     let sink = evdev::sink();
     let before = sink.locks();
     let result = (|| {
@@ -200,7 +200,7 @@ ktest!("in.hid.leds", QemuOnly, leds_follow_locks);
 fn report_and_unplug() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     kassert!(settled(), "USB devices did not settle");
-    let Some(k) = qemu_keyboard() else { return ktest::skip("no bound QEMU usb-kbd") };
+    let Some(k) = qemu_keyboard() else { return ktest::fail("no bound QEMU usb-kbd") };
     let sink = evdev::sink();
     let n = k.numbers()[0];
     let from = sink.next_seq();

@@ -43,7 +43,8 @@ pub fn glass_solid(t: &Theme, g: Glass) -> Rgba {
 
 /// The glass for a panel: translucent over the wallpaper, solid over windows.
 pub fn glass_for(t: &Theme, g: Glass, over_windows: bool) -> Rgba {
-    if over_windows { glass_solid(t, g) } else { glass(t, g) }
+    // WY-19a: the gpu level blurs what lies under it, so the panel stays glass over windows too.
+    if over_windows && !t.effects_gpu { glass_solid(t, g) } else { glass(t, g) }
 }
 
 /// How far the brackets reach outside their panel (board px): the margin an image needs around a bracketed panel.
@@ -222,6 +223,20 @@ pub fn shadow_layer(c: &mut Canvas, b: Box2, r: f32, (dy, blur_px, spread): (f32
 pub fn shadow(c: &mut Canvas, b: Box2, r: f32, s: &Shadow, t: &Theme) {
     for l in s.0.iter().rev() {
         shadow_layer(c, b, r, (l.dy, l.blur, l.spread), l.color, t);
+    }
+}
+
+/// A glass panel's shadow in its image: only at the cheap level, the gpu level draws it as `fx::Kind::Shadow`.
+pub fn panel_shadow(c: &mut Canvas, b: Box2, r: f32, s: &Shadow, t: &Theme) {
+    if !t.effects_gpu {
+        shadow(c, b, r, s, t);
+    }
+}
+
+/// A lit panel's glow in its image, likewise.
+pub fn panel_glow(c: &mut Canvas, b: Box2, r: f32, t: &Theme) {
+    if !t.effects_gpu {
+        glow_soft(c, b, r, t);
     }
 }
 

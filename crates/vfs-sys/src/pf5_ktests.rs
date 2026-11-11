@@ -152,7 +152,7 @@ fn pending() -> TestResult {
     const N: u64 = 1024;
     const SLACK: u64 = 4 << 20;
     if mm_core::frames().is_none() {
-        return ktest::skip("no frame allocator");
+        return ktest::fail("no frame allocator");
     }
     let pool = Arc::new(Pool::new("pf5-pending"));
     let c = PageCache::tmpfs(pool.clone());
@@ -342,13 +342,13 @@ fn pressure() -> TestResult {
     const LEAVE: u64 = 8 * MIB;
     const FILE: u64 = 16 * MIB;
     const ROUNDS: u64 = 40;
-    let Some(a) = mm_core::frames() else { return ktest::skip("no frame allocator") };
+    let Some(a) = mm_core::frames() else { return ktest::fail("no frame allocator") };
     let total = a.stats().total_bytes;
     if total == 0 || total > 5 * (512 * MIB) {
-        return ktest::skip("takes all free memory: small RAM only (54-grace-pressure.sh, the 2G gate)");
+        return ktest::fail("takes all free memory: small RAM only (54-grace-pressure.sh, the 2G gate)");
     }
     if free_bytes() < LEAVE + FILE + 32 * MIB {
-        return ktest::skip("too little free memory to start");
+        return ktest::fail("too little free memory to start");
     }
     // The file's buffer and the readers come first (they need the heap); then the frames go.
     let data = vec![0x6Bu8; FILE as usize];

@@ -189,7 +189,7 @@ fn spin(n: u32) {
 fn deadline64() -> R {
     let n = crate::wait_cpus_online(5 * SEC);
     if n < 2 {
-        return ktest::skip("needs two CPUs");
+        return ktest::fail("needs two CPUs");
     }
     let _back = FocusBack(interactive::focus());
     let _pin = crate::pin_for_now(crate::current_cpu()).ok_or("could not pin the driver")?;
@@ -293,7 +293,11 @@ fn deadline_run(n: usize, stop: &Arc<AtomicBool>, go: &Arc<AtomicBool>, hs: &mut
     kassert!(own < limit, "wake-to-run {} ms (limit {} ms)", own / MS, limit / MS);
     let seen = interactive::WAITS.get() - waits0;
     kassert!(seen >= ROUNDS as u64 / 2, "the metric saw {seen} waits");
-    kassert!(st.max_ns >= own && interactive::WAIT_MAX_NS.get() == st.max_ns, "metric max {} < own {own} or counter {}", st.max_ns, interactive::WAIT_MAX_NS.get());
+    kassert!(st.max_ns >= own, "metric max {} < own {own}", st.max_ns);
+    // Other threads' waits go on: a new maximum lands in MAX a moment before the counter, so the two are compared
+    // until a read finds them settled, not at one instant.
+    let settled = (0..1000).any(|_| interactive::WAIT_MAX_NS.get() == interactive::wait_stats_now().max_ns);
+    kassert!(settled, "the counter {} never matched the metric max {}", interactive::WAIT_MAX_NS.get(), interactive::wait_stats_now().max_ns);
     for i in 0..BUSY {
         kassert!(end[i] > mid[i] && mid[i] >= before[i], "busy thread {i} starved: {} -> {} -> {}", before[i], mid[i], end[i]);
     }
@@ -307,7 +311,7 @@ fn deadline_run(n: usize, stop: &Arc<AtomicBool>, go: &Arc<AtomicBool>, hs: &mut
 /// (the race the fixer closed: each saw the other still alive), and the group cannot be granted afterwards.
 fn exit_race() -> R {
     if crate::wait_cpus_online(5 * SEC) < 2 {
-        return ktest::skip("needs two CPUs");
+        return ktest::fail("needs two CPUs");
     }
     let _back = FocusBack(interactive::focus());
     const ROUNDS: usize = 32;
@@ -408,7 +412,7 @@ fn focus_flips() -> R {
 fn front_shares() -> R {
     let n = crate::wait_cpus_online(5 * SEC);
     if n < 2 {
-        return ktest::skip("needs two CPUs");
+        return ktest::fail("needs two CPUs");
     }
     let _back = FocusBack(interactive::focus());
     let me = crate::current_cpu();

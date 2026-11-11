@@ -1,17 +1,20 @@
-//! The boot stick at `/boot` (kernel side).
+//! The boot volume at `/boot` (kernel side): the USB stick, or the ESP on the NVMe that `nvme_boot=` names.
 //!
-//! When the block layer lists a USB disk it recognised as the boot stick (`StickMatch::Yes`: a partition start
-//! or block 0 holds the 96 bytes bitsboot read from the boot volume), this module plugs its write gate into
-//! that disk, mounts the FAT32 volume there at `/boot` and decides whether it may be written. **All** of these
-//! must hold, else the volume is mounted read-only and the first reason that failed is logged (R8b: a doubt
+//! When the block layer lists a USB or NVMe disk it recognised as the boot volume's (`StickMatch::Yes`: a partition
+//! start or block 0 holds the 96 bytes bitsboot read from the boot volume), this module plugs its write gate into
+//! the volume's disk, mounts the FAT32 volume there at `/boot` and decides whether it may be written. **All** of
+//! these must hold, else the volume is mounted read-only and the first reason that failed is logged (R8b: a doubt
 //! refuses the write; V1 `fs/stickid.asm`):
 //! 1. bitsboot handed over `\BITSOS2\STICK.ID` and the volume's own `\BITSOS2\STICK.ID` holds the same 32 hex
 //!    digits;
 //! 2. the volume label is `BITSOS` (the stick tool's rule, BT-3);
-//! 3. exactly one USB disk matches the stick and no USB disk is a doubt (`StickMatch::Unknown`): a cloned
-//!    stick or one whose partition starts could not be read turns writing off for both;
-//! 4. the device is not write-protected, its partition table is clean (no Windows/EFI partition, R8a), and
-//!    the volume has two mirrored FATs.
+//! 3. exactly one USB or NVMe disk matches the boot volume and none is a doubt (`StickMatch::Unknown`): a cloned
+//!    stick or one whose partition starts could not be read turns writing off for both; the stick plugged in
+//!    beside an NVMe boot (another block 0) is an ordinary disk;
+//! 4. the device is not write-protected and the volume has two mirrored FATs; on a USB stick the partition table
+//!    is clean (no Windows/EFI partition, R8a); on an NVMe disk the volume is exactly the ESP `nvme_boot=` names
+//!    beside `nvme_data=`'s armed window (`block::gpt::window::boot_esp`, Georg 6.11.2026), and its writes go
+//!    through a second window of exactly that range (`Disk::open_boot_window`, both layers).
 //!
 //! The volume is mounted read-only at once and writing is decided only after no disk came or went for 2 s, so a
 //! clone plugged in with the stick is seen first. A USB disk that might be the stick appearing later turns
@@ -21,6 +24,7 @@
 //! FAT code announces while it writes them (`DiskDev::write`), and only inside the FATs, the data area and the
 //! FSInfo sector; never the partition table, the boot sector or its backup, and nothing at all unless armed.
 
+pub use crate::stick_rules::{Facts, parse_stick_id, source_name, verdict};
 use crate::vol::{Clock, Options, Volume};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -34,68 +38,28 @@ use uapi::errno::*;
 /// Where the stick is mounted in the boot view.
 pub const MOUNT: &str = "/boot";
 
-/// `\BITSOS2\STICK.ID`'s text as 16 bytes (bitsboot's rule: 32 hex digits, white space around ignored).
-pub fn parse_stick_id(text: &[u8]) -> Option<[u8; 16]> {
-    let t = core::str::from_utf8(text).ok()?.trim();
-    if t.len() != 32 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut id = [0u8; 16];
-    for (i, b) in id.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(id)
-}
-
-/// What the write decision looks at.
-#[derive(Clone, Debug, Default)]
-pub struct Facts {
-    pub loader_id: Option<[u8; 16]>,
-    pub volume_id: Option<[u8; 16]>,
-    pub label: Vec<u8>,
-    /// USB disks recognised as the stick, and USB disks that might be it.
-    pub sticks: usize,
-    pub doubts: usize,
-    pub device_read_only: bool,
-    pub table_clean: bool,
-    pub layout_ok: bool,
-}
-
-/// Ok: the volume may be written (below `\BITSOS2\`); Err: why not (pure; host-tested).
-pub fn verdict(f: &Facts) -> Result<(), &'static str> {
-    let Some(want) = f.loader_id else { return Err("bitsboot handed over no \\BITSOS2\\STICK.ID") };
-    match f.volume_id {
-        None => return Err("the volume has no readable \\BITSOS2\\STICK.ID"),
-        Some(id) if id != want => return Err("the volume's STICK.ID differs from the boot stick's"),
-        _ => {}
-    }
-    if !f.label.eq_ignore_ascii_case(b"BITSOS") {
-        return Err("the volume label is not BITSOS");
-    }
-    if f.sticks != 1 {
-        return Err("more than one USB disk looks like the boot stick");
-    }
-    if f.doubts != 0 {
-        return Err("a USB disk could not be told apart from the boot stick");
-    }
-    if f.device_read_only {
-        return Err("the stick is write-protected or its unit refuses writes");
-    }
-    if !f.table_clean {
-        return Err("its partition table is protected (R8a)");
-    }
-    if !f.layout_ok {
-        return Err("the volume does not keep two mirrored FATs");
-    }
-    Ok(())
-}
-
 struct Mounted {
     disk: String,
-    /// The disk itself (a name can come back with a new disk after a re-plug).
+    /// The disk the volume sits on (a name can come back with a new disk after a re-plug): the stick, or the
+    /// ESP's stacked partition disk.
     dref: Weak<Disk>,
+    /// The whole disk bitsboot's block 0 matched: the stick itself, or the NVMe namespace.
+    whole: Weak<Disk>,
+    nvme: bool,
     vol: Arc<Volume>,
     gate: Arc<StickGate>,
+}
+
+impl Mounted {
+    /// No more writes: the FAT gate and, on the NVMe, the boot ESP's window at both layers.
+    fn shut(&self) {
+        self.gate.disarm();
+        if self.nvme
+            && let Some(w) = self.whole.upgrade()
+        {
+            w.close_boot_window();
+        }
+    }
 }
 
 static MOUNTED: Mutex<Option<Mounted>> = Mutex::named("fat.stick", None);
@@ -120,11 +84,26 @@ pub fn with_sys<R>(f: impl FnOnce(&crate::sysapi::Sys<'_>) -> R) -> Result<R, i6
     Ok(f(&crate::sysapi::Sys { vol: &vol, ns: &ns, mount: MOUNT }))
 }
 
-fn usb_counts() -> (usize, usize) {
+/// The mounted boot volume lies on an NVMe disk (no data.img there: fs-ext4's fallback is the stick's).
+pub fn on_nvme() -> bool {
+    MOUNTED.lock().as_ref().is_some_and(|m| m.nvme)
+}
+
+/// The block disk the mounted boot volume sits on (`msd0`, `nvme0n1p3`).
+pub fn disk_name() -> Option<String> {
+    MOUNTED.lock().as_ref().map(|m| m.disk.clone())
+}
+
+/// Disks that may hold the boot volume: USB sticks and NVMe namespaces (their partitions are matched through them).
+fn boot_kind(k: DiskKind) -> bool {
+    matches!(k, DiskKind::Usb | DiskKind::Nvme)
+}
+
+fn boot_counts() -> (usize, usize) {
     let mut yes = 0;
     let mut unknown = 0;
     for d in block::disks() {
-        if d.kind() == DiskKind::Usb {
+        if boot_kind(d.kind()) {
             match d.stick() {
                 StickMatch::Yes => yes += 1,
                 StickMatch::Unknown => unknown += 1,
@@ -230,16 +209,18 @@ fn settle() {
     }
 }
 
-/// `/dev/<disk>p<n>` for the partition starting at `start` (n is Linux's partition number from the scan: the
-/// table slot, logical partitions from 5; Linux's `disk_name` puts a `p` after a disk name ending in a digit),
-/// `/dev/<disk>` for a stick without a table.
-pub fn source_name(disk: &str, start: u64, parts: &[(u64, u64, String, u32)]) -> String {
-    match parts.iter().find(|p| p.0 == start) {
-        Some(p) if start != 0 => {
-            let sep = if disk.ends_with(|c: char| c.is_ascii_digit()) { "p" } else { "" };
-            alloc::format!("/dev/{disk}{sep}{}", p.3)
+/// The stacked disk of the boot partition `name` of NVMe disk `d`: the driver registers a namespace's partitions
+/// right after the namespace, and this runs on the mount thread from the namespace's registration.
+fn part_disk(d: &Arc<Disk>, name: &str) -> Option<Arc<Disk>> {
+    let end = ksync::now_ns().unwrap_or(0).saturating_add(30_000_000_000);
+    loop {
+        if let Some(p) = block::find(name) {
+            return Some(p);
         }
-        _ => alloc::format!("/dev/{disk}"),
+        if !is_listed(d) || ksync::now_ns().unwrap_or(u64::MAX) >= end {
+            return None;
+        }
+        sched::sleep_ns(20_000_000);
     }
 }
 
@@ -251,16 +232,26 @@ fn mount_inner(d: Arc<Disk>) -> Result<Option<&'static str>, &'static str> {
     let identity = block::policy::stick_identity().ok_or("no boot stick identity")?;
     let block0 = identity.block0.ok_or("bitsboot could not read the stick's block 0")?;
     let scan = d.scan();
-    let start = scan.firsts.iter().find(|(_, b)| *b == block0).map(|(lba, _)| *lba).ok_or("no partition start holds the boot volume")?;
+    let at = scan.firsts.iter().find(|(_, b)| *b == block0).map(|(lba, _)| *lba).ok_or("no partition start holds the boot volume")?;
     let blocks = d.dev_info().blocks;
-    let sectors = if start == 0 { blocks } else { scan.parts.iter().find(|p| p.0 == start).map(|p| p.1).ok_or("the boot volume's partition is not listed")? };
-    let gate = gate_for(&d);
-    let dev = Arc::new(DiskDev::new(d.clone(), start, sectors, Some(gate.clone())));
+    let sectors = if at == 0 { blocks } else { scan.parts.iter().find(|p| p.0 == at).map(|p| p.1).ok_or("the boot volume's partition is not listed")? };
+    let nvme = d.kind() == DiskKind::Nvme;
+    // On the NVMe the volume sits on its partition's own disk, whose writes pass the partition's port: the FAT gate
+    // there is that partition's alone, never asked for nvme_data's.
+    let (vd, start) = if nvme {
+        let number = scan.parts.iter().find(|p| p.0 == at && at != 0).map(|p| p.3).ok_or("the boot volume on the NVMe is no partition")?;
+        let part = part_disk(&d, &block::gpt::part_name(d.name(), number)).ok_or("the boot partition's disk did not appear")?;
+        (part, 0)
+    } else {
+        (d.clone(), at)
+    };
+    let gate = gate_for(&vd);
+    let dev = Arc::new(DiskDev::new(vd.clone(), start, sectors, Some(gate.clone())));
     let vol = Volume::mount(dev, Options { writable: false, stick: true }, CLOCK)?;
     let ns = vfs::root_ns();
     match crate::glue::mount(&vol, &ns, MOUNT, false) {
         // FS-13: the device as Linux names it (`mnt_devname`), so /proc/mounts shows /boot's real source.
-        Ok(m) => m.sb.set_source(&source_name(d.name(), start, &scan.parts)),
+        Ok(m) => m.sb.set_source(&source_name(d.name(), at, &scan.parts)),
         Err(e) => {
             klog::event!(Warn, "fat", "stick.mount_failed", disk = String::from(d.name()), errno = e);
             return Err("mounting /boot failed");
@@ -271,63 +262,78 @@ fn mount_inner(d: Arc<Disk>) -> Result<Option<&'static str>, &'static str> {
     if vfs::writeback::register_fs(w).is_err() {
         klog::event!(Warn, "fat", "stick.no_sync_hook"; "vfs::writeback::sync_all will not reach the stick's FSInfo and cache flush");
     }
-    *MOUNTED.lock() = Some(Mounted { disk: String::from(d.name()), dref: Arc::downgrade(&d), vol: vol.clone(), gate: gate.clone() });
+    *MOUNTED.lock() = Some(Mounted { disk: String::from(vd.name()), dref: Arc::downgrade(&vd), whole: Arc::downgrade(&d), nvme, vol: vol.clone(), gate: gate.clone() });
     // The disk may have gone between the scan and the line above (its `unregistered` found nothing to undo):
     // block::unregister takes it off the list before it tells the listeners, so a check after the store
     // sees it.
-    if !is_listed(&d) {
+    if !is_listed(&d) || !is_listed(&vd) {
         if let Some(m) = take_mounted(&d) {
             teardown(m);
         }
         return Err("the stick went away while it was mounted");
     }
-    klog::event!(Info, "fat", "stick.mounted", disk = String::from(d.name()), start_lba = start, sectors = sectors,
+    klog::event!(Info, "fat", "stick.mounted", disk = String::from(vd.name()), start_lba = at, sectors = sectors, nvme = nvme,
         cluster_bytes = vol.geo.cluster_bytes(), clusters = vol.geo.clusters,
         label = String::from_utf8_lossy(&vol.label_text()).into_owned(); "the boot stick is at /boot (read-only until its identity is decided)");
     settle();
     let volume_id = vol.peek(&[b"BITSOS2", b"STICK.ID"]).ok().flatten().and_then(|e| vol.peek_read(&e, 64).ok()).and_then(|t| parse_stick_id(&t));
-    let (sticks, doubts) = usb_counts();
+    let (sticks, doubts) = boot_counts();
+    let now = d.scan();
+    let w = block::gpt::window::boot_esp;
     let facts = Facts {
         loader_id: identity.id,
         volume_id,
         label: vol.label_text(),
         sticks,
         doubts,
-        device_read_only: d.dev_info().read_only,
-        table_clean: d.scan().verdict() == block::table::Verdict::Clean,
+        // The NVMe namespace itself (its partition disk stays read-only until the boot window opens).
+        device_read_only: d.device().info().read_only,
+        table_clean: now.verdict() == block::table::Verdict::Clean,
         layout_ok: vol.geo.writable_layout(),
+        nvme: nvme.then(|| w(&block::gpt::window::boot_keys(), &block::gpt::window::esp_key(), d.window(), d.named_esp(), d.dev_info().blocks, &now, at, sectors)),
     };
     let mut decision = verdict(&facts);
     if decision.is_ok() && vol.is_gone() {
         decision = Err("the stick went away while USB settled");
     }
+    if decision.is_ok()
+        && nvme
+        && let Err(why) = d.open_boot_window(at, sectors)
+    {
+        decision = Err(why);
+    }
     if decision.is_ok() {
         let g = &vol.geo;
         gate.arm(start + g.reserved, start + g.total, g.fsinfo.map(|s| start + s));
-        if !vol.allow_writes() {
+        // On the NVMe every layer below the gate must agree too (the partition's disk, its port, the controller).
+        let below = if nvme && vd.write_policy().is_err() { Some("the boot partition's disk refuses writes") } else { None };
+        if below.is_some() || !vol.allow_writes() {
             gate.disarm();
-            decision = Err("writing was turned off meanwhile");
+            if nvme {
+                d.close_boot_window();
+            }
+            decision = Err(below.unwrap_or("writing was turned off meanwhile"));
         }
     }
     let free = vol.statfs().map(|s| s.2).unwrap_or(0);
-    klog::event!(Info, "fat", "stick.decided", disk = String::from(d.name()), rw = decision.is_ok(), sticks = sticks, doubts = doubts,
+    klog::event!(Info, "fat", "stick.decided", disk = String::from(vd.name()), nvme = nvme, rw = decision.is_ok(), sticks = sticks, doubts = doubts,
         free_clusters = free, reason = decision.err().unwrap_or("identity confirmed: writes below \\BITSOS2\\ only"));
     Ok(decision.err())
 }
 
-/// Takes the mount record of disk `d`, if the mounted stick is that disk.
+/// Takes the mount record of disk `d`, if the mounted volume lies on that disk (or on a partition of it).
 fn take_mounted(d: &Arc<Disk>) -> Option<Mounted> {
     let me = Arc::downgrade(d);
     let mut m = MOUNTED.lock();
     match m.as_ref() {
-        Some(x) if Weak::ptr_eq(&x.dref, &me) => m.take(),
+        Some(x) if Weak::ptr_eq(&x.dref, &me) || Weak::ptr_eq(&x.whole, &me) => m.take(),
         _ => None,
     }
 }
 
 /// The stick went away: no more writes, every call EIO, `/boot` unmounted.
 fn teardown(m: Mounted) {
-    m.gate.disarm();
+    m.shut();
     m.vol.set_gone();
     let ns = vfs::root_ns();
     let r = ns.lookup_path(MOUNT.as_bytes(), true).and_then(|p| ns.umount(&p));
@@ -370,7 +376,7 @@ struct Listener;
 impl block::DiskListener for Listener {
     fn registered(&self, d: &Arc<Disk>) {
         retry_pending();
-        if d.kind() != DiskKind::Usb {
+        if !boot_kind(d.kind()) {
             return;
         }
         match d.stick() {
@@ -379,11 +385,11 @@ impl block::DiskListener for Listener {
             _ => {
                 // Another disk that is (or might be) the boot stick: writing stops until the next boot.
                 if let Some(m) = MOUNTED.lock().as_ref()
-                    && !Weak::ptr_eq(&m.dref, &Arc::downgrade(d))
+                    && !Weak::ptr_eq(&m.whole, &Arc::downgrade(d))
                 {
                     let was = m.vol.writable();
                     m.vol.set_read_only();
-                    m.gate.disarm();
+                    m.shut();
                     klog::event!(Warn, "fat", "stick.read_only", disk = m.disk.clone(), other = String::from(d.name()), was_writable = was;
                         "a second disk looks like the boot stick: /boot is read-only from now on");
                 }
@@ -412,49 +418,3 @@ fn init() -> Result<(), &'static str> {
     Ok(())
 }
 kreg::initcall!(kreg::Level::Service, "fat.stick", init);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn good() -> Facts {
-        Facts { loader_id: Some([7; 16]), volume_id: Some([7; 16]), label: b"BITSOS".to_vec(), sticks: 1, doubts: 0, device_read_only: false, table_clean: true, layout_ok: true }
-    }
-
-    #[test]
-    fn source_names_like_linux() {
-        // Slot 2 is empty: the second partition is number 3, its slot, not its position (sdb3, not sdb2).
-        let parts = alloc::vec![(2048u64, 100u64, String::from("FAT32"), 1u32), (4096, 100, String::from("Linux"), 3)];
-        assert_eq!(source_name("msd0", 2048, &parts), "/dev/msd0p1");
-        assert_eq!(source_name("msd0", 4096, &parts), "/dev/msd0p3");
-        assert_eq!(source_name("sdb", 4096, &parts), "/dev/sdb3");
-        assert_eq!(source_name("msd1", 0, &[]), "/dev/msd1");
-    }
-
-    #[test]
-    fn identity_rules() {
-        assert_eq!(verdict(&good()), Ok(()));
-        let cases: Vec<(Facts, &str)> = alloc::vec![
-            (Facts { loader_id: None, ..good() }, "bitsboot handed over no \\BITSOS2\\STICK.ID"),
-            (Facts { volume_id: None, ..good() }, "the volume has no readable \\BITSOS2\\STICK.ID"),
-            (Facts { volume_id: Some([8; 16]), ..good() }, "the volume's STICK.ID differs from the boot stick's"),
-            (Facts { label: b"ZORINOS".to_vec(), ..good() }, "the volume label is not BITSOS"),
-            (Facts { sticks: 2, ..good() }, "more than one USB disk looks like the boot stick"),
-            (Facts { doubts: 1, ..good() }, "a USB disk could not be told apart from the boot stick"),
-            (Facts { device_read_only: true, ..good() }, "the stick is write-protected or its unit refuses writes"),
-            (Facts { table_clean: false, ..good() }, "its partition table is protected (R8a)"),
-            (Facts { layout_ok: false, ..good() }, "the volume does not keep two mirrored FATs"),
-        ];
-        for (f, why) in cases {
-            assert_eq!(verdict(&f), Err(why));
-        }
-        assert_eq!(verdict(&Facts { label: b"bitsos".to_vec(), ..good() }), Ok(()));
-    }
-
-    #[test]
-    fn stick_id_text() {
-        assert_eq!(parse_stick_id(b"00112233445566778899aabbccddeeff\r\n").unwrap()[15], 0xff);
-        assert!(parse_stick_id(b"0011").is_none());
-        assert!(parse_stick_id(b"zz112233445566778899aabbccddeeff").is_none());
-    }
-}

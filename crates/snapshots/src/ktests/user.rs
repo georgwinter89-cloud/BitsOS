@@ -127,4 +127,4 @@ fn user() -> TestResult {
     let _ = vfs::writeback::sync_durable();
     r
 }
-ktest!("snap.user", QemuOnly, user);
+ktest!("snap.user", Run("vs/30-snapshots"), user);

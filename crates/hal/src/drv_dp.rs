@@ -95,6 +95,34 @@ impl FbWindow {
         self.copy_in(off, src.as_ptr().cast::<u8>(), n)
     }
 
+    /// WY-17: copies 32-bit pixels from byte `off` of the window into `dst`; false (nothing copied) if they do not
+    /// lie inside. Reads write-combined memory: slow, only on request (MCP `screen`).
+    pub fn read_pixels(&self, off: usize, dst: &mut [u32]) -> bool {
+        let Some(n) = dst.len().checked_mul(4) else { return false };
+        if !crate::BARE_METAL || off.checked_add(n).is_none_or(|e| e > self.len()) {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+        let src = (self.win.virt() as usize).wrapping_add(off);
+        let dst = dst.as_mut_ptr().cast::<u8>();
+        // SAFETY: the source `[src, src + n)` lies inside the mapped, verified device window (checked above, no
+        // overflow), which this FbWindow keeps mapped; device memory is no Rust object, so nothing is aliased. `dst`
+        // is a live, exclusively borrowed slice of `n` bytes (u32 has no padding, every byte pattern is valid) and
+        // RAM, so the two never overlap. DF is clear (Rust ABI).
+        unsafe {
+            core::arch::asm!(
+                "rep movsb",
+                inout("rcx") n => _,
+                inout("rsi") src => _,
+                inout("rdi") dst => _,
+                options(nostack, preserves_flags)
+            );
+        }
+        true
+    }
+
     /// `n` bytes from `src` (the pointer and byte length of a live slice) to byte `off`.
     fn copy_in(&self, off: usize, src: *const u8, n: usize) -> bool {
         if !crate::BARE_METAL || off.checked_add(n).is_none_or(|e| e > self.len()) {

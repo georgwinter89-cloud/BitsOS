@@ -34,11 +34,13 @@ mod pf3_ktests;
 mod pf4_ktests;
 mod pf5_ktests;
 mod pf6_ktests;
+mod pf7_ktests;
 mod mnt_ktests;
 pub mod preload;
 mod preload_ktests;
 mod preload_reclaim_ktest;
 mod preload_tool;
+mod bl4_ktests;
 mod ktests;
 mod sysinfo;
 
@@ -169,23 +171,22 @@ fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     vfs::inode::set_id_view(id_view);
     let p = c.proc;
     let mem = ProcMem(p);
-    // FS-16: the calling thread's cwd/root/umask, apart from the fd table.
-    let fs = c.thread.fs(p);
-    let ns = mount_view(p);
-    // PF-6: one look at the credentials per call (each `cred()` takes the group's `proc.cred` lock and its
-    // `Arc` count: with many threads the most contended lock of a read, plan/notes/fs-PF-6.md).
-    let cred = p.cred();
-    let subject = policy::Subject { program: p.program, pid: p.pid, uid: cred.euid };
-    let s = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: cred.fs(), subject };
-    drop(cred);
+    // FS-16: the calling thread's cwd/root/umask, apart from the fd table; PF-7: looked up when a call asks.
+    let fs = proc::ThreadFs::new(c.thread, p);
+    // PF-7: no write to a line the program's threads share: `proc.fs`, `proc.cred` and the `Arc` counts of the fs
+    // state, the credentials and the mount view were each one per syscall (plan/notes/fs-PF-7.md).
+    let ns = proc::ns::mnt::CallView::new(p);
+    let ids = p.group().call_ids();
+    let subject = policy::Subject { program: p.program, pid: p.pid, uid: ids.euid };
+    let s = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: ids.fs, subject };
     let a: Args = c.args;
     f(&s, a)
 }
 
-/// SX-3a: the mount view of `p`'s calls (its mount namespace's). While no view was ever copied every process
-/// uses the boot view it holds, so the common path takes no lock.
+/// SX-3a: the mount view of `p`'s calls (its mount namespace's); no lock for a program in the boot view.
 pub(crate) fn mount_view(p: &Process) -> alloc::sync::Arc<vfs::MountNs> {
-    if vfs::MountNs::copies_exist() { p.mount_ns() } else { p.ns.clone() }
+    let mut held = None;
+    p.mount_view(&mut held).clone()
 }
 
 /// One handler per call. Numbers `uapi::nr` names go through `syscall!`; the few it does not name yet
@@ -212,26 +213,30 @@ macro_rules! fs_call {
 use vfs::sys as v;
 
 /// NW-5: a socket fd's read/write/readv/writev are one recvmsg/sendmsg each (a datagram stays one datagram;
-/// the generic path splits writes into 64 KiB pieces, fine only for byte streams).
-fn on_socket(s: &Sys<'_>, fd: u64) -> bool {
-    let fd = fd as u32 as i32;
-    fd >= 0 && s.fds.get(fd as usize).is_ok_and(|f| net::sock::SockFile::of(&f.file).is_some())
+/// the generic path splits writes into 64 KiB pieces, fine only for byte streams). PF-7: the file looked up here
+/// is the one the call goes on with, one look-up per call.
+fn on_socket(f: &Result<alloc::sync::Arc<vfs::fd::OpenFile>, Errno>) -> bool {
+    f.as_ref().is_ok_and(|f| net::sock::SockFile::of(&f.file).is_some())
 }
 
 fn read_any(s: &Sys<'_>, a: Args) -> i64 {
-    if on_socket(s, a[0]) { net::sock::sys::read(s, a) } else { v::read(s, a) }
+    let f = s.file(a[0]);
+    if on_socket(&f) { net::sock::sys::read(s, a) } else { v::read_file(s, f, a) }
 }
 
 fn write_any(s: &Sys<'_>, a: Args) -> i64 {
-    if on_socket(s, a[0]) { net::sock::sys::write(s, a) } else { v::write(s, a) }
+    let f = s.file(a[0]);
+    if on_socket(&f) { net::sock::sys::write(s, a) } else { v::write_file(s, f, a) }
 }
 
 fn readv_any(s: &Sys<'_>, a: Args) -> i64 {
-    if on_socket(s, a[0]) { net::sock::sys::readv(s, a) } else { v::readv(s, a) }
+    let f = s.file(a[0]);
+    if on_socket(&f) { net::sock::sys::readv(s, a) } else { v::readv_file(s, f, a, 0) }
 }
 
 fn writev_any(s: &Sys<'_>, a: Args) -> i64 {
-    if on_socket(s, a[0]) { net::sock::sys::writev(s, a) } else { v::writev(s, a) }
+    let f = s.file(a[0]);
+    if on_socket(&f) { net::sock::sys::writev(s, a) } else { v::writev_file(s, f, a, 0) }
 }
 
 fs_call!(READ, read_any);
@@ -309,6 +314,7 @@ fs_call!(INOTIFY_INIT1, vi::inotify_init1);
 // FS-1b (the brief grants these entry points): attributes, statfs, sync, vectored and copying I/O.
 use vfs::sys_attr as va;
 use vfs::sys_copy as vc;
+use vfs::sys_xattr as vx;
 fs_call!(CHMOD, va::chmod);
 fs_call!(FCHMOD, va::fchmod);
 fs_call!(92, "chown", va::chown);
@@ -327,6 +333,20 @@ fs_call!(306, "syncfs", va::syncfs);
 fs_call!(452, "fchmodat2", va::fchmodat2);
 fs_call!(40, "sendfile", vc::sendfile);
 fs_call!(221, "fadvise64", vc::fadvise64);
+fs_call!(187, "readahead", vx::readahead);
+fs_call!(188, "setxattr", vx::setxattr);
+fs_call!(189, "lsetxattr", vx::lsetxattr);
+fs_call!(190, "fsetxattr", vx::fsetxattr);
+fs_call!(191, "getxattr", vx::getxattr);
+fs_call!(192, "lgetxattr", vx::lgetxattr);
+fs_call!(193, "fgetxattr", vx::fgetxattr);
+fs_call!(194, "listxattr", vx::listxattr);
+fs_call!(195, "llistxattr", vx::llistxattr);
+fs_call!(196, "flistxattr", vx::flistxattr);
+fs_call!(197, "removexattr", vx::removexattr);
+fs_call!(198, "lremovexattr", vx::lremovexattr);
+fs_call!(199, "fremovexattr", vx::fremovexattr);
+fs_call!(277, "sync_file_range", vx::sync_file_range);
 fs_call!(295, "preadv", vc::preadv);
 fs_call!(296, "pwritev", vc::pwritev);
 fs_call!(326, "copy_file_range", vc::copy_file_range);
@@ -340,14 +360,14 @@ fn rwf_ok(a: &Args) -> bool {
 }
 
 fn preadv2_any(s: &Sys<'_>, a: Args) -> i64 {
-    if a[3] as i64 == -1 && on_socket(s, a[0]) {
+    if a[3] as i64 == -1 && on_socket(&s.file(a[0])) {
         return if rwf_ok(&a) { net::sock::sys::readv(s, a) } else { -EOPNOTSUPP };
     }
     vc::preadv2(s, a)
 }
 
 fn pwritev2_any(s: &Sys<'_>, a: Args) -> i64 {
-    if a[3] as i64 == -1 && on_socket(s, a[0]) {
+    if a[3] as i64 == -1 && on_socket(&s.file(a[0])) {
         return if rwf_ok(&a) { net::sock::sys::writev(s, a) } else { -EOPNOTSUPP };
     }
     vc::pwritev2(s, a)
@@ -356,16 +376,27 @@ fn pwritev2_any(s: &Sys<'_>, a: Args) -> i64 {
 /// FS-5: the background write-back of files whose page cache has a backend (none before FS-6: then it only
 /// sleeps). Class Background (B4, FS-12); it never waits on a program, each pass is bounded by the backends.
 const WRITEBACK_PERIOD_NS: u64 = 5_000_000_000;
+/// The shortest gap between two passes a writer over the dirty limit asked for.
+const KICK_GAP_NS: u64 = 200_000_000;
 
 fn writeback_loop() {
+    let mut last = 0u64;
     loop {
-        sched::sleep_ns(WRITEBACK_PERIOD_NS);
+        // Its period, or sooner for a writer over the dirty limit (`writeback::balance_dirty`), but not more often
+        // than every `KICK_GAP_NS`: every pass commits the journals, and kicks come from every waiting writer.
+        vfs::writeback::wait_for_work(WRITEBACK_PERIOD_NS);
+        let since = ksync::now_ns().unwrap_or(0).saturating_sub(last);
+        if since < KICK_GAP_NS {
+            sched::sleep_ns(KICK_GAP_NS - since);
+        }
+        last = ksync::now_ns().unwrap_or(0);
         if vfs::writeback::registered() > 0 {
             let p = vfs::writeback::flush_all(vfs::pagecache::SyncKind::Background);
             if p.failed > 0 {
                 klog::event!(Warn, "vfs", "writeback.pass", flushed = p.flushed, failed = p.failed);
             }
         }
+        vfs::writeback::pass_done();
     }
 }
 
@@ -383,16 +414,52 @@ fn start_writeback() -> Result<(), &'static str> {
 }
 kreg::initcall!(kreg::Level::Service, "vfs.writeback", start_writeback);
 
-/// FS-12: the read-ahead thread (`vfs::readahead`). Background, so its disk requests never go before a reader's
-/// own (`block::prio::current`). Without it read-ahead is off and readers read every page themselves.
-fn start_readahead() -> Result<(), &'static str> {
-    match sched::spawn("vfs.readahead", sched::Class::Background, || vfs::readahead::reader_loop()) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            klog::event!(Warn, "vfs", "readahead.no_thread"; "read-ahead off");
-            Err("vfs.readahead: no thread")
+/// BL-4: the block layer's I/O priorities for read-ahead jobs (`vfs::readahead::IoPrio`): a job runs at the
+/// priority of the reader that opened its window, through an I/O floor (`block::prio::floor`) on the worker.
+struct RaPrio;
+
+impl vfs::readahead::IoPrio for RaPrio {
+    fn current(&self) -> vfs::readahead::Prio {
+        match block::prio::current() {
+            block::prio::IoPriority::Interactive => vfs::readahead::Prio::Interactive,
+            block::prio::IoPriority::Normal => vfs::readahead::Prio::Normal,
+            block::prio::IoPriority::Background => vfs::readahead::Prio::Background,
         }
     }
+    fn run_at(&self, p: vfs::readahead::Prio, f: &mut dyn FnMut()) {
+        let want = match p {
+            vfs::readahead::Prio::Interactive => block::prio::IoPriority::Interactive,
+            vfs::readahead::Prio::Normal => block::prio::IoPriority::Normal,
+            vfs::readahead::Prio::Background => block::prio::IoPriority::Background,
+        };
+        let _floor = block::prio::floor(want);
+        f()
+    }
+}
+
+static RA_PRIO: RaPrio = RaPrio;
+
+/// FS-12, BL-4: the read-ahead workers (`vfs::readahead::worker`), one per CPU (R1: from the CPU count), class
+/// Background: a job's own requests go at its reader's priority (`RaPrio`), a worker never raises them above it.
+/// Placed on their CPU at the start but not pinned, so an idle CPU may take a busy one's job. Without any worker
+/// no async window is queued (readers still read their own windows).
+fn start_readahead() -> Result<(), &'static str> {
+    vfs::readahead::set_io_prio(&RA_PRIO);
+    let cpus = sched::online_cpus().max(1);
+    let mut started = 0usize;
+    for cpu in 0..cpus {
+        let name = alloc::format!("vfs.readahead/{cpu}");
+        let opts = sched::SpawnOpts { cpu: Some(cpu), pin: false, ..sched::SpawnOpts::default() };
+        if sched::spawn_with(&name, sched::Class::Background, opts, move || vfs::readahead::worker(cpu)).is_ok() {
+            started += 1;
+        }
+    }
+    if started == 0 {
+        klog::event!(Warn, "vfs", "readahead.no_thread"; "no read-ahead worker: async read-ahead off");
+        return Err("vfs.readahead: no thread");
+    }
+    klog::event!(Info, "vfs", "readahead.started", workers = started as u64, cpus = cpus as u64, max_pages = vfs::readahead::DEFAULT_PAGES);
+    Ok(())
 }
 kreg::initcall!(kreg::Level::Service, "vfs.readahead", start_readahead);
 
@@ -407,6 +474,7 @@ fn block_boot_facts() -> Result<(), &'static str> {
         usb: (s.flags & bootinfo::stick_flags::USB_VALID != 0).then_some((s.usb_vid, s.usb_pid)),
         // FS-7: only `\BITSOS2\STICK.ID` counts (V1's legacy file means the stick was not prepared for V2).
         id: (s.flags & bootinfo::stick_flags::STICK_ID_VALID != 0 && s.flags & bootinfo::stick_flags::STICK_ID_LEGACY == 0).then_some(s.stick_id),
+        nvme: s.device_path.windows(5).any(|w| w == b"NVMe("),
     });
     block::configure(kexec::boot::config, stick);
     Ok(())

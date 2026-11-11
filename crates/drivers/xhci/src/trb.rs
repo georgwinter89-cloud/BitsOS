@@ -27,6 +27,7 @@ pub mod ty {
     pub const RESET_ENDPOINT: u8 = 14;
     pub const STOP_ENDPOINT: u8 = 15;
     pub const SET_TR_DEQUEUE: u8 = 16;
+    pub const RESET_DEVICE: u8 = 17;
     pub const NOOP_COMMAND: u8 = 23;
     pub const TRANSFER_EVENT: u8 = 32;
     pub const COMMAND_COMPLETION: u8 = 33;
@@ -58,6 +59,8 @@ pub mod cc {
     /// Isochronous IN ring empty when data came (xHCI 4.10.3.1).
     pub const RING_OVERRUN: u8 = 15;
     pub const BANDWIDTH_OVERRUN: u8 = 18;
+    /// A command in a slot or endpoint state it is not valid in (xHCI 6.4.5).
+    pub const CONTEXT_STATE: u8 = 19;
     /// An isochronous TD's service interval passed before it ran (xHCI 4.10.3.2).
     pub const MISSED_SERVICE: u8 = 23;
     /// The device sent more than the isochronous TD's buffer (xHCI 4.10.3.3).
@@ -129,6 +132,9 @@ impl Trb {
         let mut t = Trb::with_type(ty::ENABLE_SLOT);
         t.control |= ((slot_type & 0x1F) as u32) << 16;
         t
+    }
+    pub fn reset_device(slot: u8) -> Trb {
+        Trb::slot_cmd(ty::RESET_DEVICE, slot)
     }
     pub fn disable_slot(slot: u8) -> Trb {
         Trb::slot_cmd(ty::DISABLE_SLOT, slot)

@@ -25,6 +25,8 @@ pub struct Menu<W> {
     pub held: bool,
     /// Where the pointer was when the menu opened; near the output's edges that is not the centre.
     pub opened_at: (f64, f64),
+    /// PK-L1b: the library entry whose tile the menu was opened on.
+    pub entry: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +54,17 @@ pub fn window_items(floating: bool, maximised: Option<bool>, can_stack: bool, in
     m[5] = item("Programm beenden", Action::Kill, true);
     m[6] = item("Schmaler", Action::Grow(-0.25), !floating);
     m[7] = item("Aus Stapel nehmen", Action::Unstack, in_stack);
+    m
+}
+
+/// PK-L1b: a library tile's menu (desk-PK67-plan.md §3 "Favourites"); "Programm verwalten" waits for PK-7,
+/// "Entfernen" for PK-6 (greyed until then).
+pub fn library_items(pinned: bool) -> Items {
+    let mut m: Items = [None; 8];
+    m[0] = item(if pinned { "Lösen" } else { "An Startseite anheften" }, Action::LibraryPin, true);
+    m[2] = item("In neuer Kachel öffnen", Action::LibraryTile, true);
+    m[4] = item("Programm verwalten", Action::None, false);
+    m[6] = item("Entfernen", Action::None, false);
     m
 }
 
@@ -129,6 +142,17 @@ mod tests {
     use super::*;
 
     const C: (f64, f64) = (500.0, 400.0);
+
+    #[test]
+    fn a_library_tile_menu_pins_or_loosens_and_greys_what_comes_later() {
+        for pinned in [false, true] {
+            let m = library_items(pinned);
+            let labels: Vec<(&str, bool)> = m.iter().flatten().map(|i| (i.label, i.enabled)).collect();
+            let pin = if pinned { "Lösen" } else { "An Startseite anheften" };
+            assert_eq!(labels, [(pin, true), ("In neuer Kachel öffnen", true), ("Programm verwalten", false), ("Entfernen", false)]);
+            assert_eq!(m[0].unwrap().action, Action::LibraryPin);
+        }
+    }
 
     #[test]
     fn boxes_do_not_overlap() {

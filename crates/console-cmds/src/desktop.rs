@@ -6,7 +6,9 @@
 //! shows the text console with a message; typing `bitscomp` in the shell still works, `desktop start` on the
 //! monitor tries again. A desktop that ends after it took the screen is not restarted here (also when it ends
 //! within the same poll): the console takes the screen back. The decisions are pure functions (`init_wait`,
-//! `poll`, `next`) so host tests cover them without QEMU.
+//! `poll`, `next`) so host tests cover them without QEMU. GX-8c: a driver that comes up at boot holds the start
+//! (`console::bootscreen::hold_desktop`, CONFIG `gpu=on`): after init's wait, and never past the hold's own bound.
+//! WY-21: a child of the started program that takes the screen counts as the program (bitscomp's gpu build).
 
 use alloc::format;
 use alloc::string::String;
@@ -72,6 +74,23 @@ pub(crate) fn init_wait(state: Init, ready: bool, waited_ns: u64) -> InitWait {
         Init::Running if ready => InitWait::Ready,
         _ if waited_ns > WAIT_INIT_NS => InitWait::Timeout,
         _ => InitWait::Wait,
+    }
+}
+
+/// GX-8c: the look at the hold (`until`: `console::bootscreen::desktop_hold`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hold {
+    Free,
+    Wait,
+    /// The bound passed with the driver still at work: the desktop goes on without it.
+    Over,
+}
+
+pub(crate) fn hold_wait(until: Option<u64>, now_ns: u64) -> Hold {
+    match until {
+        None => Hold::Free,
+        Some(t) if now_ns > t => Hold::Over,
+        Some(_) => Hold::Wait,
     }
 }
 
@@ -150,6 +169,7 @@ fn run() {
             }
         }
     }
+    wait_hold();
     for attempt in 1.. {
         klog::event!(Info, "console", "desktop.start", program = program, attempt = attempt);
         let t = time::now_ns();
@@ -185,6 +205,34 @@ fn run() {
                     "desktop-failed",
                     &format!("\nDie Arbeitsfläche ({program}) ist {ATTEMPTS}-mal nicht gestartet: {why}.\nTextkonsole; `bitscomp` in der Shell startet sie von Hand.\n"),
                 );
+                return;
+            }
+        }
+    }
+}
+
+/// GX-8c: until the driver that holds the start let go, or its bound passed.
+fn wait_hold() {
+    let t0 = time::now_ns();
+    let mut held = false;
+    loop {
+        match hold_wait(console::bootscreen::desktop_hold(), time::now_ns()) {
+            Hold::Free => {
+                if held {
+                    klog::event!(Info, "console", "desktop.hold_end", waited_ms = time::now_ns().saturating_sub(t0) / 1_000_000);
+                }
+                return;
+            }
+            Hold::Wait => {
+                if !held {
+                    klog::event!(Info, "console", "desktop.held"; "a driver comes up first, within its bound");
+                }
+                held = true;
+                sched::sleep_ns(POLL_NS);
+            }
+            Hold::Over => {
+                klog::event!(Warn, "console", "desktop.hold_over", waited_ms = time::now_ns().saturating_sub(t0) / 1_000_000; "the driver is still at work: the desktop starts without it");
+                console::bootscreen::release_desktop();
                 return;
             }
         }
@@ -237,11 +285,18 @@ fn watch(p: &proc::Process) -> Outcome {
             Some(proc::ExitStatus::Exited(0)) => "ended",
             _ => "exit_code",
         });
-        let has = console::vt::kd_owner() == p.pid;
+        let has = holds_screen(p.pid);
         if let Some(o) = poll(p.pid, ended, has, console::vt::took_screen(p.pid), time::now_ns().saturating_sub(t)) {
             return o;
         }
     }
+}
+
+/// Whether the started program has the screen: itself, or (WY-21) its child: bitscomp's rescue build starts the gpu
+/// build as its child and waits beside it, to take the screen back when the GPU is lost.
+fn holds_screen(pid: u32) -> bool {
+    let owner = console::vt::kd_owner();
+    owner != 0 && (owner == pid || proc::find(owner).is_some_and(|o| o.ppid() == pid))
 }
 
 fn desktop_cmd(c: &mut Ctx) -> Result<(), String> {
@@ -262,7 +317,7 @@ fn desktop_cmd(c: &mut Ctx) -> Result<(), String> {
         }
         Some("start") => {
             let pid = PID.load(Ordering::Acquire);
-            if pid != 0 && console::vt::kd_owner() == pid && console::jobs::procs().alive(pid) {
+            if pid != 0 && holds_screen(pid) && console::jobs::procs().alive(pid) {
                 return Err(format!("desktop: runs already (pid {pid}) and has the screen"));
             }
             if spawn_start() {

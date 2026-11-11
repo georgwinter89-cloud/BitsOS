@@ -9,7 +9,7 @@ use crate::host::{Host, HubParams, PipeEvent, UsbError};
 use crate::place::{HubAt, Place, PlaceError, MAX_DEPTH};
 use crate::ports::{PortSet, PortStatus, Ports};
 use crate::registry::{self, UsbDriver, UsbMatch};
-use crate::setup::{feature, Setup, LINK_SS_DISABLED};
+use crate::setup::{feature, Setup, LINK_SS_DISABLED, LINK_SS_RX_DETECT};
 use crate::speed::Speed;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -294,9 +294,12 @@ impl Ports for HubPorts<'_> {
         }
     }
     fn reset(&self, port: u8) -> Result<Speed, UsbError> {
+        self.reset_device(port, false)
+    }
+    fn reset_device(&self, port: u8, warm: bool) -> Result<Speed, UsbError> {
         // A SuperSpeed link stuck in SS.Inactive (6) or Compliance (10) needs a warm reset (Linux `hub_port_reset`).
         let link = (self.status(port)?.raw >> 5) & 0xF;
-        let warm = self.ss() && (link == 6 || link == 10);
+        let warm = self.ss() && (warm || link == 6 || link == 10);
         self.send(Setup::set_port_feature(port, if warm { feature::BH_PORT_RESET } else { feature::PORT_RESET }, 0))?;
         let host = self.hub.dev.host();
         let deadline = host.now_ns().saturating_add(PORT_RESET_NS);
@@ -328,6 +331,12 @@ impl Ports for HubPorts<'_> {
             self.send(Setup::clear_port_feature(port, feature::PORT_ENABLE))
         };
         klog::event!(Warn, "usb", "hub.port_off", hub = self.hub.dev.path(), port = port, ok = r.is_ok());
+    }
+    fn enable_again(&self, port: u8) {
+        if self.ss() {
+            let r = self.send(Setup::set_port_feature(port, feature::PORT_LINK_STATE, LINK_SS_RX_DETECT as u8));
+            klog::event!(Debug, "usb", "hub.port_on", hub = self.hub.dev.path(), port = port, ok = r.is_ok());
+        }
     }
     fn place(&self, port: u8, speed: Speed) -> Result<Place, UsbError> {
         Place::child(&self.hub.at(), port, speed).map_err(|e| match e {

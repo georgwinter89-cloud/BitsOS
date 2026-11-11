@@ -184,7 +184,7 @@ fn order() -> TestResult {
     use crate::output::{APPLY, Request, apply};
     use ksync::lockdep;
     if !lockdep::enabled() {
-        return ktest::skip("lock checker not built in");
+        return ktest::fail("lock checker not built in");
     }
     keeping_target(|m| {
         let (r, n) = lockdep::expect_violations(|| {
@@ -228,7 +228,7 @@ fn order() -> TestResult {
         Ok(())
     })
 }
-ktest!("sn.out.order", Safe, order);
+ktest!("sn.out.order", QemuOnly, order);
 
 /// SN-12 fixer: every branch of the file request's helper, and the writer's answer to each. A request withdrawn
 /// before it began must not run after (its `begin` says no), a late one runs on and its result is dropped with

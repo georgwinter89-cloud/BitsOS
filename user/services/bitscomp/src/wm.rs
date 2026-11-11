@@ -52,6 +52,9 @@ pub enum Action {
     Minimize,
     /// WY-12: Alt+Tab (1) and Shift+Alt+Tab (-1): the next window; a minimised one is restored.
     Switch(i32),
+    /// PK-L1b: the circle menu of a library tile: pin to (or loosen from) the start page, start in a new tile.
+    LibraryPin,
+    LibraryTile,
 }
 
 impl App {
@@ -142,6 +145,7 @@ impl App {
     }
 
     pub fn forget_window(&mut self, w: &Window) {
+        self.lock.changed();
         self.ws.remove(w);
         self.forget_parked(w);
         self.anchors.retain(|_, a| a != w);
@@ -306,6 +310,8 @@ impl App {
                 }
             }
             Action::Switch(dir) => self.switch_window(dir),
+            Action::LibraryPin => self.library_pin(),
+            Action::LibraryTile => self.library_new_tile(),
             Action::Grow(d) => {
                 self.ws.grow_focused(d);
             }
@@ -330,7 +336,10 @@ impl App {
                 self.ws_remove(self.desk.active);
             }
             Action::Workspace(i) => {
-                self.ws_switch(i);
+                if self.ws_switch(i) {
+                    // WY-19c: the arrival (Wechsel.dc.html's circle wipe), at the gpu level.
+                    self.fx_play(crate::fx::plan::WIPE);
+                }
             }
             Action::Address => {
                 let tile = match (self.theme.layout.address_top, self.ws.focus) {
@@ -432,7 +441,17 @@ impl App {
     }
 
     pub fn reap_children(&mut self) {
-        self.children.retain_mut(|(c, _)| !matches!(c.try_wait(), Ok(Some(_))));
+        let mut ended = Vec::new();
+        self.children.retain_mut(|(c, _)| match c.try_wait() {
+            Ok(Some(st)) => {
+                ended.push((c.id(), st));
+                false
+            }
+            _ => true,
+        });
+        for (pid, st) in ended {
+            self.library_ended(pid, st);
+        }
         if self.spawned.len() > self.children.len() {
             let alive: Vec<u32> = self.children.iter().map(|(c, _)| c.id()).collect();
             if self.launches.retain_alive(|p| alive.contains(&p)) {

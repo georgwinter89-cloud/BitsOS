@@ -1,0 +1,14 @@
+mode seccomp
+RWX page at 0x600000000000: yes
+probe before the filter = -ENOSYS
+PR_GET_SECCOMP = 0
+this program's code is at or above 0x700000000000: yes
+PR_SET_NO_NEW_PRIVS = 0
+seccomp filter with SPEC_ALLOW = 0
+PR_GET_SECCOMP = 2
+probe after the filter gives STATUS_INVALID_PARAMETER: yes
+  SIGSYS code 1, arch x86_64 yes, data 42, nr 0xffff
+  call address and rip right after the syscall: yes
+a trapped getpid answered by the handler: yes
+syscalls from this program's code pass: yes
+done

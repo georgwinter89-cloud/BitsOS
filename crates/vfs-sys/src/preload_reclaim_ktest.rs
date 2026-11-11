@@ -70,11 +70,11 @@ fn commit_room() -> u64 {
 fn preload_reclaim() -> TestResult {
     let total = mm_core::frames().map_or(0, |f| f.stats().total_bytes);
     if total == 0 || total > 5 * (512 * MIB) {
-        return ktest::skip("fills all memory: small RAM only (53-preload-reclaim.sh, the 2G gate)");
+        return ktest::fail("fills all memory: small RAM only (53-preload-reclaim.sh, the 2G gate)");
     }
     let floor = preload::memory_floor();
     if free_pages() * P < floor + 64 * MIB {
-        return ktest::skip("too little free memory above the preload floor");
+        return ktest::fail("too little free memory above the preload floor");
     }
     let used_n = 16 * MIB / P;
     let used = file(used_n);
@@ -107,7 +107,7 @@ fn preload_reclaim() -> TestResult {
     // The spike: what is free plus half of the preloaded pages.
     let n = (free_pages() + b.pages / 2).min(commit_room());
     if n < free_pages() + 4 * MIB / P {
-        return ktest::skip("the commit limit leaves no room past the free memory");
+        return ktest::fail("the commit limit leaves no room past the free memory");
     }
     let a = AddressSpace::with_fill(Fill::OnFault).map_err(|e| format!("address space: {e:?}"))?;
     let m = a.map_anywhere(n * P, Prot::rw()).map_err(|e| format!("mmap of {} MiB: {e:?}", n * P / MIB))?;

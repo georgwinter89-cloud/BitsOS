@@ -54,7 +54,7 @@ fn want(s: &'static stack::Stack, url: &str) -> Result<Option<(String, u64)>, St
 
 fn fetch_parallel() -> TestResult {
     let s = st()?;
-    let Some(base) = fetch_base(s)? else { return ktest::skip("no test server: net_test_url= in CONFIG, or 30-stack.sh under QEMU") };
+    let Some(base) = fetch_base(s)? else { return ktest::fail("no test server: net_test_url= in CONFIG, or 30-stack.sh under QEMU") };
     // `/slice/N` where the server has it (stack_server.py since NW-7), else the whole file.
     let (path, (hex, size)) = match want(s, &format!("{base}/slice/{SLICE}.sha256"))? {
         Some(w) => (format!("/slice/{SLICE}"), w),
@@ -144,4 +144,4 @@ fn fetch_parallel() -> TestResult {
     kassert!(stack::NO_MEMORY.get() == no_memory, "real socket buffer refusals during the downloads: {}", stack::NO_MEMORY.get() - no_memory);
     Ok(())
 }
-ktest!("nw.stack.fetch_parallel", Safe, fetch_parallel);
+ktest!("nw.stack.fetch_parallel", Run("nw/30-stack"), fetch_parallel);

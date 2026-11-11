@@ -19,12 +19,22 @@ static NEXT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 klog::counter!(pub NO_ROOM, "sched.sleepers_no_room");
 
-/// Room for one more sleeper per thread (`spawn`, thread context). `Err`: no memory.
+/// Room for one more sleeper per thread (`spawn`, thread context). `Err`: no memory. The larger vector is made
+/// with the lock dropped and swapped in (`ksync::spare`, as `table::insert`): under the lock, with interrupts
+/// off, the heap can neither reclaim nor fall back to single frames, and a spawn failed although memory was there.
 pub(crate) fn reserve() -> Result<(), ()> {
     let threads = crate::table::len() + 1;
-    let mut s = SET.lock();
-    let extra = threads.saturating_sub(s.len());
-    s.try_reserve(extra).map_err(|_| ())
+    let mut spare = ksync::Spare::new();
+    loop {
+        {
+            let mut s = SET.lock();
+            let extra = threads.saturating_sub(s.len());
+            if spare.fits(&mut *s, extra) {
+                return Ok(());
+            }
+        }
+        spare.grow()?;
+    }
 }
 
 fn pos(s: &[(u64, u64, usize)], key: (u64, u64)) -> usize {

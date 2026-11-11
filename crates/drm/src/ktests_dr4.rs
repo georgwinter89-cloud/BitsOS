@@ -1,7 +1,7 @@
 //! DR-4 in-kernel tests (Safe, rerunnable): AMDGPU_INFO through an open file of the boot device answers what
 //! Linux answered on the 780M (the captured fixture, when the device is the fake with its captured memory), and
 //! AMDGPU_CTX gives ids, refuses nothing to the kernel, and ends its contexts at close. On hardware without a
-//! fake they skip, as DR-2's do.
+//! fake they fail, as DR-2's do.
 
 use crate::file::MinorKind;
 use crate::gpu::GpuDevice;
@@ -38,9 +38,9 @@ fn info(f: &crate::node::OpenDrm, m: &KMem, query: u32, a: [u32; 4], size: u32) 
 
 fn captured_answers() -> TestResult {
     with_dev!(d, {
-        let Some(fake) = d.dev.driver().as_fake() else { return ktest::skip("the device is no fake: no fixture to compare") };
+        let Some(fake) = d.dev.driver().as_fake() else { return ktest::fail("the device is no fake: no fixture to compare") };
         if fake.memory().vram_total != 0x2000_0000 {
-            return ktest::skip("the fake has another carve-out than the capture");
+            return ktest::fail("the fake has another carve-out than the capture");
         }
         let f = open_device(d.dev.clone(), MinorKind::Render, false).map_err(|e| format!("open: errno {e}"))?;
         let m = KMem::new(4096);
@@ -67,7 +67,7 @@ fn captured_answers() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.info.captured", Safe, captured_answers);
+ktest!("dr.info.captured", QemuAll, captured_answers);
 
 fn ctx(f: &crate::node::OpenDrm, m: &KMem, op: u32, id: u32, prio: i32) -> Result<i64, vfs::Errno> {
     let mut b = [0u8; 16];
@@ -78,7 +78,7 @@ fn ctx(f: &crate::node::OpenDrm, m: &KMem, op: u32, id: u32, prio: i32) -> Resul
 
 fn contexts() -> TestResult {
     with_dev!(d, {
-        let Some(gpu) = d.dev.driver().gpu() else { return ktest::skip("the device has no amdgpu uAPI") };
+        let Some(gpu) = d.dev.driver().gpu() else { return ktest::fail("the device has no amdgpu uAPI") };
         let f = open_device(d.dev.clone(), MinorKind::Render, false).map_err(|e| format!("open: errno {e}"))?;
         let m = KMem::new(4096);
         // The kernel may ask for any priority (CAP_SYS_NICE).
@@ -95,4 +95,4 @@ fn contexts() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.ctx.alloc_free", Safe, contexts);
+ktest!("dr.ctx.alloc_free", QemuAll, contexts);

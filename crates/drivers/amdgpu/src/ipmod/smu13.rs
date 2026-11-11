@@ -28,7 +28,7 @@ pub static MODULE: Module = Module {
         v(13, 0, 11),
     ],
     firmware: Firmware::None("APU: the SMU firmware is part of the BIOS"),
-    state: State::Present("gpucore::smu, gpucore::gfxup (GX-7e: the driver mailbox, EnableGfxImu, mode 2)"),
+    state: State::Present("gpucore::smu, gpucore::gfxup (GX-7e: the driver mailbox, EnableGfxImu, mode 2), dpm (GX-9b)"),
 };
 
 /// (segment index, dword) in MP1's bases (mp_13_0_4_offset.h).
@@ -61,6 +61,8 @@ pub mod msg {
     pub const ENABLE_GFX_IMU: u32 = 0x16;
     pub const ALLOW_GFXOFF: u32 = 0x19;
     pub const DISALLOW_GFXOFF: u32 = 0x1A;
+    pub const SET_SOFT_MAX_GFXCLK: u32 = 0x1B;
+    pub const SET_HARD_MIN_GFXCLK: u32 = 0x1C;
     pub const POWER_DOWN_JPEG: u32 = 0x21;
     pub const POWER_UP_JPEG: u32 = 0x22;
     pub const ALLOW_ZSTATES: u32 = 0x25;
@@ -77,6 +79,9 @@ pub mod resp {
     pub const PREREQ: u32 = 0xFD;
     pub const BUSY: u32 = 0xFC;
 }
+
+/// FEATURE_GFX_DPM_BIT of PMFW 13.0.4's enabled mask (smu_v13_0_4_pmfw.h:55): PMFW runs GFXCLK by load.
+pub const FEATURE_GFX_DPM_BIT: u32 = 20;
 
 /// SMU13_0_4_DRIVER_IF_VERSION (smu13_driver_if_v13_0_4.h:30): the interface the message table is for.
 pub const DRIVER_IF_VERSION: u32 = 8;
@@ -156,6 +161,8 @@ pub fn msg_name(id: u32) -> &'static str {
         msg::ENABLE_GFX_IMU => "EnableGfxImu",
         msg::ALLOW_GFXOFF => "AllowGfxOff",
         msg::DISALLOW_GFXOFF => "DisallowGfxOff",
+        msg::SET_SOFT_MAX_GFXCLK => "SetSoftMaxGfxClk",
+        msg::SET_HARD_MIN_GFXCLK => "SetHardMinGfxClk",
         msg::POWER_DOWN_JPEG => "PowerDownJpeg",
         msg::POWER_UP_JPEG => "PowerUpJpeg",
         msg::ALLOW_ZSTATES => "AllowZstates",

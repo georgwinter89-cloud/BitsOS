@@ -15,7 +15,7 @@
 //! whose saved root is the test root loads it as owner again (the flush then asks that CPU, an IPI, not a skip;
 //! a later switch to a kernel thread makes it lazy again). So a round's lazy reads and IPIs are judged only for
 //! the APs whose switch counter did not move in it; for those, a lazy AP at its read was lazy on the root since
-//! its `ap_lazy`, through the flush (counted as a skip in the flush's first look) and until its catch-up. Every
+//! its `ap_lazy`, through the flush (counted as a failure in the flush's first look) and until its catch-up. Every
 //! AP, moved or not, must still fault on the unmapped page.
 
 use crate::linux::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ};
@@ -82,7 +82,7 @@ fn read_only(r: u64) -> bool {
 fn lazy_skip() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let frames_before = user_frames();
     let s0 = tlb::stats();
@@ -158,10 +158,10 @@ fn lazy_skip() -> TestResult {
     }
     kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
     if kept == 0 {
-        // The APs were lazy right before most unmaps but none was after it: they were asked and left (no skip).
+        // The APs were lazy right before most unmaps but none was after it: they were asked and left (no fail).
         kassert!(lazy_before <= ROUNDS, "{lazy_before} lazy APs before the unmaps, none lazy after them");
         // Every AP ran another thread between going lazy and its read, every time (busy machine).
-        return ktest::skip("no AP stayed lazy on the test root");
+        return ktest::fail("no AP stayed lazy on the test root");
     }
     Ok(())
 }
@@ -170,7 +170,7 @@ ktest!("mm.tlb.lazy_skip", Safe, lazy_skip);
 fn lazy_tables() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let s0 = tlb::stats();
     let a = AddressSpace::with_fill(Fill::OnFault).map_err(e)?;
@@ -196,7 +196,7 @@ fn lazy_tables() -> TestResult {
     }
     if lazy == 0 {
         // Every AP ran another thread right after `ap_lazy` (busy machine): nothing to shoot lazily.
-        return ktest::skip("no AP lazy on the test root");
+        return ktest::fail("no AP lazy on the test root");
     }
     let t0 = paging::count_user_tables(a.root());
     a.sys_munmap(far, P).map_err(e)?;
@@ -205,12 +205,16 @@ fn lazy_tables() -> TestResult {
     // An AP that ran no other thread since `ap_lazy` must have left the root; one that switched may have taken it
     // again as owner through a thread whose saved root is `a`'s (it then flushed as an owner and may be lazy again
     // by now). Neither may read the freed page through its TLB (checked below for every AP).
-    let moved = moved(&aps, &sw);
-    for &c in aps.iter().filter(|c| !moved.contains(c)) {
-        let r = on(c, ap_root, 0)?;
-        kassert!(r != a.root(), "CPU {c} still holds the root after tables were freed (no thread switch since it went lazy)");
+    let mut roots = Vec::new();
+    for &c in &aps {
+        roots.push((c, on(c, ap_root, 0)?));
     }
     let kept = a.loaded_on();
+    // Asked after the look (CR-GM8-5, a busy machine): a switch just before it may have brought a thread of this root back.
+    let moved = moved(&aps, &sw);
+    for &(c, r) in roots.iter().filter(|(c, _)| !moved.contains(c)) {
+        kassert!(r != a.root(), "CPU {c} still holds the root after tables were freed (no thread switch since it went lazy)");
+    }
     kassert!(kept.iter().all(|c| moved.contains(c)), "still in the mask: {kept:?} (switched: {moved:?})");
     let s1 = tlb::stats();
     // At least one when a lazy AP stayed without a switch: it can only have left the root lazily.
@@ -276,7 +280,7 @@ fn copier(a: &AddressSpace, base: u64) {
 
 fn lazy_copy() -> TestResult {
     let aps = aps();
-    let Some(&c) = aps.first() else { return ktest::skip("one CPU") };
+    let Some(&c) = aps.first() else { return ktest::fail("one CPU") };
     let s0 = tlb::stats();
     let a = Arc::new(AddressSpace::with_fill(Fill::OnFault).map_err(e)?);
     let base = a.sys_mmap(0, 2 * P, RW, AP, 0).map_err(e)?;
@@ -320,7 +324,7 @@ fn lazy_copy() -> TestResult {
     kassert!(got == val(3), "the kernel thread read {got:#x} (a stale entry: {:#x} or {:#x}), want {:#x}", val(1), val(2), val(3));
     if !(lazy0 && was_lazy) {
         // CPU c ran a user thread between the steps (busy machine).
-        return ktest::skip("the copying thread did not hold the root lazily throughout");
+        return ktest::fail("the copying thread did not hold the root lazily throughout");
     }
     kassert!(s1.lazy_drops > s0.lazy_drops, "the copy through a lazily held root did not leave it first");
     kassert!(COPY_WALKS.load(SeqCst) == 1, "the copy through a lazily held root did not walk the tables");

@@ -1,0 +1,60 @@
+segment 3 pages = 0
+bad id = EINVAL
+negative id = EINVAL
+REMAP without address = EINVAL
+misaligned = EINVAL
+page aligned: yes
+maps /SYSV51c0de01 (deleted) len 12288 perms rw-s off 0
+zero filled: yes
+over a mapping = EINVAL
+rounded over a mapping = EINVAL
+detach off page = -EINVAL
+detach mapped elsewhere = -EINVAL
+detach = 0
+detach again = -EINVAL
+gone: 11
+SHM_RND rounds down: yes
+contents kept: yes
+SHM_REMAP takes the place: yes
+after remap: nattch 1 mode 600 key 51c0de01
+detach = 0
+low address = EPERM
+past user space = ENOMEM
+wrapping = EINVAL
+wrapping with REMAP = ENOMEM
+maps /SYSV51c0de01 (deleted) len 12288 perms r--s off 0
+write to rdonly: 11
+reads: yes
+mprotect rw on rdonly = -EACCES
+detach = 0
+maps /SYSV51c0de01 (deleted) len 12288 perms rwxs off 0
+detach = 0
+mprotect exec = 0
+mprotect rw = 0
+mprotect middle = 0
+split by mprotect: nattch 3 mode 600 key 51c0de01
+mprotect back = 0
+mprotect back does not merge: nattch 3 mode 600 key 51c0de01
+detach inside a VMA = -EINVAL
+detach whole = 0
+detached: nattch 0 mode 600 key 51c0de01
+detach inside the only VMA = -EINVAL
+still attached: nattch 1 mode 600 key 51c0de01
+shrunk in place: yes
+after the shrink: nattch 1 mode 600 key 51c0de01
+moved: yes
+after the move: nattch 1 mode 600 key 51c0de01
+detach at the old place = -EINVAL
+detach at the new place = 0
+detached: nattch 0 mode 600 key 51c0de01
+munmap middle = 0
+hole: nattch 2 mode 600 key 51c0de01
+detach from the start finds both = 0
+detached: nattch 0 mode 600 key 51c0de01
+munmap first page = 0
+detach at the hole: pgoff 1 at distance 1 = 0
+rest detached: nattch 0 mode 600 key 51c0de01
+plain munmap = 0
+munmap detaches: nattch 0 mode 600 key 51c0de01
+detach at unrelated map = -EINVAL
+remove = 0

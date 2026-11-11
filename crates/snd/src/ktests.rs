@@ -178,7 +178,7 @@ fn state() -> TestResult {
 pub(crate) fn players() -> Result<Vec<String>, TestResult> {
     let v: Vec<String> = hda::controllers().iter().filter(|d| d.pick(devmodel::audio::Output::Jack).is_some()).map(|d| d.ctrl.name().into()).collect();
     if v.is_empty() {
-        return Err(ktest::skip("no controller with a playable analog output"));
+        return Err(ktest::fail("no controller with a playable analog output"));
     }
     Ok(v)
 }
@@ -245,7 +245,7 @@ fn switch() -> TestResult {
         Err(r) => return r,
     };
     if p.len() < 2 {
-        return ktest::skip("needs two controllers with a playable output (QEMU: two intel-hda)");
+        return ktest::fail("needs two controllers with a playable output (QEMU: two intel-hda)");
     }
     with_mixer(fixed(&p[0]), |m| {
         let n = 57600;

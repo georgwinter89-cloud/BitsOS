@@ -162,7 +162,24 @@ impl Rules {
 /// Keys only Georg's own edit may add or change (R8a; MC's GUARDED_KEYS). `wlan` is free since 21.10. (R8d).
 /// MC-10 (Georg 27.10.): `mcp` (who serves MCP) and `mcp_confirmer` (`test` lets a program answer the
 /// installer's dialogs) too.
-pub const GUARDED_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+/// NV-2p (Georg 5.11.): `nvme_data`, the window into the Windows SSD; `bitsdisk` adds it, typed at the real keyboard
+/// (`with_keyboard_line`). Dropping it is allowed: the disk is then read-only and /data on the stick.
+/// Georg 6.11.: `nvme_boot`, the one EFI System partition the window's disk may hold (BitsOS's own).
+pub const GUARDED_KEYS: &[&str] = &["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+
+/// NV-2p: the one guarded line the kernel is writing right now for Georg (key, value), and only while it does.
+static KEYBOARD_LINE: ksync::SpinLock<Option<(String, String)>> = ksync::SpinLock::named("fat.keyboard_line", None);
+
+/// NV-2p: runs `f` (one append to CONFIG.TXT and its fsync, nothing else) while `key=value` counts as allowed. Only
+/// crates/drivers/nvme's `/dev/bitsos/disksetup` calls it, after it read Georg's typed code out of the input sink
+/// itself; nothing a program or MCP hands in reaches it. A program writing in that moment could add only this very
+/// line.
+pub fn with_keyboard_line<R>(key: &str, value: &str, f: impl FnOnce() -> R) -> R {
+    *KEYBOARD_LINE.lock() = Some((String::from(key), String::from(value)));
+    let r = f();
+    *KEYBOARD_LINE.lock() = None;
+    r
+}
 
 /// MC-10: guarded keys whose value may not even go: dropping `mcp=service` would bring back the kernel's
 /// plain-HTTP server (`mcp=kernel`, the token alone opens everything), which is Georg's rescue setting to write
@@ -281,15 +298,22 @@ fn effective<'a>(text: &'a [u8], key: &str) -> Option<&'a str> {
 /// reordering or a dropped duplicate may not flip `nvme_write=off` / `nvme_write=on`. A `FIXED_KEYS` value
 /// may not go either (MC-10). Err names the key.
 pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
+    let permit = KEYBOARD_LINE.lock().clone();
+    config_guard_with(old, new, permit.as_ref())
+}
+
+/// `config_guard` with NV-2p's one permitted line.
+pub fn config_guard_with(old: &[u8], new: &[u8], permit: Option<&(String, String)>) -> Result<(), String> {
     let before = guarded_lines(old);
     for line in guarded_lines(new) {
-        if !before.contains(&line) {
+        if !before.contains(&line) && permit != Some(&line) {
             return Err(line.0);
         }
     }
     for &k in GUARDED_KEYS {
         if let Some(v) = effective(new, k)
             && effective(old, k) != Some(v)
+            && !permit.is_some_and(|p| p.0 == k && p.1 == v)
         {
             return Err(String::from(k));
         }
@@ -318,6 +342,23 @@ mod tests {
         // Without an old value the redacted line goes.
         assert_eq!(unredact_config(b"", b"token=t\nwlan_psk=***\nx=1"), b"token=t\nx=1".to_vec());
         assert_eq!(redact_config(b""), b"".to_vec());
+    }
+
+    /// NV-2p: `nvme_data` is guarded like `nvme_write`; only the one permitted line passes, and only while permitted.
+    #[test]
+    fn the_window_key() {
+        let line = "S1:GUID:34816:1000";
+        let (old, new) = (&b"a=1\n"[..], format!("a=1\nnvme_data={line}\n"));
+        assert!(config_guard(old, new.as_bytes()).is_err(), "added");
+        assert!(config_guard(new.as_bytes(), b"a=1\nnvme_data=S1:GUID:0:1000\n").is_err(), "changed");
+        assert!(config_guard(new.as_bytes(), b"a=2\n").is_ok(), "dropped: the disk is read-only again");
+        assert!(config_guard(b"nvme_data=x\nnvme_data=y\n", b"nvme_data=y\nnvme_data=x\n").is_err(), "last line wins");
+        let permit = (String::from("nvme_data"), String::from(line));
+        assert!(config_guard_with(old, new.as_bytes(), Some(&permit)).is_ok());
+        assert!(config_guard_with(old, b"nvme_data=other\n", Some(&permit)).is_err(), "only the very line");
+        assert!(config_guard_with(old, b"nvme_write=on\n", Some(&permit)).is_err(), "never another key");
+        assert!(with_keyboard_line("nvme_data", line, || config_guard(old, new.as_bytes())).is_ok());
+        assert!(config_guard(old, new.as_bytes()).is_err(), "the permit ends with the call");
     }
 
     #[test]

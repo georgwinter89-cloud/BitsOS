@@ -13,17 +13,6 @@ pub struct Row {
     pub addr: String,
 }
 
-/// The programs BitsOS can start from an address today.
-const PROGRAMS: [(&str, &str); 1] = [("Terminal", "programm/terminal")];
-/// LO-1: LibreOffice's, listed only when its launcher is on the stick (`address::OFFICE_LAUNCHER`); without it the
-/// address still answers, with a notice that LibreOffice is missing.
-const OFFICE: [(&str, &str); 4] = [
-    ("Writer (Text)", "programm/writer"),
-    ("Calc (Tabellen)", "programm/calc"),
-    ("Impress (Präsentation)", "programm/impress"),
-    ("LibreOffice", "programm/libreoffice"),
-];
-
 pub const ROW_H: i32 = 36;
 pub const HEAD_H: i32 = 26;
 
@@ -36,8 +25,8 @@ pub fn short_name(addr: &str) -> String {
 
 /// Every row that matches `query` (case-insensitive, in name or address); an empty query lists favourites,
 /// programs and recent addresses but not the many settings keys.
-/// `office`: LibreOffice is on the stick.
-pub fn build(query: &str, favourites: &[String], keys: &[(String, String)], recent: &[String], office: bool) -> Vec<Row> {
+/// `programs`: (name, address) of the library's programs (PK-L1a: what is there, LibreOffice only with its launcher).
+pub fn build(query: &str, favourites: &[String], keys: &[(String, String)], recent: &[String], programs: &[(String, String)]) -> Vec<Row> {
     let q = query.trim().to_lowercase();
     let hit = |name: &str, addr: &str| q.is_empty() || name.to_lowercase().contains(&q) || addr.to_lowercase().contains(&q);
     let mut out: Vec<Row> = Vec::new();
@@ -49,8 +38,8 @@ pub fn build(query: &str, favourites: &[String], keys: &[(String, String)], rece
     for f in favourites {
         push(&mut out, "FAVORITEN", short_name(f), f.clone());
     }
-    for (n, a) in PROGRAMS.into_iter().chain(OFFICE.into_iter().filter(|_| office)) {
-        push(&mut out, "PROGRAMME", n.into(), a.into());
+    for (n, a) in programs {
+        push(&mut out, "PROGRAMME", n.clone(), a.clone());
     }
     if !q.is_empty() {
         for (k, text) in keys {
@@ -85,12 +74,18 @@ pub fn layout(rows: &[Row], field: Rect, bottom: i32) -> (Rect, Vec<(Option<Rect
     (Rect { x, y: top, w, h: y - top }, out)
 }
 
+/// The library's programs as suggestion rows, its GenericName in brackets ("Writer (Textverarbeitung)").
+pub fn programs(ix: &crate::library::Index) -> Vec<(String, String)> {
+    ix.entries.iter().filter(|e| e.address.starts_with("programm/"))
+        .map(|e| (if e.generic.is_empty() || e.generic == e.name { e.name.clone() } else { format!("{} ({})", e.name, e.generic) }, e.address.clone()))
+        .collect()
+}
+
 impl App {
     /// The suggestions shown for the address bar being edited (only as many as fit on the output).
     pub fn suggestions(&self) -> Vec<Row> {
         let Some(e) = &self.desk.edit else { return Vec::new() };
-        let office = std::path::Path::new(crate::address::OFFICE_LAUNCHER).is_file();
-        let rows = build(&e.text, &self.desk.favourites, &self.setting_keys, &self.session.recent_addresses(), office);
+        let rows = build(&e.text, &self.desk.favourites, &self.setting_keys, &self.session.recent_addresses(), &programs(&self.library));
         let (_, placed) = layout(&rows, self.edit_field(), self.area_full().h - 8);
         rows.into_iter().take(placed.len()).collect()
     }
@@ -104,27 +99,38 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    fn progs(office: bool) -> Vec<(String, String)> {
+        let mut v = vec![("Terminal (Befehlszeile)".to_string(), "programm/terminal".to_string())];
+        if office {
+            v.push(("Writer (Textverarbeitung)".into(), "programm/writer".into()));
+            v.push(("Calc (Tabellenkalkulation)".into(), "programm/calc".into()));
+        }
+        v
+    }
+
     #[test]
     fn favourites_come_first_and_duplicates_once() {
         let keys = vec![("theme.accent".to_string(), "Akzentfarbe".to_string())];
-        let rows = build("", &s(&["programm/terminal", "einstellungen/aussehen"]), &keys, &s(&["programm/terminal"]), true);
+        let rows = build("", &s(&["programm/terminal", "einstellungen/aussehen"]), &keys, &s(&["programm/terminal"]), &progs(true));
         let groups: Vec<_> = rows.iter().map(|r| r.group).collect();
-        assert_eq!(groups, ["FAVORITEN", "FAVORITEN", "PROGRAMME", "PROGRAMME", "PROGRAMME", "PROGRAMME"], "programm/terminal is a favourite already; no keys without a query");
+        assert_eq!(groups, ["FAVORITEN", "FAVORITEN", "PROGRAMME", "PROGRAMME"], "programm/terminal is a favourite already; no keys without a query");
         assert_eq!(rows[2].addr, "programm/writer");
-        assert_eq!(build("tabellen", &[], &[], &[], true)[0].addr, "programm/calc");
-        // Without LibreOffice on the stick its programs are not offered.
-        let rows = build("", &s(&["programm/terminal", "einstellungen/aussehen"]), &keys, &[], false);
+        assert_eq!(build("tabellen", &[], &[], &[], &progs(true))[0].addr, "programm/calc");
+        // Without LibreOffice on the stick its programs are not in the library, so not offered.
+        let rows = build("", &s(&["programm/terminal", "einstellungen/aussehen"]), &keys, &[], &progs(false));
         assert_eq!(rows.iter().map(|r| r.group).collect::<Vec<_>>(), ["FAVORITEN", "FAVORITEN"]);
-        assert!(build("calc", &[], &[], &[], false).is_empty());
-        let rows = build("akzent", &[], &keys, &[], true);
+        assert!(build("calc", &[], &[], &[], &progs(false)).is_empty());
+        let rows = build("akzent", &[], &keys, &[], &progs(true));
         assert_eq!(rows, [Row { group: "EINSTELLUNGEN", name: "Akzentfarbe".into(), addr: "einstellungen/theme.accent".into() }]);
-        assert_eq!(build("TERM", &[], &[], &[], false)[0].addr, "programm/terminal");
+        assert_eq!(build("TERM", &[], &[], &[], &progs(false))[0].addr, "programm/terminal");
         assert_eq!(short_name("einstellungen/aussehen"), "Aussehen");
+        // The built-in library: Terminal (Einstellungen is the settings page, not a program row).
+        assert_eq!(programs(&crate::library::Index::builtin()), [("Terminal (Befehlszeile)".to_string(), "programm/terminal".to_string())]);
     }
 
     #[test]
     fn rows_stop_at_the_bottom() {
-        let rows = build("", &s(&["a/b", "c/d", "e/f"]), &[], &s(&["g/h"]), false);
+        let rows = build("", &s(&["a/b", "c/d", "e/f"]), &[], &s(&["g/h"]), &[]);
         let field = Rect { x: 0, y: 0, w: 400, h: 40 };
         let (_, all) = layout(&rows, field, 10_000);
         assert_eq!(all.len(), rows.len());

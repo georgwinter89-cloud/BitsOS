@@ -109,7 +109,7 @@ pub(crate) fn own_device(t: impl FnOnce(&Arc<crate::device::Device>, &FakeGpu) -
 pub(crate) fn own_device_with(g: FakeGpu, t: impl FnOnce(&Arc<crate::device::Device>, &FakeGpu) -> TestResult) -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let gpu = Arc::new(g);
@@ -154,7 +154,7 @@ fn run() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.cs.run", Safe, run);
+ktest!("dr.cs.run", QemuAll, run);
 
 fn hang() -> TestResult {
     own_device(|dev, gpu| {
@@ -169,7 +169,7 @@ fn hang() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.cs.hang", Safe, hang);
+ktest!("dr.cs.hang", QemuAll, hang);
 
 /// A job waiting for a fence when its file closes: the close waits its second, the job ends with ESRCH when
 /// the fence comes, and its object stays until then.
@@ -199,7 +199,7 @@ fn dying_fd() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.cs.dying_fd", Safe, dying_fd);
+ktest!("dr.cs.dying_fd", QemuAll, dying_fd);
 
 const PROG: &str = "/bin/abi-drm-cs";
 const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-cs.txt");
@@ -207,11 +207,11 @@ const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-cs.
 /// The ABI program on V2: every line as on CachyOS.
 fn abi_program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let out = proc::stdio::Capture::new(1 << 16);
@@ -234,4 +234,4 @@ fn abi_program() -> TestResult {
         before.check()
     })
 }
-ktest!("dr.cs.program", Safe, abi_program);
+ktest!("dr.cs.program", QemuAll, abi_program);

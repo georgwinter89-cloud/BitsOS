@@ -22,7 +22,7 @@
 // files), `install.dry_run`: BitsOS fetches the bundle from http://<me:port>/echt-install/, checks it and plans the
 // generation, writes nothing (the stick's SYS listing is the same before and after), and names the local hashes.
 // `install.proof_counter`: wrong-token requests move hw_info's "mcp requests=" but not "answered=" (RB-6's proof).
-// An install check that cannot run prints "SKIP <check>: why"; with --require-install it fails instead.
+// An install check that cannot run is FAIL (Georg 30.10.: nothing is skipped), so a run against a target passes all of these.
 import { readFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -50,9 +50,6 @@ const HTTP = arg('--http');
 const HTTP_BIND = arg('--http-bind') ?? '0.0.0.0';
 const ONLY = arg('--only')?.split(',');
 const INSTALL_BUNDLE = arg('--install-bundle');
-// --require-install: an install check that cannot run (no install_kernel, no bundle arguments) fails instead of
-// printing SKIP (the desk's A2 run, so a default run never silently does nothing).
-const REQUIRE_INSTALL = process.argv.includes('--require-install');
 
 // ---------------------------------------------------------------------------------------------------------
 // Transport: one connection per request (as V1's mcp-call.mjs; no keep-alive surprises).
@@ -153,12 +150,10 @@ async function check(name, f) {
     console.log(`FAIL ${name}: ${String(e.message ?? e).slice(0, 2000)}`);
   }
 }
-function skipped(name, why) {
+function cannot(name, why) {
   if (ONLY && !ONLY.some((o) => name.startsWith(o))) return;
-  if (REQUIRE_INSTALL) {
-    results.push({ name, ok: false });
-    console.log(`FAIL ${name}: ${why} (--require-install)`);
-  } else console.log(`SKIP ${name}: ${why}`);
+  results.push({ name, ok: false });
+  console.log(`FAIL ${name}: ${why}`);
 }
 function want(cond, what, text) {
   if (!cond) throw new Error(`${what}${text === undefined ? '' : `\n  answer: ${String(text).slice(0, 1500)}`}`);
@@ -559,8 +554,8 @@ async function main() {
     want(dReq >= WRONG + 1 && dAns >= 1 && dAns <= dReq - WRONG, `requests +${dReq}, answered +${dAns}: the ${WRONG} wrong-token requests must count in requests only`);
   });
   if (!tools.some((t) => t.name === 'install_kernel')) {
-    skipped('install.refusals', 'this kernel has no install_kernel (before RB-6)');
-    skipped('install.dry_run', 'this kernel has no install_kernel (before RB-6)');
+    cannot('install.refusals', 'this kernel has no install_kernel');
+    cannot('install.dry_run', 'this kernel has no install_kernel');
   } else {
     await check('install.refusals', async () => {
       const t = tools.find((x) => x.name === 'install_kernel');
@@ -578,6 +573,8 @@ async function main() {
       want(typed.rpcError === -32602, 'dry_run "yes": invalid params (-32602)', typed.text);
     });
     if (HTTP && INSTALL_BUNDLE) {
+      // Fetching and hashing a debug kernel of 370 MB keeps QEMU's MCP busy past that check's limit, so that one ends first.
+      if (defaultDeadline) await defaultDeadline;
       await check('install.dry_run', async () => {
         const files = { '/echt-install/KERNEL': readFileSync(`${INSTALL_BUNDLE}/KERNEL`), '/echt-install/INITRD': readFileSync(`${INSTALL_BUNDLE}/INITRD`) };
         const [, port] = HTTP.split(':');
@@ -597,7 +594,7 @@ async function main() {
           want((await sys()) === before, 'the stick\'s SYS listing changed', before);
         } finally { srv.close(); }
       });
-    } else skipped('install.dry_run', 'needs --http <me:port> and --install-bundle <dir> (KERNEL + INITRD)');
+    } else cannot('install.dry_run', 'needs --http <me:port> and --install-bundle <dir> (KERNEL + INITRD)');
   }
   await check('files.cleanup', async () => {
     ok1(await call('delete', { path: dir, recursive: true }), 'delete the folder');

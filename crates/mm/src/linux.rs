@@ -205,11 +205,16 @@ pub struct Space {
     pub mmap_top: u64,
     /// Pages of VM_ACCOUNT VMAs (what this space holds of the commit; kept by every commit step below).
     pub committed: u64,
+    /// mlockall(MCL_FUTURE): (VM_LOCKED, VM_LOCKONFAULT) of new mappings and heap (Linux `mm->def_flags`).
+    pub def_lock: (bool, bool),
+    /// RLIMIT_MEMLOCK in pages for `mlock_future_ok`, the caller's since the syscall layer's last
+    /// `refresh_future_limit`; None: CAP_IPC_LOCK or no MCL_FUTURE.
+    pub def_lock_limit: Option<u64>,
 }
 
 impl Space {
     pub fn new(mmap_top: u64) -> Self {
-        Space { tree: VmaTree::new(), brk_start: 0, brk: 0, mmap_top, committed: 0 }
+        Space { tree: VmaTree::new(), brk_start: 0, brk: 0, mmap_top, committed: 0, def_lock: (false, false), def_lock_limit: None }
     }
 
     /// `mmap(addr, len, prot, flags, -1, off)` for anonymous memory: the checks and the placement.
@@ -277,7 +282,10 @@ impl Space {
             _ if file => false,
             _ => return Err(Errno::Inval),
         };
-        let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE;
+        if !self.lock_future_ok(len / PAGE) {
+            return Err(Errno::Again);
+        }
+        let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE || (self.def_lock.0 && !self.def_lock.1);
         let prot = Prot::from_linux(prot);
         let (nohugepage, growsdown) = (flags & MAP_STACK != 0, flags & MAP_GROWSDOWN != 0);
         Ok(MmapPlan { addr: start, len, prot, replaces: overlaps, populate, shared, account: !shared && prot.write, nohugepage, growsdown })
@@ -328,7 +336,9 @@ impl Space {
         if plan.replaces {
             self.commit_munmap(plan.addr, end)?;
         }
-        let flags = VmaFlags { account: plan.account, nohugepage: plan.nohugepage, growsdown: plan.growsdown, ..VmaFlags::default() };
+        // Device mappings are VM_SPECIAL: `mmap_region` takes VM_LOCKED off them again.
+        let (locked, lock_onfault) = if file.as_ref().is_some_and(|f| f.device.is_some()) { (false, false) } else { self.def_lock };
+        let flags = VmaFlags { account: plan.account, nohugepage: plan.nohugepage, growsdown: plan.growsdown, locked, lock_onfault, ..VmaFlags::default() };
         self.tree.insert(Vma { start: plan.addr, end, prot: plan.prot, kind, file, flags }).map_err(|_| Errno::NoMem)?;
         if plan.account {
             self.committed += plan.len / PAGE;
@@ -430,6 +440,22 @@ impl Space {
         self.brk = s;
     }
 
+    /// Pages of locked VMAs (Linux `locked_vm`).
+    pub fn locked_pages(&self) -> u64 {
+        self.tree.iter().filter(|v| v.flags.locked).map(|v| v.pages()).sum()
+    }
+
+    /// Pages of locked VMAs inside `start..start + len` (`count_mm_mlocked_page_nr`).
+    pub fn locked_in(&self, start: u64, len: u64) -> u64 {
+        let end = start.saturating_add(len);
+        self.tree.overlapping(start, end).iter().filter(|v| v.flags.locked).map(|v| (v.end.min(end) - v.start.max(start)) / PAGE).sum()
+    }
+
+    /// `mlock_future_ok` (mm/mmap.c): whether `pages` more under MCL_FUTURE stay inside the limit.
+    fn lock_future_ok(&self, pages: u64) -> bool {
+        !self.def_lock.0 || self.def_lock_limit.is_none_or(|l| self.locked_pages().saturating_add(pages) <= l)
+    }
+
     /// `brk(new)` as Linux's `mm/mmap.c`.
     pub fn plan_brk(&self, new: u64) -> BrkPlan {
         if new < self.brk_start || self.brk_start == 0 {
@@ -448,7 +474,7 @@ impl Space {
             (Some(n), Some(limit)) => n.start >= limit,
             (None, Some(_)) => true,
         };
-        if !next_ok || newbrk > TASK_SIZE {
+        if !next_ok || newbrk > TASK_SIZE || !self.lock_future_ok((newbrk - oldbrk) / PAGE) {
             return BrkPlan::Keep(self.brk);
         }
         BrkPlan::Move { brk: new, unmap: None, map: Some((oldbrk, newbrk)) }
@@ -466,6 +492,7 @@ impl Space {
                 if let Some((s, e)) = map {
                     let mut v = Vma::anon(s, e, Prot::rw(), VmaKind::Heap);
                     v.flags.account = true;
+                    (v.flags.locked, v.flags.lock_onfault) = self.def_lock;
                     self.tree.insert(v).map_err(|_| Errno::NoMem)?;
                     self.committed += (e - s) / PAGE;
                 }

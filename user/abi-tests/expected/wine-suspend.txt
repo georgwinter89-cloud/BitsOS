@@ -1,0 +1,7 @@
+mode suspend
+200 suspends caught the thread in its loop: yes
+each resume continued from the written r12: yes
+the last written r12 ended the loop: yes
+still waiting after 50 handled signals: yes
+futex_waitv then answers 1 (the woken entry)
+done

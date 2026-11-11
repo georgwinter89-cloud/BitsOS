@@ -248,6 +248,28 @@ fn writeback_order_and_failures() {
     assert!(!SyncKind::Background.durable() && SyncKind::Msync.durable());
 }
 
+/// FS-STALL: several ranges in one write-back (one begin, one commit), only the pages inside them; the ones
+/// outside stay dirty; an empty list writes and commits nothing.
+#[test]
+fn writeback_of_ranges_writes_only_those() {
+    let rec = Arc::new(Recorder::default());
+    let c = PageCache::with_backend(rec.clone(), 16 * P);
+    for pg in [1u64, 2, 6, 9, 10, 14] {
+        c.write_at(pg * P, &[0u8; P as usize]).unwrap();
+    }
+    take(&rec);
+    let one = c.lock_sync();
+    c.sync_ranges_locked(&one, &[(0, 2), (9, 9), (12, 15)], SyncKind::Fsync).unwrap();
+    assert_eq!(take(&rec), ["begin Fsync", "run 1+2 size 65536 first byte 0", "run 9+1 size 65536 first byte 0", "run 14+1 size 65536 first byte 0", "commit Fsync"]);
+    assert_eq!(c.dirty_pages(), 2, "pages 6 and 10 were outside the ranges");
+    c.sync_ranges_locked(&one, &[], SyncKind::Fsync).unwrap();
+    assert!(take(&rec).is_empty());
+    *rec.fail_at.lock() = Some(10);
+    assert_eq!(c.sync_ranges_locked(&one, &[(6, 6), (10, 10)], SyncKind::Fsync), Err(EIO));
+    assert_eq!(take(&rec), ["begin Fsync", "run 6+1 size 65536 first byte 0", "fail 10", "commit Fsync"]);
+    assert_eq!(c.dirty_pages(), 1, "the failed range stays dirty");
+}
+
 fn backed(size: u64) -> (Arc<Recorder>, Arc<PageCache>) {
     let rec = Arc::new(Recorder::default());
     let c = Arc::new(PageCache::with_backend(rec.clone(), size));

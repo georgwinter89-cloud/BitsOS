@@ -316,6 +316,8 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     if cfg!(feature = "ktest") {
         run_ktests();
     }
+    // GX-8c: CONFIG gpu=on: the chip comes up by itself, in a bounded thread of its own; the desktop's start waits for its end.
+    amdgpu::hw::boot::start(&config::get);
     // Not an initcall: the init levels run before the network stack is installed above.
     mcp::set_boot_info(&bi, env!("CARGO_PKG_VERSION"));
     match mcp::start_kernel(&config::get) {
@@ -356,11 +358,12 @@ fn configure_serial() {
 
 fn run_ktests() -> ! {
     let filter = config::get("ktest").unwrap_or_default();
-    // CONFIG `ktest_hw=on`: only Safe and Display tests, as on the Mini-PC over MCP (QemuOnly ones skip there).
-    // Program tests (a stick tree's program) run only without a hypervisor: on the Mini-PC (Georg 30.10.).
+    // CONFIG `ktest_hw=on`: as on the Mini-PC over MCP (QemuOnly ones belong to another run). `ktest_run=` names this
+    // boot, so the tests of class Run/RunHw that belong to it run (TS-1). The class decides, never the test.
     let hw = config::get("ktest_hw").as_deref() == Some("on");
+    let runs = config::get("ktest_run").unwrap_or_default();
     let hypervisor = hal::cpu::detect().hypervisor;
-    let allowed = |c: ktest::Class| c.runs_here(hypervisor, hw);
+    let allowed = |c: ktest::Class| c.runs_here(hypervisor, hw, &runs);
     // CONFIG `ktest_nmi_check=on`: after each test, every other CPU must answer an NMI sample (desk fix/nmi).
     // INT-W28 (GX-7m CR): a canary at the boot stack's low end; a test that reaches it is named after it ran.
     // CONFIG `ktest_stack=<KiB>`: each test's stack use measured against that budget (bootstack's module doc).

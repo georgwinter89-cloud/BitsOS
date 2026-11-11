@@ -122,6 +122,7 @@ pub struct Summary {
 
 static LAYERS: SpinLock<Vec<(Stage, Arc<dyn Stop>)>> = SpinLock::named("block.shutdown.layers", Vec::new());
 static STOPPED: AtomicBool = AtomicBool::new(false);
+static COLD_RESET: AtomicBool = AtomicBool::new(false);
 
 /// Registers a layer (drivers do it once, at their first device).
 pub fn add(stage: Stage, s: Arc<dyn Stop>) {
@@ -141,6 +142,22 @@ pub fn stopped() -> bool {
 
 fn now() -> u64 {
     ksync::now_ns().unwrap_or(0)
+}
+
+/// A layer found a device a warm reset may not cure (usb-msd: a stick that was not well at the stop; on 3.11. one stayed
+/// wedged through the warm reset and the firmware booted Windows): the machine reset should drop the ports' power.
+pub fn ask_cold_reset() {
+    COLD_RESET.store(true, Ordering::Release);
+}
+
+/// Takes `ask_cold_reset` back (`resume_all` does, and a ktest that only tried a stop).
+pub fn withdraw_cold_reset() {
+    COLD_RESET.store(false, Ordering::Release);
+}
+
+/// Whether the reset that follows this stop should be a cold one (the reset paths read it after `stop_all`).
+pub fn cold_reset_asked() -> bool {
+    COLD_RESET.load(Ordering::Acquire)
 }
 
 /// Stops every disk and every layer under them (see the module text) within `budget_ns`.
@@ -200,6 +217,7 @@ pub fn resume_all(why: &str) {
         d.reopen();
     }
     STOPPED.store(false, Ordering::Release);
+    withdraw_cold_reset();
     klog::event!(Info, "block", "shutdown.resumed", why = String::from(why));
 }
 

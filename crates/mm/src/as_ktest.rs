@@ -386,7 +386,7 @@ fn file_recopy() -> TestResult {
     const PATH: &[u8] = b"/tmp/.mm-file-recopy";
     let ns = vfs::root_ns();
     if ns.lookup("/tmp").is_err() {
-        return ktest::skip("no /tmp in this image");
+        return ktest::fail("no /tmp in this image");
     }
     let t = mm_core::alloc_table_frame().ok_or("no frame for the refusal check")?;
     let refused = mm_core::alloc_copy(t, mm_core::Kind::User);

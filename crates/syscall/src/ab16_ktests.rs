@@ -114,11 +114,11 @@ fn nmi_storm() -> TestResult {
         if crate::ab7_ktests::have("/bin/abi-ids") {
             return Err(String::from("the image has ABI programs but not /bin/abi-sigstorm (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU: nothing to sample");
+        return ktest::fail("one CPU: nothing to sample");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());

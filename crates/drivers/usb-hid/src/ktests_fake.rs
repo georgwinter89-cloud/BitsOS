@@ -298,7 +298,7 @@ fn with_device(fake: &Arc<Fake>, port: u8, t: impl FnOnce(&Arc<Device>, Option<A
 
 fn with_device_at(fake: &Arc<Fake>, port: u8, speed: Speed, t: impl FnOnce(&Arc<Device>, Option<Arc<HidIface>>) -> TestResult) -> TestResult {
     if iface::left_raw().is_some() {
-        return ktest::skip("CONFIG leaves HID devices unbound");
+        return ktest::fail("CONFIG leaves HID devices unbound");
     }
     let host: Arc<dyn Host> = fake.clone();
     let dev = enumerate(&host, Place::root(port, speed), Scheme::Direct).map_err(|e| alloc::format!("enumerate: {}", e.as_str()))?;

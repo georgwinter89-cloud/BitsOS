@@ -5,7 +5,7 @@
 //! keyboard with idle 0 NAKs: Stop Endpoint + Set TR Dequeue, the next transfer works) and interrupt IN pipes on
 //! usb-kbd/usb-tablet (idle reports keep coming through `depth` queued TDs, the ring wraps, stop ends them).
 //! `host/tests/us/40-xfer.sh` boots with the HID devices and drives keys and the tablet through QMP for
-//! `us.xfer.hid_input`. Devices a class driver has bound are left alone (the test skips).
+//! `us.xfer.hid_input`. Devices a class driver has bound are left alone (the test fails).
 
 use crate::driver::controllers;
 use crate::hc::MS;
@@ -139,7 +139,7 @@ fn stick_read() -> TestResult {
     kassert!(settled(), "hotplug did not settle");
     let sticks = Bot::sticks();
     if sticks.is_empty() {
-        return ktest::skip("no unbound USB mass storage device");
+        return ktest::fail("no unbound USB mass storage device");
     }
     for bot in sticks {
         let path = bot.d.path();
@@ -147,7 +147,7 @@ fn stick_read() -> TestResult {
     }
     Ok(())
 }
-ktest!("us.xfer.stick_read", Safe, stick_read);
+ktest!("us.xfer.stick_read", Run("us/40-xfer"), stick_read);
 
 fn stick_read_one(mut bot: Bot) -> TestResult {
     bot.ready()?;
@@ -205,7 +205,7 @@ fn chain() -> TestResult {
     kassert!(settled(), "hotplug did not settle");
     let sticks = Bot::sticks();
     if sticks.is_empty() {
-        return ktest::skip("no unbound USB mass storage device");
+        return ktest::fail("no unbound USB mass storage device");
     }
     for bot in sticks {
         let path = bot.d.path();
@@ -213,7 +213,7 @@ fn chain() -> TestResult {
     }
     Ok(())
 }
-ktest!("us.xfer.chain", Safe, chain);
+ktest!("us.xfer.chain", Run("us/40-xfer"), chain);
 
 fn chain_one(mut bot: Bot) -> TestResult {
     bot.ready()?;
@@ -284,10 +284,10 @@ fn stall() -> TestResult {
     kassert!(settled(), "hotplug did not settle");
     let sticks = Bot::sticks();
     if sticks.is_empty() {
-        return ktest::skip("no unbound USB mass storage device");
+        return ktest::fail("no unbound USB mass storage device");
     }
     if !hal::cpu::detect().hypervisor {
-        return ktest::skip("the stall path relies on QEMU's usb-storage");
+        return ktest::fail("the stall path relies on QEMU's usb-storage");
     }
     for bot in sticks {
         let path = bot.d.path();
@@ -295,7 +295,7 @@ fn stall() -> TestResult {
     }
     Ok(())
 }
-ktest!("us.xfer.stall", QemuOnly, stall);
+ktest!("us.xfer.stall", Run("us/40-xfer"), stall);
 
 fn stall_one(mut bot: Bot) -> TestResult {
     bot.ready()?;
@@ -335,7 +335,7 @@ fn set_idle(d: &Device, iface: u8, four_ms: u8) -> Result<(), UsbError> {
 /// with idle 4 ms the next transfer gets a report.
 fn timeout() -> TestResult {
     kassert!(settled(), "hotplug did not settle");
-    let Some((d, iface, eps)) = find(3, 1, 1) else { return ktest::skip("no unbound USB boot keyboard (scenario us/40-xfer.sh)") };
+    let Some((d, iface, eps)) = find(3, 1, 1) else { return ktest::fail("no unbound USB boot keyboard (scenario us/40-xfer.sh)") };
     let ep = eps.iter().find(|e| e.is_in() && e.kind() == EpKind::Interrupt).ok_or("no interrupt IN")?.address;
     set_idle(&d, iface, 0).map_err(|e| format!("SET_IDLE 0: {e:?}"))?;
     // Drain what the keyboard still has (its first report after configuration).
@@ -356,7 +356,7 @@ fn timeout() -> TestResult {
     set_idle(&d, iface, 0).map_err(|e| format!("SET_IDLE 0: {e:?}"))?;
     Ok(())
 }
-ktest!("us.xfer.timeout", QemuOnly, timeout);
+ktest!("us.xfer.timeout", Run("us/40-xfer"), timeout);
 
 struct PipeLog {
     reports: AtomicU64,
@@ -436,7 +436,7 @@ fn hid_pipes() -> TestResult {
     let kbd = hid_pipe(1, 8, 4)?;
     let tab = hid_pipe(0, 5, 4)?;
     if kbd.is_none() && tab.is_none() {
-        return ktest::skip("no unbound usb-kbd or usb-tablet (scenario us/40-xfer.sh)");
+        return ktest::fail("no unbound usb-kbd or usb-tablet (scenario us/40-xfer.sh)");
     }
     for (name, p) in [("keyboard", &kbd), ("tablet", &tab)] {
         let Some((d, iface, h, log)) = p else { continue };
@@ -454,13 +454,13 @@ fn hid_pipes() -> TestResult {
     }
     Ok(())
 }
-ktest!("us.xfer.hid_pipes", QemuOnly, hid_pipes);
+ktest!("us.xfer.hid_pipes", Run("us/40-xfer"), hid_pipes);
 
 /// With `host/tests/us/40-xfer.sh`: the script presses "a" and moves the tablet through QMP after
 /// `ktest.hid_ready`; both arrive through the pipes.
 fn hid_input() -> TestResult {
     if !pci::registry::opted_in("usb_xfer_test") {
-        return ktest::skip("scenario only: host/tests/us/40-xfer.sh boots with usb_xfer_test=on and drives QMP");
+        return ktest::fail("scenario only: host/tests/us/40-xfer.sh boots with usb_xfer_test=on and drives QMP");
     }
     kassert!(settled(), "hotplug did not settle");
     let (Some((kd, ki, kh, kl)), Some((td, ti, th, tl))) = (hid_pipe(1, 8, 2)?, hid_pipe(0, 5, 2)?) else {
@@ -474,4 +474,4 @@ fn hid_input() -> TestResult {
     klog::event!(Info, "usb", "ktest.hid_input_seen");
     Ok(())
 }
-ktest!("us.xfer.hid_input", QemuOnly, hid_input);
+ktest!("us.xfer.hid_input", Run("us/40-xfer"), hid_input);

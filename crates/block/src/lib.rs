@@ -1,10 +1,11 @@
 //! Block layer (owner: FS; FS-6): every disk of the system on `C: BlockDevice` behind one request queue.
 //!
-//! - `register(dev, kind)` puts a device behind a `Disk` (queue, dispatcher thread, write-refusal hook), reads
+//! - `register(dev, kind)` puts a device behind a `Disk` (queue dispatched by its submitters, write-refusal hook), reads
 //!   its partition table once and lists it; drivers call it when a disk appears (usb-msd's scan) and
 //!   `unregister` when it goes. `disks()`, `find`, `generation()` for the file systems above (FS-7/8).
 //! - `disk`: the queue per device with merging up to max_sectors, priorities Interactive > Normal >
 //!   Background with aging (B4), completions that wake the waiters, scatter-gather into page-cache pages.
+//!   BL-2: no dispatcher thread; the submitter dispatches, stacked disks only remap, frames (`frames`) pass down.
 //! - `queue`: the elevator as plain logic (host-tested).
 //! - `policy`: the write-refusal hook (R8a): Windows/EFI partition tables (`table`), the boot stick
 //!   (CONFIG `stick_write`), other USB disks (`usb_msd_write`), NVMe (`nvme_write`), plugged-in `WriteGate`s.
@@ -25,6 +26,7 @@ extern crate std;
 pub mod bdev;
 pub mod disk;
 pub mod error;
+pub mod frames;
 pub mod gpt;
 mod lift;
 mod ktests;
@@ -41,6 +43,8 @@ pub mod testimg;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod frames_tests;
+#[cfg(test)]
 mod shutdown_tests;
 #[cfg(test)]
 mod prio_tests;
@@ -52,7 +56,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use devmodel::block::BlockDevice;
 use ksync::SpinLock;
 
-pub use disk::{Data, Disk, DiskDevice, DiskStats, Dispatch, PageSeg, Ticket};
+pub use disk::{Data, Disk, DiskDevice, DiskStats, Dispatch, LowerWindow, PageSeg, Ticket};
+pub use frames::{Concat, HeapFrames, PageFrames};
 pub use error::{BlockError, Refusal};
 pub use policy::{DiskKind, StickIdentity, StickMatch, WriteCheck, WriteGate, add_global_gate, usb_writes_possible};
 pub use queue::Kind;

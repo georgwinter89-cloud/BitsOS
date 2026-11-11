@@ -14,6 +14,9 @@ use usb_core::{Place, PortStatus, Ports, Speed, UsbError};
 pub const PORT_NS: u64 = 500 * MS;
 /// After a USB 2 port reset, before the address: 10 ms TRSTRCY plus Linux's margin (V1 `XH_RECOVERY`).
 pub const RECOVERY_NS: u64 = 50 * MS;
+/// A port's power stays off this long when a wedged device is to lose it (US-R; enough for a stick's capacitors
+/// on the boards Linux users drive with `uhubctl`, whose default is 1 s, at half the wait).
+pub const POWER_OFF_NS: u64 = 500 * MS;
 const POLL_STEP_NS: u64 = MS;
 
 klog::counter!(PORT_RESETS, "usb.xhci.port_resets");
@@ -100,6 +103,34 @@ impl<E: Env> RootPorts<'_, E> {
     }
 }
 
+impl<E: Env> RootPorts<'_, E> {
+    /// A reset with a device on a USB 3 port (US-R): hot (PR), or warm (WPR) as the second step
+    /// (linux-6.6/drivers/usb/core/hub.c:2948); then enabled with the link in U0.
+    fn hard_usb3(&self, port: u8, warm: bool) -> Result<u32, UsbError> {
+        if warm {
+            WARM_RESETS.inc();
+            klog::event!(Info, "usb", "xhci.warm_reset", ctrl = self.c.name.as_str(), port = port, portsc = klog::Hex(self.read(port)? as u64),
+                why = "reset of a device in place");
+        }
+        self.write(port, if warm { WPR } else { PR })?;
+        self.wait(port, PRC, PRC)?;
+        self.clear_all_changes(port)?;
+        self.wait(port, PED | PLS_MASK, PED)?;
+        self.clear_all_changes(port)?;
+        self.read(port)
+    }
+
+    fn speed_of(&self, port: u8, v: u32) -> Result<Speed, UsbError> {
+        let psiv = ((v >> portsc::SPEED_SHIFT) & 0xF) as u8;
+        let speed = self.c.protocol_of(port).and_then(|p| p.speed(psiv));
+        if speed.is_none() {
+            klog::event!(Warn, "usb", "xhci.unknown_speed", ctrl = self.c.name.as_str(), port = port, psiv = psiv,
+                portsc = klog::Hex(v as u64));
+        }
+        speed.ok_or(UsbError::Invalid("root port reports no known speed"))
+    }
+}
+
 impl<E: Env> Ports for RootPorts<'_, E> {
     fn label(&self) -> String {
         self.c.name.clone()
@@ -119,13 +150,29 @@ impl<E: Env> Ports for RootPorts<'_, E> {
     fn reset(&self, port: u8) -> Result<Speed, UsbError> {
         PORT_RESETS.inc();
         let v = if self.usb3(port) { self.link_usb3(port)? } else { self.reset_usb2(port)? };
-        let psiv = ((v >> portsc::SPEED_SHIFT) & 0xF) as u8;
-        let speed = self.c.protocol_of(port).and_then(|p| p.speed(psiv));
-        if speed.is_none() {
-            klog::event!(Warn, "usb", "xhci.unknown_speed", ctrl = self.c.name.as_str(), port = port, psiv = psiv,
-                portsc = klog::Hex(v as u64));
+        self.speed_of(port, v)
+    }
+    fn reset_device(&self, port: u8, warm: bool) -> Result<Speed, UsbError> {
+        PORT_RESETS.inc();
+        let v = if self.usb3(port) { self.hard_usb3(port, warm)? } else { self.reset_usb2(port)? };
+        self.speed_of(port, v)
+    }
+    /// PP off and on (xHCI 5.4.8; only with PPC set the bit does anything). A board may have one power switch for
+    /// several ports or none at all: the check list of US-R looks at what the Mini-PC's does.
+    fn power_cycle(&self, port: u8) -> bool {
+        if !self.c.caps.ppc {
+            klog::event!(Info, "usb", "xhci.no_power_switch", ctrl = self.c.name.as_str(), port = port);
+            return false;
         }
-        speed.ok_or(UsbError::Invalid("root port reports no known speed"))
+        let Ok(v) = self.read(port) else { return false };
+        self.c.wr(self.off(port), v & KEEP & !PP);
+        self.c.env.sleep_ns(POWER_OFF_NS);
+        let Ok(v) = self.read(port) else { return false };
+        self.c.wr(self.off(port), (v & KEEP) | PP);
+        self.c.env.sleep_ns(crate::hotplug::POWER_GOOD_NS);
+        klog::event!(Warn, "usb", "xhci.port_power_cycled", ctrl = self.c.name.as_str(), port = port;
+            "the device on this port lost its power on purpose");
+        true
     }
     fn disable(&self, port: u8) {
         klog::event!(Debug, "usb", "xhci.port_left", ctrl = self.c.name.as_str(), port = port;

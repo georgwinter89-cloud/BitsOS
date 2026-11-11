@@ -50,7 +50,7 @@ fn settled_list() -> Result<Option<Vec<Arc<Xhci>>>, String> {
 /// Every connected root port of every controller has its device; under QEMU the boot stick is there,
 /// configured, with its mass storage interface.
 fn boot() -> TestResult {
-    let Some(list) = settled_list()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = settled_list()? else { return ktest::fail("no xHCI controller in this machine") };
     let mut total = 0;
     for c in &list {
         let devs = devices_of(c);
@@ -67,7 +67,7 @@ fn boot() -> TestResult {
             kassert!(i.dcbaa_ok, "{d:?}: DCBAA entry is not its output context");
             // Configured with endpoints = Configured; a configuration without endpoints may stay Addressed.
             kassert!(i.state == slot_state::CONFIGURED || i.state == slot_state::ADDRESSED, "{d:?}: slot state {}", i.state);
-            kassert!(i.address == d.address && i.address != 0, "{d:?}: address {} vs {}", i.address, d.address);
+            kassert!(i.address == d.address() && i.address != 0, "{d:?}: address {} vs {}", i.address, d.address());
             klog::event!(Info, "usb", "ktest.device", device = d.path(), vendor = klog::Hex(d.vendor() as u64),
                 product = klog::Hex(d.product() as u64), speed = d.speed().as_str(), slot = i.id, address = i.address,
                 mps0 = i.mps0, drivers = registry::bindings_of(d.id).len());
@@ -84,11 +84,13 @@ fn boot() -> TestResult {
     Ok(())
 }
 ktest!("us.enum.boot", Safe, boot);
+// US-R: the same look after the recoveries of `us.recover.*` (names sort it behind them): slots, addresses, drivers.
+ktest!("us.recover.z_slots", Run("us/55-recover"), boot);
 
 /// The controller's view of every device matches the core's: route string, root port, speed, TT of
 /// low/full speed devices below high speed hubs, hub slots with their port count.
 fn topology() -> TestResult {
-    let Some(list) = settled_list()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = settled_list()? else { return ktest::fail("no xHCI controller in this machine") };
     let mut seen = 0;
     for c in &list {
         for d in devices_of(c) {
@@ -117,7 +119,7 @@ fn topology() -> TestResult {
         }
     }
     if seen == 0 {
-        return ktest::skip("no USB device connected");
+        return ktest::fail("no USB device connected");
     }
     Ok(())
 }
@@ -125,13 +127,14 @@ ktest!("us.enum.topology", Safe, topology);
 
 /// 300 control transfers on endpoint 0 (its ring past its Link TRB three times) and 300 Evaluate Contexts with
 /// the same packet size (the command ring past its Link TRB): every one answered, the device still works.
+/// US-R: QEMU's boots only. On a real machine every device is in use (the boot stick, the keyboard), and this keeps its
+/// endpoint 0 and its slot busy for nothing; it ran on the Mini-PC's boot stick while the stick was in use (3.11.). The
+/// rings' wrap is the same code there.
 fn rings_wrap() -> TestResult {
-    let Some(list) = settled_list()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = settled_list()? else { return ktest::fail("no xHCI controller in this machine") };
     let devs: Vec<_> = list.iter().flat_map(|c| devices_of(c)).collect();
-    // A mass storage device if there is one (on the Mini-PC the stick, not Georg's receiver).
-    let storage = |d: &&Arc<Device>| d.config.as_ref().is_some_and(|c| c.defaults().any(|f| f.class == 8));
-    let d = devs.iter().find(|d| (d.vendor(), d.product()) == QEMU_STICK).or(devs.iter().find(storage)).or(devs.first());
-    let Some(d) = d else { return ktest::skip("no USB device connected") };
+    let d = devs.iter().find(|d| (d.vendor(), d.product()) == QEMU_STICK).or(devs.first());
+    let Some(d) = d else { return ktest::fail("no USB device connected") };
     let c = list.iter().find(|c| c.name() == d.host_name()).ok_or("controller")?;
     let mps0 = c.slot_info(d.slot).ok_or("slot")?.mps0;
     let (cw0, _, _) = c.ring_info();
@@ -147,16 +150,16 @@ fn rings_wrap() -> TestResult {
     klog::event!(Info, "usb", "ktest.rings_wrap", device = d.path(), cmd_wraps = cw1 - cw0);
     Ok(())
 }
-ktest!("us.enum.rings_wrap", Safe, rings_wrap);
+ktest!("us.enum.rings_wrap", QemuAll, rings_wrap);
 
 /// Quiesce and restart the controller with the most devices: every device detached (new ids afterwards), the
 /// same set found again, no slot of the old epoch left.
 fn restart() -> TestResult {
-    let Some(list) = settled_list()? else { return ktest::skip("no xHCI controller in this machine") };
-    let Some(c) = list.iter().max_by_key(|c| devices_of(c).len()) else { return ktest::skip("no controller") };
+    let Some(list) = settled_list()? else { return ktest::fail("no xHCI controller in this machine") };
+    let Some(c) = list.iter().max_by_key(|c| devices_of(c).len()) else { return ktest::fail("no controller") };
     let before = devices_of(c);
     if before.is_empty() {
-        return ktest::skip("no USB device connected");
+        return ktest::fail("no USB device connected");
     }
     let key = |d: &Arc<Device>| (d.vendor(), d.product(), d.place.root_port, d.place.route);
     devmodel::quiesce_matching(c.name());
@@ -229,7 +232,7 @@ fn until(ns: u64, mut f: impl FnMut() -> bool) -> bool {
 
 fn unplug_held() -> TestResult {
     if !pci::registry::opted_in("usb_unplug_test") {
-        return ktest::skip("scenario only: host/tests/us/30-unplug.sh boots with usb_unplug_test=on and drives QMP");
+        return ktest::fail("scenario only: host/tests/us/30-unplug.sh boots with usb_unplug_test=on and drives QMP");
     }
     ARMED.store(true, Ordering::Release);
     let r = unplug_rounds();
@@ -272,4 +275,4 @@ fn unplug_rounds() -> TestResult {
     }
     Ok(())
 }
-ktest!("us.unplug.held", QemuOnly, unplug_held);
+ktest!("us.unplug.held", Run("us/30-unplug"), unplug_held);

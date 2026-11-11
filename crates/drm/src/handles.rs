@@ -72,10 +72,11 @@ impl<T> Handles<T> {
         self.map.values()
     }
 
-    /// Takes every entry out (the last close: Linux `drm_gem_release`).
-    pub fn drain(&mut self) -> alloc::vec::Vec<(u32, T)> {
+    /// Takes every entry out (the last close: Linux `drm_gem_release`). The map itself is handed over: callers
+    /// hold a spin lock, where a list of every handle was a large allocation (see `ksync::spare`).
+    pub fn drain(&mut self) -> BTreeMap<u32, T> {
         self.free.clear();
         self.next = 1;
-        core::mem::take(&mut self.map).into_iter().collect()
+        core::mem::take(&mut self.map)
     }
 }

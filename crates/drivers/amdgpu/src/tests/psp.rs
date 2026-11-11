@@ -22,6 +22,28 @@ fn psp_err(h: Hostile) -> (FakeGpu, PspError) {
     }
 }
 
+/// The fakes prove `Until::Backend` as one run, the live tool runs `BACKEND_STAGES` one by one: the two must stand for
+/// the same work, or `gx.hw.*` proves another chain than the chip gets.
+#[test]
+fn fake_backend_chain_is_the_live_tools_stages() {
+    use psp::Until;
+    assert_eq!(Until::BACKEND_STAGES, [Until::Sdma, Until::GfxMes]);
+    let what: [(&str, fn(Until) -> bool); 6] = [
+        ("loads_fw", Until::loads_fw),
+        ("runs_gc", Until::runs_gc),
+        ("runs_gmc", Until::runs_gmc),
+        ("after_gart", Until::after_gart),
+        ("sdma", Until::fake_chain_sdma),
+        ("mes", Until::fake_chain_mes),
+    ];
+    for (name, p) in what {
+        assert_eq!(p(Until::Backend), Until::BACKEND_STAGES.iter().any(|&s| p(s)), "{name}");
+    }
+    assert!(Until::Backend.fake_chain_sdma() && Until::Sdma.fake_chain_sdma() && !Until::GfxMes.fake_chain_sdma());
+    assert!(Until::Backend.fake_chain_mes() && Until::GfxMes.fake_chain_mes() && !Until::Sdma.fake_chain_mes());
+    assert!(Until::Backend.maps_queues() && Until::GfxMes.maps_queues(), "the live stage and the fake chain both map the queues");
+}
+
 #[test]
 fn good_run_in_linux_order() {
     crate::ktests_psp::check_run(&mut FakeGpu::new(Hostile::None), &mut MapSource(pspfake::synthetic_780m())).unwrap();

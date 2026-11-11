@@ -22,13 +22,13 @@ use crate::ipmod::gmc11::Hub;
 use crate::ipmod::sdma6::{R, f};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
+use ksync::SpinLock;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use amdgpu_fmt::bus::{GpuBus, MemFault};
 use amdgpu_fmt::sim::{Engine, Event, Isa, Limits, Report, Stop};
-use core::cell::RefCell;
 
 const PAGE: u64 = 4096;
 /// GFXHUB's client id of SDMA0 (the hub fake's fault decode names it).
@@ -71,7 +71,13 @@ pub enum SdmaHostile {
 }
 
 /// Sparse system memory by host-physical page (shared with the stage's `SysPages`).
-pub type SysMem = Rc<RefCell<BTreeMap<u64, Box<[u8]>>>>;
+pub type SysMem = Arc<SpinLock<BTreeMap<u64, Box<[u8]>>>>;
+
+/// GX-8b: pages outside the fake's own memory that a VM can reach (a test's GTT objects: real frames a program maps).
+pub trait HostMem: Send + Sync {
+    fn read(&self, phys: u64, out: &mut [u8]) -> bool;
+    fn write(&self, phys: u64, data: &[u8]) -> bool;
+}
 
 pub struct SdmaFake {
     pub addrs: Option<SdmaAddrs>,
@@ -95,7 +101,8 @@ pub struct SdmaFake {
     /// Writes into memory by the engine: (host-physical, bytes).
     pub gpu_writes: Vec<(u64, usize)>,
     pub sys: SysMem,
-    next_sys: Rc<RefCell<u64>>,
+    pub host: Option<Arc<dyn HostMem>>,
+    next_sys: Arc<SpinLock<u64>>,
 }
 
 impl SdmaFake {
@@ -115,8 +122,9 @@ impl SdmaFake {
             port: BTreeMap::new(),
             rsmu_index: 0,
             gpu_writes: Vec::new(),
-            sys: Rc::new(RefCell::new(BTreeMap::new())),
-            next_sys: Rc::new(RefCell::new(SYS_BASE)),
+            sys: Arc::new(SpinLock::named("gx.fake.sys", BTreeMap::new())),
+            host: None,
+            next_sys: Arc::new(SpinLock::named("gx.fake.next_sys", SYS_BASE)),
         };
         for (r, v) in [
             (R::F32Cntl, 0x0808_4001),
@@ -321,7 +329,7 @@ impl SdmaFake {
 /// `SysAlloc` for the fakes: pages from `SYS_BASE` up, zeroed, never reused.
 pub struct FakeSys {
     mem: SysMem,
-    next: Rc<RefCell<u64>>,
+    next: Arc<SpinLock<u64>>,
 }
 
 pub struct FakePages {
@@ -331,11 +339,11 @@ pub struct FakePages {
 
 impl SysAlloc for FakeSys {
     fn alloc(&self, pages: u64) -> Result<Box<dyn SysPages>, String> {
-        let mut next = self.next.borrow_mut();
+        let mut next = self.next.lock();
         let mut phys = Vec::new();
         for _ in 0..pages {
             phys.push(*next);
-            self.mem.borrow_mut().insert(*next / PAGE, vec![0u8; PAGE as usize].into_boxed_slice());
+            self.mem.lock().insert(*next / PAGE, vec![0u8; PAGE as usize].into_boxed_slice());
             // A gap after each page: the pages are not contiguous (as DmaPages may give them).
             *next += 2 * PAGE;
         }
@@ -351,7 +359,7 @@ impl SysPages for FakePages {
         self.phys.get(page as usize).copied()
     }
     fn read(&mut self, off: u64, out: &mut [u8]) -> bool {
-        let m = self.mem.borrow();
+        let m = self.mem.lock();
         for (i, b) in out.iter_mut().enumerate() {
             let o = off + i as u64;
             let Some(p) = self.phys.get((o / PAGE) as usize) else { return false };
@@ -361,7 +369,7 @@ impl SysPages for FakePages {
         true
     }
     fn write(&mut self, off: u64, data: &[u8]) -> bool {
-        let mut m = self.mem.borrow_mut();
+        let mut m = self.mem.lock();
         for (i, &b) in data.iter().enumerate() {
             let o = off + i as u64;
             let Some(p) = self.phys.get((o / PAGE) as usize) else { return false };
@@ -378,6 +386,7 @@ pub struct FakeBus<'a> {
     pub hubs: &'a mut HubFake,
     pub mem: &'a mut BTreeMap<u64, Box<[u8]>>,
     pub sys: &'a SysMem,
+    pub host: Option<&'a dyn HostMem>,
     pub fb_mc: u64,
     pub fb_phys: u64,
     pub fb_size: u64,
@@ -423,6 +432,12 @@ impl FakeBus<'_> {
         self.hubs.translate(Hub::Gfx, addr, write, cid, &mut |p| carve8(mem, fb_mc, fb_phys, fb_size, p)).ok_or(fault)
     }
 
+    /// The bridge, for a page neither the carve-out nor the fake's system memory holds.
+    fn host_for(&self, p: u64) -> Option<&'_ dyn HostMem> {
+        let own = (p >= self.fb_phys && p < self.fb_phys + self.fb_size) || self.sys.lock().contains_key(&(p / PAGE));
+        self.host.filter(|_| !own)
+    }
+
     /// One byte at a host-physical address.
     fn byte(&mut self, p: u64, write: Option<u8>) -> bool {
         if p >= self.fb_phys && p < self.fb_phys + self.fb_size {
@@ -435,7 +450,7 @@ impl FakeBus<'_> {
                 None => true,
             }
         } else {
-            let mut m = self.sys.borrow_mut();
+            let mut m = self.sys.lock();
             match (m.get_mut(&(p / PAGE)), write) {
                 (Some(pg), Some(v)) => {
                     pg[(p % PAGE) as usize] = v;
@@ -452,7 +467,7 @@ impl FakeBus<'_> {
             let mc = self.fb_mc + (p - self.fb_phys);
             self.mem.get(&(mc / PAGE)).map_or(0, |pg| pg[(mc % PAGE) as usize])
         } else {
-            self.sys.borrow().get(&(p / PAGE)).map_or(0, |pg| pg[(p % PAGE) as usize])
+            self.sys.lock().get(&(p / PAGE)).map_or(0, |pg| pg[(p % PAGE) as usize])
         }
     }
 }
@@ -485,6 +500,13 @@ impl FakeBus<'_> {
             let a = addr + i as u64;
             let p = self.phys(vmid, a, access)?;
             let n = ((PAGE - (a % PAGE)) as usize).min(out.len() - i);
+            if let Some(h) = self.host_for(p) {
+                if !h.read(p, &mut out[i..i + n]) {
+                    return Err(MemFault { vmid, addr: a, write: false });
+                }
+                i += n;
+                continue;
+            }
             for k in 0..n {
                 if !self.byte(p + k as u64, None) {
                     return Err(MemFault { vmid, addr: a, write: false });
@@ -519,6 +541,14 @@ impl FakeBus<'_> {
             let p = self.phys(vmid, a, Access::Write)?;
             let n = ((PAGE - (a % PAGE)) as usize).min(data.len() - i);
             let sys = !(p >= self.fb_phys && p < self.fb_phys + self.fb_size);
+            if let Some(h) = self.host_for(p) {
+                if !h.write(p, &data[i..i + n]) {
+                    return Err(MemFault { vmid, addr: a, write: true });
+                }
+                self.gpu_writes.push((p, n));
+                i += n;
+                continue;
+            }
             for k in 0..n {
                 let mut v = data[i + k];
                 if self.hostile == SdmaHostile::CopyCorrupt && sys && k == 0 {

@@ -10,6 +10,9 @@ use alloc::vec::Vec;
 use devmodel::block::{BlockDevice, IoPriority::Normal, Snapshots};
 
 mod commit_time;
+mod delete_steps;
+mod flush_outside;
+mod lockfree_read;
 mod window;
 
 pub(crate) fn dev(bs: u32, chunks: u64, chunk: u32, max: u32) -> Arc<MemDev> {

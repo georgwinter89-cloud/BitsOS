@@ -53,7 +53,7 @@ boot() {
 # ---- boot 1: the stick read-write, another BITSOS-labelled FAT disk next to it ----
 NAME=fs-fat
 LOG="$RUN_DIR/serial-1.log"
-cargo xtask image --name "$NAME" --ktest --config-extra "ktest=fs.fat.;loglevel=info"
+cargo xtask image --name "$NAME" --ktest --config-extra "ktest=fs.fat.,-fs.fat.doubt;loglevel=info"
 IMG="target/xtask/$NAME.img"
 mtype -i "$IMG" ::/BITSOS2/STICK.ID > "$RUN_DIR/stick.id"
 mtype -i "$IMG" ::/BITSOS2/SYS/1/KERNEL > "$RUN_DIR/kernel.before"

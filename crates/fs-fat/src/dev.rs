@@ -37,6 +37,8 @@ pub struct MemDev {
     slow_reads_us: AtomicU64,
     /// FS-14b: bytes read so far (the host tests' `usb.msd.read_bytes`).
     read_bytes: AtomicU64,
+    /// Bytes written so far (what a stick pays in time and wear).
+    written_bytes: AtomicU64,
 }
 
 impl MemDev {
@@ -50,6 +52,7 @@ impl MemDev {
             fail_reads: AtomicBool::new(false),
             slow_reads_us: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
+            written_bytes: AtomicU64::new(0),
         }
     }
     /// Starts recording every write (sector, bytes) in order.
@@ -77,6 +80,10 @@ impl MemDev {
     /// Bytes read so far.
     pub fn read_bytes(&self) -> u64 {
         self.read_bytes.load(Ordering::Relaxed)
+    }
+    /// Bytes written so far.
+    pub fn written_bytes(&self) -> u64 {
+        self.written_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -113,6 +120,7 @@ impl Dev for MemDev {
             let dst = img.get_mut(at..at + data.len()).ok_or(EIO)?;
             dst.copy_from_slice(data);
         }
+        self.written_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         if let Some(l) = self.log.lock().as_mut() {
             l.push((sector, data.to_vec()));
         }

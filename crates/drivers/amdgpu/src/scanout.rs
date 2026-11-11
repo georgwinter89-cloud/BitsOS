@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use devmodel::DevError;
 use devmodel::display::{DisplayDevice, Fence, Mode, PixelFormat, VblankEvent};
-use gopfb::GopFb;
-use gopfb::fbdev::flip::{FlipError, Vblank};
+use gopfb::{GopFb, Layout};
+use gopfb::fbdev::flip::{DirectBuffer, DirectFrame, FlipError, Vblank};
 
 /// A flip must land this long after its order (V1 `DCN_LIMIT`, spec/gpu.md §1.2), per surface.
 pub const LATE_NS: u64 = 50_000_000;
@@ -426,6 +426,78 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
         }
         self.prep.store(back as u8, Ordering::Release);
         Ok(&self.bufs[back])
+    }
+
+    /// WY-17: scanout buffer `window` as a program gets it (a linear XRGB8888 buffer at a plain physical address, what
+    /// `flip::order` already points the pipes at: no new register). None without a mapped window (test targets).
+    pub fn direct_buffer(&self, window: usize) -> Option<DirectBuffer> {
+        let fb = &self.bufs[window & 1].fb;
+        let (_, phys) = fb.target().window()?;
+        if fb.layout() != Layout::Bgrx {
+            return None;
+        }
+        Some(DirectBuffer { phys, len: fb.target().len() as u64, stride: fb.stride().checked_mul(4)? })
+    }
+
+    /// WY-17: waits for the last flip and names the hidden buffer. `whole` when something other than the program
+    /// wrote into either buffer since this one's last turn (`begin` would repair that from a RAM frame; here no RAM
+    /// frame exists and the program redraws it). Nothing is claimed: `direct_flip` does.
+    pub fn direct_begin(&self) -> Result<DirectFrame, FlipError> {
+        if !self.active() {
+            return Err(FlipError::Off);
+        }
+        let seq = self.ordered.load(Ordering::Acquire);
+        if seq != 0 {
+            self.wait(seq)?;
+        }
+        let c = usize::from(self.cur.load(Ordering::SeqCst) & 1);
+        let back = 1 - c;
+        let t0 = self.clock.now_ns();
+        while self.marks.busy[back].load(Ordering::SeqCst) != 0 && self.clock.now_ns().saturating_sub(t0) < LATE_NS {
+            self.clock.sleep_ns(POLL_NS / 10);
+        }
+        let own = self.marks.written[back].swap(0, Ordering::AcqRel);
+        let other = self.marks.written[c].load(Ordering::Acquire);
+        Ok(DirectFrame { window: back, whole: own != 0 || other != 0 })
+    }
+
+    /// WY-17: orders the flip to `window`, which a program finished drawing. Busy while a kernel frame is being
+    /// prepared. The buffer already shown is no flip: its last order's number.
+    pub fn direct_flip(&self, window: usize) -> Result<u64, FlipError> {
+        if !self.active() {
+            return Err(FlipError::Off);
+        }
+        if self.prep.compare_exchange(NONE, CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(FlipError::Busy);
+        }
+        let seq = self.ordered.load(Ordering::Acquire);
+        if seq != 0
+            && let Err(e) = self.wait(seq)
+        {
+            self.prep.store(NONE, Ordering::Release);
+            return Err(e);
+        }
+        let window = window & 1;
+        if window == usize::from(self.cur.load(Ordering::SeqCst) & 1) {
+            self.prep.store(NONE, Ordering::Release);
+            return Ok(seq);
+        }
+        self.prep.store(window as u8, Ordering::Release);
+        self.commit()
+    }
+
+    /// WY-17: the buffer shown now into `dst`, row by row (`stride` pixels apart, `dst` holds the visible size).
+    /// False when the target cannot be read. May tear with a flip or a store under way: this is a look, not a frame.
+    pub fn read_shown(&self, dst: &mut [u32], stride: u32) -> bool {
+        let c = usize::from(self.cur.load(Ordering::SeqCst) & 1);
+        let fb = &self.bufs[c].fb;
+        let line = fb.stride() as usize * 4;
+        let (w, h) = self.marks.size();
+        let (w, stride) = (w as usize, stride as usize);
+        if stride < w || dst.len() < stride.saturating_mul(h as usize) {
+            return false;
+        }
+        (0..h as usize).all(|y| fb.target().read_pixels(y * line, &mut dst[y * stride..y * stride + w]))
     }
 
     /// Orders the flip to the buffer `begin` prepared.

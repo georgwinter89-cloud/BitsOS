@@ -1,0 +1,13 @@
+# PK-L1a: the program library's entry for the stick launcher `brave` (\BITSOS2\bin\brave). Exec names the launcher
+# without a path: bitscomp starts it as /bin/sh \BITSOS2\bin\<launcher>. Icon: brave.png beside it (manifest).
+[Desktop Entry]
+Type=Application
+Name=Brave
+GenericName=Web Browser
+GenericName[de]=Webbrowser
+Comment[de]=Im Internet surfen
+Exec=brave
+Icon=brave
+Categories=Network;WebBrowser;
+Keywords[de]=Internet;Web;Browser;Chromium;
+StartupWMClass=brave-browser

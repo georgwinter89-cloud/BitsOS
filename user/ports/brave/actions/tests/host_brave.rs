@@ -4,7 +4,7 @@
 //! internet). Every action once; the change actions refused without permission and with an allow set over MCP,
 //! then allowed (Georg's shell); file: URLs refused; a hanging page against timeout_ms; a page larger than an
 //! answer; Brave killed and started again by the next call. Needs the stage (bash
-//! user/ports/brave-launcher/scripts/stage-v2.sh): without it the test fails unless BRAVE_ACT_ALLOW_SKIP=1.
+//! user/ports/brave-launcher/scripts/stage-v2.sh): without it the test fails.
 
 use mcpreg::Json;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -164,11 +164,7 @@ fn s<'a>(j: &'a Json, k: &str) -> &'a str {
 #[test]
 fn every_action_on_headless_brave() {
     let stage = std::env::var("BRAVE_STAGE").unwrap_or_else(|_| "/var/tmp/claude-v2/stage/brave".into());
-    if !Path::new(&stage).join("brave").is_file() {
-        assert!(std::env::var_os("BRAVE_ACT_ALLOW_SKIP").is_some(), "no staged Brave in {stage}: stage it, or set BRAVE_ACT_ALLOW_SKIP=1");
-        eprintln!("SKIP (BRAVE_ACT_ALLOW_SKIP): no staged Brave in {stage}");
-        return;
-    }
+    assert!(Path::new(&stage).join("brave").is_file(), "no staged Brave in {stage}: stage it (no test is skipped, Georg 30.10.)");
     let dir = std::env::temp_dir().join(format!("brave-act-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("home")).unwrap();

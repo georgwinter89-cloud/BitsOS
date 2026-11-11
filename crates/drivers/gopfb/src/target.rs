@@ -21,6 +21,11 @@ pub trait FbTarget: Send + Sync {
     fn write_bytes(&self, off: usize, b: &[u8]) -> bool;
     /// Makes the writes so far reach the device (WC: `sfence`).
     fn flush(&self) {}
+    /// WY-17: 32-bit pixels from byte `off`; false when this target cannot be read (MCP `screen` of a frame the GPU
+    /// drew: a slow read of write-combined memory, only on request).
+    fn read_pixels(&self, _off: usize, _px: &mut [u32]) -> bool {
+        false
+    }
     /// (virtual, physical) address of byte 0 when this is a mapped framebuffer window (for the WC ktest).
     fn window(&self) -> Option<(u64, u64)> {
         None
@@ -39,6 +44,9 @@ impl FbTarget for FbWindow {
     }
     fn flush(&self) {
         FbWindow::flush(self)
+    }
+    fn read_pixels(&self, off: usize, px: &mut [u32]) -> bool {
+        FbWindow::read_pixels(self, off, px)
     }
     fn window(&self) -> Option<(u64, u64)> {
         Some((self.virt(), self.phys()))
@@ -127,6 +135,16 @@ impl FbTarget for RamTarget {
         let Some(dst) = off.checked_add(b.len()).and_then(|e| g.get_mut(off..e)) else { return false };
         dst.copy_from_slice(b);
         self.written.fetch_add(b.len() as u64, Ordering::Relaxed);
+        true
+    }
+    fn read_pixels(&self, off: usize, px: &mut [u32]) -> bool {
+        let g = self.bytes.lock();
+        let Some(src) = px.len().checked_mul(4).and_then(|n| off.checked_add(n)).and_then(|e| g.get(off..e)) else {
+            return false;
+        };
+        for (p, s) in px.iter_mut().zip(src.as_chunks::<4>().0) {
+            *p = u32::from_le_bytes(*s);
+        }
         true
     }
 }

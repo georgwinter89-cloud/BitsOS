@@ -76,9 +76,9 @@ done_wait() { # log
 
 # --- A ---
 LOG="$RUN/a.log"
-boot a "ktest=sn.usb.bound,sn.usb.tone,sn.usb.capture,sn.mix.state" "$LOG"
+boot a "ktest=sn.usb.bound,sn.usb.mute,sn.usb.tone,sn.usb.capture,sn.mix.state" "$LOG"
 done_wait "$LOG"
-check "$LOG" 'KTEST done passed=3 failed=0 skipped=1' "A: bound, tone, state pass; capture skips (no mic in QEMU)"
+check "$LOG" 'KTEST done passed=4 failed=0 skipped=1' "A: bound, mute, tone, state pass; capture belongs to the Mini-PC (no mic in QEMU)"
 check "$LOG" 'usb_audio uac.bound device=xhci[0-9]*-[0-9]* vendor=0x46f4 product=0x2 control=0 playback=1 capture=0' "A: QEMU's usb-audio bound"
 check "$LOG" 'usb_audio uac.stream .* interface=1 alt=1 endpoint=0x1 dir=playback channels=2 bits=16' "A: its 48 kHz stereo setting"
 check "$LOG" 'snd mix.open endpoint=usb:xhci[0-9]*-[0-9]*/usb/0:0x1' "A: Auto opened the headset"

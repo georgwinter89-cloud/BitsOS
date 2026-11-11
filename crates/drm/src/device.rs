@@ -68,8 +68,8 @@ pub enum Place {
     /// (the fake: no PCI function behind it).
     Own,
     /// The PCI view's directory of a real function (path below /sys, e.g. `devices/pci0000:00/0000:00:08.1/0000:c7:00.0`);
-    /// PC provides its files, the DRM view adds `drm/` below it. No backend registers one yet: GX's hardware
-    /// backend takes the path from pci's sysfs view when it does (C1 removed the unused `pci::sysfs::function_dir`).
+    /// PC provides its files, the DRM view adds `drm/` below it. GX's hardware backend takes the path from
+    /// `pci::sysfs::dir`.
     Pci(String),
 }
 
@@ -106,7 +106,7 @@ impl PciIdentity {
     }
 }
 
-/// A GPU backend behind the DRM core: the fake now, the amdgpu hardware backend later (GX).
+/// A GPU backend behind the DRM core: the fake, or the amdgpu hardware backend (`amdgpu::hw`, GX-8).
 pub trait Driver: Send + Sync {
     fn info(&self) -> &DriverInfo;
     fn pci(&self) -> &PciIdentity;
@@ -351,7 +351,7 @@ pub fn by_render_minor(minor: u32) -> Option<Arc<Device>> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// The hardware backend when one attaches (none yet: no DRM device, as Linux without a GPU driver).
+    /// The hardware backend registers itself when its bring-up passed (`amdgpu::hw`); until then no DRM device, as Linux without a GPU driver.
     Auto = 0,
     /// The fake GPU (QEMU scenarios with Mesa, the ABI diff; never needed on hardware).
     Fake = 1,
@@ -375,7 +375,20 @@ pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
         }
     };
     MODE.store(m as u8, Ordering::Release);
+    let lose = match get("drm_fake_hang").as_deref().map(str::trim) {
+        None | Some("") | Some("reset") => false,
+        Some("lose") => true,
+        Some(other) => {
+            klog::event!(Warn, "drm", "config.unknown", value = other; "drm_fake_hang= takes reset or lose: reset");
+            false
+        }
+    };
+    FAKE_LOSES.store(lose, Ordering::Release);
 }
+
+/// WY-21: CONFIG `drm_fake_hang=lose` (a test's): a hang on the boot's fake ends the device, so a scenario sees what
+/// a program meets on the chip when GX-9a's ladder cannot recover. Default `reset`: Linux's recovered job timeout.
+static FAKE_LOSES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn mode() -> Mode {
     match MODE.load(Ordering::Acquire) {
@@ -399,7 +412,9 @@ pub(crate) fn boot_devices() {
             klog::event!(Info, "drm", "fake.off", mode = format!("{m:?}").as_str(); "no fake DRM device (drm=fake gives one)");
             return;
         }
-        match crate::add_device(Arc::new(crate::fake::FakeGpu::radeon_780m())) {
+        let fake = crate::fake::FakeGpu::radeon_780m();
+        fake.lose_on_hang(FAKE_LOSES.load(Ordering::Acquire));
+        match crate::add_device(Arc::new(fake)) {
             Ok(d) => klog::event!(Info, "drm", "fake.on", minor = d.render_minor();
                 "the fake GPU answers on /dev/dri/renderD{}", d.render_minor()),
             Err(e) => klog::event!(Warn, "drm", "fake.failed", errno = e),

@@ -36,7 +36,7 @@ fn mounted() -> Result<alloc::sync::Arc<crate::Volume>, TestResult> {
         Some(v) => Ok(v),
         None => Err(match stick::last_reason() {
             Some(r) => Err(format!("the boot stick was not mounted: {r}")),
-            None => ktest::skip("no boot stick (no USB disk recognised as the stick)"),
+            None => ktest::fail("no boot stick (no USB disk recognised as the stick)"),
         }),
     }
 }
@@ -104,7 +104,7 @@ fn fs_fat_tree() -> TestResult {
     klog::event!(Info, "fat", "ktest.tree", dirs = dirs, files = files, bytes = bytes);
     Ok(())
 }
-ktest!("fs.fat.tree", Safe, fs_fat_tree);
+ktest!("fs.fat.tree", QemuAll, fs_fat_tree);
 
 fn fs_fat_refusals() -> TestResult {
     let vol = match mounted() {
@@ -280,7 +280,7 @@ fn fs_fat_doubt() -> TestResult {
         }
     }
     if yes() < 2 {
-        return ktest::skip("needs a second disk that looks like the boot stick (host/tests/fs/30-fat.sh)");
+        return ktest::fail("needs a second disk that looks like the boot stick (host/tests/fs/30-fat.sh)");
     }
     let vol = match mounted() {
         Ok(v) => v,
@@ -301,4 +301,4 @@ fn fs_fat_doubt() -> TestResult {
     klog::event!(Info, "fat", "ktest.doubt", sticks = yes(), reason = stick::last_reason().unwrap_or("second stick after the mount"));
     Ok(())
 }
-ktest!("fs.fat.doubt", QemuOnly, fs_fat_doubt);
+ktest!("fs.fat.doubt", Run("fs/30-fat"), fs_fat_doubt);

@@ -18,6 +18,11 @@ pub mod op {
     pub const WRITE_16: u8 = 0x8A;
     pub const SERVICE_ACTION_IN_16: u8 = 0x9E;
     pub const SAI_READ_CAPACITY_16: u8 = 0x10;
+
+    /// A command a device cannot answer from its firmware's memory alone.
+    pub fn reaches_medium(opcode: u8) -> bool {
+        matches!(opcode, READ_10 | READ_16 | WRITE_10 | WRITE_16 | SYNCHRONIZE_CACHE_10 | UNMAP)
+    }
 }
 
 /// Sense keys (SPC-4 Table 51).

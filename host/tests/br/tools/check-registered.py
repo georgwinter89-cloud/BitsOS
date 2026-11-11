@@ -14,9 +14,9 @@ import pathlib
 import re
 import sys
 
-# plan/notes/br-BR-1.md, "Not registered in V2" (fgetxattr/fsetxattr only in the net run).
-# pkey_alloc and pkey_mprotect are registered since INT-W10 (BR-3 CR 4).
-EXPECTED = {"rseq", "landlock_create_ruleset", "fgetxattr", "fsetxattr"}
+# plan/notes/br-BR-1.md, "Not registered in V2".
+# pkey_alloc and pkey_mprotect are registered since INT-W10 (BR-3 CR 4), the xattr family since INT-W32a (GM-2a CR 5).
+EXPECTED = {"rseq", "landlock_create_ruleset"}
 REFS = ("br1-local.txt", "br1-net.txt", "br6-sandbox.txt")
 # The calls only the sandbox makes (SX-1 seccomp, SX-2 namespaces and chroot), host strace of br6-sandbox.txt.
 SANDBOX_CALLS = {"unshare", "chroot", "seccomp", "capset"}

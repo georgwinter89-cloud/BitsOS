@@ -33,7 +33,8 @@ pub fn pattern_frame(i: u64) -> [u8; 4] {
 /// endpoint: (device, interface, alternate setting, endpoint address, packet size).
 fn find_audio() -> Option<(Arc<Device>, u8, u8, u8, usize)> {
     registry::devices().into_iter().find_map(|d| {
-        if !registry::bindings_of(d.id).is_empty() {
+        // A device being detached is still listed until its `detach` ends (the replug's search can come that early).
+        if d.is_gone() || !registry::bindings_of(d.id).is_empty() {
             return None;
         }
         let cfg = d.config.as_ref()?;
@@ -67,15 +68,18 @@ impl Stream {
             if self.filling.swap(true, Ordering::AcqRel) {
                 return;
             }
-            self.fill_some();
+            let refused = self.fill_some();
             self.filling.store(false, Ordering::Release);
-            if self.stop.load(Ordering::Acquire) || self.pipe.room() < PER_REQ {
+            // Not again after a refusal: on a device that is gone this ran for ever inside a completion callback,
+            // and the requests behind it in the queue never ended (`us.isoch.unplug` red now and then, INT-W31).
+            if refused || self.stop.load(Ordering::Acquire) || self.pipe.room() < PER_REQ {
                 return;
             }
         }
     }
 
-    fn fill_some(self: &Arc<Self>) {
+    /// Whether the pipe or the buffer refused a request.
+    fn fill_some(self: &Arc<Self>) -> bool {
         while !self.stop.load(Ordering::Acquire) && self.pipe.room() >= PER_REQ {
             let seq = self.seq.load(Ordering::Acquire);
             let buf = self.bufs[(seq as usize) % self.bufs.len()].clone();
@@ -85,7 +89,7 @@ impl Stream {
                 bytes.extend_from_slice(&pattern_frame(seq * PER_REQ as u64 * frames + i));
             }
             if !buf.write(0, &bytes) {
-                return;
+                return true;
             }
             let me = self.clone();
             let req = IsoRequest::even(buf, PER_REQ, self.packet);
@@ -93,10 +97,11 @@ impl Stream {
                 Ok(()) => self.seq.store(seq + 1, Ordering::Release),
                 Err(e) => {
                     klog::event!(Debug, "usb", "ktest.iso_queue_refused", error = e.as_str());
-                    return;
+                    return true;
                 }
             }
         }
+        false
     }
 
     fn done(self: &Arc<Self>, r: IsoResult) {
@@ -128,6 +133,10 @@ fn settled() -> bool {
     }
     false
 }
+
+/// How long a queue may take to end, in ms. These tests run only under QEMU, where timing is not judged (`us/70-isoch`: this
+/// was 2 s and 1 s; 2 s went red once in a gate with other QEMUs running): a queue that never ends is still red.
+const QUEUE_ENDS: u64 = 30_000;
 
 fn until(ns: u64, f: impl Fn() -> bool) -> bool {
     let deadline = time::now_ns().saturating_add(ns);
@@ -171,11 +180,11 @@ fn start() -> Result<Option<(Arc<Device>, u8, Arc<Stream>)>, alloc::string::Stri
 fn stream() -> TestResult {
     let (missed0, errors0) = (ISO_MISSED.get(), ISO_ERRORS.get());
     let Some((d, iface, st)) = start()? else {
-        return ktest::skip("no unbound usb-audio (scenario host/tests/us/70-isoch.sh)");
+        return ktest::fail("no unbound usb-audio (scenario host/tests/us/70-isoch.sh)");
     };
     sched::sleep_ns(3000 * MS);
     st.stop.store(true, Ordering::Release);
-    let drained = until(1000 * MS, || st.pipe.queued() == 0);
+    let drained = until(QUEUE_ENDS * MS, || st.pipe.queued() == 0);
     let left = st.pipe.stop().map_err(|e| format!("stop: {e:?}"))?;
     d.set_interface(iface, 0).map_err(|e| format!("alternate setting 0: {e:?}"))?;
     let (packets, bad) = (st.packets.load(Ordering::Acquire), st.bad.load(Ordering::Acquire));
@@ -188,20 +197,20 @@ fn stream() -> TestResult {
     kassert!(drained && left == 0, "queue did not drain ({} queued, {left} cancelled by stop)", st.pipe.queued());
     Ok(())
 }
-ktest!("us.isoch.stream", QemuOnly, stream);
+ktest!("us.isoch.stream", Run("us/70-isoch"), stream);
 
 /// With `host/tests/us/70-isoch.sh` (usb_iso_test=on): the script pulls the usb-audio while it streams; every
 /// queued request ends (`Gone`), nothing stays queued, the controller runs on. Then the script plugs a usb-audio
 /// in again and it streams like the first.
 fn unplug() -> TestResult {
     if !pci::registry::opted_in("usb_iso_test") {
-        return ktest::skip("scenario only: host/tests/us/70-isoch.sh boots with usb_iso_test=on and pulls the device");
+        return ktest::fail("scenario only: host/tests/us/70-isoch.sh boots with usb_iso_test=on and pulls the device");
     }
     let Some((d, _iface, st)) = start()? else { return Err("usb-audio expected".into()) };
     kassert!(until(5000 * MS, || st.packets.load(Ordering::Acquire) >= 200), "not streaming");
     klog::event!(Info, "usb", "ktest.iso_streaming", device = d.path(); "pull the device now");
     kassert!(until(60_000 * MS, || d.is_gone()), "device not gone within 60 s");
-    kassert!(until(2000 * MS, || st.pipe.queued() == 0), "{} packets still queued after the unplug", st.pipe.queued());
+    kassert!(until(QUEUE_ENDS * MS, || st.pipe.queued() == 0), "{} packets still queued after the unplug", st.pipe.queued());
     st.stop.store(true, Ordering::Release);
     kassert!(controllers().iter().all(|c| c.state() == crate::hc::State::Running), "a controller stopped");
     klog::event!(Info, "usb", "ktest.iso_unplug_done", packets = st.packets.load(Ordering::Acquire),
@@ -212,11 +221,11 @@ fn unplug() -> TestResult {
     let Some((d, iface, st)) = start()? else { return Err("usb-audio vanished".into()) };
     kassert!(until(5000 * MS, || st.packets.load(Ordering::Acquire) >= 200), "not streaming after the replug");
     st.stop.store(true, Ordering::Release);
-    kassert!(until(1000 * MS, || st.pipe.queued() == 0), "queue did not drain after the replug");
+    kassert!(until(QUEUE_ENDS * MS, || st.pipe.queued() == 0), "queue did not drain after the replug");
     d.set_interface(iface, 0).map_err(|e| format!("alternate setting 0 after the replug: {e:?}"))?;
     let bad = st.bad.load(Ordering::Acquire);
     kassert!(bad == 0, "{bad} bad packets after the replug, first {:?}", *st.first_bad.lock());
     klog::event!(Info, "usb", "ktest.iso_replug_done", device = d.path(), packets = st.packets.load(Ordering::Acquire));
     Ok(())
 }
-ktest!("us.isoch.unplug", QemuOnly, unplug);
+ktest!("us.isoch.unplug", Run("us/70-isoch"), unplug);

@@ -2,6 +2,8 @@
 //! and its interrupt vectors. The kernel's `MmioHw` and the host tests' fake controller implement it.
 
 use alloc::string::String;
+use alloc::sync::Arc;
+use ksync::WaitQueue;
 
 /// DMA memory as the queues see it. In the kernel a write-back `mm::dma::DmaBuffer` (snooped: no barrier
 /// before a doorbell write), in host tests `VecMem`, which the fake reads and writes as its DMA. Every access
@@ -43,8 +45,18 @@ impl IrqMode {
     }
 }
 
+/// BL-1: the hard-IRQ hook a vector runs before its wake (pci's `IrqHook`): it reaps the completion queues on
+/// that vector. No heap, no klog, only `IrqSpinLock`s.
+pub type IrqHook = Arc<dyn Fn(u16) + Send + Sync>;
+
+/// A doorbell writer the IRQ hook can own (lock-free, IRQ-safe: one uncached store).
+pub trait Bell: Send + Sync + 'static {
+    fn ring(&self, off: usize, v: u32);
+}
+
 pub trait Hw: Send + Sync {
-    type Mem: DmaMem;
+    type Mem: DmaMem + 'static;
+    type Bell: Bell;
     /// A register read; a gone device answers all ones.
     fn rd32(&self, off: usize) -> u32;
     fn wr32(&self, off: usize, v: u32);
@@ -60,8 +72,21 @@ pub trait Hw: Send + Sync {
     fn enable(&self, dma: bool) -> Result<(), String>;
     /// MSI/MSI-X and bus master off, vectors released (PC-2's `disable_device`): lock-free, no sleep.
     fn pci_off(&self);
-    /// Asks for up to `max` vectors (index 0 = admin CQ). Drops a previous set first.
-    fn setup_irqs(&self, max: u16) -> IrqMode;
+    /// Asks for up to `max` vectors (index 0 = admin CQ), spread over the CPUs, each running `hook` in its
+    /// interrupt. Drops a previous set first.
+    fn setup_irqs(&self, max: u16, hook: IrqHook) -> IrqMode;
+    /// The CPU vector index `i` was given (None: polled, released, no such index).
+    fn irq_cpu(&self, i: u16) -> Option<u32>;
+    /// The doorbell writer for the IRQ hook.
+    fn bell(&self) -> Self::Bell;
+    /// CPUs that run threads (queues per CPU) and the caller's CPU (it may move right after).
+    fn cpus(&self) -> usize;
+    fn cpu(&self) -> usize;
+    /// BL-1: the device address of `buf` when the device may read or write it in place (physically contiguous,
+    /// in the kernel's direct map); None: the bounce pages carry it.
+    fn dma_target(&self, buf: &[u8]) -> Option<u64>;
+    /// Sleeps on `wq` until `cond` or `timeout_ns` (the fake moves its clock instead).
+    fn sleep_on(&self, wq: &WaitQueue, cond: &mut dyn FnMut() -> bool, timeout_ns: u64);
     /// Frees the vectors (before a restart; dropping may sleep).
     fn free_irqs(&self);
     /// Waits on vector index `i` up to `timeout_ns`; false when there is no such vector (poll instead).

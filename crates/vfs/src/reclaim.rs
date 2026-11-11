@@ -18,7 +18,7 @@
 //! the hands stay where it stopped, so the next round goes on from there, and kswapd does the exhaustive scan). Freed frames go back while the cache lock is held (as
 //! truncate does); the ring lock is never held while a cache is locked (order vfs.inode.data > the rings).
 
-use crate::pagecache::{frames_held, tmpfs_frames, Inner, COLD, PRELOADED, REFERENCED};
+use crate::pagecache::{frames_held, invalidate_clean, tmpfs_frames, Inner, Invalidated, COLD, PRELOADED, REFERENCED};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use ksync::{Mutex, MutexGuard, SpinLock, SpinLockGuard};
@@ -138,7 +138,9 @@ impl Ring {
                 self.take_out(mode, &w);
                 continue;
             };
-            match visit(&c) {
+            let step = visit(&c);
+            release(c);
+            match step {
                 Step::Keep => {
                     if let Some(mut s) = self.slots(mode) {
                         s.hand += 1;
@@ -187,6 +189,18 @@ impl Reclaimer {
             }
         }
         r
+    }
+
+    /// BL-0: every listed cache's clean pages that only the index holds leave (`drop_caches` bit 1).
+    pub fn drop_clean(&self) -> Invalidated {
+        let mut out = Invalidated::default();
+        self.all.walk(Mode::Background, &mut |c| {
+            let r = invalidate_clean(c, 0, u64::MAX);
+            out.dropped += r.dropped;
+            out.kept += r.kept;
+            Step::Keep
+        });
+        out
     }
 
     /// Caches listed (all, preloaded).
@@ -342,7 +356,7 @@ fn apply(g: &mut Inner, i: u64, v: Verdict, out: &mut Outcome) -> bool {
             // locked reader's new reference waits for; a reader may have taken one since `judge`): dropping it
             // frees the frame after a grace period (PF-5: lockless readers may still copy from it; the
             // allocator waits for that before it retries, `grace::expedite`).
-            let Some(page) = g.pages.take_alone(i) else {
+            let Some(page) = g.pages.try_take_alone(i) else {
                 out.held += 1;
                 return false;
             };
@@ -425,18 +439,164 @@ klog::counter!(EMPTY_CALLS, "vfs.reclaim.empty_calls");
 klog::counter!(BUSY_CACHES, "vfs.reclaim.busy_caches");
 klog::counter!(NOT_LISTED, "vfs.reclaim.not_listed");
 
-/// Lists a new block file system cache (`PageCache::build`).
-pub(crate) fn register(c: &Arc<Cache>) {
+/// Lists a new block file system cache (`PageCache::build`); its id for frame owners (0: none).
+pub(crate) fn register(c: &Arc<Cache>) -> u64 {
     if !GLOBAL.all.add(c) {
         NOT_LISTED.inc();
     }
+    ids::add(c)
 }
+
+/// The cache of id `id` is gone (`PageCache`'s drop).
+pub(crate) fn unregister(id: u64) {
+    ids::remove(id);
+}
+
+/// A reference to a cache that reclaim took from a weak one: when it is the last (the file was dropped meanwhile)
+/// the cache is freed after a grace period by the queue, not here: reclaim runs inside an allocation, maybe with
+/// the caller's locks held (review item 7). A count of more than two means another holder besides the list's
+/// owner; two holders dropping at once may still leave the drop here, rarely.
+fn release(c: Arc<Cache>) {
+    if Arc::strong_count(&c) > 2 {
+        drop(c);
+    } else {
+        mm_core::grace::defer_arc_nowait(c, 0);
+    }
+}
+
+/// The owner word of page `index` of cache `id` (`mm_core::reclaim::set_frame_owner`).
+pub(crate) fn owner_word(id: u64, index: u64) -> u64 {
+    if index >= 1 << INDEX_BITS { 0 } else { (id << INDEX_BITS) | index }
+}
+
+const INDEX_BITS: u32 = 40;
+
+/// FS-STALL review item 4: takes back the page that frame `phys` holds, found through the frame's owner word
+/// (cache id and index), when it is clean, unmapped and held by nobody else: the heap frees a block by its frames
+/// instead of walking caches. Direct reclaim's rules: try-locks only, nothing allocated. True: the page went.
+pub fn reclaim_frame(phys: u64, owner: u64) -> bool {
+    let (id, index) = (owner >> INDEX_BITS, owner & ((1 << INDEX_BITS) - 1));
+    let Some(c) = ids::get(id) else { return false };
+    let mut spins = SPINS;
+    let taken = match lock(&c, Mode::Direct, &mut spins) {
+        Some(g) => {
+            let ok = g.pages.next_with(index, |i, p| i == index && p.phys() == Some(phys) && p.strong_count() == 1 && !p.is_dirty()).is_some_and(|(_, ok)| ok);
+            match ok.then(|| g.pages.try_take_alone(index)).flatten() {
+                Some(page) => {
+                    page.drop_nowait();
+                    true
+                }
+                None => false,
+            }
+        }
+        None => false,
+    };
+    release(c);
+    if taken {
+        PAGES.inc();
+        FRAME_PAGES.inc();
+    }
+    taken
+}
+
+klog::counter!(pub FRAME_PAGES, "vfs.reclaim.frame_pages");
+
+/// Ids of reclaimable caches: a slot per live cache, reused after its drop. A stale owner word naming a reused
+/// slot finds another cache, whose page at that index has another frame: `reclaim_frame` checks the frame.
+mod ids {
+    use super::Cache;
+    use alloc::sync::{Arc, Weak};
+    use alloc::vec::Vec;
+    use ksync::SpinLock;
+
+    struct Table {
+        slots: Vec<Weak<Cache>>,
+        free: Vec<u32>,
+    }
+
+    static IDS: SpinLock<Table> = SpinLock::named("vfs.reclaim.ids", Table { slots: Vec::new(), free: Vec::new() });
+
+    pub(super) fn add(c: &Arc<Cache>) -> u64 {
+        let mut t = IDS.lock();
+        if let Some(i) = t.free.pop() {
+            t.slots[i as usize] = Arc::downgrade(c);
+            return u64::from(i) + 1;
+        }
+        // Ids above 24 bits do not fit the owner word: such a cache is reclaimed by the clock only.
+        let room = t.slots.len() + 1 - t.free.len();
+        if t.slots.len() >= (1 << 24) - 1 || t.slots.try_reserve(1).is_err() || t.free.try_reserve(room).is_err() {
+            return 0;
+        }
+        t.slots.push(Arc::downgrade(c));
+        t.slots.len() as u64
+    }
+
+    pub(super) fn remove(id: u64) {
+        if id == 0 {
+            return;
+        }
+        let mut t = IDS.lock();
+        let i = (id - 1) as usize;
+        if i < t.slots.len() {
+            t.slots[i] = Weak::new();
+            // Room was reserved when the slot was made.
+            if t.free.len() < t.free.capacity() {
+                t.free.push(i as u32);
+            }
+        }
+    }
+
+    /// The live cache of `id`; never waits for the table (reclaim).
+    pub(super) fn get(id: u64) -> Option<Arc<Cache>> {
+        let t = IDS.try_lock()?;
+        t.slots.get(id.checked_sub(1)? as usize)?.upgrade()
+    }
+}
+
 
 /// A cache got its first unused preloaded page (`fill_as`, under its lock).
 pub(crate) fn note_preloaded(c: &Arc<Cache>) {
     if !GLOBAL.preloaded.add(c) {
         NOT_LISTED.inc();
     }
+}
+
+klog::counter!(DROP_PAGECACHE, "vfs.drop_caches.pagecache");
+klog::counter!(DROP_SLAB, "vfs.drop_caches.slab");
+static DROP_QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BL-0: what a write of `what` (1..=4) to `/proc/sys/vm/drop_caches` does (linux-7/fs/drop_caches.c:51
+/// `drop_caches_sysctl_handler`). Bit 1 (`iterate_supers(drop_pagecache_sb)`, every super block and the block
+/// devices' own): the clean pages nobody else holds leave every block file system cache and every block device
+/// cache (ext4's metadata under `CachedDiskDev`, `block::bdev::DiskFile`), all of them listed in the reclaim
+/// ring; dirty, mapped and held pages stay (`invalidate_clean`), tmpfs is never listed. Bit 2 (`drop_slab`): the
+/// kernel heap's magazines and empty slabs go back (`mm_core::HEAP.shrink`; V2's dentries and inodes are no
+/// LRU cache, they live while used, so there is nothing more to shrink). Bit 4 only quiets the event from then on,
+/// as Linux's `stfu`. Thread context with no lock held: it takes each cache's data lock in turn.
+pub fn drop_caches(what: u64, by: &str, pid: u64) -> Invalidated {
+    let mut out = Invalidated::default();
+    if what & 1 != 0 {
+        out = GLOBAL.drop_clean();
+        // The frames are free when the write returns (bounded wait for the grace period, no lock held).
+        mm_core::grace::expedite();
+        DROP_PAGECACHE.inc();
+    }
+    if what & 2 != 0 {
+        mm_core::HEAP.shrink();
+        DROP_SLAB.inc();
+    }
+    if !DROP_QUIET.load(core::sync::atomic::Ordering::Relaxed) {
+        klog::event!(Info, "vfs", "drop_caches", value = what, comm = by, pid = pid, dropped = out.dropped, kept = out.kept);
+    }
+    if what & 4 != 0 {
+        DROP_QUIET.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// Page-cache drops since boot (`drop_caches` with bit 1).
+pub fn drop_caches_done() -> u64 {
+    DROP_PAGECACHE.get()
 }
 
 /// Reclaims up to `want` pages from every block file system cache (see the module docs), counted.
@@ -504,8 +664,9 @@ pub fn file_pages() -> u64 {
 
 /// `/proc/meminfo` MemAvailable in bytes (`mm_core::reclaim::mem_available` over the frame allocator's numbers
 /// and `file_pages`); 0 without a frame allocator (host tests). PF-5: frames that wait for a grace period count
-/// as free (they left `file_pages` when they left the index, `CachePage::account_out`).
+/// as free (they left `file_pages` when they left the index, `CachePage::account_out`); the HighAtomic reserve
+/// does not (no program gets it).
 pub fn mem_available_bytes() -> u64 {
     let Some(s) = mm_core::frames().map(|f| f.stats()) else { return 0 };
-    mm_core::reclaim::mem_available(s.total_bytes, s.free_bytes.saturating_add(s.pending_bytes), file_pages().saturating_mul(4096))
+    mm_core::reclaim::mem_available(s.total_bytes, s.usable_free_bytes().saturating_add(s.pending_bytes), file_pages().saturating_mul(4096))
 }

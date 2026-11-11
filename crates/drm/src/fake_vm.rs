@@ -1,5 +1,5 @@
 //! DR-7: the fake GPU's client VMs. A job's ops build real GFX 11 page tables in heap memory with GR's VM core
-//! (`amdgpu_fmt::vm`, the CPU path; GX-8 writes the same entries by SDMA), and the fake keeps the memory of
+//! (`amdgpu_fmt::vm`, the CPU path, as GX-8a does on the chip), and the fake keeps the memory of
 //! every mapped page for as long as a translation reaches it. Without physical addresses (host tests have no
 //! frames) only the translation map is kept. TLB flushes are immediate, so freed tables go back at once.
 //!
@@ -22,7 +22,7 @@ use amdgpu_fmt::vm::{Backing, Vm};
 use amdgpu_fmt::walk::{self, Walk};
 use core::sync::atomic::{AtomicU64, Ordering};
 use ksync::SpinLock;
-use linux::errno::{EIO, ENOMEM};
+use linux::errno::{EIO, ENOMEM, ESRCH};
 
 const PAGE_SHIFT: u32 = 12;
 /// Where the fake's tables "live" (above any RAM a test machine has, inside 48 bits; never touched).
@@ -278,7 +278,7 @@ impl Drop for FakeVm {
             vm.destroy(&mut g.store);
         }
         for d in deferred {
-            d.done.signal();
+            d.done.signal_error(ESRCH as i32);
         }
         LIVE_VMS.fetch_sub(1, Ordering::Relaxed);
     }

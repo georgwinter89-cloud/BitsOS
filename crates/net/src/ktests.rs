@@ -1,6 +1,6 @@
 //! In-kernel tests of the stack (NW-3). Under `xtask ktest` (QEMU user network on a virtio-net card: DHCP gives
 //! 10.0.2.15, the gateway 10.0.2.2 answers ping) `nw.stack.dhcp`, `ping_gateway` and `loopback_*` run for real;
-//! the tests that need a host-side partner (an HTTP server on the lane port 24510, reached as 10.0.2.2:24510;
+//! the tests that need a host-side partner (an HTTP server on a free lane port, reached as 10.0.2.2:<port>;
 //! a host client through hostfwd 24521 -> 24520; the fake LAN of `host/tests/nw/40-fake-lan.sh`) skip at once
 //! when the partner is missing, and the scenario scripts require them to pass.
 
@@ -25,8 +25,12 @@ const SEC: u64 = 1_000_000_000;
 const SLIRP_GUEST: Ipv4 = Ipv4([10, 0, 2, 15]);
 const SLIRP_GW: Ipv4 = Ipv4([10, 0, 2, 2]);
 const SLIRP_DNS: Ipv4 = Ipv4([10, 0, 2, 3]);
-/// The scenario's host HTTP server (lane ports 24500-24999).
-const HOST_HTTP: SockAddr = SockAddr { ip: SLIRP_GW, port: 24510 };
+/// The scenario's host HTTP server: `net_test_host=<port>` in CONFIG, a free port of the run (30-stack.sh), so two
+/// runs on one machine do not share a server.
+fn host_http() -> Option<SockAddr> {
+    let port = crate::config("net_test_host")?.trim().parse().ok()?;
+    Some(SockAddr { ip: SLIRP_GW, port })
+}
 /// Guest port the host reaches through `--hostfwd 24521:24520`.
 const INBOUND_PORT: u16 = 24520;
 /// Loopback tests' ports.
@@ -48,7 +52,7 @@ fn e(x: impl core::fmt::Debug) -> String {
     format!("{x:?}")
 }
 
-/// A configured card, or skip/fail: no card at all is a skip, a card without lease after 30 s a failure.
+/// A configured card, or skip/fail: no card at all is a failure, a card without lease after 30 s a failure.
 fn configured(s: &'static Stack) -> Result<Option<stack::IfSummary>, String> {
     if crate::netdev::devices().is_empty() {
         return Ok(None);
@@ -59,7 +63,7 @@ fn configured(s: &'static Stack) -> Result<Option<stack::IfSummary>, String> {
 
 fn dhcp() -> TestResult {
     let s = st()?;
-    let Some(i) = configured(s)? else { return ktest::skip("no network card") };
+    let Some(i) = configured(s)? else { return ktest::fail("no network card") };
     let (ip, prefix) = i.info.addr.ok_or("no address")?;
     klog::event!(Info, "net", "ktest.dhcp", ifname = i.name.as_str(), ip = stack::ip_str(ip), prefix = prefix,
         router = i.info.router.map(stack::ip_str).unwrap_or_default());
@@ -99,7 +103,7 @@ ktest!("nw.stack.quiet_memory", Safe, quiet_memory);
 
 fn ping_gateway() -> TestResult {
     let s = st()?;
-    let Some(i) = configured(s)? else { return ktest::skip("no network card") };
+    let Some(i) = configured(s)? else { return ktest::fail("no network card") };
     let gw = i.info.router.ok_or("no router in the lease")?;
     let mut rtts = Vec::new();
     for _ in 0..3 {
@@ -260,22 +264,20 @@ ktest!("nw.sock.poll_wake", Safe, sock_poll_wake);
 // ---------------------------------------------------------------------------------------------------------
 // With the scenario's host partners (QEMU only: they talk to 10.0.2.2).
 
-/// A connection to the host server, or None when nobody listens there (no scenario: skip). Only under QEMU's
+/// A connection to the host server, or None when nobody listens there (no scenario: a failure). Only under QEMU's
 /// user network (the default router is 10.0.2.2): on a real network nothing is sent to 10.0.2.2.
 fn host(s: &'static Stack) -> Result<Option<alloc::boxed::Box<dyn TcpStream>>, String> {
     // Only the scenario that started the server says so (CONFIG net_test_host): a gate in another worktree
     // would otherwise reach a lane's server on the shared host port and fail where it should skip.
-    if crate::config("net_test_host").is_none() {
-        return Ok(None);
-    }
+    let Some(addr) = host_http() else { return Ok(None) };
     let Some(i) = configured(s)? else { return Ok(None) };
     if i.info.router != Some(SLIRP_GW) {
         return Ok(None);
     }
-    match s.tcp_connect(HOST_HTTP, Some(5 * SEC)) {
+    match s.tcp_connect(addr, Some(5 * SEC)) {
         Ok(c) => Ok(Some(c)),
         Err(NetError::ConnectionRefused) | Err(NetError::Unreachable) => Ok(None),
-        Err(x) => Err(format!("connect to 10.0.2.2:24510: {x:?}")),
+        Err(x) => Err(format!("connect to 10.0.2.2:{}: {x:?}", addr.port)),
     }
 }
 
@@ -287,17 +289,18 @@ fn fetch_base(s: &'static Stack) -> Result<Option<String>, String> {
     if let Some(u) = crate::config("net_test_url") {
         return Ok(Some(String::from(u.trim().trim_end_matches('/'))));
     }
-    Ok(host(s)?.map(|_| String::from("http://10.0.2.2:24510")))
+    Ok(host(s)?.map(|c| format!("http://10.0.2.2:{}", c.peer().port)))
 }
 
 fn host_get(path: &str, limit: u64) -> Result<Vec<u8>, String> {
-    let url = format!("http://10.0.2.2:24510{path}");
+    let port = host_http().ok_or_else(|| String::from(NO_HOST))?.port;
+    let url = format!("http://10.0.2.2:{port}{path}");
     http::get(st()?, &url, &http::Options::new(limit)).map(|(_, b)| b).map_err(|x| format!("GET {path}: {x:?}"))
 }
 
 fn tcp_host() -> TestResult {
     let s = st()?;
-    let Some(c) = host(s)? else { return ktest::skip(NO_HOST) };
+    let Some(c) = host(s)? else { return ktest::fail(NO_HOST) };
     c.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", Some(5 * SEC)).map_err(e)?;
     let mut got = Vec::new();
     let mut b = [0u8; 512];
@@ -308,18 +311,18 @@ fn tcp_host() -> TestResult {
         }
     }
     kassert!(got.starts_with(b"HTTP/1.") && got.ends_with(b"pong\n"), "answer {:?}", String::from_utf8_lossy(&got));
-    kassert!(c.local().ip == SLIRP_GUEST && c.peer() == HOST_HTTP);
+    kassert!(c.local().ip == SLIRP_GUEST && Some(c.peer()) == host_http());
     Ok(())
 }
-ktest!("nw.stack.tcp_host", QemuOnly, tcp_host);
+ktest!("nw.stack.tcp_host", Run("nw/30-stack"), tcp_host);
 
-/// UDP both ways: the scenario's echo on 10.0.2.2:24511 (stack_server.py) sends each datagram back.
+/// UDP both ways: the scenario's echo on 10.0.2.2:<port>+1 (stack_server.py) sends each datagram back.
 fn udp_host() -> TestResult {
     let s = st()?;
     if host(s)?.is_none() {
-        return ktest::skip(NO_HOST);
+        return ktest::fail(NO_HOST);
     }
-    let echo = SockAddr { ip: SLIRP_GW, port: HOST_HTTP.port + 1 };
+    let echo = SockAddr { ip: SLIRP_GW, port: host_http().ok_or(NO_HOST)?.port + 1 };
     let u = s.udp_bind(SockAddr { ip: Ipv4::ANY, port: 0 }).map_err(e)?;
     let mut b = [0u8; 64];
     // UDP may lose a datagram (slirp's first one waits for its ARP): three tries.
@@ -334,15 +337,15 @@ fn udp_host() -> TestResult {
             Err(x) => return Err(format!("recv: {x:?}")),
         }
     }
-    Err(String::from("no UDP echo from 10.0.2.2:24511 in three tries"))
+    Err(String::from("no UDP echo from 10.0.2.2 in three tries"))
 }
-ktest!("nw.stack.udp_host", QemuOnly, udp_host);
+ktest!("nw.stack.udp_host", Run("nw/30-stack"), udp_host);
 
 /// `/file` and `/chunked` against the hash the server publishes (`/file.sha256`: "<hex> <size>"), then the
 /// caller's size limit and a 404. Timing is reported (`ktest.fetch`), judged only on the Mini-PC.
 fn fetch() -> TestResult {
     let s = st()?;
-    let Some(base) = fetch_base(s)? else { return ktest::skip("no test server: net_test_url= in CONFIG, or 30-stack.sh under QEMU") };
+    let Some(base) = fetch_base(s)? else { return ktest::fail("no test server: net_test_url= in CONFIG, or 30-stack.sh under QEMU") };
     let get = |path: &str, limit: u64| {
         http::get(s, &format!("{base}{path}"), &http::Options::new(limit)).map(|(_, b)| b).map_err(|x| format!("GET {path}: {x:?}"))
     };
@@ -388,13 +391,13 @@ fn fetch() -> TestResult {
     kassert!(missing.as_ref().err() == Some(&http::HttpError::Status(404)), "404: {:?}", missing.err());
     Ok(())
 }
-ktest!("nw.stack.fetch", Safe, fetch);
+ktest!("nw.stack.fetch", Run("nw/30-stack"), fetch);
 
 /// The host connects in: through hostfwd 127.0.0.1:24521 -> guest 24520 (how MCP is reached in QEMU).
 fn inbound() -> TestResult {
     let s = st()?;
     if host(s)?.is_none() {
-        return ktest::skip(NO_HOST);
+        return ktest::fail(NO_HOST);
     }
     let l = s.tcp_listen(SockAddr { ip: Ipv4::ANY, port: INBOUND_PORT }, 2).map_err(e)?;
     // Ask the host server to connect to us now.
@@ -415,7 +418,7 @@ fn inbound() -> TestResult {
     kassert!(c.read(&mut b, Some(10 * SEC)) == Ok(0), "host closes after the answer");
     Ok(())
 }
-ktest!("nw.stack.inbound", QemuOnly, inbound);
+ktest!("nw.stack.inbound", Run("nw/30-stack"), inbound);
 
 // ---------------------------------------------------------------------------------------------------------
 // The fake LAN (40-fake-lan.sh): second card on `-netdev dgram`, a Python router at 192.168.77.1.
@@ -443,7 +446,7 @@ fn lan_addr(s: &'static Stack) -> Option<Ipv4> {
 fn lan_dhcp() -> TestResult {
     let s = st()?;
     if lan_card(s).is_none() {
-        return ktest::skip("no fake-LAN card (host/tests/nw/40-fake-lan.sh)");
+        return ktest::fail("no fake-LAN card (host/tests/nw/40-fake-lan.sh)");
     }
     kassert!(wait_for(30 * SEC, || lan_addr(s) == Some(Ipv4([192, 168, 77, 20]))), "no lease .20 on the fake LAN: {:?}", lan_card(s));
     let lan = lan_card(s).ok_or("card gone")?;
@@ -458,12 +461,12 @@ fn lan_dhcp() -> TestResult {
     s.ping(LAN_ROUTER, 5 * SEC).map_err(|x| format!("ping after the new lease: {x:?}"))?;
     Ok(())
 }
-ktest!("nw.lan.dhcp", QemuOnly, lan_dhcp);
+ktest!("nw.lan.dhcp", Run("nw/40-fake-lan"), lan_dhcp);
 
 /// Cable pulled and plugged back (QMP set_link): address kept while down, DHCP asked again when back.
 fn lan_link() -> TestResult {
     let s = st()?;
-    let Some(lan) = lan_card(s) else { return ktest::skip("no fake-LAN card (host/tests/nw/40-fake-lan.sh)") };
+    let Some(lan) = lan_card(s) else { return ktest::fail("no fake-LAN card (host/tests/nw/40-fake-lan.sh)") };
     let addr = lan.info.addr.ok_or("no address before the link test")?;
     let seq = klog::next_seq();
     klog::event!(Info, "net", "ktest.lan_link_wait"; "pull the cable now (QMP set_link off)");
@@ -481,4 +484,4 @@ fn lan_link() -> TestResult {
     s.ping(LAN_ROUTER, 5 * SEC).map_err(|x| format!("ping after the link came back: {x:?}"))?;
     Ok(())
 }
-ktest!("nw.lan.link", QemuOnly, lan_link);
+ktest!("nw.lan.link", Run("nw/40-fake-lan"), lan_link);

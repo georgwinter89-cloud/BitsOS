@@ -26,6 +26,7 @@ const UVA: u64 = 0x2_0000_0000;
 /// Address-space ids: one per test (the registry is the kernel's, shared by tests running at once).
 const MM_RULES: u64 = 9_001;
 const MM_JOBS: u64 = 9_002;
+const MM_FRAMES: u64 = 9_020;
 const MM_RO: u64 = 9_003;
 const MM_WAIT: u64 = 9_004;
 const MM_FUZZ: u64 = 9_005;
@@ -309,6 +310,30 @@ fn dr9_userptr_create_rules() {
         fx.close(0, x).unwrap();
     }
     assert_eq!(crate::userptr::registered_in(MM_RULES), 0, "closed objects leave the registry");
+}
+
+/// The frames a device's page table must hold: the pages of now, which a revalidation replaces.
+#[test]
+fn dr9_userptr_frames_are_the_pages_of_now() {
+    use crate::dma_buf::Exporter;
+    let (fx, sp) = with_space(MM_FRAMES, 2);
+    let c = ctx_alloc(&fx, 0, 0, ME).unwrap();
+    let u = userptr(&fx, UADDR, 2 * P, AMDGPU_GEM_USERPTR_REGISTER).unwrap();
+    let bo = fx.bo(0, u);
+    let mem = bo.userptr().unwrap();
+    assert!(mem.frames().is_none(), "no pages before the first validation");
+    let (h, dw) = setup(&fx, 0, &write_to(UVA, &[1]));
+    map(&fx, 0, u, UVA, 2 * P, RW);
+    let l = bo_list(&fx, AMDGPU_BO_LIST_OP_CREATE, 0, &[(h, 0), (u, 0)], 8).unwrap();
+    assert_eq!(cs_as(&fx, 0, c, l, &[gfx(dw)]), Ok(1));
+    let first = mem.frames().expect("pages after a CS");
+    assert_eq!(first.size(), 2 * P);
+    // Unmapped and mapped anew: the next CS gets other pages, and the old object stays with whoever holds it.
+    assert_eq!(sp.unmap(MM_FRAMES, UADDR, 2), 1);
+    sp.map(MM_FRAMES, UADDR, 2, true, false);
+    assert_eq!(cs_as(&fx, 0, c, l, &[gfx(dw)]), Ok(2));
+    let second = mem.frames().expect("pages after the revalidation");
+    assert!(!Arc::ptr_eq(&first, &second), "a revalidation that kept the old pages");
 }
 
 #[test]

@@ -195,40 +195,34 @@ def t0(c):
     mine = props(text)
     REPORT["t0_properties"] = len(mine)
     theirs = ref_props()
-    if theirs is None:
-        print(f"SKIP: T0 property comparison: no vulkaninfo.out or vulkaninfo.props in {REFDIR}", flush=True)
-        REPORT["t0_vs_real"] = f"SKIP: no reference in {REFDIR}"
-    else:
-        keys = [k for k in theirs if k in mine and not VOLATILE.search(k.split("/")[-1]) and not k.startswith("Presentable")]
-        diff = {k: (mine[k], theirs[k]) for k in keys if mine[k] != theirs[k]}
-        allow = allowed()
-        new = {k: d for k, d in diff.items() if allow.get(k) != d}
-        gone = sorted(k for k in allow if k not in diff)
-        REPORT["t0_vs_real"] = {"reference": REFDIR, "compared": len(keys), "differ": len(diff), "not_allowed": new,
-                                "allowed_gone": gone, "only_here": len(set(mine) - set(theirs)),
-                                "only_real": len(set(theirs) - set(mine)), "differences": diff}
-        print(f"T0: {len(keys)} properties compared with a real 780M: {len(diff)} differ, {len(new)} of them not in allow.txt",
-              flush=True)
-        for k in gone:
-            print(f"NOTE: T0: the known difference {k} is gone: its allow.txt line can go", flush=True)
-        need(len(keys) >= 500, f"T0: the reference has the properties to compare ({len(keys)})")
-        need(not new, "T0: every property differing from the real 780M is a known one (ref-780m/allow.txt)", json.dumps(new, indent=1))
+    need(theirs is not None, f"T0: a reference to compare with: vulkaninfo.out or vulkaninfo.props in {REFDIR}")
+    keys = [k for k in theirs if k in mine and not VOLATILE.search(k.split("/")[-1]) and not k.startswith("Presentable")]
+    diff = {k: (mine[k], theirs[k]) for k in keys if mine[k] != theirs[k]}
+    allow = allowed()
+    new = {k: d for k, d in diff.items() if allow.get(k) != d}
+    gone = sorted(k for k in allow if k not in diff)
+    REPORT["t0_vs_real"] = {"reference": REFDIR, "compared": len(keys), "differ": len(diff), "not_allowed": new,
+                            "allowed_gone": gone, "only_here": len(set(mine) - set(theirs)),
+                            "only_real": len(set(theirs) - set(mine)), "differences": diff}
+    print(f"T0: {len(keys)} properties compared with a real 780M: {len(diff)} differ, {len(new)} of them not in allow.txt",
+          flush=True)
+    for k in gone:
+        print(f"NOTE: T0: the known difference {k} is gone: its allow.txt line can go", flush=True)
+    need(len(keys) >= 500, f"T0: the reference has the properties to compare ({len(keys)})")
+    need(not new, "T0: every property differing from the real 780M is a known one (ref-780m/allow.txt)", json.dumps(new, indent=1))
     info = os.path.join(REFDIR, "vulkaninfo.info")
-    if not os.path.exists(info):
-        print(f"SKIP: T0 INFO comparison: no vulkaninfo.info in {REFDIR}", flush=True)
-        REPORT["t0_info_vs_real"] = f"SKIP: no vulkaninfo.info in {REFDIR}"
-    else:
-        ref = {k: a for k, a in drmtrace.read_info(open(info).read()).items() if k[0] not in INFO_SIZES}
-        mine_info = {k: a for k, a in drmtrace.info_answers(recs).items() if k[0] not in INFO_SIZES}
-        lines = drmtrace.compare_info(mine_info, ref)
-        REPORT["t0_info_vs_real"] = lines
-        print("T0: INFO answers against a real 780M:", flush=True)
-        for l in lines:
-            print("  " + l, flush=True)
-        equal = [l for l in lines if l.endswith(": equal")]
-        need(len(equal) >= 5, f"T0: vulkaninfo and the reference share INFO queries ({len(equal)} equal)", "\n".join(lines))
-        need(not drmtrace.info_differs(lines), "T0: every INFO answer both runs asked for is the real 780M's",
-             "\n".join(drmtrace.info_differs(lines)))
+    need(os.path.exists(info), f"T0: INFO answers to compare with: vulkaninfo.info in {REFDIR}")
+    ref = {k: a for k, a in drmtrace.read_info(open(info).read()).items() if k[0] not in INFO_SIZES}
+    mine_info = {k: a for k, a in drmtrace.info_answers(recs).items() if k[0] not in INFO_SIZES}
+    lines = drmtrace.compare_info(mine_info, ref)
+    REPORT["t0_info_vs_real"] = lines
+    print("T0: INFO answers against a real 780M:", flush=True)
+    for l in lines:
+        print("  " + l, flush=True)
+    equal = [l for l in lines if l.endswith(": equal")]
+    need(len(equal) >= 5, f"T0: vulkaninfo and the reference share INFO queries ({len(equal)} equal)", "\n".join(lines))
+    need(not drmtrace.info_differs(lines), "T0: every INFO answer both runs asked for is the real 780M's",
+         "\n".join(drmtrace.info_differs(lines)))
     ev = drm_events(klog_new(c))
     REPORT["t0_events"] = ev
     need(not ev["unsupported"] and not ev["unknown"], "T0: every ioctl and INFO query of vulkaninfo is answered", json.dumps(ev))
@@ -490,7 +484,7 @@ def main():
     klog_new(c)
 
     sock = "wayland-3"
-    comp = v.Job(c, "/bin/bitscomp", ["--socket", sock, "--stats", "5"], sock=sock)
+    comp = v.Job(c, "/bin/bitscomp", ["--socket", sock, "--stats", "5", "--main-device", "render"], sock=sock)
     comp.wait_for(r"backend=fbdev size=1280x800", "bitscomp started on fbdev at 1280x800")
     comp.wait_for(r"dmabuf: zwp_linux_dmabuf_v1 for renderer \w+, main device 226:128 \(/dev/dri/renderD128\)",
                   "bitscomp names the fake's node as the main device of linux-dmabuf")

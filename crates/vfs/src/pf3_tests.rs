@@ -92,6 +92,24 @@ fn close_on_exec_returns_what_it_closed() {
     assert!(t.close_on_exec().is_empty());
 }
 
+/// `close_all` takes the slots whole (the table gets shorter): every file is released once and the table is
+/// usable again from fd 0, also at a number beyond its old length.
+#[test]
+fn close_all_leaves_an_empty_usable_table() {
+    let f = files(3);
+    let t = FdTable::new();
+    for x in &f {
+        t.install(x.clone()).unwrap();
+    }
+    t.install_at(40, f[0].clone()).unwrap();
+    t.close_all();
+    assert_eq!(t.count(), 0);
+    assert!(f.iter().all(|x| Arc::strong_count(x) == 1), "no reference left in the table");
+    assert_eq!(t.install(f[1].clone()), Ok(0));
+    t.install_at(40, f[2].clone()).unwrap();
+    assert!(Arc::ptr_eq(&t.get(40).unwrap(), &f[2]) && t.count() == 2);
+}
+
 /// Two threads dup2 their own file onto fd 9, one closes fd 9, one looks it up: a look-up only ever sees one of
 /// the two files, and every reference installed at 9 comes back exactly once (by a close, as the file a dup
 /// replaced, or still in the table at the end), so `filp_close` work is never done twice or on the wrong file.

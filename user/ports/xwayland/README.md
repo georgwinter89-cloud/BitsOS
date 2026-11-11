@@ -5,7 +5,13 @@ X11 programs run on bitscomp through Xwayland (rootless). This port builds the X
 
     XW_TEST=1 bash user/ports/xwayland/scripts/build-v2.sh    # the tree in $CARGO_TARGET_DIR/wy-xwayland/xwayland
 
-- Software only for now: no glamor, no DRI3, no GLX (WY-3b brings glamor once Mesa runs on the 780M).
+- WY-3b: built with glamor, DRI3 and GLX. bitscomp starts it with them when it draws on the chip itself and names a render
+  node that opens, else with `XWAYLAND_NO_GLAMOR=1`, the software Xwayland; a glamor start that fails or a node that is lost costs an
+  X11 client nothing (`user/services/bitscomp/src/xwayland.rs`). `--xwayland-glamor off` on bitscomp's command line
+  switches it off. Without glamor there is no GL for X11 programs: the server has no GLX provider, they say so and end.
+- `clients/` holds `glxgears`, `glxinfo`, `xdpyinfo` from the distribution's signed packages, started with `run` (the tree's
+  `bitsos/run`), which puts this tree's `lib/` before the Mesa tree's: `libGLX_mesa.so.0` lies here, and an X11 GL client's
+  libGLX loads it by name. `host/tests/minipc/x11gpu.sh` uses them on the stick.
 - `bin/Xwayland` and `bin/xkbcomp` are built from the X.Org source releases with the host's compiler. Their
   PT_INTERP is the Mesa tree's loader (`/boot/BITSOS2/mesa/lib/ld-linux-x86-64.so.2`) and their DT_RPATH
   `/boot/BITSOS2/xwayland/lib:/boot/BITSOS2/mesa/lib`, as bitscomp's gpu build: the tree uses the Mesa tree's glibc,
@@ -29,6 +35,10 @@ X11 programs run on bitscomp through Xwayland (rootless). This port builds the X
 | `meson-1.12.1.tar.gz` (build tool) | https://github.com/mesonbuild/meson/releases/download/1.12.1/meson-1.12.1.tar.gz | `ab0a6ca09f8ef70c564c8241fb5a23957886a0b53fb58412b5e07eaf07dba743` | Apache-2.0 |
 
 Packages (pacman's cache or the configured mirror, each checked against its signature with pacman's keyring):
-`xorgproto` (headers, build only), `xkeyboard-config` (the xkb data), and for `XW_TEST=1` only `xterm`, `xorg-xeyes`,
+`xorgproto` (headers, build only), `xkeyboard-config` (the xkb data), `mesa-utils`, `xorg-xdpyinfo` (`clients/`), and for `XW_TEST=1` only `xterm`, `xorg-xeyes`,
 `xorg-xclock`, `xorg-xdpyinfo`, `xorg-xinput`, `xorg-xrandr`, `xclip`, `wl-clipboard`. The exact files are listed in
 the tree's `SOURCES.txt`.
+
+Build dependencies of glamor from the host: `libepoxy`, `libdrm`, `mesa` (gbm), `libglvnd`, `libxshmfence` (headers and link
+only: every file the tree runs with comes from `lib/` or the Mesa stage, which `build-v2.sh` checks). `libepoxy.so.0` and
+`libGLX_mesa.so.0` are the host's files, as the rest of `lib/`; the host's Mesa must be the stage's (the build says so).

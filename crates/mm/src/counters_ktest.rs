@@ -124,7 +124,7 @@ fn files() -> TestResult {
     const PATH: &[u8] = b"/tmp/.mm-ctr-file";
     let ns = vfs::root_ns();
     if ns.lookup("/tmp").is_err() {
-        return ktest::skip("no /tmp in this image");
+        return ktest::fail("no /tmp in this image");
     }
     let f = ns.open_flags(PATH, O_RDWR | O_CREAT, 0o600).map_err(e)?;
     let r = (|| -> TestResult {
@@ -179,7 +179,7 @@ ktest!("mm.ctr.files", Safe, files);
 /// whose dirty state is not implied as for a program's own frames.
 fn referenced_dirty() -> TestResult {
     let aps = aps();
-    let Some(&c) = aps.first() else { return ktest::skip("one CPU") };
+    let Some(&c) = aps.first() else { return ktest::fail("one CPU") };
     let a = lazy()?;
     let s = a.sys_mmap(0, P, RW, MAP_SHARED | MAP_ANONYMOUS, 0).map_err(e)?;
     a.read_u64(s).map_err(e)?;

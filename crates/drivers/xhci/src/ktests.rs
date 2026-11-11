@@ -1,7 +1,7 @@
 //! In-kernel tests (US-1) under QEMU's qemu-xhci (32-byte contexts, no scratchpads, one event ring segment).
 //! `xtask qemu`/`ktest` always give the machine one qemu-xhci (the boot stick hangs on it); the scenario
 //! `host/tests/us/10-xhci.sh` adds two more (qemu-xhci and nec-usb-xhci) for the several-controllers case.
-//! A machine without any xHCI function skips. `contract.quiesce` only quiesces its own test device, but a test
+//! A machine without any xHCI function fails. `contract.quiesce` only quiesces its own test device, but a test
 //! here may leave a controller quiesced, so each test first restarts a controller that is not running.
 
 use crate::driver::{controllers, is_xhci, Xhci};
@@ -35,7 +35,7 @@ pub(crate) fn running() -> Result<Option<Vec<Arc<Xhci>>>, String> {
 }
 
 fn running_all() -> TestResult {
-    let Some(list) = running()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = running()? else { return ktest::fail("no xHCI controller in this machine") };
     for c in &list {
         let name = c.name();
         kassert!(c.state() == State::Running, "{name}: state {}", c.state().as_str());
@@ -67,7 +67,7 @@ fn running_all() -> TestResult {
 ktest!("us.xhci.running", Safe, running_all);
 
 fn noop() -> TestResult {
-    let Some(list) = running()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = running()? else { return ktest::fail("no xHCI controller in this machine") };
     for c in &list {
         let before = c.stats.cmd_completions.load(Ordering::Relaxed);
         let r = c.noop().map_err(|e| format!("{}: No-Op: {e:?}", c.name()))?;
@@ -81,7 +81,7 @@ ktest!("us.xhci.noop", Safe, noop);
 
 /// The event thread (not the waiter's fallback) handles the completions when the scheduler runs it.
 fn event_thread() -> TestResult {
-    let Some(list) = running()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = running()? else { return ktest::fail("no xHCI controller in this machine") };
     let c = &list[0];
     let before = c.stats.by_thread.load(Ordering::Relaxed);
     for _ in 0..8 {
@@ -95,7 +95,7 @@ ktest!("us.xhci.event_thread", Safe, event_thread);
 
 /// Enough No-Ops to drive the command ring past its Link TRB twice and the event ring around at least once.
 fn wrap() -> TestResult {
-    let Some(list) = running()? else { return ktest::skip("no xHCI controller in this machine") };
+    let Some(list) = running()? else { return ktest::fail("no xHCI controller in this machine") };
     let c = &list[0];
     let (cw0, ew0, _) = c.ring_info();
     let (t0, w0) = (c.stats.by_thread.load(Ordering::Relaxed), c.stats.by_waiter.load(Ordering::Relaxed));
@@ -116,10 +116,21 @@ fn wrap() -> TestResult {
 }
 ktest!("us.xhci.wrap", Safe, wrap);
 
-/// Quiesce halts the controller and clears bus master; commands are refused; restart brings it back.
+/// Quiesce halts the controller and clears bus master; commands are refused; restart brings it back. It drops
+/// every device of that controller, so on a real machine it takes one that holds no storage (US-R: the first
+/// controller could be the boot stick's: "xhci.restart", then the stick enumerated afresh or not at all, /boot
+/// gone). Under QEMU the only controller has the boot stick, whose loss nothing in that run minds.
 fn quiesce() -> TestResult {
-    let Some(list) = running()? else { return ktest::skip("no xHCI controller in this machine") };
-    let c = &list[0];
+    let Some(list) = running()? else { return ktest::fail("no xHCI controller in this machine") };
+    let holds_storage = |c: &Arc<Xhci>| {
+        usb_core::registry::devices().iter().any(|d| {
+            d.host_name() == c.name() && usb_core::registry::bindings_of(d.id).iter().any(|(_, n)| *n == "usb-msd")
+        })
+    };
+    let free = list.iter().find(|c| !holds_storage(c));
+    let Some(c) = free.or(list.first().filter(|_| hal::cpu::detect().hypervisor)) else {
+        return ktest::fail("every xHCI controller of this machine holds a storage device");
+    };
     kassert!(devmodel::quiesce_matching(c.name()) == 1, "registered once under {}", c.name());
     kassert!(c.state() == State::Quiesced);
     let (uc, us) = (c.usbcmd(), c.usbsts());
@@ -134,4 +145,6 @@ fn quiesce() -> TestResult {
     kassert!(c.env().pci().command() & 0x4 != 0, "bus master back on");
     Ok(())
 }
-ktest!("us.xhci.quiesce", Safe, quiesce);
+// Not on the machine: this stops the controller that carries the boot stick, so /boot comes back but the data volume
+// stays read-only until the next start (4.11., W30 round).
+ktest!("us.xhci.quiesce", QemuAll, quiesce);

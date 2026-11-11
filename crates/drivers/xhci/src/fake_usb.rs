@@ -5,7 +5,7 @@
 //! packet and the transfer ends short, as on the bus. Mistakes of the driver are recorded in `World::errors`.
 
 use crate::fake::Model;
-pub use crate::fake_dev::FakeDev;
+pub use crate::fake_dev::{FakeDev, Wedge};
 use crate::trb::{cc, ty, Trb, LINK_TC};
 use std::collections::{BTreeMap, VecDeque};
 use std::format;
@@ -85,6 +85,9 @@ pub struct World {
     pub stop_moved: Option<u32>,
     /// Isochronous endpoints (`fake_iso.rs`).
     pub iso: crate::fake_iso::IsoWorld,
+    /// Port resets as (root port, warm), and ports whose power went off.
+    pub port_resets: Vec<(u8, bool)>,
+    pub power_offs: Vec<u8>,
 }
 
 /// The device at `path` (root port, then hub ports), reachable only through enabled hub ports.
@@ -189,6 +192,22 @@ impl Model {
         let cur = self.portsc[i];
         let mut n = (cur & !KEEP & !CHANGES) | (v & KEEP) | (cur & CHANGES & !(v & CHANGES));
         let has_dev = self.usb.root.contains_key(&port);
+        if cur & PP != 0 && v & PP == 0 {
+            self.usb.power_offs.push(port);
+            if let Some(d) = self.usb.root.get_mut(&port) {
+                d.wedged = None;
+            }
+        }
+        if v & (PR | WPR) != 0 {
+            self.usb.port_resets.push((port, v & WPR != 0));
+            if let Some(d) = self.usb.root.get_mut(&port) {
+                d.configured = 0;
+                // A stick wedged this hard stays wedged through this kind of reset.
+                if d.wedged == Some(Wedge::UntilWarm) && v & WPR != 0 {
+                    d.wedged = None;
+                }
+            }
+        }
         if v & PR != 0 && has_dev {
             n |= PED | PRC;
         }
@@ -257,8 +276,31 @@ impl Model {
             ty::EVALUATE_CONTEXT => (self.evaluate(slot, t.param), slot),
             ty::CONFIGURE_ENDPOINT => (self.configure(slot, t.param), slot),
             ty::RESET_ENDPOINT | ty::STOP_ENDPOINT | ty::SET_TR_DEQUEUE => (self.ep_command(t), slot),
+            ty::RESET_DEVICE => (self.reset_device_cmd(slot), slot),
             _ => (cc::TRB_ERROR, slot),
         }
+    }
+
+    /// Reset Device (xHCI 4.6.11): the slot goes to Default, address 0, Context Entries 1; every endpoint but 0
+    /// disabled. In the Default state already: Context State Error, as hardware answers.
+    fn reset_device_cmd(&mut self, slot: u8) -> u8 {
+        let Some(s) = self.usb.slots.get_mut(&slot) else { return cc::SLOT_NOT_ENABLED };
+        if s.default_state || !s.addressed {
+            return 19;
+        }
+        let out = s.out;
+        s.default_state = true;
+        for e in s.eps.iter_mut().skip(2) {
+            *e = FEp::default();
+        }
+        let dw0 = self.out_get(out, 0, 0);
+        self.out_set(out, 0, 0, (dw0 & !(0x1F << 27)) | 1 << 27);
+        self.out_set(out, 0, 3, 1 << 27);
+        for dci in 2..32 {
+            self.out_set(out, dci, 0, 0);
+        }
+        // The device hears nothing of this command; its state went with the port reset before it.
+        cc::SUCCESS
     }
 
     fn address_device(&mut self, slot: u8, input: u64, bsr: bool) -> u8 {
@@ -578,7 +620,7 @@ impl Model {
                 self.halt(slot, 1);
                 return;
             };
-            if dev.hang {
+            if dev.hang || dev.wedged.is_some() {
                 return;
             }
             let mps0 = dev.mps0 as u32;

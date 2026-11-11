@@ -12,7 +12,7 @@ RUN_DIR="$(realpath "$RUN_DIR")"
 LOG="$RUN_DIR/serial.log"
 BOOT_LINE="BdsDxe: loading"
 
-cargo xtask image --name rb-klog-config --ktest --config-extra "ktest=rb;loglevel=warn,klog=debug;log_buf=2M"
+cargo xtask image --name rb-klog-config --ktest --config-extra "ktest=rb,-rb.crash.log_tail,-rb.log.ring_sized;loglevel=warn,klog=debug;log_buf=2M"
 for attempt in 1 2; do
     if cargo xtask qemu --name rb-klog-config --timeout 120 --serial-log "$LOG" --net virtio; then
         break
@@ -36,7 +36,4 @@ grep -aq 'klog levels.set levels="warn,klog=debug"' "$BOOT" || { echo "RED: logl
 grep -aq "klog ring.sized bytes=2097152 source=log_buf" "$BOOT" || { echo "RED: log_buf=2M not applied"; exit 1; }
 # warn as default: Info events of other subsystems stay off the serial line, klog's own (debug) appear.
 if grep -aq "I kernel start" "$BOOT"; then echo "RED: Info event despite loglevel=warn"; exit 1; fi
-if grep -aq "KTEST ok rb.log.ring_sized" "$LOG" || grep -aq "KTEST skip rb.log.ring_sized: CONFIG log_buf" "$LOG"; then
-    echo "klogd linked: log tool and drain thread tested"
-fi
 echo "GREEN: klog CONFIG and ktests"

@@ -38,11 +38,14 @@ mod devmap;
 pub(crate) mod fault;
 mod fork;
 mod huge;
+mod mlock;
 mod remap;
 pub mod rmap;
 mod shm;
+mod sysv;
 mod stats;
 
+pub use mlock::LockLimit;
 pub use stats::{MemStats, PageUsage, PSS_SHIFT};
 
 use counters::{Class, Counters};
@@ -219,6 +222,8 @@ pub struct AsCore {
     anon_hint: core::sync::atomic::AtomicBool,
     /// MM-13: PR_SET_THP_DISABLE (`set_thp_disabled`).
     thp_off: core::sync::atomic::AtomicBool,
+    /// GM-2a CR 4: `Space::def_lock.0`, readable without `inner` (`refresh_future_limit`).
+    future_lock: core::sync::atomic::AtomicBool,
 }
 
 /// The 8 KiB block of a user root: the PML4 and its TLB context (`hal::paging::new_user_root`).
@@ -300,6 +305,7 @@ impl AddressSpace {
             ctr,
             anon_hint: core::sync::atomic::AtomicBool::new(true),
             thp_off: core::sync::atomic::AtomicBool::new(false),
+            future_lock: core::sync::atomic::AtomicBool::new(false),
         });
         AddressSpace { core }
     }
@@ -718,9 +724,9 @@ impl AsCore {
     /// ASYNC|SYNC; the length page-aligned with wrap-around (a length within a page of 2^64 is 0: answer 0);
     /// ENOMEM for a range past 2^64; holes are skipped but answer ENOMEM at the end (at once for
     /// a plain MS_ASYNC); MS_SYNC writes the range of every shared file VMA back (`MapBacking::sync`), after
-    /// the space's lock is released. There is no mlock, so MS_INVALIDATE never meets VM_LOCKED (EBUSY).
+    /// the space's lock is released. MS_INVALIDATE on a locked VMA is EBUSY (msync.c:79).
     pub fn sys_msync(&self, start: u64, len: u64, flags: u64) -> Result<(), i64> {
-        use uapi::errno::{EINVAL, ENOMEM};
+        use uapi::errno::{EBUSY, EINVAL, ENOMEM};
         if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || start & (PAGE - 1) != 0 || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0) {
             return Err(EINVAL);
         }
@@ -752,6 +758,10 @@ impl AsCore {
                         break;
                     }
                     unmapped_error = ENOMEM;
+                }
+                if flags & MS_INVALIDATE != 0 && v.flags.locked {
+                    error = EBUSY;
+                    break;
                 }
                 let fstart = v.pgoff_at(at);
                 let fend = v.pgoff_at(end.min(v.end) - 1);
@@ -804,7 +814,7 @@ impl AsCore {
                 self.unmap_pages(&mut g, s, e, &Vec::new(), tlb::Cause::Munmap, free);
             }
             if let Some((s, e)) = map
-                && g.fill == Fill::Eager
+                && (g.fill == Fill::Eager || (g.space.def_lock.0 && !g.space.def_lock.1))
                 && self.populate(&mut g, s, e, true).is_err()
             {
                 let _ = self.remove_range(&mut g, s, e, tlb::Cause::Munmap);

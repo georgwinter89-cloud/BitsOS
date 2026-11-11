@@ -23,10 +23,13 @@ mod bb;
 mod brave;
 mod cobalt;
 mod fetch;
+mod mesa;
 mod office;
 mod pkg;
 mod settings;
+mod steam;
 mod tools;
+mod vkquake;
 
 static RUN: AtomicU32 = AtomicU32::new(0);
 

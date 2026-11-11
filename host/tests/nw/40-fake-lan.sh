@@ -13,8 +13,9 @@ RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/nw-40-fake-lan}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 HERE="$(pwd)/host/tests/nw"
-LAN_PORT=24530   # fake_lan.py listens here
-QEMU_PORT=24531  # QEMU's end of the dgram cable
+PORTS=$(python3 -I "$HERE/ports.py" 2)
+LAN_PORT=$PORTS             # fake_lan.py listens here
+QEMU_PORT=$((PORTS + 1))    # QEMU's end of the dgram cable
 NAME=nw-fake-lan
 LOG="$RUN_DIR/serial.log"
 LANLOG="$RUN_DIR/fake-lan.log"
@@ -52,6 +53,9 @@ for attempt in 1 2; do
     rm -f "$RUN_DIR/qmp.sock" "$LOG" "$LANLOG"
     python3 -I "$HERE/fake_lan.py" "$LAN_PORT" "$QEMU_PORT" "$LANLOG" &
     FPID=$!
+    # A partner that lost its bind ends at once; the guest must not go on against someone else's.
+    sleep 0.5
+    kill -0 "$FPID" 2>/dev/null || { echo "RED: fake_lan.py did not start (port $LAN_PORT taken?)"; exit 1; }
     cargo xtask qemu --name "$NAME" --net virtio --timeout 240 --serial-log "$LOG" -- \
         -netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$QEMU_PORT,remote.type=inet,remote.host=127.0.0.1,remote.port=$LAN_PORT" \
         -device virtio-net-pci,netdev=lan,mac=52:54:00:4e:57:30 -qmp "unix:$RUN_DIR/qmp.sock,server=on,wait=off" &

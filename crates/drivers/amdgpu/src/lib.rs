@@ -12,7 +12,9 @@
 //! gcfake, fakechip, watch, regtrace, regdiff}`, `ktests_fakes`). GX-7d: the real PSP path, M1/M2 (`gpucore::
 //! pspbringup` the run, `psplive` the live device, bus master and Quiesce, MCP `gx_bringup`; `ktests_bringup`).
 //! GX-7h: the GART and VMID 0 on both hubs (`gpucore::{gmc, carvetable, hubfake}`, `gx_bringup {"until":"gart"}`;
-//! `ktests_gmc`).
+//! `ktests_gmc`). GX-8a: the memory half of the hardware backend behind `drm::GpuDevice` (`hw`, `gx_bringup
+//! {"until":"backend"}`; `ktests_hw`). GX-8b: its job half (`hw::jobs`, `ktests_hw_jobs`). GX-8c: the same at boot,
+//! CONFIG `gpu=on` (`hw::boot`, `ktests_hw_boot`).
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -29,7 +31,12 @@ pub mod edid_modes;
 pub mod flip;
 pub mod flip_test;
 pub mod gpu;
+pub mod dpm;
+mod dpm_asleep;
+pub mod dpm_live;
+pub mod dpm_table;
 pub mod gpucore;
+pub mod hw;
 pub mod ip;
 pub mod ipmod;
 pub mod kms;
@@ -46,13 +53,23 @@ pub mod snapshot;
 pub mod state;
 pub mod tools;
 pub mod tools_cursor;
+pub mod tools_gpu;
 pub mod tools_gx;
 
 mod ktests;
 mod ktests_bringup;
+pub(crate) mod ktests_dpm;
+pub(crate) mod ktests_dpm_edges;
 mod ktests_fakes;
 mod ktests_gmc;
 mod ktests_gx;
+mod ktests_hw;
+mod ktests_hw_boot;
+mod ktests_hw_ih;
+mod ktests_hw_jobs;
+mod ktests_hw_ladder;
+mod ktests_hw_lost;
+mod ktests_hw_reset;
 mod ktests_psp;
 mod ktests_gfxring;
 mod ktests_mes;

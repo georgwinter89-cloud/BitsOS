@@ -217,13 +217,17 @@ pub fn flush_page(virt: u64) {
     let _ = virt;
 }
 
-/// Maps one 4 KiB page. `alloc` returns a free frame for intermediate tables (zeroed here). Kernel-half
+/// Maps one 4 KiB page. `alloc` returns a free frame for intermediate tables (zeroed here); in the kernel half
+/// only before `set_table_frames`, afterwards the table hook is the source (`kernel::map_shared`). Kernel-half
 /// pages are always global: every root shares the kernel half, and the shootdown relies on `invlpg` dropping
 /// them in every PCID (`tlb`).
 pub fn map_4k(root: u64, virt: u64, phys: u64, flags: PageFlags, alloc: &mut dyn FnMut() -> Option<u64>) -> Result<(), MapError> {
+    if virt >= KERNEL_HALF {
+        // Every root shares these tables, and other walkers change them: `kernel::map_shared` takes the lock.
+        return kernel::map_shared(root, virt, phys, PageSize::Size4K, flags.0 | PageFlags::GLOBAL, alloc);
+    }
     let mut free = |_| {};
-    let f = if virt >= KERNEL_HALF { flags.0 | PageFlags::GLOBAL } else { flags.0 };
-    walk::map(&mut Direct { alloc, free: &mut free }, root, virt, phys, PageSize::Size4K, f)
+    walk::map(&mut Direct { alloc, free: &mut free }, root, virt, phys, PageSize::Size4K, flags.0)
 }
 
 /// Maps one 4 KiB page in the user half of `root` (below `USER_TOP`); every table entry on the way carries

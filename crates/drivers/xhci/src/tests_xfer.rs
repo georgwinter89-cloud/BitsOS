@@ -33,7 +33,7 @@ fn pump(c: &C, env: &FakeEnv) {
     c.process_events(Source::Waiter);
 }
 
-fn cbw(tag: u32, len: u32, dir_in: bool, cb: &[u8]) -> Vec<u8> {
+pub(crate) fn cbw(tag: u32, len: u32, dir_in: bool, cb: &[u8]) -> Vec<u8> {
     let mut v = b"USBC".to_vec();
     v.extend_from_slice(&tag.to_le_bytes());
     v.extend_from_slice(&len.to_le_bytes());
@@ -53,7 +53,7 @@ fn read10(lba: u32, n: u16) -> [u8; 10] {
 }
 
 /// One BOT READ(10): CBW, the data into `buf` (one TD), CSW. Returns the bytes read.
-fn bot_read(d: &Arc<Device>, buf: &Buffer, lba: u32, blocks: u16) -> usize {
+pub(crate) fn bot_read(d: &Arc<Device>, buf: &Buffer, lba: u32, blocks: u16) -> usize {
     let n = blocks as usize * 512;
     assert_eq!(d.out_bytes(OUT, &cbw(7, n as u32, true, &read10(lba, blocks)), T), Ok(31));
     let r = d.transfer(IN, Request::new(buf.clone(), 0, n), T);

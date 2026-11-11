@@ -1,4 +1,4 @@
-//! GX-6 in-kernel tests. QEMU has no AMD function: the hardware parts skip there, the registry and argument
+//! GX-6 in-kernel tests. QEMU has no AMD function: the hardware parts belong to the Mini-PC there, the registry and argument
 //! checks run everywhere. All rerunnable (Safe runs on CPU 0 over MCP, possibly several times per boot).
 
 use crate::gpu::Gpu;
@@ -47,7 +47,8 @@ fn probe_tool() -> ktest::TestResult {
     if Gpu::get().is_none() {
         let e = call("{}");
         kassert!(matches!(&e, Err(ToolError::Failed(s)) if s.starts_with("no AMD GPU")), "QEMU: {e:?}");
-        return ktest::skip("no AMD GPU function (QEMU): only the arguments checked");
+        // No GPU here: the arguments and this refusal are what QEMU can show; the Mini-PC run goes on below.
+        return Ok(());
     }
     let a = call("{}").map_err(|e| format!("{e:?}"))?;
     for section in ["gpu: ", "display: ", "memsize: ", "carve-out", "discovery", "state", "iommu"] {
@@ -77,13 +78,17 @@ ktest::ktest!("gx.probe.tool", Display, probe_tool);
 /// and the plan chose the existing display module for it.
 fn carve_out() -> ktest::TestResult {
     let Some(g) = Gpu::get() else {
-        return ktest::skip("no AMD GPU function (QEMU)");
+        return ktest::fail("no AMD GPU function (QEMU)");
     };
     // GX-7b: when the CPU cannot read the binary there, the probe says exactly why (all ones at the top while the
     // carve-out below answers, 27.10.): that is a fact of the machine, reported, not a failure of this code.
     let found = match fetch_carve_out(g.regs, g.display.is_ok()) {
         Ok(f) => f,
-        Err(why) => return ktest::skip(&why),
+        Err(why) => {
+            klog::event!(Info, "gx", "disc.carveout_unreadable", why = why.as_str());
+            kassert!(why.contains("carve-out"), "the probe does not say why: {why}");
+            return Ok(());
+        }
     };
     let d = disc::parse(&found.bytes).map_err(|w| format!("refused: {w}"))?;
     kassert!(!d.ips.is_empty(), "no IPs");
@@ -100,14 +105,14 @@ fn carve_out() -> ktest::TestResult {
     }
     Ok(())
 }
-ktest::ktest!("gx.disc.carveout", Safe, carve_out);
+ktest::ktest!("gx.disc.carveout", Hardware, carve_out);
 
 /// Mini-PC, writes MM_INDEX/MM_INDEX_HI through `dcn::MmWindow` (counted apart; both restored after each chunk):
 /// Linux's indirect path gives the same bytes as the read-only carve-out path, the index registers hold their old
 /// values afterwards, and the display write log (its ring keeps the display's read-back and undo) is untouched.
 fn indirect() -> ktest::TestResult {
     let Some(g) = Gpu::get() else {
-        return ktest::skip("no AMD GPU function (QEMU)");
+        return ktest::fail("no AMD GPU function (QEMU)");
     };
     use crate::dcn;
     use crate::gpucore::vram::{CHUNK_DWORDS, MM_INDEX, MM_INDEX_HI};
@@ -134,7 +139,7 @@ fn indirect() -> ktest::TestResult {
     }
     Ok(())
 }
-ktest::ktest!("gx.disc.indirect", Display, indirect);
+ktest::ktest!("gx.disc.indirect", Hardware, indirect);
 
 /// The copy in hex, 256 bytes per line (klog cuts records near 1 KiB), so the desk can turn the log into the fixture
 /// host/tests/gx/fixtures/minipc-780m-discovery.bin.
@@ -155,10 +160,10 @@ fn log_hex(bytes: &[u8]) {
 /// carve-out's, or the copy ktest gx.disc.indirect keeps.
 fn classify_state() -> ktest::TestResult {
     let Some(g) = Gpu::get() else {
-        return ktest::skip("no AMD GPU function (QEMU)");
+        return ktest::fail("no AMD GPU function (QEMU)");
     };
     let Some(found) = probe::kept().or_else(|| fetch_carve_out(g.regs, g.display.is_ok()).ok()) else {
-        return ktest::skip("no discovery table in this boot (the carve-out gave none): run gx.disc.indirect first");
+        return ktest::fail("no discovery table in this boot (the carve-out gave none): run gx.disc.indirect first");
     };
     let d = disc::parse(&found.bytes).map_err(|w| format!("kept copy refused: {w}"))?;
     let w0 = crate::dcn::write_counts();
@@ -173,7 +178,7 @@ fn classify_state() -> ktest::TestResult {
     klog::event!(Info, "gx", "state.ktest", start = a.start.name(), gc = format!("{:?}", a.gc).as_str());
     Ok(())
 }
-ktest::ktest!("gx.state.classify", Safe, classify_state);
+ktest::ktest!("gx.state.classify", Hardware, classify_state);
 
 /// GX-7b, everywhere: the bring-up owner over the PSP fake logs every write with its read-back; with the gate
 /// shut nothing reaches the device and each attempt is logged as refused.

@@ -293,13 +293,13 @@ ktest!("nw.virtio.failover", Safe, failover);
 /// Link watch against a real cable pull: `host/tests/nw/10-virtio-net.sh` (third run) answers the
 /// `ktest.link_wait` event with QMP `set_link off`, then `on` after `ktest.link_down_seen`. Not under the
 /// `nw.virtio` prefix, so the runs without QMP do not include it. The script gives its card the MAC
-/// `QMP_MAC`; any other card (the gate boots with one) means nobody will pull the cable, so the test skips.
+/// `QMP_MAC`; any other card (the gate boots with one) means nobody will pull the cable, so the test fails.
 fn link_toggle() -> TestResult {
     // NW-3: the stack keeps away from the cards while this test sends and receives raw frames.
     let _cards = net::stack::hold_cards();
-    let Some(d) = card("nw.link.qmp")? else { return ktest::skip("no virtio-net card") };
+    let Some(d) = card("nw.link.qmp")? else { return ktest::fail("no virtio-net card") };
     if d.mac().0 != QMP_MAC {
-        return ktest::skip("not the QMP scenario card (host/tests/nw/10-virtio-net.sh)");
+        return ktest::fail("not the QMP scenario card (host/tests/nw/10-virtio-net.sh)");
     }
     let seq = klog::next_seq();
     let wait = |up: bool| {
@@ -325,7 +325,7 @@ fn link_toggle() -> TestResult {
     kassert!(ev.iter().any(|r| r.name == "link.down") && ev.iter().any(|r| r.name == "link.up"), "link events");
     Ok(())
 }
-ktest!("nw.link.qmp", Safe, link_toggle);
+ktest!("nw.link.qmp", Run("nw/10-virtio-net"), link_toggle);
 
 const QMP_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x4e, 0x57, 0x01];
 
@@ -336,7 +336,7 @@ fn irq() -> TestResult {
     let Some(d) = card("nw.virtio.irq")? else { return Ok(()) };
     if d.irq_setup() == "polled" {
         if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-            return ktest::skip("net_irq=off: polled by request");
+            return ktest::fail("net_irq=off: polled by request");
         }
         return Err("virtio-net runs polled: no MSI-X (see virtio.irq_fallback / pci msi.refused)".into());
     }

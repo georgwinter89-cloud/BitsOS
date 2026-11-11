@@ -105,10 +105,17 @@ pub struct GcFake {
     pub bootload: u32,
     pub cp_stat: u32,
     pub rlc_cntl: u32,
+    /// GX-9b: gfx_v11_cntl_pg's writes in order (byte, value); SAFE_MODE's CMD bit clears itself.
+    pub rlc_safe_mode: u32,
+    pub rlc_pg_cntl: u32,
+    pub rlc_pg_delay_3: u32,
+    pub pg_writes: Vec<(u32, u32)>,
     pub cp_me_cntl: u32,
     pub cp_mes_cntl: u32,
     pub power: Power,
     pub hostile: GcHostile,
+    /// GX-9b: false: the RLC never answers SAFE_MODE's command.
+    pub safe_mode_answers: bool,
     pub imu_started: bool,
     /// AUTOLOAD_RLC arrived; the needed images that were missing then.
     pub autoload: Option<Vec<UcodeId>>,
@@ -119,6 +126,8 @@ pub struct GcFake {
     pub off_access: Vec<(u32, bool)>,
     /// GC register reads after the IMU start while GC was not yet powered (Linux's autoload poll does them).
     pub powering_reads: u32,
+    /// GX-9b: of those, the reads while GC was off or going off (a read after Disallow, while it comes up, is none).
+    pub asleep_reads: u32,
     /// Mode-2 resets taken.
     pub resets: u32,
     /// Leaving/entering GFXOFF and the boot after both preconditions, in us (assumptions).
@@ -146,10 +155,15 @@ impl GcFake {
             bootload: b(gfx11::RLC_RLCS_BOOTLOAD_STATUS_11_0_1),
             cp_stat: b(gfx11::CP_STAT),
             rlc_cntl: b(gfx11::RLC_CNTL),
+            rlc_safe_mode: b(gfx11::RLC_SAFE_MODE),
+            rlc_pg_cntl: b(gfx11::RLC_PG_CNTL),
+            rlc_pg_delay_3: b(gfx11::RLC_PG_DELAY_3),
+            pg_writes: Vec::new(),
             cp_me_cntl: b(gfx11::CP_ME_CNTL),
             cp_mes_cntl: b(gfx11::CP_MES_CNTL),
             power: Power::Off,
             hostile: GcHostile::None,
+            safe_mode_answers: true,
             imu_started: false,
             autoload: None,
             boot_due: None,
@@ -157,6 +171,7 @@ impl GcFake {
             gfxoff_allowed: false,
             off_access: Vec::new(),
             powering_reads: 0,
+            asleep_reads: 0,
             resets: 0,
             wake_us: REAL_WAKE_US,
             sleep_us: 200,
@@ -295,6 +310,9 @@ impl GcFake {
         if self.power != Power::On {
             if self.imu_started {
                 self.powering_reads += 1;
+                if !matches!(self.power, Power::Leaving { .. }) {
+                    self.asleep_reads += 1;
+                }
             } else {
                 self.off_access.push((byte, false));
             }
@@ -334,6 +352,11 @@ impl GcFake {
             self.off_access.push((byte, true));
             return true; // lost
         }
+        if [self.rlc_safe_mode, self.rlc_pg_cntl, self.rlc_pg_delay_3].contains(&byte) {
+            self.pg_writes.push((byte, value));
+        }
+        // The RLC answers SAFE_MODE's command at once unless it is stopped.
+        let value = if byte == self.rlc_safe_mode && self.safe_mode_answers { value & !1 } else { value };
         self.regs.insert(byte, value);
         true
     }

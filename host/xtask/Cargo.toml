@@ -6,6 +6,12 @@ description = "Host build/test tool: build, image, qemu (with refusals), test, f
 
 [dependencies]
 bootinfo = { path = "../../crates/bootinfo" }
+# release-assets packs with the installer's own tar, manifest and VENDOR.txt code, so both read the same format.
+bitsos-install = { path = "../installer" }
+
+[dev-dependencies]
+# ledger.rs: the ledger's reading of a class against the kernel's rule.
+ktest = { path = "../../crates/ktest" }
 
 [lints]
 workspace = true

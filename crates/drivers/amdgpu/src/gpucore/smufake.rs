@@ -130,7 +130,18 @@ pub struct SmuFake {
     /// stayed so until a cold boot). On by default: the fakes behave as the chip did.
     pub wedge_on_warm_load: bool,
     pub wedged: bool,
+    /// GX-9b: MinGfxClk and MaxGfxClk of PMFW's DpmClocks table; the limits in force; the load PMFW measures (%);
+    /// the temperature and power its metrics report; what a transfer put in memory: (MC address, bytes).
+    pub gfx_range: (u32, u32),
+    pub hard_min: u32,
+    pub soft_max: u32,
+    pub load: u32,
+    pub metrics_read: u32,
+    pub table_writes: Vec<(u64, Vec<u8>)>,
 }
+
+/// GX-9b: the fake's GFXCLK range (an assumption; the Mini-PC's own answer is `gpu`'s level line).
+pub const GFX_RANGE: (u32, u32) = (800, 2700);
 
 impl SmuFake {
     /// The mailboxes at MP1's segment-1 base (dwords). Cold: both last answers OK (the capture's first read of
@@ -152,7 +163,44 @@ impl SmuFake {
             unloaded: false,
             wedge_on_warm_load: true,
             wedged: false,
+            gfx_range: GFX_RANGE,
+            hard_min: GFX_RANGE.0,
+            soft_max: GFX_RANGE.1,
+            load: 0,
+            metrics_read: 0,
+            table_writes: Vec::new(),
         }
+    }
+
+    /// GX-9b: DpmClocks_t as PMFW writes it (the two fields Linux reads; the rest stays empty, display clocks too).
+    fn clocks_table(&self) -> Vec<u8> {
+        let mut t = alloc::vec![0u8; crate::dpm_table::DPMCLOCKS_BYTES];
+        t[crate::dpm_table::MIN_GFX_AT..crate::dpm_table::MIN_GFX_AT + 4].copy_from_slice(&self.gfx_range.0.to_le_bytes());
+        t[crate::dpm_table::MAX_GFX_AT..crate::dpm_table::MAX_GFX_AT + 4].copy_from_slice(&self.gfx_range.1.to_le_bytes());
+        t
+    }
+
+    /// GX-9b: SmuMetrics_t: GFXCLK by load between the limits in force, the capture's pm_info for the rest.
+    fn metrics_table(&mut self) -> Vec<u8> {
+        self.metrics_read = self.metrics_read.wrapping_add(1);
+        let gfx = if self.load > 0 { self.soft_max } else { self.hard_min };
+        let mut t = alloc::vec![0u8; crate::dpm_table::METRICS_BYTES];
+        let mut put = |at: usize, v: u16| t[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        put(0, gfx as u16);
+        put(2, 1200);
+        put(8, 2800);
+        put(12, (self.load * 100) as u16);
+        put(16, 1165);
+        put(18, 762);
+        put(80, 3900);
+        put(82, 4150);
+        put(86, 9000);
+        put(120, gfx as u16);
+        put(124, (self.load * 100) as u16);
+        put(136, 8500);
+        t[92..96].copy_from_slice(&7200u32.to_le_bytes());
+        t[156..160].copy_from_slice(&self.metrics_read.to_le_bytes());
+        t
     }
 
     /// GX-7j3: the PSP took AUTOLOAD_RLC; `imu_running`: PMFW's IMU was started by an earlier load.
@@ -313,6 +361,23 @@ impl SmuFake {
                 arg
             }
             msg::TRANSFER_TABLE_SMU2DRAM | msg::TRANSFER_TABLE_DRAM2SMU if self.dram == (0, 0) => return (resp::PREREQ, arg),
+            msg::TRANSFER_TABLE_SMU2DRAM => {
+                let table = match arg & 0xffff {
+                    crate::dpm_table::TABLE_DPMCLOCKS => self.clocks_table(),
+                    crate::dpm_table::TABLE_SMU_METRICS => self.metrics_table(),
+                    _ => return (resp::FAILED, arg),
+                };
+                self.table_writes.push((u64::from(self.dram.0) << 32 | u64::from(self.dram.1), table));
+                arg
+            }
+            msg::SET_HARD_MIN_GFXCLK => {
+                self.hard_min = arg;
+                arg
+            }
+            msg::SET_SOFT_MAX_GFXCLK => {
+                self.soft_max = arg;
+                arg
+            }
             msg::POWER_UP_VCN => {
                 self.vcn_on = true;
                 arg

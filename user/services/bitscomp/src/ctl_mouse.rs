@@ -4,7 +4,7 @@
 //! chrome, start page and suggestion lines of WY-5 (`chrome ...`, `fav`, `ws`, `start ...`, `suggest`).
 //!
 //! pointer X Y | press [left|right|middle] [X Y] | release [BTN] [X Y] | click [X Y] [BTN] | wheel N
-//! drag X1 Y1 X2 Y2 [BTN] (press, eight moves, release) | hot
+//! drag X1 Y1 X2 Y2 [BTN] (press, eight moves, release) | hot | rel DX DY | lock
 
 use crate::input::InputEvent;
 use crate::layout::{Place, Rect};
@@ -60,6 +60,12 @@ pub fn execute(app: &mut App, words: &[&str]) -> Option<Result<String, String>> 
                 btn(app, code, false);
             }
             "wheel" => app.handle_input(InputEvent::Wheel { steps: num(1)? }),
+            // WY-20: a report of a relative device; what the pointer is held by.
+            "rel" => {
+                let e = crate::lock::relative_event(app, num(1)?, num(2)?);
+                app.handle_input(e);
+            }
+            "lock" => return Ok(app.lock_report()),
             "hot" => return Ok(hot(app)),
             _ => return Err(String::new()),
         }
@@ -152,6 +158,8 @@ fn chrome_hot(app: &App, pt: &dyn Fn(i32, i32) -> String) -> String {
         out.push_str(&format!("minimized {i} at={} id={} title={:?}\n", mid(*r), crate::ctl::win_id(w), crate::ctl::names(w).1));
     }
     out.push_str(&format!("wsnew at={}\nhome at={}\n", mid(c.ws_new), mid(c.home)));
+    // PK-L1b: the top bar's "Programme" button.
+    out.push_str(&format!("programs at={} open={}\n", mid(c.programs), app.lib.open));
     // DS-3: the Bühne's own parts.
     if let Some(b) = app.buehne() {
         out.push_str(&format!("buehne sun={} bell={} feld={}", mid(b.sun), mid(b.bell), mid(b.feld)));

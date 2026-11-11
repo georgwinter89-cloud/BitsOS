@@ -52,7 +52,7 @@ fn ended_root_refused() -> TestResult {
         (now, live)
     };
     if live {
-        return ktest::skip("the freed root was reused at once");
+        return ktest::fail("the freed root was reused at once");
     }
     kassert!(now == home, "the ended root {root:#x} was loaded (CR3 {now:#x}, kernel root {home:#x})");
     kassert!(tlb::stats().foreign_refused == s0 + 1, "refusal not counted");

@@ -11,6 +11,7 @@ use hal::percpu::PerCpu;
 use hal::smp::Topology;
 use ksync::{IrqSpinLock, Once};
 
+#[repr(align(64))]
 pub(crate) struct CpuSched {
     pub cpu: usize,
     /// Threads waiting to run here.

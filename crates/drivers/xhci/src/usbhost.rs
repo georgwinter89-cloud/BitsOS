@@ -2,7 +2,7 @@
 
 use crate::hc::{Controller, Env};
 use alloc::sync::Arc;
-use usb_core::{Buffer, Data, Endpoint, HcSlot, Host, HubParams, IsoRequest, IsoUrb, PipeEvent, PipeOpts, Place, Request, Setup, Sink, TimedSink, Urb, UsbError};
+use usb_core::{Buffer, Data, Endpoint, EpLook, HcSlot, Host, HubParams, IsoRequest, IsoUrb, PipeEvent, PipeOpts, Place, Request, Setup, Sink, TimedSink, Urb, UsbError};
 
 impl<E: Env> Host for Controller<E> {
     fn name(&self) -> &str {
@@ -64,6 +64,12 @@ impl<E: Env> Host for Controller<E> {
     }
     fn submit_iso(&self, slot: HcSlot, ep: u8, req: IsoRequest, urb: Arc<IsoUrb>) -> Result<(), UsbError> {
         Controller::submit_iso(self, slot, ep, req, urb)
+    }
+    fn look_endpoint(&self, slot: HcSlot, ep: u8) -> Option<EpLook> {
+        self.look_ep(slot, ep)
+    }
+    fn reset_slot(&self, slot: HcSlot) -> Result<(), UsbError> {
+        Controller::reset_slot(self, slot)
     }
     fn release(&self, slot: HcSlot) {
         self.release_slot(slot)

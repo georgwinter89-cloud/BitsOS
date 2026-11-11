@@ -19,7 +19,8 @@ impl Fb {
         }
     }
 
-    /// Called by `take` under `fbdev.screen`, before the refresh; only the first take since boot seeds.
+    /// Called by `take` under `fbdev.screen`, before the refresh; only the first take since boot seeds, and the first
+    /// after a holder that drew straight into the scanout buffers (WY-17: fb0's memory holds nothing of its frames).
     pub(super) fn seed(&self, scr: &mut Screen) {
         if !self.fresh.swap(false, Ordering::AcqRel) {
             return;

@@ -207,6 +207,7 @@ fn new_thread(p: &Arc<Process>, t: &Thread, a: &CloneArgs, want: Option<u32>, cc
     let vtid = p.vnr(tid);
     let th = Thread::new(tid, p.group());
     th.prctl().inherit(t.prctl());
+    th.ipc().undo.inherit(&t.ipc().undo, a.flags & CLONE_SYSVSEM != 0);
     // FS-16 (`copy_fs`): CLONE_FS shares the creator's state (its own, or the image's); else a copy of it.
     th.set_own_fs(if a.flags & CLONE_FS != 0 { t.own_fs() } else { Some(Arc::new(t.fs(p).copy())) });
     th.set_alt_stack(child_alt_stack(t, a.flags));
@@ -325,6 +326,7 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
     child.release();
     let th = Thread::new(child.pid, child.group());
     th.prctl().inherit(t.prctl());
+    th.ipc().undo.inherit(&t.ipc().undo, f & CLONE_SYSVSEM != 0);
     // `set_cred_user_ns`: a new user namespace gives the full bounding set.
     if f & CLONE_NEWUSER != 0 {
         th.prctl().set_full_bset();

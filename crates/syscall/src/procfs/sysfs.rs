@@ -50,6 +50,22 @@ impl FileSource for ThpEnabled {
     }
 }
 
+/// W35 MM-3: `/sys/kernel/mm/transparent_hugepage/defrag` (Linux `defrag_show`/`defrag_store`, mode 0644: every
+/// mode with the active one in brackets; a word other than always/defer/defer+madvise/madvise/never is EINVAL).
+struct ThpDefrag;
+
+impl FileSource for ThpDefrag {
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(mm::thp::defrag_text().into_bytes())
+    }
+    fn write(&self, _who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        mm::thp::defrag_store(data).map(|_| data.len()).map_err(|_| uapi::errno::EINVAL)
+    }
+    fn size(&self) -> u64 {
+        4096
+    }
+}
+
 /// MM-13: `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size` (mode 0444).
 struct ThpPmdSize;
 
@@ -67,6 +83,7 @@ struct ThpDir;
 impl DirSource for ThpDir {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         Ok(alloc::vec![
+            SynthEntry::file("defrag", 0o644, Arc::new(ThpDefrag)).cookie(3),
             SynthEntry::file("enabled", 0o644, Arc::new(ThpEnabled)).cookie(1),
             SynthEntry::file("hpage_pmd_size", 0o444, Arc::new(ThpPmdSize)).cookie(2),
         ])

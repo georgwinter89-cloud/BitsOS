@@ -1,7 +1,7 @@
 //! DR-2 in-kernel tests (all Safe and rerunnable): the node, ioctls through the open file, the /sys walk through
 //! the real VFS (links, merged directories), a second device at run time, and the ABI program `/bin/abi-drm`.
 //! They use the boot device (`drm=fake`); without one, under a hypervisor each test adds a fake at renderD128 for
-//! its own run and removes it again (node and /sys entries gone afterwards); on hardware without a device they skip.
+//! its own run and removes it again (node and /sys entries gone afterwards); on hardware without a device they fail.
 
 use crate::device;
 use crate::dispatch::Caller;
@@ -89,7 +89,7 @@ impl Dev {
 
 macro_rules! with_dev {
     ($d:ident, $body:block) => {{
-        let Some($d) = Dev::get()? else { return ktest::skip("no DRM device on hardware (drm=fake gives one)") };
+        let Some($d) = Dev::get()? else { return ktest::fail("no DRM device on hardware (drm=fake gives one)") };
         let r = (|| -> TestResult { $body })();
         $d.done(r)
     }};
@@ -112,7 +112,7 @@ fn node() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.node.made", Safe, node);
+ktest!("dr.node.made", QemuAll, node);
 
 fn ioctls_through_the_file() -> TestResult {
     with_dev!(d, {
@@ -145,7 +145,7 @@ fn ioctls_through_the_file() -> TestResult {
         Ok(())
     })
 }
-ktest!("dr.node.ioctl", Safe, ioctls_through_the_file);
+ktest!("dr.node.ioctl", QemuAll, ioctls_through_the_file);
 
 fn read_text(path: &str) -> Result<String, String> {
     let of = vfs::root_ns().open_flags(path.as_bytes(), 0, 0).map_err(|e| format!("open {path}: errno {e}"))?;
@@ -183,7 +183,7 @@ fn walk(m: u32) -> TestResult {
     kassert!(vfs::root_ns().lookup("/sys/bus/pci/devices").is_ok(), "PCI's view is gone");
     Ok(())
 }
-ktest!("dr.sysfs.walk", Safe, sysfs_walk);
+ktest!("dr.sysfs.walk", QemuAll, sysfs_walk);
 
 fn second_device() -> TestResult {
     with_dev!(first, { second(&first) })
@@ -210,7 +210,7 @@ fn second(_first: &Dev) -> TestResult {
     crate::remove_device(&d);
     r
 }
-ktest!("dr.device.second", Safe, second_device);
+ktest!("dr.device.second", QemuAll, second_device);
 
 struct KBo;
 impl crate::file::GemObject for KBo {
@@ -248,7 +248,7 @@ fn unplug_with_open_file() -> TestResult {
     crate::remove_device(&d);
     r
 }
-ktest!("dr.device.unplug_open", Safe, unplug_open);
+ktest!("dr.device.unplug_open", QemuAll, unplug_open);
 
 fn direct_dispatch() -> TestResult {
     with_dev!(dv, {
@@ -265,7 +265,7 @@ fn direct_dispatch() -> TestResult {
 /// After a test's own fake is gone, nothing of it is left (Linux without a GPU: no /dev/dri/renderD*, no class/drm).
 fn removed_cleanly() -> TestResult {
     if !device::devices().is_empty() || !hal::serial::under_hypervisor() {
-        return ktest::skip("a DRM device is registered (drm=fake) or no hypervisor");
+        return ktest::fail("a DRM device is registered (drm=fake) or no hypervisor");
     }
     let d = crate::add_device(Arc::new(FakeGpu::radeon_780m())).map_err(|e| format!("errno {e}"))?;
     crate::remove_device(&d);
@@ -275,15 +275,15 @@ fn removed_cleanly() -> TestResult {
     kassert!(vfs::root_ns().lookup("/sys/bus/pci/devices").is_ok(), "PCI's view is gone");
     Ok(())
 }
-ktest!("dr.device.removed", Safe, removed_cleanly);
-ktest!("dr.dispatch.sizes", Safe, direct_dispatch);
+ktest!("dr.device.removed", QemuAll, removed_cleanly);
+ktest!("dr.dispatch.sizes", QemuAll, direct_dispatch);
 
 const PROG: &str = "/bin/abi-drm";
 
 /// The ABI program on V2 itself: every check line says yes, the node is found.
 fn program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     with_dev!(_d, { run_program() })
 }
@@ -308,4 +308,4 @@ fn run_program() -> TestResult {
     kassert!(no.is_empty(), "{PROG}: {no:?}");
     Ok(())
 }
-ktest!("dr.program", Safe, program);
+ktest!("dr.program", QemuAll, program);

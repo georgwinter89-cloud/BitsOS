@@ -97,6 +97,10 @@ pub struct VmaFlags {
     pub nohugepage: bool,
     /// VM_GROWSDOWN (MAP_GROWSDOWN; V2 grows no such VMA): a stack, so no anonymous fault-around (MM-12).
     pub growsdown: bool,
+    /// VM_LOCKED (mlock, `aspace::mlock`): counts in VmLck; a fork's child does not inherit it.
+    pub locked: bool,
+    /// VM_LOCKONFAULT (mlock2, MCL_ONFAULT): locked, but filled at the first use.
+    pub lock_onfault: bool,
 }
 
 impl FileRef {
@@ -135,7 +139,7 @@ impl Vma {
         let files = match (&self.file, &next.file) {
             (None, None) => true,
             // Same mapping object and contiguous file pages (Linux's vma_merge for file VMAs).
-            (Some(a), Some(b)) => a.same_object(b) && b.pgoff == a.pgoff + (self.end - self.start) / 4096,
+            (Some(a), Some(b)) => a.same_object(b) && a.backing.mergeable() && b.pgoff == a.pgoff + (self.end - self.start) / 4096,
             _ => false,
         };
         self.end == next.start && self.prot == next.prot && self.kind == next.kind && self.flags == next.flags && files
@@ -262,6 +266,9 @@ impl VmaTree {
         let i = self.first_ending_above(vma.start);
         self.pages += vma.pages();
         self.peak = self.peak.max(self.pages);
+        if let Some(f) = &vma.file {
+            f.backing.vma_open();
+        }
         self.v.insert(i, vma);
         self.merge_around(i, i);
         Ok(())
@@ -276,6 +283,9 @@ impl VmaTree {
             let mut right = Vma { start: at, ..x.clone() };
             if let Some(f) = right.file.as_mut() {
                 f.pgoff += (at - x.start) / 4096;
+            }
+            if let Some(f) = &right.file {
+                f.backing.vma_open();
             }
             self.v[i].end = at;
             self.v.insert(i + 1, right);
@@ -294,6 +304,9 @@ impl VmaTree {
         let j = self.v.partition_point(|x| x.start < end);
         for x in self.v.drain(i..j) {
             self.pages -= x.pages();
+            if let Some(f) = &x.file {
+                f.backing.vma_close();
+            }
         }
         Ok(true)
     }
@@ -370,6 +383,17 @@ impl VmaTree {
             at = at.max(x.end);
         }
         (hi >= at && hi - at >= len).then_some(at)
+    }
+}
+
+impl Drop for VmaTree {
+    /// The space ends (exit, exec, a failed fork): every VMA closes.
+    fn drop(&mut self) {
+        for x in &self.v {
+            if let Some(f) = &x.file {
+                f.backing.vma_close();
+            }
+        }
     }
 }
 

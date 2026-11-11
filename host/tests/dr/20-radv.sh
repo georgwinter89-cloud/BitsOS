@@ -6,7 +6,9 @@
 # tree's loader; then `vulkaninfo --summary` and `vulkaninfo` with RADV only must end with an exit code (no
 # crash), and the kernel's `drm ioctl.unsupported` events name the first ioctl the fake does not answer yet.
 # DR-7: vulkaninfo gets past memory allocation (GEM_VA into the per-fd VM); drm events at debug to see `vm.created`.
-# Needs GM-1a's Mesa stage (user/ports/mesa, lane GM): MESA_STAGE=<tree> or the tree at user/ports/mesa/out/mesa.
+# Needs GM-1a's Mesa stage: MESA_STAGE=<tree>, the tree at user/ports/mesa/out/mesa, or the manifest's `tree mesa`.
+# Needs the musl sysroot for the image's /bin/sh, the shell v2_radv.py runs everything through: V2_SYSROOT=<dir> or
+# user/sysroot/out/sysroot, built here when it is missing. Anything missing: RED, naming it, before the image is built.
 # No xtask change: the tree and the probe go onto the stick image here, the FAT image is made again larger from
 # xtask's ESP tree (as host/tests/gm/10-mesa.sh).
 set -euo pipefail
@@ -22,9 +24,20 @@ LOG="$RUN_DIR/serial.log"
 QMP="$RUN_DIR/qmp.sock"
 NAME=dr-radv
 STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$STAGE" ]; then
+    STAGE=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' user/packaging/manifest.txt)
+fi
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
-[ -x "$STAGE/run" ] && [ -f "$STAGE/lib/libdrm.so.2" ] && [ -f "$STAGE/lib/libvulkan_radeon.so" ] \
-  || { echo "RED: no staged Mesa tree in $STAGE (lane GM: bash user/ports/mesa/scripts/stage-v2.sh, or MESA_STAGE=)"; exit 1; }
+export V2_SYSROOT=${V2_SYSROOT:-$ROOT/user/sysroot/out/sysroot}
+if [ ! -f "$V2_SYSROOT/usr/lib/libc.a" ] && [ -x user/sysroot/build.sh ]; then
+    echo "building UL-1's sysroot (user/sysroot/build.sh)"
+    user/sysroot/build.sh > "$RUN_DIR/sysroot-build.log" 2>&1 || tail -5 "$RUN_DIR/sysroot-build.log"
+fi
+[ -f "$V2_SYSROOT/usr/lib/libc.a" ] \
+  || { echo "RED: no musl sysroot in $V2_SYSROOT, so no /bin/sh in the image (V2_SYSROOT=, or user/sysroot/build.sh; log $RUN_DIR/sysroot-build.log)"; exit 1; }
+# STAGE empty (no `tree mesa` line) would test /run and /lib, which a host with Mesa has.
+[ -n "$STAGE" ] && [ -d "$STAGE" ] && [ -x "$STAGE/run" ] && [ -f "$STAGE/lib/libdrm.so.2" ] && [ -f "$STAGE/lib/libvulkan_radeon.so" ] \
+  || { echo "RED: no staged Mesa tree in '${STAGE}' (MESA_STAGE=, user/ports/mesa/out/mesa or the manifest's tree mesa; lane GM: bash user/ports/mesa/scripts/stage-v2.sh, or MESA_STAGE=)"; exit 1; }
 
 gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm -o "$RUN_DIR/drmprobe" host/tests/dr/drmprobe.c -ldrm -ldrm_amdgpu
 

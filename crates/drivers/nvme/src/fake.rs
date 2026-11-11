@@ -3,14 +3,18 @@
 //! by device address, as a bus would). Every opcode placed in a queue is recorded, so the tests can assert
 //! that no media-writing command ever reached the device. Injections: lost completions, an error status for an
 //! LBA, a controller that never gets ready, a fatal status, a gone device, no shutdown completion.
+//! BL-1: as many I/O queues as Set Features grants (`grant_queues`), each CQ on its vector; after a doorbell the
+//! fake runs the interrupt hook of every vector it posted to (as the interrupt would), so the hook's reaping is
+//! what the host tests exercise. Abort answers a command whose completion was lost with Command Abort Requested
+//! (unless `abort_ignored`, as QEMU does). `cpus`/`cpu` pick the queue a submitter uses.
 
-use crate::hw::{DmaMem, Hw, IrqMode, VecMem};
+use crate::hw::{Bell, DmaMem, Hw, IrqHook, IrqMode, VecMem};
 use crate::regs;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use ksync::SpinLock;
+use ksync::{SpinLock, WaitQueue};
 
 #[derive(Clone)]
 pub struct FakeNs {
@@ -33,12 +37,19 @@ struct Cq {
     depth: u16,
     tail: u16,
     phase: bool,
+    /// Interrupt vector and whether interrupts are enabled (admin CQ: vector 0).
+    iv: u16,
+    ien: bool,
 }
 
 #[derive(Default)]
 pub struct Inject {
     /// Completions of this many next I/O commands are never posted.
     pub drop_io: u32,
+    /// Only on this I/O queue (None: any).
+    pub drop_on: Option<u16>,
+    /// Abort answers "not aborted" and leaves the command lost (QEMU's behaviour).
+    pub abort_ignored: bool,
     /// Reads touching this LBA fail with Unrecovered Read Error (media, SCT 2 / SC 81h).
     pub bad_lba: Option<u64>,
     pub never_ready: bool,
@@ -62,6 +73,8 @@ pub enum HookAt {
     Enable(bool),
     /// After an I/O submission doorbell was rung.
     IoDoorbell,
+    /// After the n-th I/O submission doorbell (counted from 1 since the hook was set).
+    NthIoDoorbell(u32),
 }
 
 pub type Hook = alloc::boxed::Box<dyn FnOnce() + Send>;
@@ -98,6 +111,58 @@ pub struct St {
     /// BAR0 size.
     pub bar: usize,
     pub hook: Option<(HookAt, Hook)>,
+    /// Write commands as the device saw them (data went into `ns`).
+    pub writes: Vec<WriteSeen>,
+    /// Dataset Management deallocations: (nsid, lba, blocks); the blocks read as zeros afterwards.
+    pub deallocs: Vec<(u32, u64, u64)>,
+    pub flushes: u32,
+    pub oncs: u16,
+    /// BL-1: queues Set Features Number of Queues grants at most; CPUs and the submitter's CPU.
+    pub grant_queues: u16,
+    pub cpus: usize,
+    pub cpu: usize,
+    irq_hook: Option<IrqHook>,
+    /// Vectors posted to since the last doorbell (their hook runs after it).
+    fire: Vec<u16>,
+    /// (SQ id, CID) of commands whose completion was lost (an Abort can still end them).
+    lost: Vec<(u16, u16, u16)>,
+    pub aborts_seen: u32,
+    io_doorbells: u32,
+    /// Every I/O command the device took, with the memory pages it reaches (data, PRP list, range page).
+    pub seen_cmds: Vec<SeenCmd>,
+}
+
+/// One I/O command at the device and the pages it reaches.
+#[derive(Clone, Debug)]
+pub struct SeenCmd {
+    pub qid: u16,
+    pub cid: u16,
+    pub op: u8,
+    /// Controller enables so far: commands of one generation ran on the same queues.
+    pub epoch: u32,
+    pub pages: Vec<u64>,
+    /// Its completion was dropped (`drop_io`).
+    pub lost: bool,
+}
+
+std::thread_local! {
+    static CPU: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// The CPU `Hw::cpu` reports on this thread (host tests with several submitters at once); unset: `St::cpu`.
+pub fn on_cpu(cpu: usize) {
+    CPU.with(|c| c.set(Some(cpu)));
+}
+
+/// One Write command at the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteSeen {
+    pub nsid: u32,
+    pub lba: u64,
+    pub blocks: u64,
+    pub fua: bool,
+    /// Flush commands the device had completed before this write (the order a journal needs).
+    pub after_flushes: u32,
 }
 
 #[derive(Clone)]
@@ -118,7 +183,9 @@ pub fn ns(nsid: u32, shift: u8, blocks: u64) -> FakeNs {
 impl FakeHw {
     /// Runs `f` once at `at` (see `HookAt`).
     pub fn hook(&self, at: HookAt, f: impl FnOnce() + Send + 'static) {
-        self.st.lock().hook = Some((at, alloc::boxed::Box::new(f)));
+        let mut st = self.st.lock();
+        st.io_doorbells = 0;
+        st.hook = Some((at, alloc::boxed::Box::new(f)));
     }
     fn take_hook(st: &mut St, at: HookAt) -> Option<Hook> {
         if st.hook.as_ref().is_some_and(|h| h.0 == at) { st.hook.take().map(|h| h.1) } else { None }
@@ -156,6 +223,19 @@ impl FakeHw {
                 bus_master: false,
                 bar: 0x4000,
                 hook: None,
+                writes: Vec::new(),
+                deallocs: Vec::new(),
+                flushes: 0,
+                oncs: crate::cmd::ONCS_DSM,
+                grant_queues: 64,
+                cpus: 1,
+                cpu: 0,
+                irq_hook: None,
+                fire: Vec::new(),
+                lost: Vec::new(),
+                aborts_seen: 0,
+                io_doorbells: 0,
+                seen_cmds: Vec::new(),
             })),
         }
     }
@@ -206,7 +286,8 @@ impl St {
         let d = (self.aqa & 0xFFF) as u16 + 1;
         self.sqs.push((0, Sq { addr: self.asq, depth: d, head: 0, cqid: 0 }));
         let cd = ((self.aqa >> 16) & 0xFFF) as u16 + 1;
-        self.cqs.push((0, Cq { addr: self.acq, depth: cd, tail: 0, phase: true }));
+        self.cqs.push((0, Cq { addr: self.acq, depth: cd, tail: 0, phase: true, iv: 0, ien: true }));
+        self.lost.clear();
     }
 
     fn post(&mut self, cqid: u16, sqid: u16, sq_head: u16, cid: u16, status: u16, dw0: u32) {
@@ -225,6 +306,9 @@ impl St {
             cq.phase = !cq.phase;
         }
         self.cqs[i].1 = cq;
+        if cq.ien && self.irq != IrqMode::Polled && !self.fire.contains(&cq.iv) {
+            self.fire.push(cq.iv);
+        }
     }
 
     fn ring(&mut self, qid: u16, tail: u16) {
@@ -249,13 +333,16 @@ impl St {
                 (s, d, true)
             } else {
                 self.seen_io.push(op);
+                let pages = self.cmd_pages(op, dw(1), prp1, prp2, dw(12));
                 let (s, d) = self.io(op, dw(1), prp1, prp2, [dw(10), dw(11), dw(12)]);
-                let post = if self.inject.drop_io > 0 {
+                let post = if self.inject.drop_io > 0 && self.inject.drop_on.is_none_or(|q| q == qid) {
                     self.inject.drop_io -= 1;
+                    self.lost.push((qid, cid, sq.cqid));
                     false
                 } else {
                     true
                 };
+                self.seen_cmds.push(SeenCmd { qid, cid, op, epoch: self.enables, pages, lost: !post });
                 (s, d, post)
             };
             if post {
@@ -263,6 +350,7 @@ impl St {
                 let mut head = sq.head;
                 if qid != 0 && self.inject.wrong_cid > 0 {
                     self.inject.wrong_cid -= 1;
+                    self.lost.push((qid, cid, sq.cqid));
                     cid ^= 0x5A5A;
                 }
                 if qid != 0 && self.inject.bad_sq_head > 0 {
@@ -294,6 +382,7 @@ impl St {
                         p[80..84].copy_from_slice(&self.vs.to_le_bytes());
                         let nn = self.ns.iter().map(|n| n.nsid).max().unwrap_or(0);
                         p[516..520].copy_from_slice(&nn.to_le_bytes());
+                        p[520..522].copy_from_slice(&self.oncs.to_le_bytes());
                         p[525] = self.vwc;
                     }
                     0 => {
@@ -325,13 +414,31 @@ impl St {
                 bus_write(self, prp1, &p);
                 (0, 0)
             }
-            0x09 if cdw[0] & 0xFF == 7 => (0, cdw[1]),
+            0x09 if cdw[0] & 0xFF == 7 => {
+                let g = self.grant_queues.max(1) as u32 - 1;
+                let (sq, cq) = ((cdw[1] & 0xFFFF).min(g), (cdw[1] >> 16).min(g));
+                (0, sq | cq << 16)
+            }
+            0x08 => {
+                self.aborts_seen += 1;
+                let (sqid, cid) = (cdw[0] as u16, (cdw[0] >> 16) as u16);
+                match self.lost.iter().position(|l| l.0 == sqid && l.1 == cid) {
+                    Some(i) if !self.inject.abort_ignored => {
+                        let (_, _, cqid) = self.lost.remove(i);
+                        let head = self.sqs.iter().find(|s| s.0 == sqid).map_or(0, |s| s.1.head);
+                        // Command Abort Requested (SCT 0, SC 07h).
+                        self.post(cqid, sqid, head, cid, 0x07, 0);
+                        (0, 0)
+                    }
+                    _ => (0, 1),
+                }
+            }
             0x0A if cdw[0] & 0xFF == 6 => (0, self.vwc as u32 & 1),
             0x05 => {
                 let qid = cdw[0] as u16;
                 let depth = (cdw[0] >> 16) as u16 + 1;
                 self.cqs.retain(|c| c.0 != qid);
-                self.cqs.push((qid, Cq { addr: prp1, depth, tail: 0, phase: true }));
+                self.cqs.push((qid, Cq { addr: prp1, depth, tail: 0, phase: true, iv: (cdw[1] >> 16) as u16, ien: cdw[1] & 2 != 0 }));
                 (0, 0)
             }
             0x01 => {
@@ -365,25 +472,88 @@ impl St {
         }
     }
 
-    fn io(&mut self, op: u8, nsid: u32, prp1: u64, prp2: u64, cdw: [u32; 3]) -> (u16, u32) {
-        let Some(n) = self.ns.iter().find(|n| n.nsid == nsid).cloned() else { return (0x0B, 0) };
+    /// The 4 KiB pages an I/O command reaches: its data pages and PRP list for Read/Write, the range page for DSM.
+    fn cmd_pages(&self, op: u8, nsid: u32, prp1: u64, prp2: u64, cdw12: u32) -> Vec<u64> {
+        let pg = |a: u64| a & !(regs::PAGE as u64 - 1);
         match op {
-            0x00 => (0, 0),
+            0x01 | 0x02 => {
+                let Some(n) = self.ns.iter().find(|n| n.nsid == nsid) else { return Vec::new() };
+                let len = (((cdw12 & 0xFFFF) as usize) + 1) << n.shift;
+                let mut v: Vec<u64> = prp_pages(self, prp1, prp2, len).unwrap_or_default().iter().map(|p| pg(p.0)).collect();
+                if v.len() > 2 {
+                    v.push(pg(prp2));
+                }
+                v
+            }
+            0x09 => vec![pg(prp1)],
+            _ => Vec::new(),
+        }
+    }
+
+    fn io(&mut self, op: u8, nsid: u32, prp1: u64, prp2: u64, cdw: [u32; 3]) -> (u16, u32) {
+        let Some(i) = self.ns.iter().position(|n| n.nsid == nsid) else { return (0x0B, 0) };
+        let (shift, dlen) = (self.ns[i].shift, self.ns[i].data.len());
+        match op {
+            0x00 => {
+                self.flushes += 1;
+                (0, 0)
+            }
+            0x01 => {
+                let slba = cdw[0] as u64 | (cdw[1] as u64) << 32;
+                let nlb = (cdw[2] & 0xFFFF) as u64 + 1;
+                let blocks = (dlen >> shift) as u64;
+                if slba.checked_add(nlb).is_none_or(|e| e > blocks) {
+                    return (0x80, 0);
+                }
+                let len = (nlb << shift) as usize;
+                let Some(pages) = prp_pages(self, prp1, prp2, len) else { return (0x04, 0) };
+                let mut data = vec![0u8; len];
+                let mut at = 0usize;
+                for (a, l) in pages {
+                    if !bus_read(self, a, &mut data[at..at + l]) {
+                        return (0x04, 0);
+                    }
+                    at += l;
+                }
+                self.writes.push(WriteSeen { nsid, lba: slba, blocks: nlb, fua: cdw[2] & crate::cmd::CDW12_FUA != 0, after_flushes: self.flushes });
+                let o = (slba << shift) as usize;
+                self.ns[i].data[o..o + len].copy_from_slice(&data);
+                (0, 0)
+            }
+            0x09 => {
+                if cdw[1] & crate::cmd::DSM_DEALLOCATE == 0 {
+                    return (0x02, 0);
+                }
+                let mut r = [0u8; crate::cmd::DSM_RANGE_BYTES];
+                if !bus_read(self, prp1, &mut r) {
+                    return (0x04, 0);
+                }
+                let nlb = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64;
+                let slba = u64::from_le_bytes([r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]]);
+                let blocks = (dlen >> shift) as u64;
+                if slba.checked_add(nlb).is_none_or(|e| e > blocks) {
+                    return (0x80, 0);
+                }
+                self.deallocs.push((nsid, slba, nlb));
+                let (o, len) = ((slba << shift) as usize, (nlb << shift) as usize);
+                self.ns[i].data[o..o + len].fill(0);
+                (0, 0)
+            }
             0x02 => {
                 let slba = cdw[0] as u64 | (cdw[1] as u64) << 32;
                 let nlb = (cdw[2] & 0xFFFF) as u64 + 1;
-                let blocks = (n.data.len() >> n.shift) as u64;
+                let blocks = (dlen >> shift) as u64;
                 if slba.checked_add(nlb).is_none_or(|e| e > blocks) {
                     return (0x80, 0);
                 }
                 if self.inject.bad_lba.is_some_and(|b| b >= slba && b < slba + nlb) {
                     return (0x281, 0);
                 }
-                let len = (nlb << n.shift) as usize;
+                let len = (nlb << shift) as usize;
                 let Some(pages) = prp_pages(self, prp1, prp2, len) else { return (0x04, 0) };
-                let mut at = (slba << n.shift) as usize;
+                let mut at = (slba << shift) as usize;
                 for (a, l) in pages {
-                    if !bus_write(self, a, &n.data[at..at + l]) {
+                    if !bus_write(self, a, &self.ns[i].data[at..at + l]) {
                         return (0x04, 0);
                     }
                     at += l;
@@ -397,6 +567,7 @@ impl St {
 
 impl Hw for FakeHw {
     type Mem = VecMem;
+    type Bell = FakeHw;
     fn rd32(&self, off: usize) -> u32 {
         let st = self.st.lock();
         if st.inject.gone {
@@ -450,12 +621,24 @@ impl Hw for FakeHw {
                 let idx = (o - regs::DOORBELLS) / (4usize << ((st.cap >> 32) & 0xF));
                 if idx.is_multiple_of(2) {
                     st.ring((idx / 2) as u16, v as u16);
-                    if idx >= 2 {
-                        let h = Self::take_hook(&mut st, HookAt::IoDoorbell);
-                        drop(st);
-                        if let Some(f) = h {
-                            f();
+                    let fire = core::mem::take(&mut st.fire);
+                    let irq = st.irq_hook.clone();
+                    let h = if idx >= 2 {
+                        st.io_doorbells += 1;
+                        let n = st.io_doorbells;
+                        Self::take_hook(&mut st, HookAt::IoDoorbell).or_else(|| Self::take_hook(&mut st, HookAt::NthIoDoorbell(n)))
+                    } else {
+                        None
+                    };
+                    drop(st);
+                    // The interrupts of the completions just posted (the hook takes the driver's locks, not ours).
+                    if let Some(irq) = irq {
+                        for i in fire {
+                            irq(i);
                         }
+                    }
+                    if let Some(f) = h {
+                        f();
                     }
                 }
             }
@@ -504,8 +687,35 @@ impl Hw for FakeHw {
         st.pci_offs += 1;
         st.bus_master = false;
     }
-    fn setup_irqs(&self, _max: u16) -> IrqMode {
-        self.st.lock().irq
+    fn setup_irqs(&self, max: u16, hook: IrqHook) -> IrqMode {
+        let mut st = self.st.lock();
+        st.irq_hook = Some(hook);
+        if let IrqMode::MsiX(n) = st.irq {
+            st.irq = IrqMode::MsiX(n.min(max).max(1));
+        }
+        st.irq
+    }
+    fn irq_cpu(&self, i: u16) -> Option<u32> {
+        let st = self.st.lock();
+        (st.irq != IrqMode::Polled && i < st.irq.vectors()).then(|| (i as usize % st.cpus.max(1)) as u32)
+    }
+    fn bell(&self) -> FakeHw {
+        self.clone()
+    }
+    fn cpus(&self) -> usize {
+        self.st.lock().cpus.max(1)
+    }
+    fn cpu(&self) -> usize {
+        CPU.with(|c| c.get()).unwrap_or_else(|| self.st.lock().cpu)
+    }
+    fn dma_target(&self, _buf: &[u8]) -> Option<u64> {
+        // Host memory is not on the fake's bus: everything goes through bounce pages.
+        None
+    }
+    fn sleep_on(&self, _wq: &WaitQueue, cond: &mut dyn FnMut() -> bool, timeout_ns: u64) {
+        if !cond() {
+            self.st.lock().now += timeout_ns;
+        }
     }
     fn free_irqs(&self) {}
     fn wait_irq(&self, _i: u16, timeout_ns: u64) -> bool {
@@ -518,5 +728,11 @@ impl Hw for FakeHw {
     }
     fn irq_count(&self, _i: u16) -> u64 {
         0
+    }
+}
+
+impl Bell for FakeHw {
+    fn ring(&self, off: usize, v: u32) {
+        self.wr32(off, v);
     }
 }

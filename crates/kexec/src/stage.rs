@@ -94,7 +94,7 @@ pub fn order_for(bytes: u64) -> u32 {
 
 /// Free bytes the frame allocator has now, minus what the running kernel keeps.
 pub fn budget() -> u64 {
-    mm_core::frames().map(|f| f.stats().free_bytes).unwrap_or(0).saturating_sub(RESERVE)
+    mm_core::frames().map(|f| f.stats().usable_free_bytes()).unwrap_or(0).saturating_sub(RESERVE)
 }
 
 fn no_memory(what: &str, bytes: u64, budget: u64) -> String {

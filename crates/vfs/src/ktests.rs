@@ -109,7 +109,7 @@ fn framework() -> TestResult {
     let st = devfs::populate_from(
         &ns,
         &[],
-        &[ProcFileEntry { path: "/proc/fs-ktest/hello", render: hello }],
+        &[ProcFileEntry { path: "/proc/fs-ktest/hello", render: hello, mode: 0o444 }],
         &[ProcDirEntry { path: "/proc/fs-ktest", make: numbers }],
     );
     kassert!(st.failed == 0 && st.procfiles == 1 && st.procdirs == 1, "{st:?}");

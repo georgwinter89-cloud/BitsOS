@@ -10,6 +10,13 @@ use super::{Json, Mcp, jstr, run_status};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Copies by a rename: a reader in a parallel xtask sees the old file or the new one, whole.
+fn copy_whole(from: &Path, to: &Path) -> Result<(), String> {
+    let tmp = to.with_file_name(format!(".copy.{}", std::process::id()));
+    std::fs::copy(from, &tmp).map_err(|e| format!("{}: {e}", from.display()))?;
+    std::fs::rename(&tmp, to).map_err(|e| format!("{}: {e}", to.display()))
+}
+
 /// CachyOS programs copied as they are (their name in the image, the file).
 const HOST_PROGRAMS: &[(&str, &str)] = &[("dyn-ls", "/usr/bin/ls"), ("dyn-cat", "/usr/bin/cat")];
 
@@ -42,18 +49,21 @@ fn try_build(root: &Path, out: &Path) -> Result<Vec<(String, PathBuf)>, String> 
     for s in srcs {
         let name = format!("dyn-{}", s.file_stem().unwrap_or_default().to_string_lossy());
         let exe = out.join(&name);
+        let tmp = out.join(format!(".{name}.{}", std::process::id()));
         let mut c = Command::new("gcc");
         // AB-14: `<stem>-static.c` is a static-PIE glibc program (glibc's own vDSO set-up without ld.so).
         let link: &[&str] = if name.ends_with("-static") { &["-static-pie"] } else { &["-fPIE", "-pie"] };
-        c.args(["-O2", "-Wall", "-Werror", "-std=gnu11", "-pthread"]).args(link).arg(format!("-I{}", root.join("user/abi-tests/c").display())).arg("-o").arg(&exe).arg(&s);
+        c.args(["-O2", "-Wall", "-Werror", "-std=gnu11", "-pthread"]).args(link).arg(format!("-I{}", root.join("user/abi-tests/c").display())).arg("-o").arg(&tmp).arg(&s);
         // DR-2 CR (INT-W23): a first line `// abi-dyn-link: -ldrm -ldrm_amdgpu` adds libraries (only -l flags).
         c.args(link_flags(&std::fs::read_to_string(&s).unwrap_or_default())?);
         run_status(&mut c, &format!("building {name} (host gcc, glibc)"))?;
+        // By a rename: another xtask of a parallel scenario may be reading the last build.
+        std::fs::rename(&tmp, &exe).map_err(|e| format!("{}: {e}", exe.display()))?;
         progs.push((name, exe));
     }
     for (name, from) in HOST_PROGRAMS {
         let exe = out.join(name);
-        std::fs::copy(from, &exe).map_err(|e| format!("{from}: {e}"))?;
+        copy_whole(Path::new(from), &exe)?;
         progs.push((name.to_string(), exe));
     }
     let mut libs: Vec<(String, PathBuf)> = Vec::new();
@@ -61,7 +71,7 @@ fn try_build(root: &Path, out: &Path) -> Result<Vec<(String, PathBuf)>, String> 
         for (soname, file) in ldd(exe)? {
             if !libs.iter().any(|(n, _)| *n == soname) {
                 let dst = out.join(&soname);
-                std::fs::copy(&file, &dst).map_err(|e| format!("{}: {e}", file.display()))?;
+                copy_whole(Path::new(&file), &dst)?;
                 libs.push((soname, dst));
             }
         }

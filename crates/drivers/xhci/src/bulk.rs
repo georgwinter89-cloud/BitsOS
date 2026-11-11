@@ -280,6 +280,7 @@ impl<E: Env> Controller<E> {
         let dci = t.endpoint();
         let code = t.code();
         let mut after = After::default();
+        r.events += 1;
         let Some((k, i)) = r.tds.iter().enumerate().find_map(|(k, td)| td.index_of(t.param).map(|i| (k, i))) else {
             after.stray = true;
             return after;

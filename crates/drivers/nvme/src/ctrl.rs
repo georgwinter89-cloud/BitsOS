@@ -1,35 +1,40 @@
-//! One controller: bring-up (linux-6.6/drivers/nvme/host/pci.c:1716 `nvme_pci_configure_admin_queue`,
-//! core.c:2197 `nvme_disable_ctrl`, :2223 `nvme_enable_ctrl`, pci.c:2257 `nvme_setup_io_queues`), the admin and
-//! I/O queue with their commands, recovery after a timeout or a fatal status (reset, set-up again, the command
-//! once more), and Quiesce. Read side only (R8a, NV-1): the I/O queue carries Read and Flush, nothing else.
+//! One controller: bring-up (linux-7/drivers/nvme/host/pci.c `nvme_pci_configure_admin_queue`, core.c
+//! `nvme_disable_ctrl`, `nvme_enable_ctrl`, pci.c:2960 `nvme_setup_io_queues`, :2426 `nvme_create_io_queues`), the
+//! admin queue, the I/O queues (`mq`, BL-1: one per CPU or per vector, many commands in flight; the I/O path is in
+//! `io`), recovery after a timeout or a fatal status, and Quiesce. Media-changing commands only inside the
+//! armed window (R8a, NV-2p).
 //!
-//! Locks: `nvme.io` (Mutex) > `nvme.admin` (Mutex) > `nvme.info` (SpinLock, leaf). A command is placed and
-//! waited for under its queue's lock (one outstanding command per queue: the waiting thread is the only one on
-//! its vector, as PC-3's `IrqHandle::wait` wants). Quiesce takes no lock.
+//! Locks: `nvme.admin` (Mutex, an admin command is placed and waited for under it) > `nvme.info`/`nvme.window`
+//! (SpinLock, leaves); `nvme.io` (RwSpinLock: the current queue set, held only to clone it, never with another
+//! nvme lock). An I/O queue has `nvme.sq` (slot copy + doorbell) and `nvme.cq` (IrqSpinLock, one pass over the ring),
+//! the interrupt hook `nvme.hooks` > `nvme.cq`; no lock is held across a device wait. Quiesce takes no lock.
 
-use crate::cmd::{self, AdminCmd, Cqe, Encode, IoCmd};
+use crate::cmd::{self, AdminCmd, Cqe, Encode, WriteWindow};
 use crate::hw::{DmaMem, Hw, IrqMode};
 use crate::ident::{self, CtrlId, NsId, Smart};
+use crate::hw::IrqHook;
+use crate::mq::{HookTable, IoQueue, IoSet};
 use crate::prp;
 use crate::queue::QueuePair;
 use crate::regs::{self, Cap};
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use ksync::{Mutex, SpinLock};
+use ksync::{Mutex, RwSpinLock, SpinLock};
 
-const MS: u64 = 1_000_000;
-const SEC: u64 = 1_000_000_000;
+pub(crate) const MS: u64 = 1_000_000;
+pub(crate) const SEC: u64 = 1_000_000_000;
 /// Longest single wait on a vector before the controller status is looked at again (a lost interrupt costs
 /// at most this).
-const SLICE_NS: u64 = MS;
+pub(crate) const SLICE_NS: u64 = MS;
 /// Quiesce bounds (interrupts off, other CPUs parked: bounded spins). Linux waits `shutdown_timeout` (5 s
 /// default, core.c:54) for the shutdown and (CAP.TO + 1) / 2 s for RDY (core.c:2219); the same here, the
 /// latter at most 10 s.
-const QUIESCE_SHUTDOWN_NS: u64 = 5 * SEC;
-const QUIESCE_RDY_MAX_NS: u64 = 10 * SEC;
+pub(crate) const QUIESCE_SHUTDOWN_NS: u64 = 5 * SEC;
+pub(crate) const QUIESCE_RDY_MAX_NS: u64 = 10 * SEC;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -76,6 +81,8 @@ pub enum CmdError {
     Fatal,
     /// Not ready (failed bring-up), queue full or DMA memory problem.
     NotReady,
+    /// R8a, NV-2p: a media-changing request outside the armed window, or with none armed. No command was built.
+    OutsideWindow,
     /// The request itself is invalid (outside the namespace, wrong length).
     Invalid,
 }
@@ -89,6 +96,7 @@ impl CmdError {
             CmdError::Fatal => String::from("controller fatal status"),
             CmdError::NotReady => String::from("not ready"),
             CmdError::Invalid => String::from("invalid request"),
+            CmdError::OutsideWindow => String::from("outside the write window"),
         }
     }
     pub fn to_dev(self) -> devmodel::DevError {
@@ -99,11 +107,8 @@ impl CmdError {
             CmdError::Timeout => DevError::Timeout,
             CmdError::Gone | CmdError::NotReady => DevError::Gone,
             CmdError::Invalid => DevError::InvalidArgument,
+            CmdError::OutsideWindow => DevError::Refused,
         }
-    }
-    /// Worth a controller reset and one more try.
-    fn recoverable(&self) -> bool {
-        matches!(self, CmdError::Timeout | CmdError::Fatal)
     }
 }
 
@@ -146,12 +151,25 @@ pub struct Info {
     pub ident: Option<CtrlId>,
     pub namespaces: Vec<Namespace>,
     pub irq: Option<IrqMode>,
+    /// Entries per I/O queue (each has one tag fewer: commands in flight at most).
     pub io_depth: u16,
-    /// Bytes per Read command (MDTS, the PRP list page and the bounce buffer bound it).
+    /// Bytes per Read command (MDTS and one PRP list page bound it).
     pub max_transfer: usize,
+    /// The first I/O queue's vector index.
     pub io_vector: Option<u16>,
+    /// BL-1: the I/O queues of this start.
+    pub queues: Vec<QueueInfo>,
     pub starts: u32,
     pub last_error: Option<String>,
+}
+
+/// One I/O queue as the bring-up made it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueInfo {
+    pub qid: u16,
+    pub vector: Option<u16>,
+    /// The CPU its vector was given.
+    pub cpu: Option<u32>,
 }
 
 pub struct Stats {
@@ -161,24 +179,60 @@ pub struct Stats {
     pub errors: AtomicU64,
     pub timeouts: AtomicU64,
     pub resets: AtomicU64,
-    /// Completions that matched no waiting command (late ones after a timeout).
-    pub stale: AtomicU64,
+    /// Completions that matched no waiting command (late ones after a timeout, hostile CIDs); shared with the
+    /// interrupt hook.
+    pub stale: Arc<AtomicU64>,
+    /// BL-1: Abort commands sent for timed-out I/O commands (Linux `nvme_timeout`).
+    pub aborts: AtomicU64,
     pub bytes_read: AtomicU64,
+    pub bytes_written: AtomicU64,
+    /// Write or deallocate requests the controller refused because they left the window (NV-2p).
+    pub window_refused: AtomicU64,
+    /// BL-0: I/O commands placed and not yet completed now, and the most at once (the I/O queue's depth in use).
+    pub inflight: AtomicU64,
+    pub inflight_max: AtomicU64,
 }
 
+// BL-0: the bounce buffer's copy into the caller's buffer (per CPU), and the deepest I/O queue of any controller.
+vfs::pcpu_counter!(pub(crate) COPY_NVME_BOUNCE, "block.copy_bytes.nvme_bounce", vfs::pcpu::BYTES_BATCH);
+// BL-1: bytes the device moved straight to or from the caller's memory (no bounce, no copy).
+vfs::pcpu_counter!(pub(crate) NVME_DIRECT, "nvme.direct_bytes", vfs::pcpu::BYTES_BATCH);
+klog::counter!(INFLIGHT_MAX, "nvme.inflight_max");
+static INFLIGHT_MAX_SEEN: AtomicU64 = AtomicU64::new(0);
+
 impl Stats {
+    /// BL-0: an I/O command was placed (`io_cmd`).
+    pub(crate) fn placed(&self) {
+        let now = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        if now > self.inflight_max.load(Ordering::Relaxed) {
+            self.inflight_max.fetch_max(now, Ordering::Relaxed);
+            let seen = INFLIGHT_MAX_SEEN.fetch_max(now, Ordering::Relaxed);
+            if now > seen {
+                INFLIGHT_MAX.add(now - seen);
+            }
+        }
+    }
+    /// BL-0: the command's wait ended (completed, failed or abandoned).
+    pub(crate) fn ended(&self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
     fn new() -> Stats {
         Stats {
+            inflight: AtomicU64::new(0),
+            inflight_max: AtomicU64::new(0),
             admin: [const { AtomicU64::new(0) }; 256],
             io: [const { AtomicU64::new(0) }; 256],
             errors: AtomicU64::new(0),
             timeouts: AtomicU64::new(0),
             resets: AtomicU64::new(0),
-            stale: AtomicU64::new(0),
+            stale: Arc::new(AtomicU64::new(0)),
+            aborts: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            window_refused: AtomicU64::new(0),
         }
     }
-    /// Media-changing commands ever placed in a queue (R8a: always 0 in NV-1).
+    /// Media-changing commands ever placed in a queue (R8a: 0 unless a window was armed, NV-2p).
     pub fn media_writes(&self) -> u64 {
         let io: u64 = cmd::MEDIA_WRITE_IO_OPS.iter().map(|&o| self.io[o as usize].load(Ordering::Relaxed)).sum();
         let ad: u64 = cmd::MEDIA_WRITE_ADMIN_OPS.iter().map(|&o| self.admin[o as usize].load(Ordering::Relaxed)).sum();
@@ -191,24 +245,17 @@ impl Stats {
     }
 }
 
-struct AdminState<M: DmaMem> {
+pub(crate) struct AdminState<M: DmaMem> {
     q: QueuePair<M, AdminCmd>,
     /// One page for Identify and log pages.
     page: M,
     vector: Option<u16>,
 }
 
-struct IoState<M: DmaMem> {
-    q: QueuePair<M, IoCmd>,
-    bounce: M,
-    list: M,
-    vector: Option<u16>,
-}
-
 pub struct Controller<H: Hw> {
     pub name: String,
     pub hw: H,
-    cfg: Config,
+    pub(crate) cfg: Config,
     state: AtomicU8,
     /// CAP and RTD3E for Quiesce (no lock there).
     cap_raw: AtomicU64,
@@ -217,15 +264,25 @@ pub struct Controller<H: Hw> {
     layout: AtomicU64,
     quiesce_note: AtomicU32,
     /// A start or a recovery is running (they never overlap; the PCI calls of a start run with no lock held).
-    starting: AtomicBool,
+    pub(crate) starting: AtomicBool,
     admin: Mutex<Option<AdminState<H::Mem>>>,
-    io: Mutex<Option<IoState<H::Mem>>>,
-    info: SpinLock<Info>,
+    /// BL-1: the I/O queues of this start (None while down); a recovery or restart replaces the set.
+    pub(crate) io: RwSpinLock<Option<Arc<IoSet<H::Mem>>>>,
+    /// What the vectors' interrupt hook reaps.
+    pub(crate) hooks: Arc<HookTable<H::Mem, H::Bell>>,
+    /// Counts each stop of the device's DMA (a reset that reached RDY = 0, bus master off, a Quiesce). A command
+    /// given up returns its pages, and its caller's memory, only once this moved past its value at placing.
+    pub(crate) stop_gen: AtomicU64,
+    pub(crate) info: SpinLock<Info>,
+    /// NV-2p: the only blocks Write and Dataset Management may name; None: nothing is ever written.
+    window: SpinLock<Option<WriteWindow>>,
     pub stats: Stats,
 }
 
 impl<H: Hw> Controller<H> {
     pub fn new(name: String, hw: H, cfg: Config) -> Controller<H> {
+        let stats = Stats::new();
+        let hooks = Arc::new(HookTable { set: ksync::IrqSpinLock::named("nvme.hooks", None), bell: hw.bell(), stale: stats.stale.clone() });
         Controller {
             name,
             hw,
@@ -237,9 +294,12 @@ impl<H: Hw> Controller<H> {
             quiesce_note: AtomicU32::new(0),
             starting: AtomicBool::new(false),
             admin: Mutex::named("nvme.admin", None),
-            io: Mutex::named("nvme.io", None),
+            io: RwSpinLock::named("nvme.io", None),
+            hooks,
+            stop_gen: AtomicU64::new(0),
             info: SpinLock::named("nvme.info", Info::default()),
-            stats: Stats::new(),
+            window: SpinLock::named("nvme.window", None),
+            stats,
         }
     }
 
@@ -257,10 +317,13 @@ impl<H: Hw> Controller<H> {
     pub fn quiesce_note(&self) -> u32 {
         self.quiesce_note.load(Ordering::Acquire)
     }
+    pub(crate) fn cap_raw(&self) -> u64 {
+        self.cap_raw.load(Ordering::Acquire)
+    }
     fn stride(&self) -> usize {
         self.stride.load(Ordering::Relaxed) as usize
     }
-    fn gone(&self) -> bool {
+    pub(crate) fn gone(&self) -> bool {
         matches!(self.state(), State::Quiesced | State::Removed)
     }
 
@@ -318,9 +381,27 @@ impl<H: Hw> Controller<H> {
             .and_then(|()| self.disable_ctrl())
             .and_then(|_| self.still_starting())
             .and_then(|()| self.hw.enable(true))
-            .map(|()| if self.cfg.irqs { self.hw.setup_irqs(2) } else { IrqMode::Polled });
-        let mut io = self.io.lock();
-        self.start_locked(&mut io, Some(mode))
+            .map(|()| if self.cfg.irqs { self.setup_irqs() } else { IrqMode::Polled });
+        self.start_locked(Some(mode))
+    }
+
+    /// BL-1: one vector per CPU for the I/O queues plus the admin one (Linux `nvme_setup_irqs`: the queue count
+    /// plus one pre-vector); the PCI core gives fewer when the controller or the CPUs have fewer, and the queues
+    /// follow (`bring_up`). Each runs the hook that reaps its queues.
+    fn setup_irqs(&self) -> IrqMode {
+        let want = (self.hw.cpus().max(1) + 1).min(u16::MAX as usize) as u16;
+        let t = self.hooks.clone();
+        let hook: IrqHook = Arc::new(move |i| t.irq(i));
+        let m = self.hw.setup_irqs(want, hook);
+        if m.vectors() < want {
+            klog::event!(Info, "nvme", "irq.fewer", ctrl = self.name.as_str(), wanted = want, got = m.vectors(), mode = m.name();
+                "fewer vectors than CPUs + 1: the I/O queues share or poll");
+        }
+        m
+    }
+
+    fn bump_stop(&self) {
+        self.stop_gen.fetch_add(1, Ordering::AcqRel);
     }
 
     /// CAP read and checked, CC.EN cleared (no shutdown notification, pci.c:1730), RDY = 0 awaited.
@@ -346,6 +427,8 @@ impl<H: Hw> Controller<H> {
         }
         self.wait_csts(regs::CSTS_RDY, 0, cap.ready_timeout_ns(), true)
             .map_err(|c| format!("RDY stayed 1 after disable (CSTS {c:#x}, {} ms)", cap.ready_timeout_ns() / MS))?;
+        // The controller is reset: every command it had is gone, it reaches no memory of the old queues.
+        self.bump_stop();
         Ok(cap)
     }
 
@@ -353,18 +436,26 @@ impl<H: Hw> Controller<H> {
     /// keeps the vectors.
     /// A start: the state is Starting already (`start_unlocked`). A recovery: Ready -> Starting here; any other
     /// state (a Quiesce or remove came first) refuses it untouched.
-    fn start_locked(&self, io: &mut Option<IoState<H::Mem>>, mode: Option<Result<IrqMode, String>>) -> Result<(), String> {
+    pub(crate) fn start_locked(&self, mode: Option<Result<IrqMode, String>>) -> Result<(), String> {
         if mode.is_none() && self.state.compare_exchange(State::Ready as u8, State::Starting as u8, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(format!("controller {}", self.state().name()));
         }
+        // The old queues take no command any more; their waiters retry on the new ones once the device stopped.
+        let old = self.take_set();
+        let snap = self.stop_gen.load(Ordering::Acquire);
         let r = match mode {
             Some(Err(e)) => Err(e),
-            Some(Ok(m)) => self.still_starting().and_then(|()| self.bring_up(io, m)),
+            Some(Ok(m)) => self.still_starting().and_then(|()| self.bring_up(m)),
             None => {
                 let m = self.info.lock().irq.unwrap_or(IrqMode::Polled);
-                self.bring_up(io, m)
+                self.bring_up(m)
             }
         };
+        // The old queue memory and the pages of its commands go back only with the device stopped since.
+        if old.is_some() && self.stop_gen.load(Ordering::Acquire) == snap {
+            self.stop_device();
+        }
+        drop(old);
         let end = if r.is_ok() { State::Ready } else { State::Failed };
         // A Quiesce or remove at any point of the start wins: its state stays, and what the start turned on
         // after the Quiesce stopped the controller (bus master, MSI-X, CC.EN) goes off again here. A Quiesce
@@ -391,6 +482,14 @@ impl<H: Hw> Controller<H> {
 
     /// The controller off again after a start that a Quiesce or remove overtook (the thread may sleep here).
     fn undo_start(&self, now: State) {
+        let enabled = self.stop_device();
+        klog::event!(Warn, "nvme", "ctrl.start_aborted", ctrl = self.name.as_str(), state = now.name(), was_enabled = enabled;
+            "a Quiesce or remove came during the start: controller and bus master off again");
+    }
+
+    /// CC.EN off, RDY = 0 awaited (bounded), bus master and MSI-X off: nothing of the controller's reaches memory any
+    /// more. Returns whether it was enabled. The thread may sleep here.
+    pub(crate) fn stop_device(&self) -> bool {
         let cc = self.hw.rd32(regs::CC);
         let enabled = cc != !0 && cc & regs::CC_EN != 0;
         if enabled {
@@ -399,8 +498,34 @@ impl<H: Hw> Controller<H> {
             let _ = self.wait_csts(regs::CSTS_RDY, 0, cap.ready_timeout_ns().min(QUIESCE_RDY_MAX_NS), true);
         }
         self.hw.pci_off();
-        klog::event!(Warn, "nvme", "ctrl.start_aborted", ctrl = self.name.as_str(), state = now.name(), was_enabled = enabled;
-            "a Quiesce or remove came during the start: controller and bus master off again");
+        self.bump_stop();
+        enabled
+    }
+
+    /// The current queue set out of reach (submitters, the interrupt hook), and dead.
+    fn take_set(&self) -> Option<Arc<IoSet<H::Mem>>> {
+        let old = self.io.write().take();
+        self.hooks.publish(None);
+        if let Some(o) = &old {
+            o.kill();
+        }
+        old
+    }
+
+    /// A command is given up with no reset behind it: it may still run on the controller, and it may fetch its PRP
+    /// list or range late, from pages the next command would write. So no next command: the device stops and stays
+    /// Failed until a real restart (Linux: a second timeout disables the device, pci.c `nvme_timeout`). A state other
+    /// than Ready means someone else has it: a Quiesce or remove stopped it, a start resets it.
+    pub(crate) fn abandon(&self, e: &CmdError) {
+        if self.state.compare_exchange(State::Ready as u8, State::Failed as u8, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let old = self.take_set();
+        let was_enabled = self.stop_device();
+        drop(old);
+        let why = format!("a command was given up: {}", e.text());
+        klog::event!(Error, "nvme", "ctrl.abandoned", ctrl = self.name.as_str(), error = why.as_str(), was_enabled = was_enabled; "controller stopped, it stays down until a restart");
+        self.info.lock().last_error = Some(why);
     }
 
     fn wait_csts(&self, mask: u32, want: u32, timeout_ns: u64, may_sleep: bool) -> Result<(), u32> {
@@ -424,7 +549,7 @@ impl<H: Hw> Controller<H> {
         }
     }
 
-    fn bring_up(&self, io: &mut Option<IoState<H::Mem>>, mode: IrqMode) -> Result<(), String> {
+    fn bring_up(&self, mode: IrqMode) -> Result<(), String> {
         let cap = self.disable_ctrl()?;
         let version = self.hw.rd32(regs::VS);
         // Linux nvme_remap_bar (pci.c): the doorbells at this stride must lie in BAR0, else every doorbell
@@ -463,12 +588,11 @@ impl<H: Hw> Controller<H> {
         self.wait_csts(regs::CSTS_RDY | regs::CSTS_CFS, regs::CSTS_RDY, cap.ready_timeout_ns(), true)
             .map_err(|c| format!("not ready after enable (CSTS {c:#x}, {} ms)", cap.ready_timeout_ns() / MS))?;
         self.still_starting()?;
-        // Vectors: index 0 serves the admin CQ, index 1 (if granted) the I/O CQ.
-        let (admin_vec, io_vec) = match mode {
-            IrqMode::MsiX(n) if n >= 2 => (Some(0), Some(1)),
-            IrqMode::Polled => (None, None),
-            // One vector: the I/O queue waits on it; admin commands (rare) poll, so one thread per index.
-            _ => (None, Some(0)),
+        // Vectors: index 0 serves the admin CQ, index q (if granted) I/O queue q (`make_queues`).
+        let admin_vec = match mode {
+            IrqMode::MsiX(n) if n >= 2 => Some(0),
+            // One vector: the I/O queue is reaped on it; admin commands (rare) poll.
+            _ => None,
         };
         a.vector = admin_vec;
         // Identify Controller.
@@ -476,66 +600,121 @@ impl<H: Hw> Controller<H> {
         let id = ident::parse_ctrl(&page);
         klog::event!(Info, "nvme", "ctrl.identified", ctrl = self.name.as_str(), model = id.model.as_str(), serial = id.serial.as_str(),
             firmware = id.firmware.as_str(), vid = klog::Hex(id.vid as u64), mdts = id.mdts, namespaces = id.nn, cache = id.volatile_cache());
-        // One I/O queue pair (per-CPU queues come later).
-        let cqe = self.admin_cmd(a, AdminCmd::set_num_queues(1, 1)).map_err(|e| format!("set queue count: {}", e.text()))?;
-        let granted = ((cqe.dw0 & 0xFFFF) + 1).min((cqe.dw0 >> 16) + 1);
-        if granted == 0 {
-            return Err(String::from("no I/O queue granted"));
-        }
         let depth = (regs::IO_DEPTH as u32).min(cap.mqes()).max(2) as u16;
         let max_transfer = id.max_transfer(cap.mpsmin_shift()).map_or(usize::MAX, |b| usize::try_from(b).unwrap_or(usize::MAX));
-        let want = max_transfer.min(prp::max_bytes() - regs::PAGE).max(regs::PAGE);
-        // Kept over restarts (the controller was disabled above, so it no longer reaches them).
-        if io.as_ref().is_none_or(|s| s.q.depth != depth) {
-            let q = QueuePair::new(1, depth, self.dma(depth as usize * regs::SQE)?, self.dma(depth as usize * regs::CQE)?)
-                .ok_or_else(|| String::from("I/O queue memory"))?;
-            *io = Some(IoState { q, bounce: self.bounce(want)?, list: self.dma(regs::PAGE)?, vector: None });
-        }
-        let Some(s) = io.as_mut() else { return Err(String::from("I/O queue missing")) };
-        if !s.q.reset() {
-            return Err(String::from("I/O queue memory"));
-        }
-        s.vector = io_vec;
-        let iv = io_vec.unwrap_or(0);
-        self.admin_cmd(a, AdminCmd::create_cq(1, depth, s.q.cq.dev_addr(), iv, io_vec.is_some()))
-            .map_err(|e| format!("create I/O CQ: {}", e.text()))?;
-        self.admin_cmd(a, AdminCmd::create_sq(1, depth, s.q.sq.dev_addr(), 1)).map_err(|e| format!("create I/O SQ: {}", e.text()))?;
+        // One PRP list page bounds a command, with one page more for a start inside a page.
+        let xfer = max_transfer.min(prp::max_bytes() - regs::PAGE).max(regs::PAGE);
+        let queues = self.make_queues(a, cap, mode, depth, xfer)?;
         let namespaces = self.scan_namespaces(a, version, id.nn);
         drop(adm);
-        let xfer = s.bounce.size().min(want);
+        let qinfo: Vec<QueueInfo> = queues.iter().map(|q| QueueInfo { qid: q.qid, vector: q.vector, cpu: q.cpu }).collect();
+        let io_vec = qinfo.first().and_then(|q| q.vector);
+        let set = Arc::new(IoSet::new(queues, self.hw.cpus()));
+        *self.io.write() = Some(set.clone());
+        self.hooks.publish(Some(set));
         let mut info = self.info.lock();
         let changed = info.namespaces.iter().map(|n| (n.nsid, n.id.nsze, n.block_size())).ne(namespaces.iter().map(|n| (n.nsid, n.id.nsze, n.block_size())));
         if changed && restart {
             self.layout.fetch_add(1, Ordering::AcqRel);
+            // Other namespaces, other blocks: the checked window no longer means anything.
+            *self.window.lock() = None;
         }
         let usable = namespaces.iter().filter(|n| n.unusable.is_none()).count();
-        *info = Info { cap, version, ident: Some(id), namespaces, irq: Some(mode), io_depth: depth, max_transfer: xfer, io_vector: io_vec, starts: info.starts, last_error: None };
+        let nq = qinfo.len();
+        *info = Info {
+            cap,
+            version,
+            ident: Some(id),
+            namespaces,
+            irq: Some(mode),
+            io_depth: depth,
+            max_transfer: xfer,
+            io_vector: io_vec,
+            queues: qinfo,
+            starts: info.starts,
+            last_error: None,
+        };
         drop(info);
         if changed && restart {
             klog::event!(Warn, "nvme", "ns.changed", ctrl = self.name.as_str(); "namespaces differ after the restart: their disks answer Gone");
         }
-        klog::event!(Info, "nvme", "ctrl.ready", ctrl = self.name.as_str(), irq = mode.name(), vectors = mode.vectors(), io_depth = depth,
-            max_transfer = xfer, namespaces = usable);
+        klog::event!(Info, "nvme", "ctrl.ready", ctrl = self.name.as_str(), irq = mode.name(), vectors = mode.vectors(), queues = nq,
+            io_depth = depth, tags = depth - 1, max_transfer = xfer, namespaces = usable);
         Ok(())
+    }
+
+    /// BL-1 (linux-7/drivers/nvme/host/pci.c:2960 `nvme_setup_io_queues`, :2426 `nvme_create_io_queues`): one I/O
+    /// queue pair per CPU, fewer when the controller grants fewer (Set Features Number of Queues), when there are
+    /// fewer vectors (one per queue; a single vector or MSI: one queue on it, admin polls) or doorbells in BAR0, or
+    /// when the memory or a Create command for a later queue fails. Each step down is an event.
+    fn make_queues(&self, a: &mut AdminState<H::Mem>, cap: Cap, mode: IrqMode, depth: u16, xfer: usize) -> Result<Vec<IoQueue<H::Mem>>, String> {
+        let cpus = self.hw.cpus().max(1);
+        // NVMe counts at most 65535 queues (0-based 16 bits).
+        let want = cpus.min(0xFFFF) as u16;
+        let cqe = self.admin_cmd(a, AdminCmd::set_num_queues(want, want)).map_err(|e| format!("set queue count: {}", e.text()))?;
+        let granted = (((cqe.dw0 & 0xFFFF) + 1).min((cqe.dw0 >> 16) + 1)) as usize;
+        let mut nq = (want as usize).min(granted);
+        if nq < want as usize {
+            klog::event!(Info, "nvme", "queues.granted", ctrl = self.name.as_str(), wanted = want, granted = granted; "the controller grants fewer queues than CPUs: CPUs share");
+        }
+        let by_vectors = match mode {
+            IrqMode::MsiX(n) if n >= 2 => n as usize - 1,
+            IrqMode::Polled => usize::MAX,
+            _ => 1,
+        };
+        if nq > by_vectors {
+            klog::event!(Info, "nvme", "queues.vectors", ctrl = self.name.as_str(), queues = nq, vectors = mode.vectors(), mode = mode.name();
+                "one queue per I/O vector");
+            nq = by_vectors;
+        }
+        // Linux nvme_remap_bar: the highest queue's doorbells must lie in BAR0.
+        let stride = cap.stride();
+        let fit = self.hw.window().saturating_sub(regs::DOORBELLS + 4 + stride) / (2 * stride);
+        if nq > fit {
+            klog::event!(Warn, "nvme", "queues.bar", ctrl = self.name.as_str(), queues = nq, fit = fit; "BAR0 holds fewer doorbells");
+            nq = fit;
+        }
+        let keep = xfer / regs::PAGE + 2;
+        let mut out: Vec<IoQueue<H::Mem>> = Vec::with_capacity(nq);
+        for qid in 1..=nq as u16 {
+            let vector = match mode {
+                IrqMode::MsiX(n) if n >= 2 => Some(qid),
+                IrqMode::Polled => None,
+                _ => Some(0),
+            };
+            let cpu = vector.and_then(|v| self.hw.irq_cpu(v));
+            let dbs = (regs::doorbell(qid, false, stride), regs::doorbell(qid, true, stride));
+            let q = match (self.dma(depth as usize * regs::SQE), self.dma(depth as usize * regs::CQE)) {
+                (Ok(sq), Ok(cq)) => IoQueue::new(qid, depth, sq, cq, vector, cpu, dbs, keep, self.cfg.io_timeout_ns.max(1)),
+                _ => None,
+            };
+            let made = match q {
+                None => Err(String::from("queue memory")),
+                Some(q) => {
+                    let (sq_addr, cq_addr) = (q.sq.lock().mem.dev_addr(), q.cq.lock().mem.dev_addr());
+                    self.admin_cmd(a, AdminCmd::create_cq(qid, depth, cq_addr, vector.unwrap_or(0), vector.is_some()))
+                        .map_err(|e| format!("create I/O CQ {qid}: {}", e.text()))
+                        .and_then(|_| {
+                            // A CQ without its SQ never gets a completion: its memory may be freed.
+                            self.admin_cmd(a, AdminCmd::create_sq(qid, depth, sq_addr, qid)).map_err(|e| format!("create I/O SQ {qid}: {}", e.text()))
+                        })
+                        .map(|_| q)
+                }
+            };
+            match made {
+                Ok(q) => out.push(q),
+                Err(e) if qid == 1 => return Err(e),
+                Err(e) => {
+                    klog::event!(Warn, "nvme", "queues.fewer", ctrl = self.name.as_str(), made = qid - 1, wanted = nq, error = e.as_str(); "going on with the queues made");
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn dma(&self, len: usize) -> Result<H::Mem, String> {
         self.hw.alloc_dma(len.max(regs::PAGE).next_multiple_of(regs::PAGE))
-    }
-
-    /// The bounce buffer: as large as wanted, halved while memory is short (down to one page).
-    fn bounce(&self, want: usize) -> Result<H::Mem, String> {
-        let mut len = want.next_multiple_of(regs::PAGE);
-        loop {
-            match self.hw.alloc_dma(len) {
-                Ok(m) => return Ok(m),
-                Err(e) if len <= regs::PAGE => return Err(e),
-                Err(_) => {
-                    len = (len / 2).next_multiple_of(regs::PAGE);
-                    klog::event!(Warn, "nvme", "bounce.smaller", ctrl = self.name.as_str(), bytes = len; "DMA memory short: smaller reads");
-                }
-            }
-        }
     }
 
     fn read64(&self, off: usize) -> u64 {
@@ -612,7 +791,7 @@ impl<H: Hw> Controller<H> {
         Ok(v)
     }
 
-    fn admin_cmd(&self, a: &mut AdminState<H::Mem>, c: AdminCmd) -> Result<Cqe, CmdError> {
+    pub(crate) fn admin_cmd(&self, a: &mut AdminState<H::Mem>, c: AdminCmd) -> Result<Cqe, CmdError> {
         let (cid, tail, op) = a.q.push(&c).map_err(|_| CmdError::NotReady)?;
         self.stats.admin[op as usize].fetch_add(1, Ordering::Relaxed);
         self.hw.wr32(regs::doorbell(0, false, self.stride()), tail as u32);
@@ -620,7 +799,7 @@ impl<H: Hw> Controller<H> {
         self.note(r, "admin", op)
     }
 
-    fn note(&self, r: Result<Cqe, CmdError>, queue: &str, op: u8) -> Result<Cqe, CmdError> {
+    pub(crate) fn note(&self, r: Result<Cqe, CmdError>, queue: &str, op: u8) -> Result<Cqe, CmdError> {
         match r {
             Ok(c) if c.ok() => Ok(c),
             Ok(c) => {
@@ -630,7 +809,8 @@ impl<H: Hw> Controller<H> {
                 Err(e)
             }
             Err(e) => {
-                if e == CmdError::Timeout {
+                // An I/O command's timeouts are counted where its wait ran out (`io::finish`), once per wait.
+                if e == CmdError::Timeout && queue == "admin" {
                     self.stats.timeouts.fetch_add(1, Ordering::Relaxed);
                 }
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -690,141 +870,51 @@ impl<H: Hw> Controller<H> {
         }
     }
 
-    fn ready_io<'a>(&self, io: &'a mut Option<IoState<H::Mem>>) -> Result<&'a mut IoState<H::Mem>, CmdError> {
-        match self.state() {
-            State::Ready => io.as_mut().ok_or(CmdError::NotReady),
-            State::Quiesced | State::Removed => Err(CmdError::Gone),
-            _ => Err(CmdError::NotReady),
+    /// NV-2p: `block::gpt::window`'s checked range is the only one this controller writes from now on.
+    pub fn arm_window(&self, nsid: u32, first: u64, blocks: u64) {
+        klog::event!(Info, "nvme", "window.armed", ctrl = self.name.as_str(), nsid = nsid, first = first, blocks = blocks);
+        *self.window.lock() = Some(WriteWindow::new(nsid, first, blocks));
+    }
+
+    /// The boot ESP's range beside the armed window of `nsid` (fs-fat's /boot there, through `block::LowerWindow`).
+    /// False: no window of that namespace is armed, or the ranges overlap.
+    pub fn open_boot_window(&self, nsid: u32, first: u64, blocks: u64) -> bool {
+        let mut w = self.window.lock();
+        let Some(next) = w.filter(|w| w.nsid() == nsid).and_then(|w| w.with_boot(first, blocks)) else { return false };
+        *w = Some(next);
+        drop(w);
+        klog::event!(Info, "nvme", "window.boot_opened", ctrl = self.name.as_str(), nsid = nsid, first = first, blocks = blocks);
+        true
+    }
+
+    pub fn close_boot_window(&self) {
+        let mut w = self.window.lock();
+        if let Some(x) = *w
+            && x.boot().is_some()
+        {
+            *w = Some(x.without_boot());
+            drop(w);
+            klog::event!(Info, "nvme", "window.boot_closed", ctrl = self.name.as_str());
         }
     }
 
-    /// One I/O command under the lock; after a timeout or fatal status the controller is reset and set up
-    /// again (with the lock still held) and the command placed once more (B6: each step logged).
-    fn io_cmd(&self, io: &mut Option<IoState<H::Mem>>, make: &dyn Fn(&IoState<H::Mem>) -> Result<IoCmd, CmdError>) -> Result<Cqe, CmdError> {
-        let mut tried = false;
-        loop {
-            let s = self.ready_io(io)?;
-            let c = make(s)?;
-            let (cid, tail, op) = s.q.push(&c).map_err(|_| CmdError::NotReady)?;
-            self.stats.io[op as usize].fetch_add(1, Ordering::Relaxed);
-            self.hw.wr32(regs::doorbell(1, false, self.stride()), tail as u32);
-            let r = self.wait(&mut s.q, cid, s.vector, self.cfg.io_timeout_ns);
-            let r = self.note(r, "io", op);
-            match r {
-                Err(e) if e.recoverable() && !tried && !self.gone() => {
-                    tried = true;
-                    if self.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-                        klog::event!(Warn, "nvme", "ctrl.recover_skipped", ctrl = self.name.as_str(); "a start is running");
-                        return Err(e);
-                    }
-                    self.stats.resets.fetch_add(1, Ordering::Relaxed);
-                    klog::event!(Warn, "nvme", "ctrl.recover", ctrl = self.name.as_str(), error = e.text(); "reset and set-up again, then one retry");
-                    // The reset stops the controller's DMA before the bounce buffer is used again.
-                    let r = self.start_locked(io, None);
-                    self.starting.store(false, Ordering::Release);
-                    if let Err(why) = r {
-                        klog::event!(Error, "nvme", "ctrl.recover_failed", ctrl = self.name.as_str(), error = why.as_str());
-                        return Err(e);
-                    }
-                    klog::event!(Info, "nvme", "ctrl.recovered", ctrl = self.name.as_str());
-                }
-                r => return r,
-            }
+    pub fn disarm_window(&self) {
+        if self.window.lock().take().is_some() {
+            klog::event!(Info, "nvme", "window.disarmed", ctrl = self.name.as_str());
         }
     }
 
-    /// Reads `buf.len() / block_size` blocks of `nsid` from `lba`, in transfers of at most `max_transfer`.
-    /// `check` = bounds of the namespace are checked (ktests pass false to see the device's own answer).
-    pub fn read(&self, nsid: u32, lba: u64, buf: &mut [u8], check: bool) -> Result<(), CmdError> {
-        let (bs, blocks, xfer) = {
-            let i = self.info.lock();
-            let ns = i.namespaces.iter().find(|n| n.nsid == nsid);
-            match ns {
-                Some(n) => (n.block_size() as usize, n.id.nsze, i.max_transfer),
-                None if !check => (512, u64::MAX, i.max_transfer),
-                None => return Err(CmdError::Invalid),
-            }
-        };
-        if buf.is_empty() || !buf.len().is_multiple_of(bs) || xfer < bs {
-            return Err(CmdError::Invalid);
-        }
-        let n = (buf.len() / bs) as u64;
-        if check && lba.checked_add(n).is_none_or(|e| e > blocks) {
-            return Err(CmdError::Invalid);
-        }
-        let per = (xfer / bs).min(65536);
-        let mut io = self.io_lock()?;
-        let mut done = 0usize;
-        for chunk in buf.chunks_mut(per * bs) {
-            let at = lba + (done / bs) as u64;
-            let len = chunk.len();
-            let make = |s: &IoState<H::Mem>| -> Result<IoCmd, CmdError> {
-                let base = s.bounce.dev_addr();
-                let p = prp::plan(base, len, s.list.dev_addr()).ok_or(CmdError::Invalid)?;
-                for i in 0..p.list_len {
-                    if !s.list.wr64(8 * i, prp::list_entry(base, i)) {
-                        return Err(CmdError::Invalid);
-                    }
-                }
-                Ok(IoCmd::read(nsid, at, (len / bs) as u32, p.prp1, p.prp2))
-            };
-            self.io_cmd(&mut io, &make)?;
-            let s = self.ready_io(&mut io)?;
-            if !s.bounce.copy_out(0, chunk) {
-                return Err(CmdError::NotReady);
-            }
-            self.stats.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-            done += len;
-        }
-        Ok(())
+    pub fn window(&self) -> Option<WriteWindow> {
+        *self.window.lock()
     }
 
-    /// Reads `bytes` from `lba` on into the bounce buffer only (the `nvme` tool's read speed: no copy).
-    /// Returns (bytes read, ns taken).
-    pub fn read_speed(&self, nsid: u32, lba: u64, bytes: u64) -> Result<(u64, u64), CmdError> {
-        let (bs, blocks, xfer) = {
-            let i = self.info.lock();
-            let n = i.namespaces.iter().find(|n| n.nsid == nsid && n.unusable.is_none()).ok_or(CmdError::Invalid)?;
-            (n.block_size() as u64, n.id.nsze, i.max_transfer as u64)
-        };
-        let per = (xfer / bs).clamp(1, 65536);
-        let total = (bytes / bs).min(blocks.saturating_sub(lba));
-        let mut io = self.io_lock()?;
-        let t0 = self.hw.now_ns();
-        let mut at = lba;
-        while at < lba + total {
-            let n = per.min(lba + total - at);
-            let len = (n * bs) as usize;
-            let make = |s: &IoState<H::Mem>| -> Result<IoCmd, CmdError> {
-                let base = s.bounce.dev_addr();
-                let p = prp::plan(base, len, s.list.dev_addr()).ok_or(CmdError::Invalid)?;
-                for i in 0..p.list_len {
-                    if !s.list.wr64(8 * i, prp::list_entry(base, i)) {
-                        return Err(CmdError::Invalid);
-                    }
-                }
-                Ok(IoCmd::read(nsid, at, n as u32, p.prp1, p.prp2))
-            };
-            self.io_cmd(&mut io, &make)?;
-            self.stats.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-            at += n;
+    pub(crate) fn outside(&self, what: &str, nsid: u32, lba: u64, blocks: u64) -> CmdError {
+        let n = self.stats.window_refused.fetch_add(1, Ordering::Relaxed);
+        // A bug above may send many: the first ones are enough to find it, the counter keeps the rest.
+        if n < 16 {
+            klog::event!(Error, "nvme", "window.refused", ctrl = self.name.as_str(), op = what, nsid = nsid, lba = lba, blocks = blocks; "R8a: outside the write window, no command was built");
         }
-        Ok((total * bs, self.hw.now_ns().saturating_sub(t0)))
-    }
-
-    /// The I/O queue's lock, bounded (B4: the block layer's dispatcher is Interactive): a holder needs at most
-    /// a command's timeout plus one recovery.
-    fn io_lock(&self) -> Result<ksync::MutexGuard<'_, Option<IoState<H::Mem>>>, CmdError> {
-        let bound = self.cfg.io_timeout_ns.saturating_mul(2).saturating_add(Cap { raw: self.cap_raw.load(Ordering::Acquire) }.ready_timeout_ns() * 2);
-        self.io.lock_timeout(bound).ok_or_else(|| {
-            klog::event!(Warn, "nvme", "io.lock_timeout", ctrl = self.name.as_str(), ms = bound / MS);
-            CmdError::Timeout
-        })
-    }
-
-    pub fn flush(&self, nsid: u32) -> Result<(), CmdError> {
-        let mut io = self.io_lock()?;
-        self.io_cmd(&mut io, &|_| Ok(IoCmd::flush(nsid))).map(|_| ())
+        CmdError::OutsideWindow
     }
 
     /// The SMART / Health log (global, NSID FFFFFFFFh).
@@ -843,7 +933,7 @@ impl<H: Hw> Controller<H> {
         self.with_admin(|a| self.admin_cmd(a, AdminCmd::get_features(fid)).map(|c| c.dw0).map_err(|e| e.text()))
     }
 
-    fn with_admin<R>(&self, f: impl FnOnce(&mut AdminState<H::Mem>) -> Result<R, String>) -> Result<R, String> {
+    pub(crate) fn with_admin<R>(&self, f: impl FnOnce(&mut AdminState<H::Mem>) -> Result<R, String>) -> Result<R, String> {
         if self.state() != State::Ready {
             return Err(format!("controller {}", self.state().name()));
         }
@@ -874,6 +964,7 @@ impl<H: Hw> Controller<H> {
             note |= 2;
         }
         self.hw.pci_off();
+        self.bump_stop();
         self.quiesce_note.store(note, Ordering::Release);
     }
 

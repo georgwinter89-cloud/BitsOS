@@ -157,7 +157,7 @@ fn guard_probe() -> R {
 /// on and the stack comes back.
 fn stack_overflow() -> R {
     if !hal::cpu::live().has("hypervisor") {
-        return ktest::skip("resuming after a #DF is only done under a hypervisor");
+        return ktest::fail("resuming after a #DF is only done under a hypervisor");
     }
     let overflows = crate::guard::OVERFLOWS.get();
     let live = stack_stats().live;
@@ -266,7 +266,7 @@ fn many_threads() -> R {
 /// turned them off keeps them off across switches while the others run with them on.
 fn irq_new_threads() -> R {
     if !acpi::irq::enabled() {
-        return ktest::skip("interrupts are not on (acpi::irq::init did not enable them)");
+        return ktest::fail("interrupts are not on (acpi::irq::init did not enable them)");
     }
     let seen = Arc::new(SpinLock::new(Vec::new()));
     let mut hs = Vec::new();

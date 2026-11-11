@@ -485,6 +485,12 @@ impl LateMany {
     fn new() -> LateMany {
         LateMany(Vec::new())
     }
+    /// Room for `n` entries, asked for before the table's lock is taken: under it the heap can neither reclaim
+    /// nor fall back to single frames, so a list of a large table's fds found no memory there, or brought the
+    /// kernel down where it could not fail (Mini-PC, 11.11.2026; see `ksync::spare`).
+    fn room(&mut self, n: usize) {
+        let _ = self.0.try_reserve(n);
+    }
     fn keep(&mut self, r: Late) {
         if let Some(r) = r {
             if self.0.try_reserve(1).is_ok() {
@@ -677,7 +683,7 @@ impl FdTable {
         }
     }
     /// Makes the table at least `want` long. The new table is allocated and filled outside the spin lock (as
-    /// Linux's `expand_fdtable`); only moving the existing slots happens under it. Tables never shrink.
+    /// Linux's `expand_fdtable`); only moving the existing slots happens under it. Tables never shrink (but for `close_all` at exit).
     fn grow_to(&self, want: usize) -> Result<(), Errno> {
         loop {
             let len = self.fds.lock().len();
@@ -858,31 +864,44 @@ impl FdTable {
     /// and then the files, outside the lock).
     pub fn close_on_exec(&self) -> Vec<Arc<OpenFile>> {
         let mut late = LateMany::new();
-        let mut fds = self.fds.lock();
-        self.hint.store(0, Ordering::Relaxed);
-        let mut out = Vec::new();
-        for (i, s) in fds.iter_mut().enumerate() {
-            if s.as_ref().is_some_and(|s| s.cloexec && s.file.is_some())
-                && let Some(f) = s.take().and_then(|s| s.file)
-            {
-                late.keep(self.hide(i));
-                out.push(f);
-            }
+        let mut out: Vec<Arc<OpenFile>> = Vec::new();
+        // Counted under the lock, room made outside it (`LateMany::room`); fds marked meanwhile ask again.
+        loop {
+            let want = {
+                let mut fds = self.fds.lock();
+                let want = fds.iter().flatten().filter(|s| s.cloexec && s.file.is_some()).count();
+                if want <= out.capacity() {
+                    self.hint.store(0, Ordering::Relaxed);
+                    for (i, s) in fds.iter_mut().enumerate() {
+                        if s.as_ref().is_some_and(|s| s.cloexec && s.file.is_some())
+                            && let Some(f) = s.take().and_then(|s| s.file)
+                        {
+                            late.keep(self.hide(i));
+                            out.push(f);
+                        }
+                    }
+                    break;
+                }
+                want
+            };
+            out.reserve_exact(want);
+            late.room(want);
         }
-        drop(fds);
         drop(late);
         out
     }
     /// exit (Linux `exit_files`): closes every fd at once, so pipe readers see EOF and writers EPIPE when a
     /// program ends, not only when its process object is freed (FS-3 change request to AB: call it when the
-    /// process ends). The table stays usable (empty).
+    /// process ends). The table stays usable (empty, and the one case of a table getting shorter: its slots are
+    /// taken whole, as a list of them would be made under the lock; see `LateMany::room`).
     pub fn close_all(&self) {
         let mut late = LateMany::new();
-        let gone: Vec<Slot> = {
+        late.room(self.count());
+        let gone = {
             let mut fds = self.fds.lock();
             self.hint.store(0, Ordering::Relaxed);
             self.view.write().drain_from(0, &mut |_, r| late.keep(Some(r)));
-            fds.iter_mut().filter_map(|s| s.take()).collect()
+            core::mem::take(&mut *fds)
         };
         drop(gone);
         drop(late);

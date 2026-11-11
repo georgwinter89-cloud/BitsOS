@@ -49,6 +49,11 @@ impl Launches {
         self.waiting.iter().map(|(_, d)| *d).min()
     }
 
+    /// Whether start `pid` still waits for its first window.
+    pub fn waiting_for(&self, pid: u32) -> bool {
+        self.waiting.iter().any(|(p, _)| *p == pid)
+    }
+
     pub fn busy(&self) -> bool {
         !self.waiting.is_empty()
     }

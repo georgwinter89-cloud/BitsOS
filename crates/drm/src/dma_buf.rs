@@ -65,6 +65,15 @@ pub trait Exporter: Send + Sync {
     /// What MM maps for a program (built once at export); None: the buffer cannot be mapped (EINVAL, Linux's
     /// answer for an exporter without `.mmap`).
     fn aperture(&self) -> Option<Aperture>;
+    /// WY-17: a buffer made of several pieces maps as several apertures (fbdev's windows, 2 MiB DMA buffers);
+    /// `locate` says where a page lies. One piece unless an exporter says otherwise.
+    fn apertures(&self) -> Vec<Aperture> {
+        self.aperture().into_iter().collect()
+    }
+    /// WY-17: page `pgoff` of the buffer as (index in `apertures`, page in that aperture).
+    fn locate(&self, pgoff: u64) -> (usize, u64) {
+        (0, pgoff)
+    }
     /// The exporter's own mmap rule after the size check (`ops->mmap`); `shared` = MAP_SHARED.
     fn mmap_check(&self, _shared: bool) -> Result<(), Errno> {
         Ok(())
@@ -79,6 +88,12 @@ pub trait Exporter: Send + Sync {
     /// The physical address of page `page` for an importing device (the sg table's entries); None outside or
     /// without frames (host tests).
     fn page_phys(&self, page: u64) -> Option<u64>;
+    /// Who owns the frames `page_phys` names right now, when they can change under this object (a userptr range,
+    /// which a revalidation points at new pages). None: this object itself owns them for its whole life. A device's
+    /// page tables copy frames: they must read them from this and hold this, or an entry outlives its frame.
+    fn frames(&self) -> Option<Arc<dyn Exporter>> {
+        None
+    }
     /// Kernel access (`dma_buf_vmap` for the kernel and the tests): false outside the buffer.
     fn read(&self, off: u64, out: &mut [u8]) -> bool;
     fn write(&self, off: u64, data: &[u8]) -> bool;
@@ -174,8 +189,8 @@ pub struct DmaBuf {
     file: SpinLock<(Weak<OpenFile>, Option<u64>)>,
 }
 
-/// The device side of a dma-buf mapping (MM's hook): page `pgoff` of the buffer is page `pgoff` of its one
-/// aperture.
+/// The device side of a dma-buf mapping (MM's hook): where page `pgoff` of the buffer lies says the exporter
+/// (`Exporter::locate`; page `pgoff` of its one aperture for all but fbdev's windows).
 pub(crate) struct MapOps {
     exp: Arc<dyn Exporter>,
     pages: u64,
@@ -200,7 +215,8 @@ impl DeviceOps for MapOps {
             return Err(PageFault::Bus);
         }
         self.exp.cpu_fault();
-        Ok(DevicePage { aperture: 0, page: pgoff, writable: true })
+        let (aperture, page) = self.exp.locate(pgoff);
+        Ok(DevicePage { aperture, page, writable: true })
     }
 }
 
@@ -212,18 +228,18 @@ impl DmaBuf {
         if size == 0 || size % PAGE != 0 {
             return Err(EINVAL);
         }
-        let map = match exp.aperture() {
-            Some(a) => {
-                let ops = Arc::new(MapOps::new(exp.clone(), size / PAGE));
-                match DeviceMap::new(ops, alloc::vec![a]) {
-                    Ok(m) => Some(m),
-                    Err(e) => {
-                        klog::event!(Warn, "drm", "dma_buf.no_mapping", exporter = exp.name(), error = alloc::format!("{e:?}"); "the buffer cannot be mapped by programs");
-                        return Err(ENOMEM);
-                    }
+        let apertures = exp.apertures();
+        let map = if apertures.is_empty() {
+            None
+        } else {
+            let ops = Arc::new(MapOps::new(exp.clone(), size / PAGE));
+            match DeviceMap::new(ops, apertures) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    klog::event!(Warn, "drm", "dma_buf.no_mapping", exporter = exp.name(), error = alloc::format!("{e:?}"); "the buffer cannot be mapped by programs");
+                    return Err(ENOMEM);
                 }
             }
-            None => None,
         };
         let resv = resv.unwrap_or_else(Resv::new);
         let ino = NEXT_INO.fetch_add(1, Ordering::Relaxed);

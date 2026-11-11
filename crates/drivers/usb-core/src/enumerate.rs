@@ -14,8 +14,8 @@ use crate::setup::{dt, Setup};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicBool;
-use ksync::Mutex;
+use core::sync::atomic::{AtomicBool, AtomicU8};
+use ksync::{Mutex, SpinLock};
 
 klog::counter!(MPS0_FIXED, "usb.mps0_fixed");
 
@@ -50,13 +50,15 @@ pub fn enumerate(host: &Arc<dyn Host>, place: Place, scheme: Scheme) -> Result<A
                 id: registry::next_id(),
                 host: host.clone(),
                 slot,
-                address,
+                address: AtomicU8::new(address),
                 place,
                 desc,
                 config,
                 gone: AtomicBool::new(false),
                 bind_lock: Mutex::named("usb.dev_bind", ()),
                 alts: Default::default(),
+                reset: Default::default(),
+                serial: SpinLock::named("usb.dev_serial", None),
             });
             registry::add(dev.clone());
             let cfg = dev.config.as_ref();
@@ -121,7 +123,7 @@ fn setup(host: &dyn Host, slot: HcSlot, place: &Place, guess: u16, need_first8: 
 }
 
 /// The first configuration: 9 bytes for wTotalLength, then all of it (at most 64 KiB - 1 by its size field).
-fn read_config(host: &dyn Host, slot: HcSlot) -> Result<Configuration, UsbError> {
+pub(crate) fn read_config(host: &dyn Host, slot: HcSlot) -> Result<Configuration, UsbError> {
     let mut h = [0u8; 9];
     let n = host.control(slot, Setup::get_descriptor(dt::CONFIGURATION, 0, 9), Data::In(&mut h))?;
     if n < 9 || h[1] != dt::CONFIGURATION {

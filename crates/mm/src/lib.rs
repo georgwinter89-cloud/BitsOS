@@ -11,7 +11,8 @@
 //! quarantine of dropped windows) remain only as the fallback for a CPU that never answers.
 //!
 //! MM-2: `kernel_tables` switches to the kernel's own page tables (plan in `kmap`, MTRR rules in `mtrr`),
-//! `vmap` hands out typed device windows with guard pages and plain kernel-virtual reservations.
+//! `vmap` hands out typed device windows with guard pages and plain kernel-virtual reservations, `scatter` the
+//! kernel heap's large blocks of single frames.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -23,6 +24,8 @@ mod as_ktest;
 mod aspace;
 pub mod commit;
 mod commit_ktest;
+pub mod compact;
+mod compact_ktest;
 mod counters_ktest;
 mod cow_ktest;
 pub mod device;
@@ -33,16 +36,22 @@ pub mod dma_pages;
 mod dma_pages_ktest;
 pub mod fault;
 mod frames_ktest;
+mod grouping_ktest;
 mod heap_ktest;
+mod highatomic_ktest;
+mod mlock_ktest;
 pub mod kernel_tables;
 pub mod kmap;
 pub mod linux;
 pub mod mtrr;
 mod paging_ktest;
 pub mod reclaim;
+mod order_ktest;
 mod reclaim_ktest;
 mod rmap_ktest;
 mod report;
+mod scatter;
+mod scatter_ktest;
 pub mod share;
 mod spurious_ktest;
 pub mod thp;
@@ -58,7 +67,7 @@ pub mod vma;
 mod vaspace;
 pub mod vmap;
 
-pub use aspace::{AddressSpace, AsCore, Fill, MemStats, PageUsage, PSS_SHIFT};
+pub use aspace::{AddressSpace, AsCore, Fill, LockLimit, MemStats, PageUsage, PSS_SHIFT};
 pub use fault::FaultReason;
 pub use vma::{FileRef, Prot, Vma, VmaKind};
 

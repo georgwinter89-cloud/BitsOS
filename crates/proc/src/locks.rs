@@ -636,16 +636,23 @@ pub fn release_owner(fds: &Arc<FdTable>) {
         return;
     }
     let me = files_owner(fds);
-    let nodes: Vec<(usize, Arc<Node>)> = {
-        let t = NODES.lock();
-        let mut v = Vec::new();
-        if v.try_reserve(t.len()).is_err() {
+    // The list's room is made with the table's lock dropped (under a spin lock the heap can neither reclaim nor
+    // fall back to single frames, see `ksync::spare`); a table that grew meanwhile asks again.
+    let mut nodes: Vec<(usize, Arc<Node>)> = Vec::new();
+    loop {
+        let want = {
+            let t = NODES.lock();
+            if t.len() <= nodes.capacity() {
+                nodes.extend(t.iter().map(|(k, n)| (*k, n.clone())));
+                break;
+            }
+            t.len()
+        };
+        if nodes.try_reserve_exact(want).is_err() {
             klog::event!(Warn, "proc", "locks.release_no_memory"; "no memory to walk the lock table: the dead owner's locks go lazily");
             return;
         }
-        v.extend(t.iter().map(|(k, n)| (*k, n.clone())));
-        v
-    };
+    }
     for (key, n) in nodes {
         let (changed, empty) = {
             let mut s = n.state.lock();

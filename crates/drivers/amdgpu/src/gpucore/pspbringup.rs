@@ -588,7 +588,7 @@ pub fn run<H: Hw>(owner: &mut Bringup<Watch<H>>, bo: &mut dyn BoAlloc, inp: &Inp
             if inp.until.fake_chain_mes() && pass {
                 pass &= stage_mes_pre(owner, inp, &mut out);
             }
-            if inp.until.runs_gfx_stage() || inp.until == Until::Vm {
+            if inp.until.runs_gfx_stage() || inp.until.fake_chain_mes() {
                 stage_gfx_ring(owner, bo, inp, pass, seq0, &mut out);
                 pass = pass && out.checks.iter().all(|c| c.pass) && owner.hw().total() == v0;
             }
@@ -785,6 +785,7 @@ pub fn render(out: &Outcome, inp: &Inputs) -> Vec<String> {
             Until::Mes => "mes (M3 + GMC + GFX tail, Linux's CP unhalt, MES: KIQ, scheduler, SET_HW_RESOURCES, self test)",
             Until::GfxMes => "gfx_mes (mes + a compute ring and GFX ring 0 mapped through MES, ring/IB/fence tests)",
             Until::Vm => "vm (sdma + gfx_mes, then a test VM in the rings: VMID, in-ring flush, PASID entry, an intended fault)",
+            Until::Backend => "backend (sdma + gfx_mes, kept for the render node)",
         },
         inp.start.name(),
         out.report.prior.map_or("-", |p| if p == psp::Prior::Stale { "stale: destroy first" } else { "fresh" }),

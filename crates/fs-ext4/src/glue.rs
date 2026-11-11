@@ -70,8 +70,8 @@ impl Ext4Ops {
         let mut fifo = None;
         let data = match (d.ftype(), data) {
             (di::S_IFREG, _) => {
-                let f = Ext4File::new(self.vol.clone(), ino, d.size());
-                self.vol.hold(ino)?;
+                let blocks = self.vol.hold(ino)?;
+                let f = Ext4File::new(self.vol.clone(), ino, d.size(), blocks);
                 file = Some(f.clone());
                 Data::External(Box::new(Ops(f)))
             }

@@ -217,9 +217,17 @@ impl Transfer {
     }
     /// Waits at most `timeout_ns`. When the time is up the transfer is cancelled (Stop Endpoint and skip) and
     /// ends with `Timeout`, unless it completed in the meantime. Never waits without a deadline (B4).
+    ///
+    /// The clock alone does not decide (US-R): while every CPU stood still the time ran out for a transfer the
+    /// controller finished long ago. Time up means the controller is asked (`Device::still_moving`).
     pub fn wait(&self, timeout_ns: u64) -> XferResult {
-        if !self.urb.is_done() && !self.dev.host.wait(self.dev.slot, &self.urb, timeout_ns) {
-            self.dev.host.cancel(self.dev.slot, self.ep, &self.urb, UsbError::Timeout);
+        let mut last = None;
+        while !self.urb.is_done() && !self.dev.host.wait(self.dev.slot, &self.urb, timeout_ns) {
+            let done = |ns: u64| self.dev.host.wait(self.dev.slot, &self.urb, ns);
+            if !self.dev.still_moving(self.ep, &mut last, &done) {
+                self.dev.host.cancel(self.dev.slot, self.ep, &self.urb, UsbError::Timeout);
+                break;
+            }
         }
         self.finish()
     }

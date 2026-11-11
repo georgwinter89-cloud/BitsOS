@@ -49,6 +49,10 @@ pub struct FakeSched {
     pub(crate) vram_lost: AtomicU32,
     jobs_run: AtomicU64,
     hangs: AtomicU64,
+    /// WY-21: CONFIG `drm_fake_hang=lose`: a hang ends the device as GX-9a's ladder does when no rung works.
+    pub(crate) lose_on_hang: AtomicBool,
+    /// The device is lost: new files and submissions answer ENODEV, as on the chip (`hw/mod.rs`, `hw/jobs.rs`).
+    pub(crate) lost: AtomicBool,
 }
 
 struct Wake(Weak<FakeSched>);
@@ -72,6 +76,8 @@ impl FakeSched {
             vram_lost: AtomicU32::new(0),
             jobs_run: AtomicU64::new(0),
             hangs: AtomicU64::new(0),
+            lose_on_hang: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
         })
     }
 
@@ -81,6 +87,10 @@ impl FakeSched {
     }
 
     pub(crate) fn submit(&self, sub: Submission) -> Result<(), Errno> {
+        if self.lost.load(Ordering::Acquire) {
+            sub.cancel(ENODEV);
+            return Err(ENODEV);
+        }
         let prio = sub.jobs.iter().map(|j| j.entity.priority).max().unwrap_or(SchedPriority::Normal);
         let mut regs = Vec::new();
         if regs.try_reserve_exact(sub.deps.len()).is_err() {
@@ -184,6 +194,9 @@ impl FakeSched {
                     _ => 0,
                 };
                 klog::event!(Warn, "drm", "fake.cs_hang", why = what.as_str(), engine_errno = engine_errno; "the job ends with ETIME, its context is guilty, the fake counts a reset");
+                if self.lose_on_hang.load(Ordering::Acquire) && !self.lost.swap(true, Ordering::AcqRel) {
+                    klog::event!(Error, "drm", "fake.device_lost"; "drm_fake_hang=lose: new files and submissions answer ENODEV until the next boot");
+                }
                 for (j, e) in sub.jobs.iter().zip(&refused) {
                     if e.is_none() {
                         j.entity.guilty.store(true, Ordering::Release);
@@ -239,7 +252,14 @@ fn exec(vm: &FakeVm, jobs: &[Job], refused: &[Option<Errno>]) -> Result<(), Fail
     let mut parts: Vec<Part> = Vec::new();
     for (j, r) in jobs.iter().zip(refused) {
         let limits = Limits { max_ib_depth: if j.entity.ip_type == AMDGPU_HW_IP_DMA { 1 } else { LIMITS.max_ib_depth }, ..LIMITS };
-        let engine = isa(j.entity.ip_type).and_then(|i| Engine::new(i, 0, 256, 0, limits).ok());
+        let mut engine = isa(j.entity.ip_type).and_then(|i| Engine::new(i, 0, 256, 0, limits).ok());
+        // TS-2: an INDIRECT_BUFFER a program writes into its own IB reaches the MEC as written (the job's own IBs are
+        // the driver's to sign-extend, hw/frame.rs, so `exec_ib` below goes around this check).
+        if j.entity.ip_type == AMDGPU_HW_IP_COMPUTE
+            && let Some(e) = engine.as_mut()
+        {
+            e.refuse_non_canonical_ibs();
+        }
         if engine.is_none() && r.is_none() && !j.ibs.is_empty() {
             klog::event!(Debug, "drm", "fake.cs_no_engine", ip = j.entity.ip_type; "the fake has no interpreter for this IP: its IBs count as done");
         }

@@ -1,0 +1,23 @@
+type 1 goes to r2: r2=2 
+type 9 goes to r3: r3=3 
+nothing queued: cbytes 0 qnum 0 qbytes 16384 mode 600 key 0 uid 0 gid 0 stime 1 rtime 1 lspid me 1 lrpid me 0
+type 2 goes to r1: r1=4 
+too big for the first: big=3 small=-7 
+both wait: 
+took 4
+room for the small one only: small=0 
+took 4
+still not for the big one: 
+took 2
+room for the big one: big=0 
+sent: cbytes 8 qnum 1 qbytes 8 mode 600 key 0 uid 0 gid 0 stime 1 rtime 1 lspid me 1 lrpid me 1
+waits: 
+room by IPC_SET: w2=0 
+still waiting: 
+gets it: again=1 
+msgrcv interrupted = -EINTR
+msgrcv with SA_RESTART: EINTR all the same (ERESTARTNOHAND) = -EINTR
+msgrcv through stop and continue = 3
+msgsnd interrupted = -EINTR
+sender at removal: tx=-43 
+receiver at removal: rx=-43 

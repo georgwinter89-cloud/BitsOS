@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# slow
+# Run: `cargo xtask fullrun`, on the build host (a program in a container, no QEMU, no Mini-PC; silent); by hand
+# `cargo xtask scenario yt/fb-e2e`. Needs lane YT's container cobalt-yt-v2 and the Cobalt build it mounts: without them RED.
 # End-to-end test of the framebuffer backend without the network (YT-1).
 # Run on the host; it uses the lane container cobalt-yt-v2 (podman) and the
 # built loader_app in the Cobalt copy. A local page (e2e/keys.html, served on
@@ -8,8 +11,18 @@
 # QWERTZ letters, gamepad -> remote keys, pointer position mapping (screen ->
 # window), click, wheel, pointer drawn, Ctrl+Alt+Backspace ends Cobalt.
 set -uo pipefail
-if [ "$(podman container inspect -f '{{.State.Running}}' cobalt-yt-v2 2>/dev/null)" != "true" ]; then
-    echo "SKIP: the lane container cobalt-yt-v2 is not running (podman start cobalt-yt-v2)"
-    exit 0
+here=$(cd "$(dirname "$0")" && pwd)
+C=cobalt-yt-v2
+state=$(podman container inspect -f '{{.State.Running}}' "$C" 2>/dev/null) \
+  || { echo "RED: no container $C (lane YT: user/ports/cobalt-launcher/README.md)"; exit 1; }
+started=""
+if [ "$state" != true ]; then
+    podman start "$C" >/dev/null || { echo "RED: podman start $C failed"; exit 1; }
+    started=1
 fi
-podman exec cobalt-yt-v2 bash /lane/host/tests/yt/fb-e2e-inner.sh
+# Only what this script started goes down again.
+trap '[ -z "$started" ] || podman stop -t 5 "$C" >/dev/null 2>&1' EXIT
+OUT=/work/cobalt/src/out/evergreen-x64-bitsos_qa
+podman exec "$C" test -x "$OUT/loader_app" || { echo "RED: no Cobalt build in the container ($OUT/loader_app)"; exit 1; }
+# This worktree's inner script; bash -c, because Cobalt's helpers would read a script on stdin.
+podman exec "$C" bash -c "$(cat "$here/fb-e2e-inner.sh")"

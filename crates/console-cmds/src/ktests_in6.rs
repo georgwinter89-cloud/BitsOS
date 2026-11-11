@@ -45,13 +45,13 @@ fn newest(t: u64) -> Option<latency::Sample> {
 fn pointer_over_fbdev() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
     if gopfb::fbdev::device().is_none() || display::device().is_none() {
-        return ktest::skip("no fbdev device (no GOP framebuffer)");
+        return ktest::fail("no fbdev device (no GOP framebuffer)");
     }
     if vfs::root_ns().lookup(PROGRAM).is_err() {
-        return ktest::skip("/bin/abi-fbdev is not in this image (user/abi-tests need the musl sysroot)");
+        return ktest::fail("/bin/abi-fbdev is not in this image (user/abi-tests need the musl sysroot)");
     }
     if vt::graphics() || display::scanout_holder().is_some() {
-        return ktest::skip("a program has the screen");
+        return ktest::fail("a program has the screen");
     }
     gopfb::fbdev::fix_node_owner();
     let mut caps = Caps::default();
@@ -118,4 +118,4 @@ fn pointer_over_fbdev() -> TestResult {
     kassert!(pointer_over::drawn_at().is_none(), "the arrow over the program is still remembered after the program ended");
     Ok(())
 }
-ktest!("in.latency.pointer_over_fbdev", Safe, pointer_over_fbdev);
+ktest!("in.latency.pointer_over_fbdev", Screen, pointer_over_fbdev);

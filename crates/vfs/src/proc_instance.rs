@@ -36,7 +36,7 @@ pub fn instance_from(
     let mut failed = 0usize;
     for f in files {
         let Some(rel) = below_proc(f.path) else { continue };
-        if rel.is_empty() || make_file(&root, rel, f.render).is_err() {
+        if rel.is_empty() || make_file(&root, rel, f.render, f.mode).is_err() {
             failed += 1;
         }
     }
@@ -86,7 +86,7 @@ fn dir_at(root: &Arc<Dentry>, rel: &[u8]) -> Result<Arc<Dentry>, Errno> {
     Ok(cur)
 }
 
-fn make_file(root: &Arc<Dentry>, rel: &[u8], render: fn() -> alloc::string::String) -> Result<(), Errno> {
+fn make_file(root: &Arc<Dentry>, rel: &[u8], render: fn() -> alloc::string::String, mode: u32) -> Result<(), Errno> {
     let (dir, name) = match rel.iter().rposition(|&b| b == b'/') {
         Some(i) => (dir_at(root, &rel[..i])?, &rel[i + 1..]),
         None => (root.clone(), rel),
@@ -96,7 +96,7 @@ fn make_file(root: &Arc<Dentry>, rel: &[u8], render: fn() -> alloc::string::Stri
     }
     let sb = dir.sb.clone();
     let _g = sb.lock_names();
-    dir.create_child(name, uapi::S_IFREG | 0o444, Cred::ROOT, crate::inode::Data::Proc(render)).map(|_| ())
+    dir.create_child(name, uapi::S_IFREG | (mode & 0o7777), Cred::ROOT, crate::inode::Data::Proc(render)).map(|_| ())
 }
 
 fn add_source(root: &Arc<Dentry>, rel: &[u8], src: Arc<dyn DirSource>) -> Result<(), Errno> {

@@ -1,0 +1,5 @@
+no new privs = 0
+filter = 0
+semget filtered = -ENOTTY
+semop passes = 0
+IPC_RMID = 0

@@ -23,7 +23,7 @@ pub mod screen;
 
 pub use phys::{PHYS_MAX, phys_check};
 pub use reboot::ResetPlan;
-pub use run_ktests::{Verdict, verdict};
+pub use run_ktests::{Here, Verdict, verdict};
 
 use crate::{Json, ToolError, ToolOutput, ToolResult};
 use alloc::string::String;

@@ -203,8 +203,21 @@ impl Stream {
         let st = StreamState { kept: Vec::new(), dropped: 0, live: None, live_from: 0, total: 0 };
         Arc::new(Stream { state: SpinLock::named("proc.run_stream", st), cap })
     }
+    /// A copy of what was kept; its room is made with the lock dropped (see `write_at`), a stream that grew
+    /// meanwhile asks again.
     pub fn contents(&self) -> Vec<u8> {
-        self.state.lock().kept.clone()
+        let mut out = Vec::new();
+        loop {
+            let want = {
+                let g = self.state.lock();
+                if g.kept.len() <= out.capacity() {
+                    out.extend_from_slice(&g.kept);
+                    return out;
+                }
+                g.kept.len()
+            };
+            out.reserve_exact(want);
+        }
     }
     pub fn dropped(&self) -> u64 {
         self.state.lock().dropped
@@ -265,13 +278,26 @@ impl File for Stream {
         Err(EBADF)
     }
     fn write_at(&self, _pos: u64, buf: &[u8]) -> Result<usize, Errno> {
-        let mut g = self.state.lock();
-        let g = &mut *g;
+        // `kept` (up to `cap`, 1 MiB) grows with the lock dropped: under a spin lock the heap can neither
+        // reclaim nor fall back to single frames, and `try_reserve` there dropped output although memory was
+        // there (see `ksync::spare`). Every round looks at the stream again.
+        let mut spare = ksync::Spare::new();
+        let mut refused = false;
+        let mut guard = loop {
+            let mut g = self.state.lock();
+            let room = if g.dropped == 0 { self.cap.saturating_sub(g.kept.len()).min(buf.len()) } else { 0 };
+            if refused || room == 0 || spare.fits(&mut g.kept, room) {
+                break g;
+            }
+            drop(g);
+            refused = spare.grow().is_err();
+        };
+        let g = &mut *guard;
         g.total += buf.len() as u64;
         // Only while nothing was dropped: `kept` stays the stream's start without holes (a write the heap
         // refused once must not be followed by later bytes that look adjacent).
         let room = if g.dropped == 0 { self.cap.saturating_sub(g.kept.len()).min(buf.len()) } else { 0 };
-        if room > 0 && g.kept.try_reserve(room).is_ok() {
+        if room > 0 && !refused {
             g.kept.extend_from_slice(&buf[..room]);
             g.dropped += (buf.len() - room) as u64;
         } else {
@@ -408,16 +434,18 @@ pub(crate) fn running() -> usize {
 /// What one job may hold at most besides its program: the kept start and the progress buffer of both streams.
 const JOB_CAPTURE_MAX: u64 = 2 * (OUTPUT_CAP + LIVE_KEEP) as u64;
 
-/// R1: no fixed job count. A new job is refused when free memory no longer covers the worst-case capture of
+/// R1: no fixed job count. A new job is refused when available memory no longer covers the worst-case capture of
 /// every running job and this one, plus 1/16 of all memory kept for the rest of the system (pure, host-tested).
-pub(crate) fn room_for_a_job(free: u64, total: u64, running: usize) -> Result<(), String> {
+/// `available` is MemAvailable (`vfs::reclaim::mem_available_bytes`): clean page cache is memory a job gets, so a
+/// machine whose RAM is mostly cache is not full (FS-STALL: 875 MiB free beside 20 GB of cache refused a run).
+pub(crate) fn room_for_a_job(available: u64, total: u64, running: usize) -> Result<(), String> {
     let need = (running as u64).saturating_add(1).saturating_mul(JOB_CAPTURE_MAX).saturating_add(total / 16);
-    if free >= need {
+    if available >= need {
         return Ok(());
     }
     Err(format!(
-        "not started: {} MiB free is below the {} MiB needed (the output capture of {running} running jobs and this one, plus 1/16 of memory for the system); stop a job first (stop {{\"call\":n}})",
-        free >> 20,
+        "not started: {} MiB available is below the {} MiB needed (the output capture of {running} running jobs and this one, plus 1/16 of memory for the system); stop a job first (stop {{\"call\":n}})",
+        available >> 20,
         need >> 20
     ))
 }
@@ -427,11 +455,10 @@ pub(crate) fn room_for_a_job(free: u64, total: u64, running: usize) -> Result<()
 /// pinned to that CPU preempts it: the reschedule IPI is that interrupt. The CPU is read anew on every nudge:
 /// a nudge that lands on a CPU the thread just left is harmless and the next one (200 ms later) follows it; a
 /// thread still in user mode can only have moved by being preempted, which delivered the kill anyway.
-/// `thread_stats` is the only per-thread CPU lookup sched offers; it runs at most 5 times a second per killed
-/// job that has not ended. A stop-gap until `Process::kill` interrupts the thread's CPU itself (change request 1
+/// Runs at most 5 times a second per killed job that has not ended. A stop-gap until `Process::kill` interrupts the thread's CPU itself (change request 1
 /// in plan/notes/mc-MC-5a.md).
 fn nudge(pid: u32, tid: u64) {
-    let Some(t) = sched::thread_stats().into_iter().find(|t| t.id == tid) else {
+    let Some(t) = sched::thread_stat(tid) else {
         klog::event!(Debug, "proc", "run.nudge_no_thread", pid = pid, thread = tid; "its thread is not in the table any more (on its way out)");
         return;
     };
@@ -503,8 +530,9 @@ pub(crate) fn admit(caller: &policy::Subject, r: &Request) -> Result<(), ToolErr
     // Memory for one more job (no frame allocator on the host: nothing to ask).
     if let Some(f) = mm_core::frames() {
         let st = f.stats();
-        room_for_a_job(st.free_bytes, st.total_bytes, running()).map_err(|why| {
-            klog::event!(Warn, "proc", "run.no_memory", path = r.path.as_str(), free_mb = st.free_bytes >> 20, running = running());
+        let available = vfs::reclaim::mem_available_bytes();
+        room_for_a_job(available, st.total_bytes, running()).map_err(|why| {
+            klog::event!(Warn, "proc", "run.no_memory", path = r.path.as_str(), available_mb = available >> 20, free_mb = st.free_bytes >> 20, running = running());
             ToolError::Failed(why)
         })?;
     }
@@ -889,10 +917,24 @@ mod tests {
         let max = ((30 * G - 2 * G) / JOB_CAPTURE_MAX) as usize;
         assert!(room_for_a_job(30 * G, 32 * G, max - 1).is_ok());
         let e = room_for_a_job(30 * G, 32 * G, max).unwrap_err();
-        assert!(e.starts_with("not started: 30720 MiB free") && e.contains("stop a job first"), "{e}");
+        assert!(e.starts_with("not started: 30720 MiB available") && e.contains("stop a job first"), "{e}");
         // Little memory left: refused even with no job running; no overflow on absurd counts.
         assert!(room_for_a_job(10 << 20, 32 * G, 0).is_err());
         assert!(room_for_a_job(u64::MAX - 1, 64 * G, usize::MAX).is_err());
+    }
+
+    /// The Mini-PC's refusal: 875 MiB free, 20 GB of clean page cache, 24 GB in all. Free memory alone says no,
+    /// MemAvailable (what the check takes) says yes.
+    #[test]
+    fn page_cache_counts_as_room_for_a_job() {
+        const G: u64 = 1 << 30;
+        let (total, free, cache) = (24 * G, 875 << 20, 20 * G);
+        assert!(room_for_a_job(free, total, 0).is_err());
+        let available = mm_core::reclaim::mem_available(total, free, cache);
+        assert!(available > 15 * G, "{available}");
+        assert!(room_for_a_job(available, total, 0).is_ok());
+        // Without cache to give, still refused.
+        assert!(room_for_a_job(mm_core::reclaim::mem_available(total, free, 0), total, 0).is_err());
     }
 
     #[test]

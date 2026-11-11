@@ -8,7 +8,7 @@
 //! thread (crate mm, `mm.kswapd`) keeps free memory between the watermarks computed here in the background.
 
 use crate::{Kind, PAGE};
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// The page cache's side (crate vfs implements it, crate mm installs it).
 pub trait Reclaim: Sync {
@@ -16,6 +16,13 @@ pub trait Reclaim: Sync {
     /// only) or allocate frames: the allocator may be called with any lock of its caller held. `thorough`: look
     /// at every cached page (the rounds before the allocation would fail).
     fn reclaim(&self, pages: u64, thorough: bool) -> Reclaimed;
+    /// FS-STALL: takes back the page that frame `phys` holds, named by the frame's owner word (`Buddy::owner`),
+    /// when it is clean and nobody holds it; the same rules. True: it went (its frame comes back after a grace
+    /// period). Default: never.
+    fn reclaim_frame(&self, phys: u64, owner: u64) -> bool {
+        let _ = (phys, owner);
+        false
+    }
 }
 
 /// What one reclaim round did.
@@ -127,6 +134,74 @@ klog::counter!(DIRECT_RUNS, "mm.reclaim.direct_runs");
 klog::counter!(DIRECT_PAGES, "mm.reclaim.direct_pages");
 klog::counter!(DIRECT_RESCUED, "mm.reclaim.direct_rescued");
 klog::counter!(DIRECT_FAILED, "mm.reclaim.direct_failed");
+// FS-STALL: the kernel heap's own reclaim (`Buddy::reclaim_for_heap`): calls, pages freed, allocations it saved.
+klog::counter!(pub HEAP_RUNS, "mm.reclaim.heap_runs");
+klog::counter!(pub HEAP_PAGES, "mm.reclaim.heap_pages");
+klog::counter!(pub HEAP_RESCUED, "mm.reclaim.heap_rescued");
+// W35 MM-3: blocks the heap's direct compaction made (the name is from the cache-dropping search it replaced).
+klog::counter!(pub HEAP_CLEARED, "mm.reclaim.heap_cleared_blocks");
+// Heap allocations whose run was missing (the order noted for kswapd), and the blocks kcompactd made for the
+// orders kswapd handed it (W35 MM-3; before, kswapd cleared them of cache itself).
+klog::counter!(pub HEAP_ORDER_WANTED, "mm.reclaim.heap_order_wanted");
+klog::counter!(pub KSWAPD_CLEARED, "mm.reclaim.kswapd_cleared_blocks");
+
+/// W35 MM-1: orders of frame allocations that failed (the boot allocator's slow path, `Buddy::want_kswapd`), next
+/// to the heap's and the faults' (`KernelHeap::order_want`, crate mm's `want_order`): kswapd takes all three.
+pub static FRAME_WANT: crate::OrderWant = crate::OrderWant::new();
+
+/// kswapd's doorbell (Linux `wakeup_kswapd` -> `wake_up_interruptible(&pgdat->kswapd_wait)`): `wake_kswapd` rings it,
+/// the thread waits on it between looks (`kswapd_sleep`; its period stays as the backstop).
+static KSWAPD_WAIT: ksync::WaitQueue = ksync::WaitQueue::new();
+/// A wake is due (the condition the thread waits for).
+static KSWAPD_KICK: AtomicBool = AtomicBool::new(false);
+/// A wake asked for where the scheduler may not be called (a spin lock held, an interrupt handler): the next caller
+/// of `wake_deferred` from a context that allows it rings the bell.
+static KSWAPD_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// Wakes kswapd: at once where the caller's context may call the scheduler (`context_allows`: no spin lock, no
+/// interrupt handler; 87fbfd71's rule that the allocator never calls the scheduler from a context that may not
+/// sleep), else deferred to the next `wake_deferred` or the thread's period. Lock-free until the wake itself.
+pub fn wake_kswapd() {
+    KSWAPD_KICK.store(true, Relaxed);
+    if context_allows() {
+        KSWAPD_WAIT.wake_one();
+    } else {
+        KSWAPD_DEFERRED.store(true, Relaxed);
+    }
+}
+
+/// kswapd is looking (between its wake and its next sleep; Linux `kswapd_is_running`): proactive compaction waits.
+static KSWAPD_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Set by the kswapd thread around each look.
+pub fn set_kswapd_running(on: bool) {
+    KSWAPD_RUNNING.store(on, Relaxed);
+}
+
+/// Whether kswapd is looking now (`set_kswapd_running`).
+pub fn kswapd_running() -> bool {
+    KSWAPD_RUNNING.load(Relaxed)
+}
+
+/// A wake is pending that kswapd has not taken yet (`Buddy::want_kswapd` then skips its zone-lock check).
+pub fn kswapd_kicked() -> bool {
+    KSWAPD_KICK.load(Relaxed)
+}
+
+/// Rings a wake `wake_kswapd` had to leave for later, where the context allows it (the slow paths that may reclaim).
+pub fn wake_deferred() {
+    if KSWAPD_DEFERRED.load(Relaxed) && context_allows() && KSWAPD_DEFERRED.swap(false, Relaxed) {
+        KSWAPD_WAIT.wake_one();
+    }
+    crate::compact::wake_deferred();
+}
+
+/// kswapd's wait between looks: until `wake_kswapd` or `timeout_ns`; true if woken.
+pub fn kswapd_sleep(timeout_ns: u64) -> bool {
+    let woke = KSWAPD_WAIT.wait_until_timeout(|| KSWAPD_KICK.load(Relaxed), timeout_ns);
+    KSWAPD_KICK.store(false, Relaxed);
+    woke
+}
 
 /// Bumps the global klog counters (the boot allocator only).
 pub(crate) fn count_global(pages: u64, outcome: Option<bool>) {
@@ -139,6 +214,155 @@ pub(crate) fn count_global(pages: u64, outcome: Option<bool>) {
     }
     if pages > 0 {
         DIRECT_PAGES.add(pages);
+    }
+}
+
+/// Threads inside page-cache reclaim now (ksync thread ids; 0 = a free slot). FS-STALL: a heap allocation made
+/// inside reclaim (the grace queue growing for the pages it takes) must not reclaim again, or reclaim recurses.
+static INSIDE: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// FS-STALL: notes frame `phys`'s owner (the page cache: its cache and page, `vfs::reclaim`); 0 clears it.
+pub fn set_frame_owner(phys: u64, v: u64) {
+    if let Some(b) = crate::boot_buddy() {
+        b.set_owner(phys, v);
+    }
+}
+
+/// Whether the caller's context lets it reclaim for the heap (FS-STALL review R1/R2): no spin lock held (reclaim
+/// frees into the grace queue under `mm.grace` and takes cache index locks: a holder of one of those would spin on
+/// itself), not in an interrupt handler or with interrupts off (an NMI too), not inside a grace section. The heap
+/// then answers null as before; kswapd and the reserve are for those callers.
+pub fn context_allows() -> bool {
+    if ksync::preempt_count() != 0 || hal::percpu::in_hard_irq() || crate::grace::in_section() {
+        return false;
+    }
+    #[cfg(target_os = "none")]
+    if !hal::cpu::interrupts_enabled() {
+        return false;
+    }
+    true
+}
+
+/// Marks the calling thread as inside reclaim until the guard drops; None when it is inside already (or no
+/// thread id, or every slot is taken: then the caller does not reclaim).
+pub fn enter() -> Option<Inside> {
+    let me = ksync::thread_id();
+    if me == 0 || INSIDE.iter().any(|s| s.load(Relaxed) == me) {
+        return None;
+    }
+    INSIDE.iter().position(|s| s.compare_exchange(0, me, Relaxed, Relaxed).is_ok()).map(Inside)
+}
+
+pub struct Inside(usize);
+
+/// Threads whose heap allocation leaves the frames reserve alone for now (`keep_reserve`).
+static KEEP: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// A slot whose thread's allocation is suspended by a nested one (`Keep::Paused`).
+const PAUSED: u64 = 1 << 63;
+
+fn inside(me: u64) -> bool {
+    INSIDE.iter().any(|s| s.load(Relaxed) == me)
+}
+
+/// The heap's tries before the last one, where it may reclaim: it does not take the reserve (the frames below
+/// the min watermark are for callers under spin locks, which cannot reclaim). None where reclaim is not allowed
+/// or the thread is reclaiming (the heap takes the reserve then, as Linux's PF_MEMALLOC does: what frees memory
+/// must get the little it needs for that), or with no slot.
+///
+/// A heap allocation made while the same thread's outer one holds a slot (the grace queue growing inside the
+/// outer one's reclaim round, the vmap bookkeeping of a scattered block, an interrupt handler on top of it)
+/// pauses that slot for its own duration: the outer allocation's patience is not the inner one's. Mini-PC
+/// 11.11.2026, generation 114: the inner ones were refused the reserve, reclaim freed nothing, and with the
+/// patient bound everything stood for seconds.
+pub fn keep_reserve() -> Option<Keep> {
+    let me = ksync::thread_id();
+    if me == 0 {
+        return None;
+    }
+    if let Some(i) = KEEP.iter().position(|s| s.compare_exchange(me, me | PAUSED, Relaxed, Relaxed).is_ok()) {
+        return Some(Keep::Paused(i));
+    }
+    if !context_allows() || inside(me) {
+        return None;
+    }
+    KEEP.iter().position(|s| s.compare_exchange(0, me, Relaxed, Relaxed).is_ok()).map(Keep::Held)
+}
+
+/// Whether the calling thread's heap allocation keeps the reserve: asked only when a zone is below it.
+pub fn keeps_reserve() -> bool {
+    // An interrupt handler runs with the interrupted thread's id: that thread's slot is not the handler's, which
+    // cannot reclaim and is what the reserves are for.
+    if hal::percpu::in_hard_irq() {
+        return false;
+    }
+    let me = ksync::thread_id();
+    me != 0 && KEEP.iter().any(|s| s.load(Relaxed) == me)
+}
+
+/// Whether the calling thread is inside page-cache reclaim (`enter`): its allocations are not patient.
+pub fn reclaiming() -> bool {
+    let me = ksync::thread_id();
+    me != 0 && inside(me)
+}
+
+pub enum Keep {
+    /// This allocation keeps the reserve until the guard drops.
+    Held(usize),
+    /// The thread's outer allocation keeps it again when the guard drops.
+    Paused(usize),
+}
+
+impl Keep {
+    /// Whether this allocation itself keeps the reserve (and so has a last try without it).
+    pub fn held(&self) -> bool {
+        matches!(self, Keep::Held(_))
+    }
+}
+
+impl Drop for Keep {
+    fn drop(&mut self) {
+        match *self {
+            Keep::Held(i) => KEEP[i].store(0, Relaxed),
+            Keep::Paused(i) => {
+                let _ = KEEP[i].fetch_and(!PAUSED, Relaxed);
+            }
+        }
+    }
+}
+
+/// Threads whose heap allocations stay short (`hurry`).
+static HURRY: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// Marks the calling thread as one that must not stall until the guard drops: its heap allocations that find no
+/// memory answer null after the short bound instead of the patient one (`KernelHeap::regain`). For threads that
+/// others wait on and that handle a refusal themselves (the network poll round: a stalled round stops receive
+/// processing for every connection). None with no thread id or no slot: the thread is then patient like any other.
+pub fn hurry() -> Option<Hurry> {
+    let me = ksync::thread_id();
+    if me == 0 || hurried() {
+        return None;
+    }
+    HURRY.iter().position(|s| s.compare_exchange(0, me, Relaxed, Relaxed).is_ok()).map(Hurry)
+}
+
+/// Whether the calling thread is inside `hurry`: asked only on the heap's slow path.
+pub fn hurried() -> bool {
+    let me = ksync::thread_id();
+    me != 0 && HURRY.iter().any(|s| s.load(Relaxed) == me)
+}
+
+pub struct Hurry(usize);
+
+impl Drop for Hurry {
+    fn drop(&mut self) {
+        HURRY[self.0].store(0, Relaxed);
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        INSIDE[self.0].store(0, Relaxed);
     }
 }
 

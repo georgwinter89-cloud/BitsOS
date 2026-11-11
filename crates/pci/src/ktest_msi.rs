@@ -2,7 +2,7 @@
 //! QEMU's `edu` (MSI, one message, no mask bits; an MMIO write raises it), an `e1000e` (82574L: MSI-X with 5
 //! entries in BAR3, and MSI; causes forced through ICS reach the vector IVAR names), `pci-testdev` (no MSI at
 //! all: the polled fallback) and `virtio-rng-pci` (virtio MSI-X: table programming, masking, affinity). In the
-//! plain gate they skip. The `Safe` ones only read or are refused before any access; they run on the Mini-PC
+//! plain gate they fail. The `Safe` ones only read or are refused before any access; they run on the Mini-PC
 //! (`pc.msi.sets` checks every live set, e.g. igc's after NW-4) and may run several times per boot.
 
 use crate::irq::{self, Affinity, IrqMode, IrqRequest, IrqSet, StormLimit, Wake};
@@ -20,16 +20,16 @@ type R = ktest::TestResult;
 ktest!("pc.msi.compose", Safe, msi_compose);
 ktest!("pc.msi.sets", Safe, msi_sets);
 ktest!("pc.msi.refused", Safe, msi_refused);
-ktest!("pc.msi.edu", QemuOnly, msi_edu);
-ktest!("pc.msi.edu_storm", QemuOnly, msi_edu_storm);
-ktest!("pc.msi.msix", QemuOnly, msi_msix);
-ktest!("pc.msi.e1000e_msi", QemuOnly, msi_e1000e_msi);
-ktest!("pc.msi.fake_storm", QemuOnly, msi_fake_storm);
-ktest!("pc.msi.disable_device", QemuOnly, msi_disable_device);
-ktest!("pc.msi.restore", QemuOnly, msi_restore);
-ktest!("pc.msi.polled", QemuOnly, msi_polled);
-ktest!("pc.msi.virtio", QemuOnly, msi_virtio);
-ktest!("pc.msi.firmware_off", QemuOnly, msi_firmware_off);
+ktest!("pc.msi.edu", Run("pc/50-msi"), msi_edu);
+ktest!("pc.msi.edu_storm", Run("pc/50-msi"), msi_edu_storm);
+ktest!("pc.msi.msix", Run("pc/50-msi"), msi_msix);
+ktest!("pc.msi.e1000e_msi", Run("pc/50-msi"), msi_e1000e_msi);
+ktest!("pc.msi.fake_storm", Run("pc/50-msi"), msi_fake_storm);
+ktest!("pc.msi.disable_device", Run("pc/50-msi"), msi_disable_device);
+ktest!("pc.msi.restore", Run("pc/50-msi"), msi_restore);
+ktest!("pc.msi.polled", Run("pc/50-msi"), msi_polled);
+ktest!("pc.msi.virtio", Run("pc/50-msi"), msi_virtio);
+ktest!("pc.msi.firmware_off", Run("pc/50-msi"), msi_firmware_off);
 
 const EDU: (u16, u16) = (0x1234, 0x11E8);
 const E1000E: (u16, u16) = (0x8086, 0x10D3);
@@ -200,7 +200,7 @@ fn msi_compose() -> R {
 fn msi_sets() -> R {
     let all = irq::sets();
     if all.is_empty() {
-        return ktest::skip("no MSI/MSI-X set allocated (drivers still polled)");
+        return ktest::fail("no MSI/MSI-X set allocated (drivers still polled)");
     }
     for (at, name, mode, stats) in all {
         check_device(at, mode, stats.len()).map_err(|e| format!("{name}: {e}"))?;
@@ -234,7 +234,7 @@ fn msi_refused() -> R {
         }
     }
     if tried == 0 {
-        return ktest::skip("no mass storage function and no idle MSI-capable function");
+        return ktest::fail("no mass storage function and no idle MSI-capable function");
     }
     // Untouched functions (R8d), if this machine has one (the Mini-PC's WLAN).
     for n in crate::tree().into_iter().filter(|n| n.untouched.is_some()) {
@@ -246,7 +246,7 @@ fn msi_refused() -> R {
 
 /// edu: one MSI, raised by an MMIO write; the handle's thread wakes; mask in software; teardown.
 fn msi_edu() -> R {
-    let Some(n) = spare_ids(EDU) else { return ktest::skip("no driverless edu (host/tests/pc/50-msi.sh adds one)") };
+    let Some(n) = spare_ids(EDU) else { return ktest::fail("no driverless edu (host/tests/pc/50-msi.sh adds one)") };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
     let io = bar0(&f)?;
@@ -286,7 +286,7 @@ fn msi_edu() -> R {
 /// edu storm: far more raises than the limit allows; the guard switches MSI off (no mask bits), logs,
 /// holds, switches it on again; the owner's waits turn into `Poll` meanwhile.
 fn msi_edu_storm() -> R {
-    let Some(n) = spare_ids(EDU) else { return ktest::skip("no driverless edu (host/tests/pc/50-msi.sh adds one)") };
+    let Some(n) = spare_ids(EDU) else { return ktest::fail("no driverless edu (host/tests/pc/50-msi.sh adds one)") };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
     let io = bar0(&f)?;
@@ -347,7 +347,7 @@ fn e1000e_quiet(io: &IoMem) {
 /// e1000e MSI-X: three entries spread over the CPUs, each delivered on its own vector and CPU; masking holds
 /// the message pending in the PBA until the unmask; affinity re-aims an entry; teardown.
 fn msi_msix() -> R {
-    let Some(n) = spare_ids(E1000E) else { return ktest::skip("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
+    let Some(n) = spare_ids(E1000E) else { return ktest::fail("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
     let io = bar0(&f)?;
@@ -414,7 +414,7 @@ fn msi_msix() -> R {
 
 /// e1000e with MSI only: one message, delivered.
 fn msi_e1000e_msi() -> R {
-    let Some(n) = spare_ids(E1000E) else { return ktest::skip("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
+    let Some(n) = spare_ids(E1000E) else { return ktest::fail("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
     let io = bar0(&f)?;
@@ -439,7 +439,7 @@ fn msi_e1000e_msi() -> R {
 fn msi_fake_storm() -> R {
     let msix_spare = || spare(|n| n.vendor == VIRTIO_VENDOR && n.cap(crate::caps::id::MSIX).is_some()).into_iter().next();
     let Some(n) = spare_ids(E1000E).or_else(msix_spare) else {
-        return ktest::skip("no driverless MSI-X function (host/tests/pc/50-msi.sh adds one)");
+        return ktest::fail("no driverless MSI-X function (host/tests/pc/50-msi.sh adds one)");
     };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
@@ -473,7 +473,7 @@ fn msi_fake_storm() -> R {
 /// `disable_device` (Quiesce, remove) switches MSI-X off and frees the vectors; the driver's set answers
 /// `Released`; enable again, allocate again.
 fn msi_disable_device() -> R {
-    let Some(n) = spare_ids(E1000E) else { return ktest::skip("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
+    let Some(n) = spare_ids(E1000E) else { return ktest::fail("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
     let set = f.alloc_irqs(&IrqRequest::new("ktest-quiesce", 2, 2).modes(true, false, false)).map_err(|e| format!("{e}"))?;
@@ -501,7 +501,7 @@ fn msi_disable_device() -> R {
 /// `restore_config` after a lost MSI-X state (control cleared, entries zeroed as after a function reset):
 /// written back, delivered again.
 fn msi_restore() -> R {
-    let Some(n) = spare_ids(E1000E) else { return ktest::skip("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
+    let Some(n) = spare_ids(E1000E) else { return ktest::fail("no driverless e1000e (host/tests/pc/50-msi.sh adds one)") };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
     let io = bar0(&f)?;
@@ -535,7 +535,7 @@ fn msi_restore() -> R {
 /// No MSI capability: the polled fallback (no vector, INTx off, `wait` gives `Poll` every `poll_ns`); with
 /// polling not allowed the request is refused.
 fn msi_polled() -> R {
-    let Some(n) = spare_ids(PCI_TESTDEV) else { return ktest::skip("no driverless pci-testdev") };
+    let Some(n) = spare_ids(PCI_TESTDEV) else { return ktest::fail("no driverless pci-testdev") };
     let f = n.function();
     kassert!(f.msi_cap == 0 && f.msix_cap == 0, "pci-testdev has MSI now?");
     f.enable_device(true).map_err(|e| format!("{e}"))?;
@@ -556,7 +556,7 @@ fn msi_polled() -> R {
 /// programmed, masks and affinity visible in the table, teardown.
 fn msi_virtio() -> R {
     let Some(n) = spare(|n| n.vendor == VIRTIO_VENDOR && n.cap(crate::caps::id::MSIX).is_some()).into_iter().next() else {
-        return ktest::skip("no driverless virtio function with MSI-X (host/tests/pc/50-msi.sh adds virtio-rng-pci)");
+        return ktest::fail("no driverless virtio function with MSI-X (host/tests/pc/50-msi.sh adds virtio-rng-pci)");
     };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;
@@ -595,7 +595,7 @@ fn msi_firmware_off() -> R {
     // Not mass storage (R8a refuses it before the firmware check) and not a bridge (its MSI is the port's).
     let usable = |n: &Node| !matches!(n.class >> 16, 0x01 | 0x06) && (n.cap(crate::caps::id::MSIX).is_some() || n.cap(crate::caps::id::MSI).is_some());
     let Some(n) = spare(usable).into_iter().next() else {
-        return ktest::skip("no driverless function with MSI or MSI-X (host/tests/pc/50-msi.sh adds them)");
+        return ktest::fail("no driverless function with MSI or MSI-X (host/tests/pc/50-msi.sh adds them)");
     };
     let f = n.function();
     f.enable_device(true).map_err(|e| format!("{e}"))?;

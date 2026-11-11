@@ -110,8 +110,7 @@ impl KernelStack {
     /// allocator: the paging soundness rule), `alloc_table` frames for page tables; `free_frame` takes a stack
     /// frame back, `release(base)` the range, both once the retired stack is reaped. On `Retired` the pages mapped
     /// so far are retired and hal releases the range later (see `StackError::Retired`); on every other error
-    /// nothing was ever mapped and the range stays the caller's. Callers serialise `map` calls that may create
-    /// the same page table (sched's stack pool lock): `paging::map_4k` itself does not.
+    /// nothing was ever mapped and the range stays the caller's.
     pub fn map(
         base: u64,
         guard_pages: u64,

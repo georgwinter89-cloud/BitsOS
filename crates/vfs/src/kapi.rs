@@ -235,7 +235,12 @@ impl MountNs {
     }
 
     pub fn create_proc(&self, path: &str, render: fn() -> String) -> Result<Arc<Dentry>, Errno> {
-        self.kernel_create(path.as_bytes(), uapi::S_IFREG | 0o444, |_| Data::Proc(render))
+        self.create_proc_mode(path, render, 0o444)
+    }
+
+    /// `create_proc` with the permission bits given (only 0o7777 of `mode` is used).
+    pub fn create_proc_mode(&self, path: &str, render: fn() -> String, mode: u32) -> Result<Arc<Dentry>, Errno> {
+        self.kernel_create(path.as_bytes(), uapi::S_IFREG | (mode & 0o7777), |_| Data::Proc(render))
     }
 
     /// A whole file (at most `max` bytes; EFBIG if it is longer). Files whose size says nothing (proc, sysfs,

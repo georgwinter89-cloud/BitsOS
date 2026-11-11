@@ -33,6 +33,11 @@ impl VaSpace {
         VaSpace { lo, hi, free }
     }
 
+    /// Room for `n` free ranges without growing: false when the heap has none.
+    pub fn reserve_room(&mut self, n: usize) -> bool {
+        self.free.try_reserve(n.saturating_sub(self.free.len())).is_ok()
+    }
+
     /// Index of the free range starting at or below `a`.
     fn at_or_below(&self, a: u64) -> Option<usize> {
         self.free.partition_point(|r| r.0 <= a).checked_sub(1)

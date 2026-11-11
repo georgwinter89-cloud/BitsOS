@@ -75,7 +75,7 @@ impl Balance {
 fn objects() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let r = (|| -> TestResult {
@@ -108,11 +108,11 @@ fn objects() -> TestResult {
         r.and_then(|()| before.check())
     })
 }
-ktest!("dr.gem.objects", Safe, objects);
+ktest!("dr.gem.objects", QemuAll, objects);
 
 fn prime() -> TestResult {
     with_dev!(d, {
-        let Some(fake) = d.dev.driver().as_fake() else { return ktest::skip("not the fake GPU") };
+        let Some(fake) = d.dev.driver().as_fake() else { return ktest::fail("not the fake GPU") };
         let before = Balance::now();
         let r = (|| -> TestResult {
             let fds = Arc::new(FdTable::new());
@@ -152,13 +152,13 @@ fn prime() -> TestResult {
         r.and_then(|()| before.check())
     })
 }
-ktest!("dr.gem.prime", Safe, prime);
+ktest!("dr.gem.prime", QemuAll, prime);
 
 /// Carve-outs of 512 MiB and 8 GiB on a second fake (no node): usage, the fall-back to GTT when it is full.
 fn carveouts() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         for carve in [512u64 << 20, 8 << 30] {
@@ -182,7 +182,7 @@ fn carveouts() -> TestResult {
         before.check()
     })
 }
-ktest!("dr.gem.carveouts", Safe, carveouts);
+ktest!("dr.gem.carveouts", QemuAll, carveouts);
 
 /// Until CR-DR6-1: the file's mapping view (`File::device_map`) holds the memory of every object it was built
 /// with until it goes, and a file without objects gets a view too (it refuses every range: EINVAL as Linux,
@@ -190,7 +190,7 @@ ktest!("dr.gem.carveouts", Safe, carveouts);
 fn view() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let r = (|| -> TestResult {
@@ -216,14 +216,14 @@ fn view() -> TestResult {
         r.and_then(|()| before.check())
     })
 }
-ktest!("dr.gem.view", Safe, view);
+ktest!("dr.gem.view", QemuAll, view);
 
 /// QemuOnly (it lowers the system's pin and commit limits for a moment): GTT objects are pinned pages, so a
 /// create past the pin limit or the strict commit answers ENOMEM and leaves no frame, object or pin charge.
 fn pin_limit() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let pinned = mm::dma_pages::stats().pinned_pages;
@@ -267,11 +267,11 @@ const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-gem
 /// The ABI program on V2: every line as on CachyOS.
 fn program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let out = proc::stdio::Capture::new(1 << 16);
@@ -294,4 +294,4 @@ fn program() -> TestResult {
         before.check()
     })
 }
-ktest!("dr.gem.program", Safe, program);
+ktest!("dr.gem.program", QemuAll, program);

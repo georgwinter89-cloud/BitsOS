@@ -68,6 +68,7 @@ impl App {
                 }
             }
             Spot::Chrome(Part::Ring) => self.act(Action::Sidebar),
+            Spot::Chrome(Part::Programs) => self.library_toggle("Programme button"),
             // WY-5c: the fold button folds a docked list and pins a revealed one; the top bar's button docks it.
             Spot::Chrome(Part::WsFold | Part::WsButton) => self.act(Action::Workspaces),
             // No tab has a history yet (the address layer comes later): the buttons are shown as not available.

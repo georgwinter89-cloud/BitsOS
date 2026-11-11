@@ -1,0 +1,1 @@
+abi-pfcalls idsns: SX: a user namespace's root with a mapped owner has no CAP_DAC_OVERRIDE in Inode::permission (only fsuid 0 passes; capable_wrt_inode_uidgid is not modelled); older than PF-7, plan/notes/fs-PF-7.md

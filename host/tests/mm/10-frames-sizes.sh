@@ -10,11 +10,14 @@ cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/mm-10-frames-sizes}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
-TESTS="mm.,contract.frame_alloc,contract.global_alloc,contract.dma_pool"
+# The reclaim tests are for small RAM: their run is 60-reclaim.sh and the 2G gate.
+TESTS="mm.,-mm.reclaim.dirty_pressure,-mm.reclaim.mapped_exec,-mm.reclaim.pressure,contract.frame_alloc,contract.global_alloc,contract.dma_pool"
 
 run() { # $1 = name, $2 = memory
     local log="$RUN_DIR/$1.log"
-    cargo xtask image --name "$1" --ktest --config-extra "ktest=$TESTS;loglevel=info"
+    local filter="$TESTS"
+    [ "$2" = 6G ] || filter="$TESTS,-mm.frames.normal_above_4g" # only 6G has RAM above 4 GiB
+    cargo xtask image --name "$1" --ktest --config-extra "ktest=$filter;loglevel=info"
     cargo xtask qemu --name "$1" --mem "$2" --timeout 120 --serial-log "$log" || true
     grep -a "KTEST\|frames.init\|ktest.frames\|paging.switched\|ktest.direct_map" "$log" || true
     grep -aq "KTEST done passed=[0-9]* failed=0" "$log" || { echo "RED: $1 ($2) not green"; return 1; }

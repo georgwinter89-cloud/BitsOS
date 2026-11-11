@@ -15,7 +15,8 @@ def read_ppm(path):
     parts = data.split(maxsplit=4)
     assert parts[0] == b"P6"
     w, h = int(parts[1]), int(parts[2])
-    return w, h, parts[4]
+    # From the end: split would also take a first pixel that reads as white space.
+    return w, h, data[-w * h * 3:]
 
 
 def glyph(img, x0, y0, box, ch, inner=False):

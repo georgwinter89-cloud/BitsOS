@@ -15,6 +15,11 @@ GPU_TOL=
 if [ "${WY_GPU:-0}" = 1 ] || [ "${WY_GPU:-0}" = gles ]; then
     if [ "$WY_GPU" = gles ]; then _build=gles _r=gles _over="build gpu, renderer gles"; else _build=gpu _r=pixman _over="build gpu"; fi
     _stage=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+    if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$_stage" ]; then
+        # A worktree has no out/: the manifest's `tree mesa`, as dr/20 does; an empty answer keeps the path above.
+        _m=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' "$ROOT/user/packaging/manifest.txt")
+        [ -z "$_m" ] || _stage=$_m
+    fi
     if [ ! -f "$_stage/lib/ld-linux-x86-64.so.2" ]; then
         _stage=$CARGO_TARGET_DIR/wy-mesa-out/mesa
         [ -f "$_stage/lib/ld-linux-x86-64.so.2" ] || MESA_OUT=$CARGO_TARGET_DIR/wy-mesa-out \

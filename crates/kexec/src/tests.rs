@@ -521,6 +521,10 @@ fn reload_config_takes_the_stick_file_with_its_guards() {
     // A guarded key added where the boot had none: dropped.
     let (c, o) = choose_config(b"a=1\n", t(b"a=2\nstick_write=on\n"));
     assert_eq!((c.as_deref(), o), (Some(&b"a=2\n# reload: these keys stay as at boot until the next firmware start\n"[..]), Outcome::KeptKeys(vec!["stick_write"])));
+    // NV-2p: `bitsdisk` added the window's key since the boot: /data moves only at a real restart.
+    let (c, o) = choose_config(b"a=1\n", t(b"a=1\nnvme_data=ser,guid,2048,4096\n"));
+    assert_eq!(o, Outcome::KeptKeys(vec!["nvme_data"]));
+    assert_eq!(effective(&c.unwrap(), "nvme_data"), None);
     // The profile is bitsboot's choice at the firmware start.
     let (c, o) = choose_config(b"a=1\n", t(b"a=1\nprofile=gaming-pc\nb=2"));
     assert_eq!(o, Outcome::KeptKeys(vec!["profile"]));

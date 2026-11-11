@@ -11,6 +11,11 @@
 //!
 //! The phase is in `phase()` and, for user space, one line in `/run/bitsos/data-state` (`describe`).
 //!
+//! NV-2p (Georg 5.11.): with a checked window into the Windows SSD (`block::gpt::window`, CONFIG `nvme_write=on` and
+//! `nvme_data=`) the bitsvol pool on that partition is /data, the same stack as ever; the stick's `data.img` is
+//! then mounted read-only at /stickdata, never made, changed or removed. No window, a refused one or a partition
+//! without a usable pool: everything as below, with a Warn. /data never formats anything at boot (`bitsdisk` does).
+//!
 //! CONFIG `data_img_mb=` sets the size of a new image (default 2048, 32..4095: FAT32 files stay below 4 GiB);
 //! `data_img_mb=0` turns `/data` off.
 
@@ -19,7 +24,7 @@ use crate::imgblk::{BlockDev, ImageBlock};
 use crate::mkfs::{self, MkfsOptions};
 use crate::vol::Options;
 use alloc::sync::Arc;
-use bitsvol::{Config, Pool, PoolHandle};
+use bitsvol::{Config, Pool, PoolHandle, VolError};
 use devmodel::block::BlockDevice;
 use ksync::SpinLock;
 use vfs::inode::Cred;
@@ -30,6 +35,8 @@ use vfs::pagecache::SyncKind;
 pub const IMAGE: &str = "/boot/BITSOS2/data.img";
 const TEMP: &str = "/boot/BITSOS2/data.img.new";
 pub const AT: &str = "/data";
+/// Where the stick's image is mounted read-only while /data lies on the SSD.
+pub const STICK_AT: &str = "/stickdata";
 pub const VOLUME: &str = "data";
 const DEFAULT_MB: u64 = 2048;
 const MIN_MB: u64 = 32;
@@ -40,6 +47,9 @@ const KEEP_FREE: u64 = 512 << 20;
 const GROW_STEP: u64 = 16 << 20;
 /// How long the thread waits for the stick (USB enumerates and settles after the kernel starts).
 const STICK_WAIT_MS: u64 = 120_000;
+/// How long /data waits for the NVMe driver's word on a window before it goes on without (controllers bring their
+/// namespaces up within seconds; CAP.TO may allow more, the machine must still come up).
+const WINDOW_WAIT_MS: u64 = 60_000;
 pub const UID: u32 = 1000;
 
 /// Where the boot mount stands (ktests, MCP checks through the events).
@@ -126,6 +136,30 @@ pub fn format_pool(dev: Arc<dyn BlockDevice>, label: &[u8]) -> Result<(), i64> {
     Ok(())
 }
 
+/// What a device with this BitsOS pool's signature holds (bitsdisk asks before it would make one again).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PoolLook {
+    /// A pool with the volume "data": never made again.
+    Data,
+    /// No superblock decodes, or a good pool without that volume: a cut in `format_pool` left it, nothing to lose.
+    HalfMade,
+    /// A read error, no memory, damaged metadata: it may hold Georg's data, so it is never taken for empty.
+    Unclear(alloc::string::String),
+}
+
+pub fn look_at_pool(dev: Arc<dyn BlockDevice>) -> PoolLook {
+    let pool = match Pool::open(dev, Config::default()) {
+        Ok(p) => p,
+        Err(VolError::NotFound) => return PoolLook::HalfMade,
+        Err(e) => return PoolLook::Unclear(alloc::format!("{e:?}")),
+    };
+    match pool.list() {
+        Ok(v) if v.iter().any(|v| v.label == VOLUME && !v.snapshot) => PoolLook::Data,
+        Ok(_) => PoolLook::HalfMade,
+        Err(e) => PoolLook::Unclear(alloc::format!("{e:?}")),
+    }
+}
+
 /// Grows `place.temp` to `bytes` (zero-filled), makes the pool and ext4 inside, renames it to `place.image`.
 fn create(ns: &MountNs, place: &Place, bytes: u64) -> Result<(), i64> {
     let c = Ctx::kernel(ns);
@@ -194,27 +228,8 @@ pub fn mount(ns: &MountNs, image: &str, at: &str, writable: bool, pool_name: &st
     let opts = Options { writable, ..Options::default() };
     let dev: Arc<dyn BlockDevice> = Arc::new(ImageBlock::new(pool_name, file, writable).map_err(|_| "the image cannot be opened")?);
     match Pool::open(dev.clone(), Config::default()) {
-        Ok(pool) => {
-            let vols = pool.list().map_err(|_| "the pool's volume list cannot be read")?;
-            let id = vols.iter().find(|v| v.label == VOLUME && !v.snapshot).map(|v| v.id).ok_or("the pool has no volume \"data\"")?;
-            let h = PoolHandle::new(pool, pool_name);
-            let vd = h.open_volume(id).map_err(|_| "the volume cannot be opened")?;
-            let handle = Some((h.clone(), id));
-            let disk = block::register(Arc::new(vd), block::DiskKind::Stacked).map_err(|_| "the volume cannot be registered as a disk")?;
-            let blocks = disk.dev_info().blocks;
-            match crate::mount::mount_disk(disk.clone(), 0, blocks, ns, at, opts) {
-                Ok((vol, m)) => {
-                    m.sb.set_source(&alloc::format!("/dev/mapper/{pool_name}"));
-                    Ok(Mounted { pool: true, vol, disk: Some(disk.name().into()), handle })
-                }
-                Err(e) => {
-                    klog::event!(Warn, "ext4", "data.mount_failed", errno = e, pool = true);
-                    block::unregister(disk.name());
-                    Err("ext4 on the pool's volume does not mount")
-                }
-            }
-        }
-        Err(bitsvol::VolError::NotFound) => {
+        Ok(pool) => mount_pool(pool, ns, at, opts, pool_name),
+        Err(VolError::NotFound) => {
             drop(dev);
             match crate::mount::mount_image(ns, image, at, opts) {
                 Ok((vol, m)) => {
@@ -230,6 +245,28 @@ pub fn mount(ns: &MountNs, image: &str, at: &str, writable: bool, pool_name: &st
         Err(e) => {
             klog::event!(Error, "ext4", "data.pool_unusable", error = alloc::format!("{e:?}").as_str(); "the image is left as it is");
             Err("the pool in the image cannot be opened")
+        }
+    }
+}
+
+/// The pool's volume "data" at `at`, registered as the stacked disk `<pool_name>.v<id>`.
+fn mount_pool(pool: Pool, ns: &MountNs, at: &str, opts: Options, pool_name: &str) -> Result<Mounted, &'static str> {
+    let vols = pool.list().map_err(|_| "the pool's volume list cannot be read")?;
+    let id = vols.iter().find(|v| v.label == VOLUME && !v.snapshot).map(|v| v.id).ok_or("the pool has no volume \"data\"")?;
+    let h = PoolHandle::new(pool, pool_name);
+    let vd = h.open_volume(id).map_err(|_| "the volume cannot be opened")?;
+    let handle = Some((h.clone(), id));
+    let disk = block::register(Arc::new(vd), block::DiskKind::Stacked).map_err(|_| "the volume cannot be registered as a disk")?;
+    let blocks = disk.dev_info().blocks;
+    match crate::mount::mount_disk(disk.clone(), 0, blocks, ns, at, opts) {
+        Ok((vol, m)) => {
+            m.sb.set_source(&alloc::format!("/dev/mapper/{pool_name}"));
+            Ok(Mounted { pool: true, vol, disk: Some(disk.name().into()), handle })
+        }
+        Err(e) => {
+            klog::event!(Warn, "ext4", "data.mount_failed", errno = e, pool = true);
+            block::unregister(disk.name());
+            Err("ext4 on the pool's volume does not mount")
         }
     }
 }
@@ -383,9 +420,101 @@ fn publish(ns: &MountNs, p: Phase) {
     }
 }
 
+/// The stacked disk of the boot's window partition, if there is one to use. Waits (bounded) for the driver's word;
+/// every refusal has been said by the driver or is said here, and /data goes on as if there were no keys.
+fn window_partition() -> Option<alloc::string::String> {
+    use block::gpt::window::{self, Boot, Why};
+    match window::boot_keys() {
+        Ok(_) => {}
+        Err(Why::NoDataKey) => return None,
+        Err(why) => {
+            klog::event!(Warn, "ext4", "data.window_refused", why = why.word(), text = why.text(); "every disk stays read-only, /data stays on the stick's data.img");
+            return None;
+        }
+    }
+    let t0 = ksync::now_ns().unwrap_or(0);
+    let waited = || ksync::now_ns().unwrap_or(u64::MAX).saturating_sub(t0) / 1_000_000;
+    loop {
+        // No controller at all: nothing else tells the driver's verdict.
+        window::look();
+        match window::boot_state() {
+            Boot::Armed { part, .. } => return Some(part),
+            Boot::Refused { word, .. } => {
+                klog::event!(Info, "ext4", "data.window_refused", why = word; "/data stays on the stick's data.img");
+                window::data_went_on();
+                return None;
+            }
+            Boot::Looking => {}
+        }
+        if waited() >= WINDOW_WAIT_MS {
+            klog::event!(Warn, "ext4", "data.window_refused", why = "timeout"; "no word from the NVMe driver: /data stays on the stick's data.img");
+            window::data_went_on();
+            return None;
+        }
+        sched::sleep_ns(20_000_000);
+    }
+}
+
+/// /data on the window's partition, writable, and the user folders. Err: why not (the partition stays as it is; no
+/// repair and no format here, only `bitsdisk` makes a pool).
+pub fn mount_window(ns: &MountNs, part: &str, at: &str, pool_name: &str) -> Result<Mounted, &'static str> {
+    let d = block::find(part).ok_or("the partition is not registered")?;
+    let dev: Arc<dyn BlockDevice> = Arc::new(block::DiskDevice(d));
+    let pool = Pool::open(dev, Config::default()).map_err(|e| {
+        klog::event!(Warn, "ext4", "data.window_pool", part = part, error = alloc::format!("{e:?}").as_str());
+        "the partition holds no usable pool"
+    })?;
+    let m = mount_pool(pool, ns, at, Options { writable: true, ..Options::default() }, pool_name)?;
+    if let Err(e) = user_dirs(ns, at) {
+        klog::event!(Warn, "ext4", "data.dirs_failed", errno = e);
+    }
+    Ok(m)
+}
+
+/// The stick's `data.img` at /stickdata, read-only, for the one move of its contents (host/tests/minipc/data-move.sh).
+/// Its absence or a failure costs nothing but the Warn; nothing is made and nothing removed.
+fn stick_data(ns: &MountNs) {
+    if fs_fat::stick::wait_mounted(STICK_WAIT_MS).is_none() {
+        klog::event!(Info, "ext4", "data.stickdata", state = "no stick");
+        return;
+    }
+    if ns.lookup_path(IMAGE.as_bytes(), true).is_err() {
+        klog::event!(Info, "ext4", "data.stickdata", state = "no data.img");
+        return;
+    }
+    match mount(ns, IMAGE, STICK_AT, false, "stickdata") {
+        Ok(m) => {
+            klog::event!(Info, "ext4", "data.stickdata", state = "mounted", pool = m.pool; "read-only");
+            *STICK_DATA.lock() = Some(m);
+        }
+        Err(why) => klog::event!(Warn, "ext4", "data.stickdata", state = "not mounted", reason = why),
+    }
+}
+
+/// /stickdata is there.
+pub fn stick_data_mounted() -> bool {
+    STICK_DATA.lock().is_some()
+}
+
+/// Keeps /stickdata's volume and pool alive.
+static STICK_DATA: SpinLock<Option<Mounted>> = SpinLock::named("ext4.data.stick", None);
+
 fn run() {
     let ns = vfs::root_ns();
     publish(&ns, Phase::Waiting);
+    if let Some(part) = window_partition() {
+        match mount_window(&ns, &part, AT, VOLUME) {
+            Ok(m) => {
+                let pool = m.pool;
+                *DATA.lock() = Some(m);
+                klog::event!(Info, "ext4", "data.mounted", at = AT, pool = pool, writable = true, created = false, image = part.as_str(); "/data lies on the window partition");
+                publish(&ns, Phase::Mounted { pool, writable: true, created: false });
+                stick_data(&ns);
+                return;
+            }
+            Err(why) => klog::event!(Warn, "ext4", "data.window_unused", part = part.as_str(), reason = why; "/data stays on the stick's data.img"),
+        }
+    }
     let Some(mb) = image_mb(kexec::boot::config("data_img_mb").as_deref()) else {
         klog::event!(Info, "ext4", "data.off"; "data_img_mb=0: no /data");
         publish(&ns, Phase::Skipped("data_img_mb=0"));
@@ -396,6 +525,12 @@ fn run() {
         publish(&ns, Phase::Skipped("no boot stick"));
         return;
     };
+    // data.img is the stick's fallback only: /boot on the NVMe beside a refused or unused window makes none there.
+    if fs_fat::stick::on_nvme() {
+        klog::event!(Warn, "ext4", "data.skipped", reason = "the boot volume is on the NVMe"; "no data.img there: /data needs the nvme_data= window");
+        publish(&ns, Phase::Skipped("boot volume on the NVMe, no window"));
+        return;
+    }
     let rw = fs_fat::stick::last_reason().is_none();
     let free = || fat.statfs().map(|(cb, _, f)| cb * f).unwrap_or(0);
     let (p, m) = bring_up(&ns, &BOOT, rw, mb, &free, &|p| publish(&ns, p));

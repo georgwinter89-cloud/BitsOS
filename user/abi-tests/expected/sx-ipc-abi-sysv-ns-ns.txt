@@ -1,0 +1,27 @@
+semget in first = 0
+shmget in first = 0
+msgget in first = 0
+first: +2 undo = 0
+unshare(CLONE_NEWIPC) = 0
+undo applied in the old one is out of reach: id here = -EINVAL
+key gone = -ENOENT
+key gone = -ENOENT
+key gone = -ENOENT
+semget in second = 0
+attached segment still mapped: yes
+setns back = 0
+first value: undo done by leaving = 5
+first shm key = 0
+old memory: yes
+nattch 2
+first msg key = 0
+first: +3 undo = 0
+setns to second = 0
+second still has its value = 9
+setns nstype wrong = -EINVAL
+setns back = 0
+first: undo went at setns = 5
+clone with CLONE_NEWIPC|CLONE_SYSVSEM = -EINVAL
+child in a new namespace, key = -ENOENT
+child makes a key = 0
+the child's key is not here = -ENOENT

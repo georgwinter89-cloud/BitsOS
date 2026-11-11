@@ -22,9 +22,9 @@ fn pat(i: usize) -> u8 {
 
 fn frame_copies() -> TestResult {
     if !hal::usercopy::stats().fast_path {
-        return ktest::skip("the user-copy fast path is not installed");
+        return ktest::fail("the user-copy fast path is not installed");
     }
-    let Some(frame) = mm_core::PageFrame::new_zeroed() else { return ktest::skip("no frame") };
+    let Some(frame) = mm_core::PageFrame::new_zeroed() else { return ktest::fail("no frame") };
     let data: alloc::vec::Vec<u8> = (0..4096).map(pat).collect();
     kassert!(frame.write(0, &data), "fill the frame");
     let asp = Arc::new(AddressSpace::new().map_err(|e| format!("address space: {e:?}"))?);

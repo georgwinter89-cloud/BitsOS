@@ -144,6 +144,19 @@ fn now_parts(secs: i64) -> (libc::tm, bool) {
     }
 }
 
+/// What `ctl clock` adds to the shown text: whether it is local time, what decided it, and the offset libc answers.
+pub fn zone_report() -> String {
+    let tz = std::env::var("TZ").ok();
+    let (tm, local) = now_parts(epoch_secs());
+    report_text(tz.as_deref(), Path::new("/etc/localtime"), local, tm.tm_gmtoff)
+}
+
+fn report_text(tz: Option<&str>, localtime: &Path, local: bool, gmtoff: i64) -> String {
+    let link = std::fs::read_link(localtime).map_or_else(|e| format!("({e})"), |p| p.display().to_string());
+    let offset = if local { gmtoff / 60 } else { 0 };
+    format!("local={local} tz={} localtime={link} localtime_tzif={} offset_min={offset}", tz.unwrap_or("(unset)"), tzif(localtime))
+}
+
 /// "Di 21.10. · 14:32", with " UTC" when there is no time zone.
 pub fn clock_text(tm: &libc::tm, local: bool) -> String {
     let day = DAYS[tm.tm_wday.clamp(0, 6) as usize];
@@ -310,6 +323,30 @@ mod tests {
         assert!(zone_known(Some("CET-1CEST,M3.5.0,M10.5.0/3"), &no, &zi));
         assert!(!zone_known(Some("garbage"), &no, &zi));
         assert!(zone_known(Some(&d.join("good").to_string_lossy()), &no, &zi));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_clock_report_names_what_decided() {
+        let d = std::env::temp_dir().join(format!("bitscomp-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("zi/Europe")).unwrap();
+        std::fs::write(d.join("zi/Europe/Berlin"), b"TZif2\0\0").unwrap();
+        std::fs::write(d.join("junk"), b"not a zone").unwrap();
+        std::os::unix::fs::symlink("zi/Europe/Berlin", d.join("localtime")).unwrap();
+        std::os::unix::fs::symlink("gone", d.join("dangling")).unwrap();
+        let link = d.join("localtime");
+        // The /etc/localtime path: a link to a zoneinfo file, no TZ.
+        assert!(zone_known(None, &link, &d.join("zi")));
+        assert_eq!(report_text(None, &link, true, 3600), "local=true tz=(unset) localtime=zi/Europe/Berlin localtime_tzif=true offset_min=60");
+        // TZ wins and is named; the link is still reported as it is.
+        assert_eq!(report_text(Some("Asia/Tokyo"), &link, true, 32400), "local=true tz=Asia/Tokyo localtime=zi/Europe/Berlin localtime_tzif=true offset_min=540");
+        // Not local: the offset is 0 whatever libc left in the tm.
+        assert_eq!(report_text(None, &d.join("dangling"), false, 3600), "local=false tz=(unset) localtime=gone localtime_tzif=false offset_min=0");
+        // A plain file and a missing one say why there is no link.
+        assert!(!zone_known(None, &d.join("junk"), &d.join("zi")));
+        assert!(report_text(None, &d.join("junk"), false, 0).contains(" localtime=(") && report_text(None, &d.join("junk"), false, 0).contains("localtime_tzif=false"));
+        assert!(report_text(None, &d.join("none"), false, 0).contains(" localtime=("));
         let _ = std::fs::remove_dir_all(&d);
     }
 

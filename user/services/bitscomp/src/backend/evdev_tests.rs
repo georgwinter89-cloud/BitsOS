@@ -32,11 +32,47 @@ fn classifies_devices() {
     // The MCP pointer: relative and absolute, left button.
     let mcp = Caps::from_bits(&bits(&[BTN_LEFT]), &bits(&[REL_X, REL_Y]), &bits(&[ABS_X, ABS_Y]), Some((r, r)));
     assert!(mcp.rel_xy && mcp.abs.is_some());
-    // A pad: X/Y axes but no left button or touch.
+    // A pad: X/Y axes but no left button or touch: a pad (PK-L1c), never a pointer.
     let pad = Caps::from_bits(&bits(&[0x130]), &bits(&[]), &bits(&[ABS_X, ABS_Y]), Some((r, r)));
-    assert!(!pad.wanted());
+    assert!(pad.pad && !pad.pointer() && pad.wanted());
     // A power button: one key, no letters.
     assert!(!Caps::from_bits(&bits(&[116]), &bits(&[]), &bits(&[]), None).wanted());
+}
+
+/// PK-L1c: the bitmaps a DragonRise (crates/drivers/usb-hid ktests_fake: BTN_TRIGGER..BTN_BASE6, X/Y/Z/RZ, hat),
+/// an Xbox-style BTN_SOUTH pad (crates/console ktests_in6), a mouse and a keyboard report: only the pads are pads,
+/// and no pad is a pointer.
+#[test]
+fn pads_are_pads_and_never_pointers() {
+    let r = Range { min: 0, max: 255 };
+    let dragon = Caps::from_bits(&bits(&(0x120..=0x12b).collect::<Vec<_>>()), &bits(&[]), &bits(&[ABS_X, ABS_Y, 2, 5, 0x10, 0x11]), Some((r, r)));
+    let xbox_keys = [0x130, 0x131, 0x133, 0x134, 0x136, 0x137, 0x13a, 0x13b, 0x13c, 0x13d, 0x13e];
+    let xbox = Caps::from_bits(&bits(&xbox_keys), &bits(&[]), &bits(&[ABS_X, ABS_Y, 2, 3, 4, 5, 0x10, 0x11]), Some((r, r)));
+    for (what, c) in [("dragonrise", &dragon), ("xbox", &xbox)] {
+        assert!(c.pad && !c.pointer() && !c.keyboard && c.wanted(), "{what}: {c:?}");
+    }
+    assert_eq!(codes(&bits(&(0x120..=0x12b).collect::<Vec<_>>())), (0x120..=0x12b).collect::<Vec<u16>>());
+    let m = mouse().caps;
+    assert!(!m.pad && m.pointer());
+    let kb = Caps::from_bits(&bits(&(1..0x100).collect::<Vec<_>>()), &bits(&[]), &bits(&[]), None);
+    assert!(!kb.pad && kb.keyboard);
+    // A joystick button without axes or hat is not a pad (joydev's rule); a touchpad's BTN_TOUCH never is.
+    assert!(!Caps::from_bits(&bits(&[0x120]), &bits(&[]), &bits(&[]), None).wanted());
+    let touch = Caps::from_bits(&bits(&[0x130, BTN_TOUCH]), &bits(&[]), &bits(&[ABS_X, ABS_Y]), Some((r, r)));
+    assert!(!touch.pad);
+    // A hat alone with joystick buttons is enough.
+    assert!(Caps::from_bits(&bits(&[0x120, 0x121]), &bits(&[]), &bits(&[0x10, 0x11]), None).pad);
+    // A racing wheel or flight stick with joystick buttons and joydev's wheel/throttle axis is one too.
+    assert!(Caps::from_bits(&bits(&[0x120, 0x121]), &bits(&[]), &bits(&[8]), None).pad);
+    assert!(Caps::from_bits(&bits(&[0x120, 0x121]), &bits(&[]), &bits(&[6]), None).pad);
+    // Never grabbed: Steam, SDL and games read the pad's node too; keyboards and pointers are grabbed.
+    for (what, c) in [("dragonrise", &dragon), ("xbox", &xbox)] {
+        assert!(!c.grabs(), "{what} would be grabbed");
+    }
+    assert!(m.grabs() && kb.grabs());
+    // A pad's buttons never become mouse buttons or keys in the pointer/keyboard decoder.
+    let mut d = Decoder::new(dragon.clone());
+    assert!(feed(&mut d, &[(EV_KEY, 0x122, 1), (EV_KEY, 0x130, 1), (EV_SYN, SYN_REPORT, 0)]).is_empty());
 }
 
 #[test]

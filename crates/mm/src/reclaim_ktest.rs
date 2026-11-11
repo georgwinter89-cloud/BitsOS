@@ -1,7 +1,7 @@
 //! MM-9 ktests: page-cache reclaim. `setup` and `private` are Safe (rerunnable, they free only their own
 //! file's pages); `pressure` and `mapped_exec` are QemuOnly: they fill the machine's memory with a file's
 //! pages and then ask for more program memory than is free (host/tests/mm/60-reclaim.sh runs them with a small
-//! RAM; on a machine above 2.5 GiB they skip).
+//! RAM; on a machine above 2.5 GiB they fail).
 
 use crate::{AddressSpace, Fill, Prot};
 use alloc::format;
@@ -17,7 +17,7 @@ const MIB: u64 = 1 << 20;
 const MAGIC: u64 = 0x5eed_0000_0000;
 
 /// A device that is not there: every page holds its number at both ends.
-struct Pat {
+pub(crate) struct Pat {
     reads: AtomicU64,
     /// Pages written back (their content is the pattern again: the tests dirty pages by writing it).
     writes: AtomicU64,
@@ -45,13 +45,13 @@ impl Backend for Pat {
     }
 }
 
-fn pattern_file(pages: u64) -> (PageCache, Arc<Pat>) {
+pub(crate) fn pattern_file(pages: u64) -> (PageCache, Arc<Pat>) {
     let b = Arc::new(Pat { reads: AtomicU64::new(0), writes: AtomicU64::new(0) });
     (PageCache::with_backend(b.clone(), pages * P), b)
 }
 
 /// Reads every page of a `pattern_file` and checks both ends.
-fn check_file(c: &PageCache, pages: u64) -> Result<(), String> {
+pub(crate) fn check_file(c: &PageCache, pages: u64) -> Result<(), String> {
     for i in 0..pages {
         let (mut a, mut z) = ([0u8; 8], [0u8; 8]);
         c.read_at(i * P, &mut a).map_err(|e| format!("read page {i}: {e}"))?;
@@ -65,8 +65,9 @@ fn stats() -> mm_core::FrameStats {
     mm_core::frames().map(|f| f.stats()).unwrap_or_default()
 }
 
+/// Free pages a program or the cache can get (not the HighAtomic reserve).
 fn free_pages() -> u64 {
-    stats().free_bytes / P
+    stats().usable_free_bytes() / P
 }
 
 /// The reclaimer is installed, the watermarks and the reserve follow Linux's rules for this machine's RAM, and
@@ -164,7 +165,18 @@ fn check_anon(a: &AddressSpace, m: u64, pages: u64) -> Result<(), String> {
 /// Skips on machines too big for a pressure test (it would fill all their memory).
 fn small_machine() -> Option<TestResult> {
     let total = stats().total_bytes;
-    (total == 0 || total > 5 * (512 * MIB)).then(|| ktest::skip("pressure test for small RAM (60-reclaim.sh, the 2G gate)"))
+    (total == 0 || total > 5 * (512 * MIB)).then(|| ktest::fail("pressure test for small RAM (60-reclaim.sh, the 2G gate)"))
+}
+
+/// Why a pressure test could not start: the numbers that decide between "something still holds committed memory"
+/// and "the file's pages went again while it was read" (a background reclaimer at work).
+fn no_commit_room(free: u64, cached: u64) -> String {
+    format!(
+        "the commit limit leaves no room past the free memory: free {free} pages, file {cached} pages in the cache, room {} (limit {}, committed {})",
+        commit_room(),
+        crate::commit::limit(),
+        crate::commit::committed()
+    )
 }
 
 /// The pages a pressure test may map beyond its file (strict commit: the room left under the limit).
@@ -181,13 +193,17 @@ fn commit_room() -> u64 {
 /// memory drops its address space and file and runs once more (`mm ktest.retry`); two in a row stay red. The
 /// test is QemuOnly (it fills all memory), so no memory-pressure test runs on the Mini-PC.
 fn pressure() -> TestResult {
+    let leaked0 = mm_core::grace::stats().leaked;
     match pressure_once() {
         Err(e) if out_of_memory(&e) => {
             klog::event!(Warn, "mm", "ktest.retry", test = "mm.reclaim.pressure", reason = e.as_str(); "one more try (bounded reclaim under QEMU)");
             pressure_once()
         }
         r => r,
-    }
+    }?;
+    let leaked = mm_core::grace::stats().leaked - leaked0;
+    kassert!(leaked == 0, "the grace queue leaked {leaked} items under pressure");
+    Ok(())
 }
 
 /// A failure of `pressure_once` that says memory ran out (a program page, a file read with ENOMEM, a failed
@@ -204,7 +220,7 @@ fn pressure_once() -> TestResult {
     let free0 = free_pages();
     let margin = w.high + 16 * MIB / P;
     if free0 < margin + 16 * MIB / P {
-        return ktest::skip("too little free memory to start");
+        return ktest::fail("too little free memory to start");
     }
     let (s0, d0) = (vr::stats(), mm_core::reclaim::direct_stats());
     let fails0 = mm_core::report::GLOBAL.alloc_fails.load(Ordering::Relaxed);
@@ -218,7 +234,7 @@ fn pressure_once() -> TestResult {
     kassert!(avail > free1 * P && avail <= free1 * P + vr::file_pages() * P, "MemAvailable {avail} vs free {} + file {}", free1 * P, vr::file_pages() * P);
     let n = (free1 + cached / 2).min(commit_room());
     if n < free1 + 4 * MIB / P {
-        return ktest::skip("the commit limit leaves no room past the free memory");
+        return Err(no_commit_room(free1, c.pages()));
     }
     let (a, m) = anon(n)?;
     let after = c.pages();
@@ -259,7 +275,7 @@ fn mapped_exec() -> TestResult {
         }
         sched::sleep_ms(100);
     }
-    let Some(f) = found else { return ktest::skip("no program file in /boot/BITSOS2/bin (no boot stick)") };
+    let Some(f) = found else { return ktest::fail("no program file in /boot/BITSOS2/bin (no boot stick)") };
     let i = f.inode().ok_or("no inode")?.clone();
     let cache = i.page_cache().ok_or("no page cache")?;
     kassert!(cache.reclaimable(), "a FAT file is reclaimable");
@@ -290,7 +306,7 @@ fn mapped_exec() -> TestResult {
     let free1 = free_pages();
     let n = (free1 + c.pages() / 2).min(commit_room());
     if n < free1 + 4 * MIB / P {
-        return ktest::skip("the commit limit leaves no room past the free memory");
+        return Err(no_commit_room(free1, c.pages()));
     }
     let (b, bm) = anon(n)?;
     let mut again = 0u64;
@@ -357,10 +373,11 @@ fn dirty_pressure() -> TestResult {
     let free0 = free_pages();
     let margin = w.high + 32 * MIB / P;
     if free0 < margin + 32 * MIB / P {
-        return ktest::skip("too little free memory to start");
+        return ktest::fail("too little free memory to start");
     }
     let d0 = mm_core::reclaim::direct_stats();
     let fails0 = mm_core::report::GLOBAL.alloc_fails.load(Ordering::Relaxed);
+    let leaked0 = mm_core::grace::stats().leaked;
     let target = free0 - margin;
     let (c, b) = pattern_file(target);
     check_file(&c, target)?;
@@ -369,7 +386,7 @@ fn dirty_pressure() -> TestResult {
     let free1 = free_pages();
     let n = (free1 + clean / 2).min(commit_room());
     if n < free1 + 4 * MIB / P {
-        return ktest::skip("the commit limit leaves no room past the free memory");
+        return Err(no_commit_room(free1, c.pages()));
     }
     let (a, m) = anon(n)?;
     let d1 = mm_core::reclaim::direct_stats();
@@ -382,9 +399,20 @@ fn dirty_pressure() -> TestResult {
     drop(a);
     c.sync_all(vfs::pagecache::SyncKind::Fsync).map_err(|e| format!("sync: {e}"))?;
     kassert!(b.writes.load(Ordering::Relaxed) == dirty, "{} of {dirty} written back", b.writes.load(Ordering::Relaxed));
+    // The machine's own reclaim may take pages of this file beside the private reclaimer (kcompactd clears a
+    // block for an order noted meanwhile, `vfs::reclaim::reclaim_frame`): every page still goes, each by this call
+    // or counted by the kernel's.
+    let taken0 = vr::stats().pages;
     let held = c.pages();
     let o = Reclaimer::of(&[&c]).shrink(held, Mode::Background, true);
-    kassert!(o.freed == held && c.pages() == 0, "after write-back every page goes: {o:?}");
-    check_file(&c, target)
+    let others = vr::stats().pages - taken0;
+    kassert!(c.pages() == 0 && o.held == 0 && o.dirty == 0 && o.freed <= held && o.freed + others >= held,
+        "after write-back every page goes: held {held}, left {}, the kernel's reclaim took {others} meanwhile, {o:?}", c.pages());
+    check_file(&c, target)?;
+    // PF-7 fixer: index nodes the grace queue had no room for stayed all over memory for good: no free block above
+    // 8 MiB after this test, ENOMEM for the next 9 MiB read.
+    let leaked = mm_core::grace::stats().leaked - leaked0;
+    kassert!(leaked == 0, "the grace queue leaked {leaked} items under pressure");
+    Ok(())
 }
 ktest!("mm.reclaim.dirty_pressure", QemuOnly, dirty_pressure);

@@ -16,8 +16,9 @@
 //!   passes whole with a residue gets its residues ignored from then on (Linux `US_FL_IGNORE_RESIDUE` heuristic);
 //! - an unplugged device ends a command with `Gone` and never gets a reset.
 
-use crate::link::{data_timeout_ns, Cmd, Dir, Link, Ran, CSW_TIMEOUT_NS};
-use crate::scsi::{op, Cdb};
+use crate::escalate::{Escalation, Step};
+use crate::link::{data_timeout_ns, Cmd, Dir, Link, Ran, CBW_TIMEOUT_NS, CSW_TIMEOUT_NS};
+use crate::scsi::{self, op, Cdb};
 use alloc::string::String;
 use alloc::vec::Vec;
 use usb_core::{Buffer, Request, UsbError, XferResult};
@@ -27,12 +28,17 @@ pub const CSW_SIGNATURE: [u8; 4] = *b"USBS";
 /// How long the device gets after a Bulk-Only reset before its endpoints are cleared. Linux waits up to 6 s
 /// (transport.c:1371, a conservative margin for slow bridges); V1 did not wait at all and never needed to.
 pub const RESET_SETTLE_NS: u64 = 100_000_000;
+/// TEST UNIT READY after a reset: its status phase's time (with the CBW's 5 s: Linux's 10 s for that command).
+const ANSWER_CSW_NS: u64 = 5_000_000_000;
 
 klog::counter!(COMMANDS, "usb.msd.commands");
 klog::counter!(TRANSPORT_ERRORS, "usb.msd.transport_errors");
 klog::counter!(PHASE_ERRORS, "usb.msd.phase_errors");
 klog::counter!(RESETS, "usb.msd.resets");
 klog::counter!(RESET_FAILURES, "usb.msd.reset_failures");
+klog::counter!(PORT_RESETS, "usb.msd.port_resets");
+klog::counter!(PORT_RESET_FAILURES, "usb.msd.port_reset_failures");
+klog::counter!(GAVE_UP, "usb.msd.gave_up");
 klog::counter!(STALLS_CLEARED, "usb.msd.stalls_cleared");
 klog::counter!(CSW_RETRIES, "usb.msd.csw_retries");
 klog::counter!(SKIPPED_DATA, "usb.msd.skipped_data_phases");
@@ -158,6 +164,8 @@ pub struct BotStats {
     pub phase_errors: u64,
     pub resets: u64,
     pub reset_failures: u64,
+    pub port_resets: u64,
+    pub port_reset_failures: u64,
     pub stalls_cleared: u64,
     pub csw_retries: u64,
     pub skipped_data: u64,
@@ -173,12 +181,18 @@ pub struct Bot<L: Link> {
     small: Option<Buffer>,
     /// Bumped when the link says its buffers may be held by the controller (`Link::take_poisoned`).
     epoch: u64,
+    /// How far up the ladder of recoveries this device is (`escalate`).
+    esc: Escalation,
+    /// A port reset succeeded and the request under way has not heard of it yet (`take_port_reset`).
+    port_reset_seen: bool,
+    /// A port reset succeeded and no command passed since: a UNIT ATTENTION now is the reset's (`just_reset`).
+    reset_ua: bool,
     pub stats: BotStats,
 }
 
 impl<L: Link> Bot<L> {
     pub fn new(link: L) -> Bot<L> {
-        Bot { link, tag: 0, signature: None, ignore_residue: false, needs_reset: false, small: None, epoch: 0, stats: BotStats::default() }
+        Bot { link, tag: 0, signature: None, ignore_residue: false, needs_reset: false, small: None, epoch: 0, esc: Escalation::default(), port_reset_seen: false, reset_ua: false, stats: BotStats::default() }
     }
 
     /// Changes when buffers handed to the link before may not be used again.
@@ -193,6 +207,39 @@ impl<L: Link> Bot<L> {
     /// A reset recovery is due before the next command (an earlier one failed).
     pub fn needs_reset(&self) -> bool {
         self.needs_reset
+    }
+
+    /// Recoveries are under way, not at their end, and the device has not answered yet: a transport error now is
+    /// worth another attempt. A device that answers after its reset and still fails this one command has a problem
+    /// with this command (a sector its flash hangs on): the command's own attempts are the bound.
+    pub fn recovering(&self) -> bool {
+        self.esc.climbing()
+    }
+
+    /// True once after a port reset: the request's attempts start over (the device was set up anew and will
+    /// answer with a UNIT ATTENTION first; the ladder bounds how often this comes).
+    pub fn take_port_reset(&mut self) -> bool {
+        core::mem::take(&mut self.port_reset_seen)
+    }
+
+    /// A port reset was done and no command has passed since.
+    pub fn just_reset(&self) -> bool {
+        self.reset_ua
+    }
+
+    /// The device is not known to be well: reset recovery is due or something was tried since the last command
+    /// that passed.
+    pub fn unhealthy(&self) -> bool {
+        self.needs_reset || self.esc.dirty()
+    }
+
+    /// A command passed. Only one that reached the medium proves the device well; only one that is not itself about
+    /// the attention ends the reset's aftermath.
+    fn passed(&mut self, o: &Op) {
+        if op::reaches_medium(o.cdb.opcode()) {
+            self.esc.clean();
+        }
+        self.reset_ua &= o.cdb.opcode() == op::REQUEST_SENSE;
     }
 
     fn name(&self) -> String {
@@ -246,6 +293,7 @@ impl<L: Link> Bot<L> {
         for (i, r) in ran.iter().enumerate().take(cmds.len()) {
             let c = &cmds[i];
             if clean(c, r) {
+                self.passed(&ops[i]);
                 self.signature.get_or_insert(CSW_SIGNATURE);
                 out.push(Ok(Outcome { passed: true, moved: c.data_len(), residue: 0 }));
             } else {
@@ -409,6 +457,9 @@ impl<L: Link> Bot<L> {
             residue = 0;
         }
         let residue = residue.max((len - moved) as u32);
+        if s.status == 0 {
+            self.passed(op);
+        }
         Ok(Outcome { passed: s.status == 0, moved, residue })
     }
 
@@ -433,32 +484,133 @@ impl<L: Link> Bot<L> {
         }
     }
 
-    /// Reset recovery (BOT 5.3.4): whatever is queued cancelled, Bulk-Only Mass Storage Reset, a short settle,
-    /// both bulk endpoints' halts cleared (toggle 0 on both sides). Stays due when a step fails.
+    /// What a device gets that stopped answering (`escalate`): the next rung up. A rung counts only if the device
+    /// answers after it (`answers`), else it is on up at once. Stays due when none worked (`Bot::run` tries again
+    /// before the next command). Whatever is queued is cancelled first; the data of a request survives: it goes again
+    /// after this (`disk.rs`).
     pub fn reset_recovery(&mut self) -> Result<(), BotError> {
         self.needs_reset = true;
         self.stats.resets += 1;
         RESETS.inc();
+        let answered_before = self.esc.answering();
+        loop {
+            match self.esc.next(self.link.now_ns()) {
+                Step::BotReset => match self.bot_reset() {
+                    Ok(()) if self.answers() => return self.recovered(),
+                    Ok(()) if self.link.gone() => return Err(BotError::Gone),
+                    Ok(()) => klog::event!(Warn, "usb", "msd.reset_no_answer", device = self.name(); "Bulk-Only reset done, the device does not answer; a port reset follows"),
+                    Err(e) if e == UsbError::Gone || self.link.gone() => return Err(BotError::Gone),
+                    Err(e) => {
+                        self.stats.reset_failures += 1;
+                        RESET_FAILURES.inc();
+                        klog::event!(Warn, "usb", "msd.reset_failed", device = self.name(), error = e.as_str(); "Bulk-Only reset failed; a port reset follows");
+                    }
+                },
+                Step::PortReset { pause_ns, power, wait_ns } => {
+                    self.link.abort_all();
+                    if pause_ns > 0 {
+                        self.link.sleep_ns(pause_ns);
+                    }
+                    match self.port_reset_now(power, wait_ns) {
+                        Ok(()) => {
+                            // A device that had answered before this reset gets no new attempts for its command.
+                            self.port_reset_seen = !answered_before;
+                            if self.answers() {
+                                return self.recovered();
+                            }
+                            if self.link.gone() {
+                                return Err(BotError::Gone);
+                            }
+                            klog::event!(Warn, "usb", "msd.reset_no_answer", device = self.name(), power = power; "port reset done, the device does not answer");
+                        }
+                        Err(e) if e == UsbError::Gone || self.link.gone() => return Err(BotError::Gone),
+                        Err(UsbError::Invalid(why)) => {
+                            klog::event!(Warn, "usb", "msd.port_reset_impossible", device = self.name(), why = why);
+                            self.esc.no_port_reset();
+                        }
+                        Err(e) => {
+                            self.stats.port_reset_failures += 1;
+                            PORT_RESET_FAILURES.inc();
+                            klog::event!(Warn, "usb", "msd.port_reset_failed", device = self.name(), error = e.as_str());
+                        }
+                    }
+                }
+                Step::GiveUp => return Err(self.give_up()),
+            }
+        }
+    }
+
+    /// One TEST UNIT READY after a reset: does a command get through (a sense is an answer too)? Linux's error handler
+    /// asks the same (`scsi_eh_tur`, 10 s). It tells a device still wedged from one that hangs on one sector; it changes
+    /// nothing else here (a sense it leaves behind goes with the next command).
+    fn answers(&mut self) -> bool {
+        self.tag = self.tag.wrapping_add(1);
+        let tag = self.tag;
+        let Ok(buf) = self.small() else { return false };
+        if !buf.write(0, &cbw(tag, 0, Dir::None, 0, &scsi::test_unit_ready())) {
+            return false;
+        }
+        let r = self.link.bulk(false, Request::new(buf.clone(), 0, 31), CBW_TIMEOUT_NS);
+        if r.error.is_some() || r.actual != 31 {
+            return false;
+        }
+        let r = self.link.bulk(true, Request::new(buf.clone(), 32, 13), ANSWER_CSW_NS);
+        let mut b = [0u8; 13];
+        if r.error.is_some() || r.actual != 13 || !buf.read(32, &mut b) {
+            return false;
+        }
+        let s = Csw::parse(&b);
+        s.tag == tag && s.status <= 1
+    }
+
+    /// One port reset in place, and what the commands after it have to know (`take_port_reset`, `just_reset`).
+    pub fn port_reset_now(&mut self, power: bool, wait_ns: u64) -> Result<(), UsbError> {
+        klog::event!(Warn, "usb", "msd.port_reset", device = self.name(), power = power; "resetting the device's port; the disk stays");
+        self.link.port_reset(power, wait_ns)?;
+        self.stats.port_resets += 1;
+        PORT_RESETS.inc();
+        self.port_reset_seen = true;
+        self.reset_ua = true;
+        Ok(())
+    }
+
+    /// Reset recovery is due before the next command, as after a failure (ktests).
+    pub fn mark_reset_due(&mut self) {
+        self.needs_reset = true;
+    }
+
+    fn recovered(&mut self) -> Result<(), BotError> {
+        self.esc.answered();
+        self.needs_reset = false;
+        klog::event!(Info, "usb", "msd.reset", device = self.name(), resets = self.stats.resets, port_resets = self.stats.port_resets; "reset recovery done");
+        Ok(())
+    }
+
+    /// Bulk-Only Mass Storage Reset (BOT 5.3.4), a short settle, both bulk endpoints' halts cleared (toggle 0 on
+    /// both sides).
+    fn bot_reset(&mut self) -> Result<(), UsbError> {
         self.link.abort_all();
-        let r = self.link.bot_reset().and_then(|_| {
+        self.link.bot_reset().and_then(|_| {
             self.link.sleep_ns(RESET_SETTLE_NS);
             let a = self.link.clear_halt(true);
             let b = self.link.clear_halt(false);
             a.and(b)
-        });
-        match r {
-            Ok(()) => {
-                self.needs_reset = false;
-                klog::event!(Info, "usb", "msd.reset", device = self.name(), resets = self.stats.resets; "reset recovery done");
-                Ok(())
-            }
-            Err(e) if e == UsbError::Gone || self.link.gone() => Err(BotError::Gone),
-            Err(e) => {
-                self.stats.reset_failures += 1;
-                RESET_FAILURES.inc();
-                klog::event!(Error, "usb", "msd.reset_failed", device = self.name(), error = e.as_str(); "reset recovery failed; tried again before the next command");
-                Err(BotError::ResetFailed)
-            }
+        })
+    }
+
+    fn give_up(&mut self) -> BotError {
+        if self.esc.has_given_up() {
+            return BotError::ResetFailed;
         }
+        let will_go = self.link.give_up();
+        GAVE_UP.inc();
+        klog::event!(Error, "usb", "msd.gave_up", device = self.name(), will_detach = will_go, resets = self.stats.resets,
+            port_resets = self.stats.port_resets; "no recovery worked");
+        if will_go {
+            self.esc.gave_up();
+        } else {
+            self.esc.clean();
+        }
+        BotError::ResetFailed
     }
 }

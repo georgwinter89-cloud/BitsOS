@@ -203,7 +203,7 @@ fn vendor_paths() -> R {
     let deadline = v.has("tsc_deadline_timer");
     let cfg = time::lapic::config();
     if cfg == time::lapic::Config::Poll {
-        return ktest::skip("hrtimer=poll: no LAPIC timers to check");
+        return ktest::fail("hrtimer=poll: no LAPIC timers to check");
     }
     for c in 0..hal::percpu::cpu_count() {
         let Some(kind) = time::lapic::cpu_stats(c).and_then(|s| s.kind) else { continue };

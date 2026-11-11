@@ -5,10 +5,12 @@ host's key from the key store pair.mjs made (client.key, client.crt), the Mini-P
 plain HTTP carries only the pairing, so every helper that calls the real Mini-PC (host/tests/nw/lan_rate.py)
 goes through here.
 
-As a module: store_of(tls, token_file), call(hostport, token, name, args, timeout, tls=None, token_file=None).
+As a module: store_of(tls, token_file), call(hostport, token, name, args, timeout, tls=None, token_file=None),
+call_full (the same, with the answer's images).
 As a command (for a quick look and the self-check in 05-desk-tools.sh):
   mcp_tls.py <host:port> <tool> [json] --tls DIR|auto [--token-file F]   (token: BITSOS_TOKEN or the file)
 Exit 0 answer, 1 the tool's error, 2 not asked (pin, store, unreachable)."""
+import base64
 import http.client
 import json
 import os
@@ -68,6 +70,12 @@ class Pinned(http.client.HTTPSConnection):
 
 def call(hostport, token, name, args=None, timeout=330, tls=None, token_file=None):
     """One tools/call -> (isError, text). tls None: plain HTTP (QEMU's kernel server); else a store or auto."""
+    err, text, _ = call_full(hostport, token, name, args, timeout, tls, token_file)
+    return err, text
+
+
+def call_full(hostport, token, name, args=None, timeout=330, tls=None, token_file=None):
+    """`call`, with the answer's images: (isError, text, [png bytes])."""
     host, port = hostport.rsplit(":", 1)
     if tls:
         c = Pinned(host, int(port), store_of(tls, token_file), timeout)
@@ -86,7 +94,8 @@ def call(hostport, token, name, args=None, timeout=330, tls=None, token_file=Non
         if "result" not in j:
             raise ValueError(f"{j}")
         text = "\n".join(i.get("text", "") for i in j["result"]["content"] if i["type"] == "text")
-        return j["result"]["isError"], text
+        images = [base64.b64decode(i["data"]) for i in j["result"]["content"] if i["type"] == "image"]
+        return j["result"].get("isError", False), text, images
     finally:
         c.close()
 

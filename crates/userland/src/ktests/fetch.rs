@@ -70,7 +70,7 @@ fn bundle() -> TestResult {
     need("/bin/fetch")?;
     let path = "/etc/ssl/certs/ca-certificates.crt";
     if !exists(path) {
-        return ktest::skip("no /etc/ssl/certs/ca-certificates.crt in this image (change request UL-4a CR1: xtask copies CachyOS's bundle)");
+        return ktest::fail("no /etc/ssl/certs/ca-certificates.crt in this image (change request UL-4a CR1: xtask copies CachyOS's bundle)");
     }
     let d = scratch_dir("fetch-bundle")?;
     let out = format!("{d}/x");
@@ -83,7 +83,7 @@ fn bundle() -> TestResult {
 }
 ktest!("ul.fetch.bundle", Safe, bundle);
 
-/// Gets the partner's CA files and the blob's hash over plain HTTP. `Ok(None)`: no partner (skip). Waits while
+/// Gets the partner's CA files and the blob's hash over plain HTTP. `Ok(None)`: no partner (fail). Waits while
 /// the network is still coming up ("unreachable"), at most 30 s.
 fn bootstrap(d: &str) -> Result<Option<String>, String> {
     let end = time::now_ns() + 30 * SEC;
@@ -167,7 +167,7 @@ fn cases() -> TestResult {
     let d = scratch_dir("fetch-cases")?;
     let r = (|| -> TestResult {
         let Some(sha) = bootstrap(&d)? else {
-            return ktest::skip("no fetch partner at 10.0.2.2:28541 (host/tests/ul/31-fetch-qemu.sh starts host/tests/ul/fetch_server.py)");
+            return ktest::fail("no fetch partner at 10.0.2.2:28541 (host/tests/ul/31-fetch-qemu.sh starts host/tests/ul/fetch_server.py)");
         };
         let mut bad = Vec::new();
         let mut n = 0;
@@ -192,4 +192,4 @@ fn cases() -> TestResult {
     let _ = vfs::root_ns().remove_tree(&d);
     r
 }
-ktest!("ul.fetch.cases", Safe, cases);
+ktest!("ul.fetch.cases", Run("ul/31-fetch-qemu"), cases);

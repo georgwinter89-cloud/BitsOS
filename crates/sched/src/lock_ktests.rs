@@ -13,10 +13,10 @@ use ktest::{kassert, ktest};
 
 type R = ktest::TestResult;
 
-ktest!("sc.locks.order_injected", Safe, order_injected);
-ktest!("sc.locks.inversion_injected", Safe, inversion_injected);
-ktest!("sc.locks.sleep_under_spin_injected", Safe, sleep_under_spin_injected);
-ktest!("sc.locks.per_thread_held", Safe, per_thread_held);
+ktest!("sc.locks.order_injected", QemuOnly, order_injected);
+ktest!("sc.locks.inversion_injected", QemuOnly, inversion_injected);
+ktest!("sc.locks.sleep_under_spin_injected", QemuOnly, sleep_under_spin_injected);
+ktest!("sc.locks.per_thread_held", QemuOnly, per_thread_held);
 ktest!("sc.locks.mutex_contention", Safe, mutex_contention);
 ktest!("sc.locks.timeouts", Safe, timeouts);
 ktest!("sc.locks.wakeups_irq_on", Safe, wakeups_irq_on);
@@ -34,7 +34,7 @@ fn join(h: &JoinHandle, what: &str) -> R {
 }
 
 fn need_checker() -> Option<R> {
-    (!lockdep::enabled()).then(|| ktest::skip("release build: the lock-order checker is off"))
+    (!lockdep::enabled()).then(|| ktest::fail("release build: the lock-order checker is off"))
 }
 
 /// Unexpected count unchanged by `f` (the injected ones are marked, everything else is a bug).
@@ -358,7 +358,7 @@ fn irq_nesting() -> R {
     static A: IrqSpinLock<()> = IrqSpinLock::named("sc.kt.irq_a", ());
     static B: IrqSpinLock<()> = IrqSpinLock::named("sc.kt.irq_b", ());
     if !acpi::irq::enabled() {
-        return ktest::skip("interrupts are not on (no IOAPIC/LAPIC set-up)");
+        return ktest::fail("interrupts are not on (no IOAPIC/LAPIC set-up)");
     }
     OK.store(0, Ordering::Release);
     no_new_unexpected(|| {
@@ -433,7 +433,7 @@ fn irq_depth_per_thread() -> R {
     static LA: IrqSpinLock<()> = IrqSpinLock::named("sc.kt.irqdepth_a", ());
     static LB: IrqSpinLock<()> = IrqSpinLock::named("sc.kt.irqdepth_b", ());
     if !acpi::irq::enabled() {
-        return ktest::skip("interrupts are not on (no IOAPIC/LAPIC set-up)");
+        return ktest::fail("interrupts are not on (no IOAPIC/LAPIC set-up)");
     }
     HELD.store(false, Ordering::Release);
     B_BITS.store(0, Ordering::Release);

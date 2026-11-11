@@ -68,9 +68,9 @@ fn fake_pci_view() -> Arc<dyn DirSource> {
 /// Mounts /dev, /proc, /sys on `ns` with FS's devices and the stand-in providers.
 pub(crate) fn fake_system(ns: &MountNs) -> Populated {
     let files = [
-        ProcFileEntry { path: "/proc/meminfo", render: meminfo },
-        ProcFileEntry { path: "/proc/cpuinfo", render: cpuinfo },
-        ProcFileEntry { path: "/proc/uptime", render: uptime },
+        ProcFileEntry { path: "/proc/meminfo", render: meminfo, mode: 0o444 },
+        ProcFileEntry { path: "/proc/cpuinfo", render: cpuinfo, mode: 0o444 },
+        ProcFileEntry { path: "/proc/uptime", render: uptime, mode: 0o444 },
     ];
     let dirs = [
         ProcDirEntry { path: "/proc", make: fake_self },
@@ -224,7 +224,7 @@ fn registries_and_duplicates() {
         DevNodeEntry { path: "/dev/sub/bar", make: foo },
         DevNodeEntry { path: "/dev/tty0", make: recorder },
     ];
-    let files = [ProcFileEntry { path: "/proc/x", render: render_x }, ProcFileEntry { path: "/sys/kernel/y", render: render_x }];
+    let files = [ProcFileEntry { path: "/proc/x", render: render_x, mode: 0o400 }, ProcFileEntry { path: "/sys/kernel/y", render: render_x, mode: 0o444 }];
     let dirs = [
         ProcDirEntry { path: "/sys/devices", make: dev_a },
         ProcDirEntry { path: "/sys/devices", make: dev_b },
@@ -245,6 +245,8 @@ fn registries_and_duplicates() {
     assert_eq!(ns.lookup_path(b"/sys", true).unwrap().mnt.sb.fstype, "sysfs");
     assert_eq!(ns.read_file("/proc/x", 10).unwrap(), b"x\n");
     assert_eq!(ns.read_file("/sys/kernel/y", 10).unwrap(), b"x\n");
+    assert_eq!(ns.lookup("/proc/x").unwrap().inode.meta.mode() & 0o7777, 0o400, "the owner's mode is kept (pagetypeinfo)");
+    assert_eq!(ns.lookup("/sys/kernel/y").unwrap().inode.meta.mode() & 0o7777, 0o444, "the default mode");
     // Merged: both sources' files, one "system" directory with both sources' names.
     let mut top: Vec<Vec<u8>> = ns.list_dir("/sys/devices").unwrap().into_iter().map(|(n, _)| n).collect();
     top.sort();

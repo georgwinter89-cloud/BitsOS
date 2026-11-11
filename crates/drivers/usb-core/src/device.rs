@@ -11,15 +11,15 @@ use crate::setup::Setup;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
-use ksync::Mutex;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use ksync::{Mutex, SpinLock};
 
 pub struct Device {
     pub id: DeviceId,
     pub(crate) host: Arc<dyn Host>,
     pub slot: HcSlot,
-    /// The USB address the controller assigned.
-    pub address: u8,
+    /// The USB address the controller assigned (a reset in place may change it, `reset.rs`).
+    pub(crate) address: AtomicU8,
     pub place: Place,
     pub desc: DeviceDescriptor,
     /// The configuration that was set (all devices with one get their first; `None` if they have none).
@@ -30,6 +30,10 @@ pub struct Device {
     pub(crate) bind_lock: Mutex<()>,
     /// Interfaces switched to another alternate setting (`alt.rs`).
     pub(crate) alts: crate::alt::Alts,
+    /// A reset in place asked for or under way (`reset.rs`).
+    pub(crate) reset: crate::reset::ResetCell,
+    /// Its serial as a driver that survives a reset asked for it (`reset::Serial`, read before any trouble).
+    pub(crate) serial: SpinLock<Option<crate::reset::Serial>>,
 }
 
 impl Device {
@@ -56,11 +60,22 @@ impl Device {
     pub fn is_gone(&self) -> bool {
         self.gone.load(Ordering::Acquire)
     }
-
-    pub fn control(&self, setup: Setup, data: Data<'_>) -> Result<usize, UsbError> {
+    pub fn address(&self) -> u8 {
+        self.address.load(Ordering::Acquire)
+    }
+    /// `Gone` once detached, `Busy` while its port is being reset (`reset.rs`).
+    fn usable(&self) -> Result<(), UsbError> {
         if self.is_gone() {
             return Err(UsbError::Gone);
         }
+        if self.reset.running() {
+            return Err(UsbError::Busy);
+        }
+        Ok(())
+    }
+
+    pub fn control(&self, setup: Setup, data: Data<'_>) -> Result<usize, UsbError> {
+        self.usable()?;
         self.host.control(self.slot, setup, data)
     }
     pub fn control_in(&self, setup: Setup, buf: &mut [u8]) -> Result<usize, UsbError> {
@@ -131,9 +146,7 @@ impl Device {
     }
 
     fn submit_urb(self: &Arc<Self>, ep: u8, req: Request, on_done: Option<OnDone>) -> Result<Transfer, UsbError> {
-        if self.is_gone() {
-            return Err(UsbError::Gone);
-        }
+        self.usable()?;
         if !req.in_bounds() {
             return Err(UsbError::Invalid("transfer range outside its buffer"));
         }
@@ -182,9 +195,7 @@ impl Device {
     /// (the controller forgets its place in it): it ends with `Cancelled` and the bytes it moved, and the ones
     /// behind it run. Normally the queue is empty or halted here (after a STALL, or after `abort`).
     pub fn clear_halt(&self, ep: u8) -> Result<(), UsbError> {
-        if self.is_gone() {
-            return Err(UsbError::Gone);
-        }
+        self.usable()?;
         if ep & 0x0F == 0 {
             return Err(UsbError::Invalid("endpoint 0 has no halt to clear"));
         }
@@ -194,9 +205,7 @@ impl Device {
 
     /// Cancels every transfer queued on `ep` (each ends with `Cancelled`); returns how many there were.
     pub fn abort(&self, ep: u8) -> Result<usize, UsbError> {
-        if self.is_gone() {
-            return Err(UsbError::Gone);
-        }
+        self.usable()?;
         self.host.abort_endpoint(self.slot, ep)
     }
 }

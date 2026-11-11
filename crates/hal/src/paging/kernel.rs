@@ -8,7 +8,7 @@ use walk::Tables as _;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// First address of the kernel (upper canonical) half.
 pub const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
@@ -20,6 +20,122 @@ static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 static CANDIDATE: AtomicU64 = AtomicU64::new(0);
 static TABLE_ALLOC: AtomicUsize = AtomicUsize::new(0);
 static TABLE_FREE: AtomicUsize = AtomicUsize::new(0);
+/// One change of the kernel half's tables at a time, whoever asks: `map_4k` (device windows of `mmio`, stacks, the CPU
+/// area, `reserve_kernel_va` ranges), `map_kernel` and `unmap_kernel` (MM's vmap, under its own mutex). They share PDs
+/// and PTs: two walkers entering a new region would both install a table and one would lose its pages, and a walker
+/// could write a leaf into a table `unmap_kernel` just emptied and took out. The innermost lock of the kernel: nothing
+/// is taken and nothing waits under it (table frames come before it, `map_shared`), and it is held for one short piece
+/// of work (`unmap_kernel` takes it per slice) with interrupts off, so a holder is never preempted and never owes a
+/// shootdown for long. A waiter spins with interrupts as the caller had them: it must not hold up other CPUs' shootdowns
+/// or this CPU's interrupts for what may be several holders in a row, and it holds nothing an interrupt could want.
+/// Clearing a leaf in a table that stays (`unmap_4k`, `unmap_kernel_pages`) needs it not: a table with a present leaf is
+/// not empty, so nobody frees it.
+static TABLES: AtomicBool = AtomicBool::new(false);
+
+/// CPUs in the spin of `with_tables_locked`: only `let_waiters_in` looks at it.
+static TABLES_WAITERS: AtomicU32 = AtomicU32::new(0);
+/// How long `let_waiters_in` leaves the lock free: long enough for a waiter's load, its `poll` and its attempt, about a
+/// microsecond or two. A waiter that is not at its spin just then (preempted) costs each slice no more than this.
+const HAND_OFF_SPINS: u32 = 128;
+
+pub(super) fn with_tables_locked<R>(f: impl FnOnce() -> R) -> R {
+    let mut waiting = false;
+    loop {
+        let irq = crate::cpu::IrqGuard::new();
+        if TABLES.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if waiting {
+                TABLES_WAITERS.fetch_sub(1, Ordering::Relaxed);
+            }
+            let r = f();
+            TABLES.store(false, Ordering::Release);
+            return r;
+        }
+        drop(irq);
+        if !waiting {
+            waiting = true;
+            TABLES_WAITERS.fetch_add(1, Ordering::Relaxed);
+        }
+        while TABLES.load(Ordering::Relaxed) {
+            // The caller may have interrupts off, and another CPU may be waiting for this one's answer to its shootdown.
+            super::tlb::poll();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Between two slices of one walk: this CPU would otherwise retake the lock before a waiter's load has even seen it free,
+/// and a waiter would wait out the whole walk, a masked one with its interrupts off. Costs one load when nobody waits.
+pub(super) fn let_waiters_in() {
+    // A caller with interrupts off answers shootdowns only here for the length of the walk.
+    super::tlb::poll();
+    if TABLES_WAITERS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    for _ in 0..HAND_OFF_SPINS {
+        if TABLES.load(Ordering::Relaxed) || TABLES_WAITERS.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// `walk::map` of one kernel-half leaf under `TABLES`. A table frame may wait for memory (`alloc` can reclaim), so the
+/// walk runs with what it has and comes back for a frame only when it finds a table missing; each pass leaves the tables
+/// it could install, so this ends. A frame another walker made unneeded goes back through the table hook. Once the hook
+/// is installed it is the source of every frame here, whatever `alloc` the caller brought: that frame can go back, and a
+/// table in the vmap area may later be freed through the hook by `unmap_kernel`, whoever installed it. `alloc` serves
+/// the boot before the hook, on one CPU: no other walker, so no frame is left over there.
+pub(super) fn map_shared(root: u64, virt: u64, phys: u64, size: PageSize, flags: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> Result<(), MapError> {
+    let hook = table_hook();
+    let mut source = || match hook {
+        Some(h) => h(),
+        None => alloc(),
+    };
+    let (out, spare) = map_with_retries(&mut source, &mut |take| {
+        let mut free = |_| {};
+        let mut d = Direct { alloc: take, free: &mut free };
+        with_tables_locked(|| walk::map(&mut d, root, virt, phys, size, flags))
+    });
+    if let (Some(f), true) = (spare, hook.is_some()) {
+        let _ = with_frames(|d| d.free_table(f));
+    }
+    out
+}
+
+/// The passes of `map_shared`: `pass` is one walk that takes table frames from what it is given. Returns its result and
+/// the frame `source` gave for a table another walker installed in the meantime, which the caller still owns.
+pub(super) fn map_with_retries(
+    source: &mut dyn FnMut() -> Option<u64>,
+    pass: &mut dyn FnMut(&mut dyn FnMut() -> Option<u64>) -> Result<(), MapError>,
+) -> (Result<(), MapError>, Option<u64>) {
+    let mut spare = None;
+    let out = loop {
+        let mut short = false;
+        let mut take = || {
+            let f = spare.take();
+            short = f.is_none();
+            f
+        };
+        let out = pass(&mut take);
+        if out != Err(MapError::NoMemory) || !short {
+            break out;
+        }
+        spare = source();
+        if spare.is_none() {
+            break out;
+        }
+    };
+    (out, spare)
+}
+
+/// The allocator `set_table_frames` installed.
+fn table_hook() -> Option<fn() -> Option<u64>> {
+    match TABLE_ALLOC.load(Ordering::Acquire) {
+        0 => None,
+        // SAFETY: only `set_table_frames` stores a non-zero value here, once, always a valid fn pointer of this type.
+        a => Some(unsafe { core::mem::transmute::<usize, fn() -> Option<u64>>(a) }),
+    }
+}
 
 /// The root `new_kernel_root` built and nobody has loaded yet (0: none).
 pub(super) fn candidate() -> u64 {
@@ -119,7 +235,10 @@ pub fn map_kernel(root: u64, virt: u64, phys: u64, size: PageSize, flags: PageFl
     if size == PageSize::Size1G && !crate::cpu::detect().pdpe1gb {
         return Err(MapError::Unsupported);
     }
-    with_frames(|d| walk::map(d, root, virt, phys, size, flags.0))?
+    if !table_frames_ready() {
+        return Err(MapError::WrongRange);
+    }
+    map_shared(root, virt, phys, size, flags.0, &mut || None)
 }
 
 /// Copies every leaf of `from` in [lo, hi) (kernel half) into `to` (the root being built) with the same
@@ -139,22 +258,53 @@ pub fn adopt_leaves(from: u64, to: u64, lo: u64, hi: u64) -> Result<Vec<Unmapped
 
 /// Unmaps [virt, virt + len) of the vmap area in the kernel root and frees the PTs and PDs that became empty
 /// (the shared PDPTs stay) once every CPU dropped the old translations (`tlb::flush_kernel`, also when nothing
-/// was mapped: a retry after an unconfirmed attempt). `f` sees each removed leaf; what it pointed to must not be
-/// reused before this returns `Ok`. `NeedsShootdown`: a CPU did not confirm in time; the leaves are gone, but
+/// was mapped: a retry after an unconfirmed attempt). `f` sees each removed leaf, with `TABLES` held and interrupts off
+/// (it must not wait or allocate); what it pointed to must not be reused before this returns `Ok`. `NeedsShootdown`: a CPU did not confirm in time; the leaves are gone, but
 /// the range must stay out of use, and the emptied tables are kept (counted in `tlb::stats().kept_tables`).
+///
+/// A whole reservation may be GiBs (a GPU buffer): `TABLES` is taken per slice of the walk (`walk::UnmapSlices`), so no
+/// CPU spends the whole walk with interrupts off, and waiters get their turn between the slices (`let_waiters_in`). Between
+/// the slices other walkers go on in the rest of the kernel half; the range itself is the caller's until this returns. A
+/// table that reaches past the range is taken out only at the very end: until the shootdown another CPU may still hold its
+/// entry in a paging-structure cache, and a neighbour could already be mapping into the slot with a new table. Interrupts
+/// stay off from that moment to the shootdown, so this thread cannot be preempted in between; the window is then the
+/// shootdown itself, up to `tlb`'s give-up time with a stuck CPU (plan/notes/PC-PC-W31.md, open point 1).
 pub fn unmap_kernel(virt: u64, len: u64, f: &mut dyn FnMut(Unmapped)) -> Result<UnmapStats, MapError> {
     let Some(root) = kernel_root().filter(|_| in_vmap(virt, len)) else {
         return Err(MapError::WrongRange);
     };
+    let mut slices = walk::UnmapSlices::new(virt, len)?;
     // Clear, shoot down, then free: emptied tables are only collected during the walk and go back to the frame
     // allocator after every CPU flushed, so no cached PDE anywhere can point at a reused frame.
     let mut freed = Vec::new();
     let mut lost = 0u64;
-    let st = with_frames(|d| {
-        let mut t = Deferred { d, freed: &mut freed, lost: &mut lost };
-        walk::unmap(&mut t, root, virt, len, 3, f)
+    // The room comes first (no heap under `TABLES`): at most the PTs and PDs the range touches.
+    reserve_room(&mut freed, ((len >> 21) + (len >> 30) + 4) as usize);
+    let mut st = UnmapStats::default();
+    // The common small range (a stack, a window) is one step and one lock hold, tables that reach past it included.
+    let one_step = slices.one_step();
+    let mut to_shootdown = one_step.then(crate::cpu::IrqGuard::new);
+    with_frames(|d| {
+        let mut t = Deferred { d, freed: &mut freed, lost: &mut lost, range: (virt, virt + len), ends: one_step };
+        with_tables_locked(|| {
+            slices.check(&t, root)?;
+            slices.step(&mut t, root, 3, f, &mut st);
+            Ok::<(), MapError>(())
+        })?;
+        while !slices.done() {
+            let_waiters_in();
+            with_tables_locked(|| slices.step(&mut t, root, 3, f, &mut st));
+        }
+        if !one_step {
+            let_waiters_in();
+            to_shootdown = Some(crate::cpu::IrqGuard::new());
+            t.ends = true;
+            with_tables_locked(|| slices.finish(&mut t, root, 3, &mut st));
+        }
+        Ok::<(), MapError>(())
     })??;
     let o = super::tlb::flush_kernel_as(virt, virt + len, !freed.is_empty() || lost > 0, super::tlb::Cause::Vmap);
+    drop(to_shootdown);
     if !o.confirmed() {
         super::tlb::count_kept(0, freed.len() as u64 + lost);
         return Err(MapError::NeedsShootdown);
@@ -168,15 +318,28 @@ pub fn unmap_kernel(virt: u64, len: u64, f: &mut dyn FnMut(Unmapped)) -> Result<
     Ok(st)
 }
 
-/// `Direct` with table frees collected instead of done (see `unmap_kernel`).
-struct Deferred<'a, 'b> {
-    d: &'a mut Direct<'b>,
-    freed: &'a mut Vec<u64>,
-    /// Emptied tables with no room in `freed`: kept out of use for good (never an aborting allocation here).
-    lost: &'a mut u64,
+/// Room for `want` more entries, or as many as the heap gives: what does not fit is lost one table at a time
+/// (`Deferred`), not all of them.
+pub(super) fn reserve_room(v: &mut Vec<u64>, want: usize) {
+    let mut n = want;
+    while n > 0 && v.try_reserve_exact(n).is_err() {
+        n /= 2;
+    }
 }
 
-impl walk::Tables for Deferred<'_, '_> {
+/// A `walk::Tables` with table frees collected instead of done (see `unmap_kernel`).
+pub(super) struct Deferred<'a, T> {
+    pub(super) d: &'a mut T,
+    pub(super) freed: &'a mut Vec<u64>,
+    /// Emptied tables with no room in `freed`: kept out of use for good (never an allocation here, `TABLES` is held).
+    pub(super) lost: &'a mut u64,
+    /// What is being unmapped: tables wholly inside are nobody else's.
+    pub(super) range: (u64, u64),
+    /// The last piece of the walk: tables that reach past `range` may go too.
+    pub(super) ends: bool,
+}
+
+impl<T: walk::Tables> walk::Tables for Deferred<'_, T> {
     fn read(&self, t: u64, i: usize) -> u64 {
         self.d.read(t, i)
     }
@@ -187,11 +350,14 @@ impl walk::Tables for Deferred<'_, '_> {
         self.d.alloc_table()
     }
     fn free_table(&mut self, t: u64) {
-        if self.freed.try_reserve(1).is_ok() {
+        if self.freed.len() < self.freed.capacity() {
             self.freed.push(t)
         } else {
             *self.lost += 1;
         }
+    }
+    fn may_free(&self, start: u64, len: u64) -> bool {
+        self.ends || (start >= self.range.0 && start.saturating_add(len) <= self.range.1)
     }
 }
 

@@ -1,0 +1,23 @@
+GETNCNT 3 waiters = 3
+first +1: a 
+second +1: b 
+GETNCNT left = 1
+third +1: c 
+GETZCNT = 1
+GETNCNT = 1
+sem 2 given: e 
+sem 1 to zero: z 
+sem 1 to two: d 
+GETNCNT sem 0 (blocking op of cx) = 3
+GETNCNT sem 1 = 1
+sem 1 = 1 goes to s2 past blocked cx: s2 
+sem 0 = 1: s1 
+sem 1 = 1 again: cx wants sem 0 too: 
+sem 0 = 1: cx before s3: cx 
+sem 0 = 1: s3: s3 
+GETZCNT sem 2 = 1
+GETZCNT sem 3 = 0
+zero list: h 
+g: g 
+IPC_RMID with waiters = 0
+removed: w!EIDRM x!EIDRM y!EIDRM 

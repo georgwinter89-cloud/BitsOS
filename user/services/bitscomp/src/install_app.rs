@@ -635,4 +635,75 @@ mod tests {
         line(&mut app, 1, FromInstaller::Access { access: vec![], clients: vec![] });
         assert_eq!(app.install_marker(), None);
     }
+
+    /// PK-L1c (MC-9b): a real pad's presses never answer the question, even on an armed Erlauben: A, X, Y, the
+    /// D-pad and Home are ignored there, B refuses as injected input; the full-access question the same.
+    #[test]
+    fn a_pad_only_refuses() {
+        use crate::backend::evdev_map::{EV_ABS, EV_KEY, EV_SYN, SYN_REPORT};
+        let (_d, mut app, mut p) = linked();
+        let byte = crate::pad::Axis { min: 0, max: 255, flat: 15 };
+        let keys: Vec<u16> = (0x120..=0x12b).collect();
+        app.pad_plug(1, crate::pad_app::PadDev::new("test", "DragonRise", (0x0079, 0x0006), &keys, (Some(byte), Some(byte)), Origin::Physical));
+        let press = |app: &mut App, code: u16| {
+            app.pad_feed(1, &[(EV_KEY, code, 1), (EV_SYN, SYN_REPORT, 0)]);
+            app.pad_feed(1, &[(EV_KEY, code, 0), (EV_SYN, SYN_REPORT, 0)]);
+        };
+        line(&mut app, 1, ask(8));
+        let a = app.install.ask.as_mut().unwrap();
+        (a.on_yes, a.seen_end, a.opened) = (true, true, Duration::ZERO);
+        for code in [0x122, 0x123, 0x120, 0x124] {
+            press(&mut app, code);
+        }
+        app.pad_feed(1, &[(EV_ABS, crate::pad::ABS_HAT0X, -1), (EV_SYN, SYN_REPORT, 0)]);
+        // Select+Start held past 500 ms: Home, which must not open the library over the question either.
+        app.pad_feed(1, &[(EV_KEY, 0x128, 1), (EV_KEY, 0x129, 1), (EV_SYN, SYN_REPORT, 0)]);
+        app.pad_tick(crate::pacer::now() + Duration::from_secs(1));
+        assert!(app.install.ask.as_ref().is_some_and(|a| a.id == 8 && a.on_yes), "the pad moved or answered the question");
+        assert!(!app.lib.open);
+        assert_eq!(sent(&mut p), "", "nothing answered");
+        assert_eq!(app.pads.list[0].1.last.map(|l| l.0), Some("Home"));
+        let notes = app.install.log.iter().filter(|l| l.contains("on the dialog ignored")).count();
+        assert_eq!(notes, 1, "one line per dialog and pad, not one per press: {:?}", app.install.log);
+        app.input_origin = Origin::Physical;
+        press(&mut app, 0x121);
+        assert_eq!(app.input_origin, Origin::Physical, "the pad's B left the origin injected");
+        assert_eq!(sent(&mut p), link::answer(8, false, "injected"));
+        assert!(app.install.ask.is_none());
+        // The full-access question: A on its preselected yes is ignored, B is an injected no.
+        let c = "cd".repeat(32);
+        line(&mut app, 1, FromInstaller::AskAccess { id: 9, title: String::new(), text: "Vollzugriff".into(), timeout_ms: 240_000, client: c.clone(), name: "bitsos-desk".into(), hours: 24 });
+        app.install.access.as_mut().unwrap().opened = Duration::ZERO;
+        press(&mut app, 0x122);
+        assert_eq!(sent(&mut p), "");
+        press(&mut app, 0x121);
+        assert_eq!(sent(&mut p), link::answer(9, false, "injected"));
+        // The grant dialog (opened at the real keyboard): no pad press sets, moves or closes it, B neither (an
+        // injected Esc is ignored there).
+        app.input_origin = Origin::Physical;
+        app.install_grant_open();
+        let before = format!("{:?}", app.install.grant.as_ref().map(|g| (g.focus, g.hover)));
+        assert!(app.install.grant.is_some(), "no grant dialog: {:?}", app.install.log);
+        for code in [0x122, 0x123, 0x120, 0x121] {
+            press(&mut app, code);
+        }
+        app.pad_feed(1, &[(EV_ABS, crate::pad::ABS_HAT0X, 1), (EV_SYN, SYN_REPORT, 0)]);
+        app.pad_feed(1, &[(EV_ABS, crate::pad::ABS_HAT0X, 0), (EV_SYN, SYN_REPORT, 0)]);
+        assert!(app.install.grant.is_some(), "a pad press closed the grant dialog");
+        assert_eq!(format!("{:?}", app.install.grant.as_ref().map(|g| (g.focus, g.hover))), before, "a pad press moved the grant dialog");
+        assert_eq!(sent(&mut p), "", "a pad press set a grant");
+        app.install_key(Keysym::Escape);
+        assert!(app.install.grant.is_none());
+        // A pad button while Super is down spoils "Win alone" (no library toggle on the release).
+        app.lib.alone.key(125, true, 0);
+        press(&mut app, 0x122);
+        assert!(!app.lib.alone.key(125, false, 10), "Win alone after a pad button");
+        // Without a dialog, Home is the library; the origin outside the event stays what it was.
+        app.input_origin = Origin::Injected;
+        app.pad_feed(1, &[(EV_KEY, 0x128, 0), (EV_KEY, 0x129, 0), (EV_SYN, SYN_REPORT, 0)]);
+        app.pad_feed(1, &[(EV_KEY, 0x128, 1), (EV_KEY, 0x129, 1), (EV_SYN, SYN_REPORT, 0)]);
+        app.pad_tick(crate::pacer::now() + Duration::from_secs(1));
+        assert!(app.lib.open);
+        assert_eq!(app.input_origin, Origin::Injected, "a pad press left its origin behind");
+    }
 }

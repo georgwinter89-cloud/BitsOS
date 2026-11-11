@@ -1,0 +1,4 @@
+msgget works: yes
+send 0
+receive = 5 type 4 text hello
+remove = 0

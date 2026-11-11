@@ -110,7 +110,7 @@ pub(super) fn mounted() -> Result<alloc::sync::Arc<fs_fat::Volume>, TestResult> 
         Some(v) => Ok(v),
         None => Err(match fs_fat::stick::last_reason() {
             Some(r) => Err(format!("the boot stick was not mounted: {r}")),
-            None => ktest::skip("no boot stick (no USB disk recognised as the stick)"),
+            None => ktest::fail("no boot stick (no USB disk recognised as the stick)"),
         }),
     }
 }

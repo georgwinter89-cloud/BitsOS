@@ -100,7 +100,7 @@ pub fn send(socket_name: &str, cmd: &str) -> std::io::Result<String> {
     Ok(out)
 }
 
-pub fn run_queue(app: &mut App, comp: &dyn Picture) {
+pub fn run_queue(app: &mut App, comp: &mut dyn crate::render::Composer) {
     // `bench` runs over many turns (`bench.rs`); a second one waits in the queue for the first.
     // A screenshot waits for the start animation and an unfolding menu (WY-5), so it shows the settled look.
     let moving = app.anim.running(crate::pacer::now(), &app.theme);
@@ -110,7 +110,14 @@ pub fn run_queue(app: &mut App, comp: &dyn Picture) {
     });
     app.ctl_queue = bench;
     for (cmd, mut stream) in rest {
-        let answer = execute(app, comp, &cmd).unwrap_or_else(|e| format!("error: {e}"));
+        // WY-17: frames that go straight to the scanout leave no copy; a screenshot reads the one on the screen.
+        if cmd.split_whitespace().any(|w| w == "shot") {
+            comp.sync_pixels();
+        }
+        // WY-19: `fx` asks the renderer too; the other commands see only the finished picture.
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let result = if words.first() == Some(&"fx") { crate::fx::ctl::execute(app, &*comp, &words) } else { execute(app, &*comp, &cmd) };
+        let answer = result.unwrap_or_else(|e| format!("error: {e}"));
         let _ = stream.write_all(format!("{answer}\n").as_bytes());
     }
 }
@@ -132,8 +139,8 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
             return Err("phys: only in the headless test build".into());
         }
         let rest = words[1..].join(" ");
-        if !matches!(words.get(1).copied(), Some("key" | "pointer" | "press" | "release" | "click" | "wheel")) {
-            return Err("usage: phys key|pointer|press|release|click|wheel ...".into());
+        if !matches!(words.get(1).copied(), Some("key" | "pointer" | "press" | "release" | "click" | "wheel" | "pad-event")) {
+            return Err("usage: phys key|pointer|press|release|click|wheel|pad-event ...".into());
         }
         app.ctl_origin = crate::input::Origin::Physical;
         let r = execute(app, comp, &rest);
@@ -142,6 +149,9 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
     }
     if words.first() == Some(&"install") {
         return app.install_ctl(&words);
+    }
+    if let Some(r) = crate::pad_app::ctl(app, &words) {
+        return r;
     }
     if let Some(r) = crate::ctl_mouse::execute(app, &words) {
         return r;
@@ -165,12 +175,14 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
         "stats" => {
             // WY-7: how programs start and how many still wait for their window (read here only, no loop cost).
             let how = if crate::spawn::trampoline().is_some() { "trampoline" } else { "fork" };
-            let r = format!("{} output={}x{} launching={} spawn={how} build={} renderer={}", app.stats.report(), comp.size().0, comp.size().1, app.launches.count(), crate::flavour::name(), comp.renderer());
+            let r = format!("{} output={}x{} launching={} spawn={how} scanout={} build={} renderer={}", app.stats.report(), comp.size().0, comp.size().1, app.launches.count(), if comp.draws_direct() { "direct" } else { "readback" }, crate::flavour::name(), comp.renderer());
             if words.get(1) == Some(&"reset") {
                 app.stats = Default::default();
             }
             Ok(r)
         }
+        // WY-17b: what the status bar's clock shows, and why (QEMU's check; the picture alone cannot say it).
+        "clock" => Ok(format!("clock {} {}", app.status.clock, crate::status::zone_report())),
         "key" => {
             for tok in &words[1..] {
                 let (code, press, release) = match tok.as_bytes()[0] {
@@ -197,7 +209,14 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
         "focus" => run(app, Action::Focus(num(1).unwrap_or(1.0) as i32)),
         "grow" => run(app, Action::Grow(0.25)),
         "shrink" => run(app, Action::Grow(-0.25)),
-        "close" => run(app, Action::Close),
+        // close [ID]: asks a window to close (the focused one without ID).
+        "close" => match words.get(1) {
+            Some(id) => {
+                crate::xwm::close(&window(app, id)?);
+                Ok("ok".into())
+            }
+            None => run(app, Action::Close),
+        },
         // WY-12: minimize [ID] (the focused window without ID), unminimize ID, switch [-1] (Alt+Tab).
         "minimize" => {
             let w = match words.get(1) {
@@ -245,6 +264,18 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
             Ok(format!("sent={sent} client={}", if alive { "connected" } else { "dropped" }))
         }
         "quit" => run(app, Action::Quit),
+        // WY-21: the next present waits as one stuck in the driver would (a test's and the desk's: the GPU desktop's
+        // stall watch must end it within `gpu_watch::STALL`, and the rescue build take over). At most a minute.
+        "stall" => {
+            let secs = num(1)?;
+            if !(0.0..=60.0).contains(&secs) {
+                return Err("stall SECS (0 to 60)".into());
+            }
+            eprintln!("bitscomp: ctl stall {secs} s: the next present waits that long");
+            app.stall = Some(std::time::Duration::from_secs_f64(secs));
+            app.needs_frame = true;
+            Ok(format!("the next present waits {secs} s"))
+        }
         "size" => {
             app.requested_size = Some((num(1)? as i32, num(2)? as i32));
             Ok("ok".into())

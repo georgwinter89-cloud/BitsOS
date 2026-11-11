@@ -203,7 +203,7 @@ fn run(seed: u32, n: u64, how: &str, shape: &str) -> Result<Option<Run>, String>
 
 fn need() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     fb()?;
     need_program()?;
@@ -230,14 +230,14 @@ fn single() -> TestResult {
     }
     Ok(())
 }
-ktest!("dp.fbdev.damage", Safe, single);
+ktest!("dp.fbdev.damage", Screen, single);
 
 /// Two windows: the damage of the hidden window waits for the pan to it, which copies only that.
 fn panned() -> TestResult {
     need()?;
     let n = 6;
     let Some(r) = run(70, n, "pan", "box")? else {
-        return ktest::skip("fb0 offers no second window here (yres_virtual)");
+        return ktest::fail("fb0 offers no second window here (yres_virtual)");
     };
     kassert!(r.d.write_faults == 0 && r.d.dev_faults == 0, "{} write / {} device faults in {n} panned frames", r.d.write_faults, r.d.dev_faults);
     kassert!(r.d.damage.pans == n, "{} of {n} pans copied only the damage", r.d.damage.pans);
@@ -245,7 +245,7 @@ fn panned() -> TestResult {
     kassert!(r.d.refreshes == 0, "{} whole-window copies", r.d.refreshes);
     Ok(())
 }
-ktest!("dp.fbdev.damage_pan", Safe, panned);
+ktest!("dp.fbdev.damage_pan", Screen, panned);
 
 /// The refusals and the work bound of one call, with `abi-fbdev frames ... damage box` holding the screen.
 fn rules() -> TestResult {
@@ -299,7 +299,7 @@ fn rules() -> TestResult {
     kassert!(!fb.damaging(), "damage mode stayed on after the hold ended");
     Ok(())
 }
-ktest!("dp.fbdev.damage_rules", Safe, rules);
+ktest!("dp.fbdev.damage_rules", Screen, rules);
 
 /// BITSOS_DAMAGE_END while the holder keeps the screen: every page write-protected, one whole copy, and the next
 /// frames fault and are tracked again (fsync).
@@ -315,4 +315,4 @@ fn ended() -> TestResult {
     kassert!(r.d.damage.px == 0 && r.d.damage.pans == 0, "damage copies after END: {} px, {} pans", r.d.damage.px, r.d.damage.pans);
     Ok(())
 }
-ktest!("dp.fbdev.damage_end", Safe, ended);
+ktest!("dp.fbdev.damage_end", Screen, ended);

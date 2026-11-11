@@ -1,0 +1,12 @@
+# PK-L1a: the program library's entry for LibreOffice (stick launcher `libreoffice`, \BITSOS2\bin\libreoffice).
+# Exec names the launcher without a path (started as /bin/sh \BITSOS2\bin\libreoffice). The icon is the tree's own
+# (\BITSOS2\libreoffice\gtk\share\icons\hicolor, 128 px: the tile size at 2560x1440), referenced, not copied.
+[Desktop Entry]
+Type=Application
+Name=Impress
+GenericName[de]=Präsentation
+Exec=libreoffice impress
+Icon=/boot/BITSOS2/libreoffice/gtk/share/icons/hicolor/128x128/apps/libreoffice-impress.png
+Categories=Office;Presentation;
+Keywords[de]=Folien;Vortrag;PowerPoint;pptx;odp;
+StartupWMClass=libreoffice-impress

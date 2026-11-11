@@ -154,6 +154,7 @@ fn held() -> TestResult {
         r.pause();
         let t = d.submit(crate::queue::Kind::Write { fua: false, preflush: false }, 8, 0, crate::disk::Data::Bytes(alloc::vec![2; 512]), Normal)
             .map_err(e)?;
+        crate::ktests::dispatch_aside(&d)?;
         kassert!(until(2000, || r.holding()), "the device never got the write");
         let probe = Arc::new(Probe { disk: d.clone(), ram: r.clone(), seen: SpinLock::new(None) });
         let t0 = now();

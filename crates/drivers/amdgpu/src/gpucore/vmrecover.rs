@@ -32,6 +32,11 @@
 //! is still set with the queue gone, it is written 0 before the map, so one round on the chip shows both the bit and
 //! whether the fresh queue runs. The bit was already set, so the write cannot start a halt; the register is GC's, no
 //! display field moves (GX-D9). Decision and reason: plan/notes/gx-GX-7m3.md.
+//!
+//! GX-9a: the same rung for a plain hang of GFX ring 0 (`gfx`): 7.1's gfx_v11_0_reset_kgq with the REMOVE_QUEUE this module
+//! already trusts: the HQD through CP_GFX_HQD_* if still active (mes_v11_0_reset_queue_mmio, 7.1), the MQD and ring rewritten,
+//! ADD_QUEUE map_legacy; no clear-state preamble, as reset_kgq has none: the queue goes, CP state stays. SDMA 0 (`sdma`): the
+//! restart above. The job half's ring test follows on each.
 
 use super::bringup::Bringup;
 use super::mes::{self, Layout, MesAddrs, MesError, PmQueue, Regs, Rung, hx32};
@@ -41,6 +46,7 @@ use super::vmproc;
 use super::vmring::{self, Ctx, Q, Queue, VmInputs, VmReport};
 use super::watch::Watch;
 use crate::ipmod::gmc11::{Fault, R};
+use crate::ipmod::gfx11;
 use crate::ipmod::mes11::{self, M, f};
 use crate::ipmod::mesapi::Frame;
 use crate::ipmod::mesmqd;
@@ -150,7 +156,7 @@ fn stuck<H: Hw>(owner: &mut Bringup<Watch<H>>, l: &Layout, r: &mut VmReport, d: 
 /// The kernel compute ring: unmapped, its HQD off, its memory rewritten, mapped again (the module text). A failure
 /// after the unmap leaves that on record (`mes::COMPUTE_UNMAPPED`, `COMPUTE_STUCK`).
 #[inline(never)]
-fn compute<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, r: &mut VmReport, d: &mut String) -> Result<Queue, &'static str> {
+pub(crate) fn compute<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, r: &mut VmReport, d: &mut String) -> Result<Queue, &'static str> {
     let l = inp.mes;
     let a = inp.addrs.hqd.ok_or("no MES registers known")?;
     let (_, qtype, pipe, queue, db) = mes::LEGACY[0];
@@ -211,6 +217,121 @@ fn compute<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, r: &mut VmRepor
     Ok(Queue::Pm4 { q: mq, gfx: false })
 }
 
+/// `mes::COMPUTE_*`'s values in GFX ring 0's slot.
+fn note_gfx<H: Hw>(owner: &mut Bringup<Watch<H>>, l: &Layout, state: u64, d: &mut String) {
+    if mes::mem(owner, l.gfx_state, &state.to_le_bytes()).is_err() {
+        klog::event!(Error, "gx", "vm.recover_note", state = state; "GFX ring 0's state slot was not written");
+        d.push_str("GFX ring 0's state slot NOT written; ");
+    }
+}
+
+fn gfx_stuck<H: Hw>(owner: &mut Bringup<Watch<H>>, l: &Layout, r: &mut VmReport, d: &mut String, why: &'static str) -> &'static str {
+    r.stranded = true;
+    note_gfx(owner, l, mes::COMPUTE_STUCK, d);
+    klog::event!(Error, "gx", "vm.recover_stranded", why = why; "GFX ring 0's HQD is left with no firmware owning it");
+    d.push_str("STRANDED: no firmware owns the HQD; ");
+    why
+}
+
+/// The selected HQD of ring 0: `(active as found, active after)`; reset as mes_v11_0_reset_queue_mmio (7.1) only if active.
+fn gfx_hqd_reset(o: &mut dyn mes::Regs, a: &MesAddrs, us: u64) -> Result<(u32, u32), MesError> {
+    let found = mes::rd(o, a, M::CpGfxHqdActive)?;
+    let mut now = found;
+    if found & f::HQD_ACTIVE != 0 {
+        mes::wr(o, a, M::CpGfxHqdDequeueRequest, f::DEQUEUE_RESET)?;
+        mes::wr(o, a, M::SpiComputeQueueReset, f::SPI_QUEUE_RESET)?;
+        for _ in 0..us {
+            now = mes::rd(o, a, M::CpGfxHqdActive)?;
+            if now & f::HQD_ACTIVE == 0 {
+                break;
+            }
+            o.delay(1);
+        }
+    }
+    Ok((found, now))
+}
+
+/// GX-9a: GFX ring 0 unmapped, its HQD off, its memory rewritten, mapped again (the module text). A failure after the unmap
+/// leaves that on record (`Layout::gfx_state`).
+#[inline(never)]
+pub(crate) fn gfx<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, r: &mut VmReport, d: &mut String) -> Result<Queue, &'static str> {
+    let l = inp.mes;
+    let a = inp.addrs.hqd.ok_or("no MES registers known")?;
+    let (_, qtype, pipe, queue, db) = mes::LEGACY[1];
+    let mut ring = vmproc::sched_ring(owner, &l);
+    let mut dbs = Vec::new();
+    let res = ring.submit(owner, &l, Frame::unmap_legacy(qtype, pipe, queue, db), inp.api_us, &mut dbs);
+    r.doorbells.append(&mut dbs);
+    match res {
+        Ok((us, _)) => {
+            d.push_str(&format!("MES REMOVE_QUEUE (unmap_legacy_queue) answered in {us} us; "));
+            note_gfx(owner, &l, mes::COMPUTE_UNMAPPED, d);
+        }
+        Err(e) => {
+            r.stranded = true;
+            klog::event!(Error, "gx", "vm.recover_unmap", error = format!("{e:?}").as_str(); "MES did not unmap GFX ring 0");
+            d.push_str(&format!("MES REMOVE_QUEUE FAILED {e:?}: STRANDED; "));
+            return Err("MES did not unmap the queue");
+        }
+    }
+    if mes::select(owner, &a, 0, pipe, queue).is_err() {
+        return Err(gfx_stuck(owner, &l, r, d, "GRBM_GFX_CNTL not written"));
+    }
+    let res = gfx_hqd_reset(owner, &a, inp.timeout_us);
+    if mes::select(owner, &a, 0, 0, 0).is_err() {
+        return Err(gfx_stuck(owner, &l, r, d, "GRBM_GFX_CNTL not written back"));
+    }
+    let Ok((found, now)) = res else {
+        return Err(gfx_stuck(owner, &l, r, d, "the HQD registers did not answer"));
+    };
+    d.push_str(&format!("CP_GFX_HQD_ACTIVE after the unmap {found:#x}{}; ", if found & f::HQD_ACTIVE != 0 { format!(", reset (DEQUEUE_REQUEST 2, SPI_COMPUTE_QUEUE_RESET 1): now {now:#x}") } else { String::new() }));
+    klog::event!(Info, "gx", "vm.recover_hqd", found = klog::Hex(u64::from(found)), now = klog::Hex(u64::from(now)));
+    if now & f::HQD_ACTIVE != 0 {
+        return Err(gfx_stuck(owner, &l, r, d, "the HQD stays active after the reset"));
+    }
+    let gp = l.gfx_prop(&inp.gfx);
+    let mq = PmQueue::new(gp.ring, gp.ring_bytes, Some(gp.rptr), gp.wptr, gfx11::DOORBELL_DW).map_err(|_| "no ring")?;
+    mes::zero(owner, gp.ring, gp.ring_bytes).map_err(|_| "the ring's memory")?;
+    mes::mem(owner, gp.mqd, &mesmqd::bytes(&mesmqd::gfx_mqd(&gp))).map_err(|_| "the MQD's memory")?;
+    mq.reset(owner).map_err(|_| "the pointer slots' memory")?;
+    let mut ring = vmproc::sched_ring(owner, &l);
+    let mut dbs = Vec::new();
+    let res = ring.submit(owner, &l, Frame::map_legacy(qtype, pipe, queue, db, gp.mqd, gp.wptr), inp.api_us, &mut dbs);
+    r.doorbells.append(&mut dbs);
+    match res {
+        Ok((us, _)) => {
+            d.push_str(&format!("MQD and ring rewritten, wptr 0; MES ADD_QUEUE (map_legacy) answered in {us} us; "));
+            note_gfx(owner, &l, 0, d);
+        }
+        Err(e) => {
+            r.stranded = true;
+            note_gfx(owner, &l, mes::COMPUTE_STUCK, d);
+            klog::event!(Error, "gx", "vm.recover_map", error = format!("{e:?}").as_str(); "MES did not map GFX ring 0 again");
+            d.push_str(&format!("MES ADD_QUEUE FAILED {e:?}: STRANDED; "));
+            return Err("MES did not map the queue again");
+        }
+    }
+    Ok(Queue::Pm4 { q: mq, gfx: true })
+}
+
+/// GX-9a: SDMA 0 stopped and started, found again at its pointers (the module text).
+#[inline(never)]
+pub(crate) fn sdma_queue<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, d: &mut String) -> Result<Queue, &'static str> {
+    let s = inp.sdma.ok_or("no SDMA queue known")?;
+    match sdma::restart_stalled(owner, &s.addrs, &s.layout, s.burst_nop, inp.timeout_us) {
+        Ok(t) => {
+            d.push_str(&t);
+            d.push_str("; ");
+        }
+        Err(e) => {
+            d.push_str(&format!("{e:?}; "));
+            return Err("SDMA 0 did not restart");
+        }
+    }
+    let mut found = Vec::new();
+    vmring::sdma_queue(owner, &s, &mut found).map_err(|_| "SDMA 0 is not idle after its restart")
+}
+
 /// Rewrites what `compute`, `process` or `sdma_queue` left behind, then a ring test on the fresh queue. The rung is
 /// `which.recover_rung()`; it fails (`done` true) when a step did, and times out when the fresh queue does not run.
 #[inline(never)]
@@ -224,20 +345,7 @@ pub(super) fn recover<H: Hw>(owner: &mut Bringup<Watch<H>>, q: &mut Queue, which
             Some(s) => vmproc::again(owner, c.inp, &s, r, &mut d),
             None => Err("the process queue's frame is unknown"),
         },
-        Q::Sdma => match c.inp.sdma {
-            Some(s) => sdma::restart_stalled(owner, &s.addrs, &s.layout, s.burst_nop, c.inp.timeout_us)
-                .map_err(|e| {
-                    d.push_str(&format!("{e:?}; "));
-                    "SDMA 0 did not restart"
-                })
-                .and_then(|t| {
-                    d.push_str(&t);
-                    d.push_str("; ");
-                    let mut found = Vec::new();
-                    vmring::sdma_queue(owner, &s, &mut found).map_err(|_| "SDMA 0 is not idle after its restart")
-                }),
-            None => Err("no SDMA queue known"),
-        },
+        Q::Sdma => sdma_queue(owner, c.inp, &mut d),
         Q::Gfx => Err("GFX ring 0 is not recovered: it must go on"),
     };
     let fail = |d: String, why: &str, us: u64| {

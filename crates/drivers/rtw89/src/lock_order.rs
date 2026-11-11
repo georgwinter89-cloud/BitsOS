@@ -5,9 +5,6 @@
 extern crate std;
 use ksync::{Completion, Mutex, SpinLock, ViolationKind, lockdep, order};
 
-// The checker exists only with debug_assertions (ksync lockdep.rs:99/104); a release run has no proof to give, so
-// the test is left out there instead of passing silently.
-#[cfg(debug_assertions)]
 #[test]
 fn the_order_table_accepts_the_bring_up_nesting() {
     assert!(lockdep::enabled(), "lockdep off in a debug build");
@@ -93,7 +90,6 @@ fn named_locks() -> std::vec::Vec<&'static str> {
 }
 
 // The checker's finding (W12): the nesting above is replayed by hand, so this one ties it to the driver's code.
-#[cfg(debug_assertions)]
 #[test]
 fn every_lock_of_the_driver_and_the_pci_chain_sits_inside_rtw89_core() {
     assert!(lockdep::enabled(), "lockdep off in a debug build");

@@ -168,6 +168,44 @@ fn thin_volume_full_is_enospc_not_eio() {
     assert!(code == 0, "after ENOSPC on the thin volume (sync_fs {synced:?}): {out}");
 }
 
+/// VS-H CR 5, the way a slow pool reaches /data: the device's timeout through `Disk` and the disk's page cache. fsync
+/// answers EIO, the pages stay dirty, the volume stays writable, and the next round writes everything. The same
+/// failure as a media error stops the volume.
+#[test]
+fn a_timeout_below_the_disk_cache_leaves_the_volume_writable() {
+    use super::write::{file, put};
+    use crate::inode::ROOT;
+    use block::ramdisk::{Fault, RamDisk};
+    use block::{Dispatch, Disk, DiskKind};
+    let s = Scratch::new();
+    let img = mkfs(&s, "16M", &["-b", "4096"], None);
+    let blocks = img.len() as u64 / 512;
+    let fault = |error| Fault { write: true, lba: 0, blocks, error, times: None };
+    let r = Arc::new(RamDisk::from_image("hram", 512, img, false));
+    let disk = Disk::open(r.clone(), DiskKind::Ram, Dispatch::Inline).unwrap();
+    let dev = Arc::new(crate::dev::CachedDiskDev::new(disk, 0, blocks));
+    let v = crate::Volume::mount(dev, opts()).unwrap();
+    let f = file(&v, ROOT, "f");
+    put(&v, f, 0, &[7u8; 9000]);
+    v.flush().unwrap();
+    put(&v, f, 9000, &[8u8; 9000]);
+    let g = file(&v, ROOT, "g");
+    r.inject(fault(DevError::Timeout));
+    assert_eq!(v.flush().err(), Some(crate::errno::EIO));
+    assert!(v.create(ROOT, b"h", 0o100644, 0, 0, crate::Kind::Reg).is_ok(), "a timeout must not stop the volume");
+    r.clear_faults();
+    put(&v, g, 0, &[9u8; 100]);
+    v.flush().unwrap();
+    v.sync_fs().unwrap();
+    let (code, out) = fsck(&s, &r.snapshot());
+    assert!(code == 0, "after a timeout and the next round: {out}");
+    r.inject(fault(DevError::Io));
+    put(&v, g, 100, &[9u8; 100]);
+    assert_eq!(v.flush().err(), Some(crate::errno::EIO));
+    assert_eq!(v.create(ROOT, b"i", 0o100644, 0, 0, crate::Kind::Reg).err(), Some(crate::errno::EROFS), "a media error stops it");
+    r.clear_faults();
+}
+
 // FS-8c fixer: the boot steps (`bring_up`) on a private view, the hostile images, the user folders' repair,
 // the stop pass on a frozen volume, CONFIG and the state line.
 
@@ -352,6 +390,56 @@ fn stop_on_a_frozen_volume_returns_at_once_and_does_nothing() {
     ns.create_file_bytes(b"/d/b", 0o600, b"after").unwrap();
     assert_eq!(vfs::writeback::Flush::stop(&*v), Ok(true));
     assert!(!v.st.lock().dirty, "clean after the stop");
+}
+
+/// A pool on memory whose reads can be made to fail from one block on.
+struct MemPool(std::sync::Mutex<Vec<u8>>, std::sync::atomic::AtomicU64);
+
+impl BlockDevice for MemPool {
+    fn name(&self) -> &str {
+        "mem"
+    }
+    fn info(&self) -> BlockInfo {
+        BlockInfo { block_size: 4096, blocks: self.0.lock().unwrap().len() as u64 / 4096, read_only: false, max_blocks_per_request: 256, supports_discard: false, has_volatile_cache: false }
+    }
+    fn read_blocks(&self, lba: u64, buf: &mut [u8], _p: IoPriority) -> Result<(), DevError> {
+        if lba + (buf.len() as u64 / 4096) > self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(DevError::Io);
+        }
+        let a = lba as usize * 4096;
+        buf.copy_from_slice(&self.0.lock().unwrap()[a..a + buf.len()]);
+        Ok(())
+    }
+    fn write_blocks(&self, lba: u64, buf: &[u8], _: bool, _: IoPriority) -> Result<(), DevError> {
+        let a = lba as usize * 4096;
+        self.0.lock().unwrap()[a..a + buf.len()].copy_from_slice(buf);
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), DevError> {
+        Ok(())
+    }
+}
+
+/// What bitsdisk asks before it would make a pool again: only a pool known to be half-made may be erased.
+#[test]
+fn look_at_pool_takes_nothing_it_cannot_read_for_empty() {
+    use data::PoolLook;
+    use std::sync::atomic::Ordering;
+    let dev = Arc::new(MemPool(std::sync::Mutex::new(vec![0u8; 64 << 20]), std::sync::atomic::AtomicU64::new(u64::MAX)));
+    let d: Arc<dyn BlockDevice> = dev.clone();
+    assert_eq!(data::look_at_pool(d.clone()), PoolLook::HalfMade, "no superblock at all");
+    // The pool, no volume yet: a cut in format_pool.
+    Pool::format(d.clone(), Config::default()).unwrap();
+    assert_eq!(data::look_at_pool(d.clone()), PoolLook::HalfMade, "no volume in it");
+    data::format_pool(d.clone(), b"t").unwrap();
+    assert_eq!(data::look_at_pool(d.clone()), PoolLook::Data);
+    // A read error anywhere: the same good pool is not called empty.
+    dev.1.store(0, Ordering::Relaxed);
+    assert!(matches!(data::look_at_pool(d.clone()), PoolLook::Unclear(_)), "the superblocks cannot be read");
+    dev.1.store(2, Ordering::Relaxed);
+    assert!(matches!(data::look_at_pool(d.clone()), PoolLook::Unclear(_)), "the metadata behind them cannot be read");
+    dev.1.store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(data::look_at_pool(d.clone()), PoolLook::Data);
 }
 
 #[test]

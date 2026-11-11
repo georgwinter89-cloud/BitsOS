@@ -19,6 +19,12 @@ pub enum InputEvent {
         x: f64,
         y: f64,
     },
+    /// WY-20: the same from a relative device, with its motion as it came (`lock::relative_event`).
+    Relative {
+        x: f64,
+        y: f64,
+        rel: crate::lock::Rel,
+    },
     Button {
         code: u32,
         pressed: bool,
@@ -101,6 +107,10 @@ impl App {
     pub fn handle_input_as(&mut self, ev: InputEvent, origin: Origin) {
         self.input_origin = origin;
         let time = self.now_ms();
+        // PK-L1b: a button or a wheel step while Win is down makes it a combination (no library on its release).
+        if matches!(ev, InputEvent::Button { pressed: true, .. } | InputEvent::Wheel { .. } | InputEvent::HWheel { .. }) {
+            self.lib.alone.other();
+        }
         // MC-9b: while the overlay is shown, the wheel scrolls its text and reaches no window.
         if self.install.shown() {
             match ev {
@@ -109,21 +119,13 @@ impl App {
                 _ => {}
             }
         }
+        if self.lib.open && matches!(ev, InputEvent::HWheel { .. }) {
+            return;
+        }
         match ev {
             InputEvent::Key { code, pressed } => self.key(code, pressed, time),
-            InputEvent::Motion { x, y } => {
-                let t_in = std::time::Instant::now();
-                let s = self.theme.scale;
-                self.pointer = (x / s, y / s).into();
-                self.motion(time);
-                // WY-11: the shape bitscomp chose for this spot, then the hardware cursor moves now, not at a frame.
-                self.cursor_sync();
-                self.cursor_moved(t_in);
-                // A software pointer (or the "starting" mark beside a hardware one) needs a frame.
-                if self.draw_pointer && (!self.cursor.on_hw || self.launches.busy()) {
-                    self.needs_frame = true;
-                }
-            }
+            InputEvent::Motion { x, y } => self.pointer_to(x, y, None, time),
+            InputEvent::Relative { x, y, rel } => self.pointer_to(x, y, Some(rel), time),
             InputEvent::Button { code, pressed } => self.button(code, pressed, time),
             InputEvent::Wheel { steps } => self.wheel(steps, time),
             InputEvent::HWheel { steps } => {
@@ -138,10 +140,29 @@ impl App {
         }
     }
 
+    fn pointer_to(&mut self, x: f64, y: f64, rel: Option<crate::lock::Rel>, time: u32) {
+        let t_in = std::time::Instant::now();
+        let s = self.theme.scale;
+        // WY-20: the client gets the relative motion; a lock keeps the pointer where it is, a confinement near.
+        let Some(to) = self.lock_motion((x / s, y / s).into(), rel) else { return };
+        self.pointer = to;
+        self.motion(time);
+        // WY-11: the shape bitscomp chose for this spot, then the hardware cursor moves now, not at a frame.
+        self.cursor_sync();
+        self.cursor_moved(t_in);
+        // A software pointer (or the "starting" mark beside a hardware one) needs a frame.
+        if self.draw_pointer && (!self.cursor.on_hw || self.launches.busy()) {
+            self.needs_frame = true;
+        }
+    }
+
     fn key(&mut self, code: u32, pressed: bool, time: u32) {
         let keycode = Keycode::new(code + 8);
         let state = if pressed { KeyState::Pressed } else { KeyState::Released };
         let kb = self.seat.get_keyboard().unwrap();
+        // PK-L1b (D7): Win pressed and released alone toggles the library. The Super key itself still reaches the
+        // client as before (its press and release both), so its modifier state there never sticks.
+        let alone = self.lib.alone.key(code, pressed, time);
         let action =
             kb.input::<Action, _>(self, keycode, state, SERIAL_COUNTER.next_serial(), time, |app, mods, sym| {
                 // MC-9b: the installer's overlay takes every key first (nothing reaches a window or a shortcut
@@ -183,19 +204,39 @@ impl App {
                     return FilterResult::Intercept(a);
                 }
                 // WY-5c: Super+Up maximises (and restores), as on classic desktops; WY-12: Super+Down minimises.
-                if pressed && mods.logo && !mods.ctrl && !mods.alt && sym.modified_sym() == Keysym::Up {
+                // Not while the library is open: the window under the dim would change unseen (the arrows move
+                // the library's focus instead).
+                if pressed && !app.lib.open && mods.logo && !mods.ctrl && !mods.alt && sym.modified_sym() == Keysym::Up {
                     app.intercepted.insert(keycode);
                     return FilterResult::Intercept(Action::Maximise);
                 }
-                if pressed && mods.logo && !mods.ctrl && !mods.alt && sym.modified_sym() == Keysym::Down {
+                if pressed && !app.lib.open && mods.logo && !mods.ctrl && !mods.alt && sym.modified_sym() == Keysym::Down {
                     app.intercepted.insert(keycode);
                     return FilterResult::Intercept(Action::Minimize);
+                }
+                // PK-L1b: Win+Esc (GM-6's sofa mode), Win+Space (Feld), Win+Tab (workspaces) and Win+Z (rewind) are
+                // kept for their parts (desktop.md §0 point 6): bitscomp takes them, unbound for now.
+                if pressed
+                    && mods.logo
+                    && !mods.ctrl
+                    && !mods.alt
+                    && matches!(sym.modified_sym(), Keysym::Escape | Keysym::space | Keysym::Tab | Keysym::ISO_Left_Tab | Keysym::z | Keysym::Z)
+                {
+                    app.intercepted.insert(keycode);
+                    return FilterResult::Intercept(Action::None);
                 }
                 // WY-12: Alt+Tab and Shift+Alt+Tab switch windows, minimised ones too (Shift turns Tab into
                 // ISO_Left_Tab in most layouts).
                 if pressed && mods.alt && !mods.ctrl && !mods.logo && let Some(dir) = switch_dir(sym.modified_sym(), mods.shift) {
                     app.intercepted.insert(keycode);
+                    // The switch shows another window: the library goes first, so it is not switched to unseen.
+                    app.library_close("Alt+Tab");
                     return FilterResult::Intercept(Action::Switch(dir));
+                }
+                // PK-L1b: the open library takes every key but the modifiers (they reach the client as before).
+                if pressed && app.lib.open && app.library_key(sym.modified_sym(), mods) {
+                    app.intercepted.insert(keycode);
+                    return FilterResult::Intercept(Action::None);
                 }
                 // A settings page's field being edited takes every other key (WY-5b).
                 if pressed && let Some(pid) = app.page_edit_pid() {
@@ -230,6 +271,10 @@ impl App {
             });
         if let Some(a) = action {
             self.act(a);
+        }
+        // The installer's question and the boot scene keep the keys first (MC-9b, DS-5): no library over them.
+        if alone && !self.install.shown() && !self.images.boot.shown() {
+            self.library_toggle("Win alone");
         }
     }
 

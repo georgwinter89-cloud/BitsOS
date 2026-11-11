@@ -14,7 +14,12 @@ NAME="${BITSOS_LANE:-mm}-smp16"
 log="$RUN_DIR/serial.log"
 
 cargo xtask image --name "$NAME" --ktest --config-extra "loglevel=info"
-cargo xtask qemu --name "$NAME" --smp 16 --mem 4G --timeout 300 --serial-log "$log" || true
+# The plain gate's machine with 16 CPUs: its card, USB keyboard and tablet, sound into a WAV file, 2G (the small-RAM
+# tests are in this run too). A test without what it needs is FAIL (Georg 30.10.).
+cargo xtask qemu --name "$NAME" --smp 16 --timeout 540 --net virtio --serial-log "$log" -- \
+    -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+    -audiodev "wav,id=a0,path=$RUN_DIR/a0.wav" -device intel-hda,id=h0 -device hda-duplex,bus=h0.0,audiodev=a0,mixer=off \
+    -audiodev "wav,id=a1,path=$RUN_DIR/a1.wav" -device intel-hda,id=h1 -device hda-duplex,bus=h1.0,audiodev=a1,mixer=off || true
 touch "$log"
 grep -a "KTEST done\|KTEST FAIL\|KTEST PANIC\|heap.ready\|ktest.heap\|heap.bad_free\|heap.corrupt" "$log" || true
 fail=0
@@ -29,7 +34,8 @@ for t in lazy_fill guard split brk user_touch abi_diff eager frees; do
     grep -aq "KTEST ok mm.as.$t" "$log" || { echo "RED: mm.as.$t did not pass"; fail=1; }
 done
 grep -aq "KTEST ok mm.vmap.reserve" "$log" || { echo "RED: mm.vmap.reserve"; fail=1; }
-grep -aq "as.drop_leaked" "$log" && { echo "RED: an address space leaked on drop"; fail=1; }
+# mm.tlb.give_up makes one on purpose (a CPU that never confirms): that one is kept out of use by design.
+grep -a "as.drop_leaked" "$log" | grep -avq "reason=shootdown_unconfirmed" && { echo "RED: an address space leaked on drop"; fail=1; }
 # MM-6: with 16 CPUs the vmap ranges go back (shootdown) instead of into the quarantine, DMA UC/WC works.
 for t in vmap.guard_fault vmap.unmap_frees_tables dma.uc_wc_pat tlb.storm tlb.stale_user; do
     grep -aq "KTEST ok mm.$t" "$log" || { echo "RED: mm.$t did not pass"; fail=1; }

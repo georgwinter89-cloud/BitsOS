@@ -1,0 +1,9 @@
+[package]
+name = "reaper"
+version = "0.1.0"
+edition = "2024"
+description = "64-bit stand-in for Valve's 32-bit steamrt64/reaper (GM-2b)"
+
+[dependencies]
+# Fork, exec, signal handlers: `sys.rs`. Same pin as bitsmcp and bitsinstall, already in user/Cargo.lock.
+libc = "=0.2.190"

@@ -15,20 +15,24 @@
 //! `sys_net` (/sys/devices/system/cpu, /sys/class/net); `attr::Live` is their text-at-open file.
 
 mod attr;
+mod buddyinfo;
 mod cpuinfo;
 mod fd;
 mod maps;
 mod mem;
 mod mounts;
 mod ns;
+mod pagetypeinfo;
 mod stat;
 mod sys_cache;
 mod sys_cpu;
 mod sys_net;
 mod sysctl;
+mod sysv;
 mod sysfs;
 mod system;
 mod text;
+mod vmstat;
 #[cfg(test)]
 mod tests;
 
@@ -470,8 +474,8 @@ impl FileSource for PidFile {
             What::OomScoreAdj => format!("{}\n", g.oom_score_adj()).into_bytes(),
             What::Mounts => mounts::render(&p, false).into_bytes(),
             What::MountInfo => mounts::render(&p, true).into_bytes(),
-            // `proc_pid_personality`: V2 has no personality(2), every process runs as PER_LINUX.
-            What::Personality => b"00000000\n".to_vec(),
+            // `proc_pid_personality` of the thread (kernel/exec_domain.c).
+            What::Personality => format!("{:08x}\n", th.as_ref().map_or(0, |t| t.prctl().personality())).into_bytes(),
             // `proc_cgroup_show` with only the unified hierarchy and no cgroups made: the root cgroup.
             What::Cgroup => b"0::/\n".to_vec(),
         })

@@ -42,6 +42,22 @@ impl Flip {
         self.shown
     }
 
+    /// WY-17: the window the frame being drawn goes to (`aim`).
+    pub fn back(&self) -> usize {
+        self.back
+    }
+
+    /// WY-17: the renderer draws into the window itself, and the kernel named which one: it may not be the one this
+    /// count would pick, the engine alternates its buffers for every frame it ever flipped. A window comes back two
+    /// frames old; whole while `fresh` (at the start) and when something else wrote into the buffers (`whole`).
+    pub fn aim(&mut self, window: usize, whole: bool) -> (usize, usize) {
+        self.back = window;
+        self.shown = window ^ 1;
+        let fresh = self.fresh > 0;
+        self.fresh = self.fresh.saturating_sub(1);
+        (window, if fresh || whole { 0 } else { 2 })
+    }
+
     /// The window to draw into now and the rectangles to copy there (`full` is the whole screen).
     pub fn frame(&mut self, damage: &[Rect], full: Rect) -> (usize, Vec<Rect>) {
         let mut rects = std::mem::take(&mut self.prev);
@@ -129,6 +145,31 @@ mod tests {
         assert_eq!(f.frame(&[r(5)], full()), (1, vec![r(5)]), "then only the damage");
         f.moved_to(0);
         assert_eq!(f.frame(&[r(6)], full()), (0, vec![r(6), full()]));
+    }
+
+    #[test]
+    fn a_window_the_renderer_draws_itself_is_two_frames_old() {
+        let mut f = Flip::new(true);
+        assert_eq!(f.aim(1, false), (1, 0), "both whole at the start");
+        f.landed(&[]);
+        assert_eq!(f.aim(0, false), (0, 0));
+        f.landed(&[]);
+        assert_eq!(f.aim(1, false), (1, 2));
+        assert_eq!(f.shown(), 0);
+        f.landed(&[]);
+        assert_eq!(f.aim(0, true), (0, 0), "the kernel says something else wrote there");
+        f.landed(&[]);
+        assert_eq!(f.aim(1, false), (1, 2));
+        assert_eq!(f.back(), 1);
+        assert_eq!(f.aim(1, false), (1, 2), "nothing drawn, nothing flipped: the same window, as old as it was");
+    }
+
+    #[test]
+    fn the_kernel_names_the_window_not_the_count() {
+        let mut f = Flip::new(true);
+        // The engine showed its second buffer when the renderer started: the first frame goes to the first.
+        assert_eq!(f.aim(0, false), (0, 0));
+        assert_eq!(f.shown(), 1);
     }
 
     #[test]

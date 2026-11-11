@@ -25,6 +25,9 @@ const REFUSED: u64 = 1 << 62;
 pub(crate) const PF_P: u64 = 1;
 pub(crate) const PF_W: u64 = 2;
 const SEC: u64 = 1_000_000_000;
+/// `stale_user`'s tries at a freed-tables shootdown that reaches a CPU still lazy (one that switched threads
+/// first proves nothing about the lazy leave).
+const LAZY_TRIES: u32 = 8;
 
 fn e<T: core::fmt::Debug>(x: T) -> String {
     format!("{x:?}")
@@ -57,8 +60,29 @@ fn val(i: u64) -> u64 {
     0x0123_4500_0000 | i
 }
 
+/// Every program's frames: only a machine where nothing else runs can compare it (QemuOnly tests, `frames_back`).
 fn user_frames() -> u64 {
     mm_core::frames().map_or(0, |f| f.stats().used_by_kind[mm_core::Kind::User as usize])
+}
+
+fn frames_back(what: &str, before: u64) -> TestResult {
+    let now = user_frames();
+    kassert!(now == before, "{what}: user frames {before} bytes -> {now} bytes");
+    Ok(())
+}
+
+/// What a live machine's tests can say about frames: the counters that move only when a space's own books are wrong
+/// (tables kept, a frame lost, a teardown that found other pages than the space counted). Other programs never move
+/// them on a healthy machine, as they do move `user_frames`.
+pub(crate) fn frame_errors() -> [u64; 4] {
+    let mut out = [0; 4];
+    for (name, v) in klog::metrics::snapshot() {
+        let i = ["mm.as.tables_leaked", "mm.as.frames_lost", "mm.as.counter_mismatches", "mm.as.counter_underflows"].iter().position(|n| *n == name);
+        if let Some(i) = i {
+            out[i] = v;
+        }
+    }
+    out
 }
 
 // What the other CPUs run (hard-IRQ context: atomics and the probes only).
@@ -190,12 +214,11 @@ ktest!("mm.tlb.kernel_global", Safe, kernel_global);
 fn stale_user() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     // The kernel root itself: this thread may sit lazily on some program's root right now.
     let kroot = paging::home_root();
-    let frames_before = user_frames();
-    let leaked_before = crate::aspace::AS_LEAKED.get();
+    let errors_before = frame_errors();
     let s0 = tlb::stats();
     let dropped;
     {
@@ -281,38 +304,71 @@ fn stale_user() -> TestResult {
         klog::event!(Info, "mm", "ktest.tlb_stale_user_lazy", aps = aps.len(), kept = kept, skips = s_kept.lazy_skips - s_skip.lazy_skips,
             catchups = s_kept.lazy_catchups - s_skip.lazy_catchups, ipis = s_kept.ipis - s_skip.ipis, lazy_leaves = s_kept.lazy_leaves - s_skip.lazy_leaves);
         // Freed tables: the far page has a page table (and more) of its own; its unmap asks the lazy CPUs too, and
-        // they leave the root (Linux shoots lazy CPUs when tables are freed).
-        // Before the CPUs go lazy: a switch right after `ap_lazy` may already make one an owner again.
-        let sw = switches(&aps);
-        for &c in &aps {
-            kassert!(on(c, ap_lazy, 0)? == 1, "CPU {c} did not keep the root lazily");
+        // they leave the root (Linux shoots lazy CPUs when tables are freed). The guarantee is for a CPU that is
+        // still lazy when the shootdown comes: one that switched threads meanwhile may have become an owner again
+        // (a thread whose saved root is `a`'s, from an earlier probe: flushed as an owner, no lazy leave) or gone
+        // to another root (gate 9, 1G: "1 lazy CPUs, none left the root lazily"). So the CPUs that were lazy and
+        // did not switch until the unmap had returned must all have left lazily; a try in which every lazy CPU
+        // switched proves nothing about the lazy leave and goes again with a new far page (new tables).
+        let mut sw;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            if tries > 1 {
+                kassert!(a.sys_mmap(far, P, RW, AP | MAP_FIXED, 0).map_err(e)? == far, "fixed mapping refused (try {tries})");
+                a.write_u64(far, val(7)).map_err(e)?;
+                for &c in &aps {
+                    kassert!(on(c, ap_read_in, far)? == val(7), "CPU {c} far page (try {tries})");
+                }
+            }
+            // Before the CPUs go lazy: a switch right after `ap_lazy` may already make one an owner again.
+            sw = switches(&aps);
+            for &c in &aps {
+                kassert!(on(c, ap_lazy, 0)? == 1, "CPU {c} did not keep the root lazily");
+            }
+            // Taken before the look: a CPU lazy at its look and without a switch after this was lazy until the
+            // shootdown reached it (nothing else on it changes the flag: no other flush of `a`, no copy of it).
+            let sw_lazy = switches(&aps);
+            let lazy: Vec<usize> = aps.iter().copied().filter(|&c| on(c, ap_is_lazy, 0).unwrap_or(0) == 1).collect();
+            let lazy0 = tlb::stats().lazy_leaves;
+            let tables0 = paging::count_user_tables(a.root());
+            a.sys_munmap(far, P).map_err(e)?;
+            let tables1 = paging::count_user_tables(a.root());
+            kassert!(tables1 < tables0, "the far unmap freed no tables ({tables0} -> {tables1})");
+            let left = tlb::stats().lazy_leaves - lazy0;
+            let switched = moved(&aps, &sw_lazy);
+            let stayed: Vec<usize> = lazy.iter().copied().filter(|c| !switched.contains(c)).collect();
+            kassert!(left >= stayed.len() as u64, "CPUs {stayed:?} stayed lazy on the root without a thread switch, {left} left it lazily \
+                ({lazy0} -> {}; lazy {lazy:?}, switched {switched:?}, try {tries})", tlb::stats().lazy_leaves);
+            // MM-11 fixer: a CPU still in the mask must have taken the root again through a thread switch (a thread
+            // whose saved root is `a`'s, see above: it flushed as an owner and may be lazy again by now); one that
+            // stayed without a switch kept it although the freed tables asked it to leave. Neither may read the
+            // freed page through its TLB.
+            let kept = a.loaded_on();
+            let moved = moved(&aps, &sw);
+            kassert!(kept.iter().all(|c| moved.contains(c)), "still in the mask after leaving: {kept:?} (switched: {moved:?}, lazy now: {:?})",
+                kept.iter().map(|&c| on(c, ap_is_lazy, 0).unwrap_or(9)).collect::<Vec<_>>());
+            for &c in &kept {
+                let r = on(c, ap_read, far)?;
+                kassert!(on(c, ap_root, 0)? != a.root() || gone(r), "CPU {c} read {r:#x} from the freed far page");
+            }
+            if !stayed.is_empty() || tries == LAZY_TRIES {
+                kassert!(!stayed.is_empty(), "in {tries} tries every lazy CPU switched threads before the freed tables' shootdown: \
+                    the lazy leave never ran (lazy {lazy:?}, switched {switched:?})");
+                klog::event!(Info, "mm", "ktest.tlb_stale_user_tables", tries = tries, lazy = lazy.len(), stayed = stayed.len(), left = left);
+                break;
+            }
         }
-        let still: u64 = aps.iter().map(|&c| on(c, ap_is_lazy, 0).unwrap_or(0)).sum();
-        let lazy0 = tlb::stats().lazy_leaves;
-        let tables0 = paging::count_user_tables(a.root());
-        a.sys_munmap(far, P).map_err(e)?;
-        let tables1 = paging::count_user_tables(a.root());
-        kassert!(tables1 < tables0, "the far unmap freed no tables ({tables0} -> {tables1})");
-        let left = tlb::stats().lazy_leaves - lazy0;
-        kassert!(still == 0 || left >= 1, "{still} lazy CPUs, none left the root lazily ({lazy0} -> {})", tlb::stats().lazy_leaves);
-        // MM-11 fixer: a CPU still in the mask must have taken the root again through a thread switch (a thread
-        // whose saved root is `a`'s, see above: it flushed as an owner and may be lazy again by now); one that
-        // stayed without a switch kept it although the freed tables asked it to leave. Neither may read the
-        // freed page through its TLB.
-        let kept = a.loaded_on();
-        let moved = moved(&aps, &sw);
-        kassert!(kept.iter().all(|c| moved.contains(c)), "still in the mask after leaving: {kept:?} (switched: {moved:?}, lazy now: {:?})",
-            kept.iter().map(|&c| on(c, ap_is_lazy, 0).unwrap_or(9)).collect::<Vec<_>>());
-        for &c in &kept {
-            let r = on(c, ap_read, far)?;
-            kassert!(on(c, ap_root, 0)? != a.root() || gone(r), "CPU {c} read {r:#x} from the freed far page");
-        }
-        for &c in &aps {
+        for (k, &c) in aps.iter().enumerate() {
             // INT-A2a2: the invariant is "not on a's root any more". The CPU may have run another program's
-            // thread meanwhile and sit on that root (gate flake "CPU 1 not on the kernel root after leaving").
+            // thread meanwhile and sit on that root (gate flake "CPU 1 not on the kernel root after leaving"), or
+            // be back on `a`'s through a thread switch after the mask was read (a thread whose saved root is
+            // `a`'s, as above: gate 9's "CPU 1 on 0x104e000 after leaving (a 0x104e000 ...)"); the switch count is
+            // read after the root, so a CPU counted as not switched was not on `a`'s root through a switch.
             let r = on(c, ap_root, 0)?;
-            kassert!((r != a.root() || kept.contains(&c)) && (r == kroot || r == a.root() || tlb::has_context(r)),
-                "CPU {c} on {r:#x} after leaving (a {:#x}, kernel {kroot:#x})", a.root());
+            let back = hal::switch::switch_count_of(c) > sw[k];
+            kassert!((r != a.root() || back) && (r == kroot || r == a.root() || tlb::has_context(r)),
+                "CPU {c} on {r:#x} after leaving (a {:#x}, kernel {kroot:#x}, switched since {back})", a.root());
             kassert!(on(c, ap_activate, a.root())? == a.root());
             kassert!(gone(on(c, ap_read, base + 2 * P)?), "CPU {c} reads page 2 after munmap");
             kassert!(on(c, ap_read, base + 3 * P)? == val(3), "CPU {c} page 3 after reload");
@@ -324,8 +380,7 @@ fn stale_user() -> TestResult {
         kassert!(r != dropped && (r == kroot || tlb::has_context(r)), "CPU {c} kept a dropped root loaded ({r:#x}, dropped {dropped:#x})");
     }
     let s1 = tlb::stats();
-    kassert!(crate::aspace::AS_LEAKED.get() == leaked_before, "the address space leaked");
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     kassert!(s1.give_ups == s0.give_ups, "a shootdown gave up");
     kassert!(s1.dying_leaves >= s0.dying_leaves + aps.len() as u64, "dying leaves {} -> {}", s0.dying_leaves, s1.dying_leaves);
     klog::event!(Info, "mm", "ktest.tlb_stale_user", aps = aps.len(), user = s1.user - s0.user, ipis = s1.ipis - s0.ipis,
@@ -334,12 +389,19 @@ fn stale_user() -> TestResult {
 }
 ktest!("mm.tlb.stale_user", Safe, stale_user);
 
+fn stale_user_frames() -> TestResult {
+    let before = user_frames();
+    stale_user()?;
+    frames_back("stale_user", before)
+}
+ktest!("mm.tlb.stale_user_frames", QemuOnly, stale_user_frames);
+
 /// A kernel page every AP has read is gone on all of them after `unmap_4k` (the KernelStack path), and the
 /// range goes back (no quarantine).
 fn stale_kernel() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let root = paging::kernel_root().ok_or("kernel still on the loader's tables")?;
     let fa = mm_core::frames().ok_or("no frame allocator")?;
@@ -408,7 +470,7 @@ ktest!("mm.tlb.stale_kernel", Safe, stale_kernel);
 fn stacks() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let s0 = tlb::stats();
     let seen = Arc::new(ksync::SpinLock::new(Vec::new()));
@@ -466,7 +528,7 @@ fn pcid() -> TestResult {
     if !s.pcid {
         // CPUID leaf 1 ECX bit 17 is clear (`tlb.ready pcid=false`): hidden by the hypervisor (`-cpu ...,-pcid`) or
         // the CPU has none. Zen 4 (the Mini-PC) has it.
-        return ktest::skip("CPUID shows no PCID (leaf 1 ECX bit 17): every switch flushes");
+        return ktest::fail("CPUID shows no PCID (leaf 1 ECX bit 17): every switch flushes");
     }
     if s.pcid_cpus == 0 && s.pcid_no_pge + s.pcid_cr3_bits > 0 {
         return Err(format!("CPUID offers PCID, but no CPU turned it on: {} without CR4.PGE, {} with CR3 low bits set", s.pcid_no_pge, s.pcid_cr3_bits));
@@ -516,7 +578,7 @@ fn pcid() -> TestResult {
     paging::activate(kroot);
     r
 }
-ktest!("mm.tlb.pcid", Safe, pcid);
+ktest!("mm.tlb.pcid", QemuAll, pcid);
 
 // ---------------------------------------------------------------------------------------------------------
 // A CPU that does not answer: resend, and give up.
@@ -577,7 +639,7 @@ fn make_busy(cpu: usize, ns: u64, root: u64) -> Result<hal::vectors::Vector, Str
 }
 
 fn resend() -> TestResult {
-    let Some(&c) = aps().first() else { return ktest::skip("one CPU") };
+    let Some(&c) = aps().first() else { return ktest::fail("one CPU") };
     let a = lazy()?;
     let base = a.sys_mmap(0, P, RW, AP, 0).map_err(e)?;
     a.write_u64(base, val(7)).map_err(e)?;
@@ -595,7 +657,7 @@ fn resend() -> TestResult {
     m.map_err(e)?;
     if on_busy {
         // This thread ran on the busy CPU itself (it may migrate since SC-3): the change came after the busy end.
-        return ktest::skip("the test thread ran on the busy CPU");
+        return ktest::fail("the test thread ran on the busy CPU");
     }
     let s1 = tlb::stats();
     kassert!(s1.resends > s0.resends, "no resend while CPU {c} was busy ({waited} ns)");
@@ -711,7 +773,7 @@ impl Drop for OnCpu0 {
 /// A CPU stuck longer than `GIVE_UP_NS`: the unmap returns while it is still stuck, its frames stay out of use
 /// until the drop, and the stuck CPU is back in service once it answers.
 fn give_up() -> TestResult {
-    let Some(&c) = aps().last() else { return ktest::skip("one CPU") };
+    let Some(&c) = aps().last() else { return ktest::fail("one CPU") };
     let _cpu0 = OnCpu0::take()?;
     kassert!(hal::percpu::this_cpu() == 0, "the test thread runs on CPU {}", hal::percpu::this_cpu());
     let frames_before = user_frames();
@@ -895,11 +957,11 @@ fn storm_thread(a: &AddressSpace, first: usize, step: usize, until: u64) -> Resu
 fn storm() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     const THREADS: usize = 4;
     const RUN_NS: u64 = 1_000_000_000;
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let s0 = tlb::stats();
     let a = Arc::new(lazy()?);
     let base = a.sys_mmap(0, STORM_PAGES as u64 * P, RW, AP, 0).map_err(e)?;
@@ -992,6 +1054,9 @@ fn storm() -> TestResult {
     let (samples, skipped, stale, first) = (S_SAMPLES.load(SeqCst), S_SKIPPED.load(SeqCst), S_STALE.load(SeqCst), S_FIRST.load(SeqCst));
     let ops = ops.load(SeqCst);
     let s1 = tlb::stats();
+    // This test's own frames, exactly what its table says is mapped; what other programs hold does not count here.
+    let mapped = PAGES.iter().filter(|p| p.load(SeqCst) & 3 != K_GONE).count() as u64;
+    let resident = a.resident_pages();
     drop(a);
     klog::event!(Info, "mm", "ktest.tlb_storm", cpus = aps.len() + 1, workers = workers.len(), threads = THREADS, ops = ops, samples = samples,
         skipped = skipped, stale = stale, shootdowns = s1.user - s0.user, ipis = s1.ipis - s0.ipis, irqs = s1.irqs - s0.irqs,
@@ -1001,10 +1066,77 @@ fn storm() -> TestResult {
         S_BAD.0.load(SeqCst), S_BAD.1.load(SeqCst), S_BAD.2.load(SeqCst), S_BAD.3.load(SeqCst));
     kassert!(ops >= 30 && samples >= 1000, "too little happened: {ops} ops, {samples} samples");
     kassert!(s1.give_ups == s0.give_ups, "a shootdown gave up during the storm");
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(resident == mapped, "the space holds {resident} pages, its table says {mapped}");
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
 ktest!("mm.tlb.storm", Safe, storm);
+
+/// Programs of a live machine as far as frames go: an address space that keeps mapping, touching and unmapping.
+fn load_thread(stop: &AtomicBool, mut x: u64) -> Result<(), String> {
+    let a = lazy()?;
+    while !stop.load(SeqCst) {
+        x = x.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(1);
+        let n = 1 + (x >> 40) % 256;
+        let base = a.sys_mmap(0, n * P, RW, AP, 0).map_err(e)?;
+        for i in 0..n {
+            a.write_u64(base + i * P, i).map_err(e)?;
+        }
+        sched::yield_now();
+        a.sys_munmap(base, n * P).map_err(e)?;
+    }
+    Ok(())
+}
+
+/// The storm twice in a row with frames moving around it. The check `mm.tlb.storm` once had, machine-wide, is red under
+/// such a load while it runs (asserted, `moved`), as it was on the Mini-PC; with the load ended every frame is back:
+/// no leak, neither of the storm nor of the load.
+fn storm_under_load() -> TestResult {
+    let before = user_frames();
+    let stop = Arc::new(AtomicBool::new(false));
+    let errs = Arc::new(ksync::SpinLock::new(Vec::<String>::new()));
+    let mut hs = Vec::new();
+    let mut started = Ok(());
+    for k in 0..4 {
+        let (stop, errs) = (stop.clone(), errs.clone());
+        match sched::spawn("mm.tlb.load", sched::Class::Normal, move || {
+            if let Err(x) = load_thread(&stop, k + 1) {
+                errs.lock().push(x);
+            }
+        }) {
+            Ok(h) => hs.push(h),
+            Err(x) => {
+                started = Err(e(x));
+                break;
+            }
+        }
+    }
+    let mut moved = false;
+    let until = time::now_ns() + SEC / 10;
+    while !moved && time::now_ns() < until {
+        moved = user_frames() != before;
+        sched::yield_now();
+    }
+    let mut runs = started.and_then(|()| storm());
+    if runs.is_ok() {
+        klog::event!(Info, "mm", "ktest.tlb_storm_load", other_bytes = user_frames() as i64 - before as i64);
+        runs = storm();
+    }
+    stop.store(true, SeqCst);
+    for h in &hs {
+        if !h.join_timeout(30 * SEC) {
+            errs.lock().push(String::from("a load thread did not finish"));
+        }
+    }
+    runs?;
+    let first_err = errs.lock().first().cloned();
+    if let Some(x) = first_err {
+        return Err(x);
+    }
+    kassert!(moved, "the load never moved the machine's count");
+    frames_back("two storms under load", before)
+}
+ktest!("mm.tlb.storm_under_load", QemuOnly, storm_under_load);
 
 // ---------------------------------------------------------------------------------------------------------
 
@@ -1039,7 +1171,7 @@ fn probe_close_irq(_v: u8) {
 /// kernel #PF on the AP) nor gives up: the close waits for the probe in flight, the next one is refused.
 fn probe_close() -> TestResult {
     let aps = aps();
-    let Some(&cpu) = aps.first() else { return ktest::skip("one CPU") };
+    let Some(&cpu) = aps.first() else { return ktest::fail("one CPU") };
     for round in 0..20u64 {
         on(cpu, ap_activate, paging::home_root())?;
         PC_COUNT.store(0, SeqCst);

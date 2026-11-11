@@ -383,7 +383,7 @@ fn mutex_storm() -> TestResult {
 
 fn run_abi(argv: &[&str], want: &str) -> TestResult {
     if vfs::root_ns().lookup("/bin/abi-ntsync").is_err() {
-        return ktest::skip("/bin/abi-ntsync is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-ntsync is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let out = proc::stdio::Capture::new(1 << 20);
     let env = ["HOME=/", "PATH=/bin", "ABI_TEST=1"];

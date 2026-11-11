@@ -157,7 +157,7 @@ ktest!("fs.vfs.tmpfs_budget", Safe, tmpfs_budget);
 fn linux_cases() -> TestResult {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/fs-cases").is_err() {
-        return ktest::skip("/bin/fs-cases is not in this image (xtask change request in plan/notes/fs-FS-1.md)");
+        return ktest::fail("/bin/fs-cases is not in this image (xtask change request in plan/notes/fs-FS-1.md)");
     }
     let n = RUN.fetch_add(1, Ordering::Relaxed);
     // FS-13: the cases run on a plain tmpfs of their own: /tmp is nodev on V2 (AB-7c) but was not where CachyOS

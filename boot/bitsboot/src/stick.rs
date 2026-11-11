@@ -115,6 +115,9 @@ pub fn log(s: &StickInfo, volume: Option<(String, u64)>) {
     } else {
         info!("stick: no USB VID:PID (not a USB device, or the firmware does not tell)");
     }
+    if s.path.windows(5).any(|w| w == b"NVMe(") {
+        info!("stick: the boot volume is an NVMe partition: the kernel writes it only as CONFIG nvme_boot= names it");
+    }
     match s.block0.get(..96).and_then(fat_id) {
         Some(f) => info!("stick: {} volume label \"{}\" serial {}", if f.fat32 { "FAT32" } else { "FAT" }, f.label, f.serial_text()),
         None if s.flags & stick_flags::BLOCK0_VALID != 0 => warn!("stick: block 0 holds no FAT boot sector"),

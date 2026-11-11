@@ -22,6 +22,7 @@ pub mod fbcursor;
 pub mod fbdev;
 mod flip;
 pub mod headless;
+pub mod scanout;
 pub mod hotplug;
 #[cfg(feature = "nested")]
 pub mod hostshm;
@@ -53,6 +54,23 @@ pub trait Backend {
     /// The scanout's frame period and one vblank time on CLOCK_MONOTONIC, when the output knows them.
     fn pacing(&self) -> Option<(Duration, Duration)> {
         None
+    }
+    /// WY-17: the output's two windows as dma-bufs for the renderer to draw into; why not.
+    fn scanout_windows(&mut self) -> Result<scanout::Windows, String> {
+        Err("this back end has no scanout buffers".into())
+    }
+    /// WY-17: the renderer took them: from now on `present` flips and copies nothing.
+    fn scanout_on(&mut self) {}
+    /// WY-17, before a frame: where the renderer draws it (None: into its picture, for `present` to copy). May wait
+    /// for the last flip.
+    fn scanout_frame(&mut self) -> Option<scanout::Aim> {
+        None
+    }
+    /// WY-17: the renderer cannot draw there any more: back to the copy.
+    fn scanout_lost(&mut self, _why: &str) {}
+    /// WY-17, after a frame: the direct path ended just now, so the picture must be drawn again.
+    fn scanout_left(&mut self) -> bool {
+        false
     }
 }
 

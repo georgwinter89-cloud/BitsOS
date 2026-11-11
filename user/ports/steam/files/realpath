@@ -1,0 +1,28 @@
+#!/bin/sh
+# GM-2a: Valve's pv-run.sh runs `realpath --no-symlinks "$0"` on the host side; BusyBox's realpath has no such option.
+# --no-symlinks is answered here lexically, as GNU's: the path made absolute, `.` and `..` removed, links left alone.
+# Everything else goes to the system's realpath.
+case "$1" in
+  --no-symlinks | -s) shift ;;
+  *) exec /bin/realpath "$@" ;;
+esac
+rc=0
+for p in "$@"; do
+  case "$p" in
+    '') echo "realpath: '': No such file or directory" >&2; rc=1; continue ;;
+    /*) ;;
+    *) p="$(pwd)/$p" ;;
+  esac
+  printf '%s\n' "$p" | awk -F/ '{
+    n = 0
+    for (i = 1; i <= NF; i++) {
+      if ($i == "" || $i == ".") continue
+      if ($i == "..") { if (n > 0) n--; continue }
+      s[++n] = $i
+    }
+    o = ""
+    for (i = 1; i <= n; i++) o = o "/" s[i]
+    print (o == "" ? "/" : o)
+  }'
+done
+exit $rc

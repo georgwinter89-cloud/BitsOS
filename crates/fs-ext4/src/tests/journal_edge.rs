@@ -5,7 +5,7 @@
 use super::journal::{content, debugfs_w, ro};
 use super::util::*;
 use super::write::{file, put};
-use crate::errno::{EBUSY, EROFS};
+use crate::errno::{EBUSY, EIO, EROFS};
 use crate::inode::ROOT;
 use crate::jbd2::{self, gb32, gb64, pb32};
 use crate::le::g16;
@@ -157,6 +157,78 @@ fn a_device_that_fails_in_a_commit_leaves_a_replayable_log() {
             assert_clean(&s, &d2.image(), &format!("{o:?}: commit failed at write {k} of {n}, then replay"));
         }
     }
+}
+
+/// VS-H CR 5: a commit that hits the device's timeout answers EIO and the volume stays writable; the next commit
+/// writes everything; a crash in between finds the old state or the new one, never a mix.
+#[test]
+fn a_timeout_in_a_commit_keeps_the_volume_writable() {
+    for o in [&["-b", "4096"][..], &["-b", "1024", "-O", "^64bit,^metadata_csum"][..]] {
+        let s = Scratch::new();
+        let (dev0, v0) = mount(mkfs(&s, "16M", o, None));
+        let kept = file(&v0, ROOT, "kept");
+        put(&v0, kept, 0, &[7u8; 5000]);
+        v0.flush().unwrap();
+        drop(v0);
+        let (dev, v) = mount(dev0.image());
+        let f = file(&v, ROOT, "new");
+        put(&v, f, 0, &[9u8; 9000]);
+        dev.time_out(true);
+        assert_eq!(v.flush().err(), Some(EIO), "{o:?}: fsync during the timeout");
+        assert_eq!(v.flush().err(), Some(EIO), "{o:?}: a second fsync during the timeout");
+        let crash = dev.image();
+        // More changes in memory while the device is slow: nothing may be lost or stop the volume.
+        let g = file(&v, ROOT, "while_slow");
+        dev.time_out(false);
+        put(&v, g, 0, &[5u8; 3000]);
+        v.flush().unwrap();
+        assert_eq!(content(&v, "/new").as_deref(), Some(&[9u8; 9000][..]), "{o:?}");
+        v.sync_fs().unwrap();
+        drop(v);
+        assert_clean(&s, &dev.image(), &format!("{o:?}: after the retry"));
+        let (_, v2) = mount(dev.image());
+        assert_eq!(content(&v2, "/while_slow").as_deref(), Some(&[5u8; 3000][..]), "{o:?}");
+        assert_eq!(content(&v2, "/kept").as_deref(), Some(&[7u8; 5000][..]), "{o:?}");
+        drop(v2);
+        // The crash during the timeout.
+        let (d3, v3) = mount(crash);
+        assert_eq!(content(&v3, "/kept").as_deref(), Some(&[7u8; 5000][..]), "{o:?}: crash during the timeout");
+        v3.sync_fs().unwrap();
+        drop(v3);
+        assert_clean(&s, &d3.image(), &format!("{o:?}: crash during the timeout, then replay"));
+    }
+}
+
+/// A sync_fs (and so a snapshot's freeze) hitting the timeout leaves the volume dirty and writable too.
+#[test]
+fn a_timeout_while_making_clean_starts_over() {
+    let s = Scratch::new();
+    let (dev, v) = mount(mkfs(&s, "16M", &["-b", "4096"], None));
+    let f = file(&v, ROOT, "f");
+    put(&v, f, 0, &[3u8; 5000]);
+    dev.time_out(true);
+    assert_eq!(v.sync_fs().err(), Some(EIO));
+    dev.time_out(false);
+    let g = file(&v, ROOT, "g");
+    put(&v, g, 0, &[4u8; 100]);
+    v.sync_fs().unwrap();
+    drop(v);
+    assert_clean(&s, &dev.image(), "sync_fs again after a timeout");
+}
+
+/// The same failure as a media error stops the volume, as before (Linux errors=remount-ro).
+#[test]
+fn a_media_error_after_an_old_timeout_still_stops_the_volume() {
+    let s = Scratch::new();
+    let (dev, v) = mount(mkfs(&s, "16M", &["-b", "4096"], None));
+    let f = file(&v, ROOT, "f");
+    put(&v, f, 0, &[3u8; 5000]);
+    dev.time_out(true);
+    assert_eq!(v.flush().err(), Some(EIO));
+    dev.time_out(false);
+    dev.fail_writes(true);
+    assert_eq!(v.flush().err(), Some(EIO));
+    assert_eq!(v.create(ROOT, b"after", 0o100644, 0, 0, Kind::Reg).err(), Some(EROFS), "a media error must stop the volume");
 }
 
 #[test]

@@ -113,6 +113,23 @@ impl BoManager {
         self.free.iter().map(|(s, e)| e - s).sum()
     }
 
+    /// GX-8a: `r` joins the free list (a sub-allocator over slabs of another manager: it starts with everything
+    /// reserved and gets its slabs here). `r` must be neither free nor in a BO.
+    pub fn donate(&mut self, r: Range<u64>) {
+        if !r.is_empty() && r.end <= self.size {
+            self.give(r);
+        }
+    }
+
+    /// GX-8a: the opposite of `donate`: `r` leaves the free list if all of it is free (else false, nothing changed).
+    pub fn withdraw(&mut self, r: Range<u64>) -> bool {
+        if r.is_empty() || !self.is_free(&r) {
+            return false;
+        }
+        self.take(r);
+        true
+    }
+
     /// Removes `r` from the free list (it must be free).
     fn take(&mut self, r: Range<u64>) {
         let hits: Vec<(u64, u64)> =

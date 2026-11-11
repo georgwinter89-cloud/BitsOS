@@ -9,8 +9,57 @@ use crate::error::{Result, VolError};
 use crate::layout::{FLAG_AUTO, FLAG_READ_ONLY, FLAG_ROLLBACK, FLAG_SNAPSHOT, KIND_RECORD, LABEL_BOUND, Record, Tree};
 use crate::pool::{Pool, Vol, zeroed};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use devmodel::block::IoPriority;
+use devmodel::DevError;
+use devmodel::block::{BlockDevice, FrameIo, IoBuf, IoPriority};
+
+/// BL-2: one piece of a volume read: `len` bytes at `at` of the request, from byte `src` of the pool's device
+/// (None: a hole, zeros).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Piece {
+    pub at: usize,
+    pub len: usize,
+    pub src: Option<u64>,
+}
+
+/// Reads a plan into a byte buffer (`buf.len()` = the plan's length), splitting runs to the device's limit.
+pub(crate) fn read_pieces(dev: &Arc<dyn BlockDevice>, bs: u64, plan: &[Piece], buf: &mut [u8], prio: IoPriority) -> core::result::Result<(), DevError> {
+    let max = (dev.info().max_blocks_per_request.max(1) as usize).saturating_mul(bs as usize);
+    for p in plan {
+        let dst = buf.get_mut(p.at..p.at + p.len).ok_or(DevError::InvalidArgument)?;
+        match p.src {
+            None => dst.fill(0),
+            Some(src) => {
+                for (i, part) in dst.chunks_mut(max).enumerate() {
+                    dev.read_blocks((src + (i * max) as u64) / bs, part, prio)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads a plan into frames: holes zeroed, every run handed down in one `read_frames` call (the device below
+/// merges and runs them side by side).
+pub(crate) fn read_pieces_frames(dev: &Arc<dyn BlockDevice>, bs: u64, plan: &[Piece], buf: &IoBuf, prio: IoPriority) -> core::result::Result<(), DevError> {
+    let mut ios: Vec<FrameIo> = Vec::new();
+    ios.try_reserve_exact(plan.iter().filter(|p| p.src.is_some()).count()).map_err(|_| DevError::NoMemory)?;
+    for p in plan {
+        match p.src {
+            None => {
+                if !buf.zero(p.at, p.len) {
+                    return Err(DevError::InvalidArgument);
+                }
+            }
+            Some(src) => ios.push(FrameIo { lba: src / bs, buf: buf.slice(p.at, p.len).ok_or(DevError::InvalidArgument)? }),
+        }
+    }
+    if ios.is_empty() {
+        return Ok(());
+    }
+    dev.read_frames(&ios, prio)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeInfo {
@@ -28,6 +77,13 @@ pub struct VolumeInfo {
 
 /// Mapped chunks handled per tree walk while discarding (keeps the walk's buffer small).
 const WALK_BATCH: usize = 1024;
+
+/// A delete under way (`Pool::delete_begin`): what is left of its tree. Dropping it unfinished leaks that space
+/// until the next open.
+pub struct Deletion {
+    id: u64,
+    todo: Vec<(u64, u32)>,
+}
 
 impl Pool {
     fn vol(&self, id: u64) -> Result<&Vol> {
@@ -283,27 +339,54 @@ impl Pool {
 
     /// Deletes a volume or snapshot; its chunks are free after the commit this makes.
     pub fn delete(&mut self, id: u64) -> Result<()> {
-        if self.busy.contains_key(&id) || self.vol(id)?.rec.rollback_pending() {
-            return Err(VolError::Busy);
-        }
-        self.delete_inner(id)?;
+        let mut d = self.delete_begin(id)?;
+        self.delete_step(&mut d, u64::MAX);
         self.commit()?;
         note!(self.cfg.quiet, "volume.delete", id = id);
         Ok(())
     }
 
+    /// The first part of a delete in steps (`PoolHandle::delete`): the record goes, and the tree waits in the
+    /// returned `Deletion` for `delete_step`s. Until the next commit a power cut keeps the volume; after one the
+    /// rest of the tree is only space the next open finds free (it rebuilds the counts from what is reachable).
+    pub fn delete_begin(&mut self, id: u64) -> Result<Deletion> {
+        if self.busy.contains_key(&id) || self.vol(id)?.rec.rollback_pending() {
+            return Err(VolError::Busy);
+        }
+        self.delete_inner_steps(id)
+    }
+
+    /// Opens at most `pages` tree pages of the deletion's tree; true when nothing is left of it. A failure leaks
+    /// the rest until the next open (`delete_record`).
+    pub fn delete_step(&mut self, d: &mut Deletion, pages: u64) -> bool {
+        if let Err(e) = self.drop_steps(&mut d.todo, Tree::Map, pages) {
+            d.todo.clear();
+            self.leaks += 1;
+            klog::event!(Error, "bitsvol", "delete.leak", id = d.id, error = alloc::format!("{e:?}"));
+        }
+        d.todo.is_empty()
+    }
+
     fn delete_inner(&mut self, id: u64) -> Result<()> {
+        let mut d = self.delete_inner_steps(id)?;
+        self.delete_step(&mut d, u64::MAX);
+        Ok(())
+    }
+
+    fn delete_inner_steps(&mut self, id: u64) -> Result<Deletion> {
         let urgent = core::mem::replace(&mut self.urgent, true);
-        let r = self.delete_tree_and_record(id);
+        let r = self.delete_record(id);
         self.urgent = urgent;
         r
     }
 
-    fn delete_tree_and_record(&mut self, id: u64) -> Result<()> {
+    fn delete_record(&mut self, id: u64) -> Result<Deletion> {
         let (rec_page, root, depth) = {
             let v = self.vol(id)?;
             (v.rec_page, v.rec.root, v.rec.depth)
         };
+        let mut d = Deletion { id, todo: Vec::new() };
+        d.todo.try_reserve(1).map_err(|_| VolError::NoMemory)?;
         if rec_page != 0 {
             let old = self.set_table(id, (0, 0))?;
             if old.0 != rec_page {
@@ -317,12 +400,15 @@ impl Pool {
         self.vols.remove(&id);
         self.table_dirty = true;
         if root != 0 {
-            if let Err(e) = below(depth).and_then(|l| self.drop_tree(root, l, Tree::Map)) {
-                self.leaks += 1;
-                klog::event!(Error, "bitsvol", "delete.leak", id = id, error = alloc::format!("{e:?}"));
+            match below(depth) {
+                Ok(l) => d.todo.push((root, l)),
+                Err(e) => {
+                    self.leaks += 1;
+                    klog::event!(Error, "bitsvol", "delete.leak", id = id, error = alloc::format!("{e:?}"));
+                }
             }
         }
-        Ok(())
+        Ok(d)
     }
 
     /// Rolls volume `id` back to snapshot `snap`. The state before is kept as a new snapshot (returned), so
@@ -464,22 +550,47 @@ impl Pool {
     }
 
     pub fn read(&mut self, id: u64, lba: u64, buf: &mut [u8], prio: IoPriority) -> Result<()> {
-        let (mut off, _) = self.range(id, lba, buf.len(), false)?;
+        let plan = self.read_plan(id, lba, buf.len())?;
+        Ok(read_pieces(&self.dev, self.bs, &plan, buf, prio)?)
+    }
+
+    /// BL-2: where the bytes `[lba x bs, + len)` of volume `id` are: pieces in request order, each a hole (zeros) or
+    /// a run on the pool's device; physically adjacent chunks are one piece, up to the device's request size (the
+    /// pool lock is needed only for this, not for the reads: `device::VolumeDevice`).
+    pub(crate) fn read_plan(&mut self, id: u64, lba: u64, len: usize) -> Result<Vec<Piece>> {
+        let (mut off, _) = self.range(id, lba, len, false)?;
+        let mut out: Vec<Piece> = Vec::new();
         let mut done = 0usize;
-        while done < buf.len() {
+        while done < len {
             let (vc, at) = (off / self.cs, off % self.cs);
-            let n = ((self.cs - at) as usize).min(buf.len() - done);
+            let n = ((self.cs - at) as usize).min(len - done);
             let r = &self.vol(id)?.rec;
             let (p, _) = self.tree_get(r.root, r.depth, Tree::Map, vc)?;
-            if p == 0 {
-                buf[done..done + n].fill(0);
-            } else {
-                self.io_read(p * self.cs + at, &mut buf[done..done + n], prio)?;
+            let src = match p {
+                0 => None,
+                p if p < self.first || p >= self.chunks => return Err(VolError::Corrupt("mapping outside the pool's data chunks")),
+                p => Some(p * self.cs + at),
+            };
+            let joins = |l: &Piece| {
+                l.at + l.len == done
+                    && (l.len + n) as u64 <= self.dev_max.max(self.cs)
+                    && match (l.src, src) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => a + l.len as u64 == b,
+                        _ => false,
+                    }
+            };
+            match out.last_mut() {
+                Some(l) if joins(l) => l.len += n,
+                _ => {
+                    out.try_reserve(1).map_err(|_| VolError::NoMemory)?;
+                    out.push(Piece { at: done, len: n, src });
+                }
             }
             done += n;
             off += n as u64;
         }
-        Ok(())
+        Ok(out)
     }
 
     /// `fua`: durable when this returns (commits).

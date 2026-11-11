@@ -76,7 +76,12 @@ pub enum MesHostile {
     RemapDead,
     /// GX-7m3: the process queue's first ADD_QUEUE is answered, the next is not.
     ProcAgainRefused,
+    /// GX-9a: CP_MES_CNTL does not take a halt: MES goes on running.
+    HaltIgnored,
 }
+
+/// CP_HQD_ERROR.SUA_ERROR (gc_11_0_0_sh_mask.h:17716): an IB address that is not sign-extended (`Hang::NotCanonicalIb`).
+pub const HQD_ERROR_SUA: u32 = 0x10;
 
 /// A queue a MES pipe runs (from its HQD registers or its MQD).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +173,8 @@ pub struct MesFake {
     pub cpc_error: u32,
     /// GX-7m3: the writes to it.
     pub cpc_error_writes: Vec<u32>,
+    /// GX-9a: the writes to SQ_CMD.
+    pub sq_cmds: Vec<u32>,
 }
 
 /// What a doorbell rang.
@@ -213,6 +220,7 @@ impl MesFake {
             proc_adds: 0,
             cpc_error: 0,
             cpc_error_writes: Vec::new(),
+            sq_cmds: Vec::new(),
         }
     }
 
@@ -246,6 +254,15 @@ impl MesFake {
         mes11::grbm_select(mes11::COMPUTE_ME, mes11::COMPUTE_PIPE, mes11::COMPUTE_QUEUE, 0)
     }
 
+    fn gfx_sel() -> u32 {
+        mes11::grbm_select(0, mes11::GFX_PIPE, mes11::GFX_QUEUE, 0)
+    }
+
+    /// GX-9a: `byte` is SQ_CMD.
+    pub fn byte_of_sq(&self, byte: u32) -> bool {
+        self.addrs.and_then(|a| a.byte(M::SqCmd)) == Some(byte)
+    }
+
     pub fn running(&self) -> bool {
         mes11::cntl_running(self.cntl) && self.started
     }
@@ -261,6 +278,11 @@ impl MesFake {
         for p in mes11::PIPES {
             self.set_bank(Self::pipe_sel(p), M::CpHqdActive, 1);
         }
+    }
+
+    /// The kernel compute ring's HQD register `r` (tests).
+    pub fn compute_hqd(&self, r: M) -> u32 {
+        self.bank(Self::compute_sel(), r)
     }
 
     /// The HQD registers of `pipe` as `r` reads (tests).
@@ -308,6 +330,9 @@ impl MesFake {
         match r {
             M::CpMesCntl => {
                 self.cntl_writes.push(v);
+                if self.hostile == MesHostile::HaltIgnored && v & f::MES_HALT != 0 {
+                    return;
+                }
                 if v & f::MES_PIPE0_RESET != 0 {
                     self.sched = None;
                     self.sched_hung = false;
@@ -339,6 +364,7 @@ impl MesFake {
                 self.cpc_error = v;
                 self.cpc_error_writes.push(v);
             }
+            M::SqCmd => self.sq_cmds.push(v),
             M::CpHqdDequeueRequest if v == f::DEQUEUE_RESET => {
                 self.banks.insert((sel, byte), v);
             }
@@ -346,6 +372,9 @@ impl MesFake {
                 self.resets.push(sel);
                 if self.bank(sel, M::CpHqdDequeueRequest) == f::DEQUEUE_RESET && self.hostile != MesHostile::HqdStuck {
                     self.set_bank(sel, M::CpHqdActive, 0);
+                }
+                if self.bank(sel, M::CpGfxHqdDequeueRequest) == f::DEQUEUE_RESET && self.hostile != MesHostile::HqdStuck {
+                    self.set_bank(sel, M::CpGfxHqdActive, 0);
                 }
             }
             M::CpHqdDequeueRequest => {
@@ -551,9 +580,14 @@ impl MesFake {
                     let db = d[at::REMOVE_DOORBELL];
                     let held = self.legacy.len();
                     if d[at::REMOVE_FLAGS] & mesapi::REMOVE_UNMAP_LEGACY_QUEUE != 0 {
+                        let qtype = self.legacy.iter().find(|q| q.doorbell == db && q.vmid == 0).map(|q| q.qtype);
                         self.legacy.retain(|q| q.doorbell != db || q.vmid != 0);
                         if !matches!(self.hostile, MesHostile::UnmapLeavesActive | MesHostile::HqdStuck) {
-                            self.set_bank(Self::compute_sel(), M::CpHqdActive, 0);
+                            match qtype {
+                                Some(mesapi::qtype::GFX) => self.set_bank(Self::gfx_sel(), M::CpGfxHqdActive, 0),
+                                Some(mesapi::qtype::COMPUTE) => self.set_bank(Self::compute_sel(), M::CpHqdActive, 0),
+                                _ => {}
+                            }
                         }
                     } else {
                         self.legacy.retain(|q| q.doorbell != db || q.vmid == 0);
@@ -594,11 +628,16 @@ impl MesFake {
         let limits = Limits { max_dw: 1 << 16, max_bytes: 1 << 24, max_ib_depth: 2 };
         let again = self.maps.contains(&db);
         self.maps.push(db);
-        let engine = if again && self.hostile == MesHostile::RemapDead { None } else { Engine::new(Isa::Pm4, base, ring_dw, 0, limits).ok() };
+        let mut engine = if again && self.hostile == MesHostile::RemapDead { None } else { Engine::new(Isa::Pm4, base, ring_dw, 0, limits).ok() };
+        if qtype != mesapi::qtype::GFX {
+            engine.iter_mut().for_each(Engine::refuse_non_canonical_ibs);
+        }
         self.legacy.retain(|q| q.doorbell != db);
         self.legacy.push(Legacy { qtype, doorbell: db, rptr_wb, wptr: 0, engine, vmid: 0, page_table: 0 });
         if qtype == mesapi::qtype::COMPUTE {
             self.set_bank(Self::compute_sel(), M::CpHqdActive, 1);
+        } else if qtype == mesapi::qtype::GFX {
+            self.set_bank(Self::gfx_sel(), M::CpGfxHqdActive, 1);
         }
     }
 
@@ -637,7 +676,8 @@ impl MesFake {
         let ring_dw = 1u64 << ((m[c::PQ_CONTROL] & f::PQ_QUEUE_SIZE_MASK) + 1).min(30);
         let rptr_wb = u64::from(m[c::RPTR_REPORT_HI]) << 32 | u64::from(m[c::RPTR_REPORT_LO]);
         let limits = Limits { max_dw: 1 << 16, max_bytes: 1 << 24, max_ib_depth: 2 };
-        let engine = Engine::new(Isa::Pm4, ring, ring_dw, 0, limits).ok();
+        let mut engine = Engine::new(Isa::Pm4, ring, ring_dw, 0, limits).ok();
+        engine.iter_mut().for_each(Engine::refuse_non_canonical_ibs);
         let db = d[at::ADD_DOORBELL];
         self.legacy.retain(|q| q.doorbell != db);
         self.legacy.push(Legacy { qtype: mesapi::qtype::COMPUTE, doorbell: db, rptr_wb, wptr: 0, engine, vmid, page_table: pt });
@@ -658,6 +698,7 @@ impl MesFake {
         if matches!(self.hostile, MesHostile::QueuesDead | MesHostile::UnmapHangs) {
             return;
         }
+        let mut sua = false;
         for q in &mut self.legacy {
             let runs = if q.qtype == mesapi::qtype::GFX { gfx_runs } else { mec_runs };
             let Some(e) = q.engine.as_mut().filter(|_| runs) else { continue };
@@ -675,10 +716,15 @@ impl MesFake {
                 if q.qtype == mesapi::qtype::COMPUTE && matches!(rep.stop, Stop::Hang(amdgpu_fmt::sim::Hang::Fault(_))) {
                     self.cpc_error |= f::CPC_ERROR_HALT;
                 }
+                sua |= matches!(rep.stop, Stop::Hang(amdgpu_fmt::sim::Hang::NotCanonicalIb { .. }));
                 self.stops.push(rep.stop);
                 self.events.extend(rep.events.into_iter().filter(|e| !matches!(e, Event::RegWrite { .. })));
             }
             let _ = bus.write(0, q.rptr_wb & !3, &(e.rptr() as u32).to_le_bytes());
+        }
+        if sua {
+            let v = self.compute_hqd(M::CpHqdError) | HQD_ERROR_SUA;
+            self.set_bank(Self::compute_sel(), M::CpHqdError, v);
         }
     }
 }

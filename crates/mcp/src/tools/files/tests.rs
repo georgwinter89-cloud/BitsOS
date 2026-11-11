@@ -214,6 +214,10 @@ fn config_txt_lines_only_georg_sets() {
     assert_eq!(config_guard(b"wlan=off\n", b"wlan=on\n"), Ok(()), "wlan is free (R8d, 21.10.)");
     assert_eq!(config_guard(b"nvme_write=on\n", b"x=1\n"), Ok(()), "dropping it is allowed");
     assert!(config_guard(b"", b"\xef\xbb\xbfnvme_write=on").is_err(), "behind a BOM");
+    // NV-2p: the window key arrives through no file tool.
+    assert!(config_guard(b"", b"nvme_data=S:G:1:2\n").is_err());
+    assert!(config_guard(b"nvme_data=S:G:1:2\n", b"nvme_data=S:G:0:2\n").is_err(), "changed");
+    assert_eq!(config_guard(b"nvme_data=S:G:1:2\n", b"x=1\n"), Ok(()), "dropping it is allowed");
     assert_eq!(apply(b"abc", b"Z", Change::At(5)), b"abc\0\0Z");
     assert_eq!(apply(b"abc", b"Z", Change::Append), b"abcZ");
     assert_eq!(apply(b"abc", b"Z", Change::Replace), b"Z");
@@ -222,6 +226,7 @@ fn config_txt_lines_only_georg_sets() {
     vfs::root_ns().create_file("/h4/CONFIG.TXT", 0o644, b"token=t\nstick_write=".to_vec()).unwrap();
     assert!(refused("write_file", r#"{"path":"/h4/CONFIG.TXT","text":"on\n","append":true}"#).contains("stick_write=on"));
     assert!(refused("write_file", r#"{"path":"/h4/config.txt","text":"nvme_write=off"}"#).contains("R8a"));
+    assert!(refused("write_file", r#"{"path":"/h4/config.txt","text":"nvme_data=S:G:1:2"}"#).contains("R8a"));
     assert!(refused("fetch", r#"{"url":"http://10.0.2.2/c","path":"/h4/CONFIG.TXT"}"#).contains("never writes a CONFIG.TXT"));
     ok("write_file", r#"{"path":"/h4/CONFIG.TXT","text":"token=u\nstick_write=","offset":0}"#);
     ok("write_file", r#"{"path":"/h4/CONFIG.TXT","text":"\nx=1\nwlan=on\n","append":true}"#);

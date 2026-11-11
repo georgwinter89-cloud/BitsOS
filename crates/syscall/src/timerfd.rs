@@ -601,7 +601,19 @@ pub(crate) fn set_ticks(c: &SysCtx<'_>, sh: &Shared, arg: u64) -> i64 {
 pub fn clock_was_set() {
     // AB-14: the vDSO's REALTIME offset follows at once (Linux's timekeeping updates the vDSO data on a set).
     proc::vdso::refresh();
-    let all: Vec<Arc<Shared>> = OBJECTS.lock().values().map(|(s, _)| s.clone()).collect();
+    // The list's room is made with the table's lock dropped (see `ksync::spare`); a table that grew asks again.
+    let mut all: Vec<Arc<Shared>> = Vec::new();
+    loop {
+        let want = {
+            let t = OBJECTS.lock();
+            if t.len() <= all.capacity() {
+                all.extend(t.values().map(|(s, _)| s.clone()));
+                break;
+            }
+            t.len()
+        };
+        all.reserve_exact(want);
+    }
     for sh in all {
         if sh.clock != TfdClock::Realtime {
             continue;

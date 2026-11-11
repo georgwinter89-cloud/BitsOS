@@ -66,6 +66,7 @@ members = [
   "kernel",
   "boot/bitsboot",
   "host/xtask",
+  "host/installer",
 ]
 # `cargo test` without -p runs the host-testable crates only (the kernel and the loader need their own targets).
 default-members = ["host/xtask"]

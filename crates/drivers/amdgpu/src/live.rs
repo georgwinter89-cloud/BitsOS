@@ -17,7 +17,7 @@ use alloc::sync::Arc;
 use devmodel::DevError;
 use devmodel::display::{DisplayDevice, Fence};
 use gopfb::GopFb;
-use gopfb::fbdev::flip::{CursorError as FbCursorError, FlipError, ScanoutFlip, Vblank};
+use gopfb::fbdev::flip::{CursorError as FbCursorError, DirectBuffer, DirectFrame, FlipError, ScanoutFlip, Vblank};
 use ksync::Once;
 
 /// The register owner as the flip sequences see it.
@@ -232,6 +232,18 @@ impl ScanoutFlip for Provider {
         if let Some(s) = get() {
             s.rearm();
         }
+    }
+    fn direct_buffer(&self, window: usize) -> Option<DirectBuffer> {
+        get().filter(|s| s.active())?.direct_buffer(window)
+    }
+    fn direct_begin(&self) -> Result<DirectFrame, FlipError> {
+        get().ok_or(FlipError::Off)?.direct_begin()
+    }
+    fn direct_flip(&self, window: usize) -> Result<u64, FlipError> {
+        get().ok_or(FlipError::Off)?.direct_flip(window)
+    }
+    fn read_shown(&self, dst: &mut [u32], stride: u32) -> bool {
+        get().is_some_and(|s| s.read_shown(dst, stride))
     }
     fn cursor_ready(&self) -> bool {
         cursor_ready()

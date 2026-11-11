@@ -186,6 +186,10 @@ impl GopFb {
     pub fn layout(&self) -> Layout {
         self.layout
     }
+    /// WY-17: pixels per scan line of the framebuffer.
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
     /// The size shown (GX-4: below the framebuffer's after a mode switch).
     pub fn visible(&self) -> (u32, u32) {
         let v = self.visible.load(Ordering::Acquire);

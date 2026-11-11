@@ -4,8 +4,8 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use devmodel::block::{BlockDevice, BlockInfo, IoPriority};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoPriority};
 use devmodel::DevError;
 use ksync::{SpinLock, WaitQueue};
 
@@ -55,6 +55,12 @@ pub struct RamDisk {
     flushes: AtomicU64,
     /// FS-12: every device call takes this long (a slow disk for the hog tests; 0 = none).
     delay_ns: AtomicU64,
+    /// BL-2: calls it takes at once (`queue_depth`; 1 unless a test sets more), and `read_frames` calls so far.
+    depth: AtomicU32,
+    frame_calls: AtomicU64,
+    /// Calls waiting in the pause now, and the most at once (BL-2 tests: several calls in the device together).
+    paused_now: AtomicU32,
+    paused_max: AtomicU32,
 }
 
 impl RamDisk {
@@ -88,7 +94,23 @@ impl RamDisk {
             pause_wq: WaitQueue::new(),
             flushes: AtomicU64::new(0),
             delay_ns: AtomicU64::new(0),
+            depth: AtomicU32::new(1),
+            frame_calls: AtomicU64::new(0),
+            paused_now: AtomicU32::new(0),
+            paused_max: AtomicU32::new(0),
         }
+    }
+
+    /// BL-2: `read_frames` calls so far (each logs one `Call` per read it holds).
+    pub fn frame_calls(&self) -> u64 {
+        self.frame_calls.load(Ordering::Relaxed)
+    }
+
+    /// BL-2: how many calls the disk says it takes at once (`queue_depth`); a `Disk` opened after this lets that
+    /// many submitters call it together.
+    pub fn with_queue_depth(self, n: u32) -> Self {
+        self.depth.store(n.max(1), Ordering::Relaxed);
+        self
     }
 
     /// The transfer limit the disk reports (`max_blocks_per_request`).
@@ -138,6 +160,11 @@ impl RamDisk {
         self.held.load(Ordering::Acquire)
     }
 
+    /// (calls waiting in the pause now, the most that ever waited in it at once).
+    pub fn paused_calls(&self) -> (u32, u32) {
+        (self.paused_now.load(Ordering::Acquire), self.paused_max.load(Ordering::Acquire))
+    }
+
     /// A copy of the bytes (tests).
     pub fn snapshot(&self) -> Vec<u8> {
         self.data.lock().clone()
@@ -154,8 +181,12 @@ impl RamDisk {
     fn enter(&self, op: CallOp, lba: u64, blocks: u64, prio: IoPriority) -> Result<(), DevError> {
         if self.paused.load(Ordering::Acquire) {
             self.held.store(true, Ordering::Release);
+            let n = self.paused_now.fetch_add(1, Ordering::AcqRel) + 1;
+            self.paused_max.fetch_max(n, Ordering::AcqRel);
             self.pause_wq.wait_until_timeout(|| !self.paused.load(Ordering::Acquire), PAUSE_LIMIT_NS);
-            self.held.store(false, Ordering::Release);
+            if self.paused_now.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.held.store(false, Ordering::Release);
+            }
         }
         if let Some(l) = self.log.lock().as_mut() {
             l.push(Call { op, lba, blocks, prio });
@@ -232,6 +263,26 @@ impl BlockDevice for RamDisk {
         self.enter(CallOp::Flush, 0, 0, IoPriority::Normal)?;
         self.flushes.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+    /// BL-2: one call log entry per read, the bytes copied from the disk's memory straight into the frames.
+    fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {
+        self.frame_calls.fetch_add(1, Ordering::Relaxed);
+        for r in reqs {
+            let bs = self.block_size as usize;
+            if r.buf.is_empty() || !r.buf.len().is_multiple_of(bs) {
+                return Err(DevError::InvalidArgument);
+            }
+            self.enter(CallOp::Read, r.lba, (r.buf.len() / bs) as u64, prio)?;
+            let d = self.data.lock();
+            let range = self.range(r.lba, r.buf.len(), d.len())?;
+            if !r.buf.write(0, &d[range]) {
+                return Err(DevError::InvalidArgument);
+            }
+        }
+        Ok(())
+    }
+    fn queue_depth(&self) -> u32 {
+        self.depth.load(Ordering::Relaxed)
     }
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
         if self.read_only {

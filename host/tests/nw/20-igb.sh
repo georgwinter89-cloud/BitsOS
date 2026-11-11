@@ -16,7 +16,7 @@ RUN_DIR="$(realpath "$RUN_DIR")"
 BOOT_LINE="BdsDxe: loading"
 
 # 1. all nw.igc ktests on one igb
-cargo xtask image --name nw-igb-1 --ktest --config-extra "ktest=nw.igc,contract.netdevice,contract.quiesce;loglevel=info"
+cargo xtask image --name nw-igb-1 --ktest --config-extra "ktest=nw.igc,-nw.igc.link_qmp,-nw.igc.two_cards,contract.netdevice,contract.quiesce;loglevel=info"
 cargo xtask qemu --name nw-igb-1 --net igb --timeout 180 --serial-log "$RUN_DIR/one.log" || true
 grep -a "KTEST\|igc\.\|link\." "$RUN_DIR/one.log" || true
 grep -aq "KTEST done" "$RUN_DIR/one.log" || { echo "RED: run 1 did not finish"; exit 1; }
@@ -24,7 +24,6 @@ grep -aq "KTEST FAIL" "$RUN_DIR/one.log" && { echo "RED: run 1 has failures"; ex
 ok=$(grep -ac "KTEST ok nw.igc." "$RUN_DIR/one.log" || true)
 [ "$ok" -ge 13 ] || { echo "RED: only $ok nw.igc tests passed (want 13)"; exit 1; }
 grep -aq "KTEST ok nw.igc.bars_lost" "$RUN_DIR/one.log" || { echo "RED: nw.igc.bars_lost (NW-3b restore_config) did not pass"; exit 1; }
-grep -aq "KTEST skip nw.igc.*no igb" "$RUN_DIR/one.log" && { echo "RED: a test found no igb card"; exit 1; }
 grep -aq "igc.up ifname=igc0 model=82576" "$RUN_DIR/one.log" || { echo "RED: no igc.up"; exit 1; }
 grep -aq "ktest.dhcp_offer" "$RUN_DIR/one.log" || { echo "RED: no DHCP offer"; exit 1; }
 

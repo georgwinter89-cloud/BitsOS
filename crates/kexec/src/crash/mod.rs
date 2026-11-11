@@ -632,6 +632,9 @@ pub fn settle_with(steps: &mut [Step], n: usize, offset_of: Option<&dyn Fn(u64) 
     k
 }
 
+/// The record's line when the panic path found the ring busy; `ktests::log_tail_told` takes it as the log's answer.
+pub(crate) const LOG_BUSY: &str = "(log ring busy)";
+
 /// Streams body lines into the crash page.
 struct Page {
     off: u64,
@@ -680,7 +683,7 @@ impl Page {
                 n
             }
             None => {
-                self.line("(log ring busy)");
+                self.line(LOG_BUSY);
                 0
             }
         }
@@ -818,6 +821,20 @@ fn step_line(page: &mut Page, cpu: usize, i: usize, s: Step) {
 }
 
 /// One backtrace step as an event, and as a record line when `page` is given.
+/// One step of `step_line_to` once more, for the screen.
+fn step_again(cpu: usize, i: usize, s: Step) {
+    match s {
+        Step::None => {}
+        Step::Call(pc) | Step::Guess(pc) => {
+            klog::try_event!(Error, "crash", "frame.again", cpu = cpu, n = i, pc = klog::Hex(pc), at = symbolize(pc, true).as_str());
+        }
+        Step::Trap { vector, rip, user, .. } => {
+            let at = if user { Buf::<240>::new() } else { symbolize(rip, false) };
+            klog::try_event!(Error, "crash", "frame.again", cpu = cpu, n = i, pc = klog::Hex(rip), at = at.as_str(), what = hal::idt::exception_name(vector));
+        }
+    }
+}
+
 fn step_line_to(page: Option<&mut Page>, cpu: usize, i: usize, s: Step) {
     let mut l = Buf::<320>::new();
     match s {
@@ -1067,8 +1084,13 @@ pub fn report(info: &core::panic::PanicInfo<'_>) -> ! {
             klog::try_event!(Warn, "crash", "record.none"; "no crash page: nothing kept for the next boot");
         }
     }
-    // The other CPUs' backtraces push the panic line off a 1440p console; repeat it last so a photo of the screen
-    // shows it (the Mini-PC clears RAM on reset, so the record above is often lost).
+    // The other CPUs' backtraces push the panic line and this CPU's frames off a 1440p console; repeat both last so
+    // a photo of the screen shows where the panic happened (the Mini-PC clears RAM on reset, so the record above is
+    // often lost). The record has the frames already: console and log only, as `frame.again` so the frames are
+    // not counted twice.
+    for (i, s) in steps[..n].iter().enumerate() {
+        step_again(me, i, *s);
+    }
     klog::try_event!(Error, "crash", "panic.again", cpu = me; "{}", msg.as_str());
     klog::flush_emergency();
     finish(action())

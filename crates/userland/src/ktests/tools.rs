@@ -165,7 +165,7 @@ fn evtest() -> TestResult {
     kassert!(code == 3, "evtest with no events in 1 s: exit {code}, want 3\n{err}");
     Ok(())
 }
-ktest!("ul.tools.evtest", Safe, evtest);
+ktest!("ul.tools.evtest", Screen, evtest);
 
 /// abi-fbdev's pattern (user/abi-tests/c/fbdev.c, user/tools/fbtest/src/fb.rs).
 fn pat(seed: u32, x: u32, y: u32) -> u32 {
@@ -186,7 +186,7 @@ fn holds_screen(pid: u32) -> bool {
 
 fn fbtest() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     need("/bin/fbtest")?;
     let before = display::scanout_holder();
@@ -224,7 +224,7 @@ fn fbtest() -> TestResult {
     klog::event!(Info, "ul", "tools.fbtest", width = display::snapshot().map(|s| s.0).unwrap_or(0), demo_frames = frames);
     Ok(())
 }
-ktest!("ul.tools.fbtest", Safe, fbtest);
+ktest!("ul.tools.fbtest", Screen, fbtest);
 
 fn memstress_enomem() -> TestResult {
     need("/bin/memstress")?;
@@ -248,7 +248,7 @@ fn memstress_truncate() -> TestResult {
     need("/bin/memstress")?;
     let (code, out, err) = run(&["memstress", "truncate"], 60)?;
     if code == 1 && out.contains("the store past the end came back") {
-        return ktest::skip("V2 keeps mapped pages after a shrinking truncate (no SIGBUS): CR3 in plan/notes/ul-UL-4b.md");
+        return ktest::fail("V2 keeps mapped pages after a shrinking truncate (no SIGBUS): CR3 in plan/notes/ul-UL-4b.md");
     }
     kassert!(code == 0 && out.starts_with("ok "), "memstress truncate: exit {code}\n{out}{err}");
     Ok(())

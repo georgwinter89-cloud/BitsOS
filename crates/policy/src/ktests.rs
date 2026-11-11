@@ -34,7 +34,7 @@ const P: u32 = 0x504D_0000;
 fn defaults() -> TestResult {
     let s = subj(P + 1);
     if rules_of(s.program) != RuleSet::allow_all() {
-        return ktest::skip("default rules for foreign programs are installed (permd)");
+        return ktest::fail("default rules for foreign programs are installed (permd)");
     }
     let accesses = [
         Access::Path { path: "/pm-ktest/x", write: true, create: true },

@@ -1,6 +1,6 @@
 //! SN-5 ktests: HDMI sound. `sn.dpaudio.absent` (Safe) proves that nothing is written without a display engine
 //! (QEMU) and only reads on hardware. `on` and `off` write display registers (class `Display`, R8c: no switch)
-//! and `tone` plays sound (`Audible`); they skip without the display engine. Each leaves HDMI sound as it found
+//! and `tone` plays sound (`Audible`); they fail without the display engine. Each leaves HDMI sound as it found
 //! it, so a full run over MCP changes nothing on the machine.
 
 use crate::ctrl::DP_AUDIO_PIN;
@@ -59,10 +59,10 @@ fn absent() -> TestResult {
 
 fn ready() -> Result<(), TestResult> {
     if DcnRegs::attached().is_none() {
-        return Err(ktest::skip("no display engine (QEMU, or no GPU attach yet)"));
+        return Err(ktest::fail("no display engine (QEMU, or no GPU attach yet)"));
     }
     if gpu_controller().is_none() {
-        return Err(ktest::skip("no GPU HD Audio function"));
+        return Err(ktest::fail("no GPU HD Audio function"));
     }
     Ok(())
 }
@@ -92,13 +92,17 @@ fn off_checked() -> TestResult {
             kassert!(v == 0 || v & dpaudio::DP_SEC_STREAM_ENABLE != 0, "DP_SEC_CNTL {v:#x}: a sender without its master switch");
             continue;
         }
+        // The pair's index is a pointer: reading these very registers back moved it (0x55 on the Mini-PC, 5.11.).
+        if loc == dpaudio::Loc::Bar(AZ_ENDPOINT_INDEX) {
+            continue;
+        }
         kassert!((v ^ w.or) & w.check == 0, "{loc:?} reads {v:#x}, the firmware had {:#x}", w.or);
     }
     kassert!(gpu_controller().is_none_or(|d| d.ctrl.read_only()), "the GPU controller still streams");
     Ok(())
 }
 
-ktest!("sn.dpaudio.on", Display, on);
+ktest!("sn.dpaudio.on", Picture, on);
 /// HDMI sound on: the display side's 48 writes (or "on already"), the GPU controller streaming, pin 3 playable;
 /// then off again if it was off.
 fn on() -> TestResult {
@@ -132,7 +136,7 @@ fn playable() -> TestResult {
     Ok(())
 }
 
-ktest!("sn.dpaudio.tone", Audible, tone);
+ktest!("sn.dpaudio.tone", WithGeorg, tone);
 /// Three seconds of a quiet 1 kHz tone on pin 3 (the monitor's speakers); HDMI sound on for it and off again
 /// if it was off.
 fn tone() -> TestResult {
@@ -193,7 +197,7 @@ fn play() -> TestResult {
     Ok(())
 }
 
-ktest!("sn.dpaudio.off", Display, off);
+ktest!("sn.dpaudio.off", Picture, off);
 /// The undo, checked (`off_checked`); HDMI sound on first if it was off, and on again afterwards if it was on.
 fn off() -> TestResult {
     if let Err(r) = ready() {

@@ -1,9 +1,9 @@
 #!/bin/bash
 # slow
 # NW-3: the smoltcp stack on a QEMU card (virtio-net, then igb) against host partners in the lane's port range:
-# a Python HTTP server on 127.0.0.1:24510 (the guest reaches it as 10.0.2.2:24510; a UDP echo on 24511) serving a 16 MiB random file
+# a Python HTTP server on 127.0.0.1:<free port> (the guest reaches it as 10.0.2.2:<port>; a UDP echo on <port>+1) serving a 16 MiB random file
 # by length and chunked plus its SHA-256, and a host client that connects into the guest through
-# hostfwd 127.0.0.1:24521 -> guest 24520. All nw.stack ktests must pass (none may skip), the downloads must
+# hostfwd 127.0.0.1:<free port> -> guest 24520. All nw.stack ktests must pass (none may skip), the downloads must
 # match the hash, and the host must get the guest's answer line. NW-7: nw.stack.fetch_parallel (64 downloads at once,
 # each checked against its SHA-256, while a fresh connection keeps being answered).
 set -eu
@@ -12,8 +12,9 @@ RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/nw-30-stack}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 HERE="$(pwd)/host/tests/nw"
-HTTP_PORT=24510
-FWD_HOST=24521
+PORTS=$(python3 -I "$HERE/ports.py" 4)
+HTTP_PORT=$PORTS            # stack_server.py (UDP echo +1, TCP echo +2); the guest learns it from net_test_host
+FWD_HOST=$((PORTS + 3))
 FWD_GUEST=24520
 TESTS="nw.stack"
 WANT="dhcp ephemeral_random fetch fetch_parallel inbound listen_private loopback_full_pipe loopback_listener_drop loopback_shutdown no_memory ping_gateway quiet_memory tcp_host udp_host"
@@ -33,6 +34,10 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
+# A server that lost its bind ends at once; the guest must not go on against someone else's.
+sleep 0.5
+kill -0 "$SPID" 2>/dev/null || { echo "RED: stack_server.py did not start (port $HTTP_PORT taken?)"; exit 1; }
+
 check() { # $1 = serial log
     local log="$1" t
     grep -a "KTEST\|ktest\.\|dhcp\.\|http\.get" "$log" || true
@@ -45,7 +50,7 @@ check() { # $1 = serial log
 
 for card in virtio igb; do
     rm -f "$RUN_DIR/inbound.txt"
-    cargo xtask image --name "nw-stack-$card" --ktest --config-extra "ktest=$TESTS;loglevel=info;net_test_host=1"
+    cargo xtask image --name "nw-stack-$card" --ktest --config-extra "ktest=$TESTS;loglevel=info;net_test_host=$HTTP_PORT"
     cargo xtask qemu --name "nw-stack-$card" --net "$card" --hostfwd "$FWD_HOST:$FWD_GUEST" --timeout 240 \
         --serial-log "$RUN_DIR/$card.log" || true
     echo "== $card"

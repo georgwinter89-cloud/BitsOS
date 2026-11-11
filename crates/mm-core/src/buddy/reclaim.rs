@@ -25,7 +25,6 @@ use core::sync::atomic::Ordering::Relaxed;
 
 /// Reserve hits that skip the light round after one found nothing.
 const SKIP: u64 = 16;
-
 impl Buddy {
     /// Installs the page cache's reclaimer (once) and sets each zone's reserve to its share of the min
     /// watermark. False: one was installed already.
@@ -56,7 +55,78 @@ impl Buddy {
     /// Whether an allocation of `kind` must leave zone `zone`'s last frames (the zone lock is held).
     #[inline]
     pub(super) fn below_reserve(&self, zone: usize, zs: &ZoneState, kind: Kind) -> bool {
-        zs.free_frames < self.reserve[zone].load(Relaxed) && reclaim::direct_allowed(kind)
+        zs.usable_free() < self.reserve[zone].load(Relaxed) && (reclaim::direct_allowed(kind) || (kind == Kind::Heap && reclaim::keeps_reserve()))
+    }
+
+    /// FS-STALL (the Mini-PC's panic: a kernel heap allocation of 75600 bytes failed beside 20 GB of clean page
+    /// cache): the heap's step between two tries of an allocation that found no frames. Only where the caller's
+    /// context allows it (`reclaim::context_allows`: no spin lock held, no interrupt handler) and not inside reclaim
+    /// already (`reclaim::enter`). It takes clean cache pages under the `Reclaim` contract (try-locks only), waits
+    /// for their grace period within `grace` (one budget for all tries of the allocation) and puts the per-CPU
+    /// lists back into the buddy (try-locks), so freed frames merge. For a block of several frames it first
+    /// compacts (W35 MM-3, `compact_direct_inside`; it replaced the cursor scan that dropped cache-only blocks):
+    /// memory may be free but in pieces. True: something was freed or a block made (or a cache was busy), the heap
+    /// tries again.
+    #[cold]
+    pub fn reclaim_for_heap(&self, order: u32, grace: &mut crate::grace::WaitBudget) -> bool {
+        let Some(r) = self.reclaimer.get() else { return false };
+        if !reclaim::context_allows() {
+            return false;
+        }
+        // The heap noted its order under its lock: kswapd's wake waited for a context like this one.
+        reclaim::wake_deferred();
+        let Some(_inside) = reclaim::enter() else { return false };
+        if order > 0 && self.compact_direct_inside(order, grace) {
+            if self.global_reports {
+                reclaim::HEAP_CLEARED.inc();
+            }
+            // The block exists, but below the reserve the heap is refused it (`below_reserve`): frames are short
+            // too, so cache pages are taken as well. Without this the heap's rounds were compaction runs only,
+            // hundreds of thousands in a minute, each under the zone lock (Mini-PC 11.11.2026, generation 114).
+            if !self.all_below_reserve() {
+                return true;
+            }
+        }
+        let want = reclaim::CLUSTER.max(64u64 << order.min(14));
+        let (mut freed, mut busy) = (0, false);
+        for round in 0..reclaim::ROUNDS {
+            let o = r.reclaim(want - freed.min(want - 1), round > 0);
+            freed += o.freed;
+            busy = o.busy;
+            if freed >= want || (o.freed == 0 && !o.busy) {
+                break;
+            }
+        }
+        if freed > 0 {
+            crate::grace::expedite_with(grace);
+            if order > 0 {
+                self.try_drain_all();
+            }
+        }
+        reclaim::HEAP_RUNS.inc();
+        reclaim::HEAP_PAGES.add(freed);
+        freed > 0 || busy
+    }
+
+    /// Every zone has less usable free memory than its reserve.
+    fn all_below_reserve(&self) -> bool {
+        (0..ZONES).all(|z| self.zones[z].lock().usable_free() < self.reserve[z].load(Relaxed))
+    }
+
+    /// `drain_all` with try-locks: a list another CPU holds is left for later (the heap's step never waits).
+    pub(super) fn try_drain_all(&self) -> u64 {
+        let mut moved = 0;
+        for cpu in self.pcp.iter_existing() {
+            for (zone, lists) in cpu.lists.iter().enumerate() {
+                for l in lists {
+                    if let Some(mut list) = l.try_lock() {
+                        let n = list.len();
+                        moved += self.pcp_return(&mut list, zone, n);
+                    }
+                }
+            }
+        }
+        moved
     }
 
     #[cold]
@@ -65,6 +135,8 @@ impl Buddy {
             return None;
         }
         let r = self.reclaimer.get()?;
+        reclaim::wake_deferred();
+        let Some(_inside) = reclaim::enter() else { return self.grab(order, zone, kind, true) };
         if self.skip.try_update(Relaxed, Relaxed, |s| s.checked_sub(1)).is_ok() {
             self.direct.dips.fetch_add(1, Relaxed);
             return self.grab(order, zone, kind, true);
@@ -89,6 +161,11 @@ impl Buddy {
                 self.skip.store(SKIP, Relaxed);
                 break;
             }
+        }
+        // W35 MM-3: a block of several frames may exist in pieces only (Linux `__alloc_pages_direct_compact`
+        // after reclaim for the orders that may sleep).
+        if got.is_none() && order > 0 && reclaim::context_allows() && self.compact_direct_inside(order, budget) {
+            got = self.grab(order, zone, kind, false);
         }
         if got.is_none() {
             self.direct.dips.fetch_add(1, Relaxed);

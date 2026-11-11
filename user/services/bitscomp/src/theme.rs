@@ -19,8 +19,8 @@ pub enum Motion {
     Off,
 }
 
-/// theme.effects: the level the user chose. `Gpu` is accepted now and drawn like `Cheap` until a GPU renderer
-/// exists (DS-2; the ambient motion of desktop.md §0 answer 7 comes with it).
+/// theme.effects: the level the user chose. `Gpu` is drawn where a renderer has shaders and a GPU (WY-19, `fx`:
+/// `effects_gpu`); elsewhere (the rescue build, Pixman, a software rasteriser) it is drawn like `Cheap`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effects {
     Cheap,
@@ -115,10 +115,10 @@ pub struct Theme {
     pub fonts: Families,
     /// The chosen effect level (theme.effects).
     pub effects: Effects,
-    /// Whether the GPU level is drawn: false until a GPU renderer exists, so `gpu` draws exactly like `cheap`
-    /// (DS-2; every `if t.effects_gpu` picks the cheap branch).
+    /// Whether the GPU level is drawn: the renderer's to say, frame by frame (`App::fx_follow`); never from `build`.
     pub effects_gpu: bool,
-    /// theme.scanlines: the design's scanlines, baked only into bitscomp's own ground (dark mode), never over windows.
+    /// theme.scanlines: the design's scanlines (dark mode): baked into bitscomp's own ground at the cheap level, over
+    /// the ground at the GPU level (`fx::plan::ground`).
     pub scanlines: bool,
     pub motion: Motion,
     pub layout: Layout,

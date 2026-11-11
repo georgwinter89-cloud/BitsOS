@@ -21,7 +21,7 @@ fn knob(key: &str, default: u64, max: u64) -> u64 {
 
 fn program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     let secs = knob("fs17_secs", 4, 24 * 3600);
     let clients = knob("fs17_clients", 8, 256);

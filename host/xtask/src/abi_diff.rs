@@ -221,9 +221,13 @@ pub fn build_programs(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
         for s in srcs {
             let name = format!("abi-{}", s.file_stem().unwrap_or_default().to_string_lossy());
             let exe = out.join(&name);
+            // By a rename: another xtask of a parallel scenario may be reading the last build (TS-1: the gate's
+            // scenario boots build images side by side; "abi-unixwake: No such file").
+            let tmp = out.join(format!(".{name}.{}", std::process::id()));
             let mut c = Command::new(root.join("user/sysroot/bin/v2-cc"));
-            c.env("V2_SYSROOT", &sysroot).args(["-O2", "-Wall", "-Werror", "-std=gnu11"]).arg(format!("-I{}", cdir.display())).arg("-o").arg(&exe).arg(&s);
+            c.env("V2_SYSROOT", &sysroot).args(["-O2", "-Wall", "-Werror", "-std=gnu11"]).arg(format!("-I{}", cdir.display())).arg("-o").arg(&tmp).arg(&s);
             run_status(&mut c, &format!("building {name}"))?;
+            std::fs::rename(&tmp, &exe).map_err(|e| format!("{}: {e}", exe.display()))?;
             progs.push((name, exe));
         }
     }

@@ -388,6 +388,12 @@ impl PageSrc {
         }
     }
 
+    /// FS-STALL: clean page cache taken back for a heap block of `order` that found no frames
+    /// (`Buddy::reclaim_for_heap`); false without a frame allocator or with nothing freed.
+    pub fn reclaim_for(&self, order: u32, grace: &mut crate::grace::WaitBudget) -> bool {
+        self.buddy().is_some_and(|b| b.reclaim_for_heap(order, grace))
+    }
+
     /// `pages` contiguous pages aligned to `align_pages` (a power of two) for a large block: an exact run
     /// from the buddy allocator, or from the seed's tail before the frame allocator exists.
     pub fn alloc_run(&self, pages: u64, align_pages: u64, kind: Kind) -> Option<usize> {

@@ -81,6 +81,12 @@ ln -s lib "$gfx/usr/lib64"
 ln -s usr/bin "$gfx/bin"
 ln -s usr/bin "$gfx/sbin"
 ln -s bin "$gfx/usr/sbin"
+# Mesa's GLX vendor library lives in the Xwayland tree (WY-3b), not in the Mesa tree. Without it the runtime's own older one stays
+# in the container, and that cannot load this provider's drivers ("image driver extension not found").
+xw=${XWAYLAND_STAGE:-/var/tmp/claude-v2/stage/xwayland}/lib
+for l in libGLX_mesa.so.0 libxcb-glx.so.0 libXext.so.6 libXxf86vm.so.1; do
+  cp -L "$xw/$l" "$gfx/usr/lib/$l" || die "no $l in $xw: stage the Xwayland tree first"
+done
 : > "$gfx/etc/ld.so.conf"
 ldconfig -r "$gfx" -X
 echo "steamrt: $out: sniper $SLR_VER, provider $(du -sm "$gfx" | cut -f1) MB, runtime $(du -sm "$slr" | cut -f1) MB"

@@ -292,6 +292,7 @@ pub(crate) fn check_again(d: &Discovery) -> ktest::TestResult {
     let removes = owner.hw().hw().mes.frames.iter().filter(|&&op| op == mesapi::op::REMOVE_QUEUE).count() - fr0;
     owner.hw().hw().mes.hostile = MesHostile::None;
     kassert!(!st.ok && st.stranded == ["compute ring", "GFX ring 0"] && removes == 1 && halted(owner.hw().hw()), "wedged stop: {:?} removes {removes}", st.lines);
+    kassert!(st.mes_halted, "stranded queues do not unsay the halt: {:?}", st.lines);
     kassert!(el < 2 * mes11::API_TIMEOUT_US && st.lines.iter().any(|l| l.contains("not attempted")) && st.lines.iter().any(|l| l.contains("STRANDED")), "wedged stop waited {el} us: {:?}", st.lines);
     // Linux's plan from what the first run found: the capture's 29 writes plus the last select.
     let seq = mes::linux_sequence(&r1, &a);
@@ -338,6 +339,27 @@ fn again() -> ktest::TestResult {
     check_again(&crate::gpucore::fakechip::discovery_780m())
 }
 ktest::ktest!("gx.mes.again", Safe, again);
+
+/// GX-9a: a halt that did not take is no proof, with no queue stranded; the stop says so and a full reset reads it.
+pub(crate) fn check_halt_proof(d: &Discovery) -> ktest::TestResult {
+    let (mut owner, mut bo, hub, gl) = after_cp(d)?;
+    let a = addrs(d)?;
+    let inp = MesInputs { queues: true, ..inputs(d, &mut owner)? };
+    let r = mes::enable(&mut owner, &mut bo, &inp, &hub, Some(&gl));
+    kassert!(r.passed(), "start: {:?}", r.error);
+    owner.hw().hw().mes.hostile = MesHostile::HaltIgnored;
+    let st = mes::stop(&mut owner, &a, r.layout.map(|l| l.bo_mc), true);
+    owner.hw().hw().mes.hostile = MesHostile::None;
+    kassert!(!st.mes_halted && !st.ok && st.stranded.is_empty() && !halted(owner.hw().hw()), "{:?}", st.lines);
+    let st = mes::stop(&mut owner, &a, r.layout.map(|l| l.bo_mc), false);
+    kassert!(st.mes_halted && st.ok && halted(owner.hw().hw()), "{:?}", st.lines);
+    Ok(())
+}
+
+fn halt_proof() -> ktest::TestResult {
+    check_halt_proof(&crate::gpucore::fakechip::discovery_780m())
+}
+ktest::ktest!("gx.mes.halt_proof", Safe, halt_proof);
 
 fn values() -> ktest::TestResult {
     check_values()

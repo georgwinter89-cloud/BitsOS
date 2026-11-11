@@ -125,7 +125,7 @@ ktest::ktest!("gx.psp.hostile", Safe, hostile);
 /// the list in Linux's order, the whole sequence against the fake. Skips when the image has none.
 fn stick_files() -> ktest::TestResult {
     if !wait_stick() {
-        return ktest::skip("no boot stick mounted at /boot within 30 s");
+        return ktest::fail("no boot stick mounted at /boot within 30 s");
     }
     let first = fwload::stick_path("amdgpu/psp_13_0_4_toc.bin");
     match StickSource.read(&first) {
@@ -133,7 +133,7 @@ fn stick_files() -> ktest::TestResult {
         Ok(None) => {
             let zst = StickSource.read(&format!("{first}.zst")).ok().flatten().is_some();
             kassert!(!zst, "{first}.zst on the stick: xtask must decompress");
-            return ktest::skip("no firmware on the image (desk CR: xtask image copies linux-firmware-amdgpu)");
+            return ktest::fail("no firmware on the image (desk CR: xtask image copies linux-firmware-amdgpu)");
         }
         Err(LoadError::Read { errno, .. }) => return Err(format!("{first}: errno {errno}").into()),
         Err(e) => return Err(format!("{e:?}").into()),

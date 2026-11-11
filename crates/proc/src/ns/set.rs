@@ -43,6 +43,13 @@ pub fn init_set() -> &'static Arc<NsSet> {
     INIT.get_or_init(|| Arc::new(NsSet { uts: misc::init_uts().clone(), ipc: misc::init_ipc().clone(), net: misc::init_net().clone(), pid_for_children: pid::init_pid_ns().clone(), mnt: mnt::init_mnt().clone() }))
 }
 
+impl NsSet {
+    /// Its mount view is not the boot view every program starts in (`Process::ns`).
+    pub(crate) fn in_copied_view(&self) -> bool {
+        !Arc::ptr_eq(&self.mnt, mnt::init_mnt())
+    }
+}
+
 /// The namespace flags V2 builds.
 const BUILT: u64 = CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS;
 /// The namespace flags V2 does not build (EINVAL).
@@ -188,6 +195,11 @@ impl Process {
         if f & CLONE_FS != 0 {
             self.unshare_fs(t);
         }
+        // kernel/fork.c:3300, :3321: CLONE_SYSVSEM is exit_sem(); a new IPC namespace also leaves the undo list (the
+        // old arrays are out of reach) and orphans the caller's segments in the old one.
+        if f & (CLONE_NEWIPC | CLONE_SYSVSEM) != 0 {
+            crate::ipc::leave_undo(t, f & CLONE_NEWIPC != 0);
+        }
         if let Some(s) = new_set {
             // `copy_mnt_ns`: the caller's (now private) state moves onto the copies; its other threads follow
             // at their next file call (V2 keeps namespaces per thread group).
@@ -263,6 +275,8 @@ impl Process {
             }
             NsRef::Ipc(ns) => {
                 both(&ns.user_ns)?;
+                // kernel/nsproxy.c:556 `commit_nsset`: the undo list belongs to the old namespace.
+                crate::ipc::leave_undo(t, false);
                 NsSet { ipc: ns.clone(), ..(*old).clone() }
             }
             NsRef::Net(ns) => {

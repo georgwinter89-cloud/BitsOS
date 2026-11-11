@@ -21,10 +21,20 @@ impl App {
             }
             None => menu::empty_items(self.ws_count() > 1 && self.ws_counts(self.desk.active) == (0, 0)),
         };
-        let centre = menu::clamp_centre(self.pointer.x, self.pointer.y, self.area(), &self.theme);
+        self.open_menu_with(target, items, None);
+    }
+
+    /// The circle menu with `items` at the pointer (PK-L1b: a library tile's own items).
+    pub(crate) fn open_menu_with(&mut self, target: Option<Window>, items: menu::Items, entry: Option<String>) {
+        self.open_menu_at(target, items, entry, (self.pointer.x, self.pointer.y), true);
+    }
+
+    /// The circle menu centred at `at` (PK-L1c: the pad's X on a tile, `held` false: no button to release).
+    pub(crate) fn open_menu_at(&mut self, target: Option<Window>, items: menu::Items, entry: Option<String>, at: (f64, f64), held: bool) {
+        let centre = menu::clamp_centre(at.0, at.1, self.area(), &self.theme);
         self.anim.menu_opened(crate::pacer::now());
         let opened_at = (self.pointer.x, self.pointer.y);
-        self.menu = Some(Menu { centre, target, items, hover: None, held: true, opened_at });
+        self.menu = Some(Menu { centre, target, items, hover: None, held, opened_at, entry });
         self.hover = None;
         self.needs_frame = true;
         self.motion(self.now_ms());
@@ -35,10 +45,15 @@ impl App {
         menu::hit(m.centre, &m.items, &self.theme, self.pointer.x, self.pointer.y)
     }
 
-    fn run_menu_item(&mut self, d: usize) {
+    pub(crate) fn run_menu_item(&mut self, d: usize) {
         let Some(m) = self.menu.take() else { return };
         match m.items[d] {
-            Some(item) if item.enabled => self.act_on(m.target.as_ref(), item.action),
+            Some(item) if item.enabled => {
+                // The library's entries act on the tile the menu was opened on.
+                self.lib.menu_for = m.entry;
+                self.act_on(m.target.as_ref(), item.action);
+                self.lib.menu_for = None;
+            }
             // A greyed-out entry does nothing and leaves the menu open.
             _ => self.menu = Some(m),
         }

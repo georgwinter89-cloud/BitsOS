@@ -1,0 +1,15 @@
+[package]
+name = "bitsdisk"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS's data partition on a disk with Windows on it (NV-2p): console tool at the machine's own keyboard"
+publish = false
+
+[dependencies]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsdisk"
+path = "src/main.rs"

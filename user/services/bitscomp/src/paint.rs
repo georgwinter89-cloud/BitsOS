@@ -14,6 +14,9 @@ pub enum Layer {
     Overlays,
     /// The notice and the address suggestions (`chrome_render::over`).
     Over,
+    /// PK-L1b: the program library's overlay (`library_draw`): over every window, fullscreen ones too, and the
+    /// bars; under the installer's question (MC-9b) and the circle menu (its tiles' menu).
+    Library,
     /// A window's frame (header, border, the corners that round off the client).
     Frame(usize),
     /// A hung window's veil: over its content, under its own frame.
@@ -28,7 +31,7 @@ pub enum Layer {
 /// WY-8: a fullscreen window is all there is under the cursor, the menu and the notice: no frame, no bars, nothing
 /// under it (the windows it covers are hidden).
 pub fn order<W>(placements: &[Placement<W>]) -> Vec<Layer> {
-    let mut out = vec![Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over];
+    let mut out = vec![Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over, Layer::Library];
     if let Some(i) = placements.iter().position(|p| p.fullscreen && p.visible) {
         out.extend([Layer::Veil(i), Layer::Content(i)]);
         return out;
@@ -65,11 +68,11 @@ mod tests {
         let p = ws.arrange(area, full, 8);
         let i = p.iter().position(|q| q.win == 2).unwrap();
         // MC-9b: the installer's overlay lies over a fullscreen window too.
-        assert_eq!(order(&p), vec![Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over, Layer::Veil(i), Layer::Content(i)]);
+        assert_eq!(order(&p), vec![Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over, Layer::Library, Layer::Veil(i), Layer::Content(i)]);
         // The focus going to the float ends the cover: the usual order again.
         ws.focus_window(&3);
         let o = order(&ws.arrange(area, full, 8));
-        assert!(o.contains(&Layer::Chrome) && o.len() > 6);
+        assert!(o.contains(&Layer::Chrome) && o.len() > 7);
     }
 
     #[test]
@@ -86,7 +89,11 @@ mod tests {
         let o = order(&p);
         let idx = |w: u32| p.iter().position(|q| q.win == w).unwrap();
         let (f3, f4, t1) = (idx(3), idx(4), idx(1));
-        assert_eq!(o[..4], [Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over], "the installer's overlay, then menu and suggestions over everything");
+        assert_eq!(
+            o[..5],
+            [Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over, Layer::Library],
+            "the installer's overlay, then menu and suggestions, then the library over everything"
+        );
         for f in [f3, f4] {
             assert!(at(&o, Layer::Over) < at(&o, Layer::Frame(f)));
             assert!(at(&o, Layer::Frame(f)) < at(&o, Layer::Veil(f)), "the header stays over the veil");

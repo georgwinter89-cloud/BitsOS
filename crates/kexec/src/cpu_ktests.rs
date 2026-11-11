@@ -55,7 +55,7 @@ fn cpu_checks() -> TestResult {
     kassert!(kexec_stub::check_cpus().is_ok(), "the boot CPU may stop the others: {:?}", kexec_stub::check_cpus());
     if aps().is_empty() {
         kassert!(kexec_stub::others_stopped(), "one CPU: nothing to stop");
-        return ktest::skip("one CPU: the AP refusals need -smp 2 or more");
+        return ktest::fail("one CPU: the AP refusals need -smp 2 or more");
     }
     kassert!(!kexec_stub::others_stopped(), "APs run: the jump must refuse");
     for c in aps() {
@@ -70,7 +70,7 @@ ktest!("rb.reload.cpu_checks", Safe, cpu_checks);
 fn park_release() -> TestResult {
     let n = aps().len();
     if n == 0 {
-        return ktest::skip("one CPU: nothing to park");
+        return ktest::fail("one CPU: nothing to park");
     }
     for round in 0..2 {
         let st = kexec_stub::stop_others(&opts(5 * SEC, None)).map_err(|e| format!("round {round}: {e:?}"))?;
@@ -112,7 +112,7 @@ fn silent() -> Vec<usize> {
 fn park_answers_nmi_sample() -> TestResult {
     let n = aps().len();
     if n == 0 {
-        return ktest::skip("one CPU: nothing to park");
+        return ktest::fail("one CPU: nothing to park");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());
@@ -242,7 +242,7 @@ fn unstick(st: Stuck) -> TestResult {
 /// APs that had parked run again. The IPI it got late is counted as stray, not acted on.
 fn stuck_ap_refused() -> TestResult {
     if aps().is_empty() {
-        return ktest::skip("one CPU: nothing to park");
+        return ktest::fail("one CPU: nothing to park");
     }
     let _boot = OnBootCpu::take()?;
     let (stray0, _) = kexec_stub::stray_and_deferred();
@@ -270,7 +270,7 @@ ktest!("rb.reload.stuck_ap_refused", Safe, stuck_ap_refused);
 /// The same stuck AP is parked by the NMI step; released, it goes back to its spin and then answers.
 fn nmi_parks_stuck_ap() -> TestResult {
     if aps().is_empty() {
-        return ktest::skip("one CPU: nothing to park");
+        return ktest::fail("one CPU: nothing to park");
     }
     let _boot = OnBootCpu::take()?;
     let n = aps().len();
@@ -306,7 +306,7 @@ fn test_guard() -> bool {
 /// A park guard that says "not now" on one AP: that AP is not parked (refused, counted as deferred), the
 /// others are released.
 fn park_guard_defers() -> TestResult {
-    let Some(&k) = aps().last() else { return ktest::skip("one CPU: nothing to park") };
+    let Some(&k) = aps().last() else { return ktest::fail("one CPU: nothing to park") };
     let prev = kexec_stub::park_guard();
     let (_, def0) = kexec_stub::stray_and_deferred();
     DEFER.store(k, Ordering::Release);

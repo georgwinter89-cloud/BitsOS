@@ -51,6 +51,10 @@ pub struct XState {
     /// WM_HINTS says input=False (ICCCM 4.1.7: the WM never sets the focus on it; WM_TAKE_FOCUS only).
     pub no_input: Cell<bool>,
     pub transient_for: Cell<u32>,
+    /// `_NET_WM_STATE_FULLSCREEN` asked for before the window showed.
+    pub wants_full: Cell<bool>,
+    /// The fullscreen state the window was last told in `_NET_WM_STATE`.
+    pub full_told: Cell<bool>,
     /// What bitscomp asked for and the WM has not sent yet: the content rectangle, a close.
     pub want_geo: Cell<Option<Rectangle<i32, Logical>>>,
     pub want_close: Cell<bool>,

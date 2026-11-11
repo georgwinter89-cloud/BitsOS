@@ -8,6 +8,9 @@
 #   NVQ1  ns1 16 MiB, 4 KiB blocks, GPT with two Linux partitions 256-1023 and 1024-3800 (seed 4)
 # Afterwards every image (and the boot image) is byte for byte what it was (sha256): the driver has no write
 # command, and the log shows media_writes=0 for both controllers.
+# BL-1: three more boots run nv.mq.* (queues per CPU, 64 in flight, a timeout on one queue, every CPU at once) and
+# the pattern reads with -smp 1/4/16 and NVQ0's max_ioqpairs 1/8/64; CONFIG nv_mq_queues= tells nv.mq.queues the
+# queue count to expect (min of the two), nv_mq_irq= the interrupt mode (msix, or polled in the nvme_irq=off boot).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/nv-10-nvme}"
@@ -57,7 +60,7 @@ boot() {
             -drive "if=none,id=q0n2,format=raw,file=$RUN_DIR/q0n2.img" \
             -drive "if=none,id=q0n3,format=raw,file=$RUN_DIR/win.img" \
             -drive "if=none,id=q1n1,format=raw,file=$RUN_DIR/linux4k.img" \
-            -device nvme,id=nvq0,serial=NVQ0 \
+            -device "nvme,id=nvq0,serial=NVQ0${NVQ0_OPTS:-}" \
             -device nvme-ns,drive=q0n1,bus=nvq0,nsid=1 \
             -device nvme-ns,drive=q0n2,bus=nvq0,nsid=2,logical_block_size=4096,physical_block_size=4096 \
             -device nvme-ns,drive=q0n3,bus=nvq0,nsid=3 \
@@ -73,12 +76,12 @@ boot() {
     QPID=""
 }
 
-boot "$NAME" "ktest=nv.;loglevel=info"
+boot "$NAME" "ktest=nv.;loglevel=info;nv_mq_irq=msix"
 LOG="$RUN_DIR/$NAME.log"
 BOOT_SUM=$(sum "target/xtask/$NAME.img")
 grep -a "KTEST\|nvme \|block disk\.registered\|block disk\.protected\|block write\.refused" "$LOG" || true
 grep -aq "KTEST done passed=.* failed=0" "$LOG" || fail "ktests not green"
-for t in cmd.no_write_opcodes ident read zero_writes smart flush irq tool qemu.pattern gpt errors reset; do
+for t in cmd.no_write_opcodes ident read zero_writes smart flush irq tool qemu.pattern gpt errors reset mq.queues mq.inflight64 mq.timeout_one_queue mq.every_cpu mq.speed mq.restart; do
     grep -aq "KTEST ok nv.$t " "$LOG" || fail "nv.$t did not pass"
 done
 # What the tests assert inside the kernel (media_writes=0 on both controllers, the 4 KiB namespace, the Windows
@@ -93,15 +96,33 @@ if grep -aq "PANIC\|lock.violation" "$LOG"; then
 fi
 
 # Second boot: CONFIG nvme_irq=off keeps both controllers polled; the same reads pass, nv.irq skips.
-boot nv-polled "ktest=nv.;loglevel=info;nvme_irq=off"
+boot nv-polled "ktest=nv.,-nv.irq;loglevel=info;nvme_irq=off;nv_mq_irq=polled;nv_mq_queues=$SMP"
 PLOG="$RUN_DIR/nv-polled.log"
 grep -a "KTEST" "$PLOG" || true
 grep -aq "KTEST done passed=.* failed=0" "$PLOG" || fail "polled: ktests not green"
-for t in ident read zero_writes qemu.pattern gpt errors reset; do
+for t in ident read zero_writes qemu.pattern gpt errors reset mq.queues mq.inflight64 mq.timeout_one_queue mq.every_cpu mq.speed mq.restart; do
     grep -aq "KTEST ok nv.$t " "$PLOG" || fail "polled: nv.$t did not pass"
 done
-grep -aq "KTEST skip nv.irq: every controller is polled" "$PLOG" || fail "polled: nv.irq did not skip (a controller has vectors)"
 for i in q0n1 q0n2 win linux4k; do
     [ "$(sum "$RUN_DIR/$i.img")" = "${WANT[$i]}" ] || fail "polled: $i.img changed"
 done
+
+# BL-1 matrix: CPUs x queues the controller grants.
+for combo in "1 1" "4 8" "16 64"; do
+    set -- $combo
+    SMP=$1
+    NVQ0_OPTS=",max_ioqpairs=$2"
+    want=$(( $1 < $2 ? $1 : $2 ))
+    boot "nv-mq-$1-$2" "ktest=nv.mq.,nv.read,nv.qemu.pattern,nv.reset;loglevel=info;nv_mq_irq=msix;nv_mq_queues=$want"
+    MLOG="$RUN_DIR/nv-mq-$1-$2.log"
+    grep -a "KTEST" "$MLOG" || true
+    grep -aq "KTEST done passed=.* failed=0" "$MLOG" || fail "smp $1 max_ioqpairs $2: ktests not green"
+    for t in mq.queues mq.inflight64 mq.timeout_one_queue mq.every_cpu mq.speed mq.restart read qemu.pattern reset; do
+        grep -aq "KTEST ok nv.$t " "$MLOG" || fail "smp $1 max_ioqpairs $2: nv.$t did not pass"
+    done
+    for i in q0n1 q0n2 win linux4k; do
+        [ "$(sum "$RUN_DIR/$i.img")" = "${WANT[$i]}" ] || fail "smp $1 max_ioqpairs $2: $i.img changed"
+    done
+done
+NVQ0_OPTS=""
 echo "GREEN: nv ktests, images unchanged (win.img ${WANT[win]})"

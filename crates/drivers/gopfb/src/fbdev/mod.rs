@@ -58,10 +58,12 @@ pub mod flip;
 pub mod handback;
 mod ktests;
 mod ktests_store;
+mod ktests_scanout;
 pub mod mem;
 pub mod pacing;
 mod ktests_pacing;
 mod scene;
+pub mod scanout;
 mod seed;
 
 use abi::{Cmap, CmapUser, Geometry, SetOutcome, UserIo, Var};
@@ -179,6 +181,8 @@ struct Returned {
     pid: u32,
     reason: &'static str,
     release_ns: u64,
+    /// WY-17: the holder's frames went straight to the scanout until now.
+    direct: bool,
 }
 
 struct Holder {
@@ -219,6 +223,9 @@ pub struct Fb {
     flip_seq: AtomicU64,
     /// GX-3: fb0's frames went to the hidden buffer; the first copy after flipping stopped is whole.
     flipping: AtomicBool,
+    /// WY-17: what the holder exported and whether its frames are drawn straight into the scanout buffers
+    /// (`scanout`); both end with the hold.
+    direct: scanout::State,
     /// INT-D1 (CR DS-5-3): no take yet since boot and no store that the dirty map does not track: the first take
     /// copies the console's picture into fb0 first (`seed`).
     fresh: AtomicBool,
@@ -411,6 +418,7 @@ fn init() -> Result<(), &'static str> {
         rearm_pending: AtomicBool::new(false),
         flip_seq: AtomicU64::new(0),
         flipping: AtomicBool::new(false),
+        direct: scanout::State::new(),
         fresh: AtomicBool::new(true),
         screen: Mutex::named("fbdev.screen", Screen { frame, guard: None, holder: None, release_gen: 0, busy_logged: false, rearm_at: 0,
             reported: damage::Pending::default() }),
@@ -597,6 +605,11 @@ impl Fb {
         };
         let px = display::stats().pixels;
         let t = time::now_ns();
+        // WY-17: before the guard's drop, so no take sees the old view (a take needs the display free). The var is
+        // under `fbdev.meta`, which is never nested in `fbdev.screen`: that is why it is here and not in `release`.
+        if r.direct {
+            scanout::view_home(self);
+        }
         // The guard's drop shows the console frame (`display::returned_pixels` is that copy alone).
         drop(r.guard);
         display::sync_vt();
@@ -682,13 +695,19 @@ impl Fb {
         if reporter != 0 {
             klog::event!(Info, "fbdev", "damage.off", pid = reporter, why = reason);
         }
+        let direct = self.direct.end(reason);
+        // WY-17: fb0's memory holds nothing of those frames (a window may never have been written): the next take
+        // starts from the console's picture, as the first one does (`seed`; the marks are cleared just below).
+        if direct {
+            self.fresh.store(true, Ordering::Release);
+        }
         scr.reported.clear();
         self.shared.dirty.lock().clear();
         self.map.write_protect(0, self.shared.pages.saturating_sub(1));
         RELEASES.inc();
         let (pid, name) = h.map(|h| (h.pid, h.name)).unwrap_or((0, String::new()));
         klog::event!(Info, "fbdev", "screen.returned", pid = pid, program = name.as_str(), reason = reason);
-        Some(Returned { guard: g, pid, reason, release_ns: time::now_ns() - t })
+        Some(Returned { guard: g, pid, reason, release_ns: time::now_ns() - t, direct })
     }
 
     /// Copies the whole visible window into the frame and presents it (a take, a pan, a mode set).
@@ -968,6 +987,10 @@ impl Fb {
                     return Err(EFAULT);
                 }
                 let var = Var::from_bytes(&b);
+                // WY-17: the holder drew this window itself: a flip, no copy.
+                if self.direct.drawing() {
+                    return scanout::pan(self, &var, who);
+                }
                 {
                     let mut m = self.meta.lock();
                     abi::pan(&var, &mut m.var)?;
@@ -1001,6 +1024,8 @@ impl Fb {
             cursor::FBIO_BITSOS_CURSOR => cursor::ioctl(self, arg, io, who),
             // DP-6: the holder's damage rectangles instead of write-protected pages (`damage`).
             damage::FBIO_BITSOS_DAMAGE => damage::ioctl(self, arg, io, who),
+            // WY-17: the windows as dma-bufs, drawn into by the holder's renderer (`scanout`).
+            scanout::FBIO_BITSOS_SCANOUT => scanout::ioctl(self, arg, io, who),
             _ => Err(ENOTTY),
         }
     }
@@ -1010,6 +1035,10 @@ impl ScanoutSource for Fb {
     /// MCP `screen` while a program has the screen: fbdev's frame. The lock is waited for at most 250 ms (a
     /// flush holds it for a few ms; MCP's thread is KernelRt, B4).
     fn with_picture(&self, f: &mut dyn FnMut(&[u32], u32, u32)) -> bool {
+        // WY-17: the GPU's frames never pass through this frame: what shows is read from the scanout buffer.
+        if self.direct.drawing() && scanout::look(self, f) {
+            return true;
+        }
         let Some(scr) = self.screen.lock_timeout(250 * MS) else {
             klog::event!(Warn, "fbdev", "picture.busy"; "the screen frame stayed locked for 250 ms");
             return false;

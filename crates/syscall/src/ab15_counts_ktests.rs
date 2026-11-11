@@ -51,7 +51,7 @@ ktest!("ab.syscall.counts_per_cpu", QemuOnly, counts_per_cpu);
 fn counts_per_cpu() -> TestResult {
     let cpus: Vec<usize> = (0..hal::percpu::cpu_count()).filter(|&c| hal::smp::is_online(c)).take(4).collect();
     if cpus.len() < 2 {
-        return ktest::skip("needs two CPUs online (run with -- -smp 4)");
+        return ktest::fail("needs two CPUs online (run with -- -smp 4)");
     }
     let n = cpus.len() as u64;
     let k = u64::from(K);
@@ -131,7 +131,7 @@ ktest!("ab.syscall.slow_trace_blocked", QemuOnly, slow_trace_blocked);
 fn slow_trace_blocked() -> TestResult {
     use klog::trace::{self, Kind};
     if trace::rings().next().is_none() {
-        return ktest::skip("no trace rings in this boot");
+        return ktest::fail("no trace rings in this boot");
     }
     let (kinds, limits) = (trace::kinds(), trace::limits());
     if !trace::enabled(Kind::Syscall) {

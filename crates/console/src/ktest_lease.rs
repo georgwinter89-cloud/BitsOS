@@ -9,7 +9,7 @@
 //!   the monitor finds the console free and shows its prompt (waited for, as the tests expect it there).
 //! - drop: the session, foreground group and settings come back, test input is dropped, SIGCONT.
 //!
-//! A program in the shell's foreground (Georg's `vi`, say) is never stopped: the test is skipped then. Without
+//! A program in the shell's foreground (Georg's `vi`, say) is never stopped: the test fails then. Without
 //! a session on the console (ktest boots, `init=off`) a lease changes nothing.
 
 use crate::jobs::{self, Ctl, SIGCONT, SIGSTOP};
@@ -24,7 +24,7 @@ pub struct ConsoleLease {
 }
 
 impl ConsoleLease {
-    /// Takes the console from its session for one test. `Err` is a failure or a skip (`ktest::skip` text), as a
+    /// Takes the console from its session for one test. `Err` is a failure or a failure (`ktest::fail` text), as a
     /// test returns it.
     pub fn take() -> Result<ConsoleLease, String> {
         let t = crate::tty();
@@ -33,7 +33,7 @@ impl ConsoleLease {
         let Some(sid) = c.session else { return Ok(ConsoleLease { saved: None }) };
         if c.pgrp != Some(sid) {
             let why = format!("a program runs in the foreground of the console's session {sid} (pgrp {:?}); the test would take its keys", c.pgrp);
-            return Err(ktest::skip(&why).err().unwrap_or(why));
+            return Err(ktest::fail(&why).err().unwrap_or(why));
         }
         p.signal_pgrp(sid, SIGSTOP);
         let end = time::now_ns() + 5_000 * MS;

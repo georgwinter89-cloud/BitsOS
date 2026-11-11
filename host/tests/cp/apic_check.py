@@ -85,7 +85,7 @@ def main():
     check("masked" in lvt.get(other, ""), f"{other} masked ({lvt.get(other)!r})")
     nmi_lvt = lvt.get(f"LVT{nmi}", "")
     check("NMI" in nmi_lvt and "masked" not in nmi_lvt, f"LVT{nmi} = NMI, not masked ({nmi_lvt!r})")
-    check("masked" in lvt.get("LVTT", "") and "vec 240" in lvt.get("LVTT", ""), f"LVT timer masked, vector 0xF0 ({lvt.get('LVTT')!r})")
+    check("vec 240" in lvt.get("LVTT", ""), f"LVT timer on vector 0xF0, masked or running since CP-5 ({lvt.get('LVTT')!r})")
     check(re.search(r"^ISR\s+\(none\)", mon, re.M) is not None, "nothing left in service")
 
     # 4. Both 8259s masked, bases 0x20/0x28.

@@ -34,6 +34,10 @@ pub const GFX_IMU_MSG_FLAGS: (usize, u32) = (1, 0x403f);
 pub const RLC_RLCS_BOOTLOAD_STATUS_11_0_1: (usize, u32) = (1, 0x4e7e);
 /// Bit 0 RLC_ENABLE_F32.
 pub const RLC_CNTL: (usize, u32) = (1, 0x4c00);
+/// GX-9b: gfx_v11_cntl_pg (gfx_v11_0.c:4991-5021; gc_11_0_0_offset.h).
+pub const RLC_SAFE_MODE: (usize, u32) = (1, 0x0980);
+pub const RLC_PG_CNTL: (usize, u32) = (1, 0x4c43);
+pub const RLC_PG_DELAY_3: (usize, u32) = (1, 0x4c78);
 /// Zero when the CP is idle (gfx_v11_0.c:2563, :2640).
 pub const CP_STAT: (usize, u32) = (0, 0xf40);
 /// Bit 31 GUI_ACTIVE.

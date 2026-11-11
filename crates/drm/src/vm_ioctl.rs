@@ -50,7 +50,7 @@ pub fn va_ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, 
         h => Some(ctx.file.syncobj(h).ok_or(ENOENT)?),
     };
     let vm = &ctx.file.vm;
-    vm.backend(gpu)?;
+    vm.backend(gpu, ctx.file.client_id())?;
     let owner = bo.as_ref().map_or(Owner::Prt, |b| Owner::Bo(key(b)));
     let r = match a.operation {
         AMDGPU_VA_OP_MAP => map(vm, owner, bo.as_ref(), va, a.offset_in_bo, a.map_size, a.flags, false),

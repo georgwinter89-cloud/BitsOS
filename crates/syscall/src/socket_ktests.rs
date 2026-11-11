@@ -67,7 +67,7 @@ fn have(prog: &str) -> bool {
 /// Every block of `prog` must end and print as on Linux.
 fn same_as_linux(prog: &str) -> TestResult {
     if !have(prog) {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     let sockets = net::sock::alive();
     let mut n = 0;
@@ -122,7 +122,7 @@ ktest!("nw.sock.abi_fdpass", Safe, abi_fdpass);
 /// frames, and SO_PEERCRED names the other process.
 fn wayland_pair() -> TestResult {
     if !have("abi-fdpass") {
-        return ktest::skip("abi-fdpass is not in this image (no musl sysroot when it was built)");
+        return ktest::fail("abi-fdpass is not in this image (no musl sysroot when it was built)");
     }
     let path = format!("/tmp/nw-wayland-{}", ktest_seq());
     let (srv, sout) = start(&["abi-fdpass", "server", &path])?;
@@ -165,14 +165,14 @@ fn ktest_seq() -> u64 {
 /// recorded with the program as owner (B3).
 fn fetch_over_the_card() -> TestResult {
     if !have("abi-net") {
-        return ktest::skip("abi-net is not in this image (no musl sysroot when it was built)");
+        return ktest::fail("abi-net is not in this image (no musl sysroot when it was built)");
     }
     let Some(base) = net::config("net_test_url") else {
-        return ktest::skip("no net_test_url in CONFIG (a host server: host/tests/nw/60-sockets.sh)");
+        return ktest::fail("no net_test_url in CONFIG (a host server: host/tests/nw/60-sockets.sh)");
     };
-    let Some(stack) = net::stack::kernel() else { return ktest::skip("no network stack") };
+    let Some(stack) = net::stack::kernel() else { return ktest::fail("no network stack") };
     if stack.wait_configured(20 * SEC).is_none() {
-        return ktest::skip("no address on any card within 20 s");
+        return ktest::fail("no address on any card within 20 s");
     }
     let hostport = base.trim_start_matches("http://").trim_end_matches('/');
     let Some((host, port)) = hostport.split_once(':') else { return Err(format!("net_test_url {base}: want http://IP:PORT")) };
@@ -190,7 +190,7 @@ fn fetch_over_the_card() -> TestResult {
     );
     Ok(())
 }
-ktest!("nw.sock.fetch", Safe, fetch_over_the_card);
+ktest!("nw.sock.fetch", Run("nw/60-sockets"), fetch_over_the_card);
 
 /// With CONFIG `nw_k3_peer` (host/tests/nw/k3_lan.py on a second card, 60-sockets.sh): V1's k3a/k3b fakes for
 /// program sockets: a refused and a silent connect, a peer that ignores the first segment (the resend comes from
@@ -198,12 +198,12 @@ ktest!("nw.sock.fetch", Safe, fetch_over_the_card);
 /// duplicated and reordered segments) whose files must arrive intact.
 fn k3_lan() -> TestResult {
     if !have("abi-net") {
-        return ktest::skip("abi-net is not in this image (no musl sysroot when it was built)");
+        return ktest::fail("abi-net is not in this image (no musl sysroot when it was built)");
     }
     let Some(peer) = net::config("nw_k3_peer") else {
-        return ktest::skip("no nw_k3_peer in CONFIG (the fake LAN of host/tests/nw/60-sockets.sh)");
+        return ktest::fail("no nw_k3_peer in CONFIG (the fake LAN of host/tests/nw/60-sockets.sh)");
     };
-    let Some(stack) = net::stack::kernel() else { return ktest::skip("no network stack") };
+    let Some(stack) = net::stack::kernel() else { return ktest::fail("no network stack") };
     let on_lan = || stack.interfaces().iter().any(|i| i.info.addr.is_some_and(|(a, _)| a.0[..3] == [192, 168, 77]));
     let t0 = time::now_ns();
     while !on_lan() && time::now_ns() - t0 < 60 * SEC {
@@ -222,7 +222,7 @@ fn k3_lan() -> TestResult {
     kassert!(end == "end: exit 0" && out.matches("sha256 matches").count() == 2, "lossy web server: {end} {out:?}");
     Ok(())
 }
-ktest!("nw.sock.k3_lan", Safe, k3_lan);
+ktest!("nw.sock.k3_lan", Run("nw/60-sockets"), k3_lan);
 
 /// NW-7 fixer: with CONFIG `net_test_url` (stack_server.py with `/part/N/`): 64 programs run `abi-net fetchcheck`
 /// at once, each fetching 1 MiB by length and chunked through the syscall socket path and checking its SHA-256,
@@ -233,19 +233,19 @@ fn fetch_parallel_programs() -> TestResult {
     const PROGRAMS: usize = 64;
     const PART: usize = 1 << 20;
     if !have("abi-net") {
-        return ktest::skip("abi-net is not in this image (no musl sysroot when it was built)");
+        return ktest::fail("abi-net is not in this image (no musl sysroot when it was built)");
     }
     let Some(base) = net::config("net_test_url") else {
-        return ktest::skip("no net_test_url in CONFIG (a host server: host/tests/nw/60-sockets.sh)");
+        return ktest::fail("no net_test_url in CONFIG (a host server: host/tests/nw/60-sockets.sh)");
     };
-    let Some(stack) = net::stack::kernel() else { return ktest::skip("no network stack") };
+    let Some(stack) = net::stack::kernel() else { return ktest::fail("no network stack") };
     if stack.wait_configured(20 * SEC).is_none() {
-        return ktest::skip("no address on any card within 20 s");
+        return ktest::fail("no address on any card within 20 s");
     }
     let opts = net::http::Options { timeout_ns: 10 * SEC, idle_ns: 10 * SEC, ..net::http::Options::new(200) };
     match net::http::get(stack, &format!("{base}/part/{PART}/file.sha256"), &opts) {
         Ok(_) => {}
-        Err(net::http::HttpError::Status(404)) => return ktest::skip("the test server has no /part/N/ (stack_server.py before NW-7's fixer)"),
+        Err(net::http::HttpError::Status(404)) => return ktest::fail("the test server has no /part/N/ (stack_server.py before NW-7's fixer)"),
         Err(x) => return Err(format!("GET /part/{PART}/file.sha256: {x:?}")),
     }
     let no_memory = net::stack::NO_MEMORY.get();
@@ -312,4 +312,4 @@ fn fetch_parallel_programs() -> TestResult {
     kassert!(net::stack::NO_MEMORY.get() == no_memory, "real socket buffer refusals during the downloads: {}", net::stack::NO_MEMORY.get() - no_memory);
     Ok(())
 }
-ktest!("nw.sock.fetch_parallel", Safe, fetch_parallel_programs);
+ktest!("nw.sock.fetch_parallel", Run("nw/60-sockets"), fetch_parallel_programs);

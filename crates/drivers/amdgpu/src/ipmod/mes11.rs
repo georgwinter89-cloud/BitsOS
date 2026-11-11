@@ -59,10 +59,15 @@ pub enum M {
     CpcUtcl1Status,
     CpCpcStatus,
     CpCpcStalledStat1,
+    /// GX-9a: the soft rung's wave kill (gfx_v11_0_ring_soft_recovery) and GFX ring 0's HQD where REMOVE_QUEUE leaves it
+    /// active (mes_v11_0_reset_queue_mmio, 7.1).
+    SqCmd,
+    CpGfxHqdActive,
+    CpGfxHqdDequeueRequest,
 }
 
 impl M {
-    pub const ALL: [M; 32] = [
+    pub const ALL: [M; 35] = [
         M::CpMesCntl,
         M::CpMesPrgrmCntrStart,
         M::CpMesPrgrmCntrStartHi,
@@ -95,6 +100,9 @@ impl M {
         M::CpcUtcl1Status,
         M::CpCpcStatus,
         M::CpCpcStalledStat1,
+        M::SqCmd,
+        M::CpGfxHqdActive,
+        M::CpGfxHqdDequeueRequest,
     ];
 
     /// (segment, dword) in GC's bases (gc_11_0_0_offset.h).
@@ -132,6 +140,9 @@ impl M {
             M::CpcUtcl1Status => (0, 0x1f55),
             M::CpCpcStatus => (0, 0x0e24),
             M::CpCpcStalledStat1 => (0, 0x0e26),
+            M::SqCmd => (0, 0x111b),
+            M::CpGfxHqdActive => (0, 0x1e80),
+            M::CpGfxHqdDequeueRequest => (0, 0x1e93),
         }
     }
 
@@ -169,17 +180,20 @@ impl M {
             M::CpcUtcl1Status => "CPC_UTCL1_STATUS",
             M::CpCpcStatus => "CP_CPC_STATUS",
             M::CpCpcStalledStat1 => "CP_CPC_STALLED_STAT1",
+            M::SqCmd => "SQ_CMD",
+            M::CpGfxHqdActive => "CP_GFX_HQD_ACTIVE",
+            M::CpGfxHqdDequeueRequest => "CP_GFX_HQD_DEQUEUE_REQUEST",
         }
     }
 
     /// Only read (the firmware's version; GX-7m3: the stall's report).
     pub fn read_only(self) -> bool {
-        matches!(self, M::CpMesGp3Lo | M::CpHqdError | M::CpcUtcl1Status | M::CpCpcStatus | M::CpCpcStalledStat1)
+        matches!(self, M::CpMesGp3Lo | M::CpHqdError | M::CpcUtcl1Status | M::CpCpcStatus | M::CpCpcStalledStat1 | M::CpGfxHqdActive)
     }
 
     /// Banked by GRBM_GFX_CNTL (the HQD/MQD registers).
     pub fn banked(self) -> bool {
-        !matches!(self, M::CpMesCntl | M::RlcCpSchedulers | M::CpcUtcl1Error | M::CpcUtcl1Status | M::CpCpcStatus | M::CpCpcStalledStat1)
+        !matches!(self, M::CpMesCntl | M::RlcCpSchedulers | M::CpcUtcl1Error | M::CpcUtcl1Status | M::CpCpcStatus | M::CpCpcStalledStat1 | M::SqCmd)
     }
 }
 
@@ -199,6 +213,10 @@ pub mod f {
     /// CP_HQD_DEQUEUE_REQUEST 2: the reset dequeue (mes_v11_0_reset_queue_mmio, 7.1); 1 drains, which a stalled
     /// queue never finishes.
     pub const DEQUEUE_RESET: u32 = 2;
+    /// SQ_CMD: CMD 3 (kill), MODE 1 (broadcast), CHECK_VMID, the VMID in VM_ID (gfx_v11_0.c:5693, gc_11_0_0_sh_mask.h:7218-7224).
+    pub const fn sq_kill(vmid: u8) -> u32 {
+        3 | 1 << 4 | 1 << 7 | ((vmid as u32) & 0xf) << 28
+    }
     pub const SPI_QUEUE_RESET: u32 = 1;
     /// CPC_UTCL1_ERROR.ERROR_DETECTED_HALT (gc_11_0_0_sh_mask.h:15347).
     pub const CPC_ERROR_HALT: u32 = 1;

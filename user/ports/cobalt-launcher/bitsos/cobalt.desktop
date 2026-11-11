@@ -1,0 +1,11 @@
+# PK-L1a: the program library's entry for the stick launcher (\BITSOS2\bin\<launcher>, started through /bin/sh).
+# No icon: the program's own is a trademark; the library shows the fallback (first letter) until lane DS draws one.
+# No StartupWMClass: Cobalt has no window in the desktop (YT-2: the launcher ends bitscomp and Cobalt draws on the
+# framebuffer), so there is no window for the launcher rule to restore.
+[Desktop Entry]
+Type=Application
+Name=Cobalt
+GenericName[de]=Videos (YouTube)
+Exec=cobalt
+Categories=AudioVideo;Video;
+Keywords[de]=YouTube;Video;Fernsehen;

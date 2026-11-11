@@ -668,3 +668,34 @@ fn commands_come_through_fetch() {
     assert_eq!(rep.stop, Stop::Idle);
     assert_eq!(r.mem.peek_u32(0, BUF + 0x1000), Some(0x5a));
 }
+
+/// GM-1d CR-GM1d-3: state a shader would use, which the model does not execute; it must not stop the queue.
+#[test]
+fn load_context_reg_index_is_no_effect() {
+    let mut g = Rig::new(Kind::Gfx, 512, limits());
+    let w = g.submit(|v| v.extend_from_slice(&[pm4::packet3(pm4::op::LOAD_CONTEXT_REG_INDEX, 3), 0, 0, 0, 1]));
+    let rep = g.run(w);
+    assert_eq!(rep.stop, Stop::Idle);
+    assert_eq!(rep.events, [Event::NoEffect { header: 0xc0039f00 }]);
+}
+
+/// The real MEC drops an IB above the hole whose address is not sign-extended (CP_HQD_ERROR.SUA_ERROR); GFX takes it.
+#[test]
+fn compute_queue_refuses_an_ib_address_without_its_upper_bits() {
+    const HIGH: u64 = 0x8000_0000_0000;
+    let run = |compute: bool, hi: u32| {
+        let mut r = Rig::new(Kind::Gfx, 512, limits());
+        if compute {
+            r.eng.refuse_non_canonical_ibs();
+        }
+        r.mem.map(0, HIGH, 0x1000).unwrap();
+        let mut ib = Vec::new();
+        pm4::write_data(&mut ib, pm4::dst_sel::MEM, BUF, pm4::WR_CONFIRM, &[0xabcd]).unwrap();
+        r.mem.poke_dwords(0, HIGH, &ib).unwrap();
+        let w = r.submit(|v| v.extend([pm4::packet3(pm4::op::INDIRECT_BUFFER, 2), 0, hi, ib.len() as u32]));
+        (r.run(w).stop, r.mem.peek_u32(0, BUF).unwrap())
+    };
+    assert_eq!(run(true, 0xffff_8000), (Stop::Idle, 0xabcd), "sign-extended on a compute queue");
+    assert_eq!(run(true, 0x8000), (Stop::Hang(Hang::NotCanonicalIb { addr: HIGH }), 0), "not sign-extended on a compute queue");
+    assert_eq!(run(false, 0x8000), (Stop::Idle, 0xabcd), "not sign-extended on a GFX queue");
+}

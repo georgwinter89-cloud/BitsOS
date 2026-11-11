@@ -1,4 +1,5 @@
 #!/bin/bash
+# helper: 40-crash.sh and the others call it with arguments
 # RB-2 helper (not a scenario: no number prefix): puts the symbol table of the kernel an image boots into the
 # image as \BITSOS2\fw\KSYMS, which bitsboot loads as a FIRMWARE module and kexec::crash reads at boot.
 # Until the desk's xtask writes boot/kernel.syms into every initramfs (change request in plan/notes/rb-RB-2.md),

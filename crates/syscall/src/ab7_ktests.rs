@@ -69,7 +69,7 @@ ktest!("ab7.proc.pid_files", Safe, pid_files);
 /// Every name of /proc/<pid> and the content the kernel can check without the program running.
 fn pid_files() -> TestResult {
     if !have("/bin/hello") {
-        return ktest::skip("/bin/hello is not in this image");
+        return ktest::fail("/bin/hello is not in this image");
     }
     let ns = vfs::root_ns();
     kassert!(ns.lookup("/proc/thread-self").err() == Some(ENOENT), "/proc/thread-self exists for a kernel thread");
@@ -150,7 +150,7 @@ ktest!("ab7.proc.exec_and_gone", Safe, exec_and_gone);
 /// A directory opened before the process ended answers ESRCH afterwards, never a panic or stale data.
 fn exec_and_gone() -> TestResult {
     if !have("/bin/hello") {
-        return ktest::skip("/bin/hello is not in this image");
+        return ktest::fail("/bin/hello is not in this image");
     }
     let p = held(&["hello"], &[])?;
     let pid = p.pid;
@@ -173,7 +173,7 @@ ktest!("ab7.proc.edges", Safe, edges);
 /// as `kstrtoint` takes them (a NUL ends the text, 12 bytes are looked at), comm of an ended process.
 fn edges() -> TestResult {
     if !have("/bin/hello") {
-        return ktest::skip("/bin/hello is not in this image");
+        return ktest::fail("/bin/hello is not in this image");
     }
     let ns = vfs::root_ns();
     let p = held(&["hello", "a b", "c"], &["X=1"])?;
@@ -269,7 +269,7 @@ fn program_with(path: &str, argv: &[&str], extra_env: &[&str], expected: &str) -
         if have("/bin/abi-ids") {
             return Err(format!("the image has ABI programs but not {path} (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     let out = proc::stdio::Capture::new(1 << 20);
     let mut env = alloc::vec!["PATH=/bin", "HOME=/", "ABI_TEST=1"];

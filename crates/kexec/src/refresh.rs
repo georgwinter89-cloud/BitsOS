@@ -27,7 +27,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroize;
 
 /// Keys a Reload never changes: R8a's guarded keys and bitsboot's profile choice.
-pub const KEPT_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "profile", "profile_reason"];
+pub const KEPT_KEYS: &[&str] = &["nvme_write", "nvme_data", "stick_write", "usb_msd_write", "profile", "profile_reason"];
 
 /// How long the jump waits for the stick (a hung stick must not hold the Reload: B4), and, at the jump, at most
 /// as long again for an earlier read still running.

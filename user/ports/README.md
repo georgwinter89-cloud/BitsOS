@@ -14,6 +14,8 @@ musl) for CachyOS and V2 alike.
 | `brave/` | `brave-act`, Brave's actions for Claude over the DevTools pipe (AC-3; a Rust crate of the user/ workspace) | `cargo` (user/ workspace) |
 | `ffmpeg-min/` | FFmpeg 7.1 (LGPL, decoders only) as shared libraries for Cobalt (VP9, H.264, AAC) | `ffmpeg-min/build.sh` |
 | `mesa/` | the distribution's Mesa and Vulkan with their tools as the glibc tree `\BITSOS2\mesa\` | `mesa/scripts/stage-v2.sh` (its own README) |
+| `vkquake/` | vkQuake 1.37.0 on SDL 2.32.10 with LibreQuake's free data as the glibc tree `\BITSOS2\vkquake\`, on the Mesa tree, and its `vkquake` launcher (GM-8) | `vkquake/scripts/stage-v2.sh` (its own README) |
+| `steam/` | Valve's Steam client (publicbeta, pinned; 64-bit path up to the login window) with its bootstrap and the graphics provider of `steamrt/`, as the glibc tree `\BITSOS2\steam\`, on the Mini-PC only (GM-2a; tree never in git, Georg logs in himself) | `steam/scripts/stage-v2.sh` |
 | `steamrt/` | the Steam Linux Runtime sniper tree with pressure-vessel, plus a software graphics provider (SX-3c; scenario only, never on an image or the stick; `out/` ignored) | `steamrt/build.sh` |
 
 ## Download cache
@@ -39,3 +41,5 @@ Source tarballs are downloaded once, only with Georg's OK per tarball, and kept 
 | `xkbcomp-1.5.0.tar.xz` | https://xorg.freedesktop.org/releases/individual/app/xkbcomp-1.5.0.tar.xz (MIT/X11) | `2ac31f26600776db6d9cd79b3fcd272263faebac7eb85fb2f33c7141b8486060` | Georg 28.10.2026 |
 | `wayland-protocols-1.47.tar.xz` | https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.47/downloads/wayland-protocols-1.47.tar.xz (MIT) | `5fd4349bcbc9bab9a46f8cf77d1f434296a7a052c87440a094f63fcf62a58e20` | Georg 28.10.2026 |
 | `SteamLinuxRuntime_sniper-3.0.20261021.266025.tar.xz` | https://repo.steampowered.com/steamrt-images-sniper/snapshots/3.0.20261021.266025/SteamLinuxRuntime_sniper.tar.xz (many packages, each with its own open-source licence; pressure-vessel MIT with LGPL-2.1-or-later and LGPL-2.0-or-later parts) | `86956ad0ee62e89134f5e30359cd1019d1ecb614c7b677dad82d4d00f51a2696` | Georg 28.10.2026 |
+| `steam-launcher_1.0.0.87_amd64.deb` | https://repo.steampowered.com/steam/archive/stable/ (Steam subscriber agreement; launcher scripts see its copyright file) | SHA256 in `steam/pins.txt` | Georg 2.11.2026 |
+| `steam_client_publicbeta_ubuntu12` and the zips it names | https://client-update.steamstatic.com/ (no versioned URL, the pinned copy is the cache's; Steam subscriber agreement, the runtime's packages their own open-source licences) | version and SHA256 in `steam/pins.txt`, the zips by the manifest's `sha2` | Georg 2.11.2026 |

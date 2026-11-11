@@ -8,12 +8,14 @@
 //! Only `devmodel` is used, so the file also builds inside the nvme crate until `pub mod gpt;` is in
 //! `block/src/lib.rs` (change request NV-1 CR 1).
 
+pub mod window;
+
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use devmodel::DevError;
-use devmodel::block::{BlockDevice, BlockInfo, IoPriority};
+use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoBuf, IoPriority};
 
 /// Linux's partition name (linux-6.6/block/partitions/core.c:349): a disk name ending in a digit gets a
 /// `p` before the number (`nvme0n1p1`), others not (`sda1`).
@@ -77,6 +79,27 @@ impl BlockDevice for Partition {
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
         let at = self.range(lba, blocks)?;
         self.lower.discard(at, blocks)
+    }
+    /// BL-2: the same frames down, each read moved by the partition's offset (Linux `blk_partition_remap`).
+    fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {
+        if let [one] = reqs {
+            let at = self.range(one.lba, self.count(one.buf.len())?)?;
+            return self.lower.read_frames(&[FrameIo { lba: at, buf: one.buf.clone() }], prio);
+        }
+        let mut down = Vec::new();
+        down.try_reserve_exact(reqs.len()).map_err(|_| DevError::NoMemory)?;
+        for r in reqs {
+            let at = self.range(r.lba, self.count(r.buf.len())?)?;
+            down.push(FrameIo { lba: at, buf: r.buf.clone() });
+        }
+        self.lower.read_frames(&down, prio)
+    }
+    fn write_frames(&self, lba: u64, buf: &IoBuf, fua: bool, prio: IoPriority) -> Result<(), DevError> {
+        let at = self.range(lba, self.count(buf.len())?)?;
+        self.lower.write_frames(at, buf, fua, prio)
+    }
+    fn queue_depth(&self) -> u32 {
+        self.lower.queue_depth()
     }
 }
 

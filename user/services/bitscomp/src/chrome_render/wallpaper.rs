@@ -115,7 +115,8 @@ impl Paper {
             dot_out: 1.3 * k,
             glows,
             // 1 px every 3 board px at 2.8 %: on the physical grid one line every round(3 k) px, the same mean.
-            scan: (t.dark && t.scanlines).then(|| {
+            // WY-19b: the gpu level draws them right over the ground (`fx::plan::ground`), not into it.
+            scan: (t.dark && t.scanlines && !t.effects_gpu).then(|| {
                 let p = (3.0 * k).round().max(2.0) as i32;
                 (p, ink, 0.028 * p as f32 / 3.0)
             }),
@@ -265,6 +266,10 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, placements: &[
     }
     // DS-3: the Bühne's stage lies on the wallpaper, under the tiles.
     let stage = super::scene::stage_element(app, renderer);
+    let glass = match app.buehne() {
+        Some(b) => crate::fx::plan::stage(app, &b),
+        None => Vec::new(),
+    };
     let buf = &app.images.wallpaper.as_ref().unwrap().1;
     let full = app.area_full();
     let o = crate::header::px_rect(full, app.theme.scale);
@@ -274,7 +279,7 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, placements: &[
     let paper = MemoryRenderBufferRenderElement::from_buffer(renderer, at, buf, None, Some(src), Some(size), Kind::Unspecified)
         .ok()
         .map(CompElement::from);
-    stage.into_iter().chain(paper).collect()
+    stage.into_iter().chain(glass.into_iter().map(CompElement::from)).chain(paper).collect()
 }
 
 #[cfg(test)]
@@ -324,6 +329,15 @@ mod tests {
         assert!(row.windows(2).all(|w| (w[0] - w[1]).abs() <= 2), "jumps in {row:?}");
         let distinct: std::collections::HashSet<i32> = row.iter().copied().collect();
         assert!(distinct.len() >= 2, "the dither mixes neighbouring levels");
+    }
+
+    #[test]
+    fn at_the_gpu_level_the_scanlines_are_not_in_the_ground() {
+        let mut t = theme(&[("theme.mode", "dark")]);
+        let baked = Paper::new(&t, 64, 36);
+        t.effects_gpu = true;
+        let drawn = Paper::new(&t, 64, 36);
+        assert!(baked.scan.is_some() && drawn.scan.is_none(), "fx::plan::ground draws them");
     }
 
     #[test]

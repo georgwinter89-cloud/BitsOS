@@ -174,13 +174,21 @@ impl Tables {
             return true;
         }
         v.extend_from_slice(data);
-        let mut q = r.q.lock();
-        if q.try_reserve(1).is_err() {
-            return true;
+        // The queue grows with its lock dropped (`ksync::spare`).
+        let mut spare = ksync::Spare::new();
+        loop {
+            let mut q = r.q.lock();
+            if !spare.fits(&mut *q, 1) {
+                drop(q);
+                if spare.grow().is_err() {
+                    return true;
+                }
+                continue;
+            }
+            r.bytes.fetch_add(data.len(), Ordering::AcqRel);
+            q.push_back(LoDgram { data: v, from, at: ctl::Arrival { to: to.ip, v6, ifindex: 1, spec: to.ip } });
+            break;
         }
-        r.bytes.fetch_add(data.len(), Ordering::AcqRel);
-        q.push_back(LoDgram { data: v, from, at: ctl::Arrival { to: to.ip, v6, ifindex: 1, spec: to.ip } });
-        drop(q);
         notify();
         true
     }
@@ -382,6 +390,40 @@ struct LoDgram {
     data: Vec<u8>,
     from: SockAddr,
     at: ctl::Arrival,
+}
+
+/// The first datagram a socket connected to `peer` may have (others are dropped, as a connected socket takes
+/// datagrams from its peer only), cut to `size`: bytes, full length, sender, arrival. Nothing is copied or
+/// freed under the queue's lock: a taken datagram hands over its own bytes, a peek copies into a buffer made
+/// with the lock dropped (`unix::fill`).
+fn lo_take(l: &LoUdp, peer: Option<SockAddr>, size: usize, peek: bool) -> Result<Option<(Vec<u8>, usize, SockAddr, ctl::Arrival)>, Errno> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let taken = {
+            let mut q = l.q.lock();
+            let Some(x) = q.front() else { return Ok(None) };
+            if peek && peer.is_none_or(|p| p == x.from) {
+                let n = x.data.len().min(size);
+                if super::unix::fill(&mut buf, &x.data[..n]) {
+                    return Ok(Some((buf, x.data.len(), x.from, x.at)));
+                }
+                Err(n)
+            } else {
+                let x = q.pop_front().ok_or(EAGAIN)?;
+                l.bytes.fetch_sub(x.data.len(), Ordering::AcqRel);
+                Ok(x)
+            }
+        };
+        match taken {
+            Err(n) => super::unix::grow(&mut buf, n)?,
+            Ok(x) if peer.is_some_and(|p| p != x.from) => drop(x),
+            Ok(LoDgram { mut data, from, at }) => {
+                let len = data.len();
+                data.truncate(size);
+                return Ok(Some((data, len, from, at)));
+            }
+        }
+    }
 }
 
 /// The loopback slots a socket of family `fam` holds.
@@ -1567,30 +1609,7 @@ impl InetSock {
             };
             let mut got: Option<(Vec<u8>, usize, SockAddr, ctl::Arrival)> = None;
             if let Some(l) = &lo {
-                let mut dropped = Vec::new();
-                {
-                    let mut q = l.q.lock();
-                    // A connected socket takes datagrams from its peer only.
-                    while let Some(x) = q.front() {
-                        if peer.is_some_and(|p| p != x.from) {
-                            if let Some(x) = q.pop_front() {
-                                l.bytes.fetch_sub(x.data.len(), Ordering::AcqRel);
-                                dropped.push(x);
-                            }
-                            continue;
-                        }
-                        let item = (x.data[..x.data.len().min(size)].to_vec(), x.data.len(), x.from, x.at);
-                        if !peek
-                            && let Some(x) = q.pop_front()
-                        {
-                            l.bytes.fetch_sub(x.data.len(), Ordering::AcqRel);
-                            dropped.push(x);
-                        }
-                        got = Some(item);
-                        break;
-                    }
-                }
-                drop(dropped);
+                got = lo_take(l, peer, size, peek)?;
             }
             if got.is_none()
                 && let Some(s) = &smol

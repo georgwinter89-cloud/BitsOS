@@ -1,0 +1,7 @@
+mode fsync
+/dev/shm file made: yes
+mapped shared: yes
+waitv with a value that differs = -EAGAIN
+waitv to an absolute monotonic deadline 50 ms ahead = -ETIMEDOUT
+the other process's waitv over 64 shared words answered 63
+done

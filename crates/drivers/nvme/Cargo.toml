@@ -18,6 +18,17 @@ policy = { path = "../../policy" }
 hal = { path = "../../hal" }
 sched = { path = "../../sched" }
 time = { path = "../../time" }
+# NV-2p: bitsdisk's keyboard-only path (crates/drivers/nvme/src/setup.rs): /dev/bitsos/disksetup, the proof from the
+# input sink, CONFIG.TXT through fs-fat's guard, the pool through fs-ext4's format_pool.
+console = { path = "../../console" }
+fs-ext4 = { path = "../../fs-ext4" }
+fs-fat = { path = "../../fs-fat" }
+proc = { path = "../../proc" }
+uapi = { path = "../../uapi" }
+vfs = { path = "../../vfs" }
+# BL-2: the three-layer reader ktest (ktests_stack.rs) builds a pool and volume of its own (already in the kernel
+# through fs-ext4).
+bitsvol = { path = "../../bitsvol" }
 
 [lints]
 workspace = true

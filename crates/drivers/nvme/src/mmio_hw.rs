@@ -4,21 +4,23 @@
 //! interrupt vectors from PC-2/PC-3. Bus master on every bridge above the controller comes from
 //! `enable_device(true)` (CONTRACTS 6b: the Mini-PC firmware leaves it off, DMA would fail with UR).
 
-use crate::hw::{DmaMem, Hw, IrqMode};
+use crate::hw::{Bell, DmaMem, Hw, IrqHook, IrqMode};
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use hal::mmio::IoMem;
-use ksync::SpinLock;
+use ksync::{SpinLock, WaitQueue};
 use mm::dma::{DmaBuffer, DmaConstraints};
 
 /// `pause_us` sleeps from this length on and spins below it.
 const SLEEP_MIN_US: u64 = 50;
-/// MSI-X storm bound: far above what one outstanding command per queue can cause, low enough that a
-/// misbehaving device cannot hold a CPU (PC-3: the default 100 per ms would mask a busy NVMe queue).
+/// MSI-X storm bound per vector: an interrupt per completion (no coalescing) on one queue stays far below it at
+/// several hundred thousand commands per second; a misbehaving device still cannot hold a CPU (PC-3: the default
+/// 100 per ms would mask a busy NVMe queue).
 const STORM: pci::StormLimit = pci::StormLimit { per_window: 5000, window_ns: 1_000_000 };
 
 pub struct MmioHw {
-    io: IoMem,
+    io: Arc<IoMem>,
     pci: pci::PciFunction,
     irqs: SpinLock<Option<pci::IrqSet>>,
 }
@@ -37,7 +39,7 @@ impl MmioHw {
         if pci.save_config().is_none() {
             klog::event!(Warn, "nvme", "save_config_failed", function = format!("{}", pci.loc()); "no saved header until the first enable");
         }
-        Ok(MmioHw { io, pci: pci.clone(), irqs: SpinLock::named("nvme.irqs", None) })
+        Ok(MmioHw { io: Arc::new(io), pci: pci.clone(), irqs: SpinLock::named("nvme.irqs", None) })
     }
     pub fn pci(&self) -> &pci::PciFunction {
         &self.pci
@@ -47,6 +49,15 @@ impl MmioHw {
         let g = self.irqs.lock();
         let s = g.as_ref()?;
         Some((s.mode(), (0..s.len()).map(|i| s.count(i)).collect(), s.is_released()))
+    }
+}
+
+/// The doorbell writer the interrupt hook owns: one uncached store, no lock.
+pub struct MmioBell(Arc<IoMem>);
+
+impl Bell for MmioBell {
+    fn ring(&self, off: usize, v: u32) {
+        let _ = self.0.write32(off, v);
     }
 }
 
@@ -76,6 +87,7 @@ impl DmaMem for DmaBuffer {
 
 impl Hw for MmioHw {
     type Mem = DmaBuffer;
+    type Bell = MmioBell;
     fn rd32(&self, off: usize) -> u32 {
         self.io.read32(off).unwrap_or(!0)
     }
@@ -108,10 +120,12 @@ impl Hw for MmioHw {
     fn pci_off(&self) {
         let _ = self.pci.disable_device();
     }
-    fn setup_irqs(&self, max: u16) -> IrqMode {
+    fn setup_irqs(&self, max: u16, hook: IrqHook) -> IrqMode {
         self.free_irqs();
-        // No polled set from the PCI core: the waiter polls by itself without vectors.
-        let req = pci::IrqRequest::new("nvme", 1, max).modes(true, true, false).storm(Some(STORM));
+        // No polled set from the PCI core: the waiter polls by itself without vectors. Spread: index i on the i-th CPU
+        // from a rotating start, so each I/O queue's interrupt arrives where its submitters run (Linux
+        // `pci_alloc_irq_vectors_affinity` with one pre-vector for admin).
+        let req = pci::IrqRequest::new("nvme", 1, max).modes(true, true, false).storm(Some(STORM)).affinity(pci::Affinity::Spread).hook(hook);
         match self.pci.alloc_irqs(&req) {
             Ok(set) => {
                 let m = match set.mode() {
@@ -127,6 +141,25 @@ impl Hw for MmioHw {
                 IrqMode::Polled
             }
         }
+    }
+    fn irq_cpu(&self, i: u16) -> Option<u32> {
+        self.irqs.lock().as_ref().and_then(|s| s.vector(i as usize)).map(|v| v.cpu)
+    }
+    fn bell(&self) -> MmioBell {
+        MmioBell(self.io.clone())
+    }
+    fn cpus(&self) -> usize {
+        // The CPUs that are up, also those not yet scheduling (the bring-up may run before every AP joined).
+        hal::percpu::cpu_count().max(sched::online_cpus()).max(1)
+    }
+    fn cpu(&self) -> usize {
+        sched::current_cpu()
+    }
+    fn dma_target(&self, buf: &[u8]) -> Option<u64> {
+        hal::drv_nv::dma_target(buf)
+    }
+    fn sleep_on(&self, wq: &WaitQueue, cond: &mut dyn FnMut() -> bool, timeout_ns: u64) {
+        let _ = wq.wait_until_timeout(cond, timeout_ns);
     }
     fn free_irqs(&self) {
         let old = self.irqs.lock().take();

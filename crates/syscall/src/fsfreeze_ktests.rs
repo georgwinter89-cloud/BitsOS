@@ -1,7 +1,8 @@
 //! FIFREEZE / FITHAW (VS-2 CR5; linux-6.6/fs/ioctl.c:387-415): EPERM for uid 1000, EOPNOTSUPP on tmpfs and on a
 //! file without a file system of its own, EINVAL for a thaw nobody asked for; on an ext4 /data (FS-8c) a freeze,
 //! EBUSY for a second one, the thaw, and EINVAL for a second thaw. Rerunnable: /data is thawed before the end
-//! (also when a step fails), and the tmpfs file is removed.
+//! (also when a step fails), and the tmpfs file is removed. QEMU only: on the Mini-PC it would freeze the live /data
+//! under the desktop and the services, and its wait for /data would sit on MCP's ktest thread.
 
 use crate::ab6_ktests::T;
 use crate::fsfreeze::{FIFREEZE, FITHAW};
@@ -20,7 +21,7 @@ const STATE: &str = "/run/bitsos/data-state";
 /// The /data thread waits up to 120 s for the stick; a missing line means a boot without that thread.
 const DATA_WAIT_NS: u64 = 150_000_000_000;
 
-ktest!("ab.fsfreeze", Safe, fsfreeze);
+ktest!("ab.fsfreeze", Run("vs/30-snapshots"), fsfreeze);
 fn fsfreeze() -> TestResult {
     let ns = vfs::root_ns();
     let file = ns.open_flags(TMP, O_RDWR | O_CREAT, 0o600).map_err(|e| format!("{TMP:?}: {e}"))?;
@@ -67,6 +68,6 @@ fn fsfreeze() -> TestResult {
     let _ = vfs::ops::Ctx::kernel(&ns).unlink(None, TMP);
     match r? {
         true => Ok(()),
-        false => ktest::skip("no ext4 /data in this boot: only the refusals were checked"),
+        false => ktest::fail("no ext4 /data in this boot: only the refusals were checked"),
     }
 }

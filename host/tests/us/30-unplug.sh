@@ -77,7 +77,8 @@ run() { # $1 = name, $2 = device_add arguments of the keyboard, rest = extra QEM
     wait "$QPID" || true
     QPID=""
     grep -a "KTEST\|ktest\.\|device\.attached\|device\.detached" "$log" || true
-    grep -aq "KTEST ok us.unplug.held" "$log" || fail "$NAME: us.unplug.held did not pass"
+    # The ok line can interleave byte by byte with another CPU's klog on the serial port; its done line is the fallback.
+    grep -aq "KTEST ok us.unplug.held\|KTEST done passed=1 failed=0" "$log" || fail "$NAME: us.unplug.held did not pass"
     if grep -aq "xhci.failed\|xhci.slot_leaked\|lock.violation\|PANIC" "$log"; then fail "$NAME: failure line"; fi
 }
 

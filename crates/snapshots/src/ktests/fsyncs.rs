@@ -17,6 +17,11 @@ use vfs::MountNs;
 
 const WRITERS: u64 = 4;
 const TAKES: usize = 30;
+/// After this long no further take starts (at least `MIN_TAKES`): with 2 s flushes 30 takes under this load run for
+/// many minutes (VS-H, 18 of them before the flush left the pool lock), which says nothing more than the first 10
+/// did and runs into a scenario's bound. Not a judgement: fewer takes are no failure.
+const TAKES_WITHIN_NS: u64 = 240 * SEC;
+const MIN_TAKES: usize = 5;
 const RECORD: usize = 4096;
 /// Each log file wraps at this size (a WAL checkpointed now and then).
 const LOG_BYTES: u64 = 1 << 20;
@@ -108,7 +113,12 @@ fn fsyncs() -> TestResult {
     sched::sleep_ns(500 * MS);
     let mut taken: Vec<Taken> = Vec::new();
     let r = (|| -> TestResult {
+        let t0 = time::now_ns();
         for i in 0..TAKES {
+            if i >= MIN_TAKES && time::now_ns().saturating_sub(t0) > TAKES_WITHIN_NS {
+                klog::event!(Warn, "snap", "fsyncs.fewer_takes", takes = i, want = TAKES; "a very slow disk: the rest is left out");
+                break;
+            }
             taken.push(take(&t, "vsfsync", true, true).map_err(|x| format!("take {i}: errno {x}"))?);
             sched::sleep_ns(300 * MS);
         }
@@ -129,7 +139,7 @@ fn fsyncs() -> TestResult {
     kassert!(ended, "a writer did not stop");
     kassert!(l.errors.load(Ordering::Relaxed) == 0, "{} writer errors", l.errors.load(Ordering::Relaxed));
     let new = taken.iter().filter(|k| k.new).count();
-    kassert!(new * 2 >= TAKES, "only {new} of {TAKES} takes found a change under a steady write load");
+    kassert!(new * 2 >= taken.len(), "only {new} of {} takes found a change under a steady write load", taken.len());
     let col = |f: fn(&Taken) -> u64| spread(taken.iter().map(f).collect());
     let (p0, p50, p95, p100) = col(|k| k.pause_ns);
     let (_, f50, _, f100) = col(|k| k.freeze_ns);
@@ -138,7 +148,7 @@ fn fsyncs() -> TestResult {
     let (_, c50, _, c100) = col(|k| k.commit_ns);
     let (_, _, _, b100) = col(|k| k.pause_barriers * 1000);
     let (_, bt50, _, bt100) = col(|k| k.pause_barrier_ns);
-    klog::event!(Info, "snap", "fsyncs.pauses", snapshots = new, takes = TAKES, steps = steps_before_check,
+    klog::event!(Info, "snap", "fsyncs.pauses", snapshots = new, takes = taken.len(), steps = steps_before_check,
         min_us = p0, median_us = p50, p95_us = p95, max_us = p100, freeze_median_us = f50, freeze_max_us = f100,
         snap_median_us = s50, snap_max_us = s100, preflush_median_us = pre50, preflush_max_us = pre100,
         commit_median_us = c50, commit_max_us = c100, barriers_max = b100, barrier_median_us = bt50, barrier_max_us = bt100,
@@ -151,4 +161,4 @@ fn fsyncs() -> TestResult {
     kassert!(t.pool.owed_flushes() == 0, "{} deferred flushes never committed", t.pool.owed_flushes());
     Ok(())
 }
-ktest!("snap.fsyncs", QemuOnly, fsyncs);
+ktest!("snap.fsyncs", Run("vs/30-snapshots"), fsyncs);

@@ -85,7 +85,7 @@ impl vfs::sys::UserMem for Mem {
 
 pub(crate) struct Fx {
     pub(crate) gpu: Arc<FakeGpu>,
-    dev: Arc<device::Device>,
+    pub(crate) dev: Arc<device::Device>,
     pub(crate) files: Vec<Option<Arc<OpenDrm>>>,
     pub(crate) fds: Arc<FdTable>,
     pub(crate) m: Mem,

@@ -8,6 +8,7 @@
 # build (`flavour`). Since INT-W24 the stick's manifest carries the gpu build and the stage pixman/libxkbcommon.
 # WY_GPU=1: the gpu build and a tree it loads from (the stage plus the host's copies of what it lacks).
 # WY-15: WY_GPU=gles: the same image with CONFIG.TXT bitscomp=gles (the gpu build draws with GLES on llvmpipe).
+# WY-17: WY_GPU=auto: the same with bitscomp=auto (GLES when a render node is up).
 # WY-3: WY_XWAYLAND=1 also puts the Xwayland tree (user/ports/xwayland/scripts/build-v2.sh, with its test clients)
 # at \BITSOS2\xwayland\.
 # Fallback cases (the rescue build must run on): WY_GPU=bare: a stage without libpixman-1 (the stage before INT-W24
@@ -15,12 +16,12 @@
 # build without any Mesa tree (its loader is missing).
 set -euo pipefail
 case ${WY_GPU:-0} in
-  1|gles|bare|notree) ;;
+  1|gles|auto|bare|notree) ;;
   0) exit 0 ;;
-  *) echo "WY_GPU=1|gles|bare|notree, not ${WY_GPU}" >&2; exit 2 ;;
+  *) echo "WY_GPU=1|gles|auto|bare|notree, not ${WY_GPU}" >&2; exit 2 ;;
 esac
 case $1 in
-  config) if [ "$WY_GPU" = gles ]; then echo ";bitscomp=gles"; else echo ";bitscomp=gpu"; fi; exit 0 ;;
+  config) case $WY_GPU in gles|auto) echo ";bitscomp=$WY_GPU" ;; *) echo ";bitscomp=gpu" ;; esac; exit 0 ;;
   image) NAME=$2 ;;
   *) echo "gpu-image.sh config | image NAME" >&2; exit 2 ;;
 esac
@@ -28,6 +29,11 @@ cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 ROOT=$PWD
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$STAGE" ]; then
+    # A worktree has no out/: the manifest's `tree mesa`, as dr/20 does; an empty answer keeps the path above.
+    _m=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' "$ROOT/user/packaging/manifest.txt")
+    [ -z "$_m" ] || STAGE=$_m
+fi
 if [ ! -f "$STAGE/lib/ld-linux-x86-64.so.2" ]; then
     STAGE=$CARGO_TARGET_DIR/wy-mesa-out/mesa
     [ -f "$STAGE/lib/ld-linux-x86-64.so.2" ] || MESA_OUT=$CARGO_TARGET_DIR/wy-mesa-out bash user/ports/mesa/scripts/stage-v2.sh
@@ -59,7 +65,7 @@ rm -f "$IMG"
 mkfs.fat -F 32 -n BITSOS -C "$IMG" "$kib" > /dev/null
 mcopy -s -i "$IMG" "$ESP/EFI" "$ESP/BITSOS2" ::/
 want=gpu
-[ "$WY_GPU" = gles ] && want=gles
+case $WY_GPU in gles|auto) want=$WY_GPU ;; esac
 grep -q "^bitscomp=$want" "$ESP/BITSOS2/CONFIG.TXT" || { echo "RED: CONFIG.TXT of $NAME has no bitscomp=$want"; exit 1; }
 [ "${WY_XWAYLAND:-0}" = 1 ] && echo "gpu-image: $NAME carries \BITSOS2\xwayland\ (Xwayland and the X11 test clients)"
 echo "gpu-image ($WY_GPU): $NAME carries \\BITSOS2\\bin\\bitscomp-gpu$([ "$WY_GPU" = notree ] && echo ' and no Mesa tree' || echo ' and \BITSOS2\mesa\') ($((bytes >> 20)) MB ESP), CONFIG.TXT bitscomp=$want"

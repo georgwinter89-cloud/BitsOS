@@ -9,7 +9,7 @@
 //! CPUs that come online after the allocator was built (CP-4) have no list yet; `PerCpu::get_for` returns
 //! `None` for them and they use the buddy lists directly.
 
-use crate::buddy::ZONES;
+use crate::buddy::{PCP_TYPES, ZONES};
 use alloc::vec::Vec;
 use ksync::IrqSpinLock;
 
@@ -19,10 +19,14 @@ pub const BATCH: usize = 32;
 pub const HIGH: usize = 6 * BATCH;
 
 pub struct PcpCpu {
-    /// One list per zone, so a frame always goes back to the zone it came from.
-    pub lists: [IrqSpinLock<Vec<u64>>; ZONES],
+    /// One list per zone, so a frame always goes back to the zone it came from, and per migrate type (W35 MM-1,
+    /// Linux `per_cpu_pages.lists[]`): a list refills from its type's pageblocks, a freed frame goes to the list of
+    /// its pageblock's type (HighAtomic has none: `buddy::highatomic`).
+    pub lists: [[IrqSpinLock<Vec<u64>>; PCP_TYPES]; ZONES],
 }
 
 pub fn new_cpu(_cpu: usize) -> PcpCpu {
-    PcpCpu { lists: core::array::from_fn(|_| IrqSpinLock::named("frames.pcp", Vec::with_capacity(HIGH + BATCH))) }
+    PcpCpu {
+        lists: core::array::from_fn(|_| core::array::from_fn(|_| IrqSpinLock::named("frames.pcp", Vec::with_capacity(HIGH + BATCH)))),
+    }
 }

@@ -4,9 +4,12 @@
 extern crate std;
 
 mod blob;
+mod boot;
 mod bringup;
+mod compute_ib;
 mod cursor;
 mod disc;
+mod dpm;
 mod fakes;
 mod ipmod;
 mod fake;
@@ -14,6 +17,8 @@ mod flip;
 mod gates;
 mod gmc;
 mod handoff;
+mod hw;
+mod ih;
 mod layout;
 mod mode;
 mod model;

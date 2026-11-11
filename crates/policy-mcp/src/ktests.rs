@@ -76,7 +76,7 @@ fn self_exec_named_by_its_executable() -> TestResult {
     let env = ["PATH=/bin"];
     let p = match proc::spawn_with("/bin/sh", &proc::SpawnOptions::new(&argv, &env, ProgramId(1))) {
         Ok(p) => p,
-        Err(proc::SpawnError::NotFound) => return ktest::skip("no /bin/sh (BusyBox) in this image"),
+        Err(proc::SpawnError::NotFound) => return ktest::fail("no /bin/sh (BusyBox) in this image"),
         Err(e) => return Err(alloc::format!("spawn /bin/sh: {e}")),
     };
     let end = time::now_ns() + 10_000 * MS;
@@ -143,7 +143,7 @@ fn named_after_the_owner_ended() -> TestResult {
     let env = ["PATH=/bin"];
     let p = match proc::spawn_with("/bin/sh", &proc::SpawnOptions::new(&argv, &env, ProgramId(0x504D_0041))) {
         Ok(p) => p,
-        Err(proc::SpawnError::NotFound) => return ktest::skip("no /bin/sh (BusyBox) in this image"),
+        Err(proc::SpawnError::NotFound) => return ktest::fail("no /bin/sh (BusyBox) in this image"),
         Err(e) => return Err(alloc::format!("spawn /bin/sh: {e}")),
     };
     let s = Subject { program: p.program, pid: p.pid, uid: p.uid };

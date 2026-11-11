@@ -11,6 +11,7 @@ use crate::chrome_draw::buehne::{self as bd, ColumnLook, HeaderLook, HeadlineLoo
 use crate::chrome_draw::strip::{self, BottomLook, StripLook};
 use crate::chrome_draw::{self as draw, RingLook};
 use crate::desk::Spot;
+use crate::fx::plan as fx;
 use crate::layout::Rect;
 use crate::render::{CompElement, CompRenderer};
 use crate::state::App;
@@ -151,7 +152,10 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
         app.images.buehne.work = Some(b.work);
         app.layout_dirty = true;
     }
+    // Each image follows only its own buttons: a hover elsewhere must not draw it again.
+    let in_bottom = |h: &Hover| matches!(h, Hover::Buehne(Part::Feld) | Hover::Chrome(crate::chrome::Part::Min(_) | crate::chrome::Part::Home));
     let hover = app.buehne_hover();
+    let (hover_top, hover_bottom) = (hover.filter(|h| !in_bottom(h)), hover.filter(in_bottom));
     let slug = app.slug();
     let mut out = Vec::new();
     let put = |renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement<R>>| {
@@ -159,9 +163,10 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
     };
     // Claude's ring in the header: its own sprite over the header image.
     let ring = app.desk.ring;
-    let step = app.status.ring.shown(crate::ring::moves(ring), now, &t);
+    let step = app.status.ring.shown(crate::ring::sprite_moves(ring, &t), now, &t);
     let size = t.bl(40.0) as f32 * 48.0 / 44.0 * 0.9;
     let rl = RingLook { rect: b.ring, ring, step, size, theme: tg };
+    out.extend(fx::ring(app, "ring-top", b.ring, size, ring, -glide).map(CompElement::from));
     let rbuf = cached(&mut app.images.top_ring, &rl, |l| draw::ring_sprite(l, &t));
     put(renderer, rbuf, b.ring, -glide, &mut out);
     let edit = app.desk.edit.as_ref().filter(|e| e.tile.is_none()).map(|e| (e.text.clone(), e.before().to_string()));
@@ -174,21 +179,27 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
         edit,
         blocks: app.status.blocks.clone(),
         clock: app.status.clock.clone(),
-        hover,
+        hover: hover_top,
         notices: 0,
+        library: app.lib.open,
     };
+    out.extend(fx::mark(app, b, -glide).map(CompElement::from));
     let buf = cached(&mut app.images.buehne.header, &look, |l| bd::header(l, &t));
     put(renderer, buf, b.header, -glide, &mut out);
     if let (Some(r), Some(text)) = (b.headline, app.absicht()) {
         let look = HeadlineLook { rect: r, theme: tg, slug: slug.clone(), text };
+        out.extend(fx::headline_dot(app, r).map(CompElement::from));
         let buf = cached(&mut app.images.buehne.headline, &look, |l| bd::headline(l, &t));
         put(renderer, buf, r, 0.0, &mut out);
+        out.extend(fx::halo(app, "headline-halo", r).map(CompElement::from));
     }
     if let Some((map, next)) = b.column {
         let look = ColumnLook { map, next, theme: tg, workspaces: app.ws_count() };
         let area = bd::padded(Rect { h: next.y + next.h - map.y, ..map }, &t, b.stage.x + b.stage.w);
+        out.extend(fx::radar(app, map).map(CompElement::from));
         let buf = cached(&mut app.images.buehne.column, &look, |l| bd::column(l, &t, area));
         put(renderer, buf, area, 0.0, &mut out);
+        out.extend(fx::column(app, map, next).into_iter().map(CompElement::from));
     }
     if let Some(r) = b.strip {
         let look = StripLook {
@@ -202,6 +213,7 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
         let area = Rect { y: r.y - t.bl(20.0), h: r.h + t.bl(44.0), ..bd::padded(r, &t, 0) };
         let buf = cached(&mut app.images.buehne.strip, &look, |l| strip::strip(l, &t, area));
         put(renderer, buf, area, glide, &mut out);
+        out.extend(fx::strip(app, r).into_iter().map(CompElement::from));
     }
     if let Some(row) = b.bottom {
         let (tiles, _) = app.ws_counts(app.desk.active);
@@ -217,18 +229,18 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
             grant: app.install_marker(),
             minimized: app.ws.minimized.iter().map(|m| crate::minimize::label(&m.win)).collect(),
             home_lit: app.start_shown(),
-            hover,
+            hover: hover_bottom,
         };
         let full = app.area_full();
         let top = row.y - t.bl(16.0);
         let area = Rect { x: 0, y: top, w: full.w, h: full.h - top };
+        out.extend(fx::feld_ring(app, b.feld).map(CompElement::from));
         let buf = cached(&mut app.images.buehne.bottom, &look, |l| strip::bottom(l, &t, area));
         put(renderer, buf, area, glide, &mut out);
+        out.extend(fx::feld(app, b.feld).into_iter().map(CompElement::from));
     }
     if app.start_shown() {
-        let look = app.start_look(tg);
-        let buf = cached(&mut app.images.start, &look, |l| crate::start_draw::draw(l, &t));
-        put(renderer, buf, b.work, 0.0, &mut out);
+        super::start_page(app, renderer, b.work, alpha, &mut out);
     }
     out
 }

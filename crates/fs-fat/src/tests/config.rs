@@ -35,7 +35,7 @@ fn evasions_are_refused() {
     let c = Ctx::kernel(&ns);
     let old = ns.read_file(CFG_S, 1 << 16).unwrap();
     let f = c.open(None, CFG, O_WRONLY | O_APPEND, 0).unwrap();
-    for line in [&b"NVME_WRITE=yes\n"[..], b"  nvme_write  =  1  \r\n", b"Nvme_Write=yes\n", b"usb_msd_write = on\n", b"stick_write=on # x\n"] {
+    for line in [&b"NVME_WRITE=yes\n"[..], b"  nvme_write  =  1  \r\n", b"Nvme_Write=yes\n", b"usb_msd_write = on\n", b"stick_write=on # x\n", b"nvme_data=S:G:1:2\n", b" NVME_DATA = S:G:1:2\n"] {
         assert_eq!(f.write(line).err(), Some(EPERM), "{}", String::from_utf8_lossy(line));
     }
     // A line split over two writes: the first half is harmless, the second completes a guarded line.

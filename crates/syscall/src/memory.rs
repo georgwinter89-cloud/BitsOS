@@ -6,6 +6,7 @@ use crate::SysCtx;
 use uapi::errno::*;
 
 fn sys_brk(c: &mut SysCtx<'_>) -> i64 {
+    c.proc.mm.refresh_future_limit(|| lock_limit(c));
     c.proc.mm.sys_brk(c.args[0]) as i64
 }
 crate::syscall!(BRK, sys_brk);
@@ -16,6 +17,7 @@ crate::syscall!(BRK, sys_brk);
 /// address checks and FS's file checks (`vfs::mmap::check`).
 fn sys_mmap(c: &mut SysCtx<'_>) -> i64 {
     let [addr, len, prot, flags, fd, off] = c.args;
+    c.proc.mm.refresh_future_limit(|| lock_limit(c));
     if flags & uapi::mman::MAP_ANONYMOUS == 0 {
         if off & 0xfff != 0 {
             return -EINVAL;
@@ -104,6 +106,37 @@ fn sys_pkey_free(_c: &mut SysCtx<'_>) -> i64 {
     -EINVAL
 }
 crate::syscall!(PKEY_FREE, sys_pkey_free);
+
+/// GM-2a CR 4: RLIMIT_MEMLOCK and CAP_IPC_LOCK of the caller (linux-6.6/mm/mlock.c `can_do_mlock`).
+fn lock_limit(c: &SysCtx<'_>) -> mm::LockLimit {
+    let bytes = c.proc.limits.get(uapi::ab::rlimit::RLIMIT_MEMLOCK).map_or(u64::MAX, |l| l.cur);
+    mm::LockLimit { bytes, capable: c.proc.capable(proc::cred::Cap::IpcLock) }
+}
+
+fn sys_mlock(c: &mut SysCtx<'_>) -> i64 {
+    c.proc.mm.sys_mlock(c.args[0], c.args[1], 0, lock_limit(c)).map(|_| 0).unwrap_or_else(|e| -e.code())
+}
+crate::syscall_nr!(149, "mlock", sys_mlock);
+
+fn sys_munlock(c: &mut SysCtx<'_>) -> i64 {
+    c.proc.mm.sys_munlock(c.args[0], c.args[1]).map(|_| 0).unwrap_or_else(|e| -e.code())
+}
+crate::syscall_nr!(150, "munlock", sys_munlock);
+
+fn sys_mlockall(c: &mut SysCtx<'_>) -> i64 {
+    c.proc.mm.sys_mlockall(c.args[0] as u32 as u64, lock_limit(c)).map(|_| 0).unwrap_or_else(|e| -e.code())
+}
+crate::syscall_nr!(151, "mlockall", sys_mlockall);
+
+fn sys_munlockall(c: &mut SysCtx<'_>) -> i64 {
+    c.proc.mm.sys_munlockall().map(|_| 0).unwrap_or_else(|e| -e.code())
+}
+crate::syscall_nr!(152, "munlockall", sys_munlockall);
+
+fn sys_mlock2(c: &mut SysCtx<'_>) -> i64 {
+    c.proc.mm.sys_mlock(c.args[0], c.args[1], c.args[2] as u32 as u64, lock_limit(c)).map(|_| 0).unwrap_or_else(|e| -e.code())
+}
+crate::syscall_nr!(325, "mlock2", sys_mlock2);
 
 /// MM-5b: madvise with Linux 6.6's semantics (`mm::aspace` advise.rs; the advice is the `int` argument).
 fn sys_madvise(c: &mut SysCtx<'_>) -> i64 {

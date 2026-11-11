@@ -23,6 +23,11 @@ LOG="$RUN_DIR/serial.log"
 QMP="$RUN_DIR/qmp.sock"
 NAME=gm-radv
 STAGE=${MESA_STAGE:-$ROOT/user/ports/mesa/out/mesa}
+if [ -z "${MESA_STAGE:-}" ] && [ ! -d "$STAGE" ]; then
+    # A worktree has no out/: the manifest's `tree mesa`, as dr/20 does; an empty answer keeps the path above.
+    _m=$(awk '$1 == "tree" && $2 == "mesa" { sub(/^host:/, "", $3); print $3 }' "$ROOT/user/packaging/manifest.txt")
+    [ -z "$_m" ] || STAGE=$_m
+fi
 REF=${GM_RADV_REF:--}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 [ -x "$STAGE/run" ] && [ -f "$STAGE/lib/libvulkan_radeon.so" ] && [ -f "$STAGE/share/libdrm/amdgpu.ids" ] \

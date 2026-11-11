@@ -273,7 +273,7 @@ fn settingsd_defaults_match_the_built_in_ones() {
 }
 
 #[test]
-fn effects_gpu_is_accepted_and_drawn_like_cheap_and_scanlines_switch() {
+fn the_gpu_level_is_chosen_here_and_drawn_by_the_renderers_word_and_scanlines_switch() {
     use crate::theme::Effects;
     let mut v = Values::default();
     let t = Theme::build(&v);
@@ -282,7 +282,7 @@ fn effects_gpu_is_accepted_and_drawn_like_cheap_and_scanlines_switch() {
     v.set("theme.scanlines", "false");
     let g = Theme::build(&v);
     assert_eq!((g.effects, g.effects.word()), (Effects::Gpu, "gpu"));
-    assert!(!g.effects_gpu, "the GPU level is not drawn before a GPU renderer exists");
+    assert!(!g.effects_gpu, "a setting alone draws nothing: `App::fx_follow` asks the renderer");
     assert!(!g.scanlines);
     // Everything drawn is the same: only the chosen level and the scanline switch differ.
     let same = Theme { effects: Effects::Cheap, scanlines: true, ..g };

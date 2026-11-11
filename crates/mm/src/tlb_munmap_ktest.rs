@@ -8,7 +8,7 @@
 //! frees no table while the other CPUs hold the space lazily.
 
 use crate::linux::{madv, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED};
-use crate::tlb_ktest::{ap_activate, aps, on};
+use crate::tlb_ktest::{ap_activate, aps, frame_errors, on};
 use crate::{AddressSpace, Fill};
 use alloc::format;
 use alloc::string::String;
@@ -40,10 +40,6 @@ fn lazy() -> Result<Arc<AddressSpace>, String> {
 
 fn generation(a: &AddressSpace) -> u64 {
     tlb::generation(a.root()).unwrap_or(0)
-}
-
-fn user_frames() -> u64 {
-    mm_core::frames().map_or(0, |f| f.stats().used_by_kind[mm_core::Kind::User as usize])
 }
 
 /// Reschedule IPIs sent so far (sched's counter, the other vector of the storm; not MM's to lower).
@@ -92,9 +88,9 @@ fn munmap() -> TestResult {
     const RUN_NS: u64 = 1_500_000_000;
     let cpus: Vec<usize> = (0..hal::percpu::cpu_count()).filter(|&c| hal::smp::is_online(c)).take(16).collect();
     if cpus.len() < 2 {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let a = lazy()?;
     let w = Arc::new(Work::default());
     let errs = Arc::new(ksync::SpinLock::new(Vec::<String>::new()));
@@ -150,16 +146,17 @@ fn munmap() -> TestResult {
     kassert!(rounds <= n + early + splits, "{rounds} rounds for {n} munmaps ({early} early gather rounds, {splits} huge page splits)");
     // Every munmap removed written pages: each is one flush of cause munmap; its IPIs are what the munmaps sent.
     kassert!(m_flushes >= n && m_rounds <= m_flushes && m_ipis <= ipis, "munmap cause: {m_flushes} flushes, {m_rounds} rounds, {m_ipis} of {ipis} IPIs for {n} munmaps");
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
-ktest!("mm.tlb.munmap", Safe, munmap);
+// Only with the desktop stopped: it compares all user frames of the machine, and a running desktop moves them too (4.11., W30 round).
+ktest!("mm.tlb.munmap", Screen, munmap);
 
 /// One madvise(DONTNEED) over several VMAs is one round and frees no page table; a munmap between two touched
 /// neighbours frees no table either (they share its tables), one over a 2 MiB-aligned run frees the tables inside.
 fn batch() -> TestResult {
     let aps = aps();
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let r = (|| -> TestResult {
         let a = lazy()?;
         // Page tables of 4 KiB pages (MM-11); huge pages have their own tests (mm.thp.*).
@@ -209,7 +206,7 @@ fn batch() -> TestResult {
         let _ = on(c, ap_activate, paging::home_root());
     }
     r?;
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
 ktest!("mm.tlb.batch", Safe, batch);
@@ -245,10 +242,10 @@ fn ipis() -> TestResult {
     const K: u64 = 8;
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
     let others = aps.len() as u64;
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let r = (|| -> TestResult {
         let a = lazy()?;
         // 4 KiB pages: a huge page cut by the hole would add its split's table and round (mm.thp.*).
@@ -307,7 +304,7 @@ fn ipis() -> TestResult {
         let _ = on(c, ap_activate, paging::home_root());
     }
     r?;
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
 ktest!("mm.tlb.ipis", Safe, ipis);

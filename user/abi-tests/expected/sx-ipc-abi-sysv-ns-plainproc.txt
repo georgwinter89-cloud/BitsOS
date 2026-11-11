@@ -1,0 +1,12 @@
+/proc/sys/kernel/sem: 32000	1024000000	500	32000
+/proc/sys/kernel/shmmax: 18446744073692774399
+/proc/sys/kernel/shmall: 18446744073692774399
+/proc/sys/kernel/shmmni: 4096
+/proc/sys/kernel/msgmax: 8192
+/proc/sys/kernel/msgmnb: 16384
+/proc/sys/kernel/msgmni: 32000
+write refused = -EACCES
+write refused = -EACCES
+       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime
+       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap
+       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime

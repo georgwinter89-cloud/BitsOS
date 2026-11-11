@@ -1,4 +1,4 @@
-# Pinned by date in CONTRACTS.md ("toolchain"); xtask checks `rustc -V` against it and warns on a mismatch.
+# Pinned by date in host/xtask/src/main.rs; xtask checks `rustc -V` against it and warns on a mismatch.
 # The channel name stays "nightly" so no second toolchain download is needed; the desk bumps the expected
 # date once a month in one commit.
 [toolchain]

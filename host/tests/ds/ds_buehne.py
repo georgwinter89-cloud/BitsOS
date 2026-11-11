@@ -110,7 +110,6 @@ try:
         wait_for(lambda: f'title="{title}"' in ctl("list"), f"wyclient {title} did not map")
     time.sleep(0.5)
     hot = ctl("hot")
-    has_cr = "\nbuehne sun=" in hot
     # The Bühne is the default: the stage at (48, 80) board px = (51, 85) logical, no favourites, no list.
     wx, wy, ww, wh = work()
     need((wx, wy) == (51, 85) and 1400 < ww < 1500 and 700 < wh < 800, f"the tiles' area is the stage ({wx},{wy},{ww},{wh})")
@@ -202,19 +201,16 @@ try:
     procs.remove(hanger)
     wait_for(lambda: 'title="four"' not in ctl("list"), "four did not go")
 
-    # The sun: light and dark (needs CR DS-3-1: spots.rs asks the Bühne's parts).
-    if has_cr:
-        click(hot_at("buehne", "sun"))
-        wait_for(lambda: "mode=light" in ctl("theme"), "the sun did not switch to light")
-        click(hot_at("buehne", "sun"))
-        wait_for(lambda: "mode=dark" in ctl("theme"), "the sun did not switch back to dark")
-        need(True, "the sun switches light and dark")
-        for part in ["bell", "feld", "strip"]:
-            click(hot_at("buehne", part))
-        need("editing=false" in ctl("hot") and ctl("ws").count("\n") >= 2, "bell, Feld bar and strip open nothing yet")
-    else:
-        need(os.environ.get("DS_REQUIRE_CRS") != "1", "DS_REQUIRE_CRS=1 needs CR DS-3-1 (the sun's click)")
-        print("skip: the sun's click (CR DS-3-1 not applied: spots.rs does not ask the Bühne's parts)", flush=True)
+    # The sun: light and dark.
+    need("\nbuehne sun=" in hot, "the Bühne's parts answer in `ctl hot`")
+    click(hot_at("buehne", "sun"))
+    wait_for(lambda: "mode=light" in ctl("theme"), "the sun did not switch to light")
+    click(hot_at("buehne", "sun"))
+    wait_for(lambda: "mode=dark" in ctl("theme"), "the sun did not switch back to dark")
+    need(True, "the sun switches light and dark")
+    for part in ["bell", "feld", "strip"]:
+        click(hot_at("buehne", part))
+    need("editing=false" in ctl("hot") and ctl("ws").count("\n") >= 2, "bell, Feld bar and strip open nothing yet")
 
     still(3.0, "still Bühne desktop")
     # Classic stays a preset: the list and the favourites come back, the tiles' area is today's.

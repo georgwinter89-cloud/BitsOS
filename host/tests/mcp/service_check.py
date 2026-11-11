@@ -19,7 +19,7 @@ import time
 
 MODE = sys.argv[1]
 next_id = 0
-OFFERED = ["events", "hw_info", "ktest", "log", "metrics", "output", "reload_info", "stop", "system_list", "version"]
+OFFERED = ["events", "gpu", "hw_info", "ktest", "log", "metrics", "output", "reload_info", "stop", "system_list", "version"]
 INSTALLER = ["install_kernel", "install_system", "reboot", "reload", "system_pin"]
 
 

@@ -185,10 +185,10 @@ fn check_sample(s: &latency::Sample, t: u64) -> TestResult {
 /// A mouse report moves the pointer on the console; that frame is measured from the report's time.
 fn pointer_frame() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display device (no GOP framebuffer)");
+        return ktest::fail("no display device (no GOP framebuffer)");
     }
     if vt::graphics() {
-        return ktest::skip("a program has the screen");
+        return ktest::fail("a program has the screen");
     }
     let m = fake_mouse("ktest latency mouse", &[0, 1]);
     let r = (|| -> TestResult {
@@ -215,7 +215,7 @@ fn pointer_frame() -> TestResult {
     m.unregister(time::now_ns());
     r
 }
-ktest!("in.latency.pointer_frame", Safe, pointer_frame);
+ktest!("in.latency.pointer_frame", Screen, pointer_frame);
 
 /// The hanging program's picture: one colour, never presented by anyone.
 struct Still {
@@ -253,15 +253,15 @@ fn patch(r: display::Rect) -> Result<Vec<u32>, alloc::string::String> {
 fn pointer_over_hanging_program() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
     if display::device().is_none() {
-        return ktest::skip("no display device (no GOP framebuffer)");
+        return ktest::fail("no display device (no GOP framebuffer)");
     }
     if vt::graphics() || display::scanout_holder().is_some() {
-        return ktest::skip("a program has the screen");
+        return ktest::fail("a program has the screen");
     }
     let (w, h) = display::with_frame(|f| (f.width, f.height)).ok_or("no frame")?;
     let mut px = Vec::new();
     if px.try_reserve((w * h) as usize).is_err() {
-        return ktest::skip("no memory for a full-screen picture");
+        return ktest::fail("no memory for a full-screen picture");
     }
     px.resize((w * h) as usize, STILL);
     let still = Arc::new(Still { px, w, h });
@@ -272,7 +272,7 @@ fn pointer_over_hanging_program() -> TestResult {
         Ok(g) => g,
         Err(e) => {
             m.unregister(time::now_ns());
-            return ktest::skip(&alloc::format!("scanout busy: {e:?}"));
+            return ktest::fail(&alloc::format!("scanout busy: {e:?}"));
         }
     };
     pointer_over::set_record(true);
@@ -342,7 +342,7 @@ fn pointer_over_hanging_program() -> TestResult {
     kassert!(pointer_over::drawn_at().is_none(), "the arrow over the program is still remembered after KD_TEXT");
     r
 }
-ktest!("in.latency.pointer_over_program", Safe, pointer_over_hanging_program);
+ktest!("in.latency.pointer_over_program", Screen, pointer_over_hanging_program);
 
 /// Takes every event and keeps none (the grabbing program of `pointer_grabbed`).
 struct Swallow;
@@ -357,10 +357,10 @@ impl evdev::Listener for Swallow {
 fn pointer_grabbed() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
     if display::device().is_none() {
-        return ktest::skip("no display device (no GOP framebuffer)");
+        return ktest::fail("no display device (no GOP framebuffer)");
     }
     if vt::graphics() {
-        return ktest::skip("a program has the screen");
+        return ktest::fail("a program has the screen");
     }
     let sink = evdev::sink();
     let m = fake_mouse("ktest latency grabbed", &[0, 1]);
@@ -386,7 +386,7 @@ fn pointer_grabbed() -> TestResult {
     m.unregister(time::now_ns());
     r
 }
-ktest!("in.latency.pointer_grabbed", Safe, pointer_grabbed);
+ktest!("in.latency.pointer_grabbed", Screen, pointer_grabbed);
 
 /// IN-6b (WY-1a change request 2): the console's arrow over programs is off exactly while some program holds the
 /// grab of a pointer device on the machine's sink, however the grab ends (EVIOCGRAB 0, the handle closing, the
@@ -394,7 +394,7 @@ ktest!("in.latency.pointer_grabbed", Safe, pointer_grabbed);
 fn pointer_grab_switch() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;
     if pointer_over::grabbed() {
-        return ktest::skip("a program holds a pointer grab (bitscomp)");
+        return ktest::fail("a program holds a pointer grab (bitscomp)");
     }
     let sink = evdev::sink();
     let mut kcaps = Caps::default();
@@ -441,4 +441,4 @@ fn pointer_grab_switch() -> TestResult {
     kassert!(!pointer_over::grabbed(), "a pointer grab is left over");
     r
 }
-ktest!("in.latency.pointer_grab_switch", Safe, pointer_grab_switch);
+ktest!("in.latency.pointer_grab_switch", Screen, pointer_grab_switch);

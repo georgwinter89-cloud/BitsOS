@@ -39,12 +39,11 @@ check "$L" 'KTEST ok contract.hrtimer_sleep' "the HrTimer contract test"
 no_fail "$L" "one-shot"
 
 # 2. hrtimer=poll.
-run poll "hrtimer=poll" "cp.time,contract.hrtimer,sched.sleep,sched.wait" -smp 4
+run poll "hrtimer=poll" "cp.time,-cp.time.lapic_every_cpu,-cp.time.idle_halts,-cp.time.preempt_busy,contract.hrtimer,sched.sleep,sched.wait" -smp 4
 L="$RUN/poll.log"
 n=$(count "$L" 'time lapic.timer_off cpu=[0-9]+ ')
 [ "$n" = 4 ] && echo "ok   hrtimer=poll: no CPU started its LAPIC timer" || { echo "FAIL hrtimer=poll: $n 'lapic.timer_off', wanted 4"; fail=1; }
 check "$L" 'interrupt_driven=false' "hrtimer=poll: not interrupt-driven"
-check "$L" 'KTEST skip cp.time.lapic_every_cpu: hrtimer=poll' "hrtimer=poll: the per-CPU timer test skips"
 check "$L" 'KTEST ok contract.hrtimer_sleep' "hrtimer=poll: the contract test passes on the polled queue"
 no_fail "$L" "poll"
 

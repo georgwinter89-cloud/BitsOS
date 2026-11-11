@@ -110,8 +110,10 @@ mx=$(printf '%s\n' "$r" "$g" "$b" | sort -n | tail -1); mn=$(printf '%s\n' "$r" 
 read -r kx ky <<<"$(hot_field B kill)"
 red=$(python3 -I - "$RUN/hung.ppm" "$kx" "$ky" <<'PY'
 import sys
-d = open(sys.argv[1], "rb").read().split(maxsplit=4)
-w, px, x0, y = int(d[1]), d[4], int(sys.argv[2]), int(sys.argv[3])
+data = open(sys.argv[1], "rb").read()
+d = data.split(maxsplit=4)
+w, x0, y = int(d[1]), int(sys.argv[2]), int(sys.argv[3])
+px = data[-w * int(d[2]) * 3:]
 # The button's red border (#ff6b6b) within 120 pixels left of its middle.
 print(any(px[(y * w + x) * 3] > px[(y * w + x) * 3 + 1] + 60 for x in range(max(0, x0 - 120), x0)))
 PY

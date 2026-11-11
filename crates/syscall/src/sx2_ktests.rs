@@ -186,6 +186,7 @@ ktest!("ab.sx2.lifetime", Safe, lifetime);
 /// A namespace lives as long as a process, a child or an open `/proc/<pid>/ns/*` file uses it, and goes with
 /// the last of them (the live() counters come back).
 fn lifetime() -> TestResult {
+    let others_before = others_in_namespaces(&[]);
     let before = counters();
     let mut holder = T::new("sx2-life-holder")?;
     let (wu, wp, wn, wt): (Weak<user::UserNs>, Weak<pid::PidNs>, Weak<misc::NetNs>, Weak<misc::UtsNs>);
@@ -224,8 +225,13 @@ fn lifetime() -> TestResult {
     kassert!(wn.upgrade().is_some() && wu.upgrade().is_some(), "the open ns file must keep the net namespace and its owner");
     expect("close the ns file", holder.call(nr::CLOSE, &[nsfd as u64]), 0)?;
     kassert!(until(5, || wn.upgrade().is_none() && wu.upgrade().is_none()), "outlived the ns file: net {} user {}", wn.strong_count(), wu.strong_count());
-    if !others_in_namespaces(&[holder.p.pid]) {
-        kassert!(until(5, || counters() == before), "counters {:?}, before {before:?}", counters());
+    // A program that held a namespace at the start may have ended since, so its counts are gone from `now`.
+    if !others_before && !others_in_namespaces(&[holder.p.pid]) {
+        // Not `==`: a program ending meanwhile can only lower them (the Mini-PC, 4.11.), and a leak raises them.
+        let no_more = |c: (u64, u64, (u64, u64, u64))| {
+            c.0 <= before.0 && c.1 <= before.1 && c.2.0 <= before.2.0 && c.2.1 <= before.2.1 && c.2.2 <= before.2.2
+        };
+        kassert!(until(5, || no_more(counters())), "counters {:?}, before {before:?}", counters());
     } else {
         klog::event!(Info, "ktest", "sx2.lifetime", note = "other programs use namespaces: counters not compared");
     }
@@ -626,7 +632,7 @@ fn programs() -> TestResult {
         if have("/bin/abi-ids") {
             return Err(String::from("the image has ABI programs but not /bin/abi-ns-unshare (did it fail to build?)"));
         }
-        return ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
     for (path, arg, want) in cases {
         let out = proc::stdio::Capture::new(1 << 20);

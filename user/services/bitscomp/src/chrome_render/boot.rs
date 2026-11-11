@@ -276,9 +276,19 @@ impl App {
         if !fades(reason, motion_off) {
             return self.boot_end(now, reason);
         }
+        // WY-19c: the gpu level's way into the desktop: the scene is the old picture of the circle wipe.
+        if self.theme.effects_gpu {
+            self.fx_play(crate::fx::plan::WIPE);
+            return self.boot_end(now, "wipe");
+        }
         up.fade = Some(now);
         self.anim.boot_fade = Some(now + FADE);
         Some(1.0)
+    }
+
+    /// WY-19b: the boot scene is up: nothing moves over it, it shows the kernel's picture to the pixel.
+    pub(crate) fn boot_shown(&self) -> bool {
+        matches!(self.images.boot.phase, Phase::Up(_))
     }
 
     fn boot_end(&mut self, now: Duration, how: &str) -> Option<f32> {

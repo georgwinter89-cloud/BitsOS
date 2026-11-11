@@ -1,0 +1,15 @@
+mode gs
+arch_prctl ARCH_SET_GS = 0
+ARCH_GET_GS gives the TEB: yes
+%gs:0x30 is the TEB: yes
+the GS selector is 0: yes
+main keeps its TEB while a thread runs with another: yes
+the thread kept its own TEB: yes
+kept across sleeps: yes
+50 handlers ran: yes
+the handler sees the TEB through %gs: yes
+ARCH_SET_FS in the handler: yes
+TEB and libc's TLS intact after the handlers: yes
+a fork child has the TEB: yes
+wrgsbase kept across switches, or no FSGSBASE: yes
+done

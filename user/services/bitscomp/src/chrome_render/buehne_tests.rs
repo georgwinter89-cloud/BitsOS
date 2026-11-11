@@ -110,6 +110,10 @@ fn hits_reach_wy_parts_and_the_buehne_parts() {
     assert_eq!(c.hit(x, y), Some(C::WsNew));
     let (x, y) = mid(l.ring);
     assert_eq!(c.hit(x, y), Some(C::Ring));
+    // PK-L1b: the "Programme" button between the new-workspace chip and the context address.
+    let (x, y) = mid(l.programs);
+    assert_eq!(c.hit(x, y), Some(C::Programs));
+    assert!(l.ws_new.x + l.ws_new.w < l.programs.x && l.programs.x + l.programs.w < l.address.x);
     let (x, y) = mid(l.home.unwrap());
     assert_eq!(c.hit(x, y), Some(C::Home));
     assert_eq!(l.min_items.len(), 2);

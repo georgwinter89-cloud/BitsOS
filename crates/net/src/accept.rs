@@ -27,7 +27,20 @@ impl AcceptQueue {
             s.shutdown();
             return Err(NetError::ConnectionRefused);
         }
-        self.q.lock().push_back(s);
+        // The queue grows with its lock dropped (`ksync::spare`).
+        let mut spare = ksync::Spare::new();
+        loop {
+            let mut q = self.q.lock();
+            if spare.fits(&mut *q, 1) {
+                q.push_back(s);
+                break;
+            }
+            drop(q);
+            if spare.grow().is_err() {
+                s.shutdown();
+                return Err(NetError::NoMemory);
+            }
+        }
         self.wq.wake_all();
         crate::sock::inet::notify();
         Ok(())

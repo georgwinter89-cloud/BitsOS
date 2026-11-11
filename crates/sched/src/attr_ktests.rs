@@ -83,7 +83,7 @@ fn busy_until(stop: &AtomicBool) {
 /// A thread narrows its own mask: it moves at once and stays; a mask without an online CPU and an unknown
 /// thread are refused; the read-back is the mask limited to the online CPUs.
 fn affinity_self() -> R {
-    let Some((t, home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let errs = Arc::new(ksync::SpinLock::new(Vec::<String>::new()));
     let e = errs.clone();
     let h = spawn("sc-aff-self", move || {
@@ -145,7 +145,7 @@ fn affinity_self() -> R {
 /// Another thread's mask: a running one leaves its CPU at once and stays on the allowed one; a sleeping one
 /// wakes on the allowed one; widening lets it go again.
 fn affinity_other() -> R {
-    let Some((t, home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let busy = spawn("sc-aff-busy", move || busy_until(&s))?;
@@ -209,7 +209,7 @@ fn affinity_other() -> R {
 /// Two busy threads share one CPU: nice 0 gets clearly more than nice 5 (weights 1024 : 335); a SCHED_IDLE
 /// thread gets far less than a SCHED_OTHER one (3 : 1024).
 fn nice_share() -> R {
-    let Some((t, _home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let share = |a_set: &dyn Fn(u64) -> Result<(), AttrError>, b_set: &dyn Fn(u64) -> Result<(), AttrError>| -> Result<(u64, u64), String> {
         let stop = Arc::new(AtomicBool::new(false));
         let mut hs = Vec::new();
@@ -239,11 +239,10 @@ fn nice_share() -> R {
     klog::event!(Info, "sched", "ktest.nice_share", nice0_ms = n0 / MS, nice5_ms = n5 / MS, other_ms = other / MS, idle_ms = idle / MS;
         "Linux weights: nice 0 : nice 5 = 3.06, SCHED_OTHER : SCHED_IDLE = 341");
     // Under QEMU steal time counts as runtime of whichever pinned thread was on the vCPU, so the shares are not
-    // meaningful there: the plain orderings only (W26: nice 0 939 ms, nice 5 718 ms under host load). On hardware
+    // meaningful there, nor is their order on a loaded host (timing is never judged in QEMU): both threads ran. On hardware
     // the shares follow the weight table (a wrong table or nice-to-weight mapping fails here): more than 1.5 x and
     // 4 x, 1024 : 335 = 3.06 within 2.4..3.9, and 1024 : 3 leaves SCHED_IDLE under 3 % of SCHED_OTHER.
-    kassert!(n5 > 0 && n0 > n5, "nice 0 got {} ms, nice 5 {} ms: not in weight order", n0 / MS, n5 / MS);
-    kassert!(other > idle, "SCHED_OTHER got {} ms, SCHED_IDLE {} ms: not in weight order", other / MS, idle / MS);
+    kassert!(n5 > 0 && other > 0, "nice 0 got {} ms, nice 5 {} ms, SCHED_OTHER {} ms: a thread that never ran", n0 / MS, n5 / MS, other / MS);
     if !hal::cpu::live().has("hypervisor") {
         kassert!(n0 > n5 + n5 / 2, "nice 0 got {} ms, nice 5 {} ms: not in weight order (want > 1.5 x)", n0 / MS, n5 / MS);
         kassert!(other > 4 * idle, "SCHED_OTHER got {} ms, SCHED_IDLE {} ms (want > 4 x)", other / MS, idle / MS);
@@ -257,7 +256,7 @@ fn nice_share() -> R {
 /// fork/clone's copy: nice, policy and mask come along; reset-on-fork turns a negative nice into 0 and is not
 /// inherited.
 fn copy_attrs() -> R {
-    let Some((t, _home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let stop = Arc::new(AtomicBool::new(false));
     let mut hs = Vec::new();
     for name in ["sc-copy-a", "sc-copy-b", "sc-copy-c"] {
@@ -293,7 +292,7 @@ fn copy_attrs() -> R {
 /// The user-mode marks split CPU time: ~40 ms between enter and exit is user time, ~40 ms after is system time;
 /// user + system is all the thread ran; the CPU's user time grows with it.
 fn split() -> R {
-    let Some((t, _home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let out = Arc::new(ksync::SpinLock::new(None));
     let o = out.clone();
     let cpu_user0 = crate::cpu_stats().get(t).map_or(0, |c| c.user_ns);
@@ -331,7 +330,7 @@ fn split() -> R {
 /// Read from another CPU while the thread runs: CPU time never goes back and includes the running slice; it
 /// does not grow while the thread sleeps.
 fn monotonic_read() -> R {
-    let Some((t, _home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let stop = Arc::new(AtomicBool::new(false));
     let sleep_now = Arc::new(AtomicBool::new(false));
     let (s, sl) = (stop.clone(), sleep_now.clone());
@@ -374,7 +373,7 @@ fn monotonic_read() -> R {
 
 /// Blocking counts voluntary switches; yielding to another runnable thread counts involuntary ones.
 fn switch_counts() -> R {
-    let Some((t, _home, _pin)) = two_cpus() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _home, _pin)) = two_cpus() else { return ktest::fail("needs two CPUs") };
     let h = spawn("sc-nvcsw", || {
         for _ in 0..20 {
             crate::sleep_ms(1);

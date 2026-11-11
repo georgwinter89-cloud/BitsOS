@@ -6,7 +6,7 @@
 //!   reads zero for anonymous memory, the file's content for a file mapping. The commit stays (Linux).
 //! - FREE: anonymous memory only (else EINVAL); freed at once (Linux frees lazily under memory pressure, V2 has
 //!   no reclaim, so it gives the memory back now; the content after FREE is undefined on both).
-//! - WILLNEED, COLD, PAGEOUT, MERGEABLE/UNMERGEABLE, DONTDUMP/DODUMP: accepted (no swap, no KSM, no core dumps in
+//! - WILLNEED: a file VMA's range is read ahead (BL-4, `vfs_fadvise(WILLNEED)`). COLD, PAGEOUT, MERGEABLE/UNMERGEABLE, DONTDUMP/DODUMP: accepted (no swap, no KSM, no core dumps in
 //!   V2), with Linux's refusals for device VMAs.
 //! - NORMAL/RANDOM/SEQUENTIAL: Linux's VM_RAND_READ/VM_SEQ_READ, HUGEPAGE/NOHUGEPAGE: VM_HUGEPAGE/VM_NOHUGEPAGE
 //!   (split at the range like Linux; MM-13: a huge page the split cuts is split first; HUGEPAGE is what mode
@@ -113,7 +113,8 @@ impl AsCore {
         };
         match behavior {
             madv::DONTNEED | madv::DONTNEED_LOCKED | madv::FREE => {
-                if device || (behavior == madv::FREE && v.file.is_some()) {
+                // `madvise_dontneed_free_valid_vma`: VM_LOCKED only for DONTNEED_LOCKED.
+                if device || (behavior == madv::FREE && v.file.is_some()) || (v.flags.locked && behavior != madv::DONTNEED_LOCKED) {
                     return Err(Errno::Inval);
                 }
                 let segs = Self::segments(g, s, e)?;
@@ -153,6 +154,11 @@ impl AsCore {
             madv::WIPEONFORK if v.file.is_some() => Err(Errno::Inval),
             madv::WIPEONFORK => set(g, &mut |x| x.flags.wipeonfork = true),
             madv::KEEPONFORK => set(g, &mut |x| x.flags.wipeonfork = false),
+            // BL-4: a file VMA's range is read ahead (`madvise_willneed`); anonymous memory has no swap to read.
+            madv::WILLNEED => {
+                super::fault::file_will_need(v, s, e);
+                Ok(())
+            }
             madv::COLLAPSE => Err(Errno::Inval),
             _ => Ok(()),
         }
@@ -160,7 +166,7 @@ impl AsCore {
 
     /// MADV_POPULATE_READ/WRITE (linux-6.6/mm/madvise.c `madvise_populate`, gup.c `check_vma_flags`): every page of
     /// [s, e) present (written: writable, copy-on-write broken).
-    fn populate_advice(&self, g: &mut Inner, v: &Vma, s: u64, e: u64, write: bool) -> Result<(), Errno> {
+    pub(super) fn populate_advice(&self, g: &mut Inner, v: &Vma, s: u64, e: u64, write: bool) -> Result<(), Errno> {
         let device = v.file.as_ref().is_some_and(|f| f.device.is_some());
         if device || (write && !v.prot.write) || (!write && !v.prot.read) {
             return Err(Errno::Inval);

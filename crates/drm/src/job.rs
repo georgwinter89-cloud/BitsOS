@@ -12,7 +12,7 @@ use crate::gpu::GpuVm;
 use crate::uapi::*;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use vfs::Errno;
 
 /// `enum drm_sched_priority` as `amdgpu_ctx_to_drm_sched_prio` (amdgpu_ctx.c:67) maps the context priority.
@@ -38,6 +38,28 @@ impl SchedPriority {
 
 static ENTITY_IDS: AtomicU64 = AtomicU64::new(1);
 
+/// A context's view of the device's reset counter (`ctx->reset_counter`, `ctx->reset_counter_query`), shared with its
+/// entities so a backend can blame the context from a job.
+#[derive(Default)]
+pub struct ResetSnaps {
+    pub reset_counter: AtomicU32,
+    pub reset_counter_query: AtomicU32,
+}
+
+impl ResetSnaps {
+    pub fn new(now: u32) -> ResetSnaps {
+        ResetSnaps { reset_counter: AtomicU32::new(now), reset_counter_query: AtomicU32::new(now) }
+    }
+    /// GR-3, `amdgpu_fmt::told::Counters::blame`: Mesa reads GUILTY only inside RESET and a queue-scope recovery does not
+    /// move the device's counter (`now`), so the context's snapshots leave it. Off for good as after a real move; the old
+    /// query answers UNKNOWN_RESET once.
+    pub fn leave(&self, now: u32) {
+        for snap in [&self.reset_counter, &self.reset_counter_query] {
+            let _ = snap.compare_exchange(now, now.wrapping_sub(1), Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 /// A context's queue on one HW IP ring (`amdgpu_ctx_entity`): its jobs run in submission order.
 pub struct Entity {
     id: u64,
@@ -47,6 +69,7 @@ pub struct Entity {
     /// The context's guilty flag (`drm_sched_entity.guilty` = `&ctx->guilty`): the backend sets it when a job of
     /// the entity hangs; jobs of a guilty entity are not run (ECANCELED).
     pub guilty: Arc<AtomicBool>,
+    snaps: Arc<ResetSnaps>,
     /// `drm_sched_entity_kill` (the context ended): jobs that have not started finish with this errno instead.
     killed: AtomicI64,
     /// Fence contexts: `scheduled` and `scheduled + 1` (finished), as `drm_sched_entity_init` takes two.
@@ -54,13 +77,14 @@ pub struct Entity {
 }
 
 impl Entity {
-    pub fn new(ip_type: u32, ring: u32, priority: SchedPriority, guilty: Arc<AtomicBool>) -> Arc<Entity> {
+    pub fn new(ip_type: u32, ring: u32, priority: SchedPriority, guilty: Arc<AtomicBool>, snaps: Arc<ResetSnaps>) -> Arc<Entity> {
         Arc::new(Entity {
             id: ENTITY_IDS.fetch_add(1, Ordering::Relaxed),
             ip_type,
             ring,
             priority,
             guilty,
+            snaps,
             killed: AtomicI64::new(0),
             fence_context: crate::fence::context_alloc(2),
         })
@@ -68,6 +92,18 @@ impl Entity {
     /// Unique over the kernel's run: jobs of one entity run in order.
     pub fn id(&self) -> u64 {
         self.id
+    }
+    /// Names the context: its entities share the guilty flag.
+    pub fn ctx_id(&self) -> u64 {
+        Arc::as_ptr(&self.guilty) as usize as u64
+    }
+    /// GR-3, `Action::Blame` of a queue-scope recovery, as `amdgpu_fmt::told::Counters::blame`: a job of this entity
+    /// hung or stopped. Mesa reads GUILTY only inside RESET and such a recovery does not move the device's counter, so
+    /// the context's own snapshots leave it (`now`: that counter). Off for good as after a real move; the old query
+    /// answers UNKNOWN_RESET once.
+    pub fn blame(&self, now: u32) {
+        self.guilty.store(true, Ordering::Release);
+        self.snaps.leave(now);
     }
     /// The errno a job that has not started yet ends with (None: run it).
     pub fn refused(&self) -> Option<Errno> {

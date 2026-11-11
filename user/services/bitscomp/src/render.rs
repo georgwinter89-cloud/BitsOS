@@ -16,7 +16,7 @@ use smithay::backend::renderer::element::{
 };
 use smithay::backend::renderer::pixman::{PixmanRenderer, PixmanTexture};
 use smithay::backend::allocator::{Buffer as _, Format};
-use smithay::backend::renderer::{Bind, Color32F, ImportAll, ImportDma, ImportMem, Renderer, Texture};
+use smithay::backend::renderer::{Bind, Color32F, ImportAll, ImportDma, ImportMem, Renderer, RendererSuper, Texture};
 use smithay::desktop::utils::{
     OutputPresentationFeedback, surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
     update_surface_primary_scanout_output,
@@ -26,6 +26,7 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::utils::{Monotonic, Physical, Rectangle, Scale, Time};
 use smithay::wayland::presentation::Refresh;
 
+use crate::backend::scanout::{Aim, Windows};
 use crate::win::Window;
 
 use crate::deco;
@@ -59,13 +60,57 @@ pub trait CompRenderer: Renderer<TextureId = Self::Tex> + ImportAll + ImportDma 
     fn pixels(target: &Self::Target) -> (&[u32], usize);
     /// After each frame: textures no element uses any more.
     fn cleanup(&mut self);
+    /// WY-21: why the GPU behind this renderer is gone, once it says so (a robust GL context's reset).
+    fn reset_status(&mut self) -> Option<String> {
+        None
+    }
     /// WY-16: the renderer reads client dma-bufs through a CPU mapping that must be checked first (`probe`).
     fn maps_dmabufs(&self) -> bool {
         false
     }
+    /// WY-17b: this renderer reads client buffers by CPU, whichever way it maps them: it has no GPU a client could
+    /// share VRAM with, so linux-dmabuf names no main device (`dmabuf::advertised`). Pixman; GLES says what it runs on.
+    fn reads_by_cpu(&self) -> bool {
+        true
+    }
     /// WY-16: the last frame's GPU work is over (client buffers may go back); asked without waiting.
     fn gpu_idle(_target: &mut Self::Target) -> bool {
         true
+    }
+    /// WY-17: takes fbdev's two windows as render targets (`backend::scanout`): frames go straight there, `pixels`
+    /// is only what `sync_pixels` read last. Why not, and nothing changed.
+    fn adopt_scanout(&mut self, _target: &mut Self::Target, _windows: Windows) -> Result<(), String> {
+        Err(format!("renderer {} has no render targets but its own picture", Self::NAME))
+    }
+    /// WY-17, before a frame: where it goes. None ends the direct path (the next frame draws and reads back whole).
+    /// False: `aim` named a window but this picture has none.
+    fn aim(_target: &mut Self::Target, aim: Option<Aim>) -> bool {
+        aim.is_none()
+    }
+    /// WY-17: the frame on the screen into `pixels` (`ctl shot`); nothing to do for a picture that always has it.
+    fn sync_pixels(&mut self, _target: &mut Self::Target) {}
+    /// WY-17: for `ctl stats`.
+    fn draws_direct(_target: &Self::Target) -> bool {
+        false
+    }
+    /// WY-19: whether this renderer draws the gpu effect level (`on_software`: also as a software rasteriser); why not.
+    fn fx_capable(&mut self, _on_software: bool) -> Result<(), String> {
+        Err(format!("renderer {} has no shaders", Self::NAME))
+    }
+    /// WY-19, before a frame's draw: what its effects need beforehand (blurs, snapshots), in frame order.
+    fn fx_prepare(&mut self, _target: &mut Self::Target, _elements: &[CompElement<Self>], _scale: Scale<f64>) {}
+    /// WY-19: one effect into the frame under way. A renderer without shaders is never handed one (`fx_capable`).
+    fn fx_draw(
+        _frame: &mut <Self as RendererSuper>::Frame<'_, '_>,
+        _fx: &crate::fx::FxElement,
+        _dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), <Self as RendererSuper>::Error> {
+        Ok(())
+    }
+    /// WY-19: for `ctl fx`.
+    fn fx_report(&self) -> String {
+        "no shaders".to_string()
     }
 }
 
@@ -117,6 +162,13 @@ render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
     Solid=SolidColorRenderElement,
     Memory=MemoryRenderBufferRenderElement<R>,
+    Fx=crate::fx::FxElement,
+}
+
+impl<R: CompRenderer> CompElement<R> {
+    pub fn is_beam(&self) -> bool {
+        matches!(self, CompElement::Fx(f) if matches!(f.kind, crate::fx::Kind::Beam { .. }))
+    }
 }
 
 /// The finished picture, renderer-neutral: what the back ends copy out, screenshots and the bench read.
@@ -125,6 +177,10 @@ pub trait Picture {
     /// XRGB8888 rows `stride` u32 apart.
     fn pixels(&self) -> (&[u32], usize);
     fn renderer(&self) -> &'static str;
+    /// WY-17: the frames go straight into the scanout windows (`pixels` holds only a read on request).
+    fn draws_direct(&self) -> bool {
+        false
+    }
 }
 
 pub struct Compositor<R: CompRenderer = DefaultRenderer> {
@@ -159,6 +215,9 @@ impl<R: CompRenderer> Picture for Compositor<R> {
     fn renderer(&self) -> &'static str {
         R::NAME
     }
+    fn draws_direct(&self) -> bool {
+        R::draws_direct(&self.target)
+    }
 }
 
 /// WY-15: the compositor whichever renderer draws it; the main loop holds one of these (`make`).
@@ -169,11 +228,24 @@ pub trait Composer: Picture {
     fn dmabuf_formats(&self) -> Vec<Format>;
     /// WY-16: client dma-bufs must map for reading before this renderer sees them (`dmabuf::probe`).
     fn maps_dmabufs(&self) -> bool;
+    /// WY-17b: `CompRenderer::reads_by_cpu`.
+    fn reads_by_cpu(&self) -> bool;
     /// WY-16, each loop turn: answers the new dma-bufs (the renderer imports each one now, so a buffer it cannot
     /// read is `failed` instead of an empty window later) and drops the imports of destroyed buffers.
     fn dmabuf_turn(&mut self, app: &mut App);
     /// WY-16: the last frame's GPU work is over (`CompRenderer::gpu_idle`).
     fn gpu_idle(&mut self) -> bool;
+    /// WY-17: `CompRenderer::adopt_scanout`.
+    fn adopt_scanout(&mut self, windows: Windows) -> Result<(), String>;
+    /// WY-17, before `render`: follows the output's mode first, since a new picture has no windows; then
+    /// `CompRenderer::aim`.
+    fn aim(&mut self, app: &App, aim: Option<Aim>) -> bool;
+    /// WY-17: `CompRenderer::sync_pixels`.
+    fn sync_pixels(&mut self);
+    /// WY-19: `CompRenderer::fx_report`.
+    fn fx_report(&self) -> String;
+    /// WY-21: `CompRenderer::reset_status`.
+    fn gpu_reset(&mut self) -> Option<String>;
 }
 
 impl<R: CompRenderer> Composer for Compositor<R> {
@@ -189,10 +261,36 @@ impl<R: CompRenderer> Composer for Compositor<R> {
         self.renderer.maps_dmabufs()
     }
 
+    fn reads_by_cpu(&self) -> bool {
+        self.renderer.reads_by_cpu()
+    }
+
     fn gpu_idle(&mut self) -> bool {
         R::gpu_idle(&mut self.target)
     }
 
+    fn adopt_scanout(&mut self, windows: Windows) -> Result<(), String> {
+        self.renderer.adopt_scanout(&mut self.target, windows)
+    }
+
+    fn aim(&mut self, app: &App, aim: Option<Aim>) -> bool {
+        if let Some(mode) = app.output.current_mode().map(|m| (m.size.w, m.size.h)) {
+            self.follow_mode(app, mode);
+        }
+        R::aim(&mut self.target, aim)
+    }
+
+    fn sync_pixels(&mut self) {
+        self.renderer.sync_pixels(&mut self.target);
+    }
+
+    fn fx_report(&self) -> String {
+        self.renderer.fx_report()
+    }
+
+    fn gpu_reset(&mut self) -> Option<String> {
+        self.renderer.reset_status()
+    }
     fn dmabuf_turn(&mut self, app: &mut App) {
         for (buf, notifier) in std::mem::take(&mut app.dma.pending) {
             match self.renderer.import_dmabuf(&buf, None).map_err(|e| format!("{e:?}")) {
@@ -253,7 +351,18 @@ impl<R: CompRenderer> Compositor<R> {
             self.follow_mode(app, mode);
         }
         let t0 = Instant::now();
+        // WY-19: the gpu level follows the renderer's shaders, live (a theme change just draws the new images).
+        if app.theme.effects == crate::theme::Effects::Gpu || app.theme.effects_gpu {
+            let can = self.renderer.fx_capable(app.fx.on_software);
+            app.fx_follow(can);
+        }
         let elements = build_elements(app, &mut self.renderer);
+        app.stats.build += t0.elapsed();
+        // Also without an effect in the frame: that is what hands the textures of the last one back.
+        let scale = Scale::from(app.output.current_scale().fractional_scale());
+        let t1 = Instant::now();
+        self.renderer.fx_prepare(&mut self.target, &elements, scale);
+        app.stats.prepare += t1.elapsed();
         let clear: Color32F = app.theme.bg.into();
         let (damage, states) = match self.renderer.draw(&mut self.target, &mut self.damage, &elements, clear) {
             Ok(r) => r,
@@ -398,19 +507,31 @@ fn build_elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompE
             Layer::System => out.extend(crate::install_draw::elements(app, renderer)),
             Layer::Overlays => {
                 // WY-3: X11 menus and tooltips under bitscomp's own overlays, over every window and bar.
+                // WY-19: the transition over all of them (the boot scene decides first).
+                let overlays = deco::overlays(app, renderer);
+                let covered = placements.iter().any(|p| p.fullscreen && p.visible);
+                out.extend(crate::fx::plan::top(app, covered).into_iter().map(CompElement::from));
                 x_unmanaged(app, renderer, &mut out);
-                out.extend(deco::overlays(app, renderer));
+                out.extend(overlays);
             }
             Layer::Over => out.extend(crate::chrome_render::over(app, renderer)),
+            Layer::Library => out.extend(crate::library_draw::elements(app, renderer)),
             // The frame above the window: its bottom corners round off the client's corners.
             Layer::Frame(i) => out.extend(deco::frame(app, renderer, &placements[i])),
             Layer::Veil(i) => out.extend(crate::veil::elements(app, renderer, &placements[i])),
-            Layer::Content(i) => window_content(app, renderer, &placements[i], &mut out),
+            Layer::Content(i) => {
+                window_content(app, renderer, &placements[i], &mut out);
+                out.extend(crate::fx::plan::window(app, &placements[i]).into_iter().map(CompElement::from));
+            }
             Layer::Chrome => out.extend(crate::chrome_render::elements(app, renderer)),
         }
     }
+    let covered = placements.iter().any(|p| p.fullscreen && p.visible);
+    out.extend(crate::fx::plan::ground(app, covered).into_iter().map(CompElement::from));
     // DS-2: the wallpaper is the bottom of every frame (none under a fullscreen window).
     out.extend(crate::chrome_render::wallpaper::elements(app, renderer, &placements));
+    let scale = Scale::from(app.output.current_scale().fractional_scale());
+    crate::fx::seal(&mut app.fx, &mut out, scale);
     out
 }
 

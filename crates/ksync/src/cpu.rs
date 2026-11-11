@@ -44,8 +44,9 @@ pub(crate) struct CpuSync {
     pub irq: AtomicU32,
     /// Locks of allocator classes (`order.rs`, `alloc`) held on this CPU: while non-zero ksync never allocates.
     pub alloc_held: AtomicU32,
-    /// Spin locks (and `PreemptGuard`s) held on this CPU: while non-zero the running thread must not be
-    /// preempted (SC-3's interrupt-exit hook asks `preempt_count`). Goes with the thread across a switch.
+    /// Host only (thread-local records): spin locks and `PreemptGuard`s held. In the kernel the count lies in
+    /// hal's per-CPU block (`hal::percpu::preempt_inc`, one instruction).
+    #[cfg(not(target_os = "none"))]
     pub preempt: AtomicU32,
     #[cfg(debug_assertions)]
     pub boot_held: crate::lockdep::imp::HeldCell,
@@ -61,6 +62,7 @@ impl CpuSync {
             busy: AtomicBool::new(false),
             irq: AtomicU32::new(0),
             alloc_held: AtomicU32::new(0),
+            #[cfg(not(target_os = "none"))]
             preempt: AtomicU32::new(0),
             #[cfg(debug_assertions)]
             boot_held: crate::lockdep::imp::HeldCell::new(),
@@ -310,9 +312,11 @@ pub struct IrqState {
 }
 
 pub fn take_irq_state() -> IrqState {
+    let preempt = preempt_count();
+    set_preempt(0);
     with_cpu(|c| match c {
-        Some(c) => IrqState { irq: c.irq.swap(0, Ordering::Relaxed), preempt: c.preempt.swap(0, Ordering::Relaxed) },
-        None => IrqState { irq: 0, preempt: 0 },
+        Some(c) => IrqState { irq: c.irq.swap(0, Ordering::Relaxed), preempt },
+        None => IrqState { irq: 0, preempt },
     })
 }
 
@@ -320,15 +324,40 @@ pub fn put_irq_state(s: IrqState) {
     with_cpu(|c| {
         if let Some(c) = c {
             c.irq.store(s.irq, Ordering::Relaxed);
-            c.preempt.store(s.preempt, Ordering::Relaxed);
         }
     });
+    set_preempt(s.preempt);
 }
 
-/// Counts one more preemption blocker on this CPU (a spin lock about to be taken). Interrupts are off for the
-/// update, so the count cannot land on another CPU's record halfway.
+/// Counts one more preemption blocker on this CPU (a spin lock about to be taken).
+#[cfg(target_os = "none")]
+#[inline]
 pub(crate) fn preempt_inc() {
-    let _irq = IrqOff::new();
+    hal::percpu::preempt_inc();
+}
+
+/// Undoes `preempt_inc` (after the lock is released); never below 0.
+#[cfg(target_os = "none")]
+#[inline]
+pub(crate) fn preempt_dec() {
+    hal::percpu::preempt_dec();
+}
+
+/// Spin locks and `PreemptGuard`s held on this CPU (0: the running thread may be preempted, as far as ksync
+/// knows; SC-3's interrupt-exit hook and `cond_resched` ask this).
+#[cfg(target_os = "none")]
+#[inline]
+pub fn preempt_count() -> u32 {
+    hal::percpu::preempt_count() as u32
+}
+
+#[cfg(target_os = "none")]
+fn set_preempt(n: u32) {
+    hal::percpu::preempt_set(u64::from(n));
+}
+
+#[cfg(not(target_os = "none"))]
+pub(crate) fn preempt_inc() {
     with_cpu(|c| {
         if let Some(c) = c {
             c.preempt.fetch_add(1, Ordering::Relaxed);
@@ -336,9 +365,8 @@ pub(crate) fn preempt_inc() {
     });
 }
 
-/// Undoes `preempt_inc` (after the lock is released); never below 0.
+#[cfg(not(target_os = "none"))]
 pub(crate) fn preempt_dec() {
-    let _irq = IrqOff::new();
     with_cpu(|c| {
         if let Some(c) = c {
             update(&c.preempt, |n| n.saturating_sub(1));
@@ -346,11 +374,18 @@ pub(crate) fn preempt_dec() {
     });
 }
 
-/// Spin locks and `PreemptGuard`s held on this CPU (0: the running thread may be preempted, as far as ksync
-/// knows; SC-3's interrupt-exit hook and `cond_resched` ask this).
+#[cfg(not(target_os = "none"))]
 pub fn preempt_count() -> u32 {
-    let _irq = IrqOff::new();
     with_cpu(|c| c.map(|c| c.preempt.load(Ordering::Relaxed)).unwrap_or(0))
+}
+
+#[cfg(not(target_os = "none"))]
+fn set_preempt(n: u32) {
+    with_cpu(|c| {
+        if let Some(c) = c {
+            c.preempt.store(n, Ordering::Relaxed);
+        }
+    });
 }
 
 /// Keeps the running thread on this CPU and unpreempted while it lives (code that works on per-CPU data with

@@ -77,7 +77,7 @@ fn minipc_root_devices_enumerate() {
         let i = c.slot_info(x.slot).unwrap();
         assert_eq!(i.state, slot_state::CONFIGURED, "{x:?}");
         assert!(i.dcbaa_ok);
-        assert_eq!((i.root_port, i.route, i.address), (x.place.root_port, 0, x.address));
+        assert_eq!((i.root_port, i.route, i.address), (x.place.root_port, 0, x.address()));
     }
     let m = env.model();
     // The keyboard's endpoint 0 is 8 bytes: Evaluate Context with the whole output context copied (dequeue
@@ -455,7 +455,7 @@ fn a_device_failing_set_address_after_reset_gets_the_deferred_address() {
     let i = c.slot_info(d[0].slot).unwrap();
     assert_eq!((i.state, i.mps0), (slot_state::CONFIGURED, 8));
     assert_ne!(i.address, 0);
-    assert_eq!(d[0].address, i.address);
+    assert_eq!(d[0].address(), i.address);
 }
 
 #[test]

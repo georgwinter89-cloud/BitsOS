@@ -39,6 +39,9 @@ pub struct DiskRaw {
     pub errors: u64,
     pub timeouts: u64,
     pub queued: u64,
+    /// Levels: device operations under way now, and the most at once since the disk opened (BL-0).
+    pub inflight: u64,
+    pub inflight_max: u64,
     /// Running totals: bytes read and written, time with a request at the device (ns).
     pub read_bytes: u64,
     pub write_bytes: u64,
@@ -211,6 +214,8 @@ impl Sampler {
                 store.put(&format!("disk.{dev}.busy"), Unit::Pct, pct(grew(d.busy_ns, busy), dt).min(10_000));
             }
             store.put(&format!("disk.{dev}.queued"), Unit::Count, d.queued);
+            store.put(&format!("disk.{dev}.inflight"), Unit::Count, d.inflight);
+            store.put(&format!("disk.{dev}.inflight_max"), Unit::Count, d.inflight_max);
             store.put(&format!("disk.{dev}.errors"), Unit::Count, d.errors);
             store.put(&format!("disk.{dev}.timeouts"), Unit::Count, d.timeouts);
             seen.insert(dev, [d.requests, d.dispatches, d.read_bytes, d.write_bytes, d.busy_ns]);
@@ -234,7 +239,7 @@ mod tests {
             procs: alloc::vec![ProcRaw { pid: 7, name: "bits comp".into(), cpu_ns: prog }, ProcRaw { pid: 8, name: "idle".into(), cpu_ns: 5 }],
             mem: Some((1000, 400, [1, 2, 3, 4, 5, 6, 7, 8])),
             nets: alloc::vec![NetRaw { name: "igc0".into(), totals: [rx, 0, 10, 0, 1, 0] }],
-            disks: alloc::vec![DiskRaw { name: "usb0".into(), requests: rx / 1000, dispatches: 0, errors: 2, timeouts: 0, queued: 1, read_bytes: rx, write_bytes: 0, busy_ns: t / 2 }],
+            disks: alloc::vec![DiskRaw { name: "usb0".into(), requests: rx / 1000, dispatches: 0, errors: 2, timeouts: 0, queued: 1, inflight: 0, inflight_max: 1, read_bytes: rx, write_bytes: 0, busy_ns: t / 2 }],
             counters: alloc::vec![("proc.faulted", 3)],
             temps: alloc::vec![("tctl".into(), 48_125)],
             pkg_energy: Some((energy, 16)),

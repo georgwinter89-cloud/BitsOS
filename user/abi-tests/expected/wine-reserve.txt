@@ -1,0 +1,22 @@
+mode reserve
+dos: reserved = yes
+low: reserved = yes
+top32: reserved = yes
+top: reserved = yes
+dos and low: one ---p line in maps: yes
+top32: one ---p line in maps: yes
+top: one ---p line in maps, or it holds the stack: yes
+shared user data at 0x7ffe0000 written and read: yes
+noreplace inside the reservation = -EEXIST
+a hint into a freed hole is taken: yes
+mmap without a hint stays out of the reservations: yes
+MAP_32BIT in [1 GiB, 2 GiB): yes
+MAP_32BIT outside the reservations: yes
+MAP_32BIT takes the lowest free address: yes
+64 GiB PROT_NONE reservation: yes
+20000 pages committed one by one: yes
+maps grew by about 40000 lines: yes
+every committed page holds its byte: yes
+munmap of the reservation = 0
+maps back to the line count before: yes
+done

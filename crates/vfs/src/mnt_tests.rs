@@ -461,7 +461,7 @@ fn proc_instance_per_mount() {
     fn text() -> String {
         String::from("x\n")
     }
-    let files = [ProcFileEntry { path: "/proc/sys/kernel/sx", render: text }, ProcFileEntry { path: "/sys/sx", render: text }];
+    let files = [ProcFileEntry { path: "/proc/sys/kernel/sx", render: text, mode: 0o444 }, ProcFileEntry { path: "/sys/sx", render: text, mode: 0o444 }];
     let dirs = [ProcDirEntry { path: "/proc", make: boot }];
     let (ns, _) = view();
     let c = Ctx::kernel(&ns);

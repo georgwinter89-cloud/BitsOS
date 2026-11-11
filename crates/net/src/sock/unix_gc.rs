@@ -118,9 +118,13 @@ impl InFlight {
         core::mem::take(&mut self.files)
     }
 
-    /// The unix sockets among the files (the collector's edges).
-    pub(crate) fn sockets(&self) -> Vec<Arc<UnixSock>> {
-        self.files.iter().filter_map(|f| unix_of(f)).collect()
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Adds the unix sockets among the files (the collector's edges); `out` has room for `len` more.
+    pub(crate) fn sockets_into(&self, out: &mut Vec<Arc<UnixSock>>) {
+        out.extend(self.files.iter().filter_map(|f| unix_of(f)));
     }
 
     fn detach(&mut self) {
@@ -234,11 +238,20 @@ pub fn collect() {
 
 fn pass() {
     RUNS.fetch_add(1, Ordering::Relaxed);
-    let list: Vec<(Weak<OpenFile>, Weak<UnixSock>)> = {
-        let mut l = LIST.lock();
-        l.retain(|_, (f, s)| f.strong_count() > 0 && s.strong_count() > 0);
-        l.values().cloned().collect()
-    };
+    // The snapshot's memory is made with LIST dropped (`unix::fill`'s reason); a list that grew asks again.
+    let mut list: Vec<(Weak<OpenFile>, Weak<UnixSock>)> = Vec::new();
+    loop {
+        let want = {
+            let mut l = LIST.lock();
+            l.retain(|_, (f, s)| f.strong_count() > 0 && s.strong_count() > 0);
+            if l.len() <= list.capacity() {
+                list.extend(l.values().cloned());
+                break;
+            }
+            l.len()
+        };
+        list.reserve_exact(want);
+    }
     // Candidates: referenced only from queues (no fd, no syscall holding the file right now).
     let mut cands: Vec<(Arc<UnixSock>, usize)> = Vec::new();
     for (f, s) in &list {

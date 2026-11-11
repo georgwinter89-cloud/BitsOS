@@ -1,0 +1,6 @@
+semop interrupted = -EINTR
+semop with SA_RESTART stays EINTR = -EINTR
+no waiter left = 0
+semop through stop and continue = -EINTR
+killed waiter queued = 1
+killed waiter gone = 0

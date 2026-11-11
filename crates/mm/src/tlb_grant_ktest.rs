@@ -9,7 +9,7 @@
 use crate::device::{Aperture, DeviceMap, DeviceOps, DevicePage};
 use crate::dma::{DmaBuffer, DmaCache, DmaConstraints};
 use crate::linux::{madv, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED};
-use crate::tlb_ktest::{ap_activate, aps, on, ap_read_in, ap_write_in, FAULT, PF_P, PF_W, PROBE_ROOT, WRITE_VAL};
+use crate::tlb_ktest::{ap_activate, aps, frame_errors, on, ap_read_in, ap_write_in, FAULT, PF_P, PF_W, PROBE_ROOT, WRITE_VAL};
 use crate::{AddressSpace, Fill};
 use alloc::format;
 use alloc::string::String;
@@ -37,10 +37,6 @@ fn lazy() -> Result<Arc<AddressSpace>, String> {
 
 fn generation(a: &AddressSpace) -> u64 {
     tlb::generation(a.root()).unwrap_or(0)
-}
-
-fn user_frames() -> u64 {
-    mm_core::frames().map_or(0, |f| f.stats().used_by_kind[mm_core::Kind::User as usize])
 }
 
 /// A device whose pages stay read-only until written (dirty bit per page), as fbdev's deferred io.
@@ -175,9 +171,9 @@ fn kept_round(aps: &[usize]) -> TestResult {
 fn grant() -> TestResult {
     let aps = aps();
     if aps.is_empty() {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let grants0 = tlb::stats().grants;
     let r = (|| -> TestResult {
         let _probes = paging::probe::user_probes().map_err(e)?;
@@ -186,7 +182,7 @@ fn grant() -> TestResult {
         // No fast kernel copy writes into this space: its grants may skip the round whatever the copy fault path
         // does (`tlb::allow_grants`).
         tlb::allow_grants(a.root());
-        let Some(f) = fb(&a, 4)? else { return ktest::skip("no /dev/zero to stand in for a device file") };
+        let Some(f) = fb(&a, 4)? else { return ktest::fail("no /dev/zero to stand in for a device file") };
         let m = f.base;
         PROBE_ROOT.store(a.root(), SeqCst);
         for &c in &aps {
@@ -247,7 +243,7 @@ fn grant() -> TestResult {
     leave_all(&aps);
     r?;
     kassert!(tlb::stats().grants >= grants0 + 5, "grants {} -> {}", grants0, tlb::stats().grants);
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
 ktest!("mm.tlb.grant", Safe, grant);
@@ -256,7 +252,7 @@ ktest!("mm.tlb.grant", Safe, grant);
 /// `GATHER_MAX` frames takes one more.
 fn gather() -> TestResult {
     let aps = aps();
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let r = (|| -> TestResult {
         let a = lazy()?;
         // The gather bound counts 4 KiB frames (a 2 MiB entry is one entry).
@@ -311,7 +307,7 @@ fn gather() -> TestResult {
     })();
     leave_all(&aps);
     r?;
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
 ktest!("mm.tlb.gather", Safe, gather);
@@ -396,12 +392,12 @@ fn cobalt() -> TestResult {
     const RUN_NS: u64 = 2 * SEC;
     let cpus: Vec<usize> = (0..hal::percpu::cpu_count()).filter(|&c| hal::smp::is_online(c)).collect();
     if cpus.len() < 2 {
-        return ktest::skip("one CPU");
+        return ktest::fail("one CPU");
     }
-    let frames_before = user_frames();
+    let errors_before = frame_errors();
     let a = lazy()?;
     tlb::allow_grants(a.root());
-    let Some(f) = fb(&a, 2048)? else { return ktest::skip("no /dev/zero to stand in for a device file") };
+    let Some(f) = fb(&a, 2048)? else { return ktest::fail("no /dev/zero to stand in for a device file") };
     let f = Arc::new(f);
     let w = Arc::new(Work::default());
     let errs = Arc::new(ksync::SpinLock::new(Vec::<String>::new()));
@@ -457,7 +453,8 @@ fn cobalt() -> TestResult {
         let resched = r1 - r0;
         kassert!(resched <= fills / 4 + 1000, "{resched} reschedule IPIs for {fills} filled pages: the decoders queue on the space's lock");
     }
-    kassert!(user_frames() == frames_before, "{} bytes of user frames not back", user_frames().saturating_sub(frames_before));
+    kassert!(frame_errors() == errors_before, "the frame bookkeeping went wrong: {errors_before:?} -> {:?}", frame_errors());
     Ok(())
 }
-ktest!("mm.tlb.cobalt", Safe, cobalt);
+// Only with the desktop stopped: it compares all user frames of the machine, and a running desktop moves them too (4.11., W30 round).
+ktest!("mm.tlb.cobalt", Screen, cobalt);

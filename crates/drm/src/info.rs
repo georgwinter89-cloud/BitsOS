@@ -64,7 +64,7 @@ pub fn ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, Err
             if f.ip_instance != 0 {
                 return Err(EINVAL);
             }
-            let fw = p.firmware(f.fw_type, f.index).ok_or(EINVAL)?;
+            let fw = gpu.firmware(f.fw_type, f.index).ok_or(EINVAL)?;
             out(ctx, ptr, size, &bytes(&drm_amdgpu_info_firmware { ver: fw.ver, feature: fw.feature }))
         }
         AMDGPU_INFO_NUM_BYTES_MOVED => u64_out(gpu.memory().bytes_moved),

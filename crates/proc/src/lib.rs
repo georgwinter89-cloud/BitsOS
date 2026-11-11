@@ -62,6 +62,7 @@ pub mod stdio;
 mod task;
 pub mod wait;
 pub mod ns;
+pub mod ipc;
 
 pub use mcp_run::MCP_PROGRAM;
 pub use clone::{CloneArgs, clone, forks_total};
@@ -71,7 +72,7 @@ pub use group::Group;
 pub use image::min_sigstack_size;
 pub use status::ExitStatus;
 pub use deliver::{current_signal_pending, kill_pgrp, signal_current_thread};
-pub use task::{ExitRelease, Restart, Thread, current_thread, find_thread, set_exit_release};
+pub use task::{ExitRelease, Restart, Thread, ThreadFs, current_thread, find_thread, set_exit_release};
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -155,7 +156,7 @@ impl Process {
         drop(old);
     }
     pub fn subject(&self) -> Subject {
-        Subject { program: self.program, pid: self.pid, uid: self.cred().euid }
+        Subject { program: self.program, pid: self.pid, uid: self.group().call_ids().euid }
     }
     /// The thread group behind this image.
     pub fn group(&self) -> &Arc<Group> {
@@ -578,7 +579,7 @@ fn spawn_inner(path: &str, src: image::Source<'_>, o: &SpawnOptions<'_>, exe: Op
             // AB-6: init (pid 1) is SIGNAL_UNKILLABLE: no signal it has no handler for reaches it.
             let sigs = signal::SignalState::default();
             sigs.raw(|s| s.unkillable = pid == 1);
-            let g = Group::new(ids, uapi::ab::signal::SIGCHLD, o.class, sigs, rlimit::Limits::new(ram_pages), time::now_ns());
+            let g = Group::new(ids, uapi::ab::signal::SIGCHLD, o.class, sigs, rlimit::Limits::new_system(ram_pages), time::now_ns());
             make_image(pid, base_name(path), String::from(path), args, o.program, &cred, mm, fds, Arc::new(vfs::FsState::new()), ns, g, hal::entry::segs::LdtSlot::new())
         },
         o.pid1.then_some(1),

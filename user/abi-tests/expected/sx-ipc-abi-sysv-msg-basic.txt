@@ -1,0 +1,64 @@
+msgget no key = -ENOENT
+msgget create = 0
+msgget again = 0
+msgget excl = -EEXIST
+private = 1
+new: cbytes 0 qnum 0 qbytes 16384 mode 640 key 51c0de00 uid 0 gid 0 stime 0 rtime 0 lspid me 0 lrpid me 0
+stat fault = -EFAULT
+stat negative = -EINVAL
+cmd negative = -EINVAL
+bad cmd = -EINVAL
+stale id = -EINVAL
+IPC_INFO = 1
+info 512000 16384 8192 16384 32000 16 16384 65535 (1)
+type 0 = -1 EINVAL
+negative type = -1 EINVAL
+over msgmax = -1 EINVAL
+negative size = -EINVAL
+negative id = -EINVAL
+snd fault = -EFAULT
+snd bad text = -EINVAL
+bad id = -EINVAL
+five queued: cbytes 19 qnum 5 qbytes 16384 mode 640 key 51c0de00 uid 0 gid 0 stime 1 rtime 0 lspid me 1 lrpid me 0
+MSG_INFO = 1
+msg_info pool 2 map 5 tql 19
+MSG_STAT index 0 = 0
+MSG_STAT free = -EINVAL
+MSG_STAT_ANY = 1
+copy 0 = 4 type 5 text five
+copy 2 = 5 type 7 text seven
+copy 9 = -ENOMSG
+copy needs NOWAIT = -EINVAL
+copy with EXCEPT = -EINVAL
+copy small = -E2BIG
+copy small NOERROR = -EINVAL
+copy bad buffer = -EFAULT
+copies change nothing: cbytes 19 qnum 5 qbytes 16384 mode 640 key 51c0de00 uid 0 gid 0 stime 1 rtime 0 lspid me 1 lrpid me 0
+too small = -E2BIG
+cut = 2 type 5 text fi
+type 9 none = -ENOMSG
+except 3 first is seven? no: three first = 5 type 7 text seven
+lowest up to 3 = 0 type 1 text 
+lowest up to 3 again = 5 type 3 text three
+LONG_MIN = 5 type 3 text again
+empty = -ENOMSG
+empty: cbytes 0 qnum 0 qbytes 16384 mode 640 key 51c0de00 uid 0 gid 0 stime 1 rtime 1 lspid me 1 lrpid me 1
+rcv negative id = -EINVAL
+rcv negative size = -EINVAL
+rcv fault loses it = -EFAULT
+after the fault: cbytes 0 qnum 0 qbytes 16384 mode 640 key 51c0de00 uid 0 gid 0 stime 1 rtime 1 lspid me 1 lrpid me 1
+type 2 = -ENOMSG
+IPC_STAT = 0
+IPC_SET = 0
+stat wants rights = -EACCES
+receive wants rights = -EACCES
+qbytes over msgmnb = -EPERM
+qbytes down = 0
+set: cbytes 0 qnum 0 qbytes 10 mode 600 key 51c0de00 uid 0 gid 0 stime 1 rtime 1 lspid me 1 lrpid me 1
+fits = 0
+full = -1 EAGAIN
+IPC_SET fault = -EFAULT
+IPC_RMID = 0
+IPC_RMID again = -EINVAL
+MSG_INFO = 1
+msg_info pool 1 map 0 tql 0

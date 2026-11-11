@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use devmodel::block::IoPriority;
-use ksync::SpinLock;
+use ksync::RwSpinLock;
 
 klog::counter!(LIFTED, "block.io.lifted");
 
@@ -92,7 +92,9 @@ impl Drop for Waiting<'_> {
 
 /// Per-thread I/O floors: (ksync thread id, priority). Empty unless some thread is inside a lifted call,
 /// and `current` skips the lock then.
-static FLOORS: SpinLock<Vec<(u64, IoPriority)>> = SpinLock::named("block.prio.floors", Vec::new());
+// INT-W35-BL (BL-4 CR 7): a reader-writer lock, because BL-4's read-ahead jobs above Background hold a floor
+// while they run and every block request's `prio::current` then looks it up; the lookups no longer serialize.
+static FLOORS: RwSpinLock<Vec<(u64, IoPriority)>> = RwSpinLock::named("block.prio.floors", Vec::new());
 static NFLOORS: AtomicUsize = AtomicUsize::new(0);
 
 /// The calling thread's requests go at least at `p` until the guard drops (nothing when `p` is not higher
@@ -102,7 +104,7 @@ pub fn floor(p: IoPriority) -> Floor {
     if tid == 0 || crate::prio::higher(p, crate::prio::current()) == crate::prio::current() {
         return Floor(0);
     }
-    let mut f = FLOORS.lock();
+    let mut f = FLOORS.write();
     if f.try_reserve(1).is_err() {
         return Floor(0);
     }
@@ -116,7 +118,7 @@ pub fn floor_of(tid: u64) -> Option<IoPriority> {
     if NFLOORS.load(Ordering::Acquire) == 0 {
         return None;
     }
-    FLOORS.lock().iter().filter(|e| e.0 == tid).map(|e| e.1).reduce(crate::prio::higher)
+    FLOORS.read().iter().filter(|e| e.0 == tid).map(|e| e.1).reduce(crate::prio::higher)
 }
 
 pub struct Floor(u64);
@@ -126,7 +128,7 @@ impl Drop for Floor {
         if self.0 == 0 {
             return;
         }
-        let mut f = FLOORS.lock();
+        let mut f = FLOORS.write();
         if let Some(i) = f.iter().rposition(|e| e.0 == self.0) {
             f.remove(i);
             NFLOORS.fetch_sub(1, Ordering::AcqRel);

@@ -146,7 +146,7 @@ fn leaf(a: &AddressSpace, va: u64) -> Option<(u64, PageFlags)> {
 
 fn map() -> TestResult {
     let ns = vfs::root_ns();
-    let Ok(f) = ns.open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::skip("no /dev/zero to stand in for a device file") };
+    let Ok(f) = ns.open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::fail("no /dev/zero to stand in for a device file") };
     let (used, st) = (held(), dma_pages::stats());
     const N: u64 = 40;
     let p = get(N, DmaPagesOptions::default().with_max_order(0))?;
@@ -290,8 +290,8 @@ fn wait_unstuck() {
 /// device mapping of DMA pages, so the shootdown is not confirmed; then every other reference goes. The object
 /// must live on until the address space drops (a CPU may still hold a translation), and go back then.
 fn give_up_device() -> TestResult {
-    let Some(&c) = crate::tlb_ktest::aps().last() else { return ktest::skip("one CPU") };
-    let Ok(f) = vfs::root_ns().open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::skip("no /dev/zero to stand in for a device file") };
+    let Some(&c) = crate::tlb_ktest::aps().last() else { return ktest::fail("one CPU") };
+    let Ok(f) = vfs::root_ns().open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::fail("no /dev/zero to stand in for a device file") };
     let _cpu0 = crate::tlb_ktest::OnCpu0::take()?;
     let (used, st, unconfirmed0) = (held(), dma_pages::stats(), crate::aspace::UNCONFIRMED.get());
     let kept0 = mm_core::dma::KEPT_UNTYPED.load(core::sync::atomic::Ordering::Relaxed);
@@ -329,8 +329,8 @@ ktest!("mm.tlb.give_up_device", QemuOnly, give_up_device);
 /// loaded while the address space drops, so it is leaked; its device mapping's pages must be kept for good
 /// (frames still allocated, the object alive), not freed or retyped under tables a CPU may still walk.
 fn leaked_space_keeps_device() -> TestResult {
-    let Some(&c) = crate::tlb_ktest::aps().last() else { return ktest::skip("one CPU") };
-    let Ok(f) = vfs::root_ns().open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::skip("no /dev/zero to stand in for a device file") };
+    let Some(&c) = crate::tlb_ktest::aps().last() else { return ktest::fail("one CPU") };
+    let Ok(f) = vfs::root_ns().open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::fail("no /dev/zero to stand in for a device file") };
     let _cpu0 = crate::tlb_ktest::OnCpu0::take()?;
     let (leaked0, kept0) = (crate::aspace::AS_LEAKED.get(), crate::aspace::DEVICE_KEPT.get());
     // Write-back: kept WC pages would leave the direct map WC for the rest of the boot (mm.paging.direct_map).

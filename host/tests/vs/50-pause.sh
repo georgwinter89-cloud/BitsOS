@@ -6,6 +6,7 @@
 # (QEMU timing is shown, not judged: the < 50 ms check is on the Mini-PC list). Afterwards the pool and the volume
 # are checked on the host (e2fsck -fn).
 set -eu
+export BITSOS_KTEST_RUN=vs/30-snapshots # snap.fsyncs is one of that run's tests
 export LC_ALL=C
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/vs-50-pause}"

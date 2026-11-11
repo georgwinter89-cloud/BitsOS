@@ -132,7 +132,7 @@ fn next_deadline() -> R {
     t.arm(want);
     let Some(cpu) = t.cpu() else {
         t.cancel();
-        return ktest::skip("the timer went to the polled queue (no LAPIC timer here)");
+        return ktest::fail("the timer went to the polled queue (no LAPIC timer here)");
     };
     // `None` only while the queue is busy this instant: a bounded retry.
     let ask = || (0..1000).find_map(|_| time::hrtimer::next_deadline_on(cpu));

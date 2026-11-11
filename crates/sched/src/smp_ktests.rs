@@ -25,6 +25,7 @@ ktest!("sched.class.interactive_wake", Safe, interactive_wake);
 ktest!("sched.wake.irq", Safe, wake_irq);
 ktest!("sched.balance.spread", Safe, balance_spread);
 ktest!("sched.reap.sync", Safe, reap_sync);
+ktest!("sched.reap.churn", Safe, reap_churn);
 ktest!("sched.preempt.hook", Safe, preempt_hook);
 ktest!("sched.exclusive", Safe, exclusive);
 ktest!("sched.latency.rt_under_load", Safe, rt_latency);
@@ -210,7 +211,7 @@ fn scale64() -> R {
 
 /// A KernelRt thread on a CPU keeps a Normal thread there from running at all until it is done.
 fn rt_strict() -> R {
-    let Some((t, _pin)) = test_cpu() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _pin)) = test_cpu() else { return ktest::fail("needs two CPUs") };
     let stop = Arc::new(AtomicBool::new(false));
     let n_count = Arc::new(AtomicU64::new(0));
     let (s, c) = (stop.clone(), n_count.clone());
@@ -258,7 +259,7 @@ fn rt_strict() -> R {
 /// KernelRt FIFO: B (same priority, queued behind A) starts only after A ended; C (higher priority) preempts A at
 /// its next preemption point; A, preempted, runs again before B.
 fn rt_fifo() -> R {
-    let Some((t, _pin)) = test_cpu() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _pin)) = test_cpu() else { return ktest::fail("needs two CPUs") };
     let seq = Arc::new(AtomicU64::new(0));
     let log = Arc::new(SpinLock::new(Vec::new()));
     let a_started = Arc::new(AtomicBool::new(false));
@@ -310,7 +311,7 @@ fn rt_fifo() -> R {
 /// Interactive, Normal and Background busy on one CPU: CPU time in that order (weights 3121 / 1024 / 110), and
 /// none starves.
 fn fair_weights() -> R {
-    let Some((t, _pin)) = test_cpu() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _pin)) = test_cpu() else { return ktest::fail("needs two CPUs") };
     let stop = Arc::new(AtomicBool::new(false));
     let mut hs = Vec::new();
     for (name, class) in [("sched-w-int", Class::Interactive), ("sched-w-norm", Class::Normal), ("sched-w-bg", Class::Background)] {
@@ -339,7 +340,7 @@ fn fair_weights() -> R {
 /// An Interactive thread that sleeps and wakes on a CPU busy with two Normal threads runs soon after each wake-up
 /// (latency bonus); the latencies are reported, judged only on hardware.
 fn interactive_wake() -> R {
-    let Some((t, _pin)) = test_cpu() else { return ktest::skip("needs two CPUs") };
+    let Some((t, _pin)) = test_cpu() else { return ktest::fail("needs two CPUs") };
     let stop = Arc::new(AtomicBool::new(false));
     let mut hogs = Vec::new();
     for _ in 0..2 {
@@ -393,7 +394,7 @@ fn wake_handler(_v: u8) {
 /// another CPU each wake for every interrupt, `Completion::complete` from the handler too; no lock-order finding.
 fn wake_irq() -> R {
     if !acpi::irq::enabled() {
-        return ktest::skip("interrupts are not on");
+        return ktest::fail("interrupts are not on");
     }
     let n = crate::wait_cpus_online(5 * SEC);
     let me = current_cpu();
@@ -465,7 +466,7 @@ fn wake_irq() -> R {
 fn balance_spread() -> R {
     let ncpu = crate::wait_cpus_online(5 * SEC);
     if ncpu < 2 {
-        return ktest::skip("needs two CPUs");
+        return ktest::fail("needs two CPUs");
     }
     let n = (2 * ncpu).min(16);
     let start = current_cpu();
@@ -545,6 +546,36 @@ fn reap_sync() -> R {
     Ok(())
 }
 
+/// Threads that exit without a pause for 2 s: every reaper pass leaves new stacks and records behind, while each
+/// sync generation passes at once. That is no stall (gate 9's sc/20-smp: `reap.stalled` from work pending 1 s,
+/// not from a generation that did not pass), and everything is freed afterwards.
+fn reap_churn() -> R {
+    let ncpu = crate::wait_cpus_online(5 * SEC);
+    let stalls0 = crate::reap::REAP_STALLS.get();
+    let (live0, threads0) = (crate::stack_stats().live, crate::thread_count());
+    let (t0, mut rounds, mut exited) = (time::now_ns(), 0u64, 0u64);
+    while time::now_ns() - t0 < 2 * SEC {
+        let hs: Vec<JoinHandle> = (0..ncpu).map(|_| spawn_on("sched-churn", Class::Normal, None, false, 0, || spin(200))).collect::<Result<_, _>>()?;
+        join_all(&hs, "churn")?;
+        exited += hs.len() as u64;
+        rounds += 1;
+    }
+    let stalls = crate::reap::REAP_STALLS.get() - stalls0;
+    // The backlog of that many exits (16 CPUs: some 15000 stacks) takes the reaper longer than `reap`'s 2 s.
+    let (t1, backlog) = (time::now_ns(), hal::switch::retired_count());
+    let mut freed = false;
+    while !freed && time::now_ns() - t1 < 30 * SEC {
+        freed = crate::reap();
+    }
+    klog::event!(Info, "sched", "ktest.reap_churn", cpus = ncpu, rounds = rounds, exited = exited, stalls = stalls, backlog = backlog,
+        drained_ms = (time::now_ns() - t1) / MS);
+    kassert!(stalls == 0, "{stalls} stall reports while {exited} threads exited and every generation passed");
+    kassert!(freed, "the reaper did not free everything within 30 s (stacks retired: {})", hal::switch::retired_count());
+    kassert!(crate::stack_stats().live <= live0 && crate::thread_count() <= threads0, "stacks {} (before {live0}), threads {} (before {threads0})",
+        crate::stack_stats().live, crate::thread_count());
+    Ok(())
+}
+
 /// The interrupt-exit hook: it never preempts with a spin lock held or when the interrupted code had interrupts
 /// off; with a reschedule pending it switches to the waiting KernelRt thread and returns once this thread runs
 /// again.
@@ -575,7 +606,8 @@ fn preempt_hook() -> R {
             let _irq = hal::cpu::IrqGuard::new();
             crate::irq_exit_preempt(true)
         };
-        kassert!(switched, "a pending reschedule did not preempt");
+        // A tick since the spawn may have preempted us for it already: that is the same path, and nothing is left to do.
+        kassert!(switched || ran.load(Ordering::Acquire), "a pending reschedule did not preempt");
         let t0 = time::now_ns();
         while !ran.load(Ordering::Acquire) && time::now_ns() - t0 < 5 * SEC {
             crate::sleep_ms(1);
@@ -593,7 +625,7 @@ fn preempt_hook() -> R {
 fn exclusive() -> R {
     let ncpu = crate::wait_cpus_online(5 * SEC);
     if ncpu < 2 {
-        return ktest::skip("needs two CPUs");
+        return ktest::fail("needs two CPUs");
     }
     let stop = Arc::new(AtomicBool::new(false));
     let count = Arc::new(AtomicU64::new(0));
@@ -646,7 +678,7 @@ fn lat_handler(_v: u8) {
 /// the 20 ms bound is judged on hardware only.
 fn rt_latency() -> R {
     if !acpi::irq::enabled() {
-        return ktest::skip("interrupts are not on");
+        return ktest::fail("interrupts are not on");
     }
     const BUSY: usize = 32;
     const ROUNDS: u64 = 100;

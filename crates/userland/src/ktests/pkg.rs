@@ -2,8 +2,8 @@
 //! /usr/lib behind CachyOS's merged-/usr links, every listed file with its SHA-256, a dynamic C++ program running
 //! on it, a missing library refused by the loader as on CachyOS, and a CachyOS program run from the stick's
 //! `\BITSOS2\bin`. The image lists what it carries in `/usr/share/bitsos/package.txt`. xtask fails a build that
-//! lacks part of the package unless V2_PKG_OPTIONAL=1, which the list states (`mode optional`); only then a test
-//! skips for a missing part, so the gate never passes on an image without the set.
+//! lacks part of the package unless V2_PKG_OPTIONAL=1, which the list states (`mode optional`); a test without its
+//! part is a failure on any image.
 //! All Safe and rerunnable: scratch files carry the run counter and are removed.
 
 use super::{SEC, finish, scratch, start, text, wait_for};
@@ -54,12 +54,23 @@ fn optional(list: &str) -> bool {
     list.lines().any(|l| l.starts_with("mode optional"))
 }
 
-/// A part of the package the list does not name: skip on an optional image, a failure otherwise.
+/// A part of the package the list does not name: a failure, and it says how the image was built.
 pub(super) fn absent(list: &str, what: &str) -> TestResult {
     if optional(list) {
-        return ktest::skip(&format!("{what} (image built with V2_PKG_OPTIONAL=1)"));
+        return ktest::fail(&format!("{what} (image built with V2_PKG_OPTIONAL=1)"));
     }
     Err(format!("{what}, and the image was not built with V2_PKG_OPTIONAL=1"))
+}
+
+/// What a tree carries about itself (`PKGLIST.TXT`, written with the tree by xtask): the image's list is built today
+/// from the host's files, the tree on the stick was copied on another day, and a system library updated between the
+/// two is no defect of the tree (Mini-PC 3.11.: libfribidi, TS-1).
+pub(super) fn tree_list(tree: &str) -> Result<String, String> {
+    let p = format!("{tree}PKGLIST.TXT");
+    let ns = vfs::root_ns();
+    kassert!(wait_for(30 * SEC, || ns.lookup("/boot/BITSOS2/STICK.ID").is_ok()), "the stick did not show /boot/BITSOS2/STICK.ID within 30 s");
+    let b = ns.read_file(&p, MAX_LIST).map_err(|e| format!("{p}: {e:?} (copy the tree from an image built with V2_STICK_TREES to the stick again)"))?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
 }
 
 /// The file at `path` (links followed) is a regular file with permissions `perm`, the size and SHA-256 of
@@ -179,13 +190,13 @@ ktest!("ul.pkg.locale", Safe, locale);
 
 /// Georg 30.10. ("Programme werden nur noch am Mini PC getestet"): a program tree's tests (class Program) run only on
 /// the Mini-PC, where the tree and its launcher must be on the stick: every way they can be missing is a failure,
-/// never a skip (CONTRACTS section 4), also on an image built with V2_PKG_OPTIONAL=1. Returns the list lines of the
+/// never a failure (CONTRACTS section 4), also on an image built with V2_PKG_OPTIONAL=1. Returns the list lines of the
 /// files below `tree` (`/boot/BITSOS2/<tree>/`) and the launcher `/boot/BITSOS2/bin/<launcher>`'s path, after
 /// checking the launcher against its list line and the stick's identity (STICK.ID within 30 s).
-pub(super) fn program_tree<'a>(list: &'a str, tree: &str, launcher: &str) -> Result<(Vec<Line<'a>>, String), String> {
+pub(super) fn program_tree<'a>(list: &str, own: &'a str, tree: &str, launcher: &str) -> Result<(Vec<Line<'a>>, String), String> {
     let all = entries(list);
-    let lines: Vec<Line> = all.iter().copied().filter(|e| e.kind == "stick" && e.path.starts_with(tree)).collect();
-    kassert!(!lines.is_empty(), "no {tree} in this image's package list (stage the tree and build the image again)");
+    let lines: Vec<Line> = entries(own).into_iter().filter(|e| e.kind == "stick" && e.path.starts_with(tree)).collect();
+    kassert!(!lines.is_empty(), "{tree}PKGLIST.TXT names no file of the tree");
     let want = format!("/boot/BITSOS2/bin/{launcher}");
     let Some(l) = all.iter().find(|e| e.kind == "stick" && e.path == want) else {
         return Err(format!("{want} is not in this image's package list"));
@@ -254,7 +265,7 @@ ktest!("ul.pkg.missing_lib", Safe, missing_lib);
 /// file with nothing to do, a tool, and a missing build file (strerror text, exit 1), as on CachyOS.
 fn stick() -> TestResult {
     let Some(ninja) = on_stick("ninja")? else {
-        return ktest::skip("no ninja in \\BITSOS2\\bin of this stick (xtask stick does not copy it yet; MCP write_file does), or an optional image");
+        return ktest::fail("no ninja in \\BITSOS2\\bin of this stick (xtask stick does not copy it yet; MCP write_file does), or an optional image");
     };
     let dir = scratch("pkg");
     let ns = vfs::root_ns();

@@ -27,8 +27,8 @@ export XCURSOR_PATH=/usr/share/icons
 unset DISPLAY WAYLAND_DISPLAY XCURSOR_THEME XCURSOR_SIZE
 
 if [ ! -f /usr/share/icons/Adwaita/cursors/text ]; then
-    echo "SKIP: no Adwaita cursor theme on this host (adwaita-cursors)"
-    exit 0
+    echo "FAIL: no Adwaita cursor theme on this host (adwaita-cursors; a test that cannot do its work is FAIL)"
+    exit 1
 fi
 
 echo "== build"

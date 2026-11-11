@@ -215,7 +215,7 @@ fn valid_name(n: &str) -> bool {
 
 /// The accounts init writes once when /etc has none (Linux layout, passwd(5), group(5)): root, uid 1000 (the
 /// uid V2 gives programs it starts, `proc::SpawnOptions`) and nobody, so ps, ls -l and id show names.
-pub const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:BitsOS programs:/:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n";
+pub const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:BitsOS programs:/data/home/1000:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n";
 pub const GROUP: &str = "root:x:0:\nuser:x:1000:\nnobody:x:65534:\n";
 
 pub fn render_hostname(hostname: &str) -> String {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LO-1 Mini-PC run (Georg 30.10.: programs are tested on the Mini-PC only): LibreOffice from the stick, over MCP.
 
-Usage: lo_check.py <host> <port> <token> <out dir> [--desktop]
+Usage: lo_check.py <host:port> <out dir> [--tls DIR|auto] [--token-file F] [--desktop]   (token: BITSOS_TOKEN or the file)
 The desk runs it against the Mini-PC (`bash host/tests/minipc/lo.sh`), with the stick carrying \\BITSOS2\\libreoffice\\
 and \\BITSOS2\\bin\\libreoffice, the data volume mounted. It replaces the QEMU scenario host/tests/lo/10-office.sh:
   1. MCP ktest `ul.pkg.libreoffice` (class Program: tree, links, licences, libraries, --check, --env, a headless
@@ -16,19 +16,21 @@ and \\BITSOS2\\bin\\libreoffice, the data volume mounted. It replaces the QEMU s
 What a person has to see (typing, saving through the dialog, the state after a reboot) stays in the check list of
 plan/notes/lo-LO-1.md. Exit 0 = green."""
 import base64
-import http.client
 import json
 import os
 import re
 import sys
 import time
 
-HOST, PORT, TOKEN, OUT = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-DESKTOP = "--desktop" in sys.argv[5:]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mp  # noqa: E402
+
+OPTS = mp.options(sys.argv[1:], positional=2, flags=("--desktop",))
+OUT = OPTS.rest[1]
+DESKTOP = OPTS.flags["--desktop"]
 LAUNCHER = "/boot/BITSOS2/bin/libreoffice"
 DIR = "/data/home/1000/lo1-check"
 ENV = {"PATH": "/bin:/usr/bin:/boot/BITSOS2/bin", "XDG_RUNTIME_DIR": "/run/user/1000"}
-_id = 0
 
 
 def need(cond, what, detail=""):
@@ -37,27 +39,8 @@ def need(cond, what, detail=""):
     print(f"ok: {what}", flush=True)
 
 
-def rpc(method, params):
-    global _id
-    _id += 1
-    c = http.client.HTTPConnection(HOST, PORT, timeout=900)
-    c.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": _id, "method": method, "params": params}),
-              {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
-    r = c.getresponse()
-    data = r.read()
-    if r.status != 200:
-        raise SystemExit(f"RED: MCP {method}: HTTP {r.status} {data[:200]!r}")
-    return json.loads(data)
-
-
 def call(name, args=None):
-    j = rpc("tools/call", {"name": name, "arguments": args or {}})
-    if "error" in j:
-        return True, f"rpc error {j['error']}", []
-    r = j["result"]
-    text = "\n".join(i.get("text", "") for i in r["content"] if i["type"] == "text")
-    images = [base64.b64decode(i["data"]) for i in r["content"] if i["type"] == "image"]
-    return r.get("isError", False), text, images
+    return mp.call(OPTS, name, args)
 
 
 def sh(cmd, ms=300000):

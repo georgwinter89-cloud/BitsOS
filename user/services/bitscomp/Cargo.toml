@@ -42,6 +42,9 @@ fontdue = { version = "=0.9.5", default-features = false, features = ["std", "si
 # WY-11: Xcursor theme files (Adwaita). In the lock already (winit's dependency) and in the local cargo cache; no
 # dependencies of its own.
 xcursor = "=0.3.11"
+# PK-L1a: the library's PNG icons, inflated by miniz_oxide (in user/Cargo.lock and the root lock already; the decoder
+# itself is bitscomp's icon_png.rs: plan/spec/rust-ecosystem.md names neither png nor resvg).
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
 
 [profile.release]
 opt-level = 3

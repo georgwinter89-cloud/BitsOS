@@ -14,7 +14,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use crate::dma_buf::Exporter;
 use crate::gpu::{BoPlace, ChipProfile, GpuDevice, GpuShared, MemoryState, Register, Sensor};
-use linux::errno::ENOMEM;
+use linux::errno::{ENODEV, ENOMEM};
 use mm::device::Aperture;
 #[cfg(not(test))]
 use mm::dma::DmaCache;
@@ -242,6 +242,14 @@ impl FakeGpu {
     pub fn pstate_changed_under_lock(&self) -> bool {
         self.pstate_under_lock.load(Ordering::Acquire)
     }
+    /// WY-21: a hang from now on ends the device (CONFIG `drm_fake_hang=lose`, or a test).
+    pub fn lose_on_hang(&self, on: bool) {
+        self.sched.lose_on_hang.store(on, Ordering::Release);
+    }
+    /// Whether a hang ended the device.
+    pub fn lost(&self) -> bool {
+        self.sched.lost.load(Ordering::Acquire)
+    }
     pub fn reset(&self, vram_lost: bool) {
         self.sched.reset_counter.fetch_add(1, Ordering::AcqRel);
         if vram_lost {
@@ -283,6 +291,14 @@ impl crate::device::Driver for FakeGpu {
     }
     fn gpu(&self) -> Option<&dyn GpuDevice> {
         Some(self)
+    }
+    /// A lost device takes no new file, as amdgpu's `HardwareGpu::open`.
+    fn open(&self, _file: &crate::file::DrmFile) -> Result<(), vfs::Errno> {
+        if self.lost() {
+            klog::event!(Debug, "drm", "fake.open_refused"; "the device is lost");
+            return Err(ENODEV);
+        }
+        Ok(())
     }
     /// DR-7: amdgpu's memory lines (`amdgpu_show_fdinfo`).
     fn fdinfo(&self, file: &crate::file::DrmFile, out: &mut alloc::string::String) {
@@ -355,7 +371,7 @@ impl GpuDevice for FakeGpu {
     /// handed out). The fake's "VRAM" is system pages too (write-back: the fake draws nothing), so a program's
     /// mapping works the same in both places; the alignment does not matter for them.
     /// DR-7: GFX 11 page tables in heap memory (see `fake_vm`).
-    fn vm_create(&self) -> Result<Arc<dyn crate::gpu::GpuVm>, vfs::Errno> {
+    fn vm_create(&self, _client: u64) -> Result<Arc<dyn crate::gpu::GpuVm>, vfs::Errno> {
         Ok(crate::fake_vm::FakeVm::new(self.mem.carveout)?)
     }
     /// DR-8: the IBs run in amdgpu-fmt's interpreters on the client VM (`fake_cs`).

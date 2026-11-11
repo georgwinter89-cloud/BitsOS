@@ -27,7 +27,7 @@ fn lib_path(name: &str) -> String {
 pub(crate) fn link_libs() -> Result<(), TestResult> {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/dyn-hello").is_err() {
-        return Err(ktest::skip("no dynamic programs in this image (built without the host's gcc or the musl sysroot)"));
+        return Err(ktest::fail("no dynamic programs in this image (built without the host's gcc or the musl sysroot)"));
     }
     let names = ns.list_dir("/bin").map_err(|e| Err(format!("list /bin: {e}")))?;
     for (n, _) in names {

@@ -25,7 +25,7 @@ pub(super) fn fb() -> Result<&'static Arc<Fb>, String> {
 pub(super) fn need_program() -> TestResult {
     if vfs::root_ns().lookup(PROGRAM).is_err() {
         // Images built without the musl sysroot have no user/abi-tests (MC-5b, RB-7a requests).
-        return ktest::skip("/bin/abi-fbdev is not in this image (user/abi-tests need the musl sysroot)");
+        return ktest::fail("/bin/abi-fbdev is not in this image (user/abi-tests need the musl sysroot)");
     }
     Ok(())
 }
@@ -214,7 +214,7 @@ fn get_var(fb: &Fb, io: &FakeIo) -> Result<Var, String> {
 /// The node, its owner, and what GET_V/GET_F say about the live mode.
 fn node() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     kassert!(fix_node_owner(), "{NODE} missing");
@@ -244,7 +244,7 @@ ktest!("dp.fbdev.node", Safe, node);
 /// a pan moves the window, the argument is read and written through the caller's memory.
 fn rules() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     let io = FakeIo::new();
@@ -300,7 +300,7 @@ ktest!("dp.fbdev.rules", Safe, rules);
 /// `abi-fbdev v2`: every fbdev call from a program, compared with the Linux answers (expected/dp2-fbdev.txt).
 fn program() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -324,14 +324,14 @@ fn program() -> TestResult {
     handed_back(fb, "abi-fbdev v2 ended")?;
     Ok(())
 }
-ktest!("dp.fbdev.program", Safe, program);
+ktest!("dp.fbdev.program", Screen, program);
 
 /// An fbDOOM-style program: double-buffered frames with pans and vsync waits, then stores straight into the
 /// shown buffer and a pwrite band. While it holds the screen, MCP `screen`'s picture (display::snapshot) is
 /// exactly what it drew; when it is killed the console comes back.
 fn picture() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -370,12 +370,12 @@ fn picture() -> TestResult {
     kassert!((w, h) == (m.width, m.height), "console snapshot {w}x{h}");
     Ok(())
 }
-ktest!("dp.fbdev.picture", Safe, picture);
+ktest!("dp.fbdev.picture", Screen, picture);
 
 /// A program that crashes while it holds the screen: the console comes back by itself.
 fn crash() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -388,13 +388,13 @@ fn crash() -> TestResult {
     klog::event!(Info, "dp", "ktest.fbdev_crash", code = code, message = s.p.end_message().unwrap_or_default().as_str());
     Ok(())
 }
-ktest!("dp.fbdev.crash", Safe, crash);
+ktest!("dp.fbdev.crash", Screen, crash);
 
 /// The console asks for the screen back (KD_TEXT's path, `display::request_scanout_back`): fbdev gives it while
 /// the program runs on; a kernel owner holding the screen keeps a program's picture off it.
 fn handback() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -426,14 +426,14 @@ fn handback() -> TestResult {
     handed_back(fb, "both programs ended")?;
     Ok(())
 }
-ktest!("dp.fbdev.handback", Safe, handback);
+ktest!("dp.fbdev.handback", Screen, handback);
 
 /// DP-2f: every open of /dev/fb0 is its own object whose close wakes the `fbdev` thread. A close of an open that
 /// does not hold the screen leaves the holder alone (the thread looks, sees it alive); a close with nobody
 /// holding the screen is harmless (no hand-back, the console keeps it).
 fn opens() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -473,4 +473,4 @@ fn opens() -> TestResult {
     kassert!(super::handback::last().at_ns == at, "a close without a take recorded a hand-back");
     Ok(())
 }
-ktest!("dp.fbdev.opens", Safe, opens);
+ktest!("dp.fbdev.opens", Screen, opens);

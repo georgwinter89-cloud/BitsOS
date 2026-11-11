@@ -1,0 +1,41 @@
+segment = 0
+attached: nattch 1 mode 600 key 51c0de02
+lpid me 1 atime 1 dtime0 1
+fork child inherited: nattch 2 mode 600 key 51c0de02
+child attached again: nattch 3 mode 600 key 51c0de02
+child sees parent's byte: yes
+child: exit 0
+child gone: nattch 1 mode 600 key 51c0de02
+parent sees child's byte: yes
+dtime 1 lpid not me 1
+RMID while attached = 0
+marked: nattch 1 mode 1600 key 0
+dest 1
+maps /SYSV51c0de02 (deleted) len 4096 perms rw-s off 0
+key free = -ENOENT
+key again is a new one = 1
+attach after RMID works: yes
+second attach: nattch 2 mode 1600 key 0
+RMID twice = 0
+SHM_INFO = 1
+used 2 tot 2 rss 1
+proc line key 0 id 0 mode 1600 size 4096 nattch 2
+proc line key 1371594242 id 1 mode 600 size 4096 nattch 0
+detach = 0
+detach last = 0
+stat gone = -EINVAL
+SHM_INFO = 1
+used 1 tot 1
+child's segment = 2
+child leaves a segment: exit 0
+SHM_INFO = 2
+used 2
+forced on = 2
+SHM_INFO = 1
+orphan gone, used 1
+child's segment = 3
+child with forced: exit 0
+SHM_INFO = 1
+child's gone with it, used 1
+detach with forced = 0
+destroyed = -EINVAL

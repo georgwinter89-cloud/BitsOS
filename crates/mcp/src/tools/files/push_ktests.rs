@@ -181,7 +181,7 @@ fn push_stick() -> TestResult {
     if fs_fat::stick::wait_mounted(40_000).is_none() {
         return match fs_fat::stick::last_reason() {
             Some(r) => Err(format!("the boot stick was not mounted: {r}")),
-            None => ktest::skip("no boot stick in this run (no USB disk recognised as the stick)"),
+            None => ktest::fail("no boot stick in this run (no USB disk recognised as the stick)"),
         };
     }
     let ns = vfs::root_ns();

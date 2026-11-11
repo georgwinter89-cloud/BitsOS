@@ -204,15 +204,16 @@ fn usage_rows(s: &mut String, u: &PageUsage, rollup: bool, anon_huge: u64) {
     row("Private_Dirty:  ", kb(u.private_dirty));
     row("Referenced:     ", kb(u.referenced));
     row("Anonymous:      ", kb(u.anonymous));
-    // V2 has no KSM, lazy free, file or shmem huge pages, swap or mlock: Linux's zero rows; MM-13's anonymous ones.
+    // V2 has no KSM, lazy free, file or shmem huge pages or swap: Linux's zero rows; MM-13's anonymous ones.
     row("KSM:            ", 0);
     row("LazyFree:       ", 0);
     row("AnonHugePages:  ", kb(anon_huge));
     for name in ["ShmemPmdMapped: ", "FilePmdMapped:  ",
-        "Shared_Hugetlb: ", "Private_Hugetlb: ", "Swap:           ", "SwapPss:        ", "Locked:         "]
+        "Shared_Hugetlb: ", "Private_Hugetlb: ", "Swap:           ", "SwapPss:        "]
     {
         row(name, 0);
     }
+    row("Locked:         ", pk(u.pss_locked));
 }
 
 /// `show_smap_vma_flags` (task_mmu.c:636) in bit order for the flags V2 has. `me` from the file's VM_MAYEXEC
@@ -234,11 +235,13 @@ fn vm_flags(s: &mut String, v: &Vma) {
         (v.kind == VmaKind::Stack || v.flags.growsdown, "gd"),
         // A device mapping is Linux's `io_remap_pfn_range`: VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP.
         (device, "pf"),
+        (v.flags.locked, "lo"),
         (device, "io"),
         (v.flags.seq_read, "sr"),
         (v.flags.rand_read, "rr"),
         (v.flags.dontfork, "dc"),
         (device, "de"),
+        (v.flags.lock_onfault, "lf"),
         (v.flags.account, "ac"),
         (v.flags.wipeonfork, "wf"),
         (device, "dd"),
@@ -277,6 +280,7 @@ pub(super) fn share_of(u: &PageUsage, a: u64, b: u64, last: bool, taken: &mut u6
         pss_anon: part(u.pss_anon, &mut g.pss_anon),
         pss_file: part(u.pss_file, &mut g.pss_file),
         pss_shmem: part(u.pss_shmem, &mut g.pss_shmem),
+        pss_locked: part(u.pss_locked, &mut g.pss_locked),
         shared_clean: part(u.shared_clean, &mut g.shared_clean),
         shared_dirty: part(u.shared_dirty, &mut g.shared_dirty),
         private_clean: part(u.private_clean, &mut g.private_clean),

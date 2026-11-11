@@ -8,6 +8,7 @@
 # host: e2fsck -fy replays the journal and must fix nothing else. Boot 2 (ktest kernel and CONFIG swapped in on the
 # same stick): V2 replays the journal at mount, fs.ext4.data passes, the power-off leaves it clean: e2fsck -fn.
 set -eu
+export BITSOS_KTEST_RUN=fs/50-data # shares the data volume's tests with fs/50-data
 export LC_ALL=C
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/fs-51-data-reload}"

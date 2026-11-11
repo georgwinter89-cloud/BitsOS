@@ -39,7 +39,7 @@ fn walk(f: &OpenDrm, addr: u64) -> TableWalk {
 fn tables() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let r = (|| -> TestResult {
@@ -84,13 +84,13 @@ fn tables() -> TestResult {
         r.and_then(|()| before.check())
     })
 }
-ktest!("dr.vm.tables", Safe, tables);
+ktest!("dr.vm.tables", QemuAll, tables);
 
 /// A delayed UNMAP keeps the memory reachable until it runs; another file's VM is apart.
 fn memory_held() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let r = (|| -> TestResult {
@@ -115,13 +115,13 @@ fn memory_held() -> TestResult {
         r.and_then(|()| before.check())
     })
 }
-ktest!("dr.vm.memory_held", Safe, memory_held);
+ktest!("dr.vm.memory_held", QemuAll, memory_held);
 
 /// Georg 27.10.: any carve-out size; the VM and a VRAM mapping on 512 MiB and 8 GiB.
 fn carveouts() -> TestResult {
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         for carve in [512u64 << 20, 8 << 30] {
@@ -141,7 +141,7 @@ fn carveouts() -> TestResult {
         before.check()
     })
 }
-ktest!("dr.vm.carveouts", Safe, carveouts);
+ktest!("dr.vm.carveouts", QemuAll, carveouts);
 
 const PROG: &str = "/bin/abi-drm-va";
 const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-va.txt");
@@ -149,11 +149,11 @@ const EXPECTED: &str = include_str!("../../../host/tests/dr/fixtures/abi-drm-va.
 /// The ABI program on V2: every line as on CachyOS.
 fn program() -> TestResult {
     if vfs::root_ns().lookup(PROG).is_err() {
-        return ktest::skip("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
+        return ktest::fail("the ABI-diff programs are not in this image (no musl sysroot when it was built)");
     }
     with_dev!(d, {
         if d.dev.driver().as_fake().is_none() {
-            return ktest::skip("not the fake GPU");
+            return ktest::fail("not the fake GPU");
         }
         let before = Balance::now();
         let out = proc::stdio::Capture::new(1 << 16);
@@ -176,4 +176,4 @@ fn program() -> TestResult {
         before.check()
     })
 }
-ktest!("dr.vm.program", Safe, program);
+ktest!("dr.vm.program", QemuAll, program);

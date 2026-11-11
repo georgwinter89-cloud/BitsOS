@@ -1,0 +1,458 @@
+#!/bin/sh
+# GM-2a: `steam` starts Valve's Steam client (beta channel, the 64-bit client in its container) on BitsOS V2, in software
+# through Xwayland, up to the login window. Lives in \BITSOS2\bin\ (on PATH); Valve's files in \BITSOS2\steam\ (manifest
+# `tree steam`, made by user/ports/steam/scripts/stage-v2.sh).
+#   steam [ARGS]    start it in the desktop; ARGS go to Steam (for example -cef-disable-sandbox); ends when Steam ends
+#   steam --check   check the tree, /bin/bash, the desktop, Xwayland, the user, the data volume, the reaper, Proton; start and write nothing
+#   steam --env     print the environment Steam gets (one VAR=value per line); start nothing
+#   steam --status  the launcher's last stage, Steam's processes, the X11 windows, where the logs are; change nothing
+#   steam --stop    ask Steam to end (its own -shutdown), then TERM and KILL what is left of it
+# It never runs as root: started by root (console, MCP as root) it runs as uid 1000 (BusyBox chpst -u 1000:1000) or refuses.
+# Steam needs a real file system (links, hard links, several GB), so it refuses without an ext4 data volume at /data.
+# One at a time: a flock on $RUN/lock, gone with the launcher however it ends. A second start, or one while Steam's programs still
+# run without a launcher, says so and changes nothing (not the tree, not the log, not the stages).
+# First start: Valve's bootstrap into $HOME/.local/share/Steam, Steam's package/ folder seeded from the stick (the client then
+# unpacks it itself; a newer client comes from Valve's CDN as usual), the opt-in to the beta and its 64-bit client, and the
+# graphics provider (Mesa + glibc, software only here) into $HOME/.local/share/bitsos-steam/gfx.
+# Xwayland belongs to the desktop (bitscomp holds :0 and starts it at the first X11 client); no second one is started.
+# Every stage goes to $RUN/steam.log with Steam's own output; `steam_check.py` (host/tests/minipc/steam.sh) reads it.
+# GM-2b: Steam starts every game through steamrt64/reaper, which is 32-bit (V2 cannot run it). Once Steam's file check is over the
+# stand-in /bin/reaper (user/ports/steam/reaper) is put there as a real file and kept there; the stage `reaper` and --check say
+# which one is there. It counts among Steam's programs: --stop and a signal reach a game through it.
+# Games need a sound device (FMOD stops without one) and Georg's games have sound. Tests set STEAM_SILENT=1: SDL's dummy driver, and
+# ALSA's default device is the null device. No credentials: Georg logs in himself;
+# nothing here reads, stores or passes any. The SB_* settings exist for tests: a fake tree and mount table on the build host.
+MNT=${SB_MOUNT:-/boot}
+T=${SB_TREE:-$MNT/BITSOS2/steam}
+DATA=${SB_DATA:-/data}
+HOME_DATA=$DATA/home/1000
+STATE=${SB_DATA_STATE:-/run/bitsos/data-state}
+MOUNTS=${SB_MOUNTS:-/proc/self/mounts}
+USER_RUN=${SB_USER_RUN:-/run/user/1000}
+BASH_BIN=${SB_BASH:-/bin/bash}
+X11_DIR=${SB_X11_DIR:-/tmp/.X11-unix}
+PATH=${SB_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
+export PATH
+UID_NOW=$(id -u 2>/dev/null)
+CHANNEL=publicbeta
+# The client, the runtime and pressure-vessel's copy of it, a provider and Steam's own download cache, in KiB.
+NEED_KB=${SB_NEED_KB:-6000000}
+# The web helper draws on the GPU like the rest (WY-3b gave Xwayland glamor and DRI3); SB_STEAM_FLAGS="-cef-disable-gpu" goes back.
+FLAGS=${SB_STEAM_FLAGS-}
+
+say() { echo "steam: $*"; }
+case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
+
+# Root hands over at once: everything below runs as uid 1000.
+if [ "$UID_NOW" = 0 ]; then
+  out=$(chpst -u 1000:1000 id -u 2>&1)
+  if [ "$out" != 1000 ]; then
+    say "does not run as root: root cannot hand over to uid 1000 (chpst -u 1000:1000: $(echo "${out:-no answer}" | head -n 1)). Start it as user 1000."
+    exit 1
+  fi
+  if [ ! -d "$USER_RUN" ]; then
+    mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; exit 1; }
+  fi
+  # A volume older than FS-8c has no home yet: root makes it, never through a link.
+  if [ "$1" != --check ] && [ "$1" != --env ] && [ "$1" != --status ] && [ -d "$DATA" ] && [ ! -e "$HOME_DATA" ] && [ ! -L "$HOME_DATA" ] && [ ! -L "$DATA/home" ]; then
+    mkdir -p "$DATA/home" && mkdir -m 700 "$HOME_DATA" && chown -h 1000:1000 "$HOME_DATA"
+  fi
+  exec chpst -u 1000:1000 sh "$0" "$@"
+fi
+
+RUN=$USER_RUN/steam
+[ "$UID_NOW" = 1000 ] || RUN=${XDG_RUNTIME_DIR:-/tmp}/steam
+LOG=$RUN/steam.log
+STAGES=$RUN/stages
+LOCK=$RUN/lock
+H=$HOME_DATA
+NAME=$(id -un 2>/dev/null)
+NAME=${NAME:-user}
+STEAMROOT=$H/.local/share/Steam
+REAPER=$STEAMROOT/steamrt64/reaper
+REAPER_SRC=${SB_REAPER:-/bin/reaper}
+BITS=$H/.local/share/bitsos-steam
+STAMP=$BITS/installed
+
+# stage NAME [what]: one line in the log and in the stages file (the last line there is where the launcher is).
+stage() {
+  line="$(date +%s) stage=$*"
+  echo "$line" >>"$LOG" 2>/dev/null
+  echo "$line" >>"$STAGES" 2>/dev/null
+  say "stage $*"
+}
+fail() { # fail STAGE WHY
+  stage "$1-failed $2"
+  say "$2"
+  exit 1
+}
+
+tree_ok() {
+  for f in VERSION.txt bootstraplinux_ubuntu12_32.tar.xz gfx.tar.gz bin/realpath "package/steam_client_${CHANNEL}_ubuntu12.manifest"; do
+    [ -e "$T/$f" ] || { why="tree $T: $f is missing (copy \\BITSOS2\\steam\\ to the stick)"; return 1; }
+  done
+  set -- "$T"/package/steam_steamrt_ubuntu12.zip.*
+  [ -e "$1" ] || { why="tree $T: package/steam_steamrt_ubuntu12.zip.* (the 64-bit client) is missing"; return 1; }
+}
+# pv-run.sh and steam-runtime-steamrt.sh are Valve's scripts with #!/bin/bash, run on the host side.
+bash_ok() {
+  [ -x "$BASH_BIN" ] || { why="$BASH_BIN is missing: Valve's host-side scripts need it (manifest line: initrd bash host:/usr/bin/bash)"; return 1; }
+}
+
+desk_pids() {
+  ps_=
+  for p in $(pidof bitscomp); do
+    # The rescue build waits beside the gpu build as its parent (WY-CHIP): not a desktop of its own.
+    [ "$(cat "/proc/$p/comm" 2>/dev/null)" != bitscomp-rescue ] || continue
+    case "$(tr '\0' ' ' 2>/dev/null <"/proc/$p/cmdline")" in
+      *" page "* | *" ctl "* | *" page" | *" ctl") ;;
+      *) ps_="$ps_${ps_:+ }$p" ;;
+    esac
+  done
+  echo "$ps_"
+}
+# Sets XDG (the desktop's runtime directory) or why.
+find_desk() {
+  XDG= why=
+  if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    XDG=$XDG_RUNTIME_DIR
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  set -- $(desk_pids)
+  [ $# -gt 0 ] || { why="desktop: none runs (start the desktop first)"; return 1; }
+  [ $# = 1 ] || { why="desktop: $# desktops run"; return 1; }
+  XDG=$(tr '\0' '\n' 2>/dev/null <"/proc/$1/environ" | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -n 1)
+  # A desktop started as root and run as the user after it gave root up hides its environ (not dumpable, as on Linux): its
+  # socket in the user's runtime directory says where it is.
+  [ -n "$XDG" ] || [ ! -S "$USER_RUN/wayland-bits-0" ] || XDG=$USER_RUN
+  [ -n "$XDG" ] || { why="desktop: its XDG_RUNTIME_DIR cannot be read (/proc/$1/environ)"; return 1; }
+}
+# The desktop's Xwayland on :0 (WY-3): sets XW (its state line) or why.
+xwayland_ok() {
+  XW=$(XDG_RUNTIME_DIR="$XDG" bitscomp ctl xwayland 2>&1) || { why="xwayland: bitscomp ctl xwayland failed: $XW"; return 1; }
+  case $XW in
+    *"display=:0"*) ;;
+    *) why="xwayland: the desktop holds no display :0 ($XW; \\BITSOS2\\xwayland\\ on the stick?)"; return 1 ;;
+  esac
+  [ -S "$X11_DIR/X0" ] || { why="xwayland: $X11_DIR/X0 is not there"; return 1; }
+}
+
+# Steam's processes by their program's name: `procs NAME` -> pids. BusyBox's pidof would also name this very script (its
+# argv[1] is .../steam); a program whose exe cannot be read (another user namespace) goes by its comm.
+PROC=${SB_PROC:-/proc}
+procs() {
+  for d in "$PROC"/[0-9]*; do
+    e=$(readlink "$d/exe" 2>/dev/null)
+    b=${e##*/}
+    [ -n "$b" ] || b=$(cat "$d/comm" 2>/dev/null)
+    [ "$b" != "$1" ] || printf '%s ' "${d##*/}"
+  done
+}
+STEAM_PROGRAMS="steam srt-client-container pressure-vessel-wrap srt-bwrap pv-adverb steamwebhelper reaper"
+steam_left() { left=; for p in $STEAM_PROGRAMS; do left="$left$(procs "$p")"; done; }
+# Waits until they are gone, half a second a tick: TERM at tick $1, KILL ten seconds later, gives up five seconds after that.
+drain() {
+  n=0
+  while :; do
+    steam_left
+    [ -n "$left" ] || return 0
+    n=$((n + 1))
+    # shellcheck disable=SC2086
+    if [ $n = "$1" ]; then kill -TERM $left 2>/dev/null; elif [ $n = $(($1 + 20)) ]; then kill -KILL $left 2>/dev/null; elif [ $n -gt $(($1 + 30)) ]; then return 1; fi
+    sleep 0.5
+  done
+}
+# The launcher that holds the lock, if it still lives: the lock is the authority, this pid only names it.
+holder() {
+  h_=$(cat "$LOCK" 2>/dev/null)
+  case $h_ in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$h_" 2>/dev/null || return 1
+  case "$(tr '\0' ' ' 2>/dev/null <"$PROC/$h_/cmdline")" in *steam*) echo "$h_" ;; *) return 1 ;; esac
+}
+# BusyBox's hand-over leaves one group (chpst.c: setgroups(1, gid)); the kernel's answer is what counts, on any way in. Sets why.
+user_ok() {
+  GRP=$(id -G 2>/dev/null)
+  for g in $GRP; do
+    [ "$g" != 0 ] || { why="user: uid $UID_NOW still has group 0 ($GRP): Steam must not run with root's group"; return 1; }
+  done
+}
+
+mounted_rw() { awk -v m="$1" '$2 == m { split($4, o, ","); if (o[1] == "rw") { print $3; found = 1 } } END { exit !found }' "$MOUNTS" 2>/dev/null | tail -n 1; }
+# /data may still be coming (the kernel mounts it in the background after boot), as the other launchers wait for it.
+data_wait() {
+  fs=$(mounted_rw "$DATA")
+  [ -z "$fs" ] || [ "$fs" = vfat ] || return 0
+  n=0
+  while :; do
+    st=$(head -n 1 "$STATE" 2>/dev/null)
+    case $st in
+      waiting*) max=${SB_DATA_WAIT:-260} ;;
+      '') [ -d "${STATE%/*}" ] || return 0; max=10 ;;
+      *) return 0 ;;
+    esac
+    [ $n -lt "$max" ] || return 0
+    [ $n != 0 ] || say "data: waiting for the data volume (${st:-no state yet})"
+    n=$((n + 1))
+    sleep 0.5
+  done
+}
+# Steam's home must be uid 1000's own folder on a real file system. Sets why.
+data_ok() {
+  fs=$(mounted_rw "$DATA")
+  [ -n "$fs" ] || { why="data: no data volume mounted writable at $DATA ($(head -n 1 "$STATE" 2>/dev/null)): Steam needs one"; return 1; }
+  [ "$fs" != vfat ] || { why="data: $DATA is vfat: Steam needs links and hard links"; return 1; }
+  [ -d "$HOME_DATA" ] && [ ! -L "$HOME_DATA" ] && [ -w "$HOME_DATA" ] || { why="data: $HOME_DATA is not uid 1000's own writable folder"; return 1; }
+  free=$(df -k "$DATA" 2>/dev/null | awk 'NR > 1 { v = $(NF - 2) } END { print v }')
+  [ -z "$free" ] || [ "$free" -ge "$NEED_KB" ] || [ -e "$STAMP" ] || { why="data: $DATA has $free KiB free, Steam needs about $NEED_KB KiB"; return 1; }
+}
+
+# What Steam runs in. `steam_env PROGRAM ARGS` replaces the calling shell with PROGRAM in it (`--env`: env). No Wayland
+# variables: the client is X11 only. PRESSURE_VESSEL_ARCHITECTURES: V2 runs no 32-bit programs yet, so pressure-vessel does not
+# look for a 32-bit graphics stack. PROTON_USE_WOW64: for the same reason every Proton game takes Proton's 64-bit-only Wine
+# (files/bin-wow64); the classic files/bin/wine is i386 and Wine starts it for any 32-bit Windows program, also in a 64-bit game's
+# prefix (plan/notes/gm-PROTON.md). Games get it from Steam's environment; native games ignore it. The session bus is the
+# launcher's own (start_bus): Valve's container tools will not run without one. No system bus.
+steam_env() {
+  exec env -i PATH="$T/bin:/bin:/sbin:/usr/bin" HOME="$H" USER="$NAME" LOGNAME="$NAME" LANG=C.UTF-8 ${TZ:+TZ=$TZ} \
+    XDG_RUNTIME_DIR="$XDG" XDG_SESSION_TYPE=x11 DISPLAY=:0 \
+    PRESSURE_VESSEL_GRAPHICS_PROVIDER="$BITS/gfx" PRESSURE_VESSEL_ARCHITECTURES=x86_64-linux-gnu PROTON_USE_WOW64=1 \
+    ${STEAM_SILENT:+SDL_AUDIODRIVER=dummy} ${STEAM_SILENT:+ALSA_CONFIG_PATH="$BITS/asound.conf"} \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG:-$USER_RUN}/bus" DBUS_SYSTEM_BUS_ADDRESS=disabled: STEAM_RUNTIME_LOGGER=0 \
+    ${SB_VERBOSE:+PRESSURE_VESSEL_VERBOSE=1} ${SB_VERBOSE:+STEAM_LINUX_RUNTIME_VERBOSE=1} ${SB_VERBOSE:+STEAM_BOOTSTRAP_LOG_VERBOSE=1} ${SB_VERBOSE:+LIBGL_DEBUG=verbose} \
+    "$@"
+}
+
+# A changed tree (new VERSION.txt) is seeded again; what Steam itself updated meanwhile is not overwritten.
+install_client() {
+  v=$(cat "$T/VERSION.txt")
+  if [ -e "$STAMP" ] && [ "$(cat "$STAMP")" = "$v" ]; then
+    stage install "already, $(sed -n 's/^client //p' "$STAMP" | cut -d' ' -f1,2)"
+    return 0
+  fi
+  stage install "seeding $STEAMROOT from $T"
+  mkdir -p "$STEAMROOT/package" "$STEAMROOT/steamrt64" "$BITS" "$H/.steam" || fail install "cannot make $STEAMROOT"
+  # As Valve's own bin_steam.sh does it: the bootstrap, then ~/.steam/steam and ~/.steam/root.
+  [ -e "$STEAMROOT/steam.sh" ] || tar -xJf "$T/bootstraplinux_ubuntu12_32.tar.xz" -C "$STEAMROOT" >>"$LOG" 2>&1 \
+    || fail install "the bootstrap does not unpack into $STEAMROOT"
+  ln -fns "$STEAMROOT" "$H/.steam/steam" && ln -fns "$STEAMROOT" "$H/.steam/root" || fail install "cannot make the links in $H/.steam"
+  for f in "$T"/package/*; do
+    n=${f##*/}
+    [ ! -e "$STEAMROOT/package/$n" ] || continue
+    { cp "$f" "$STEAMROOT/package/$n.part" && mv "$STEAMROOT/package/$n.part" "$STEAMROOT/package/$n"; } || fail install "cannot copy $n (disk full?)"
+  done
+  # What steam.sh looks for before it runs the 64-bit client.
+  echo "$CHANNEL" >"$STEAMROOT/package/beta" && : >"$STEAMROOT/.steam-enable-steamrt64-client" || fail install "cannot opt in to the beta"
+  if [ ! -x "$STEAMROOT/steamrt64/steam" ]; then
+    set -- "$T"/package/steam_steamrt_ubuntu12.zip.*
+    unzip -o -q "$1" steamrt64/steam -d "$STEAMROOT" >>"$LOG" 2>&1 && chmod 755 "$STEAMROOT/steamrt64/steam" \
+      || fail install "$1 does not give steamrt64/steam"
+  fi
+  echo "$v" >"$STAMP"
+}
+install_provider() {
+  sum=$(sed -n 's/^gfx [^ ]* //p' "$T/VERSION.txt")
+  if [ -e "$BITS/gfx/.bitsos-version" ] && [ "$(cat "$BITS/gfx/.bitsos-version")" = "$sum" ]; then
+    stage provider already
+  else
+    stage provider "unpacking $T/gfx.tar.gz"
+    rm -rf "$BITS/gfx.new" "$BITS/gfx"
+    mkdir -p "$BITS/gfx.new" && tar -xzf "$T/gfx.tar.gz" -C "$BITS/gfx.new" >>"$LOG" 2>&1 && [ -e "$BITS/gfx.new/gfx/usr/lib/libc.so.6" ] \
+      || fail provider "gfx.tar.gz does not unpack into $BITS (disk full?)"
+    mv "$BITS/gfx.new/gfx" "$BITS/gfx" && rmdir "$BITS/gfx.new" && echo "$sum" >"$BITS/gfx/.bitsos-version" || fail provider "cannot move the provider into place"
+  fi
+  printf 'pcm.!default { type null }\n' >"$BITS/asound.conf" || fail provider "cannot write $BITS/asound.conf"
+}
+# The session bus: a dbus-daemon for this start, its socket where pressure-vessel looks ($XDG/bus), gone with the launcher. A daemon
+# left by a launcher that was killed goes first. Mesa's glibc, as Xwayland's run has it.
+BUS_PID=
+start_bus() {
+  D=$T/dbus
+  M=${SB_MESA:-$(dirname "$T")/mesa}
+  [ -f "$D/dbus-daemon" ] && [ -f "$M/lib/ld-linux-x86-64.so.2" ] || fail bus "no $D/dbus-daemon or no Mesa tree next to it"
+  [ ! -f "$RUN/bus.pid" ] || kill "$(cat "$RUN/bus.pid")" 2>/dev/null
+  rm -f "$XDG/bus"
+  "$M/lib/ld-linux-x86-64.so.2" --inhibit-cache --library-path "$D:$M/lib" --argv0 dbus-daemon "$D/dbus-daemon" --nofork --nosyslog \
+    --config-file="$D/session.conf" --address="unix:path=$XDG/bus" 9>&- >>"$LOG" 2>&1 </dev/null &
+  BUS_PID=$!
+  echo $BUS_PID >"$RUN/bus.pid"
+  n=0
+  while [ ! -S "$XDG/bus" ]; do
+    kill -0 $BUS_PID 2>/dev/null || fail bus "dbus-daemon ended at once (the log has why)"
+    n=$((n + 1))
+    [ $n -lt 50 ] || fail bus "dbus-daemon made no socket in 5 s"
+    sleep 0.1
+  done
+  stage bus "$XDG/bus, pid $BUS_PID"
+}
+stop_bus() {
+  [ -z "$BUS_PID" ] || kill $BUS_PID 2>/dev/null
+  rm -f "$RUN/bus.pid" "$XDG/bus"
+}
+
+# Which reaper Steam's tree holds. Sets REAPER_IS. Reads only.
+reaper_is() {
+  if [ ! -e "$REAPER" ]; then REAPER_IS="none yet"
+  elif cmp -s "$REAPER_SRC" "$REAPER"; then REAPER_IS=stand-in
+  # Byte 4 of an ELF header: 1 is 32-bit.
+  elif [ "$(od -An -tu1 -j4 -N1 "$REAPER" 2>/dev/null | tr -d ' ')" = 1 ]; then REAPER_IS="original (i386)"
+  else REAPER_IS="another file"
+  fi
+}
+# A real file, not a link: Steam's own restore must find something it can simply replace. Written beside it and moved, so that a
+# full disk leaves what was there.
+put_reaper() {
+  reaper_is
+  if [ "$REAPER_IS" = stand-in ]; then
+    stage reaper "stand-in, already"
+    return 0
+  fi
+  [ -f "$REAPER_SRC" ] || fail reaper "the stand-in $REAPER_SRC is missing: no game could start (image without user/ports/steam/reaper?)"
+  if mkdir -p "${REAPER%/*}" && cp "$REAPER_SRC" "$REAPER.part" && chmod 755 "$REAPER.part" && mv -f "$REAPER.part" "$REAPER"; then
+    stage reaper "stand-in, over: $REAPER_IS"
+  else
+    rm -f "$REAPER.part"
+    fail reaper "cannot put the stand-in at $REAPER (disk full?); there is still: $REAPER_IS"
+  fi
+}
+
+# The Proton versions in Steam's own library and whether each has the 64-bit-only Wine V2 needs. Reads only; never red: Steam
+# installs Proton with the first Windows game.
+proton_lines() {
+  found=
+  for d in "$STEAMROOT"/steamapps/common/Proton*/; do
+    [ -f "${d}proton" ] || continue
+    found=1
+    n=${d%/}
+    n=${n##*/}
+    if [ -f "${d}files/bin-wow64/wine" ]; then say "proton: $n: files/bin-wow64/wine there (WoW64, runs on V2)"
+    else say "proton: $n: no files/bin-wow64/wine: its classic Wine is 32-bit, no game starts through it on V2"; fi
+  done
+  [ -n "$found" ] || say "proton: none in $STEAMROOT/steamapps/common yet (Steam installs it with the first Windows game)"
+}
+
+case "$1" in
+  -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --check)
+    rc=0
+    if tree_ok; then say "tree $T: ok, $(sed -n 's/^client //p' "$T/VERSION.txt")"; else say "$why"; rc=1; fi
+    if bash_ok; then say "bash: $BASH_BIN"; else say "$why"; rc=1; fi
+    if find_desk; then
+      say "desktop: $XDG"
+      if xwayland_ok; then say "$XW"; else say "$why"; rc=1; fi
+    else say "$why"; rc=1; fi
+    if user_ok; then say "user: runs as uid $UID_NOW, groups $GRP"; else say "$why"; rc=1; fi
+    steam_left
+    if h=$(holder); then say "running: launcher $h, $(tail -n 1 "$STAGES" 2>/dev/null)"
+    elif [ -n "$left" ]; then say "still running without a launcher: $left (steam --stop ends them)"; rc=1; fi
+    if data_ok; then say "data: $H on $fs, $free KiB free"; else say "$why"; rc=1; fi
+    if [ -e "$STAMP" ]; then say "installed: $(sed -n 's/^client //p' "$STAMP")"; else say "installed: not yet (the first start seeds it)"; fi
+    reaper_is
+    if [ ! -f "$REAPER_SRC" ]; then say "reaper: the stand-in $REAPER_SRC is missing: no game could start (image without user/ports/steam/reaper?)"; rc=1
+    elif [ "$REAPER_IS" = stand-in ]; then say "reaper: stand-in at $REAPER"
+    else say "reaper: $REAPER_IS at $REAPER: no game can start through it until the next steam start puts the stand-in there"; fi
+    proton_lines
+    exit $rc ;;
+  --env)
+    find_desk || XDG=$USER_RUN
+    steam_env env ;;
+  --status)
+    say "launcher: $(holder || echo none)"
+    say "last stage: $(tail -n 1 "$STAGES" 2>/dev/null)"
+    for n in $STEAM_PROGRAMS; do
+      say "process $n: $(procs "$n")"
+    done
+    if find_desk; then
+      say "$(XDG_RUNTIME_DIR="$XDG" bitscomp ctl xwayland 2>&1)"
+      XDG_RUNTIME_DIR="$XDG" bitscomp ctl list 2>&1 | grep 'x11=' | sed 's/^/window: /'
+    else say "$why"; fi
+    say "log: $LOG"
+    say "steam logs: $STEAMROOT/logs"
+    exit 0 ;;
+  --stop)
+    find_desk || XDG=$USER_RUN
+    h=$(holder)
+    if [ -n "$(procs steam)" ] && [ -x "$STEAMROOT/steamrt64/steam" ]; then
+      (steam_env "$STEAMROOT/steamrt64/steam" -shutdown) >>"$LOG" 2>&1 &
+    elif [ -n "$h" ]; then
+      # Still before Steam (unpacking): nobody to ask, so the launcher itself ends.
+      kill -TERM "$h" 2>/dev/null
+    fi
+    drain 60 || { say "still there: $left"; exit 1; }
+    n=0
+    while h=$(holder); do
+      n=$((n + 1))
+      [ $n -le 30 ] || { say "the launcher $h still runs"; exit 1; }
+      sleep 0.5
+    done
+    say "stopped"
+    exit 0 ;;
+esac
+
+mkdir -p "$RUN" || { say "cannot make $RUN"; exit 1; }
+# Fd 9 stays open for the launcher's life; Steam itself does not get it (a stray helper must not hold the lock). Append: this
+# open must not wipe the pid of the launcher that holds it.
+exec 9>>"$LOCK" || { say "cannot open $LOCK"; exit 1; }
+err=$(flock -n 9 2>&1) || {
+  [ -z "$err" ] || { say "cannot take $LOCK: $err"; exit 1; }
+  say "already running (launcher $(cat "$LOCK" 2>/dev/null), $(tail -n 1 "$STAGES" 2>/dev/null)): nothing changed. steam --status shows it, steam --stop ends it."
+  exit 1
+}
+steam_left
+[ -z "$left" ] || { say "still running without a launcher: $left: nothing changed. steam --stop ends them."; exit 1; }
+echo $$ >"$LOCK"
+: >"$STAGES"
+stage start "uid $UID_NOW, $(sed -n 's/^client //p' "$T/VERSION.txt" 2>/dev/null)"
+tree_ok || fail tree "$why"
+bash_ok || fail bash "$why"
+user_ok || fail user "$why"
+find_desk || fail desktop "$why"
+xwayland_ok || fail xwayland "$why"
+stage xwayland "$XW"
+data_wait
+data_ok || fail data "$why"
+stage data "$H on $fs, $free KiB free"
+install_client
+install_provider
+start_bus
+[ "$(pwd)" != / ] || cd "$H" 2>/dev/null || :
+stage steam "bash steam.sh $FLAGS $*"
+CHILD= sig=
+trap 'sig=1; [ -z "$CHILD" ] || kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+cd "$STEAMROOT" || fail steam "cannot enter $STEAMROOT"
+# shellcheck disable=SC2086
+(steam_env "$BASH_BIN" "$STEAMROOT/steam.sh" $FLAGS "$@") 9>&- >>"$LOG" 2>&1 &
+CHILD=$!
+# Steam's file check at its start compares sizes: a stand-in there means a repair and a new start, again and again. So the stand-in
+# comes only once the check is over (the web helper runs), and returns whenever an update has put Valve's back.
+(while kill -0 $CHILD 2>/dev/null; do
+  sleep "${SB_REAPER_WAIT:-5}"
+  [ -n "$(procs steamwebhelper)" ] || continue
+  reaper_is
+  [ "$REAPER_IS" = stand-in ] || put_reaper
+done) 9>&- >/dev/null 2>&1 &
+KEEP=$!
+[ -z "$sig" ] || kill -TERM $CHILD 2>/dev/null
+wait $CHILD
+rc=$?
+# A trapped signal ends `wait` at once, not the child: wait on (bounded by a KILL), so that `ended` means it has ended and the code
+# is its own. kill -0 is true for a zombie too, and the next wait collects that one.
+W=
+if [ -n "$sig" ] && kill -0 $CHILD 2>/dev/null; then
+  (sleep 20; kill -KILL $CHILD) 9>&- >/dev/null 2>&1 &
+  W=$!
+fi
+while [ $rc != 127 ] && kill -0 $CHILD 2>/dev/null; do
+  wait $CHILD
+  rc=$?
+done
+[ -z "$W" ] || kill $W 2>/dev/null
+# steam.sh dies of the TERM at once, its client does not: what is left goes too, so a new start finds no half-dead Steam.
+if [ -n "$sig" ]; then
+  drain 1 || stage leftover "still running: $left"
+fi
+trap - INT TERM HUP
+kill $KEEP 2>/dev/null
+stop_bus
+stage ended "code $rc"
+exit $rc

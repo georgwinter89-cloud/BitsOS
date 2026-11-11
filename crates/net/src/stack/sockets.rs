@@ -169,6 +169,7 @@ impl Stack {
             reserve,
             owner,
             prog,
+            settling: core::sync::atomic::AtomicBool::new(true),
         });
         {
             let mut l = st.listeners.lock();
@@ -206,6 +207,7 @@ impl Stack {
                 st.top_up_kept(false);
             }
         }
+        shared.settling.store(false, core::sync::atomic::Ordering::Release);
         st.kick();
         let k = st.kept_info();
         klog::event!(Info, "net", "tcp.listen", ip = ip_str(addr.ip), port = addr.port, backlog = backlog, private_only = private_only,

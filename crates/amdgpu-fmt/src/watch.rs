@@ -7,8 +7,8 @@
 //! answers garbage (all ones after a dead link) cannot postpone the verdict, and both kinds of progress are bounded
 //! by what was submitted. The pointer is known only modulo the ring, so with more than half the ring in flight a read
 //! from behind can look like a big step ahead: such a step counts only when the next sample agrees. A poll (`Stop::Wait`) gets no special case: on the chip a CP waiting forever and a CP
-//! stalled at a fault look the same, the timeout decides for both. `Stop::Hang`, which only the fakes can report,
-//! is a verdict at once.
+//! stalled at a fault look the same, the timeout decides for both. `Stop::Hang` is a verdict at once: the fakes
+//! report it for a bad packet, the hardware backend for the chip's CPC stop at a VM fault (`poll_report`).
 
 use alloc::collections::VecDeque;
 use alloc::string::String;

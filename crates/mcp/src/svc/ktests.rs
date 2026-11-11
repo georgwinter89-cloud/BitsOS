@@ -148,7 +148,8 @@ fn register_call() -> TestResult {
     with_services(25150, TOOLS.entries(), |_| {}, |c, s: &Services| {
         let f = fake(&s.path, alloc::vec![register(1, "ktfake", &[tool("kt_echo", "read"), tool("kt_wipe", "delete_overwrite")])], Mode::Echo)?;
         until("registered", 5, || s.reg.tool_count() == 2)?;
-        kassert!(f.saw(r#""registered":["kt_echo","kt_wipe"]"#), "register answer: {:?}", f.seen());
+        // The count moves before the fake service has read its answer: wait for that too.
+        until("register answer", 5, || f.saw(r#""registered":["kt_echo","kt_wipe"]"#)).map_err(|e| format!("{e}: {:?}", f.seen()))?;
         let list = listed(c)?;
         let n = names(&list);
         let mut sorted = n.clone();

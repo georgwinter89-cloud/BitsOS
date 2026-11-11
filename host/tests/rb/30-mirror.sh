@@ -8,9 +8,7 @@
 #           second start and the line after it, no loss marker;
 #   boot 2: a forced panic after the boot went out: its line can only come through the panic path
 #           (try_event! + NetDevice::poll_tx). Needs the desk's panic-handler lines and an allocation-free
-#           console emergency write (plan/notes/rb-RB-4.md, change requests 1 and 2). Without them that part is
-#           SKIPPED and the result line says so ("GREEN (panic part SKIPPED)"), so RB-4 is not counted as
-#           fully proven; BITSOS_RB_MIRROR_PANIC=required turns the skip into RED (desk integration).
+#           console emergency write (plan/notes/rb-RB-4.md, change requests 1 and 2). Without them: RED.
 # Ports: the listener on LO+300 (never 6666, the real listener's).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
@@ -79,13 +77,12 @@ if [ "$PANIC_CR" = no ] && [ "${BITSOS_RB_MIRROR_PANIC:-}" = required ]; then
     echo "RED: BITSOS_RB_MIRROR_PANIC=required but kernel/src/main.rs's panic handler does not call klog::flush_emergency() (change request 1)"
     exit 1
 fi
-PANIC_SKIPPED=""
 
 for NET in user igb; do
     echo "== $NET =="
     LOG="$RUN_DIR/$NET-ktest.serial"
     OUT="$RUN_DIR/$NET-ktest.console.log"
-    cargo xtask image --name rb-mirror --ktest --config-extra "ktest=rb.mirror;mirror=10.0.2.2:$PORT" | tail -1
+    cargo xtask image --name rb-mirror --ktest --config-extra "ktest=rb.mirror,-rb.mirror.forced_panic;mirror=10.0.2.2:$PORT" | tail -1
     listen "$OUT"
     boot rb-mirror "$NET" "$LOG" || { echo "RED: ktests failed ($NET)"; grep -a KTEST "$LOG"; exit 1; }
     stop_listen
@@ -112,9 +109,8 @@ for NET in user igb; do
     echo "listener: $lines log lines; ring.early at $early, kernel start at $start, dhcp.lease at $lease, mirror.live at $live"
 
     if [ "$PANIC_CR" = no ]; then
-        echo "SKIPPED (panic part, $NET): kernel/src/main.rs does not call klog::flush_emergency() in the panic handler yet (change requests 1 and 2)"
-        PANIC_SKIPPED="$PANIC_SKIPPED $NET"
-        continue
+        echo "RED (panic part, $NET): kernel/src/main.rs does not call klog::flush_emergency() in the panic handler"
+        exit 1
     fi
     LOG="$RUN_DIR/$NET-panic.serial"
     OUT="$RUN_DIR/$NET-panic.console.log"
@@ -128,8 +124,6 @@ for NET in user igb; do
     grep -q "rb.mirror forced panic marker=" "$OUT" || { echo "RED: the panic line did not reach the listener ($NET)"; tail -20 "$OUT"; exit 1; }
     grep "rb.mirror forced panic" "$OUT"
 done
-if [ -n "$PANIC_SKIPPED" ]; then
-    echo "GREEN (panic part SKIPPED:$PANIC_SKIPPED; RB-4 not fully proven until change requests 1 and 2 are in): console mirror (virtio-net and igb) with the unchanged console-listen.mjs"
-else
-    echo "GREEN: console mirror (virtio-net and igb, forced panic through poll_tx included) with the unchanged console-listen.mjs"
-fi
+# TS-1: the panic ends the boot, so the test prints no `KTEST ok`: the ledger reads it here.
+echo "KTEST ok rb.mirror.forced_panic (checked by this script)" >> "$RUN_DIR/ledger.txt"
+echo "GREEN: console mirror (virtio-net and igb, forced panic through poll_tx included) with the unchanged console-listen.mjs"

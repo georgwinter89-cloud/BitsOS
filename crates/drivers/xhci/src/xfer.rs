@@ -5,7 +5,7 @@
 //! matched by TRB address; older ones are counted as stray.
 
 use crate::ctx::ep_state;
-use crate::hc::{Controller, Env, Source, State, FALLBACK_NS, MS};
+use crate::hc::{Controller, Env, Source, State, FALLBACK_NS, LATE_LOOK_NS, MS};
 use crate::mem::DmaMem;
 use crate::queue::{Owner, Td, TdState};
 use crate::ring::ProducerRing;
@@ -78,12 +78,14 @@ pub(crate) struct EpRing<M: DmaMem> {
     pub(crate) next_seq: u64,
     /// An isochronous endpoint's request bookkeeping (`isoch.rs`).
     pub(crate) iso: Option<IsoEp>,
+    /// Transfer events seen for this endpoint (`Host::look_endpoint`).
+    pub(crate) events: u64,
 }
 
 impl<M: DmaMem> EpRing<M> {
     fn new(ring: ProducerRing<M>, ep: Option<Endpoint>) -> Self {
         let iso = ep.filter(|d| d.kind() == EpKind::Isoch).map(|_| IsoEp::default());
-        EpRing { ring, ep, pipe: None, tds: VecDeque::new(), busy: false, halted: false, next_seq: 0, iso }
+        EpRing { ring, ep, pipe: None, tds: VecDeque::new(), busy: false, halted: false, next_seq: 0, iso, events: 0 }
     }
     /// Appends a TD pushed onto the ring (in ring order) with the next sequence number.
     pub(crate) fn queue(&mut self, mut td: Td) {
@@ -255,6 +257,23 @@ impl<M: DmaMem> Xfer<M> {
     pub(crate) fn set_endpoint(&mut self, ep: Endpoint, ring: ProducerRing<M>) {
         self.eps[ep.dci() as usize] = Some(EpRing::new(ring, Some(ep)));
     }
+    /// Reset Device did its work: the controller runs no endpoint but 0 any more and forgot where they stood, so
+    /// their transfers end with `why`, their buffers are free and their rings go; endpoint 0's ring starts over
+    /// (the next Address Device names its enqueue pointer).
+    pub(crate) fn forget_endpoints(&mut self, why: UsbError, out: &mut Vec<Deferred>) {
+        self.ctl = None;
+        for e in self.eps.iter_mut().skip(2) {
+            if let Some(mut r) = e.take() {
+                r.end_all(why, out);
+                for t in &r.tds {
+                    t.set_stuck(false);
+                }
+            }
+        }
+        if let Some(r) = self.ring(1) {
+            r.skipped();
+        }
+    }
     /// The device is gone (or the controller forgot it): every transfer ends with `why`, pipes stop. The TDs stay
     /// (their buffers alive) until the slot entry itself goes after Disable Slot.
     pub(crate) fn stop_all(&mut self, why: UsbError, out: &mut Vec<Deferred>) {
@@ -418,7 +437,11 @@ impl<E: Env> Controller<E> {
         }
         CONTROL_TRANSFERS.inc();
         self.ring_doorbell(e.id, 1);
-        self.wait_slot(&e, CONTROL_NS, |x| x.ctl.as_ref().is_some_and(|t| t.done.is_some()));
+        // The clock alone does not decide (US-R): after the CPUs stood still, its answer gets a moment to arrive.
+        let answered = |x: &Xfer<E::Mem>| x.ctl.as_ref().is_some_and(|t| t.done.is_some());
+        if !self.wait_slot(&e, CONTROL_NS, answered) {
+            self.wait_slot(&e, LATE_LOOK_NS, answered);
+        }
         let td = {
             let mut x = e.xfer.lock();
             let td = x.ctl.take();

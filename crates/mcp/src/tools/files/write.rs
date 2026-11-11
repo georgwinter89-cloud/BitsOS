@@ -11,10 +11,9 @@ use uapi::errno::*;
 use vfs::abi::{O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_WRONLY};
 use vfs::{Ctx, MountNs};
 
-/// Keys only Georg's own edit may add or change (R8a `nvme_write`, `stick_write`, `usb_msd_write` (FS-6, US-4);
-/// MC-10: `mcp`, `mcp_confirmer`). fs-fat's guard has the last word (`fs_fat::protect::config_guard`, which also
-/// keeps `mcp` from being dropped).
-const GUARDED_KEYS: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+/// Keys only Georg's own edit may add or change: fs-fat's list, so the two can never disagree. fs-fat's guard has
+/// the last word (`fs_fat::protect::config_guard`, which also keeps `mcp` from being dropped).
+use fs_fat::protect::GUARDED_KEYS;
 
 /// How a write changes a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,15 +62,17 @@ fn guarded_lines(text: &[u8]) -> Vec<(String, String)> {
     v
 }
 
-/// R8a: a write may leave the `nvme_write=`/`stick_write=`/`usb_msd_write=` lines of a CONFIG.TXT exactly as they
+/// R8a: a write may leave the `nvme_write=`/`nvme_data=`/`stick_write=`/`usb_msd_write=` lines of a CONFIG.TXT exactly as they
 /// are, or drop them, but never add or change one (only Georg's own edit turns them on). Err names the line.
 pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
     let before = guarded_lines(old);
     for line in guarded_lines(new) {
         if !before.contains(&line) {
             return Err(format!(
-                "CONFIG.TXT: the line {}={} would be added or changed; nvme_write, stick_write, usb_msd_write, mcp and mcp_confirmer are set only by Georg himself (R8a)",
-                line.0, line.1
+                "CONFIG.TXT: the line {}={} would be added or changed; {} are set only by Georg himself (R8a)",
+                line.0,
+                line.1,
+                GUARDED_KEYS.join(", ")
             ));
         }
     }

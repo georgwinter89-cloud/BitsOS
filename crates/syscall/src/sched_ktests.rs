@@ -440,7 +440,7 @@ fn diff(got: &str, want: &str, known: &str) -> Vec<String> {
 ktest!("sc.sched.abi", Safe, abi);
 fn abi() -> TestResult {
     if !have("/bin/abi-sched") {
-        return ktest::skip("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let (p, out) = run("/bin/abi-sched", &["abi-sched"])?;
     let code = finish(&p, &out, 60 * SEC)?;
@@ -455,14 +455,14 @@ fn abi() -> TestResult {
 ktest!("sc.sched.child", Safe, child);
 fn child() -> TestResult {
     if !have("/bin/abi-sched") {
-        return ktest::skip("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let (p, out) = run("/bin/abi-sched", &["abi-sched", "child"])?;
     let code = finish(&p, &out, 60 * SEC)?;
     let got = text(&out);
     if let Some(l) = got.lines().find(|l| l.starts_with("fork = -") || l.starts_with("pipe = -")) {
         klog::event!(Info, "sc", "sched.child.missing", line = l);
-        return ktest::skip("no pipe or fork yet (FS pipes, AB-4 fork); then copy_attrs at fork (SC-6 CR 2)");
+        return ktest::fail("no pipe or fork yet (FS pipes, AB-4 fork); then copy_attrs at fork (SC-6 CR 2)");
     }
     let d = diff(&got, include_str!("../../../user/abi-tests/expected/sched-child.txt"), "");
     kassert!(d.is_empty() && code == 0, "abi-sched child differs from CachyOS (exit {code}):\n{}", d.join("\n"));
@@ -474,7 +474,7 @@ fn child() -> TestResult {
 ktest!("sc.sched.burn", Safe, burn);
 fn burn() -> TestResult {
     if !have("/bin/abi-sched") {
-        return ktest::skip("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let (p, out) = run("/bin/abi-sched", &["abi-sched", "burn"])?;
     // Watch the thread while it runs: the largest user/system parts seen.
@@ -491,7 +491,7 @@ fn burn() -> TestResult {
     let got = text(&out);
     klog::event!(Info, "sc", "sched.burn", user_ms = user / 1_000_000, system_ms = system / 1_000_000, code = code, marked = sched::cputime::user_marked());
     if !sched::cputime::user_marked() {
-        return ktest::skip("proc does not mark user mode yet (SC-6 change request 1: user_enter/user_exit around execute)");
+        return ktest::fail("proc does not mark user mode yet (SC-6 change request 1: user_enter/user_exit around execute)");
     }
     let d = diff(&got, include_str!("../../../user/abi-tests/expected/sched-burn.txt"), "");
     kassert!(d.is_empty() && code == 0, "abi-sched burn differs from CachyOS (exit {code}):\n{}", d.join("\n"));
@@ -504,7 +504,7 @@ fn burn() -> TestResult {
 ktest!("sc.sched.children_times", Safe, children_times);
 fn children_times() -> TestResult {
     if !have("/bin/abi-sched") {
-        return ktest::skip("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
+        return ktest::fail("/bin/abi-sched is not in this image (the ABI-diff programs need UL-1's musl sysroot)");
     }
     let mut t = T::new("sc6-parent", 1000)?;
     let out = proc::stdio::Capture::new(1 << 16);
@@ -531,7 +531,7 @@ fn children_times() -> TestResult {
     };
     expect("wait4 collects the child", got, child.pid as i64)?;
     if !sched::cputime::user_marked() {
-        return ktest::skip("proc does not keep CPU times of ended threads and children yet (SC-6 change request 1)");
+        return ktest::fail("proc does not keep CPU times of ended threads and children yet (SC-6 change request 1)");
     }
     let tv = |t: &T, at: u64| t.u64_at(at) * SEC + t.u64_at(at + 8) * 1000;
     let (u, s) = (tv(&t, 64), tv(&t, 80));

@@ -65,7 +65,7 @@ impl BadFree {
 }
 
 /// Number of counters `flush` tracks (one `seen` slot each).
-const SEEN: usize = 10;
+const SEEN: usize = 12;
 
 /// Counts and the last detail of each kind of trouble; one per allocator instance.
 #[derive(Default)]
@@ -94,13 +94,20 @@ pub struct Reports {
     /// Heap allocations that got null (ENOMEM to the asker) after the caches gave back what they held.
     pub heap_alloc_fails: AtomicU64,
     heap_fail_size: AtomicU64,
+    /// The return addresses above the last refused heap request, innermost first (`callers`).
+    heap_fail_callers: [AtomicU64; CALLERS],
     /// Heap objects found handed out twice (a bug elsewhere); kept out of use.
     pub heap_corrupt: AtomicU64,
     heap_corrupt_last: AtomicU64,
     /// Times an allocation emptied the magazines and returned empty slabs before retrying.
     pub heap_reclaims: AtomicU64,
+    /// W35 MM-1: blocks taken out of another migrate type's pageblock, which kept its type.
+    pub steals: AtomicU64,
+    /// W35 MM-1: pageblocks of another migrate type taken over whole.
+    pub whole_blocks: AtomicU64,
     seen: [AtomicU64; SEEN],
     fallback_told: AtomicBool,
+    mixing_told: AtomicBool,
 }
 
 impl Reports {
@@ -123,11 +130,15 @@ impl Reports {
             corrupt_last: AtomicU64::new(0),
             heap_alloc_fails: AtomicU64::new(0),
             heap_fail_size: AtomicU64::new(0),
+            heap_fail_callers: [const { AtomicU64::new(0) }; CALLERS],
             heap_corrupt: AtomicU64::new(0),
             heap_corrupt_last: AtomicU64::new(0),
             heap_reclaims: AtomicU64::new(0),
+            steals: AtomicU64::new(0),
+            whole_blocks: AtomicU64::new(0),
             seen: [const { AtomicU64::new(0) }; SEEN],
             fallback_told: AtomicBool::new(false),
+            mixing_told: AtomicBool::new(false),
         }
     }
 
@@ -150,6 +161,19 @@ impl Reports {
         self.fallbacks.fetch_add(1, Relaxed);
         if self.global {
             DMA32_FALLBACKS.inc();
+        }
+    }
+    /// Under the zone lock (the fallback path only, never a per-CPU hit).
+    pub fn steal(&self) {
+        self.steals.fetch_add(1, Relaxed);
+        if self.global {
+            crate::buddy::count_steal();
+        }
+    }
+    pub fn whole_block(&self) {
+        self.whole_blocks.fetch_add(1, Relaxed);
+        if self.global {
+            crate::buddy::count_whole_block();
         }
     }
     pub fn drain(&self) {
@@ -183,6 +207,9 @@ impl Reports {
 
     pub fn heap_alloc_fail(&self, size: usize) {
         self.heap_fail_size.store(size as u64, Relaxed);
+        for (slot, ret) in self.heap_fail_callers.iter().zip(callers()) {
+            slot.store(ret, Relaxed);
+        }
         self.heap_alloc_fails.fetch_add(1, Relaxed);
         if self.global {
             HEAP_ALLOC_FAILS.inc();
@@ -240,6 +267,11 @@ impl Reports {
         if n > 0 && !self.fallback_told.swap(true, Relaxed) {
             klog::event!(Info, "mm", "frames.dma32_fallback", allocator = who, count = n; "NORMAL empty, served from DMA32 (counter mm.frames.dma32_fallback has the rest)");
         }
+        let (steals, claims) = (self.delta(10, self.steals.load(Relaxed)), self.delta(11, self.whole_blocks.load(Relaxed)));
+        if steals > 0 && !self.mixing_told.swap(true, Relaxed) {
+            klog::event!(Info, "mm", "frames.fallback_steal", allocator = who, count = steals, whole_blocks = claims;
+                "a pageblock of one migrate type now also holds frames of another (counters mm.frames.fallback_steal and fallback_whole_block have the rest)");
+        }
         let n = self.delta(3, self.drains.load(Relaxed));
         if n > 0 {
             klog::event!(Info, "mm", "frames.pcp_drain", allocator = who, count = n; "per-CPU lists drained to satisfy an allocation");
@@ -261,7 +293,10 @@ impl Reports {
         }
         let n = self.delta(7, self.heap_alloc_fails.load(Relaxed));
         if n > 0 {
-            klog::event!(Warn, "mm", "heap.alloc_fail", count = n, last_size = self.heap_fail_size.load(Relaxed); "null to the asker after the caches gave back what they held");
+            let c = |i: usize| klog::Hex(self.heap_fail_callers[i].load(Relaxed));
+            klog::event!(Warn, "mm", "heap.alloc_fail", count = n, last_size = self.heap_fail_size.load(Relaxed),
+                c0 = c(0), c1 = c(1), c2 = c(2), c3 = c(3), c4 = c(4), c5 = c(5), c6 = c(6), c7 = c(7), c8 = c(8), c9 = c(9), c10 = c(10), c11 = c(11);
+                "null to the asker after the caches gave back what they held (c0..: return addresses, innermost first)");
         }
         let n = self.delta(8, self.heap_corrupt.load(Relaxed));
         if n > 0 {
@@ -281,4 +316,40 @@ pub static GLOBAL: Reports = Reports::new(true);
 /// Emits the pending events of the boot allocator and the heap (see `Reports::flush`).
 pub fn flush_reports() {
     GLOBAL.flush("frames");
+}
+
+/// How many return addresses a refused heap request keeps.
+const CALLERS: usize = 12;
+
+/// The return addresses above this function, innermost first, as far as the frame records on this thread's stack
+/// lead (the kernel is built with frame pointers). 11.11.2026: the size alone did not say who kept asking for
+/// 4 MiB.
+#[cfg(target_os = "none")]
+#[inline(never)]
+fn callers() -> [u64; CALLERS] {
+    let mut out = [0u64; CALLERS];
+    let st = hal::switch::current_stack();
+    let mut fp: u64;
+    // SAFETY: reads a register, nothing else.
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+    for slot in &mut out {
+        if fp < st.bottom || fp % 8 != 0 || fp.checked_add(16).is_none_or(|end| end > st.top) {
+            break;
+        }
+        // SAFETY: `fp` is 8-aligned and lies inside this thread's mapped kernel stack with 16 bytes below its top:
+        // two readable stack words. In a function with a frame record they are the caller's frame pointer and the
+        // return address; otherwise plain words, which the bounds check of the next round judges.
+        let (next, ret) = unsafe { ((fp as *const u64).read(), ((fp + 8) as *const u64).read()) };
+        *slot = ret;
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    out
+}
+
+#[cfg(not(target_os = "none"))]
+fn callers() -> [u64; CALLERS] {
+    [0; CALLERS]
 }

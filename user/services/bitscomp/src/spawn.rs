@@ -80,6 +80,15 @@ pub fn unblock_all() {
     }
 }
 
+/// B4 (CR of PK-L1a): the calling thread runs in the Background class, for helper threads whose work never holds
+/// a frame (the library's scan and icon decoding). SCHED_IDLE is the Background class in `sched::attr` (SC-6); on
+/// Linux it is the same idle weight. A refusal leaves the thread in bitscomp's own class; the caller reports it.
+pub fn background_class() -> std::io::Result<()> {
+    let p = libc::sched_param { sched_priority: 0 };
+    // SAFETY: `p` is a valid, live sched_param that the call only reads; pid 0 is the calling thread.
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

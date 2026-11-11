@@ -46,6 +46,11 @@ impl FbMem {
     pub fn apertures(&self) -> Vec<Aperture> {
         self.chunks.iter().map(|c| Aperture::Ram(c.clone())).collect()
     }
+    /// WY-17: the physical address of page `pgoff`, for a device importing the buffer.
+    pub fn page_phys(&self, pgoff: u64) -> Option<u64> {
+        let (c, p) = self.locate(pgoff)?;
+        Some(self.chunks[c].phys() + p * PAGE as u64)
+    }
     /// Page `pgoff` of the buffer as (piece, page in it).
     pub fn locate(&self, pgoff: u64) -> Option<(usize, u64)> {
         if pgoff >= self.pages() {

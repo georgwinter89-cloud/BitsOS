@@ -221,15 +221,8 @@ def main():
             dev, _ = wait_events(c, s, [(EV_KEY, code, 1), (EV_KEY, code, 0)], f"{who}: {name} button down and up")
             need(dev == only, f"{who}: the {name} button came from device {only}")
         rel_caps = pointers()[2][only]["rel"].strip("[]").split(",")
-        if str(REL_HWHEEL) in rel_caps:
-            s = seq(c)
-            for b in ["wheel-right", "wheel-left"]:
-                q.events(btn(b, True))
-                q.events(btn(b, False))
-            dev, _ = wait_events(c, s, [(EV_REL, REL_HWHEEL, 1), (EV_REL, REL_HWHEEL, -1)], f"{who}: horizontal wheel right, then left")
-            need(dev == only, f"{who}: the horizontal wheel came from device {only}")
-        else:
-            print(f"skip: {who} has no horizontal wheel in this QEMU (rel {rel_caps})")
+        # 10-input.sh's header: the horizontal wheel's run is hidparse's host test, because QEMU's two pointers have none.
+        need(str(REL_HWHEEL) not in rel_caps, f"{who}: as known, QEMU's device has no horizontal wheel (rel {rel_caps}; if it has one now, check it here again)")
         s = seq(c)
         q.events(btn("wheel-down", True))
         q.events(btn("wheel-down", False))

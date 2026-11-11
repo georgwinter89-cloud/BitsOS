@@ -324,6 +324,57 @@ fn the_first_picture_in_bands_equals_the_whole() {
 }
 
 #[test]
+fn the_mcp_row_gives_a_reason_only_when_there_is_one() {
+    let row = |sub, name, fields: &str| {
+        let mut s = Steps::new();
+        s.feed(&line(300, 'E', sub, name, fields));
+        assert_eq!(s.get(Key::Mcp).state, State::Failed);
+        s.get(Key::Mcp).detail.clone()
+    };
+    assert_eq!(row("kernel", "mcp.not_started", "reason=no_net"), "nicht gestartet (no_net)");
+    assert_eq!(row("mcp", "server.start_failed", "reason=listen port=8765 error=Busy"), "nicht gestartet (listen)");
+    // The kernel's own line says `error=`, not `reason=`.
+    assert_eq!(row("kernel", "mcp.not_started", "error=NoToken"), "nicht gestartet (NoToken)");
+    assert_eq!(row("kernel", "mcp.not_started", "error=\"NoToken\""), "nicht gestartet (NoToken)");
+    // No reason, an empty one, one with nothing printable: no empty parentheses.
+    for fields in ["", "reason=", "reason=\u{1b}\u{7f}", "reason=\"\"", "other=x"] {
+        assert_eq!(row("kernel", "mcp.not_started", fields), "nicht gestartet", "{fields:?}");
+        assert_eq!(row("mcp", "server.start_failed", fields), "nicht gestartet", "{fields:?}");
+    }
+    // klog quotes a value with spaces: it is read whole. A first field with nothing to show does not hide the second.
+    assert_eq!(row("kernel", "mcp.not_started", "error=\"Listen { port: 8765 }\""), "nicht gestartet (Listen { port: 8765 })");
+    assert_eq!(row("kernel", "mcp.not_started", "reason=\"\" error=NoStack"), "nicht gestartet (NoStack)");
+    assert_eq!(row("kernel", "mcp.not_started", "reason=\u{1b} error=\"no stack\""), "nicht gestartet (no stack)");
+}
+
+#[test]
+fn a_hostile_mcp_error_stays_one_printable_line() {
+    let row = |fields: &str| {
+        let mut s = Steps::new();
+        s.feed(&line(300, 'E', "kernel", "mcp.not_started", fields));
+        s.get(Key::Mcp).detail.clone()
+    };
+    let long = "x".repeat(10_000);
+    for fields in [
+        alloc::format!("error={long}"),
+        alloc::format!("error=\"{long} {long}\""),
+        alloc::format!("error=\u{1b}[31m{long}\u{7f}"),
+        alloc::format!("error=\"a\tb\u{0}c\u{1b}[31m\u{7f}\""),
+    ] {
+        let d = row(&fields);
+        assert!(d.starts_with("nicht gestartet (") && d.chars().count() <= 80 && !d.chars().any(char::is_control), "{d:?}");
+    }
+    assert_eq!(row("error=\"a\tb\u{0}c\""), "nicht gestartet (abc)");
+    // Nothing the screen can draw: quotes, an escaped quote, control characters, signs the atlas lacks, no end.
+    for fields in ["error=\"\"", "error=\"\\\"\"", "error=\"", "error=\"\\", "error=\u{1b}\u{7f}", "error=\u{2603}\u{2603}", "error=\u{1b}\""] {
+        assert_eq!(row(fields), "nicht gestartet", "{fields:?}");
+    }
+    // A cut value (no closing quote, a backslash at the end) never panics and shows what is there.
+    assert_eq!(row("error=\"abc\\"), "nicht gestartet (abc\\)");
+    assert_eq!(row("error=\"x\\\u{e4}"), "nicht gestartet (x\\\u{e4})");
+}
+
+#[test]
 fn hostile_details_stay_one_short_printable_line() {
     let long = "x".repeat(10_000);
     let hostile = alloc::format!("a\nb\tc\u{1b}[31md\u{7f}eÄÖÜß€☃\u{0}{long}");
@@ -396,4 +447,32 @@ fn the_rasteriser_is_only_a_build_dependency() {
         }
     }
     assert!(toml.contains("[build-dependencies]\nfontdue"), "the atlases need fontdue at build time");
+}
+
+/// GX-8c: `gpu=on`: the row follows the whole run: GC's boot on the way settles nothing, a failure after it still shows.
+#[test]
+fn gpu_row_follows_the_boots_bring_up() {
+    let row = |lines: &[&str]| {
+        let mut s = Steps::new();
+        for l in lines {
+            s.feed(l);
+        }
+        (s.get(Key::Gpu).state, alloc::format!("{}", s.get(Key::Gpu).detail))
+    };
+    const START: &str = "[    1.000000] I gx boot.start bound_s=30";
+    const BOOTED: &str = "[    2.000000] I gx gfx.booted booted_us=30468 answered_us=30463 polls=1";
+    assert_eq!(row(&[START]), (State::Running, "gpu startet".into()));
+    assert_eq!(row(&[START, BOOTED]), (State::Running, "gpu gestartet".into()));
+    assert_eq!(row(&[START, BOOTED, "[    3.000000] I gx boot.up minor=128 after_ms=2000"]), (State::Done, "gpu bereit, renderD128".into()));
+    let failed = "[    3.000000] E gx boot.failed stage=gfx_mes stop=done after_ms=2000 why=\"mes FAIL\" | the desktop starts without the GPU";
+    assert_eq!(row(&[START, BOOTED, failed]), (State::Failed, "gestoppt bei gfx_mes, ohne gpu".into()));
+    let refused = "[    3.000000] E gx boot.failed stage=refused stop=not_needed after_ms=2000 why=\"firmware\" | the desktop starts without the GPU";
+    assert_eq!(row(&[START, refused]), (State::Failed, "nicht gestartet (refused), ohne gpu".into()));
+    assert_eq!(row(&[START, "[    1.500000] I gx boot.no_chip"]).0, State::Skipped);
+    // Without the boot's bring-up a passed tool run still settles the row, as before.
+    assert_eq!(row(&[BOOTED]), (State::Done, "gpu gestartet".into()));
+    for name in ["boot.start", "boot.no_chip", "boot.up", "boot.failed", "gfx.booted"] {
+        assert!(Steps::watched("gx", name), "{name}: lost below the log level");
+    }
+    assert!(Steps::watched("console", "desktop.held"));
 }

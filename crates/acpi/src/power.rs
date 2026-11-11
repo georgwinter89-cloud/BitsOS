@@ -92,6 +92,15 @@ impl RebootPlan {
     pub fn declared(&self) -> bool {
         self.steps.iter().any(Step::declared)
     }
+
+    /// The same paths with the full reset (0xCF9 <- 0xE, the ports lose their power) first, for a device a warm reset
+    /// may not cure (`block::shutdown::cold_reset_asked`; a stick wedged through a warm reset on 3.11.).
+    pub fn cold_first(mut self) -> Self {
+        let full = Step::Cf9 { code: hal::cpu::reset::CF9_CODE_FULL };
+        self.steps.retain(|s| *s != full);
+        self.steps.insert(0, full);
+        self
+    }
 }
 
 /// What the FADT allows, in the order FADT reset register, 0xCF9, 8042, triple fault (pure; host-tested).
@@ -451,6 +460,16 @@ mod tests {
         assert_eq!(p.steps, alloc::vec![Step::FadtIo { port: 0xB2, value: 0xBE }, HARD, FULL, Step::TripleFault]);
         assert!(p.declared());
         assert!(p.skipped.iter().any(|m| m.contains("keyboard controller")));
+    }
+
+    #[test]
+    fn cold_first_moves_the_full_reset_only() {
+        let p = reboot_plan(Some(&minipc())).cold_first();
+        assert_eq!(p.steps, alloc::vec![FULL, Step::FadtIo { port: 0xB2, value: 0xBE }, HARD, Step::TripleFault]);
+        assert!(p.declared(), "the paths the firmware declares stay");
+        let p = reboot_plan(None).cold_first();
+        assert_eq!(p.steps.first(), Some(&FULL));
+        assert_eq!(p.steps.iter().filter(|s| **s == FULL).count(), 1);
     }
 
     #[test]

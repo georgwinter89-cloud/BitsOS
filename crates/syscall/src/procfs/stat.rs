@@ -50,8 +50,7 @@ fn escape_name(s: &str) -> String {
 }
 
 fn sched_of(th: Option<&Thread>) -> Option<ThreadStat> {
-    let k = th?.kthread();
-    sched::thread_stats().into_iter().find(|s| s.id == k)
+    sched::thread_stat(th?.kthread())
 }
 
 /// `task_state_array`: zombie for an ended group or an ended leader, T in a group stop, S while blocked.
@@ -270,7 +269,7 @@ pub(super) fn render_status(t: &Target, g: &Group, p: &Process, th: Option<&Thre
         let (text, lib) = m.text_lib(&info);
         let _ = write!(
             s,
-            "VmPeak:\t{peak:>8} kB\nVmSize:\t{vm:>8} kB\nVmLck:\t{z:>8} kB\nVmPin:\t{z:>8} kB\nVmHWM:\t{hwm:>8} kB\nVmRSS:\t{rss:>8} kB\n\
+            "VmPeak:\t{peak:>8} kB\nVmSize:\t{vm:>8} kB\nVmLck:\t{lck:>8} kB\nVmPin:\t{z:>8} kB\nVmHWM:\t{hwm:>8} kB\nVmRSS:\t{rss:>8} kB\n\
              RssAnon:\t{anon:>8} kB\nRssFile:\t{file:>8} kB\nRssShmem:\t{shmem:>8} kB\nVmData:\t{data:>8} kB\nVmStk:\t{stk:>8} kB\n\
              VmExe:\t{text:>8} kB\nVmLib:\t{lib:>8} kB\nVmPTE:\t{pte:>8} kB\nVmSwap:\t{z:>8} kB\nHugetlbPages:\t{z:>8} kB\n\
              CoreDumping:\t0\nTHP_enabled:\t{thp}\nuntag_mask:\t0xffffffffffffffff\n",
@@ -280,6 +279,7 @@ pub(super) fn render_status(t: &Target, g: &Group, p: &Process, th: Option<&Thre
             file = st.file * 4,
             shmem = st.shmem * 4,
             pte = st.page_table_bytes() / 1024,
+            lck = p.mm.locked_pages() * 4,
             z = 0,
             data = kb(m.data),
             stk = kb(m.stack),

@@ -89,6 +89,13 @@ impl Limits {
     pub fn new(ram_pages: u64) -> Self {
         Limits { t: SpinLock::named("proc.rlimits", defaults(ram_pages)) }
     }
+    /// A process the kernel starts itself: the kernel stands where systemd stands on Linux, so it gets systemd's
+    /// NOFILE ceiling over the kernel defaults (a Linux kernel alone would leave 4096).
+    pub fn new_system(ram_pages: u64) -> Self {
+        let mut t = defaults(ram_pages);
+        t[RLIMIT_NOFILE as usize].max = SYSTEM_NOFILE_MAX;
+        Limits { t: SpinLock::named("proc.rlimits", t) }
+    }
     pub fn get(&self, resource: u32) -> Option<Rlimit> {
         self.t.lock().get(resource as usize).copied()
     }
@@ -115,6 +122,14 @@ mod tests {
         assert_eq!(t[RLIMIT_CORE as usize].cur, 0);
         assert_eq!(t[RLIMIT_CPU as usize].cur, RLIM_INFINITY);
         assert_eq!(nproc_default(0), 10, "MIN_THREADS 20, halved");
+    }
+
+    #[test]
+    fn system_started_gets_systemds_nofile_ceiling() {
+        let l = Limits::new_system(8 << 20);
+        assert_eq!(l.get(RLIMIT_NOFILE), Some(Rlimit { cur: 1024, max: 524_288 }));
+        assert_eq!(l.get(RLIMIT_STACK), Some(defaults(8 << 20)[RLIMIT_STACK as usize]));
+        assert_eq!(l.copy().get(RLIMIT_NOFILE), Some(Rlimit { cur: 1024, max: 524_288 }), "children inherit it");
     }
 
     #[test]

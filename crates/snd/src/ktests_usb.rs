@@ -17,11 +17,11 @@ fn on_usb(m: &crate::Mixer) -> bool {
     m.status().endpoint.as_deref().is_some_and(|e| e.starts_with("usb:"))
 }
 
-ktest!("sn.usb.tone", Audible, tone);
+ktest!("sn.usb.tone", Run("sn/50-usbaudio"), tone);
 fn tone() -> TestResult {
     usb_audio::ktest_settle();
     if usb_audio::outputs().is_empty() {
-        return ktest::skip("no USB audio output (QEMU: -device usb-audio on a qemu-xhci)");
+        return ktest::fail("no USB audio output (QEMU: -device usb-audio on a qemu-xhci)");
     }
     with_mixer(Target::Auto, |m| {
         let n = 96_000;
@@ -38,17 +38,17 @@ fn tone() -> TestResult {
     })
 }
 
-ktest!("sn.usb.unplug", QemuOnly, unplug);
+ktest!("sn.usb.unplug", Run("sn/50-usbaudio"), unplug);
 fn unplug() -> TestResult {
     if !pci::registry::opted_in("usb_audio_unplug_test") {
-        return ktest::skip("scenario only: host/tests/sn/50-usbaudio.sh boots with usb_audio_unplug_test=on and pulls the device");
+        return ktest::fail("scenario only: host/tests/sn/50-usbaudio.sh boots with usb_audio_unplug_test=on and pulls the device");
     }
     usb_audio::ktest_settle();
     if usb_audio::outputs().is_empty() {
-        return ktest::skip("no USB audio output");
+        return ktest::fail("no USB audio output");
     }
     if crate::ktests::players().is_err() {
-        return ktest::skip("no jack to fall back to (QEMU: intel-hda + hda-duplex)");
+        return ktest::fail("no jack to fall back to (QEMU: intel-hda + hda-duplex)");
     }
     with_mixer(Target::Auto, |m| {
         let x = m.open(F48, 48_000, "ktest.usb_unplug").map_err(err("open"))?;

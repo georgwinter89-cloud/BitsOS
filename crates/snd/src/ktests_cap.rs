@@ -157,12 +157,12 @@ fn node() -> TestResult {
     Ok(())
 }
 
-ktest!("sn.cap.system", Safe, system);
+ktest!("sn.cap.system", RunHw("sn/60-capture"), system);
 fn system() -> TestResult {
     usb_audio::ktest_settle();
     let c = match capture::open(devmodel::audio::PcmFormat { rate: 48000, channels: 2, bits: 16 }, 9600) {
         Ok(c) => c,
-        Err(crate::SndError::NoInput) => return ktest::skip("no microphone or line input (QEMU: intel-hda + hda-duplex)"),
+        Err(crate::SndError::NoInput) => return ktest::fail("no microphone or line input (QEMU: intel-hda + hda-duplex)"),
         Err(e) => return Err(format!("open: {e:?}")),
     };
     let name = c.source_name();
@@ -181,7 +181,7 @@ fn system() -> TestResult {
     drop(c);
     klog::event!(Info, "ktest", "cap.system", source = name.as_str(), frames = got, peak = peak as u64, overruns = lost, kicks = kicks);
     if got == 0 && qemu_codec(&name) {
-        return ktest::skip("QEMU's wav audiodev has no input side (record with -audiodev none, host/tests/sn/60-capture.sh)");
+        return ktest::fail("QEMU's wav audiodev has no input side (record with -audiodev none, host/tests/sn/60-capture.sh)");
     }
     kassert!(got > 0, "no frames from {name} in 1 s");
     Ok(())

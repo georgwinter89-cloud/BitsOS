@@ -37,7 +37,7 @@ fn settle() {
 
 fn have_program() -> Result<(), TestResult> {
     if vfs::root_ns().lookup("/bin/abi-vdso").is_err() {
-        return Err(ktest::skip("the user/abi-tests programs are not in this image (no musl sysroot when it was built)"));
+        return Err(ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)"));
     }
     Ok(())
 }
@@ -161,7 +161,7 @@ fn torture() -> TestResult {
     vdso::publish();
     let (_, a) = published().ok_or("no vDSO page")?;
     if a.mode != layout::MODE_TSC {
-        return ktest::skip("the vDSO does not read the TSC in this boot");
+        return ktest::fail("the vDSO does not read the TSC in this boot");
     }
     let k = time::tsc_hz() / 10;
     sched::sleep_ns(150 * MS);
@@ -215,7 +215,7 @@ ktest!("ab.vdso.rate_change", QemuOnly, rate_change);
 /// the vDSO agrees with the syscall afterwards. QemuOnly: it runs the clock 100 ppm fast for a moment.
 fn rate_change() -> TestResult {
     settle();
-    let Some(c) = time::calibration() else { return ktest::skip("no calibration in this boot") };
+    let Some(c) = time::calibration() else { return ktest::fail("no calibration in this boot") };
     let hz = time::tsc_hz();
     time::set_rate_for_test(hz + hz / 10_000, c.source);
     vdso::refresh();
@@ -237,7 +237,7 @@ ktest!("ab.vdso.wall_jump", QemuOnly, wall_jump);
 /// it moves the wall clock by an hour for a moment.
 fn wall_jump() -> TestResult {
     settle();
-    let Some(now) = time::wall::realtime_ns() else { return ktest::skip("no wall clock in this boot") };
+    let Some(now) = time::wall::realtime_ns() else { return ktest::fail("no wall clock in this boot") };
     let before = published().map(|(_, p)| p.real_off).unwrap_or(0);
     time::wall::set_realtime(now + 3600 * 1000 * MS);
     vdso::refresh();
@@ -284,7 +284,7 @@ ktest!("ab.vdso.publish_race", QemuOnly, publish_race);
 /// preempted there); meanwhile the wall clock moves by an hour and `publish` runs. The page must carry the new
 /// offset afterwards: the older reading never lands over the newer one. QemuOnly: it moves the wall clock.
 fn publish_race() -> TestResult {
-    let Some(_) = time::wall::realtime_ns() else { return ktest::skip("no wall clock in this boot") };
+    let Some(_) = time::wall::realtime_ns() else { return ktest::fail("no wall clock in this boot") };
     settle();
     let h = sched::spawn("vdso-race", sched::Class::Normal, || vdso::publish_slow_for_test(20 * MS)).map_err(|e| format!("spawn the publisher: {e:?}"))?;
     sched::sleep_ns(5 * MS);
@@ -307,7 +307,7 @@ ktest!("ab.vdso.publish_hook", QemuOnly, publish_hook);
 /// fast and moves the wall clock by an hour for a moment.
 fn publish_hook() -> TestResult {
     settle();
-    let Some(c) = time::calibration() else { return ktest::skip("no calibration in this boot") };
+    let Some(c) = time::calibration() else { return ktest::fail("no calibration in this boot") };
     let s = time::snapshot();
     let p = published().map(|(_, p)| p);
     kassert!(p.is_some_and(|p| (p.base_tsc, p.base_ns, p.mult) == (s.base_tsc, s.base_ns, s.ns_mult)), "page {p:?}, clock {s:?}");
@@ -337,10 +337,10 @@ ktest!("ab.vdso.recheck_gate", QemuOnly, recheck_gate);
 fn recheck_gate() -> TestResult {
     settle();
     if published().map(|(_, p)| p.mode) != Some(layout::MODE_TSC) {
-        return ktest::skip("the page does not use the TSC in this boot");
+        return ktest::fail("the page does not use the TSC in this boot");
     }
     let Some(during) = time::hold_recheck_pending_for_test(|| published().map(|(_, p)| p.mode)) else {
-        return ktest::skip("a real re-check is pending");
+        return ktest::fail("a real re-check is pending");
     };
     kassert!(during == Some(layout::MODE_NONE), "mode {during:?} while the re-check is pending");
     kassert!(published().is_some_and(|(_, p)| p.mode == layout::MODE_TSC), "the TSC mode did not come back after the re-check");

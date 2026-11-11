@@ -60,10 +60,10 @@ fn leaf(a: &AddressSpace, va: u64) -> Option<(u64, PageFlags)> {
 
 fn deferred_io() -> TestResult {
     let ns = vfs::root_ns();
-    let Ok(f) = ns.open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::skip("no /dev/zero to stand in for a device file") };
+    let Ok(f) = ns.open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::fail("no /dev/zero to stand in for a device file") };
     let buf = match wc_buffer(4) {
         Ok(b) => b,
-        Err(x) => return ktest::skip(&x),
+        Err(x) => return ktest::fail(&x),
     };
     let frames: Vec<u64> = (0..4).map(|i| buf.phys() + i * P).collect();
     let dev = Arc::new(TestDev { dirty: AtomicU64::new(0), faults: AtomicU64::new(0) });
@@ -137,11 +137,11 @@ impl DeviceOps for BadDev {
 
 fn bad_pages() -> TestResult {
     let ns = vfs::root_ns();
-    let Ok(rw) = ns.open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::skip("no /dev/zero to stand in for a device file") };
+    let Ok(rw) = ns.open_flags(b"/dev/zero", vfs::abi::O_RDWR, 0) else { return ktest::fail("no /dev/zero to stand in for a device file") };
     let ro = ns.open_flags(b"/dev/zero", vfs::abi::O_RDONLY, 0).map_err(e)?;
     let buf = match wc_buffer(1) {
         Ok(b) => b,
-        Err(x) => return ktest::skip(&x),
+        Err(x) => return ktest::fail(&x),
     };
     let map = DeviceMap::new(Arc::new(BadDev), alloc::vec![Aperture::Ram(buf.clone())]).map_err(e)?;
     let a = AddressSpace::with_fill(Fill::OnFault).map_err(e)?;

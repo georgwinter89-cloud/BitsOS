@@ -105,9 +105,8 @@ fn release_slot(base: u64) {
     POOL.lock().release(base);
 }
 
-/// A fresh kernel stack with its guard page. The pool lock is held while the stack is mapped: `map_4k` does not
-/// serialise page-table creation, and two CPUs mapping stacks into the same new page table would lose one.
-/// (A freed stack is unmapped by the reaper without it: clearing its own entries creates no table.)
+/// A fresh kernel stack with its guard page. The pool lock is held while the stack is mapped, so a slot and its pages
+/// appear together. (A freed stack is unmapped by the reaper without it: clearing its own entries creates no table.)
 pub fn alloc() -> Result<KernelStack, StackError> {
     let fa = mm_core::frames().ok_or(StackError::NoMemory)?;
     let (r, base, new_chunk) = {

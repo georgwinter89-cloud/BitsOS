@@ -1,41 +1,53 @@
-//! A registered disk: one `C: BlockDevice` with its request queue (`queue::Elevator`), its dispatcher, its
-//! partition-table verdict and its write-refusal hook.
+//! A registered disk: one `C: BlockDevice` with its request queue (`queue::Elevator`), its partition-table
+//! verdict and its write-refusal hook.
 //!
-//! - **Submitting** (`submit`, or the waiting helpers `read_vec`, `write`, `read_pages`, `write_pages`,
-//!   `flush`, `discard`): the request is checked (block size, range: a write past the end is `NoSpace`, a read
-//!   `BeyondEnd`; writes, FUA/preflush writes and discards through the hook: `ReadOnly(why)` = EROFS), then
-//!   queued with its priority. Every request **owns** its memory (a byte vector or page-cache pages), so a
-//!   caller that gives up (deadline) never leaves the device writing into freed memory.
-//! - **Dispatching:** one thread per disk (`blk:<name>`, class Interactive: it serves Interactive reads and
-//!   sleeps while the device works) takes the next batch from the elevator (priority with aging, merges up to
-//!   max_sectors), calls the device and completes the members. A merged batch that fails is retried member by
-//!   member, so one bad block fails only the request that holds it. Without a thread (spawn failed, host tests)
-//!   the waiting callers dispatch themselves, one at a time.
-//! - **Waiting:** every member has a `Completion`; the waiter sleeps on it with a deadline (B4: default
-//!   120 s, `set_timeout_ns`). On a timeout the request is taken out of the queue, or, if the device has it
-//!   already, its answer is dropped (`Timeout` = EIO to the caller).
-//! - **Scatter-gather into page-cache pages:** `read_pages`/`write_pages` take `PageSeg`s (FS-5's
-//!   `CachePage`s); the dispatcher moves the bytes between the pages and the device in chunks of at least
-//!   1 MiB (the trait takes a byte slice, and safe code reaches a cache frame only through its copy
-//!   accessors, so this is one copy per byte: see the notes' change request for physical segments).
+//! - **Submitting** (`submit`, or the waiting helpers `read_vec`, `read`, `write`, `read_pages`, `read_frames`,
+//!   `write_pages`, `flush`, `discard`): the request is checked (block size, range: a write past the end is
+//!   `NoSpace`, a read `BeyondEnd`; writes, FUA/preflush writes and discards through the hook: `ReadOnly(why)` =
+//!   EROFS), then queued with its priority. Every request **owns** its memory (a byte vector, or frames:
+//!   page-cache pages by `Arc`), so a caller that gives up (deadline) never leaves the device writing into freed
+//!   memory.
+//! - **Dispatching (BL-2, Linux 7.x block/blk-mq.c `blk_mq_submit_bio`, plugging):** there is no dispatcher
+//!   thread. What a caller submits waits in the queue until it waits for it (the plug: requests submitted together
+//!   merge and go side by side); the waiting caller then takes one of the device's slots (`queue_depth`: an NVMe
+//!   controller's tags, one for a device that takes one call at a time), picks the next batch by the elevator's
+//!   rules (priority with aging, merging up to max_sectors, an older overlapping write first) and calls the device
+//!   itself. Reads into frames go to the device together, as many as slots are free (one `read_frames` call: NVMe
+//!   puts them all in flight). A dispatcher stops once its own request is answered and wakes the next sleeping
+//!   waiter whenever a slot comes free, so nobody serves other callers' backlog for long (B4). A merged batch that
+//!   fails is retried member by member, so one bad block fails only the request that holds it. An unwaited ticket
+//!   is dispatched when dropped. `run_queue` dispatches without a request of one's own (tests holding a device).
+//! - **Stacked disks** (partitions, bitsvol volumes, `DiskKind::Stacked`) only remap: no elevator, no merging, no
+//!   slot limit; the caller hands its own requests to the device below (Linux `submit_bio_noacct`'s remap), the
+//!   frames unchanged. Merging happens at the bottom only.
+//! - **Waiting:** every request has a `Completion`; the waiter sleeps with a deadline (B4: default 120 s,
+//!   `set_timeout_ns`), looking at least every `POLL_NS`. On a timeout the request is taken out of the queue, or,
+//!   if the device has it already, its answer is dropped (`Timeout` = EIO to the caller).
+//! - **Byte reads** (`read`) go straight into the caller's buffer when the caller can call the device at once (a
+//!   stacked disk, or a free slot with nothing queued); otherwise through the request's own buffer (one copy,
+//!   `block.copy_bytes.disk_copy`).
 //!
-//! Locks: `block.queue` (spin; the elevator and the request list; never held across a device call, a wait or
-//! a klog event), `block.table`, `block.disk.gates`, a request's `block.req.data`/`block.req.result` (spin,
-//! leaves). The dispatcher calls the device with no lock of this crate held.
+//! Locks: `block.queue` (spin; the elevator, the request list and what is at the device; never held across a
+//! device call, a wait or a klog event), `block.table`, `block.disk.gates`, a request's `block.req.data`/
+//! `block.req.result` (spin, leaves). A device is called with no lock of this crate held.
+
+mod dispatch;
 
 use crate::error::{BlockError, Refusal};
+use crate::frames::PageFrames;
 use crate::policy::{self, DiskKind, StickMatch, WriteCheck, WriteGate};
-use crate::queue::{Batch, Elevator, Entry, Kind, Limits};
+use crate::queue::{Elevator, Entry, Kind};
 use crate::table::{self, Scan};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use devmodel::block::{BlockDevice, BlockInfo, IoPriority};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoBuf, IoPriority};
 use devmodel::DevError;
 use ksync::{Completion, SpinLock, WaitQueue};
-use vfs::pagecache::CachePage;
+
+pub use crate::frames::PageSeg;
 
 /// Default deadline of a request (B4).
 pub const DEFAULT_TIMEOUT_NS: u64 = 120_000_000_000;
@@ -43,11 +55,10 @@ pub const DEFAULT_TIMEOUT_NS: u64 = 120_000_000_000;
 pub const DEFAULT_AGE_NS: u64 = 250_000_000;
 /// Bounce chunks are at least this big (usb-msd chains its commands up to 1 MiB per run).
 pub const CHUNK_BYTES: u64 = 1 << 20;
-/// How long the idle dispatcher sleeps before it looks again by itself.
-const IDLE_NS: u64 = 1_000_000_000;
-/// A waiter without a dispatcher thread looks at least this often whether it should dispatch.
-const INLINE_POLL_NS: u64 = 10_000_000;
+/// A waiter looks this often by itself (a hand-off it missed, its deadline, a disk without a clock).
+const POLL_NS: u64 = 10_000_000;
 
+klog::counter!(BOUNCE_SHRUNK, "block.bounce_shrunk");
 klog::counter!(SUBMITTED, "block.requests");
 klog::counter!(MERGED, "block.merged");
 klog::counter!(DISPATCHES, "block.dispatches");
@@ -56,17 +67,56 @@ klog::counter!(REFUSED, "block.writes_refused");
 klog::counter!(TIMEOUTS, "block.timeouts");
 klog::counter!(AGED, "block.aged");
 klog::counter!(SPLIT_RETRIES, "block.merge_retries");
+// BL-2: byte reads that went straight into the caller's buffer; groups of reads given to a device in one call.
+vfs::pcpu_counter!(DIRECT_READS, "block.direct_reads", vfs::pcpu::EVENTS_BATCH);
+klog::counter!(GROUPS, "block.read_groups");
+// BL-0: bytes copied per copy site of the read path (plan/notes/bl-BL-0.md), per CPU.
+vfs::pcpu_counter!(COPY_READVEC_ZERO, "block.copy_bytes.readvec_zero", vfs::pcpu::BYTES_BATCH);
+vfs::pcpu_counter!(COPY_DISK, "block.copy_bytes.disk_copy", vfs::pcpu::BYTES_BATCH);
+vfs::pcpu_counter!(COPY_BOUNCE, "block.copy_bytes.bounce", vfs::pcpu::BYTES_BATCH);
+// BL-0: device operations of all disks under way now (a gauge: it goes down again) and the most one disk ever had
+// at once (per disk: `DiskStats::inflight`, `inflight_max`).
+klog::counter!(INFLIGHT, "block.inflight");
+klog::counter!(INFLIGHT_MAX, "block.inflight_max");
+static INFLIGHT_MAX_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// BL-0: `n` device operations of a disk under way (one per batch), counted at the bottom of that disk, after the
+/// elevator merged its requests: the queue depth the device sees. BL-2: also the disk's busy time (Linux
+/// `io_ticks`: wall time with at least one operation at the device).
+struct InFlight<'a>(&'a Stats, u64);
+
+impl<'a> InFlight<'a> {
+    fn new(s: &'a Stats, n: u64) -> InFlight<'a> {
+        let before = s.inflight.fetch_add(n, Ordering::Relaxed);
+        if before == 0 {
+            s.busy_since.store(now(), Ordering::Relaxed);
+        }
+        let now = before + n;
+        INFLIGHT.add(n);
+        if now > s.inflight_max.load(Ordering::Relaxed) {
+            s.inflight_max.fetch_max(now, Ordering::Relaxed);
+            let seen = INFLIGHT_MAX_SEEN.fetch_max(now, Ordering::Relaxed);
+            if now > seen {
+                INFLIGHT_MAX.add(now - seen);
+            }
+        }
+        InFlight(s, n)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(self.1, Ordering::Relaxed) == self.1 {
+            let since = self.0.busy_since.load(Ordering::Relaxed);
+            self.0.busy_ns.fetch_add(now().saturating_sub(since), Ordering::Relaxed);
+        }
+        // The shared total goes down by wrapping (the counter only adds).
+        INFLIGHT.add(self.1.wrapping_neg());
+    }
+}
 
 fn now() -> u64 {
     ksync::now_ns().unwrap_or(0)
-}
-
-/// Part of a page-cache page: bytes `[off, off + len)` of `page`.
-#[derive(Clone)]
-pub struct PageSeg {
-    pub page: Arc<CachePage>,
-    pub off: usize,
-    pub len: usize,
 }
 
 /// The memory a request owns.
@@ -75,7 +125,10 @@ pub enum Data {
     #[default]
     None,
     Bytes(Vec<u8>),
+    /// Page-cache pages; turned into `Frames` when the request is queued (`wait` gives `Frames` back).
     Pages(Vec<PageSeg>),
+    /// BL-2: frames passed down by the layer above (or the pages above, as frames).
+    Frames(IoBuf),
 }
 
 impl Data {
@@ -84,6 +137,7 @@ impl Data {
             Data::None => 0,
             Data::Bytes(b) => b.len(),
             Data::Pages(p) => p.iter().map(|s| s.len).sum(),
+            Data::Frames(f) => f.len(),
         }
     }
 
@@ -91,24 +145,17 @@ impl Data {
         self.len() == 0
     }
 
-    /// Copies `out.len()` bytes from offset `at` of the data into `out`.
+    /// Copies `out.len()` bytes from offset `at` of the data into `out` (the bounce of a mixed batch).
     fn copy_out(&self, at: usize, out: &mut [u8]) {
         match self {
-            Data::None => {}
+            Data::None | Data::Pages(_) => {}
             Data::Bytes(b) => {
                 if let Some(s) = b.get(at..at + out.len()) {
                     out.copy_from_slice(s);
                 }
             }
-            Data::Pages(segs) => {
-                let mut base = 0usize;
-                for s in segs {
-                    let (lo, hi) = (at.max(base), (at + out.len()).min(base + s.len));
-                    if lo < hi {
-                        s.page.read(s.off + (lo - base), &mut out[lo - at..hi - at]);
-                    }
-                    base += s.len;
-                }
+            Data::Frames(f) => {
+                f.read(at, out);
             }
         }
     }
@@ -116,21 +163,14 @@ impl Data {
     /// Copies `src` into the data at offset `at`.
     fn copy_in(&mut self, at: usize, src: &[u8]) {
         match self {
-            Data::None => {}
+            Data::None | Data::Pages(_) => {}
             Data::Bytes(b) => {
                 if let Some(s) = b.get_mut(at..at + src.len()) {
                     s.copy_from_slice(src);
                 }
             }
-            Data::Pages(segs) => {
-                let mut base = 0usize;
-                for s in segs.iter() {
-                    let (lo, hi) = (at.max(base), (at + src.len()).min(base + s.len));
-                    if lo < hi {
-                        s.page.write(s.off + (lo - base), &src[lo - at..hi - at]);
-                    }
-                    base += s.len;
-                }
+            Data::Frames(f) => {
+                f.write(at, src);
             }
         }
     }
@@ -144,6 +184,11 @@ struct Req {
     data: SpinLock<Data>,
     result: SpinLock<Option<Result<(), BlockError>>>,
     done: Completion,
+    /// In the elevator now (not held back, not at the device, not answered).
+    queued: AtomicBool,
+    /// Its waiter sleeps on `kick` (a slot that comes free wakes such a one, BL-2).
+    sleeping: AtomicBool,
+    kick: WaitQueue,
 }
 
 impl Req {
@@ -156,9 +201,14 @@ struct Queue {
     elev: Elevator,
     /// Queued and in-flight requests.
     reqs: Vec<Arc<Req>>,
+    /// What the device has now (members of batches, direct reads): a younger request overlapping one of them
+    /// with a write involved waits (the elevator's order rule across slots).
+    inflight: Vec<Entry>,
+    /// Byte reads straight into a caller's buffer under way (`Disk::read`; no request of their own).
+    direct: usize,
     stopped: bool,
-    /// RB-14: closed by the storage stop before a reset (`shutdown`): new requests are held back (`held`), the
-    /// dispatcher runs on for what was queued before, `reopen` undoes it.
+    /// RB-14: closed by the storage stop before a reset (`shutdown`): new requests are held back (`held`), what was
+    /// queued before still runs (its waiters dispatch it), `reopen` undoes it.
     closed: bool,
     /// RB-14: requests submitted while closed, oldest first. They never reach the device before `reopen` queues
     /// them; their waiters keep their own deadline (`cancel` takes them out), `stop` fails them with `Gone`.
@@ -173,17 +223,6 @@ struct TableState {
     blocks: u64,
     stick: StickMatch,
 }
-
-/// What the dispatcher does next (`Disk::next`).
-enum Step {
-    Run(Batch, Vec<Arc<Req>>),
-    /// No memory to build a batch: its requests were failed with ENOMEM (logged by `drain`, outside the lock).
-    NoMemory { kind: Kind, lba: u64, blocks: u64, members: usize },
-}
-
-const MODE_NONE: u8 = 0;
-const MODE_THREAD: u8 = 1;
-const MODE_INLINE: u8 = 2;
 
 /// Counters of one disk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,13 +240,21 @@ pub struct DiskStats {
     /// Bytes of successful reads and writes, counted at completion (RB-7b CR2).
     pub read_bytes: u64,
     pub write_bytes: u64,
-    /// Time with a request at the device (Linux /proc/diskstats `io_ticks`, in ns): one worker per disk runs
-    /// the batches one at a time, so it is the time spent in `execute`.
+    /// Time with at least one request at the device (Linux /proc/diskstats `io_ticks`, in ns).
     pub busy_ns: u64,
+    /// BL-0: device operations of this disk under way now, and the most at once since it opened.
+    pub inflight: u64,
+    pub inflight_max: u64,
+    /// BL-2: bytes this disk copied on reads (a zeroed request buffer, its copy to the caller, a bounce): the
+    /// sites of `block.copy_bytes.{readvec_zero, disk_copy, bounce}`, for this disk alone.
+    pub copied_bytes: u64,
 }
 
 #[derive(Default)]
 struct Stats {
+    inflight: AtomicU64,
+    inflight_max: AtomicU64,
+    busy_since: AtomicU64,
     requests: AtomicU64,
     merged: AtomicU64,
     dispatches: AtomicU64,
@@ -219,6 +266,7 @@ struct Stats {
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
     busy_ns: AtomicU64,
+    copied: AtomicU64,
 }
 
 pub struct Disk {
@@ -227,15 +275,30 @@ pub struct Disk {
     kind: DiskKind,
     block_size: u32,
     q: SpinLock<Queue>,
-    work: WaitQueue,
+    /// BL-2: calls the device takes at once (`BlockDevice::queue_depth`; unbounded for a stacked disk), and how
+    /// many dispatchers hold one now.
+    slots: u32,
+    active: AtomicU32,
+    /// A stacked disk: no elevator, the caller hands its requests down itself.
+    passthrough: bool,
+    /// Grows whenever a request leaves the device (a waiter the order rule held back looks again).
+    progress: AtomicU64,
     next_id: AtomicU64,
     table: SpinLock<TableState>,
     gates: SpinLock<Vec<Arc<dyn WriteGate>>>,
-    mode: AtomicU8,
-    dispatching: AtomicBool,
-    worker_done: AtomicBool,
+    /// NV-2p: the armed window `(first, blocks)`, only a `PartPort` of exactly this range writes (gpt/window.rs).
+    /// While it is armed the whole-disk device refuses every write, inside the range too.
+    window: SpinLock<Option<(u64, u64)>>,
+    /// The EFI System partition `nvme_boot=` names, allowed beside the armed window (set with it).
+    esp: SpinLock<Option<(u64, u64)>>,
+    /// That ESP's own window, open while fs-fat has it as /boot (`open_boot_window`); only beside `window`.
+    boot: SpinLock<Option<(u64, u64)>>,
+    /// The layer below that keeps its own copy of the windows (the NVMe controller's command builder).
+    lower: SpinLock<Option<Arc<dyn LowerWindow>>>,
     age_ns: AtomicU64,
     timeout_ns: AtomicU64,
+    /// VS-H CR 5: the last failed request of this disk ended in a timeout, not in a media error (`take_timed_out`).
+    timed_out: AtomicBool,
     stats: Stats,
     /// One bit per refusal reason already logged (one `write.refused` event per reason and disk).
     logged: AtomicU32,
@@ -243,12 +306,17 @@ pub struct Disk {
     written: AtomicBool,
     dirty: AtomicBool,
     last_write_ns: AtomicU64,
+    /// Writes (not FUA) completed so far: a flush makes the cache clean only if none completed while it ran (with
+    /// several slots a write may complete beside a flush).
+    write_gen: AtomicU64,
 }
 
-/// A queued request; `wait` gives its data back (the bytes read, or the buffer written).
+/// A queued request; `wait` gives its data back (the bytes read, or the buffer written). Dropped without a wait,
+/// it is dispatched and waited for there (BL-2: its submitter is its dispatcher).
 pub struct Ticket {
     disk: Arc<Disk>,
     req: Arc<Req>,
+    waited: bool,
 }
 
 impl Ticket {
@@ -263,79 +331,73 @@ impl Ticket {
         let t = self.disk.timeout_ns.load(Ordering::Relaxed);
         self.wait_timeout(t)
     }
-    pub fn wait_timeout(self, timeout_ns: u64) -> Result<Data, BlockError> {
-        let done = self.disk.wait_req(&self.req, timeout_ns);
-        if !done && !self.disk.cancel(&self.req) && !self.req.done.is_done() {
-            TIMEOUTS.inc();
-            self.disk.stats.timeouts.fetch_add(1, Ordering::Relaxed);
-            klog::event!(Warn, "block", "req.timeout", disk = self.disk.name.clone(), op = self.req.kind.as_str(), lba = self.req.lba,
-                blocks = self.req.blocks, timeout_ms = timeout_ns / 1_000_000; "the device still has it: its answer will be dropped");
-            return Err(BlockError::Timeout);
-        }
-        let r = self.req.result.lock().take().unwrap_or(Err(BlockError::Timeout));
-        r.map(|()| core::mem::take(&mut *self.req.data.lock()))
+    pub fn wait_timeout(mut self, timeout_ns: u64) -> Result<Data, BlockError> {
+        self.waited = true;
+        self.disk.settle_req(&self.req, timeout_ns)
     }
 }
 
-/// How a disk dispatches.
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if !self.waited && !self.req.done.is_done() {
+            let t = self.disk.timeout_ns.load(Ordering::Relaxed);
+            let _ = self.disk.settle_req(&self.req, t);
+        }
+    }
+}
+
+/// How a disk dispatches. BL-2: always in its submitters (there is no dispatcher thread any more); both names are
+/// kept so callers keep building, and mean the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dispatch {
-    /// A dispatcher thread (`blk:<name>`, Interactive).
+    /// Formerly a `blk:<name>` thread; now as `Inline`.
     Thread,
-    /// The waiting callers dispatch (host tests, or when no thread could be started).
+    /// The waiting callers dispatch.
     Inline,
 }
 
 impl Disk {
-    /// Puts a queue in front of `dev` (not in the registry: `crate::register` does that), starts its
-    /// dispatcher and reads its partition table.
-    pub fn open(dev: Arc<dyn BlockDevice>, kind: DiskKind, dispatch: Dispatch) -> Result<Arc<Disk>, BlockError> {
+    /// Puts a queue in front of `dev` (not in the registry: `crate::register` does that) and reads its partition
+    /// table.
+    pub fn open(dev: Arc<dyn BlockDevice>, kind: DiskKind, _dispatch: Dispatch) -> Result<Arc<Disk>, BlockError> {
         let info = dev.info();
         if !matches!(info.block_size, 512 | 1024 | 2048 | 4096) {
             klog::event!(Warn, "block", "disk.bad_block_size", disk = String::from(dev.name()), block_size = info.block_size);
             return Err(BlockError::Invalid);
         }
+        let passthrough = kind == DiskKind::Stacked;
+        let slots = if passthrough { u32::MAX } else { dev.queue_depth().max(1) };
         let d = Arc::new(Disk {
             name: String::from(dev.name()),
             dev,
             kind,
             block_size: info.block_size,
-            q: SpinLock::named("block.queue", Queue { elev: Elevator::new(), reqs: Vec::new(), stopped: false, closed: false, held: Vec::new() }),
-            work: WaitQueue::new(),
+            q: SpinLock::named("block.queue", Queue { elev: Elevator::new(), reqs: Vec::new(), inflight: Vec::new(), direct: 0, stopped: false, closed: false, held: Vec::new() }),
+            slots,
+            active: AtomicU32::new(0),
+            passthrough,
+            progress: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             table: SpinLock::named("block.table", TableState { scan: Scan::default(), blocks: info.blocks, stick: StickMatch::Unknown }),
             gates: SpinLock::named("block.disk.gates", Vec::new()),
-            mode: AtomicU8::new(MODE_NONE),
-            dispatching: AtomicBool::new(false),
-            worker_done: AtomicBool::new(false),
+            window: SpinLock::named("block.disk.window", None),
+            esp: SpinLock::named("block.disk.esp", None),
+            boot: SpinLock::named("block.disk.boot", None),
+            lower: SpinLock::named("block.disk.lower", None),
             age_ns: AtomicU64::new(DEFAULT_AGE_NS),
             timeout_ns: AtomicU64::new(DEFAULT_TIMEOUT_NS),
+            timed_out: AtomicBool::new(false),
             stats: Stats::default(),
             logged: AtomicU32::new(0),
             written: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             last_write_ns: AtomicU64::new(0),
+            write_gen: AtomicU64::new(0),
         });
-        d.start(dispatch);
+        klog::event!(Debug, "block", "disk.dispatch", disk = d.name.clone(), slots = slots as u64, stacked = passthrough;
+            "BL-2: requests are dispatched by their submitters");
         d.rescan();
         Ok(d)
-    }
-
-    fn start(self: &Arc<Self>, dispatch: Dispatch) {
-        if dispatch == Dispatch::Thread {
-            let me = self.clone();
-            let name = format!("blk:{}", self.name);
-            self.mode.store(MODE_THREAD, Ordering::Release);
-            match sched::spawn(&name, sched::Class::Interactive, move || me.worker()) {
-                Ok(_) => return,
-                Err(e) => {
-                    klog::event!(Warn, "block", "worker.inline", disk = self.name.clone(), error = format!("{e:?}");
-                        "no dispatcher thread: the waiting callers dispatch")
-                }
-            }
-        }
-        self.worker_done.store(true, Ordering::Release);
-        self.mode.store(MODE_INLINE, Ordering::Release);
     }
 
     pub fn name(&self) -> &str {
@@ -354,6 +416,16 @@ impl Disk {
     pub fn dev_info(&self) -> BlockInfo {
         self.dev.info()
     }
+    /// BL-4 CR 4: the device's largest request in 4 KiB pages (Linux `bdi->io_pages` from max_sectors,
+    /// linux-7/block/blk-settings.c); NVMe: MDTS. A stacked disk reports its lowest device's.
+    pub fn request_pages(&self) -> u64 {
+        let i = self.dev.info();
+        (i.max_blocks_per_request as u64).saturating_mul(i.block_size as u64) / 4096
+    }
+    /// BL-2: calls the device takes at once (u32::MAX for a stacked disk: it only remaps).
+    pub fn slots(&self) -> u32 {
+        self.slots
+    }
     pub fn set_timeout_ns(&self, ns: u64) {
         self.timeout_ns.store(ns.max(1), Ordering::Relaxed);
     }
@@ -363,13 +435,18 @@ impl Disk {
     pub fn is_stopped(&self) -> bool {
         self.q.lock().stopped
     }
-    /// The dispatcher thread ended (or never ran).
+    /// The dispatcher thread ended (or never ran). BL-2: there is none, always true.
     pub fn worker_done(&self) -> bool {
-        self.worker_done.load(Ordering::Acquire)
+        true
     }
 
     pub fn stats(&self) -> DiskStats {
         let s = &self.stats;
+        let mut busy = s.busy_ns.load(Ordering::Relaxed);
+        let inflight = s.inflight.load(Ordering::Relaxed);
+        if inflight > 0 {
+            busy += now().saturating_sub(s.busy_since.load(Ordering::Relaxed));
+        }
         DiskStats {
             requests: s.requests.load(Ordering::Relaxed),
             merged: s.merged.load(Ordering::Relaxed),
@@ -382,7 +459,10 @@ impl Disk {
             queued: self.q.lock().elev.len() as u64,
             read_bytes: s.read_bytes.load(Ordering::Relaxed),
             write_bytes: s.write_bytes.load(Ordering::Relaxed),
-            busy_ns: s.busy_ns.load(Ordering::Relaxed),
+            busy_ns: busy,
+            inflight,
+            inflight_max: s.inflight_max.load(Ordering::Relaxed),
+            copied_bytes: s.copied.load(Ordering::Relaxed),
         }
     }
 
@@ -439,10 +519,129 @@ impl Disk {
             klog::event!(Info, "block", "disk.protected", disk = self.name.clone(), reason = format!("{verdict:?}");
                 "writes refused for good (R8a)");
         }
+        // NV-2p: a table that no longer holds the armed window ends it; the next boot checks everything anyway. The
+        // window is read into a local first: the lock guard of an `if let` scrutinee lives through the body, and the
+        // body takes the same lock (this spun forever before 6.11.2026; a lost window had never happened yet).
+        let armed = *self.window.lock();
+        if let Some(w) = armed
+            && (crate::gpt::window::foreign_esp(&scan, *self.esp.lock()) || !scan.gpt.as_ref().is_some_and(|g| g.entries.iter().any(|e| e.first == w.0 && e.last.checked_sub(e.first).and_then(|d| d.checked_add(1)) == Some(w.1))))
+        {
+            klog::event!(Warn, "block", "window.lost", disk = self.name.clone(), first = w.0, blocks = w.1; "the partition table changed under the armed window: the disk is read-only now");
+            *self.window.lock() = None;
+            self.close_boot_window();
+        }
         let mut t = self.table.lock();
         t.scan = scan;
         t.blocks = info.blocks;
         t.stick = stick;
+    }
+
+    /// NV-2p: only the blocks `first..first + blocks` take writes, and only through a `PartPort` of that range
+    /// (the driver calls this after `gpt::window::validate`, and arms its own command builder too).
+    /// `esp`: the EFI System partition `nvme_boot=` names (never written, only allowed to be there).
+    pub fn arm_window(&self, first: u64, blocks: u64, esp: Option<(u64, u64)>) {
+        klog::event!(Info, "block", "window.armed", disk = self.name.clone(), first = first, blocks = blocks, esp = esp.is_some(); "NV-2p: one partition of this disk takes writes, everything else on it is refused");
+        // A new window is checked anew: the boot ESP's is opened again only by its own check.
+        self.close_boot_window();
+        *self.esp.lock() = esp;
+        *self.window.lock() = Some((first, blocks));
+    }
+
+    /// NV-2p: the disk is read-only as a whole again.
+    pub fn disarm_window(&self) {
+        self.close_boot_window();
+        *self.esp.lock() = None;
+        if self.window.lock().take().is_some() {
+            klog::event!(Info, "block", "window.disarmed", disk = self.name.clone());
+        }
+    }
+
+    pub fn window(&self) -> Option<(u64, u64)> {
+        *self.window.lock()
+    }
+
+    /// The ESP `nvme_boot=` names, as the window was armed with it.
+    pub fn named_esp(&self) -> Option<(u64, u64)> {
+        *self.esp.lock()
+    }
+
+    /// The layer below that must open and close the boot ESP's window with this disk (the driver sets it).
+    pub fn set_lower(&self, l: Arc<dyn LowerWindow>) {
+        *self.lower.lock() = Some(l);
+    }
+
+    /// Opens the second window, exactly the named ESP `first..first + blocks`, for /boot's writes there (fs-fat,
+    /// after `gpt::window::boot_esp` and its own identity rules passed). Only beside the armed window, only the ESP it
+    /// was armed with, only when the layer below opens it too. Err: why it stays shut.
+    pub fn open_boot_window(&self, first: u64, blocks: u64) -> Result<(), &'static str> {
+        let Some(w) = self.window() else { return Err("no nvme_data= window is armed on this disk") };
+        if self.named_esp() != Some((first, blocks)) {
+            return Err("the range is not the EFI System partition nvme_boot= names");
+        }
+        if first < w.0.saturating_add(w.1) && w.0 < first.saturating_add(blocks) {
+            return Err("the boot partition overlaps nvme_data='s window");
+        }
+        {
+            let t = self.table.lock();
+            if crate::gpt::window::foreign_esp(&t.scan, Some((first, blocks))) {
+                return Err("the disk holds another EFI System partition");
+            }
+            // A port is known by its range only: a second listed entry of that range would share the window.
+            if t.scan.parts.iter().filter(|p| (p.0, p.1) == (first, blocks)).count() != 1 {
+                return Err("not exactly one partition of the disk has the boot partition's range");
+            }
+        }
+        let lower = self.lower.lock().clone();
+        if lower.is_some_and(|l| !l.open_boot(first, blocks)) {
+            return Err("the controller did not open the boot partition's window");
+        }
+        *self.boot.lock() = Some((first, blocks));
+        klog::event!(Info, "block", "window.boot_opened", disk = self.name.clone(), first = first, blocks = blocks; "the boot partition nvme_boot= names takes /boot's writes too");
+        Ok(())
+    }
+
+    /// Closes the boot ESP's window (both layers); nothing when it is shut.
+    pub fn close_boot_window(&self) {
+        let was = self.boot.lock().take();
+        let lower = self.lower.lock().clone();
+        if let Some(l) = lower {
+            l.close_boot();
+        }
+        if let Some((first, blocks)) = was {
+            klog::event!(Info, "block", "window.boot_closed", disk = self.name.clone(), first = first, blocks = blocks);
+        }
+    }
+
+    pub fn boot_window(&self) -> Option<(u64, u64)> {
+        *self.boot.lock()
+    }
+
+    /// NV-2p: what a partition of `first..first + blocks` is stacked on (instead of `DiskDevice`): it writes when
+    /// the armed window is exactly its range.
+    pub fn part_port(self: &Arc<Self>, first: u64, blocks: u64) -> PartPort {
+        PartPort { disk: self.clone(), port: (first, blocks) }
+    }
+
+    /// The hook for a request through a partition's port: `gpt::window::port_rule` (either window), an EFI System
+    /// partition on the disk other than the one `nvme_boot=` names (whatever was armed), then the gates as for every write.
+    fn check_port(self: &Arc<Self>, op: Kind, port: (u64, u64), range: Option<(u64, u64)>) -> Result<(), Refusal> {
+        let read_only = self.dev.info().read_only;
+        let (window, boot) = (*self.window.lock(), *self.boot.lock());
+        crate::gpt::window::port_rule(window, boot, port, read_only, range)?;
+        if crate::gpt::window::foreign_esp(&self.table.lock().scan, *self.esp.lock()) {
+            return Err(Refusal::EfiPartition);
+        }
+        self.ask_gates(op, range, self.gates.lock().clone())
+    }
+
+    fn ask_gates(&self, op: Kind, range: Option<(u64, u64)>, own: Vec<Arc<dyn WriteGate>>) -> Result<(), Refusal> {
+        let w = WriteCheck { disk: &self.name, kind: self.kind, op, range };
+        let mut gates = policy::global_gates();
+        gates.extend(own);
+        match gates.iter().find(|g| !g.allows(&w)) {
+            Some(g) => Err(Refusal::Gate(g.name())),
+            None => Ok(()),
+        }
     }
 
     /// The boot stick's identity changed (`crate::configure`): match again without I/O.
@@ -468,13 +667,11 @@ impl Disk {
         let own: Vec<Arc<dyn WriteGate>> = self.gates.lock().clone();
         let opens = own.iter().any(|g| g.opens_boot_stick());
         policy::opened(policy::decide(self.kind, info.read_only, &verdict, stick, policy::switches()), stick, opens)?;
-        let w = WriteCheck { disk: &self.name, kind: self.kind, op, range };
-        let mut gates = policy::global_gates();
-        gates.extend(own);
-        match gates.iter().find(|g| !g.allows(&w)) {
-            Some(g) => Err(Refusal::Gate(g.name())),
-            None => Ok(()),
+        // NV-2p: under an armed window the whole-disk device stays refused, inside the window's range too.
+        if self.window.lock().is_some() {
+            return Err(Refusal::Gate(crate::gpt::window::KEY));
         }
+        self.ask_gates(op, range, own)
     }
 
     fn refused(&self, why: Refusal, op: Kind, lba: u64, blocks: u64) -> BlockError {
@@ -491,6 +688,11 @@ impl Disk {
     /// Queues a request. Reads and writes take their length from `data` (a multiple of the block size);
     /// discards take `blocks`; flushes neither.
     pub fn submit(self: &Arc<Self>, kind: Kind, lba: u64, blocks: u64, data: Data, prio: IoPriority) -> Result<Ticket, BlockError> {
+        self.submit_via(None, kind, lba, blocks, data, prio)
+    }
+
+    /// `port`: the request comes through a partition's `PartPort` of this range (NV-2p), which has its own rule.
+    fn submit_via(self: &Arc<Self>, port: Option<(u64, u64)>, kind: Kind, lba: u64, blocks: u64, data: Data, prio: IoPriority) -> Result<Ticket, BlockError> {
         let bs = self.block_size as u64;
         let blocks = match kind {
             Kind::Read | Kind::Write { .. } => {
@@ -516,8 +718,17 @@ impl Disk {
             }
         }
         if kind.writes() {
-            self.check_write(kind, Some((lba, blocks))).map_err(|why| self.refused(why, kind, lba, blocks))?;
+            let rule = match port {
+                Some(p) => self.check_port(kind, p, Some((lba, blocks))),
+                None => self.check_write(kind, Some((lba, blocks))),
+            };
+            rule.map_err(|why| self.refused(why, kind, lba, blocks))?;
         }
+        // BL-2: page-cache pages travel as frames (the device below reads straight into them).
+        let data = match data {
+            Data::Pages(segs) => Data::Frames(IoBuf::new(Arc::new(PageFrames::new(segs).ok_or(BlockError::Invalid)?))),
+            d => d,
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = Arc::new(Req {
             id,
@@ -527,6 +738,9 @@ impl Disk {
             data: SpinLock::named("block.req.data", data),
             result: SpinLock::named("block.req.result", None),
             done: Completion::new(),
+            queued: AtomicBool::new(false),
+            sleeping: AtomicBool::new(false),
+            kick: WaitQueue::new(),
         });
         {
             let mut q = self.q.lock();
@@ -539,25 +753,17 @@ impl Disk {
                     return Err(BlockError::NoMemory);
                 }
                 q.held.push((entry, req.clone()));
-                drop(q);
-                SUBMITTED.inc();
-                self.stats.requests.fetch_add(1, Ordering::Relaxed);
-                return Ok(Ticket { disk: self.clone(), req });
+            } else {
+                if q.reqs.try_reserve(1).is_err() || q.elev.push(entry).is_err() {
+                    return Err(BlockError::NoMemory);
+                }
+                q.reqs.push(req.clone());
+                req.queued.store(true, Ordering::SeqCst);
             }
-            if q.reqs.try_reserve(1).is_err() {
-                return Err(BlockError::NoMemory);
-            }
-            if q.elev.push(entry).is_err() {
-                return Err(BlockError::NoMemory);
-            }
-            q.reqs.push(req.clone());
         }
         SUBMITTED.inc();
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        if self.mode.load(Ordering::Acquire) == MODE_THREAD {
-            self.work.wake_one();
-        }
-        Ok(Ticket { disk: self.clone(), req })
+        Ok(Ticket { disk: self.clone(), req, waited: false })
     }
 
     // ---- waiting helpers
@@ -567,16 +773,47 @@ impl Disk {
         let mut v = Vec::new();
         v.try_reserve_exact(len).map_err(|_| BlockError::NoMemory)?;
         v.resize(len, 0);
+        COPY_READVEC_ZERO.add(len as u64);
+        self.stats.copied.fetch_add(len as u64, Ordering::Relaxed);
         match self.submit(Kind::Read, lba, 0, Data::Bytes(v), prio)?.wait()? {
             Data::Bytes(v) => Ok(v),
             _ => Err(BlockError::Io),
         }
     }
 
-    /// Reads into `buf` (one copy from the request's own buffer).
+    /// Reads into `buf`: straight into it when the caller can call the device at once (BL-2, `direct`), else
+    /// through a request of its own (one copy from the request's buffer).
     pub fn read(self: &Arc<Self>, lba: u64, buf: &mut [u8], prio: IoPriority) -> Result<(), BlockError> {
+        let bs = self.block_size as u64;
+        let len = buf.len() as u64;
+        if len == 0 || !len.is_multiple_of(bs) {
+            return Err(BlockError::Invalid);
+        }
+        let blocks = len / bs;
+        if lba.checked_add(blocks).is_none_or(|e| e > self.dev.info().blocks) {
+            return Err(BlockError::BeyondEnd);
+        }
+        if let Some(slot) = self.direct(lba, blocks, prio) {
+            SUBMITTED.inc();
+            DIRECT_READS.inc();
+            self.stats.requests.fetch_add(1, Ordering::Relaxed);
+            self.stats.dispatches.fetch_add(1, Ordering::Relaxed);
+            DISPATCHES.inc();
+            let r = {
+                let _op = InFlight::new(&self.stats, 1);
+                self.dev.read_blocks(lba, buf, prio).map_err(BlockError::from_dev)
+            };
+            drop(slot);
+            self.report(Kind::Read, lba, blocks, r);
+            if r.is_ok() {
+                self.stats.read_bytes.fetch_add(len, Ordering::Relaxed);
+            }
+            return r;
+        }
         let v = self.read_vec(lba, buf.len(), prio)?;
         buf.copy_from_slice(&v);
+        COPY_DISK.add(buf.len() as u64);
+        self.stats.copied.fetch_add(buf.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -600,6 +837,49 @@ impl Disk {
         self.submit(Kind::Read, lba, 0, Data::Pages(segs), prio)?.wait().map(|_| ())
     }
 
+    /// BL-2: reads into frames, one request per `FrameIo`. All are queued before the first is waited for (the
+    /// plug), so adjacent ones merge at the bottom and the device gets the rest side by side; a stacked disk hands
+    /// them all down in one call. The first error is the answer, once every request ended.
+    pub fn read_frames(self: &Arc<Self>, reqs: &[FrameIo], prio: IoPriority) -> Result<(), BlockError> {
+        self.frames_via(None, reqs, prio)
+    }
+
+    fn frames_via(self: &Arc<Self>, port: Option<(u64, u64)>, reqs: &[FrameIo], prio: IoPriority) -> Result<(), BlockError> {
+        if let [one] = reqs {
+            return self.submit_via(port, Kind::Read, one.lba, 0, Data::Frames(one.buf.clone()), prio)?.wait().map(|_| ());
+        }
+        let mut tickets: Vec<Ticket> = Vec::new();
+        tickets.try_reserve_exact(reqs.len()).map_err(|_| BlockError::NoMemory)?;
+        let mut err = None;
+        for r in reqs {
+            match self.submit_via(port, Kind::Read, r.lba, 0, Data::Frames(r.buf.clone()), prio) {
+                Ok(t) => tickets.push(t),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        if self.passthrough {
+            let mut own: Vec<Arc<Req>> = Vec::new();
+            if own.try_reserve_exact(tickets.len()).is_ok() {
+                own.extend(tickets.iter().map(|t| t.req.clone()));
+                self.run_own(&own);
+            }
+        }
+        for t in tickets {
+            if let Err(e) = t.wait() {
+                err.get_or_insert(e);
+            }
+        }
+        err.map_or(Ok(()), Err)
+    }
+
+    /// BL-2: writes `buf`'s frames at `lba` (no bounce on the way down; the bottom device gathers if it must).
+    pub fn write_frames(self: &Arc<Self>, lba: u64, buf: &IoBuf, fua: bool, prio: IoPriority) -> Result<(), BlockError> {
+        self.submit(Kind::Write { fua, preflush: false }, lba, 0, Data::Frames(buf.clone()), prio)?.wait().map(|_| ())
+    }
+
     /// Writes page-cache pages (gather). `fua`: durable on completion.
     pub fn write_pages(self: &Arc<Self>, lba: u64, segs: Vec<PageSeg>, fua: bool, prio: IoPriority) -> Result<(), BlockError> {
         self.submit(Kind::Write { fua, preflush: false }, lba, 0, Data::Pages(segs), prio)?.wait().map(|_| ())
@@ -616,425 +896,20 @@ impl Disk {
     }
 
     /// fsync's last step (INT-W12, VS-2b CR 3): every flush answered before is durable (`BlockDevice::settle`).
-    /// Runs on the caller's thread, not through the dispatcher, so a device that waits here (bitsvol until a
+    /// Runs on the caller's thread, not through the queue, so a device that waits here (bitsvol until a
     /// snapshot's commit) never holds up other requests.
     pub fn settle(&self) -> Result<(), BlockError> {
         self.dev.settle().map_err(BlockError::from_dev)
     }
 
+    /// VS-H CR 5: whether the last failed request ended in a timeout, and forgets it. A file system tells by this
+    /// a slow device, where the same write can go again, from a media error: both answer EIO to programs.
+    pub fn take_timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Relaxed) && self.timed_out.swap(false, Ordering::Relaxed)
+    }
+
     pub fn discard(self: &Arc<Self>, lba: u64, blocks: u64, prio: IoPriority) -> Result<(), BlockError> {
         self.submit(Kind::Discard, lba, blocks, Data::None, prio)?.wait().map(|_| ())
-    }
-
-    // ---- dispatching
-
-    fn limits(&self) -> Limits {
-        let info = self.dev.info();
-        Limits {
-            max_blocks: (info.max_blocks_per_request as u64).max(1),
-            max_discard_blocks: u64::MAX >> 1,
-            age_ns: self.age_ns.load(Ordering::Relaxed),
-        }
-    }
-
-    fn has_work(&self) -> bool {
-        let q = self.q.lock();
-        !q.elev.is_empty() || q.stopped
-    }
-
-    /// The next step for the dispatcher; None when the queue is empty. Every step takes at least one request
-    /// out of the queue, so `drain` ends even when memory has run out (no spinning on a queue it cannot serve).
-    fn next(&self) -> Option<Step> {
-        let lim = self.limits();
-        let now = now();
-        let mut q = self.q.lock();
-        let b = match q.elev.pick(now, &lim)? {
-            Ok(b) => b,
-            Err(e) => {
-                // No memory for the elevator's working lists: the chosen request fails with ENOMEM.
-                let r = q.reqs.iter().position(|r| r.id == e.id).map(|i| q.reqs.remove(i));
-                drop(q);
-                if let Some(r) = r {
-                    self.finish(&r, Err(BlockError::NoMemory));
-                }
-                return Some(Step::NoMemory { kind: e.kind, lba: e.lba, blocks: e.blocks, members: 1 });
-            }
-        };
-        let mut reqs = Vec::new();
-        if reqs.try_reserve_exact(b.members.len()).is_err() {
-            // No memory for a list of pointers: the members fail with ENOMEM (nothing allocates here).
-            for m in &b.members {
-                if let Some(i) = q.reqs.iter().position(|r| r.id == m.id) {
-                    let r = q.reqs.remove(i);
-                    self.finish(&r, Err(BlockError::NoMemory));
-                }
-            }
-            return Some(Step::NoMemory { kind: b.kind, lba: b.lba, blocks: b.blocks, members: b.members.len() });
-        }
-        for m in &b.members {
-            if let Some(r) = q.reqs.iter().find(|r| r.id == m.id) {
-                reqs.push(r.clone());
-            }
-        }
-        Some(Step::Run(b, reqs))
-    }
-
-    /// Takes and runs batches until the queue is empty.
-    fn drain(&self) {
-        while let Some(step) = self.next() {
-            match step {
-                Step::Run(b, reqs) => self.execute(&b, &reqs),
-                Step::NoMemory { kind, lba, blocks, members } => {
-                    ERRORS.add(members as u64);
-                    self.stats.errors.fetch_add(members as u64, Ordering::Relaxed);
-                    klog::event!(Warn, "block", "req.nomem", disk = self.name.clone(), op = kind.as_str(), lba = lba, blocks = blocks,
-                        members = members; "no memory to build the batch: its requests fail with ENOMEM");
-                }
-            }
-        }
-    }
-
-    /// Host tests: the next `n` picks of the elevator find no memory.
-    #[cfg(test)]
-    pub(crate) fn inject_pick_oom(&self, n: u32) {
-        self.q.lock().elev.oom_picks = n;
-    }
-
-    fn worker(self: Arc<Self>) {
-        klog::event!(Debug, "block", "worker.started", disk = self.name.clone());
-        loop {
-            self.drain();
-            if self.q.lock().stopped {
-                break;
-            }
-            self.work.wait_until_timeout(|| self.has_work(), IDLE_NS);
-        }
-        self.fail_queued();
-        self.worker_done.store(true, Ordering::Release);
-        klog::event!(Debug, "block", "worker.ended", disk = self.name.clone());
-    }
-
-    /// Waits for `req` (inline: dispatching in turn with the other waiters). True when it completed.
-    fn wait_req(&self, req: &Arc<Req>, timeout_ns: u64) -> bool {
-        if self.mode.load(Ordering::Acquire) != MODE_INLINE {
-            return req.done.wait_timeout(timeout_ns);
-        }
-        let start = now();
-        let mut spins: u64 = 0;
-        loop {
-            if req.done.is_done() {
-                return true;
-            }
-            if self.dispatching.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                self.drain();
-                self.dispatching.store(false, Ordering::Release);
-                if req.done.is_done() {
-                    return true;
-                }
-                // Not queued at all (RB-14: held back by a closed disk): wait out the deadline below, do not
-                // spin on an empty queue.
-            }
-            // Without a clock (host) the deadline counts polls instead.
-            let elapsed = match ksync::now_ns() {
-                Some(n) => n.saturating_sub(start),
-                None => {
-                    spins += 1;
-                    spins.saturating_mul(INLINE_POLL_NS)
-                }
-            };
-            if elapsed >= timeout_ns {
-                return req.done.is_done();
-            }
-            if req.done.wait_timeout(INLINE_POLL_NS.min(timeout_ns - elapsed)) {
-                return true;
-            }
-        }
-    }
-
-    /// Takes a request that has not reached the device out of the queue. True when it was still queued.
-    fn cancel(&self, req: &Arc<Req>) -> bool {
-        let removed = {
-            let mut q = self.q.lock();
-            let r = q.elev.remove(req.id).is_some();
-            if r {
-                q.reqs.retain(|x| x.id != req.id);
-            }
-            let before = q.held.len();
-            q.held.retain(|(e, _)| e.id != req.id);
-            r || q.held.len() != before
-        };
-        if removed {
-            TIMEOUTS.inc();
-            self.stats.timeouts.fetch_add(1, Ordering::Relaxed);
-            klog::event!(Warn, "block", "req.timeout", disk = self.name.clone(), op = req.kind.as_str(), lba = req.lba, blocks = req.blocks;
-                "taken out of the queue before the device got it");
-            self.finish(req, Err(BlockError::Timeout));
-        }
-        removed
-    }
-
-    fn finish(&self, req: &Arc<Req>, r: Result<(), BlockError>) {
-        *req.result.lock() = Some(r);
-        req.done.complete();
-    }
-
-    fn execute(&self, b: &Batch, reqs: &[Arc<Req>]) {
-        let t0 = now();
-        self.execute_inner(b, reqs);
-        self.stats.busy_ns.fetch_add(now().saturating_sub(t0), Ordering::Relaxed);
-    }
-
-    fn execute_inner(&self, b: &Batch, reqs: &[Arc<Req>]) {
-        DISPATCHES.inc();
-        self.stats.dispatches.fetch_add(1, Ordering::Relaxed);
-        if reqs.len() > 1 {
-            MERGED.add(reqs.len() as u64 - 1);
-            self.stats.merged.fetch_add(reqs.len() as u64 - 1, Ordering::Relaxed);
-        }
-        if b.aged {
-            AGED.inc();
-            self.stats.aged.fetch_add(1, Ordering::Relaxed);
-        }
-        let r = self.run(b.kind, b.lba, b.blocks, b.prio, reqs);
-        if r.is_err() && reqs.len() > 1 && b.kind != Kind::Flush {
-            SPLIT_RETRIES.inc();
-            self.stats.merge_retries.fetch_add(1, Ordering::Relaxed);
-            klog::event!(Info, "block", "req.merged_failed", disk = self.name.clone(), op = b.kind.as_str(), lba = b.lba, blocks = b.blocks,
-                members = reqs.len(), error = r.err().map_or("", |e| e.as_str()); "each member tried alone");
-            for req in reqs {
-                let one = self.run(req.kind, req.lba, req.blocks, b.prio, core::slice::from_ref(req));
-                self.report(req.kind, req.lba, req.blocks, one);
-                self.done(req, one);
-            }
-        } else {
-            self.report(b.kind, b.lba, b.blocks, r);
-            for req in reqs {
-                self.done(req, r);
-            }
-        }
-    }
-
-    fn report(&self, kind: Kind, lba: u64, blocks: u64, r: Result<(), BlockError>) {
-        if let Err(e) = r {
-            ERRORS.inc();
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            klog::event!(Warn, "block", "req.failed", disk = self.name.clone(), op = kind.as_str(), lba = lba, blocks = blocks, error = e.as_str());
-        }
-    }
-
-    fn done(&self, req: &Arc<Req>, r: Result<(), BlockError>) {
-        if r.is_ok() {
-            self.note_done(req.kind);
-            let bytes = req.blocks * self.block_size as u64;
-            match req.kind {
-                Kind::Read => self.stats.read_bytes.fetch_add(bytes, Ordering::Relaxed),
-                Kind::Write { .. } => self.stats.write_bytes.fetch_add(bytes, Ordering::Relaxed),
-                Kind::Discard | Kind::Flush => 0,
-            };
-        }
-        self.q.lock().reqs.retain(|x| x.id != req.id);
-        self.finish(req, r);
-    }
-
-    /// One device operation for `reqs` (one request, or the members of a merged batch in LBA order).
-    fn run(&self, kind: Kind, lba: u64, blocks: u64, prio: IoPriority, reqs: &[Arc<Req>]) -> Result<(), BlockError> {
-        let dev = |r: Result<(), DevError>| r.map_err(BlockError::from_dev);
-        match kind {
-            Kind::Flush => dev(self.dev.flush()),
-            Kind::Discard => dev(self.dev.discard(lba, blocks)),
-            Kind::Read | Kind::Write { .. } => {
-                let (write, fua) = match kind {
-                    Kind::Write { fua, preflush } => {
-                        if preflush {
-                            dev(self.dev.flush())?;
-                        }
-                        (true, fua)
-                    }
-                    _ => (false, false),
-                };
-                // The members' memory, taken out for the time of the device call.
-                let mut datas: Vec<Data> = Vec::new();
-                datas.try_reserve_exact(reqs.len()).map_err(|_| BlockError::NoMemory)?;
-                for r in reqs {
-                    datas.push(core::mem::take(&mut *r.data.lock()));
-                }
-                let res = self.move_data(write, fua, lba, blocks, prio, reqs, &mut datas);
-                for (r, d) in reqs.iter().zip(datas) {
-                    *r.data.lock() = d;
-                }
-                res
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn move_data(&self, write: bool, fua: bool, lba: u64, blocks: u64, prio: IoPriority, reqs: &[Arc<Req>], datas: &mut [Data]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        // One request with a plain buffer: straight through.
-        if let [Data::Bytes(b)] = datas {
-            let r = if write { self.dev.write_blocks(lba, b, fua, prio) } else { self.dev.read_blocks(lba, b, prio) };
-            return r.map_err(BlockError::from_dev);
-        }
-        let max = (self.dev.info().max_blocks_per_request as u64).max(1);
-        let chunk = max.max(CHUNK_BYTES / bs).min(blocks.max(1));
-        let mut bounce: Vec<u8> = Vec::new();
-        let cap = usize::try_from(chunk * bs).map_err(|_| BlockError::NoMemory)?;
-        bounce.try_reserve_exact(cap).map_err(|_| BlockError::NoMemory)?;
-        let end = lba + blocks;
-        let mut at = lba;
-        while at < end {
-            let n = chunk.min(end - at);
-            let len = (n * bs) as usize;
-            bounce.clear();
-            bounce.resize(len, 0);
-            let overlap = |r: &Req| -> Option<(u64, u64)> {
-                let (lo, hi) = (r.lba.max(at), r.end().min(at + n));
-                (lo < hi).then_some((lo, hi))
-            };
-            if write {
-                for (r, d) in reqs.iter().zip(datas.iter()) {
-                    if let Some((lo, hi)) = overlap(r) {
-                        d.copy_out(((lo - r.lba) * bs) as usize, &mut bounce[((lo - at) * bs) as usize..((hi - at) * bs) as usize]);
-                    }
-                }
-                self.dev.write_blocks(at, &bounce, fua, prio).map_err(BlockError::from_dev)?;
-            } else {
-                self.dev.read_blocks(at, &mut bounce, prio).map_err(BlockError::from_dev)?;
-                for (r, d) in reqs.iter().zip(datas.iter_mut()) {
-                    if let Some((lo, hi)) = overlap(r) {
-                        d.copy_in(((lo - r.lba) * bs) as usize, &bounce[((lo - at) * bs) as usize..((hi - at) * bs) as usize]);
-                    }
-                }
-            }
-            at += n;
-        }
-        Ok(())
-    }
-
-    /// Ends the disk: queued requests fail with `Gone`, new ones are refused, the dispatcher thread ends.
-    /// Requests the device has already finish normally.
-    pub fn stop(&self) {
-        {
-            let mut q = self.q.lock();
-            if q.stopped {
-                return;
-            }
-            q.stopped = true;
-        }
-        self.fail_queued();
-        let held = core::mem::take(&mut self.q.lock().held);
-        for (_, r) in &held {
-            self.finish(r, Err(BlockError::Gone));
-        }
-        self.work.wake_all();
-    }
-
-    fn fail_queued(&self) -> usize {
-        let failed: Vec<Arc<Req>> = {
-            let mut q = self.q.lock();
-            let ids: Vec<u64> = q.elev.entries().iter().map(|e| e.id).collect();
-            let mut out = Vec::new();
-            for id in ids {
-                q.elev.remove(id);
-                if let Some(i) = q.reqs.iter().position(|r| r.id == id) {
-                    out.push(q.reqs.remove(i));
-                }
-            }
-            out
-        };
-        for r in &failed {
-            self.finish(r, Err(BlockError::Gone));
-        }
-        failed.len()
-    }
-
-    // ---- RB-14: the storage stop before a reset (`crate::shutdown`)
-
-    /// What a completed request leaves for the stop: a write makes the device cache dirty (a FUA write is
-    /// durable itself but leaves the others as they were), a flush cleans it. One dispatcher (or one inline
-    /// waiter) runs the batches one at a time, so no write completes while a flush is at the device.
-    fn note_done(&self, kind: Kind) {
-        match kind {
-            Kind::Write { fua, .. } => {
-                self.written.store(true, Ordering::Release);
-                self.last_write_ns.store(now(), Ordering::Release);
-                if !fua {
-                    self.dirty.store(true, Ordering::Release);
-                }
-            }
-            Kind::Flush => self.dirty.store(false, Ordering::Release),
-            Kind::Read | Kind::Discard => {}
-        }
-    }
-
-    /// Holds new requests back from now on (they wait for `reopen`); what is queued still runs. Returns
-    /// (queued, at the device).
-    pub fn close(&self) -> (usize, usize) {
-        let mut q = self.q.lock();
-        q.closed = true;
-        let queued = q.elev.entries().len();
-        (queued, q.reqs.len().saturating_sub(queued))
-    }
-
-    /// Takes requests again (a Reload that did not happen, ktests): the held ones are queued in their order.
-    pub fn reopen(&self) {
-        let mut lost: Vec<Arc<Req>> = Vec::new();
-        let queued = {
-            let mut q = self.q.lock();
-            q.closed = false;
-            let held = core::mem::take(&mut q.held);
-            let n = held.len();
-            for (e, r) in held {
-                if q.reqs.try_reserve(1).is_err() || q.elev.push(e).is_err() {
-                    let _ = lost.try_reserve(1).map(|()| lost.push(r));
-                    continue;
-                }
-                q.reqs.push(r);
-            }
-            n
-        };
-        for r in &lost {
-            self.finish(r, Err(BlockError::NoMemory));
-        }
-        if queued > 0 && self.mode.load(Ordering::Acquire) == MODE_THREAD {
-            self.work.wake_all();
-        }
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.q.lock().closed
-    }
-
-    /// (queued, at the device): requests not answered yet (without the ones held back by `close`).
-    pub fn pending(&self) -> (usize, usize) {
-        let q = self.q.lock();
-        let queued = q.elev.entries().len();
-        (queued, q.reqs.len().saturating_sub(queued))
-    }
-
-    /// Fails what is still queued (not at the device, not held) with `Gone`; returns how many.
-    pub fn fail_waiting(&self) -> usize {
-        self.fail_queued()
-    }
-
-    /// (a write completed since boot, a write completed after the last flush, when the last write completed).
-    pub fn write_state(&self) -> (bool, bool, u64) {
-        (self.written.load(Ordering::Acquire), self.dirty.load(Ordering::Acquire), self.last_write_ns.load(Ordering::Acquire))
-    }
-
-    /// Requests held back by `close`.
-    pub fn held(&self) -> usize {
-        self.q.lock().held.len()
-    }
-
-    /// The stop's cache flush (Linux `sd_shutdown` -> `sd_sync_cache`): straight to the device, past the closed
-    /// queue. Only after `pending` read (0, 0): nothing of this disk is at the device then.
-    pub fn shutdown_flush(&self) -> Result<(), BlockError> {
-        let r = self.dev.flush().map_err(BlockError::from_dev);
-        if r.is_ok() {
-            self.dirty.store(false, Ordering::Release);
-        }
-        r
     }
 }
 
@@ -1061,7 +936,8 @@ pub fn stick_str(s: StickMatch) -> &'static str {
 }
 
 /// A `Disk` is a `C: BlockDevice` itself, so partitions, crypt and bitsvol stack on it and their writes pass
-/// its hook. Byte-slice calls copy once through the request's own buffer.
+/// its hook. Byte-slice reads go straight into the caller's buffer when they can (`Disk::read`), frames pass
+/// down unchanged (BL-2).
 pub struct DiskDevice(pub Arc<Disk>);
 
 impl BlockDevice for DiskDevice {
@@ -1087,5 +963,73 @@ impl BlockDevice for DiskDevice {
     }
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
         self.0.discard(lba, blocks, IoPriority::Background).map_err(BlockError::to_dev)
+    }
+    fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {
+        self.0.read_frames(reqs, prio).map_err(BlockError::to_dev)
+    }
+    fn write_frames(&self, lba: u64, buf: &IoBuf, fua: bool, prio: IoPriority) -> Result<(), DevError> {
+        self.0.write_frames(lba, buf, fua, prio).map_err(BlockError::to_dev)
+    }
+    fn queue_depth(&self) -> u32 {
+        self.0.slots
+    }
+}
+
+/// The layer below a disk that keeps its own copy of the windows (the NVMe controller's command builder, NV-2p): the
+/// boot ESP's window opens and closes there with the disk's, so both layers allow the same ranges.
+pub trait LowerWindow: Send + Sync {
+    /// False: it did not open (its own window is not the one this disk has).
+    fn open_boot(&self, first: u64, blocks: u64) -> bool;
+    fn close_boot(&self);
+}
+
+/// NV-2p: a partition's way down to its disk when that disk may hold a window (the driver stacks each NVMe
+/// partition on one): reads as `DiskDevice`, writes and discards pass `Disk::check_port`, so only the partition
+/// whose range the armed window is takes any.
+pub struct PartPort {
+    disk: Arc<Disk>,
+    port: (u64, u64),
+}
+
+impl BlockDevice for PartPort {
+    fn name(&self) -> &str {
+        &self.disk.name
+    }
+    fn info(&self) -> BlockInfo {
+        let mut i = self.disk.dev.info();
+        i.read_only |= self.disk.check_port(Kind::Write { fua: false, preflush: false }, self.port, None).is_err();
+        i
+    }
+    fn read_blocks(&self, lba: u64, buf: &mut [u8], prio: IoPriority) -> Result<(), DevError> {
+        self.disk.read(lba, buf, prio).map_err(BlockError::to_dev)
+    }
+    fn write_blocks(&self, lba: u64, buf: &[u8], fua: bool, prio: IoPriority) -> Result<(), DevError> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(buf.len()).map_err(|_| DevError::NoMemory)?;
+        v.extend_from_slice(buf);
+        let t = self.disk.submit_via(Some(self.port), Kind::Write { fua, preflush: false }, lba, 0, Data::Bytes(v), prio).map_err(BlockError::to_dev)?;
+        t.wait().map(|_| ()).map_err(BlockError::to_dev)
+    }
+    fn flush(&self) -> Result<(), DevError> {
+        self.disk.flush(IoPriority::Normal).map_err(BlockError::to_dev)
+    }
+    fn settle(&self) -> Result<(), DevError> {
+        self.disk.settle().map_err(BlockError::to_dev)
+    }
+    fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
+        let t = self.disk.submit_via(Some(self.port), Kind::Discard, lba, blocks, Data::None, IoPriority::Background).map_err(BlockError::to_dev)?;
+        t.wait().map(|_| ()).map_err(BlockError::to_dev)
+    }
+    /// Reads stay unchecked, as `read_blocks`.
+    fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {
+        self.disk.read_frames(reqs, prio).map_err(BlockError::to_dev)
+    }
+    /// Through `Disk::check_port`, per request, as `write_blocks`.
+    fn write_frames(&self, lba: u64, buf: &IoBuf, fua: bool, prio: IoPriority) -> Result<(), DevError> {
+        let t = self.disk.submit_via(Some(self.port), Kind::Write { fua, preflush: false }, lba, 0, Data::Frames(buf.clone()), prio).map_err(BlockError::to_dev)?;
+        t.wait().map(|_| ()).map_err(BlockError::to_dev)
+    }
+    fn queue_depth(&self) -> u32 {
+        self.disk.slots
     }
 }

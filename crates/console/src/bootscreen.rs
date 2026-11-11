@@ -42,6 +42,8 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 static DESKTOP: AtomicBool = AtomicBool::new(false);
 static PROGRAM: SpinLock<Option<String>> = SpinLock::named("console.desktop_program", None);
 static SINK_ADDED: AtomicBool = AtomicBool::new(false);
+/// GX-8c: the desktop's start waits until this `time::now_ns` (0: nothing holds it).
+static DESKTOP_HOLD: AtomicU64 = AtomicU64::new(0);
 /// A panic ended the boot screen and the text console is not painted over it yet: every emergency line retries
 /// until one gets the VT and the frame (the first may find either busy).
 static PANIC_REPAINT: AtomicBool = AtomicBool::new(false);
@@ -75,6 +77,21 @@ pub fn desktop_program() -> String {
 }
 
 /// What became of init so far (from the log).
+/// GX-8c: a driver that comes up at boot holds the desktop's start until `until_ns` at the latest.
+pub fn hold_desktop(until_ns: u64) {
+    DESKTOP_HOLD.store(until_ns, Ordering::Release);
+}
+
+/// GX-8c: its end; the desktop may start.
+pub fn release_desktop() {
+    DESKTOP_HOLD.store(0, Ordering::Release);
+}
+
+/// GX-8c: until when the desktop's start waits, if anything holds it.
+pub fn desktop_hold() -> Option<u64> {
+    Some(DESKTOP_HOLD.load(Ordering::Acquire)).filter(|&t| t != 0)
+}
+
 pub fn init_state() -> Init {
     STEPS.lock().init
 }

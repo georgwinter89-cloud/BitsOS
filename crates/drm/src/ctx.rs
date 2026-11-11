@@ -8,12 +8,13 @@ use crate::file::DrmFile;
 use crate::gpu::GpuDevice;
 use crate::uapi::*;
 use crate::entity::{self, CtxEntity};
+use crate::job::ResetSnaps;
 use crate::wire::Wire;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use ksync::SpinLock;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use linux::errno::*;
 use vfs::Errno;
 
@@ -24,9 +25,8 @@ static UIDS: AtomicU64 = AtomicU64::new(1);
 pub struct GpuCtx {
     uid: u64,
     priority: i32,
-    /// `reset_counter` at creation and at the last QUERY_STATE; [`GpuCtx::blame`] moves both off the device's.
-    reset_counter: AtomicU32,
-    reset_counter_query: AtomicU32,
+    /// `reset_counter` at creation and at the last QUERY_STATE; [`crate::job::Entity::blame`] moves both off the device's.
+    snaps: Arc<ResetSnaps>,
     /// `amdgpu_vm_generation` at creation (the VRAM-lost counter; one VM per file comes with GEM_VA).
     generation: u32,
     /// Shared with its entities' jobs: the backend sets it when one of them hangs (`ctx->guilty`).
@@ -40,16 +40,6 @@ pub struct GpuCtx {
 }
 
 impl GpuCtx {
-    /// GR-3, `Action::Blame` of a queue-scope recovery, as `amdgpu_fmt::told::Counters::blame`: Mesa reads GUILTY only
-    /// inside RESET and such a recovery does not move the device's counter, so the context's own snapshots leave it.
-    /// Off for good as after a real move; the old query answers UNKNOWN_RESET once.
-    pub fn blame(&self, gpu: &dyn GpuDevice) {
-        self.guilty.store(true, Ordering::Release);
-        let now = gpu.reset_counter();
-        for snap in [&self.reset_counter, &self.reset_counter_query] {
-            let _ = snap.compare_exchange(now, now.wrapping_sub(1), Ordering::AcqRel, Ordering::Acquire);
-        }
-    }
     pub fn priority(&self) -> i32 {
         self.priority
     }
@@ -73,7 +63,7 @@ impl GpuCtx {
             match m.get(&(ip_type, ring)) {
                 Some(e) => e.clone(),
                 None => {
-                    let e = Arc::new(CtxEntity::new(ip_type, ring, self.priority, self.guilty.clone()));
+                    let e = Arc::new(CtxEntity::new(ip_type, ring, self.priority, self.guilty.clone(), self.snaps.clone()));
                     m.insert((ip_type, ring), e.clone());
                     e
                 }
@@ -126,7 +116,7 @@ pub fn ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, Err
         AMDGPU_CTX_OP_QUERY_STATE => {
             let c = lookup(ctx.file, a.ctx_id)?;
             let now = gpu.reset_counter();
-            let before = c.reset_counter_query.swap(now, Ordering::AcqRel);
+            let before = c.snaps.reset_counter_query.swap(now, Ordering::AcqRel);
             let status = if before == now { AMDGPU_CTX_NO_RESET } else { AMDGPU_CTX_UNKNOWN_RESET };
             state_out(data, 0, status);
             Ok(0)
@@ -134,7 +124,7 @@ pub fn ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, Err
         AMDGPU_CTX_OP_QUERY_STATE2 => {
             let c = lookup(ctx.file, a.ctx_id)?;
             let mut flags = 0u64;
-            if c.reset_counter.load(Ordering::Acquire) != gpu.reset_counter() {
+            if c.snaps.reset_counter.load(Ordering::Acquire) != gpu.reset_counter() {
                 flags |= AMDGPU_CTX_QUERY2_FLAGS_RESET as u64;
             }
             if c.generation != gpu.vram_lost_counter() {
@@ -199,8 +189,7 @@ fn alloc(ctx: &Ctx, gpu: &dyn GpuDevice, priority: i32) -> Result<u32, Errno> {
     let c = Arc::new(GpuCtx {
         uid: UIDS.fetch_add(1, Ordering::Relaxed),
         priority,
-        reset_counter: AtomicU32::new(gpu.reset_counter()),
-        reset_counter_query: AtomicU32::new(gpu.reset_counter()),
+        snaps: Arc::new(ResetSnaps::new(gpu.reset_counter())),
         generation: gpu.vram_lost_counter(),
         guilty: Arc::new(AtomicBool::new(false)),
         entities: SpinLock::named("drm.ctx.entities", BTreeMap::new()),

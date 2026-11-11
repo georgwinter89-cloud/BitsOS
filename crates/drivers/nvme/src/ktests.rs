@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use devmodel::DevError;
 use devmodel::block::{BlockDevice, IoPriority};
-use ktest::{TestResult, kassert, ktest, skip};
+use ktest::{TestResult, kassert, ktest, fail};
 
 const SEC: u64 = 1_000_000_000;
 /// blkdebug's read error on NVQ0 ns1 (host/tests/nv/10-nvme.sh `eio.conf`).
@@ -25,7 +25,7 @@ fn ready() -> Result<Vec<Arc<Nvme>>, TestResult> {
     }
     let all = controllers();
     if all.is_empty() {
-        return Err(skip("no NVMe controller"));
+        return Err(fail("no NVMe controller"));
     }
     Ok(all)
 }
@@ -34,7 +34,7 @@ fn by_serial(serial: &str) -> Result<Arc<Nvme>, TestResult> {
     let all = ready()?;
     all.into_iter()
         .find(|c| c.info().ident.is_some_and(|i| i.serial == serial))
-        .ok_or_else(|| skip(&format!("no controller with serial {serial} (host/tests/nv images)")))
+        .ok_or_else(|| fail(&format!("no controller with serial {serial} (host/tests/nv images)")))
 }
 
 macro_rules! need {
@@ -48,8 +48,9 @@ macro_rules! need {
 
 fn no_write_opcodes() -> TestResult {
     for op in cmd::IO_OPS {
-        kassert!(!MEDIA_WRITE_IO_OPS.contains(&(op as u8)), "I/O opcode {:?} writes media", op);
+        kassert!(!cmd::NEVER_BUILT_IO_OPS.contains(&(op as u8)), "I/O opcode {:?} must not exist", op);
     }
+    kassert!(cmd::NEVER_BUILT_IO_OPS.iter().all(|o| MEDIA_WRITE_IO_OPS.contains(o)), "the never-built list left the media-writing list");
     for op in cmd::ADMIN_OPS {
         kassert!(!cmd::MEDIA_WRITE_ADMIN_OPS.contains(&(op as u8)), "admin opcode {:?} changes media", op);
     }
@@ -71,7 +72,7 @@ fn ident() -> TestResult {
     }
     Ok(())
 }
-ktest!("nv.ident", Safe, ident);
+ktest!("nv.ident", RunHw("nv/10-nvme"), ident);
 
 /// Every usable namespace: up to 1 MiB from block 0 read twice (same bytes), and the start again through the
 /// block layer's queue.
@@ -95,20 +96,24 @@ fn read() -> TestResult {
     }
     Ok(())
 }
-ktest!("nv.read", Safe, read);
+ktest!("nv.read", RunHw("nv/10-nvme"), read);
 
 /// R8a: no media-writing command was ever placed in a queue, and a write through the block layer or straight
 /// at the namespace device is refused before it reaches the controller.
 fn zero_writes() -> TestResult {
     let all = need!(ready());
     for c in &all {
-        kassert!(c.stats.media_writes() == 0, "{}: {} media-writing commands issued", c.name, c.stats.media_writes());
+        // NV-2p: a controller with a checked window has /data on it: its commands and SMART counters move by right.
+        // The refusals below hold for it all the same: LBA 0 lies outside every window.
+        let armed = c.window().is_some();
+        kassert!(armed || c.stats.media_writes() == 0, "{}: {} media-writing commands issued", c.name, c.stats.media_writes());
         // The device's own word too (not only the driver's counters): SMART Host Write Commands and Data Units
         // Written must not move over reads, a flush and the refused writes below.
         let smart_before = c.smart().map_err(|e| format!("{}: SMART: {e}", c.name))?;
         let (_, io) = c.stats.used();
         kassert!(io.iter().all(|(op, _)| cmd::IO_OPS.iter().any(|o| *o as u8 == *op)), "{}: I/O opcodes {:?}", c.name, io);
         let before: u64 = io.iter().map(|x| x.1).sum();
+        let refused0 = c.stats.media_writes();
         for ns in c.info().namespaces.iter().filter(|n| n.unusable.is_none()) {
             let disk = format!("{}n{}", c.name, ns.nsid);
             let Some(d) = block::find(&disk) else { continue };
@@ -118,27 +123,28 @@ fn zero_writes() -> TestResult {
             let dev = crate::ns::NsDevice::new(c.clone(), ns.nsid).ok_or_else(|| format!("{disk}: no device"))?;
             kassert!(dev.write_blocks(0, &buf, false, IoPriority::Normal) == Err(DevError::Refused), "{disk}: device write not refused");
             kassert!(dev.discard(0, 1) == Err(DevError::Refused), "{disk}: discard not refused");
-            kassert!(dev.info().read_only, "{disk}: not read-only");
+            kassert!(armed || dev.info().read_only, "{disk}: not read-only");
         }
         let after: u64 = c.stats.used().1.iter().map(|x| x.1).sum();
-        kassert!(after == before, "{}: refused writes still sent {} commands", c.name, after - before);
+        kassert!(armed || after == before, "{}: refused writes still sent {} commands", c.name, after - before);
+        kassert!(armed || c.stats.media_writes() == refused0, "{}: a refused write reached the queue", c.name);
         for ns in c.info().namespaces.iter().filter(|n| n.unusable.is_none()) {
             let mut buf = vec![0u8; (ns.block_size() as usize * 16).min(c.info().max_transfer.max(ns.block_size() as usize))];
             c.read(ns.nsid, 0, &mut buf, true).map_err(|e| format!("{}n{}: read: {}", c.name, ns.nsid, e.text()))?;
             c.flush(ns.nsid).map_err(|e| format!("{}n{}: flush: {}", c.name, ns.nsid, e.text()))?;
         }
         let smart_after = c.smart().map_err(|e| format!("{}: SMART: {e}", c.name))?;
-        kassert!(smart_after.host_writes == smart_before.host_writes, "{}: SMART host write commands {} -> {}", c.name,
+        kassert!(armed || smart_after.host_writes == smart_before.host_writes, "{}: SMART host write commands {} -> {}", c.name,
             smart_before.host_writes, smart_after.host_writes);
-        kassert!(smart_after.data_units_written == smart_before.data_units_written, "{}: SMART data units written {} -> {}", c.name,
+        kassert!(armed || smart_after.data_units_written == smart_before.data_units_written, "{}: SMART data units written {} -> {}", c.name,
             smart_before.data_units_written, smart_after.data_units_written);
-        kassert!(c.stats.media_writes() == 0, "{}: media writes", c.name);
+        kassert!(armed || c.stats.media_writes() == 0, "{}: media writes", c.name);
         klog::event!(Info, "nvme", "ktest.zero_writes", ctrl = c.name.as_str(), media_writes = c.stats.media_writes(), io_commands = after,
             smart_host_writes = smart_after.host_writes, smart_units_written = smart_after.data_units_written);
     }
     Ok(())
 }
-ktest!("nv.zero_writes", Safe, zero_writes);
+ktest!("nv.zero_writes", RunHw("nv/10-nvme"), zero_writes);
 
 fn smart() -> TestResult {
     let all = need!(ready());
@@ -150,7 +156,7 @@ fn smart() -> TestResult {
     }
     Ok(())
 }
-ktest!("nv.smart", Safe, smart);
+ktest!("nv.smart", RunHw("nv/10-nvme"), smart);
 
 fn flush() -> TestResult {
     let all = need!(ready());
@@ -161,31 +167,40 @@ fn flush() -> TestResult {
     }
     Ok(())
 }
-ktest!("nv.flush", Safe, flush);
+ktest!("nv.flush", RunHw("nv/10-nvme"), flush);
 
-/// With vectors, reads complete by interrupt on the I/O vector.
+/// With vectors, reads complete by interrupt on the I/O vectors (BL-1: the caller's CPU's queue, whichever it is).
 fn irq() -> TestResult {
     let all = need!(ready());
     let mut seen = 0;
     for c in &all {
         let i = c.info();
-        let Some(v) = i.io_vector else { continue };
+        let vs: Vec<u16> = i.queues.iter().filter_map(|q| q.vector).collect();
+        if vs.is_empty() {
+            continue;
+        }
         let Some(ns) = i.namespaces.iter().find(|n| n.unusable.is_none()) else { continue };
-        let before = crate::hw::Hw::irq_count(&c.hw, v);
+        let count = || vs.iter().map(|&v| crate::hw::Hw::irq_count(&c.hw, v)).sum::<u64>();
+        let before = count();
         let mut b = vec![0u8; i.max_transfer.min(ns.block_size() as usize * 64)];
         for _ in 0..8 {
             c.read(ns.nsid, 0, &mut b, true).map_err(|e| e.text())?;
         }
-        let after = crate::hw::Hw::irq_count(&c.hw, v);
-        kassert!(after > before, "{}: no interrupt on vector {} in 8 reads ({:?})", c.name, v, i.irq);
+        // A waiter may reap a completion (its spin) before the message reaches the vector's CPU.
+        let end = time::now_ns() + SEC;
+        while count() == before && time::now_ns() < end {
+            sched::sleep_ns(1_000_000);
+        }
+        let after = count();
+        kassert!(after > before, "{}: no interrupt on the I/O vectors {:?} in 8 reads ({:?})", c.name, vs, i.irq);
         seen += 1;
     }
     if seen == 0 {
-        return skip("every controller is polled");
+        return fail("every controller is polled");
     }
     Ok(())
 }
-ktest!("nv.irq", Safe, irq);
+ktest!("nv.irq", RunHw("nv/10-nvme"), irq);
 
 fn pattern_ok(c: &Nvme, nsid: u32, seed: u8, lba: u64, len: usize) -> TestResult {
     let mut b = vec![0u8; len];
@@ -208,7 +223,7 @@ fn qemu_pattern() -> TestResult {
     }
     Ok(())
 }
-ktest!("nv.qemu.pattern", QemuOnly, qemu_pattern);
+ktest!("nv.qemu.pattern", Run("nv/10-nvme"), qemu_pattern);
 
 /// The fake Windows namespace (NVQ0 ns3) and the Linux GPT (NVQ1 ns1, 4 KiB blocks): verdicts, partitions as
 /// Stacked disks, reads at their offsets, every write refused.
@@ -249,7 +264,7 @@ fn gpt() -> TestResult {
     kassert!(q0.stats.media_writes() == 0 && q1.stats.media_writes() == 0, "media writes");
     Ok(())
 }
-ktest!("nv.gpt", QemuOnly, gpt);
+ktest!("nv.gpt", Run("nv/10-nvme"), gpt);
 
 /// Error answers: past the end (the device's LBA Out of Range), an unknown namespace, blkdebug's read error;
 /// the controller stays ready and reads go on.
@@ -275,7 +290,7 @@ fn errors() -> TestResult {
     pattern_ok(&c, 1, 1, BAD_SECTOR + 8, 4096)?;
     Ok(())
 }
-ktest!("nv.errors", QemuOnly, errors);
+ktest!("nv.errors", Run("nv/10-nvme"), errors);
 
 /// Quiesce (shutdown, EN=0, bus master off) and bring-up again, three times, with the disks staying usable.
 fn reset() -> TestResult {
@@ -293,7 +308,7 @@ fn reset() -> TestResult {
     d.read_vec(0, 4096, IoPriority::Normal).map_err(|e| e.as_str())?;
     Ok(())
 }
-ktest!("nv.reset", QemuOnly, reset);
+ktest!("nv.reset", Run("nv/10-nvme"), reset);
 
 /// The `nvme` MCP tool as a client calls it: the summary (media_writes=0), SMART, a short read speed, and a
 /// bad argument.
@@ -312,7 +327,9 @@ fn tool() -> TestResult {
     for c in &all {
         kassert!(s.contains(&format!("{} at ", c.name)), "no line for {}: {s}", c.name);
     }
-    kassert!(s.matches("media_writes=0 ").count() == all.len(), "media_writes not 0 everywhere: {s}");
+    // The disk that holds /data writes through its window; every other one never does.
+    let quiet = all.iter().filter(|c| c.window().is_none()).count();
+    kassert!(s.matches("media_writes=0 ").count() >= quiet, "media_writes not 0 where no window is: {s}");
     kassert!(s.matches("  smart warning=").count() == all.len(), "no SMART line: {s}");
     let first = &all[0];
     let nsid = first.info().namespaces.iter().find(|n| n.unusable.is_none()).map(|n| n.nsid).ok_or("no usable namespace")?;
@@ -326,4 +343,4 @@ fn tool() -> TestResult {
     kassert!(all.iter().all(|c| c.stats.media_writes() == 0), "media writes after the tool");
     Ok(())
 }
-ktest!("nv.tool", Safe, tool);
+ktest!("nv.tool", RunHw("nv/10-nvme"), tool);

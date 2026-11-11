@@ -310,7 +310,8 @@ fn threads_on(m: &Arc<Mixer>) -> TestResult {
                         return (Err(EPIPE), total);
                     }
                 }
-                (Err(EPIPE), 0) if xruns < ROUNDS => {
+                // xferi.result holds -EPIPE (linux-6.6/sound/core/pcm_native.c, snd_pcm_xferi_frames_ioctl), not 0.
+                (Err(EPIPE), _) if xruns < ROUNDS => {
                     xruns += 1;
                     if t.call(PCM_PREPARE, 0).is_err() {
                         return (Err(EPIPE), total);

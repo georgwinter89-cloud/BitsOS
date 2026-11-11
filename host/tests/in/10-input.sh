@@ -7,6 +7,10 @@
 # keyboards (device_del), then plugs a new keyboard in and types on it: input_check.py reads every step back
 # through the MCP tool `input` (the evdev events and the held-key state) and fails on anything missing or a key
 # that stays held.
+# Run: `cargo xtask fullrun`. The horizontal wheel is not checked here: QEMU's usb-mouse and usb-tablet have none (input_check.py
+# goes red if that changes). Report to event, with its sign and capability: the gate's host tests, `cargo test -p hidparse`,
+# five_button_mouse_with_wheel_and_ac_pan. Event to reader: evdev takes REL codes alike (crates/console/src/evdev.rs:952, by the
+# device's capabilities), which REL_WHEEL proves here. A device with AC Pan end to end has no test yet (notes ul-TS-2.md, request 6).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/in-10-input}"

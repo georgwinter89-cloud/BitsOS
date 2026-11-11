@@ -50,6 +50,9 @@ pub struct Group {
     pub(crate) owner_uid: AtomicU32,
     /// AB-13: the group's credentials (`cred.rs`); replaced whole by `Process::change_cred`.
     pub(crate) cred: SpinLock<Arc<crate::cred::Cred>>,
+    /// PF-7: the ids a file call needs, readable without that lock; written with it. Also whether the group left the
+    /// boot mount view (written under `nsset`'s lock).
+    pub(crate) published_ids: crate::cred::PublishedIds,
     /// SX-2: the pid namespace the group's ids live in (`task_active_pid_ns`, fixed for its life).
     pub pid_ns: Arc<crate::ns::pid::PidNs>,
     /// SX-2: its other namespaces (`nsproxy`, per group: see `ns`'s module doc); replaced whole.
@@ -130,6 +133,7 @@ impl Group {
         Arc::new(Group {
             tgid: ids.tgid,
             owner_uid: AtomicU32::new(ids.cred.uid),
+            published_ids: crate::cred::PublishedIds::new(&ids.cred, ids.nsset.in_copied_view()),
             cred: SpinLock::named("proc.cred", ids.cred),
             pid_ns: ids.pid_ns,
             nsset: SpinLock::named("proc.nsset", ids.nsset),
@@ -180,8 +184,16 @@ impl Group {
     }
     /// The old set is dropped after the lock (its last reference may free namespaces).
     pub(crate) fn set_nsset(&self, s: Arc<crate::ns::set::NsSet>) {
-        let old = core::mem::replace(&mut *self.nsset.lock(), s);
+        let mut l = self.nsset.lock();
+        self.published_ids.set_view_copied(s.in_copied_view());
+        let old = core::mem::replace(&mut *l, s);
+        drop(l);
         drop(old);
+    }
+    /// PF-7: the group left the boot mount view; what a syscall asks without `proc.nsset`. Another thread's unshare is
+    /// seen from the next call on (Linux's threads keep theirs; `ns`'s module doc says why V2's follow).
+    pub(crate) fn view_copied(&self) -> bool {
+        self.published_ids.view_copied()
     }
     /// SX-2: global id `id` as this group's pid namespace numbers it (0: not visible from here; Linux
     /// `pid_nr_ns(.., task_active_pid_ns(current))`).

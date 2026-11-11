@@ -20,7 +20,8 @@ def read_ppm(path):
     if parts[0] != b"P6":
         raise SystemExit(f"{path}: not a P6 PPM")
     w, h = int(parts[1]), int(parts[2])
-    return w, h, parts[4][: w * h * 3]
+    # From the end: split would also take a first pixel that reads as white space.
+    return w, h, data[-w * h * 3:]
 
 
 def write_png(path, w, h, rgb):
@@ -107,4 +108,6 @@ def main():
         raise SystemExit(__doc__)
 
 
-main()
+
+if __name__ == "__main__":
+    main()

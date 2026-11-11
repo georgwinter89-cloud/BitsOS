@@ -10,8 +10,8 @@ use ktest::{kassert, ktest};
 
 type R = ktest::TestResult;
 
-ktest!("cp.smp.limit_off", Safe, limit_off);
-ktest!("cp.smp.limit_cpus", Safe, limit_cpus);
+ktest!("cp.smp.limit_off", Run("cp/55-smp-limits"), limit_off);
+ktest!("cp.smp.limit_cpus", Run("cp/55-smp-limits"), limit_cpus);
 
 const CALL_NS: u64 = 1_000_000_000;
 
@@ -24,7 +24,7 @@ fn plus_one(x: u64) -> u64 {
 fn limit_off() -> R {
     let (lim, _) = config_limit();
     if !lim.bsp_only() {
-        return ktest::skip("CONFIG smp=off (or cpus=1) not set");
+        return ktest::fail("CONFIG smp=off (or cpus=1) not set");
     }
     let o = outcome().ok_or("the bring-up initcall did not run")?;
     kassert!(o.not_started == Some(lim.reason()), "not_started {:?}, wanted {:?}", o.not_started, lim.reason());
@@ -53,11 +53,11 @@ fn limit_off() -> R {
 fn limit_cpus() -> R {
     let (lim, _) = config_limit();
     let Some(max) = lim.max_cpus.filter(|_| !lim.bsp_only()) else {
-        return ktest::skip("CONFIG cpus=N (N >= 2) not set");
+        return ktest::fail("CONFIG cpus=N (N >= 2) not set");
     };
     let o = outcome().ok_or("the bring-up initcall did not run")?;
     if let Some(why) = o.not_started {
-        return ktest::skip(&format!("bring-up not started: {why}"));
+        return ktest::fail(&format!("bring-up not started: {why}"));
     }
     kassert!(o.limit == lim);
     kassert!(o.failed.is_empty(), "{} AP(s) failed", o.failed.len());

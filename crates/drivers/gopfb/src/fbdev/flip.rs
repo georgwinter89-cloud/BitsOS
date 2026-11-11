@@ -46,6 +46,22 @@ pub enum CursorError {
     Failed,
 }
 
+/// WY-17: one scanout buffer as a program gets it: `len` bytes at `phys`, linear XRGB8888, `stride` bytes per line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectBuffer {
+    pub phys: u64,
+    pub len: u64,
+    pub stride: u32,
+}
+
+/// WY-17: the buffer a program draws its next frame into; `whole`: something else wrote into the buffers since
+/// (the kernel's pointer, the console), so the frame must redraw all of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectFrame {
+    pub window: usize,
+    pub whole: bool,
+}
+
 pub trait ScanoutFlip: Send + Sync {
     /// Thread context: flipping works (attaches the engine on first use; may sleep).
     fn ready(&self) -> bool;
@@ -73,6 +89,26 @@ pub trait ScanoutFlip: Send + Sync {
     /// Thread context, at a rare state change (fbdev's take of the screen): after a late flip, flipping starts
     /// again if the engine shows A0 settled (V1 kept one image until the next start; V2 re-arms per surface).
     fn rearm(&self);
+    /// WY-17, thread context: scanout buffer `window` (0 = A0, 1 = A1), when the engine flips and the buffer can be
+    /// handed out (None: fbdev's own windows go out instead).
+    fn direct_buffer(&self, _window: usize) -> Option<DirectBuffer> {
+        None
+    }
+    /// WY-17, thread context, may sleep (bounded as `begin`): waits until the last flip landed and names the hidden
+    /// buffer. Unlike `begin` it repairs nothing and prepares nothing: the program draws into the buffer itself.
+    fn direct_begin(&self) -> Result<DirectFrame, FlipError> {
+        Err(FlipError::Off)
+    }
+    /// WY-17: orders the flip to `window`, which the program finished drawing: the same order `commit` gives, nothing
+    /// else is written (GX-D9). Its sequence number; the one already ordered when `window` is the shown buffer.
+    fn direct_flip(&self, _window: usize) -> Result<u64, FlipError> {
+        Err(FlipError::Off)
+    }
+    /// WY-17, thread context: the buffer shown now into `dst` (`stride` pixels per line, the visible size), for MCP
+    /// `screen` while no copy of the picture exists. False: it cannot be read.
+    fn read_shown(&self, _dst: &mut [u32], _stride: u32) -> bool {
+        false
+    }
     /// GX-5a, any context, lock-free: a hardware cursor is there (default: none, the compositor draws its own).
     fn cursor_ready(&self) -> bool {
         false

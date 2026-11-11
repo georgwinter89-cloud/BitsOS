@@ -11,7 +11,7 @@
 //! - `ul.pkg.libreoffice_convert`: the launcher's headless `--convert-to pdf` of a small text as uid 1000, with a
 //!   scratch HOME (LO_HOME): the new profile's restart (code 81) is handled by the launcher, the PDF is whole.
 
-use super::pkg::{Line, Sha256, TEST_STICK_ID, list, program_tree};
+use super::pkg::{Line, Sha256, TEST_STICK_ID, list, program_tree, tree_list};
 use super::{SEC, finish, read, scratch, start_as, text};
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -66,8 +66,8 @@ fn is_elf(path: &str) -> bool {
 }
 
 /// The tree and its launcher (pkg::program_tree: missing is a failure, never a skip).
-fn tree_lines(l: &str) -> Result<(Vec<Line<'_>>, String), String> {
-    program_tree(l, TREE, "libreoffice")
+fn tree_lines<'a>(l: &str, own: &'a str) -> Result<(Vec<Line<'a>>, String), String> {
+    program_tree(l, own, TREE, "libreoffice")
 }
 
 /// A shell command as uid `uid` (None: the spawn default) that must end with 0; its stdout.
@@ -82,7 +82,8 @@ fn sh(cmd: &str, uid: Option<u32>, secs: u64) -> Result<String, String> {
 /// icon themes, the libraries, then `libreoffice --check` and `--env`.
 fn libreoffice() -> TestResult {
     let l = list()?;
-    let (tree, launcher) = tree_lines(&l)?;
+    let own = tree_list(TREE)?;
+    let (tree, launcher) = tree_lines(&l, &own)?;
     let has = |rel: &str| tree.iter().any(|e| e.path.strip_prefix(TREE) == Some(rel));
     for rel in ["LICENSES/README.txt", "LICENSES/libreoffice.txt", "VERSION.txt", "program/soffice.bin", "share/registry/bitsos.xcd",
         "gtk/share/icons/hicolor/48x48/apps/libreoffice-writer.png", "gtk/share/icons/Adwaita/index.theme", "etc/fonts/fonts.conf"] {
@@ -183,15 +184,21 @@ fn env_ok(launcher: &str) -> TestResult {
     kassert!(lang == "de_DE.UTF-8" || lang == "en_US.UTF-8", "LANG={lang}\n{out}");
     kassert!(get("PATH").is_some_and(|p| p.ends_with(":/boot/BITSOS2/libreoffice/gtk/libexec")), "PATH\n{out}");
     kassert!(get("DISPLAY").is_none() && get("LO_HOME").is_none(), "an X display or a test setting leaks into LibreOffice\n{out}");
-    let data = read("/proc/self/mounts").lines().any(|l| {
+    // The mount table as the launcher sees it: this test may run on a kernel thread (MCP's `ktest`), which has no
+    // /proc/self (procfs `self_link`). Mini-PC 3.11.: the launcher saw /data, this test did not.
+    let mounts = sh("exec cat /proc/self/mounts", Some(1000), 60)?;
+    let lines: Vec<&str> = mounts.lines().filter(|l| l.split_whitespace().nth(1) == Some("/data")).collect();
+    // The launcher's own rule (`mounted_rw`): the last /data line that is read-write says the file system.
+    let fs = lines.iter().rev().find_map(|l| {
         let f: Vec<&str> = l.split_whitespace().collect();
-        f.len() > 3 && f[1] == "/data" && f[2] != "vfat" && f[3].split(',').next() == Some("rw")
+        (f.len() > 3 && f[3].split(',').next() == Some("rw")).then(|| f[2])
     });
+    let data = fs.is_some_and(|fs| fs != "vfat");
     let home = get("HOME").unwrap_or("");
     if data {
-        kassert!(home == "/data/home/1000", "a data volume is mounted, HOME={home}\n{out}");
+        kassert!(home == "/data/home/1000", "a data volume is mounted ({lines:?}), HOME={home}\n{out}");
     } else {
-        kassert!(home.ends_with("/home") && home.contains("/libreoffice"), "no data volume: HOME={home}, want the run folder's home in RAM\n{out}");
+        kassert!(home.ends_with("/home") && home.contains("/libreoffice"), "no writable data volume ({lines:?}): HOME={home}, want the run folder's home in RAM\n{out}");
     }
     klog::event!(Info, "ul", "pkg.libreoffice_env", home = home, lang = lang, data_volume = data);
     Ok(())
@@ -200,7 +207,8 @@ fn env_ok(launcher: &str) -> TestResult {
 /// The bigger files' SHA-256 (the others are hashed by `ul.pkg.libreoffice`).
 fn libreoffice_sha() -> TestResult {
     let l = list()?;
-    let (tree, _) = tree_lines(&l)?;
+    let own = tree_list(TREE)?;
+    let (tree, _) = tree_lines(&l, &own)?;
     let t0 = time::now_ns();
     let mut bytes = 0;
     for e in tree.iter().filter(|e| e.size > HASH_IN_MAIN) {
@@ -235,7 +243,8 @@ fn init_passwd() -> Result<String, String> {
 /// boot that is not a ktest boot, the Mini-PC's MCP run included) it is there and stays untouched.
 fn libreoffice_convert() -> TestResult {
     let l = list()?;
-    let (_, launcher) = tree_lines(&l)?;
+    let own = tree_list(TREE)?;
+    let (_, launcher) = tree_lines(&l, &own)?;
     let passwd = init_passwd()?;
     let d = scratch("lo-convert");
     let r = (|| -> TestResult {

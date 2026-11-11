@@ -231,17 +231,42 @@ impl SmolUdp {
     /// next call tries again).
     fn sync(&self) -> Result<(), NetError> {
         let cards = self.stack.iface_list();
-        let mut socks = self.socks.lock();
-        for c in cards.iter().skip(socks.len()) {
-            let mut s = new_socket(self.stack)?;
-            let ep = IpListenEndpoint { addr: (!self.ip.is_unspecified()).then(|| iface::v4(self.ip).into()), port: self.port };
-            if s.bind(ep).is_err() {
+        loop {
+            let have = self.socks.lock().len();
+            if have >= cards.len() {
+                return Ok(());
+            }
+            // The buffers (2 x 128 KiB a card) are made before `socks` is locked: under a spin lock the heap can
+            // neither reclaim nor fall back to single frames (see `sock::unix`'s `fill`) and refused them
+            // whenever no free run was at hand.
+            let mut fresh = Vec::with_capacity(cards.len() - have);
+            let mut refused = None;
+            for c in &cards[have..] {
+                let mut s = match new_socket(self.stack) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
+                };
+                let ep = IpListenEndpoint { addr: (!self.ip.is_unspecified()).then(|| iface::v4(self.ip).into()), port: self.port };
+                if s.bind(ep).is_ok() {
+                    fresh.push((c.clone(), s));
+                }
+            }
+            let mut socks = self.socks.lock();
+            // Another `sync` got there first: ours go (after the unlock), the next round looks again.
+            if socks.len() != have {
                 continue;
             }
-            let h = c.inner.lock().sockets.add(s);
-            socks.push((c.clone(), h));
+            // A card or two: no large block.
+            socks.reserve(fresh.len());
+            for (c, s) in fresh.drain(..) {
+                let h = c.inner.lock().sockets.add(s);
+                socks.push((c, h));
+            }
+            return refused.map_or(Ok(()), Err);
         }
-        Ok(())
     }
 
     fn send_on(&self, card: &Arc<Iface>, h: SocketHandle, buf: &[u8], to: SockAddr) -> Result<(), NetError> {

@@ -254,6 +254,20 @@ pub fn ldd_in(file: &Path, lib_path: Option<&Path>) -> Result<Vec<(String, PathB
 
 /// `ldd` with LD_LIBRARY_PATH=`lib_paths` joined by ':' (none: no LD_LIBRARY_PATH).
 pub fn ldd_paths(file: &Path, lib_paths: &[&Path]) -> Result<Vec<(String, PathBuf)>, String> {
+    let (found, not_found) = ldd_report(file, lib_paths)?;
+    match not_found.first() {
+        Some(name) => Err(no_host_lib(name)),
+        None => Ok(found),
+    }
+}
+
+/// The error for a library `ldd` did not find.
+pub fn no_host_lib(name: &str) -> String {
+    format!("needs {name}, which this host does not have")
+}
+
+/// `ldd_paths` that also returns the sonames `ldd` did not find instead of failing on them: (found, not found).
+pub fn ldd_report(file: &Path, lib_paths: &[&Path]) -> Result<(Vec<(String, PathBuf)>, Vec<String>), String> {
     let mut c = Command::new("ldd");
     c.arg(file).env("LC_ALL", "C");
     if !lib_paths.is_empty() {
@@ -263,7 +277,7 @@ pub fn ldd_paths(file: &Path, lib_paths: &[&Path]) -> Result<Vec<(String, PathBu
     if !o.status.success() {
         return Err(format!("ldd {}: {}", file.display(), String::from_utf8_lossy(&o.stderr).trim()));
     }
-    let mut v = Vec::new();
+    let (mut v, mut not_found) = (Vec::new(), Vec::new());
     for l in String::from_utf8_lossy(&o.stdout).lines() {
         let l = l.trim();
         // "libc.so.6 => /usr/lib/libc.so.6 (0x...)", "/lib64/ld-linux-x86-64.so.2 (0x...)" or "libx.so.1 => not found"
@@ -275,7 +289,8 @@ pub fn ldd_paths(file: &Path, lib_paths: &[&Path]) -> Result<Vec<(String, PathBu
             }
         };
         if file == "not found" {
-            return Err(format!("needs {name}, which this host does not have"));
+            not_found.push(name.to_string());
+            continue;
         }
         if !file.starts_with('/') {
             continue;
@@ -284,7 +299,7 @@ pub fn ldd_paths(file: &Path, lib_paths: &[&Path]) -> Result<Vec<(String, PathBu
         let real = std::fs::canonicalize(file).map_err(|e| format!("{file}: {e}"))?;
         v.push((soname, real));
     }
-    Ok(v)
+    Ok((v, not_found))
 }
 
 /// A program on PATH (util's `have_tool` is for tests only).
@@ -488,6 +503,15 @@ fn put_whole(from: &Path, to: &Path) -> Result<(), String> {
 /// libraries), appended to `out` as (kind, path below the stick's root, file).
 fn trees<'a>(items: &[Item], set: impl Iterator<Item = &'a (String, PathBuf)>, out: &mut Vec<(&'static str, String, PathBuf)>) -> Result<(), String> {
     let have: BTreeSet<String> = set.filter(|(n, _)| lib_dest(n).is_some()).map(|(n, _)| n.clone()).collect();
+    // The staged trees by their name under \BITSOS2\ (FAT: any case), so a tree's programs can reach another's lib/.
+    let staged: BTreeMap<String, PathBuf> = items
+        .iter()
+        .filter(|i| i.place == Place::Tree)
+        .filter_map(|i| match &i.source {
+            Source::Host(p) => Some((i.name.to_lowercase(), p.clone())),
+            _ => None,
+        })
+        .collect();
     for it in items.iter().filter(|i| i.place == Place::Tree) {
         let Source::Host(src) = &it.source else { continue };
         let files = match tree::files(src) {
@@ -499,7 +523,7 @@ fn trees<'a>(items: &[Item], set: impl Iterator<Item = &'a (String, PathBuf)>, o
         };
         // Without the initramfs set (V2_PKG_OPTIONAL=1 on a host without ldd) every library would land in the tree.
         let libs = if have.iter().any(|s| s.starts_with("ld-linux")) {
-            tree::libs(src, &files, &have).or_else(|e| missing(format!("tree {}: {e}", it.name)).map(|_| Vec::new()))?
+            tree::libs(src, &files, &have, &staged).or_else(|e| missing(format!("tree {}: {e}", it.name)).map(|_| Vec::new()))?
         } else {
             Vec::new()
         };
@@ -631,6 +655,11 @@ pub fn sha256(data: &[u8]) -> String {
 }
 
 /// One line of the list: `<kind> <path on V2> <size> <sha256>` (+ ` <package> <version> <licences>` for a library).
+/// A list line without an origin (a tree's own list, `image::tree_lists`).
+pub fn list_line(kind: &str, path: &str, data: &[u8]) -> String {
+    line(kind, path, data, None)
+}
+
 fn line(kind: &str, path: &str, data: &[u8], o: Option<&Origin>) -> String {
     let mut s = format!("{kind} {path} {} {}", data.len(), sha256(data));
     if let Some(o) = o {

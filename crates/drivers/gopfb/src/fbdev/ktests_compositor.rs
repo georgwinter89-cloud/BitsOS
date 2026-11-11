@@ -87,7 +87,7 @@ fn steps(fb: &Fb, s: &Started) -> Result<(), String> {
 
 fn grant() -> TestResult {
     if display::device().is_none() {
-        return ktest::skip("no display (headless)");
+        return ktest::fail("no display (headless)");
     }
     let fb = fb()?;
     need_program()?;
@@ -107,4 +107,4 @@ fn grant() -> TestResult {
     kassert!(compositor::granted() == 0 && !has_grant(s.p.pid), "a grant outlived the program");
     Ok(())
 }
-ktest!("dp.fbdev.compositor", Safe, grant);
+ktest!("dp.fbdev.compositor", Screen, grant);

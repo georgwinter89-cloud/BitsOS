@@ -8,18 +8,26 @@
 //! orphan list a cut left (`orphan_cleanup`). A writable mount clears the "cleanly unmounted" state bit (and
 //! sets needs_recovery with a journal) before its first change and undoes both at `sync_fs`/freeze/unmount
 //! after the log is empty. fsync commits the running journal transaction (`flush`).
+//!
+//! FS-STALL (Steam's UI stalled 8-27 s behind fsyncs on the Mini-PC): no device flush and no wait for the device
+//! under `ext4.vol` on the common paths. A commit writes the log with the lock released (`commit_out`, lock
+//! `ext4.commit` > `ext4.vol`, one commit at a time; `journal`'s module text); a file read maps under the lock and
+//! reads the blocks after it; read-only calls never read the device under it (`read_op`); `writable` and a file's
+//! st_blocks need no lock. Left under the lock: a change's own metadata reads on a cache miss, and the copy of a
+//! write-back step's data into the device's cache.
 
 use crate::dev::Dev;
 use crate::gd::{self, Table};
 use crate::inode::DiskInode;
 use crate::le::*;
 use crate::sb::{self, Access, Geo};
-use crate::state::{Node, State};
+use crate::state::{Node, State, MISS};
+use core::cell::Cell;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ksync::{Mutex, SpinLock, WaitQueue};
 use crate::errno::*;
 use vfs::abi::Time;
@@ -38,6 +46,7 @@ impl Default for Options {
     }
 }
 
+
 pub struct Volume {
     pub geo: Geo,
     pub access: Access,
@@ -52,6 +61,25 @@ pub struct Volume {
     thawed: WaitQueue,
     /// A write-back waited `WRITEBACK_WAIT` for this freeze's thaw: further write-backs fail at once.
     wb_gave_up: AtomicBool,
+    /// One commit written to the log at a time, the volume lock released (`commit_out`).
+    commit_lock: Mutex<()>,
+    /// Its holder's requests go at the priority of the threads waiting for it (`block::prio::Lift`).
+    commit_lift: block::prio::Lift,
+    /// `State::stopped`: a failed write made the volume read-only.
+    stopped: Arc<AtomicBool>,
+}
+
+/// Rounds of a read-only call that met blocks the device's cache did not hold (`read_op`): each round reads the
+/// missing ones with the lock released; then the call reads under the lock.
+const MISS_ROUNDS: u32 = 32;
+
+/// Rounds of one `commit_out` that may retry owed home writes before it answers ENOMEM.
+const HOME_ROUNDS: u32 = 3;
+
+/// ETIMEDOUT marks a request of this volume's own device that timed out (`CachedDiskDev`, FS-STALL review E5);
+/// programs get EIO for it, as before.
+fn user_errno(e: i64) -> i64 {
+    if e == ETIMEDOUT { EIO } else { e }
 }
 
 /// How long a write-back (`lock_wb`) waits for a thaw, in 100 ms slices: as long as the VFS waits for the
@@ -110,7 +138,7 @@ fn read_meta(dev: &dyn Dev) -> Result<(Geo, Access, Vec<u8>, Table), i64> {
 
 impl Volume {
     pub fn mount(dev: Arc<dyn Dev>, opts: Options) -> Result<Arc<Volume>, i64> {
-        Volume::mount_stage(dev, opts, None)
+        Volume::mount_stage(dev, opts, None).map_err(user_errno)
     }
 
     /// `replayed`: the journal was replayed already (Some(reason) for a read-only mount over a memory replay).
@@ -123,7 +151,8 @@ impl Volume {
         label.copy_from_slice(&raw[0x78..0x88]);
         let seed = g32(&raw, sb::WTIME) ^ geo.uuid.iter().fold(0u32, |a, &b| a.rotate_left(5) ^ b as u32);
         let recover = g32(&raw, sb::FEATURE_INCOMPAT) & sb::incompat::RECOVER != 0;
-        let mut st = State { dev: dev.clone(), geo: geo.clone(), sb: raw, gd, nodes: BTreeMap::new(), reserved: 0, now: opts.now, next_gen: seed, writable: access == Access::ReadWrite, written: 0, jnl: None, dirty: false, frozen: false };
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut st = State { dev: dev.clone(), geo: geo.clone(), sb: raw, gd, nodes: BTreeMap::new(), reserved: 0, now: opts.now, next_gen: seed, writable: access == Access::ReadWrite, written: 0, jnl: None, dirty: false, frozen: false, stopped: stopped.clone(), no_io: Cell::new(false), miss: Cell::new(None) };
         if geo.has_compat(sb::compat::HAS_JOURNAL) {
             match crate::journal::load(&st, st.writable)? {
                 Ok((j, disk)) if recover && disk.start != 0 && replayed.is_none() => return Volume::recover(dev, opts, &st, j, disk),
@@ -149,9 +178,10 @@ impl Volume {
             st.counts_from_groups();
         }
         let lift_dev = dev.clone();
-        let vol = Arc::new(Volume { geo, access, st: Mutex::named("ext4.vol", st), dev, dropped: SpinLock::named("ext4.dropped", Vec::new()), label, frozen: AtomicBool::new(false), thawed: WaitQueue::new(), wb_gave_up: AtomicBool::new(false) });
+        let vol = Arc::new(Volume { geo, access, st: Mutex::named("ext4.vol", st), dev, dropped: SpinLock::named("ext4.dropped", Vec::new()), label, frozen: AtomicBool::new(false), thawed: WaitQueue::new(), wb_gave_up: AtomicBool::new(false), commit_lock: Mutex::named("ext4.commit", ()), commit_lift: block::prio::Lift::new(), stopped });
         let _ = lift_dev;
         if writable {
+            crate::file::write_bufs_init();
             let mut st = vol.st.lock();
             st.ensure_dirty()?;
             if let Err(e) = st.orphan_cleanup() {
@@ -220,7 +250,7 @@ impl Volume {
     }
 
     pub fn writable(&self) -> bool {
-        self.st.lock().writable
+        self.access == Access::ReadWrite && !self.stopped.load(Ordering::Acquire)
     }
 
     /// The volume lock, after the inodes the VFS dropped are dealt with (not while frozen: freeing them
@@ -245,8 +275,8 @@ impl Volume {
     }
 
     /// The lock for a change: EROFS on a read-only volume; waits while frozen; a running journal
-    /// transaction grown past a quarter of the log is committed first (so one operation's transactions
-    /// land in one journal transaction).
+    /// transaction grown past a quarter of the log is committed first, with the lock released (so one
+    /// operation's transactions land in one journal transaction).
     pub fn lock_rw(&self) -> Result<VolGuard<'_>, i64> {
         self.lock_change(false)
     }
@@ -259,21 +289,25 @@ impl Volume {
     }
 
     fn lock_change(&self, writeback: bool) -> Result<VolGuard<'_>, i64> {
-        let mut st = loop {
+        let mut commits = 0;
+        loop {
             self.wait_thawed(writeback)?;
-            let st = self.lock();
+            let mut st = self.lock();
             if !st.writable {
                 return Err(EROFS);
             }
-            if !st.frozen {
-                break st;
+            if st.frozen {
+                continue;
             }
-        };
-        st.ensure_dirty()?;
-        if st.journal_need_commit() {
-            st.jcommit()?;
+            st.ensure_dirty()?;
+            if st.journal_need_commit() && commits < 2 {
+                drop(st);
+                self.commit_out(None)?;
+                commits += 1;
+                continue;
+            }
+            return Ok(st);
         }
-        Ok(st)
     }
 
     fn wait_thawed(&self, writeback: bool) -> Result<(), i64> {
@@ -317,13 +351,17 @@ impl Volume {
         st.nodes.remove(&ino);
     }
 
-    /// The VFS holds inode `ino` (a regular file's ops object exists).
-    pub fn hold(&self, ino: u32) -> Result<DiskInode, i64> {
+    /// The VFS holds inode `ino` (a regular file's ops object exists): its st_blocks as the volume keeps it.
+    pub fn hold(&self, ino: u32) -> Result<Arc<AtomicU64>, i64> {
+        // Read once without the lock held over the device, then again under it (from memory now): the inode may
+        // have changed in between.
+        self.read_op(|st| st.inode(None, ino))?;
         let mut st = self.lock();
         let di = st.inode(None, ino)?;
-        let n = st.nodes.entry(ino).or_insert(Node { di: di.clone(), holders: 0, reserved: BTreeMap::new() });
+        let blocks = di.blocks512(&st.geo);
+        let n = st.nodes.entry(ino).or_insert_with(|| Node { di, holders: 0, reserved: BTreeMap::new(), blocks: Arc::new(AtomicU64::new(blocks)) });
         n.holders += 1;
-        Ok(n.di.clone())
+        Ok(n.blocks.clone())
     }
 
     /// The VFS let go of inode `ino` (the last reference to its ops object went). Only noted: the drop may
@@ -333,21 +371,55 @@ impl Volume {
         self.dropped.lock().push(ino);
     }
 
+    /// FS-STALL: a read-only call under the lock that never waits for the device there. A block the device's
+    /// cache does not hold stops it (`State::no_io`); it is read with the lock released and the call starts over
+    /// (`MISS_ROUNDS` times, then it reads under the lock as before). `f` must not change the state before its
+    /// last read.
+    fn read_op<T>(&self, mut f: impl FnMut(&mut State) -> Result<T, i64>) -> Result<T, i64> {
+        for _ in 0..MISS_ROUNDS {
+            let missed = {
+                let mut st = self.lock();
+                st.no_io.set(true);
+                let r = f(&mut st);
+                st.no_io.set(false);
+                match r {
+                    Err(MISS) => st.miss.take(),
+                    r => return r,
+                }
+            };
+            let Some((at, len)) = missed else { break };
+            let mut tmp = Vec::new();
+            if tmp.try_reserve_exact(len).is_err() {
+                break;
+            }
+            tmp.resize(len, 0);
+            if self.dev.read(at, &mut tmp).is_err() {
+                break;
+            }
+        }
+        let mut st = self.lock();
+        f(&mut st)
+    }
+
     pub fn stat(&self, ino: u32) -> Result<DiskInode, i64> {
-        self.lock().inode(None, ino)
+        self.read_op(|st| st.inode(None, ino))
     }
 
     pub fn list(&self, dir: u32) -> Result<Vec<(Vec<u8>, u32, u8)>, i64> {
-        let st = self.lock();
-        let di = st.inode(None, dir)?;
-        if !di.is_dir() {
-            return Err(ENOTDIR);
-        }
-        st.list_dir(&di)
+        self.read_op(|st| {
+            let di = st.inode(None, dir)?;
+            if !di.is_dir() {
+                return Err(ENOTDIR);
+            }
+            st.list_dir(&di)
+        })
     }
 
     pub fn readlink(&self, ino: u32) -> Result<Vec<u8>, i64> {
-        let st = self.lock();
+        self.read_op(|st| Self::readlink_in(st, ino))
+    }
+
+    fn readlink_in(st: &State, ino: u32) -> Result<Vec<u8>, i64> {
         let di = st.inode(None, ino)?;
         if !di.is_symlink() {
             return Err(EINVAL);
@@ -366,25 +438,50 @@ impl Volume {
         Ok(v)
     }
 
+    /// A regular file's blocks are mapped under the lock and read after it (a page-cache fill; a truncate meanwhile
+    /// makes the cache drop what it read, `PageCache::fill_with`'s epoch). Other inodes read under the lock.
     pub fn read(&self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        let st = self.lock();
-        let di = st.inode(None, ino)?;
-        st.read_file(&di, off, buf)
+        let Some(plan) = self.file_plan(ino, off, buf.len())? else {
+            return self.read_op(|st| {
+                let di = st.inode(None, ino)?;
+                st.read_file(&di, off, buf)
+            });
+        };
+        let (bs, blocks) = (self.geo.bs, self.geo.blocks);
+        crate::vol_data::read_by_plan(&plan, bs, buf, &mut |p, dst| {
+            let n = (dst.len() as u64).div_ceil(bs);
+            if p.checked_add(n).is_none_or(|e| e > blocks) {
+                return Err(EUCLEAN);
+            }
+            self.dev.read(p * bs, dst)
+        })
+    }
+
+    /// Where a regular file's bytes [off, off + len) lie, mapped under the lock (`read_op`: no device wait there).
+    /// None: not a regular file, or inline data (read through the inode under the lock).
+    pub(crate) fn file_plan(&self, ino: u32, off: u64, len: usize) -> Result<Option<crate::vol_data::ReadPlan>, i64> {
+        self.read_op(|st| {
+            let di = st.inode(None, ino)?;
+            if di.is_reg() { st.read_plan(&di, off, len) } else { Ok(None) }
+        })
     }
 
     pub fn xattrs(&self, ino: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i64> {
-        let st = self.lock();
-        let di = st.inode(None, ino)?;
-        st.xattrs(&di)
+        self.read_op(|st| {
+            let di = st.inode(None, ino)?;
+            st.xattrs(&di)
+        })
     }
 
     /// Writes a run of a file's pages (`write_run`): the disk size follows up to `size`.
     pub fn write(&self, ino: u32, off: u64, data: &[u8], size: u64, pages: core::ops::Range<u64>) -> Result<(), i64> {
         let mut st = self.lock_wb()?;
         // This run's promises are used now; the others' stay out of reach.
-        // A run may use as much of the root reserve as it was promised (root's writes reserve from it).
+        // A run may use as much of the root reserve as it was promised (root's writes reserve from it). A promise
+        // into the reserve can be smaller than what the reserve still has to give: `write_run`'s steps, and any short
+        // run of root's with the volume already below the reserve. What was promised is always there (`reserve_pages`).
         let promised = st.release_reserved(ino, pages);
-        let keep = st.reserved + sb::reserved_blocks(&st.sb, &st.geo).saturating_sub(promised);
+        let keep = (st.reserved + sb::reserved_blocks(&st.sb, &st.geo).saturating_sub(promised)).min(st.free_blocks().saturating_sub(promised));
         st.write_file(ino, off, data, size, keep)
     }
 
@@ -424,14 +521,14 @@ impl Volume {
     }
 
     fn store_meta_as(&self, ino: u32, m: Meta, writeback: bool) -> Result<(), i64> {
-        {
-            let st = self.lock();
+        let same = self.read_op(|st| {
             let mut di = st.inode(None, ino)?;
             let before = di.raw.clone();
             m.apply(&mut di);
-            if di.raw == before {
-                return Ok(());
-            }
+            Ok(di.raw == before)
+        })?;
+        if same {
+            return Ok(());
         }
         let mut st = self.lock_change(writeback)?;
         st.with_tx(|st, tx| {
@@ -480,21 +577,131 @@ impl Volume {
     /// device before).
     /// The device's `settle` comes last, with the volume lock dropped (VS-2b CR 3): a flush that a snapshot's
     /// freeze held back is durable when fsync returns, as on a frozen Linux file system.
+    /// FS-STALL: the commit is written with the volume lock released (`commit_out`); this fsync's changes are in the
+    /// running transaction now, or in the one in flight. When another fsync's commit took them, that commit's
+    /// flushes came after this fsync's data reached the device (its data was written before the call, and that
+    /// commit began after this call saw its transaction running): nothing more to flush.
     pub fn flush(&self) -> Result<(), i64> {
-        let committed = {
-            let mut st = self.lock();
-            if st.writable && st.jnl.as_ref().is_some_and(|j| !j.run.is_empty()) { Some(st.jcommit()) } else { None }
+        let r = self.flush_inner();
+        r.map_err(user_errno)
+    }
+
+    fn flush_inner(&self) -> Result<(), i64> {
+        // The transaction this fsync needs: the running one, else the one in flight or waiting for its retry (it
+        // may hold this file's last change). `commit_out` answers only once it is committed, or with an error: never
+        // Ok without that (review E1, round 2 item 1).
+        let target = {
+            let st = self.lock();
+            match st.jnl.as_ref() {
+                Some(j) if !j.run.is_empty() || j.committing.is_some() => {
+                    if !st.writable {
+                        // Changes that will never reach the disk.
+                        return Err(EIO);
+                    }
+                    Some(match &j.committing {
+                        Some(c) if j.run.is_empty() => c.tid(),
+                        _ => j.tid,
+                    })
+                }
+                _ => None,
+            }
         };
-        match committed {
-            Some(r) => r?,
-            None => self.dev.flush()?,
+        let logged = match target {
+            Some(tid) => self.commit_out(Some(tid))?,
+            None => false,
+        };
+        if !logged {
+            self.dev.flush()?;
         }
         self.dev.settle()
     }
 
+    /// Commits the journal (FS-STALL): a transaction is taken out under the volume lock, written and flushed
+    /// without it, booked under it again; one at a time (`ext4.commit`). A failed one goes first, then the running
+    /// one. `upto`: an fsync's transaction, done when it and all before it are committed (EIO when the volume
+    /// stopped first); None: everything there is now. Ok(true): a commit covered it.
+    fn commit_out(&self, upto: Option<u32>) -> Result<bool, i64> {
+        self.commit_out_inner(upto).map_err(user_errno)
+    }
+
+    fn commit_out_inner(&self, upto: Option<u32>) -> Result<bool, i64> {
+        let lift = &self.commit_lift;
+        let _one = match self.commit_lock.try_lock() {
+            Some(g) => g,
+            None => {
+                let _w = lift.wait();
+                self.commit_lock.lock()
+            }
+        };
+        let _held = lift.hold();
+        let mut logged = false;
+        // Each round commits one transaction (a waiting retry first, then the running one), so an fsync's target
+        // is reached after at most two, unless a commit fails (an error) or nothing is left to log. Home writes
+        // still owed that keep finding no memory end the call with ENOMEM after `HOME_ROUNDS` (round 3: it looped
+        // holding `ext4.commit`); the volume stays writable, the next commit tries them again.
+        let mut home_rounds = 0;
+        for round in 0.. {
+            if upto.is_none() && round >= 3 {
+                break;
+            }
+            let plan = {
+                let mut st = self.lock();
+                let Some(j) = st.jnl.as_ref() else { return Ok(logged) };
+                if upto.is_some_and(|t| j.committed(t)) {
+                    return Ok(true);
+                }
+                if upto.is_none() && logged && j.run.is_empty() && j.committing.is_none() {
+                    return Ok(true);
+                }
+                if !st.writable {
+                    return if upto.is_some() { Err(EIO) } else { Ok(logged) };
+                }
+                if st.frozen {
+                    // A freeze committed everything before it: a target still open cannot be made durable now.
+                    return if upto.is_some() { Err(EIO) } else { Ok(logged) };
+                }
+                if j.retry && j.home_only {
+                    home_rounds += 1;
+                    if home_rounds > HOME_ROUNDS {
+                        return Err(ENOMEM);
+                    }
+                }
+                st.timeout_begin();
+                // A holder of the volume lock ends what it waits for itself (`settle_commit`): none in flight here.
+                if let Err(e) = st.settle_commit() {
+                    return Err(st.commit_failed(e));
+                }
+                match st.begin_commit() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return Ok(logged),
+                    Err(e) => return Err(st.commit_failed(e)),
+                }
+            };
+            plan.tx.finish(plan.run(Some(lift)));
+            let tx = plan.tx.clone();
+            drop(plan);
+            let mut st = self.lock();
+            let mine = st.jnl.as_ref().is_some_and(|j| j.in_flight() && j.committing.as_ref().is_some_and(|c| Arc::ptr_eq(c, &tx)));
+            if mine {
+                st.end_commit(tx).map_err(|e| st.commit_failed(e))?;
+            } else {
+                tx.result()?;
+            }
+            logged = true;
+        }
+        Ok(logged)
+    }
+
     /// syncfs / unmount: everything committed and checkpointed, the log empty, the superblock "clean"
-    /// without needs_recovery, then the device's cache.
+    /// without needs_recovery, then the device's cache. The commit and a first flush run without the volume lock,
+    /// so what is left under it is short.
     pub fn sync_fs(&self) -> Result<(), i64> {
+        self.sync_fs_inner().map_err(user_errno)
+    }
+
+    fn sync_fs_inner(&self) -> Result<(), i64> {
+        self.commit_out(None)?;
+        self.dev.flush()?;
         {
             let mut st = self.lock();
             st.make_clean()?;
@@ -525,7 +732,7 @@ impl Volume {
             }
             Err(e) => {
                 self.thaw();
-                Err(e)
+                Err(user_errno(e))
             }
         }
     }
@@ -571,11 +778,7 @@ impl vfs::writeback::Flush for Volume {
         if self.is_frozen() {
             return Ok(());
         }
-        let mut st = self.lock();
-        if !st.writable {
-            return Ok(());
-        }
-        st.jcommit()
+        self.commit_out(None).map(|_| ())
     }
     /// Before a Reload or power-off: committed, checkpointed, clean on disk (`sync_fs`); a frozen volume was
     /// made clean by its freeze and stays as it is.
@@ -593,6 +796,8 @@ impl State {
         if !self.writable || !self.dirty {
             return Ok(());
         }
+        self.timeout_begin();
+        let keep = self.sb.clone();
         let r = self.empty_journal().and_then(|()| {
             // A writable volume had no recorded error at mount (`sb::parse`): STATE_ERROR here is the mark
             // of a transaction written around the log (`write_around`), stable now.
@@ -606,6 +811,12 @@ impl State {
             Ok(()) => {
                 self.dirty = false;
                 Ok(())
+            }
+            // After a timeout it stays dirty and needs_recovery in memory too: the next attempt starts over.
+            // So after a buffer the home writes could not get (round 3: ENOMEM is memory, not the disk: no stop).
+            Err(e) if self.just_slow(e) || (e == ENOMEM && self.writable) => {
+                self.sb = keep;
+                Err(if e == ETIMEDOUT { EIO } else { e })
             }
             Err(e) => Err(self.failed(e)),
         }

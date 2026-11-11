@@ -35,6 +35,7 @@ pub mod listing;
 pub mod name;
 pub mod protect;
 pub mod stick;
+mod stick_rules;
 pub mod sysapi;
 pub mod vol;
 mod vol_dir;

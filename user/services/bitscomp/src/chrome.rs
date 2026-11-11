@@ -26,6 +26,8 @@ pub enum Part {
     WsButton,
     /// WY-12: an entry of the window list's minimised windows (restores it).
     Min(usize),
+    /// PK-L1b: the "Programme" button left of the address field (opens and closes the program library).
+    Programs,
 }
 
 /// A workspace entry with its second line ("2 Kacheln · 3 Tabs"), and the lowest one (name only).
@@ -54,6 +56,8 @@ pub struct Chrome {
     pub mark: Rect,
     pub back: Rect,
     pub forward: Rect,
+    /// PK-L1b: the "Programme" button.
+    pub programs: Rect,
     pub address: Rect,
     pub ring: Rect,
     pub favs: Option<Rect>,
@@ -105,7 +109,8 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
     let back = Rect { x: mark.x + mark.w + 12, y: mid(36), w: 36, h: 36 };
     let forward = Rect { x: back.x + back.w + 12, ..back };
     let ring = Rect { x: w - 16 - 40, y: mid(40), w: 40, h: 40 };
-    let ax = forward.x + forward.w + 12;
+    let programs = Rect { x: forward.x + forward.w + 12, ..back };
+    let ax = programs.x + programs.w + 12;
     let address = Rect { x: ax, y: mid(40), w: (ring.x - 12 - ax).max(40), h: 40 };
     let mut y = top.h;
     let (favs, fav_items) = if t.layout.favourites {
@@ -164,6 +169,7 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
         mark,
         back,
         forward,
+        programs,
         address,
         ring,
         favs,
@@ -189,7 +195,13 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
 impl Chrome {
     /// The chrome part under (x, y); `None` over the work area or empty chrome.
     pub fn hit(&self, x: f64, y: f64) -> Option<Part> {
-        let parts = [(self.back, Part::Back), (self.forward, Part::Forward), (self.address, Part::Address), (self.ring, Part::Ring)];
+        let parts = [
+            (self.back, Part::Back),
+            (self.forward, Part::Forward),
+            (self.programs, Part::Programs),
+            (self.address, Part::Address),
+            (self.ring, Part::Ring),
+        ];
         if let Some((_, p)) = parts.iter().find(|(r, _)| r.contains(x, y)) {
             return Some(*p);
         }

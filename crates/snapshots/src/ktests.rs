@@ -15,6 +15,10 @@
 //!   while mounted (nothing changes then), carried out at the next mount with the state before kept as
 //!   "before-rollback", undone the same way, cancelled; the scheduled snapshot cannot be deleted; the command
 //!   lines `rollback`, `rollback cancel`, `rollback ID`; `restore-at` refuses a time before every snapshot. Rerunnable.
+//! - `delete_yields` (Safe, RAM; VS-H, ktests/yields.rs): a foreground write during a burst of deletes on a slow
+//!   device waits for a step of one delete, not for the burst. `delete_writable` (Safe, RAM): an fsync writer through
+//!   ext4 on a private pool during a burst, no write fails and the volume stays writable. `load` deletes its
+//!   snapshots on /data under the same writer with the count of `delete_yields`.
 //! - `user` (QemuOnly, writes /data): /bin/bitssnap as root: take, list, a file and a folder restored from a
 //!   snapshot (the state before saved first, everything else in the folder untouched), `serve --once`; as uid
 //!   1000 refused.
@@ -46,11 +50,15 @@ fn read(ns: &MountNs, p: &str) -> Option<Vec<u8>> {
 /// A pool image in a private view mounted at /d, as the boot makes data.img; `f` runs with it, then everything
 /// is unmounted and unregistered.
 fn with_private(f: impl FnOnce(&Arc<MountNs>, &Target) -> TestResult) -> TestResult {
+    with_private_mib(32, f)
+}
+
+fn with_private_mib(mib: u64, f: impl FnOnce(&Arc<MountNs>, &Target) -> TestResult) -> TestResult {
     let name = format!("snapkt{}", RUN.fetch_add(1, Ordering::Relaxed));
     let ns = Arc::new(MountNs::new_empty());
     ns.mkdir_p("/stick").map_err(e)?;
     let p = data::Place { image: "/stick/data.img", temp: "/stick/data.img.new", at: "/d", pool_name: &name, on_stick: false };
-    let (ph, m) = data::bring_up(&ns, &p, true, 32, &|| 1 << 40, &|_| {});
+    let (ph, m) = data::bring_up(&ns, &p, true, mib, &|| 1 << 40, &|_| {});
     let m = m.ok_or_else(|| format!("the private pool did not mount: {ph:?}"))?;
     let r = Target::of(&ns, "/d", &m).map_err(e).and_then(|t| {
         let r = f(&ns, &t);
@@ -171,13 +179,13 @@ ktest!("snap.private", Safe, private);
 fn data_mount() -> Result<Target, TestResult> {
     match data::wait_done(120_000) {
         data::Phase::Mounted { .. } => {}
-        p => return Err(ktest::skip(&format!("/data: {p:?}"))),
+        p => return Err(ktest::fail(&format!("/data: {p:?}"))),
     }
     match Target::data() {
         Ok(t) => Ok(t),
-        Err(ENODEV) => Err(ktest::skip("no /data mount")),
-        Err(EOPNOTSUPP) => Err(ktest::skip("/data is a plain ext4 image (no pool)")),
-        Err(EROFS) => Err(ktest::skip("/data is read-only")),
+        Err(ENODEV) => Err(ktest::fail("no /data mount")),
+        Err(EOPNOTSUPP) => Err(ktest::fail("/data is a plain ext4 image (no pool)")),
+        Err(EROFS) => Err(ktest::fail("/data is read-only")),
         Err(x) => Err(Err(format!("/data: errno {x}"))),
     }
 }
@@ -194,7 +202,7 @@ fn data_reads() -> TestResult {
     kassert!(l.lines().all(|x| x.starts_with("id=")), "list: {l}");
     Ok(())
 }
-ktest!("snap.data", Safe, data_reads);
+ktest!("snap.data", RunHw("vs/30-snapshots"), data_reads);
 
 const FILES: u64 = 8;
 const FILE_BYTES: usize = 16 * 1024;
@@ -287,7 +295,7 @@ fn load() -> TestResult {
     let want = 100u64;
     let n = want.min(free / (2 << 20));
     if n < 10 {
-        return ktest::skip("less than 20 MiB free in the pool");
+        return ktest::fail("less than 20 MiB free in the pool");
     }
     let ns = vfs::root_ns();
     let rel = format!("vs-load-{}", RUN.fetch_add(1, Ordering::Relaxed));
@@ -301,7 +309,14 @@ fn load() -> TestResult {
     let mut ids = Vec::new();
     let mut pauses = Vec::new();
     let r = (|| -> TestResult {
+        let t0 = time::now_ns();
         for i in 0..n {
+            // VS-H: on a very slow disk the run that deletes its own stops early, as snap.fsyncs does. Boot 1's 100
+            // are what the host checks, so that one always takes them all.
+            if !keep && i >= 10 && time::now_ns().saturating_sub(t0) > 240 * SEC {
+                klog::event!(Warn, "snap", "load.fewer_takes", takes = i, want = n; "a very slow disk: the rest is left out");
+                break;
+            }
             let before = writes.load(Ordering::Relaxed);
             let k = take(&t, "vsload", false, false).map_err(|x| format!("take {i}: errno {x}"))?;
             ids.push(k.id);
@@ -330,9 +345,7 @@ fn load() -> TestResult {
         klog::event!(Warn, "snap", "load.fewer", snapshots = n, want = want, free = free);
     }
     if !keep {
-        for &id in &ids {
-            delete(&t, id).map_err(|x| format!("delete {id}: errno {x}"))?;
-        }
+        yields::delete_under_writes(&t, &ns, &dir, &ids, Some(4))?;
     }
     let _ = ns.remove_tree(&dir);
     // A ktest boot ends without the stop pass: make the removal durable, or the next boot replays a state with
@@ -341,11 +354,12 @@ fn load() -> TestResult {
     kassert!(n == want || !keep, "only {n} snapshots fit (want {want}); give the scenario a larger data.img");
     Ok(())
 }
-ktest!("snap.load", QemuOnly, load);
+ktest!("snap.load", Run("vs/30-snapshots"), load);
 
 mod fsyncs;
 mod rollback;
 mod user;
+mod yields;
 
 /// A writer saving Brave's way (a new file renamed over the old, through the kernel's own file calls and through
 /// fds) while snapshots are taken: in every snapshot the saved file is whole (rename_over).

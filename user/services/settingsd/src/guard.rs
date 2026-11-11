@@ -5,11 +5,11 @@
 //! (crates/fs-fat/src/protect.rs `config_guard`), so settingsd refuses before the file system would.
 
 /// Only Georg's own hand turns these on (R8a; FS-7 GUARDED_KEYS). `wlan` is free since 21.10. (R8d).
-pub const R8_SWITCHES: &[&str] = &["nvme_write", "stick_write", "usb_msd_write"];
+pub const R8_SWITCHES: &[&str] = &["nvme_write", "nvme_data", "stick_write", "usb_msd_write"];
 /// CONFIG.TXT keys the kernel never shows; they stay out of journal, history and answers.
 pub const KERNEL_SECRETS: &[&str] = &["token", "wlan_psk", "claude_api_key"];
 /// FS-7's guarded CONFIG keys (MC-10: `mcp`, `mcp_confirmer` too; fs-fat also keeps `mcp` from being dropped).
-const GUARDED: &[&str] = &["nvme_write", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+const GUARDED: &[&str] = &["nvme_write", "nvme_data", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
 
 fn is_switch(s: &str) -> bool {
     let s = s.trim().trim_start_matches('\u{feff}').to_ascii_lowercase();

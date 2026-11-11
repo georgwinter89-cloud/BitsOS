@@ -6,6 +6,7 @@
 //! `shutdown` resets both directions and wakes a reader blocked on either side (V1 `srv_kill`).
 
 use crate::accept::AcceptQueue;
+use crate::ring::ByteRing;
 use crate::*;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -18,7 +19,7 @@ pub const PIPE_LIMIT: usize = 256 * 1024;
 
 /// One direction of a connection.
 struct Pipe {
-    data: SpinLock<VecDeque<u8>>,
+    data: SpinLock<ByteRing>,
     /// The writer closed (FIN): the reader gets EOF after the data.
     eof: AtomicBool,
     /// The reader is gone (its stream was dropped): writes fail.
@@ -31,7 +32,7 @@ struct Pipe {
 impl Pipe {
     fn new() -> Arc<Self> {
         Arc::new(Pipe {
-            data: SpinLock::named("loopback.pipe", VecDeque::new()),
+            data: SpinLock::named("loopback.pipe", ByteRing::new()),
             eof: AtomicBool::new(false),
             reader_gone: AtomicBool::new(false),
             reset: AtomicBool::new(false),
@@ -46,6 +47,29 @@ impl Pipe {
     fn is(&self, flag: &AtomicBool) -> bool {
         let _ = self;
         flag.load(Ordering::Acquire)
+    }
+    /// Queues as much of `buf` as `PIPE_LIMIT` leaves room for; the count queued. The chunks are made with
+    /// the lock dropped (`ring`), so the room is looked at again in every round.
+    fn put(&self, buf: &[u8]) -> usize {
+        let mut spare = alloc::vec::Vec::new();
+        loop {
+            let need = {
+                let mut d = self.data.lock();
+                let n = PIPE_LIMIT.saturating_sub(d.len()).min(buf.len());
+                let need = d.chunks_for(n);
+                if need <= spare.len() {
+                    d.push(&buf[..n], &mut spare);
+                    return n;
+                }
+                need
+            };
+            crate::ring::spare(&mut spare, need);
+        }
+    }
+    /// Drops what is queued; the chunks are freed after the unlock.
+    fn clear(&self) {
+        let old = core::mem::take(&mut *self.data.lock());
+        drop(old);
     }
 }
 
@@ -82,10 +106,7 @@ impl TcpStream for Stream {
             };
         }
         let was_full = d.len() >= PIPE_LIMIT;
-        let n = buf.len().min(d.len());
-        for (b, v) in buf.iter_mut().zip(d.drain(..n)) {
-            *b = v;
-        }
+        let n = d.pop(buf);
         drop(d);
         // Room again: a writer may wait on the same queue.
         if was_full && rx.wq.waiter_count() > 0 {
@@ -107,12 +128,7 @@ impl TcpStream for Stream {
             if tx.is(&tx.eof) {
                 return Err(NetError::Closed);
             }
-            let n = {
-                let mut d = tx.data.lock();
-                let n = PIPE_LIMIT.saturating_sub(d.len()).min(buf.len() - off);
-                d.extend(buf[off..off + n].iter().copied());
-                n
-            };
+            let n = tx.put(&buf[off..]);
             off += n;
             if n > 0 {
                 tx.wq.wake_all();
@@ -146,8 +162,8 @@ impl TcpStream for Stream {
         self.tx.set(&self.tx.eof);
     }
     fn shutdown(&self) {
-        self.tx.data.lock().clear();
-        self.rx.data.lock().clear();
+        self.tx.clear();
+        self.rx.clear();
         self.tx.set(&self.tx.reset);
         self.rx.set(&self.rx.reset);
     }
@@ -166,17 +182,11 @@ impl crate::conn::Conn for Stream {
         if d.is_empty() {
             return Ok(rx.is(&rx.eof).then_some(0));
         }
-        let n = buf.len().min(d.len());
         if peek {
-            for (b, v) in buf.iter_mut().zip(d.iter()) {
-                *b = *v;
-            }
-            return Ok(Some(n));
+            return Ok(Some(d.peek(buf)));
         }
         let was_full = d.len() >= PIPE_LIMIT;
-        for (b, v) in buf.iter_mut().zip(d.drain(..n)) {
-            *b = v;
-        }
+        let n = d.pop(buf);
         drop(d);
         if was_full && rx.wq.waiter_count() > 0 {
             rx.wq.wake_all();
@@ -190,9 +200,8 @@ impl crate::conn::Conn for Stream {
             return Err(NetError::ConnectionReset);
         }
         let mut d = rx.data.lock();
-        let k = n.min(d.len());
         let was_full = d.len() >= PIPE_LIMIT;
-        d.drain(..k);
+        let k = d.skip(n);
         drop(d);
         if was_full && rx.wq.waiter_count() > 0 {
             rx.wq.wake_all();
@@ -208,12 +217,7 @@ impl crate::conn::Conn for Stream {
         if tx.is(&tx.eof) {
             return Err(NetError::Closed);
         }
-        let n = {
-            let mut d = tx.data.lock();
-            let n = PIPE_LIMIT.saturating_sub(d.len()).min(buf.len());
-            d.extend(buf[..n].iter().copied());
-            n
-        };
+        let n = tx.put(buf);
         if n > 0 {
             tx.wq.wake_all();
             crate::sock::inet::notify();
@@ -257,7 +261,7 @@ impl Drop for Stream {
             return;
         }
         self.tx.set(&self.tx.eof);
-        self.rx.data.lock().clear();
+        self.rx.clear();
         self.rx.set(&self.rx.reader_gone);
     }
 }

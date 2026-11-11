@@ -334,6 +334,128 @@ fn hidden_buffer_gets_exactly_what_it_lacks() {
     assert_eq!(r.s.written(0), None, "begin forgets what it repaired");
 }
 
+/// WY-17: a program drew the hidden buffer itself. The flip is the same order `commit` gives (GX-D9: no other
+/// register), and it needs no frame in RAM: `direct_begin` repairs nothing, it says what must be redrawn.
+#[test]
+fn a_frame_the_program_drew_flips_with_the_same_writes() {
+    let r = rig();
+    let d = r.s.direct_begin().unwrap();
+    assert_eq!((d.window, d.whole), (1, true), "A1's content is unknown: redrawn whole");
+    let before = r.t[1].to_vec();
+    let at = r.e.writes().len();
+    let s1 = r.s.direct_flip(1).unwrap();
+    let direct: Vec<_> = r.e.writes()[at..].iter().map(|w| w.0).collect();
+    assert_eq!(r.t[1].to_vec(), before, "nothing was copied into the buffer");
+    r.s.wait(s1).unwrap();
+    assert_eq!(r.s.state().shown, 1);
+
+    // The kernel's own flip writes the same registers in the same order.
+    let src = frame(1);
+    let _ = r.s.begin(&src, W).unwrap();
+    let at = r.e.writes().len();
+    let s2 = r.s.commit().unwrap();
+    let kernel: Vec<_> = r.e.writes()[at..].iter().map(|w| w.0).collect();
+    assert_eq!(direct, kernel, "the same register order as commit");
+    r.s.wait(s2).unwrap();
+    assert_eq!(r.s.state().shown, 0);
+
+    let d = r.s.direct_begin().unwrap();
+    assert_eq!((d.window, d.whole), (1, false), "nothing else wrote: the program's damage is enough");
+    let s = r.s.direct_flip(1).unwrap();
+    assert_eq!(r.s.direct_flip(1), Ok(s), "the buffer shown is no new flip");
+    assert_eq!(r.s.state().ordered, s, "no order was given");
+}
+
+/// WY-17: the console, the kernel's pointer or a panic write the shown buffer while the program draws the hidden
+/// one: both buffers then lack or carry something the program does not know, each is redrawn whole once.
+#[test]
+fn what_the_kernel_wrote_makes_both_buffers_whole_once() {
+    let r = rig();
+    let d = r.s.direct_begin().unwrap();
+    let s = r.s.direct_flip(d.window).unwrap();
+    r.s.wait(s).unwrap();
+    let d = r.s.direct_begin().unwrap();
+    let s = r.s.direct_flip(d.window).unwrap();
+    r.s.wait(s).unwrap();
+    assert!(!r.s.direct_begin().unwrap().whole, "settled");
+    r.s.present_shown(&frame(9), W, (5, 5, 4, 1)).unwrap();
+    assert_eq!(px(&r, 0, 6, 5), 9, "A0 is shown and got it");
+    let d = r.s.direct_begin().unwrap();
+    assert_eq!((d.window, d.whole), (1, true), "the hidden buffer lacks it");
+    let s = r.s.direct_flip(1).unwrap();
+    r.s.wait(s).unwrap();
+    let d = r.s.direct_begin().unwrap();
+    assert_eq!((d.window, d.whole), (0, true), "the other one carries it");
+    let s = r.s.direct_flip(0).unwrap();
+    r.s.wait(s).unwrap();
+    assert!(!r.s.direct_begin().unwrap().whole, "and then it is over");
+}
+
+#[test]
+fn a_late_flip_ends_the_program_drawing() {
+    let r = rig();
+    let d = r.s.direct_begin().unwrap();
+    r.e.st().stuck = true;
+    let s = r.s.direct_flip(d.window).unwrap();
+    assert_eq!(r.s.wait(s), Err(FlipError::Late));
+    assert_eq!(r.s.direct_begin(), Err(FlipError::Off));
+    assert_eq!(r.s.direct_flip(1), Err(FlipError::Off));
+    assert_eq!(r.s.begin(&frame(1), W).err(), Some(FlipError::Off), "the kernel's frames fall back too");
+}
+
+/// WY-17: a pan to the buffer shown, as a compositor's frame without damage may ask, twice: no register is written,
+/// and what the pan then waits for has landed (or never was: number 0, no wait at all).
+#[test]
+fn a_flip_to_the_buffer_shown_writes_nothing_and_does_not_wait() {
+    let r = rig();
+    let at = r.e.writes().len();
+    assert_eq!(r.s.direct_flip(0), Ok(0), "A0 is shown and nothing was ever ordered");
+    assert_eq!(r.s.direct_flip(0), Ok(0));
+    assert_eq!(r.e.writes().len(), at, "no register");
+    let s = r.s.direct_flip(1).unwrap();
+    r.s.wait(s).unwrap();
+    let at = r.e.writes().len();
+    assert_eq!(r.s.direct_flip(1), Ok(s));
+    assert_eq!(r.s.direct_flip(1), Ok(s));
+    assert_eq!(r.e.writes().len(), at, "no register");
+    assert_eq!(r.s.wait(s), Ok(()), "the number it hands back has landed");
+    assert_eq!(r.s.state().shown, 1);
+}
+
+/// WY-17: a kernel frame being prepared keeps its claim; the claim is free again afterwards.
+#[test]
+fn the_flip_waits_its_turn_behind_a_kernel_frame() {
+    let r = rig();
+    let src = frame(1);
+    let _ = r.s.begin(&src, W).unwrap();
+    assert_eq!(r.s.direct_flip(0), Err(FlipError::Busy));
+    let s = r.s.commit().unwrap();
+    r.s.wait(s).unwrap();
+    assert!(r.s.direct_flip(0).is_ok());
+}
+
+/// WY-17: MCP `screen` reads what shows, row by row, whichever buffer that is.
+#[test]
+fn read_shown_reads_the_buffer_on_the_screen() {
+    let r = rig();
+    r.t[0].write_pixels(0, &frame(7));
+    r.t[1].write_pixels(0, &frame(8));
+    let mut out = vec![0u32; (W * H) as usize];
+    assert!(r.s.read_shown(&mut out, W));
+    assert!(out.iter().all(|&p| p == 7), "A0 is shown");
+    let s = r.s.direct_flip(1).unwrap();
+    r.s.wait(s).unwrap();
+    assert!(r.s.read_shown(&mut out, W));
+    assert!(out.iter().all(|&p| p == 8), "A1 is shown");
+    let mut short = vec![0u32; 4];
+    assert!(!r.s.read_shown(&mut short, W), "too small a frame is refused, not cut");
+}
+
+#[test]
+fn a_ram_target_cannot_be_handed_out() {
+    assert_eq!(rig().s.direct_buffer(0), None, "no physical address: fbdev's own windows go out");
+}
+
 #[test]
 fn stuck_latch_times_out_and_falls_back_to_a0() {
     let r = rig();

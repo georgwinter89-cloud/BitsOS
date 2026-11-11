@@ -9,7 +9,7 @@
 //!   and `fs_fat::sysapi`; fs-fat enforces the same again by long name and 8.3 alias), never on another file
 //!   system and never in the trees the kernel builds itself (`/dev`, `/proc`, `/sys`);
 //! - only regular files are written or read (a device node could wait for ever or change device state);
-//! - a file named `CONFIG.TXT` never gains or changes an `nvme_write=`, `stick_write=` or `usb_msd_write=` line (R8a:
+//! - a file named `CONFIG.TXT` never gains or changes an `nvme_write=`, `nvme_data=`, `stick_write=` or `usb_msd_write=` line (R8a:
 //!   only Georg's own edit turns them on), whatever the write does to the rest of it (`wlan=` is free, R8d);
 //! - every access asks `policy::check` (B3) besides the per-call `McpAction` question of rpc.
 //!

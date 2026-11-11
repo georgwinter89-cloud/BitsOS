@@ -191,6 +191,22 @@ pub fn create(name: &[u8], flags: u32, cred: Cred) -> Result<Arc<OpenFile>, Errn
 
 /// `check_sysctl_memfd_noexec`: without MFD_EXEC or MFD_NOEXEC_SEAL the sysctl picks one; at scope 2 anything
 /// but MFD_NOEXEC_SEAL is EACCES.
+/// SX-IPC: a SysV segment's file (`shmem_kernel_file_setup(name, size, acct)`, linux-7.3.1/ipc/shm.c:767): named
+/// exactly `name` and unlinked on the memfd instance, so `/proc/<pid>/maps` shows `/<name> (deleted)`. Charged by size
+/// as Linux under strict overcommit, or page by page with `noreserve`; never sealable (no fd ever reaches a program).
+pub fn create_sysv(name: &[u8], size: u64, noreserve: bool, cred: Cred) -> Result<Arc<OpenFile>, Errno> {
+    let mnt = shm_mount();
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(name.len()).map_err(|_| ENOMEM)?;
+    owned.extend_from_slice(name);
+    let data = if noreserve { crate::kapi::reg_data(&mnt.sb) } else { crate::kapi::reg_data_accounted(&mnt.sb) };
+    let d = mnt.root.nameless_child(owned, uapi::S_IFREG | 0o777, cred, data)?;
+    d.inode.truncate(size).map_err(|_| ENOMEM)?;
+    let path = Path { mnt, dentry: d };
+    let file = crate::node::file_of(&path.dentry);
+    Ok(OpenFile::with_path(file, crate::abi::O_RDWR, path))
+}
+
 fn apply_noexec_scope(flags: &mut u32) -> Result<(), Errno> {
     let scope = noexec_scope();
     if *flags & (MFD_EXEC | MFD_NOEXEC_SEAL) == 0 {

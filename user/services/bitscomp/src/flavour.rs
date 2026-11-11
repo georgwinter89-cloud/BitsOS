@@ -16,6 +16,18 @@
 //! tree, a garbage file, a hang, and a failed execve all keep the rescue build running. The `exec`, `page`, `ctl`,
 //! `licenses` and `check-build` commands never hand over.
 //!
+//! WY-17: `bitscomp=auto` asks for GLES only with a render node up (GX-8c, `gpu=on`, or the fake GPU): the check then
+//! decides as for `gles`, and without a node or with a failed check the rescue build's Pixman draws, said in the log.
+//!
+//! WY-21: `bitscomp=auto` is the default (a CONFIG.TXT without the key); without a CONFIG.TXT (a host) the rescue build
+//! stays. The node must open, not only be there: a lost device keeps its node and answers a new open with ENODEV.
+//! The hand-over no longer replaces the rescue build: it starts the gpu build as its child and waits beside it, as
+//! nothing but a waiting process (no file, no socket, root kept for the screen). When the gpu build gives the GPU up
+//! (`gpu_watch::LOST_EXIT`), crashes, or ends with an error, the rescue build takes the screen itself and brings the
+//! gpu build's session back (`Session::restore_since`); a clean end or a kill ends it too (`after_gpu`). SIGTERM,
+//! SIGINT and SIGHUP are passed on; the gpu build dies with it (PR_SET_PDEATHSIG). While it waits its command name is
+//! `bitscomp-rescue`, so `pidof bitscomp` names the compositor alone.
+//!
 //! The kernel names the process after the file it ran (`/proc/PID/comm`: bitscomp-gpu), so the gpu build sets its
 //! command name back to `bitscomp` first thing (PR_SET_NAME): `pidof bitscomp`, `ps` and anything that matches the
 //! command name see the compositor under one name in both builds; `/proc/PID/exe` still tells them apart.
@@ -33,8 +45,10 @@ pub const GPU: bool = cfg!(feature = "gpu");
 pub const GPU_EXE: &str = "/boot/BITSOS2/bin/bitscomp-gpu";
 /// The stick's CONFIG.TXT as V2 shows it (`--config` names another, for host tests).
 pub const CONFIG: &str = "/boot/BITSOS2/CONFIG.TXT";
-/// The CONFIG.TXT key: `bitscomp=rescue|gpu` (default rescue).
+/// The CONFIG.TXT key: `bitscomp=rescue|gpu|gles|auto` (default auto, WY-21).
 pub const KEY: &str = "bitscomp";
+/// WY-17: the CONFIG.TXT key `bitscomp_gl=software|hardware`: what `gles` draws with, past `gl_software`'s choice.
+pub const GL_KEY: &str = "bitscomp_gl";
 /// The gpu build's self-check before the hand-over.
 pub const CHECK_ARG: &str = "check-build";
 /// How long the rescue build waits for the check (B4: bounded; the tree is loaded from the stick the first time).
@@ -73,6 +87,8 @@ pub enum Build {
     Gpu,
     /// WY-15: the gpu build drawing with GLES (`bitscomp=gles`, `--build gles`).
     Gles,
+    /// WY-17: GLES when a render node is up and the check proves the renderer, else the rescue build's Pixman.
+    Auto,
 }
 
 pub fn parse(v: &str) -> Option<Build> {
@@ -80,6 +96,7 @@ pub fn parse(v: &str) -> Option<Build> {
         "rescue" => Some(Build::Rescue),
         "gpu" => Some(Build::Gpu),
         "gles" => Some(Build::Gles),
+        "auto" => Some(Build::Auto),
         _ => None,
     }
 }
@@ -109,8 +126,8 @@ impl Renderer {
 
 /// WY-15: the gpu build's renderer: `--renderer` first, then `--build gles`/`gpu`, then CONFIG.TXT `bitscomp=gles`
 /// (the rescue build hands that over as `--renderer gles`; this covers a direct start), else Pixman. The second
-/// value says where the choice came from.
-pub fn renderer_wanted(cli: Option<&str>, build: Option<&str>, config: Result<&str, &str>) -> (Renderer, String) {
+/// value says where the choice came from. `bitscomp=auto` in a gpu build started directly: GLES with a render node.
+pub fn renderer_wanted(cli: Option<&str>, build: Option<&str>, config: Result<&str, &str>, node: bool) -> (Renderer, String) {
     if let Some(v) = cli {
         return match Renderer::parse(v) {
             Some(r) => (r, format!("--renderer {v}")),
@@ -118,10 +135,17 @@ pub fn renderer_wanted(cli: Option<&str>, build: Option<&str>, config: Result<&s
         };
     }
     if let Some(b) = build.and_then(parse) {
-        return if b == Build::Gles { (Renderer::Gles, "--build gles".into()) } else { (Renderer::Pixman, "default".into()) };
+        return match b {
+            Build::Gles => (Renderer::Gles, "--build gles".into()),
+            Build::Auto if node => (Renderer::Gles, "--build auto, a render node is up".into()),
+            _ => (Renderer::Pixman, "default".into()),
+        };
     }
-    match config.ok().and_then(|t| config_value(t, KEY)).as_deref().and_then(parse) {
-        Some(Build::Gles) => (Renderer::Gles, format!("CONFIG.TXT {KEY}=gles")),
+    let Ok(text) = config else { return (Renderer::Pixman, "default".into()) };
+    match config_value(text, KEY).as_deref().map(parse) {
+        Some(Some(Build::Gles)) => (Renderer::Gles, format!("CONFIG.TXT {KEY}=gles")),
+        Some(Some(Build::Auto)) if node => (Renderer::Gles, format!("CONFIG.TXT {KEY}=auto, a render node is up")),
+        None if node => (Renderer::Gles, "default auto, a render node is up".into()),
         _ => (Renderer::Pixman, "default".into()),
     }
 }
@@ -130,7 +154,7 @@ pub fn renderer_wanted(cli: Option<&str>, build: Option<&str>, config: Result<&s
 /// `--renderer` (CONFIG.TXT `bitscomp=gles`): the gpu build then needs no CONFIG.TXT of its own.
 pub fn hand_over_args(build: Build, argv: &[String]) -> Vec<String> {
     let mut out = argv.to_vec();
-    if build == Build::Gles && !argv.iter().any(|a| a == "--renderer") {
+    if matches!(build, Build::Gles | Build::Auto) && !argv.iter().any(|a| a == "--renderer") {
         out.extend(["--renderer".to_string(), "gles".to_string()]);
     }
     out
@@ -166,7 +190,7 @@ pub fn wanted(cli: Option<&str>, renderer: Option<&str>, config: Result<&str, &s
     if let Some(v) = cli {
         return match parse(v) {
             Some(b) => (b, format!("--build {v}")),
-            None => (Build::Rescue, format!("--build {v:?} is neither rescue, gpu nor gles")),
+            None => (Build::Rescue, format!("--build {v:?} is neither rescue, gpu, gles nor auto")),
         };
     }
     // WY-15: GLES exists only in the gpu build, so asking for it on the command line asks for that build.
@@ -175,12 +199,13 @@ pub fn wanted(cli: Option<&str>, renderer: Option<&str>, config: Result<&str, &s
     }
     match config {
         Ok(text) => match config_value(text, KEY) {
-            None => (Build::Rescue, "default".into()),
+            None if renderer == Some("pixman") => (Build::Rescue, "default".into()),
+            None => (Build::Auto, "default auto".into()),
             Some(v) => match parse(&v) {
                 // `--renderer pixman` on the command line keeps the gpu build of `bitscomp=gles` on Pixman.
-                Some(Build::Gles) if renderer == Some("pixman") => (Build::Gpu, format!("CONFIG.TXT {KEY}={v}, --renderer pixman")),
+                Some(Build::Gles | Build::Auto) if renderer == Some("pixman") => (Build::Gpu, format!("CONFIG.TXT {KEY}={v}, --renderer pixman")),
                 Some(b) => (b, format!("CONFIG.TXT {KEY}={v}")),
-                None => (Build::Rescue, format!("CONFIG.TXT {KEY}={v:?} is neither rescue, gpu nor gles")),
+                None => (Build::Rescue, format!("CONFIG.TXT {KEY}={v:?} is neither rescue, gpu, gles nor auto")),
             },
         },
         Err(why) => (Build::Rescue, format!("default (CONFIG.TXT: {why})")),
@@ -188,13 +213,14 @@ pub fn wanted(cli: Option<&str>, renderer: Option<&str>, config: Result<&str, &s
 }
 
 /// Called by the rescue build before anything is opened (one thread): hands over to the gpu build when asked.
-/// Returns only when the rescue build stays; `argv` without the program name.
-pub fn hand_over(cli: Option<&str>, renderer: Option<&str>, gpu_exe: &str, config: &str, argv: &[String]) {
+/// Returns when the rescue build draws: None as before any hand-over, Some(the gpu build's start, unix seconds) when it
+/// takes over from a gpu build that could not go on; `argv` without the program name.
+pub fn hand_over(cli: Option<&str>, renderer: Option<&str>, gpu_exe: &str, config: &str, argv: &[String]) -> Option<i64> {
     if GPU {
         if cli == Some("rescue") {
             eprintln!("bitscomp: this is the gpu build: --build rescue is not followed (start /bin/bitscomp for the rescue build)");
         }
-        return;
+        return None;
     }
     let text = if cli.is_some() || renderer == Some("gles") { Ok(String::new()) } else { read_config(config) };
     let (build, why) = wanted(cli, renderer, text.as_deref().map_err(String::as_str));
@@ -205,19 +231,228 @@ pub fn hand_over(cli: Option<&str>, renderer: Option<&str>, gpu_exe: &str, confi
         if renderer == Some("gles") {
             eprintln!("bitscomp: --renderer gles needs the gpu build; the rescue build draws with pixman");
         }
-        return;
+        return None;
     }
-    let (r, timeout) = if build == Build::Gles { (Renderer::Gles, CHECK_TIMEOUT_GLES) } else { (Renderer::Pixman, CHECK_TIMEOUT) };
-    let label = if build == Build::Gles { "gpu, renderer gles" } else { "gpu" };
+    // WY-17: `auto` asks for GLES only with a render node up; without one the rescue build's Pixman draws. WY-21: up
+    // means it opens; a lost device keeps its node.
+    if build == Build::Auto {
+        let node = crate::dmabuf::render_device().1;
+        let Some(node) = node else {
+            eprintln!("bitscomp: build rescue ({why}): no render node");
+            return None;
+        };
+        if let crate::gpu_watch::Look::Gone(e) = crate::gpu_watch::look_within(&node, NODE_LOOK) {
+            eprintln!("bitscomp: build rescue ({why}): the GPU is lost ({e})");
+            return None;
+        }
+    }
+    let gles = matches!(build, Build::Gles | Build::Auto);
+    let (r, timeout) = if gles { (Renderer::Gles, CHECK_TIMEOUT_GLES) } else { (Renderer::Pixman, CHECK_TIMEOUT) };
+    let label = if gles { "gpu, renderer gles" } else { "gpu" };
     if let Err(e) = check_gpu(gpu_exe, r, timeout) {
         eprintln!("bitscomp: build {label} ({why}): {gpu_exe} {CHECK_ARG}: {e}; the rescue build runs on");
-        return;
+        return None;
     }
     eprintln!("bitscomp: build {label} ({why}): handing over to {gpu_exe}");
-    // execve only returns on failure; the rescue build then runs on, as if nothing had been asked.
+    let since = crate::status::epoch_secs();
     let arg0 = std::env::args_os().next().unwrap_or_else(|| "bitscomp".into());
-    let e = Command::new(gpu_exe).arg0(arg0).args(hand_over_args(build, argv)).exec();
-    eprintln!("bitscomp: build gpu: {gpu_exe}: {e}; the rescue build runs on");
+    let me = std::process::id();
+    let mut cmd = Command::new(gpu_exe);
+    cmd.arg0(arg0).args(hand_over_args(build, argv)).env(RESCUE_ENV, me.to_string());
+    // SAFETY: runs in the child between fork and exec, where only async-signal-safe calls are allowed: prctl and getppid
+    // are. A parent that died before the prctl would never send the signal: the pid says so.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != me {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    // Orphans of the gpu build (its programs, Xwayland) come to this process, which ends them before it takes over.
+    // SAFETY: a prctl with an integer argument.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1 as libc::c_ulong, 0, 0, 0) };
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bitscomp: build gpu: {gpu_exe}: {e}; the rescue build runs on");
+            return None;
+        }
+    };
+    eprintln!("bitscomp: the rescue build waits as pid {} beside the gpu build (pid {}): it takes over if the GPU is lost", std::process::id(), child.id());
+    CHILD.store(child.id() as i32, std::sync::atomic::Ordering::Release);
+    pass_signals(true);
+    name_self(c"bitscomp-rescue");
+    let status = child.wait();
+    CHILD.store(0, std::sync::atomic::Ordering::Release);
+    pass_signals(false);
+    end_orphans();
+    // SAFETY: as above.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0 as libc::c_ulong, 0, 0, 0) };
+    name_self(c"bitscomp");
+    let why = match status {
+        Ok(st) => after_gpu(st),
+        Err(e) => Ok(format!("could not be waited for ({e})")),
+    };
+    match why {
+        Ok(why) => {
+            eprintln!("bitscomp: the gpu build {why}: the rescue build takes the screen, with the session");
+            Some(since)
+        }
+        Err(code) => std::process::exit(code),
+    }
+}
+
+/// The environment variable that tells the gpu build which rescue build waits for it (its pid).
+pub const RESCUE_ENV: &str = "BITSCOMP_RESCUE_PID";
+/// The rescue build's pid, taken out of the environment at the start (`take_rescue`).
+static RESCUE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The gpu build at its start, while it has one thread: the waiting rescue build's pid, out of the environment so no
+/// program it starts inherits it.
+pub fn take_rescue() {
+    if let Some(p) = std::env::var(RESCUE_ENV).ok().and_then(|v| v.parse::<u32>().ok()) {
+        RESCUE.store(p, std::sync::atomic::Ordering::Release);
+    }
+    // SAFETY: called first in main, before any thread exists.
+    unsafe { std::env::remove_var(RESCUE_ENV) };
+}
+
+/// After the gpu build gave root up: the kernel cleared its parent-death signal with the credentials (Linux
+/// commit_creds, V2 `proc::cred`), so it is armed again; a rescue build that died meanwhile is no parent any more, and
+/// the gpu build ends (nobody would take over, and nothing ends it otherwise).
+pub fn rearm_death_signal() {
+    let want = RESCUE.load(std::sync::atomic::Ordering::Acquire);
+    if want == 0 {
+        return;
+    }
+    // SAFETY: a prctl with integer arguments, and getppid.
+    let (armed, parent) = unsafe { (libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0), libc::getppid() as u32) };
+    if armed != 0 {
+        eprintln!("bitscomp: PR_SET_PDEATHSIG: {}", std::io::Error::last_os_error());
+    }
+    if parent != want {
+        eprintln!("bitscomp: the rescue build (pid {want}) is gone (parent now {parent}): the gpu build ends");
+        std::process::exit(1);
+    }
+}
+
+/// The processes the gpu build left (they came here as their subreaper): SIGTERM to each one's group, SIGKILL after a
+/// second, all reaped. Read from /proc: this process has no other children now.
+fn end_orphans() {
+    let me = std::process::id();
+    let kids = || -> Vec<i32> {
+        let Ok(d) = std::fs::read_dir("/proc") else { return Vec::new() };
+        d.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|&p| std::fs::read_to_string(format!("/proc/{p}/stat")).ok().and_then(|t| stat_ppid(&t)) == Some(me))
+            .collect()
+    };
+    // SAFETY: waitpid without a status pointer, never blocking.
+    let reap = || while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {};
+    let first = kids();
+    if first.is_empty() {
+        return;
+    }
+    eprintln!("bitscomp: the gpu build left {} programs: ending them before the session comes back", first.len());
+    for sig in [libc::SIGTERM, libc::SIGKILL] {
+        for &p in &kids() {
+            // SAFETY: kill(2) of a child of ours (unreaped, so its pid is not reused) and of the group it leads.
+            unsafe {
+                libc::kill(-p, sig);
+                libc::kill(p, sig);
+            }
+        }
+        let end = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < end {
+            reap();
+            if kids().is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    reap();
+}
+
+/// The parent pid in a /proc/PID/stat line (the fourth field, after the name in parentheses).
+fn stat_ppid(text: &str) -> Option<u32> {
+    text.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// How long the hand-over waits for one open of the render node.
+const NODE_LOOK: Duration = Duration::from_secs(2);
+
+/// What the rescue build does once the gpu build ended: Ok(why) it takes over, Err(status) it ends with that status.
+pub fn after_gpu(st: std::process::ExitStatus) -> Result<String, i32> {
+    use std::os::unix::process::ExitStatusExt;
+    match (st.code(), st.signal()) {
+        (Some(0), _) => Err(0),
+        (Some(crate::gpu_watch::LOST_EXIT), _) => Ok("gave the GPU up".into()),
+        (Some(c), _) => Ok(format!("ended with status {c}")),
+        // Someone ended it on purpose: the desktop ends as it would have without a hand-over.
+        (None, Some(sig @ (libc::SIGKILL | libc::SIGTERM | libc::SIGINT | libc::SIGHUP))) => Err(128 + sig),
+        (None, Some(sig)) => Ok(format!("crashed (signal {sig})")),
+        (None, None) => Ok("ended in an unknown way".into()),
+    }
+}
+
+/// The gpu build's pid while the rescue build waits for it.
+static CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+const PASSED: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+extern "C" fn pass_on(sig: libc::c_int) {
+    let pid = CHILD.load(std::sync::atomic::Ordering::Acquire);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe; the pid is our unreaped child's.
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+/// The signals that end a desktop go to the gpu build while the rescue build waits (on), default again after (off).
+fn pass_signals(on: bool) {
+    for sig in PASSED {
+        // SAFETY: a sigaction with a handler that only calls kill(2), or the default action; no memory but the struct.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = if on { pass_on as extern "C" fn(libc::c_int) as libc::sighandler_t } else { libc::SIG_DFL };
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+fn name_self(name: &std::ffi::CStr) {
+    // SAFETY: PR_SET_NAME reads a NUL-terminated string of at most 16 bytes; nothing else is passed.
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0) };
+}
+
+/// WY-17: whether GLES draws with the software rasteriser. `config` is CONFIG.TXT's `bitscomp_gl=`, which wins; else a
+/// real GPU only on V2's own hardware with a render node: a host's GPU is not this test's (wy/98 compares
+/// llvmpipe's picture), and under a hypervisor the node is the fake GPU, which runs no shader and draws nothing.
+pub fn software_gl(config: Option<&str>, on_v2: bool, hypervisor: bool, node: bool) -> (bool, &'static str) {
+    match config {
+        Some("software") => (true, "CONFIG.TXT bitscomp_gl=software"),
+        Some("hardware") => (false, "CONFIG.TXT bitscomp_gl=hardware"),
+        _ if !on_v2 => (true, "not on V2"),
+        _ if hypervisor => (true, "under a hypervisor"),
+        _ if !node => (true, "no render node"),
+        _ => (false, "a render node on the machine"),
+    }
+}
+
+/// `software_gl` on this machine, said once by the caller.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub fn gl_software(config_path: &str) -> (bool, &'static str) {
+    let text = read_config(config_path).unwrap_or_default();
+    let key = config_value(&text, GL_KEY);
+    let leaf1 = std::arch::x86_64::__cpuid(1);
+    let on_v2 = std::path::Path::new("/proc/bitsos").exists();
+    software_gl(key.as_deref(), on_v2, leaf1.ecx & (1 << 31) != 0, crate::dmabuf::render_device().1.is_some())
 }
 
 /// Starts `gpu_exe check-build` (with `--renderer gles` for GLES) and waits at most `timeout` for it: Ok only for
@@ -406,7 +641,9 @@ mod tests {
         assert_eq!(wanted(Some("fast"), None, Ok("bitscomp=gpu")).0, Build::Rescue);
         assert_eq!(wanted(None, None, Ok("bitscomp=gpu")).0, Build::Gpu);
         assert_eq!(wanted(None, None, Ok("bitscomp=GPU!")).0, Build::Rescue);
-        assert_eq!(wanted(None, None, Ok("loglevel=info")), (Build::Rescue, "default".into()));
+        // WY-21: a CONFIG.TXT without the key asks for auto; without a CONFIG.TXT (a host) the rescue build stays.
+        assert_eq!(wanted(None, None, Ok("loglevel=info")), (Build::Auto, "default auto".into()));
+        assert_eq!(wanted(None, Some("pixman"), Ok("loglevel=info")).0, Build::Rescue);
         assert_eq!(wanted(None, None, Err("none")).0, Build::Rescue);
     }
 
@@ -418,16 +655,58 @@ mod tests {
         // --build wins over --renderer: --build rescue --renderer gles stays rescue (the renderer is then pixman).
         assert_eq!(wanted(Some("rescue"), Some("gles"), Ok("")).0, Build::Rescue);
         assert_eq!(wanted(None, Some("pixman"), Ok("bitscomp=gles")).0, Build::Gpu);
+        assert_eq!(wanted(None, None, Ok("bitscomp=auto")).0, Build::Auto);
+        assert_eq!(wanted(None, Some("pixman"), Ok("bitscomp=auto")).0, Build::Gpu);
+        assert_eq!(wanted(Some("auto"), None, Ok("")).0, Build::Auto);
         // The gpu build's renderer.
-        assert_eq!(renderer_wanted(None, None, Ok("")).0, Renderer::Pixman);
-        assert_eq!(renderer_wanted(Some("gles"), Some("gpu"), Ok("")).0, Renderer::Gles);
-        assert_eq!(renderer_wanted(Some("pixman"), Some("gles"), Ok("bitscomp=gles")).0, Renderer::Pixman);
-        assert_eq!(renderer_wanted(Some("vulkan"), None, Ok("")).0, Renderer::Pixman);
-        assert_eq!(renderer_wanted(None, Some("gles"), Ok("")).0, Renderer::Gles);
-        assert_eq!(renderer_wanted(None, Some("gpu"), Ok("bitscomp=gles")).0, Renderer::Pixman);
-        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=gles\r\n")).0, Renderer::Gles);
-        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=gpu")).0, Renderer::Pixman);
-        assert_eq!(renderer_wanted(None, None, Err("none")).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(None, None, Ok(""), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(Some("gles"), Some("gpu"), Ok(""), false).0, Renderer::Gles);
+        assert_eq!(renderer_wanted(Some("pixman"), Some("gles"), Ok("bitscomp=gles"), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(Some("vulkan"), None, Ok(""), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(None, Some("gles"), Ok(""), false).0, Renderer::Gles);
+        assert_eq!(renderer_wanted(None, Some("gpu"), Ok("bitscomp=gles"), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=gles\r\n"), false).0, Renderer::Gles);
+        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=gpu"), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(None, None, Err("none"), false).0, Renderer::Pixman);
+        // WY-17: auto is GLES only with a render node up.
+        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=auto"), true).0, Renderer::Gles);
+        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=auto"), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(None, Some("auto"), Ok(""), true).0, Renderer::Gles);
+        assert_eq!(renderer_wanted(None, Some("auto"), Ok(""), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(Some("pixman"), None, Ok("bitscomp=auto"), true).0, Renderer::Pixman);
+        // WY-21: no key is auto.
+        assert_eq!(renderer_wanted(None, None, Ok("loglevel=info"), true).0, Renderer::Gles);
+        assert_eq!(renderer_wanted(None, None, Ok("loglevel=info"), false).0, Renderer::Pixman);
+        assert_eq!(renderer_wanted(None, None, Ok("bitscomp=what"), true).0, Renderer::Pixman);
+    }
+
+    /// WY-21: what the waiting rescue build does when the gpu build ended.
+    #[test]
+    fn the_rescue_build_takes_over_unless_the_end_was_asked_for() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        let killed = |s: i32| std::process::ExitStatus::from_raw(s);
+        assert_eq!(after_gpu(exited(0)), Err(0), "a clean end (ctl quit, Strg+Alt+Q, SIGTERM) ends the desktop");
+        assert_eq!(after_gpu(exited(crate::gpu_watch::LOST_EXIT)), Ok("gave the GPU up".into()));
+        assert!(after_gpu(exited(1)).unwrap().contains("status 1"), "an error: the rescue build draws");
+        assert!(after_gpu(killed(libc::SIGABRT)).unwrap().contains("crashed"), "Mesa's abort on a lost device");
+        assert!(after_gpu(killed(libc::SIGSEGV)).is_ok());
+        assert_eq!(after_gpu(killed(libc::SIGKILL)), Err(128 + libc::SIGKILL), "a kill -9 ends the desktop, as before");
+        assert_eq!(after_gpu(killed(libc::SIGTERM)), Err(128 + libc::SIGTERM));
+        assert_eq!(stat_ppid("42 (a (b) c) S 7 42 42 0"), Some(7), "the name may hold parentheses and spaces");
+        assert_eq!(stat_ppid("garbage"), None);
+    }
+
+    /// WY-17: GLES on the real GPU only where a real GPU can be: never on a host's, never on the fake node.
+    #[test]
+    fn the_software_rasteriser_unless_the_machine_has_the_chip() {
+        assert!(software_gl(None, false, false, true).0, "a host's GPU is not this test's");
+        assert!(software_gl(None, true, true, true).0, "the node under a hypervisor is the fake GPU, which draws nothing");
+        assert!(software_gl(None, true, false, false).0, "no node, no GPU");
+        assert!(!software_gl(None, true, false, true).0, "the Mini-PC with the node up");
+        assert!(!software_gl(Some("hardware"), true, true, false).0, "CONFIG wins");
+        assert!(software_gl(Some("software"), true, false, true).0, "CONFIG wins");
+        assert!(!software_gl(Some("?"), true, false, true).0, "an unknown value is no choice");
     }
 
     #[test]
@@ -436,6 +715,7 @@ mod tests {
         assert_eq!(hand_over_args(Build::Gles, &a(&["--stats", "5"])), a(&["--stats", "5", "--renderer", "gles"]));
         assert_eq!(hand_over_args(Build::Gles, &a(&["--renderer", "gles"])), a(&["--renderer", "gles"]));
         assert_eq!(hand_over_args(Build::Gpu, &a(&["--stats", "5"])), a(&["--stats", "5"]));
+        assert_eq!(hand_over_args(Build::Auto, &a(&["--stats", "5"])), a(&["--stats", "5", "--renderer", "gles"]));
         assert_eq!(check_renderer(&[]), Ok(Renderer::Pixman));
         assert_eq!(check_renderer(&a(&["--renderer", "gles"])), Ok(Renderer::Gles));
         assert!(check_renderer(&a(&["--renderer", "x"])).is_err());

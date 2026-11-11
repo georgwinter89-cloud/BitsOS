@@ -122,17 +122,17 @@ fn prio_class() -> TestResult {
             let call = r.calls().into_iter().find(|c| c.op == CallOp::Read && c.lba == pg * 8);
             kassert!(call.map(|c| c.prio) == Some(want), "{class:?} ioprio {ioprio:#x}: device call {call:?}, want {want:?}");
         }
-        // Read-ahead: a Normal thread misses page 0 (the file start); the pages after it come from the
-        // read-ahead thread as Background.
+        // BL-4: a Normal thread misses page 0 and reads its first window itself (linux-7 page_cache_sync_ra: 4 pages,
+        // mark on page 1); reading page 1 queues the next window [4, 12) on a worker, at the reader's priority.
         if !vfs::readahead::active() {
-            return ktest::skip("no read-ahead thread in this kernel");
+            return ktest::fail("no read-ahead worker in this kernel");
         }
         let pc0 = pc.clone();
-        in_class(Class::Normal, 5000, move || pc0.read_at(0, &mut [0u8; 1]).map(|_| ()))?.map_err(|x| format!("page 0: errno {x}"))?;
-        kassert!(until(5000, || r.calls().iter().any(|c| c.lba == 8 && c.op == CallOp::Read && c.prio == Background)), "no read-ahead of page 1: {:?}", r.calls());
+        in_class(Class::Normal, 5000, move || pc0.read_at(0, &mut [0u8; 1]).and_then(|_| pc0.read_at(4096, &mut [0u8; 1])).map(|_| ()))?.map_err(|x| format!("pages 0/1: errno {x}"))?;
         let p0 = r.calls().into_iter().find(|c| c.lba == 0);
-        kassert!(p0.map(|c| c.prio) == Some(Normal), "the missed page goes at the reader's priority: {p0:?}");
-        kassert!(until(2000, || pc.cached(1).is_some()), "the read-ahead page is cached");
+        kassert!(p0.map(|c| (c.prio, c.blocks)) == Some((Normal, 32)), "the first window goes at the reader's priority: {p0:?}");
+        kassert!(until(5000, || r.calls().iter().any(|c| c.lba == 32 && c.op == CallOp::Read && c.prio == Normal)), "no read-ahead of page 4: {:?}", r.calls());
+        kassert!(until(2000, || pc.cached(11).is_some()), "the read-ahead pages are cached");
         Ok(())
     })();
     close(&r, &d)?;
@@ -281,6 +281,7 @@ fn ram_starve_aged() -> TestResult {
         let read = |lba: u64| d.submit(Kind::Read, lba, 0, Data::Bytes(vec![0; 512]), IoPriority::Interactive).map_err(e);
         r.pause();
         let first = read(0)?;
+        crate::ktests::dispatch_aside(&d)?;
         if !until(2000, || r.holding()) {
             r.resume();
             return Err("the device never got the first read".into());

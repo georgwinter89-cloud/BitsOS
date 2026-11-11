@@ -106,7 +106,7 @@ fn sample() -> Result<hal::nmi::Round, alloc::string::String> {
 fn nmi_user_ss() -> TestResult {
     let n = hal::percpu::cpu_count();
     if n < 2 {
-        return ktest::skip("one CPU: nothing to sample");
+        return ktest::fail("one CPU: nothing to sample");
     }
     if !hal::nmi::prepared() {
         return Err("the NMI slots were not prepared at boot".into());
@@ -196,7 +196,7 @@ fn foreign_gs_hook(f: &mut TrapFrame) -> bool {
 
 fn foreign_gs() -> TestResult {
     if !hal::entry::user_fsgsbase() {
-        return ktest::skip("no FSGSBASE: the probe switches the GS base with wrgsbase");
+        return ktest::fail("no FSGSBASE: the probe switches the GS base with wrgsbase");
     }
     if !idt::gs_base_check_armed() {
         return Err("the lower-half GS check was never armed (platform::smp bring-up)".into());

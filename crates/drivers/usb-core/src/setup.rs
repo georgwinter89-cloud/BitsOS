@@ -45,6 +45,8 @@ pub mod feature {
 
 /// SuperSpeed link state SS.Disabled (USB 3.2 Table 10-13), used to switch a SuperSpeed hub port off.
 pub const LINK_SS_DISABLED: u16 = 4;
+/// SS.RxDetect: a port taken out of SS.Disabled looks for its device again.
+pub const LINK_SS_RX_DETECT: u16 = 5;
 
 impl Setup {
     /// The eight bytes as the controller wants them in a Setup Stage TRB (little endian).

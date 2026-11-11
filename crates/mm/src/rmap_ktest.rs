@@ -54,7 +54,7 @@ macro_rules! file_or_skip {
     ($pages:expr, $flags:expr) => {
         match tmpfile($pages, $flags) {
             Ok(x) => x,
-            Err(s) if s == "skip" => return ktest::skip("no /dev/shm in this image (memfds live there)"),
+            Err(s) if s == "skip" => return ktest::fail("no /dev/shm in this image (memfds live there)"),
             Err(s) => return Err(s),
         }
     };
@@ -70,7 +70,7 @@ fn unconfirmed() -> u64 {
 macro_rules! settled {
     ($u0:expr) => {
         if unconfirmed() != $u0 {
-            return ktest::skip("a TLB shootdown went unconfirmed: its frames keep their charge until the space ends");
+            return ktest::fail("a TLB shootdown went unconfirmed: its frames keep their charge until the space ends");
         }
     };
 }

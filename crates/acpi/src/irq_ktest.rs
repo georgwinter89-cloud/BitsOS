@@ -261,7 +261,7 @@ fn system_vector() -> R {
     ensure()?;
     const V: u8 = 0xFD;
     if vectors::register_system(V, counting).is_err() {
-        return ktest::skip("system vector 0xFD has an owner");
+        return ktest::fail("system vector 0xFD has an owner");
     }
     let _irq = IrqGuard::new();
     reset_hits();
@@ -286,7 +286,7 @@ fn pic_masked() -> R {
 fn ioapic_pins() -> R {
     let st = ensure()?;
     if !st.tables {
-        return ktest::skip("acpi::init has not run (desk change request CP-2/1): no I/O APIC data");
+        return ktest::fail("acpi::init has not run (desk change request CP-2/1): no I/O APIC data");
     }
     let madt = crate::tables().and_then(|a| a.madt.as_ref()).ok_or("tables without MADT")?;
     kassert!(st.ioapics.len() == madt.ioapics.len(), "{} of {} I/O APICs opened", st.ioapics.len(), madt.ioapics.len());
@@ -335,7 +335,7 @@ fn route_seen(p: Purpose) {
 fn route_dispatch() -> R {
     ensure()?;
     let Some(r) = irq::route(Purpose::Sci) else {
-        return ktest::skip("no SCI route (no tables or no FADT)");
+        return ktest::fail("no SCI route (no tables or no FADT)");
     };
     let _irq = IrqGuard::new();
     let old = irq::set_handler(Purpose::Sci, Some(route_seen)).map_err(|e| format!("{e:?}"))?;
@@ -362,10 +362,10 @@ fn sci_masked(st: &State, r: &irq::Route) -> Option<bool> {
 fn storm_mask() -> R {
     let st = ensure()?;
     let Some(r) = irq::route(Purpose::Sci) else {
-        return ktest::skip("no SCI route (no tables or no FADT)");
+        return ktest::fail("no SCI route (no tables or no FADT)");
     };
     if r.stormed() {
-        return ktest::skip("the SCI line is in a real storm already");
+        return ktest::fail("the SCI line is in a real storm already");
     }
     let _irq = IrqGuard::new();
     let old = irq::set_handler(Purpose::Sci, Some(route_seen)).map_err(|e| format!("{e:?}"))?;
@@ -398,10 +398,10 @@ fn storm_mask() -> R {
 fn owner_unmask() -> R {
     let st = ensure()?;
     let Some(r) = irq::route(Purpose::Sci) else {
-        return ktest::skip("no SCI route (no tables or no FADT)");
+        return ktest::fail("no SCI route (no tables or no FADT)");
     };
     if r.has_handler() {
-        return ktest::skip("the SCI has an owner already");
+        return ktest::fail("the SCI has an owner already");
     }
     let _irq = IrqGuard::new();
     kassert!(sci_masked(st, r) == Some(true), "SCI pin unmasked without an owner");
@@ -498,7 +498,7 @@ fn i8042_data(v: u8) -> Result<(), String> {
 fn ps2_loopback() -> R {
     ensure()?;
     let Some(kbd) = irq::route(Purpose::Ps2Keyboard) else {
-        return ktest::skip("no PS/2 route (no 8042 per FADT, or no tables)");
+        return ktest::fail("no PS/2 route (no 8042 per FADT, or no tables)");
     };
     let mouse = irq::route(Purpose::Ps2Mouse);
     let _irq = IrqGuard::new();

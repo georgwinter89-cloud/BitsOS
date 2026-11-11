@@ -9,7 +9,7 @@
 //! still sees the truth. What a program can query is the same: numbers older than the window are done.
 
 use crate::fence::{self, Fence, Waiter};
-use crate::job::{Entity, SchedPriority};
+use crate::job::{Entity, ResetSnaps, SchedPriority};
 use crate::uapi::*;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -60,9 +60,9 @@ pub struct CtxEntity {
 }
 
 impl CtxEntity {
-    pub(crate) fn new(ip_type: u32, ring: u32, priority: i32, guilty: Arc<AtomicBool>) -> CtxEntity {
+    pub(crate) fn new(ip_type: u32, ring: u32, priority: i32, guilty: Arc<AtomicBool>, snaps: Arc<ResetSnaps>) -> CtxEntity {
         CtxEntity {
-            job: Entity::new(ip_type, ring, SchedPriority::of_ctx(priority), guilty),
+            job: Entity::new(ip_type, ring, SchedPriority::of_ctx(priority), guilty, snaps),
             submit: ksync::Mutex::named("drm.cs.submit", ()),
             win: SpinLock::named("drm.cs.window", Window { sequence: 1, base: 1, slots: VecDeque::new(), members: VecDeque::new(), fence_seq: 0 }),
         }

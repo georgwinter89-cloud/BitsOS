@@ -57,6 +57,7 @@ pub mod op {
     pub const SET_UCONFIG_REG: u8 = 0x79;
     pub const SET_UCONFIG_REG_INDEX: u8 = 0x7A;
     pub const SET_SH_REG_INDEX: u8 = 0x9B;
+    pub const LOAD_CONTEXT_REG_INDEX: u8 = 0x9F;
     pub const SWITCH_BUFFER: u8 = 0x8B;
     pub const FRAME_CONTROL: u8 = 0x90;
     pub const HDP_FLUSH: u8 = 0x95;
@@ -100,6 +101,7 @@ pub fn op_name(opcode: u8) -> Option<&'static str> {
         op::SET_UCONFIG_REG => "SET_UCONFIG_REG",
         op::SET_UCONFIG_REG_INDEX => "SET_UCONFIG_REG_INDEX",
         op::SET_SH_REG_INDEX => "SET_SH_REG_INDEX",
+        op::LOAD_CONTEXT_REG_INDEX => "LOAD_CONTEXT_REG_INDEX",
         op::SWITCH_BUFFER => "SWITCH_BUFFER",
         op::FRAME_CONTROL => "FRAME_CONTROL",
         op::HDP_FLUSH => "HDP_FLUSH",
@@ -569,7 +571,9 @@ pub fn indirect_buffer(
     if addr & 3 != 0 {
         return Err(EncodeError::Misaligned { addr, align: 4 });
     }
-    if addr >> 48 != 0 {
+    // A compute queue wants the upper half sign-extended (gfx_v11_0_ring_emit_ib_compute): it drops the job with
+    // CP_HQD_ERROR.SUA_ERROR otherwise, measured on the 780M. So both forms are in range here.
+    if addr >> 48 != 0 && addr >> 47 != 0x1_ffff {
         return Err(EncodeError::Field { what: "IB address", value: addr });
     }
     if len_dw > IB_SIZE_MASK {

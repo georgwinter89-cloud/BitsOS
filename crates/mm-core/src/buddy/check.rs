@@ -14,6 +14,7 @@ impl Buddy {
         for zone in 0..ZONES {
             let zs = self.zones[zone].lock();
             let (mut frames, mut blocks) = (0u64, [0u64; ORDERS]);
+            let mut by_type = [[0u64; ORDERS]; super::MIGRATE_TYPES];
             for r in self.zone_regions(zone) {
                 let mut pfn = r.start;
                 while pfn < r.end {
@@ -30,15 +31,30 @@ impl Buddy {
                                     return Err("state inside a block");
                                 }
                             }
-                            let bit = r.maps[m.order as usize].test(self.blob(), r.bit(pfn, m.order));
+                            let mt = self.pb_type(r, pfn);
+                            let bit = r.map(m.order, mt).test(self.blob(), r.bit(pfn, m.order));
                             if bit != (m.state == State::Free) {
                                 return Err("bitmap and frame state disagree");
+                            }
+                            // W35 MM-1: a free block lies in its pageblock type's bitmap only.
+                            if (m.order as usize) < super::PB
+                                && super::MigrateType::ALL.iter().any(|&o| o != mt && r.map(m.order, o).test(self.blob(), r.bit(pfn, m.order)))
+                            {
+                                return Err("a block in the bitmap of another migrate type");
+                            }
+                            if m.state == State::Free {
+                                by_type[mt as usize][m.order as usize] += 1;
                             }
                             if m.state == State::Free {
                                 frames += 1 << m.order;
                                 blocks[m.order as usize] += 1;
                                 let buddy = pfn ^ (1 << m.order);
-                                if m.order < MAX_ORDER && r.holds(buddy, m.order) && self.get_meta(r, buddy) == m {
+                                // The reserve's halves stay apart (`free_block`).
+                                let top = if mt == super::MigrateType::HighAtomic { super::PAGEBLOCK_ORDER - 1 } else { MAX_ORDER };
+                                if m.order > top {
+                                    return Err("a free pageblock of the HighAtomic reserve");
+                                }
+                                if m.order < top && r.holds(buddy, m.order) && self.get_meta(r, buddy) == m {
                                     return Err("two free buddies not merged");
                                 }
                             } else {
@@ -51,6 +67,17 @@ impl Buddy {
             }
             if frames != zs.free_frames || blocks != zs.free_blocks {
                 return Err("zone counters disagree with the lists");
+            }
+            if by_type != zs.by_type {
+                return Err("per-type counters disagree with the lists");
+            }
+            let reserved: u64 = by_type[super::MigrateType::HighAtomic as usize].iter().enumerate().map(|(o, n)| n << o).sum();
+            if reserved != zs.free_highatomic {
+                return Err("the HighAtomic reserve's free count disagrees with the lists");
+            }
+            let pbs: u64 = self.zone_regions(zone).map(|r| super::pageblocks(r.start, r.end)).sum();
+            if zs.pageblocks.iter().sum::<u64>() != pbs {
+                return Err("pageblock counts disagree with the regions");
             }
         }
         let used: u64 = self.used.iter().map(|u| u.load(Relaxed)).sum();

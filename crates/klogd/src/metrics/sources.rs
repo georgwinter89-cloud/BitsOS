@@ -67,7 +67,7 @@ impl Sources {
             .iter()
             .map(|d| {
                 let s = d.stats();
-                DiskRaw { name: String::from(d.name()), requests: s.requests, dispatches: s.dispatches, errors: s.errors, timeouts: s.timeouts, queued: s.queued, read_bytes: s.read_bytes, write_bytes: s.write_bytes, busy_ns: s.busy_ns }
+                DiskRaw { name: String::from(d.name()), requests: s.requests, dispatches: s.dispatches, errors: s.errors, timeouts: s.timeouts, queued: s.queued, inflight: s.inflight, inflight_max: s.inflight_max, read_bytes: s.read_bytes, write_bytes: s.write_bytes, busy_ns: s.busy_ns }
             })
             .collect();
         let temps = match &self.zen {

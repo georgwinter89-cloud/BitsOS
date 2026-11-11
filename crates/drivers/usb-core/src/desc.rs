@@ -25,6 +25,8 @@ pub struct DeviceDescriptor {
     pub vendor: u16,
     pub product: u16,
     pub device: u16,
+    /// iSerialNumber: the string descriptor with the device's serial, 0 if it has none.
+    pub i_serial: u8,
     pub num_configurations: u8,
 }
 
@@ -45,6 +47,7 @@ impl DeviceDescriptor {
             vendor: le16(b, 8),
             product: le16(b, 10),
             device: le16(b, 12),
+            i_serial: b[16],
             num_configurations: b[17],
         })
     }

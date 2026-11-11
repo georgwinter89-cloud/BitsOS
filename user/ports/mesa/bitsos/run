@@ -2,7 +2,7 @@
 # GM-1a: starts a program of the Mesa tree (scripts/stage-v2.sh) with the tree's own glibc loader, libraries and
 # driver manifests. Every path comes from where this script lies, so the tree works wherever it is copied
 # (\BITSOS2\mesa\ on the stick, the stage directory on the host).
-#   run PROGRAM [ARGS]   a program of bin/ (vulkaninfo, vkcube, eglinfo, eglgears_wayland, es2gears_wayland) or a path
+#   run PROGRAM [ARGS]   a program of bin/ (vulkaninfo, vkcube, vkgears, eglinfo, the gears demos) or a path
 #   run --check          every library of the tree resolves inside the tree; says the drivers and render nodes
 #   MESA_VK_DRIVERS="radeon_icd"   only these Vulkan drivers of the tree (default: lvp_icd radeon_icd)
 # The programs are started through the tree's loader, not their PT_INTERP: V2's /usr/lib loader belongs to the

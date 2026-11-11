@@ -25,6 +25,11 @@
 #                             (--no-archive) from /usr/share/i18n; a file equal to an earlier data file becomes a link
 # A source the host lacks fails the build; V2_PKG_OPTIONAL=1 leaves it out with a note (the ktests then skip).
 
+# BL-0: /bin/blkbench (user/tools/blkbench, the read-path measurements of plan/notes/bl-BL-0.md) comes from the user
+# workspace like the other tools (static musl, the same binary as on CachyOS) and is kept in lean images (not in
+# image.rs LEAN_DROP: the desk measures with it on the Mini-PC). No entry: a cargo: line would build a second, glibc
+# copy of the same name, which the package step leaves out with a note.
+
 # The library-set check (ktest ul.pkg.cxx): exceptions through libgcc_s, iostreams, threads, libm.
 initrd pkg-cxx  g++:user/packaging/tests/pkg-cxx.cc
 # UL-6: the ABI-diff locale program (ul.pkg.locale compares its output with pkg-locale.out, made on CachyOS).
@@ -39,7 +44,30 @@ initrd wyclient cargo:user/services/bitscomp/wyclient
 # loader is its PT_INTERP, so no host libraries are added for it); CONFIG bitscomp=gpu hands over to it. Without the
 # tree on the stick, /bin/bitscomp (the rescue build) keeps running.
 stick bitscomp-gpu cargo:user/services/bitscomp+gpu
-# WY-3 (INT-W27b): Xwayland in software (\BITSOS2\xwayland\, 14 MB): bin/Xwayland and bin/xkbcomp run on the Mesa
+# GM-1d: milestone 1 (spec/gpu.md, plan/notes/gm-GM-1d.md): the Mesa tree in \BITSOS2\mesa\ (Arch's unmodified Mesa with
+# RADV and radeonsi, the Vulkan loader, vulkan-tools, mesa-utils, and what they load, its own glibc among them; ~320 MB)
+# and the Vulkan conformance runner in \BITSOS2\deqp\ (deqp-vk built from the pinned CTS tag, on the tree's glibc, its
+# data and the subset of host/tests/minipc/vk.sh; ~110 MB). Both made by user/ports/mesa/scripts/stage-stick.sh. The
+# trees' programs run on the tree's loader (`mesa-run`, the tree's `run`), so nothing comes by ldd.
+tree  mesa host:/var/tmp/claude-v2/stage/mesa
+tree  deqp host:/var/tmp/claude-v2/stage/deqp
+stick mesa-run file:user/ports/mesa/bitsos/mesa-run
+# GM-8: milestone 3's game (plan/notes/gm-GM-8.md): vkQuake and SDL2 built from their pinned releases, on the Mesa tree's glibc
+# and RADV, with LibreQuake's free game data (never in git, ~260 MB). Made by user/ports/vkquake/scripts/stage-v2.sh; `vkquake`
+# starts it fullscreen in the desktop (`vkquake --check`). The game needs the mesa tree on the same stick.
+tree  vkquake host:/var/tmp/claude-v2/stage/vkquake
+stick vkquake file:user/ports/vkquake/bitsos/vkquake
+# GM-2a: Valve's Steam client for the 64-bit path up to the login window (never in git, about 825 MB). Made by
+# user/ports/steam/scripts/stage-v2.sh; `steam` (`steam --check`) unpacks it on /data at the first start. Tested only on
+# the Mini-PC (host/tests/minipc/steam.sh), Georg logs in himself. Valve's pv-run.sh and steam-runtime-steamrt.sh start
+# with #!/bin/bash and Steam restores its own files, so the image carries a real bash (libreadline and libncursesw by ldd).
+initrd bash host:/usr/bin/bash
+tree  steam host:/var/tmp/claude-v2/stage/steam
+# Steam starts games beside its container, on V2 itself: its overlay and the games look for libGL by name. This cache finds
+# the stick's Mesa and Xwayland libraries (user/ports/steam/scripts/host-gl-cache.sh); what /usr/lib holds still comes from there.
+data /etc/ld.so.cache host:/var/tmp/claude-v2/stage/ld.so.cache
+stick steam file:user/ports/steam/bitsos/steam
+# WY-3 (INT-W27b): Xwayland with glamor and DRI3 (WY-3b) (\BITSOS2\xwayland\, 13 MB): bin/Xwayland and bin/xkbcomp run on the Mesa
 # tree's glibc (PT_INTERP and DT_RPATH there), so nothing comes by ldd; lib/ holds what the Mesa tree lacks and
 # share/X11/xkb the keymap data. Made by user/ports/xwayland/scripts/build-v2.sh without XW_TEST (needs the Mesa
 # stage; XW_OUT=<dir> puts the tree in <dir>/xwayland), then copied to the source below; bitscomp starts it at the
@@ -144,3 +172,19 @@ data /usr/share/alsa/alsa.conf          host:/usr/share/alsa/alsa.conf
 data /usr/share/alsa/cards/aliases.conf host:/usr/share/alsa/cards/aliases.conf
 data /usr/share/alsa/pcm                host:/usr/share/alsa/pcm
 data /usr/share/alsa/ctl                host:/usr/share/alsa/ctl
+
+# PK-L1a (lane WY, granted these lines only): the program library's entries beside the stick launchers
+# (\BITSOS2\bin\<id>.desktop; bitscomp's library.rs reads them, an entry only while its launcher is there). Brave's
+# icon is its tree's own product_logo_256.png, taken from the same stage as `tree brave`; LibreOffice's .desktop files
+# name the tree's own hicolor icons; Steam, vkQuake and Cobalt have none (trademarks: the fallback until lane DS
+# draws neutral ones).
+stick brave.desktop       file:user/ports/brave-launcher/bitsos/brave.desktop
+stick brave.png           host:/var/tmp/claude-v2/stage/brave/product_logo_256.png
+stick libreoffice.desktop file:user/ports/libreoffice-launcher/bitsos/libreoffice.desktop
+stick writer.desktop      file:user/ports/libreoffice-launcher/bitsos/writer.desktop
+stick calc.desktop        file:user/ports/libreoffice-launcher/bitsos/calc.desktop
+stick impress.desktop     file:user/ports/libreoffice-launcher/bitsos/impress.desktop
+stick draw.desktop        file:user/ports/libreoffice-launcher/bitsos/draw.desktop
+stick steam.desktop       file:user/ports/steam/bitsos/steam.desktop
+stick vkquake.desktop     file:user/ports/vkquake/bitsos/vkquake.desktop
+stick cobalt.desktop      file:user/ports/cobalt-launcher/bitsos/cobalt.desktop

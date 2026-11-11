@@ -12,7 +12,8 @@
 //! (answered `failed`), a plain memfd instead of a dma-buf (`failed`), rows past the end (out_of_bounds).
 //! Lines: `dmabuf feedback main_device=MAJ:MIN formats=N first=CODE:MOD tranches=T tranche_formats=K`,
 //! `dmabuf created N`, `dmabuf failed`, `syncobj acquire signalled point=P`; with `--animate` the frames line gets
-//! ` sync_released=N`.
+//! ` sync_released=N`. WY-21: the default feedback stays bound; each later one is printed as
+//! `dmabuf feedback again main_device=MAJ:MIN formats=N`.
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -150,7 +151,8 @@ impl State {
             return;
         }
         let Some(mgr) = d.sync_mgr.clone() else { fail("--syncobj: no wp_linux_drm_syncobj_manager_v1".into()) };
-        let Some(node) = crate::drm_sync::node_of(dev) else { fail(format!("--syncobj: no render node for {dev:#x}")) };
+        let node = if dev == 0 { own_node() } else { crate::drm_sync::node_of(dev) };
+        let Some(node) = node else { fail(format!("--syncobj: no render node for {dev:#x}")) };
         let drm = Arc::new(Drm::open(&node).unwrap_or_else(|e| fail(format!("{node}: {e}"))));
         let tl = |drm: &Drm| {
             let h = drm.create().unwrap_or_else(|e| fail(format!("SYNCOBJ_CREATE: {e}")));
@@ -307,7 +309,7 @@ impl Dispatch<dmabuf::ZwpLinuxDmabufV1, ()> for State {
 }
 
 impl Dispatch<feedback::ZwpLinuxDmabufFeedbackV1, ()> for State {
-    fn event(st: &mut Self, fb: &feedback::ZwpLinuxDmabufFeedbackV1, ev: feedback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(st: &mut Self, _: &feedback::ZwpLinuxDmabufFeedbackV1, ev: feedback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         let d = st.dma.as_mut().unwrap();
         match ev {
             feedback::Event::FormatTable { fd, size } => {
@@ -326,8 +328,11 @@ impl Dispatch<feedback::ZwpLinuxDmabufFeedbackV1, ()> for State {
             feedback::Event::TrancheFormats { indices } => d.tranche_formats += indices.len() / 2,
             feedback::Event::TrancheDone => d.tranches += 1,
             feedback::Event::Done => {
+                if d.fb_done {
+                    let dev = d.main_device.unwrap_or(0);
+                    println!("dmabuf feedback again main_device={}:{} formats={}", libc::major(dev), libc::minor(dev), d.table.len());
+                }
                 d.fb_done = true;
-                fb.destroy();
             }
             _ => {}
         }
@@ -371,3 +376,11 @@ impl Dispatch<params::ZwpLinuxBufferParamsV1, (u32, u8)> for State {
 wayland_client::delegate_noop!(State: ignore sync_mgr::WpLinuxDrmSyncobjManagerV1);
 wayland_client::delegate_noop!(State: ignore sync_surf::WpLinuxDrmSyncobjSurfaceV1);
 wayland_client::delegate_noop!(State: ignore sync_tl::WpLinuxDrmSyncobjTimelineV1);
+
+/// The node of a client when the compositor names no main device (0:0, WY-17b): its own, the first renderD*, as RADV
+/// opens its node without asking the compositor.
+fn own_node() -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir("/dev/dri").ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names.into_iter().find(|n| n.starts_with("renderD")).map(|n| format!("/dev/dri/{n}"))
+}

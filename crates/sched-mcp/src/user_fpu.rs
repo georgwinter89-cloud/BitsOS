@@ -71,7 +71,7 @@ fn user_process(k: u32, order: &SpinLock<Vec<u32>>) -> Result<(), String> {
 /// its own AVX state, which its own user code keeps changing, and its own CR3.
 fn fpu_user_processes() -> R {
     if xsave::reg_shape().1 < 32 {
-        return ktest::skip("no AVX in XCR0");
+        return ktest::fail("no AVX in XCR0");
     }
     let errs = Arc::new(SpinLock::new(Vec::new()));
     let order = Arc::new(SpinLock::new(Vec::new()));

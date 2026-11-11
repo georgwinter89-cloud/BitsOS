@@ -1,12 +1,12 @@
 //! `dp.scene.screendump` (QemuOnly): the screen compared with the RAM frame from outside, by QEMU's own
 //! screendump (host/tests/dp/10-screendump.sh with scene_check.py). Runs only when the scenario attaches a
-//! second UART (COM2, 0x2F8) as a socket; otherwise it skips.
+//! second UART (COM2, 0x2F8) as a socket; otherwise it fails.
 //!
 //! Protocol on COM2 (ours alone; COM1 carries klog and may interleave): for each step the kernel writes
 //! `DPSCENE step=<name> phys=<hex> width= height= stride= masks=<r>,<g>,<b>,<x> bytes=<n> hidden=<x>:<y>:<old>;...`
 //! (`stride` in pixels of the step's layout, so the row pitch is `stride * bytes`)
 //! and waits for one byte: `g` = the host has taken its screendump and saved the RAM frame (QMP `pmemsave`
-//! at `phys`, which is the RAM frame's direct-map address, so physically contiguous), anything else = abort.
+//! at `phys`, a physically contiguous copy of the RAM frame in a DMA buffer), anything else = abort.
 //! Hidden pixels changed in the RAM frame without being marked; the screen must still show `<old>`.
 //! Steps: the console picture plus colour ramps at the boot layout (full present), a damage-only present,
 //! then the same frame through an RGB layout and two 32-bit bit-mask layouts over the same scanout, then
@@ -19,7 +19,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use display::{RamFrame, Rect};
-use ktest::{ktest, TestResult};
+use ktest::{kassert, ktest, TestResult};
 
 const COM2: u16 = 0x2F8;
 const ANSWER_NS: u64 = 120_000_000_000;
@@ -56,11 +56,19 @@ fn step(name: &str, f: &RamFrame, l: Layout, stride: u32, hidden: &[(u32, u32, u
     step_px(name, f.pixels(), f.width, f.height, l, stride, hidden)
 }
 
-/// One step over any picture in RAM (DP-2: a copy of fbdev's frame as MCP `screen` gets it); `px` must be one
-/// heap block (large allocations are page runs of the direct map, physically contiguous).
+/// One step over any picture in RAM (DP-2: a copy of fbdev's frame as MCP `screen` gets it). The host reads it
+/// by physical address, so it goes through a DMA buffer: a large heap block may be only virtually contiguous.
 pub(crate) fn step_px(name: &str, px: &[u32], width: u32, height: u32, l: Layout, stride: u32, hidden: &[(u32, u32, u32)]) -> TestResult {
-    let virt = px.as_ptr() as u64;
-    let phys = hal::virt_to_phys(virt).ok_or_else(|| format!("RAM frame at {virt:#x} is not in the direct map"))?;
+    let buf = mm::dma::DmaBuffer::alloc(px.len() * 4, mm::dma::DmaConstraints::dma64())
+        .map_err(|e| format!("no contiguous {} KiB for the RAM frame: {e:?}", px.len() * 4 / 1024))?;
+    let mut chunk = [0u8; 4096];
+    for (i, c) in px.chunks(chunk.len() / 4).enumerate() {
+        for (d, p) in chunk.chunks_exact_mut(4).zip(c) {
+            d.copy_from_slice(&p.to_ne_bytes());
+        }
+        kassert!(buf.copy_in(i * chunk.len(), &chunk[..c.len() * 4]), "copy into the DMA buffer refused");
+    }
+    let phys = buf.phys();
     let m = l.masks();
     let mut h = String::new();
     for (x, y, old) in hidden {
@@ -100,9 +108,9 @@ fn ramps(f: &mut RamFrame) {
 
 fn scene() -> TestResult {
     if !com2_present() {
-        return ktest::skip("no COM2 handshake port: only host/tests/dp/10-screendump.sh runs this scene");
+        return ktest::fail("no COM2 handshake port: only host/tests/dp/10-screendump.sh runs this scene");
     }
-    let Some((fb, target)) = live() else { return ktest::skip("no GOP framebuffer") };
+    let Some((fb, target)) = live() else { return ktest::fail("no GOP framebuffer") };
     let boot = Layout::from_bootinfo(&fb).map_err(|e| format!("{e:?}"))?;
     let mut g = display::take_scanout("dp.scene").map_err(|e| format!("{e:?}"))?;
     let (w, h) = (fb.width, fb.height);
@@ -164,4 +172,4 @@ fn scene() -> TestResult {
     com2_write("DPSCENE done\n");
     Ok(())
 }
-ktest!("dp.scene.screendump", QemuOnly, scene);
+ktest!("dp.scene.screendump", Run("dp/10-screendump"), scene);
