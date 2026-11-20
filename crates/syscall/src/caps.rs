@@ -1,4 +1,4 @@
-//! `capget` and `capset` (linux-6.6/kernel/capability.c :141, :220) over V2's capability model
+//! `capget` and `capset` (linux-7.3.1/kernel/capability.c :137, :216) over V2's capability model
 //! (`proc::cred`): the permitted and effective sets follow from the ids until something stores them (a new
 //! user namespace, or capset itself: SX-2), the inheritable set is stored. capget answers as Linux for any
 //! task; capset follows `cap_capset` (EPERM for growing what Linux refuses) and stores the result, so a
@@ -102,7 +102,8 @@ fn sys_capset(c: &mut SysCtx<'_>) -> i64 {
     let valid = proc::prctl_state::CAP_FULL_SET;
     let want = [0, 4, 8].map(|o| (word(o) | word(12 + o) << 32) & valid);
     let bset = c.thread.prctl().cap_bset();
-    if want == sets(&c.proc.cred(), bset) {
+    let old = sets(&c.proc.cred(), bset);
+    if want == old {
         return 0;
     }
     // security/commoncap.c `cap_capset` (`proc::cred::capset`), then `commit_creds`.
@@ -110,6 +111,7 @@ fn sys_capset(c: &mut SysCtx<'_>) -> i64 {
     match c.proc.change_cred(c.thread, |o| cred::capset(o, bset, want)) {
         Ok(_) => {
             klog::event!(Info, "syscall", "capset", pid = c.proc.pid, eff = klog::Hex(e), prm = klog::Hex(p), inh = klog::Hex(i));
+            if e & !old[0] != 0 { vfs::access::right(vfs::access::Kind::CapRaise, c.proc.pid, c.proc.uid, e & !old[0]) }
             0
         }
         Err(err) => {

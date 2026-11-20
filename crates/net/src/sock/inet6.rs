@@ -1,10 +1,10 @@
 //! AF_INET6 for programs (NW-v6) on the IPv4 machinery of `inet` (this is its child module). BitsOS has no IPv6
 //! on the wire (smoltcp runs without proto-ipv6, so no SLAAC or NDP), and an AF_INET6 socket reaches two kinds
 //! of peers: ::1 over the loopback, and IPv4 hosts through v4-mapped addresses (::ffff:a.b.c.d), the dual stack
-//! of linux-6.6/net/ipv6/af_inet6.c, tcp_ipv6.c, udp.c and datagram.c. Inside the kernel ::1 is the IPv4
+//! of linux-7.3.1/net/ipv6/af_inet6.c, tcp_ipv6.c, udp.c and datagram.c. Inside the kernel ::1 is the IPv4
 //! stand-in `LO6` (in 127.0.0.0/8, so the loopback carries it unchanged) and :: is 0.0.0.0; this file turns a
 //! sockaddr_in6 into that view and back, holds Linux's bind-conflict rule across both families and the SOL_IPV6
-//! options (linux-6.6/net/ipv6/ipv6_sockglue.c).
+//! options (linux-7.3.1/net/ipv6/ipv6_sockglue.c).
 
 use super::{InetSock, Proto, Tcp};
 use crate::sock::abi::*;
@@ -28,7 +28,7 @@ const EPROTO: Errno = 71;
 
 /// ::1 inside the kernel. A program never sees it: an AF_INET6 socket shows it as ::1. The loopback keeps the
 /// two sides apart (an AF_INET program's own 127.0.6.1 goes to the IPv4 side); the remaining traces are listed
-/// in plan/notes/nw-NW-v6.md.
+/// in plan/spec/net.md §10.6.
 pub const LO6: Ipv4 = Ipv4([127, 0, 6, 1]);
 pub const LO6_BYTES: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 /// The largest UDP payload over IPv6 (65535 payload bytes less the UDP header; IPv4's is 65507).
@@ -180,7 +180,7 @@ pub fn encode_in6_as(a: SockAddr, v6: bool) -> Vec<u8> {
 }
 
 /// Whether a multicast group's scope (node- or link-local) needs an interface, as fe80::/10 does
-/// (`__ipv6_addr_needs_scope_id`, linux-6.6/include/net/ipv6.h:571).
+/// (`__ipv6_addr_needs_scope_id`, linux-7.3.1/include/net/ipv6.h:493).
 fn mc_needs_scope(a: &[u8; 16]) -> bool {
     matches!(a[1] & 0x0f, 1 | 2)
 }
@@ -291,7 +291,7 @@ impl InetSock {
 
     /// `__inet6_bind` up to the port: what to bind. A specific IPv6 address (::1, a group) makes the socket
     /// IPv6-only, as Linux does; the caller sets that (`force_v6only`) only for the port's taking, and gives the
-    /// old value back when the bind fails (`saved_ipv6only`, linux-6.6/net/ipv6/af_inet6.c:395-403).
+    /// old value back when the bind fails (`saved_ipv6only`, linux-7.3.1/net/ipv6/af_inet6.c:385-401).
     pub(super) fn bind6(&self, raw: &[u8], c: &super::Caller) -> Result<Bind6, Errno> {
         let s = parse_in6(raw)?;
         let tcp = matches!(self.proto, Proto::Tcp(_));

@@ -1,6 +1,6 @@
 //! RB-8 (B6): `/dev/bitsos/events`, the record reader of the journal service `bitsjournal` (root only, 0600:
-//! events may carry peer addresses). Linux's model is `/dev/kmsg` (linux-6.6/kernel/printk/printk.c
-//! devkmsg_open/devkmsg_read): every open file has its own position, a read hands out whole records only
+//! events may carry peer addresses). Linux's model is `/dev/kmsg` (linux-7.3.1/kernel/printk/printk.c
+//! devkmsg_open :920/devkmsg_read :801): every open file has its own position, a read hands out whole records only
 //! (EINVAL when the first one does not fit, as devkmsg_read), records overwritten before they were read are
 //! reported, a blocking read waits for new ones. Unlike Linux, the gap is a line of its own instead of EPIPE (the
 //! journal wants to write down what was lost and go on), and three sources arrive in one stream: the log ring,

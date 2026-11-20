@@ -608,8 +608,8 @@ static void frames(int seed, int n, const char *how, const char *shape) {
 }
 
 /* WY-17: what a program can do with a scanout window as a file, with Linux's answers for a dma-buf
- * (linux-6.6/drivers/dma-buf/dma-buf.c: dma_buf_llseek, dma_buf_mmap_internal, dma_buf_ioctl). V2 only: Linux has no
- * FBIO_BITSOS_SCANOUT. One line for dp.fbdev.scanout_engine. */
+ * (linux-7.3.1/drivers/dma-buf/dma-buf.c: dma_buf_llseek :251, dma_buf_mmap_internal :228, dma_buf_ioctl :540).
+ * V2 only: Linux has no FBIO_BITSOS_SCANOUT. One line for dp.fbdev.scanout_engine. */
 struct bitsos_fb_scanout {
     uint32_t op, window;
     int32_t fd;

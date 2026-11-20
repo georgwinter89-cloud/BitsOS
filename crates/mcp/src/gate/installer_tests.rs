@@ -29,9 +29,9 @@ fn reboot(ctx: &ToolContext, _: &Json) -> ToolResult {
 }
 
 static TOOLS: [ToolEntry; 3] = [
-    ToolEntry { name: "hw_info", description: "Facts.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, handler: facts },
-    ToolEntry { name: "system_pin", description: "Pin.", input_schema: r#"{"type":"object"}"#, owner: "RB", safety: Safety::Change, handler: pin },
-    ToolEntry { name: "reboot", description: "Reboot.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Change, handler: reboot },
+    ToolEntry { name: "hw_info", description: "Facts.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, local: false, handler: facts },
+    ToolEntry { name: "system_pin", description: "Pin.", input_schema: r#"{"type":"object"}"#, owner: "RB", safety: Safety::Change, local: false, handler: pin },
+    ToolEntry { name: "reboot", description: "Reboot.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Change, local: false, handler: reboot },
 ];
 
 fn the_installer() -> Result<u32, String> {

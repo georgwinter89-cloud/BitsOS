@@ -1,8 +1,10 @@
 //! Interval timers (setitimer/alarm) and POSIX timers (timer_create & co.) as part of the group's signal state,
-//! where Linux keeps them too (`signal_struct`, under the siglock): linux-6.6/kernel/time/itimer.c,
-//! kernel/time/posix-timers.c (`posix_timer_fn` :280, `common_timer_get` :620, `common_timer_set` :816),
-//! kernel/time/posix-cpu-timers.c (`set_process_cpu_timer` :1461, `check_cpu_itimer` :947) and kernel/signal.c
-//! (`dequeue_signal`'s SIGALRM re-arm :664, `posixtimer_rearm`, `send_sigqueue` :1955).
+//! where Linux keeps them too (`signal_struct`, under the siglock): linux-7.3.1/kernel/time/itimer.c,
+//! kernel/time/posix-timers.c (`posix_timer_queue_signal` :357, `__posixtimer_deliver_signal` :299,
+//! `common_timer_get` :684, `common_timer_set` :887, `do_timer_settime` :927), kernel/time/posix-cpu-timers.c
+//! (`set_process_cpu_timer` :1504, `check_cpu_itimer` :983) and kernel/signal.c (`dequeue_signal` :624 with
+//! `posixtimer_rearm_itimer`, itimer.c:161; `posixtimer_send_sigqueue` :2045, `posixtimer_sig_ignore` :2160,
+//! `posixtimer_sig_unignore` :2175).
 //!
 //! Pure: the clocks come in as arguments (`now` is the monotonic clock, CPU clocks are sampled by the caller
 //! outside the lock and passed as `Samples`), so host tests drive it; `crate::itimer` runs it.
@@ -11,19 +13,22 @@
 //! - ITIMER_REAL fires once; a periodic one is re-armed only when its SIGALRM is dequeued (any SIGALRM), so a
 //!   blocked or ignored SIGALRM pauses it and getitimer shows 0 meanwhile;
 //! - ITIMER_VIRTUAL/PROF are absolute CPU-time expiries (one tick added at arming, `expires += incr` on firing);
-//! - a POSIX timer has one preallocated siginfo: while it is queued, a further expiry only counts into its
-//!   si_overrun; a periodic timer whose signal was queued is re-armed when that signal is dequeued
-//!   (`it_requeue_pending` matching `si_sys_private`), counting the periods missed into `it_overrun`, and the
-//!   delivered siginfo carries them (`it_overrun_last`, timer_getoverrun); an ignored signal re-arms at once
-//!   (at least one tick ahead, `posix_timer_fn`'s throttle); timer_settime invalidates a queued signal's
-//!   re-arm (`it_requeue_pending + 2`).
-
+//! - a POSIX timer has one preallocated siginfo. An expiry stops the timer (a periodic one waits as
+//!   REQUEUE_PENDING) and queues the siginfo unless it is queued already (nothing more then: 7.3.1 counts no
+//!   overrun into a queued siginfo). Its delivery re-arms a periodic timer, counting the periods missed into
+//!   `overrun` and carrying them in si_overrun (`overrun_last`, timer_getoverrun);
+//! - every timer_settime and the re-arm itself bump `signal_seq`; a queued siginfo whose `sigqueue_seq` (taken at
+//!   its last expiry) is older is dropped when it is dequeued, as is one of a deleted timer (the queue entry, not
+//!   the siginfo, carries the timer's `tag`, so a new timer with the same id is not mistaken for it and a
+//!   program's own SI_TIMER siginfo never passes for a timer's);
+//! - a periodic timer whose signal is ignored is parked (`ignored`, Linux's `ignored_posix_timers`) instead of
+//!   re-armed, and so is one whose queued siginfo is flushed because the signal became ignored; when the signal
+//!   stops being ignored (sigaction from SIG_IGN) its siginfo is queued at once and the delivery re-arms it.
 use super::*;
 use sched::cputime::CpuTimes;
 
 /// One tick of CachyOS's HZ=1000 (`TICK_NSEC`): what set/getitimer add or report for CPU itimers.
 pub const TICK_NSEC: u64 = 1_000_000;
-const REQUEUE_PENDING: u32 = 1;
 /// Linux's CPUCLOCK kinds.
 pub const CPU_PROF: u8 = 0;
 pub const CPU_VIRT: u8 = 1;
@@ -62,13 +67,24 @@ pub struct PosixTimer {
     /// The expiry in the clock's own nanoseconds (kept while disarmed: `hrtimer_get_expires`).
     pub expires: u64,
     pub interval: u64,
-    /// `it_active`: armed and waiting to fire.
+    /// POSIX_TIMER_ARMED: armed and waiting to fire.
     pub active: bool,
+    /// POSIX_TIMER_REQUEUE_PENDING: a periodic timer that fired and waits for its signal's delivery to re-arm.
+    pub requeue_pending: bool,
     pub overrun: i64,
     pub overrun_last: i64,
-    pub requeue: u32,
+    /// `it_signal_seq`: bumped by timer_settime and by each re-arm.
+    pub signal_seq: u32,
+    /// `it_sigqueue_seq`: `signal_seq` at the last expiry that sent (or parked) the siginfo.
+    pub sigqueue_seq: u32,
+    /// `it_sig_periodic`: that expiry was of a periodic timer.
+    pub sig_periodic: bool,
     /// The preallocated siginfo is on a pending list.
     pub queued: bool,
+    /// Parked on the group's ignored timers (its signal was ignored).
+    pub ignored: bool,
+    /// The tag its queued siginfo's entry carries (`Queued::timer`; 0: none given yet).
+    pub tag: u32,
     /// The clock's value when last looked at (CPU clocks re-arm from it on dequeue).
     pub seen: u64,
     /// A CLOCK_REALTIME/TAI timer (counted on the monotonic clock; absolute times are wall times).
@@ -77,7 +93,26 @@ pub struct PosixTimer {
 
 impl PosixTimer {
     pub fn new(clock: TClock, notify: Notify, signo: u32, value: u64) -> PosixTimer {
-        PosixTimer { clock, notify, signo, value, expires: 0, interval: 0, active: false, overrun: -1, overrun_last: 0, requeue: 0, queued: false, seen: 0, wall: false }
+        PosixTimer {
+            clock,
+            notify,
+            signo,
+            value,
+            expires: 0,
+            interval: 0,
+            active: false,
+            requeue_pending: false,
+            overrun: -1,
+            overrun_last: 0,
+            signal_seq: 0,
+            sigqueue_seq: 0,
+            sig_periodic: false,
+            queued: false,
+            ignored: false,
+            tag: 0,
+            seen: 0,
+            wall: false,
+        }
     }
 }
 
@@ -104,6 +139,10 @@ pub struct Timers {
     pub posix: BTreeMap<i32, PosixTimer>,
     /// `next_posix_timer_id` (kept across exec; a new group starts at 0).
     pub next_id: i32,
+    /// PR_TIMER_CREATE_RESTORE_IDS: timer_create takes the id it is given (off again at exec).
+    pub restore_ids: bool,
+    /// The last `PosixTimer::tag` given out.
+    pub last_tag: u32,
 }
 
 /// CPU clock values the caller sampled outside the lock (see `Signals::timer_needs`).
@@ -155,23 +194,15 @@ fn overrun_int(last: i64, base: i32) -> i32 {
     if sum > i32::MAX as i64 { i32::MAX } else { sum as i32 }
 }
 
-/// The SI_TIMER siginfo of timer `id` (`_timer`: si_tid 16, si_overrun 20, si_value 24, `si_sys_private` 32,
-/// which the dequeue zeroes before a program sees it).
-pub fn timer_info(signo: u32, id: i32, value: u64, sys_private: u32) -> SigInfo {
+/// The SI_TIMER siginfo of timer `id` (`_timer`: si_tid 16, si_overrun 20, si_value 24; si_sys_private stays
+/// 0: the timer's tag goes into the queue entry, not the bytes).
+pub fn timer_info(signo: u32, id: i32, value: u64) -> SigInfo {
     let mut i = SigInfo::new(signo, SI_TIMER);
     i.0[16..20].copy_from_slice(&(id as u32).to_le_bytes());
     i.0[24..32].copy_from_slice(&value.to_le_bytes());
-    i.0[32..36].copy_from_slice(&sys_private.to_le_bytes());
     i
 }
 
-/// What firing a POSIX timer asks the signal state to do.
-enum Event {
-    Queued,
-    Ignored,
-    /// The target thread is gone: the timer just stops (`send_sigqueue` < 0).
-    Lost,
-}
 
 impl Timers {
     /// Something is armed or can re-arm (the service keeps looking at the group).
@@ -261,7 +292,7 @@ impl Timers {
         if iv == 0 && !t.active && !sig_none {
             return Some((0, 0));
         }
-        if iv != 0 && (t.requeue & REQUEUE_PENDING != 0 || sig_none) {
+        if iv != 0 && !t.active {
             let (e, k) = forward(t.expires, now, iv);
             t.expires = e;
             t.overrun = t.overrun.saturating_add(k as i64);
@@ -281,9 +312,11 @@ impl Timers {
     pub fn posix_set(&mut self, id: i32, now: u64, expires: u64, interval: u64) -> Option<(u64, u64)> {
         let old = self.posix_get(id, now)?;
         let t = self.posix.get_mut(&id)?;
+        // `do_timer_settime`: a queued siginfo of the old setting is no longer delivered.
+        t.signal_seq = t.signal_seq.wrapping_add(1);
         t.active = false;
+        t.requeue_pending = false;
         t.interval = if expires != 0 { interval } else { 0 };
-        t.requeue = t.requeue.wrapping_add(2) & !REQUEUE_PENDING;
         t.overrun_last = 0;
         t.overrun = -1;
         if expires == 0 {
@@ -299,6 +332,29 @@ impl Timers {
     pub fn posix_overrun(&self, id: i32) -> Option<i32> {
         self.posix.get(&id).map(|t| overrun_int(t.overrun_last, 0))
     }
+
+    /// The timer of a preallocated siginfo: `id` from its si_tid (the kernel wrote it), `tag` from the queue
+    /// entry; None when that timer is gone.
+    fn by_info(&mut self, info: &SigInfo, tag: u32) -> Option<&mut PosixTimer> {
+        let id = info.get32(16) as i32;
+        self.posix.get_mut(&id).filter(|t| tag != 0 && t.tag == tag)
+    }
+
+    fn tag_of(&mut self, id: i32) -> u32 {
+        let next = match self.last_tag.wrapping_add(1) {
+            0 => 1,
+            n => n,
+        };
+        match self.posix.get_mut(&id) {
+            Some(t) if t.tag != 0 => t.tag,
+            Some(t) => {
+                self.last_tag = next;
+                t.tag = next;
+                next
+            }
+            None => 0,
+        }
+    }
 }
 
 impl Signals {
@@ -306,6 +362,7 @@ impl Signals {
     /// `sigqueue_free`); the interval timers stay.
     pub fn drop_posix_timers(&mut self) {
         self.timers.posix.clear();
+        self.timers.restore_ids = false;
     }
 
     /// The CPU clocks the armed timers of this group need sampled.
@@ -336,7 +393,7 @@ impl Signals {
     /// re-arms at once, and returns the sends (signal + outcome, for `Group::after_send`) and when to look
     /// again: the earliest monotonic expiry and the least CPU time left over all armed CPU timers.
     pub fn fire_timers(&mut self, now: u64, smp: &Samples, limit: u64) -> (Vec<(u32, Outcome)>, Option<u64>, Option<u64>) {
-        let mut out = Vec::new();
+        let mut out = core::mem::take(&mut self.timer_sends);
         let mut wall: Option<u64> = None;
         let mut cpu: Option<u64> = None;
         let min = |a: &mut Option<u64>, v: u64| *a = Some(a.map_or(v, |x| x.min(v)));
@@ -386,72 +443,132 @@ impl Signals {
                 }
                 continue;
             }
-            let mut si_private = 0;
             if let Some(x) = self.timers.posix.get_mut(&id) {
                 x.active = false;
-                if x.interval != 0 {
-                    x.requeue = x.requeue.wrapping_add(1);
-                    si_private = x.requeue;
-                }
+                x.requeue_pending = x.interval != 0;
             }
-            match self.timer_event(id, &t, si_private, &mut out) {
-                Event::Ignored if t.interval != 0 => {
-                    // A handler may come later: keep it running, at least a tick apart (`posix_timer_fn`).
-                    let at = if t.interval < TICK_NSEC { cur.saturating_add(TICK_NSEC) } else { cur };
-                    if let Some(x) = self.timers.posix.get_mut(&id) {
-                        let (e, k) = forward(x.expires, at, x.interval);
-                        x.expires = e;
-                        x.overrun = x.overrun.saturating_add(k as i64);
-                        x.requeue = x.requeue.wrapping_add(1);
-                        x.active = true;
-                        match x.clock {
-                            TClock::Mono => min(&mut wall, e),
-                            _ => min(&mut cpu, e.saturating_sub(cur)),
-                        }
-                    }
-                }
-                _ => {}
-            }
+            self.timer_event(id, &mut out);
         }
         (out, wall, cpu)
     }
 
-    /// `posix_timer_event` + `send_sigqueue`: the timer's one siginfo goes to its target unless it is queued
-    /// already (then its si_overrun counts up).
-    fn timer_event(&mut self, id: i32, t: &PosixTimer, si_private: u32, out: &mut Vec<(u32, Outcome)>) -> Event {
+    /// `common_timer_set`'s "timer was already expired, queue the signal" (linux-7.3.1/kernel/time/posix-timers.c
+    /// :887): a monotonic-clock timer just set to an expiry not after `now` fires inside timer_settime, so its
+    /// signal is pending when the call returns. The sends' wake-ups go to the timer service as sigaction's do
+    /// (`timers_unignored`). SIGEV_NONE timers never queue; CPU-clock timers are left to the service.
+    pub fn posix_fire_if_due(&mut self, id: i32, now: u64) {
+        let Some(t) = self.timers.posix.get_mut(&id) else { return };
+        if !t.active || t.clock != TClock::Mono || t.notify == Notify::None || t.expires > now {
+            return;
+        }
+        t.active = false;
+        t.requeue_pending = t.interval != 0;
+        t.seen = now;
+        let mut out = core::mem::take(&mut self.timer_sends);
+        self.timer_event(id, &mut out);
+        if !out.is_empty() {
+            crate::itimer::nudge();
+        }
+        self.timer_sends = out;
+    }
+
+    /// `posixtimer_send_sigqueue`: the timer's one siginfo goes to its target unless it is queued already; an
+    /// ignored signal parks a periodic timer (and unparks a one-shot one: its old siginfo is void). A target
+    /// thread that is gone stops the timer for good.
+    fn timer_event(&mut self, id: i32, out: &mut Vec<(u32, Outcome)>) {
+        let Some(t) = self.timers.posix.get(&id).copied() else { return };
         let to = match t.notify {
-            Notify::None => return Event::Ignored,
+            Notify::None => return,
             Notify::Group => To::Group,
             Notify::Thread(k) => To::Thread(k),
         };
         let key = match to {
             To::Thread(k) if self.threads.contains_key(&k) => k,
-            To::Thread(_) => return Event::Lost,
+            To::Thread(_) => return,
             To::Group => self.main_key(),
         };
+        if let Some(x) = self.timers.posix.get_mut(&id) {
+            x.sigqueue_seq = x.signal_seq;
+            x.sig_periodic = x.requeue_pending;
+        }
         let mut o = Outcome { sent: Sent::Dropped, wake: Wake::default(), continued: false };
         if !self.prepare(t.signo, key, false, &mut o) {
-            return Event::Ignored;
+            if let Some(x) = self.timers.posix.get_mut(&id)
+                && !x.queued
+            {
+                x.ignored = x.sig_periodic;
+            }
+            return;
         }
         if t.queued {
-            self.bump_queued_overrun(id);
-            return Event::Queued;
+            return;
         }
-        match self.queue_prealloc(timer_info(t.signo, id, t.value, si_private), to, key, &mut o) {
-            true => {
-                if let Some(x) = self.timers.posix.get_mut(&id) {
-                    x.queued = true;
-                }
-                out.push((t.signo, o));
-                Event::Queued
+        if let Some(x) = self.timers.posix.get_mut(&id) {
+            x.ignored = false;
+        }
+        self.queue_timer(id, to, key, o, out);
+    }
+
+    /// The timer's siginfo onto `to`'s list (`posixtimer_queue_sigqueue`, no `prepare_signal`).
+    fn queue_timer(&mut self, id: i32, to: To, key: u64, mut o: Outcome, out: &mut Vec<(u32, Outcome)>) {
+        let tag = self.timers.tag_of(id);
+        let Some(t) = self.timers.posix.get(&id).copied() else { return };
+        if self.queue_prealloc(timer_info(t.signo, id, t.value), tag, to, key, &mut o) {
+            if let Some(x) = self.timers.posix.get_mut(&id) {
+                x.queued = true;
             }
-            false => Event::Lost,
+            if out.try_reserve(1).is_ok() {
+                out.push((t.signo, o));
+            }
+        }
+    }
+
+    /// `posixtimer_sig_unignore` (from `sigaction`, when `sig` stops being ignored): the parked timers of it queue
+    /// their siginfo now, so the signal is pending when sigaction returns (the delivery re-arms them). The sends'
+    /// wake-ups and a fatal outcome are the timer service's to carry out (`fire_timers` hands them over first):
+    /// sigaction's caller has no `Group::after_send`.
+    pub(crate) fn timers_unignored(&mut self, sig: u32) {
+        let mut out = core::mem::take(&mut self.timer_sends);
+        let ids: Vec<i32> = self.timers.posix.iter().filter(|(_, t)| t.ignored && t.signo == sig).map(|(id, _)| *id).collect();
+        for id in ids {
+            let Some(t) = self.timers.posix.get_mut(&id) else { continue };
+            t.ignored = false;
+            if t.queued {
+                continue;
+            }
+            let (to, key) = match t.notify {
+                Notify::Group if !self.exiting => (To::Group, self.main_key()),
+                Notify::Thread(k) if self.threads.contains_key(&k) => (To::Thread(k), k),
+                _ => continue,
+            };
+            let o = Outcome { sent: Sent::Dropped, wake: Wake::default(), continued: false };
+            self.queue_timer(id, to, key, o, &mut out);
+        }
+        if !out.is_empty() {
+            crate::itimer::nudge();
+        }
+        self.timer_sends = out;
+    }
+
+    /// `sigqueue_free_ignored` for every timer siginfo of `mask` a flush is about to remove: it is no longer
+    /// queued, and the timer is parked when that siginfo came from a periodic expiry.
+    pub(crate) fn timers_flushed(&mut self, mask: u64) {
+        for t in self.timers.posix.values_mut().filter(|t| t.queued && bit_checked(t.signo) & mask != 0) {
+            t.queued = false;
+            t.ignored = t.sig_periodic;
+        }
+    }
+
+    /// A thread's own queue went with it: its timers' siginfos are no longer queued.
+    pub(crate) fn timers_lost_thread(&mut self, key: u64) {
+        for t in self.timers.posix.values_mut().filter(|t| t.notify == Notify::Thread(key)) {
+            t.queued = false;
         }
     }
 
     /// The timer's preallocated siginfo onto the target's list (no `legacy_queue`, no RLIMIT: it was counted
     /// when the timer was made). False when there is no memory for the entry.
-    fn queue_prealloc(&mut self, info: SigInfo, to: To, key: u64, o: &mut Outcome) -> bool {
+    fn queue_prealloc(&mut self, info: SigInfo, tag: u32, to: To, key: u64, o: &mut Outcome) -> bool {
         let sig = info.signo();
         let shared = matches!(to, To::Group);
         let q = if shared {
@@ -462,40 +579,22 @@ impl Signals {
                 None => return false,
             }
         };
-        if q.q.try_reserve(1).is_err() {
+        if !q.push(info, tag) {
             return false;
         }
-        q.q.push(info);
         q.set |= bit(sig);
         self.queued += 1;
         o.sent = self.complete(sig, key, shared, &mut o.wake);
         true
     }
 
-    /// `q->info.si_overrun++` on the queued siginfo of timer `id`.
-    fn bump_queued_overrun(&mut self, id: i32) {
-        let hit = |i: &SigInfo| i.code() == SI_TIMER && i.get32(16) as i32 == id;
-        let bump = |i: &mut SigInfo| {
-            let n = (i.get32(20) as i32).saturating_add(1);
-            i.0[20..24].copy_from_slice(&(n as u32).to_le_bytes());
-        };
-        if let Some(i) = self.shared.q.iter_mut().find(|i| hit(i)) {
-            bump(i);
-            return;
-        }
-        for t in self.threads.values_mut() {
-            if let Some(i) = t.pending.q.iter_mut().find(|i| hit(i)) {
-                bump(i);
-                return;
-            }
-        }
-    }
-
     /// `dequeue_signal`'s timer part for a signal just taken (`now`: the monotonic clock): a SIGALRM re-arms
-    /// a periodic ITIMER_REAL; a timer's siginfo frees its slot and, when it is the current one of a periodic
-    /// timer, re-arms it and carries the overrun (`posixtimer_rearm`). Returns whether the service must look
-    /// again (a timer was re-armed).
-    pub(crate) fn timer_dequeued(&mut self, info: &mut SigInfo, now: u64) -> bool {
+    /// a periodic ITIMER_REAL; a timer's preallocated siginfo (`tag` not 0, Linux's `timer_sigq`) frees its slot
+    /// and goes through `__posixtimer_deliver_signal`: dropped when its timer is gone or was set again since
+    /// that expiry, else delivered, a periodic timer re-armed with the missed periods counted into si_overrun.
+    /// Any other siginfo, a program's SI_TIMER one too, is delivered as it is. Returns (deliver it, the
+    /// service must look again).
+    pub(crate) fn timer_dequeued(&mut self, info: &mut SigInfo, tag: u32, now: u64) -> (bool, bool) {
         let mut rearmed = false;
         if info.signo() == SIGALRM && !self.timers.real.active && self.timers.real.incr != 0 {
             let r = &mut self.timers.real;
@@ -503,31 +602,34 @@ impl Signals {
             r.active = true;
             rearmed = true;
         }
-        if info.code() != SI_TIMER {
-            return rearmed;
+        if tag == 0 {
+            return (true, rearmed);
         }
-        let id = info.get32(16) as i32;
-        let private = info.get32(32);
-        if let Some(t) = self.timers.posix.get_mut(&id) {
-            t.queued = false;
-            if private != 0 && t.interval != 0 && t.requeue == private {
-                let cur = if t.clock == TClock::Mono { now.max(t.seen) } else { t.seen };
-                let (e, k) = forward(t.expires, cur, t.interval);
-                t.expires = e;
-                t.overrun = t.overrun.saturating_add(k as i64);
-                t.active = true;
-                t.overrun_last = t.overrun;
-                t.overrun = -1;
-                t.requeue = t.requeue.wrapping_add(1);
-                let base = info.get32(20) as i32;
-                let n = overrun_int(t.overrun_last, base);
-                info.0[20..24].copy_from_slice(&(n as u32).to_le_bytes());
-                rearmed = true;
+        let deliver = match self.timers.by_info(info, tag) {
+            None => false,
+            Some(t) => {
+                t.queued = false;
+                if t.signal_seq != t.sigqueue_seq {
+                    false
+                } else {
+                    if t.interval != 0 && t.requeue_pending {
+                        let cur = if t.clock == TClock::Mono { now.max(t.seen) } else { t.seen };
+                        let (e, k) = forward(t.expires, cur, t.interval);
+                        t.expires = e;
+                        t.overrun = t.overrun.saturating_add(k as i64);
+                        t.active = true;
+                        t.requeue_pending = false;
+                        t.overrun_last = t.overrun;
+                        t.overrun = -1;
+                        t.signal_seq = t.signal_seq.wrapping_add(1);
+                        let n = overrun_int(t.overrun_last, 0);
+                        info.0[20..24].copy_from_slice(&(n as u32).to_le_bytes());
+                        rearmed = true;
+                    }
+                    true
+                }
             }
-        }
-        if private != 0 {
-            info.0[32..36].copy_from_slice(&[0; 4]);
-        }
-        rearmed
+        };
+        (deliver, rearmed)
     }
 }

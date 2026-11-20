@@ -10,7 +10,7 @@
 #                                 as the app's own, ~23 MB, as in the Linux build directory
 #   LICENSES/                     YT-5: the licence texts of everything in libcobalt.so and loader_app (Chromium's
 #                                 licenses.py over their GN dependencies, made by licenses-v2.sh into <copy>/lic) and
-#                                 of the fonts; Crashpad's handler stays out (decision in plan/notes/yt-YT-5.md)
+#                                 of the fonts; Crashpad's handler stays out (why: plan/spec/programs.md §2.2)
 # xtask adds lib/ with the libraries loader_app needs beyond the initramfs set (libX11 & co., libasound).
 # Run it again after a Cobalt rebuild (no rebuild here). The stage is replaced as a whole (new dir, rename).
 set -euo pipefail

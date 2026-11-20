@@ -180,7 +180,7 @@ fn no_shared_lock() -> TestResult {
     kassert!(in_copy_fd >= 0, "open in the own view: {in_copy_fd}");
     let in_copy = locks_of_reads(&mut own, in_copy_fd)?;
 
-    // A name looked up there asks once per call, its group's own lock (plan/notes/fs-FS-W33.md): once, not more. A later
+    // A name looked up there asks once per call, its group's own lock: once, not more. A later
     // lock-free holder passes this too.
     let named_in_copy = nsset_of_opens(&mut own, &own_path)?;
     klog::event!(Info, "fs", "pf7.path_in_copy", opens = AT_READS, acquired = named_in_copy);

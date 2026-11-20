@@ -31,6 +31,9 @@ pub enum TestHook {
     EdidActive,
     /// BT-edid: Active answers with a broken header, Discovered with `edid::fixture()` (the fallback path).
     EdidFallback,
+    /// GP-GUARD: bitsboot stands in for a loader older than the profiles: it chooses none, forces no line, hands
+    /// STICK.ID over and starts any kernel (the kernel must then hold the Gaming-PC's disk rule up by itself).
+    OldLoader,
 }
 
 pub const TEST_KEY: &str = "bitsboot.test";
@@ -41,6 +44,7 @@ pub fn test_hook(text: &[u8]) -> TestHook {
         Some("ebs_fail") => TestHook::EbsFail,
         Some("edid_active") => TestHook::EdidActive,
         Some("edid_fallback") => TestHook::EdidFallback,
+        Some("old_loader") => TestHook::OldLoader,
         _ => TestHook::None,
     }
 }
@@ -70,6 +74,7 @@ mod tests {
         assert_eq!(test_hook(b"bitsboot.test=ebs_fail"), TestHook::EbsFail);
         assert_eq!(test_hook(b"bitsboot.test=edid_active"), TestHook::EdidActive);
         assert_eq!(test_hook(b"bitsboot.test=edid_fallback"), TestHook::EdidFallback);
+        assert_eq!(test_hook(b"bitsboot.test=old_loader"), TestHook::OldLoader);
         assert_eq!(test_hook(b"bitsboot.test=other"), TestHook::None);
         assert_eq!(test_hook(b""), TestHook::None);
     }

@@ -2,7 +2,7 @@
 //! V1's `tasks`/`stop_task` become `ps` (pid, threads, core, state, CPU time) and `kill` (pid, signal)).
 //!
 //! `ps` reads the process table (`crate::processes`, zombies included) and sched's thread table once: state
-//! letters as Linux `task_state` (linux-6.6/fs/proc/array.c:130: R, S, T, Z, X; sched knows no uninterruptible
+//! letters as Linux `task_state` (linux-7.3.1/fs/proc/array.c:127: R, S, T, Z, X; sched knows no uninterruptible
 //! sleep, so there is no D), CPU time from SC-6 (`Group::cpu_times`, per thread `ThreadStat`), memory from MM-5b
 //! (resident and committed pages of the address space, the system's commit total and limit), the command line.
 //! Kernel threads have no process: they are counted (listed with `kernel: true`) and never signalled.
@@ -53,7 +53,7 @@ fn letter(stat: Option<&sched::ThreadStat>) -> char {
     }
 }
 
-/// A process's state as `/proc/<pid>/stat` shows it (the leader's, linux-6.6/fs/proc/array.c `do_task_stat`):
+/// A process's state as `/proc/<pid>/stat` shows it (the leader's, linux-7.3.1/fs/proc/array.c:466 `do_task_stat`):
 /// Z once every thread ended (until reaped), T in a group stop, else the leader thread's R/S; a group whose
 /// leader called pthread_exit shows Z as in Linux (its leader is a zombie until the group ends).
 pub(crate) fn process_state(p: &Process, stats: &BTreeMap<u64, &sched::ThreadStat>) -> char {

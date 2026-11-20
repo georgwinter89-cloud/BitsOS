@@ -1,0 +1,20 @@
+# GP-GPU1 (plan/spec/gpu-rdna4.md piece 15, section 3): the RX 9070 XT's firmware for the Gaming-PC's stick. Copied only
+# when asked for (`cargo xtask image --firmware gaming-pc`; a stick: `cargo xtask stick --firmware gaming-pc`), from
+# the host's linux-firmware-amdgpu (decompressed, with LICENSE.amdgpu); the Mini-PC's stick does not carry it.
+# The names as `ipmod::plan(..).files()` gives them for the card's measured table (a host test keeps the two equal,
+# tests/rdna4.rs `the_stick_list_matches_the_modules`). This board (1002:7550 rev c0) is no kicker board
+# (amdgpu_ucode.c:33), so the plain names. psp_14_0_3_sos holds the bootloader's parts and the secure OS the card needs at a
+# cold start, the TOC and the register list.
+# Never into git: names only. Licence: no reverse engineering, decompilation or disassembly of these files.
+amdgpu/psp_14_0_3_sos.bin
+amdgpu/psp_14_0_3_ta.bin
+amdgpu/smu_14_0_3.bin
+amdgpu/gc_12_0_1_pfp.bin
+amdgpu/gc_12_0_1_me.bin
+amdgpu/gc_12_0_1_mec.bin
+amdgpu/gc_12_0_1_rlc.bin
+amdgpu/gc_12_0_1_imu.bin
+amdgpu/gc_12_0_1_uni_mes.bin
+amdgpu/sdma_7_0_1.bin
+amdgpu/dcn_4_0_1_dmcub.bin
+amdgpu/vcn_5_0_0.bin

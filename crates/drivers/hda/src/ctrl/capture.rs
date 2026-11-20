@@ -87,8 +87,8 @@ impl<H: Hw> Controller<H> {
             klog::event!(Warn, "snd", "hda.open_failed", ctrl = self.name.as_str(), what = what, error = e);
             HdaError::NoMemory
         };
-        let bdl = self.alloc(layout.bdl_bytes(), DmaUse::Control).map_err(|e| fail("bdl", &e))?;
-        let data = self.alloc(layout.ring_bytes as usize, DmaUse::Data).map_err(|e| fail("ring", &e))?;
+        let bdl = self.alloc(layout.bdl_bytes()).map_err(|e| fail("bdl", &e))?;
+        let data = self.alloc(layout.ring_bytes as usize).map_err(|e| fail("ring", &e))?;
         let ioc = self.irq_driven();
         if !stream::write_bdl(&bdl, data.dev_addr(), &layout, ioc) {
             return Err(fail("bdl", "write"));
@@ -105,12 +105,12 @@ impl<H: Hw> Controller<H> {
         if !stream::reset(&self.hw, desc) {
             klog::event!(Warn, "snd", "hda.stream_reset_slow", ctrl = self.name.as_str(), desc = desc);
         }
-        stream::program(&self.hw, desc, tag, word, bdl.dev_addr(), &layout, !self.snooped());
+        stream::program(&self.hw, desc, tag, word, bdl.dev_addr(), &layout);
         let g = self.generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1) & 0xFF_FFFF;
         let sid = g << 8 | n as u32;
         klog::event!(Info, "snd", "hda.open_input", ctrl = self.name.as_str(), stream = sid, desc = desc, tag = tag, cad = id.cad,
             pin = klog::Hex(id.pin as u64), adc = klog::Hex(info.converter as u64), rate = fmt.rate, bits = fmt.bits,
-            ring_frames = layout.ring_frames(), period_frames = layout.period_frames(), ioc = ioc, snoop = self.snooped());
+            ring_frames = layout.ring_frames(), period_frames = layout.period_frames(), ioc = ioc);
         slots[n] = Some(Slot {
             id: sid,
             input: true,

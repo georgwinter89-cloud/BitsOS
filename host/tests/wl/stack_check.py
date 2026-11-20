@@ -2,7 +2,7 @@
 """WL: the rtw89 driver thread's stack, measured in a built kernel (static, from its machine code).
 
 The thread runs on a kernel stack of 64 KiB (crates/sched/src/stack.rs). At opt-level 1 (the dev profile the
-stick runs) a Device moved by value through four bring-up frames overflowed it on the Mini-PC with wlan=on
+stick runs) a Device moved by value through four bring-up frames overflowed it on the Mini-PC (22.10.)
 (`thread 38 "rtw89" ran into its guard page`, rip in Device::bring_up's stack probe). QEMU has no RTL8852BE, so no
 ktest ever enters these frames, and the fake chip of the host tests is a node process: the kernel's machine code is
 the only place the frames can be seen without the chip.

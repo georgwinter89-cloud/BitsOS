@@ -171,7 +171,9 @@ fn send(dev: &dyn DisplayDevice, s: &mut Scratch, r: Rect, arrow: Option<(u32, u
     if patch.try_reserve(n).is_err() || keep.try_reserve(n).is_err() {
         return Step::Failed("no memory for the patch");
     }
-    if !display::with_screen(|px, w, h| (w, h) == (sw, sh) && copy_out(px, w, h, r, patch)).unwrap_or(false) {
+    // Only the patch is read: while a program draws straight into the scanout, a whole picture is a slow read of
+    // device memory that holds the program's next frame back (SHOT).
+    if display::copy_screen(r, patch) != Ok((sw, sh)) {
         return Step::Failed("no picture of the screen's size");
     }
     if let Some((x, y, scale)) = arrow {
@@ -374,7 +376,7 @@ pub fn clear() {
     if at.is_none() && stale.is_none() {
         return;
     }
-    let (Some(dev), Some((sw, sh))) = (display::device(), display::with_screen(|_, w, h| (w, h))) else { return };
+    let (Some(dev), Some((sw, sh))) = (display::device(), display::with_frame(|f| (f.width, f.height))) else { return };
     let record = RECORD.load(Ordering::Acquire);
     s.last.clear();
     for r in [stale, at].into_iter().flatten().map(|r| r.clip(sw, sh)).filter(|r| !r.is_empty()) {

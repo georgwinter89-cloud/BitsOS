@@ -1,6 +1,6 @@
 /* DR-2: the DRM render node as libdrm and Mesa meet it: the node itself, the core ioctls with the
- * size-tolerant copy rules (linux-6.6/drivers/gpu/drm/drm_ioctl.c:812-890), the render node's refusals, and the
- * /sys walk of libdrm's drmGetDevices2 (gx-scout-uapi.md §2); DR-4: the INFO and CTX rules. Takes the first
+ * size-tolerant copy rules (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:834-916), the render node's refusals, and the
+ * /sys walk of libdrm's drmGetDevices2; DR-4: the INFO and CTX rules. Takes the first
  * /dev/dri/renderD* whose driver is
  * "amdgpu" (on CachyOS the real GPU, on V2 under QEMU the fake). Prints only device-neutral facts: no ids,
  * slots, paths of the host's PCI tree, or version numbers beyond Mesa's floor. */
@@ -126,9 +126,9 @@ static void version_checks(void) {
     struct drm_version v = {0};
     res("VERSION lengths", io(VERSION, &v));
     yes("major 3", v.major == 3);
-    yes("minor >= 54", v.minor >= 54);
-    /* The date is "20150101" in Linux 6.6 and "0" since DRIVER_DATE went (6.14): only its presence counts. */
-    printf("name_len=%lu desc_len=%lu date_len>0=%s\n", v.name_len, v.desc_len, v.date_len > 0 ? "yes" : "no");
+    yes("minor >= 64", v.minor >= 64);
+    /* The date is "0" since DRIVER_DATE went (6.14). */
+    printf("name_len=%lu desc_len=%lu date_len=%lu\n", v.name_len, v.desc_len, v.date_len);
     char name[16], date[16], desc[16];
     memset(name, 0x55, sizeof name);
     memset(date, 0x55, sizeof date);
@@ -139,6 +139,7 @@ static void version_checks(void) {
     res("VERSION strings", io(VERSION, &v));
     printf("name=%.3s after=%#x name_len=%lu\n", name, (unsigned char)name[3], v.name_len);
     printf("desc=%.*s nul_after_date=%s\n", (int)v.desc_len, desc, v.date_len < sizeof date && date[v.date_len] == 0x55 ? "no" : "yes");
+    printf("date=%.*s\n", (int)(v.date_len < sizeof date ? v.date_len : sizeof date), date);
     struct drm_version bad = {.name_len = 6, .name = KERNEL_ADDR};
     res("VERSION bad name buffer", io(VERSION, &bad));
     printf("lengths back after EFAULT: name_len=%lu major=%d\n", bad.name_len, bad.major);
@@ -173,6 +174,7 @@ static void cap_checks(void) {
         {1, "DUMB_BUFFER"}, {2, "VBLANK_HIGH_CRTC"}, {3, "DUMB_PREFERRED_DEPTH"}, {4, "DUMB_PREFER_SHADOW"},
         {5, "PRIME"}, {6, "TIMESTAMP_MONOTONIC"}, {7, "ASYNC_PAGE_FLIP"}, {0x10, "ADDFB2_MODIFIERS"},
         {0x11, "PAGE_FLIP_TARGET"}, {0x12, "CRTC_IN_VBLANK_EVENT"}, {0x13, "SYNCOBJ"}, {0x14, "SYNCOBJ_TIMELINE"},
+        {0x15, "ATOMIC_ASYNC_PAGE_FLIP"},
         {0, "0 (none)"}, {0x7f, "0x7f (unknown)"},
     };
     for (unsigned i = 0; i < sizeof caps / sizeof caps[0]; i++) {
@@ -206,6 +208,62 @@ static void refusal_checks(void) {
     res("core number 0xfe", io(IOC(R, 0xfe, 8), any));
     res("driver number 0x9f", io(IOC(W, 0x9f, 8), any));
     res("AMDGPU_SCHED (master only)", io(IOC(W, 0x55, 16), any));
+    /* Linux 7.3.1's core table: the legacy numbers are holes (EINVAL, no copy), drm_noop entries keep their
+     * flags, and 0xD0..0xD2 are new (drm_ioctl.c:644-747). */
+    res("legacy LOCK", io(IOC(W, 0x2a, 8), NULL));
+    res("legacy ADD_CTX", io(IOC(RW, 0x20, 8), NULL));
+    res("legacy AGP_ACQUIRE", io(IOC(0, 0x30, 0), NULL));
+    res("legacy MODESET_CTL", io(IOC(W, 0x08, 8), NULL));
+    res("FINISH (drm_noop, AUTH) on a render node", io(IOC(W, 0x2c, 8), any));
+    res("SET_UNIQUE on a render node", io(IOC(W, 0x10, 16), any));
+    res("MODE_CLOSEFB on a render node", io(IOC(RW, 0xd0, 8), any));
+    struct { uint32_t handle, new_handle; } ch = {1, 2};
+    res("GEM_CHANGE_HANDLE", io(IOC(RW, 0xd2, 8), &ch));
+    res("core number 0xd3", io(IOC(RW, 0xd3, 8), any));
+}
+
+#define SET_CLIENT_NAME IOC(RW, 0xd1, 16)
+
+static long client_name(uint64_t len, const void *p) {
+    struct { uint64_t len, ptr; } a = {len, (uintptr_t)p};
+    return io(SET_CLIENT_NAME, &a);
+}
+
+/* What fdinfo says about the client name: the line or "none". */
+static void show_name(const char *label) {
+    char path[64], text[1024];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    char *t = slurp(path, text, sizeof text);
+    char *l = t ? strstr(t, "drm-client-name:\t") : NULL;
+    if (!l) {
+        printf("%s: none\n", label);
+        return;
+    }
+    char *e = strchr(l, '\n');
+    printf("%s: %.*s\n", label, e ? (int)(e - l) : (int)strlen(l), l);
+}
+
+/* DRM_IOCTL_SET_CLIENT_NAME (Linux 7.3.1 drm_ioctl.c:577): at most 64 printable bytes without space or NUL. */
+static void client_name_checks(void) {
+    show_name("fdinfo name before");
+    res("SET_CLIENT_NAME abi-test", client_name(8, "abi-test"));
+    show_name("fdinfo name after");
+    char longer[80];
+    memset(longer, 'n', sizeof longer);
+    res("SET_CLIENT_NAME 64 bytes", client_name(64, longer));
+    res("SET_CLIENT_NAME 65 bytes", client_name(65, longer));
+    res("SET_CLIENT_NAME with a space", client_name(3, "a b"));
+    res("SET_CLIENT_NAME with a tab", client_name(3, "a\tb"));
+    res("SET_CLIENT_NAME NUL inside", client_name(4, "ab\0c"));
+    res("SET_CLIENT_NAME byte 0xe4", client_name(2, "a\xe4"));
+    res("SET_CLIENT_NAME bad pointer", client_name(4, KERNEL_ADDR));
+    res("SET_CLIENT_NAME NULL, length 0", client_name(0, NULL));
+    show_name("fdinfo name cleared");
+    res("SET_CLIENT_NAME again", client_name(2, "x1"));
+    show_name("fdinfo name again");
+    res("SET_CLIENT_NAME 65 bytes keeps the old", client_name(65, longer));
+    show_name("fdinfo name kept");
+    client_name(0, NULL);
 }
 
 static void file_checks(void) {
@@ -274,6 +332,20 @@ static void amdgpu_checks(void) {
     memset(di, 0x5a, sizeof di);
     res("INFO DEV_INFO 6 bytes", info(0x16, 0, 0, 0, di, 6));
     yes("DEV_INFO 6 bytes leaves the rest", di[6] == 0x5a && di[15] == 0x5a);
+    /* Linux 7.3.1 AMDGPU_INFO_UQ_FW_AREAS (0x24, amdgpu_kms.c:1389): GFX 11 and 12 answer GFX, COMPUTE and DMA
+     * (the sizes are the chip's); other types EINVAL; a faulting copy still answers 0. */
+    static const struct { uint32_t ty; const char *name; } uq[] = {{0, "GFX"}, {1, "COMPUTE"}, {2, "DMA"}};
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t m[5] = {0, 0, 0, 0, 0x5a5a5a5au};
+        char l[64];
+        snprintf(l, sizeof l, "INFO UQ_FW_AREAS %s", uq[i].name);
+        res(l, info(0x24, uq[i].ty, 0, 0, m, 16));
+        printf("  first size > 0=%s alignment > 0=%s nothing past 16=%s\n", m[0] ? "yes" : "no", m[1] ? "yes" : "no",
+               m[4] == 0x5a5a5a5au ? "yes" : "no");
+    }
+    res("INFO UQ_FW_AREAS UVD", info(0x24, 3, 0, 0, v, 8));
+    res("INFO UQ_FW_AREAS type 99", info(0x24, 99, 0, 0, v, 8));
+    res("INFO UQ_FW_AREAS GFX kernel pointer", info(0x24, 0, 0, 0, KERNEL_ADDR, 16));
 
     struct amdgpu_ctx c, d;
     res("CTX ALLOC NORMAL", ctx(1, 0, 0, 0, &c));
@@ -392,6 +464,7 @@ int main(void) {
     cap_checks();
     refusal_checks();
     file_checks();
+    client_name_checks();
     sysfs_checks();
     amdgpu_checks();
     close(fd);

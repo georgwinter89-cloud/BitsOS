@@ -1,8 +1,8 @@
 //! DP-3: present-pacing info for fbdev programs (`FBIO_BITSOS_PACING`). Linux's fbdev has no way to tell a
 //! program the exact refresh or when a vblank happened (DRM's emulation zeroes the timings, FBIOGET_VBLANK is
 //! ENOTTY there); DRM programs get both from `drmWaitVBlank`'s reply and the mode's clock. V2 answers one BitsOS
-//! ioctl in the fbdev number space that Linux leaves unused ('F' 0xB0; linux-6.6/Documentation/userspace-api/
-//! ioctl/ioctl-number.rst lists 'F' 00-0F, 20, 80-8F, DD), so the same program runs on Linux (ENOTTY there: it
+//! ioctl in the fbdev number space that Linux leaves unused ('F' 0xB0; linux-7.3.1/Documentation/userspace-api/
+//! ioctl/ioctl-number.rst:137-145 lists 'F' 00-0F, 20, 80-8F, DD), so the same program runs on Linux (ENOTTY there: it
 //! measures instead) and on V2 (the kernel's own numbers). Pure: the layout and its encoding, host-tested.
 //!
 //! ```c

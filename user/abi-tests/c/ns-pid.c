@@ -1,4 +1,4 @@
-/* SX-2: pids across pid namespaces as the initial /proc mount shows them (linux-6.6/fs/proc/array.c NSpid,
+/* SX-2: pids across pid namespaces as the initial /proc mount shows them (linux-7.3.1/fs/proc/array.c:211 NSpid,
  * NStgid, NSpgid, NSsid; kernel/pid.c pid_vnr): getpid/getppid inside, the NS* lines with one number per
  * level (global first, then each namespace down to the caller's), /proc/self naming the global pid, kill and
  * waitid with namespace numbers. Pids appear only as levels and relations. */

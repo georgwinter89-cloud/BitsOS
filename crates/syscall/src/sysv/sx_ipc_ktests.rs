@@ -531,6 +531,7 @@ fn programs() -> TestResult {
         case!("abi-sysv-ns", "ns"),
         case!("abi-sysv-ns", "proc"),
         case!("abi-sysv-ns", "plainproc"),
+        case!("abi-sysv-ns", "writes"),
     ];
     if !have("/bin/abi-sysv-sem") {
         return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built, or abi-sysv-sem failed to build)");

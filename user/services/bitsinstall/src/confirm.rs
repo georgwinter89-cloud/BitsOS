@@ -1,7 +1,7 @@
 //! The confirmer's protocol (bitsinstall <-> bitscomp, MC-9b): one JSON object per line over the stream socket
 //! `SOCKET` (bitsinstall listens; the session's bitscomp connects and stays connected; while none is, every
 //! request is refused). bitsinstall takes a peer only when its executable (SO_PEERCRED's pid, then
-//! /proc/<pid>/exe) is the expected confirmer (`/bin/bitscomp`; CONFIG.TXT `mcp_confirmer=test` names
+//! /proc/<pid>/exe) is the expected confirmer (`/boot/BITSOS2/bin/bitscomp`; CONFIG.TXT `mcp_confirmer=test` names
 //! `bitsinstall test-confirmer` instead, for QEMU scenarios) and runs as root or the desktop user, and only one at a
 //! time (the first holds the place until it disconnects).
 //!

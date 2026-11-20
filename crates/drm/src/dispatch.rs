@@ -1,4 +1,4 @@
-//! The ioctl front end of a DRM file (Linux `drm_ioctl`, linux-6.6/drivers/gpu/drm/drm_ioctl.c:812-890): the
+//! The ioctl front end of a DRM file (Linux `drm_ioctl`, linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:834-930): the
 //! table is looked up by number only, the argument is copied in by the caller's size, zero-extended to the
 //! kernel's size, and copied back by the caller's size, each only for the direction bits both sides share. So a
 //! program built against older or newer headers (libdrm 2.4.134's 64-byte `drm_amdgpu_gem_va`, 6.6's 40) works.
@@ -12,12 +12,11 @@ use linux::errno::*;
 use vfs::Errno;
 use vfs::sys::UserMem;
 
-/// `drm_ioctl_desc.flags` (linux-6.6/include/drm/drm_ioctl.h).
+/// `drm_ioctl_desc.flags` (linux-7.3.1/include/drm/drm_ioctl.h:80; DRM_UNLOCKED is gone).
 pub mod flags {
     pub const AUTH: u32 = 0x1;
     pub const MASTER: u32 = 0x2;
     pub const ROOT_ONLY: u32 = 0x4;
-    pub const UNLOCKED: u32 = 0x10;
     pub const RENDER_ALLOW: u32 = 0x20;
 }
 

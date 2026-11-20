@@ -110,7 +110,7 @@ static void alarm_clocks(void) {
     }
 }
 
-/* capget/capset (linux-6.6/kernel/capability.c) as a user: empty sets, the version handshake, and only
+/* capget/capset (linux-7.3.1/kernel/capability.c:137, :216) as a user: empty sets, the version handshake, and only
  * unchanged sets may be set. */
 static void caps(void) {
     uint32_t h[2] = { 0x20080522, 0 }, d[6] = { 0 };

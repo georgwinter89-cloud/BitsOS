@@ -17,13 +17,8 @@ pub fn lines(backtrace: bool) -> Vec<String> {
     out.push(format!("watchdog state={} chip={}{}", st.name(), system::found().unwrap_or("(not looked yet)"), if system::on_fake() { " fake=yes" } else { "" }));
     match system::config() {
         Some(c) => out.push(format!(
-            "config on={} ({}) timeout_s={} alive_s={} grace_s={} reload={}",
-            c.on,
-            if c.on_from_config { "CONFIG" } else { "default" },
-            c.timeout_s,
-            c.alive_s,
-            c.grace_s,
-            if c.reload_grace { "grace" } else { "stop" }
+            "config timeout_s={} alive_s={} grace_s={} reload=stop",
+            c.timeout_s, c.alive_s, c.grace_s
         )),
         None => out.push(String::from("config not read yet")),
     }
@@ -96,7 +91,7 @@ mcp_tool!(
     name: "watchdog",
     owner: "RB",
     safety: Read,
-    description: "The FCH watchdog: state (armed/off/absent/...), CONFIG (watchdog=, watchdog_timeout=, watchdog_alive=, watchdog_grace=, watchdog_reload=), what the boot found (FIRED = the last start ended by the watchdog), kicks and withheld kicks, and per CPU whether it is alive (heartbeat moved, idle with interrupts on, stalled). backtrace=true: NMI-samples every CPU and adds registers and backtraces.",
+    description: "The FCH watchdog: state (armed/absent/...), CONFIG (watchdog_timeout= watchdog_alive=, watchdog_grace=; a Reload stops it), what the boot found (FIRED = the last start ended by the watchdog), kicks and withheld kicks, and per CPU whether it is alive (heartbeat moved, idle with interrupts on, stalled). backtrace=true: NMI-samples every CPU and adds registers and backtraces.",
     schema: r#"{"type":"object","properties":{"backtrace":{"type":"boolean","description":"NMI-sample every CPU and show its backtrace"}}}"#,
     handler: watchdog,
 );

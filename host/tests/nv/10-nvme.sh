@@ -1,6 +1,6 @@
 #!/bin/bash
 # NV-1: the read-only NVMe driver on QEMU `-device nvme` controllers backed by image files of this run only.
-# Two boots (ktest=nv.; the second with nvme_irq=off, polled) with two controllers:
+# Two boots (ktest=nv.; the second with the test key ktest_poll=nvme, polled) with two controllers:
 #   NVQ0  ns1 16 MiB, 512 B, pattern seed 1, behind blkdebug: reads of sector 20000 fail (nv.errors)
 #         ns2  8 MiB, 4 KiB blocks, pattern seed 2
 #         ns3 32 MiB, 512 B, fake Windows GPT: EFI System 2048-4095, MS reserved 4096-8191, MS basic data
@@ -9,8 +9,8 @@
 # Afterwards every image (and the boot image) is byte for byte what it was (sha256): the driver has no write
 # command, and the log shows media_writes=0 for both controllers.
 # BL-1: three more boots run nv.mq.* (queues per CPU, 64 in flight, a timeout on one queue, every CPU at once) and
-# the pattern reads with -smp 1/4/16 and NVQ0's max_ioqpairs 1/8/64; CONFIG nv_mq_queues= tells nv.mq.queues the
-# queue count to expect (min of the two), nv_mq_irq= the interrupt mode (msix, or polled in the nvme_irq=off boot).
+# the pattern reads with -smp 1/4/16 and NVQ0's max_ioqpairs 1/8/64; CONFIG ktest_nv_mq_queues= tells nv.mq.queues the
+# queue count to expect (min of the two), ktest_nv_mq_irq= the interrupt mode (msix, or polled in the ktest_poll=nvme boot).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/nv-10-nvme}"
@@ -66,7 +66,9 @@ boot() {
             -device nvme-ns,drive=q0n3,bus=nvq0,nsid=3 \
             -device nvme,id=nvq1,serial=NVQ1,drive=q1n1,logical_block_size=4096,physical_block_size=4096 &
         QPID=$!
-        for _ in $(seq 1 600); do grep -aq "$BOOT_LINE" "$log" 2>/dev/null && break; sleep 0.1; done
+        # At -smp 16 OVMF misses the stick in most boots ("found nothing to boot"; xtask retries that up to 11
+        # times, qemu.rs FIRMWARE_MISS_RETRIES): wait as long as xtask is still trying, not a fixed minute.
+        for _ in $(seq 1 3000); do grep -aq "$BOOT_LINE" "$log" 2>/dev/null && break; kill -0 "$QPID" 2>/dev/null || break; sleep 0.1; done
         if grep -aq "$BOOT_LINE" "$log" 2>/dev/null; then break; fi
         echo "note: attempt $attempt: firmware never reached the boot loader, retrying"
         stop_own
@@ -76,7 +78,7 @@ boot() {
     QPID=""
 }
 
-boot "$NAME" "ktest=nv.;loglevel=info;nv_mq_irq=msix"
+boot "$NAME" "ktest=nv.;loglevel=info;ktest_nv_mq_irq=msix"
 LOG="$RUN_DIR/$NAME.log"
 BOOT_SUM=$(sum "target/xtask/$NAME.img")
 grep -a "KTEST\|nvme \|block disk\.registered\|block disk\.protected\|block write\.refused" "$LOG" || true
@@ -95,8 +97,8 @@ if grep -aq "PANIC\|lock.violation" "$LOG"; then
     fail "a failure line in the log"
 fi
 
-# Second boot: CONFIG nvme_irq=off keeps both controllers polled; the same reads pass, nv.irq skips.
-boot nv-polled "ktest=nv.,-nv.irq;loglevel=info;nvme_irq=off;nv_mq_irq=polled;nv_mq_queues=$SMP"
+# Second boot: the test key ktest_poll=nvme keeps both controllers polled; the same reads pass, nv.irq skips.
+boot nv-polled "ktest=nv.,-nv.irq;loglevel=info;ktest_poll=nvme;ktest_nv_mq_irq=polled;ktest_nv_mq_queues=$SMP"
 PLOG="$RUN_DIR/nv-polled.log"
 grep -a "KTEST" "$PLOG" || true
 grep -aq "KTEST done passed=.* failed=0" "$PLOG" || fail "polled: ktests not green"
@@ -113,7 +115,7 @@ for combo in "1 1" "4 8" "16 64"; do
     SMP=$1
     NVQ0_OPTS=",max_ioqpairs=$2"
     want=$(( $1 < $2 ? $1 : $2 ))
-    boot "nv-mq-$1-$2" "ktest=nv.mq.,nv.read,nv.qemu.pattern,nv.reset;loglevel=info;nv_mq_irq=msix;nv_mq_queues=$want"
+    boot "nv-mq-$1-$2" "ktest=nv.mq.,nv.read,nv.qemu.pattern,nv.reset;loglevel=info;ktest_nv_mq_irq=msix;ktest_nv_mq_queues=$want"
     MLOG="$RUN_DIR/nv-mq-$1-$2.log"
     grep -a "KTEST" "$MLOG" || true
     grep -aq "KTEST done passed=.* failed=0" "$MLOG" || fail "smp $1 max_ioqpairs $2: ktests not green"

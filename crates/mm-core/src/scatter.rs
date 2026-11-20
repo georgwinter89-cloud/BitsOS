@@ -39,6 +39,11 @@ pub trait Scatter: Sync {
     fn looks_live(&self, v: usize, pages: u64) -> bool;
     /// Wakes the thread that drains deferred frees; called outside spin locks and interrupt handlers only.
     fn kick(&self);
+    /// Pages of freed blocks the hook keeps for the next block of their size (their frames are still `Kind::Heap`
+    /// frames). Lock-free.
+    fn kept_pages(&self) -> u64 {
+        0
+    }
 }
 
 klog::counter!(SCATTER_ALLOCS, "mm.heap.scatter_allocs");
@@ -250,6 +255,7 @@ impl KernelHeap {
             deferred: s.deferred.load(Relaxed),
             held_bytes: s.held.load(Relaxed) * PAGE,
             waiting_bytes: s.waiting.load(Relaxed) * PAGE,
+            kept_bytes: s.hook.get().map_or(0, |h| h.kept_pages()) * PAGE,
         }
     }
 }
@@ -265,4 +271,6 @@ pub struct ScatterStats {
     pub held_bytes: u64,
     /// Of `held_bytes`, the blocks on the deferred list.
     pub waiting_bytes: u64,
+    /// Freed blocks the hook keeps for reuse (`Scatter::kept_pages`); not part of `held_bytes`.
+    pub kept_bytes: u64,
 }

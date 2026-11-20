@@ -10,7 +10,7 @@
 //! Commit: the child is charged every accounted VMA it gets (Linux charges `vma_pages` per VM_ACCOUNT VMA in
 //! `dup_mmap`), all before anything is copied: ENOMEM refuses the fork and the parent is unchanged.
 //!
-//! Huge pages (MM-13, Linux `copy_huge_pmd`, linux-6.6/mm/huge_memory.c:1062): a 2 MiB leaf stays a 2 MiB leaf in
+//! Huge pages (MM-13, Linux `copy_huge_pmd`, linux-7.3.1/mm/huge_memory.c:1950): a 2 MiB leaf stays a 2 MiB leaf in
 //! both spaces, read-only; its frames are split into 512 order-0 frames first (still mapped by the parent's 2 MiB
 //! entry), each shared with its own count, so either side can later split its entry and copy single pages, or
 //! take the 2 MiB back writable once it holds all 512 alone (`huge.rs`). The child takes a page table for its
@@ -44,6 +44,9 @@ impl AsCore {
             v.extend(g.space.tree.iter().filter(|x| !x.flags.dontfork));
             v
         };
+        // L7-VFS: guards are copied with the page tables (VM_MAYBE_GUARD is in VM_COPY_ON_FORK), except in WIPEONFORK
+        // VMAs, whose tables the child does not get.
+        let guards = g.guards.for_child(kept.iter().filter(|v| !v.flags.wipeonfork).map(|v| (v.start, v.end))).map_err(|_| MmError::NoMemory)?;
         let charge: u64 = kept.iter().filter(|v| v.flags.account).map(|v| v.pages()).sum();
         if g.limit.is_some_and(|l| charge > l) {
             commit::refused_by_space(charge);
@@ -61,6 +64,7 @@ impl AsCore {
             }
         };
         let mut c = Inner::new(g.fill);
+        c.guards = guards;
         c.limit = g.limit;
         c.space.brk_start = g.space.brk_start;
         c.space.brk = g.space.brk;

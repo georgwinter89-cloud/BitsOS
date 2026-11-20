@@ -1,0 +1,34 @@
+# Packages that are parts of a Linux system, not programs (plan 1.5). bitspkg refuses them with the reason.
+# One rule per line: `PATTERN SCOPE REASON`. PATTERN is a package name with `*` for any text. SCOPE `top`: refused
+# when asked for as the program; `all`: also refused when a program's closure needs it (the program then is
+# refused, naming the part). The file rule (usr/lib/modules, usr/lib/firmware, boot/, hooks and units only) is
+# checked on the package's file list once it is downloaded (PK-6d).
+linux all Linux-Kern: BitsOS hat seinen eigenen Kern
+linux-firmware* all Firmware: BitsOS bringt die Firmware seiner Geräte selbst mit
+linux-* top Linux-Kern oder ein Teil davon: BitsOS hat seinen eigenen Kern
+*-firmware all Firmware: BitsOS bringt die Firmware seiner Geräte selbst mit
+*-dkms all Kernmodul: BitsOS lädt keine Linux-Module
+*-ucode all Prozessor-Mikrocode: den lädt der Start von BitsOS
+grub all Bootlader: BitsOS startet mit seinem eigenen Lader
+refind all Bootlader: BitsOS startet mit seinem eigenen Lader
+limine all Bootlader: BitsOS startet mit seinem eigenen Lader
+syslinux all Bootlader: BitsOS startet mit seinem eigenen Lader
+efibootmgr all Bootlader-Werkzeug: BitsOS ändert die Starteinträge nur selbst
+os-prober all Bootlader-Werkzeug: BitsOS startet mit seinem eigenen Lader
+mkinitcpio all Startabbild-Werkzeug: BitsOS baut sein Startabbild selbst
+dracut all Startabbild-Werkzeug: BitsOS baut sein Startabbild selbst
+booster all Startabbild-Werkzeug: BitsOS baut sein Startabbild selbst
+systemd top Init-System: BitsOS hat sein eigenes (systemd-libs als Bibliothek geht)
+systemd-sysvcompat all Init-System: BitsOS hat sein eigenes
+pacman top Paketverwaltung: auf BitsOS installiert bitspkg die Programme
+sddm all Anmeldebildschirm: BitsOS hat seinen eigenen
+gdm all Anmeldebildschirm: BitsOS hat seinen eigenen
+lightdm all Anmeldebildschirm: BitsOS hat seinen eigenen
+lxdm all Anmeldebildschirm: BitsOS hat seinen eigenen
+ly all Anmeldebildschirm: BitsOS hat seinen eigenen
+greetd all Anmeldebildschirm: BitsOS hat seinen eigenen
+plasma-login-manager all Anmeldebildschirm: BitsOS hat seinen eigenen
+nvidia all Grafiktreiber: BitsOS bringt seine Treiber selbst mit
+nvidia-* all Grafiktreiber: BitsOS bringt seine Treiber selbst mit
+xf86-video-* all Grafiktreiber für Xorg: BitsOS bringt seine Treiber selbst mit
+xf86-input-* all Eingabetreiber für Xorg: BitsOS bringt seine Treiber selbst mit

@@ -362,7 +362,7 @@ pub(crate) struct DevMapped {
     pub(crate) may_write: bool,
 }
 
-/// The file checks of `do_mmap` for a device file (linux-6.6/mm/mmap.c:1279-1337, as `vfs::mmap::check` for
+/// The file checks of `do_mmap` for a device file (linux-7.3.1/mm/mmap.c:430-491, as `vfs::mmap::check` for
 /// files): unknown flags with MAP_SHARED_VALIDATE (EOPNOTSUPP, devices support no extension flag), PROT_WRITE on
 /// a mapping of an fd not open for writing (EACCES; for MAP_PRIVATE too, see the module docs), an fd not open
 /// for reading (EACCES), a map type

@@ -73,7 +73,7 @@ fn results() {
 
 #[test]
 fn lines() {
-    let c = call_line(7, "t\"x", &j(r#"{"a":[1,"b"]}"#), 9000);
+    let c = call_line(7, "t\"x", &j(r#"{"a":[1,"b"]}"#), 9000, None, false);
     assert!(c.ends_with('\n'));
     let m = j(c.trim_end());
     assert_eq!(m.get("method").and_then(Json::as_str), Some("tools/call"));
@@ -81,6 +81,15 @@ fn lines() {
     assert_eq!(p.get("name").and_then(Json::as_str), Some("t\"x"));
     assert_eq!(p.get("_meta").and_then(|x| x.get("timeout_ms")).and_then(Json::as_u64), Some(9000));
     assert_eq!(p.get("_meta").and_then(|x| x.get("progressToken")).and_then(Json::as_u64), Some(7));
+    assert!(p.get("_meta").and_then(|x| x.get("caller")).is_none(), "the network side's call names a caller");
+    assert!(p.get("_meta").and_then(|x| x.get("access")).is_none(), "a narrow call says full access");
+    // DB1: a call the gate runs for a client with full access says so.
+    let f = j(call_line(9, "t", &j("{}"), 100, None, true).trim_end());
+    assert_eq!(f.get("params").and_then(|p| p.get("_meta")).and_then(|x| x.get("access")).and_then(Json::as_str), Some("full"));
+    // MC-L: a call from the local tools socket says which program it was.
+    let l = j(call_line(8, "t", &j("{}"), 100, Some((321, 1000)), false).trim_end());
+    let who = l.get("params").and_then(|p| p.get("_meta")).and_then(|x| x.get("caller")).expect("caller");
+    assert_eq!((who.get("pid").and_then(Json::as_u64), who.get("uid").and_then(Json::as_u64)), (Some(321), Some(1000)));
     let k = j(cancel_line(7, "timeout").trim_end());
     assert_eq!(k.get("params").and_then(|x| x.get("requestId")).and_then(Json::as_u64), Some(7));
     assert_eq!(ok_line("\"a\"", &names_result("registered", &["x".into(), "y".into()])), "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"result\":{\"registered\":[\"x\",\"y\"]}}\n");

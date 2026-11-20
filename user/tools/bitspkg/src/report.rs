@@ -57,6 +57,8 @@ pub fn space(st: &Store, only: Option<&str>) -> Result<i32, String> {
         }
     }
     if only.is_none() {
+        // PK-0: where /apps lives (init's line; none for a scratch root).
+        println!("volume {}", st.apps_state().unwrap_or_else(|| format!("unknown (no {})", st.apps_state.display())));
         println!("store: {} files, {}", s.files, sz(s.size));
         println!("store unused: {} files, {} (bitspkg gc frees it)", s.unused_files, sz(s.unused));
         println!("trash: {}", sz(s.trash));

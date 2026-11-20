@@ -11,7 +11,7 @@
 #   boot 2, mcp=service: the kernel server is not started, the service answers on 8765 (MC-10: a token over plain
 #     HTTP gets 403 there, TLS only after a pairing at the keyboard: 95-access.sh), the mirror sends; the console
 #     shell (typed on through QEMU's USB keyboard and QMP) kills the service, init starts it again.
-# Needs init's glue (plan/notes/mc-MC-8a.md, change request 1): without it the service never starts and the
+# Needs init's glue (init starts /bin/bitsmcp): without it the service never starts and the
 # scenario is RED (MC_ALLOW_NO_GLUE=1 turns that into a SKIP, for the lane branch before the desk applied it).
 set -eu -o pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
@@ -28,8 +28,8 @@ MPORT=$((LO + 160))
 TOKEN="mc8a-scenario-token-51c2"
 
 if ! grep -q "fn bitsmcp" user/init/src/main.rs; then
-    if [ "${MC_ALLOW_NO_GLUE:-}" = 1 ]; then echo "SKIP: user/init/src/main.rs does not start bitsmcp yet (plan/notes/mc-MC-8a.md, change request 1)"; exit 0; fi
-    echo "RED: user/init lacks the bitsmcp glue (plan/notes/mc-MC-8a-init.patch, change request 1)"
+    if [ "${MC_ALLOW_NO_GLUE:-}" = 1 ]; then echo "SKIP: user/init/src/main.rs does not start bitsmcp yet (MC-8a's change request 1, plan/spec/net.md §11.4)"; exit 0; fi
+    echo "RED: user/init lacks the bitsmcp glue (MC-8a's change request 1, plan/spec/net.md §11.4)"
     exit 1
 fi
 

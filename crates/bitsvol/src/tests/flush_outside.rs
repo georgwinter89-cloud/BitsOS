@@ -115,6 +115,37 @@ fn a_data_flush_leaves_reads_and_writes_going() {
     f.join().unwrap().unwrap();
 }
 
+/// 12.11. gate (snap.fsyncs): a snapshot window opens only once the volume flushes it did not hold back have
+/// ended, so the freeze after it meets none of their device barriers; a flush asked meanwhile is held back.
+#[test]
+fn a_window_opens_after_the_flushes_it_came_too_late_for() {
+    let (d, h, vd) = setup("vsh-win");
+    vd.write_blocks(0, &block(100, 512), false, Normal).unwrap();
+    d.hold.store(true, Ordering::SeqCst);
+    let (f, done) = flush_thread(&vd);
+    soon("the flush reached the device", || d.started.load(Ordering::SeqCst) == 1);
+    let (h2, v, opened) = (h.clone(), vd.id(), Arc::new(AtomicBool::new(false)));
+    let o2 = opened.clone();
+    let w = std::thread::spawn(move || {
+        let w = h2.window(v, Arc::new(|| true)).unwrap();
+        o2.store(true, Ordering::SeqCst);
+        w
+    });
+    soon("the window held the next flush back", || h.window_open());
+    vd.write_blocks(8, &block(101, 512), false, Normal).unwrap();
+    vd.flush().unwrap();
+    assert_eq!((h.deferred_flushes(), d.started.load(Ordering::SeqCst)), (1, 1), "the flush after the window went to the device");
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(!opened.load(Ordering::SeqCst) && !done.load(Ordering::SeqCst), "the window opened beside a flush under way");
+    d.hold.store(false, Ordering::SeqCst);
+    f.join().unwrap().unwrap();
+    let w = w.join().unwrap();
+    let b = h.lock().unwrap().barriers().0;
+    h.commit().unwrap();
+    drop(w);
+    assert!(h.lock().unwrap().barriers().0 > b && h.owed_flushes() == 0, "the window's commit covers the held flush");
+}
+
 #[test]
 fn a_second_fsync_waits_for_a_flush_that_covers_it() {
     let (d, _h, vd) = setup("vsh-out2");

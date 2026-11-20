@@ -2,6 +2,7 @@
 //! `call`. Privacy (DESIGN §9.3, Georg 15.10.): for `Caller::Mcp` documents under private roots do not
 //! exist (not in results, workspaces, status or explain), and snippets are short.
 
+use crate::learn::Event;
 use crate::engine::{Caller, Engine, Generation, Hit, SearchReq};
 use crate::snippet;
 use crate::workspace::{Item, Workspace};
@@ -166,7 +167,19 @@ fn item_json(e: &Engine, g: &Generation, h: &Hit, query: &str, chars: usize, exp
             };
             why.push(json!({"part": "keyword", "text": txt}));
         }
-        why.push(json!({"part": "recency", "text": age_text(d.mtime)}));
+        if h.parts.c.is_some_and(|c| c > 0.0) {
+            if let Some((b, n)) = &h.co.best
+                && let Some(&j) = g.by_id.get(b)
+                && doc_visible(g, b, caller).is_some()
+            {
+                let t = snippet::cut_chars(&g.cat.docs[j as usize].title, 60);
+                why.push(json!({"part": "co_use", "text": format!("Oft zusammen geöffnet mit „{t}“ ({n} mal)")}));
+            }
+            if h.co.tied > 0.0 {
+                why.push(json!({"part": "co_use", "text": "Nach einer ähnlichen Suche schon einmal geöffnet"}));
+            }
+        }
+        why.push(json!({"part": "recency", "text": age_text(e.learn.last_open(&d.id).unwrap_or(0).max(d.mtime))}));
         it["why"] = json!(why);
     }
     it
@@ -190,9 +203,11 @@ fn search(e: &Engine, a: &Value, caller: Caller) -> R {
         deadline: deadline(e, a, caller),
         hidden: vec![],
         force_doc: None,
+        anchors: vec![],
     };
     let out = e.search(&req);
     let g = e.generation();
+    record_search(e, &out, &g, None);
     let chars = snippet_chars(e, a, caller);
     let items: Vec<Value> = match &g {
         Some(g) => out.hits.iter().map(|h| item_json(e, g, h, query, chars, explain, caller)).collect(),
@@ -227,6 +242,39 @@ pub fn group_label(kind: &str, title: &str) -> &'static str {
             _ => "Weitere",
         }
     }
+}
+
+/// CX-3: the search event (ids of the top 20 and the query's key, never its text).
+fn record_search(e: &Engine, out: &crate::engine::SearchOut, g: &Option<std::sync::Arc<Generation>>, workspace: Option<String>) {
+    let (Some(q), Some(g)) = (&out.qkey, g) else { return };
+    let ids = out.hits.iter().take(20).map(|h| g.cat.docs[h.doc as usize].id.clone()).collect();
+    e.learn.search_event(q, ids, workspace);
+}
+
+/// Socket op `open` (the desktop only; not an MCP tool): Georg opened a document (`doc` or `path`), optionally
+/// in a workspace and with the program that opened it. Learning takes it from here (DESIGN §7.2).
+pub fn opened(e: &Engine, a: &Value) -> R {
+    let g = e.generation().ok_or_else(|| err("busy", "index not built yet"))?;
+    let i = match (s_arg(a, "doc"), s_arg(a, "path")) {
+        (Some(d), _) => g.by_id.get(d).copied(),
+        (None, Some(p)) => {
+            let canon = std::fs::canonicalize(p).ok().map(|c| c.display().to_string());
+            g.cat.docs.iter().position(|d| d.paths.iter().any(|x| x.path == p || Some(&x.path) == canon.as_ref())).map(|i| i as u32)
+        }
+        _ => return Err(err("bad_request", "doc or path is required")),
+    };
+    let i = i.ok_or_else(|| err("not_found", "no such document"))?;
+    let doc = g.cat.docs[i as usize].id.clone();
+    let via = s_arg(a, "via").unwrap_or("desktop").to_string();
+    e.learn.record(Event {
+        ev: "open".into(),
+        doc: Some(doc.clone()),
+        workspace: s_arg(a, "workspace").map(str::to_string),
+        via: Some(via),
+        program: s_arg(a, "program").map(str::to_string),
+        ..Default::default()
+    });
+    Ok(json!({"doc": doc}))
 }
 
 fn doc_visible(g: &Generation, id: &str, caller: Caller) -> Option<u32> {
@@ -339,9 +387,11 @@ fn ws_open(e: &Engine, a: &Value, caller: Caller) -> R {
         deadline: deadline(e, a, caller),
         hidden: seen.dismissed.clone(),
         force_doc: None,
+        anchors: seen.items.iter().map(|i| i.doc.clone()).collect(),
     };
     let out = e.search(&req);
     let g = e.generation();
+    record_search(e, &out, &g, Some(seen.id.clone()));
     let found: Vec<String> = match &g {
         Some(g) => out.hits.iter().map(|h| g.cat.docs[h.doc as usize].id.clone()).collect(),
         None => Vec::new(),
@@ -423,6 +473,8 @@ fn ws_add(e: &Engine, a: &Value, caller: Caller) -> R {
                 skipped.push(json!({"item": what, "reason": "already_in"}));
                 continue;
             }
+            let with: Vec<String> = w.items.iter().filter(|x| x.doc != id).map(|x| x.doc.clone()).collect();
+            e.learn.record(Event { ev: "add".into(), doc: Some(id.clone()), workspace: Some(w.id.clone()), with: Some(with), how: Some("manual".into()), ..Default::default() });
             w.items.retain(|x| x.doc != id);
             w.dismissed.retain(|x| *x != id);
             w.items.push(Item { doc: id.clone(), how: "manual".into(), added: now });
@@ -477,11 +529,14 @@ fn dismiss(e: &Engine, a: &Value, caller: Caller) -> R {
     let id = ws_id(a)?;
     let doc = s_arg(a, "doc").ok_or_else(|| err("bad_request", "doc is required"))?.to_string();
     let scope = s_arg(a, "scope").unwrap_or("workspace");
-    if scope != "workspace" {
-        return Err(err("bad_request", "scope query/everywhere comes with the learning step (CX-3)"));
+    if !["workspace", "query", "everywhere"].contains(&scope) {
+        return Err(err("bad_request", "scope must be workspace, query or everywhere"));
     }
     let undo = a.get("undo").and_then(Value::as_bool).unwrap_or(false);
     let g = e.generation();
+    // The dismissal counts for queries like the one the workspace was made from (DESIGN §7.3).
+    let wq = e.ws.get(id).and_then(|w| w.query.clone().or(Some(w.name)));
+    let qk = wq.map(|q| e.learn.qkey(&q, e.query_vec(&q).as_deref()));
     ws_edit(e, id, if undo { "undismiss" } else { "dismiss" }, |w| {
         if let Some(g) = &g
             && doc_visible(g, &doc, caller).is_none()
@@ -489,13 +544,17 @@ fn dismiss(e: &Engine, a: &Value, caller: Caller) -> R {
         {
             return Err(err("not_found", "no such document"));
         }
+        let base = Event { doc: Some(doc.clone()), workspace: Some(w.id.clone()), ..Default::default() };
         if undo {
             w.dismissed.retain(|d| *d != doc);
+            e.learn.record(Event { ev: "undo".into(), ..base });
         } else {
             w.items.retain(|i| i.doc != doc);
             if !w.dismissed.contains(&doc) {
                 w.dismissed.push(doc.clone());
             }
+            let (qh, qv) = qk.as_ref().map_or((None, None), |k| (Some(k.hash.clone()), k.vec.as_deref().map(crate::learn::encode_vec)));
+            e.learn.record(Event { ev: "dismiss".into(), scope: Some(scope.into()), qh, qv, ..base });
         }
         Ok((json!({"ok": true}), true))
     })
@@ -578,6 +637,7 @@ fn explain(e: &Engine, a: &Value, caller: Caller) -> R {
         deadline: deadline(e, a, caller),
         hidden: vec![],
         force_doc: Some(i),
+        anchors: a.get("workspace").and_then(Value::as_str).and_then(|w| e.ws.get(w)).map(|w| w.items.iter().map(|i| i.doc.clone()).collect()).unwrap_or_default(),
     };
     let out = e.search(&req);
     let rank = out.hits.iter().filter(|h| h.gate).position(|h| h.doc == i).map(|p| p + 1);
@@ -591,9 +651,10 @@ fn explain(e: &Engine, a: &Value, caller: Caller) -> R {
         "parts": {
             "V": {"cos": h.cos, "floor": c.floor, "ceil": c.ceil, "value": h.parts.v, "v_min": rc.v_min},
             "B": {"bm25": h.bm25, "value": h.parts.b, "b_min": rc.b_min},
-            "C": {"value": null, "note": "usage learning comes with CX-3"},
+            "C": {"value": h.parts.c, "A": h.co.a, "tied": h.co.tied, "tau": rc.tau,
+                  "best": h.co.best.as_ref().and_then(|(b, n)| doc_visible(&g, b, caller).map(|j| json!({"doc": b, "title": g.cat.docs[j as usize].title, "together": n})))},
             "R": {"age_days": (crate::util::now_secs() - d.mtime) as f32 / 86_400.0, "t_half_days": rc.t_half_days, "value": h.parts.r},
-            "X": {"value": h.parts.x},
+            "X": {"value": h.parts.x, "D": h.d},
         },
         "weights": out.weights.map(|w| json!({"v": w.v, "b": w.b, "c": w.c, "r": w.r, "x": w.x})),
         "matching_chunks": h.matching, "candidates": out.candidates, "embedder": out.embedder, "fusion": rc.fusion,
@@ -624,7 +685,7 @@ fn forget(e: &Engine, a: &Value, caller: Caller) -> R {
             let id = s_arg(a, "workspace").ok_or_else(|| err("bad_request", "workspace is required"))?;
             json!({"deleted": e.ws.delete(id).map_err(|x| err("internal", x.to_string()))?})
         }
-        "usage" => json!({"files": e.store.wipe_dir("usage")}),
+        "usage" => json!({"events": e.learn.forget()}),
         "index" => {
             e.clear_generation();
             let n = e.store.wipe_derived();
@@ -633,7 +694,7 @@ fn forget(e: &Engine, a: &Value, caller: Caller) -> R {
         }
         "all" => {
             e.clear_generation();
-            let n = e.store.wipe_derived() + e.store.wipe_dir("usage") + e.ws.wipe() as u64;
+            let n = e.store.wipe_derived() + e.learn.forget() + e.ws.wipe() as u64;
             e.wake_indexer();
             json!({"files": n})
         }

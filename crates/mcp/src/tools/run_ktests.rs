@@ -1,7 +1,7 @@
 //! `ktest`: runs registered in-kernel tests by name prefix (`spec/net.md` §5.2, the replacement for V1's
 //! `run_asm` probing) under R8e's class rules: on hardware `Safe`, `Display`, `Program`, `Hardware` and `RunHw` tests
-//! run (R8c: display writes need no switch since 21.10.); `Audible` is refused, `Wlan` runs only with `wlan=on` in
-//! CONFIG (WL-4 CR 3); `Screen` runs only while no program holds the screen, `Picture` also only with
+//! run (R8c: display writes need no switch since 21.10.); `Audible` is refused, `Wlan` runs only where CONFIG names a
+//! WLAN (`wlan_ssid`, WL-4 CR 3); `Screen` runs only while no program holds the screen, `Picture` also only with
 //! `ktest_picture=on`; QEMU's classes belong to another run. Under QEMU (hypervisor bit) a class runs as at a ktest
 //! boot, except that `ktest_hw` does not apply: the tool runs QemuOnly tests as well.
 //!
@@ -31,8 +31,8 @@ pub enum Verdict {
 pub struct Here<'a> {
     /// No hypervisor bit.
     pub hardware: bool,
-    /// CONFIG `wlan=on` (PC-4's opt-in).
-    pub wlan_on: bool,
+    /// CONFIG names a WLAN to join (`wlan_ssid`): the Wlan class has a network to test against.
+    pub wlan_set: bool,
     /// A program holds the screen now (the desktop on the Mini-PC).
     pub screen_held: bool,
     /// CONFIG `ktest_picture=on`: the hold on tests that change the picture is lifted (GX-D9).
@@ -41,6 +41,8 @@ pub struct Here<'a> {
     pub georg_on: bool,
     /// CONFIG `ktest_run=`.
     pub runs: &'a str,
+    /// GP-ROUND: the kernel runs the Gaming-PC's profile (`Class::on_machine`).
+    pub gaming_pc: bool,
 }
 
 /// The class rule (pure).
@@ -48,8 +50,11 @@ pub fn verdict(class: Class, h: Here) -> Verdict {
     if !h.hardware {
         return if class.runs_here(true, false, h.runs) { Verdict::Run } else { Verdict::Skip("belongs to another run: not this QEMU boot") };
     }
+    if !class.on_machine(h.gaming_pc) {
+        return Verdict::Skip(if h.gaming_pc { "belongs to the Mini-PC run: a part only the Mini-PC has" } else { "belongs to the Gaming-PC run: a part only the Gaming-PC has" });
+    }
     match class {
-        Class::Safe | Class::Display | Class::Program | Class::Hardware | Class::RunHw(_) => Verdict::Run,
+        Class::Safe | Class::Display | Class::Program | Class::Hardware | Class::GamingPc | Class::RunHw(_) => Verdict::Run,
         Class::Screen if h.screen_held => Verdict::Skip("belongs to the Mini-PC run without the desktop: a program holds the screen"),
         Class::Screen => Verdict::Run,
         Class::Picture if !h.picture_on => Verdict::Refuse("changes the picture: needs ktest_picture=on (GX-D9)"),
@@ -59,8 +64,8 @@ pub fn verdict(class: Class, h: Here) -> Verdict {
         Class::WithGeorg if h.georg_on => Verdict::Run,
         Class::WithGeorg => Verdict::Refuse("WithGeorg: a tone to hear or a device to plug in; needs ktest_georg=on (R8e)"),
         Class::Audible => Verdict::Refuse("Audible: makes sound; not over MCP on hardware (R8e)"),
-        Class::Wlan if h.wlan_on => Verdict::Run,
-        Class::Wlan => Verdict::Refuse("wlan: needs wlan=on (R8d/R8e)"),
+        Class::Wlan if h.wlan_set => Verdict::Run,
+        Class::Wlan => Verdict::Refuse("wlan: needs wlan_ssid and wlan_psk in CONFIG (R8e)"),
     }
 }
 
@@ -117,7 +122,7 @@ pub(crate) const NOT_SAFE: &str = "not Safe: the user-space MCP service starts o
 /// The classes the user-space service starts: what writes no display register, makes no sound, leaves the WLAN chip
 /// alone and is safe on a real machine. `Run` is QEMU's own (`RunHw` is `Safe` on the machine that has the device).
 fn service_starts(c: Class) -> bool {
-    matches!(c, Class::Safe | Class::Program | Class::Hardware | Class::Screen | Class::RunHw(_) | Class::QemuAll)
+    matches!(c, Class::Safe | Class::Program | Class::Hardware | Class::GamingPc | Class::Screen | Class::RunHw(_) | Class::QemuAll)
 }
 
 /// `run`; with `safe_only` (the gate) a test of any other class is skipped with `NOT_SAFE`, also under QEMU.
@@ -180,7 +185,7 @@ pub(crate) fn run_with(ctx: &ToolContext, filter: &str, here: Here, safe_only: b
     if t.not_run > 0 {
         head.push_str(&format!(" not_run={} (stopped)", t.not_run));
     }
-    head.push_str(match (here.hardware, here.wlan_on) {
+    head.push_str(match (here.hardware, here.wlan_set) {
         (true, false) => " (hardware: skip = belongs to another run; Wlan refused)",
         (true, true) => " (hardware: skip = belongs to another run)",
         (false, _) => " (QEMU: skip = belongs to another run)",
@@ -210,11 +215,12 @@ fn ktest_call(ctx: &ToolContext, args: &Json, safe_only: bool) -> ToolResult {
     let runs = pci::registry::config_value("ktest_run").unwrap_or_default();
     let here = Here {
         hardware: !hal::cpu::detect().hypervisor,
-        wlan_on: pci::registry::opted_in("wlan"),
+        wlan_set: pci::registry::config_value("wlan_ssid").is_some_and(|v| !v.trim().is_empty()),
         screen_held: false,
         picture_on: pci::registry::config_value("ktest_picture").as_deref() == Some("on"),
         georg_on: pci::registry::config_value("ktest_georg").as_deref() == Some("on"),
         runs: &runs,
+        gaming_pc: gp_platform::tiers::is_gaming_pc(pci::registry::config_value("profile").as_deref()),
     };
     run_with(ctx, filter, here, safe_only)
 }
@@ -223,7 +229,7 @@ mcp_tool!(
     name: "ktest",
     owner: "MC",
     safety: Change,
-    description: "Runs in-kernel tests (ktests) whose names start with one of the comma-separated prefixes in filter (empty: all), in name order, one run at a time. Which tests run is decided by their class: a test of another run shows as skip (on hardware the QEMU classes; Screen tests while a program holds the screen), Audible is refused on hardware, Wlan runs only with wlan=on in CONFIG (R8e), Picture only with ktest_picture=on, WithGeorg only with ktest_georg=on. A test that runs and cannot do its work is FAIL. Answers one line per test (ok/FAIL/skip/refused) under a summary; a run past its deadline goes on (follow it with output, end it between two tests with stop).",
+    description: "Runs in-kernel tests (ktests) whose names start with one of the comma-separated prefixes in filter (empty: all), in name order, one run at a time. Which tests run is decided by their class: a test of another run shows as skip (on hardware the QEMU classes; Screen tests while a program holds the screen), Audible is refused on hardware, Wlan runs only where CONFIG names a WLAN (wlan_ssid, R8e), Picture only with ktest_picture=on, WithGeorg only with ktest_georg=on. A test that runs and cannot do its work is FAIL. Answers one line per test (ok/FAIL/skip/refused) under a summary; a run past its deadline goes on (follow it with output, end it between two tests with stop).",
     schema: r#"{"type":"object","properties":{"filter":{"type":"string","description":"comma-separated name prefixes, e.g. \"nw.stack,mcp.\""}}}"#,
     handler: ktest_tool,
 );
@@ -232,17 +238,23 @@ mcp_tool!(
 mod tests {
     use super::*;
 
-    const QEMU: Here = Here { hardware: false, wlan_on: false, screen_held: false, picture_on: false, georg_on: false, runs: "" };
+    const QEMU: Here = Here { hardware: false, wlan_set: false, screen_held: false, picture_on: false, georg_on: false, runs: "", gaming_pc: false };
     const HW: Here = Here { hardware: true, ..QEMU };
 
     /// `verdict` and `Class::runs_here` are two copies of the rule, and host/tests/minipc/ktests.py reads the words.
     #[test]
     fn verdict_agrees_with_the_kernels_rule_and_the_scripts() {
-        let lifted = Here { wlan_on: true, picture_on: true, georg_on: true, ..HW };
         for &c in Class::ALL {
-            let (kernel, mcp) = (c.runs_here(false, false, ""), verdict(c, lifted) == Verdict::Run);
-            // Wlan is the one the kernel's boot rule leaves to MCP: over MCP with `wlan=on`, in no ktest boot on hardware.
-            assert_eq!(kernel, mcp && c != Class::Wlan, "{c:?} on hardware with every switch on");
+            // GP-ROUND: on each real machine; the kernel's boot rule adds the machine rule the same way.
+            for gaming_pc in [false, true] {
+                let lifted = Here { wlan_set: true, picture_on: true, georg_on: true, gaming_pc, ..HW };
+                let (kernel, mcp) = (c.runs_here(false, false, "") && c.on_machine(gaming_pc), verdict(c, lifted) == Verdict::Run);
+                // Wlan is the one the kernel's boot rule leaves to MCP: over MCP with a WLAN in CONFIG, in no ktest boot on hardware.
+                assert_eq!(kernel, mcp && c != Class::Wlan, "{c:?} on hardware with every switch on (gaming_pc {gaming_pc})");
+                if let Verdict::Skip(why) = verdict(c, lifted) {
+                    assert!(why.starts_with("belongs to"), "{c:?}: {why}");
+                }
+            }
             let named = if let Class::Run(r) | Class::RunHw(r) = c { r } else { "" };
             let here = Here { runs: named, ..QEMU };
             assert_eq!(c.runs_here(true, false, named), verdict(c, here) == Verdict::Run, "{c:?} under QEMU");
@@ -267,8 +279,8 @@ mod tests {
             assert!(matches!(verdict(c, HW), Verdict::Refuse(_)), "{c:?}");
             assert_eq!(verdict(c, QEMU), Verdict::Run, "{c:?} under QEMU");
         }
-        // WL-4 CR 3: `wlan=on` lets the Wlan class run on hardware, never Audible.
-        let wlan = Here { wlan_on: true, ..HW };
+        // WL-4 CR 3: a WLAN in CONFIG lets the Wlan class run on hardware, never Audible.
+        let wlan = Here { wlan_set: true, ..HW };
         assert_eq!(verdict(Class::Wlan, wlan), Verdict::Run);
         assert!(matches!(verdict(Class::Audible, wlan), Verdict::Refuse(_)));
         assert_eq!(verdict(Class::QemuOnly, QEMU), Verdict::Run);
@@ -277,6 +289,16 @@ mod tests {
         for c in [Class::Program, Class::Hardware] {
             assert_eq!(verdict(c, HW), Verdict::Run);
             assert!(matches!(verdict(c, QEMU), Verdict::Skip(_)));
+        }
+        // GP-ROUND: each machine's own parts; under QEMU neither.
+        let gp = Here { gaming_pc: true, ..HW };
+        assert_eq!(verdict(Class::GamingPc, gp), Verdict::Run);
+        assert_eq!(verdict(Class::GamingPc, HW), Verdict::Skip("belongs to the Gaming-PC run: a part only the Gaming-PC has"));
+        assert_eq!(verdict(Class::Hardware, gp), Verdict::Skip("belongs to the Mini-PC run: a part only the Mini-PC has"));
+        assert!(matches!(verdict(Class::GamingPc, QEMU), Verdict::Skip(_)));
+        assert!(matches!(verdict(Class::GamingPc, Here { gaming_pc: true, ..QEMU }), Verdict::Skip(_)));
+        for c in [Class::Safe, Class::Program, Class::Display] {
+            assert_eq!(verdict(c, gp), Verdict::Run, "{c:?} on the Gaming-PC");
         }
         // The kernel's ktest boot draws the same line.
         assert!(Class::Program.runs_here(false, false, "") && !Class::Program.runs_here(true, false, "") && !Class::Program.runs_here(true, true, ""));

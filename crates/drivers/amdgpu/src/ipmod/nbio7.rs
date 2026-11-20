@@ -1,4 +1,4 @@
-//! NBIO 7.7.0 (NBIF): Linux `nbio_v7_7` (linux-6.6 amdgpu/nbio_v7_7.c): doorbells, HDP flush, the RCC registers
+//! NBIO 7.7.0 (NBIF): Linux `nbio_v7_7` (linux-7.3.1 amdgpu/nbio_v7_7.c): doorbells, HDP flush, the RCC registers
 //! (`RCC_CONFIG_MEMSIZE`) and the index/data windows. Today's BAR5 constants of `dcn314_regs::bar5` are this
 //! block's; GX-7 moves their users here.
 

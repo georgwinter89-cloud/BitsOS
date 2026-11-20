@@ -1,4 +1,4 @@
-//! AF_INET sockets for programs (linux-6.6/net/ipv4/af_inet.c, tcp.c, udp.c for the semantics) on the kernel's
+//! AF_INET sockets for programs (linux-7.3.1/net/ipv4/af_inet.c, tcp.c, udp.c for the semantics) on the kernel's
 //! smoltcp stack and its 127.0.0.0/8 loopback: TCP streams (non-blocking connect with EINPROGRESS and SO_ERROR,
 //! listen/accept on the stack's private-only listeners, half-close, MSG_PEEK/WAITALL) and UDP datagrams
 //! (bound/connected, the loopback delivered here directly). B3: `policy::check` at bind, listen and connect (and
@@ -165,8 +165,11 @@ impl Tables {
     /// Delivers a datagram to whoever holds `to.port` on the loopback side `v6`; false when nobody does.
     fn lo_deliver(&self, data: &[u8], from: SockAddr, to: SockAddr, v6: bool) -> bool {
         let Some(r) = self.lo_udp.lock().get(&(to.port, v6)).and_then(|w| w.upgrade()) else { return false };
-        // A full receive buffer drops the datagram (Linux counts it as a receive-buffer error).
-        if r.bytes.load(Ordering::Acquire) + data.len() > r.rcvbuf.load(Ordering::Relaxed) {
+        // A full receive buffer drops the datagram (Linux counts it as a receive-buffer error). An empty queue
+        // takes one of any size (Linux `__udp_enqueue_schedule_skb`), or a small SO_RCVBUF would take none.
+        let cost = lo_cost(data.len());
+        let held = r.bytes.load(Ordering::Acquire);
+        if held != 0 && held + cost > r.rcvbuf.load(Ordering::Relaxed) {
             return true;
         }
         let mut v = Vec::new();
@@ -185,7 +188,7 @@ impl Tables {
                 }
                 continue;
             }
-            r.bytes.fetch_add(data.len(), Ordering::AcqRel);
+            r.bytes.fetch_add(cost, Ordering::AcqRel);
             q.push_back(LoDgram { data: v, from, at: ctl::Arrival { to: to.ip, v6, ifindex: 1, spec: to.ip } });
             break;
         }
@@ -234,7 +237,7 @@ impl<'a> Place<'a> {
     }
 
     /// `inet_addr_valid_or_nonlocal` (`v6_lo`: an AF_INET6 socket's ::1). In a namespace, as CachyOS answers
-    /// (`__inet_dev_addr_type`, linux-6.6/net/ipv4/fib_frontend.c:206): before lo's first address (its first UP
+    /// (`__inet_dev_addr_type`, linux-7.3.1/net/ipv4/fib_frontend.c:227): before lo's first address (its first UP
     /// or RTM_NEWADDR/SIOCSIFADDR) there is no local table, so every IPv4 address passes; after it 0.0.0.0,
     /// broadcast, multicast and the subnets of lo's addresses (a loopback's prefix route is local; they stay
     /// while lo is down again). ::1 is lo's only while it is UP (`ipv6_chk_addr`).
@@ -381,8 +384,18 @@ fn port_take(at: Place<'_>, me: PortUse, port: u16) -> Result<u16, Errno> {
 
 pub(crate) struct LoUdp {
     q: SpinLock<VecDeque<LoDgram>>,
+    /// What the queued datagrams cost (`lo_cost`), against `rcvbuf`.
     bytes: AtomicUsize,
     rcvbuf: AtomicUsize,
+}
+
+/// What a queued datagram costs beyond its bytes: Linux charges the receive buffer an skb's truesize, 768 bytes
+/// for a datagram without payload (the sk_buff's 256 and a 512-byte data block with its shared info). With the
+/// bytes alone a sender of empty datagrams grew the queue of a socket that never reads without end.
+const LO_DGRAM_OVERHEAD: usize = 768;
+
+fn lo_cost(len: usize) -> usize {
+    len + LO_DGRAM_OVERHEAD
 }
 
 /// A loopback datagram: payload, sender, and how it arrived (for the receive ancillary data).
@@ -410,7 +423,7 @@ fn lo_take(l: &LoUdp, peer: Option<SockAddr>, size: usize, peek: bool) -> Result
                 Err(n)
             } else {
                 let x = q.pop_front().ok_or(EAGAIN)?;
-                l.bytes.fetch_sub(x.data.len(), Ordering::AcqRel);
+                l.bytes.fetch_sub(lo_cost(x.data.len()), Ordering::AcqRel);
                 Ok(x)
             }
         };
@@ -507,6 +520,8 @@ pub struct InetSock {
     /// Serialises bind, listen and the automatic UDP bind with IPV6_V6ONLY and IPV6_ADDRFORM (Linux's socket
     /// lock): the family a port is taken with is the one the program reads back.
     bind_mx: ksync::Mutex<()>,
+    /// DB2: the connection's peer and bytes for the access log (`sock::access`).
+    pub(crate) acc: vfs::access::NetTally,
 }
 
 /// SOL_IP options accepted with their defaults (`ip_setsockopt`/`ip_getsockopt`: IP_TOS, IP_TTL, IP_PKTINFO,
@@ -555,12 +570,13 @@ impl InetSock {
             opts,
             // Without `ids`: a socket must not keep its creator's cred and namespaces alive; capability checks
             // use the caller of each call (`sockopt_ns_capable`).
-            owner: Caller { pid: c.pid, uid: c.uid, gid: c.gid, subject: c.subject, net: c.net.clone(), ids: None, cred: c.cred },
+            owner: Caller { pid: c.pid, uid: c.uid, gid: c.gid, subject: c.subject, net: c.net.clone(), ids: None, cred: c.cred, program: None },
             ip_opts: SpinLock::named("net.inet.opts", BTreeMap::new()),
             rd: ksync::Mutex::named("net.inet.read", ()),
             v6: AtomicBool::new(v6),
             groups6: SpinLock::named("net.inet.groups6", Vec::new()),
             bind_mx: ksync::Mutex::named("net.inet.bind", ()),
+            acc: vfs::access::NetTally::default(),
         }))
     }
 
@@ -877,6 +893,7 @@ impl InetSock {
     fn sync(&self, t: &SpinLock<TcpSt>) {
         let mut gone: Option<Box<dyn Conn>> = None;
         let mut free: Option<u16> = None;
+        let mut opened = None;
         {
             let mut g = t.lock();
             let state = match &g.s {
@@ -896,7 +913,7 @@ impl InetSock {
                         gone = Some(c);
                     } else if !state.connecting {
                         g.local = Some(c.local());
-                        c.on_established();
+                        opened = c.on_established();
                         g.s = Tcp::Connected(c);
                     } else {
                         g.s = Tcp::Connecting(c);
@@ -917,6 +934,11 @@ impl InetSock {
                 }
                 other => g.s = other,
             }
+        }
+        // The connection record allocates (the view's event ring doubles up to 32 KiB at a time): written with
+        // the socket's lock gone.
+        if let Some(o) = opened {
+            o.write();
         }
         if let Some(p) = free {
             self.t().port_release(p, self.id());
@@ -1232,10 +1254,12 @@ impl InetSock {
     // data
 
     pub fn send(&self, src: &mut dyn Source, len: usize, flags: u32, nonblock: bool, to: Option<&[u8]>) -> Result<usize, Errno> {
-        match &self.proto {
+        let r = match &self.proto {
             Proto::Tcp(t) => self.tcp_send(t, src, len, flags, nonblock),
             Proto::Udp(u) => self.udp_send(u, src, len, flags, nonblock, to),
-        }
+        };
+        if let Ok(n) = r { self.acc.sent(n) }
+        r
     }
 
     fn tcp_send(&self, t: &SpinLock<TcpSt>, src: &mut dyn Source, len: usize, flags: u32, nonblock: bool) -> Result<usize, Errno> {
@@ -1357,10 +1381,12 @@ impl InetSock {
     }
 
     pub fn recv(&self, size: usize, flags: u32, nonblock: bool, sink: &mut dyn FnMut(&[u8]) -> Result<(), Errno>) -> Result<Received, Errno> {
-        match &self.proto {
+        let r = match &self.proto {
             Proto::Tcp(t) => self.tcp_recv(t, size, flags, nonblock, sink),
             Proto::Udp(u) => self.udp_recv(u, size, flags, nonblock, sink),
-        }
+        };
+        if let Ok(g) = &r && flags & MSG_PEEK == 0 { self.acc.received(g.n) }
+        r
     }
 
     fn tcp_recv(&self, t: &SpinLock<TcpSt>, size: usize, flags: u32, nonblock: bool, sink: &mut dyn FnMut(&[u8]) -> Result<(), Errno>) -> Result<Received, Errno> {
@@ -1877,7 +1903,8 @@ impl InetSock {
                         self.options_changed();
                     }
                     TCP_CORK => self.opts.set(flag::CORK, v != 0),
-                    // `__tcp_sock_set_quickack` (linux-6.6/net/ipv4/tcp.c:3259): 0 enters pingpong mode, else leaves it.
+                    // `__tcp_sock_set_quickack` (linux-7.3.1/net/ipv4/tcp.c:3687): 0 enters pingpong mode, else
+                    // leaves it.
                     TCP_QUICKACK => {
                         self.opts.set(flag::PINGPONG, v == 0);
                         self.options_changed();
@@ -1952,6 +1979,7 @@ impl InetSock {
     /// The last fd went: a connection closes gracefully (SO_LINGER with 0 s: reset), a listener resets what
     /// waits, ports go back.
     pub fn release(&self) {
+        self.acc.closed();
         match &self.proto {
             Proto::Tcp(t) => {
                 let (s, port) = {

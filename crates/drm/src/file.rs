@@ -1,4 +1,4 @@
-//! One open DRM file (Linux `struct drm_file`, linux-6.6/drivers/gpu/drm/drm_file.c:150 `drm_file_alloc`): its
+//! One open DRM file (Linux `struct drm_file`, linux-7.3.1/drivers/gpu/drm/drm_file.c:132 `drm_file_alloc`): its
 //! minor's kind, the client id, authentication, the GEM handle table and the syncobj handle table (DR-3,
 //! `syncobj.rs`), the file's GEM state (DR-6, `gem::FileGem`: PRIME cache, pin owner, mapping view). Dropped at
 //! the last close of the fd.
@@ -50,6 +50,8 @@ pub struct DrmFile {
     pub vm: crate::vm::FileVm,
     /// DR-9: the BO lists (`amdgpu_fpriv.bo_list_handles`).
     pub(crate) bo_lists: crate::bo_list::FileBoLists,
+    /// L7: SET_CLIENT_NAME's name (`drm_file.client_name`), shown in fdinfo.
+    client_name: SpinLock<Option<alloc::string::String>>,
 }
 
 impl DrmFile {
@@ -68,6 +70,7 @@ impl DrmFile {
             gem,
             vm,
             bo_lists: crate::bo_list::FileBoLists::new(),
+            client_name: SpinLock::named("drm.file.client_name", None),
         }
     }
 
@@ -79,6 +82,14 @@ impl DrmFile {
     }
     pub fn client_id(&self) -> u64 {
         self.client_id
+    }
+    pub fn client_name(&self) -> Option<alloc::string::String> {
+        self.client_name.lock().clone()
+    }
+    /// The old name goes after the lock is dropped.
+    pub fn set_client_name(&self, name: Option<alloc::string::String>) {
+        let old = core::mem::replace(&mut *self.client_name.lock(), name);
+        drop(old);
     }
     pub fn authenticated(&self) -> bool {
         self.authenticated.load(Ordering::Acquire)

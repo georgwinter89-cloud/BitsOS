@@ -1,4 +1,4 @@
-//! DS-4 host tests: the step model from real log lines, `/proc/bitsos/boot`, `desktop=`, and the picture (the
+//! DS-4 host tests: the step model from real log lines, `/proc/bitsos/boot`, the desktop rule, and the picture (the
 //! same drawing code the kernel runs; `bootscreen_matches_model` compares a QEMU screendump with it).
 
 extern crate std;
@@ -107,7 +107,7 @@ fn kernel_ready_settles_what_never_spoke_and_init_off_is_seen() {
         assert_eq!(s.get(k).state, State::Skipped, "{k:?}");
     }
     assert_eq!(s.get(Key::Services).state, State::Running);
-    s.feed(&line(531, 'I', "ul", "init.off", "| CONFIG init=off: no user program is started"));
+    s.feed(&line(531, 'I', "ul", "init.off", "| a ktest boot: no user program is started"));
     assert_eq!((s.init, s.get(Key::Services).state), (Init::Off, State::Skipped));
     // Lines that are not steps change nothing; neither do broken ones.
     let seq = s.seq;
@@ -142,12 +142,9 @@ fn proc_text_round_trips() {
 }
 
 #[test]
-fn desktop_mode_from_config() {
-    assert_eq!(resolve(None, false), Ok((true, "auto")));
-    assert_eq!(resolve(Some("auto"), true), Ok((false, "auto, hypervisor")));
-    assert_eq!(resolve(Some(" on "), true), Ok((true, "on")));
-    assert_eq!(resolve(Some("off"), false), Ok((false, "off")));
-    assert_eq!(resolve(Some("yes"), false), Err(()));
+fn the_desktop_starts_everywhere_but_the_gaming_pc() {
+    assert_eq!(resolve(false), (true, "start"));
+    assert_eq!(resolve(true), (false, "gaming_pc"));
 }
 
 #[test]
@@ -257,7 +254,9 @@ fn larger_screens_centre_the_scene_and_smaller_ones_keep_the_text_console() {
 }
 
 /// QEMU's screendump while the boot screen is up equals this model drawn from `/proc/bitsos/boot` read at the
-/// same moment (host/tests/in/50-boot-screen.sh: BITSOS_SCREENDUMP, BITSOS_BOOT_PROC).
+/// same moment (host/tests/in/50-boot-screen.sh: BITSOS_SCREENDUMP, BITSOS_BOOT_PROC). Decision: ignored in the
+/// host tests because both inputs come from a QEMU boot; it runs in in/50-boot-screen.sh (boot_check.py), which
+/// only fullrun starts so far (no gate class names in/50: plan/notes/desk-offen.md).
 #[test]
 #[ignore]
 fn bootscreen_matches_model() {
@@ -404,7 +403,8 @@ fn a_flapping_step_keeps_the_list_bounded() {
     }
     assert_eq!(s.get(Key::Desktop).state, State::Running);
     assert!(s.get(Key::Desktop).detail.chars().count() <= 80);
-    assert_eq!(s.proc_text("shown", 0).lines().count(), 5 + KEYS.len());
+    // GS-1: one `mark` line per graphics stage at most (here the first desktop start).
+    assert_eq!(s.proc_text("shown", 0).lines().count(), 5 + KEYS.len() + 1);
 }
 
 #[test]
@@ -449,7 +449,7 @@ fn the_rasteriser_is_only_a_build_dependency() {
     assert!(toml.contains("[build-dependencies]\nfontdue"), "the atlases need fontdue at build time");
 }
 
-/// GX-8c: `gpu=on`: the row follows the whole run: GC's boot on the way settles nothing, a failure after it still shows.
+/// GX-8c: the row follows the whole run: GC's boot on the way settles nothing, a failure after it still shows.
 #[test]
 fn gpu_row_follows_the_boots_bring_up() {
     let row = |lines: &[&str]| {
@@ -464,10 +464,10 @@ fn gpu_row_follows_the_boots_bring_up() {
     assert_eq!(row(&[START]), (State::Running, "gpu startet".into()));
     assert_eq!(row(&[START, BOOTED]), (State::Running, "gpu gestartet".into()));
     assert_eq!(row(&[START, BOOTED, "[    3.000000] I gx boot.up minor=128 after_ms=2000"]), (State::Done, "gpu bereit, renderD128".into()));
-    let failed = "[    3.000000] E gx boot.failed stage=gfx_mes stop=done after_ms=2000 why=\"mes FAIL\" | the desktop starts without the GPU";
-    assert_eq!(row(&[START, BOOTED, failed]), (State::Failed, "gestoppt bei gfx_mes, ohne gpu".into()));
-    let refused = "[    3.000000] E gx boot.failed stage=refused stop=not_needed after_ms=2000 why=\"firmware\" | the desktop starts without the GPU";
-    assert_eq!(row(&[START, refused]), (State::Failed, "nicht gestartet (refused), ohne gpu".into()));
+    let failed = "[    3.000000] E gx boot.failed stage=gfx_mes stop=done after_ms=2000 why=\"mes FAIL\" | no desktop: the text console stays";
+    assert_eq!(row(&[START, BOOTED, failed]), (State::Failed, "gestoppt bei gfx_mes, textkonsole".into()));
+    let refused = "[    3.000000] E gx boot.failed stage=refused stop=not_needed after_ms=2000 why=\"firmware\" | no desktop: the text console stays";
+    assert_eq!(row(&[START, refused]), (State::Failed, "nicht gestartet (refused), textkonsole".into()));
     assert_eq!(row(&[START, "[    1.500000] I gx boot.no_chip"]).0, State::Skipped);
     // Without the boot's bring-up a passed tool run still settles the row, as before.
     assert_eq!(row(&[BOOTED]), (State::Done, "gpu gestartet".into()));

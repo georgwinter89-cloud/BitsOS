@@ -19,6 +19,10 @@
 //!   zeroed, so every mapping and read(2) sees zeros as after Linux's hole punch; the frames stay until the page
 //!   cache can punch holes (FS change request), the file size stays.
 //! - COLLAPSE: EINVAL (MM-13 has no khugepaged and no synchronous collapse). HWPOISON/SOFT_OFFLINE: EPERM (`plan_madvise`).
+//! - GUARD_INSTALL (linux-7.3.1/mm/madvise.c:1124): EINVAL on a device or locked VMA; the pages of the range go as
+//!   with DONTNEED (their data is lost) and the range is guarded (`guard.rs`): a touch is SIGSEGV, a kernel copy
+//!   EFAULT. GUARD_REMOVE (:1252): EINVAL on a device VMA (a locked one is fine); the range is no longer guarded and
+//!   reads zero or the file again. Neither splits a VMA.
 //!
 //! Device VMAs count as Linux's VM_PFNMAP|VM_IO|VM_DONTEXPAND: DONTNEED/FREE/COLD/PAGEOUT/POPULATE, DOFORK and
 //! DODUMP are EINVAL there.
@@ -66,13 +70,23 @@ fn zero_cached(f: &crate::vma::FileRef, first: u64, n: u64) {
 }
 
 impl AsCore {
+    /// L7-VFS D4, for the measurement ktest `mm.as.ptr_measure` only: MADV_DONTNEED of [start, end) as Linux
+    /// 7.3.1 with CONFIG_PT_RECLAIM does it (mm/madvise.c:860): the page tables the range empties whole go too.
+    #[cfg(not(bitsos_no_ktests))]
+    pub(crate) fn test_dontneed_reclaim(&self, start: u64, end: u64) -> Result<(), Errno> {
+        let mut g = self.inner.lock();
+        let segs = Self::segments(&g, start, end)?;
+        self.unmap_pages(&mut g, start, end, &segs, tlb::Cause::Madvise, (start, end));
+        Ok(())
+    }
+
     /// `madvise(start, len, behavior)`.
     pub fn sys_madvise(&self, start: u64, len: u64, behavior: u64) -> Result<(), Errno> {
         let Some((start, end)) = plan_madvise(start, len, behavior)? else { return Ok(()) };
         let mut g = self.inner.lock();
         // MM-11: what DONTNEED and FREE take out of every VMA of the call goes in one round, also when a later
         // VMA ends the walk with an error (the earlier ones changed, as in Linux's `madvise_walk_vmas`).
-        let zaps = matches!(behavior, madv::DONTNEED | madv::DONTNEED_LOCKED | madv::FREE);
+        let zaps = matches!(behavior, madv::DONTNEED | madv::DONTNEED_LOCKED | madv::FREE | madv::GUARD_INSTALL);
         let mut z = zaps.then(|| Zap::begin(self, &g, tlb::Cause::Madvise));
         let r = self.advise_range(&mut g, start, end, behavior, z.as_mut());
         if let Some(z) = z {
@@ -118,13 +132,32 @@ impl AsCore {
                     return Err(Errno::Inval);
                 }
                 let segs = Self::segments(g, s, e)?;
-                // The VMA stays: no page table is freed (Linux's `zap_page_range_single`), so the round need not
-                // ask CPUs that hold the space lazily.
+                // The VMA stays: no page table is freed, so the round need not ask CPUs that hold the space lazily.
+                // Linux 7.3.1 with CONFIG_PT_RECLAIM (CachyOS) frees a page table a DONTNEED empties whole
+                // (linux-7.3.1/mm/madvise.c:860, memory.c:2113); measured slower here (plan/spec/storage.md §3.4),
+                // for 4 KiB per 2 MiB, so V2 keeps it.
                 match z {
                     Some(z) => self.zap_pages(g, z, s, e, &segs, (0, 0)),
                     None => self.unmap_pages(g, s, e, &segs, tlb::Cause::Madvise, (0, 0)),
                 }
                 DONTNEED_CALLS.inc();
+                Ok(())
+            }
+            // `is_valid_guard_vma`: VM_SPECIAL (V2's device VMAs) never; VM_LOCKED not for an install.
+            madv::GUARD_INSTALL if device || v.flags.locked => Err(Errno::Inval),
+            madv::GUARD_INSTALL => {
+                let segs = Self::segments(g, s, e)?;
+                g.guards.add(s, e).map_err(|_| Errno::NoMem)?;
+                match z {
+                    Some(z) => self.zap_pages(g, z, s, e, &segs, (0, 0)),
+                    None => self.unmap_pages(g, s, e, &segs, tlb::Cause::Madvise, (0, 0)),
+                }
+                Ok(())
+            }
+            madv::GUARD_REMOVE if device => Err(Errno::Inval),
+            madv::GUARD_REMOVE => {
+                g.guards.reserve_cut().map_err(|_| Errno::NoMem)?;
+                g.guards.remove(s, e);
                 Ok(())
             }
             madv::COLD | madv::PAGEOUT if device => Err(Errno::Inval),
@@ -141,11 +174,11 @@ impl AsCore {
                 }
             },
             madv::DODUMP if device => Err(Errno::Inval),
-            // linux-6.6/mm/madvise.c:1049-1057: each one clears the other.
+            // linux-7.3.1/mm/madvise.c:1381-1389: each one clears the other.
             madv::NORMAL => set(g, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (false, false)),
             madv::RANDOM => set(g, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (true, false)),
             madv::SEQUENTIAL => set(g, &mut |x| (x.flags.rand_read, x.flags.seq_read) = (false, true)),
-            // linux-6.6/mm/khugepaged.c:352-373 (`hugepage_madvise`).
+            // linux-7.3.1/mm/khugepaged.c:450-468 (`hugepage_madvise`).
             madv::HUGEPAGE => set(g, &mut |x| (x.flags.hugepage, x.flags.nohugepage) = (true, false)),
             madv::NOHUGEPAGE => set(g, &mut |x| (x.flags.hugepage, x.flags.nohugepage) = (false, true)),
             madv::DONTFORK => set(g, &mut |x| x.flags.dontfork = true),
@@ -164,8 +197,8 @@ impl AsCore {
         }
     }
 
-    /// MADV_POPULATE_READ/WRITE (linux-6.6/mm/madvise.c `madvise_populate`, gup.c `check_vma_flags`): every page of
-    /// [s, e) present (written: writable, copy-on-write broken).
+    /// MADV_POPULATE_READ/WRITE (linux-7.3.1/mm/madvise.c:966 `madvise_populate`, gup.c:1200 `check_vma_flags`):
+    /// every page of [s, e) present (written: writable, copy-on-write broken).
     pub(super) fn populate_advice(&self, g: &mut Inner, v: &Vma, s: u64, e: u64, write: bool) -> Result<(), Errno> {
         let device = v.file.as_ref().is_some_and(|f| f.device.is_some());
         if device || (write && !v.prot.write) || (!write && !v.prot.read) {
@@ -177,6 +210,10 @@ impl AsCore {
         };
         let mut va = s;
         while va < e {
+            // `madvise_populate`: a guard's SIGSEGV is EFAULT.
+            if g.guards.contains(va) {
+                return Err(Errno::Fault);
+            }
             match paging::translate(self.root, va) {
                 // MM-13: a written aligned 2 MiB takes a huge page, as Linux's populate faults do.
                 None if write

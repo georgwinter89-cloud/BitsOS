@@ -1,4 +1,4 @@
-//! Interrupt handler ring on OSSSYS 6.0.x: Linux `ih_v6_0` (linux-6.6 amdgpu/ih_v6_0.c). GX-D6: the ring
+//! Interrupt handler ring on OSSSYS 6.0.x: Linux `ih_v6_0` (linux-7.3.1 amdgpu/ih_v6_0.c). GX-D6: the ring
 //! belongs to the device object; GX-7n: GFX/SDMA fences and VM faults arrive on it. The display's sources stay masked
 //! (GX-D9): nothing here or in `gpucore::ih` writes a DCN register, their entries are counted and dropped unless DS
 //! gives the source a hook (`hw::ih::IrqFeed::set_hook`) after turning it on itself.
@@ -31,8 +31,11 @@ pub const IH_STORM_CLIENT_LIST_CNTL: (usize, u32) = (0, 0xda);
 pub const IH_MSI_STORM_CTRL: (usize, u32) = (0, 0xf1);
 /// GX-7m: IH_VMID_0_LUT .. IH_VMID_15_LUT (osssys_6_0_0_offset.h:30, segment 0): the VMID-to-PASID table of
 /// GFXHUB's VMIDs that names a fault's process; a kernel ring writes entry `vmid` (gmc_v11_0.c:429-445), MES does
-/// it for its own queues. (The MMHUB table IH_VMID_0_LUT_MM is not used: no MMHUB VMID here.)
+/// it for its own queues.
 pub const IH_VMID_0_LUT: (usize, u32) = (0, 0x0);
+/// GX-8v: IH_VMID_0_LUT_MM .. _15 (osssys_6_0_0_offset.h:62): the same table for MMHUB's VMIDs; VCN's ring writes
+/// entry `vmid` of a program's job (gmc_v11_0_emit_pasid_mapping on an MMHUB ring).
+pub const IH_VMID_0_LUT_MM: (usize, u32) = (0, 0x10);
 
 /// NBIO's interrupt side, beyond BAR5: through the RSMU window as Linux's indirect access (nbio_7_7_0_offset.h).
 /// Segment 3 / segment 5 of NBIF.
@@ -173,7 +176,7 @@ pub const SRC_PRIV_INSTR: u8 = 185;
 /// VMC_1_0__SRCID__VM_FAULT.
 pub const SRC_VMC_FAULT: u8 = 0;
 
-/// Where an entry goes. The display's sources are named for DS (ds-roadmap.md section 6): irqsrcs_dcn_1_0.h,
+/// Where an entry goes. The display's sources are named for DS (plan/spec/display-roadmap.md §6): irqsrcs_dcn_1_0.h,
 /// irq_service_dcn314.c:96-112.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -184,6 +187,8 @@ pub enum Source {
     PrivReg,
     PrivInstr,
     IhSelf,
+    /// GX-8v: client VCN (0x10) src 119, the unified ring's TRAP after a fence (the VCN thread polls its fence).
+    VcnTrap,
     /// client 4 src 9: every HPD and HPD RX; the context tells them apart.
     DcnHpd,
     /// src 0x3C..0x41: OTG VSTARTUP, Linux's vblank. Enabling it is OTG_GLOBAL_SYNC_STATUS's VSTARTUP_INT_EN
@@ -202,7 +207,7 @@ pub enum Source {
 }
 
 impl Source {
-    pub const ALL: [Source; 15] = [
+    pub const ALL: [Source; 16] = [
         Source::Eop,
         Source::SdmaTrap,
         Source::GfxFault,
@@ -210,6 +215,7 @@ impl Source {
         Source::PrivReg,
         Source::PrivInstr,
         Source::IhSelf,
+        Source::VcnTrap,
         Source::DcnHpd,
         Source::DcnVblank,
         Source::DcnVline0,
@@ -233,6 +239,7 @@ impl Source {
             Source::PrivReg => "privileged register",
             Source::PrivInstr => "privileged instruction",
             Source::IhSelf => "IH self",
+            Source::VcnTrap => "VCN trap",
             Source::DcnHpd => "DCN HPD",
             Source::DcnVblank => "DCN vblank",
             Source::DcnVline0 => "DCN vline0",
@@ -258,6 +265,7 @@ pub fn route(client: u8, src: u8) -> Source {
         (CLIENT_GFX, SRC_UTCL2_FAULT) => Source::GfxFault,
         (CLIENT_VMC, SRC_VMC_FAULT) => Source::MmhubFault,
         (CLIENT_IH, 0) => Source::IhSelf,
+        (c, s) if u32::from(c) == crate::ipmod::vcn4::IH_CLIENT_VCN && u32::from(s) == crate::ipmod::vcn4::IH_SRC_ENC_GENERAL_PURPOSE => Source::VcnTrap,
         (CLIENT_DCN, 9) => Source::DcnHpd,
         (CLIENT_DCN, 0x1e..=0x23) => Source::DcnVline0,
         (CLIENT_DCN, 0x3c..=0x41) => Source::DcnVblank,

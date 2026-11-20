@@ -2,13 +2,14 @@
 """DS-4 scenario client (50-boot-screen.sh): the boot screen seen through QEMU's screendump (QMP) and the step
 list through MCP (`read_file /proc/bitsos/boot`).
 
-Usage: boot_check.py fail|key|up|off|emergency <host port> <token> <qmp socket> <run dir> <repo root> <serial log>
-fail (desktop_program=/bin/sleep 6): the boot screen appears early; a screendump equals the Rust model drawn from /proc/bitsos/boot (cargo test
+Usage: boot_check.py fail|key|up|nonode|missing|emergency|errlvl|warnlvl <host port> <token> <qmp socket> <run dir> <repo root> <serial log>
+fail (ktest_desktop_program=/bin/sleep 15): the boot screen appears early; a screendump equals the Rust model drawn from /proc/bitsos/boot (cargo test
       ... bootscreen_matches_model) mid-start and again with the failing desktop step; after three failed starts
       the text console shows the message.
 key:  a key (QMP send-key) while the boot screen is up brings the text console.
-up:   /bin/bitscomp takes the screen; the step list says the desktop runs.
-off:  no boot screen; /proc/bitsos/boot still lists the steps, the desktop step skipped.
+up:   the stand-in (fbtest demo) takes the screen; the step list says the desktop runs.
+nonode: no GPU (QEMU has none): the boot screen ends to the text console without a desktop start; /proc/bitsos/boot still
+      lists the steps, the desktop step skipped.
 emergency: ktest in.boot.emergency runs while the boot screen is up (the script reads its result).
 Exit status 0 = green."""
 import http.client
@@ -241,21 +242,22 @@ def key(q):
 def up(q):
     wait_boot_screen(q)
     c = connect(240)
-    t = wait_proc(c, lambda f: f.get("step desktop", "").startswith("done"), "bitscomp started and took the screen", 120)
+    t = wait_proc(c, lambda f: f.get("step desktop", "").startswith("done"), "the desktop program started and took the screen", 120)
     need(proc_fields(t).get("screen") == "handed", "the boot screen handed the screen over", t)
     time.sleep(2)
     desktop_shown(q, "desktop.ppm")
 
 
-def off(q):
+def nonode(q):
     c = connect(240)
-    t = wait_proc(c, lambda f: f.get("step services", "").startswith("done"), "init started (desktop=off boot)")
+    t = wait_proc(c, lambda f: f.get("step services", "").startswith("done"), "init started (a boot without a GPU)")
+    t = wait_proc(c, lambda f: f.get("step desktop", "").startswith("skipped"), "the desktop step skipped (no GPU)")
     f = proc_fields(t)
-    need(f.get("screen") == "off" and f.get("step desktop", "").startswith("skipped"), "no boot screen, the desktop step skipped", t)
+    need(f.get("screen") == "text", "the boot screen gave the screen to the text console", t)
     for sid in ("kernel", "memory", "cpus"):
         need(f.get("step " + sid, "").startswith("done"), f"step {sid} done", t)
-    p = ppm_pixel(screendump(q, "off.ppm"), *CORE)
-    need(not is_core(p), f"the text console as today (core pixel {p:06x})")
+    p = ppm_pixel(screendump(q, "nonode.ppm"), *CORE)
+    need(not is_core(p), f"the text console (core pixel {p:06x})")
 
 
 def missing(q):
@@ -290,8 +292,8 @@ def watch_metrics(c):
 
 
 def desktop_shown(q, name):
-    """The picture is bitscomp's, neither the boot screen (core dot) nor the text console (its background at the
-    core and in the top-left corner; bitscomp's start page is lighter in both)."""
+    """The picture is the desktop program's, neither the boot screen (core dot) nor the text console (its background
+    at the core and in the top-left corner; fbtest's bars and patterns are lighter in both)."""
     d = screendump(q, name)
     p, corner = ppm_pixel(d, *CORE), ppm_pixel(d, 10, 10)
     print(f"  desktop picture core pixel {p:06x}, corner {corner:06x}")
@@ -300,7 +302,7 @@ def desktop_shown(q, name):
 
 
 def errlvl(q):
-    """IN-9: loglevel=error (Georg's normal) or warn, and desktop=on: every step settles and bitscomp takes the
+    """IN-9: loglevel=error (Georg's normal) or warn, and a desktop start: every step settles and the program takes the
     screen, fed through klog's watch (the Info lines themselves never reach the ring: checked on serial by the
     script). BITSOS_REQUIRE_WATCH=1 (the desk's merge gate with the change requests applied) makes a missing
     watch red instead of a skip."""
@@ -314,7 +316,7 @@ def errlvl(q):
             raise SystemExit(f"RED ({MODE}): BITSOS_REQUIRE_WATCH=1 but klog has no watch (change request IN-9 CR-1 not applied)")
         print(f"  SKIP ({MODE}): klog has no watch yet (change request IN-9 CR-1); the step list cannot see Info lines at error")
         return
-    t = wait_proc(c, lambda f: f.get("step desktop", "").startswith("done"), "bitscomp started and took the screen at loglevel=error", 120)
+    t = wait_proc(c, lambda f: f.get("step desktop", "").startswith("done"), "the desktop program started and took the screen at loglevel=error", 120)
     f = proc_fields(t)
     need(f.get("screen") == "handed", "the boot screen handed the screen over", t)
     for sid in ("kernel", "memory", "cpus", "services", "desktop"):
@@ -331,7 +333,7 @@ def errlvl(q):
 
 def main():
     q = Qmp(QMP_PATH)
-    {"fail": fail, "key": key, "up": up, "off": off, "missing": missing, "emergency": emergency, "errlvl": errlvl, "warnlvl": errlvl}[MODE](q)
+    {"fail": fail, "key": key, "up": up, "nonode": nonode, "missing": missing, "emergency": emergency, "errlvl": errlvl, "warnlvl": errlvl}[MODE](q)
     print(f"in boot screen ({MODE}): green")
 
 

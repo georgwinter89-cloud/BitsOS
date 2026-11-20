@@ -51,6 +51,8 @@ impl App {
         }
         if let Some(i) = slot(self.restoring.iter().map(|r| r.pid), pid, group) {
             let r = self.restoring.remove(i);
+            // DB4: a restored program is no start of Georg's and keeps its remembered place.
+            w.user_data().insert_if_missing(|| crate::habit_app::Restored);
             let active = r.ws == self.desk.active || r.ws >= self.ws_count();
             let anchor = self.anchors.get(&r.group).cloned();
             let ws = if active { &mut self.ws } else { &mut self.desk.parked[r.ws] };

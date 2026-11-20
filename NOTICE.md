@@ -15,6 +15,7 @@ These parts carry code or data derived from other projects and keep those projec
 | Where | Derived from | Licence used |
 |---|---|---|
 | `crates/dcn314-regs/src/generated/` | Linux `drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_1_4_*.h`, Copyright 2022 Advanced Micro Devices, Inc. | MIT (notice below) |
+| `crates/rdna4-regs/src/generated/` | Linux 7.3.1 `drivers/gpu/drm/amd/include/asic_reg/` (athub 4.1.0, gc 12.0.0, hdp 7.0.0, lsdma 7.0.0, mmhub 4.1.0, mp 14.0.2, nbif 6.3.1, osssys 7.0.0, smuio 14.0.2 `*_offset.h` and `*_sh_mask.h`), Copyright 2023 Advanced Micro Devices, Inc. | MIT (notice below) |
 | `crates/rtw89-core/`, `crates/drivers/rtw89/` | Linux `drivers/net/wireless/realtek/rtw89/`, Copyright(c) 2019-2020 Realtek Corporation, `GPL-2.0 OR BSD-3-Clause` | BSD-3-Clause (notice below) |
 | `crates/display/src/font/cp437-8x16.bin` | the CP437 8x16 VGA font from SeaVGABIOS (see `crates/display/src/font/README.md`) | public domain |
 | `crates/drm/src/uapi/` | generated from libdrm's `drm.h`, `drm_mode.h`, `amdgpu_drm.h` (MIT) and Linux's `sync_file.h`, `dma-buf.h` | as their sources: MIT; `sync_file.rs` GPL-1.0+ and `dma_buf.rs` GPL-2.0, both WITH Linux-syscall-note (notices in the files) |
@@ -28,7 +29,8 @@ their code is written for BitsOS and not copied from Linux.
 
 ## AMD register headers (MIT)
 
-Copyright (C) 2022 Advanced Micro Devices, Inc.
+Copyright (C) 2022 Advanced Micro Devices, Inc. (dcn314-regs)
+Copyright (C) 2023 Advanced Micro Devices, Inc. (rdna4-regs)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 documentation files (the "Software"), to deal in the Software without restriction, including without limitation

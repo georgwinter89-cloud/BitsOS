@@ -1,5 +1,5 @@
 //! MM-9: direct reclaim in the allocator's slow path (`__alloc_pages_direct_reclaim`,
-//! linux-6.6/mm/page_alloc.c:3639) and the reserve that keeps it from starving the kernel.
+//! linux-7.3.1/mm/page_alloc.c:4464) and the reserve that keeps it from starving the kernel.
 //!
 //! The reserve: once a reclaimer is installed, an allocation of program or cache memory
 //! (`reclaim::direct_allowed`) does not take the last frames of a zone (its share of the min watermark) when it
@@ -25,6 +25,23 @@ use core::sync::atomic::Ordering::Relaxed;
 
 /// Reserve hits that skip the light round after one found nothing.
 const SKIP: u64 = 16;
+
+/// What one heap reclaim round did (`Buddy::heap_round`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeapRound {
+    /// Cache pages taken back.
+    pub freed: u64,
+    /// A cache was passed over (its lock was held) or the scan budget ran out.
+    pub busy: bool,
+    /// Compaction made a free block of the order.
+    pub made: bool,
+}
+
+impl HeapRound {
+    pub fn progress(&self) -> bool {
+        self.freed > 0 || self.made
+    }
+}
 impl Buddy {
     /// Installs the page cache's reclaimer (once) and sets each zone's reserve to its share of the min
     /// watermark. False: one was installed already.
@@ -69,22 +86,32 @@ impl Buddy {
     /// tries again.
     #[cold]
     pub fn reclaim_for_heap(&self, order: u32, grace: &mut crate::grace::WaitBudget) -> bool {
-        let Some(r) = self.reclaimer.get() else { return false };
+        let r = self.heap_round(order, grace);
+        r.progress() || r.busy
+    }
+
+    /// `reclaim_for_heap` with what the round did (MEMCRASH: the never-failing loop counts rounds without
+    /// progress, `oom::Stall`; a busy cache is no progress there, as in Linux's `should_reclaim_retry`).
+    #[cold]
+    pub fn heap_round(&self, order: u32, grace: &mut crate::grace::WaitBudget) -> HeapRound {
+        let mut out = HeapRound::default();
+        let Some(r) = self.reclaimer.get() else { return out };
         if !reclaim::context_allows() {
-            return false;
+            return out;
         }
         // The heap noted its order under its lock: kswapd's wake waited for a context like this one.
         reclaim::wake_deferred();
-        let Some(_inside) = reclaim::enter() else { return false };
+        let Some(_inside) = reclaim::enter() else { return out };
         if order > 0 && self.compact_direct_inside(order, grace) {
             if self.global_reports {
                 reclaim::HEAP_CLEARED.inc();
             }
+            out.made = true;
             // The block exists, but below the reserve the heap is refused it (`below_reserve`): frames are short
             // too, so cache pages are taken as well. Without this the heap's rounds were compaction runs only,
             // hundreds of thousands in a minute, each under the zone lock (Mini-PC 11.11.2026, generation 114).
             if !self.all_below_reserve() {
-                return true;
+                return out;
             }
         }
         let want = reclaim::CLUSTER.max(64u64 << order.min(14));
@@ -105,7 +132,9 @@ impl Buddy {
         }
         reclaim::HEAP_RUNS.inc();
         reclaim::HEAP_PAGES.add(freed);
-        freed > 0 || busy
+        out.freed = freed;
+        out.busy = busy;
+        out
     }
 
     /// Every zone has less usable free memory than its reserve.
@@ -129,15 +158,49 @@ impl Buddy {
         moved
     }
 
+    /// MEMCRASH row 2 (`oom`): a program's frames and page tables of order <= `oom::COSTLY_ORDER`, asked for where
+    /// the caller may sleep (a fault under `mm.as`; Linux GFP_PGTABLE_USER is GFP_KERNEL), do not fail while reclaim or the OOM killer can still make room (Linux's page
+    /// fault allocations; their failure is `pagefault_out_of_memory`, which kills too). Each round reclaims (with
+    /// the reserve, `alloc_reclaiming`), waits for what passed its grace period and tries the HighAtomic reserve;
+    /// between rounds `oom::Stall` sleeps and, after rounds without progress, asks the OOM killer. A program that
+    /// is being killed gets its None at once (it never sees the page). Page-cache frames keep their bounded path:
+    /// read-ahead may fail (Linux allocates it with __GFP_NORETRY) and a read answers ENOMEM.
     #[cold]
-    pub(super) fn alloc_reclaiming(&self, order: u32, zone: Zone, kind: Kind, budget: &mut crate::grace::WaitBudget) -> Option<u64> {
-        if !reclaim::direct_allowed(kind) {
+    pub(super) fn alloc_nofail(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64> {
+        let mut stall = crate::oom::Stall::new(order);
+        loop {
+            let before = self.direct.pages.load(Relaxed);
+            let mut budget = crate::grace::WaitBudget::default();
+            if let Some(p) = self.alloc_reclaiming(order, zone, kind, &mut budget, true) {
+                return Some(p);
+            }
+            if let Some(p) = self.alloc_after_grace(order, zone, kind, &mut budget) {
+                return Some(p);
+            }
+            if let Some(p) = self.alloc_highatomic(order, zone, kind) {
+                return Some(p);
+            }
+            let progress = self.direct.pages.load(Relaxed) > before;
+            if crate::oom::current_dying() || !stall.next(progress) {
+                return None;
+            }
+        }
+    }
+
+    #[cold]
+    /// `nofail` (the never-failing loop, `alloc_nofail`): every call really reclaims, also for a kind that
+    /// otherwise leaves direct reclaim to kswapd (`may_nofail` already holds: no spin lock, may sleep), and the
+    /// shared `skip` shortcut is not taken. Checker 13.11.2026: with the shortcut, one failed pass was followed by
+    /// 16 rounds that only looked, and the OOM killer came 17 ms after a single real try (Linux counts 16 real
+    /// reclaim passes, `should_reclaim_retry`).
+    pub(super) fn alloc_reclaiming(&self, order: u32, zone: Zone, kind: Kind, budget: &mut crate::grace::WaitBudget, nofail: bool) -> Option<u64> {
+        if !nofail && !reclaim::direct_allowed(kind) {
             return None;
         }
         let r = self.reclaimer.get()?;
         reclaim::wake_deferred();
         let Some(_inside) = reclaim::enter() else { return self.grab(order, zone, kind, true) };
-        if self.skip.try_update(Relaxed, Relaxed, |s| s.checked_sub(1)).is_ok() {
+        if !nofail && self.skip.try_update(Relaxed, Relaxed, |s| s.checked_sub(1)).is_ok() {
             self.direct.dips.fetch_add(1, Relaxed);
             return self.grab(order, zone, kind, true);
         }
@@ -157,7 +220,15 @@ impl Buddy {
                 if got.is_some() {
                     break;
                 }
-            } else if thorough && !o.busy {
+            } else if o.busy {
+                // A cache was busy, most often kswapd's own round in it: what it freed waits for its grace
+                // period, and this allocation may take it (bounded, `budget`) before it reclaims again.
+                crate::grace::expedite_with(budget);
+                got = self.grab(order, zone, kind, false);
+                if got.is_some() {
+                    break;
+                }
+            } else if thorough {
                 self.skip.store(SKIP, Relaxed);
                 break;
             }

@@ -13,6 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use devmodel::block::BlockDevice;
 use devmodel::block::IoPriority::Normal;
 
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +29,9 @@ pub struct RunCfg {
     pub crash: bool,
     pub cache_pages: usize,
     pub commit_dirty_pages: usize,
+    /// Commits queue their freed chunks (as under a `PoolHandle`, trim.rs), and random steps do what the handle
+    /// does with them between its holds of the lock (`Runner::trim_step`).
+    pub trim: bool,
 }
 
 impl RunCfg {
@@ -43,6 +47,7 @@ impl RunCfg {
             crash: false,
             cache_pages: 64,
             commit_dirty_pages: 16,
+            trim: false,
         }
     }
 }
@@ -62,6 +67,11 @@ pub struct Report {
     pub dropped: u64,
     pub crash_images: u64,
     pub generations: u64,
+    pub trim_rounds: u64,
+    /// Discards the device carried out while their chunks were under way, and after their answer was lost.
+    pub trim_landed: u64,
+    pub trim_late: u64,
+    pub trim_lost: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,6 +124,10 @@ pub struct Runner {
     since: BTreeSet<(u64, u64, u64)>,
     pub report: Report,
     last: u64,
+    /// Runs taken for their discard (`RunCfg::trim`), and whether the device carried it out yet.
+    inflight: Vec<((u64, u64), bool)>,
+    /// Runs whose discard was answered with a timeout and the device has not carried out yet: it may at any step.
+    lost: Vec<(u64, u64)>,
 }
 
 fn e<T>(r: Result<T, VolError>, what: &str) -> Result<T, String> {
@@ -125,7 +139,10 @@ impl Runner {
         let blocks = cfg.dev_chunks * (cfg.chunk_size / cfg.block_size) as u64;
         let dev = Arc::new(MemDev::new("model", cfg.block_size, blocks, cfg.max_req).ok_or("no memory for the device")?);
         let pcfg = Config { chunk_size: cfg.chunk_size, reserve_chunks: None, cache_pages: cfg.cache_pages, commit_dirty_pages: cfg.commit_dirty_pages, quiet: true };
-        let pool = e(Pool::format(dev.clone(), pcfg), "format")?;
+        let mut pool = e(Pool::format(dev.clone(), pcfg), "format")?;
+        if cfg.trim {
+            pool.set_trim_later();
+        }
         let generation = pool.generation();
         let mut r = Runner {
             cfg,
@@ -140,6 +157,8 @@ impl Runner {
             since: BTreeSet::new(),
             report: Report::default(),
             last: 0,
+            inflight: Vec::new(),
+            lost: Vec::new(),
         };
         r.create()?;
         r.create()?;
@@ -397,12 +416,92 @@ impl Runner {
         }
     }
 
+    /// The device carries out the discard of `run` (now, or late).
+    fn land(&mut self, run: (u64, u64)) -> Result<(), String> {
+        let (lba, n) = self.pool().run_blocks(run);
+        self.dev.discard(lba, n).map_err(|x| format!("discard {run:?}: {x:?}"))
+    }
+
+    /// One step of the discard queue, as a `PoolHandle` takes it between its holds of the pool lock: a round's
+    /// take, the device carrying out a discard under way or one whose answer was lost, the answer (done, refused
+    /// before it was sent, timed out), or space running short. Then every volume must still read as the model.
+    fn trim_step(&mut self) -> Result<(), String> {
+        match self.rnd(6) {
+            0 => {
+                let (max, chunks) = (1 + self.rnd(4) as usize, 1 + self.rnd(8));
+                let runs = self.pool().take_trim(max, chunks);
+                self.report.trim_rounds += u64::from(!runs.is_empty());
+                self.inflight.extend(runs.into_iter().map(|r| (r, false)));
+            }
+            1 | 4 => {
+                let open: Vec<usize> = (0..self.inflight.len()).filter(|&i| !self.inflight[i].1).collect();
+                if !open.is_empty() {
+                    let i = open[self.rnd(open.len() as u64) as usize];
+                    let run = self.inflight[i].0;
+                    self.land(run)?;
+                    self.inflight[i].1 = true;
+                    self.report.trim_landed += 1;
+                }
+            }
+            2 if !self.inflight.is_empty() => {
+                let i = self.rnd(self.inflight.len() as u64) as usize;
+                let (run, landed) = self.inflight.swap_remove(i);
+                match self.rnd(3) {
+                    0 => {
+                        if !landed {
+                            self.land(run)?;
+                        }
+                        self.pool().trim_done(&[run], &[]);
+                    }
+                    1 if !landed => self.pool().trim_done(&[run], &[]),
+                    _ => {
+                        self.pool().trim_done(&[], &[run]);
+                        self.report.trim_lost += run.1;
+                        if !landed {
+                            self.lost.push(run);
+                        }
+                    }
+                }
+            }
+            3 => {
+                self.pool().untrim();
+            }
+            _ if !self.lost.is_empty() => {
+                let i = self.rnd(self.lost.len() as u64) as usize;
+                let run = self.lost.swap_remove(i);
+                self.land(run)?;
+                self.report.trim_late += 1;
+            }
+            _ => {}
+        }
+        self.check_all()
+    }
+
+    /// Before a reopen: every discard under way or lost reaches the device and is answered (a new start has
+    /// no request left at the device).
+    fn settle_trims(&mut self) -> Result<(), String> {
+        for (run, landed) in core::mem::take(&mut self.inflight) {
+            if !landed {
+                self.land(run)?;
+            }
+            self.pool().trim_done(&[run], &[]);
+        }
+        for run in core::mem::take(&mut self.lost) {
+            self.land(run)?;
+        }
+        Ok(())
+    }
+
     /// Commit, then open the pool again from the device and from a copy of its image.
     fn reopen(&mut self) -> Result<(), String> {
+        self.settle_trims()?;
         e(self.pool().commit(), "commit")?;
         let digest = self.pool().alloc_digest();
         let old = self.pool.take().ok_or("no pool")?;
-        let p = e(Pool::open(self.dev.clone(), self.pcfg), "reopen")?;
+        let mut p = e(Pool::open(self.dev.clone(), self.pcfg), "reopen")?;
+        if self.cfg.trim {
+            p.set_trim_later();
+        }
         if p.alloc_digest() != digest {
             return Err(format!("reference counts rebuilt on open differ from the live ones: {}", old.alloc_diff(&p)));
         }
@@ -431,6 +530,11 @@ impl Runner {
 
     /// One random step; true when it ended with a commit that matches the model exactly.
     fn step(&mut self) -> Result<bool, String> {
+        if self.cfg.trim && self.rnd(4) == 0 {
+            self.last = 100;
+            self.trim_step()?;
+            return Ok(false);
+        }
         let r = self.rnd(100);
         self.last = r;
         let exact = match r {

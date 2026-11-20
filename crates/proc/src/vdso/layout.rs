@@ -3,7 +3,7 @@
 // `include!`s it. Only constants here, so both compile it alike. The layout is private between this kernel and
 // its own vDSO (Linux's `struct vdso_data` is not an ABI either); programs only see the exported functions.
 //
-// Protocol (Linux `vdso_write_begin`/`vdso_read_begin`, linux-6.6/include/vdso/helpers.h): the writer makes
+// Protocol (Linux `vdso_write_begin`/`vdso_read_begin`, linux-7.3.1/include/vdso/helpers.h:94): the writer makes
 // `SEQ` odd, stores the fields, makes it even again; a reader takes an even `SEQ`, reads the TSC and the fields
 // and retries when `SEQ` changed meanwhile. x86 keeps stores in order and loads in order, so compiler barriers
 // suffice on both sides.
@@ -33,6 +33,13 @@ pub const RES_NS: usize = 56;
 pub const COARSE_RES_NS: usize = 60;
 /// u32 `F_*` bits: which instructions the vDSO may use.
 pub const FLAGS: usize = 64;
+/// L7-SYNC, `struct vdso_rng_data` (linux-7.3.1/include/vdso/datapage.h:145): u64 count of the kernel RNG's
+/// reseeds as the vDSO's getrandom sees them, never 0 once published.
+pub const RNG_GEN: usize = 72;
+/// u32 1 when the kernel RNG is ready (V2's always is once the page is published).
+pub const RNG_READY: usize = 80;
+/// u32 `RNG_F_*` bits.
+pub const RNG_FLAGS: usize = 84;
 /// Start of the room kept for time namespace offsets (SX: CLONE_NEWTIME; nothing there yet). The page ends at
 /// `VVAR_SIZE`.
 pub const TIMENS: usize = 128;
@@ -49,5 +56,8 @@ pub const MODE_TSC: u32 = 1;
 pub const F_RDTSCP: u32 = 1;
 /// rdpid exists (getcpu reads IA32_TSC_AUX with it).
 pub const F_RDPID: u32 = 2;
+/// mmap takes MAP_DROPPABLE, so getrandom's params query may name it (it answers -ENOSYS without).
+pub const RNG_F_DROPPABLE: u32 = 1;
+
 /// IA32_TSC_AUX holds `(node << 12) | cpu` on every CPU (fewer than 4096 CPUs): getcpu may answer from it.
 pub const F_GETCPU: u32 = 4;

@@ -3,7 +3,7 @@
 //! PCI binder probes the 780M's display function (boot thread, after the scan, no lock held: the attach reads PCI
 //! configuration and a settle may sleep up to 50 ms), installed into gopfb's fbdev (`gopfb::fbdev::flip`) by an
 //! initcall, and its Quiesce (Reload/reboot/panic: A0 back if GX flipped). QEMU has no such function: nothing
-//! binds, fbdev keeps copying.
+//! binds, fbdev copies into the GOP framebuffer (the text console's picture, no engine).
 
 use crate::attach::{self, BACK_OFFSET, Regs};
 use crate::cursor::{self, CursorError, Shape};
@@ -18,7 +18,6 @@ use devmodel::DevError;
 use devmodel::display::{DisplayDevice, Fence};
 use gopfb::GopFb;
 use gopfb::fbdev::flip::{CursorError as FbCursorError, DirectBuffer, DirectFrame, FlipError, ScanoutFlip, Vblank};
-use ksync::Once;
 
 /// The register owner as the flip sequences see it.
 pub struct Live(pub &'static DcnRegs);
@@ -51,17 +50,16 @@ impl Clock for KClock {
 
 pub type KScanout = Scanout<Live, KClock>;
 
-static SCANOUT: Once<Option<KScanout>> = Once::new();
-
-/// The scanout pair if it was taken over (never builds; any context).
+/// The scanout pair if it was taken over (never builds; any context). The pair is its device's
+/// (`devs::Device::scanout`); the console has one framebuffer, so the display side asks by role: the 780M's device.
 pub fn get() -> Option<&'static KScanout> {
-    SCANOUT.get().and_then(Option::as_ref)
+    crate::devs::registry_now().and_then(|r| r.first(crate::devs::Family::Phoenix)).and_then(|d| d.scanout.get()).and_then(Option::as_ref)
 }
 
 /// Takes the display over on first use. Thread context with no lock held, after the PCI scan (the binder's
 /// probe; the MCP tool and the ktests call it too, later).
 pub fn attach() -> Option<&'static KScanout> {
-    SCANOUT.get_or_init(build).as_ref()
+    crate::devs::registry().first(crate::devs::Family::Phoenix)?.scanout.get_or_init(build).as_ref()
 }
 
 fn refuse(why: &str) -> Option<KScanout> {
@@ -163,7 +161,7 @@ fn cursor_buffer(g: &Gpu, a: &attach::Attach, s: &mut KScanout) {
     }
 }
 
-/// GX-5a: the hardware cursor for gopfb's fbdev (`FBIO_BITSOS_CURSOR`, change request in plan/notes/gx-GX-5a.md)
+/// GX-5a: the hardware cursor for gopfb's fbdev (`FBIO_BITSOS_CURSOR`, gopfb fbdev/cursor.rs)
 /// and the `dcn_cursor` tool. NoDevice without a display engine taken over (QEMU).
 pub fn cursor_ready() -> bool {
     get().is_some_and(|s| s.cursor_ready())
@@ -204,13 +202,10 @@ struct Provider;
 
 impl ScanoutFlip for Provider {
     fn ready(&self) -> bool {
-        get().is_some_and(|s| s.active())
+        get().is_some()
     }
     fn active(&self) -> bool {
-        get().is_some_and(|s| s.active())
-    }
-    fn redirects(&self) -> bool {
-        get().is_some_and(|s| s.redirects())
+        get().is_some()
     }
     fn present_shown(&self, src: &[u32], stride: u32, rect: (u32, u32, u32, u32)) -> Result<Fence, DevError> {
         get().ok_or(DevError::Unsupported)?.present_shown(src, stride, rect)
@@ -226,15 +221,10 @@ impl ScanoutFlip for Provider {
         get().ok_or(FlipError::Off)?.wait(seq)
     }
     fn vblank(&self) -> Option<Vblank> {
-        get().filter(|s| s.active())?.vblank()
-    }
-    fn rearm(&self) {
-        if let Some(s) = get() {
-            s.rearm();
-        }
+        get()?.vblank()
     }
     fn direct_buffer(&self, window: usize) -> Option<DirectBuffer> {
-        get().filter(|s| s.active())?.direct_buffer(window)
+        get()?.direct_buffer(window)
     }
     fn direct_begin(&self) -> Result<DirectFrame, FlipError> {
         get().ok_or(FlipError::Off)?.direct_begin()
@@ -242,8 +232,11 @@ impl ScanoutFlip for Provider {
     fn direct_flip(&self, window: usize) -> Result<u64, FlipError> {
         get().ok_or(FlipError::Off)?.direct_flip(window)
     }
-    fn read_shown(&self, dst: &mut [u32], stride: u32) -> bool {
-        get().is_some_and(|s| s.read_shown(dst, stride))
+    fn shown(&self) -> Option<usize> {
+        Some(get()?.shown())
+    }
+    fn read_window(&self, window: usize, rect: (u32, u32, u32, u32), dst: &mut [u32]) -> bool {
+        get().is_some_and(|s| s.read_window(window, rect, dst))
     }
     fn cursor_ready(&self) -> bool {
         cursor_ready()
@@ -291,7 +284,7 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
         None => Err(String::from("display not taken over (see the dcn flip.off event)")),
     }
 }
-pci::pci_driver!(pci::DriverEntry { name: "amdgpu", matches: &MATCHES, opt_in_key: None, probe });
+pci::pci_driver!(pci::DriverEntry { name: "amdgpu", matches: &MATCHES, probe });
 
 /// The scanout's state as one line (MCP tool, ktests).
 pub fn state_line() -> String {
@@ -301,8 +294,7 @@ pub fn state_line() -> String {
             let st = s.state();
             let t = s.timing();
             alloc::format!(
-                "flip: {}, shows A{}, ordered {}, landed {}, late {}, settled at take-over {}, OTG{} {} lines of {} ps, {} mHz",
-                if st.flipping { "on" } else { "fell back (one image)" },
+                "flip: on, shows A{}, ordered {}, landed {}, late (frames dropped) {}, settled at take-over {}, OTG{} {} lines of {} ps, {} mHz",
                 st.shown,
                 st.ordered,
                 st.landed,

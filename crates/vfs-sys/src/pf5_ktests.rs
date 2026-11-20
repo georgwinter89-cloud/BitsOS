@@ -329,8 +329,11 @@ impl Drop for Taken {
     }
 }
 
+/// Free memory a page-cache or user allocation can take: the HighAtomic reserve (11.11., free only for allocations
+/// that cannot reclaim) is not free for these tests (INT-W35-MM2: with it counted, fs.pf5.pressure saw 13.5 MiB it
+/// could not take).
 fn free_bytes() -> u64 {
-    mm_core::frames().map_or(0, |f| f.stats().free_bytes)
+    mm_core::frames().map_or(0, |f| f.stats().usable_free_bytes())
 }
 
 /// The hole-punch loop with almost no free memory: a tmpfs file is written, the frames are taken until LEAVE
@@ -378,7 +381,9 @@ fn pressure() -> TestResult {
         other => return Err(format!("first write {other:?}")),
     }
     let mut taken = Taken(Vec::new());
-    taken.0.try_reserve((total / (2 * MIB) + 4096) as usize).map_err(|_| "no room for the frame list")?;
+    // A 2 MiB block per entry for most of memory, and room for 64 MiB of single frames: after the whole `fs.` series
+    // free memory lay in more than 5100 pieces (13.11.2026: list full at 13 to 25 MiB free, the frames were there).
+    taken.0.try_reserve((total / (2 * MIB) + (64 * MIB) / P) as usize).map_err(|_| "no room for the frame list")?;
     // Large blocks first, smaller ones for the rest (never the allocator's reclaiming path: alloc_light). Free
     // frames on other CPUs' per-CPU lists count as free but this CPU cannot take them (with -smp 16 that was
     // ~2.7 MiB, INT-W27): the lists are drained into the buddy and the take repeated once.
@@ -396,6 +401,7 @@ fn pressure() -> TestResult {
         }
     }
     let low = free_bytes();
+    let (held, room) = (taken.0.len(), taken.0.capacity());
     let (g0, d0) = (grace::stats(), mm_core::reclaim::direct_stats());
     let mut failed = None;
     let mut max_pending = 0u64;
@@ -423,7 +429,7 @@ fn pressure() -> TestResult {
     grace::expedite();
     klog::event!(Info, "ktest", "fs.pf5.pressure", total_mb = total / MIB, low_kb = low / 1024, rounds = ROUNDS,
         max_pending_kb = max_pending / 1024, drained_mb = (g1.drained_bytes - g0.drained_bytes) / MIB,
-        expedites = g1.expedites - g0.expedites, reclaim_runs = d1.runs - d0.runs; "punch loop with almost no free memory");
+        expedites = g1.expedites - g0.expedites, reclaim_runs = d1.runs - d0.runs, held_blocks = held, list_room = room; "punch loop with almost no free memory");
     kassert!(joined, "a reader did not finish in 20 s");
     kassert!(low <= LEAVE + 2 * MIB, "free memory stayed at {} KiB: the frames could not be taken", low / 1024);
     kassert!(failed.is_none(), "round {:?}", failed);

@@ -2,17 +2,18 @@
 //!
 //! Transfer size per command (bytes; Linux keeps `max_sectors` in 512-byte sectors, so a 4K-block device gets the
 //! same byte limit in fewer blocks):
-//! - SuperSpeed and faster: 2048 sectors = 1 MiB (linux-6.6/drivers/usb/storage/scsiglue.c:117-123);
-//! - high speed: 240 sectors = 120 KiB (the SCSI host default of usb-storage; uas.c:837; V1 `MSD_RD_HIGH`);
+//! - SuperSpeed and faster: 2048 sectors = 1 MiB (linux-7.3.1/drivers/usb/storage/scsiglue.c:114-120);
+//! - high speed: 240 sectors = 120 KiB (the SCSI host default of usb-storage; uas.c:852-853; V1 `MSD_RD_HIGH`);
 //! - full/low speed: 128 sectors = 64 KiB (V1: one 64 KiB command);
-//! - `US_FL_MAX_SECTORS_64`: 64 sectors = 32 KiB (scsiglue.c:97-109).
+//! - `US_FL_MAX_SECTORS_64`: 64 sectors = 32 KiB (scsiglue.c:101-106).
 //!
 //! The SMI stick 090C:1000 (Georg's BITSOS stick, "SMI USB DISK") gets the 32 KiB limit for every revision, as V1
 //! did (`usb/msd.asm:34`), but only below SuperSpeed: Georg's 128 GB "TESLA DRIVE" (Samsung Flash Drive, also
 //! 090C:1000 rev 11.00) moved 1 MiB commands at 5 Gbit/s on CachyOS without an error (22.10.2026: 60 MB/s write,
-//! 413 MB/s read). Note: linux-6.6's `unusual_devs.h` has no 090C:1000 entry (only 090C:1132, 3350,
-//! 6000); the spec's "there only for bcdDevice 11.00" could not be found in 6.6. Linux users of such sticks set
-//! `usb-storage.quirks=090c:1000:m` (usb.c:550, `m` = MAX_SECTORS_64). V1 measured the limit on the real stick.
+//! 413 MB/s read). Note: linux-7.3.1/drivers/usb/storage/unusual_devs.h:1300-1334 has no 090C:1000 entry (only
+//! 090C:1132, 3350, 6000); the spec's "there only for bcdDevice 11.00" could not be found in 6.6 or 7.3.1. Linux
+//! users of such sticks set `usb-storage.quirks=090c:1000:m` (usb.c:632, `m` = MAX_SECTORS_64).
+//! V1 measured the limit on the real stick.
 
 use usb_core::Speed;
 

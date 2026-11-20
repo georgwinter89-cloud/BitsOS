@@ -1,5 +1,5 @@
 //! MC-9b: bitscomp as the installer's confirmer. The protocol is bitsinstall's (user/services/bitsinstall/src/
-//! confirm.rs, plan/notes/mc-MC-9a.md "Confirmer protocol"): one JSON object per line over the stream socket
+//! confirm.rs, plan/spec/net.md §11.5): one JSON object per line over the stream socket
 //! `SOCKET`, which bitsinstall listens on; bitscomp connects and stays connected (reconnecting with a back-off when
 //! bitsinstall restarts). A thread reads the lines and hands them to the main loop through a calloop channel; the
 //! main loop writes its answers itself with a short send timeout (B4: a stalled installer is dropped, never waited
@@ -189,8 +189,8 @@ pub enum Msg {
     Down(u64, String),
 }
 
-/// Starts the link thread for `socket` (`check`: the peer must be root running `/bin/bitsinstall`).
-pub fn start(handle: &LoopHandle<'static, App>, socket: String, check: bool) -> Result<(), String> {
+/// Starts the link thread for `socket` (the peer must be root running the boot's bitsinstall).
+pub fn start(handle: &LoopHandle<'static, App>, socket: String) -> Result<(), String> {
     let (tx, rx) = channel::channel::<Msg>();
     handle
         .insert_source(rx, |ev, _, app| {
@@ -201,7 +201,7 @@ pub fn start(handle: &LoopHandle<'static, App>, socket: String, check: bool) -> 
         .map_err(|e| e.to_string())?;
     std::thread::Builder::new()
         .name("bitscomp-install".into())
-        .spawn(move || run(&socket, check, &tx))
+        .spawn(move || run(&socket, &tx))
         .map(|_| ())
         .map_err(|e| format!("installer thread: {e}"))
 }
@@ -213,7 +213,7 @@ fn next_backoff(cur: Duration, healthy: bool) -> Duration {
     if healthy { BACKOFF_MIN } else { (cur * 2).min(BACKOFF_MAX) }
 }
 
-fn run(socket: &str, check: bool, tx: &Sender<Msg>) {
+fn run(socket: &str, tx: &Sender<Msg>) {
     let mut backoff = BACKOFF_MIN;
     let mut last = String::new();
     let mut n = 0u64;
@@ -221,7 +221,7 @@ fn run(socket: &str, check: bool, tx: &Sender<Msg>) {
         let mut healthy = false;
         let why = match UnixStream::connect(socket) {
             Err(e) => format!("not reachable at {socket}: {e}"),
-            Ok(s) => match peer_ok(&s, check) {
+            Ok(s) => match peer_ok(&s) {
                 Err(e) => format!("peer refused: {e}"),
                 Ok(how) => {
                     n += 1;
@@ -254,16 +254,13 @@ fn run(socket: &str, check: bool, tx: &Sender<Msg>) {
 struct Stop;
 
 /// Ok(how the peer was accepted) or Err(why not).
-fn peer_ok(s: &UnixStream, check: bool) -> Result<String, String> {
-    if !check {
-        return Ok("peer not checked (test socket)".into());
-    }
+fn peer_ok(s: &UnixStream) -> Result<String, String> {
     let (pid, uid) = crate::clients::peer_cred(s).ok_or("no SO_PEERCRED")?;
     if uid != 0 {
         return Err(format!("pid {pid} runs as uid {uid}, not root"));
     }
     // INT-W17 (MC-9b CR 5): the kernel names the process that holds its installer gate; when it does, that very
-    // pid is the installer and no other root process. Without the file (Linux, a nested build) the checks below
+    // pid is the installer and no other root process. Without the file (Linux) the checks below
     // decide, as before.
     match std::fs::read_to_string(INSTALLER_HOLDER) {
         Ok(t) => {
@@ -280,7 +277,7 @@ fn peer_ok(s: &UnixStream, check: bool) -> Result<String, String> {
     // bitsinstall runs with PR_SET_DUMPABLE 0, so bitscomp as uid 1000 may not read its exe link (EACCES, as
     // Linux's ptrace_may_access); root as the peer is what decides then (root is trusted with files anyway, MC-9a
     // open point 1). A readable link must name the installer. Which root process it is cannot be told from here
-    // (plan/notes/wy-MC-9b.md, change request 2: the kernel names the installer gate's holder); the log says so.
+    // (a change request: the kernel names the installer gate's holder); the log says so.
     match std::fs::read_link(format!("/proc/{pid}/exe")) {
         Ok(exe) if exe != std::path::Path::new(INSTALLER) => Err(format!("pid {pid} runs {}, not {INSTALLER}", exe.display())),
         Ok(_) => Ok(format!("peer pid {pid} runs {INSTALLER}")),

@@ -6,9 +6,13 @@ use std::collections::HashMap;
 
 /// UL-7: restart and power off (busybox's signals, the power socket, R8f's answer).
 pub mod power;
+/// PK-0: /apps on the data volume, the state line.
+pub mod apps_state;
+/// GM-6w: the power socket's JSON requests, the compositor-holder and real-input rule.
+pub mod power_req;
 
 /// Where the kernel shows its network cards and DHCP leases (one line per card, `key=value` fields; written by
-/// the kernel's `userland` crate today, owner NW, see plan/notes/ul-UL-2.md).
+/// the kernel's `userland` crate today, owner NW, see plan/spec/userland.md §2).
 pub const DEFAULT_NET_FILE: &str = "/proc/net/dhcp";
 
 /// What init was asked to do.

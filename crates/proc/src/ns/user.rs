@@ -1,4 +1,4 @@
-//! SX-2: user namespaces (linux-6.6/kernel/user_namespace.c): a parent, an owner (the creator's euid/egid as
+//! SX-2: user namespaces (linux-7.3.1/kernel/user_namespace.c): a parent, an owner (the creator's euid/egid as
 //! kernel ids), the uid/gid/projid maps written once through `/proc/<pid>/*_map`, and the setgroups switch.
 //! Credentials keep kernel ids (`Cred` fields); a namespace only changes how a program sees and names them
 //! (`make_kuid` / `from_kuid`) and where its capabilities count (`cred::ns_capable`).
@@ -15,7 +15,7 @@ use vfs::Errno;
 
 /// `/proc/sys/kernel/overflowuid` and `overflowgid`: what an id without a mapping reads as.
 pub const OVERFLOW_ID: u32 = 65534;
-/// linux-6.6/kernel/user_namespace.c:91: a parent at a deeper level than this gets ENOSPC (33 levels at most;
+/// linux-7.3.1/kernel/user_namespace.c:92: a parent at a deeper level than this gets ENOSPC (33 levels at most;
 /// an ABI value, not a count of things V2 keeps).
 const MAX_PARENT_LEVEL: u32 = 32;
 /// `CAP_SETFCAP` (V2 names no file capabilities otherwise).

@@ -23,7 +23,7 @@ ktest!("pc.scan.tree", Safe, scan_tree);
 ktest!("pc.scan.ecam", Safe, scan_ecam);
 ktest!("pc.ecam.q35_window", QemuOnly, q35_window);
 ktest!("pc.bars.restored", Safe, bars_restored);
-ktest!("pc.untouched.key_off", QemuAll, untouched_key_off);
+ktest!("pc.untouched.held", QemuAll, untouched_held);
 ktest!("pc.untouched.wlan", Hardware, untouched_wlan);
 ktest!("pc.storage.nvme_only", QemuAll, storage_nvme_only);
 ktest!("pc.guard.storage_bar", Safe, guard_storage_bar);
@@ -53,13 +53,11 @@ fn storage_probe(_: &PciFunction) -> Result<(), String> {
 crate::pci_driver!(DriverEntry {
     name: "ktest-untouched",
     matches: &[Match::Id { vendor: ICH9_SMBUS.0, device: ICH9_SMBUS.1 }],
-    opt_in_key: Some("ktest_untouched"),
     probe: untouched_probe,
 });
 crate::pci_driver!(DriverEntry {
     name: "ktest-storage",
     matches: &[Match::Id { vendor: ICH9_AHCI.0, device: ICH9_AHCI.1 }],
-    opt_in_key: None,
     probe: storage_probe,
 });
 
@@ -143,10 +141,8 @@ fn q35_window() -> R {
     let last = (buses - 1) as u8;
     let space = crate::ecam::EcamSpace::new(&[acpi::mcfg::Ecam { base, segment: 0, bus_start: 0, bus_end: last }]);
     let roots = [Root { segment: 0, bus_start: 0, bus_end: last }];
-    let (a, b) = {
-        let _g = crate::CFG_LOCK.lock();
-        (enumerate(&space, &roots), enumerate(&cf8, &roots))
-    };
+    // As the kernel's own walk: `pci.cfg` per access, the lists made with no lock held.
+    let (a, b) = (enumerate(&crate::PerAccess(&space), &roots), enumerate(&crate::PerAccess(&cf8), &roots));
     kassert!(a.len() == b.len(), "ECAM found {} functions, 0xCF8 {}", a.len(), b.len());
     for (x, y) in a.iter().zip(&b) {
         kassert!(x.loc == y.loc && x.vendor == y.vendor && x.device == y.device && x.class == y.class, "{} differs", x.loc);
@@ -184,9 +180,9 @@ fn bars_restored() -> R {
     Ok(())
 }
 
-/// A function matched by an opt-in driver whose key is off: no sizing, no probe, writes refused, command
-/// register as the firmware left it.
-fn untouched_key_off() -> R {
+/// A function a rule holds (`optin::TEST_HELD`, matched by a test driver): no sizing, no probe, writes refused,
+/// command register as the firmware left it.
+fn untouched_held() -> R {
     let nodes = crate::tree();
     let Some(i) = find(&nodes, ICH9_SMBUS) else { return ktest::fail("no ICH9 SMBus (QEMU q35 only)") };
     let n = &nodes[i];
@@ -196,35 +192,36 @@ fn untouched_key_off() -> R {
     kassert!(f.bar(4).is_none());
     kassert!(!f.write32_ext(4, n.command_at_scan as u32 | 0x7), "write to an untouched function went through");
     kassert!(f.command() == n.command_at_scan, "command changed: {:#x} -> {:#x}", n.command_at_scan, f.command());
-    kassert!(UNTOUCHED_PROBES.load(Ordering::SeqCst) == 0, "opt-in driver probed without its key");
+    kassert!(UNTOUCHED_PROBES.load(Ordering::SeqCst) == 0, "a driver probed an untouched function");
     Ok(())
 }
 
-/// R8d: every wireless controller (and a bridge above only it) is untouched without `wlan=on`, its command
-/// register unchanged since the scan. On the Mini-PC: 04:00.0 and 00:02.2.
+/// R8d: under the Gaming-PC profile every wireless controller (and a bridge above only it) is held for good, its
+/// command register unchanged since the scan; elsewhere (the Mini-PC: 04:00.0 below 00:02.2) it is touched like
+/// any other function and its driver may bind.
 fn untouched_wlan() -> R {
     let nodes = crate::tree();
-    let is_wlan = |n: &Node| crate::optin::CORE_OPT_IN.iter().any(|(m, _)| m.hits(n.vendor, n.device, n.class));
+    let is_wlan = |n: &Node| crate::gp::is_wlan_class(n.class);
     if !nodes.iter().any(is_wlan) {
         return ktest::fail("no wireless controller");
     }
-    // The Mini-PC's usual CONFIG has wlan=on: then the opt-in is what this test sees.
-    if crate::registry::opted_in("wlan") {
+    let held = gp_platform::never_touch::Why::Wlan.key();
+    if !crate::gp::active() {
         for n in nodes.iter().filter(|n| is_wlan(n)) {
-            kassert!(n.untouched != Some("wlan"), "{}: wlan=on, still untouched", n.loc);
+            kassert!(n.untouched.is_none(), "{}: untouched by {:?} outside the Gaming-PC profile", n.loc, n.untouched);
         }
         return Ok(());
     }
     for (i, n) in nodes.iter().enumerate() {
         if is_wlan(n) {
-            kassert!(n.untouched == Some("wlan"), "{} not untouched", n.loc);
+            kassert!(n.untouched == Some(held), "{} not untouched", n.loc);
             // Its bridge, if it serves only the WLAN, is untouched too.
             if let Some(&p) = ancestors(&nodes, i).first() {
                 let only = nodes.iter().filter(|c| c.parent == Some(p)).all(|c| c.untouched.is_some());
-                kassert!(!only || nodes[p].untouched == Some("wlan"), "bridge {} above the WLAN touched", nodes[p].loc);
+                kassert!(!only || nodes[p].untouched.is_some(), "bridge {} above the WLAN touched", nodes[p].loc);
             }
         }
-        if n.untouched == Some("wlan") {
+        if n.untouched == Some(held) {
             kassert!(n.bars.is_none(), "{} sized", n.loc);
             let now = n.function().command();
             kassert!(now == n.command_at_scan, "{} command {:#x} -> {:#x}", n.loc, n.command_at_scan, now);
@@ -256,9 +253,19 @@ fn guard_storage_bar() -> R {
         .filter_map(|n| n.bars)
         .flat_map(|b| b.into_iter().flatten())
         .find(|b| matches!(b, Bar::Mem { .. }) && b.assigned());
-    let Some(bar) = bar else { return ktest::fail("no mass-storage memory BAR") };
-    let r = acpi::check_mem(bar.start(), 4);
-    kassert!(r == Err(acpi::guard::Refusal::StorageBar), "guard said {:?} for storage BAR {:#x}", r, bar.start());
+    let start = match bar {
+        Some(b) => b.start(),
+        // GP-GUARD: under `nvme_bind=off` no storage function is sized, so the guard takes the ranges from the
+        // headers. The test asks for the same ranges and expects the same refusal.
+        None => {
+            let read = |n: &Node, off: u8| n.function().read32(off);
+            let ranges = crate::guardview::storage_ranges_with(&nodes, Some(&read)).map_err(|_| "the untouched storage functions cannot be read")?;
+            let Some(r) = ranges.iter().find(|r| r.space == acpi::sdt::Space::Memory) else { return ktest::fail("no mass-storage memory BAR") };
+            r.start
+        }
+    };
+    let r = acpi::check_mem(start, 4);
+    kassert!(r == Err(acpi::guard::Refusal::StorageBar), "guard said {:?} for storage BAR {:#x}", r, start);
     Ok(())
 }
 

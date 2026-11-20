@@ -18,6 +18,7 @@ pub mod iface;
 mod kernel;
 mod phy;
 pub(crate) mod quickack;
+pub(crate) mod slots;
 pub(crate) mod sockets;
 pub mod tcp;
 pub mod udp;
@@ -148,6 +149,8 @@ pub struct Stack {
     seed: u64,
     /// Cards come from `netdev` (kernel) or are added by hand (host tests).
     auto_devices: bool,
+    /// A thread is making the cards of new `netdev` registrations (`sync_devices`).
+    adding: AtomicBool,
     /// The stack itself, once it has its final ('static) place: sockets keep a reference to it.
     me: ksync::OnceRef<Stack>,
     /// Fault injection (tests): this many buffer allocations fail as if memory were short ...
@@ -267,6 +270,7 @@ impl Stack {
             default_if: AtomicUsize::new(NO_IF),
             seed,
             auto_devices,
+            adding: AtomicBool::new(false),
             me: ksync::OnceRef::new(),
             inject_nomem: AtomicU32::new(0),
             inject_thread: AtomicU64::new(ANY_THREAD),
@@ -309,7 +313,9 @@ impl Stack {
         s.abort();
         let cap = self.kept_cap();
         let mut p = self.kept.lock();
-        if p.len() < cap {
+        // Never beyond the pool's room (`kept_room` makes it for the cap with no lock held): a push that grew
+        // the pool here would ask for pages under two spin locks.
+        if p.len() < cap.min(p.capacity()) {
             p.push(s);
             return;
         }
@@ -322,12 +328,20 @@ impl Stack {
     /// Frees idle kept sockets beyond the cap (a reserved listener went).
     pub(crate) fn trim_kept(&self) {
         let cap = self.kept_cap();
-        let extra: Vec<smoltcp::socket::tcp::Socket<'static>> = {
+        // The list for what goes is made before the lock (`split_off` made it under it: eight sockets are more
+        // than a page).
+        let mut extra: Vec<smoltcp::socket::tcp::Socket<'static>> = Vec::new();
+        loop {
             let mut p = self.kept.lock();
             let n = p.len().saturating_sub(cap);
-            let at = p.len() - n;
-            p.split_off(at)
-        };
+            if n <= extra.capacity() {
+                let at = p.len() - n;
+                extra.extend(p.drain(at..));
+                break;
+            }
+            drop(p);
+            extra.reserve_exact(n);
+        }
         self.kept_made.fetch_sub(extra.len(), Ordering::AcqRel);
         KEPT_FREED.add(extra.len() as u64);
         drop(extra);
@@ -344,6 +358,7 @@ impl Stack {
             return true;
         }
         let target = per_card.saturating_mul(self.ifaces.lock().len().max(1));
+        self.kept_room();
         let mut made = 0usize;
         let full = loop {
             {
@@ -368,13 +383,18 @@ impl Stack {
             let mut p = self.kept.lock();
             self.kept_pending.fetch_sub(1, Ordering::AcqRel);
             match s {
-                Ok(s) => {
+                // (Without room in the pool, which `kept_room` found no memory for, the spare goes again.)
+                Ok(s) if p.len() < p.capacity() => {
                     self.kept_made.fetch_add(1, Ordering::AcqRel);
                     KEPT_MADE.inc();
                     p.push(s);
                     made += 1;
                 }
-                Err(_) => break false,
+                r => {
+                    drop(p);
+                    drop(r);
+                    break false;
+                }
             }
         };
         if self.kept_short.swap(!full, Ordering::AcqRel) != !full {
@@ -387,6 +407,32 @@ impl Stack {
             }
         }
         full
+    }
+
+    /// The pool's list gets its room for the cap (it rises with a reserved listener or a card) with the lock
+    /// dropped, so `give_back` and the top-up never grow it under `net.kept`, which `give_back` takes under a
+    /// card's lock: eight sockets are more than a page. Nothing is allocated when the room is there (every
+    /// round asks). Without memory the pool keeps the room it has.
+    fn kept_room(&self) {
+        let mut spare = ksync::Spare::new();
+        loop {
+            let cap = self.kept_cap();
+            let mut p = self.kept.lock();
+            let more = cap.saturating_sub(p.len());
+            if spare.fits(&mut *p, more) {
+                return;
+            }
+            drop(p);
+            if spare.grow().is_err() {
+                NO_MEMORY.inc();
+                return;
+            }
+        }
+    }
+
+    /// Kept sockets one card may carry at most while the pool is all there is (`kept_want`).
+    pub(crate) fn kept_per_card(&self) -> usize {
+        self.kept_want.load(Ordering::Acquire)
     }
 
     fn kept_cap(&self) -> usize {
@@ -412,6 +458,7 @@ impl Stack {
         if on {
             self.kept_want.fetch_add(want, Ordering::AcqRel);
             self.kept_spare.fetch_add(iface::RESERVE_MIN, Ordering::AcqRel);
+            self.kept_room();
         } else {
             self.kept_want.fetch_sub(want, Ordering::AcqRel);
             self.kept_spare.fetch_sub(iface::RESERVE_MIN, Ordering::AcqRel);
@@ -475,18 +522,27 @@ impl Stack {
     /// Adds a card (host tests; the kernel's stack picks up `netdev` registrations itself). With `dhcp` false
     /// the card waits for `set_static`.
     pub fn add_device(&self, dev: Arc<dyn NetDevice>, dhcp: bool) -> usize {
-        let index = {
-            let mut l = self.ifaces.lock();
-            self.push_iface(&mut l, dev.clone(), dhcp);
-            l.len() - 1
-        };
+        let index = self.push_iface(dev.clone(), dhcp);
         self.added(&*dev, index, dhcp);
         index
     }
 
-    fn push_iface(&self, l: &mut Vec<Arc<Iface>>, dev: Arc<dyn NetDevice>, dhcp: bool) {
+    /// A card for `dev` at the end of the list; its index. The card is made before the list's lock is taken:
+    /// its buffers and socket table are pages, which the heap cannot promise under a spin lock. Under the
+    /// lock it only gets its place (it is not shared yet).
+    fn push_iface(&self, dev: Arc<dyn NetDevice>, dhcp: bool) -> usize {
+        // The index it will most likely get, for its seed (a card that lost a race keeps a neighbour's
+        // number in the seed; its MAC and the time still tell it apart).
+        let guess = self.ifaces.lock().len();
+        let mut card = Arc::new(Iface::new(guess, dev, self.now(), self.seed.wrapping_add(guess as u64), dhcp));
+        let mut l = self.ifaces.lock();
         let index = l.len();
-        l.push(Arc::new(Iface::new(index, dev, self.now(), self.seed.wrapping_add(index as u64), dhcp)));
+        if let Some(c) = Arc::get_mut(&mut card) {
+            c.index = index;
+        }
+        // (A pointer per card: the list itself never needs a page.)
+        l.push(card);
+        index
     }
 
     fn added(&self, dev: &dyn NetDevice, index: usize, dhcp: bool) {
@@ -496,26 +552,24 @@ impl Stack {
         self.kick();
     }
 
-    /// Cards the drivers registered since the last look (checked and added under one lock: no card twice).
+    /// Cards the drivers registered since the last look. One thread at a time makes them (no card twice), with
+    /// no spin lock held; a caller that finds another thread at it goes on with the cards that are there, as a
+    /// call a moment earlier would have (the poll thread never waits for a program's allocation, B4).
     fn sync_devices(&self) {
         if !self.auto_devices || crate::netdev::count() <= self.ifaces.lock().len() {
             return;
         }
-        let devs = crate::netdev::devices();
-        let new: Vec<(Arc<dyn NetDevice>, usize)> = {
-            let mut l = self.ifaces.lock();
-            let have = l.len();
-            devs.into_iter()
-                .skip(have)
-                .map(|d| {
-                    self.push_iface(&mut l, d.clone(), true);
-                    (d, l.len() - 1)
-                })
-                .collect()
-        };
-        for (d, i) in new {
-            self.added(&*d, i, true);
+        if self.adding.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let devs = crate::netdev::devices();
+        loop {
+            let have = self.ifaces.lock().len();
+            let Some(d) = devs.get(have) else { break };
+            let index = self.push_iface(d.clone(), true);
+            self.added(&**d, index, true);
+        }
+        self.adding.store(false, Ordering::Release);
     }
 
     /// A fixed address on card `name` instead of DHCP.
@@ -528,10 +582,17 @@ impl Stack {
         Ok(())
     }
 
-    /// Every card, including ones registered a moment ago (a socket call never misses a new card).
+    /// Every card, including ones registered since the last look. A card another thread is making right now
+    /// (`sync_devices`) is seen by the next call.
     fn iface_list(&self) -> Vec<Arc<Iface>> {
         self.sync_devices();
         self.ifaces.lock().clone()
+    }
+
+    /// In-kernel tests: every card's `Iface::table_info`.
+    #[cfg(target_os = "none")]
+    pub(crate) fn tables(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.iface_list().iter().map(|c| c.table_info()).collect()
     }
 
     fn routes(&self) -> (Vec<Arc<Iface>>, Vec<IfRoute>) {
@@ -626,6 +687,21 @@ impl Stack {
             return Err(NetError::NoMemory);
         }
         b.resize(n, v);
+        Ok(b)
+    }
+
+    /// An empty list with room for `n` entries, asked for like `buffer` (a card's larger socket table and the
+    /// lists beside it, `slots::Room`).
+    pub(crate) fn room<T>(&self, n: usize) -> Result<Vec<T>, NetError> {
+        let mut b = Vec::new();
+        if self.injected() {
+            NO_MEMORY_INJECTED.inc();
+            return Err(NetError::NoMemory);
+        }
+        if b.try_reserve_exact(n).is_err() {
+            NO_MEMORY.inc();
+            return Err(NetError::NoMemory);
+        }
         Ok(b)
     }
 
@@ -810,6 +886,7 @@ impl Poller {
             }
             for (q, s) in rep.accepted {
                 TCP_ACCEPTS.inc();
+                s.on_accepted();
                 let _ = q.push(s);
             }
         }

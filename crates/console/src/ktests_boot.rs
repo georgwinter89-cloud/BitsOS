@@ -53,7 +53,7 @@ ktest!("in.boot.draw", Safe, draw_private);
 /// the boot screen without a lock or an allocation and paints the text console with the line over the picture.
 /// The first line finds the VT busy (as when another CPU held it at the panic): the repaint is not lost, the next
 /// line paints it. QemuOnly (it ends the boot screen and writes over the screen); without a real boot screen
-/// (QEMU's default desktop=auto -> off) the state is pretended, so every QEMU run covers it.
+/// (QEMU's screens are smaller than the scene) the state is pretended, so every QEMU run covers it.
 fn emergency_shows_text() -> TestResult {
     let real = crate::bootscreen::active();
     if !real {

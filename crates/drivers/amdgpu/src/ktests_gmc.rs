@@ -296,7 +296,7 @@ fn starts() -> ktest::TestResult {
 }
 // INT-W28 post-integration made the fake chains here QemuOnly (52-121 KiB of stack in a release build, over MCP's
 // 64 KiB request thread). GX-7m2 boxed the chains' outcomes and owners and gave every engine stage its own frame:
-// at most 33 KiB with `ktest_stack=48` (29.10., release, QEMU; plan/notes/gx-GX-7m2.md): Safe again.
+// at most 33 KiB with `ktest_stack=48` (release, QEMU): Safe again.
 ktest::ktest!("gx.gmc.starts", Safe, starts);
 
 fn mmhub() -> ktest::TestResult {

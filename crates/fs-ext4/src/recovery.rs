@@ -1,5 +1,5 @@
-//! Journal replay at mount (`jbd2_journal_recover`, linux-6.6/fs/jbd2/recovery.c:286): three passes over
-//! the log from `s_start` like `do_one_pass` (:463). SCAN finds the last transaction with a valid commit
+//! Journal replay at mount (`jbd2_journal_recover`, linux-7.3.1/fs/jbd2/recovery.c:282): three passes over
+//! the log from `s_start` like `do_one_pass` (:588). SCAN finds the last transaction with a valid commit
 //! block, REVOKE collects the revoke records of those transactions, REPLAY hands each logged block that no
 //! later revoke covers and whose checksum holds to `put` (its home block, or a read-only mount's memory).
 //!

@@ -10,7 +10,7 @@
 //! storage work and storage work never runs at KernelRt. PC-3's `alloc_irqs` exists now, but the switch to MSI-X
 //! is an open US item (C1 left it for a wave with a Mini-PC check: it changes the keyboard's path): interrupter 0
 //! is prepared (IMOD set at start), the vector's handler is to call `Controller::interrupt`, which wakes the same
-//! thread, with the poller kept as the fallback (as nvme's `nvme_irq=off`). The hotplug worker (class Normal) sleeps until a port
+//! thread, with the poller kept for a controller without a vector (as nvme's). The hotplug worker (class Normal) sleeps until a port
 //! change, a hub report or a debounce deadline wakes it (at most `HOTPLUG_TICK_NS`).
 //!
 //! PCI (PC-2, V1 `xhcipci.asm` order): `disable_device` first (MSI/MSI-X and bus master off: a controller a
@@ -105,7 +105,13 @@ static CONTROLLERS: SpinLock<Vec<Arc<Xhci>>> = SpinLock::named("xhci.controllers
 static POLLER: ksync::Once<()> = ksync::Once::new();
 
 static MATCHES: [pci::Match; 1] = [pci::Match::Class { class: CLASS_XHCI, mask: 0xFF_FF_FF }];
-pci::pci_driver!(pci::DriverEntry { name: "xhci", matches: &MATCHES, opt_in_key: None, probe });
+pci::pci_driver!(pci::DriverEntry { name: "xhci", matches: &MATCHES, probe });
+
+/// GP-R3 (block's `usb_busy`): a running controller whose hotplug round has not settled is still bringing devices
+/// up (the rule of `ktests_isoch::settled`).
+fn enumerating() -> bool {
+    controllers().iter().any(|c| c.state() == crate::hc::State::Running && !c.settled())
+}
 
 pub fn is_xhci(f: &pci::PciFunction) -> bool {
     f.class == CLASS_XHCI
@@ -133,6 +139,17 @@ fn prepare_pci(f: &pci::PciFunction) -> Result<(), String> {
     f.enable_device(false).map(|_| ()).map_err(|e| format!("enable_device: {e:?}"))
 }
 
+/// BAR0 as the register window: address and size. The error is the probe's (PCI keeps it for the report page).
+pub(crate) fn register_window(bar0: Option<pci::Bar>) -> Result<(u64, u64), String> {
+    let Some(pci::Bar::Mem { phys, size, .. }) = bar0 else {
+        return Err("BAR0 is not a memory BAR".into());
+    };
+    if !(0x100..=BAR_MAX).contains(&size) {
+        return Err(format!("BAR0 size {size:#x} is not an xHCI register window"));
+    }
+    Ok((phys, size))
+}
+
 fn probe(f: &pci::PciFunction) -> Result<(), String> {
     let function = format!("{}", f.addr);
     let fail = |e: String| {
@@ -141,12 +158,7 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
         e
     };
     prepare_pci(f).map_err(fail)?;
-    let Some(pci::Bar::Mem { phys, size, .. }) = f.bar(0) else {
-        return Err(fail("BAR0 is not a memory BAR".into()));
-    };
-    if !(0x100..=BAR_MAX).contains(&size) {
-        return Err(fail(format!("BAR0 size {size:#x} is not an xHCI register window")));
-    }
+    let (phys, size) = register_window(f.bar(0)).map_err(fail)?;
     let io = hal::mmio::map_device(phys, size as usize, CacheType::Uncached).map_err(|e| fail(format!("map BAR0: {e:?}")))?;
     let env = KernelEnv { io, pci: f.clone() };
     let caps = Caps::parse(|o| env.read32(o), env.bar_len()).map_err(|e| fail(String::from(e)))?;
@@ -169,12 +181,13 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
         klog::event!(Debug, "usb", "xhci.protocol", ctrl = name.as_str(), usb = format!("{}.{:x}", p.major, p.minor),
             first_port = p.first_port, ports = p.ports, slot_type = p.slot_type, psic = p.psi.len(), psi = psi.join(" "));
     }
-    let c = Arc::new(Controller::new(name.clone(), env, caps, ext).with_quirks(quirks));
+    let c = Arc::new(Controller::new(name.clone(), env, caps, ext).with_quirks(quirks).with_timing(quirks::timing_for(f.vendor)));
     list.push(c.clone());
     PANIC_LIST.add(c.clone());
     drop(list);
     devmodel::register_quiesce(c.clone());
     crate::shutdown::register_once();
+    block::add_usb_busy(enumerating);
     // B4 (US-ev): the event ring and pipe reports (input) on KernelRt; transfer ends (usb-msd's callbacks) on a
     // Normal thread of their own, so input never waits behind storage and storage never runs at KernelRt.
     let t = c.clone();

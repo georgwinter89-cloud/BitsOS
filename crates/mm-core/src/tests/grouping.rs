@@ -101,6 +101,38 @@ fn an_unmovable_fallback_claims_a_pageblock_at_least_half_free() {
     b.check().unwrap();
 }
 
+/// W35 MM-2 (`group::NoClaim`): a run of kernel frames stolen out of a pageblock that cannot be claimed looks for
+/// one to claim once per batch, not once per frame, and frees end the wait.
+#[test]
+fn a_failed_claim_sweep_is_not_repeated_for_every_stolen_frame() {
+    let (b, _) = two_full_blocks(Kind::User);
+    for i in 0..100 {
+        b.free(B + i * 4 * PAGE, 0, Kind::User);
+    }
+    b.drain_all();
+    // Counted from here: filling the pool may have swept for the program frames (another type's memory).
+    let s0 = b.reports().sweeps.load(Relaxed);
+    let sweeps = |b: &Buddy| b.reports().sweeps.load(Relaxed) - s0;
+    let batch = crate::pcp::BATCH as u64;
+    // Asked of the zone the two pageblocks lie in: the empty Normal zone would count a sweep of its own.
+    for n in 1..=batch {
+        let p = b.alloc(0, Zone::Dma32, Kind::Other).unwrap();
+        assert!((B..B + 2 * MIB).contains(&p));
+        assert_eq!((steals(&b), sweeps(&b), claims(&b)), (n, 1, 0), "100 of 512 free: stolen, one sweep for the batch");
+    }
+    b.alloc(0, Zone::Dma32, Kind::Other).unwrap();
+    assert_eq!((steals(&b), sweeps(&b)), (batch + 1, 2), "the next batch looks again");
+    // 300 frames of A come free: more than a batch of frees, so the very next kernel frame looks and claims A.
+    for i in 0..300 {
+        b.free(A + i * PAGE, 0, Kind::User);
+    }
+    b.drain_all();
+    let p = b.alloc(0, Zone::Dma32, Kind::Other).unwrap();
+    assert!((A..B).contains(&p), "{p:#x}");
+    assert_eq!((b.pageblock_type(A), claims(&b), steals(&b), sweeps(&b)), (Some(UNMOV), 1, batch + 1, 3));
+    b.check().unwrap();
+}
+
 #[test]
 fn small_movable_fallbacks_steal_and_large_ones_claim() {
     let (b, _) = two_full_blocks(Kind::Other);

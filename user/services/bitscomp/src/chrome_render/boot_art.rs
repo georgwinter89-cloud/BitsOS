@@ -1,7 +1,6 @@
 //! DS-5: the boot scene's pieces, made at run time the way crates/console/build.rs makes the kernel's (same font
 //! files, sizes, fontdue calls, ring maths), and the integer blitters of crates/console/src/bootart.rs. bitscomp is
-//! its own workspace without the kernel crates, so this is a re-implementation; `boot_tests` pins its numbers and
-//! host/tests/ds/60-boot.sh compares it with the kernel's picture.
+//! its own workspace without the kernel crates, so this is a re-implementation; `boot_tests` pins its numbers.
 
 use std::collections::HashMap;
 

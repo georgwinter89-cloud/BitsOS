@@ -11,7 +11,7 @@
 use crate::view::{open, ConnHandle};
 use crate::{dns, IpAddr, NetProto, Subject};
 use alloc::collections::BTreeMap;
-use ksync::SpinLock;
+use ksync::Mutex;
 
 const KEEP: usize = 64;
 
@@ -28,12 +28,16 @@ struct Peers {
 pub struct UdpPeers {
     owner: Subject,
     local_port: u16,
-    peers: SpinLock<Peers>,
+    /// A sleeping lock: a new peer's entry is opened under it (`open` makes the view's records and may double
+    /// its lists, pages long; under a spin lock the heap may not reclaim, ATOMIC-3). Its holders are the socket
+    /// calls of `net::stack::udp` (a program's send and receive, the kernel's DHCP and DNS), all in thread
+    /// context with no spin lock held, which a mutex demands of them anyway.
+    peers: Mutex<Peers>,
 }
 
 impl UdpPeers {
     pub const fn new(owner: Subject, local_port: u16) -> UdpPeers {
-        UdpPeers { owner, local_port, peers: SpinLock::named("policy.udp", Peers { map: BTreeMap::new(), more: None }) }
+        UdpPeers { owner, local_port, peers: Mutex::named("policy.udp", Peers { map: BTreeMap::new(), more: None }) }
     }
 
     /// A datagram of `len` bytes went to `to:port`.

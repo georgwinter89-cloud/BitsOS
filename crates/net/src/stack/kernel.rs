@@ -52,7 +52,7 @@ fn timer_fired(_: usize) {
     }
 }
 
-/// The poll thread. While some card is polled (no MSI, `net_irq=off`, a stormed line), it looks at the cards every
+/// The poll thread. While some card is polled (no MSI, a stormed line), it looks at the cards every
 /// 50 µs while traffic flows and every 500 µs when quiet. Once every card is interrupt-driven (NW-4: their
 /// hard-IRQ hooks call `netdev::irq_wake`), it sleeps until a wake, smoltcp's next deadline or the safety look
 /// (`IRQ_SAFETY_NS`, catches a lost interrupt as Linux igc's watchdog does with EICS). smoltcp's deadlines

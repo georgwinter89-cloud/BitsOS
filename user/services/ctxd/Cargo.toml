@@ -2,15 +2,22 @@
 name = "ctxd"
 version = "0.1.0"
 edition = "2024"
-description = "BitsOS context service prototype (CX-1): context instead of folders"
+description = "BitsOS context service (CX-1 prototype, CX-5 on V2): context instead of folders"
 publish = false
 
-# Own workspace: ctxd is built on its own (CachyOS prototype, later static musl for V2);
+# Own workspace: ctxd is built on its own (CachyOS and static musl for V2, host/xtask/src/image.rs builds it);
 # the user/ workspace manifest stays untouched.
 [workspace]
 
+# C1: the shipped build has no test knobs. `test-knobs` turns on the fake embedder and the CTXD_TEST_*
+# variables; the integration tests turn it on through the dev-dependency on this very package below.
+[features]
+test-knobs = []
+
 # Exact pins (CX-1 notes list them; downloads covered by Georg's OK of 15.10.).
 [dependencies]
+# The only unsafe code (raw system calls: SCHED_IDLE, peer credentials), no dependencies of its own.
+usys = { path = "../../tools/usys" }
 blake3 = "=1.8.7"
 encoding_rs = "=0.8.42"
 inotify = { version = "=0.11.0", default-features = false }
@@ -25,6 +32,9 @@ tantivy = { version = "=0.26.2", default-features = false, features = ["mmap", "
 toml = "=1.1.8"
 unicode-normalization = "=0.1.25"
 zip = { version = "=9.3.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+ctxd = { path = ".", features = ["test-knobs"] }
 
 [profile.release]
 opt-level = 3

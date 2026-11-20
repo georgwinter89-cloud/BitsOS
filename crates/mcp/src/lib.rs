@@ -20,6 +20,9 @@
 //! MC-8a: the protocol code (HTTP head, JSON, JSON-RPC answers, the argument check) lives in `mcp_wire`, shared
 //! with the user-space MCP service bitsmcp; the kernel's narrow interface for that service is the gate
 //! (`gate`, `/dev/bitsos/mcp`), armed under CONFIG.TXT `mcp=both|service` (default `kernel`: today's server only).
+//! MC-L: `/run/bitsos/tools.sock` (`local`): a local program (the assistant) lists and calls the tools marked
+//! `local` (`ToolEntry::local`, `mcp_tool!(... local: true ...)`), judged by the kernel (SO_PEERCRED and the
+//! peer's executable); everything else stays behind the network side.
 #![cfg_attr(target_os = "none", no_std)]
 #![forbid(unsafe_code)]
 
@@ -38,6 +41,8 @@ pub mod gate;
 pub mod host;
 pub use mcp_wire::{http, json};
 mod kernel;
+/// MC-L: `/run/bitsos/tools.sock`, the local door to the tools marked `local`.
+pub mod local;
 pub mod png;
 pub mod rpc;
 pub mod server;
@@ -48,7 +53,7 @@ pub mod testclient;
 pub mod tools;
 mod worker;
 
-pub use boot::{BootFacts, facts as boot_facts, reason_name, running_reason_with, set_boot_info, set_running_kernel_id};
+pub use boot::{BootFacts, facts as boot_facts, reason_name, running_reason_with, set_boot_info, set_report_source, set_running_kernel_id};
 pub use calls::{AfterAnswer, DEFAULT_GRACE_MS, KEEP_NS, MAX_GRACE_MS, OUTPUT_KEEP, ProcessTools, StopTarget, set_process_tools};
 pub use kernel::{KernelEnv, start_kernel};
 pub use server::{Env, ServerConfig, ServerHandle, SpawnFailed, StartError, ThreadKind, start, start_with};
@@ -82,6 +87,9 @@ pub struct ToolEntry {
     /// Lane or service that owns the back end (B5), e.g. "RB", "PC", "kernel".
     pub owner: &'static str,
     pub safety: Safety,
+    /// MC-L: offered on the local tools socket (`local`, `/run/bitsos/tools.sock`) too. Only for tools that tell
+    /// what a program of uid 1000 can read from /proc, /sys or the settings anyway; the network side ignores it.
+    pub local: bool,
     pub handler: fn(&ToolContext, &Json) -> ToolResult,
 }
 
@@ -91,11 +99,15 @@ kreg::declare!(pub TOOLS: ToolEntry = "mcptool");
 pub use kreg as __kreg;
 
 /// `mcp::mcp_tool!(name: "log", owner: "RB", safety: Read, description: "...", schema: "{...}", handler: f);`
+/// `local: true` after `safety` also offers the tool on the local tools socket (MC-L; default false).
 #[macro_export]
 macro_rules! mcp_tool {
     (name: $name:literal, owner: $owner:literal, safety: $safety:ident, description: $desc:literal, schema: $schema:literal, handler: $h:path $(,)?) => {
+        $crate::mcp_tool!(name: $name, owner: $owner, safety: $safety, local: false, description: $desc, schema: $schema, handler: $h);
+    };
+    (name: $name:literal, owner: $owner:literal, safety: $safety:ident, local: $local:literal, description: $desc:literal, schema: $schema:literal, handler: $h:path $(,)?) => {
         $crate::__kreg::register!("mcptool", $crate::ToolEntry, $crate::ToolEntry {
-            name: $name, description: $desc, input_schema: $schema, owner: $owner, safety: $crate::Safety::$safety, handler: $h,
+            name: $name, description: $desc, input_schema: $schema, owner: $owner, safety: $crate::Safety::$safety, local: $local, handler: $h,
         });
     };
 }
@@ -159,6 +171,7 @@ mcp_tool!(
     name: "version",
     owner: "MC",
     safety: Read,
+    local: true,
     description: "Kernel name and version; the second line names this start (Reload counter, generation, boot id).",
     schema: r#"{"type":"object","properties":{}}"#,
     handler: version,

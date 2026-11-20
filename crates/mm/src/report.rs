@@ -24,6 +24,7 @@ fn start() -> Result<(), &'static str> {
                 continue;
             }
             last = time::now_ns();
+            crate::scatter::age();
             mm_core::flush_reports();
             crate::tlb::report();
             crate::commit::report();

@@ -10,7 +10,7 @@
 //! flush_vm_hub :194 (engine 17; MMHUB takes the engine's semaphore first, :221-235), amdgpu_gart.c:296-318
 //! (unbound entries point at the dummy page with no flags), amdgpu_gmc.c:127 pd_addr.
 //!
-//! Where BitsOS differs (gx-GX-7h.md):
+//! Where BitsOS differs (plan/spec/gpu.md §11.4):
 //! - GC is on first (the GFX stage ran): GFXHUB registers read all ones before; Linux programs MMHUB before PSP.
 //! - The GART window is where Linux 7.1 put it on the 780M (the capture: 512 MiB at 0x7FFF_0000_0000, high below
 //!   the hole) and AGP is off (AGP_BOT 0xFFFFFF, TOP 0), as in the capture; 6.6 would place both elsewhere.

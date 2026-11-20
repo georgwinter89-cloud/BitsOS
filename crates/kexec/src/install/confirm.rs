@@ -9,6 +9,19 @@
 //! "MCP answered" is read from a klog counter (no lock, no dependency on the MCP crate's internals): MC's
 //! `mcp.answered` (authenticated requests answered; change request in the RB-6 notes) when the kernel has it,
 //! else `mcp.requests` (every request MCP answered, refusals included: the server and the network work).
+//!
+//! UPDATE (Georg 15.11.: an update he starts himself must not depend on the remote desk): the desktop confirms
+//! too (`DesktopWatch`). The confirmation's purpose is "this version works well enough to reach and use the
+//! machine"; MCP proves the remote lifeline, the desktop proves the local one: a program has held the screen
+//! without a break (`fbdev.takes`/`fbdev.releases`) for the whole proof time, and Georg's real input reached a
+//! reader that takes physical input only (`input.physical_read`, the compositor's way of reading the devices;
+//! MCP's injected keys never count) in at least `DESKTOP_INPUTS` samples spread over half of it. Whichever proof
+//! is done first writes `OK`; a version that brings up neither falls back as before. Only a numbered version in
+//! its own slot (what the update page and `bitsupdate` install) has the desktop proof (`desktop_proof_for`): a
+//! development build the desk installs over MCP keeps MCP as its only proof, as before UPDATE.
+//!
+//! VB-1: Georg's own "Ja" (`confirm_ask`) is the third proof, taken at the next sample (`by=georg`), for the same
+//! versions the desktop proof counts for.
 
 use super::{Confirmed, FatStick, LOCK, confirm_on};
 use alloc::format;
@@ -27,6 +40,108 @@ const TRIES: u32 = 20;
 
 /// The counters that say "MCP answered", best first.
 pub const COUNTERS: &[&str] = &["mcp.answered", "mcp.requests"];
+
+/// UPDATE: the counters of the desktop proof (gopfb's screen holds, console's physical input handed to readers).
+pub const SCREEN_TAKES: &str = "fbdev.takes";
+pub const SCREEN_RELEASES: &str = "fbdev.releases";
+pub const PHYSICAL_INPUT: &str = "input.physical_read";
+/// Samples with new real input the desktop proof needs (one stray key at boot proves nothing).
+pub const DESKTOP_INPUTS: u32 = 3;
+
+/// The desktop proof rule (pure, see the module text): `sample` returns true once the screen was held by the same
+/// hold (the takes count unchanged, more takes than releases) for `need_ns`, and real input rose in at least
+/// `DESKTOP_INPUTS` samples of that hold whose first and last lie at least `need_ns / 2` apart. A release or a new
+/// take starts it again; input counted before the hold began does not count.
+#[derive(Clone, Copy, Debug)]
+pub struct DesktopWatch {
+    pub need_ns: u64,
+    hold: Option<(u64, u64)>,
+    last_input: Option<u64>,
+    rises: u32,
+    first_rise: Option<u64>,
+    last_rise: Option<u64>,
+    proven: bool,
+    /// How often a lost or new hold started it again.
+    pub restarts: u32,
+}
+
+impl DesktopWatch {
+    pub fn new(need_ns: u64) -> Self {
+        DesktopWatch { need_ns, hold: None, last_input: None, rises: 0, first_rise: None, last_rise: None, proven: false, restarts: 0 }
+    }
+    /// One sample; true once proven (and from then on). The proof is judged after the sample is taken in: a hold
+    /// that ended since the last sample proves nothing.
+    pub fn sample(&mut self, now_ns: u64, takes: u64, releases: u64, input: u64) -> bool {
+        if self.proven {
+            return true;
+        }
+        let held = takes > releases;
+        let same = self.hold.is_some_and(|(t, _)| t == takes);
+        if !held || !same {
+            if self.hold.is_some() {
+                self.restarts += 1;
+            }
+            self.hold = held.then_some((takes, now_ns));
+            self.rises = 0;
+            self.first_rise = None;
+            self.last_rise = None;
+        } else if self.last_input.is_some_and(|l| input > l) {
+            self.rises += 1;
+            self.first_rise.get_or_insert(now_ns);
+            self.last_rise = Some(now_ns);
+        }
+        self.last_input = Some(input);
+        self.proven = self.done(now_ns);
+        self.proven
+    }
+    fn done(&self, now_ns: u64) -> bool {
+        let (Some((_, since)), Some(f), Some(l)) = (self.hold, self.first_rise, self.last_rise) else { return false };
+        now_ns.saturating_sub(since) >= self.need_ns && self.rises >= DESKTOP_INPUTS && l.saturating_sub(f) >= self.need_ns / 2
+    }
+    /// How long the screen has been held so far without a break.
+    pub fn held_ns(&self, now_ns: u64) -> u64 {
+        self.hold.map_or(0, |(_, s)| now_ns.saturating_sub(s))
+    }
+    pub fn rises(&self) -> u32 {
+        self.rises
+    }
+}
+
+/// Whether the desktop proof may confirm generation `generation` run by a kernel of version `version` (pure). A
+/// numbered version in its own slot: an update Georg starts, which must not depend on the remote desk. Not a
+/// development build (`version` 0): the desk installs those over MCP to try them, and their only lifeline is MCP;
+/// one whose MCP or network is broken must fall back by itself even while Georg uses the desktop.
+pub fn desktop_proof_for(version: u32, generation: u32) -> bool {
+    version != 0 && version == generation
+}
+
+/// Both proofs of one boot (pure): `sample` returns which one is done first (`"mcp"` or `"desktop"`).
+#[derive(Clone, Copy, Debug)]
+pub struct Proofs {
+    pub mcp: Watch,
+    /// None: this kernel has no desktop proof (`desktop_proof_for`).
+    pub desktop: Option<DesktopWatch>,
+}
+
+impl Proofs {
+    pub fn new(need_ns: u64, version: u32, generation: u32) -> Self {
+        Proofs { mcp: Watch::new(need_ns), desktop: desktop_proof_for(version, generation).then(|| DesktopWatch::new(need_ns)) }
+    }
+    pub fn sample(&mut self, now_ns: u64, answers: u64, takes: u64, releases: u64, input: u64) -> Option<&'static str> {
+        if self.mcp.sample(now_ns, answers) {
+            return Some("mcp");
+        }
+        let d = self.desktop.as_mut()?;
+        d.sample(now_ns, takes, releases, input).then_some("desktop")
+    }
+}
+
+/// The desktop proof's progress for the update page: (screen held s, samples with real input).
+static DESKTOP: ksync::SpinLock<(u64, u32)> = ksync::SpinLock::named("kexec.confirm_desk", (0, 0));
+
+pub fn desktop_progress() -> (u64, u32) {
+    *DESKTOP.lock()
+}
 
 /// Longest silence the proof tolerates: a quarter of the proof time, at least three samples, at most 30 s. A
 /// longer pause between two answers starts the proof again (an answer at boot and a stray one two minutes later
@@ -159,6 +274,11 @@ fn counter() -> Option<(&'static str, u64)> {
     None
 }
 
+/// One counter's value (0 when this kernel has none: the desktop proof then never completes).
+fn value(name: &str) -> u64 {
+    klog::metrics::snapshot().find(|(n, _)| *n == name).map_or(0, |(_, v)| v)
+}
+
 fn need_ns() -> u64 {
     let s = crate::boot::config("boot_confirm_s").and_then(|v| v.parse::<u64>().ok()).unwrap_or(DEFAULT_S);
     s.clamp(MIN_S, MAX_S) * SEC
@@ -199,58 +319,119 @@ fn write(n: u32) -> Result<bool, String> {
 }
 
 fn run(n: u32, need: u64) {
-    let mut w = Watch::new(need);
+    super::confirm_ask::watch_began(time::now_ns());
+    let mut p = Proofs::new(need, bitsver::NUMBER, n);
+    if p.desktop.is_none() {
+        klog::event!(Info, "kexec", "boot.confirm_mcp_only", generation = n, version = bitsver::NUMBER;
+            "a development build (or a version outside its own slot): only MCP confirms it");
+    }
+    // VB-1: a write that fails after Georg's "Ja" voids the answer and the watch waits again (the question comes
+    // back); a write after a proof that fails ends the watch as before.
+    while wait(&mut p, n, need) {
+        match write_all(n) {
+            Written::Done => return,
+            Written::Failed(why) if super::confirm_ask::taken(n) => {
+                super::confirm_ask::answer_lost(n);
+                let name = counter().map_or("", |c| c.0);
+                {
+                    let mut s = STATUS.lock();
+                    if !matches!(*s, Status::Writing { .. }) {
+                        return;
+                    }
+                    *s = Status::Pending { generation: n, covered_s: p.mcp.covered_ns() / SEC, need_s: need / SEC, counter: name };
+                }
+                klog::event!(Warn, "kexec", "boot.confirm_answer_lost", generation = n, reason = why.as_str();
+                    "OK could not be written after Georg's Ja: the question stands again and the watch goes on");
+            }
+            Written::Failed(why) => {
+                klog::event!(Error, "kexec", "boot.confirm_failed", generation = n, reason = why.as_str();
+                    "never confirmed: the next boot starts the newest confirmed generation");
+                set(Status::Failed { generation: n, why });
+                return;
+            }
+        }
+    }
+}
+
+enum Written {
+    /// Confirmed, already OK, or replaced meanwhile: the watch is over.
+    Done,
+    Failed(String),
+}
+
+/// The watch until a proof or Georg's answer: true when OK is to be written (the status is Writing then).
+fn wait(p: &mut Proofs, n: u32, need: u64) -> bool {
     loop {
         sched::sleep_ns(SAMPLE_NS);
         let Some((name, count)) = counter() else {
             set(Status::Failed { generation: n, why: String::from("no MCP counter in this kernel") });
             klog::event!(Error, "kexec", "boot.confirm_failed", generation = n, reason = "no MCP counter");
-            return;
+            return false;
         };
-        let restarts = w.restarts;
-        let proven = w.sample(time::now_ns(), count);
+        let now = time::now_ns();
+        let restarts = p.mcp.restarts;
+        let input = value(PHYSICAL_INPUT);
+        let by = p.sample(now, count, value(SCREEN_TAKES), value(SCREEN_RELEASES), input);
+        let w = &p.mcp;
+        if by.is_none() && super::confirm_ask::taken(n) {
+            klog::event!(Info, "kexec", "boot.confirm_proof", generation = n, by = "georg", covered_s = w.covered_ns() / SEC;
+                "Georg said yes at the machine with a real key or click");
+            super::confirm_ask::note_by("georg");
+            break;
+        }
         if w.restarts != restarts {
             klog::event!(Warn, "kexec", "boot.confirm_gap", generation = n, gap_s = w.gap_ns / SEC, answers = count;
                 "MCP was silent longer than the proof allows: the proof starts again");
         }
-        if proven {
-            klog::event!(Info, "kexec", "boot.confirm_proof", generation = n, covered_s = w.covered_ns() / SEC, counter = name, answers = count;
+        if by == Some("mcp") {
+            klog::event!(Info, "kexec", "boot.confirm_proof", generation = n, by = "mcp", covered_s = w.covered_ns() / SEC, counter = name, answers = count;
                 "MCP answered over the whole proof time");
+            super::confirm_ask::note_by("mcp");
             break;
+        }
+        if let Some(d) = &p.desktop {
+            *DESKTOP.lock() = (d.held_ns(now) / SEC, d.rises());
+            if by == Some("desktop") {
+                klog::event!(Info, "kexec", "boot.confirm_proof", generation = n, by = "desktop", held_s = d.held_ns(now) / SEC, input_samples = d.rises(), input = input;
+                    "the desktop held the screen over the whole proof time and Georg's real input reached it");
+                super::confirm_ask::note_by("desktop");
+                break;
+            }
         }
         // Only a Pending status is updated: an install that replaced the generation ends the watch.
         let mut s = STATUS.lock();
         if !matches!(*s, Status::Pending { .. }) {
-            return;
+            return false;
         }
         *s = Status::Pending { generation: n, covered_s: w.covered_ns() / SEC, need_s: need / SEC, counter: name };
     }
-    {
-        let mut s = STATUS.lock();
-        if !matches!(*s, Status::Pending { .. }) {
-            return;
-        }
-        *s = Status::Writing { generation: n };
+    let mut s = STATUS.lock();
+    if !matches!(*s, Status::Pending { .. }) {
+        return false;
     }
+    *s = Status::Writing { generation: n };
+    true
+}
+
+/// OK for `n`, with `TRIES` tries.
+fn write_all(n: u32) -> Written {
     for t in 1..=TRIES {
         // An install in this boot may have replaced the generation while this waited (note_replaced).
         if !matches!(status(), Status::Writing { .. }) {
-            return;
+            return Written::Done;
         }
         match write(n) {
-            Ok(_) => return,
+            Ok(_) => return Written::Done,
             Err(why) => {
                 klog::event!(Warn, "kexec", "boot.confirm_retry", generation = n, attempt = t, reason = why.as_str());
                 if t == TRIES {
-                    klog::event!(Error, "kexec", "boot.confirm_failed", generation = n, reason = why.as_str();
-                        "never confirmed: the next boot starts the newest confirmed generation");
-                    set(Status::Failed { generation: n, why });
-                    return;
+                    return Written::Failed(why);
                 }
                 sched::sleep_ns(RETRY_NS);
             }
         }
     }
+    Written::Done
 }
 
 /// An install in this boot removed generation `n` (the watch ends without writing anything).

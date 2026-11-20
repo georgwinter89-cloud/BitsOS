@@ -150,6 +150,63 @@ fn every_captured_answer_is_linuxs() {
     }
 }
 
+/// GP-GPU1 (plan/spec/gpu-rdna4.md piece 19): the RX 9070 XT's profile answers what Linux 7.3.1 answered on the card, byte for byte,
+/// for every chip-data query of the capture. 0x19 (MEMORY) and 0x14 (VRAM_GTT) are that boot's memory use: their sizes
+/// are checked, their use numbers are not chip data (GTT in use beyond the driver's has no place in the fake).
+#[test]
+fn rx_9070xt_profile_answers_as_the_card_did() {
+    const CARD: &str = include_str!("../../../host/tests/dr/fixtures/9070xt-info.txt");
+    let fx = Fx::with(FakeGpu::radeon_9070xt());
+    let all: Vec<(u32, [u32; 4], u32, Vec<u8>)> = CARD
+        .lines()
+        .filter(|l| l.starts_with("Q "))
+        .map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let a: Vec<u32> = w[2].trim_start_matches("a=").split(',').map(|x| x.parse().unwrap()).collect();
+            let (sz, data) = w[3].trim_start_matches("sz=").split_once(':').unwrap();
+            (u32::from_str_radix(w[1].trim_start_matches("0x"), 16).unwrap(), [a[0], a[1], a[2], a[3]], sz.parse().unwrap(), hex(data))
+        })
+        .collect();
+    assert_eq!(all.len(), 20);
+    let mut chip = 0;
+    for (q, a, sz, want) in all {
+        let m = Mem::new();
+        assert_eq!(fx.info(&m, q, a, sz), Ok(0), "query {q:#x} {a:?}");
+        let got = m.get(OUT, sz as usize);
+        match q {
+            // Linux 7.3.1's struct is 440 bytes (it ends at userq_ip_mask); the capture's last 8 are the tool's fill.
+            AMDGPU_INFO_DEV_INFO => {
+                assert_eq!(got[..440], want[..440], "DEV_INFO");
+                assert_eq!(want[440..], [0xa5; 8]);
+                chip += 1;
+            }
+            AMDGPU_INFO_MEMORY => {
+                // total, usable, (use), max allocation of vram, cpu-accessible vram and gtt: all but the two use fields.
+                for f in (0..12).filter(|f| ![2, 6, 10].contains(f)) {
+                    assert_eq!(got[f * 8..f * 8 + 8], want[f * 8..f * 8 + 8], "MEMORY field {f}");
+                }
+                assert_eq!(got[16..24], want[16..24], "vram in use as seen");
+            }
+            AMDGPU_INFO_VRAM_GTT => assert_eq!(got, want, "VRAM_GTT"),
+            _ => {
+                assert_eq!(got, want, "query {q:#x} {a:?}");
+                chip += 1;
+            }
+        }
+    }
+    assert_eq!(chip, 18);
+    // GB_ADDR_CONFIG as libdrm read it (gb_addr_cfg=0x8200545), and soc24's two SDMA status registers are allowed.
+    let m = Mem::new();
+    assert_eq!(fx.info(&m, AMDGPU_INFO_READ_MMR_REG, [0x263e, 1, 0xffff_ffff, 0], 4), Ok(0));
+    assert_eq!(m.u32(OUT), 0x0820_0545);
+    for r in [0x1284, 0x1884] {
+        assert_eq!(fx.info(&m, AMDGPU_INFO_READ_MMR_REG, [r, 1, 0xffff_ffff, 0], 4), Ok(0), "SDMA status {r:#x}");
+    }
+    // The same constants rdna4-core tested against the capture (its `devinfo`).
+    let d = crate::profile_9070xt::RADEON_9070XT.dev_info;
+    assert_eq!((d.device_id, d.family, d.cu_active_number, d.num_rb_pipes, d.pcie_gen), (0x7550, 152, 64, 16, 5));
+}
+
 #[test]
 fn scalars_mesa_reads() {
     let fx = Fx::new();
@@ -197,7 +254,10 @@ fn scalars_mesa_reads() {
     assert_eq!(fx.info(&m, AMDGPU_INFO_SENSOR, [AMDGPU_INFO_SENSOR_GPU_TEMP, 0, 0, 0], 4), Ok(0));
     assert_eq!(m.u32(OUT), 39_000);
     assert_eq!(fx.info(&m, AMDGPU_INFO_SENSOR, [AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_SCLK, 0, 0, 0], 4), Err(EINVAL));
-    assert_eq!(fx.info(&m, AMDGPU_INFO_SENSOR, [0xc, 0, 0, 0], 4), Err(EINVAL));
+    // GPU_INPUT_POWER (Linux 7.3.1 amdgpu_kms.c:1217): the current socket power in W.
+    assert_eq!(fx.info(&m, AMDGPU_INFO_SENSOR, [AMDGPU_INFO_SENSOR_GPU_INPUT_POWER, 0, 0, 0], 4), Ok(0));
+    assert_eq!(m.u32(OUT), 9);
+    assert_eq!(fx.info(&m, AMDGPU_INFO_SENSOR, [0xd, 0, 0, 0], 4), Err(EINVAL));
     // TIMESTAMP counts up at about 100 MHz.
     assert_eq!(fx.info(&m, AMDGPU_INFO_TIMESTAMP, [0; 4], 8), Ok(0));
     let t0 = m.u64(OUT);

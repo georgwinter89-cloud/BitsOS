@@ -115,7 +115,12 @@ pub fn missing(boot: &[u8], handed: &[u8]) -> Vec<&'static str> {
 }
 
 /// Whether a Reload that loses `lost` must be refused without `force`: it may take the machine off the network, with
-/// nobody at it. The token is MCP's way in; the passphrase counts where WLAN is on.
-pub fn loss_blocks_reload(lost: &[&str], wlan_on: bool) -> bool {
-    lost.iter().any(|k| *k != "wlan_psk" || wlan_on)
+/// nobody at it. The token is MCP's way in; the passphrase counts where the machine joins a WLAN.
+pub fn loss_blocks_reload(lost: &[&str], wlan_used: bool) -> bool {
+    lost.iter().any(|k| *k != "wlan_psk" || wlan_used)
+}
+
+/// The machine joins a WLAN: CONFIG names one (`wlan_ssid`; the passphrase itself is a take-once secret).
+pub fn wlan_used() -> bool {
+    pci::registry::config_value("wlan_ssid").is_some_and(|v| !v.trim().is_empty())
 }

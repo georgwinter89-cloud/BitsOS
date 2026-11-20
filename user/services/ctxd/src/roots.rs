@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 const WINDOWS_FS: &[&str] =
     &["ntfs", "ntfs3", "ntfs-3g", "fuseblk", "fuse.ntfs", "fuse.ntfs-3g", "exfat", "vfat", "msdos", "fat"];
 /// Places where removable and foreign disks, and the EFI partition, get mounted on CachyOS.
+/// On V2 the stick is /boot (FAT, refused by its type too) and the Windows partitions are never mounted; the
+/// system service adds /apps, /proc, /sys, /dev and /run (system.rs).
 const FORBIDDEN_PREFIXES: &[&str] = &["/run/media", "/media", "/boot", "/efi"];
 /// Partition types of Windows and EFI partitions (GPT type GUIDs and MBR ids as udev reports them).
 const WINDOWS_PARTS: &[&str] = &[
@@ -253,8 +255,10 @@ pub struct Scan {
     pub errors: u64,
 }
 
-/// Walk every root (explicit stack, no recursion). Files above `max_bytes` are counted, not listed.
-pub fn scan(roots: &[Root], excludes: &[String], max_bytes: u64) -> Scan {
+/// Walk every root (explicit stack, no recursion). Every file is listed, however many (DECISIONS 18.11.: no fixed
+/// limits; the run's memory grows with the files, as a Linux indexer's does); files above `max_bytes` are counted,
+/// not listed; folders in `skip` (and below) are never entered.
+pub fn scan(roots: &[Root], excludes: &[String], max_bytes: u64, skip: &[PathBuf]) -> Scan {
     let mut s = Scan::default();
     for (ri, root) in roots.iter().enumerate() {
         let mut stack = vec![root.path.clone()];
@@ -293,7 +297,9 @@ pub fn scan(roots: &[Root], excludes: &[String], max_bytes: u64) -> Scan {
                     s.other_fs += 1;
                 } else if ft.is_dir() {
                     // A nested root is walked as itself (its own privacy flag).
-                    if !roots.iter().enumerate().any(|(j, r)| j != ri && r.path == path) {
+                    if skip.iter().any(|k| path.starts_with(k)) {
+                        s.excluded += 1;
+                    } else if !roots.iter().enumerate().any(|(j, r)| j != ri && r.path == path) {
                         stack.push(path);
                     }
                 } else if ft.is_file() {
@@ -323,6 +329,22 @@ pub fn scan(roots: &[Root], excludes: &[String], max_bytes: u64) -> Scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_file_is_listed_in_path_order() {
+        let tmp = std::env::temp_dir().join(format!("ctxd-all-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("sub")).unwrap();
+        for i in 0..7 {
+            fs::write(tmp.join(if i % 2 == 0 { format!("a{i}.txt") } else { format!("sub/b{i}.txt") }), "x").unwrap();
+        }
+        let dev = fs::metadata(&tmp).unwrap().dev();
+        let root = Root { path: tmp.clone(), private: false, dev };
+        let s = scan(&[root], &[], 1 << 20, &[]);
+        assert_eq!(s.files.len(), 7);
+        assert!(s.files.windows(2).all(|w| w[0].path < w[1].path), "sorted by path");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn mountinfo_parses_escapes_and_types() {

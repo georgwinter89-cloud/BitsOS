@@ -1,8 +1,8 @@
 //! CONFIG.TXT for the WLAN (spec/wlan.md §2.4; R8 i): `wlan_ssid=` (a name, shown), `wlan_psk=` (a
 //! secret: 8-63 characters or 64 hex digits; never shown, logged, sent in an MCP answer or kept
 //! outside wifi's `Passphrase`/`Secret`), `wlan_channels=` (default every 2.4 GHz channel, 1-13),
-//! `wlan_scan_dwell_ms=` (default 120, V1 bringup.mjs) and `wlan_fw=` (the firmware file). The
-//! passphrase becomes the PMK at once; its copies here are wiped.
+//! `wlan_scan_dwell_ms=` (default 120, V1 bringup.mjs). The passphrase becomes the PMK at once;
+//! its copies here are wiped. The firmware file has fixed places (`FW_PATHS`), no CONFIG line.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -12,8 +12,8 @@ use rtw89_core::sta::supervise::WlanCfg;
 use wifi::mlme::JoinTiming;
 use wifi::secret::{Passphrase, wipe};
 
-/// Where the firmware is looked for, in order (`wlan_fw=` first): the stick's BITSOS2 tree (the
-/// desk copies the file there), then Linux's place (an initrd may carry it)
+/// Where the firmware is looked for, in order: the stick's BITSOS2 tree (the desk copies the file
+/// there), then Linux's place (an initrd may carry it)
 pub const FW_PATHS: [&str; 2] = [
     "/boot/BITSOS2/FIRMWARE/rtw89/rtw8852b_fw-2.bin",
     "/lib/firmware/rtw89/rtw8852b_fw-2.bin",
@@ -92,16 +92,6 @@ pub fn network_with(
             .ok_or_else(|| String::from("wlan_scan_dwell_ms: 10 to 1000"))?,
     };
     Ok(Some(WlanCfg { ssid, pmk, band, channels, dwell_ms, timing: JoinTiming::default() }))
-}
-
-/// The firmware paths to try, `wlan_fw=` first
-pub fn fw_paths(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some(p) = get("wlan_fw").map(|p| String::from(p.trim())).filter(|p| !p.is_empty()) {
-        v.push(p);
-    }
-    v.extend(FW_PATHS.iter().map(|p| String::from(*p)));
-    v
 }
 
 /// How long the firmware loop waits for the boot stick's mount before a missing file is a
@@ -218,13 +208,5 @@ mod tests {
         let e = network(&cfg(&[("wlan_ssid", "x"), ("wlan_psk", "12345678"), ("wlan_scan_dwell_ms", "5")]))
             .unwrap_err();
         assert!(e.contains("dwell"), "{e}");
-    }
-
-    #[test]
-    fn firmware_paths_config_first() {
-        let p = fw_paths(&cfg(&[("wlan_fw", "/boot/x.bin")]));
-        assert_eq!(p[0], "/boot/x.bin");
-        assert_eq!(p.len(), 1 + FW_PATHS.len());
-        assert_eq!(fw_paths(&cfg(&[])).len(), FW_PATHS.len());
     }
 }

@@ -69,15 +69,57 @@ pub fn answer(dpm: Option<Arc<Dpm>>) -> ToolResult {
     Ok(vec![ToolOutput::Text(text(&d.report()))])
 }
 
-fn gpu(_ctx: &ToolContext, _args: &Json) -> ToolResult {
-    answer(crate::hw::live::NODE.gpu().and_then(|g| g.dpm()))
+/// `device`: which GPU (`devs::Registry::pick`), or `list`. Without it the first device answers, which is the 780M on
+/// the Mini-PC: every call of before means what it meant.
+pub fn parse_device(args: &Json) -> Result<Option<String>, ToolError> {
+    match args.get("device").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v.as_str().map(|s| Some(String::from(s))).ok_or_else(|| ToolError::BadArgument(String::from("device (card0, 04:00.0 or list)"))),
+    }
+}
+
+/// One line per device, in the stable order.
+pub fn list(reg: &crate::devs::Registry) -> String {
+    let mut s = format!("gpu devices: {}\n", reg.all().len());
+    for d in reg.all() {
+        s.push_str(&format!(
+            "{} {} renderD{}: {}{}\n",
+            d.card_name(),
+            d.key,
+            d.render_minor(),
+            match d.family {
+                crate::devs::Family::Phoenix => "Radeon 780M driver (driven)",
+                crate::devs::Family::Rdna4 => "Radeon RX 9070 XT (read-only attach, GP-GPU1)",
+            },
+            if d.display { ", the boot display" } else { "" }
+        ));
+    }
+    s
+}
+
+fn gpu(_ctx: &ToolContext, args: &Json) -> ToolResult {
+    let want = parse_device(args)?;
+    let reg = crate::devs::registry();
+    if want.as_deref() == Some("list") {
+        return Ok(vec![ToolOutput::Text(list(reg))]);
+    }
+    let dev = match want.as_deref() {
+        None => reg.all().first().copied(),
+        Some(a) => Some(reg.pick(Some(a)).map_err(ToolError::BadArgument)?),
+    };
+    match dev {
+        Some(d) if d.family == crate::devs::Family::Rdna4 => crate::rdna4::live::answer(d).map(|s| vec![ToolOutput::Text(s)]).map_err(ToolError::Failed),
+        // The 780M's device, and a machine without any device (QEMU): the answer of before.
+        Some(d) => answer(d.hw.node.gpu().and_then(|g| g.dpm())),
+        None => answer(None),
+    }
 }
 
 mcp::mcp_tool!(
     name: "gpu",
     owner: "GX",
     safety: Read,
-    description: "Radeon 780M power and clocks (GX-9b), read from PMFW's metrics table through one table transfer on the driver's mailbox; no GC register is touched, so a sleeping GFX block sleeps on. Lines: 'level:' (auto with PMFW's GFX range, or why it was left), 'clocks:' (gfx, its average, soc, mem in MHz), 'activity:' (%), 'temperature:' (C), 'power:' (W), 'voltage:' (mV), 'throttle:', 'metrics counter:', 'gfxoff:' (allowed, held off, off/refused; the request count; power gating; messages sent), 'gfxoff status:' (SMUIO's status, unverified on 13.0.4). Without a backend on the render node: an error.",
-    schema: r#"{"type":"object","properties":{}}"#,
+    description: "One GPU device's state; device=list names them (card0 is the boot display, then by PCI address). Radeon 780M: power and clocks (GX-9b), read from PMFW's metrics table through one table transfer on the driver's mailbox; no GC register is touched, so a sleeping GFX block sleeps on. Lines: 'level:' (auto with PMFW's GFX range, or why it was left), 'clocks:' (gfx, its average, soc, mem in MHz), 'activity:' (%), 'temperature:' (C), 'power:' (W), 'voltage:' (mV), 'throttle:', 'metrics counter:', 'gfxoff:' (allowed, held off, off/refused; the request count; power gating; messages sent), 'gfxoff status:' (SMUIO's status, unverified on 13.0.4). Without a backend on the render node: an error. Radeon RX 9070 XT (GP-GPU1, read-only attach: the attach writes nothing to the card; only once the stage pmfw passed in this boot do the temperature lines come from Linux's one metrics message, TransferTableSmu2Dram with argument 5: three writes of the SMU's mailbox registers, then the PMFW writes its table into VRAM; never during a stage call): 'gpu cardN <address>:' (ids, whether it is the display card), 'writes:' (must say nothing was written), 'pci:' (command, power state, MSI), 'bar0/bar2/bar5:', 'link:' (the card's and the narrowest above it), 'dma:', 'attach:' (PASS, or STOPPED at step N of 5 with the reason), 'memsize:', 'discovery:', 'measured:' (the table against the one read under Linux), 46 'ip ...' lines, 12 'module <role>:' lines (which code is not built yet and which item brings it), and a 'firmware <file>:' line per file the card needs (present on the stick with size and header versions, or missing).",
+    schema: r#"{"type":"object","properties":{"device":{"type":"string","description":"card0, card1, a PCI address (04:00.0), or list; default: the first device"}}}"#,
     handler: gpu,
 );

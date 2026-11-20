@@ -7,6 +7,8 @@ description = "NVMe with the write gate (owner: NV)"
 [dependencies]
 block = { path = "../../block" }
 devmodel = { path = "../../devmodel" }
+# GP-GUARD: the Gaming-PC's disk rule (probe refuses under nvme_bind=off; pure, no dependencies).
+gp-platform = { path = "../../gp-platform" }
 pci = { path = "../../pci" }
 ksync = { path = "../../ksync" }
 klog = { path = "../../klog" }
@@ -29,6 +31,9 @@ vfs = { path = "../../vfs" }
 # BL-2: the three-layer reader ktest (ktests_stack.rs) builds a pool and volume of its own (already in the kernel
 # through fs-ext4).
 bitsvol = { path = "../../bitsvol" }
+# CRASHDISK: the panic writer implements kexec's crash-disk device (kexec cannot depend on nvme: nvme -> fs-ext4 ->
+# kexec already).
+kexec = { path = "../../kexec" }
 
 [lints]
 workspace = true

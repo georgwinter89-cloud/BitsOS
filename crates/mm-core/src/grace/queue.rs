@@ -1,12 +1,14 @@
 //! PF-5: the deferred drops of `grace` (a type-erased queue in cookie order), the drains, the bound and the
 //! back-pressure on the freer, the numbers.
 
-use super::{cookie, in_section, open_sections, passed, synchronize, try_advance, EPOCH, SLOTS};
+use super::{cookie, in_section, open_sections, passed, synchronize, try_advance, try_box, EPOCH, SLOTS};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use ksync::{OnceRef, SpinLock};
+
+mod overflow;
 
 pub(super) struct Deferred {
     pub(super) cookie: u64,
@@ -33,67 +35,124 @@ impl Deferred {
 /// Items in one block of the queue: one page of them.
 const BLOCK: usize = crate::PAGE as usize / core::mem::size_of::<Deferred>();
 
-/// The waiting items, oldest first, in blocks of one page. One `VecDeque` of all of them doubled at 2.6, 5 and
-/// 10 MiB in one run, exactly when memory is full of frames that wait here: the growth failed under the queue's
-/// lock, where nothing could drain, and index nodes freed under a spin lock were leaked. Thousands of leaked nodes,
-/// allocated all over memory while a file was cached, left no free block above 8 MiB for the machine's whole
-/// life (PF-7 fixer: `mm.reclaim.dirty_pressure`, then ENOMEM for 9 MiB reads; plan/notes/fs-PF-7.md).
-struct Queue {
-    /// No block in here is empty. An entry costs 32 bytes per page of items, so this `VecDeque` stays small.
-    blocks: VecDeque<VecDeque<Deferred>>,
-    /// The last block that ran empty: a queue that keeps going from empty to one item allocates nothing.
-    spare: Option<VecDeque<Deferred>>,
+/// One page of waiting items and the link to the next younger block.
+struct Block {
+    /// Made with room for `BLOCK` items; never grows.
+    items: VecDeque<Deferred>,
+    /// Null for the youngest block (and for a block outside the chain).
+    next: *mut Block,
 }
+
+impl Block {
+    /// A block with its page, or None without memory. Never call it under `mm.grace`.
+    fn try_new() -> Option<Box<Block>> {
+        // Without a block the item takes the old road (drain, wait): no never-failing loop in a freeing path.
+        let _bounded = crate::oom::no_retry();
+        let mut items = VecDeque::new();
+        items.try_reserve_exact(BLOCK).ok()?;
+        try_box(Block { items, next: core::ptr::null_mut() })
+    }
+}
+
+/// The waiting items, oldest first, in blocks of one page chained oldest to youngest. One `VecDeque` of all of
+/// them doubled at 2.6, 5 and 10 MiB in one run, exactly when memory is full of frames that wait here: the growth
+/// failed under the queue's lock, where nothing could drain, and index nodes freed under a spin lock were leaked.
+/// Thousands of leaked nodes, allocated all over memory while a file was cached, left no free block above 8 MiB
+/// for the machine's whole life (PF-7 fixer: `mm.reclaim.dirty_pressure`, then ENOMEM for 9 MiB reads).
+/// A list of the blocks still doubled under the lock (16 KiB at 26 000 items; ATOMIC-3):
+/// chained, a queue of any length needs nothing but its blocks, which are made with the lock released.
+struct Queue {
+    /// The oldest block (from `Box::into_raw`, owned by the queue), null when empty. No block in the chain is
+    /// empty.
+    head: *mut Block,
+    /// The youngest block, the last of the chain; null when empty.
+    tail: *mut Block,
+    /// The last block that ran empty: a queue that keeps going from empty to one item allocates nothing.
+    spare: Option<Box<Block>>,
+}
+
+// SAFETY: the chain's blocks are owned by the queue alone (nothing else holds a pointer into it) and are only
+// reached through `&mut Queue`/`&Queue`; the items are `Send` (`Deferred`).
+unsafe impl Send for Queue {}
 
 impl Queue {
     const fn new() -> Queue {
-        Queue { blocks: VecDeque::new(), spare: None }
+        Queue { head: core::ptr::null_mut(), tail: core::ptr::null_mut(), spare: None }
     }
 
     fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.head.is_null()
     }
 
-    /// Whether `push_back` has room now, after taking a block if it must: the spare, or `fresh` (allocated by the
-    /// caller before it took the lock). Err: a new block is needed and `fresh` has none (the caller allocates it
-    /// with the lock released and comes again); Ok(false): no memory for the list of blocks.
-    fn room(&mut self, fresh: &mut Option<VecDeque<Deferred>>) -> Result<bool, ()> {
-        if self.blocks.back().is_some_and(|b| b.len() < BLOCK) {
-            return Ok(true);
-        }
-        let Some(block) = self.spare.take().or_else(|| fresh.take()) else { return Err(()) };
-        if self.blocks.try_reserve(1).is_err() {
-            self.spare = Some(block);
-            return Ok(false);
-        }
-        self.blocks.push_back(block);
-        Ok(true)
+    fn tail_mut(&mut self) -> Option<&mut Block> {
+        // SAFETY: null or the last block of the chain, owned by the queue; `&mut self` makes this the only
+        // reference into it.
+        unsafe { self.tail.as_mut() }
     }
 
-    /// After `room` answered true: within the block's capacity, nothing allocates.
+    /// Whether `push_back` has room now, after linking a block if it must: the spare, or `fresh` (made by the
+    /// caller with the lock released). Err: a new block is needed and `fresh` has none (the caller makes it with
+    /// the lock released and comes again). Linking allocates nothing.
+    fn room(&mut self, fresh: &mut Option<Box<Block>>) -> Result<(), ()> {
+        if self.tail_mut().is_some_and(|b| b.items.len() < BLOCK) {
+            return Ok(());
+        }
+        let Some(mut block) = self.spare.take().or_else(|| fresh.take()) else { return Err(()) };
+        block.next = core::ptr::null_mut();
+        let p = Box::into_raw(block);
+        match self.tail_mut() {
+            Some(t) => t.next = p,
+            None => self.head = p,
+        }
+        self.tail = p;
+        Ok(())
+    }
+
+    /// After `room` answered Ok: within the block's capacity, nothing allocates.
     fn push_back(&mut self, d: Deferred) {
-        if let Some(b) = self.blocks.back_mut() {
-            b.push_back(d);
+        if let Some(b) = self.tail_mut() {
+            b.items.push_back(d);
         }
     }
 
     fn front_cookie(&self) -> Option<u64> {
-        self.blocks.front().and_then(|b| b.front()).map(|d| d.cookie)
+        // SAFETY: null or the chain's first block, owned by the queue, read through `&self`.
+        unsafe { self.head.as_ref() }.and_then(|b| b.items.front()).map(|d| d.cookie)
     }
 
     /// The oldest item, and a block that ran empty and is not kept, for the caller to drop after the lock.
-    fn pop_front(&mut self) -> (Option<Deferred>, Option<VecDeque<Deferred>>) {
-        let Some(b) = self.blocks.front_mut() else { return (None, None) };
-        let d = b.pop_front();
-        if !b.is_empty() {
+    fn pop_front(&mut self) -> (Option<Deferred>, Option<Box<Block>>) {
+        // SAFETY: null or the chain's first block, owned by the queue; `&mut self` makes this the only reference.
+        let Some(b) = (unsafe { self.head.as_mut() }) else { return (None, None) };
+        let d = b.items.pop_front();
+        if !b.items.is_empty() {
             return (d, None);
         }
-        let empty = self.blocks.pop_front();
+        let first = self.head;
+        self.head = b.next;
+        if self.head.is_null() {
+            self.tail = core::ptr::null_mut();
+        }
+        // SAFETY: `first` came from `Box::into_raw` (`room`) and is out of the chain now: nothing points to it.
+        let mut empty = unsafe { Box::from_raw(first) };
+        empty.next = core::ptr::null_mut();
         if self.spare.is_none() {
-            self.spare = empty;
+            self.spare = Some(empty);
             return (d, None);
         }
-        (d, empty)
+        (d, Some(empty))
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        let mut p = core::mem::replace(&mut self.head, core::ptr::null_mut());
+        self.tail = core::ptr::null_mut();
+        while !p.is_null() {
+            // SAFETY: every block of the chain came from `Box::into_raw` and is freed once, here.
+            let b = unsafe { Box::from_raw(p) };
+            p = b.next;
+        }
     }
 }
 
@@ -126,8 +185,18 @@ pub(super) unsafe fn drop_arc<T>(p: *mut ()) {
 }
 
 /// `wait`: the freer may pay the back-pressure (`after_push`); false for freers that run under another
-/// cache's lock (reclaim: the allocation that called it waits instead).
+/// cache's lock (reclaim: the allocation that called it waits instead). Those never wait for `mm.grace`: their
+/// items go to this CPU's stash (`stash`), which the next drain hands over in one hold of the lock.
 pub(super) fn push(d: Deferred, wait: bool) {
+    count_in(&d);
+    let d = if wait {
+        d
+    } else {
+        match stash(d).or_else(spill) {
+            Ok(()) => return,
+            Err(d) => d,
+        }
+    };
     let Err(d) = enqueue(d, wait) else { return };
     // No page for a block with the queue's lock held, where nothing drains; what waits may be what the page would
     // come from. Drains already run under a freer's spin lock (the heap's last step before out-of-memory).
@@ -141,6 +210,7 @@ pub(super) fn push(d: Deferred, wait: bool) {
             Err(d) => d,
         }
     };
+    count_out(&d);
     // No room in the queue. INT-W28 (PF-6 CR): a freer under a spin lock (rcu_index's writers under
     // vfs.fds.view or vfs.inode.index) never waits here; the item is leaked, counted, rather than freed early.
     if ksync::preempt_count() != 0 || hal::percpu::in_hard_irq() {
@@ -158,22 +228,41 @@ pub(super) fn push(d: Deferred, wait: bool) {
     }
 }
 
-/// `d` into the queue, stamped under its lock; back to the caller when there is no room.
+/// An item's numbers join the waiting ones (once, in `push`; the drain that frees it takes them out).
+fn count_in(d: &Deferred) {
+    PENDING.fetch_add(d.bytes, Relaxed);
+    HELD.fetch_add(d.held, Relaxed);
+    WAITING.fetch_add(1, Relaxed);
+}
+
+fn count_out(d: &Deferred) {
+    PENDING.fetch_sub(d.bytes, Relaxed);
+    HELD.fetch_sub(d.held, Relaxed);
+    WAITING.fetch_sub(1, Relaxed);
+}
+
+/// `d` into the queue, stamped under its lock; back to the caller when there is no room. `wait` false (reclaim):
+/// a held lock is waited for only after a try, and that wait is counted (`mm.grace.reclaim_waits`, which the stash
+/// keeps at 0 unless every stash of the CPU is full or busy).
 fn enqueue(d: Deferred, wait: bool) -> Result<(), Deferred> {
     // A block's page is never allocated under `mm.grace` (FS-STALL review R1: an allocation there that reclaimed
     // would free into this queue and spin on its own lock).
-    let mut fresh: Option<VecDeque<Deferred>> = None;
+    let mut fresh: Option<Box<Block>> = None;
     let mut q = loop {
-        let mut q = QUEUE.lock();
+        let mut q = match QUEUE.try_lock() {
+            Some(q) => q,
+            None => {
+                if !wait {
+                    RECLAIM_WAITS.inc();
+                }
+                QUEUE.lock()
+            }
+        };
         match q.room(&mut fresh) {
-            Ok(true) => break q,
-            Ok(false) => return Err(d),
+            Ok(()) => break q,
             Err(()) if fresh.is_none() => {
                 drop(q);
-                let mut b = VecDeque::new();
-                if b.try_reserve_exact(BLOCK).is_err() {
-                    return Err(d);
-                }
+                let Some(b) = Block::try_new() else { return Err(d) };
                 fresh = Some(b);
             }
             Err(()) => return Err(d),
@@ -184,17 +273,174 @@ fn enqueue(d: Deferred, wait: bool) -> Result<(), Deferred> {
         q.spare = fresh.take();
     }
     let first = q.is_empty();
-    let d = Deferred { cookie: cookie(), ..d };
-    PENDING.fetch_add(d.bytes, Relaxed);
-    HELD.fetch_add(d.held, Relaxed);
-    WAITING.fetch_add(1, Relaxed);
-    q.push_back(d);
+    q.push_back(Deferred { cookie: cookie(), ..d });
     drop(q);
     drop(fresh);
     if wait {
         after_push(first);
     }
     Ok(())
+}
+
+/// MEMCRASH (Mini-PC 13.11.2026): every page reclaim took and every cache its walk visited went into the queue
+/// one by one under `mm.grace`, from all CPUs at once; the last 200 events before the crash were waits for that
+/// lock, one of them inside a heap allocation's reclaim (B4: reclaim never waits for a lock). Reclaim's items now
+/// go to a small per-CPU stash, stamped when they are handed over (a later stamp only delays the free), and the
+/// next drain moves a whole stash into the queue in one hold (`flush_stashes`). When every stash is full or held
+/// the item goes to the overflow pool (`spill`, no lock); only when that is full too does it go to the queue as
+/// before, counted when that waited (`mm.grace.reclaim_waits`).
+const STASHES: usize = 32;
+const STASH_ITEMS: usize = 64;
+
+struct Stash {
+    items: [Option<Deferred>; STASH_ITEMS],
+    n: usize,
+}
+
+impl Stash {
+    const fn new() -> Stash {
+        Stash { items: [const { None }; STASH_ITEMS], n: 0 }
+    }
+}
+
+static STASH: [SpinLock<Stash>; STASHES] = [const { SpinLock::named("mm.grace.stash", Stash::new()) }; STASHES];
+/// Items in the stashes now (a drain with none looks at no stash).
+static STASHED: AtomicU64 = AtomicU64::new(0);
+klog::counter!(HANDOVER, "mm.grace.reclaim_handover");
+klog::counter!(RECLAIM_WAITS, "mm.grace.reclaim_waits");
+
+/// `d` into this CPU's stash, stamped now. A full stash is handed over first if the queue's lock is free; when it
+/// stays full or another holder has it (an interrupt on top of its holder, a drain moving it), the other CPUs'
+/// stashes are tried. Back only when every stash is full or held: the caller then queues it itself.
+fn stash(d: Deferred) -> Result<(), Deferred> {
+    let d = Deferred { cookie: cookie(), ..d };
+    let me = hal::percpu::this_cpu() % STASHES;
+    let mut d = Some(d);
+    for k in 0..STASHES {
+        let i = (me + k) % STASHES;
+        // Any full stash on the way is handed over when the queue's lock is free (not only this CPU's).
+        if STASH[i].try_lock().is_some_and(|st| st.n == STASH_ITEMS) {
+            flush_stash(i, false);
+        }
+        let Some(mut st) = STASH[i].try_lock() else { continue };
+        if st.n == STASH_ITEMS {
+            continue;
+        }
+        let n = st.n;
+        st.items[n] = d.take();
+        st.n += 1;
+        let now_full = st.n == STASH_ITEMS;
+        drop(st);
+        let first = STASHED.fetch_add(1, Relaxed) == 0;
+        HANDOVER.inc();
+        // As `after_push`: the reaper hands the stashes over in the background, woken where the scheduler may be;
+        // also on every stash that became full (a drain may have left others behind, held at the time).
+        if (first || now_full) && ksync::preempt_count() == 0 && !hal::percpu::in_hard_irq() {
+            kick();
+        }
+        return Ok(());
+    }
+    match d {
+        Some(d) => Err(d),
+        None => Ok(()),
+    }
+}
+
+/// Where reclaim's items go when every stash is full or held (`spill`).
+static OVERFLOW: overflow::Pool<1024> = overflow::Pool::new();
+klog::counter!(SPILLED, "mm.grace.reclaim_overflow");
+
+/// A stamped item that found no stash into the overflow pool, without a lock. Err: the pool is full too.
+fn spill(d: Deferred) -> Result<(), Deferred> {
+    let start = hal::percpu::this_cpu() * (OVERFLOW.len_max() / STASHES);
+    OVERFLOW.put(d, start)?;
+    SPILLED.inc();
+    if ksync::preempt_count() == 0 && !hal::percpu::in_hard_irq() {
+        kick();
+    }
+    Ok(())
+}
+
+/// The overflow pool into the queue, as `flush_stash` (stamps kept; without a block the rest stays).
+fn flush_overflow(wait_lock: bool) {
+    let mut fresh: Option<Box<Block>> = None;
+    let mut i = 0;
+    while i < OVERFLOW.len_max() && !OVERFLOW.is_empty() {
+        let Some(mut q) = (if wait_lock { Some(QUEUE.lock()) } else { QUEUE.try_lock() }) else { break };
+        let mut need_block = false;
+        while i < OVERFLOW.len_max() {
+            if OVERFLOW.is_full(i) {
+                if q.room(&mut fresh).is_err() {
+                    need_block = true;
+                    break;
+                }
+                if let Some(d) = OVERFLOW.take(i) {
+                    q.push_back(d);
+                }
+            }
+            i += 1;
+        }
+        if q.spare.is_none() {
+            q.spare = fresh.take();
+        }
+        drop(q);
+        if !need_block {
+            break;
+        }
+        match Block::try_new() {
+            Some(b) => fresh = Some(b),
+            None => break,
+        }
+    }
+    drop(fresh);
+}
+
+/// Moves every stash and the overflow pool into the queue (stashes held elsewhere stay for the next drain).
+/// `wait_lock`: the queue's lock may be waited for (as `drain_with`).
+fn flush_stashes(wait_lock: bool) {
+    if !OVERFLOW.is_empty() {
+        flush_overflow(wait_lock);
+    }
+    if STASHED.load(Relaxed) == 0 {
+        return;
+    }
+    for i in 0..STASHES {
+        flush_stash(i, wait_lock);
+    }
+}
+
+/// Stash `i` into the queue with its stamps, in one hold of `mm.grace` (a block the queue lacks is made with
+/// that lock released; without memory for one the items stay stashed).
+fn flush_stash(i: usize, wait_lock: bool) {
+    let Some(mut st) = STASH[i].try_lock() else { return };
+    let mut fresh: Option<Box<Block>> = None;
+    while st.n > 0 {
+        let q = if wait_lock { Some(QUEUE.lock()) } else { QUEUE.try_lock() };
+        let Some(mut q) = q else { break };
+        let mut moved = 0;
+        while st.n > 0 && q.room(&mut fresh).is_ok() {
+            st.n -= 1;
+            let n = st.n;
+            if let Some(d) = st.items[n].take() {
+                q.push_back(d);
+                moved += 1;
+            }
+        }
+        if q.spare.is_none() {
+            q.spare = fresh.take();
+        }
+        drop(q);
+        STASHED.fetch_sub(moved, Relaxed);
+        if st.n == 0 {
+            break;
+        }
+        match Block::try_new() {
+            Some(b) => fresh = Some(b),
+            None => break,
+        }
+    }
+    drop(st);
+    drop(fresh);
 }
 
 /// Drops `b` after a grace period. `bytes`: frames its drop frees (counted as pending meanwhile).
@@ -225,33 +471,53 @@ fn drain_with(wait_lock: bool) -> u64 {
     if hal::percpu::in_hard_irq() || WAITING.load(Relaxed) == 0 {
         return 0;
     }
+    flush_stashes(wait_lock);
     // Two advances pass what was deferred in the epoch before (when no section of it is open, both succeed).
     if try_advance() {
         try_advance();
     }
     let mut freed = 0u64;
     loop {
-        let (d, empty) = {
+        // Up to a batch of items per hold of the lock (one each made every CPU's drain take it thousands of times
+        // a second under reclaim), dropped after it is released.
+        let mut got: [Option<Deferred>; DRAIN_BATCH] = [const { None }; DRAIN_BATCH];
+        let mut empty: [Option<Box<Block>>; 2] = [None, None];
+        let mut n = 0;
+        {
             let q = if wait_lock { Some(QUEUE.lock()) } else { QUEUE.try_lock() };
             let Some(mut q) = q else { break };
-            // Cookies grow along the queue (stamped under its lock): the first that has not passed ends it.
-            match q.front_cookie() {
-                Some(c) if passed(c) => q.pop_front(),
-                _ => (None, None),
+            // Stamps that are not passed end the batch: the items behind are younger (a stash's item may be
+            // older than one before it, and only waits a little longer).
+            while n < DRAIN_BATCH && empty[1].is_none() {
+                let (d, e) = match q.front_cookie() {
+                    Some(c) if passed(c) => q.pop_front(),
+                    _ => break,
+                };
+                if e.is_some() {
+                    let slot = usize::from(empty[0].is_some());
+                    empty[slot] = e;
+                }
+                got[n] = d;
+                n += 1;
             }
-        };
+        }
         drop(empty);
-        let Some(d) = d else { break };
-        PENDING.fetch_sub(d.bytes, Relaxed);
-        HELD.fetch_sub(d.held, Relaxed);
-        WAITING.fetch_sub(1, Relaxed);
-        freed += d.bytes;
-        // SAFETY: popped, so owned here; its grace period passed (checked under the queue lock).
-        unsafe { d.release() };
+        if n == 0 {
+            break;
+        }
+        for d in got.iter_mut().take(n).filter_map(Option::take) {
+            count_out(&d);
+            freed += d.bytes;
+            // SAFETY: popped, so owned here; its grace period passed (checked under the queue lock).
+            unsafe { d.release() };
+        }
     }
     DRAINED.fetch_add(freed, Relaxed);
     freed
 }
+
+/// Items one drain pops per hold of `mm.grace`.
+const DRAIN_BATCH: usize = 32;
 
 /// One caller's right to wait for grace periods (an allocation's steps share one): once a wait ran out (a
 /// section held the grace period past `WAIT_NS`, a bug the reaper reports), the caller's later steps only drain,
@@ -277,6 +543,8 @@ pub fn expedite_with(b: &mut WaitBudget) -> u64 {
     if b.spent || in_section() {
         return drain();
     }
+    // Stashed items join the queue first: the grace period waited for below then covers them too.
+    flush_stashes(ksync::preempt_count() == 0);
     EXPEDITES.fetch_add(1, Relaxed);
     if !synchronize() {
         b.spent = true;
@@ -396,11 +664,39 @@ pub fn kick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     unsafe fn nothing(_: *mut ()) {}
 
     fn item(cookie: u64) -> Deferred {
         Deferred { cookie, ptr: core::ptr::null_mut(), drop: nothing, bytes: 0, held: 0 }
+    }
+
+    fn blocks(q: &Queue) -> Vec<(usize, usize)> {
+        let mut v = Vec::new();
+        let mut p = q.head;
+        // SAFETY: the test's own queue; the chain is not changed while it is walked.
+        while let Some(x) = unsafe { p.as_ref() } {
+            v.push((x.items.len(), x.items.capacity()));
+            p = x.next;
+        }
+        v
+    }
+
+    /// `n` items in, each block made outside (as `enqueue` does); returns the blocks made.
+    fn fill(q: &mut Queue, first: u64, n: u64) -> usize {
+        let mut made = 0;
+        for c in first..first + n {
+            let mut fresh = None;
+            if q.room(&mut fresh).is_err() {
+                fresh = Block::try_new();
+                made += 1;
+                assert_eq!(q.room(&mut fresh), Ok(()), "a block at hand always links");
+                assert!(fresh.is_none());
+            }
+            q.push_back(item(c));
+        }
+        made
     }
 
     /// Blocks of one page, in order; none of them grows; an empty queue keeps one block and frees the rest.
@@ -410,18 +706,9 @@ mod tests {
         let mut q = Queue::new();
         assert!(q.is_empty() && q.front_cookie().is_none());
         let n = BLOCK as u64 * 3 + 1;
-        for c in 0..n {
-            let mut fresh = None;
-            if q.room(&mut fresh).is_err() {
-                let mut b = VecDeque::new();
-                b.try_reserve_exact(BLOCK).unwrap();
-                fresh = Some(b);
-                assert_eq!(q.room(&mut fresh), Ok(true));
-            }
-            q.push_back(item(c));
-        }
-        assert_eq!(q.blocks.len(), 4);
-        assert!(q.blocks.iter().all(|b| b.capacity() == BLOCK), "a block never grows");
+        assert_eq!(fill(&mut q, 0, n), 4);
+        assert_eq!(blocks(&q).len(), 4);
+        assert!(blocks(&q).iter().all(|&(_, cap)| cap == BLOCK), "a block never grows");
         let mut freed = 0;
         for c in 0..n {
             assert_eq!(q.front_cookie(), Some(c));
@@ -429,13 +716,45 @@ mod tests {
             assert_eq!(d.map(|d| d.cookie), Some(c));
             freed += usize::from(empty.is_some());
         }
-        assert!(q.is_empty() && q.front_cookie().is_none());
+        assert!(q.is_empty() && q.front_cookie().is_none() && q.tail.is_null());
         assert!(q.pop_front().0.is_none());
         assert_eq!(freed, 3, "one of the four stays as the spare");
-        let spare = q.spare.as_ref().map(|b| b.as_slices().0.as_ptr());
+        let spare = q.spare.as_ref().map(|b| b.items.as_slices().0.as_ptr());
         assert!(spare.is_some());
-        assert_eq!(q.room(&mut None), Ok(true), "the spare serves without an allocation");
+        assert_eq!(q.room(&mut None), Ok(()), "the spare serves without an allocation");
         q.push_back(item(1));
-        assert_eq!(q.blocks.front().map(|b| b.as_slices().0.as_ptr()), spare, "from empty to one item allocates nothing");
+        // SAFETY: the test's own queue, not changed while it is read.
+        assert_eq!(unsafe { q.head.as_ref() }.map(|b| b.items.as_slices().0.as_ptr()), spare, "from empty to one item allocates nothing");
+    }
+
+    /// ATOMIC-3: the list of blocks doubled under `mm.grace` (16 KiB at 512 blocks). Chained, a queue of 600 blocks
+    /// asks for nothing but the 600 blocks, all made outside, and keeps its order while it is filled and drained
+    /// at once (the tail moves on while the head is popped, also through an empty queue).
+    #[test]
+    fn a_long_queue_needs_no_list_of_its_blocks() {
+        let mut q = Queue::new();
+        let n = BLOCK as u64 * 600;
+        assert_eq!(fill(&mut q, 0, n), 600);
+        assert!(blocks(&q).iter().all(|&(len, cap)| len == BLOCK && cap == BLOCK));
+        let (mut next_in, mut next_out) = (n, 0u64);
+        for round in 0..2000u64 {
+            for _ in 0..(round % 7) * 50 {
+                let (d, _) = q.pop_front();
+                let Some(d) = d else { break };
+                assert_eq!(d.cookie, next_out);
+                next_out += 1;
+            }
+            let k = (round % 5) * 40;
+            fill(&mut q, next_in, k);
+            next_in += k;
+        }
+        while let (Some(d), _) = q.pop_front() {
+            assert_eq!(d.cookie, next_out);
+            next_out += 1;
+        }
+        assert_eq!(next_out, next_in, "every item came out once, in order");
+        assert!(q.is_empty() && q.tail.is_null() && blocks(&q).is_empty());
+        fill(&mut q, 0, 1);
+        assert_eq!(blocks(&q), [(1, BLOCK)], "an emptied queue links its spare again");
     }
 }

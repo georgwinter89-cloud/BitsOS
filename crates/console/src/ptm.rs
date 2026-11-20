@@ -1,6 +1,6 @@
 //! The pty master (IN-7): reads what the slave wrote and echoed, writes the slave's input, and answers the
-//! master's ioctls (`pty_unix98_ioctl`, linux-6.6/drivers/tty/pty.c:642, then `tty_ioctl` with the slave as
-//! `real_tty`, tty_io.c:2652). See `pty` for the whole picture.
+//! master's ioctls (`pty_unix98_ioctl`, linux-7.3.1/drivers/tty/pty.c:625, then `tty_ioctl` with the slave as
+//! `real_tty`, tty_io.c:2658). See `pty` for the whole picture.
 
 use crate::jobs::{self, Procs};
 use crate::pty::{Pair, PTMX_DEV, SLICE_NS, hung_mask, ended, put, get_i32, sets_termios, SIG_MAX};

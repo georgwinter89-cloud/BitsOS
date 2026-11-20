@@ -1,6 +1,6 @@
 //! US-R: a device brought back in place. A wedged device gets a port reset and is set up again with the same slot,
 //! the same `Device`, the same drivers (Linux `usb_reset_device` -> `usb_reset_and_verify_device`,
-//! linux-6.6/drivers/usb/core/hub.c:6013): nothing above the driver notices, so a mass storage disk keeps its name
+//! linux-7.3.1/drivers/usb/core/hub.c:6188): nothing above the driver notices, so a mass storage disk keeps its name
 //! and its mounted file system. Its descriptors are compared afterwards; another device there, a change of speed
 //! or an empty port end in an ordinary detach (Linux "re_enumerate").
 //!
@@ -10,7 +10,7 @@
 //!
 //! Steps of `ResetKind::Recover`: port reset (a SuperSpeed port: hot reset, then warm), `Host::reset_slot`,
 //! `Host::set_address`, device descriptor, serial string and configuration descriptor compared (Linux
-//! `descriptors_changed`, hub.c:5198), `Host::configure`, SET_CONFIGURATION.
+//! `descriptors_changed`, hub.c:5324), `Host::configure`, SET_CONFIGURATION.
 
 use crate::device::Device;
 use crate::enumerate::{read_config, SET_ADDRESS_RECOVERY_NS};
@@ -273,8 +273,8 @@ pub(crate) fn run(host: &Arc<dyn Host>, ports: &dyn Ports, port: u8, dev: &Arc<D
 fn recover(host: &Arc<dyn Host>, ports: &dyn Ports, port: u8, dev: &Arc<Device>, power: bool) -> Ended {
     let t0 = host.now_ns();
     let mut last = UsbError::Timeout;
-    // Hot reset first, then the warm one (linux-6.6/drivers/usb/core/hub.c:2948 hub_port_reset; on a USB 2 port the
-    // two are the same reset, tried twice as Linux's `hub_port_init` does).
+    // Hot reset first, then the warm one (linux-7.3.1/drivers/usb/core/hub.c:3068 hub_port_reset; on a USB 2 port
+    // the two are the same reset, tried twice as Linux's `hub_port_init` does).
     for (i, warm) in [false, true].into_iter().enumerate() {
         let on = power && i == 0;
         match one_try(host, ports, port, dev, warm, on) {

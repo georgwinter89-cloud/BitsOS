@@ -1,4 +1,4 @@
-//! blkbench (BL-0, plan/notes/desk-W35-mm-blk.md "BL-0 procedure"): read-path measurements, the same static binary
+//! blkbench (BL-0, plan/guides/blk0.md): read-path measurements, the same static binary
 //! on V2 and on CachyOS. One `key=value` line per measurement (`test=<name> ...`), medians of `--runs` runs (3).
 //!
 //! - `prepare DIR`: seq.bin (4 GiB), rand.bin (1 GiB), small/ (4000 files, 4 KiB..1 MiB log-uniform, seed 35);

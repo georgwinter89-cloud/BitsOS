@@ -9,7 +9,7 @@
 //!   is replaced (rebased, never back), logged as `time tsc.rehandover`, and handed on at the next Reload.
 //! - **HrTimer** (`hrtimer`, `lapic`): per-CPU queues, each programmed into its CPU's LAPIC timer (TSC-deadline
 //!   or calibrated one-shot); callbacks run from the timer interrupt; the polled queue remains for CPUs whose
-//!   timer is not running (and `hrtimer=poll`). The interrupt also calls the scheduler's tick hook
+//!   timer is not running (and under the test key `ktest_timer=poll`). The interrupt also calls the scheduler's tick hook
 //!   (`set_tick_hook`); `interrupt_driven()` tells the scheduler when no CPU has to poll for timers.
 //! - **Wall clock** (`wall`, `rtc`, `tz`): the RTC's local time to UTC with CONFIG `tz=` (EU rule by default).
 //!
@@ -175,11 +175,11 @@ pub fn snapshot() -> clock::Snapshot {
 }
 
 /// True when every online CPU's timers fire by its LAPIC timer interrupt: nobody has to poll for hrtimers
-/// (the scheduler's poll-duty CPU may halt then). False with `hrtimer=poll`, while a CPU's timer is not live,
+/// (the scheduler's poll-duty CPU may halt then). False under `ktest_timer=poll`, while a CPU's timer is not live,
 /// and while the polled queue holds timers (an arm that found no room in its CPU's queue, see `hrtimer`).
 pub fn interrupt_driven() -> bool {
     let live = lapic::live_cpus();
-    lapic::config() != lapic::Config::Poll && live > 0 && live >= hal::percpu::cpu_count() && hrtimer::polled_len() == 0
+    !lapic::poll_test() && live > 0 && live >= hal::percpu::cpu_count() && hrtimer::polled_len() == 0
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -232,6 +232,9 @@ pub struct CalibInputs {
     pub hint_hz: u64,
     /// A Reload's rate and its original source code (kept, not re-measured).
     pub reload: Option<(u64, u32)>,
+    /// GP B5: whether the HPET can stop in a deep package sleep state (Intel only; `gp_platform::clock`). The
+    /// caller hands in no `hpet_phys` then; here it decides what the measurement is compared with.
+    pub hpet_trust: gp_platform::clock::HpetTrust,
 }
 
 /// The calibration's report (boot event, ktests, `hw_info`).
@@ -250,6 +253,9 @@ pub struct Calibration {
     pub took_ns: u64,
     /// The last re-check of a handed-on rate against the HPET (`None` before it finished, or after a cold boot).
     pub recheck: Option<recheck::Recheck>,
+    pub hpet_trust: gp_platform::clock::HpetTrust,
+    /// GP B5, only with an untrusted HPET: the measured rate and how CPUID 0x15 took part in the final one.
+    pub settled: Option<(u64, gp_platform::clock::Settled)>,
 }
 
 impl Calibration {
@@ -301,6 +307,43 @@ pub fn choose(
     (if first_hz != 0 { first_hz } else { GUESS_HZ }, Source::Guess)
 }
 
+/// GP B5: on a machine whose HPET is not trusted, a rate measured against the PM timer or the PIT is compared with
+/// CPUID 0x15, and the exact CPUID rate is taken where the two agree (Linux uses it unchecked,
+/// linux-7.3.1/arch/x86/kernel/tsc.c:683-688, :723). With a trusted HPET (every AMD machine) nothing changes: the
+/// input comes back as it is and no record is made (pure; host-tested).
+///
+/// The loader's hint must not decide this: `choose` drops every rate more than 2 % from the hint, and the hint is
+/// a 17 ms firmware Stall nobody measured on this board. Where `choose` therefore fell back to the hint or the
+/// guess, a PM-timer or PIT measurement in `tried` that confirms CPUID 0x15 still wins: two independent sources
+/// against one weak one.
+pub fn settle(
+    trust: gp_platform::clock::HpetTrust,
+    chosen: (u64, Source),
+    cpuid15: Option<u64>,
+    tried: &[(Source, Result<u64, CalibError>)],
+) -> ((u64, Source), Option<(u64, gp_platform::clock::Settled)>) {
+    use gp_platform::clock::RateFrom;
+    if !trust.untrusted() {
+        return (chosen, None);
+    }
+    if matches!(chosen.1, Source::PmTimer | Source::Pit) {
+        let s = gp_platform::clock::settle(trust, chosen.0, cpuid15);
+        let source = if s.from == RateFrom::Cpuid15Checked { Source::Cpuid15 } else { chosen.1 };
+        return ((s.hz, source), Some((chosen.0, s)));
+    }
+    if matches!(chosen.1, Source::LoaderHint | Source::Guess | Source::Cpuid15) {
+        let confirmed = tried.iter().find_map(|(src, r)| {
+            let hz = r.ok().filter(|_| matches!(src, Source::PmTimer | Source::Pit))?;
+            let s = gp_platform::clock::settle(trust, hz, cpuid15);
+            (s.from == RateFrom::Cpuid15Checked).then_some((hz, s))
+        });
+        if let Some((hz, s)) = confirmed {
+            return ((s.hz, Source::Cpuid15), Some((hz, s)));
+        }
+    }
+    (chosen, None)
+}
+
 /// Starts the HPET and calibrates the TSC (once; later calls return the first report). Boot, interrupts as they
 /// are; ~100 ms per source tried.
 pub fn calibrate(inputs: &CalibInputs) -> Calibration {
@@ -335,6 +378,7 @@ pub fn calibrate(inputs: &CalibInputs) -> Calibration {
         first_hz,
         &mut tried,
     );
+    let (chosen, settled) = settle(inputs.hpet_trust, chosen, cpuid.leaf15_hz, &tried);
     CLOCK.set_rate(hal::cpu::rdtsc(), chosen.0);
     SOURCE.store(chosen.1.code(), Ordering::Release);
     published();
@@ -350,6 +394,8 @@ pub fn calibrate(inputs: &CalibInputs) -> Calibration {
         invariant_tsc: hal::cpu::live().has("constant_tsc"),
         took_ns: now_ns().saturating_sub(t0),
         recheck: None,
+        hpet_trust: inputs.hpet_trust,
+        settled,
     };
     report(&c);
     *CALIBRATION.lock() = Some(c.clone());
@@ -524,7 +570,27 @@ fn report(c: &Calibration) {
         cpuid15_hz = c.cpuid.leaf15_hz.unwrap_or(0), cpuid16_mhz = c.cpuid.leaf16_mhz.unwrap_or(0),
         invariant = c.invariant_tsc, tried = tried.join(","), took_ms = c.took_ns / 1_000_000);
     let hardware = hal::BARE_METAL && !hal::cpu::live().has("hypervisor");
-    if hardware && !matches!(c.source, Source::Hpet | Source::Reload(_)) {
+    if c.hpet_trust.untrusted() {
+        // GP B5: its own lines, and the "fallback" warning below is not for this machine: the HPET was left out on
+        // purpose.
+        klog::event!(Info, "time", "hpet.untrusted", reason = c.hpet_trust.name(); "the HPET can stop in the deepest package sleep state: not started, not read (as Linux)");
+        if let Some((measured, s)) = c.settled {
+            let from = match s.from {
+                gp_platform::clock::RateFrom::Measured => "measured",
+                gp_platform::clock::RateFrom::Cpuid15Checked => "cpuid15_checked",
+                gp_platform::clock::RateFrom::MeasuredAgainstCpuid15 => "measured_cpuid15_disagrees",
+            };
+            klog::event!(Info, "time", "clock.cross_check", measured_hz = measured, cpuid15_hz = c.cpuid.leaf15_hz.unwrap_or(0), ppm = s.ppm.unwrap_or(0), taken = from, tsc_hz = s.hz);
+            if !calib::agrees_with_hint(s.hz, c.hint_hz) {
+                klog::event!(Warn, "time", "clock.hint_disagrees", hint_hz = c.hint_hz, cpuid15_hz = c.cpuid.leaf15_hz.unwrap_or(0), ppm = calib::ppm(c.hint_hz, s.hz);
+                    "the loader's rough TSC rate is more than 2 % from the one two other sources agree on: the loader's is not used");
+            }
+            if s.from == gp_platform::clock::RateFrom::MeasuredAgainstCpuid15 {
+                klog::event!(Warn, "time", "clock.cpuid15_disagrees", measured_hz = measured, cpuid15_hz = c.cpuid.leaf15_hz.unwrap_or(0), ppm = s.ppm.unwrap_or(0);
+                    "the measured TSC rate and the one the CPU states differ by more than 1000 ppm: the measured one is used");
+            }
+        }
+    } else if hardware && !matches!(c.source, Source::Hpet | Source::Reload(_)) {
         klog::event!(Warn, "time", "clock.fallback", source = c.source.name(); "the HPET did not give the rate (spec §7.1 order: HPET, PM timer, PIT)");
     }
     if !c.invariant_tsc {
@@ -550,13 +616,9 @@ pub fn hpet_read() -> Option<(u64, u64)> {
 // ---------------------------------------------------------------------------------------------------------
 // Configuration and the boot CPU's timer
 
-/// CONFIG keys (CP's `acpi::irq::init` hands its getter over): `tz=`, `lapic_timer=`, `hrtimer=`.
+/// CONFIG keys (CP's `acpi::irq::init` hands its getter over): `tz=`, and the test key `ktest_timer=poll`.
 pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
-    let (cfg, bad) = lapic::parse_config(get("lapic_timer").as_deref(), get("hrtimer").as_deref());
-    lapic::set_config(cfg);
-    if let Some(key) = bad {
-        klog::event!(Warn, "time", "config.unknown", key = key, value = get(key).unwrap_or_default(); "lapic_timer= takes auto|oneshot|deadline, hrtimer= interrupt|poll");
-    }
+    lapic::set_poll_test(get("ktest_timer").is_some_and(|v| v.trim() == "poll"));
     if let Some(v) = get("tz") {
         match tz::parse(&v) {
             Some(z) => wall::set_tz(z),
@@ -595,8 +657,8 @@ pub fn log_cpu_start(cpu: usize, r: Result<lapic::Kind, lapic::StartError>) {
             "CPUID 6 has no ARAT: the LAPIC timer stops in C3 and deeper; idle is hlt (C1), so the timer is used");
     }
     match r {
-        Ok(k) => klog::event!(Info, "time", "lapic.timer", cpu = cpu, mode = k.name(), counts_per_ms = st.counts_per_ms, config = lapic::config().name()),
-        Err(lapic::StartError::Disabled) => klog::event!(Info, "time", "lapic.timer_off", cpu = cpu; "hrtimer=poll: timers are polled"),
+        Ok(k) => klog::event!(Info, "time", "lapic.timer", cpu = cpu, mode = k.name(), counts_per_ms = st.counts_per_ms),
+        Err(lapic::StartError::Disabled) => klog::event!(Info, "time", "lapic.timer_off", cpu = cpu; "ktest_timer=poll: timers are polled"),
         Err(e) => klog::event!(Warn, "time", "lapic.timer_failed", cpu = cpu, error = e.name(),
             counts_per_ms = match e { lapic::StartError::Calibration(n) => n, _ => 0 }; "this CPU's timers go to the polled queue"),
     }
@@ -616,8 +678,8 @@ pub fn summary() -> Vec<String> {
     let utc = wall::utc_now().map(|d| fmt_dt(&d, "Z")).unwrap_or_else(|| String::from("unknown"));
     out.push(alloc::format!("time wall utc={utc} offset_min={} tz={}", wall::utc_offset_minutes(), wall::tz().describe()));
     out.push(alloc::format!(
-        "time timers config={} live={}/{} interrupt_driven={} hrtimers={} polled_queue={}",
-        lapic::config().name(), lapic::live_cpus(), hal::percpu::cpu_count(), interrupt_driven(), hrtimer::count(),
+        "time timers live={}/{} interrupt_driven={} hrtimers={} polled_queue={}",
+        lapic::live_cpus(), hal::percpu::cpu_count(), interrupt_driven(), hrtimer::count(),
         hrtimer::queue_state(None).map(|q| q.0).unwrap_or(0)
     ));
     for cpu in 0..hal::percpu::cpu_count() {
@@ -648,6 +710,83 @@ mod tests {
     }
     fn bad() -> impl FnMut() -> Result<u64, CalibError> {
         || Err(CalibError::Stalled)
+    }
+
+    #[test]
+    fn settle_changes_nothing_with_a_trusted_hpet() {
+        use gp_platform::clock::HpetTrust;
+        // The Mini-PC's world: every source, with and without a CPUID 0x15 rate that disagrees wildly.
+        for src in [Source::Hpet, Source::PmTimer, Source::Pit, Source::Cpuid15, Source::LoaderHint, Source::Reload(2), Source::Guess] {
+            for c15 in [None, Some(3_878_400_000), Some(1)] {
+                // A measurement that would confirm CPUID 0x15 lies in `tried`: still nothing.
+                let tried = [(Source::PmTimer, Ok(c15.unwrap_or(7)))];
+                assert_eq!(settle(HpetTrust::Trusted, (3_792_877_000, src), c15, &[]), ((3_792_877_000, src), None));
+                assert_eq!(settle(HpetTrust::Trusted, (3_792_877_000, src), c15, &tried), ((3_792_877_000, src), None));
+            }
+        }
+    }
+
+    #[test]
+    fn settle_on_the_gaming_pc() {
+        use gp_platform::clock::{HpetTrust, RateFrom};
+        let c15 = Some(3_878_400_000);
+        // The PM timer's measurement confirms CPUID 0x15: the exact rate is taken and the source says so.
+        let (chosen, rec) = settle(HpetTrust::Pc10, (3_878_412_345, Source::PmTimer), c15, &[]);
+        assert_eq!(chosen, (3_878_400_000, Source::Cpuid15));
+        let (measured, s) = rec.unwrap();
+        assert_eq!((measured, s.from, s.ppm), (3_878_412_345, RateFrom::Cpuid15Checked, Some(3)));
+        // They disagree: the measurement stays, with its own source.
+        let (chosen, rec) = settle(HpetTrust::Pc10, (3_700_000_000, Source::Pit), c15, &[]);
+        assert_eq!(chosen, (3_700_000_000, Source::Pit));
+        assert_eq!(rec.unwrap().1.from, RateFrom::MeasuredAgainstCpuid15);
+        // No CPUID rate: the measurement stays.
+        assert_eq!(settle(HpetTrust::Pc10, (3_878_412_345, Source::PmTimer), None, &[]).0, (3_878_412_345, Source::PmTimer));
+        // A Reload's rate, the loader's hint and CPUID itself are no measurements: untouched, no record.
+        for src in [Source::Reload(4), Source::LoaderHint, Source::Cpuid15, Source::Guess] {
+            assert_eq!(settle(HpetTrust::Pc10, (3_878_400_000, src), c15, &[]), ((3_878_400_000, src), None));
+        }
+    }
+
+    #[test]
+    fn a_wrong_loader_hint_cannot_outvote_two_sources() {
+        use gp_platform::clock::{HpetTrust, RateFrom};
+        // The firmware's Stall is 5 % off on this board: every rate fails the 2 % rule, `choose` ends at the hint.
+        let c15 = 3_878_400_000u64;
+        let hint = c15 * 105 / 100;
+        let i = CalibInputs { hint_hz: hint, hpet_trust: HpetTrust::Pc10, ..Default::default() };
+        let pm_hz = c15 + c15 / 50_000; // 20 ppm
+        let (mut p, mut q, mut t) = (ok(pm_hz), ok(c15 - c15 / 200), Vec::new());
+        let chosen = choose(&i, None, Some(&mut p), &mut q, Some(c15), 0, &mut t);
+        assert_eq!(chosen, (hint, Source::LoaderHint), "choose alone still ends at the hint");
+        let (chosen, rec) = settle(i.hpet_trust, chosen, Some(c15), &t);
+        assert_eq!(chosen, (c15, Source::Cpuid15));
+        let (measured, s) = rec.unwrap();
+        assert_eq!((measured, s.from, s.hz), (pm_hz, RateFrom::Cpuid15Checked, c15));
+        assert!(!calib::agrees_with_hint(s.hz, hint), "the report warns clock.hint_disagrees");
+        // The PM timer failed, the PIT confirms: same result. A PIT 0.5 % off confirms nothing.
+        let t2 = [(Source::PmTimer, Err(CalibError::Stalled)), (Source::Pit, Ok(c15 - 1000))];
+        assert_eq!(settle(HpetTrust::Pc10, (hint, Source::LoaderHint), Some(c15), &t2).0, (c15, Source::Cpuid15));
+        let t3 = [(Source::PmTimer, Err(CalibError::Stalled)), (Source::Pit, Ok(c15 - c15 / 200))];
+        assert_eq!(settle(HpetTrust::Pc10, (hint, Source::LoaderHint), Some(c15), &t3), ((hint, Source::LoaderHint), None));
+        // An HPET figure is never the witness (it is not even started here), and without CPUID 0x15 nothing moves.
+        let t4 = [(Source::Hpet, Ok(c15))];
+        assert_eq!(settle(HpetTrust::Pc10, (hint, Source::LoaderHint), Some(c15), &t4), ((hint, Source::LoaderHint), None));
+        assert_eq!(settle(HpetTrust::Pc10, (hint, Source::LoaderHint), None, &t), ((hint, Source::LoaderHint), None));
+        // A Reload's handed-on rate is not second-guessed.
+        assert_eq!(settle(HpetTrust::Pc10, (hint, Source::Reload(2)), Some(c15), &t), ((hint, Source::Reload(2)), None));
+    }
+
+    #[test]
+    fn without_an_hpet_the_order_is_pm_timer_pit_cpuid() {
+        // What `acpi::clock::inputs` hands in for an untrusted HPET: no HPET closure at all.
+        let i = CalibInputs { hint_hz: 3_880_000_000, hpet_trust: gp_platform::clock::HpetTrust::Pc10, ..Default::default() };
+        let (mut p, mut q, mut t) = (ok(3_878_412_345), ok(3_878_000_000), Vec::new());
+        assert_eq!(choose(&i, None, Some(&mut p), &mut q, Some(3_878_400_000), 0, &mut t), (3_878_412_345, Source::PmTimer));
+        assert_eq!(t.len(), 1, "the PIT is not even tried");
+        let (mut p, mut q, mut t) = (bad(), ok(3_878_000_000), Vec::new());
+        assert_eq!(choose(&i, None, Some(&mut p), &mut q, Some(3_878_400_000), 0, &mut t), (3_878_000_000, Source::Pit));
+        let (mut p, mut q, mut t) = (bad(), bad(), Vec::new());
+        assert_eq!(choose(&i, None, Some(&mut p), &mut q, Some(3_878_400_000), 0, &mut t), (3_878_400_000, Source::Cpuid15));
     }
 
     #[test]

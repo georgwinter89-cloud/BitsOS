@@ -53,6 +53,19 @@ pub fn check_framebuffer(phys: u64, size: u64, width: u32, height: u32, stride: 
     Ok(())
 }
 
+/// The picture far above 512 GiB (plan/spec/gaming-pc.md §5): the whole framebuffer lies inside what the CPU can
+/// address (`phys_bits` from CPUID 0x80000008; 0 or an implausible value counts as x86's most, 52). The Gaming-PC's
+/// lies far above 512 GiB (the graphics card's 16 GiB BAR at 0xa0_0000_0000) and is fine with its 46 bits; an address
+/// past the CPU's bits would put reserved bits into the page table entries bitsboot builds for it, and the first
+/// pixel drawn would fault. Such a framebuffer is handed over as none (headless), with a line.
+pub fn check_reachable(phys: u64, size: u64, phys_bits: u32) -> Result<(), &'static str> {
+    let limit = if (1..=52).contains(&phys_bits) { 1u64 << phys_bits } else { 1u64 << 52 };
+    match phys.checked_add(size).and_then(|e| e.checked_add(0xFFF)) {
+        Some(end) if end & !0xFFF <= limit => Ok(()),
+        _ => Err("the framebuffer lies above what this CPU can address"),
+    }
+}
+
 /// Spec core.md 2.1: a framebuffer larger than this is never chosen (BT-2); for the firmware's own mode it is
 /// only a warning, the kernel maps what the firmware reports.
 pub const FB_LARGE: u64 = 64 << 20;
@@ -120,6 +133,28 @@ mod tests {
         assert!(check_framebuffer(0x8000_0000, 1280 * 800 * 4 - 1, 1280, 800, 1280, 4).is_err());
         assert!(check_framebuffer(0x8000_0000, u64::MAX, 1280, 800, 1000, 4).is_err());
         assert!(check_framebuffer(u64::MAX - 10, 1 << 20, 16, 16, 16, 4).is_err());
+    }
+
+    #[test]
+    fn a_framebuffer_far_above_512_gib_is_fine_and_one_past_the_cpu_is_not() {
+        let picture = 2560 * 1440 * 4;
+        // The Gaming-PC: 46 address bits, the picture at 640 GiB (14.11.2026) or 672 GiB (5.11.2026).
+        assert!(check_reachable(0xa0_0000_0000, picture, 46).is_ok());
+        assert!(check_reachable(0xa8_0000_0000, picture, 46).is_ok());
+        // The Mini-PC (48 bits, picture below 512 GiB) and QEMU, as before.
+        assert!(check_reachable(0x7C_0000_0000, picture, 48).is_ok());
+        assert!(check_reachable(0x8000_0000, 1280 * 800 * 4, 40).is_ok());
+        // Made up: the same address on a CPU with 39 bits (512 GiB), and addresses past 46 bits.
+        assert_eq!(check_reachable(0xa0_0000_0000, picture, 39), Err("the framebuffer lies above what this CPU can address"));
+        assert!(check_reachable(1 << 46, picture, 46).is_err());
+        assert!(check_reachable((1 << 46) - 4096, 4097, 46).is_err(), "the last page straddles the limit");
+        assert!(check_reachable((1 << 46) - 4096, 4096, 46).is_ok());
+        assert!(check_reachable(1 << 50, picture, 46).is_err(), "inside 52 bits, past this CPU's");
+        // No usable CPUID answer: x86's 52 bits.
+        assert!(check_reachable(1 << 50, picture, 0).is_ok());
+        assert!(check_reachable(1 << 52, picture, 0).is_err());
+        assert!(check_reachable(1 << 52, picture, 64).is_err());
+        assert!(check_reachable(u64::MAX - 10, 1 << 20, 46).is_err(), "wraps");
     }
 
     #[test]

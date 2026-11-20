@@ -50,7 +50,7 @@ shortcut, and sets QEMU up if this computer lacks it. Run again to add a newer r
                                ~/.local/share/bitsos; %LOCALAPPDATA%\\BitsOS on Windows)
   --size <n>G                  size of a new image (default 16G; sparse: it takes only what is written)
   --screen <W>x<H>|firmware    the window's screen mode (default 1600x900)
-  --trees none|<a,b,...>       program trees (default none: the system and the desktop); every tree is
+  --trees none|<a,b,...>       program trees (default none: only the system; QEMU shows no desktop); every tree is
                                untested in QEMU
   --steam yes|no, --brave yes|no   Steam or Brave from their makers (untested in QEMU, default no)
   --assets <dir>, --manifest-sha256 <hex>, --vendor-cache <dir>, --offline, --cache <dir>, --allow-missing
@@ -288,7 +288,7 @@ mod tests {
     fn secrets_and_test_flags_are_kept_in_their_place() {
         assert!(p("--wifi-psk hunter22").is_err());
         assert!(p("--wifi Net").is_err());
-        assert!(p("--extra-config desktop=on").is_err(), "only with --image");
+        assert!(p("--extra-config data_img_mb=64").is_err(), "only with --image");
         assert!(p("--image a.img --extra-config mcp=kernel").is_err());
         assert!(p("--erase a --update b").is_err());
         assert_eq!(parse_size("8G").unwrap(), 8 << 30);

@@ -240,7 +240,7 @@ pub(crate) fn check_again(d: &Discovery) -> ktest::TestResult {
     // not armed.
     let t0 = owner.hw().hw().now;
     let n0 = owner.log().totals().writes;
-    let (none, ok) = crate::psplive::with_live_held(|_| (crate::psplive::quiesce_halt(None, owner.hw()), crate::psplive::quiesce_halt(Some(&a), owner.hw())));
+    let (none, ok) = crate::psplive::with_live_held(&crate::psplive::State::new(), |_| (crate::psplive::quiesce_halt(None, owner.hw()), crate::psplive::quiesce_halt(Some(&a), owner.hw())));
     kassert!(none.is_none() && ok == Some(true), "quiesce halt: {none:?} {ok:?}");
     kassert!(owner.hw().hw().now == t0 && owner.log().totals().writes == n0, "quiesce halt waited or went through the owner's log");
     let f = owner.hw().hw();
@@ -281,13 +281,12 @@ pub(crate) fn check_restart(d: &Discovery) -> ktest::TestResult {
             f.write(b, 0);
             kassert!(f.get(R::RbRptr) == 0x40 && f.lost.last() == Some(&(b, 0)), "{what}: the fake took RB_RPTR 0 with CAPTURED set");
         }
-        let seq = klog::next_seq();
         let r2 = direct(d, &mut owner, &mut bo, &gu, r1.bo)?;
         kassert!(r2.passed() && r2.stopped_first && r2.rungs.iter().all(|x| x.pass), "{what}: again {:?} {:?} {:x?}", r2.error, r2.rungs, r2.rewinds);
-        // The kept RB_RPTR is a warn fallback (B6); a reset that took is no fallback.
-        let kept_ev = klog::read_since(seq, 4096).iter().any(|e| e.name == "sdma.ptr_kept" && e.level == klog::Level::Warn);
-        kassert!(kept_ev == keep, "{what}: sdma.ptr_kept warn {kept_ev}");
         let w = r2.rewinds.first().ok_or("again: no restart recorded")?;
+        // The kept RB_RPTR is a warn fallback (B6); a reset that took is no fallback. The restart's own record says
+        // whether its warn went out (the shared log is written by every test that runs beside this one).
+        kassert!(w.warned == keep, "{what}: sdma.ptr_kept warn {}", w.warned);
         kassert!(w.found.2 & f::DOORBELL_CAPTURED != 0 && w.after.2 & (f::DOORBELL_ENABLE | f::DOORBELL_CAPTURED) == 0, "{what}: doorbell {:x?}", w);
         if keep {
             kassert!(w.found.0 != 0 && w.after.0 == w.found.0 && w.start == w.found.0 && w.after.1 == 0, "{what}: {w:x?}");
@@ -416,7 +415,7 @@ fn starts() -> ktest::TestResult {
 }
 // INT-W28 post-integration made the fake chains here QemuOnly (52-121 KiB of stack in a release build, over MCP's
 // 64 KiB request thread). GX-7m2 boxed the chains' outcomes and owners and gave every engine stage its own frame:
-// at most 33 KiB with `ktest_stack=48` (29.10., release, QEMU; plan/notes/gx-GX-7m2.md): Safe again.
+// at most 33 KiB with `ktest_stack=48` (release, QEMU): Safe again.
 ktest::ktest!("gx.sdma.starts", Safe, starts);
 
 fn failures() -> ktest::TestResult {

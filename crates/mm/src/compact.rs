@@ -51,6 +51,8 @@ impl Daemon {
     /// One wake: the asked orders, else (woken without one, or the period ran out) the proactive check.
     fn work(&mut self) {
         let Some(b) = mm_core::boot_buddy() else { return };
+        // The HighAtomic reserve first: who takes from it cannot wait.
+        crate::highatomic::refill();
         let mut orders = cp::take_orders();
         if orders != 0 {
             let mut failed = None;
@@ -123,6 +125,8 @@ pub fn compact_memory() -> mm_core::CompactStats {
     let Some(b) = mm_core::boot_buddy() else { return Default::default() };
     let before = b.fragmentation_score();
     let s = b.compact_all(How::Manual, &mut sched::yield_now);
+    // W35 MM-2: the address spaces the run's migrations let go of end here (the writer's thread, no lock).
+    crate::aspace::migrate::drop_dying();
     klog::event!(Info, "mm", "compact.memory", score_before = before, score_after = b.fragmentation_score(), cleared = s.cleared,
         dropped = s.dropped, moved = s.moved, migrate_scanned = s.migrate_scanned, skipped_anon = s.skipped_anon);
     s
@@ -130,11 +134,14 @@ pub fn compact_memory() -> mm_core::CompactStats {
 
 fn start() -> Result<(), &'static str> {
     sched::spawn("mm.kcompactd", sched::Class::Background, || {
+        // A memory helper as kswapd (`mm_core::oom::mark_memalloc`).
+        mm_core::oom::mark_memalloc();
         let mut d = Daemon::default();
         loop {
             sched::sleep_ms(MIN_GAP_MS);
             cp::kcompactd_sleep((d.timeout_ms() - MIN_GAP_MS) * 1_000_000);
             d.work();
+            crate::aspace::migrate::drop_dying();
         }
     })
     .map_err(|_| "mm.kcompactd thread not started")?;

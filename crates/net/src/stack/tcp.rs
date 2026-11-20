@@ -104,7 +104,8 @@ pub struct SmolStream {
     closed: AtomicBool,
     reset: AtomicBool,
     /// The connection view's entry (PM-2), from the record as opened or accepted on; its close ends it.
-    conn: ksync::Once<policy::ConnHandle>,
+    /// Shared with a record still to be written (`Conn::on_established`).
+    conn: Arc<ksync::Once<policy::ConnHandle>>,
     /// The socket belongs to the kept pool (a reserved listener's, the MCP reserve): it goes back to the pool
     /// once the connection has closed instead of being freed.
     kept: bool,
@@ -156,7 +157,7 @@ impl SmolStream {
             fin_seen: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             reset: AtomicBool::new(false),
-            conn: ksync::Once::new(),
+            conn: Arc::new(ksync::Once::new()),
             bytes: policy::ConnCounters::new(),
             subject: ksync::SpinLock::named("net.tcp.owner", policy::Subject::KERNEL),
             established: AtomicBool::new(false),
@@ -176,12 +177,13 @@ impl SmolStream {
         s.set_ack_delay(ack_delay(q.mode()));
     }
 
-    /// A connection a listening socket completed (called by the card's poll, under its lock).
+    /// A connection a listening socket completed (called by the card's poll, under its lock). Its record is
+    /// written by `on_accepted`, once the lock is gone: the connection view allocates (its event ring doubles
+    /// up to 16 KiB at a time).
     pub(crate) fn accepted(stack: &'static Stack, iface: Arc<Iface>, handle: SocketHandle, local: SockAddr, peer: SockAddr, kept: bool, owner: policy::Subject) -> Self {
         let s = Self::new(stack, iface, handle, local, peer, kept, false);
         s.own(owner);
         s.established.store(true, Ordering::Release);
-        record(policy::ConnKind::Accepted, &s);
         s
     }
 
@@ -416,8 +418,17 @@ pub(crate) fn connect_start(stack: &'static Stack, to: SockAddr, local_port: Opt
         klog::event!(Warn, "net", "tcp.no_memory", peer = super::ip_str(to.ip), port = to.port, rx = rx, tx = tx;
             "no memory for the socket buffers: connect refused before any packet");
     })?;
+    // Its slot in the card's socket table, likewise (`Iface::lock_room`).
+    let mut room = iface::Room::new();
     let (handle, local) = {
-        let mut g = ifc.inner.lock();
+        let (mut g, slot) = ifc.lock_room(stack, &mut room, 0, 1, false);
+        if !slot {
+            drop(g);
+            CONNECT_FAILED.inc();
+            klog::event!(Warn, "net", "tcp.no_memory", peer = super::ip_str(to.ip), port = to.port, rx = rx, tx = tx;
+                "no memory for a larger socket table: connect refused before any packet");
+            return Err(NetError::NoMemory);
+        }
         let inner = &mut *g;
         // A port whose 4-tuple a connection on this card still holds (TIME-WAIT, a long-lived one after the
         // counter wrapped) is skipped.
@@ -452,7 +463,7 @@ pub(crate) fn connect_start(stack: &'static Stack, to: SockAddr, local_port: Opt
             return Err(NetError::Unreachable);
         }
         let local_ip = inner.iface.ipv4_addr().map(iface::from_v4).unwrap_or(crate::Ipv4::ANY);
-        (inner.sockets.add(sock), SockAddr { ip: local_ip, port })
+        (inner.sockets.add(sock, false), SockAddr { ip: local_ip, port })
     };
     super::TCP_CONNECTS.inc();
     let s = SmolStream::new(stack, ifc, handle, local, to, false, true);
@@ -600,7 +611,7 @@ impl crate::conn::Conn for SmolStream {
         self.with(|s| s.set_nagle_enabled(!on));
     }
 
-    /// TCP_QUICKACK (`__tcp_sock_set_quickack`, linux-6.6/net/ipv4/tcp.c:3259): 0 enters pingpong mode (delayed
+    /// TCP_QUICKACK (`__tcp_sock_set_quickack`, linux-7.3.1/net/ipv4/tcp.c:3687): 0 enters pingpong mode (delayed
     /// ACKs), 1 leaves it. An outgoing connection keeps its quick budget; an accepted one goes between ACK at once
     /// (`tune_listen`) and the delayed ACK. Linux sends an ACK that is due at once when it leaves pingpong; smoltcp
     /// (pinned) keeps a running delayed-ACK timer, so that ACK goes out when the timer ends (10 ms at most).
@@ -628,10 +639,16 @@ impl crate::conn::Conn for SmolStream {
         Some(self.wake.seq())
     }
 
-    fn on_established(&self) {
+    fn on_established(&self) -> Option<crate::conn::Opened> {
         self.established.store(true, Ordering::Release);
-        if !self.conn.is_completed() {
-            record(policy::ConnKind::Opened, self);
+        if self.conn.is_completed() {
+            return None;
         }
+        // Two references and a few words: the record is the caller's to write after its lock.
+        Some(crate::conn::Opened { conn: self.conn.clone(), bytes: self.bytes.clone(), who: *self.subject.lock(), local_port: self.local.port, peer: self.peer })
+    }
+
+    fn on_accepted(&self) {
+        record(policy::ConnKind::Accepted, self);
     }
 }

@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 /// The file the desk fills: `<test> <run> <yyyy-mm-dd> <generation>` per line, `#` comments.
 pub const MINIPC_FILE: &str = "host/tests/minipc/ran.txt";
+/// GP-ROUND: the same for the Gaming-PC's own tests (class `GamingPc`), filled by the desk after a remote round.
+pub const GAMINGPC_FILE: &str = "host/tests/gamingpc/ran.txt";
 /// A record older than this is stale: the test may have changed since the machine last ran it.
 const STALE_DAYS: i64 = 30;
 /// Boots of the gate's own table (`Run("gate/...")`), not scripts.
@@ -27,6 +29,9 @@ enum Home {
     Named(String),
     /// Only the real machine runs it.
     MiniPc,
+    /// GP-ROUND: only the Gaming-PC runs it (class `GamingPc`), counted through [`GAMINGPC_FILE`] as the Mini-PC's
+    /// through [`MINIPC_FILE`]: stale is a line, never red.
+    GamingPc,
 }
 
 /// `class Run("nv/10-nvme") belongs to another run` -> where the test belongs. `None`: not such a line.
@@ -35,12 +40,24 @@ fn home_of(why: &str) -> Option<Home> {
     if let Some(r) = class.strip_prefix("Run(\"").or_else(|| class.strip_prefix("RunHw(\"")) {
         return Some(Home::Named(r.trim_end_matches("\")").to_string()));
     }
-    Some(if matches!(class, "Program" | "Hardware" | "Picture" | "WithGeorg") { Home::MiniPc } else { Home::Gate })
+    Some(match class {
+        "Program" | "Hardware" | "Picture" | "WithGeorg" => Home::MiniPc,
+        "GamingPc" => Home::GamingPc,
+        _ => Home::Gate,
+    })
 }
 
 /// True if `why` is the kernel's line for a test of another run; anything else is a test that skipped itself.
 pub fn is_other_run(why: &str) -> bool {
     home_of(why).is_some()
+}
+
+/// The first line of a scenario's output that says it skipped (`SKIP: gcc missing`, `SKIPPED, NOTHING CHECKED`,
+/// `GREEN (SKIPPED: ...)`), whatever its exit code: Georg 30.10., a skip never passes for green.
+pub fn skip_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|t| {
+        *t == "SKIP" || ["SKIP:", "SKIP ", "SKIPPED"].iter().any(|p| t.starts_with(p)) || t.contains("(SKIPPED")
+    })
 }
 
 fn dir(root: &Path) -> PathBuf {
@@ -124,7 +141,7 @@ fn parse_ran(text: &str) -> BTreeMap<String, String> {
 }
 
 /// Days since 1970 of a `yyyy-mm-dd` date (Howard Hinnant's days_from_civil).
-fn days(date: &str) -> Option<i64> {
+pub fn days(date: &str) -> Option<i64> {
     let mut p = date.split('-');
     let (y, m, d): (i64, i64, i64) = (p.next()?.parse().ok()?, p.next()?.parse().ok()?, p.next()?.parse().ok()?);
     let y = if m <= 2 { y - 1 } else { y };
@@ -152,9 +169,19 @@ pub struct Report {
     pub minipc_never: usize,
     /// Mini-PC tests with no record or an old one, and records of tests that no longer exist.
     pub stale: Vec<String>,
+    /// GP-ROUND: the Gaming-PC's tests, recorded fresh, never recorded, and stale (as the Mini-PC's).
+    pub gamingpc: usize,
+    pub gamingpc_fresh: usize,
+    pub gamingpc_never: usize,
+    pub gamingpc_stale: Vec<String>,
 }
 
+#[cfg(test)]
 fn compute(universe: &[Summary], ran: &BTreeSet<String>, recorded: &BTreeMap<String, String>, now: i64) -> Report {
+    compute_both(universe, ran, recorded, &BTreeMap::new(), now)
+}
+
+fn compute_both(universe: &[Summary], ran: &BTreeSet<String>, recorded: &BTreeMap<String, String>, gp_recorded: &BTreeMap<String, String>, now: i64) -> Report {
     let mut r = Report::default();
     let mut all: BTreeMap<&str, Option<Home>> = BTreeMap::new();
     for s in universe {
@@ -172,6 +199,16 @@ fn compute(universe: &[Summary], ran: &BTreeSet<String>, recorded: &BTreeMap<Str
     for (n, home) in &all {
         if ran.contains(*n) {
             r.ran += 1;
+        } else if *home == Some(Home::GamingPc) {
+            r.gamingpc += 1;
+            match gp_recorded.get(*n) {
+                Some(d) if days(d).is_some_and(|d| now - d <= STALE_DAYS) => r.gamingpc_fresh += 1,
+                Some(d) => r.gamingpc_stale.push(format!("{n} (recorded {d})")),
+                None => {
+                    r.gamingpc_never += 1;
+                    r.gamingpc_stale.push(n.to_string());
+                }
+            }
         } else if *home == Some(Home::MiniPc) {
             r.minipc += 1;
             match recorded.get(*n) {
@@ -195,6 +232,11 @@ fn compute(universe: &[Summary], ran: &BTreeSet<String>, recorded: &BTreeMap<Str
             r.stale.push(format!("{n} (no such test any more)"));
         }
     }
+    for n in gp_recorded.keys() {
+        if !all.contains_key(n.as_str()) {
+            r.gamingpc_stale.push(format!("{n} (no such test any more)"));
+        }
+    }
     r
 }
 
@@ -213,11 +255,30 @@ fn ran_names(root: &Path) -> BTreeSet<String> {
 
 /// The gate's step: prints the report, `Err` when a test ran in no run.
 pub fn check(root: &Path, universe: &[Summary]) -> Result<(), String> {
+    check_with(root, universe, None)
+}
+
+/// An interim run's ledger: a test of `stable` that ran nowhere was left to the integrator's full run (not red);
+/// `left` says how many tests the run left out in all. Every other test is counted as strictly as in `check`.
+pub fn check_interim(root: &Path, universe: &[Summary], stable: &BTreeSet<String>, left: &str) -> Result<(), String> {
+    check_with(root, universe, Some((stable, left)))
+}
+
+/// Moves the stable ones of `nowhere` (`name` or `name (run x)`) to the returned list.
+fn split_left(r: &mut Report, stable: &BTreeSet<String>) -> Vec<String> {
+    let (left, red) = std::mem::take(&mut r.nowhere).into_iter().partition(|n| stable.contains(n.split(' ').next().unwrap_or("")));
+    r.nowhere = red;
+    left
+}
+
+fn check_with(root: &Path, universe: &[Summary], interim: Option<(&BTreeSet<String>, &str)>) -> Result<(), String> {
     if universe.is_empty() {
         return Err("ledger: the plain boot left no result to count".into());
     }
     let recorded = parse_ran(&std::fs::read_to_string(root.join(MINIPC_FILE)).unwrap_or_default());
-    let r = compute(universe, &ran_names(root), &recorded, today());
+    let gp_recorded = parse_ran(&std::fs::read_to_string(root.join(GAMINGPC_FILE)).unwrap_or_default());
+    let mut r = compute_both(universe, &ran_names(root), &recorded, &gp_recorded, today());
+    let left = interim.map(|(st, _)| split_left(&mut r, st)).unwrap_or_default();
     println!(
         "ledger: {} tests: {} ran in a gate boot, {} belong to the Mini-PC runs ({} recorded within {STALE_DAYS} days, {} declared but never run there), {} in no run",
         r.total,
@@ -227,8 +288,23 @@ pub fn check(root: &Path, universe: &[Summary]) -> Result<(), String> {
         r.minipc_never,
         r.nowhere.len()
     );
+    if let Some((_, line)) = interim {
+        println!("ledger: {line}");
+        if !left.is_empty() {
+            println!("ledger: of them in no run of this boot ({}): {}", left.len(), left.join(", "));
+        }
+    }
     if !r.stale.is_empty() {
         println!("ledger: Mini-PC stale ({}, {MINIPC_FILE}, not red): {}", r.stale.len(), r.stale.join(", "));
+    }
+    if r.gamingpc > 0 || !r.gamingpc_stale.is_empty() {
+        println!(
+            "ledger: {} tests belong to the Gaming-PC runs ({} recorded within {STALE_DAYS} days, {} declared but never run there)",
+            r.gamingpc, r.gamingpc_fresh, r.gamingpc_never
+        );
+    }
+    if !r.gamingpc_stale.is_empty() {
+        println!("ledger: Gaming-PC stale ({}, {GAMINGPC_FILE}, not red): {}", r.gamingpc_stale.len(), r.gamingpc_stale.join(", "));
     }
     if r.nowhere.is_empty() {
         Ok(())
@@ -263,6 +339,25 @@ mod tests {
     }
 
     #[test]
+    fn a_scenario_that_says_it_skipped_is_found() {
+        for (out, want) in [
+            ("== 1\nSKIP: gcc missing\n", Some("SKIP: gcc missing")),
+            ("SKIPPED, NOTHING CHECKED: no tree\n", Some("SKIPPED, NOTHING CHECKED: no tree")),
+            ("GREEN (SKIPPED: no glue)\n", Some("GREEN (SKIPPED: no glue)")),
+            ("ok   a\nSKIP MCP reboot listener: node missing\n", Some("SKIP MCP reboot listener: node missing")),
+            ("  SKIP (errlvl): no watch\n", Some("SKIP (errlvl): no watch")),
+            ("SKIP\n", Some("SKIP")),
+            // Not a skip of the scenario: a ktest of another run, a TAP line of a suite's known lines, a variable.
+            ("KTEST skip a.b: class Program belongs to another run\n", None),
+            ("known test-run: ok 2 x # SKIP no FUSE support  (desk)\n", None),
+            ("export MTOOLS_SKIP_CHECK=1\nSKIPPY\n", None),
+            ("green\n", None),
+        ] {
+            assert_eq!(skip_line(out), want, "{out:?}");
+        }
+    }
+
+    #[test]
     fn the_plain_boot_names_the_scripts() {
         let s = ktest::parse(PLAIN);
         assert_eq!(scripts_named(&s).into_iter().collect::<Vec<_>>(), ["nv/10-nvme"]);
@@ -291,6 +386,28 @@ mod tests {
         assert_eq!(r.stale, ["e.hw (recorded 2026-01-01)", "gone.test (no such test any more)"]);
     }
 
+    /// GP-ROUND: a Gaming-PC test is never red for not running in a gate boot, and is counted by its own file.
+    #[test]
+    fn gaming_pc_tests_are_counted_by_their_own_record_and_never_red() {
+        let s = ktest::parse("KTEST ok a (1 ms)\nKTEST skip g.rtl: class GamingPc belongs to another run\n\
+            KTEST skip g.old: class GamingPc belongs to another run\nKTEST skip h.hw: class Hardware belongs to another run\n\
+            KTEST done passed=1 failed=0 skipped=3\n");
+        assert_eq!(home_of("class GamingPc belongs to another run"), Some(Home::GamingPc));
+        let ran: BTreeSet<String> = ["a"].map(String::from).into();
+        let gp = parse_ran("g.rtl remote 2026-11-14 158\ng.old remote 2026-01-01 1\ngone gp 2026-11-14 158\n");
+        let r = compute_both(std::slice::from_ref(&s), &ran, &BTreeMap::new(), &gp, days("2026-11-15").unwrap());
+        assert!(r.nowhere.is_empty(), "{:?}", r.nowhere);
+        assert_eq!((r.gamingpc, r.gamingpc_fresh, r.gamingpc_never), (2, 1, 0));
+        assert_eq!(r.gamingpc_stale, ["g.old (recorded 2026-01-01)", "gone (no such test any more)"]);
+        assert_eq!((r.minipc, r.stale.clone()), (1, alloc_vec(&["h.hw"])));
+        let none = compute(std::slice::from_ref(&s), &ran, &BTreeMap::new(), 0);
+        assert_eq!((none.gamingpc, none.gamingpc_never, none.nowhere.len()), (2, 2, 0));
+    }
+
+    fn alloc_vec(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn a_test_that_ran_both_ways_counts_once() {
         let a = ktest::parse("KTEST ok x (1 ms)\nKTEST skip y: class Safe belongs to another run\nKTEST done passed=1 failed=0 skipped=1\n");
@@ -312,6 +429,11 @@ mod tests {
                     Home::Named(r.to_string())
                 }
                 _ if c.runs_here(true, false, "") || c.runs_here(true, true, "") => Home::Gate,
+                // GP-ROUND: a real machine's class whose machine is the Gaming-PC.
+                _ if c.on_machine(true) && !c.on_machine(false) => {
+                    assert!(c.runs_here(false, false, ""), "{c:?}");
+                    Home::GamingPc
+                }
                 _ => {
                     assert!(c.runs_here(false, false, "") || !c.runs_here(true, false, ""), "{c:?}");
                     Home::MiniPc
@@ -342,6 +464,27 @@ mod tests {
         let r = compute(std::slice::from_ref(&s), &ran_names(&root), &BTreeMap::new(), 0);
         assert_eq!((r.minipc, r.minipc_fresh, r.minipc_never, r.stale.len()), (2, 0, 2, 2));
         assert!(check(&root, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_interim_ledger_leaves_only_stable_tests_to_the_full_run() {
+        let root = scratch("interim");
+        let s = ktest::parse(PLAIN);
+        start(&root).unwrap();
+        record_boot(&root, "plain", "KTEST ok a.plain (1 ms)\nKTEST ok c.nv (1 ms)\n");
+        let stable: BTreeSet<String> = ["f.gate"].map(String::from).into();
+        // b.nv is not stable: red in both modes.
+        assert!(check_interim(&root, std::slice::from_ref(&s), &stable, "1 stable test left").is_err());
+        assert!(check(&root, std::slice::from_ref(&s)).is_err());
+        let stable: BTreeSet<String> = ["b.nv", "f.gate"].map(String::from).into();
+        check_interim(&root, std::slice::from_ref(&s), &stable, "2 stable tests left").unwrap();
+        // The full run stays as strict as before: a stable test that did not run is red.
+        let e = check(&root, std::slice::from_ref(&s)).unwrap_err();
+        assert!(e.starts_with("2 test(s)"), "{e}");
+        let mut r = compute(std::slice::from_ref(&s), &ran_names(&root), &BTreeMap::new(), 0);
+        assert_eq!(split_left(&mut r, &stable), ["b.nv (run nv/10-nvme)", "f.gate (run gate/nmi-nested)"]);
+        assert!(r.nowhere.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

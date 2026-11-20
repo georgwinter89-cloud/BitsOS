@@ -1,6 +1,6 @@
-//! AB-7b: `/sys/devices/system/cpu/cpuN/cache/indexM` (linux-6.6 drivers/base/cacheinfo.c
-//! `cache_default_attrs`, arch/x86/kernel/cpu/cacheinfo.c `ci_leaf_init`, `__cache_amd_cpumap_setup`,
-//! `get_cache_id`). The leaves come from CPUID 0x8000001D on AMD with TOPOEXT, else Intel's leaf 4 (both have
+//! AB-7b: `/sys/devices/system/cpu/cpuN/cache/indexM` (linux-7.3.1 drivers/base/cacheinfo.c:782
+//! `cache_default_attrs`, arch/x86/kernel/cpu/cacheinfo.c:584 `ci_info_init`, :488 `__cache_amd_cpumap_setup`,
+//! :297 `get_cache_id`). The leaves come from CPUID 0x8000001D on AMD with TOPOEXT, else Intel's leaf 4 (both have
 //! the same register layout). Both machines are homogeneous, so the leaves are read once on the asking CPU;
 //! which CPUs share a leaf comes from each CPU's APIC ID and LLC domain (`hal::smp::topology`).
 

@@ -1,7 +1,7 @@
 //! Settings applied live (WY-5): every message of the settings thread rebuilds the theme from the values; a
 //! different theme replaces the old one at once (no restart), drops every image drawn with the old colours and
 //! sizes, and with a new scale tells the output (clients get the new fractional scale). Favourites and the
-//! assistant's name follow `desktop.favourites` and `claude.name`.
+//! assistant's name follow `desktop.favourites` and `ai.assistant.name` (CL-5s; it was `claude.name`).
 
 use std::rc::Rc;
 
@@ -21,6 +21,13 @@ impl App {
                 self.settings_live = true;
                 self.apply_settings("list");
                 self.absicht_register();
+                self.sofa_register();
+                self.db_register();
+                self.db_pad_sync();
+                self.sofa_settings_came();
+                if self.assist_on() {
+                    self.assist_menu_follow();
+                }
             }
             Msg::Changed(k, v) => {
                 // WY-5c: the echo of a fold that a newer fold of the same bar already overtook.
@@ -34,11 +41,24 @@ impl App {
                     None => self.settings.remove(&k),
                 }
                 self.apply_settings(&k);
+                self.assist_setting(&k);
+                self.ki_setting(&k);
+                // WY-SET: the settings tabs' marks, consolidations and lists follow the value.
+                self.page_views_refresh();
+                if k == crate::db_settings::PAD {
+                    self.db_pad_sync();
+                }
+            }
+            Msg::Stored(k, own) => {
+                self.settings.set_stored(&k, own);
+                self.ki_setting(&k);
+                self.page_views_refresh();
             }
             Msg::Place(dir) => self.session_place(dir),
             Msg::Lost => {
                 self.settings_live = false;
                 self.absicht_sent.clear();
+                self.sofa.keys_sent = false;
                 self.page_dialogs_drop(None, "der Einstellungsdienst antwortet nicht");
             }
         }
@@ -51,10 +71,12 @@ impl App {
             .list("desktop.favourites")
             .unwrap_or_else(|| DEFAULT_FAVOURITES.iter().map(|s| s.to_string()).collect());
         self.desk.claude_name =
-            v.text("claude.name").map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Claude").to_string();
-        let mut t = Theme::build(v);
-        // WY-19: whether the gpu level is drawn is the renderer's to say (`fx_follow`), not a setting's.
-        t.effects_gpu = t.effects == crate::theme::Effects::Gpu && self.theme.effects_gpu;
+            v.text(crate::ki::NAME).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Claude").to_string();
+        // CL-3b: the assistant's own status names it once it answered; until then the setting does.
+        if self.assist.status.is_none() {
+            self.assist.name = self.desk.claude_name.clone();
+        }
+        let t = Theme::build(v);
         // A bar docked again (by anyone) ends its reveal.
         let docked = match self.desk.reveal.shown {
             Some(crate::reveal::Edge::Left) => t.layout.workspaces,
@@ -87,9 +109,6 @@ impl App {
                 t.layout.sidebar,
                 t.layout.statusbar
             );
-            if t.effects != self.theme.effects {
-                eprintln!("bitscomp: effects: level chosen: {}", t.effects.word());
-            }
             self.theme = Rc::new(t);
             self.theme_gen += 1;
             self.deco_img.clear();
@@ -101,6 +120,7 @@ impl App {
             }
             self.layout_dirty = true;
         }
+        self.sofa_apply();
         // WY-5b: foot.ini follows (only rewritten when its text changes), running terminals follow the mode.
         self.foot_sync();
         self.chrome_dirty();

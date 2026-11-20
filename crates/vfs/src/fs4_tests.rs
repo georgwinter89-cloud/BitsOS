@@ -356,7 +356,12 @@ fn nested_epolls_loops_and_depth() {
         assert_eq!(h.wait(outer, 8), vec![(IN, 3)]);
         assert!(h.wait(outer, 8).is_empty());
         h.write(p1, b"x");
-        assert_eq!(h.wait(outer, 8), vec![(IN, 3)], "a second wake of the inner epoll is a second edge");
+        assert!(h.wait(outer, 8).is_empty(), "a second write into the pipe wakes nobody: no second edge");
+        // An EPOLLET item on the pipe itself makes every write wake its readers: the inner epoll again.
+        let et = h.epoll();
+        assert_eq!(h.ctl(et, EPOLL_CTL_ADD, p0, IN | EPOLLET, 8), 0);
+        h.write(p1, b"x");
+        assert_eq!(h.wait(outer, 8), vec![(IN, 3)], "a wake of the inner epoll is a second edge");
         h.drain(p0);
         assert_eq!(h.ctl(inner, EPOLL_CTL_ADD, outer, IN, 4), -ELOOP);
         let third = h.epoll();

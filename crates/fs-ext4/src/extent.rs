@@ -1,4 +1,4 @@
-//! Extent trees (linux-6.6/fs/ext4/ext4_extents.h, extents.c): lookup, and one edit primitive that maps or
+//! Extent trees (linux-7.3.1/fs/ext4/ext4_extents.h, extents.c): lookup, and one edit primitive that maps or
 //! unmaps a range of file blocks, splitting extents, splitting full nodes (the root in the inode grows a
 //! level), removing empty nodes, keeping every index key equal to its child's first block (e2fsck checks
 //! that) and pulling a small tree back into the inode. Truncate, writes into holes and the conversion of

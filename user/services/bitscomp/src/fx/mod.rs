@@ -1,10 +1,8 @@
-//! WY-19: the full effect level of `theme.effects` (plan/notes/wy-design-v2-scout.md §6b). At `gpu`, on a renderer
-//! with shaders, the frame gets extra render elements: live backdrop blur behind glass, soft drop shadows and glows
-//! (19a), the ambient motion (19b) and the transitions (19c). `cheap` draws none of them: the rescue build, Pixman and
-//! a software rasteriser stay on the images the level has always drawn, and an idle desktop draws no frames.
+//! WY-19: the desktop's effects (plan/spec/bitscomp.md §3), always on: every frame gets extra render elements, live
+//! backdrop blur behind glass, soft drop shadows and glows (19a), the ambient motion (19b) and the transitions (19c).
 //!
-//! This module is renderer-neutral and in every build: which effects a frame shows, as data (`Kind`), in one element
-//! type (`FxElement`) that hands its drawing to the renderer (`CompRenderer::fx_draw`). The shaders are in `fx_gl`.
+//! This module says which effects a frame shows, as data (`Kind`), in one element type (`FxElement`) that hands its
+//! drawing to the renderer (`CompRenderer::fx_draw`). The shaders are in `fx_gl`.
 //!
 //! Damage. The tracker draws one element at a time and only inside the damage, so a blur cannot read the frame it is
 //! part of. `seal` gives every glass a stamp of what lies under it (each element's id, commit, place and alpha);
@@ -26,7 +24,7 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale};
 
 use crate::render::{CompElement, CompRenderer};
-use crate::theme::{Effects, Motion, Rgba};
+use crate::theme::{Motion, Rgba};
 use trans::{Look, Play, Playing, Title};
 
 /// An effect's name and instance (a panel's part, a window's surface): stays the same over the frames.
@@ -124,7 +122,7 @@ pub enum Demo {
     Flow([i32; 4]),
 }
 
-/// The effect level's state in the App.
+/// The effects' state in the App.
 #[derive(Default)]
 pub struct Fx {
     slots: HashMap<Key, Slot>,
@@ -132,12 +130,8 @@ pub struct Fx {
     /// The next ambient step's frame; set by a frame that draws moving effects, taken by `tick`.
     next: Option<Duration>,
     epoch: Option<Duration>,
-    /// `--fx-on-software` / `ctl fx software on`: draw the level on a software rasteriser too (tests, measuring).
-    pub on_software: bool,
     /// `ctl fx freeze T`: the ambient clocks stand at T seconds, no frame is asked for them.
     pub frozen: Option<f64>,
-    /// Why the chosen gpu level is not drawn, as last said (once per reason).
-    pub why_cheap: Option<String>,
     pub playing: Option<Playing>,
     serial: u64,
     pub title: Option<Title>,
@@ -282,42 +276,9 @@ pub fn seal<R: CompRenderer>(fx: &mut Fx, out: &mut [CompElement<R>], s: Scale<f
 }
 
 impl crate::state::App {
-    /// Follows what the renderer can do, before each frame while the level is chosen or still drawn: `can` is why it
-    /// cannot (said once per reason). The level is live: the cached images follow the new theme generation.
-    pub fn fx_follow(&mut self, can: Result<(), String>) {
-        let chosen = self.theme.effects == Effects::Gpu;
-        let draw = chosen && can.is_ok();
-        match can {
-            Err(why) if chosen && self.fx.why_cheap.as_deref() != Some(&why) => {
-                eprintln!("bitscomp: effects: gpu level chosen, drawing the cheap level: {why}");
-                self.fx.why_cheap = Some(why);
-            }
-            Ok(()) => self.fx.why_cheap = None,
-            Err(_) => {}
-        }
-        if self.theme.effects_gpu == draw {
-            return;
-        }
-        eprintln!("bitscomp: effects: drawing the {} level", if draw { "gpu" } else { "cheap" });
-        let mut t = (*self.theme).clone();
-        t.effects_gpu = draw;
-        self.theme = Rc::new(t);
-        self.theme_gen += 1;
-        self.deco_img.clear();
-        self.corner_img.clear();
-        self.menu_img = None;
-        self.hung_img.clear();
-        if !draw {
-            self.fx.playing = None;
-            self.fx.title = None;
-            self.fx.still();
-        }
-        self.chrome_dirty();
-    }
-
-    /// A transition, if this level plays them: `theme.motion` off has none, calm only the fade.
+    /// A transition: `theme.motion` off has none, calm only the fade.
     pub fn fx_play(&mut self, what: Play) {
-        if !self.theme.effects_gpu || self.theme.motion == Motion::Off {
+        if self.theme.motion == Motion::Off {
             return;
         }
         let what = if self.theme.motion == Motion::Calm { Play::Fade } else { what };
@@ -331,9 +292,9 @@ mod tests {
     use super::*;
     use smithay::backend::renderer::element::Kind as K;
     use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
-    use smithay::backend::renderer::pixman::PixmanRenderer;
+    use smithay::backend::renderer::gles::GlesRenderer;
 
-    type E = CompElement<PixmanRenderer>;
+    type E = CompElement<GlesRenderer>;
 
     fn solid(buf: &SolidColorBuffer, x: i32) -> E {
         SolidColorRenderElement::from_buffer(buf, (x, 0), 1.0, 1.0, K::Unspecified).into()

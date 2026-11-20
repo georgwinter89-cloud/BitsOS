@@ -1,0 +1,20 @@
+[package]
+name = "bitsprof"
+version = "0.1.0"
+edition = "2024"
+description = "SELFOPT-1: the sampling profiler (perf_event_open at ~1 kHz on every CPU) and its report; runs unchanged on BitsOS and CachyOS"
+
+[dependencies]
+# The perf ABI the kernel uses (record layouts, attribute bits), shared with it.
+perf-abi = { path = "../../../crates/perf-abi" }
+# perf_event_open, the ring mapping and the signalfd (the only unsafe code).
+usys = { path = "../usys" }
+
+[[bin]]
+name = "bitsprof"
+path = "src/main.rs"
+
+# A CPU-bound program with one known hot function: the scenario's target and the overhead benchmark.
+[[bin]]
+name = "profbusy"
+path = "src/bin/profbusy.rs"

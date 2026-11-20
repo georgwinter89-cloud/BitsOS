@@ -5,6 +5,8 @@
 
 use super::dhcp::{Action, DhcpState, Lease};
 use super::phy::{Phy, TxState};
+pub(crate) use super::slots::Room;
+use super::slots::{Sockets, FIRST_SLOTS};
 use super::{tcp, ListenShared, Stack};
 use crate::accept::AcceptQueue;
 use crate::{Ipv4, NetError, SockAddr};
@@ -15,13 +17,13 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use devmodel::net::NetDevice;
 use ksync::SpinLock;
-use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle};
 use smoltcp::socket::{dhcpv4, tcp as stcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr};
 
 /// Frames taken from the card per poll round (bounded work under the lock, B4). NW-7: Linux NAPI's weight
-/// (linux-6.6/include/linux/netdevice.h:2615 `NAPI_POLL_WEIGHT`); 32 paused the poll thread twice as often.
+/// (linux-7.3.1/include/linux/netdevice.h:2885 `NAPI_POLL_WEIGHT`); 32 paused the poll thread twice as often.
 pub const RX_BUDGET: usize = 64;
 /// Connections a listener holds beyond its backlog (listening, in handshake or waiting in the accept queue): a
 /// burst of SYNs (node/undici open the next connection before closing the idle one, spec §2.4 "knock") finds a
@@ -68,14 +70,14 @@ pub struct Info {
     pub metric: u32,
 }
 
-struct ListenSock {
+pub(crate) struct ListenSock {
     l: Arc<ListenShared>,
     handle: SocketHandle,
     /// From the stack's kept pool (a reserved listener): goes back there, never to the heap.
     kept: bool,
 }
 
-struct Orphan {
+pub(crate) struct Orphan {
     handle: SocketHandle,
     deadline_ns: u64,
     /// When the deadline's abort was made (its RST then has one second to leave).
@@ -85,14 +87,16 @@ struct Orphan {
 
 pub(crate) struct Inner {
     pub iface: Interface,
-    pub sockets: SocketSet<'static>,
+    /// The socket table. It and the two lists with one entry per socket (`listen`, `orphans`) have their room
+    /// before the lock is taken (`lock_room`): nothing here grows under it.
+    pub sockets: Sockets,
     dhcp: Option<SocketHandle>,
     dhcp_state: DhcpState,
     rx: Vec<u8>,
     tx: Vec<u8>,
     txs: TxState,
-    listen: Vec<ListenSock>,
-    orphans: Vec<Orphan>,
+    pub(super) listen: Vec<ListenSock>,
+    pub(super) orphans: Vec<Orphan>,
     discovers_logged: u32,
     /// A refill found no memory (logged once until a refill succeeds again).
     listen_short: bool,
@@ -147,8 +151,11 @@ impl Iface {
         let metric = dev.route_metric();
         let mtu = dev.mtu().max(576);
         let mut rx = alloc::vec![0u8; mtu + 18];
-        let mut tx = Vec::new();
+        // A frame's length from the start: the first frame out (and the first one held for a full ring) would
+        // otherwise make its buffer under the card's lock, more than a page with a large MTU.
+        let mut tx = Vec::with_capacity(mtu + 18);
         let mut txs = TxState::default();
+        txs.held.reserve_exact(mtu + 18);
         let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         // TCP initial sequence numbers and DHCP xids come from this. Until the stack's seed has RDRAND in it
         // (change request to CP), each card adds what differs between machines and boots: its MAC and the
@@ -160,13 +167,13 @@ impl Iface {
             let mut phy = Phy { dev: &*dev, rx: &mut rx, tx: &mut tx, st: &mut txs, rx_left: 0, rx_frames: 0, mtu };
             Interface::new(cfg, &mut phy, instant(now_ns))
         };
-        let mut sockets = SocketSet::new(Vec::new());
+        let mut sockets = Sockets::first();
         let dhcp_handle = dhcp.then(|| {
             let mut d = dhcpv4::Socket::new();
             // smoltcp hands out the lease time only with the whole packet. Cards live as long as the kernel, so
             // the buffer is leaked once per card (one MTU).
             d.set_receive_packet_buffer(alloc::boxed::Box::leak(alloc::vec![0u8; 1536].into_boxed_slice()));
-            sockets.add(d)
+            sockets.add(d, false)
         });
         let name = String::from(dev.name());
         let link = dev.link();
@@ -183,8 +190,8 @@ impl Iface {
                 rx,
                 tx,
                 txs,
-                listen: Vec::new(),
-                orphans: Vec::new(),
+                listen: Vec::with_capacity(FIRST_SLOTS),
+                orphans: Vec::with_capacity(FIRST_SLOTS),
                 discovers_logged: 0,
                 listen_short: false,
             }),
@@ -203,7 +210,7 @@ impl Iface {
         let mut g = self.inner.lock();
         let inner = &mut *g;
         if let Some(h) = inner.dhcp.take() {
-            inner.sockets.remove(h);
+            inner.sockets.remove(h, false);
         }
         apply_addr(&mut inner.iface, Some((addr, prefix)), router);
         let mut i = self.info.lock();
@@ -215,6 +222,8 @@ impl Iface {
     /// Hands a socket whose owner went away to the background closer (`kept`: it returns to the kept pool when
     /// done).
     pub(crate) fn orphan(inner: &mut Inner, handle: SocketHandle, now_ns: u64, kept: bool) {
+        // Called from a stream's drop under the card's lock: the list has a place for every slot of the table.
+        debug_assert!(inner.orphans.len() < inner.orphans.capacity(), "the orphan list grows under the card's lock");
         inner.orphans.push(Orphan { handle, deadline_ns: now_ns.saturating_add(ORPHAN_NS), aborted_ns: None, kept });
     }
 
@@ -227,7 +236,11 @@ impl Iface {
         let mtu = self.dev.mtu().max(576);
         // Before the guard: what the round leaves of it goes after the unlock.
         let mut stock = self.premake(stack, listeners, true);
-        let mut g = self.inner.lock();
+        // Their slots in the socket table, likewise. Without memory for them the round goes on and `refill`
+        // adds what fits.
+        let mut room = Room::new();
+        let (kept, other) = stock.iter().fold((0, 0), |(k, o), st| if st.kept { (k + st.socks.len(), o) } else { (k, o + st.socks.len()) });
+        let (mut g, _) = if kept + other == 0 { (self.inner.lock(), true) } else { self.lock_room(stack, &mut room, kept, other, true) };
         let inner = &mut *g;
 
         // Link watch: lost = keep the address; back = ask DHCP again at once (another network may be there).
@@ -275,7 +288,7 @@ impl Iface {
             let mut phy = Phy { dev: &*self.dev, rx: &mut inner.rx, tx: &mut inner.tx, st: &mut inner.txs, rx_left: RX_BUDGET, rx_frames: 0, mtu };
             let mut changed = false;
             loop {
-                match inner.iface.poll_ingress_single(now, &mut phy, &mut inner.sockets) {
+                match inner.iface.poll_ingress_single(now, &mut phy, inner.sockets.smol()) {
                     PollIngressSingleResult::None => break,
                     PollIngressSingleResult::PacketProcessed => {}
                     PollIngressSingleResult::SocketStateChanged => {
@@ -293,7 +306,7 @@ impl Iface {
             }
             // Egress is bounded per call; a few calls drain what the sockets have queued.
             for _ in 0..8 {
-                match inner.iface.poll_egress(now, &mut phy, &mut inner.sockets) {
+                match inner.iface.poll_egress(now, &mut phy, inner.sockets.smol()) {
                     smoltcp::iface::PollResult::None => break,
                     smoltcp::iface::PollResult::SocketStateChanged => changed = true,
                 }
@@ -401,7 +414,7 @@ impl Iface {
             // One more second after the abort for its RST (a peer without ARP answer never gets it). Counted from
             // the abort, not the deadline: a late round (a poll gap) still sends the RST first.
             if done || o.aborted_ns.is_some_and(|t| now_ns >= t.saturating_add(1_000_000_000)) {
-                let sock = sockets.remove(o.handle);
+                let sock = sockets.remove(o.handle, o.kept);
                 if o.kept {
                     stack.give_back(sock);
                 }
@@ -424,7 +437,7 @@ impl Iface {
             let ls = &inner.listen[i];
             if ls.l.queue.is_closed() {
                 let ls = inner.listen.swap_remove(i);
-                let sock = inner.sockets.remove(ls.handle);
+                let sock = inner.sockets.remove(ls.handle, ls.kept);
                 if ls.kept {
                     stack.give_back(sock);
                 }
@@ -480,12 +493,19 @@ impl Iface {
         let inner = &mut *g;
         while inner.listen.len() > keep {
             let ls = inner.listen.swap_remove(0);
-            let sock = inner.sockets.remove(ls.handle);
+            let sock = inner.sockets.remove(ls.handle, ls.kept);
             // A kept socket goes back to the pool like at every other removal site (`kept_made` stays exact).
             if ls.kept {
                 stack.give_back(sock);
             }
         }
+    }
+
+    /// Tests: the socket table's slots and sockets, and the room of the two lists beside it.
+    #[cfg(any(test, target_os = "none"))]
+    pub(crate) fn table_info(&self) -> (usize, usize, usize, usize) {
+        let g = self.inner.lock();
+        (g.sockets.slots(), g.sockets.used(), g.listen.capacity(), g.orphans.capacity())
     }
 
     #[cfg(test)]
@@ -506,7 +526,10 @@ impl Iface {
     pub(crate) fn add_listener(&self, stack: &Stack, l: &Arc<ListenShared>) -> Refill {
         let mut stock = self.premake(stack, core::slice::from_ref(l), false);
         let Some(stock) = stock.first_mut() else { return Refill::default() };
-        refill(&mut self.inner.lock(), l, 0, stock)
+        let mut room = Room::new();
+        let n = stock.socks.len();
+        let (mut g, _) = if l.reserve { self.lock_room(stack, &mut room, n, 0, false) } else { self.lock_room(stack, &mut room, 0, n, false) };
+        refill(&mut g, l, 0, stock)
     }
 
     /// The listening sockets each of `live` is missing on this card, made before the card's lock is taken:
@@ -574,7 +597,7 @@ impl Iface {
             let ls = inner.listen.swap_remove(i);
             let s = inner.sockets.get_mut::<stcp::Socket>(ls.handle);
             if s.state() == stcp::State::Listen {
-                let sock = inner.sockets.remove(ls.handle);
+                let sock = inner.sockets.remove(ls.handle, ls.kept);
                 if ls.kept {
                     stack.give_back(sock);
                 }
@@ -591,7 +614,7 @@ impl Iface {
 /// smoltcp has put the listening socket into SYN-RECEIVED; it is aborted before the SYN-ACK leaves (egress sends
 /// the RST instead) and listens again in `listeners`: no connection, no new socket, nothing allocated for the
 /// scanner.
-fn refuse_public(sockets: &mut SocketSet<'static>, listen: &[ListenSock]) {
+fn refuse_public(sockets: &mut Sockets, listen: &[ListenSock]) {
     for ls in listen.iter().filter(|ls| ls.l.private_only) {
         let s = sockets.get_mut::<stcp::Socket>(ls.handle);
         if s.state() != stcp::State::SynReceived {
@@ -655,7 +678,12 @@ fn wanted(inner: &Inner, l: &Arc<ListenShared>, handed: usize) -> (usize, usize)
 /// leaves MCP its listening sockets.
 fn refill(inner: &mut Inner, l: &Arc<ListenShared>, handed: usize, stock: &mut Stock<'_>) -> Refill {
     let (mut have, want) = wanted(inner, l, handed);
+    let (kept, other) = if l.reserve { (1, 0) } else { (0, 1) };
     while have < want {
+        // No slot in the table (no memory for a larger one): short, the next round asks again.
+        if !inner.admits(stock.stack, kept, other) {
+            return Refill { have, short: true };
+        }
         let Some(mut s) = stock.socks.pop() else {
             return Refill { have, short: stock.short };
         };
@@ -667,7 +695,8 @@ fn refill(inner: &mut Inner, l: &Arc<ListenShared>, handed: usize, stock: &mut S
             }
             break;
         }
-        let handle = inner.sockets.add(s);
+        let handle = inner.sockets.add(s, l.reserve);
+        debug_assert!(inner.listen.len() < inner.listen.capacity(), "the listener list grows under the card's lock");
         inner.listen.push(ListenSock { l: l.clone(), handle, kept: l.reserve });
         have += 1;
     }

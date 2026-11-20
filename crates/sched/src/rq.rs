@@ -1,12 +1,16 @@
 //! The run queue of one CPU (SC-3; pure, host-tested): KernelRt threads by strict priority, FIFO inside a
 //! priority; the fair class (Interactive, Normal, Background) by virtual runtime. Both lists are sorted vectors
 //! with the best entry last, so picking is a `pop` and inserting a binary search plus a move of the entries
-//! behind it (a CPU rarely has more than a handful waiting). The vectors only grow (R1: no limit); memory is
-//! taken under the queue lock in thread context only, never in an interrupt handler (the scheduler queues
-//! interrupt-time wake-ups elsewhere), and fallibly: a push without memory hands the item back (the scheduler
-//! then keeps the thread on the CPU's lock-free wake list and retries).
+//! behind it (a CPU rarely has more than a handful waiting). The vectors only grow (R1: no limit).
+//!
+//! A push never allocates: it runs under the queue's lock with interrupts off, on every wake-up, where the heap
+//! can neither reclaim nor compact (a queue of a few hundred threads is two pages).
+//! The room is made where threads are made: before a thread is listed, every queue gets room for every listed
+//! thread (`Room`, grown with the queue's lock dropped; `run::reserve`). A push that finds no room anyway hands
+//! the item back (the scheduler then keeps the thread on the CPU's lock-free wake list and retries).
 
 use alloc::vec::Vec;
+use ksync::Spare;
 
 /// One waiting KernelRt thread: higher `prio` first, then lower `seq` (earlier) first.
 struct RtEntry<T> {
@@ -49,9 +53,54 @@ pub enum Taken {
     Fair(u64),
 }
 
+/// Larger lists for one queue in the making (see the module doc). Declared before the queue's guard, so the
+/// lists it replaces are freed after the unlock.
+pub struct Room<T> {
+    rt: Spare<Vec<RtEntry<T>>>,
+    fair: Spare<Vec<FairEntry<T>>>,
+    /// Which list the last `has_room` found short.
+    short: (bool, bool),
+}
+
+impl<T> Default for Room<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Room<T> {
+    pub const fn new() -> Self {
+        Room { rt: Spare::new(), fair: Spare::new(), short: (false, false) }
+    }
+
+    /// With no spin lock held: allocates what the last `has_room` missed. `Err`: no memory.
+    pub fn grow(&mut self) -> Result<(), ()> {
+        if self.short.0 {
+            self.rt.grow()?;
+        }
+        if self.short.1 {
+            self.fair.grow()?;
+        }
+        Ok(())
+    }
+}
+
 impl<T> RunQueue<T> {
     pub const fn new() -> Self {
         RunQueue { rt: Vec::new(), fair: Vec::new(), min_vruntime: 0, back_seq: 0, front_seq: 0 }
+    }
+
+    /// Whether each list can hold `total` entries now (any thread may be of either class), taking the larger
+    /// lists out of `room` when they are there. False: drop the queue's lock, `room.grow()`, lock and ask again.
+    pub fn has_room(&mut self, room: &mut Room<T>, total: usize) -> bool {
+        let (rt, fair) = (total.saturating_sub(self.rt.len()), total.saturating_sub(self.fair.len()));
+        room.short = (!room.rt.fits(&mut self.rt, rt), !room.fair.fits(&mut self.fair, fair));
+        room.short == (false, false)
+    }
+
+    /// Entries each list can hold without growing (the smaller of the two).
+    pub fn capacity(&self) -> usize {
+        self.rt.capacity().min(self.fair.capacity())
     }
 
     pub fn len(&self) -> usize {
@@ -62,9 +111,9 @@ impl<T> RunQueue<T> {
     }
 
     /// Queues a KernelRt thread behind the others of its priority, or (`front`, a preempted thread) before them.
-    /// `Err(item)`: no memory to grow the queue.
+    /// `Err(item)`: the list is full (`has_room` made no room for it).
     pub fn push_rt(&mut self, prio: u8, front: bool, id: u64, item: T) -> Result<(), T> {
-        if self.rt.try_reserve(1).is_err() {
+        if self.rt.len() == self.rt.capacity() {
             return Err(item);
         }
         let seq = if front {
@@ -81,9 +130,9 @@ impl<T> RunQueue<T> {
         Ok(())
     }
 
-    /// Queues a fair-class thread at virtual runtime `vruntime`. `Err(item)`: no memory to grow the queue.
+    /// Queues a fair-class thread at virtual runtime `vruntime`. `Err(item)`: the list is full (as `push_rt`).
     pub fn push_fair(&mut self, vruntime: u64, id: u64, item: T) -> Result<(), T> {
-        if self.fair.try_reserve(1).is_err() {
+        if self.fair.len() == self.fair.capacity() {
             return Err(item);
         }
         let key = (vruntime, id);
@@ -178,17 +227,31 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    /// A queue with room for `n` threads, made the way the scheduler makes it.
+    fn queue(n: usize) -> RunQueue<u64> {
+        let mut q = RunQueue::new();
+        give_room(&mut q, n);
+        q
+    }
+
+    fn give_room(q: &mut RunQueue<u64>, n: usize) {
+        let mut room = Room::new();
+        while !q.has_room(&mut room, n) {
+            room.grow().unwrap();
+        }
+    }
+
     #[test]
     fn rt_is_strict_priority_and_fifo_inside_one() {
-        let mut q: RunQueue<u64> = RunQueue::new();
-        let _ = q.push_rt(50, false, 1, 1);
-        let _ = q.push_rt(50, false, 2, 2);
-        let _ = q.push_rt(90, false, 3, 3);
-        let _ = q.push_rt(10, false, 4, 4);
-        let _ = q.push_rt(50, false, 5, 5);
+        let mut q = queue(6);
+        q.push_rt(50, false, 1, 1).unwrap();
+        q.push_rt(50, false, 2, 2).unwrap();
+        q.push_rt(90, false, 3, 3).unwrap();
+        q.push_rt(10, false, 4, 4).unwrap();
+        q.push_rt(50, false, 5, 5).unwrap();
         assert_eq!(q.order(), vec![3, 1, 2, 5, 4]);
         // A preempted thread goes before the others of its priority.
-        let _ = q.push_rt(50, true, 6, 6);
+        q.push_rt(50, true, 6, 6).unwrap();
         assert_eq!(q.order(), vec![3, 6, 1, 2, 5, 4]);
         assert_eq!(q.best_rt_prio(), Some(90));
         let got: Vec<u64> = core::iter::from_fn(|| q.pop_best()).collect();
@@ -197,12 +260,12 @@ mod tests {
 
     #[test]
     fn fair_runs_the_least_virtual_runtime_first_and_rt_before_it() {
-        let mut q: RunQueue<u64> = RunQueue::new();
-        let _ = q.push_fair(300, 1, 1);
-        let _ = q.push_fair(100, 2, 2);
-        let _ = q.push_fair(200, 3, 3);
-        let _ = q.push_fair(100, 4, 4);
-        let _ = q.push_rt(1, false, 9, 9);
+        let mut q = queue(5);
+        q.push_fair(300, 1, 1).unwrap();
+        q.push_fair(100, 2, 2).unwrap();
+        q.push_fair(200, 3, 3).unwrap();
+        q.push_fair(100, 4, 4).unwrap();
+        q.push_rt(1, false, 9, 9).unwrap();
         assert_eq!(q.order(), vec![9, 2, 4, 3, 1]);
         assert_eq!(q.best_fair_vruntime(), Some(100));
         assert_eq!(q.pop_best(), Some(9));
@@ -212,10 +275,10 @@ mod tests {
 
     #[test]
     fn min_vruntime_only_grows() {
-        let mut q: RunQueue<u64> = RunQueue::new();
+        let mut q = queue(1);
         q.update_min(Some(50));
         assert_eq!(q.min_vruntime, 50);
-        let _ = q.push_fair(40, 1, 1);
+        q.push_fair(40, 1, 1).unwrap();
         q.update_min(Some(60));
         assert_eq!(q.min_vruntime, 50, "never back");
         q.pop_fair();
@@ -227,12 +290,12 @@ mod tests {
 
     #[test]
     fn stealing_takes_rt_first_then_the_last_fair_one_and_skips_pinned() {
-        let mut q: RunQueue<u64> = RunQueue::new();
-        let _ = q.push_fair(10, 1, 1);
-        let _ = q.push_fair(30, 2, 2);
-        let _ = q.push_fair(20, 3, 3);
-        let _ = q.push_rt(5, false, 7, 7);
-        let _ = q.push_rt(9, false, 8, 8);
+        let mut q = queue(5);
+        q.push_fair(10, 1, 1).unwrap();
+        q.push_fair(30, 2, 2).unwrap();
+        q.push_fair(20, 3, 3).unwrap();
+        q.push_rt(5, false, 7, 7).unwrap();
+        q.push_rt(9, false, 8, 8).unwrap();
         // 8 is pinned: the best movable RT thread is 7.
         assert_eq!(q.take_movable(|&t| t != 8), Some((7, Taken::Rt)));
         assert_eq!(q.take_movable(|&t| t != 8 && t != 2), Some((3, Taken::Fair(20))));
@@ -245,11 +308,11 @@ mod tests {
 
     #[test]
     fn many_entries_stay_sorted() {
-        let mut q: RunQueue<u64> = RunQueue::new();
+        let mut q = queue(2000);
         let mut x = 12345u64;
         for id in 0..2000u64 {
             x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let _ = q.push_fair(x >> 40, id, id);
+            q.push_fair(x >> 40, id, id).unwrap();
         }
         let mut last = 0;
         let mut n = 0;
@@ -260,5 +323,38 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 2000);
+    }
+
+    /// A push never allocates (it runs under the queue's lock with interrupts off): the lists grow only through
+    /// `Room`, to the thread count asked for, and a full list hands the item back.
+    #[test]
+    fn a_push_never_grows_a_list() {
+        let mut q: RunQueue<u64> = RunQueue::new();
+        assert_eq!(q.push_fair(1, 1, 1), Err(1), "a list without room took an entry");
+        assert_eq!(q.push_rt(1, false, 1, 1), Err(1));
+        give_room(&mut q, 300);
+        assert!(q.capacity() >= 300);
+        let (rt, fair) = (q.rt.capacity(), q.fair.capacity());
+        // Every thread fair, then every thread KernelRt: both lists take them all.
+        for id in 0..300u64 {
+            q.push_fair(id, id, id).unwrap();
+        }
+        let full = q.fair.len() == q.fair.capacity();
+        assert_eq!(q.push_fair(1, 999, 999).is_err(), full);
+        while q.pop_fair().is_some() {}
+        for id in 0..300u64 {
+            q.push_rt(7, id % 2 == 0, id, id).unwrap();
+        }
+        assert_eq!((q.rt.capacity(), q.fair.capacity()), (rt, fair), "a push allocated");
+        // Room asked for again with threads queued: they keep their order across the swap.
+        let before = q.order();
+        give_room(&mut q, 5000);
+        assert!(q.capacity() >= 5000);
+        assert_eq!(q.order(), before);
+        // Enough room already: nothing is made.
+        let mut room = Room::new();
+        assert!(q.has_room(&mut room, 4000));
+        assert!(room.grow().is_ok());
+        assert_eq!(q.rt.len(), 300);
     }
 }

@@ -15,6 +15,8 @@ net = { path = "../net" }
 # UL-7: reboot(2) restarts and powers off through CP-5's platform functions (granted to UL, src/reboot.rs).
 platform = { path = "../platform" }
 uapi = { path = "../uapi" }
+# UPDATE: uname -v and /proc/sys/kernel/version name the build's version number.
+bitsver = { path = "../bitsver" }
 kreg = { path = "../kreg" }
 klog = { path = "../klog" }
 hal = { path = "../hal" }
@@ -25,6 +27,12 @@ time = { path = "../time" }
 ksync = { path = "../ksync" }
 policy = { path = "../policy" }
 ktest = { path = "../ktest" }
+# SELFOPT-1: the perf events' ABI (shared with bitsprof) and the kernel symbol table for /proc/kallsyms.
+perf-abi = { path = "../perf-abi" }
+kexec = { path = "../kexec" }
+# SYS-K: the SMBIOS identity (/sys/class/dmi/id) and the enumerated USB devices (/sys/bus/usb/devices).
+acpi = { path = "../acpi" }
+usb-core = { path = "../drivers/usb-core" }
 
 [lints]
 workspace = true

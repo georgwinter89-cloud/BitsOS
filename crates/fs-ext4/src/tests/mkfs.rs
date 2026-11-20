@@ -99,7 +99,7 @@ fn mkfs_cut_leaves_nothing_mountable_or_a_clean_volume() {
     dev.record();
     format(&dev, &opts_for(true)).unwrap();
     let log = dev.take_log();
-    let writes: std::vec::Vec<_> = log.iter().filter(|(at, _)| *at != u64::MAX).collect();
+    let writes: std::vec::Vec<_> = log.iter().filter(|(at, _)| !crate::dev::is_mark(*at)).collect();
     for k in 0..writes.len() {
         let img = MemDev::new(vec![0u8; 32 << 20]);
         for (at, data) in &writes[..k] {

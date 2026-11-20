@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use bitssnap::dev::Dev;
-use bitssnap::{human, local_time, restore, serve, settings, space};
+use bitssnap::{human, local, local_time, restore, serve, settings, space};
 use std::process::exit;
 
 const USAGE: &str = "usage: bitssnap COMMAND
@@ -26,7 +26,10 @@ const USAGE: &str = "usage: bitssnap COMMAND
   stats                     the kernel's raw pool numbers
   prune [--dry-run]         apply the retention rules now (snap.* settings)
   serve [--once]            the scheduler init starts (every snap.interval_min minutes), MCP tools
-                            snapshots, snapshot_take, snapshot_delete and restore";
+                            snapshots, snapshot_take, snapshot_delete and restore, and the desktop's socket
+                            /run/bitsos/bitssnap.sock (BITSSNAP_SOCKET elsewhere)
+  ask JSON                  one request to the desktop's socket (op list, browse, restore-path, ...), the
+                            answer printed; exit 0 when it says ok";
 
 fn fail(m: impl std::fmt::Display) -> ! {
     eprintln!("bitssnap: {m}");
@@ -128,6 +131,12 @@ fn main() {
             let r = serve::round(&mut dev(), &s, false, dry).unwrap_or_else(|e| fail(e));
             let verb = if dry { "would delete" } else { "deleted" };
             println!("{verb} by age: {:?}; for space: {:?}; {}.{} % free", r.deleted_age, r.deleted_space, r.free_permille / 10, r.free_permille % 10);
+        }
+        ["ask", line] => {
+            let sock = std::env::var("BITSSNAP_SOCKET").unwrap_or_else(|_| local::SOCKET.into());
+            let (ok, out) = local::ask(&sock, line).unwrap_or_else(|e| fail(e));
+            println!("{out}");
+            exit(if ok { 0 } else { 1 })
         }
         ["serve"] => exit(serve::serve(false)),
         ["serve", "--once"] => exit(serve::serve(true)),

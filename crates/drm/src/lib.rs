@@ -11,7 +11,7 @@
 //!
 //! DR-2, the DRM core: the render node `/dev/dri/renderD128` (char 226:128, `node`), the size-tolerant ioctl
 //! front end (`dispatch`, Linux `drm_ioctl`), the core ioctls with Linux 6.6's table (`core`), open files with
-//! their handle tables (`file`, `handles`), the device registry and CONFIG `drm=` (`device`), the /sys tree
+//! their handle tables (`file`, `handles`), the device registry and the test-only CONFIG `drm=fake` (`device`), the /sys tree
 //! libdrm walks (`sysfs`), and the fake GPU behind it under QEMU (`fake`).
 //!
 //! DR-3: fences (`fence`, Linux's dma_fence with chains and arrays), sync objects with their twelve ioctls
@@ -64,12 +64,15 @@ pub mod info;
 pub mod job;
 pub mod ioc;
 pub mod node;
+pub mod pm;
 pub mod prime;
 pub mod profile_780m;
+pub mod profile_9070xt;
 pub mod resv;
 pub mod sync_file;
 pub mod syncobj;
 pub mod sysfs;
+pub mod sysfs_pm;
 pub mod udmabuf;
 pub mod userptr;
 pub mod vm;
@@ -83,8 +86,14 @@ pub use wire::Wire;
 
 /// Registers a backend and makes its node `/dev/dri/renderD<minor>` (and /dev/dri with it).
 pub fn add_device(driver: alloc::sync::Arc<dyn Driver>) -> Result<alloc::sync::Arc<Device>, vfs::Errno> {
-    let d = device::register(driver)?;
+    add_device_at(driver, None)
+}
+
+/// `add_device` with a wished place in the driver's device order (`device::register_at`).
+pub fn add_device_at(driver: alloc::sync::Arc<dyn Driver>, index: Option<u32>) -> Result<alloc::sync::Arc<Device>, vfs::Errno> {
+    let d = device::register_at(driver, index)?;
     node::publish(&d);
+    sysfs_pm::added(&d);
     Ok(d)
 }
 
@@ -96,6 +105,7 @@ pub fn remove_device(d: &alloc::sync::Arc<Device>) {
         return;
     }
     node::unpublish(d);
+    sysfs_pm::removed(d);
     device::release_minor(d);
 }
 
@@ -109,6 +119,8 @@ pub fn boot() {
 mod ktests;
 #[cfg(not(test))]
 mod ktests_dr3;
+#[cfg(not(test))]
+mod ktests_sysk;
 #[cfg(not(test))]
 mod ktests_dr4;
 #[cfg(not(test))]
@@ -140,3 +152,5 @@ mod dr7_tests;
 mod dr8_tests;
 #[cfg(test)]
 mod dr9_tests;
+#[cfg(test)]
+mod l7_tests;

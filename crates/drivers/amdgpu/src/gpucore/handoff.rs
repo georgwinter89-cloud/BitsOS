@@ -135,7 +135,7 @@ pub fn read_note(hw: &mut dyn super::psp::Hw, a: &crate::ipmod::psp13::Addrs, ri
     StopNote { ring, gc, tmr_destroyed, bus_master_left_on, wptr, size, addr_lo, addr_hi }
 }
 
-/// How the note crosses a Reload: kexec's driver-note slot (a change request on RB, gx-GX-7f.md), bound by the
+/// How the note crosses a Reload: kexec's driver-note slot (`kexec::crash::hand_on_note`), bound by the
 /// kernel at boot. `put` runs in the Quiesce hook (interrupts off: no allocation, no lock); `take` gives the note
 /// the kernel before handed on in this Reload (nothing after a firmware start); `from_reload` tells whether this
 /// boot came from a Reload at all (kexec's boot marker of the same boot), so "nothing handed on" can say which.
@@ -154,6 +154,34 @@ impl NoteIo {
     pub fn take_note(&self) -> Option<StopNote> {
         (self.take)(TAG).and_then(|b| StopNote::parse(&b))
     }
+    /// GP-GPU2: the note of the device at `key`, in a slot of its own (`tag_for`), so a second device with a PSP ring
+    /// never overwrites the 780M's (which keeps `TAG`). False for a key with no tag.
+    pub fn put_note_for(&self, key: crate::devs::Key, n: &StopNote) -> bool {
+        tag_for(key).is_some_and(|t| (self.put)(t, &n.bytes()))
+    }
+    pub fn take_note_for(&self, key: crate::devs::Key) -> Option<StopNote> {
+        (self.take)(tag_for(key)?).and_then(|b| StopNote::parse(&b))
+    }
+    /// GX-10 PS: the bootloader note of the device at `key` (`rdna4_core::bootnote`), as bytes, in a slot of its own
+    /// next to the device's stop note. False for a key with no tag.
+    pub fn put_boot_for(&self, key: crate::devs::Key, bytes: &[u8]) -> bool {
+        boot_tag_for(key).is_some_and(|t| (self.put)(t, bytes))
+    }
+    pub fn take_boot_for(&self, key: crate::devs::Key) -> Option<alloc::vec::Vec<u8>> {
+        (self.take)(boot_tag_for(key)?)
+    }
+}
+
+/// GP-GPU2: the driver-note tag of a device other than the 780M: "GP", the bus and the device/function byte. Its
+/// second byte differs from `TAG`'s, so it is never `TAG`; two functions never share one. Segment 0 only (both
+/// machines have no other); `None` elsewhere, and then no note is written for that device.
+pub fn tag_for(key: crate::devs::Key) -> Option<u32> {
+    (key.segment == 0 && key.dev < 32 && key.func < 8).then(|| u32::from_le_bytes([b'G', b'P', key.bus, key.dev << 3 | key.func]))
+}
+
+/// GX-10 PS: the tag of a device's bootloader note: `tag_for`'s with "GB" for "GP", so it is neither that nor `TAG`.
+pub fn boot_tag_for(key: crate::devs::Key) -> Option<u32> {
+    tag_for(key).map(|t| t & !0xFF00 | u32::from(b'B') << 8)
 }
 
 /// GX-7i2: how this boot's note from the kernel before arrived (logged once at warn level, shown by gx_probe, so

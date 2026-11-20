@@ -28,8 +28,6 @@ pub struct Install {
     link: Option<(u64, UnixStream)>,
     /// Buttons pressed while the overlay was shown: their releases stay with it (`pointer::button`).
     pub buttons: HashSet<u32>,
-    /// Headless test aid (`ctl install test-seconds N`, nested build only): a grant of N seconds is offered.
-    pub test_secs: Option<i64>,
     log: Vec<String>,
     /// What the overlay draws, cached (`install_draw`).
     pub images: crate::install_draw::Images,
@@ -295,10 +293,7 @@ impl App {
             self.notice("Kein Installer verbunden: es gibt nichts zu erlauben.");
             return;
         }
-        let mut durs = DURS.to_vec();
-        if let Some(s) = self.install.test_secs {
-            durs.insert(0, Dur::Secs(s));
-        }
+        let durs = DURS.to_vec();
         self.cancel_pointer_modes();
         self.address_end();
         self.page_edit_end();
@@ -402,17 +397,11 @@ impl App {
         }
     }
 
-    /// `ctl install`: the state, `log`, the button centres (physical pixels), test aids.
+    /// `ctl install`: the state, `log`, the button centres (physical pixels).
     pub fn install_ctl(&mut self, words: &[&str]) -> Result<String, String> {
         match words.get(1).copied() {
             None => Ok(self.install_report()),
             Some("log") => Ok(self.install.log.join("\n")),
-            Some("test-seconds") if cfg!(feature = "nested") && self.headless => {
-                let n: i64 = words.get(2).and_then(|w| w.parse().ok()).filter(|n| (1..=600).contains(n)).ok_or("usage: install test-seconds 1..600")?;
-                self.install.test_secs = Some(n);
-                Ok(format!("the grant dialog offers {n} s"))
-            }
-            Some("test-seconds") => Err("install test-seconds: only in the headless test build".into()),
             Some(o) => Err(format!("unknown install command {o}")),
         }
     }
@@ -698,12 +687,68 @@ mod tests {
         app.lib.alone.key(125, true, 0);
         press(&mut app, 0x122);
         assert!(!app.lib.alone.key(125, false, 10), "Win alone after a pad button");
-        // Without a dialog, Home is the library; the origin outside the event stays what it was.
+        // Without a dialog, Home switches the sofa mode (GM-6a); the origin outside the event stays what it was.
+        assert!(!app.sofa.active, "no sofa mode over the question");
         app.input_origin = Origin::Injected;
         app.pad_feed(1, &[(EV_KEY, 0x128, 0), (EV_KEY, 0x129, 0), (EV_SYN, SYN_REPORT, 0)]);
         app.pad_feed(1, &[(EV_KEY, 0x128, 1), (EV_KEY, 0x129, 1), (EV_SYN, SYN_REPORT, 0)]);
         app.pad_tick(crate::pacer::now() + Duration::from_secs(1));
-        assert!(app.lib.open);
+        assert!(app.sofa.active && !app.lib.open);
         assert_eq!(app.input_origin, Origin::Injected, "a pad press left its origin behind");
+    }
+
+    /// GM-6a (MC-9b): with the sofa mode on, on a sofa screen or behind a program in front, the installer's
+    /// question keeps the pad and the keys first: A, the hat, Home (the chord) and Win+Esc neither answer it nor
+    /// switch the mode or open the quick menu; a pad's B refuses as before.
+    #[test]
+    fn the_sofa_mode_never_takes_the_dialogs_input() {
+        use crate::backend::evdev_map::{EV_ABS, EV_KEY, EV_SYN, SYN_REPORT};
+        use crate::input::InputEvent;
+        let (_d, mut app, mut p) = linked();
+        let byte = crate::pad::Axis { min: 0, max: 255, flat: 15 };
+        let keys: Vec<u16> = (0x120..=0x12b).collect();
+        app.sofa_settings_came();
+        app.pad_plug(1, crate::pad_app::PadDev::new("test", "DragonRise", (0x0079, 0x0006), &keys, (Some(byte), Some(byte)), Origin::Physical));
+        assert!(app.sofa.active, "the pad started the sofa mode");
+        let feed = |app: &mut App, evs: &[(u16, u16, i32)]| {
+            let mut v = evs.to_vec();
+            v.push((EV_SYN, SYN_REPORT, 0));
+            app.pad_feed(1, &v);
+        };
+        for (n, program) in [(20u64, false), (21, true)] {
+            app.sofa.front = if program { crate::sofa::Front::Program } else { crate::sofa::Front::Shell };
+            line(&mut app, 1, ask(n));
+            let a = app.install.ask.as_mut().unwrap();
+            (a.on_yes, a.seen_end, a.opened) = (true, true, Duration::ZERO);
+            let before = app.sofa_state();
+            feed(&mut app, &[(EV_KEY, 0x122, 1)]);
+            feed(&mut app, &[(EV_KEY, 0x122, 0)]);
+            feed(&mut app, &[(EV_ABS, crate::pad::ABS_HAT0X, 1)]);
+            feed(&mut app, &[(EV_ABS, crate::pad::ABS_HAT0X, 0)]);
+            feed(&mut app, &[(EV_KEY, 0x128, 1), (EV_KEY, 0x129, 1)]);
+            app.pad_tick(crate::pacer::now() + Duration::from_secs(1));
+            feed(&mut app, &[(EV_KEY, 0x128, 0), (EV_KEY, 0x129, 0)]);
+            assert_eq!(app.pads.list[0].1.last.map(|l| l.0), Some("Home"), "the chord came out as Home");
+            assert_eq!(app.sofa_state(), before, "a pad press over the question changed the sofa mode (program {program})");
+            assert!(app.install.ask.as_ref().is_some_and(|a| a.id == n && a.on_yes), "the pad answered the question");
+            assert_eq!(sent(&mut p), "", "nothing answered");
+            // Win+Esc on the real keyboard: the question has the key (its Esc), the mode stays as it was.
+            for (code, pressed) in [(125, true), (1, true), (1, false), (125, false)] {
+                app.handle_input_as(InputEvent::Key { code, pressed }, Origin::Physical);
+            }
+            assert!(app.sofa.active, "Win+Esc over the question left the sofa mode");
+            assert_eq!(app.sofa.front, if program { crate::sofa::Front::Program } else { crate::sofa::Front::Shell });
+            assert!(!app.sofa.nav.quick);
+            if app.install.ask.is_some() {
+                feed(&mut app, &[(EV_KEY, 0x121, 1)]);
+                feed(&mut app, &[(EV_KEY, 0x121, 0)]);
+            }
+            assert!(app.install.ask.is_none());
+            assert!(!sent(&mut p).contains("true"), "never a yes");
+        }
+        // Without a dialog the same pad works the sofa mode again.
+        feed(&mut app, &[(EV_KEY, 0x128, 1), (EV_KEY, 0x129, 1)]);
+        app.pad_tick(crate::pacer::now() + Duration::from_secs(1));
+        assert!(app.sofa.nav.quick, "the chord over the program opens the quick menu");
     }
 }

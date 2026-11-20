@@ -544,7 +544,7 @@ static void part_threads(void) {
     write(hold[1], "x", 1);
     pthread_join(th, NULL);
     close(hold[0]), close(hold[1]);
-    /* The joiner wakes in exit_mm, before exit_notify takes the thread off the list (linux-6.6/kernel/exit.c:861, 894). */
+    /* The joiner wakes in exit_mm, before exit_notify takes the thread off the list (linux-7.3.1/kernel/exit.c:974, 999). */
     for (int i = 0; i < 200; i++) {
         slurp("/proc/self/status");
         if (!strcmp(key("Threads"), "1"))

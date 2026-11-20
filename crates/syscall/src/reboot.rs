@@ -1,5 +1,5 @@
-//! reboot(2) (UL-7; AB's syscall file granted to UL for it), linux-6.6/kernel/reboot.c `SYSCALL_DEFINE4(reboot)`
-//! :700 and kernel/pid_namespace.c `reboot_pid_ns` :319, numbers from include/uapi/linux/reboot.h.
+//! reboot(2) (UL-7; AB's syscall file granted to UL for it), linux-7.3.1/kernel/reboot.c `SYSCALL_DEFINE4(reboot)`
+//! :738 and kernel/pid_namespace.c `reboot_pid_ns` :320, numbers from include/uapi/linux/reboot.h.
 //!
 //! Order as Linux: CAP_SYS_BOOT in the caller's pid namespace's user namespace (EPERM), the magic numbers
 //! (EINVAL), a child pid namespace's init ended as if by SIGHUP (restart) or SIGINT (power off, halt) and the

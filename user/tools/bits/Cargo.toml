@@ -1,0 +1,20 @@
+[package]
+name = "bits"
+version = "0.1.0"
+edition = "2024"
+description = "EINS-D (PLAN K7): one command for BitsOS: windows, the desktop as a list, settings, workspaces, files, clipboard, pictures, notices, measurements, programs, the trash"
+publish = false
+
+# Path dependencies only (nothing new to download): uilist for C1's ids, bitstree for PLAN K5, bitspkg and bitsrun
+# for the command view of the scripting set; serde_json and miniz_oxide are pinned as elsewhere in user/.
+[dependencies]
+bitstree = { path = "../../lib/bitstree" }
+bitspkg = { path = "../bitspkg" }
+bitsrun = { path = "../bitsrun" }
+usys = { path = "../usys" }
+serde_json = "=1.0.154"
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+
+[[bin]]
+name = "bits"
+path = "src/main.rs"

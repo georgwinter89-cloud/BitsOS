@@ -251,3 +251,29 @@ fn late_record_skips_a_reused_pid() {
     record_conn(rec(ConnKind::Closed, 41006, 3_000));
     forget_test_connections(&s);
 }
+
+/// ATOMIC-3: a new peer's entry is opened under the socket's sleeping lock (`open` may grow the view's lists, which
+/// must not happen under a spin lock). Eight threads sending to and hearing from the same 40 new peers at once
+/// still give one entry per peer, with every datagram's bytes in it.
+#[test]
+fn threads_on_one_udp_socket_open_one_entry_per_peer() {
+    let _g = serial();
+    let s = fresh(0x504D_0032);
+    let u = UdpPeers::new(s, 40102);
+    std::thread::scope(|sc| {
+        for _ in 0..8 {
+            sc.spawn(|| {
+                for i in 0..40u8 {
+                    u.sent(IpAddr::V4([192, 0, 2, 100 + i]), 5000, 7);
+                    u.received(IpAddr::V4([192, 0, 2, 100 + i]), 5000, 5, None);
+                }
+            });
+        }
+    });
+    assert_eq!(u.peers(), 40);
+    let v = mine(&s, true);
+    assert_eq!(v.len(), 40, "one entry per peer");
+    assert!(v.iter().all(|c| (c.bytes_out, c.bytes_in) == (56, 40)), "every datagram counted once");
+    drop(u);
+    forget_test_connections(&s);
+}

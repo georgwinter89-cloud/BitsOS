@@ -1,0 +1,5 @@
+# The cable card's firmware xtask copies onto the stick (host/xtask/src/firmware.rs): the RTL8126A in the Gaming-PC,
+# XID 64a. With V2_FW_INITRD=1 it also goes into the initramfs, where the driver looks first.
+# linux-firmware 1:20261019-1, 13 232 bytes unpacked,
+# sha256 18ffaf3b873d217bf780503a80f04fe2b03c088ba2d0c2a3d626145cb8e53b26. The file itself is never in git.
+rtl_nic/rtl8126a-3.fw

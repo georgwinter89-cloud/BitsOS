@@ -1,4 +1,4 @@
-//! GX-7a: the PSP's command protocol, version-independent (linux-6.6 amdgpu/amdgpu_psp.c, psp_gfx_if.h): the KM
+//! GX-7a: the PSP's command protocol, version-independent (linux-7.3.1 amdgpu/amdgpu_psp.c, psp_gfx_if.h): the KM
 //! ring of 64-byte frames in a GPU-visible buffer, one 1024-byte command buffer per command, a fence value per
 //! frame written back by the PSP, and the bring-up order of `psp_load_fw` for an APU whose secure OS the BIOS
 //! started: ring create, LOAD_TOC (the TMR size), the TMR in the carve-out (SETUP_TMR), then LOAD_IP_FW for each
@@ -14,7 +14,7 @@
 //! GX-7d, stricter than Linux: any non-zero command status is fatal (`CmdStatus`: stop, undo, report; Linux only
 //! warns, amdgpu_psp.c:681-699, and the 27.10. capture had none); a ring or TMR an earlier kernel left is
 //! destroyed first (`Prior::Stale`: DESTROY_RINGS before create, DESTROY_TMR before LOAD_TOC); DMCUB is never in
-//! a list (GX-D9) and VCN only when `allow_vcn`; `Until` stops after M1 (ring + LOAD_TOC) or M2 (all firmware).
+//! a list (GX-D9); VCN's microcode is loaded with the rest (GX-8v); `Until` stops after M1 (ring + LOAD_TOC) or M2 (all firmware).
 //! `stop` neither allocates nor sleeps beyond `Hw::delay_us`, so the Quiesce hook can run it.
 
 use crate::bo::{BoError, BoManager, PAGE, Placement};
@@ -85,6 +85,68 @@ pub trait Hw {
         let _ = (index_dw, value);
         false
     }
+    /// GX-8v: one 32-bit doorbell write (Linux WDOORBELL32: VCN's unified ring, vcn_v4_0.c:1790).
+    fn doorbell_write32(&mut self, index_dw: u32, value: u32) -> bool {
+        let _ = (index_dw, value);
+        false
+    }
+    /// GX-10: the reads of `byte` from here to `wait_end` are one poll for `cond` that gives up at `bound`. The
+    /// bring-up owner keeps it as one wait in its trail (`gpucore::trail::Trail`), which `rdna4::linuxseq` compares
+    /// with Linux's; a wrapper above the owner hands both on, everything else needs neither.
+    fn wait_begin(&mut self, byte: u32, cond: Cond, bound: Bound) {
+        let _ = (byte, cond, bound);
+    }
+    fn wait_end(&mut self) {}
+}
+
+/// What a poll of one register waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cond {
+    /// `(register & mask) == value` (`psp_wait_for`, amdgpu_psp.c:627).
+    Masked { mask: u32, value: u32 },
+    /// The register no longer reads `from` (`PSP_WAITREG_CHANGED`, amdgpu_psp.c:623-625).
+    Changed { from: u32 },
+}
+
+/// The reads after which Linux gives a register wait up (`adev->usec_timeout`, amdgpu_device.c:3783;
+/// AMDGPU_MAX_USEC_TIMEOUT, amdgpu.h:274).
+pub const LINUX_POLLS: u32 = 100_000;
+
+/// When a poll gives up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// After this many reads with 1 us between them: Linux's form (amdgpu_psp.c:621-630). A count, so how long
+    /// the wait may take is the card's doing, for BitsOS exactly as for Linux.
+    Reads(u32),
+    /// After `us`, read every `step_us`: the 780M driver's form (`Timeouts`).
+    Time { us: u64, step_us: u64 },
+}
+
+impl core::fmt::Display for Bound {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Bound::Reads(n) => write!(f, "{n} reads 1 us apart"),
+            Bound::Time { us, step_us } => write!(f, "{us} us, reading every {step_us} us"),
+        }
+    }
+}
+
+impl Cond {
+    pub fn met(self, read: u32) -> bool {
+        match self {
+            Cond::Masked { mask, value } => read & mask == value,
+            Cond::Changed { from } => read != from,
+        }
+    }
+}
+
+impl core::fmt::Display for Cond {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Cond::Masked { mask, value } => write!(f, "(value & {mask:#010x}) == {value:#010x}"),
+            Cond::Changed { from } => write!(f, "the value is no longer {from:#010x}"),
+        }
+    }
 }
 
 /// The register half of the KM ring: one implementation per PSP version (`ipmod::psp13::Mailbox13`).
@@ -125,8 +187,9 @@ impl BoAlloc for BoManager {
     }
 }
 
-/// The waits. Linux: 100 ms register waits polled every 1 us (`psp_wait_for`, amdgpu_psp.c:539,
-/// AMDGPU_MAX_USEC_TIMEOUT), 20 ms settle after a ring command, fences 20000 polls of 10-100 us (:629).
+/// The 780M driver's waits, bounded by time. Linux bounds a register wait by reads, `LINUX_POLLS` of them 1 us
+/// apart (`psp_wait_for`, amdgpu_psp.c:609-639), which is 100 ms plus the reads themselves; the RX 9070 XT's
+/// stages wait in Linux's form (`wait_reads`). 20 ms settle after a ring command, fences 20000 polls of 10-100 us.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
     pub reg_us: u64,
@@ -186,6 +249,9 @@ pub enum PspError {
     RingNotReset { wptr: u32 },
     /// A microcode BitsOS never loads here: DMCUB (GX-D9, the running picture's firmware) or VCN (not this item).
     Forbidden(UcodeId),
+    /// GP-GPU2: a ring command the card's allow list does not have (`rdna4_core::refuse::ring_command_refused`);
+    /// nothing was written. Never built on the 780M's path.
+    CmdRefused { cmd: u32, why: &'static str },
 }
 
 impl PspError {
@@ -224,12 +290,57 @@ pub fn write(hw: &mut dyn Hw, byte: u32, value: u32) -> Result<(), PspError> {
 
 /// `psp_wait_for`: until `(reg & mask) == value`; returns the value read.
 pub fn wait_for(hw: &mut dyn Hw, t: &Timeouts, byte: u32, value: u32, mask: u32, what: &'static str) -> Result<u32, PspError> {
+    wait_until(hw, t, byte, Cond::Masked { mask, value }, what)
+}
+
+/// `psp_wait_for` as Linux bounds it (amdgpu_psp.c:609-639): at most `reads` reads with 1 us between them, no
+/// clock asked. Returns the value read.
+pub fn wait_reads(hw: &mut dyn Hw, byte: u32, cond: Cond, reads: u32, what: &'static str) -> Result<u32, PspError> {
+    hw.wait_begin(byte, cond, Bound::Reads(reads));
+    let mut r = Err(PspError::Timeout { what, last: 0 });
+    for _ in 0..reads {
+        match read(hw, byte) {
+            Ok(v) if cond.met(v) => {
+                r = Ok(v);
+                break;
+            }
+            Ok(last) => r = Err(PspError::Timeout { what, last }),
+            Err(e) => {
+                r = Err(e);
+                break;
+            }
+        }
+        hw.delay_us(1);
+    }
+    hw.wait_end();
+    if let Err(PspError::Timeout { last, .. }) = r {
+        klog::event!(Warn, "gx", "psp.timeout", what = what, reg = byte, last = last, reads = reads);
+    }
+    r
+}
+
+/// `psp_wait_for` with either of its conditions, bounded by `t`'s time; returns the value read.
+pub fn wait_until(hw: &mut dyn Hw, t: &Timeouts, byte: u32, cond: Cond, what: &'static str) -> Result<u32, PspError> {
+    hw.wait_begin(byte, cond, Bound::Time { us: t.reg_us, step_us: t.poll_us.max(1) });
+    let r = poll(hw, t, byte, cond);
+    hw.wait_end();
+    r.map_err(|e| match e {
+        Some(last) => {
+            klog::event!(Warn, "gx", "psp.timeout", what = what, reg = byte, last = last, waited_us = t.reg_us);
+            PspError::Timeout { what, last }
+        }
+        None => PspError::Gone { byte },
+    })
+}
+
+/// `Err(Some(last))`: the time ran out; `Err(None)`: the register could not be read.
+fn poll(hw: &mut dyn Hw, t: &Timeouts, byte: u32, cond: Cond) -> Result<u32, Option<u32>> {
     let start = hw.now_us();
     let tries = t.reg_us / t.poll_us.max(1) + 1;
     let mut last = 0;
     for _ in 0..=tries {
-        last = read(hw, byte)?;
-        if last & mask == value {
+        last = read(hw, byte).map_err(|_| None)?;
+        if cond.met(last) {
             return Ok(last);
         }
         if hw.now_us().saturating_sub(start) >= t.reg_us {
@@ -237,8 +348,7 @@ pub fn wait_for(hw: &mut dyn Hw, t: &Timeouts, byte: u32, value: u32, mask: u32,
         }
         hw.delay_us(t.poll_us.max(1));
     }
-    klog::event!(Warn, "gx", "psp.timeout", what = what, reg = byte, last = last, waited_us = t.reg_us);
-    Err(PspError::Timeout { what, last })
+    Err(Some(last))
 }
 
 /// A BO from the manager with its MC address.
@@ -416,7 +526,7 @@ pub enum Step {
     AutoloadRlc,
 }
 
-/// How far `start_until` goes (gx-scout-bringup.md M1/M2).
+/// How far `start_until` goes (M1: ring + LOAD_TOC, M2: firmware).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Until {
     /// M1: the ring answers (create, the stale TMR destroyed, LOAD_TOC with the TMR size).
@@ -558,8 +668,6 @@ pub struct Psp<M: Mailbox> {
     /// The start-state classifier did not say cold: destroy a stale ring and TMR first even when the
     /// registers look clean (`Prior::of`).
     pub stale_hint: bool,
-    /// Whether VCN's microcode may be loaded (GX-7d: no).
-    pub allow_vcn: bool,
     /// The report of the last `start`, kept after a failure too.
     pub last: Report,
 }
@@ -596,7 +704,6 @@ impl<M: Mailbox> Psp<M> {
                 dirty: false,
                 tmr_set: false,
                 stale_hint: false,
-                allow_vcn: false,
                 last: Report::default(),
             }),
             Err(e) => {
@@ -671,6 +778,16 @@ impl<M: Mailbox> Psp<M> {
         Ok(resp)
     }
 
+    /// GX-8v: VCN's DPG SRAM list (`amdgpu_vcn_psp_update_sram`, amdgpu_vcn.c:1347): LOAD_IP_FW of
+    /// `GFX_FW_TYPE_VCN0_RAM` from `mc`, `size` bytes. The answer comes back
+    /// whatever its status: a non-zero one is VCN's failure alone, the ring still answers (a fence timeout wedges it
+    /// as for every command).
+    pub fn load_vcn_sram(&mut self, hw: &mut dyn Hw, mc: u64, size: u32) -> Result<Resp, PspError> {
+        let r = self.submit(hw, &encode_arr(cmd::LOAD_IP_FW, &[lo(mc), hi(mc), size, crate::ipmod::vcn4::FW_TYPE_VCN0_RAM]))?;
+        klog::event!(Info, "gx", "psp.vcn_sram", mc = klog::Hex(mc), bytes = size, status = klog::Hex(u64::from(r.status)));
+        Ok(r)
+    }
+
     /// A command whose non-zero status is fatal (GX-7d).
     fn checked(&mut self, hw: &mut dyn Hw, id: u32, words: &[u32], ucode: Option<UcodeId>) -> Result<Resp, PspError> {
         let r = self.submit(hw, &encode_arr(id, words))?;
@@ -709,8 +826,8 @@ impl<M: Mailbox> Psp<M> {
         if self.dirty {
             return Err(PspError::Wedged);
         }
-        if let Some(u) = list.iter().find(|u| u.id == UcodeId::Dmcub || (u.id == UcodeId::Vcn && !self.allow_vcn)) {
-            klog::event!(Error, "gx", "psp.forbidden", fw_type = u.id.fw_type(); "DMCUB is never reloaded (GX-D9); VCN is not loaded here");
+        if let Some(u) = list.iter().find(|u| u.id == UcodeId::Dmcub) {
+            klog::event!(Error, "gx", "psp.forbidden", fw_type = u.id.fw_type(); "DMCUB is never reloaded (GX-D9)");
             return Err(PspError::Forbidden(u.id));
         }
         if until.loads_fw() && autoload && !list.iter().any(|u| u.id == UcodeId::RlcG) {
@@ -753,7 +870,7 @@ impl<M: Mailbox> Psp<M> {
         let prior = Prior::of(rep.stale_ring_size, rep.stale_wptr, self.stale_hint);
         rep.prior = Some(prior);
         if prior == Prior::Stale {
-            // psp_v13_0_4_ring_stop (:194-216): the old ring goes before ours is made (gx-GX-7c.md findings).
+            // psp_v13_0_4_ring_stop (:194-216): the old ring goes before ours is made (plan/spec/gpu.md §11.4).
             klog::event!(Warn, "gx", "psp.ring.stale", size = rep.stale_ring_size, wptr = rep.stale_wptr, hint = self.stale_hint; "destroying it first");
             self.mb.ring_stop(hw, &self.t)?;
             self.snap(rep, hw, Step::StaleRingDestroyed { size: rep.stale_ring_size, wptr: rep.stale_wptr });
@@ -778,7 +895,7 @@ impl<M: Mailbox> Psp<M> {
             return Err(PspError::RingNotReset { wptr: w });
         }
         if prior == Prior::Stale {
-            // No register shows a TMR left behind (gx-GX-7c.md): destroy whatever is there. A non-zero answer
+            // No register shows a TMR left behind (plan/spec/gpu.md §11.4): destroy whatever is there. A non-zero answer
             // may mean "no TMR" and is tolerated here only; SETUP_TMR's status is the proof.
             let r = self.submit(hw, &encode_arr(cmd::DESTROY_TMR, &[]))?;
             if r.status != 0 {

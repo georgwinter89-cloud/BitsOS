@@ -96,7 +96,7 @@ fn rb_install_checks() -> TestResult {
     kassert!(check::initrd(&i[..i.len() - 4]).is_err(), "an initramfs without its trailer passed");
     kassert!(check::config(Some(b"token=a\n"), b"token=a\nusb_msd_write=on\n").is_err());
     kassert!(check::config(Some(b"token=a\n"), b"token=a\nnvme_write=on\n").is_err());
-    check::config(Some(b"token=a\n"), b"token=a\nwlan=on\n").map_err(e)?;
+    check::config(Some(b"token=a\n"), b"token=a\ntz=UTC\n").map_err(e)?;
     check::config(Some(b"token=a\nnvme_write=off\n"), b"token=a\n").map_err(e)?;
     let g = |n, ok, new| Gen { n, ok, new, kernel: true, initrd: true, ..Gen::default() };
     let p = plan::install(&[g(1, true, false), g(2, false, true)], None, 5, false, false).map_err(|x| x.describe())?;

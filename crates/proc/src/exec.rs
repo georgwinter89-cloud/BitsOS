@@ -1,5 +1,7 @@
-//! execve and execveat (linux-6.6/fs/exec.c `do_execveat_common`, `bprm_execve`, `do_open_execat` :906,
-//! `exec_binprm` :1773, `begin_new_exec` :1250, `de_thread` :1044; fs/binfmt_script.c `load_script`).
+//! execve and execveat (linux-7.3.1/fs/exec.c `do_execveat_common` :1897, `alloc_bprm` :1510, `bprm_execve`
+//! :1843, `do_open_execat` :769, `exec_binprm` :1794, `begin_new_exec` :1136 (comm :1281), `de_thread` :923;
+//! fs/binfmt_script.c `load_script`). As `alloc_bprm`, the program file is opened (`exec_open`) before the
+//! syscall layer counts and copies argv and envp, so an open error wins over their EFAULT and E2BIG.
 //!
 //! The new program is loaded completely into a fresh address space, and every other allocation that can fail is
 //! made, *before* anything of the caller changes, so every error (ENOENT, EACCES, ENOEXEC, E2BIG, ENOMEM)
@@ -78,7 +80,7 @@ impl ArgList {
 pub struct ExecRequest {
     pub dirfd: i32,
     pub path: Vec<u8>,
-    /// AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH (execveat); anything else is EINVAL.
+    /// AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_EXECVE_CHECK (execveat; `exec_open` refused anything else).
     pub flags: u64,
     pub argv: ArgList,
     pub envp: ArgList,
@@ -155,7 +157,7 @@ fn open_exec(p: &Process, c: &Ctx<'_>, t: ExecTarget) -> Result<(Path, Arc<dyn v
     if !i.is_reg() {
         return Err(EACCES);
     }
-    // FS-13 CR1: noexec before the permission bits, as Linux (linux-6.6/fs/namei.c:3263, fs/exec.c:935); this
+    // FS-13 CR1: noexec before the permission bits, as Linux (linux-7.3.1/fs/namei.c:4262, fs/exec.c:790); this
     // covers the program, PT_INTERP and a script's interpreter alike.
     if path.noexec() {
         klog::event!(Info, "proc", "exec.noexec", pid = p.pid, mount = path.mnt.id);
@@ -175,6 +177,53 @@ fn open_exec(p: &Process, c: &Ctx<'_>, t: ExecTarget) -> Result<(Path, Arc<dyn v
     let deny = i.deny_write()?;
     let f = vfs::node::file_of(&path.dentry);
     Ok((path, f, deny))
+}
+
+/// linux-7.3.1/fs/exec.c:1359 `would_dump`: a program file the caller may not read makes the new image
+/// non-dumpable (`BINPRM_FLAGS_ENFORCE_NONDUMP`, then `suid_dumpable` 0 in `begin_new_exec` :1267), and the
+/// exec user namespace climbs to the first one privileged over the file, so a namespace's owner cannot read
+/// through /proc what the file hid from it.
+fn would_dump(cred: &crate::cred::Cred, fs: vfs::Cred, path: &Path, user_ns: &mut Arc<crate::ns::user::UserNs>) -> bool {
+    use crate::cred::{Cap, ns_capable};
+    let i = &path.dentry.inode;
+    // `inode_permission(MAY_READ)`: a synthetic file's own permission op, else `generic_permission`: the mode
+    // bits (`acl_permission_check`, fs/namei.c:438), then the capability half (:549, :558): CAP_DAC_READ_SEARCH
+    // or CAP_DAC_OVERRIDE in the caller's namespace when that namespace maps the file's owner and group. Not
+    // vfs's `Meta::permission`: its fsuid-0 shortcut would let a root without those capabilities read.
+    let own_op = match &i.data {
+        vfs::inode::Data::Synth(f) => f.permission(fs, vfs::inode::MAY_READ).map(|r| r.is_ok()),
+        _ => None,
+    };
+    let capable = |c: Cap| ns_capable(cred, &cred.user_ns, c) && privileged_over(&cred.user_ns, i);
+    let readable = own_op.unwrap_or_else(|| mode_bits_allow(&i.meta, fs, vfs::inode::MAY_READ) || capable(Cap::DacReadSearch) || capable(Cap::DacOverride));
+    if readable {
+        return false;
+    }
+    while !user_ns.is_init() && !privileged_over(user_ns, i) {
+        let Some(up) = user_ns.parent.clone() else { break };
+        *user_ns = up;
+    }
+    true
+}
+
+/// linux-7.3.1/fs/namei.c:438 `acl_permission_check` (V2 has no ACLs): the owner's bits for the fs uid that owns
+/// the file, else the group's for a member of its group, else the others'.
+fn mode_bits_allow(m: &vfs::inode::Meta, fs: vfs::Cred, want: u32) -> bool {
+    let mode = m.mode();
+    let bits = if fs.uid == m.uid() {
+        mode >> 6
+    } else if vfs::inode::in_group(fs, m.gid()) {
+        mode >> 3
+    } else {
+        mode
+    };
+    want & 7 & !bits == 0
+}
+
+/// linux-7.3.1/kernel/capability.c:472 `privileged_wrt_inode_uidgid`: `ns` maps the file's owner and group.
+fn privileged_over(ns: &crate::ns::user::UserNs, i: &vfs::inode::Inode) -> bool {
+    use crate::ns::user::MapKind;
+    ns.from_kernel(MapKind::Uid, i.meta.uid()).is_some() && ns.from_kernel(MapKind::Gid, i.meta.gid()).is_some()
 }
 
 /// `prepare_binprm`: the first `BINPRM_BUF_SIZE` bytes (fewer for a short file).
@@ -283,18 +332,43 @@ fn clean_fpu() {
     hal::xsave::load_user_regs(&d);
 }
 
-/// execve/execveat for thread `t` of image `p`. On success the thread continues in the new program (its `ctx`
-/// is the new start); on an error nothing changed.
-pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &ExecRequest) -> Result<(), Errno> {
-    if r.flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+/// The flags `do_open_execat` takes (linux-7.3.1/fs/exec.c:780): anything else is EINVAL, before the name is
+/// looked at.
+pub fn exec_flags_valid(flags: u64) -> bool {
+    flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | uapi::ab::exec::AT_EXECVE_CHECK) == 0
+}
+
+/// The program file `alloc_bprm` opened (`do_open_execat`): held, with its write denial, until `execve` runs it.
+pub struct OpenedProgram {
+    file: Path,
+    f: Arc<dyn vfs::File>,
+    deny: vfs::inode::DenyWrite,
+}
+
+/// `alloc_bprm`'s open of `dirfd`/`path` for thread `t` (the flags were checked by `exec_flags_valid`).
+pub fn exec_open(p: &Process, t: &Thread, dirfd: i32, path: &[u8], flags: u64) -> Result<OpenedProgram, Errno> {
+    let ns = p.mount_ns();
+    let c = view(p, &ns, t);
+    let (file, f, deny) = open_exec(p, &c, lookup(p, &c, dirfd, path, flags)?)?;
+    Ok(OpenedProgram { file, f, deny })
+}
+
+/// execve/execveat for thread `t` of image `p` with the file `exec_open` opened. On success the thread
+/// continues in the new program (its `ctx` is the new start); on an error nothing changed. AT_EXECVE_CHECK stops
+/// after the open and the argument copy (`bprm_execve` :1864: `bprm->is_check`): 0, nothing read or changed.
+pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &ExecRequest, opened: OpenedProgram) -> Result<(), Errno> {
+    if !exec_flags_valid(r.flags) {
         return Err(EINVAL);
+    }
+    if r.flags & uapi::ab::exec::AT_EXECVE_CHECK != 0 {
+        return Ok(());
     }
     let ns = p.mount_ns();
     let c = view(p, &ns, t);
     let fname = filename(r.dirfd, &r.path);
     let mut argv = r.argv.clone();
-    let (mut file, mut f, mut deny) = open_exec(p, &c, lookup(p, &c, r.dirfd, &r.path, r.flags)?)?;
-    // `BINPRM_FLAGS_PATH_INACCESSIBLE` (linux-6.6/fs/exec.c:1848): the name a script's interpreter would get,
+    let OpenedProgram { mut file, mut f, mut deny } = opened;
+    // `BINPRM_FLAGS_PATH_INACCESSIBLE` (linux-7.3.1/fs/exec.c:1551): the name a script's interpreter would get,
     // /dev/fd/N/..., dies with the close-on-exec fd N, so a script there is ENOENT (fs/binfmt_script.c:93).
     let path_inaccessible = r.dirfd != AT_FDCWD && r.path.first() != Some(&b'/') && p.fds.cloexec(r.dirfd as u32 as usize).unwrap_or(false);
     // `bprm->interp`: the name the next interpreter gets as its script argument.
@@ -374,6 +448,16 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     drop(prog);
     // FS-13: the program and its interpreter for the start-up preload's record (while the view is at hand).
     let preload = (c.root.clone(), file.clone(), interp.as_ref().map(|(ip, ..)| ip.clone()));
+    // `bprm_mm_init` (:269) stages the caller's user namespace; `would_dump` (:1213) checks the program that runs
+    // (a script's last interpreter, as `bprm->file`) and binfmt_elf (fs/binfmt_elf.c:914) its PT_INTERP, with
+    // the caller's own credentials (`commit_creds` comes later).
+    let caller = p.cred();
+    let mut exec_user_ns = caller.user_ns.clone();
+    let mut nondump = would_dump(&caller, c.cred, &file, &mut exec_user_ns);
+    if let Some((ip, ..)) = &interp {
+        nondump |= would_dump(&caller, c.cred, ip, &mut exec_user_ns);
+    }
+    drop(caller);
     drop(interp);
     drop(f);
     let exe = String::from_utf8_lossy(&c.ns.path_of(&c.root, &file).unwrap_or_else(|| fname.clone())).into_owned();
@@ -381,7 +465,13 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     drop(c);
     // Everything that can fail is done before the caller changes: the argv copy for /proc and an own fd table
     // when another process shares this one (taken now; checked again after de_thread below).
-    let name = crate::base_name(&String::from_utf8_lossy(&fname));
+    // `bprm->comm_from_dentry` (linux-7.3.1/fs/exec.c:1533, :1281): for fexecve (an fd and an empty name) the
+    // name of the file that runs, not the "N" of /dev/fd/N; else `kbasename(bprm->filename)`.
+    let name = if r.path.is_empty() && r.dirfd != AT_FDCWD {
+        String::from_utf8_lossy(&file.dentry.name()).into_owned()
+    } else {
+        crate::base_name(&String::from_utf8_lossy(&fname))
+    };
     let mut args: Vec<String> = Vec::new();
     args.try_reserve(argv.len()).map_err(|_| ENOMEM)?;
     args.extend(argv.iter().map(|s| String::from_utf8_lossy(s).into_owned()));
@@ -420,7 +510,7 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
         s.drop_posix_timers();
     });
     t.reset_alt_stack();
-    // `__set_task_comm(me, kbasename(bprm->filename))`.
+    // `__set_task_comm` with that name.
     t.prctl().set_comm(crate::prctl_state::comm_of(name.as_bytes()));
     // `begin_new_exec`'s `commit_creds(bprm->cred)`. `cred` was taken before de_thread on purpose: in Linux
     // `bprm->cred` is the exec'ing task's own copy (`prepare_bprm_creds`), so a sibling's set*id while the
@@ -431,17 +521,28 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     // image's, which its only thread now shares.
     let fs = t.fs(p);
     // AB-10a: the new address space has no LDT (`destroy_context_ldt` with the old mm).
-    let new = crate::make_image(p.pid, name, exe, args, p.program, &cred, Arc::new(mm), fds, fs, p.ns.clone(), g.clone(), hal::entry::segs::LdtSlot::new());
+    let new = crate::make_image(p.pid, name, exe, args, p.program, &cred, Arc::new(mm), fds, fs, p.ns.clone(), g.clone(), hal::entry::segs::LdtSlot::new(), exec_user_ns);
     t.set_own_fs(None);
+    // `unshare_files` gave the image a table of its own: this thread is its one user.
+    if !Arc::ptr_eq(&new.fds, &p.fds) {
+        t.count_on(&new.fds);
+    }
     new.mm_flags.for_exec(&p.mm_flags);
     // MM-13: PR_SET_THP_DISABLE survives exec (Linux MMF_INIT_MASK); the new image's space gets it.
     new.mm.set_thp_disabled(new.mm_flags.thp_disabled());
-    // `begin_new_exec`: dumpable again only when the effective ids are the real ones (else `suid_dumpable`, 0).
+    // `begin_new_exec` (:1267): dumpable again only when the program was readable and the effective ids are the
+    // real ones (else `suid_dumpable`, 0).
     if cred.euid != cred.uid || cred.egid != cred.gid {
         t.prctl().clear_personality_on_setid();
         new.mm_flags.set_dumpable(0);
     }
+    if nondump {
+        new.mm_flags.set_dumpable(0);
+    }
     *new.saved_auxv.lock() = core::mem::take(&mut l.auxv);
+    // MC-L CR 1 (INT-CL3T): the local tools door's program starts closed to the other programs of its user,
+    // before its first instruction and before anyone can find the new image.
+    crate::mcp_run::local::close_door_program(&new, Some(&exe_path));
     // AB-7a: /proc's view of the new image (`set_mm_exe_file`, the layout of `load_elf_binary`).
     *new.image_info.lock() = crate::procinfo::ImageInfo { exe: Some(exe_path), deny: Some(Arc::new(deny)), ..core::mem::take(&mut l.info) };
     let old = crate::replace_image(&new);
@@ -464,8 +565,12 @@ pub fn execve(p: &Arc<Process>, t: &Arc<Thread>, ctx: &mut UserContext, r: &Exec
     hal::entry::segs::install(hal::entry::segs::Snapshot::default(), Some(new.ldt.clone()));
     clean_fpu();
     t.new_image.store(true, Ordering::Release);
+    crate::perf_hook::image(&new, t.tid());
     EXECS.inc();
     vfs::preload::exec_started(new.pid, &new.ns, &preload.0, &preload.1, preload.2.as_ref());
+    // DB2: a set-id file is noted though V2 runs it with the caller's ids (no set-id exec yet).
+    vfs::access::exec(new.pid, new.uid, &preload.1, preload.1.dentry.inode.meta.mode() & 0o6000 != 0);
+    crate::tree::on_exec(&new);
     klog::event!(Info, "proc", "exec", pid = new.pid, path = new.path.as_str(), entry = klog::Hex(l.entry), pie = elf.is_pie, bias = klog::Hex(l.bias), interp_base = klog::Hex(l.interp_base), argc = argv.len());
     Ok(())
 }

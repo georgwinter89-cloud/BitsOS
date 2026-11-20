@@ -31,7 +31,7 @@ for n in libpath view; do
 done
 tar -cf "$RUN_DIR/pkgs.tar" -C "$RUN_DIR/out" pkg-libpath pkg-view
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;wlan=off;nvme_write=off"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;nvme_write=off"
 rm -f "$LOG"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 500 --serial-log "$LOG" \
     > "$RUN_DIR/qemu.out" 2>&1 &

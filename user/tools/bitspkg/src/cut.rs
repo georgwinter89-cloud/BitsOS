@@ -7,16 +7,22 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ENV: &str = "BITSPKG_CUT_AT";
+/// PK-6d: the same exit at a named step (`after download`, `after verify`, `after unpack`, `after triggers`,
+/// `before switch`, `after switch`): a repository install has thousands of counted steps, its tests cut by name.
+pub const ENV_POINT: &str = "BITSPKG_CUT_POINT";
 /// Exit status of a cut process, so a test tells a cut from a refusal.
 pub const EXIT: i32 = 86;
 
 static STEP: AtomicU64 = AtomicU64::new(0);
 static AT: OnceLock<Option<u64>> = OnceLock::new();
+static POINT: OnceLock<Option<String>> = OnceLock::new();
 
 pub fn step(what: &str) {
+    crate::progress::phase(what);
     let n = STEP.fetch_add(1, Ordering::Relaxed) + 1;
     let at = AT.get_or_init(|| std::env::var(ENV).ok().and_then(|v| v.parse().ok()));
-    if *at == Some(n) {
+    let point = POINT.get_or_init(|| std::env::var(ENV_POINT).ok());
+    if *at == Some(n) || point.as_deref() == Some(what) {
         eprintln!("bitspkg: cut before step {n} ({what})");
         std::process::exit(EXIT);
     }

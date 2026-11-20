@@ -1,6 +1,6 @@
 //! SX-1 glue (granted to SX in crates/syscall): seccomp(2), prctl's PR_SET_SECCOMP, and the dispatcher's
-//! check (linux-6.6/kernel/seccomp.c `do_seccomp`, `seccomp_set_mode_filter`, `prctl_set_seccomp`,
-//! `__seccomp_filter`). The filters and their rules are in `crates/seccomp`.
+//! check (linux-7.3.1/kernel/seccomp.c:2099 `do_seccomp`, :1954 `seccomp_set_mode_filter`, :2137 `prctl_set_seccomp`,
+//! :1260 `__seccomp_filter`). The filters and their rules are in `crates/seccomp`.
 
 use crate::SysCtx;
 use alloc::sync::Arc;

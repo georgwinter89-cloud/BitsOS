@@ -10,8 +10,9 @@ cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/mm-10-frames-sizes}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
-# The reclaim tests are for small RAM: their run is 60-reclaim.sh and the 2G gate.
-TESTS="mm.,-mm.reclaim.dirty_pressure,-mm.reclaim.mapped_exec,-mm.reclaim.pressure,contract.frame_alloc,contract.global_alloc,contract.dma_pool"
+# The reclaim tests are for small RAM: their run is 60-reclaim.sh and the 2G gate. The HighAtomic load test fills
+# the machine's memory and is sized for the 2G gate boot, its only run (it refuses more RAM).
+TESTS="mm.,-mm.reclaim.dirty_pressure,-mm.reclaim.mapped_exec,-mm.reclaim.pressure,-mm.frames.highatomic.load,contract.frame_alloc,contract.global_alloc,contract.dma_pool"
 
 run() { # $1 = name, $2 = memory
     local log="$RUN_DIR/$1.log"

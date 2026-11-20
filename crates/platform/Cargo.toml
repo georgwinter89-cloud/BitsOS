@@ -18,6 +18,7 @@ mm-core = { path = "../mm-core" }
 mm = { path = "../mm" }
 sched = { path = "../sched" }
 time = { path = "../time" }
+gp-platform = { path = "../gp-platform" }
 block = { path = "../block" }
 # INT-A2a (FS-7 CR1): write-back before reboot/poweroff.
 vfs = { path = "../vfs" }

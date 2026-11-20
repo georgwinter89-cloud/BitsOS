@@ -1,5 +1,5 @@
-//! memfd (FS-10): `memfd_create` and file seals (`F_ADD_SEALS`/`F_GET_SEALS`), as linux-6.6/mm/memfd.c and the
-//! seal checks of linux-6.6/mm/shmem.c.
+//! memfd (FS-10): `memfd_create` and file seals (`F_ADD_SEALS`/`F_GET_SEALS`), as linux-7.3.1/mm/memfd.c and the
+//! seal checks of linux-7.3.1/mm/shmem.c.
 //!
 //! A memfd is a nameless tmpfs file on an internal tmpfs instance (Linux's `shm_mnt`): its pages are an FS-5
 //! page cache charged to that instance's pool at size change (ENOMEM from the system pool, R2), it maps like
@@ -38,7 +38,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uapi::errno::*;
 
-// linux-6.6/include/uapi/linux/memfd.h:8-24
+// linux-7.3.1/include/uapi/linux/memfd.h:8-24
 pub const MFD_CLOEXEC: u32 = 0x1;
 pub const MFD_ALLOW_SEALING: u32 = 0x2;
 pub const MFD_HUGETLB: u32 = 0x4;
@@ -49,7 +49,7 @@ const MFD_ALL_FLAGS: u32 = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_N
 const MFD_HUGE_SHIFT: u32 = 26;
 const MFD_HUGE_MASK: u32 = 0x3f;
 
-// linux-6.6/include/uapi/linux/fcntl.h:35-46
+// linux-7.3.1/include/uapi/linux/fcntl.h:41-52
 pub const F_ADD_SEALS: u64 = 1033;
 pub const F_GET_SEALS: u64 = 1034;
 pub const F_SEAL_SEAL: u32 = 0x1;
@@ -64,7 +64,7 @@ const NAME_PREFIX: &[u8] = b"memfd:";
 /// `MFD_NAME_MAX_LEN` = NAME_MAX - strlen("memfd:"): the longest name a program may give (bytes, no NUL).
 pub const MFD_NAME_MAX_LEN: usize = crate::abi::NAME_MAX - 6;
 
-/// `vm.memfd_noexec` (linux-6.6/kernel/pid_sysctl.h): 0 = MFD_EXEC unless asked otherwise, 1 = MFD_NOEXEC_SEAL
+/// `vm.memfd_noexec` (linux-7.3.1/kernel/pid_sysctl.h:8): 0 = MFD_EXEC unless asked otherwise, 1 = MFD_NOEXEC_SEAL
 /// unless asked otherwise, 2 = MFD_NOEXEC_SEAL required. One pid namespace in V2: one value.
 const SCOPE_NOEXEC_SEAL: u64 = 1;
 const SCOPE_NOEXEC_ENFORCED: u64 = 2;
@@ -141,7 +141,10 @@ impl crate::synth::DirSource for ProcSysVm {
         Ok(alloc::vec![SynthEntry::file(
             "memfd_noexec",
             0o644,
-            Arc::new(crate::sysctl::Knob { get: noexec_scope, set: set_noexec_scope, uint: true })
+            Arc::new(crate::sysctl::IntKnob {
+                get: noexec_scope,
+                set: |v| set_noexec_scope(crate::sysctl::non_negative(v)?)
+            })
         )
         .cookie(1)])
     }
@@ -219,7 +222,7 @@ fn apply_noexec_scope(flags: &mut u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// memfd_create(name, flags) (linux-6.6/mm/memfd.c:285-375) in Linux's order: unknown flags EINVAL (huge page
+/// memfd_create(name, flags) (linux-7.3.1/mm/memfd.c:407-521) in Linux's order: unknown flags EINVAL (huge page
 /// size bits only with MFD_HUGETLB), MFD_EXEC with MFD_NOEXEC_SEAL EINVAL, the sysctl (EACCES), the name (a
 /// fault EFAULT, more than MFD_NAME_MAX_LEN bytes EINVAL), the fd (EMFILE), then the file (ENOMEM). V2 has no
 /// hugetlbfs: MFD_HUGETLB is ENOSYS there, as a Linux kernel without CONFIG_HUGETLBFS answers.
@@ -301,7 +304,7 @@ pub fn seal_fcntl(f: &OpenFile, cmd: u64, arg: u64) -> Result<i64, Errno> {
     }
 }
 
-/// F_SEAL_EXEC's rule for a mode change (`shmem_setattr`, linux-6.6/mm/shmem.c:1166): changing an exec bit of
+/// F_SEAL_EXEC's rule for a mode change (`shmem_setattr`, linux-7.3.1/mm/shmem.c:1342): changing an exec bit of
 /// a file sealed so is EPERM. For the chmod family when it arrives (V2 has none yet; FS-10 open point).
 pub fn check_mode_change(inode: &Inode, new_mode: u32) -> Result<(), Errno> {
     let sealed = inode.page_cache().and_then(|c| c.seals()).is_some_and(|s| s & F_SEAL_EXEC != 0);

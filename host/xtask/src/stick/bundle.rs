@@ -171,8 +171,9 @@ pub fn check_bitsboot(b: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// A CONFIG.TXT the tool may put on a stick that has none: never one that sets `nvme_write`, `stick_write` or
-/// `usb_msd_write` (R8a: only Georg's own edit turns them on; `wlan` is free since 21.10., R8d).
+/// A CONFIG.TXT the tool may put on a stick that has none: never one that sets `nvme_write`, `stick_write`,
+/// `usb_msd_write` (R8a: only Georg's own edit turns them on; `wlan` is free since 21.10., R8d) or `gp_nvme`
+/// (GP-DISK: only Georg names a disk of the Gaming-PC for the driver).
 pub fn check_config(text: &[u8]) -> Result<(), String> {
     for raw in text.split(|&c| c == b'\n') {
         let line = String::from_utf8_lossy(raw);
@@ -180,7 +181,7 @@ pub fn check_config(text: &[u8]) -> Result<(), String> {
         if let Some((k, _)) = line.split_once('=') {
             let k = k.trim();
             // R8a (FS-6, US-4): stick_write and usb_msd_write open USB disks for writing.
-            if ["nvme_write", "stick_write", "usb_msd_write"].iter().any(|g| k.eq_ignore_ascii_case(g)) {
+            if ["nvme_write", "stick_write", "usb_msd_write", "gp_nvme"].iter().any(|g| k.eq_ignore_ascii_case(g)) {
                 return Err(format!("it sets {k}: only Georg turns that on, by his own edit (R8)"));
             }
         }
@@ -367,9 +368,11 @@ pub mod tests {
         }
         assert!(check_config(b"loglevel=info\n# nvme_write=on is Georg's\npanic=reboot\n").is_ok());
         assert!(check_config(b"loglevel=info\n nvme_write = on\n").is_err());
-        assert!(check_config(b"loglevel=info\nwlan=on\n").is_ok());
+        assert!(check_config(b"loglevel=info\ntz=UTC\n").is_ok());
         assert!(check_config(b"NVME_WRITE=off\n").is_err());
         assert!(check_config(b"stick_write=on\n").is_err());
         assert!(check_config(b"usb_msd_write=on\n").is_err());
+        assert!(check_config(b"gp_nvme=81:00.0/1d97:5236\n").is_err());
+        assert!(check_config(b"gp_net=on\ngp_stick=on\n").is_ok(), "the tiers the desk writes for a round");
     }
 }

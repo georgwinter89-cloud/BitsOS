@@ -355,15 +355,31 @@ fn registry_stop_fails_waiting_calls_at_once() {
     s.end();
 }
 
+/// Builds mcp-fakesvc (package mcpreg, no dependencies) with the user workspace's own toolchain into
+/// target/user, the place and flags of xtask's `build_user`.
+fn build_fakesvc() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tdir = root.join("target/user");
+    let st = std::process::Command::new("cargo")
+        .current_dir(root.join("user"))
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .args(["build", "-q", "--release", "--target", "x86_64-unknown-linux-musl", "-p", "mcpreg", "--bin", "mcp-fakesvc", "--target-dir"])
+        .arg(&tdir)
+        .status()
+        .unwrap_or_else(|e| panic!("cargo build of mcp-fakesvc cannot start: {e}"));
+    assert!(st.success(), "cargo build of mcp-fakesvc (user/lib/mcpreg, musl target) failed: {st}");
+    let exe = tdir.join("x86_64-unknown-linux-musl/release/mcp-fakesvc");
+    assert!(exe.is_file(), "{} missing after its build", exe.display());
+    exe
+}
+
 /// The client library's test program (user/lib/mcpreg, static musl) against the registry on CachyOS: the same
-/// bytes the kernel sees from it. Built by `cargo xtask image`/`ktest` (target/user); skipped without it.
+/// bytes the kernel sees from it. The test builds it into target/user as `cargo xtask image` does (the gate's
+/// host tests run before the image); a failed build is a failure.
 #[test]
 fn the_client_library_program() {
-    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/user/x86_64-unknown-linux-musl/release/mcp-fakesvc");
-    if !exe.is_file() {
-        eprintln!("SKIP: {} not built (cargo xtask ktest builds it)", exe.display());
-        return;
-    }
+    let exe = build_fakesvc();
     let s = Svc::start(|_| {});
     let spawn = |args: &[&str]| std::process::Command::new(&exe).args(args).env("BITSOS_MCP_SOCK", &s.path).stdout(std::process::Stdio::piped()).spawn().expect("spawn mcp-fakesvc");
     let mut echo = spawn(&["echo", "libsvc"]);

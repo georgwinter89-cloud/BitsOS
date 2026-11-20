@@ -5,6 +5,7 @@
 //!
 //! ext4 keeps no block cache of its own: an image file has its own page cache below, and a disk mount gets one
 //! by `block::bdev::DiskFile` (`CachedDiskDev`, FS-8c). C1 removed the uncached `DiskDev` (no caller).
+//! FS-W2: that cache is for metadata and the log; a file's data goes to the disk beside it (`Dev::write_pages`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,6 +23,11 @@ const PAGE: u64 = 4096;
 
 // BL-0: bytes ext4 copies out of a disk's page cache (`CachedDiskDev::read`, `read_cached`), per CPU.
 vfs::pcpu_counter!(pub COPY_BDEV_CACHE, "block.copy_bytes.bdev_cache", vfs::pcpu::BYTES_BATCH);
+// FS-W2: bytes ext4 copies into a disk's page cache (`CachedDiskDev::write`: metadata, the log; file data only
+// where it cannot go straight to the disk).
+vfs::pcpu_counter!(pub COPY_BDEV_WRITE, "block.copy_bytes.bdev_cache_write", vfs::pcpu::BYTES_BATCH);
+// FS-W2: file bytes a write-back sent straight to the disk, beside its cache (`CachedDiskDev::write_pages`).
+vfs::pcpu_counter!(pub DIRECT_BYTES, "ext4.write_direct_bytes", vfs::pcpu::BYTES_BATCH);
 // BL-3: file bytes a disk read straight into the file's cache pages, and the reads that went through the disk's
 // cache instead because it held newer bytes of their blocks (written, not yet flushed) or were not in whole disk
 // blocks.
@@ -84,6 +90,13 @@ pub trait Dev: Send + Sync {
     fn write(&self, at: u64, data: &[u8]) -> Result<(), i64>;
     /// Everything written so far on stable storage.
     fn flush(&self) -> Result<(), i64>;
+    /// `write`, then these bytes on stable storage: the journal's commit block (FS-W). Other bytes written since the
+    /// last `flush` may stay where they are: Linux sends the commit record alone with a flush before it and FUA
+    /// (`journal_submit_commit_record`), it writes out nobody's dirty data for it. Default: `write` and `flush`.
+    fn write_through(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+        self.write(at, data)?;
+        self.flush()
+    }
     /// `read` if the bytes are in memory, else false and nothing read (FS-STALL: the volume lock is never held over a
     /// device read of a read-only call). Default: every read counts as in memory.
     fn read_cached(&self, at: u64, buf: &mut [u8]) -> Result<bool, i64> {
@@ -115,10 +128,52 @@ pub trait Dev: Send + Sync {
     fn io_pages(&self) -> u64 {
         0
     }
+    /// FS-W2: file data of whole volume blocks, straight to the device (a write-back step's part 2, `flight`).
+    /// When it returns the device has taken the bytes: the next `flush` makes them durable, `read` gives them,
+    /// and nothing written to the same blocks through `write` before can land on top of them. The caller makes
+    /// sure nobody writes these blocks through `write` meanwhile (they belong to the step's file). Default:
+    /// `write` (a device with no cache of its own in front of it, or one that is a file).
+    fn write_data(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+        self.write(at, data)
+    }
+    /// FSR: file data of whole volume blocks that the caller will write back with `write_data`. A disk reads it
+    /// beside its cache when the cache does not hold it, so that write finds nothing of the range cached. Default:
+    /// `read`.
+    fn read_data(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
+        self.read(at, buf)
+    }
+    /// FS-W2: whether `write_pages` sends the pages themselves to the device (a disk). False: it would copy them
+    /// into one buffer from the heap, so a write-back copies into its kept buffer and calls `write_data`.
+    fn takes_pages(&self) -> bool {
+        false
+    }
+    /// FS-W2: `write_data` from page-cache pages: `segs` in order, whole volume blocks in all. Default: gathered
+    /// into one buffer (host tests; the kernel asks `takes_pages` first).
+    fn write_pages(&self, at: u64, segs: Vec<PageSeg>) -> Result<(), i64> {
+        let len: usize = segs.iter().map(|s| s.len).sum();
+        let mut tmp = Vec::new();
+        tmp.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+        tmp.resize(len, 0);
+        let mut done = 0;
+        for s in &segs {
+            s.page.read(s.off, &mut tmp[done..done + s.len]);
+            done += s.len;
+        }
+        self.write_data(at, &tmp)
+    }
 }
 
-/// Recorded writes: (byte offset, bytes), in order; a flush is recorded as an empty write at `u64::MAX`.
+/// Recorded writes: (byte offset, bytes), in order, and two marks, each an empty write: at `FLUSHED` a flush
+/// (every write before it is stable), at `THROUGH` a `write_through` (the write right before it is stable, and
+/// nothing else is). A power cut may lose any write that neither mark covers.
 pub type WriteLog = Vec<(u64, Vec<u8>)>;
+pub const FLUSHED: u64 = u64::MAX;
+pub const THROUGH: u64 = u64::MAX - 1;
+
+/// Whether a log entry at `at` is a mark, not a write.
+pub fn is_mark(at: u64) -> bool {
+    at >= THROUGH
+}
 
 /// A volume image in memory (host tests, ktests).
 pub struct MemDev {
@@ -198,21 +253,10 @@ impl MemDev {
     }
 }
 
-impl Dev for MemDev {
-    fn size(&self) -> u64 {
-        self.img.lock().len() as u64
-    }
-    fn read(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
-        if self.fail_reads.load(Ordering::Relaxed) {
-            return Err(EIO);
-        }
-        let img = self.img.lock();
-        let at = usize::try_from(at).map_err(|_| EIO)?;
-        let src = img.get(at..at.checked_add(buf.len()).ok_or(EIO)?).ok_or(EIO)?;
-        buf.copy_from_slice(src);
-        Ok(())
-    }
-    fn write(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+impl MemDev {
+    /// A write; `through`: with the mark that it alone is stable, right behind it in the log (one hold of the
+    /// log, so no other thread's write gets between the two).
+    fn put(&self, at: u64, data: &[u8], through: bool) -> Result<(), i64> {
         if self.timing_out() {
             return Err(EIO);
         }
@@ -230,17 +274,45 @@ impl Dev for MemDev {
         self.written_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         if let Some(l) = self.log.lock().as_mut() {
             l.push((at, data.to_vec()));
+            if through {
+                l.push((THROUGH, Vec::new()));
+            }
         }
         Ok(())
+    }
+}
+
+impl Dev for MemDev {
+    fn size(&self) -> u64 {
+        self.img.lock().len() as u64
+    }
+    fn read(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
+        if self.fail_reads.load(Ordering::Relaxed) {
+            return Err(EIO);
+        }
+        let img = self.img.lock();
+        let at = usize::try_from(at).map_err(|_| EIO)?;
+        let src = img.get(at..at.checked_add(buf.len()).ok_or(EIO)?).ok_or(EIO)?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+    fn write(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+        self.put(at, data, false)
     }
     fn flush(&self) -> Result<(), i64> {
         if self.timing_out() {
             return Err(EIO);
         }
         if let Some(l) = self.log.lock().as_mut() {
-            l.push((u64::MAX, Vec::new()));
+            l.push((FLUSHED, Vec::new()));
         }
         Ok(())
+    }
+    /// As a disk with a cache does it (`CachedDiskDev::write_through`): only this write becomes stable. The log
+    /// says so with its own mark, so a cut test can lose what a real disk could lose behind the commit block
+    /// (with the default, a flush, every cut test would still model the second barrier FS-W removed).
+    fn write_through(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+        self.put(at, data, true)
     }
     fn settle(&self) -> Result<(), i64> {
         self.settles.fetch_add(1, Ordering::Relaxed);
@@ -293,8 +365,16 @@ pub(crate) fn write_part(bs: u64, at: u64, data: &[u8], read: impl Fn(u64, &mut 
 
 /// A partition (or a whole disk) of a `block::Disk` through the disk's page cache (`block::bdev::DiskFile`,
 /// Linux's block-device mapping that ext4's buffer heads live in): metadata reads hit memory after the first
-/// time. Writes land in the cache; `flush` writes every dirty page back and flushes the device, the barrier the
-/// journal puts before and after a commit block (the same contract as `ImageDev` on a file's cache).
+/// time. `write` lands in the cache; `flush` writes every dirty page back and flushes the device, the barrier the
+/// journal puts before a commit block (the same contract as `ImageDev` on a file's cache).
+///
+/// FS-W2: file data does not pass through this cache. `write_pages` (and `write_data`) send it to the disk and
+/// keep the cache right about those blocks (`vfs::pagecache::PageCache::write_direct`: an older page of them is
+/// written out or waited for first and then dropped, a fill that read them meanwhile inserts nothing). So a
+/// `flush` writes only what `write` dirtied (metadata, the log) and then flushes the device **once**, itself:
+/// the cache's backend does not (`DiskFile::page_cache_owner_flushes`), because with data beside the cache "no
+/// dirty page" no longer means "nothing in the device's cache". That one device flush is what makes every data
+/// write that ended before the call durable: the journal's commit relies on it (ordered mode, `flight`).
 pub struct CachedDiskDev {
     cache: vfs::pagecache::PageCache,
     disk: Arc<Disk>,
@@ -388,7 +468,7 @@ impl Dirtied {
     }
 }
 
-/// A flush's failure as the write-back reports it (ETIMEDOUT for a timeout, `DiskFile::page_cache_telling_timeouts`).
+/// A request's failure as the write-back reports it (ETIMEDOUT for a timeout, as `DiskFile::page_cache_owner_flushes`).
 fn flush_errno(e: block::BlockError) -> i64 {
     if e == block::BlockError::Timeout { ETIMEDOUT } else { e.errno() }
 }
@@ -421,7 +501,7 @@ fn merged(mut runs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 impl CachedDiskDev {
     pub fn new(disk: Arc<Disk>, start: u64, blocks: u64) -> CachedDiskDev {
         let bs = disk.block_size() as u64;
-        CachedDiskDev { cache: block::bdev::DiskFile::page_cache_telling_timeouts(disk.clone()), disk, start: start * bs, bytes: blocks * bs, lift: Lift::new(), dirty: SpinLock::named("ext4.dev.dirtied", Dirtied::default()), via_cache: AtomicU64::new(0) }
+        CachedDiskDev { cache: block::bdev::DiskFile::page_cache_owner_flushes(disk.clone()), disk, start: start * bs, bytes: blocks * bs, lift: Lift::new(), dirty: SpinLock::named("ext4.dev.dirtied", Dirtied::default()), via_cache: AtomicU64::new(0) }
     }
     /// BL-0: pages in the disk's cache now (ktests: drop_caches empties it of clean pages).
     pub fn cached_pages(&self) -> u64 {
@@ -436,6 +516,22 @@ impl CachedDiskDev {
             return Err(EIO);
         }
         Ok(self.start + at)
+    }
+    /// The device's own cache made durable: every write it answered before (nothing to do without such a cache).
+    fn device_flush(&self) -> Result<(), i64> {
+        if !self.disk.dev_info().has_volatile_cache {
+            return Ok(());
+        }
+        self.disk.flush(block::prio::higher(devmodel::block::IoPriority::Normal, block::prio::current())).map_err(flush_errno)
+    }
+    /// The pages [first, last] of the disk's cache that the disk bytes [pos, pos + len) are, when they are whole
+    /// pages (a partition that begins inside a page has none: its data keeps going through the cache).
+    fn page_run(pos: u64, len: usize) -> Option<(u64, u64)> {
+        (len > 0 && pos % PAGE == 0 && len as u64 % PAGE == 0).then(|| (pos / PAGE, (pos + len as u64 - 1) / PAGE))
+    }
+    /// The priority of a data write: never below Normal, as the commit's flush sent it before FS-W2.
+    fn data_prio() -> devmodel::block::IoPriority {
+        block::prio::higher(devmodel::block::IoPriority::Normal, block::prio::current())
     }
 }
 
@@ -544,6 +640,7 @@ impl Dev for CachedDiskDev {
             return Ok(());
         }
         let n = self.cache.write_at(pos, data)?;
+        COPY_BDEV_WRITE.add(n as u64);
         // Noted after the bytes are in the cache: a flush that took the list earlier did not owe them.
         if n > 0 {
             self.dirty.lock().note(pos / PAGE, (pos + n as u64 - 1) / PAGE);
@@ -556,29 +653,120 @@ impl Dev for CachedDiskDev {
     fn flush(&self) -> Result<(), i64> {
         let _f = block::prio::floor(self.lift.prio());
         // The list is taken under the cache's write-back lock: a flush that finds it empty while another one writes
-        // its pages waits for that one (and its device flush) first.
-        let one = self.cache.lock_sync();
-        let (runs, lost) = self.dirty.lock().start_flush();
-        if runs.is_empty() && !lost {
-            // Nothing this device dirtied is waiting: the write-back would skip its commit, but a flush is an
-            // ordering point (the journal's barriers, fsync), so the disk's cache is flushed anyway (review E2).
-            let r = if self.disk.dev_info().has_volatile_cache { self.disk.flush(block::prio::higher(devmodel::block::IoPriority::Normal, block::prio::current())).map_err(flush_errno) } else { Ok(()) };
-            self.dirty.lock().end_flush();
-            drop(one);
-            return r;
-        }
-        let runs = if lost { alloc::vec![(0, u64::MAX)] } else { merged(runs) };
-        let r = self.cache.sync_ranges_locked(&one, &runs, SyncKind::Fsync);
-        // Noted again before `flushing` goes: a file read never sees the failed ranges unlisted.
-        let mut d = self.dirty.lock();
-        if r.is_err() {
-            d.lost |= lost;
-            for (a, b) in runs {
-                d.note(a, b);
+        // its pages waits for those writes first. The lock goes before the device flush (FS-W2): the flush covers
+        // every write the device answered, whoever sent it, and a data write that has to wait for this lock (it
+        // met an old page of its blocks) does not wait for the device's flush too.
+        let wrote = {
+            let one = self.cache.lock_sync();
+            let (runs, lost) = self.dirty.lock().start_flush();
+            let r = if runs.is_empty() && !lost {
+                Ok(())
+            } else {
+                let runs = if lost { alloc::vec![(0, u64::MAX)] } else { merged(runs) };
+                let r = self.cache.sync_ranges_locked(&one, &runs, SyncKind::Fsync);
+                if r.is_err() {
+                    // Noted again before `flushing` goes: a file read never sees the failed ranges unlisted.
+                    let mut d = self.dirty.lock();
+                    d.lost |= lost;
+                    for (a, b) in runs {
+                        d.note(a, b);
+                    }
+                    d.end_flush();
+                }
+                r
+            };
+            if r.is_ok() {
+                self.dirty.lock().end_flush();
             }
+            r
+        };
+        wrote?;
+        // Always, also with nothing dirty: a flush is an ordering point (the journal's barrier, fsync), and file
+        // data went to the disk beside the cache.
+        self.device_flush()
+    }
+    /// Only these pages are written back, then the disk's own cache is flushed: what else the cache holds dirty
+    /// waits for the next `flush`. The cache's write-back lock is taken before the bytes go in, so no flush running
+    /// beside this call still has the pages at the device when this call flushes it. The pages stay noted as
+    /// dirtied; the next `flush` finds them clean.
+    fn write_through(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+        let pos = self.at(at, data.len())?;
+        if data.is_empty() {
+            return self.flush();
         }
-        d.end_flush();
-        r
+        let _f = block::prio::floor(self.lift.prio());
+        {
+            let one = self.cache.lock_sync();
+            let n = self.cache.write_at(pos, data)?;
+            COPY_BDEV_WRITE.add(n as u64);
+            let (first, last) = (pos / PAGE, (pos + data.len() as u64 - 1) / PAGE);
+            if n > 0 {
+                self.dirty.lock().note(first, (pos + n as u64 - 1) / PAGE);
+            }
+            if n != data.len() {
+                return Err(EIO);
+            }
+            self.cache.sync_ranges_locked(&one, &[(first, last)], SyncKind::Fsync)?;
+        }
+        self.device_flush()
+    }
+    /// FSR: from the disk's cache when it holds the pages (they may be newer than the disk), else straight from the
+    /// disk without bringing them in: the `write_data` after it then takes `write_direct`'s way with nothing cached,
+    /// and never waits for the cache's write-back lock, which a commit's flush holds while it writes the log and
+    /// the metadata (the caller holds `ext4.vol`). Nobody writes these blocks through the cache meanwhile (file data).
+    fn read_data(&self, at: u64, buf: &mut [u8]) -> Result<(), i64> {
+        let pos = self.at(at, buf.len())?;
+        let dbs = u64::from(self.disk.block_size()).max(1);
+        if Self::page_run(pos, buf.len()).is_none() || pos % dbs != 0 {
+            return self.read(at, buf);
+        }
+        if self.read_cached(at, buf)? {
+            return Ok(());
+        }
+        let _f = block::prio::floor(self.lift.prio());
+        self.disk.read(pos / dbs, buf, Self::data_prio()).map_err(|e| e.errno())?;
+        FRAME_BYTES.add(buf.len() as u64);
+        Ok(())
+    }
+    /// FS-W2: to the disk, beside the cache (`PageCache::write_direct` keeps the cache right about the blocks).
+    /// The request owns a copy of `data` (`Disk::write`): for the one padded block at a file's end; a write-back's
+    /// megabytes come through `write_pages`.
+    fn write_data(&self, at: u64, data: &[u8]) -> Result<(), i64> {
+        let pos = self.at(at, data.len())?;
+        let Some((first, last)) = Self::page_run(pos, data.len()) else { return self.write(at, data) };
+        let lba = pos / u64::from(self.disk.block_size()).max(1);
+        self.cache.write_direct(first, last, || self.disk.write(lba, data, false, Self::data_prio()).map_err(flush_errno))?;
+        DIRECT_BYTES.add(data.len() as u64);
+        Ok(())
+    }
+    fn takes_pages(&self) -> bool {
+        self.start % PAGE == 0
+    }
+    /// FS-W2: the file's pages are the request's memory (no copy, as the cache's own write-back sends its pages).
+    fn write_pages(&self, at: u64, segs: Vec<PageSeg>) -> Result<(), i64> {
+        let len: usize = segs.iter().map(|s| s.len).sum();
+        let pos = self.at(at, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        let Some((first, last)) = Self::page_run(pos, len) else {
+            // Not whole pages of the disk's cache: through it, page by page (one page from the heap, not the run).
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(PAGE as usize).map_err(|_| ENOMEM)?;
+            buf.resize(PAGE as usize, 0);
+            let mut done = 0u64;
+            for s in &segs {
+                let b = buf.get_mut(..s.len).ok_or(EIO)?;
+                s.page.read(s.off, b);
+                self.write(at + done, b)?;
+                done += s.len as u64;
+            }
+            return Ok(());
+        };
+        let lba = pos / u64::from(self.disk.block_size()).max(1);
+        self.cache.write_direct(first, last, move || self.disk.write_pages(lba, segs, false, Self::data_prio()).map_err(flush_errno))?;
+        DIRECT_BYTES.add(len as u64);
+        Ok(())
     }
     fn settle(&self) -> Result<(), i64> {
         self.disk.settle().map_err(|e| e.errno())

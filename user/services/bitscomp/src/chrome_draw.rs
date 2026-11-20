@@ -216,6 +216,12 @@ pub struct ListLook {
     pub minimized: Vec<String>,
     pub active: usize,
     pub hover: Option<Part>,
+    /// A (12.11.): which workspaces may close (their entry shows the x on hover).
+    pub closable: Vec<bool>,
+    /// DESK-LEFT: the "+N" list is open.
+    pub more_open: bool,
+    /// DESK-LEFT: the start page is shown (Startseite is lit).
+    pub home_lit: bool,
 }
 
 pub fn list(l: &ListLook, t: &Theme) -> Canvas {
@@ -224,7 +230,7 @@ pub fn list(l: &ListLook, t: &Theme) -> Canvas {
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
     // Glass when docked over the wallpaper; revealed over the tiles it is the same colour, solid.
-    c.clear(hud::glass_for(t, Glass::Bar, !c0.list_docked));
+    c.clear(hud::glass(t, Glass::Bar));
     let edge = p.r(Rect { x: c0.list.x + c0.list.w - 1, w: 1, ..c0.list });
     c.fill(edge.x, 0, edge.w.max(1), h, t.line);
     c.text_fit(&label(t), p.r(c0.ws_title), "ARBEITSRÄUME", t.muted);
@@ -247,6 +253,16 @@ pub fn list(l: &ListLook, t: &Theme) -> Canvas {
         } else if l.hover == Some(Part::Ws(i)) {
             c.rrect(b, p.v(10.0), t.panel2);
         }
+        let on_x = l.hover == Some(Part::WsClose(i));
+        let x_rect = c0.ws_close.get(i).filter(|_| (on_x || l.hover == Some(Part::Ws(i))) && l.closable.get(i) == Some(&true));
+        if let Some(x) = x_rect {
+            let xb = p.b(*x);
+            if on_x {
+                c.rrect(xb, p.v(6.0), t.panel2);
+            }
+            crate::chrome_draw::buehne::close_x(&mut c, xb.x + xb.w / 2.0, xb.y + xb.h / 2.0, p.v(5.0), p.v(1.6), if on_x { t.text } else { t.muted });
+        }
+        let r = &if x_rect.is_some() { Rect { w: r.w - 32, ..*r } } else { *r };
         let inner = p.r(Rect { x: r.x + 12, w: r.w - 24, ..*r });
         if r.h >= crate::chrome::WS_FULL {
             let top = Rect { y: inner.y + p.v(10.0) as i32, h: p.v(20.0) as i32, ..inner };
@@ -265,27 +281,57 @@ pub fn list(l: &ListLook, t: &Theme) -> Canvas {
         let r = p.r(Rect { x: c0.ws_new.x + 12, w: c0.ws_new.w - 24, ..c0.ws_new });
         c.text_fit(&font(t, 14.0, Weight::Regular), r, "+ Neuer Arbeitsraum", t.muted);
     }
-    if !c0.min_items.is_empty() {
+    if !c0.min_items.is_empty() || c0.min_more.is_some() {
         c.text_fit(&label(t), p.r(c0.min_title), "MINIMIERT", t.muted);
     }
     for (i, (r, n)) in c0.min_items.iter().zip(&l.minimized).enumerate() {
         let b = p.b(*r);
-        if l.hover == Some(Part::Min(i)) {
+        let on_x = l.hover == Some(Part::MinClose(i));
+        let on = on_x || l.hover == Some(Part::Min(i));
+        if on {
             c.rrect(b, p.v(10.0), t.panel2);
         }
         let ib = Box2 { x: b.x + p.v(8.0), y: b.y + (b.h - p.v(18.0)) / 2.0, w: p.v(18.0), h: p.v(18.0) };
         glyph_into(&mut c, Glyph::Restore, ib, t.muted);
         let tx = r.x + 34;
-        c.text_fit(&name, p.r(Rect { x: tx, w: r.x + r.w - 8 - tx, ..*r }), n, t.text);
+        // DESK-LEFT: the x at the entry's right end while the pointer is on the entry (as a workspace entry's).
+        let x = c0.min_close.get(i).filter(|_| on);
+        let end = x.map_or(r.x + r.w - 8, |x| x.x - 4);
+        c.text_fit(&name, p.r(Rect { x: tx, w: end - tx, ..*r }), n, t.text);
+        if let Some(x) = x {
+            let xb = p.b(*x);
+            if on_x {
+                c.rrect(xb, p.v(6.0), t.panel2);
+            }
+            crate::chrome_draw::buehne::close_x(&mut c, xb.x + xb.w / 2.0, xb.y + xb.h / 2.0, p.v(5.0), p.v(1.6), if on_x { t.text } else { t.muted });
+        }
+    }
+    // DESK-LEFT: "+N weitere" opens the list of every minimised window beside the window list.
+    if let Some(r) = c0.min_more {
+        let b = p.b(r);
+        let n = l.minimized.len().saturating_sub(c0.min_items.len());
+        if l.more_open {
+            c.rrect(b, p.v(10.0), t.chip);
+            c.rrect_line(b, p.v(10.0), p.line(), t.accent);
+        } else if l.hover == Some(Part::MinMore) {
+            c.rrect(b, p.v(10.0), t.panel2);
+        }
+        let tx = r.x + 34;
+        c.text_fit(&name, p.r(Rect { x: r.x + 10, w: 22, ..r }), &format!("+{n}"), t.muted);
+        c.text_fit(&name, p.r(Rect { x: tx, w: r.x + r.w - 8 - tx, ..r }), if n == 1 { "weiteres Fenster" } else { "weitere Fenster" }, t.text);
     }
     let hb = p.r(c0.home);
-    if l.hover == Some(Part::Home) {
+    // DESK-LEFT: lit while the start page is shown, as the active workspace's entry (and the Bühne's button).
+    if l.home_lit {
+        c.rrect(Box2::of(hb), p.v(10.0), t.chip);
+        c.rrect_line(Box2::of(hb), p.v(10.0), p.line(), t.accent);
+    } else if l.hover == Some(Part::Home) {
         c.rrect(Box2::of(hb), p.v(10.0), t.panel2);
     }
     let icon = Box2 { x: hb.x as f32 + p.v(8.0), y: hb.y as f32 + (hb.h as f32 - p.v(20.0)) / 2.0, w: p.v(20.0), h: p.v(20.0) };
-    glyph_into(&mut c, Glyph::Home, icon, t.muted);
+    glyph_into(&mut c, Glyph::Home, icon, if l.home_lit { t.text } else { t.muted });
     let tx = hb.x + p.v(34.0) as i32;
-    c.text_fit(&font(t, 14.0, Weight::Regular), Rect { x: tx, w: hb.x + hb.w - tx, ..hb }, "Startseite", t.muted);
+    c.text_fit(&font(t, 14.0, Weight::Regular), Rect { x: tx, w: hb.x + hb.w - tx, ..hb }, "Startseite", if l.home_lit { t.text } else { t.muted });
     c
 }
 
@@ -314,9 +360,18 @@ pub struct SideLook {
     pub ring: Ring,
     /// Revealed over the tiles: solid glass.
     pub solid: bool,
+    /// CL-3b: the state line when the assistant drives it ("ANTWORTET" has no ring of its own).
+    pub word: &'static str,
+    /// "geht an <Anbieter>" and the running tool's line.
+    pub notice: Option<String>,
+    pub tool: Option<String>,
+    /// The conversation (None: no assistant in this session, the old note).
+    pub conv: Option<crate::assist_layout::Look>,
+    /// The model list right of the name.
+    pub menu: Option<crate::assist_menu_app::MenuLook>,
 }
 
-/// The line the sidebar shows until the conversation comes (CL-3): no made-up chat.
+/// The line the sidebar shows when no assistant is part of the session (the test back ends): no made-up chat.
 pub fn side_note(name: &str) -> String {
     format!("Hier sprichst du bald mit {name}.")
 }
@@ -325,14 +380,25 @@ pub fn side(l: &SideLook, t: &Theme) -> Canvas {
     let p = Px::new(l.rect, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    c.clear(hud::glass_for(t, Glass::Bar, l.solid));
+    c.clear(hud::glass(t, Glass::Bar));
     c.fill(0, 0, p.line().round() as i32, h, t.line);
     let r = l.rect;
     // The ring is its own sprite over this image (`ring_sprite` at `side_ring_rect`).
     let tx = r.x + 16 + 44 + 12;
     c.text_fit(&font(t, 16.0, Weight::SemiBold), p.r(Rect { x: tx, y: r.y + 20, w: r.w - (tx - r.x) - 16, h: 22 }), &l.name, t.text);
     let state = label(t);
-    c.text_fit(&state, p.r(Rect { x: tx, y: r.y + 42, w: r.w - (tx - r.x) - 16, h: 16 }), l.ring.word(), t.accent);
+    let waits = l.ring == Ring::Waiting && l.conv.is_some();
+    c.text_fit(&state, p.r(Rect { x: tx, y: r.y + 42, w: r.w - (tx - r.x) - 16, h: 16 }), l.word, if waits { t.warm } else { t.accent });
+    if let Some(conv) = &l.conv {
+        let notice = Rect { x: tx, y: r.y + 58, w: r.w - (tx - r.x) - 16, h: 16 };
+        let tool = Rect { x: r.x + 16, y: r.y + 74, w: r.w - 32, h: 17 };
+        crate::assist_draw::head_lines(&mut c, &p, t, notice, tool, l.notice.as_deref(), l.tool.as_deref());
+        crate::assist_draw::conversation(&mut c, &p, t, conv);
+        if let Some(m) = &l.menu {
+            crate::assist_menu_draw::draw(&mut c, &p, t, m);
+        }
+        return c;
+    }
     let note = Rect { x: r.x + 16, y: r.y + 18 + 44 + 14, w: r.w - 32, h: 0 };
     let f = font(t, 14.0, Weight::Regular);
     let lines = wrap(&f, &side_note(&l.name), p.r(note).w - p.v(28.0) as i32);

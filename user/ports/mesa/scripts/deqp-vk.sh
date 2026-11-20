@@ -13,7 +13,7 @@
 #   tree/VERSION.txt the tag and its commit
 # No windowing system is linked (the vulkan_headless target): this subset has no WSI test and the program must need
 # nothing beyond the Mesa tree. zlib and libpng come from the CTS's pinned sources, static. Vulkan comes by dlopen of
-# libvulkan.so.1, which `run` finds in the Mesa tree, so `MESA_VK_DRIVERS` chooses the driver.
+# libvulkan.so.1, which `run` finds in the Mesa tree, and RADV, the tree's one Vulkan driver (the Mini-PC's 780M).
 # Run it after the Mesa stage; `DEQP_JOBS=<n>` limits the build's threads.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)

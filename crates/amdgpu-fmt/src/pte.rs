@@ -1,7 +1,7 @@
 //! GFX 11 page-table entry formats (GC 10.x/11.x layout; GFX 12 moves bits and needs its own module).
 //!
-//! Bit names follow Linux's macros (linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h:57-112), not the
-//! letters of the format comment at gmc_v11_0.c:446-477 (which calls bit 51 "T", 55 "L", 56 "F" and leaves 54
+//! Bit names follow Linux's macros (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h:57-118), not the
+//! letters of the format comment at gmc_v11_0.c:413-444 (which calls bit 51 "T", 55 "L", 56 "F" and leaves 54
 //! reserved in the PTE; Linux sets bit 54 as PDE_PTE on directory levels and the PDE comment calls it "P").
 //!
 //! PTE (and PDE used as PTE): address 47:12, MTYPE 50:48, fragment 11:7, flags in 6:0 and the high bits.

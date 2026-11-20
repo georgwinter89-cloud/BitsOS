@@ -3,7 +3,7 @@
 //! The page cache lives above mm-core (crate vfs), so the allocator knows it only as a registered `Reclaim`.
 //! When an allocation of a reclaim-allowed kind found no frame (both attempts and the per-CPU drain failed:
 //! the slow path, the fast path is unchanged), the buddy asks it for clean, unmapped cache pages and tries
-//! again (`__alloc_pages_direct_reclaim`, linux-6.6/mm/page_alloc.c:3639): a light round first, then a thorough
+//! again (`__alloc_pages_direct_reclaim`, linux-7.3.1/mm/page_alloc.c:4464): a light round first, then a thorough
 //! one, no more (bounded, B4: the reclaimer never waits for a lock and never allocates). The kswapd-like
 //! thread (crate mm, `mm.kswapd`) keeps free memory between the watermarks computed here in the background.
 
@@ -64,8 +64,8 @@ pub struct Watermarks {
 }
 
 /// Linux's watermarks for `total` managed frames: min = `min_free_kbytes` = sqrt(16 x RAM in KiB), clamped to
-/// 128 KiB..256 MiB (linux-6.6/mm/page_alloc.c:5748); the kswapd gaps low - min and high - low are each the
-/// larger of min/4 and 0.1 % of RAM (`watermark_scale_factor` 10, :5682). 32 GB: min 22.6 MiB, low 55 MiB,
+/// 128 KiB..256 MiB (linux-7.3.1/mm/page_alloc.c:6734); the kswapd gaps low - min and high - low are each the
+/// larger of min/4 and 0.1 % of RAM (`watermark_scale_factor` 10, :6662). 32 GB: min 22.6 MiB, low 55 MiB,
 /// high 87 MiB; 512 MiB: min 2.8 MiB, low 3.5 MiB, high 4.2 MiB.
 pub fn watermarks(total: u64) -> Watermarks {
     let kib = total.saturating_mul(PAGE / 1024);
@@ -75,7 +75,7 @@ pub fn watermarks(total: u64) -> Watermarks {
     Watermarks { min, low: min.saturating_add(gap), high: min.saturating_add(gap.saturating_mul(2)) }
 }
 
-/// `si_mem_available` (linux-6.6/mm/show_mem.c:32) in bytes: free memory minus the reserve (the high
+/// `si_mem_available` (linux-7.3.1/mm/show_mem.c:33) in bytes: free memory minus the reserve (the high
 /// watermark, `calculate_totalreserve_pages`), plus the file pages of the page cache minus what has to stay (half
 /// of it, at most the low watermark). `file`: page-cache bytes that are not shared memory (tmpfs never goes:
 /// no swap). V2 has no reclaimable slab to add.
@@ -228,6 +228,11 @@ pub fn set_frame_owner(phys: u64, v: u64) {
     }
 }
 
+/// What frame `phys`'s owner word holds now (`set_frame_owner`; 0: nothing). A hint, as `Buddy::owner`.
+pub fn frame_owner(phys: u64) -> u64 {
+    crate::boot_buddy().map_or(0, |b| b.owner(phys))
+}
+
 /// Whether the caller's context lets it reclaim for the heap (FS-STALL review R1/R2): no spin lock held (reclaim
 /// frees into the grace queue under `mm.grace` and takes cache index locks: a holder of one of those would spin on
 /// itself), not in an interrupt handler or with interrupts off (an NMI too), not inside a grace section. The heap
@@ -255,11 +260,33 @@ pub fn enter() -> Option<Inside> {
 
 pub struct Inside(usize);
 
-/// Threads whose heap allocation leaves the frames reserve alone for now (`keep_reserve`).
-static KEEP: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// Threads whose heap allocation leaves the frames reserve alone for now (`keep_reserve`): a thread's slot is
+/// one of the `KEEP_PROBES` its id leads to (`slots`), so taking and asking cost a few loads however many threads
+/// wait. A thread that finds all of them taken goes without (as a caller that cannot wait): with a quarter of
+/// the table in use that is one allocation in 65536. Until 12.11.2026 the table had 64 slots, searched whole by
+/// every allocation, and the 65th thread waiting for memory at once took the reserves at its first try.
+static KEEP: [AtomicU64; KEEP_SLOTS] = [const { AtomicU64::new(0) }; KEEP_SLOTS];
+const KEEP_SLOTS: usize = 1024;
+const KEEP_PROBES: usize = 8;
+
+/// The slots thread `me` may hold.
+fn slots(me: u64) -> impl Iterator<Item = (usize, &'static AtomicU64)> {
+    // Thread ids come one after the other: the multiplication spreads them.
+    let first = (me.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize;
+    (0..KEEP_PROBES).map(move |i| {
+        let at = (first + i) % KEEP_SLOTS;
+        (at, &KEEP[at])
+    })
+}
 
 /// A slot whose thread's allocation is suspended by a nested one (`Keep::Paused`).
 const PAUSED: u64 = 1 << 63;
+/// A slot whose allocation gave up the frames below the min watermark and still waits (`Keep::dip`).
+const DIP: u64 = 1 << 62;
+/// A slot whose allocation is on its last try (`Keep::last`).
+const LAST: u64 = 1 << 61;
+/// The thread id of a slot.
+const THREAD: u64 = !(PAUSED | DIP | LAST);
 
 fn inside(me: u64) -> bool {
     INSIDE.iter().any(|s| s.load(Relaxed) == me)
@@ -275,21 +302,31 @@ fn inside(me: u64) -> bool {
 /// pauses that slot for its own duration: the outer allocation's patience is not the inner one's. Mini-PC
 /// 11.11.2026, generation 114: the inner ones were refused the reserve, reclaim freed nothing, and with the
 /// patient bound everything stood for seconds.
+///
+/// Two reserves hang on the slot. The frames below the min watermark are kept until `Keep::dip` (the heap's
+/// first tries). The HighAtomic pageblocks (`buddy::highatomic`) are kept for as long as the slot lives: an
+/// allocation that may wait reclaims and compacts for its block, and takes that reserve only on the try after
+/// which null is next (`Keep::last`). Until 12.11.2026 the slot was dropped at the dip, and slabs of callers that
+/// could have waited settled in that reserve (ktest `mm.frames.highatomic.load`).
 pub fn keep_reserve() -> Option<Keep> {
     let me = ksync::thread_id();
     if me == 0 {
         return None;
     }
-    if let Some(i) = KEEP.iter().position(|s| s.compare_exchange(me, me | PAUSED, Relaxed, Relaxed).is_ok()) {
-        return Some(Keep::Paused(i));
+    for (i, s) in slots(me) {
+        let v = s.load(Relaxed);
+        if v & THREAD == me && v & PAUSED == 0 && s.compare_exchange(v, v | PAUSED, Relaxed, Relaxed).is_ok() {
+            return Some(Keep::Paused(i));
+        }
     }
-    if !context_allows() || inside(me) {
+    if !context_allows() || crate::oom::memalloc() {
         return None;
     }
-    KEEP.iter().position(|s| s.compare_exchange(0, me, Relaxed, Relaxed).is_ok()).map(Keep::Held)
+    slots(me).find(|(_, s)| s.compare_exchange(0, me, Relaxed, Relaxed).is_ok()).map(|(i, _)| Keep::Held(i))
 }
 
-/// Whether the calling thread's heap allocation keeps the reserve: asked only when a zone is below it.
+/// Whether the calling thread's heap allocation keeps the frames below the min watermark: asked only when a zone
+/// is below it.
 pub fn keeps_reserve() -> bool {
     // An interrupt handler runs with the interrupted thread's id: that thread's slot is not the handler's, which
     // cannot reclaim and is what the reserves are for.
@@ -297,7 +334,28 @@ pub fn keeps_reserve() -> bool {
         return false;
     }
     let me = ksync::thread_id();
-    me != 0 && KEEP.iter().any(|s| s.load(Relaxed) == me)
+    me != 0 && slots(me).any(|(_, s)| s.load(Relaxed) == me)
+}
+
+/// Whether the calling thread's heap allocation may wait and will come again (its slot lives, dipped or not): it
+/// leaves the HighAtomic reserve alone, and a try of it that found nothing is not a failure yet. Asked only on
+/// the frame allocator's last step.
+pub fn heap_waits() -> bool {
+    if hal::percpu::in_hard_irq() {
+        return false;
+    }
+    let me = ksync::thread_id();
+    me != 0 && slots(me).any(|(_, s)| s.load(Relaxed) & !DIP == me)
+}
+
+/// Whether the calling thread's heap allocation is on its last try (`Keep::last`): the reserve's statistics tell
+/// it from a caller that cannot wait.
+pub fn heap_last_try() -> bool {
+    if hal::percpu::in_hard_irq() {
+        return false;
+    }
+    let me = ksync::thread_id();
+    me != 0 && slots(me).any(|(_, s)| s.load(Relaxed) == me | LAST)
 }
 
 /// Whether the calling thread is inside page-cache reclaim (`enter`): its allocations are not patient.
@@ -317,6 +375,31 @@ impl Keep {
     /// Whether this allocation itself keeps the reserve (and so has a last try without it).
     pub fn held(&self) -> bool {
         matches!(self, Keep::Held(_))
+    }
+
+    /// From now on this allocation takes the frames below the min watermark; it still waits (`heap_waits`).
+    pub fn dip(&self) {
+        if let Keep::Held(i) = *self {
+            KEEP[i].fetch_or(DIP, Relaxed);
+        }
+    }
+
+    /// Back to keeping both reserves: the never-failing rounds stop at the min watermark and leave HighAtomic to
+    /// the callers that cannot wait, as Linux's GFP_KERNEL retries do (checker 13.11.2026: with `last` kept for
+    /// every round, hundreds of looping threads emptied the reserves of interrupt handlers and spin-lock holders).
+    pub fn hold(&self) {
+        if let Keep::Held(i) = *self {
+            let me = KEEP[i].load(Relaxed) & THREAD;
+            KEEP[i].store(me, Relaxed);
+        }
+    }
+
+    /// The allocation's last try: nothing is kept from it (`heap_last_try`).
+    pub fn last(&self) {
+        if let Keep::Held(i) = *self {
+            let me = KEEP[i].load(Relaxed) & THREAD;
+            KEEP[i].store(me | LAST, Relaxed);
+        }
     }
 }
 
@@ -369,7 +452,12 @@ impl Drop for Inside {
 /// Installs the page cache's reclaimer into the boot allocator (crate mm's core initcall). False: no boot
 /// allocator, or one was installed already.
 pub fn set_reclaimer(r: &'static dyn Reclaim) -> bool {
-    crate::boot_buddy().is_some_and(|b| b.set_reclaimer(r))
+    let Some(b) = crate::boot_buddy() else { return false };
+    if !b.set_reclaimer(r) {
+        return false;
+    }
+    crate::boost::set_total(crate::FrameAlloc::stats(b).total_bytes / PAGE);
+    true
 }
 
 /// The boot allocator's direct reclaim counts (zeros without one).

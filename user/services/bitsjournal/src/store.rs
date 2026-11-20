@@ -2,7 +2,7 @@
 //! blocks. A block = a 40-byte head (`BJ1\n`, raw length, compressed length, lines, boot id, first and last wall
 //! time in ms, little endian) + the lines of one boot as zlib (its Adler-32 tells a damaged block). Blocks are
 //! appended and made durable with one fsync per block (every few seconds, never per event: the jbd2 commit and
-//! the snapshot freeze stay cheap, desk-INT-W12.md). A torn tail (power cut while appending) is cut off when the
+//! the snapshot freeze stay cheap). A torn tail (power cut while appending) is cut off when the
 //! segment is opened again, and skipped by readers until then. Retention deletes whole segments, oldest first.
 
 use std::fs::{self, File, OpenOptions};

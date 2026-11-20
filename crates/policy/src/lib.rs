@@ -26,6 +26,7 @@ mod ktests;
 mod ktests_view;
 pub mod rules;
 mod table;
+pub mod tree;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -38,7 +39,7 @@ pub use conn::{conn_keep, record_conn, recent_connections, set_conn_keep, ConnKi
 pub use dns::{dns_keep, dns_names, note_dns_answer, parse_answer};
 pub use udp::{udp_peer_keep, UdpPeers};
 pub use view::{
-    connection_counts, connections, forget_test_connections, open as open_conn, open_counted, proto_name, record_live_ns, set_owners,
+    connection_counts, connections, forget_test_connections, live_room, open as open_conn, open_counted, proto_name, record_live_ns, set_owners,
     ConnCounters, ConnFilter, ConnHandle, ConnInfo, Owners,
 };
 pub use rules::{Decision, DeviceRule, NameRule, NetRule, PathRule, RuleSet, SignalRule};
@@ -57,10 +58,12 @@ pub struct Subject {
     pub program: ProgramId,
     pub pid: u32,
     pub uid: u32,
+    /// EINS-C (K5): the assistant tree the process is in (`tree::Tree::id`; 0: none).
+    pub tree: u32,
 }
 
 impl Subject {
-    pub const KERNEL: Subject = Subject { program: ProgramId::SYSTEM, pid: 0, uid: 0 };
+    pub const KERNEL: Subject = Subject { program: ProgramId::SYSTEM, pid: 0, uid: 0, tree: 0 };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

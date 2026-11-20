@@ -1,5 +1,5 @@
 //! One descriptor per class that tests/oracle.rs leaves out because V2 reads it differently from
-//! V1 on purpose (plan/notes/IN-1.md): what V2 does there, asserted.
+//! V1 on purpose (plan/spec/usb.md §4.3): what V2 does there, asserted.
 
 mod common;
 

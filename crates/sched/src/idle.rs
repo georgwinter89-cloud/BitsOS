@@ -7,7 +7,7 @@
 //! - One idle CPU at a time holds poll duty: it spins, runs the registered pollers (devices without interrupts,
 //!   the hrtimer queue, which fires the scheduler's sleep timer and ticks: `timers`) and reports lock-order
 //!   violations. When it finds work it gives the duty up and wakes a halted CPU to take it over. Since CP-5 the
-//!   duty exists only while hrtimers are polled (`time::interrupt_driven()` false: early boot, `hrtimer=poll`, a
+//!   duty exists only while hrtimers are polled (`time::interrupt_driven()` false: early boot, `ktest_timer=poll`, a
 //!   CPU without a live LAPIC timer); with every CPU's LAPIC timer live the duty goes back to the poll thread and
 //!   every idle CPU halts.
 //! - Every other idle CPU halts (`sti; hlt`) until an interrupt: a reschedule IPI when work is placed on it, or
@@ -162,6 +162,7 @@ pub(crate) fn poll_loop() {
         poll_pass(now);
         timers::fallback(now);
         balance::push_all(now);
+        balance::pull_misfits(now);
         crate::sleep_ns(crate::POLL_NS);
     }
 }

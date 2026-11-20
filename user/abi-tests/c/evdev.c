@@ -2,7 +2,7 @@
  * from the Linux headers: a CachyOS test must never open /dev/input (Georg's devices). With "v2" (the ktest
  * in.evdev.program, V2 only) it opens the event node of the MCP keyboard, checks the ioctls and reads the
  * events the test injects; the ktest compares the transcript with user/abi-tests/expected/in4-evdev.txt,
- * written from linux-6.6/drivers/input/evdev.c. */
+ * written from linux-7.3.1/drivers/input/evdev.c. */
 #include "abi.h"
 #include <fcntl.h>
 #include <linux/input.h>

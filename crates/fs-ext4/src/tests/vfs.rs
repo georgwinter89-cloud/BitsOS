@@ -376,7 +376,7 @@ fn freeze_through_the_vfs() {
     assert_clean(&s, &dev.image(), "after the thaw");
 }
 
-/// auto_da_alloc (linux-6.6/fs/ext4/namei.c:3871, VS-2 CR4): a file written and renamed over an older one has
+/// auto_da_alloc (linux-7.3.1/fs/ext4/namei.c:3877, VS-2 CR4): a file written and renamed over an older one has
 /// its data on disk when the rename commits, so a cut right after the commit (the volume synced, the page cache
 /// never written back) finds the new content under the old name, not 0 bytes.
 #[test]

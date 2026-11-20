@@ -1,6 +1,6 @@
-//! Clocks and sleeps of wave A: clock_gettime, clock_getres, clock_nanosleep (linux-6.6/kernel/time/
-//! posix-timers.c :1132, :1252, :1373, the clock table :1514), nanosleep (hrtimer.c :2121), gettimeofday and
-//! time (time.c :140, :62).
+//! Clocks and sleeps of wave A: clock_gettime, clock_getres, clock_nanosleep (linux-7.3.1/kernel/time/posix-timers.c
+//! :1142, :1262, :1383, the clock table :1524), nanosleep (hrtimer.c :2503), gettimeofday and time (time.c :148,
+//! :69).
 //!
 //! V2's clocks: MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE and BOOTTIME are `time::now_ns()` (TSC since boot;
 //! no suspend, so BOOTTIME equals MONOTONIC). REALTIME, REALTIME_COARSE and TAI are CP-5's wall clock
@@ -12,6 +12,11 @@
 //! need CAP_WAKE_ALARM (`alarm_timer_nsleep`; V2 has no suspend to wake from, so they are plain sleeps; AB-13,
 //! nplb's PosixTimeClockGettime cases). Every clock has 1 ns resolution (the coarse ones are as exact as the
 //! others; `hrtimer_resolution` for the alarm clocks).
+//!
+//! L7-SYNC: the auxiliary clocks CLOCK_AUX .. CLOCK_AUX_LAST (16..23, CONFIG_POSIX_AUX_CLOCKS as on CachyOS) are
+//! in the table but never enabled (Linux turns one on through sysfs, which V2 does not have): clock_gettime
+//! answers ENODEV (timekeeping.c:3208 `aux_get_timespec`), clock_getres answers 1 ns (:3198 `aux_get_res` looks
+//! at the id only), clock_nanosleep and timer_create EOPNOTSUPP (`clock_aux` has neither).
 
 use crate::SysCtx;
 use uapi::Timespec;
@@ -30,7 +35,13 @@ pub(crate) enum Clock {
     Cpu { pid: u32, thread: bool, which: u8 },
     /// REALTIME_ALARM (`real`) / BOOTTIME_ALARM.
     Alarm { real: bool },
+    /// CLOCK_AUX + n (n < 8), never enabled.
+    Aux,
 }
+
+/// `CLOCK_AUX` and `CLOCK_AUX_LAST` (include/uapi/linux/time.h:74).
+pub(crate) const CLOCK_AUX: i32 = 16;
+pub(crate) const CLOCK_AUX_LAST: i32 = 23;
 
 /// `clockid_to_kclock` and the CPU-clock encoding (`CPUCLOCK_PID` = ~(id >> 3), bit 2 per-thread, the low two
 /// bits PROF/VIRT/SCHED/FD). None = EINVAL.
@@ -49,6 +60,7 @@ pub(crate) fn decode(id: i32) -> Option<Clock> {
         CLOCK_THREAD_CPUTIME_ID => Some(Clock::Cpu { pid: 0, thread: true, which: crate::cputime_sys::CPUCLOCK_SCHED }),
         CLOCK_REALTIME_ALARM => Some(Clock::Alarm { real: true }),
         CLOCK_BOOTTIME_ALARM => Some(Clock::Alarm { real: false }),
+        CLOCK_AUX..=CLOCK_AUX_LAST => Some(Clock::Aux),
         _ => None,
     }
 }
@@ -80,6 +92,7 @@ fn read_ns(c: &SysCtx<'_>, clock: Clock) -> Result<u64, i64> {
         Clock::Cpu { pid, thread, which } => crate::cputime_sys::cpu_clock_ns(c, pid, thread, which),
         Clock::Alarm { real: true } => Ok(realtime_ns()),
         Clock::Alarm { real: false } => Ok(time::now_ns()),
+        Clock::Aux => Err(-ENODEV),
     }
 }
 
@@ -207,6 +220,7 @@ fn sys_clock_nanosleep(c: &mut SysCtx<'_>) -> i64 {
         // turned into a monotonic deadline once, at the call; one already past returns at once.
         Clock::Realtime if abs => realtime_deadline(ns, realtime_ns(), time::now_ns()),
         Clock::Monotonic | Clock::Realtime => time::now_ns().saturating_add(ns),
+        Clock::Aux => return -EOPNOTSUPP,
     };
     if !abs {
         return relative_sleep(c, deadline, rmtp);
@@ -274,6 +288,13 @@ mod tests {
         assert_eq!(decode(10), None, "CLOCK_SGI_CYCLE is gone");
         assert_eq!(decode(11), Some(Clock::Realtime));
         assert_eq!(decode(12), None);
+        // L7-SYNC: the auxiliary clocks are known ids (EINVAL only past them).
+        for id in CLOCK_AUX..=CLOCK_AUX_LAST {
+            assert_eq!(decode(id), Some(Clock::Aux), "{id}");
+            assert!(!can_sleep(id), "{id}: no nsleep");
+        }
+        assert_eq!(decode(15), None);
+        assert_eq!(decode(24), None);
         // glibc's clock_getcpuclockid(pid 0): MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_SCHED) = -6; thread clock -2.
         assert_eq!(decode(-6), Some(Clock::Cpu { pid: 0, thread: false, which: 2 }));
         assert_eq!(decode(-2), Some(Clock::Cpu { pid: 0, thread: true, which: 2 }));

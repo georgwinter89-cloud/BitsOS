@@ -1,10 +1,11 @@
 //! A regular ext4 file behind the VFS: its page cache (FS-5) with the volume as the backend. A write that
 //! reaches pages the disk does not map yet promises their blocks first (`Volume::reserve`): a full volume
 //! answers ENOSPC at `write`, not at write-back (Linux's delayed-allocation reservation). The write-back
-//! writes runs (`Volume::write`: blocks marked used, data, then extents and inode) and stores the times the
-//! VFS keeps; fsync then flushes the device, after the cache's lock is released.
+//! writes runs in steps (`flight`: blocks claimed, the data to the device, then blocks, extents and inode in one
+//! transaction; FS-W2: on a disk the pages themselves go to the device, `Volume::write_pages`) and stores the
+//! times the VFS keeps; fsync then commits and flushes the device, after the cache's lock is released.
 
-use crate::vol::{Meta, Volume};
+use crate::vol::{Hold, Meta, Slot, Volume};
 use alloc::vec::Vec;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,6 +25,8 @@ pub struct Ext4File {
     registered: AtomicBool,
     /// st_blocks as the volume keeps it (`Volume::hold`): stat takes no volume lock.
     blocks: Arc<AtomicU64>,
+    /// This file's place on the volume's list of dropped inodes (`Volume::hold`), given back in the drop.
+    slot: Option<Slot>,
 }
 
 struct Back {
@@ -33,11 +36,12 @@ struct Back {
 }
 
 impl Ext4File {
-    /// `blocks`: from `Volume::hold`, which the caller called for this file (its `forget` is this file's drop).
-    pub fn new(vol: Arc<Volume>, ino: u32, size: u64, blocks: Arc<AtomicU64>) -> Arc<Ext4File> {
+    /// `hold`: from `Volume::hold`, which the caller called for this file (its `forget` is this file's drop).
+    pub fn new(vol: Arc<Volume>, ino: u32, size: u64, hold: Hold) -> Arc<Ext4File> {
+        let Hold { blocks, slot } = hold;
         Arc::new_cyclic(|me: &Weak<Ext4File>| {
             let back = Arc::new(Back { vol: vol.clone(), ino, file: me.clone() });
-            Ext4File { vol, ino, cache: PageCache::with_backend(back, size), me: SpinLock::named("ext4.file.me", None), registered: AtomicBool::new(false), blocks }
+            Ext4File { vol, ino, cache: PageCache::with_backend(back, size), me: SpinLock::named("ext4.file.me", None), registered: AtomicBool::new(false), blocks, slot: Some(slot) }
         })
     }
     pub fn set_inode(&self, i: &Arc<Inode>) {
@@ -71,7 +75,9 @@ impl Ext4File {
 
 impl Drop for Ext4File {
     fn drop(&mut self) {
-        self.vol.forget(self.ino);
+        if let Some(slot) = self.slot.take() {
+            self.vol.forget(slot);
+        }
     }
 }
 
@@ -180,8 +186,10 @@ impl InodeOps for Ops {
 /// the order holds per step. 1 MiB: one device request (`vol_data::IO_MAX`), and the volume lock is free again
 /// after each, so other programs' file calls get in between a download's steps.
 pub(crate) const WRITE_STEP_PAGES: usize = 256;
-/// The buffers the steps copy their pages into, made once (`write_bufs_init`, at the first writable mount) and
-/// kept. Write-back is what frees memory, so it must not ask the heap while memory is short. 11.11.2026, a Steam
+/// The buffers the steps copy their pages into where the device takes no pages (an image file, a volume with
+/// blocks smaller than a page; a disk with 4 KiB blocks needs none since FS-W2), made once (`write_bufs_init`,
+/// at the first writable mount of such a volume) and kept. Their number bounds those volumes' steps at the device;
+/// such a device has no queue that could say how many it takes (its writes are copies into another cache). Write-back is what frees memory, so it must not ask the heap while memory is short. 11.11.2026, a Steam
 /// download beside a full page cache on the Mini-PC: every run asked for 16 MiB, then for halves, each refused
 /// only after the heap's reclaim rounds, 125 refusals a second on ten threads; sound and picture stalled.
 const WRITE_BUFS: usize = 4;
@@ -271,22 +279,41 @@ impl Backend for Back {
             return Ok(());
         }
         let len = (pages.len() as u64 * PAGE).min(size - off) as usize;
-        // A kept buffer, never the heap (`WRITE_BUF`); the step is what the buffer holds.
-        let mut data = write_buf()?;
-        let step_pages = (data.capacity() / PAGE as usize).clamp(1, WRITE_STEP_PAGES);
-        let step_bytes = step_pages * PAGE as usize;
         // Pages past `size` (a file cut after they were collected) hold nothing to write: the last step gives back
         // their promises too.
         let with_data = len.div_ceil(PAGE as usize);
-        for (k, part) in pages[..with_data].chunks(step_pages).enumerate() {
-            let at = k * step_pages;
-            data.resize((len - at * PAGE as usize).min(step_bytes), 0);
+        let mut at = 0;
+        // FS-W2: a disk takes the pages themselves as its requests' memory (`Dev::write_pages`): no buffer, no copy,
+        // and no count of buffers that bounds the steps. Each writing thread has one step at the device; what the
+        // device does not take at once waits in its queue (`block::Disk`: `queue_depth` slots), and the thread
+        // with it. With blocks smaller than a page the data shares the disk cache's pages with metadata and goes
+        // through the buffer path below, as on a device that is a file.
+        if self.vol.geo.bs == PAGE && self.vol.dev.takes_pages() {
+            while at < with_data {
+                let part = &pages[at..(at + WRITE_STEP_PAGES).min(with_data)];
+                let bytes = (len - at * PAGE as usize).min(part.len() * PAGE as usize);
+                let step = first + at as u64;
+                let promised = step..if at + part.len() == with_data { first + pages.len() as u64 } else { step + part.len() as u64 };
+                self.vol.write_pages(self.ino, step * PAGE, part, bytes, size, promised)?;
+                at += part.len();
+            }
+            return Ok(());
+        }
+        while at < with_data {
+            // A kept buffer, never the heap (`WRITE_BUF`); the step is what the buffer holds. Taken for one step
+            // (FS-W): a long run held one of the four for all its steps (4.6 s on the Mini-PC) and the fifth
+            // writer waited that long; now the writers take turns step by step.
+            let mut data = write_buf()?;
+            let step_pages = (data.capacity() / PAGE as usize).clamp(1, WRITE_STEP_PAGES);
+            let part = &pages[at..(at + step_pages).min(with_data)];
+            data.resize((len - at * PAGE as usize).min(part.len() * PAGE as usize), 0);
             for (p, b) in part.iter().zip(data.chunks_mut(PAGE as usize)) {
                 p.read(0, b);
             }
             let step = first + at as u64;
             let promised = step..if at + part.len() == with_data { first + pages.len() as u64 } else { step + part.len() as u64 };
             self.vol.write(self.ino, step * PAGE, &data, size, promised)?;
+            at += part.len();
         }
         Ok(())
     }
@@ -298,6 +325,14 @@ impl Backend for Back {
     }
     fn read_ahead_pages(&self) -> u64 {
         32
+    }
+    /// FS-W2: 4 MiB (four steps). A step's data now waits for the device, so the pages a write-back took and has
+    /// not written are real memory in flight; one batch for all of a file's dirty pages took them out of the dirty
+    /// count at once and the limit (`dirty_over_limit`) let every writer go on. Linux counts pages under write-back
+    /// apart and holds writers back by both numbers; V2 has the one number, so what is outside it stays small:
+    /// one batch per writing thread.
+    fn batch_pages(&self) -> usize {
+        4 * WRITE_STEP_PAGES
     }
     /// BL-4 CR 4: the disk's request size in pages (0 on an image or in memory: as `read_ahead_pages`).
     fn io_pages(&self) -> u64 {

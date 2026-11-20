@@ -34,4 +34,4 @@ applets root`). A case whose first line is `# as: root` runs as uid 0 on V2 and,
 mount, net and uts namespaces (`unshare --user --map-root-user --mount --net --uts`), so it never touches the host.
 A line that depends on a V2 gap is written so that the gap makes it *missing* (`... && echo name`, `| grep -x`),
 never different: `.known` can excuse a missing line only. ENOSYS calls show up once per boot in the kernel log
-(`syscall enosys nr=... program=...`); `plan/notes/ul-UL-3b.md` has the list by applet and owner.
+(`syscall enosys nr=... program=...`); the `.known` lines name each gap and its owner.

@@ -8,7 +8,7 @@ use super::watch::client;
 use crate::bus::SimMem;
 use crate::errno;
 use crate::pm4;
-use crate::recover::{Action, IpVersion, MODE2_UNMEASURED, Next, Outcome, Policy, Reply, ResetDomain, Scope};
+use crate::recover::{Action, IpVersion, Next, Outcome, Policy, Reply, ResetDomain, Scope};
 use crate::ring::{Kind, Ring};
 use crate::sdma;
 use crate::sim::{Engine, Isa, Stop};
@@ -113,7 +113,12 @@ impl Chip {
                 self.fence_writes.push(fence_value);
                 Reply::Ring { ptr: self.ring.wptr() }
             }
-            Action::SuspendGc | Action::Mode2Reset => panic!("mode 2 on the default policy"),
+            Action::SuspendGc => Reply::Ok,
+            Action::Mode2Reset => {
+                let w = self.ring.wptr();
+                self.eng.reset(w);
+                Reply::Reset { vram_intact: true, display_equal: true }
+            }
         }
     }
 
@@ -348,15 +353,16 @@ fn an_sdma_poll_is_cleared_by_restarting_only_that_ring() {
 }
 
 #[test]
-fn when_gc_will_not_come_back_the_default_policy_asks_for_a_reboot() {
+fn when_gc_will_not_come_back_even_after_mode2_the_ladder_asks_for_a_reboot() {
     let mut c = Chip::new(Kind::Gfx, RingClass::GfxDirect, 1000);
     c.submit(1, &wait_never());
     c.tick(1);
     c.tick(1000);
     c.fail_reinit = true;
     let (acts, f) = c.recover();
-    assert!(acts.contains(&Action::ReinitGc));
-    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_UNMEASURED) });
+    assert!(acts.ends_with(&[Action::ReinitGc, Action::SuspendGc, Action::Mode2Reset, Action::ReinitGc]), "{acts:?}");
+    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: None });
+    assert_eq!(c.reinits, 2, "the re-init alone, then the one that ends mode 2");
     assert_eq!(f.fates[0].fate.errno(), errno::ETIME);
     assert!(c.d.is_dead());
 }

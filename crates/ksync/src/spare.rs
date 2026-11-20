@@ -5,7 +5,7 @@
 //! `try_reserve` fails although memory is there. A `Spare` allocates the larger queue with the lock dropped
 //! and swaps it in under the lock, where only plain moves are left:
 //!
-//! ```ignore
+//! ```text
 //! let mut spare = Spare::new();   // before the guard: the emptied old queue is freed after the unlock
 //! loop {
 //!     let mut g = lock.lock();

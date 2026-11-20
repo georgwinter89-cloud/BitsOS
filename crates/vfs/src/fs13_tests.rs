@@ -49,7 +49,7 @@ fn checks(ns: &MountNs) {
     assert!(!check(&nx, PROT_READ, MAP_PRIVATE, 0, 4096).unwrap().may_exec);
     let ok = user.open(None, b"/ok/f", O_RDONLY, 0).unwrap();
     assert!(check(&ok, PROT_READ | PROT_EXEC, MAP_PRIVATE, 0, 4096).unwrap().may_exec);
-    // EACCES for an fd not open for reading comes first (linux-6.6/mm/mmap.c:1321).
+    // EACCES for an fd not open for reading comes first (linux-7.3.1/mm/mmap.c:477).
     let wo = user.open(None, b"/nx/f", crate::abi::O_WRONLY, 0);
     if let Ok(wo) = wo {
         assert_eq!(check(&wo, PROT_READ | PROT_EXEC, MAP_PRIVATE, 0, 4096).err(), Some(EACCES));

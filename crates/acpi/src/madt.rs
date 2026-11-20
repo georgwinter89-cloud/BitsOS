@@ -106,6 +106,9 @@ pub struct Madt {
     pub lapic_nmis: Vec<LapicNmi>,
     /// Entries of types this parser does not read (GIC, SAPIC, wakeup, ...).
     pub other_entries: u32,
+    /// x2APIC entries that are unused slots (GP B6: broadcast ID, neither enabled nor online-capable). Firmware
+    /// pads its processor list with them; Linux drops them without a word, so they are counted, not noted.
+    pub empty_slots: u32,
 }
 
 impl Madt {
@@ -186,6 +189,10 @@ fn entry(m: &mut Madt, ty: u8, e: &[u8]) -> Option<Kept> {
         9 => {
             let f = u32_at(e, 8)?;
             let (apic_id, uid) = (u32_at(e, 4)?, u32_at(e, 12)?);
+            if gp_platform::madt::is_placeholder(apic_id, f) {
+                m.empty_slots = m.empty_slots.saturating_add(1);
+                return Some(Kept::Yes);
+            }
             if apic_id == X2APIC_BROADCAST {
                 return Some(Kept::Broadcast(apic_id));
             }

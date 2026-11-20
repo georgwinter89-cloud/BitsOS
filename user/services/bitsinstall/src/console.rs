@@ -39,7 +39,7 @@ pub const CODE_LEN: usize = 4;
 /// What starts every painting: cursor home, clear the screen (ECMA-48 CUP, ED).
 pub const CLEAR: &str = "\x1b[H\x1b[2J";
 
-/// Evdev key codes (linux-6.6/include/uapi/linux/input-event-codes.h): positions, the same on a German and a US
+/// Evdev key codes (linux-7.3.1/include/uapi/linux/input-event-codes.h): positions, the same on a German and a US
 /// layout for these keys.
 pub const KEY_ESC: u16 = 1;
 pub const KEY_1: u16 = 2;
@@ -49,7 +49,7 @@ pub const KEY_8: u16 = 9;
 pub const KEY_P: u16 = 25;
 pub const KEY_J: u16 = 36;
 pub const KEY_N: u16 = 49;
-/// linux-6.6/include/uapi/linux/input.h.
+/// linux-7.3.1/include/uapi/linux/input.h:259.
 pub const BUS_VIRTUAL: u16 = 0x06;
 
 /// The code's letters and their evdev codes: the same key on a German and a US layout (no Y/Z), none of the

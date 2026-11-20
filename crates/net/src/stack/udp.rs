@@ -254,6 +254,17 @@ impl SmolUdp {
                     fresh.push((c.clone(), s));
                 }
             }
+            // Each card's socket table gets its free slot before `socks` is locked too (`Iface::lock_room`; the
+            // larger table is not made under a spin lock). A card without memory for it and the cards after it
+            // wait for the next call.
+            let mut rooms: Vec<iface::Room> = Vec::new();
+            rooms.resize_with(fresh.len(), iface::Room::new);
+            if let Some(i) = fresh.iter().zip(&mut rooms).position(|((c, _), room)| !c.lock_room(self.stack, room, 0, 1, false).1) {
+                refused = Some(NetError::NoMemory);
+                fresh.truncate(i);
+            }
+            // The first card is taken first.
+            fresh.reverse();
             let mut socks = self.socks.lock();
             // Another `sync` got there first: ours go (after the unlock), the next round looks again.
             if socks.len() != have {
@@ -261,9 +272,22 @@ impl SmolUdp {
             }
             // A card or two: no large block.
             socks.reserve(fresh.len());
-            for (c, s) in fresh.drain(..) {
-                let h = c.inner.lock().sockets.add(s);
+            let mut taken = false;
+            while let Some(c) = fresh.last().map(|(c, _)| c.clone()) {
+                let mut g = c.inner.lock();
+                // The slot went to someone else since it was made: again from the top (what is left of `fresh`
+                // goes after the unlock).
+                if !g.admits(self.stack, 0, 1) {
+                    taken = true;
+                    break;
+                }
+                let Some((_, s)) = fresh.pop() else { break };
+                let h = g.sockets.add(s, false);
+                drop(g);
                 socks.push((c, h));
+            }
+            if taken {
+                continue;
             }
             return refused.map_or(Ok(()), Err);
         }
@@ -358,7 +382,7 @@ impl UdpSocket for SmolUdp {
 impl Drop for SmolUdp {
     fn drop(&mut self) {
         for (c, h) in self.socks.lock().drain(..) {
-            c.inner.lock().sockets.remove(h);
+            c.inner.lock().sockets.remove(h, false);
         }
         if self.owns_port {
             UDP_PORTS.lock().remove(&self.port);
@@ -397,7 +421,12 @@ pub(crate) fn ping(stack: &'static Stack, dst: Ipv4, timeout_ns: u64) -> Result<
         let mut s = icmp::Socket::new(buf()?, buf()?);
         s.bind(icmp::Endpoint::Ident(ident)).map_err(|_| NetError::Other)?;
         s.send_slice(&echo_request(ident, seq), IpAddress::Ipv4(iface::v4(dst))).map_err(|_| NetError::Other)?;
-        card.inner.lock().sockets.add(s)
+        let mut room = iface::Room::new();
+        let (mut g, slot) = card.lock_room(stack, &mut room, 0, 1, false);
+        if !slot {
+            return Err(NetError::NoMemory);
+        }
+        g.sockets.add(s, false)
     };
     stack.kick();
     let mut buf = [0u8; 256];
@@ -426,6 +455,6 @@ pub(crate) fn ping(stack: &'static Stack, dst: Ipv4, timeout_ns: u64) -> Result<
         stack.wq.wait_until_timeout(|| card.inner.lock().sockets.get_mut::<icmp::Socket>(h).can_recv(), deadline - now);
     }
     let rtt = stack.now().saturating_sub(t0);
-    card.inner.lock().sockets.remove(h);
+    card.inner.lock().sockets.remove(h, false);
     if got { Ok(rtt) } else { Err(NetError::TimedOut) }
 }

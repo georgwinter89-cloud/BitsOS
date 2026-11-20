@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"Hallo Georg, "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"hier antwortet die Aufzeichnung "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"OPENAI-OK. "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"Grüße mit Umlauten: äöüß."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

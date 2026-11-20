@@ -11,9 +11,9 @@
 //! (checked 30.10.): Brave's and Cobalt's libraries outside lib/ (libvulkan, libvk_swiftshader, libcobalt) have no
 //! RUNPATH, and the Mesa and Xwayland trees run on their own loader, which skips the host's ldd altogether.
 //! Names must be safe on FAT and in the package list: no whitespace, none of `"*/:<>?\|`, no trailing dot,
-//! at most 255 UTF-16 units (a FAT long name, linux-6.6/fs/fat/namei_vfat.c:597 FAT_LFN_LEN), and no two names in one
-//! directory that differ only in case (a directory and a file included). A link is followed; a dangling one is an
-//! error.
+//! at most 255 UTF-16 units (a FAT long name, linux-7.3.1/fs/fat/namei_vfat.c:523 FAT_LFN_LEN), and no two names in
+//! one directory that differ only in case (a directory and a file included). A link is followed; a dangling one is
+//! an error.
 
 use super::{interp, is_dynamic, is_shared_lib, ldd_report, no_host_lib};
 use std::collections::{BTreeMap, BTreeSet};
@@ -301,10 +301,8 @@ mod tests {
     /// A host program in a tree: the libraries the set has stay out, the others are named with their host file.
     #[test]
     fn libs_only_what_the_set_lacks() {
-        let Ok(ls) = std::fs::canonicalize("/usr/bin/ls") else { return };
-        if !super::super::have_tool("ldd") {
-            return;
-        }
+        let ls = std::fs::canonicalize("/usr/bin/ls").unwrap();
+        assert!(super::super::have_tool("ldd"), "ldd is on every build host (glibc)");
         let d = scratch("libs");
         std::fs::copy(&ls, d.join("ls")).unwrap();
         let fs = files(&d).unwrap();
@@ -325,10 +323,8 @@ mod tests {
     /// nothing from the host, even with an empty set.
     #[test]
     fn libs_of_a_tree_on_a_stick_loader() {
-        let (Ok(ls), Ok(cxx)) = (std::fs::canonicalize("/usr/bin/ls"), std::fs::canonicalize("/usr/lib/libstdc++.so.6")) else { return };
-        if !super::super::have_tool("ldd") {
-            return;
-        }
+        let (ls, cxx) = (std::fs::canonicalize("/usr/bin/ls").unwrap(), std::fs::canonicalize("/usr/lib/libstdc++.so.6").unwrap());
+        assert!(super::super::have_tool("ldd"), "ldd is on every build host (glibc)");
         let d = scratch("stickld");
         std::fs::create_dir_all(d.join("lib")).unwrap();
         let mut elf = std::fs::read(&ls).unwrap();
@@ -440,10 +436,8 @@ mod tests {
     /// lib/ has already is taken from there; a library outside lib/ is the tree's own business.
     #[test]
     fn libs_of_a_dlopened_library() {
-        let (Ok(cxx), Ok(gcc)) = (std::fs::canonicalize("/usr/lib/libstdc++.so.6"), std::fs::canonicalize("/usr/lib/libgcc_s.so.1")) else { return };
-        if !super::super::have_tool("ldd") {
-            return;
-        }
+        let (cxx, gcc) = (std::fs::canonicalize("/usr/lib/libstdc++.so.6").unwrap(), std::fs::canonicalize("/usr/lib/libgcc_s.so.1").unwrap());
+        assert!(super::super::have_tool("ldd"), "ldd is on every build host (glibc)");
         assert!(super::super::is_shared_lib(&read_head(&cxx).unwrap()));
         if let Ok(ls) = std::fs::canonicalize("/usr/bin/ls") {
             assert!(!super::super::is_shared_lib(&read_head(&ls).unwrap()), "a PIE program is not a library");

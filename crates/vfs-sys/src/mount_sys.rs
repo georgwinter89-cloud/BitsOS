@@ -36,9 +36,6 @@ impl MountPerms for Perms<'_> {
     fn may_mount(&self) -> bool {
         cred::ns_capable(&self.c, &self.p.mnt_ns().user_ns, Cap::SysAdmin)
     }
-    fn capable_init(&self) -> bool {
-        cred::capable(&self.c, Cap::SysAdmin)
-    }
     fn may_mount_fs(&self, fstype: &str) -> bool {
         cred::ns_capable(&self.c, &self.fs_ns(fstype), Cap::SysAdmin)
     }
@@ -63,12 +60,8 @@ impl MountPerms for Perms<'_> {
         let fs = self.p.fs_cred();
         f(&Mounter { fsuid: fs.uid, fsgid: fs.gid, uid_in: &uid_in, gid_in: &gid_in, init_ns: ns.is_init(), ns_root: root })
     }
-    fn ptmx(&self) -> Option<Arc<dyn vfs::File>> {
-        let p = vfs::root_ns().lookup_path(b"/dev/ptmx", true).ok()?;
-        match &p.dentry.inode.data {
-            vfs::inode::Data::Device(f) => Some(f.clone()),
-            _ => None,
-        }
+    fn ptmx(&self, inst: vfs::mount_fs::PtsSuper) -> Option<Arc<dyn vfs::File>> {
+        Some(console::pty::instance_ptmx(inst))
     }
     fn ram_bytes(&self) -> u64 {
         mm_core::frames().map_or(0, |f| f.stats().total_bytes)

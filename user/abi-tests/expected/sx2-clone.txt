@@ -36,3 +36,33 @@ clone3(CLONE_NEWPID, set_tid {1, n}) without CAP_CHECKPOINT_RESTORE outside = -E
 clone3(CLONE_NEWPID, set_tid of 3 levels) = -EINVAL
 clone3(set_tid {1}) in the caller's namespace = -EPERM
 set_tid helper: exit 0
+clone3(AUTOREAP with SIGCHLD) = -EINVAL
+clone3(AUTOREAP|PARENT) = -EINVAL
+clone3(NNP|thread) = -EINVAL
+clone3(PIDFD_AUTOKILL|AUTOREAP) without PIDFD = -EINVAL
+clone3(PIDFD_AUTOKILL|PIDFD) without AUTOREAP = -EINVAL
+clone3(PIDFD_AUTOKILL|PIDFD|AUTOREAP) without NNP, unprivileged = -EPERM
+clone3(EMPTY_MNTNS) unprivileged = -EPERM
+clone3(bit 38) = -EINVAL
+clone3(AUTOREAP|NNP|PIDFD) made a child = yes
+its exit code through PIDFD_GET_INFO = 0x2900
+wait4 after the autoreap child = -ECHILD
+SIGCHLD pending = no
+F_GETFL(autokill pidfd) = 01002
+the child after the close: exit code 0x9
+pid_max write from outside, unprivileged = -13
+pid_max: unshare(CLONE_NEWUSER|CLONE_NEWPID) = 0
+pid_max in a new namespace = 4194304
+write 100 = -22
+write 5000 = 4
+pid_max there now = 5000
+pid_max: init: exit 0
+pid_max: the creator still reads its own = yes
+pid_max helper: exit 0
+pid_max outside unchanged = yes
+reaped: unshare(CLONE_NEWUSER|CLONE_NEWPID) = 0
+reaped: child: exit 7
+reaped: pidfd_send_signal(0) = -ESRCH
+reaped: exit code through PIDFD_GET_INFO = 0x700
+reaped: init: exit 0
+reaped helper: exit 0

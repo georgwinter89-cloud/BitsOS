@@ -412,7 +412,7 @@ pub fn dry_run(st: &Staged) -> String {
     // Busy: the jump waits for that read and reads the stick then.
     if !lost.is_empty() && outcome != Outcome::Busy {
         line.push_str(&alloc::format!("; the new kernel would have no value for {}", lost.join(",")));
-        if crate::secret::loss_blocks_reload(&lost, pci::registry::opted_in("wlan")) {
+        if crate::secret::loss_blocks_reload(&lost, crate::secret::wlan_used()) {
             line.push_str(" (a real Reload refuses this without force)");
         }
     }
@@ -424,7 +424,7 @@ pub fn dry_run(st: &Staged) -> String {
 /// nobody at it, and this kernel can still say no and go on. The read at the jump can still lose one (logged).
 pub fn refuse_secret_loss(st: &Staged) -> Result<(), String> {
     let Forecast { outcome, lost, .. } = forecast(st, true);
-    if !crate::secret::loss_blocks_reload(&lost, pci::registry::opted_in("wlan")) {
+    if !crate::secret::loss_blocks_reload(&lost, crate::secret::wlan_used()) {
         return Ok(());
     }
     let keys = lost.join(",");

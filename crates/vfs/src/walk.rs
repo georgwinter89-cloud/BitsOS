@@ -61,6 +61,14 @@ pub struct Walker<'a> {
     links: u32,
 }
 
+/// A walk that ends on `p` by a jump: a synthetic directory may refuse it (`DirSource::jumped_to`).
+fn jumped_to(p: &Path) -> Result<(), Errno> {
+    match &p.dentry.inode.data {
+        crate::inode::Data::SynthDir(sd) => sd.jumped_to(),
+        _ => Ok(()),
+    }
+}
+
 impl<'a> Walker<'a> {
     pub fn new(ns: &'a MountNs, root: Path, cred: Cred) -> Self {
         Walker { ns, root, cred, links: 0 }
@@ -71,7 +79,7 @@ impl<'a> Walker<'a> {
         if !dir.dentry.is_dir() {
             return Err(ENOTDIR);
         }
-        dir.dentry.inode.meta.permission(self.cred, MAY_EXEC)
+        dir.dentry.inode.permission(self.cred, MAY_EXEC)
     }
 
     /// Looks `name` up in `dir` (searchable, checked by the caller): `Ok(None)` for a free name.
@@ -148,7 +156,12 @@ impl<'a> Walker<'a> {
     pub fn last(&mut self, mut dir: Path, mut last: Last, follow: bool) -> Result<(Path, Last, Option<Path>), Errno> {
         loop {
             match last.kind {
-                LastKind::Root | LastKind::Dot => return Ok((dir.clone(), last, Some(dir))),
+                LastKind::Root => {
+                    // Only slashes: the walk jumped to the root and checked no component (`complete_walk`).
+                    jumped_to(&dir)?;
+                    return Ok((dir.clone(), last, Some(dir)));
+                }
+                LastKind::Dot => return Ok((dir.clone(), last, Some(dir))),
                 LastKind::DotDot => {
                     let p = self.ns.parent_of(&self.root, &dir);
                     return Ok((dir, last, Some(p)));
@@ -159,6 +172,7 @@ impl<'a> Walker<'a> {
                         self.follow_count()?;
                         if let Some(m) = &found.dentry.inode.magic {
                             let to = m.target()?;
+                            jumped_to(&to)?;
                             if last.trailing && !to.dentry.is_dir() {
                                 return Err(ENOTDIR);
                             }

@@ -70,7 +70,7 @@ fn anonymous_union_of_info() {
 
 #[test]
 fn prime_export_flags_are_the_x86_64_open_flags() {
-    // PRIME_HANDLE_TO_FD takes DRM_CLOEXEC | DRM_RDWR; linux-6.6/include/uapi/asm-generic/fcntl.h:22 and :63.
+    // PRIME_HANDLE_TO_FD takes DRM_CLOEXEC | DRM_RDWR; linux-7.3.1/include/uapi/asm-generic/fcntl.h:21 and :66.
     assert_eq!(DRM_RDWR, 0o2);
     assert_eq!(DRM_CLOEXEC, 0o2000000);
 }

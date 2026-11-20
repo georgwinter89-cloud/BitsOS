@@ -1,11 +1,13 @@
 //! UL-7: init waits for busybox's halt/poweroff/reboot signals and the desktop's power socket between its rounds,
 //! and ends the system as busybox init does (`run_shutdown_and_kill_processes`): SIGTERM to every process, a
 //! bounded wait, SIGKILL, a bounded wait, sync, then reboot(2). A power-off is judged before anything ends
-//! (the kernel's `/proc/bitsos/power`, R8f); refused, nothing happens but the log line.
+//! (the kernel's `/proc/bitsos/power`, R8f); refused, nothing happens but the log line. GM-6w: over the socket a
+//! restart or power-off only for fb0's compositor grant holder with its real-input statement (`power_req`).
 //! Only the system's init does this (pid 1, no test root, not `--once`): a test init keeps the default signals.
 
 use super::Init;
 use initlib::power::{self, Action, Request};
+use initlib::power_req::{self, Answer, answer};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -147,7 +149,8 @@ fn listen(init: &mut Init) -> Option<UnixListener> {
 }
 
 /// One client: the peer check (a peer that may not ask is answered at once, its line never read), its line
-/// within CLIENT_MS, the answer. Some(action) when it is to happen now.
+/// within CLIENT_MS, then for a restart or power-off GM-6w's rule (the compositor grant holder, its real-input
+/// statement) and for a power-off the kernel's R8f judgement. Some(action) when it is to happen now.
 fn serve(init: &mut Init, s: &mut UnixStream) -> Option<(Action, String)> {
     let fd = s.as_raw_fd();
     let (pid, uid, _) = match usys::power::peer_cred(fd as usize) {
@@ -159,39 +162,56 @@ fn serve(init: &mut Init, s: &mut UnixStream) -> Option<(Action, String)> {
     };
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned());
     let from = format!("power socket, pid {pid} uid {uid} {}", exe.as_deref().unwrap_or("?"));
-    let answer = |s: &mut UnixStream, text: &str| {
+    let send = |s: &mut UnixStream, text: String| {
         // Non-blocking: a peer that does not read its answer cannot hold init up.
         let _ = s.set_nonblocking(true);
         let _ = s.write_all(text.as_bytes());
     };
     if let Err(why) = power::peer_allowed(uid, exe.as_deref()) {
         init.log_repeat("powerpeer", &format!("power socket refused: {why} ({from})"));
-        answer(s, &format!("refused {why}\n"));
+        send(s, answer(false, &Answer::Refused(&why)));
         return None;
     }
-    let line = read_line(fd, s);
-    match line.as_deref().and_then(power::parse_request) {
-        Some(Request::Status) => {
-            let t = std::fs::read_to_string(power::POWER_FILE).unwrap_or_default();
-            answer(s, &format!("status {}\n", t.lines().next().unwrap_or("poweroff=unknown")));
-            None
-        }
-        Some(Request::Do(a)) => {
-            if a == Action::PowerOff
-                && let Err(why) = judged(pid)
-            {
-                init.log(&format!("power off refused: {why} ({from})"));
-                answer(s, &format!("refused {why}\n"));
-                return None;
-            }
-            answer(s, &format!("ok {}\n", if a == Action::Restart { "restart" } else { "poweroff" }));
-            Some((a, from))
+    let line = match read_line(fd, s).as_deref().map(power_req::parse_line) {
+        Some(Ok(l)) => l,
+        Some(Err(why)) => {
+            init.log_repeat("powerline", &format!("power socket refused: {why} ({from})"));
+            send(s, answer(false, &Answer::Refused(&why)));
+            return None;
         }
         None => {
-            answer(s, "refused unknown request (restart, poweroff or status)\n");
-            None
+            init.log_repeat("powerline", &format!("power socket refused: no request line within {CLIENT_MS} ms ({from})"));
+            send(s, answer(false, &Answer::Refused("no request line in time")));
+            return None;
         }
+    };
+    let a = match line.request {
+        Request::Status => {
+            let t = std::fs::read_to_string(power::POWER_FILE).unwrap_or_default();
+            send(s, answer(line.json, &Answer::Status(t.lines().next().unwrap_or("poweroff=unknown"))));
+            return None;
+        }
+        Request::Do(a) => a,
+    };
+    // GM-6w: only the compositor the kernel names, and only with its statement that real input asked.
+    let holder = std::fs::read_to_string(power_req::COMPOSITOR_HOLDER).ok();
+    let who = match power_req::do_allowed(pid, holder.as_deref(), &line) {
+        Ok(w) => w,
+        Err(power_req::Refusal { kind, why }) => {
+            init.log_repeat(kind, &format!("power socket refused {}: {why} ({from})", a.word()));
+            send(s, answer(line.json, &Answer::Refused(&why)));
+            return None;
+        }
+    };
+    if a == Action::PowerOff
+        && let Err(why) = judged(pid)
+    {
+        init.log(&format!("power off refused: {why} ({from})"));
+        send(s, answer(line.json, &Answer::Refused(&why)));
+        return None;
     }
+    send(s, answer(line.json, &Answer::Ok(a)));
+    Some((a, format!("{from}, {who}")))
 }
 
 fn read_line(fd: i32, s: &mut UnixStream) -> Option<String> {
@@ -209,8 +229,7 @@ fn read_line(fd: i32, s: &mut UnixStream) -> Option<String> {
             Ok(n) => buf.extend_from_slice(&b[..n.min(power::REQUEST_MAX - buf.len())]),
         }
     }
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    (!text.trim().is_empty()).then_some(text)
+    power_req::first_line(&buf)
 }
 
 /// Ends every program and the system. Returns never: a power-off that did not happen leaves init reaping
@@ -299,6 +318,45 @@ fn others_running() -> usize {
 /// `init --power <restart|poweroff|status>`: one request over the power socket, the answer on stdout (the
 /// reference client for the desktop's power menu, DS-6). Exit 0 for "ok" and "status" answers, 1 otherwise.
 pub fn client(request: &str) -> i32 {
+    ask(&format!("{request}\n"))
+}
+
+/// `init --power-holder <reboot|poweroff>` (GM-6w): asks as the desktop will, typed by a person on the console
+/// while no compositor runs: takes fb0's compositor grant (the screen goes to this process), then sends
+/// `{"op":..,"input":"physical"}`. The reference client of the JSON request and the scenario's compositor peer
+/// (host/tests/ul/60-power-sock.sh). The grant ends with this process.
+/// `no_input` (`--no-input`) leaves the statement out: the scenario's case of the holder that init must refuse.
+pub fn holder_client(op: &str, no_input: bool) -> i32 {
+    let fb = match std::fs::OpenOptions::new().read(true).write(true).open(FB) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("init: cannot open {FB} ({e})");
+            return 1;
+        }
+    };
+    let mut arg = [0u8; 8];
+    arg[..4].copy_from_slice(&OP_GRANT.to_le_bytes());
+    arg[4..].copy_from_slice(&std::process::id().to_le_bytes());
+    if let Err(e) = usys::dev::ioctl_buf(fb.as_raw_fd() as usize, FBIO_BITSOS_COMPOSITOR, &mut arg) {
+        eprintln!("init: the compositor grant is not offered ({e})");
+        return 1;
+    }
+    let line = if no_input {
+        format!("{{\"op\":{}}}\n", power_req::quote(op))
+    } else {
+        format!("{{\"op\":{},\"input\":\"{}\"}}\n", power_req::quote(op), power_req::INPUT_PHYSICAL)
+    };
+    let code = ask(&line);
+    drop(fb);
+    code
+}
+
+const FB: &str = "/dev/fb0";
+/// _IOW('F', 0xB1, struct { u32 op; u32 pid; }) (gopfb fbdev/compositor.rs, bitscomp grant.rs).
+const FBIO_BITSOS_COMPOSITOR: u32 = 0x4008_46B1;
+const OP_GRANT: u32 = 1;
+
+fn ask(line: &str) -> i32 {
     let mut s = match UnixStream::connect(power::POWER_SOCKET) {
         Ok(s) => s,
         Err(e) => {
@@ -307,12 +365,13 @@ pub fn client(request: &str) -> i32 {
         }
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-    if let Err(e) = s.write_all(format!("{request}\n").as_bytes()) {
+    if let Err(e) = s.write_all(line.as_bytes()) {
         eprintln!("init: cannot send the request ({e})");
         return 1;
     }
-    let mut answer = String::new();
-    let _ = s.take(power::REQUEST_MAX as u64 * 8).read_to_string(&mut answer);
-    print!("{answer}");
-    i32::from(!(answer.starts_with("ok ") || answer.starts_with("status ")))
+    let mut reply = String::new();
+    let _ = s.take(power::REQUEST_MAX as u64 * 8).read_to_string(&mut reply);
+    print!("{reply}");
+    let ok = reply.starts_with("ok ") || reply.starts_with("status ") || reply.starts_with("{\"ok\":true");
+    i32::from(!ok)
 }

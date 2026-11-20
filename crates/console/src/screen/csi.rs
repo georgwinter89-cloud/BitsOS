@@ -183,6 +183,7 @@ impl Screen {
             }
             7 => self.autowrap = on,
             25 => self.cursor_on = on,
+            2004 => self.bracketed_paste = on,
             1049 => self.alt_screen(on, true),
             47 | 1047 => self.alt_screen(on, false),
             _ => {}

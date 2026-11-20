@@ -1,5 +1,5 @@
 cap.open2 -16
-cap.pversion 0 0x2000f
+cap.pversion 0 0x20012
 cap.info 0 stream 1 BitsOS Mixer 0/1
 readi.open -77
 refine 0 access 0x8 format 0x4404 channels 1-2 rate 48000-48000 sample_bits 16-32 buffer_bytes_max 4194304

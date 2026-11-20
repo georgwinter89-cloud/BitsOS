@@ -5,7 +5,7 @@
 //! as the test advances them, IOC/INTSTS, and codecs that answer from `hdacodec` dumps (set verbs recorded,
 //! power and pin-sense state kept). Knobs: AMD's LPIB = CBL at the wrap, a dead CORB, no UC/WC memory.
 
-use crate::hw::{AllocError, DmaUse, Hw, Mem};
+use crate::hw::{Hw, Mem};
 use crate::regs::*;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -25,7 +25,7 @@ pub enum Ev {
     PciModify(u8, u32, u32),
     /// A write to STATESTS (write 1 to clear): the bits written.
     Statests(u16),
-    Alloc(usize, bool),
+    Alloc(usize),
 }
 
 type Buf = Arc<SpinLock<Vec<u8>>>;
@@ -143,7 +143,6 @@ pub struct FakeHda {
     pub no_power: AtomicBool,
     /// The codecs report every set power state but stay in D0 (actual state bits 7:4 never follow).
     pub stays_d0: AtomicBool,
-    pub no_uc: AtomicBool,
     /// Engines ignore their stop (RUN/DMA bits and SRST stay); only a link reset stops them.
     pub stuck: AtomicBool,
     /// Register reads and writes so far (SN-7: none may come after a Quiesce).
@@ -173,7 +172,6 @@ impl FakeHda {
             corb_dead: AtomicBool::new(false),
             no_power: AtomicBool::new(false),
             stays_d0: AtomicBool::new(false),
-            no_uc: AtomicBool::new(false),
             stuck: AtomicBool::new(false),
             accesses: AtomicU64::new(0),
             on_write: SpinLock::new(None),
@@ -708,11 +706,8 @@ impl Hw for FakeHw {
     fn delay_us(&self, us: u64) {
         self.0.clock.fetch_add(us.max(1) * 1000, Ordering::AcqRel);
     }
-    fn alloc(&self, len: usize, _usage: DmaUse, _limit32: bool, snoop: bool) -> Result<FakeMem, (AllocError, String)> {
-        if !snoop && self.0.no_uc.load(Ordering::Acquire) {
-            return Err((AllocError::Unsupported, "no UC/WC (knob)".into()));
-        }
-        self.0.trace.lock().push(Ev::Alloc(len, snoop));
+    fn alloc(&self, len: usize, _limit32: bool) -> Result<FakeMem, String> {
+        self.0.trace.lock().push(Ev::Alloc(len));
         let addr = self.0.next.fetch_add((len as u64).div_ceil(4096) * 4096 + 4096, Ordering::AcqRel);
         let buf: Buf = Arc::new(SpinLock::new(vec![0; len]));
         self.0.mem.lock().insert(addr, buf.clone());

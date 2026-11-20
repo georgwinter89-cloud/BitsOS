@@ -1,7 +1,7 @@
-//! Who-am-I and limits of wave A: getpid/gettid/getuid family (linux-6.6/kernel/sys.c), uname (sys.c
+//! Who-am-I and limits of wave A: getpid/gettid/getuid family (linux-7.3.1/kernel/sys.c:999), uname (sys.c
 //! `newuname`), set_tid_address (kernel/fork.c), set_robust_list/get_robust_list (kernel/futex/syscalls.c),
-//! getrlimit/setrlimit/prlimit64 (sys.c :1518, :1731, :1684; rules in `proc::rlimit`), getrandom
-//! (drivers/char/random.c :1364), sched_yield (kernel/sched/core.c; the affinity calls are SC-6's `sched_sys`).
+//! getrlimit/setrlimit/prlimit64 (sys.c :1563, :1794, :1729; rules in `proc::rlimit`), getrandom
+//! (drivers/char/random.c :1380), sched_yield (kernel/sched/core.c; the affinity calls are SC-6's `sched_sys`).
 //!
 //! AB-13: the credential calls (getuid family, set*id, setfs*id, get/setgroups) on `proc::cred`.
 //!
@@ -88,8 +88,8 @@ fn set(c: &SysCtx<'_>, what: &'static str, f: impl FnOnce(&Cred) -> cred::Change
     }
 }
 
-/// `setuid` and its family: linux-6.6/kernel/sys.c :610 `__sys_setuid`, :438 `__sys_setgid`, :529
-/// `__sys_setreuid`, :372 `__sys_setregid`, :667 `__sys_setresuid`, :769 `__sys_setresgid` (the rules are in
+/// `setuid` and its family: linux-7.3.1/kernel/sys.c :651 `__sys_setuid`, :479 `__sys_setgid`, :570
+/// `__sys_setreuid`, :413 `__sys_setregid`, :708 `__sys_setresuid`, :810 `__sys_setresgid` (the rules are in
 /// `proc::cred`, host-tested there).
 fn sys_setuid(c: &mut SysCtx<'_>) -> i64 {
     let Some([u]) = kuids::<1>(c).filter(|[u]| *u != cred::NO_ID) else { return -EINVAL };
@@ -165,7 +165,7 @@ fn sys_getresgid(c: &mut SysCtx<'_>) -> i64 {
 }
 crate::syscall_nr!(uapi::ab::nr_more::GETRESGID, "getresgid", sys_getresgid);
 
-/// `getgroups(size, list)` (linux-6.6/kernel/groups.c:161): size 0 asks for the count; a smaller size than the
+/// `getgroups(size, list)` (linux-7.3.1/kernel/groups.c:161): size 0 asks for the count; a smaller size than the
 /// count is EINVAL; the list comes sorted.
 fn sys_getgroups(c: &mut SysCtx<'_>) -> i64 {
     let size = c.args[0] as i32;
@@ -235,9 +235,12 @@ fn readable_ids(c: &SysCtx<'_>, raw: &mut [u8], n: usize) -> usize {
     (0..n).take_while(|&i| c.proc.mm.copy_from_user(&mut raw[i * 4..i * 4 + 4], c.args[1].wrapping_add(i as u64 * 4)).is_ok()).count()
 }
 
-/// The release V2 reports: Linux 6.6 is the reference its semantics follow (`ref/linux-6.6`).
+/// The release V2 reports: Linux 6.6 is the reference its semantics follow (`ref/linux-6.6`) (Linux 7.3.1 differs:
+/// linux-7.3.1/Makefile:2, see plan/spec/linux7-differences.md).
 pub(crate) const RELEASE: &str = "6.6.0-bitsos-v2";
-pub(crate) const VERSION: &str = "#1 SMP PREEMPT_DYNAMIC BitsOS V2";
+/// UPDATE: "#1 SMP PREEMPT_DYNAMIC BitsOS V2" for a development build (as before), "#<N> ... Version <N> <date>" for
+/// a numbered one (crates/bitsver).
+pub(crate) const VERSION: &str = bitsver::UTS_VERSION;
 
 /// `struct new_utsname`: six fields of 65 bytes, NUL-padded; "Linux" as sysname (programs compare it),
 /// the host and domain names from `uts` (defaults "bitsos" and Linux's "(none)").
@@ -270,7 +273,7 @@ fn sys_set_robust_list(c: &mut SysCtx<'_>) -> i64 {
 }
 crate::syscall!(SET_ROBUST_LIST, sys_set_robust_list);
 
-/// `check_prlimit_permission` (linux-6.6/kernel/sys.c:1662) without the `current == task` case: the caller's
+/// `check_prlimit_permission` (linux-7.3.1/kernel/sys.c:1707) without the `current == task` case: the caller's
 /// real uid equals the target's uid, euid and suid and its real gid the target's gid, egid and sgid, or the
 /// caller has CAP_SYS_RESOURCE. Not the kill rule (review AB-5 finding 7).
 pub(crate) fn may_prlimit(me: &Cred, t: &Cred) -> bool {

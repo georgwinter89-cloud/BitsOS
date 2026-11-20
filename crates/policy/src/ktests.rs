@@ -22,7 +22,7 @@ impl Drop for Rules {
 }
 
 fn subj(p: u32) -> Subject {
-    Subject { program: ProgramId(p), pid: 0x7fff_5000 + (p & 0xfff), uid: 1000 }
+    Subject { program: ProgramId(p), pid: 0x7fff_5000 + (p & 0xfff), uid: 1000, tree: 0 }
 }
 
 fn denies(s: &Subject, a: &Access<'_>) -> bool {
@@ -49,7 +49,7 @@ fn defaults() -> TestResult {
         kassert!(check(&s, a).is_ok(), "default refused {a:?}");
         kassert!(counts()[a.class() as usize].1 > before, "{a:?} not counted");
     }
-    kassert!(check(&Subject { program: ProgramId::SYSTEM, pid: 1, uid: 0 }, &accesses[0]).is_ok(), "BitsOS's own programs allow");
+    kassert!(check(&Subject { program: ProgramId::SYSTEM, pid: 1, uid: 0, tree: 0 }, &accesses[0]).is_ok(), "BitsOS's own programs allow");
     Ok(())
 }
 ktest!("pm.default.allow", Safe, defaults);

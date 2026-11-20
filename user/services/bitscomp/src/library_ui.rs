@@ -1,16 +1,16 @@
-//! PK-L1b: the program library's overlay (desk-PK67-plan.md §3, Georg 6.11.: "Programme per Knopfdruck
+//! PK-L1b: the program library's overlay (plan/spec/program-library.md section 5, Georg 6.11.: "Programme per Knopfdruck
 //! starten"): opened by the Win key alone (D7, `win_alone`), the top bar's "Programme" button or `ctl library open`;
 //! closed by Esc, Win again, a click outside it or a start. Typing filters at once, the arrows move the focus, Tab
 //! moves between the rows, Enter or a click starts. A start follows desktop.md's launcher rule: the program's newest
 //! minimised window on the shown workspace comes back, else it starts (launch.rs's mark until its window maps). A
-//! right click opens the circle menu (pin to the start page, a new tile, two greyed entries). What it shows and the
+//! right click opens the circle menu (pin to the start page, a new tile, and for a package its programme page). What it shows and the
 //! focus moves are pure (`library_view`); its look is `library_draw`.
 
 use smithay::input::keyboard::{Keysym, ModifiersState};
 
 use crate::address::Where;
 use crate::layout::Rect;
-use crate::library_view::{self as view, Move, Row};
+use crate::library_view::{self as view, Button, Move, Row};
 use crate::state::App;
 
 #[derive(Default)]
@@ -29,10 +29,13 @@ pub struct Overlay {
     pub alone: crate::win_alone::WinAlone,
     /// PK-L1c: the pad's Y put the focus on the search field (Down or B leaves it; typing works either way).
     pub search_focus: bool,
+    /// LIB-ADD: the keyboard (or pad) focus is on one of the ways to the "Programme" page, not on a tile.
+    pub button: Option<Button>,
+    pub hover_button: Option<Button>,
     /// The rows of the last `library_rows` and what they were made from: pointer motion (up to 1000 Hz) and a
     /// frame read them without scoring the whole index again.
     rows_cache: std::cell::RefCell<Option<(RowsKey, Vec<Row>)>>,
-    /// Programs the library started that have no window yet: one that ends with an error says so.
+    /// Programs the library (and the sofa) started, by the name their notice uses (PE-1, `prog_ended`).
     pub starts: Vec<(u32, String)>,
     pub images: crate::library_draw::Images,
 }
@@ -54,7 +57,7 @@ struct RowsKey {
     query: String,
 }
 
-fn is_modifier(sym: Keysym) -> bool {
+pub(crate) fn is_modifier(sym: Keysym) -> bool {
     matches!(
         sym,
         Keysym::Shift_L
@@ -85,14 +88,17 @@ impl App {
             query: self.lib.query.clone(),
         };
         let mut cache = self.lib.rows_cache.borrow_mut();
-        match cache.as_ref() {
+        let mut rows = match cache.as_ref() {
             Some((k, rows)) if *k == key => rows.clone(),
             _ => {
                 let rows = view::rows(&self.library, &key.favourites, &key.recent, &key.query);
                 *cache = Some((key, rows.clone()));
                 rows
             }
-        }
+        };
+        // DB4: "Gerade passend", a row of its own after the favourites.
+        crate::passend::insert_row(&mut rows, crate::passend::library_row(&self.library, &self.desk.favourites, &self.habit.shown));
+        rows
     }
 
     pub fn library_geo(&self) -> view::Geo {
@@ -144,9 +150,13 @@ impl App {
             return;
         }
         self.address_end();
+        self.feld_close("library");
+        self.rewind_close("library");
+        self.assist_menu_close("library");
         self.menu = None;
         let lib = &mut self.lib;
         (lib.open, lib.query, lib.scroll, lib.note, lib.hover, lib.menu_for, lib.search_focus) = (true, String::new(), 0, None, None, None, false);
+        (lib.button, lib.hover_button) = (None, None);
         let rows = self.library_rows();
         self.lib.focus = rows.first().and_then(|r| r.ids.first()).map(|id| (0, id.clone()));
         eprintln!("bitscomp: library: opened ({why}), {} programs", self.library.entries.len());
@@ -161,6 +171,7 @@ impl App {
         }
         self.lib.open = false;
         self.lib.search_focus = false;
+        (self.lib.button, self.lib.hover_button) = (None, None);
         self.lib.query.clear();
         self.lib.note = None;
         if self.menu.as_ref().is_some_and(|m| m.entry.is_some()) {
@@ -207,12 +218,17 @@ impl App {
         let rows = self.library_rows();
         self.lib.focus = rows.first().and_then(|r| r.ids.first()).map(|id| (0, id.clone()));
         self.lib.scroll = 0;
-        self.lib.note = rows.is_empty().then(|| format!("Kein Programm passt zu „{}“.", self.lib.query));
+        // Nothing found: the body says so and its link to "Programme hinzufügen" takes the focus (Enter opens it).
+        self.lib.note = None;
+        self.lib.button = (rows.is_empty() && !self.lib.query.trim().is_empty()).then_some(Button::AddSearch);
         self.needs_frame = true;
     }
 
     /// Enter or the pad's A: the focused tile starts.
     pub fn library_start_focused(&mut self) {
+        if let Some(b) = self.lib.button {
+            return self.library_button(b);
+        }
         let rows = self.library_rows();
         if let Some((r, i)) = self.library_at(&rows) {
             self.library_start(&rows[r].ids[i].clone(), Where::Tab);
@@ -221,9 +237,24 @@ impl App {
 
     pub fn library_move(&mut self, m: Move) {
         self.lib.search_focus = false;
+        if let Some(b) = self.lib.button {
+            return self.library_button_move(b, m);
+        }
         let rows = self.library_rows();
-        let Some(at) = self.library_at(&rows) else { return };
+        let Some(at) = self.library_at(&rows) else {
+            return self.library_focus_button(Some(Button::Add));
+        };
         let (g, placed, content) = self.library_layout(&rows);
+        // Above the first line, past the last row (Tab) or before the first (Shift+Tab): the head's buttons.
+        match m {
+            Move::Up if at.0 == 0 && at.1 < g.cols => return self.library_focus_button(Some(Button::Add)),
+            Move::NextRow if at.0 + 1 == rows.len() => return self.library_focus_button(Some(Button::Add)),
+            Move::PrevRow if at.0 == 0 => {
+                let last = self.library_last_head();
+                return self.library_focus_button(Some(last));
+            }
+            _ => {}
+        }
         let lens: Vec<usize> = rows.iter().map(|r| r.ids.len()).collect();
         let (r, i) = view::step(&lens, g.cols, at, m);
         self.lib.focus = Some((r, rows[r].ids[i].clone()));
@@ -240,10 +271,16 @@ impl App {
             self.needs_frame = true;
             return;
         };
+        self.habit_pick("library", &e.address);
         if w == Where::Tab && self.restore_program(&e.address) {
             eprintln!("bitscomp: library: {id} restored (its newest minimised window)");
             self.recent_add(&e.address);
             return self.library_close("restored");
+        }
+        if e.address == crate::address::SOFA {
+            self.library_close("started");
+            self.recent_add(&e.address);
+            return self.sofa_switch(crate::sofa::Way::Tile);
         }
         if e.exec.is_empty() {
             // Einstellungen: bitscomp's own page, opened by its address.
@@ -267,29 +304,16 @@ impl App {
         }
     }
 
-    /// A child ended (`reap_children`, before the launch marks are updated). A program the library started that
-    /// ends with an error before it showed a window (exec failed in the trampoline, a launcher that gave up) says so:
-    /// in the overlay when it is open, else as a notice.
-    pub fn library_ended(&mut self, pid: u32, status: std::process::ExitStatus) {
-        let Some(k) = self.lib.starts.iter().position(|(p, _)| *p == pid) else { return };
-        let (_, name) = self.lib.starts.remove(k);
-        let windowless = self.launches.waiting_for(pid);
-        self.lib.starts.retain(|(p, _)| self.launches.waiting_for(*p));
-        if !windowless || status.success() {
-            return;
-        }
-        eprintln!("bitscomp: library: {name} (pid {pid}) ended before its window: {status}");
-        let line = format!("„{name}“ hat sich gleich wieder beendet ({}).", german_status(status));
-        if self.lib.open {
-            self.lib.note = Some(line);
-            self.needs_frame = true;
-        } else {
-            self.notice(line);
-        }
-    }
-
     fn library_tile_at(&self, x: f64, y: f64) -> Option<(usize, String)> {
         self.library_tiles().2.into_iter().find(|p| p.rect.contains(x, y)).map(|p| (p.row, p.id))
+    }
+
+    /// DESK-LEFT: whether a press at (x, y) outside the panel is one on the bottom row's buttons (a minimised
+    /// window's chip or entry, its x, "+N", its open list, Startseite), which acts as if the overlay were closed.
+    pub fn library_passes(&self, x: f64, y: f64) -> bool {
+        use crate::chrome::Part as C;
+        !self.library_geo().panel.contains(x, y)
+            && matches!(self.spot_at(x, y), Some(crate::desk::Spot::Chrome(C::Min(_) | C::MinMore | C::MinClose(_) | C::Home)))
     }
 
     /// A press while the overlay is open (the circle menu, when open, gets it first).
@@ -301,6 +325,12 @@ impl App {
         }
         if !self.library_geo().panel.contains(x, y) {
             return self.library_close("click outside");
+        }
+        if let Some(b) = self.library_button_at(x, y) {
+            if code == BTN_LEFT {
+                self.library_button(b);
+            }
+            return;
         }
         let Some((row, id)) = self.library_tile_at(x, y) else { return };
         self.lib.focus = Some((row, id.clone()));
@@ -315,7 +345,8 @@ impl App {
     /// The circle menu of a tile (the pad's X opens it too, PK-L1c).
     pub fn library_menu(&mut self, id: String) {
         let pinned = view::pinned(&self.library, &self.desk.favourites, &id);
-        self.open_menu_with(None, crate::menu::library_items(pinned), Some(id));
+        let package = self.library_is_package(&id);
+        self.open_menu_with(None, crate::menu::library_items(pinned, package), Some(id));
     }
 
     /// PK-L1c: the pad's X: the circle menu centred on the focused tile (the pointer stays where it is; the pad
@@ -329,13 +360,20 @@ impl App {
         let at = (rect.x as f64 + rect.w as f64 / 2.0, rect.y as f64 + rect.h as f64 / 2.0);
         let pinned = view::pinned(&self.library, &self.desk.favourites, &id);
         eprintln!("bitscomp: library: circle menu of {id} (pad X)");
-        self.open_menu_at(None, crate::menu::library_items(pinned), Some(id), at, false);
+        let package = self.library_is_package(&id);
+        self.open_menu_at(None, crate::menu::library_items(pinned, package), Some(id), at, false);
+    }
+
+    /// PK-7a: whether entry `id` is a package of /apps (the menu's "Programm verwalten" and "Entfernen").
+    fn library_is_package(&self, id: &str) -> bool {
+        self.library.entries.iter().any(|e| e.id == id && matches!(e.source, crate::library::Source::Package(_)))
     }
 
     pub fn library_motion(&mut self) {
         let hover = self.library_tile_at(self.pointer.x, self.pointer.y);
-        if hover != self.lib.hover {
-            self.lib.hover = hover;
+        let button = self.library_button_at(self.pointer.x, self.pointer.y);
+        if hover != self.lib.hover || button != self.lib.hover_button {
+            (self.lib.hover, self.lib.hover_button) = (hover, button);
             self.needs_frame = true;
         }
     }
@@ -389,13 +427,14 @@ impl App {
         let (rows, _, tiles) = self.library_tiles();
         let focus = self.library_at(&rows).map_or("-".to_string(), |(r, i)| rows[r].ids[i].clone());
         let mut out = format!(
-            "library open={} query={:?} focus={focus} search_focus={} scroll={} cols={} note={:?}\nfavourites={}\n",
+            "library open={} query={:?} focus={focus} search_focus={} scroll={} cols={} note={:?} button={}\nfavourites={}\n",
             self.lib.open,
             self.lib.query,
             self.lib.search_focus,
             self.lib.scroll,
             self.library_geo().cols,
             self.lib.note.as_deref().unwrap_or(""),
+            self.lib.button.map_or("-", Button::name),
             self.desk.favourites.join(",")
         );
         for (k, r) in rows.iter().enumerate() {
@@ -407,16 +446,5 @@ impl App {
         }
         out.push_str("end");
         out
-    }
-}
-
-/// An exit status in the user's words.
-fn german_status(status: std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt;
-    match (status.code(), status.signal()) {
-        (Some(127), _) => "Programmdatei fehlt oder ist nicht ausführbar".into(),
-        (Some(c), _) => format!("Fehlercode {c}"),
-        (None, Some(s)) => format!("Signal {s}"),
-        _ => "unbekannter Grund".into(),
     }
 }

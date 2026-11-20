@@ -1,4 +1,4 @@
-//! Pipes and FIFOs (FS-3), after linux-6.6/fs/pipe.c.
+//! Pipes and FIFOs (FS-3), after linux-7.3.1/fs/pipe.c.
 //!
 //! A `Pipe` is Linux's `pipe_inode_info`: a ring of page buffers (`Buf`, 4 KiB each, filled from offset 0,
 //! read from `offset`) of at most `max` slots (`max_usage`; 16 by default = 64 KiB, F_SETPIPE_SZ changes it).
@@ -37,7 +37,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use ksync::{Mutex, SpinLock, WaitQueue};
 use uapi::errno::*;
 
@@ -79,7 +79,6 @@ pub(crate) fn user_pages_knob(hard: bool) -> crate::sysctl::Knob {
                 USER_PAGES_HARD_NOW.store(v, Ordering::Relaxed);
                 Ok(())
             },
-            uint: false,
         }
     } else {
         crate::sysctl::Knob {
@@ -88,7 +87,6 @@ pub(crate) fn user_pages_knob(hard: bool) -> crate::sysctl::Knob {
                 USER_PAGES_SOFT_NOW.store(v, Ordering::Relaxed);
                 Ok(())
             },
-            uint: false,
         }
     }
 }
@@ -199,6 +197,9 @@ pub struct Pipe {
     meta: Option<Meta>,
     /// A FIFO's tmpfs inode: a write updates its times (`file_update_time`).
     node: Option<Weak<Inode>>,
+    /// `pseudo_edgetrigger`: an EPOLLET item watched a read end, so every write wakes the readers; otherwise
+    /// only a write into an empty pipe does (they sleep only on an empty one). Never cleared, as in Linux.
+    edge: AtomicBool,
 }
 
 impl Pipe {
@@ -217,6 +218,7 @@ impl Pipe {
             wr: PollQueue::new(),
             meta,
             node,
+            edge: AtomicBool::new(false),
         })
     }
 
@@ -358,6 +360,8 @@ impl Pipe {
         let mut ret: Result<usize, Errno> = Ok(0);
         let mut sigpipe = false;
         let mut done = 0usize;
+        // `pipe_empty(head, tail)`: a slot kept with length 0 counts as data.
+        let mut was_empty = ring.bufs.is_empty();
         // Merge the odd part into the newest buffer when it fits behind its data.
         let chars = total & (PAGE - 1);
         let mut finished = false;
@@ -440,23 +444,27 @@ impl Pipe {
             }
             self.sync_mirror(&ring);
             drop(ring);
-            // Readers drain what is there while this writer waits for room.
-            self.wake_readers();
-            if let Err(e) = Self::wait(&self.wr, || self.writable()) {
+            // Readers drain what is there while this writer waits for room (woken already unless it was empty).
+            if was_empty {
+                self.wake_readers();
+            }
+            let waited = Self::wait(&self.wr, || self.writable());
+            ring = self.ring.lock();
+            was_empty = ring.bufs.is_empty();
+            if let Err(e) = waited {
                 if done == 0 {
                     ret = Err(e);
                 }
-                ring = self.ring.lock();
                 break;
             }
-            ring = self.ring.lock();
         }
         self.sync_mirror(&ring);
         drop(ring);
-        // Every write wakes the readers. Deliberate: Linux wakes on every write too once poll/epoll looked at
-        // the pipe (`was_empty || pipe->poll_usage`, linux-6.6/fs/pipe.c:594), and only then can anyone see the edge
-        // (EPOLLET counts one per write, as on Linux).
-        self.wake_readers();
+        // `was_empty || pipe->pseudo_edgetrigger` (linux-7.3.1/fs/pipe.c:670): readers sleep only on an empty pipe,
+        // and an EPOLLET watcher sees one edge per write.
+        if was_empty || self.edge.load(Ordering::Relaxed) {
+            self.wake_readers();
+        }
         if done > 0 {
             self.touch_times();
         }
@@ -627,6 +635,12 @@ impl File for PipeEnd {
         }
         if self.write {
             add(&self.pipe.wr);
+        }
+    }
+    /// `pipe_poll` with EPOLLET in the key on an end that reads (FMODE_READ).
+    fn poll_edge(&self) {
+        if self.read {
+            self.pipe.edge.store(true, Ordering::Relaxed);
         }
     }
     fn link_name(&self) -> Option<String> {

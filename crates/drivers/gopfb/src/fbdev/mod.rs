@@ -1,9 +1,10 @@
 //! fbdev `/dev/fb0` on the GOP framebuffer (DP-2; spec/gpu.md §5.3 layer 2, V2-PLAN §2.8 "Picture").
 //!
-//! What a program sees is Linux's DRM fbdev emulation on a firmware framebuffer (simpledrm +
-//! `drm_fbdev_generic`, linux-6.6): one 32-bit XRGB mode at the native resolution, `yres_virtual` twice the
-//! height when memory allowed (double buffering by FBIOPAN_DISPLAY), FBIO_WAITFORVSYNC, read/write and `mmap`.
-//! The rules live in `abi` (host-tested); this module is the device.
+//! What a program sees is Linux's DRM fbdev emulation on a firmware framebuffer (simpledrm + `drm_fbdev_generic`,
+//! linux-6.6; Linux 7.3.1 differs: linux-7.3.1/drivers/gpu/drm/drm_fbdev_shmem.c, see
+//! plan/spec/linux7-differences.md): one 32-bit XRGB mode at the native resolution, `yres_virtual` twice the height
+//! when memory allowed (double buffering by FBIOPAN_DISPLAY), FBIO_WAITFORVSYNC, read/write and `mmap`. The rules live
+//! in `abi` (host-tested); this module is the device.
 //!
 //! **Memory and deferred io.** `mmap` hands out ordinary RAM pages (`mem`, MM-4 DMA buffers given to MM-5b's
 //! device mapping), never the GOP BAR, so the kernel's RAM frame stays the truth and MCP `screen` sees the
@@ -37,8 +38,9 @@
 //! **Flips (GX-3, `flip`).** With a display engine that flips (amdgpu on the Mini-PC), every present of fb0's
 //! frame goes to the hidden buffer and is flipped in at the next vblank (no tearing); FBIOPAN_DISPLAY returns
 //! once its flip landed (as Linux's `drm_fb_helper_pan_display`, an atomic commit that waits for flip_done),
-//! FBIO_WAITFORVSYNC and pacing follow the engine's own vblank (source Hardware). A late flip falls back to the
-//! copy path above.
+//! FBIO_WAITFORVSYNC and pacing follow the engine's own vblank (source Hardware). A late flip drops its frame (no
+//! copy into the screen stands in); the next frame carries what it owed. Without an engine (QEMU, no GPU) the frame
+//! is copied into the GOP framebuffer as above.
 //!
 //! Locks: `fbdev.screen` (Mutex; the frame, the scanout guard, the holder) > `fbdev.meta` is never nested;
 //! `fbdev.screen` > mm.as (write-protect); `fbdev.meta` > mm.as (FBIOPUTCMAP reads the channels under it);
@@ -59,12 +61,14 @@ pub mod handback;
 mod ktests;
 mod ktests_store;
 mod ktests_scanout;
+mod ktests_shot;
 pub mod mem;
 pub mod pacing;
 mod ktests_pacing;
 mod scene;
 pub mod scanout;
 mod seed;
+pub mod shot;
 
 use abi::{Cmap, CmapUser, Geometry, SetOutcome, UserIo, Var};
 use alloc::string::String;
@@ -72,7 +76,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use dirty::Dirty;
-use display::{RamFrame, Rect, ScanoutGuard, ScanoutSource};
+use display::{PictureError, RamFrame, Rect, ScanoutGuard, ScanoutSource};
 use ksync::{Mutex, Once, SpinLock, WaitQueue};
 use mem::FbMem;
 use mm::device::{DeviceMap, DeviceOps, DevicePage};
@@ -660,10 +664,6 @@ impl Fb {
                 self.shared.kick();
                 WAKES_TAKE.inc();
                 klog::event!(Info, "fbdev", "screen.taken", pid = p.pid, program = p.name.as_str(), via = via);
-                // GX-3: a surface that fell back to one image after a late flip may flip again.
-                if let Some(f) = flip::get() {
-                    f.rearm();
-                }
                 self.seed(scr);
                 self.refresh(scr);
                 true
@@ -731,7 +731,8 @@ impl Fb {
     }
 
     /// Presents the frame's damage: into the hidden buffer and flipped in when the display engine flips (GX-3),
-    /// else copied to the screen. A flip that fell back makes the next present whole (A0 lacks the frames A1 got).
+    /// else copied to the screen (no engine). A frame whose flip was not ordered is dropped and its damage stays for
+    /// the next one; the first copy after the engine went away is whole (A0 lacks the frames A1 got).
     fn show(&self, g: &mut ScanoutGuard, frame: &mut RamFrame) {
         let shown = flip::frame(flip::ready(), &self.flipping, frame, |fr| (fr.pixels(), fr.width), |back, fr| {
             g.present_via(back, fr);
@@ -742,6 +743,7 @@ impl Fb {
                 self.presented();
                 return;
             }
+            flip::Shown::Dropped => return,
             flip::Shown::Copy { whole: true } => frame.mark_all(),
             flip::Shown::Copy { whole: false } => {}
         }
@@ -1035,9 +1037,18 @@ impl ScanoutSource for Fb {
     /// MCP `screen` while a program has the screen: fbdev's frame. The lock is waited for at most 250 ms (a
     /// flush holds it for a few ms; MCP's thread is KernelRt, B4).
     fn with_picture(&self, f: &mut dyn FnMut(&[u32], u32, u32)) -> bool {
-        // WY-17: the GPU's frames never pass through this frame: what shows is read from the scanout buffer.
-        if self.direct.drawing() && scanout::look(self, f) {
-            return true;
+        // WY-17: the GPU's frames never pass through this frame: what shows is read from the scanout buffer (SHOT).
+        if self.direct.drawing() {
+            let g = self.g();
+            let mut px = Vec::new();
+            match shot::look(self, Rect::new(0, 0, g.width, g.height), &mut px) {
+                Ok((w, h)) => {
+                    f(&px, w, h);
+                    return true;
+                }
+                Err(shot::Look::Failed(_)) => return false,
+                Err(shot::Look::Off) => {}
+            }
         }
         let Some(scr) = self.screen.lock_timeout(250 * MS) else {
             klog::event!(Warn, "fbdev", "picture.busy"; "the screen frame stayed locked for 250 ms");
@@ -1045,6 +1056,23 @@ impl ScanoutSource for Fb {
         };
         f(scr.frame.pixels(), scr.frame.width, scr.frame.height);
         true
+    }
+
+    /// SHOT: only rectangle `r`; while the holder draws into the scanout buffers, read from the buffer shown and held
+    /// still for the copy (`shot`).
+    fn copy_rect(&self, r: Rect, dst: &mut Vec<u32>) -> Result<(u32, u32), PictureError> {
+        if self.direct.drawing() {
+            match shot::look(self, r, dst) {
+                Ok(size) => return Ok(size),
+                Err(shot::Look::Failed(e)) => return Err(e),
+                Err(shot::Look::Off) => {}
+            }
+        }
+        let Some(scr) = self.screen.lock_timeout(250 * MS) else {
+            klog::event!(Warn, "fbdev", "picture.busy"; "the screen frame stayed locked for 250 ms");
+            return Err(PictureError::NoPicture);
+        };
+        display::copy_rect(scr.frame.pixels(), scr.frame.width, scr.frame.height, r, dst)
     }
 }
 
@@ -1143,7 +1171,7 @@ impl File for Fb0 {
     fn seekable(&self) -> bool {
         true
     }
-    /// `default_llseek` (linux-6.6/fs/read_write.c:230) with the node's i_size 0: SEEK_END is `0 + off`,
+    /// `default_llseek` (linux-7.3.1/fs/read_write.c:332) with the node's i_size 0: SEEK_END is `0 + off`,
     /// SEEK_DATA is ENXIO, SEEK_HOLE is ENXIO or 0; a negative result is EINVAL. SET and CUR stay generic.
     fn lseek(&self, off: i64, whence: u32) -> Option<Result<u64, Errno>> {
         let neg = Err(EINVAL);
@@ -1195,7 +1223,7 @@ mod resize_tests {
         assert_eq!((v.0[XRES], v.0[YRES], v.0[XRES_VIRTUAL], v.0[YRES_VIRTUAL]), (1920, 1080, 1920, 2160));
         assert_eq!(g.line_length(), 7680);
         let f = g.fix_bytes();
-        // struct fb_fix_screeninfo: line_length at byte 48 (linux-6.6/include/uapi/linux/fb.h:158-174).
+        // struct fb_fix_screeninfo: line_length at byte 48 (linux-7.3.1/include/uapi/linux/fb.h:158-174).
         assert_eq!(u32::from_le_bytes([f[48], f[49], f[50], f[51]]), 7680);
     }
 }

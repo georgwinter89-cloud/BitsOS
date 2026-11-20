@@ -1,5 +1,5 @@
 //! FS-12 (B4): the I/O priority of a request comes from the thread that submits it, and `ioprio_set`/
-//! `ioprio_get` (linux-6.6/block/ioprio.c) are mapped onto it.
+//! `ioprio_get` (linux-7.3.1/block/ioprio.c) are mapped onto it.
 //!
 //! - No ioprio set (class NONE): the scheduling class decides: KernelRt and Interactive -> Interactive, Normal
 //!   -> Normal, Background (kernel helpers, SCHED_IDLE programs) -> Background (Linux `task_nice_ioclass`).
@@ -33,7 +33,7 @@ pub const IOPRIO_NORM: u32 = 4;
 pub const IOPRIO_WHO_PROCESS: i32 = 1;
 pub const IOPRIO_WHO_PGRP: i32 = 2;
 pub const IOPRIO_WHO_USER: i32 = 3;
-/// `IOPRIO_DEFAULT` = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_NONE, 0) (linux-6.6/include/linux/ioprio.h:14).
+/// `IOPRIO_DEFAULT` = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_NONE, 0) (linux-7.3.1/include/linux/ioprio.h:14).
 pub const IOPRIO_DEFAULT: i32 = 0;
 
 /// `IOPRIO_PRIO_VALUE(class, data)`.
@@ -51,7 +51,7 @@ pub const fn level_of(ioprio: i32) -> u32 {
     (ioprio as u32) & (IOPRIO_NR_LEVELS - 1)
 }
 
-/// `ioprio_check_cap` (linux-6.6/block/ioprio.c:36): RT needs CAP_SYS_ADMIN or CAP_SYS_NICE (`privileged`;
+/// `ioprio_check_cap` (linux-7.3.1/block/ioprio.c:33): RT needs CAP_SYS_ADMIN or CAP_SYS_NICE (`privileged`;
 /// EPERM), RT/BE a level below 8 (only the low three bits count, hint bits are not checked), NONE level 0, IDLE
 /// anything; every other class EINVAL. Returns the negative errno.
 pub fn check(ioprio: i32, privileged: bool) -> Result<(), i64> {

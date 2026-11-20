@@ -429,6 +429,7 @@ impl Disk {
             if r.is_ok() {
                 for (b, reqs) in &group {
                     self.count_dispatch(b, reqs.len());
+                    self.account(b.kind, reqs, Ok(()));
                     for req in reqs {
                         self.done(req, Ok(()));
                     }
@@ -482,13 +483,30 @@ impl Disk {
             for req in reqs {
                 let one = self.run(req.kind, req.lba, req.blocks, b.prio, core::slice::from_ref(req));
                 self.report(req.kind, req.lba, req.blocks, one);
+                self.account(req.kind, core::slice::from_ref(req), one);
                 self.done(req, one);
             }
         } else {
             self.report(b.kind, b.lba, b.blocks, r);
+            self.account(b.kind, reqs, r);
             for req in reqs {
                 self.done(req, r);
             }
+        }
+    }
+
+    /// SYS-K: diskstats count what reached the device as one request, as Linux counts a request of N merged bios
+    /// once with N-1 merges (iostats.rst fields 1/2, `blk_account_io_done`), its time from the earliest member's
+    /// submission. Members a failed batch ran alone are a request each and no merge.
+    fn account(&self, kind: Kind, reqs: &[Arc<Req>], r: Result<(), BlockError>) {
+        if r.is_err() || reqs.is_empty() {
+            return;
+        }
+        let start = reqs.iter().map(|q| q.start_ns).min().unwrap_or(0);
+        let moved = if kind == Kind::Flush { 0 } else { reqs.iter().map(|q| q.blocks).sum::<u64>() * self.block_size as u64 };
+        self.stats.io.done(kind, moved, now().saturating_sub(start));
+        if reqs.len() > 1 {
+            self.stats.io.merged(kind, reqs.len() as u64 - 1);
         }
     }
 
@@ -564,7 +582,8 @@ impl Disk {
                 }
                 r
             }
-            Kind::Discard => dev(self.dev.discard(lba, blocks)),
+            // A stacked device below (a partition, its port) queues it again: at the batch's priority, not Background.
+            Kind::Discard => dev(self.dev.discard_at(lba, blocks, prio)),
             Kind::Read | Kind::Write { .. } => {
                 let (write, fua) = match kind {
                     Kind::Write { fua, preflush } => {

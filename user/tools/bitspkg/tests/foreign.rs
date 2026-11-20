@@ -130,15 +130,14 @@ fn a_cachyos_program_runs_from_its_package() {
 
 /// A foreign file whose DT_NEEDED is a path (`sub/x.so`, `../../x.so`, `/etc/x.so`) cannot make import write
 /// outside the lib folder: refused before anything is copied for it. A launcher path the wrapper could not quote
-/// safely is refused too. (ls with its DT_NEEDED libcap.so.2 patched; skipped where ls does not need libcap.)
+/// safely is refused too. (CachyOS's ls with its DT_NEEDED libcap.so.2 patched; an ls without exactly one
+/// libcap.so.2 name is a failure, not a skip.)
 #[test]
 fn hostile_library_names_and_launcher_paths_are_refused() {
     let ls = fs::read("/usr/bin/ls").unwrap();
     let needle = b"libcap.so.2\0";
-    if ls.windows(needle.len()).filter(|w| w == needle).count() != 1 {
-        eprintln!("skip: /usr/bin/ls does not need libcap.so.2 here");
-        return;
-    }
+    let n = ls.windows(needle.len()).filter(|w| w == needle).count();
+    assert_eq!(n, 1, "/usr/bin/ls should name libcap.so.2 once (CachyOS coreutils), found {n}: this test patches that name");
     for (i, bad) in [&b"sub/libc.so\0"[..], b"../../ab.so\0", b"/etc/ab.so2\0"].iter().enumerate() {
         let d = tmp(&format!("import-hostile-{i}"));
         let src = d.join("src");

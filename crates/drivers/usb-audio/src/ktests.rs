@@ -1,7 +1,8 @@
 //! In-kernel tests of the binding (no sound): `sn.usb.bound` (every bound function, its settings made at
 //! probe) and `sn.usb.capture` (records 1 s from the first microphone, e.g. the JBL's chat mic; QEMU's
 //! usb-audio has none: a failure). Both `Safe` and rerunnable. Playback tests are in `snd` (`sn.usb.tone`,
-//! `sn.usb.unplug`), through the mixer.
+//! `sn.usb.unplug`), through the mixer. `sn.usb.jacks` (GP-SOUND, Hardware, no sound): the UAC2 jacks as the device
+//! answers now.
 
 use alloc::format;
 use alloc::string::String;
@@ -127,5 +128,36 @@ fn mute() -> TestResult {
     kassert!(hw == last, "applied {hw}, last asked {last}");
     kassert!(read.iter().all(|r| r.is_none_or(|m| m == last)), "feature units read {read:?}, last asked {last}");
     kassert!(crate::hw_mute() == before);
+    Ok(())
+}
+
+ktest!("sn.usb.jacks", Hardware, jacks);
+/// Every UAC2 jack (the Gaming-PC's board sound) as the device answers now: its alternate setting, its clock at 48 kHz
+/// and valid, nothing refused. Reads only, no sound. Under the gaming-pc profile the board device must be bound; on
+/// the Mini-PC, which has no UAC2 device, the work is that nothing was claimed or refused.
+fn jacks() -> TestResult {
+    use uac2::clock;
+    settle();
+    let gaming = gp_platform::tiers::is_gaming_pc(pci::registry::config_value("profile").as_deref());
+    let refused = crate::uac2dev::refused();
+    let board: Vec<_> = crate::dev::functions().into_iter().filter(|f| f.board).collect();
+    klog::event!(Info, "ktest", "usb_audio.jacks", gaming_pc = gaming, devices = board.len(), refused = refused.len());
+    kassert!(refused.is_empty(), "not up: {refused:?}");
+    kassert!(!gaming || !board.is_empty(), "gaming-pc profile: the board's USB sound (26ce:0a09) is not bound");
+    for f in &board {
+        for s in &f.playback {
+            let j = crate::uac2dev::jack(f.dev.id, s.iface).ok_or_else(|| format!("{} interface {}: no UAC2 jack kept", f.dev.path(), s.iface))?;
+            let alt = f.dev.current_alt(s.iface);
+            kassert!(alt == Some(s.alt), "{} interface {}: alternate setting {alt:?}, want {}", f.dev.path(), s.iface, s.alt);
+            let mut b = [0u8; 4];
+            let n = crate::req::Ctl::input(&f.dev, crate::uac2dev::conv(clock::get_rate(j.plan.control_iface, j.plan.clock)), &mut b);
+            kassert!(n == Ok(4) && u32::from_le_bytes(b) == crate::uac2dev::RATE, "clock {}: {n:?} {b:?}", j.plan.clock);
+            let mut v = [0u8; 1];
+            let r = crate::req::Ctl::input(&f.dev, crate::uac2dev::conv(clock::get_valid(j.plan.control_iface, j.plan.clock)), &mut v);
+            kassert!(!j.clock.validity_readable() || (r == Ok(1) && v[0] != 0), "clock {} not valid: {r:?} {v:?}", j.plan.clock);
+            klog::event!(Info, "ktest", "usb_audio.jack", device = f.dev.path(), jack = klog::Hex(s.terminal_type as u64), interface = s.iface,
+                alt = s.alt, clock = j.plan.clock);
+        }
+    }
     Ok(())
 }

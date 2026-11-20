@@ -1,4 +1,4 @@
-//! eventfd (FS-3), after linux-6.6/fs/eventfd.c: a 64-bit counter behind an fd.
+//! eventfd (FS-3), after linux-7.3.1/fs/eventfd.c: a 64-bit counter behind an fd.
 //!
 //! read takes the whole count (EFD_SEMAPHORE: 1) and leaves 0 (count - 1), waiting while it is 0 (EAGAIN with
 //! O_NONBLOCK); a read of fewer than 8 bytes is EINVAL, the value is copied after it was taken (a fault then
@@ -159,7 +159,7 @@ fn ids_take() -> u32 {
 }
 
 impl File for EventFd {
-    /// linux-6.6/fs/eventfd.c:295 `eventfd_show_fdinfo` (`%16llx` pads with spaces).
+    /// linux-7.3.1/fs/eventfd.c:283 `eventfd_show_fdinfo` (`%16llx` pads with spaces).
     fn show_fdinfo(&self, out: &mut alloc::string::String) {
         use core::fmt::Write;
         let c = *self.count.lock();

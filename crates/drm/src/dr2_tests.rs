@@ -113,8 +113,8 @@ fn version_lengths_then_strings() {
     let m = Mem::new(4096);
     // First call: null pointers, zero lengths (libdrm's drmGetVersion).
     assert_eq!(fx.io(DRM_IOCTL_VERSION, BASE, &m), Ok(0));
-    assert_eq!((m.i32(0), m.i32(4), m.i32(8)), (3, 54, 0));
-    assert_eq!((m.u64(16), m.u64(32), m.u64(48)), (6, 8, 7));
+    assert_eq!((m.i32(0), m.i32(4), m.i32(8)), (3, 64, 0));
+    assert_eq!((m.u64(16), m.u64(32), m.u64(48)), (6, 1, 7));
     // Second call: buffers; the name buffer is short (3 bytes): "amd", the length still 6, no NUL written.
     let mut v = drm_version::ZERO;
     v.name_len = 3;
@@ -129,9 +129,9 @@ fn version_lengths_then_strings() {
     m.set(1024, &[0xee; 8]);
     assert_eq!(fx.io(DRM_IOCTL_VERSION, BASE, &m), Ok(0));
     assert_eq!(&m.get(1024, 4), b"amd\xee");
-    assert_eq!(&m.get(1100, 9), b"20150101\0");
+    assert_eq!(&m.get(1100, 2), b"0\0", "linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:554");
     assert_eq!(&m.get(1200, 7), b"AMD GPU");
-    assert_eq!((m.u64(16), m.u64(32), m.u64(48)), (6, 8, 7));
+    assert_eq!((m.u64(16), m.u64(32), m.u64(48)), (6, 1, 7));
 }
 
 #[test]
@@ -284,7 +284,8 @@ fn caps_as_amdgpu() {
         (DRM_CAP_CRTC_IN_VBLANK_EVENT, Ok(1)),
         (DRM_CAP_SYNCOBJ, Ok(1)),
         (DRM_CAP_SYNCOBJ_TIMELINE, Ok(1)),
-        (DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, Err(EINVAL)),
+        // Linux 7.3.1 (drm_ioctl.c:306): DRIVER_ATOMIC and async_page_flip.
+        (DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, Ok(1)),
         (0, Err(EINVAL)),
         (0x7f, Err(EINVAL)),
     ];
@@ -491,22 +492,21 @@ fn sysfs_walk_as_libdrm() {
 }
 
 #[test]
-fn tables_match_linux_66() {
-    assert_eq!(core_ioctls::COUNT, 0xd0, "DRM_IOCTL_SYNCOBJ_EVENTFD (0xcf) is 6.6's last core number");
+fn tables_match_linux() {
+    assert_eq!(core_ioctls::COUNT, 0xd3, "DRM_IOCTL_GEM_CHANGE_HANDLE (0xd2) is Linux 7.3.1's last core number");
     assert_eq!(AMDGPU_COUNT, 0x16, "AMDGPU_SCHED (0x15) is 6.6's last amdgpu number");
     let v = core_ioctls::TABLE[0].unwrap();
     assert_eq!((v.cmd, v.name), (DRM_IOCTL_VERSION, "VERSION"));
-    assert_eq!(core_ioctls::TABLE.iter().flatten().count(), 107);
+    // linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:644-747: 77 entries, the legacy ones gone.
+    assert_eq!(core_ioctls::TABLE.iter().flatten().count(), 77);
     assert_eq!(AMDGPU_TABLE.iter().flatten().count(), 16);
     let va = AMDGPU_TABLE[0x08].unwrap();
     assert_eq!(ioc::size(va.cmd), 40, "GEM_VA keeps 6.6's size");
 }
 
 #[test]
-fn fake_mode() {
-    use device::{fake_wanted, Mode};
-    assert!(fake_wanted(Mode::Fake) && !fake_wanted(Mode::Auto) && !fake_wanted(Mode::Off));
-    assert_eq!(device::mode(), Mode::Auto, "auto without CONFIG");
+fn fake_only_with_its_test_key() {
+    assert!(!device::fake_wanted(), "no fake without CONFIG drm=fake");
 }
 
 /// Random numbers, sizes and bytes never panic and answer only errno values Linux would.
@@ -563,6 +563,29 @@ fn unplug_waits_for_a_call_inside_the_device() {
     device::release_minor(&d);
 }
 
+/// GP-GPU1: a driver's own device order decides the node number, whichever device registers first; a wish that
+/// cannot be met falls back to the lowest free minor, and no wish is `register`.
+#[test]
+fn a_wished_index_keeps_the_node_number_stable() {
+    let _g = MINORS.lock().unwrap_or_else(|e| e.into_inner());
+    let base = device::RENDER_BASE;
+    let free: Vec<u32> = (base..base + 64).filter(|m| device::by_render_minor(*m).is_none()).collect();
+    let (lo, hi) = (free[0], free[1]);
+    // The second card of the order comes up first and still gets its own number; the first one fills in below it.
+    let second = device::register_at(Arc::new(FakeGpu::at(0xd1, 0)), Some(hi - base)).unwrap();
+    assert_eq!(second.render_minor(), hi);
+    let first = device::register_at(Arc::new(FakeGpu::at(0xd0, 0)), Some(lo - base)).unwrap();
+    assert_eq!(first.render_minor(), lo);
+    // A taken wish and one past the 64 render minors: the lowest free.
+    let third = device::register_at(Arc::new(FakeGpu::at(0xd2, 0)), Some(hi - base)).unwrap();
+    assert!(third.render_minor() != hi && third.render_minor() != lo);
+    let fourth = device::register_at(Arc::new(FakeGpu::at(0xd3, 0)), Some(64)).unwrap();
+    assert!(![lo, hi, third.render_minor()].contains(&fourth.render_minor()));
+    for d in [second, first, third, fourth] {
+        device::unregister(&d);
+    }
+}
+
 #[test]
 fn the_minor_stays_taken_until_released() {
     let _g = MINORS.lock().unwrap_or_else(|e| e.into_inner());
@@ -575,4 +598,38 @@ fn the_minor_stays_taken_until_released() {
     assert_eq!(c.render_minor(), a.render_minor());
     device::unregister(&b);
     device::unregister(&c);
+}
+
+/// L7 row 46: past the 64 legacy render minors the next device gets 192 (linux-7.3.1/drivers/gpu/drm/drm_drv.c:157,
+/// the extended range), and a freed legacy minor is taken again first.
+#[test]
+fn minors_extend_past_64() {
+    let _g = MINORS.lock().unwrap_or_else(|e| e.into_inner());
+    let info = crate::fake::AMDGPU_INFO;
+    let pci = FakeGpu::at(0xc8, 0).pci().clone();
+    let mut mine = Vec::new();
+    let ext = loop {
+        let d = device::register(Arc::new(RenderOnly(info, pci.clone()))).unwrap();
+        let m = d.render_minor();
+        mine.push(d);
+        if m >= 192 {
+            break m;
+        }
+        assert!((128..192).contains(&m), "{m}");
+        assert!(mine.len() <= 64, "the legacy range holds 64");
+    };
+    assert_eq!(ext, 192);
+    let next = device::register(Arc::new(RenderOnly(info, pci.clone()))).unwrap();
+    assert_eq!(next.render_minor(), 193);
+    mine.push(next);
+    let low = mine.iter().position(|d| d.render_minor() < 192).unwrap();
+    let freed = mine[low].render_minor();
+    device::unregister(&mine.remove(low));
+    let again = device::register(Arc::new(RenderOnly(info, pci))).unwrap();
+    assert_eq!(again.render_minor(), freed, "the legacy range first");
+    mine.push(again);
+    assert!(device::by_render_minor(193).is_some());
+    for d in &mine {
+        device::unregister(d);
+    }
 }

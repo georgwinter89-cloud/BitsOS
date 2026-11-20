@@ -218,7 +218,7 @@ fn go_on_boot_cpu(mut st: Staged) {
         klog::event!(Info, "kexec", "reload.synced", reload = counter, flushed = synced.flushed, failed = synced.failed);
     }
     // RB-14: the storage stop (Linux's kexec runs `kernel_restart_prepare` -> `device_shutdown` too,
-    // linux-6.6/kernel/kexec_core.c:1272): every disk closed, drained and its cache flushed, usb-msd starts no
+    // linux-7.3.1/kernel/kexec_core.c:1192): every disk closed, drained and its cache flushed, usb-msd starts no
     // command and xHCI has no bulk transfer in flight, so the jump never cuts a stick command in half. Bounded;
     // undone on every path below that goes on in this kernel.
     let storage = block::shutdown::stop_all("reload", block::shutdown::STOP_NS);

@@ -12,14 +12,21 @@ struct Holder {
     frames: Mutex<Vec<u64>>,
     calls: Mutex<Vec<(u64, bool)>>,
     busy: Mutex<bool>,
+    /// Frames another reclaimer (kswapd) frees while this call finds its cache busy: freed, not counted.
+    aside: Mutex<Vec<u64>>,
+    /// False: a light call frees nothing (its cache is busy).
+    light_frees: Mutex<bool>,
 }
 
 impl Reclaim for Holder {
     fn reclaim(&self, pages: u64, thorough: bool) -> Reclaimed {
         self.calls.lock().unwrap().push((pages, thorough));
+        for p in self.aside.lock().unwrap().drain(..) {
+            self.b.free(p, 0, Kind::PageCache);
+        }
         let mut f = self.frames.lock().unwrap();
         let mut n = 0;
-        while n < pages {
+        while n < pages && (thorough || *self.light_frees.lock().unwrap()) {
             let Some(p) = f.pop() else { break };
             self.b.free(p, 0, Kind::PageCache);
             n += 1;
@@ -32,7 +39,7 @@ impl Reclaim for Holder {
 fn full() -> (&'static Buddy, &'static Holder) {
     let f: &'static BuddyFrames = Box::leak(Box::new(staged(&[free(MIB, 5 * MIB)])));
     let b: &'static Buddy = f;
-    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(false) }));
+    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(false), aside: Mutex::new(Vec::new()), light_frees: Mutex::new(true) }));
     while let Some(p) = b.alloc(0, Zone::Dma32, Kind::PageCache) {
         h.frames.lock().unwrap().push(p);
     }
@@ -177,6 +184,39 @@ fn busy_caches_get_more_rounds_then_the_reserve() {
     b.check().unwrap();
 }
 
+/// ATOMIC-3 reclaim fixer: a round that found the cache busy (kswapd in it) takes what the other reclaimer freed
+/// meanwhile before it reclaims again; before, the allocation went on through every round to the reserve.
+#[test]
+fn a_busy_round_takes_what_the_other_reclaimer_freed() {
+    let (b, h) = full();
+    let all: Vec<u64> = core::mem::take(&mut *h.frames.lock().unwrap());
+    *h.busy.lock().unwrap() = true;
+    *h.aside.lock().unwrap() = all[..256].to_vec();
+    let p = b.alloc(0, Zone::Normal, Kind::User).expect("a frame kswapd freed");
+    assert_eq!(*h.calls.lock().unwrap(), [(32, false)], "one round, then the frames freed meanwhile");
+    assert_eq!(b.direct_reclaim(), DirectStats { runs: 1, pages: 0, rescued: 1, failed: 0, dips: 0 });
+    b.free(p, 0, Kind::User);
+    for f in &all[256..] {
+        b.free(*f, 0, Kind::PageCache);
+    }
+    b.check().unwrap();
+}
+
+/// The allocation's rounds with a cache kswapd holds throughout: the light round finds it busy and nothing freed
+/// meanwhile; the thorough round frees other cache pages (`vfs::reclaim` goes on with the clock there), and the
+/// allocation gets its frame from them, without the reserve.
+#[test]
+fn a_thorough_round_after_a_busy_light_one_frees_without_the_reserve() {
+    let (b, h) = full();
+    *h.busy.lock().unwrap() = true;
+    *h.light_frees.lock().unwrap() = false;
+    let p = b.alloc(0, Zone::Normal, Kind::User).expect("a frame from the thorough round");
+    assert_eq!(*h.calls.lock().unwrap(), [(32, false), (32, true)], "light (busy, nothing), then thorough");
+    assert_eq!(b.direct_reclaim(), DirectStats { runs: 1, pages: 32, rescued: 1, failed: 0, dips: 0 });
+    b.free(p, 0, Kind::User);
+    b.check().unwrap();
+}
+
 #[test]
 fn light_allocations_never_reclaim() {
     let (b, h) = full();
@@ -210,7 +250,7 @@ fn light_allocations_never_reclaim() {
 #[test]
 fn heap_allocations_take_cache_pages_back() {
     let b = super::heap::host_buddy(8);
-    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(false) }));
+    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(false), aside: Mutex::new(Vec::new()), light_frees: Mutex::new(true) }));
     while let Some(p) = b.alloc(0, Zone::Normal, Kind::PageCache) {
         h.frames.lock().unwrap().push(p);
     }
@@ -246,7 +286,7 @@ fn heap_allocations_take_cache_pages_back() {
 #[test]
 fn a_heap_allocation_asks_the_cache_a_bounded_number_of_times() {
     let b = super::heap::host_buddy(4);
-    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(true) }));
+    let h: &'static Holder = Box::leak(Box::new(Holder { b, frames: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), busy: Mutex::new(true), aside: Mutex::new(Vec::new()), light_frees: Mutex::new(true) }));
     let mut held = Vec::new();
     while let Some(p) = b.alloc(0, Zone::Normal, Kind::User) {
         held.push(p);

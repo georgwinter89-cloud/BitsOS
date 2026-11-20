@@ -3,6 +3,7 @@
 //! notice, and a window's own hung veil lie above a float.
 
 use crate::layout::{Place, Placement};
+use crate::sofa::Show;
 
 /// One layer, in the order the damage tracker wants: topmost first. `usize` is an index into the placements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +18,10 @@ pub enum Layer {
     /// PK-L1b: the program library's overlay (`library_draw`): over every window, fullscreen ones too, and the
     /// bars; under the installer's question (MC-9b) and the circle menu (its tiles' menu).
     Library,
+    /// GM-6a: the sofa mode (`sofa_draw`): its screens alone and opaque, or its quick menu over the program in
+    /// front; under the installer's question, the grant and full-access dialogs (they keep their input rules) and
+    /// the circle menu, over every workspace, window and bar.
+    Sofa,
     /// A window's frame (header, border, the corners that round off the client).
     Frame(usize),
     /// A hung window's veil: over its content, under its own frame.
@@ -30,8 +35,23 @@ pub enum Layer {
 /// placements (other stack pages) are left out.
 /// WY-8: a fullscreen window is all there is under the cursor, the menu and the notice: no frame, no bars, nothing
 /// under it (the windows it covers are hidden).
+#[cfg(test)]
 pub fn order<W>(placements: &[Placement<W>]) -> Vec<Layer> {
+    order_with(placements, Show::None)
+}
+
+/// `order` with the sofa layer: a sofa screen is drawn alone (nothing under it shows), the quick menu lies over
+/// the program in front, which is still drawn.
+pub fn order_with<W>(placements: &[Placement<W>], sofa: Show) -> Vec<Layer> {
     let mut out = vec![Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over, Layer::Library];
+    match sofa {
+        Show::None => {}
+        Show::Shell => {
+            out.push(Layer::Sofa);
+            return out;
+        }
+        Show::Over => out.push(Layer::Sofa),
+    }
     if let Some(i) = placements.iter().position(|p| p.fullscreen && p.visible) {
         out.extend([Layer::Veil(i), Layer::Content(i)]);
         return out;
@@ -104,6 +124,25 @@ mod tests {
         assert!(at(&o, Layer::Chrome) < at(&o, Layer::Frame(t1)), "the bars over the tiles");
         // Another float's veil lies under a float above it.
         assert!(at(&o, Layer::Content(f3)) < at(&o, Layer::Veil(f4)));
+    }
+
+    #[test]
+    fn the_sofa_layer_lies_under_the_system_layer_and_over_every_window() {
+        let mut ws: Workspace<u32> = Workspace::default();
+        ws.add(1);
+        ws.add(2);
+        ws.focus_window(&2);
+        assert!(ws.set_fullscreen(&2, true));
+        let area = Rect { x: 0, y: 0, w: 1000, h: 500 };
+        let p = ws.arrange(area, area, 8);
+        let i = p.iter().position(|q| q.win == 2).unwrap();
+        // A sofa screen: opaque and alone (the windows of Sofa are not drawn under it).
+        assert_eq!(order_with(&p, Show::Shell), vec![Layer::Cursor, Layer::System, Layer::Overlays, Layer::Over, Layer::Library, Layer::Sofa]);
+        // The quick menu over the fullscreen game: the game is still drawn under it.
+        let o = order_with(&p, Show::Over);
+        assert!(at(&o, Layer::System) < at(&o, Layer::Sofa), "the installer's question over the sofa");
+        assert!(at(&o, Layer::Sofa) < at(&o, Layer::Content(i)), "the quick menu over the game");
+        assert_eq!(order_with(&p, Show::None), order(&p));
     }
 
     #[test]

@@ -116,6 +116,18 @@ impl MagSlots {
         }
     }
 
+    /// Makes the slots now (allocates), so the first heap call does not: that call may come under a spin lock
+    /// (lockdep's first top-up was one in every boot), where the slots' block is one the heap cannot reclaim for.
+    /// From the heap's seed, before anything else allocates; later calls do nothing.
+    pub fn make(&self) {
+        if let MagSlots::Kernel { per, state } = self
+            && state.compare_exchange(UNINIT, BUSY, Ordering::Acquire, Ordering::Acquire).is_ok()
+        {
+            per.cover_possible();
+            state.store(READY, Ordering::Release);
+        }
+    }
+
     /// Creates every possible CPU's magazines (allocates; from the BSP before the APs start, holding no heap
     /// lock). Does nothing before the first heap call made the slots.
     pub fn prepare_cpus(&self) {

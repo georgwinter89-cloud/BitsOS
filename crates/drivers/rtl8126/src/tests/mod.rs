@@ -1,0 +1,14 @@
+mod bringup;
+mod chip;
+mod desc;
+mod device;
+mod fake;
+mod fakerules;
+mod fw;
+mod irq;
+mod ocp;
+mod phy;
+mod recover;
+mod ring;
+mod selfcheck;
+mod seq;

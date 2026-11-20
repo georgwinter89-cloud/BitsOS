@@ -52,6 +52,8 @@ pub fn start_kernel(config: &dyn Fn(&str) -> Option<String>) -> Result<ServerHan
     let sock = net::stack().ok_or(StartError::NoStack)?;
     // MC-6: user-space services' tools; without the socket the server still serves its own tools.
     let services = crate::svc::start_kernel(TOOLS.entries());
+    // MC-L: the local tools socket, in every mode (`mcp=service` too: it never goes through the network side).
+    let _ = crate::local::start_kernel(TOOLS.entries(), services.clone());
     let gate = arm_gate(&cfg, mode, services.clone(), confirmer_from(config));
     if !mode.kernel_serves()
         && let Some(sh) = gate

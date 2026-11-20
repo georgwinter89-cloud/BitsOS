@@ -21,6 +21,8 @@ ktest!("pc.enable.msi_stale", Run("pc/20-enable"), enable_msi_stale);
 ktest!("pc.enable.restore", Run("pc/20-enable"), enable_restore);
 ktest!("pc.enable.refused", QemuAll, enable_refused);
 ktest!("pc.enable.dma_path", Safe, enable_dma_path);
+// GP-CPU B7, scenario cp/69: its name is outside `pc.` so no other run's filter meets it.
+ktest!("cp.dmar.enable_refused", Run("cp/69-intel-bare"), enable_refused_by_iommu);
 
 const IGB: (u16, u16) = (0x8086, 0x10C9);
 /// 82574L: PM, MSI, MSI-X and PCIe like the igb, and no BitsOS driver matches it.
@@ -245,6 +247,50 @@ fn enable_refused() -> R {
     if checked == 0 {
         return ktest::fail("no untouched test function and no mass storage");
     }
+    Ok(())
+}
+
+/// GP B7: while the IOMMU verdict blocks DMA, `enable_device(true)` refuses every function before any access (the
+/// command register and the DMA record stay as they were, one `enable.refused` event names the function), an
+/// enable without DMA is not refused by the gate, and once the verdict is free again the gate is open. No machine
+/// in the suite has an IOMMU the firmware left translating, so the verdict is set for the length of the test
+/// (`acpi::dmar::ktest_block`); only functions without a driver are asked, and none of them is changed.
+fn enable_refused_by_iommu() -> R {
+    use acpi::dmar::DmaVerdict;
+    struct Unblock;
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            acpi::dmar::ktest_block(None);
+        }
+    }
+    kassert!(acpi::dma_gate().is_ok(), "this run's machine must start with DMA free: {:?}", acpi::dma_gate());
+    let targets: Vec<Node> = crate::tree().into_iter().filter(|n| n.untouched.is_none() && !n.is_storage() && crate::device::driver_of_loc(n.loc).is_none()).collect();
+    if targets.is_empty() {
+        return ktest::fail("no function without a driver");
+    }
+    for verdict in [DmaVerdict::TranslationOn, DmaVerdict::ProtectedMemoryOn] {
+        let _unblock = Unblock;
+        acpi::dmar::ktest_block(Some(verdict));
+        kassert!(acpi::dma_gate() == Err(verdict), "the gate did not take the verdict: {:?}", acpi::dma_gate());
+        for n in &targets {
+            let f = n.function();
+            let fname = format!("{}", n.loc);
+            let (before, recorded) = (f.command(), crate::dma_enabled().contains(&n.loc));
+            let seq = klog::next_seq();
+            let r = f.enable_device(true);
+            kassert!(r == Err(EnableError::DmaBlocked(verdict.name())), "{fname}: {:?}", r);
+            kassert!(f.command() == before, "{fname}: command {before:#x} -> {:#x}", f.command());
+            kassert!(crate::dma_enabled().contains(&n.loc) == recorded, "{fname}: the DMA record changed");
+            let logged = events(seq, "enable.refused");
+            kassert!(logged.iter().any(|t| has_field(t, "function", &fname) && t.contains(verdict.name())), "{fname}: no enable.refused event naming {}: {:?}", verdict.name(), logged);
+            kassert!(events(seq, "enable").is_empty() && events(seq, "bridge.bus_master").is_empty(), "{fname}: something was switched on");
+        }
+        kassert!(crate::enable::dma_allowed(false, acpi::dma_gate().map_err(|v| v.name())).is_ok(), "an enable without DMA was refused");
+    }
+    // Free again: the gate is open for the next driver (no function is switched on here to show it; every other
+    // boot of the suite does that).
+    kassert!(acpi::dma_gate().is_ok(), "the verdict did not go back: {:?}", acpi::dma_gate());
+    kassert!(crate::enable::dma_allowed(true, acpi::dma_gate().map_err(|v| v.name())).is_ok());
     Ok(())
 }
 

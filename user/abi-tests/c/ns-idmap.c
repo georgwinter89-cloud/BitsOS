@@ -1,7 +1,7 @@
-/* SX-2: uid_map, gid_map and setgroups (linux-6.6/kernel/user_namespace.c map_write :920, the second write
- * :966, the writer's namespace :1116, new_idmap_permitted :1160/:1181, proc_setgroups_write :1213/:1252) as
+/* SX-2: uid_map, gid_map and setgroups (linux-7.3.1/kernel/user_namespace.c map_write :932, the second write
+ * :978, the writer's namespace :1130, new_idmap_permitted :1172/:1193, proc_setgroups_write :1225/:1264) as
  * Chromium writes them, the hostile writes, and how ids look inside afterwards (stat, /proc/self/status,
- * setuid, setgroups). Shaped like the user-namespace parts of linux-6.6/tools/testing/selftests. The outer
+ * setuid, setgroups). Shaped like the user-namespace parts of linux-7.3.1/tools/testing/selftests. The outer
  * uid/gid appear only as "U"/"G". */
 #include "ns.h"
 #include <grp.h>
@@ -98,7 +98,7 @@ static int chromium(void) {
     return 0;
 }
 
-/* Mode "pwrite" (FS-16): seq_file files clear FMODE_PWRITE (linux-6.6/fs/seq_file.c seq_open): pwrite is ESPIPE
+/* Mode "pwrite" (FS-16): seq_file files clear FMODE_PWRITE (linux-7.3.1/fs/seq_file.c:86 seq_open): pwrite is ESPIPE
  * before the mode check (fs/read_write.c ksys_pwrite64), write(2) at the position works; a file without
  * seq_file (oom_score_adj) keeps pwrite. */
 static int pwrites(void) {
@@ -126,7 +126,7 @@ static int pwrites(void) {
     printf("oom_score_adj (no seq_file): pwrite of its own value = %s\n", yn(an > 0 && pwrite(fd, adj, an, 0) == an));
     close(fd);
     /* INT-W21 (FS-16 CR to AB): /proc/self/mem keeps pwrite (no seq_file), the position is the address
-     * (linux-6.6/fs/proc/base.c mem_rw); an address with nothing mapped is EIO. */
+     * (linux-7.3.1/fs/proc/base.c:880 mem_rw); an address with nothing mapped is EIO. */
     static volatile char cell[8] = "abcdefg";
     fd = open("/proc/self/mem", O_RDWR);
     printf("mem: pwrite at the address = %s\n", yn(pwrite(fd, "XY", 2, (off_t)(unsigned long)&cell[2]) == 2));

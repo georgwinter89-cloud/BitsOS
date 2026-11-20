@@ -4,6 +4,7 @@
 //! A second model stops the device after k writes (every later write fails): the volume turns read-only
 //! and the image is as repairable.
 
+use super::lay::{cut_image, Rng};
 use super::util::*;
 use super::write::{file, put};
 use crate::inode::ROOT;
@@ -80,7 +81,7 @@ fn every_cut_is_repairable() {
         dev.record();
         changes(&v);
         let log = dev.take_log();
-        let writes: Vec<_> = log.iter().filter(|(a, _)| *a != u64::MAX).collect();
+        let writes: Vec<_> = log.iter().filter(|(a, _)| !crate::dev::is_mark(*a)).collect();
         let step = (writes.len() / 25).max(1);
         let mut cuts = 0;
         for k in (0..writes.len()).step_by(step).chain([writes.len()]) {
@@ -138,16 +139,6 @@ fn deep_changes(v: &Volume) -> u16 {
     depth
 }
 
-struct Rng(u64);
-impl Rng {
-    fn bit(&mut self) -> bool {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 & 1 == 1
-    }
-}
-
 /// Each cut: every write before the last flush is on the disk, and of the writes after it (still in a
 /// volatile cache) a random half, in any order: reordering a journal-less ext4 on Linux sees too.
 #[test]
@@ -171,14 +162,7 @@ fn deep_cuts_with_reordered_writes_are_repairable() {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         let step = (log.len() / 24).max(1);
         for k in (0..log.len()).step_by(step).chain([log.len()]) {
-            let flush = log[..k].iter().rposition(|(a, _)| *a == u64::MAX).map_or(0, |i| i + 1);
-            let mut img = before.clone();
-            for (i, (at, d)) in log[..k].iter().enumerate() {
-                if *at == u64::MAX || (i >= flush && !rng.bit()) {
-                    continue;
-                }
-                img[*at as usize..*at as usize + d.len()].copy_from_slice(d);
-            }
+            let (img, flush) = cut_image(&before, &log, k, usize::MAX, Some(&mut || rng.bit()));
             check_disk(&s, img, &format!("{name}: cut after {k} of {} (flush at {flush}), half of the rest", log.len()));
         }
         if name == "4k-csum" {

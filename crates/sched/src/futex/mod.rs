@@ -1,4 +1,5 @@
-//! Futexes (SC-5; spec/core.md §9.2, V2-PLAN §2.6; Linux linux-6.6/kernel/futex/).
+//! Futexes (SC-5; spec/core.md §9.2, V2-PLAN §2.6; Linux linux-7.3.1/kernel/futex/: core.c, waitwake.c,
+//! requeue.c, pi.c; L7-SYNC: the robust-unlock op flags, futex2's NUMA words and the per-process hash).
 //!
 //! - **Hash buckets** (R5): `256 x CPUs` buckets (a power of two, Linux's `futex_init`), each a spin lock over
 //!   its waiters in arrival order (`table`). A key is (address space, address) for a private futex,
@@ -20,16 +21,24 @@
 //! - **Interruption**: a wait also ends when `Space::interrupted` says so (the process was killed; AB-6 adds
 //!   deliverable signals). `kick_thread` wakes a sleeping thread, and the waiter checks `interrupted` after it
 //!   is queued and before it sleeps (both sides with a full fence), so a kill is never missed.
+//! - **Robust unlock** (L7-SYNC, linux-7.3.1/kernel/futex/waitwake.c:155 `futex_robust_unlock`, core.c:1438):
+//!   FUTEX_WAKE/WAKE_BITSET with FUTEX_ROBUST_UNLOCK store 0 into the word and clear the robust list's
+//!   `list_op_pending` after the key and before the wake; FUTEX_UNLOCK_PI clears it after the unlock.
+//! - **futex2 NUMA words** (L7-SYNC, core.c:515 `get_futex_key`): with FUTEX2_NUMA the word is followed by a node
+//!   word; the pair is 8-aligned, a node of -1 becomes this CPU's node (V2 has one, node 0) and is written back,
+//!   any other node but 0 is EINVAL. FUTEX2_MPOL asks the memory policy first; V2 has none (`FUTEX_NO_NODE`).
+//!   The node only picks a hash queue in Linux, never the match, so V2's single table needs nothing more.
 //! - **Robust lists and thread exit** (`robust`): `exit_robust_list` walks the list at thread exit (OWNER_DIED,
 //!   wake one), `clear_child_tid` zeroes the tid word and wakes one waiter (CLONE_CHILD_CLEARTID).
 //!
 //! - **PI futexes** (SC-7b, `pi`): FUTEX_LOCK_PI/LOCK_PI2/TRYLOCK_PI/UNLOCK_PI with the owner's TID in the word,
 //!   hand-over by the unlocker, priority passing to the owner (`sched::pi`), and the owner's exit handing each
 //!   PI futex it holds to its top waiter. FUTEX_WAIT_REQUEUE_PI/CMP_REQUEUE_PI: Linux's argument checks, then
-//!   ENOSYS (not built; plan/notes/sc-SC-7b.md).
+//!   ENOSYS (not built; plan/spec/core.md §9.3).
 //!
 //! Errors are positive errno values (`uapi::errno`); the syscall layer negates them.
 
+mod hash_ktests;
 mod ktests;
 mod ops;
 pub mod pi;
@@ -42,7 +51,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering, fence};
 use ksync::user_word::{WordError, WordOp};
 use ksync::{SchedHooks, SpinLock, SpinLockGuard};
 pub use ops::{WaitvItem, requeue, wait_multiple, wake_op};
@@ -61,6 +70,7 @@ klog::counter!(WAKES, "futex.woken");
 klog::counter!(TIMEOUTS, "futex.timeouts");
 klog::counter!(FAULT_RETRIES, "futex.fault_retries");
 klog::counter!(REQUEUED, "futex.requeued");
+klog::counter!(ROOM_GROWN, "futex.bucket_grown");
 
 /// A key and what keeps its object alive while the operation runs (a file mapping's backing for an inode key:
 /// the inode address in the key cannot be reused while a reference is held).
@@ -73,6 +83,58 @@ impl KeyRef {
     pub fn plain(key: Key) -> KeyRef {
         KeyRef { key, hold: None }
     }
+}
+
+/// How a futex word is keyed (Linux's FLAGS_SHARED, FLAGS_NUMA, FLAGS_MPOL). A plain `bool` is `shared` alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    pub shared: bool,
+    /// FUTEX2_NUMA: a u32 node word follows the futex word.
+    pub numa: bool,
+    /// FUTEX2_MPOL: a node of -1 is taken from the memory policy first.
+    pub mpol: bool,
+}
+
+impl From<bool> for Flags {
+    fn from(shared: bool) -> Flags {
+        Flags { shared, ..Flags::default() }
+    }
+}
+
+/// `FUTEX_NO_NODE`.
+pub const NO_NODE: u32 = u32::MAX;
+
+/// FUTEX_ROBUST_UNLOCK: the robust list's `list_op_pending` to clear (`pop`, the op's uaddr2) and whether it is
+/// a 32-bit pointer (FUTEX_ROBUST_LIST32).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RobustUnlock {
+    pub pop: u64,
+    pub list32: bool,
+}
+
+/// `get_futex_key` with `f`: futex2's node word first (alignment of the pair, the node read, checked and
+/// written back), then the key itself (`Space::key`).
+pub(crate) fn key_of(sp: &dyn Space, addr: u64, f: Flags, write: bool) -> Result<KeyRef, i64> {
+    if f.numa {
+        if addr % 8 != 0 {
+            return Err(EINVAL);
+        }
+        if addr > hal::USER_TOP {
+            return Err(EFAULT);
+        }
+        let naddr = addr + 4;
+        let mut node = sp.read_u32(naddr)?;
+        // `node >= MAX_NUMNODES || !node_possible(node)`: V2 has node 0 only.
+        if node != NO_NODE && node != 0 {
+            return Err(EINVAL);
+        }
+        // FUTEX2_MPOL: V2 has no memory policies, so `futex_mpol` finds no node (FUTEX_NO_NODE).
+        if node == NO_NODE {
+            node = 0;
+            sp.write_u32(naddr, node)?;
+        }
+    }
+    sp.key(addr, f.shared, write)
 }
 
 /// When a wait gives up (absolute).
@@ -100,6 +162,11 @@ pub trait Space {
     fn write_u32(&self, addr: u64, v: u32) -> Result<(), i64>;
     /// Why a sleeping wait must end now (the errno to return), if it must.
     fn interrupted(&self) -> Option<i64>;
+    /// FUTEX_ROBUST_UNLOCK's `futex_robust_list_clear_pending`: zeroes the pointer at `pop` (4 bytes with
+    /// `list32`, else 8); false when it cannot be written.
+    fn clear_pending(&self, pop: u64, list32: bool) -> bool {
+        self.write_u32(pop, 0).is_ok() && (list32 || self.write_u32(pop.wrapping_add(4), 0).is_ok())
+    }
     /// SC-7b: the calling thread's TID as its programs see it (the owner field of a PI futex word); None for a
     /// caller that has none (the PI operations answer EINVAL).
     fn tid(&self) -> Option<u32> {
@@ -156,10 +223,64 @@ impl ThreadState {
 
 pub(crate) type FEntry = table::Entry<Arc<Thread>>;
 
+/// Room for more waiters in a bucket, made with its lock dropped (`ksync::Spare`): a bucket of a hundred
+/// waiters is more than a page, and under its spin lock the heap finds that only while memory is not full.
+/// Declared before the bucket's guard; a caller that hears "does not fit" drops the guard, grows, locks again
+/// and repeats every check it made under the lock. A caller that goes on to sleep calls `release` first.
+pub(crate) struct Room {
+    spare: ksync::Spare<Vec<FEntry>>,
+    /// `grow` ran: this one holds a vector (an unused spare, or the bucket's old one).
+    made: bool,
+}
+
+/// `Room`s that hold a vector now (ktests: none is held by a sleeping waiter).
+static ROOMS_HELD: AtomicUsize = AtomicUsize::new(0);
+
+impl Room {
+    pub(crate) const fn new() -> Room {
+        Room { spare: ksync::Spare::new(), made: false }
+    }
+    /// Bucket lock held: whether `q` takes `n` more entries now.
+    pub(crate) fn fits(&mut self, q: &mut Vec<FEntry>, n: usize) -> bool {
+        self.spare.fits(q, n)
+    }
+    /// No bucket lock held. ENOMEM: the heap has none, even after waiting.
+    pub(crate) fn grow(&mut self) -> Result<(), i64> {
+        ROOM_GROWN.inc();
+        self.spare.grow().map_err(|_| ENOMEM)?;
+        if !self.made {
+            self.made = true;
+            ROOMS_HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    /// No bucket lock held, before the caller blocks: frees what is left over (the bucket's old vector, or a
+    /// spare another waiter's growth made useless). A wait may last forever; a crowd on one futex would
+    /// otherwise keep a vector of up to twice the bucket per sleeping thread.
+    pub(crate) fn release(&mut self) {
+        *self = Room::new();
+    }
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        if self.made {
+            ROOMS_HELD.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `Room`s that hold memory now (ktests).
+pub(crate) fn rooms_held() -> usize {
+    ROOMS_HELD.load(Ordering::Relaxed)
+}
+
 /// The hash table.
 pub(crate) struct Table {
     buckets: Vec<SpinLock<Vec<FEntry>>>,
     mask: usize,
+    /// The CPU count it was sized for.
+    cpus: usize,
 }
 
 static TABLE: ksync::OnceRef<Table> = ksync::OnceRef::new();
@@ -169,27 +290,44 @@ pub(crate) fn buckets() -> Result<&'static Table, i64> {
     if let Some(t) = TABLE.get() {
         return Ok(t);
     }
-    let _g = TABLE_INIT.lock();
+    // Made with no lock held: the table is tens of pages, and under `futex.init` the heap could neither reclaim
+    // nor compact for them. Two first callers both make one; the lock only decides
+    // whose is published, the other is freed after it.
+    let fresh = Table::make()?;
+    let g = TABLE_INIT.lock();
     if let Some(t) = TABLE.get() {
+        drop(g);
+        drop(fresh);
         return Ok(t);
     }
-    let cpus = hal::percpu::cpu_count().max(crate::online_cpus()).max(1);
-    let n = (256 * cpus).next_power_of_two();
-    let mut v: Vec<SpinLock<Vec<FEntry>>> = Vec::new();
-    if v.try_reserve_exact(n).is_err() {
-        klog::event!(Error, "futex", "table.no_memory", buckets = n; "no memory for the futex hash table (ENOMEM; retried at the next call)");
-        return Err(ENOMEM);
-    }
-    for _ in 0..n {
-        v.push(SpinLock::named("futex.bucket", Vec::new()));
-    }
-    let t: &'static Table = Box::leak(Box::new(Table { buckets: v, mask: n - 1 }));
+    let (n, cpus) = (fresh.buckets.len(), fresh.cpus);
+    let t: &'static Table = Box::leak(fresh);
     TABLE.set(t);
+    drop(g);
     klog::event!(Info, "futex", "table.ready", buckets = n, cpus = cpus);
     Ok(t)
 }
 
 impl Table {
+    /// A table for the CPUs there are now (allocates: no spin lock may be held).
+    fn make() -> Result<Box<Table>, i64> {
+        let cpus = hal::percpu::cpu_count().max(crate::online_cpus()).max(1);
+        let mut t = Self::with_buckets((256 * cpus).next_power_of_two())?;
+        t.cpus = cpus;
+        Ok(t)
+    }
+    /// A table of `n` buckets (a power of two).
+    pub(crate) fn with_buckets(n: usize) -> Result<Box<Table>, i64> {
+        let mut v: Vec<SpinLock<Vec<FEntry>>> = Vec::new();
+        if v.try_reserve_exact(n).is_err() {
+            klog::event!(Error, "futex", "table.no_memory", buckets = n; "no memory for the futex hash table (ENOMEM; retried at the next call)");
+            return Err(ENOMEM);
+        }
+        for _ in 0..n {
+            v.push(SpinLock::named("futex.bucket", Vec::new()));
+        }
+        Ok(Box::new(Table { buckets: v, mask: n - 1, cpus: 0 }))
+    }
     pub(crate) fn index(&self, k: &Key) -> u32 {
         (k.hash() as usize & self.mask) as u32
     }
@@ -309,10 +447,12 @@ pub(crate) fn unqueue(t: &Table, me: &Arc<Thread>, slot: u32) -> bool {
     }
 }
 
-/// FUTEX_WAIT / FUTEX_WAIT_BITSET (linux-6.6/kernel/futex/waitwake.c:631 `futex_wait`, :577 `futex_wait_setup`):
+/// FUTEX_WAIT / FUTEX_WAIT_BITSET (linux-7.3.1/kernel/futex/waitwake.c:741 `futex_wait`, :622 `futex_wait_setup`):
 /// Ok when woken (also spuriously by a waker of an unrelated futex sharing a pattern: callers re-check), EAGAIN
 /// when the word is not `val`, ETIMEDOUT, EINVAL for an empty bitset, EFAULT, or `Space::interrupted`'s errno.
-pub fn wait(sp: &dyn Space, addr: u64, shared: bool, val: u32, bitset: u32, deadline: Option<Deadline>) -> Result<(), i64> {
+pub fn wait(sp: &dyn Space, addr: u64, flags: impl Into<Flags>, val: u32, bitset: u32, deadline: Option<Deadline>) -> Result<(), i64> {
+    let f: Flags = flags.into();
+    let shared = f.shared;
     if bitset == 0 {
         return Err(EINVAL);
     }
@@ -321,14 +461,19 @@ pub fn wait(sp: &dyn Space, addr: u64, shared: bool, val: u32, bitset: u32, dead
     me.futex.reserve(1)?;
     WAITS.inc();
     let mut faults = 0;
+    // Before any bucket guard, so a bucket's old vector is freed after the unlock.
+    let mut room = Room::new();
     'retry: loop {
-        let kr = sp.key(addr, shared, false)?;
+        let kr = key_of(sp, addr, f, false)?;
         // setup
         loop {
             let bi = t.index(&kr.key);
             let mut q = t.lock(bi);
-            if q.try_reserve(1).is_err() {
-                return Err(ENOMEM);
+            if !room.fits(&mut q, 1) {
+                // Nothing is queued and the word is not read yet: the setup simply starts later.
+                drop(q);
+                room.grow()?;
+                continue;
             }
             match sp.word(addr, WordOp::Load) {
                 Ok(v) if v != val => return Err(EAGAIN),
@@ -352,6 +497,7 @@ pub fn wait(sp: &dyn Space, addr: u64, shared: bool, val: u32, bitset: u32, dead
                 }
             }
         }
+        room.release();
         sleep(&me, sp, deadline);
         if !unqueue(t, &me, 0) {
             return Ok(());
@@ -368,18 +514,53 @@ pub fn wait(sp: &dyn Space, addr: u64, shared: bool, val: u32, bitset: u32, dead
     }
 }
 
-/// FUTEX_WAKE / FUTEX_WAKE_BITSET (waitwake.c:143): how many were woken.
-pub fn wake(sp: &dyn Space, addr: u64, shared: bool, nr_wake: i32, bitset: u32) -> Result<i64, i64> {
+/// FUTEX_WAKE / FUTEX_WAKE_BITSET (linux-7.3.1/kernel/futex/waitwake.c:178): how many were woken.
+pub fn wake(sp: &dyn Space, addr: u64, flags: impl Into<Flags>, nr_wake: i32, bitset: u32) -> Result<i64, i64> {
+    wake_unlock(sp, addr, flags.into(), nr_wake, bitset, None, false)
+}
+
+/// `futex_wake` with its 7.3.1 parts: `robust` (FUTEX_ROBUST_UNLOCK: the word is set to 0 with release order and
+/// the pending pointer cleared, after the key and before anyone is woken; EFAULT when either cannot be written)
+/// and `strict` (futex2's FLAGS_STRICT: `nr_wake` 0 wakes nobody; the old call wakes one).
+pub fn wake_unlock(sp: &dyn Space, addr: u64, f: Flags, nr_wake: i32, bitset: u32, robust: Option<RobustUnlock>, strict: bool) -> Result<i64, i64> {
     if bitset == 0 {
         return Err(EINVAL);
     }
-    let kr = sp.key(addr, shared, false)?;
+    let kr = key_of(sp, addr, f, false)?;
+    if let Some(r) = robust {
+        store_zero(sp, addr)?;
+        if !sp.clear_pending(r.pop, r.list32) {
+            return Err(EFAULT);
+        }
+    }
+    if strict && nr_wake == 0 {
+        return Ok(0);
+    }
     let t = buckets()?;
     let mut q = t.lock(t.index(&kr.key));
     let n = table::wake(&mut q, &kr.key, nr_wake, bitset, &mut wake_entry);
     drop(q);
     drop(kr);
     n
+}
+
+/// `unsafe_atomic_store_release_user(0, uaddr)`: an atomic exchange (at least release order), the page faulted
+/// in when it is not writable yet.
+fn store_zero(sp: &dyn Space, addr: u64) -> Result<(), i64> {
+    let mut faults = 0;
+    loop {
+        match sp.word(addr, WordOp::Set(0)) {
+            Ok(_) => return Ok(()),
+            Err(WordError::NotLoaded) => {
+                not_loaded();
+                return Err(EFAULT);
+            }
+            Err(_) => {
+                sp.fault_in(addr, true)?;
+                retry_fault(&mut faults)?;
+            }
+        }
+    }
 }
 
 /// Retries of one operation after a word access failed although the page could be faulted in (a race with
@@ -410,6 +591,11 @@ pub(crate) fn not_loaded() {
     if !NOT_LOADED_SEEN.swap(true, Ordering::Relaxed) {
         klog::event!(Warn, "futex", "word.not_loaded", thread = crate::current_id(); "a futex word access from a thread that does not run in that address space: EFAULT");
     }
+}
+
+/// The global table's size (made or not yet): what a private hash is clamped to (`__futex_mask + 1`).
+pub fn global_buckets() -> usize {
+    TABLE.get().map_or_else(|| (256 * hal::percpu::cpu_count().max(crate::online_cpus()).max(1)).next_power_of_two(), |t| t.buckets.len())
 }
 
 /// Futex waiters queued now (all buckets; for tests and the `locks`-style views).

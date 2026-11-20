@@ -3,8 +3,10 @@
 A guide for AI coding agents (Claude Code, Codex, Cursor and others) that help a person try or develop BitsOS.
 
 BitsOS is a hobby operating system: its own Rust kernel with the Linux system-call interface, a UEFI loader
-(`boot/bitsboot`), a Wayland desktop and ports of Linux programs. It is developed on one machine (Ryzen 7 8845HS,
-Radeon 780M) and tested in QEMU through one tool, `cargo xtask` (`host/xtask`).
+(`boot/bitsboot`), a Wayland desktop and ports of Linux programs. It runs on two machines, a Mini-PC (Ryzen 7 PRO
+8845HS, Radeon 780M) and a Gaming-PC (Core Ultra 7 265K, Radeon RX 9070 XT, no desktop there yet), and is tested in
+QEMU through one tool, `cargo xtask` (`host/xtask`). In QEMU it shows the boot screen and then the text console: the
+desktop draws only on a GPU that BitsOS drives, and QEMU has none.
 
 Read `README.md`, section "Trying BitsOS", before you suggest anything to the person. Everything there is derived from
 the code; when the code and a document disagree, the code wins, and you say so.
@@ -19,7 +21,7 @@ These protect the person's machine and data. Do not bend them, not even when ask
    device: start QEMU only through `cargo xtask qemu`, which refuses host disks, passthrough and foreign ports, or
    through the start script `bitsos-install --qemu` wrote, which boots its own image file only.
 2. **Never set, change or remove a guarded CONFIG key.** The guarded keys are `nvme_write`, `nvme_data`, `nvme_boot`,
-   `stick_write`, `usb_msd_write`, `mcp` and `mcp_confirmer`. Only the person sets them, by hand, in
+   `stick_write`, `usb_msd_write`, `mcp`, `mcp_confirmer` and the Gaming-PC's `gp_net`, `gp_stick`, `gp_nvme`. Only the person sets them, by hand, in
    `\BITSOS2\CONFIG.TXT`. Do not write a `CONFIG.TXT` that contains them, do not offer to "add the line for them",
    and do not look for a way around BitsOS's refusal. You may explain what a key does and what the rules are.
    The one tool that writes `mcp=service` is `bitsos-install`, and only for `--remote yes`: pass that only when the
@@ -129,11 +131,11 @@ section 9 has every command.
   entry was chosen; the processor lacks x86-64-v3 (bitsboot's screen names the missing features); the stick has no
   generation or a kernel bitsboot refuses (its screen says why). bitsboot returns to the firmware after a key or a
   few seconds.
-- **Black screen**: the desktop waits up to 30 s for the 780M to come up. Press a key during the boot screen for the
-  text console. Try `gpu=off`, `bitscomp=rescue` or `desktop=off` in `CONFIG.TXT`. On other graphics the picture is
+- **Black screen**: the desktop waits up to 30 s for the 780M to come up; if it does not, the text console says so
+  in one line. Press a key during the boot screen for the text console. On other graphics the picture is
   the firmware's framebuffer; if the firmware set none, nothing is shown.
 - **No network**: only Intel I226/82576 and the RTL8852BE have drivers (virtio-net in QEMU, with `--net user`). An
-  Intel processor starts in safe mode without network drivers (`profile=normal` changes that). Wi-Fi needs `wlan=on`,
+  Intel processor starts in safe mode without network drivers (`profile=normal` changes that). Wi-Fi needs
   `wlan_ssid=`, `wlan_psk=` and the firmware in `\BITSOS2\firmware\rtw89\` (copied from the image folder); without
   `wlan_ssid=` the log says `wlan config.no_network`. The monitor command `net` lists cards and addresses.
 - **Stick read-only**: look for the kernel log line `fat stick.decided ... rw=false ... reason=...`. The reasons:
@@ -206,7 +208,8 @@ image file and a start script in the person's data folder and never a disk; it r
    (`1 OK, 2 NEW`) and keeps `CONFIG.TXT` and `data.img`. Programs are untested in QEMU: add `--trees`,
    `--steam yes` or `--brave yes` only when the person asks for them.
 5. **Read along:** the serial log is `bitsos-serial.log` beside the image (`~/.local/share/bitsos/`,
-   `%LOCALAPPDATA%\BitsOS\`); `console desktop.up` there means the desktop is up. The QEMU PID is in `qemu.pid`
+   `%LOCALAPPDATA%\BitsOS\`); in QEMU there is no desktop, so `console desktop.up` never comes there: the run
+   has come up when the window shows the text console after the boot screen. The QEMU PID is in `qemu.pid`
    there; stop that PID and nothing else. With remote control the forward is `127.0.0.1:18765` (the run prints the
    port); pairing is the person's step as in "Using the remote control safely", `--trust-first-use` is allowed here.
    On Windows QEMU's own messages are in `qemu-output.log` there. A slow-start note (no KVM, no WHPX) names the fix;
@@ -221,7 +224,7 @@ image file and a start script in the person's data folder and never a disk; it r
    with README section 3 and tell them plainly what will likely not work.
 2. **QEMU first.** Without building: the installer's QEMU mode (above). To build it yourself: install the packages
    (README section 1), the toolchains, build
-   `V2_PKG_OPTIONAL=1 cargo xtask image --name try --config-extra "desktop=on"` in the background, then start
+   `V2_PKG_OPTIONAL=1 cargo xtask image --name try` in the background, then start
    `cargo xtask qemu --name try --display gtk --timeout 3600 --mem 4G --smp 4 --net user -- -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0`.
    Tell them about the German keyboard layout. Read `target/xtask/try.log` with them if something looks wrong.
 3. **Decide about the big programs.** If they want Brave, LibreOffice or Steam, go through README section 2 with

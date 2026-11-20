@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::theme::{Motion, Theme};
 
-/// The chrome's start (at most 400 ms, the brief's limit for the desktop's opening at the cheap level, DS-5).
+/// The chrome's start (at most 400 ms, the brief's limit for the desktop's opening, DS-5).
 pub const START: Duration = Duration::from_millis(400);
 pub const MENU: Duration = Duration::from_millis(120);
 /// How far the top and bottom bars glide (logical pixels).
@@ -61,8 +61,6 @@ pub struct Anim {
     menu: Option<Duration>,
     /// DS-5: the boot scene lies over the desktop; the chrome's start waits and no frame is asked for it.
     pub hold: bool,
-    /// DS-5: the boot scene's fade ends then (frames until the frame after it has taken the scene away).
-    pub boot_fade: Option<Duration>,
 }
 
 fn ease(k: f32) -> f32 {
@@ -82,7 +80,7 @@ impl Anim {
         }
     }
 
-    /// DS-5: the chrome is at rest from now on (the boot scene's fade is the desktop's opening).
+    /// DS-5: the chrome is at rest from now on (the boot scene's wipe is the desktop's opening).
     pub fn settle(&mut self, now: Duration) {
         self.start = Some(now.saturating_sub(START));
     }
@@ -113,9 +111,7 @@ impl Anim {
         }
         let started = !self.hold && self.start.is_none_or(|t0| now < t0 + START);
         let menu = self.menu.is_some_and(|t0| now < t0 + MENU);
-        // Until the scene's last frame took it away (`boot_end` clears it), not only until its end time.
-        let fade = self.boot_fade.is_some();
-        started || menu || fade
+        started || menu
     }
 }
 
@@ -202,10 +198,10 @@ mod tests {
         }
     }
 
-    /// DS-5: while the boot scene lies over the desktop no frame is asked for the chrome's start; when it fades
-    /// the chrome is at rest and frames come until the scene's last frame has taken it away.
+    /// DS-5: while the boot scene lies over the desktop no frame is asked for the chrome's start; after it the chrome
+    /// is at rest (the wipe is the desktop's opening).
     #[test]
-    fn the_boot_scene_holds_the_start_and_its_fade_asks_for_frames() {
+    fn the_boot_scene_holds_the_start() {
         let t = crate::theme::test_theme().clone();
         let mut a = Anim { hold: true, ..Anim::default() };
         let t0 = Duration::from_secs(3);
@@ -214,11 +210,8 @@ mod tests {
         assert_eq!(a.chrome(t0, &t), (1.0, 0.0), "the desktop under the scene is drawn at rest");
         a.hold = false;
         a.settle(t0 + Duration::from_secs(1));
-        a.boot_fade = Some(t0 + Duration::from_secs(1) + Duration::from_millis(300));
         let now = t0 + Duration::from_secs(2);
         assert_eq!(a.chrome(now, &t), (1.0, 0.0));
-        assert!(a.running(now, &t), "past its end the fade still needs the frame that ends it");
-        a.boot_fade = None;
         assert!(!a.running(now, &t));
         a.first_frame(now + Duration::from_secs(5));
         assert_eq!(a.chrome(now + Duration::from_secs(5), &t), (1.0, 0.0), "the start does not run again");

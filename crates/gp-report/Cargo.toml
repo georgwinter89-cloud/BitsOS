@@ -1,0 +1,9 @@
+[package]
+name = "gp-report"
+version = "0.1.0"
+edition = "2024"
+description = "The Gaming-PC's report page (gp-roadmap B10): rows in plain German, pages for the firmware screen, the file names on the stick; pure logic"
+publish = false
+
+[lints]
+workspace = true

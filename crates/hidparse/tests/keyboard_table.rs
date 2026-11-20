@@ -1,7 +1,7 @@
 //! Keyboard page 7 against the real Linux table: `hid_keyboard[256]` of drivers/hid/hid-input.c,
 //! read byte for byte out of /usr/src/linux-cachyos/vmlinux (7.2.9-2-cachyos, 14.10.2026; the table
-//! is the same as in v6.6: compared entry for entry with linux-6.6/drivers/hid/hid-input.c:27-44 in
-//! IN-2a). 240 = KEY_UNKNOWN (`unk`), 0 = usage ignored.
+//! is the same as in v6.6, compared entry for entry in IN-2a, and as in
+//! linux-7.3.1/drivers/hid/hid-input.c:27-44). 240 = KEY_UNKNOWN (`unk`), 0 = usage ignored.
 
 use hidparse::codes::KEY_UNKNOWN;
 use hidparse::{InputMap, parse};

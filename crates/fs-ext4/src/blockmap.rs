@@ -1,6 +1,6 @@
 //! ext2/ext3 block maps (`i_block[0..12]` direct, then single, double and triple indirect blocks;
-//! linux-6.6/fs/ext4/indirect.c), read; a change of such an inode first turns it into an extent tree
-//! (`State::migrate`, as `EXT4_IOC_MIGRATE` does: linux-6.6/fs/ext4/migrate.c), so V2 writes only extents.
+//! linux-7.3.1/fs/ext4/indirect.c), read; a change of such an inode first turns it into an extent tree
+//! (`State::migrate`, as `EXT4_IOC_MIGRATE` does: linux-7.3.1/fs/ext4/migrate.c), so V2 writes only extents.
 
 use crate::inode::DiskInode;
 use crate::le::*;

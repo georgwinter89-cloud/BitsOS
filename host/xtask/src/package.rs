@@ -10,9 +10,12 @@
 //! V2_PKG_OPTIONAL=1 turns those into notes, the list says `mode optional` and only then the `ul.pkg` ktests skip.
 //! YT-2: a `tree` entry puts a whole directory onto the stick (`\BITSOS2\<dir>\`, Cobalt's ~150 MB), with the
 //! libraries its programs need beyond the initramfs set in its own `lib\` (`package/tree.rs`).
+//! PK-B D1/D2: bitspkg's first keyrings and mirror lists come from the build host too (`package/trust.rs`).
 
 #[path = "package/tree.rs"]
 mod tree;
+#[path = "package/trust.rs"]
+mod trust;
 
 use crate::cpio;
 use crate::util::{run_status, xdir};
@@ -67,10 +70,8 @@ pub enum Source {
     Host(PathBuf),
     Gcc(PathBuf),
     Gxx(PathBuf),
-    /// WY-1a: the binary of the same name from the cargo package in this directory (`compile`). WY-14
-    /// (`cargo:dir+feat[+feat]`): with features, the binary named like the directory, built with those
-    /// features, copied out under the entry's name (`stick bitscomp-gpu cargo:user/services/bitscomp+gpu`).
-    Cargo(PathBuf, Vec<String>),
+    /// WY-1a: the binary of the same name from the cargo package in this directory (`compile`).
+    Cargo(PathBuf),
     /// YT-2: a file of this repository copied unchanged (a launcher script).
     File(PathBuf),
     /// UL-6: a glibc locale directory made by the host's `localedef -i <input> -f <charmap> --no-archive` (only
@@ -135,16 +136,7 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Item>, String> {
             Some(("host", p)) if p.starts_with('/') => Source::Host(p.into()),
             Some(("gcc", p)) if rel(p) => Source::Gcc(p.into()),
             Some(("g++", p)) if rel(p) => Source::Gxx(p.into()),
-            Some(("cargo", p)) if rel(p.split('+').next().unwrap_or("")) => {
-                let mut parts = p.split('+');
-                let dir = parts.next().unwrap_or("");
-                let feats: Vec<String> = parts.map(String::from).collect();
-                let feat_ok = |f: &String| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-                if !feats.iter().all(feat_ok) {
-                    return Err(format!("{at}: source '{src}': cargo:rel/dir or cargo:rel/dir+feature[+feature]"));
-                }
-                Source::Cargo(dir.into(), feats)
-            }
+            Some(("cargo", p)) if rel(p) => Source::Cargo(p.into()),
             Some(("file", p)) if rel(p) => Source::File(p.into()),
             Some(("localedef", p)) if place == Place::Data => {
                 let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "_@.-".contains(c));
@@ -360,12 +352,10 @@ pub fn stick_dir(root: &Path) -> PathBuf {
 }
 
 /// WY-1a: `cargo:rel/dir` builds the binary named like the entry from the package in `dir` for the host
-/// (x86_64-unknown-linux-gnu, CachyOS glibc, dynamic): release, without the package's default features (bitscomp's
-/// `nested` back end stays out), stripped, x86-64-v3 (R10), from the lock and the local cache only (`--locked
+/// (x86_64-unknown-linux-gnu, dynamic; bitscomp links against the Mesa tree's glibc, its build.rs): release, without
+/// the package's default features, stripped, x86-64-v3 (R10), from the lock and the local cache only (`--locked
 /// --offline`, no download), in the package's directory so its rust-toolchain file applies, own target directory.
-/// WY-14: `features` non-empty builds the binary named like `dir`'s last component with `--features`, in its own
-/// target directory (pkg/cargo-<features>), because its output has the same name as the build without them.
-fn cargo_build(root: &Path, dir: &Path, name: &str, features: &[String]) -> Result<PathBuf, String> {
+fn cargo_build(root: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
     let pkg = root.join(dir);
     if !pkg.join("Cargo.toml").is_file() {
         return Err(format!("{}: no Cargo.toml", pkg.display()));
@@ -373,18 +363,10 @@ fn cargo_build(root: &Path, dir: &Path, name: &str, features: &[String]) -> Resu
     if !have_tool("cargo") {
         return Err("no cargo on this host".into());
     }
-    let (tdir, bin) = if features.is_empty() {
-        (xdir(root).join("pkg/cargo"), name.to_string())
-    } else {
-        let bin = dir.file_name().and_then(|n| n.to_str()).ok_or_else(|| format!("{}: no directory name", dir.display()))?;
-        (xdir(root).join(format!("pkg/cargo-{}", features.join("-"))), bin.to_string())
-    };
+    let tdir = xdir(root).join("pkg/cargo");
     let mut c = Command::new("cargo");
     c.current_dir(&pkg).args(["build", "--release", "--locked", "--offline", "--no-default-features", "-q"]);
-    if !features.is_empty() {
-        c.arg("--features").arg(features.join(","));
-    }
-    c.arg("--bin").arg(&bin).arg("--manifest-path").arg(pkg.join("Cargo.toml"));
+    c.arg("--bin").arg(name).arg("--manifest-path").arg(pkg.join("Cargo.toml"));
     for v in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTC_WRAPPER", "RUSTDOC", "RUSTFLAGS", "CARGO_BUILD_TARGET", "CARGO_MANIFEST_DIR"] {
         c.env_remove(v);
     }
@@ -393,14 +375,14 @@ fn cargo_build(root: &Path, dir: &Path, name: &str, features: &[String]) -> Resu
         .env("CARGO_PROFILE_RELEASE_STRIP", "symbols")
         .env("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=x86-64-v3");
     run_status(&mut c, &format!("building {name} (cargo, CachyOS glibc, {})", dir.display()))?;
-    Ok(tdir.join("release").join(bin))
+    Ok(tdir.join("release").join(name))
 }
 
 fn compile(root: &Path, item: &Item, out: &Path) -> Result<PathBuf, String> {
     let (cc, std, src) = match &item.source {
         Source::Gcc(p) => ("gcc", "-std=gnu11", root.join(p)),
         Source::Gxx(p) => ("g++", "-std=c++17", root.join(p)),
-        Source::Cargo(p, f) => return cargo_build(root, p, &item.name, f),
+        Source::Cargo(p) => return cargo_build(root, p, &item.name),
         Source::File(p) => {
             let f = root.join(p);
             return if f.is_file() { Ok(f) } else { Err(format!("{} is not in this repository", f.display())) };
@@ -558,7 +540,7 @@ fn lib_set<'a>(root: &Path, progs: impl Iterator<Item = &'a (String, PathBuf)>) 
         if lib_dest(n).is_some() || !is_dynamic(&elf) {
             continue;
         }
-        // WY-14: a program linked against a stick tree's own loader (bitscomp-gpu: the Mesa tree's glibc) brings
+        // WY-14: a program linked against a stick tree's own loader (bitscomp: the Mesa tree's glibc) brings
         // its libraries with that tree; the host's ldd cannot run it.
         if interp(&elf).is_some_and(|i| i.starts_with("/boot/BITSOS2/")) {
             continue;
@@ -717,6 +699,12 @@ pub fn initrd_extra(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<c
         }
         // UL-4a: HTTPS programs then need --ca FILE; not part of the dynamic set, so never an error.
         Err(e) => eprintln!("xtask: note: no CA bundle in the image ({CA_HOST}: {e}); HTTPS programs need --ca FILE"),
+    }
+    // PK-B D1/D2: bitspkg's first keyrings (checked against their packages) and the host's mirror servers.
+    for f in trust::files(root, programs, &mut cache)? {
+        licence_texts(root, &f.origin, &mut lic_files, &mut lic_missing);
+        lines.push(line("data", &format!("/{}", f.dest), &f.data, Some(&f.origin)));
+        v.push(cpio::file(&f.dest, 0o644, f.data));
     }
     // /etc/localtime as a link into the zoneinfo the manifest ships, as on CachyOS (YT-4a CR 1: Starboard reads
     // the zone name from the link target).
@@ -1022,12 +1010,9 @@ mod tests {
         assert_eq!(m[1], Item { place: Place::Stick, name: "b".into(), source: Source::Host("/usr/bin/b".into()) });
         // WY-1a: a cargo-built program and data at an absolute V2 path.
         let m = parse_manifest("stick c cargo:user/services/c\ndata /usr/share/d/e host:/usr/share/e\n").unwrap();
-        assert_eq!(m[0], Item { place: Place::Stick, name: "c".into(), source: Source::Cargo("user/services/c".into(), vec![]) });
+        assert_eq!(m[0], Item { place: Place::Stick, name: "c".into(), source: Source::Cargo("user/services/c".into()) });
         assert_eq!(m[1], Item { place: Place::Data, name: "/usr/share/d/e".into(), source: Source::Host("/usr/share/e".into()) });
-        // WY-14: features after '+'.
-        let m = parse_manifest("stick c-gpu cargo:user/services/c+gpu+x_y\n").unwrap();
-        assert_eq!(m[0].source, Source::Cargo("user/services/c".into(), vec!["gpu".into(), "x_y".into()]));
-        for bad in ["data rel host:/x", "data / host:/x", "data /a/../b host:/x", "data /a//b host:/x", "data /a cargo:x", "initrd a cargo:/abs", "initrd a cargo:../up", "stick a cargo:x+", "stick a cargo:x+a b", "stick a cargo:x+g/h"] {
+        for bad in ["data rel host:/x", "data / host:/x", "data /a/../b host:/x", "data /a//b host:/x", "data /a cargo:x", "initrd a cargo:/abs", "initrd a cargo:../up"] {
             assert!(parse_manifest(bad).is_err(), "{bad}");
         }
         for bad in ["usb a host:/x", "initrd a/b host:/x", "initrd libz.so.1 host:/x", "initrd a host:x", "initrd a gcc:../x.c", "initrd a gcc:/x.c", "initrd a", "initrd a host:/x\nstick a host:/y"] {
@@ -1055,13 +1040,12 @@ mod tests {
         assert!(parse_manifest(&std::fs::read_to_string(crate::util::root().join(MANIFEST)).unwrap()).is_ok());
     }
 
-    /// UL-6: the host's localedef makes de_DE.utf8 with every LC_* file glibc opens (skipped without localedef).
+    /// UL-6: the host's localedef makes de_DE.utf8 with every LC_* file glibc opens (localedef and the de_DE
+    /// source are glibc's; missing is a failure).
     #[test]
     fn localedef_makes_a_locale() {
-        if !have_tool("localedef") || !Path::new(I18N).join("locales/de_DE").is_file() {
-            eprintln!("skip: no localedef or no de_DE source on this host");
-            return;
-        }
+        crate::util::need_tools("localedef_makes_a_locale", &[("localedef", "glibc")]);
+        assert!(Path::new(I18N).join("locales/de_DE").is_file(), "localedef_makes_a_locale: {I18N}/locales/de_DE missing (glibc's locale sources)");
         let root = std::env::temp_dir().join(format!("ul6-localedef-{}", std::process::id()));
         let d = localedef(&root, "de_DE", "UTF-8", "/usr/lib/locale/de_DE.utf8").unwrap();
         assert!(d.ends_with("de_DE.utf8"));
@@ -1171,10 +1155,7 @@ mod tests {
     /// The CachyOS oracle of ktest ul.pkg.cxx: the program built as the image builds it prints pkg-cxx.out.
     #[test]
     fn pkg_cxx_on_the_host() {
-        if !have_tool("g++") {
-            eprintln!("no g++, skipped");
-            return;
-        }
+        crate::util::need_tools("pkg_cxx_on_the_host", &[("g++", "gcc")]);
         let root = crate::util::root();
         let out = std::env::temp_dir().join(format!("xt-pkg-{}", std::process::id()));
         std::fs::create_dir_all(&out).unwrap();

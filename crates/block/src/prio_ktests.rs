@@ -255,7 +255,7 @@ fn ram_starve() -> TestResult {
         }
         kassert!(served.is_some(), "the Background write starved behind 400 Interactive reads");
         bg.wait().map_err(e)?;
-        // FS-15: not "served by aging" here: a busy CPU 0 (full Mini-PC run, desk-minipc-w6) can let all reads
+        // FS-15: not "served by aging" here: a busy CPU 0 (full Mini-PC run, 21.10.) can let all reads
         // finish before the next one is queued, and the write then goes in that gap as a plain pick.
         // block.ram.starve_aged proves aging with a queue that is never empty.
         klog::event!(Debug, "block", "starve.served", reads = served.unwrap_or(0), aged = d.stats().aged);

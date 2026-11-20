@@ -3,7 +3,7 @@
 Cobalt's own Linux build (loader_app + our GL-free libcobalt) with a small
 V2 backend: picture on the Linux framebuffer, input from evdev, sound through
 the existing ALSA/Pulse code. Plan: `plan/V2-LANES.md` (YT), `plan/spec/gpu.md`
-§6. State and numbers: `plan/notes/YT-1.md`.
+§6, `plan/spec/programs.md` §2. Mini-PC check lists: `plan/guides/cobalt.md`.
 
 ## Layout
 
@@ -81,14 +81,14 @@ After a Cobalt rebuild run `scripts/stage-v2.sh`; `cargo xtask image` then puts 
 `\BITSOS2\cobalt\` (only an image with `V2_STICK_TREES=1` or `=cobalt`: no QEMU run carries it, Georg 30.10.), with `lib/` and the
 tree's `PKGLIST.TXT` (`ul.pkg.cobalt` compares the stick with it, so copy the image's tree, not the stage), and the launcher into
 `\BITSOS2\bin\cobalt`. On V2: `cobalt` in the BusyBox shell (over MCP: `/bin/sh /boot/BITSOS2/bin/cobalt`,
-since MCP `run` takes ELF files only). Details and the sign-in rule: `plan/notes/yt-YT-2.md`.
+since MCP `run` takes ELF files only). Details and the sign-in rule: `plan/spec/programs.md` §2.2.
 Started while the desktop runs (e.g. in a foot terminal) it goes on in the background, ends bitscomp through
 its control socket, runs Cobalt and starts bitscomp again with the same arguments and environment. The
 sign-in is kept as one file, `\BITSOS2\home\cobalt_files.tar` (plus `.old`, the copy before).
-`cobalt --stats` prints the A/V numbers of the running or last session (YT-5, `plan/notes/yt-YT-5.md`).
+`cobalt --stats` prints the A/V numbers of the running or last session (YT-5, `plan/spec/programs.md` §2.3).
 Cobalt never runs as root (YT-6): started by root (the console shell, a terminal of a desktop started from the
 console) the launcher hands it to uid 1000 with BusyBox `chpst -u 1000:1000` and says so; its run directory is
 `/run/user/1000/cobalt`, and root makes or writes nothing in it itself (every step there runs as uid 1000; the
 desktop's start line stays in a root-only `mktemp -d` directory). If root cannot hand over it refuses in German and English (`COBALT_ALLOW_ROOT=1` runs it
-as root anyway, for diagnosis). Scenario: `host/tests/yt/30-root.sh`; notes `plan/notes/yt-YT-6.md`.
+as root anyway, for diagnosis). Scenario: `host/tests/yt/30-root.sh`; Mini-PC check list `plan/guides/cobalt.md`.
 Formats on BitsOS: video up to 1920x1080 (either orientation), SDR only, no AC-3/E-AC-3 (patch 0007).

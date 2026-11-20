@@ -1,5 +1,5 @@
-//! Signal state of a thread group (AB-3 basics, AB-6 delivery), with Linux 6.6's rules
-//! (linux-6.6/kernel/signal.c). Pure: host tests drive `Signals` directly; `crate::deliver` runs it on the
+//! Signal state of a thread group (AB-3 basics, AB-6 delivery), with Linux 7.3.1's rules
+//! (linux-7.3.1/kernel/signal.c). Pure: host tests drive `Signals` directly; `crate::deliver` runs it on the
 //! threads and `hal::signal_frame` builds the frames.
 //!
 //! What the group keeps under one lock (`proc.signals`, Linux's `sighand->siglock`):
@@ -31,7 +31,7 @@ pub use info::*;
 pub use state::*;
 pub use uapi::ab::sigabi::*;
 
-/// What a signal's default action is (`SIG_KERNEL_*_MASK` in linux-6.6/include/linux/signal.h:380).
+/// What a signal's default action is (`SIG_KERNEL_*_MASK` in linux-7.3.1/include/linux/signal.h:419).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefaultAction {
     Terminate,

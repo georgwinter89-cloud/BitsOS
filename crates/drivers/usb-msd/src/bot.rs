@@ -1,13 +1,13 @@
 //! USB Mass Storage Bulk-Only Transport 1.0: command block wrapper out, data, command status wrapper in, and
 //! reset recovery when that fails. The rules follow Linux `drivers/usb/storage/transport.c`
-//! (`usb_stor_Bulk_transport` linux-6.6/drivers/usb/storage/transport.c:1115-1331, `interpret_urb_result` :256,
-//! `usb_stor_reset_common` :1347) and V1 `usb/msdbot.asm` / `usb/msdreset.asm`:
+//! (`usb_stor_Bulk_transport` linux-7.3.1/drivers/usb/storage/transport.c:1111-1343, `interpret_urb_result` :256,
+//! `usb_stor_reset_common` :1359) and V1 `usb/msdbot.asm` / `usb/msdreset.asm`:
 //!
 //! - data that came before a STALL counts; the stalled endpoint is cleared and the CSW read (BOT 6.7.2);
 //! - an empty packet where the CSW should be is read once more (devices that add a zero-length packet after
 //!   data of whole packets), a stalled CSW is cleared and read once more (BOT 5.3.3);
 //! - a 13-byte "USBS" answer with this command's tag in the data phase of an IN command means the device skipped
-//!   the data phase (Linux "Device skipped data phase");
+//!   the data phase (Linux "Device skipped data phase"); its bytes in the data buffer are zeroed (:1205-1219);
 //! - a CSW with another tag, a status above 2, a learnt signature that changes, a phase error (status 2), a
 //!   short CSW, a failed CBW or data phase other than a STALL, a timeout: transport error -> reset recovery
 //!   (Bulk-Only Mass Storage Reset, then CLEAR_FEATURE(HALT) on bulk IN and bulk OUT, each with the host side
@@ -26,7 +26,7 @@ use usb_core::{Buffer, Request, UsbError, XferResult};
 pub const CBW_SIGNATURE: [u8; 4] = *b"USBC";
 pub const CSW_SIGNATURE: [u8; 4] = *b"USBS";
 /// How long the device gets after a Bulk-Only reset before its endpoints are cleared. Linux waits up to 6 s
-/// (transport.c:1371, a conservative margin for slow bridges); V1 did not wait at all and never needed to.
+/// (transport.c:1383, a conservative margin for slow bridges); V1 did not wait at all and never needed to.
 pub const RESET_SETTLE_NS: u64 = 100_000_000;
 /// TEST UNIT READY after a reset: its status phase's time (with the CBW's 5 s: Linux's 10 s for that command).
 const ANSWER_CSW_NS: u64 = 5_000_000_000;
@@ -336,6 +336,10 @@ impl<L: Link> Bot<L> {
                                     "the device sent its CSW in place of the data");
                                 moved = 0;
                                 status = Some(b);
+                                // The CSW is not data: no reader of the buffer may see it.
+                                if !req.buf.write(req.offset, &[0u8; 13]) {
+                                    klog::event!(Debug, "usb", "msd.skipped_data_clear_failed", device = self.name(), tag = tag);
+                                }
                             }
                         }
                     }

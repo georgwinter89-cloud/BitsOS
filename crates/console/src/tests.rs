@@ -552,7 +552,9 @@ fn monitor_splits_and_refuses_injected_physical_commands() {
 /// The QEMU screendump scenario (`host/tests/in/20-console.sh`): the PPM QEMU wrote equals the model's picture of
 /// the expected screen, pixel for pixel. Inputs from the environment: `BITSOS_SCREENDUMP` (P6 PPM),
 /// `BITSOS_SCREEN_EXPECT` (one row per line: `attr<TAB>text` segments separated by TABs; first line
-/// `face cursor_col cursor_row`). Ignored in normal runs.
+/// `face cursor_col cursor_row`). Decision: ignored in the host tests because its input is the PPM a QEMU boot
+/// writes; it runs in host/tests/in/20-console.sh (console_check.py), which only fullrun starts so far (no gate
+/// class names in/20: plan/notes/desk-offen.md).
 #[test]
 #[ignore]
 fn screendump_matches_model() {

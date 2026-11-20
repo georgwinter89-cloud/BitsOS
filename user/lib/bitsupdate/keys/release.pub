@@ -1,0 +1,3 @@
+# The desk's release key (Ed25519, public half; fingerprint 611f 75b7 c9ac 1066), compiled into BitsOS by build.rs.
+# Made by cargo xtask update-release; the private half lives only in ~/.config/bitsos-release/ on the desk host.
+ee18b873eb0309dd95e7e170b3bf2dc495b4b99b85e922aef37eea299b675fb8

@@ -1,0 +1,165 @@
+access.enabled		true	BitsOS merkt sich, welches Programm welche Ordner, Geräte und Netzadressen benutzt hat (bleibt auf diesem Rechner)
+access.ignore			Programme, die „Wer hat was gemacht“ nicht aufschreibt (Name oder Pfad, mehrere mit ; trennen)
+access.keep_days		30	So viele Tage hebt „Wer hat was gemacht“ auf
+access.max_mb	*	200	So viele MB darf „Wer hat was gemacht“ auf /data höchstens belegen (die ältesten Tage gehen zuerst)
+ai.assistant.name		Claude	Name des Assistenten
+ai.cloud_notice		true	Am Ring zeigen, wenn etwas aus deinen Dateien an einen Anbieter in der Cloud geht („geht an …“)
+ai.level	*	auto	Wie viel der Assistent darf: nur antworten, vorher fragen oder alles im Automodus
+ai.local_only		false	Nur lokal: kein Anbieter in der Cloud wird angesprochen
+ai.max_tokens		64000	Längste Antwort (nur für Anbieter, die eine Grenze verlangen)
+ai.mcp.ask_tools		true	Dürfen andere Programme über „assist --mcp“ auch Werkzeuge benutzen, die etwas ändern (das Programm fragt dich dann selbst, BitsOS fragt nicht mehr)
+ai.provider.abo.address	*	/data/home/1000/claude-code/claude-abo	Anbieter abo: Adresse (http:// nur lokal im Heimnetz; bei der Art program der volle Pfad des Hilfsprogramms)
+ai.provider.abo.key		***	Anbieter abo: Schlüssel (wird nie angezeigt)
+ai.provider.abo.kind	*	program	Anbieter abo: welche Schnittstelle er spricht
+ai.provider.abo.model	*	sonnet	Anbieter abo: Name des Modells
+ai.provider.abo.place	*	cloud	Anbieter abo: läuft in der Cloud oder lokal (das legst du fest)
+ai.providers	*	abo	Namen der eingerichteten KI-Anbieter, durch Kommas getrennt. Ein neuer Name legt einen Anbieter an; ein gestrichener Name entfernt ihn mit seinen Angaben und seinem Schlüssel
+ai.retries		2	Wie oft eine Anfrage wiederholt wird, wenn der Anbieter überlastet ist oder um eine Pause bittet
+ai.role.chat	*	abo	Welcher Anbieter im Gespräch antwortet (leer: keiner)
+ai.role.chat_fallback			Ersatz für das Gespräch, wenn der erste Anbieter nicht erreichbar ist: Namen der Reihe nach, durch Kommas getrennt (leer: keiner)
+ai.timeout_s		600	Wie lange eine Antwort des Anbieters höchstens dauern darf
+ai.tool_rounds		20	Wie viele Werkzeug-Runden der Assistent je Frage höchstens macht
+assistant.never_see			Bei diesen Programmen sieht der Assistent nie etwas
+assistant.sidebar_sees		true	In der Seitenleiste das Fenster vorne mitsehen
+context.claude.allow_forget		false	Eine KI darf den Kontextdienst Dinge vergessen lassen (sonst nur Georg selbst)
+context.claude.snippet_chars		200	So viele Zeichen Textausschnitt bekommt eine KI je gefundenem Dokument (0: keinen, nur Titel und Ort)
+context.embedder.kind		local	Wie der Kontextdienst nach Bedeutung sucht (nie über das Internet)
+context.embedder.threads		auto	So viele Rechenkerne darf das Sprachmodell beim Einlesen nutzen (auto: die Hälfte)
+context.enabled		true	Der Kontextdienst durchsucht die genannten Ordner, damit Suche und Assistent Dokumente finden
+context.excludes		.ssh;.gnupg;*.kdbx;*.pem;*.key;node_modules;.git;*.tmp;.mozilla;BraveSoftware;google-chrome;chromium;.cache;.Trash-*;lost+found	Namen, die der Kontextdienst nie liest (mit ; trennen, * steht für beliebige Zeichen)
+context.index.max_file_mb		64	Größere Dateien (MB) lässt der Kontextdienst aus
+context.index.max_files		100000	Höchstens so viele Dateien liest der Kontextdienst ein (mehr braucht zu viel Arbeitsspeicher)
+context.index.rescan_minutes		10	Zur Sicherheit sieht der Kontextdienst alle so viele Minuten alle Ordner ganz durch
+context.index.watch		true	Neue, geänderte und gelöschte Dateien sofort bemerken (sonst erst beim nächsten Durchsehen)
+context.index.workers		2	So viele Dateien liest der Kontextdienst gleichzeitig
+context.private_roots			Private Ordner: werden durchsucht und auf dem Bildschirm gezeigt, gehen aber nie an eine KI (mehrere mit ; trennen)
+context.roots	*	/home	Ordner, die der Kontextdienst durchsucht (mehrere mit ; trennen). Leer: er durchsucht nichts
+desktop.absicht.arbeitsraum-1			Absicht des Arbeitsraums „Arbeitsraum 1“ (Überschrift auf der Bühne; leer: keine)
+desktop.durchblick.programs		true	Durchblick liest auch die Knöpfe und Felder fremder Programme (Brave, LibreOffice, Steam), nur auf diesem Rechner; gilt für Programme, die danach starten
+desktop.favourites		programm/terminal, einstellungen/aussehen	Favoriten: Adressen, durch Kommas getrennt
+durchblick.pad		select_y	Gamepad-Tasten für den Assistenten als Popup
+durchblick.taste		win_f1	Taste für den Assistenten als Popup
+gewohnheiten.auswahl		true	Lernen: Was du oft auswählst
+gewohnheiten.breite		true	Lernen: Kachelbreite je Programm
+gewohnheiten.dateien		true	Lernen: Dateien, die zusammengehören
+gewohnheiten.enabled		true	BitsOS merkt sich, wie du es benutzt, und macht Kleinigkeiten nach (alles bleibt auf diesem Rechner)
+gewohnheiten.fenster		true	Lernen: Fenstergröße je Programm
+gewohnheiten.sofa		true	Lernen: Sofa-Modus
+gewohnheiten.suche		true	Lernen: Suchgedächtnis
+gewohnheiten.ton		true	Lernen: Ton je Programm
+gewohnheiten.zeiten		true	Lernen: Uhrzeiten, zu denen du Programme startest
+gewohnheiten.zusammen		true	Lernen: Programme, die du zusammen startest
+journal.enabled		true	Das Journal hebt Ereignisse und Messwerte auf /data auf (Wochen zurück)
+journal.keep_days		60	So viele Tage bleiben Ereignisse und Messwerte im Journal
+journal.max_mb	*	400	So viele MB darf das Journal auf /data höchstens belegen (die ältesten gehen zuerst)
+journal.metrics_s		60	Messwerte im Journal: ein Mittelwert alle so viele Sekunden
+kernel.console_font		noto	Schrift der Textkonsole
+kernel.console_log	*	info	Welche Kernmeldungen die Konsole zeigt
+kernel.idle		deep	Wie tief untätige Prozessorkerne schlafen
+kernel.loglevel	*	error	Wie viel der Kern protokolliert
+kernel.preload.enabled		true	Programme nach dem Hochfahren vorladen (merkt sich, was sie beim Start lesen)
+kernel.preload.max_mb	*	1000	So viel liest das Vorladen nach jedem Hochfahren höchstens (alles = so viel freier Speicher da ist; 0 = angehalten)
+kernel.snd_output	*	hdmi	Wo der Ton spielt (auto folgt den Steckern; hdmi schaltet HDMI-Ton ein)
+pkg.cpu_level	*	znver4	Fassung der CachyOS-Programme für diesen Prozessor (v3 läuft auf allen modernen CPUs)
+pkg.optional.ask		true	Vor dem Installieren die Zusätze (optionale Teile) zur Auswahl zeigen
+pkg.sources.cachyos-core-znver4.keyring		cachyos	Schlüsselbund, der cachyos-core-znver4 prüft
+pkg.sources.cachyos-core-znver4.servers		include:cachyos-v4-mirrorlist	Server der Quelle cachyos-core-znver4 (Adressen mit $repo und $arch, oder include:<Spiegelliste>)
+pkg.sources.cachyos-core-znver4.sig_db		required	Signatur der Datenbank von cachyos-core-znver4
+pkg.sources.cachyos-core-znver4.sig_pkg		required	Signatur der Pakete von cachyos-core-znver4 (immer Pflicht)
+pkg.sources.cachyos-extra-znver4.keyring		cachyos	Schlüsselbund, der cachyos-extra-znver4 prüft
+pkg.sources.cachyos-extra-znver4.servers		include:cachyos-v4-mirrorlist	Server der Quelle cachyos-extra-znver4 (Adressen mit $repo und $arch, oder include:<Spiegelliste>)
+pkg.sources.cachyos-extra-znver4.sig_db		required	Signatur der Datenbank von cachyos-extra-znver4
+pkg.sources.cachyos-extra-znver4.sig_pkg		required	Signatur der Pakete von cachyos-extra-znver4 (immer Pflicht)
+pkg.sources.cachyos-znver4.keyring		cachyos	Schlüsselbund, der cachyos-znver4 prüft
+pkg.sources.cachyos-znver4.servers		include:cachyos-v4-mirrorlist	Server der Quelle cachyos-znver4 (Adressen mit $repo und $arch, oder include:<Spiegelliste>)
+pkg.sources.cachyos-znver4.sig_db		required	Signatur der Datenbank von cachyos-znver4
+pkg.sources.cachyos-znver4.sig_pkg		required	Signatur der Pakete von cachyos-znver4 (immer Pflicht)
+pkg.sources.cachyos.keyring		cachyos	Schlüsselbund, der cachyos prüft
+pkg.sources.cachyos.servers		include:cachyos-mirrorlist	Server der Quelle cachyos (Adressen mit $repo und $arch, oder include:<Spiegelliste>)
+pkg.sources.cachyos.sig_db		required	Signatur der Datenbank von cachyos
+pkg.sources.cachyos.sig_pkg		required	Signatur der Pakete von cachyos (immer Pflicht)
+pkg.sources.core.keyring		archlinux	Schlüsselbund, der core prüft
+pkg.sources.core.servers		include:mirrorlist	Server der Quelle core (Adressen mit $repo und $arch, oder include:<Spiegelliste>)
+pkg.sources.core.sig_db		optional	Signatur der Datenbank von core
+pkg.sources.core.sig_pkg		required	Signatur der Pakete von core (immer Pflicht)
+pkg.sources.extra.keyring		archlinux	Schlüsselbund, der extra prüft
+pkg.sources.extra.servers		include:mirrorlist	Server der Quelle extra (Adressen mit $repo und $arch, oder include:<Spiegelliste>)
+pkg.sources.extra.sig_db		optional	Signatur der Datenbank von extra
+pkg.sources.extra.sig_pkg		required	Signatur der Pakete von extra (immer Pflicht)
+pkg.sources.order		cachyos-$level cachyos-extra-$level cachyos-core-$level cachyos core extra	Quellen in ihrer Reihenfolge (die erste mit einem Namen gewinnt)
+pkg.space.max_gb		auto	Höchstens so viel Platz dürfen Programme auf /data belegen (auto: die Hälfte von /data)
+pkg.updates.check		daily	Wie oft nach Aktualisierungen geschaut wird (es wird nur nachgesehen, nichts installiert)
+pkg.updates.install		ask	Was mit gefundenen Aktualisierungen geschieht
+settings.history_keep	*	10	Wie viele Änderungen das Journal aufhebt
+settings.language		de	Sprache der Beschreibungen
+snap.daily_days		30	So viele Tage bleibt eine Sicherung pro Tag
+snap.enabled	*	false	Sicherungen von /data alle paar Minuten
+snap.hourly_days		7	So viele Tage bleibt eine Sicherung pro Stunde
+snap.interval_min		5	Alle wie viele Minuten /data gesichert wird
+snap.keep_all_hours		24	So viele Stunden bleibt jede Sicherung
+snap.min_free_pct		25	Unter so viel Prozent freiem Platz gehen die ältesten zuerst, bis 5 Prozent mehr frei sind
+snap.weekly_months		6	So viele Monate bleibt eine Sicherung pro Woche
+sofa.home_chord		select_start	Home-Taste für Gamepads ohne Home: Select und Start zusammen
+sofa.motion		true	Kacheln heben sich, wenn sie gewählt sind
+sofa.overscan		100	Bildausschnitt für Fernseher, die den Rand abschneiden
+sofa.pad.map			Gelernte Tastenbelegung (vendor:product=a:b2,b:b1,...)
+sofa.sort		zuletzt	Sortierung der Bibliothek
+sofa.start_on_pad		true	Im Sofa-Modus starten, sobald ein Gamepad eingeschaltet wird
+sofa.start_volume		20	Lautstärke beim Start (nur wenn sie höher ist)
+theme.accent		#7fcfa0	Akzentfarbe für hell und dunkel (Standard Moos: folgt dem Modus)
+theme.cursor.size	*	30	Größe des Mauszeigers
+theme.dark.accent		#7fcfa0	Eigene Akzentfarbe des Modus (dunkel)
+theme.dark.accent_soft		#1f3a2c	Akzent, sanft (hinter Ausgewähltem) (dunkel)
+theme.dark.bg		#121a16	Hintergrund (dunkel)
+theme.dark.border		#2b3731	Rahmenlinien (dunkel)
+theme.dark.claude		#7fcfa0	Farbe des Assistenten (dunkel)
+theme.dark.kontext_1		#d9765b	Kontextfarbe 1 (dunkel)
+theme.dark.kontext_2		#e3bd5f	Kontextfarbe 2 (auch: wartet) (dunkel)
+theme.dark.kontext_3		#86afd9	Kontextfarbe 3 (dunkel)
+theme.dark.line_strong		#6b7a71	Kräftige Linien (dunkel)
+theme.dark.on_accent		#0f1712	Text auf dem Akzent (dunkel)
+theme.dark.on_kontext		#121a16	Text auf Kontextfarben (dunkel)
+theme.dark.on_terminal		#d5e2da	Terminal-Text (dunkel)
+theme.dark.paper		#1b2520	Gezeigter Reiter (dunkel)
+theme.dark.surface		#1b2520	Leisten und Kacheln (dunkel)
+theme.dark.surface2		#0c120f	Vertiefte Fläche (Felder) (dunkel)
+theme.dark.terminal		#0a0f0c	Terminal-Hintergrund (dunkel)
+theme.dark.text		#e8eee9	Text (dunkel)
+theme.dark.text_dim		#a3b0a8	Nebentext (dunkel)
+theme.dark.warnung		#ff7b6b	Warnungen und Fehler (dunkel)
+theme.font.display		Bricolage Grotesque	Schrift für Überschriften (auch: Figtree, JetBrains Mono, Exo 2)
+theme.font.mono		JetBrains Mono	Schrift für Beschriftungen und Adressen
+theme.font.size	*	16	Grundschriftgröße bei 100 %
+theme.font.ui		Figtree	Schrift der Oberfläche (auch: Exo 2, Bricolage Grotesque, JetBrains Mono)
+theme.glow	*	100	Stärke des holografischen Leuchtens
+theme.layout.address_bar	*	tile	Adresszeile: eine oben oder eine pro Kachel
+theme.layout.claude_sidebar		true	Claudes Seitenleiste rechts zeigen
+theme.layout.favourites_bar		true	Favoritenleiste unter der Adresszeile zeigen
+theme.layout.preset		buehne	Aufbau des Bildschirms: Bühne (Kopfleiste, Bühne, Verlauf) oder klassisch (Leisten wie bisher)
+theme.layout.statusbar		true	Statusleiste unten zeigen
+theme.layout.workspaces_bar	*	false	Liste der Arbeitsräume links zeigen (aus: eingeklappt)
+theme.light.accent		#2f6b4f	Eigene Akzentfarbe des Modus (hell)
+theme.light.accent_soft		#cfe3d6	Akzent, sanft (hinter Ausgewähltem) (hell)
+theme.light.bg		#e3e7e3	Hintergrund (hell)
+theme.light.border		#c3cbc3	Rahmenlinien (hell)
+theme.light.claude		#2f6b4f	Farbe des Assistenten (hell)
+theme.light.kontext_1		#e2694b	Kontextfarbe 1 (hell)
+theme.light.kontext_2		#f2c14e	Kontextfarbe 2 (auch: wartet) (hell)
+theme.light.kontext_3		#8db9e6	Kontextfarbe 3 (hell)
+theme.light.line_strong		#6f7b71	Kräftige Linien (hell)
+theme.light.on_accent		#fbfcfa	Text auf dem Akzent (hell)
+theme.light.on_kontext		#15201a	Text auf Kontextfarben (hell)
+theme.light.on_terminal		#e8eee9	Terminal-Text (hell)
+theme.light.paper		#fbfcfa	Gezeigter Reiter (hell)
+theme.light.surface		#fbfcfa	Leisten und Kacheln (hell)
+theme.light.surface2		#d5dbd5	Vertiefte Fläche (Felder) (hell)
+theme.light.terminal		#15201a	Terminal-Hintergrund (hell)
+theme.light.text		#15201a	Text (hell)
+theme.light.text_dim		#4e5b52	Nebentext (hell)
+theme.light.warnung		#b3261e	Warnungen und Fehler (hell)
+theme.mode		dark	Helles oder dunkles Design
+theme.motion		medium	Bewegung: mittel, ruhig oder aus
+theme.radius	*	6	Eckenradius von Fenstern und Knöpfen
+theme.scale	*	100	Skalierung der Oberfläche
+theme.scanlines	*	false	Feine Rasterlinien im dunklen Hintergrund (nie über Fenstern)
+theme.spacing	*	2	Grundabstand zwischen Elementen

@@ -4,7 +4,8 @@
 //! blocks with what `show_options` prints for them.
 //!
 //! overlay: `overlay.rs` (lower layers only).
-//! tmpfs, devpts and mqueue are new instances per mount (Linux keeps one mqueue instance per IPC namespace).
+//! tmpfs, devpts and mqueue are new instances per mount (Linux keeps one mqueue instance per IPC namespace). A
+//! devpts instance has its own ptys: console's pty layer makes their numbers and nodes in it (IN-PTY).
 //! proc (SX-3b): a new instance per mount in the mounter's pid namespace (`proc_instance`); hidepid/subset/gid are
 //! checked as Linux and not applied yet (a Warn event names them). sysfs: a new mount shows the boot instance.
 
@@ -12,7 +13,7 @@ use crate::dentry::{Dentry, SuperBlock};
 use crate::inode::{Cred, Data, Inode};
 use crate::Errno;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write;
 use uapi::errno::*;
@@ -242,10 +243,23 @@ pub fn devpts_opts(o: &Opts, who: &Mounter<'_>) -> Result<Devpts, Errno> {
     Ok(d)
 }
 
+/// What a new devpts instance hands the pty layer (Linux's `pts_fs_info`, linux-7.3.1/fs/devpts/inode.c:101): its
+/// super block and root, where its slave nodes are made, and their owner and mode (`mount_opts`). Weak, so the
+/// pty layer never keeps an unmounted tree alive.
+pub struct PtsSuper {
+    pub sb: Weak<SuperBlock>,
+    pub root: Weak<Dentry>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: u32,
+    pub ptmxmode: u32,
+    pub max: Option<u64>,
+}
+
 /// A new devpts instance: its root (0755) and `ptmx` (char 5:2, `ptmxmode`, owned by the namespace's root or
-/// else the mounter; `devpts_fill_super`/`mknod_ptmx`), whose opens go to `ptmx` (the system's pty layer: the
-/// slaves appear in the boot instance until the pty layer knows instances, SX-3a CR to IN).
-pub fn devpts(d: &Devpts, who: &Mounter<'_>, ptmx: Option<Arc<dyn crate::File>>) -> (Arc<SuperBlock>, Arc<Dentry>) {
+/// else the mounter; `devpts_fill_super`/`mknod_ptmx`). `ptmx` makes the node's object from the instance (the pty
+/// layer's own ptmx, which makes its slaves and numbers in this instance: IN-PTY); None: no `ptmx` node.
+pub fn devpts(d: &Devpts, who: &Mounter<'_>, ptmx: &dyn Fn(PtsSuper) -> Option<Arc<dyn crate::File>>) -> (Arc<SuperBlock>, Arc<Dentry>) {
     let sb = SuperBlock::new("devpts");
     let mut s = String::new();
     if let Some(u) = d.uid {
@@ -261,7 +275,8 @@ pub fn devpts(d: &Devpts, who: &Mounter<'_>, ptmx: Option<Arc<dyn crate::File>>)
     sb.set_options(&s);
     let root = Inode::new(sb.next_ino(), uapi::S_IFDIR | 0o755, Cred::ROOT, Data::Dir);
     let top = Dentry::new_root(sb.clone(), root);
-    if let Some(f) = ptmx {
+    let inst = PtsSuper { sb: Arc::downgrade(&sb), root: Arc::downgrade(&top), uid: d.uid, gid: d.gid, mode: d.mode, ptmxmode: d.ptmxmode, max: d.max };
+    if let Some(f) = ptmx(inst) {
         let (uid, gid) = who.ns_root.unwrap_or((who.fsuid, who.fsgid));
         let _g = sb.lock_names();
         if let Err(e) = top.create_child(b"ptmx", uapi::S_IFCHR | d.ptmxmode, Cred { uid, gid }, Data::Device(f)) {
@@ -269,6 +284,30 @@ pub fn devpts(d: &Devpts, who: &Mounter<'_>, ptmx: Option<Arc<dyn crate::File>>)
         }
     }
     (sb, top)
+}
+
+/// `devpts_acquire` (linux-7.3.1/fs/devpts/inode.c:181) with `devpts_ptmx_path` (:113) and `path_pts`
+/// (fs/namei.c:3612): the devpts file system a ptmx opened at `at` makes its pty in. A ptmx on devpts (`pts/ptmx`, or
+/// a bind of it onto `/dev/ptmx`) is its own instance's; any other (`/dev/ptmx` of devtmpfs, a mknod'd 5:2)
+/// takes the devpts mounted on `pts` in its own directory. ENOENT: no `pts` there; ENODEV: `pts` is not the root
+/// of a devpts mount.
+pub fn devpts_for_ptmx(at: &crate::Path) -> Result<Arc<SuperBlock>, Errno> {
+    if at.mnt.sb.fstype == "devpts" {
+        return Ok(at.mnt.sb.clone());
+    }
+    devpts_ptmx_path(at).map(|p| p.mnt.sb.clone())
+}
+
+/// `devpts_ptmx_path`: the root of the devpts mounted on `pts` next to `at` (ENOENT, ENODEV as above).
+pub fn devpts_ptmx_path(at: &crate::Path) -> Result<crate::Path, Errno> {
+    // `dget_parent`: the directory within the same mount (no step out of a mount root).
+    let parent = at.dentry.parent().unwrap_or_else(|| at.dentry.clone());
+    let child = parent.child(b"pts").ok_or(ENOENT)?;
+    let pts = crate::mount_ns::cross_down(crate::Path { mnt: at.mnt.clone(), dentry: child });
+    if pts.mnt.sb.fstype != "devpts" || !Arc::ptr_eq(&pts.dentry, &pts.mnt.root) || pts.dentry.parent().is_some() {
+        return Err(ENODEV);
+    }
+    Ok(pts)
 }
 
 /// A new mqueue instance (`mqueue_fill_super`): an empty 1777 directory owned by the mounter; no options.

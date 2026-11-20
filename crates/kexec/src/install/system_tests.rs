@@ -180,7 +180,7 @@ fn running_line(t: &str) -> String {
     t.lines().find(|l| l.starts_with("running: ")).map(String::from).unwrap_or_default()
 }
 
-/// RB-11 (desk-minipc-w13 FAIL 5): a TRY generation that confirmed itself in this boot is named as `reboot` and
+/// RB-11 (found on the Mini-PC, 23.10.): a TRY generation that confirmed itself in this boot is named as `reboot` and
 /// `hw_info` name it, from the listing's own OK marker.
 #[test]
 fn a_try_generation_confirmed_in_this_boot_is_named_so() {
@@ -207,7 +207,7 @@ fn a_try_generation_confirmed_in_this_boot_is_named_so() {
     }
 }
 
-/// RB-11 (desk-minipc-w13 follow-up 4): after a URL Reload from pinned generation 20 into generation 21's kernel
+/// RB-11 (found on the Mini-PC, 23.10.): after a URL Reload from pinned generation 20 into generation 21's kernel
 /// the record still says 20; the handed-on kernel id names 21.
 #[test]
 fn the_running_kernel_is_named_by_its_kernel_id() {

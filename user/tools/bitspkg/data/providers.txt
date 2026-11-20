@@ -1,0 +1,11 @@
+# Which package bitspkg takes when several packages provide one dependency (plan 1.5; pacman asks the user here,
+# pacman/lib/libalpm/deps.c resolvedep, BitsOS does not). One rule per line: `DEPENDENCY -> PACKAGE` or
+# `DEPENDENCY -> newest GLOB` (among the providers whose name matches GLOB, the one providing the highest version).
+# A dependency not listed here, or whose listed package cannot satisfy it, gets the provider of the program's
+# previous version, else the first provider in repository order (pacman --noconfirm).
+vulkan-driver -> vulkan-radeon
+opengl-driver -> mesa
+ttf-font -> noto-fonts
+java-runtime -> newest jre*-openjdk
+libgl -> mesa
+sh -> bash

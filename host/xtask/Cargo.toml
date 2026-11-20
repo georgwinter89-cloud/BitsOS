@@ -8,6 +8,10 @@ description = "Host build/test tool: build, image, qemu (with refusals), test, f
 bootinfo = { path = "../../crates/bootinfo" }
 # release-assets packs with the installer's own tar, manifest and VENDOR.txt code, so both read the same format.
 bitsos-install = { path = "../installer" }
+# UPDATE: update-release checks the version mark (bitsver) and the disk guard's mark (gp-platform) in the
+# stripped kernel; the initramfs gets etc/bitsos/version.
+bitsver = { path = "../../crates/bitsver" }
+gp-platform = { path = "../../crates/gp-platform" }
 
 [dev-dependencies]
 # ledger.rs: the ledger's reading of a class against the kernel's rule.

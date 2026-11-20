@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use ksync::SpinLock;
 
 fn wire(g: &Gpu) -> Result<Wire, String> {
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs))?;
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs))?;
     let d = disc::parse(&found.bytes).map_err(|w| format!("no discovery table: {w}"))?;
     let smu = Addrs::from_discovery(&d).ok_or("no MP1 or NBIF bases")?;
     let gc = GcAddrs::from_discovery(&d).ok_or("no GC bases")?;
@@ -28,8 +28,7 @@ fn wire(g: &Gpu) -> Result<Wire, String> {
 }
 
 /// Beside the node's start: clocks by load, GFXOFF, the hook. Nothing here can fail the node.
-pub fn start(gpu: &Arc<HardwareGpu>) {
-    let Some(g) = Gpu::get() else { return };
+pub fn start(g: &'static Gpu, gpu: &Arc<HardwareGpu>) {
     let w = match wire(g) {
         Ok(w) => w,
         Err(why) => {
@@ -38,11 +37,11 @@ pub fn start(gpu: &Arc<HardwareGpu>) {
         }
     };
     if let Some(d) = gpu.start_dpm(w, DpmCfg { thread: true }) {
-        if HOOK.point(w, d.flags()) {
-            devmodel::register_quiesce(Arc::new(DpmQuiesce { regs: g.regs }));
+        if g.hw().dpm_hook.point(w, d.flags()) {
+            devmodel::register_quiesce(Arc::new(DpmQuiesce { regs: g.regs, hook: &g.hw().dpm_hook }));
         }
         // The run that started the backend entered with no block to hold: it holds it from here on.
-        crate::hw::live::TOOL.hold(d.awake());
+        g.hw().tool.hold(d.awake());
     }
 }
 
@@ -70,13 +69,11 @@ impl Hw for Raw {
     }
 }
 
-/// What the boot's one hook works on: the last start's.
+/// What a device's one hook works on: the last start's (`hw::live::Slots::dpm_hook`).
 pub(crate) struct Hook {
     hooked: AtomicBool,
     now: SpinLock<Option<(Wire, Arc<Flags>)>>,
 }
-
-static HOOK: Hook = Hook::new();
 
 impl Hook {
     pub(crate) const fn new() -> Hook {
@@ -102,6 +99,7 @@ impl Hook {
 
 struct DpmQuiesce {
     regs: &'static DcnRegs,
+    hook: &'static Hook,
 }
 
 impl devmodel::Quiesce for DpmQuiesce {
@@ -109,7 +107,7 @@ impl devmodel::Quiesce for DpmQuiesce {
         "amdgpu.dpm"
     }
     fn quiesce(&self) {
-        HOOK.run(&mut Raw(self.regs));
+        self.hook.run(&mut Raw(self.regs));
     }
 }
 

@@ -10,7 +10,7 @@
 //!
 //! NW-4: receive and transmit completions arrive by MSI-X (two vectors: link and queue 0, Linux igc's layout),
 //! else MSI (V1's measured EICR/EIMS rules), through PC-3's `alloc_irqs`; the hard-IRQ hook wakes the stack's
-//! poll thread, which reads the ring and re-arms the vector (NAPI). Without vectors (or with CONFIG `net_irq=off`)
+//! poll thread, which reads the ring and re-arms the vector (NAPI). Without vectors
 //! the card is polled by the stack as at M0 (logged). Housekeeping (link look, health, restarts) stays on one
 //! poller for every card. Restarts (seconds in the worst case: PHY semaphore, resets) run on the `igc.restart`
 //! worker thread (class KernelRt) with sleeping waits, not in the poller, which the idle thread shares with every
@@ -57,7 +57,7 @@ static MATCHES: [pci::Match; 2] = [
     pci::Match::Id { vendor: regs::VENDOR_INTEL, device: regs::DEV_82576 },
 ];
 
-pci::pci_driver!(pci::DriverEntry { name: "igc", matches: &MATCHES, opt_in_key: None, probe });
+pci::pci_driver!(pci::DriverEntry { name: "igc", matches: &MATCHES, probe });
 
 struct Entry {
     card: Arc<Igc>,
@@ -117,18 +117,10 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
     Ok(())
 }
 
-/// CONFIG: `net_irq=off` keeps every card polled (a way back if MSI-X misbehaves on a machine);
-/// `igc_itr_us=<n>` sets the queue vector's gap between interrupts (default 49 µs, about 20,000 a second).
+/// The card's settings: the defaults (the queue vector's gap between interrupts is Linux's 49 µs, about 20,000 a
+/// second; no CONFIG line changes it).
 fn config() -> Config {
-    let mut c = Config::default();
-    if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-        c.irqs = false;
-    }
-    if let Some(us) = net::config("igc_itr_us").and_then(|v| v.trim().parse::<u32>().ok()) {
-        // EITR's interval field holds up to 8191 µs; 0 would turn moderation off (an interrupt per frame).
-        c.itr_us = us.clamp(1, 8191);
-    }
-    c
+    Config::default()
 }
 
 /// Cards that came up for the first time join the stack's device list. False if the list was busy (the next

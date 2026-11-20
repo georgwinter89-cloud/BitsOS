@@ -1,9 +1,9 @@
 //! AB-7a: the per-process part of /proc (moved here from FS-2's `vfs-sys/src/procpid.rs`, content providers
 //! belong to their owners): `/proc/self`, `/proc/thread-self`, `/proc/<pid>` and `/proc/<pid>/task/<tid>` with
-//! the files of linux-6.6/fs/proc/base.c `tgid_base_stuff`/`tid_base_stuff` that programs read (in the
+//! the files of linux-7.3.1/fs/proc/base.c:3282 `tgid_base_stuff`/:3641 `tid_base_stuff` that programs read (in the
 //! table's order): task, fd, fdinfo, environ, auxv, status, personality, limits, comm, cmdline, stat, statm,
-//! maps, mem, cwd, root, exe, mounts, mountinfo, smaps, smaps_rollup, cgroup, oom_score, oom_score_adj. The framework
-//! is FS's `vfs::synth`.
+//! maps, mem, cwd, root, exe, mounts, mountinfo, smaps, smaps_rollup, pagemap, cgroup, oom_score, oom_score_adj.
+//! The framework is FS's `vfs::synth`.
 //!
 //! A directory holds its thread group weakly (`Weak<Group>`; the image is asked for at each read, so an execve
 //! or the leader's end never orphans it); an ended and reaped process answers ESRCH. Access to another
@@ -22,16 +22,24 @@ mod maps;
 mod mem;
 mod mounts;
 mod ns;
+mod pagemap;
+mod pagemap_ktests;
 mod pagetypeinfo;
+mod power_supply;
 mod stat;
+mod sys_block;
 mod sys_cache;
 mod sys_cpu;
+mod sys_cpufreq;
+mod sys_dmi;
 mod sys_net;
+mod sys_usb;
 mod sysctl;
 mod sysv;
 mod sysfs;
 mod system;
 mod text;
+mod tree;
 mod vmstat;
 #[cfg(test)]
 mod tests;
@@ -53,7 +61,7 @@ const PID_COOKIE: u64 = 16;
 
 /// The process part of one proc instance: the pid namespace it was mounted in (SX-3b; the boot /proc has the
 /// initial one). Directory names, `self`, `thread-self` and the ids inside are that namespace's numbers
-/// (linux-6.6/fs/proc/base.c `proc_pid_lookup`/`proc_pid_readdir` with `proc_pid_ns(sb)`).
+/// (linux-7.3.1/fs/proc/base.c:3474 `proc_pid_lookup`/:3557 `proc_pid_readdir` with `proc_pid_ns(sb)`).
 struct PidRoot {
     ns: Arc<PidNs>,
 }
@@ -64,21 +72,21 @@ fn pid_dir(ns: &Arc<PidNs>, g: &Arc<Group>, p: &Process, tid: u32) -> Option<Syn
     Some(owned(SynthEntry::dir(&format!("{nr}"), Arc::new(PidDir(t))), p, true).cookie(PID_COOKIE + nr as u64).immutable())
 }
 
-/// `/proc/self` (linux-6.6/fs/proc/self.c): the reader's pid in the instance's namespace; missing for a reader
+/// `/proc/self` (linux-7.3.1/fs/proc/self.c:11): the reader's pid in the instance's namespace; missing for a reader
 /// the namespace does not number (Linux: the link reads ENOENT) and for kernel threads.
 fn self_link(ns: &PidNs) -> Option<SynthEntry> {
     let nr = ns.nr(proc::current()?.pid)?;
     Some(SynthEntry::link("self", &format!("{nr}")).cookie(SELF_COOKIE))
 }
 
-/// `/proc/thread-self` (linux-6.6/fs/proc/thread_self.c): `<pid>/task/<tid>` of the reader.
+/// `/proc/thread-self` (linux-7.3.1/fs/proc/thread_self.c:11): `<pid>/task/<tid>` of the reader.
 fn thread_self_link(ns: &PidNs) -> Option<SynthEntry> {
     let t = proc::current_thread()?;
     let (tgid, tid) = (ns.nr(t.group().tgid)?, ns.nr(t.tid())?);
     Some(SynthEntry::link("thread-self", &format!("{tgid}/task/{tid}")).cookie(THREAD_SELF_COOKIE))
 }
 
-/// `/proc/mounts` -> `self/mounts` (linux-6.6/fs/proc/root.c:291 `proc_symlink("mounts", NULL, "self/mounts")`),
+/// `/proc/mounts` -> `self/mounts` (linux-7.3.1/fs/proc/root.c:383 `proc_symlink("mounts", NULL, "self/mounts")`),
 /// there for every reader (a kernel thread's lookup through it fails at `self`).
 fn mounts_link() -> SynthEntry {
     SynthEntry::link("mounts", "self/mounts").cookie(MOUNTS_COOKIE)
@@ -166,11 +174,15 @@ impl Target {
     }
 }
 
-/// AB-13: who owns a process's /proc entries (linux-6.6/fs/proc/base.c `task_dump_owner`): its euid and egid;
-/// a file (not the r-x pid/tid directories) of a process that is not dumpable is root's.
+/// AB-13: who owns a process's /proc entries (linux-7.3.1/fs/proc/base.c:1862 `task_dump_owner`): its euid and egid;
+/// a file (not the r-x pid/tid directories) of a process that is not dumpable, ended or not (the dumpable flag is
+/// the image's, Linux's `task_exec_state`), belongs to the root of the user namespace of its execve
+/// (`exec_user_ns`; global root when that namespace maps no 0).
 pub(super) fn owned(e: SynthEntry, p: &Process, dir: bool) -> SynthEntry {
-    if !dir && !p.is_finished() && p.mm_flags.dumpable() != 1 {
-        return e.owner(0, 0);
+    if !dir && p.mm_flags.dumpable() != 1 {
+        use proc::ns::user::MapKind;
+        let ns = &p.exec_user_ns;
+        return e.owner(ns.to_kernel(MapKind::Uid, 0).unwrap_or(0), ns.to_kernel(MapKind::Gid, 0).unwrap_or(0));
     }
     let c = p.cred();
     e.owner(c.euid, c.egid)
@@ -185,6 +197,24 @@ pub(super) fn may_read_mm(p: &Process) -> bool {
 /// The reader's mount view (paths in links and maps are shown relative to the reader's root, as `d_path`).
 pub(super) fn reader_ns() -> Arc<vfs::MountNs> {
     proc::current().map_or_else(vfs::root_ns, |me| me.mount_ns())
+}
+
+/// SELFOPT-1: `/proc/<pid>/maps` of `p`, for the perf events' MMAP2 records of a new image or a new mapping.
+pub(crate) fn maps_of(p: &Process) -> alloc::string::String {
+    maps::render_maps(p.group(), p)
+}
+
+/// SYS-K: `/proc/<pid>/io`'s seven lines (base.c:3031).
+pub(super) fn io_text(c: sched::ioac::IoCounts) -> alloc::string::String {
+    format!(
+        "rchar: {}\nwchar: {}\nsyscr: {}\nsyscw: {}\nread_bytes: {}\nwrite_bytes: {}\ncancelled_write_bytes: {}\n",
+        c.rchar, c.wchar, c.syscr, c.syscw, c.read_bytes, c.write_bytes, c.cancelled_write_bytes
+    )
+}
+
+/// SYS-K: see `sys_usb::busnum`.
+pub(crate) fn usb_busnum(host: &str, s: usb_core::speed::Speed) -> u32 {
+    sys_usb::busnum(host, s)
 }
 
 pub(super) fn d_path(path: &vfs::Path) -> Vec<u8> {
@@ -214,6 +244,10 @@ pub(super) enum What {
     OomScoreAdj,
     Personality,
     Cgroup,
+    /// SYS-K: `io` (base.c:3002 `do_io_accounting`).
+    Io,
+    /// EINS-C: `bitsos_tree` (BitsOS's own, `tree.rs`).
+    Tree,
 }
 
 #[derive(Clone, Copy)]
@@ -229,6 +263,8 @@ enum Item {
     Link(LinkKind),
     File(What, u32),
     Mem,
+    /// L7-RESTE: `pagemap`, read live like `mem`.
+    Pagemap,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -239,7 +275,7 @@ enum LinkKind {
 }
 
 /// `tgid_base_stuff`'s order (the subset V2 has); `task` only in the process view.
-const ITEMS: [(&str, Item); 30] = [
+const ITEMS: [(&str, Item); 33] = [
     ("task", Item::Task),
     ("fd", Item::Fd),
     ("fdinfo", Item::FdInfo),
@@ -263,13 +299,18 @@ const ITEMS: [(&str, Item); 30] = [
     ("mountinfo", Item::File(What::MountInfo, 0o444)),
     ("smaps", Item::File(What::Smaps, 0o444)),
     ("smaps_rollup", Item::File(What::SmapsRollup, 0o444)),
+    ("pagemap", Item::Pagemap),
     ("cgroup", Item::File(What::Cgroup, 0o444)),
     ("oom_score", Item::File(What::OomScore, 0o444)),
     ("oom_score_adj", Item::File(What::OomScoreAdj, 0o644)),
+    // -r-------- (`ONE("io", S_IRUSR, ..)`, base.c:3366).
+    ("io", Item::File(What::Io, 0o400)),
     ("uid_map", Item::IdMap(ns::MapWhich::Map(proc::ns::user::MapKind::Uid))),
     ("gid_map", Item::IdMap(ns::MapWhich::Map(proc::ns::user::MapKind::Gid))),
     ("projid_map", Item::IdMap(ns::MapWhich::Map(proc::ns::user::MapKind::Projid))),
     ("setgroups", Item::IdMap(ns::MapWhich::Setgroups)),
+    // EINS-C: BitsOS's own, last (Linux has no such file); looked up by name only, never listed (`dir_entries`).
+    ("bitsos_tree", Item::File(What::Tree, 0o644)),
 ];
 
 fn make_entry(t: &Target, p: &Arc<Process>, i: usize, name: &str, item: Item) -> Option<SynthEntry> {
@@ -295,7 +336,7 @@ fn make_entry(t: &Target, p: &Arc<Process>, i: usize, name: &str, item: Item) ->
             e
         }
         Item::Net => {
-            // dr-xr-xr-x (`DIR("net", S_IRUGO|S_IXUGO, ..)`, linux-6.6/fs/proc/base.c; `proc_tgid_net_lookup`
+            // dr-xr-xr-x (`DIR("net", S_IRUGO|S_IXUGO, ..)`, linux-7.3.1/fs/proc/base.c:3289; `proc_tgid_net_lookup`
             // takes the task's namespace). The files show uids as the reader names them, as /proc/net does.
             let net = p.nsset().net.view.clone();
             let ids = net::procnet::Reader::current().ids;
@@ -306,6 +347,8 @@ fn make_entry(t: &Target, p: &Arc<Process>, i: usize, name: &str, item: Item) ->
         Item::IdMap(w) => own(SynthEntry::file(name, 0o644, Arc::new(ns::MapFile::new(t.clone(), w)))),
         Item::Link(k) => own(link_entry(t, p, name, k)),
         Item::Mem => own(SynthEntry::file(name, 0o600, Arc::new(mem::Mem(t.clone())))),
+        // -r-------- (`REG("pagemap", S_IRUSR, ..)`, base.c:3325).
+        Item::Pagemap => own(SynthEntry::file(name, 0o400, Arc::new(pagemap::Pagemap(t.clone())))),
         Item::File(what, perm) => own(SynthEntry::file(name, perm, Arc::new(PidFile { t: t.clone(), what }))),
     })
 }
@@ -361,7 +404,8 @@ fn dir_entries(t: &Target) -> Result<Vec<SynthEntry>, Errno> {
     if !t.whole && t.thread(&g).is_none() {
         return Err(ESRCH);
     }
-    Ok(ITEMS.iter().enumerate().filter_map(|(i, (n, it))| make_entry(t, &p, i, n, *it)).collect())
+    // EINS-C: `bitsos_tree` is found by its name but not listed, so a listing stays Linux's to the byte.
+    Ok(ITEMS.iter().enumerate().filter(|(_, (_, it))| !matches!(it, Item::File(What::Tree, _))).filter_map(|(i, (n, it))| make_entry(t, &p, i, n, *it)).collect())
 }
 
 fn dir_lookup(t: &Target, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
@@ -372,8 +416,9 @@ fn dir_lookup(t: &Target, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
     Ok(ITEMS.iter().enumerate().find(|(_, (n, _))| n.as_bytes() == name).and_then(|(i, (n, it))| make_entry(t, &p, i, n, *it)))
 }
 
-/// `pid_entry_nlink` (linux-6.6/fs/proc/base.c:158-167): the links stat adds for the table's directories
-/// (`/proc/<pid>` base.c:3426-3429, `/proc/<pid>/task/<tid>` base.c:3926-3929; `task` only in the process view).
+/// `pid_entry_nlink` (linux-7.3.1/fs/proc/base.c:194-207): the links stat adds for the table's directories
+/// (`/proc/<pid>` base.c:3468, `/proc/<pid>/task/<tid>` base.c:3779, counted at :3988-3989; `task` only in the process
+/// view).
 fn dir_items(whole: bool) -> u32 {
     ITEMS.iter().filter(|(_, it)| matches!(it, Item::Fd | Item::FdInfo | Item::Ns | Item::Net) || (whole && matches!(it, Item::Task))).count() as u32
 }
@@ -445,7 +490,7 @@ impl FileSource for PidFile {
     fn may_open(&self, _who: Cred, _write: bool) -> Result<(), Errno> {
         let (_, p) = self.t.live()?;
         // `proc_mem_open(PTRACE_MODE_READ)` for the files that show the memory.
-        if matches!(self.what, What::Environ | What::Auxv | What::Maps | What::Smaps | What::SmapsRollup | What::Personality) && !may_read_mm(&p) {
+        if matches!(self.what, What::Environ | What::Auxv | What::Maps | What::Smaps | What::SmapsRollup | What::Personality | What::Io) && !may_read_mm(&p) {
             return Err(EACCES);
         }
         Ok(())
@@ -478,6 +523,10 @@ impl FileSource for PidFile {
             What::Personality => format!("{:08x}\n", th.as_ref().map_or(0, |t| t.prctl().personality())).into_bytes(),
             // `proc_cgroup_show` with only the unified hierarchy and no cgroups made: the root cgroup.
             What::Cgroup => b"0::/\n".to_vec(),
+            // `ptrace_may_access` again at the read, as Linux checks there (the opener may have lost it).
+            What::Io if !may_read_mm(&p) => return Err(EACCES),
+            What::Tree => tree::render(&g),
+            What::Io => io_text(if t.whole { g.io_counts() } else { th.as_ref().and_then(|t| sched::ioac::of_thread(t.kthread())).unwrap_or_default() }).into_bytes(),
         })
     }
     fn write(&self, _who: Cred, data: &[u8]) -> Result<usize, Errno> {
@@ -485,11 +534,12 @@ impl FileSource for PidFile {
         match self.what {
             What::Comm => text::write_comm(&g, self.t.thread(&g).as_deref(), data),
             What::OomScoreAdj => text::write_oom_score_adj(&g, data, text::writer_has_sys_resource()),
+            What::Tree => tree::write(&g, data),
             _ => Err(EIO),
         }
     }
     /// FS-16: everything but cmdline, environ, auxv and oom_score_adj is a seq_file in Linux (`proc_single_open`,
-    /// `comm_open`, `seq_open` of maps/mounts: FMODE_PWRITE cleared, pwrite ESPIPE; linux-6.6/fs/proc/base.c).
+    /// `comm_open`, `seq_open` of maps/mounts: FMODE_PWRITE cleared, pwrite ESPIPE; linux-7.3.1/fs/proc/base.c).
     fn positional_write(&self, _opened_for_write: bool) -> bool {
         matches!(self.what, What::Cmdline | What::Environ | What::Auxv | What::OomScoreAdj)
     }

@@ -1,7 +1,7 @@
 //! PK-2: a package's settings keys in settingsd (CL-1). Install registers the current version's keys; removal
 //! registers the keys of every version still on disk once more (settingsd only forgets values of keys it knows,
 //! and after a reboot it knows none of a package's keys until they are registered: their values wait as
-//! orphans, cl-CL-1 notes) and then unregisters `app.<name>.` with `forget`, which also drops the values, the
+//! orphans, CL-1) and then unregisters `app.<name>.` with `forget`, which also drops the values, the
 //! file lines and the journal entries. One JSON line per request on settingsd's socket (settingsd/src/proto.rs).
 
 use crate::hooks::Hook;
@@ -32,7 +32,7 @@ pub type Answer = Result<Json, (String, String)>;
 impl Settings {
     /// One request, one answer line. Err = settingsd not reachable or no sane answer.
     pub fn request(&self, req: &Json) -> Result<Answer, String> {
-        // sun_path holds 108 bytes with its NUL (linux-6.6/net/unix/af_unix.c:292 unix_mkname_bsd): say so
+        // sun_path holds 108 bytes with its NUL (linux-7.3.1/net/unix/af_unix.c:347 unix_mkname_bsd): say so
         // instead of a bare "not reachable".
         if self.socket.as_os_str().len() >= SUN_PATH {
             return Err(format!("settingsd socket path {} is longer than a Unix socket address holds ({} bytes)", self.socket.display(), SUN_PATH - 1));

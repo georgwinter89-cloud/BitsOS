@@ -52,6 +52,24 @@ pub fn allowed_running(id: u32, arg: u32) -> bool {
         }
 }
 
+/// GX-8v: VCN's and JPEG's power, the four messages `amdgpu_dpm_enable_vcn` / `_jpeg` send on 13.0.4
+/// (smu_v13_0.c:1857-1890): PowerUpVcn and PowerDownVcn with `instance << 16` (VCN 0: 0), PowerUpJpeg and PowerDownJpeg
+/// with 0. They concern the video block alone, no clock of the display. Reachable only through `send_video`; never on
+/// `ALLOWED` or `allowed_running`.
+pub fn allowed_video(id: u32, arg: u32) -> bool {
+    matches!(id, msg::POWER_UP_VCN | msg::POWER_DOWN_VCN | msg::POWER_UP_JPEG | msg::POWER_DOWN_JPEG) && arg == 0
+}
+
+/// GX-8v: one of `allowed_video`'s messages, waited (the running driver's bounds when the job half sends it).
+pub fn send_video(hw: &mut dyn Hw, a: &Addrs, t: SmuTimeouts, id: u32, arg: u32) -> Result<u32, SmuError> {
+    if !allowed_video(id, arg) {
+        klog::event!(Error, "gx", "smu.forbidden", id = klog::Hex(u64::from(id)), arg = klog::Hex(u64::from(arg)), name = smu13::msg_name(id);
+            "a message not on the video list");
+        return Err(SmuError::Forbidden { id, arg });
+    }
+    handshake(hw, a, t, id, arg)
+}
+
 /// Linux's waits: 2 s for the pre-poll and for an answer (`usec_timeout * 20` rounds of 1 us, smu_cmn.c:112).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmuTimeouts {
@@ -182,10 +200,12 @@ impl Smu {
     /// Waits until the previous message is answered (Linux's pre-poll). The answer of a message sent without
     /// waiting is recorded on it here; an answer other than OK to it is an error (Linux goes on).
     ///
-    /// The first pre-poll: answer 0 with message 0 is PMFW out of reset with no message ever sent (newer Linux
-    /// ignores the first answer register value for this reason; the capture's kernel did not pre-poll its first
-    /// message; GX-7b's classifier calls 0/0 cold): it is not waited for. Answer 0 with a message id is a message
-    /// in flight (a crash left it) and is waited for like any other.
+    /// The first pre-poll: answer 0 with message 0 is PMFW out of reset with no message ever sent: it is not waited
+    /// for, as Linux 7.3.1 sends the first message after `smu_start_smc_engine` without the pre-poll
+    /// (linux-7.3.1/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c:508, SMU_FW_INIT; amdgpu_smu.c:1924). Deliberately
+    /// stricter than Linux: answer 0 with a message id is a message in flight (an earlier kernel of this boot or a
+    /// crash left it) and is waited for like any other (GX-7j3); Linux would write over it. A non-zero answer
+    /// ends the poll at once, so it differs from Linux in nothing but the wait for that in-flight case.
     pub fn pre_poll(&mut self, hw: &mut dyn Hw) -> Result<u32, SmuError> {
         if core::mem::take(&mut self.first) {
             let r = hw.reg_read(self.a.resp).ok_or(SmuError::Read { byte: self.a.resp })?;

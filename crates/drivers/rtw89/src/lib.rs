@@ -1,7 +1,7 @@
 //! Realtek RTL8852BE (rtw89, PCI 10EC:B852; the Mini-PC's 04:00.0 behind root port 00:02.2).
 //! Owner: WL. Item WL-4: the kernel side of `rtw89-core` (spec/wlan.md):
-//! - attaches only with `wlan=on` in CONFIG.TXT (R8 d: the PCI core leaves the function and its
-//!   bridge untouched otherwise, `opt_in_key`);
+//! - attaches like every driver; it joins a network only with `wlan_ssid`/`wlan_psk` in CONFIG.TXT (under the
+//!   Gaming-PC profile the PCI core holds every WLAN card, `pci::gp::network_key`);
 //! - `kbus::KBus`: rtw89-core's `Bus` on BAR2 (the whole 1 MB, uncached), config space and DMA
 //!   memory below 4 GB (`dma::DmaPool`), wrapped in Linux's CMAC read rule;
 //! - `card`: the driver thread (class KernelRt, its own: the chip is served whatever programs do),
@@ -12,7 +12,7 @@
 //! - `tool`: MCP `wlan` (status, scan, join, leave).
 //!
 //! Interrupts: one MSI vector (capability 0x50) wakes the thread, with a 20 ms safety poll while
-//! linked; without MSI (or `net_irq=off`) the thread polls RX every 2 ms. Bus master on the
+//! linked; without MSI the thread polls RX every 2 ms. Bus master on the
 //! function only after the MAC is known off (`card::run`).
 #![no_std]
 #![forbid(unsafe_code)]
@@ -50,7 +50,7 @@ pub const RT_PRIO: u8 = 40;
 
 static MATCHES: [pci::Match; 1] = [pci::Match::Id { vendor: VENDOR_REALTEK, device: DEV_RTL8852BE }];
 
-pci::pci_driver!(pci::DriverEntry { name: "rtw89", matches: &MATCHES, opt_in_key: Some("wlan"), probe });
+pci::pci_driver!(pci::DriverEntry { name: "rtw89", matches: &MATCHES, probe });
 
 static CARDS: SpinLock<Vec<Arc<Card>>> = SpinLock::named("rtw89.cards", Vec::new());
 

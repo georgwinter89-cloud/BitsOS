@@ -3,7 +3,7 @@
 //! every sink; the watch gets the dropped events its owner asks for (`wants`, asked before the event's fields are
 //! built) as a rendered line, at once in the emitter's context. Nothing else sees them: the ring, serial, the
 //! mirror and the console stay filtered (Linux keeps below-level lines in its ring and filters only the console,
-//! linux-6.6/kernel/printk/printk.c `suppress_message_printing`; here "no extra lines at error" wins).
+//! linux-7.3.1/kernel/printk/printk.c:1287 `suppress_message_printing`; here "no extra lines at error" wins).
 //!
 //! One watch (the kernel installs the console's before `kernel start`); Info and Warn only (Error is never
 //! dropped, Debug and Trace are never watched, so their call sites stay one compare); never the panic/NMI path.

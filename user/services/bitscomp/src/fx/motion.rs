@@ -67,7 +67,7 @@ pub fn radar_angle(t: f64) -> f32 {
 }
 
 /// Seconds per turn of Claude's ring per state; None stands still. The busy states as `ring.rs` steps them
-/// (thinking "dreht schnell"); idle turns at the design's `.spin` (60 s, GPU level only, desktop.md §0 answer 7).
+/// (thinking "dreht schnell"); idle turns at the design's `.spin` (60 s, desktop.md §0 answer 7).
 pub fn ring_turn(r: Ring) -> Option<f64> {
     match r {
         Ring::Idle => Some(60.0),

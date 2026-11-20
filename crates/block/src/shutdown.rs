@@ -1,7 +1,8 @@
 //! RB-14: the storage stop before a machine reset or a Reload, after the write-back (`vfs::writeback::sync_all`)
 //! and before the CPUs park and the drivers quiesce. Linux's restart does the same in `device_shutdown`
 //! (linux-6.6/drivers/base/core.c:4724, children before parents): `sd_shutdown` syncs every disk's cache and,
-//! on a restart, does not spin it down (drivers/scsi/sd.c:3838-3856); then the host controllers halt
+//! on a restart, does not spin it down (drivers/scsi/sd.c:3838-3856; Linux 7.3.1 differs:
+//! linux-7.3.1/drivers/scsi/sd.c:4250, see plan/spec/linux7-differences.md); then the host controllers halt
 //! (`usb_hcd_pci_shutdown` -> `xhci_shutdown`, drivers/usb/core/hcd-pci.c:359, drivers/usb/host/xhci.c:631).
 //!
 //! `stop_all`, newest disk first (a stacked disk, /data's image on the stick, before the stick under it):

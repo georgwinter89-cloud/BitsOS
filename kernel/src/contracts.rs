@@ -153,27 +153,17 @@ fn quiesce() -> TestResult {
 }
 ktest!("contract.quiesce", Safe, quiesce);
 
-// PCI: the scan found the q35 host bridge, and an opt-in driver is skipped without its key.
-static PROBED: AtomicU32 = AtomicU32::new(0);
-fn optin_probe(_f: &pci::PciFunction) -> Result<(), alloc::string::String> {
-    PROBED.fetch_add(1, Ordering::SeqCst);
-    Ok(())
-}
-pci::pci_driver!(pci::DriverEntry {
-    name: "ktest-optin",
-    // Only q35's MCH, so real machines never mark their host bridges untouched.
-    matches: &[pci::Match::Id { vendor: 0x8086, device: 0x29C0 }],
-    opt_in_key: Some("ktest_optin"),
-    probe: optin_probe,
-});
+// PCI: the scan found a host bridge, and the registry has its drivers, each name once.
 fn pci_registry() -> TestResult {
     let devs = pci::devices();
     kassert!(!devs.is_empty(), "no PCI function found");
     kassert!(devs.iter().any(|d| d.class >> 8 == 0x0600), "no host bridge");
-    kassert!(PROBED.load(Ordering::SeqCst) == 0, "opt-in driver attached without its key");
+    let drivers = pci::registry::registered();
+    kassert!(!drivers.is_empty(), "no driver registered");
+    kassert!(pci::registry::duplicates(&drivers).is_empty(), "a driver name registered twice");
     Ok(())
 }
-ktest!("contract.pci_registry_optin", Safe, pci_registry);
+ktest!("contract.pci_registry", Safe, pci_registry);
 
 fn ksocket() -> TestResult {
     let s = net::stack().ok_or("no stack")?;
@@ -256,7 +246,7 @@ fn metrics() -> TestResult {
     loop {
         let names = klogd::metrics::with_store(1_000_000_000, |s| ["cpu.all.busy", "metrics.cost", "mem.total"].iter().all(|n| s.has(n)));
         match names {
-            None => return ktest::fail("metrics=off"),
+            None => return ktest::fail("the metric sampler did not start"),
             Some(true) => return Ok(()),
             Some(false) if time::now_ns() < until => sched::sleep_ms(200),
             Some(false) => return Err("cpu.all.busy/metrics.cost/mem.total missing after 3 periods".into()),
@@ -266,7 +256,7 @@ fn metrics() -> TestResult {
 ktest!("contract.b6_metrics", Safe, metrics);
 
 fn policy_hook() -> TestResult {
-    let s = policy::Subject { program: policy::ProgramId(77), pid: 5, uid: 1000 };
+    let s = policy::Subject { program: policy::ProgramId(77), pid: 5, uid: 1000, tree: 0 };
     let before = policy::counts()[1].1;
     kassert!(policy::check(&s, &policy::Access::NetConnect { proto: policy::NetProto::Tcp, addr: policy::IpAddr::V4([10, 0, 0, 1]), port: 80 }).is_ok());
     kassert!(policy::counts()[1].1 == before + 1, "net access counted");

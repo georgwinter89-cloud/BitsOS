@@ -10,8 +10,8 @@
 //! mmap base (`load_bias` 0, then `elf_map` picks the address), aligned down to the largest segment alignment
 //! when that is above a page; its break starts at `PAGE_ALIGN(ELF_ET_DYN_BASE)` (Linux 6.10 "Move brk for
 //! static PIE even if ASLR disabled"). Checked on CachyOS 7.2.9 with `setarch -R` on a static-PIE program: the
-//! image ends at the mmap base 0x7ffff7fff000, the break is at 0x555555555000. No randomisation yet (open point
-//! in plan/notes/ab-AB-2.md).
+//! image ends at the mmap base 0x7ffff7fff000, the break is at 0x555555555000. No randomisation yet
+//! (plan/spec/abi.md §3).
 //!
 //! AB-8, dynamic programs (`load_elf_binary` :1105-1137): an ET_DYN with PT_INTERP loads at `ELF_ET_DYN_BASE`
 //! aligned down to its largest segment alignment, less its first segment's page; its break follows its image.

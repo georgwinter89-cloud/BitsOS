@@ -1,0 +1,34 @@
+[package]
+name = "bitsupdate"
+version = "0.1.0"
+edition = "2024"
+description = "UPDATE: BitsOS versions from the private workshop repository: the signed manifest, the GitHub client, the kernel's install node, the console command bitsupdate and the desk's signing tool"
+publish = false
+build = "build.rs"
+
+# ring and sha2: the versions fetch already pins (no new download). mcp-wire: the JSON both kernel and services
+# use. bitsinstall: the real-keyboard rule and the code letters of its console dialog (MC-11). usys: the evdev
+# ioctls without unsafe here.
+[dependencies]
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
+sha2 = { version = "=0.10.9", default-features = false }
+mcp-wire = { path = "../../../crates/mcp-wire" }
+bitsinstall = { path = "../../services/bitsinstall" }
+usys = { path = "../../tools/usys" }
+# UPD-4: the zstd reader of the tree archives (several frames, each checksum checked), the one bitspkg reads
+# packages with.
+bitspkg = { path = "../../tools/bitspkg" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsupdate"
+path = "src/main.rs"
+
+# The fake GitHub of tests/fake_github.rs: a TLS server with a test CA (the versions fetch pins).
+[dev-dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
+# UPD-4: the tests pack small tree pieces (the desk packs with the zstd tool).
+ruzstd = { version = "=0.8.1", default-features = false, features = ["std"] }

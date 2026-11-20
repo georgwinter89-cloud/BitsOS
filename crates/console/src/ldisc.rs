@@ -1,20 +1,20 @@
-//! The N_TTY line discipline as data (IN-4): what Linux 6.6's drivers/tty/n_tty.c does with the bytes the
+//! The N_TTY line discipline as data (IN-4): what Linux 7.3.1's drivers/tty/n_tty.c does with the bytes the
 //! keyboard sends and the bytes programs write, driven by `termios`. No locks and no waiting here (`tty.rs` adds
 //! them), so every rule is host-tested.
 //!
-//! Followed exactly (n_tty.c line numbers of linux-6.6):
+//! Followed exactly (n_tty.c line numbers of linux-7.3.1):
 //! - input: ISTRIP, IUCLC (with IEXTEN), IGNCR/ICRNL/INLCR, IXON/IXANY flow control (`n_tty_receive_char_flow_ctrl`
-//!   :1243), ISIG with VINTR/VQUIT/VSUSP and the flush unless NOFLSH (`isig` :1095, `n_tty_receive_signal_char`
-//!   :1211), canonical editing with VERASE/VKILL/VWERASE (`eraser` :953, UTF-8 aware with IUTF8), VLNEXT,
-//!   VREPRINT, VEOF/VEOL/VEOL2 (`n_tty_receive_char_canon` :1274), the special-character map
-//!   (`n_tty_set_termios` :1795), the 4096-byte read buffer and its canonical overflow rule
-//!   (`n_tty_receive_buf_common` :1689);
+//!   :1214), ISIG with VINTR/VQUIT/VSUSP and the flush unless NOFLSH (`isig` :1067, `n_tty_receive_signal_char`
+//!   :1182), canonical editing with VERASE/VKILL/VWERASE (`eraser` :925, UTF-8 aware with IUTF8), VLNEXT,
+//!   VREPRINT, VEOF/VEOL/VEOL2 (`n_tty_receive_char_canon` :1245), the special-character map
+//!   (`n_tty_set_termios` :1774), the 4096-byte read buffer and its canonical overflow rule
+//!   (`n_tty_receive_buf_common` :1671);
 //! - echo: ECHO, ECHOE, ECHOK, ECHOKE, ECHONL, ECHOCTL (`^X`), ECHOPRT, the tab erase from the canon column
-//!   (`n_tty_process_echo_ops` :585), held back while output is stopped;
+//!   (`n_tty_process_echo_ops` :560), held back while output is stopped;
 //! - reads: one line per canonical read without the EOF character, the EOF skip after a full buffer
-//!   (`canon_copy_from_read_buf` :2012, `canon_skip_eof` :2080), switching ICANON with data pending pushes it as a
-//!   line (:1799-1813), `input_available_p` (:1929) with VMIN for poll, TIOCINQ counting (`inq_canon` :2479);
-//! - output: OPOST with ONLCR, OCRNL, ONOCR, ONLRET, OLCUC, XTABS and the column (`do_output_char` :417).
+//!   (`canon_copy_from_read_buf` :1991, `canon_skip_eof` :2053), switching ICANON with data pending pushes it as a
+//!   line (:1778-1792), `input_available_p` (:1907) with VMIN for poll, TIOCINQ counting (`inq_canon` :2460);
+//! - output: OPOST with ONLCR, OCRNL, ONOCR, ONLRET, OLCUC, XTABS and the column (`do_output_char` :402).
 //!
 //! BitsOS addition: each byte remembers whether its key was injected by MCP (`send_keys`), so the monitor can
 //! refuse physical-key-only commands typed by injection (R8c). An injected erase that removes a typed byte marks
@@ -792,14 +792,21 @@ impl Ldisc {
 
     /// Program output through OPOST (`n_tty_write`): the bytes for the screen. Without OPOST unchanged.
     pub fn output(&mut self, data: &[u8]) -> Vec<u8> {
-        if !self.t.o(OPOST) {
-            return data.to_vec();
-        }
         let mut out = Vec::with_capacity(data.len() + data.len() / 8);
-        for &c in data {
-            self.output_char(c, &mut out);
-        }
+        self.output_into(data, &mut out);
         out
+    }
+
+    /// `output` appended to `out`: with room for `data.len()` times `tty::growth` of the termios it allocates
+    /// nothing (`Tty::write` calls it under the terminal's spin lock).
+    pub fn output_into(&mut self, data: &[u8], out: &mut Vec<u8>) {
+        if !self.t.o(OPOST) {
+            out.extend_from_slice(data);
+            return;
+        }
+        for &c in data {
+            self.output_char(c, out);
+        }
     }
 
     /// `do_output_char`.

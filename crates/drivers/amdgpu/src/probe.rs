@@ -24,7 +24,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt::Write;
-use ksync::Mutex;
 
 /// How the binary was fetched and from where (CPU physical address, or position in graphics memory).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,15 +267,15 @@ pub(crate) fn memsize(regs: &DcnRegs) -> Result<u32, String> {
     regs.read(crate::layout::MEMSIZE).map_err(|e| format!("MEMSIZE: {e:?}"))
 }
 
-/// The discovery copy of this boot that parsed (from the carve-out or the indirect path), for the probe.
-static COPY: Mutex<Option<Found>> = Mutex::named("amdgpu.disc_copy", None);
+/// The discovery copy of this boot that parsed (from the carve-out or the indirect path), for the probe: kept with the
+/// device's register owner (`DcnRegs::disc_copy`), so each device has its own table.
 const COPY_WAIT_NS: u64 = 100_000_000;
 
-pub(crate) fn keep(found: &Found) {
+pub(crate) fn keep(regs: &DcnRegs, found: &Found) {
     if disc::parse(&found.bytes).is_err() {
         return;
     }
-    match COPY.lock_timeout(COPY_WAIT_NS) {
+    match regs.disc_copy.lock_timeout(COPY_WAIT_NS) {
         Some(mut c) => *c = Some(found.clone()),
         None => klog::event!(Warn, "gx", "discovery.copy_busy", what = "keep", wait_ns = COPY_WAIT_NS),
     }
@@ -284,8 +283,8 @@ pub(crate) fn keep(found: &Found) {
 
 /// The kept copy, if any (ktests and the probe). A lock timeout counts as no copy and is logged (the holder only
 /// clones or stores, so it means a stalled holder, not a race this answer could win).
-pub(crate) fn kept() -> Option<Found> {
-    match COPY.lock_timeout(COPY_WAIT_NS) {
+pub(crate) fn kept(regs: &DcnRegs) -> Option<Found> {
+    match regs.disc_copy.lock_timeout(COPY_WAIT_NS) {
         Some(c) => c.clone(),
         None => {
             klog::event!(Warn, "gx", "discovery.copy_busy", what = "kept", wait_ns = COPY_WAIT_NS);
@@ -308,8 +307,12 @@ pub fn fetch_indirect_counted(regs: &DcnRegs) -> (Result<Found, String>, u64) {
 
 fn fetch_with(regs: &DcnRegs, n: &Cell<u64>) -> Result<Found, String> {
     let mb = memsize(regs)?;
-    let pos = vram::discovery_pos(mb).ok_or_else(|| format!("MEMSIZE {mb} MB: no VRAM position (Linux asks ACPI)"))?;
-    let read = vram::read_indirect(&Window { regs, held: None, writes: n }, pos, disc::TMR_SIZE);
+    let default = vram::discovery_pos(mb).ok_or_else(|| format!("MEMSIZE {mb} MB: no VRAM position (Linux asks ACPI)"))?;
+    let w = Window { regs, held: None, writes: n };
+    let (pos, read) = vram::read_tmr(&w, default, |byte| regs.read(byte).ok(), u64::from(mb) << 20);
+    if pos != default {
+        klog::event!(Info, "gx", "discovery.scratch", pos = pos; "no table at the default place: DRIVER_SCRATCH names it");
+    }
     let writes = n.get();
     let bytes = read.map_err(|e| {
         klog::event!(Warn, "gx", "discovery.indirect_failed", pos = pos, index_writes = writes, why = format!("{e:?}").as_str());
@@ -317,7 +320,7 @@ fn fetch_with(regs: &DcnRegs, n: &Cell<u64>) -> Result<Found, String> {
     })?;
     klog::event!(Info, "gx", "discovery.indirect", pos = pos, bytes = bytes.len(), index_writes = writes);
     let found = Found { via: Via::Indirect { pos }, bytes };
-    keep(&found);
+    keep(regs, &found);
     Ok(found)
 }
 
@@ -371,7 +374,7 @@ pub fn run(hex: bool) -> Option<Result<String, String>> {
         Err(e) => format!("memsize: {e}"),
     });
     // Section 2: the carve-out (MMHUB's offset needs a discovery table: a copy kept from earlier in this boot).
-    let mut copy = kept();
+    let mut copy = kept(g.regs);
     let d0 = copy.as_ref().and_then(|f| disc::parse(&f.bytes).ok());
     let dcn = dcn_fb_offset(g.regs, display_ok);
     let c = crate::carve::section(fb_offset(g.regs, d0.as_ref(), dcn), dcn, mb.as_ref().ok().copied(), gop_in_bar0(g.bar0), g.bar0.map(|b| b.1));
@@ -379,14 +382,14 @@ pub fn run(hex: bool) -> Option<Result<String, String>> {
     // way gx_bringup does (MM_INDEX/MM_DATA, the index registers restored), unless the carve-out gave one.
     let carve_ok = c.discovery.as_ref().is_some_and(|(_, b)| disc::parse(b).is_ok());
     // Under the PSP run's lock: a gx_bringup in progress compares the display's write counts around itself.
-    let (c2, fetched) = probe_copy(copy, carve_ok, || crate::psplive::while_idle(|| fetch_indirect_counted(g.regs)));
+    let (c2, fetched) = probe_copy(copy, carve_ok, || crate::psplive::while_idle(g.st(), || fetch_indirect_counted(g.regs)));
     copy = c2;
     if let Some(l) = fetched {
         line(&mut s, &l);
     }
     let iommu = crate::state::iommu_lines();
     let mut state = |d: &Discovery| {
-        let (st, totals) = crate::state::classify_live(g.regs, d);
+        let (st, totals) = crate::state::classify_live(g.st(), g.regs, d);
         let mut v = crate::state::lines(&st);
         // GX-7i2: how the stop note arrived in this boot, visible at any loglevel.
         v.extend(crate::psplive::note_lines());
@@ -395,7 +398,7 @@ pub fn run(hex: bool) -> Option<Result<String, String>> {
     };
     let (text, to_keep) = assemble(s, c, copy, &ip::known_blocks(g.device), hex, &mut state, &iommu);
     if let Some(f) = &to_keep {
-        keep(f);
+        keep(g.regs, f);
     }
     Some(Ok(text))
 }

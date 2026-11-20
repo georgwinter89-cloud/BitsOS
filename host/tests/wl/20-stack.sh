@@ -1,6 +1,6 @@
 #!/bin/bash
-# WL: the rtw89 driver thread's stack in the dev kernel (opt-level 1, what the stick runs). On the Mini-PC with
-# wlan=on the thread ran into its guard page in Device::bring_up (2026-10-22: card::run, Runner::bring_up,
+# WL: the rtw89 driver thread's stack in the dev kernel (opt-level 1, what the stick runs). On the Mini-PC the
+# thread ran into its guard page in Device::bring_up (2026-10-22: card::run, Runner::bring_up,
 # Device::bring_up and Device::up held a Device by value, 18-26 KiB per frame, on a 64 KiB stack). QEMU has no
 # RTL8852BE and the fake chip is a node process, so no ktest enters these frames: stack_check.py measures them in
 # the built kernel's machine code instead (prologues with their probe pages, the direct calls from card::run through

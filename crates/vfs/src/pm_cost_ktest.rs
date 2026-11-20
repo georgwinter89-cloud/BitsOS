@@ -21,7 +21,7 @@ fn per_open(c: &Ctx<'_>, p: &[u8]) -> Result<u64, alloc::string::String> {
 
 fn open_cost() -> TestResult {
     let ns = crate::root_ns();
-    let prog = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0001, uid: 1000 } };
+    let prog = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0001, uid: 1000, tree: 0 } };
     let kern = Ctx::kernel(&ns);
     for p in [&b"/dev/null"[..], b"/proc/sys/fs/nr_open"] {
         let k = per_open(&kern, p)?;
@@ -37,7 +37,7 @@ fn deny_prefix() -> TestResult {
     use policy::{AccessClass, Decision, PathRule, RuleSet};
     let id = policy::ProgramId(0x7e57_0b3d);
     let ns = crate::root_ns();
-    let prog = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { program: id, pid: 0x7fff_0002, uid: 1000 } };
+    let prog = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { program: id, pid: 0x7fff_0002, uid: 1000, tree: 0 } };
     let mut r = RuleSet::allow_all();
     r.paths.push(PathRule { prefix: "/dev/null".into(), modes: policy::rules::modes::READ, decision: Decision::Deny });
     policy::set_rules(id, Some(r));

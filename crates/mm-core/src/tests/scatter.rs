@@ -124,10 +124,10 @@ fn fallback_when_the_run_is_missing() {
     fill(p, big.size(), 0xA5);
     assert!(holds(p, big.size(), 0xA5));
     let taken = exhaust(b);
-    // 32 KiB is order 3: a run first, and single frames only once reclaim found none (the late step).
+    // 32 KiB is order 3: a free run first, single frames when there is none (no reclaim or compaction for the run).
     let l8 = lay(32 << 10, 8);
     let r8 = h.alloc(l8);
-    assert!(in_span(f, r8), "a run up to the costly order falls back late");
+    assert!(in_span(f, r8), "a run up to the costly order falls back to single frames");
     assert_eq!(f.live.lock().unwrap().get(&(r8 as usize)), Some(&8));
     free_block(h, r8, l8);
     // One page is a frame, never a mapping.
@@ -312,4 +312,59 @@ fn a_missing_run_notes_its_order_only_where_it_is_needed() {
     free_block(h, q, l);
     give_back(b, taken);
     h.check().unwrap();
+}
+
+/// 12.11.2026, Mini-PC generation 137: every buffer above the costly order tried its run with the full
+/// allocation first, and a run that is missing drains every CPU's frame lists (1900 times a second there). Single
+/// frames serve such a block as well: it takes the run only if one is free.
+#[test]
+fn a_block_single_frames_serve_drains_no_frame_lists() {
+    let (b, h, f) = setup(4);
+    let singles: Vec<u64> = (0..4).map(|_| b.alloc(0, Zone::Normal, Kind::Other).unwrap()).collect();
+    let taken = exhaust(b);
+    // Four frames on this CPU's list: a drain would have something to give back.
+    for p in singles {
+        b.free(p, 0, Kind::Other);
+    }
+    let drains = b.reports().drains.load(Relaxed);
+    let l = lay(68_000, 8);
+    let p = h.alloc(l);
+    assert!(in_span(f, p), "no run: single frames");
+    assert_eq!(b.reports().drains.load(Relaxed), drains, "the missing run drained the per-CPU lists");
+    free_block(h, p, l);
+    give_back(b, taken);
+    // With a run free the block is a run as before.
+    let p = h.alloc(l);
+    assert!(!p.is_null() && !in_span(f, p));
+    free_block(h, p, l);
+    b.check().unwrap();
+}
+
+/// A block up to the costly order (12 and 28 KiB) that finds no free run takes single frames at once: no drain of
+/// the per-CPU lists and no direct compaction for its run (Linux 7.x `kmalloc_gfp_adjust` for kvmalloc). Before, it
+/// drained and compacted first and scattered only after two reclaim rounds.
+#[test]
+fn a_small_block_without_a_run_takes_single_frames_at_once() {
+    let (b, h, f) = setup(4);
+    let singles: Vec<u64> = (0..16).map(|_| b.alloc(0, Zone::Normal, Kind::Other).unwrap()).collect();
+    let taken = exhaust(b);
+    for p in singles {
+        b.free(p, 0, Kind::Other);
+    }
+    for size in [12_000usize, 28_000] {
+        let drains = b.reports().drains.load(Relaxed);
+        let stalls = b.compact_stats().stall;
+        let l = lay(size, 8);
+        let p = h.alloc(l);
+        assert!(in_span(f, p), "{size} bytes, no run: single frames");
+        assert_eq!(b.reports().drains.load(Relaxed), drains, "{size} bytes: the missing run drained the per-CPU lists");
+        assert_eq!(b.compact_stats().stall, stalls, "{size} bytes: the missing run compacted");
+        free_block(h, p, l);
+    }
+    give_back(b, taken);
+    let l = lay(12_000, 8);
+    let p = h.alloc(l);
+    assert!(!p.is_null() && !in_span(f, p), "with a run free the block is a run");
+    free_block(h, p, l);
+    b.check().unwrap();
 }

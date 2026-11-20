@@ -136,7 +136,9 @@ impl<M: DmaMem> IoQueue<M> {
             seq_mod,
             tags: Tags::new(n),
             slots: (0..n).map(|_| Slot { st: AtomicU32::new(IDLE), cqe: AtomicU64::new(0), wq: WaitQueue::new() }).collect(),
-            pool: SpinLock::named("nvme.pool", Vec::new()),
+            // Room for all it keeps, made here: `put_pages` fills it under the spin lock, where the heap may not
+            // reclaim (6.5 KiB eleven times in a browser start, Mini-PC 12.11.2026).
+            pool: SpinLock::named("nvme.pool", Vec::with_capacity(keep)),
             keep,
             timeout_ns: AtomicU64::new(timeout_ns),
             placed: AtomicU64::new(0),
@@ -236,6 +238,12 @@ impl<M: DmaMem> IoQueue<M> {
     }
     pub fn pool_len(&self) -> usize {
         self.pool.lock().len()
+    }
+    /// Host tests: free places in the pool now (it never grows past what `new` made).
+    #[cfg(test)]
+    pub(crate) fn pool_room(&self) -> usize {
+        let p = self.pool.lock();
+        p.capacity() - p.len()
     }
 }
 

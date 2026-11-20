@@ -1,4 +1,4 @@
-//! DRM sync objects (linux-6.6/drivers/gpu/drm/drm_syncobj.c, with the behaviour of the Linux 7.3 that the ABI
+//! DRM sync objects (linux-7.3.1/drivers/gpu/drm/drm_syncobj.c, with the behaviour of the Linux 7.3 that the ABI
 //! diff compares against where it differs: WAIT with no handles answers 0, WAIT_AVAILABLE waits for a missing
 //! fence, WAIT_DEADLINE, the TIMELINE flags of HANDLE_TO_FD/FD_TO_HANDLE, TRANSFER takes only WAIT_FOR_SUBMIT).
 //! A syncobj holds one fence or none; a timeline syncobj holds a chain whose nodes are its points. Handles are

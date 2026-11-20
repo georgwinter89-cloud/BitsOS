@@ -310,10 +310,14 @@ fn reset() -> TestResult {
 }
 ktest!("nv.reset", Run("nv/10-nvme"), reset);
 
-/// The `nvme` MCP tool as a client calls it: the summary (media_writes=0), SMART, a short read speed, and a
-/// bad argument.
+/// The `nvme` MCP tool as a client calls it: the summary (media_writes=0 where no window is), SMART, a short read
+/// speed, and a bad argument. GP-R3: a disk with a window (the Mini-PC's Lexar holds /data) writes through it all the
+/// while, so the tool's own writes are what it must not have: none outside a window ever (window_refused stays and
+/// media_writes stays 0 on every disk without one), and on a disk with one, a summary and a speed call that leave
+/// media_writes as they were (a write of the tool would show in every try; /data's come and go: up to five tries).
 fn tool() -> TestResult {
     let all = need!(ready());
+    let refused: Vec<u64> = all.iter().map(|c| c.stats.window_refused.load(core::sync::atomic::Ordering::Relaxed)).collect();
     let t = mcp::find("nvme").ok_or("the nvme tool is not registered")?;
     kassert!(t.safety == mcp::Safety::Read, "nvme tool is not Read");
     let ctx = mcp::ToolContext { caller: policy::Subject::KERNEL, deadline_ns: u64::MAX };
@@ -340,7 +344,26 @@ fn tool() -> TestResult {
     kassert!(matches!(bad, Err(mcp::ToolError::BadArgument(_))), "speed_mb=0 accepted: {bad:?}");
     let none = (t.handler)(&ctx, &mcp::Json::parse(r#"{"controller":"nvme99"}"#).map_err(|_| "json")?);
     kassert!(matches!(none, Err(mcp::ToolError::BadArgument(_))), "unknown controller accepted");
-    kassert!(all.iter().all(|c| c.stats.media_writes() == 0), "media writes after the tool");
+    for (c, before) in all.iter().zip(&refused) {
+        let now = c.stats.window_refused.load(core::sync::atomic::Ordering::Relaxed);
+        kassert!(now == *before, "{}: {} writes outside its window refused while the tool ran", c.name, now - before);
+        if c.window().is_none() {
+            kassert!(c.stats.media_writes() == 0, "{}: media writes without a window", c.name);
+        }
+    }
+    let summary = mcp::Json::parse(r#"{"smart":true}"#).map_err(|_| "json")?;
+    for c in all.iter().filter(|c| c.window().is_some()) {
+        // The speed call is the tool's one path with media I/O: it is in each try beside the summary.
+        let nsid = c.info().namespaces.iter().find(|n| n.unusable.is_none()).map(|n| n.nsid).ok_or("no usable namespace")?;
+        let speed = mcp::Json::parse(&format!(r#"{{"controller":"{}","speed_mb":8,"nsid":{nsid}}}"#, c.name)).map_err(|_| "json")?;
+        let quiet = (0..5).any(|_| {
+            let m = c.stats.media_writes();
+            let r = (t.handler)(&ctx, &summary).is_ok() && (t.handler)(&ctx, &speed).is_ok();
+            r && c.stats.media_writes() == m
+        });
+        klog::event!(Info, "nvme", "ktest.tool_window", ctrl = c.name.as_str(), media_writes = c.stats.media_writes(), quiet = quiet, with_speed = true);
+        kassert!(quiet, "{}: media_writes rose in each of five tries (summary and an 8 MiB speed read): the tool writes", c.name);
+    }
     Ok(())
 }
 ktest!("nv.tool", RunHw("nv/10-nvme"), tool);

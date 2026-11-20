@@ -5,7 +5,7 @@
 //! is always built as a value on the stack first (measured: a 65.6 KiB frame in `Box::default`, `Box::write` and
 //! an out-of-line constructor, debug and release), which overflows a 64 KiB kernel thread stack onto its guard
 //! page. miniz_oxide's inflate (no such array) stays in use for the tests that read the PNG back. Once kernel
-//! threads can ask for a bigger stack (change request to SC in plan/notes/mc-MC-3.md) the deflate side can switch
+//! threads can ask for a bigger stack the deflate side can switch
 //! back; the PNG code calls only `Deflater`.
 //!
 //! State is heap-only (hash table and a 32 KiB window, a few hundred KiB), the stack frame small. Scalar (R10).

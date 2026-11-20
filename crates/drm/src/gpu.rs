@@ -14,7 +14,7 @@ use vfs::Errno;
 pub const HW_IP_NUM: usize = AMDGPU_HW_IP_NUM as usize;
 
 /// One HW IP type of `AMDGPU_INFO_HW_IP_INFO` as the chip has it (Linux `amdgpu_hw_ip_info`,
-/// linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c:361): the IP block's version, its discovery version, the IB
+/// linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c:435): the IP block's version, its discovery version, the IB
 /// alignments and how many rings of the type come up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HwIp {
@@ -92,6 +92,24 @@ pub struct ChipProfile {
     pub gds: Gds,
     /// The chip has RAS (`AMDGPU_INFO_RAS_ENABLED_FEATURES`): the feature mask; None = EINVAL.
     pub ras_features: Option<u64>,
+    /// `AMDGPU_INFO_UQ_FW_AREAS` (Linux 7.3.1): the firmware areas a user-mode queue needs.
+    pub uq_fw_areas: UqFwAreas,
+    /// Bytes of the doorbell BAR all DOORBELL objects may hold together: the BAR less the kernel's doorbell
+    /// pages (`AMDGPU_PL_DOORBELL`'s range manager, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c:2229, and
+    /// `amdgpu_doorbell_create_kernel_doorbells`, amdgpu_doorbell_mgr.c:149-180).
+    pub doorbell_room: u64,
+}
+
+/// The answers of `AMDGPU_INFO_UQ_FW_AREAS` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c:379-433) by queue
+/// type, (size, alignment) pairs; None = the block has no such query (EOPNOTSUPP).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UqFwAreas {
+    /// GFX: the shadow area and the context save area (`get_gfx_shadow_info`).
+    pub gfx: Option<[(u32, u32); 2]>,
+    /// COMPUTE: the EOP buffer.
+    pub compute: Option<(u32, u32)>,
+    /// DMA: the SDMA context save area (`sdma.get_csa_info`).
+    pub sdma: Option<(u32, u32)>,
 }
 
 impl ChipProfile {
@@ -147,6 +165,8 @@ pub enum Sensor {
     StablePstateMclk,
     PeakPstateSclk,
     PeakPstateMclk,
+    /// `AMDGPU_INFO_SENSOR_GPU_INPUT_POWER` (Linux 7.3.1): the current socket power in W.
+    GpuInputPower,
 }
 
 /// Linux `adev->pm.stable_pstate_ctx` and its mutex: the context that forced a stable pstate (by its id, with
@@ -220,6 +240,11 @@ pub trait GpuDevice: Send + Sync {
     fn dpm_enabled(&self) -> bool;
     /// A sensor value; None = the read failed (EINVAL).
     fn sensor(&self, s: Sensor) -> Option<u32>;
+    /// SYS-K: all power-management sensors at once for sysfs and hwmon (None: DPM is off or the read failed). It
+    /// may block (on hardware an SMU exchange): only `sysfs_pm`'s sampler thread calls it.
+    fn pm_sample(&self) -> Option<crate::pm::PmSample> {
+        self.dpm_enabled().then(|| crate::pm::from_sensors(|s| self.sensor(s)))
+    }
     /// `gpu_reset_counter`, `vram_lost_counter`, `amdgpu_in_reset`.
     fn reset_counter(&self) -> u32;
     fn vram_lost_counter(&self) -> u32;

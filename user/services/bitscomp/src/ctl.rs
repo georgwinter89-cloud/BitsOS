@@ -1,6 +1,7 @@
 //! Control socket `$XDG_RUNTIME_DIR/<wayland socket>.ctl`: one command line per connection, one answer.
-//! Scripts (host/tests/wy) drive the compositor through it without touching the host's keyboard; it is
-//! also the seed of the MCP tools of WY-4 (`window_kill`) and the settings hook of WY-5.
+//! The desk's check lists (MCP `run`), `bits` and the assistant's tree drive the compositor through it; every input
+//! from it counts as injected. It is also the seed of the MCP tools of WY-4 (`window_kill`) and the settings hook of
+//! WY-5.
 
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -100,17 +101,30 @@ pub fn send(socket_name: &str, cmd: &str) -> std::io::Result<String> {
     Ok(out)
 }
 
+/// The longest a screenshot waits for a frame that is due (`run_queue`).
+const SHOT_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub fn run_queue(app: &mut App, comp: &mut dyn crate::render::Composer) {
-    // `bench` runs over many turns (`bench.rs`); a second one waits in the queue for the first.
     // A screenshot waits for the start animation and an unfolding menu (WY-5), so it shows the settled look.
+    // It also waits for a frame that is due and not drawn yet (a click that opened the library a turn ago would
+    // picture the desktop without it), at most SHOT_FRAME_WAIT, so clients that draw all the time do not hold it off.
     let moving = app.anim.running(crate::pacer::now(), &app.theme);
-    let (bench, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut app.ctl_queue).into_iter().partition(|(c, _)| {
-        let w = c.split_whitespace().next();
-        w == Some("bench") || (moving && w == Some("shot"))
+    let shot_queued = app.ctl_queue.iter().any(|(c, _)| c.split_whitespace().next() == Some("shot"));
+    let frame_due = shot_queued && (app.needs_frame || app.layout_dirty) && app.shot_wait.get_or_insert_with(std::time::Instant::now).elapsed() < SHOT_FRAME_WAIT;
+    if !frame_due {
+        app.shot_wait = None;
+    }
+    let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut app.ctl_queue).into_iter().partition(|(c, _)| {
+        (moving || frame_due) && c.split_whitespace().next() == Some("shot")
     });
-    app.ctl_queue = bench;
-    for (cmd, mut stream) in rest {
-        // WY-17: frames that go straight to the scanout leave no copy; a screenshot reads the one on the screen.
+    app.ctl_queue = waiting;
+    for (cmd, stream) in rest {
+        // EINS-D: a line of the assistant's tree is judged (one gate, `ctl_bits`), and bits's own verbs run, before
+        // anything else.
+        let Some((cmd, stream)) = crate::ctl_bits::take(app, comp, cmd, stream) else { continue };
+        // DB3: `ui` waits for a foreign program's provider on a thread, `ui-act` on such an element too.
+        let Some(mut stream) = app.ui_defer_ctl(&cmd, stream) else { continue };
+        // WY-17: frames go straight to the scanout and leave no copy; a screenshot reads the one on the screen.
         if cmd.split_whitespace().any(|w| w == "shot") {
             comp.sync_pixels();
         }
@@ -131,26 +145,56 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
     let num = |i: usize| -> Result<f64, String> {
         words.get(i).ok_or("missing number")?.parse::<f64>().map_err(|e| e.to_string())
     };
-    // MC-9b test path of the headless build: `phys COMMAND...` runs a key/pointer command as input from a real
-    // device. It does not exist in the V2 build (no `nested` feature) nor with another back end: there the
-    // control socket's input is always injected and can never answer the installer.
-    if words.first() == Some(&"phys") {
-        if !(cfg!(feature = "nested") && app.headless) {
-            return Err("phys: only in the headless test build".into());
-        }
-        let rest = words[1..].join(" ");
-        if !matches!(words.get(1).copied(), Some("key" | "pointer" | "press" | "release" | "click" | "wheel" | "pad-event")) {
-            return Err("usage: phys key|pointer|press|release|click|wheel|pad-event ...".into());
-        }
-        app.ctl_origin = crate::input::Origin::Physical;
-        let r = execute(app, comp, &rest);
-        app.ctl_origin = crate::input::Origin::Injected;
-        return r;
+    // MC-9b: the control socket's input is always injected and can never answer the installer.
+    // CL-5: while Georg types a provider's key, no command moves the keyboard, the focus or a setting.
+    if app.ki_ctl_waits(&words) {
+        return Err(crate::ki_guard::BUSY.into());
     }
     if words.first() == Some(&"install") {
         return app.install_ctl(&words);
     }
     if let Some(r) = crate::pad_app::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::sofa_app::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = app.assist_ctl(&words, cmd) {
+        return r;
+    }
+    if let Some(r) = crate::feld_app::ctl(app, &words, cmd) {
+        return r;
+    }
+    if let Some(r) = crate::rewind_app::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::leistung_app::ctl(app, &words) {
+        return r;
+    }
+    // DB3: Durchblick's panel.
+    if let Some(r) = crate::db_ctl::ctl(app, &words, cmd) {
+        return r;
+    }
+    // DB1: ui, ui-act, ui-history.
+    if let Some(r) = crate::ui_ctl::ctl(app, &words, cmd) {
+        return r;
+    }
+    if let Some(r) = crate::habit_app::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::werhatwas_app::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::update_app::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::confirm_note::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::sys_ctl::ctl(app, &words) {
+        return r;
+    }
+    if let Some(r) = crate::prog_note::ctl(app, &words) {
         return r;
     }
     if let Some(r) = crate::ctl_mouse::execute(app, &words) {
@@ -159,23 +203,20 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
     if let Some(r) = crate::ctl_desk::execute(app, &words, cmd) {
         return r;
     }
+    // GS-1: the start's summary line (`boot.desktop_ready`), or the marks so far.
+    if let Some(r) = crate::bootmark::ctl(&words) {
+        return r;
+    }
     match words.first().copied().unwrap_or("") {
         "list" => Ok(list(app)),
         // WY-3: the X11 display: its number, Xwayland's state and pid, X11 windows, the clipboard bridge.
         "xwayland" => Ok(app.xwayland.as_ref().map_or_else(|| "xwayland off".to_string(), |x| x.describe())),
         // WY-11: the pointer's mode (hw/software), shape, image, counters and the input-to-move delay.
-        "cursor" => match words.get(1).copied() {
-            // Test aid (headless `--pointer fake` only): the next N door calls fail with ERRNO.
-            Some("fail") => {
-                let (e, n) = (num(2)? as i32, num(3).unwrap_or(1.0) as u32);
-                if app.cursor.inject(e, n) { Ok(format!("next {n} cursor calls fail with errno {e}")) } else { Err("no fake hardware cursor".into()) }
-            }
-            _ => Ok(app.cursor.report()),
-        },
+        "cursor" => Ok(app.cursor.report()),
         "stats" => {
             // WY-7: how programs start and how many still wait for their window (read here only, no loop cost).
             let how = if crate::spawn::trampoline().is_some() { "trampoline" } else { "fork" };
-            let r = format!("{} output={}x{} launching={} spawn={how} scanout={} build={} renderer={}", app.stats.report(), comp.size().0, comp.size().1, app.launches.count(), if comp.draws_direct() { "direct" } else { "readback" }, crate::flavour::name(), comp.renderer());
+            let r = format!("{} output={}x{} launching={} spawn={how} renderer={}", app.stats.report(), comp.size().0, comp.size().1, app.launches.count(), comp.renderer());
             if words.get(1) == Some(&"reset") {
                 app.stats = Default::default();
             }
@@ -264,22 +305,14 @@ fn execute(app: &mut App, comp: &dyn Picture, cmd: &str) -> Result<String, Strin
             Ok(format!("sent={sent} client={}", if alive { "connected" } else { "dropped" }))
         }
         "quit" => run(app, Action::Quit),
-        // WY-21: the next present waits as one stuck in the driver would (a test's and the desk's: the GPU desktop's
-        // stall watch must end it within `gpu_watch::STALL`, and the rescue build take over). At most a minute.
-        "stall" => {
-            let secs = num(1)?;
-            if !(0.0..=60.0).contains(&secs) {
-                return Err("stall SECS (0 to 60)".into());
-            }
-            eprintln!("bitscomp: ctl stall {secs} s: the next present waits that long");
-            app.stall = Some(std::time::Duration::from_secs_f64(secs));
-            app.needs_frame = true;
-            Ok(format!("the next present waits {secs} s"))
-        }
         "size" => {
             app.requested_size = Some((num(1)? as i32, num(2)? as i32));
             Ok("ok".into())
         }
+        // CL-6: a program of the library by its name (mcp_start.rs), for BitsOS's assistant.
+        "program-start" => app.ctl_program_start(cmd.trim_start().strip_prefix("program-start").unwrap_or("")),
+        // Which entry a name means, before anybody is asked whether it may start: `<id>\t<name>`.
+        "program-find" => app.ctl_program_find(cmd.trim_start().strip_prefix("program-find").unwrap_or("")),
         "spawn" => {
             let argv: Vec<&str> = words[1..].to_vec();
             app.spawn(&argv).map(|pid| format!("pid {pid}")).ok_or_else(|| "spawn failed".into())
@@ -303,7 +336,7 @@ fn run(app: &mut App, a: Action) -> Result<String, String> {
     Ok(format!("{a:?}"))
 }
 
-fn list(app: &App) -> String {
+pub(crate) fn list(app: &App) -> String {
     let mut out = String::new();
     for p in app.placements() {
         let (app_id, title) = names(&p.win);

@@ -1,4 +1,4 @@
-//! GX-7h: the two VM hubs in the fakes (gx-scout-bringup.md "hub fakes"): a register file with the values the
+//! GX-7h: the two VM hubs in the fakes: a register file with the values the
 //! 780M's firmware leaves (the 27.10. capture's first reads: L1 TLB 0x501, L2 0x80602, every context 0x01fffe00,
 //! fault control 0x3ffffffc, CNTL2 GC 0x20000 / MM 0xa0000, CP_DEBUG 0x400000; registers Linux never reads start
 //! at 0), invalidation engines (a request sets its VMIDs' ack bits; the semaphore is taken by a read and given back
@@ -22,11 +22,14 @@
 //! MAPPING_ERROR outside the context's range), and the access goes to the protection-fault default page when the
 //! context has its fault defaults on (gfxhub_v3_0 setup_vmid_config): the client goes on, as on the chip with
 //! retry off. The IH's VMID-to-PASID table (IH_VMID_n_LUT, OSSSYS) lives here too: the fault path reads it with
-//! the hub registers and the rings write it beside them (gmc_v11_0_emit_pasid_mapping).
+//! the hub registers and the rings write it beside them (gmc_v11_0_emit_pasid_mapping); GX-8v: MMHUB's table
+//! (IH_VMID_n_LUT_MM, 16 dwords further) as well. Assumed, not seen: an MMHUB engine whose ADDR_RANGE was never
+//! programmed (LO32 0xffffffff, HI32 0x1f, mmhub_v3_0_1_program_invalidation) acks a request but invalidates nothing,
+//! so its walkers keep the base they had (GFXHUB's engines: the GMC stage programs them all).
 
 use super::disc::Discovery;
 use super::gmc::HubAddrs;
-use crate::ipmod::gmc11::{CONTEXTS, ENGINES, Hub, R, f};
+use crate::ipmod::gmc11::{CONTEXTS, ENGINES, Hub, R, RANGE_HI_ALL, RANGE_LO_ALL, f};
 use crate::ipmod::ih6;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -54,6 +57,9 @@ pub enum HubHostile {
     CpgHalts,
     /// GX-7m3: a VM fault reaches no status register (a client halts and nothing says why).
     FaultUnrecorded,
+    /// GX-8v: MMHUB does not translate VMIDs 1-15 while its L2 is off as the firmware leaves it (unmeasured on the
+    /// chip): every such access faults.
+    MmNoVm,
 }
 
 /// GX-7m2: what an engine does at a VM address (the permission it needs).
@@ -94,11 +100,18 @@ pub struct HubFake {
     /// GX-7m: the page-table base each VMID's walker latched at its last invalidate (index = VMID).
     /// (On the heap: the fakes live on ktest stacks.)
     latched: Vec<Option<u64>>,
-    /// GX-7m: IH_VMID_0_LUT's byte (OSSSYS segment 0) and the 16 entries.
+    /// GX-7m: IH_VMID_0_LUT's byte (OSSSYS segment 0) and the 16 entries; GX-8v: LUT_MM's 16 after them.
     lut_base: Option<u32>,
     lut: Vec<u32>,
     /// GX-7m: every IH_VMID_n_LUT write: (VMID, PASID).
     pub lut_writes: Vec<(u8, u32)>,
+    /// GX-8v: every IH_VMID_n_LUT_MM write: (VMID, PASID).
+    pub lut_mm_writes: Vec<(u8, u32)>,
+}
+
+/// GX-8v: the latch slot of a hub's VMID (GFXHUB's 0-15, MMHUB's 16-31).
+fn latch_index(hub: Hub, vmid: u8) -> usize {
+    usize::from(vmid & 0xf) + if hub == Hub::Mm { CONTEXTS as usize } else { 0 }
 }
 
 /// GR-1's walker reads the fake's memory through this (8 bytes at a host-physical address).
@@ -139,10 +152,11 @@ impl HubFake {
             sem_taken: 0,
             faults: Vec::new(),
             read_set: alloc::collections::BTreeSet::new(),
-            latched: alloc::vec![None; CONTEXTS as usize],
+            latched: alloc::vec![None; 2 * CONTEXTS as usize],
             lut_base: d.reg(super::hwid::OSSSYS, 0, ih6::IH_VMID_0_LUT.0, ih6::IH_VMID_0_LUT.1).and_then(|x| x.checked_mul(4)),
-            lut: alloc::vec![0; CONTEXTS as usize],
+            lut: alloc::vec![0; 2 * CONTEXTS as usize],
             lut_writes: Vec::new(),
+            lut_mm_writes: Vec::new(),
         };
         for a in [h.gfx, h.mm].into_iter().flatten() {
             for r in all_regs() {
@@ -223,12 +237,14 @@ impl HubFake {
                 let dead = self.hostile == HubHostile::NoAck(hub) || (hub == Hub::Gfx && self.hostile == HubHostile::NoAckEngine(e));
                 let ack = if dead { 0 } else { value & 0xffff };
                 self.acks.insert((hub, e), ack);
-                // GX-7m: the walkers of the VMIDs the request names take their context's base now.
-                if hub == Hub::Gfx && ack != 0 {
+                // GX-7m: the walkers of the VMIDs the request names take their context's base now (GX-8v: per hub; on
+                // MMHUB only through an engine whose range covers everything).
+                let ranged = hub == Hub::Gfx || (self.get(hub, R::RangeLo(e)) == RANGE_LO_ALL && self.get(hub, R::RangeHi(e)) & RANGE_HI_ALL == RANGE_HI_ALL);
+                if ack != 0 && ranged {
                     for n in 1..CONTEXTS {
                         if ack >> n & 1 != 0 {
                             let base = u64::from(self.get(hub, R::PtBaseLo(n))) | u64::from(self.get(hub, R::PtBaseHi(n))) << 32;
-                            self.latched[n as usize] = Some(base);
+                            self.latched[latch_index(hub, n)] = Some(base);
                         }
                     }
                 }
@@ -279,7 +295,7 @@ impl HubFake {
 
     fn lut_index(&self, byte: u32) -> Option<usize> {
         let o = byte.checked_sub(self.lut_base?)?;
-        (o % 4 == 0 && o / 4 < u32::from(CONTEXTS)).then_some((o / 4) as usize)
+        (o % 4 == 0 && o / 4 < 2 * u32::from(CONTEXTS)).then_some((o / 4) as usize)
     }
 
     /// GX-7m: an IH_VMID_n_LUT entry (CPU or ring).
@@ -290,7 +306,8 @@ impl HubFake {
     pub fn lut_write(&mut self, byte: u32, value: u32) -> bool {
         let Some(i) = self.lut_index(byte) else { return false };
         self.lut[i] = value;
-        self.lut_writes.push((i as u8, value));
+        let c = usize::from(CONTEXTS);
+        if i < c { self.lut_writes.push((i as u8, value)) } else { self.lut_mm_writes.push(((i - c) as u8, value)) }
         true
     }
 
@@ -310,9 +327,14 @@ impl HubFake {
         self.lut_write(byte, value) || self.write(byte, value)
     }
 
-    /// GX-7m: the base VMID `vmid`'s walker uses (latched at its last invalidate).
+    /// GX-7m: the base GFXHUB's VMID `vmid`'s walker uses (latched at its last invalidate).
     pub fn latched(&self, vmid: u8) -> Option<u64> {
-        self.latched.get(vmid as usize).copied().flatten()
+        self.latched_on(Hub::Gfx, vmid)
+    }
+
+    /// GX-8v: the same on either hub.
+    pub fn latched_on(&self, hub: Hub, vmid: u8) -> Option<u64> {
+        self.latched.get(latch_index(hub, vmid)).copied().flatten()
     }
 
     /// GX-7m: an access of client `cid` through GFXHUB in VMID `vmid` (1-15): the 4-level walk from the latched
@@ -326,10 +348,10 @@ impl HubFake {
         let start = g(self, R::PtStartLo(n)) | g(self, R::PtStartHi(n)) << 32;
         let end = g(self, R::PtEndLo(n)) | g(self, R::PtEndHi(n)) << 32;
         let write = access == Access::Write;
-        let kind = if ctx & f::CTX_ENABLE == 0 || !(start..=end).contains(&page) {
+        let kind = if ctx & f::CTX_ENABLE == 0 || !(start..=end).contains(&page) || (hub == Hub::Mm && self.hostile == HubHostile::MmNoVm) {
             1 << 8
         } else {
-            let root = self.latched(n).unwrap_or(0) & 0x0000_ffff_ffff_f000;
+            let root = self.latched_on(hub, n).unwrap_or(0) & 0x0000_ffff_ffff_f000;
             match walk::walk(&Tables(mem), root, amdgpu_fmt::addr::sign_extend(va & amdgpu_fmt::addr::HOLE_MASK)) {
                 Ok(Walk::Page(l)) => {
                     let exec = l.flags.exec && self.hostile != HubHostile::NoExecute;

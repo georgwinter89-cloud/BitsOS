@@ -1,5 +1,5 @@
 //! HID class pieces without hardware: the HID descriptor (HID 1.11 §6.2.1), the class requests (§7.2) and
-//! names (Linux `hidinput_allocate`, linux-6.6/drivers/hid/hid-input.c:2007-2075).
+//! names (Linux `hidinput_allocate`, linux-7.3.1/drivers/hid/hid-input.c:2063-2132).
 
 use alloc::format;
 use alloc::string::String;
@@ -32,34 +32,41 @@ pub const MAX_STATE_BYTES: u64 = 4 << 20;
 pub struct HidDescriptor {
     pub version: u16,
     pub country: u8,
-    /// wDescriptorLength of the (last) report descriptor entry, as Linux `usbhid_parse` takes it.
+    /// wDescriptorLength of the first class descriptor when it is the report descriptor, as Linux `usbhid_parse`
+    /// takes it.
     pub report_len: u16,
 }
 
 /// Linux `HID_MAX_DESCRIPTOR_SIZE` (include/uapi/linux/hid.h:78): longer report descriptors are refused.
 pub const MAX_DESCRIPTOR_BYTES: u16 = 4096;
 
-/// The HID descriptor among an interface's class-specific descriptors; None if there is none or it names no
-/// report descriptor or one of 0 or more than 4096 bytes (Linux refuses the interface then, usbhid_parse,
-/// linux-6.6/drivers/hid/usbhid/hid-core.c:1027-1030; a boot interface falls back to the boot protocol).
-pub fn hid_descriptor(extra: &[u8]) -> Option<HidDescriptor> {
-    let mut i = 0usize;
-    while i + 2 <= extra.len() {
-        let len = extra[i] as usize;
-        if len < 2 || i + len > extra.len() {
+/// The HID descriptor of an interface as Linux `usbhid_parse` takes it (linux-7.3.1/drivers/hid/usbhid/hid-core.c:1009-1048):
+/// the first descriptor of type HID and at least 9 bytes among the interface's class-specific descriptors, else
+/// among its first endpoint's (none when a descriptor's length is below 2 or runs past the end, as
+/// `__usb_get_extra_descriptor`). Only its first class descriptor counts: the report length is taken when that
+/// one is a Report descriptor; a bNumDescriptors that does not fit bLength is repaired from bLength there and
+/// changes nothing else. None when there is no HID descriptor or the report length is 0 or above 4096 (Linux
+/// refuses the interface then; a boot interface falls back to the boot protocol).
+pub fn hid_descriptor(extra: &[u8], ep0_extra: Option<&[u8]>) -> Option<HidDescriptor> {
+    let d = find_hid(extra).or_else(|| ep0_extra.and_then(find_hid))?;
+    let report_len = if d[6] == DT_REPORT { u16::from_le_bytes([d[7], d[8]]) } else { 0 };
+    if report_len == 0 || report_len > MAX_DESCRIPTOR_BYTES {
+        return None;
+    }
+    Some(HidDescriptor { version: u16::from_le_bytes([d[2], d[3]]), country: d[4], report_len })
+}
+
+/// `__usb_get_extra_descriptor(.., HID_DT_HID, .., 9)` (linux-7.3.1/drivers/usb/core/usb.c:954).
+fn find_hid(mut b: &[u8]) -> Option<&[u8]> {
+    while b.len() >= 2 {
+        let len = b[0] as usize;
+        if len < 2 || len > b.len() {
             return None;
         }
-        let d = &extra[i..i + len];
-        if d[1] == DT_HID && len >= 9 {
-            let n = (d[5] as usize).min((len - 6) / 3);
-            let report_len = (0..n)
-                .filter(|k| d[6 + 3 * k] == DT_REPORT)
-                .map(|k| u16::from_le_bytes([d[7 + 3 * k], d[8 + 3 * k]]))
-                .next_back()
-                .filter(|&l| l > 0 && l <= MAX_DESCRIPTOR_BYTES)?;
-            return Some(HidDescriptor { version: u16::from_le_bytes([d[2], d[3]]), country: d[4], report_len });
+        if b[1] == DT_HID && len >= 9 {
+            return Some(&b[..len]);
         }
-        i += len;
+        b = &b[len..];
     }
     None
 }
@@ -85,7 +92,8 @@ pub fn get_report_feature(iface: u8, id: u8, len: u16) -> Setup {
 
 /// Sixaxis-family pads that send no report before the host reads feature reports 0xF2 (17 bytes) and 0xF5
 /// (8 bytes): Linux hid-sony `sixaxis_set_operational_usb` (linux-6.6/drivers/hid/hid-sony.c:1133-1180, sizes
-/// :465-466) for SIXAXIS_CONTROLLER_USB and NAVIGATION_CONTROLLER_USB (device table :2222-2257).
+/// :465-466) for SIXAXIS_CONTROLLER_USB and NAVIGATION_CONTROLLER_USB (device table :2222-2257) (Linux 7.3.1
+/// differs: linux-7.3.1/drivers/hid/hid-sony.c:1425, see plan/spec/linux7-differences.md).
 pub const SIXAXIS_USB: [(u16, u16); 3] = [(0x054C, 0x0268), (0x054C, 0x042F), (0x1345, 0x3008)];
 pub const SIXAXIS_WAKE: [(u8, u16); 2] = [(0xF2, 17), (0xF5, 8)];
 
@@ -110,10 +118,9 @@ pub fn fast_interval(speed: Speed, b_interval: u8) -> Option<u8> {
     }
 }
 
-/// The interval wish for an interface: `fast_interval` for a pad, None for any other interface and when
-/// CONFIG `usbhid_pad_binterval=on` (`keep_descriptor`) keeps the descriptor's bInterval.
-pub fn pad_poll(pad: bool, keep_descriptor: bool, speed: Speed, b_interval: u8) -> Option<u8> {
-    if pad && !keep_descriptor { fast_interval(speed, b_interval) } else { None }
+/// The interval wish for an interface: `fast_interval` for a pad, None for any other interface.
+pub fn pad_poll(pad: bool, speed: Speed, b_interval: u8) -> Option<u8> {
+    if pad { fast_interval(speed, b_interval) } else { None }
 }
 
 /// Milliseconds (or fractions) the controller waits between polls for `b_interval` at `speed`, as xHCI
@@ -126,8 +133,8 @@ pub fn poll_us(speed: Speed, b_interval: u8) -> u32 {
     125 << exp
 }
 
-/// The wished poll period in microseconds as the MCP tool and `hid.bound` show it, `none` without a wish. Only a
-/// wish until usb-core's PipeOpts carries an interval (plan/notes/in-IN-2b.md, change request 1).
+/// The wished poll period in microseconds as the MCP tool and `hid.bound` show it, `none` without a wish (applied
+/// through usb-core's `PipeOpts::with_interval`).
 pub fn poll_want_us(speed: Speed, want: Option<u8>) -> String {
     want.map(|b| format!("{}", poll_us(speed, b))).unwrap_or_else(|| String::from("none"))
 }
@@ -185,23 +192,47 @@ mod tests {
 
     #[test]
     fn hid_descriptor_from_extra_bytes() {
+        let h = |b: &[u8]| hid_descriptor(b, None);
         // QEMU usb-kbd: HID 1.11, country 0, one report descriptor of 63 bytes.
         let kbd = [0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x3F, 0x00];
-        assert_eq!(hid_descriptor(&kbd), Some(HidDescriptor { version: 0x0111, country: 0, report_len: 63 }));
-        // Behind another class descriptor; two entries (a physical descriptor first).
-        let two = [0x04, 0x24, 0x00, 0x00, 0x0C, 0x21, 0x10, 0x01, 0x09, 0x02, 0x23, 0x10, 0x00, 0x22, 0x80, 0x01];
-        assert_eq!(hid_descriptor(&two).map(|h| (h.country, h.report_len)), Some((9, 0x180)));
-        // bNumDescriptors larger than the descriptor holds: only what fits is read (Linux min_t).
+        assert_eq!(h(&kbd), Some(HidDescriptor { version: 0x0111, country: 0, report_len: 63 }));
+        // Behind another class descriptor; two entries, the report descriptor first, a physical one second.
+        let two = [0x04, 0x24, 0x00, 0x00, 0x0C, 0x21, 0x10, 0x01, 0x09, 0x02, 0x22, 0x80, 0x01, 0x23, 0x10, 0x00];
+        assert_eq!(h(&two).map(|h| (h.country, h.report_len)), Some((9, 0x180)));
+        // Linux 7 reads only the first class descriptor: a physical descriptor first means no report length
+        // (6.6 and the old V2 took the last Report entry).
+        let physical_first = [0x0C, 0x21, 0x10, 0x01, 0x09, 0x02, 0x23, 0x10, 0x00, 0x22, 0x80, 0x01];
+        assert_eq!(h(&physical_first), None);
+        // A wrong bNumDescriptors is repaired from bLength and changes nothing: 5 in 9 bytes, and 0.
         let lying = [0x09, 0x21, 0x11, 0x01, 0x00, 0x05, 0x22, 0x10, 0x00];
-        assert_eq!(hid_descriptor(&lying).map(|h| h.report_len), Some(16));
+        assert_eq!(h(&lying).map(|h| h.report_len), Some(16));
+        let none = [0x09, 0x21, 0x11, 0x01, 0x00, 0x00, 0x22, 0x10, 0x00];
+        assert_eq!(h(&none).map(|h| h.report_len), Some(16));
         // Linux's size bound: 4096 bytes pass, 4097 and 65535 do not.
-        assert_eq!(hid_descriptor(&[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x00, 0x10]).map(|h| h.report_len), Some(4096));
-        assert_eq!(hid_descriptor(&[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x01, 0x10]), None);
-        assert_eq!(hid_descriptor(&[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0xFF, 0xFF]), None);
+        assert_eq!(h(&[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x00, 0x10]).map(|h| h.report_len), Some(4096));
+        assert_eq!(h(&[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x01, 0x10]), None);
+        assert_eq!(h(&[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0xFF, 0xFF]), None);
+        // A HID descriptor below 9 bytes is passed over; the next one counts.
+        let short_first = [0x06, 0x21, 0x11, 0x01, 0, 0, 0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x20, 0x00];
+        assert_eq!(h(&short_first).map(|h| h.report_len), Some(32));
         for bad in [&[][..], &[0x09, 0x21, 0x11][..], &[0x00, 0x21][..], &[0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0, 0][..],
-            &[0x09, 0x21, 0x11, 0x01, 0, 1, 0x23, 9, 0][..], &[0x06, 0x21, 0x11, 0x01, 0, 0][..]] {
-            assert_eq!(hid_descriptor(bad), None, "{bad:x?}");
+            &[0x09, 0x21, 0x11, 0x01, 0, 1, 0x23, 9, 0][..], &[0x06, 0x21, 0x11, 0x01, 0, 0][..],
+            // A bogus length before the HID descriptor ends the search.
+            &[0x01, 0x24, 0x09, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x10, 0x00][..]] {
+            assert_eq!(h(bad), None, "{bad:x?}");
         }
+    }
+
+    #[test]
+    fn hid_descriptor_after_the_first_endpoint() {
+        // usbhid_parse looks at endpoint[0]'s descriptors when the interface has none.
+        let ep = [0x09, 0x21, 0x10, 0x01, 0x00, 0x01, 0x22, 0x41, 0x00];
+        assert_eq!(hid_descriptor(&[], Some(&ep)).map(|h| h.report_len), Some(0x41));
+        assert_eq!(hid_descriptor(&[0x04, 0x24, 0, 0], Some(&ep)).map(|h| h.report_len), Some(0x41));
+        // The interface's own one wins; an interface without endpoints has no second place to look.
+        let own = [0x09, 0x21, 0x10, 0x01, 0x00, 0x01, 0x22, 0x10, 0x00];
+        assert_eq!(hid_descriptor(&own, Some(&ep)).map(|h| h.report_len), Some(0x10));
+        assert_eq!(hid_descriptor(&[], None), None);
     }
 
     #[test]
@@ -239,11 +270,10 @@ mod tests {
         assert_eq!((fast_interval(Speed::High, 4), fast_interval(Speed::High, 1)), (None, None));
         assert_eq!(fast_interval(Speed::Super, 16), Some(4));
         assert_eq!(poll_us(Speed::Super, 1), 125);
-        // CONFIG usbhid_pad_binterval=on keeps the descriptor's; a keyboard or mouse never gets a wish.
-        assert_eq!(pad_poll(true, false, Speed::Low, 10), Some(1));
-        assert_eq!(pad_poll(true, true, Speed::Low, 10), None);
-        assert_eq!(pad_poll(true, true, Speed::High, 7), None);
-        assert_eq!(pad_poll(false, false, Speed::Low, 10), None);
+        // A keyboard or mouse never gets a wish.
+        assert_eq!(pad_poll(true, Speed::Low, 10), Some(1));
+        assert_eq!(pad_poll(true, Speed::High, 7), Some(4));
+        assert_eq!(pad_poll(false, Speed::Low, 10), None);
         assert_eq!((poll_want_us(Speed::Low, Some(1)), poll_want_us(Speed::Low, None)), (String::from("1000"), String::from("none")));
         assert!(is_pad(0x10004) && is_pad(0x10005) && !is_pad(0x10002) && !is_pad(0x10006) && !is_pad(0x10008));
     }

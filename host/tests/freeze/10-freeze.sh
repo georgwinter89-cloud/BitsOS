@@ -8,7 +8,7 @@
 # key presses. Green when the probe's threads are in class interactive under the load, every deadline of its
 # clock thread and every key event its reader sees are within 500 ms, no press is lost, every busy thread counted,
 # the hogs made progress and stop ends the hung program. Functional only: the QEMU numbers go to numbers.txt; the
-# real numbers come from the Mini-PC (plan/notes/sc-SC-7c.md). Before the desk applied the SC-7a/7b integration
+# real numbers come from the Mini-PC. Before the desk applied the SC-7a/7b integration
 # the run is red at the first missing piece; FREEZE_EXPECT_B4=0 runs every check anyway and ends red by name.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"

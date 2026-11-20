@@ -4,11 +4,10 @@
 Usage: v2_radv.py <mcp host port> <token> <qmp socket> <run dir> <host reference dir>
 1. /dev/dri/renderD128 and /sys/class/drm exist; 2. drmprobe (libdrm's drmGetDevices2/drmGetDevice2/drmGetVersion
 through the staged Mesa tree's loader) prints the same "drm:" lines as on CachyOS; 3. `run --check` with RADV only
-lists the node; 4. `vulkaninfo --summary` and `vulkaninfo` with RADV only (MESA_VK_DRIVERS=radeon_icd) end with an
+lists the node; 4. `vulkaninfo --summary` and `vulkaninfo` with RADV (the tree's one Vulkan driver) end with an
 exit code, never a signal, and name no crash; 5. the kernel's `drm` events name the first ioctl the fake does not
 answer. DR-4: RADV gets through the amdgpu winsys set-up (INFO, CTX: no unknown query, no unsupported INFO/CTX)
-and stops at its first buffer (vkCreateDevice: GEM_CREATE is the next ioctl); lavapipe alone still lists itself
-(with RADV beside it vulkaninfo now stops at RADV's vkCreateDevice, recorded only). DR-7: with GEM (DR-6) and the
+and stops at its first buffer (vkCreateDevice: GEM_CREATE is the next ioctl). DR-7: with GEM (DR-6) and the
 per-fd GPU VM RADV gets past memory allocation: vulkaninfo ends with 0 and no "Failed to allocate", GEM_VA ran
 (the drm `vm.created` event), no GEM or VM ioctl is unsupported; the next unsupported ioctl is recorded (none for
 vulkaninfo: the next one, CS, comes with the first queue submit). DR-8: CS, WAIT_CS and WAIT_FENCES are answered;
@@ -29,7 +28,7 @@ T = "/boot/BITSOS2/mesa"
 PROBE = "/boot/BITSOS2/drtest/drmprobe"
 WORK = "/tmp/dr"
 ENV = dict(v.ENV, HOME=f"{WORK}/home")
-RADV = dict(ENV, MESA_VK_DRIVERS="radeon_icd")
+RADV = ENV
 REPORT = {}
 
 
@@ -70,16 +69,6 @@ def main():
         REPORT[tag] = {"ended": how, "tail": text.splitlines()[-25:]}
         need(how is not None and how[0] == "exit", f"{tag} with RADV ends with an exit code, not a signal ({how})", text[-3000:])
         need(not re.search(r"Segmentation fault|SIGSEGV|core dumped|Aborted", text), f"{tag}: no crash", text[-3000:])
-
-    # The software drivers must not suffer from the fake GPU: lavapipe alone, and EGL with radeonsi beside llvmpipe.
-    _, text = run(c, [f"{T}/run", "vulkaninfo", "--summary"], dict(ENV, MESA_VK_DRIVERS="lvp_icd"), tag="vulkaninfo-lvp")
-    REPORT["vulkaninfo_lvp"] = {"ended": ended(text), "lavapipe": "llvmpipe" in text}
-    need(ended(text) == ("exit", 0) and "llvmpipe" in text, "vulkaninfo with lavapipe lists lavapipe", text[-3000:])
-    _, text = run(c, [f"{T}/run", "vulkaninfo", "--summary"], ENV, tag="vulkaninfo-both")
-    REPORT["vulkaninfo_both"] = {"ended": ended(text), "lavapipe": "llvmpipe" in text, "tail": text.splitlines()[-8:]}
-    _, text = run(c, [f"{T}/run", "eglinfo", "-B"], ENV, tag="eglinfo")
-    REPORT["eglinfo"] = {"ended": ended(text), "llvmpipe": "llvmpipe" in text}
-    need(ended(text) is not None and ended(text)[0] == "exit" and "llvmpipe" in text, "eglinfo -B still finds llvmpipe", text[-3000:])
 
     # DR-8: vkcube with RADV, recorded only (QEMU has no Wayland compositor or KMS for it, so it may stop before
     # its first frame; the report says where).

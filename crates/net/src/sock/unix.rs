@@ -1,7 +1,8 @@
-//! AF_UNIX sockets (linux-6.6/net/unix/af_unix.c): stream, datagram and seqpacket; path names (a socket inode
+//! AF_UNIX sockets (linux-7.3.1/net/unix/af_unix.c): stream, datagram and seqpacket; path names (a socket inode
 //! made through the VFS, found again by its inode), abstract names (one name space per socket type, as Linux's
 //! hash includes the type) and autobind; listen/connect/accept with embryo sockets in the listener's queue;
-//! socketpair; SCM_RIGHTS and SCM_CREDENTIALS; SO_PEERCRED.
+//! socketpair; SCM_RIGHTS, SCM_CREDENTIALS, SCM_PIDFD and SCM_INQ; SO_PEERCRED, SO_PASSRIGHTS (a receiver that
+//! turned it off refuses files with EPERM, af_unix.c:2245, :2485).
 //!
 //! Locks (R5): `st` (one socket's state and receive queue) is a short spin section and never nested with
 //! another socket's `st`; the name tables are taken before a socket's `st` (bind) and never inside it. Nothing
@@ -16,7 +17,7 @@
 use super::abi::*;
 use super::addr::{self, UnixName, UnixTarget};
 use super::unix_gc::InFlight;
-use super::{Caller, Deadline, Opts, Received, Source, Ucred, flag, wait};
+use super::{Caller, Deadline, Opts, PinnedPid, Program, Received, ScmPid, Source, Ucred, flag, wait};
 use crate::netns::Net;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -88,7 +89,7 @@ pub(crate) struct Packet {
     /// The sender's name when it sent (recvfrom's address).
     from: Option<UnixName>,
     /// Attached credentials (explicit SCM_CREDENTIALS, or the sender's when a side has SO_PASSCRED).
-    creds: Option<Ucred>,
+    creds: Option<SentBy>,
     files: Option<InFlight>,
     /// A listener's queue: a connection waiting for accept (its embryo socket).
     conn: Option<Arc<UnixSock>>,
@@ -135,6 +136,8 @@ struct St {
     /// `sk_max_ack_backlog`: the listen backlog, or the datagram queue limit.
     backlog: usize,
     peercred: Option<Ucred>,
+    /// The program image behind `peercred`, set and copied wherever that is (`sk_peer_cred`'s companion).
+    peerprog: Option<Arc<Program>>,
     dead: bool,
     /// Made by a connect and not yet accepted (`!sk->sk_socket`).
     embryo: bool,
@@ -161,7 +164,7 @@ pub struct UnixSock {
 }
 
 /// Abstract names of one network namespace, one name space per socket type: (type, name bytes) -> socket
-/// (NW-11: per namespace as Linux's `unix_table` in `struct net`, linux-6.6/net/unix/af_unix.c:370).
+/// (NW-11: per namespace as Linux's `unix_table` in `struct net`, linux-7.3.1/net/unix/af_unix.c:377).
 pub(crate) struct Names(SpinLock<BTreeMap<(UType, Vec<u8>), Weak<UnixSock>>>);
 
 impl Names {
@@ -317,6 +320,42 @@ fn find(name: &UnixName, ty: UType, net: &Net, ctx: Option<&vfs::Ctx<'_>>, calle
     Ok(s)
 }
 
+/// A message's credentials and the process they name, held from the send on (`UNIXCB(skb).pid`).
+#[derive(Clone)]
+struct SentBy {
+    ucred: Ucred,
+    pin: Option<PinnedPid>,
+}
+
+impl PartialEq for SentBy {
+    /// `unix_skb_scm_eq`: the same ids and the same process, not merely the same pid number.
+    fn eq(&self, o: &SentBy) -> bool {
+        self.ucred == o.ucred
+            && match (&self.pin, &o.pin) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (a, b) => a.is_none() && b.is_none(),
+            }
+    }
+}
+
+/// The process a send's credentials name, held through proc's hook, which takes proc's locks and so runs with
+/// no socket lock held: when [`Pinned::need`] says so, the sender drops its lock, calls [`Pinned::take`] and
+/// looks again (the credentials name the same pid every round: the explicit one or the caller's).
+#[derive(Default)]
+struct Pinned(Option<Option<PinnedPid>>);
+
+impl Pinned {
+    fn need(&self, c: &Option<Ucred>) -> bool {
+        c.is_some() && self.0.is_none() && super::pidfd_hooked()
+    }
+    fn take(&mut self, c: &Option<Ucred>) {
+        self.0 = Some(c.and_then(|c| super::pin_pid(c.pid)));
+    }
+    fn sent_by(&self, c: Option<Ucred>) -> Option<SentBy> {
+        c.map(|ucred| SentBy { ucred, pin: self.0.clone().flatten() })
+    }
+}
+
 /// The Linux view of a not-attached credential: pid 0, ids shown as overflowuid.
 fn shown(c: Option<Ucred>) -> Ucred {
     c.unwrap_or(Ucred { pid: 0, uid: OVERFLOW_ID, gid: OVERFLOW_ID })
@@ -345,6 +384,7 @@ impl UnixSock {
                     inode: None,
                     backlog: MAX_DGRAM_QLEN,
                     peercred: None,
+                    peerprog: None,
                     dead: false,
                     embryo: false,
                     connecting: false,
@@ -373,6 +413,7 @@ impl UnixSock {
             s.peer = Some(y.clone());
             s.state = State::Established;
             s.peercred = Some(caller.ucred());
+            s.peerprog = caller.program.clone();
         }
         (a, b)
     }
@@ -398,8 +439,31 @@ impl UnixSock {
         }
     }
 
+    /// SO_PASSCRED: the receiver is given SCM_CREDENTIALS.
     fn passcred(&self) -> bool {
         self.opts.has(flag::PASSCRED)
+    }
+
+    /// `unix_may_passcred` (linux-7.3.1/net/unix/af_unix.c:804): SO_PASSCRED or SO_PASSPIDFD, either makes a
+    /// sender autobind and attach its credentials.
+    fn may_passcred(&self) -> bool {
+        self.opts.has(flag::PASSCRED | flag::PASSPIDFD)
+    }
+
+    /// What a recvmsg gets besides data and files: SCM_CREDENTIALS, SCM_PIDFD (the sender's pid) and the
+    /// SO_PASSSEC mark, as the receiver's options ask (`__scm_recv_common`, `scm_recv_unix`).
+    fn scm_into(&self, r: &mut Received, creds: Option<SentBy>) {
+        if self.passcred() {
+            r.creds = Some(shown(creds.as_ref().map(|c| c.ucred)));
+        }
+        if self.opts.has(flag::PASSPIDFD) {
+            r.pidfd = Some(match creds {
+                None => ScmPid::Nobody,
+                Some(SentBy { pin: None, .. }) => ScmPid::Unheld,
+                Some(SentBy { pin: Some(p), .. }) => ScmPid::Held(p),
+            });
+        }
+        r.sec = self.opts.has(flag::PASSSEC);
     }
 
     /// SO_ERROR (cleared by reading).
@@ -519,6 +583,13 @@ impl UnixSock {
         self.st.lock().peercred
     }
 
+    /// The program image that made this socket's peer, taken with the peer credentials: on an accepted
+    /// socket the program that called connect, on a connected one the program that called listen. None: the
+    /// kernel itself did, or there is no peer.
+    pub fn peer_program(&self) -> Option<Arc<Program>> {
+        self.st.lock().peerprog.clone()
+    }
+
     /// NW-12: what /proc/net/unix shows of this socket (`unix_seq_show`): listening, connected, its name.
     pub(crate) fn proc_row(&self) -> (bool, bool, Option<Vec<u8>>) {
         let s = self.st.lock();
@@ -537,7 +608,8 @@ impl UnixSock {
         if self.ty == UType::Dgram {
             return Err(EOPNOTSUPP);
         }
-        let grew = {
+        // An earlier listen's record is dropped after the lock (its last holder frees memory).
+        let (grew, _before) = {
             let mut s = self.st.lock();
             if s.name.is_none() {
                 return Err(EINVAL);
@@ -549,7 +621,7 @@ impl UnixSock {
             s.backlog = backlog;
             s.state = State::Listen;
             s.peercred = Some(caller.ucred());
-            grew
+            (grew, core::mem::replace(&mut s.peerprog, caller.program.clone()))
         };
         if grew {
             self.wake_senders();
@@ -563,7 +635,7 @@ impl UnixSock {
             return self.dgram_connect(raw, ctx, caller);
         }
         let UnixTarget::Name(name) = addr::parse_unix(raw, false)? else { return Err(EINVAL) };
-        if self.passcred() {
+        if self.may_passcred() {
             self.autobind()?;
         }
         let dl = Deadline::new(nonblock, self.opts.sndtimeo.load(Ordering::Relaxed));
@@ -637,10 +709,15 @@ impl UnixSock {
                 e.peer = Some(self.clone());
                 e.state = State::Established;
                 e.peercred = Some(caller.ucred());
+                e.peerprog = caller.program.clone();
                 e.name = lname;
                 e.path = lpath;
                 e.embryo = true;
             }
+            // `unix_stream_connect` copies the listener's receive options to the embryo as it is made.
+            let inherit = other.opts.flags.load(Ordering::Relaxed) & flag::UNIX_INHERITED;
+            embryo.opts.set(flag::UNIX_INHERITED, false);
+            embryo.opts.set(inherit, true);
             // The listener's queue grows with its `st` dropped (`ksync::spare`); every round looks again.
             let mut spare = ksync::Spare::new();
             let pushed = loop {
@@ -657,16 +734,17 @@ impl UnixSock {
                     continue;
                 }
                 o.q.push_back(Packet { data: Vec::new(), consumed: 0, from: None, creds: None, files: None, conn: Some(embryo.clone()), _charge: None });
-                break Some(o.peercred);
+                break Some((o.peercred, o.peerprog.clone()));
             };
             match pushed {
-                Some(cred) => {
+                Some((cred, prog)) => {
                     {
                         let mut s = self.st.lock();
                         s.peer = Some(embryo.clone());
                         s.state = State::Established;
                         s.connecting = false;
                         s.peercred = cred;
+                        s.peerprog = prog;
                     }
                     other.wake();
                     return Ok(());
@@ -684,7 +762,7 @@ impl UnixSock {
         }
         let other = if addr::family(raw) != Some(AF_UNSPEC) {
             let UnixTarget::Name(name) = addr::parse_unix(raw, false)? else { return Err(EINVAL) };
-            if self.passcred() {
+            if self.may_passcred() {
                 self.autobind()?;
             }
             loop {
@@ -733,7 +811,8 @@ impl UnixSock {
         Ok(())
     }
 
-    /// `unix_accept`: the oldest embryo becomes a socket of its own (SO_PASSCRED is inherited).
+    /// `unix_accept`: the oldest embryo becomes a socket of its own (with the receive options it took from the
+    /// listener at connect).
     pub fn accept(&self, nonblock: bool) -> Result<Arc<UnixSock>, Errno> {
         if self.ty == UType::Dgram {
             return Err(EOPNOTSUPP);
@@ -758,7 +837,6 @@ impl UnixSock {
                 self.wake_senders();
                 let Some(e) = p.conn.take() else { continue };
                 e.st.lock().embryo = false;
-                e.opts.set(flag::PASSCRED, self.passcred());
                 return Ok(e);
             }
             let ready = || {
@@ -958,10 +1036,10 @@ impl UnixSock {
         InFlight::attach(core::mem::take(&mut a.files), a.caller.uid, a.nofile).map(Some)
     }
 
-    /// `maybe_add_creds`: the sender's credentials when either side has SO_PASSCRED or the receiver is an
+    /// `unix_maybe_add_creds`: the sender's credentials when either side has SO_PASSCRED or SO_PASSPIDFD or the receiver is an
     /// embryo nobody accepted yet.
     fn creds_for(&self, explicit: Option<Ucred>, other: &St, other_sock: &UnixSock, caller: &Caller) -> Option<Ucred> {
-        explicit.or_else(|| (self.passcred() || other_sock.passcred() || other.embryo).then(|| caller.ucred()))
+        explicit.or_else(|| (self.may_passcred() || other_sock.may_passcred() || other.embryo).then(|| caller.ucred()))
     }
 
     fn stream_send(self: &Arc<Self>, src: &mut dyn Source, len: usize, mut a: SendArgs<'_>) -> Result<usize, Errno> {
@@ -988,6 +1066,7 @@ impl UnixSock {
         let mut files = self.files_for(&mut a)?;
         let dl = Deadline::new(a.nonblock || a.flags & MSG_DONTWAIT != 0, self.opts.sndtimeo.load(Ordering::Relaxed));
         let mut sent = 0usize;
+        let mut pinned = Pinned::default();
         while sent < len {
             match self.wait_room(dl) {
                 Ok(()) => {}
@@ -1009,17 +1088,29 @@ impl UnixSock {
             let mut spare = ksync::Spare::new();
             let refused = loop {
                 let mut o = peer.st.lock();
+                let creds = self.creds_for(a.creds, &o, &peer, &a.caller);
+                if pinned.need(&creds) {
+                    drop(o);
+                    pinned.take(&creds);
+                    continue;
+                }
                 if o.dead || o.shutdown & RCV_SHUTDOWN != 0 {
                     break Some(Ok(pk));
+                }
+                if pk.files.is_some() && peer.opts.has(flag::NO_RIGHTS) {
+                    break Some(Err((pk, EPERM)));
                 }
                 if !spare.fits(&mut o.q, 1) {
                     drop(o);
                     if spare.grow().is_err() {
-                        break Some(Err(pk));
+                        break Some(Err((pk, ENOMEM)));
                     }
                     continue;
                 }
-                pk.creds = self.creds_for(a.creds, &o, &peer, &a.caller);
+                pk.creds = pinned.sent_by(creds);
+                if let Some(f) = &pk.files {
+                    f.queued_at(&peer, o.embryo);
+                }
                 o.q.push_back(pk);
                 break None;
             };
@@ -1028,10 +1119,11 @@ impl UnixSock {
                     drop(pk);
                     return pipe(sent, a.flags);
                 }
-                Some(Err(pk)) => {
-                    // R2: no room for one more queue entry: what was sent stands, else ENOMEM.
+                Some(Err((pk, e))) => {
+                    // R2: no room for one more queue entry (ENOMEM), or files to a receiver without
+                    // SO_PASSRIGHTS (EPERM): what was sent stands.
                     drop(pk);
-                    return if sent > 0 { Ok(sent) } else { Err(ENOMEM) };
+                    return if sent > 0 { Ok(sent) } else { Err(e) };
                 }
                 None => {}
             }
@@ -1056,7 +1148,7 @@ impl UnixSock {
             Some(_) => None,
             None => Some(self.st.lock().peer.clone().ok_or(ENOTCONN)?),
         };
-        if self.passcred() {
+        if self.may_passcred() {
             self.autobind()?;
         }
         if len > self.opts.sndbuf().saturating_sub(32) {
@@ -1072,6 +1164,7 @@ impl UnixSock {
         let mut pk = Some(Packet { data, consumed: 0, from, creds: None, files, conn: None, _charge: Some(charge) });
         // The receiver's queue grows with its `st` dropped (`ksync::spare`); the round after looks again.
         let mut spare = ksync::Spare::new();
+        let mut pinned = Pinned::default();
         loop {
             let o = match &other {
                 Some(o) => o.clone(),
@@ -1085,6 +1178,7 @@ impl UnixSock {
                 Dead,
                 Full,
                 Grow,
+                Pin(Option<Ucred>),
             }
             let next = {
                 let mut g = o.st.lock();
@@ -1095,6 +1189,8 @@ impl UnixSock {
                     Next::Dead
                 } else if g.shutdown & RCV_SHUTDOWN != 0 {
                     return Err(EPIPE);
+                } else if pk.as_ref().is_some_and(|p| p.files.is_some()) && o.opts.has(flag::NO_RIGHTS) {
+                    return Err(EPERM);
                 } else if !Arc::ptr_eq(&o, self)
                     && !g.peer.as_ref().is_some_and(|p| Arc::ptr_eq(p, self))
                     && g.q.len() > g.backlog
@@ -1103,10 +1199,18 @@ impl UnixSock {
                 } else if !spare.fits(&mut g.q, 1) {
                     Next::Grow
                 } else {
-                    let mut p = pk.take().ok_or(EINVAL)?;
-                    p.creds = self.creds_for(a.creds, &g, &o, &a.caller);
-                    g.q.push_back(p);
-                    Next::Done
+                    let creds = self.creds_for(a.creds, &g, &o, &a.caller);
+                    if pinned.need(&creds) {
+                        Next::Pin(creds)
+                    } else {
+                        let mut p = pk.take().ok_or(EINVAL)?;
+                        p.creds = pinned.sent_by(creds);
+                        if let Some(f) = &p.files {
+                            f.queued_at(&o, g.embryo);
+                        }
+                        g.q.push_back(p);
+                        Next::Done
+                    }
                 }
             };
             match next {
@@ -1115,6 +1219,10 @@ impl UnixSock {
                     return Ok(len);
                 }
                 Next::Grow => spare.grow().map_err(|_| ENOMEM)?,
+                Next::Pin(creds) => {
+                    pinned.take(&creds);
+                    other = Some(o);
+                }
                 Next::Dead => {
                     if self.ty == UType::SeqPacket {
                         return Err(EPIPE);
@@ -1172,7 +1280,7 @@ impl UnixSock {
         let got = loop {
             enum Look {
                 Got(Packet),
-                Peeked(usize, Option<UnixName>, Option<Ucred>, Vec<Arc<OpenFile>>),
+                Peeked(usize, Option<UnixName>, Option<SentBy>, Vec<Arc<OpenFile>>),
                 Grow(usize),
                 Empty,
             }
@@ -1188,7 +1296,7 @@ impl UnixSock {
                             if !fill(&mut buf, &p.data[..n]) {
                                 Look::Grow(n)
                             } else {
-                                Look::Peeked(p.data.len(), p.from.clone(), p.creds, p.files.as_ref().map(|f| f.peek()).unwrap_or_default())
+                                Look::Peeked(p.data.len(), p.from.clone(), p.creds.clone(), p.files.as_ref().map(|f| f.peek()).unwrap_or_default())
                             }
                         }
                         None => Look::Empty,
@@ -1209,7 +1317,7 @@ impl UnixSock {
                     // A failed copy loses the datagram (Linux frees the skb) and closes its files.
                     r?;
                     let Packet { from, creds, files, .. } = p;
-                    break (n, len, from, creds, files.map(|f| f.take()).unwrap_or_default());
+                    break (n, len, from, creds, files.map(|f| f.take(self)).unwrap_or_default());
                 }
                 Look::Peeked(len, from, creds, files) => {
                     sink(&buf)?;
@@ -1249,9 +1357,7 @@ impl UnixSock {
         if want_from {
             r.from = from.map(|f| f.bytes().to_vec());
         }
-        if self.passcred() {
-            r.creds = Some(shown(creds));
-        }
+        self.scm_into(&mut r, creds);
         r.fds = fds;
         Ok(r)
     }
@@ -1262,10 +1368,10 @@ impl UnixSock {
         }
         let peek = flags & MSG_PEEK != 0;
         let target = if flags & MSG_WAITALL != 0 { size } else { (self.opts.rcvlowat.load(Ordering::Relaxed) as usize).min(size) }.max(1);
-        let passcred = self.passcred();
+        let passcred = self.may_passcred();
         let mut io = Some(self.io.lock());
         let mut copied = 0usize;
-        let mut creds: Option<Option<Ucred>> = None;
+        let mut creds: Option<Option<SentBy>> = None;
         let mut from: Option<Vec<u8>> = None;
         let mut fds: Vec<Arc<OpenFile>> = Vec::new();
         // Peeking walks the queue: packet index and offset inside it.
@@ -1277,7 +1383,7 @@ impl UnixSock {
                 break;
             }
             enum Step {
-                Chunk(Option<Ucred>, Option<UnixName>, bool),
+                Chunk(Option<Option<SentBy>>, Option<UnixName>, bool),
                 Grow(usize),
                 Stop,
                 Wait,
@@ -1303,19 +1409,19 @@ impl UnixSock {
                             }
                         }
                         Some(p) => {
-                            if let Some(c) = creds {
-                                if c != p.creds {
+                            if let Some(c) = &creds {
+                                if *c != p.creds {
                                     // Never glue messages from different writers.
                                     Step::Stop
                                 } else {
                                     let off = if peek { p.consumed + poff } else { p.consumed };
                                     let n = (p.data.len() - off).min(size - copied);
-                                    if fill(&mut buf, &p.data[off..off + n]) { Step::Chunk(p.creds, p.from.clone(), p.files.is_some()) } else { Step::Grow(n) }
+                                    if fill(&mut buf, &p.data[off..off + n]) { Step::Chunk((creds.is_none() && passcred).then(|| p.creds.clone()), p.from.clone(), p.files.is_some()) } else { Step::Grow(n) }
                                 }
                             } else {
                                 let off = if peek { p.consumed + poff } else { p.consumed };
                                 let n = (p.data.len() - off).min(size - copied);
-                                if fill(&mut buf, &p.data[off..off + n]) { Step::Chunk(p.creds, p.from.clone(), p.files.is_some()) } else { Step::Grow(n) }
+                                if fill(&mut buf, &p.data[off..off + n]) { Step::Chunk((creds.is_none() && passcred).then(|| p.creds.clone()), p.from.clone(), p.files.is_some()) } else { Step::Grow(n) }
                             }
                         }
                     }
@@ -1357,7 +1463,7 @@ impl UnixSock {
                 }
                 Step::Chunk(pc, pfrom, has_files) => {
                     let bytes = &buf[..];
-                    if creds.is_none() && passcred {
+                    if let Some(pc) = pc {
                         creds = Some(pc);
                     }
                     if want_from && from.is_none() {
@@ -1398,7 +1504,7 @@ impl UnixSock {
                         let (pk, f) = taken;
                         drop(pk);
                         if let Some(f) = f {
-                            fds = f.take();
+                            fds = f.take(self);
                         }
                         if done {
                             break;
@@ -1415,10 +1521,12 @@ impl UnixSock {
         }
         let mut r = Received { n: copied, ..Default::default() };
         r.from = from;
-        if passcred {
-            r.creds = Some(shown(creds.flatten()));
-        }
+        self.scm_into(&mut r, creds.flatten());
         r.fds = fds;
+        // `unix_stream_read_generic` (linux-7.3.1/net/unix/af_unix.c:3110): SO_INQ adds what is still queued.
+        if self.opts.has(flag::INQ) {
+            r.inq = Some(self.queued() as u32);
+        }
         Ok(r)
     }
 
@@ -1467,6 +1575,11 @@ impl UnixSock {
             return Err(EINVAL);
         }
         Ok(if self.ty == UType::Dgram { s.q.front().map_or(0, |p| p.data.len()) } else { s.q.iter().map(|p| p.left()).sum::<usize>() } as i64)
+    }
+
+    /// The bytes waiting in a stream's queue (`unix_sock::inq_len`).
+    fn queued(&self) -> usize {
+        self.st.lock().q.iter().map(|p| p.left()).sum()
     }
 
     /// SIOCOUTQ: what this socket has queued at others (with the per-packet overhead, as Linux's truesize).

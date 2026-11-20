@@ -21,6 +21,8 @@ pub enum Part {
     Float,
     /// WY-5c: a floating window's maximise (and restore) button.
     Max,
+    /// C (12.11.): the minimise button, left of the others.
+    Minimize,
     Close,
     /// A tab and its close button, by stack page (a floating window has one tab, page 0).
     Tab(usize),
@@ -90,6 +92,12 @@ pub fn max_button(f: Rect, t: &Theme) -> Rect {
     Rect { x: c.x - 2 - c.w, ..c }
 }
 
+/// C (12.11.): the minimise button: left of the float button, on a floating window left of the maximise button.
+pub fn min_button(f: Rect, floating: bool, t: &Theme) -> Rect {
+    let c = if floating { max_button(f, t) } else { float_button(f, t) };
+    Rect { x: c.x - 2 - c.w, ..c }
+}
+
 /// The frame the tab strip is laid out in: a floating window's header has one button more, so its tabs end
 /// before the maximise button.
 pub fn tab_frame(f: Rect, floating: bool, t: &Theme) -> Rect {
@@ -121,6 +129,9 @@ pub fn header_part(f: Rect, place: Place, t: &Theme, x: f64, y: f64) -> Part {
     }
     if matches!(place, Place::Floating { .. }) && max_button(f, t).contains(x, y) {
         return Part::Max;
+    }
+    if min_button(f, matches!(place, Place::Floating { .. }), t).contains(x, y) {
+        return Part::Minimize;
     }
     let (n, shown) = pages(place);
     let strip = tabs::strip(tab_frame(f, matches!(place, Place::Floating { .. }), t), n, shown, t);

@@ -1,5 +1,5 @@
 //! Block and inode bitmaps (with their checksums and the `BLOCK_UNINIT`/`INODE_UNINIT` groups mkfs leaves,
-//! linux-6.6/fs/ext4/balloc.c:183 `ext4_init_block_bitmap`, ialloc.c `ext4_read_inode_bitmap`) and the
+//! linux-7.3.1/fs/ext4/balloc.c:182 `ext4_init_block_bitmap`, ialloc.c:125 `ext4_read_inode_bitmap`) and the
 //! allocators: blocks near a goal (the file's last block, else its inode's group), inodes in the parent's
 //! group for files and in the emptiest group for directories (a simple form of Linux's Orlov spreading).
 
@@ -109,59 +109,104 @@ impl State {
     /// Up to `want` free blocks in one run, the first at or after `goal` if possible (then anywhere).
     /// Marked used in `tx` (early). `keep` blocks stay for others (the reserved-for-root count).
     pub fn alloc_blocks(&mut self, tx: &mut Tx, goal: u64, want: u64, keep: u64) -> Result<(u64, u64), i64> {
+        let want = self.grant(want, keep)?;
+        let (g, first, len, b) = self.free_run(Some(tx), goal, want)?;
+        self.mark_used(tx, g, first, len, b);
+        Ok((self.geo.group_start(g) + first, len))
+    }
+
+    /// How many of `want` blocks an allocation that must leave `keep` may take; ENOSPC for none. Blocks a write
+    /// in flight claimed count as taken (`free_now`).
+    pub(crate) fn grant(&self, want: u64, keep: u64) -> Result<u64, i64> {
         if want == 0 {
             return Err(EINVAL);
         }
-        if self.free_blocks() <= keep {
+        if self.free_now() <= keep {
             return Err(ENOSPC);
         }
-        let want = want.min(self.free_blocks() - keep).min(self.geo.bpg);
+        Ok(want.min(self.free_now() - keep).min(self.geo.bpg))
+    }
+
+    /// A run of up to `want` free blocks near `goal`: (group, first bit, length, the group's bitmap as `tx` sees
+    /// it). Nothing is marked. Skipped: blocks freed by a transaction the journal has not committed yet (`busy`)
+    /// and blocks a write in flight claimed (`flight`). When only busy blocks are left the journal is committed
+    /// (under the lock: the last blocks of a volume) and the search runs again; without a journal the device is
+    /// flushed for the blocks freed since its last flush (`held`).
+    pub(crate) fn free_run(&mut self, tx: Option<&Tx>, goal: u64, want: u64) -> Result<(u32, u64, u64, Vec<u8>), i64> {
         let geo = &self.geo;
         let goal = if goal >= geo.first_data_block && goal < geo.blocks { goal } else { geo.first_data_block };
         let g0 = geo.group_of_block(goal);
         let n = geo.groups;
-        for k in 0..=n {
-            let g = (g0 + k) % n;
-            if self.gd.free_blocks(g) == 0 {
-                continue;
-            }
-            let mut b = self.block_bitmap(Some(tx), g)?;
-            let in_group = self.geo.blocks_in(g);
-            let base = self.geo.group_start(g);
-            // Blocks freed by a transaction the journal has not committed yet are not handed out (`busy`).
-            let busy = self.busy_in(tx, base, base + in_group);
-            let real = if busy.is_empty() { None } else { Some(b.clone()) };
-            for (s, e) in busy {
-                for x in s.max(base)..e.min(base + in_group) {
-                    set(&mut b, x - base, true);
+        // One commit frees what the running and the committing transaction hold busy; a second search that still
+        // finds nothing is the answer (a commit whose home writes are owed keeps its blocks busy).
+        for commits in 0..2 {
+            for k in 0..=n {
+                let g = (g0 + k) % n;
+                if self.gd.free_blocks(g) == 0 {
+                    continue;
                 }
+                let mut b = self.block_bitmap(tx, g)?;
+                let in_group = self.geo.blocks_in(g);
+                let base = self.geo.group_start(g);
+                let busy = self.busy_in(tx, base, base + in_group);
+                let real = if busy.is_empty() { None } else { Some(b.clone()) };
+                for (s, e) in busy {
+                    for x in s.max(base)..e.min(base + in_group) {
+                        set(&mut b, x - base, true);
+                    }
+                }
+                let from = if k == 0 { goal - self.geo.group_start(g) } else { 0 };
+                let Some((first, len)) = find_run(&b, from, in_group, want).or_else(|| if k == 0 && from > 0 { find_run(&b, 0, in_group, want) } else { None }) else {
+                    continue;
+                };
+                return Ok((g, first, len, real.unwrap_or(b)));
             }
-            let from = if k == 0 { goal - self.geo.group_start(g) } else { 0 };
-            let Some((first, len)) = find_run(&b, from, in_group, want).or_else(|| if k == 0 && from > 0 { find_run(&b, 0, in_group, want) } else { None }) else {
+            if commits == 0 && let Some(mark) = self.held.mark() {
+                // No journal: the frees wait in the device's cache. One flush under the lock, as the commit below.
+                klog::event!(Info, "ext4", "alloc.flush_for_held", want = want);
+                self.dev.flush()?;
+                self.held.release(mark);
                 continue;
-            };
-            let mut b = real.unwrap_or(b);
-            for i in first..first + len {
-                set(&mut b, i, true);
             }
-            self.save_gd(tx, g);
-            self.put_bitmap(tx, g, false, b, true);
-            let fg = self.gd.free_blocks(g).saturating_sub(len);
-            self.gd.set_free_blocks(g, fg);
-            self.gd_changed(tx, g);
-            let (fb, fi) = (self.free_blocks() - len, self.free_inodes());
-            self.set_free(tx, fb, fi);
-            return Ok((self.geo.group_start(g) + first, len));
-        }
-        if self.jnl.as_ref().is_some_and(|j| !j.run.busy.is_empty() || j.committing.as_ref().is_some_and(|c| !c.busy.is_empty())) {
-            // Only blocks freed in the running (or the committing) journal transaction are left: commit it, then they
-            // are free.
+            let busy = self.jnl.as_ref().is_some_and(|j| !j.run.busy.is_empty() || j.committing.as_ref().is_some_and(|c| !c.busy.is_empty()));
+            if !busy || commits > 0 {
+                break;
+            }
             klog::event!(Info, "ext4", "alloc.commit_for_busy", want = want);
             self.jcommit()?;
-            return self.alloc_blocks(tx, goal, want, keep);
         }
-        klog::event!(Warn, "ext4", "alloc.nospace", free = self.free_blocks(); "free count says space, bitmaps none");
+        klog::event!(Warn, "ext4", "alloc.nospace", free = self.free_blocks(), claimed = self.flights.claimed(); "free count says space, bitmaps none");
         Err(ENOSPC)
+    }
+
+    /// Marks bits [first, first + len) of group `g` used in `tx` (early) and takes them off the free counts; `b`
+    /// is the group's bitmap as `tx` sees it.
+    fn mark_used(&mut self, tx: &mut Tx, g: u32, first: u64, len: u64, mut b: Vec<u8>) {
+        for i in first..first + len {
+            set(&mut b, i, true);
+        }
+        self.save_gd(tx, g);
+        self.put_bitmap(tx, g, false, b, true);
+        let fg = self.gd.free_blocks(g).saturating_sub(len);
+        self.gd.set_free_blocks(g, fg);
+        self.gd_changed(tx, g);
+        let (fb, fi) = (self.free_blocks() - len, self.free_inodes());
+        self.set_free(tx, fb, fi);
+    }
+
+    /// The blocks [p, p + n) a write in flight claimed (`flight`; one group, `free_run`'s run) become its file's
+    /// in `tx`. A claimed block the bitmap shows used would be another owner's: EUCLEAN, nothing marked.
+    pub(crate) fn take_claimed(&mut self, tx: &mut Tx, p: u64, n: u64) -> Result<(), i64> {
+        let g = self.geo.group_of_block(p);
+        let first = p - self.geo.group_start(g);
+        let b = self.block_bitmap(Some(tx), g)?;
+        if first + n > self.geo.blocks_in(g) || (first..first + n).any(|i| bit(&b, i)) {
+            klog::event!(Error, "ext4", "claim.not_free", block = p, n = n; "a block claimed for a file's data is marked used");
+            return Err(EUCLEAN);
+        }
+        self.flights.unclaim(p, n);
+        self.mark_used(tx, g, first, n, b);
+        Ok(())
     }
 
     /// Frees blocks [first, first + n) (they may cross groups). Late in `tx`: after the pointers went.
@@ -172,7 +217,11 @@ impl State {
             klog::event!(Warn, "ext4", "free.out_of_range", first = first, n = n);
             return Err(EUCLEAN);
         }
+        if self.jnl.is_none() {
+            self.held.add(first, n)?;
+        }
         tx.freed.push((first, n));
+        self.flights.late_freed(first, n);
         while b0 < end {
             let g = self.geo.group_of_block(b0);
             let start = self.geo.group_start(g);
@@ -277,11 +326,15 @@ impl State {
     }
 }
 
-/// The first run of free bits in [from, end): the longest up to `want` starting at the first free bit.
 impl State {
-    /// Busy ranges overlapping [start, end): freed in the running journal transaction or in `tx`.
-    fn busy_in(&self, tx: &Tx, start: u64, end: u64) -> Vec<(u64, u64)> {
-        let mut v: Vec<(u64, u64)> = tx.freed.iter().map(|&(s, n)| (s, s + n)).filter(|&(s, e)| s < end && e > start).collect();
+    /// Ranges of [start, end) not to hand out: freed in the running or the committing journal transaction or in
+    /// `tx`, claimed by a write in flight, kept for a write that timed out (`Flights::late`), or (no journal) freed
+    /// and not yet durably so (`held`).
+    fn busy_in(&self, tx: Option<&Tx>, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = tx.iter().flat_map(|t| t.freed.iter()).map(|&(s, n)| (s, s + n)).filter(|&(s, e)| s < end && e > start).collect();
+        v.extend(self.flights.claims_in(start, end));
+        v.extend(self.flights.late_in(start, end));
+        v.extend(self.held.within(start, end));
         if let Some(j) = self.jnl.as_ref() {
             v.extend(j.run.busy_in(start, end));
             if let Some(c) = &j.committing {
@@ -292,6 +345,7 @@ impl State {
     }
 }
 
+/// The first run of free bits in [from, end): the longest up to `want` starting at the first free bit.
 fn find_run(b: &[u8], from: u64, end: u64, want: u64) -> Option<(u64, u64)> {
     let mut i = from;
     while i < end {

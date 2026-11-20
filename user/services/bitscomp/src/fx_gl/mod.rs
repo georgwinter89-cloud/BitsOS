@@ -1,5 +1,5 @@
-//! WY-19: the effect level on the GLES renderer (gpu build only): the shaders of `shaders.rs`, compiled once per EGL
-//! context and kept in its user data, the work before a frame (`prepare`: blurs, snapshots, the new scene as a
+//! WY-19: the effects on the GLES renderer: the shaders of `shaders.rs`, compiled once per EGL context when the renderer
+//! is made (`ready`) and kept in its user data, the work before a frame (`prepare`: blurs, snapshots, the new scene as a
 //! texture) and each element's draw. Only Smithay's renderer calls, no raw GL: its GL state stays its own. Blurs run
 //! at half resolution in two passes and only when what lies under a glass changed (`fx::seal`'s stamp), so a still
 //! desktop costs one texture draw per damaged glass. All of it is GPU work inside the frame's bounded wait (`GPU_WAIT`).
@@ -7,8 +7,6 @@
 mod draw;
 mod prepare;
 mod shaders;
-#[cfg(test)]
-mod tests;
 
 pub use draw::draw;
 pub use prepare::prepare;

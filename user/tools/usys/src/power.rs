@@ -1,5 +1,5 @@
 //! UL-7: what init needs to end the system: sync, reboot(2), the signals it waits for (signalfd) and who is on
-//! the other end of its power socket (SO_PEERCRED). linux-6.6/kernel/reboot.c, fs/signalfd.c, net/core/sock.c.
+//! the other end of its power socket (SO_PEERCRED). linux-7.3.1/kernel/reboot.c, fs/signalfd.c, net/core/sock.c.
 
 use super::{SysResult, ints, raw, ret};
 
@@ -64,8 +64,8 @@ pub fn peer_cred(fd: usize) -> SysResult<(u32, u32, u32)> {
 }
 
 /// Makes `cmd`'s child start with the signals in `mask` unblocked. Init blocks its power signals for the
-/// signalfd; the blocked mask is inherited through fork and exec (linux-6.6/kernel/fork.c copies it, execve
-/// keeps it), and the spawned programs (busybox ash, the services) expect a clean one.
+/// signalfd; the blocked mask is inherited through fork and exec (linux-7.3.1/kernel/fork.c:915 dup_task_struct copies
+/// it, execve keeps it), and the spawned programs (busybox ash, the services) expect a clean one.
 pub fn unblock_in_child(cmd: &mut std::process::Command, mask: u64) {
     use std::os::unix::process::CommandExt;
     let hook = move || -> std::io::Result<()> {

@@ -5,7 +5,10 @@
 
 mod bad;
 mod bounds;
+mod dmar;
+mod gaming_pc;
 mod good;
 mod guard;
 mod hostile;
 mod irq;
+mod real_265k;

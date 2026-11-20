@@ -1,5 +1,5 @@
-//! Filters and their stack (linux-6.6/kernel/seccomp.c `struct seccomp_filter`, `seccomp_run_filters`,
-//! `seccomp_cache_prepare`): every filter points at the one installed before it; a thread holds the newest.
+//! Filters and their stack (linux-7.3.1/kernel/seccomp.c:224 `struct seccomp_filter`, :404 `seccomp_run_filters`,
+//! `seccomp_cache_prepare` :889): every filter points at the one installed before it; a thread holds the newest.
 //! Filters are shared (fork, clone and TSYNC hand the same stack on) and never change once installed.
 
 use crate::bpf::Program;

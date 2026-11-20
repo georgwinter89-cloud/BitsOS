@@ -40,6 +40,36 @@ fn settle() -> Result<(), String> {
     Ok(())
 }
 
+/// ATOMIC-2: 1200 lines through both ways onto the screen (a program's or the monitor's text, and log lines
+/// above the open line) fill the scrollback by as many rows, and no scroll made its memory under `console.vt`:
+/// the rows and the longer list of rows came from the writers (`screen::Stock`), or from the oldest rows once
+/// the window was full.
+fn scroll_room() -> TestResult {
+    if let Some(s) = fail_without_display() {
+        return s;
+    }
+    const LINES: u32 = 600;
+    // An empty open line, so each log line below is one row.
+    crate::console().write_str("\n", crate::FG);
+    let unprepared = vt::scroll_unprepared();
+    let (limit, before) = vt::scrollback();
+    for i in 0..LINES {
+        crate::console().write_str(&alloc::format!("in.console.scroll_room text {i}\n"), crate::FG);
+        vt::write_line(&alloc::format!("in.console.scroll_room log {i}"), crate::screen::FG_INDEX);
+    }
+    let (_, after) = vt::scrollback();
+    // The first lines may only have filled the screen's own rows; the log's lines of other threads add some.
+    let (_, rows) = vt::size();
+    let want = (before + 2 * LINES).min(limit as u32);
+    kassert!(after + rows >= want && after <= limit as u32, "the scrollback holds {after} rows after {} lines on top of {before} (window {limit}, screen {rows}): about {want} expected", 2 * LINES);
+    let (_, _, lines, _) = crate::text_grid().ok_or("no grid")?;
+    let last = alloc::format!("in.console.scroll_room log {}", LINES - 1);
+    kassert!(lines.iter().any(|l| l == &last), "the last line is not on the screen: {lines:?}");
+    let made = vt::scroll_unprepared() - unprepared;
+    kassert!(made == 0, "{made} scrolls made their memory under the VT's lock");
+    Ok(())
+}
+
 fn fail_without_display() -> Option<TestResult> {
     if display::device().is_none() {
         return Some(ktest::fail("no display device (no GOP framebuffer)"));
@@ -54,11 +84,26 @@ fn grid_and_pixels() -> TestResult {
     }
     let marker = alloc::format!("in.console.grid Grüße {{@}} [x] € {}", time::now_ns() % 1_000_003);
     crate::console().write_str(&alloc::format!("\n{marker}\n"), crate::FG);
-    let (cols, rows, lines, _) = crate::text_grid().ok_or("no grid")?;
-    kassert!(cols > 0 && rows > 0);
-    let row = lines.iter().rposition(|l| l == &marker).ok_or_else(|| alloc::format!("marker not in the grid: {lines:?}"))? as u32;
+    // Another thread's warning may scroll the screen between the grid read and the frame (gate L7: the marker's row
+    // was one line lower in the grid than in the frame), so a frame is only judged when the grid did not move
+    // around it; a wrong pixel in a still frame is red at once.
+    for _ in 0..5 {
+        let (cols, rows, lines, _) = crate::text_grid().ok_or("no grid")?;
+        kassert!(cols > 0 && rows > 0);
+        let row = lines.iter().rposition(|l| l == &marker).ok_or_else(|| alloc::format!("marker not in the grid: {lines:?}"))? as u32;
+        let frame = display::snapshot().ok_or("no frame")?;
+        let (_, _, again, _) = crate::text_grid().ok_or("no grid")?;
+        if again != lines {
+            sched::sleep_ns(10_000_000);
+            continue;
+        }
+        return marker_pixels(&marker, row, frame);
+    }
+    Err("the screen scrolled under every one of 5 frames".into())
+}
+
+fn marker_pixels(marker: &str, row: u32, (w, _h, px): (u32, u32, alloc::vec::Vec<u32>)) -> TestResult {
     let font = vt::font().ok_or("no font")?;
-    let (w, _h, px) = display::snapshot().ok_or("no frame")?;
     let p = vt::pointer().ok_or("no pointer")?;
     let scale = (font.h / 16).max(1);
     for (i, ch) in marker.chars().enumerate() {
@@ -80,6 +125,7 @@ fn grid_and_pixels() -> TestResult {
     Ok(())
 }
 ktest!("in.console.grid", Screen, grid_and_pixels);
+ktest!("in.console.scroll_room", Screen, scroll_room);
 
 /// reboot and poweroff refuse injected lines, directly and typed through the VT and the monitor thread.
 fn injected_reboot_refused() -> TestResult {

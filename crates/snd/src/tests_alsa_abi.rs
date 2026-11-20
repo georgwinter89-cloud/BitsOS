@@ -115,6 +115,15 @@ fn table() -> Vec<(String, u64)> {
         ("ioctl SNDRV_CTL_IOCTL_ELEM_READ", CTL_ELEM_READ),
         ("ioctl SNDRV_CTL_IOCTL_ELEM_WRITE", CTL_ELEM_WRITE),
         ("ioctl SNDRV_CTL_IOCTL_PCM_INFO", CTL_PCM_INFO),
+        // L7-HW: Linux 7's PCM version, the subformat and the hw_params sync ID.
+        ("value SNDRV_PCM_VERSION", SNDRV_PCM_VERSION as u64),
+        ("value SNDRV_PCM_SUBFORMAT_STD", SUBFORMAT_STD as u64),
+        ("value SNDRV_PCM_SUBFORMAT_MSBITS_MAX", SUBFORMAT_MSBITS_MAX as u64),
+        ("value SNDRV_PCM_FORMAT_LAST", FORMAT_LAST as u64),
+        ("offsetof snd_pcm_hw_params.msbits", 524),
+        ("offsetof snd_pcm_hw_params.fifo_size", 536),
+        ("offsetof snd_pcm_hw_params.sync", 544),
+        ("offsetof snd_pcm_info.pad1", 208),
     ];
     t.extend(ioctls.iter().map(|(n, v)| ((*n).into(), *v)));
     t
@@ -124,18 +133,11 @@ fn table() -> Vec<(String, u64)> {
 fn layout_matches_asound_h() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let src = root.join("host/tests/sn/abi-layout.c");
-    if !std::path::Path::new("/usr/include/sound/asound.h").exists() || !src.exists() {
-        std::eprintln!("skip: no <sound/asound.h> or abi-layout.c on this host");
-        return;
-    }
+    // The build host has its headers and a compiler (the gate runs here): a missing one is red, not skipped.
+    assert!(std::path::Path::new("/usr/include/sound/asound.h").exists(), "no <sound/asound.h> on this host");
     let exe = std::env::temp_dir().join(alloc::format!("snd-abi-layout-{}", std::process::id()));
-    match Command::new("cc").arg("-O0").arg("-o").arg(&exe).arg(&src).status() {
-        Ok(s) if s.success() => {}
-        r => {
-            std::eprintln!("skip: cc unavailable or failed: {r:?}");
-            return;
-        }
-    }
+    let st = Command::new("cc").arg("-O0").arg("-o").arg(&exe).arg(&src).status();
+    assert!(st.as_ref().is_ok_and(|s| s.success()), "cc abi-layout.c: {st:?}");
     let out = Command::new(&exe).output().expect("run abi-layout");
     let _ = std::fs::remove_file(&exe);
     let text = String::from_utf8(out.stdout).unwrap();

@@ -1,7 +1,7 @@
 //! Settings under `context.*` (DESIGN §1, desk decision 6a). The prototype reads them from a TOML file
-//! (`$XDG_CONFIG_HOME/ctxd/config.toml` or `--config`); on V2 they come from `settingsd`.
-//! Without a config file the only root is the synthetic test set `host/cx-eval/docs`, so ctxd never
-//! crawls Georg's home unless a root is configured.
+//! (`$XDG_CONFIG_HOME/ctxd/config.toml` or `--config`); on V2 they come from `settingsd` (`settings.rs`).
+//! Without a configured root nothing is indexed (CX-5: on V2 nothing until Georg names folders); `ctxd eval`
+//! names the synthetic test set `host/cx-eval/docs` itself.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -57,6 +57,8 @@ pub struct IndexCfg {
     pub watch_debounce_ms: u64,
     /// Chunks per embedder request.
     pub embed_batch: usize,
+    /// B4: the indexer, its workers and llama-server run in the Background class (V2's service sets it).
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -157,7 +159,7 @@ pub fn third_party_dir() -> PathBuf {
 impl Default for Context {
     fn default() -> Self {
         Context {
-            roots: vec![RootCfg { path: eval_docs_dir(), private: false }],
+            roots: Vec::new(),
             forbidden_roots: Vec::new(),
             excludes: default_excludes(),
             data: None,
@@ -186,6 +188,7 @@ impl Default for IndexCfg {
             watch: true,
             watch_debounce_ms: 1000,
             embed_batch: 32,
+            background: false,
         }
     }
 }
@@ -318,10 +321,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_use_test_set_root() {
+    fn defaults_index_nothing() {
         let c = Config::default();
-        assert_eq!(c.context.roots.len(), 1);
-        assert!(c.context.roots[0].path.ends_with("host/cx-eval/docs"));
+        assert!(c.context.roots.is_empty());
         assert_eq!(c.context.claude.snippet_chars, 200);
         assert_eq!(c.context.mcp.port, 29510);
     }

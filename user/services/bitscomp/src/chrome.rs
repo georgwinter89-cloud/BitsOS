@@ -24,8 +24,14 @@ pub enum Part {
     WsFold,
     /// WY-5c: the top bar's workspaces button while the list is folded (it brings the list back).
     WsButton,
+    /// A (12.11.): the close x of workspace entry (chip) i.
+    WsClose(usize),
     /// WY-12: an entry of the window list's minimised windows (restores it).
     Min(usize),
+    /// DESK-LEFT: "+N" of the minimised windows that have no entry (opens the list of all of them).
+    MinMore,
+    /// DESK-LEFT: the small x of minimised window i (its entry, chip or line in the open list): closes it.
+    MinClose(usize),
     /// PK-L1b: the "Programme" button left of the address field (opens and closes the program library).
     Programs,
 }
@@ -71,10 +77,19 @@ pub struct Chrome {
     pub ws_button: Option<Rect>,
     pub ws_title: Rect,
     pub ws_items: Vec<Rect>,
+    /// A (12.11.): one close x per workspace entry; empty with a single workspace.
+    pub ws_close: Vec<Rect>,
     pub ws_new: Rect,
     /// WY-12: the "MINIMIERT" heading and one entry per minimised window that fits, above "Startseite".
     pub min_title: Rect,
     pub min_items: Vec<Rect>,
+    /// DESK-LEFT: each entry's x (shown while the pointer is on the entry).
+    pub min_close: Vec<Rect>,
+    /// DESK-LEFT (the Bühne since C): "+N" when not every minimised window has an entry, and the list it opens
+    /// (one line per minimised window, oldest first; drawn and hit only while open; a zero rect where no room).
+    pub min_more: Option<Rect>,
+    pub min_list: Vec<Rect>,
+    pub min_list_close: Vec<Rect>,
     pub home: Rect,
     /// Claude's sidebar when shown (docked or revealed).
     pub side: Option<Rect>,
@@ -97,6 +112,15 @@ pub fn fav_font(t: &Theme) -> Font {
 /// Logical width of `s` in `f` (measured at the output scale, so it matches what is drawn).
 pub fn logical_width(f: &Font, s: &str, scale: f64) -> i32 {
     (f.width(s) as f64 / scale).ceil() as i32
+}
+
+/// DESK-LEFT: the classic list's line of minimised windows behind "+N".
+pub const MIN_LIST_W: i32 = 320;
+pub const MIN_LIST_H: i32 = 40;
+
+/// The small x at the right end of a list entry (workspaces, minimised windows), shown on hover.
+pub fn close_x(r: Rect) -> Rect {
+    Rect { x: r.x + r.w - 32, y: r.y + (r.h - 24) / 2, w: 24, h: 24 }
 }
 
 pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
@@ -140,14 +164,29 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
     let home = Rect { x: list.x + 12, y: list.y + list.h - 16 - 40, w: item_w, h: 40 };
     let mut iy = ws_title.y + ws_title.h + 6;
     // WY-12: the minimised windows above "Startseite", as many as leave room for one low workspace entry and
-    // the "+" button; the others are reached by Alt+Tab.
+    // the "+" button; DESK-LEFT: when not all fit, the last place is "+N", which opens the list of all of them.
     let fit = ((home.y - 6 - (iy + WS_LOW + 6 + 52) - MIN_HEAD) / MIN_ROW).max(0) as usize;
-    let shown_min = i.minimized.min(fit);
-    let min_h = if shown_min > 0 { MIN_HEAD + shown_min as i32 * MIN_ROW } else { 0 };
+    let over = i.minimized > fit && fit > 0;
+    let shown_min = if over { fit - 1 } else { i.minimized.min(fit) };
+    let rows = shown_min + over as usize;
+    let min_h = if rows > 0 { MIN_HEAD + rows as i32 * MIN_ROW } else { 0 };
     let min_title = Rect { x: list.x + 20, y: home.y - 6 - min_h, w: item_w - 8, h: 20 };
-    let min_items = (0..shown_min as i32)
-        .map(|k| Rect { x: list.x + 12, y: min_title.y + MIN_HEAD + k * MIN_ROW, w: item_w, h: MIN_ROW - 4 })
-        .collect();
+    let row_at = |k: usize| Rect { x: list.x + 12, y: min_title.y + MIN_HEAD + k as i32 * MIN_ROW, w: item_w, h: MIN_ROW - 4 };
+    let min_items: Vec<Rect> = (0..shown_min).map(row_at).collect();
+    let min_close = min_items.iter().map(|r| close_x(*r)).collect();
+    let min_more = over.then(|| row_at(shown_min));
+    // The list right of the window list, upwards from the "+N" line's foot; lines that would reach above the
+    // list's top are left out (Alt+Tab reaches them).
+    let min_list: Vec<Rect> = match min_more {
+        Some(m) => (0..i.minimized)
+            .map(|k| {
+                let y = m.y + m.h - (i.minimized - k) as i32 * (MIN_LIST_H + 4) + 4;
+                if y < list.y + 8 { Rect { x: 0, y: h + 1, w: 0, h: 0 } } else { Rect { x: list.x + list.w + 8, y, w: MIN_LIST_W, h: MIN_LIST_H } }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let min_list_close = min_list.iter().map(|r| if r.w > 0 { close_x(*r) } else { *r }).collect();
     // Many workspaces: the entries get lower (name only below `WS_FULL`) until they fit; what still does not fit
     // is reached by Ctrl+Alt+digit and `ctl ws` (`ws_shown`).
     let room = home.y - 6 - 52 - iy - min_h;
@@ -159,6 +198,7 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
         iy += item_h + 6;
     }
     let ws_new = Rect { x: list.x + 12, y: iy + 6, w: item_w, h: 40 };
+    let ws_close = if ws_items.len() < 2 { Vec::new() } else { ws_items.iter().map(|r| close_x(Rect { h: r.h.min(40), ..*r })).collect() };
     let side_rect = Rect { x: w - t.side_w.min(w / 3), y, w: t.side_w.min(w / 3), h: list.h };
     let side = (side_docked || i.reveal == Some(Edge::Right)).then_some(side_rect);
     let left = if list_docked { list.x + list.w } else { 0 };
@@ -181,9 +221,14 @@ pub fn layout(t: &Theme, i: &Inputs) -> Chrome {
         ws_button,
         ws_title,
         ws_items,
+        ws_close,
         ws_new,
         min_title,
         min_items,
+        min_close,
+        min_more,
+        min_list,
+        min_list_close,
         home,
         side,
         side_docked,
@@ -217,6 +262,9 @@ impl Chrome {
         if self.ws_fold.contains(x, y) {
             return Some(Part::WsFold);
         }
+        if let Some(i) = self.ws_close.iter().take(self.ws_shown()).position(|r| r.contains(x, y)) {
+            return Some(Part::WsClose(i));
+        }
         if let Some(i) = self.ws_items[..self.ws_shown()].iter().position(|r| r.contains(x, y)) {
             return Some(Part::Ws(i));
         }
@@ -224,8 +272,15 @@ impl Chrome {
         if self.ws_new.contains(x, y) && self.ws_new.y + self.ws_new.h <= self.list_end() {
             return Some(Part::WsNew);
         }
+        // The x lies on its entry, so it is asked first.
+        if let Some(i) = self.min_close.iter().take(self.min_items.len()).position(|r| r.contains(x, y)) {
+            return Some(Part::MinClose(i));
+        }
         if let Some(i) = self.min_items.iter().position(|r| r.contains(x, y)) {
             return Some(Part::Min(i));
+        }
+        if self.min_more.is_some_and(|r| r.contains(x, y)) {
+            return Some(Part::MinMore);
         }
         if self.home.contains(x, y) {
             return Some(Part::Home);
@@ -266,7 +321,7 @@ impl Chrome {
 
     /// Where the workspace part of the list ends: at the minimised windows (WY-12), else at "Startseite".
     pub fn list_end(&self) -> i32 {
-        if self.min_items.is_empty() { self.home.y } else { self.min_title.y }
+        if self.min_items.is_empty() && self.min_more.is_none() { self.home.y } else { self.min_title.y }
     }
 }
 

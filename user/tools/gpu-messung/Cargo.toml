@@ -1,0 +1,8 @@
+[package]
+name = "gpu-messung"
+version = "0.1.0"
+edition = "2024"
+description = "Asks the kernel for the RX 9070 XT measurement run from the shell (/dev/bitsos/gpu-messung); the J at a real keyboard decides"
+publish = false
+
+[dependencies]

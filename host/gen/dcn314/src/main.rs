@@ -160,8 +160,9 @@ mod tests {
         include_bytes!("../tests/data/mini_p1.txt"),
     ];
 
-    /// The real Linux headers; missing inputs fail unless DCN314_ALLOW_SKIP=1 (machine without werkzeuge).
-    fn real_inputs() -> Option<[Vec<u8>; 3]> {
+    /// The real Linux headers. Decision (SK fix, 17.11.): a missing input is red, no switch skips it (as amdtrace's
+    /// Linux tree): the gate's machine has them under `$HOME/BitsOS`; elsewhere set BITSOS_ROOT.
+    fn real_inputs() -> [Vec<u8>; 3] {
         let root = default_root();
         let dcn = root.join(DCN_DIR);
         let r = (|| Ok::<_, String>([
@@ -169,14 +170,7 @@ mod tests {
             read(&dcn.join("dcn_3_1_4_sh_mask.h"))?,
             read(&root.join(P1))?,
         ]))();
-        match r {
-            Ok(x) => Some(x),
-            Err(e) if std::env::var_os("DCN314_ALLOW_SKIP").is_some_and(|v| v == "1") => {
-                eprintln!("real inputs not found ({e}), skipped by DCN314_ALLOW_SKIP=1");
-                None
-            }
-            Err(e) => panic!("real inputs not found: {e} (set BITSOS_ROOT, or DCN314_ALLOW_SKIP=1)"),
-        }
+        r.unwrap_or_else(|e| panic!("real inputs not found: {e} (set BITSOS_ROOT to the tree that has them)"))
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -195,7 +189,7 @@ mod tests {
 
     #[test]
     fn real_two_runs_are_identical() {
-        let Some([a, b, c]) = real_inputs() else { return };
+        let [a, b, c] = real_inputs();
         let x = generate(&a, &b, &c).unwrap();
         let y = generate(&a, &b, &c).unwrap();
         assert_eq!(x.files, y.files);

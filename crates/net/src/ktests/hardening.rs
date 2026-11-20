@@ -144,15 +144,15 @@ impl NetDevice for End {
 }
 
 /// Two stacks of their own joined by an in-kernel cable, polled by a thread of the test (no real card involved).
-struct Cable {
-    a: &'static Stack,
-    b: &'static Stack,
+pub(super) struct Cable {
+    pub(super) a: &'static Stack,
+    pub(super) b: &'static Stack,
     stop: Arc<AtomicBool>,
     poller: Option<sched::JoinHandle>,
 }
 
 impl Cable {
-    fn new(tag: u8) -> Result<Cable, String> {
+    pub(super) fn new(tag: u8) -> Result<Cable, String> {
         let (ab, ba): (Frames, Frames) = (Arc::new(SpinLock::new(VecDeque::new())), Arc::new(SpinLock::new(VecDeque::new())));
         let ea = End { name: "ktcable-a".into(), mac: [2, 0, tag, 0x6b, 0, 0xa], rx: ba.clone(), tx: ab.clone() };
         let eb = End { name: "ktcable-b".into(), mac: [2, 0, tag, 0x6b, 0, 0xb], rx: ab, tx: ba };
@@ -174,13 +174,13 @@ impl Cable {
         Ok(Cable { a, b, stop, poller: Some(poller) })
     }
 
-    fn addrs(&self, a: Ipv4, b: Ipv4, prefix: u8) -> TestResult {
+    pub(super) fn addrs(&self, a: Ipv4, b: Ipv4, prefix: u8) -> TestResult {
         self.a.set_static("ktcable-a", a, prefix, None).map_err(e)?;
         self.b.set_static("ktcable-b", b, prefix, None).map_err(e)
     }
 
     /// Stops the poller (bounded); false if it did not end.
-    fn end(mut self) -> bool {
+    pub(super) fn end(mut self) -> bool {
         self.stop.store(true, Ordering::Release);
         self.poller.take().is_none_or(|p| p.join_timeout(5 * SEC))
     }

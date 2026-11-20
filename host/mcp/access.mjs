@@ -6,9 +6,9 @@
 // request waits up to 5 minutes for Georg's answer and prints it (the end time); status prints the time left.
 // Exit code 0 granted (status: a grant runs), 1 refused (status: none), 2 not asked (unreachable, token, key;
 // status: still "grants not loaded yet" after the wait, MC-11: right after a start the installer has not reported).
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { connect, McpError, NOT_LOADED, readToken } from './mcp-call.mjs';
+import { tokenFileFor } from './token.mjs';
+import { isMain } from './is-main.mjs';
 
 const USAGE = 'usage: node access.mjs <host[:port]> request [--hours 1..168] [--reason TEXT] | status  [--tls DIR|auto] [--token-file F]';
 
@@ -16,6 +16,7 @@ export async function main(argv) {
   const opts = { tls: 'auto' }, rest = [];
   for (let i = 0; i < argv.length; i++) {
     if (['--hours', '--reason', '--tls', '--token-file'].includes(argv[i])) opts[argv[i].slice(2)] = argv[++i];
+    else if (argv[i] === '--gaming-pc') opts['gaming-pc'] = true;
     else rest.push(argv[i]);
   }
   const [host, what] = rest;
@@ -28,7 +29,7 @@ export async function main(argv) {
   }
   if (opts.reason !== undefined) args.reason = String(opts.reason).slice(0, 200);
   try {
-    const s = await connect(host, { token: readToken(opts['token-file']), tls: opts.tls, tokenFile: opts['token-file'], ms: 30000 });
+    const s = await connect(host, { token: readToken(tokenFileFor(opts['token-file'], opts['gaming-pc'])), tls: opts.tls, tokenFile: opts['token-file'], ms: 30000 });
     if (what === 'status') {
       const r = await s.call('access_status', {});
       console.log(r.texts[0] ?? r.text);
@@ -46,4 +47,4 @@ export async function main(argv) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) process.exitCode = await main(process.argv.slice(2));
+if (isMain(import.meta.url)) process.exitCode = await main(process.argv.slice(2));

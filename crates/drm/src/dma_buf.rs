@@ -1,4 +1,4 @@
-//! DR-5: the dma-buf fd type (linux-6.6/drivers/dma-buf/dma-buf.c): one buffer shared between processes and
+//! DR-5: the dma-buf fd type (linux-7.3.1/drivers/dma-buf/dma-buf.c): one buffer shared between processes and
 //! devices. A buffer comes from an exporter (`Exporter`: `/dev/udmabuf` today, GEM objects with DR-6) and has a
 //! reservation object (`Resv`) for implicit sync. The fd answers like Linux's `dma_buf_fops`:
 //!
@@ -274,7 +274,7 @@ impl DmaBuf {
     pub fn ino(&self) -> u64 {
         self.meta.ino
     }
-    /// What MM maps for `mmap` of the fd (the desk wires `mm::device::lookup` to it, see plan/notes/dr-DR-5.md).
+    /// What MM maps for `mmap` of the fd (the desk wires `mm::device::lookup` to it).
     pub fn device_map(&self) -> Option<&Arc<DeviceMap>> {
         self.map.as_ref()
     }

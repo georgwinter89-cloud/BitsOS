@@ -2,8 +2,8 @@
 //! bar dimmed, and a panel in the Feld board's Absicht look (Feld.dc.html: 1120x800 board px, radius 28, an accent
 //! edge): the search line at its top (Bricolage Grotesque), the rows' uppercase mono labels, tiles of a 96 board px
 //! icon (128 px at 2560x1440) with the name below (Figtree), the focus as the design's ring (2 px ground, 4 px
-//! accent), the key hints at its foot. Cheap level only: one state change on hover (the tile lifts with
-//! theme.motion on, no animation). Two cached images: the panel (search, hints) and the scrolled tiles, so a focus
+//! accent), the key hints at its foot. One state change on hover (the tile lifts with theme.motion on, no
+//! animation). Two cached images: the panel (search, hints) and the scrolled tiles, so a focus
 //! move redraws the tiles alone.
 
 use smithay::backend::renderer::element::Kind;
@@ -17,6 +17,7 @@ use crate::header::px_rect;
 use crate::icon_png::Argb;
 use crate::layout::Rect;
 use crate::library::Icon;
+use crate::library_view::{self as view, Button};
 use crate::render::{CompElement, CompRenderer};
 use crate::state::App;
 use crate::text::{Family, Weight};
@@ -35,7 +36,23 @@ struct PanelLook {
     note: Option<String>,
     /// PK-L1c: the pad's Y focused the search field: it gets the focus ring.
     search_focus: bool,
+    /// LIB-ADD: the head's buttons, the count of updates, which button has the keys' focus and the pointer.
+    head: view::Head,
+    count: Option<usize>,
+    button: Option<Button>,
+    hover_button: Option<Button>,
     theme: u64,
+}
+
+/// LIB-ADD: a search that found nothing: what it says and its link to "Programme hinzufügen".
+#[derive(Clone, Debug, PartialEq)]
+struct Empty {
+    query: String,
+    line: Rect,
+    link: Rect,
+    hint: Rect,
+    focus: bool,
+    hover: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +70,7 @@ struct BodyLook {
     at: Rect,
     heads: Vec<(Rect, &'static str)>,
     tiles: Vec<Tile>,
+    empty: Option<Empty>,
     lift: bool,
     theme: u64,
 }
@@ -82,7 +100,7 @@ fn draw_panel(l: &PanelLook, t: &Theme) -> Canvas {
     let big = t.bfont(Family::Display, 34.0, Weight::Medium);
     let esc_w = (label(t).width(ESC) as f32 + 28.0 * k) as i32;
     let esc = Rect { x: s.x + s.w - (20.0 * k) as i32 - esc_w, y: s.y + (s.h - (44.0 * k) as i32) / 2, w: esc_w, h: (44.0 * k) as i32 };
-    let text = Rect { x: s.x + (32.0 * k) as i32, y: s.y, w: esc.x - s.x - (48.0 * k) as i32, h: s.h };
+    let text = Rect { y: s.y, h: s.h, ..p.r(l.head.text) };
     if l.query.is_empty() {
         c.text_fit(&big, text, PLACEHOLDER, t.muted);
         c.fill(text.x, s.y + (s.h - (36.0 * k) as i32) / 2, (3.0 * k) as i32, (36.0 * k) as i32, t.accent);
@@ -96,6 +114,13 @@ fn draw_panel(l: &PanelLook, t: &Theme) -> Canvas {
     }
     c.rrect_line(Box2::of(esc), 14.0 * k, k.max(1.0), t.line);
     c.text_mid(&label(t), esc, &Theme::label(Style::Label, ESC), t.muted);
+    let on = |b: Button| (l.button == Some(b), l.hover_button == Some(b));
+    let (f, h) = on(Button::Add);
+    head_button(&mut c, &p, t, l.head.add, view::ADD, true, f, h, None);
+    if let Some(r) = l.head.updates {
+        let (f, h) = on(Button::Updates);
+        head_button(&mut c, &p, t, r, view::UPDATES, false, f, h, l.count);
+    }
     // The foot: the note (a failed start, a pin) or the key hints.
     let f = p.r(l.hints);
     match &l.note {
@@ -106,6 +131,53 @@ fn draw_panel(l: &PanelLook, t: &Theme) -> Canvas {
         }
     }
     c
+}
+
+/// A button of the head or the empty search: `primary` filled in the accent (the way to add programs), else a
+/// quiet outline like the Esc chip; a count as a small accent badge; the keys' focus as the tiles' ring.
+#[allow(clippy::too_many_arguments)]
+fn head_button(c: &mut Canvas, p: &Px, t: &Theme, r: Rect, text: &str, primary: bool, focus: bool, hover: bool, count: Option<usize>) {
+    let k = t.board as f32;
+    let b = p.b(r);
+    let rad = 14.0 * k;
+    if primary {
+        c.rrect(b, rad, t.accent);
+        if hover {
+            c.rrect_line(b, rad, k.max(1.0), t.text);
+        }
+    } else {
+        if hover {
+            c.rrect(b, rad, t.panel2);
+        }
+        c.rrect_line(b, rad, k.max(1.0), if hover { t.accent } else { t.line });
+    }
+    let f = view::button_font(t);
+    let col = if primary { t.on_accent } else { t.text };
+    match count {
+        None => c.text_mid(&f, p.r(r), text, col),
+        Some(n) => {
+            let (pad, bw, bh) = (t.bl(16.0), view::badge_w(t, n), t.bl(24.0));
+            let label = Rect { x: r.x + pad, w: r.w - 2 * pad - bw - t.bl(8.0), ..r };
+            c.text_mid(&f, p.r(label), text, col);
+            let badge = Rect { x: r.x + r.w - pad - bw, y: r.y + (r.h - bh) / 2, w: bw, h: bh };
+            let bb = p.b(badge);
+            c.rrect(bb, bb.h / 2.0, t.accent);
+            c.text_mid(&view::badge_font(t), p.r(badge), &n.to_string(), t.on_accent);
+        }
+    }
+    if focus {
+        let (g, a) = (2.0 * k, 4.0 * k);
+        c.rrect_line(b.inset(-g), rad + g, g, t.bg);
+        c.rrect_line(b.inset(-g - a), rad + g + a, a, t.accent);
+    }
+}
+
+/// What a search that found nothing says, its link and the hint that the text goes along.
+fn draw_empty(c: &mut Canvas, p: &Px, e: &Empty, t: &Theme) {
+    let q: String = e.query.chars().take(40).collect();
+    c.text_mid(&t.bfont(Family::Display, 26.0, Weight::Medium), p.r(e.line), &format!("Kein Programm passt zu „{q}“."), t.text);
+    head_button(c, p, t, e.link, view::ADD_SEARCH, true, e.focus, e.hover, None);
+    c.text_mid(&t.bfont(Family::Ui, 15.0, Weight::Medium), p.r(e.hint), &format!("Dort wird gleich nach „{q}“ gesucht."), t.muted);
 }
 
 /// An icon scaled into `b` (nearest pixel: the tile size is fixed, so this runs once per look).
@@ -155,7 +227,7 @@ fn draw_tile(c: &mut Canvas, p: &Px, tile: &Tile, lift: bool, t: &Theme) {
     c.text_mid(&t.bfont(Family::Ui, 15.0, Weight::Medium), p.r(name), &tile.name, t.text);
 }
 
-/// The fallback icon: the name's first letter on an accent-coloured rounded square (desk-PK67-plan.md §3).
+/// The fallback icon: the name's first letter on an accent-coloured rounded square (plan/spec/program-library.md section 5).
 fn fallback(c: &mut Canvas, b: Box2, ch: char, t: &Theme) {
     c.rrect(b, b.w * 0.22, t.accent);
     let f = t.bfont(Family::Display, 52.0, Weight::SemiBold);
@@ -171,6 +243,9 @@ fn draw_body(l: &BodyLook, t: &Theme) -> Canvas {
     }
     for tile in &l.tiles {
         draw_tile(&mut c, &p, tile, l.lift, t);
+    }
+    if let Some(e) = &l.empty {
+        draw_empty(&mut c, &p, e, t);
     }
     c
 }
@@ -204,15 +279,33 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
                 rect: pl.rect,
                 name: e.name.clone(),
                 icon: e.icon.clone(),
-                focus: !app.lib.search_focus && focus.as_ref().is_some_and(|(r, id)| *r == pl.row && *id == pl.id),
+                focus: !app.lib.search_focus && app.lib.button.is_none() && focus.as_ref().is_some_and(|(r, id)| *r == pl.row && *id == pl.id),
                 hover: app.lib.hover.as_ref().is_some_and(|(r, id)| *r == pl.row && *id == pl.id),
             })
         })
         .collect();
     let _ = rows;
     let m = t.bl(10.0);
-    let body = BodyLook { at: Rect { x: g.body.x - m, y: g.body.y - m, w: g.body.w + 2 * m, h: g.body.h + 2 * m }, heads, tiles, lift: t.motion != Motion::Off, theme: tg };
-    let panel = PanelLook { panel: g.panel, search: g.search, hints: g.hints, query: app.lib.query.clone(), note: app.lib.note.clone(), search_focus: app.lib.search_focus, theme: tg };
+    let empty = app.library_empty().then(|| {
+        let (line, link, hint) = view::empty(&g, &t);
+        let b = Some(Button::AddSearch);
+        Empty { query: app.lib.query.trim().to_string(), line, link, hint, focus: app.lib.button == b, hover: app.lib.hover_button == b }
+    });
+    let body = BodyLook { at: Rect { x: g.body.x - m, y: g.body.y - m, w: g.body.w + 2 * m, h: g.body.h + 2 * m }, heads, tiles, empty, lift: t.motion != Motion::Off, theme: tg };
+    let (head, count) = (app.library_head(), app.library_updates_count());
+    let panel = PanelLook {
+        panel: g.panel,
+        search: g.search,
+        hints: g.hints,
+        query: app.lib.query.clone(),
+        note: app.lib.note.clone().or_else(|| app.passend_library_note()),
+        search_focus: app.lib.search_focus,
+        head,
+        count,
+        button: app.lib.button,
+        hover_button: app.lib.hover_button,
+        theme: tg,
+    };
     let im = &mut app.lib.images;
     if im.body.as_ref().is_none_or(|(l, _)| *l != body) {
         im.body = Some((body.clone(), draw_body(&body, &t).into_buffer()));
@@ -236,10 +329,10 @@ mod tests {
     #[test]
     fn every_text_of_the_overlay_has_its_glyphs() {
         let t = Theme::default();
-        let mut texts: Vec<&str> = vec![PLACEHOLDER, ESC, "„Brave“ ist an der Startseite angeheftet.", "ließ sich nicht starten", "gelöst", "Kein Programm passt"];
+        let mut texts: Vec<&str> = vec![PLACEHOLDER, ESC, view::ADD, view::UPDATES, view::ADD_SEARCH, "Dort wird gleich nach „foot“ gesucht.", "0123456789", "„Brave“ ist an der Startseite angeheftet.", "ließ sich nicht starten", "gelöst", "Kein Programm passt"];
         texts.extend(HINTS);
         let (big, ui, lab) = (t.bfont(Family::Display, 34.0, Weight::Medium), t.bfont(Family::Ui, 15.0, Weight::Medium), label(&t));
-        for s in [PLACEHOLDER, "wri"] {
+        for s in [PLACEHOLDER, "wri", "Kein Programm passt zu „wri“."] {
             assert!(s.chars().all(|c| c == ' ' || big.draws(c)), "{s}");
         }
         for s in &texts {
@@ -255,15 +348,28 @@ mod tests {
         for dark in [true, false] {
             let mut t = Theme::default();
             t.dark = dark;
-            let panel = PanelLook { panel: Rect { x: 10, y: 50, w: 800, h: 600 }, search: Rect { x: 10, y: 50, w: 800, h: 72 }, hints: Rect { x: 10, y: 614, w: 800, h: 36 }, query: "wri".into(), note: None, search_focus: true, theme: 0 };
+            let g = view::geo(Rect { x: 0, y: 0, w: 2560, h: 1440 }, 60, &t);
+            let head = view::head(&g, &t, Some(3));
+            let panel = PanelLook { panel: g.panel, search: g.search, hints: g.hints, query: "wri".into(), note: None, search_focus: true, head, count: Some(3), button: Some(Button::Add), hover_button: Some(Button::Updates), theme: 0 };
             let c = draw_panel(&panel, &t);
             assert!(c.w > 0 && c.pixel(c.w / 2, c.h / 2) != 0, "the panel is filled");
             let tile = Tile { rect: Rect { x: 40, y: 140, w: 108, h: 112 }, name: "Writer".into(), icon: Icon::Fallback('W'), focus: true, hover: true };
-            let body = BodyLook { at: Rect { x: 20, y: 120, w: 400, h: 300 }, heads: vec![(Rect { x: 30, y: 120, w: 300, h: 20 }, "Favoriten")], tiles: vec![tile], lift: true, theme: 0 };
+            let body = BodyLook { at: Rect { x: 20, y: 120, w: 400, h: 300 }, heads: vec![(Rect { x: 30, y: 120, w: 300, h: 20 }, "Favoriten")], tiles: vec![tile], empty: None, lift: true, theme: 0 };
             let b = draw_body(&body, &t);
             let p = Px::new(body.at, t.scale);
             let centre = p.r(Rect { x: 40 + 54, y: 140 + 8 + 36, w: 1, h: 1 });
             assert_ne!(b.pixel(centre.x, centre.y), 0, "the fallback square is drawn");
+            // LIB-ADD: the add button is filled with the accent; the empty search draws its link the same way.
+            let pp = Px::new(panel.panel, t.scale);
+            let inner = pp.r(Rect { x: head.add.x + 6, y: head.add.y + head.add.h / 2, w: 1, h: 1 });
+            assert_eq!(c.pixel(inner.x, inner.y), crate::canvas::pack(t.accent), "the add button is in the accent");
+            let (line, link, hint) = view::empty(&g, &t);
+            let e = Empty { query: "zzz".into(), line, link, hint, focus: true, hover: false };
+            let body = BodyLook { at: g.body, heads: vec![], tiles: vec![], empty: Some(e), lift: true, theme: 0 };
+            let b = draw_body(&body, &t);
+            let pb = Px::new(body.at, t.scale);
+            let inner = pb.r(Rect { x: link.x + 6, y: link.y + link.h / 2, w: 1, h: 1 });
+            assert_eq!(b.pixel(inner.x, inner.y), crate::canvas::pack(t.accent), "the empty search's link is drawn");
         }
     }
 }

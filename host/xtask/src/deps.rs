@@ -213,12 +213,11 @@ pub fn find_cycle(g: &Graph) -> Option<Vec<String>> {
     None
 }
 
+/// The gate's step: the lane table must be there (the gate runs on the private tree, where plan/ is tracked).
 pub fn run_deps(root: &Path) -> Result<(), String> {
     let p = root.join("plan/V2-LANES.md");
-    // The public tree ships without plan/ (DECISIONS 24.10.2026), so there is no lane table to check there.
     if !p.exists() {
-        println!("deps: skipped, no {}", p.display());
-        return Ok(());
+        return Err(format!("deps: {} missing (the gate runs on the private tree, which has plan/)", p.display()));
     }
     let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
     let g = parse(&text);
@@ -236,6 +235,12 @@ pub fn run_deps(root: &Path) -> Result<(), String> {
 
 pub fn cmd_deps(root: &Path, a: Args) -> Result<(), String> {
     a.positionals()?;
+    // Decision (SK, 17.11.): the public tree ships without plan/ (DECISIONS 24.10.2026), so `cargo xtask deps`
+    // there has no lane table to check and says so; the gate's step (`run_deps`) is red without it.
+    if !root.join("plan/V2-LANES.md").exists() {
+        println!("deps: nothing to check, no plan/V2-LANES.md (public tree)");
+        return Ok(());
+    }
     run_deps(root)
 }
 
@@ -301,6 +306,17 @@ Intro text with BT-9 in it.
         let c = find_cycle(&g).unwrap();
         assert_eq!(c.first(), c.last());
         assert!(c.len() >= 2);
+    }
+
+    /// The gate's step is red where plan/ is missing; `cargo xtask deps` on the public tree says why it has
+    /// nothing to check.
+    #[test]
+    fn missing_lane_table() {
+        let d = std::env::temp_dir().join(format!("xt-deps-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(run_deps(&d).unwrap_err().contains("V2-LANES.md missing"));
+        assert!(cmd_deps(&d, Args::new(Vec::new())).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

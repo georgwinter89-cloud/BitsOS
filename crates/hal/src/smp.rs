@@ -23,16 +23,20 @@
 //! `topology(cpu)` the data SC-3 places threads by (R4: no "sibling = APIC ID ^ 1", no core roles).
 //!
 //! Hybrid Intel CPUs (CP-6; the Gaming-PC's Core Ultra 7 265K: 8 P + 12 E cores, no SMT): every CPU reads its own
-//! core type from CPUID 0x1A EAX[31:24] (0x40 P, 0x20 E; linux-6.6/arch/x86/kernel/cpu/intel.c:1366-1379, only
-//! with CPUID 7.0 EDX[15] `hybrid_cpu`) and, with CPUID 6 EAX[7] `hwp` and HWP switched on by the firmware
-//! (IA32_PM_ENABLE bit 0; V2 never sets it), its HWP highest performance (IA32_HWP_CAPABILITIES[7:0]). `capacity(cpu)` turns that into the hint SC weighs placement by: highest
-//! performance x 1024 / the maximum over the online CPUs (what Linux's `cpu_capacity` shows on the 265K: P 1012
-//! or 1024 for the two favoured cores at 87/88, E 756 at 65; Linux 6.6 uses the same numbers as ITMT priorities,
+//! core type from CPUID 0x1A EAX[31:24] (0x40 P, 0x20 E; linux-6.6/arch/x86/kernel/cpu/intel.c:1366-1379
+//! (Linux 7.3.1 differs: linux-7.3.1/arch/x86/kernel/cpu/topology_common.c:175,
+//! see plan/spec/linux7-differences.md), only with CPUID 7.0 EDX[15] `hybrid_cpu`) and, with CPUID 6 EAX[7]
+//! `hwp` and HWP switched on (CP-265K: `cpu::hwp` on each CPU before this read), its HWP
+//! highest performance (IA32_HWP_CAPABILITIES[7:0]). `capacity(cpu)` turns that into the hint SC weighs placement
+//! by: highest performance x 1024 / the maximum over the online CPUs (what Linux's `cpu_capacity` shows on the
+//! 265K; on 5.11.2026 P 1012 or 1024 for the two favoured cores at 87/88, E 802 at 69, firmware may change them, so
+//! they are read, never assumed; Linux 6.6 uses the same numbers as ITMT priorities,
 //! drivers/cpufreq/intel_pstate.c:352-372). Without HWP numbers: P/uniform 1024, E `E_CORE_FALLBACK_CAPACITY`.
-//! AMD and non-hybrid Intel CPUs never read the MSR and are uniform (1024).
+//! AMD and non-hybrid Intel CPUs never read the MSR and are uniform (1024). `l2_id` is the L2 domain from the same
+//! cache leaf as the LLC (on the 265K E cores share one in fours).
 
 use crate::apic::{self, IpiDest, IpiKind, NmiPin};
-use crate::cpu::{self, CpuidView, Features, FlagBits, MtrrAction, MtrrState, SetupReport, XsaveSig};
+use crate::cpu::{self, hwp, CpuidView, Features, FlagBits, MtrrAction, MtrrState, SetupReport, XsaveSig};
 use crate::percpu::{self, PerCpu};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -49,7 +53,8 @@ pub const CORE_TYPE_EFFICIENCY: u8 = 2;
 
 /// The capacity of the fastest CPU (Linux `SCHED_CAPACITY_SCALE`).
 pub const CAPACITY_SCALE: u16 = 1024;
-/// E-core capacity when the CPU gives no HWP numbers: the 265K's 756 (HWP highest 65 of 88), rounded to 3/4.
+/// E-core capacity when the CPU gives no HWP numbers (HWP could not be switched on): about 3/4. The
+/// 265K's E cores report more (802 on 5.11.2026, HWP highest 69 of 88); real numbers are read at run time.
 pub const E_CORE_FALLBACK_CAPACITY: u16 = 768;
 
 /// Topology of one logical CPU, decoded from its own CPUID (0x1F, else 0x0B, else the legacy leaves; AMD
@@ -71,6 +76,9 @@ pub struct Topology {
     pub smt_sibling_of: Option<u32>,
     /// The last-level-cache domain (a CCX on AMD, a die's L3 on Intel): CPUs with the same id share the LLC.
     pub cluster_id: u32,
+    /// The L2 domain (one core on most CPUs; four E cores on the 265K): CPUs with the same id share the L2. Linux
+    /// calls this domain the cluster on Intel's hybrid parts.
+    pub l2_id: u32,
     /// NUMA node (SRAT proximity domain; 0 without SRAT).
     pub node: u32,
     /// `CORE_TYPE_*`.
@@ -178,6 +186,24 @@ fn llc_sharing(v: &CpuidView, amd_topoext: bool) -> Option<u32> {
     best.map(|(_, s)| s)
 }
 
+/// Sharing of the L2 (the same leaves as `llc_sharing`).
+fn l2_sharing(v: &CpuidView, amd_topoext: bool) -> Option<u32> {
+    let leaf = if amd_topoext { 0x8000_001D } else { 4 };
+    if (leaf == 4 && v.max_basic() < 4) || (leaf != 4 && v.max_ext() < leaf) {
+        return None;
+    }
+    for n in 0..SUBLEAF_WALK {
+        let r = v.get(leaf, n);
+        if r.eax & 0x1F == 0 {
+            break;
+        }
+        if (r.eax >> 5) & 7 == 2 {
+            return Some(((r.eax >> 14) & 0xFFF) + 1);
+        }
+    }
+    None
+}
+
 /// Decodes the topology of the CPU whose CPUID `v` shows (pure; host-tested with recorded leaves).
 pub fn decode_topology(v: &CpuidView, node: u32) -> Topology {
     let vendor = v.get(0, 0);
@@ -232,6 +258,12 @@ pub fn decode_topology(v: &CpuidView, node: u32) -> Topology {
         }
         None => die_id,
     };
+    let l2_id = match l2_sharing(v, topoext) {
+        Some(s) if ceil_log2(s) < 32 => apic >> ceil_log2(s),
+        Some(_) => 0,
+        // Without the leaf: each core its own (the SMT threads of one core always share it).
+        None => apic >> smt_shift.min(31),
+    };
     let core_type = if v.has("hybrid_cpu") && v.max_basic() >= 0x1A {
         match v.get(0x1A, 0).eax >> 24 {
             0x40 => CORE_TYPE_PERFORMANCE,
@@ -250,6 +282,7 @@ pub fn decode_topology(v: &CpuidView, node: u32) -> Topology {
         threads_per_core: tpc,
         smt_sibling_of: (thread_id != 0).then_some(apic & !low_mask(smt_shift)),
         cluster_id,
+        l2_id,
         node,
         core_type,
         source_leaf: source,
@@ -259,9 +292,9 @@ pub fn decode_topology(v: &CpuidView, node: u32) -> Topology {
 }
 
 /// HWP highest performance of the CPU `v` describes, read with `read` (pure; host-tested). Only hybrid Intel CPUs
-/// with CPUID `hwp` and HWP switched on (IA32_PM_ENABLE bit 0) are asked: the MSR #GPs elsewhere and `msr::read`
-/// cannot recover; uniform CPUs need no hint. V2 never switches HWP on itself (that is a power-management choice,
-/// not a topology read), so with the firmware's PM_ENABLE clear the core-type fallback applies (0 here).
+/// with CPUID `hwp` and HWP switched on (IA32_PM_ENABLE bit 0, by `cpu::hwp` on this CPU before this read) are asked:
+/// the MSR #GPs elsewhere and `msr::read` cannot recover; uniform CPUs need no hint. With HWP off (it could not be
+/// switched on) the core-type rule applies (0 here).
 pub fn hwp_highest_perf(v: &CpuidView, read: &mut dyn FnMut(u32) -> u64) -> u8 {
     if v.has("hybrid_cpu") && crate::msr::hwp_enabled(v, read) {
         (read(crate::msr::IA32_HWP_CAPABILITIES) & 0xFF) as u8
@@ -270,9 +303,25 @@ pub fn hwp_highest_perf(v: &CpuidView, read: &mut dyn FnMut(u32) -> u64) -> u8 {
     }
 }
 
+/// GP-CPU2: the preference `cpu_policy=performance` as the BSP read it, for the APs.
+static HWP_PERFORMANCE: AtomicBool = AtomicBool::new(false);
+
+/// The `cpu_policy=` in force (`Balanced` until `hwp_bsp` ran).
+pub fn hwp_policy() -> hwp::Policy {
+    if HWP_PERFORMANCE.load(Ordering::Acquire) { hwp::Policy::Performance } else { hwp::Policy::Balanced }
+}
+
+/// HWP on the BSP, before its topology is recorded (its capacity needs the real number), and the policy every AP
+/// will follow on itself. `platform::smp` calls it first thing, on every path of the bring-up.
+pub fn hwp_bsp(policy: hwp::Policy) -> hwp::Outcome {
+    HWP_PERFORMANCE.store(policy == hwp::Policy::Performance, Ordering::Release);
+    hwp::enable_this_cpu(policy)
+}
+
 /// The topology of the CPU running this, with its HWP number (each CPU reads its own; no lock, no allocation).
 fn this_cpu_topology(v: &CpuidView, node: u32) -> Topology {
-    Topology { perf_highest: hwp_highest_perf(v, &mut crate::msr::read), ..decode_topology(v, node) }
+    // Fault-safe (GP-CPU): a faulted read is 0, which reads as "HWP off" or "no number", never a #GP at bring-up.
+    Topology { perf_highest: hwp_highest_perf(v, &mut |m| crate::msr::try_read(m).unwrap_or(0)), ..decode_topology(v, node) }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -314,7 +363,7 @@ static SLOTS: PerCpu<Slot> = PerCpu::new(|_| Slot {
     state: AtomicU8::new(OFFLINE),
     apic_id: AtomicU32::new(u32::MAX),
     topo_set: AtomicBool::new(false),
-    topo: UnsafeCell::new(Topology { apic_id: 0, package_id: 0, die_id: 0, core_id: 0, thread_id: 0, threads_per_core: 0, smt_sibling_of: None, cluster_id: 0, node: 0, core_type: 0, source_leaf: 0, perf_highest: 0 }),
+    topo: UnsafeCell::new(Topology { apic_id: 0, package_id: 0, die_id: 0, core_id: 0, thread_id: 0, threads_per_core: 0, smt_sibling_of: None, cluster_id: 0, l2_id: 0, node: 0, core_type: 0, source_leaf: 0, perf_highest: 0 }),
     stack: [const { AtomicU64::new(0) }; 3],
     call_owner: AtomicBool::new(false),
     call_state: AtomicU8::new(CALL_IDLE),
@@ -665,7 +714,7 @@ pub fn prepare(t: bootinfo::Trampoline, node: u32, alloc_table: &mut dyn FnMut()
 }
 
 /// Records the BSP as online CPU 0 (its APIC ID, its topology with `node` from SRAT) without preparing any AP
-/// start (CP-4b): for the one-CPU paths (CONFIG `smp=off`/`cpus=1`, no trampoline, no MADT), so `apic_id(0)`,
+/// start (CP-4b): for the one-CPU paths (no trampoline, no MADT, the LAPIC or the preparation failed), so `apic_id(0)`,
 /// `topology(0)` and `cpu_of_apic` hold with one CPU as well. `prepare` records the same; a second record keeps
 /// the first topology. Touches no trampoline or vector; reads only IA32_PM_ENABLE and IA32_HWP_CAPABILITIES, and
 /// only on hybrid Intel CPUs with CPUID `hwp` (`hwp_highest_perf`).
@@ -755,6 +804,7 @@ struct ApSide {
     topology: Topology,
     tsc_adjust: Option<u64>,
     syscfg_differs: Option<(u64, u64)>,
+    hwp: hwp::Outcome,
 }
 
 /// What happened to an AP's MTRRs.
@@ -812,6 +862,8 @@ pub struct ApStarted {
     pub xsave_size: u32,
     /// The AP's CPUID flags (compared with the BSP's by the caller: `FlagBits::differences`).
     pub flags: FlagBits,
+    /// HWP on this AP (`cpu::hwp`, before its topology was read).
+    pub hwp: hwp::Outcome,
     pub topology: Topology,
     /// IA32_TSC_ADJUST on the AP (CPUID `tsc_adjust` only; Linux `tsc_sync.c` checks it at boot).
     pub tsc_adjust: Option<u64>,
@@ -1019,6 +1071,7 @@ pub fn start_ap(req: &ApRequest, env: &mut Env<'_>) -> Result<Result<ApStarted, 
         lapic: side.lapic,
         xsave_size: side.xsave_size,
         flags: side.flags,
+        hwp: side.hwp,
         topology: side.topology,
         tsc_adjust: side.tsc_adjust,
         syscfg_differs: side.syscfg_differs,
@@ -1211,11 +1264,13 @@ fn ap_setup(b: &'static ApBoot) -> ! {
     };
     b.step.store(9, Ordering::Release);
     let flags = FlagBits::from_view(&v);
+    // Before the topology: the HWP number there can only be read with HWP on.
+    let hwp = hwp::enable_this_cpu(hwp_policy());
     let topology = this_cpu_topology(&v, b.node);
     let tsc_adjust = v.has("tsc_adjust").then(|| crate::msr::read(crate::msr::IA32_TSC_ADJUST));
     // SAFETY: only this AP writes `side`, before publishing ST_ONLINE (Release).
     unsafe {
-        *b.side.get() = ApSide { refused: None, setup, mtrr, syscfg_fix, lapic, xsave_size: x.size, flags, topology, tsc_adjust, syscfg_differs };
+        *b.side.get() = ApSide { refused: None, setup, mtrr, syscfg_fix, lapic, xsave_size: x.size, flags, topology, tsc_adjust, syscfg_differs, hwp };
     }
     b.step.store(10, Ordering::Release);
     b.stage.store(ST_ONLINE, Ordering::Release);
@@ -1348,65 +1403,94 @@ mod tests {
         assert_eq!(seen.len(), 16);
     }
 
-    /// Arrow Lake (Gaming-PC): no SMT, hybrid, P cores APIC 0-14 even (shift 1 with one thread), E cores later.
-    fn arrow_lake(apic: u32, e_core: bool) -> Leaves {
-        let mut t = Leaves::new();
-        vendor(&mut t, 0x23, b"GenuineIntel");
-        t.insert((1, 0), r(0x000C_0662, (apic << 24) | (32 << 16), 0, 1 << 28));
-        t.insert((7, 0), r(1, 0, 0, 1 << 15));
-        level(&mut t, 0x1F, 0, 1, 1, 1, apic);
-        level(&mut t, 0x1F, 1, 2, 7, 20, apic);
-        t.insert((0x1A, 0), r(if e_core { 0x20 << 24 } else { 0x40 << 24 }, 0, 0, 0));
-        t.insert((4, 0), r((3 << 5) | 3 | (63 << 14), 0, 0, 0));
-        t
+    use crate::cpu::real_265k::{self, Dump};
+
+    fn real_view<T>(d: &Dump, f: impl FnOnce(&CpuidView) -> T) -> T {
+        let g = d.getter();
+        f(&CpuidView::new(&g))
+    }
+
+    /// The dump of CPU `c`'s kind with `c`'s APIC ID. P core kinds: CPUs 0-7; E: 8-19 (the real numbering).
+    fn real_cpu(c: real_265k::LinuxCpu) -> Dump {
+        if c.cpu < 8 { real_265k::cpu0().with_apic(c.apic) } else { real_265k::cpu8().with_apic(c.apic) }
+    }
+
+    /// What the HWP capabilities of CPU `c` could read: its real highest performance in byte 0.
+    fn caps(c: real_265k::LinuxCpu) -> u64 {
+        0x0101_3E00 | u64::from(c.highest_perf)
+    }
+
+    /// The dumps carry the real APIC IDs, so the dumped CPUs need no patching: decode them as they are.
+    #[test]
+    fn real_265k_dumps_decode_like_linux() {
+        let linux = real_265k::linux_view();
+        for (d, cpu, ty) in [(real_265k::cpu0(), 0, CORE_TYPE_PERFORMANCE), (real_265k::cpu3(), 3, CORE_TYPE_PERFORMANCE), (real_265k::cpu8(), 8, CORE_TYPE_EFFICIENCY), (real_265k::cpu19(), 19, CORE_TYPE_EFFICIENCY)] {
+            let t = real_view(&d, |v| decode_topology(v, 0));
+            let want = linux[cpu];
+            assert_eq!((t.apic_id, t.core_id, t.core_type, t.source_leaf), (want.apic, want.core, ty, 0x1F), "cpu {cpu}");
+            assert_eq!((t.package_id, t.die_id, t.thread_id, t.threads_per_core, t.smt_sibling_of), (0, 0, 0, 1, None), "cpu {cpu}: one package, no SMT");
+        }
+    }
+
+    /// All 20 CPUs as Linux sees them: sparse APIC IDs, core numbers, one L3, the L2 domains (E cores in fours).
+    #[test]
+    fn real_265k_all_cpus_match_linux() {
+        let linux = real_265k::linux_view();
+        assert_eq!(linux.len(), 20);
+        let topo: Vec<Topology> = linux.iter().map(|&c| real_view(&real_cpu(c), |v| decode_topology(v, 0))).collect();
+        for (t, c) in topo.iter().zip(&linux) {
+            assert_eq!((t.apic_id, t.core_id), (c.apic, c.core), "cpu {}", c.cpu);
+            assert_eq!(t.cluster_id, 0, "cpu {}: one L3 for the package", c.cpu);
+            assert_eq!(t.core_type, if c.cpu < 8 { CORE_TYPE_PERFORMANCE } else { CORE_TYPE_EFFICIENCY });
+            assert_eq!(t.l2_id, topo[c.l2_first].l2_id, "cpu {}: the L2 domain Linux shows", c.cpu);
+            for (o, oc) in topo.iter().zip(&linux) {
+                assert_eq!(t.l2_id == o.l2_id, c.l2_first == oc.l2_first, "cpus {} and {}", c.cpu, oc.cpu);
+            }
+        }
+        assert_eq!(topo.iter().map(|t| t.l2_id).collect::<alloc::collections::BTreeSet<_>>().len(), 8 + 3, "8 P cores + 3 E clusters");
     }
 
     #[test]
-    fn hybrid_core_types() {
-        let p = view_of(&arrow_lake(4, false), |v| decode_topology(v, 0));
-        let e = view_of(&arrow_lake(40, true), |v| decode_topology(v, 0));
-        assert_eq!(p.core_type, CORE_TYPE_PERFORMANCE);
-        assert_eq!(e.core_type, CORE_TYPE_EFFICIENCY);
-        assert_eq!((p.thread_id, p.smt_sibling_of, p.threads_per_core), (0, None, 1), "no SMT: one thread, no sibling");
-        assert_eq!(p.core_id, 2);
-        assert_eq!(e.core_id, 20);
-        assert_eq!(p.cluster_id, e.cluster_id, "one L3 for the whole package");
-        // Without the hybrid flag leaf 0x1A is not trusted.
-        let mut t = arrow_lake(4, false);
-        t.insert((7, 0), r(1, 0, 0, 0));
-        assert_eq!(view_of(&t, |v| decode_topology(v, 0)).core_type, CORE_TYPE_UNIFORM);
+    fn real_265k_without_the_hybrid_flag_trusts_no_core_type() {
+        let mut d = real_265k::cpu8();
+        d.patch(7, 0, |r| r.edx &= !(1 << 15));
+        assert_eq!(real_view(&d, |v| decode_topology(v, 0)).core_type, CORE_TYPE_UNIFORM);
     }
 
-    /// CP-6: the capacity hint from the HWP numbers the 265K reports (Linux `cpu_capacity`: 1024/1012/756).
+    /// The capacity hint from the HWP numbers read on each CPU: Linux's `cpu_capacity` of this machine, 1012 / 1024 /
+    /// 802, whatever order the CPUs come up in.
     #[test]
-    fn hybrid_capacity() {
-        let with_hwp = |apic, e| {
-            let mut t = arrow_lake(apic, e);
-            t.insert((6, 0), r(0xF86, 0, 0, 0));
-            t
-        };
-        // IA32_HWP_CAPABILITIES: lowest, efficient, guaranteed, highest (byte 0) like the host's P/E cores.
-        let topo = |t: &Leaves, highest: u64| {
-            view_of(t, |v| Topology {
-                perf_highest: hwp_highest_perf(v, &mut |m| match m {
-                    crate::msr::IA32_PM_ENABLE => 1,
-                    crate::msr::IA32_HWP_CAPABILITIES => 0x0101_3E00 | highest,
-                    _ => panic!("MSR {m:#x}"),
-                }),
-                ..decode_topology(v, 0)
+    fn real_265k_capacity_matches_linux() {
+        let linux = real_265k::linux_view();
+        let topo: Vec<Topology> = linux
+            .iter()
+            .map(|&c| {
+                real_view(&real_cpu(c), |v| Topology {
+                    perf_highest: hwp_highest_perf(v, &mut |m| match m {
+                        crate::msr::IA32_PM_ENABLE => 1,
+                        crate::msr::IA32_HWP_CAPABILITIES => caps(c),
+                        _ => panic!("MSR {m:#x}"),
+                    }),
+                    ..decode_topology(v, 0)
+                })
             })
-        };
-        let fav = topo(&with_hwp(6, false), 88);
-        let p = topo(&with_hwp(4, false), 87);
-        let e = topo(&with_hwp(40, true), 65);
-        assert_eq!((fav.perf_highest, p.perf_highest, e.perf_highest), (88, 87, 65));
-        assert_eq!((fav.capacity(88), p.capacity(88), e.capacity(88)), (1024, 1012, 756));
-        assert_eq!(p.capacity(87), 1024, "before the favoured core is up");
-        assert_eq!(fav.capacity(87), 1024, "never above the scale");
-        // CPUID hwp but HWP left off by the firmware (PM_ENABLE bit 0 clear): the capabilities MSR would #GP, so it
-        // is never read and the core type decides.
+            .collect();
+        let max = topo.iter().map(|t| t.perf_highest).max().unwrap();
+        assert_eq!(max, 88);
+        for (t, c) in topo.iter().zip(&linux) {
+            assert_eq!((t.perf_highest, t.capacity(max)), (c.highest_perf, c.cap), "cpu {}", c.cpu);
+        }
+        assert_eq!(topo[0].capacity(87), 1024, "before the favoured core is up");
+        assert_eq!(topo[3].capacity(87), 1024, "never above the scale");
+    }
+
+    /// HWP left off (PM_ENABLE clear: it could not be switched on): the capabilities MSR would #GP, so only PM_ENABLE is asked
+    /// and the core type decides. AMD and non-hybrid Intel ask nothing and stay uniform.
+    #[test]
+    fn capacity_without_hwp() {
+        let e = real_265k::cpu8();
         let mut asked = Vec::new();
-        let off = view_of(&with_hwp(40, true), |v| Topology {
+        let off = real_view(&e, |v| Topology {
             perf_highest: hwp_highest_perf(v, &mut |m| {
                 asked.push(m);
                 assert_eq!(m, crate::msr::IA32_PM_ENABLE, "HWP_CAPABILITIES read with HWP off");
@@ -1416,20 +1500,33 @@ mod tests {
         });
         assert_eq!(asked, [crate::msr::IA32_PM_ENABLE]);
         assert_eq!((off.perf_highest, off.capacity(0)), (0, E_CORE_FALLBACK_CAPACITY));
-        // Without CPUID hwp: no MSR read, the core type decides.
+        let p = real_view(&real_265k::cpu0(), |v| decode_topology(v, 0));
+        assert_eq!(p.capacity(0), CAPACITY_SCALE);
         let never = &mut |m: u32| -> u64 { panic!("MSR {m:#x} read without CPUID hwp") };
-        let plain_e = view_of(&arrow_lake(40, true), |v| Topology { perf_highest: hwp_highest_perf(v, never), ..decode_topology(v, 0) });
-        assert_eq!((plain_e.perf_highest, plain_e.capacity(0), plain_e.capacity(88)), (0, E_CORE_FALLBACK_CAPACITY, E_CORE_FALLBACK_CAPACITY));
-        let plain_p = view_of(&arrow_lake(4, false), |v| decode_topology(v, 0));
-        assert_eq!(plain_p.capacity(0), CAPACITY_SCALE);
+        let mut no_hwp = real_265k::cpu8();
+        no_hwp.patch(6, 0, |r| r.eax &= !(1 << 7));
+        assert_eq!(real_view(&no_hwp, |v| hwp_highest_perf(v, never)), 0);
+        let mut guest = real_265k::cpu8();
+        guest.patch(1, 0, |r| r.ecx |= 1 << 31);
+        assert_eq!(real_view(&guest, |v| hwp_highest_perf(v, never)), 0, "a guest that shows hwp has no such MSR");
         // AMD (even with bit 7 of leaf 6 set) and a non-hybrid Intel never read it and stay uniform.
         let mut amd = zen4(3);
         amd.insert((6, 0), r(0x84, 0, 0, 0));
         let a = view_of(&amd, |v| Topology { perf_highest: hwp_highest_perf(v, never), ..decode_topology(v, 0) });
         assert_eq!((a.perf_highest, a.capacity(0)), (0, CAPACITY_SCALE));
-        let mut uniform = with_hwp(4, false);
-        uniform.insert((7, 0), r(1, 0, 0, 0));
-        assert_eq!(view_of(&uniform, |v| hwp_highest_perf(v, never)), 0);
+        let mut uniform = real_265k::cpu0();
+        uniform.patch(7, 0, |r| r.edx &= !(1 << 15));
+        assert_eq!(real_view(&uniform, |v| hwp_highest_perf(v, never)), 0);
+    }
+
+    /// The L2 domain on the Mini-PC's shape (each core its own, SMT threads together): nothing there reads it, the
+    /// test keeps the answer honest.
+    #[test]
+    fn l2_on_a_uniform_cpu() {
+        for apic in [0u32, 1, 6, 7] {
+            let topo = view_of(&zen4(apic), |v| decode_topology(v, 0));
+            assert_eq!(topo.l2_id, apic >> 1, "apic {apic}: without a cache leaf each core its own");
+        }
     }
 
     #[test]

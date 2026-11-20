@@ -57,6 +57,17 @@ pub fn init(bi: &bootinfo::BootInfo<'_>) {
             Acpi::default()
         }
     };
+    // SYS-K: the SMBIOS identity for /sys/class/dmi/id, through the same guarded reader.
+    if let Some(sm) = bi.smbios() {
+        let mut mem = KernelMem::new(&map, phys_bits, &*snap).with_ecam(&acpi.mcfg);
+        match crate::dmi::read(&mut mem, sm.phys) {
+            Some((e, f)) => {
+                klog::event!(Debug, "acpi", "dmi.read", version = Hex(e.version as u64), bytes = e.len, fields = f.len());
+                crate::dmi::set(f);
+            }
+            None => klog::event!(Info, "acpi", "dmi.unreadable"; "the SMBIOS entry point or table could not be read: no /sys/class/dmi"),
+        }
+    }
     // Read before anyone writes ACPI_ENABLE: CP-5 enables ACPI mode only when the firmware left it off.
     let sci = {
         let gd = Guard { map: &map, phys_bits, ecam: &acpi.mcfg, pci: &*snap };
@@ -64,6 +75,10 @@ pub fn init(bi: &bootinfo::BootInfo<'_>) {
     };
     let st = STATE.get_or_init(|| State { acpi, map, phys_bits, sci_at_boot: sci });
     report::log(&st.acpi, st.sci_at_boot);
+    // GP B7: the IOMMUs' state as the firmware left it, read and logged before any initcall can enable a device.
+    crate::dmar::boot(st.acpi.dmar.as_ref());
+    // GP R3: the Intel chipset's watchdog as the firmware left it (read only; nothing on an AMD CPU).
+    crate::tco::boot();
     // CP-5: the HPET started and the TSC calibrated against it (the guard knows the map now), the RTC read.
     crate::clock::boot(&st.acpi, bi);
     TRAMPOLINE.get_or_init(|| bi.trampoline());
@@ -97,7 +112,16 @@ pub fn sci_en_at_boot() -> Option<bool> {
 /// Lines for `hw_info`'s firmware section (MC registers the tool).
 pub fn summary() -> alloc::vec::Vec<alloc::string::String> {
     match STATE.get() {
-        Some(s) => report::summary(&s.acpi, sci_en_at_boot()),
+        Some(s) => {
+            let mut v = report::summary(&s.acpi, sci_en_at_boot());
+            if let Some(d) = crate::dmar::found() {
+                v.extend(d.lines());
+            }
+            if let Some(t) = crate::tco::found() {
+                v.extend(t.lines());
+            }
+            v
+        }
         None => alloc::vec![alloc::string::String::from("acpi: not read (acpi::init was not called)")],
     }
 }

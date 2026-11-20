@@ -1,6 +1,6 @@
 """The Mini-PC scripts' way to MCP: the address and the key store as host/mcp/mcp-call.mjs takes them
 (<host[:port]>, --tls DIR|auto, --token-file F, token also from BITSOS_TOKEN), over mutual TLS with the pinned key
-(host/tests/mcp/mcp_tls.py). Without --tls plain HTTP: QEMU's kernel server, for host/tests/lo/20-desktop-stop.sh."""
+(host/tests/mcp/mcp_tls.py). Without --tls plain HTTP: QEMU's kernel server, and selftest.py's stand-in for the machine."""
 import http.client
 import json
 import os

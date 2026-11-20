@@ -38,7 +38,7 @@ fn synthetic_780m_list_is_linux_order() {
     let ids: Vec<_> = list.iter().map(|u| u.id).collect();
     assert_eq!(ids, EXPECT_780M);
     let types: Vec<u32> = list.iter().map(|u| u.id.fw_type()).collect();
-    assert_eq!(types, [71, 72, 2, 1, 4, 33, 34, 81, 82, 68, 69, 20, 21, 26, 48, 25, 8]);
+    assert_eq!(types, [71, 72, 2, 1, 4, 33, 34, 81, 82, 68, 69, 20, 21, 26, 48, 25, 8, 13]);
     let size = |id| list.iter().find(|u| u.id == id).unwrap().size();
     assert_eq!(size(UcodeId::CpMec1), 0x2400 - 0x380);
     assert_eq!((size(UcodeId::ImuI), size(UcodeId::ImuD)), (0x1000, 0x800));
@@ -60,7 +60,7 @@ fn synthetic_780m_list_is_linux_order() {
 
 #[test]
 fn options_change_the_list_as_linux_flags_do() {
-    let all = ListOpts { autoload: false, mes_kiq: true, keep_display_firmware: false, vcn: true };
+    let all = ListOpts { autoload: false, mes_kiq: true, keep_display_firmware: false };
     let s = set_with(&all, synth()).unwrap();
     let ids: Vec<_> = s.load_list(&all).unwrap().iter().map(|u| u.id).collect();
     for id in [UcodeId::CpMec1Jt, UcodeId::CpMes1, UcodeId::CpMes1Data, UcodeId::Vcn, UcodeId::Dmcub] {
@@ -259,15 +259,8 @@ fn crc32_is_zlibs() {
 }
 
 /// The host's linux-firmware-amdgpu files (CachyOS: /usr/lib/firmware/amdgpu/*.bin.zst), decompressed with the
-/// host's zstd: they parse, give the 780M list in Linux's order and run through the fake. Skipped (passes)
-/// where the package or zstd is missing, with a line on stderr (`--nocapture` shows it); `V2_FW_STRICT=1`
-/// turns the skip into a failure, as for xtask image. Never copied anywhere.
-fn skip_real(why: &str) {
-    let strict = std::env::var("V2_FW_STRICT").is_ok_and(|v| v == "1");
-    assert!(!strict, "real_files: {why} (V2_FW_STRICT=1)");
-    std::eprintln!("real_files: SKIPPED, {why}");
-}
-
+/// host's zstd: they parse, give the 780M list in Linux's order and run through the fake. A missing package or
+/// zstd is a failure (no skipped tests). Never copied anywhere.
 #[test]
 fn real_files() {
     let dir = std::path::Path::new("/usr/lib/firmware/amdgpu");
@@ -280,19 +273,17 @@ fn real_files() {
             if !zst.exists() {
                 continue;
             }
-            let Ok(out) = std::process::Command::new("zstd").arg("-dcf").arg(&zst).output() else {
-                skip_real("no zstd on this host");
-                return;
-            };
+            let out = std::process::Command::new("zstd").arg("-dcf").arg(&zst).output();
+            let out = out.unwrap_or_else(|e| panic!("real_files: zstd -dcf {}: {e} (install zstd: pacman -S zstd)", zst.display()));
             if out.status.success() {
                 m.insert(stick_path(name), out.stdout);
             }
         }
     }
-    if !m.contains_key(&stick_path("amdgpu/psp_13_0_4_toc.bin")) {
-        skip_real("linux-firmware-amdgpu not installed in /usr/lib/firmware/amdgpu");
-        return;
-    }
+    assert!(
+        m.contains_key(&stick_path("amdgpu/psp_13_0_4_toc.bin")),
+        "real_files: psp_13_0_4_toc.bin.zst missing in /usr/lib/firmware/amdgpu (install linux-firmware-amdgpu)"
+    );
     let opts = ListOpts::PSP13_0_4;
     let s = set_with(&opts, m.clone()).unwrap();
     let list = s.load_list(&opts).unwrap();

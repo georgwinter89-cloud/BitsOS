@@ -1,4 +1,4 @@
-//! FS-1b: statfs/fstatfs answers per file system (linux-6.6/fs/statfs.c; tmpfs `shmem_statfs`, proc/sysfs/
+//! FS-1b: statfs/fstatfs answers per file system (linux-7.3.1/fs/statfs.c; tmpfs `shmem_statfs`, proc/sysfs/
 //! devpts `simple_statfs`, vfat `fat_statfs` through `FsOps::statfs`, pipefs/sockfs/anon_inodefs for objects
 //! without a name).
 
@@ -59,7 +59,7 @@ impl StatFs {
 
 /// tmpfs (`shmem_statfs`): pages; a mount with its own size reports it, else the system pool (the tmpfs
 /// budget all instances share, V2-PLAN R2) as the size. Inodes (FS-15): `f_files` is Linux's default
-/// `nr_inodes` (`shmem_default_max_inodes`, linux-6.6/mm/shmem.c:139-145: RAM pages / 2 on x86-64, no highmem),
+/// `nr_inodes` (`shmem_default_max_inodes`, linux-7.3.1/mm/shmem.c:152-158: RAM pages / 2 on x86-64, no highmem),
 /// `f_ffree` that minus the slots in use. The number is advisory (R1): V2 refuses inodes only when the pool
 /// refuses their metadata (ENOSPC), never at a count.
 fn tmpfs(sb: &SuperBlock) -> StatFs {

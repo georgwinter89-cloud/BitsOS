@@ -1,7 +1,7 @@
-//! DR-8: `DRM_IOCTL_AMDGPU_CS` (Linux `amdgpu_cs_ioctl`, linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:1382):
-//! the chunks Mesa sends (IB, FENCE, BO_HANDLES, DEPENDENCIES, SCHEDULED_DEPENDENCIES, SYNCOBJ_IN/OUT,
-//! SYNCOBJ_TIMELINE_WAIT/SIGNAL, CP_GFX_SHADOW) with Linux's checks in Linux's order (parser_init, pass1, pass2,
-//! the BO list, the VM, the implicit sync, submit), and the gang of jobs it hands the backend.
+//! DR-8: `DRM_IOCTL_AMDGPU_CS` (Linux `amdgpu_cs_ioctl`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:1431): the
+//! chunks Mesa sends (IB, FENCE, BO_HANDLES, DEPENDENCIES, SCHEDULED_DEPENDENCIES, SYNCOBJ_IN/OUT,
+//! SYNCOBJ_TIMELINE_WAIT/SIGNAL, CP_GFX_SHADOW) with Linux's checks in Linux's order (parser_init, pass1, pass2, the BO
+//! list, the VM, the implicit sync, submit), and the gang of jobs it hands the backend.
 //!
 //! Nothing a program can see changes before the backend took the jobs: the sequence number, the fences on the
 //! objects and the out-syncobjs come after `GpuDevice::submit` answered Ok.
@@ -23,6 +23,16 @@ use alloc::vec::Vec;
 use linux::errno::*;
 use linux::ab::errno_more::ECANCELED;
 use vfs::Errno;
+
+/// `amdgpu_cs_ib_packet_size_max_dw` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:49-62): the IB packets of
+/// GFX, compute, SDMA and VPE have a 20-bit size field; the multimedia rings take up to 0x7FFFF0 dwords. The IP
+/// type is the ring type here (one ring kind per type).
+fn ib_max_dw(ip_type: u32) -> u32 {
+    match ip_type {
+        AMDGPU_HW_IP_GFX | AMDGPU_HW_IP_COMPUTE | AMDGPU_HW_IP_DMA | AMDGPU_HW_IP_VPE => 0xF_FFFF,
+        _ => 0x7F_FFF0,
+    }
+}
 
 /// `AMDGPU_CS_GANG_SIZE` (amdgpu_cs.h:37): entities one CS may feed.
 pub const GANG_SIZE: usize = 4;
@@ -260,9 +270,10 @@ impl Parser<'_> {
         r
     }
 
-    /// `amdgpu_cs_p2_ib` (:326): one preemptible DE IB per GFX submission. CachyOS refuses the CE flag on any IB
-    /// (GFX 11 and later have no constant engine; seen on the RX 9070 XT, applied to the 780M too), so 6.6's
-    /// count of preemptible CE IBs cannot be reached.
+    /// `amdgpu_cs_p2_ib` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:347): one preemptible DE IB per GFX
+    /// submission. The CE flag is refused on any IB (`debug_enable_ce_cs` is off: GFX 11 and later have no constant
+    /// engine), so the count of preemptible CE IBs cannot be reached. Then the IB's size against its ring's packet
+    /// (:395).
     fn p2_ib(&mut self, c: &Chunk, de: &mut u32) -> Result<(), Errno> {
         let ib = rec::<drm_amdgpu_cs_chunk_ib>(&c.data, 0);
         let r = self.job_idx(&ib)?;
@@ -274,6 +285,9 @@ impl Parser<'_> {
             if *de > 1 {
                 return Err(EINVAL);
             }
+        }
+        if ib.ib_bytes / 4 > ib_max_dw(ib.ip_type) {
+            return Err(EINVAL);
         }
         self.members[r].ibs.push(JobIb { va: ib.va_start & HOLE_MASK, len_dw: ib.ib_bytes / 4, flags: ib.flags });
         Ok(())

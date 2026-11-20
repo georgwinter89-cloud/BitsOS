@@ -26,9 +26,8 @@ pub mod store;
 pub mod text;
 
 /// The confirmer the session runs (CONFIG.TXT `mcp_confirmer=test`: the test confirmer below, QEMU only).
-/// INT-W24 (WY-14 CR 3): bitscomp's rescue build and its gpu build on the stick (CONFIG bitscomp=gpu hands over to
-/// it, so the session's compositor runs that file); both must hold fb0's compositor grant.
-pub const CONFIRMERS: [&str; 2] = ["/bin/bitscomp", "/boot/BITSOS2/bin/bitscomp-gpu"];
+/// bitscomp on the stick, beside the Mesa tree it runs with; it must hold fb0's compositor grant.
+pub const CONFIRMERS: [&str; 1] = ["/boot/BITSOS2/bin/bitscomp"];
 pub const TEST_CONFIRMER: &str = "/bin/bitsinstall";
 /// The users a confirmer may run as: root and the desktop user (bitscomp gives root up for 1000).
 pub const CONFIRMER_UIDS: [u32; 2] = [0, 1000];

@@ -1,5 +1,6 @@
 # ctxd settings (namespace context.*). Copy to ~/.config/ctxd/config.toml and adapt.
-# Without any config file the only root is the synthetic test set host/cx-eval/docs.
+# Without a configured root nothing is indexed (ctxd eval names host/cx-eval/docs itself). On BitsOS V2 the
+# same keys live in the settings registry (context.*; see DESIGN.md section 15), not in this file.
 
 [context]
 # Only these folders are read. private = true: never shown to Claude (MCP), only on Georg's own screen.

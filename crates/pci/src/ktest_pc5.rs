@@ -139,8 +139,8 @@ fn aspm_fake() -> R {
     kassert!(legacy.get(NIC, 0xB0) == 0 && legacy.get(PORT, 0x50) == 0, "ASPM L1 still on without ECAM");
 
     let mut un = ns.clone();
-    un[nic].untouched = Some("wlan");
-    kassert!(aspm::l12_off(&f, &un, nic, false) == Err(AspmError::Untouched("wlan")));
+    un[nic].untouched = Some("gp_wlan");
+    kassert!(aspm::l12_off(&f, &un, nic, false) == Err(AspmError::Untouched("gp_wlan")));
     let mut st = ns.clone();
     st[nic].class = 0x01_08_02;
     kassert!(aspm::l12_off(&f, &st, nic, false) == Err(AspmError::Storage));
@@ -152,7 +152,7 @@ fn aspm_fake() -> R {
 /// After boot every I226 its driver enabled has L1.2 off on both ends of its link (the Mini-PC's 03:00.0
 /// behind 00:02.1). Reads only.
 fn aspm_i226() -> R {
-    let ns = NODES.lock().clone();
+    let ns = NODES.get().to_vec();
     let mut seen = 0;
     for (i, n) in ns.iter().enumerate().filter(|(_, n)| aspm::needs_l12_off(n.vendor, n.device) && crate::device::is_enabled(n.loc)) {
         let Some(p) = n.parent.map(|p| &ns[p]) else { continue };
@@ -175,10 +175,10 @@ fn aspm_i226() -> R {
 }
 
 /// `PciFunction::aspm_l12_off` on q35: a PCIe card behind a root port (QEMU's ports have no L1 PM Substates:
-/// "the link never enters L1.2", nothing written), and the refusals with their events (the untouched MCH,
+/// "the link never enters L1.2", nothing written), and the refusals with their events (the untouched SMBus,
 /// the AHCI). QEMU only: it may write Link Control of a card no driver uses.
 fn aspm_kernel_path() -> R {
-    let ns = NODES.lock().clone();
+    let ns = NODES.get().to_vec();
     let mut done = 0;
     if let Some(n) = ns.iter().find(|n| {
         n.untouched.is_none() && !n.is_storage() && n.pcie.is_some_and(|p| p.port_type == 0) && n.parent.is_some_and(|p| ns[p].pcie.is_some_and(|x| x.is_root_port()))
@@ -208,7 +208,7 @@ fn aspm_kernel_path() -> R {
 /// unless integrated endpoint / event collector, Root Control on root ports, the "2" registers from
 /// capability version 2. Reads only (`enable::save` over the locked back end).
 fn saved_regs() -> R {
-    let ns = NODES.lock().clone();
+    let ns = NODES.get().to_vec();
     let mut checked = 0;
     for n in ns.iter().filter(|n| n.untouched.is_none()) {
         let Some(cap) = n.cap(crate::caps::id::PCIE) else { continue };
@@ -233,7 +233,7 @@ fn saved_regs() -> R {
 /// End-End TLP Prefix Blocking, the one QEMU lets software write), and Slot Control of a root port with a slot
 /// (the attention indicator bits, which only light a LED). QEMU only: it changes live registers.
 fn restore_ctl2() -> R {
-    let ns = NODES.lock().clone();
+    let ns = NODES.get().to_vec();
     let pcie_off = |n: &Node| n.cap(crate::caps::id::PCIE).map(|c| c.offset as u16);
     let mut done = 0;
     let dev = ns.iter().find(|n| {
@@ -319,7 +319,7 @@ fn amd_gpu() -> Node {
 /// every untouched function read only in its header and never written; a bridge above mass storage never
 /// written; the Radeon's (made up, plus the real one when there is one) index pairs never touched.
 fn raw_guards() -> R {
-    let ns = NODES.lock().clone();
+    let ns = NODES.get().to_vec();
     for (i, n) in ns.iter().enumerate() {
         let space = raw::cfg_space(n, crate::access().space_size(n.loc.segment, n.loc.bus));
         if n.is_storage() {

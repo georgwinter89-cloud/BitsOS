@@ -130,6 +130,40 @@ fn important_events_exist_in_the_sources() {
     for &(s, n) in logfilter::IMPORTANT {
         assert!(emitted(s, n), "no event \"{s}\", \"{n}\" in crates/ or kernel/: update logfilter::IMPORTANT");
     }
+    for &(s, n) in logfilter::PROFILE_IMPORTANT {
+        assert!(emitted(s, n), "no event \"{s}\", \"{n}\" in crates/ or kernel/: update logfilter::PROFILE_IMPORTANT");
+    }
+}
+
+/// GP-ROUND: the profile's own lines reach the quiet screen only with the profile, and only at the quiet level;
+/// without it the filter is the old one line for line.
+#[test]
+fn the_profile_raises_only_its_own_lines() {
+    let raised = [
+        line(Level::Info, "acpi", "dma.state", "verdict=free blocked=false"),
+        line(Level::Info, "time", "hpet.untrusted", "reason=pc10"),
+        line(Level::Info, "time", "clock.cross_check", "measured_hz=1 cpuid15_hz=1"),
+        line(Level::Info, "cpu", "hwp.on", "cpu=3"),
+        line(Level::Info, "smp", "done", "cpus=20 planned=19 up=19 failed=0"),
+        line(Level::Info, "smp", "shape", "cpus=20"),
+        line(Level::Info, "net", "rtl8126.stage", "ifname=rtl0 stage=link verdict=ok"),
+    ];
+    for l in &raised {
+        assert!(!logfilter::shows(WARN, Level::Info, l), "{l}");
+        assert!(!logfilter::shows_with(WARN, Level::Info, l, false), "{l}");
+        assert!(logfilter::shows_with(WARN, Level::Info, l, true), "{l}");
+        assert!(!logfilter::shows_with(ERROR, Level::Info, l, true) && !logfilter::shows_with(OFF, Level::Info, l, true), "{l}");
+    }
+    for l in [line(Level::Info, "cpu", "topology", "cpu=1"), line(Level::Info, "pci", "function", "function=00:00.0"), line(Level::Debug, "acpi", "dma.state", "x")] {
+        assert!(!logfilter::shows_with(WARN, if l.contains(" D ") { Level::Debug } else { Level::Info }, &l, true), "{l}");
+    }
+    // Everything else answers the same with and without the profile, at every level.
+    for lvl in [OFF, ERROR, WARN, INFO, DEBUG, ALL] {
+        for (lv, s, n) in [(Level::Info, "net", "link.up"), (Level::Warn, "pci", "bar.x"), (Level::Error, "kernel", "x"), (Level::Info, "mm", "frames"), (Level::Trace, "x", "y")] {
+            let l = line(lv, s, n, "a=1");
+            assert_eq!(logfilter::shows(lvl, lv, &l), logfilter::shows_with(lvl, lv, &l, true), "{l} at {lvl}");
+        }
+    }
 }
 
 #[test]

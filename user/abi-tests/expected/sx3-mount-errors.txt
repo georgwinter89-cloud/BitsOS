@@ -7,7 +7,7 @@ mount bad type pointer = -EFAULT
 mount bad dir pointer = -EFAULT
 mount bad data pointer = -EFAULT
 umount2 bad pointer = -EFAULT
-pivot_root bad pointer = -EPERM
+pivot_root bad pointer = -EFAULT
 unshare mnt = -EPERM
 uid_map = 11
 setgroups = 4
@@ -35,6 +35,9 @@ file f = 0
 bind file onto dir = -ENOTDIR
 bind dir onto file = -ENOTDIR
 pivot_root onto a file = -ENOTDIR
+bind /bin = 0
+umount2 force a foreign file system = -EPERM
+umount2 the bind = 0
 umount2 expire = -EAGAIN
 umount2 expire detach = -EINVAL
 chdir tmp = 0
@@ -48,4 +51,4 @@ remount own sb read-only = 0
 write on read-only sb = -EROFS
 -- mountinfo errors
 0 - / /tmp ro,relatime - tmpfs sxe ro,uid=1000,gid=1000,inode64
-umount2 force = -EPERM
+umount2 force = 0

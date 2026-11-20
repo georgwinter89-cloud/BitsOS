@@ -96,7 +96,7 @@ pub(super) fn leaf_flags(e: u64, level: u32) -> u64 {
 
 /// MM-13: entry `i` (0..512) of the page table that maps what the 2 MiB leaf entry `pde` maps, 4 KiB at a time:
 /// the frame at offset i * 4 KiB with the same rights, memory type and accessed/dirty bits (Linux
-/// `__split_huge_pmd_locked`, linux-6.6/mm/huge_memory.c:2066, copies them into every pte).
+/// `__split_huge_pmd_locked`, linux-7.3.1/mm/huge_memory.c:3184, copies them into every pte).
 pub fn small_entry(pde: u64, i: usize) -> u64 {
     (leaf_phys(pde, 2) + i as u64 * 4096) | leaf_bits(leaf_flags(pde, 2), 1)
 }

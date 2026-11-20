@@ -8,7 +8,8 @@
 //! output is; the null output), `mixer` (`Core::step`, kernel-free), `hdaback` (the back end on `hda`),
 //! `usbback` (USB audio, SN-8b, and the kernel mixer's hda + USB pair), `thread` (`Mixer`, the thread,
 //! `mixer()`), `output` and `tool` (SN-10: `/sys/bitsos/snd_output` and the MCP tool `snd`), `boot` (SN-11: a stored `hdmi`
-//! switched on after a boot), `capture` and `capsrc` (SN-9: recording from a USB microphone or an hda input), `ktests`. Latency: plan/notes/sn-SN-3.md.
+//! switched on after a boot), `capture` and `capsrc` (SN-9: recording from a USB microphone or an hda input), `tone` (GP-SOUND: the tone check `snd ton`
+//! and the report page's sound line), `ktests`. Latency: plan/spec/sound.md §5.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -51,8 +52,11 @@ mod ktests_reboot;
 mod helper;
 pub mod output;
 mod tool;
+pub mod tone;
 #[cfg(test)]
 mod tests_out;
+#[cfg(test)]
+mod tests_tone;
 
 pub use backend::{Endpoint, OutError, Port, Target};
 pub use client::{Playback, SndError, State, UNITY};

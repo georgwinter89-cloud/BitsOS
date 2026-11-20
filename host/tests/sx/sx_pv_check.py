@@ -4,10 +4,12 @@ steam-runtime-system-info's report with the CachyOS reference run (<host dir>, u
 
 Checked on V2: `run -- true` and `run -- steam-runtime-system-info` end with 0 and pressure-vessel printed no
 error line (" E: "); the report is JSON; the container is pressure-vessel with the host at /run/host; the runtime
-is the sniper tree and ok; x86_64 can run and its libraries are ok; Vulkan's lavapipe and Mesa's EGL vendor come
-from the provider and are ok; the Vulkan check lists llvmpipe; --copy-runtime hard-linked files into var/.
+is the sniper tree and ok; x86_64 can run and its libraries are ok; Vulkan's RADV and Mesa's EGL vendor come from
+the provider and are ok; the Vulkan check lists no software device (the provider has none since DECISIONS 18.11.,
+and QEMU has no GPU node: RADV's device on the chip is the Mini-PC's check, plan/guides/minipc-steam.md step C);
+--copy-runtime hard-linked files into var/.
 With the reference: every section equal after leaving out what differs by design (KNOWN below, each with its
-reason; plan/notes/sx-SX-3c.md explains every red line of the report).
+reason; plan/spec/sandbox.md §5 explains every red line of the report).
 
 A command that fails inside (`run -- sh -c 'exit 7'`) must hand back its exit code 7. SX_REQUIRE_HOST_REF=1 makes a
 missing reference a failure; the last line says whether the report was compared.
@@ -83,13 +85,14 @@ def main():
     check(x.get("can-run") is True and x.get("libraries-ok") is True,
           f"x86_64: can-run={x.get('can-run')} libraries-ok={x.get('libraries-ok')}")
     icds = rep.get("vulkan", {}).get("icds", [])
-    check(any(i.get("ok") and i.get("library_path", "").endswith("/libvulkan_lvp.so") for i in icds),
-          "Vulkan: lavapipe's ICD from the provider, ok")
+    check(any(i.get("ok") and i.get("library_path", "").endswith("/libvulkan_radeon.so") for i in icds),
+          "Vulkan: RADV's ICD from the provider, ok")
+    check(not any("lvp" in i.get("library_path", "") for i in icds), "Vulkan: no lavapipe ICD in the provider")
     egl = rep.get("egl", {}).get("icds", [])
     check(any(i.get("ok") and i.get("library_path") == "libEGL_mesa.so.0" for i in egl), "EGL: Mesa's vendor file, ok")
     vk = x.get("graphics-details", {}).get("x11/vulkan", {})
     names = [d.get("name", "") for d in vk.get("devices", [])]
-    check(any(n.startswith("llvmpipe") for n in names), f"the Vulkan check finds llvmpipe ({names})")
+    check(not any(n.startswith("llvmpipe") for n in names), f"the Vulkan check finds no software device ({names})")
     rc = read(V2, "exit7.rc").strip()
     check(rc == "7", f"run -- sh -c 'exit 7': exit {rc or '?'} (want 7, the command's own code)")
     virt = rep.get("virtualization", {})

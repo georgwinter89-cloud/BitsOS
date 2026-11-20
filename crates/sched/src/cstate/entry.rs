@@ -1,5 +1,5 @@
 //! Entering a planned state (Linux `acpi_idle_enter` / `acpi_idle_enter_bm` / `io_idle`,
-//! linux-6.6/drivers/acpi/processor_idle.c l.501-525, l.527-575, l.616-705). Generic over the machine so the
+//! linux-7.3.1/drivers/acpi/processor_idle.c l.521-552, l.560-598, l.616-704). Generic over the machine so the
 //! host tests and the ktests run the very same steps against a recording fake; the idle loop uses the real
 //! ports.
 
@@ -20,6 +20,8 @@ pub trait IdleHw {
     fn read32(&self, port: u16);
     /// `sti; hlt` (C1).
     fn halt(&self);
+    /// GP-CPU2: MWAIT with `hint` and the interrupt break, interrupts staying off (`hal::cpu::mwait::idle`).
+    fn mwait(&self, hint: u8);
     fn sti(&self);
 }
 
@@ -53,7 +55,9 @@ pub fn enter<H: IdleHw>(hw: &H, plan: &Plan, pick: Option<usize>) -> Entered {
             }
         }
     }
-    if !hw.read8(plan.deep[at].port) {
+    if let Some(hint) = plan.deep[at].mwait {
+        hw.mwait(hint);
+    } else if !hw.read8(plan.deep[at].port) {
         hw.halt();
         return Entered::Refused(at);
     }

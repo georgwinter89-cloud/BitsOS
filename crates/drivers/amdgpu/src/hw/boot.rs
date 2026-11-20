@@ -1,14 +1,16 @@
-//! GX-8c: the chip comes up by itself at boot. CONFIG `gpu=on` (WY-21: the default; `gpu=off` keeps the chip down; not a
-//! guarded key) runs what
-//! `gx_bringup {"until":"backend"}` runs (`psplive::LiveBoot`), in a thread of its own, beside init. The desktop's start
-//! (`console_cmds::desktop`, the only one who starts bitscomp) waits for its end until `BOUND_NS` after the start
-//! (`console::bootscreen::hold_desktop`). MCP and the console's shell never wait.
+//! GX-8c: the chip comes up by itself at every boot (Georg 18.11.: no key keeps it down). The kernel runs what
+//! `gx_bringup {"until":"backend"}` runs (`psplive::LiveBoot`, VCN included), in a thread of its own, beside init. The
+//! desktop's start (`console_cmds::desktop`, the only one who starts bitscomp) waits for its end until `BOUND_NS` after
+//! the start (`console::bootscreen::hold_desktop`). MCP and the console's shell never wait.
 //!
-//! - Every failure after a write ends with what `until=stop` does (a refusal before the first write stops nothing); no node appears, the reason is in the log and in
-//!   `gx_bringup {"until":"boot"}`, and the desktop starts as without the GPU. The machine always reaches a desktop and MCP.
+//! - Every failure after a write ends with what `until=stop` does (a refusal before the first write stops nothing); no
+//!   node appears, the reason is in the log and in `gx_bringup {"until":"boot"}`, and there is no desktop: the boot
+//!   says so in one line on the text console (`console::bootscreen::desktop_no_gpu`). MCP always answers.
 //! - The chain's own waits are bounded (polls, the jobs' 70 s), but their sum may pass the bound when a chip misbehaves.
-//!   The desktop then goes on, and the thread ends its chain behind it. No stage starts and no node appears past the
-//!   bound: a node that comes while the desktop runs without it would help nothing, the bound is one number for both.
+//!   The desktop's start then gives up on the GPU (the same one line), and the thread ends its chain behind it. No
+//!   stage starts and no node appears past the bound: the bound is the hang guard of the boot.
+//! - A machine without a function the 780M's driver drives tells the desktop's start the same (no desktop without a
+//!   GPU: there is no software drawing).
 //! - Stopping needs no `again`: a boot is a new kernel, its statics count no earlier run, and `classify` reads what the
 //!   Quiesce hook left before the Reload. `until=stop` and `until=backend` work on a chip that came up here as on one
 //!   the tool brought up: the same `LIVE`, `NODE` and `TOOL`.
@@ -27,10 +29,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use ksync::Mutex;
 
-/// From the thread's start to the last moment for a node and for the desktop's wait.
+/// From the thread's start to the last moment for a node and for the desktop's wait (the hang guard).
 pub const BOUND_NS: u64 = 30_000_000_000;
-/// How often the thread looks for the stick.
-pub const STICK_POLL_NS: u64 = 100_000_000;
+/// How often the thread looks for the stick. GS-1: the desktop waits for this thread, so a look every 100 ms cost up to
+/// 100 ms of the start for nothing; a path lookup every 10 ms for the few seconds of the mount costs nothing.
+pub const STICK_POLL_NS: u64 = 10_000_000;
 /// Where the stick's files lie.
 pub const STICK_DIR: &str = "/boot/BITSOS2";
 /// The reason's longest form in the log (the whole text stays in `answer`).
@@ -178,117 +181,150 @@ pub fn run(c: &dyn Chip, deadline: u64) -> Report {
 }
 
 enum State {
-    /// CONFIG `gpu` is not on.
-    Off,
+    /// `start` has not looked at this slot yet.
+    NotYet,
     /// No AMD GPU function on this machine.
     NoChip,
     Running,
     Done(Report),
 }
 
-static STATE: Mutex<State> = Mutex::named("amdgpu.hw.boot", State::Off);
-
-/// GX-9a: CONFIG `gx_mode2=on`, read once at boot, opens the mode-2 rung (`mode2_open`).
-static MODE2: AtomicBool = AtomicBool::new(false);
-
-/// What the desk's measurement names when the rung is open (GX-D9: mode 2 is unmeasured until then).
-pub const MODE2_PROOF: &str = "CONFIG gx_mode2=on: the desk's measurement of what mode 2 does to DCN";
-
-/// The rung is open. The chain asks again at the message itself: this is a second lock next to `Policy`'s.
-pub fn mode2_open() -> bool {
-    MODE2.load(Ordering::Acquire)
+/// GP-GPU1 (plan/spec/gpu-rdna4.md piece 3): how one device's bring-up at boot went (the statics of before). A device has one
+/// (`devs::Device::boot`); the registry has one for the machine itself, which says "no AMD GPU function" where there
+/// is no device to ask, and takes the scenario's stand-in.
+pub struct BootSlot {
+    state: Mutex<State>,
+    lost: AtomicBool,
 }
 
-/// `gx_mode2=on` opens it, anything else leaves it closed.
-pub(crate) fn read_mode2(get: &dyn Fn(&str) -> Option<String>) -> bool {
-    match get("gx_mode2").as_deref().map(str::trim) {
-        None | Some("") | Some("off") => false,
-        Some("on") => {
-            klog::event!(Warn, "gx", "boot.mode2_open"; "CONFIG gx_mode2=on: an unrecoverable hang may send GfxDeviceDriverReset(2); what it does to DCN is what the desk measures");
-            true
-        }
-        Some(other) => {
-            klog::event!(Warn, "gx", "boot.config_unknown", value = other; "gx_mode2= takes on or off: off");
-            false
-        }
+impl BootSlot {
+    pub const fn new() -> BootSlot {
+        BootSlot { state: Mutex::named("amdgpu.hw.boot", State::NotYet), lost: AtomicBool::new(false) }
     }
 }
 
-/// The kernel's call before init starts: CONFIG `gpu=on`, or no `gpu=` (WY-21), starts the thread; `gpu=off` costs nothing,
-/// and so does a machine without the chip.
+impl Default for BootSlot {
+    fn default() -> BootSlot {
+        BootSlot::new()
+    }
+}
+
+/// The kernel's call before init starts: every device the 780M's driver drives gets its thread; a machine without one
+/// costs nothing and tells the desktop's start that there is no GPU. `get` is CONFIG, for the test-only stand-in.
 pub fn start(get: &dyn Fn(&str) -> Option<String>) {
-    MODE2.store(read_mode2(get), Ordering::Release);
-    match get("gpu").as_deref().map(str::trim) {
-        Some("off") => return,
-        None | Some("") | Some("on") => {}
-        Some(other) => {
-            klog::event!(Warn, "gx", "boot.config_unknown", value = other; "gpu= takes on or off: off");
-            return;
-        }
-    }
+    let reg = crate::devs::registry();
     // The scenario's stand-in (a machine with a chip has none to spare, and no test may play it there).
     if let Some(s) = get("gpu_boot_fake").as_deref().and_then(Script::parse) {
         if hal::cpu::detect().hypervisor {
-            spawn(ScriptChip { script: s, gate: ToolGate::new() }, BOUND_NS);
+            spawn(&reg.machine, ScriptChip { script: s, gate: ToolGate::new() }, BOUND_NS);
             return;
         }
         klog::event!(Warn, "gx", "boot.fake_refused"; "gpu_boot_fake only under a hypervisor");
     }
-    match crate::psplive::live_boot() {
-        Some(chip) => spawn(chip, BOUND_NS),
-        None => {
-            *STATE.lock() = State::NoChip;
-            klog::event!(Info, "gx", "boot.no_chip"; "gpu=on, and this machine has no AMD GPU function");
+    // Every device the 780M's driver drives comes up by itself; a card attached read-only has no bring-up (GP-GPU1).
+    let mut any = false;
+    for dev in reg.all() {
+        match crate::psplive::live_boot(dev) {
+            Some(chip) => {
+                any = true;
+                spawn(&dev.boot, chip, BOUND_NS);
+            }
+            // A function the 780M's driver looked at and refused answers as a machine without the chip always did.
+            None => *dev.boot.state.lock() = State::NoChip,
         }
+    }
+    if !any {
+        *reg.machine.state.lock() = State::NoChip;
+        match reg.all().iter().filter(|d| d.family == crate::devs::Family::Rdna4).count() {
+            0 => klog::event!(Info, "gx", "boot.no_chip"; "this machine has no AMD GPU function: no desktop, the text console stays"),
+            cards => klog::event!(Info, "gx", "boot.read_only", cards = cards; "the cards here are attached read-only (GP-GPU1), nothing is brought up: the text console stays"),
+        }
+        console::bootscreen::desktop_no_gpu(String::from(NO_CHIP_LINE));
     }
 }
 
 /// The desktop is held from here, whatever happens to the thread: the hold ends at the deadline by itself.
-pub(crate) fn spawn<C: Chip + Send + 'static>(chip: C, bound_ns: u64) {
+pub(crate) fn spawn<C: Chip + Send + 'static>(slot: &'static BootSlot, chip: C, bound_ns: u64) {
     let deadline = chip.now_ns().saturating_add(bound_ns);
-    *STATE.lock() = State::Running;
+    *slot.state.lock() = State::Running;
     console::bootscreen::hold_desktop(deadline);
-    klog::event!(Info, "gx", "boot.start", bound_s = bound_ns / 1_000_000_000);
+    // GS-1: `at_ms` is the monotonic clock (CLOCK_MONOTONIC in user space): the desk's start table lines up on it.
+    klog::event!(Info, "gx", "boot.start", bound_s = bound_ns / 1_000_000_000, at_ms = time::now_ns() / 1_000_000);
     let started = sched::spawn("gpu-boot", sched::Class::Normal, move || {
         let r = run(&chip, deadline);
-        finish(r);
+        finish(slot, r);
     });
     if let Err(e) = started {
-        finish(Report { outcome: Outcome::Failed { fail: Fail::Refused, why: format!("no thread: {e:?}"), stop: StopEnd::NotNeeded }, lines: Vec::new(), took_ns: 0 });
+        finish(slot, Report { outcome: Outcome::Failed { fail: Fail::Refused, why: format!("no thread: {e:?}"), stop: StopEnd::NotNeeded }, lines: Vec::new(), took_ns: 0 });
     }
 }
 
-/// The log's event, the answer kept, the desktop let go (in this order: what the desktop may look at is written).
-fn finish(r: Report) {
+/// The text console's one line on a machine without a GPU the driver brings up.
+pub const NO_CHIP_LINE: &str = "Dieser Rechner hat keine Grafik, die BitsOS hochfährt: keine Arbeitsfläche, Textkonsole.";
+
+/// The text console's one line after a failed bring-up (`stage`: `Fail::word`).
+pub fn failed_line(stage: &str) -> String {
+    format!("Die Grafik ist nicht hochgekommen ({stage}): keine Arbeitsfläche, Textkonsole.")
+}
+
+/// The log's event, the answer kept, the desktop told (in this order: what the desktop may look at is written).
+fn finish(slot: &BootSlot, r: Report) {
     let ms = r.took_ns / 1_000_000;
-    match &r.outcome {
-        Outcome::Up(m) => klog::event!(Info, "gx", "boot.up", minor = *m, after_ms = ms),
-        Outcome::Failed { fail, why, stop } => klog::event!(Error, "gx", "boot.failed", stage = fail.word(), stop = stop.word(), after_ms = ms, why = why.as_str();
-            "the desktop starts without the GPU"),
+    let at_ms = time::now_ns() / 1_000_000;
+    let line = match &r.outcome {
+        Outcome::Up(m) => {
+            klog::event!(Info, "gx", "boot.up", minor = *m, after_ms = ms, at_ms = at_ms);
+            None
+        }
+        Outcome::Failed { fail, why, stop } => {
+            klog::event!(Error, "gx", "boot.failed", stage = fail.word(), stop = stop.word(), after_ms = ms, at_ms = at_ms, why = why.as_str();
+                "no desktop: the text console stays");
+            Some(failed_line(fail.word()))
+        }
+    };
+    *slot.state.lock() = State::Done(r);
+    match line {
+        None => console::bootscreen::desktop_gpu_up(),
+        Some(l) => console::bootscreen::desktop_no_gpu(l),
     }
-    *STATE.lock() = State::Done(r);
-    console::bootscreen::release_desktop();
 }
 
-/// GX-9a: a hang ended the device for this boot, after the desktop came up on it. The node stays and answers ENODEV: what the
-/// GPU's users do with that is the fallback GX-8c gives them at boot, and this is what the tool says from now on.
-pub fn note_device_lost() {
-    DEVICE_LOST.store(true, Ordering::Release);
+impl BootSlot {
+    /// GX-9a: a hang ended the device for this boot, after the desktop came up on it. The node stays and answers ENODEV
+    /// (the GPU's users see a lost device, as on Linux), and this is what the tool says from now on.
+    pub fn note_device_lost(&self) {
+        self.lost.store(true, Ordering::Release);
+    }
+
+    /// `gx_bringup {"until":"boot"}`: how the boot's bring-up went, with all its lines. Changes nothing.
+    pub fn answer(&self) -> String {
+        const NOTHING: &str = "gx_bringup: REFUSED (no PSP or SMU register written)\n";
+        match &*self.state.lock() {
+            State::NotYet => format!("{NOTHING}boot: not started yet\n"),
+            State::NoChip => format!("{NOTHING}boot: no AMD GPU function on this machine\n"),
+            State::Running => format!("{NOTHING}boot: still running\n"),
+            State::Done(r) => {
+                let mut s = render(r);
+                if self.lost.load(Ordering::Acquire) {
+                    s += "boot: a hang ended the device afterwards: submissions answer ENODEV until until=stop and until=backend, or the next boot\n";
+                }
+                s
+            }
+        }
+    }
 }
 
-static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
-
-/// `gx_bringup {"until":"boot"}`: how the boot's bring-up went, with all its lines. Changes nothing.
+/// The answer for a tool call without a device of its own: the 780M's bring-up, else the machine's slot (no device,
+/// or the scenario's stand-in).
 pub fn answer() -> String {
-    const NOTHING: &str = "gx_bringup: REFUSED (no PSP or SMU register written)\n";
-    match &*STATE.lock() {
-        State::Off => format!("{NOTHING}boot: CONFIG gpu=off\n"),
-        State::NoChip => format!("{NOTHING}boot: no AMD GPU function on this machine\n"),
-        State::Running => format!("{NOTHING}boot: still running\n"),
-        State::Done(r) => {
-            let mut s = render(r);
-            if DEVICE_LOST.load(Ordering::Acquire) {
-                s += "boot: a hang ended the device afterwards: submissions answer ENODEV until until=stop and until=backend, or the next boot\n";
+    let reg = crate::devs::registry();
+    match reg.first(crate::devs::Family::Phoenix) {
+        Some(d) => d.boot.answer(),
+        None => {
+            let mut s = reg.machine.answer();
+            let cards = reg.all().iter().filter(|d| d.family == crate::devs::Family::Rdna4).count();
+            if cards > 0 {
+                s += &format!("boot: {cards} RX 9070 XT attached read-only (GP-GPU1): they have no bring-up yet; gpu {{\"device\":\"list\"}} names them\n");
             }
             s
         }
@@ -309,7 +345,8 @@ pub fn render(r: &Report) -> String {
     s
 }
 
-/// `gpu_boot_fake=`: what the scenario host/tests/gx/10-boot.sh has the boot's bring-up do under QEMU, which has no chip.
+/// `gpu_boot_fake=` (test only, refused outside a hypervisor): what the scenario host/tests/gx/10-boot.sh has the
+/// boot's bring-up do under QEMU, which has no chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Script {
     /// Passes, on the fake's node (`drm=fake`).
@@ -351,7 +388,11 @@ impl Chip for ScriptChip {
     }
     fn backend(&self, node_by: u64, lines: &mut Vec<String>) -> Result<u32, Fail> {
         match self.script {
-            Script::Up => drm::device::devices().first().map(|d| d.render_minor()).ok_or(Fail::Node),
+            Script::Up => {
+                // GS-1: the chip's mark between its engines and its proof, so a scenario sees the whole chain of marks.
+                klog::event!(Info, "gx", "boot.engines_up", wrote = true, at_ms = time::now_ns() / 1_000_000);
+                drm::device::devices().first().map(|d| d.render_minor()).ok_or(Fail::Node)
+            }
             Script::Fail => {
                 lines.push(String::from("script: stage FAIL"));
                 Err(Fail::Stage(Until::Sdma))

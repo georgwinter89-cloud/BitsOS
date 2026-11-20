@@ -3,7 +3,7 @@
 //! depend on klog, while the mirror lives in klogd (which depends on mcp).
 //!
 //! The order (Linux `kernel_restart_prepare` -> `device_shutdown`: the netconsole stops and the network cards
-//! shut down before the reset; linux-6.6/kernel/reboot.c, drivers/base/core.c `device_shutdown`):
+//! shut down before the reset; linux-7.3.1/kernel/reboot.c:110, drivers/base/core.c:4875 `device_shutdown`):
 //! 1. [`Step::MirrorPaused`]: the mirror stops sending through the network stack and its thread (no datagram of
 //!    it half-way through smoltcp or the card's NAPI path when the CPUs are parked); from now on what is logged
 //!    goes out on the raw path (`NetDevice::poll_tx`) at each [`checkpoint`], and the card is asked
@@ -15,7 +15,7 @@
 //! 5. [`Step::Reset`]: the platform reset.
 //!
 //! Each step is a `shutdown step` event (a Warn when it comes out of order) and a counter. RAM does not survive
-//! the Mini-PC's reset (rb-RB-13), so the next start cannot read them: the mirror's listener (which gets every
+//! the Mini-PC's reset (plan/spec/robustness.md §1), so the next start cannot read them: the mirror's listener (which gets every
 //! line up to step 4 before the end datagram) and the console are where "how far it came" is read.
 
 use alloc::sync::Arc;

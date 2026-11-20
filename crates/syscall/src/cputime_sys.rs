@@ -1,14 +1,14 @@
 //! SC-6 syscall glue (granted): CPU time for programs.
-//! - `times` (linux-6.6/kernel/sys.c:1023): the process's user/system time and its reaped children's, in
+//! - `times` (linux-7.3.1/kernel/sys.c:1064): the process's user/system time and its reaped children's, in
 //!   clock ticks (`USER_HZ` 100); the answer is the ticks since boot (Linux adds `INITIAL_JIFFIES`, an
 //!   arbitrary start; programs only take differences);
-//! - `getrusage` (kernel/sys.c:1858, `getrusage` :1781): RUSAGE_SELF / CHILDREN / THREAD, times as timevals,
+//! - `getrusage` (kernel/sys.c:1934, `getrusage` :1846): RUSAGE_SELF / CHILDREN / THREAD, times as timevals,
 //!   voluntary/involuntary switches, ru_maxrss the peak resident set (AB-7c: MM's high-water mark and the
 //!   group's earlier images; for CHILDREN the largest peak of the collected children, Linux `cmaxrss`);
 //!   page-fault and block-I/O counts are 0 until MM/FS count them;
 //! - the CPU clocks of `clock_gettime`/`clock_getres`/`clock_nanosleep` (kernel/time/posix-cpu-timers.c:
 //!   `pid_for_clock` :57, `posix_cpu_clock_getres` :160, `posix_cpu_clock_get` :358, `posix_cpu_nsleep`
-//!   :1592): PROF = user + system, VIRT = user, SCHED = all run time (the same as PROF in V2, where nothing is
+//!   :1637): PROF = user + system, VIRT = user, SCHED = all run time (the same as PROF in V2, where nothing is
 //!   sampled); a thread clock only of the caller's own thread group; resolution 1 ns for SCHED clocks and
 //!   1 ms (Linux at CachyOS's HZ=1000) for PROF/VIRT;
 //! - wait4's rusage of the collected child.
@@ -63,7 +63,7 @@ fn sample(t: CpuTimes, which: u8) -> u64 {
     }
 }
 
-/// What a CPU clock names (`pid_for_clock`, linux-6.6/kernel/time/posix-cpu-timers.c:57).
+/// What a CPU clock names (`pid_for_clock`, linux-7.3.1/kernel/time/posix-cpu-timers.c:57).
 enum Target {
     Thread(alloc::sync::Arc<proc::Thread>),
     Process(alloc::sync::Arc<Process>),

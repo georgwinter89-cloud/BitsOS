@@ -59,8 +59,8 @@ fn mailbox_sequence_and_formats() {
     assert_eq!(fake.writes[..4], [(a.c2pmsg_69, ring as u32), (a.c2pmsg_70, (ring >> 32) as u32), (a.c2pmsg_71, 0x1000), (a.c2pmsg_64, 0x2_0000)]);
     // Then only write pointers, one frame (16 dwords) further each time, wrapping at the ring's 1024 dwords.
     let wptrs: Vec<u32> = fake.writes[4..].iter().map(|&(b, v)| { assert_eq!(b, a.c2pmsg_67); v }).collect();
-    // LOAD_TOC, SETUP_TMR, 17 images (GX-7d: no VCN; GX-7k: MES's KIQ pipe too), AUTOLOAD_RLC.
-    assert_eq!(wptrs.len(), 20);
+    // LOAD_TOC, SETUP_TMR, 18 images (GX-7k: MES's KIQ pipe too; GX-8v: VCN's), AUTOLOAD_RLC.
+    assert_eq!(wptrs.len(), 21);
     assert!(wptrs.iter().enumerate().all(|(i, &w)| w == (i as u32 + 1) * 16 % 1024));
     assert_eq!(r.report.steps[0], psp::Step::SosAlive(pspfake::SOS_SIGN));
     assert_eq!(r.report.stale_ring_size, 0);

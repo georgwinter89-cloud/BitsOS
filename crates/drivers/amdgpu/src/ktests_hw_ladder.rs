@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use amdgpu_fmt::errno;
-use amdgpu_fmt::recover::{MODE2_UNMEASURED, REINIT_LOOP};
+use amdgpu_fmt::recover::REINIT_LOOP;
 use amdgpu_fmt::told::{ContextState, Counters, query2};
 use core::sync::atomic::Ordering;
 use drm::fence;
@@ -335,30 +335,9 @@ pub(crate) fn gc_limit() -> ktest::TestResult {
 }
 ktest::ktest!("gx.hw.ladder_gc_limit", Safe, gc_limit);
 
-/// Mode 2 closed, the default: nothing is sent, a hang past the re-init ends the device, and the tool says why.
-pub(crate) fn mode2_closed() -> ktest::TestResult {
+/// The last rung: the suspend, the one message, the re-init, all rings tested. One SMU message, never mode 1.
+pub(crate) fn mode2() -> ktest::TestResult {
     let r = rig(cfg_from(Rung::Mode2))?;
-    let g = &r.gpu;
-    let (m, cx) = (Mem::new(g)?, Cx::new(g));
-    let j = jobs(&r)?;
-    let e = hang(&r, &m, &cx, RingType::Gfx)?;
-    kassert_end(g, &e, RingType::Gfx)?;
-    settle(&r, &j, Rung::None)?;
-    let k = &r.reset.knobs;
-    kassert!(k.suspends.load(Ordering::Acquire) == 0 && k.mode2s.load(Ordering::Acquire) == 0 && k.reinits.load(Ordering::Acquire) == 0, "a rung ran");
-    kassert!(r.fake(|f| f.gc.resets) == 0, "the message went");
-    let text = j.describe().join("\n");
-    kassert!(text.contains(MODE2_UNMEASURED) && text.contains("LOST"), "{text}");
-    drop(j);
-    drop(g.stop_jobs());
-    drop(m);
-    r.finish()
-}
-ktest::ktest!("gx.hw.ladder_mode2_closed", Safe, mode2_closed);
-
-/// `gx_mode2=on`: the suspend, the one message, the re-init, all rings tested. One SMU message, never mode 1.
-pub(crate) fn mode2_open() -> ktest::TestResult {
-    let r = rig(JobCfg { mode2: Some("a test"), ..cfg_from(Rung::Mode2) })?;
     r.fake(|f| f.smu.mode2_answers = true);
     let g = &r.gpu;
     let (m, cx) = (Mem::new(g)?, Cx::new(g));
@@ -377,11 +356,11 @@ pub(crate) fn mode2_open() -> ktest::TestResult {
     drop(m);
     r.finish()
 }
-ktest::ktest!("gx.hw.ladder_mode2_open", Safe, mode2_open);
+ktest::ktest!("gx.hw.ladder_mode2", Safe, mode2);
 
 /// A PMFW that does not answer the message, as 13.0.4 on 28.10.: the rung fails, the device is lost, the jobs ended.
 pub(crate) fn mode2_no_answer() -> ktest::TestResult {
-    let r = rig(JobCfg { mode2: Some("a test"), ..cfg_from(Rung::Mode2) })?;
+    let r = rig(cfg_from(Rung::Mode2))?;
     let g = &r.gpu;
     let (m, cx) = (Mem::new(g)?, Cx::new(g));
     let j = jobs(&r)?;
@@ -396,10 +375,10 @@ pub(crate) fn mode2_no_answer() -> ktest::TestResult {
 }
 ktest::ktest!("gx.hw.ladder_mode2_no_answer", Safe, mode2_no_answer);
 
-/// `gx_mode2=on`: the re-init's stop could not halt an engine and its chain is gone: the suspend that finds no chain must
-/// not take that for a proof, and the one SMU message is never sent.
+/// The re-init's stop could not halt an engine and its chain is gone: the suspend that finds no chain must not take that
+/// for a proof, and the one SMU message is never sent.
 pub(crate) fn mode2_unproven() -> ktest::TestResult {
-    let r = rig(JobCfg { mode2: Some("a test"), ..cfg_from(Rung::Gc) })?;
+    let r = rig(cfg_from(Rung::Gc))?;
     r.fake(|f| f.smu.mode2_answers = true);
     let k = &r.reset.knobs;
     k.halt_fails.store(true, Ordering::Release);
@@ -548,16 +527,6 @@ fn expires() -> ktest::TestResult {
 }
 #[cfg(not(test))]
 ktest::ktest!("gx.hw.ladder_expire", Safe, expires);
-
-/// CONFIG `gx_mode2`: on opens it, every other word leaves it closed.
-pub(crate) fn config() -> ktest::TestResult {
-    use crate::hw::boot::read_mode2;
-    let of = |v: Option<&'static str>| read_mode2(&move |k| (k == "gx_mode2").then(|| v.map(String::from)).flatten());
-    kassert!(of(Some("on")) && of(Some(" on ")), "on");
-    kassert!(!of(None) && !of(Some("")) && !of(Some("off")) && !of(Some("1")) && !of(Some("ON")), "only on opens it");
-    Ok(())
-}
-ktest::ktest!("gx.hw.ladder_config", Safe, config);
 
 /// The tool's word, and what it leaves the chip with: nothing.
 pub(crate) fn tool_word() -> ktest::TestResult {

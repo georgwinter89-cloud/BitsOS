@@ -136,10 +136,7 @@ mod tests {
 
     #[test]
     fn round_trip_through_system_cpio() {
-        if !crate::util::have_tool("cpio") {
-            eprintln!("cpio not installed, skipped");
-            return;
-        }
+        crate::util::need_tools("round_trip_through_system_cpio", &[("cpio", "cpio")]);
         let base = std::env::temp_dir().join(format!("xt-cpio-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();

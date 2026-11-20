@@ -1,0 +1,12 @@
+[package]
+name = "bitsver"
+version = "0.1.0"
+edition = "2024"
+description = "UPDATE: the one version number of a BitsOS build (BITSOS_VERSION at build time), its mark in the kernel image and its texts"
+build = "build.rs"
+
+[lib]
+test = true
+
+[lints]
+workspace = true

@@ -5,9 +5,9 @@
 //! (with Linux's block as the candidate if one module's Linux block serves the version) - never a guess from a
 //! neighbouring version. Nothing here is keyed to a PCI ID: the 780M is "these versions", an RX 9070 is others.
 //!
-//! The roles key on the IPs Linux's `amdgpu_discovery_set_ip_blocks` keys on (linux-6.6 amdgpu_discovery.c:1600-2135):
-//! GFX, MES, GMC and GFXHUB on GC; SDMA on SDMA0; PSP on MP0; SMU on MP1; display on DMU; VCN on UVD/VCN; IH on
-//! OSSSYS; MMHUB on MMHUB; NBIO on NBIF.
+//! The roles key on the IPs Linux's `amdgpu_discovery_set_ip_blocks` keys on (linux-7.3.1
+//! amdgpu_discovery.c:3085-3734): GFX, MES, GMC and GFXHUB on GC; SDMA on SDMA0; PSP on MP0; SMU on MP1; display on
+//! DMU; VCN on UVD/VCN; IH on OSSSYS; MMHUB on MMHUB; NBIO on NBIF.
 
 use crate::gpucore::disc::Discovery;
 use crate::gpucore::fw::{self, Need};
@@ -21,11 +21,14 @@ pub mod gfx11;
 pub mod gmc11;
 pub mod ih6;
 pub mod mes11;
+pub mod mes12;
 pub mod mesapi;
 pub mod mesmqd;
 pub mod nbio7;
 pub mod psp13;
+pub mod rdna4;
 pub mod sdma6;
+pub mod sdma7;
 pub mod smu13;
 pub mod vcn4;
 
@@ -122,6 +125,9 @@ pub struct Module {
 #[derive(Clone, Copy, Debug)]
 pub enum Firmware {
     Files { prefix: &'static str, needs: &'static [Need] },
+    /// Whole file names (below `fw::DIR`, without `.bin`) with the suffix the loader keys on, for a file Linux does
+    /// not name after the table's version (DMU 4.1.0 runs as DCN 4.0.1, amdgpu_discovery.c:2688).
+    Named(&'static [(&'static str, &'static str)]),
     None(&'static str),
 }
 
@@ -143,6 +149,19 @@ pub static MODULES: &[&Module] = &[
     &sdma6::MODULE,
     &dcn31::MODULE,
     &vcn4::MODULE,
+    // GP-GPU1: the RX 9070 XT's versions, none driven yet (each says which item brings its code).
+    &rdna4::PSP,
+    &rdna4::SMU,
+    &rdna4::NBIF,
+    &rdna4::GMC,
+    &rdna4::GFXHUB,
+    &rdna4::MMHUB,
+    &rdna4::IH,
+    &rdna4::GFX,
+    &mes12::MODULE,
+    &sdma7::MODULE,
+    &rdna4::DISPLAY,
+    &rdna4::VCN,
 ];
 
 /// What `plan` decided for one role.
@@ -214,6 +233,21 @@ impl Plan {
         self.choices.iter().filter(|c| matches!(c, Choice::Missing { .. }))
     }
 
+    /// GP-GPU1: the chosen modules whose code is still to come, with the item that brings it: what a card cannot do
+    /// yet, said by name (`(role, module, item)`).
+    pub fn planned(&self) -> Vec<(Role, &'static Module, &'static str)> {
+        self.choices
+            .iter()
+            .filter_map(|c| match *c {
+                Choice::Chosen { role, module, .. } => match module.state {
+                    State::Planned(item) => Some((role, module, item)),
+                    State::Present(_) => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn chosen(&self, role: Role) -> Option<&'static Module> {
         self.choices.iter().find_map(|c| match *c {
             Choice::Chosen { role: r, module, .. } if r == role => Some(module),
@@ -227,11 +261,17 @@ impl Plan {
         let mut out: Vec<FileNeed> = Vec::new();
         for c in &self.choices {
             let Choice::Chosen { role, version, module } = *c else { continue };
-            let Firmware::Files { prefix, needs } = module.firmware else { continue };
+            let needs: Vec<FileNeed> = match module.firmware {
+                Firmware::Files { prefix, needs } => needs
+                    .iter()
+                    .map(|n| FileNeed { role, suffix: n.suffix, name: fw::file(prefix, version, n.suffix), fallback: n.fallback.map(|f| fw::file(prefix, version, f)) })
+                    .collect(),
+                Firmware::Named(files) => files.iter().map(|&(name, suffix)| FileNeed { role, suffix, name: fw::named(name), fallback: None }).collect(),
+                Firmware::None(_) => continue,
+            };
             for n in needs {
-                let name = fw::file(prefix, version, n.suffix);
-                if !out.iter().any(|f| f.name == name) {
-                    out.push(FileNeed { role, suffix: n.suffix, name, fallback: n.fallback.map(|f| fw::file(prefix, version, f)) });
+                if !out.iter().any(|f| f.name == n.name) {
+                    out.push(n);
                 }
             }
         }
@@ -242,18 +282,14 @@ impl Plan {
     /// file once (GFX and MES share the `gc` prefix).
     pub fn firmware(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for c in &self.choices {
-            let Choice::Chosen { version, module, .. } = *c else { continue };
-            let Firmware::Files { prefix, needs } = module.firmware else { continue };
-            for n in needs {
-                let mut s = fw::file(prefix, version, n.suffix);
-                if let Some(f) = n.fallback {
-                    s.push('|');
-                    s += &fw::file(prefix, version, f);
-                }
-                if !out.contains(&s) {
-                    out.push(s);
-                }
+        for f in self.files() {
+            let mut s = f.name;
+            if let Some(fb) = f.fallback {
+                s.push('|');
+                s += &fb;
+            }
+            if !out.contains(&s) {
+                out.push(s);
             }
         }
         out

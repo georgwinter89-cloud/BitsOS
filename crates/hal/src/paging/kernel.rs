@@ -268,7 +268,7 @@ pub fn adopt_leaves(from: u64, to: u64, lo: u64, hi: u64) -> Result<Vec<Unmapped
 /// table that reaches past the range is taken out only at the very end: until the shootdown another CPU may still hold its
 /// entry in a paging-structure cache, and a neighbour could already be mapping into the slot with a new table. Interrupts
 /// stay off from that moment to the shootdown, so this thread cannot be preempted in between; the window is then the
-/// shootdown itself, up to `tlb`'s give-up time with a stuck CPU (plan/notes/PC-PC-W31.md, open point 1).
+/// shootdown itself, up to `tlb`'s give-up time with a stuck CPU (open item in plan/notes/desk-offen.md, notes cleanup G1).
 pub fn unmap_kernel(virt: u64, len: u64, f: &mut dyn FnMut(Unmapped)) -> Result<UnmapStats, MapError> {
     let Some(root) = kernel_root().filter(|_| in_vmap(virt, len)) else {
         return Err(MapError::WrongRange);
@@ -316,6 +316,38 @@ pub fn unmap_kernel(virt: u64, len: u64, f: &mut dyn FnMut(Unmapped)) -> Result<
         }
     })?;
     Ok(st)
+}
+
+/// `unmap_kernel` for a range whose 4 KiB leaves all map RAM frames the caller owns (mm's scattered heap blocks):
+/// each frame goes to `free` once every CPU dropped it, after the one shootdown round that also frees the tables.
+/// Before, such a block cost two rounds (`unmap_kernel_pages`, then `unmap_kernel` of the emptied range; Mini-PC
+/// 12.11.2026: 15 interrupts per block on sixteen CPUs). The frames are chained through their first word in the
+/// direct map while the walk holds `TABLES`, so nothing is allocated; nobody else may touch them before `free`.
+/// A round a CPU did not confirm keeps them out of use (`tlb::stats().kept_pages`). Never for MMIO or other
+/// windows: their frames are no RAM of the caller's.
+pub fn unmap_kernel_frames(virt: u64, len: u64, free: &mut dyn FnMut(u64)) -> Result<UnmapStats, MapError> {
+    const END: u64 = u64::MAX;
+    let (mut head, mut n) = (END, 0u64);
+    let r = unmap_kernel(virt, len, &mut |u| {
+        if u.size == PageSize::Size4K {
+            // SAFETY: a RAM frame of the caller's (this fn's rule), mapped by the direct map; its old mapping is
+            // gone and nothing reads it before the chain is walked below.
+            unsafe { (crate::phys_to_virt(u.phys & ADDR_MASK) as *mut u64).write_volatile(head) };
+            head = u.phys & ADDR_MASK;
+            n += 1;
+        }
+    });
+    if r.is_err() {
+        super::tlb::count_kept(n, 0);
+        return r;
+    }
+    while head != END {
+        // SAFETY: written by the walk above; read before `free` hands the frame on.
+        let next = unsafe { (crate::phys_to_virt(head) as *const u64).read_volatile() };
+        free(head);
+        head = next;
+    }
+    r
 }
 
 /// Room for `want` more entries, or as many as the heap gives: what does not fit is lost one table at a time

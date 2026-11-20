@@ -1,11 +1,15 @@
-//! Robust futexes and the thread-exit protocol (linux-6.6/kernel/futex/core.c:636 `handle_futex_death`, :756
-//! `exit_robust_list`; kernel/fork.c:1616 `mm_release`).
+//! Robust futexes and the thread-exit protocol (linux-7.3.1/kernel/futex/core.c:980 `handle_futex_death`, :1151
+//! `exit_robust_list`; kernel/fork.c:1478 `mm_release`). The robust-unlock op flags that clear `list_op_pending`
+//! in the kernel (core.c:1438 `futex_robust_list_clear_pending`) are `super::wake_unlock` and the syscall layer;
+//! the vDSO's try-unlock and its fixup are `proc::vdso` and `proc::signal`.
 //!
 //! At thread exit the kernel walks the thread's robust list (registered with set_robust_list; a userspace list,
 //! so every read may fail and the walk then just stops) and, for every lock word whose owner TID is the dying
 //! thread, sets FUTEX_OWNER_DIED atomically (keeping FUTEX_WAITERS) and wakes one waiter (shared key, as Linux:
 //! glibc's robust mutexes use shared futex operations for that reason). `list_op_pending` (a lock being
-//! taken or released when the thread died) is handled last; an unowned pending word only wakes. The walk stops
+//! taken or released when the thread died) is handled last; a pending word the thread does not own wakes one
+//! waiter when it is unowned or has no FUTEX_WAITERS bit (7.3.1: a woken waiter that died before it set the bit
+//! must not strand the next one). The walk stops
 //! after ROBUST_LIST_LIMIT entries (Linux's bound against circular lists, an input bound, not a count limit).
 //! Bit 0 of a list pointer marks a PI futex: its word gets OWNER_DIED but no wake here: the owner's exit hands
 //! each PI futex it holds to its top waiter (`pi::owner_exits`, SC-7b), as Linux's `exit_pi_state_list`.
@@ -40,11 +44,10 @@ pub fn handle_death(sp: &dyn Space, uaddr: u64, tid: u32, pi: bool, pending: boo
     loop {
         let uval = sp.read_u32(uaddr).map_err(|_| ())?;
         let owner = uval & FUTEX_TID_MASK;
-        if pending && !pi && owner == 0 {
-            let _ = wake(sp, uaddr, true, 1, super::BITSET_MATCH_ANY);
-            return Ok(());
-        }
         if owner != tid {
+            if pending && !pi && (owner == 0 || uval & FUTEX_WAITERS == 0) {
+                let _ = wake(sp, uaddr, true, 1, super::BITSET_MATCH_ANY);
+            }
             return Ok(());
         }
         let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;

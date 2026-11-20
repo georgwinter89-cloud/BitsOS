@@ -1,0 +1,60 @@
+# PK-6c: 50 programs whose closure must equal pacman -Sp on a scratch copy of the build host's sync databases
+# (user/tools/bitspkg/tests/resolve.rs). CLI and GUI, Rust and C/C++, small and large; each one must exist in
+# the build host's cachyos-v3 cachyos-extra-v3 cachyos-core-v3 cachyos core extra (no multilib).
+# Rust
+ripgrep
+fd
+bat
+helix
+alacritty
+nushell
+zellij
+starship
+eza
+yazi
+wezterm
+# command line, C/C++ and others
+jq
+neovim
+htop
+btop
+tmux
+git
+curl
+ffmpeg
+imagemagick
+fish
+emacs
+# terminals and small GUI
+foot
+kitty
+zathura
+evince
+keepassxc
+# media
+mpv
+vlc
+audacity
+obs-studio
+kdenlive
+qbittorrent
+# graphics and office
+gimp
+inkscape
+krita
+darktable
+blender
+freecad
+libreoffice-fresh
+okular
+# KDE
+kate
+dolphin
+konsole
+# browsers, mail, editors, games
+brave-bin
+firefox
+chromium
+thunderbird
+code
+vkquake

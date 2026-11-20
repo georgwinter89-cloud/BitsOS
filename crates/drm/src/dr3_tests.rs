@@ -644,6 +644,7 @@ fn dropped_ring_signals_and_releases_eventfd_entries() {
     assert!(Arc::strong_count(&efile.file) > 1, "and holds the eventfd");
     drop(ring);
     assert!(fence::is_signaled(&f));
+    assert_eq!(fence::status(&f), -(linux::ab::errno_more::ECANCELED as i32), "forced completion: ECANCELED (amdgpu_fence.c:680)");
     assert_eq!(f.callbacks(), 0);
     assert_eq!(Arc::strong_count(&efile.file), 1, "the entry let the eventfd go");
     let mut b = [0u8; 8];

@@ -1,7 +1,7 @@
 //! Wakes for client sockets without relying on epoll inside epoll (WY-1a). Smithay's display keeps its clients in
 //! an epoll of its own and calloop watches that epoll's fd; on V2 (20.10.) the inner epoll's readiness did not
-//! reach the outer one after the first message (a client stuck after its first roundtrip; change request in
-//! wy-WY-1a.md). So each client socket is also watched directly through a duplicate fd, and the main loop
+//! reach the outer one after the first message (a client stuck after its first roundtrip; a change request to
+//! FS). So each client socket is also watched directly through a duplicate fd, and the main loop
 //! dispatches the display every turn (one epoll_wait(0) when nothing is pending). Remove this file once the
 //! nested-epoll change request has landed.
 //!
@@ -35,8 +35,9 @@ pub fn hang_up(w: &Watch) {
     unsafe { libc::shutdown(w.as_raw_fd(), libc::SHUT_RDWR) };
 }
 
-/// The peer's pid from SO_PEERCRED at accept (linux-6.6/net/core/sock.c sk_getsockopt SO_PEERCRED: the creds
-/// stored at connect, af_unix.c unix_stream_connect); 0 when unknown. Read once here, so no later lookup can fail.
+/// The peer's pid from SO_PEERCRED at accept (linux-7.3.1/net/core/sock.c:1903 sk_getsockopt SO_PEERCRED:
+/// the creds stored at connect, af_unix.c unix_stream_connect); 0 when unknown. Read once here, so no later lookup
+/// can fail.
 pub fn peer_pid(stream: &UnixStream) -> i32 {
     peer_cred(stream).map_or(0, |(pid, _)| pid)
 }
@@ -56,6 +57,23 @@ pub fn peer_cred(stream: &UnixStream) -> Option<(i32, u32)> {
         )
     };
     (r == 0 && cred.pid > 0).then_some((cred.pid, cred.uid))
+}
+
+/// SO_PEERSEC: the label the kernel recorded for the program behind the peer credentials, without its closing
+/// NUL. None when the kernel keeps none (Linux without a security module) or the socket has no such peer.
+pub fn peer_label(stream: &UnixStream) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 4352];
+    let mut len = buf.len() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `buf`, which is that long.
+    let r = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERSEC, buf.as_mut_ptr().cast(), &mut len) };
+    if r != 0 {
+        return None;
+    }
+    buf.truncate((len as usize).min(buf.len()));
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Some(buf)
 }
 
 /// Whether the peer has closed its end (a peek reads end of file). False while it is alive, even if it does not
@@ -93,8 +111,8 @@ pub fn watch(handle: &LoopHandle<'static, App>, w: Watch, id: ClientId) {
 }
 
 /// Whether the socket takes more data now (poll POLLOUT). A unix stream socket stops being writable once the data
-/// its peer has not read fills a quarter of its send buffer (linux-6.6/net/unix/af_unix.c unix_writable), so a
-/// peer that reads nothing makes this false long before wayland-backend's own bounded queue would have to hold
+/// its peer has not read fills a quarter of its send buffer (linux-7.3.1/net/unix/af_unix.c:591 unix_writable), so
+/// a peer that reads nothing makes this false long before wayland-backend's own bounded queue would have to hold
 /// anything. True when poll fails (no reason to hold back).
 pub fn writable(w: &Watch) -> bool {
     let mut p = libc::pollfd { fd: w.as_raw_fd(), events: libc::POLLOUT, revents: 0 };

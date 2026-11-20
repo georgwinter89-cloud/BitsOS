@@ -438,6 +438,7 @@ fn queued_adjacent_requests_reach_the_device_merged() {
     r.poke(0, &pattern(0, 1024, 7));
     let d = open(&r);
     let read0 = d.stats().read_bytes;
+    let io0 = d.io_stat();
     r.record();
     // Eight adjacent single blocks (submitted out of order) and one far away: queued before anyone waits.
     let order = [3u64, 0, 1, 7, 2, 4, 6, 5];
@@ -452,6 +453,10 @@ fn queued_adjacent_requests_reach_the_device_merged() {
     assert_eq!((calls[0].op, calls[0].lba, calls[0].blocks), (CallOp::Read, 0, 8));
     assert_eq!((calls[1].lba, calls[1].blocks), (500, 2));
     assert_eq!(d.stats().merged, 7);
+    // SYS-K: diskstats see what reached the device: two reads, seven merges, ten blocks (Linux's iostats).
+    let io = d.io_stat();
+    let rd = crate::iostat::READ;
+    assert_eq!((io.ios[rd] - io0.ios[rd], io.merges[rd] - io0.merges[rd], io.sectors[rd] - io0.sectors[rd]), (2, 7, 10 * d.block_size() as u64 / 512));
     // RB-7b CR2: bytes counted per completed request (10 blocks read, nothing written).
     assert_eq!((d.stats().read_bytes - read0, d.stats().write_bytes), (10 * d.block_size() as u64, 0));
     // Merging stops at the device's limit (16 blocks): 40 adjacent blocks in 4-block requests -> 16+16+8.
@@ -517,6 +522,7 @@ fn an_error_in_a_merged_batch_fails_only_its_request() {
     let d = open(&r);
     r.inject(Fault { write: false, lba: 13, blocks: 1, error: DevError::Io, times: None });
     r.record();
+    let io0 = d.io_stat();
     let ts: Vec<_> = (10..18).map(|l| (l, submit_read(&d, l, 1, Normal))).collect();
     for (l, t) in ts {
         let res = t.wait();
@@ -530,6 +536,10 @@ fn an_error_in_a_merged_batch_fails_only_its_request() {
     assert_eq!(calls[0].blocks, 8, "merged first: {calls:?}");
     assert_eq!(calls.len(), 9, "then each alone: {calls:?}");
     assert_eq!(d.stats().merge_retries, 1);
+    // SYS-K: run alone, the seven good members are seven reads and no merge.
+    let io = d.io_stat();
+    let rd = crate::iostat::READ;
+    assert_eq!((io.ios[rd] - io0.ios[rd], io.merges[rd] - io0.merges[rd]), (7, 0));
     // A fault that passes after one try: the single request succeeds on its own retry path.
     r.clear_faults();
     r.inject(Fault { write: true, lba: 40, blocks: 1, error: DevError::Io, times: Some(1) });

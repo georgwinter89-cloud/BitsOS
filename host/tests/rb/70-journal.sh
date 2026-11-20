@@ -7,7 +7,7 @@
 #      metrics from the journal; `reboot` (QEMU ends, -no-reboot);
 #   2. the same stick booted again: both still there, three boots told apart;
 #   3. booted with the clock 70 days on (-rtc base=...): retention (journal.keep_days=60) deleted the old part.
-# Needs init to start /bin/bitsjournal (change request 1 of plan/notes/rb-RB-8.md): without it SKIP, or RED with
+# Needs init to start /bin/bitsjournal (RB-8's change request 1): without it SKIP, or RED with
 # RB8_REQUIRE=1 (the desk's merge gate: a missing CR 1/CR 2 must not pass silently).
 # Ports: RB's range (BITSOS_PORT_LO, default 23000): MCP LO+140, HTTP LO+150.
 set -eu
@@ -15,8 +15,8 @@ export LC_ALL=C
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 for t in python3 mcopy mkfs.fat; do command -v $t >/dev/null || { echo "SKIP: $t missing"; exit 0; }; done
 if ! grep -q "bitsjournal" user/init/src/main.rs; then
-    if [ "${RB8_REQUIRE:-0}" = 1 ]; then echo "RED: init does not start bitsjournal (CR 1 of plan/notes/rb-RB-8.md missing)"; exit 1; fi
-    echo "SKIP: init does not start bitsjournal yet (change request 1 of plan/notes/rb-RB-8.md)"
+    if [ "${RB8_REQUIRE:-0}" = 1 ]; then echo "RED: init does not start bitsjournal (RB-8's CR 1 missing, plan/spec/robustness.md §8)"; exit 1; fi
+    echo "SKIP: init does not start bitsjournal yet (RB-8's change request 1, plan/spec/robustness.md §8)"
     exit 0
 fi
 # MCP's reboot drains the journal once CR 2 is applied: then no wait before it and the drain line is required.
@@ -33,7 +33,7 @@ TOKEN="rb8-scenario-token-3d1f"
 NAME=rb-journal
 IMG="target/xtask/$NAME.img"
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;wlan=off;nvme_write=off;data_img_mb=64" > "$RUN_DIR/image.out" 2>&1 \
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;nvme_write=off;data_img_mb=64" > "$RUN_DIR/image.out" 2>&1 \
     || { tail -20 "$RUN_DIR/image.out"; exit 1; }
 kib=$(( $(stat -c %s "$IMG") / 1024 + 700 * 1024 ))
 rm -f "$IMG"
@@ -87,8 +87,8 @@ grep -a "klog journal.drained" "$RUN_DIR/serial-1.log" | head -3
 if [ "$RB8_REBOOT_DRAIN" = 1 ]; then
     grep -aq "klog journal.drained what=mcp-reboot" "$RUN_DIR/serial-1.log" || { echo "RED: MCP's reboot did not wait for the journal"; exit 1; }
 else
-    if [ "${RB8_REQUIRE:-0}" = 1 ]; then echo "RED: MCP's reboot does not drain the journal (CR 2 of plan/notes/rb-RB-8.md missing)"; exit 1; fi
-    echo "SKIP: MCP's reboot does not drain the journal yet (CR 2 of plan/notes/rb-RB-8.md); waited for the 5 s flush instead"
+    if [ "${RB8_REQUIRE:-0}" = 1 ]; then echo "RED: MCP's reboot does not drain the journal (RB-8's CR 2 missing, plan/spec/robustness.md §8)"; exit 1; fi
+    echo "SKIP: MCP's reboot does not drain the journal yet (RB-8's CR 2, plan/spec/robustness.md §8); waited for the 5 s flush instead"
 fi
 run 2
 run 3 -- -rtc "base=$(date -d '+70 days' +%Y-%m-%dT%H:%M:%S)"

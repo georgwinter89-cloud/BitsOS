@@ -38,7 +38,8 @@ fn hung(s: RingState) -> bool {
 fn linux_timeouts_and_bad_configurations() {
     assert_eq!(TimeoutClass::Gfx.linux_us(), 10_000_000);
     assert_eq!(TimeoutClass::Sdma.linux_us(), 10_000_000);
-    assert_eq!(TimeoutClass::Video.linux_us(), 10_000_000);
+    // GX-8v: 7.3.1's video_timeout (amdgpu_device.c:3582).
+    assert_eq!(TimeoutClass::Video.linux_us(), 2_000_000);
     assert_eq!(TimeoutClass::Compute.linux_us(), 60_000_000);
     assert!(RingWatch::new(RingId(0), cfg(Kind::Gfx, 1000)).is_none(), "ring size");
     let mut c = cfg(Kind::Gfx, 1024);

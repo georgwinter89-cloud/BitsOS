@@ -3,9 +3,9 @@
 //! of `/bin/bitsinstall` with its size and times. A caller passes only when it runs as root (euid 0) and its
 //! image's executable (Linux `mm->exe_file`, set at execve and spawn) is that very inode, unchanged since: same
 //! object (a file renamed over it or a copy elsewhere is another inode), same size, mtime and ctime (a write or
-//! truncate moves them, and no call sets ctime from user space; linux-6.6/fs/attr.c `setattr_copy`). The
+//! truncate moves them, and no call sets ctime from user space; linux-7.3.1/fs/attr.c:342 `setattr_copy`). The
 //! running program keeps it so: execve holds deny_write on its file (ETXTBSY for writers while it runs).
-//! Linux has no such check (CAP_SYS_BOOT, linux-6.6/kernel/reboot.c, goes to any root process); it is
+//! Linux has no such check (CAP_SYS_BOOT, linux-7.3.1/kernel/reboot.c:746, goes to any root process); it is
 //! BitsOS's narrowing of root for the actions that change what boots.
 //!
 //! The process layer reports the caller (`set_caller`, from crates/proc/src/mcp_run/caller.rs): mcp sits below
@@ -58,9 +58,13 @@ impl Measured {
         let (_, mtime, ctime) = inode.meta.times();
         Some(Measured { size: inode.size(), mtime, ctime, inode })
     }
-    fn unchanged(&self) -> bool {
+    pub(crate) fn unchanged(&self) -> bool {
         let (_, m, c) = self.inode.meta.times();
         self.inode.size() == self.size && m == self.mtime && c == self.ctime
+    }
+    /// Whether `exe` is this very file (the same inode: a copy or a file renamed over it is another one).
+    pub(crate) fn is(&self, exe: &Path) -> bool {
+        Arc::ptr_eq(&exe.dentry.inode, &self.inode)
     }
 }
 

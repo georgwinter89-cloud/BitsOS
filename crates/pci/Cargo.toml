@@ -7,6 +7,7 @@ description = "PCI enumeration (ECAM), capabilities, BAR sizing, driver registry
 [dependencies]
 acpi = { path = "../acpi" }
 dcn314-regs = { path = "../dcn314-regs" }
+gp-platform = { path = "../gp-platform" }
 hal = { path = "../hal" }
 ksync = { path = "../ksync" }
 kreg = { path = "../kreg" }

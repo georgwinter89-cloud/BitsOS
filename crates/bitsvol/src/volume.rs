@@ -220,7 +220,8 @@ impl Pool {
 
     /// Frees space: a commit releases what earlier changes freed (once per operation: a second one would only
     /// release what the failed attempt itself shadowed, and the next attempt shadows it again), then the
-    /// oldest automatic snapshot goes.
+    /// oldest automatic snapshot goes. Chunks waiting for their discard were taken before (`alloc_chunk`'s
+    /// `untrim`), and those under way counted as free there: a snapshot goes only when they would not do either.
     fn make_room(&mut self, try_commit: bool) -> Result<()> {
         if try_commit && self.has_pending() {
             return self.commit();
@@ -232,7 +233,7 @@ impl Pool {
             .min_by_key(|v| (v.rec.created_ns, v.rec.id))
             .map(|v| (v.rec.id, v.rec.created_ns));
         let Some((id, created)) = victim else {
-            klog::event!(Warn, "bitsvol", "nospace", free = self.free, reserve = self.reserve, pending = 0u64);
+            klog::event!(Warn, "bitsvol", "nospace", free = self.free, reserve = self.reserve, discarding = self.trimming);
             return Err(VolError::NoSpace);
         };
         self.delete_inner(id)?;

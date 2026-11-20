@@ -62,6 +62,19 @@ def tool(c, name, args=None):
     return "\n".join(i.get("text", "") for i in r["content"] if i["type"] == "text"), r.get("isError", False)
 
 
+def wait_tool(c, name, secs=180):
+    """A tool of a user-space service (settingsd's settings_*) is listed only once that service registered it; a
+    call before that is a protocol error, not the tool's refusal (12.11. gate under load: setup called
+    settings_set 1 s after /data was mounted)."""
+    end = time.time() + secs
+    while True:
+        if any(t.get("name") == name for t in rpc(c, "tools/list").get("tools", [])):
+            return
+        if time.time() > end:
+            raise SystemExit(f"RED: no tool {name} in tools/list after {secs} s")
+        time.sleep(1)
+
+
 def sh(c, cmd, ms=120000):
     t, err = tool(c, "run", {"path": "/bin/sh", "args": ["-c", cmd], "timeout_ms": ms})
     return t, err
@@ -190,6 +203,7 @@ def setup():
     need(err and "CONFIG.TXT" in t, "write_file cannot append nvme_data", t)
     t, err = sh(c, f"echo '{line.strip()}' >> {CONFIG}; echo status=$?")
     need("status=0" not in t, "the shell cannot append nvme_data", t)
+    wait_tool(c, "settings_set")
     t, err = tool(c, "settings_set", {"key": "kernel.nvme_data", "value": "x"})
     need(err or "refus" in t.lower() or "R8" in t, "settings_set cannot set it", t)
     need(read_text(c, CONFIG) == before, "CONFIG.TXT is what it was")
@@ -255,12 +269,10 @@ def moved():
     need("eins" in t and "status=0" not in t, "/stickdata holds the tree and refuses writes", t)
     t, err = tool(c, "run", {"path": "/bin/bitsdisk", "args": ["list"], "timeout_ms": 20000})
     need("nie ueber MCP" in t, "bitsdisk over MCP is still refused", t)
-    # data.img as it stands at this boot; the script compares it after the power-off.
-    t, err = sh(c, "sha256sum /boot/BITSOS2/data.img")
-    m = re.search(r"\b[0-9a-f]{64}\b", t)
-    need(m is not None, "data.img hashed", t)
-    with open(os.path.join(os.path.dirname(LOG), "data-img.sum"), "w") as f:
-        f.write(m.group(0))
+    # GP-START: data.img holds all of the old /data and is root's alone; the script hashes it on the host before this
+    # boot and compares it after the power-off.
+    t, err = sh(c, "sha256sum /boot/BITSOS2/data.img; echo status=$?")
+    need("status=0" not in t and re.search(r"\b[0-9a-f]{64}\b", t) is None, "data.img is not readable by MCP's run (uid 1000)", t)
 
 
 def poweroff():

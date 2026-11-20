@@ -1,7 +1,8 @@
-/* SX-2: unshare(2) as an unprivileged user (linux-6.6/kernel/fork.c ksys_unshare, check_unshare_flags):
+/* SX-2: unshare(2) as an unprivileged user (linux-7.3.1/kernel/fork.c:3254 ksys_unshare, :3179 check_unshare_flags
+ * with UNSHARE_EMPTY_MNTNS):
  * unknown flags, namespaces without CAP_SYS_ADMIN, the implied thread-group flags with a second thread, then a
  * new user namespace (unmapped ids, full capabilities there) and the namespaces it owns. Shaped like
- * linux-6.6/tools/testing/selftests/nsfs and the user-namespace parts of the clone3 selftests. */
+ * linux-7.3.1/tools/testing/selftests/filesystems/nsfs and the user-namespace parts of the clone3 selftests. */
 #include "ns.h"
 #include <pthread.h>
 #include <sys/utsname.h>
@@ -138,6 +139,67 @@ static int execd(void) {
     return 0;
 }
 
+/* What a process sees in an empty mount namespace (`copy_mnt_ns` with CLONE_EMPTY_MNTNS, linux-7.3.1/fs/
+ * namespace.c:4420): cwd and root on the copy of the root mount, nothing mounted below it. /proc is reached
+ * through a descriptor taken before; its mountinfo shows the reader's (new) namespace. */
+static void empty_view(const char *who, int procfd) {
+    char l[128], cwd[256];
+    snprintf(l, sizeof l, "%s: getcwd", who);
+    printf("%s = %s\n", l, getcwd(cwd, sizeof cwd) ? cwd : en(errno));
+    struct stat st;
+    snprintf(l, sizeof l, "%s: stat(/proc/self)", who);
+    R(l, stat("/proc/self", &st));
+    snprintf(l, sizeof l, "%s: stat(/)", who);
+    R(l, stat("/", &st));
+    int fd = openat(procfd, "self/mountinfo", O_RDONLY);
+    char buf[4096];
+    long n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+    int lines = 0;
+    char points[256] = "";
+    for (char *p = buf, *e; n > 0 && p < buf + n && (e = memchr(p, '\n', buf + n - p)); p = e + 1) {
+        /* Field 5 is the mount point. */
+        char *f = p;
+        for (int i = 0; i < 4 && f; i++)
+            f = memchr(f, ' ', e - f) ? memchr(f, ' ', e - f) + 1 : 0;
+        char *end = f ? memchr(f, ' ', e - f) : 0;
+        if (end && strlen(points) + (end - f) + 2 < sizeof points) {
+            strncat(points, f, end - f);
+            strcat(points, " ");
+        }
+        lines++;
+    }
+    printf("%s: mountinfo lines = %d, mount points: %s\n", who, lines, points);
+    if (fd >= 0)
+        close(fd);
+}
+
+static int empty(void) {
+    int procfd = open("/proc", O_PATH | O_DIRECTORY);
+    char before[64] = "", after[64] = "";
+    readlinkat(procfd, "self/ns/mnt", before, sizeof before - 1);
+    R("unshare(CLONE_NEWUSER)", unshare(CLONE_NEWUSER));
+    R("chdir(/proc/self)", chdir("/proc/self"));
+    R("unshare(UNSHARE_EMPTY_MNTNS)", unshare(0x00100000));
+    readlinkat(procfd, "self/ns/mnt", after, sizeof after - 1);
+    printf("a new mount namespace = %s\n", yn(strcmp(before, after) != 0));
+    empty_view("unshare", procfd);
+    struct clone_args { uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup; } a;
+    memset(&a, 0, sizeof a);
+    a.flags = 1ull << 37;
+    a.exit_signal = SIGCHLD;
+    fflush(stdout);
+    R("chdir(/) before clone3", chdir("/"));
+    pid_t p = syscall(435, &a, sizeof a);
+    if (p == 0) {
+        empty_view("clone3 child", procfd);
+        _exit(0);
+    }
+    /* After the child's lines: printed by the parent once the child is gone. */
+    reap("clone3 child", p);
+    printf("clone3(CLONE_EMPTY_MNTNS) = %s\n", yn(p > 0));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "threadfs"))
@@ -146,6 +208,8 @@ int main(int argc, char **argv) {
         return threadexec();
     if (argc > 1 && !strcmp(argv[1], "execd"))
         return execd();
+    if (argc > 1 && !strcmp(argv[1], "empty"))
+        return empty();
     struct utsname before, after;
     uname(&before);
     R("unshare(0)", unshare(0));
@@ -158,6 +222,8 @@ int main(int argc, char **argv) {
     R("unshare(CLONE_NEWIPC) unprivileged", unshare(CLONE_NEWIPC));
     R("unshare(CLONE_NEWNS) unprivileged", unshare(CLONE_NEWNS));
     R("unshare(CLONE_NEWCGROUP) unprivileged", unshare(CLONE_NEWCGROUP));
+    R("unshare(UNSHARE_EMPTY_MNTNS) unprivileged", unshare(0x00100000));
+    R("unshare(UNSHARE_EMPTY_MNTNS|CLONE_VFORK)", unshare(0x00100000 | CLONE_VFORK));
     R("unshare(CLONE_FS)", unshare(CLONE_FS));
     R("unshare(CLONE_FILES)", unshare(CLONE_FILES));
     R("unshare(CLONE_SYSVSEM)", unshare(CLONE_SYSVSEM));

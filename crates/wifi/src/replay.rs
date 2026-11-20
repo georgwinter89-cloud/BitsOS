@@ -36,8 +36,8 @@ impl RxPn {
         u64::from_le_bytes(b)
     }
 
-    // Linux: the replay check of ieee80211_crypto_ccmp_decrypt (linux-6.6/net/mac80211/wpa.c:506,
-    // the memcmp at :548): a PN not above the last one of its counter is a replay. True = drop. An index past the counters is
+    // Linux: the replay check of ieee80211_crypto_ccmp_decrypt (linux-7.3.1/net/mac80211/wpa.c:518,
+    // the memcmp at :561): a PN not above the last one of its counter is a replay. True = drop. An index past the counters is
     // a replay (never one a parser gives).
     pub fn replay(&mut self, sec_idx: usize, pn: u64) -> bool {
         let Some(slot) = self.last.get_mut(sec_idx) else {
@@ -80,7 +80,7 @@ impl DupCheck {
     pub fn new() -> DupCheck {
         DupCheck::default()
     }
-    // Linux: ieee80211_rx_h_check_dup (linux-6.6/net/mac80211/rx.c:1411; sta-link.mjs duplicate): a unicast
+    // Linux: ieee80211_rx_h_check_dup (linux-7.3.1/net/mac80211/rx.c:1521; sta-link.mjs duplicate): a unicast
     // retransmission (retry bit, same sequence control as the last frame of its counter) from
     // our AP is dropped. True = drop. The caller has checked that the frame is from our AP.
     pub fn duplicate(&mut self, f: &DupInfo) -> bool {
@@ -145,9 +145,9 @@ pub trait Keys {
 }
 
 // Linux: none (sta-link.mjs ethOf) as mac80211 runs them: ieee80211_crypto_ccmp_decrypt
-// (linux-6.6/net/mac80211/wpa.c:506), ieee80211_802_1x_port_control
-// (linux-6.6/net/mac80211/rx.c:2379), ieee80211_frame_allowed (linux-6.6/net/mac80211/rx.c:2550),
-// ieee80211_drop_unencrypted (linux-6.6/net/mac80211/rx.c:2387)
+// (linux-7.3.1/net/mac80211/wpa.c:518), ieee80211_802_1x_port_control
+// (linux-7.3.1/net/mac80211/rx.c:2538), ieee80211_frame_allowed (linux-7.3.1/net/mac80211/rx.c:2727),
+// ieee80211_drop_unencrypted (linux-7.3.1/net/mac80211/rx.c:2546)
 pub fn data_allowed(f: &DataInfo, authorized: bool, keys: &mut dyn Keys) -> Result<(), DataDrop> {
     if f.protected {
         if !f.decrypted {

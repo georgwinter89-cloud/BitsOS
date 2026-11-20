@@ -116,6 +116,11 @@ impl fmt::Display for Dump {
 /// position `from` up to `wptr` (dword counters; `from` should be a packet start the driver knows, e.g. the
 /// last signalled submission's start). A window longer than the ring is cut to the last ring's worth.
 pub fn decode_ring(isa: Isa, ring: &[u32], from: u64, rptr: u64, wptr: u64) -> Dump {
+    decode_ring_by(ring, from, rptr, wptr, &|w, base| decode_stream(isa, w, base))
+}
+
+/// `decode_ring` with another packet language's stream decoder (GX-8v: VCN's, `vcn::decode_stream`).
+pub fn decode_ring_by(ring: &[u32], from: u64, rptr: u64, wptr: u64, stream: &dyn Fn(&[u32], u64) -> Vec<Line>) -> Dump {
     let size = ring.len() as u64;
     let mut from = from;
     if !size.is_power_of_two() {
@@ -126,7 +131,7 @@ pub fn decode_ring(isa: Isa, ring: &[u32], from: u64, rptr: u64, wptr: u64) -> D
     }
     let n = wptr.wrapping_sub(from);
     let words: Vec<u32> = (0..n).map(|i| ring[(from.wrapping_add(i) & (size - 1)) as usize]).collect();
-    let mut lines = decode_stream(isa, &words, from);
+    let mut lines = stream(&words, from);
     let mut found = false;
     for l in &mut lines {
         let off = rptr.wrapping_sub(l.pos);

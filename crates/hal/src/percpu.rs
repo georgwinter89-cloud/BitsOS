@@ -34,6 +34,12 @@ pub struct CpuLocal {
     pub irq_depth: u64,
     /// ksync's preemption blockers on this CPU (spin locks and `PreemptGuard`s held; Linux `__preempt_count`).
     pub preempt: u64,
+    /// An interrupt exit found a reschedule pending but the preemption blocked (`defer_resched`): the point where
+    /// the count drops to 0 with interrupts on preempts instead (Linux `preempt_enable` -> `preempt_schedule`).
+    pub resched: u64,
+    /// The trap frame of the interrupt `vectors::dispatch` hands to a handler on this CPU now (0: none), for a
+    /// sampling profiler's look at the interrupted code (`sampling`).
+    pub irq_frame: u64,
 }
 
 pub const CL_SELF: usize = 0;
@@ -45,6 +51,8 @@ pub const CL_CURRENT: usize = 40;
 pub const CL_GDT: usize = 48;
 pub const CL_IRQ_DEPTH: usize = 56;
 pub const CL_PREEMPT: usize = 64;
+pub const CL_RESCHED: usize = 72;
+pub const CL_IRQ_FRAME: usize = 80;
 
 /// One block per cache line, so two CPUs never share a line of their GS blocks.
 #[repr(C, align(64))]
@@ -55,7 +63,7 @@ struct LocalCell(UnsafeCell<CpuLocal>);
 unsafe impl Sync for LocalCell {}
 
 const fn empty_local() -> CpuLocal {
-    CpuLocal { self_ptr: 0, kernel_rsp: 0, user_rsp_scratch: 0, user_ctx: 0, cpu_index: 0, current: 0, gdt: 0, irq_depth: 0, preempt: 0 }
+    CpuLocal { self_ptr: 0, kernel_rsp: 0, user_rsp_scratch: 0, user_ctx: 0, cpu_index: 0, current: 0, gdt: 0, irq_depth: 0, preempt: 0, resched: 0, irq_frame: 0 }
 }
 
 static BSP_LOCAL: LocalCell = LocalCell(UnsafeCell::new(empty_local()));
@@ -162,6 +170,8 @@ fn gs_read(off: usize) -> u64 {
             CL_GDT => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_GDT, options(nostack, readonly, preserves_flags)),
             CL_IRQ_DEPTH => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_IRQ_DEPTH, options(nostack, readonly, preserves_flags)),
             CL_PREEMPT => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_PREEMPT, options(nostack, readonly, preserves_flags)),
+            CL_RESCHED => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_RESCHED, options(nostack, readonly, preserves_flags)),
+            CL_IRQ_FRAME => core::arch::asm!("mov {}, gs:[{o}]", out(reg) v, o = const CL_IRQ_FRAME, options(nostack, readonly, preserves_flags)),
             _ => v = 0,
         }
     }
@@ -179,6 +189,8 @@ fn gs_read(off: usize) -> u64 {
         CL_GDT => l.gdt,
         CL_IRQ_DEPTH => l.irq_depth,
         CL_PREEMPT => l.preempt,
+        CL_RESCHED => l.resched,
+        CL_IRQ_FRAME => l.irq_frame,
         _ => 0,
     }
 }
@@ -344,7 +356,75 @@ pub fn preempt_dec() {
     if gs_read(CL_PREEMPT) != 0 {
         // SAFETY: this CPU's own block through GS (see gs_read); one instruction.
         unsafe { core::arch::asm!("dec qword ptr gs:[{o}]", o = const CL_PREEMPT, options(nostack)) };
+        if gs_read(CL_PREEMPT) == 0 && gs_read(CL_RESCHED) != 0 {
+            run_resched_hook();
+        }
     }
+}
+
+/// The scheduler's deferred preemption (`set_resched_hook`); it checks the context itself.
+static RESCHED_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Installs what runs when a deferred reschedule (`defer_resched`) meets a point where the count is 0 again.
+pub fn set_resched_hook(f: fn()) {
+    RESCHED_HOOK.store(f as usize, Ordering::Release);
+}
+
+#[cold]
+pub(crate) fn run_resched_hook() {
+    let f = RESCHED_HOOK.load(Ordering::Acquire);
+    if f != 0 {
+        // SAFETY: only `set_resched_hook` stores here, a `fn()`.
+        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(f) };
+        f();
+    }
+}
+
+/// An interrupt exit could not preempt (a spin lock held, interrupts off where it hit) although a switch is
+/// pending: the next drop of the count to 0, or interrupts turned on with it at 0, asks the scheduler again.
+pub fn defer_resched() {
+    if !GS_READY.load(Ordering::Acquire) {
+        return;
+    }
+    #[cfg(target_os = "none")]
+    // SAFETY: this CPU's own block through GS (see gs_read); one instruction.
+    unsafe {
+        core::arch::asm!("mov qword ptr gs:[{o}], 1", o = const CL_RESCHED, options(nostack, preserves_flags))
+    };
+}
+
+/// Whether a reschedule was deferred on this CPU; clears it. A plain read and write: only this CPU and its own
+/// interrupts write the flag, and an interrupt between the two that could not preempt sets it again for the
+/// caller's next point (the caller looks at the reschedule itself anyway).
+pub fn take_deferred_resched() -> bool {
+    if !GS_READY.load(Ordering::Acquire) {
+        return false;
+    }
+    #[cfg(target_os = "none")]
+    {
+        let v = gs_read(CL_RESCHED);
+        if v != 0 {
+            // SAFETY: this CPU's own block through GS (see gs_read); one instruction.
+            unsafe { core::arch::asm!("mov qword ptr gs:[{o}], 0", o = const CL_RESCHED, options(nostack, preserves_flags)) };
+        }
+        v != 0
+    }
+    #[cfg(not(target_os = "none"))]
+    false
+}
+
+/// A point where the thread could be preempted if the count is 0 (interrupts just came back on, a wake-up on this
+/// CPU): runs the deferred reschedule. The hook itself checks interrupts and the interrupt context.
+#[inline]
+pub fn resched_point() {
+    if preempt_count() == 0 && resched_deferred() {
+        run_resched_hook();
+    }
+}
+
+/// Whether a reschedule waits for the next preemption point on this CPU (`defer_resched`).
+pub fn resched_deferred() -> bool {
+    GS_READY.load(Ordering::Acquire) && gs_read(CL_RESCHED) != 0
 }
 
 /// Preemption blockers on this CPU.
@@ -386,6 +466,25 @@ pub(crate) fn irq_exit() {
         // SAFETY: as irq_enter; always paired with it in `dispatch`.
         unsafe { core::arch::asm!("dec qword ptr gs:[{o}]", o = const CL_IRQ_DEPTH, options(nostack)) };
     }
+}
+
+/// Publishes `frame` (a `TrapFrame` address, 0 for none) as the frame of the interrupt this CPU handles now and
+/// returns the one before. Only `vectors::dispatch`, around the handler call, with interrupts off.
+pub(crate) fn set_irq_frame(frame: u64) -> u64 {
+    #[cfg(target_os = "none")]
+    if GS_READY.load(Ordering::Acquire) {
+        let old = gs_read(CL_IRQ_FRAME);
+        // SAFETY: this CPU's own block through GS; one store to its own field.
+        unsafe { core::arch::asm!("mov qword ptr gs:[{o}], {v}", o = const CL_IRQ_FRAME, v = in(reg) frame, options(nostack, preserves_flags)) };
+        return old;
+    }
+    let _ = frame;
+    0
+}
+
+/// The frame `set_irq_frame` published on this CPU (0: not inside a handler of `dispatch`).
+pub(crate) fn irq_frame() -> u64 {
+    if GS_READY.load(Ordering::Acquire) { gs_read(CL_IRQ_FRAME) } else { 0 }
 }
 
 /// True while this CPU runs a hard-IRQ handler (`vectors::dispatch`); for lock checkers and wake-up rules.
@@ -435,33 +534,46 @@ impl<T> PerCpu<T> {
         None
     }
 
-    /// Makes sure CPUs 0..n have values (allocates; interrupts off while growing: the holder only builds a few
-    /// small values and links them, so waiters spin a bounded time).
+    /// Makes sure CPUs 0..n have values. The values and their chunk are made first, with interrupts as the
+    /// caller has them (a driver's interrupt setup: 32 KiB of MSI slots for 16 CPUs; with interrupts off the heap
+    /// may not reclaim, ATOMIC-3); interrupts are off only while the holder of the grow flag links the chunk, so
+    /// waiters spin a bounded time. A chunk made for a stale `covered` is dropped and made again.
     fn cover(&self, n: usize) {
-        if self.covered.load(Ordering::Acquire) >= n {
-            return;
-        }
-        let _irq = crate::cpu::IrqGuard::new();
-        while self.grow.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
-        let have = self.covered.load(Ordering::Acquire);
-        if n > have {
+        loop {
+            let have = self.covered.load(Ordering::Acquire);
+            if have >= n {
+                return;
+            }
             let items: Box<[T]> = (have..n).map(self.init).collect();
             let chunk = Box::into_raw(Box::new(Chunk { first: have, items, next: AtomicPtr::new(core::ptr::null_mut()) }));
-            let mut tail = &self.head;
-            loop {
-                let p = tail.load(Ordering::Acquire);
-                if p.is_null() {
-                    break;
+            let linked = {
+                let _irq = crate::cpu::IrqGuard::new();
+                while self.grow.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                    core::hint::spin_loop();
                 }
-                // SAFETY: as in `find`.
-                tail = unsafe { &(*p).next };
+                let fits = self.covered.load(Ordering::Acquire) == have;
+                if fits {
+                    let mut tail = &self.head;
+                    loop {
+                        let p = tail.load(Ordering::Acquire);
+                        if p.is_null() {
+                            break;
+                        }
+                        // SAFETY: as in `find`.
+                        tail = unsafe { &(*p).next };
+                    }
+                    tail.store(chunk, Ordering::Release);
+                    self.covered.store(n, Ordering::Release);
+                }
+                self.grow.store(0, Ordering::Release);
+                fits
+            };
+            if linked {
+                return;
             }
-            tail.store(chunk, Ordering::Release);
-            self.covered.store(n, Ordering::Release);
+            // SAFETY: never published (another grower moved `covered` first), so nobody else can reach it.
+            drop(unsafe { Box::from_raw(chunk) });
         }
-        self.grow.store(0, Ordering::Release);
     }
 
     fn get_or_grow(&self, cpu: usize) -> &T {
@@ -526,6 +638,7 @@ impl<T> Drop for PerCpu<T> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use core::sync::atomic::AtomicU32;
 
@@ -536,6 +649,9 @@ mod tests {
         assert_eq!(core::mem::offset_of!(CpuLocal, current), CL_CURRENT);
         assert_eq!(core::mem::offset_of!(CpuLocal, gdt), CL_GDT);
         assert_eq!(core::mem::offset_of!(CpuLocal, irq_depth), CL_IRQ_DEPTH);
+        assert_eq!(core::mem::offset_of!(CpuLocal, preempt), CL_PREEMPT);
+        assert_eq!(core::mem::offset_of!(CpuLocal, resched), CL_RESCHED);
+        assert_eq!(core::mem::offset_of!(CpuLocal, irq_frame), CL_IRQ_FRAME);
         assert_eq!(core::mem::align_of::<LocalCell>(), 64);
     }
 
@@ -552,5 +668,48 @@ mod tests {
             assert_eq!(p.get_or_grow(c).load(Ordering::Relaxed), c as u32 + 1);
         }
         assert_eq!(p.iter().count(), cpu_count());
+    }
+
+    static MADE: AtomicU32 = AtomicU32::new(0);
+    static DROPPED: AtomicU32 = AtomicU32::new(0);
+
+    struct Counted(u32);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// ATOMIC-3: values are made before the grow flag (and interrupts off) are taken, so growers race; the one
+    /// that finds `covered` unchanged links, the others drop what they made and look again. Every CPU gets one
+    /// value that never moves, nothing made is lost or freed twice.
+    #[test]
+    fn racing_growers_link_one_chunk_each_and_drop_the_rest() {
+        let p: PerCpu<Counted> = PerCpu::new(|i| {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            Counted(i as u32)
+        });
+        let top = 64usize;
+        std::thread::scope(|sc| {
+            for t in 0..8 {
+                let p = &p;
+                sc.spawn(move || {
+                    for c in (t % 3..top).step_by(3) {
+                        let v = p.get_or_grow(c);
+                        assert_eq!(v.0, c as u32);
+                    }
+                });
+            }
+        });
+        let at: std::vec::Vec<*const Counted> = (0..top).map(|c| p.get_or_grow(c) as *const Counted).collect();
+        for (c, &a) in at.iter().enumerate() {
+            assert_eq!(p.get_or_grow(c) as *const Counted, a, "CPU {c}'s value did not move");
+        }
+        let (made, dropped) = (MADE.load(Ordering::Relaxed), DROPPED.load(Ordering::Relaxed));
+        let covered = p.covered.load(Ordering::Acquire) as u32;
+        assert!(covered >= top as u32);
+        assert_eq!(made - dropped, covered, "exactly the linked values live");
+        drop(p);
+        assert_eq!(MADE.load(Ordering::Relaxed), DROPPED.load(Ordering::Relaxed), "every value made was dropped once");
     }
 }

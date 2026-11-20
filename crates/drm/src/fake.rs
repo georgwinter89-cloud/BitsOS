@@ -1,4 +1,4 @@
-//! The fake GPU (gx-roadmap.md §9): the DRM core's backend under QEMU and in host tests until the amdgpu hardware
+//! The fake GPU (plan/spec/gpu.md §11.6): the DRM core's backend under QEMU and in host tests until the amdgpu hardware
 //! backend exists. DR-2 answers only the core calls (VERSION, GET_CAP, ...); every amdgpu ioctl is in the table
 //! with Linux 6.6's flags and says "not done yet" (EINVAL), INFO and friends follow later. DR-3: the fake's
 //! GFX ring hands out fences and signals them in order (`FakeRing`), the test stand-in for a job's end. DR-4:
@@ -25,18 +25,19 @@ use crate::profile_780m;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ksync::SpinLock;
 
-/// amdgpu's `drm_driver` values (linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c:117-119 and :2817,
-/// amdgpu_drv.h:41-43; features DRIVER_GEM | DRIVER_MODESET | DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE; mode values from
-/// amdgpu_dm.c:3992-3999 and DCN 3.1.4's `max_cursor_size` 256, dcn314_resource.c:1860). 3.54 is Mesa's floor
-/// (gx-roadmap.md §1 item 5).
+/// amdgpu's `drm_driver` values (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c:130-132 and :3118
+/// `amdgpu_kms_driver`, amdgpu_drv.h:41-43; features DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET | DRIVER_SYNCOBJ |
+/// DRIVER_SYNCOBJ_TIMELINE; mode values from amdgpu_dm.c:3992-3999 and DCN 3.1.4's `max_cursor_size` 256,
+/// linux-7.3.1/drivers/gpu/drm/amd/display/dc/resource/dcn314/dcn314_resource.c:2002). KMS 3.64: what Mesa keys on
+/// between 3.55 and 3.64 exists for GC 11 (GPUVM_FAULT 3.55, cleared VRAM 3.59: objects are always cleared here,
+/// DEV_INFO's userq_ip_mask 3.64: 0, no user queues; 3.58/3.60/3.63 are GFX 12 only).
 pub const AMDGPU_INFO: DriverInfo = DriverInfo {
     name: "amdgpu",
-    date: "20150101",
     desc: "AMD GPU",
     major: 3,
-    minor: 54,
+    minor: 64,
     patch: 0,
-    features: Features { gem: true, modeset: true, syncobj: true, syncobj_timeline: true },
+    features: Features { gem: true, modeset: true, syncobj: true, syncobj_timeline: true, atomic: true },
     mode: ModeConfig {
         dumb_create: true,
         preferred_depth: 24,
@@ -121,6 +122,16 @@ impl FakeRing {
     pub fn signal_all(&self) -> usize {
         self.signal_through(u64::MAX)
     }
+    /// `amdgpu_fence_driver_force_completion` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c:668): every
+    /// pending fence gets ECANCELED before it signals (the fake has no timed-out job, so no ETIME).
+    pub fn cancel_all(&self) -> usize {
+        let mut n = 0;
+        while let Some(f) = self.pending.lock().pop_front() {
+            f.signal_error(linux::ab::errno_more::ECANCELED as i32);
+            n += 1;
+        }
+        n
+    }
     pub fn pending(&self) -> usize {
         self.pending.lock().len()
     }
@@ -129,12 +140,12 @@ impl FakeRing {
     }
 }
 
-/// A ring that goes signals what it still owes (`amdgpu_fence_driver_force_completion` in
-/// `amdgpu_fence_driver_hw_fini`, linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c:614): every fence signals
-/// once, so the waiters and eventfd entries hanging on it are let go.
+/// A ring that goes ends what it still owes (`amdgpu_fence_driver_force_completion` in
+/// `amdgpu_fence_driver_hw_fini`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c:533): every fence signals
+/// once, with ECANCELED, so the waiters and eventfd entries hanging on it are let go and see it did not run.
 impl Drop for FakeRing {
     fn drop(&mut self) {
-        let n = self.signal_all();
+        let n = self.cancel_all();
         if n > 0 {
             klog::event!(Info, "drm", "fake.ring_forced", ring = self.name, fences = n; "a dropped ring signals its pending fences");
         }
@@ -165,6 +176,16 @@ impl FakeMemory {
         kernel_vram_other: 0x9000,
         kernel_gtt_pinned: 0xd8_8000,
     };
+    /// Card A of the Gaming-PC under Linux on 5.11. (the capture's 0x19 and 0x14): 16304 MiB of VRAM, all of it
+    /// CPU-visible, 23934 MiB of GTT; the driver's pinned part; the rest in use was that desktop's.
+    pub const SEEN_9070XT: FakeMemory = FakeMemory {
+        carveout: 0x3_fb00_0000,
+        visible: 0x3_fb00_0000,
+        gtt: 0x5_d7ed_0000,
+        kernel_vram_pinned: 0x55e_4000,
+        kernel_vram_other: 0x5c4d_4000 - 0x55e_4000,
+        kernel_gtt_pinned: 0xbd_c000,
+    };
     /// The same machine with another carve-out size (all of it CPU-visible).
     pub const fn with_carveout(bytes: u64) -> FakeMemory {
         FakeMemory { carveout: bytes, visible: bytes, ..FakeMemory::CAPTURED }
@@ -186,6 +207,9 @@ pub struct FakeGpu {
     /// Tests: the next pstate change fails with this errno (0 = none); set if a change ran under the uAPI's lock.
     pstate_fail: core::sync::atomic::AtomicI64,
     pstate_under_lock: core::sync::atomic::AtomicBool,
+    /// What GB_ADDR_CONFIG reads, and the sensors' values (the chip's, as captured).
+    gb_addr_config: (u32, u32),
+    sensors: &'static [(Sensor, u32)],
 }
 
 impl FakeGpu {
@@ -218,7 +242,17 @@ impl FakeGpu {
             pstate: AtomicU32::new(AMDGPU_CTX_STABLE_PSTATE_NONE),
             pstate_fail: core::sync::atomic::AtomicI64::new(0),
             pstate_under_lock: core::sync::atomic::AtomicBool::new(false),
+            gb_addr_config: (profile_780m::GB_ADDR_CONFIG, profile_780m::GB_ADDR_CONFIG_VALUE),
+            sensors: profile_780m::SENSORS,
         }
+    }
+
+    /// The Gaming-PC's RX 9070 XT, card A, as Linux shows it (plan/spec/gpu-rdna4.md: 04:00.0, VGA [0300], 1002:7550
+    /// rev c0, subsystem 148c:2435). GP-GPU1: the profile's INFO answers for tests; nothing boots this fake.
+    pub fn radeon_9070xt() -> FakeGpu {
+        use crate::profile_9070xt as p;
+        let pci = PciIdentity { bus: 0x04, device: 0x7550, subsystem_vendor: 0x148c, subsystem_device: 0x2435, revision: 0xc0, ..FakeGpu::radeon_780m().pci };
+        FakeGpu { pci, profile: p::RADEON_9070XT, mem: FakeMemory::SEEN_9070XT, gb_addr_config: (p::GB_ADDR_CONFIG, p::GB_ADDR_CONFIG_VALUE), sensors: p::SENSORS, ..FakeGpu::radeon_780m() }
     }
 
     /// The 780M with other memory (another carve-out size).
@@ -334,7 +368,7 @@ impl GpuDevice for FakeGpu {
     }
     /// An idle GPU: the status registers read 0, GB_ADDR_CONFIG its captured value.
     fn read_register(&self, reg: &Register, _se: Option<u32>, _sh: Option<u32>) -> Option<u32> {
-        Some(if reg.offset == profile_780m::GB_ADDR_CONFIG { profile_780m::GB_ADDR_CONFIG_VALUE } else { 0 })
+        Some(if reg.offset == self.gb_addr_config.0 { self.gb_addr_config.1 } else { 0 })
     }
     /// The counter at `gpu_counter_freq` kHz from the kernel's monotonic clock.
     fn gpu_clock_counter(&self) -> u64 {
@@ -345,7 +379,7 @@ impl GpuDevice for FakeGpu {
         true
     }
     fn sensor(&self, s: Sensor) -> Option<u32> {
-        profile_780m::SENSORS.iter().find(|(k, _)| *k == s).map(|&(_, v)| v)
+        self.sensors.iter().find(|(k, _)| *k == s).map(|&(_, v)| v)
     }
     fn reset_counter(&self) -> u32 {
         self.sched.reset_counter.load(Ordering::Acquire)

@@ -1,4 +1,4 @@
-//! The user ABI numbers of seccomp and classic BPF (linux-6.6/include/uapi/linux/seccomp.h, filter.h,
+//! The user ABI numbers of seccomp and classic BPF (linux-7.3.1/include/uapi/linux/seccomp.h:15, filter.h,
 //! bpf_common.h, audit.h). Kept here because `uapi` does not name them yet (change request to the desk: move
 //! them under `uapi::ab` when another crate needs them).
 

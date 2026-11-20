@@ -1,12 +1,11 @@
 //! The kernel's `Hw`: BAR0 through `hal::mmio::IoMem` (uncached), the clock from `time`, sleeping waits from
-//! `sched`, DMA memory from `mm::dma` (MM-4: write-back when snooped, uncached rings and lists and
-//! write-combining sample rings without snooping), PC-2's enable/disable.
+//! `sched`, DMA memory from `mm::dma` (write-back: every controller snoops), PC-2's enable/disable.
 
-use crate::hw::{AllocError, DmaUse, Hw, Mem};
+use crate::hw::{Hw, Mem};
 use alloc::format;
 use alloc::string::String;
 use hal::mmio::IoMem;
-use mm::dma::{DmaBuffer, DmaCache, DmaConstraints, DmaError};
+use mm::dma::{DmaBuffer, DmaCache, DmaConstraints};
 
 /// `pause_us` sleeps from this length on and spins below it (a trip through the scheduler costs more).
 const SLEEP_MIN_US: u64 = 50;
@@ -98,17 +97,9 @@ impl Hw for MmioHw {
     fn pause_us(&self, us: u64) {
         if us >= SLEEP_MIN_US { sched::sleep_ns(us * 1000) } else { time::delay_us(us) }
     }
-    fn alloc(&self, len: usize, usage: DmaUse, limit32: bool, snoop: bool) -> Result<DmaBuffer, (AllocError, String)> {
-        let cache = match (snoop, usage) {
-            (true, _) => DmaCache::WriteBack,
-            (false, DmaUse::Control) => DmaCache::Uncached,
-            (false, DmaUse::Data) => DmaCache::WriteCombining,
-        };
+    fn alloc(&self, len: usize, limit32: bool) -> Result<DmaBuffer, String> {
         let base = if limit32 { DmaConstraints::dma32() } else { DmaConstraints::dma64() };
-        DmaBuffer::alloc(len, base.with_align(crate::regs::BDL_ALIGN as u64).with_cache(cache)).map_err(|e| {
-            let kind = if e == DmaError::Unsupported { AllocError::Unsupported } else { AllocError::Other };
-            (kind, format!("DMA {len} bytes {cache:?}: {e:?}"))
-        })
+        DmaBuffer::alloc(len, base.with_align(crate::regs::BDL_ALIGN as u64).with_cache(DmaCache::WriteBack)).map_err(|e| format!("DMA {len} bytes: {e:?}"))
     }
     fn enable(&self, dma: bool) -> Result<(), String> {
         self.pci.enable_device(dma).map(|_| ()).map_err(|e| format!("enable_device({dma}): {e}"))

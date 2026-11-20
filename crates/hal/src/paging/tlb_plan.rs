@@ -4,7 +4,7 @@
 
 /// Up to this many pages a flush invalidates page by page (`invlpg`); a larger range, a range not known any
 /// more or more than one missed generation flushes the whole context instead (MM-11: Linux's
-/// `tlb_single_page_flush_ceiling`, linux-6.6/arch/x86/mm/tlb.c:957 and :1010, a range over 33 pages is full).
+/// `tlb_single_page_flush_ceiling`, linux-7.3.1/arch/x86/mm/tlb.c:1374 and :1386, a range over 33 pages is full).
 pub const RANGE_PAGES: u64 = 33;
 
 /// How a CPU brings its TLB from generation `synced` to `generation`.
@@ -214,10 +214,10 @@ pub fn ticks_to_ns(ticks: u64, hz: u64) -> u64 {
 /// Whether rewriting a present leaf from `old` to `new` (both in the 4 KiB layout, frame bits included) only
 /// grants rights, so no other CPU needs a shootdown (MM-tlb2): WRITABLE set or NX cleared, everything else
 /// (frame, present, user, memory type, global) the same; the Accessed/Dirty bits must not be cleared (a clear
-/// needs a flush, linux-6.6/arch/x86/include/asm/tlbflush.h:306 `flush_on_clear`). A CPU with the old,
+/// needs a flush, linux-7.3.1/arch/x86/include/asm/tlbflush.h:399 `flush_on_clear`). A CPU with the old,
 /// narrower translation cached takes one spurious fault and drops it there (Linux's fault path:
-/// mm/memory.c:3030 `wp_page_reuse` -> `ptep_set_access_flags`, arch/x86/mm/pgtable.c:499, no flush;
-/// `flush_tlb_fix_spurious_fault` is empty on x86, arch/x86/include/asm/pgtable.h:1325).
+/// mm/memory.c:3891 `wp_page_reuse` -> `ptep_set_access_flags`, arch/x86/mm/pgtable.c:380, no flush;
+/// `flush_tlb_fix_spurious_fault` is empty on x86, arch/x86/include/asm/pgtable.h:1295).
 pub fn grant_only(old: u64, new: u64) -> bool {
     const W: u64 = 1 << 1;
     const A: u64 = 1 << 5;
@@ -234,7 +234,7 @@ pub fn grant_only(old: u64, new: u64) -> bool {
 
 /// Frames one user unmap gathers at most before a shootdown round (MM-tlb2): Linux's mmu_gather keeps up to
 /// `MAX_GATHER_BATCH_COUNT` batches of `MAX_GATHER_BATCH` pages, about 10,000 pages
-/// (linux-6.6/include/asm-generic/tlb.h:252-261), to bound one round's latency and the memory held back.
+/// (linux-7.3.1/include/asm-generic/tlb.h:283-292), to bound one round's latency and the memory held back.
 pub const GATHER_MAX: usize = 10_000;
 
 #[cfg(test)]

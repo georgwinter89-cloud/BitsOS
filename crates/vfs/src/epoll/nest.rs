@@ -1,5 +1,5 @@
-//! The nesting checks of `epoll_ctl` (linux-6.6/fs/eventpoll.c `ep_loop_check` :2010, `reverse_path_check`
-//! :1387): run under the global `NEST` mutex, before (loop) and after (paths) the new item is linked. They take
+//! The nesting checks of `epoll_ctl` (linux-7.3.1/fs/eventpoll.c `ep_loop_check` :2459, `reverse_path_check`
+//! :1723): run under the global `NEST` mutex, before (loop) and after (paths) the new item is linked. They take
 //! each epoll's item mutex one at a time, never two at once.
 
 use super::{EpInner, EpItem, EP_MAX_NESTS};

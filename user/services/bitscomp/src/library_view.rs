@@ -1,5 +1,5 @@
 //! PK-L1b: what the program library's overlay shows and how its focus moves, as pure functions (host tests in
-//! library_view_tests.rs). The rows (desk-PK67-plan.md §3 "What it shows"): "Favoriten" from `desktop.favourites`,
+//! library_view_tests.rs). The rows (plan/spec/program-library.md section 5): "Favoriten" from `desktop.favourites`,
 //! "Zuletzt benutzt" from the start page's recent list counted by program (up to RECENT_MAX), "Alle Programme" A-Z;
 //! while a search is typed, one row of hits, best first. The geometry is in logical px from the Feld board's sizes
 //! (board px, `Theme::bl`), so the look (library_draw.rs) and the hit tests read the same rectangles.
@@ -167,6 +167,98 @@ pub fn geo(full: Rect, top_h: i32, t: &Theme) -> Geo {
     let (cell, gap) = ((b(144.0), b(150.0)), b(8.0));
     let cols = ((body.w + gap) / (cell.0 + gap)).max(1) as usize;
     Geo { dim, panel, search, body, hints, cols, cell, head: b(36.0), gap }
+}
+
+/// LIB-ADD: the overlay's ways to the "Programme" page: the head's two buttons beside the search field, and the
+/// link of a search that found nothing (it hands the typed text on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Add,
+    Updates,
+    AddSearch,
+}
+
+pub const ADD: &str = "Programme hinzufügen";
+pub const UPDATES: &str = "Aktualisierungen";
+pub const ADD_SEARCH: &str = "Nicht dabei? Programme hinzufügen";
+
+impl Button {
+    /// Its name in `ctl hot` (`library add`, `library updates`, `library add-search`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Button::Add => "add",
+            Button::Updates => "updates",
+            Button::AddSearch => "add-search",
+        }
+    }
+
+    /// The page address it opens; the empty search's link carries the search (`programme/hinzufuegen/<text>`).
+    pub fn address(self, query: &str) -> String {
+        match (self, query.trim()) {
+            (Button::Updates, _) => "programme/aktualisierungen".into(),
+            (Button::AddSearch, q) if !q.is_empty() => format!("programme/hinzufuegen/{q}"),
+            _ => "programme/hinzufuegen".into(),
+        }
+    }
+}
+
+/// The search line's parts (logical px): the typed text, the two buttons, the Esc chip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Head {
+    pub text: Rect,
+    pub add: Rect,
+    /// Left out when the panel is too narrow for it beside a readable search (the page's tab is the way then).
+    pub updates: Option<Rect>,
+    pub esc: Rect,
+}
+
+/// Logical px of `s` in `f` (fonts measure physical px).
+fn lw(f: &crate::text::Font, s: &str, t: &Theme) -> i32 {
+    (f.width(s) as f64 / t.scale).ceil() as i32
+}
+
+pub fn button_font(t: &Theme) -> crate::text::Font {
+    t.bfont(crate::text::Family::Ui, 15.0, crate::text::Weight::SemiBold)
+}
+
+pub fn badge_font(t: &Theme) -> crate::text::Font {
+    t.bfont(crate::text::Family::Ui, 13.0, crate::text::Weight::Bold)
+}
+
+/// The count's badge width inside the updates button.
+pub fn badge_w(t: &Theme, n: usize) -> i32 {
+    (lw(&badge_font(t), &n.to_string(), t) + t.bl(14.0)).max(t.bl(24.0))
+}
+
+/// The head's rectangles; `count` is the number of updates shown in its button.
+pub fn head(g: &Geo, t: &Theme, count: Option<usize>) -> Head {
+    let s = g.search;
+    let h = t.bl(44.0).min(s.h);
+    let y = s.y + (s.h - h) / 2;
+    let esc_w = lw(&t.style(crate::theme::Style::Label), crate::library_draw::ESC, t) + t.bl(28.0);
+    let esc = Rect { x: s.x + s.w - t.bl(20.0) - esc_w, y, w: esc_w, h };
+    let (f, gap, left) = (button_font(t), t.bl(12.0), s.x + t.bl(32.0));
+    let uw = lw(&f, UPDATES, t) + t.bl(32.0) + count.map_or(0, |n| badge_w(t, n) + t.bl(8.0));
+    let aw = lw(&f, ADD, t) + t.bl(36.0);
+    let with = esc.x - gap - uw - gap - aw;
+    let (add_x, updates) = if with - t.bl(16.0) - left >= t.bl(240.0) {
+        (with, Some(Rect { x: esc.x - gap - uw, y, w: uw, h }))
+    } else {
+        (esc.x - gap - aw, None)
+    };
+    let add = Rect { x: add_x, y, w: aw, h };
+    let text = Rect { x: left, y: s.y, w: (add.x - t.bl(16.0) - left).max(1), h: s.h };
+    Head { text, add, updates, esc }
+}
+
+/// The empty search's place in the body: its line, the link, the hint under it (logical px).
+pub fn empty(g: &Geo, t: &Theme) -> (Rect, Rect, Rect) {
+    let b = g.body;
+    let line = Rect { x: b.x, y: b.y + b.h / 4, w: b.w, h: t.bl(44.0) };
+    let w = (lw(&button_font(t), ADD_SEARCH, t) + t.bl(48.0)).min(b.w);
+    let link = Rect { x: b.x + (b.w - w) / 2, y: line.y + line.h + t.bl(20.0), w, h: t.bl(52.0) };
+    let hint = Rect { x: b.x, y: link.y + link.h + t.bl(12.0), w: b.w, h: t.bl(28.0) };
+    (line, link, hint)
 }
 
 /// Where each row's heading and tiles lie in the scrolled content (y from the body's top, before scrolling), and

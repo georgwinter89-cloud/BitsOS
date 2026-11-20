@@ -16,6 +16,7 @@ pub mod apic;
 pub mod cpu;
 pub mod dma;
 pub mod dma_buf;
+pub mod freq;
 pub mod entry;
 pub mod gdt;
 pub mod idt;
@@ -30,6 +31,7 @@ pub mod pat;
 pub mod percpu;
 mod percpu_free;
 pub mod portio;
+pub mod sampling;
 #[cfg(bitsos_fd_measure)]
 pub mod prof;
 pub mod serial;

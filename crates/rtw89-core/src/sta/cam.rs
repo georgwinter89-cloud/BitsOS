@@ -24,7 +24,7 @@ pub struct CamSizes {
 }
 
 impl CamSizes {
-    /// rtw8852b_chip_info (linux-6.6/drivers/net/wireless/realtek/rtw89/rtw8852b.c:2508; acam_num at :2555)
+    /// rtw8852b_chip_info (linux-7.3.1/drivers/net/wireless/realtek/rtw89/rtw8852b.c:932; acam_num at :1014)
     pub const RTL8852B: CamSizes = CamSizes {
         addr: 128,
         bssid: 10,

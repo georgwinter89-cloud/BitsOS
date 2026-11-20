@@ -1,4 +1,4 @@
-//! The jbd2 on-disk format (linux-6.6/include/linux/jbd2.h): big-endian headers, the journal superblock,
+//! The jbd2 on-disk format (linux-7.3.1/include/linux/jbd2.h): big-endian headers, the journal superblock,
 //! descriptor tags, revoke records, commit blocks and their crc32c checksums (v2/v3). Everything here is
 //! pure: building and checking blocks; `journal` writes them and `recovery` reads them back.
 

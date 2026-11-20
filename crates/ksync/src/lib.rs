@@ -48,7 +48,7 @@ mod wait;
 pub use class::LockClass;
 pub use cpu::{IrqState, PreemptGuard, heap_ready, irq_lock_depth, preempt_count, prepare_cpus, put_irq_state, take_irq_state};
 pub use lockdep::{LockKind, Violation, ViolationKind};
-pub use mutex::{Mutex, MutexGuard};
+pub use mutex::{AsClass, Mutex, MutexGuard};
 pub use spin::{IrqSpinLock, IrqSpinLockGuard, ReadGuard, RwSpinLock, SpinLock, SpinLockGuard, WriteGuard};
 pub use raw::set_slow_wait_hook;
 pub use spare::Spare;
@@ -92,14 +92,26 @@ pub trait SchedHooks: Sync {
     fn rank(&self, _t: ThreadRef) -> u8 {
         0
     }
-    /// INT-W7 (MM-tlb2 CR 1 to SC): optimistic spinning for a held `Mutex` (linux-6.6/kernel/locking/mutex.c:441
-    /// `mutex_spin_on_owner`, :517 `mutex_optimistic_spin`). Spins while the thread in `owner` runs on a CPU,
+    /// INT-W7 (MM-tlb2 CR 1 to SC): optimistic spinning for a held `Mutex` (linux-7.3.1/kernel/locking/mutex.c:385
+    /// `mutex_spin_on_owner`, :474 `mutex_optimistic_spin`). Spins while the thread in `owner` runs on a CPU,
     /// calling `take` (one try to acquire) between checks; stops when the owner sleeps or is off its CPU, the
     /// caller is asked to reschedule, or `deadline_ns` passes (B4). Returns whether `take` succeeded. The
     /// default never spins (the caller then sleeps).
     fn spin_on_owner(&self, _owner: &core::sync::atomic::AtomicU64, _deadline_ns: u64, _take: &dyn Fn() -> bool) -> bool {
         false
     }
+    /// Whether a thread sleeps for a `Mutex` the calling thread holds (the priority-passing book knows). The
+    /// default knows of none.
+    fn holds_waited(&self) -> bool {
+        false
+    }
+}
+
+/// Whether another thread sleeps for a `Mutex` the calling thread holds. For the heap's patience: a holder
+/// others wait for must not spend seconds in reclaim rounds (Mini-PC 12.11.2026: `mm.as` held 0.7 s). Takes the
+/// scheduler's priority-passing lock when anyone waits at all: slow paths only, no spin lock held.
+pub fn holds_waited_lock() -> bool {
+    hooks().is_some_and(|h| h.holds_waited())
 }
 
 static HOOKS_SET: AtomicBool = AtomicBool::new(false);

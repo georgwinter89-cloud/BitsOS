@@ -14,7 +14,7 @@ use vfs::{Cred, FdTable, FsFreeze, MountNs};
 const SEC: u64 = 1_000_000_000;
 const CASES: &str = include_str!("../../../host/tests/fs/cases.txt");
 const USER: Cred = Cred { uid: 1000, gid: 1000 };
-const SUBJECT: policy::Subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 1000 };
+const SUBJECT: policy::Subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 1000, tree: 0 };
 
 static RUN: AtomicU32 = AtomicU32::new(0);
 
@@ -157,7 +157,7 @@ ktest!("fs.vfs.tmpfs_budget", Safe, tmpfs_budget);
 fn linux_cases() -> TestResult {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/fs-cases").is_err() {
-        return ktest::fail("/bin/fs-cases is not in this image (xtask change request in plan/notes/fs-FS-1.md)");
+        return ktest::fail("/bin/fs-cases is not in this image (FS-1's xtask change request: host/xtask/src/image.rs builds host/tests/fs/progs)");
     }
     let n = RUN.fetch_add(1, Ordering::Relaxed);
     // FS-13: the cases run on a plain tmpfs of their own: /tmp is nodev on V2 (AB-7c) but was not where CachyOS

@@ -22,7 +22,7 @@ use uapi::errno::*;
 // ---------- bundles ----------
 
 /// A kernel-like ELF with the BitsOS signature in its rodata; `tag` makes kernels differ.
-fn kernel(tag: u8) -> Vec<u8> {
+pub(super) fn kernel(tag: u8) -> Vec<u8> {
     let text: Vec<u8> = (0..6000u32).map(|i| (i as u8).wrapping_mul(7) ^ tag).collect();
     let mut rodata = b"....BitsOS V2 kernel: entry\n....".to_vec();
     rodata.push(tag);
@@ -37,7 +37,7 @@ fn kernel(tag: u8) -> Vec<u8> {
     )
 }
 
-fn newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
+pub(super) fn newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     let put = |name: &str, body: &[u8], mode: u32, out: &mut Vec<u8>| {
         let h = format!(
@@ -74,8 +74,57 @@ fn newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
-fn initrd(tag: u8) -> Vec<u8> {
+pub(super) fn initrd(tag: u8) -> Vec<u8> {
     newc(&[("bin/init", &[tag; 300]), ("etc/motd", b"hello\n")])
+}
+
+/// GP-GUARD: where the internal disks are off limits, a kernel without the disk guard's mark in a loaded segment
+/// is refused for install and for Reload; with the mark, or on any other machine, it passes as before.
+#[test]
+fn a_kernel_older_than_the_disk_guard_is_refused_where_disks_are_off_limits() {
+    use gp_platform::disk_rule::marker::KERNEL_MARK;
+    let old = kernel(1);
+    let mut rodata = b"....BitsOS V2 kernel: entry\n....".to_vec();
+    rodata.extend_from_slice(KERNEL_MARK);
+    let text = vec![0x90u8; 6000];
+    let guarded = elf(
+        &[Seg { vaddr: KERNEL_BASE, flags: 5, data: &text, memsz: 6000 }, Seg { vaddr: KERNEL_BASE + 0x2000, flags: 4, data: &rodata, memsz: rodata.len() as u64 }],
+        KERNEL_BASE + 0x10,
+    );
+    check::kernel(&old).unwrap();
+    check::kernel(&guarded).unwrap();
+    // The Mini-PC, QEMU: nothing is asked.
+    assert_eq!(check::disk_guard(&old, false), Ok(()));
+    assert_eq!(check::disk_guard(&guarded, false), Ok(()));
+    // The Gaming-PC profile.
+    assert_eq!(check::disk_guard(&guarded, true), Ok(()));
+    let why = check::disk_guard(&old, true).unwrap_err();
+    assert!(why.starts_with("KERNEL: older than the disk guard") && why.contains("nvme_bind=off"), "{why}");
+    // The mark appended to the file, outside every loaded segment, is not the kernel's own.
+    let mut tail = old.clone();
+    tail.extend_from_slice(KERNEL_MARK);
+    assert!(check::disk_guard(&tail, true).is_err());
+    assert!(check::disk_guard(&tail[..40], true).is_err(), "not an ELF: refused, never a panic");
+    // Reload's rule over what its stream found.
+    use crate::stage::reload_guard;
+    assert_eq!(reload_guard(false, false), Ok(()));
+    assert_eq!(reload_guard(true, false), Ok(()));
+    assert_eq!(reload_guard(true, true), Ok(()));
+    assert_eq!(reload_guard(false, true), Err(check::UNGUARDED));
+}
+
+/// GP-GUARD: install_kernel's `config` argument is the one way a remote client replaces CONFIG.TXT; it cannot add
+/// or change a tier line of the Gaming-PC profile.
+#[test]
+fn install_config_cannot_add_a_tier_line() {
+    let live: &[u8] = b"token=t\ngp_stick=on\n";
+    assert!(check::config(Some(live), b"token=t\ngp_stick=on\nloglevel=info\n").is_ok());
+    assert!(check::config(Some(live), b"token=t\n").is_ok(), "dropping the tier is the safe side");
+    for new in [&b"token=t\ngp_stick=on\ngp_net=on\n"[..], b"token=t\ngp_stick=on\nGP_NET = on\n", b"token=t\ngp_stick=off\n"] {
+        let why = check::config(Some(live), new).unwrap_err();
+        assert!(why.contains("gp_net=") || why.contains("gp_stick="), "{why}");
+    }
+    assert!(check::config(None, b"gp_net=on\n").unwrap_err().contains("gp_net="));
 }
 
 #[test]
@@ -165,7 +214,7 @@ fn config_checks() {
     let old = b"token=abc\nloglevel=info\nstick_write=off\n";
     check::config(Some(old), b"token=abc\nloglevel=debug\nstick_write=off\n").unwrap();
     check::config(Some(old), b"token=other\n").unwrap(); // dropping a guarded line is allowed
-    check::config(Some(old), b"token=abc\nwlan=on\n").unwrap(); // wlan is free (R8d, 21.10.)
+    check::config(Some(old), b"token=abc\ntz=UTC\n").unwrap(); // other keys are free
     assert!(check::config(Some(old), b"token=abc\nstick_write=on\n").is_err());
     assert!(check::config(Some(old), b"token=abc\nstick_write=off\nstick_write=on\n").is_err());
     assert!(check::config(Some(old), b"token=abc\nnvme_write=on\n").is_err());
@@ -440,30 +489,30 @@ fn which_boots_confirm_themselves() {
 // ---------- the model stick ----------
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-struct Dir {
-    files: BTreeMap<String, Vec<u8>>,
+pub(super) struct Dir {
+    pub(super) files: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-struct State {
-    gens: BTreeMap<u32, Dir>,
-    pin: Option<u32>,
-    config: Option<Vec<u8>>,
+pub(super) struct State {
+    pub(super) gens: BTreeMap<u32, Dir>,
+    pub(super) pin: Option<u32>,
+    pub(super) config: Option<Vec<u8>>,
 }
 
 /// A stick in memory. `cut`: the stick stops answering after this many changes (a pulled stick, a power cut);
 /// the change at the cut is half done (a file write leaves its first half, a removal its first file).
-struct Model {
-    st: RefCell<State>,
+pub(super) struct Model {
+    pub(super) st: RefCell<State>,
     changes: RefCell<usize>,
-    cut: Option<usize>,
+    pub(super) cut: Option<usize>,
     flip_read: bool,
     cluster: u64,
     free: u64,
 }
 
 impl Model {
-    fn new(s: State) -> Model {
+    pub(super) fn new(s: State) -> Model {
         Model { st: RefCell::new(s), changes: RefCell::new(0), cut: None, flip_read: false, cluster: 4096, free: 1 << 30 }
     }
     /// Ok(true) = do it, Ok(false) = do half of it and fail, Err = the stick is gone.
@@ -601,11 +650,11 @@ impl Stick for Model {
     }
 }
 
-fn gen_dir(files: &[(&str, &[u8])]) -> Dir {
+pub(super) fn gen_dir(files: &[(&str, &[u8])]) -> Dir {
     Dir { files: files.iter().map(|(n, b)| (n.to_string(), b.to_vec())).collect() }
 }
 
-fn stick_with(gens: &[(u32, &str, u8)]) -> State {
+pub(super) fn stick_with(gens: &[(u32, &str, u8)]) -> State {
     let mut s = State { config: Some(b"token=t\n".to_vec()), ..State::default() };
     for &(n, marks, tag) in gens {
         let (k, i) = (kernel(tag), initrd(tag));
@@ -622,7 +671,7 @@ fn stick_with(gens: &[(u32, &str, u8)]) -> State {
 
 /// bitsboot on a stick state: its marker rule and its file checks (a generation whose files fail is "bad" and
 /// the rule is asked again, as `boot/bitsboot/src/load.rs` loops). Returns the started generation and its files.
-fn boot(s: &State) -> Option<(u32, &'static str, Vec<u8>, Vec<u8>)> {
+pub(super) fn boot(s: &State) -> Option<(u32, &'static str, Vec<u8>, Vec<u8>)> {
     use bitsboot_pure::gens::{Choice, GenDir, Pin};
     let dirs: Vec<GenDir> = s
         .gens

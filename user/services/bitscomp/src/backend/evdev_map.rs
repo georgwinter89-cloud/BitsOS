@@ -1,5 +1,5 @@
 //! Pure part of the evdev reader: what a device is (from its EVIOCGBIT/EVIOCGABS answers) and how its raw
-//! `input_event`s become bitscomp's `InputEvent`s (linux-6.6/include/uapi/linux/input-event-codes.h,
+//! `input_event`s become bitscomp's `InputEvent`s (linux-7.3.1/include/uapi/linux/input-event-codes.h,
 //! Documentation/input/event-codes.rst). Host-tested in `evdev_tests.rs`; the ioctls and reads are in `evdev`.
 
 use std::collections::BTreeSet;
@@ -92,7 +92,7 @@ impl Caps {
     }
 }
 
-/// PK-L1c, after linux-6.6/drivers/input/joydev.c `joydev_match`: a pad has BTN_SOUTH or a button of the gamepad
+/// PK-L1c, after linux-7.3.1/drivers/input/joydev.c:897 `joydev_match`: a pad has BTN_SOUTH or a button of the gamepad
 /// block (BTN_GAMEPAD..BTN_THUMBR), or one of the joystick block (BTN_JOYSTICK..BTN_DEAD) with X/Y axes, a hat, or
 /// joydev's wheel or throttle axis (racing wheels, flight sticks; joydev also takes bare axes, but without buttons
 /// there is nothing to press). Touchpads (BTN_TOUCH) and tablets (BTN_DIGI: joydev tests that one bit) are not.
@@ -111,7 +111,7 @@ pub fn codes(keys: &[u8]) -> Vec<u16> {
     (0..=KEY_MAX).filter(|&c| bit(keys, c)).collect()
 }
 
-/// linux-6.6/include/uapi/linux/input.h BUS_VIRTUAL: uinput's default, virtio-input's, and V2's MCP devices.
+/// linux-7.3.1/include/uapi/linux/input.h:259 BUS_VIRTUAL: uinput's default, virtio-input's, and V2's MCP devices.
 pub const BUS_VIRTUAL: u16 = 0x06;
 
 /// MC-9b (R8c): whether a device's events can be real keys and clicks. MCP's injected keyboard and pointer

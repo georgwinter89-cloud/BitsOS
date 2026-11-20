@@ -9,8 +9,8 @@ RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/mm-40-tlb-smp}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 ROUNDS="${MM_TLB_ROUNDS:-2}"
-# Not the reclaim tests (for small RAM: 60-reclaim.sh, the 2G gate); give_up_device leaves its own unconfirmed shootdown (plain gate).
-TESTS="mm.,-mm.reclaim.dirty_pressure,-mm.reclaim.mapped_exec,-mm.reclaim.pressure,-mm.tlb.give_up_device,contract.address_space,contract.frame_alloc"
+# Not the reclaim tests nor the HighAtomic load test (for small RAM: 60-reclaim.sh, the 2G gate); give_up_device leaves its own unconfirmed shootdown (plain gate).
+TESTS="mm.,-mm.reclaim.dirty_pressure,-mm.reclaim.mapped_exec,-mm.reclaim.pressure,-mm.frames.highatomic.load,-mm.tlb.give_up_device,contract.address_space,contract.frame_alloc"
 fail=0
 
 run() { # $1 = name, $2.. = extra QEMU arguments

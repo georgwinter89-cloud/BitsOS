@@ -1,5 +1,5 @@
 //! Small CPU images for everything bitscomp draws itself: chrome, headers, the circle menu, the start page. Pixels
-//! are premultiplied ARGB (pixman's a8r8g8b8) at output resolution, so they map 1:1. Shapes are antialiased by
+//! are premultiplied ARGB (a8r8g8b8, what the GLES renderer uploads) at output resolution, so they map 1:1. Shapes are antialiased by
 //! coverage from a distance function per pixel (WY-5: rounded rectangles, rings, dashed arcs, lines, convex
 //! polygons); cheap enough for images that are drawn once and cached. Text comes from `text` (Exo 2 by fontdue).
 
@@ -47,6 +47,7 @@ fn cov(d: f32) -> f32 {
     (0.5 - d).clamp(0.0, 1.0)
 }
 
+#[derive(Clone)]
 pub struct Canvas {
     pub w: i32,
     pub h: i32,
@@ -116,6 +117,11 @@ impl Canvas {
         self.shade(b.x - 1.0, b.y - 1.0, b.x + b.w + 1.0, b.y + b.h + 1.0, c, |x, y| cov(rbox_dist(b, r, x, y)));
     }
 
+    /// The rows `y0..y1` of a filled rounded rectangle (a panel's foot in its own colour, its corners kept).
+    pub fn rrect_rows(&mut self, b: Box2, r: f32, y0: f32, y1: f32, c: Rgba) {
+        self.shade(b.x - 1.0, y0, b.x + b.w + 1.0, y1, c, |x, y| cov(rbox_dist(b, r, x, y)));
+    }
+
     /// `c` everywhere outside the rounded rectangle (to round off what lies below this image's corner).
     pub fn rrect_outside(&mut self, b: Box2, r: f32, c: Rgba) {
         let (w, h) = (self.w as f32, self.h as f32);
@@ -131,7 +137,7 @@ impl Canvas {
         });
     }
 
-    /// The cheap glow (theme.effects cheap): `n` lines around `b`, each one pixel further out and fainter.
+    /// The glow lines around a lit part's image: `n` lines around `b`, each one pixel further out and fainter.
     pub fn glow(&mut self, b: Box2, r: f32, n: i32, c: Rgba) {
         for i in 1..=n {
             let k = 1.0 - (i - 1) as f32 / n as f32;
@@ -167,6 +173,18 @@ impl Canvas {
             // Distance outside the dash along the circle, for a soft dash end.
             let out = if p < on { -(p.min(on - p)) } else { (p - on).min(on + off - p) };
             radial * (0.5 - out).clamp(0.0, 1.0)
+        });
+    }
+
+    /// GM-6b: a ring as `arc` without dashes, but only inside the rounded box `clip` (the sofa hero's decoration,
+    /// cut by its tile's corners as the board's `overflow: hidden`).
+    pub fn ring_in(&mut self, cx: f32, cy: f32, r: f32, width: f32, clip: Box2, clip_r: f32, c: Rgba) {
+        let e = r + width;
+        let (x0, y0) = ((cx - e - 1.0).max(clip.x - 1.0), (cy - e - 1.0).max(clip.y - 1.0));
+        let (x1, y1) = ((cx + e + 1.0).min(clip.x + clip.w + 1.0), (cy + e + 1.0).min(clip.y + clip.h + 1.0));
+        self.shade(x0, y0, x1, y1, c, |x, y| {
+            let radial = (width / 2.0 + 0.5 - ((x - cx).hypot(y - cy) - r).abs()).clamp(0.0, 1.0);
+            radial * cov(rbox_dist(clip, clip_r, x, y))
         });
     }
 
@@ -267,6 +285,8 @@ pub enum Glyph {
     Pin,
     /// PK-L1b: the top bar's "Programme" button: a grid of nine small squares.
     Programs,
+    /// C (12.11.): minimise: a short bar low in the square.
+    Minimize,
 }
 
 /// The glyph alone, over whatever `c` holds, in the square `b`.
@@ -283,6 +303,7 @@ pub fn glyph_into(c: &mut Canvas, glyph: Glyph, b: Box2, fg: Rgba) {
                 c.rrect(Box2 { x: cx - d / 2.0, y: cy - d / 2.0, w: d, h: d }, d * 0.25, fg);
             }
         }
+        Glyph::Minimize => c.line(p(0.3, 0.68), p(0.7, 0.68), th, fg),
         Glyph::Close => {
             c.line(p(0.3, 0.3), p(0.7, 0.7), th, fg);
             c.line(p(0.7, 0.3), p(0.3, 0.7), th, fg);

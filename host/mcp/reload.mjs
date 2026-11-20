@@ -24,6 +24,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connect, fnv1a64, McpError, readToken } from './mcp-call.mjs';
+import { tokenFileFor } from './token.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -38,11 +39,12 @@ for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (FLAGS.includes(a)) opts[a.slice(2)] = process.argv[++i] ?? '';
   else if (a === '--no-build') opts['no-build'] = true;
+  else if (a === '--gaming-pc') opts['gaming-pc'] = true;
   else rest.push(a);
 }
 const [host] = rest;
 if (!host || rest.length > 1 || Boolean(opts.kernel) !== Boolean(opts.initrd)) {
-  fail('usage: node reload.mjs <host[:port]> [--name n] [--no-build] [--kernel F --initrd F] [--bind A] [--port P] [--me A] [--count N] [--back-s S] [--token-file F] [--tls DIR|auto]', 2);
+  fail('usage: node reload.mjs <host[:port]> [--name n] [--no-build] [--kernel F --initrd F] [--bind A] [--port P] [--me A] [--count N] [--back-s S] [--token-file F] [--gaming-pc] [--tls DIR|auto]', 2);
 }
 const name = opts.name ?? 'reload';
 const port = Number(opts.port ?? 25410);
@@ -74,7 +76,7 @@ if (kernel.length < 64 || kernel.toString('latin1', 0, 4) !== '\x7fELF') fail(`$
 const initrdFnv = fnv1a64(initrd);
 
 let token;
-try { token = readToken(opts['token-file']); } catch (e) { fail(e.message, 2); }
+try { token = readToken(tokenFileFor(opts['token-file'], opts['gaming-pc'])); } catch (e) { fail(e.message, 2); }
 const bitsos = host.replace(/:\d+$/, '');
 
 async function localAddress(to) {  // the address this machine sends from to `to`

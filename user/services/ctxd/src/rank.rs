@@ -1,7 +1,8 @@
 //! The hybrid score of DESIGN §7.1:
 //! `S = w_v V + w_b B + w_c C + w_r R - w_x X`, weights of the present positive parts renormalised,
 //! the gate `V >= v_min or B >= b_min` first, sorting on the unclamped S, the shown score clamped to [0,1].
-//! `C` (co-use) needs the usage log of CX-3; in CX-1 it is never present, so the cold-start weights apply.
+//! `C` (co-use) and `X` (dismissals) come from the usage log (CX-3, `learn.rs`); without an anchor `C` is
+//! absent and the cold-start weights apply.
 
 use crate::config::RankCfg;
 

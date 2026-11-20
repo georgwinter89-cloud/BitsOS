@@ -9,6 +9,8 @@
 extern crate alloc;
 
 mod config;
+mod gpreport;
+mod gpmessung;
 mod earlycon;
 mod bootstack;
 mod bt_edid;
@@ -28,6 +30,7 @@ use igc as _;
 use kexec as _;
 use nvme as _;
 use platform as _;
+use rtl8126 as _;
 use rtw89 as _;
 use seccomp as _;
 use snapshots as _;
@@ -89,6 +92,9 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     hal::gdt::init();
     hal::idt::init();
     hal::serial::init();
+    // The allocator names the callers of what it counts by their stack's frame records: this stack's place.
+    let (bottom, top) = bootstack::bounds();
+    mm_core::callers::set_boot_stack(bottom, top);
 
     // SAFETY: bitsboot passes the direct-map address of the KEEP pages holding BootInfo; we read the header
     // first, then exactly `total_size` bytes. KEEP pages are never freed, so the slice lives forever.
@@ -182,7 +188,7 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
 
     stage("own page tables done");
     time::init(bi.tsc().map(|t| t.calibrated_hz).unwrap_or(0));
-    klog::event!(Info, "kernel", "start", version = env!("CARGO_PKG_VERSION"), generation = bi.generation().map(|g| g.number).unwrap_or(0), reload = bi.reload().map(|r| r.counter).unwrap_or(0), gen_reason = bi.generation().map(|g| g.reason).unwrap_or(0), gen_skipped = bi.generation().map(|g| g.skipped).unwrap_or(0), gen_flags = klog::Hex(bi.generation().map(|g| g.flags as u64).unwrap_or(0)));
+    klog::event!(Info, "kernel", "start", version = env!("CARGO_PKG_VERSION"), generation = bi.generation().map(|g| g.number).unwrap_or(0), reload = bi.reload().map(|r| r.counter).unwrap_or(0), gen_reason = bi.generation().map(|g| g.reason).unwrap_or(0), gen_skipped = bi.generation().map(|g| g.skipped).unwrap_or(0), gen_flags = klog::Hex(bi.generation().map(|g| g.flags as u64).unwrap_or(0)), bitsos_version = bitsver::NUMBER);
     // The Mini-PC has no COM1: bitsboot's own log lines reach the mirror only through klog.
     if let Some(log) = bi.loader_log() {
         for line in log.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
@@ -193,6 +199,9 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     stage("clock calibrated");
     acpi::init(&bi);
     stage("ACPI tables read");
+    // GP-GUARD: the SMBIOS names are known now; the Gaming-PC's board keeps its disk rule whatever the CONFIG
+    // record's profile= says (before the initcalls and the PCI scan read any disk, network or stick key).
+    config::guard_board();
 
     // R10: x86-64-v3 is the minimum (bitsboot checks too; this is the kernel's own line of defence).
     let missing = hal::cpu::missing_v3_features();
@@ -207,9 +216,8 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     klog::event!(Info, "mm", "frames", total_mb = st.0 / (1 << 20), free_mb = st.1 / (1 << 20), nx = features.nx, smep = features.smep, smap = features.smap, avx512 = features.avx512f);
 
     stage("clock, ACPI and interrupts done");
-    sched::cstate::configure(&config::get);
     mm::thp::configure(&config::get);
-    // DR-2 (desk change request): CONFIG drm=auto|fake|off, read before drm::boot.
+    // DR-2 (desk change request): the test-only CONFIG drm=fake, read before drm::boot.
     drm::configure(&config::get);
     sched::init();
     stage("scheduler ready");
@@ -235,6 +243,9 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
         follow::install();
         // IN-3/IN-quiet: CONFIG console_font, console_scrollback, console_log; attaches the console's log sink
         // (boot lines replayed at that level).
+        // GP-ROUND: under the Gaming-PC's profile the screen is the report page and then the shell (no GPU driver
+        // there yet: the console starts no desktop), and the profile's own short list of lines reaches the quiet screen.
+        console::set_profile_lines(gpreport::on());
         console::configure(&config::get);
         console::console().write_str("BitsOS V2 (G0 scaffold)\n", console::FG);
     }
@@ -316,16 +327,28 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     if cfg!(feature = "ktest") {
         run_ktests();
     }
-    // GX-8c: CONFIG gpu=on: the chip comes up by itself, in a bounded thread of its own; the desktop's start waits for its end.
+    // GX-8c: the chip comes up by itself at every boot, in a bounded thread of its own; the desktop's start waits for its
+    // end (no GPU: no desktop, the text console says so).
     amdgpu::hw::boot::start(&config::get);
     // Not an initcall: the init levels run before the network stack is installed above.
     mcp::set_boot_info(&bi, env!("CARGO_PKG_VERSION"));
     match mcp::start_kernel(&config::get) {
-        Ok(_running) => {} // the handle may drop; the server keeps running
-        Err(e) => klog::event!(Error, "kernel", "mcp.not_started", error = alloc::format!("{e:?}")),
+        // the handle may drop; the server keeps running
+        Ok(_running) => gpreport::note_mcp(Ok(config::get("mcp_port").and_then(|p| p.trim().parse().ok()).unwrap_or(8765))),
+        Err(e) => {
+            klog::event!(Error, "kernel", "mcp.not_started", error = alloc::format!("{e:?}"));
+            gpreport::note_mcp(Err(gpreport::mcp_down(e)));
+        }
     }
+    // GP-ROUND (plan/spec/gaming-pc.md §8): the Gaming-PC's report page, by itself after the drivers bound; nothing
+    // elsewhere.
+    gpreport::start(gpreport::Facts {
+        fb: bi.framebuffer().map(|f| (f.phys, f.size, f.width, f.height)),
+        unguarded: bi.loader_log().map(gpreport::unguarded_in).unwrap_or_default(),
+        generation: bi.generation().map(|g| (g.number, gpreport::reason_de(g.reason))),
+    });
     klog::event!(Info, "kernel", "ready");
-    // UL-2: the first user program (CONFIG init=, default /bin/init; init=off starts nothing), watched and
+    // UL-2: the first user program, /bin/init (the test key ktest_init=off starts nothing), watched and
     // restarted by userland's supervisor thread (`ul init.died` with code and fault message, back-off restarts,
     // `ul init.given_up`). The initramfs is in tmpfs since vfs::init, MCP and the network are up.
     if let Err(e) = userland::start_init(&config::get) {
@@ -337,33 +360,30 @@ extern "C" fn kernel_entry(bootinfo_virt: u64, bootinfo_phys: u64) -> ! {
     sched::exit();
 }
 
-/// CONFIG `serial=auto|on|off` (D1): `auto` (the entry's choice) = COM1 only under a hypervisor; the Mini-PC's
-/// FCH UART answers at 0x3F8 but has no connector, and its 87 us per byte stalled whole CPUs.
+/// COM1 (D1): only under a hypervisor; the Mini-PC's FCH UART answers at 0x3F8 but has no connector, and its 87 us
+/// per byte stalled whole CPUs. The test key `ktest_serial=on` uses it wherever a UART answers.
 fn configure_serial() {
-    let value = config::get("serial");
-    let mode = match value.as_deref().map(hal::serial::Mode::parse) {
-        None => hal::serial::Mode::Auto,
-        Some(Some(m)) => m,
-        Some(None) => {
-            klog::event!(Warn, "kernel", "config.bad", key = "serial", value = value.unwrap_or_default(); "want auto, on or off; keeping auto");
-            hal::serial::Mode::Auto
-        }
-    };
-    let port = hal::serial::configure(mode);
+    let test = config::get("ktest_serial").is_some_and(|v| v.trim() == "on");
+    let port = hal::serial::configure(test);
     // klog's serial sink only while something reads it (the port, or the early screen console until the
     // console takes over).
     klog::set_serial(hal::serial::has_output());
-    klog::event!(Info, "kernel", "serial", mode = mode.name(), hypervisor = hal::serial::under_hypervisor(), port = port);
+    klog::event!(Info, "kernel", "serial", test = test, hypervisor = hal::serial::under_hypervisor(), port = port);
 }
 
 fn run_ktests() -> ! {
+    // A ktest boot starts no user program: the step list (and the desktop's start, which waits for init) learn it here.
+    klog::event!(Info, "ul", "init.off"; "a ktest boot: no user program is started");
     let filter = config::get("ktest").unwrap_or_default();
     // CONFIG `ktest_hw=on`: as on the Mini-PC over MCP (QemuOnly ones belong to another run). `ktest_run=` names this
     // boot, so the tests of class Run/RunHw that belong to it run (TS-1). The class decides, never the test.
     let hw = config::get("ktest_hw").as_deref() == Some("on");
     let runs = config::get("ktest_run").unwrap_or_default();
     let hypervisor = hal::cpu::detect().hypervisor;
-    let allowed = |c: ktest::Class| c.runs_here(hypervisor, hw, &runs);
+    // GP-ROUND: on the Gaming-PC's profile the Mini-PC's own parts (class Hardware) are not there, the Gaming-PC's
+    // (class GamingPc) are; under QEMU the class rule alone decides, as before.
+    let gaming_pc = !hypervisor && gp_platform::tiers::is_gaming_pc(config::get("profile").as_deref());
+    let allowed = |c: ktest::Class| c.runs_here(hypervisor, hw, &runs) && (hypervisor || c.on_machine(gaming_pc));
     // CONFIG `ktest_nmi_check=on`: after each test, every other CPU must answer an NMI sample (desk fix/nmi).
     // INT-W28 (GX-7m CR): a canary at the boot stack's low end; a test that reaches it is named after it ran.
     // CONFIG `ktest_stack=<KiB>`: each test's stack use measured against that budget (bootstack's module doc).
@@ -376,9 +396,12 @@ fn run_ktests() -> ! {
     } else {
         ktest::run_checked(&filter, allowed, time::now_ns, bootstack::check_after)
     };
+    // What the allocator counted in the last second (`mm.report` flushes once a second) still becomes events.
+    mm_core::flush_reports();
     // RB-klog CR2: serial lines a storm left to klogd reach the log before QEMU exits (diagnostics only).
-    // SN-12 CR (INT-W23): and a line klogd is printing on another CPU (bounded, 100 ms).
-    let _ = klog::flush_serial_settled(100_000_000);
+    // SN-12 CR (INT-W23): and the lines klogd is still printing on another CPU. Bounded at 2 s: with 100 ms a boot
+    // whose tests end early lost the tail of its log (pc/60-peer-root, boot 2, 15.11.).
+    let _ = klog::flush_serial_settled(2_000_000_000);
     hal::panic::qemu_exit(if sum.failed == 0 { hal::panic::EXIT_PASS } else { hal::panic::EXIT_FAIL });
     hal::panic::halt_forever()
 }
@@ -463,7 +486,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             hal::panic::qemu_exit(hal::panic::EXIT_PANIC);
             stop()
         }
-        Err(_) => hal::panic::halt_forever(),
+        Err(_) => {
+            // CRASHDISK: its message goes into the record (lock-free slots), not onto the screen.
+            kexec::crash::note_again(me, info);
+            hal::panic::halt_forever()
+        }
     }
     // RB-2: the other CPUs stop by NMI first, each saving its registers and backtrace, while the heap still
     // works for them (in emergency mode their next allocation would fail and panic instead).

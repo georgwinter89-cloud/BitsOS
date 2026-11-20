@@ -14,11 +14,15 @@ pub const NAMES: [&str; 6] =
     ["settings_list", "settings_describe", "settings_get", "settings_set", "settings_undo", "settings_history"];
 
 const CONFIRM: &str = "Keys of safety class confirm need \"confirmed\": true; set it only after Georg agreed to \
-this change in the conversation.";
+this change in the conversation. A secret (a provider's key) and the removal of an AI provider from ai.providers \
+are not changed through this tool, confirmed or not (not_confirmer): Georg does that himself on the settings \
+page \"KI\" or at the root console.";
 
 pub fn tools() -> Vec<Tool> {
     let t = |name: &str, desc: String, schema: &str, safety| {
-        Tool::new(name, &desc, schema, safety).expect("built-in tool schemas are JSON")
+        // MC-L: all six are also offered on the local tools socket. A local program reaches the same ops on
+        // settingsd's own socket anyway, and every rule (confirm, secrets as ***, refused_r8) is applied here.
+        Tool::new(name, &desc, schema, safety).expect("built-in tool schemas are JSON").local()
     };
     vec![
         t(
@@ -150,13 +154,21 @@ pub fn request(name: &str, args: &Json) -> Result<SJson, String> {
     })
 }
 
-/// Runs one call against the registry and turns settingsd's answer into the tool's answer.
-pub fn call(shared: &Shared, name: &str, args: &Json) -> Reply {
-    let req = match request(name, args) {
+/// Runs one call against the registry and turns settingsd's answer into the tool's answer. `local`: the call
+/// came from a program on this machine through the kernel's local tools socket (`mcpreg::Call::caller`), not
+/// from the network side; the journal says so (source `local` instead of `mcp`; MC-L change request 5b). The
+/// rules are the same for both: neither is a program settingsd can tell, so neither owns a secret.
+pub fn call(shared: &Shared, name: &str, args: &Json, local: bool) -> Reply {
+    let mut req = match request(name, args) {
         Ok(r) => r,
         Err(e) => return Reply::bad_argument(e),
     };
-    let out = match proto::handle(shared, &req.to_text()) {
+    if let (true, SJson::Obj(fields)) = (local, &mut req) {
+        for (_, v) in fields.iter_mut().filter(|(k, _)| k == "source") {
+            *v = SJson::from("local");
+        }
+    }
+    let out = match proto::handle(shared, &crate::peer::INSIDE, &req.to_text()) {
         PReply::Line(l) => l,
         PReply::Watch(_) => return Reply::error("internal: a watch is not a tool"),
     };

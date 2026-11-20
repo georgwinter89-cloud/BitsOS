@@ -88,7 +88,7 @@ fn node() -> TestResult {
     use vfs::inode::Cred;
     use vfs::ops::Ctx;
     let ns = vfs::root_ns();
-    let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0 };
+    let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0, tree: 0 };
     let root = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 0, gid: 0 }, umask: 0o022, subject };
     let user = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { uid: 1000, ..subject } };
     kassert!(user.open(None, wire::NODE.as_bytes(), O_RDWR, 0).err() == Some(EACCES), "uid 1000 opened the gate");

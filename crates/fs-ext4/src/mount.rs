@@ -34,7 +34,7 @@ impl Place {
 static BUSY: SpinLock<Vec<(Place, Option<Weak<Volume>>)>> = SpinLock::named("ext4.busy", Vec::new());
 
 /// Claims `p` for a new mount; EBUSY when a mounted (or mounting) volume uses it. Linux refuses a second
-/// writable claim of a block device too (`bdev_open_by_dev` with the holder, linux-6.6/block/bdev.c); V2
+/// writable claim of a block device too (`bdev_file_open_by_dev` with the holder, linux-7.3.1/block/bdev.c:1079); V2
 /// refuses any second mount, read-only included, instead of sharing the super block.
 fn claim(p: Place) -> Result<(), i64> {
     let mut b = BUSY.lock();

@@ -383,19 +383,35 @@ fn check_spattern(name: &str, start: u64, v: &[u8], xor: u8) -> TestResult {
 }
 
 /// Waits until USB disks stopped appearing (block registry quiet for 2 s, at least one USB disk; 40 s at most).
-fn usb_disks() -> Vec<Arc<Disk>> {
-    let end = now() + 40_000 * MS;
+pub(crate) fn usb_disks() -> Vec<Arc<Disk>> {
+    usb_disks_for(policy::stick_identity().is_some_and(|s| s.nvme))
+}
+
+/// GP-R3: an NVMe boot has no stick to wait for: it waits until the USB host controllers and usb-msd's scans say
+/// done and the list stood still for Linux's settle time (`usb_busy::done_waiting`), at most 15 s (xhci's own
+/// settle bound, ktests_isoch.rs), instead of the 40 s a USB boot may need for its stick (the MCP deadline).
+fn usb_disks_for(nvme_boot: bool) -> Vec<Arc<Disk>> {
+    let t0 = now();
+    let end = t0 + (if nvme_boot { 15_000 } else { 40_000 }) * MS;
     let mut last = crate::generation();
     let mut quiet = now();
+    let mut settled = false;
     while now() < end {
         sched::sleep_ns(50 * MS);
         let g = crate::generation();
-        if g != last {
+        let busy = crate::usb_busy::usb_busy();
+        if g != last || (nvme_boot && busy == Some(true)) {
             last = g;
             quiet = now();
-        } else if now() - quiet >= 2000 * MS && crate::disks().iter().any(|d| d.kind() == DiskKind::Usb) {
+        }
+        let n = crate::disks().iter().filter(|d| d.kind() == DiskKind::Usb).count();
+        if crate::usb_busy::done_waiting(nvme_boot, now() - quiet, busy, n) {
+            settled = true;
             break;
         }
+    }
+    if nvme_boot {
+        klog::event!(Info, "block", "ktest.usb_wait", boot = "nvme", waited_ms = (now() - t0) / MS, settled = settled);
     }
     crate::disks().into_iter().filter(|d| d.kind() == DiskKind::Usb).collect()
 }
@@ -411,12 +427,17 @@ fn scenario_disks() -> Vec<(Arc<Disk>, Header)> {
 }
 
 fn usb_stick() -> TestResult {
-    let disks = usb_disks();
-    if disks.is_empty() {
-        return ktest::fail("no USB disk registered");
-    }
     if !crate::configured() {
         return Err("block::configure never ran (vfs-sys's block.boot_facts initcall)".into());
+    }
+    // GP-R2: the test follows the boot medium the loader reported. Booted from the NVMe (the Mini-PC since the
+    // Lexar move, `nvme_boot`), no USB disk is the stick: each one there must refuse writes as a plain USB disk.
+    if policy::stick_identity().is_some_and(|s| s.nvme) {
+        return usb_disks_beside_an_nvme_boot(&usb_disks_for(true));
+    }
+    let disks = usb_disks();
+    if disks.is_empty() {
+        return ktest::fail("no USB disk registered (the loader reported a boot from USB)");
     }
     let sticks: Vec<_> = disks.iter().filter(|d| d.stick() == StickMatch::Yes).collect();
     let ident = policy::stick_identity();
@@ -447,6 +468,22 @@ fn usb_stick() -> TestResult {
     let rule = policy::decide(DiskKind::Usb, false, &s.scan().verdict(), s.stick(), sw);
     kassert!(rule == Err(Refusal::BootStick), "{}: the stick rule says {rule:?}", s.name());
     kassert!(crate::DiskDevice(s.clone()).info().read_only);
+    Ok(())
+}
+
+/// Booted from the NVMe: no USB disk is taken for the stick, and each one is guarded by the USB rule, not the
+/// stick's. Without a USB disk there is nothing to check, and the test says so in its event.
+fn usb_disks_beside_an_nvme_boot(disks: &[Arc<Disk>]) -> TestResult {
+    let sw = policy::switches();
+    klog::event!(Info, "block", "ktest.stick", boot = "nvme", usb_disks = disks.len();
+        "{}", if disks.is_empty() { "no USB disk on this boot: the boot medium is the NVMe" } else { "the boot medium is the NVMe: the USB disks are no stick" });
+    for d in disks {
+        kassert!(d.stick() != StickMatch::Yes, "{}: matches the boot volume's block 0 on an NVMe boot", d.name());
+        if !sw.usb_msd_write {
+            kassert!(d.write_policy().is_err(), "{}: takes writes with usb_msd_write off", d.name());
+            kassert!(crate::DiskDevice(d.clone()).info().read_only, "{}: not read-only", d.name());
+        }
+    }
     Ok(())
 }
 

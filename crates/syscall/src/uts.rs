@@ -1,4 +1,4 @@
-//! AB-7b: the host and domain name (linux-6.6/kernel/sys.c `sethostname` :1343, `setdomainname` :1395,
+//! AB-7b: the host and domain name (linux-7.3.1/kernel/sys.c `sethostname` :1419, `setdomainname` :1473,
 //! kernel/utsname_sysctl.c): read by uname(2) and `/proc/sys/kernel/{hostname,domainname}`, changed by root
 //! through the two calls or those files. SX-2: the pair is the calling process's UTS namespace's
 //! (`proc::ns::misc::UtsNs`; kernel threads and the boot use the initial one).

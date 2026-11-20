@@ -126,14 +126,22 @@ fn auto(list: &[Arc<Hda>]) -> Option<Endpoint> {
     pick(&list[i], port).map(|o| endpoint(&list[i], port, o))
 }
 
+fn resolve_in(list: &[Arc<Hda>], t: &Target) -> Option<Endpoint> {
+    match t {
+        Target::Auto => auto(list),
+        Target::Prefer(port) => list.iter().find_map(|d| pick(d, *port).map(|o| endpoint(d, *port, o))).or_else(|| auto(list)),
+        Target::Fixed { dev, port } => list.iter().find(|d| d.ctrl.name() == dev).and_then(|d| pick(d, *port).map(|o| endpoint(d, *port, o))),
+    }
+}
+
+/// `HdaBackend`'s pick now, without a back end (registers no plug callback): the report page's sound line.
+pub(crate) fn resolve_now(t: &Target) -> Option<Endpoint> {
+    resolve_in(&hda::controllers(), t)
+}
+
 impl Backend for HdaBackend {
     fn resolve(&mut self, t: &Target) -> Option<Endpoint> {
-        let list = self.controllers();
-        match t {
-            Target::Auto => auto(&list),
-            Target::Prefer(port) => list.iter().find_map(|d| pick(d, *port).map(|o| endpoint(d, *port, o))).or_else(|| auto(&list)),
-            Target::Fixed { dev, port } => list.iter().find(|d| d.ctrl.name() == dev).and_then(|d| pick(d, *port).map(|o| endpoint(d, *port, o))),
-        }
+        resolve_in(&self.controllers(), t)
     }
 
     fn endpoints(&mut self) -> Vec<Endpoint> {

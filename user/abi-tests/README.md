@@ -18,7 +18,7 @@ Rules for a program (so a difference always means a kernel difference):
 - clean up what it creates (files in `/tmp` named with the pid);
 - keep stdin small (below 32 KiB).
 
-One deliberate exception: `abi-pfread bench` (PF-1, the read-path benchmark for the desk; plan/notes/fs-PF-1.md)
+One deliberate exception: `abi-pfread bench` (PF-1, the read-path benchmark for the desk; plan/guides/read-path-measurements.md)
 prints times, cycles and rates. Only its deterministic `check` mode has a line in `cases.txt`; never add `bench`
 (or `clean`) there.
 

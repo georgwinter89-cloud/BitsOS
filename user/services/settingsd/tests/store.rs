@@ -51,7 +51,7 @@ fn values_survive_a_restart_and_hand_edits_are_read() {
         r#"{"key":"context.depth","schema":{"type":"int","min":0,"max":9},"default":1,"text":{"de":"Tiefe","en":"Depth"}}"#,
         "ctxd",
     );
-    r.register("ctxd", vec![ctx]).unwrap();
+    r.register("ctxd", vec![ctx], &prog("ctxd")).unwrap();
     assert_eq!(value(&r, "context.depth"), Json::Int(3));
 }
 
@@ -100,32 +100,32 @@ fn secrets_and_confirm() {
     let env = Env::new("secret", true);
     let (mut r, _) = env.open();
     let k = reg_def(
-        r#"{"key":"claude.api_key","schema":{"type":"text","max_bytes":200},"default":"","text":{"de":"API-Schlüssel","en":"API key"},"safety":"secret"}"#,
-        "claude",
+        r#"{"key":"ai.provider.t.key","schema":{"type":"text","max_bytes":200},"default":"","text":{"de":"API-Schlüssel","en":"API key"},"safety":"secret"}"#,
+        "assist",
     );
     let c = reg_def(
-        r#"{"key":"claude.allow_run","schema":{"type":"bool"},"default":false,"text":{"de":"Darf Programme starten","en":"May run programs"},"safety":"confirm"}"#,
-        "claude",
+        r#"{"key":"ai.provider.t.allow_run","schema":{"type":"bool"},"default":false,"text":{"de":"Darf Programme starten","en":"May run programs"},"safety":"confirm"}"#,
+        "assist",
     );
-    r.register("claude", vec![k, c]).unwrap();
-    let a = r.set("claude.api_key", &s("sk-very-secret"), &WHO).unwrap();
+    r.register("assist", vec![k, c], &prog("assist")).unwrap();
+    let a = r.set("ai.provider.t.key", &s("sk-very-secret"), &WHO).unwrap();
     assert_eq!(a.get("new"), Some(&s("***")));
-    assert_eq!(value(&r, "claude.api_key"), s("***"));
-    assert_eq!(r.get("claude.api_key", Some("claude")).unwrap().get("value"), Some(&s("sk-very-secret")));
+    assert_eq!(value(&r, "ai.provider.t.key"), s("***"));
+    assert_eq!(r.get("ai.provider.t.key", Some("assist"), &prog("assist")).unwrap().get("value"), Some(&s("sk-very-secret")));
     assert_eq!(entries(&r, 1)[0].get("new"), Some(&s("***")));
     assert!(!env.stick_file("settings/journal.log").contains("very-secret"));
     assert_eq!(r.undo(1, &WHO).unwrap_err().code, "not_undoable");
-    assert_eq!(r.set("claude.allow_run", &Json::Bool(true), &WHO).unwrap_err().code, "needs_confirm");
-    let yes = Who { source: "test", confirmed: true };
-    r.set("claude.allow_run", &Json::Bool(true), &yes).unwrap();
+    assert_eq!(r.set("ai.provider.t.allow_run", &Json::Bool(true), &WHO).unwrap_err().code, "needs_confirm");
+    let yes = Who { source: "test", confirmed: true, asker: None };
+    r.set("ai.provider.t.allow_run", &Json::Bool(true), &yes).unwrap();
     // An undo is a change too: Georg's confirmed change is not reverted without a confirmation.
     assert_eq!(r.undo(1, &WHO).unwrap_err().code, "needs_confirm");
-    assert_eq!(value(&r, "claude.allow_run"), Json::Bool(true));
+    assert_eq!(value(&r, "ai.provider.t.allow_run"), Json::Bool(true));
     r.undo(1, &yes).unwrap();
-    assert_eq!(value(&r, "claude.allow_run"), Json::Bool(false));
+    assert_eq!(value(&r, "ai.provider.t.allow_run"), Json::Bool(false));
     // Secret-class values are kept in clear in the group file (like wlan_psk in CONFIG.TXT): the stick is
     // Georg's; only the journal, history and answers hide them.
-    assert!(env.stick_file("settings/claude.toml").contains("sk-very-secret"));
+    assert!(env.stick_file("settings/ai.toml").contains("sk-very-secret"));
 }
 
 #[test]
@@ -141,22 +141,22 @@ fn namespaces_have_owners() {
             o,
         )
     };
-    r.register("ctxd", vec![d("context.a", "ctxd").unwrap()]).unwrap();
-    assert_eq!(r.register("other", vec![d("context.b", "other").unwrap()]).unwrap_err().code, "not_owner");
-    assert_eq!(r.register("other", vec![d("kernel.x", "other").unwrap()]).unwrap_err().code, "not_owner");
-    assert_eq!(r.register("other", vec![d("settings.x", "other").unwrap()]).unwrap_err().code, "not_owner");
-    assert_eq!(r.register("bitscomp", vec![d("theme.accent", "bitscomp").unwrap()]).unwrap_err().code, "not_owner");
-    r.register("bitscomp", vec![d("theme.blur", "bitscomp").unwrap()]).unwrap();
-    assert_eq!(r.register("bitscomp", vec![d("theme.accent.x", "bitscomp").unwrap()]).unwrap_err().code, "bad_request");
+    r.register("ctxd", vec![d("context.a", "ctxd").unwrap()], &prog("ctxd")).unwrap();
+    assert_eq!(r.register("other", vec![d("context.b", "other").unwrap()], &prog("other")).unwrap_err().code, "not_owner");
+    assert_eq!(r.register("other", vec![d("kernel.x", "other").unwrap()], &prog("other")).unwrap_err().code, "not_owner");
+    assert_eq!(r.register("other", vec![d("settings.x", "other").unwrap()], &prog("other")).unwrap_err().code, "not_owner");
+    assert_eq!(r.register("bitscomp", vec![d("theme.accent", "bitscomp").unwrap()], &prog("bitscomp")).unwrap_err().code, "not_owner");
+    r.register("bitscomp", vec![d("theme.blur", "bitscomp").unwrap()], &prog("bitscomp")).unwrap();
+    assert_eq!(r.register("bitscomp", vec![d("theme.accent.x", "bitscomp").unwrap()], &prog("bitscomp")).unwrap_err().code, "bad_request");
     assert!(d("theme", "bitscomp").is_err(), "a key needs a namespace and a name");
     // PK-2: a removed package leaves nothing behind.
     r.set("context.a", &Json::Bool(true), &WHO).unwrap();
     assert!(env.stick_file("settings/context.toml").contains("context.a"));
-    r.unregister("ctxd", "context", true).unwrap();
+    r.unregister("ctxd", "context", true, &prog("ctxd")).unwrap();
     assert!(!env.paths.stick.join("settings/context.toml").exists());
     assert!(!env.stick_file("settings/journal.log").contains("context."));
-    assert_eq!(r.get("context.a", None).unwrap_err().code, "unknown_key");
-    r.register("other", vec![d("context.b", "other").unwrap()]).unwrap();
+    assert_eq!(r.get("context.a", None, &prog("ctxd")).unwrap_err().code, "unknown_key");
+    r.register("other", vec![d("context.b", "other").unwrap()], &prog("other")).unwrap();
 }
 
 #[test]
@@ -195,19 +195,12 @@ fn failing_stick_moves_to_fallback_and_restart_finds_it() {
     {
         let (mut r, _) = env.open();
         r.set("theme.radius", &Json::Int(2), &WHO).unwrap();
-        // The stick turns read-only: the settings directory cannot take a new file.
-        let dir = env.paths.stick.join("settings");
-        let mut p = std::fs::metadata(&dir).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o555);
-        std::fs::set_permissions(&dir, p).unwrap();
+        // The stick's write fails: a directory stands where the group file's `.new` goes (EISDIR for every
+        // user; a read-only mode would not stop root).
+        let blocker = env.paths.stick.join("settings/theme.toml.new");
+        std::fs::create_dir_all(&blocker).unwrap();
         let a = r.set("theme.radius", &Json::Int(4), &WHO).unwrap();
-        let mut p = std::fs::metadata(&dir).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
-        std::fs::set_permissions(&dir, p).unwrap();
-        if a.str("stored") == Some("stick") {
-            eprintln!("SKIP part: running as root, permissions do not stop writes");
-            return;
-        }
+        std::fs::remove_dir(&blocker).unwrap();
         assert_eq!(a.str("stored"), Some("fallback"));
         assert_eq!(r.status().str("place"), Some("fallback"));
     }
@@ -306,12 +299,12 @@ fn watchers_hear_registered_and_unregistered() {
     let (all, _) = r.watch("");
     let (other, _) = r.watch("theme");
     let def = reg_def(r#"{"key":"test.risky","schema":{"type":"bool"},"default":false,"text":{"de":"x","en":"x"},"safety":"confirm"}"#, "tester");
-    r.register("tester", vec![def]).unwrap();
+    r.register("tester", vec![def], &prog("tester")).unwrap();
     let l = parse(&all.try_recv().unwrap()).unwrap();
     assert_eq!((l.str("event"), l.str("owner")), (Some("registered"), Some("tester")));
     assert_eq!(l.get("keys").map(Json::to_text).as_deref(), Some(r#"["test.risky"]"#));
     assert!(other.try_recv().is_err(), "a watcher of theme hears nothing of test.*");
-    r.unregister("tester", "test", false).unwrap();
+    r.unregister("tester", "test", false, &prog("tester")).unwrap();
     let l = parse(&all.try_recv().unwrap()).unwrap();
     assert_eq!(l.str("event"), Some("unregistered"));
 }
@@ -327,8 +320,30 @@ fn undo_with_expect_seq_refuses_a_newer_change() {
     let e = r.undo_expect(1, Some(seq), &WHO).unwrap_err();
     assert_eq!(e.code, "changed_meanwhile");
     assert_eq!(value(&r, "theme.radius"), Json::Int(3), "nothing undone");
+    // The same holds for an undo of several changes: the newest one names the run.
+    assert_eq!(r.undo_expect(2, Some(seq), &WHO).unwrap_err().code, "changed_meanwhile");
+    assert_eq!((value(&r, "theme.radius"), value(&r, "theme.accent")), (Json::Int(3), s("#111111")), "nothing undone");
     let newest = entries(&r, 1)[0].get("seq").and_then(Json::as_i64).unwrap() as u64;
     let u = r.undo_expect(1, Some(newest), &WHO).unwrap();
     assert_eq!(u.str("stopped"), None);
     assert_ne!(value(&r, "theme.radius"), Json::Int(3));
+}
+
+/// Checker 12.11.: ctxd's privacy keys, registered by ctxd, are leashed like the assistant's levels: a folder
+/// an AI may see is Georg's own yes; a private folder more, or one off the list that no root touches, is not.
+#[test]
+fn the_context_services_folders_take_georgs_own_yes() {
+    let env = Env::new("ctx-leash", true);
+    let (mut r, _) = env.open();
+    let text = |k: &str| reg_def(&format!(r#"{{"key":"{k}","schema":{{"type":"text","max_bytes":8192}},"default":"","text":{{"de":"x","en":"x"}}}}"#), "ctxd");
+    r.register("ctxd", vec![text("context.roots"), text("context.private_roots")], &prog("ctxd")).unwrap();
+    assert_eq!(r.set("context.roots", &s("/d/Dokumente"), &WHO).unwrap_err().code, "needs_confirm");
+    r.set("context.private_roots", &s("/d/Privat"), &WHO).unwrap();
+    r.set("context.private_roots", &s(""), &WHO).unwrap();
+    let yes = Who { confirmed: true, ..WHO };
+    r.set("context.roots", &s("/d"), &yes).unwrap();
+    r.set("context.private_roots", &s("/d/Privat"), &WHO).unwrap();
+    assert_eq!(r.set("context.private_roots", &s(""), &WHO).unwrap_err().code, "needs_confirm", "/d/Privat would go to the AI");
+    r.set("context.roots", &s(""), &WHO).unwrap();
+    r.set("context.private_roots", &s(""), &WHO).unwrap();
 }

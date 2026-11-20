@@ -1,4 +1,4 @@
-//! Inline data, read (linux-6.6/fs/ext4/inline.c): the first 60 bytes in `i_block`, the rest in the
+//! Inline data, read (linux-7.3.1/fs/ext4/inline.c): the first 60 bytes in `i_block`, the rest in the
 //! `system.data` xattr inside the inode; a directory keeps its parent in the first 4 bytes and its entries
 //! after, without `.` and `..`. Volumes with inline_data mount read-only in FS-8a.
 

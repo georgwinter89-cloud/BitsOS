@@ -76,14 +76,25 @@ fn hat_right_twice_and_held_with_repeat() {
 #[test]
 fn select_and_start_held_500_ms_is_home_499_is_not() {
     let mut p = dragonrise();
-    assert_eq!(frame(&mut p, 0, &[key(0x128, 1), key(0x129, 1)]), vec![Press::Btn(Btn::Select), Press::Btn(Btn::Start)]);
+    // GM-6a: on the way to Home neither Select nor Start comes out (Start would open the sofa's quick menu).
+    assert!(frame(&mut p, 0, &[key(0x128, 1), key(0x129, 1)]).is_empty());
     assert_eq!(p.due(), Some(500));
     assert!(tick(&mut p, 499).is_empty(), "499 ms is not Home");
     assert_eq!(tick(&mut p, 500), vec![Press::Btn(Btn::Home)]);
     assert!(tick(&mut p, 2000).is_empty(), "one Home per hold");
     assert_eq!(p.due(), None);
+    assert!(frame(&mut p, 2100, &[key(0x128, 0), key(0x129, 0)]).is_empty(), "the chord's buttons give nothing when let go");
+    // Start alone comes out when let go; Select too.
+    assert!(frame(&mut p, 2200, &[key(0x129, 1)]).is_empty());
+    assert_eq!(frame(&mut p, 2300, &[key(0x129, 0)]), vec![Press::Btn(Btn::Start)]);
+    assert_eq!(frame(&mut p, 2400, &[key(0x128, 1), key(0x128, 0)]), vec![Press::Btn(Btn::Select)]);
+    // With sofa.home_chord aus they come out at once, as on a pad with Home, and no Home comes.
+    p.chord_off = true;
+    assert_eq!(frame(&mut p, 2500, &[key(0x129, 1)]), vec![Press::Btn(Btn::Start)]);
+    assert!(frame(&mut p, 2510, &[key(0x128, 1)]).len() == 1 && tick(&mut p, 3100).is_empty(), "no Home with the chord off");
+    frame(&mut p, 3110, &[key(0x128, 0), key(0x129, 0)]);
+    p.chord_off = false;
     // Let go at 499 ms: nothing.
-    frame(&mut p, 2100, &[key(0x128, 0), key(0x129, 0)]);
     frame(&mut p, 3000, &[key(0x129, 1)]);
     frame(&mut p, 3100, &[key(0x128, 1)]);
     assert_eq!(p.due(), Some(3600), "the hold counts from the second button");
@@ -229,4 +240,61 @@ fn a_stick_deflected_when_opened_is_not_resting() {
     let mut q = dragonrise();
     q.seed(None, None, (3, 0));
     assert_eq!(frame(&mut q, 0, &[key(0x126, 1)]), vec![RIGHT], "the hat held at open counts at the first report");
+}
+
+#[test]
+fn a_learned_mapping_is_written_and_read_back_for_its_pad_only() {
+    let keys: Vec<u16> = (0x120..=0x12b).collect();
+    // Learned in the order of the screen: A on b0, B on b3, ... (codes 0x120.. are SDL's b0..).
+    let got: Vec<(Btn, u16)> = LEARN.iter().enumerate().map(|(i, (b, _))| (*b, 0x120 + [0, 3, 1, 2, 4, 5, 8, 9][i])).collect();
+    let text = learned_text("045e:028e=a:b0", 0x0079, 0x0006, &keys, &got);
+    assert_eq!(text, "045e:028e=a:b0;0079:0006=a:b0,b:b3,x:b1,y:b2,lb:b4,rb:b5,select:b8,start:b9");
+    let m = mapping_for(0x0079, 0x0006, &keys, &text);
+    assert_eq!(m.source, Source::Learned);
+    assert_eq!((m.of(0x120), m.of(0x123), m.of(0x129)), (Some(Btn::A), Some(Btn::B), Some(Btn::Start)));
+    assert!(m.chord(), "Select and Start learned: Home is the chord");
+    // Learning again replaces the entry; another pad keeps the table.
+    let again = learned_text(&text, 0x0079, 0x0006, &keys, &[(Btn::A, 0x122)]);
+    assert_eq!(again, "045e:028e=a:b0;0079:0006=a:b2");
+    assert_eq!(mapping_for(0x1234, 0x5678, &keys, &again).source, Source::Fallback);
+}
+
+#[test]
+fn a_broken_learned_text_falls_back_and_never_panics() {
+    let keys: Vec<u16> = (0x120..=0x12b).collect();
+    for t in ["", ";;", "0079:0006", "0079:0006=", "0079:0006=a", "0079:0006=a:b99,b:x1,zz:b2", "0079:0006=a:b1,b:b1"] {
+        let m = mapping_for(0x0079, 0x0006, &keys, t);
+        if t.ends_with("b:b1") {
+            assert_eq!((m.source, m.buttons.len()), (Source::Learned, 1), "one code is one button: {t}");
+        } else {
+            assert_eq!(m.source, Source::Table, "{t}");
+        }
+    }
+    let mut s = String::from("0079:0006=");
+    for i in 0..2000 {
+        s.push_str(&format!("a:b{i},\u{fffd}:,"));
+    }
+    assert_eq!(learned(&s, 0x0079, 0x0006, &keys).map(|m| m.buttons.len()), Some(1));
+}
+
+#[test]
+fn select_and_y_is_durchblicks_key() {
+    let mut p = dragonrise();
+    // Select is held back on this pad (its Home is Select+Start): Y with it gives Help, neither Y nor Select.
+    assert!(frame(&mut p, 0, &[key(0x128, 1)]).is_empty());
+    assert_eq!(frame(&mut p, 10, &[key(0x120, 1)]), vec![Press::Btn(Btn::Help)]);
+    assert!(frame(&mut p, 20, &[key(0x120, 0), key(0x128, 0)]).is_empty(), "the chord's Select gives nothing when let go");
+    // Y alone is Y again; Select alone is Select.
+    assert_eq!(frame(&mut p, 30, &[key(0x120, 1)]), vec![Press::Btn(Btn::Y)]);
+    frame(&mut p, 40, &[key(0x120, 0)]);
+    assert_eq!(frame(&mut p, 50, &[key(0x128, 1), key(0x128, 0)]), vec![Press::Btn(Btn::Select)]);
+    // durchblick.pad = select_x, then aus.
+    p.help = Some(Btn::X);
+    frame(&mut p, 60, &[key(0x128, 1)]);
+    assert_eq!(frame(&mut p, 70, &[key(0x120, 1)]), vec![Press::Btn(Btn::Y)]);
+    assert_eq!(frame(&mut p, 80, &[key(0x123, 1)]), vec![Press::Btn(Btn::Help)]);
+    frame(&mut p, 90, &[key(0x120, 0), key(0x123, 0), key(0x128, 0)]);
+    p.help = None;
+    frame(&mut p, 100, &[key(0x128, 1)]);
+    assert_eq!(frame(&mut p, 110, &[key(0x120, 1)]), vec![Press::Btn(Btn::Y)]);
 }

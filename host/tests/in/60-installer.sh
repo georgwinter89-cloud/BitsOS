@@ -2,7 +2,8 @@
 # slow
 # The installer end to end. `xtask release-assets` packs the system (no program tree: QEMU images carry none,
 # Georg 30.10.) and builds bitsos-install with that manifest's hash; the installer writes an MBR stick image from the
-# assets with every answer as a flag; QEMU boots it to the desktop (generation 1 confirmed, the stick writable). Then
+# assets with every answer as a flag; QEMU boots it (generation 1 confirmed, the stick writable; QEMU has no desktop,
+# Georg 18.11.: it draws only on the GPU). Then
 # --update adds the release once more: generation 2 gets its one try (TRY), CONFIG.TXT and data.img stay.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
@@ -77,7 +78,7 @@ rm -rf "$RUN_DIR/host" "$IMG"
 if "$INST" "${COMMON[@]}" --image-size 4G --erase sdb-31.0G --cable-only --remote no > "$RUN_DIR/wrong-id.log" 2>&1; then
     echo "RED: the installer accepted a disk id that is not the image's"; exit 1
 fi
-"$INST" "${COMMON[@]}" --image-size 4G --erase "$ID" --cable-only --remote yes --extra-config "desktop=on;data_img_mb=64" \
+"$INST" "${COMMON[@]}" --image-size 4G --erase "$ID" --cable-only --remote yes --extra-config "data_img_mb=64" \
     > "$RUN_DIR/install.log" 2>&1 || { cat "$RUN_DIR/install.log"; echo "RED: the installer failed"; exit 1; }
 grep -q "generations: 1 OK" "$RUN_DIR/install.log" || { cat "$RUN_DIR/install.log"; echo "RED: no generation 1 OK"; exit 1; }
 TOKEN="$(cat "$RUN_DIR"/host/sticks/*/token.txt)"
@@ -87,12 +88,12 @@ TOKEN="$(cat "$RUN_DIR"/host/sticks/*/token.txt)"
 # has nothing else secret.
 if grep -q "$TOKEN" "$RUN_DIR/install.log"; then echo "RED: a batch run printed the token"; exit 1; fi
 grep -q "token is in token.txt" "$RUN_DIR/install.log" || { cat "$RUN_DIR/install.log"; echo "RED: the run does not say where the token is"; exit 1; }
-for k in nvme_write nvme_data nvme_boot stick_write usb_msd_write mcp_confirmer; do
+for k in nvme_write nvme_data nvme_boot stick_write usb_msd_write mcp_confirmer gp_net gp_stick gp_nvme; do
     if mtype -i "$IMG@@1M" ::/BITSOS2/CONFIG.TXT | grep -Eq "^\s*$k\s*="; then echo "RED: CONFIG.TXT sets $k"; exit 1; fi
 done
 mtype -i "$IMG@@1M" ::/BITSOS2/CONFIG.TXT | grep -q "^mcp=service$" || { echo "RED: no mcp=service after --remote yes"; exit 1; }
 
-boot 1 "bitsboot generation.chosen number=1 reason=NEWEST_OK" "fat stick.decided" "console desktop.up program=/bin/bitscomp" "console bootscreen.end reason=handover" "ext4 data.created"
+boot 1 "bitsboot generation.chosen number=1 reason=NEWEST_OK" "fat stick.decided" "ext4 data.created"
 on_stick BITSOS2 | grep -q "/data.img$" || { echo "RED: BitsOS made no data.img on the installed stick"; exit 1; }
 DATA_SUM="$(mtype -i "$IMG@@1M" ::/BITSOS2/data.img | sha256sum)"
 [ "$DATA_SUM" != "$(sha256sum < /dev/null)" ] || { echo "RED: data.img cannot be read from the image"; exit 1; }
@@ -103,6 +104,6 @@ grep -q "generations: 1 OK, 2 NEW" "$RUN_DIR/update.log" || { cat "$RUN_DIR/upda
 [ "$(mtype -i "$IMG@@1M" ::/BITSOS2/CONFIG.TXT | sha256sum)" = "$CFG_SUM" ] || { echo "RED: the update changed CONFIG.TXT"; exit 1; }
 [ "$(mtype -i "$IMG@@1M" ::/BITSOS2/data.img | sha256sum)" = "$DATA_SUM" ] || { echo "RED: the update changed data.img"; exit 1; }
 
-boot 2 "bitsboot generation.chosen number=2 reason=NEWEST_TRY" "fat stick.decided" "console desktop.up program=/bin/bitscomp" "created=false image=/boot/BITSOS2/data.img"
+boot 2 "bitsboot generation.chosen number=2 reason=NEWEST_TRY" "fat stick.decided" "created=false image=/boot/BITSOS2/data.img"
 on_stick BITSOS2/SYS/2 | grep -q "TRY" || { echo "RED: bitsboot wrote no TRY next to generation 2"; exit 1; }
-echo "in installer: green (release-assets packed the system, the static installer wrote an MBR/FAT32 stick image from them with flags only, it booted to the desktop with generation 1 confirmed and the stick writable; --update added generation 2, which got its one try, CONFIG.TXT and data.img unchanged)"
+echo "in installer: green (release-assets packed the system, the static installer wrote an MBR/FAT32 stick image from them with flags only, it booted with generation 1 confirmed and the stick writable; --update added generation 2, which got its one try, CONFIG.TXT and data.img unchanged)"

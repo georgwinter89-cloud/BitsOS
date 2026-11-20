@@ -1,4 +1,4 @@
-//! FIFREEZE / FITHAW (VS-2 CR5; linux-6.6/fs/ioctl.c:387-415): EPERM for uid 1000, EOPNOTSUPP on tmpfs and on a
+//! FIFREEZE / FITHAW (VS-2 CR5; linux-7.3.1/fs/ioctl.c:385-413): EPERM for uid 1000, EOPNOTSUPP on tmpfs and on a
 //! file without a file system of its own, EINVAL for a thaw nobody asked for; on an ext4 /data (FS-8c) a freeze,
 //! EBUSY for a second one, the thaw, and EINVAL for a second thaw. Rerunnable: /data is thawed before the end
 //! (also when a step fails), and the tmpfs file is removed. QEMU only: on the Mini-PC it would freeze the live /data

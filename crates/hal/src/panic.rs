@@ -315,6 +315,11 @@ pub(crate) fn walk_from(rsp: u64, rbp: u64, out: &mut [Step]) -> usize {
     live_env(|env| walk_with(env, rsp, rbp, out))
 }
 
+/// `walk_from` handing each step to `visit` (the sampling profiler, `sampling`): the same soundness rule.
+pub(crate) fn walk_visit_from(rsp: u64, rbp: u64, max: usize, visit: &mut dyn FnMut(Step)) -> usize {
+    live_env(|env| walk_visit_with(env, rsp, rbp, max, visit))
+}
+
 /// `entry_return_with` on this kernel's memory (the NMI handler's first step).
 pub fn entry_return(rip: u64, rsp: u64) -> Option<Step> {
     live_env(|env| entry_return_with(env, rip, rsp))

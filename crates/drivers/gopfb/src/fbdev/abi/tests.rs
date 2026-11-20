@@ -1,4 +1,4 @@
-//! Host tests of the fbdev rules against what linux-6.6 does (each case names the code it follows).
+//! Host tests of the fbdev rules against what linux-7.3.1 does (each case names the code it follows).
 
 use super::*;
 use alloc::vec::Vec;

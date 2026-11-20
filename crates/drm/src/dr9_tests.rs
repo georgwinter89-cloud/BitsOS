@@ -117,9 +117,12 @@ fn dr9_bo_list_ops_in_linux_order() {
         x.set_in(&drm_amdgpu_bo_list_in { operation: 5, list_handle: 1, bo_number: 2, bo_info_size: 8, bo_info_ptr: 8 });
         fx.m.put(0, &x);
         assert_eq!(fx.io(0, DRM_IOCTL_AMDGPU_BO_LIST), Err(EINVAL), "an unknown operation reads nothing");
-        x.set_in(&drm_amdgpu_bo_list_in { operation: AMDGPU_BO_LIST_OP_CREATE, list_handle: 1, bo_number: 1 << 30, bo_info_size: 8, bo_info_ptr: BASE });
-        fx.m.put(0, &x);
-        assert_eq!(fx.io(0, DRM_IOCTL_AMDGPU_BO_LIST), Err(ENOMEM), "over kvmalloc's limit");
+        // Linux 7.3.1: at most AMDGPU_BO_LIST_MAX_ENTRIES (amdgpu_bo_list.c:169), before the entry size.
+        for (n, size, want) in [(1u32 << 30, 8, EINVAL), (128 * 1024 + 1, 8, EINVAL), (128 * 1024 + 1, 12, EINVAL), (128 * 1024, 8, EFAULT)] {
+            x.set_in(&drm_amdgpu_bo_list_in { operation: AMDGPU_BO_LIST_OP_CREATE, list_handle: 1, bo_number: n, bo_info_size: size, bo_info_ptr: 8 });
+            fx.m.put(0, &x);
+            assert_eq!(fx.io(0, DRM_IOCTL_AMDGPU_BO_LIST), Err(want), "{n} entries of {size} bytes");
+        }
     }
     assert_eq!(bo_list(&fx, AMDGPU_BO_LIST_OP_CREATE, 0, &[], 8), Ok(3));
     {

@@ -235,8 +235,9 @@ struct OutInner {
     played: AtomicU64,
 }
 
-/// A playback stream (see the module doc).
-pub struct Playback(Arc<OutInner>);
+/// A playback stream (see the module doc). The second field is held while the stream lives (`dev`'s count of open
+/// streams per interface, which the tone check reads).
+pub struct Playback(Arc<OutInner>, Option<Box<dyn core::any::Any + Send + Sync>>);
 
 impl Playback {
     /// `ring` frames of ring, requests of `req` packets, buffers from `alloc`.
@@ -247,7 +248,13 @@ impl Playback {
         let cap = ring.max(c.fpp * c.req);
         let mut q = VecDeque::new();
         q.try_reserve(cap).map_err(|_| UsbError::NoMemory)?;
-        Ok(Playback(Arc::new(OutInner { c, ring: SpinLock::named("usb_audio.ring", q), cap, played: AtomicU64::new(0) })))
+        Ok(Playback(Arc::new(OutInner { c, ring: SpinLock::named("usb_audio.ring", q), cap, played: AtomicU64::new(0) }), None))
+    }
+
+    /// Keeps `g` until this stream is dropped.
+    pub fn holding(mut self, g: Box<dyn core::any::Any + Send + Sync>) -> Playback {
+        self.1 = Some(g);
+        self
     }
 
     pub fn ring_frames(&self) -> usize {

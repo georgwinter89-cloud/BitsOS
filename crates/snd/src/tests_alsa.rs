@@ -41,6 +41,8 @@ fn ioctl_numbers_match_linux() {
         (PCM_TTSTAMP, 0x40044103),
         (PCM_USER_PVERSION, 0x40044104),
         (CTL_CARD_INFO, 0x81785501),
+        // linux-7.3.1/include/uapi/sound/asound.h:1220, _IOWR('U', 0x02, 24 bytes): newer than the host's headers.
+        (CTL_CARD_BYTES, 0xc0185502),
         (CTL_ELEM_LIST, 0xc0505510),
         (CTL_ELEM_INFO, 0xc1105511),
         (CTL_ELEM_READ, 0xc4c85512),
@@ -59,7 +61,7 @@ fn ioctl_numbers_match_linux() {
 
 fn refined(p: &mut HwParams) {
     constraints().refine(p).unwrap();
-    constraints().fixup(p);
+    constraints().fixup(p).unwrap();
 }
 
 #[test]
@@ -121,6 +123,71 @@ fn hw_params_choose_as_linux() {
     assert_eq!(p.get(params::BUFFER_SIZE), 4096);
     assert_eq!(p.get(params::BUFFER_SIZE) % p.get(params::PERIOD_SIZE), 0);
     assert_eq!(p.msbits, 16);
+}
+
+/// L7-HW: the subformat rule and the msbits fixup of Linux 7 (pcm_native.c:2537, :478-548, PCM 2.0.16).
+#[test]
+fn subformat_msbits_as_linux_7() {
+    let std_max = (1 << SUBFORMAT_STD) | (1 << SUBFORMAT_MSBITS_MAX);
+    // Any format: STD and MSBITS_MAX (S16/S32 are linear); the rule changes no cmask bit of its own.
+    let mut p = HwParams::any();
+    p.rmask = 1 << params::SUBFORMAT;
+    p.cmask = 0;
+    refined(&mut p);
+    assert_eq!(p.masks[params::SUBFORMAT].0[..2], [std_max, 0]);
+    assert_eq!(p.cmask & (1 << params::SUBFORMAT), 0, "the subformat rule has no variable");
+    // FLOAT_LE alone is not linear: STD only.
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_FLOAT_LE, 48000, 2, 0, 0));
+    refined(&mut p);
+    assert_eq!(p.masks[params::SUBFORMAT].0[0], 1 << SUBFORMAT_STD);
+    assert_eq!(p.msbits, 16, "the 16-bit mixer behind 32-bit samples");
+    // S16: msbits 16 is the format's width, MSBITS_MAX stays.
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S16_LE, 48000, 2, 0, 0));
+    refined(&mut p);
+    assert_eq!((p.masks[params::SUBFORMAT].0[0], p.msbits), (std_max, 16));
+    // S32: 16 of 32 bits, so the fixup takes MSBITS_MAX away; asked for alone it is EINVAL.
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S32_LE, 48000, 2, 0, 0));
+    refined(&mut p);
+    assert_eq!((p.masks[params::SUBFORMAT].0[0], p.msbits), (1 << SUBFORMAT_STD, 16));
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S32_LE, 48000, 2, 0, 0));
+    p.masks[params::SUBFORMAT] = Mask::of(&[SUBFORMAT_MSBITS_MAX]);
+    constraints().refine(&mut p).unwrap();
+    assert_eq!(constraints().fixup(&mut p), Err(EINVAL));
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S32_LE, 48000, 2, 0, 0));
+    p.masks[params::SUBFORMAT] = Mask::of(&[SUBFORMAT_MSBITS_MAX]);
+    assert_eq!(constraints().hw_params(&mut p), Err(EINVAL));
+    // MSBITS_20 is offered by nobody here: refine empties the mask.
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S16_LE, 48000, 2, 0, 0));
+    p.masks[params::SUBFORMAT] = Mask::of(&[2]);
+    assert_eq!(constraints().refine(&mut p), Err(EINVAL));
+    // S16 with MSBITS_MAX only: kept (16 of 16 bits); hw_params chooses STD when both are left.
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S16_LE, 48000, 2, 0, 0));
+    p.masks[params::SUBFORMAT] = Mask::of(&[SUBFORMAT_MSBITS_MAX]);
+    constraints().hw_params(&mut p).unwrap();
+    assert_eq!(p.masks[params::SUBFORMAT].0[0], 1 << SUBFORMAT_MSBITS_MAX);
+    let mut p = HwParams::decode(&testkit::hw(FORMAT_S16_LE, 48000, 2, 0, 0));
+    constraints().hw_params(&mut p).unwrap();
+    assert_eq!(p.masks[params::SUBFORMAT].0[0], 1 << SUBFORMAT_STD);
+}
+
+/// L7-HW: the hw_params sync ID (bytes 544-559, PCM 2.0.17) goes back as the program gave it: the device sets
+/// no sync ID, as a driver without `snd_pcm_set_sync`.
+#[test]
+fn hw_params_sync_id_is_returned_untouched() {
+    let mut raw = testkit::hw(FORMAT_S16_LE, 48000, 2, 0, 0);
+    raw[544..560].copy_from_slice(&[0xA5; 16]);
+    let mut p = HwParams::decode(&raw);
+    constraints().hw_params(&mut p).unwrap();
+    assert_eq!(p.encode()[544..560], [0xA5; 16]);
+}
+
+#[test]
+fn format_width_and_linear_as_pcm_misc() {
+    for (f, w, lin) in [(0, 8, true), (2, 16, true), (6, 24, true), (10, 32, true), (14, 32, false), (16, 64, false),
+        (18, 32, false), (20, 8, false), (22, 4, false), (23, 0, false), (25, 20, true), (29, 0, true), (31, 0, false),
+        (32, 24, true), (36, 20, true), (40, 18, true), (44, 3, false), (47, 5, false), (48, 8, true), (52, 32, true)] {
+        assert_eq!((params::format_width(f), params::format_linear(f)), (w, lin), "format {f}");
+    }
 }
 
 #[test]

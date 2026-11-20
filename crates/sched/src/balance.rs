@@ -14,6 +14,7 @@ use core::sync::atomic::Ordering;
 
 klog::counter!(pub STEALS, "sched.steals");
 klog::counter!(pub PUSHES, "sched.pushes");
+klog::counter!(pub MISFITS, "sched.misfit_moves");
 
 /// Takes one movable thread out of `from`'s queue (keeping its place as a lag), or None.
 fn take_from(from: &CpuSched, to: usize) -> Option<Arc<Thread>> {
@@ -66,3 +67,42 @@ pub(crate) fn push_all(now: u64) {
 }
 
 const STALE_NS: u64 = 4 * crate::BALANCE_NS;
+
+/// GP-CPU2: Linux's misfit pull on a hybrid CPU, from the poll thread: a thread that has run without a break on a
+/// slower core and no longer fits it (or is Interactive) is asked to move to an idle, clearly faster core
+/// (`hybrid::misfit`, `place::misfit_target`). The move happens at its next preemption point, which the
+/// reschedule IPI makes immediate (`run::schedule` turns it into `Leave::Move`). Each idle core takes one thread per
+/// pass. Nothing on a uniform CPU.
+pub(crate) fn pull_misfits(now: u64) {
+    if !cpus::hybrid() || now.saturating_sub(LAST_MISFIT.load(Ordering::Relaxed)) < crate::BALANCE_NS {
+        return;
+    }
+    LAST_MISFIT.store(now, Ordering::Relaxed);
+    let mut claimed = [crate::NO_CPU; 8];
+    let mut k = 0;
+    for cs in cpus::online() {
+        if k == claimed.len() {
+            break;
+        }
+        if cs.in_idle.load(Ordering::Acquire) || cs.curr_pinned.load(Ordering::Relaxed) || cs.misfit_id.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        let class = crate::Class::from_u8(cs.curr_class.load(Ordering::Relaxed));
+        let run = now.saturating_sub(cs.curr_start.load(Ordering::Relaxed));
+        let view = cs.view();
+        if !crate::hybrid::misfit(class, cs.curr_util.load(Ordering::Relaxed), run, view.capacity) {
+            continue;
+        }
+        let free = |c: usize| if claimed.contains(&c) { None } else { cpus::view_of(c) };
+        let Some(to) = place::misfit_target(cpus::count(), &free, cs.cpu) else { continue };
+        let id = cs.curr_id.load(Ordering::Relaxed);
+        cs.misfit_to.store(to, Ordering::Release);
+        cs.misfit_id.store(id, Ordering::Release);
+        claimed[k] = to;
+        k += 1;
+        MISFITS.inc();
+        cpus::kick(cs, true);
+    }
+}
+
+static LAST_MISFIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

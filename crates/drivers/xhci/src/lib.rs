@@ -28,12 +28,14 @@ mod driver;
 mod command;
 pub mod ctx;
 mod events;
+pub mod gp_report;
 pub mod hc;
 pub mod hotplug;
 mod ktests;
 mod ktests_usb;
 mod ktests_xfer;
 mod ktests_isoch;
+mod ktests_peer;
 pub mod isoch;
 mod isoch_repair;
 pub mod port;
@@ -75,6 +77,10 @@ mod tests_shutdown;
 mod tests_ev;
 #[cfg(test)]
 mod tests_isoch;
+#[cfg(test)]
+mod tests_tt_iso;
+#[cfg(test)]
+mod tests_intel;
 #[cfg(test)]
 mod fake_iso;
 

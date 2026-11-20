@@ -4,34 +4,62 @@ CREATE unknown flag 1<<30 = -EINVAL
 CREATE unknown domain 0x80 = -EINVAL
 CREATE domain bit 32 = -EINVAL
 CREATE GDS always valid = -EINVAL
+CREATE GDS|GTT = -EINVAL
+CREATE GDS|GWS = -EINVAL
+CREATE DOORBELL|GTT = -EINVAL
+CREATE DOORBELL|GDS = -EINVAL
+CREATE DOORBELL 1 GiB = -ENOMEM
+CREATE VRAM_CONTIGUOUS = -EINVAL
+CREATE bad domain mix with an unknown flag = -EINVAL
 CREATE GDS 2^40 entries = -errno 28
 CREATE GTT 2^62 = -ENOMEM
 CREATE VRAM 2^62 = -ENOMEM
 CREATE VRAM|GTT 2^62 = -ENOMEM
 CREATE size 1 align 0 domains 2 flags 0 = 0
   handle > 0: yes
-  info size=4096 align=0 domains=2 flags=0
+  info size=4096 align=0 domains=2 flags=0x208
 CREATE size 4097 align 1 domains 2 flags 0x4 = 0
   handle > 0: yes
-  info size=8192 align=4096 domains=2 flags=0x4
+  info size=8192 align=4096 domains=2 flags=0x20c
 CREATE size 12288 align 12288 domains 2 flags 0x80 = 0
   handle > 0: yes
-  info size=12288 align=12288 domains=2 flags=0x80
+  info size=12288 align=12288 domains=2 flags=0x288
 CREATE size 4096 align 65536 domains 4 flags 0x1 = 0
   handle > 0: yes
-  info size=4096 align=65536 domains=4 flags=0
+  info size=4096 align=65536 domains=4 flags=0x208
 CREATE size 4096 align 4096 domains 6 flags 0 = 0
   handle > 0: yes
-  info size=4096 align=4096 domains=6 flags=0
+  info size=4096 align=4096 domains=6 flags=0x208
 CREATE size 4096 align 0 domains 1 flags 0 = 0
   handle > 0: yes
-  info size=4096 align=0 domains=1 flags=0
+  info size=4096 align=0 domains=1 flags=0x208
 CREATE size 4096 align 0 domains 0 flags 0 = 0
   handle > 0: yes
-  info size=4096 align=0 domains=0 flags=0
+  info size=4096 align=0 domains=0 flags=0x208
 CREATE size 4096 align 0 domains 2 flags 0x2 = 0
   handle > 0: yes
-  info size=4096 align=0 domains=2 flags=0x2
+  info size=4096 align=0 domains=2 flags=0x20a
+CREATE size 4096 align 0 domains 64 flags 0 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=64 flags=0x208
+CREATE size 4096 align 0 domains 2 flags 0x2000 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=2 flags=0x2208
+CREATE size 4096 align 0 domains 2 flags 0x4000 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=2 flags=0x4208
+CREATE size 4096 align 0 domains 2 flags 0x8000 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=2 flags=0x8208
+CREATE size 4096 align 0 domains 4 flags 0x10000 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=4 flags=0x10208
+CREATE size 4096 align 0 domains 4 flags 0x200 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=4 flags=0x208
+CREATE size 4096 align 0 domains 4 flags 0x8 = 0
+  handle > 0: yes
+  info size=4096 align=0 domains=4 flags=0x208
 mmap of a file without objects = EINVAL
 MMAP GTT object = 0
 MMAP VRAM object = 0
@@ -125,7 +153,7 @@ PRIME_FD_TO_HANDLE pipe = -EINVAL
 PRIME_FD_TO_HANDLE udmabuf = 0
 PRIME_FD_TO_HANDLE udmabuf again = 0
 same handle for the udmabuf: yes
-udmabuf object size=8192 align=4096 domains=2 flags=0
+udmabuf object size=8192 align=4096 domains=2 flags=0x200
 SET_PLACEMENT VRAM on an import = -EINVAL
 SET_PLACEMENT GTT on an import = 0
 PRIME_HANDLE_TO_FD of the import = 0

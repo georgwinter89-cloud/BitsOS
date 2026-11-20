@@ -18,6 +18,7 @@ ktest!("sc.locks.inversion_injected", QemuOnly, inversion_injected);
 ktest!("sc.locks.sleep_under_spin_injected", QemuOnly, sleep_under_spin_injected);
 ktest!("sc.locks.per_thread_held", QemuOnly, per_thread_held);
 ktest!("sc.locks.mutex_contention", Safe, mutex_contention);
+ktest!("sc.locks.contended_until_taken", Safe, contended_until_taken);
 ktest!("sc.locks.timeouts", Safe, timeouts);
 ktest!("sc.locks.wakeups_irq_on", Safe, wakeups_irq_on);
 ktest!("sc.locks.irq_nesting", Safe, irq_nesting);
@@ -25,6 +26,7 @@ ktest!("sc.locks.stats", Safe, statistics);
 ktest!("sc.locks.no_unexpected", Safe, no_unexpected);
 ktest!("sc.locks.cond_true_after_prepare", Safe, cond_true_after_prepare);
 ktest!("sc.locks.irq_depth_per_thread", Safe, irq_depth_per_thread);
+ktest!("sc.locks.holds_waited", Safe, holds_waited);
 
 const SEC: u64 = 1_000_000_000;
 
@@ -268,6 +270,46 @@ fn mutex_contention() -> R {
     })
 }
 
+/// `Mutex::contended` stays true from a waiter's sleep until that waiter holds the lock, also in the moment after
+/// the release woke it (off the wait queue, not running yet), where `try_lock` would win: the holder and the
+/// waiter share a CPU, and the holder looks with preemption off right after its release.
+fn contended_until_taken() -> R {
+    static M: Mutex<u64> = Mutex::named("sc.kt.contended", 0);
+    static TOOK: AtomicBool = AtomicBool::new(false);
+    TOOK.store(false, Ordering::Release);
+    let pin = crate::current_thread().and_then(|t| t.pinned());
+    let cpu = crate::current_cpu();
+    kassert!(crate::pin_current(Some(cpu)), "could not stay on CPU {cpu}");
+    let r = (|| {
+        let g = M.lock();
+        kassert!(!M.contended(), "contended with no waiter");
+        let o = crate::SpawnOpts { cpu: Some(cpu), pin: true, ..crate::SpawnOpts::default() };
+        let h = crate::spawn_with("sc-kt-contended", Class::Normal, o, || {
+            *M.lock() += 1;
+            TOOK.store(true, Ordering::Release);
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        let end = time::now_ns() + 10 * SEC;
+        while M.waiters() == 0 {
+            kassert!(time::now_ns() < end, "the waiter did not go to sleep within 10 s");
+            sleep_ms(1);
+        }
+        kassert!(M.contended(), "a sleeping waiter does not show");
+        let (queued, contended, took) = {
+            let _p = ksync::PreemptGuard::new();
+            drop(g);
+            (M.waiters(), M.contended(), TOOK.load(Ordering::Acquire))
+        };
+        kassert!(queued == 0 && !took, "the release did not wake the waiter off the queue ({queued} queued, took {took})");
+        kassert!(contended, "between the release and the waiter's take the mutex looks free of waiters");
+        join(&h, "waiter")?;
+        kassert!(TOOK.load(Ordering::Acquire) && !M.contended() && !M.is_locked(), "contended after the waiter took and released it");
+        Ok(())
+    })();
+    crate::pin_current(pin);
+    r
+}
+
 fn timeouts() -> R {
     static M: Mutex<()> = Mutex::named("sc.kt.timeout", ());
     static HELD: AtomicBool = AtomicBool::new(false);
@@ -503,5 +545,40 @@ fn no_unexpected() -> R {
     crate::report_lock_violations();
     let c = lockdep::counts();
     kassert!(c.unexpected == 0, "{} lock violations since boot: {}", c.unexpected, unexpected_list());
+    Ok(())
+}
+
+/// `ksync::holds_waited_lock` (the heap's patience asks it): false holding a mutex nobody waits for, true once a
+/// thread sleeps for it, false again after the release, and false for the waiter itself.
+fn holds_waited() -> R {
+    static M: Mutex<u64> = Mutex::named("sc.kt.holds_waited", 0);
+    static SAW: AtomicU64 = AtomicU64::new(u64::MAX);
+    SAW.store(u64::MAX, Ordering::Release);
+    kassert!(!ksync::holds_waited_lock(), "holding nothing, a waiter is seen");
+    let g = M.lock();
+    kassert!(!ksync::holds_waited_lock(), "a mutex nobody waits for counts as waited for");
+    let h = spawn("sc-kt-holds-waited", Class::Normal, || {
+        let _g = M.lock();
+        SAW.store(u64::from(ksync::holds_waited_lock()), Ordering::Release);
+    })
+    .map_err(|e| format!("{e:?}"))?;
+    let end = time::now_ns() + 10 * SEC;
+    while M.waiters() == 0 {
+        kassert!(time::now_ns() < end, "the waiter did not go to sleep within 10 s");
+        sleep_ms(1);
+    }
+    // The waiter is in the book once it sleeps (a waiter without a record shows only in the queue).
+    let mut seen = false;
+    while !seen && time::now_ns() < end {
+        seen = ksync::holds_waited_lock();
+        if !seen {
+            sleep_ms(1);
+        }
+    }
+    kassert!(seen, "the holder of a mutex a thread sleeps for is not told");
+    drop(g);
+    join(&h, "waiter")?;
+    kassert!(SAW.load(Ordering::Acquire) == 0, "the waiter, holding the mutex nobody waits for any more, is told it is waited for");
+    kassert!(!ksync::holds_waited_lock(), "after the release the old holder is still told");
     Ok(())
 }

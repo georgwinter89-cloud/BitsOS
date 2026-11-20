@@ -1,20 +1,16 @@
 //! Which functions the PCI core leaves alone (R8d) and who may bind mass storage (R8a).
 //!
-//! A function matched by an opt-in driver whose CONFIG key is not `on` is **untouched**: no BAR sizing, no
-//! command register write, no driver; only the reads of the walk. The same holds for the core list below,
-//! so the WLAN chip stays untouched even before its driver registers. A bridge whose functions below are all
-//! untouched is untouched too (the Mini-PC's 00:02.2 above the WLAN at 04:00.0).
+//! A function a rule keeps **untouched** (the Gaming-PC's never-touch list and network rule, `gp`; the disk
+//! guard's `nvme_bind=off`; the test function below) gets no BAR sizing, no command register write, no driver;
+//! only the reads of the walk. A bridge whose functions below are all untouched is untouched too (the
+//! Gaming-PC's 80:1c.3 above its WLAN card at 85:00.0).
 
 use crate::node::Node;
 use crate::registry::Match;
 
-/// Kept untouched without the key even when no driver claims them: the Mini-PC's RTL8852BE and every
-/// wireless controller (class 02/80 is how Realtek and Intel WLAN cards report, class 0D is "wireless").
-pub const CORE_OPT_IN: &[(Match, &str)] = &[
-    (Match::Id { vendor: 0x10EC, device: 0xB852 }, "wlan"),
-    (Match::Class { class: 0x02_80_00, mask: 0xFF_FF_00 }, "wlan"),
-    (Match::Class { class: 0x0D_00_00, mask: 0xFF_00_00 }, "wlan"),
-];
+/// The ktest `pc.untouched.held`'s function: QEMU q35's ICH9 SMBus (no machine BitsOS runs on has this id), held
+/// in every boot so the untouched rules are tested where a test driver matches it.
+pub const TEST_HELD: &[(Match, &str)] = &[(Match::Id { vendor: 0x8086, device: 0x2930 }, "ktest_untouched")];
 
 /// The only driver that may bind a class 01 (mass storage) function (R8a: the write gate lives in it).
 pub const STORAGE_DRIVER: &str = "nvme";

@@ -1,7 +1,11 @@
-//! prctl(2) (AB-5; linux-6.6/kernel/sys.c `SYSCALL_DEFINE5(prctl)` :2408, security/commoncap.c
-//! `cap_task_prctl`, security/yama `yama_task_prctl`). The state lives in `proc::prctl_state` (per task and
-//! per address space). Every option of 6.6 answers as Linux does on x86-64 with V2's constant credentials
-//! (uid 0 = all capabilities, others none), the LSM options first (commoncap, Yama), unknown ones EINVAL.
+//! prctl(2) (AB-5; linux-7.3.1/kernel/sys.c:2534 `SYSCALL_DEFINE5(prctl)`, security/commoncap.c:1301
+//! `cap_task_prctl`, security/yama `yama_task_prctl`). The state lives in `proc::prctl_state` (per task and per
+//! address space). Every option of 6.6 answers as Linux does on x86-64 with V2's constant credentials (uid 0 = all
+//! capabilities, others none), the LSM options first (commoncap, Yama), unknown ones EINVAL. Of the options since
+//! (kernel/sys.c:2864-2890), the x86 ones of CachyOS's kernel answer as there (L7-SYNC): PR_TIMER_CREATE_RESTORE_IDS
+//! (posix-timers.c:384), PR_FUTEX_HASH (futex/core.c:2071, `proc::prctl_state::FutexHash`) and
+//! PR_RSEQ_SLICE_EXTENSION (rseq.c:746: GET is 0, SET finds no rseq area, ENXIO: V2 has no rseq, AB-8); the
+//! shadow stack (74-76) and CFI (80, 81) options are EINVAL as on x86 without them.
 //!
 //! Built: PR_SET/GET_PDEATHSIG (sent by proc when the parent thread or process ends), PR_SET/GET_DUMPABLE,
 //! PR_SET/GET_NAME (the thread's comm), PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_CHILD_SUBREAPER (proc reparents
@@ -33,6 +37,18 @@ const SAVED_AUXV_BYTES: usize = 2 * (3 + 22 + 1) * 8;
 /// `sizeof(struct prctl_mm_map)` (PR_SET_MM_MAP_SIZE).
 const PRCTL_MM_MAP_SIZE: u32 = 104;
 const PR_SPEC_NOT_AFFECTED: i64 = 0;
+/// L7-SYNC: the prctl options of Linux 7.3.1 that CachyOS answers (include/uapi/linux/prctl.h:379-397).
+const PR_TIMER_CREATE_RESTORE_IDS: i32 = 77;
+const PR_TIMER_CREATE_RESTORE_IDS_OFF: u64 = 0;
+const PR_TIMER_CREATE_RESTORE_IDS_ON: u64 = 1;
+const PR_TIMER_CREATE_RESTORE_IDS_GET: u64 = 2;
+const PR_FUTEX_HASH: i32 = 78;
+const PR_FUTEX_HASH_SET_SLOTS: u64 = 1;
+const PR_FUTEX_HASH_GET_SLOTS: u64 = 2;
+const PR_RSEQ_SLICE_EXTENSION: i32 = 79;
+const PR_RSEQ_SLICE_EXTENSION_GET: u64 = 1;
+const PR_RSEQ_SLICE_EXTENSION_SET: u64 = 2;
+const PR_RSEQ_SLICE_EXT_ENABLE: u64 = 1;
 
 /// Options refused as "not built" (one Info event per option, then Debug).
 static REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -320,10 +336,61 @@ fn sys_prctl(c: &mut SysCtx<'_>) -> i64 {
             }
             get_auxv(c, arg2, arg3)
         }
+        PR_TIMER_CREATE_RESTORE_IDS => {
+            if arg3 | arg4 | arg5 != 0 {
+                return -EINVAL;
+            }
+            match arg2 {
+                PR_TIMER_CREATE_RESTORE_IDS_OFF | PR_TIMER_CREATE_RESTORE_IDS_ON => {
+                    c.proc.signals.raw(|s| s.timers.restore_ids = arg2 == PR_TIMER_CREATE_RESTORE_IDS_ON);
+                    0
+                }
+                PR_TIMER_CREATE_RESTORE_IDS_GET => c.proc.signals.raw(|s| s.timers.restore_ids) as i64,
+                _ => -EINVAL,
+            }
+        }
+        PR_FUTEX_HASH => futex_hash(c, arg2, arg3, arg4),
+        PR_RSEQ_SLICE_EXTENSION => {
+            if arg4 | arg5 != 0 {
+                return -EINVAL;
+            }
+            match arg2 {
+                PR_RSEQ_SLICE_EXTENSION_GET if arg3 != 0 => -EINVAL,
+                // No thread of V2 has an rseq area, so none has the extension on.
+                PR_RSEQ_SLICE_EXTENSION_GET => 0,
+                PR_RSEQ_SLICE_EXTENSION_SET if arg3 & !PR_RSEQ_SLICE_EXT_ENABLE != 0 => -EINVAL,
+                PR_RSEQ_SLICE_EXTENSION_SET => -ENXIO,
+                _ => -EINVAL,
+            }
+        }
         _ => -EINVAL,
     }
 }
 crate::syscall_nr!(uapi::ab::nr_more::PRCTL, "prctl", sys_prctl);
+
+/// PR_FUTEX_HASH (`futex_hash_prctl`). GET also applies the size the clones so far would have given
+/// (`futex_hash_allocate_default` at each CLONE_VM clone, here from the threads there are now: the clone path does
+/// not call it yet).
+fn futex_hash(c: &SysCtx<'_>, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    let h = c.proc.mm_flags.futex_hash();
+    match arg2 {
+        PR_FUTEX_HASH_SET_SLOTS => {
+            if arg4 != 0 {
+                return -EINVAL;
+            }
+            // `unsigned int hash_slots`: the argument's low 32 bits.
+            h.set_custom(arg3 as u32).map(|_| 0).unwrap_or_else(|e| -e)
+        }
+        PR_FUTEX_HASH_GET_SLOTS => {
+            let threads = c.proc.group().thread_count() as u32;
+            if threads > 1 {
+                h.grow_default(threads - 1, sched::online_cpus() as u32, sched::futex::global_buckets() as u32);
+            }
+            h.slots() as i64
+        }
+        _ => -EINVAL,
+    }
+}
 
 /// PR_SET_NAME: up to 15 bytes of the string (`strncpy_from_user(comm, arg2, 15)`; EFAULT only when no byte
 /// of the first 15 could be read up to a NUL).

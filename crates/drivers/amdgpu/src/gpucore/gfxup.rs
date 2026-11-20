@@ -1,4 +1,4 @@
-//! GX-7e/GX-7f: M3, GC powered (gx-scout-bringup.md :82-102, :246-249), generic over the device. After the PSP
+//! GX-7e/GX-7f: M3, GC powered (plan/spec/gpu.md §11.4), generic over the device. After the PSP
 //! took the firmware and AUTOLOAD_RLC (M2, kept), the SMU stage of Linux's smu_hw_init (amdgpu_smu.c:1457-1480)
 //! and the RLC autoload wait of gfx_v11_0 (gfx_v11_0.c:2555-2580), and nothing more:
 //!
@@ -20,10 +20,11 @@
 //! GX-7e read "bits 2:1 == 2" of the IMU flags as "GC on" (SMUIO's PWR_GFXOFF_STATUS rule, yellow_carp): wrong
 //! on the 780M, it skipped every GC read and timed out a boot it never looked at (desk 28.10.).
 //!
-//! Polling the bootload status before EnableGfxImu times out by design (gx-scout-bringup.md :101-102), so the
+//! Polling the bootload status before EnableGfxImu times out by design (plan/spec/gpu.md §11.4), so the
 //! order is fixed. With PSP loading Linux never writes GFX_IMU_CORE_CTRL (imu_v11_0_start is the direct-load
 //! path only, gfx_v11_0.c:4270-4277); BitsOS does not either. `mode2` (GfxDeviceDriverReset with RESET_MODE_2)
-//! is kept for the fakes; the live tool refuses it (`MODE2_REFUSED`).
+//! runs as the recovery ladder's last rung, after `suspend_gc` (`psplive::mode2_chip`); the tool's bare
+//! `until=reset` refuses it (`MODE2_REFUSED`: no suspend around it).
 
 use super::disc::Discovery;
 use super::hwid;
@@ -75,7 +76,7 @@ pub struct GcAddrs {
     pub imu_flags: u32,
     pub bootload: u32,
     pub cp_stat: u32,
-    /// SMUIO_GFX_MISC_CNTL (its meaning on 13.0.4 is unverified, gx-GX-7b.md).
+    /// SMUIO_GFX_MISC_CNTL (its meaning on 13.0.4 is unverified, plan/spec/gpu.md §11.4).
     pub smuio_misc: Option<u32>,
     /// GX-7j3: RLC_CNTL (the unload's RLC stop, gfx_v11_0_rlc_stop).
     pub rlc_cntl: u32,
@@ -265,7 +266,7 @@ pub enum GfxError {
     Interface { got: u32 },
     /// GFX_IMU_MSG_FLAGS read all ones: the device is gone.
     Gone { byte: u32 },
-    /// The RLC bootload or the CP never finished within Linux's deadline (gx-roadmap.md risk 1).
+    /// The RLC bootload or the CP never finished within Linux's deadline.
     BootTimeout { last: GcSnap },
 }
 
@@ -294,7 +295,7 @@ impl GfxError {
             GfxError::Smu(_) => ": PMFW refused a message: nothing more sent",
             GfxError::Interface { .. } => ": PMFW's driver interface is not 8: no EnableGfxImu sent; check the 13.0.4 message table first",
             GfxError::Gone { .. } => ": GC's flags read all ones: the device is gone; reboot",
-            GfxError::BootTimeout { .. } => ": the RLC autoload never completed (gx-roadmap risk 1): compare the W lines with the capture; TMR and ring stay; reboot",
+            GfxError::BootTimeout { .. } => ": the RLC autoload never completed (plan/spec/gpu.md §11.4): compare the W lines with the capture; TMR and ring stay; reboot",
         }
     }
 }
@@ -465,7 +466,8 @@ fn up(hw: &mut dyn Hw, s: &mut Smu, gc: &GcAddrs, stale: bool, t: &GfxTimeouts, 
 pub const MODE2_REFUSED: &str = "mode 2 is refused on SMU 13.0.4: Linux sends GfxDeviceDriverReset(2) only between a full IP suspend (GFXOFF off, CP/RLC halted, PSP rings stopped) and a full firmware reload, which BitsOS does not have; on 28.10. it went unanswered and the Mini-PC hung. The recovery after a failed GC stage is a reboot";
 
 /// A mode-2 reset of GC (GfxDeviceDriverReset, RESET_MODE_2, waited as Linux does, smu_v13_0_4_ppt.c:1079-1083),
-/// with GC's state before and after. Only the fakes run it (the live tool refuses, `MODE2_REFUSED`). No answer
+/// with GC's state before and after. The ladder runs it after `suspend_gc`; the bare `until=reset` refuses
+/// (`MODE2_REFUSED`). No answer
 /// within the SMU wait: `Smu(Timeout)`, a reboot, and nothing is read or written after it.
 pub fn mode2(hw: &mut dyn Hw, smu: smu13::Addrs, gc: &GcAddrs, t: &GfxTimeouts) -> GfxReport {
     let mut s = Smu::new(smu, t.smu);
@@ -500,7 +502,7 @@ pub struct GfxCheck {
     pub why: String,
 }
 
-/// The M3 pass rules (gx-scout-bringup.md :246-249).
+/// The M3 pass rules.
 pub fn checks(r: &GfxReport) -> Vec<GfxCheck> {
     let mut v = Vec::new();
     let h = |x: Option<u32>| x.map_or(String::from("unread"), |y| format!("{y:#x}"));

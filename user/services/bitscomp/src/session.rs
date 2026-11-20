@@ -150,9 +150,6 @@ pub struct Session {
     pub due: Option<Duration>,
     /// A window has opened or the offer was used: a session read later is not offered any more.
     taken: bool,
-    /// WY-21: the rescue build took over from the gpu build started at this time (unix seconds): the first session
-    /// read that was saved since comes back at once, without the start page's offer.
-    pub restore_since: Option<i64>,
     last_written: String,
     jobs: Option<mpsc::Sender<Job>>,
 }
@@ -202,10 +199,7 @@ pub fn start(handle: &LoopHandle<'static, App>, app: &mut App, rundir: &Path) ->
         .map_err(|e| format!("session thread: {e}"))?;
     app.session.path = rundir.join("bitscomp-session.txt");
     app.session.fallback = app.session.path.clone();
-    // Test mode (`--fixed-status`): no earlier session, so screenshots compare.
-    if !app.status.fixed {
-        let _ = jtx.send(Job::Load(app.session.path.clone()));
-    }
+    let _ = jtx.send(Job::Load(app.session.path.clone()));
     app.session.jobs = Some(jtx);
     Ok(())
 }
@@ -249,7 +243,7 @@ fn write(p: &Path, text: &str) -> std::io::Result<()> {
     f.sync_all()?;
     drop(f);
     if let Err(e) = std::fs::rename(&tmp, p) {
-        // A file system without rename over an existing file (rename(2), linux-6.6/fs/namei.c): remove, then rename.
+        // A file system without rename over an existing file (rename(2), linux-7.3.1/fs/namei.c): remove, then rename.
         if !p.exists() {
             return Err(e);
         }
@@ -308,14 +302,7 @@ impl App {
                 }
                 if let Some((saved, recent)) = text.as_deref().and_then(decode) {
                     eprintln!("bitscomp: session {}: {} workspaces, {} recent", p.display(), saved.spaces.len(), recent.len());
-                    let back = self.session.restore_since.is_some_and(|t| saved.when >= t);
                     self.session.loaded(saved);
-                    if back && self.session.offered {
-                        self.session.restore_since = None;
-                        let (tiles, pages) = self.session.saved.as_ref().map_or((0, 0), Saved::counts);
-                        eprintln!("bitscomp: session: the gpu build's session comes back ({tiles} tiles, {pages} programs)");
-                        self.session_restore();
-                    }
                     for r in recent {
                         if !self.session.recent.iter().any(|x| x.addr == r.addr) {
                             self.session.recent.push(r);
@@ -341,7 +328,23 @@ impl App {
     pub fn session_now(&self) -> Saved {
         let mut spaces = Vec::new();
         let seen = std::cell::RefCell::new(std::collections::HashSet::new());
+        // GM-6a: the `Sofa` workspace is not saved (the mode is not stored, sofa-mode.md §5; its games start from
+        // the library, not as desktop tiles at the next start); in the mode the workspace shown before counts.
+        let is_sofa = |i: usize| self.desk.names[i] == crate::sofa::WORKSPACE;
+        let shown = if is_sofa(self.desk.active) {
+            let before = self.sofa.before.as_ref().and_then(|b| self.desk.names.iter().position(|n| n == b));
+            before.filter(|&i| !is_sofa(i)).or_else(|| (0..self.ws_count()).find(|&i| !is_sofa(i))).unwrap_or(0)
+        } else {
+            self.desk.active
+        };
+        let mut active = 0;
         for i in 0..self.ws_count() {
+            if is_sofa(i) {
+                continue;
+            }
+            if i == shown {
+                active = spaces.len();
+            }
             let ws = if i == self.desk.active { &self.ws } else { &self.desk.parked[i] };
             // LO-1: one argv per started program: windows of one launcher's program (two LibreOffice windows of one
             // soffice.bin) restart it once, not once per window.
@@ -360,7 +363,7 @@ impl App {
             tiles.retain(|t: &Vec<Vec<String>>| !t.is_empty());
             spaces.push(Space { name: self.desk.names[i].clone(), tiles });
         }
-        Saved { when: crate::status::epoch_secs(), active: self.desk.active, spaces }
+        Saved { when: crate::status::epoch_secs(), active, spaces }
     }
 
     /// What restarts the program of `pid`: the argv bitscomp started it with, else only its program name (another
@@ -436,7 +439,7 @@ impl App {
                         continue;
                     }
                     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    if let Some(pid) = self.spawn(&refs) {
+                    if let Some(pid) = self.spawn_desktop(&refs) {
                         self.restoring.push(crate::place::Restore { pid, ws: at, group });
                     }
                 }

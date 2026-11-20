@@ -1,9 +1,10 @@
-//! SDMA 6.0.1: Linux `sdma_v6_0` (linux-6.6 amdgpu/sdma_v6_0.c). Its registers sit in the GC 11 register map
-//! (Linux reaches them through GC's segment bases, sdma_v6_0.c:123-139 `sdma_v6_0_get_reg_offset`).
+//! SDMA 6.0.1: Linux `sdma_v6_0` (linux-7.3.1 amdgpu/sdma_v6_0.c). Its registers sit in the GC 11 register map
+//! (Linux reaches them through GC's segment bases, sdma_v6_0.c:127-143 `sdma_v6_0_get_reg_offset`).
 //!
 //! GX-7i: the registers the bring-up touches (`R`, as (segment, dword) of gc_11_0_0_offset.h for instance 0),
-//! Linux's values (`sdma_v6_0_gfx_resume` :467-619 and `sdma_v6_0_enable` :439, checked against the 27.10. capture
-//! of the 780M, Linux 7.1) and the doorbell numbers (amdgpu_doorbell.h:209, soc21.c:499-510, nbio_v7_7.c:65-85).
+//! Linux's values (`sdma_v6_0_gfx_resume_instance` :483-622 and `sdma_v6_0_enable` :453, checked against the
+//! 27.10. capture of the 780M, Linux 7.1) and the doorbell numbers (amdgpu_doorbell.h:210, soc21.c:505-517,
+//! nbio_v7_7.c:64-85).
 //! The run is `gpucore::sdma`.
 
 use super::{Firmware, Module, Role, State, v};

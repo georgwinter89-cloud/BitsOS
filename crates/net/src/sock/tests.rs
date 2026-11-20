@@ -69,7 +69,7 @@ impl Prog {
         Prog { mem: Mem(StdMutex::new(alloc::vec![0; SIZE])), fds: FdTable::new(), ns: ns.clone(), cred: Cred { uid, gid: uid }, pid, next: StdMutex::new(BASE), fs: vfs::FsState::new() }
     }
     pub fn sys(&self) -> Sys<'_> {
-        Sys { mem: &self.mem, fds: &self.fds, fs: &self.fs, ns: &self.ns, cred: self.cred, subject: policy::Subject { program: policy::ProgramId(1), pid: self.pid, uid: self.cred.uid } }
+        Sys { mem: &self.mem, fds: &self.fds, fs: &self.fs, ns: &self.ns, cred: self.cred, subject: policy::Subject { program: policy::ProgramId(1), pid: self.pid, uid: self.cred.uid, tree: 0 } }
     }
     pub fn call(&self, f: vfs::sys::SysFn, a: [u64; 6]) -> i64 {
         f(&self.sys(), a)
@@ -885,4 +885,75 @@ fn nested_epoll_ping_pong_over_a_unix_stream_never_loses_a_wake() {
         p.fds.close(s0 as usize).unwrap();
         assert_eq!(client.join().unwrap(), ROUNDS);
     }
+}
+
+/// INT-CL3T (CL-S CR 2, MC-L CR 2): connect, listen and socketpair keep the calling program next to the peer
+/// credentials. The accepted socket names the program that connected, the connected one the program that
+/// listens, both ends of a pair their maker; SO_PEERSEC gives the label as Linux gives a security label (with
+/// its NUL; ERANGE and the length it takes for a short buffer; ENOPROTOOPT where none was recorded).
+#[test]
+fn a_unix_socket_keeps_the_program_that_connected() {
+    use core::any::Any;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let ns = ns();
+    let srv = Prog::new(&ns, 31, 1000);
+    let cli = Prog::new(&ns, 32, 1000);
+    let image: Arc<dyn Any + Send + Sync> = Arc::new(7u32);
+    let asked = AtomicU32::new(0);
+    let weak = Arc::downgrade(&image);
+    let prog = |label: &str| {
+        asked.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(super::Program { label: label.as_bytes().to_vec(), image: weak.clone() }))
+    };
+    let name = sun(b"/tmp/peer-program\0");
+    let l = srv.socket(AF_UNIX, SOCK_STREAM) as u64;
+    let a = srv.put(&name);
+    assert_eq!(srv.call(sys::bind, [l, a, name.len() as u64, 0, 0, 0]), 0);
+    assert_eq!(sys::listen_by(&srv.sys(), [l, 8, 0, 0, 0, 0], &|| prog("server")), 0);
+    let c = cli.socket(AF_UNIX, SOCK_STREAM) as u64;
+    assert_eq!(cli.getopt(c, SOL_SOCKET, SO_PEERSEC, 64), Err(-ENOPROTOOPT), "no peer yet");
+    let a = cli.put(&name);
+    assert_eq!(sys::connect_by(&cli.sys(), [c, a, name.len() as u64, 0, 0, 0], &|| prog("client")), 0);
+    let s = srv.call(sys::accept, [l, 0, 0, 0, 0, 0]) as u64;
+    assert_eq!(srv.getopt(s, SOL_SOCKET, SO_PEERSEC, 64).unwrap(), b"client\0", "the accepted socket: who connected");
+    assert_eq!(cli.getopt(c, SOL_SOCKET, SO_PEERSEC, 64).unwrap(), b"server\0", "the connected socket: who listens");
+    assert_eq!(srv.getopt(l, SOL_SOCKET, SO_PEERSEC, 64).unwrap(), b"server\0", "a listener's peer credentials are its own");
+    assert_eq!(asked.load(Ordering::Relaxed), 2);
+    // A short buffer: ERANGE, the length written back, the buffer untouched. Exactly enough fits.
+    let buf = srv.put(&[0xaa; 8]);
+    let len = srv.put(&6u32.to_le_bytes());
+    assert_eq!(srv.call(sys::getsockopt, [s, SOL_SOCKET as u64, SO_PEERSEC as u64, buf, len, 0]), -ERANGE);
+    assert_eq!((srv.u32_at(len), srv.get(buf, 8)), (7, alloc::vec![0xaa; 8]));
+    assert_eq!(srv.getopt(s, SOL_SOCKET, SO_PEERSEC, 7).unwrap(), b"client\0");
+    // The kernel's own listeners take the image itself; the socket does not keep it alive.
+    let file = srv.fds.get(s as usize).unwrap();
+    let rec = super::SockFile::of(&file.file).unwrap().unix().unwrap().peer_program().unwrap();
+    assert!(rec.image.upgrade().is_some_and(|i| Arc::ptr_eq(&i, &image)));
+    drop(image);
+    assert!(rec.image.upgrade().is_none(), "the socket held the image");
+    assert_eq!(srv.getopt(s, SOL_SOCKET, SO_PEERSEC, 64).unwrap(), b"client\0", "the label stays what connect recorded");
+    // The peer credentials go on as before.
+    assert_eq!(&srv.getopt(s, SOL_SOCKET, SO_PEERCRED, 12).unwrap()[..8], &[32, 0, 0, 0, 0xe8, 3, 0, 0]);
+
+    // A connect that brings nobody (the kernel's own, host tests): no label, never somebody else's.
+    let c2 = cli.socket(AF_UNIX, SOCK_STREAM) as u64;
+    assert_eq!(cli.call(sys::connect, [c2, a, name.len() as u64, 0, 0, 0]), 0);
+    let s2 = srv.call(sys::accept, [l, 0, 0, 0, 0, 0]) as u64;
+    assert_eq!(srv.getopt(s2, SOL_SOCKET, SO_PEERSEC, 64), Err(-ENOPROTOOPT));
+
+    // socketpair: both ends name their maker.
+    let image: Arc<dyn Any + Send + Sync> = Arc::new(8u32);
+    let pair = || Some(Arc::new(super::Program { label: b"pair".to_vec(), image: Arc::downgrade(&image) }));
+    let sv = cli.buf(8);
+    assert_eq!(sys::socketpair_by(&cli.sys(), [AF_UNIX as u64, SOCK_STREAM as u64, 0, sv, 0, 0], &pair), 0);
+    for fd in [cli.u32_at(sv), cli.u32_at(sv + 4)] {
+        assert_eq!(cli.getopt(fd as u64, SOL_SOCKET, SO_PEERSEC, 64).unwrap(), b"pair\0");
+    }
+
+    // Other families never ask who calls: the question costs a path walk in the kernel.
+    let before = asked.load(Ordering::Relaxed);
+    let t = cli.socket(AF_INET, SOCK_STREAM) as u64;
+    let _ = sys::listen_by(&cli.sys(), [t, 1, 0, 0, 0, 0], &|| prog("tcp"));
+    assert_eq!(asked.load(Ordering::Relaxed), before, "a TCP listen asked for the program");
+    assert_eq!(cli.getopt(t, SOL_SOCKET, SO_PEERSEC, 64), Err(-ENOPROTOOPT));
 }

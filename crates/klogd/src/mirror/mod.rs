@@ -1,5 +1,5 @@
 //! The console mirror (RB-4, spec net.md 5.3, core.md 10.3; V1 `net/mirror*.asm`): every rendered log line as
-//! UDP to the listener CONFIG names (`mirror=a.b.c.d[:port]`, V1's `console=` too; R9: nothing without it), in
+//! UDP to the listener CONFIG names (`mirror=a.b.c.d[:port]`; R9: nothing without it), in
 //! V1's wire format (`wire`), so the unchanged `console-listen.mjs` on the Gaming-PC shows the log from the
 //! first line of the boot.
 //!

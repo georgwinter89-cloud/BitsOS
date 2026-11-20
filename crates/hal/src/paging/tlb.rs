@@ -326,7 +326,7 @@ fn inc(c: &AtomicU64) {
 }
 
 /// MM-11 fixer: rounds a user unmap took before its end because its gather could not grow (`GATHER_MAX` frames,
-/// or no heap for more): Linux's `tlb_flush_mmu` on a full batch (linux-6.6/mm/mmu_gather.c:297).
+/// or no heap for more): Linux's `tlb_flush_mmu` on a full batch (linux-7.3.1/mm/mmu_gather.c:421).
 static GATHER_EARLY: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn count_gather_early() {
@@ -412,6 +412,13 @@ pub struct TlbStats {
     pub by_cause: [CauseStats; CAUSES],
     /// MM-11 fixer: rounds of user unmaps taken before the unmap's end (a full gather, `count_gather_early`).
     pub gather_early: u64,
+    /// MEMCRASH: gather batch pages the frame allocator could not give without waiting (the gather flushed early).
+    pub gather_nobatch: u64,
+}
+
+/// Only the per-cause totals of `stats` (klogd reads them every look of its storm sampler, GP-R3).
+pub fn causes() -> [CauseStats; CAUSES] {
+    super::tlb_cause::by_cause()
 }
 
 pub fn stats() -> TlbStats {
@@ -467,6 +474,7 @@ pub fn stats() -> TlbStats {
         wait_hist: core::array::from_fn(|i| l(&C.wait_hist[i])),
         by_cause: super::tlb_cause::by_cause(),
         gather_early: l(&GATHER_EARLY),
+        gather_nobatch: super::gather::no_batch(),
     }
 }
 
@@ -601,8 +609,8 @@ pub(super) fn count_grant_rounds(pages: u64) {
 static SPURIOUS_COPY_RETRY: AtomicBool = AtomicBool::new(false);
 
 /// MM-tlb2 fixer: the copy fault resolver (`hal::usercopy::set_fault_resolver`, proc's `resolve_copy_fault`)
-/// retries a fault on an allowed access as a spurious one (Linux handle_pte_fault, linux-6.6/mm/memory.c:5016;
-/// `flush_tlb_fix_spurious_fault` is empty on x86, arch/x86/include/asm/pgtable.h:1325). Only then may
+/// retries a fault on an allowed access as a spurious one (Linux handle_pte_fault, linux-7.3.1/mm/memory.c:6592;
+/// `flush_tlb_fix_spurious_fault` is empty on x86, arch/x86/include/asm/pgtable.h:1295). Only then may
 /// `grant_user` leave a narrower (read-only) translation on other CPUs: before, a `read()` into a page another
 /// thread had just made writable through a reused copy-on-write or dirty-marked page would fail with EFAULT on
 /// a CPU that still holds the read-only entry.

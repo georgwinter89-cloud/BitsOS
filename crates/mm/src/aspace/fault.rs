@@ -22,6 +22,7 @@ klog::counter!(FAULT_SPURIOUS, "mm.as.fault_spurious");
 klog::counter!(FAULT_REFUSED, "mm.as.fault_refused");
 klog::counter!(COPY_FILLS, "mm.as.copy_fills");
 klog::counter!(SPARE_UNUSED, "mm.as.spare_unused");
+klog::counter!(MIGRATION_ENTRY_SEEN, "mm.as.fault_on_migration_entry");
 klog::counter!(FILE_FILLS, "mm.as.file_fills");
 klog::counter!(FILE_COPIES, "mm.as.file_copies");
 klog::counter!(pub(crate) COW_COPIES, "mm.as.cow_copies");
@@ -31,7 +32,7 @@ klog::counter!(AROUND_FILLS, "mm.as.around_fills");
 klog::counter!(AROUND_SHORT, "mm.as.around_short");
 // BL-4: file pages a read fault mapped beside its own (`file_fault_around`).
 klog::counter!(FILE_AROUND, "mm.as.file_around");
-/// Pages per fault-around block: 64 KiB, Linux's default `fault_around_bytes` (linux-6.6/mm/memory.c:4445).
+/// Pages per fault-around block: 64 KiB, Linux's default `fault_around_bytes` (linux-7.3.1/mm/memory.c:5874).
 const AROUND_PAGES: u64 = 16;
 
 /// MM-13: the 2 MiB block of one fault, made without the space's lock.
@@ -145,6 +146,7 @@ impl AsCore {
             super::free_user(f);
             return Err(FaultReason::NoMemory);
         }
+        self.note_anon(f, va);
         self.ctr.add(Class::Anon, 1);
         Ok(())
     }
@@ -196,6 +198,7 @@ impl AsCore {
             super::free_user(copy);
             return Err(FaultReason::NoMemory);
         }
+        self.note_anon(copy, va);
         self.ctr.add(Class::Anon, 1);
         FILE_COPIES.inc();
         Ok(())
@@ -233,6 +236,7 @@ impl AsCore {
             super::free_user(copy);
             return Err(e);
         }
+        self.note_anon(copy, page);
         if v.file.is_some() { FILE_COPIES.inc() } else { COW_COPIES.inc() }
         Ok(())
     }
@@ -294,6 +298,10 @@ impl AsCore {
             }
             let mut va = v.start.max(start);
             while va < v.end.min(end) {
+                // A guard ends the VMA's population (GUP's EFAULT; mlock and MAP_POPULATE ignore it).
+                if g.guards.contains(va) {
+                    break;
+                }
                 if paging::translate(self.root, va).is_none() {
                     if va.is_multiple_of(HUGE)
                         && va + HUGE <= end
@@ -343,7 +351,7 @@ impl AsCore {
     }
 
     /// MM-tlb2: a fault on a missing page zeroes its frame before it takes the space's lock (Linux's
-    /// do_anonymous_page allocates before the page-table lock too, linux-6.6/mm/memory.c:4113, lock at 4133),
+    /// do_anonymous_page allocates before the page-table lock too, linux-7.3.1/mm/memory.c:5482, lock at 5498),
     /// so threads of one program that fault in fresh buffers at the same time (Cobalt's decoders) hold the lock
     /// only for the mapping: with the zeroing inside, they queued on it and every hand-over woke a halted CPU
     /// with a reschedule IPI (200k/s on 4 CPUs in `mm.tlb.cobalt`, 7.5k/s now). An unused frame goes back.
@@ -393,6 +401,11 @@ impl AsCore {
         };
         let Some(v) = vma else { return Some(Err(FaultReason::NotMapped)) };
         let page = addr & !(PAGE - 1);
+        // L7-VFS: a guard page (`handle_pte_marker`, linux-7.3.1/mm/memory.c:4736): SIGSEGV with SEGV_MAPERR, after
+        // the VMA's own access check (a write to a read-only VMA stays SEGV_ACCERR).
+        if g.guards.contains(page) {
+            return Some(Err(FaultReason::NotMapped));
+        }
         if !ra_done && file_ra_reads(&v, page) && paging::translate(self.root, page).is_none() {
             drop(g);
             file_ra_unlocked(&v, page);
@@ -430,6 +443,14 @@ impl AsCore {
     #[allow(clippy::too_many_arguments)]
     fn fault_page(&self, g: &mut Inner, addr: u64, error: u64, page: u64, v: &Vma, access: Access, run: &mut SpuriousRun, spare: &mut Option<u64>, ra_done: bool) -> Result<(), FaultReason> {
         let Some(l) = paging::translate_leaf(self.root, page) else {
+            // W35 MM-2: a migration holds this space's lock from the freeze to the thaw, so a fault under the lock
+            // never meets its entry; should one be seen, the page is not missing: the fault comes again (bounded
+            // by the spurious run) instead of filling over it.
+            if paging::migration_entry(self.root, page) {
+                MIGRATION_ENTRY_SEEN.inc();
+                run.note(self.root, page, time::now_ns())?;
+                return Ok(());
+            }
             run.reset();
             self.fill_at_with(page, &v, access == Access::Write, spare, !ra_done)?;
             FAULT_FILLS.inc();
@@ -438,7 +459,7 @@ impl AsCore {
             if access == Access::Write && around(&v) && !self.thp_disabled() && crate::thp::mode_allows(v.flags.hugepage, v.flags.nohugepage) {
                 self.fault_around(g, page, &v);
             } else if access != Access::Write {
-                self.file_fault_around(page, &v);
+                self.file_fault_around(g, page, &v);
             }
             return Ok(());
         };
@@ -477,18 +498,19 @@ impl AsCore {
 
     /// MM-12 (FD-1): after a write fault filled a page of a VMA `around` accepts, the other missing pages of its
     /// aligned 64 KiB block get zeroed frames too when the whole block lies inside the VMA (Linux's rule for a
-    /// huge page, `transhuge_vma_suitable`, linux-6.6/include/linux/huge_mm.h:100: small or cut VMAs, a heap of a
+    /// huge page, `thp_vma_suitable_order`, linux-7.3.1/include/linux/huge_mm.h:225: small or cut VMAs, a heap of a
     /// few pages, the ends of a mapping stay page by page, as on Linux), so a program writing a fresh buffer front to
     /// back pays the fault entry, the space lock and the walk once per block instead of per page (Chromium's
     /// software compositor: a new 13.8 MB layer per video frame). Linux reaches the same with transparent huge
-    /// pages (CachyOS: `always`, 2 MiB at a time); its own fault-around (`do_fault_around`, memory.c:4504) is
+    /// pages (CachyOS: `always`, 2 MiB at a time); its own fault-around (`do_fault_around`, memory.c:5934) is
     /// for file pages. Frames come from `alloc_zeroed_light`: only memory free now, never reclaim or the OOM
     /// path for pages nobody touched; the first refusal ends the round quietly (the faulting page is in).
     /// Nothing is charged: `around` takes only VM_ACCOUNT VMAs, whose every page the mapping charged.
     /// No TLB flush: every entry made here was not present (x86 caches no not-present translation).
+    /// A block with a guard page stays page by page (Linux: a guard's PTE is not none, no large folio there).
     fn fault_around(&self, g: &Inner, page: u64, v: &Vma) {
         let (lo, hi) = (page & !(AROUND_PAGES * PAGE - 1), (page & !(AROUND_PAGES * PAGE - 1)) + AROUND_PAGES * PAGE);
-        if lo < v.start || hi > v.end {
+        if lo < v.start || hi > v.end || g.guards.any_in(lo, hi) {
             return;
         }
         // One walk for the block (it lies in one page table): bit i = page lo + i*PAGE is present.
@@ -533,8 +555,9 @@ impl AsCore {
     /// cached or the read-ahead mark are left to their own fault (`PageCache::ready_for_map`). Each page gets what
     /// a read fault of it gets (`fill_at_with`: read-only when private or dirty-tracked) and its pin. A page
     /// reclaimed between the look and the pin is read as its own fault would read it (rare: reclaim takes only
-    /// pages nobody holds). No TLB flush: every entry made here was not present.
-    fn file_fault_around(&self, page: u64, v: &Vma) {
+    /// pages nobody holds). No TLB flush: every entry made here was not present. Guard pages are skipped
+    /// (`filemap_map_pages` maps only none entries).
+    fn file_fault_around(&self, g: &Inner, page: u64, v: &Vma) {
         let Some(f) = &v.file else { return };
         let Some(c) = file_cache(f) else { return };
         let lo = (page & !(AROUND_PAGES * PAGE - 1)).max(v.start);
@@ -556,7 +579,7 @@ impl AsCore {
         let mut va = lo;
         while va < hi {
             let Some(pgoff) = v.pgoff_at(va) else { break };
-            if present & 1 << ((va - lo) / PAGE) == 0 && c.ready_for_map(pgoff) {
+            if present & 1 << ((va - lo) / PAGE) == 0 && !g.guards.contains(va) && c.ready_for_map(pgoff) {
                 let Ok(phys) = f.backing.get_page(pgoff, false) else { break };
                 if paging::map_user_4k(self.root, va, phys, fl, &mut || self.alloc_table()).is_err() {
                     f.backing.put_page(phys);
@@ -619,6 +642,9 @@ impl AsCore {
                 }
                 None => {
                     let v = g.space.tree.find(va).cloned().ok_or(MmError::Fault)?;
+                    if g.guards.contains(va) {
+                        return Err(MmError::Fault);
+                    }
                     let allowed = match need {
                         Need::Read | Need::Load => v.prot.accessible(),
                         Need::Write => v.prot.write,
@@ -683,11 +709,11 @@ impl AsCore {
         Ok(())
     }
 
-    /// PF-6 (fs-PF-4 CR 2): copies the page-cache frame parts `(frame, off, n)` back to back to user memory from
+    /// PF-6 (PF-4's CR 2): copies the page-cache frame parts `(frame, off, n)` back to back to user memory from
     /// `dst`, straight from each frame (no buffer in between when this thread owns the space here; else through a
     /// small stack buffer, `frame_via_buffer`), taking `mm.as` once for the whole call and filling
     /// user pages as `copy_to_user` does. Returns the bytes that reached the program: all, or exactly those before
-    /// the first user page that cannot be written (Linux's short `copy_page_to_iter`, linux-6.6/lib/iov_iter.c:
+    /// the first user page that cannot be written (Linux's short `copy_page_to_iter`, linux-7.3.1/lib/iov_iter.c:361:
     /// the read ends there). A part that leaves its frame ends the copy too. Never call it under a page-cache
     /// lock (`vfs.inode.index`: `mm.as` is outside it, CONTRACTS §4).
     pub fn copy_frames_to_user(&self, dst: u64, parts: &[(&mm_core::PageFrame, usize, usize)]) -> usize {
@@ -743,7 +769,7 @@ impl AsCore {
         k
     }
 
-    /// PF-6 (fs-PF-5 CR 2): `copy_to_user` that takes no lock and never handles a fault (Linux
+    /// PF-6 (PF-5's CR 2): `copy_to_user` that takes no lock and never handles a fault (Linux
     /// `copy_to_user_nofault`): for lockless readers inside a grace section, and as the first try of a copy whose
     /// user pages are usually present. Only a thread that owns this space here (CR3 holds it, not lazily) copies;
     /// otherwise, and at the first user page not present and writable, it ends: the bytes before count, the

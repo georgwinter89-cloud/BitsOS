@@ -151,13 +151,18 @@ fn chrome_hot(app: &App, pt: &dyn Fn(i32, i32) -> String) -> String {
         out.push_str(&format!("fav {i} at={} addr={}\n", mid(*r), app.desk.favourites[i]));
     }
     for (i, r) in c.ws_items.iter().take(if c.list_shown { c.ws_shown() } else { 0 }).enumerate() {
-        out.push_str(&format!("ws {i} at={} active={} name={:?}\n", mid(*r), i == app.desk.active, app.desk.names[i]));
+        // A (12.11.): `close=` where the entry's x closes the workspace.
+        let close = c.ws_close.get(i).filter(|_| app.ws_closable(i)).map_or(String::new(), |x| format!(" close={}", mid(*x)));
+        out.push_str(&format!("ws {i} at={} active={} name={:?}{close}\n", mid(*r), i == app.desk.active, app.desk.names[i]));
     }
     for (i, r) in c.min_items.iter().enumerate().take(if c.list_shown { app.ws.minimized.len() } else { 0 }) {
         let w = &app.ws.minimized[i].win;
-        out.push_str(&format!("minimized {i} at={} id={} title={:?}\n", mid(*r), crate::ctl::win_id(w), crate::ctl::names(w).1));
+        // DESK-LEFT: `close=` is the entry's (chip's) x, shown while the pointer is on it.
+        let close = c.min_close.get(i).map_or(String::new(), |x| format!(" close={}", mid(*x)));
+        out.push_str(&format!("minimized {i} at={} id={} title={:?}{close}\n", mid(*r), crate::ctl::win_id(w), crate::ctl::names(w).1));
     }
-    out.push_str(&format!("wsnew at={}\nhome at={}\n", mid(c.ws_new), mid(c.home)));
+    // B: `lit` while the start page is what the workspace shows; `forced` while it covers the windows.
+    out.push_str(&format!("wsnew at={}\nhome at={} lit={} forced={}\n", mid(c.ws_new), mid(c.home), app.start_shown(), app.desk.start_forced));
     // PK-L1b: the top bar's "Programme" button.
     out.push_str(&format!("programs at={} open={}\n", mid(c.programs), app.lib.open));
     // DS-3: the Bühne's own parts.
@@ -173,7 +178,8 @@ fn chrome_hot(app: &App, pt: &dyn Fn(i32, i32) -> String) -> String {
             out.push_str(&format!("start fav {i} at={}\n", mid(*r)));
         }
         for (i, r) in p.recents.iter().enumerate().take(app.session.recent.len()) {
-            out.push_str(&format!("start recent {i} at={} addr={}\n", mid(*r), app.session.recent[i].addr));
+            let a = &app.session.recent[i].addr;
+            out.push_str(&format!("start recent {i} at={} addr={a} name={:?}\n", mid(*r), app.recent_name(a)));
         }
     }
     let rows = app.suggestions();
@@ -184,14 +190,14 @@ fn chrome_hot(app: &App, pt: &dyn Fn(i32, i32) -> String) -> String {
     out
 }
 
-fn hot(app: &App) -> String {
+pub(crate) fn hot(app: &App) -> String {
     let t = &app.theme;
     let s = t.scale;
     let pt = |x: i32, y: i32| format!("{},{}", (x as f64 * s).round(), (y as f64 * s).round());
     let mid = |r: Rect| pt(r.x + r.w / 2, r.y + r.h / 2);
     let mut out = String::new();
     let mut tab_lines = String::new();
-    for p in app.placements().into_iter().filter(|p| p.visible) {
+    for p in app.drawn_placements().into_iter().filter(|p| p.visible) {
         let f = p.frame;
         let (_, title) = crate::ctl::names(&p.win);
         let place = match p.place {
@@ -218,6 +224,8 @@ fn hot(app: &App) -> String {
             let max = app.ws.floating[index].restore.is_some();
             out.push_str(&format!(" max={} maximised={max}", mid(zones::max_button(f, t))));
         }
+        // C (12.11.): the minimise button of every window.
+        out.push_str(&format!(" min={}", mid(zones::min_button(f, floating, t))));
         if crate::veil::shown(app, &p.win) {
             out.push_str(&format!(" kill={}", mid(crate::veil::kill_button(app.content_rect(f), t))));
             out.push_str(&format!(" wait={}", mid(crate::veil::wait_button(app.content_rect(f), t))));
@@ -248,7 +256,16 @@ fn hot(app: &App) -> String {
         }
     }
     out.push_str(&chrome_hot(app, &pt));
+    out.push_str(&app.library_hot());
+    out.push_str(&app.feld_hot());
+    out.push_str(&app.rewind_hot());
+    out.push_str(&app.ws_ask_hot());
+    out.push_str(&app.habit_hint_hot());
+    out.push_str(&app.confirm_hot());
+    out.push_str(&app.prog_note_hot());
+    out.push_str(&app.min_row_hot());
     out.push_str(&app.page_hot());
+    out.push_str(&app.assist_hot());
     out.push_str("end");
     out
 }

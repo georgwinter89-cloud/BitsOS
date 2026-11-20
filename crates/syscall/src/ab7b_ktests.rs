@@ -347,7 +347,7 @@ impl vfs::pagecache::Backend for Zeroes {
 }
 
 ktest!("ab7.sys.meminfo_available", Safe, meminfo_available);
-/// MM-9 CR1: MemAvailable counts the clean file cache (si_mem_available, linux-6.6/mm/show_mem.c:32). The file
+/// MM-9 CR1: MemAvailable counts the clean file cache (si_mem_available, linux-7.3.1/mm/show_mem.c:33). The file
 /// is big enough that what stays cached (half of it, at most the low watermark) and the reserve (the high
 /// watermark) still leave MemAvailable above MemFree, which counts the HighAtomic reserve while MemAvailable does
 /// not. Its pages go when the cache is dropped (rerunnable).

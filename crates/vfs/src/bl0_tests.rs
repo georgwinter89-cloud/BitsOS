@@ -240,7 +240,10 @@ fn lockless_readers_survive_dontneed_and_drop_caches() {
     let r = Reclaimer::of(&[&*c]);
     let (mut dropped, mut round) = (0, 0u32);
     let t0 = std::time::Instant::now();
-    while t0.elapsed() < std::time::Duration::from_millis(200) || round < 200 {
+    // On until pages were dropped and read again while the readers ran (60 s at most): on a busy host the readers
+    // may not run during the first 200 ms (the race is judged, not how soon it comes).
+    let raced = |dropped: u64| dropped > 0 && b.reads.load(Ordering::Relaxed) > PAGES;
+    while t0.elapsed() < std::time::Duration::from_millis(200) || round < 200 || !raced(dropped) && t0.elapsed() < std::time::Duration::from_secs(60) {
         round += 1;
         dropped += if round % 2 == 0 { c.dont_need(0, 0).dropped } else { r.drop_clean().dropped };
         mm_core::grace::drain();

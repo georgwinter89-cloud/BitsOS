@@ -41,6 +41,13 @@ impl Buddy {
         self.make_run(phys, order, pages, kind)
     }
 
+    /// `alloc_exact` from what is free now (`FrameAlloc::alloc_light`): no drain of the per-CPU lists, no reclaim.
+    pub fn alloc_exact_light(&self, pages: u64, align_pages: u64, zone: Zone, kind: Kind) -> Option<u64> {
+        let order = exact_order(pages, align_pages)?;
+        let phys = self.alloc_light(order, zone, kind)?;
+        self.make_run(phys, order, pages, kind)
+    }
+
     /// `alloc_exact` for a run that ends at or below `limit` (bytes, exclusive; DMA address masks). The run
     /// lies at the start of its covering block, so it never crosses a multiple of that block's size.
     pub fn alloc_exact_below(&self, pages: u64, align_pages: u64, limit: u64, kind: Kind) -> Option<u64> {

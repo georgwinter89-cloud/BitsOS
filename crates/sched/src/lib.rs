@@ -50,16 +50,20 @@ pub mod attr;
 mod attr_ktests;
 mod balance;
 mod cpus;
+pub use cpus::resched_vector;
 pub mod cputime;
 pub mod cstate;
 mod cstate_ktests;
+mod gp_ktests;
 #[cfg(bitsos_fd_measure)]
 pub use cpus::prof_kick;
 pub mod futex;
+pub mod hybrid;
 pub mod ntsync;
 mod guard;
 mod idle;
 pub mod interactive;
+pub mod ioac;
 mod interactive_ktests;
 mod ktests;
 mod lock_ktests;
@@ -69,10 +73,12 @@ mod pi_ktests;
 pub mod place;
 mod reap;
 mod reap_watch;
+mod room_ktests;
 pub mod rq;
 mod run;
 mod sleepers;
 mod smp_ktests;
+mod wake_strand_ktests;
 mod state_ktests;
 pub mod stack;
 mod stop;
@@ -85,7 +91,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use hal::switch::{KernelContext, StackBounds, Switchable};
 use hal::xsave::FpuState;
 use ksync::{Completion, SchedHooks, SpinLock, ThreadRef};
@@ -240,6 +246,11 @@ pub struct Thread {
     affine_all: AtomicBool,
     migrations: AtomicU64,
     wakeups: AtomicU64,
+    /// GP-CPU2 (hybrid CPUs only): utilisation 0..=1024 (`hybrid::util_next`), when it was last brought up to date
+    /// and the runtime it had then.
+    util: AtomicU32,
+    util_at: AtomicU64,
+    util_runtime: AtomicU64,
     /// Link of a CPU's interrupt-time wake list.
     wake_next: AtomicU64,
     /// The deadline of the current sleep (0: none).
@@ -249,6 +260,13 @@ pub struct Thread {
     done: Completion,
     /// Futex wait state (SC-5).
     futex: futex::ThreadState,
+    /// SELFOPT-1: the ids a sampling profiler reports for it, `pid << 32 | tid` (0: a kernel thread).
+    user_ids: AtomicU64,
+    /// SELFOPT-1: rip, rbp and rsp of its program when it last came back from user mode, for the program's part of
+    /// a sample taken while it runs kernel code (Linux `task_pt_regs`).
+    user_regs: [AtomicU64; 3],
+    /// SYS-K: its I/O accounting (`/proc/<pid>/io`).
+    io: ioac::IoAcct,
 }
 
 impl Thread {
@@ -291,12 +309,18 @@ impl Thread {
             affine_all: AtomicBool::new(true),
             migrations: AtomicU64::new(0),
             wakeups: AtomicU64::new(0),
+            util: AtomicU32::new(0),
+            util_at: AtomicU64::new(0),
+            util_runtime: AtomicU64::new(0),
             wake_next: AtomicU64::new(0),
             sleep_deadline: AtomicU64::new(0),
             ctx,
             entry: SpinLock::new(entry),
             done: Completion::new(),
             futex: futex::ThreadState::new(),
+            user_ids: AtomicU64::new(0),
+            user_regs: [const { AtomicU64::new(0) }; 3],
+            io: ioac::IoAcct::new(),
         }
     }
     fn state(&self) -> State {
@@ -328,6 +352,29 @@ impl Thread {
     pub fn group(&self) -> u64 {
         self.group.load(Ordering::Relaxed)
     }
+    /// SELFOPT-1: names the program thread it runs (pid and tid as the initial pid namespace sees them).
+    pub fn set_user_ids(&self, pid: u32, tid: u32) {
+        self.user_ids.store((pid as u64) << 32 | tid as u64, Ordering::Relaxed);
+    }
+    /// SELFOPT-1: (pid, tid) of the program thread it runs; None for a kernel thread. Lock-free (interrupt handlers).
+    pub fn user_ids(&self) -> Option<(u32, u32)> {
+        let v = self.user_ids.load(Ordering::Relaxed);
+        (v != 0).then_some(((v >> 32) as u32, v as u32))
+    }
+    /// SELFOPT-1: the program's registers as it last left user mode (the process loop, after every return).
+    pub fn note_user_regs(&self, rip: u64, rbp: u64, rsp: u64) {
+        self.user_regs[0].store(rip, Ordering::Relaxed);
+        self.user_regs[1].store(rbp, Ordering::Relaxed);
+        self.user_regs[2].store(rsp, Ordering::Relaxed);
+    }
+    /// SELFOPT-1: (rip, rbp, rsp) noted by `note_user_regs`.
+    pub fn user_regs(&self) -> (u64, u64, u64) {
+        (self.user_regs[0].load(Ordering::Relaxed), self.user_regs[1].load(Ordering::Relaxed), self.user_regs[2].load(Ordering::Relaxed))
+    }
+    /// Whether it is a CPU's idle thread.
+    pub fn is_idle_thread(&self) -> bool {
+        self.is_idle()
+    }
     /// Its longest wake-to-run wait while Interactive (ns, SC-7a).
     pub fn interactive_wait_max(&self) -> u64 {
         self.wait_max.load(Ordering::Relaxed)
@@ -351,6 +398,25 @@ impl Thread {
     /// The CPU it runs or last ran on (`NO_CPU` before its first run).
     pub fn last_cpu(&self) -> usize {
         self.cpu.load(Ordering::Relaxed)
+    }
+    /// GP-CPU2: its utilisation (0..=1024) as of its last wake-up on a hybrid CPU (0 elsewhere).
+    pub fn util(&self) -> u32 {
+        self.util.load(Ordering::Relaxed)
+    }
+    /// Brings `util` up to date at a wake-up (hybrid CPUs only; the thread is not running, so `runtime_ns` is whole).
+    /// Windows shorter than a PELT period are left to grow, so a thread woken every few hundred microseconds is still
+    /// measured.
+    pub(crate) fn update_util(&self, now: u64) {
+        let at = self.util_at.load(Ordering::Relaxed);
+        if at != 0 && now.saturating_sub(at) < hybrid::PERIOD_NS {
+            return;
+        }
+        let run = self.runtime_ns.load(Ordering::Relaxed);
+        self.util_at.store(now, Ordering::Relaxed);
+        let before = self.util_runtime.swap(run, Ordering::Relaxed);
+        if at != 0 {
+            self.util.store(hybrid::util_next(self.util(), run.saturating_sub(before), now - at), Ordering::Relaxed);
+        }
     }
     pub fn migrations(&self) -> u64 {
         self.migrations.load(Ordering::Relaxed)
@@ -451,6 +517,7 @@ pub fn init() {
     guard::install();
     ksync::set_tsc_hz(time::tsc_hz());
     ksync::set_sched_hooks(&HOOKS);
+    hal::percpu::set_resched_hook(preempt_deferred);
     STARTED.store(true, Ordering::Release);
     for (name, class, f) in [("reaper", Class::Normal, reap::reaper_loop as fn()), ("poll", Class::KernelRt, idle::poll_loop as fn())] {
         if let Err(e) = spawn(name, class, f) {
@@ -491,6 +558,7 @@ fn smp_start() -> Result<(), &'static str> {
     }
     if let Some(t) = hal::smp::topology(0) {
         let _ = cpus::this().topo.get_or_init(|| t);
+        cpus::note_core_type(t.core_type);
     }
     // RB-5b: a Reload parks the APs from an interrupt; a CPU that holds a ksync spin lock (or a PreemptGuard)
     // says "not now" and gets the park interrupt again later.
@@ -524,6 +592,11 @@ fn ap_entry(cpu: usize) -> ! {
     cstate::check_cpu(cs);
     if let Some(topo) = hal::smp::topology(cpu) {
         let _ = cs.topo.get_or_init(|| topo);
+        cpus::note_core_type(topo.core_type);
+    }
+    // Before it is online: nothing is queued on a CPU whose queue lacks the room (`run::reserve`).
+    if run::reserve_cpu(cs).is_err() {
+        park(cpu, "no memory for the run queue");
     }
     if table::insert(t.clone()).is_err() {
         park(cpu, "no memory for the thread table");
@@ -893,7 +966,20 @@ pub fn timer_tick() {
 /// interrupts on, holds no spin lock, is not in a nested handler). Returns whether it switched (this returns
 /// when the thread runs again, possibly on another CPU).
 pub fn irq_exit_preempt(interrupted_if: bool) -> bool {
-    if !STARTED.load(Ordering::Acquire) || !interrupted_if || hal::percpu::in_hard_irq() || ksync::preempt_count() > 0 {
+    if !STARTED.load(Ordering::Acquire) || hal::percpu::in_hard_irq() {
+        return false;
+    }
+    if !interrupted_if || ksync::preempt_count() > 0 {
+        // `of`, not `this`: nothing may grow the per-CPU table in an interrupt handler.
+        let Some(cs) = cpus::of(hal::percpu::this_cpu()) else { return false };
+        // The interrupted code may not be preempted here (a spin lock held, interrupts off). A switch that is due
+        // waits for the point where it may: the count's drop to 0 or interrupts turned on (`preempt_deferred`).
+        // Without it the woken thread stayed on this CPU's wake list while a thread that never blocks kept a
+        // spin lock most of the time and the tick was off: nothing interrupted it again (FS's snapshot
+        // experiment, 20 s to 3 minutes; Linux keeps PREEMPT_NEED_RESCHED in the count for this).
+        if (cs.need_resched.load(Ordering::Acquire) || cs.wake_head.load(Ordering::Acquire) != 0) && !cs.in_idle.load(Ordering::Acquire) {
+            hal::percpu::defer_resched();
+        }
         return false;
     }
     let cs = cpus::this();
@@ -907,6 +993,27 @@ pub fn irq_exit_preempt(interrupted_if: bool) -> bool {
     matches!(run::schedule(Leave::Preempt), Ok(true))
 }
 klog::counter!(PREEMPTIONS, "sched.irq_preemptions");
+
+/// The deferred half of `irq_exit_preempt` (hal's resched hook): runs where the preemption count dropped to 0 or
+/// interrupts came back on with it at 0, i.e. at a point where an interrupt could have preempted the thread
+/// anyway. The flag stays for a later point when this one does not allow it yet.
+fn preempt_deferred() {
+    if !STARTED.load(Ordering::Acquire) || hal::percpu::in_hard_irq() || ksync::preempt_count() > 0 || !hal::cpu::interrupts_enabled() {
+        return;
+    }
+    if !hal::percpu::take_deferred_resched() {
+        return;
+    }
+    let cs = cpus::this();
+    timers::tick_update(cs);
+    if !(cs.need_resched.load(Ordering::Acquire) || cs.wake_head.load(Ordering::Acquire) != 0) || cs.in_idle.load(Ordering::Acquire) {
+        return;
+    }
+    DEFERRED_PREEMPTIONS.inc();
+    let _irq = hal::cpu::IrqGuard::new();
+    let _ = run::schedule(Leave::Preempt);
+}
+klog::counter!(pub DEFERRED_PREEMPTIONS, "sched.deferred_preemptions");
 
 /// Sleeps at least `ns` nanoseconds (ended by the sleep timer, `timers`; costs nothing while asleep).
 pub fn sleep_ns(ns: u64) {
@@ -1058,6 +1165,9 @@ impl SchedHooks for Hooks {
     }
     fn spin_on_owner(&self, owner: &AtomicU64, deadline_ns: u64, take: &dyn Fn() -> bool) -> bool {
         spin_on_owner(owner, deadline_ns, take)
+    }
+    fn holds_waited(&self) -> bool {
+        pi::holds_waited()
     }
     fn rank(&self, r: ThreadRef) -> u8 {
         // Asked by the sleeper itself before it queues: its own thread, no table lookup.

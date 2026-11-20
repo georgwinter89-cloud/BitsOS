@@ -2,8 +2,7 @@
 //!
 //! `init` is the one call the kernel makes (after `time::init` and `acpi::init`, see the CP-3 notes for the
 //! exact place); it runs `setup` and then turns interrupts on. `setup` (idempotent, interrupts stay off):
-//! 1. the BSP's LAPIC through `hal::apic::init_bsp`: x2APIC when CPUID offers it (`apic=xapic` in CONFIG.TXT
-//!    keeps xAPIC), spurious vector 0xFF, LINT0 masked, NMI on the MADT's pin, LVT timer masked (CP-5);
+//! 1. the BSP's LAPIC through `hal::apic::init_bsp`: x2APIC when CPUID offers it, else xAPIC, spurious vector 0xFF, LINT0 masked, NMI on the MADT's pin, LVT timer masked (CP-5);
 //!    unmasked firmware LVTs (thermal, perf, CMCI, error, AMD extended) are left alone with their vector
 //!    reserved, or masked when that vector is not a device vector (0x30-0xEF);
 //! 2. both 8259s re-initialised to 0x20-0x2F and masked for good;
@@ -135,11 +134,11 @@ pub fn route(p: Purpose) -> Option<&'static Route> {
 
 /// Sets up the controllers and turns interrupts on for this CPU. The kernel calls it once, after `acpi::init`.
 pub fn init(config: &dyn Fn(&str) -> Option<String>) -> Result<&'static State, SetupError> {
-    // Before anything can fail: CP-4b's `smp=`/`cpus=` for the `cpu.smp` initcall.
+    // Before anything can fail: the values the `cpu.smp` initcall reads (`cpu_keys`).
     crate::cpu_keys::capture(config);
-    // CP-5: tz=, lapic_timer=, hrtimer= before the boot CPU's timer starts.
+    // CP-5: tz= before the boot CPU's timer starts.
     time::configure(config);
-    let r = setup(config);
+    let r = setup();
     match r {
         Ok(st) => {
             // CP-5: the boot CPU's LAPIC timer drives its hrtimer queue from here on (logs its own result).
@@ -155,29 +154,18 @@ pub fn init(config: &dyn Fn(&str) -> Option<String>) -> Result<&'static State, S
 }
 
 /// Sets up LAPIC, 8259s and I/O APICs once (later calls return the first result). Interrupts stay as they are.
-pub fn setup(config: &dyn Fn(&str) -> Option<String>) -> Result<&'static State, SetupError> {
-    let st = STATE.get_or_init(|| build(config)).as_ref().map_err(|e| *e)?;
+pub fn setup() -> Result<&'static State, SetupError> {
+    let st = STATE.get_or_init(build).as_ref().map_err(|e| *e)?;
     if !POLLER.swap(true, Ordering::AcqRel) {
         vectors::register_poller("cp.irq.events", report_deferred);
     }
     Ok(st)
 }
 
-fn want_x2apic(config: &dyn Fn(&str) -> Option<String>) -> bool {
-    match config("apic").as_deref().map(str::trim) {
-        None | Some("") | Some("x2apic") => true,
-        Some("xapic") => false,
-        Some(other) => {
-            klog::event!(Warn, "apic", "config.unknown", value = other; "apic= takes x2apic or xapic; x2apic used");
-            true
-        }
-    }
-}
-
-fn build(config: &dyn Fn(&str) -> Option<String>) -> Result<State, SetupError> {
+fn build() -> Result<State, SetupError> {
     let _irq = hal::cpu::IrqGuard::new();
-    let want = want_x2apic(config);
-    let mut lapic = apic::init_bsp(&LapicConfig { want_x2apic: want, nmi: None }).map_err(|e| {
+    // x2APIC wherever the CPU offers it (Linux's default); `init_bsp` takes the xAPIC on one without.
+    let mut lapic = apic::init_bsp(&LapicConfig { nmi: None }).map_err(|e| {
         klog::event!(Error, "apic", "setup.failed", error = format!("{e:?}"); "the LAPIC cannot be used");
         SetupError::Lapic(e)
     })?;
@@ -190,7 +178,7 @@ fn build(config: &dyn Fn(&str) -> Option<String>) -> Result<State, SetupError> {
         lapic.nmi = nmi;
     }
     let lvt = apic::lvt_snapshot().unwrap_or(lapic.after);
-    log_lapic(&lapic, &lvt, want);
+    log_lapic(&lapic, &lvt);
     let (reserved_lvt, masked_lvt) = reserve_firmware_lvts(&lvt);
     if let Some(m) = madt
         && m.lapic_address != lapic.base_phys
@@ -265,17 +253,14 @@ fn build(config: &dyn Fn(&str) -> Option<String>) -> Result<State, SetupError> {
     Ok(st)
 }
 
-fn log_lapic(l: &LapicReport, lvt: &LvtSnapshot, want: bool) {
+fn log_lapic(l: &LapicReport, lvt: &LvtSnapshot) {
     klog::event!(Info, "apic", "setup", mode = l.mode.name(), firmware_mode = l.firmware_mode.name(), cpuid_x2apic = l.cpuid_x2apic,
         id = l.id, base = Hex(l.base_phys), apic_base_msr = Hex(l.apic_base), version = Hex(l.version as u64), max_lvt = l.max_lvt,
         svr_was = Hex(l.before.svr as u64), svr = Hex(lvt.svr as u64), lint0 = Hex(lvt.lint0 as u64), lint1 = Hex(lvt.lint1 as u64),
         timer = Hex(lvt.timer as u64), error = Hex(lvt.error as u64), nmi_lint = l.nmi.lint, nmi_low = l.nmi.active_low,
         stale_isr_acked = l.stale_isr_acked, esr = Hex(l.esr as u64), eilvt_count = l.eilvt_count);
-    if l.mode == Mode::XApic && want {
+    if l.mode == Mode::XApic {
         klog::event!(Info, "apic", "fallback.xapic", reason = "cpuid has no x2apic"; "xAPIC through its MMIO page");
-    }
-    if l.kept_firmware_x2apic {
-        klog::event!(Warn, "apic", "fallback.x2apic", reason = "firmware had x2apic on"; "apic=xapic ignored");
     }
     if l.xapic_map_failed {
         klog::event!(Warn, "apic", "fallback.x2apic", reason = "xapic page not mappable");

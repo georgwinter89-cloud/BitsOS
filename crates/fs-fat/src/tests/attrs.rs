@@ -191,6 +191,40 @@ fn stick_mcp_is_root_only() {
     assert_eq!(st("/boot/BITSOS2/bin/mcp"), (0, 0, 0o755));
 }
 
+/// INT-CL3T (CL-S CR 1): `\BITSOS2\settings\` (settingsd's files: `ai.toml` holds the AI providers' keys in
+/// clear, `owners.list` whose secrets are whose) is root's with 0700/0600 like `\BITSOS2\mcp\`. settingsd runs
+/// as root; everyone else asks its socket.
+#[test]
+fn stick_settings_is_root_only() {
+    use vfs::abi::{O_CREAT, O_RDONLY, O_WRONLY};
+    let dir = scratch("attrs-settings");
+    let dev = Arc::new(crate::MemDev::new(stick_image(&dir, true), 512));
+    let vol = mount_stick(&dev);
+    let ns = view(&vol);
+    let root = Ctx::kernel(&ns);
+    root.mkdir(None, b"/boot/BITSOS2/settings", 0o755).unwrap();
+    root.open(None, b"/boot/BITSOS2/settings/ai.toml", O_CREAT | O_WRONLY, 0o644).unwrap().pwrite(0, b"ai.provider.a.key = \"k\"").unwrap();
+    let st = |p: &str| {
+        let a = ns.lookup_path(p.as_bytes(), false).unwrap().attr();
+        (a.uid, a.gid, a.mode & 0o7777)
+    };
+    assert_eq!(st("/boot/BITSOS2/settings"), (0, 0, 0o700));
+    assert_eq!(st("/boot/BITSOS2/SETTINGS/ai.toml"), (0, 0, 0o600), "whatever the case");
+    assert_eq!(ns.read_file("/boot/BITSOS2/settings/ai.toml", 64).unwrap(), b"ai.provider.a.key = \"k\"");
+    let user = Ctx { cred: Cred { uid: 1000, gid: 1000 }, ..Ctx::kernel(&ns) };
+    assert_eq!(user.open(None, b"/boot/BITSOS2/settings/ai.toml", O_RDONLY, 0).err(), Some(EACCES));
+    assert_eq!(user.open(None, b"/boot/BITSOS2/settings", O_RDONLY, 0).err(), Some(EACCES), "not even its names");
+    assert_eq!(user.open(None, b"/boot/BITSOS2/settings/owners.list", O_CREAT | O_WRONLY, 0o644).err(), Some(EACCES));
+    assert_eq!(user.unlink(None, b"/boot/BITSOS2/settings/ai.toml").err(), Some(EACCES));
+    // A mode root asks for does not open it again.
+    set(&root, "/boot/BITSOS2/settings/ai.toml", |_| setattr::chmod(0o644)).unwrap();
+    assert_eq!(mode(&ns, "/boot/BITSOS2/settings/ai.toml"), 0o600);
+    // Its neighbours stay as they were, and so does a "settings" deeper down.
+    root.mkdir(None, b"/boot/BITSOS2/bin/settings", 0o755).unwrap();
+    assert_eq!(st("/boot/BITSOS2/bin/settings"), (0, 0, 0o755));
+    assert_eq!(st("/boot/BITSOS2/bin"), (0, 0, 0o755));
+}
+
 /// INT-W7 (MC-push CR 4 to FS): a rename into or out of `\BITSOS2\home\` gives the moved node and its cached
 /// subtree the owner and mode of the new place at once, not only after the next mount.
 #[test]

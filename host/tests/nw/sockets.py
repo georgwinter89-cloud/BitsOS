@@ -139,7 +139,7 @@ def ktest_during(mcp, token, name, what):
     print(text)
     head = text.splitlines()[0] if text else ""
     if "no ktest matches" in head:
-        print(f"note: {name} is not in this kernel (desk: plan/notes/nw-NW-7-integration.patch)")
+        print(f"note: {name} is not in this kernel")
         return
     need(not err and "passed=1 failed=0" in head, what)
     lat.sort()

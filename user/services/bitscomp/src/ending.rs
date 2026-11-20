@@ -3,7 +3,7 @@
 //! SIGKILL 2 s later if the same process is still there, and then the Wayland client is dropped, so the window
 //! goes even if the process lingers in the kernel. "The same process": its start time in /proc/PID/stat, read at
 //! accept, must still match before every signal, so a pid that was reused since the client connected is never
-//! hit. SIGCONT because a stopped process keeps SIGTERM pending until it runs again (linux-6.6/kernel/signal.c
+//! hit. SIGCONT because a stopped process keeps SIGTERM pending until it runs again (linux-7.3.1/kernel/signal.c:877
 //! prepare_signal: only SIGKILL and SIGCONT act on a stopped task). Only that one pid: like other Linux
 //! desktops, a program's own children are its business. Never waits (B4): the SIGKILL is a deadline the main
 //! loop checks.
@@ -28,8 +28,8 @@ pub struct Ending {
     what: String,
 }
 
-/// Never pid 0 (unknown), 1 (init) or bitscomp itself (kill(2) with pid <= 0 means groups, linux-6.6/kernel/signal.c
-/// kill_something_info).
+/// Never pid 0 (unknown), 1 (init) or bitscomp itself (kill(2) with pid <= 0 means groups,
+/// linux-7.3.1/kernel/signal.c:1615 kill_something_info).
 pub fn may_signal(pid: i32, own: i32) -> bool {
     pid > 1 && pid != own
 }
@@ -58,8 +58,8 @@ pub fn cmdline(pid: i32) -> Option<Vec<String>> {
     split_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
 }
 
-/// Every argument ends with a NUL (linux-6.6/fs/proc/base.c:256 get_mm_cmdline): only that last terminator is dropped,
-/// so an empty argument inside (`foot -T ""`) stays.
+/// Every argument ends with a NUL (linux-7.3.1/fs/proc/base.c:283 get_mm_cmdline): only that last terminator is
+/// dropped, so an empty argument inside (`foot -T ""`) stays.
 pub fn split_cmdline(raw: &[u8]) -> Option<Vec<String>> {
     let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
     if raw.is_empty() {
@@ -81,6 +81,46 @@ fn still_same(pid: i32, at_accept: Option<u64>) -> Option<bool> {
 fn signal(pid: i32, sig: libc::c_int) -> std::io::Result<()> {
     // SAFETY: kill(2) on a single positive pid checked by `may_signal`; no memory is touched.
     if unsafe { libc::kill(pid, sig) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// GM-6c: bitscomp's own process group (a group to signal must never be it).
+pub fn own_group() -> u32 {
+    // SAFETY: getpgrp has no arguments and cannot fail.
+    unsafe { libc::getpgrp() as u32 }
+}
+
+/// GM-6c: whether Spiel beenden may SIGTERM the window's process group `pgid`: never 0, 1 or bitscomp's own,
+/// never a group another window's program is in (`others`), never the Steam client's (`leader` is the group
+/// leader's /proc comm; a game Steam started may share Steam's group, and Steam must live on).
+pub fn group_ok(pgid: u32, own: u32, others: &[u32], leader: &str) -> bool {
+    pgid > 1 && pgid != own && !others.contains(&pgid) && !matches!(leader.trim(), "steam" | "steam.sh" | "steamwebhelper")
+}
+
+/// The process group of `pid`, None when it cannot be read (ended, reaped, foreign): never a guess.
+pub fn group_read(pid: u32) -> Option<u32> {
+    let p = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: getpgid only reads the pid; an ended or foreign pid answers -1 (ESRCH).
+    u32::try_from(unsafe { libc::getpgid(p) }).ok()
+}
+
+/// The group leader's /proc comm, None when unreadable or empty (the Steam check must not pass on nothing).
+pub fn leader_comm(pgid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pgid}/comm")).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+}
+
+/// Spiel beenden's group to SIGTERM, read before the window's program is signalled: none when the group or its
+/// leader's name cannot be read (fails closed), else as `group_ok` says.
+pub fn group_target(pgid: Option<u32>, own: u32, others: &[u32], leader: Option<&str>) -> Option<u32> {
+    let (g, l) = (pgid?, leader?);
+    group_ok(g, own, others, l).then_some(g)
+}
+
+/// SIGTERM (or `sig`) to process group `pgid` (kill(2) with -pgid), after `group_ok`.
+pub fn signal_group(pgid: u32, sig: libc::c_int) -> std::io::Result<()> {
+    let g = libc::pid_t::try_from(pgid).ok().filter(|g| *g > 1).ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: kill(2) on the negative of a group id > 1 checked above (never 0 or -1, which mean "all"); no
+    // memory is touched.
+    if unsafe { libc::kill(-g, sig) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 impl App {
@@ -143,6 +183,8 @@ impl App {
             eprintln!("bitscomp: {what}: already ended (zombie), client dropped ({why})");
             return Ok(format!("{what}: the program has already ended; client dropped"));
         }
+        // PE-1: an end the desktop asked for is no program error.
+        self.prog_asked(pid as u32);
         if let Err(e) = signal(pid, libc::SIGTERM) {
             // ESRCH: the process is gone already; its socket closes by itself.
             self.drop_client(&client);
@@ -201,6 +243,46 @@ mod tests {
         assert_eq!(split_cmdline(b"rewritten title"), v(&["rewritten title"]));
         assert_eq!(split_cmdline(b""), None);
         assert_eq!(split_cmdline(b"\0"), None);
+    }
+
+    #[test]
+    fn spiel_beenden_never_signals_a_shared_or_steams_group() {
+        assert!(group_ok(4242, 100, &[], "wyclient"));
+        assert!(!group_ok(0, 100, &[], "x"));
+        assert!(!group_ok(1, 100, &[], "init"));
+        assert!(!group_ok(100, 100, &[], "bitscomp"));
+        assert!(!group_ok(4242, 100, &[7, 4242], "sh"), "another window's program is in it");
+        assert!(!group_ok(4242, 100, &[], "steam\n"), "Steam's group");
+        assert!(signal_group(1, 0).is_err() && signal_group(0, 0).is_err());
+        assert_eq!(group_target(Some(4242), 100, &[], Some("wyclient")), Some(4242));
+        assert_eq!(group_target(None, 100, &[], Some("wyclient")), None, "getpgid failed: no group");
+        assert_eq!(group_target(Some(4242), 100, &[], None), None, "unreadable leader: not signalled");
+        assert_eq!(group_target(Some(4242), 100, &[4242], Some("wyclient")), None);
+        assert_eq!(group_read(0), None);
+    }
+
+    #[test]
+    fn spiel_beenden_terms_a_programs_own_group() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        // A program in a group of its own (as `spawn` starts launchers): read, chosen, SIGTERMed as a group.
+        let mut c = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let pid = c.id();
+        let g = group_read(pid);
+        assert_eq!(g, Some(pid));
+        // Between fork and exec the child still carries this test binary's name: wait for the exec.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut comm = leader_comm(pid);
+        while comm.as_deref() != Some("sleep") && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            comm = leader_comm(pid);
+        }
+        assert_eq!(comm.as_deref(), Some("sleep"));
+        let t = group_target(g, own_group(), &[], comm.as_deref());
+        assert_eq!(t, Some(pid));
+        signal_group(pid, libc::SIGTERM).unwrap();
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert_eq!(group_read(pid), None, "reaped: no group to read");
+        assert_eq!(group_target(Some(own_group()), own_group(), &[], Some("bitscomp")), None, "never bitscomp's own");
     }
 
     #[test]

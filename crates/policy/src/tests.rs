@@ -12,7 +12,7 @@ extern crate std;
 pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
 fn subj(p: u32) -> Subject {
-    Subject { program: ProgramId(p), pid: 100 + p, uid: 1000 }
+    Subject { program: ProgramId(p), pid: 100 + p, uid: 1000, tree: 0 }
 }
 
 fn path(p: &str, write: bool, create: bool) -> Access<'_> {
@@ -125,7 +125,7 @@ fn table_fast_path_and_refusal() {
     assert!(check(&s, &path("/open/x", false, false)).is_ok());
     // SYSTEM keeps allow-all even under a strict default for foreign programs.
     set_default_rules(Some(RuleSet::with_defaults([Decision::Deny; CLASSES])));
-    assert!(check(&Subject { program: ProgramId::SYSTEM, pid: 5, uid: 0 }, &path("/x", true, true)).is_ok());
+    assert!(check(&Subject { program: ProgramId::SYSTEM, pid: 5, uid: 0, tree: 0 }, &path("/x", true, true)).is_ok());
     assert!(check(&subj(9003), &path("/x", false, false)).is_err());
     set_default_rules(None);
     set_rules(p, None);
@@ -299,7 +299,7 @@ fn identical_asks_share_one_request() {
     r.ask_timeout_ns = Some(20_000_000_000);
     set_rules(p, Some(r));
     let waiters: std::vec::Vec<_> = (0..3)
-        .map(|i| std::thread::spawn(move || check(&Subject { program: ProgramId(9050), pid: 200 + i, uid: 1000 }, &Access::Device { class: DeviceClass::Camera, name: "video0" }).is_ok()))
+        .map(|i| std::thread::spawn(move || check(&Subject { program: ProgramId(9050), pid: 200 + i, uid: 1000, tree: 0 }, &Access::Device { class: DeviceClass::Camera, name: "video0" }).is_ok()))
         .collect();
     // Wait until all three are parked on the one request (they cannot be told apart from outside, so give
     // the late ones time to join it).

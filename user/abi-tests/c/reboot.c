@@ -1,4 +1,4 @@
-/* UL-7: reboot(2)'s refusals (linux-6.6/kernel/reboot.c :700). Never a valid command: every call carries a
+/* UL-7: reboot(2)'s refusals (linux-7.3.1/kernel/reboot.c:738). Never a valid command: every call carries a
  * command no kernel knows, so even a caller with CAP_SYS_BOOT gets EINVAL and nothing restarts. Without the
  * capability (the ABI diff runs as an ordinary user on CachyOS and as MCP's user 1000 on V2) EPERM comes first,
  * before the magic numbers are looked at. */

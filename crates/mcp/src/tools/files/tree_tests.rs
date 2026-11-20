@@ -282,6 +282,44 @@ fn fetch_refuses_before_it_makes_directories() {
     assert!(failed(&j) && !exists("/t7/new"), "{}", j.to_string());
 }
 
+/// UPDATE: the update service's folder on the boot medium and the token in settingsd's are out of every file tool's reach.
+#[test]
+fn the_update_folder_is_never_reached() {
+    for p in ["/boot/BITSOS2/UPDATE", "/boot/BITSOS2/UPDATE/TOKEN", "/boot/bitsos2/update/token", "/boot/BITSOS2/Update./SOURCE.TXT"] {
+        assert!(super::kept_refusal(p).is_some_and(|w| w.contains("update service")), "{p}");
+    }
+    // The token itself lies in settingsd's folder, refused by the rule older kernels have too.
+    for p in ["/boot/BITSOS2/settings/update.tok", "/boot/bitsos2/SETTINGS/UPDATE.TOK"] {
+        assert!(super::settings_refusal(p).is_some(), "{p}");
+    }
+    for p in ["/boot/BITSOS2/UPDATE2/TOKEN", "/boot/BITSOS2/bin/update", "/data/update/token", "/boot/update/token"] {
+        assert!(super::kept_refusal(p).is_none(), "{p}");
+    }
+    for (dir, name) in [("/boot/BITSOS2/UPDATE", "TOKEN"), ("/boot/BITSOS2", "UPDATE"), ("/boot/BITSOS2", "update.")] {
+        assert!(stick_refusal(dir, name.as_bytes()).is_some_and(|w| w.contains("update service")), "{dir} {name}");
+    }
+    assert!(stick_refusal("/boot/BITSOS2", b"updates").is_none());
+}
+
+/// CL-S CR 4 (INT-CL3T): settingsd's folder on the stick (the AI providers' keys in clear, the owners' list)
+/// is out of every file tool's reach, for reading and for writing; its neighbours are not.
+#[test]
+fn the_settings_folder_is_never_reached() {
+    for p in ["/boot/BITSOS2/settings", "/boot/BITSOS2/settings/ai.toml", "/boot/bitsos2/SETTINGS/owners.list", "/boot/BITSOS2/Settings./journal.log", "/boot/BITSOS2/settings/a/b"] {
+        assert!(super::kept_refusal(p).is_some_and(|w| w.contains("settings_get") && w.contains("keys in clear")), "{p}");
+    }
+    for p in ["/boot/BITSOS2", "/boot/BITSOS2/settings2/ai.toml", "/boot/BITSOS2/bin/settings", "/boot/BITSOS2/home/settings/x", "/tmp/boot/BITSOS2/settings", "/data/settings/ai.toml", "/boot/settings/ai.toml"] {
+        assert!(super::kept_refusal(p).is_none(), "{p}");
+    }
+    // Writing, deleting and moving: in the folder, and the folder itself as an entry of \BITSOS2\.
+    for (dir, name) in [("/boot/BITSOS2/settings", "ai.toml"), ("/boot/BITSOS2/SETTINGS", "owners.list"), ("/boot/BITSOS2/settings/sub", "x"), ("/boot/BITSOS2", "settings"), ("/boot/BITSOS2", "Settings.")] {
+        assert!(stick_refusal(dir, name.as_bytes()).is_some_and(|w| w.contains("settings_set")), "{dir} {name}");
+    }
+    for (dir, name) in [("/boot/BITSOS2", "settings2"), ("/boot/BITSOS2/bin", "settings"), ("/boot/BITSOS2/home", "settings")] {
+        assert!(stick_refusal(dir, name.as_bytes()).is_none(), "{dir} {name}");
+    }
+}
+
 /// MC-10: the installer's grants are out of every file tool's reach, the place itself and all below it.
 #[test]
 fn the_access_store_is_never_reached() {

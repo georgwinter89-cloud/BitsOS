@@ -377,10 +377,7 @@ impl Inner {
             rec(Rung::Mode2),
             rec(Rung::None),
             Rung::from_u8(s.ladder_from.load(Ordering::Acquire)).name(),
-            match self.domain.policy().mode2 {
-                amdgpu_fmt::recover::Mode2Gate::Refused(why) => format!("refused: {why}"),
-                amdgpu_fmt::recover::Mode2Gate::Measured { proof } => format!("open: {proof}"),
-            }
+            if self.domain.policy().mode2 { "is the last rung" } else { "is not this chip's method" }
         ));
         if let Some(l) = &self.last_reset {
             v.push(format!("backend recovery: the last full reset:\n{l}"));

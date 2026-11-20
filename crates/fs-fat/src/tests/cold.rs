@@ -1,5 +1,4 @@
-//! FS-14b: a cold start reads each byte from the stick once (plan/notes/desk-minipc-w11.md "Cold vs warm
-//! start": Brave's first start read 4.5 GB for a 575 MB folder). Files mapped by several "processes" in their
+//! FS-14b: a cold start reads each byte from the stick once (Brave's first start read 4.5 GB for a 575 MB folder). Files mapped by several "processes" in their
 //! own fault orders, faulted at the same time by two threads, and read with read() in small and large pieces:
 //! the device reads at most 1.2 x the bytes of the files, and a second pass reads nothing.
 

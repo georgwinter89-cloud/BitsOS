@@ -166,7 +166,7 @@ ktest!("fs.dev.console_out", Safe, console_out);
 fn dev_cases() -> TestResult {
     let ns = vfs::root_ns();
     if ns.lookup("/bin/fs-cases").is_err() {
-        return ktest::fail("/bin/fs-cases is not in this image (xtask change request 3 in plan/notes/fs-FS-1.md)");
+        return ktest::fail("/bin/fs-cases is not in this image (FS-1's xtask change request 3: host/xtask/src/image.rs builds host/tests/fs/progs)");
     }
     let n = RUN.fetch_add(1, Ordering::Relaxed);
     let cases = format!("/tmp/dev-cases-{n}.txt");

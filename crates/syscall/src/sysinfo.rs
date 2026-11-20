@@ -1,4 +1,4 @@
-//! sysinfo(2) (AB-5; linux-6.6/kernel/sys.c `do_sysinfo` :2802, `SYSCALL_DEFINE1(sysinfo)`) and the load
+//! sysinfo(2) (AB-5; linux-7.3.1/kernel/sys.c `do_sysinfo` :2934, `SYSCALL_DEFINE1(sysinfo)` :2997) and the load
 //! average behind it (kernel/sched/loadavg.c: `calc_load`, EXP_1/5/15, every LOAD_FREQ = 5 s).
 //!
 //! - uptime: seconds of the boot clock, rounded up when there is a fraction (`tp.tv_sec + (tp.tv_nsec ? 1 :

@@ -1,5 +1,5 @@
-//! The socket syscalls (linux-6.6/net/socket.c, net/core/sock.c `sk_setsockopt`/`sk_getsockopt`,
-//! net/core/scm.c `put_cmsg`/`scm_detach_fds`) on `vfs::sys::Sys`: the caller's memory, fd table, mount view and
+//! The socket syscalls (linux-7.3.1/net/socket.c, net/core/sock.c `sk_setsockopt`/`sk_getsockopt`,
+//! net/core/scm.c `put_cmsg`/`scm_detach_fds`/`scm_recv_unix`) on `vfs::sys::Sys`: the caller's memory, fd table, mount view and
 //! credentials. Every function takes the six raw arguments and returns the value or -errno, with Linux's
 //! argument checks in Linux's order; `crates/syscall/src/socket.rs` registers them.
 
@@ -32,6 +32,19 @@ fn access_ok(buf: u64, count: u64) -> bool {
 
 fn caller(s: &Sys<'_>) -> Caller {
     super::with_ns(Caller::new(s.subject.pid, s.cred.uid, s.cred.gid, s.subject))
+}
+
+/// The calling program's image for an AF_UNIX socket to keep with its peer credentials (SO_PEERSEC, the
+/// kernel's own listeners). The syscall glue brings it, as a question: it is asked only once the socket is
+/// known to be AF_UNIX, so no other family pays for it. Host tests and the kernel's own calls have none.
+pub type Who<'a> = &'a dyn Fn() -> Option<Arc<super::Program>>;
+
+fn nobody() -> Option<Arc<super::Program>> {
+    None
+}
+
+fn recording(s: &Sys<'_>, who: Who<'_>) -> Caller {
+    Caller { program: who(), ..caller(s) }
 }
 
 /// `sockfd_lookup_light`: EBADF (no fd, or an O_PATH one), ENOTSOCK.
@@ -157,6 +170,10 @@ impl vfs::File for Reserved {
 
 /// socketpair(2): two fds first (EMFILE), their numbers to the program (EFAULT), then the sockets.
 pub fn socketpair(s: &Sys<'_>, a: Args) -> i64 {
+    socketpair_by(s, a, &nobody)
+}
+
+pub fn socketpair_by(s: &Sys<'_>, a: Args, who: Who<'_>) -> i64 {
     ret((|| {
         let ty = a[1] as u32 as u64;
         let flags = ty & !SOCK_TYPE_MASK;
@@ -186,7 +203,7 @@ pub fn socketpair(s: &Sys<'_>, a: Args) -> i64 {
             Err(e) => return undo(e),
         };
         let Kind::Unix(u) = kind else { return undo(EOPNOTSUPP) };
-        let (x, y) = UnixSock::pair(u.ty, &c);
+        let (x, y) = UnixSock::pair(u.ty, &Caller { program: who(), ..c });
         u.release(false);
         drop(u);
         let (fx, fy) = match (SockFile::new(Kind::Unix(x)), SockFile::new(Kind::Unix(y))) {
@@ -215,12 +232,16 @@ pub fn bind(s: &Sys<'_>, a: Args) -> i64 {
 
 /// listen(2): the backlog is clamped to net.core.somaxconn (a negative one too: Linux compares unsigned).
 pub fn listen(s: &Sys<'_>, a: Args) -> i64 {
+    listen_by(s, a, &nobody)
+}
+
+pub fn listen_by(s: &Sys<'_>, a: Args, who: Who<'_>) -> i64 {
     ret((|| {
         let (_, k) = sock(s, a[0])?;
         let backlog = (a[1] as u32).min(SOMAXCONN) as usize;
         match &k.kind {
-            Kind::Unix(u) => u.listen(backlog, &caller(s)).map(|_| 0),
-            Kind::Inet(i) => i.listen(backlog, &caller(s)).map(|_| 0),
+            Kind::Unix(u) => u.listen(backlog, &recording(s, who)).map(|_| 0),
+            Kind::Inet(i) => super::access::listen(i, backlog, &caller(s)),
             // `sock_no_listen`.
             Kind::Netlink(_) => Err(EOPNOTSUPP),
         }
@@ -249,6 +270,7 @@ fn do_accept(s: &Sys<'_>, a: Args, flags: u64) -> Result<i64, Errno> {
         }
         Kind::Inet(i) => {
             let (n, peer) = i.accept(nonblock, &caller(s))?;
+            super::access::accepted(&n, &peer, &caller(s));
             (Kind::Inet(n), (a[1] != 0).then_some(peer))
         }
         // `sock_no_accept`.
@@ -272,6 +294,10 @@ pub fn accept4(s: &Sys<'_>, a: Args) -> i64 {
 
 /// connect(2).
 pub fn connect(s: &Sys<'_>, a: Args) -> i64 {
+    connect_by(s, a, &nobody)
+}
+
+pub fn connect_by(s: &Sys<'_>, a: Args, who: Who<'_>) -> i64 {
     ret((|| {
         let f = s.fds.get(fd_of(a[0])?)?;
         if f.is_path_only() {
@@ -281,8 +307,8 @@ pub fn connect(s: &Sys<'_>, a: Args) -> i64 {
         let k = SockFile::of(&f.file).ok_or(ENOTSOCK)?;
         let nonblock = f.nonblocking();
         match &k.kind {
-            Kind::Unix(u) => u.connect(&raw, Some(&s.ctx()), &caller(s), nonblock).map(|_| 0),
-            Kind::Inet(i) => i.connect(&raw, &caller(s), nonblock).map(|_| 0),
+            Kind::Unix(u) => u.connect(&raw, Some(&s.ctx()), &recording(s, who), nonblock).map(|_| 0),
+            Kind::Inet(i) => super::access::connect(i, &raw, &caller(s), nonblock),
             Kind::Netlink(n) => n.connect(&raw, &caller(s)).map(|_| 0),
         }
     })())
@@ -622,6 +648,32 @@ impl CtlOut {
         self.used += n;
     }
 
+    /// `scm_pidfd_recv` (linux-7.3.1/net/core/scm.c:489): MSG_CTRUNC when an int does not fit, nothing for a
+    /// message without a pid, else the sender's pidfd (always close-on-exec) or the errno that stood in for it.
+    fn pidfd(&mut self, s: &Sys<'_>, pid: super::ScmPid) {
+        if self.left < cmsg_len(4) as u64 {
+            self.flags |= MSG_CTRUNC;
+            return;
+        }
+        let file = match &pid {
+            super::ScmPid::Nobody => return,
+            super::ScmPid::Unheld => super::pidfd_of(None),
+            super::ScmPid::Held(p) => super::pidfd_of(Some(p)),
+        };
+        let fd = match file {
+            Ok(f) => match s.fds.install_flags(f, 0, true) {
+                Ok(fd) => fd as i32,
+                Err(e) => -(e as i32),
+            },
+            Err(e) => -(e as i32),
+        };
+        let before = self.used;
+        self.put(s, SOL_SOCKET, SCM_PIDFD, &fd.to_le_bytes());
+        if self.used == before && fd >= 0 {
+            let _ = s.fds.close(fd as usize);
+        }
+    }
+
     /// `scm_detach_fds`: as many fds as fit (installed, numbers written), the rest closed with MSG_CTRUNC.
     fn rights(&mut self, s: &Sys<'_>, files: Vec<Arc<OpenFile>>, cloexec: bool) {
         let count = files.len();
@@ -664,7 +716,7 @@ fn recvmsg_one(s: &Sys<'_>, f: &OpenFile, k: &SockFile, at: u64, flags: u32) -> 
     let mut out = CtlOut { at: m.control, left: m.controllen, used: 0, flags: r.flags & (MSG_TRUNC | MSG_CTRUNC | MSG_EOR) };
     out.flags |= flags & MSG_CMSG_CLOEXEC;
     if m.control == 0 {
-        if r.creds.is_some() || !r.fds.is_empty() || r.pktinfo.is_some() || !r.ctl.is_empty() {
+        if r.creds.is_some() || r.pidfd.is_some() || r.sec || !r.fds.is_empty() || r.pktinfo.is_some() || !r.ctl.is_empty() || r.inq.is_some() {
             out.flags |= MSG_CTRUNC;
         }
         drop(r.fds);
@@ -683,6 +735,12 @@ fn recvmsg_one(s: &Sys<'_>, f: &OpenFile, k: &SockFile, at: u64, flags: u32) -> 
         }
         if !r.fds.is_empty() {
             out.rights(s, r.fds, flags & MSG_CMSG_CLOEXEC != 0);
+        }
+        if let Some(pid) = r.pidfd {
+            out.pidfd(s, pid);
+        }
+        if let Some(n) = r.inq {
+            out.put(s, SOL_SOCKET, SCM_INQ, &n.to_le_bytes());
         }
     }
     put(s, at + 48, &out.flags.to_le_bytes())?;
@@ -860,6 +918,10 @@ fn set_sol_socket(k: &SockFile, c: &Caller, name: u32, val: &[u8]) -> Result<(),
             };
             let v = v.min(i32::MAX as u32 / 2);
             o.rcvbuf.store((v * 2).max(SOCK_MIN_RCVBUF), Ordering::Relaxed);
+            // A bound UDP socket's loopback queue follows (it kept the size it was bound with).
+            if let Kind::Inet(i) = &k.kind {
+                i.options_changed();
+            }
         }
         SO_KEEPALIVE => {
             o.set(flag::KEEPALIVE, on);
@@ -883,7 +945,14 @@ fn set_sol_socket(k: &SockFile, c: &Caller, name: u32, val: &[u8]) -> Result<(),
             o.linger.store(if on { (1u64 << 63) | secs as u64 } else { 0 }, Ordering::Relaxed);
         }
         SO_BSDCOMPAT => {}
+        // linux-7.3.1/net/core/sock.c:1560-1586: the receive options belong to the families that attach them
+        // (`sk_may_scm_recv`: AF_UNIX and AF_NETLINK here; SO_PASSPIDFD and SO_PASSRIGHTS AF_UNIX only).
+        SO_PASSCRED | SO_PASSSEC if !k.may_scm_recv() => return Err(EOPNOTSUPP),
+        SO_PASSPIDFD | SO_PASSRIGHTS if k.unix().is_none() => return Err(EOPNOTSUPP),
         SO_PASSCRED => o.set(flag::PASSCRED, on),
+        SO_PASSSEC => o.set(flag::PASSSEC, on),
+        SO_PASSPIDFD => o.set(flag::PASSPIDFD, on),
+        SO_PASSRIGHTS => o.set(flag::NO_RIGHTS, !on),
         SO_RCVLOWAT => {
             let v = if v < 0 { i32::MAX } else { v };
             o.rcvlowat.store((v as u32).max(1), Ordering::Relaxed);
@@ -969,6 +1038,25 @@ pub fn setsockopt(s: &Sys<'_>, a: Args) -> i64 {
         if level == SOL_SOCKET && name == SO_BINDTODEVICE {
             return set_bindtodevice(s, &k, a[3], optlen as usize).map(|_| 0);
         }
+        // `unix_setsockopt` (linux-7.3.1/net/unix/af_unix.c:932) takes AF_UNIX's own options before
+        // `sock_setsockopt`: exactly an int, 0 or 1; SO_INQ on streams only.
+        if level == SOL_SOCKET
+            && matches!(name, SO_INQ | SO_RIGHTS_NOTRUNC)
+            && let Some(u) = k.unix()
+        {
+            if optlen != 4 {
+                return Err(EINVAL);
+            }
+            let v = read_u32(s, a[3])? as i32;
+            if name == SO_INQ && u.ty != UType::Stream {
+                return Err(ENOPROTOOPT);
+            }
+            if !(0..=1).contains(&v) {
+                return Err(EINVAL);
+            }
+            k.opts().set(if name == SO_INQ { flag::INQ } else { flag::RIGHTS_NOTRUNC }, v == 1);
+            return Ok(0);
+        }
         if level == SOL_SOCKET {
             if optlen < 4 {
                 return Err(EINVAL);
@@ -1031,7 +1119,12 @@ fn get_sol_socket(s: &Sys<'_>, k: &SockFile, name: u32) -> Result<Vec<u8>, Errno
         SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => get_timeout(&o.sndtimeo),
         SO_RCVLOWAT => int(o.rcvlowat.load(Ordering::Relaxed)),
         SO_SNDLOWAT => int(1),
+        SO_PASSCRED | SO_PASSSEC if !k.may_scm_recv() => return Err(EOPNOTSUPP),
+        SO_PASSPIDFD | SO_PASSRIGHTS if k.unix().is_none() => return Err(EOPNOTSUPP),
         SO_PASSCRED => b(flag::PASSCRED),
+        SO_PASSSEC => b(flag::PASSSEC),
+        SO_PASSPIDFD => b(flag::PASSPIDFD),
+        SO_PASSRIGHTS => int(!o.has(flag::NO_RIGHTS) as u32),
         SO_PEERCRED => {
             let c = match &k.kind {
                 Kind::Unix(u) => u.peercred(),
@@ -1069,6 +1162,24 @@ fn get_sol_socket(s: &Sys<'_>, k: &SockFile, name: u32) -> Result<Vec<u8>, Errno
     })
 }
 
+/// SO_PEERSEC (`security_socket_getpeersec_stream`, as SELinux and Smack answer it): the label of the program
+/// behind the peer credentials, as a string with its closing NUL. A buffer too short gets the length it needs
+/// and ERANGE; a socket without such a peer (not AF_UNIX, not connected, made by the kernel) ENOPROTOOPT, as
+/// Linux answers when no label was recorded.
+fn get_peersec(s: &Sys<'_>, k: &SockFile, a: Args, len: usize) -> Result<i64, Errno> {
+    let prog = k.unix().and_then(|u| u.peer_program()).ok_or(ENOPROTOOPT)?;
+    let need = prog.label.len() + 1;
+    if len < need {
+        put(s, a[4], &(need as u32).to_le_bytes())?;
+        return Err(ERANGE);
+    }
+    let mut out = Vec::with_capacity(need);
+    out.extend_from_slice(&prog.label);
+    out.push(0);
+    put(s, a[3], &out)?;
+    put(s, a[4], &(need as u32).to_le_bytes()).map(|_| 0)
+}
+
 /// getsockopt(2).
 pub fn getsockopt(s: &Sys<'_>, a: Args) -> i64 {
     ret((|| {
@@ -1081,6 +1192,8 @@ pub fn getsockopt(s: &Sys<'_>, a: Args) -> i64 {
         }
         let v = if level == SOL_SOCKET && name == SO_BINDTODEVICE {
             get_bindtodevice(&k, len as usize)?
+        } else if level == SOL_SOCKET && name == SO_PEERSEC {
+            return get_peersec(s, &k, a, len as usize);
         } else if level == SOL_SOCKET {
             get_sol_socket(s, &k, name)?
         } else {

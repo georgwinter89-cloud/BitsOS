@@ -59,7 +59,7 @@ impl KernelHeap {
         s.scatter = self.scatter_stats();
         s.held_by_kind = self.src().held();
         // Scattered blocks take their frames from the frame allocator directly, not through the page source.
-        s.held_by_kind[Kind::Heap as usize] += s.scatter.held_bytes;
+        s.held_by_kind[Kind::Heap as usize] += s.scatter.held_bytes + s.scatter.kept_bytes;
         s.live_by_kind[Kind::Heap as usize] = s.live_bytes + s.large_bytes;
         if core::ptr::eq(self, &crate::heap::HEAP) {
             crate::slab::for_each_cache(|c| {

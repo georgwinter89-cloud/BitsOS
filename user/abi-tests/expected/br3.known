@@ -1,4 +1,4 @@
-# BR-3: what Brave met on V2 that differs from CachyOS (plan/notes/br-BR-3.md, change requests 1-6). Remove a line
+# BR-3: what Brave met on V2 that differs from CachyOS (BR-3's change requests 1-6). Remove a line
 # in the same commit that lands its fix, so abi-diff turns red if the fix regresses.
 abi-br3 uevent: NW: NETLINK_KOBJECT_UEVENT is EPROTONOSUPPORT, Linux opens it and binds any of 32 groups for everyone (BR-3 CR 3)
 abi-br3probe anonname: AB+MM: PR_SET_VMA_ANON_NAME is EINVAL (decided: as Linux without CONFIG_ANON_VMA_NAME); CachyOS has it on (BR-3 CR 5)

@@ -1,14 +1,16 @@
 //! GM-1d: `\BITSOS2\mesa\` (Arch's Mesa, RADV, radeonsi, the Vulkan loader, vulkan-tools, mesa-utils with their own
 //! glibc), its launcher `\BITSOS2\bin\mesa-run` and `\BITSOS2\deqp\` (the Vulkan conformance runner, its data and its
 //! subset) as the package list names them. Class Program: on the Mini-PC only, where a missing tree is a failure
-//! (CONTRACTS section 4); `host/tests/minipc/vk.sh` starts them first. Rerunnable, and nothing here assumes QEMU or the
-//! machine's state: they read the stick, run on lavapipe (the CPU, so also before a GPU node exists and with the
-//! desktop running) and write only below a scratch folder of their own. No system library is hashed: both trees bring
-//! everything they load.
-//! - `ul.pkg.mesa`: every file's size, the SHA-256 of all up to 1 MiB, the pieces a Vulkan and EGL start needs, each
-//!   package's licence, the trees that run on this tree's loader, `mesa-run --check`, `vulkaninfo --summary` on lavapipe.
+//! (CONTRACTS section 4); the Mini-PC ktest round runs them. Rerunnable, and nothing here assumes QEMU: they read the
+//! stick, run on RADV (the tree's one Vulkan driver since DECISIONS 18.11.: no software driver; the machine's GPU
+//! node, also with the desktop running, which holds its own context) and write only below a scratch folder of their
+//! own. No system library is hashed: both trees bring everything they load.
+//! - `ul.pkg.mesa`: every file's size, the SHA-256 of all up to 1 MiB, the pieces a Vulkan, EGL and VA-API start needs,
+//!   each package's licence, the trees that run on this tree's loader, `mesa-run --check` (also its VA driver line),
+//!   no software driver in the tree, `vulkaninfo --summary` on RADV. `vainfo` is not started here: the video engine's
+//!   start is GX's (VCN), it is the desk's check on the Mini-PC (`plan/spec/programs.md` section 4).
 //! - `ul.pkg.mesa_sha`: the SHA-256 of the bigger files (libLLVM, libgallium, the drivers; ~280 MB).
-//! - `ul.pkg.deqp`: the same for the deqp tree, and one conformance case (`dEQP-VK.info.build`) on lavapipe.
+//! - `ul.pkg.deqp`: the same for the deqp tree, and one conformance case (`dEQP-VK.info.build`) on RADV.
 
 use super::pkg::{Line, Sha256, TEST_STICK_ID, entries, list, program_tree, tree_list};
 use super::{SEC, finish, read, scratch, start_as, text};
@@ -39,20 +41,23 @@ const MESA_FILES: &[&str] = &[
     "lib/libc.so.6",
     "lib/libvulkan.so.1",
     "lib/libvulkan_radeon.so",
-    "lib/libvulkan_lvp.so",
     "lib/libEGL_mesa.so.0",
     "lib/gbm/dri_gbm.so",
     "lib/dri/radeonsi_dri.so",
     "share/vulkan/icd.d/radeon_icd.json",
-    "share/vulkan/icd.d/lvp_icd.json",
     "share/glvnd/egl_vendor.d/50_mesa.json",
     "share/libdrm/amdgpu.ids",
+    "bin/vainfo",
+    "lib/libva.so.2",
+    "lib/libva-drm.so.2",
+    "lib/dri/radeonsi_drv_video.so",
 ];
 /// Packages whose licence text the tree must carry (the ones that make it what it is).
-const MESA_LICENCES: &[&str] = &["mesa", "vulkan-radeon", "vulkan-swrast", "vulkan-icd-loader", "vulkan-tools", "mesa-utils", "glibc"];
+const MESA_LICENCES: &[&str] =
+    &["mesa", "vulkan-radeon", "vulkan-icd-loader", "vulkan-tools", "mesa-utils", "glibc", "libva", "libva-utils"];
 const DEQP_FILES: &[&str] = &["deqp-vk", "subset.txt", "VERSION.txt", "LICENSES/vk-gl-cts/LICENSE"];
 /// Programs of other parts of the stick that run on this tree's loader: without it they cannot start.
-const ON_THIS_LOADER: &[&str] = &["/boot/BITSOS2/bin/bitscomp-gpu", "/boot/BITSOS2/xwayland/bin/Xwayland"];
+const ON_THIS_LOADER: &[&str] = &["/boot/BITSOS2/bin/bitscomp", "/boot/BITSOS2/xwayland/bin/Xwayland"];
 /// The longest wait for one small program of the tree. A bound of a stuck program: the first start reads its libraries
 /// from the stick.
 const RUN_SECS: u64 = 300;
@@ -139,12 +144,15 @@ fn mesa() -> TestResult {
 
     let out = sh(&format!("exec sh {launcher} --check"), RUN_SECS)?;
     kassert!(out.lines().any(|x| x.starts_with("mesa: libraries: ") && x.contains(" resolve inside ")), "mesa-run --check:\n{out}");
-    kassert!(out.contains("mesa: driver radeon_icd.json: libvulkan_radeon.so") && out.contains("mesa: driver lvp_icd.json: libvulkan_lvp.so"), "mesa-run --check:\n{out}");
+    kassert!(out.contains("mesa: driver radeon_icd.json: libvulkan_radeon.so") && !out.contains("lvp_icd"), "mesa-run --check:\n{out}");
+    let soft: Vec<&str> = tree.iter().map(|e| e.path).filter(|p| ["swrast", "lvp", "lavapipe"].iter().any(|w| p.contains(w))).collect();
+    kassert!(soft.is_empty(), "software drivers in the tree (DECISIONS 18.11.: none): {soft:?}");
+    // libva's driver is a stand-in that only names libgallium (FAT has no links): the line says it reaches it.
+    kassert!(out.contains("mesa: driver radeonsi_drv_video.so: libgallium-"), "mesa-run --check names no VA driver:\n{out}");
 
-    // The glibc stage really starts: the Vulkan loader, lavapipe and the tree's libraries on the CPU. RADV may answer
-    // too on a machine with a node; only lavapipe is asked for here (vk.sh is the run on the chip).
-    let out = in_scratch("mesa-vk", &format!("MESA_VK_DRIVERS=lvp_icd exec sh {launcher} vulkaninfo --summary"), RUN_SECS)?;
-    kassert!(out.contains("GPU0:") && out.contains("llvmpipe") && out.contains("DRIVER_ID_MESA_LLVMPIPE"), "vulkaninfo --summary on lavapipe:\n{out}");
+    // The glibc stage really starts: the Vulkan loader, RADV and the tree's libraries on the machine's GPU node.
+    let out = in_scratch("mesa-vk", &format!("exec sh {launcher} vulkaninfo --summary"), RUN_SECS)?;
+    kassert!(out.contains("GPU0:") && out.contains("DRIVER_ID_MESA_RADV") && !out.contains("llvmpipe"), "vulkaninfo --summary on RADV:\n{out}");
     klog::event!(Info, "ul", "pkg.mesa", files = tree.len(), hashed_bytes = hashed, sized_bytes = sized);
     Ok(())
 }
@@ -180,8 +188,8 @@ fn deqp() -> TestResult {
     let subset = read(&format!("{DEQP}subset.txt"));
     kassert!(subset.lines().any(|x| x == "dEQP-VK.api.smoke.triangle"), "{DEQP}subset.txt has no draw:\n{subset}");
     // The runner on this tree's glibc: it reads its data from the stick, writes its log to the scratch folder.
-    let out = in_scratch("deqp", &format!("cd $D && MESA_VK_DRIVERS=lvp_icd exec sh {launcher} {DEQP}deqp-vk --deqp-archive-dir={DEQP} --deqp-case=dEQP-VK.info.build --deqp-log-filename=$D/t.qpa"), RUN_SECS)?;
-    kassert!(out.contains("Test case 'dEQP-VK.info.build'") && out.contains("Passed:        1/1"), "deqp-vk on lavapipe:\n{out}");
+    let out = in_scratch("deqp", &format!("cd $D && exec sh {launcher} {DEQP}deqp-vk --deqp-archive-dir={DEQP} --deqp-case=dEQP-VK.info.build --deqp-log-filename=$D/t.qpa"), RUN_SECS)?;
+    kassert!(out.contains("Test case 'dEQP-VK.info.build'") && out.contains("Passed:        1/1"), "deqp-vk on RADV:\n{out}");
     klog::event!(Info, "ul", "pkg.deqp", files = tree.len(), hashed_bytes = hashed, read_ms = read_ms);
     Ok(())
 }

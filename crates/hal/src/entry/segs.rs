@@ -2,7 +2,7 @@
 //!
 //! - **Selectors**: a program's DS, ES, FS and GS stay in the CPU registers while its thread runs (the entry
 //!   code never touches them); `switch_to` saves them for the thread it leaves and loads the next thread's,
-//!   as Linux's `__switch_to` (linux-6.6/arch/x86/kernel/process_64.c:608-614, `save_fsgs`/`x86_fsgsbase_load`).
+//!   as Linux's `__switch_to` (linux-7.3.1/arch/x86/kernel/process_64.c:626-663, `save_fsgs`/`x86_fsgsbase_load`).
 //!   The bases a program set stay in `UserContext::{fs_base, gs_base}`, which the return to user writes after
 //!   the selector, so loading a selector here never changes what the program sees as its base.
 //! - **TLS slots**: three GDT descriptors per thread (`set_thread_area`), written into the running CPU's GDT at

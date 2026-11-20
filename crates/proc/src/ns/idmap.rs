@@ -1,5 +1,5 @@
 //! SX-2: the id maps of a user namespace (`/proc/<pid>/{uid,gid,projid}_map`): the text a writer gives, Linux's
-//! rules for it (linux-6.6/kernel/user_namespace.c `map_write` :920, `mappings_overlap` :731) and the lookups in
+//! rules for it (linux-7.3.1/kernel/user_namespace.c `map_write` :932, `mappings_overlap` :745) and the lookups in
 //! both directions (`map_id_range_down` / `map_id_up`). Pure: no locks, no process; host-tested.
 //!
 //! An extent maps `count` ids starting at `first` (inside the namespace) onto ids starting at `lower`. Once a

@@ -590,3 +590,47 @@ fn hostile_completions_are_skipped_or_recovered() {
 mod window;
 mod mq;
 mod frames;
+mod panic;
+
+/// GP-GUARD B3a: the PCI core's reader and the disk rule's truth table are one rule: for every class code's base
+/// and sub class and every spelling of the line they give the same answer, and this driver's class is covered.
+#[test]
+fn pci_and_the_disk_rule_agree_on_nvme_bind() {
+    let values = [None, Some("off"), Some(" off\r"), Some("on"), Some(""), Some("OFF"), Some("0")];
+    for base in 0u32..=0xFF {
+        for sub in [0u32, 0x01, 0x04, 0x06, 0x08, 0x80] {
+            let class = (base << 16) | (sub << 8) | 0x02;
+            for v in values {
+                assert_eq!(pci::registry::storage_kept_off(class, v), gp_platform::disk_rule::kept_unbound(class, v), "{class:#x} {v:?}");
+            }
+        }
+    }
+    assert!(pci::registry::storage_kept_off(crate::CLASS_NVME, Some("off")));
+    assert!(!pci::registry::storage_kept_off(crate::CLASS_NVME, None));
+}
+
+/// GP-DISK: the probe's reader with a place is the disk rule's `kept_unbound_at` for every class, line, place and
+/// id, so the PCI scan and this driver release exactly the same one controller.
+#[test]
+fn pci_and_the_disk_rule_agree_on_gp_nvme() {
+    use gp_platform::disk_rule::named::kept_unbound_at;
+    let lines = [None, Some("81:00.0/1d97:5236"), Some("01:00.0/144d:a80d"), Some("81:00.0"), Some(""), Some("00:04.0/1b36:0010")];
+    let places = [(0x81, 0, 0), (0x01, 0, 0), (0x86, 0, 0), (0, 4, 0), (0x81, 0, 1)];
+    let ids = [(0x1D97, 0x5236), (0x144D, 0xA80D), (0x144D, 0xA80A), (0x1B36, 0x0010)];
+    for class in [crate::CLASS_NVME, 0x01_06_01, 0x01_04_00, 0x02_00_00] {
+        for bind in [None, Some("off"), Some("on")] {
+            for line in lines {
+                for place in places {
+                    for id in ids {
+                        assert_eq!(pci::registry::storage_kept_off_at(class, bind, line, Some(place), id), kept_unbound_at(class, bind, line, place, id), "{class:#x} {bind:?} {line:?} {place:?} {id:?}");
+                    }
+                }
+            }
+        }
+    }
+    let released = |line, place, id| !pci::registry::storage_kept_off_at(crate::CLASS_NVME, Some("off"), Some(line), Some(place), id);
+    assert!(released("81:00.0/1d97:5236", (0x81, 0, 0), (0x1D97, 0x5236)));
+    assert!(!released("81:00.0/1d97:5236", (0x86, 0, 0), (0x144D, 0xA80A)));
+    assert!(released("00:04.0/1b36:0010", (0, 4, 0), (0x1B36, 0x0010)), "QEMU's controller by its own ids");
+    assert!(!released("00:04.0/1b36:0010", (0, 5, 0), (0x1B36, 0x0010)), "the same ids at another place");
+}

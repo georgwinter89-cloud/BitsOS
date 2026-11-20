@@ -1,6 +1,6 @@
 //! The queue logic of one hash bucket, without locks or threads (host-tested): Linux's `futex_wake`,
 //! `futex_requeue` (non-PI part) and the wake halves of `futex_wake_op` on a list of waiters in arrival order
-//! (linux-6.6/kernel/futex/waitwake.c:143, requeue.c:364). The kernel side (`super`) holds the bucket locks and
+//! (linux-7.3.1/kernel/futex/waitwake.c:178, requeue.c:390). The kernel side (`super`) holds the bucket locks and
 //! wakes the threads; here only who is taken off, moved or left.
 //!
 //! The order is FIFO: Linux queues by priority (`plist`) and every normal-priority waiter has the same one, so

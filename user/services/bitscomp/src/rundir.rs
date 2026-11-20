@@ -1,5 +1,5 @@
-//! `$XDG_RUNTIME_DIR`, where the Wayland socket and the control socket live. V2's init sets none (change request
-//! in wy-WY-1a.md: /run/user/<uid> from init), so without it bitscomp uses /run/user/<uid> when that exists, else
+//! `$XDG_RUNTIME_DIR`, where the Wayland socket and the control socket live. V2's init sets none (change request:
+//! /run/user/<uid> from init), so without it bitscomp uses /run/user/<uid> when that exists, else
 //! its own /tmp/bitscomp-<uid> (mode 0700; /run is root's), and exports the choice to the programs it starts.
 //! `bitscomp ctl` follows the same rule, so it finds the socket without the variable too.
 //!

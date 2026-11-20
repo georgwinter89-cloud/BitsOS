@@ -23,6 +23,8 @@ mod clock;
 mod counts;
 mod exec;
 pub mod fcntl;
+mod fchroot;
+mod fhandle;
 mod fork;
 mod fsfreeze;
 mod fsfreeze_ktests;
@@ -68,6 +70,11 @@ mod seccomp_sys;
 mod sx1_ktests;
 mod ns_sys;
 mod sx2_ktests;
+mod l7_proc_ktests;
+mod l7_reste_ktests;
+mod peer_ktests;
+mod perf;
+mod sysk_ktests;
 mod sysv;
 mod signal;
 mod signalfd;
@@ -77,6 +84,7 @@ mod socket;
 mod socket_ktests;
 mod uts;
 mod wave_a_ktests;
+mod tree_ktests;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -266,6 +274,7 @@ pub(crate) fn note_gap(kind: u8, key: u64, ret: i64, program: &str) {
 /// into `proc`.
 pub fn init() {
     hal::usercopy::install_fixup();
+    counts::init();
     proc::init();
     proc::set_syscall_handler(dispatch);
     // AB-10a: int 0x80's TLS/LDT calls.
@@ -381,3 +390,8 @@ fn unique() -> ktest::TestResult {
     Ok(())
 }
 ktest::ktest!("kreg.syscalls_unique", Safe, unique);
+
+/// SYS-K: the bus number `/sys/bus/usb/devices` names a device's directory with (for the ktests).
+pub(crate) fn procfs_usb_busnum(host: &str, s: usb_core::speed::Speed) -> u32 {
+    procfs::usb_busnum(host, s)
+}

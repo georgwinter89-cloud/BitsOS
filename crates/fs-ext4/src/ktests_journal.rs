@@ -53,10 +53,11 @@ fn journal_inner() -> TestResult {
     ns.lookup("/x/logged").map_err(e)?.inode.sync(SyncKind::Fsync).map_err(e)?;
     kassert!(crate::journal::commits() > commits, "fsync did not commit");
     let log = dev.take_log();
-    let last = log.iter().rposition(|(a, _)| *a == u64::MAX).ok_or("no flush in the log")?;
+    // Right behind the commit block (written through): committed, not yet at its home places.
+    let last = log.iter().rposition(|(a, _)| crate::dev::is_mark(*a)).ok_or("no barrier in the log")?;
     let mut cut = base.clone();
     for (at, d) in &log[..last] {
-        if *at != u64::MAX {
+        if !crate::dev::is_mark(*at) {
             cut[*at as usize..*at as usize + d.len()].copy_from_slice(d);
         }
     }

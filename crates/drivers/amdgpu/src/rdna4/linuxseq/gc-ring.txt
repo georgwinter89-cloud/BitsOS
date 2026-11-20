@@ -1,0 +1,28 @@
+# linuxseq gc-ring: plan/hw/gaming-pc-gpu-2026-11-18/init.txt.zst sha256 62289898e3bbb5cb41a52a202eb686b6c6448b5d38f5c25426876ed29f1e7007, init lines 9568-9603, by host/gaming-pc/gx-trace-seq.py; regenerate: python3 host/gaming-pc/gx-trace-seq.py plan/hw/gaming-pc-gpu-2026-11-18/init.txt.zst crates/drivers/amdgpu/src/rdna4/linuxseq
+# wait SCRATCH_REG0: until (value & 0xffffffff) == 0xdeadbeef; after 100000 reads 1 us apart Linux fails the ring test (-ETIMEDOUT); gfx_v12_0.c:477-486
+9568 W CP_MAX_CONTEXT 0x30ae 0x00000007
+9569 W CP_DEVICE_ID 0x304b 0x00000001
+9570 W SCRATCH_REG0 0xc040 0xcafedead
+9571 WAIT SCRATCH_REG0 0xc040 mask=0xffffffff is=0xdeadbeef max=100000 last=0xdeadbeef reads=7 us=13 seen=0xcafedeadx6,0xdeadbeefx1
+9574 W SCRATCH_REG0 0xc040 0xcafedead
+9575 WAIT SCRATCH_REG0 0xc040 mask=0xffffffff is=0xdeadbeef max=100000 last=0xdeadbeef reads=6 us=11 seen=0xcafedeadx5,0xdeadbeefx1
+9578 W SCRATCH_REG0 0xc040 0xcafedead
+9579 WAIT SCRATCH_REG0 0xc040 mask=0xffffffff is=0xdeadbeef max=100000 last=0xdeadbeef reads=4 us=7 seen=0xcafedeadx3,0xdeadbeefx1
+9582 W SCRATCH_REG0 0xc040 0xcafedead
+9583 WAIT SCRATCH_REG0 0xc040 mask=0xffffffff is=0xdeadbeef max=100000 last=0xdeadbeef reads=3 us=3 seen=0xcafedeadx2,0xdeadbeefx1
+9586 W SCRATCH_REG0 0xc040 0xcafedead
+9587 WAIT SCRATCH_REG0 0xc040 mask=0xffffffff is=0xdeadbeef max=100000 last=0xdeadbeef reads=3 us=4 seen=0xcafedeadx2,0xdeadbeefx1
+9590 R CP_INT_CNTL_RING0 0x306a 0x00000000
+9591 W CP_INT_CNTL_RING0 0x306a 0x00800000
+9592 R CP_ME1_PIPE0_INT_CNTL 0x3085 0x00000000
+9593 W CP_ME1_PIPE0_INT_CNTL 0x3085 0x00800000
+9594 R CP_ME1_PIPE1_INT_CNTL 0x3086 0x00000000
+9595 W CP_ME1_PIPE1_INT_CNTL 0x3086 0x00800000
+9596 R CP_INT_CNTL_RING0 0x306a 0x00800000
+9597 W CP_INT_CNTL_RING0 0x306a 0x00c00000
+9598 R CP_INT_CNTL_RING0 0x306a 0x00c00000
+9599 W CP_INT_CNTL_RING0 0x306a 0x01c00000
+9600 R CP_ME1_PIPE0_INT_CNTL 0x3085 0x00800000
+9601 W CP_ME1_PIPE0_INT_CNTL 0x3085 0x01800000
+9602 R CP_ME1_PIPE1_INT_CNTL 0x3086 0x00800000
+9603 W CP_ME1_PIPE1_INT_CNTL 0x3086 0x01800000

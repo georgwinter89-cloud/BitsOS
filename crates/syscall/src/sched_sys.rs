@@ -1,8 +1,9 @@
 //! SC-6 syscall glue (granted by the SC-6 brief): affinity, priorities and policies, getcpu. The objects are
 //! `sched::attr`'s; the rules and error order are Linux's:
 //! - `sched_setaffinity`/`sched_getaffinity` (linux-6.6/kernel/sched/core.c:8448, :8500; `get_user_cpu_mask`
-//!   :8436, `__set_cpus_allowed_ptr_locked` :3106): masks of `cpumask_size()` bytes = `nr_cpu_ids` (V2: the
-//!   possible CPUs) rounded up to longs;
+//!   :8436, `__set_cpus_allowed_ptr_locked` :3106) (Linux 7.3.1 differs: linux-7.3.1/kernel/sched/syscalls.c:1262,
+//!   see plan/spec/linux7-differences.md): masks of `cpumask_size()` bytes = `nr_cpu_ids` (V2: the possible CPUs)
+//!   rounded up to longs;
 //! - `getcpu` (kernel/sys.c:2730); node 0 (one NUMA node);
 //! - `setpriority`/`getpriority` (kernel/sys.c:218, :288; `set_one_prio` :195, `can_nice` core.c:7266):
 //!   nice -20..19 clamped, EPERM for another owner's process, EACCES for lowering nice beyond RLIMIT_NICE;
@@ -79,8 +80,9 @@ pub(crate) fn task(c: &SysCtx<'_>, pid: i32) -> Result<(Arc<Process>, u64), i64>
     Ok((p, k))
 }
 
-/// `check_same_owner` / `set_one_prio_perm` (linux-6.6/kernel/sched/core.c, kernel/sys.c:203): the caller's
-/// euid is the target's real or effective uid.
+/// `check_same_owner` / `set_one_prio_perm` (linux-6.6/kernel/sched/core.c, kernel/sys.c:203) (Linux 7.3.1 differs:
+/// linux-7.3.1/kernel/sched/syscalls.c:277, see plan/spec/linux7-differences.md): the caller's euid is the target's
+/// real or effective uid.
 fn same_owner(c: &SysCtx<'_>, t: &Process) -> bool {
     let (me, t) = (c.proc.cred(), t.cred());
     me.euid == t.uid || me.euid == t.euid
@@ -435,7 +437,7 @@ crate::syscall_nr!(nr::SCHED_GET_PRIORITY_MIN, "sched_get_priority_min", sys_sch
 // ---------------------------------------------------------------------------------------------------------
 // I/O priorities (FS-12: the values live in `block::prio`, which maps them onto the request priorities)
 
-/// `ioprio_set` (linux-6.6/block/ioprio.c:69): the value's check first (`ioprio_check_cap`; RT needs
+/// `ioprio_set` (linux-7.3.1/block/ioprio.c:65): the value's check first (`ioprio_check_cap`; RT needs
 /// CAP_SYS_ADMIN/CAP_SYS_NICE = root), then the targets as setpriority names them (IOPRIO_WHO_* = PRIO_* + 1);
 /// another owner without the capability, or B3 refusing, is EPERM and stops the walk (`set_task_ioprio`).
 fn sys_ioprio_set(c: &mut SysCtx<'_>) -> i64 {
@@ -460,7 +462,7 @@ fn sys_ioprio_set(c: &mut SysCtx<'_>) -> i64 {
 }
 crate::syscall_nr!(nr::IOPRIO_SET, "ioprio_set", sys_ioprio_set);
 
-/// `ioprio_get` (linux-6.6/block/ioprio.c:210): IOPRIO_WHO_PROCESS the raw value (IOPRIO_DEFAULT when none),
+/// `ioprio_get` (linux-7.3.1/block/ioprio.c:180): IOPRIO_WHO_PROCESS the raw value (IOPRIO_DEFAULT when none),
 /// PGRP/USER the best effective value of the named threads (`ioprio_best`), ESRCH when none.
 fn sys_ioprio_get(c: &mut SysCtx<'_>) -> i64 {
     let (which, who) = (c.args[0] as i32, c.args[1] as i32);

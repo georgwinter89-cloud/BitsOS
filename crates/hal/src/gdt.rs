@@ -1,5 +1,5 @@
 //! GDT, TSS and the IST stacks (owner: CP). Selector layout is a contract (SYSCALL/SYSRET depend on it), since
-//! AB-10a Linux's 64-bit one for everything a program sees (linux-6.6/arch/x86/include/asm/segment.h:165-220):
+//! AB-10a Linux's 64-bit one for everything a program sees (linux-7.3.1/arch/x86/include/asm/segment.h:165-220):
 //! 0x08 kernel code, 0x10 kernel data, 0x23 32-bit user code (`__USER32_CS`), 0x2B user data (`__USER_DS`),
 //! 0x33 64-bit user code (`__USER_CS`), 0x40 TSS (16 bytes), 0x50 LDT (16 bytes, present only while a thread
 //! of a process with an LDT runs), 0x63/0x6B/0x73 the three TLS slots of the running thread (`set_thread_area`).
@@ -365,7 +365,7 @@ mod imp {
         // `lldt` with selector 0 loads a null LDTR (AB-16 CR, INT-W21): every TI=1 selector a program puts into
         // a sigreturn or iretq frame then raises #GP instead of the CPU reading a descriptor from whatever base
         // and limit firmware or the previous kernel (Reload) left in LDTR, as Linux's clear_LDT does
-        // (linux-6.6/arch/x86/kernel/cpu/common.c:2283, arch/x86/include/asm/mmu_context.h:80).
+        // (linux-7.3.1/arch/x86/kernel/cpu/common.c:2516, arch/x86/include/asm/mmu_context.h:80).
         unsafe {
             core::arch::asm!(
                 "lgdt [{p}]",

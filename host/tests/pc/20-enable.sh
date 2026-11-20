@@ -31,7 +31,7 @@ check 'KTEST ok pc.enable.msi_stale' "stale MSI/MSI-X enables cleared"
 check 'KTEST ok pc.enable.restore' "header written back after a simulated retrain"
 check 'KTEST ok pc.enable.refused' "untouched and mass storage refused"
 check 'KTEST ok pc.enable.dma_path' "functions enabled for DMA have bus master on their path"
-check 'KTEST ok contract.pci_registry_optin' "PCI contract test"
+check 'KTEST ok contract.pci_registry' "PCI contract test"
 if grep -aq 'KTEST ok pc.enable.wake' "$LOG"; then
     echo "ok   D3hot -> D0 through PMCSR (pm.wake)"
 else

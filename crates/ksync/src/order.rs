@@ -94,7 +94,7 @@ pub(crate) static TABLE: [LockClass; 23] = [
     // SN-5's HDMI sequence lock (desk 22.10.): the GPU's HD Audio function is reset and brought up under it, which
     // takes pci.cfg/pci.ecam (the Mini-PC's checker saw hda.hdmi -> pci.* on every sn.dpaudio run).
     LockClass::fixed("hda.hdmi", DRIVER_OUTER, false),
-    // SN-12 (desk-minipc-w12 follow-up 1): every path of SN-10/SN-11's output request (sysfs, MCP, console, the
+    // SN-12 (found on the Mini-PC, 23.10.): every path of SN-10/SN-11's output request (sysfs, MCP, console, the
     // boot switch) takes hda.hdmi under snd.output; at SUBSYSTEM that was the boot's lock.violation.
     LockClass::fixed("snd.output", SND_OUTPUT, false),
     // WL's chip mutex (W12): the driver thread runs rtw89-core's bring-up under it, whose bus reads and writes the

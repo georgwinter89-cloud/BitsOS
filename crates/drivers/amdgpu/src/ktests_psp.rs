@@ -35,10 +35,11 @@ pub(crate) fn check_run(fake: &mut FakeGpu, src: &mut dyn FwSource) -> ktest::Te
     kassert!(fake.tmr_writes.is_empty() && fake.display_writes.is_empty() && fake.scanout_writes.is_empty(), "tmr {:?} display {:?}", fake.tmr_writes, fake.display_writes);
     kassert!(fake.gc.autoload.as_ref().is_some_and(|m| m.is_empty()), "autoload missing {:?}", fake.gc.autoload);
     kassert!(report.warnings.is_empty(), "warnings {:?}", report.warnings);
-    // GX-7d: a cold fake is fresh (no destroy first), never DMCUB or VCN, one snapshot per step.
+    // GX-7d: a cold fake is fresh (no destroy first), never DMCUB (GX-8v: VCN's last), one snapshot per step.
     kassert!(report.prior == Some(psp::Prior::Fresh) && report.snaps.len() == report.steps.len(), "prior {:?}", report.prior);
-    let banned = [crate::gpucore::ucode::UcodeId::Dmcub.fw_type(), crate::gpucore::ucode::UcodeId::Vcn.fw_type()];
-    kassert!(fake.loaded.iter().all(|l| !banned.contains(&l.fw_type)), "DMCUB or VCN loaded");
+    let dmcub = crate::gpucore::ucode::UcodeId::Dmcub.fw_type();
+    kassert!(fake.loaded.iter().all(|l| l.fw_type != dmcub), "DMCUB loaded");
+    kassert!(fake.loaded.last().map(|l| l.fw_type) == Some(crate::gpucore::ucode::UcodeId::Vcn.fw_type()), "VCN not last");
     let (tmc, tsize) = fake.tmr.ok_or("no TMR")?;
     kassert!(tmc % psp::TMR_ALIGN == 0 && tsize == pspfake::TOC_TMR, "TMR {tmc:#x} {tsize:#x}");
     kassert!(psp.fence_value() == want.len() as u32, "fence {}", psp.fence_value());

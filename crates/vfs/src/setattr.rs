@@ -1,5 +1,5 @@
 //! FS-1b: changing a node's mode, owner and times (chmod, chown, utimensat and their relatives) as Linux's
-//! `notify_change` does (linux-6.6/fs/attr.c:381): `may_setattr`, the time stamps, the suid/sgid kill bits,
+//! `notify_change` does (linux-7.3.1/fs/attr.c:427): `may_setattr`, the time stamps, the suid/sgid kill bits,
 //! `setattr_prepare` (owner and CAP rules), the file system's own `setattr` (FAT: `FsOps::setattr`), then
 //! `setattr_copy`. V2's credentials have no capability set and no supplementary groups: CAP_CHOWN, CAP_FOWNER
 //! and CAP_FSETID are uid 0, group membership is the caller's gid.
@@ -12,7 +12,7 @@ use crate::Errno;
 use core::sync::atomic::Ordering;
 use uapi::errno::*;
 
-// `ia_valid` bits (linux-6.6/include/linux/fs.h).
+// `ia_valid` bits (linux-7.3.1/include/linux/fs.h:221).
 pub const ATTR_MODE: u32 = 1 << 0;
 pub const ATTR_UID: u32 = 1 << 1;
 pub const ATTR_GID: u32 = 1 << 2;
@@ -55,7 +55,7 @@ pub fn chmod(mode: u32) -> SetAttr {
     SetAttr { valid: ATTR_MODE | ATTR_CTIME, mode: mode & 0o7777, ..Default::default() }
 }
 
-/// chown_common (linux-6.6/fs/open.c:751): -1 keeps that id; a non-directory loses its suid bit and, per
+/// chown_common (linux-7.3.1/fs/open.c:788): -1 keeps that id; a non-directory loses its suid bit and, per
 /// `setattr_should_drop_sgid`, its sgid bit.
 pub fn chown(m: &Meta, c: Cred, uid: u32, gid: u32) -> SetAttr {
     let mut a = SetAttr { valid: ATTR_CTIME, ..Default::default() };
@@ -77,7 +77,7 @@ pub fn chown(m: &Meta, c: Cred, uid: u32, gid: u32) -> SetAttr {
     a
 }
 
-/// vfs_utimes (linux-6.6/fs/utimes.c:22): `times` = [atime, mtime] as (sec, nsec), None = both now.
+/// vfs_utimes (linux-7.3.1/fs/utimes.c:21): `times` = [atime, mtime] as (sec, nsec), None = both now.
 /// EINVAL for a nanosecond value out of range. Both UTIME_NOW is the same as None.
 pub fn utimes(times: Option<[(i64, i64); 2]>) -> Result<SetAttr, Errno> {
     let valid_ns = |n: i64| n == UTIME_NOW || n == UTIME_OMIT || (0..=999_999_999).contains(&n);
@@ -221,7 +221,7 @@ impl Ctx<'_> {
                 return Err(EPERM);
             }
             if a.valid & ATTR_MODE != 0 {
-                // shmem_setattr (linux-6.6/mm/shmem.c:1166): F_SEAL_EXEC keeps the exec bits.
+                // shmem_setattr (linux-7.3.1/mm/shmem.c:1342): F_SEAL_EXEC keeps the exec bits.
                 crate::memfd::check_mode_change(i, (i.meta.mode() & uapi::S_IFMT) | a.mode)?;
             }
             match &sb.ops {
@@ -239,9 +239,9 @@ impl Ctx<'_> {
     }
 }
 
-/// /proc's own setattr answers: `proc_setattr` (linux-6.6/fs/proc/base.c:689) refuses a mode change under
-/// /proc/<pid>, /proc/self and /proc/thread-self; `proc_sys_setattr` (fs/proc/proc_sysctl.c:826) also an owner
-/// change under /proc/sys. The other /proc entries take both (`proc_notify_change`, fs/proc/generic.c:118).
+/// /proc's own setattr answers: `proc_nochmod_setattr` (linux-7.3.1/fs/proc/base.c:705) refuses a mode change
+/// under /proc/<pid>, /proc/self and /proc/thread-self; `proc_sys_setattr` (fs/proc/proc_sysctl.c:820) also an
+/// owner change under /proc/sys. The other /proc entries take both (`proc_setattr`, fs/proc/generic.c:120).
 fn proc_refuses(d: &alloc::sync::Arc<crate::dentry::Dentry>, valid: u32) -> bool {
     let mut cur = d.clone();
     let mut below = None;

@@ -13,7 +13,7 @@
 //!
 //! Exit codes: 0 ok, 1 open/read error (and an event time off the monotonic clock), 2 usage, 3 `--count` not
 //! reached within the timeout, 4 not an evdev device (ENOTTY), 10 `--query`: set. Linux semantics:
-//! linux-6.6/drivers/input/evdev.c (`evdev_do_ioctl` :1029, `evdev_read` :558, `evdev_handle_get_val` :908).
+//! linux-7.3.1/drivers/input/evdev.c (`evdev_do_ioctl` :1032, `evdev_read` :561, `evdev_handle_get_val` :889).
 #![forbid(unsafe_code)]
 
 mod codes;
@@ -31,7 +31,7 @@ const EV_MAX: u16 = 0x1f;
 /// The highest code per type (input-event-codes.h *_MAX), for the EVIOCGBIT buffer sizes.
 const KEY_MAX: usize = 0x2ff;
 
-/// _IOC(dir, 'E', nr, size) (linux-6.6/include/uapi/linux/input.h).
+/// _IOC(dir, 'E', nr, size) (linux-7.3.1/include/uapi/linux/input.h).
 fn ioc(dir: u32, nr: u32, size: usize) -> u32 {
     (dir << 30) | ((size as u32) << 16) | (0x45 << 8) | nr
 }

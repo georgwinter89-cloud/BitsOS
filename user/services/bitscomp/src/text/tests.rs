@@ -11,7 +11,7 @@ fn every_family_draws_german_text_and_the_boards_signs() {
     // The boards use − → ✓ ✗ ▾ ▸ ● ·; a lacking family takes them from another one or from the icons.
     let signs = "äöüÄÖÜß€…·°‹›„“−→✓✗▾▸●";
     for tf in ALL {
-        for w in [Weight::Regular, Weight::Medium, Weight::SemiBold] {
+        for w in [Weight::Regular, Weight::Medium, Weight::SemiBold, Weight::Bold] {
             let f = Font::of(tf, 15.0, w, 1.0);
             for c in signs.chars() {
                 assert!(f.draws(c), "{} {w:?} lacks {c}", tf.name());
@@ -39,8 +39,10 @@ fn a_missing_glyph_comes_from_the_next_family_with_its_metrics() {
 #[test]
 fn weights_take_the_nearest_shipped_file() {
     let w = |tf, w| FILES[file(tf, w)].1;
-    assert_eq!(w(Typeface::Bricolage, Weight::Regular), 500, "Bricolage has 500 and 600 only");
-    assert_eq!(w(Typeface::Bricolage, Weight::Bold), 600);
+    assert_eq!(w(Typeface::Bricolage, Weight::Regular), 500, "Bricolage has 500, 600 and 700, no 400");
+    assert_eq!(w(Typeface::Bricolage, Weight::Medium), 500);
+    assert_eq!(w(Typeface::Bricolage, Weight::SemiBold), 600);
+    assert_eq!(w(Typeface::Bricolage, Weight::Bold), 700, "GM-6f: the boards' big titles and tile names");
     assert_eq!(w(Typeface::Figtree, Weight::Light), 400);
     assert_eq!(w(Typeface::Figtree, Weight::Bold), 700);
     assert_eq!(w(Typeface::JetBrainsMono, Weight::Bold), 600);
@@ -106,12 +108,32 @@ fn fitting_cuts_with_an_ellipsis() {
 #[test]
 fn drawing_puts_ink_inside_the_line() {
     for tf in ALL {
-        let f = Font::of(tf, 15.0, Weight::SemiBold, 1.25);
-        let mut c = Canvas::new(160, 30);
-        let w = c.text(&f, 2, 2, "Grüße €", [1.0; 4]);
-        assert!(w > 40);
-        assert!(ink(&c).len() > 80, "{}: {} pixels of ink", tf.name(), ink(&c).len());
+        for w in [Weight::SemiBold, Weight::Bold] {
+            let f = Font::of(tf, 15.0, w, 1.25);
+            let mut c = Canvas::new(160, 30);
+            let width = c.text(&f, 2, 2, "Grüße €", [1.0; 4]);
+            assert!(width > 40);
+            assert!(ink(&c).len() > 80, "{} {w:?}: {} pixels of ink", tf.name(), ink(&c).len());
+        }
     }
+}
+
+#[test]
+fn bricolage_700_is_its_own_heavier_sample() {
+    // GM-6f (sofa-mode.md section 1): the hero title and tile names in Bricolage 700, not the 600 stand-in.
+    let sample = |w| {
+        let f = Font::of(Typeface::Bricolage, 40.0, w, 1.0);
+        let mut c = Canvas::new(400, 60);
+        c.text(&f, 2, 2, "Weiterspielen Äö", [1.0; 4]);
+        (f.own(), ink(&c))
+    };
+    let ((semi_file, semi), (bold_file, bold)) = (sample(Weight::SemiBold), sample(Weight::Bold));
+    assert_ne!(semi_file, bold_file, "Bold has its own file");
+    assert_eq!(FILES[bold_file].1, 700);
+    assert!(bold.len() > semi.len(), "700 has more ink than 600: {} vs {}", bold.len(), semi.len());
+    let rows = |p: &[(i32, i32)]| (p.iter().map(|q| q.1).min().unwrap(), p.iter().map(|q| q.1).max().unwrap());
+    let ((t6, b6), (t7, b7)) = (rows(&semi), rows(&bold));
+    assert!((t7 - t6).abs() <= 2 && (b7 - b6).abs() <= 2, "same line (opsz 48, wdth 100): {t6}..{b6} vs {t7}..{b7}");
 }
 
 #[test]
@@ -182,5 +204,30 @@ fn fitting_a_long_title_matches_the_exact_cut() {
             .find(|c| f.width(c) <= max)
             .unwrap_or_else(|| if f.width("…") <= max { "…".into() } else { String::new() });
         assert_eq!(cut, exact, "max {max}");
+    }
+}
+
+#[test]
+fn claude_codes_title_and_prompt_signs_are_no_empty_box() {
+    // GPY (desk 15.11.): Claude Code sets the tab title to "✳ <task>" (spinner ◐ ◑ while it works) and draws ❯ ✻ ⏵ ⚠ ⎿
+    // in its window; each must come out as a glyph of its own, not the empty box a missing character draws.
+    let signs: String = format!("◐◑✶{}", crate::symbols::CLAUDE_CODE);
+    for tf in ALL {
+        let f = Font::of(tf, 15.0, Weight::Medium, 1.25);
+        let empty = glyph(f.src('\u{e000}'), f.px, '\u{e000}');
+        for c in signs.chars() {
+            assert!(f.draws(c), "{} lacks {c} U+{:04X}", tf.name(), c as u32);
+            let g = glyph(f.src(c), f.px, c);
+            assert!(g.cov.iter().any(|&v| v > 128), "{} draws {c} without ink", tf.name());
+            assert!(
+                (g.width, g.height, &g.cov) != (empty.width, empty.height, &empty.cov),
+                "{} draws {c} U+{:04X} as the empty box",
+                tf.name(),
+                c as u32
+            );
+        }
+        let mut cv = Canvas::new(400, 40);
+        let w = cv.text(&f, 0, 0, "✳ Zugriff auf den PC", [1.0; 4]);
+        assert!(w > 0 && !ink(&cv).is_empty());
     }
 }

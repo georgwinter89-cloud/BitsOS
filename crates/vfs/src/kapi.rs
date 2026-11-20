@@ -195,7 +195,7 @@ impl MountNs {
         let d = self.kernel_create(path, uapi::S_IFREG | (mode & 0o7777), reg_data)?;
         if !data.is_empty() {
             // A kernel writer waits for a thaw like a program's (kernel_write takes file_start_write,
-            // linux-6.6/fs/read_write.c:557; VS-2 CR3).
+            // linux-7.3.1/fs/read_write.c:660; VS-2 CR3).
             let _w = d.sb.write_begin()?;
             let n = d.inode.write_at(0, data)?;
             if n != data.len() {

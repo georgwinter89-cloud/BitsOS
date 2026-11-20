@@ -12,6 +12,7 @@ pub enum Op {
     In32(u16),
     Halt,
     Sti,
+    Mwait(u8),
 }
 
 #[derive(Default)]
@@ -54,5 +55,8 @@ impl IdleHw for Recorder {
     }
     fn sti(&self) {
         self.ops.borrow_mut().push(Op::Sti);
+    }
+    fn mwait(&self, hint: u8) {
+        self.ops.borrow_mut().push(Op::Mwait(hint));
     }
 }

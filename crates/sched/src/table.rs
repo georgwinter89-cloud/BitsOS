@@ -14,7 +14,7 @@ use ksync::IrqSpinLock;
 /// Sorted by thread id (ids only grow, so new threads go to the end).
 static TABLE: IrqSpinLock<Vec<Arc<Thread>>> = IrqSpinLock::named("sched", Vec::new());
 
-/// Adds a thread. `Err`: no memory to grow the table.
+/// Adds a thread. `Err`: no memory to grow the table, or the run queues with it.
 pub(crate) fn insert(t: Arc<Thread>) -> Result<(), Arc<Thread>> {
     loop {
         let need = {
@@ -28,6 +28,11 @@ pub(crate) fn insert(t: Arc<Thread>) -> Result<(), Arc<Thread>> {
         };
         let mut fresh: Vec<Arc<Thread>> = Vec::new();
         if fresh.try_reserve_exact(need).is_err() {
+            return Err(t);
+        }
+        // Before the larger table is in: every run queue can hold as many threads as the table can list, so
+        // queueing one never allocates (`run::reserve`).
+        if crate::run::reserve(fresh.capacity()).is_err() {
             return Err(t);
         }
         let old = {
@@ -73,6 +78,11 @@ pub(crate) fn next_where(after: u64, pred: impl Fn(&Thread) -> bool) -> Option<A
 
 pub(crate) fn len() -> usize {
     TABLE.lock().len()
+}
+
+/// Threads the table can list without growing (the run queues have room for as many: `run::reserve`).
+pub(crate) fn capacity() -> usize {
+    TABLE.lock().capacity()
 }
 
 /// Every thread (the copy is made in memory reserved outside the lock).

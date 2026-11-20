@@ -4,8 +4,8 @@
 //! change. One memory type per frame is the SDM's rule (11.12.4): a UC/WC buffer must not stay reachable as WB
 //! through the direct map, so the alias itself is retyped instead of a second mapping being added.
 //!
-//! Split leaves stay split after the type goes back to WB (Linux collapses them later; open point in
-//! plan/notes/mm-MM-4.md): it costs TLB reach, not correctness.
+//! Split leaves stay split after the type goes back to WB (Linux collapses them later): it
+//! costs TLB reach, not correctness.
 
 use super::walk::{index, leaf_bits, leaf_flags, leaf_phys, span, Tables};
 use super::{CacheType, MapError, PageFlags, ADDR_MASK};

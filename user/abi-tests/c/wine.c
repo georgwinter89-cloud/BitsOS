@@ -1,5 +1,5 @@
 /* GM-PROTON: the kernel sequences Wine (Proton 10's, 64-bit and WoW64 alike) runs before and while a game starts, for
- * the ABI diff against CachyOS (plan/notes/gm-PROTON.md 1.4). argv[1]:
+ * the ABI diff against CachyOS (plan/spec/programs.md §5.3). argv[1]:
  *   reserve   the preloader's four PROT_NONE reservations, shared user data, hints, MAP_32BIT, a 64 GiB reservation
  *             cut into 20 000 VMAs
  *   faults    the exceptions Wine's segv/trap handlers decode: page-fault error bits, #GP of int 0x29/0x2c/0x2d/0x2e

@@ -19,8 +19,14 @@ use vfs::setattr::{SetAttr, ATTR_ATIME, ATTR_CTIME, ATTR_GID, ATTR_MODE, ATTR_MT
 use vfs::{Dentry, SuperBlock};
 
 pub struct Ext4Ops {
+    /// BIGDIR: the volume's place on the list of those asked for memory (its directory indexes). Declared above
+    /// `vol` so it is dropped first: the reclaim thread then never holds the volume's last reference
+    /// (`vfs::meta_shrink`), and the unmount's last commit runs here, not there.
+    _shrink: vfs::meta_shrink::Registration,
     pub vol: Arc<Volume>,
     inodes: SpinLock<Inodes>,
+    /// BIGDIR: st_size and st_blocks of directories for fstat without the volume lock (the volume keeps them).
+    dir_stats: Arc<crate::dirstat::DirStats>,
 }
 
 #[derive(Default)]
@@ -36,7 +42,10 @@ fn ino_of(i: &Inode) -> Result<u32, i64> {
 
 impl Ext4Ops {
     pub fn new(vol: Arc<Volume>) -> Arc<Ext4Ops> {
-        Arc::new(Ext4Ops { vol, inodes: SpinLock::named("ext4.inodes", Inodes::default()) })
+        let dir_stats = vol.dir_stats();
+        let weak: Weak<Volume> = Arc::downgrade(&vol);
+        let _shrink = vfs::meta_shrink::register(weak);
+        Arc::new(Ext4Ops { _shrink, vol, inodes: SpinLock::named("ext4.inodes", Inodes::default()), dir_stats })
     }
 
     fn known(&self, ino: u32) -> Option<Arc<Inode>> {
@@ -70,8 +79,8 @@ impl Ext4Ops {
         let mut fifo = None;
         let data = match (d.ftype(), data) {
             (di::S_IFREG, _) => {
-                let blocks = self.vol.hold(ino)?;
-                let f = Ext4File::new(self.vol.clone(), ino, d.size(), blocks);
+                let hold = self.vol.hold(ino)?;
+                let f = Ext4File::new(self.vol.clone(), ino, d.size(), hold);
                 file = Some(f.clone());
                 Data::External(Box::new(Ops(f)))
             }
@@ -101,6 +110,12 @@ impl Ext4Ops {
 }
 
 impl vfs::FsOps for Ext4Ops {
+    /// ext4 names are their bytes (no casefold directories in V2): a lookup that misses the loaded directory
+    /// ends in the VFS, the volume is not asked.
+    fn exact_names(&self) -> bool {
+        true
+    }
+
     fn load_dir(&self, dir: &Arc<Dentry>) -> Result<(), i64> {
         for (name, ino, _) in self.vol.list(ino_of(&dir.inode)?)? {
             let inode = self.inode_of(ino, None, None)?;
@@ -153,7 +168,7 @@ impl vfs::FsOps for Ext4Ops {
             Some(t) => Some(ino_of(&t.inode)?),
             None => None,
         };
-        // auto_da_alloc (linux-6.6/fs/ext4/namei.c:3871, VS-2 CR4): a file renamed over another gets its data
+        // auto_da_alloc (linux-7.3.1/fs/ext4/namei.c:3877, VS-2 CR4): a file renamed over another gets its data
         // written first, so a cut after the rename's commit never finds the new name with 0 bytes (the
         // write-then-rename save Brave's profile uses). Linux ignores the result too; the rename goes on.
         if t.is_some()
@@ -229,10 +244,12 @@ impl vfs::FsOps for Ext4Ops {
         self.vol.statfs()
     }
 
-    /// st_size and st_blocks of a directory as Linux ext4 shows them (its blocks, `ext4_getattr`).
+    /// st_size and st_blocks of a directory as Linux ext4 shows them (its blocks, `ext4_getattr`). BIGDIR: from
+    /// the numbers the volume keeps in step with the directory's inode, without `ext4.vol` (Steam: 1250 fstat of
+    /// a directory per second behind the changes); the volume is asked once per directory.
     fn dir_attr(&self, dir: &Inode) -> Option<(u64, u64)> {
-        let d = self.vol.stat(ino_of(dir).ok()?).ok()?;
-        Some((d.size(), d.blocks512(&self.vol.geo)))
+        let ino = ino_of(dir).ok()?;
+        self.dir_stats.get(ino).or_else(|| self.vol.dir_stat_slow(ino).ok())
     }
 }
 
@@ -244,6 +261,9 @@ pub fn super_block(vol: &Arc<Volume>) -> Result<(Arc<SuperBlock>, Arc<Dentry>), 
         return Err(EUCLEAN);
     }
     let sb = SuperBlock::with_ops("ext4", ops);
+    // BIGDIR: the directory indexes are charged to the mount's pool (and given back when memory is short:
+    // `Ext4Ops::new` listed the volume).
+    vol.set_meta_pool(sb.pool.clone());
     // A read-only mount replays a dirty journal in memory (FS-8b): no `norecovery` any more.
     sb.set_options(",errors=remount-ro");
     let d = Dentry::new_root(sb.clone(), root);

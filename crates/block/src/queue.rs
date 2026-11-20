@@ -210,6 +210,12 @@ impl Elevator {
         self.entries.is_empty()
     }
 
+    /// Under the queue's lock: whether `push` has room for one more now; false: drop the lock, `spare.grow()`,
+    /// lock and ask again (`Disk::submit_via`: the list is not grown under the spin lock).
+    pub fn fits(&mut self, spare: &mut ksync::Spare<Vec<Entry>>) -> bool {
+        spare.fits(&mut self.entries, 1)
+    }
+
     /// Queues `e` in id order (ids are taken before the queue lock, so two submitters may arrive swapped by a
     /// few nanoseconds). Err: no memory for the slot.
     pub fn push(&mut self, e: Entry) -> Result<(), Entry> {

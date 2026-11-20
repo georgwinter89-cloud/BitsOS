@@ -167,7 +167,6 @@ fn env_ok(launcher: &str) -> TestResult {
     for (k, want) in [
         ("LD_LIBRARY_PATH", "/boot/BITSOS2/libreoffice/lib"),
         ("SAL_USE_VCLPLUGIN", "gtk3"),
-        ("SAL_DISABLE_OPENCL", "1"),
         ("GDK_BACKEND", "wayland"),
         ("FONTCONFIG_FILE", "/boot/BITSOS2/libreoffice/etc/fonts/fonts.conf"),
         ("XDG_DATA_DIRS", "/boot/BITSOS2/libreoffice/gtk/share"),
@@ -184,6 +183,7 @@ fn env_ok(launcher: &str) -> TestResult {
     kassert!(lang == "de_DE.UTF-8" || lang == "en_US.UTF-8", "LANG={lang}\n{out}");
     kassert!(get("PATH").is_some_and(|p| p.ends_with(":/boot/BITSOS2/libreoffice/gtk/libexec")), "PATH\n{out}");
     kassert!(get("DISPLAY").is_none() && get("LO_HOME").is_none(), "an X display or a test setting leaks into LibreOffice\n{out}");
+    kassert!(get("SAL_DISABLE_OPENCL").is_none(), "Calc's OpenCL is switched off (DECISIONS 18.11.: nothing is)\n{out}");
     // The mount table as the launcher sees it: this test may run on a kernel thread (MCP's `ktest`), which has no
     // /proc/self (procfs `self_link`). Mini-PC 3.11.: the launcher saw /data, this test did not.
     let mounts = sh("exec cat /proc/self/mounts", Some(1000), 60)?;

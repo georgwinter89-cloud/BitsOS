@@ -1,0 +1,1 @@
+{"filter": "cp.cpu,cp.msr,cp.trap,cp.acpi,cp.irq,cp.time.calibration,cp.smp.all_up,cp.smp.hwp,cp.smp.spec_ctrl,cp.smp.topology,cp.smp.mtrr,cp.smp.apic_map,cp.smp.ap_registers,sc.idle,so.sysk,rb.metrics,gp.rtl."}

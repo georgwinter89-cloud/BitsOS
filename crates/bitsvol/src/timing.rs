@@ -3,7 +3,7 @@
 //! cache flush is the image's fsync (its dirty pages, the FAT, SYNCHRONIZE CACHE).
 //!
 //! Slow means slower than the stick can explain: `SLOW_BASE_NS` for the flushes plus the bytes the flushes had
-//! to make durable at `SLOW_MIN_BPS`. Georg's stick writes ~1.8 MB/s on small files (desk-minipc-w7.md:6) and
+//! to make durable at `SLOW_MIN_BPS`. Georg's stick writes ~1.8 MB/s on small files and
 //! its cache flush takes tens to hundreds of ms; the floor is about half that, so a warning means the stick or
 //! something above it was clearly slower than it ever is on a normal day.
 

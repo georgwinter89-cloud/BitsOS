@@ -108,9 +108,10 @@ pub fn core_scan_complete<B: Bus + ?Sized>(
     Ok(())
 }
 
-// Linux: none (mac80211's ieee80211_start_sw_scan (linux-6.6/net/mac80211/scan.c:512):
+// Linux: none (mac80211's ieee80211_start_sw_scan (linux-6.6/net/mac80211/scan.c:512) (Linux 7.3.1
+// differs: linux-7.3.1/net/mac80211/scan.c:557, see plan/spec/linux7-differences.md):
 // drv_sw_scan_start, the flush, configure_filter; ieee80211_scan_work; __ieee80211_scan_completed
-// (linux-6.6/net/mac80211/scan.c:403): hw_config back to the operating channel, configure_filter,
+// (linux-7.3.1/net/mac80211/scan.c:448): hw_config back to the operating channel, configure_filter,
 // drv_sw_scan_complete) around rtw89_ops_sw_scan_start (mac80211.c:1231) and
 // rtw89_ops_sw_scan_complete (mac80211.c:1252). As mac80211 (ieee80211_scan_state_set_channel):
 // a channel the country marks NO-IR or radar is scanned passively; one it does not allow stops

@@ -1,9 +1,9 @@
 //! SDMA 6.0 packets (the 780M's SDMA 6.0.1): encoders, a strict decoder and readable text.
 //!
-//! Opcodes from linux-6.6/drivers/gpu/drm/amd/amdgpu/navi10_sdma_pkt_open.h:26-65, field positions from
-//! sdma_v6_0_0_pkt_open.h (6.0 additions), packet use from sdma_v6_0.c (insert_nop :224, emit_ib :247,
-//! emit_mem_sync :282, emit_hdp_flush :307, emit_fence :338, pad_ib :1129, emit_wreg :1208, reg_wait :1217,
-//! copy/fill :1631/:1658). A header is `sub_op << 8 | op` plus per-packet bits in 16..31.
+//! Opcodes from linux-7.3.1/drivers/gpu/drm/amd/amdgpu/navi10_sdma_pkt_open.h:26-65, field positions from
+//! sdma_v6_0_0_pkt_open.h (6.0 additions), packet use from sdma_v6_0.c (insert_nop :242, emit_ib :265,
+//! emit_mem_sync :300, emit_hdp_flush :325, emit_fence :356, pad_ib :1126, emit_wreg :1205, reg_wait :1214,
+//! copy/fill :1821/:1848). A header is `sub_op << 8 | op` plus per-packet bits in 16..31.
 
 use core::fmt;
 

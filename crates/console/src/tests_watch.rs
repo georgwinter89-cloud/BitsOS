@@ -45,7 +45,8 @@ fn every_named() -> Vec<String> {
         l("ul", "init.off", ""),
         l("ul", "init.died", "code=1"),
         l("ul", "init.given_up", ""),
-        l("console", "desktop.off", "why=off"),
+        l("console", "desktop.off", "why=gaming_pc"),
+        l("console", "desktop.no_gpu", "reason=gpu"),
         l("console", "desktop.wait", ""),
         l("console", "desktop.start", "program=/bin/bitscomp attempt=1"),
         l("console", "desktop.failed", "attempt=1 reason=ended"),
@@ -94,7 +95,7 @@ fn start_with_desktop() -> Vec<String> {
         line(40, 'I', "mm", "frames", "total_mb=31744 free_mb=30876"),
         line(95, 'I', "smp", "prepared", ""),
         line(180, 'I', "smp", "done", "cpus=16 failed=0"),
-        line(200, 'I', "console", "desktop.mode", "on=true why=auto program=/bin/bitscomp"),
+        line(200, 'I', "console", "desktop.mode", "on=true why=start program=/bin/bitscomp"),
         line(260, 'I', "usb", "xhci.up", "ctrl=xhci0"),
         line(270, 'W', "usb", "port.slow", "port=3"),
         line(290, 'E', "wlan", "fw.timeout", "step=boot"),
@@ -168,15 +169,15 @@ fn an_error_after_a_watched_success_keeps_the_success() {
 }
 
 #[test]
-fn a_start_with_desktop_off_at_error_settles_without_the_desktop() {
+fn a_start_without_a_gpu_at_error_settles_without_the_desktop() {
     let lines: Vec<String> = start_with_desktop()
         .into_iter()
         .filter(|l| !head(l).1.starts_with("desktop."))
-        .chain([line(545, 'I', "console", "desktop.off", "why=off")])
+        .chain([line(545, 'E', "console", "desktop.no_gpu", "reason=gpu")])
         .collect();
     let (s, _) = at_level(&lines, &['E']);
     assert_eq!(s.get(Key::Desktop).state, State::Skipped);
-    assert_eq!(s.get(Key::Desktop).detail, "desktop=off");
+    assert_eq!(s.get(Key::Desktop).detail, "keine gpu: textkonsole");
     // The rest is what info lists (this start's GPU stays at "wird geprüft" at every level).
     assert_eq!(s, at_level(&lines, &['E', 'W', 'I']).0);
     assert_eq!(s.init, Init::Running);

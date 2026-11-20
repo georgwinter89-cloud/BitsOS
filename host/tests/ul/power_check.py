@@ -139,7 +139,7 @@ def reboot(c, q):
     t, _ = tool(c, "run", {"path": "/bin/reboot", "args": [], "timeout_ms": 10000})
     need("Operation not permitted" in t, "reboot from MCP's run (user 1000): EPERM", t)
     t, _ = tool(c, "run", {"path": "/bin/init", "args": ["--power", "poweroff"], "timeout_ms": 10000})
-    need("refused user 1000 asks only through /bin/bitscomp" in t, "the power socket refuses user 1000 outside bitscomp", t)
+    need("refused user 1000 asks only through /boot/BITSOS2/bin/bitscomp" in t, "the power socket refuses user 1000 outside bitscomp", t)
     q.type("init --power status\n")
     wait_screen(c, "status poweroff=allowed", "root asks the power socket: a line typed on the keyboard allows")
     t, _ = tool(c, "run", {"path": "/bin/sh", "args": ["-c", "grep -H SigBlk /proc/[0-9]*/status"], "timeout_ms": 5000})
@@ -168,4 +168,5 @@ def main():
     print(f"ul power ({MODE}): green")
 
 
-main()
+if __name__ == "__main__":
+    main()

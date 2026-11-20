@@ -108,8 +108,6 @@ const NAMES: &[(&str, &str, &str)] = &[
     ("theme.mode", "light", "Hell"),
     ("theme.motion", "medium", "Mittel"),
     ("theme.motion", "calm", "Ruhig"),
-    ("theme.effects", "cheap", "Sparsam"),
-    ("theme.effects", "gpu", "GPU"),
     ("theme.layout.address_bar", "top", "Oben"),
     ("theme.layout.address_bar", "tile", "Pro Kachel"),
     ("kernel.snd_output", "jack", "Klinke"),
@@ -136,26 +134,36 @@ pub fn choice_name(key: &str, value: &str) -> String {
     find(key).or_else(|| find("")).unwrap_or_else(|| value.to_string())
 }
 
-/// German group heads by key prefix (the longest one wins), in the page's order. FAVORITEN comes after AUFBAU.
+/// German group names by key prefix (the longest one wins), in the page's order; the page heads them in capitals.
+/// FAVORITEN comes after AUFBAU.
 const GROUPS: &[(&str, &str)] = &[
-    ("theme", "AUSSEHEN"),
-    ("theme.layout", "AUFBAU"),
-    ("theme.font", "SCHRIFT"),
-    ("theme.dark", "FARBEN IM DUNKLEN DESIGN"),
-    ("theme.light", "FARBEN IM HELLEN DESIGN"),
-    ("desktop", "SCHREIBTISCH"),
-    ("claude", "CLAUDE"),
+    ("theme", "Aussehen"),
+    ("theme.layout", "Aufbau"),
+    ("theme.font", "Schrift"),
+    ("theme.dark", "Farben im dunklen Design"),
+    ("theme.light", "Farben im hellen Design"),
+    ("desktop", "Schreibtisch"),
+    ("claude", "Claude"),
     ("ki", "KI"),
-    ("net", "NETZ"),
-    ("snd", "TON"),
-    ("kernel", "KERN"),
-    ("settings", "EINSTELLUNGSDIENST"),
+    ("net", "Netz"),
+    ("snd", "Ton"),
+    ("kernel", "Kern"),
+    ("settings", "Einstellungsdienst"),
+    // SELFOPT-1: bitsbench's keys and the page "Leistung"'s own rows.
+    ("leistung", "Leistung"),
+    // DB4: ctxd's switches and the learned entries (gelernt.rs).
+    ("gewohnheiten", "Was BitsOS über dich gelernt hat"),
+    // DB3: Durchblick's keys and atspid's switch (`db_settings::group_key`).
+    ("durchblick", "Durchblick"),
+    // DB2: bitsaccess's keys and the way to the page "Wer hat was gemacht".
+    ("access", "Wer hat was gemacht"),
 ];
 /// Groups before the favourites (the mock-up's order).
 const BEFORE_FAVOURITES: usize = 2;
 
 /// The group of `key`: its index in GROUPS, or its first segment in capitals (a namespace nobody named yet).
 fn group_of(key: &str) -> Result<usize, String> {
+    let key = crate::db_settings::group_key(key);
     let under = |p: &str| key == p || key.starts_with(&format!("{p}."));
     GROUPS
         .iter()
@@ -166,18 +174,33 @@ fn group_of(key: &str) -> Result<usize, String> {
         .ok_or_else(|| key.split('.').next().unwrap_or(key).to_uppercase())
 }
 
+/// The readable name of `key`'s group ("Aussehen"), for where a row is named outside the page; None for a
+/// namespace nobody named.
+pub fn group_name(key: &str) -> Option<&'static str> {
+    group_of(key).ok().map(|g| GROUPS[g].1)
+}
+
 /// The hand-made rows: their order first in their group, a short name for answer lines, a kind that adds something.
-const HAND: [(&str, &str); 10] = [
+const HAND: [(&str, &str); 16] = [
     ("theme.mode", "Design"),
     ("theme.accent", "Akzentfarbe"),
     ("theme.scale", "Skalierung"),
     ("theme.motion", "Bewegung"),
-    ("theme.effects", "Effektstufe"),
     ("theme.layout.address_bar", "Adresszeile"),
     ("theme.layout.favourites_bar", "Favoritenleiste"),
     ("theme.layout.workspaces_bar", "Liste der Arbeitsräume"),
     ("theme.layout.claude_sidebar", "Claudes Seitenleiste"),
     ("theme.layout.statusbar", "Statusleiste"),
+    // SELFOPT-1: the switch first, then the window's hours in their order.
+    ("leistung.nachts", "Nachts messen"),
+    ("leistung.von", "Messen ab"),
+    ("leistung.bis", "Messen bis"),
+    // DB4: the master switch first.
+    ("gewohnheiten.enabled", "Lernen und Nachmachen"),
+    // DB3: the keys, then atspid's switch.
+    crate::db_settings::ORDER[0],
+    crate::db_settings::ORDER[1],
+    crate::db_settings::ORDER[2],
 ];
 
 /// The page's keys while settingsd has not answered (its defaults as in settingsd/src/builtin.rs).
@@ -197,7 +220,6 @@ pub fn builtin() -> Vec<Spec> {
         s("theme.accent", Ty::Color, crate::theme::ACCENT, "Akzentfarbe"),
         s("theme.scale", Ty::Int { min: 100, max: 300, unit: "%".into(), word: None }, "125", "Skalierung der Oberfläche"),
         s("theme.motion", ch(&["medium", "calm", "off"]), "medium", "Bewegung"),
-        s("theme.effects", ch(&["cheap", "gpu"]), "cheap", "Effektstufe"),
         s("theme.layout.address_bar", ch(&["top", "tile"]), "top", "Adresszeile"),
         s("theme.layout.favourites_bar", Ty::Bool, "true", "Favoritenleiste"),
         s("theme.layout.workspaces_bar", Ty::Bool, "true", "Liste der Arbeitsräume"),
@@ -254,10 +276,13 @@ fn word_name(w: &str) -> String {
     }
 }
 
+/// The note of a settingsd `secret` key's row (DB1's list knows such a row by it and never shows a value).
+pub const SECRET_NOTE: &str = "Geheim: nur sein Dienst sieht den Wert.";
+
 fn kind_of(s: &Spec) -> Kind {
     // A confirm key gets its control like any other; the page asks before it sends (WY-10, `page_confirm`).
     if s.safety == "secret" {
-        return Kind::Fixed("Geheim: nur sein Dienst sieht den Wert.".into());
+        return Kind::Fixed(SECRET_NOTE.into());
     }
     match &s.ty {
         _ if s.key == "theme.accent" => Kind::Accent,
@@ -294,7 +319,7 @@ fn note_of(s: &Spec) -> &'static str {
     }
 }
 
-fn row_of(s: &Spec) -> Row {
+pub fn row_of(s: &Spec) -> Row {
     let short = HAND.iter().find(|(k, _)| *k == s.key).map(|(_, n)| n.to_string());
     let label = if s.de.trim().is_empty() { s.key.clone() } else { s.de.clone() };
     Row {
@@ -305,6 +330,7 @@ fn row_of(s: &Spec) -> Row {
         label,
         note: note_of(s).into(),
         confirm: s.safety == "confirm",
+        stack: false,
     }
 }
 
@@ -334,25 +360,39 @@ pub fn model(specs: &[Spec]) -> Model {
         }
         let from = m.rows.len();
         m.rows.extend(v.iter().map(|s| row_of(s)));
+        // DESK-LEFT: the programs' group (bitspkgd's keys) ends with the way to add programs.
+        if v.iter().any(|s| s.key.starts_with("pkg.")) && !v.iter().any(|s| s.key == crate::page::ADD_LINK_KEY) {
+            m.rows.push(crate::page::add_programs_row());
+        }
+        if v.iter().any(|s| s.key.starts_with("access.")) && !v.iter().any(|s| s.key == crate::werhatwas::LINK_KEY) {
+            m.rows.push(crate::werhatwas::link_row());
+        }
+        // UPDATE: the kernel's group (settingsd's kernel keys, known by its log level) ends with the way to
+        // "Aktualisieren".
+        if v.iter().any(|s| s.key == "kernel.loglevel") && !v.iter().any(|s| s.key == crate::update_page::LINK_KEY) {
+            m.rows.push(crate::update_page::link_row());
+        }
+        // SELFOPT-1: bitsbench's keys are followed by the report, the origin, the history and the comparison.
+        if v.iter().any(|s| s.key.starts_with(crate::leistung::PREFIX)) {
+            m.rows.extend(crate::leistung::rows().into_iter().filter(|r| !v.iter().any(|s| s.key == r.key)));
+        }
+        // DB4: what the memory learned, under its master switch (the parts' switches follow).
+        if v.iter().any(|s| s.key.starts_with("gewohnheiten.")) {
+            let at = crate::gelernt::insert_at(&m.rows[from..]) + from;
+            m.rows.splice(at..at, crate::gelernt::rows_now());
+        }
         m.sections.push(Section::Rows(name.to_string(), from..m.rows.len()));
     };
     for (g, (_, name)) in GROUPS.iter().enumerate() {
         if g == BEFORE_FAVOURITES {
             m.sections.push(Section::Favourites);
         }
-        add(&mut m, name, &named[g]);
+        add(&mut m, &name.to_uppercase(), &named[g]);
     }
     for (name, v) in &other {
         add(&mut m, name, v);
     }
     m
-}
-
-/// A field being edited in row `r` of `old` follows its key into `new` (a re-list may reorder the rows): the
-/// key's new row while it still takes typed text, else None (the edit ends, nothing is written).
-pub fn field_row(old: &Model, new: &Model, r: usize) -> Option<usize> {
-    let key = &old.rows.get(r)?.key;
-    new.rows.iter().position(|n| n.key == *key && matches!(n.kind, Kind::Number { .. } | Kind::Field { .. }))
 }
 
 #[cfg(test)]
@@ -417,10 +457,10 @@ mod tests {
         let m = model(&specs);
         let keys: Vec<&str> = m.rows.iter().map(|r| r.key.as_str()).collect();
         let hand: Vec<&str> = HAND.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys[..5], hand[..5], "AUSSEHEN in the mock-up's order");
-        assert_eq!(keys[5], "theme.glow", "a new theme key joins AUSSEHEN after the hand-made rows");
-        assert_eq!(keys[6..11], hand[5..]);
-        assert_eq!(&keys[11..], ["net.secret", "net.risky", "kernel.snd_output", "zz.new"]);
+        assert_eq!(keys[..4], hand[..4], "AUSSEHEN in the mock-up's order");
+        assert_eq!(keys[4], "theme.glow", "a new theme key joins AUSSEHEN after the hand-made rows");
+        assert_eq!(keys[5..10], hand[4..9]);
+        assert_eq!(&keys[10..], ["net.secret", "net.risky", "kernel.snd_output", "zz.new"]);
         let heads: Vec<String> = m
             .sections
             .iter()
@@ -429,34 +469,16 @@ mod tests {
                 Section::Favourites => "FAV".into(),
             })
             .collect();
-        assert_eq!(heads, ["AUSSEHEN:6", "AUFBAU:5", "FAV", "NETZ:2", "KERN:1", "ZZ:1"]);
+        assert_eq!(heads, ["AUSSEHEN:5", "AUFBAU:5", "FAV", "NETZ:2", "KERN:1", "ZZ:1"]);
         assert!(matches!(&m.rows[0].kind, Kind::Choice(o) if o[0] == ("dark".into(), "Dunkel".into())));
         assert_eq!(m.rows[0].short, "Design");
         assert_eq!(m.rows[1].kind, Kind::Accent);
         assert!(matches!(m.rows[2].kind, Kind::Number { min: 100, max: 300, step: 25, .. }));
-        assert!(matches!(m.rows[11].kind, Kind::Fixed(_)), "a secret gets no control");
-        assert!(!m.rows[11].confirm && m.rows[12].confirm && !m.rows[0].confirm);
-        assert_eq!(m.rows[12].kind, Kind::Switch, "a confirm key gets its control (the page asks first)");
-        assert!(matches!(&m.rows[13].kind, Kind::Choice(o) if o[1] == ("hdmi".into(), "HDMI".into())));
-        assert_eq!(model(&builtin()).rows.len(), 10, "offline: the hand-made rows");
-    }
-
-    #[test]
-    fn an_open_field_follows_its_key_when_the_rows_move() {
-        let spec = |k: &str, ty: &str| parse(&format!(r#"{{"key":"{k}","schema":{ty},"text":"x"}}"#)).unwrap();
-        let int = r#"{"type":"int","min":0,"max":1000,"unit":""}"#;
-        let old = model(&[spec("zz.a", int), spec("zz.b", r#"{"type":"text","max_bytes":600}"#)]);
-        let r = old.rows.iter().position(|w| w.key == "zz.a").unwrap();
-        // A re-list puts a new number key where zz.a was: Enter must not write zz.a's 500 into it.
-        let new = model(&[spec("zz.0", int), spec("zz.a", int), spec("zz.b", r#"{"type":"text"}"#)]);
-        assert_eq!(new.rows[r].key, "zz.0", "the old row index now names another key");
-        let n = field_row(&old, &new, r).unwrap();
-        assert_eq!(new.rows[n].key, "zz.a");
-        let gone = model(&[spec("zz.0", int), spec("zz.b", r#"{"type":"text"}"#)]);
-        assert_eq!(field_row(&old, &gone, r), None, "the key is gone: the edit ends");
-        let untyped = model(&[spec("zz.a", r#"{"type":"bool"}"#)]);
-        assert_eq!(field_row(&old, &untyped, r), None, "no longer typed: the edit ends");
-        assert_eq!(field_row(&old, &new, 99), None);
+        assert!(matches!(m.rows[10].kind, Kind::Fixed(_)), "a secret gets no control");
+        assert!(!m.rows[10].confirm && m.rows[11].confirm && !m.rows[0].confirm);
+        assert_eq!(m.rows[11].kind, Kind::Switch, "a confirm key gets its control (the page asks first)");
+        assert!(matches!(&m.rows[12].kind, Kind::Choice(o) if o[1] == ("hdmi".into(), "HDMI".into())));
+        assert_eq!(model(&builtin()).rows.len(), 9, "offline: the hand-made rows");
     }
 
     /// FS-13b: an int with a word (kernel.preload.max_mb `all`) gets a pill named `alles` after +; a bad word is
@@ -470,5 +492,38 @@ mod tests {
         assert!(matches!(&r.kind, Kind::Number { word: Some((w, name)), .. } if w == "all" && name == "alles"), "{:?}", r.kind);
         assert!(crate::page::controls_width(r, 2000) > crate::page::NUM_W + 2 * crate::page::CTL_H + crate::page::OPT_W);
         assert!(parse(r#"{"key":"a.b","schema":{"type":"int","min":0,"max":1,"word":"a b"}}"#).is_none());
+    }
+
+    #[test]
+    fn the_kernels_group_ends_with_the_way_to_the_update_page() {
+        let mut specs = builtin();
+        assert!(!model(&specs).rows.iter().any(|r| r.key == crate::update_page::LINK_KEY));
+        specs.push(Spec { key: "kernel.loglevel".into(), ty: Ty::Bool, ..builtin()[0].clone() });
+        let m = model(&specs);
+        let at = m.rows.iter().position(|r| r.key == crate::update_page::LINK_KEY).expect("the link");
+        assert_eq!(m.rows[at - 1].key, "kernel.loglevel");
+        assert_eq!(m.rows[at].kind, Kind::Link("aktualisieren".into()));
+    }
+
+    #[test]
+    fn the_programs_group_ends_with_the_way_to_add_programs() {
+        let mut specs = builtin();
+        let plain = model(&specs);
+        assert!(!plain.rows.iter().any(|r| r.key == crate::page::ADD_LINK_KEY), "no programs' keys: no link");
+        specs.push(Spec { key: "pkg.cpu_level".into(), ty: Ty::Bool, ..builtin()[0].clone() });
+        specs.push(Spec { key: "pkg.space".into(), ty: Ty::Bool, ..builtin()[0].clone() });
+        let m = model(&specs);
+        let sec = m.sections.iter().find_map(|s| match s {
+            Section::Rows(_, r) if m.rows[r.clone()].iter().any(|x| x.key.starts_with("pkg.")) => Some(r.clone()),
+            _ => None,
+        });
+        let r = sec.expect("a programs section");
+        let last = &m.rows[r.end - 1];
+        assert_eq!((last.key.as_str(), &last.kind, last.label.as_str()), (crate::page::ADD_LINK_KEY, &Kind::Link("programme/hinzufuegen".into()), "Programme hinzufügen"));
+        assert_eq!(m.rows.iter().filter(|x| x.key == crate::page::ADD_LINK_KEY).count(), 1);
+        let ctl = crate::page::controls(last, r.end - 1, 0, 0, 600);
+        assert_eq!(ctl.len(), 1);
+        assert_eq!(crate::page::part_name(&m.rows, ctl[0].0), "link=programme/hinzufuegen");
+        assert_eq!(crate::page::prefix_of("programme/hinzufuegen"), crate::page::ADD_LINK_KEY, "its address scrolls to it");
     }
 }

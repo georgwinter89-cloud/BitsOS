@@ -28,8 +28,10 @@ pub mod disk;
 pub mod error;
 pub mod frames;
 pub mod gpt;
+pub mod iostat;
 mod lift;
 mod ktests;
+mod ktests_guard;
 mod prio_ktests;
 mod shutdown_ktests;
 pub mod policy;
@@ -39,11 +41,14 @@ pub mod ramdisk;
 pub mod shutdown;
 pub mod table;
 pub mod testimg;
+pub mod usb_busy;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod frames_tests;
+#[cfg(test)]
+mod discard_tests;
 #[cfg(test)]
 mod shutdown_tests;
 #[cfg(test)]
@@ -62,6 +67,7 @@ pub use error::{BlockError, Refusal};
 pub use policy::{DiskKind, StickIdentity, StickMatch, WriteCheck, WriteGate, add_global_gate, usb_writes_possible};
 pub use queue::Kind;
 pub use ramdisk::RamDisk;
+pub use usb_busy::add_usb_busy;
 
 static DISKS: SpinLock<Vec<Arc<Disk>>> = SpinLock::named("block.disks", Vec::new());
 static LISTENERS: SpinLock<Vec<Arc<dyn DiskListener>>> = SpinLock::named("block.listeners", Vec::new());
@@ -181,16 +187,26 @@ pub fn generation() -> u64 {
 /// The CONFIG reader (`stick_write`, `usb_msd_write`, `nvme_write`) and the boot stick's identity from
 /// BootInfo. Disks registered before are matched against the stick again.
 pub fn configure(config: fn(&str) -> Option<String>, stick: Option<StickIdentity>) {
+    // GP-GUARD: `nvme_bind=off` and a profile the kernel chose itself (pure rule, `policy::guarded`).
+    let (internal_off, stick) = policy::guarded(&config, stick);
+    let named = policy::named(&config);
     {
         let mut f = policy::FACTS.lock();
         f.config = Some(config);
         f.stick = stick;
         f.configured = true;
+        f.internal_off = internal_off;
+        f.named = named;
     }
     let sw = policy::switches();
     klog::event!(Info, "block", "configured", stick_block0 = stick.is_some_and(|s| s.block0.is_some()),
         stick_usb = stick.and_then(|s| s.usb).map_or(alloc::string::String::new(), |(v, p)| alloc::format!("{v:04x}:{p:04x}")),
         stick_id = stick.is_some_and(|s| s.id.is_some()), stick_write = sw.stick_write, usb_msd_write = sw.usb_msd_write, nvme_write = sw.nvme_write);
+    if internal_off && named {
+        klog::event!(Warn, "block", "internal_disks.one"; "nvme_bind=off with gp_nvme=: only the named NVMe controller is driven, under the Mini-PC's rules (nvme_write, nvme_data, nvme_boot); no other internal disk; the full-access NVMe tick is refused");
+    } else if internal_off {
+        klog::event!(Warn, "block", "internal_disks.off"; "nvme_bind=off: no internal disk is driven, read or written on this machine; the full-access NVMe tick is refused");
+    }
     for d in disks() {
         let m = d.rematch_stick();
         klog::event!(Info, "block", "disk.stick", disk = String::from(d.name()), stick = disk::stick_str(m));

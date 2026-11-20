@@ -22,7 +22,7 @@ NAME=cl-settings-mcp
     > "$RUN_DIR/build.log" 2>&1 || { tail -20 "$RUN_DIR/build.log"; echo "RED: musl build"; exit 1; }
 BIN="$ROOT/target/x86_64-unknown-linux-musl/release/settingsd"
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;wlan=off;nvme_write=off"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;nvme_write=off"
 rm -f "$LOG"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 500 --serial-log "$LOG" \
     > "$RUN_DIR/qemu.out" 2>&1 &

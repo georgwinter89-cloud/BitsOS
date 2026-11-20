@@ -6,7 +6,7 @@ use crate::place::{CpuView, Pref};
 use crate::rq::RunQueue;
 use crate::{Class, Leave, Thread};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use hal::percpu::PerCpu;
 use hal::smp::Topology;
 use ksync::{IrqSpinLock, Once};
@@ -71,6 +71,15 @@ pub(crate) struct CpuSched {
     /// SC-9: this CPU lacks ARAT or an invariant TSC although the boot CPU (whose CPUID made the idle plan)
     /// has them: it stays in C1 (`cstate::check_cpu`).
     pub idle_c1_only: AtomicBool,
+    /// GP-CPU2 (hybrid CPUs): the running thread's utilisation when it started here and whether it is pinned or has a
+    /// narrowed affinity mask (`Thread::misfit_free`: such a thread is not pulled); a
+    /// misfit request (the thread's id, 0: none) with the faster CPU it should move to, and the target of a move
+    /// under way (`after_switch` takes it).
+    pub curr_util: AtomicU32,
+    pub curr_pinned: AtomicBool,
+    pub misfit_id: AtomicU64,
+    pub misfit_to: AtomicUsize,
+    pub moving_to: AtomicUsize,
 }
 
 impl CpuSched {
@@ -114,6 +123,11 @@ impl CpuSched {
             idle_entry: AtomicU64::new(0),
             idle_predicted: AtomicU64::new(0),
             idle_c1_only: AtomicBool::new(false),
+            curr_util: AtomicU32::new(0),
+            curr_pinned: AtomicBool::new(false),
+            misfit_id: AtomicU64::new(0),
+            misfit_to: AtomicUsize::new(crate::NO_CPU),
+            moving_to: AtomicUsize::new(crate::NO_CPU),
         }
     }
 
@@ -137,6 +151,10 @@ impl CpuSched {
         self.curr_start.store(now, Ordering::Relaxed);
         self.acct_at.store(now, Ordering::Relaxed);
         self.in_idle.store(t.is_idle(), Ordering::Release);
+        if hybrid() {
+            self.curr_util.store(t.util(), Ordering::Relaxed);
+            self.curr_pinned.store(!t.misfit_free(), Ordering::Relaxed);
+        }
     }
 
     /// Busy and idle time up to `now` (what `busy_ns`/`idle_ns` hold plus the running thread's time since).
@@ -208,6 +226,30 @@ pub(crate) fn view_of(c: usize) -> Option<CpuView> {
     of(c).filter(|s| s.online.load(Ordering::Acquire)).map(|s| s.view())
 }
 
+/// GP-CPU2: some online CPU has a P or E core type (`hal::smp`); never set on a uniform CPU such as the Mini-PC's.
+static HYBRID: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn note_core_type(core_type: u8) {
+    if core_type != hal::smp::CORE_TYPE_UNIFORM {
+        HYBRID.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) fn hybrid() -> bool {
+    HYBRID.load(Ordering::Acquire)
+}
+
+/// The capacity of the slowest online CPU (the E cores' on the 265K).
+pub(crate) fn smallest_capacity() -> u16 {
+    // `hal::smp::capacity` alone (no queue state): this runs at every wake-up on a hybrid CPU.
+    online().filter_map(|c| hal::smp::capacity(c.cpu)).min().unwrap_or(hal::smp::CAPACITY_SCALE)
+}
+
+/// Where `t` wants to run: by class, and on a hybrid CPU a Normal thread by its utilisation (`hybrid::pref_for`).
+pub(crate) fn pref_for(t: &Thread) -> Pref {
+    if hybrid() { crate::hybrid::pref_for(t.class(), t.util(), smallest_capacity()) } else { pref_of(t.class()) }
+}
+
 pub(crate) fn pref_of(class: Class) -> Pref {
     match class {
         Class::KernelRt | Class::Interactive => Pref::Performance,
@@ -226,9 +268,13 @@ pub(crate) fn select_for(t: &Thread) -> usize {
     }
     let prev = t.cpu.load(Ordering::Relaxed);
     let prev = (prev != crate::NO_CPU).then_some(prev);
+    if hybrid() {
+        t.update_util(time::now_ns());
+    }
+    let pref = pref_for(t);
     let allowed = |c: usize| if t.may_run_on(c) { view_of(c) } else { None };
-    crate::place::select(count(), &allowed, prev, pref_of(t.class()))
-        .or_else(|| crate::place::select(count(), &view_of, prev, pref_of(t.class())))
+    crate::place::select(count(), &allowed, prev, pref)
+        .or_else(|| crate::place::select(count(), &view_of, prev, pref))
         .unwrap_or_else(hal::percpu::this_cpu)
 }
 
@@ -260,7 +306,8 @@ pub(crate) fn register_resched() -> Option<u8> {
     None
 }
 
-pub(crate) fn resched_vector() -> u8 {
+/// The reschedule IPI's vector (0 before `register_resched`); klogd names it in a storm line (GP-R3).
+pub fn resched_vector() -> u8 {
     RESCHED_VECTOR.load(Ordering::Acquire)
 }
 
@@ -292,9 +339,17 @@ pub fn prof_kick() {
 /// preemption can act at once), sends the IPI. IRQ-safe.
 pub(crate) fn kick(cs: &CpuSched, urgent: bool) {
     cs.need_resched.store(true, Ordering::SeqCst);
+    let here = cs.cpu == hal::percpu::this_cpu();
     // Pairs with the fence in `idle::halt`: either it sees the flag, or this sees `halted`.
-    if cs.cpu != hal::percpu::this_cpu() && (urgent || cs.halted.load(Ordering::SeqCst)) {
+    if !here && (urgent || cs.halted.load(Ordering::SeqCst)) {
         send_resched(cs.cpu);
+    }
+    // This CPU in thread context (Linux `resched_curr` -> `set_preempt_need_resched` locally): the waker may hold
+    // a spin lock and never block, so the switch waits for its next point where the count is 0, or happens now.
+    // In an interrupt handler the interrupt exit does that (`irq_exit_preempt`).
+    if here && !hal::percpu::in_hard_irq() {
+        hal::percpu::defer_resched();
+        hal::percpu::resched_point();
     }
 }
 

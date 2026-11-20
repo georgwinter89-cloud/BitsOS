@@ -825,3 +825,6 @@ fn pthread() -> TestResult {
     kassert!(bad.is_empty(), "{}", bad.join("\n"));
     Ok(())
 }
+
+#[path = "futex7_ktests.rs"]
+mod futex7_ktests;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TS-1: ktests.py and lo_check.py against a stand-in for the Mini-PC's MCP (plain HTTP on 127.0.0.1): the judgement,
+"""TS-1: ktests.py against a stand-in for the Mini-PC's MCP (plain HTTP on 127.0.0.1): the judgement,
 the record file, and above all the machine put back after a red run. A step of `cargo xtask test`; nothing here touches
 a machine. Usage: selftest.py <scratch dir>"""
 import base64
@@ -7,7 +7,6 @@ import contextlib
 import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import threading
@@ -27,10 +26,6 @@ skip e.f: belongs to a QEMU run
 skip nv.g: belongs to a QEMU run
 refused i.j: Audible: makes sound; not over MCP on hardware (R8e)
 """
-LO_KTEST = "ok ul.pkg.libreoffice (1 ms)\nktest: passed=3 failed=0 skipped=0 refused=0\n"
-LO_CHECK = "libraries: 12 found, none missing\nlibreoffice: home: /data/home/1000 (data volume; documents stay)\nrc=0\n"
-PDF = b"%PDF-1.7\n...\n%%EOF\n"
-ODT = b"PK\x03\x04" + b"mimetypeapplication/vnd.oasis.opendocument.text"
 
 
 class Machine:
@@ -40,12 +35,10 @@ class Machine:
         self.desktop = True
         self.level = "warn,net=debug"
         self.config = "token=x\n"
-        self.window = None
         self.calls = []
         self.during_ktest = None  # the level and the desktop while the long run was going
         self.get_fails = self.set_back_fails = self.keys_refused = self.quit_ignored = self.stays_open = False
         self.back_on_keys = True
-        self.lo_tally = LO_KTEST
         self.__dict__.update(switches)
 
     def tool(self, name, a):
@@ -54,8 +47,6 @@ class Machine:
             return self.list_dir(a["path"])
         if name == "read_file":
             data = {
-                "/data/home/1000/lo1-check/brief.pdf": PDF,
-                "/data/home/1000/lo1-check/brief.odt": ODT,
                 "/proc/105/comm": b"bitscomp\n",
                 "/proc/105/status": b"Name:\tbitscomp\nState:\tS (sleeping)\n",
                 "/proc/7/comm": b"oldholder\n",
@@ -83,8 +74,6 @@ class Machine:
             return self.shell(a["args"][1])
         if name == "ktest":
             return self.ktest(a["filter"])
-        if name == "screen":
-            return False, "the picture"
         raise ValueError(f"no such tool in the stand-in: {name}")
 
     def list_dir(self, path):
@@ -100,8 +89,6 @@ class Machine:
         if flt == PROBE:
             line = f"skip {PROBE}: belongs to the Mini-PC run without the desktop: a program holds the screen" if self.desktop else f"ok {PROBE} (1 ms)"
             return False, f"call 1 ktest: finished\n{line}\n"
-        if flt.startswith("ul.pkg.libreoffice"):
-            return False, self.lo_tally
         self.during_ktest = (self.level, self.desktop)
         return False, WHOLE
 
@@ -110,18 +97,6 @@ class Machine:
             if not self.quit_ignored:
                 self.desktop = False
             return False, "ok\n"
-        if "ctl address open" in cmd:
-            self.window = cmd.split("/")[-1]
-            return False, "opened\n"
-        if "ctl list" in cmd:
-            return False, f"id=1 app_id=libreoffice-{self.window} title=x\n" if self.window else "\n"
-        if "ctl close" in cmd:
-            self.window = None
-            return False, "\n"
-        if "--check" in cmd:
-            return False, LO_CHECK
-        if "--convert-to" in cmd:
-            return False, "LibreOffice ended (code 0)\nrc=0\n"
         return False, "\n"
 
     def used(self, tool):
@@ -251,30 +226,13 @@ def machine_put_back(out):
 
     m = Machine(desktop=False)
     code, text = run_ktests(m, "bare", out)
-    check(code is None and not m.used("send_keys") and not m.desktop, "bare in a boot with desktop=off: nothing is stopped, nothing started", text)
+    check(code is None and not m.used("send_keys") and not m.desktop, "bare in a boot without the desktop: nothing is stopped, nothing started", text)
     check(not [a for a in m.used("run") if "ctl quit" in a["args"][1]], "and no quit goes out")
 
     for f in ktests.FORBIDDEN:
         m = Machine(config=f + "\n")
         code, text = run_ktests(m, "bare", out)
         check(code and f in code and not m.used("settings_set") and not m.used("ktest"), f"a CONFIG with {f} stops the script before it changes anything", text)
-
-
-def lo_check(out):
-    def go(m):
-        srv = serve(m)
-        env = dict(os.environ, BITSOS_TOKEN=TOKEN)
-        cmd = [sys.executable, "-I", os.path.join(HERE, "lo_check.py"), f"127.0.0.1:{srv.server_address[1]}", os.path.join(out, "lo"), "--desktop"]
-        try:
-            return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180, check=False)
-        finally:
-            srv.shutdown()
-
-    p = go(Machine())
-    check(p.returncode == 0 and "GREEN" in p.stdout, "lo_check.py green with windows and a picture", p.stdout + p.stderr)
-    check(os.path.exists(os.path.join(out, "lo", "writer.png")), "its picture is saved")
-    p = go(Machine(lo_tally="ktest: passed=2 failed=1 skipped=0 refused=0\n"))
-    check(p.returncode != 0 and "ul.pkg.libreoffice" in p.stderr, "lo_check.py red when the ktest fails", p.stdout + p.stderr)
 
 
 def main():
@@ -286,7 +244,6 @@ def main():
     ktests.STOP_WAIT_S, ktests.POLL_S = 1, 0.05
     judge_and_record()
     machine_put_back(out)
-    lo_check(out)
     print("GREEN: the Mini-PC scripts against the stand-in", flush=True)
 
 

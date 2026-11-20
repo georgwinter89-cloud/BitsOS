@@ -1,6 +1,6 @@
-//! Process groups and sessions, minimal (linux-6.6/kernel/sys.c `setpgid` :1073, `getpgid`, `setsid`,
+//! Process groups and sessions, minimal (linux-7.3.1/kernel/sys.c `setpgid` :1114, `getpgid`, `setsid`,
 //! `getsid`; drivers/tty/tty_jobctrl.c `tiocspgrp`, `session_of_pgrp`): what shells and init need; AB-6 adds
-//! the orphaned-group rule of job control (kernel/exit.c `will_become_orphaned_pgrp` :326).
+//! the orphaned-group rule of job control (kernel/exit.c `will_become_orphaned_pgrp` :359).
 //!
 //! A process the kernel starts leads its own session and group (V2 has no login: the MCP `run` tool, the
 //! console and init start programs like a fresh `setsid`). Children inherit both.

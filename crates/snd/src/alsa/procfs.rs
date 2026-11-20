@@ -1,4 +1,4 @@
-//! `/proc/asound` as `linux-6.6/sound/core/{info.c,init.c,pcm.c,sound.c}` print it (aplay -l and the
+//! `/proc/asound` as `linux-7.3.1/sound/core/{info.c,init.c,pcm.c,sound.c}` print it (aplay -l and the
 //! card-name lookups read the control device; these files are for people and scripts).
 
 use alloc::format;

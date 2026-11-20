@@ -1,5 +1,5 @@
-//! CP-5: what the console's `poweroff` / `reboot` commands call (IN-3 wires the command line; change request 3 in
-//! plan/notes/cp-CP-5.md). Thread context: RB-15's order (`klog::shutdown`: the console mirror off the stack,
+//! CP-5: what the console's `poweroff` / `reboot` commands call (IN-3 wires the command line). Thread
+//! context: RB-15's order (`klog::shutdown`: the console mirror off the stack,
 //! storage stop, park), quiesce every driver (CONTRACTS 6a), then `acpi::power`, waiting with
 //! the scheduler's sleep. Power-off is never an MCP tool (R8f); MC's `reboot` tool calls `acpi::power::reboot`
 //! itself after its answer.
@@ -65,7 +65,7 @@ pub fn stop_before_park(what: &'static str) {
 }
 
 /// RB-quiesce: the other CPUs parked before the quiesce (Linux `native_machine_shutdown` -> `stop_other_cpus`,
-/// linux-6.6/arch/x86/kernel/reboot.c:742), so no driver's Quiesce undo meets its own work running on another
+/// linux-7.3.1/arch/x86/kernel/reboot.c:703), so no driver's Quiesce undo meets its own work running on another
 /// CPU. Moves the thread to CPU 0 first. A refusal is logged and the shutdown goes on beside the running CPUs.
 /// Dropping the result releases the CPUs and unpins the thread (a power-off that did not happen). Plain `event!`
 /// after the park is safe: a CPU parked by the park IPI holds no spin lock (SC's park guard), and one parked only

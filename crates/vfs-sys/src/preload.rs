@@ -14,7 +14,8 @@
 //!    files (their keep-alives go) and merged after it.
 //! `preload.max_mb` 0 pauses it: no pass, nothing recorded, and the stored record is left as it is. A pass that
 //! stopped because the preload was switched off runs again when it is switched on.
-//! Settings: CONFIG `preload` (on/off), `preload_max_mb`, `preload_window_ms`; at run time
+//! Settings: CONFIG `preload` (on/off, default on: settingsd's `kernel.preload.enabled` writes it, a service's off
+//! switch DECISIONS 18.11. keeps), `preload_max_mb`, `preload_window_ms`; at run time
 //! `/sys/bitsos/preload`, `/sys/bitsos/preload_max_mb` (settingsd `kernel.preload.*`), `/sys/bitsos/preload_clear`
 //! (write 1: the record is emptied), `/sys/bitsos/preload_status` (one line); MCP tool and console command
 //! `preload` (`preload_tool`).
@@ -412,6 +413,8 @@ fn note_record(rec: &Record) {
     s.record_pages = pages;
 }
 
+/// What CONFIG may give: the off switch (settingsd's `kernel.preload.enabled`, kept over a reboot; at run time it
+/// writes /sys/bitsos/preload too) and the sizes.
 fn config() {
     if let Some(v) = pci::registry::config_value("preload") {
         match parse_switch(v.trim()) {

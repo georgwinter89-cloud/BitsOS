@@ -1,7 +1,7 @@
-//! PSP 13.0.4 (MP0 of Phoenix/Hawk Point): Linux `psp_v13_0_4` (linux-6.6 amdgpu/psp_v13_0_4.c). On this APU the
+//! PSP 13.0.4 (MP0 of Phoenix/Hawk Point): Linux `psp_v13_0_4` (linux-7.3.1 amdgpu/psp_v13_0_4.c). On this APU the
 //! secure OS already runs when the OS starts (the BIOS loaded it; Linux's bootloader steps only run when
 //! C2PMSG_81 reads 0), so the driver's part is the ring: wait for C2PMSG_64 bit 31, ring address and size into
-//! C2PMSG_69/70/71, the command into C2PMSG_64, wait for bit 31 again (psp_v13_0_4.c:223-288).
+//! C2PMSG_69/70/71, the command into C2PMSG_64, wait for bit 31 again (psp_v13_0_4.c:223-291).
 //!
 //! GX-7a: the register half of the KM ring (`Mailbox13`: create, stop, write pointer); the protocol over it
 //! (frames, command buffers, fences, TMR, firmware loading) is version-independent and lives in

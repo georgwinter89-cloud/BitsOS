@@ -16,7 +16,6 @@ use ktest::{kassert, ktest};
 type R = ktest::TestResult;
 
 ktest!("pc.optin.command_unchanged", QemuAll, optin_command_unchanged);
-ktest!("pc.optin.net_drivers_off", Run("pc/30-bind"), net_drivers_off);
 ktest!("pc.bind.one_per_function", Safe, one_per_function);
 ktest!("pc.bind.order", QemuOnly, bind_order);
 ktest!("pc.bind.remove_reprobe", QemuOnly, remove_reprobe);
@@ -33,14 +32,14 @@ fn events(seq: u64, name: &str) -> Vec<String> {
     klog::read_since(seq, usize::MAX).into_iter().filter(|r| r.subsystem == "pci" && r.name == name).map(|r| r.text).collect()
 }
 
-/// R8d after boot: every function left untouched by its key (on the Mini-PC 04:00.0 and its bridge
-/// 00:02.2, under QEMU the ICH9 SMBus and the q35 MCH with test keys) still has the command register the
-/// firmware left, no BARs sized, no driver, no record, and is refused by `probe`.
+/// R8d after boot: every function a rule keeps untouched (on the Gaming-PC its never-touch list and network rule,
+/// under QEMU the ICH9 SMBus of `optin::TEST_HELD`) still has the command register the firmware left, no BARs
+/// sized, no driver, no record, and is refused by `probe`.
 fn optin_command_unchanged() -> R {
     let nodes = crate::tree();
     let opted_out: Vec<&Node> = nodes.iter().filter(|n| n.untouched.is_some()).collect();
     if opted_out.is_empty() {
-        return ktest::fail("no function is untouched on this machine (no WLAN, no test key)");
+        return ktest::fail("no function is untouched on this machine (no Gaming-PC rule, no test function)");
     }
     for n in opted_out {
         let f = n.function();
@@ -59,33 +58,12 @@ fn optin_command_unchanged() -> R {
     Ok(())
 }
 
-/// BT-5 safe mode: with `net_drivers=off` every network-class function (QEMU: the virtio-net card) is
-/// untouched by that key, keeps the command register the firmware left and has no driver. Without the key
-/// it fails; run it with `cargo xtask ktest pc.optin --config-extra net_drivers=off`.
-fn net_drivers_off() -> R {
-    if !registry::net_kept_off(0x02_00_00, registry::config_value("net_drivers").as_deref()) {
-        return ktest::fail("net_drivers is not off in this boot's CONFIG");
-    }
-    let nodes = crate::tree();
-    let nets: Vec<&Node> = nodes.iter().filter(|n| n.class >> 16 == 0x02).collect();
-    if nets.is_empty() {
-        return ktest::fail("no network-class function on this machine");
-    }
-    for n in nets {
-        kassert!(n.untouched == Some("net_drivers") || n.untouched == Some("wlan"), "{} untouched by {:?}", n.loc, n.untouched);
-        kassert!(n.function().command() == n.command_at_scan, "{} command changed", n.loc);
-        kassert!(n.bars.is_none(), "{} was sized", n.loc);
-        kassert!(bind::binding(n.loc).is_none(), "{} has a driver", n.loc);
-    }
-    Ok(())
-}
-
 /// Every eligible driver ranked before `b.driver` for this node must be in `failed`.
 fn check_order(n: &Node, b: &crate::Binding, cands: &[Candidate]) -> R {
     let order = registry::ordered(cands, n.vendor, n.device, n.class);
     let pos = order.iter().position(|(c, _)| c.name == b.driver).ok_or_else(|| format!("{}: bound driver {} does not match it", n.loc, b.driver))?;
     for (c, _) in &order[..pos] {
-        let eligible = c.opt_in_key.is_none_or(registry::opted_in) && crate::optin::may_bind(c.name, n);
+        let eligible = crate::optin::may_bind(c.name, n);
         kassert!(!eligible || b.failed.contains(&c.name), "{}: {} ranks before {} and did not fail", n.loc, c.name, b.driver);
     }
     kassert!(b.by_id == (order[pos].1.0 == 0), "{}: by_id wrong", n.loc);
@@ -168,9 +146,9 @@ fn bind_order() -> R {
     let Some(n) = lpc() else { return ktest::fail("no free ICH9 LPC bridge (QEMU q35 only)") };
     reset();
     let cands = [
-        Candidate { name: "ktest-wide", matches: &[Match::Class { class: 0x06_00_00, mask: 0xFF_00_00 }], opt_in_key: None, probe: wide_probe },
-        Candidate { name: "ktest-narrow", matches: &[Match::Class { class: 0x06_01_00, mask: 0xFF_FF_FF }], opt_in_key: None, probe: narrow_probe },
-        Candidate { name: "ktest-id", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], opt_in_key: None, probe: id_probe },
+        Candidate { name: "ktest-wide", matches: &[Match::Class { class: 0x06_00_00, mask: 0xFF_00_00 }], probe: wide_probe },
+        Candidate { name: "ktest-narrow", matches: &[Match::Class { class: 0x06_01_00, mask: 0xFF_FF_FF }], probe: narrow_probe },
+        Candidate { name: "ktest-id", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], probe: id_probe },
     ];
     let at = n.loc;
     let r = bind::probe_with(at, &cands);
@@ -237,8 +215,8 @@ fn remove_reprobe() -> R {
     let f = n.function();
     let orig = f.command();
     EN_REMOVES.store(0, Ordering::SeqCst);
-    let en = [Candidate { name: "ktest-enable", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], opt_in_key: None, probe: enabling_probe }];
-    let nohook = [Candidate { name: "ktest-nohook", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], opt_in_key: None, probe: nohook_probe }];
+    let en = [Candidate { name: "ktest-enable", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], probe: enabling_probe }];
+    let nohook = [Candidate { name: "ktest-nohook", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], probe: nohook_probe }];
     let res = (|| -> R {
         for round in 0..3 {
             let seq = klog::next_seq();
@@ -300,7 +278,7 @@ fn busy_refusals() -> R {
     for c in [&IN_PROBE_REMOVE, &IN_PROBE_PROBE, &IN_HOOK_REMOVE, &IN_HOOK_ENABLE, &BUSY_HOOKS] {
         c.store(0, Ordering::SeqCst);
     }
-    let busy = [Candidate { name: "ktest-busy", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], opt_in_key: None, probe: busy_probe }];
+    let busy = [Candidate { name: "ktest-busy", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], probe: busy_probe }];
     let res = (|| -> R {
         kassert!(bind::probe_with(at, &busy) == Ok("ktest-busy"));
         kassert!(IN_PROBE_REMOVE.load(Ordering::SeqCst) == 1, "remove during probe: {}", IN_PROBE_REMOVE.load(Ordering::SeqCst));
@@ -348,7 +326,7 @@ fn gone_during_probe() -> R {
     let f = n.function();
     GONE_ACTION.store(0, Ordering::SeqCst);
     GONE_HOOKS.store(0, Ordering::SeqCst);
-    let c = [Candidate { name: "ktest-vanish", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], opt_in_key: None, probe: vanishing_probe }];
+    let c = [Candidate { name: "ktest-vanish", matches: &[Match::Id { vendor: ICH9_LPC.0, device: ICH9_LPC.1 }], probe: vanishing_probe }];
     let seq = klog::next_seq();
     let r = bind::probe_with(at, &c);
     let res = (|| -> R {
@@ -443,6 +421,9 @@ fn resolve(link_path: &str, target: &str) -> String {
 /// bus/pci/devices, a driver link for each bound function, no config file for an untouched one, and the
 /// config file reads the live ID register.
 fn sysfs_view() -> R {
+    // Nothing changed between two questions: the same view object, not a second build.
+    let (a, b) = (sysfs::entries_shared(), sysfs::entries_shared());
+    kassert!(alloc::sync::Arc::ptr_eq(&a, &b), "two questions in a row built the view twice");
     let e = sysfs::entries();
     let get = |p: &str| e.iter().find(|x| x.path == p).map(|x| &x.kind);
     let nodes = crate::tree();

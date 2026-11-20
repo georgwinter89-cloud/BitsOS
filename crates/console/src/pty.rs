@@ -1,6 +1,6 @@
-//! Pseudo-terminals (IN-7): `/dev/ptmx` and the slave nodes `/dev/pts/N`, after linux-6.6/drivers/tty/pty.c
-//! (`ptmx_open` :790, `pty_open` :220, `pty_close` :47, `pty_unix98_ioctl` :642, `pty_set_termios` :242) and
-//! fs/devpts/inode.c (`devpts_new_index` :512, `devpts_pty_new` :544, `devpts_pty_kill` :600).
+//! Pseudo-terminals (IN-7): `/dev/ptmx` and the slave nodes `/dev/pts/N`, after linux-7.3.1/drivers/tty/pty.c
+//! (`ptmx_open` :767, `pty_open` :219, `pty_close` :47, `pty_unix98_ioctl` :625, `pty_set_termios` :241) and
+//! fs/devpts/inode.c (`devpts_new_index` :466, `devpts_pty_new` :498, `devpts_pty_kill` :553).
 //!
 //! Each open of `/dev/ptmx` makes a `Pair`: the slave is IN-4's line discipline (`Tty` with a `Port`), the master
 //! reads what the slave wrote (after OPOST) plus the slave's echo, and writes the slave's input. As in Linux the
@@ -18,7 +18,14 @@
 //! controlling terminal (`tty_open_proc_set_tty`); a session holds at most one terminal (`session_has_tty`).
 //! Packet mode (TIOCPKT) is not built: switching it on answers ENOTTY (V2-LANES IN-7: packet mode off).
 //!
-//! Locks: `console.ptys` (the index map) and each pair's `pty.state`, `pty.pending`, `pty.to_master` are leaves;
+//! devpts instances (IN-PTY, fs/devpts/inode.c `devpts_acquire` :181, `devpts_pty_new` :544): a ptmx opened by
+//! name makes its pty in the devpts instance it belongs to (`vfs::mount_fs::devpts_for_ptmx`: its own on devpts,
+//! else the one mounted on `pts` next to it). Each instance has its own numbers from 0, its slave nodes appear in
+//! its own root only (owner and mode from its `uid=`, `gid=`, `mode=`; `max=` bounds its numbers), and a slave
+//! is opened only through its own instance's node. The boot instance (`/dev/pts`, IN-7 CR3's devpts-named tmpfs)
+//! is the one it always was: nodes by path in the boot view, owner the opener, group tty, 0600.
+//!
+//! Locks: `console.ptys` (the index map) and `console.pts_instances` and each pair's `pty.state`, `pty.pending`, `pty.to_master` are leaves;
 //! the line discipline's lock (`tty.state`) is never held while one of them is taken except `pty.to_master` (the
 //! echo, `Port::echo`). Process hooks (signals) run with none of them held.
 
@@ -50,7 +57,7 @@ pub const TO_SLAVE_MAX: usize = 8192;
 /// Slave to master: the master's N_TTY read buffer plus its flip buffer.
 pub const TO_MASTER_MAX: usize = crate::ldisc::BUF_SIZE + 8192;
 /// Echoes may use this much more than `TO_MASTER_MAX` (n_tty's echo buffer, which keeps echoes the master has no
-/// room for; beyond it n_tty discards them, linux-6.6/drivers/tty/n_tty.c:736). Slave output never uses it.
+/// room for; beyond it n_tty discards them, linux-7.3.1/drivers/tty/n_tty.c:711). Slave output never uses it.
 pub const ECHO_ROOM: usize = crate::ldisc::BUF_SIZE;
 /// The slave-to-master queue's length from the start: its bound, the echo's room, and room for the characters
 /// by which concurrent `commit`s exceed their reservations. Both of a pty's queues are made whole with the pty
@@ -68,22 +75,76 @@ pub fn new_encode_dev(major: u32, minor: u32) -> u32 {
     (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
 }
 
-/// The live pairs by index; an entry exists from the master's open until the pair's last end is gone (Linux
-/// frees the index in `pty_unix98_remove`, when both ends are released).
-static PTYS: SpinLock<BTreeMap<u32, Weak<Pair>>> = SpinLock::named("console.ptys", BTreeMap::new());
+/// The live pairs by (instance, index); an entry exists from the master's open until the pair's last end is gone
+/// (Linux frees the index in `pty_unix98_remove`, when both ends are released).
+static PTYS: SpinLock<BTreeMap<(u64, u32), Weak<Pair>>> = SpinLock::named("console.ptys", BTreeMap::new());
 
-/// `devpts_new_index`: the lowest free index (no limit apart from memory, R1). Reserved with an empty entry.
-fn reserve_index() -> u32 {
+/// `devpts_new_index`: the instance's lowest free index (`ida_alloc_max(.., max - 1)`; without `max=` no limit
+/// apart from memory, R1). ENOSPC at `max`. Reserved with an empty entry.
+fn reserve_index(inst: &Instance) -> Result<u32, Errno> {
     let mut m = PTYS.lock();
     let mut i = 0u32;
-    for &k in m.keys() {
+    for (&(_, k), _) in m.range((inst.id, 0)..=(inst.id, u32::MAX)) {
         if k != i {
             break;
         }
         i += 1;
     }
-    m.insert(i, Weak::new());
-    i
+    if inst.max.is_some_and(|max| u64::from(i) >= max) {
+        return Err(ENOSPC);
+    }
+    m.insert((inst.id, i), Weak::new());
+    Ok(i)
+}
+
+/// A devpts instance as the pty layer sees it (Linux's `pts_fs_info`): its numbers' key in `PTYS`, where its
+/// slave nodes are made and how they look. Id 0 is the boot instance (`BOOT`), whose nodes go by path.
+pub struct Instance {
+    id: u64,
+    sb: Weak<vfs::SuperBlock>,
+    root: Weak<vfs::Dentry>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: u32,
+    max: Option<u64>,
+}
+
+/// The boot instance: `/dev/pts` of the boot view, nodes owned by the opener, group tty, `SLAVE_PERM`.
+static BOOT: Instance = Instance { id: 0, sb: Weak::new(), root: Weak::new(), uid: None, gid: Some(TTY_GID), mode: SLAVE_PERM, max: None };
+/// The mounted instances by super block. An entry goes when its super block is gone (pruned at the next mount
+/// or lookup); pairs keep their instance as long as they live.
+static INSTANCES: SpinLock<Vec<Arc<Instance>>> = SpinLock::named("console.pts_instances", Vec::new());
+static NEXT_INSTANCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// The instance of devpts super block `sb`: a mounted one's, or the boot one when `sb` is the boot view's
+/// `/dev/pts`. ENODEV for any other (a devpts the pty layer did not make, e.g. without a `ptmx`).
+fn instance_of(sb: &Arc<vfs::SuperBlock>) -> Result<Option<Arc<Instance>>, Errno> {
+    let found = {
+        let mut l = INSTANCES.lock();
+        l.retain(|i| i.sb.strong_count() > 0);
+        l.iter().find(|i| core::ptr::eq(i.sb.as_ptr(), Arc::as_ptr(sb))).cloned()
+    };
+    if found.is_some() {
+        return Ok(found);
+    }
+    match vfs::root_ns().lookup_path(b"/dev/pts", true) {
+        Ok(p) if Arc::ptr_eq(&p.mnt.sb, sb) => Ok(None),
+        _ => Err(ENODEV),
+    }
+}
+
+/// The `ptmx` node's object of a new devpts instance (`mknod_ptmx`): it is registered by its super block, and
+/// a ptmx opened at a place that belongs to it makes its ptys there.
+pub fn instance_ptmx(s: vfs::mount_fs::PtsSuper) -> Arc<dyn File> {
+    let id = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+    let inst = Arc::new(Instance { id, sb: s.sb, root: s.root, uid: s.uid, gid: s.gid, mode: s.mode & 0o777, max: s.max });
+    {
+        let mut l = INSTANCES.lock();
+        l.retain(|i| i.sb.strong_count() > 0);
+        l.push(inst);
+    }
+    klog::event!(Debug, "console", "pty.instance", id = id, mode = s.mode, ptmxmode = s.ptmxmode, max = s.max.unwrap_or(0));
+    Arc::new(PtmxDev { perm: s.ptmxmode & 0o777 })
 }
 
 /// Every live pair (taken out of the map's lock, so dropping them never runs under it).
@@ -95,6 +156,12 @@ pub(crate) fn live_pairs() -> Vec<Arc<Pair>> {
 /// How many pairs exist (tests, the monitor).
 pub fn count() -> usize {
     live_pairs().len()
+}
+
+/// The numbers instance `id` holds in `PTYS` (reserved or live): the host tests check that none stays behind.
+#[cfg(test)]
+pub(crate) fn numbers_in(id: u64) -> usize {
+    PTYS.lock().range((id, 0)..=(id, u32::MAX)).count()
 }
 
 /// Session `sid` holds a terminal other than `except` as its controlling terminal (Linux's
@@ -208,13 +275,15 @@ pub struct Pair {
     again: AtomicBool,
     /// The `/dev/pts/N` node's object (removed when the master closes).
     node: SpinLock<Option<Arc<dyn File>>>,
+    /// The devpts instance the pty belongs to (None: the boot instance).
+    inst: Option<Arc<Instance>>,
     /// The master file's address (`peer_path` recognises it).
     pub(crate) master_addr: AtomicUsize,
 }
 
 impl Pair {
-    fn new() -> Arc<Pair> {
-        let index = reserve_index();
+    fn new(inst: Option<Arc<Instance>>) -> Result<Arc<Pair>, Errno> {
+        let index = reserve_index(inst.as_deref().unwrap_or(&BOOT))?;
         let out = Arc::new(ToMaster { buf: SpinLock::named("pty.to_master", VecDeque::with_capacity(TO_MASTER_CAP)), rq: PollQueue::new(), room: PollQueue::new(), reserved: AtomicUsize::new(0), dev: new_encode_dev(PTS_MAJOR, index) });
         let pair = Arc::new(Pair {
             index,
@@ -226,10 +295,30 @@ impl Pair {
             feeding: AtomicBool::new(false),
             again: AtomicBool::new(false),
             node: SpinLock::named("pty.node", None),
+            inst,
             master_addr: AtomicUsize::new(0),
         });
-        PTYS.lock().insert(index, Arc::downgrade(&pair));
-        pair
+        PTYS.lock().insert((pair.inst().id, index), Arc::downgrade(&pair));
+        Ok(pair)
+    }
+
+    fn inst(&self) -> &Instance {
+        self.inst.as_deref().unwrap_or(&BOOT)
+    }
+
+    /// The slave node's permissions in its instance (`mode=`).
+    pub(crate) fn slave_perm(&self) -> u32 {
+        self.inst().mode
+    }
+
+    /// Whether `f` is this pair's master file.
+    pub fn is_master(&self, f: &dyn File) -> bool {
+        self.master_addr() == f as *const dyn File as *const u8 as usize
+    }
+
+    /// The devpts instance's id (0: the boot instance); tests and events.
+    pub fn instance_id(&self) -> u64 {
+        self.inst().id
     }
 
     pub fn index(&self) -> u32 {
@@ -352,7 +441,10 @@ impl Pair {
         // session leader finds no node any more.
         let node = self.node.lock().take();
         if let Some(node) = node {
-            remove_node(&self.path(), &node);
+            match &self.inst {
+                None => remove_node(&self.path(), &node),
+                Some(inst) => remove_node_in(inst, self.index, &node),
+            }
         }
         self.hangup_slave("master closed");
         klog::event!(Debug, "console", "pty.master_closed", index = self.index);
@@ -378,7 +470,7 @@ impl Pair {
 
 impl Drop for Pair {
     fn drop(&mut self) {
-        PTYS.lock().remove(&self.index);
+        PTYS.lock().remove(&(self.inst().id, self.index));
     }
 }
 
@@ -395,6 +487,40 @@ fn remove_node(path: &str, node: &Arc<dyn File>) {
     }
     if let Err(e) = ns.remove(path) {
         klog::event!(Warn, "console", "pty.node_remove_failed", path = path, errno = e);
+    }
+}
+
+/// `devpts_pty_new` in a mounted instance: the node `N` in its root, owner and mode from its options (else the
+/// opener's fs ids), made under the instance's name lock. ENODEV once the instance is unmounted and gone.
+fn make_node_in(inst: &Instance, index: u32, node: Arc<dyn File>, who: vfs::inode::Cred) -> Result<(), Errno> {
+    let root = inst.root.upgrade().ok_or(ENODEV)?;
+    let name = format!("{index}");
+    let cred = vfs::inode::Cred { uid: inst.uid.unwrap_or(who.uid), gid: inst.gid.unwrap_or(who.gid) };
+    let _g = root.sb.lock_names();
+    if root.child(name.as_bytes()).is_some() {
+        return Err(EEXIST);
+    }
+    root.create_child(name.as_bytes(), uapi::S_IFCHR | inst.mode, cred, vfs::inode::Data::Device(node)).map(|_| ())
+}
+
+/// `devpts_pty_kill` in a mounted instance: the node goes if it is still the pair's (an unmounted instance's tree
+/// may be gone already: nothing to do then).
+fn remove_node_in(inst: &Instance, index: u32, node: &Arc<dyn File>) {
+    let Some(root) = inst.root.upgrade() else {
+        klog::event!(Debug, "console", "pty.node_gone", instance = inst.id, index = index; "the devpts instance is unmounted: no node to remove");
+        return;
+    };
+    let name = format!("{index}");
+    let _g = root.sb.lock_names();
+    let ours = root.child(name.as_bytes()).is_some_and(|d| matches!(&d.inode.data, vfs::inode::Data::Device(f) if Arc::ptr_eq(f, node)));
+    if !ours {
+        klog::event!(Debug, "console", "pty.node_gone", instance = inst.id, index = index; "the slave node was removed or replaced already");
+        return;
+    }
+    if let Some(v) = root.detach(name.as_bytes()) {
+        v.inode.drop_link();
+        v.inode.meta.touch_ctime();
+        root.inode.meta.touch_mtime();
     }
 }
 
@@ -424,20 +550,29 @@ pub struct PtmxDev {
 }
 
 impl PtmxDev {
-    /// `ptmx_open`: a new pair, its slave node `/dev/pts/N` owned by the opener and group tty, locked.
+    /// `ptmx_open` in the boot instance: a new pair, its slave node `/dev/pts/N` owned by the opener and group
+    /// tty, locked.
     pub fn open_master(who: vfs::inode::Cred) -> Result<Arc<crate::ptm::MasterFile>, Errno> {
-        let pair = Pair::new();
+        Self::open_in(None, who)
+    }
+
+    /// `ptmx_open` in devpts instance `inst` (None: the boot instance).
+    pub fn open_in(inst: Option<Arc<Instance>>, who: vfs::inode::Cred) -> Result<Arc<crate::ptm::MasterFile>, Errno> {
+        let pair = Pair::new(inst).inspect_err(|&e| {
+            klog::event!(Info, "console", "pty.no_index", errno = e; "the devpts instance has no free number (max=): the open of ptmx fails");
+        })?;
         let node: Arc<dyn File> = Arc::new(crate::pts::PtsNode::new(&pair));
         let path = pair.path();
-        match vfs::root_ns().create_device(&path, node.clone()) {
-            Ok(d) => d.inode.meta.set_owner(who.uid, TTY_GID),
-            Err(e) => {
-                klog::event!(Warn, "console", "pty.node_failed", path = path.as_str(), errno = e; "no slave node: the open of /dev/ptmx fails");
-                return Err(e);
-            }
+        let made = match &pair.inst {
+            None => vfs::root_ns().create_device(&path, node.clone()).map(|d| d.inode.meta.set_owner(who.uid, TTY_GID)),
+            Some(inst) => make_node_in(inst, pair.index, node.clone(), who),
+        };
+        if let Err(e) = made {
+            klog::event!(Warn, "console", "pty.node_failed", instance = pair.instance_id(), path = path.as_str(), errno = e; "no slave node: the open of ptmx fails");
+            return Err(e);
         }
         *pair.node.lock() = Some(node);
-        klog::event!(Debug, "console", "pty.open", index = pair.index, uid = who.uid);
+        klog::event!(Debug, "console", "pty.open", instance = pair.instance_id(), index = pair.index, uid = who.uid);
         let m = Arc::new(crate::ptm::MasterFile::new(pair));
         m.pair().master_addr.store(Arc::as_ptr(&m) as *const u8 as usize, Ordering::Release);
         Ok(m)
@@ -457,8 +592,20 @@ impl File for PtmxDev {
     fn rdev(&self) -> u64 {
         vfs::abi::encode_dev(PTMX_DEV.0, PTMX_DEV.1)
     }
+    /// Opened without a place (kernel users): the boot instance.
     fn open_node(&self, _flags: u64, who: vfs::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
         Some(PtmxDev::open_master(who).map(|m| m as Arc<dyn File>))
+    }
+    /// `ptmx_open` → `devpts_acquire`: the pty is made in the devpts instance the opened place belongs to.
+    fn open_node_at(&self, at: &vfs::Path, _flags: u64, who: vfs::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
+        let inst = match vfs::mount_fs::devpts_for_ptmx(at).and_then(|sb| instance_of(&sb)) {
+            Ok(i) => i,
+            Err(e) => {
+                klog::event!(Info, "console", "pty.no_instance", errno = e; "no devpts instance belongs to this ptmx (none mounted on pts next to it): the open fails as on Linux");
+                return Some(Err(e));
+            }
+        };
+        Some(PtmxDev::open_in(inst, who).map(|m| m as Arc<dyn File>))
     }
 }
 
@@ -477,8 +624,56 @@ pub(crate) fn hung_mask() -> u32 {
 /// TIOCGPTPEER's path for the syscall layer (change request IN-7 CR2): the slave node's name if `f` is an open
 /// pty master (`ptm_open_peer` opens it with the caller's flags); None for any other file.
 pub fn peer_path(f: &dyn File) -> Option<String> {
-    let addr = f as *const dyn File as *const u8 as usize;
-    live_pairs().into_iter().find(|p| p.master_addr() == addr).map(|p| p.path())
+    master_pair(f).map(|p| p.path())
+}
+
+fn master_pair(f: &dyn File) -> Option<Arc<Pair>> {
+    live_pairs().into_iter().find(|p| p.is_master(f))
+}
+
+/// `devpts_mntget` (linux-7.3.1/fs/devpts/inode.c:150): the mount of instance `inst` a master opened at `at`
+/// reaches: up out of binds of a single file, then `at`'s own mount when it is the instance's, else the devpts
+/// on `pts` next to it. ENODEV when that is not `inst`.
+fn devpts_mntget(at: &vfs::Path, inst: &Instance) -> Result<Arc<vfs::Mount>, Errno> {
+    let mut p = at.clone();
+    while Arc::ptr_eq(&p.dentry, &p.mnt.root) {
+        match p.mnt.mountpoint() {
+            Some((mnt, dentry)) => p = vfs::Path { mnt, dentry },
+            None => break,
+        }
+    }
+    let ours = |m: &vfs::Mount| core::ptr::eq(inst.sb.as_ptr(), Arc::as_ptr(&m.sb));
+    if p.mnt.sb.fstype == "devpts" && ours(&p.mnt) {
+        return Ok(p.mnt);
+    }
+    match vfs::mount_fs::devpts_ptmx_path(&p) {
+        Ok(pts) if ours(&pts.mnt) => Ok(pts.mnt),
+        Ok(_) => Err(ENODEV),
+        Err(e) => Err(e),
+    }
+}
+
+/// TIOCGPTPEER (`ptm_open_peer`, linux-7.3.1/drivers/tty/pty.c:617): the slave of pty master `master`, opened with
+/// `flags` in the master's own devpts instance (a boot pty by its path in the boot view; a mounted instance's
+/// through the master's devpts mount, `devpts_mntget`). None: `master` is not a pty master. ENODEV: the master
+/// was not opened on its instance's devpts (`devpts_mntget` finds none); EIO: the slave is locked or gone.
+pub fn open_peer(master: &vfs::OpenFile, flags: u64) -> Option<Result<Arc<vfs::OpenFile>, Errno>> {
+    let pair = master_pair(&*master.file)?;
+    let Some(inst) = &pair.inst else {
+        return Some(vfs::root_ns().open_flags(pair.path().as_bytes(), flags, 0));
+    };
+    Some((|| {
+        let mnt = devpts_mntget(master.path.as_ref().ok_or(ENODEV)?, inst)?;
+        let root = inst.root.upgrade().ok_or(EIO)?;
+        let d = root.child(format!("{}", pair.index).as_bytes()).ok_or(EIO)?;
+        let ours = { pair.node.lock().clone() };
+        if !matches!((&d.inode.data, &ours), (vfs::inode::Data::Device(f), Some(n)) if Arc::ptr_eq(f, n)) {
+            return Err(EIO);
+        }
+        let at = vfs::Path { mnt, dentry: d };
+        let file = vfs::node::open_file_at(&at, vfs::inode::Cred::ROOT, flags, flags & 3 != 0)?;
+        Ok(vfs::OpenFile::with_path(file, flags, at))
+    })())
 }
 
 pub use crate::pts::open_ctty;

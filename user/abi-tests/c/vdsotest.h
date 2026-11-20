@@ -48,7 +48,10 @@ static void find(void) {
   check("AT_SYSINFO_EHDR", base != 0);
   check("vdso ELF header", base && !memcmp(base, ELFMAG, SELFMAG));
   static const char *names[] = { "__vdso_clock_gettime", "__vdso_gettimeofday", "__vdso_time", "__vdso_getcpu", "__vdso_clock_getres",
-                                 "clock_gettime", "gettimeofday", "time", "getcpu", "clock_getres" };
+                                 "clock_gettime", "gettimeofday", "time", "getcpu", "clock_getres",
+                                 /* Linux 7.3.1 (L7-SYNC) */
+                                 "__vdso_getrandom", "getrandom", "__vdso_futex_robust_list64_try_unlock",
+                                 "__vdso_futex_robust_list32_try_unlock" };
   char label[96];
   for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
     snprintf(label, sizeof label, "symbol %s@LINUX_2.6", names[i]);

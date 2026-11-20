@@ -1,4 +1,4 @@
-//! Synthetic IP discovery binaries for the host tests: the layout of linux-6.6 include/discovery.h, written by
+//! Synthetic IP discovery binaries for the host tests: the layout of linux-7.3.1 include/discovery.h, written by
 //! BitsOS's own builder (header, IP table with its dies, then GC, harvest, VCN, MALL), with every checksum right.
 //! Tests then break one thing at a time.
 
@@ -30,7 +30,7 @@ pub struct Blob {
     /// (instance, fuses) per VCN instance.
     pub vcn: Option<Vec<(u32, u32)>>,
     pub mall: Option<(u16, u16, Vec<u32>)>,
-    /// The buffer length (the reserved region is 8 KiB).
+    /// The buffer length (the reserved region is 10 KiB).
     pub len: usize,
 }
 

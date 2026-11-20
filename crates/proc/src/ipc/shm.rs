@@ -106,7 +106,7 @@ fn locked_add(c: &Caller<'_>, pages: u64) -> bool {
 
 /// `newseg`'s file part. Without a huge-page pool (CachyOS's `nr_hugepages = 0`) SHM_HUGETLB ends at the size check,
 /// `can_do_hugetlb_shm` (fs/hugetlbfs/inode.c:1477, EPERM) or the reservation (ENOMEM). With SHM_NORESERVE Linux would
-/// hand out a segment whose first touch is SIGBUS; V2 answers ENOMEM there too (plan/notes/sx-SX-IPC.md).
+/// hand out a segment whose first touch is SIGBUS; V2 answers ENOMEM there too (plan/spec/sandbox.md §7).
 fn new_file(c: &Caller<'_>, key: i32, size: u64, flg: i32) -> Result<Arc<OpenFile>, Errno> {
     if flg & SHM_HUGETLB != 0 {
         if !matches!((flg >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK, 0 | 21 | 30) {

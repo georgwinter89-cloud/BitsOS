@@ -109,7 +109,7 @@ fn refusals_write_nothing() {
     // Allowed below \BITSOS2\.
     let cfg = c.open(None, b"/boot/BITSOS2/CONFIG.TXT", O_WRONLY | O_APPEND, 0).unwrap();
     cfg.write(b"console_log=info\n").unwrap();
-    cfg.write(b"wlan=on\n").unwrap();
+    cfg.write(b"tz=UTC\n").unwrap();
     drop(cfg);
     c.truncate(None, b"/boot/BITSOS2/CONFIG.TXT", 0).unwrap();
     ns.create_file_bytes(b"/boot/BITSOS2/new.cfg", 0o644, b"stick_write=on\n").unwrap();

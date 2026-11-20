@@ -1,0 +1,9 @@
+[package]
+name = "steamlib"
+version = "0.1.0"
+edition = "2024"
+description = "GM-6s: Steam's installed games for the sofa mode and the program library (sofa-mode.md 3.3): a KeyValues text parser, libraryfolders.vdf and the appmanifests, nothing else of Steam's"
+publish = false
+
+[dependencies]
+libc = ">=0.2.190, <=0.2.191"

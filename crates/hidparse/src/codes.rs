@@ -15,6 +15,7 @@ pub const ABS_Z: u16 = 0x002;
 pub const EV_REL: u16 = 0x002;
 pub const KEY_1: u16 = 0x002;
 pub const LED_SCROLLL: u16 = 0x002;
+pub const REL_Z: u16 = 0x002;
 pub const ABS_RX: u16 = 0x003;
 pub const EV_ABS: u16 = 0x003;
 pub const KEY_2: u16 = 0x003;
@@ -68,6 +69,7 @@ pub const EV_PWR: u16 = 0x016;
 pub const KEY_U: u16 = 0x016;
 pub const KEY_I: u16 = 0x017;
 pub const KEY_O: u16 = 0x018;
+pub const ABS_DISTANCE: u16 = 0x019;
 pub const KEY_P: u16 = 0x019;
 pub const KEY_LEFTBRACE: u16 = 0x01a;
 pub const KEY_RIGHTBRACE: u16 = 0x01b;
@@ -271,6 +273,7 @@ pub const BTN_JOYSTICK: u16 = 0x120;
 pub const BTN_TRIGGER: u16 = 0x120;
 pub const BTN_THUMB: u16 = 0x121;
 pub const BTN_THUMB2: u16 = 0x122;
+pub const BTN_TOP2: u16 = 0x124;
 pub const BTN_BASE4: u16 = 0x129;
 pub const BTN_DEAD: u16 = 0x12f;
 pub const BTN_GAMEPAD: u16 = 0x130;
@@ -357,8 +360,13 @@ pub const KEY_DICTATE: u16 = 0x24a;
 pub const KEY_CAMERA_ACCESS_ENABLE: u16 = 0x24b;
 pub const KEY_CAMERA_ACCESS_DISABLE: u16 = 0x24c;
 pub const KEY_CAMERA_ACCESS_TOGGLE: u16 = 0x24d;
+pub const KEY_ACCESSIBILITY: u16 = 0x24e;
+pub const KEY_DO_NOT_DISTURB: u16 = 0x24f;
 pub const KEY_BRIGHTNESS_MIN: u16 = 0x250;
 pub const KEY_BRIGHTNESS_MAX: u16 = 0x251;
+pub const KEY_ACTION_ON_SELECTION: u16 = 0x254;
+pub const KEY_CONTEXTUAL_INSERT: u16 = 0x255;
+pub const KEY_CONTEXTUAL_QUERY: u16 = 0x256;
 pub const KEY_KBDINPUTASSIST_PREV: u16 = 0x260;
 pub const KEY_KBDINPUTASSIST_NEXT: u16 = 0x261;
 pub const KEY_KBDINPUTASSIST_PREVGROUP: u16 = 0x262;
@@ -388,6 +396,7 @@ pub const ALL: &[(&str, u16)] = &[
     ("EV_REL", EV_REL),
     ("KEY_1", KEY_1),
     ("LED_SCROLLL", LED_SCROLLL),
+    ("REL_Z", REL_Z),
     ("ABS_RX", ABS_RX),
     ("EV_ABS", EV_ABS),
     ("KEY_2", KEY_2),
@@ -441,6 +450,7 @@ pub const ALL: &[(&str, u16)] = &[
     ("KEY_U", KEY_U),
     ("KEY_I", KEY_I),
     ("KEY_O", KEY_O),
+    ("ABS_DISTANCE", ABS_DISTANCE),
     ("KEY_P", KEY_P),
     ("KEY_LEFTBRACE", KEY_LEFTBRACE),
     ("KEY_RIGHTBRACE", KEY_RIGHTBRACE),
@@ -644,6 +654,7 @@ pub const ALL: &[(&str, u16)] = &[
     ("BTN_TRIGGER", BTN_TRIGGER),
     ("BTN_THUMB", BTN_THUMB),
     ("BTN_THUMB2", BTN_THUMB2),
+    ("BTN_TOP2", BTN_TOP2),
     ("BTN_BASE4", BTN_BASE4),
     ("BTN_DEAD", BTN_DEAD),
     ("BTN_GAMEPAD", BTN_GAMEPAD),
@@ -730,8 +741,13 @@ pub const ALL: &[(&str, u16)] = &[
     ("KEY_CAMERA_ACCESS_ENABLE", KEY_CAMERA_ACCESS_ENABLE),
     ("KEY_CAMERA_ACCESS_DISABLE", KEY_CAMERA_ACCESS_DISABLE),
     ("KEY_CAMERA_ACCESS_TOGGLE", KEY_CAMERA_ACCESS_TOGGLE),
+    ("KEY_ACCESSIBILITY", KEY_ACCESSIBILITY),
+    ("KEY_DO_NOT_DISTURB", KEY_DO_NOT_DISTURB),
     ("KEY_BRIGHTNESS_MIN", KEY_BRIGHTNESS_MIN),
     ("KEY_BRIGHTNESS_MAX", KEY_BRIGHTNESS_MAX),
+    ("KEY_ACTION_ON_SELECTION", KEY_ACTION_ON_SELECTION),
+    ("KEY_CONTEXTUAL_INSERT", KEY_CONTEXTUAL_INSERT),
+    ("KEY_CONTEXTUAL_QUERY", KEY_CONTEXTUAL_QUERY),
     ("KEY_KBDINPUTASSIST_PREV", KEY_KBDINPUTASSIST_PREV),
     ("KEY_KBDINPUTASSIST_NEXT", KEY_KBDINPUTASSIST_NEXT),
     ("KEY_KBDINPUTASSIST_PREVGROUP", KEY_KBDINPUTASSIST_PREVGROUP),

@@ -758,7 +758,8 @@ impl BlockDevice for HostPool {
 }
 
 /// BITSVOL_POOL_IMG=<the window's bytes> BITSVOL_OUT=<file>: volume "data" of the pool, for the host's e2fsck
-/// (host/tests/nv/41-window-reload.sh, 42-window-setup.sh).
+/// (host/tests/nv/41-window-reload.sh, 42-window-setup.sh). Decision: ignored in the host tests because it is
+/// those scenarios' tool on the pool image their boot wrote; it runs there.
 #[test]
 #[ignore]
 fn extract_volume() {

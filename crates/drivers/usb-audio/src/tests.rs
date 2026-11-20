@@ -127,7 +127,8 @@ fn sampling_frequency_set_cur_on_the_endpoint_and_verified() {
     let f = Fake::default();
     assert_eq!(req::set_rate(&f, &s), Ok(RateResult::Set(48000)));
     let log = f.log.lock().unwrap();
-    // linux-6.6/sound/usb/clock.c:414: USB_TYPE_CLASS | USB_RECIP_ENDPOINT | USB_DIR_OUT, UAC_EP_CS_ATTR_SAMPLE_RATE << 8, ep.
+    // linux-7.3.1/sound/usb/clock.c:485: USB_TYPE_CLASS | USB_RECIP_ENDPOINT | USB_DIR_OUT,
+    // UAC_EP_CS_ATTR_SAMPLE_RATE << 8, ep.
     assert_eq!(log[0].0, Setup { request_type: 0x22, request: 1, value: 0x0100, index: 0x02, length: 3 });
     assert_eq!(log[0].1, vec![0x80, 0xBB, 0x00]);
     assert_eq!(log[1].0, Setup { request_type: 0xA2, request: 0x81, value: 0x0100, index: 0x02, length: 3 });

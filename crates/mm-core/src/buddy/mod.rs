@@ -24,12 +24,14 @@ mod highatomic;
 mod limit;
 mod order;
 mod reclaim;
+pub use reclaim::HeapRound;
 pub use census::{BlockCensus, BlockHolder, FEW, HOLDERS};
 pub use exact::exact_order;
-pub(crate) use group::{count_steal, count_whole_block, pageblocks, side_words, PB};
+pub(crate) use group::{count_steal, count_sweep, count_whole_block, pageblocks, side_words, PB};
 pub use group::{MigrateType, MIGRATE_TYPES, PAGEBLOCK_FRAMES, PAGEBLOCK_ORDER, PCP_TYPES};
-pub use highatomic::reserve_pageblocks;
-pub use compact::{extfrag_for_order, fragmentation_index, CompactStats, Control, How, Status};
+pub(crate) use highatomic::flush_takers;
+pub use highatomic::{reserve_pageblocks, Refill, ReserveStats};
+pub use compact::{extfrag_for_order, fragmentation_index, CompactStats, Control, How, Status, FREE_SCAN};
 #[cfg(test)]
 pub(crate) use exact::pieces;
 pub use handle::{boot_buddy, BuddyFrames};
@@ -107,6 +109,10 @@ struct ZoneState {
     /// Free frames of the HighAtomic pageblocks (Linux `nr_free_highatomic`): part of `free_frames`, usable only
     /// by the allocations `highatomic` lets in.
     free_highatomic: u64,
+    /// Free blocks put back so far (`free_block`), and per asking type the claim sweep that found nothing
+    /// (`group::NoClaim`: when it is run again).
+    freed: u64,
+    no_claim: [group::NoClaim; MIGRATE_TYPES],
 }
 
 /// Per-zone numbers (`hw_info memory`, fragmentation view, tests).
@@ -187,6 +193,8 @@ pub struct Buddy {
     /// W35 MM-3: per-zone compaction state (cached scanner positions, deferral).
     compact: [compact::ZoneCompact; ZONES],
     compact_counts: compact::CompactCounters,
+    /// The HighAtomic reserve's size and takers (`highatomic`).
+    ha: highatomic::Reserve,
 }
 
 impl Buddy {
@@ -195,7 +203,7 @@ impl Buddy {
     }
 
     fn assemble(name: &'static str, blob: Blob, regions: Vec<Region>, carve: (u64, u64), global: bool) -> Self {
-        let zs = ZoneState { free_frames: 0, free_blocks: [0; ORDERS], by_type: [[0; ORDERS]; MIGRATE_TYPES], pageblocks: [0; MIGRATE_TYPES], free_highatomic: 0 };
+        let zs = ZoneState { free_frames: 0, free_blocks: [0; ORDERS], by_type: [[0; ORDERS]; MIGRATE_TYPES], pageblocks: [0; MIGRATE_TYPES], free_highatomic: 0, freed: 0, no_claim: [group::NoClaim::NONE; MIGRATE_TYPES] };
         let me = Buddy {
             name,
             blob,
@@ -221,6 +229,7 @@ impl Buddy {
             migrator: ksync::OnceRef::new(),
             compact: [const { compact::ZoneCompact::new() }; ZONES],
             compact_counts: compact::CompactCounters::new(),
+            ha: highatomic::Reserve::new(),
         };
         // Create the per-CPU lists now, while the heap may be used: later the allocator runs under the
         // heap's lock, and a lazy init there would re-enter the heap.
@@ -398,6 +407,7 @@ impl Buddy {
             pfn = pfn.min(buddy);
             order += 1;
         }
+        zs.freed += 1;
         self.insert_free(r, zs, pfn, order);
     }
 
@@ -743,9 +753,11 @@ impl Buddy {
                 if z != zone_index(zone) {
                     self.reports().fallback();
                 }
+                crate::boost::wake_if_boosted();
                 return Some(pfn * PAGE);
             }
         }
+        crate::boost::wake_if_boosted();
         None
     }
 }
@@ -763,7 +775,7 @@ impl FrameAlloc for Buddy {
         // MM-9: only after both attempts and the drain failed (the fast path is unchanged). PF-5: one wait budget
         // for the reclaim rounds and the last step (at most one bounded wait runs out per allocation, B4).
         let mut budget = crate::grace::WaitBudget::default();
-        if let Some(p) = self.alloc_reclaiming(order, zone, kind, &mut budget) {
+        if let Some(p) = self.alloc_reclaiming(order, zone, kind, &mut budget, false) {
             return Some(p);
         }
         if let Some(p) = self.alloc_after_grace(order, zone, kind, &mut budget) {
@@ -772,9 +784,14 @@ impl FrameAlloc for Buddy {
         if let Some(p) = self.alloc_highatomic(order, zone, kind) {
             return Some(p);
         }
+        if self.global_reports && matches!(kind, Kind::User | Kind::PageTable) && crate::oom::may_nofail(order) && !crate::oom::current_dying() {
+            if let Some(p) = self.alloc_nofail(order, zone, kind) {
+                return Some(p);
+            }
+        }
         // A heap try that left the reserve alone is not a failure yet: the heap reclaims and comes again, its last
         // try may take the reserve (`reclaim::keep_reserve`); that one is counted if it fails.
-        if !(kind == Kind::Heap && crate::reclaim::keeps_reserve()) {
+        if highatomic::final_try(kind) {
             self.reports().alloc_fail(order, zone_index(zone));
         }
         None

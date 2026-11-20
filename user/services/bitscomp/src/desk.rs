@@ -9,8 +9,8 @@ use crate::win::Window;
 use crate::layout::Workspace;
 use crate::state::App;
 
-/// Claude's ring (plan/spec/desktop.md §3). Until CL-3 drives it, only the control command `ring` sets it
-/// (`App::set_ring`); otherwise it stays `Idle`.
+/// Claude's ring (plan/spec/desktop.md §3). CL-3b: the conversation with the assistant drives it (`assist_app`);
+/// without an assistant in the session only the control command `ring` sets it (`App::set_ring`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ring {
     Idle,
@@ -44,8 +44,13 @@ pub enum Spot {
     Start(crate::start::Part),
     /// A settings page (the pid of its window's program) and the part of it (WY-5b).
     Page(u32, crate::page::Part),
+    /// CL-3b: a part of the conversation with the assistant (the sidebar, the Bühne's panel).
+    Assist(crate::assist_layout::Part),
     /// DS-3: a part of the Bühne preset WY's chrome has no name for (sun, bell, Feld bar, strip, "+N").
     Buehne(crate::chrome_render::buehne::Part),
+    /// A (12.11.): the question before a workspace with windows closes: Some(true) its "Schließen", Some(false)
+    /// "Abbrechen", None the rest of the screen (the question is modal: nothing happens there).
+    WsAsk(Option<bool>),
 }
 
 pub struct Desk {
@@ -66,10 +71,21 @@ pub struct Desk {
     pub hover: Option<Spot>,
     /// A press on a spot: it acts when released over the same spot.
     pub press: Option<Spot>,
+    /// CL-3b: who pressed (the release alone does not say whose click it is).
+    pub press_origin: crate::input::Origin,
     /// Shown below the address bar until the deadline (`pacer` time).
     pub notice: Option<(String, Duration)>,
     /// "Startseite" was asked for while the workspace has windows.
     pub start_forced: bool,
+    /// B (12.11.): "Startseite" pressed where the start page is shown already: the Bühne's hint line says so on
+    /// that workspace until the deadline (`pacer` time).
+    pub home_note: Option<(usize, Duration)>,
+    /// A (12.11.): the open question "Arbeitsraum N schließen?".
+    pub ws_ask: Option<crate::ws_close::Ask>,
+    /// C (12.11.): the list of minimised windows behind the bottom row's "+N".
+    pub min_list: crate::min_row::MinList,
+    /// DESK-LEFT: minimised windows closed by their x, until they are gone or their answer shows them.
+    pub min_closing: Vec<crate::min_close::Closing>,
     /// The address bar being edited.
     pub edit: Option<crate::address::Edit>,
     /// The key held down while editing, repeated by bitscomp itself.
@@ -99,8 +115,13 @@ impl Default for Desk {
             claude_name: "Claude".into(),
             hover: None,
             press: None,
+            press_origin: crate::input::Origin::Injected,
             notice: None,
             start_forced: false,
+            home_note: None,
+            ws_ask: None,
+            min_list: Default::default(),
+            min_closing: Vec::new(),
             edit: None,
             held: None,
         }
@@ -168,9 +189,35 @@ impl App {
         true
     }
 
-    /// Removes workspace `i` when it is empty and not the only one.
+    /// REWIND: Win+Tab: the workspace `dir` steps on from the shown one, wrapping around. Not in the sofa mode
+    /// (its screens and its own workspace are its world; Win+Esc leaves it); the library, the Feld and the rewind
+    /// view close first,
+    /// so nothing is switched to unseen under them.
+    pub fn ws_cycle(&mut self, dir: i32) {
+        if self.sofa.active {
+            eprintln!("bitscomp: Win+Tab: not in the sofa mode");
+            return;
+        }
+        self.library_close("Win+Tab");
+        self.feld_close("Win+Tab");
+        self.rewind_close("Win+Tab");
+        let n = self.ws_count() as i64;
+        if n < 2 {
+            return;
+        }
+        let i = (self.desk.active as i64 + i64::from(dir)).rem_euclid(n) as usize;
+        if self.ws_switch(i) {
+            eprintln!("bitscomp: Win+Tab: workspace {} of {n}", i + 1);
+            self.fx_play(crate::fx::plan::WIPE);
+        }
+    }
+
+    /// Removes workspace `i` when it is empty and not the only one (GM-6a: `Sofa` not while the sofa mode is on).
     pub fn ws_remove(&mut self, i: usize) -> bool {
         if self.ws_count() < 2 || i >= self.ws_count() || self.ws_counts(i) != (0, 0) {
+            return false;
+        }
+        if self.sofa.active && self.desk.names[i] == crate::sofa::WORKSPACE {
             return false;
         }
         if i == self.desk.active {
@@ -202,7 +249,7 @@ impl App {
         }
     }
 
-    /// Claude's state on the ring: the control command `ring` today, CL-3 later.
+    /// Claude's state on the ring: the assistant's conversation (CL-3b), the control command `ring` in tests.
     pub fn set_ring(&mut self, r: Ring) {
         if self.desk.ring != r {
             self.desk.ring = r;
@@ -211,7 +258,12 @@ impl App {
     }
 
     pub fn notice(&mut self, text: impl Into<String>) {
-        let until = crate::pacer::now() + NOTICE_FOR;
+        self.notice_for(text, NOTICE_FOR);
+    }
+
+    /// A notice that stays `dur` (CRASHDISK: the crash note; SELFOPT-1: the morning line).
+    pub fn notice_for(&mut self, text: impl Into<String>, dur: Duration) {
+        let until = crate::pacer::now() + dur;
         self.desk.notice = Some((text.into(), until));
         self.needs_frame = true;
     }
@@ -222,7 +274,12 @@ impl App {
             self.desk.notice = None;
             self.needs_frame = true;
         }
-        self.desk.notice.as_ref().map(|(_, t)| *t)
+        if self.desk.home_note.is_some_and(|(_, t)| now >= t) {
+            self.desk.home_note = None;
+            self.chrome_dirty();
+        }
+        let next = [self.desk.notice.as_ref().map(|(_, t)| *t), self.desk.home_note.map(|(_, t)| t)];
+        next.into_iter().flatten().min()
     }
 
     /// WY-5c: docks (`open`) or folds the bar of `key` at once (a local value, as `ctl set` sets one) and keeps it
@@ -270,6 +327,9 @@ impl App {
         if let Some(i) = self.desk.fold_sent.iter().position(|(k, _, _)| k == key) {
             self.desk.fold_sent.remove(i);
         }
+        if key.starts_with("sofa.") {
+            return eprintln!("bitscomp: sofa: settingsd refused the sofa keys: their defaults (and `ctl set`) apply");
+        }
         // PK-L1b: a pin from the library that settingsd refused stays on this screen only.
         if key == crate::page::FAVOURITES {
             eprintln!("bitscomp: library: settingsd refused the favourites: they stay local until a restart");
@@ -286,9 +346,13 @@ impl App {
         // WY-8: no bar comes over a fullscreen window (it is the client's whole screen).
         let busy = self.grab.is_some() || self.menu.is_some() || self.desk.press.is_some() || self.ws.fullscreen_shown().is_some();
         let at = if busy || self.float_at(x, y) { None } else { ch.edge_at(x, y) };
-        let inside = ch.overlay().is_some_and(|r| r.contains(x, y));
+        // The open "+N" list lies beside the revealed list (and the gap between them belongs to it).
+        let left = ch.overlay().filter(|o| *o == ch.list);
+        let list = left.zip(self.min_list_area()).map(|(o, a)| crate::layout::Rect { x: o.x + o.w, w: a.x + a.w - (o.x + o.w), ..a });
+        let inside = ch.overlay().is_some_and(|r| r.contains(x, y)) || list.is_some_and(|r| r.contains(x, y));
         if self.desk.reveal.motion(now, at, inside) {
             eprintln!("bitscomp: revealed bar folds again (pointer left it)");
+            self.desk.min_list.open = false;
             self.chrome_dirty();
             self.layout_dirty = true;
         }
@@ -323,3 +387,7 @@ mod tests {
         assert_eq!(name(2), "Arbeitsraum 2");
     }
 }
+
+#[cfg(test)]
+#[path = "ws_cycle_tests.rs"]
+mod cycle_tests;

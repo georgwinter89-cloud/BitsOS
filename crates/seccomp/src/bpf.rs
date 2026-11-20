@@ -1,7 +1,7 @@
 //! Classic BPF for seccomp: the verifier and the interpreter.
 //!
-//! The verifier applies Linux's two passes in one walk (linux-6.6/net/core/filter.c `bpf_check_classic` and
-//! `check_load_and_stores`, kernel/seccomp.c `seccomp_check_filter`): only the opcodes seccomp allows, jumps
+//! The verifier applies Linux's two passes in one walk (linux-7.3.1/net/core/filter.c:1079 `bpf_check_classic` and
+//! `check_load_and_stores` :935, kernel/seccomp.c:278 `seccomp_check_filter`): only the opcodes seccomp allows, jumps
 //! forward and inside the program, no division by a constant zero, shifts by a constant below 32, scratch cells
 //! 0..16 and read only after a write on every path, 32-bit loads of `struct seccomp_data` (aligned, inside its
 //! 64 bytes), and a return at the end. Every refusal is EINVAL, as in Linux.
@@ -258,7 +258,7 @@ impl Program {
         &self.ops
     }
 
-    /// The length Linux's stack bound counts: the program as `bpf_convert_filter` (linux-6.6/net/core/filter.c)
+    /// The length Linux's stack bound counts: the program as `bpf_convert_filter` (linux-7.3.1/net/core/filter.c:584)
     /// rewrites it for its runtime. Three prologue instructions; RET K takes two; a division by X takes five
     /// (the zero check); a conditional jump takes one more when its constant is negative as a signed number,
     /// and two instead of one unless its false branch is the next instruction (or its true branch is, for

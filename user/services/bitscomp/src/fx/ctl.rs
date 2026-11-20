@@ -1,7 +1,6 @@
-//! `ctl fx`: what the effect level does, and the hooks the screendump tests and the desk's measuring round drive.
+//! `ctl fx`: what the effects do, and the hooks the desk's measuring round drives.
 //!
-//! fx                         one line: level, chosen level, renderer, clocks, what the renderer did so far
-//! fx software on|off         draw the gpu level on a software rasteriser too (tests, measuring; default off)
+//! fx                         one line: renderer, clocks, what the renderer did so far
 //! fx freeze SECONDS|off      the ambient clocks stand at this time, no frame is asked for them
 //! fx wait MS|off             cuts the renderer's wait for a frame's GPU work (a test's late frames; never longer)
 //! fx play wipe|fade|glitch|carousel [K]   a transition; with K (0..1) it stands at that progress
@@ -19,7 +18,7 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use super::trans::{Image, Play, Title};
-use super::{Demo, GPU_WAIT_CUT_MS, plan};
+use super::{Demo, GPU_WAIT_CUT_MS};
 use crate::canvas::Canvas;
 use crate::layout::Rect;
 use crate::render::Composer;
@@ -34,7 +33,6 @@ const FREEZE_MOST: f64 = 1e6;
 #[derive(Debug, PartialEq)]
 enum Cmd {
     Report,
-    Software(bool),
     Freeze(Option<f64>),
     Wait(Option<u64>),
     Play { what: Play, hold: Option<f32>, keep: bool },
@@ -61,11 +59,6 @@ fn rect(words: &[&str], (sw, sh): (i32, i32)) -> Option<[i32; 4]> {
 fn parse(words: &[&str], screen: (i32, i32)) -> Result<Cmd, String> {
     match words.get(1).copied() {
         None => Ok(Cmd::Report),
-        Some("software") => match words.get(2).copied() {
-            Some("on") => Ok(Cmd::Software(true)),
-            Some("off") => Ok(Cmd::Software(false)),
-            _ => Err("fx software on|off".into()),
-        },
         Some("freeze") => match words.get(2).copied() {
             Some("off") => Ok(Cmd::Freeze(None)),
             Some(v) => {
@@ -143,7 +136,6 @@ pub fn execute(app: &mut App, comp: &dyn Composer, words: &[&str]) -> Result<Str
     let cmd = parse(words, screen)?;
     match cmd {
         Cmd::Report => return Ok(report(app, comp)),
-        Cmd::Software(on) => app.fx.on_software = on,
         Cmd::Freeze(t) => app.fx.frozen = t,
         Cmd::Wait(ms) => GPU_WAIT_CUT_MS.store(ms.unwrap_or(u64::MAX), Ordering::Relaxed),
         Cmd::Play { what, hold, keep } => return start(app, what, hold, keep),
@@ -172,9 +164,6 @@ pub fn execute(app: &mut App, comp: &dyn Composer, words: &[&str]) -> Result<Str
 }
 
 fn start(app: &mut App, what: Play, hold: Option<f32>, keep: bool) -> Result<String, String> {
-    if !app.theme.effects_gpu {
-        return Err("the gpu level is not drawn".into());
-    }
     if app.theme.motion == Motion::Off {
         return Err("theme.motion off plays no transitions".into());
     }
@@ -192,9 +181,6 @@ fn start(app: &mut App, what: Play, hold: Option<f32>, keep: bool) -> Result<Str
 }
 
 fn title(app: &mut App, text: &str, hold: Option<f32>, (sw, _): (i32, i32)) -> Result<(), String> {
-    if !app.theme.effects_gpu {
-        return Err("the gpu level is not drawn".into());
-    }
     let t = app.theme.clone();
     let font = t.bfont(Family::Display, 80.0, Weight::SemiBold).spaced(-0.01);
     let w = font.width(text) + 8;
@@ -220,11 +206,8 @@ fn report(app: &App, comp: &dyn Composer) -> String {
         None => "none".into(),
     };
     format!(
-        "fx level={} chosen={} renderer={} on_software={} motion={} moving={} elements={} transition={trans} frozen={} why={:?} {}",
-        if plan::drawn(t) { "gpu" } else { "cheap" },
-        t.effects.word(),
+        "fx renderer={} motion={} moving={} elements={} transition={trans} frozen={} {}",
         comp.renderer(),
-        u8::from(app.fx.on_software),
         match t.motion {
             Motion::Medium => "medium",
             Motion::Calm => "calm",
@@ -234,7 +217,6 @@ fn report(app: &App, comp: &dyn Composer) -> String {
         u8::from(app.fx.due().is_some() || app.needs_frame),
         app.fx.elements,
         app.fx.frozen.map_or("off".to_string(), |v| v.to_string()),
-        app.fx.why_cheap.as_deref().unwrap_or(""),
         comp.fx_report(),
     )
 }
@@ -253,7 +235,6 @@ mod tests {
     #[test]
     fn what_the_tests_and_the_measuring_round_send_is_understood() {
         assert_eq!(cmd("fx"), Ok(Cmd::Report));
-        assert_eq!(cmd("fx software on"), Ok(Cmd::Software(true)));
         assert_eq!(cmd("fx freeze 4.5"), Ok(Cmd::Freeze(Some(4.5))));
         assert_eq!(cmd("fx freeze 0"), Ok(Cmd::Freeze(Some(0.0))));
         assert_eq!(cmd("fx freeze off"), Ok(Cmd::Freeze(None)));
@@ -278,8 +259,7 @@ mod tests {
     fn no_word_from_the_socket_gets_past_the_parser_unchecked() {
         for line in [
             "fx nonsense",
-            "fx software",
-            "fx software maybe",
+            "fx software on",
             "fx freeze",
             "fx freeze NaN",
             "fx freeze inf",

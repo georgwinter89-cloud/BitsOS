@@ -3,7 +3,7 @@
 # NV-1: RB's Reload scenario (host/tests/rb/reload_scenario.py: ten reloads in a row over MCP, 16 CPUs, igb,
 # qemu-xhci) with an active NVMe controller: NVQ0 with the fake Windows GPT image (ns1) and a 4 KiB pattern
 # image (ns2). Each kernel brings the controller up and registers its disks; each Reload quiesces it first
-# (shutdown, CC.EN=0, RDY=0, bus master off). CONFIG nvme_busy=on keeps a reader on ns1 going without pause in
+# (shutdown, CC.EN=0, RDY=0, bus master off). CONFIG ktest_nvme_busy=on keeps a reader on ns1 going without pause in
 # every kernel, so each Reload quiesces the controller with a read in flight. Afterwards: every boot logged `nvme ctrl.ready`, no
 # `nvme ctrl.failed`, and both images are byte for byte what they were.
 # Ports: NV's range (BITSOS_PORT_LO, default 19000).
@@ -35,9 +35,9 @@ K4=$(sum "$RUN_DIR/k4.img")
 
 # C1 (INT-W27b): squeezed like rb/20-reload.sh, so the test bundle's initramfs still fits in one piece (192 refuses
 # the reload as 256 did in W27b).
-export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-384}
+export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-512}
 export RB18_PSK="rb18-fake-psk-not-real" # reload_scenario.py expects both made-up secrets (RB-18)
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;wlan_psk=$RB18_PSK;mcp_port=8765;loglevel=info;rb_squeeze_mb=$RB_SQUEEZE_MB;rb_choke_mb=10;nvme_busy=on"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;wlan_psk=$RB18_PSK;mcp_port=8765;loglevel=info;rb_squeeze_mb=$RB_SQUEEZE_MB;rb_choke_mb=10;ktest_nvme_busy=on"
 BUNDLES="$RUN_DIR/bundles"
 rm -rf "$BUNDLES"
 mkdir -p "$BUNDLES/base"

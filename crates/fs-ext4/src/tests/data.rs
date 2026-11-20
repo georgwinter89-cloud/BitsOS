@@ -52,7 +52,9 @@ fn volume_bytes(dev: Arc<dyn BlockDevice>) -> Vec<u8> {
     out
 }
 
-/// BITSVOL_POOL_IMG=<pool image> BITSVOL_OUT=<file>: writes volume "data" of the pool to the file.
+/// BITSVOL_POOL_IMG=<pool image> BITSVOL_OUT=<file>: writes volume "data" of the pool to the file. Decision:
+/// ignored in the host tests because it is the tool of host/tests/fs/50-data.sh, fs/51-data-reload.sh and
+/// pc/85-gp-start.sh on the pool image their boot wrote; it runs there.
 #[test]
 #[ignore]
 fn extract_volume() {
@@ -82,7 +84,7 @@ fn open_data(file: &Arc<vfs::inode::Inode>) -> Arc<dyn crate::Dev> {
     Arc::new(BlockDev::new(Arc::new(h.open_volume(id).unwrap())))
 }
 
-/// What Brave does in its profile (plan/notes/br-BR-1.md): locks, a symlink lock, rename over, fsync.
+/// What Brave does in its profile (plan/spec/programs.md §1.1): locks, a symlink lock, rename over, fsync.
 fn profile_work(ns: &vfs::MountNs) {
     let c = Ctx::kernel(ns);
     c.mkdir(None, b"/data/appdata/brave", 0o700).unwrap();
@@ -113,6 +115,8 @@ fn pool_image_on_another_file_system_through_the_vfs() {
         let st = Ctx::kernel(&ns).stat(None, b"/data/home/1000", true).unwrap();
         assert_eq!((st.uid, st.gid, st.mode & 0o7777), (data::UID, data::UID, 0o700));
         assert_eq!(Ctx::kernel(&ns).stat(None, b"/data/appdata", true).unwrap().uid, data::UID);
+        let l = Ctx::kernel(&ns).stat(None, b"/data/leistung", true).unwrap();
+        assert_eq!((l.uid, l.mode & 0o7777), (data::UID, 0o755), "the benchmark's folder is the desktop user's");
         profile_work(&ns);
         let sf = vfs::statfs::of(&ns.lookup("/data").unwrap().sb, false).unwrap();
         assert_eq!(sf.ftype, 0xEF53);
@@ -200,7 +204,13 @@ fn a_timeout_below_the_disk_cache_leaves_the_volume_writable() {
     let (code, out) = fsck(&s, &r.snapshot());
     assert!(code == 0, "after a timeout and the next round: {out}");
     r.inject(fault(DevError::Io));
-    put(&v, g, 100, &[9u8; 100]);
+    // FS-W2: a file's data meets the disk itself, so the media error answers the data write (before: the next
+    // commit's flush). Nothing was mapped and the disk never heard of the blocks: the volume is still writable,
+    // until a commit meets the same disk.
+    let free = v.st.lock().free_now();
+    assert_eq!(v.write(g, 4096, &[9u8; 4096], 8192, 1..2).err(), Some(crate::errno::EIO), "a data write on a failing disk");
+    assert_eq!(v.st.lock().free_now(), free, "the failed step's block was not given back");
+    assert!(v.create(ROOT, b"j", 0o100644, 0, 0, crate::Kind::Reg).is_ok(), "a failed data write must not stop the volume");
     assert_eq!(v.flush().err(), Some(crate::errno::EIO));
     assert_eq!(v.create(ROOT, b"i", 0o100644, 0, 0, crate::Kind::Reg).err(), Some(crate::errno::EROFS), "a media error stops it");
     r.clear_faults();

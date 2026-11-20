@@ -1,9 +1,9 @@
 #!/bin/bash
 # GM-8: the vkquake launcher (user/ports/vkquake/bitsos/vkquake) on the host, no QEMU, no game: a made-up tree and Mesa tree whose
 # "loader" is a script that writes down how it was called. Checks: a missing file FAILs --check with its name, a whole tree passes,
-# the start's arguments and clean environment, RADV only by default and no driver path from outside, the pid stays (exec all the
+# the start's arguments and clean environment, RADV only (the caller's MESA_VK_DRIVERS is not read), the pid stays (exec all the
 # way), no desktop = no start but the server starts without one, root hands over to uid 1000 or refuses, the home on the data
-# volume or in RAM, a RAM folder someone else planted, a device node the game's user cannot open. Then quake_check.py's logic on made-up answers (tools/test_quake_check.py), and the shell scripts' syntax.
+# volume or in RAM, a RAM folder someone else planted, a device node the game's user cannot open. Then the shell scripts' syntax.
 set -euo pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 ROOT=$PWD
@@ -13,7 +13,7 @@ mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
 L=$ROOT/user/ports/vkquake/bitsos/vkquake
 red() { echo "RED: $*"; exit 1; }
-for s in "$L" user/ports/vkquake/scripts/stage-v2.sh host/tests/minipc/quake.sh host/tests/gm/51-vkquake-window.sh; do bash -n "$s" || red "syntax of $s"; done
+for s in "$L" user/ports/vkquake/scripts/stage-v2.sh; do bash -n "$s" || red "syntax of $s"; done
 grep -q '^tree  vkquake host:' user/packaging/manifest.txt && grep -q '^stick vkquake file:user/ports/vkquake/bitsos/vkquake' user/packaging/manifest.txt \
   || red "the manifest has no vkquake lines"
 
@@ -23,7 +23,7 @@ mkdir -p "$D/dri"
 mkdir -p "$T/bin" "$T/lib" "$T/id1" "$M/lib" "$M/share/vulkan/icd.d" "$F" "$RUN_DIR/empty"
 for f in "$T/bin/vkquake" "$T/lib/libSDL2-2.0.so.0" "$T/lib/libasound.so.2" "$T/id1/pak0.pak" "$T/id1/pak1.pak" "$M/lib/libvulkan.so.1" "$M/lib/libvulkan_radeon.so"; do : >"$f"; done
 echo "vkQuake 1.37.0 x" >"$T/VERSION.txt"
-echo '{}' >"$M/share/vulkan/icd.d/radeon_icd.json"; echo '{}' >"$M/share/vulkan/icd.d/lvp_icd.json"
+echo '{}' >"$M/share/vulkan/icd.d/radeon_icd.json"
 # The loader: --list answers like ld.so, a start writes its pid, arguments and environment.
 cat >"$M/lib/ld-linux-x86-64.so.2" <<'LD'
 #!/bin/sh
@@ -88,13 +88,14 @@ wait $pid
 got "pid=$pid " "the pid changed on the way: the check of the window goes by it"
 got "args=--inhibit-cache --library-path $T/lib:$M/lib --argv0 $T/bin/vkquake $T/bin/vkquake -basedir $T -current -nosound +map start"
 got "WAYLAND_DISPLAY=w0"; got "XDG_RUNTIME_DIR=$X"; got "SDL_VIDEODRIVER=wayland"; got "SDL_AUDIODRIVER=alsa"
-got "VK_DRIVER_FILES=$M/share/vulkan/icd.d/radeon_icd.json$"; got "VK_ICD_FILENAMES=$M/share/vulkan/icd.d/radeon_icd.json$"
+got "VK_DRIVER_FILES=$M/share/vulkan/icd.d/radeon_icd.json$"
 got "LD_LIBRARY_PATH=$T/lib:$M/lib$"; got "VK_LAYER_PATH=$M/share/vulkan/explicit_layer.d"
 if grep -q "evil\|^FOO=\|^VKQ_" "$OUT"; then cat "$OUT"; red "the caller's environment leaks into the game"; fi
 
-ENVS=("${DESK[@]}" MESA_VK_DRIVERS=lvp_icd); vkq; [ $code = 0 ] || red "lavapipe by name: exit $code"; got "VK_DRIVER_FILES=$M/share/vulkan/icd.d/lvp_icd.json$"
-ENVS=("${DESK[@]}" MESA_VK_DRIVERS=../../evil); vkq; [ $code = 1 ] && [ ! -e "$OUT" ] || red "a driver path from outside: exit $code"
-ENVS=("${DESK[@]}" MESA_VK_DRIVERS=nothing); vkq; [ $code = 1 ] && [ ! -e "$OUT" ] || red "an unknown driver: exit $code"
+ENVS=("${DESK[@]}" MESA_VK_DRIVERS=../../evil); vkq; [ $code = 0 ] || red "a caller's MESA_VK_DRIVERS: exit $code"; got "VK_DRIVER_FILES=$M/share/vulkan/icd.d/radeon_icd.json$"
+mv "$M/share/vulkan/icd.d/radeon_icd.json" "$RUN_DIR/radeon_icd.json"
+ENVS=("${DESK[@]}"); vkq; [ $code = 1 ] && [ ! -e "$OUT" ] || red "no RADV in the Mesa tree: exit $code"; said "driver radeon_icd: "
+mv "$RUN_DIR/radeon_icd.json" "$M/share/vulkan/icd.d/radeon_icd.json"
 
 # No desktop: the game refuses, the server does not ask for one and gets no -current.
 ENVS=(); vkq; [ $code = 1 ] && [ ! -e "$OUT" ] || red "no desktop: exit $code"; said "desktop: none runs"
@@ -121,5 +122,4 @@ ENVS=("${DESK[@]}" FAKE_ID=0 FAKE_NOCHPST=1); vkq --check; [ $code = 1 ] || red 
 # --env prints what a start gets, starts nothing, no test setting in it.
 ENVS=("${DESK[@]}"); vkq --env; [ $code = 0 ] && [ ! -e "$OUT" ] || red "--env: exit $code"; said "^SDL_AUDIODRIVER=alsa$"; said "^WAYLAND_DISPLAY=w0$"
 
-python3 -I -B host/tests/gm/tools/test_quake_check.py >"$RUN_DIR/logic.txt" 2>&1 || { grep -E "^FAIL [a-z-]+: exit|^FAIL the|Traceback|Error" "$RUN_DIR/logic.txt" | head -20; red "quake_check.py's logic"; }
-echo "gm vkquake: green (launcher on made-up trees, quake_check.py's logic)"
+echo "gm vkquake: green (launcher on made-up trees)"

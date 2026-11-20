@@ -1,4 +1,4 @@
-//! The superblock (linux-6.6/fs/ext4/ext4.h:1289 `struct ext4_super_block`): geometry, features, and what V2
+//! The superblock (linux-7.3.1/fs/ext4/ext4.h:1369 `struct ext4_super_block`): geometry, features, and what V2
 //! may do with the volume. The 1024 bytes are kept as read and changed in place, so fields V2 does not know
 //! survive every write.
 
@@ -152,7 +152,7 @@ impl Geo {
     pub fn group_of_block(&self, b: u64) -> u32 {
         ((b - self.first_data_block) / self.bpg) as u32
     }
-    /// Whether group `g` holds a superblock backup (`ext4_bg_has_super`, linux-6.6/fs/ext4/balloc.c:782).
+    /// Whether group `g` holds a superblock backup (`ext4_bg_has_super`, linux-7.3.1/fs/ext4/balloc.c:858).
     pub fn has_super(&self, g: u32) -> bool {
         if g == 0 {
             return true;
@@ -185,7 +185,7 @@ fn is_power(mut g: u32, base: u32) -> bool {
     g == 1
 }
 
-/// `ext4_superblock_csum` (linux-6.6/fs/ext4/super.c:276).
+/// `ext4_superblock_csum` (linux-7.3.1/fs/ext4/super.c:299).
 pub fn checksum(raw: &[u8]) -> u32 {
     crc32c(!0, &raw[..CHECKSUM])
 }

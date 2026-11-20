@@ -200,10 +200,11 @@ fn madvise_checks_in_linux_order() {
     assert_eq!(plan_madvise(0x1000, 0, madv::HWPOISON), Ok(None), "length 0 before the capability check");
     assert_eq!(plan_madvise(0x1000, 1, madv::HWPOISON), Err(Errno::Perm));
     assert_eq!(plan_madvise(0x1000, 1, madv::DONTNEED), Ok(Some((0x1000, 0x2000))));
-    for b in [0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25] {
+    for b in [0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 100, 101, 102, 103] {
         assert!(madv::valid(b), "{b}");
     }
-    assert!(!madv::valid(26) && !madv::valid(102), "MADV_GUARD_* (7.x) are not offered");
+    assert!(!madv::valid(26) && !madv::valid(99) && !madv::valid(104), "L7-VFS: MADV_GUARD_INSTALL/REMOVE (102, 103) are advice");
+    assert_eq!(plan_madvise(0x1000, P, madv::GUARD_INSTALL), Ok(Some((0x1000, 0x2000))));
 }
 
 #[test]

@@ -67,14 +67,14 @@ pub fn list() -> Vec<Action> {
         ),
         Action::new(
             "brave_fill_form",
-            "Fill form fields of a tab and optionally submit the form. fields: {key: value}, key = the field's name, id or a CSS selector; value text, or true/false for a checkbox, the value of a radio button, an option's value or text for a select. All fields are checked before any is set. Password, card and file fields are refused. submit (default false) submits the first field's form and waits for the next page. Needs Georg's permission (setting claude.actions.brave_fill_form = allow).",
+            "Fill form fields of a tab and optionally submit the form. fields: {key: value}, key = the field's name, id or a CSS selector; value text, or true/false for a checkbox, the value of a radio button, an option's value or text for a select. All fields are checked before any is set. Password, card and file fields are refused. submit (default false) submits the first field's form and waits for the next page. Refused when Georg has forbidden it (setting claude.actions.brave_fill_form = deny; allowed by default).",
             &schema(&format!(r#"{TAB},"fields":{{"type":"object"}},"submit":{{"type":"boolean"}}"#), &["fields"], 60_000),
             Safety::Change,
         )
         .gate_text("Claude darf in Brave Formulare ausfüllen und absenden", "Claude may fill in and submit forms in Brave"),
         Action::new(
             "brave_download",
-            "Download a URL with Brave (its cookies and session) into a folder (default /data/home/1000/Downloads, or /tmp/Downloads without the data volume; `dir` is a folder inside it, or inside /data/home/1000; links are not followed); answers the file's path and size once complete. A URL that shows a page instead of downloading is an error. Needs Georg's permission (setting claude.actions.brave_download = allow).",
+            "Download a URL with Brave (its cookies and session) into a folder (default /data/home/1000/Downloads, or /tmp/Downloads without the data volume; `dir` is a folder inside it, or inside /data/home/1000; links are not followed); answers the file's path and size once complete. A URL that shows a page instead of downloading is an error. Refused when Georg has forbidden it (setting claude.actions.brave_download = deny; allowed by default).",
             &schema(r#""url":{"type":"string"},"dir":{"type":"string","description":"folder for the file: relative to the download folder, or absolute inside it or inside /data/home/1000"}"#, &["url"], 300_000),
             Safety::Change,
         )

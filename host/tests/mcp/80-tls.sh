@@ -15,7 +15,7 @@
 #     nothing.
 #   boot 5 (a new read-only stick): no key can be made and no client is paired: the warning line, plain HTTP with
 #     the token, a pairing is refused ("no TLS this start").
-# Needs init's glue (plan/notes/mc-MC-8a.md, change request 1) like 60-service.sh; MC_ALLOW_NO_GLUE=1 turns its
+# Needs init's glue (init starts /bin/bitsmcp) like 60-service.sh; MC_ALLOW_NO_GLUE=1 turns its
 # absence into a SKIP (lane branch only).
 set -eu -o pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
@@ -32,8 +32,8 @@ TOKEN="mc8b-scenario-token-7d03"
 NAME=mc-tls
 
 if ! grep -q "fn bitsmcp" user/init/src/main.rs; then
-    if [ "${MC_ALLOW_NO_GLUE:-}" = 1 ]; then echo "SKIP: user/init/src/main.rs does not start bitsmcp yet (plan/notes/mc-MC-8a.md, change request 1)"; exit 0; fi
-    echo "RED: user/init lacks the bitsmcp glue (plan/notes/mc-MC-8a-init.patch, change request 1)"
+    if [ "${MC_ALLOW_NO_GLUE:-}" = 1 ]; then echo "SKIP: user/init/src/main.rs does not start bitsmcp yet (MC-8a's change request 1, plan/spec/net.md §11.4)"; exit 0; fi
+    echo "RED: user/init lacks the bitsmcp glue (MC-8a's change request 1, plan/spec/net.md §11.4)"
     exit 1
 fi
 command -v node > /dev/null || { echo "RED: node is needed (host/mcp's tools)"; exit 1; }

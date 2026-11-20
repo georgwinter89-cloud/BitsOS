@@ -33,6 +33,12 @@ impl Frame {
         Some(Frame(Mem::Heap(SpinLock::named("vfs.frame.heap", v.into_boxed_slice()))))
     }
 
+    /// W35 MM-2 (INT-W35-MM2, change request 1): a page-cache frame mm-core made (a migration target adopted by
+    /// `mm_core::PageFrame::from_target`) becomes this page's frame.
+    pub fn from_page_frame(f: mm_core::PageFrame) -> Frame {
+        Frame(Mem::Block(f))
+    }
+
     /// The physical address (None for a heap page, which cannot be mapped into a program).
     pub fn phys(&self) -> Option<u64> {
         match &self.0 {

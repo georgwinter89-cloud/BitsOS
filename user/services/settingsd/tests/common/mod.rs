@@ -3,6 +3,7 @@
 use settingsd::change::Who;
 use settingsd::events::Events;
 use settingsd::json::Json;
+use settingsd::peer::{self, Peer};
 use settingsd::registry::Registry;
 use settingsd::store::Paths;
 use std::path::PathBuf;
@@ -35,7 +36,9 @@ impl Env {
 
     pub fn open(&self) -> (Registry, Arc<Mutex<Vec<String>>>) {
         let (ev, cap) = Events::capture();
-        (Registry::open(self.paths.clone(), ev, Duration::from_millis(500)), cap)
+        let mut r = Registry::open(self.paths.clone(), ev, Duration::from_millis(500));
+        r.set_system_dir(BIN);
+        (r, cap)
     }
 
     pub fn stick_file(&self, name: &str) -> String {
@@ -62,12 +65,20 @@ pub fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
     false
 }
 
-pub const WHO: Who<'static> = Who { source: "test", confirmed: false };
+pub const WHO: Who<'static> = Who { source: "test", confirmed: false, asker: None };
 
 pub fn s(v: &str) -> Json {
     Json::from(v)
 }
 
+/// Where the registries of these tests take the system's programs to live.
+pub const BIN: &str = "/bitsos/bin";
+
+/// The system program `name`, run by the desktop user.
+pub fn prog(name: &str) -> Peer {
+    Peer::program(1000, &format!("{BIN}/{name}"))
+}
+
 pub fn value(r: &Registry, key: &str) -> Json {
-    r.get(key, None).unwrap().get("value").cloned().unwrap()
+    r.get(key, None, &peer::INSIDE).unwrap().get("value").cloned().unwrap()
 }

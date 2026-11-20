@@ -7,6 +7,8 @@ description = "Reload (owner: RB)"
 [dependencies]
 acpi = { path = "../acpi" }
 bootinfo = { path = "../bootinfo" }
+# UPDATE: a bundle's version number (its kernel mark, its initramfs entry) names the slot it installs as.
+bitsver = { path = "../bitsver" }
 # RB-14: the storage stop before the jump (`block::shutdown`).
 block = { path = "../block" }
 # RB-9: the console commands system_list, system_pin, install_system (console does not depend on kexec).
@@ -14,6 +16,8 @@ console = { path = "../console" }
 # RB-6: bitsboot's own checks and marker rule (its firmware-free library), so install_kernel judges a bundle as the
 # loader will at the next boot.
 bitsboot = { path = "../../boot/bitsboot" }
+# GP-GUARD: the disk guard's mark a kernel must carry before it is installed or reloaded where nvme_bind=off.
+gp-platform = { path = "../gp-platform" }
 hal = { path = "../hal" }
 devmodel = { path = "../devmodel" }
 fs-fat = { path = "../fs-fat" }
@@ -22,6 +26,8 @@ kreg = { path = "../kreg" }
 ksync = { path = "../ksync" }
 ktest = { path = "../ktest" }
 mcp = { path = "../mcp" }
+# UPDATE: /dev/bitsos/update refuses a process MCP's run started (`proc::MCP_PROGRAM`), as bitsdisk's node does.
+proc = { path = "../proc" }
 # RB-12: rb.crash.nmi_user_stress runs user code in address spaces of its own.
 mm = { path = "../mm" }
 mm-core = { path = "../mm-core" }

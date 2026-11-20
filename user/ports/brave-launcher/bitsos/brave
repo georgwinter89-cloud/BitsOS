@@ -3,12 +3,15 @@
 # \BITSOS2\bin\ (on PATH); Brave itself in \BITSOS2\brave\ (manifest `tree brave`, made by scripts/stage-v2.sh).
 #   brave [URL] [-- Brave arguments]   start in the desktop; ends when Brave ends (Ctrl+Q or its window's close)
 #   brave --check                      check the tree, libraries, fonts, desktop, user and profile; start nothing
+# With Brave installed from the programs (/apps/brave-bin, BR-9) every start goes to that one (bitsrun brave-bin).
 # Brave is a Wayland client: it needs the desktop. It never runs as root: started by root (console, MCP as root) it
 # runs as uid 1000 (BusyBox chpst -u 1000:1000), and refuses to start if root cannot hand over. It runs in its own
 # sandbox (BR-6): seccomp-bpf (SX-1) and user, PID and network namespaces (SX-2), without the setuid helper
 # chrome-sandbox (not in the tree). Every start probes the namespaces first and says the result (`sandbox: on ...`, or
-# `sandbox: missing ...` on a kernel without them, where Chromium ends at once with "No usable sandbox!"); by default
-# (BRAVE_SANDBOX=on, BR-6b) it never adds --no-sandbox. BRAVE_SANDBOX=auto falls back to --no-sandbox, saying so.
+# `sandbox: missing ...` on a kernel without them, where Chromium ends at once with "No usable sandbox!"); it never
+# adds --no-sandbox (BR-6b; DECISIONS 18.11.: the sandbox is always on).
+# It draws on the GPU (BR-8, Georg 24.10.): ANGLE on Mesa's EGL (radeonsi), WebGL, and video decoded by VA-API
+# (Mesa's radeonsi_drv_video), all from the tree's lib/ (stage-v2.sh).
 # The profile (bookmarks, cookies, settings): on the data volume, /data/appdata/brave, when one is mounted writable
 # at /data (ext4, FS-8); else as one file on the stick, \BITSOS2\home\brave_profile.tar (+ the copy before it, .old),
 # unpacked into RAM at the start and packed back after a clean end, as Cobalt's sign-in: FAT holds neither the
@@ -34,35 +37,73 @@ URL=
 PATH=${BRAVE_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
 export PATH
 UID_NOW=$(id -u 2>/dev/null)
-# The flags of BR-1's run on CachyOS (plan/notes/br-BR-1.md), which V2 is measured against.
-FLAGS="--ozone-platform=wayland --disable-gpu --password-store=basic --disable-breakpad
---disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required"
+# The flags of BR-1's run on CachyOS (plan/spec/programs.md §1.1), which V2 is measured against. BR-8 (Georg 24.10.):
+# on the GPU. ANGLE on the native GL of Mesa's EGL (radeonsi; not ANGLE's Vulkan, whose driver the tree does not
+# carry), so WebGL and the compositor draw on the chip; VA-API decode through GL (Chromium 157's
+# AcceleratedVideoDecoder and AcceleratedVideoDecodeLinuxGL; VaapiIgnoreDriverChecks so Chromium's list of known
+# VA drivers does not turn Mesa's down; names checked in /opt/brave-bin/brave 1.99.57). EINGABE: text-input-v3
+# (Brave's own words: --wayland-text-input-version 1 or 3, with --enable-wayland-ime), so Durchblick's "Mach das für
+# mich" can write into Brave's fields through the desktop (Chromium offers no EditableText); keys type as before.
+FLAGS="--ozone-platform=wayland --use-gl=angle --use-angle=gl
+--enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,VaapiIgnoreDriverChecks
+--password-store=basic --disable-breakpad
+--disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required
+--enable-wayland-ime --wayland-text-input-version=3"
 # Dark or light as the desktop (settingsd theme.mode, Georg 23.10.): Chromium has no portal here to ask, so the
 # browser and web pages' prefers-color-scheme follow --force-dark-mode; a change applies at Brave's next start.
 THEME=${BRAVE_THEME-$(settings get theme.mode 2>/dev/null)}
-[ "$THEME" != dark ] || FLAGS="$FLAGS --force-dark-mode"
-
-# BR-6/6b: on (the default since SX-2: probed and said, never --no-sandbox), auto (probed, --no-sandbox when the probe
-# or Chromium finds no sandbox: for an older kernel), off (always --no-sandbox, for a look without).
-SANDBOX=${BRAVE_SANDBOX:-on}
+# theme.mode "auto" ("Nach Uhrzeit", WY-SET) is light from theme.auto.light_from to theme.auto.dark_from (whole
+# local hours, 7 and 19 unless set, also across midnight), dark the rest: the rule of bitscomp's theme_auto.rs.
+# THEME_HOUR stands in for the clock in host tests.
+hour_or() { # value, default: a whole hour 0..23 (bitscomp clamps the same way)
+  case $1 in ''|*[!0-9]*) echo "$2"; return ;; esac
+  _tn=$(expr "$1" + 0); [ "$_tn" -le 23 ] || _tn=23; echo "$_tn"
+}
+theme_dark() { # mode: true when the desktop is dark now
+  [ "$1" = auto ] || { [ "$1" = dark ]; return; }
+  _th=$(hour_or "${THEME_HOUR:-$(date +%H 2>/dev/null)}" 0)
+  _tf=$(hour_or "$(settings get theme.auto.light_from 2>/dev/null)" 7)
+  _tt=$(hour_or "$(settings get theme.auto.dark_from 2>/dev/null)" 19)
+  if [ "$_tf" -le "$_tt" ]; then [ "$_th" -lt "$_tf" ] || [ "$_th" -ge "$_tt" ]; else [ "$_th" -lt "$_tf" ] && [ "$_th" -ge "$_tt" ]; fi
+}
+! theme_dark "$THEME" || FLAGS="$FLAGS --force-dark-mode"
+# Durchblick (DB5a): while the accessibility bus runs (atspid, switch desktop.durchblick.programs), Brave hands its
+# buttons, fields and page contents to it: the bus by address (no session bus here), Chromium's switch for an assistive
+# program and the page tree. Without the bus (atspid not running): no accessibility bridge.
+A11Y_BUS=${BRAVE_A11Y_BUS:-$USER_RUN/at-spi/bus}
+if [ -S "$A11Y_BUS" ]; then
+  A11Y_ENV="AT_SPI_BUS_ADDRESS=unix:path=$A11Y_BUS ACCESSIBILITY_ENABLED=1"
+  FLAGS="$FLAGS --force-renderer-accessibility"
+else
+  A11Y_ENV=NO_AT_BRIDGE=1
+fi
 
 say() { echo "brave: $*"; }
-case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
+# PE-1: a line for the person at the screen. The desktop's card about a failed start shows only these ("» " marks
+# them); the say lines are the desk's and stay in the journal.
+TOLD=
+tell() { echo "» $*"; TOLD=1; }
+NOGO="Brave startet nicht:"
+case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; tell "$NOGO Das System nennt keinen Benutzer."; exit 1 ;; esac
 
 tree_ok() {
   for f in brave resources.pak icudtl.dat v8_context_snapshot.bin locales/en-US.pak lib/libgtk-3.so.0 \
       etc/fonts/fonts.conf share/glib-2.0/schemas/gschemas.compiled share/mime/mime.cache share/icons/Adwaita/index.theme \
-      etc/gdk-pixbuf/loaders.cache glycin/glycin-image-rs share/glycin-loaders/2+/conf.d/glycin-image-rs.conf libexec/bwrap; do
+      etc/gdk-pixbuf/loaders.cache glycin/glycin-image-rs share/glycin-loaders/2+/conf.d/glycin-image-rs.conf libexec/bwrap \
+      lib/libEGL.so.1 lib/libva.so.2 lib/dri/radeonsi_drv_video.so share/glvnd/egl_vendor.d/50_mesa.json; do
     [ -e "$T/$f" ] || { say "tree $T: $f is missing (copy \\BITSOS2\\brave\\ to the stick)"; return 1; }
   done
 }
 
 # Brave has no RPATH: its libraries come through LD_LIBRARY_PATH=$T/lib, exactly as the start below sets it. The
-# libraries Chromium and NSS dlopen (GTK 3, the soft token, freebl) are listed by the loader itself (ld.so --list).
+# libraries Chromium and NSS dlopen (GTK 3, the soft token, freebl; BR-8: glvnd's EGL and GLES with Mesa's EGL vendor,
+# GBM and its backend, libva with its DRM part and Mesa's VA driver) are listed by the loader itself (ld.so --list).
 LDSO=${BRAVE_LDSO:-/usr/lib/ld-linux-x86-64.so.2}
+DLOPENED="libgtk-3.so.0 libsoftokn3.so libfreeblpriv3.so libEGL.so.1 libEGL_mesa.so.0 libGLESv2.so.2 libgbm.so.1
+gbm/dri_gbm.so libva.so.2 libva-drm.so.2 dri/radeonsi_drv_video.so"
 libs_ok() {
   out=$(env LD_LIBRARY_PATH="$T/lib" LD_TRACE_LOADED_OBJECTS=1 "$T/brave" 2>&1) || { say "libraries: the loader failed: $out"; return 1; }
-  for so in libgtk-3.so.0 libsoftokn3.so libfreeblpriv3.so; do
+  for so in $DLOPENED; do
     o=$("$LDSO" --library-path "$T/lib" --list "$T/lib/$so" 2>&1) || { say "libraries: the loader failed on lib/$so: $o"; return 1; }
     out="$out
 $o"
@@ -128,61 +169,36 @@ u() { $DROP "$@"; }
 # 1, as Chromium's do; chroot / needs CAP_SYS_CHROOT in the new namespace). 10 s at most (B4): a hanging kernel
 # call means no sandbox. A running Brave keeps its own choice (a hand-over is a second Chromium start: same flags).
 # The probe is only a prefilter that names the cause (Chromium's zygote does its chroot from a CLONE_FS child, not
-# as BusyBox does); Chromium's own verdict comes after the start (sandbox_retry). Sets SB_WHY; says the line. With
-# BRAVE_SANDBOX=on a failed probe adds nothing (`sandbox: missing`): Chromium then judges, and ends at once if it
-# finds no sandbox.
-SB_PROBE_SECS=${BRAVE_SANDBOX_SECS:-10}
+# as BusyBox does); Chromium's own verdict comes after the start (sandbox_end). Says the line; a failed probe adds
+# nothing (`sandbox: missing`): Chromium then judges, and ends at once if it finds no sandbox. BRAVE_TEST_SANDBOX_SECS
+# shortens the probe's time for host/tests/br/20-launcher.sh.
+SB_PROBE_SECS=${BRAVE_TEST_SANDBOX_SECS:-10}
 sandbox_line() {
-  SB_WHY=
-  case $SANDBOX in
-    off) SB_WHY="BRAVE_SANDBOX=off" ;;
-    *)
-      if b=$(running); then
-        bp=${b%% *}
-        if tr '\0 ' '\n\n' <"/proc/$bp/cmdline" 2>/dev/null | grep -qx -- --no-sandbox; then
-          SB_WHY="as the running Brave (pid $bp)"
-        else
-          say "sandbox: on (as the running Brave, pid $bp)"
-          return 0
-        fi
-      else
-        sc=no
-        ! grep -q '^Seccomp:' /proc/self/status 2>/dev/null || sc=yes
-        out=$(u timeout "$SB_PROBE_SECS" unshare -r -p -n -f chroot / /bin/sh -c : 2>&1)
-        src=$?
-        if [ $src = 0 ]; then
-          say "sandbox: on (user, PID and network namespaces; the kernel names seccomp in /proc: $sc)"
-          return 0
-        fi
-        # BusyBox timeout ends with 128+SIGTERM, coreutils timeout with 124: both mean the time ran out.
-        case $src in 124|143) out="no answer within $SB_PROBE_SECS s" ;; esac
-        SB_WHY="no user, PID and network namespace for uid $(u id -u 2>/dev/null || echo "$UID_NOW"): $(echo "${out:-unshare failed (code $src)}" | head -n 1)"
-        if [ "$SANDBOX" = on ]; then
-          say "sandbox: missing ($SB_WHY; BRAVE_SANDBOX=$SANDBOX adds no --no-sandbox: Chromium decides)"
-          return 1
-        fi
-      fi ;;
-  esac
-  FLAGS="$FLAGS --no-sandbox"
-  say "sandbox: off (--no-sandbox; $SB_WHY)"
-}
-# BR-6: the probe passed, but Chromium found no usable sandbox (its own calls differ from BusyBox's: clone with the
-# namespace flags, the CLONE_FS chroot to /proc/self/fdinfo/, a nested PID namespace per renderer): Brave ended at
-# once with that FATAL line. With BRAVE_SANDBOX=auto Brave starts once more with --no-sandbox, saying why (the first
-# log is kept as brave-nosandbox.log); with BRAVE_SANDBOX=on (the default) it stays ended and the launcher says why,
-# in German too (Georg reads it). Returns 0 when a new start is due.
-sandbox_retry() {
-  sbl=$(grep -m 1 'No usable sandbox' "$1" 2>/dev/null) || return 1
-  if [ "$SANDBOX" != auto ]; then
-    say "sandbox: missing (Chromium: ${sbl#*] }; BRAVE_SANDBOX=$SANDBOX: Brave stays ended)"
-    say "Brave findet keine Sandbox (Namensraeume im Kern): nicht gestartet. BRAVE_SANDBOX=auto startet es ohne."
-    return 1
+  if b=$(running); then
+    say "sandbox: on (as the running Brave, pid ${b%% *})"
+    return 0
   fi
-  [ -z "$SB_WHY" ] || return 1
-  u cp "$1" "${1%.log}-nosandbox.log" 2>/dev/null || :
-  SB_WHY="Chromium: ${sbl#*] }"
-  FLAGS="$FLAGS --no-sandbox"
-  say "sandbox: off (--no-sandbox; $SB_WHY); starting again"
+  sc=no
+  ! grep -q '^Seccomp:' /proc/self/status 2>/dev/null || sc=yes
+  out=$(u timeout "$SB_PROBE_SECS" unshare -r -p -n -f chroot / /bin/sh -c : 2>&1)
+  src=$?
+  if [ $src = 0 ]; then
+    say "sandbox: on (user, PID and network namespaces; the kernel names seccomp in /proc: $sc)"
+    return 0
+  fi
+  # BusyBox timeout ends with 128+SIGTERM, coreutils timeout with 124: both mean the time ran out.
+  case $src in 124|143) out="no answer within $SB_PROBE_SECS s" ;; esac
+  why="no user, PID and network namespace for uid $(u id -u 2>/dev/null || echo "$UID_NOW"): $(echo "${out:-unshare failed (code $src)}" | head -n 1)"
+  say "sandbox: missing ($why; Chromium decides)"
+  return 1
+}
+# BR-6: Chromium found no usable sandbox (its own calls differ from BusyBox's: clone with the namespace flags, the
+# CLONE_FS chroot to /proc/self/fdinfo/, a nested PID namespace per renderer): Brave ended at once with that FATAL
+# line. It stays ended and the launcher says why, in German too (Georg reads it).
+sandbox_end() {
+  sbl=$(grep -m 1 'No usable sandbox' "$1" 2>/dev/null) || return 0
+  say "sandbox: missing (Chromium: ${sbl#*] }; Brave stays ended)"
+  tell "$NOGO Der Schutzraum, in dem Brave Webseiten öffnet, fehlt in BitsOS noch."
 }
 
 # The desktop as Brave's user can reach it (root's own bitscomp is not uid 1000's).
@@ -385,20 +401,24 @@ lock_profile() {
 unlock() { [ -z "$LOCKED" ] || u rm -rf "$LOCK"; LOCKED=; }
 
 # Brave with BR-1's flags in a clean environment, as BR-1 measured on CachyOS; the rest points into the tree:
-# libraries, fontconfig, cursors and icons, GTK's schemas (memory backend: no dconf), the MIME database and
+# libraries, the GPU's (glvnd's EGL vendor file, GBM's backend, Mesa's driver defaults, libdrm's AMD product table,
+# libva's radeonsi driver: the names Mesa's own `run` sets, plan/spec/programs.md 4), fontconfig, cursors and icons, GTK's schemas (memory backend: no dconf), the MIME database and
 # gdk-pixbuf's loaders (BR-7: glycin's loader program from the tree; a real bwrap on PATH, /bin/bwrap on V2, comes
 # first; $T/libexec/bwrap, last, tells glycin without one that no sandbox can be made, so it runs the loader
-# directly; Chromium's own sandbox does not depend on it), no D-Bus, PulseAudio or accessibility bus
-# (Chromium then uses ALSA). run_brave LOG ARGS: replaces the calling shell (call it with & or as the last step).
+# directly; Chromium's own sandbox does not depend on it), no D-Bus or PulseAudio (Chromium then uses ALSA); the
+# accessibility bus only as A11Y_ENV says. run_brave LOG ARGS: replaces the calling shell (call it with & or as the last step).
 # shellcheck disable=SC2086,SC2016
 run_brave() {
   log=$1; shift
   exec env -i PATH="$PATH:$T/libexec" HOME="$RUN/home" LANG="${LANG:-de_DE.UTF-8}" ${TZ:+TZ=$TZ} \
     XDG_RUNTIME_DIR="${WD%/*}" WAYLAND_DISPLAY="${WD##*/}" LD_LIBRARY_PATH="$T/lib" \
+    __EGL_VENDOR_LIBRARY_FILENAMES="$T/share/glvnd/egl_vendor.d/50_mesa.json" GBM_BACKENDS_PATH="$T/lib/gbm" \
+    DRIRC_CONFIGDIR="$T/share/drirc.d" AMDGPU_ASIC_ID_TABLE_PATHS="$T/share/libdrm" \
+    LIBVA_DRIVERS_PATH="$T/lib/dri" LIBVA_DRIVER_NAME=radeonsi \
     FONTCONFIG_FILE="$T/etc/fonts/fonts.conf" XCURSOR_PATH="$T/share/icons" XCURSOR_THEME=Adwaita XCURSOR_SIZE="${XCURSOR_SIZE:-32}" \
     XDG_DATA_DIRS="$T/share:/usr/share" GSETTINGS_SCHEMA_DIR="$T/share/glib-2.0/schemas" GSETTINGS_BACKEND=memory \
     GDK_PIXBUF_MODULE_FILE="$T/etc/gdk-pixbuf/loaders.cache" \
-    GTK_USE_PORTAL=0 NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: \
+    GTK_USE_PORTAL=0 $A11Y_ENV DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: \
     PULSE_SERVER=none $DROP sh -c 'exec "$@" >"$0" 2>&1' "$log" "$T/brave" $FLAGS "$@"
 }
 # The URL (or a new window) to the running Brave $1 with profile $2: Chromium's second start hands it over and ends.
@@ -412,11 +432,29 @@ as_user
 if [ -n "$DROP" ]; then RUN=$USER_RUN/brave
 elif [ "$UID_NOW" != 0 ] && [ -n "$XDG_RUNTIME_DIR" ]; then RUN=$XDG_RUNTIME_DIR/brave
 else RUN=$TMP/brave-$UID_NOW; fi
-# PK-2 CR5: the package wrapper puts the run folder (HOME, logs, lock) into the package's data folder.
-[ -z "$BRAVE_RUN" ] || RUN=$BRAVE_RUN
+# BR-9: Brave installed from the programs ("Programme installieren", brave-bin) is the one Brave: every start goes
+# to it, in its own view, where bitsrun gives it this launcher's flags, sandbox and environment and the profile it
+# took over from $PD once. The binary, not only the package's folder: a package half removed is no Brave to hand
+# over to, and the stick's tree starts. An installed Brave that ends with an error says so with its last lines;
+# nothing starts in its place. BRAVE_TEST_STICK=1 (tests and the checks of plan/guides/brave.md only) starts the
+# stick's tree all the same.
+APPS=${BRAVE_APPS:-/apps}
+BITSRUN=${BRAVE_BITSRUN:-/bin/bitsrun}
+PKG_BIN=$APPS/brave-bin/current/root/opt/brave-bin/brave
+pkg_brave() { [ -z "$BRAVE_TEST_STICK" ] && [ -x "$PKG_BIN" ] && [ -x "$BITSRUN" ]; }
+# The run folder as Brave's user (root's hand-over makes the user's runtime folder when the desktop has not).
+run_dir() {
+  if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
+    mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; return 1; }
+  fi
+  u mkdir -p "$RUN/home" || { say "cannot make $RUN"; return 1; }
+}
+
+no_desk() { tell "$NOGO Die Arbeitsfläche ist nicht erreichbar."; exit 1; }
+no_dir() { tell "$NOGO Ein Ordner für Brave lässt sich nicht anlegen."; exit 1; }
 
 case "$1" in
-  -h|--help) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   --check)
     rc=0
     tree_ok && say "tree $T: ok" || rc=1
@@ -428,6 +466,9 @@ case "$1" in
     elif [ -z "$NOROOT" ]; then say "user: runs as uid $UID_NOW"
     else say "user: runs as uid 0: refused, $NOROOT"; rc=1; fi
     profile_line
+    if pkg_brave; then say "installed Brave: $APPS/brave-bin (every start goes to it)"
+    elif [ -z "$BRAVE_TEST_STICK" ] && [ -d "$APPS/brave-bin/current" ]; then say "installed Brave: $APPS/brave-bin is incomplete (no $PKG_BIN): the stick's tree starts"
+    else say "installed Brave: none"; fi
     loaders_line
     if [ "$MODE" = data ]; then say "downloads: $DL_DATA (data volume)"; else say "downloads: $RUN/home/Downloads (in RAM)"; fi
     if b=$(running); then say "running: pid ${b%% *} (profile ${b#* }); a start hands its URL to it"; else say "running: no"; fi
@@ -436,26 +477,48 @@ case "$1" in
 esac
 
 if [ -n "$NOROOT" ]; then
-  say "Brave startet nicht als root: $NOROOT. Bitte als Benutzer 1000 starten (zum Beispiel ueber MCP)."
+  tell "Brave startet nicht mit Verwalterrechten. Bitte als normaler Benutzer starten."
   say "Brave does not run as root: $NOROOT. Start it as user 1000 (MCP run, for example)."
   exit 1
 fi
-tree_ok || exit 1
-desk_line || exit 1
+if pkg_brave; then
+  desk_line || no_desk
+  run_dir || no_dir
+  PLOG=$RUN/installed.log
+  say "starting the installed Brave ($APPS/brave-bin through $BITSRUN, log $PLOG)"
+  START=$(date +%s)
+  # HOME empty: bitsrun takes uid 1000's from passwd (root's would be /root); the runtime folder is its own fact.
+  # shellcheck disable=SC2086
+  $DROP sh -c 'exec "$@" >"$0" 2>&1' "$PLOG" env HOME= WAYLAND_DISPLAY="${WD##*/}" "$BITSRUN" brave-bin "$@" &
+  CHILD=$!
+  sig=
+  trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+  wait $CHILD
+  rc=$?
+  if [ -n "$sig" ]; then wait $CHILD; r=$?; [ $r = 127 ] || rc=$r; fi
+  trap - INT TERM HUP
+  say "the installed Brave ended (code $rc) after $(( $(date +%s) - START )) s"
+  if [ -z "$sig" ] && [ $rc != 0 ]; then
+    tell "Brave hat sich mit einem Fehler beendet."
+    say "its last lines:"
+    u tail -n 5 "$PLOG" 2>/dev/null | sed 's/^/brave:   /'
+  fi
+  exit $rc
+fi
+tree_ok || { tell "$NOGO Auf dem Stick fehlen Dateien von Brave."; exit 1; }
+desk_line || no_desk
 sandbox_line
 if [ -n "$1" ] && [ "$1" != "--" ]; then URL=$1; shift; fi
 [ "$1" != "--" ] || shift
-if [ -n "$DROP" ] && [ ! -d "$USER_RUN" ]; then
-  mkdir -p "$USER_RUN" && chown 1000:1000 "$USER_RUN" && chmod 700 "$USER_RUN" || { say "cannot make $USER_RUN"; exit 1; }
-fi
-u mkdir -p "$RUN/home" || { say "cannot make $RUN"; exit 1; }
+run_dir || no_dir
 LOCK=$RUN/.lock
 if ! lock_profile; then
   # Another start of this user is starting or running Brave: its Brave gets the URL once it runs (10 s at most).
   n=0
   until b=$(running); do
     n=$((n + 1))
-    [ $n -le "${BRAVE_WAIT:-20}" ] || { say "another start (pid ${HOLDER:-?}) holds $LOCK, but no Brave runs: nothing started"; exit 1; }
+    [ $n -le "${BRAVE_WAIT:-20}" ] || { say "another start (pid ${HOLDER:-?}) holds $LOCK, but no Brave runs: nothing started"
+      tell "Brave wird schon gestartet, zeigt aber kein Fenster. Bitte gleich noch einmal öffnen."; exit 1; }
     sleep 0.5
   done
   forward "${b%% *}" "${b#* }" "$@"
@@ -468,26 +531,24 @@ profile_mode
 CACHE=
 # From here on no Brave of this tree runs: Chromium's lock links (they name this host and a pid) are stale.
 case $MODE in
-  data) data_dir || exit 1; import_tar; u rm -f "$PD/SingletonLock" "$PD/SingletonSocket" "$PD/SingletonCookie"; PROFILE=$PD; say "profile: $PD" ;;
+  data) data_dir || no_dir; import_tar; u rm -f "$PD/SingletonLock" "$PD/SingletonSocket" "$PD/SingletonCookie"; PROFILE=$PD; say "profile: $PD" ;;
   tar) restore; u rm -f "$RUN/profile/SingletonLock" "$RUN/profile/SingletonSocket" "$RUN/profile/SingletonCookie"; PROFILE=$RUN/profile; CACHE="--disk-cache-dir=$RUN/cache" ;;
   *) say "profile: in RAM only: $why"; PROFILE=$RUN/profile; CACHE="--disk-cache-dir=$RUN/cache" ;;
 esac
-u mkdir -p "$PROFILE" || { say "cannot make $PROFILE"; exit 1; }
+u mkdir -p "$PROFILE" || { say "cannot make $PROFILE"; no_dir; }
 downloads || :
 loaders_line
 LOG=$RUN/brave.log
 say "starting ${URL:-the start page} (log $LOG)"
 START=$(date +%s)
-while :; do
-  # shellcheck disable=SC2086
-  run_brave "$LOG" "--user-data-dir=$PROFILE" $CACHE ${URL:+"$URL"} "$@" &
-  CHILD=$!
-  sig=
-  trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
-  wait $CHILD
-  rc=$?
-  [ -z "$sig" ] && [ $rc != 0 ] && sandbox_retry "$LOG" || break
-done
+# shellcheck disable=SC2086
+run_brave "$LOG" "--user-data-dir=$PROFILE" $CACHE ${URL:+"$URL"} "$@" &
+CHILD=$!
+sig=
+trap 'sig=1; kill -TERM $CHILD 2>/dev/null' INT TERM HUP
+wait $CHILD
+rc=$?
+[ -n "$sig" ] || [ $rc = 0 ] || sandbox_end "$LOG"
 killed=
 if [ -n "$sig" ]; then
   # Brave's own end on SIGTERM flushes its databases; after 10 s it is killed.
@@ -503,6 +564,11 @@ if [ -n "$sig" ]; then
 fi
 trap - INT TERM HUP
 say "Brave ended (code $rc) after $(( $(date +%s) - START )) s"
+if [ -z "$sig" ] && [ $rc != 0 ]; then
+  # Brave writes into its log, not here: its last lines go to the journal through the desktop (PE-1).
+  [ -n "$TOLD" ] || tell "Brave hat sich mit einem Fehler beendet."
+  u tail -n 5 "$LOG" 2>/dev/null | sed 's/^/brave:   /'
+fi
 unclean=
 if [ -n "$killed" ]; then unclean="Brave had to be killed"
 elif [ $rc -gt 128 ] && { [ -z "$sig" ] || [ $rc != 143 ]; }; then unclean="Brave ended by signal $((rc - 128))"; fi

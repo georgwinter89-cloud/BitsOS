@@ -138,8 +138,15 @@ fn readiness_and_wake_counter() {
     w.write_stream(b"a", false).unwrap();
     let seq1 = rq.seq();
     assert!(seq1 > seq0);
-    // Linux wakes readers on every write, also into a pipe that has data already: an edge each time.
+    // L7-VFS (linux-7.3.1/fs/pipe.c:670): a write into a pipe with data wakes nobody (readers sleep only on an
+    // empty one) until an EPOLLET watcher looked at a read end; from then on every write wakes them.
     w.write_stream(b"b", false).unwrap();
+    assert_eq!(rq.seq(), seq1);
+    w.poll_edge();
+    w.write_stream(b"c", false).unwrap();
+    assert_eq!(rq.seq(), seq1, "a write end's EPOLLET watcher arms nothing");
+    r.poll_edge();
+    w.write_stream(b"d", false).unwrap();
     assert!(rq.seq() > seq1);
     // Writes wake rd_wait only (the writers' queue moves when a read empties a full pipe).
     assert_eq!(wq.seq(), wseq0);
@@ -157,33 +164,53 @@ fn readiness_and_wake_counter() {
     assert_eq!(File::events(&*r).0, Events::IN | Events::HUP);
 }
 
+/// Judged by order, not by time: the side that opens first is counted on the pipe (`Fifo::current`) and still
+/// in its open when the other side comes; the other side's arrival is noted before it opens, and the first open
+/// must return only after that. (It measured the reader's wait in time; on a busy machine the reader thread
+/// started after the writer had opened and returned at once, which is right: one failure in 31 runs.)
 #[test]
 fn fifo_open_waits_for_the_other_side() {
+    use std::sync::atomic::AtomicBool;
     let f = Arc::new(Fifo::new());
-    let f2 = f.clone();
+    let came = Arc::new(AtomicBool::new(false));
+    let (f2, came2) = (f.clone(), came.clone());
     let reader = thread::spawn(move || {
-        let start = Instant::now();
         let end = f2.open(crate::abi::O_RDONLY, false).unwrap();
-        (start.elapsed(), end)
+        (came2.load(Ordering::SeqCst), end)
     });
-    thread::sleep(Duration::from_millis(50));
+    wait_until("the reader is counted on the pipe", || f.current().is_some());
+    thread::sleep(Duration::from_millis(20));
+    assert!(!reader.is_finished(), "O_RDONLY returned before a writer came");
+    came.store(true, Ordering::SeqCst);
     let w = f.open(crate::abi::O_WRONLY, false).unwrap();
-    let (waited, r) = reader.join().unwrap();
-    assert!(waited >= Duration::from_millis(40), "O_RDONLY returned before a writer came ({waited:?})");
+    let (after_writer, r) = reader.join().unwrap();
+    assert!(after_writer, "O_RDONLY returned before a writer came");
     assert_eq!(w.write_stream(b"via fifo", false).unwrap(), 8);
     let mut b = [0u8; 16];
     assert_eq!(r.read_stream(&mut b, false).unwrap(), 8);
     // A writer waits for a reader the same way.
     drop((r, w));
     assert!(f.current().is_none(), "the pipe outlived its last end");
-    let f3 = f.clone();
-    let writer = thread::spawn(move || f3.open(crate::abi::O_WRONLY, false).map(|_| ()));
-    thread::sleep(Duration::from_millis(30));
+    came.store(false, Ordering::SeqCst);
+    let (f3, came3) = (f.clone(), came.clone());
+    let writer = thread::spawn(move || f3.open(crate::abi::O_WRONLY, false).map(|_| came3.load(Ordering::SeqCst)));
+    wait_until("the writer is counted on the pipe", || f.current().is_some());
+    thread::sleep(Duration::from_millis(20));
+    assert!(!writer.is_finished(), "O_WRONLY returned before a reader came");
+    came.store(true, Ordering::SeqCst);
     let r = f.open(crate::abi::O_RDONLY | crate::abi::O_NONBLOCK, false).unwrap();
-    writer.join().unwrap().unwrap();
+    assert_eq!(writer.join().unwrap(), Ok(true), "O_WRONLY returned before a reader came");
     drop(r);
     assert_eq!(f.open(crate::abi::O_WRONLY | crate::abi::O_NONBLOCK, false).err(), Some(ENXIO));
     assert_eq!(f.open(3, false).err(), Some(EINVAL));
+}
+
+fn wait_until(what: &str, f: impl Fn() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < Duration::from_secs(10), "never: {what}");
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

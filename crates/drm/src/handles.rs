@@ -1,4 +1,4 @@
-//! A per-file handle table (Linux's `object_idr`, linux-6.6/drivers/gpu/drm/drm_gem.c:376 `idr_alloc(.., 1, 0, ..)`):
+//! A per-file handle table (Linux's `object_idr`, linux-7.3.1/drivers/gpu/drm/drm_gem.c:498 `idr_alloc(.., 1, 0, ..)`):
 //! the lowest free number from 1 on, up to i32::MAX (ENOSPC beyond, as the IDR); grows without a fixed count (R1).
 
 use alloc::collections::{BTreeMap, BTreeSet};

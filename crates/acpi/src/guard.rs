@@ -274,3 +274,30 @@ pub fn bar_range(space: Space, addr: u64) -> Option<BarRange> {
     let size = if space == Space::Io { align.min(0x100) } else { align.min(BAR_GUESS_MAX) };
     Some(BarRange { space, start: addr, end: addr.saturating_add(size) })
 }
+
+/// Where the chipset's fixed range begins (I/O APIC, HPET, TPM, local APIC, flash): no BAR reaches past it.
+pub const FIXED_RANGE: u64 = 0xFEC0_0000;
+
+/// GP-GUARD CR10 (the first scan on an Intel CPU, `kpci`): a memory BAR's extent as large as its alignment, with no
+/// fixed bound, but ending where the next BAR value of any function begins (`known`, every memory BAR address the
+/// scan read, any class) and below [`FIXED_RANGE`]; the same idea as PC's `guardview::extent`, which needs the
+/// bridge windows and has the real tree. On the Gaming-PC Intel VMD's 32 MiB BAR is whole that way, and the
+/// guesses for its NVMe controllers no longer reach the SPI controller or the network card. Never smaller than the
+/// real BAR: BARs do not overlap, so the next one starts at or after its end. I/O BARs as `bar_range`.
+pub fn bar_range_until(space: Space, addr: u64, known: &[u64]) -> Option<BarRange> {
+    if space == Space::Io {
+        return bar_range(space, addr);
+    }
+    if addr == 0 {
+        return None;
+    }
+    let align = 1u64.checked_shl(addr.trailing_zeros()).unwrap_or(u64::MAX);
+    let mut end = addr.saturating_add(align);
+    if let Some(next) = known.iter().copied().filter(|&k| k > addr).min() {
+        end = end.min(next);
+    }
+    if addr < FIXED_RANGE {
+        end = end.min(FIXED_RANGE);
+    }
+    Some(BarRange { space, start: addr, end })
+}

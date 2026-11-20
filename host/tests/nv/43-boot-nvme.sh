@@ -7,7 +7,11 @@
 # stays plugged in. Never a real disk.
 #  A. ktests: /boot is that ESP (/dev/nvme0n1p3), writable below \BITSOS2\ only, through its own window at both layers;
 #     raw writes to it, to the Windows partitions, the GPT and the whole disk refused; the stick an ordinary disk; no
-#     data.img on the NVMe; the window's pool made for B (nv.boot.esp, nv.boot.stick_beside, nv.boot.pool).
+#     data.img on the NVMe; the window's pool made for B (nv.boot.esp, nv.boot.stick_beside, nv.boot.pool); the
+#     plugged stick no boot stick but a guarded USB disk (block.usb.stick's NVMe-boot path, GP-R2); the nvme tool
+#     writes nothing of its own beside the window /data writes through (nv.tool, GP-R3).
+#  A2. the same without any stick (GP-R3, the Mini-PC since the move): block.usb.stick ends after the settle time,
+#     not after 40 s; nv.tool again.
 #  B. MCP: install.mjs --reboot installs generation 2 onto the ESP, reboots into its one try and sees it confirm itself;
 #     /data on the window's pool beside the open boot window.
 #  C. nvme_boot= names the ESP with a wrong size: the disk refused as a whole, /boot on the ESP read-only, no /data
@@ -74,6 +78,9 @@ esp() {
     rm -f "$f"
     mkfs.fat -F 32 -n "${1:-BITSOS}" -h $ESP_FIRST -C "$f" $((ESP_N / 2)) > /dev/null
     mcopy -s -i "$f" "target/xtask/esp-$NAME/EFI" "target/xtask/esp-$NAME/BITSOS2" ::/
+    # The partition zeroed first: dd's sparse write skips the new volume's zero MiBs, which would keep an earlier
+    # boot's FAT entries there (GP-R3: B's third generation reached the FAT's second MiB, C's fsck saw them).
+    fallocate --punch-hole --offset $((ESP_FIRST * 512)) --length $((ESP_N * 512)) "$IMG"
     dd if="$f" of="$IMG" bs=1M seek=$((ESP_FIRST * 512)) oflag=seek_bytes conv=notrunc,sparse status=none
     dd if="$f" of="$RUN_DIR/esp.head" bs=512 count=32 status=none
     rm -f "$f"
@@ -100,7 +107,7 @@ PY
 start() {
     local log="$1"; shift
     rm -f "$log"
-    cargo xtask qemu --name "$NAME" --boot nvme --smp 4 --mem 4096 --timeout "${NV_TIMEOUT:-900}" --serial-log "$log" "$@" -- \
+    cargo xtask qemu --name "$NAME" --boot "${BOOT:-nvme}" --smp 4 --mem 4096 --timeout "${NV_TIMEOUT:-900}" --serial-log "$log" "$@" -- \
         -drive "if=none,id=nv0,format=raw,file=$IMG,discard=unmap" -device "nvme,id=nvq0,serial=$SERIAL,drive=nv0,bootindex=0" \
         -action reboot=reset > "$RUN_DIR/qemu.out" 2>&1 &
     QPID=$!
@@ -120,16 +127,42 @@ loader_from_nvme() {
 }
 
 # ---- A. ktests from the NVMe's ESP
-cargo xtask image --name "$NAME" --ktest --config-extra "ktest=nv.boot.esp,nv.boot.stick_beside,nv.boot.pool;ktest_run=nv/43-boot-nvme;loglevel=info;$KEYS" > "$RUN_DIR/image.out" 2>&1 || { tail -20 "$RUN_DIR/image.out"; fail "image"; }
+cargo xtask image --name "$NAME" --ktest --config-extra "ktest=nv.boot.esp,nv.boot.stick_beside,nv.boot.pool,block.usb.stick,-block.usb.stick_write,nv.tool;ktest_run=nv/43-boot-nvme,nv/10-nvme;loglevel=info;$KEYS" > "$RUN_DIR/image.out" 2>&1 || { tail -20 "$RUN_DIR/image.out"; fail "image"; }
 esp
 start "$RUN_DIR/a.log"
 wait "$QPID" || true
 QPID=""
 grep -aq "KTEST done passed=.* failed=0" "$RUN_DIR/a.log" || { grep -a "KTEST\|window\|fat stick\|PANIC" "$RUN_DIR/a.log" | tail -30; fail "A: ktests not green"; }
 for t in esp stick_beside pool; do grep -aq "KTEST ok nv.boot.$t " "$RUN_DIR/a.log" || fail "A: nv.boot.$t did not pass"; done
+# GP-R2: block.usb.stick follows the boot medium: on the NVMe boot the plugged stick is a plain USB disk, no stick.
+grep -aq "KTEST ok block.usb.stick " "$RUN_DIR/a.log" || fail "A: block.usb.stick did not pass"
+grep -aq "block ktest.stick boot=nvme usb_disks=1" "$RUN_DIR/a.log" || { grep -a "ktest.stick" "$RUN_DIR/a.log"; fail "A: block.usb.stick did not take the NVMe boot's path with the stick beside it"; }
+# GP-R3: the nvme tool beside a window that /data writes through: none of its own writes, none outside the window.
+grep -aq "KTEST ok nv.tool " "$RUN_DIR/a.log" || fail "A: nv.tool did not pass"
+grep -aq "nvme ktest.tool_window ctrl=nvme0 .*quiet=true" "$RUN_DIR/a.log" || { grep -a "ktest.tool_window" "$RUN_DIR/a.log"; fail "A: nv.tool did not judge the disk with the window"; }
 loader_from_nvme "$RUN_DIR/a.log"
 if grep -aq "PANIC\|lock.violation" "$RUN_DIR/a.log"; then fail "A: a failure line in the log"; fi
 checks A
+
+# ---- A2 (GP-R3). The Mini-PC since the Lexar move: from the NVMe with no stick at all. block.usb.stick must not
+# wait out a stick that never comes (it waited 40 s, past MCP's deadline): only Linux's settle time once the
+# controllers and usb-msd say done.
+cargo xtask image --name "$NAME" --ktest --config-extra "ktest=block.usb.stick,-block.usb.stick_write,nv.tool;ktest_run=nv/43-boot-nvme,nv/10-nvme;loglevel=info;$KEYS" > "$RUN_DIR/image.out" 2>&1 || { tail -20 "$RUN_DIR/image.out"; fail "image"; }
+esp
+BOOT=nvme-only start "$RUN_DIR/a2.log"
+wait "$QPID" || true
+QPID=""
+grep -aq "KTEST done passed=2 failed=0" "$RUN_DIR/a2.log" || { grep -a "KTEST\|ktest\.\|fat stick\|PANIC" "$RUN_DIR/a2.log" | tail -30; fail "A2: ktests not green"; }
+grep -aq "block ktest.stick boot=nvme usb_disks=0" "$RUN_DIR/a2.log" || { grep -a "ktest.stick" "$RUN_DIR/a2.log"; fail "A2: block.usb.stick did not see an NVMe boot without a USB disk"; }
+W=$(grep -aoE "block ktest.usb_wait boot=nvme waited_ms=[0-9]+ settled=true" "$RUN_DIR/a2.log" | head -1 | sed 's/.*waited_ms=\([0-9]*\).*/\1/')
+[ -n "$W" ] && [ "$W" -lt 5000 ] || { grep -a "ktest.usb_wait" "$RUN_DIR/a2.log"; fail "A2: the USB wait did not end settled within 5 s (waited_ms='$W')"; }
+echo "ok: A2: no stick, block.usb.stick waited $W ms (Linux's settle 1000 ms after the controllers said done)"
+# Its two ktests end before /boot's identity is decided (2 s of quiet after the mount): the loader's lines and the
+# mount on the NVMe say where it came from; A and B check the writable /boot.
+loader_from_nvme_only "$RUN_DIR/a2.log"
+grep -aq "fat stick.mounted disk=nvme0n1p3 .*nvme=true" "$RUN_DIR/a2.log" || fail "A2: /boot is not the NVMe's ESP"
+if grep -aq "PANIC\|lock.violation" "$RUN_DIR/a2.log"; then fail "A2: a failure line in the log"; fi
+checks A2
 
 # ---- B. a generation onto the ESP over MCP, its one try, its confirmation
 cargo xtask image --name "$NAME" --config-extra "token=$BITSOS_TOKEN;mcp_port=8765;loglevel=info;boot_confirm_s=20;sys_keep=2;$KEYS" > "$RUN_DIR/image.out" 2>&1 || { tail -20 "$RUN_DIR/image.out"; fail "image"; }
@@ -161,6 +194,17 @@ for i in $(seq 60); do
     sleep 1
 done
 echo "ok: B: generation 2 installed, tried and confirmed on the NVMe's ESP; /data on the window"
+# GP-R3: round 2's phase A as the remote desk runs it on Windows (collect.mjs --phase A, install.mjs --upload, no
+# --bind, no port opened here), its machine-independent steps: confirmed first, dry run, install, the restart and
+# a new connection, the version lines, the confirmation.
+node host/remote-desk/collect.mjs "127.0.0.1:$FWD" --phase A --bundle "$B" --only A01,A03,A04,A05,A06,A07,A09,A10 \
+    --heartbeat-s 2 --confirm-wait-s 120 --out "$RUN_DIR/phase-a" > "$RUN_DIR/phase-a.txt" 2>&1 || { cat "$RUN_DIR/phase-a.txt"; fail "B: phase A (collect.mjs --phase A --bundle) is not green"; }
+for want in "ok   A03-confirmed" "ok   A05-install-dry" "ok   A06-install" "note A06-install: BitsOS restarted into the new generation" "ok   A10-confirmed"; do
+    grep -qF "$want" "$RUN_DIR/phase-a.txt" || { cat "$RUN_DIR/phase-a.txt"; fail "B: phase A lacks: $want"; }
+done
+grep -q "^upload: KERNEL " "$RUN_DIR/phase-a.txt" 2>/dev/null || grep -q "upload: KERNEL " "$RUN_DIR/phase-a.txt" || { cat "$RUN_DIR/phase-a.txt"; fail "B: phase A did not upload (install.mjs --upload)"; }
+if grep -q "serving the bundle" "$RUN_DIR/phase-a.txt"; then fail "B: phase A opened a server (it must upload)"; fi
+echo "ok: B: phase A installed generation 3 over MCP uploads alone, reconnected after the restart, confirmed"
 stop_own
 grep -a "generation\.chosen\|bitsboot marker\.written\|kexec install\.done\|kexec boot\.confirmed\|fat stick\.decided\|block window\.boot_opened" "$RUN_DIR/b.log" | cut -c1-200
 if grep -aq "PANIC\|lock.violation" "$RUN_DIR/b.log"; then fail "B: a failure line in the log"; fi
@@ -168,9 +212,11 @@ if grep -aq "PANIC\|lock.violation" "$RUN_DIR/b.log"; then fail "B: a failure li
 checks B
 F="$RUN_DIR/esp.now"
 SYS=$(mdir -b -i "$F" ::/BITSOS2/SYS | tr -d '\r' | sed 's#/$##; s#.*/##' | grep -v '^$' | sort | tr '\n' ' ')
-[ "$SYS" = "1 2 " ] || fail "B: SYS is not 1 2: $SYS"
-mdir -b -i "$F" ::/BITSOS2/SYS/2 | grep -q "/OK$" || fail "B: SYS\\2\\OK missing"
-mtype -i "$F" ::/BITSOS2/SYS/2/KERNEL | cmp -s - "$B/KERNEL" || fail "B: SYS\\2\\KERNEL is not the bundle's"
+[ "$SYS" = "2 3 " ] || fail "B: SYS is not 2 3 (sys_keep=2 after phase A's generation 3): $SYS"
+for g in 2 3; do
+    mdir -b -i "$F" ::/BITSOS2/SYS/$g | grep -q "/OK$" || fail "B: SYS\\$g\\OK missing"
+    mtype -i "$F" ::/BITSOS2/SYS/$g/KERNEL | cmp -s - "$B/KERNEL" || fail "B: SYS\\$g\\KERNEL is not the bundle's"
+done
 rm -f "$F"
 
 # ---- C, D. a broken rule: /boot on the ESP read-only, no boot window at either layer, nothing outside written

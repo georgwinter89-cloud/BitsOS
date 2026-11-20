@@ -11,6 +11,7 @@
 use crate::guard;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -61,14 +62,51 @@ impl Paths {
         self.fallback.join("PENDING")
     }
 
+    /// The kernel's line on the data volume beside the socket (`/run/bitsos/data-state`, crates/fs-ext4/src/data.rs
+    /// `describe`), in RAM: reading it never waits for the stick.
+    pub fn data_state(&self) -> PathBuf {
+        self.socket.parent().map_or_else(|| PathBuf::from("data-state"), |d| d.join("data-state"))
+    }
+
+    /// GP-START: the kernel is making `\BITSOS2\data.img` on this stick (`creating`): a big write of the system's own
+    /// that keeps every other stick access waiting, so a slow answer then is no hang.
+    pub fn stick_busy(&self) -> bool {
+        fs::read_to_string(self.data_state()).is_ok_and(|t| t.split_whitespace().next() == Some("creating"))
+    }
+
     /// Whether the stick's settings directory can be used: `\BITSOS2\` exists and the directory exists or can be
     /// made. Err is the reason (ENODEV without a stick, EROFS read-only, ...).
     pub fn probe_stick(&self) -> Result<(), String> {
         if !self.stick.is_dir() {
             return Err(format!("{} missing (no stick)", self.stick.display()));
         }
-        fs::create_dir_all(self.stick.join("settings")).map_err(|e| format!("{}: {e}", self.stick.display()))
+        private_dir(&self.stick.join("settings")).map_err(|e| format!("{}: {e}", self.stick.display()))
     }
+}
+
+/// Files hold secrets in clear (provider keys), so only settingsd's own user gets at them where the file
+/// system keeps modes: the fallback, a test's directory. The stick's FAT shows fixed modes per folder
+/// (`crates/fs-fat/src/protect.rs`) and refuses the chmod; what it shows is reported at load (`sync.rs`).
+pub const FILE_MODE: u32 = 0o600;
+pub const DIR_MODE: u32 = 0o700;
+
+/// Makes `dir` (parents with the usual modes) for settingsd alone; an existing one is tightened when the file
+/// system lets it.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(up) = dir.parent() {
+        fs::create_dir_all(up)?;
+    }
+    match fs::DirBuilder::new().mode(DIR_MODE).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE));
+    Ok(())
+}
+
+/// What others (group and everyone) may do with `p`, as the file system shows it: 0 when it is settingsd's alone.
+pub fn open_bits(p: &Path) -> Option<u32> {
+    fs::metadata(p).ok().map(|m| m.permissions().mode() & 0o077)
 }
 
 #[derive(Clone, Debug)]
@@ -105,7 +143,7 @@ pub fn write_atomic(p: &Path, b: &[u8]) -> Result<(), String> {
     let mut tmp = p.as_os_str().to_owned();
     tmp.push(".new");
     let tmp = PathBuf::from(tmp);
-    let mut f = fs::File::create(&tmp).map_err(err)?;
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(FILE_MODE).open(&tmp).map_err(err)?;
     f.write_all(b).map_err(err)?;
     f.sync_all().map_err(err)?;
     drop(f);
@@ -120,7 +158,7 @@ fn append(p: &Path, b: &[u8]) -> Result<(), String> {
     if let Some(d) = p.parent() {
         fs::create_dir_all(d).map_err(err)?;
     }
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(p).map_err(err)?;
+    let mut f = fs::OpenOptions::new().create(true).append(true).mode(FILE_MODE).open(p).map_err(err)?;
     f.write_all(b).map_err(err)?;
     f.sync_data().map_err(err)
 }
@@ -166,6 +204,8 @@ pub struct Writer {
 
 /// Prefix of the error a call gives when its deadline passed.
 pub const SLOW: &str = "slow: ";
+/// Prefix of the fallback's reason when the deadline passed while the stick was busy making the data volume.
+pub const BUSY: &str = "busy: ";
 
 impl Writer {
     pub fn new(deadline: Duration) -> Writer {
@@ -225,6 +265,10 @@ pub struct RawPlace {
     pub files: Vec<(PathBuf, Result<String, String>)>,
     pub config: Result<String, String>,
     pub journal: String,
+    /// `owners.list` (`owners.rs`).
+    pub owners: String,
+    /// What others may do in the directory and with the files in it (the widest seen); None: nothing there.
+    pub open_bits: Option<u32>,
     /// `*.new` leftovers of an interrupted or abandoned write that were removed.
     pub cleaned: Vec<PathBuf>,
 }
@@ -241,7 +285,8 @@ pub fn read_raw(paths: &Paths, place: &Place) -> RawPlace {
                 .map(|e| e.path())
                 .filter(|p| {
                     let n = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-                    n.ends_with(".toml.new") || n == "journal.log.new" || n == "pending.new" || n == "config.txt.new"
+                    n.ends_with(".toml.new")
+                        || ["journal.log.new", "pending.new", "config.txt.new", "owners.list.new"].contains(&n.as_str())
                 })
                 .collect()
         })
@@ -263,6 +308,7 @@ pub fn read_raw(paths: &Paths, place: &Place) -> RawPlace {
         })
         .unwrap_or_default();
     names.sort();
+    let open_bits = names.iter().chain([&dir]).filter_map(|p| open_bits(p)).reduce(|a, b| a | b);
     let files = names.into_iter().map(|p| {
         let t = read_text(&p);
         (p, t)
@@ -271,12 +317,14 @@ pub fn read_raw(paths: &Paths, place: &Place) -> RawPlace {
         files: files.collect(),
         config: read_text(&config),
         journal: read_text(&dir.join("journal.log")).unwrap_or_default(),
+        owners: read_text(&dir.join(crate::owners::FILE)).unwrap_or_default(),
+        open_bits,
         cleaned,
     }
 }
 
 /// Writes one sysfs attribute: open without O_CREAT/O_TRUNC (an attribute is never made by a writer) and one
-/// write of the whole value (linux-6.6/fs/kernfs/file.c kernfs_fop_write_iter takes it at offset 0).
+/// write of the whole value (linux-7.3.1/fs/kernfs/file.c:304 kernfs_fop_write_iter takes it at offset 0).
 /// Ok(false): there is no such attribute (the kernel does not offer the key at run time).
 pub fn write_attr(p: &Path, text: &str) -> Result<bool, std::io::Error> {
     let mut f = match fs::OpenOptions::new().write(true).open(p) {

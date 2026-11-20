@@ -127,6 +127,7 @@ fn run(ram: Vec<(u64, u64)>, sections: Option<KernelSections>, source: &'static 
     }
     // One-shot in hal; a second run (after a failed first one) finds the same pair installed.
     let _ = paging::set_table_frames(mm_core::alloc_table_frame, mm_core::free_table_frame);
+    paging::set_batch_frames(mm_core::gather_batch_frame, mm_core::free_table_frame);
     // The direct map has room for [0, VMAP_BASE - DIRECT_MAP_BASE) only; RAM beyond it stays unmapped, but
     // still counts as RAM for the vmap allocator's refusal.
     let (direct, dropped) = kmap::clamp_ranges(&ram, VMAP_BASE - DIRECT_MAP_BASE);

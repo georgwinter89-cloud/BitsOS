@@ -1,4 +1,4 @@
-//! siginfo: the 48-byte kernel record, its union layouts and signalfd's record (linux-6.6/kernel/signal.c,
+//! siginfo: the 48-byte kernel record, its union layouts and signalfd's record (linux-7.3.1/kernel/signal.c,
 //! fs/signalfd.c).
 
 use super::{SYNCHRONOUS_MASK, bit_checked};

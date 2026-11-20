@@ -1,5 +1,5 @@
 //! The panic path (RB-2, spec/core.md §10.2-10.3): what the kernel's panic handler calls once it has made sure
-//! only one CPU reports (`kernel/src/main.rs`, change request in plan/notes/rb-RB-2.md).
+//! only one CPU reports (`kernel/src/main.rs`).
 //!
 //! `report(info)`, in this order, never allocating (the heap is in emergency mode) and never waiting for a lock:
 //! 1. the panic line (`kernel panic`, as before);
@@ -17,11 +17,17 @@
 //! Every line goes out through `klog::try_event!` (ring, serial, screen, the mirror's emergency path) and
 //! `klog::flush_emergency()` after each block, so the Gaming-PC's listener gets it (the Mini-PC has no COM1).
 //!
+//! CRASHDISK: the same report also goes into a slot on the boot ESP (`disk`), written at the end by the NVMe
+//! driver's polled writer, so a cold reset does not lose it; there it has room for every CPU's frames and
+//! registers, the panics of other CPUs that came meanwhile (`again`), the memory counters and many more log lines.
+//!
 //! At boot (`init`, a Core initcall): the CONFIG keys, the crash page (registers it with hal, logs and marks the
 //! previous record, reads and writes the boot marker that shows whether RAM survived the reset), the NMI slots,
 //! and the symbol table.
 
+mod again;
 mod clean;
+pub mod disk;
 pub mod record;
 pub mod symbols;
 pub mod text;
@@ -41,6 +47,7 @@ use record::{Header, Marker, MarkerFound, flags};
 use symbols::Symbols;
 use text::{Buf, OneLine};
 
+pub use again::{hang_panic, note as note_again};
 pub use clean::{set_sound_hook, set_watchdog_hook, watchdog_secs, SoundHook, Watchdog, WatchdogHook, WATCHDOG_MARGIN_S};
 
 // ---------------------------------------------------------------------------------------------------------
@@ -240,7 +247,7 @@ fn hex16(id: &[u8; 16]) -> Buf<32> {
     b
 }
 
-fn my_boot_id() -> [u8; 16] {
+pub(crate) fn my_boot_id() -> [u8; 16] {
     boot::boot_info().and_then(|(bi, _)| bi.boot_id()).unwrap_or([0; 16])
 }
 
@@ -574,7 +581,7 @@ fn panic_hz() -> u64 {
 }
 
 /// Nanoseconds on the TSC, for waits in the panic path (`time::now_ns` is 0 before the clock exists). Never blocks.
-fn clock() -> u64 {
+pub(crate) fn clock() -> u64 {
     ((hal::cpu::rdtsc() as u128 * 1_000_000_000) / panic_hz() as u128) as u64
 }
 
@@ -635,26 +642,36 @@ pub fn settle_with(steps: &mut [Step], n: usize, offset_of: Option<&dyn Fn(u64) 
 /// The record's line when the panic path found the ring busy; `ktests::log_tail_told` takes it as the log's answer.
 pub(crate) const LOG_BUSY: &str = "(log ring busy)";
 
-/// Streams body lines into the crash page.
+/// Streams body lines into the crash page and (CRASHDISK) the disk record's buffer.
 struct Page {
     off: u64,
     limit: u64,
     end: u64,
     on: bool,
     cut: bool,
+    disk: disk::sink::Sink,
 }
 
 impl Page {
     fn open() -> Page {
+        let disk = disk::sink::Sink::open();
         match hal::panic::crash_page() {
             Some((_, len)) if len as usize >= record::MIN_PAGE => {
                 let end = (record::HEADER + record::body_capacity(len as usize)) as u64;
-                Page { off: record::HEADER as u64, limit: end.saturating_sub(LOG_RESERVE as u64), end, on: true, cut: false }
+                Page { off: record::HEADER as u64, limit: end.saturating_sub(LOG_RESERVE as u64), end, on: true, cut: false, disk }
             }
-            _ => Page { off: 0, limit: 0, end: 0, on: false, cut: false },
+            _ => Page { off: 0, limit: 0, end: 0, on: false, cut: false, disk },
         }
     }
+    /// A line for the disk record only (the RAM page has no room for it).
+    fn disk_line(&mut self, s: &str) {
+        self.disk.line(s);
+    }
     fn line(&mut self, s: &str) {
+        self.disk.line(s);
+        self.ram_line(s);
+    }
+    fn ram_line(&mut self, s: &str) {
         if !self.on {
             return;
         }
@@ -668,11 +685,12 @@ impl Page {
         self.off += n;
     }
     fn log_tail(&mut self, before_seq: u64) -> usize {
+        self.disk.log_tail(before_seq);
         if !self.on {
             return 0;
         }
         self.limit = self.end;
-        self.line("log:");
+        self.ram_line("log:");
         let room = (self.end - self.off) as usize;
         let mut buf = [0u8; LOG_BUF];
         let take = room.min(LOG_BUF);
@@ -683,7 +701,7 @@ impl Page {
                 n
             }
             None => {
-                self.line(LOG_BUSY);
+                self.ram_line(LOG_BUSY);
                 0
             }
         }
@@ -817,7 +835,7 @@ fn print_rest(page: &mut Page, cpu: usize, rbp: u64, raw: usize, printed: usize)
 }
 
 fn step_line(page: &mut Page, cpu: usize, i: usize, s: Step) {
-    step_line_to(Some(page), cpu, i, s);
+    step_line_to(Some(page), false, cpu, i, s);
 }
 
 /// One backtrace step as an event, and as a record line when `page` is given.
@@ -835,7 +853,8 @@ fn step_again(cpu: usize, i: usize, s: Step) {
     }
 }
 
-fn step_line_to(page: Option<&mut Page>, cpu: usize, i: usize, s: Step) {
+/// `disk_only`: the line goes into the disk record only (another CPU's frames: the RAM page has no room).
+fn step_line_to(page: Option<&mut Page>, disk_only: bool, cpu: usize, i: usize, s: Step) {
     let mut l = Buf::<320>::new();
     match s {
         Step::None => return,
@@ -861,8 +880,14 @@ fn step_line_to(page: Option<&mut Page>, cpu: usize, i: usize, s: Step) {
             }
         }
     }
-    if let Some(p) = page {
-        p.line(l.as_str());
+    match page {
+        Some(p) if disk_only => {
+            let mut d = Buf::<340>::new();
+            let _ = write!(d, " cpu {cpu}{}", l.as_str());
+            p.disk_line(d.as_str());
+        }
+        Some(p) => p.line(l.as_str()),
+        None => {}
     }
 }
 
@@ -945,9 +970,14 @@ fn other_cpu(page: &mut Page, c: usize, seen: &mut [(u32, usize); SEEN], nseen: 
         r14 = klog::Hex(f.r14),
         r15 = klog::Hex(f.r15)
     );
+    // CRASHDISK: the disk record gets the registers and every frame too.
+    let mut d = Buf::<480>::new();
+    let _ = write!(d, "cpu {c} regs: rip {:x} rsp {:x} rbp {:x} rflags {:x} cr2 {:x} cr3 {:x} rax {:x} rbx {:x} rcx {:x} rdx {:x} rsi {:x} rdi {:x} r8 {:x} r9 {:x} r10 {:x} r11 {:x} r12 {:x} r13 {:x} r14 {:x} r15 {:x}",
+        f.rip, f.rsp, f.rbp, f.rflags, r.cr2, r.cr3, f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15);
+    page.disk_line(d.as_str());
     // The log and the mirror get every frame; the step 0 is the interrupted instruction (on the line above).
     for (i, s) in r.steps[..r.nsteps].iter().enumerate().skip(1) {
-        step_line_to(None, c, i, *s);
+        step_line_to(Some(page), true, c, i, *s);
     }
     // The record: one line per CPU, the place and the first callers, or "like cpu N" for a place seen already.
     let sig = signature(&r);
@@ -1061,12 +1091,29 @@ pub fn report(info: &core::panic::PanicInfo<'_>) -> ! {
         klog::flush_emergency();
     }
 
+    // CRASHDISK: panics of other CPUs meanwhile, then the memory counters (as last sampled).
+    let others = again::lines(&mut |l| {
+        klog::try_event!(Error, "crash", "again"; "{l}");
+        page.line(l);
+    });
+    if others > 0 {
+        l.clear();
+        let _ = write!(l, "again: {others} panic(s) on other CPUs while this one reported");
+        page.line(l.as_str());
+    }
+    l.clear();
+    disk::sink::memory_line(&mut l, up, true);
+    page.disk_line(l.as_str());
+    l.clear();
+    disk::sink::memory_line(&mut l, up, false);
+    page.ram_line(l.as_str());
+
     // 5. The record.
     page.log_tail(seq0);
     let (bi, _) = boot::boot_info().unzip();
     let h = Header {
         body_len: 0,
-        flags: if exception { flags::EXCEPTION } else { 0 },
+        flags: if exception { flags::EXCEPTION } else { 0 } | if again::hang(me) { disk::format::flags::HANG } else { 0 },
         boot_id: my_boot_id(),
         time_ns: up,
         reload: bi.and_then(|b| b.reload()).map_or(0, |r| r.counter),
@@ -1084,6 +1131,36 @@ pub fn report(info: &core::panic::PanicInfo<'_>) -> ! {
             klog::try_event!(Warn, "crash", "record.none"; "no crash page: nothing kept for the next boot");
         }
     }
+    // CRASHDISK: the disk copy, which survives a cold reset.
+    let mut dflags = if exception { disk::format::flags::EXCEPTION } else { 0 };
+    if again::hang(me) {
+        dflags |= disk::format::flags::HANG;
+    }
+    if page.cut {
+        dflags |= disk::format::flags::RAM_CUT;
+    }
+    let dh = disk::format::Head {
+        flags: dflags,
+        boot_id: h.boot_id,
+        time_ns: up,
+        wall_s: disk::sink::wall_at(up),
+        generation: h.generation,
+        reload: h.reload,
+        cpu: h.cpu,
+        cpus_asked: h.cpus_asked,
+        cpus_answered: h.cpus_answered,
+        ..disk::format::Head::default()
+    };
+    match page.disk.commit(dh, &clock) {
+        Ok((slot, seq, bytes, ms)) => {
+            klog::try_event!(Error, "crash", "disk.written", slot = slot, seq = seq, bytes = bytes, ms = ms, cut = page.disk.cut;
+                "kept on the boot ESP (\\BITSOS2\\CRASH\\SLOTS.BIN) for the next boot, also after a cold reset");
+        }
+        Err((why, status)) => {
+            klog::try_event!(Error, "crash", "disk.not_written", status = klog::Hex(status as u64); "no disk copy: {why}");
+        }
+    }
+    klog::flush_emergency();
     // The other CPUs' backtraces push the panic line and this CPU's frames off a 1440p console; repeat both last so
     // a photo of the screen shows where the panic happened (the Mini-PC clears RAM on reset, so the record above is
     // often lost). The record has the frames already: console and log only, as `frame.again` so the frames are

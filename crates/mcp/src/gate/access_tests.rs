@@ -40,11 +40,11 @@ fn pin(_: &ToolContext, _: &Json) -> ToolResult {
 }
 
 static TOOLS: [ToolEntry; 5] = [
-    ToolEntry { name: "hw_info", description: "Facts.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, handler: facts },
-    ToolEntry { name: "read_phys", description: "Raw.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, handler: raw },
-    ToolEntry { name: "run", description: "Run.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Change, handler: raw },
-    ToolEntry { name: "write_file", description: "Write.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::DeleteOverwrite, handler: raw },
-    ToolEntry { name: "system_pin", description: "Pin.", input_schema: r#"{"type":"object"}"#, owner: "RB", safety: Safety::Change, handler: pin },
+    ToolEntry { name: "hw_info", description: "Facts.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, local: false, handler: facts },
+    ToolEntry { name: "read_phys", description: "Raw.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, local: false, handler: raw },
+    ToolEntry { name: "run", description: "Run.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Change, local: false, handler: raw },
+    ToolEntry { name: "write_file", description: "Write.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::DeleteOverwrite, local: false, handler: raw },
+    ToolEntry { name: "system_pin", description: "Pin.", input_schema: r#"{"type":"object"}"#, owner: "RB", safety: Safety::Change, local: false, handler: pin },
 ];
 
 fn the_installer() -> Result<u32, String> {
@@ -283,4 +283,18 @@ fn the_nvme_sink_follows_the_last_table_under_concurrency() {
         let want = if t.live(&a()) { 3600 * 1_000_000_000u64 } else { 0 };
         assert_eq!((TOLD_RACE.load(Ordering::SeqCst), t.nvme_told()), (want, want), "round {round}");
     }
+}
+
+#[test]
+fn a_service_tool_learns_full_access_only_for_a_granted_call() {
+    let svc = Tool::Service(Arc::new(crate::svc::SvcTool::test("ui_list")));
+    let line = |full: bool| match tool_for_run(&svc, full) {
+        Tool::Service(t) => crate::svc::proto::call_line(1, &t.name, &Json::Obj(Vec::new()), 100, None, t.full_access),
+        Tool::Static(_) => panic!("a service tool stays one"),
+    };
+    let meta = |l: String| Json::parse(l.trim_end()).unwrap().get("params").and_then(|p| p.get("_meta")).and_then(|m| m.get("access")).and_then(Json::as_str).map(String::from);
+    assert_eq!(meta(line(true)), Some(String::from("full")), "a client with a live grant");
+    assert_eq!(meta(line(false)), None, "a token-only or narrow client");
+    let Tool::Service(t) = &svc else { unreachable!() };
+    assert!(!t.full_access, "the registered tool itself is never marked");
 }

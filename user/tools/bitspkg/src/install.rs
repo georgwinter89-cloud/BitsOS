@@ -9,6 +9,7 @@ use crate::names::{check_name, check_version};
 use crate::store::{Lock, Store, read_manifest_text};
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +30,40 @@ pub struct Report {
     pub shared: usize,
     /// Hooks (settings, rules, actions) that failed after the commit; `bitspkg register` repeats them.
     pub hooks_failed: usize,
+}
+
+/// Gives a root-owned data folder and the root-owned entries in it to `uid`, never following a symlink (lchown,
+/// no descent into links); entries of other owners stay. A failure is counted, not fatal: bitsrun then refuses the
+/// folder with the chown line to type. Returns (given, failed).
+///
+/// The walk goes only into folders that are still root's and gives a folder away only after its contents
+/// (post-order): while a path is looked at, every folder above it is root's, so the program (uid, which owns
+/// what it made in there) cannot swap a folder on the way for a link to /etc between the check and the chown.
+fn give_to(top: &Path, uid: u32) -> (usize, usize) {
+    let (mut given, mut failed) = (0, 0);
+    let mut todo = vec![(top.to_path_buf(), false)];
+    while let Some((p, walked)) = todo.pop() {
+        let Ok(md) = fs::symlink_metadata(&p) else {
+            failed += 1;
+            continue;
+        };
+        if md.uid() != 0 {
+            continue;
+        }
+        if md.is_dir() && !walked {
+            todo.push((p.clone(), true));
+            match fs::read_dir(&p) {
+                Ok(rd) => todo.extend(rd.flatten().map(|e| (e.path(), false))),
+                Err(_) => failed += 1,
+            }
+            continue;
+        }
+        match std::os::unix::fs::lchown(&p, Some(uid), Some(uid)) {
+            Ok(()) => given += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    (given, failed)
 }
 
 /// Errnos after which hard links are given up for this install: EPERM, EXDEV, EMLINK, ENOSYS, EOPNOTSUPP.
@@ -170,10 +205,29 @@ pub(crate) fn install_locked(st: &Store, _lock: &Lock, src: &Path) -> Result<Rep
         }
         return Err(e);
     }
-    rep.program_id = st.ensure_id(&m.name)?;
+    let (id, previous, failed) = commit(st, &rep.manifest)?;
+    (rep.program_id, rep.previous, rep.hooks_failed) = (id, previous, failed);
+    Ok(rep)
+}
+
+/// After the version folder is in place: ProgramId, data folder, `current` (the commit point), then the clean-up
+/// (old versions, unused store files and `.pkgs` entries) and the hooks. Returns (id, old current, hooks failed).
+/// Also PK-6d's (repo/apply.rs), under the same lock.
+pub(crate) fn commit(st: &Store, m: &Manifest) -> Result<(u64, Option<String>, usize), String> {
+    let id = st.ensure_id(&m.name)?;
     fsx::mkdir(&st.data, 0o755)?;
-    fsx::mkdir(&st.data_dir(&m.name), 0o700)?;
-    rep.previous = make_current(st, &m.name, &m.version)?;
+    let data = st.data_dir(&m.name);
+    fsx::mkdir(&data, 0o700)?;
+    // PACKAGES.md 8 (PK-3): the data folder belongs to the program's uid. bitsrun never runs as root and cannot
+    // give it away, so a root install does it (also for a folder an older install or a cut left to root).
+    let root_owned = fs::symlink_metadata(&data).map(|md| md.is_dir() && md.uid() == 0).unwrap_or(false);
+    if root_owned && usys::geteuid() == Ok(0) {
+        let (given, failed) = give_to(&data, crate::clean::PROGRAM_UID);
+        eprintln!("bitspkg: event=data.owner path={} uid={} given={given} failed={failed}", data.display(), crate::clean::PROGRAM_UID);
+    }
+    step("before switch");
+    let previous = make_current(st, &m.name, &m.version)?;
+    step("after switch");
     // The other versions' manifests before gc removes some: their keys may have to be taken back.
     let others = other_manifests(st, &m.name, &m.version);
     // Past the commit point (`current` switched): clean-up failures are events, the install stands.
@@ -184,8 +238,8 @@ pub(crate) fn install_locked(st: &Store, _lock: &Lock, src: &Path) -> Result<Rep
     let (gone, kept): (Vec<_>, Vec<_>) = others.into_iter().partition(|(v, _)| gone.contains(v));
     st.gc_content_after_commit();
     let strip = |l: Vec<(String, Manifest)>| l.into_iter().map(|(_, m)| m).collect::<Vec<_>>();
-    rep.hooks_failed = st.hooks.install(&rep.manifest, &strip(kept), &strip(gone));
-    Ok(rep)
+    let failed = st.hooks.install(m, &strip(kept), &strip(gone));
+    Ok((id, previous, failed))
 }
 
 fn build_version(st: &Store, src: &Path, m: &Manifest, vdir: &Path, copied: &mut usize, shared: &mut usize) -> Result<(), String> {
@@ -350,4 +404,27 @@ pub fn rollback(st: &Store, name: &str) -> Result<(String, String, usize), Strin
     }
     let failed = sync(st, name, &prev);
     Ok((cur, prev, failed))
+}
+
+#[cfg(test)]
+mod give_to_tests {
+    use super::give_to;
+    use std::fs;
+
+    /// As a user nothing in a folder of one's own is root's, so nothing is touched; as root the folder, the two
+    /// entries and the link itself are given away. Never through the link: / stays root's.
+    #[test]
+    fn touches_only_root_owned_entries_and_never_follows_links() {
+        use std::os::unix::fs::MetadataExt;
+        let root = usys::geteuid() == Ok(0);
+        let d = std::env::temp_dir().join(format!("bitspkg-give-to-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("profile/cache")).unwrap();
+        fs::write(d.join("profile/cache/a"), "x").unwrap();
+        std::os::unix::fs::symlink("/", d.join("profile/root-link")).unwrap();
+        assert_eq!(give_to(&d, 1000), if root { (5, 0) } else { (0, 0) });
+        assert_eq!(fs::symlink_metadata(d.join("profile/cache/a")).unwrap().uid(), if root { 1000 } else { usys::geteuid().unwrap() as u32 });
+        assert_eq!(fs::metadata("/").unwrap().uid(), 0);
+        fs::remove_dir_all(&d).unwrap();
+    }
 }

@@ -121,6 +121,11 @@ impl Symbols {
         core::str::from_utf8(&self.names[s..e]).unwrap_or("?")
     }
 
+    /// SELFOPT-1: symbol `i` (address order): its address and name, for `/proc/kallsyms`.
+    pub fn get(&self, i: usize) -> Option<(u64, &str)> {
+        (i < self.len()).then(|| (self.addrs[i], self.name(i)))
+    }
+
     /// The function containing `addr`: its name and `addr`'s offset into it. No allocation.
     pub fn lookup(&self, addr: u64) -> Option<(&str, u64)> {
         let i = self.addrs.partition_point(|&a| a <= addr).checked_sub(1)?;

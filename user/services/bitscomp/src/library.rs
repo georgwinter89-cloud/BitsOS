@@ -1,7 +1,8 @@
-//! PK-L1a: the program library's index (plan/notes/desk-PK67-plan.md §3): every program BitsOS can start, from
+//! PK-L1a: the program library's index (plan/spec/program-library.md section 5): every program BitsOS can start, from
 //! three sources in this order of precedence for one id: packages (`/apps/<prog>/current`, read through the
 //! program's own root tree, D8), stick launchers (`/boot/BITSOS2/bin/*.desktop`, an entry only while its launcher
-//! is there and executable) and the built-in ones (Terminal, Einstellungen). It knows nothing of the views that show
+//! is there and executable) and the built-in ones (Terminal, Einstellungen); GM-6b adds a fourth, Steam's installed
+//! games (library_steam.rs, through steamlib; sofa-mode.md 3.1, shown by both views). It knows nothing of the views that show
 //! it (the library overlay, PK-L1b; the sofa mode, GM-6: D9). Scans and icon decoding run on a thread of their own
 //! (B4); inotify on the folders asks for a new scan, and the main loop swaps the new index in one step.
 
@@ -36,6 +37,8 @@ pub enum Source {
     Builtin,
     Stick,
     Package(String),
+    /// GM-6b: one of Steam's installed games (library_steam.rs), with what the sofa mode shows of it.
+    Steam(crate::library_steam::Steam),
 }
 
 impl Source {
@@ -44,6 +47,7 @@ impl Source {
             Source::Builtin => "builtin".into(),
             Source::Stick => "stick".into(),
             Source::Package(p) => format!("package:{p}"),
+            Source::Steam(g) => if g.proton { "steam:proton".into() } else { "steam".into() },
         }
     }
 }
@@ -119,6 +123,12 @@ impl Entry {
                     _ => "",
                 },
                 "flatpak" => words.skip_while(|s| *s == "run" || s.starts_with('-')).next().map_or("", specific),
+                // A package: `bitsrun --exec PROG NAME` is PROG, `bitsrun NAME` the package.
+                "bitsrun" => match (words.next(), words.next()) {
+                    (Some("--exec"), Some(p)) => specific(base(p)),
+                    (Some(n), _) if !n.starts_with('-') => specific(n),
+                    _ => "",
+                },
                 _ => specific(name),
             };
         }
@@ -151,6 +161,10 @@ impl Entry {
     pub fn owns(&self, app_id: &str) -> bool {
         let id = app_id.trim();
         let same = |s: &str| !s.is_empty() && s.eq_ignore_ascii_case(id);
+        // GM-6b: a Steam game's Exec starts `steam`: Steam's own windows are not the game's (only its X11 class is).
+        if matches!(self.source, Source::Steam(_)) {
+            return crate::minimize::launches(&self.address, id) || same(&self.wm_class);
+        }
         crate::minimize::launches(&self.address, id) || same(&self.wm_class) || same(self.program_name())
     }
 }
@@ -282,23 +296,33 @@ fn builtin() -> Vec<Entry> {
         base("terminal", "Terminal", "Befehlszeile", &["foot", "shell", "konsole"],
             crate::terminal::TERMINAL.iter().map(|s| s.to_string()).collect(), "programm/terminal", "foot"),
         base("einstellungen", "Einstellungen", "Einstellungen", &["settings", "optionen", "aussehen"], Vec::new(), "einstellungen", ""),
+        // GM-6a: the sofa mode (sofa-mode.md §5), opened by its address like Einstellungen.
+        base("sofa-modus", "Sofa-Modus", "Fernseher und Gamepad", &["sofa", "tv", "gamepad", "big picture"], Vec::new(), crate::address::SOFA, ""),
+        // SYS-A: the program "System" (overview, measurements, task manager), opened by its address.
+        base("system", "System", "Systemübersicht und Taskmanager", &["taskmanager", "prozesse", "leistung", "systemmonitor", "geräte"], Vec::new(), crate::sys_view::ADDRESS, crate::sys_view::APP_ID),
     ]
 }
 
-/// Where the sources are (tests and the headless scenario point them at fake folders).
+/// Where the sources are (tests point them at fake folders).
 #[derive(Clone, Debug)]
 pub struct Roots {
     pub bin: PathBuf,
     pub apps: PathBuf,
     /// The PATH `TryExec` is looked up in.
     pub path: String,
+    /// GM-6b: Steam's root (None: no Steam source).
+    pub steam: Option<PathBuf>,
 }
 
 impl Roots {
-    /// The real places, or `BITSCOMP_LIBRARY_BIN` / `BITSCOMP_LIBRARY_APPS` (the scenario's fakes).
-    pub fn from_env() -> Roots {
-        let var = |k: &str, d: &str| std::env::var_os(k).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(d));
-        Roots { bin: var("BITSCOMP_LIBRARY_BIN", STICK_BIN), apps: var("BITSCOMP_LIBRARY_APPS", APPS), path: std::env::var("PATH").unwrap_or_default() }
+    /// The real places.
+    pub fn system() -> Roots {
+        Roots {
+            bin: PathBuf::from(STICK_BIN),
+            apps: PathBuf::from(APPS),
+            path: std::env::var("PATH").unwrap_or_default(),
+            steam: Some(PathBuf::from(steamlib::STEAM_ROOT)),
+        }
     }
 }
 
@@ -319,6 +343,7 @@ fn rank(s: &Source) -> u8 {
         Source::Package(_) => 0,
         Source::Stick => 1,
         Source::Builtin => 2,
+        Source::Steam(_) => 3,
     }
 }
 
@@ -408,7 +433,7 @@ pub fn find_icon(icon: &str, abs_root: Option<&Path>, themes: &[PathBuf], pixmap
     })
 }
 
-/// Builds the index: packages, stick launchers, built-in; a later source's id that an earlier one has is dropped.
+/// Builds the index: packages, stick launchers, built-in, Steam's games; a later source's id that an earlier one has is dropped.
 /// `exe` says whether a file is an executable (spawn.rs's `executable`; tests pass their own).
 pub fn scan(roots: &Roots, exe: &dyn Fn(&Path) -> bool) -> Scan {
     let mut s = Scan::default();
@@ -418,6 +443,11 @@ pub fn scan(roots: &Roots, exe: &dyn Fn(&Path) -> bool) -> Scan {
     s.dirs.push(roots.bin.clone());
     stick(roots, exe, &mut all, &mut s);
     all.extend(builtin());
+    if let Some(root) = &roots.steam {
+        // The games start through the Steam launcher the stick entry runs (`/bin/sh .../steam`), else `steam`.
+        let launcher = all.iter().find(|e| e.id == "steam" && !e.exec.is_empty()).map_or_else(|| vec!["steam".to_string()], |e| e.exec.clone());
+        all.extend(crate::library_steam::entries(root, &launcher, &mut s));
+    }
     let mut seen: HashMap<String, Source> = HashMap::new();
     for e in all {
         if let Some((_, by)) = s.hidden.iter().find(|(id, by)| *id == e.id && rank(by) < rank(&e.source)) {
@@ -532,6 +562,7 @@ fn packages(roots: &Roots, exe: &dyn Fn(&Path) -> bool, out: &mut Vec<Entry>, s:
         let mut any = false;
         for p in files_with(&share.join("applications"), "desktop") {
             let Some((id, d)) = read_entry(&p, &Source::Package(pkg.clone()), s) else { continue };
+            let id = crate::library_twin::package_id(id);
             let Some(prog) = in_root(&root, &d.exec[0], exe) else {
                 s.notes.push(format!("{}: left out: {} is not in the package", p.display(), d.exec[0]));
                 continue;
@@ -540,7 +571,10 @@ fn packages(roots: &Roots, exe: &dyn Fn(&Path) -> bool, out: &mut Vec<Entry>, s:
                 s.notes.push(format!("{}: left out: TryExec {} not in the package", p.display(), d.try_exec));
                 continue;
             }
-            let mut exec = vec![prog.to_string_lossy().into_owned()];
+            // In its own view (bitsrun, PK-3): there the tree is /usr and /opt, as the program's scripts and
+            // libraries expect (CachyOS's brave starts /opt/brave-bin/brave; started directly it was not found).
+            let in_view = prog.strip_prefix(&root).map(|r| format!("/{}", r.to_string_lossy())).unwrap_or_default();
+            let mut exec = vec![BITSRUN.to_string(), "--exec".into(), in_view, pkg.clone()];
             exec.extend(d.exec[1..].iter().cloned());
             let icon = find_icon(&d.icon, Some(&root), &[share.join("icons")], &[share.join("pixmaps")]);
             out.push(entry_of(id, d, exec, Source::Package(pkg.clone()), icon));
@@ -550,7 +584,7 @@ fn packages(roots: &Roots, exe: &dyn Fn(&Path) -> bool, out: &mut Vec<Entry>, s:
             let p = cur.join(&prog);
             if exe(&p) && !prog.starts_with('/') && !prog.split('/').any(|c| c == "..") {
                 let d = desktop_entry::DesktopEntry { name: capitalised(&pkg), ..Default::default() };
-                out.push(entry_of(pkg.clone(), d, vec![p.to_string_lossy().into_owned()], Source::Package(pkg.clone()), Err("no .desktop file".into())));
+                out.push(entry_of(pkg.clone(), d, vec![BITSRUN.to_string(), pkg.clone()], Source::Package(pkg.clone()), Err("no .desktop file".into())));
             } else {
                 s.notes.push(format!("{}: left out: program {prog} is not an executable of the package", cur.display()));
             }
@@ -558,8 +592,11 @@ fn packages(roots: &Roots, exe: &dyn Fn(&Path) -> bool, out: &mut Vec<Entry>, s:
     }
 }
 
+/// bitsrun (PK-3): starts an installed program in its own view; every package entry goes through it.
+pub const BITSRUN: &str = "/bin/bitsrun";
+
 /// A program of a `.desktop` file inside the package's root: absolute paths under the root, bare names in its
-/// usr/bin or bin (bitsrun, PK-3, will start it inside its own view later).
+/// usr/bin or bin; bitsrun starts it in the view (`--exec` with its path there).
 fn in_root(root: &Path, prog: &str, exe: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     if prog.split('/').any(|c| c == "..") {
         return None;
@@ -675,11 +712,12 @@ fn worker(roots: Roots, jobs: mpsc::Receiver<()>, tx: Sender<Msg>) {
         }
         let counts = |src: fn(&Source) -> bool| decoded.entries.iter().filter(|e| src(&e.source)).count();
         eprintln!(
-            "bitscomp: library: {} programs (built-in {}, stick {}, packages {}){}",
+            "bitscomp: library: {} programs (built-in {}, stick {}, packages {}, Steam games {}){}",
             decoded.entries.len(),
             counts(|s| *s == Source::Builtin),
             counts(|s| *s == Source::Stick),
             counts(|s| matches!(s, Source::Package(_))),
+            counts(|s| matches!(s, Source::Steam(_))),
             if last.is_none() { "" } else { " after a change" }
         );
         for n in &s.notes {

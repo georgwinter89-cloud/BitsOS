@@ -4,8 +4,8 @@
 //!   (relaxed), its topology recorded for the scheduler, its TSC offset measured, everything logged (B6);
 //! - `power` (CP-5): power-off and reboot for the console command (quiesce, then `acpi::power`);
 //! - `timers` (CP-5): every AP's LAPIC timer started on that AP, the scheduler's tick and interrupt-exit hooks;
-//! - pure helpers with host tests: `plan` (which APs to start), `limit` (CONFIG `smp=`/`cpus=`, CP-4b), `tsc`
-//!   (offsets from the handshake samples), `report` (comparisons and text).
+//! - pure helpers with host tests: `plan` (which APs to start), `tsc` (offsets from the handshake samples),
+//!   `report` (comparisons and text).
 //!
 //! CP-5's ktests (`time_ktest`, `power_ktest`) live here because they need the scheduler.
 #![no_std]
@@ -14,7 +14,6 @@
 extern crate alloc;
 
 pub mod cpu_setup;
-pub mod limit;
 pub mod plan;
 pub mod power;
 pub mod report;
@@ -23,8 +22,8 @@ pub mod timers;
 pub mod tsc;
 
 mod cpu_ktest;
+mod gp_cpu_ktest;
 mod entry_ktest;
 mod smp_ktest;
-mod limit_ktest;
 mod power_ktest;
 mod time_ktest;

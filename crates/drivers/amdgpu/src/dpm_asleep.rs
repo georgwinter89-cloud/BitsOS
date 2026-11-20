@@ -73,4 +73,7 @@ impl Hw for Asleep<'_> {
     fn doorbell_write64(&mut self, index_dw: u32, value: u64) -> bool {
         self.0.io().doorbell_write64(index_dw, value)
     }
+    fn doorbell_write32(&mut self, index_dw: u32, value: u32) -> bool {
+        self.0.io().doorbell_write32(index_dw, value)
+    }
 }

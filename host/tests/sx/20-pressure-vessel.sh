@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # slow
 # SX-3c: pressure-vessel (Valve's container tool) with the Steam Linux Runtime 3.0 "sniper" tree starts `true` and
-# `steam-runtime-system-info` on V2 as uid 1000, with software graphics from the GM-1a Mesa tree as the graphics
-# provider (user/ports/steamrt/build.sh: out/SteamLinuxRuntime_sniper and out/gfx). The tree (~1.1 GB) never goes
+# `steam-runtime-system-info` on V2 as uid 1000, with the GM-1a Mesa tree (radeonsi, RADV; no GPU node in QEMU) as the
+# graphics provider (user/ports/steamrt/build.sh: out/SteamLinuxRuntime_sniper and out/gfx). The tree (~1.1 GB) never goes
 # into the image: V2 pulls it over HTTP into /tmp. Checked: both runs end with 0, `true` says nothing on stderr
 # that pressure-vessel calls an error (" E: "), system-info's report is JSON whose container section says
 # pressure-vessel with V2 as the host, whose x86_64 architecture can run with its libraries, and which finds
-# lavapipe (Vulkan) and Mesa's EGL vendor from the provider, and whose sections equal the CachyOS reference run
+# RADV (Vulkan) and Mesa's EGL vendor from the provider and no software device, and whose sections equal the CachyOS reference run
 # (user/ports/steamrt/record-host.sh, made here) apart from the known ones (sx_pv_check.py; each red line of the
-# report is explained in plan/notes/sx-SX-3c.md).
-# Without the tree (V2_OFFLINE=1 build, no download here) it prints "SKIPPED, NOTHING CHECKED" and passes;
-# SX_REQUIRE_PV=1 makes that a failure. Without bwrap on the host there is no reference and the report is checked on
+# report is explained in plan/spec/sandbox.md §5).
+# Without the tree (V2_OFFLINE=1 build, no download here) it prints "SKIPPED, NOTHING CHECKED", which every run
+# xtask starts counts red (a skip is red, ledger.rs skip_line); SX_REQUIRE_PV=1 also makes the exit code 1. Without bwrap on the host there is no reference and the report is checked on
 # its own (the last line says "compared with CachyOS: no"); SX_REQUIRE_HOST_REF=1 makes that a failure too.
 # SX3C_KEEP=1 leaves QEMU running, SX3C_REUSE=1 uses the running one.
 set -euo pipefail

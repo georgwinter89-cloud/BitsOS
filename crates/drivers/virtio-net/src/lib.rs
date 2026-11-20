@@ -42,7 +42,7 @@ static MATCHES: [pci::Match; 2] = [
     pci::Match::Id { vendor: VENDOR, device: DEV_MODERN },
 ];
 
-pci::pci_driver!(pci::DriverEntry { name: "virtio-net", matches: &MATCHES, opt_in_key: None, probe });
+pci::pci_driver!(pci::DriverEntry { name: "virtio-net", matches: &MATCHES, probe });
 
 static DEVICES: SpinLock<Vec<Arc<VirtioNet>>> = SpinLock::named("virtio-net.devices", Vec::new());
 static POLLER: ksync::Once<()> = ksync::Once::new();

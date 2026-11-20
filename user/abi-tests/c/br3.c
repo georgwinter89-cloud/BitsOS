@@ -1,12 +1,12 @@
 /* BR-3: what Brave 1.97.59 (Chromium, --no-sandbox) met on V2 that differs from Linux, one part per argv[1].
  *   tasknlink  /proc/self/task's link count, as Chromium's sandbox::ThreadHelpers::IsSingleThreaded reads it
  *              (fstatat(proc_fd, "self/task/") must give 2 + threads; CHECK_LE(3, st_nlink) kills the zygote:
- *              linux-6.6/fs/proc/base.c:3897-3910 proc_task_getattr)
+ *              linux-7.3.1/fs/proc/base.c:3939-3953 proc_task_getattr)
  *   siocgiw    the wireless-extension ioctls 0x8B00-0x8BFF Chromium's network-change code asks on a UDP socket
  *              (SIOCGIWNAME, SIOCGIWESSID on "lo": EOPNOTSUPP; unknown interface ENODEV; bad pointer EFAULT first;
  *              SET commands and SIOCGIWENCODE unprivileged EPERM before the lookup; net/wireless/wext-core.c)
  *   procnlink  the other /proc directories' link counts: 2 + subdirectories, as readdir lists them
- *              (/proc/self and /proc/self/task/<tid>: base.c:3926-3929 pid_entry_nlink; GNU find and fts skip
+ *              (/proc/self and /proc/self/task/<tid>: base.c:3986-3990 pid_entry_nlink; GNU find and fts skip
  *              the stat of subdirectories by st_nlink)
  *   uevent     AF_NETLINK NETLINK_KOBJECT_UEVENT the way libudev's monitor opens it (Chromium's UdevWatcher binds
  *              the "udev" group 2; group 1 is the kernel's): bind any group unprivileged, SO_PASSCRED,

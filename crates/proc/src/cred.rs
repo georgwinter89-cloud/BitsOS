@@ -1,4 +1,4 @@
-//! AB-13: credentials as Linux keeps them (linux-6.6/include/linux/cred.h `struct cred`, kernel/cred.c,
+//! AB-13: credentials as Linux keeps them (linux-7.3.1/include/linux/cred.h `struct cred`, kernel/cred.c,
 //! kernel/sys.c set*id, kernel/groups.c): real, effective, saved and file-system uid and gid plus the
 //! supplementary groups.
 //!
@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use uapi::errno::*;
 use vfs::Errno;
 
-/// linux-6.6/include/uapi/linux/limits.h `NGROUPS_MAX`: the most supplementary groups (an ABI value).
+/// linux-7.3.1/include/uapi/linux/limits.h:7 `NGROUPS_MAX`: the most supplementary groups (an ABI value).
 pub const NGROUPS_MAX: usize = 65536;
 /// `(uid_t)-1`: "leave unchanged" for the set*id calls and an invalid id everywhere else (`uid_valid`).
 pub const NO_ID: u32 = u32::MAX;
@@ -72,7 +72,7 @@ impl PartialEq for UserNs {
 }
 impl Eq for UserNs {}
 
-/// The capabilities V2 asks about (linux-6.6/include/uapi/linux/capability.h numbers).
+/// The capabilities V2 asks about (linux-7.3.1/include/uapi/linux/capability.h numbers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Cap {
@@ -185,8 +185,8 @@ fn fix_setuid(old: &Cred, new: &mut Cred) {
     new.caps = Some(s);
 }
 
-/// linux-6.6/include/linux/capability.h `CAP_FS_MASK` as a bit set (CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH,
-/// FOWNER, FSETID, LINUX_IMMUTABLE, MKNOD, MAC_OVERRIDE).
+/// linux-7.3.1/include/linux/capability.h:68 `CAP_FS_SET` (`CAP_FS_MASK` plus LINUX_IMMUTABLE, what `cap_raise_fs_set`
+/// uses) as a bit set (CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER, FSETID, LINUX_IMMUTABLE, MKNOD, MAC_OVERRIDE).
 pub const CAP_FS_MASK: u64 = 0x1f | 1 << 9 | 1 << 27 | 1 << 32;
 
 /// The permitted and effective sets `/proc/<pid>/status` shows for credentials `c` under bounding set `bset`
@@ -228,7 +228,7 @@ impl Cred {
         Cred { uid, euid: uid, suid: uid, fsuid: uid, gid, egid: gid, sgid: gid, fsgid: gid, groups: Arc::new(Vec::new()), user_ns: init_user_ns().clone(), caps: None, cap_inh: 0 }
     }
 
-    /// linux-6.6/kernel/groups.c `in_group_p`: fsgid or a supplementary group (file access).
+    /// linux-7.3.1/kernel/groups.c:227 `in_group_p`: fsgid or a supplementary group (file access).
     pub fn in_group(&self, gid: u32) -> bool {
         self.fsgid == gid || self.groups.binary_search(&gid).is_ok()
     }
@@ -257,7 +257,7 @@ impl Cred {
 /// The outcome of a set*id call: `Ok(None)` changes nothing.
 pub type Change = Result<Option<Cred>, Errno>;
 
-/// linux-6.6/kernel/sys.c:610 `__sys_setuid`.
+/// linux-7.3.1/kernel/sys.c:651 `__sys_setuid`.
 pub fn set_uid(old: &Cred, uid: u32) -> Change {
     if uid == NO_ID {
         return Err(EINVAL);
@@ -274,7 +274,7 @@ pub fn set_uid(old: &Cred, uid: u32) -> Change {
     Ok(Some(n))
 }
 
-/// linux-6.6/kernel/sys.c:438 `__sys_setgid`.
+/// linux-7.3.1/kernel/sys.c:479 `__sys_setgid`.
 pub fn set_gid(old: &Cred, gid: u32) -> Change {
     if gid == NO_ID {
         return Err(EINVAL);
@@ -292,7 +292,7 @@ pub fn set_gid(old: &Cred, gid: u32) -> Change {
 }
 
 /// The ids of a setre*id call (`r`, `e`) applied to (`real`, `eff`, `saved`, `fs`) with Linux's rules:
-/// linux-6.6/kernel/sys.c:529 `__sys_setreuid` and :372 `__sys_setregid` (same shape; the real id may become
+/// linux-7.3.1/kernel/sys.c:570 `__sys_setreuid` and :413 `__sys_setregid` (same shape; the real id may become
 /// the old real or effective id, the effective id also the saved one, unless privileged).
 fn set_re(old: [u32; 3], r: u32, e: u32, privileged: bool) -> Result<[u32; 4], Errno> {
     let [ruid, euid, suid] = old;
@@ -328,9 +328,9 @@ pub fn set_regid(old: &Cred, r: u32, e: u32) -> Change {
     Ok(Some(Cred { gid: n[0], egid: n[1], sgid: n[2], fsgid: n[3], ..old.clone() }))
 }
 
-/// linux-6.6/kernel/sys.c:667 `__sys_setresuid` and :769 `__sys_setresgid`: `old` = (real, eff, saved, fs).
+/// linux-7.3.1/kernel/sys.c:708 `__sys_setresuid` and :810 `__sys_setresgid`: `old` = (real, eff, saved, fs).
 /// Each new id must be one of the old real/effective/saved ids unless privileged; the call that changes
-/// nothing (and leaves fs equal to eff) returns early. That no-op test is Linux's own (sys.c:691-695), so
+/// nothing (and leaves fs equal to eff) returns early. That no-op test is Linux's own (sys.c:732-737), so
 /// `setresuid(-1, -1, -1)` after a `setfsuid` keeps the fsuid there too; any other call sets fs = eff.
 fn set_res(old: [u32; 4], want: [u32; 3], privileged: bool) -> Result<Option<[u32; 4]>, Errno> {
     let [r, e, s] = want;
@@ -359,26 +359,26 @@ pub fn set_resgid(old: &Cred, r: u32, e: u32, s: u32) -> Change {
     Ok(n.map(|n| Cred { gid: n[0], egid: n[1], sgid: n[2], fsgid: n[3], ..old.clone() }))
 }
 
-/// linux-6.6/kernel/sys.c:863 `__sys_setfsuid`: never an error; the caller returns the previous fsuid.
+/// linux-7.3.1/kernel/sys.c:904 `__sys_setfsuid`: never an error; the caller returns the previous fsuid.
 pub fn set_fsuid(old: &Cred, uid: u32) -> Option<Cred> {
     let ok = uid != NO_ID && (old.has_uid(uid) || uid == old.fsuid || own_capable(old, Cap::Setuid));
     (ok && uid != old.fsuid).then(|| Cred { fsuid: uid, ..old.clone() })
 }
 
-/// linux-6.6/kernel/sys.c:907 `__sys_setfsgid`.
+/// linux-7.3.1/kernel/sys.c:948 `__sys_setfsgid`.
 pub fn set_fsgid(old: &Cred, gid: u32) -> Option<Cred> {
     let ok = gid != NO_ID && (old.has_gid(gid) || gid == old.fsgid || own_capable(old, Cap::Setgid));
     (ok && gid != old.fsgid).then(|| Cred { fsgid: gid, ..old.clone() })
 }
 
-/// linux-6.6/kernel/groups.c:66 `groups_sort`, done before the credentials lock is taken: up to NGROUPS_MAX
+/// linux-7.3.1/kernel/groups.c:84 `groups_sort`, done before the credentials lock is taken: up to NGROUPS_MAX
 /// ids must not be sorted while other threads spin on it (B4). The result goes to `set_groups`.
 pub fn sorted_groups(mut groups: Vec<u32>) -> Arc<Vec<u32>> {
     groups.sort_unstable();
     Arc::new(groups)
 }
 
-/// linux-6.6/kernel/groups.c:198 `setgroups` after the copy: `may_setgroups` (CAP_SETGID), then the sorted
+/// linux-7.3.1/kernel/groups.c:198 `setgroups` after the copy: `may_setgroups` (CAP_SETGID), then the sorted
 /// list (`sorted_groups`) replaces the old one; ids already checked for `NO_ID` (EINVAL in `groups_from_user`).
 /// Runs under the credentials lock: only the capability check and an Arc clone happen here.
 pub fn set_groups(old: &Cred, groups: Arc<Vec<u32>>) -> Change {
@@ -390,7 +390,7 @@ pub fn set_groups(old: &Cred, groups: Arc<Vec<u32>>) -> Change {
     Ok(Some(Cred { groups, ..old.clone() }))
 }
 
-/// For FS's permission checks (change request in plan/notes/ab-AB-13.md): whether `gid` is a supplementary
+/// For FS's permission checks: whether `gid` is a supplementary
 /// group of the calling process, when `cred` (a `vfs::Cred`) is that process's file-system view. Linux
 /// `in_group_p` (fsgid or a supplementary group); the fsgid itself is FS's `cred.gid == gid` check.
 pub fn current_in_group(cred: vfs::Cred, gid: u32) -> bool {
@@ -543,10 +543,14 @@ impl Process {
         capable(&self.cred(), cap)
     }
 
-    /// linux-6.6/kernel/ptrace.c:276 `__ptrace_may_access` without an LSM: the same thread group; else the
+    /// linux-7.3.1/kernel/ptrace.c:305 `__ptrace_may_access` without an LSM: the same thread group; else the
     /// caller's uid and gid (fsuid/fsgid with `fs_creds`, PTRACE_MODE_FSCREDS; else the real ones) equal all of
-    /// the target's uids and gids, or the caller has CAP_SYS_PTRACE; and then the target is dumpable or the
-    /// caller has the capability (an ended target has no memory to ask).
+    /// the target's uids and gids, or the caller has CAP_SYS_PTRACE; and then `task_still_dumpable` (:293): the
+    /// image is dumpable or the caller has the capability in the user namespace of the target's execve
+    /// (`exec_user_ns`, Linux's `task_exec_state`). The dumpable flag is the image's own (`mm_flags`), so it
+    /// outlives the memory: an ended non-dumpable target (a zombie of a set-id program) stays refused; and a
+    /// non-dumpable target that unshared a user namespace after its execve stays closed to its uid (that new
+    /// namespace is the uid's, the exec one is not).
     pub fn may_ptrace(&self, target: &Process, fs_creds: bool) -> bool {
         if Arc::ptr_eq(self.group(), target.group()) {
             return true;
@@ -554,15 +558,14 @@ impl Process {
         let (me, t) = (self.cred(), target.cred());
         let (u, g) = if fs_creds { (me.fsuid, me.fsgid) } else { (me.uid, me.gid) };
         let ids = [t.uid, t.euid, t.suid].iter().all(|&x| x == u) && [t.gid, t.egid, t.sgid].iter().all(|&x| x == g);
-        let cap = ns_capable(&me, &t.user_ns, Cap::SysPtrace);
-        (ids || cap) && (cap || target.is_finished() || target.mm_flags.dumpable() == 1)
+        (ids || ns_capable(&me, &t.user_ns, Cap::SysPtrace)) && (target.mm_flags.dumpable() == 1 || ns_capable(&me, &target.exec_user_ns, Cap::SysPtrace))
     }
 
     /// Computes and commits new credentials from the current ones in one step (two threads of the group cannot
     /// interleave; Linux's per-task `prepare_creds`/`commit_creds`). `f` runs under the group's credentials lock:
     /// it must not allocate a lot or sleep. Returns the old credentials. When the effective or file-system
     /// ids change, `commit_creds` makes the memory not dumpable (`suid_dumpable` 0) and clears the calling
-    /// thread's parent-death signal (linux-6.6/kernel/cred.c:409).
+    /// thread's parent-death signal (linux-7.3.1/kernel/cred.c:390).
     pub fn change_cred(&self, t: &Thread, f: impl FnOnce(&Cred) -> Change) -> Result<Arc<Cred>, Errno> {
         let g = self.group();
         let (old, new) = {

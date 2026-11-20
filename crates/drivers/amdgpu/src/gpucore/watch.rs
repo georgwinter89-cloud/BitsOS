@@ -2,7 +2,7 @@
 //! (and later our KMS) shows, so no bring-up write may reach a display register:
 //! - DCN's own register segments (DMU instance 0, segments 1..; segment 0 aliases NBIO and is not DCN's);
 //! - the MMHUB fields DCN fetches the frame buffer through (FB location and offset, system aperture and its
-//!   default page, AGP, L1 TLB, L2 and VM context 0 control: gx-scout-bringup.md section 6, risk 1);
+//!   default page, AGP, L1 TLB, L2 and VM context 0 control: plan/spec/gpu.md §11.2);
 //! - the display's own PMFW mailbox (MP1 C2PMSG_67/83/91, dcn314_smu.c): ours is 66/82/90 (X15);
 //! - graphics memory the display reads (the scanout surface, DMCUB's windows), as the owner registers it
 //!   (`DisplayGuard::protect`).
@@ -14,11 +14,13 @@
 //! the 27.10. capture), so the check applies to our sequence only.
 //!
 //! A display register is also reachable through the index/data windows (GX-7c fixer): NBIO's PCIE_INDEX/DATA
-//! and PCIE_INDEX2/DATA2 (SMN; linux-6.6 amdgpu_device.c:498 sends a register beyond the BAR as `reg * 4`, so
-//! an SMN address below the BAR's end is the BAR5 byte, and MP1's mailbox also answers at its SMN alias,
-//! smu_v13_0.h:33-38) and MM_INDEX/MM_INDEX_HI/MM_DATA (bit 31 clear: a register byte; set: graphics memory,
-//! amdgpu_device.c amdgpu_device_mm_access). `Watch` keeps the last index written and judges each data write by
-//! its target. The record keeps the first `keep` violations and counts all (R1: a looping driver does not grow it).
+//! and PCIE_INDEX2/DATA2 (SMN; linux-6.6 amdgpu_device.c:498 (Linux 7.3.1 differs:
+//! linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_reg_access.c:494, see plan/spec/linux7-differences.md)
+//! sends a register beyond the BAR as `reg * 4`, so an SMN address below the BAR's end is the BAR5 byte, and
+//! MP1's mailbox also answers at its SMN alias, smu_v13_0.h:33-38) and MM_INDEX/MM_INDEX_HI/MM_DATA (bit 31
+//! clear: a register byte; set: graphics memory, amdgpu_device.c amdgpu_device_mm_access). `Watch` keeps the last
+//! index written and judges each data write by its target. The record keeps the first `keep` violations and
+//! counts all (R1: a looping driver does not grow it).
 //!
 //! GX-7h (GX-7c open point 3): MMHUB's invalidation engines (INVALIDATE_ENGn_REQ and _SEM) are watched too
 //! (`Class::MmhubFlush`): DCN fetches through the system aperture, not VMID 0, but a flush of the hub it fetches
@@ -407,5 +409,8 @@ impl<H: Hw> Hw for Watch<H> {
     }    /// Doorbells are not display state (the BAR2 aperture rings an engine, never DCN).
     fn doorbell_write64(&mut self, index_dw: u32, value: u64) -> bool {
         self.hw.doorbell_write64(index_dw, value)
+    }
+    fn doorbell_write32(&mut self, index_dw: u32, value: u32) -> bool {
+        self.hw.doorbell_write32(index_dw, value)
     }
 }

@@ -22,7 +22,26 @@ fn dir(name: &str) -> PathBuf {
 fn reaper(d: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(REAPER);
     c.args(args).current_dir(d).stdin(Stdio::null());
+    at_default(&mut c);
     c
+}
+
+/// Every signal at its default in what the test starts, whatever this test process inherited: a shell cannot trap a signal
+/// that was ignored when it started (POSIX), and a run under nohup or from a script's background has SIGINT ignored (the
+/// gate of 12.11. that way: `int_goes_to_the_whole_group` red). Steam starts the stand-in with them at default.
+fn at_default(c: &mut Command) -> &mut Command {
+    // SAFETY: the closure only calls sigaction, async-signal-safe, with a value of its own, between fork and exec.
+    unsafe {
+        c.pre_exec(|| {
+            let default: libc::sigaction = std::mem::zeroed();
+            for sig in 1..32 {
+                if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+                    libc::sigaction(sig, &default, std::ptr::null_mut());
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 fn output(d: &Path, args: &[&str]) -> Output {
@@ -285,7 +304,7 @@ fn signal_lines(c: &mut Command) -> String {
 #[test]
 fn the_command_finds_its_signals_as_without_the_stand_in() {
     let d = dir("signals");
-    let plain = signal_lines(&mut Command::new("grep"));
+    let plain = signal_lines(at_default(&mut Command::new("grep")));
     let mut through = reaper(&d, &["--", "grep"]);
     assert_eq!(signal_lines(&mut through), plain);
 }

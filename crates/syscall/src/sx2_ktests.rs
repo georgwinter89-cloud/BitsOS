@@ -41,8 +41,9 @@ const UMASK: usize = 95;
 const AT_FDCWD: u64 = (-100i64) as u64;
 const THREAD: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
-struct T {
-    p: Arc<Process>,
+/// A held test process whose syscalls the test thread plays (also used by `peer_ktests`).
+pub(crate) struct T {
+    pub(crate) p: Arc<Process>,
     th: Arc<proc::Thread>,
     ctx: UserContext,
     mem: u64,
@@ -52,7 +53,7 @@ struct T {
 }
 
 impl T {
-    fn new(name: &str) -> Result<T, String> {
+    pub(crate) fn new(name: &str) -> Result<T, String> {
         let image = crate::ktests::elf(&CODE);
         let argv = [name];
         let mut o = proc::SpawnOptions::new(&argv, &[], policy::ProgramId(1));
@@ -63,7 +64,7 @@ impl T {
         let _pin = proc::pin_mm(&p);
         Ok(T { p, th, ctx: UserContext::new(ENTRY, mem + SCRATCH - 4096), mem, _pin, kids: Vec::new() })
     }
-    fn call(&mut self, n: usize, args: &[u64]) -> i64 {
+    pub(crate) fn call(&mut self, n: usize, args: &[u64]) -> i64 {
         let mut a = [0u64; 6];
         a[..args.len()].copy_from_slice(args);
         let r = &mut self.ctx.regs;
@@ -71,10 +72,15 @@ impl T {
         crate::dispatch(&self.p, &self.th, &mut self.ctx);
         self.ctx.regs.rax as i64
     }
-    fn a(&self, at: u64) -> u64 {
+    pub(crate) fn a(&self, at: u64) -> u64 {
         self.mem + at
     }
-    fn put(&self, at: u64, b: &[u8]) {
+    pub(crate) fn get(&self, at: u64, n: usize) -> Vec<u8> {
+        let mut v = alloc::vec![0u8; n];
+        let _ = self.p.mm.copy_from_user(&mut v, self.mem + at);
+        v
+    }
+    pub(crate) fn put(&self, at: u64, b: &[u8]) {
         let _ = self.p.mm.copy_to_user(self.mem + at, b);
     }
     /// A NUL-terminated string at `at`; its user address.
@@ -86,11 +92,19 @@ impl T {
     }
     /// clone3 with `flags`; `sleep`: the child runs the sleeper loop instead of exit_group(0).
     fn clone3(&mut self, flags: u64, sleep: bool) -> i64 {
+        self.clone3_with(flags, if flags & CLONE_THREAD == 0 { SIGCHLD } else { 0 }, 0, sleep)
+    }
+    /// clone3 with `flags`, `exit_signal` and the CLONE_PIDFD pointer `pidfd` (L7-PROC's ktests).
+    pub(crate) fn clone3_with(&mut self, flags: u64, exit_signal: u64, pidfd: u64, sleep: bool) -> i64 {
+        self.clone3_args(flags, exit_signal, pidfd, 0, sleep)
+    }
+    /// `clone3_with` plus CLONE_PARENT_SETTID's pointer `parent_tid`.
+    pub(crate) fn clone3_args(&mut self, flags: u64, exit_signal: u64, pidfd: u64, parent_tid: u64, sleep: bool) -> i64 {
         let mut b = [0u8; 88];
         b[0..8].copy_from_slice(&flags.to_le_bytes());
-        if flags & CLONE_THREAD == 0 {
-            b[32..40].copy_from_slice(&SIGCHLD.to_le_bytes());
-        }
+        b[8..16].copy_from_slice(&pidfd.to_le_bytes());
+        b[24..32].copy_from_slice(&parent_tid.to_le_bytes());
+        b[32..40].copy_from_slice(&exit_signal.to_le_bytes());
         self.put(0x200, &b);
         if sleep {
             self.ctx.regs.rip = SLEEP_AT;
@@ -103,7 +117,7 @@ impl T {
         }
         r
     }
-    fn unshare(&mut self, flags: u64) -> i64 {
+    pub(crate) fn unshare(&mut self, flags: u64) -> i64 {
         self.call(NR_UNSHARE, &[flags])
     }
     fn open(&mut self, path: &str) -> i64 {
@@ -145,7 +159,7 @@ impl Drop for T {
     }
 }
 
-fn expect(what: &str, got: i64, want: i64) -> TestResult {
+pub(crate) fn expect(what: &str, got: i64, want: i64) -> TestResult {
     kassert!(got == want, "{what}: got {got}, want {want}");
     Ok(())
 }
@@ -239,7 +253,7 @@ fn lifetime() -> TestResult {
 }
 
 ktest!("ab.sx2.ns_limit", Safe, ns_limit);
-/// `max_*_namespaces` (linux-6.6/kernel/ucount.c inc_ucount): a user's namespaces of one kind stop at
+/// `max_*_namespaces` (linux-7.3.1/kernel/ucount.c:218 inc_ucount): a user's namespaces of one kind stop at
 /// `max_threads / 2` with ENOSPC, the charges come back when the namespaces go, and a real unshare charges
 /// the caller's uid. The charges of the limit run go to a uid no program uses.
 fn ns_limit() -> TestResult {
@@ -282,8 +296,8 @@ fn ns_limit() -> TestResult {
 }
 
 ktest!("ab.sx2.maps", Safe, maps);
-/// The id map rules for an unprivileged writer (linux-6.6/kernel/user_namespace.c map_write :920 and :966,
-/// new_idmap_permitted :1160, the writer's namespace :1116, proc_setgroups_write :1213) with the credentials
+/// The id map rules for an unprivileged writer (linux-7.3.1/kernel/user_namespace.c map_write :932 and :978,
+/// new_idmap_permitted :1172, the writer's namespace :1130, proc_setgroups_write :1225) with the credentials
 /// a real unshare made.
 fn maps() -> TestResult {
     let mut t = T::new("sx2-maps")?;
@@ -427,8 +441,8 @@ fn fs_share() -> TestResult {
 }
 
 ktest!("ab.sx2.fs_matrix", Safe, fs_matrix);
-/// FS-16: CLONE_FS and CLONE_FILES are independent (linux-6.6/kernel/fork.c `copy_fs`, `copy_files`): the four
-/// combinations for processes, chroot reaching exactly the CLONE_FS sharers (fs/open.c `set_fs_root`), a thread
+/// FS-16: CLONE_FS and CLONE_FILES are independent (linux-7.3.1/kernel/fork.c:1627 `copy_fs`, :1669 `copy_files`): the
+/// four combinations for processes, chroot reaching exactly the CLONE_FS sharers (fs/open.c `set_fs_root`), a thread
 /// without CLONE_FS with its own copy, and unshare(CLONE_FS) of one thread of several (`unshare_fs`).
 fn fs_matrix() -> TestResult {
     let mut t = T::new("sx2-fsmatrix")?;
@@ -479,8 +493,8 @@ fn fs_matrix() -> TestResult {
 }
 
 ktest!("ab.sx2.fs_threads", Safe, fs_threads);
-/// FS-16 per thread: /proc/<pid>/task/<tid>/{cwd,root} show the viewed thread's state (linux-6.6/fs/proc/base.c
-/// `proc_cwd_link`, `proc_root_link`: the task's fs), and chroot, chdir and umask of a thread made without
+/// FS-16 per thread: /proc/<pid>/task/<tid>/{cwd,root} show the viewed thread's state (linux-7.3.1/fs/proc/base.c
+/// :222 `proc_cwd_link`, :236 `proc_root_link`: the task's fs), and chroot, chdir and umask of a thread made without
 /// CLONE_FS reach that thread only (fs/open.c `set_fs_root` on `current->fs`).
 fn fs_threads() -> TestResult {
     let mut t = T::new("sx2-fsthreads")?;
@@ -516,9 +530,10 @@ fn fs_threads() -> TestResult {
 }
 
 ktest!("ab.sx2.fs_setns", Safe, fs_setns);
-/// FS-16: setns into a user namespace needs a file-system state nobody else uses (linux-6.6/kernel/user_namespace.c
-/// `userns_install`: `current->fs->users != 1` is EINVAL); unshare(CLONE_FS) of a single-threaded sharer
-/// (kernel/fork.c `unshare_fs`) gives it its own copy, the sibling keeps the old state, and setns then works.
+/// FS-16: setns into a user namespace needs a file-system state nobody else uses
+/// (linux-7.3.1/kernel/user_namespace.c:1343 `userns_install`: `current->fs->users != 1` is EINVAL); unshare(CLONE_FS)
+/// of a single-threaded sharer (kernel/fork.c `unshare_fs`) gives it its own copy, the sibling keeps the old state, and
+/// setns then works.
 fn fs_setns() -> TestResult {
     let mut t = T::new("sx2-fssetns")?;
     let target = t.clone3(CLONE_NEWUSER, true);
@@ -541,8 +556,9 @@ fn fs_setns() -> TestResult {
 
 ktest!("ab.sx2.chroot", Safe, chroot);
 /// chroot needs CAP_SYS_CHROOT in the caller's user namespace (fs/open.c:593); Chromium's trick: the root is
-/// the fdinfo directory of a task that then ends, and every lookup below it is ENOENT, never a crash; a
-/// chrooted process makes no user namespace (EPERM, `current_chrooted`).
+/// the fdinfo directory of a task that then ends and is reaped, and every lookup below it is ESRCH
+/// (linux-7.3.1/fs/proc/fd.c:85 `proc_fdinfo_permission`), never a crash; a chrooted process makes no user
+/// namespace (EPERM, `current_chrooted`).
 fn chroot() -> TestResult {
     let mut t = T::new("sx2-chroot")?;
     let kid = t.clone3(0, true);
@@ -570,20 +586,21 @@ fn chroot() -> TestResult {
     expect("unshare(CLONE_NEWUSER) chrooted", t.unshare(CLONE_NEWUSER), -EPERM)?;
     expect("kill the child", t.call(nr::KILL, &[kid as u64, SIGKILL]), 0)?;
     kassert!(until(10, || ended(kid as u32)), "the child did not end");
+    expect("wait4(the child)", t.call(nr::WAIT4, &[kid as u64, 0, 0, 0]), kid)?;
     for p in ["/proc/self/maps", "/proc/stat", "/sys/devices/system/cpu/online", "/0", "/../../proc", "/bin/sh"] {
-        expect(&format!("open({p}) under a dead root"), t.open(p), -ENOENT)?;
+        expect(&format!("open({p}) under a dead root"), t.open(p), -ESRCH)?;
     }
     let up = t.s(0x400, "/proc");
     let st = t.a(0x800);
-    expect("stat(/proc) under a dead root", t.call(nr::NEWFSTATAT, &[AT_FDCWD, up, st, 0]), -ENOENT)?;
+    expect("stat(/proc) under a dead root", t.call(nr::NEWFSTATAT, &[AT_FDCWD, up, st, 0]), -ESRCH)?;
     Ok(())
 }
 
-fn have(path: &str) -> bool {
+pub(crate) fn have(path: &str) -> bool {
     vfs::root_ns().lookup(path).is_ok()
 }
 
-fn diff(got: &str, want: &str) -> Vec<String> {
+pub(crate) fn diff(got: &str, want: &str) -> Vec<String> {
     let g: Vec<&str> = got.lines().collect();
     let mut d = Vec::new();
     for (i, w) in want.lines().enumerate() {
@@ -602,12 +619,14 @@ fn diff(got: &str, want: &str) -> Vec<String> {
 ktest!("ab.sx2.programs", Safe, programs);
 /// The `abi-ns-*` programs against CachyOS's transcripts (the same cases `cargo xtask abi-diff` runs).
 fn programs() -> TestResult {
-    let cases: [(&str, &str, &str); 16] = [
+    let cases: [(&str, &str, &str); 18] = [
         ("/bin/abi-ns-unshare", "", include_str!("../../../user/abi-tests/expected/sx2-unshare.txt")),
         // FS-16: one thread of several unshares its cwd/umask.
         ("/bin/abi-ns-unshare", "threadfs", include_str!("../../../user/abi-tests/expected/sx2-unshare-threadfs.txt")),
         // FS-16 (fixer): execve from a thread with its own state starts the image with that state.
         ("/bin/abi-ns-unshare", "threadexec", include_str!("../../../user/abi-tests/expected/sx2-unshare-threadexec.txt")),
+        // L7-RESTE-FS: unshare(UNSHARE_EMPTY_MNTNS) and clone3(CLONE_EMPTY_MNTNS): the root mount alone, cwd on it.
+        ("/bin/abi-ns-unshare", "empty", include_str!("../../../user/abi-tests/expected/sx2-unshare-empty.txt")),
         ("/bin/abi-ns-clone", "", include_str!("../../../user/abi-tests/expected/sx2-clone.txt")),
         ("/bin/abi-ns-idmap", "", include_str!("../../../user/abi-tests/expected/sx2-idmap.txt")),
         // FS-16: pwrite on seq_file files (maps, comm, uid_map) is ESPIPE, oom_score_adj keeps it.
@@ -618,7 +637,10 @@ fn programs() -> TestResult {
         ("/bin/abi-ns-chroot", "", include_str!("../../../user/abi-tests/expected/sx2-chroot.txt")),
         // FS-16: chroot reaches a CLONE_FILES sibling only when it shares CLONE_FS too.
         ("/bin/abi-ns-chroot", "files", include_str!("../../../user/abi-tests/expected/sx2-chroot-files.txt")),
-        // Linux 6.6's answers (CachyOS 7.3 says ESRCH under the dead root: expected/sx2.known).
+        // L7-PROC: fchroot to a directory and to failfs (linux-7.3.1/fs/open.c:621); L7-RESTE-FS: failfs's
+        // permission op and its refused jump (stat, chdir and an O_PATH open of "/").
+        ("/bin/abi-ns-chroot", "fchroot", include_str!("../../../user/abi-tests/expected/sx2-chroot-fchroot.txt")),
+        // L7-RESTE-FS: chdir("/..") under the dead root asks the fdinfo directory's permission op (ESRCH).
         ("/bin/abi-ns-chroot", "trick", include_str!("../../../user/abi-tests/expected/sx2-chroot-trick.txt")),
         ("/bin/abi-ns-pid", "", include_str!("../../../user/abi-tests/expected/sx2-pid.txt")),
         ("/bin/abi-ns-net", "", include_str!("../../../user/abi-tests/expected/sx2-net.txt")),

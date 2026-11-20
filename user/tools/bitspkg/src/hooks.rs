@@ -59,19 +59,26 @@ impl Hook for Absent {
 
 pub struct Hooks {
     pub list: Vec<Box<dyn Hook>>,
+    /// settingsd's socket for this root (PK-6a reads its `pkg.*` keys there), None without one.
+    pub settings: Option<PathBuf>,
 }
 
 impl Hooks {
     /// settingsd at `settings` (None: no settings registration, logged), permd and MC-7 not there yet.
     pub fn standard(settings: Option<PathBuf>) -> Hooks {
         let mut list: Vec<Box<dyn Hook>> = Vec::new();
+        let sock = settings.clone();
         match settings {
             Some(socket) => list.push(Box::new(Settings { socket })),
             None => list.push(Box::new(Absent { what: "settings", why: "no settingsd for this root (--settings)", has: |m| !m.settings.is_empty() })),
         }
         list.push(Box::new(Absent { what: "rules", why: "permd does not exist yet (PM-3)", has: |m| !m.permissions.is_empty() }));
         list.push(Box::new(Absent { what: "actions", why: "the action registry does not exist yet (MC-7)", has: |m| !m.actions.is_empty() }));
-        Hooks { list }
+        Hooks { list, settings: sock }
+    }
+
+    pub fn settings_socket(&self) -> Option<&Path> {
+        self.settings.as_deref()
     }
 
     /// The default for a root: `BITSPKG_SETTINGS` (a socket, or `none`), else settingsd's socket for `/` only (a

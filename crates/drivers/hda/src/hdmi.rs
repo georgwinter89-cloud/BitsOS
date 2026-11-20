@@ -56,6 +56,11 @@ pub trait Raw {
     fn write(&self, byte: u32, v: u32) -> Result<(), DcnError>;
     /// A write without the read-back compare (the SMU mailbox: its response register changes under the write).
     fn write_unchecked(&self, byte: u32, v: u32) -> Result<(), DcnError>;
+    /// GPY: an endpoint index select (or its put-back) under the endpoint pair: logged by `DcnRegs` as the sound's
+    /// (`dcn::Owner::AudioIndex`), which the GX picture proof (GX-D9) does not count.
+    fn write_select(&self, byte: u32, v: u32) -> Result<(), DcnError> {
+        self.write(byte, v)
+    }
 }
 
 impl Raw for DcnRegs {
@@ -68,6 +73,9 @@ impl Raw for DcnRegs {
     fn write_unchecked(&self, byte: u32, v: u32) -> Result<(), DcnError> {
         // Logged as every BAR5 write (GX-D9), compared on no bit.
         DcnRegs::write_masked(self, byte, v, 0)
+    }
+    fn write_select(&self, byte: u32, v: u32) -> Result<(), DcnError> {
+        DcnRegs::write_owned(self, byte, v, u32::MAX, dcn::Owner::AudioIndex)
     }
 }
 
@@ -232,8 +240,11 @@ impl<A: Raw + ?Sized> Regs for Bus<'_, A> {
     }
     fn write(&mut self, byte: u32, v: u32) -> Result<(), RegError> {
         // An index select under the pair is not a display write (SN-13); one outside it is, as is every other.
-        let n = if byte == EP_INDEX && self.depth > 0 { &self.latch.selects } else { &self.latch.write_calls };
-        n.fetch_add(1, Ordering::AcqRel);
+        if byte == EP_INDEX && self.depth > 0 {
+            self.latch.selects.fetch_add(1, Ordering::AcqRel);
+            return self.raw.write_select(byte, v).map_err(map);
+        }
+        self.latch.write_calls.fetch_add(1, Ordering::AcqRel);
         self.raw.write(byte, v).map_err(map)
     }
     fn with_pair<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, RegError>) -> Result<T, RegError> {
@@ -557,7 +568,7 @@ pub fn hdmi_on() -> Result<(), String> {
         return Err("HDMI audio: the GPU codec has no DP audio pin 3".into());
     };
     GEN.fetch_add(1, Ordering::AcqRel);
-    klog::event!(Info, "snd", "hdmi.ready", ctrl = d.ctrl.name(), cad = out.id.cad, pin = klog::Hex(out.id.pin as u64), snoop = d.ctrl.snooped(),
+    klog::event!(Info, "snd", "hdmi.ready", ctrl = d.ctrl.name(), cad = out.id.cad, pin = klog::Hex(out.id.pin as u64),
         plugged = match out.plugged { Some(true) => "yes", Some(false) => "no", None => "unknown" });
     Ok(())
 }

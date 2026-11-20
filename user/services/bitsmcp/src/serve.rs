@@ -618,7 +618,8 @@ impl Conn {
 
     /// After a refused handshake: no more bytes from us (the TLS alert rustls queued is out), then what the peer
     /// still sends is read away for a moment, so the close is a FIN and not a reset that could swallow the
-    /// alert (Linux resets a socket closed with unread data: linux-6.6/net/ipv4/tcp.c:2793, __tcp_close). Bounded: 200 ms.
+    /// alert (Linux resets a socket closed with unread data: linux-7.3.1/net/ipv4/tcp.c:3186, __tcp_close).
+    /// Bounded: 200 ms.
     fn linger(&mut self) {
         let tcp = self.s.tcp();
         let _ = tcp.shutdown(Shutdown::Write);

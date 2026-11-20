@@ -62,7 +62,7 @@ fn fake_pci() -> Vec<FlatEntry> {
     ]
 }
 fn fake_pci_view() -> Arc<dyn DirSource> {
-    Arc::new(FlatView::new(fake_pci))
+    Arc::new(FlatView::new(|| Arc::new(fake_pci())))
 }
 
 /// Mounts /dev, /proc, /sys on `ns` with FS's devices and the stand-in providers.
@@ -540,10 +540,10 @@ fn snapshots_and_live_files() {
     });
 }
 
-/// FS-16: pwrite64/pwritev/pwritev2 at a position on a seq_file-like source and on a `proc_create_single` file
-/// are ESPIPE before the mode check (linux-6.6/fs/read_write.c `ksys_pwrite64`, `do_pwritev`; fs/seq_file.c
-/// `seq_open` clears FMODE_PWRITE); write(2), pwritev2 at -1 (the file position), pread and lseek stay. A positional
-/// source (/proc/<pid>/mem, sysfs) still gets the position.
+/// FS-16: pwrite64/pwritev/pwritev2 at a position on a seq_file-like source and on a `proc_create_single` file are
+/// ESPIPE before the mode check (linux-7.3.1/fs/read_write.c:783 `ksys_pwrite64`, :1142 `do_pwritev`;
+/// fs/seq_file.c:86 `seq_open` clears FMODE_PWRITE); write(2), pwritev2 at -1 (the file position), pread and lseek
+/// stay. A positional source (/proc/<pid>/mem, sysfs) still gets the position.
 #[test]
 fn pwrite_on_seq_files_is_espipe() {
     let (ns, _) = program_view();

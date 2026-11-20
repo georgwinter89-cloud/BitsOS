@@ -1,6 +1,6 @@
 //! GX-7c: a fake GC 11.0.1 power and boot model (GFXOFF, IMU, RLC autoload) for the bring-up tests.
 //!
-//! With PSP loading on this APU the driver never touches the IMU itself (gx-scout-bringup.md section 5): PMFW
+//! With PSP loading on this APU the driver never touches the IMU itself (plan/spec/gpu.md §11.4): PMFW
 //! starts the IMU on EnableGfxImu, the IMU powers GC, and the RLC bootloader places the images the PSP put in
 //! the TMR once AUTOLOAD_RLC arrived. The bootload completes only when both happened, in either order, and every
 //! image it needs was loaded; otherwise never (the scout's "autoload never completes").

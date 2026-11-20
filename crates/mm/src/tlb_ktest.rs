@@ -288,8 +288,8 @@ fn stale_user() -> TestResult {
         a.sys_mprotect(base + 2 * P, P, PROT_READ).map_err(e)?;
         a.sys_munmap(base + 2 * P, P).map_err(e)?;
         // An AP still lazy on the root when it comes back was skipped by both changes (a request would have made
-        // it leave; one that ran another thread meanwhile left through the switch, desk-INT-A1 flake): look and
-        // read in one call, so no request can come in between.
+        // it leave; one that ran another thread meanwhile left through the switch, a flake of the A1 integration
+        // run): look and read in one call, so no request can come in between.
         let mut kept = 0u64;
         for &c in &aps {
             let r = on(c, ap_read_lazy, base + 2 * P)?;
@@ -498,7 +498,9 @@ fn stacks() -> TestResult {
         sched::sleep_ns(1_000_000);
     }
     let s1 = tlb::stats();
-    kassert!(s1.kernel >= s0.kernel + 6, "kernel shootdowns {} -> {}", s0.kernel, s1.kernel);
+    // One round for every stack a reaper pass finds (not one per stack): the six may share a single round. That
+    // each CPU dropped every one of them is what the probes below judge.
+    kassert!(s1.kernel > s0.kernel, "kernel shootdowns {} -> {}", s0.kernel, s1.kernel);
     let mut checked = 0;
     let seen: Vec<(i32, u64)> = seen.lock().clone();
     for (_, bottom) in seen {
@@ -588,6 +590,8 @@ static BUSY_NS: AtomicU64 = AtomicU64::new(0);
 static BUSY_ROOT: AtomicU64 = AtomicU64::new(0);
 static BUSY_STARTED: AtomicBool = AtomicBool::new(false);
 static BUSY_DONE: AtomicBool = AtomicBool::new(false);
+/// When `busy_irq`'s spin ended (time::now_ns).
+static BUSY_END: AtomicU64 = AtomicU64::new(0);
 
 /// Spins with interrupts off and without serving requests (a CPU stuck in a long critical section).
 fn busy_irq(_v: u8) {
@@ -602,6 +606,7 @@ fn busy_irq(_v: u8) {
     while time::now_ns() < until {
         core::hint::spin_loop();
     }
+    BUSY_END.store(time::now_ns(), SeqCst);
     BUSY_DONE.store(true, SeqCst);
 }
 
@@ -641,38 +646,48 @@ fn make_busy(cpu: usize, ns: u64, root: u64) -> Result<hal::vectors::Vector, Str
 fn resend() -> TestResult {
     let Some(&c) = aps().first() else { return ktest::fail("one CPU") };
     let a = lazy()?;
-    let base = a.sys_mmap(0, P, RW, AP, 0).map_err(e)?;
-    a.write_u64(base, val(7)).map_err(e)?;
     kassert!(on(c, ap_activate, a.root())? == a.root());
-    let s0 = tlb::stats();
-    let v = make_busy(c, 5_000_000, a.root())?;
-    let here = hal::percpu::this_cpu();
-    let t0 = time::now_ns();
-    let m = a.sys_mprotect(base, P, PROT_READ);
-    let waited = time::now_ns() - t0;
-    let on_busy = here == c || hal::percpu::this_cpu() == c;
-    let r = wait_flag(&BUSY_DONE, "busy handler end");
-    hal::vectors::free(v);
-    r?;
-    m.map_err(e)?;
-    if on_busy {
-        // This thread ran on the busy CPU itself (it may migrate since SC-3): the change came after the busy end.
-        return ktest::fail("the test thread ran on the busy CPU");
+    // A round says nothing when the busy CPU's spin was over before a resend was due: this thread was off its CPU
+    // for those 5 ms (the host took the vCPU, gate of 13.11.: mprotect after 3408 ns, the spin long ended). Such a
+    // round is repeated on a fresh page; only a round that met the busy CPU is judged.
+    for _ in 0..5 {
+        let base = a.sys_mmap(0, P, RW, AP, 0).map_err(e)?;
+        a.write_u64(base, val(7)).map_err(e)?;
+        let s0 = tlb::stats();
+        let v = make_busy(c, 5_000_000, a.root())?;
+        let here = hal::percpu::this_cpu();
+        let t0 = time::now_ns();
+        let m = a.sys_mprotect(base, P, PROT_READ);
+        let waited = time::now_ns() - t0;
+        let on_busy = here == c || hal::percpu::this_cpu() == c;
+        let r = wait_flag(&BUSY_DONE, "busy handler end");
+        hal::vectors::free(v);
+        r?;
+        m.map_err(e)?;
+        if on_busy {
+            // This thread ran on the busy CPU itself (it may migrate since SC-3): the change came after the busy end.
+            return ktest::fail("the test thread ran on the busy CPU");
+        }
+        if BUSY_END.load(SeqCst) < t0 + tlb::RESEND_NS {
+            klog::event!(Info, "mm", "ktest.tlb_resend_late", late_us = (t0.saturating_sub(BUSY_END.load(SeqCst))) / 1000);
+            continue;
+        }
+        let s1 = tlb::stats();
+        kassert!(s1.resends > s0.resends, "no resend while CPU {c} was busy ({waited} ns)");
+        kassert!(s1.give_ups == s0.give_ups, "gave up on a CPU busy for 5 ms");
+        kassert!(waited >= tlb::RESEND_NS, "mprotect returned after {waited} ns while CPU {c} could not answer");
+        {
+            let _s = probe::user_probes().map_err(e)?;
+            WRITE_VAL.store(val(7), SeqCst);
+            let w = on(c, ap_write, base)?;
+            kassert!(w & FAULT != 0 && w & PF_W != 0, "CPU {c} writes the read-only page: {w:#x}");
+        }
+        drop(a);
+        kassert!(on(c, ap_root, 0)? == paging::home_root());
+        klog::event!(Info, "mm", "ktest.tlb_resend", waited_us = waited / 1000, resends = s1.resends - s0.resends);
+        return Ok(());
     }
-    let s1 = tlb::stats();
-    kassert!(s1.resends > s0.resends, "no resend while CPU {c} was busy ({waited} ns)");
-    kassert!(s1.give_ups == s0.give_ups, "gave up on a CPU busy for 5 ms");
-    kassert!(waited >= tlb::RESEND_NS, "mprotect returned after {waited} ns while CPU {c} could not answer");
-    {
-        let _s = probe::user_probes().map_err(e)?;
-        WRITE_VAL.store(val(7), SeqCst);
-        let w = on(c, ap_write, base)?;
-        kassert!(w & FAULT != 0 && w & PF_W != 0, "CPU {c} writes the read-only page: {w:#x}");
-    }
-    drop(a);
-    kassert!(on(c, ap_root, 0)? == paging::home_root());
-    klog::event!(Info, "mm", "ktest.tlb_resend", waited_us = waited / 1000, resends = s1.resends - s0.resends);
-    Ok(())
+    ktest::fail("5 rounds in a row came after the busy CPU's spin had ended")
 }
 ktest!("mm.tlb.resend", Safe, resend);
 
@@ -924,6 +939,15 @@ fn storm_irq(_v: u8) {
     S_DONE.fetch_add(1, SeqCst);
 }
 
+/// Where the storm's own threads run: pinned to the test's CPU (the boot CPU). The worker APs sit in an interrupt
+/// handler with interrupts off until the storm ends, so a thread the scheduler queued on one of them (it looks
+/// idle, or less busy than the boot CPU) first ran when the storm was over: with all four there the run counted 0
+/// operations (`mm.tlb.storm_under_load` red on 11.11.2026, also without any page migration in the kernel). On an
+/// AP that idles with the root loaded it would take the real IPIs off that AP.
+fn beside_me() -> sched::SpawnOpts {
+    sched::SpawnOpts { cpu: Some(sched::current_cpu()), pin: true, ..sched::SpawnOpts::default() }
+}
+
 /// One BSP thread: every `step`-th page from `first`, round and round, until `until`.
 fn storm_thread(a: &AddressSpace, first: usize, step: usize, until: u64) -> Result<u64, String> {
     let base = S_BASE.load(SeqCst);
@@ -1014,7 +1038,7 @@ fn storm() -> TestResult {
         for k in 0..THREADS {
             let (a, ops, errs) = (a.clone(), ops.clone(), errs.clone());
             let until = t0 + RUN_NS;
-            match sched::spawn("mm.tlb.storm", sched::Class::Normal, move || match storm_thread(&a, k, THREADS, until) {
+            match sched::spawn_with("mm.tlb.storm", sched::Class::Normal, beside_me(), move || match storm_thread(&a, k, THREADS, until) {
                 Ok(n) => {
                     ops.fetch_add(n, SeqCst);
                 }
@@ -1099,7 +1123,7 @@ fn storm_under_load() -> TestResult {
     let mut started = Ok(());
     for k in 0..4 {
         let (stop, errs) = (stop.clone(), errs.clone());
-        match sched::spawn("mm.tlb.load", sched::Class::Normal, move || {
+        match sched::spawn_with("mm.tlb.load", sched::Class::Normal, beside_me(), move || {
             if let Err(x) = load_thread(&stop, k + 1) {
                 errs.lock().push(x);
             }

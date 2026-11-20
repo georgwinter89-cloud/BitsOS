@@ -6,6 +6,7 @@ use crate::events::{Level, q};
 use crate::guard;
 use crate::journal::Journal;
 use crate::key::Applier;
+use crate::owners::{self, Records};
 use crate::registry::Registry;
 use crate::store::{self, Job, Place, RawPlace};
 use crate::tomlish;
@@ -17,6 +18,8 @@ pub(crate) struct Loaded {
     groups: Vec<(String, Value)>,
     config: String,
     journal: Journal,
+    owners: Records,
+    open_bits: Option<u32>,
 }
 
 /// How long the resync waits at most between tries (doubling from 10 s).
@@ -25,6 +28,13 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 const RETRY_STEADY: Duration = Duration::from_secs(10);
 /// The first gap after a start on the fallback (doubling up to `RETRY_STEADY`).
 const START_RETRY: Duration = Duration::from_secs(1);
+/// GP-START: how often the fallback looks whether the kernel finished making data.img.
+const BUSY_LOOK: Duration = Duration::from_secs(1);
+/// After the stick was last seen busy: a worker still stuck behind that write is waited for quietly this long.
+const BUSY_GRACE: Duration = Duration::from_secs(10);
+/// A data.img still being made after this long counts as a hung stick after all (the tries and warnings resume
+/// and stay for the rest of that creation: `busy_since` is kept, so `busy_now` stays false).
+pub(crate) const BUSY_MAX: Duration = Duration::from_secs(15 * 60);
 
 impl Registry {
     /// Parses what [`store::read_raw`] read on the worker; bad lines and unreadable files become events.
@@ -59,7 +69,23 @@ impl Registry {
         if bad > 0 {
             self.ev.emit(Level::Warn, "journal.bad_lines", &format!("count={bad}"));
         }
-        Loaded { groups, config, journal }
+        let (owners, bad) = owners::parse(&raw.owners);
+        if bad > 0 {
+            self.ev.emit(Level::Warn, "owners.bad_lines", &format!("count={bad}"));
+        }
+        Loaded { groups, config, journal, owners, open_bits: raw.open_bits }
+    }
+
+    /// Says once per load when secrets lie where others can read them: a kernel whose FAT shows `settings\`
+    /// open to every user (before INT-CL3T made the folder root's), a fallback someone made by hand.
+    fn report_open(&self, l: &Loaded) {
+        if let Some(bits) = l.open_bits.filter(|b| *b != 0 && !self.secrets.is_empty()) {
+            self.ev.emit(
+                Level::Warn,
+                "secrets.readable",
+                &format!("dir={} others={bits:03o} secrets={}", self.paths.dir(&self.place).display(), self.secrets.len()),
+            );
+        }
     }
 
     /// Probes the stick and reads it (plus the fallback when a resync is due) on the worker, within the
@@ -85,7 +111,7 @@ impl Registry {
     fn read_fallback(&mut self) -> Loaded {
         let paths = self.paths.clone();
         let raw = self.writer.call(move || {
-            let _ = std::fs::create_dir_all(&paths.fallback);
+            let _ = store::private_dir(&paths.fallback);
             let pending = store::read_text(&paths.pending()).unwrap_or_default();
             (store::read_raw(&paths, &Place::Fallback(String::new())), pending)
         });
@@ -97,7 +123,13 @@ impl Registry {
             Err(e) => {
                 self.ev.emit(Level::Error, "fallback.unreadable", &format!("error={}", q(&e)));
                 self.replace_writer();
-                Loaded { groups: Vec::new(), config: String::new(), journal: Journal::default() }
+                Loaded {
+                    groups: Vec::new(),
+                    config: String::new(),
+                    journal: Journal::default(),
+                    owners: Records::new(),
+                    open_bits: None,
+                }
             }
         }
     }
@@ -147,10 +179,16 @@ impl Registry {
                 self.place = Place::Stick;
                 let base = self.parse_place(raw);
                 self.take(&base);
+                self.secrets = base.owners.clone();
+                self.report_open(&base);
                 self.journal = base.journal;
                 if let Some(fb) = fb {
                     // settingsd ran on the fallback earlier in this boot: carry those changes over.
                     let fb = self.parse_place(fb);
+                    // Records made on the fallback come along; where both name a key, the stick's is the older.
+                    for (k, b) in &fb.owners {
+                        self.secrets.entry(k.clone()).or_insert_with(|| b.clone());
+                    }
                     let keys: BTreeSet<String> = store::read_text(&self.paths.pending())
                         .unwrap_or_default()
                         .lines()
@@ -161,12 +199,13 @@ impl Registry {
                     self.take(&fb);
                     let fb_state = (self.values.clone(), self.orphans.clone());
                     (self.values, self.orphans) = stick_state;
-                    self.overlay(&keys, &fb_state.0, &fb_state.1);
+                    self.overlay(&self.without_redirects(&keys), &fb_state.0, &fb_state.1);
                     let last = self.journal.entries.last().map_or(0, |e| e.seq);
                     for e in fb.journal.entries.into_iter().filter(|e| e.seq > last) {
                         self.journal.push_loaded(e);
                     }
                     self.pending = keys;
+                    self.drop_forgotten_records();
                     self.push_pending("start");
                 }
                 self.ev.emit(
@@ -177,6 +216,7 @@ impl Registry {
                 self.migrate();
             }
             Err(why) => {
+                let (why, level) = self.off_stick(why);
                 self.place = Place::Fallback(why.clone());
                 // At boot the stick may not be decided yet (read-only until `fat stick.decided`, about 1 s after
                 // settingsd starts): try again soon, 1, 2, 4, 8 s apart, then every 10 s (MM-9 CR6).
@@ -184,12 +224,10 @@ impl Registry {
                 self.retry_at = Instant::now() + START_RETRY;
                 let l = self.read_fallback();
                 self.take(&l);
+                self.secrets = l.owners.clone();
+                self.report_open(&l);
                 self.journal = l.journal;
-                self.ev.emit(
-                    Level::Warn,
-                    "fallback",
-                    &format!("reason={} dir={}", q(&why), self.paths.fallback.display()),
-                );
+                self.ev.emit(level, "fallback", &format!("reason={} dir={}", q(&why), self.paths.fallback.display()));
             }
         }
     }
@@ -214,6 +252,8 @@ impl Registry {
 
     /// Moves to the fallback after a failed or hung stick write: the whole state is written there.
     pub(crate) fn move_to_fallback(&mut self, why: &str) {
+        let (why, level) = self.off_stick(why.to_string());
+        let why = why.as_str();
         self.replace_writer();
         self.place = Place::Fallback(why.to_string());
         let mut jobs = Vec::new();
@@ -238,12 +278,13 @@ impl Registry {
         }
         jobs.push(Job::Write(self.paths.config(&self.place), cfg.into_bytes()));
         jobs.push(Job::Write(self.paths.dir(&self.place).join("journal.log"), self.journal.text().into_bytes()));
+        jobs.push(self.owners_job(&self.place));
         jobs.push(self.pending_job());
         self.retry_every = RETRY_STEADY;
         self.retry_at = Instant::now() + self.retry_every;
         match self.writer.run(jobs) {
             Ok(()) => self.ev.emit(
-                Level::Warn,
+                level,
                 "fallback",
                 &format!("reason={} dir={} pending={}", q(why), self.paths.fallback.display(), self.pending.len()),
             ),
@@ -264,11 +305,12 @@ impl Registry {
             jobs.push(self.job_for(k));
         }
         jobs.push(Job::Write(self.paths.dir(&Place::Stick).join("journal.log"), self.journal.text().into_bytes()));
+        jobs.push(self.owners_job(&Place::Stick));
         match self.writer.run(jobs) {
             Ok(()) => {
                 let n = self.pending.len();
                 self.pending.clear();
-                for f in ["PENDING", "CONFIG.TXT", "journal.log"] {
+                for f in ["PENDING", "CONFIG.TXT", "journal.log", owners::FILE] {
                     let _ = std::fs::remove_file(self.paths.fallback.join(f));
                 }
                 for g in &groups {
@@ -284,11 +326,70 @@ impl Registry {
                 } else {
                     // The stick write may still hang in the old worker; the fallback gets a fresh one.
                     self.replace_writer();
+                    self.end_busy_wait(&e, false);
                 }
                 self.ev.emit(Level::Warn, "resync.failed", &format!("when={why} error={}", q(&e)));
                 false
             }
         }
+    }
+
+    /// The kernel is making data.img on the stick, and not for longer than `BUSY_MAX`.
+    fn busy_now(&self) -> bool {
+        self.paths.stick_busy() && self.busy_since.is_none_or(|t| t.elapsed() < self.busy_max)
+    }
+
+    /// A try failed and it was not the wait for data.img. While the kernel still makes it (past `busy_max`),
+    /// `busy_since` stays: the stick counts as hung for the rest of that creation, and the plain line later says
+    /// the true wait. Once the kernel is done the wait is over: a refusal of another kind (`refused`, no stick,
+    /// read-only) is said as a warning, since the fallback's first line was only Info, and no later line
+    /// claims the stick was busy with data.img.
+    fn end_busy_wait(&mut self, reason: &str, refused: bool) {
+        let was_busy = matches!(&self.place, Place::Fallback(w) if w.starts_with(store::BUSY));
+        if was_busy {
+            self.place = Place::Fallback(reason.to_string());
+        }
+        if self.paths.stick_busy() {
+            return;
+        }
+        self.busy_seen = None;
+        if self.busy_since.take().is_some() && refused && was_busy {
+            self.ev.emit(
+                Level::Warn,
+                "fallback",
+                &format!("reason={} dir={} pending={}", q(reason), self.paths.fallback.display(), self.pending.len()),
+            );
+        }
+    }
+
+    /// GP-START: a deadline that passed while the kernel made data.img is the system's own big write, not a hang:
+    /// the reason says so (`store::BUSY`) and the line is Info; the fallback then waits for that write quietly.
+    fn off_stick(&mut self, why: String) -> (String, Level) {
+        if !why.starts_with(store::SLOW) || !self.busy_now() {
+            return (why, Level::Warn);
+        }
+        let now = Instant::now();
+        self.busy_since.get_or_insert(now);
+        self.busy_seen = Some(now);
+        (format!("{}the stick is making the data volume (data.img)", store::BUSY), Level::Info)
+    }
+
+    /// While the kernel makes data.img the stick is not touched (a probe would only queue behind that write and
+    /// time out): looked at again every second, quietly, and the same for a worker still stuck behind the write
+    /// shortly after it ended. False: go on with the ordinary try.
+    fn waits_for_busy_stick(&mut self) -> bool {
+        let now = Instant::now();
+        if self.busy_now() {
+            if self.busy_since.is_none() {
+                self.busy_since = Some(now);
+                self.ev.emit(Level::Info, "resync.waiting", "reason=busy");
+            }
+            self.busy_seen = Some(now);
+        } else if !(self.busy_seen.is_some_and(|t| now.duration_since(t) < BUSY_GRACE) && self.still_hung()) {
+            return false;
+        }
+        self.retry_at = now + BUSY_LOOK;
+        true
     }
 
     /// Tries the stick at once instead of waiting for the back-off. Today only the store tests (tests/store.rs) call
@@ -312,6 +413,9 @@ impl Registry {
         if !matches!(self.place, Place::Fallback(_)) || Instant::now() < self.retry_at {
             return false;
         }
+        if self.waits_for_busy_stick() {
+            return false;
+        }
         if self.still_hung() {
             // The abandoned write has not returned yet: touching the stick now could only hang another
             // thread, and its late write must land before the resync reads the stick.
@@ -322,10 +426,16 @@ impl Registry {
         let raw = match self.read_stick(false) {
             Ok((raw, _)) => raw,
             Err(e) => {
-                if e.starts_with(store::SLOW) {
+                if e.starts_with(store::SLOW) && self.busy_now() {
+                    // The write began while this probe waited: wait for it like the others.
+                    let _ = self.off_stick(e);
+                    self.retry_at = Instant::now() + BUSY_LOOK;
+                } else if e.starts_with(store::SLOW) {
+                    self.end_busy_wait(&e, false);
                     self.ev.emit(Level::Warn, "resync.failed", &format!("when=probe error={}", q(&e)));
                     self.back_off();
                 } else {
+                    self.end_busy_wait(&e, true);
                     if self.retry_every < RETRY_STEADY {
                         self.retry_every = (self.retry_every * 2).min(RETRY_STEADY);
                     }
@@ -338,15 +448,32 @@ impl Registry {
             self.defs.keys().filter_map(|k| Some((k.clone(), self.effective(k)?))).collect();
         let mem = (self.values.clone(), self.orphans.clone(), std::mem::take(&mut self.journal));
         let base = self.parse_place(raw);
+        // Before the values are taken: a key that loses its definition here keeps its stored value unregistered.
+        self.merge_records(&base.owners);
         self.take(&base);
-        self.overlay(&self.pending.clone(), &mem.0, &mem.1);
+        self.overlay(&self.without_redirects(&self.pending), &mem.0, &mem.1);
+        let records = self.secrets.clone();
+        self.drop_forgotten_records();
         let last = base.journal.entries.last().map_or(0, |e| e.seq);
         self.journal = base.journal;
         for e in mem.2.entries.iter().filter(|e| e.seq > last) {
             self.journal.push_loaded(e.clone());
         }
+        let carried = self.pending.len();
         if self.push_pending("stick back") {
             self.retry_every = RETRY_STEADY;
+            self.busy_seen = None;
+            if let Some(t) = self.busy_since.take() {
+                // The one line Georg sees after the wait (the console shows warnings, not Info).
+                self.ev.emit(
+                    Level::Warn,
+                    "back_on_stick",
+                    &format!(
+                        "keys={carried} waited_s={} | Der Stick hat den Datenbereich angelegt; die Einstellungen sind jetzt dort gespeichert",
+                        t.elapsed().as_secs()
+                    ),
+                );
+            }
             // Values Georg changed on the stick meanwhile reach the watchers too.
             for (k, old) in before {
                 if let Some(v) = self.effective(&k)
@@ -361,7 +488,9 @@ impl Registry {
                     self.notify(&k, &line);
                 }
             }
+            self.settle_load();
         } else {
+            self.secrets = records;
             (self.values, self.orphans, self.journal) = mem;
             self.back_off();
         }

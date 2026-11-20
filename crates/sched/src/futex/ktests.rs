@@ -182,12 +182,24 @@ fn requeue_storm() -> TestResult {
     Ok(())
 }
 
+/// Every waiter is queued; each gives back what it made for its bucket before it sleeps (a waiter that grew the
+/// bucket held the old vector, one that lost the race an unused spare, for as long as it slept). A queued
+/// waiter may still be a few instructions before that, hence the short wait.
+fn no_room_held(what: &str) -> TestResult {
+    let end = time::now_ns() + 10 * SEC;
+    while super::rooms_held() != 0 {
+        kassert!(time::now_ns() < end, "{what}: {} sleeping waiter(s) still hold a bucket's old or spare vector", super::rooms_held());
+        crate::sleep_ns(MS / 4);
+    }
+    Ok(())
+}
+
 // futex_waitv on the core: the highest woken index, a mismatch, a timeout.
 ktest!("sc.futex.core.waitv", Safe, waitv);
 fn waitv() -> TestResult {
     let sp = KSpace::new(8);
     let base = super::waiters();
-    let items: Vec<super::WaitvItem> = (0..4).map(|i| super::WaitvItem { addr: KSpace::a(i), val: 0, shared: false }).collect();
+    let items: Vec<super::WaitvItem> = (0..4).map(|i| super::WaitvItem { addr: KSpace::a(i), val: 0, flags: super::Flags::default() }).collect();
     let (sp2, it2) = (sp.clone(), items.clone());
     let w = spawn_r("sc-fxc-wv", move || super::wait_multiple(&*sp2, &it2, None).unwrap_or_else(|e| -e))?;
     queued(base, 4)?;
@@ -198,5 +210,59 @@ fn waitv() -> TestResult {
     kassert!(super::wait_multiple(&*sp, &items, None) == Err(EAGAIN), "mismatch");
     kassert!(super::wait_multiple(&*sp, &items[..2], Some(Deadline::Monotonic(time::now_ns() + 5 * MS))) == Err(ETIMEDOUT), "timeout");
     kassert!(super::waiters() == base, "waiters left behind");
+    Ok(())
+}
+
+// ATOMIC-2: buckets of several pages. 300 waiters on one word (twelve kilobytes of entries in one bucket) are
+// moved to another word in one requeue and woken there; then 150 futex_waitv callers fill two more buckets. The
+// buckets' room is made with their locks dropped (`Room`), so nobody is lost while a bucket is replaced.
+ktest!("sc.futex.core.crowd", Safe, crowd);
+fn crowd() -> TestResult {
+    const T: usize = 300;
+    const V: usize = 150;
+    let sp = KSpace::new(8);
+    let base = super::waiters();
+    let grown = super::ROOM_GROWN.get();
+    let mut hs = Vec::new();
+    for i in 0..T {
+        let sp = sp.clone();
+        hs.push(spawn_r(&format!("sc-fxc-c{i}"), move || match super::wait(&*sp, KSpace::a(0), false, 0, !0, Some(Deadline::Monotonic(time::now_ns() + 60 * SEC))) {
+            Ok(()) => 0,
+            Err(e) => -e,
+        })?);
+    }
+    queued(base, T)?;
+    no_room_held("wait")?;
+    // One is woken, the others move in one step: the target bucket's room for all of them is made first.
+    let n = super::requeue(&*sp, KSpace::a(0), KSpace::a(1), false, 1, i32::MAX, Some(0));
+    kassert!(n == Ok(T as i64), "requeue of {T} waiters answered {n:?}");
+    kassert!(super::waiters() == base + T - 1, "{} waiters after the requeue, {} expected", super::waiters() - base, T - 1);
+    kassert!(super::wake(&*sp, KSpace::a(0), false, i32::MAX, !0) == Ok(0), "a waiter stayed on the first word");
+    let woken = super::wake(&*sp, KSpace::a(1), false, i32::MAX, !0);
+    kassert!(woken == Ok(T as i64 - 1), "wake on the second word answered {woken:?}");
+    for h in &hs {
+        let got = result(h, 30 * SEC);
+        kassert!(got == Some(0), "a waiter ended with {got:?}");
+    }
+    kassert!(super::waiters() == base, "waiters left behind");
+    let items = [super::WaitvItem { addr: KSpace::a(2), val: 0, flags: super::Flags::default() }, super::WaitvItem { addr: KSpace::a(3), val: 0, flags: super::Flags::default() }];
+    let mut hs = Vec::new();
+    for i in 0..V {
+        let sp = sp.clone();
+        hs.push(spawn_r(&format!("sc-fxc-v{i}"), move || super::wait_multiple(&*sp, &items, Some(Deadline::Monotonic(time::now_ns() + 60 * SEC))).unwrap_or_else(|e| -e))?);
+    }
+    queued(base, 2 * V)?;
+    no_room_held("futex_waitv")?;
+    let woken = super::wake(&*sp, KSpace::a(3), false, i32::MAX, !0);
+    kassert!(woken == Ok(V as i64), "wake of the waitv callers answered {woken:?}");
+    for h in &hs {
+        let got = result(h, 30 * SEC);
+        kassert!(got == Some(1), "a waitv caller answered {got:?}");
+    }
+    kassert!(super::waiters() == base, "waitv entries left behind");
+    let grown = super::ROOM_GROWN.get() - grown;
+    // Doubling from an empty bucket to 300 entries alone is nine steps.
+    kassert!(grown >= 9, "the buckets' room was made only {grown} times outside their locks");
+    klog::event!(Info, "sc", "futex.crowd", waiters = T, waitv = V, room_grown = grown);
     Ok(())
 }

@@ -3,6 +3,9 @@
 //! - `\BITSOS2\STICK.ID` is never written, renamed, removed or created (EPERM);
 //! - `\BITSOS2\SYS\` (the system generations and their NEW/TRY/OK/PIN markers) only through the narrow API of
 //!   `sysapi` (RB-6, install); any other change there is EPERM;
+//! - `\BITSOS2\CRASH\` (CRASHDISK: the panic record's slots, whose disk blocks the panic path writes without the
+//!   file system) only through `crash_area` under the same grant: a program moving or freeing those clusters
+//!   would have the next panic write into another file;
 //! - `\BITSOS2\CONFIG.TXT` may be written, but no write may add or change a line of the keys only Georg sets
 //!   (`wlan`, `nvme_write`, `stick_write`, `usb_msd_write`; R8a/R8d; the same rule as MC's file tools);
 //! - a name matches a protected one by its long name (case-insensitive, trailing dots ignored) **or** its 8.3
@@ -24,6 +27,8 @@ pub enum Class {
     Config,
     /// `\BITSOS2\SYS\` and everything below it.
     Sys,
+    /// `\BITSOS2\CRASH\` and everything below it (CRASHDISK): changed only under the SYS grant, shown root's.
+    Crash,
     /// Everything else below `\BITSOS2\`.
     Free,
     /// `\BITSOS2\home\` and everything below it: written like `Free`, but owned by the desktop user 1000:1000
@@ -31,6 +36,9 @@ pub enum Class {
     Home,
     /// `\BITSOS2\mcp\` and everything below it (INT-W17, MC-8b CR 3): written like `Free`, but shown root's
     /// with 0700/0600, so only root reads the MCP service's TLS key, its pairings and the installer's grants.
+    /// `\BITSOS2\settings\` too (INT-CL3T, CL-S CR 1): settingsd's files hold the AI providers' keys in clear.
+    /// `\BITSOS2\data.img` too (GP-START): all of /data, and unwritten clusters of the stick's past.
+    /// `\BITSOS2\UPDATE\` too (UPDATE): where the update service looks for versions (SOURCE.TXT, a test CA).
     Private,
 }
 
@@ -43,9 +51,10 @@ impl Class {
             Class::StickId => "STICK.ID",
             Class::Config => "CONFIG.TXT",
             Class::Sys => "SYS",
+            Class::Crash => "CRASH",
             Class::Free => "BITSOS2 file",
             Class::Home => "home",
-            Class::Private => "mcp",
+            Class::Private => "root only",
         }
     }
 }
@@ -53,6 +62,13 @@ impl Class {
 /// Whether a component (shown name, 8.3 alias key) is the protected name `p` (upper case).
 pub fn is(name: &[u8], alias: &[u8], p: &[u8]) -> bool {
     crate::name::fold(name) == p || alias == p
+}
+
+/// GP-START: `\BITSOS2\data.img` (and `data.img.new` while it is made) holds all of /data, and clusters fs-ext4 left
+/// unwritten show what the stick held there before: root's alone, like `mcp\` (the long name only: the image is
+/// only ever made by that name).
+fn data_image(name: &[u8]) -> bool {
+    matches!(crate::name::fold(name).as_slice(), b"DATA.IMG" | b"DATA.IMG.NEW")
 }
 
 /// The class of a child of a directory of class `parent`, named `name` with alias key `alias`.
@@ -70,9 +86,11 @@ pub fn child_class(parent: Class, name: &[u8], alias: &[u8]) -> Class {
                 Class::StickId
             } else if is(name, alias, b"SYS") {
                 Class::Sys
+            } else if is(name, alias, b"CRASH") {
+                Class::Crash
             } else if is(name, alias, b"HOME") {
                 Class::Home
-            } else if is(name, alias, b"MCP") {
+            } else if is(name, alias, b"MCP") || is(name, alias, b"SETTINGS") || is(name, alias, b"UPDATE") || data_image(name) {
                 Class::Private
             } else if is(name, alias, b"CONFIG.TXT") {
                 Class::Config
@@ -81,6 +99,7 @@ pub fn child_class(parent: Class, name: &[u8], alias: &[u8]) -> Class {
             }
         }
         Class::Sys => Class::Sys,
+        Class::Crash => Class::Crash,
         Class::Home => Class::Home,
         Class::Private => Class::Private,
         Class::Outside => Class::Outside,
@@ -114,7 +133,7 @@ impl Rules {
         match (dir, child) {
             (Class::Root | Class::Outside, _) => Err(EROFS),
             (_, Class::StickId) => Err(EPERM),
-            (Class::Sys, _) | (_, Class::Sys) => self.sys_ok(),
+            (Class::Sys | Class::Crash, _) | (_, Class::Sys | Class::Crash) => self.sys_ok(),
             _ => Ok(()),
         }
     }
@@ -127,7 +146,7 @@ impl Rules {
         match c {
             Class::Root | Class::Outside | Class::Bitsos2 => Err(EROFS),
             Class::StickId => Err(EPERM),
-            Class::Sys => self.sys_ok(),
+            Class::Sys | Class::Crash => self.sys_ok(),
             Class::Config | Class::Free | Class::Home | Class::Private => Ok(()),
         }
     }
@@ -140,7 +159,7 @@ impl Rules {
         match c {
             Class::Root | Class::Outside | Class::Bitsos2 => Err(EROFS),
             Class::StickId => Err(EPERM),
-            Class::Sys => self.sys_ok(),
+            Class::Sys | Class::Crash => self.sys_ok(),
             Class::Config | Class::Free | Class::Home | Class::Private => Ok(()),
         }
     }
@@ -150,7 +169,7 @@ impl Rules {
     /// is refused without it.
     pub fn writeback(&self, c: Class) -> Result<(), i64> {
         match c {
-            Class::Sys => Rules { sys: true, ..*self }.write(c),
+            Class::Sys | Class::Crash => Rules { sys: true, ..*self }.write(c),
             _ => self.write(c),
         }
     }
@@ -165,7 +184,13 @@ impl Rules {
 /// NV-2p (Georg 5.11.): `nvme_data`, the window into the Windows SSD; `bitsdisk` adds it, typed at the real keyboard
 /// (`with_keyboard_line`). Dropping it is allowed: the disk is then read-only and /data on the stick.
 /// Georg 6.11.: `nvme_boot`, the one EFI System partition the window's disk may hold (BitsOS's own).
-pub const GUARDED_KEYS: &[&str] = &["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+/// GP-GUARD (14.11.): `gp_net` and `gp_stick`, the Gaming-PC profile's two tier lines. They are all that releases
+/// anything under that profile, and with `gp_stick=on` CONFIG.TXT is writable: without the guard a program or a
+/// remote client could give a stick that has `gp_stick=on` alone the network at its next start, or put back a tier
+/// Georg took away. No other machine reads the two keys.
+/// GP-DISK (15.11.): `gp_nvme`, the one NVMe controller of the Gaming-PC that may get a driver: a program or a
+/// remote client must not name a disk for the driver, nor move the line to another one.
+pub const GUARDED_KEYS: &[&str] = &["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer", "gp_net", "gp_stick", "gp_nvme"];
 
 /// NV-2p: the one guarded line the kernel is writing right now for Georg (key, value), and only while it does.
 static KEYBOARD_LINE: ksync::SpinLock<Option<(String, String)>> = ksync::SpinLock::named("fat.keyboard_line", None);
@@ -333,11 +358,11 @@ mod tests {
 
     #[test]
     fn secrets_redacted_and_kept() {
-        let old = b"token=abc\nwlan_psk = correct horse # mine\r\nwlan=on\nwlan_pskx=1\n";
+        let old = b"token=abc\nwlan_psk = correct horse # mine\r\ntz=UTC\nwlan_pskx=1\n";
         let r = redact_config(old);
-        assert_eq!(r, b"token=***\nwlan_psk =***\r\nwlan=on\nwlan_pskx=1\n".to_vec());
+        assert_eq!(r, b"token=***\nwlan_psk =***\r\ntz=UTC\nwlan_pskx=1\n".to_vec());
         // A file built from the redacted read keeps the stick's values; a new real value wins.
-        assert_eq!(unredact_config(old, &r), b"token=abc\nwlan_psk =correct horse\r\nwlan=on\nwlan_pskx=1\n".to_vec());
+        assert_eq!(unredact_config(old, &r), b"token=abc\nwlan_psk =correct horse\r\ntz=UTC\nwlan_pskx=1\n".to_vec());
         assert_eq!(unredact_config(old, b"token=new\nwlan_psk=***\n"), b"token=new\nwlan_psk=correct horse\n".to_vec());
         // Without an old value the redacted line goes.
         assert_eq!(unredact_config(b"", b"token=t\nwlan_psk=***\nx=1"), b"token=t\nx=1".to_vec());
@@ -380,6 +405,21 @@ mod tests {
         assert_eq!(child_class(Class::Bitsos2, b"Mcp", b"MCP"), Class::Private);
         assert_eq!(child_class(Class::Private, b"paired", b"PAIRED"), Class::Private, "inherited");
         assert_eq!(child_class(Class::Free, b"mcp", b"MCP"), Class::Free, "only directly below BITSOS2");
+        assert_eq!(child_class(Class::Bitsos2, b"settings", b"SETTINGS"), Class::Private);
+        assert_eq!(child_class(Class::Bitsos2, b"Settings.", b"SETTIN~1"), Class::Private, "by its long name");
+        // GP-START: the data image is root's alone, the half-made one too; a look-alike name is not.
+        assert_eq!(child_class(Class::Bitsos2, b"data.img", b"DATA.IMG"), Class::Private);
+        assert_eq!(child_class(Class::Bitsos2, b"Data.Img.New", b"DATAIM~1.NEW"), Class::Private);
+        assert_eq!(child_class(Class::Bitsos2, b"data.img2", b"DATA.IMG"), Class::Free);
+        assert_eq!(child_class(Class::Root, b"data.img", b"DATA.IMG"), Class::Outside, "only below BITSOS2");
+        assert_eq!(child_class(Class::Bitsos2, b"x", b"SETTINGS"), Class::Private, "by alias");
+        assert_eq!(child_class(Class::Private, b"ai.toml", b"AI.TOML"), Class::Private, "inherited");
+        assert_eq!(child_class(Class::Free, b"settings", b"SETTINGS"), Class::Free, "only directly below BITSOS2");
+        assert_eq!(child_class(Class::Bitsos2, b"settings2", b"SETTIN~1"), Class::Free, "another name");
+        assert_eq!(child_class(Class::Bitsos2, b"UPDATE", b"UPDATE"), Class::Private, "UPDATE: the token's folder");
+        assert_eq!(child_class(Class::Bitsos2, b"x", b"UPDATE"), Class::Private, "by alias");
+        assert_eq!(child_class(Class::Private, b"TOKEN", b"TOKEN"), Class::Private, "inherited");
+        assert_eq!(child_class(Class::Bitsos2, b"updates", b"UPDATES"), Class::Free, "another name");
     }
 
     #[test]
@@ -419,7 +459,7 @@ mod tests {
         assert_eq!(config_guard(b"nvme_write=off\n", b"nvme_write=on\n"), Err(String::from("nvme_write")));
         assert_eq!(config_guard(b"", b" NVME_WRITE = on \r\n"), Err(String::from("nvme_write")));
         assert!(config_guard(b"", b"#nvme_write=on\n").is_ok());
-        assert!(config_guard(b"wlan=off\n", b"wlan=on\n").is_ok(), "wlan is no guarded key (R8d, 21.10.)");
+        assert!(config_guard(b"tz=UTC\n", b"tz=Europe/Berlin\n").is_ok(), "tz is no guarded key");
         assert_eq!(config_guard(b"x=1\n", "\u{feff}stick_write=on\n".as_bytes()), Err(String::from("stick_write")));
     }
 
@@ -437,6 +477,34 @@ mod tests {
         assert_eq!(config_guard(b"mcp_confirmer=bitscomp\n", b"mcp_confirmer=test\n"), k("mcp_confirmer"));
         assert!(config_guard(b"mcp_confirmer=test\n", b"").is_ok(), "dropping test is the safe side");
         assert!(config_guard(b"", b"").is_ok());
+    }
+
+    /// GP-GUARD: only Georg's own edit adds or changes a tier line of the Gaming-PC profile; a write may keep it
+    /// or drop it (the safe side: less is released at the next start).
+    #[test]
+    fn tier_lines_are_guarded() {
+        let k = |s: &str| Err(String::from(s));
+        // A stick with gp_stick=on alone: nobody but Georg gives it the network.
+        assert_eq!(config_guard(b"gp_stick=on\n", b"gp_stick=on\ngp_net=on\n"), k("gp_net"));
+        assert_eq!(config_guard(b"token=t\ngp_net=on\n", b"token=t\ngp_net=on\ngp_stick=on\n"), k("gp_stick"));
+        assert_eq!(config_guard(b"", b"gp_net=on\n"), k("gp_net"));
+        assert_eq!(config_guard(b"gp_net=off\n", b"gp_net=on\n"), k("gp_net"));
+        assert_eq!(config_guard(b"gp_stick=off\ngp_stick=on\n", b"gp_stick=on\n"), Ok(()), "the value it had");
+        assert_eq!(config_guard(b"gp_stick=on\ngp_stick=off\n", b"gp_stick=on\n"), k("gp_stick"), "a dropped last line may not turn it on");
+        // A line Georg removed cannot come back, in any spelling.
+        for line in ["GP_NET=on\n", " gp_net = on \r\n", "\u{feff}gp_net=on", "gp_net=on # desk\n"] {
+            assert_eq!(config_guard(b"gp_stick=on\nscreen=1\n", format!("gp_stick=on\nscreen=1\n{line}").as_bytes()), k("gp_net"), "{line:?}");
+        }
+        // Keeping, dropping and changing free lines beside them stays allowed.
+        assert!(config_guard(b"gp_net=on\ngp_stick=on\n", b"gp_net=on\ngp_stick=on\nloglevel=info\n").is_ok());
+        assert!(config_guard(b"gp_net=on\ngp_stick=on\n", b"gp_stick=on\n").is_ok(), "dropping the network tier");
+        assert!(config_guard(b"gp_net=on\ngp_stick=on\n", b"").is_ok());
+        assert!(GUARDED_KEYS.contains(&"gp_net") && GUARDED_KEYS.contains(&"gp_stick"));
+        // GP-DISK: the named controller the same way: never added, never moved, dropping it is the safe side.
+        assert_eq!(config_guard(b"gp_stick=on\n", b"gp_stick=on\ngp_nvme=81:00.0/1d97:5236\n"), k("gp_nvme"));
+        assert_eq!(config_guard(b"gp_nvme=81:00.0/1d97:5236\n", b"gp_nvme=86:00.0/144d:a80a\n"), k("gp_nvme"));
+        assert_eq!(config_guard(b"gp_nvme=81:00.0/1d97:5236\n", b"GP_NVME = 81:00.0/1d97:5236\r\n"), Ok(()), "the value it had");
+        assert!(config_guard(b"gp_nvme=81:00.0/1d97:5236\n", b"").is_ok());
     }
 
     #[test]

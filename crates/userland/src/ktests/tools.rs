@@ -241,14 +241,14 @@ fn memstress_enomem() -> TestResult {
 }
 ktest!("ul.tools.memstress_enomem", QemuOnly, memstress_enomem);
 
-/// `memstress truncate`: Linux ends a store past the end of a shrunk shared memfd map with SIGBUS. V2 keeps a
-/// mapped page alive after a shrinking truncate (crates/vfs/src/pagecache.rs `truncate`), so the store lands:
-/// a skip naming the change request (ul-UL-4b.md CR3) until that is fixed, then this test passes by itself.
+/// `memstress truncate`: Linux ends a store past the end of a shrunk shared memfd map with SIGBUS, and so must V2
+/// (a shrinking truncate takes the cut pages out of every mapping, crates/vfs/src/pagecache.rs `truncate`). A store
+/// that lands anyway is the failure below.
 fn memstress_truncate() -> TestResult {
     need("/bin/memstress")?;
     let (code, out, err) = run(&["memstress", "truncate"], 60)?;
     if code == 1 && out.contains("the store past the end came back") {
-        return ktest::fail("V2 keeps mapped pages after a shrinking truncate (no SIGBUS): CR3 in plan/notes/ul-UL-4b.md");
+        return ktest::fail("V2 keeps mapped pages after a shrinking truncate (no SIGBUS): UL-4b's CR3, plan/spec/core.md §8.4");
     }
     kassert!(code == 0 && out.starts_with("ok "), "memstress truncate: exit {code}\n{out}{err}");
     Ok(())

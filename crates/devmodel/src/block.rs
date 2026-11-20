@@ -218,6 +218,11 @@ pub trait BlockDevice: Send + Sync {
     fn discard(&self, _lba: u64, _blocks: u64) -> Result<(), DevError> {
         Ok(())
     }
+    /// `discard` at `prio`, for a caller others wait for (a block disk queues `discard` as Background). Default:
+    /// `discard`.
+    fn discard_at(&self, lba: u64, blocks: u64, _prio: IoPriority) -> Result<(), DevError> {
+        self.discard(lba, blocks)
+    }
     /// BL-2: reads every `reqs[i]` (`buf.len()` bytes from `lba`, whole blocks) into its frames; a device may run
     /// them at once and in any order. Default: one after another through a bounce buffer (`bounce_read`).
     fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {
@@ -232,6 +237,10 @@ pub trait BlockDevice: Send + Sync {
     /// block layer lets that many submitters call it together. Default: one at a time.
     fn queue_depth(&self) -> u32 {
         1
+    }
+    /// SYS-K: the medium can be taken out (a SCSI unit's RMB bit; Linux `/sys/block/<disk>/removable`).
+    fn removable(&self) -> bool {
+        false
     }
 }
 

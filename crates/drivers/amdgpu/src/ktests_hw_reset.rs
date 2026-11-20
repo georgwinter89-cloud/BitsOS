@@ -1,7 +1,7 @@
 //! GX-9a: the fake chain's full reset: the stop and the bring-up `psplive` runs on the chip (`stop_chain`, `reinit_chip`), on
 //! the same fakes, with the switches a test wants of a chip that does not play along.
 
-use crate::bo::BoManager;
+use crate::bo::{BoError, BoManager};
 use crate::gpucore::classify;
 use crate::gpucore::disc::Discovery;
 use crate::gpucore::fwload;
@@ -10,7 +10,7 @@ use crate::gpucore::gfxup;
 use crate::gpucore::gmc::GmcInputs;
 use crate::gpucore::handoff::{self, GcFate, RingFate, StopNote, UnloadAddrs};
 use crate::gpucore::mes::{self, MesAddrs, MesInputs};
-use crate::gpucore::psp::{Carve, Hw, Psp, Timeouts, Until};
+use crate::gpucore::psp::{BoAlloc, Carve, Hw, Psp, Timeouts, Until};
 use crate::gpucore::pspbringup::{self, GfxInputs, Inputs};
 use crate::gpucore::pspfake::{self, MapSource};
 use crate::gpucore::sdma::{self, SdmaAddrs, SdmaInputs};
@@ -29,9 +29,24 @@ use alloc::vec::Vec;
 use amdgpu_fmt::addr::Carveout;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use ksync::SpinLock;
+use ksync::{Mutex, SpinLock};
 
-pub(crate) type Shared = Arc<SpinLock<Box<Owner>>>;
+/// The fake chain's owner behind a sleeping lock, as the chip's (`psplive::LIVE`): the stages make their buffers under it,
+/// which a spin lock's holder may not (the heap cannot reclaim there), and a driver path that reached the chain with a spin
+/// lock held would show here as it would on the chip.
+pub(crate) type Shared = Arc<Mutex<Box<Owner>>>;
+
+/// The manager's lock per call, as `psplive::SharedBos` takes the chip's: never over a stage.
+struct Bos<'a>(&'a SpinLock<BoManager>);
+
+impl BoAlloc for Bos<'_> {
+    fn alloc(&mut self, size: u64, align: u64) -> Result<(u32, Range<u64>), BoError> {
+        BoAlloc::alloc(&mut *self.0.lock(), size, align)
+    }
+    fn release(&mut self, handle: u32) {
+        BoAlloc::release(&mut *self.0.lock(), handle);
+    }
+}
 
 /// The switches and counts of a test's chain.
 #[derive(Default)]
@@ -81,7 +96,7 @@ impl FakeReset {
     }
 
     /// As `stop_chain`, in Linux's order. True: every engine halted, the PSP's rings down.
-    fn stop(&self, o: &mut Owner, bo: &mut BoManager, lines: &mut Vec<String>) -> bool {
+    fn stop(&self, o: &mut Owner, lines: &mut Vec<String>) -> bool {
         let Some(mut p) = self.psp.lock().take() else {
             lines.push(String::from("fake reset: no chain kept"));
             return self.proof.proven();
@@ -101,7 +116,7 @@ impl FakeReset {
         lines.push(format!("fake reset: the stop: {stopped:?}, engines halted: {halted}"));
         let quiet = stopped.is_ok() && p.quiet();
         if quiet {
-            p.free(bo);
+            p.free(&mut Bos(&self.bos));
         }
         let a = o.hw().hw().a;
         *self.note.lock() = Some(handoff::read_note(o.hw(), &a, RingFate::Destroyed, gc, true, false));
@@ -111,9 +126,8 @@ impl FakeReset {
 
     pub(crate) fn suspend(&self, owner: &Shared, lines: &mut Vec<String>) -> bool {
         self.knobs.suspends.fetch_add(1, Ordering::AcqRel);
-        let mut bo = self.bos.lock();
         let mut o = owner.lock();
-        self.stop(&mut o, &mut bo, lines)
+        self.stop(&mut o, lines)
     }
 
     pub(crate) fn mode2(&self, owner: &Shared, lines: &mut Vec<String>) -> Option<bool> {
@@ -149,9 +163,8 @@ impl FakeReset {
         let opts = ListOpts::PSP13_0_4;
         let (fw, _) = fwload::load(&pspfake::plan_780m().files(), &mut MapSource(pspfake::synthetic_780m()), &opts).ok()?;
         let list = fw.load_list(&opts).ok()?;
-        let mut bo = self.bos.lock();
         let mut o = owner.lock();
-        if !self.stop(&mut o, &mut bo, lines) {
+        if !self.stop(&mut o, lines) {
             return None;
         }
         if self.knobs.heals.load(Ordering::Acquire) {
@@ -185,7 +198,7 @@ impl FakeReset {
             vm: VmAddrs::from_discovery(d),
             unload_first: pspbringup::unload_first(st.start, note.is_some_and(|n| n.gc == GcFate::Unloaded)),
         };
-        let mut out = pspbringup::run(&mut **o, &mut *bo, &inp);
+        let mut out = pspbringup::run(&mut **o, &mut Bos(&self.bos), &inp);
         if !out.passed() {
             lines.push(format!("fake reset: the bring-up failed: {:?}", out.checks.iter().filter(|x| !x.pass).map(|x| (x.name, x.why.as_str())).collect::<Vec<_>>()));
             return None;

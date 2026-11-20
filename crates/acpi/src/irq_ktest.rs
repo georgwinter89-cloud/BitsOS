@@ -34,7 +34,7 @@ ktest!("cp.irq.firmware_lvts", Safe, firmware_lvts);
 ktest!("cp.irq.ps2_loopback", QemuOnly, ps2_loopback);
 
 fn ensure() -> Result<&'static State, String> {
-    irq::setup(&|_| None).map_err(|e| format!("interrupt set-up failed: {e:?}"))
+    irq::setup().map_err(|e| format!("interrupt set-up failed: {e:?}"))
 }
 
 /// Opens interrupts until `cond` holds or a generous second passes; true if it held.
@@ -132,9 +132,9 @@ fn lapic_config() -> R {
     kassert!(base & apic::APIC_BASE_EN != 0, "APIC globally disabled: {base:#x}");
     kassert!((base & apic::APIC_BASE_EXTD != 0) == (l.mode == Mode::X2Apic), "EXTD {base:#x} vs mode {:?}", l.mode);
     kassert!(base & apic::APIC_BASE_BSP != 0, "not marked BSP");
-    if l.cpuid_x2apic && l.mode != Mode::X2Apic {
-        // Only `apic=xapic` or a failed map may leave x2APIC off when CPUID offers it.
-        kassert!(!l.kept_firmware_x2apic);
+    if l.cpuid_x2apic {
+        // Only a failed map of the xAPIC page leaves the mode chosen without asking: x2APIC wherever CPUID offers it.
+        kassert!(l.mode == Mode::X2Apic, "CPUID offers x2APIC, mode {:?}", l.mode);
     }
     if !l.cpuid_x2apic {
         kassert!(l.mode == Mode::XApic, "no x2APIC in CPUID, mode {:?}", l.mode);
@@ -144,7 +144,7 @@ fn lapic_config() -> R {
     kassert!(apic::read(apic::REG_TPR) == Some(0));
     let timer = apic::read(apic::REG_LVT_TIMER).ok_or("timer LVT unreadable")?;
     kassert!(timer as u8 == vectors::LAPIC_TIMER, "LVT timer {timer:#x}: vector 0xF0");
-    // CP-5: a live timer is unmasked in the mode `time` chose; one not started (hrtimer=poll, failed) stays masked.
+    // CP-5: a live timer is unmasked in the mode `time` chose; one not started (ktest_timer=poll, failed) stays masked.
     match time::lapic::cpu_stats(hal::percpu::this_cpu()).filter(|s| s.live).and_then(|s| s.kind) {
         Some(k) => {
             let want = if k == time::lapic::Kind::TscDeadline { apic::timer::LVT_TSC_DEADLINE } else { apic::timer::LVT_ONESHOT };

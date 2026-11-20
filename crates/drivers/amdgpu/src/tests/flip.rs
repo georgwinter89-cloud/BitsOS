@@ -1,7 +1,7 @@
 //! GX-3 against a fake engine: the Mini-PC image (G-1 + saved-5.json) whose HUBP takes an address at the low write,
 //! sets PENDING and lands at the next vblank unless its OTG is locked or the latch is stuck; the clock is the
 //! engine's (a sleep advances the scan). Checks the order (lock, high, low, unlock), the landed check, the 50 ms
-//! timeout with its fall-back, the settle from A1, the lock released on every error path, the type restore, the
+//! timeout that drops the frame (no copy stands in), the settle from A1, the lock released on every error path, the type restore, the
 //! back buffer's repair and the vblank clock.
 
 use super::fake::*;
@@ -268,7 +268,6 @@ fn whole_equals(r: &Rig, i: usize, src: &[u32]) -> bool {
 #[test]
 fn flip_order_is_lock_high_low_unlock_and_lands() {
     let r = rig();
-    assert!(r.s.active());
     assert!(r.e.writes().is_empty(), "taking over an A0 display writes nothing");
     let src = frame(0x0012_3456);
     let back = r.s.begin(&src, W).unwrap();
@@ -291,7 +290,7 @@ fn flip_order_is_lock_high_low_unlock_and_lands() {
     assert_eq!(r.s.wait(seq + 1), Err(FlipError::Off), "a fence not ordered yet");
     r.s.wait(seq).unwrap();
     let st = r.s.state();
-    assert_eq!((st.shown, st.ordered, st.landed, st.late, st.flipping), (1, 1, 1, 0, true));
+    assert_eq!((st.shown, st.ordered, st.landed, st.late), (1, 1, 1, 0));
     assert!(whole_equals(&r, 1, &src), "A1 got the whole first frame (its content was unknown)");
     assert_eq!(r.e.reg(lock) & l::LOCK, 0);
 }
@@ -366,6 +365,21 @@ fn a_frame_the_program_drew_flips_with_the_same_writes() {
     assert_eq!(r.s.state().ordered, s, "no order was given");
 }
 
+/// SHOT: fbdev holds the buffer MCP `screen` reads from the holder's next BEGIN. That needs `shown` to name the new
+/// buffer as soon as `direct_flip` returned (before the flip landed), and BEGIN to hand out only the other one: else
+/// a BEGIN could hand out the buffer being read without waiting for the copy.
+#[test]
+fn shown_names_the_flipped_buffer_before_the_next_begin() {
+    let r = rig();
+    for _ in 0..4 {
+        let d = r.s.direct_begin().unwrap();
+        assert_eq!(1 - d.window, r.s.shown(), "BEGIN hands out the buffer not shown");
+        let s = r.s.direct_flip(d.window).unwrap();
+        assert_eq!(r.s.shown(), d.window, "shown names the flip's buffer once it returned, landed or not");
+        r.s.wait(s).unwrap();
+    }
+}
+
 /// WY-17: the console, the kernel's pointer or a panic write the shown buffer while the program draws the hidden
 /// one: both buffers then lack or carry something the program does not know, each is redrawn whole once.
 #[test]
@@ -392,15 +406,21 @@ fn what_the_kernel_wrote_makes_both_buffers_whole_once() {
 }
 
 #[test]
-fn a_late_flip_ends_the_program_drawing() {
+fn a_late_flip_drops_the_programs_frame_and_the_next_one_flips() {
     let r = rig();
     let d = r.s.direct_begin().unwrap();
     r.e.st().stuck = true;
     let s = r.s.direct_flip(d.window).unwrap();
     assert_eq!(r.s.wait(s), Err(FlipError::Late));
-    assert_eq!(r.s.direct_begin(), Err(FlipError::Off));
-    assert_eq!(r.s.direct_flip(1), Err(FlipError::Off));
-    assert_eq!(r.s.begin(&frame(1), W).err(), Some(FlipError::Off), "the kernel's frames fall back too");
+    assert_eq!(r.s.state().late, 1);
+    // The program goes on: the next frame is handed out at once (the late flip was given up) and flips.
+    r.e.st().stuck = false;
+    let d2 = r.s.direct_begin().unwrap();
+    assert_eq!(d2.window, 1 - d.window, "the buffer the late flip named stays the shown one in the books");
+    let s2 = r.s.direct_flip(d2.window).unwrap();
+    assert!(s2 > s);
+    r.s.wait(s2).unwrap();
+    assert_eq!(r.s.begin(&frame(1), W).map(|b| b.name()).ok(), Some(if d2.window == 0 { "dcn.a1" } else { "dcn.a0" }), "the kernel's frames flip too");
 }
 
 /// WY-17: a pan to the buffer shown, as a compositor's frame without damage may ask, twice: no register is written,
@@ -434,21 +454,28 @@ fn the_flip_waits_its_turn_behind_a_kernel_frame() {
     assert!(r.s.direct_flip(0).is_ok());
 }
 
-/// WY-17: MCP `screen` reads what shows, row by row, whichever buffer that is.
+/// SHOT: MCP `screen` reads the buffer it was told, only the rectangle asked for; `shown` names the buffer on the screen.
 #[test]
-fn read_shown_reads_the_buffer_on_the_screen() {
+fn read_window_reads_a_rectangle_of_the_buffer_named() {
     let r = rig();
-    r.t[0].write_pixels(0, &frame(7));
-    r.t[1].write_pixels(0, &frame(8));
+    let px = |b: u32, i: u32| b << 24 | i;
+    r.t[0].write_pixels(0, &(0..W * H).map(|i| px(1, i)).collect::<Vec<_>>());
+    r.t[1].write_pixels(0, &(0..W * H).map(|i| px(2, i)).collect::<Vec<_>>());
+    assert_eq!(r.s.shown(), 0, "A0 is shown");
     let mut out = vec![0u32; (W * H) as usize];
-    assert!(r.s.read_shown(&mut out, W));
-    assert!(out.iter().all(|&p| p == 7), "A0 is shown");
+    assert!(r.s.read_window(0, (0, 0, W, H), &mut out));
+    assert!(out.iter().enumerate().all(|(i, &p)| p == px(1, i as u32)), "all of A0");
     let s = r.s.direct_flip(1).unwrap();
     r.s.wait(s).unwrap();
-    assert!(r.s.read_shown(&mut out, W));
-    assert!(out.iter().all(|&p| p == 8), "A1 is shown");
-    let mut short = vec![0u32; 4];
-    assert!(!r.s.read_shown(&mut short, W), "too small a frame is refused, not cut");
+    assert_eq!(r.s.shown(), 1, "A1 is shown");
+    let mut cut = vec![0u32; 6];
+    assert!(r.s.read_window(1, (W - 3, H - 2, 3, 2), &mut cut));
+    let want: Vec<u32> = [(W - 3, H - 2), (W - 2, H - 2), (W - 1, H - 2), (W - 3, H - 1), (W - 2, H - 1), (W - 1, H - 1)].iter().map(|&(x, y)| px(2, y * W + x)).collect();
+    assert_eq!(cut, want, "the bottom right corner of A1");
+    assert!(r.s.read_window(0, (1, 1, 1, 1), &mut cut[..1]) && cut[0] == px(1, W + 1), "the hidden buffer when asked");
+    assert!(!r.s.read_window(1, (W - 2, 0, 3, 1), &mut cut), "past the right edge");
+    assert!(!r.s.read_window(1, (0, H, 1, 1), &mut cut), "past the bottom");
+    assert!(!r.s.read_window(1, (0, 0, 4, 2), &mut cut), "too small a destination is refused, not cut");
 }
 
 #[test]
@@ -457,7 +484,7 @@ fn a_ram_target_cannot_be_handed_out() {
 }
 
 #[test]
-fn stuck_latch_times_out_and_falls_back_to_a0() {
+fn stuck_latch_times_out_and_drops_the_frame() {
     let r = rig();
     r.e.st().stuck = true;
     let src = frame(3);
@@ -466,20 +493,20 @@ fn stuck_latch_times_out_and_falls_back_to_a0() {
     let t0 = r.e.st().now;
     assert_eq!(r.s.wait(seq), Err(FlipError::Late));
     assert!(r.e.st().now - t0 >= LATE_NS - timing().period_ns(), "waited about 50 ms");
-    assert!(!r.s.active(), "one image now");
     let w = r.e.writes();
     let lo = l::hubp(0, l::HUBP_ADDR);
-    assert_eq!(w.iter().filter(|x| x.0 == lo).map(|x| x.1).collect::<Vec<_>>(), vec![GPU1 as u32, GPU as u32], "A0 written back");
+    assert_eq!(w.iter().filter(|x| x.0 == lo).map(|x| x.1).collect::<Vec<_>>(), vec![GPU1 as u32], "no A0 order: nothing falls back");
     assert_eq!(r.e.reg(l::otg(0, l::OTG_LOCK)) & l::LOCK, 0, "never left locked");
-    assert_eq!(r.s.begin(&src, W).err(), Some(FlipError::Off), "fbdev copies now");
-    assert!(!r.s.rearm(), "A0 is not settled while the latch is stuck");
-    r.e.st().stuck = false;
-    r.e.advance(timing().period_ns());
-    assert!(r.s.rearm(), "flips again after A0 landed");
     assert_eq!(r.s.state().late, 1);
+    // The next frame does not wait for the given-up flip again: it is prepared at once and flipped.
+    let t1 = r.e.st().now;
     let b = r.s.begin(&src, W).unwrap();
-    assert_eq!(b.name(), "dcn.a1");
-    let _ = r.s.commit().unwrap();
+    assert_eq!(b.name(), "dcn.a0");
+    assert!(r.e.st().now - t1 < timing().period_ns(), "no second 50 ms for the same flip");
+    r.e.st().stuck = false;
+    let seq2 = r.s.commit().unwrap();
+    r.s.wait(seq2).unwrap();
+    assert_eq!(r.s.state().late, 1, "one late flip, one frame dropped");
 }
 
 #[test]
@@ -504,7 +531,7 @@ fn lock_is_released_when_the_address_write_fails() {
     let src = frame(5);
     let _ = r.s.begin(&src, W).unwrap();
     assert_eq!(r.s.commit(), Err(FlipError::Late));
-    assert!(!r.s.active());
+    assert_eq!((r.s.state().shown, r.s.state().late), (0, 1), "nothing ordered: A0 still shown, the frame dropped");
     let w = r.e.writes();
     let lock = l::otg(0, l::OTG_LOCK);
     let last_lock = w.iter().rposition(|x| x.0 == lock).unwrap();
@@ -663,35 +690,6 @@ fn crc_follows_the_buffer_shown() {
     assert!(t.ends_with("stable per buffer true; changes with the flip true"), "{t}");
     assert_eq!(r.e.reg(l::otg(0, l::OTG_CRC_CNTL)), 0, "CRC put back off");
     assert!(whole_equals(&r, 0, &p) && whole_equals(&r, 1, &q));
-}
-
-#[test]
-fn fall_back_whose_a0_order_failed_keeps_the_picture_and_retries() {
-    let r = rig();
-    r.e.st().stuck = true;
-    let src = frame(3);
-    let _ = r.s.begin(&src, W).unwrap();
-    let seq = r.s.commit().unwrap();
-    // The A0 order of the fall-back reads back different: what shows is not known.
-    r.e.st().refuse = Some(l::hubp(0, l::HUBP_ADDR));
-    assert_eq!(r.s.wait(seq), Err(FlipError::Late));
-    assert!(!r.s.active() && r.s.redirects(), "not flipping, but the live GopFb still goes through present_shown");
-    assert_eq!(r.e.reg(l::otg(0, l::OTG_LOCK)) & l::LOCK, 0, "never left locked");
-    let patch = vec![0x77; 16];
-    r.s.present_shown(&patch, 4, (0, 0, 4, 4)).unwrap();
-    assert_eq!((px(&r, 0, 1, 1), px(&r, 1, 1, 1)), (0x77, 0x77), "both buffers got the picture");
-    // rearm orders A0 again: still refused, then accepted; it flips once A0 landed.
-    assert!(!r.s.rearm());
-    assert!(r.s.redirects());
-    r.e.st().refuse = None;
-    r.e.st().stuck = false;
-    assert!(!r.s.rearm(), "A0 ordered, not landed yet");
-    assert!(!r.s.redirects(), "A0 ordered: presents go to the GOP framebuffer again");
-    let lo = l::hubp(0, l::HUBP_ADDR);
-    assert_eq!(r.e.writes().iter().filter(|x| x.0 == lo).map(|x| x.1).last(), Some(GPU as u32), "A0 ordered again");
-    r.e.advance(timing().period_ns());
-    assert!(r.s.rearm(), "flips again after A0 landed");
-    assert!(r.s.active());
 }
 
 #[test]

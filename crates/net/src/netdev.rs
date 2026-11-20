@@ -4,7 +4,7 @@
 //!
 //! NW-4: a driver whose receive and transmit completions arrive by MSI/MSI-X says so (`set_irq_driven`) and wakes
 //! the stack from its hard-IRQ hook (`irq_wake`); the stack then sleeps until a wake instead of looking at the
-//! cards every 50/500 µs. While any registered card is polled (no MSI to be had, a stormed line, `net_irq=off`),
+//! cards every 50/500 µs. While any registered card is polled (no MSI to be had, a stormed line),
 //! the stack keeps polling (`all_irq_driven` false).
 
 use alloc::string::String;

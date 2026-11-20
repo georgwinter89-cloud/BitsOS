@@ -339,10 +339,10 @@ fn qemu_flags() {
 }
 
 #[test]
-fn the_qemu_config_turns_the_desktop_on_and_nothing_guarded() {
+fn the_qemu_config_names_qemus_card_and_nothing_guarded() {
     use crate::config::{Answers, guarded_in, render};
     let s = render(&Answers { qemu: true, screen: Some("1600x900".into()), ..Answers::default() }, "0.9.0").unwrap();
-    assert!(s.contains("\ndesktop=on\n") && s.contains("\nscreen=1600x900\n") && s.contains("QEMU's virtio card"), "{s}");
+    assert!(!s.contains("desktop=") && s.contains("\nscreen=1600x900\n") && s.contains("QEMU's virtio card"), "{s}");
     assert!(guarded_in(&s).is_empty());
     let t = render(&Answers { qemu: true, token: Some("0123456789abcdef".into()), ..Answers::default() }, "0.9.0").unwrap();
     assert_eq!(guarded_in(&t), ["mcp"]);

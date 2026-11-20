@@ -4,23 +4,6 @@
 
 use alloc::string::String;
 
-/// Which caching DMA memory gets. `Snooped` is write-back; without snooping the controller reads RAM past the
-/// CPU caches, so the rings and lists are uncached and the sample data write-combining (Linux `set_memory_wc`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaUse {
-    /// CORB, RIRB, BDLs.
-    Control,
-    /// Sample rings.
-    Data,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AllocError {
-    /// Uncached/write-combining memory cannot be had now (MM-4 `Unsupported`): a caller may fall back to snooping.
-    Unsupported,
-    Other,
-}
-
 /// DMA memory as the driver sees it; every access is checked (false/None: outside the buffer).
 pub trait Mem: Send + Sync {
     fn dev_addr(&self) -> u64;
@@ -51,8 +34,9 @@ pub trait Hw: Send + Sync {
     fn pause_us(&self, us: u64) {
         self.delay_us(us)
     }
-    /// `len` zeroed bytes; `limit32` keeps them below 4 GiB (no 64OK in GCAP); `snoop` false asks for UC/WC.
-    fn alloc(&self, len: usize, usage: DmaUse, limit32: bool, snoop: bool) -> Result<Self::Mem, (AllocError, String)>;
+    /// `len` zeroed bytes of write-back memory (every controller snoops, as in Linux); `limit32` keeps them below
+    /// 4 GiB (no 64OK in GCAP).
+    fn alloc(&self, len: usize, limit32: bool) -> Result<Self::Mem, String>;
     /// PC-2 `enable_device(dma)`. Thread context, may sleep.
     fn enable(&self, dma: bool) -> Result<(), String>;
     /// PC-2 `disable_device`: MSI off, bus master off. Lock-free, no klog, no sleep (Quiesce).

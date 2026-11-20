@@ -54,7 +54,9 @@ chmod 700 "$F/data/home/1000"
 echo "/dev/x $F/data ext4 rw,relatime 0 0" >"$F/mounts.data"
 : >"$F/mounts.none"
 run() { ${RUN_EXEC:+exec} env -i PATH=/usr/bin:/bin HOME=/ ${LO_LANG:+LO_LANG=$LO_LANG} LO_TREE="${RUN_TREE:-$S}" LO_DATA="$F/data" LO_MOUNTS="$F/mounts.$1" LO_USER_RUN="$F/run" LO_TMP="$F/run" \
-  LO_PATH=/usr/bin:/bin LO_DATA_STATE="$F/nostate/x" LO_LDSO=/usr/lib/ld-linux-x86-64.so.2 sh "$L" "${@:2}"; }
+  LO_PATH=/usr/bin:/bin LO_DATA_STATE="$F/nostate/x" LO_LDSO=/usr/lib/ld-linux-x86-64.so.2 ${RUN_OPENCL:-LO_TEST_NO_OPENCL=1} sh "$L" "${@:2}"; }
+# Every LibreOffice this test starts on the build host has OpenCL off (LO_TEST_NO_OPENCL): the host's own OpenCL
+# driver (rusticl) would reach its GPU. RUN_OPENCL=" " leaves it out, for --env only (nothing starts).
 out=$(run data --check 2>&1); rc=$?
 echo "$out" >"$RUN_DIR/check-data.txt"
 check "--check with a data volume: exit 0, libraries found" '[ $rc = 0 ] && grep -q "libraries: [0-9]* found, none missing" <<<"$out"'
@@ -62,13 +64,15 @@ check "--check: home and profile on the data volume" 'grep -qx "libreoffice: hom
 check "--check: German locale without a settings registry" 'grep -q "^libreoffice: language: LANG=de_DE.UTF-8" <<<"$out"'
 out=$(run none --check 2>&1)
 check "--check without a data volume: home in RAM, said" 'grep -q "^libreoffice: home: $F/run/libreoffice-$(id -u)/home (in RAM: gone at the next boot; no data volume at $F/data)" <<<"$out"'
-env=$(run data --env 2>&1)
+env=$(RUN_OPENCL=" " run data --env 2>&1)
 echo "$env" >"$RUN_DIR/env.txt"
 for kv in "HOME=$F/data/home/1000" "LD_LIBRARY_PATH=$S/lib" SAL_USE_VCLPLUGIN=gtk3 GDK_BACKEND=wayland "FONTCONFIG_FILE=$S/etc/fonts/fonts.conf" \
     "XDG_DATA_DIRS=$S/gtk/share" "GDK_PIXBUF_MODULE_FILE=$S/gtk/etc/gdk-pixbuf/loaders.cache" GSETTINGS_BACKEND=memory LANG=de_DE.UTF-8 \
-    DBUS_SESSION_BUS_ADDRESS=disabled: SAL_DISABLE_OPENCL=1; do
+    DBUS_SESSION_BUS_ADDRESS=disabled:; do
   check "--env: $kv" 'grep -qx -- "$kv" <<<"$env"'
 done
+check "--env: Calc's OpenCL is not switched off (DECISIONS 18.11.)" '! grep -q "^SAL_DISABLE_OPENCL=" <<<"$env"'
+check "--env: the host test's own LO_TEST_NO_OPENCL keeps the build host's GPU out" 'run data --env | grep -qx SAL_DISABLE_OPENCL=1'
 check "--env: nothing of the caller's (no LO_*, no DISPLAY)" '! grep -q "^LO_\|^DISPLAY=" <<<"$env"'
 check "--env: LANG from LO_LANG" 'LO_LANG=en_US.UTF-8 run data --env | grep -qx LANG=en_US.UTF-8'
 

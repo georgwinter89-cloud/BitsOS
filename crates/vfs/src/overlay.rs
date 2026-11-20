@@ -1,4 +1,4 @@
-//! SX-3a: a read-only overlay (linux-6.6/fs/overlayfs: `ovl_lookup`, `ovl_iterate`'s merge, lower layers only):
+//! SX-3a: a read-only overlay (linux-7.3.1/fs/overlayfs: `ovl_lookup`, `ovl_iterate`'s merge, lower layers only):
 //! `mount -t overlay -o lowerdir=top:...:bottom`. A directory shows the union of the layers' directories of
 //! that name, the upper layer first; a non-directory hides everything below it, a whiteout (a character device
 //! 0:0) hides the name; files are the lower layers' own inodes, so reading them reads the layer. The file

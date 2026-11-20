@@ -1,7 +1,7 @@
 //! `/proc/<pid>/{cmdline,environ,auxv,limits,oom_score,oom_score_adj}` and the `comm` write
-//! (linux-6.6/fs/proc/base.c `get_mm_cmdline` :253, `get_mm_proctitle` :213, `environ_read` :937,
-//! `proc_pid_auxv`, `proc_pid_limits` :596 with `lnames` :576, `proc_oom_score`, `oom_score_adj_write` :1213,
-//! `comm_write` :1664). The strings are read from the program's memory as Linux's `access_remote_vm` does,
+//! (linux-7.3.1/fs/proc/base.c `get_mm_cmdline` :283, `get_mm_proctitle` :246, `environ_read` :987,
+//! `auxv_read` :1062, `proc_pid_limits` :629 with `lnames` :609, `proc_oom_score` :583, `oom_score_adj_write` :1258,
+//! `comm_write` :1704). The strings are read from the program's memory as Linux's `access_remote_vm` does,
 //! so a program that rewrites its argv (setproctitle) is seen.
 
 use alloc::string::String;
@@ -137,7 +137,7 @@ pub(super) fn oom_score(g: &Group, p: &Process) -> u64 {
     if g.tgid == 1 || adj == -1000 || g.is_finished() {
         return 0;
     }
-    // rss + page tables (linux-6.6/mm/oom_kill.c:230; V2 has no swap); device pages are not rss.
+    // rss + page tables (linux-7.3.1/mm/oom_kill.c:228; V2 has no swap); device pages are not rss.
     badness_points((p.mm.rss_pages() + p.mm.mem_stats().page_tables) as i64, adj, total)
 }
 

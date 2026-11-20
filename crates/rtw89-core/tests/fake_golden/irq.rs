@@ -219,7 +219,7 @@ impl Rig {
     }
 }
 
-/// The rig on a fresh fake, the chip up; `irq`: MSI (else polled, as without MSI or net_irq=off)
+/// The rig on a fresh fake, the chip up; `irq`: MSI (else polled, as without MSI)
 fn rig(name: &str, irq: bool) -> Rig {
     let rings = RingConfig::js();
     let fw = Firmware::parse(firmware(), 1, false).expect("rtw89_fw_recognize");

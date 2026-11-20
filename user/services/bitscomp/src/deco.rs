@@ -1,6 +1,6 @@
 //! bitscomp's own drawing around windows (WY-5 look): the header image of `header`, the side and bottom borders,
 //! the rounded bottom corners of a tile (images that round off the client's corners), the focused tile's glow
-//! lines (theme.effects cheap: two lines at the accent's glow alpha, no blur), and the overlays on top of
+//! lines (six lines at the accent's glow alpha), and the overlays on top of
 //! everything (circle menu, drop preview). Geometry comes from `zones`, colours from `theme`.
 
 use smithay::backend::renderer::element::Kind;
@@ -95,7 +95,7 @@ fn corner(t: &Theme, f: Rect, right: bool, focused: bool, paper: &Paper) -> (Rec
         }
     }
     if focused {
-        c.glow(fb, rad, if t.effects_gpu { 6 } else { 2 }, t.glow);
+        c.glow(fb, rad, 6, t.glow);
     }
     c.rrect_line(fb, rad, (s as f32).max(1.0), if focused { t.accent } else { t.line });
     (area, c)

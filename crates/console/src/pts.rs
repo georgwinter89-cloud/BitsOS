@@ -1,8 +1,8 @@
 //! The pty slave (IN-7): the `/dev/pts/N` node and its open ends, IN-4's line discipline with job control, the
-//! hang-up rules of `tty_vhangup` (linux-6.6/drivers/tty/tty_io.c:577). See `pty` for the whole picture.
+//! hang-up rules of `tty_vhangup` (linux-7.3.1/drivers/tty/tty_io.c:690). See `pty` for the whole picture.
 
 use crate::jobs::{self, Procs};
-use crate::pty::{Pair, PTS_MAJOR, SLAVE_PERM, SLICE_NS, hung_mask, ended, sets_termios, session_has_tty, live_pairs};
+use crate::pty::{Pair, PTS_MAJOR, SLICE_NS, hung_mask, ended, sets_termios, session_has_tty, live_pairs};
 use crate::termios::ioc::*;
 use crate::tty::Tty;
 use crate::ttyioctl;
@@ -21,11 +21,13 @@ const O_NOCTTY: u64 = 0o400;
 pub struct PtsNode {
     pair: Weak<Pair>,
     index: u32,
+    /// The node's permissions in its devpts instance (`mode=`).
+    perm: u32,
 }
 
 impl PtsNode {
     pub(crate) fn new(pair: &Arc<Pair>) -> PtsNode {
-        PtsNode { pair: Arc::downgrade(pair), index: pair.index }
+        PtsNode { pair: Arc::downgrade(pair), index: pair.index, perm: pair.slave_perm() }
     }
 
     pub(crate) fn open(&self, flags: u64) -> Result<Arc<SlaveFile>, Errno> {
@@ -79,7 +81,7 @@ impl File for PtsNode {
         Err(EIO)
     }
     fn mode(&self) -> u32 {
-        uapi::S_IFCHR | SLAVE_PERM
+        uapi::S_IFCHR | self.perm
     }
     fn rdev(&self) -> u64 {
         vfs::abi::encode_dev(PTS_MAJOR, self.index)
@@ -195,7 +197,7 @@ impl SlaveFile {
                 pair.hangup_slave("TIOCVHANGUP");
                 Ok(0)
             }
-            // Only a master has a peer to open (linux-6.6/drivers/tty/pty.c:609: `tty->driver != ptm_driver`).
+            // Only a master has a peer to open (linux-7.3.1/drivers/tty/pty.c:619: `tty->driver != ptm_driver`).
             TIOCGPTPEER => Err(EIO),
             _ => {
                 if cmd == TCFLSH && (arg == TCIFLUSH || arg == TCIOFLUSH) {
@@ -232,7 +234,7 @@ impl File for SlaveFile {
         self.write(buf, nonblock, &ended)
     }
     fn mode(&self) -> u32 {
-        uapi::S_IFCHR | SLAVE_PERM
+        uapi::S_IFCHR | self.pair.slave_perm()
     }
     fn rdev(&self) -> u64 {
         self.pair.rdev()
@@ -263,6 +265,6 @@ impl File for SlaveFile {
 pub fn open_ctty(flags: u64) -> Option<Result<Arc<dyn File>, Errno>> {
     let me = jobs::procs().current()?;
     let pair = live_pairs().into_iter().find(|p| p.tty.ctl().session == Some(me.sid))?;
-    let node = PtsNode { pair: Arc::downgrade(&pair), index: pair.index };
+    let node = PtsNode::new(&pair);
     Some(node.open(flags | O_NOCTTY).map(|f| f as Arc<dyn File>))
 }

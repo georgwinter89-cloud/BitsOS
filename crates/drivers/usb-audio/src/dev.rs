@@ -9,6 +9,7 @@
 //! back to alternate setting 0 at close, so the microphone runs only while someone records.
 
 use crate::plan::{self, FunctionPlan, StreamPlan};
+use crate::plays::Plays;
 use crate::req::{self, Ctl, RateResult};
 use crate::stream::{self, Capture, Layout, Playback, Wake};
 use alloc::boxed::Box;
@@ -29,8 +30,12 @@ pub struct Function {
     pub playback: Vec<StreamPlan>,
     /// Capture settings (set at open).
     pub capture: Vec<StreamPlan>,
+    /// A UAC2 function with several jacks (the board's own sound, GP-SOUND); false for every UAC1 device.
+    pub board: bool,
     /// Capture interfaces open now: one capture per interface, because closing sets it back to setting 0.
     capturing: SpinLock<Vec<u8>>,
+    /// Playback streams open now and the tone check's claim (`plays`).
+    plays: SpinLock<Plays>,
 }
 
 static FUNCS: SpinLock<Vec<Arc<Function>>> = SpinLock::named("usb_audio.funcs", Vec::new());
@@ -42,12 +47,9 @@ static HW_MUTE: AtomicBool = AtomicBool::new(false);
 /// so every device ends up with the state last asked for. Above `usb_audio.funcs` and the caller's state lock.
 static MUTE: Mutex<()> = Mutex::named("usb_audio.mute", ());
 
-/// CONFIG keys that leave audio devices unbound: `usb_audio=off`, and US's isochronous scenario (`usb_iso_test`)
-/// that streams to QEMU's usb-audio itself.
+/// The test key that leaves audio devices unbound: US's isochronous scenario (`usb_iso_test`) streams to QEMU's
+/// usb-audio itself.
 pub fn kept_off() -> Option<&'static str> {
-    if pci::registry::config_value("usb_audio").is_some_and(|v| v.trim() == "off") {
-        return Some("usb_audio=off");
-    }
     pci::registry::opted_in("usb_iso_test").then_some("usb_iso_test=on")
 }
 
@@ -90,24 +92,32 @@ pub struct OutputInfo {
     pub iface: u8,
     pub channels: u8,
     pub terminal_type: u16,
+    /// One of the jacks of a UAC2 device with several (the Gaming-PC's board sound): sorted after every headset.
+    pub board: bool,
 }
 
 pub fn key(dev: &Device) -> String {
     format!("usb:{}", dev.path())
 }
 
-/// Every playback output of the devices present, stereo ones first, then by device and interface.
+/// Every playback output of the devices present: headsets and dongles before a board's jacks (GP-SOUND AU-5: no
+/// jack reports a plug, so a headset someone plugged in is the better guess), stereo ones first, then by device and
+/// interface. With UAC1 devices only (the Mini-PC) `board` is false everywhere and the order is the old one.
 pub fn outputs() -> Vec<OutputInfo> {
     let mut v: Vec<OutputInfo> = functions()
         .iter()
         .flat_map(|f| f.playback.iter().map(move |s| OutputInfo { key: key(&f.dev), id: f.dev.id, control: f.control, iface: s.iface,
-            channels: s.channels, terminal_type: s.terminal_type }))
+            channels: s.channels, terminal_type: s.terminal_type, board: f.board }))
         .collect();
-    v.sort_by_key(|o| (o.channels != 2, o.id, o.iface));
+    order(&mut v);
     v
 }
 
-fn find(key_: &str, iface: u8, playback: bool) -> Option<(Arc<Function>, StreamPlan)> {
+pub(crate) fn order(v: &mut [OutputInfo]) {
+    v.sort_by_key(|o| (o.board, o.channels != 2, o.id, o.iface));
+}
+
+pub(crate) fn find(key_: &str, iface: u8, playback: bool) -> Option<(Arc<Function>, StreamPlan)> {
     functions().into_iter().find_map(|f| {
         if key(&f.dev) != key_ {
             return None;
@@ -125,12 +135,57 @@ fn layout(s: &StreamPlan) -> Layout {
 /// Opens playback on output (`key`, `iface`): `ring` frames, the bus window from the mixer's `period`. No
 /// control transfer (the setting was made at probe): callable from the mixer's thread.
 pub fn open_playback(key_: &str, iface: u8, ring: usize, period: u32, wake: Wake) -> Result<Playback, UsbError> {
+    open_out(key_, iface, ring, period, wake, false)
+}
+
+/// One open stream on a playback interface, counted while the `Playback` holds it.
+struct Open {
+    f: Arc<Function>,
+    iface: u8,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.f.plays.lock().close(self.iface);
+    }
+}
+
+/// The tone check's hold on one playback interface (`plays`): taken while nothing plays there.
+pub struct ToneClaim {
+    f: Arc<Function>,
+    iface: u8,
+}
+
+impl ToneClaim {
+    pub fn take(f: &Arc<Function>, iface: u8) -> Result<ToneClaim, UsbError> {
+        f.plays.lock().claim_tone(iface)?;
+        Ok(ToneClaim { f: f.clone(), iface })
+    }
+
+    /// The tone's own stream on the claimed interface.
+    pub fn open(&self, ring: usize, period: u32, wake: Wake) -> Result<Playback, UsbError> {
+        open_out(&key(&self.f.dev), self.iface, ring, period, wake, true)
+    }
+}
+
+impl Drop for ToneClaim {
+    fn drop(&mut self) {
+        let refused = self.f.plays.lock().release_tone();
+        if refused {
+            changed();
+        }
+    }
+}
+
+fn open_out(key_: &str, iface: u8, ring: usize, period: u32, wake: Wake, by_tone: bool) -> Result<Playback, UsbError> {
     let (f, s) = find(key_, iface, true).ok_or(UsbError::Gone)?;
+    f.plays.lock().open(iface, by_tone)?;
+    let held = Open { f: f.clone(), iface };
     let interval = usb_core::iso::service_interval_ns(f.dev.speed(), &s.ep);
     let (window_ns, req) = stream::sizing(period, interval);
     let pipe = f.dev.iso_pipe(s.ep.address, IsoOpts { window_ns })?;
     let dev = f.dev.clone();
-    let p = Playback::open(Box::new(pipe), &|n| dev.alloc_buffer(n), layout(&s), ring, req, wake)?;
+    let p = Playback::open(Box::new(pipe), &|n| dev.alloc_buffer(n), layout(&s), ring, req, wake)?.holding(Box::new(held));
     klog::event!(Info, "usb_audio", "uac.play_open", device = f.dev.path(), interface = iface, ring = p.ring_frames(), window_us = window_ns / 1000,
         packets_per_request = req, channels = s.channels, bytes = s.subframe);
     Ok(p)
@@ -141,7 +196,7 @@ pub fn inputs() -> Vec<OutputInfo> {
     functions()
         .iter()
         .flat_map(|f| f.capture.iter().map(move |s| OutputInfo { key: key(&f.dev), id: f.dev.id, control: f.control, iface: s.iface,
-            channels: s.channels, terminal_type: s.terminal_type }))
+            channels: s.channels, terminal_type: s.terminal_type, board: f.board }))
         .collect()
 }
 
@@ -303,13 +358,21 @@ pub fn probe(dev: &Arc<Device>, f: &Interface) -> Result<(), String> {
     if playback.is_empty() && capture.is_empty() {
         return Err(format!("no usable 48 kHz PCM setting (skipped {})", p.skipped.len()));
     }
+    add(dev, f.number, playback, capture, prepared_mute, false);
+    Ok(())
+}
+
+/// Logs the streams and makes the function's outputs visible; the UAC1 probe and `uac2dev` end here. `board`: the
+/// several jacks of a UAC2 device (`OutputInfo::board`).
+pub(crate) fn add(dev: &Arc<Device>, control: u8, playback: Vec<StreamPlan>, capture: Vec<StreamPlan>, prepared_mute: bool, board: bool) {
     for s in playback.iter().chain(capture.iter()) {
-        klog::event!(Info, "usb_audio", "uac.stream", device = dev.path(), control = f.number, interface = s.iface, alt = s.alt,
+        klog::event!(Info, "usb_audio", "uac.stream", device = dev.path(), control = control, interface = s.iface, alt = s.alt,
             endpoint = klog::Hex(s.ep.address as u64), dir = if s.playback { "playback" } else { "capture" }, channels = s.channels,
             bits = s.bits, max_packet = s.ep.max_packet(), sync = format!("{:?}", s.sync).as_str(), rate_control = s.rate_control,
             terminal = klog::Hex(s.terminal_type as u64), features = s.features.len());
     }
-    let func = Arc::new(Function { dev: dev.clone(), control: f.number, playback, capture, capturing: SpinLock::named("usb_audio.capturing", Vec::new()) });
+    let func = Arc::new(Function { dev: dev.clone(), control, playback, capture, board, capturing: SpinLock::named("usb_audio.capturing", Vec::new()),
+        plays: SpinLock::named("usb_audio.plays", Plays::new()) });
     // A master switch changed (either way) between `prepare` and the push reached no device: under `MUTE` a
     // `set_hw_mute` either finished before (its state is read here) or starts after (it finds this device).
     let mute = {
@@ -323,9 +386,8 @@ pub fn probe(dev: &Arc<Device>, f: &Interface) -> Result<(), String> {
     };
     BOUND.inc();
     klog::event!(Info, "usb_audio", "uac.bound", device = dev.path(), vendor = klog::Hex(dev.vendor() as u64), product = klog::Hex(dev.product() as u64),
-        control = f.number, playback = func.playback.len(), capture = func.capture.len(), mute = mute);
+        control = control, playback = func.playback.len(), capture = func.capture.len(), mute = mute);
     changed();
-    Ok(())
 }
 
 pub fn disconnect(dev: &Arc<Device>, iface: u8) {

@@ -15,7 +15,7 @@ use ktest::{kassert, ktest, TestResult};
 use uapi::errno::*;
 
 const USER: Cred = Cred { uid: 1000, gid: 1000 };
-const SUBJECT: policy::Subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0001, uid: 1000 };
+const SUBJECT: policy::Subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0001, uid: 1000, tree: 0 };
 
 fn errno<T>(r: Result<T, Errno>) -> Errno {
     match r {

@@ -2,11 +2,11 @@
 //! (an ACK for every second full segment, a lone segment's ACK delayed by 10 ms, at once when the window doubled).
 //!
 //! Linux ACKs every segment at the start of a connection and when data comes after a quiet spell
-//! (linux-6.6/net/ipv4/tcp_input.c:301 `tcp_incr_quickack`: up to `TCP_MAX_QUICKACKS` = 16 segments,
-//! include/net/tcp.h:83; tcp_input.c:791
+//! (linux-7.3.1/net/ipv4/tcp_input.c:311 `tcp_incr_quickack`: up to `TCP_MAX_QUICKACKS` = 16 segments,
+//! include/net/tcp.h:97; tcp_input.c:1015
 //! `tcp_event_data_recv`: again after more than an RTO without data), so a sender in slow start, or one with Nagle
 //! that holds its last small segment until everything before is acknowledged, never waits for the delayed-ACK
-//! timer. After that, delayed ACKs (`TCP_DELACK_MIN` 40 ms there, smoltcp's 10 ms here, include/net/tcp.h:135)
+//! timer. After that, delayed ACKs (`TCP_DELACK_MIN` 40 ms there, smoltcp's 10 ms here, include/net/tcp.h:154)
 //! halve the ACKs of a bulk transfer.
 //!
 //! smoltcp has no quick mode and does not show the segments it takes in, so the connection's reader drives it:
@@ -42,8 +42,8 @@ pub struct QuickAck {
     left: AtomicU64,
     /// When the reader last took bytes.
     last_ns: AtomicU64,
-    /// TCP_QUICKACK 0 (Linux pingpong mode, linux-6.6/include/net/inet_connection_sock.h:330): delayed ACKs even
-    /// within the quick budget (`tcp_in_quickack_mode` asks for !pingpong, net/ipv4/tcp_input.c:332).
+    /// TCP_QUICKACK 0 (Linux pingpong mode, linux-7.3.1/include/net/inet_connection_sock.h:332): delayed ACKs even
+    /// within the quick budget (`tcp_in_quickack_mode` asks for !pingpong, net/ipv4/tcp_input.c:336).
     pingpong: AtomicBool,
 }
 

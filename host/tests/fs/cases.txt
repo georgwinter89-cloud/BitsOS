@@ -503,7 +503,7 @@ open . O_TMPFILE|O_RDWR|O_CREAT 0600 => EINVAL
 open f O_TMPFILE|O_RDWR 0600 => ENOTDIR
 open nodir O_TMPFILE|O_RDWR 0600 => ENOENT
 
-# --- pipes (FS-3; linux-6.6/fs/pipe.c). pipe2 X Y FLAGS stores the read end in X and the write end in Y;
+# --- pipes (FS-3; linux-7.3.1/fs/pipe.c). pipe2 X Y FLAGS stores the read end in X and the write end in Y;
 # poll FD EVENTS = revents of a poll without waiting; fionread FD = ioctl FIONREAD; writen/readn FD N write or
 # read N bytes; fillnb FD CHUNK = CHUNK-byte writes until one is short: "total,last result". The runner ignores
 # SIGPIPE, so a write without a reader answers EPIPE.
@@ -776,7 +776,7 @@ unlink nd2 => 0
 unlink sock1 => 0
 unlink wh1 => 0
 
-# --- eventfd (FS-3; linux-6.6/fs/eventfd.c): efdw FD VALUE LEN writes an 8-byte value with count LEN, efdr FD
+# --- eventfd (FS-3; linux-7.3.1/fs/eventfd.c): efdw FD VALUE LEN writes an 8-byte value with count LEN, efdr FD
 # LEN reads (the value or the error), efdrv/efdwv FD L1 L2 do it with two iovecs (efdwv writes 1 in each)
 eventfd 3 O_NONBLOCK => fd:E
 fcntl E F_GETFL 0 => 04002
@@ -835,7 +835,7 @@ eventfd 0x100000007 O_NONBLOCK => fd:E
 efdr E 8 => 7
 close E => 0
 
-# --- memfd and seals (FS-10; linux-6.6/mm/memfd.c, the seal checks of mm/shmem.c). memfd NAME FLAGS (the name
+# --- memfd and seals (FS-10; linux-7.3.1/mm/memfd.c, the seal checks of mm/shmem.c). memfd NAME FLAGS (the name
 # is a path token: "quoted" or %N), memfdnull FLAGS (a NULL name). A write that would grow an F_SEAL_GROW file is
 # refused whole (CachyOS writes tmpfs in 2 MiB steps; 6.6 stepped by pages); a memfd is 0777 (0666 with
 # MFD_NOEXEC_SEAL), nlink 0, O_RDWR|O_LARGEFILE.
@@ -930,7 +930,7 @@ fcntl W F_ADD_SEALS 0 => EINVAL
 fcntl W F_GET_SEALS 0 => EINVAL
 close R => 0
 close W => 0
-# --- fallocate (FS-10 fixer; linux-6.6/fs/open.c vfs_fallocate, mm/shmem.c shmem_fallocate): fallocate FD MODE
+# --- fallocate (FS-10 fixer; linux-7.3.1/fs/open.c vfs_fallocate, mm/shmem.c shmem_fallocate): fallocate FD MODE
 # OFFSET LEN. tmpfs files and memfds take mode 0, KEEP_SIZE and PUNCH_HOLE|KEEP_SIZE; the seals: GROW refuses
 # growth past the end, WRITE/FUTURE_WRITE refuse a hole punch, SHRINK refuses nothing here. The mode rules are
 # CachyOS's (one operation per call, WRITE_ZEROES 128 known, everything else EOPNOTSUPP; 6.6 had EINVAL for some).

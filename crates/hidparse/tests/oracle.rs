@@ -1,7 +1,9 @@
 //! V2 against V1's models as oracle (plan/spec/usb.md §10): the node driver oracle/v1-oracle.mjs
 //! prints V1's answers for the named descriptors of hidparse-test.mjs, every prefix of DragonRise
 //! and DualShock 4, 6,000 random/mutated descriptors and gamepad-model's 600+ report cases.
-//! Set HIDPARSE_SKIP_V1_ORACLE=1 to skip where node or the V1 tree is missing.
+//! Decision (SK fix, 17.11.): HIDPARSE_SKIP_V1_ORACLE=1 stays as a developer's switch for a machine without node
+//! or the V1 tree (as RTW89_SKIP_FAKE, plan/spec/wlan.md); it is refused under BITSOS_GATE or CI, so the gate's
+//! host tests always run the oracle and a missing node there is red.
 
 mod common;
 
@@ -17,6 +19,13 @@ fn oracle() -> Option<&'static Json> {
     ORACLE
         .get_or_init(|| {
             if std::env::var_os("HIDPARSE_SKIP_V1_ORACLE").is_some() {
+                // A gate run never skips the V1 oracle (as RTW89_SKIP_FAKE): refuse the variable there.
+                for gate in ["BITSOS_GATE", "CI"] {
+                    assert!(
+                        std::env::var_os(gate).is_none_or(|v| v.is_empty() || v == "0"),
+                        "HIDPARSE_SKIP_V1_ORACLE together with {gate}: the gate must run the V1 oracle"
+                    );
+                }
                 eprintln!("HIDPARSE_SKIP_V1_ORACLE set: V1 oracle not run");
                 return None;
             }

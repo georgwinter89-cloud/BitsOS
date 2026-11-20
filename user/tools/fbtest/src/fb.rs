@@ -1,4 +1,4 @@
-//! /dev/fb0 through its ioctls (linux-6.6/include/uapi/linux/fb.h) and a shared mapping, plus `fbtest check`.
+//! /dev/fb0 through its ioctls (linux-7.3.1/include/uapi/linux/fb.h) and a shared mapping, plus `fbtest check`.
 
 use usys::dev::{SharedMap, ioctl_buf};
 use usys::{Errno, PROT_READ, PROT_WRITE};

@@ -1,5 +1,5 @@
 //! In-kernel tests `nv.window.*` (NV-2p), only in the boots of host/tests/nv/4x-window*.sh: an NVMe image built like
-//! Georg's Lexar SSD. Those scripts hash every byte outside the window before and after. `nv_expect=` says what the
+//! Georg's Lexar SSD. Those scripts hash every byte outside the window before and after. `ktest_nv_expect=` says what the
 //! boot was given.
 
 use crate::ns::NsDevice;
@@ -66,9 +66,9 @@ fn data_on_the_stick() -> TestResult {
     Ok(())
 }
 
-/// A boot whose keys are refused: `nv_expect=<word>` is what the state must say. Nothing writes, /data on data.img.
+/// A boot whose keys are refused: `ktest_nv_expect=<word>` is what the state must say. Nothing writes, /data on data.img.
 fn refused() -> TestResult {
-    let want = pci::registry::config_value("nv_expect").ok_or("no nv_expect=")?;
+    let want = pci::registry::config_value("ktest_nv_expect").ok_or("no ktest_nv_expect=")?;
     let (c, d) = lexar()?;
     let got = window_word();
     kassert!(got == want, "the window says {got}, want {want}");

@@ -86,6 +86,7 @@ pub(crate) fn tables() -> ktest::TestResult {
     kassert!(v.sensor(Sensor::GpuTemp) == Some(39_000) && v.sensor(Sensor::GpuLoad) == Some(51) && v.sensor(Sensor::GpuAvgPower) == Some(8));
     kassert!(v.sensor(Sensor::Vddgfx) == Some(1165) && v.sensor(Sensor::Vddnb) == Some(762));
     kassert!(v.sensor(Sensor::StablePstateSclk) == Some(0) && v.sensor(Sensor::PeakPstateSclk).is_none());
+    kassert!(v.sensor(Sensor::GpuInputPower) == Some(9), "input power: the current socket power in W");
     kassert!(dpm_table::throttler_names(0) == "none" && dpm_table::throttler_names(v.throttler) == "THM_GFX");
     kassert!(dpm_table::throttler_names(1 | 1 << 14) == "SPL other 0x4000");
     kassert!(dpm_table::centi(3925) == "39.25" && dpm_table::milli(9005) == "9.005");

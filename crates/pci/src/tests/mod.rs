@@ -3,21 +3,29 @@
 mod aspm;
 mod bind;
 mod enable;
+mod failed;
 mod fake;
+mod gpworld;
+mod guard_gp;
 mod hostile;
+mod locks;
 mod msi;
+mod peer;
 mod raw;
 mod review;
+mod smn;
 mod walk;
 mod world;
 
 use crate::enumerate::Root;
 use crate::node::Node;
-use crate::optin::CORE_OPT_IN;
+/// The key the host tests' own rule hands out (`keys_off`).
+pub const HELD: &str = "held";
 
-/// The untouched rule as the kernel applies it with every key off (no registry in host tests).
+/// A rule that keeps the wireless controllers untouched (as the Gaming-PC profile does with `gp_wlan`): the
+/// Mini-PC world's WLAN at 04:00.0 stands for any function a rule holds.
 pub fn keys_off(n: &Node) -> Option<&'static str> {
-    CORE_OPT_IN.iter().find(|(m, _)| m.hits(n.vendor, n.device, n.class)).map(|(_, k)| *k)
+    crate::gp::is_wlan_class(n.class).then_some(HELD)
 }
 
 pub fn no_keys(_: &Node) -> Option<&'static str> {

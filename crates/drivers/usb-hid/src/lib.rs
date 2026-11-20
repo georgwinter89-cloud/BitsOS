@@ -3,8 +3,8 @@
 //! protocol; boot protocol as fallback for boot keyboards and mice), each application becomes an input device
 //! in `console::evdev` (Linux hid-generic + hid-input), reports arrive through US-3's interrupt pipes, an unplug
 //! releases every held key at once, and keyboards show the console's Caps/Num/Scroll Lock (`leds`). MCP tool
-//! `input` shows it all. CONFIG `usbhid_raw=on` (or US's `usb_xfer_test=on`/`usb_unplug_test=on`) leaves HID
-//! devices unbound.
+//! `input` shows it all. US's test keys (`usb_ev_test=on`, `usb_xfer_test=on`, `usb_unplug_test=on`) leave HID
+//! devices unbound for their scenarios.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -13,6 +13,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod battery;
 pub mod class;
 pub mod iface;
 pub mod leds;

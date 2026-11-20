@@ -1,9 +1,13 @@
 //! Scattered DMA frames (MM-14; the policy, limits and driver API are `mm::dma_pages`): a set of blocks from the
 //! frame allocator that need not be contiguous with each other, each zeroed, its direct-map alias retyped for
-//! UC/WC, with a CPU view per block. As Linux's TTM pool (linux-6.6/drivers/gpu/drm/ttm/ttm_pool.c:447-500) the
+//! UC/WC, with a CPU view per block. As Linux's TTM pool (linux-7.3.1/drivers/gpu/drm/ttm/ttm_pool.c:783-860) the
 //! largest fitting block is tried first, and a larger order than one frame is taken only from what is free now
-//! (`alloc_light`, as TTM's `__GFP_NORETRY` for orders above 0, ttm_pool.c:91-93): a big GPU buffer never
-//! pushes the system into reclaim for contiguity it does not need; only single frames take the full path.
+//! (`alloc_light`; Linux drops `__GFP_RECLAIM` for every order above 0 but the device's "beneficial" one,
+//! ttm_pool.c:182-184): a big GPU buffer never pushes the system into reclaim for contiguity; only single frames
+//! take the full path. Linux tries amdgpu's beneficial order (2 MiB, amdgpu_ttm.c:2129) harder with
+//! `__GFP_RETRY_MAYFAIL` (:186-188: reclaim and compaction, never the OOM killer). Not here (L7 decision;
+//! an MM item in plan/notes/desk-offen.md): the only harder path is `alloc`, which may run the OOM path, and without compaction
+//! reclaim cannot promise a 2 MiB block; that needs a may-fail path from the frame allocator first.
 //!
 //! The frames are `Kind::Dma`: never reclaimed (reclaim only shrinks the page cache), never moved, never merged
 //! into a huge page (only `Kind::User` frames are), never copied by fork (device VMAs are re-faulted). They stay

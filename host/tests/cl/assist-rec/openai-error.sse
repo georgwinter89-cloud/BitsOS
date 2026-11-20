@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"Ein Anfang, dann"},"finish_reason":null}]}
+
+data: {"error":{"message":"The server is overloaded, try again later.","type":"server_error","code":503}}
+

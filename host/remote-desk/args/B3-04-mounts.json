@@ -1,0 +1,1 @@
+{"path": "/bin/sh", "args": ["-c", "grep -E ' /(boot|data) ' /proc/mounts"], "timeout_ms": 20000}

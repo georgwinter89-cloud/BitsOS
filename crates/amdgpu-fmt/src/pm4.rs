@@ -1,12 +1,14 @@
 //! PM4 command packets of the GFX 11 command processor (CP): encoders, a strict decoder and readable text.
 //!
-//! Bit positions follow linux-6.6/drivers/gpu/drm/amd/amdgpu/nvd.h:30-53 (headers), :88-140 (WRITE_DATA,
-//! WAIT_REG_MEM, INDIRECT_BUFFER), :165-205 (RELEASE_MEM), :319-336 (register spaces); the packet layouts
-//! are those gfx_v11_0.c emits (emit_fence :5357, emit_ib_gfx :5278, wait_reg_mem :291, cond_exec :5507).
+//! Bit positions follow linux-7.3.1/drivers/gpu/drm/amd/amdgpu/nvd.h:30-50 (headers), :106-250 (WRITE_DATA,
+//! WAIT_REG_MEM, INDIRECT_BUFFER), :354-393 (RELEASE_MEM), :513-537 (register spaces); the packet layouts
+//! are those gfx_v11_0.c emits (emit_fence :6078, emit_ib_gfx :6009, wait_reg_mem :544, cond_exec :6196).
 //!
 //! A type-3 header is `3 << 30 | count << 16 | opcode << 8`; the packet is `count + 2` dwords long. One
-//! exception: a NOP whose count field is 0x3FFF ([`PAD`], Linux's ring and IB filler, gfx_v11_0.c:6085) is a
-//! single dword; Linux fills rings with it one dword at a time (amdgpu_ring.c:109 insert_nop).
+//! exception: a NOP whose count field is 0x3FFF ([`PAD`], Linux's ring and IB filler, gfx_v11_0.c:7075) is a
+//! single dword; Linux fills IBs and KIQ/MES rings with it one dword at a time (amdgpu_ring.c:109 insert_nop)
+//! and GFX/compute rings with a counted NOP whose body is that filler (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/
+//! gfx_v11_0.c:566, `ring::gfx_insert_nop`).
 
 use core::fmt;
 

@@ -1,7 +1,8 @@
 /* SN-4: the ALSA kernel interface with raw ioctls, as libasound's hw plugin uses it (V2 only: never run on a
  * host with a sound card; no libasound, so the transcript shows the kernel's answers). Each line is
- * "<what> <value>"; host/tests/sn/alsa-hw.expected holds the answers linux-6.6/sound/core gives for this
- * device's constraints (plan/notes/sn-SN-4.md). "alsa-hw selftest" plays 1 s of the "hw" signal (mixcheck.py
+ * "<what> <value>"; host/tests/sn/alsa-hw.expected holds the answers linux-7.3.1/sound/core gives for this
+ * device's constraints (plan/spec/sound.md §7; L7-HW: PCM 2.0.18 with the MSBITS subformat and the hw_params sync
+ * ID, control 2.0.10 with CARD_BYTES). "alsa-hw selftest" plays 1 s of the "hw" signal (mixcheck.py
  * alsa). SN-12: without a word it prints the usage and exits 2 (it used to play: an agent asking for the state
  * made the Mini-PC beep); "alsa-hw state" prints the mixer controls without writing or playing anything. */
 #include <errno.h>
@@ -13,6 +14,16 @@
 #include <time.h>
 #include <unistd.h>
 #include <sound/asound.h>
+
+/* linux-7.3.1/include/uapi/sound/asound.h:1086, :1220: newer than the sysroot's headers. */
+#ifndef SNDRV_CTL_IOCTL_CARD_BYTES
+struct snd_ctl_card_bytes {
+    unsigned int type, data_allocated, data_len, reserved;
+    unsigned long long data;
+};
+#define SND_CTL_CARD_BTYPE_COMPONENTS 1
+#define SNDRV_CTL_IOCTL_CARD_BYTES _IOWR('U', 0x02, struct snd_ctl_card_bytes)
+#endif
 
 static int xi(int fd, unsigned long cmd, void *arg) {
     return ioctl(fd, cmd, arg) < 0 ? -errno : 0;
@@ -155,7 +166,7 @@ static int cobalt(int argc, char **argv) {
     mask1(&p, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_FLOAT_LE);
     fix(&p, SNDRV_PCM_HW_PARAM_CHANNELS, 2);
     fix(&p, SNDRV_PCM_HW_PARAM_RATE, 48000);
-    fix(&p, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 256); /* what libasound chose for Cobalt (plan/notes/yt-YT-4a.md) */
+    fix(&p, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 256); /* what libasound chose for Cobalt */
     fix(&p, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, 8192);
     int r = xi(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &p);
     if (r) {
@@ -243,7 +254,7 @@ static int cobalt(int argc, char **argv) {
  * it: open (O_NONBLOCK, then blocking), a second open (EBUSY: one substream), refine, hw_params S16 stereo
  * 48 kHz, sw_params, prepare, READI of SECONDS s in periods (the first starts the stream), status, delay,
  * an XRUN after sleeping past the buffer, drop, hw_free. Lines starting with "# " vary (levels, timing) and
- * are not compared; host/tests/sn/capture.expected holds the rest as linux-6.6 answers for this device.
+ * are not compared; host/tests/sn/capture.expected holds the rest as linux-7.3.1 answers for this device.
  * FILE gets the frames as raw S16_LE stereo 48 kHz (aplay -t raw -f S16_LE -r 48000 -c 2 FILE). */
 static int capture(int argc, char **argv) {
     long secs = argc > 2 ? atol(argv[2]) : 2;
@@ -391,6 +402,11 @@ static int selftest(void) {
     struct snd_ctl_card_info ci;
     r = xi(c, SNDRV_CTL_IOCTL_CARD_INFO, &ci);
     printf("ctl.card_info %d %s %s\n", r, ci.driver, ci.id);
+    struct snd_ctl_card_bytes cb = {.type = SND_CTL_CARD_BTYPE_COMPONENTS};
+    r = xi(c, SNDRV_CTL_IOCTL_CARD_BYTES, &cb);
+    printf("ctl.card_bytes %d len %u\n", r, cb.data_len);
+    cb.type = 2;
+    printf("ctl.card_bytes.type2 %d\n", xi(c, SNDRV_CTL_IOCTL_CARD_BYTES, &cb));
     v = -1;
     r = xi(c, SNDRV_CTL_IOCTL_PCM_NEXT_DEVICE, &v);
     printf("ctl.next_device(-1) %d %d\n", r, v);
@@ -425,6 +441,11 @@ static int selftest(void) {
            p.masks[0].bits[0], p.masks[1].bits[0], iv(&p, SNDRV_PCM_HW_PARAM_CHANNELS)->min, iv(&p, SNDRV_PCM_HW_PARAM_CHANNELS)->max,
            iv(&p, SNDRV_PCM_HW_PARAM_RATE)->min, iv(&p, SNDRV_PCM_HW_PARAM_RATE)->max, iv(&p, SNDRV_PCM_HW_PARAM_SAMPLE_BITS)->min,
            iv(&p, SNDRV_PCM_HW_PARAM_SAMPLE_BITS)->max, iv(&p, SNDRV_PCM_HW_PARAM_BUFFER_BYTES)->max);
+    printf("refine.subformat %#x\n", p.masks[SNDRV_PCM_HW_PARAM_SUBFORMAT].bits[0]);
+    any(&p);
+    mask1(&p, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S32_LE);
+    mask1(&p, SNDRV_PCM_HW_PARAM_SUBFORMAT, SNDRV_PCM_SUBFORMAT_MSBITS_MAX);
+    printf("refine.s32_msbits_max %d\n", xi(fd, SNDRV_PCM_IOCTL_HW_REFINE, &p));
     any(&p);
     fix(&p, SNDRV_PCM_HW_PARAM_RATE, 44200);
     printf("refine.44200 %d\n", xi(fd, SNDRV_PCM_IOCTL_HW_REFINE, &p));
@@ -441,6 +462,10 @@ static int selftest(void) {
            iv(&p, SNDRV_PCM_HW_PARAM_PERIOD_SIZE)->min, iv(&p, SNDRV_PCM_HW_PARAM_PERIODS)->min, iv(&p, SNDRV_PCM_HW_PARAM_BUFFER_SIZE)->min,
            iv(&p, SNDRV_PCM_HW_PARAM_BUFFER_BYTES)->min, p.msbits, p.rate_num, p.rate_den, !!(p.info & SNDRV_PCM_INFO_PAUSE),
            !!(p.info & SNDRV_PCM_INFO_MMAP));
+    int sync0 = 1;
+    for (int i = 0; i < 16; i++)
+        sync0 &= p.sync[i] == 0;
+    printf("hw_params.subformat %#x sync_zero %d\n", p.masks[SNDRV_PCM_HW_PARAM_SUBFORMAT].bits[0], sync0);
     printf("state.setup %d\n", state(fd));
     printf("writei.setup %d\n", xi(fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x));
 

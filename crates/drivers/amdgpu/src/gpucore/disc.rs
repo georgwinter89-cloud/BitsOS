@@ -1,8 +1,9 @@
 //! The IP discovery binary (GX-6): what IP blocks the GPU has, in which versions and instances, at which register
 //! bases, plus the GC, harvest, VCN and MALL tables. The layout and the checks follow Linux
-//! (linux-6.6/drivers/gpu/drm/amd/include/discovery.h, amdgpu/amdgpu_discovery.c:326-498 init, :1185-1347
-//! reg_base_init); the parser is BitsOS's own: every offset and length is checked against the binary before it is
-//! read, a blob that does not hold up is refused with a reason (`Why`), never trusted in part.
+//! (linux-7.3.1/drivers/gpu/drm/amd/include/discovery.h, amdgpu/amdgpu_discovery.c:703-773 init with
+//! :618 table_check, :1733-1936 reg_base_init); the parser is BitsOS's own: every offset and length is checked
+//! against the binary before it is read, a blob that does not hold up is refused with a reason (`Why`), never
+//! trusted in part.
 //!
 //! Where Linux reads past what it checked (die count above the header's 16 slots, `binary_size` below its header,
 //! table offsets past the end), BitsOS refuses. Where Linux deliberately does not check (the MALL table, `0 &&` at
@@ -20,9 +21,33 @@ pub const GC_TABLE_ID: u32 = 0x4347;
 pub const HARVEST_SIGNATURE: u32 = 0x5652_4148;
 pub const VCN_TABLE_ID: u32 = 0x004E_4356;
 pub const MALL_TABLE_ID: u32 = 0x4C4C_414D;
-/// Where Linux reads the binary: VRAM size minus 64 KiB, 8 KiB long (linux-6.6 amdgpu_discovery.h:27-28).
+/// Where Linux reads the binary by default: VRAM size minus 64 KiB, 10 KiB long
+/// (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.h:29-30, DISCOVERY_TMR_SIZE/_OFFSET).
 pub const TMR_OFFSET: u64 = 64 << 10;
-pub const TMR_SIZE: usize = 8 << 10;
+pub const TMR_SIZE: usize = 10 << 10;
+/// `mmDRIVER_SCRATCH_0..2` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c:148-150) as byte offsets:
+/// the table's offset (low, high) and size when the firmware put it elsewhere.
+pub const DRIVER_SCRATCH: [u32; 3] = [0x94 * 4, 0x95 * 4, 0x96 * 4];
+/// The largest table a scratch size may name: `binary_size` is 16 bits, so nothing larger can parse (Linux
+/// allocates whatever the register says).
+pub const SCRATCH_MAX: usize = 64 << 10;
+
+/// Where the binary is read (`amdgpu_discovery_get_tmr_info`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/
+/// amdgpu_discovery.c:321-366, bare metal with VRAM): the default place when its first dword is the signature,
+/// else what DRIVER_SCRATCH_2 (size) and _0/_1 (offset) name, else the default (the parse then says why). A
+/// scratch place that cannot be read whole (above 64 KiB, not dword-aligned, past `vram_bytes`) is not taken.
+pub fn tmr_place(default_pos: u64, signature: Option<u32>, scratch: impl Fn(u32) -> Option<u32>, vram_bytes: u64) -> (u64, usize) {
+    let default = (default_pos, TMR_SIZE);
+    if signature == Some(BINARY_SIGNATURE) {
+        return default;
+    }
+    let Some(size) = scratch(DRIVER_SCRATCH[2]).filter(|&s| s != 0) else { return default };
+    let (Some(lo), Some(hi)) = (scratch(DRIVER_SCRATCH[0]), scratch(DRIVER_SCRATCH[1])) else { return default };
+    let pos = u64::from(hi) << 32 | u64::from(lo);
+    let size = size as usize;
+    let fits = size <= SCRATCH_MAX && size % 4 == 0 && pos % 4 == 0 && pos.checked_add(size as u64).is_some_and(|e| e <= vram_bytes);
+    if fits { (pos, size) } else { default }
+}
 
 /// binary_header: signature, version major/minor, checksum, size, then six table_info entries of 8 bytes.
 const BINARY_HEADER: usize = 12 + 6 * 8;
@@ -279,7 +304,8 @@ fn place(b: &Bytes, t: Table, offset: u16, size: u32, header: usize, want: u16) 
     Ok((start, end))
 }
 
-/// Parses a discovery binary as read from the reserved region (8 KiB) or from a file. Never panics; every
+/// Parses a discovery binary as read from the reserved region (10 KiB, or what DRIVER_SCRATCH named) or from a
+/// file. Never panics; every
 /// refusal names its reason.
 pub fn parse(buf: &[u8]) -> Result<Discovery, Why> {
     if buf.len() < BINARY_HEADER {
@@ -601,7 +627,8 @@ impl Discovery {
     }
 
     /// Harvested (fused off): listed in the harvest table, or, before GC 10.2 (not 9.4.3), variant 1 in its own
-    /// entry (linux-6.6 amdgpu_discovery.c:1349-1370 harvest_ip).
+    /// entry (linux-6.6 amdgpu_discovery.c:1349-1370 harvest_ip; Linux 7.3.1 differs:
+    /// linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c:1957, see plan/spec/linux7-differences.md).
     pub fn harvested(&self, e: &IpEntry) -> bool {
         let per_ip = self.version(hwid::GC).is_some_and(|v| {
             v < IpVersion { major: 10, minor: 2, rev: 0 } && v != IpVersion { major: 9, minor: 4, rev: 3 }

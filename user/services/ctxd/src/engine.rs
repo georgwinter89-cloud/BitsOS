@@ -69,6 +69,9 @@ impl Generation {
     }
 }
 
+/// The first wait before the vectors are tried again after the model failed during a run.
+pub const EMBED_RETRY_SECONDS: u64 = 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
     /// The desktop, the CLI, the UI: everything Georg may see.
@@ -90,6 +93,9 @@ pub struct SearchReq {
     pub hidden: Vec<String>,
     /// Force this document into the candidates (`context_explain`).
     pub force_doc: Option<u32>,
+    /// CX-3: the documents of the open workspace (the anchors of `C`); empty for a plain search, whose
+    /// anchors are the documents opened after similar queries.
+    pub anchors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +109,9 @@ pub struct Hit {
     pub v_chunk: Option<u32>,
     pub b_chunk: Option<u32>,
     pub gate: bool,
+    /// CX-3: what learning added (`A`, the strongest anchor) and the dismissal count `D`.
+    pub co: crate::learn::CoUse,
+    pub d: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,6 +122,8 @@ pub struct SearchOut {
     pub embedder: Option<String>,
     pub weights: Option<rank::Weights>,
     pub candidates: usize,
+    /// The query as learning knows it (hash, vector), for the search event.
+    pub qkey: Option<crate::learn::QKey>,
 }
 
 pub struct EngineOpts {
@@ -130,15 +141,21 @@ pub struct Engine {
     pub progress: Progress,
     pub pool: Pool,
     pub ws: WorkspaceStore,
+    /// CX-3: what Georg did (usage log) and what follows from it.
+    pub learn: crate::learn::Learn,
+    /// DB4: the habits, the other half of the one local memory.
+    pub habits: crate::habits::Habits,
     wake: (Mutex<bool>, Condvar),
     index_lock: Mutex<()>,
 }
 
 pub fn start_embedder(cfg: &Context, data: &Path) -> (Option<Arc<dyn Embedder>>, Option<String>) {
     match cfg.embedder.kind.as_str() {
-        "fake" => (Some(Arc::new(crate::embed::fake::Fake::new(256))), None),
+        "fake" if crate::knobs::ON => (Some(Arc::new(crate::embed::fake::Fake::new(256))), None),
+        // C1: the shipped build never ranks by the hashing stand-in.
+        "fake" => (None, Some("embedder fake exists only in the test build; keyword search only".into())),
         "none" => (None, Some("embedder off (context.embedder.kind = none)".into())),
-        _ => match crate::embed::llama::LlamaCpu::start(&cfg.embedder, data) {
+        _ => match crate::embed::llama::LlamaCpu::start(&cfg.embedder, data, cfg.index.background) {
             Ok(l) => (Some(Arc::new(l)), None),
             Err(e) => {
                 crate::event!("warn", "embedder.fallback", from = "llama", to = "keyword_only", reason = e.clone());
@@ -168,6 +185,8 @@ impl Engine {
             }
         };
         let ws = WorkspaceStore::open(&data.join("workspaces")).map_err(|e| format!("workspaces: {e}"))?;
+        let learn = crate::learn::Learn::open(data);
+        let habits = crate::habits::Habits::open(data);
         Ok(Engine {
             cfg,
             store,
@@ -178,6 +197,8 @@ impl Engine {
             progress: Progress::default(),
             pool,
             ws,
+            learn,
+            habits,
             wake: (Mutex::new(false), Condvar::new()),
             index_lock: Mutex::new(()),
         })
@@ -208,6 +229,13 @@ impl Engine {
         Ok(out)
     }
 
+    /// The query's vector when the model answers within 300 ms (the key of a dismissal).
+    pub fn query_vec(&self, q: &str) -> Option<Vec<f32>> {
+        let g = self.generation()?;
+        let emb = self.embedder.as_ref().filter(|m| g.cat.embedder.as_deref() == Some(m.id()))?;
+        emb.embed(EmbedKind::Query, &[q], Duration::from_millis(300)).ok()?.pop()
+    }
+
     /// Wake the indexer thread now (after a `reindex` request or `forget index`).
     pub fn wake_indexer(&self) {
         if let Ok(mut w) = self.wake.0.lock() {
@@ -218,12 +246,25 @@ impl Engine {
 
     /// The indexer loop of `ctxd serve`: run, then sleep until the rescan interval or a wake-up.
     pub fn indexer_loop(self: &Arc<Self>) {
+        // The workers it starts inherit the class (prio.rs).
+        if self.cfg.index.background && !crate::prio::background() {
+            crate::event!("warn", "prio.refused", class = "background");
+        }
+        let rescan = self.cfg.index.rescan_seconds.max(1);
+        // After the model failed mid-run: the vectors again in a minute, then less often (a dead model
+        // would otherwise rebuild the keyword generation every minute).
+        let mut retry = 0u64;
         loop {
-            if let Err(e) = self.index_now() {
-                crate::event!("warn", "index.retry_later", reason = e);
+            match self.index_now() {
+                Ok(o) if o.embedder_failed => {
+                    retry = if retry == 0 { EMBED_RETRY_SECONDS } else { retry * 2 };
+                    crate::event!("warn", "index.vectors_later", seconds = retry.min(rescan));
+                }
+                Ok(_) => retry = 0,
+                Err(e) => crate::event!("warn", "index.retry_later", reason = e),
             }
             let Ok(mut w) = self.wake.0.lock() else { return };
-            let wait = Duration::from_secs(self.cfg.index.rescan_seconds.max(1));
+            let wait = Duration::from_secs(if retry > 0 { retry.min(rescan) } else { rescan });
             if !*w {
                 w = match self.wake.1.wait_timeout(w, wait) {
                     Ok((g, _)) => g,
@@ -333,6 +374,8 @@ impl Engine {
             v_chunk: None,
             b_chunk: None,
             gate: false,
+            co: Default::default(),
+            d: 0.0,
         };
         let match_cos = calib.floor + rc.v_min * (calib.ceil - calib.floor);
         let mut v_rank: HashMap<u32, usize> = HashMap::new();
@@ -393,18 +436,31 @@ impl Engine {
         }
 
         let max_b = cands.values().map(|h| h.bm25).fold(0.0f32, f32::max);
-        let w = rank::weights(rc, qvec.is_some(), false);
-        let now = crate::util::now_secs();
+        // CX-3: the anchors of C (the workspace's documents, else those opened after similar queries).
+        let qkey = self.learn.qkey(&req.query, qvec.as_deref());
+        let mut anchors: Vec<(String, f64)> =
+            if req.anchors.is_empty() { self.learn.anchors(&qkey) } else { req.anchors.iter().map(|a| (a.clone(), 1.0)).collect() };
+        // A private document must not even steer what Claude sees: co-use with it would leak its title
+        // through "why"/explain and its existence through the ranking.
+        if req.caller == Caller::Mcp {
+            anchors.retain(|(a, _)| g.by_id.get(a).is_some_and(|&j| !g.cat.docs[j as usize].private));
+        }
+        let has_c = !anchors.is_empty();
+        let w = rank::weights(rc, qvec.is_some(), has_c);
+        let now = self.learn.now();
         let mut scored = Vec::with_capacity(cands.len());
         for h in cands.values_mut() {
             let d = &g.cat.docs[h.doc as usize];
-            let age_days = (now - d.mtime) as f32 / 86_400.0;
+            let seen = self.learn.last_open(&d.id).unwrap_or(0).max(d.mtime);
+            let age_days = (now - seen) as f32 / 86_400.0;
+            h.co = if has_c { self.learn.co_use(&d.id, &anchors) } else { Default::default() };
+            h.d = self.learn.dismissed(&d.id, &qkey);
             h.parts = Parts {
                 v: if qvec.is_some() { h.cos.map(|c| rank::calibrated(c, calib.floor, calib.ceil)) } else { None },
                 b: if max_b > 0.0 { h.bm25 / max_b } else { 0.0 },
-                c: None,
+                c: has_c.then(|| 1.0 - (-h.co.a / rc.tau.max(1e-3)).exp()),
                 r: rank::recency(age_days, rc.t_half_days),
-                x: 0.0,
+                x: 1.0 - (-h.d / 2.0).exp(),
             };
             h.gate = rank::passes_gate(&h.parts, rc);
             h.s = if rc.fusion == "rrf" {
@@ -441,6 +497,7 @@ impl Engine {
             embedder: g.cat.embedder.clone(),
             weights: Some(w),
             candidates: n_cands,
+            qkey: Some(qkey),
         }
     }
 }

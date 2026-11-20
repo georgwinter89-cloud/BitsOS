@@ -40,6 +40,7 @@ static KTEST_SAFE: ToolEntry = ToolEntry {
     input_schema: r#"{"type":"object"}"#,
     owner: "MC",
     safety: Safety::Change,
+    local: false,
     handler: crate::tools::run_ktests::ktest_safe_tool,
 };
 
@@ -163,6 +164,7 @@ impl Gate {
                 Offer::Installer => Some(true),
                 Offer::Dropped(_) => None,
             },
+            Tool::Service(s) if !granted && wire::grant_only(&s.name) => None,
             Tool::Service(s) => match wire::service_offer_for(s.safety, s.uid == 0, granted)? {
                 Offer::Gate => Some(false),
                 Offer::Installer => Some(true),
@@ -411,10 +413,7 @@ impl Gate {
         } else if let Err(reason) = rpc::policy_check(tool.name()) {
             Ok(Err(ToolError::Refused(reason)))
         } else {
-            let run = match &tool {
-                Tool::Static(e) if e.name == "ktest" && !full => Tool::Static(&KTEST_SAFE),
-                other => other.clone(),
-            };
+            let run = tool_for_run(&tool, full);
             let ctx = ToolContext { caller: policy::Subject::KERNEL, deadline_ns: t0.saturating_add(r.timeout_ms.saturating_mul(1_000_000)) };
             let sh = self.sh.clone();
             let (res, after) = crate::conn::run_tool(&self.sh, &run, ctx, &r.args, &r.peer, None, &|| sh.stop.load(Ordering::Acquire) || vfs::dentry::killed());
@@ -660,6 +659,17 @@ pub(crate) fn armed() -> Option<&'static Gate> {
 mod access;
 pub mod identity;
 mod installer;
+/// The tool as one call runs it: a narrow client's ktest is the safe one; for a client with full access a
+/// service's tool says so to its service (DB1, `_meta.access`), so a tool that answers only under Georg's keyboard
+/// release can check it.
+fn tool_for_run(tool: &Tool, full: bool) -> Tool {
+    match tool {
+        Tool::Static(e) if e.name == "ktest" && !full => Tool::Static(&KTEST_SAFE),
+        Tool::Service(t) if full => Tool::Service(Arc::new(t.for_full_access())),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

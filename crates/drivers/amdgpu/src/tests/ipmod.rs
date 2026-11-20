@@ -47,8 +47,8 @@ fn minipc_versions_pick_the_780m_modules() {
     ];
     assert_eq!(got, want.iter().map(|&(r, n)| (r, String::from(n))).collect::<Vec<_>>());
     assert_eq!(p.missing().count(), 0);
-    // Firmware: exactly the files linux-firmware has for this GPU (fw_files.txt of the Mini-PC, 27.10.); MES's
-    // `_mes` is the fallback of `_mes_2`; no SMU file (BIOS).
+    // Firmware: exactly the files linux-firmware has for this GPU (plan/hw/gx-780m-cachyos-2026-10-27/fw_files.txt,
+    // the Mini-PC, 27.10.); MES's `_mes` is the fallback of `_mes_2`; no SMU file (BIOS).
     let fw = p.firmware();
     assert_eq!(
         fw,
@@ -79,53 +79,8 @@ fn minipc_versions_pick_the_780m_modules() {
     assert_eq!(listed.len(), on_minipc.len());
 }
 
-/// RDNA 4 (RX 9070 XT, gfx1201). Linux 6.6 has none of these; the versions are the ones Linux 6.12's
-/// amdgpu_discovery.c switches on for that family (GC 12.0.1 soc24/gfx_v12_0/gmc_v12_0/mes_v12_0, SDMA 7.0.1
-/// sdma_v7_0, MP0/MP1 14.0.3 psp_v14_0/smu_v14_0, DCN reported 4.1.0, VCN 5.0.0, OSSSYS 7.0.0 ih_v7_0, MMHUB
-/// 4.1.0, NBIF 6.3.1). Synthetic until the Gaming-PC's real dump replaces it (GX-10).
-#[test]
-fn rdna4_reports_exactly_the_missing_modules() {
-    let ips = vec![
-        ip(h::GC, 0, (12, 0, 1), &[0x1260, 0xA000]),
-        ip(h::SDMA0, 0, (7, 0, 1), &[0x1260, 0xA000]),
-        ip(h::SDMA1, 0, (7, 0, 1), &[0x1260, 0xA000]),
-        ip(h::MP0, 0, (14, 0, 3), &[0x4000, 0x16000]),
-        ip(h::MP1, 0, (14, 0, 3), &[0x4000, 0x16000]),
-        ip(h::DMU, 0, (4, 1, 0), &[0x12, 0xC0, 0x34C0]),
-        ip(h::VCN, 0, (5, 0, 0), &[0x7800]),
-        ip(h::OSSSYS, 0, (7, 0, 0), &[0x10A0]),
-        ip(h::MMHUB, 0, (4, 1, 0), &[0x13200, 0x1A000]),
-        ip(h::NBIF, 0, (6, 3, 1), &[0, 0x14]),
-        ip(h::HDP, 0, (7, 0, 0), &[0xF20]),
-    ];
-    let p = ipmod::plan(&parse(&build(&Blob::new(ips)).0).unwrap());
-    let missing: Vec<(Role, String)> = p
-        .missing()
-        .map(|c| match *c {
-            Choice::Missing { role, version, candidate } => {
-                assert!(candidate.is_none(), "{}: no BitsOS module's Linux block serves {version}", role.name());
-                (role, std::format!("{version}"))
-            }
-            _ => unreachable!(),
-        })
-        .collect();
-    let want = [
-        (Role::Psp, "14.0.3"),
-        (Role::Smu, "14.0.3"),
-        (Role::Nbio, "6.3.1"),
-        (Role::Gmc, "12.0.1"),
-        (Role::Gfxhub, "12.0.1"),
-        (Role::Mmhub, "4.1.0"),
-        (Role::Ih, "7.0.0"),
-        (Role::Gfx, "12.0.1"),
-        (Role::Mes, "12.0.1"),
-        (Role::Sdma, "7.0.1"),
-        (Role::Display, "4.1.0"),
-        (Role::Vcn, "5.0.0"),
-    ];
-    assert_eq!(missing, want.iter().map(|&(r, v)| (r, String::from(v))).collect::<Vec<_>>());
-    assert!(p.firmware().is_empty(), "no firmware for modules not chosen");
-}
+// GP-GPU1: the synthetic RDNA 4 table that stood here ("until the Gaming-PC's real dump replaces it (GX-10)") is
+// replaced by the measured one: tests/rdna4.rs `the_measured_table_resolves_to_the_planned_modules`.
 
 #[test]
 fn neighbour_versions_are_candidates_not_choices() {

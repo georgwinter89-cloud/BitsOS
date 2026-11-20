@@ -203,7 +203,7 @@ fn start_verdict() -> TestResult {
     let st = wait_started();
     kassert!(!matches!(st, State::NotStarted | State::Starting), "the start did not finish: {st:?}");
     if hal::cpu::detect().hypervisor && !system::on_fake() {
-        kassert!(matches!(st, State::Absent | State::Off), "QEMU has no FCH: {st:?}");
+        kassert!(st == State::Absent, "QEMU has no FCH: {st:?}");
     }
     klog::event!(Info, "watchdog", "ktest.state", state = st.name(), chip = system::found().unwrap_or("?"));
     Ok(())
@@ -245,30 +245,26 @@ fn system_fake() -> TestResult {
     sched::sleep_ns(2500 * MS);
     kassert!(d.kicks() == k1, "no kicks after the quiesce");
     system::resume().map_err(|e| e.text())?;
-    // Reload (default stop): stopped.
-    let reload_grace = system::config().is_some_and(|c| c.reload_grace);
+    // Reload: stopped.
     let left = system::quiesce_now(true);
-    kassert!(left == if reload_grace { State::Grace } else { State::Stopped }, "{left:?}");
-    kassert!(reload_grace || !regs::running(d.regs()), "stopped for a Reload");
+    kassert!(left == State::Stopped && !regs::running(d.regs()), "stopped for a Reload: {left:?}");
     system::resume().map_err(|e| e.text())?;
     // RB-17: the Reload's own Quiesce holds the chip (no kicks, still counting) so the crumbs up to the jump land;
     // kexec's before-jump hook stops it after the last one, which the next start then reads as the end.
     let left = system::quiesce_for_jump();
     kassert!(left == State::Grace && regs::running(d.regs()), "held for the jump: {left:?} control {:#x}", d.regs().ctl_read());
     let base = system::crumb_base();
-    if !reload_grace {
-        let jump = crate::crumb::code(klog::crumb::Stage::ReloadJump as u16, base);
-        if let Some(jump) = jump {
-            kassert!(d.crumb(jump), "the jump's crumb is kept while held");
-        }
-        let k4 = d.kicks();
-        sched::sleep_ns(1500 * MS);
-        kassert!(d.kicks() == k4, "no kicks while held");
-        kassert!(system::stop_at_jump() && system::state() == State::Stopped && !regs::running(d.regs()));
-        if jump.is_some() {
-            let prev = crate::crumb::Previous::read_with(d.regs().count_read(), base, false);
-            kassert!(prev.id == Some(klog::crumb::Stage::ReloadJump as u16) && !prev.incomplete(), "{}", prev.text());
-        }
+    let jump = crate::crumb::code(klog::crumb::Stage::ReloadJump as u16, base);
+    if let Some(jump) = jump {
+        kassert!(d.crumb(jump), "the jump's crumb is kept while held");
+    }
+    let k4 = d.kicks();
+    sched::sleep_ns(1500 * MS);
+    kassert!(d.kicks() == k4, "no kicks while held");
+    kassert!(system::stop_at_jump() && system::state() == State::Stopped && !regs::running(d.regs()));
+    if jump.is_some() {
+        let prev = crate::crumb::Previous::read_with(d.regs().count_read(), base, false);
+        kassert!(prev.id == Some(klog::crumb::Stage::ReloadJump as u16) && !prev.incomplete(), "{}", prev.text());
     }
     kassert!(!system::stop_at_jump(), "the stop is one-shot");
     // RB-17 fixer: the jump failed after that stop: kexec's failed-jump hook arms the chip again without kicks,
@@ -291,6 +287,12 @@ fn system_fake() -> TestResult {
     sched::sleep_ns(2500 * MS);
     kassert!(d.kicks() == k3, "no kicks after the panic hook");
     system::resume().map_err(|e| e.text())?;
+    // CRASHDISK fixer: a hang's panic puts the chip on the panic's grace before it panics (not 3 s from the reset).
+    let got = system::hang_grace();
+    let count = d.regs().count_read();
+    kassert!(matches!(got, kexec::crash::Watchdog::Grace { secs } if secs as u64 >= kexec::crash::WATCHDOG_MARGIN_S && count == secs)
+        && system::state() == State::Grace, "hang grace: {got:?} count {count} state {:?}", system::state());
+    system::resume().map_err(|e| e.text())?;
     let k2 = d.kicks();
     let t0 = time::now_ns();
     while d.kicks() == k2 {
@@ -298,10 +300,7 @@ fn system_fake() -> TestResult {
         sched::sleep_ns(100 * MS);
     }
     system::quiesce_now(true);
-    if regs::running(d.regs()) {
-        // watchdog_reload=grace in this CONFIG: stop it for good here.
-        d.stop();
-    }
+    kassert!(!regs::running(d.regs()), "a Reload's quiesce stopped it");
     kassert!(crate::tool::hang_refusal(system::state()).is_some(), "hang refuses once it is stopped");
     Ok(())
 }
@@ -345,3 +344,52 @@ fn crumb_in_the_count() -> TestResult {
     Ok(())
 }
 ktest!("rb.wdt.crumb", Safe, crumb_in_the_count);
+
+/// CRASHDISK (host/tests/rb/45-crashdisk.sh, CONFIG `rb_crashdisk=hang`): with the disk copy armed, the fake
+/// system dog armed and the hang's panic allowed on it, CPU 1 spins with interrupts off; the reporter sees the
+/// stall and, 3 s before the reset, panics: the record goes to the ESP. The boot after it (a new QEMU) finds that
+/// record here and kexec's `rb.crashdisk.forced` checks it.
+fn crashdisk_hang() -> TestResult {
+    if kexec::boot::config("rb_crashdisk").as_deref() != Some("hang") {
+        return ktest::fail("CONFIG rb_crashdisk=hang not set");
+    }
+    let hang = kexec::crash::disk::format::flags::HANG;
+    // The disk's records are known once the boot thread decided.
+    let _ = kexec::crash::disk::ktests_wait_decided(150);
+    if kexec::crash::disk::show::newest().is_some_and(|r| !r.reported_before && r.head.flags & hang != 0) {
+        return Ok(());
+    }
+    if !hal::cpu::detect().hypervisor || hal::percpu::cpu_count() < 2 {
+        return ktest::fail("needs QEMU with two CPUs or more");
+    }
+    let end = time::now_ns() + 150 * SEC;
+    while !matches!(kexec::crash::disk::state(), kexec::crash::disk::State::Armed { .. }) {
+        kassert!(time::now_ns() < end, "the disk copy is not armed: {:?}", kexec::crash::disk::state());
+        sched::sleep_ns(200 * MS);
+    }
+    let _ = wait_started();
+    let fake = Arc::new(Fake::new(true, false, Some(time::now_ns)));
+    kassert!(system::start_fake(Box::new(fake)) || system::on_fake(), "the fake system dog did not start");
+    kassert!(system::state() == State::Armed, "{:?}", system::state());
+    system::FAKE_HANG_PANIC.store(true, Ordering::Release);
+    let _cpu0 = OnCpu0::take()?;
+    klog::event!(Warn, "watchdog", "ktest.hanging", cpu = 1; "CPU 1 spins with interrupts off until the watchdog's panic");
+    HANG_SPIN.store(true, Ordering::Release);
+    let _ = hal::smp::call_on(1, wdt_ktest_hang, 0, time::now_ns, 50 * MS);
+    sched::sleep_ns(120 * SEC);
+    HANG_SPIN.store(false, Ordering::Release);
+    Err("the stall did not end in the watchdog's panic within 120 s".into())
+}
+ktest!("rb.crashdisk.hang", Run("rb/45-crashdisk"), crashdisk_hang);
+
+static HANG_SPIN: AtomicBool = AtomicBool::new(false);
+
+/// Spins with interrupts off (an SMP call) until the panic's NMI stops this CPU; bounded (130 s).
+#[inline(never)]
+fn wdt_ktest_hang(_: u64) -> u64 {
+    let end = time::now_ns() + 130 * SEC;
+    while HANG_SPIN.load(Ordering::Acquire) && time::now_ns() < end {
+        core::hint::spin_loop();
+    }
+    0
+}

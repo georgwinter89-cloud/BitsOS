@@ -26,9 +26,9 @@ use super::scan::{self, ScanReq};
 use super::{LinkState, Sta, StaEnv, StaEvent};
 
 /// IEEE 802.11 reason 4: disassociated due to inactivity (mac80211's connection loss:
-/// ieee80211_beacon_connection_loss_work (linux-6.6/net/mac80211/mlme.c:3422) ->
-/// __ieee80211_disconnect (linux-6.6/net/mac80211/mlme.c:3415), our deauthentication with
-/// WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY (linux-6.6/net/mac80211/mlme.c:3396)). mac80211 probes
+/// ieee80211_beacon_connection_loss_work (linux-7.3.1/net/mac80211/mlme.c:5178) ->
+/// __ieee80211_disconnect (linux-7.3.1/net/mac80211/mlme.c:5032), our deauthentication with
+/// WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY (linux-7.3.1/net/mac80211/mlme.c:5069)). mac80211 probes
 /// the AP first after a plain beacon loss (ieee80211_mgd_probe_ap); BitsOS takes the firmware's
 /// report (60 beacons missed) as the connection loss.
 pub const REASON_INACTIVITY: u16 = 4;

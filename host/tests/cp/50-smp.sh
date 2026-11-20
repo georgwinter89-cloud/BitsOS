@@ -41,7 +41,7 @@ check "$L" 'KTEST ok cp.ist.nmi' "the soft-NMI IST test with NMI IPIs paused"
 check "$L" 'KTEST ok cp.smp.call_owners' "two callers on one target: own results, Late frees the mailbox"
 check "$L" 'KTEST ok cp.smp.start_guards' "start_ap refuses running CPUs' APIC IDs"
 check "$L" 'KTEST skip cp.smp.tsc_offsets_hardware' "the 38-tick check skips under a hypervisor"
-check "$L" 'KTEST done passed=[0-9]+ failed=0 skipped=3' "every ktest passed; skipped only the hardware TSC check and the two CONFIG-limit tests (55-smp-limits.sh)"
+check "$L" 'KTEST done passed=[0-9]+ failed=0 skipped=1' "every ktest passed; skipped only the hardware TSC check"
 
 # 2. TCG: the MTRR-copy path at bring-up.
 run tcg16 "cp.smp" -machine q35,accel=tcg -cpu max -smp 16
@@ -50,7 +50,7 @@ check "$L" 'smp done cpus=16 planned=15 up=15 failed=0' "TCG: 16 CPUs up"
 n=$(count "$L" 'cpu ap.up .* mtrr=copied ')
 [ "$n" = 15 ] && echo "ok   TCG: all 15 APs took the BSP's MTRRs (QEMU clears them on INIT)" || { echo "FAIL TCG: $n APs with mtrr=copied, wanted 15"; fail=1; }
 check "$L" 'KTEST ok cp.smp.call_owners' "TCG: two callers on one target"
-check "$L" 'KTEST done passed=[0-9]+ failed=0 skipped=3' "TCG: every cp.smp ktest passed (the hardware TSC check and the CONFIG-limit tests skip)"
+check "$L" 'KTEST done passed=[0-9]+ failed=0 skipped=1' "TCG: every cp.smp ktest passed (the hardware TSC check skips)"
 
 # 3. Topology from the command line.
 if [ -e /dev/kvm ]; then

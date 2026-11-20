@@ -10,7 +10,7 @@
 //!   system and never in the trees the kernel builds itself (`/dev`, `/proc`, `/sys`);
 //! - only regular files are written or read (a device node could wait for ever or change device state);
 //! - a file named `CONFIG.TXT` never gains or changes an `nvme_write=`, `nvme_data=`, `stick_write=` or `usb_msd_write=` line (R8a:
-//!   only Georg's own edit turns them on), whatever the write does to the rest of it (`wlan=` is free, R8d);
+//!   only Georg's own edit turns them on), whatever the write does to the rest of it;
 //! - every access asks `policy::check` (B3) besides the per-call `McpAction` question of rpc.
 //!
 //! A whole-file write (no offset, no append) and `fetch` write into a hidden sibling first and rename it over
@@ -67,6 +67,39 @@ pub fn access_store_refusal(canon: &str) -> Option<String> {
     };
     let inside = canon.strip_prefix(ACCESS_STORE).is_some_and(|r| r.is_empty() || r.starts_with('/')) || ACCESS_NOTES.iter().any(|n| under(n));
     inside.then(|| format!("{canon} holds the installer's full-access grants (MC-10): no MCP tool reads or writes them; only Georg at the keyboard sets one"))
+}
+
+/// CL-S CR 4 (INT-CL3T): settingsd's folder on the stick. `ai.toml` holds the AI providers' keys in clear,
+/// `owners.list` says whose secrets are whose. The file tools neither show nor change anything there: a key
+/// read with `read_file` would stand in the caller's conversation, and a written `owners.list` would hand a
+/// secret to another program. Settings are read and changed with the `settings_*` tools.
+pub const SETTINGS_STORE: &str = "settings";
+
+/// Why the file tools do not reach `canon` (an absolute canonical path), if it is settingsd's folder on the
+/// stick or below it (FAT: any case, trailing dots and spaces ignored).
+pub fn settings_refusal(canon: &str) -> Option<String> {
+    let comps: Vec<&str> = canon.split('/').filter(|c| !c.is_empty()).collect();
+    let inside = comps.len() >= 3 && comps[0] == STICK_MOUNT && fat_fold(comps[1].as_bytes()) == "bitsos2" && fat_fold(comps[2].as_bytes()) == SETTINGS_STORE;
+    inside.then(|| format!("{canon} is settingsd's own folder (it holds the AI providers' keys in clear): no file tool reads or writes there; use settings_list, settings_get and settings_set"))
+}
+
+/// UPDATE: the update service's folder on the boot medium (`\BITSOS2\UPDATE\`): where it looks for versions
+/// (`SOURCE.TXT`, a test CA). No file tool changes or reads it, so no MCP call points the update elsewhere. Georg's
+/// GitHub token is not here but in settingsd's folder (`settings\update.tok`), which every kernel since INT-CL3T
+/// keeps from the file tools (`settings_refusal`); the update page and the `update_status` op show it as ***.
+pub const UPDATE_STORE: &str = "update";
+
+/// Why the file tools do not reach `canon`, if it is the update service's folder on the boot medium or below it.
+pub fn update_refusal(canon: &str) -> Option<String> {
+    let comps: Vec<&str> = canon.split('/').filter(|c| !c.is_empty()).collect();
+    let inside = comps.len() >= 3 && comps[0] == STICK_MOUNT && fat_fold(comps[1].as_bytes()) == "bitsos2" && fat_fold(comps[2].as_bytes()) == UPDATE_STORE;
+    inside.then(|| format!("{canon} is the update service's own folder (where it looks for versions): no file tool reads or writes there"))
+}
+
+/// Why no file tool reads, lists or hashes `canon`: the installer's grants (MC-10), settingsd's folder or the
+/// update service's.
+pub fn kept_refusal(canon: &str) -> Option<String> {
+    access_store_refusal(canon).or_else(|| settings_refusal(canon)).or_else(|| update_refusal(canon))
 }
 
 /// A path argument: absolute, at most PATH_MAX bytes, no NUL.
@@ -215,6 +248,13 @@ pub fn stick_refusal(dir: &str, name: &[u8]) -> Option<String> {
         return Some(format!("{dir} is on the boot stick outside \\BITSOS2\\: the file tools write on the stick only below /boot/BITSOS2/ (FS-7)"));
     }
     let first = comps.get(2).map(|c| fat_fold(c.as_bytes())).unwrap_or_else(|| fat_fold(name));
+    if first == SETTINGS_STORE {
+        // The folder itself (made, renamed or removed in \BITSOS2\) and everything in it.
+        return settings_refusal(&format!("/{STICK_MOUNT}/BITSOS2/{SETTINGS_STORE}"));
+    }
+    if first == UPDATE_STORE {
+        return update_refusal(&format!("/{STICK_MOUNT}/BITSOS2/{UPDATE_STORE}"));
+    }
     if STICK_KEEP_OFF.contains(&first.as_str()) {
         return Some(format!(
             "/boot/BITSOS2/{first}: the system generations (SYS), CONFIG.TXT and STICK.ID are never changed by the file tools (install_kernel and its config argument do that)"

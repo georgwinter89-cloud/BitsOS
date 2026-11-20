@@ -59,6 +59,9 @@ pub struct Stats {
     /// Deletes whose tree could not be walked to the end (memory or a metadata read failed): the space it
     /// still holds comes back at the next open, which rebuilds every reference count.
     pub leaks: u64,
+    /// Freed chunks whose discard may still be at the device (it timed out or failed under way, trim.rs): out of
+    /// the pool until the next open, which counts them free again. Not in `free` or `pending`.
+    pub trim_lost: u64,
 }
 
 pub(crate) struct CPage {
@@ -89,7 +92,7 @@ pub struct Pool {
     pub(crate) first: u64,
     /// Largest device request in bytes.
     pub(crate) dev_max: u64,
-    discard_ok: bool,
+    pub(crate) discard_ok: bool,
     pub(crate) cfg: Config,
     pub(crate) reserve: u64,
     pub(crate) committed_gen: u64,
@@ -103,8 +106,18 @@ pub struct Pool {
     pub(crate) meta: BTreeMap<u64, MetaChunk>,
     pub(crate) page_free: BTreeSet<u64>,
     pend_chunks: Vec<u64>,
-    pend_set: BTreeSet<u64>,
+    /// Chunks no allocation may take yet: freed in this transaction, or waiting for their discard (`trim`).
+    pub(crate) pend_set: BTreeSet<u64>,
     pend_pages: Vec<u64>,
+    /// Freed by a commit, their discard not sent yet (`trim.rs`; a `PoolHandle` sends it without the lock).
+    pub(crate) trim: Vec<u64>,
+    /// Of those, taken out by `take_trim` and not back through `trimmed` yet.
+    pub(crate) trimming: u64,
+    /// Freed chunks kept out after a discard that may still land (`Stats::trim_lost`); they stay in `pend_set`.
+    pub(crate) trim_lost: u64,
+    pub(crate) trim_later: bool,
+    /// The queue's bound (`trim::QUEUE_MAX`; host tests set a smaller one).
+    pub(crate) trim_max: usize,
     pub(crate) free: u64,
     cursor: u64,
     pub(crate) cache: BTreeMap<u64, CPage>,
@@ -250,6 +263,11 @@ impl Pool {
             pend_chunks: Vec::new(),
             pend_set: BTreeSet::new(),
             pend_pages: Vec::new(),
+            trim: Vec::new(),
+            trimming: 0,
+            trim_lost: 0,
+            trim_later: false,
+            trim_max: crate::trim::QUEUE_MAX,
             free: chunks - first,
             cursor: first,
             cache: BTreeMap::new(),
@@ -326,7 +344,7 @@ impl Pool {
             chunk_size: self.cs as u32,
             chunks: self.chunks,
             free: self.free,
-            pending: self.pend_chunks.len() as u64,
+            pending: self.pend_chunks.len() as u64 + self.trim.len() as u64 + self.trimming,
             meta_chunks: self.meta.len() as u64,
             reserve: self.reserve,
             generation: self.committed_gen,
@@ -334,6 +352,7 @@ impl Pool {
             snapshots: snaps,
             dropped: self.dropped,
             leaks: self.leaks,
+            trim_lost: self.trim_lost,
         }
     }
 
@@ -353,7 +372,9 @@ impl Pool {
             m.refs.iter().for_each(|&r| mix(r as u64));
         }
         self.page_free.iter().for_each(|&p| mix(p));
-        mix(self.free);
+        // Chunks waiting for their discard, under way or kept out after one (trim.rs) are free on the device: a
+        // reopen counts them in `free`.
+        mix(self.free + self.trim.len() as u64 + self.trimming + self.trim_lost);
         h
     }
 
@@ -532,16 +553,18 @@ impl Pool {
 
     // ---- chunks ----
 
-    /// A free chunk with count 1, leaving `keep` chunks free.
+    /// A free chunk with count 1, leaving `keep` chunks free. Chunks under way to their discard (trim.rs) count
+    /// as free against `keep`: they come back at the end of their round, at most `round_chunks` of them.
     pub(crate) fn alloc_chunk(&mut self, keep: u64) -> Result<u64> {
-        if self.free <= keep {
+        let room = |p: &Pool| p.free > 0 && p.free + p.trimming > keep;
+        if !room(self) && !(self.untrim() && room(self)) {
             return Err(VolError::NoSpace);
         }
         let mut at = self.cursor.max(self.first);
         let mut wrapped = false;
         loop {
             match self.crefs.next_zero(at) {
-                Some(c) if self.pend_set.contains(&c) => at = c + 1,
+                Some(c) if self.pend_set.contains(&c) => at = self.past_held(c),
                 Some(c) => {
                     self.crefs.inc(c)?;
                     self.free -= 1;
@@ -588,6 +611,10 @@ impl Pool {
         self.reuse.fetch_add(1, Ordering::SeqCst);
         self.free += 1;
         Ok(())
+    }
+
+    pub(crate) fn reuse_bump(&self) {
+        self.reuse.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -704,38 +731,23 @@ impl Pool {
     }
 
     /// After a durable commit: freed chunks and pages become usable, empty metadata chunks return to the pool
-    /// and freed chunks are discarded on the device below.
+    /// and freed chunks are discarded on the device below (under a `PoolHandle` later, without the lock: `trim`).
     fn release(&mut self) -> u64 {
         if !self.pend_chunks.is_empty() || !self.pend_pages.is_empty() {
             // Before anything freed can be allocated again: a reader without the lock sees it after its read.
             self.reuse.fetch_add(1, Ordering::SeqCst);
         }
         let mut gone = core::mem::take(&mut self.pend_chunks);
-        for &c in &gone {
-            self.pend_set.remove(&c);
-        }
-        self.free += gone.len() as u64;
         for p in core::mem::take(&mut self.pend_pages) {
             if let Some(c) = self.free_page(p) {
+                // Not given out before its discard either.
+                self.free -= 1;
+                self.pend_set.insert(c);
                 gone.push(c);
             }
         }
         let n = gone.len() as u64;
-        if self.discard_ok && !gone.is_empty() {
-            gone.sort_unstable();
-            let per = self.cs / self.bs;
-            let mut i = 0;
-            while i < gone.len() {
-                let mut j = i + 1;
-                while j < gone.len() && gone[j] == gone[j - 1] + 1 {
-                    j += 1;
-                }
-                if let Err(e) = self.dev.discard(gone[i] * per, (j - i) as u64 * per) {
-                    klog::event!(Debug, "bitsvol", "discard.failed", chunk = gone[i], error = alloc::format!("{e:?}"));
-                }
-                i = j;
-            }
-        }
+        self.trim_freed(gone);
         n
     }
 }

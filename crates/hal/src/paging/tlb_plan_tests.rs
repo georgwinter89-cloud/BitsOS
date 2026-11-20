@@ -202,7 +202,7 @@ fn grant_only_allows_widening_alone() {
     assert!(!grant_only(ro, (ro | W) & !P), "not present after");
 }
 
-/// MM-11: Linux's ceiling (linux-6.6/arch/x86/mm/tlb.c:957, :1010): 33 pages still go page by page, 34 flush the
+/// MM-11: Linux's ceiling (linux-7.3.1/arch/x86/mm/tlb.c:1374, :1386): 33 pages still go page by page, 34 flush the
 /// whole context.
 #[test]
 fn ceiling_is_linuxs_33_pages() {

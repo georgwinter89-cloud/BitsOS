@@ -1,4 +1,4 @@
-//! MM-13: transparent huge pages of one address space (Linux THP in `always` mode, linux-6.6/mm/huge_memory.c).
+//! MM-13: transparent huge pages of one address space (Linux THP in `always` mode, linux-7.3.1/mm/huge_memory.c).
 //!
 //! A write fault, a user copy's write or MAP_POPULATE / MADV_POPULATE_WRITE on a missing page whose aligned
 //! 2 MiB lies wholly inside a private anonymous VMA (heap, ELF data and bss, mmap; not a stack, not
@@ -51,6 +51,7 @@ pub(crate) fn own_huge(head: u64) -> bool {
 pub(crate) fn release_huge(head: u64) {
     if mm_core::is_user_block(head, HUGE_ORDER) {
         thp::block_gone();
+        mm_core::reclaim::set_frame_owner(head, 0);
         if let Some(fa) = mm_core::frames() {
             fa.free(head, HUGE_ORDER, mm_core::Kind::User);
         }
@@ -104,15 +105,15 @@ impl AsCore {
     /// The 2 MiB-aligned start for a huge page at `page` of `v` when one may be made there now: the mode and the
     /// space allow it (`thp::mode_allows`, PR_SET_THP_DISABLE), `v` is private anonymous memory (`huge_kind`),
     /// the aligned 2 MiB lies inside `v` and nothing is mapped in its page-directory slot. A slot that holds a
-    /// page table (left by a fallback, a partial munmap or DONTNEED) stays 4 KiB for good, as Linux 6.6's fault
-    /// takes a huge page only on `pmd_none` (linux-6.6/mm/memory.c:5091) and leaves the rest to khugepaged, which
+    /// page table (left by a fallback, a partial munmap or DONTNEED) stays 4 KiB for good, as Linux 7.3.1's fault
+    /// takes a huge page only on `pmd_none` (linux-7.3.1/mm/memory.c:6664) and leaves the rest to khugepaged, which
     /// V2 does not have: counted in `mm.thp.slot_busy` so the desk sees how often it costs a huge page.
     pub(crate) fn huge_base(&self, g: &Inner, v: &Vma, page: u64) -> Option<u64> {
         if g.fill != Fill::OnFault || self.thp_disabled() || !huge_kind(v) || !thp::mode_allows(v.flags.hugepage, v.flags.nohugepage) {
             return None;
         }
         let base = page & !(HUGE - 1);
-        if base < v.start || base.checked_add(HUGE).is_none_or(|e| e > v.end) {
+        if base < v.start || base.checked_add(HUGE).is_none_or(|e| e > v.end) || g.guards.any_in(base, base + HUGE) {
             return None;
         }
         if !paging::huge_slot_free(self.root, base) {
@@ -134,6 +135,7 @@ impl AsCore {
             return Err(frame);
         }
         g.deposit.push(t);
+        self.note_anon(frame, base);
         self.ctr.add(Class::Anon, HUGE_PAGES);
         self.ctr.huge_add(1);
         thp::block_mapped();
@@ -186,6 +188,10 @@ impl AsCore {
         if mm_core::split_user_block(head, HUGE_ORDER) {
             thp::block_gone();
             thp::SPLIT_PAGE.inc();
+            // W35 MM-2: 512 frames of this space alone now, each its own owner word.
+            for i in 0..HUGE_PAGES {
+                self.note_anon(head + i * PAGE, base + i * PAGE);
+            }
         }
         match paging::split_user_2m(self.root, base, pt, cause) {
             Ok(o) => {

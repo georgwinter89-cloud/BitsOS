@@ -148,7 +148,14 @@ fn round(seed: u64, policy: Policy, may_mode2: bool) {
 #[test]
 fn hostile_chips_default_policy() {
     for seed in 0..400 {
-        round(seed, Policy::for_mp1(IpVersion(13, 0, 4)), false);
+        round(seed, Policy::for_mp1(IpVersion(13, 0, 4)), true);
+    }
+}
+
+#[test]
+fn hostile_chips_without_mode2() {
+    for seed in 0..200 {
+        round(3000 + seed, Policy::for_mp1(IpVersion(13, 0, 7)), false);
     }
 }
 
@@ -162,10 +169,9 @@ fn hostile_chips_recovery_off() {
 }
 
 #[test]
-fn hostile_chips_mode2_open() {
+fn hostile_chips_tight_reinit_limit() {
     for seed in 0..200 {
         let mut p = Policy::for_mp1(IpVersion(13, 0, 4));
-        p.open_mode2(IpVersion(13, 0, 4), "test").unwrap();
         p.reinit_limit.count = 1 + (seed as usize % 4);
         round(1000 + seed, p, true);
     }

@@ -269,7 +269,7 @@ pub(crate) fn check_again(d: &Discovery) -> ktest::TestResult {
     // The Quiesce halt while a run holds the PSP lock: raw registers only, no wait, nothing when not armed.
     let t0 = owner.hw().hw().now;
     let n0 = owner.log().totals().writes;
-    let (none, ok) = crate::psplive::with_live_held(|_| (crate::psplive::quiesce_halt_gfx(None, owner.hw()), crate::psplive::quiesce_halt_gfx(Some(&a), owner.hw())));
+    let (none, ok) = crate::psplive::with_live_held(&crate::psplive::State::new(), |_| (crate::psplive::quiesce_halt_gfx(None, owner.hw()), crate::psplive::quiesce_halt_gfx(Some(&a), owner.hw())));
     kassert!(none.is_none() && ok == Some(true), "quiesce halt: {none:?} {ok:?}");
     kassert!(owner.hw().hw().now == t0 && owner.log().totals().writes == n0, "quiesce halt waited or went through the owner's log");
     kassert!(owner.hw().hw().gfx.get(R::CpMeCntl) & f::ALL_HALTS == f::ALL_HALTS && halted(owner.hw().hw()) && owner.hw().hw().gfx.mec_halted(), "halt left the CP or MEC running");
@@ -518,7 +518,7 @@ pub(crate) fn check_variant_failures(d: &Discovery) -> ktest::TestResult {
 /// Linux's values from the capture's reads and writes, the byte addresses the capture names, the CSB and the
 /// golden IB.
 pub(crate) fn check_values() -> ktest::TestResult {
-    kassert!(gfx11::rb0_cntl(gfx11::RING_DW) == 0x80a && gfx11::me_cntl(0x1500_0000, true) == 0x0100_0000 && gfx11::me_cntl(0x0100_0000, false) == 0x1500_0000, "RB0_CNTL / ME_CNTL");
+    kassert!(gfx11::rb0_cntl(gfx11::RING_DW) == 0x2000_080a && gfx11::me_cntl(0x1500_0000, true) == 0x0100_0000 && gfx11::me_cntl(0x0100_0000, false) == 0x1500_0000, "RB0_CNTL / ME_CNTL");
     let r: Vec<u32> = gfx11::doorbell_ranges().iter().map(|x| x.1).collect();
     kassert!(r == [0x458, 0x7f8, 0, 0x450] && gfx11::DOORBELL_DW == 0x116, "doorbell ranges {r:x?}");
     kassert!(gfx11::doorbell_control(0, true) == 0x4000_0458 && gfx11::doorbell_control(0xc000_0458, false) == 0x8000_0458, "doorbell control");
@@ -575,7 +575,7 @@ fn starts() -> ktest::TestResult {
 }
 // INT-W28 post-integration made the fake chains here QemuOnly (52-121 KiB of stack in a release build, over MCP's
 // 64 KiB request thread). GX-7m2 boxed the chains' outcomes and owners and gave every engine stage its own frame:
-// at most 33 KiB with `ktest_stack=48` (29.10., release, QEMU; plan/notes/gx-GX-7m2.md): Safe again.
+// at most 33 KiB with `ktest_stack=48` (release, QEMU): Safe again.
 ktest::ktest!("gx.gfxring.starts", Safe, starts);
 
 fn failures() -> ktest::TestResult {

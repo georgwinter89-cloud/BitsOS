@@ -12,6 +12,7 @@ use uapi::ab::nr_more::{KCMP, PIDFD_GETFD, PIDFD_OPEN, PROCESS_VM_READV, PROCESS
 use uapi::errno::*;
 use uapi::nr;
 
+const SEC: u64 = 1_000_000_000;
 const KERNEL_ADDR: u64 = 0xffff_8880_0000_0000;
 const NO_PID: u64 = 0x3fff_fff0;
 const AT_FDCWD: u64 = -100i64 as u64;
@@ -199,6 +200,62 @@ fn perm() -> TestResult {
 }
 
 // AB-8 CR 4: a write into a private file mapping must never reach the file (Linux: COW page; no FOLL_FORCE).
+ktest!("ab.ptrace.ended_undumpable", Safe, ended_undumpable);
+/// L7-PROC (linux-7.3.1/kernel/ptrace.c:293 `task_still_dumpable`): the dumpable flag belongs to the image and
+/// outlives its memory, so a target that made itself not dumpable stays closed to its uid's other processes after
+/// it ended; CAP_SYS_PTRACE still may, and an ended dumpable target stays open.
+fn ended_undumpable() -> TestResult {
+    let a = T::new("ab17-ended-a")?;
+    let mut closed = T::new("ab17-ended-closed")?;
+    let open = T::new("ab17-ended-open")?;
+    let root = T::with("ab17-ended-root", 0, false)?;
+    expect("PR_SET_DUMPABLE 0", closed.call(nr::PRCTL, &[4, 0]), 0)?;
+    for t in [&closed, &open] {
+        t.p.kill(9);
+        kassert!(t.p.wait(Some(10 * SEC)).is_some(), "{} did not end", t.p.name);
+        kassert!(t.p.is_finished(), "{} is not finished after its end", t.p.name);
+    }
+    for fs in [false, true] {
+        kassert!(!a.p.may_ptrace(&closed.p, fs), "an ended non-dumpable target is open (fs_creds {fs})");
+        kassert!(a.p.may_ptrace(&open.p, fs), "an ended dumpable target is closed (fs_creds {fs})");
+        kassert!(root.p.may_ptrace(&closed.p, fs), "CAP_SYS_PTRACE is refused an ended target (fs_creds {fs})");
+    }
+    Ok(())
+}
+
+ktest!("ab.ptrace.unshared_undumpable", Safe, unshared_undumpable);
+/// L7-PROC (linux-7.3.1/kernel/ptrace.c:293 `task_still_dumpable`, fs/proc/base.c:1885 `task_dump_owner`): the
+/// dumpable check asks the capability in the user namespace of the target's execve. A target that made itself
+/// not dumpable and then unshared a user namespace (which its uid owns) stays closed to its uid's other
+/// processes, and its /proc files stay the exec namespace's root's, whatever the new namespace maps.
+fn unshared_undumpable() -> TestResult {
+    use proc::cred::{Cap, ns_capable};
+    use proc::ns::user::{MapKind, Opened};
+    let mut a = T::new("ab17-unshared-a")?;
+    let mut closed = T::new("ab17-unshared-closed")?;
+    expect("PR_SET_DUMPABLE 0", closed.call(nr::PRCTL, &[4, 0]), 0)?;
+    expect("unshare(CLONE_NEWUSER)", closed.call(crate::ns_sys::NR_UNSHARE, &[uapi::ab::clone::CLONE_NEWUSER]), 0)?;
+    let inside = closed.p.cred();
+    kassert!(!alloc::sync::Arc::ptr_eq(&inside.user_ns, &closed.p.exec_user_ns), "the exec namespace moved with unshare");
+    // The precondition of the old gap: the first check passes on the new namespace's capability.
+    kassert!(ns_capable(&a.p.cred(), &inside.user_ns, Cap::SysPtrace), "the uid has no CAP_SYS_PTRACE over its own new namespace");
+    for fs in [false, true] {
+        kassert!(!a.p.may_ptrace(&closed.p, fs), "a non-dumpable target that unshared a user namespace is open (fs_creds {fs})");
+    }
+    let l = iov(&a, 0x100, &[(a.a(0x3000), 8)]);
+    let r = iov(&a, 0x200, &[(closed.a(0x100), 8)]);
+    expect("process_vm_readv", a.call(PROCESS_VM_READV, &[closed.p.pid as u64, l, 1, r, 1, 0]), -EPERM)?;
+    // Map 0 in the new namespace to the uid: the owner still is the exec namespace's root (0), not the uid.
+    let o = Opened { ns: inside.user_ns.clone(), opener: inside.clone() };
+    let line = format!("0 {} 1\n", inside.euid);
+    kassert!(proc::ns::user::write_map(&o, MapKind::Uid, 0, line.as_bytes(), &inside).is_ok(), "uid_map {line:?}");
+    let e = crate::procfs::owned(vfs::synth::SynthEntry::link("x", "y"), &closed.p, false);
+    kassert!(e.uid == 0, "a non-dumpable target's /proc file belongs to uid {}", e.uid);
+    expect("PR_SET_DUMPABLE 1", closed.call(nr::PRCTL, &[4, 1]), 0)?;
+    kassert!(a.p.may_ptrace(&closed.p, false), "a dumpable target of the same uid is closed");
+    Ok(())
+}
+
 ktest!("ab.procvm.private_file", Safe, private_file);
 fn private_file() -> TestResult {
     static SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

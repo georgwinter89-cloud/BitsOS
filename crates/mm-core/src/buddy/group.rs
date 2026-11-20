@@ -41,6 +41,7 @@ pub const PCP_TYPES: usize = 3;
 const PER_WORD: u64 = 32;
 
 klog::counter!(FALLBACK_STEAL, "mm.frames.fallback_steal");
+klog::counter!(FALLBACK_SWEEP, "mm.frames.fallback_sweep");
 klog::counter!(FALLBACK_WHOLE_BLOCK, "mm.frames.fallback_whole_block");
 klog::counter!(PAGEBLOCK_UNMOVABLE, "mm.frames.pageblock_unmovable");
 klog::counter!(PAGEBLOCK_MOVABLE, "mm.frames.pageblock_movable");
@@ -127,6 +128,38 @@ pub(crate) fn type_words(s: u64, e: u64) -> usize {
     pageblocks(s, e).div_ceil(PER_WORD) as usize
 }
 
+/// W35 MM-2: a claim sweep that found no pageblock to take over (`Buddy::claim_fallback`: per order up to a
+/// pageblock of frame states read under the zone lock) is not run again at once. Linux 7.x remembers it for the
+/// rest of a per-CPU refill (`rmqueue_bulk`'s `rmqueue_mode`: one hold of the zone lock, `pcp->batch` frames). A
+/// refill here takes a stolen frame alone, so the zone keeps the memory, per asking type: for `pcp::BATCH` - 1
+/// fallbacks that could find no more than the failed sweep (the same order or a higher one, the same address
+/// limit or a lower one), or until `pcp::BATCH` blocks were freed into the zone (frees are what makes a pageblock
+/// half free). Without it every frame stolen for the kernel beside a full page cache cost a sweep: 3.8 million in
+/// 40 s of `fs.ext4.download_pressure`, both CPUs waiting for the zone lock, write-back at a tenth of its pace.
+#[derive(Clone, Copy)]
+pub(super) struct NoClaim {
+    /// `ZoneState::freed` when the sweep failed.
+    freed: u64,
+    /// Fallbacks that still go without a sweep.
+    left: u32,
+    order: u32,
+    limit_pfn: u64,
+}
+
+impl NoClaim {
+    pub(super) const NONE: NoClaim = NoClaim { freed: 0, left: 0, order: 0, limit_pfn: 0 };
+
+    /// Whether the failed sweep still stands for a fallback of `order` below `limit_pfn` (`freed`: the zone's
+    /// count now); it then stands for one fallback less.
+    fn stands(&mut self, freed: u64, order: u32, limit_pfn: u64) -> bool {
+        if self.left == 0 || order < self.order || limit_pfn > self.limit_pfn || freed - self.freed >= crate::pcp::BATCH as u64 {
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
+}
+
 /// How `rmqueue` found its block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Took {
@@ -205,9 +238,13 @@ impl Buddy {
         if order as usize >= PB {
             return None;
         }
-        if let Some((ri, pfn)) = self.claim_fallback(zone, zs, order, mt, limit_pfn) {
-            self.reports().whole_block();
-            return Some((ri, pfn, Took::Claimed));
+        if !zs.no_claim[mt as usize].stands(zs.freed, order, limit_pfn) {
+            self.reports().sweep();
+            if let Some((ri, pfn)) = self.claim_fallback(zone, zs, order, mt, limit_pfn) {
+                self.reports().whole_block();
+                return Some((ri, pfn, Took::Claimed));
+            }
+            zs.no_claim[mt as usize] = NoClaim { freed: zs.freed, left: crate::pcp::BATCH as u32 - 1, order, limit_pfn };
         }
         if !steal {
             return None;
@@ -304,6 +341,10 @@ impl Buddy {
         if !r.holds_pageblock(pfn) {
             return false;
         }
+        // MEMCRASH: Linux boosts the watermarks here, before it knows whether the claim works (`boost`).
+        if self.global_reports {
+            crate::boost::raise();
+        }
         let start = pfn & !(PAGEBLOCK_FRAMES - 1);
         let (mut free, mut movable, mut at) = (0u64, 0u64, start);
         while at < start + PAGEBLOCK_FRAMES {
@@ -331,7 +372,7 @@ impl Buddy {
 
     /// Linux `__move_freepages_block`: every free block of the pageblock at `start` moves from `from`'s bitmaps to
     /// `to`'s (they are all below the pageblock order: a free pageblock would be one untyped block).
-    fn move_free(&self, r: &Region, zs: &mut ZoneState, start: u64, from: MigrateType, to: MigrateType) {
+    pub(super) fn move_free(&self, r: &Region, zs: &mut ZoneState, start: u64, from: MigrateType, to: MigrateType) {
         let mut at = start;
         while at < start + PAGEBLOCK_FRAMES {
             let m = self.get_meta(r, at);
@@ -392,4 +433,28 @@ pub(crate) fn count_steal() {
 }
 pub(crate) fn count_whole_block() {
     FALLBACK_WHOLE_BLOCK.inc();
+}
+pub(crate) fn count_sweep() {
+    FALLBACK_SWEEP.inc();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NoClaim;
+    use crate::pcp::BATCH;
+
+    #[test]
+    fn a_failed_sweep_stands_for_a_batch_of_fallbacks_that_could_find_no_more() {
+        let failed = NoClaim { freed: 100, left: BATCH as u32 - 1, order: 2, limit_pfn: 1 << 20 };
+        let mut m = failed;
+        assert!(!m.stands(100, 1, 1 << 20), "a lower order looks at more blocks");
+        assert!(!m.stands(100, 2, 1 << 21), "a higher address limit looks at more blocks");
+        assert!(!m.stands(100 + BATCH as u64, 2, 1 << 20), "a batch of frees may have made a pageblock half free");
+        assert_eq!(m.left, failed.left, "a fallback that sweeps uses none of the memory");
+        for _ in 1..BATCH {
+            assert!(m.stands(100 + BATCH as u64 - 1, 5, 1 << 10));
+        }
+        assert!(!m.stands(100, 2, 1 << 20), "the batch is over");
+        assert!(!{ NoClaim::NONE }.stands(0, 0, 0), "no sweep failed yet");
+    }
 }

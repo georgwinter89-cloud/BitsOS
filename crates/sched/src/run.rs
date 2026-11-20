@@ -18,7 +18,7 @@
 use crate::cpus::{self, CpuSched};
 use crate::{Class, Leave, State, Thread, table};
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Why a thread is queued: decides its place in the fair class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,9 +87,49 @@ fn add_owned(a: &core::sync::atomic::AtomicU64, d: u64) {
     a.store(a.load(Ordering::Relaxed).wrapping_add(d), Ordering::Relaxed);
 }
 
+/// Room every run queue has, or is being given, counted in threads: the thread table's capacity. Only grows.
+static ROOM: AtomicUsize = AtomicUsize::new(0);
+
+/// Room in every CPU's run queue for `threads` threads (`table::insert`, before it lists more threads than the
+/// queues can hold; thread context, no lock held). A queued thread is a listed one and waits in one queue, so
+/// with this room `enqueue` never grows a queue: it runs with interrupts off under the queue's lock, also from
+/// wakers that hold other spin locks, where the heap could not reclaim. `Err`: no
+/// memory (the table does not grow, the spawn fails).
+///
+/// Cost: one entry per list, CPU and listed thread (56 bytes times CPUs per thread; a kernel stack is 64 KiB).
+pub(crate) fn reserve(threads: usize) -> Result<(), ()> {
+    // Announced first: a CPU that joins while this walk runs reads it after its own state exists (`reserve_cpu`),
+    // so it is either walked here or sizes itself.
+    ROOM.fetch_max(threads, Ordering::SeqCst);
+    for c in 0..hal::percpu::possible_cpus() {
+        if let Some(cs) = cpus::of(c) {
+            give_room(cs, threads)?;
+        }
+    }
+    Ok(())
+}
+
+/// The room of `cs` alone, for a CPU about to go online (`ap_entry`): a no-op for the CPUs the firmware
+/// listed, which `reserve` walked; a CPU beyond them gets its state only when it starts.
+pub(crate) fn reserve_cpu(cs: &CpuSched) -> Result<(), ()> {
+    give_room(cs, ROOM.load(Ordering::SeqCst))
+}
+
+fn give_room(cs: &CpuSched, threads: usize) -> Result<(), ()> {
+    // Before the guard: the lists it replaces are freed after the unlock.
+    let mut room = crate::rq::Room::new();
+    loop {
+        if cs.rq.lock().has_room(&mut room, threads) {
+            return Ok(());
+        }
+        // Lock dropped: threads queued or taken meanwhile are moved by the next look, nothing is lost.
+        room.grow()?;
+    }
+}
+
 /// Queues `t` (state Runnable, not on any CPU) on `cpu` (its pinned CPU instead, if it has one; SC-6: a CPU
 /// its affinity allows if `cpu` is not one) and asks that CPU to reschedule if `t` should run before what runs
-/// there. Thread context (the queue may grow).
+/// there. Any context with interrupts off or on: nothing is allocated (`reserve` made the queue's room).
 ///
 /// SC-6 affinity race: `attr::set_affinity` stores the new mask, then (SeqCst fence) reads `t.cpu` and looks
 /// for `t` in that CPU's queue. Here `t.cpu` is stored first, then (SeqCst fence) the mask is checked again
@@ -211,12 +251,13 @@ pub(crate) fn check_preempt(cs: &CpuSched, t: &Thread) {
 
 klog::counter!(pub QUEUE_NO_ROOM, "sched.queue_no_room");
 
-/// A Runnable thread the queue of `cs` had no memory for: it waits on that CPU's lock-free wake list (no
-/// allocation; its `wake_next` link is free, as it is on no list and in no queue) and is queued again at the
-/// CPU's next drain. It stays listed in the table, so the drain finds it.
+/// A Runnable thread the queue of `cs` had no room for (never with the room `reserve` makes; the net under
+/// it): it waits on that CPU's lock-free wake list (no allocation; its `wake_next` link is free, as it is on no
+/// list and in no queue) and is queued again at the CPU's next drain, when a thread has left the queue. It
+/// stays listed in the table, so the drain finds it.
 fn no_room(cs: &CpuSched, t: &Arc<Thread>) {
     if QUEUE_NO_ROOM.get() == 0 {
-        klog::event!(Warn, "sched", "queue.no_room", id = t.id, cpu = cs.cpu; "no memory to grow a run queue; the thread waits on the wake list");
+        klog::event!(Warn, "sched", "queue.no_room", id = t.id, cpu = cs.cpu, room = ROOM.load(Ordering::Relaxed); "a run queue without room for a listed thread; the thread waits on the wake list");
     }
     QUEUE_NO_ROOM.inc();
     push_wake(cs, t);
@@ -319,10 +360,29 @@ pub(crate) fn schedule(how: Leave) -> Result<bool, hal::switch::SwitchError> {
     // SC-6: a thread whose affinity no longer allows this CPU leaves it even with nothing else to run (its
     // requeue in `after_switch` goes to an allowed CPU).
     let how = if matches!(how, Leave::Yield | Leave::Preempt) && !me.is_idle() && !me.may_run_on(cs.cpu) { Leave::Move } else { how };
+    // GP-CPU2: a misfit request for this thread (hybrid CPUs only; `balance::pull_misfits`) moves it to the faster
+    // core even with nothing else to run here; a request for a thread that blocks or ends is dropped.
+    cs.moving_to.store(crate::NO_CPU, Ordering::Relaxed);
+    let how = match cs.misfit_id.load(Ordering::Acquire) {
+        0 => how,
+        id => {
+            cs.misfit_id.store(0, Ordering::Release);
+            let to = cs.misfit_to.load(Ordering::Acquire);
+            // Its mask may have narrowed since the request: a move it may not make would only bounce back.
+            if id == me.id && matches!(how, Leave::Yield | Leave::Preempt) && !me.is_idle() && me.may_run_on(to) {
+                cs.moving_to.store(to, Ordering::Relaxed);
+                Leave::Move
+            } else {
+                how
+            }
+        }
+    };
     let now = time::now_ns();
     drain_wakes(cs);
     account(cs, &me, now);
     cs.need_resched.store(false, Ordering::Relaxed);
+    // A deferred reschedule is this one (interrupts are off here).
+    let _ = hal::percpu::take_deferred_resched();
     match how {
         Leave::Block if me.state() != State::Blocking => return Ok(false),
         Leave::Exit => me.set_state(State::Dead),
@@ -475,7 +535,11 @@ pub(crate) fn after_switch() {
                         // A waker turning Blocking into Running in between: try once more.
                         p.cas_state(State::Running, State::Runnable);
                     }
-                    enqueue(p, cs.cpu, if how == Leave::Preempt { Why::Preempted } else { Why::Requeue });
+                    // GP-CPU2: a misfit move goes to the faster core `schedule` noted (a requeue on another CPU counts
+                    // as a migration there and wakes it).
+                    let to = cs.moving_to.swap(crate::NO_CPU, Ordering::Relaxed);
+                    let to = if how == Leave::Move && to != crate::NO_CPU { to } else { cs.cpu };
+                    enqueue(p, to, if how == Leave::Preempt { Why::Preempted } else { Why::Requeue });
                 }
             }
             Leave::Block => {

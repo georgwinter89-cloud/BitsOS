@@ -1,15 +1,17 @@
 //! ext4 for the data volume (owner: FS; FS-8a: read and write; FS-8b: the jbd2 journal).
 //!
-//! Our own implementation in safe Rust (the library spike and the decision are in plan/notes/fs-FS-8a.md):
+//! Our own implementation in safe Rust (the library spike and the decision are in plan/spec/storage.md §2.1):
 //! every metadata change goes through one transaction (`tx`), so FS-8b can put jbd2 under it; file data
 //! goes through the VFS page cache, ext4 owns only the block mapping and the metadata.
 //!
 //! - `sb`, `gd`, `inode`, `crc`, `le`: on-disk structures and checksums (metadata_csum crc32c, gdt_csum crc16).
 //! - `balloc`: bitmaps and allocators; `extent`: extent trees; `blockmap`: ext2/3 block maps (read, migrated to extents before a change);
-//!   `dir`, `vol_dir`: directories; `inline`, `xattr`: inline data and xattrs (read).
+//!   `runs`: which blocks of a write are mapped, one lookup per run;
+//!   `dir`, `vol_dir`: directories (`dirx`, `dirstat`, `vol_dirx*`: their index in memory, BIGDIR); `inline`, `xattr`: inline data and xattrs (read).
 //! - `state`, `tx`: the volume state behind its lock and transactions.
 //! - `jbd2`, `journal`, `recovery`: the journal's format, the commit path (ordered mode) and replay at mount.
-//! - `vol`, `vol_data`, `vol_ns`: one mounted volume, file content, names.
+//! - `vol`, `vol_data`, `vol_ns`: one mounted volume, file content, names; `flight`: a write-back step's data
+//!   written with the volume lock released (FS-W).
 //! - `file`, `glue`, `mount`: the VFS side (page-cache backend, `vfs::FsOps`, mounting a disk or an image).
 //! - `dev`: what the volume reads and writes (memory, a block disk, a loop image file).
 #![no_std]
@@ -31,9 +33,14 @@ pub mod crc;
 pub mod data;
 pub mod dev;
 pub mod dir;
+pub mod dirstat;
+pub mod dirx;
+mod dropped;
 pub mod extent;
 pub mod file;
+pub mod flight;
 pub mod glue;
+mod held;
 pub mod gd;
 pub mod imgblk;
 pub mod inline;
@@ -46,12 +53,17 @@ mod ktests_journal;
 mod ktests_heap;
 mod ktests_download;
 mod ktests_stall;
+mod ktests_bigdir;
+mod ktests_forget;
+mod ktests_runs;
+mod ktests_trash;
 mod bl0_ktests;
 mod bl3_ktests;
 pub mod le;
 pub mod mkfs;
 pub mod mount;
 pub mod recovery;
+pub mod runs;
 pub mod sb;
 pub mod state;
 pub mod tx;
@@ -59,6 +71,9 @@ pub mod vol;
 pub mod vol_data;
 mod vol_pages;
 pub mod vol_dir;
+pub mod vol_dirx;
+mod vol_dirx_find;
+mod vol_dirx_probe;
 pub mod vol_ns;
 pub mod xattr;
 

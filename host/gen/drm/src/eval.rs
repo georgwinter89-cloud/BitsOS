@@ -4,7 +4,7 @@
 use crate::pp::{Pp, Tok};
 
 /// Names from outside the inputs that the inputs' macros use (drm.h: DRM_RDWR, DRM_CLOEXEC for PRIME export), with
-/// their x86_64 values: linux-6.6/include/uapi/asm-generic/fcntl.h:22 and :63 (both `int` in C). The probe includes
+/// their x86_64 values: linux-7.3.1/include/uapi/asm-generic/fcntl.h:21 and :66 (both `int` in C). The probe includes
 /// <fcntl.h>, so GCC checks them too.
 pub const OUTSIDE: [(&str, i128); 2] = [("O_RDWR", 0o2), ("O_CLOEXEC", 0o2000000)];
 

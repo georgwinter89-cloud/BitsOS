@@ -1,7 +1,8 @@
-/* AB-12: process handles. pidfd_open, CLONE_PIDFD (clone and clone3), pidfd_send_signal, pidfd_getfd,
- * waitid(P_PIDFD), poll/epoll on a pidfd (readable when the process ended) and /proc/self/fdinfo's Pid line.
- * Only relations are printed (never pids). After a reap only POLLIN is looked at: kernels from 6.9 add
- * EPOLLHUP there, 6.6 (V2's reference) does not. */
+/* AB-12, L7-PROC: process handles as Linux 7.3.1 has them (fs/pidfs.c). pidfd_open (PIDFD_THREAD too),
+ * CLONE_PIDFD (clone and clone3), pidfd_send_signal (scopes, PIDFD_SELF_*), pidfd_getfd, waitid(P_PIDFD),
+ * poll/epoll on a pidfd (readable when the task ended, EPOLLHUP once it has none), /proc/self/fdinfo's Pid
+ * line, fstat of the pidfs inode and the pidfs ioctls. Only relations are printed (never pids or inode
+ * numbers); PIDFD_INFO_CGROUPID is masked out (V2 has no cgroups). */
 #include "abi.h"
 #include <fcntl.h>
 #include <poll.h>
@@ -9,7 +10,9 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #ifndef P_PIDFD
@@ -56,6 +59,21 @@ static long fdinfo_pid(int fd, int *ns_same) {
     return pid;
 }
 
+/* The flags: line of /proc/self/fdinfo/<fd> as printed ("?" when missing). */
+static const char *fdinfo_flags(int fd) {
+    static char out[32];
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    strcpy(out, "?");
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return out;
+    while (fgets(buf, sizeof buf, f))
+        sscanf(buf, "flags:\t%31s", out);
+    fclose(f);
+    return out;
+}
+
 static void show_fdinfo(const char *label, int fd, long want) {
     int same = 0;
     long pid = fdinfo_pid(fd, &same);
@@ -94,9 +112,14 @@ static void t_open(void) {
     pthread_t th;
     if (pthread_create(&th, 0, thread_main, &tid) == 0) {
         pthread_join(th, 0);
-        /* 6.6: EINVAL while its pid lingers, then ESRCH; 6.9+ says ENOENT. Only the failure is compared. */
-        long r = syscall(SYS_pidfd_open, tid, 0);
-        yes("pidfd_open(ended thread) fails", r < 0);
+        /* pthread_join returns when the tid word is cleared, before the kernel releases the thread: wait for
+         * the release, then its id is unknown to pidfd_open (ESRCH). */
+        long r = 0;
+        for (int i = 0; i < 1000 && (r = syscall(SYS_pidfd_open, tid, O_EXCL)) >= 0; i++) {
+            close(r);
+            usleep(1000);
+        }
+        printf("pidfd_open(released thread, PIDFD_THREAD) = %s\n", r < 0 ? ename(errno) : "a pidfd");
     }
     close(fd);
     close(nb);
@@ -112,17 +135,136 @@ static void *spin_thread(void *arg) {
     return 0;
 }
 
+#define PIDFD_GET_INFO_ 0xc058ff0bul
+#define PIDFD_GET_INFO_V0 0xc040ff0bul
+
+struct info_ {
+    uint64_t mask, cgroupid;
+    uint32_t pid, tgid, ppid, ruid, rgid, euid, egid, suid, sgid, fsuid, fsgid;
+    int32_t exit_code;
+    uint32_t cd_mask, cd_signal, cd_code, cd_pad;
+    uint64_t supported;
+};
+
+static long get_info(int fd, uint64_t want, struct info_ *i) {
+    memset(i, 0, sizeof *i);
+    i->mask = want;
+    long r = ioctl(fd, PIDFD_GET_INFO_, i);
+    return r < 0 ? -errno : r;
+}
+
+static void show_info(const char *label, int fd, uint64_t want, pid_t pid, pid_t tgid) {
+    struct info_ i;
+    long r = get_info(fd, want, &i);
+    if (r < 0) {
+        printf("%s = -%s\n", label, ename(-r));
+        return;
+    }
+    printf("%s = 0, mask %#lx, pid %s, tgid %s, ppid me %s, ruid me %s, exit %#x, coredump %#x, supported %#lx\n", label,
+           (unsigned long)(i.mask & ~4ul), i.pid == (uint32_t)pid ? "ok" : "other", i.tgid == (uint32_t)tgid ? "ok" : "other",
+           i.ppid == (uint32_t)getpid() ? "yes" : "no", i.ruid == getuid() ? "yes" : "no", i.exit_code, i.cd_mask,
+           (unsigned long)i.supported);
+}
+
+static unsigned long ino_of(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 ? (unsigned long)st.st_ino : 0;
+}
+
 static void t_thread(void) {
     pthread_t th;
     if (pthread_create(&th, 0, spin_thread, 0) != 0)
         return;
     while (!live_tid)
         usleep(1000);
-    /* 6.6: EINVAL (no thread-group leader, `pidfd_prepare`); 6.9+ answers ENOENT without PIDFD_THREAD. */
-    long r = syscall(SYS_pidfd_open, live_tid, 0);
-    yes("pidfd_open(live non-leader thread) fails", r < 0);
+    /* linux-7.3.1/kernel/fork.c:1946: a non-leader without PIDFD_THREAD is ENOENT. */
+    SYS("pidfd_open(live non-leader thread)", SYS_pidfd_open, live_tid, 0);
+    int tf = popen_(live_tid, O_EXCL), tf2 = popen_(live_tid, O_EXCL);
+    int pf = popen_(getpid(), 0), pf2 = popen_(getpid(), 0), lf = popen_(getpid(), O_EXCL);
+    yes("thread pidfds opened", tf >= 0 && tf2 >= 0 && lf >= 0);
+    printf("F_GETFL(thread pidfd) = %#o\n", fcntl(tf, F_GETFL));
+    printf("F_GETFL(leader thread pidfd) = %#o\n", fcntl(lf, F_GETFL));
+    /* fdinfo prints f_flags, PIDFD_THREAD included (linux-7.3.1/fs/proc/fd.c:42). */
+    printf("fdinfo flags(thread pidfd) = %s\n", fdinfo_flags(tf));
+    printf("fdinfo flags(process pidfd) = %s\n", fdinfo_flags(pf));
+    yes("two pidfds of one thread: one inode", ino_of(tf) == ino_of(tf2) && ino_of(tf) != 0);
+    yes("two pidfds of one process: one inode", ino_of(pf) == ino_of(pf2));
+    yes("the leader's thread pidfd: the process's inode", ino_of(lf) == ino_of(pf));
+    yes("a thread's inode differs from its process's", ino_of(tf) != ino_of(pf));
+    printf("poll(live thread) revents = %d\n", ready(tf, 0));
+    SYS("send(thread pidfd, 0)", SYS_pidfd_send_signal, tf, 0, 0, 0);
+    show_info("GET_INFO(thread)", tf, 0x23, live_tid, getpid());
     stop_thread = 1;
     pthread_join(th, 0);
+    printf("poll(ended thread) revents = %d\n", ready(tf, 1000));
+    show_info("GET_INFO(ended thread)", tf, 0x2, live_tid, getpid());
+    show_info("GET_INFO(ended thread, EXIT)", tf, 0x8, live_tid, getpid());
+    SYS("send(ended thread)", SYS_pidfd_send_signal, tf, 0, 0, 0);
+    close(tf);
+    close(tf2);
+    close(pf);
+    close(pf2);
+    close(lf);
+}
+
+/* fstat of the pidfs inode and the pidfs ioctls (linux-7.3.1/fs/pidfs.c:365, :530, :1006). */
+static void t_pidfs(void) {
+    int self = popen_(getpid(), 0), e = eventfd(0, 0);
+    struct stat st, est;
+    fstat(self, &st);
+    fstat(e, &est);
+    printf("fstat(pidfd): mode %#o, nlink %lu, uid %u, size %ld, blksize %ld, dev differs from eventfd's: %s\n",
+           st.st_mode, (unsigned long)st.st_nlink, st.st_uid, (long)st.st_size, (long)st.st_blksize,
+           st.st_dev != est.st_dev ? "yes" : "no");
+    unsigned v = 99;
+    SYS("FS_IOC_GETVERSION", SYS_ioctl, self, 0x80087601ul, &v);
+    printf("  generation %u\n", v);
+    SYS("FS_IOC_GETVERSION(NULL)", SYS_ioctl, self, 0x80087601ul, 0);
+    SYS("GET_INFO(NULL)", SYS_ioctl, self, PIDFD_GET_INFO_, 0);
+    SYS("GET_INFO(kernel address)", SYS_ioctl, self, PIDFD_GET_INFO_, KERNEL_ADDR);
+    SYS("GET_INFO(size 8)", SYS_ioctl, self, 0xc008ff0bul, &v);
+    struct info_ i;
+    memset(&i, 0, sizeof i);
+    SYS("GET_INFO(size 64)", SYS_ioctl, self, PIDFD_GET_INFO_V0, &i);
+    printf("  mask %#lx, pid ok %s\n", (unsigned long)(i.mask & ~4ul), i.pid == (uint32_t)getpid() ? "yes" : "no");
+    show_info("GET_INFO(self, everything)", self, 0xff, getpid(), getpid());
+    SYS("ioctl(pidfd, 0xff0c)", SYS_ioctl, self, 0xff0cul, 0);
+    SYS("ioctl(pidfd, TCGETS)", SYS_ioctl, self, 0x5401ul, &i);
+    long nfd = ioctl(self, 0xff04, 0);
+    char a[64] = {0}, b[64] = {0}, pth[64];
+    snprintf(pth, sizeof pth, "/proc/self/fd/%ld", nfd);
+    readlink(pth, a, sizeof a - 1);
+    readlink("/proc/self/ns/net", b, sizeof b - 1);
+    printf("GET_NET_NAMESPACE: fd %s, same namespace %s, close-on-exec %s\n", nfd >= 0 ? "yes" : "no", !strcmp(a, b) ? "yes" : "no",
+           fcntl(nfd, F_GETFD) == FD_CLOEXEC ? "yes" : "no");
+    close(nfd);
+    nfd = ioctl(self, 0xff09, 0);
+    memset(a, 0, sizeof a);
+    memset(b, 0, sizeof b);
+    snprintf(pth, sizeof pth, "/proc/self/fd/%ld", nfd);
+    readlink(pth, a, sizeof a - 1);
+    readlink("/proc/self/ns/user", b, sizeof b - 1);
+    printf("GET_USER_NAMESPACE: same namespace %s\n", nfd >= 0 && !strcmp(a, b) ? "yes" : "no");
+    close(nfd);
+    SYS("GET_NET_NAMESPACE(arg 1)", SYS_ioctl, self, 0xff04ul, 1);
+    flush();
+    pid_t c = fork();
+    if (c == 0)
+        _exit(9);
+    int cfd = popen_(c, 0);
+    siginfo_t w;
+    waitid(P_PID, c, &w, WEXITED | WNOWAIT);
+    show_info("GET_INFO(zombie, EXIT)", cfd, 0x8, c, c);
+    SYS("GET_NET_NAMESPACE(zombie)", SYS_ioctl, cfd, 0xff04ul, 0);
+    waitpid(c, 0, 0);
+    printf("poll(reaped) revents = %d\n", ready(cfd, 0));
+    show_info("GET_INFO(reaped, EXIT)", cfd, 0x8, c, c);
+    show_info("GET_INFO(reaped, EXIT | SUPPORTED)", cfd, 0x28, c, c);
+    show_info("GET_INFO(reaped)", cfd, 0x3, c, c);
+    SYS("GET_NET_NAMESPACE(reaped)", SYS_ioctl, cfd, 0xff04ul, 0);
+    close(cfd);
+    close(e);
+    close(self);
 }
 
 static void t_signal(void) {
@@ -130,8 +272,15 @@ static void t_signal(void) {
     int p[2];
     if (pipe(p))
         return;
-    /* Flags 1, 2 and 4 are PIDFD_SIGNAL_* from 6.9 on; 8 is unknown everywhere. */
+    /* Flags 1, 2 and 4 are PIDFD_SIGNAL_* (one at a time); 8 is unknown. */
     SYS("send(flags 8)", SYS_pidfd_send_signal, self, 0, 0, 8);
+    SYS("send(flags 3)", SYS_pidfd_send_signal, self, 0, 0, 3);
+    SYS("send(self, THREAD scope)", SYS_pidfd_send_signal, self, 0, 0, 1);
+    SYS("send(self, THREAD_GROUP scope)", SYS_pidfd_send_signal, self, 0, 0, 2);
+    SYS("send(PIDFD_SELF_THREAD)", SYS_pidfd_send_signal, -10000, 0, 0, 0);
+    SYS("send(PIDFD_SELF_THREAD_GROUP)", SYS_pidfd_send_signal, -10001, 0, 0, 0);
+    SYS("send(PIDFD_SELF_THREAD_GROUP, flags 8)", SYS_pidfd_send_signal, -10001, 0, 0, 8);
+    SYS("send(-10002)", SYS_pidfd_send_signal, -10002, 0, 0, 0);
     SYS("send(closed fd)", SYS_pidfd_send_signal, 9999, 0, 0, 0);
     SYS("send(a pipe)", SYS_pidfd_send_signal, p[0], 0, 0, 0);
     SYS("send(self, 0)", SYS_pidfd_send_signal, self, 0, 0, 0);
@@ -176,11 +325,49 @@ static void t_signal(void) {
     SYS("send(reaped)", SYS_pidfd_send_signal, cfd, 0, 0, 0);
     SYS("waitid(reaped)", SYS_waitid, P_PIDFD, cfd, &w, WEXITED | WNOHANG, 0);
     SYS("waitid(nonblocking, reaped)", SYS_waitid, P_PIDFD, nb, &w, WEXITED, 0);
-    yes("poll(reaped) has POLLIN", ready(cfd, 0) & POLLIN);
+    printf("poll(reaped) revents = %d\n", ready(cfd, 0));
     show_fdinfo("fdinfo(reaped)", cfd, -1);
     close(cfd);
     close(nb);
     close(self);
+    close(p[0]);
+    close(p[1]);
+}
+
+/* PIDFD_SIGNAL_PROCESS_GROUP through the pidfd of a group leader that was reaped while its group lives on
+ * (linux-7.3.1/kernel/signal.c:4125 kill_pgrp_info): the members keep the pid as their pgid, so the signal
+ * reaches them; once the group is gone too it is ESRCH. A subreaper collects the orphaned member. */
+static void t_pgrp(void) {
+    int p[2];
+    if (pipe(p))
+        return;
+    prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    flush();
+    pid_t l = fork();
+    if (l == 0) {
+        setpgid(0, 0);
+        pid_t m = fork();
+        if (m == 0) {
+            for (;;)
+                pause();
+        }
+        if (write(p[1], &m, sizeof m) != sizeof m)
+            _exit(1);
+        _exit(0);
+    }
+    int lfd = popen_(l, 0);
+    pid_t m = 0;
+    yes("the member's pid arrived", read(p[0], &m, sizeof m) == sizeof m && m > 0);
+    int st = 0;
+    yes("the leader was reaped", waitpid(l, &st, 0) == l && WIFEXITED(st));
+    SYS("send(reaped leader, 0)", SYS_pidfd_send_signal, lfd, 0, 0, 0);
+    SYS("send(reaped leader, PROCESS_GROUP, 0)", SYS_pidfd_send_signal, lfd, 0, 0, 4);
+    SYS("send(reaped leader, PROCESS_GROUP, SIGKILL)", SYS_pidfd_send_signal, lfd, SIGKILL, 0, 4);
+    st = 0;
+    yes("the member ended by SIGKILL", m > 0 && waitpid(m, &st, 0) == m && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    SYS("send(reaped leader, PROCESS_GROUP) after the group ended", SYS_pidfd_send_signal, lfd, 0, 0, 4);
+    prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
+    close(lfd);
     close(p[0]);
     close(p[1]);
 }
@@ -226,8 +413,7 @@ static void t_clone(void) {
     int pidfd = -1;
     SYS("clone3(PIDFD, bad pointer)", SYS_clone3, &(struct clone_args_v0){.flags = CLONE_PIDFD_, .pidfd = (uint64_t)KERNEL_ADDR, .exit_signal = SIGCHLD}, sizeof(struct clone_args_v0));
     SYS("wait4 after the failed clone3", SYS_wait4, -1, 0, WNOHANG, 0);
-    /* CLONE_PIDFD | CLONE_THREAD is EINVAL in 6.6 (V2's reference) but a thread pidfd from 6.9 on: the ktest
-     * ab.pidfd.clone checks it, not this diff. */
+    /* CLONE_PIDFD | CLONE_THREAD gives a thread pidfd (ktest ab.l7.pidfd_thread). */
     long c = clone3_pidfd(&pidfd, 0, 100, 3);
     yes("clone3(PIDFD) made a child", c > 0);
     yes("pidfd >= 0", pidfd >= 0);
@@ -342,8 +528,8 @@ static void t_getfd(void) {
     }
     kill(c, SIGKILL);
     printf("poll(killed child, 5 s) revents = %d\n", ready(cfd, 5000));
-    /* 6.6: EBADF (the ended task has no files); 6.10+ answers ESRCH for an exiting task. */
-    yes("getfd(zombie) fails", syscall(SYS_pidfd_getfd, cfd, 50, 0) < 0);
+    /* linux-7.3.1/kernel/pid.c:861: the task is exiting (PF_EXITING): ESRCH. */
+    SYS("getfd(zombie)", SYS_pidfd_getfd, cfd, 50, 0);
     siginfo_t w;
     SYS("waitid(P_PIDFD)", SYS_waitid, P_PIDFD, cfd, &w, WEXITED, 0);
     SYS("getfd(reaped)", SYS_pidfd_getfd, cfd, 50, 0);
@@ -356,7 +542,9 @@ static void t_getfd(void) {
 int main(void) {
     t_open();
     t_thread();
+    t_pidfs();
     t_signal();
+    t_pgrp();
     t_waitid();
     t_clone();
     t_getfd();

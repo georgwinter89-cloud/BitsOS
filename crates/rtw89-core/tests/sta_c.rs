@@ -4,8 +4,9 @@
 //! of the packet offload / general packet / packet drop setters, every builder's category, class,
 //! function, rack and dack against the rtw89_h2c_pkt_set_hdr call of its Linux function; then
 //! every `name (file.c:line)` citation in src/sta/ against that line of WZ:linux, and every
-//! `name (linux-6.6/path:line)` citation in src/sta/ and crates/wifi against the Linux 6.6 tree
-//! (V2/ref/linux-6.6, read only). No node, no fake chip.
+//! `name (linux-7.3.1/path:line)` citation in src/sta/ and crates/wifi against the Linux 7.3.1 tree
+//! (V2/ref/linux-7.3.1, read only), and a `linux-6.6/` one that is left only where 7.3.1 differs against
+//! the Linux 6.6 tree (V2/ref/linux-6.6). No node, no fake chip.
 
 mod common;
 
@@ -26,6 +27,12 @@ fn linux66() -> PathBuf {
     std::env::var_os("LINUX_6_6")
         .map(PathBuf::from)
         .unwrap_or_else(|| common::desk("V2/ref/linux-6.6"))
+}
+
+fn linux73() -> PathBuf {
+    std::env::var_os("LINUX_7_3_1")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| common::desk("V2/ref/linux-7.3.1"))
 }
 
 fn read(p: &Path) -> String {
@@ -345,15 +352,23 @@ fn citations(text: &str) -> Vec<(String, String, usize)> {
     out
 }
 
-fn check_tree(sources: &[PathBuf], base_wz: &Path, base_66: &Path) -> (usize, usize) {
-    let (mut wz_n, mut l66_n) = (0, 0);
+fn check_tree(
+    sources: &[PathBuf],
+    base_wz: &Path,
+    base_66: &Path,
+    base_73: &Path,
+) -> (usize, usize) {
+    let (mut wz_n, mut linux_n) = (0, 0);
     let mut bad = Vec::new();
     for p in sources {
         let text = read(p);
         for (name, file, line) in citations(&text) {
-            let (base, rel) = match file.strip_prefix("linux-6.6/") {
-                Some(r) => (base_66, r.to_string()),
-                None => (base_wz, format!("linux/{file}")),
+            let (base, rel) = if let Some(r) = file.strip_prefix("linux-7.3.1/") {
+                (base_73, r.to_string())
+            } else if let Some(r) = file.strip_prefix("linux-6.6/") {
+                (base_66, r.to_string())
+            } else {
+                (base_wz, format!("linux/{file}"))
             };
             let path = base.join(&rel);
             if !path.exists() {
@@ -373,10 +388,10 @@ fn check_tree(sources: &[PathBuf], base_wz: &Path, base_66: &Path) -> (usize, us
             if !ok {
                 bad.push(format!("{}: {name} not at {file}:{line}", p.display()));
             }
-            if base == base_66 {
-                l66_n += 1;
-            } else {
+            if base == base_wz {
                 wz_n += 1;
+            } else {
+                linux_n += 1;
             }
         }
     }
@@ -386,7 +401,7 @@ fn check_tree(sources: &[PathBuf], base_wz: &Path, base_66: &Path) -> (usize, us
         bad.len(),
         bad.join("\n")
     );
-    (wz_n, l66_n)
+    (wz_n, linux_n)
 }
 
 fn rs_files(dir: &Path) -> Vec<PathBuf> {
@@ -404,10 +419,15 @@ fn every_linux_citation_points_at_its_function() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = rs_files(&here.join("src/sta"));
     files.extend(rs_files(&here.join("../wifi/src")));
-    let (wz_n, l66_n) = check_tree(&files, &wz(), &linux66());
+    let (wz_n, linux_n) = check_tree(&files, &wz(), &linux66(), &linux73());
     assert!(wz_n >= 80, "rtw89 citations checked: {wz_n}");
-    assert!(l66_n >= 10, "linux-6.6 citations checked: {l66_n}");
-    eprintln!("{wz_n} rtw89 citations (WZ:linux) and {l66_n} linux-6.6 citations checked");
+    assert!(
+        linux_n >= 10,
+        "linux-7.3.1 and linux-6.6 citations checked: {linux_n}"
+    );
+    eprintln!(
+        "{wz_n} rtw89 citations (WZ:linux) and {linux_n} linux-7.3.1/linux-6.6 citations checked"
+    );
 }
 
 #[test]

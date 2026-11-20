@@ -74,9 +74,13 @@ fn pipe_of(name: &str) -> Option<u8> {
 }
 
 /// GX-7m2: the pipe whose cursor `byte` belongs to (CURSOR0_n_ and CNVC_CURn_ registers), for the picture proof.
+/// GPY: and HUBPREQn_CURSOR_SETTINGS, which a new cursor image writes too (`cursor::attributes`; Linux
+/// hubp2_cursor_set_attributes, linux-7.3.1/drivers/gpu/drm/amd/display/dc/hubp/dcn20/dcn20_hubp.c:634-638, the
+/// DCN 3.1.4 and 3.5 HUBPs' set_cursor_attributes, dcn31/dcn31_hubp.c:96, dcn35/dcn35_hubp.c:205).
 pub fn cursor_pipe(byte: u32) -> Option<u8> {
     let n = name(byte);
-    if n.starts_with("CURSOR0_") || n.starts_with("CNVC_CUR") { pipe_of(n) } else { None }
+    let cursor = n.starts_with("CURSOR0_") || n.starts_with("CNVC_CUR") || (n.starts_with("HUBPREQ") && n.ends_with("_CURSOR_SETTINGS"));
+    if cursor { pipe_of(n) } else { None }
 }
 
 /// Whether `byte` may be read at all by the snapshot: never the NBIO aliases, the AZ pair, the MM_INDEX window, past

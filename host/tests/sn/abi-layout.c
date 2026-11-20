@@ -10,6 +10,7 @@
 #define S(t) printf("sizeof %s %zu\n", #t, sizeof(struct t))
 #define O(t, f) printf("offsetof %s.%s %zu\n", #t, #f, offsetof(struct t, f))
 #define I(n) printf("ioctl %s %lu\n", #n, (unsigned long)(n))
+#define V(n) printf("value %s %lu\n", #n, (unsigned long)(n))
 
 int main(void) {
     S(snd_pcm_info); S(snd_pcm_hw_params); S(snd_pcm_sw_params); S(snd_pcm_status); S(snd_pcm_sync_ptr);
@@ -46,5 +47,11 @@ int main(void) {
     I(SNDRV_CTL_IOCTL_ELEM_WRITE); I(SNDRV_CTL_IOCTL_PCM_INFO);
     I(SNDRV_PCM_IOCTL_READI_FRAMES); I(SNDRV_PCM_IOCTL_READN_FRAMES); I(SNDRV_PCM_IOCTL_FORWARD);
     I(SNDRV_PCM_IOCTL_DRAIN); I(SNDRV_PCM_IOCTL_DROP);
+    /* L7-HW: the PCM protocol version with what it promises (the subformat, the hw_params sync ID). The control
+     * side's 2.0.10 (CARD_BYTES) is newer than this host's headers (linux-api-headers 7.1): user/abi-tests
+     * c/alsa.c asks the running kernel instead. */
+    V(SNDRV_PCM_VERSION); V(SNDRV_PCM_SUBFORMAT_STD); V(SNDRV_PCM_SUBFORMAT_MSBITS_MAX); V(SNDRV_PCM_FORMAT_LAST);
+    O(snd_pcm_hw_params, msbits); O(snd_pcm_hw_params, fifo_size); O(snd_pcm_hw_params, sync);
+    O(snd_pcm_info, pad1);
     return 0;
 }

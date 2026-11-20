@@ -2,7 +2,7 @@
 """SX-3c: pressure-vessel with the Steam Linux Runtime sniper tree on a running V2, over MCP
 (host/tests/sx/20-pressure-vessel.sh).
 
-Streams the tree (user/ports/steamrt/out: SteamLinuxRuntime_sniper/ and gfx/, the software graphics provider) as
+Streams the tree (user/ports/steamrt/out: SteamLinuxRuntime_sniper/ and gfx/, the graphics provider) as
 an uncompressed tar from 127.0.0.1:<http port>; V2 pulls it with wget from 10.0.2.2 straight into tar (the tree is
 about 1.1 GB: no copy of the tarball in V2's RAM) below /tmp/pv. Then, as uid 1000 (MCP's run) with a clean
 environment, `run -- true` and `run -- steam-runtime-system-info` (the tree's own entry, default --copy-runtime: the
@@ -107,8 +107,8 @@ def serve():
     threading.Thread(target=s.serve_forever, daemon=True).start()
 
 
-# A clean environment as Steam would give it minus the display (QEMU has none): software graphics from the
-# provider tree, no host GPU (/dev/dri does not exist in QEMU).
+# A clean environment as Steam would give it minus the display (QEMU has none): the provider tree's graphics (the GPU's
+# drivers only), no GPU (/dev/dri does not exist in QEMU).
 ENV = ("env -i HOME=/tmp/pv/home USER=user LANG=C.UTF-8 PATH=/usr/bin:/bin XDG_RUNTIME_DIR=/tmp/pv/xdg "
        "PRESSURE_VESSEL_GRAPHICS_PROVIDER=/tmp/pv/gfx ")
 # What pressure-vessel's own programs take from the host's glibc (ldd of pressure-vessel/bin and libexec; the rest

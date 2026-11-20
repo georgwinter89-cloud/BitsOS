@@ -1,4 +1,4 @@
-//! GX-5a (change request of lane GX, plan/notes/gx-GX-5a.md): the display engine's hardware cursor for the
+//! GX-5a (written for lane GX): the display engine's hardware cursor for the
 //! screen's holder (the compositor), one BitsOS ioctl on /dev/fb0 in DP-3's private 'F' range (ENOTTY on Linux,
 //! where a compositor uses the DRM cursor plane instead):
 //!

@@ -1,4 +1,4 @@
-/* VS-2 CR5: FIFREEZE / FITHAW (linux-6.6/fs/ioctl.c:387-415) as an unprivileged program: the capability check
+/* VS-2 CR5: FIFREEZE / FITHAW (linux-7.3.1/fs/ioctl.c:385-413) as an unprivileged program: the capability check
  * comes first, so every file answers EPERM, a closed fd EBADF. The root answers (EOPNOTSUPP on tmpfs, EBUSY,
  * EINVAL, a real freeze of an ext4 /data) are the V2 ktest ab.fsfreeze, since the diff runs as a user on
  * CachyOS. As root (V2) the program drops to 65534 first. */

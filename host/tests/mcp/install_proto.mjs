@@ -273,6 +273,17 @@ await check('--upload: write_file in pieces, stat hash, install_kernel from the 
   need(fake.fetched.length === 0, 'nothing served with --upload');
 });
 
+// GP-R3: the remote desk on Windows serves nothing, so --upload needs no --bind; without --upload it still does.
+await check('--upload without --bind installs; without --upload --bind is still needed', async () => {
+  reset();
+  const r = await run([HOST, '--kernel', join(tmp, 'b', 'KERNEL'), '--initrd', join(tmp, 'b', 'INITRD'), '--upload']);
+  const [a] = installCalls();
+  need(r.code === 0 && r.out.includes('read from the uploads') && a?.url === undefined && fake.fetched.length === 0, `exit ${r.code}`, r.out);
+  reset();
+  const n = await run([HOST, '--kernel', join(tmp, 'b', 'KERNEL'), '--initrd', join(tmp, 'b', 'INITRD')]);
+  need(n.code === 2 && n.out.includes('--bind') && installCalls().length === 0, `exit ${n.code}`, n.out);
+});
+
 await check('--reboot: reboot, MCP from a new start with the new generation, reload_info until confirmed, exit 0', async () => {
   reset();
   const r = await run([HOST, ...BUNDLE, '--reboot', '--back-s', '30', '--confirm-s', '60']);

@@ -1,4 +1,4 @@
-/* PF-3: close and dup2/dup3 against threads that use the same fd numbers (linux-6.6/fs/file.c close_fd,
+/* PF-3: close and dup2/dup3 against threads that use the same fd numbers (linux-7.3.1/fs/file.c:733 close_fd,
  * ksys_dup3/do_dup2, __fget_light). Cases (argv[1]):
  *   inflight  a read blocked in another thread keeps its file across close(fd) and dup2(x, fd)
  *   storm     threads dup2 two files onto one number, close it and use it: only success or EBADF, and a

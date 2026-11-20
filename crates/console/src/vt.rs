@@ -26,6 +26,8 @@ struct Vt {
     last_cursor: Option<(u32, u32)>,
     width: u32,
     height: u32,
+    /// The panic path's blend table: kept here, off the small IST stack, made once per attribute.
+    shade: render::Shade,
 }
 
 static VT: SpinLock<Option<Vt>> = SpinLock::named("console.vt", None);
@@ -53,7 +55,9 @@ fn with_vt<R>(f: impl FnOnce(&mut Vt) -> R) -> Option<R> {
         p.scale = (font.h / 16).max(1);
         p.x = w / 2;
         p.y = h / 2;
-        *g = Some(Vt { screen: Screen::new(cols, rows), font, pointer: p, last_cursor: None, width: w, height: h });
+        let screen = Screen::new(cols, rows);
+        let shade = render::Shade::new();
+        *g = Some(Vt { screen, font, pointer: p, last_cursor: None, width: w, height: h, shade });
     }
     g.as_mut().map(f)
 }
@@ -63,7 +67,7 @@ fn with_vt<R>(f: impl FnOnce(&mut Vt) -> R) -> Option<R> {
 /// VT takes the screen back.
 fn redraw(v: &mut Vt) {
     // DS-4: the boot screen is the picture until it ends (`show_text` draws the model whole then).
-    if graphics() || crate::bootscreen::active() {
+    if graphics() || crate::bootscreen::active() || crate::report_page::active() {
         v.screen.full = true;
         return;
     }
@@ -158,6 +162,8 @@ fn set_kd_mode_if(on: bool, owner: Option<u32>, expect: Option<u32>) -> bool {
     if on {
         // DS-4: the program (the desktop) has the screen; DS-5 continues the step list from /proc/bitsos/boot.
         crate::bootscreen::stop("handover", true);
+        // GP-ROUND: the report page ends too; the program's picture is its own, and keys go to the program.
+        crate::report_page::end("handover");
     }
     if !on {
         // The arrow drawn over the program's picture: that spot comes back from the console frame too.
@@ -254,33 +260,63 @@ pub fn write_program(bytes: &[u8]) {
     write(&text, screen::FG_INDEX);
 }
 
+/// TIOCL_GETBRACKETEDPASTE: the VT's DEC mode 2004; off while there is no VT (no display yet).
+pub fn bracketed_paste() -> bool {
+    VT.lock().as_ref().is_some_and(|v| v.screen.bracketed_paste())
+}
+
 /// Reports a program asked the screen for (cursor position, status, identity), for the terminal's input.
 pub fn take_reply() -> alloc::vec::Vec<u8> {
     with_vt(|v| v.screen.take_reply()).unwrap_or_default()
 }
 
 pub fn write(s: &str, attr_fg: u8) {
-    let drew = with_vt(|v| {
-        let keep = v.screen.attr;
-        v.screen.attr = attr_fg & 15 | keep & 0xF0;
-        v.screen.write(s);
+    edit(s, |screen| {
+        let keep = screen.attr;
+        screen.attr = attr_fg & 15 | keep & 0xF0;
+        screen.write(s);
         // ANSI SGR inside `s` may have changed the attribute; the next writer starts from the default again.
-        v.screen.attr = keep;
-        redraw(v);
-    });
-    if drew.is_some() {
-        present();
-    }
+        screen.attr = keep;
+    }, false);
 }
 
 /// A log line: goes above the open line (the prompt and what Georg is typing, or a program's unfinished line),
 /// which is drawn again below it (`Screen::write_above`). Everything happens in the model under `console.vt`, the
 /// lock every key's echo takes too, so a key typed meanwhile lands either before or after, never inside.
 pub fn write_line(line: &str, attr_fg: u8) {
-    let drew = with_vt(|v| {
-        v.screen.write_above(line, attr_fg & 15);
-        redraw(v);
-    });
+    edit(line, |screen| screen.write_above(line, attr_fg & 15), true);
+}
+
+klog::counter!(UNPREPARED, "console.scroll_unprepared");
+
+/// Scrolls that had to make their memory under `console.vt` (0 unless a write's bound was too small).
+pub fn scroll_unprepared() -> u64 {
+    UNPREPARED.get()
+}
+
+/// Runs `write` (a `Screen::write` of `text`, or with `above` a `write_above`) on the model and draws. The rows
+/// a scroll adds and the longer list of rows are made here with `console.vt` dropped and handed in
+/// (`screen::Stock`): under the lock the heap cannot reclaim. What happens on the screen between the look and
+/// the write (another writer's lines, a new font) only makes the look ask again; the text is written once, whole.
+fn edit(text: &str, write: impl Fn(&mut Screen), above: bool) {
+    // Before the VT's guard: what the screen hands back is freed after the unlock.
+    let mut stock = screen::Stock::new();
+    let drew = loop {
+        let done = with_vt(|v| {
+            if !v.screen.prepare(&mut stock, text, above) {
+                return false;
+            }
+            write(&mut v.screen);
+            v.screen.unprepare(&mut stock);
+            UNPREPARED.add(v.screen.took_unprepared() as u64);
+            redraw(v);
+            true
+        });
+        match done {
+            Some(false) => stock.grow(),
+            other => break other,
+        }
+    };
     if drew.is_some() {
         present();
     }
@@ -291,6 +327,8 @@ pub fn write_line(line: &str, attr_fg: u8) {
 pub fn write_emergency(line: &str, attr_fg: u8) {
     // DS-4: a panic during the boot screen shows the text console (the model as it is, then the panic lines).
     let boot = crate::bootscreen::end_for_panic();
+    // GP-ROUND: a panic during the report page shows the text model too, not panic lines over the page's text.
+    let page = crate::report_page::end_for_panic();
     let Some(mut g) = VT.try_lock() else { return };
     let Some(v) = g.as_mut() else { return };
     let (font, cols, rows) = (v.font, v.screen.cols, v.screen.rows);
@@ -298,10 +336,10 @@ pub fn write_emergency(line: &str, attr_fg: u8) {
     let attr = attr_fg & 15;
     let drew = display::try_with_frame(|f| {
         v.pointer.hide(f);
-        if boot {
+        if boot || page {
             f.fill(f.full(), screen::PALETTE[screen::BG_INDEX as usize]);
             for r in 0..rows {
-                render::draw_row(f, &font, &v.screen, r);
+                render::draw_row_shaded(f, &font, &v.screen, r, &mut v.shade);
             }
         }
         let newline = |row: &mut u32, f: &mut display::RamFrame| {
@@ -319,7 +357,7 @@ pub fn write_emergency(line: &str, attr_fg: u8) {
                 col = 0;
                 newline(&mut row, f);
             }
-            render::draw_cell(f, &font, col, row, screen::Cell { ch: c, attr }, false);
+            render::draw_cell_shaded(f, &font, col, row, screen::Cell { ch: c, attr }, false, &mut v.shade);
             col += 1;
         }
         newline(&mut row, f);
@@ -342,7 +380,36 @@ pub fn size() -> (u32, u32) {
 }
 
 pub fn text_grid() -> Option<TextGrid> {
+    // GP-ROUND: while the report page is up, the screen shows it and not the model.
+    if let Some(page) = crate::report_page::lines() {
+        return with_vt(|v| (v.screen.cols, v.screen.rows, page.iter().map(|l| alloc::string::String::from(l.trim_end())).collect(), (0, 0)));
+    }
     with_vt(|v| (v.screen.cols, v.screen.rows, v.screen.text_lines(), (v.screen.col, v.screen.row)))
+}
+
+/// GP-ROUND: draws one report page over the whole screen in the console's font (`report_page`); the pointer is
+/// hidden while the page is up. The model is not touched: `show_text` draws it whole when the page ends.
+pub(crate) fn draw_page(lines: &[alloc::string::String]) {
+    with_vt(|v| {
+        let font = v.font;
+        let (cols, rows) = (v.screen.cols, v.screen.rows);
+        display::with_frame(|f| {
+            v.pointer.hide(f);
+            f.fill(f.full(), screen::PALETTE[screen::BG_INDEX as usize]);
+            let colors = crate::report_page::colors(lines);
+            let mut shade = render::Shade::new();
+            for (r, line) in lines.iter().take(rows as usize).enumerate() {
+                let attr = screen::index_of(colors[r]);
+                for (c, ch) in line.chars().take(cols as usize).enumerate() {
+                    let cell = screen::Cell { ch, attr };
+                    render::draw_cell_shaded(f, &font, c as u32, r as u32, cell, false, &mut shade);
+                }
+            }
+        });
+        v.screen.full = true;
+        v.last_cursor = None;
+    });
+    present();
 }
 
 /// The font in use (face, cell width, cell height).
@@ -379,7 +446,7 @@ pub fn set_face(f: Face) {
 /// GX-4 (CR 1): the display shows a new size (a mode switch; `display::resize` made the frame again): the VT is
 /// refitted to it as `set_face` refits to a font: the font for the new mode, the text kept (cut or padded),
 /// the pointer kept inside, the whole screen drawn again; the foreground group hears SIGWINCH (Linux
-/// `vc_do_resize` -> `tty_do_resize`, linux-6.6/drivers/tty/vt/vt.c:1144, drivers/tty/tty_io.c:2326).
+/// `vc_do_resize` -> `tty_do_resize`, linux-7.3.1/drivers/tty/vt/vt.c:1171, drivers/tty/tty_io.c:2299).
 pub fn refit() {
     let Some((w, h)) = display::with_frame(|fr| (fr.width, fr.height)) else { return };
     let changed = with_vt(|v| {
@@ -601,6 +668,10 @@ impl Input {
         match ev.kind {
             EV_KEY if ev.code >= 0x100 => {} // mouse buttons: nothing on the console yet
             EV_KEY => match self.union.apply(ev) {
+                // The start question of a command (the measurement run) takes every key while it stands.
+                Some(true) if crate::text_ask::answer(ev) => self.repeat.stop(),
+                // VB-1: J or Z of a real keyboard answers the report page's question.
+                Some(true) if crate::report_page::answer(ev) => self.repeat.stop(),
                 Some(true) if raw_keyboard() => self.raw_edge(ev.code, true, ev.injected, now),
                 Some(false) if raw_keyboard() => {
                     self.raw_edge(ev.code, false, ev.injected, now);
@@ -691,6 +762,11 @@ impl Input {
         if crate::bootscreen::stop("key", false) {
             self.repeat.stop();
             show_text();
+            return;
+        }
+        // GP-ROUND: a key turns the Gaming-PC's report page, and after its last page shows the console.
+        if crate::report_page::key() {
+            self.repeat.stop();
             return;
         }
         if m.shift && (c == code::PAGEUP || c == code::PAGEDOWN) {

@@ -1,0 +1,11 @@
+[package]
+name = "uilist"
+version = "0.1.0"
+edition = "2024"
+description = "DB1 (Durchblick): the desktop as a list. Contract C1's window and element types, stable ids, the plain-text rendering, the protocol file of BitsOS's own programs and C2's history entries"
+publish = false
+
+# Pins as ctxd's (in the cargo cache already, no download).
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"

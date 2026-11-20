@@ -1,4 +1,4 @@
-//! ioctl (linux-6.6/fs/ioctl.c `SYSCALL_DEFINE3(ioctl)` and `do_vfs_ioctl`): the generic commands every file
+//! ioctl (linux-7.3.1/fs/ioctl.c:583 `SYSCALL_DEFINE3(ioctl)` and :492 `do_vfs_ioctl`): the generic commands every file
 //! has (FIOCLEX, FIONCLEX, FIONBIO, FIONREAD on regular files), then the file's own ioctl. Terminals (the
 //! console fds) answer TCGETS and TIOCGWINSZ through FS's tty nodes (IN's console behind them); every other
 //! file answers ENOTTY (`File::ioctl`'s default), as Linux does for files without the command.
@@ -9,7 +9,7 @@ use uapi::errno::*;
 
 /// O_NONBLOCK in the file status flags.
 const O_NONBLOCK: u64 = 0o4000;
-/// `_IOR('T', 0x41, int)`: open the pty's slave (linux-6.6/include/uapi/asm-generic/ioctls.h).
+/// `_IO('T', 0x41)`: open the pty's slave (linux-7.3.1/include/uapi/asm-generic/ioctls.h:81).
 const TIOCGPTPEER: u64 = 0x5441;
 
 fn sys_ioctl(c: &mut SysCtx<'_>) -> i64 {
@@ -55,16 +55,23 @@ fn ioctl(c: &mut SysCtx<'_>) -> i64 {
         }
         _ => {}
     }
+    // L7-PROC: the pidfs ioctls (`pidfd_ioctl`); other numbers on a pidfd are ENOTTY below.
+    if let Some(t) = proc::pidfd::target_of(&f)
+        && let Some(r) = crate::pidfd::pidfd_ioctl(c, &t, cmd, arg)
+    {
+        return r;
+    }
     // IN-7 CR2: TIOCGPTPEER opens the master's slave as the kernel (Linux opens it through the master's devpts
-    // mount without a path walk: linux-6.6/drivers/tty/pty.c:602 `ptm_open_peer`) and answers the new fd. A still
+    // mount without a path walk: linux-7.3.1/drivers/tty/pty.c:617 `ptm_open_peer`) and answers the new fd. A still
     // locked slave answers the open's EIO. Files that are not a pty master go on below (ENOTTY).
+    // IN-PTY: in the master's own devpts instance (`devpts_mntget`).
     if cmd == TIOCGPTPEER {
-        if let Some(path) = console::pty::peer_path(&*f.file) {
-            const O_ACCMODE: u64 = 3;
-            const O_NOCTTY: u64 = 0o400;
-            const O_CLOEXEC: u64 = 0o2000000;
-            let flags = arg & (O_ACCMODE | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
-            return match vfs::root_ns().open_flags(path.as_bytes(), flags, 0) {
+        const O_ACCMODE: u64 = 3;
+        const O_NOCTTY: u64 = 0o400;
+        const O_CLOEXEC: u64 = 0o2000000;
+        let flags = arg & (O_ACCMODE | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        if let Some(r) = console::pty::open_peer(&f, flags) {
+            return match r {
                 Ok(peer) => c.proc.fds.install_flags(peer, 0, flags & O_CLOEXEC != 0).map(|fd| fd as i64).unwrap_or_else(|e| -e),
                 Err(e) => -e,
             };

@@ -282,8 +282,8 @@ static int volatile_query(uint32_t q) {
 
 // Whether a traced wait saw its fences done (else it timed out). The syncobj waits answer ETIME on a timeout; the
 // amdgpu waits answer 0 and say it in out.status: GEM_WAIT_IDLE and WAIT_CS 1 = still busy
-// (linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:1493, amdgpu_gem.c wait_idle), WAIT_FENCES 1 = signalled
-// (amdgpu_cs.c:1631, :1685).
+// (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:1545, amdgpu_gem.c:695 wait_idle), WAIT_FENCES 1 = signalled
+// (amdgpu_cs.c:1683, :1737).
 static int wait_done(unsigned nr, int tret, const unsigned char *tout, size_t tsize) {
     if (tret != 0) return 0;
     uint32_t status = get32(tout, tsize, 0);

@@ -1,8 +1,8 @@
-//! GX-7n: the chip's side of the IH ring, over `Hw`: `ih_v6_0_irq_init` (linux-6.6 amdgpu/ih_v6_0.c:293) with
-//! `nbio_v7_7_ih_control` and `_ih_doorbell_range`, the sources' enable bits (sdma_v6_0.c:1449, gfx_v11_0.c:5707, :5752,
-//! :5894, amdgpu_gmc.c:663), `ih_v6_0_irq_disable` (:371) and the Quiesce hook's raw form. Runs on the kept chain, so every
-//! write passes the GX-D9 watch: nothing here names a DCN register, and MMHUB's contexts are not touched (a display
-//! fault on MMHUB stays what it is today, no interrupt).
+//! GX-7n: the chip's side of the IH ring, over `Hw`: `ih_v6_0_irq_init` (linux-7.3.1 amdgpu/ih_v6_0.c:321) with
+//! `nbio_v7_7_ih_control` and `_ih_doorbell_range`, the sources' enable bits (sdma_v6_0.c:1594, gfx_v11_0.c:6508,
+//! :6598, :6689, amdgpu_gmc.c:1022), `ih_v6_0_irq_disable` (:415) and the Quiesce hook's raw form. Runs on the kept
+//! chain, so every write passes the GX-D9 watch: nothing here names a DCN register, and MMHUB's contexts are not
+//! touched (a display fault on MMHUB stays what it is today, no interrupt).
 //!
 //! Where it differs from Linux: the ring lies in the carve-out, not in GTT (Linux keeps it there only because it needs a
 //! CPU mapping; here the carve-out is what needs no GART on MMHUB, which the display uses), so `IH_REQ_NONSNOOP_EN` as

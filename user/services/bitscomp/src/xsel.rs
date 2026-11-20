@@ -2,7 +2,7 @@
 //! to Wayland clients as bitscomp's own selection and fetched from X when one reads it; a Wayland client's text is
 //! offered to X clients with bitscomp's WM window as the owner and fetched from the client when an X client asks.
 //! Text only for now (UTF8_STRING, TEXT, STRING and the text/plain types; STRING is Latin-1 and converted both
-//! ways); PRIMARY is not bridged (decision in plan/notes/wy-WY-3.md). Every transfer goes through calloop sources:
+//! ways); PRIMARY is not bridged (decision in plan/spec/bitscomp.md §4). Every transfer goes through calloop sources:
 //! bitscomp never waits for a client, and a transfer that makes no progress for TRANSFER_IDLE or grows past
 //! MAX_TRANSFER is given up (B4).
 
@@ -316,6 +316,7 @@ fn publish(wm: &mut Xwm, app: &mut App) {
     }
     let mimes: Vec<String> = wm.sel.targets.iter().map(|(m, _)| m.clone()).collect();
     eprintln!("bitscomp: xsel: an X11 program owns the clipboard; offered to Wayland as {}", mimes.join(" "));
+    app.sys_clip_lost();
     set_data_device_selection(&app.dh, &app.seat, mimes, ());
     wm.sel.offered = true;
 }

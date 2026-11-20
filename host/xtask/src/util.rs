@@ -43,6 +43,7 @@ const LANE_PORTS: &[(&str, u16, u16)] = &[
     ("pk", 18500, 18999), ("gr", 15500, 15999), ("dr", 16000, 16499), ("ds", 15000, 15499),
     ("lo", 14500, 14999), ("bl", 14000, 14499), ("ib", 13500, 13999), ("im", 13000, 13499),
     ("ip", 12500, 12999), ("iq", 12000, 12499), ("ig", 11500, 11999), ("pv", 11000, 11499),
+    ("so", 10500, 10999), ("sp", 10000, 10499),
 ];
 
 pub fn lane_range(lane: &str) -> Option<(u16, u16)> {
@@ -139,6 +140,15 @@ pub fn have_tool(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
         .unwrap_or(false)
+}
+
+/// A host test's tools: a missing one is a failure with its name and package, never a skip.
+#[cfg(test)]
+#[track_caller]
+pub fn need_tools(test: &str, tools: &[(&str, &str)]) {
+    for (t, pkg) in tools {
+        assert!(have_tool(t), "{test}: {t} is not on PATH (install {pkg})");
+    }
 }
 
 #[cfg(test)]

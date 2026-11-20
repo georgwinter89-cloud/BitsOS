@@ -1,13 +1,13 @@
 //! `memstress rules`: the errno and signal rules of file and memfd mappings that Wayland clients (wl_shm) and
 //! Chromium-like programs meet, each checked against Linux's answer:
-//! - mmap(MAP_SHARED, PROT_WRITE) of an O_RDONLY fd: EACCES; MAP_PRIVATE RW of it: ok (linux-6.6/mm/mmap.c:1292
+//! - mmap(MAP_SHARED, PROT_WRITE) of an O_RDONLY fd: EACCES; MAP_PRIVATE RW of it: ok (linux-7.3.1/mm/mmap.c:458
 //!   `do_mmap`, FMODE_WRITE only for shared writable maps).
-//! - memfd seals (linux-6.6/mm/memfd.c): F_SEAL_WRITE while a shared writable map exists EBUSY (:200
+//! - memfd seals (linux-7.3.1/mm/memfd.c): F_SEAL_WRITE while a shared writable map exists EBUSY (:294
 //!   `memfd_wait_for_pins`/`mapping_deny_writable`), after SHRINK|GROW|WRITE ftruncate/pwrite/shared RW map EPERM,
 //!   F_SEAL_SEAL forbids further seals (EPERM).
 //! - mremap growth keeps the bytes; a partial munmap leaves a hole mincore calls ENOMEM (mm/mincore.c:261).
-//! `memstress truncate` (its own mode: V2 differs here, see ul-UL-4b.md CR3): a store past the end of a shrunk
-//! shared memfd mapping is SIGBUS (linux-6.6/mm/truncate.c `truncate_pagecache` unmaps the cut pages, the next
+//! `memstress truncate` (its own mode): a store past the end of a shrunk
+//! shared memfd mapping is SIGBUS (linux-7.3.1/mm/truncate.c:783 `truncate_pagecache` unmaps the cut pages, the next
 //! fault past i_size is VM_FAULT_SIGBUS in mm/shmem.c), checked in a child.
 
 use crate::{ENOMEM, PAGE};

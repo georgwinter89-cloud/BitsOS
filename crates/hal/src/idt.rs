@@ -5,7 +5,7 @@
 //! from user mode go to `entry`'s return path (back to `UserContext::execute`'s caller), except NMI, #MC and
 //! #DF; those and traps from kernel mode go to `kernel_trap`: interrupts to `vectors::dispatch`, exceptions to a
 //! registered hook or a panic. NMI/#MC/#DF never `swapgs`: like Linux's paranoid entry with FSGSBASE
-//! (linux-6.6/arch/x86/entry/entry_64.S:915) the GS base is read and replaced by this CPU's block, then written
+//! (linux-7.3.1/arch/x86/entry/entry_64.S:899) the GS base is read and replaced by this CPU's block, then written
 //! back, whatever CS says (CP-8).
 //! #DF, NMI and #MC gates switch to their IST stacks (`gdt.rs`). The probes below cause deliberate faults at
 //! known instructions so the hook and IST paths can be tested (CP-1 ktests).
@@ -161,6 +161,11 @@ extern "C" fn hal_kernel_trap(frame: &mut TrapFrame) {
         crate::vectors::dispatch(v as u8, frame);
         // CP-5: the scheduler may preempt the interrupted kernel thread now (after the EOI, depth back to 0).
         crate::vectors::irq_exit_from_kernel(frame);
+        return;
+    }
+    // GP-CPU: the one rdmsr of `msr::try_read` and the one wrmsr of `msr::try_write` may fault by design; each
+    // resumes at its own "absent" return.
+    if v == GENERAL_PROTECTION as u64 && crate::msr::fault_fixup(&mut frame.rip, frame.cs) {
         return;
     }
     let hook = HOOKS[v as usize].load(Ordering::Acquire);

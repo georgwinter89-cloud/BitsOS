@@ -1,5 +1,5 @@
-//! What the VT sends to the terminal in the raw keyboard modes (IN-4, KDSKBMODE; linux-6.6/drivers/tty/vt/
-//! keyboard.c `kbd_keycode` and `emulate_raw`): K_MEDIUMRAW sends the key code with bit 7 set on release
+//! What the VT sends to the terminal in the raw keyboard modes (IN-4, KDSKBMODE; linux-7.3.1/drivers/tty/vt/
+//! keyboard.c `kbd_keycode` :1429 and `emulate_raw` :1344): K_MEDIUMRAW sends the key code with bit 7 set on release
 //! (codes above 127 as three bytes), K_RAW the PC/AT set-1 scancodes an AT keyboard would send (the
 //! `x86_keycodes` table: the scancode, 0x100 = an 0xE0 prefix).
 

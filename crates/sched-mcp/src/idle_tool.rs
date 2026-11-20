@@ -28,7 +28,7 @@ mcp::mcp_tool!(
     name: "idle_mode",
     owner: "SC",
     safety: Change,
-    description: "FD-1 measuring build: the idle loop's sleep depth. mode: auto (deep C-state when the next timer and the predicted idle allow), c1 (C1 only, as before FD-1; CONFIG idle=c1), forced (always the shallowest deep state); factor: auto's target residency in multiples of the exit latency. Without arguments: the report.",
+    description: "FD-1 measuring build: the idle loop's sleep depth. mode: auto (deep C-state when the next timer and the predicted idle allow), c1 (C1 only, as before FD-1), forced (always the shallowest deep state); factor: auto's target residency in multiples of the exit latency. Without arguments: the report.",
     schema: r#"{"type":"object","properties":{"mode":{"type":"string","enum":["auto","c1","forced"]},"factor":{"type":"integer","minimum":1,"maximum":1000}}}"#,
     handler: tool,
 );

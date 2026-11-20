@@ -71,7 +71,8 @@ pub enum State {
     Done,
     /// Fehler (the detail says why)
     Failed,
-    /// Not there or switched off (no sound card, `init=off`, `desktop=off`).
+    /// Not there (no sound card, no graphics chip for the desktop, the Gaming-PC's text console, a test boot
+    /// without init).
     Skipped,
 }
 
@@ -130,6 +131,8 @@ pub struct Steps {
     pub gpu_boot: bool,
     /// Changes so far (the screen draws when it moved; `/proc/bitsos/boot` shows it).
     pub seq: u64,
+    /// GS-1: when the graphics stages were reached (no step of their own, no `seq`: the picture does not change).
+    pub marks: crate::bootmarks::Marks,
 }
 
 impl Default for Steps {
@@ -209,6 +212,7 @@ impl Steps {
             init: Init::Unknown,
             gpu_boot: false,
             seq: 0,
+            marks: crate::bootmarks::Marks::new(),
         }
     }
 
@@ -220,6 +224,7 @@ impl Steps {
     pub fn feed(&mut self, line: &str) -> bool {
         let Some(l) = Line::parse(line) else { return false };
         let before = self.seq;
+        self.marks.note(l.subsystem, l.name, l.t_ms);
         if let Some((k, u)) = self.map(&l) {
             self.apply(k, u, l.t_ms);
         }
@@ -267,12 +272,17 @@ impl Steps {
             ("snd", n) if err => (Key::Sound, Update::Fail(Detail::from(n))),
             ("dcn", "attached") => (Key::Gpu, Update::Run(Detail::from("anzeige gefunden"))),
             ("gx", "state.classified") => (Key::Gpu, Update::Run(Detail::from("gpu wird geprüft"))),
-            // GX-8c: CONFIG gpu=on. The row is settled by the end of the whole run, not by GC's boot on the way.
+            // GX-8c: the GPU comes up at every boot. The row is settled by the end of the whole run, not by GC's boot
+            // on the way.
             ("gx", "boot.start") => {
                 self.gpu_boot = true;
                 (Key::Gpu, Update::Run(Detail::from("gpu startet")))
             }
             ("gx", "boot.no_chip") => (Key::Gpu, Update::Skip(Detail::from("keine amd-gpu"))),
+            // GS-1: a card attached read-only (the Gaming-PC's RDNA4) has no bring-up: the machine stays on the text
+            // console over the firmware's picture, and the row must not stay "running" after an earlier
+            // `state.classified` or `dcn attached`.
+            ("gx", "boot.read_only") => (Key::Gpu, Update::Skip(Detail::from("nur gop-bild"))),
             ("gx", "boot.up") => {
                 self.gpu_boot = false;
                 (Key::Gpu, Update::Done(d!("gpu bereit, renderD{}", f("minor"))))
@@ -280,9 +290,9 @@ impl Steps {
             ("gx", "boot.failed") => {
                 self.gpu_boot = false;
                 if f("stop") == "not_needed" {
-                    (Key::Gpu, Update::Fail(d!("nicht gestartet ({}), ohne gpu", f("stage"))))
+                    (Key::Gpu, Update::Fail(d!("nicht gestartet ({}), textkonsole", f("stage"))))
                 } else {
-                    (Key::Gpu, Update::Fail(d!("gestoppt bei {}, ohne gpu", f("stage"))))
+                    (Key::Gpu, Update::Fail(d!("gestoppt bei {}, textkonsole", f("stage"))))
                 }
             }
             ("gx", "gfx.booted") if self.gpu_boot => (Key::Gpu, Update::Run(Detail::from("gpu gestartet"))),
@@ -298,14 +308,22 @@ impl Steps {
             }
             ("ul", "init.off") => {
                 self.init = Init::Off;
-                (Key::Services, Update::Skip(Detail::from("init=off")))
+                (Key::Services, Update::Skip(Detail::from("ohne init (test)")))
             }
             ("ul", "init.died") => (Key::Services, Update::Fail(d!("init endete (code {})", f("code")))),
             ("ul", "init.given_up") => {
                 self.init = Init::GivenUp;
                 (Key::Services, Update::Fail(Detail::from("init aufgegeben")))
             }
-            ("console", "desktop.off") => (Key::Desktop, Update::Skip(Detail::from("desktop=off"))),
+            ("console", "desktop.off") => (Key::Desktop, Update::Skip(Detail::from(match f("why") {
+                "gaming_pc" => "gaming-pc: textkonsole",
+                other => other,
+            }))),
+            // GX-8c: no GPU came up (none on this machine, a failed bring-up, or its bound passed): no desktop.
+            ("console", "desktop.no_gpu") => (Key::Desktop, Update::Skip(Detail::from(match f("reason") {
+                "late" => "gpu zu spät: textkonsole",
+                _ => "keine gpu: textkonsole",
+            }))),
             ("console", "desktop.wait") => (Key::Desktop, Update::Run(Detail::from("wartet auf init"))),
             ("console", "desktop.held") => (Key::Desktop, Update::Run(Detail::from("wartet auf die gpu"))),
             ("console", "desktop.start") => (Key::Desktop, Update::Run(d!("{} startet (versuch {})", f("program"), f("attempt")))),
@@ -336,13 +354,13 @@ impl Steps {
             "wlan" => name == "netdev.registered",
             "snd" => matches!(name, "hda.probe" | "hda.output"),
             "dcn" => name == "attached",
-            "gx" => matches!(name, "state.classified" | "gfx.booted" | "boot.start" | "boot.no_chip" | "boot.up" | "boot.failed"),
+            "gx" => matches!(name, "state.classified" | "gfx.booted" | "boot.start" | "boot.no_chip" | "boot.read_only" | "boot.up" | "boot.failed" | "boot.engines_up"),
             "mcp" => matches!(name, "server.start" | "server.not_started" | "server.start_failed"),
             "ul" => matches!(name, "init.start" | "init.off" | "init.died" | "init.given_up"),
             "console" => matches!(
                 name,
                 "desktop.off" | "desktop.wait" | "desktop.held" | "desktop.start" | "desktop.failed" | "desktop.up" | "desktop.given_up"
-                    | "desktop.ended" | "desktop.slow" | "desktop.no_init"
+                    | "desktop.ended" | "desktop.slow" | "desktop.no_init" | "desktop.no_gpu"
             ),
             // The ktest `in.boot.watch` checks the path without touching the live list (`map` ignores it).
             "ktest" => name == "in.boot.watch",
@@ -409,7 +427,7 @@ impl Steps {
         if failed.is_empty() { format!("Bereit nach {}.", seconds(last)) } else { format!("Bereit nach {}, Fehler bei {}.", seconds(last), failed.join(", ")) }
     }
 
-    /// `/proc/bitsos/boot` (DS-5's interface, see plan/notes/in-DS-4.md): `screen` is the boot screen's state,
+    /// `/proc/bitsos/boot` (DS-5's interface, plan/spec/usb.md §4.3 "Boot screen and desktop start"): `screen` is the boot screen's state,
     /// `drawn` the `seq` it last drew.
     pub fn proc_text(&self, screen: &str, drawn: u64) -> String {
         let mut s = format!("bitsos-boot 1\nseq {}\ndrawn {drawn}\nscreen {screen}\ngeneration {}\n", self.seq, self.generation);
@@ -417,6 +435,7 @@ impl Steps {
             let st = self.get(k);
             s.push_str(&format!("step {} {} {} {}\n", k.id(), st.state.name(), st.t_ms, st.detail));
         }
+        s.push_str(&self.marks.proc_lines());
         s
     }
 
@@ -436,6 +455,7 @@ impl Steps {
                     let detail = Detail::from(w.next().unwrap_or(""));
                     st.steps[k.index()] = Step { state, detail, t_ms };
                 }
+                "mark" => st.marks.parse_line(w.next()?, w.next()?),
                 _ => {}
             }
         }

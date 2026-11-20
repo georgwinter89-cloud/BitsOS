@@ -488,7 +488,7 @@ fn record_locks() -> TestResult {
         kassert!(i32::from_le_bytes(ex[0..4].try_into().unwrap_or([0; 4])) == F_OWNER_PID && u32::from_le_bytes(ex[4..8].try_into().unwrap_or([0; 4])) == a.p.pid, "F_GETOWN_EX {ex:?}");
         expect("F_SETOWN(no such pid)", a.fcntl(&[fa as u64, F_SETOWN, 4_000_000]), -ESRCH)?;
         // INT-A2a: with FS-10 every tmpfs file is a shmem file whose seals start at F_SEAL_SEAL
-        // (linux-6.6/mm/shmem.c:2464), so memfd_add_seals answers EPERM (mm/memfd.c), as AB-5 CR5 saw on CachyOS.
+        // (linux-7.3.1/mm/shmem.c:3059), so memfd_add_seals answers EPERM (mm/memfd.c), as AB-5 CR5 saw on CachyOS.
         expect("F_ADD_SEALS on a tmpfs file (not a memfd)", a.fcntl(&[fa as u64, F_ADD_SEALS, 1]), -EPERM)?;
         expect("F_DUPFD (FS's part)", a.fcntl(&[fa as u64, F_DUPFD, 40]), 40)?;
     }
@@ -755,12 +755,14 @@ fn programs() -> TestResult {
         }
         return ktest::fail("the user/abi-tests programs are not in this image (no musl sysroot when it was built)");
     }
-    let modes: [(&str, &str); 5] = [
+    let modes: [(&str, &str); 6] = [
         ("timerfd", include_str!("../../../user/abi-tests/expected/ab5-timerfd.txt")),
         ("prctl", include_str!("../../../user/abi-tests/expected/ab5-prctl.txt")),
         ("misc", include_str!("../../../user/abi-tests/expected/ab5-misc.txt")),
         ("flock", include_str!("../../../user/abi-tests/expected/ab5-flock.txt")),
         ("fcntl", include_str!("../../../user/abi-tests/expected/ab5-fcntl.txt")),
+        // L7-RESTE-FS: CachyOS's transcript (vfs records FMODE_CREATED at the open that made the file).
+        ("created", include_str!("../../../user/abi-tests/expected/ab5-created.txt")),
     ];
     let mut skipped = Vec::new();
     for (mode, want) in modes {

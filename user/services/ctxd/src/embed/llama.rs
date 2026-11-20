@@ -25,6 +25,8 @@ pub struct LlamaCpu {
     id: String,
     dim: usize,
     restarts: Mutex<(u32, Instant)>,
+    /// B4: llama-server runs in the Background class (started from a thread that took it, prio.rs).
+    background: bool,
 }
 
 /// Closing the wrapper's stdin makes it kill llama-server; then the wrapper exits by itself.
@@ -63,7 +65,7 @@ fn socket_path(data: &Path) -> PathBuf {
 }
 
 impl LlamaCpu {
-    pub fn start(cfg: &EmbedderCfg, data: &Path) -> Result<LlamaCpu, String> {
+    pub fn start(cfg: &EmbedderCfg, data: &Path, background: bool) -> Result<LlamaCpu, String> {
         let model = cfg.model_path();
         let server = cfg.server_path();
         if !model.is_file() {
@@ -84,6 +86,7 @@ impl LlamaCpu {
             id: String::new(),
             dim: 0,
             restarts: Mutex::new((0, Instant::now())),
+            background,
         };
         me.spawn()?;
         let v = me
@@ -114,8 +117,8 @@ impl LlamaCpu {
         }
         // A small sh wrapper ends llama-server when ctxd's end of the stdin pipe closes, also after a
         // kill -9 of ctxd (no orphaned model process), and exits when llama-server exits.
-        let child = Command::new("/bin/sh")
-            .arg("-c")
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
             .arg(r#"exec 3<&0; "$0" "$@" </dev/null & p=$!; ( read _ <&3; kill $p 2>/dev/null ) & wait $p"#)
             .arg(&self.server)
             .arg("-m")
@@ -128,8 +131,8 @@ impl LlamaCpu {
             .arg(&self.sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log2))
-            .spawn()
+            .stderr(Stdio::from(log2));
+        let child = if self.background { crate::prio::in_background(|| cmd.spawn()) } else { cmd.spawn() }
             .map_err(|e| format!("spawn llama-server: {e}"))?;
         crate::event!("info", "embedder.spawn", pid = child.id());
         *self.child.lock().map_err(|_| "poisoned")? = Some(child);

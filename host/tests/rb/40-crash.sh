@@ -17,7 +17,7 @@
 #           rb_crash_level_three; boot 2 sees exception=true. RB-13: the controller is stopped here too, before
 #           the delay, and the record names it.
 #   part 3, panic=halt (RB-13): the halt leaves the devices alone: no xHCI stop, watchdog grace or reset step.
-# Needs the desk's panic handler to call kexec::crash::report (change request 1 in plan/notes/rb-RB-2.md);
+# Needs the desk's panic handler to call kexec::crash::report (RB-2's change request 1);
 # without it the scenario says SKIPPED, and BITSOS_RB_CRASH=required turns that into RED.
 # Ports: the listener on LO+310 (never 6666).
 set -eu
@@ -36,7 +36,7 @@ if ! grep -q "kexec::crash::report(info)" kernel/src/main.rs; then
         echo "RED: BITSOS_RB_CRASH=required but kernel/src/main.rs's panic handler does not call kexec::crash::report(info) (change request 1)"
         exit 1
     fi
-    echo "GREEN (SKIPPED: kernel/src/main.rs's panic handler does not call kexec::crash::report(info) yet; change request 1 in plan/notes/rb-RB-2.md)"
+    echo "GREEN (SKIPPED: kernel/src/main.rs's panic handler does not call kexec::crash::report(info) yet; RB-2's change request 1, plan/spec/robustness.md §3)"
     exit 0
 fi
 STOP_FIRST=yes

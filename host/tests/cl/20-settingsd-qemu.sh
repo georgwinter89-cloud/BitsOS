@@ -3,13 +3,14 @@
 # CL-1 on V2 (QEMU): a normal boot with MCP; the static musl settingsd is sent with write_file (it is not in the
 # initramfs until CL-1 CR1) and started from the console's BusyBox shell (uid 0, as init will start it after
 # CR2) by typing with send_keys; its client runs as uid 1000 through MCP `run`: set/apply/undo for every
-# key, R8 switches refused, kernel keys as CONFIG.TXT lines with the guarded lines unchanged, values and journal
+# key (a loosening of the AI's levels or ctxd's privacy refused as not_confirmer, a tightening taken), R8
+# switches refused, kernel keys as CONFIG.TXT lines with the guarded lines unchanged, values and journal
 # after a restart, the fallback without a stick. Afterwards the image is read on the host with mtools: the
 # settings file is a plain FAT file Georg can read on the Gaming-PC. Ports: lane range + 20.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 ROOT="$(pwd)"
-for t in python3 mtype; do command -v $t >/dev/null || { echo "SKIP: $t missing"; exit 0; }; done
+for t in python3 mtype; do command -v $t >/dev/null || { echo "RED: $t missing on this host (this scenario needs it)"; exit 1; }; done
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/cl-20-settingsd-qemu}"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(realpath "$RUN_DIR")"
@@ -23,7 +24,7 @@ NAME=cl-settingsd
     > "$RUN_DIR/build.log" 2>&1 || { tail -20 "$RUN_DIR/build.log"; echo "RED: musl build"; exit 1; }
 BIN="$ROOT/target/x86_64-unknown-linux-musl/release/settingsd"
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;wlan=off;nvme_write=off"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;nvme_write=off"
 rm -f "$LOG"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 500 --serial-log "$LOG" \
     > "$RUN_DIR/qemu.out" 2>&1 &

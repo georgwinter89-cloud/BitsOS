@@ -179,6 +179,50 @@ fn udp_over_loopback() {
     p.close(again);
 }
 
+/// A datagram costs its receive buffer more than its bytes (Linux: the skb's truesize), so datagrams without
+/// payload fill it too: the queue of a socket that never reads is bounded (it grew without end before).
+#[test]
+fn loopback_udp_queue_is_bounded_for_empty_datagrams() {
+    stack();
+    let ns = ns();
+    let p = Prog::new(&ns, 32, 1000);
+    let a = p.socket(AF_INET, SOCK_DGRAM) as u64;
+    let b = p.socket(AF_INET, SOCK_DGRAM) as u64;
+    assert_eq!(bind(&p, a, &lo(24620)), 0);
+    assert_eq!(p.setopt_int(a, SOL_SOCKET, SO_RCVBUF, 4096), 0);
+    assert_eq!(p.getopt_int(a, SOL_SOCKET, SO_RCVBUF), 8192);
+    for _ in 0..1000 {
+        assert_eq!(p.sendto(b, b"", &lo(24620)), 0, "a full receiver is not the sender's error");
+    }
+    // 768 bytes each: ten fit into 8192.
+    let mut got = 0;
+    while p.recv(a, 8, MSG_DONTWAIT).0 == 0 {
+        got += 1;
+    }
+    assert_eq!(got, 10);
+    assert_eq!(p.recv(a, 8, MSG_DONTWAIT).0, -EAGAIN);
+    // Read empty, the buffer takes datagrams again; payload counts on top.
+    for _ in 0..1000 {
+        assert_eq!(p.sendto(b, &[7u8; 256], &lo(24620)), 256);
+    }
+    let mut got = 0;
+    while p.recv(a, 512, MSG_DONTWAIT).0 == 256 {
+        got += 1;
+    }
+    assert_eq!(got, 8, "(256 + 768) bytes each");
+    // An empty queue takes one datagram of any size (the smallest SO_RCVBUF is 2304), a second one waits its turn.
+    assert_eq!(p.setopt_int(a, SOL_SOCKET, SO_RCVBUF, 1), 0);
+    assert_eq!(p.getopt_int(a, SOL_SOCKET, SO_RCVBUF), 2304);
+    assert_eq!(p.sendto(b, &[1u8; 3000], &lo(24620)), 3000);
+    assert_eq!(p.sendto(b, &[2u8; 3000], &lo(24620)), 3000);
+    assert_eq!(p.recv(a, 4096, MSG_DONTWAIT), (3000, [1u8; 3000].to_vec()));
+    assert_eq!(p.recv(a, 4096, MSG_DONTWAIT).0, -EAGAIN, "the second found the buffer full");
+    assert_eq!(p.sendto(b, &[3u8; 3000], &lo(24620)), 3000);
+    assert_eq!(p.recv(a, 4096, MSG_DONTWAIT), (3000, [3u8; 3000].to_vec()));
+    p.close(a);
+    p.close(b);
+}
+
 #[test]
 fn inet_creation_errors() {
     stack();
@@ -368,7 +412,7 @@ fn inet_epoll_wakes_on_every_change() {
 }
 
 /// NW-10 fixer: TCP_QUICKACK reads back !pingpong as on Linux (1 on a fresh socket, `do_tcp_getsockopt`
-/// linux-6.6/net/ipv4/tcp.c:4023); 0 and 1 switch it, and listen() clears it.
+/// linux-7.3.1/net/ipv4/tcp.c:4578); 0 and 1 switch it, and listen() clears it.
 #[test]
 fn tcp_quickack_reads_back_as_linux() {
     stack();

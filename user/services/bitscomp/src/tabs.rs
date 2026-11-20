@@ -25,7 +25,8 @@ impl Strip {
 
 /// The room tabs (and the chip) may use: x from, x to.
 fn room(f: Rect, t: &Theme) -> (i32, i32) {
-    (f.x + t.border + t.tab_pad, float_button(f, t).x - t.tab_pad)
+    // C (12.11.): the minimise button left of the float button (`zones::min_button`) ends the room.
+    (f.x + t.border + t.tab_pad, float_button(f, t).x - 2 - t.button_size - t.tab_pad)
 }
 
 /// The strip of a header `f` for `n` pages of which `shown` is shown; the shown tab is always drawn.

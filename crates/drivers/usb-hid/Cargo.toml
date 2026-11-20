@@ -16,6 +16,8 @@ mcp = { path = "../../mcp" }
 pci = { path = "../../pci" }
 sched = { path = "../../sched" }
 time = { path = "../../time" }
+# GM-6p: the battery ktest reads its /sys/class/power_supply files.
+vfs = { path = "../../vfs" }
 
 [lints]
 workspace = true

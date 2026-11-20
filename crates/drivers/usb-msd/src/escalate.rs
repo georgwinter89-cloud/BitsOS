@@ -2,8 +2,9 @@
 //! in place, the same after a pause, the same with the port's power off and on, and only then giving up (the device
 //! detached and its port enumerated afresh, a new disk). Each rung is taken once until a command passes again.
 //!
-//! Linux has the same pieces in another order (linux-6.6/drivers/usb/storage/transport.c:904-925: a transport error
-//! costs a port reset at once, a class reset only if that fails; the SCSI error handler above asks TEST UNIT READY):
+//! Linux has the same pieces in another order (linux-7.3.1/drivers/usb/storage/transport.c:903-930: a transport
+//! error costs a port reset at once, a class reset only if that fails; the SCSI error handler above asks TEST UNIT
+//! READY):
 //! here the cheap reset comes first, and `Bot::answers` asks after each rung. A failed command with a good CSW (a
 //! medium error) never comes here: the transport works. The first command that reached the medium and passed starts
 //! over (a TEST UNIT READY or a READ CAPACITY a firmware answers from memory proves little: a stick answering those but

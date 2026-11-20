@@ -1,4 +1,4 @@
-/* YT-4a (taken over by INT-W6 from plan/notes/yt-YT-4a-abi-nplb.c): binary abi-nplb.
+/* YT-4a: binary abi-nplb.
  * The three calls behind nplb failures on V2: readlink("") (fs/stat.c:490-494: ENOENT), socket(AF_INET6) with the
  * options nplb sets (net/ipv6/af_inet6.c:119), and /etc/localtime as a link into a zoneinfo directory (Starboard's
  * time_zone_get_name.cc reads only the link target). Host-independent output: no zone name, no addresses. */

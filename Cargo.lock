@@ -7,6 +7,7 @@ name = "acpi"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "gp-platform",
  "hal",
  "klog",
  "kreg",
@@ -76,8 +77,10 @@ dependencies = [
  "mm",
  "mm-core",
  "pci",
+ "platform",
  "policy",
  "proc",
+ "rdna4-core",
  "sched",
  "time",
  "uapi",
@@ -111,6 +114,7 @@ name = "bitsboot"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "gp-platform",
  "log",
  "uefi",
  "zeroize",
@@ -131,6 +135,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitsver"
+version = "0.1.0"
+
+[[package]]
 name = "bitsvol"
 version = "0.1.0"
 dependencies = [
@@ -146,9 +154,11 @@ name = "block"
 version = "0.1.0"
 dependencies = [
  "devmodel",
+ "gp-platform",
  "klog",
  "ksync",
  "ktest",
+ "mm-core",
  "sched",
  "uapi",
  "vfs",
@@ -208,6 +218,7 @@ dependencies = [
  "devmodel",
  "display",
  "fontdue",
+ "gp-report",
  "hal",
  "klog",
  "kreg",
@@ -513,6 +524,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gp-platform"
+version = "0.1.0"
+
+[[package]]
+name = "gp-report"
+version = "0.1.0"
+
+[[package]]
 name = "hal"
 version = "0.1.0"
 dependencies = [
@@ -599,6 +618,7 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "amdgpu",
+ "bitsver",
  "bitsvol",
  "block",
  "bootinfo",
@@ -612,6 +632,8 @@ dependencies = [
  "fs-ext4",
  "fs-fat",
  "gopfb",
+ "gp-platform",
+ "gp-report",
  "hal",
  "hda",
  "igc",
@@ -631,6 +653,7 @@ dependencies = [
  "policy",
  "policy-mcp",
  "proc",
+ "rtl8126",
  "rtw89",
  "sched",
  "sched-mcp",
@@ -641,6 +664,7 @@ dependencies = [
  "time",
  "tpm",
  "uapi",
+ "usb-audio",
  "usb-core",
  "usb-hid",
  "usb-msd",
@@ -659,11 +683,13 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "bitsboot",
+ "bitsver",
  "block",
  "bootinfo",
  "console",
  "devmodel",
  "fs-fat",
+ "gp-platform",
  "hal",
  "klog",
  "kreg",
@@ -675,6 +701,7 @@ dependencies = [
  "net",
  "pci",
  "platform",
+ "proc",
  "sched",
  "time",
  "uapi",
@@ -776,12 +803,14 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "bitsboot",
+ "bitsver",
  "block",
  "bootinfo",
  "console",
  "devmodel",
  "display",
  "fs-fat",
+ "gp-platform",
  "hal",
  "klog",
  "kreg",
@@ -876,7 +905,9 @@ dependencies = [
  "devmodel",
  "fs-ext4",
  "fs-fat",
+ "gp-platform",
  "hal",
+ "kexec",
  "klog",
  "kreg",
  "ksync",
@@ -914,6 +945,7 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "dcn314-regs",
+ "gp-platform",
  "hal",
  "klog",
  "kreg",
@@ -924,6 +956,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "perf-abi"
+version = "0.1.0"
+
+[[package]]
 name = "platform"
 version = "0.1.0"
 dependencies = [
@@ -931,6 +967,7 @@ dependencies = [
  "block",
  "bootinfo",
  "devmodel",
+ "gp-platform",
  "hal",
  "klog",
  "kreg",
@@ -1032,6 +1069,39 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "rdna4-core"
+version = "0.1.0"
+
+[[package]]
+name = "rdna4-gen"
+version = "0.1.0"
+
+[[package]]
+name = "rdna4-regs"
+version = "0.1.0"
+dependencies = [
+ "rdna4-core",
+]
+
+[[package]]
+name = "rtl8126"
+version = "0.1.0"
+dependencies = [
+ "devmodel",
+ "hal",
+ "klog",
+ "kreg",
+ "ksync",
+ "ktest",
+ "mm",
+ "net",
+ "pci",
+ "sched",
+ "time",
+ "vfs",
+]
 
 [[package]]
 name = "rtw89"
@@ -1218,9 +1288,12 @@ dependencies = [
 name = "syscall"
 version = "0.1.0"
 dependencies = [
+ "acpi",
+ "bitsver",
  "block",
  "console",
  "hal",
+ "kexec",
  "klog",
  "kreg",
  "ksync",
@@ -1228,6 +1301,7 @@ dependencies = [
  "mm",
  "mm-core",
  "net",
+ "perf-abi",
  "platform",
  "policy",
  "proc",
@@ -1235,6 +1309,7 @@ dependencies = [
  "seccomp",
  "time",
  "uapi",
+ "usb-core",
  "vfs",
 ]
 
@@ -1263,6 +1338,7 @@ name = "time"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "gp-platform",
  "hal",
  "klog",
  "kreg",
@@ -1287,6 +1363,10 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "uac2"
+version = "0.1.0"
 
 [[package]]
 name = "uapi"
@@ -1354,6 +1434,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 name = "usb-audio"
 version = "0.1.0"
 dependencies = [
+ "gp-platform",
  "klog",
  "kreg",
  "ksync",
@@ -1361,6 +1442,7 @@ dependencies = [
  "pci",
  "sched",
  "time",
+ "uac2",
  "usb-core",
 ]
 
@@ -1388,6 +1470,7 @@ dependencies = [
  "sched",
  "time",
  "usb-core",
+ "vfs",
 ]
 
 [[package]]
@@ -1557,7 +1640,9 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "bitsos-install",
+ "bitsver",
  "bootinfo",
+ "gp-platform",
  "ktest",
 ]
 

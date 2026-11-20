@@ -1,17 +1,18 @@
-//! WY-17 (gx-scout-mesa.md C3): the renderer draws straight into what the screen shows. V2's fbdev hands its two
+//! WY-17: the renderer draws straight into what the screen shows. V2's fbdev hands its two
 //! windows out as dma-bufs (FBIO_BITSOS_SCANOUT, gopfb fbdev/scanout.rs; ENOTTY on Linux and on a kernel without it):
 //! with a flipping display engine they are the scanout buffers themselves, without one fb0's RAM. The renderer
 //! imports them as render targets and draws into the hidden one; FBIOPAN_DISPLAY flips (same mode, same resolution,
 //! the flips the driver already does: GX-D9), and no CPU copy of the picture exists any more. Damage tracking stays:
 //! a window is two frames old when it comes back, so the tracker draws at age 2 (`Flip::aim`).
 //!
-//! `start` chooses at start, once, and logs it. Whatever is missing leaves today's readback path exactly as it is:
-//! the renderer draws by CPU, no render node, a kernel without the ioctl, an import the EGL refuses. Later, a refused
-//! pan or a screen that went back ends the direct path for good (`Fbdev::leave_direct`): readback from then on.
+//! `start` takes the windows at start and says so; it is the only way frames reach the screen, so a kernel without the
+//! ioctl or an import the EGL refuses ends bitscomp with that line. Later, a refused pan or a screen that went back
+//! ends the windows of this hold (`Fbdev::end_direct`): the main loop takes them again with `start`, and only when
+//! that fails does bitscomp end.
 
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
-use super::Backend;
+use super::fbdev::Fbdev;
 use crate::render::Composer;
 
 /// V2's `_IOWR('F', 0xB4, struct bitsos_fb_scanout)` (48 bytes).
@@ -76,35 +77,16 @@ fn call(fd: RawFd, op: u32, window: u32) -> std::io::Result<Args> {
     })
 }
 
-/// One window as the renderer imports it (only the gpu build has a renderer that does).
+/// One window as the renderer imports it.
 #[derive(Debug)]
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub struct Window {
     pub fd: OwnedFd,
     pub offset: u32,
     pub stride: u32,
 }
 
-impl Window {
-    /// Whether the window maps for writing, which a software rasteriser's import takes for granted (llvmpipe crashes
-    /// on a dma-buf whose mmap fails, instead of refusing it: seen with wy/88's `badfd`).
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    pub fn maps(&self, height: i32) -> Result<(), String> {
-        let len = (self.offset as usize + self.stride as usize * height as usize).max(1);
-        // SAFETY: a fresh shared mapping of `len` bytes of an fd we hold, unmapped below; nothing touches it.
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(&self.fd), 0) };
-        if p == libc::MAP_FAILED {
-            return Err(format!("the window does not map: {}", std::io::Error::last_os_error()));
-        }
-        // SAFETY: the mapping just made, whole.
-        unsafe { libc::munmap(p, len) };
-        Ok(())
-    }
-}
-
 /// The two windows, with what they are.
 #[derive(Debug)]
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub struct Windows {
     pub list: Vec<Window>,
     pub size: (i32, i32),
@@ -160,13 +142,11 @@ pub fn end(fd: RawFd) -> std::io::Result<()> {
 /// the damage tracker counted a frame that neither window got whole (Smithay records the damage before it draws), so
 /// both are redrawn. A frame counts as failed until `finished` says otherwise, so an early return cannot forget it.
 #[derive(Debug, Default)]
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub struct Redraw {
     owed: u8,
     after: u8,
 }
 
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 impl Redraw {
     /// A frame starts at `age`: the age it draws at.
     pub fn start(&mut self, age: usize) -> usize {
@@ -181,58 +161,15 @@ impl Redraw {
     }
 }
 
-/// `--scanout`: what the start may choose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Want {
-    /// Direct when everything is there, a render node included (the default).
-    Auto,
-    /// Direct without asking for a node (a host test's fake, a QEMU comparison).
-    Direct,
-    /// Today's path, whatever the machine could do.
-    Readback,
-}
-
-impl Want {
-    pub fn parse(v: &str) -> Option<Want> {
-        match v {
-            "auto" => Some(Want::Auto),
-            "direct" => Some(Want::Direct),
-            "readback" => Some(Want::Readback),
-            _ => None,
-        }
-    }
-}
-
-/// Why the start does not even try; Ok: it asks the back end and the renderer.
-pub fn plan(want: Want, renderer: &str, node: Option<&str>) -> Result<(), String> {
-    if want == Want::Readback {
-        return Err("--scanout readback".into());
-    }
-    if renderer != "gles" {
-        return Err(format!("renderer {renderer} draws by CPU"));
-    }
-    if want == Want::Auto && node.is_none() {
-        return Err("no render node".into());
-    }
+/// Takes the output's windows as the renderer's targets; why not, said by the caller.
+pub fn start(backend: &mut Fbdev, comp: &mut dyn Composer) -> Result<(), String> {
+    let w = backend.scanout_windows()?;
+    let engine = w.engine;
+    comp.adopt_scanout(w)?;
+    backend.scanout_on();
+    let what = if engine { "the scanout buffers" } else { "fb0's memory" };
+    eprintln!("bitscomp: scanout: {} draws into two dma-buf windows of {what} and flips", comp.renderer());
     Ok(())
-}
-
-/// The choice, made once at start and said once.
-pub fn start(backend: &mut dyn Backend, comp: &mut dyn Composer, want: Want, node: Option<&str>) {
-    let tried = plan(want, comp.renderer(), node).and_then(|()| {
-        let w = backend.scanout_windows()?;
-        let engine = w.engine;
-        comp.adopt_scanout(w)?;
-        Ok(engine)
-    });
-    match tried {
-        Ok(engine) => {
-            backend.scanout_on();
-            let what = if engine { "the scanout buffers" } else { "fb0's memory" };
-            eprintln!("bitscomp: scanout: direct: {} draws into two dma-buf windows of {what} and flips, no copy of the picture", comp.renderer());
-        }
-        Err(why) => eprintln!("bitscomp: scanout: readback: {why}"),
-    }
 }
 
 #[cfg(test)]
@@ -292,17 +229,6 @@ mod tests {
         assert_eq!(r.unwrap(), 7);
         let e = retrying(|| -> std::io::Result<()> { Err(std::io::Error::from_raw_os_error(libc::EIO)) }).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EIO), "any other error is one");
-    }
-
-    #[test]
-    fn the_start_tries_only_with_a_gpu_renderer_and_a_node() {
-        let n = Some("/dev/dri/renderD128");
-        assert_eq!(plan(Want::Auto, "gles", n), Ok(()));
-        assert_eq!(plan(Want::Auto, "gles", None), Err("no render node".into()));
-        assert_eq!(plan(Want::Direct, "gles", None), Ok(()), "a test's fake needs no node");
-        assert_eq!(plan(Want::Auto, "pixman", n), Err("renderer pixman draws by CPU".into()));
-        assert_eq!(plan(Want::Direct, "pixman", n), Err("renderer pixman draws by CPU".into()));
-        assert_eq!(plan(Want::Readback, "gles", n), Err("--scanout readback".into()));
     }
 
     #[test]

@@ -90,14 +90,27 @@ def sample(d):
     if t == "int":
         return s["min"] if default == s["max"] else s["max"]
     if t == "choice":
-        return next(x for x in s["choices"] if x != default)
+        # A key with one choice has no other value (cl/20: "fixed keys keep their one value").
+        return next((x for x in s["choices"] if x != default), None)
     if t == "color":
         return "#123abc"
+    # The provider list and the roles take provider names only (settingsd providers.rs, CL-5s).
+    if t == "text" and (d["key"] == "ai.providers" or d["key"].startswith("ai.role.")):
+        return "probe"
     if t == "text":
         return "Test Font"
     if t == "logspec":
         return "warn,net=debug"
     raise SystemExit(f"RED: no sample for {d['key']}")
+
+
+# Keys whose loosening is Georg's own yes (settingsd leash.rs): through MCP a change that allows more is refused
+# with not_confirmer, also as an undo. cl/20 checks the rule key by key; here it only must not be taken for a fault.
+LEASHED = {"ai.level", "ai.mcp.ask_tools"}
+
+
+def leashed(key):
+    return key in LEASHED or key.startswith("context.")
 
 
 def read_file(c, path):
@@ -143,6 +156,17 @@ def main():
         d = ok(c, "settings_describe", {"key": key})["key"]
         before = ok(c, "settings_get", {"key": key})["value"]
         v = sample(d)
+        if v is None:
+            need(d["schema"].get("choices") == [before], f"{key}: one choice, it keeps its one value", d)
+            continue
+        if leashed(key):
+            err, text = call(c, "settings_set", {"key": key, "value": v})
+            if err:
+                need("not_confirmer" in text and ok(c, "settings_get", {"key": key})["value"] == before, f"{key}: a loosening set is Georg's own yes, refused, nothing changed", text)
+                continue
+            err, text = call(c, "settings_undo", {"n": 1})
+            need(not err or ("not_confirmer" in text and ok(c, "settings_get", {"key": key})["value"] == v), f"{key}: set, and its undo is done or refused as a loosening", text)
+            continue
         a = ok(c, "settings_set", {"key": key, "value": v})
         need(a.get("changed") is True and "applied" in a and "restart" in a, f"{key} set: applied {a.get('applied')}", a)
         got = ok(c, "settings_get", {"key": key})["value"]

@@ -86,6 +86,9 @@ impl App {
     pub fn suggestions(&self) -> Vec<Row> {
         let Some(e) = &self.desk.edit else { return Vec::new() };
         let rows = build(&e.text, &self.desk.favourites, &self.setting_keys, &self.session.recent_addresses(), &programs(&self.library));
+        // DB4: "Gerade passend" after the favourites, the programs by how often they are picked.
+        let rank = |a: &str| self.habit.ranks.get(a).copied().unwrap_or(0.0);
+        let rows = crate::passend::address_rows(rows, &e.text, &self.library, &self.habit.shown, &rank);
         let (_, placed) = layout(&rows, self.edit_field(), self.area_full().h - 8);
         rows.into_iter().take(placed.len()).collect()
     }

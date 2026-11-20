@@ -19,7 +19,9 @@
 # Language: settings.language (de or en, settingsd) picks LANG de_DE.UTF-8 or en_US.UTF-8 (dates, numbers, paper);
 # the menus are German only when the tree has the German language pack (stage-v2.sh with libreoffice-fresh-de).
 # The LO_* settings exist for tests: a fake tree and mount table on the build host; LO_HOME (a home of its own, the
-# ktest ul.pkg.libreoffice_convert's scratch folder, so a test never touches the user's profile).
+# ktest ul.pkg.libreoffice_convert's scratch folder, so a test never touches the user's profile); LO_TEST_NO_OPENCL=1
+# (host/tests/lo/05-stage.sh only: the build host has an OpenCL driver of its own, Mesa's rusticl, whose probe would
+# reach the build host's GPU; V2's tree and system have none).
 MNT=${LO_MOUNT:-/boot}
 T=${LO_TREE:-$MNT/BITSOS2/libreoffice}
 DATA=${LO_DATA:-/data}
@@ -28,6 +30,8 @@ HOME_DATA=$DATA/home/1000
 STATE=${LO_DATA_STATE:-/run/bitsos/data-state}
 MOUNTS=${LO_MOUNTS:-/proc/self/mounts}
 USER_RUN=${LO_USER_RUN:-/run/user/1000}
+A11Y_BUS=${LO_A11Y_BUS:-$USER_RUN/at-spi/bus}
+if [ -S "$A11Y_BUS" ]; then A11Y_ENV="AT_SPI_BUS_ADDRESS=unix:path=$A11Y_BUS"; else A11Y_ENV=NO_AT_BRIDGE=1; fi
 TMP=${LO_TMP:-/tmp}
 PATH=${LO_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
 export PATH
@@ -40,6 +44,20 @@ MAX_RESTARTS=3
 NOMAKE=
 
 say() { echo "libreoffice: $*"; }
+# theme.mode "auto" ("Nach Uhrzeit", WY-SET) is light from theme.auto.light_from to theme.auto.dark_from (whole
+# local hours, 7 and 19 unless set, also across midnight), dark the rest: the rule of bitscomp's theme_auto.rs.
+# THEME_HOUR stands in for the clock in host tests.
+hour_or() { # value, default: a whole hour 0..23 (bitscomp clamps the same way)
+  case $1 in ''|*[!0-9]*) echo "$2"; return ;; esac
+  _tn=$(expr "$1" + 0); [ "$_tn" -le 23 ] || _tn=23; echo "$_tn"
+}
+theme_dark() { # mode: true when the desktop is dark now
+  [ "$1" = auto ] || { [ "$1" = dark ]; return; }
+  _th=$(hour_or "${THEME_HOUR:-$(date +%H 2>/dev/null)}" 0)
+  _tf=$(hour_or "$(settings get theme.auto.light_from 2>/dev/null)" 7)
+  _tt=$(hour_or "$(settings get theme.auto.dark_from 2>/dev/null)" 19)
+  if [ "$_tf" -le "$_tt" ]; then [ "$_th" -lt "$_tf" ] || [ "$_th" -ge "$_tt" ]; else [ "$_th" -lt "$_tf" ] && [ "$_th" -ge "$_tt" ]; fi
+}
 case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
 
 tree_ok() {
@@ -204,8 +222,10 @@ running() {
 }
 
 # soffice.bin in a clean environment pointing into the tree: libraries, fontconfig, GTK 3 on bitscomp's Wayland
-# (cursors, icons, schemas with the memory backend, the MIME database, gdk-pixbuf's glycin loader), no D-Bus,
-# accessibility bus, OpenCL or network printing (CUPS only through its local socket, R9). run_lo LOG ARGS: replaces
+# (cursors, icons, schemas with the memory backend, the MIME database, gdk-pixbuf's glycin loader), no D-Bus or
+# network printing (CUPS only through its local socket, R9). Calc's OpenCL is LibreOffice's own choice (DECISIONS
+# 18.11.: nothing switched off): the tree has no OpenCL driver, so its probe finds none and Calc counts on the CPU. The accessibility bus only while atspid runs
+# it (Durchblick, DB5a: GTK's bridge then hands LibreOffice's menus, dialogs and fields to it by address). run_lo LOG ARGS: replaces
 # the calling shell (call it with & or as the last step); LOG "-" keeps the output on this terminal.
 # shellcheck disable=SC2086,SC2016
 run_lo() {
@@ -217,11 +237,11 @@ run_lo() {
 lo_env() {
   exec env -i PATH="$PATH:$T/gtk/libexec" HOME="$H" LANG="$LNG" ${TZ:+TZ=$TZ} ${GTK_THEME:+GTK_THEME=$GTK_THEME} \
     ${WD:+XDG_RUNTIME_DIR="${WD%/*}"} ${WD:+WAYLAND_DISPLAY="${WD##*/}"} GDK_BACKEND=wayland LD_LIBRARY_PATH="$T/lib" \
-    SAL_USE_VCLPLUGIN="$VCL" SAL_DISABLE_OPENCL=1 \
+    SAL_USE_VCLPLUGIN="$VCL" ${LO_TEST_NO_OPENCL:+SAL_DISABLE_OPENCL=1} \
     FONTCONFIG_FILE="$T/etc/fonts/fonts.conf" XCURSOR_PATH="$T/gtk/share/icons" XCURSOR_THEME=Adwaita XCURSOR_SIZE="${XCURSOR_SIZE:-32}" \
     XDG_DATA_DIRS="$T/gtk/share" GSETTINGS_SCHEMA_DIR="$T/gtk/share/glib-2.0/schemas" GSETTINGS_BACKEND=memory \
     GDK_PIXBUF_MODULE_FILE="$T/gtk/etc/gdk-pixbuf/loaders.cache" CUPS_SERVER=/run/cups/cups.sock \
-    GTK_USE_PORTAL=0 NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: "$@"
+    GTK_USE_PORTAL=0 $A11Y_ENV DBUS_SESSION_BUS_ADDRESS=disabled: DBUS_SYSTEM_BUS_ADDRESS=disabled: "$@"
 }
 
 as_user
@@ -251,7 +271,7 @@ case "$1" in
     home_dir
     language >/dev/null
     VCL=gtk3 GTK_THEME=
-    [ "$(settings get theme.mode 2>/dev/null)" != dark ] || GTK_THEME=Adwaita:dark
+    ! theme_dark "$(settings get theme.mode 2>/dev/null)" || GTK_THEME=Adwaita:dark
     lo_env env ;;
 esac
 
@@ -280,7 +300,7 @@ home_line
 [ -z "$HOME_WHY" ] || say "Achtung: kein Datenträger unter $DATA, Dokumente und Einstellungen gehen beim Neustart verloren."
 language
 GTK_THEME=
-[ "$(settings get theme.mode 2>/dev/null)" != dark ] || GTK_THEME=Adwaita:dark
+! theme_dark "$(settings get theme.mode 2>/dev/null)" || GTK_THEME=Adwaita:dark
 # A start from / (bitscomp, MCP) opens its file dialogs and relative names in the home folder.
 [ "$(pwd)" != / ] || cd "$H" 2>/dev/null || :
 if [ -n "$HEADLESS" ]; then

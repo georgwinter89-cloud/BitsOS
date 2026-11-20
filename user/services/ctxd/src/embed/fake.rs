@@ -1,6 +1,6 @@
 //! Fake embedder (DESIGN §6.1): hashed character 3-grams of the folded words into a fixed dimension. No
 //! meaning, but deterministic and fast, so the pipeline, the formula and the crash tests run without a model.
-//! `CTXD_TEST_EMBED_DELAY_MS` slows every call (the kill -9 test uses it to hit the middle of indexing).
+//! Test build only (C1, `knobs`). `CTXD_TEST_EMBED_DELAY_MS` slows every call (the kill -9 test uses it to hit the middle of indexing).
 
 use super::{EmbedError, EmbedKind, Embedder, Health, normalize};
 use std::time::Duration;
@@ -13,7 +13,7 @@ pub struct Fake {
 
 impl Fake {
     pub fn new(dim: usize) -> Fake {
-        let delay = std::env::var("CTXD_TEST_EMBED_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let delay = crate::knobs::millis("CTXD_TEST_EMBED_DELAY_MS").unwrap_or(0);
         Fake { dim, delay: Duration::from_millis(delay), id: format!("fake/ngram3/{dim}") }
     }
 

@@ -1,0 +1,74 @@
+# GP-ROUND: tests of class GamingPc the real Gaming-PC has run, for `cargo xtask test`'s ledger
+# (host/xtask/src/ledger.rs, GAMINGPC_FILE): the remote desk fills it after a round, one line per test that passed
+# there (host/remote-desk/README.md, step "Record"). A test without a fresh line is a "stale" line, never red.
+# <test> <run> <yyyy-mm-dd> <generation>
+# GP-R2: round 1 (15.11.2026, generation 107, the remote desk on the Mini-PC under Windows): step 50 (gp.rtl.) and
+# step 51's filter; the 67 tests that passed, named from generation 107's registry (int/gp 7e89fc1e) with that
+# filter and the hardware rule (83 selected, 15 of QEMU or Mini-PC runs skipped, so.sysk.diskstats red).
+cp.acpi.live.guard remote 2026-11-15 107
+cp.acpi.live.madt remote 2026-11-15 107
+cp.acpi.live.summary remote 2026-11-15 107
+cp.acpi.live.tables remote 2026-11-15 107
+cp.acpi.reserved_read remote 2026-11-15 107
+cp.acpi.synthetic remote 2026-11-15 107
+cp.acpi.synthetic_hostile remote 2026-11-15 107
+cp.cpu.cr0 remote 2026-11-15 107
+cp.cpu.cr4 remote 2026-11-15 107
+cp.cpu.efer remote 2026-11-15 107
+cp.cpu.facts remote 2026-11-15 107
+cp.cpu.fpu_reset remote 2026-11-15 107
+cp.cpu.mca remote 2026-11-15 107
+cp.cpu.pat remote 2026-11-15 107
+cp.cpu.tsc_aux remote 2026-11-15 107
+cp.cpu.v3 remote 2026-11-15 107
+cp.cpu.vendor_paths remote 2026-11-15 107
+cp.cpu.xcr0 remote 2026-11-15 107
+cp.irq.alloc_free remote 2026-11-15 107
+cp.irq.firmware_lvts remote 2026-11-15 107
+cp.irq.ioapic_pins remote 2026-11-15 107
+cp.irq.ipi_physical remote 2026-11-15 107
+cp.irq.ipi_refused remote 2026-11-15 107
+cp.irq.lapic remote 2026-11-15 107
+cp.irq.owner_unmask remote 2026-11-15 107
+cp.irq.pic_masked remote 2026-11-15 107
+cp.irq.route_dispatch remote 2026-11-15 107
+cp.irq.self_ipi remote 2026-11-15 107
+cp.irq.spurious_vector remote 2026-11-15 107
+cp.irq.storm_mask remote 2026-11-15 107
+cp.irq.system_vector remote 2026-11-15 107
+cp.irq.unregistered remote 2026-11-15 107
+cp.msr.read_checked remote 2026-11-15 107
+cp.msr.try_read remote 2026-11-15 107
+cp.smp.all_up remote 2026-11-15 107
+cp.smp.ap_registers remote 2026-11-15 107
+cp.smp.apic_map remote 2026-11-15 107
+cp.smp.hwp remote 2026-11-15 107
+cp.smp.mtrr remote 2026-11-15 107
+cp.smp.spec_ctrl remote 2026-11-15 107
+cp.smp.topology remote 2026-11-15 107
+cp.time.calibration remote 2026-11-15 107
+cp.trap.foreign_gs remote 2026-11-15 107
+cp.trap.gp_resume remote 2026-11-15 107
+cp.trap.pf_resume remote 2026-11-15 107
+cp.trap.user_gs_window remote 2026-11-15 107
+gp.rtl.arp remote 2026-11-15 107
+gp.rtl.link remote 2026-11-15 107
+gp.rtl.ping remote 2026-11-15 107
+gp.rtl.probe remote 2026-11-15 107
+gp.rtl.registry remote 2026-11-15 107
+gp.rtl.report remote 2026-11-15 107
+rb.metrics.sources remote 2026-11-15 107
+rb.metrics.tool_answer remote 2026-11-15 107
+rb.metrics.tool_registered remote 2026-11-15 107
+sc.idle.config remote 2026-11-15 107
+sc.idle.fake_cst remote 2026-11-15 107
+sc.idle.live_plan remote 2026-11-15 107
+sc.idle.next_deadline remote 2026-11-15 107
+so.sysk.abi remote 2026-11-15 107
+so.sysk.dmi remote 2026-11-15 107
+so.sysk.hwmon_class remote 2026-11-15 107
+so.sysk.metrics_file remote 2026-11-15 107
+so.sysk.nvme_hwmon remote 2026-11-15 107
+so.sysk.pid_io remote 2026-11-15 107
+so.sysk.usb remote 2026-11-15 107
+so.sysk.wireless remote 2026-11-15 107

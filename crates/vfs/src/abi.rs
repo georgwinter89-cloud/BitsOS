@@ -105,7 +105,7 @@ pub const MAXSYMLINKS: u32 = 40;
 pub const UIO_MAXIOV: u64 = 1024;
 /// Largest file offset (`MAX_LFS_FILESIZE` on 64-bit).
 pub const MAX_FILE_SIZE: u64 = i64::MAX as u64;
-/// fallocate modes (linux-6.6/include/uapi/linux/falloc.h; FALLOC_FL_WRITE_ZEROES 0x80 is newer than 6.6 and
+/// fallocate modes (linux-7.3.1/include/uapi/linux/falloc.h:5-96; FALLOC_FL_WRITE_ZEROES 0x80 is newer than 6.6 and
 /// known to CachyOS's kernel, measured).
 pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
 pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;

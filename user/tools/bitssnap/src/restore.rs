@@ -10,10 +10,10 @@
 //! (fchdir) and every later step names one entry relative to it; the copy is built in a fresh root-only folder
 //! (0700) and gets its owners and modes only at the end, deepest first, so nobody can plant a link inside it
 //! meanwhile. Linux programs get the same from openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS
-//! (linux-6.6/include/uapi/linux/openat2.h, fs/namei.c).
+//! (linux-7.3.1/include/uapi/linux/openat2.h, fs/namei.c).
 //!
 //! Kept: contents, owners, modes (setuid/setgid too: owner before mode, as chown clears them,
-//! linux-6.6/fs/attr.c setattr_should_drop_suidgid), times, symlinks, hard links inside the copied tree, holes
+//! linux-7.3.1/fs/attr.c:63 setattr_should_drop_suidgid), times, symlinks, hard links inside the copied tree, holes
 //! of sparse files. Not copied but named in the report (`not_restored`): sockets, FIFOs and device nodes, on
 //! purpose (desk C1): a socket node is dead after a restore, a FIFO holds no data (whoever uses it makes it
 //! again), and a restore running as root must not make device nodes from a volume uid-1000 programs shape.

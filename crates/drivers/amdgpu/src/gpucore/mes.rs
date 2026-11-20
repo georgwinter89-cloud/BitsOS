@@ -750,6 +750,13 @@ impl PmQueue {
     pub fn new(base: u64, bytes: u64, rptr_wb: Option<u64>, wptr_mc: u64, doorbell: u32) -> Result<PmQueue, MesError> {
         Ok(PmQueue { ring: Ring::new(Kind::Gfx, bytes / 4, 0).map_err(MesError::Ring)?, base, rptr_wb, wptr_mc, doorbell, rptr_dw: 0 })
     }
+    /// A MES-mapped GFX or compute ring: commit pads with one counted NOP as gfx_v11_ring_insert_nop
+    /// (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c:566, :7110, :7156); the KIQ keeps single NOPs (:7189).
+    pub fn new_gfx(base: u64, bytes: u64, rptr_wb: Option<u64>, wptr_mc: u64, doorbell: u32) -> Result<PmQueue, MesError> {
+        let mut q = PmQueue::new(base, bytes, rptr_wb, wptr_mc, doorbell)?;
+        q.ring = q.ring.with_counted_nops();
+        Ok(q)
+    }
 
     /// The ring's pointer slots at 0 (the ring memory was zeroed with the BO).
     pub fn reset(&self, hw: &mut dyn Hw) -> Result<(), MesError> {

@@ -6,7 +6,8 @@
 # own Intel CPU and must stay normal). Safe mode writes nothing to the stick (whole image compared file by file),
 # starts the newest confirmed generation instead of spending a new one's try, withholds STICK.ID so the kernel
 # mounts the stick read-only, keeps the firmware's picture, and its CONFIG lines win over the stick's own.
-# CONFIG profile=normal turns it off; profile=gaming-pc turns it on anywhere.
+# GP-GUARD: on the board itself nothing on the stick ends safe mode (CONFIG profile=normal is refused and said so);
+# profile=gaming-pc turns it on anywhere. The tiers and the disks are 65-gp-tiers.sh's.
 . "$(dirname "$0")/lib.bash"
 
 INTEL=(-cpu SierraForest -smp 20,sockets=1,dies=1,modules=5,cores=4,threads=1)
@@ -25,7 +26,10 @@ want s-dmi "bitsboot profile.chosen name=gaming-pc reason=dmi: DMI names the Gam
 want_gen s-dmi 1 FALLBACK_AFTER_TRY 2 SAFE_MODE "the confirmed generation starts; the new one keeps its try"
 want s-dmi "bitsboot stick.id_withheld" "STICK.ID is withheld from the kernel"
 want_re s-dmi "bitsboot screen.kept wanted=firmware mode=[0-9]+ \(1280x800\)" "the firmware's picture stays"
-want_re s-dmi "kernel config values=\".*net_drivers=off.*nvme_write=off.*panic=halt.*profile=gaming-pc profile_reason=dmi screen=firmware stick_write=off.*usb_msd_write=off wlan=off" "the kernel got the safe-mode lines"
+want s-dmi "bitsboot profile.tiers net=off stick=off" "no tier is on"
+want_re s-dmi "kernel config values=\".*gp_net=off gp_stick=off.*nvme_bind=off nvme_write=off.*panic=halt.*profile=gaming-pc profile_reason=dmi screen=firmware stick_write=off.*usb_msd_write=off" "the kernel got the safe-mode lines"
+want s-dmi "block internal_disks.off" "the block layer keeps the internal disks off limits"
+refuse s-dmi "kernel profile.guard" "the loader forced every line itself"
 want_re s-dmi "block configured .*stick_id=false stick_write=false usb_msd_write=false nvme_write=false" "the block layer has every write switch off and no stick identity"
 want_re s-dmi "fat stick.decided .*rw=false.*bitsboot handed over no" "the kernel mounted the stick read-only"
 want_re s-dmi "display device name=gopfb width=1280 height=800" "the kernel draws on the firmware's picture"
@@ -41,18 +45,32 @@ else
     echo "  RED: the safe-mode boot changed the stick:"; cat "$RUN_DIR/sum.diff"; FAILED=1
 fi
 
-# 2. The same machine with profile=normal: the normal boot (generation 2 gets its try, the stick is writable).
-make_image bt-safe-off "ktest=fs.fat.tree;profile=normal"
+# 2. The same machine with profile=normal and every switch asked for: the board's DMI names beat the stick
+#    (plan/spec/gaming-pc.md §2). Nothing is relaxed, the refusal is said on the screen, and nothing is written.
+make_image bt-safe-off "ktest=fs.fat.tree;profile=normal;nvme_write=on;nvme_bind=on;stick_write=on;usb_msd_write=on;screen=1024x768"
 mark bt-safe-off 1 OK
 copy_gen bt-safe-off 2
 mark bt-safe-off 2 NEW
+snapshot bt-safe-off before >"$RUN_DIR/off-before.sum"
 boot bt-safe-off s-off 90 --net none --smp 20 -- "${INTEL[@]}" "${GPC_DMI[@]}"
-want s-off "bitsboot profile.chosen name=normal reason=config: CONFIG profile=normal" "CONFIG profile=normal wins over DMI"
-want_gen s-off 2 NEWEST_TRY 0 - "the new generation gets its one try as always"
-want_re s-off "fat stick.decided .*rw=true" "the stick is writable as always"
+want s-off "bitsboot profile.chosen name=gaming-pc reason=dmi: DMI names the Gaming-PC (ASRock Z890 Taichi OCF)" "DMI wins over CONFIG profile=normal"
+want s-off "bitsboot profile.normal_refused" "the refused profile=normal is said on the screen"
+want_gen s-off 1 FALLBACK_AFTER_TRY 2 SAFE_MODE "the confirmed generation starts; the new one keeps its try"
+want s-off "bitsboot stick.id_withheld" "STICK.ID is withheld"
+want_re s-off "bitsboot screen.kept wanted=firmware" "no mode switch to 1024x768"
+want_re s-off "kernel config values=\".*gp_net=off gp_stick=off.*nvme_bind=off nvme_write=off.*profile=gaming-pc profile_reason=dmi profile_refused=normal screen=firmware stick_write=off.*usb_msd_write=off" "every forced line wins over the stick's"
+refuse s-off "kernel profile.guard" "the loader forced every line itself"
+want_re s-off "block configured .*stick_id=false stick_write=false usb_msd_write=false nvme_write=false" "every write switch is off"
+want_re s-off "fat stick.decided .*rw=false" "the stick is read-only"
 want_kernel_ok s-off
-refuse s-off "stick.id_withheld" "STICK.ID is handed over"
-refuse s-off "profile_reason=" "the CONFIG record is the file itself"
+refuse s-off "marker.written" "bitsboot wrote no marker"
+want_files bt-safe-off 2 "INITRD KERNEL NEW" "generation 2 is still NEW (no TRY)"
+snapshot bt-safe-off after >"$RUN_DIR/off-after.sum"
+if diff "$RUN_DIR/off-before.sum" "$RUN_DIR/off-after.sum" >"$RUN_DIR/off-sum.diff"; then
+    echo "  ok: the stick is byte for byte the same with profile=normal on the board"
+else
+    echo "  RED: the boot with profile=normal changed the stick:"; cat "$RUN_DIR/off-sum.diff"; FAILED=1
+fi
 
 # 3. Intel under QEMU without the DMI names: normal (what every other QEMU test relies on).
 make_image bt-safe-qemu "ktest=fs.fat.tree"

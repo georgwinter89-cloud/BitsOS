@@ -8,7 +8,7 @@
 //! (`cpu_addr`) is the region's own mapping, never derived from the device address, so UC/WC buffers and a
 //! later IOMMU keep the accessors right.
 //!
-//! Raw physical reads (change request in plan/notes/mm-MM-4.md, done INT-W28 post-integration): `read_ram` is
+//! Raw physical reads: `read_ram` is
 //! the bounded read-only helper for RAM the caller has checked against the memory map (acpi's firmware tables,
 //! MCP `read_phys`); it never writes and is bounded to the direct map (never the vmap, MMIO or image windows).
 //! There is no raw physical write: code that writes memory owns it through a `DmaRegion` (C1 removed the G0

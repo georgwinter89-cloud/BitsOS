@@ -1,6 +1,6 @@
 //! Hardware IDs of the IP discovery table: the numbers the blob carries per IP (facts from
-//! linux-6.6/drivers/gpu/drm/amd/include/soc15_hw_ip.h), their short names, and which numbers Linux folds into one
-//! IP kind (`hw_id_map`, linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c:178-205). An ID BitsOS does not
+//! linux-7.3.1/drivers/gpu/drm/amd/include/soc15_hw_ip.h), their short names, and which numbers Linux folds into
+//! one IP kind (`hw_id_map`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c:255-286). An ID BitsOS does not
 //! know keeps its number (`name` is `None`); nothing is dropped for being unknown.
 
 pub const MP1: u16 = 1;
@@ -43,7 +43,8 @@ pub const DIO: u16 = 272;
 pub const DAZ: u16 = 274;
 /// Linux rejects IDs at or above this (`HW_ID_MAX`, soc15_hw_ip.h; `amdgpu_discovery_validate_ip` skips them).
 pub const LINUX_MAX: u16 = 300;
-/// Linux rejects instance numbers at or above this (`HWIP_MAX_INSTANCE`, linux-6.6 amdgpu.h:673).
+/// Linux rejects instance numbers at or above this (`HWIP_MAX_INSTANCE`, linux-6.6 amdgpu.h:673; Linux 7.3.1
+/// differs: linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.h:75, see plan/spec/linux7-differences.md).
 pub const LINUX_MAX_INSTANCE: u8 = 44;
 
 /// (number, name) in number order; the names are the ones Linux's sysfs view uses.

@@ -54,21 +54,40 @@ impl UsbBackend {
         }
     }
 
-    /// Playable outputs, stereo first; without the ones that just failed.
-    fn usable(&mut self) -> Vec<Endpoint> {
+    /// Playable outputs, headsets before a board's jacks, stereo first; without the ones that just failed.
+    fn usable(&mut self) -> Vec<usb_audio::OutputInfo> {
         self.sync_gen();
-        usb_audio::outputs().iter().filter(|o| !self.failed.iter().any(|f| f.0 == o.key && f.1 == o.iface)).map(endpoint).collect()
+        usb_audio::outputs().into_iter().filter(|o| !self.failed.iter().any(|f| f.0 == o.key && f.1 == o.iface)).collect()
+    }
+}
+
+/// `UsbBackend`'s pick over `list` (also the report page's, which has no back end of its own).
+pub(crate) fn usb_resolve(list: &[usb_audio::OutputInfo], t: &Target) -> Option<Endpoint> {
+    match t {
+        Target::Fixed { dev, port: Port::Usb } => list.iter().find(|o| &o.key == dev).map(endpoint),
+        Target::Fixed { .. } => None,
+        // GP-SOUND AU-5: `jack` reaches here only when hda has no jack (the Gaming-PC): the board's USB jacks
+        // then, the speaker first. Without board jacks (every UAC1 device, the Mini-PC) it is `Auto` as before.
+        Target::Prefer(Port::Jack) => list.iter().find(|o| o.board).or(list.first()).map(endpoint),
+        _ => list.first().map(endpoint),
+    }
+}
+
+/// `Pair`'s order of asking its two back ends.
+pub(crate) fn pair_resolve(t: &Target, first: &mut dyn FnMut(&Target) -> Option<Endpoint>, second: &mut dyn FnMut(&Target) -> Option<Endpoint>)
+    -> Option<Endpoint>
+{
+    match t {
+        Target::Auto | Target::Prefer(Port::Usb) => first(t).or_else(|| second(&Target::Auto)),
+        Target::Prefer(Port::Jack) => second(t).or_else(|| first(t)),
+        Target::Prefer(_) => second(t).or_else(|| first(&Target::Auto)),
+        Target::Fixed { .. } => first(t).or_else(|| second(t)),
     }
 }
 
 impl Backend for UsbBackend {
     fn resolve(&mut self, t: &Target) -> Option<Endpoint> {
-        let list = self.usable();
-        match t {
-            Target::Fixed { dev, port: Port::Usb } => list.into_iter().find(|e| &e.dev == dev),
-            Target::Fixed { .. } => None,
-            _ => list.into_iter().next(),
-        }
+        usb_resolve(&self.usable(), t)
     }
 
     fn endpoints(&mut self) -> Vec<Endpoint> {
@@ -115,7 +134,8 @@ impl Stream for UsbStream {
 }
 
 /// Two back ends as one: `first` is asked first for `Auto` and `Prefer(Usb)`, `Fixed` goes to the one that
-/// has it, `Prefer(Jack | Hdmi)` to `second` (then `first` if `second` has nothing at all).
+/// has it, `Prefer(Jack | Hdmi)` to `second` (then `first` if `second` has nothing at all: `Auto` for hdmi, `jack`
+/// itself for jack, which `UsbBackend` takes as the board's USB jacks).
 pub struct Pair<A: Backend, B: Backend> {
     pub first: A,
     pub second: B,
@@ -130,11 +150,8 @@ pub fn sys_backend(kick: WakeFn) -> SysBackend {
 
 impl<A: Backend, B: Backend> Backend for Pair<A, B> {
     fn resolve(&mut self, t: &Target) -> Option<Endpoint> {
-        match t {
-            Target::Auto | Target::Prefer(Port::Usb) => self.first.resolve(t).or_else(|| self.second.resolve(&Target::Auto)),
-            Target::Prefer(_) => self.second.resolve(t).or_else(|| self.first.resolve(&Target::Auto)),
-            Target::Fixed { .. } => self.first.resolve(t).or_else(|| self.second.resolve(t)),
-        }
+        let (a, b) = (&mut self.first, &mut self.second);
+        pair_resolve(t, &mut |x| a.resolve(x), &mut |x| b.resolve(x))
     }
 
     fn endpoints(&mut self) -> Vec<Endpoint> {

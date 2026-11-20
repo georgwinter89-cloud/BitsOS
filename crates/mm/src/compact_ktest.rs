@@ -126,7 +126,8 @@ fn pinned() -> TestResult {
 }
 ktest!("mm.compact.pinned", Safe, pinned);
 
-/// A huge page (an order-9 user block) keeps its pageblock until MM-2 moves or splits it; the next one is cleared.
+/// A huge page (an order-9 user block) keeps its pageblock (compaction never isolates a block at pageblock order,
+/// Linux `skip_isolation_on_order`; MM-2's `migrate_huge` moves one for other callers); the next one is cleared.
 fn thp_in_block() -> TestResult {
     let f = shared()?;
     refill(f);
@@ -162,12 +163,13 @@ fn anon_in_block() -> TestResult {
 }
 ktest!("mm.compact.anon", Safe, anon_in_block);
 
-/// What MM-2 brings: a migrator that copies, its targets from the free scanner at the top.
+/// A migrator that copies (as MM-2's does), its targets from the free scanner at the top.
 struct Mover(&'static Buddy);
 
 impl Migrate for Mover {
-    fn migrate(&self, phys: u64, kind: Kind, owner: u64, dest: &mut dyn FnMut() -> Option<u64>) -> Moved {
-        let Some(d) = dest() else { return Moved::Stays };
+    fn migrate<'b>(&self, phys: u64, kind: Kind, owner: u64, dest: &mut dyn FnMut() -> Option<mm_core::Target<'b>>) -> Moved {
+        let Some(t) = dest() else { return Moved::Stays };
+        let d = t.into_phys();
         self.0.set_owner(d, owner);
         self.0.set_owner(phys, 0);
         self.0.free(phys, 0, kind);
@@ -212,7 +214,7 @@ impl Reclaim for Vfs {
 }
 
 /// Drop-if-clean on the real page cache: a clean page goes, a dirty one stays (decision: compaction does not write
-/// back; MM-2 may migrate dirty pages with their dirty bit), as does a page someone holds.
+/// back; MM-2 leaves dirty pages too, CONTRACTS BL-3/MM-2), as does a page someone holds.
 fn dirty() -> TestResult {
     let Some(b) = mm_core::boot_buddy() else { return ktest::fail("no boot allocator") };
     let (cache, _pat) = crate::reclaim_ktest::pattern_file(4);
@@ -248,19 +250,48 @@ fn take_huge(f: &dyn FrameAlloc, held: &mut Vec<(u64, u32)>) {
     }
 }
 
-/// Memory fragmented on purpose: 64 MiB of clean cache read in, then every free block of 2 MiB or more held, so free
-/// memory exists only in pieces; direct compaction brings a 2 MiB block back (from a pageblock of clean cache,
-/// dropped until MM-2) and the cache still reads right.
+/// Memory fragmented on purpose: 64 MiB of clean cache read in, 128 MiB of program frames taken after it, every free
+/// block of 2 MiB or more held, then every other program frame given back, so free memory exists only in single
+/// frames (in Movable pageblocks: the free scanner's targets). Direct compaction brings a 2 MiB block back by moving
+/// pages into those holes (W35 MM-2: nothing dropped; the migrator keeps what it moves, so Linux's
+/// `compaction_suitable` needs the free frames) and the cache still reads right.
 fn restore() -> TestResult {
     let (Some(f), Some(b)) = (mm_core::frames(), mm_core::boot_buddy()) else { return ktest::fail("no frame allocator") };
     const PAGES: u64 = 16384;
+    const FRAG: usize = 32768;
     let (cache, _pat) = crate::reclaim_ktest::pattern_file(PAGES);
     crate::reclaim_ktest::check_file(&cache, PAGES)?;
     let mut held: Vec<(u64, u32)> = Vec::new();
-    if held.try_reserve_exact((f.stats().total_bytes / (2 * MIB)) as usize + 64).is_err() {
+    let mut frag: Vec<u64> = Vec::new();
+    if held.try_reserve_exact((f.stats().total_bytes / (2 * MIB)) as usize + 64).is_err() || frag.try_reserve_exact(FRAG).is_err() {
         return ktest::fail("no room for the list of held blocks");
     }
+    while frag.len() < FRAG {
+        let Some(p) = f.alloc_light(0, Zone::Normal, Kind::User) else { break };
+        frag.push(p);
+    }
+    let mut kept = Vec::new();
+    if kept.try_reserve_exact(frag.len()).is_err() {
+        return ktest::fail("no room for the list of kept frames");
+    }
+    // The holes first, then the big blocks held: free memory never runs short (kswapd would reclaim the cache
+    // the test moves, and race it for the file's lock).
+    for (i, p) in frag.into_iter().enumerate() {
+        if i % 2 == 0 {
+            f.free(p, 0, Kind::User);
+        } else {
+            kept.push(p);
+        }
+    }
+    b.drain_all();
+    take_huge(f, &mut held);
+    klog::event!(Info, "mm", "ktest.compact_restore_frag", frames = kept.len() * 2, free_kb = f.stats().free_bytes / 1024, held = held.len());
     let s0 = b.compact_stats();
+    let why = || {
+        use crate::migrate as m;
+        [m::CACHE_MOVED.get(), m::CACHE_DIRTY.get(), m::CACHE_HELD.get(), m::CACHE_BUSY.get(), m::CACHE_STALE.get(), m::NO_TARGET.get()]
+    };
+    let w0 = why();
     let mut made = false;
     for _ in 0..8 {
         take_huge(f, &mut held);
@@ -271,16 +302,23 @@ fn restore() -> TestResult {
         if made {
             break;
         }
+        // A page another compactor (kcompactd, woken by the held blocks' orders) or kswapd held: shortly again.
+        sched::sleep_ms(20);
     }
     let s1 = b.compact_stats();
     let blocks = held.len();
     for (p, o) in held {
         f.free(p, o, Kind::Other);
     }
-    klog::event!(Info, "mm", "ktest.compact_restore", made = made, held_blocks = blocks, dropped = s1.dropped - s0.dropped, cleared = s1.cleared - s0.cleared,
-        scanned = s1.migrate_scanned - s0.migrate_scanned, anon = s1.skipped_anon - s0.skipped_anon, score = b.fragmentation_score());
+    for p in kept {
+        f.free(p, 0, Kind::User);
+    }
+    klog::event!(Info, "mm", "ktest.compact_restore", made = made, held_blocks = blocks, dropped = s1.dropped - s0.dropped, moved = s1.moved - s0.moved, cleared = s1.cleared - s0.cleared,
+        scanned = s1.migrate_scanned - s0.migrate_scanned, anon = s1.skipped_anon - s0.skipped_anon, score = b.fragmentation_score(),
+        cache = alloc::format!("{:?}", why().iter().zip(w0).map(|(a, b)| a - b).collect::<Vec<_>>()); "cache: moved/dirty/held/busy/stale/no_target");
     kassert!(made, "no 2 MiB block came back: {:?}", mm_core::block_census(mm_core::HUGE_ORDER).map(|c| alloc::format!("{c}")));
-    kassert!(s1.success > s0.success && s1.cleared > s0.cleared, "counts did not move: {s0:?} -> {s1:?}");
+    kassert!(s1.success > s0.success && s1.cleared > s0.cleared && s1.moved > s0.moved, "counts did not move: {s0:?} -> {s1:?}");
+    kassert!(s1.dropped == s0.dropped, "compaction dropped {} cache pages instead of moving them", s1.dropped - s0.dropped);
     crate::reclaim_ktest::check_file(&cache, PAGES)
 }
 ktest!("mm.compact.restore", QemuOnly, restore);

@@ -12,6 +12,7 @@ use crate::canvas::Canvas;
 use crate::chrome_draw::{Px, font};
 use crate::layout::Rect;
 use crate::page::{Kind, Part, Row};
+use crate::page_kind::PageKind;
 use crate::settings_write::{Ask, Req};
 use crate::state::App;
 use crate::text::Weight;
@@ -106,6 +107,12 @@ pub fn dialog(row: Option<&Row>, now: &str, ask: Ask) -> Dialog {
     }
 }
 
+/// PK-7a: a dialog of the programme page (its action is kept by the page; `ask` is unused there).
+pub fn plain(title: String, lines: Vec<String>, ok: &str) -> Dialog {
+    let ask = Ask { req: Req::UNDO, key: String::new(), to: Json::Null };
+    Dialog { ask, short: title.clone(), title, lines, ok: ok.into(), on_ok: false }
+}
+
 /// Where the dialog lies in content `c` with `lines` lines of text: (frame, Abbrechen, Ändern).
 pub fn boxes(c: Rect, lines: usize) -> (Rect, Rect, Rect) {
     let w = (c.w - 32).clamp(1, 560);
@@ -128,7 +135,7 @@ pub fn draw(c: &mut Canvas, p: &Px, t: &Theme, content: Rect, d: &Dialog, hover:
     let all = p.r(content);
     c.fill(all.x, all.y, all.w, all.h, alpha(t.paper, 0.72));
     let (f, cancel, ok) = boxes(content, d.lines.len());
-    c.glow(p.b(f), p.v(14.0), if t.effects_gpu { 6 } else { 2 }, t.glow_soft);
+    c.glow(p.b(f), p.v(14.0), 6, t.glow_soft);
     c.rrect(p.b(f), p.v(14.0), t.panel);
     c.rrect_line(p.b(f), p.v(14.0), p.line(), t.accent);
     let band = |y: i32, h: i32| Rect { x: f.x + 24, y, w: f.w - 48, h };
@@ -160,7 +167,13 @@ impl App {
             Some(r) => crate::page_app::value_of(self, r),
             None => self.settings.text(&ask.key).unwrap_or("").to_string(),
         };
-        eprintln!("bitscomp: settings page {pid} asks before {}: {}", ask.key, crate::settings_write::request_line(&ask.req));
+        self.ki_ask_dropped(pid);
+        self.habit.asking.remove(&pid);
+        if let Some(s) = self.pages.by_pid.get_mut(&pid) {
+            s.many = None;
+            s.answers_as = None;
+        }
+        eprintln!("bitscomp: settings page {pid} asks before {}: {}", ask.key, crate::settings_write::logged_line(&ask.req));
         let d = dialog(row.as_ref(), &now, ask);
         if let Some(s) = self.pages.by_pid.get_mut(&pid) {
             s.confirm = Some(d);
@@ -176,10 +189,26 @@ impl App {
     }
 
     pub fn page_dialog_key(&mut self, pid: u32, sym: Keysym) {
+        self.pages.real = self.input_origin == crate::input::Origin::Physical;
         let Some(d) = self.pages.by_pid.get_mut(&pid).and_then(|s| s.confirm.as_mut()) else { return };
         let before = d.on_ok;
-        match d.key(sym) {
-            Step::Stay => self.needs_frame |= before != d.on_ok,
+        let step = d.key(sym);
+        // CL-5: an injected key may cancel the page "KI"'s own question, never prepare its yes.
+        if !self.pages.real && self.ki_asks(pid) && step != Step::Cancel {
+            return self.ki_ask_touched(pid);
+        }
+        // The same for a removal on the page "Programme" (D6): an injected Tab must not put the pick on
+        // "Entfernen" for an Enter of Georg's that was meant for something else.
+        // SYS-A: the same for the System window's questions (ending a service, Vorrang Hoch).
+        if !self.pages.real && step == Step::Stay && self.pages.by_pid.get(&pid).is_some_and(|s| matches!(s.kind, PageKind::Programme | PageKind::System)) {
+            if let Some(d) = self.pages.by_pid.get_mut(&pid).and_then(|s| s.confirm.as_mut()) {
+                d.on_ok = false;
+            }
+            self.needs_frame |= before;
+            return;
+        }
+        match step {
+            Step::Stay => self.needs_frame |= before != self.pages.by_pid.get(&pid).and_then(|s| s.confirm.as_ref()).is_some_and(|d| d.on_ok),
             Step::Cancel => self.page_dialog_close(pid, false),
             Step::Confirm => self.page_dialog_close(pid, true),
         }
@@ -187,9 +216,54 @@ impl App {
 
     /// "Ändern": the confirmed change goes to settingsd; "Abbrechen": nothing is sent.
     pub fn page_dialog_close(&mut self, pid: u32, confirm: bool) {
-        let Some(d) = self.pages.by_pid.get_mut(&pid).and_then(|s| s.confirm.take()) else { return };
+        // CL-5: a yes that comes right after the page "KI"'s own question appeared was not meant for it.
+        // SYS-A: the same for the System window's questions ("Sofort beenden" appears by itself).
+        if confirm && (self.ki_yes_early(pid) || self.sys_yes_early(pid)) {
+            eprintln!("bitscomp: settings page {pid}: a yes too soon after its question appeared does not count");
+            return;
+        }
+        let Some(s) = self.pages.by_pid.get_mut(&pid) else { return };
+        let (programme, ki) = (s.kind == PageKind::Programme, s.kind == PageKind::Ki);
+        let Some(d) = s.confirm.take() else { return };
         self.needs_frame = true;
+        if programme {
+            return self.prog_confirmed(pid, confirm);
+        }
+        if self.sys_asks(pid) {
+            return self.sys_confirmed(pid, confirm);
+        }
+        // WY-SET: a consolidated row's keys.
+        if self.page_many_asks(pid) {
+            return self.page_many_confirmed(pid, confirm);
+        }
+        // DB4: "Alles Gelernte vergessen?".
+        if self.gelernt_asks(pid) {
+            return self.gelernt_confirmed(pid, confirm);
+        }
+        // CL-5: the page "KI"'s own questions (remove a provider, delete a key, type a key).
+        if self.ki_asks(pid) {
+            return self.ki_confirmed(pid, confirm);
+        }
+        // A dialog without a request of settingsd that no page claims (its question was replaced): its yes
+        // must never fall through to the undo `plain` carries as a filler.
+        if d.ask.key.is_empty() {
+            eprintln!("bitscomp: settings page {pid}: a dialog nobody asks for closed, nothing sent");
+            return self.page_say(pid, format!("{}: nichts geändert.", d.short), false);
+        }
         if confirm {
+            // CL-5: a provider and its stored key go only by Georg's own yes, also when settingsd asked for the
+            // confirmation (a changed list on the general page, an undo): injected input cannot give it.
+            // WY-SET fixer: so do the assistant's leash keys (settingsd asks for Georg's own yes when one loosens,
+            // also by a reset or an undo, and takes bitscomp's confirmation as that yes).
+            let guarded = ki
+                || d.ask.key == crate::ki::LIST
+                || d.ask.key.starts_with("ai.provider.")
+                || crate::settings_write::is_secret(&d.ask.key)
+                || crate::page_join::leashed(&d.ask.key);
+            if guarded && !self.pages.real {
+                eprintln!("bitscomp: settings page {pid}: the confirmation of {} by injected input refused", d.ask.key);
+                return self.page_say(pid, crate::ki_ask::REAL_INPUT, true);
+            }
             eprintln!("bitscomp: settings page {pid}: Georg confirmed {}", d.ask.key);
             self.page_send(pid, d.ask.req);
         } else {
@@ -210,7 +284,10 @@ impl crate::page_app::Pages {
     pub fn drop_dialogs(&mut self, keys: Option<&[String]>, why: &str) -> bool {
         let mut closed = false;
         for (pid, s) in self.by_pid.iter_mut() {
-            let gone = s.confirm.as_ref().is_some_and(|d| keys.is_none_or(|k| !k.contains(&d.ask.key)));
+            // PK-7a: the programme page's dialogs are its own (settingsd has no part in them); CL-5: so are the
+            // page "KI"'s questions (no key of settingsd in them).
+            let settings = !matches!(s.kind, PageKind::Programme | PageKind::System);
+            let gone = settings && s.confirm.as_ref().is_some_and(|d| !d.ask.key.is_empty() && keys.is_none_or(|k| !k.contains(&d.ask.key)));
             if gone && let Some(d) = s.confirm.take() {
                 eprintln!("bitscomp: settings page {pid}: dialog for {} closed ({why}), nothing sent", d.ask.key);
                 if !why.is_empty() {

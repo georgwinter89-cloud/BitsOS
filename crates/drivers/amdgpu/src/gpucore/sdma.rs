@@ -416,6 +416,9 @@ pub struct Rewind {
     pub found: (u64, u64, u32),
     pub after: (u64, u64, u32),
     pub start: u64,
+    /// The kept RB_RPTR was taken over and said as a Warn fallback (`sdma.ptr_kept`, B6): set in the one branch
+    /// that logs it, so a test reads the decision here and not from the shared log.
+    pub warned: bool,
 }
 
 /// GX-7i2: NBIO's doorbell side as this boot's first SDMA stage found it (what a stop puts back).
@@ -614,7 +617,7 @@ fn rewind(o: &mut dyn Regs, a: &SdmaAddrs) -> Result<Option<Rewind>, SdmaError> 
     wr(o, a, R::MinorPtrUpdate, 0, &mut n)?;
     let (rp2, wp2) = ptrs(o, a)?;
     let db2 = rd(o, a, R::Doorbell)?;
-    Ok(Some(Rewind { found: (rp, wp, db), after: (rp2, wp2, db2), start: 0 }))
+    Ok(Some(Rewind { found: (rp, wp, db), after: (rp2, wp2, db2), start: 0, warned: false }))
 }
 
 /// GX-7i2: what `until=stop` (or a run that keeps nothing) puts back after SDMA 0 is halted: the queue's doorbell
@@ -762,6 +765,22 @@ fn rd64(hw: &mut dyn Hw, mc: u64) -> Option<u64> {
     hw.mem_read(mc, &mut b).then(|| u64::from_le_bytes(b))
 }
 
+/// The pieces of a ring's memory a commit from `old` to `new` (dword counters) filled, as (dword index, dwords):
+/// two when the commit wraps. For every queue that keeps a shadow of its ring: SDMA 6's here and SDMA 7's
+/// (`rdna4::sdmaq`).
+pub fn ring_spans(old: u64, new: u64, size_dw: u64) -> impl Iterator<Item = (u64, u64)> {
+    let mut p = old;
+    core::iter::from_fn(move || {
+        if p == new {
+            return None;
+        }
+        let i = p & (size_dw - 1);
+        let n = (new - p).min(size_dw - i);
+        p += n;
+        Some((i, n))
+    })
+}
+
 fn dwords(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|d| d.to_le_bytes()).collect()
 }
@@ -797,14 +816,9 @@ impl<H: Hw> Queue<'_, H> {
         }
         let old = self.ring.wptr();
         let new = self.ring.commit(&mut self.shadow).map_err(SdmaError::Ring)?;
-        let (size, mask) = (self.ring.size_dw(), self.ring.mask());
-        let mut p = old;
-        while p != new {
-            let i = p & mask;
-            let n = (new - p).min(size - i);
+        for (i, n) in ring_spans(old, new, self.ring.size_dw()) {
             let bytes = dwords(&self.shadow[i as usize..(i + n) as usize]);
             self.mem(self.l.ring + i * 4, &bytes)?;
-            p += n;
         }
         self.o.store_barrier();
         let hw = self.kind.hw_ptr(new);
@@ -980,7 +994,7 @@ fn start<H: Hw>(q: &mut Queue<'_, H>, r: &mut SdmaReport, doorbell: bool, timeou
         let align = q.kind.hw_ptr(q.kind.ring_align_dw());
         if rp2 != 0 && rp2 % align == 0 {
             klog::event!(Warn, "gx", "sdma.ptr_kept", rptr = klog::Hex(rp2); "RB_RPTR kept its value through the reset: the queue starts there");
-            start = rp2;
+            (start, w.warned) = (rp2, true);
         } else if rp2 != 0 {
             r.rewinds.push(w);
             return Err(SdmaError::StalePointers { rptr: rp2, wptr: wp2 });

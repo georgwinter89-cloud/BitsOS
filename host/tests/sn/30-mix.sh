@@ -4,7 +4,7 @@
 #  A: 4 CPUs, MSI, default latency (40 ms): sn.mix null output, state, two clients, switch, resample;
 #     mixcheck.py: the two-client mix sample-exact with saturation, every frame exactly once across
 #     hda0 -> hda1 -> hda0, the 44.1 kHz client as a clean 1 kHz sine at 48 kHz.
-#  B: 16 CPUs, polled (hda_irq=off), 20 ms latency: switch and two again.
+#  B: 16 CPUs, polled (the test key ktest_poll=hda), 20 ms latency: switch and two again.
 set -eu
 cd "$BITSOS_ROOT"
 RUN="$BITSOS_RUN_DIR"
@@ -55,7 +55,7 @@ wavs A "$W0" "$W1" two switch resample
 
 # --- B ---
 LOG="$RUN/mix-b.log"; W0="$RUN/mix-b0.wav"; W1="$RUN/mix-b1.wav"
-boot mix-b 16 "ktest=sn.mix.switch,sn.mix.two;hda_irq=off;snd_latency_ms=20" "$LOG" "$W0" "$W1"
+boot mix-b 16 "ktest=sn.mix.switch,sn.mix.two;ktest_poll=hda;snd_latency_ms=20" "$LOG" "$W0" "$W1"
 check "$LOG" 'KTEST done passed=2 failed=0 skipped=0' "B: switch and two pass polled with 20 ms"
 check "$LOG" 'snd hda.irq_mode ctrl=hda0 mode=polled' "B: polled"
 check "$LOG" 'snd mix.thread name=snd/mix class=kernel_rt prio=45 lead=1024 floor=512 period=256' "B: 20 ms lead"

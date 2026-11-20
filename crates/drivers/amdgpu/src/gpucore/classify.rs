@@ -92,6 +92,9 @@ pub enum Start {
     PspDown,
     /// A register the verdict needs could not be read.
     Unknown,
+    /// GPY (desk 15.11.): this boot's own bring-up holds the GPU now (its PSP run is kept: rings, IH and GART on
+    /// are its own). Only `gx_probe` can see it: a new run is admitted only when no run is kept.
+    ThisBoot,
 }
 
 impl Start {
@@ -105,6 +108,7 @@ impl Start {
             Start::AfterCrash => "after a crash or an unclean stop",
             Start::PspDown => "PSP secure OS not running",
             Start::Unknown => "unknown",
+            Start::ThisBoot => "brought up by BitsOS itself in this boot (its own run holds the GPU)",
         }
     }
 }
@@ -317,6 +321,18 @@ pub struct Own {
     pub doorbell_aperture: bool,
 }
 
+/// GPY (desk 15.11.: gx_probe said "after Linux" after a cold start because the IH ring was on, which BitsOS's own
+/// boot bring-up had turned on): what this boot's bring-up holds now, as the kernel knows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThisBoot {
+    /// This boot's PSP run is kept (`psplive`'s live run: its KM ring, TMR and GC are held).
+    pub run: bool,
+    /// This boot's backend stage started the IH ring and no stop has turned it off.
+    pub ih_ring: bool,
+    /// This boot's last GMC stage passed: GART (VMID 0 of both hubs) on by it.
+    pub gart: bool,
+}
+
 /// `classify` with the note the kernel before handed on (a Reload), if any.
 pub fn classify_with(d: &Discovery, read: &mut dyn FnMut(u32) -> Option<u32>, note: Option<&StopNote>) -> State {
     classify_traced(d, read, note, Own::default())
@@ -324,6 +340,11 @@ pub fn classify_with(d: &Discovery, read: &mut dyn FnMut(u32) -> Option<u32>, no
 
 /// `classify_with` and this boot's own traces: the note and the traces come before the Linux signs.
 pub fn classify_traced(d: &Discovery, read: &mut dyn FnMut(u32) -> Option<u32>, note: Option<&StopNote>, own: Own) -> State {
+    classify_boot(d, read, note, own, ThisBoot::default())
+}
+
+/// `classify_traced` and what this boot's bring-up holds now (`ThisBoot`): its own run is told from a Linux before.
+pub fn classify_boot(d: &Discovery, read: &mut dyn FnMut(u32) -> Option<u32>, note: Option<&StopNote>, own: Own, this: ThisBoot) -> State {
     let mut findings: Vec<Finding> = PLAIN.iter().map(|r| read_one(d, r, read)).collect();
     let smuio = findings.iter().find(|f| f.name == "SMUIO_GFX_MISC_CNTL").and_then(|f| f.value);
     findings.push(read_one(d, &IMU_FLAGS, read));
@@ -361,14 +382,14 @@ pub fn classify_traced(d: &Discovery, read: &mut dyn FnMut(u32) -> Option<u32>, 
         }
     }
     let mut st = State { findings, gc, start: Start::Unknown, why: Vec::new() };
-    let (start, why) = verdict(&st, note, own);
+    let (start, why) = verdict(&st, note, own, this);
     st.start = start;
     st.why = why;
     st
 }
 
 /// The rules, in order (each sentence names the register that decided).
-fn verdict(st: &State, note: Option<&StopNote>, own: Own) -> (Start, Vec<String>) {
+fn verdict(st: &State, note: Option<&StopNote>, own: Own, this: ThisBoot) -> (Start, Vec<String>) {
     let v = |n: &str| st.value(n);
     let mut why = Vec::new();
     let Some(sos) = v("MP0_C2PMSG_81") else {
@@ -383,6 +404,23 @@ fn verdict(st: &State, note: Option<&StopNote>, own: Own) -> (Start, Vec<String>
         // A PCIe read nobody answers (function gone, in reset, bus error) completes as all ones.
         why.push(String::from("MP0_C2PMSG_81 reads all ones: the GPU does not answer (gone, in reset or a bus error)"));
         return (Start::Unknown, why);
+    }
+    // GPY: this boot's own run first: what is on is its own, whatever a Linux before would have left.
+    let on = |n: &str| v(n).is_some_and(|x| bit(x, 0));
+    let signs = [
+        ("IH_RB_CNTL", "IH ring on", this.ih_ring),
+        ("RCC_DOORBELL_APER_EN", "doorbell aperture on", own.doorbell_aperture),
+        ("MMVM_CONTEXT0_CNTL", "GART (MMHUB VMID 0) on", this.gart),
+    ];
+    if this.run {
+        why.push(String::from("this boot's bring-up holds the GPU: its PSP run is kept (KM ring, TMR, GC)"));
+        for (_, s, ours) in signs.iter().filter(|(n, _, _)| on(n)) {
+            why.push(format!("{s}: {}", if *ours { "turned on by this boot's bring-up (BitsOS's own trace)" } else { "no trace of this boot's stages says so" }));
+        }
+        return (Start::ThisBoot, why);
+    }
+    for (_, s, _) in signs.iter().filter(|(n, _, ours)| *ours && *n != "RCC_DOORBELL_APER_EN" && on(n)) {
+        why.push(format!("{s}: this boot's bring-up turned it on and no stop turned it off (BitsOS's own trace), not a Linux sign"));
     }
     let wptr = v("MP0_C2PMSG_67");
     let size = v("MP0_C2PMSG_71");
@@ -405,6 +443,7 @@ fn verdict(st: &State, note: Option<&StopNote>, own: Own) -> (Start, Vec<String>
     let linux: Vec<&str> = [("IH_RB_CNTL", "IH ring on"), ("RCC_DOORBELL_APER_EN", "doorbell aperture on"), ("MMVM_CONTEXT0_CNTL", "GART (MMHUB VMID 0) on")]
         .into_iter()
         .filter(|(n, _)| v(n).is_some_and(|x| bit(x, 0)) && !(*n == "RCC_DOORBELL_APER_EN" && aperture_ours))
+        .filter(|(n, _)| !(*n == "IH_RB_CNTL" && this.ih_ring) && !(*n == "MMVM_CONTEXT0_CNTL" && this.gart))
         .map(|(_, s)| s)
         .collect();
     if !linux.is_empty() {

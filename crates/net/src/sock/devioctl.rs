@@ -1,4 +1,4 @@
-//! The interface ioctls every socket answers (linux-6.6/net/socket.c `sock_ioctl`/`sock_do_ioctl`,
+//! The interface ioctls every socket answers (linux-7.3.1/net/socket.c `sock_ioctl`/`sock_do_ioctl`,
 //! net/core/dev_ioctl.c `dev_ioctl`/`dev_ifconf`, net/ipv4/af_inet.c `inet_ioctl`, net/ipv4/devinet.c
 //! `devinet_ioctl`/`inet_gifconf`, net/ipv4/arp.c `arp_ioctl`, net/ethtool/ioctl.c): SIOCGIFNAME/INDEX/FLAGS/
 //! MTU/METRIC/TXQLEN/HWADDR/MAP/CONF on any socket, the address family (SIOCGIFADDR, NETMASK, BRDADDR, DSTADDR)
@@ -204,7 +204,7 @@ fn full_name(r: &[u8]) -> &[u8] {
 
 /// NW-12: SIOCSIFMTU / SIOCSIFTXQLEN on a namespace's lo (`dev_ifsioc`): CAP_NET_ADMIN (EPERM) before the device
 /// (ENODEV); a negative value is EINVAL (lo has no MTU bounds, `dev_validate_mtu`). SIOCSIFTXQLEN wants
-/// CAP_NET_ADMIN in the initial user namespace (`capable`, linux-6.6/net/core/dev_ioctl.c:753), which the
+/// CAP_NET_ADMIN in the initial user namespace (`capable`, linux-7.3.1/net/core/dev_ioctl.c:779), which the
 /// namespace hook answers from the credentials (`Ids::capable_initial`).
 fn set_dev(a: &Asker<'_>, cmd: u64, name: &[u8], r: &[u8]) -> Result<i64, i64> {
     let Some(v) = &a.net else { return need_admin(a) };
@@ -247,7 +247,7 @@ fn abc_len(ip: [u8; 4]) -> Option<u8> {
 }
 
 /// NW-12: SIOCSIFADDR / SIOCSIFBRDADDR / SIOCSIFDSTADDR / SIOCSIFNETMASK on a namespace's lo (`devinet_ioctl`,
-/// linux-6.6/net/ipv4/devinet.c:1033): the address is the first one labelled with the ifreq's name (with its
+/// linux-7.3.1/net/ipv4/devinet.c:1062): the address is the first one labelled with the ifreq's name (with its
 /// alias); a changed address is deleted (with its secondaries, `inet_del_ifa`) and inserted again. A new
 /// address takes its classful prefix (`inet_abc_len`) and the name as its label; 127/8 is host scope
 /// (`inet_set_ifa`). SIOCSIFDSTADDR (a peer address, which V2 does not keep apart) is EOPNOTSUPP unless it
@@ -314,7 +314,7 @@ fn set_addr(v: &alloc::sync::Arc<crate::netns::NetView>, cmd: u64, l: &Link, lab
     Ok(0)
 }
 
-/// `wext_handle_ioctl` (linux-6.6/net/wireless/wext-core.c:1063-1080, :990-1017, :942-984): the 32-byte
+/// `wext_handle_ioctl` (linux-7.3.1/net/wireless/wext-core.c:1061-1081, :988-1015, :940-983): the 32-byte
 /// iwreq (EFAULT), then the permission check before the device (SET commands, SIOCGIWENCODE and
 /// SIOCGIWENCODEEXT need CAP_NET_ADMIN), then ENODEV for an unknown name, then EOPNOTSUPP: no V2 interface has
 /// wireless handlers (cfg80211's wext compatibility for the WLAN interface is not built).

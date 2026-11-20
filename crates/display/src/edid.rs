@@ -3,9 +3,9 @@
 //! the totals of each detailed timing, so `clock / (htotal * vtotal)` is the rate the panel really runs at
 //! (2560x1440 CVT-RB: 241.5 MHz / (2720 * 1481) = 59.9506 Hz, V1 FlipPace measured 16,680 us).
 //!
-//! Decoding follows linux-6.6/drivers/gpu/drm/drm_edid.c `drm_mode_detailed` (:3437) and the block walk of
-//! `cea_for_each_detailed_block` (:3033); the rate is `drm_mode_vrefresh` (drm_modes.c:1286) in millihertz.
-//! Block validity is Linux's `edid_block_check`/`edid_block_status_valid` (:1854, :1891): a base header with at
+//! Decoding follows linux-7.3.1/drivers/gpu/drm/drm_edid.c `drm_mode_detailed` (:3521) and the block walk of
+//! `cea_for_each_detailed_block` (:3117); the rate is `drm_mode_vrefresh` (drm_modes.c:1287) in millihertz.
+//! Block validity is Linux's `edid_block_check`/`edid_block_status_valid` (:1892, :1929): a base header with at
 //! least 6 of 8 bytes right is repaired (`edid_fixup`), the base checksum and version 1 must hold, a CTA
 //! extension with a bad checksum still counts.
 //! Pure and bounded by the input's length (hostile bytes give None, never a panic).

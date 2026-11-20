@@ -1,4 +1,4 @@
-//! Host tests of IN-4: the N_TTY line discipline against linux-6.6/drivers/tty/n_tty.c's rules, the termios
+//! Host tests of IN-4: the N_TTY line discipline against linux-7.3.1/drivers/tty/n_tty.c's rules, the termios
 //! layouts, the terminal ioctls with a fake process layer and fake user memory, and evdev's client ring, bit
 //! queries and ioctls on a test sink.
 
@@ -92,7 +92,7 @@ impl Fake {
             pgid,
             sid,
             uid: self.uid,
-            subject: policy::Subject { program: policy::ProgramId(9), pid, uid: self.uid },
+            subject: policy::Subject { program: policy::ProgramId(9), pid, uid: self.uid, tree: 0 },
         })
     }
     pub(crate) fn with_uid(mut self, uid: u32) -> Fake {
@@ -768,4 +768,47 @@ fn evdev_physical_only_drops_written_events() {
     assert_eq!(read_all(&real), [(EV_KEY, 31, 1), (EV_SYN, SYN_REPORT, 0), (EV_KEY, 31, 0), (EV_SYN, SYN_REPORT, 0)], "0: written events again");
     drop((real, all));
     k.unregister(7);
+}
+
+/// VB-1: only a real key or button press read by a physical-only reader stamps the time kexec's node takes an
+/// answer behind; a pointer move, a written key and a reader that takes everything do not.
+#[test]
+fn evdev_physical_press_stamp_takes_real_presses_only() {
+    let _serial = crate::tests_in6::latency_serial(); // its reads feed the program latency slot
+    static S: EvdevSink = EvdevSink::new();
+    const UNSET: u64 = u64::MAX;
+    let mut caps = Caps::default();
+    caps.keys.extend([0x110u16, 30]);
+    caps.rel.extend([0u16, 1]);
+    let d = evdev::register(&S, DeviceInfo { name: "press mouse".to_string(), phys: "usb-2/input0".to_string(), bus: 3, caps, ..DeviceInfo::default() });
+    let real = Handle::open(&d).unwrap();
+    let all = Handle::open(&d).unwrap();
+    let m = Mem::new();
+    evdevfs::set_last_physical_press_ns(UNSET);
+    d.emit(1, &[(EV_KEY, 0x110, 1), (EV_SYN, SYN_REPORT, 0)]);
+    assert_eq!(read_all(&real).iter().filter(|e| e.0 == EV_KEY).count(), 1);
+    assert_eq!(evdevfs::last_physical_press_ns(), UNSET, "a reader that takes written events too stamps nothing");
+    d.emit(2, &[(EV_KEY, 0x110, 0), (EV_SYN, SYN_REPORT, 0)]);
+    let _ = read_all(&real);
+    m.put(0, &1i32.to_le_bytes());
+    assert_eq!(real.ioctl(ioc::EVIOC_BITSOS_PHYSICAL, BASE, &m), Ok(0));
+    d.emit(2, &[(EV_REL, 0, 5), (EV_SYN, SYN_REPORT, 0)]);
+    assert_eq!(read_all(&real).len(), 2);
+    assert_eq!(evdevfs::last_physical_press_ns(), UNSET, "a pointer move is no press");
+    let mut w = [0u8; EVENT_SIZE * 2];
+    w[16..18].copy_from_slice(&EV_KEY.to_le_bytes());
+    w[18..20].copy_from_slice(&30u16.to_le_bytes());
+    w[20..24].copy_from_slice(&1i32.to_le_bytes());
+    w[EVENT_SIZE + 16..EVENT_SIZE + 18].copy_from_slice(&EV_SYN.to_le_bytes());
+    assert_eq!(all.write(&w), Ok(EVENT_SIZE * 2));
+    let _ = read_all(&real);
+    assert_eq!(evdevfs::last_physical_press_ns(), UNSET, "a written key never reaches the physical-only reader");
+    d.emit(3, &[(EV_KEY, 0x110, 0), (EV_SYN, SYN_REPORT, 0)]);
+    let _ = read_all(&real);
+    assert_eq!(evdevfs::last_physical_press_ns(), UNSET, "a release is no press");
+    d.emit(4, &[(EV_KEY, 0x110, 1), (EV_SYN, SYN_REPORT, 0)]);
+    let _ = read_all(&real);
+    assert_ne!(evdevfs::last_physical_press_ns(), UNSET, "the real button press is stamped");
+    drop((real, all));
+    d.unregister(5);
 }

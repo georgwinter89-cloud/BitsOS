@@ -38,6 +38,58 @@ pub enum Req {
     /// CR DS-3-4: bitscomp's own keys (owner bitscomp, in the shared `desktop` namespace): the Absicht headline of
     /// each workspace, as (key, workspace name).
     Register { keys: Vec<(String, String)> },
+    /// GM-6a: bitscomp's own typed keys (the sofa mode's of sofa-mode.md §6), each a full settingsd definition.
+    Defs { keys: Vec<Json> },
+    /// CL-5: a provider's key Georg typed on the page "KI". It goes as a confirmed change (INT-CL3T: a secret is
+    /// written by its owner's program or confirmed) and only while `whilst` (address, kind, place as the page
+    /// showed them when he began to type) still holds: settingsd's `while`, as `assist --key` sends it.
+    Secret { key: String, value: Hidden, whilst: Vec<(String, Json)> },
+    /// CL-5: a key back to its default (a stored provider key removed); `confirmed` as for `Set`.
+    Reset { key: String, confirmed: bool },
+    /// CL-5: a change Georg confirmed in a dialog of the page "KI", sent only while `whilst` still holds
+    /// (settingsd's `while`): the list of providers as the dialog was built from it, so his yes never removes
+    /// more than the dialog named.
+    Guarded { key: String, value: Json, whilst: Vec<(String, Json)> },
+    /// EINS-B (PLAN K8): bitscomp's keys below `prefix` unregistered and their stored values dropped.
+    Unregister { prefix: String },
+}
+
+/// A secret on its way to settingsd: no Debug output, no log line and no page text ever shows it, and its bytes
+/// are overwritten when it is dropped.
+#[derive(Clone, PartialEq)]
+pub struct Hidden(String);
+
+impl Hidden {
+    pub fn new(s: String) -> Hidden {
+        Hidden(s)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_in(&self, text: &str) -> bool {
+        !self.0.is_empty() && text.contains(self.0.as_str())
+    }
+}
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+impl Drop for Hidden {
+    fn drop(&mut self) {
+        wipe(std::mem::take(&mut self.0));
+    }
+}
+
+/// Overwrites a text that held a secret before its memory goes back.
+pub fn wipe(s: String) {
+    let mut b = s.into_bytes();
+    b.fill(0);
+    std::hint::black_box(&b);
 }
 
 /// The change an undo dialog was confirmed for.
@@ -88,6 +140,13 @@ impl Writer {
     pub fn send(&self, pid: u32, r: Req) -> bool {
         self.tx.send((pid, r, Instant::now())).is_ok()
     }
+
+    /// A writer whose queue a test reads (no thread, no socket).
+    #[cfg(test)]
+    pub fn for_test() -> (Writer, mpsc::Receiver<(u32, Req, Instant)>) {
+        let (tx, rx) = mpsc::channel();
+        (Writer { tx }, rx)
+    }
 }
 
 pub fn start(handle: &LoopHandle<'static, App>, socket: String) -> Result<Writer, String> {
@@ -111,7 +170,7 @@ fn run(socket: &str, rx: &mpsc::Receiver<Queued>, tx: &Sender<Done>) {
     while let Ok((pid, r, queued)) = rx.recv() {
         let waited = queued.elapsed();
         let d = if waited > LIMIT {
-            eprintln!("bitscomp: settings change dropped after {} ms in the queue: {}", waited.as_millis(), request_line(&r));
+            eprintln!("bitscomp: settings change dropped after {} ms in the queue: {}", waited.as_millis(), logged_line(&r));
             Done { pid, ok: false, key: key_of(&r), text: "Nicht geändert: der Einstellungsdienst war zu langsam.".into(), ask: None }
         } else {
             one(socket, pid, &r)
@@ -124,9 +183,11 @@ fn run(socket: &str, rx: &mpsc::Receiver<Queued>, tx: &Sender<Done>) {
 
 fn key_of(r: &Req) -> Option<String> {
     match r {
-        Req::Set { key, .. } => Some(key.clone()),
+        Req::Set { key, .. } | Req::Secret { key, .. } | Req::Reset { key, .. } | Req::Guarded { key, .. } => Some(key.clone()),
         Req::Undo { .. } => None,
         Req::Register { keys } => keys.first().map(|(k, _)| k.clone()),
+        Req::Defs { keys } => keys.first().and_then(|d| d.get("key")).and_then(Json::as_str).map(String::from),
+        Req::Unregister { prefix } => Some(prefix.clone()),
     }
 }
 
@@ -151,11 +212,14 @@ fn one(socket: &str, pid: u32, r: &Req) -> Done {
         Ok(j) => answer(pid, r, &j),
         Err(e) => {
             eprintln!("bitscomp: settings change failed: {e}");
-            Done { pid, ok: false, key: None, text: "Der Einstellungsdienst antwortet nicht.".into(), ask: None }
+            Done { pid, ok: false, key: key_of(r).filter(|_| matches!(r, Req::Secret { .. })), text: "Der Einstellungsdienst antwortet nicht.".into(), ask: None }
         }
     };
+    if matches!(r, Req::Secret { .. }) {
+        wipe(line);
+    }
     if !d.ok {
-        eprintln!("bitscomp: settingsd refused {line}: {}", d.text);
+        eprintln!("bitscomp: settingsd refused {}: {}", logged_line(r), d.text);
     }
     // An undo of a confirm key: the page asks first, naming the key and the value it goes back to.
     if let (Some(a), Some(e)) = (d.ask.as_mut(), undoing) {
@@ -189,8 +253,16 @@ pub fn undo_refused(pid: u32, confirmed: Option<&Sure>, newest: Option<&Entry>) 
     }
 }
 
+/// The answer line of a `Reset` settingsd took.
+pub const DONE_RESET: &str = "Zurückgesetzt";
+
 /// The page's line when a confirmed undo no longer matches the newest change.
 pub const MEANWHILE: &str = "inzwischen neu geändert: nichts rückgängig gemacht.";
+
+/// CL-5: the page's line when the list of providers is no longer the one a removal's dialog was built from.
+/// A confirmed change whose value changed elsewhere while the dialog was open.
+pub const GUARD_MOVED: &str = "Der Wert hat sich inzwischen anderswo geändert: nichts geändert, bitte neu ansehen.";
+pub const LIST_MOVED: &str = "Die Liste der Anbieter hat sich geändert: nichts entfernt, bitte neu ansehen.";
 
 /// The page's line when the newest change came from someone else.
 pub fn foreign(source: &str) -> String {
@@ -238,6 +310,26 @@ pub fn undoable_in(j: &Json, n: usize) -> Result<(Option<Entry>, bool), String> 
     Ok((hit.map(|e| Entry { key: s(e, "key"), source: s(e, "source"), old: old(e), seq: seq(e) }), es.len() >= n))
 }
 
+/// GM-6d: the secrets bitscomp writes (the sofa mode's Wi-Fi password): their value never reaches a log line.
+pub const SECRETS: [&str; 1] = ["net.wifi.psk"];
+
+/// CL-5: a key whose value never reaches a log line: the listed ones and every provider's key
+/// (`ai.provider.<id>.key`), whatever the request that carries it.
+pub fn is_secret(key: &str) -> bool {
+    SECRETS.contains(&key) || key.strip_prefix("ai.provider.").and_then(|r| r.strip_suffix(".key")).is_some_and(|id| !id.is_empty() && !id.contains('.'))
+}
+
+/// The request line as the log shows it: a secret's value is `***`.
+pub fn logged_line(r: &Req) -> String {
+    match r {
+        Req::Set { key, confirmed, .. } if is_secret(key) => {
+            request_line(&Req::Set { key: key.clone(), value: Json::str("***"), confirmed: *confirmed })
+        }
+        Req::Secret { key, whilst, .. } => request_line(&Req::Secret { key: key.clone(), value: Hidden::new("***".into()), whilst: whilst.clone() }),
+        _ => request_line(r),
+    }
+}
+
 pub fn request_line(r: &Req) -> String {
     match r {
         Req::Set { key, value, confirmed } => {
@@ -262,6 +354,31 @@ pub fn request_line(r: &Req) -> String {
             let defs = keys.iter().map(|(k, name)| absicht_def(k, name)).collect();
             Json::obj(vec![("op", Json::str("register")), ("owner", Json::str(OWNER)), ("keys", Json::Arr(defs))])
         }
+        Req::Defs { keys } => Json::obj(vec![("op", Json::str("register")), ("owner", Json::str(OWNER)), ("keys", Json::Arr(keys.clone()))]),
+        Req::Unregister { prefix } => Json::obj(vec![("op", Json::str("unregister")), ("owner", Json::str(OWNER)), ("prefix", Json::str(prefix)), ("forget", Json::Bool(true))]),
+        Req::Secret { key, value, whilst } => Json::obj(vec![
+            ("op", Json::str("set")),
+            ("key", Json::str(key)),
+            ("value", Json::str(&value.0)),
+            ("source", Json::str(SOURCE)),
+            ("confirmed", Json::Bool(true)),
+            ("while", Json::obj(whilst.iter().map(|(k, v)| (k.as_str(), v.clone())).collect())),
+        ]),
+        Req::Reset { key, confirmed } => {
+            let mut v = vec![("op", Json::str("reset")), ("key", Json::str(key)), ("source", Json::str(SOURCE))];
+            if *confirmed {
+                v.push(("confirmed", Json::Bool(true)));
+            }
+            Json::obj(v)
+        }
+        Req::Guarded { key, value, whilst } => Json::obj(vec![
+            ("op", Json::str("set")),
+            ("key", Json::str(key)),
+            ("value", value.clone()),
+            ("source", Json::str(SOURCE)),
+            ("confirmed", Json::Bool(true)),
+            ("while", Json::obj(whilst.iter().map(|(k, v)| (k.as_str(), v.clone())).collect())),
+        ]),
     }
     .to_string()
 }
@@ -301,8 +418,24 @@ pub fn answer(pid: u32, r: &Req, j: &Json) -> Done {
     if !ok {
         let code = j.get("error").and_then(Json::as_str).unwrap_or("");
         let msg = j.get("message").and_then(Json::as_str).unwrap_or("");
+        // A refusal never repeats a secret it was sent (settingsd does not; this holds whatever it answers).
+        let msg = match r {
+            Req::Secret { value, .. } if value.is_in(msg) => "der Wert wurde abgelehnt",
+            _ => msg,
+        };
         let text = match code {
             "nothing_to_undo" => "Nichts mehr rückgängig zu machen.".to_string(),
+            "changed_meanwhile" if matches!(r, Req::Secret { .. }) => {
+                "Nicht gespeichert: Adresse, Art oder Ort haben sich geändert, während du getippt hast. Bitte ansehen und neu eingeben.".to_string()
+            }
+            "changed_meanwhile" if matches!(r, Req::Guarded { key, .. } if key == crate::ki::LIST) => LIST_MOVED.to_string(),
+            "changed_meanwhile" if matches!(r, Req::Guarded { .. }) => GUARD_MOVED.to_string(),
+            // A stored key binds address, kind and place: settingsd's sentence names console commands, the
+            // page says the same with its own buttons.
+            "key_bound" => key_of(r).as_deref().and_then(crate::ki::provider_of).map_or_else(|| msg.to_string(), |(id, _)| crate::ki_kinds::key_bound(id)),
+            // CL-5: settingsd's own German sentence, as it is (INT-CL-4: this bitscomp's yes does not count, it
+            // does not hold the screen).
+            "not_confirmer" => msg.to_string(),
             "changed_meanwhile" => MEANWHILE.to_string(),
             "not_undoable" if msg.is_empty() => "Nichts mehr rückgängig zu machen.".to_string(),
             "not_undoable" => format!("Nicht rückgängig zu machen: {msg}"),
@@ -317,6 +450,10 @@ pub fn answer(pid: u32, r: &Req, j: &Json) -> Done {
             Req::Set { key, value, confirmed: false } if code == "needs_confirm" => {
                 Some(Ask { req: Req::Set { key: key.clone(), value: value.clone(), confirmed: true }, key: key.clone(), to: value.clone() })
             }
+            // A reset back to a default that gives the assistant more freedom (settingsd's leash): asked like a set.
+            Req::Reset { key, confirmed: false } if code == "needs_confirm" => {
+                Some(Ask { req: Req::Reset { key: key.clone(), confirmed: true }, key: key.clone(), to: Json::Null })
+            }
             // The thread fills in the key and its old value from the history it read.
             Req::Undo { confirmed: None } if code == "needs_confirm" => Some(Ask { req: Req::UNDO, key: String::new(), to: Json::Null }),
             _ => None,
@@ -328,8 +465,11 @@ pub fn answer(pid: u32, r: &Req, j: &Json) -> Done {
         return Done { pid, ok, key, text, ask };
     }
     match r {
-        Req::Set { key, .. } => Done { pid, ok, key: Some(key.clone()), text: "Geändert".into(), ask: None },
-        Req::Register { .. } => Done { pid, ok, key: key_of(r), text: "Angemeldet".into(), ask: None },
+        Req::Set { key, .. } | Req::Guarded { key, .. } => Done { pid, ok, key: Some(key.clone()), text: "Geändert".into(), ask: None },
+        Req::Secret { key, .. } => Done { pid, ok, key: Some(key.clone()), text: "Gespeichert".into(), ask: None },
+        Req::Reset { key, .. } => Done { pid, ok, key: Some(key.clone()), text: DONE_RESET.into(), ask: None },
+        Req::Register { .. } | Req::Defs { .. } => Done { pid, ok, key: key_of(r), text: "Angemeldet".into(), ask: None },
+        Req::Unregister { .. } => Done { pid, ok, key: key_of(r), text: "Abgemeldet".into(), ask: None },
         Req::Undo { .. } => {
             let key = j
                 .get("undone")
@@ -374,6 +514,18 @@ mod tests {
         assert_eq!(request_line(&sure), r#"{"op":"undo","n":1,"source":"einstellungen","confirmed":true,"expect_seq":42}"#);
         let d = answer(1, &sure, &Json::parse(r#"{"ok":false,"error":"changed_meanwhile","message":"x"}"#).unwrap());
         assert!(!d.ok && d.text == MEANWHILE && d.key.as_deref() == Some("test.risky") && d.ask.is_none(), "{d:?}");
+    }
+
+    #[test]
+    fn a_secret_never_reaches_a_log_line_and_other_values_do() {
+        let psk = logged_line(&Req::set("net.wifi.psk", Json::str("geheim")));
+        assert!(!psk.contains("geheim") && psk.contains(r#""value":"***""#) && psk.contains("net.wifi.psk"), "{psk}");
+        let sure = logged_line(&Req::Set { key: "net.wifi.psk".into(), value: Json::str("geheim"), confirmed: true });
+        assert!(!sure.contains("geheim") && sure.contains(r#""confirmed":true"#), "{sure}");
+        let ssid = logged_line(&Req::set("net.wifi.ssid", Json::str("Flur")));
+        assert!(ssid.contains(r#""value":"Flur""#), "{ssid}");
+        // The request settingsd gets carries the value itself.
+        assert!(request_line(&Req::set("net.wifi.psk", Json::str("geheim"))).contains("geheim"));
     }
 
     #[test]
@@ -423,6 +575,12 @@ mod tests {
         // A confirmed request refused again is not asked again (no loop of dialogs).
         assert_eq!(answer(7, &sure, &j).ask, None);
         assert!(answer(7, &Req::UNDO, &j).ask.is_some() && answer(7, &undo, &j).ask.is_none());
+        // WY-SET fixer: a reset the leash refuses is asked too (to the default), a confirmed one is not.
+        let reset = Req::Reset { key: "ai.helper.write.allow".into(), confirmed: false };
+        let sure_reset = Req::Reset { key: "ai.helper.write.allow".into(), confirmed: true };
+        assert_eq!(answer(7, &reset, &j).ask, Some(Ask { req: sure_reset.clone(), key: "ai.helper.write.allow".into(), to: Json::Null }));
+        assert_eq!(answer(7, &sure_reset, &j).ask, None);
+        assert!(request_line(&sure_reset).ends_with(r#","confirmed":true}"#));
         let other = Json::parse(r#"{"ok":false,"error":"bad_value","message":"x"}"#).unwrap();
         assert_eq!(answer(7, &plain, &other).ask, None);
         let h = Json::parse(r#"{"ok":true,"entries":[{"key":"test.risky","op":"set","source":"einstellungen","old":1}]}"#).unwrap();

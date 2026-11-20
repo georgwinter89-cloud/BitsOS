@@ -85,14 +85,13 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use ksync::{Mutex, SpinLock};
 
+mod vcnlive;
+
 /// The carve-out's CPU mapping pieces.
 pub const CHUNK: u64 = PIECE;
 const PAGE_4K: u64 = 4096;
 const WAIT_NS: u64 = 100_000_000;
 
-/// The pieces mapped in this boot: (CPU phys, mapping). Never given back (VA is not reused); at most one per
-/// 2 MiB of carve-out the PSP's buffers touch.
-static CHUNKS: Mutex<Vec<(u64, Arc<hal::mmio::IoMem>)>> = Mutex::named("amdgpu.psp_chunks", Vec::new());
 
 /// Where the carve-out lies (offsets from 0 to `size`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +133,8 @@ impl CarveWin {
 }
 
 pub struct PspHw {
+    /// The device's PSP state (its mapped pieces).
+    dv: &'static State,
     regs: &'static DcnRegs,
     read_ok: Vec<u32>,
     write_ok: Vec<u32>,
@@ -164,12 +165,12 @@ pub fn gmc_lists(g: &GmcInputs, guard: &DisplayGuard) -> (Vec<u32>, Vec<u32>) {
 
 impl PspHw {
     /// `g`: the SMU/GC stage's addresses (M3 and mode 2); without it only the PSP's five registers are writable.
-    pub fn new(regs: &'static DcnRegs, d: &Discovery, a: &Addrs, g: Option<&GfxInputs>, win: CarveWin, forbid: Vec<Range<u64>>) -> PspHw {
-        PspHw::with_gmc(regs, d, a, g, None, win, forbid)
+    pub fn new(dv: &'static State, regs: &'static DcnRegs, d: &Discovery, a: &Addrs, g: Option<&GfxInputs>, win: CarveWin, forbid: Vec<Range<u64>>) -> PspHw {
+        PspHw::with_gmc(dv, regs, d, a, g, None, win, forbid)
     }
 
     /// `new` with the GMC stage's lists (`gmc_lists`).
-    pub fn with_gmc(regs: &'static DcnRegs, d: &Discovery, a: &Addrs, g: Option<&GfxInputs>, gm: Option<(Vec<u32>, Vec<u32>)>, win: CarveWin, forbid: Vec<Range<u64>>) -> PspHw {
+    pub fn with_gmc(dv: &'static State, regs: &'static DcnRegs, d: &Discovery, a: &Addrs, g: Option<&GfxInputs>, gm: Option<(Vec<u32>, Vec<u32>)>, win: CarveWin, forbid: Vec<Range<u64>>) -> PspHw {
         let mut read_ok: Vec<u32> = classify::addresses(d).into_iter().filter_map(|(_, b)| b).collect();
         read_ok.extend(a.readable());
         let mut write_ok: Vec<u32> = a.writable().to_vec();
@@ -179,7 +180,7 @@ impl PspHw {
             write_ok.extend(g.smu.writable());
             write_ok.extend(g.gc.writable());
         }
-        let mut hw = PspHw { regs, read_ok, write_ok, smn: g.map(|g| g.smu), win, pieces: Vec::new(), forbid, atomic: false, rsmu_more: Vec::new(), nbio: None, doorbell: None, doorbells_ok: Vec::new() };
+        let mut hw = PspHw { dv, regs, read_ok, write_ok, smn: g.map(|g| g.smu), win, pieces: Vec::new(), forbid, atomic: false, rsmu_more: Vec::new(), nbio: None, doorbell: None, doorbells_ok: Vec::new() };
         if let Some((r, w)) = gm {
             hw.allow_gmc(r, w);
         }
@@ -228,6 +229,14 @@ impl PspHw {
         }
     }
 
+    /// GX-8v: VCN 0's registers, NBIO's VCN doorbell range as an RSMU index value, VCN's doorbell; `mm`: MMHUB's
+    /// context registers 1-7 and engine 0's range (none a display field).
+    pub fn allow_vcn(&mut self, a: &crate::gpucore::vcn::VcnAddrs, bar2: Option<u64>, mm: Vec<u32>) {
+        self.allow_gmc(a.readable(), [a.writable(), mm].concat());
+        self.rsmu_more.extend(a.rsmu_value());
+        self.allow_doorbell(crate::ipmod::vcn4::DOORBELL_DW, bar2);
+    }
+
     /// GX-7m: the MES process queue's doorbell (`vmproc::DOORBELL_DW`).
     pub fn allow_vm_doorbell(&mut self, bar2: Option<u64>) {
         self.allow_doorbell(crate::gpucore::vmproc::DOORBELL_DW, bar2);
@@ -253,6 +262,31 @@ impl PspHw {
         write_ok.contains(&byte) || smn.is_some_and(|s| s.smn_index_ok(byte, value))
     }
 
+    /// BAR2's first page, mapped uncached on the first ring, for a doorbell a stage named (SDMA 0's, GFX ring 0's, VCN
+    /// 0's: the first page holds every kernel doorbell).
+    fn doorbell_page(&mut self, index_dw: u32) -> Option<Arc<hal::mmio::IoMem>> {
+        if !Self::doorbell_ok(&self.doorbells_ok, index_dw) {
+            return None;
+        }
+        let (phys, io) = self.doorbell.as_mut()?;
+        if io.is_none() {
+            if self.atomic {
+                return None;
+            }
+            match hal::mmio::map_device(*phys, PAGE_4K as usize, hal::paging::CacheType::Uncached) {
+                Ok(m) => {
+                    klog::event!(Info, "gx", "doorbell.mapped", phys = klog::Hex(*phys); "BAR2's first page, uncached");
+                    *io = Some(Arc::new(m));
+                }
+                Err(e) => {
+                    klog::event!(Error, "gx", "sdma.doorbell_map_failed", phys = klog::Hex(*phys), why = format!("{e:?}").as_str());
+                    return None;
+                }
+            }
+        }
+        io.clone()
+    }
+
     fn piece(&mut self, c: u64) -> Option<Arc<hal::mmio::IoMem>> {
         let phys = self.win.phys_base.checked_add(c.checked_mul(CHUNK)?)?;
         if let Some((_, io)) = self.pieces.iter().find(|(p, _)| *p == phys) {
@@ -261,7 +295,7 @@ impl PspHw {
         if self.atomic {
             return None;
         }
-        let mut all = CHUNKS.lock_timeout(WAIT_NS)?;
+        let mut all = self.dv.chunks.lock_timeout(WAIT_NS)?;
         let io = match all.iter().find(|(p, _)| *p == phys) {
             Some((_, io)) => io.clone(),
             None => {
@@ -304,27 +338,10 @@ impl Hw for PspHw {
         ok && self.regs.write_raw(byte, value).is_ok()
     }
     fn doorbell_write64(&mut self, index_dw: u32, value: u64) -> bool {
-        // Only the doorbells a stage named (SDMA 0's, GFX ring 0's: the first page of BAR2 holds every kernel doorbell).
-        if !Self::doorbell_ok(&self.doorbells_ok, index_dw) {
-            return false;
-        }
-        let Some((phys, io)) = self.doorbell.as_mut() else { return false };
-        if io.is_none() {
-            if self.atomic {
-                return false;
-            }
-            match hal::mmio::map_device(*phys, PAGE_4K as usize, hal::paging::CacheType::Uncached) {
-                Ok(m) => {
-                    klog::event!(Info, "gx", "doorbell.mapped", phys = klog::Hex(*phys); "BAR2's first page, uncached");
-                    *io = Some(Arc::new(m));
-                }
-                Err(e) => {
-                    klog::event!(Error, "gx", "sdma.doorbell_map_failed", phys = klog::Hex(*phys), why = format!("{e:?}").as_str());
-                    return false;
-                }
-            }
-        }
-        io.as_ref().is_some_and(|m| m.write64(index_dw as usize * 4, value).is_ok())
+        self.doorbell_page(index_dw).is_some_and(|m| m.write64(index_dw as usize * 4, value).is_ok())
+    }
+    fn doorbell_write32(&mut self, index_dw: u32, value: u32) -> bool {
+        self.doorbell_page(index_dw).is_some_and(|m| m.write32(index_dw as usize * 4, value).is_ok())
     }
     fn mem_read(&mut self, mc: u64, buf: &mut [u8]) -> bool {
         let Some(r) = self.win.offsets(mc, buf.len()) else { return false };
@@ -398,21 +415,19 @@ impl Hw for PspHw {
     }
 }
 
-/// The PSP buffers of this boot (`pspbringup::Pool`): taken from the manager once, never given back to it.
-static POOL: Mutex<Pool> = Mutex::named("amdgpu.psp_pool", Pool::new());
 
 /// The device object's BO manager through the boot's PSP pool, each locked per call (the run sleeps between
 /// allocations). Lock order: the pool, then the manager.
-pub struct SharedBos<'a>(pub &'a SpinLock<BoManager>);
+pub struct SharedBos<'a>(pub &'a SpinLock<BoManager>, pub &'a Mutex<Pool>);
 
 impl BoAlloc for SharedBos<'_> {
     fn alloc(&mut self, size: u64, align: u64) -> Result<(u32, Range<u64>), bo::BoError> {
-        let mut pool = POOL.lock_timeout(WAIT_NS).ok_or(bo::BoError::Busy)?;
+        let mut pool = self.1.lock_timeout(WAIT_NS).ok_or(bo::BoError::Busy)?;
         pool.alloc(&mut *self.0.lock(), size, align)
     }
     fn release(&mut self, handle: u32) {
         // Back to the pool only; a pool that cannot be locked keeps the buffer busy (leaked, never reused).
-        if let Some(mut pool) = POOL.lock_timeout(WAIT_NS) {
+        if let Some(mut pool) = self.1.lock_timeout(WAIT_NS) {
             pool.release(handle);
         }
     }
@@ -435,79 +450,18 @@ struct Live {
     mes: Option<(MesAddrs, Option<u64>, bool)>,
     /// GX-7j3: the SMU and GC registers of the stop's unload (from discovery: sent only while `gc` is `Booted`).
     un: Option<handoff::UnloadAddrs>,
+    /// GX-8v: a passed VCN stage runs on this owner: until=stop stops it first, the backend's job half takes it.
+    vcn: Option<vcnlive::VcnKept>,
 }
 
-/// A ring kept by `keep` (with its owner, for the Quiesce hook and `until=stop`).
-static LIVE: Mutex<Option<Live>> = Mutex::named("amdgpu.psp_live", None);
-/// This driver switched the function's bus master on (the firmware had it off).
-static BUS_MASTER_OURS: AtomicBool = AtomicBool::new(false);
-static QUIESCE_ON: AtomicBool = AtomicBool::new(false);
-/// M2 runs in this boot (a second load in one power cycle has no Linux model, V1-20 OPEN-13).
-static M2_RUNS: AtomicU32 = AtomicU32::new(0);
-/// Set when a run ended in a state only a reboot clears (ring never ready, a fence lost).
-static REBOOT_NEEDED: AtomicBool = AtomicBool::new(false);
-/// GX-7e: GC stages run in this boot (a second EnableGfxImu on a booted GC has no Linux model but resume).
-static GFX_RUNS: AtomicU32 = AtomicU32::new(0);
-/// GX-7e: the last GC stage failed after EnableGfxImu reached PMFW.
-static GC_FAILED: AtomicBool = AtomicBool::new(false);
-/// GX-7h: GMC stages run in this boot, and the GART table's BO (kept for the boot: the hubs point at it).
-static GMC_RUNS: AtomicU32 = AtomicU32::new(0);
-static GART_TABLE: SpinLock<Option<TableBo>> = SpinLock::named("amdgpu.gart_table", None);
-/// GX-7i: the GART of this boot's last passed GMC stage (`None` after a failed one), the SDMA stages run, the
-/// SDMA buffer (kept for the boot: an engine left running reads its ring) and the firmware's burst NOP (0 unknown,
-/// 1 off, 2 on; read when a run loaded the firmware).
-static GART_UP: SpinLock<Option<GartUse>> = SpinLock::named("amdgpu.gart_up", None);
-static SDMA_RUNS: AtomicU32 = AtomicU32::new(0);
-static SDMA_BO: SpinLock<Option<SdmaBo>> = SpinLock::named("amdgpu.sdma_bo", None);
-static BURST_NOP: AtomicU8 = AtomicU8::new(0);
-/// GX-7i: an SDMA stage began in this boot (armed before its first SDMA write): the Quiesce hook halts SDMA 0
-/// through its registers. A `Once`, so the hook reads it without any lock (a run may hold every other one).
-static SDMA_ARMED: ksync::Once<SdmaAddrs> = ksync::Once::new();
 
-/// GX-7j: GFX stages run in this boot, the GFX buffer (kept for the boot: a CP left running reads its ring) and
-/// the arming of the Quiesce halt (a `Once`, read without any lock).
-static GFX_RING_RUNS: AtomicU32 = AtomicU32::new(0);
-static GFX_BO: SpinLock<Option<GfxBo>> = SpinLock::named("amdgpu.gfx_bo", None);
-static GFX_ARMED: ksync::Once<GfxAddrs> = ksync::Once::new();
-/// GX-7k: MES stages run in this boot, the MES buffer (kept for the boot: MES reads its MQDs and rings while it
-/// runs), the MES firmware starts of this boot's firmware load, MES left running by a run of this boot (with its
-/// buffer's MC base and whether legacy queues are mapped), and the arming of the Quiesce halt.
-static MES_RUNS: AtomicU32 = AtomicU32::new(0);
-static MES_BO: SpinLock<Option<MesBo>> = SpinLock::named("amdgpu.mes_bo", None);
-static MES_UC: SpinLock<[Option<u64>; 2]> = SpinLock::named("amdgpu.mes_uc", [None, None]);
-static MES_UP: SpinLock<Option<(MesAddrs, Option<u64>, bool)>> = SpinLock::named("amdgpu.mes_up", None);
-/// GX-8a: what INFO reports as loaded: the files of the last run that loaded firmware, MES's versions as it reported them.
-static FW_VERSIONS: SpinLock<Vec<drm::gpu::Firmware>> = SpinLock::named("amdgpu.fw_versions", Vec::new());
-static MES_VERSIONS: SpinLock<(Option<u32>, Option<u32>)> = SpinLock::named("amdgpu.mes_versions", (None, None));
-/// PMFW's answer to GetPmfwVersion in this boot's last GC stage (`gfxup::GfxReport::pmfw`).
-static PMFW_VERSION: SpinLock<Option<u32>> = SpinLock::named("amdgpu.pmfw_version", None);
 
 /// Host tests: `MES_UP` as a passed, kept gfx_mes leaves it (`Some`) or as at boot (`None`).
 #[cfg(test)]
-pub(crate) fn set_mes_up_for_test(v: Option<(MesAddrs, Option<u64>, bool)>) {
-    *MES_UP.lock() = v;
+pub(crate) fn set_mes_up_for_test(dv: &State, v: Option<(MesAddrs, Option<u64>, bool)>) {
+    *dv.mes_up.lock() = v;
 }
-static MES_ARMED: ksync::Once<MesAddrs> = ksync::Once::new();
-/// Legacy queues MES did not unmap (a failed gfx_mes run or stop with MES deaf), or left by the VM stage's recovery
-/// (`vmring::VmReport::stranded`): their HQDs stay active with no firmware owning them, so no stage may start the CP or its firmware again in this boot. Cleared by a passed
-/// gfx_mes run (MES owns both queues again).
-static MES_STRANDED: AtomicBool = AtomicBool::new(false);
-/// GX-7m: this run's `ack=linux` (until=vm). Stored by every continue on a kept run before the stage runs, so the
-/// initial value is never read; the default (linux for until=vm) is `parse_args`'s alone.
-static VM_ACK_LINUX: AtomicBool = AtomicBool::new(false);
-/// GX-7m: the test VM a passed `until=vm` left (until=stop, a later MES/GFX stage or until=vm tear it down).
-static VM_UP: SpinLock<Option<(VmAddrs, VmUp)>> = SpinLock::named("amdgpu.vm_up", None);
 
-/// GX-8b: the Quiesce hook runs: the job thread leaves the chain alone from now on (the hook wants `LIVE`, and the engines
-/// it halts would look hung).
-static JOBS_OFF: AtomicBool = AtomicBool::new(false);
-/// GX-7n: the IH ring: running; its buffer (kept for the boot: the chip's write pointer stays there until the next start
-/// moves it); the doorbell page; the Quiesce hook's arming; whether a backend starts one (`until=irq_poll`).
-static IH: Mutex<Option<IhUp>> = Mutex::named("amdgpu.ih.up", None);
-static IH_BO: SpinLock<Option<(u32, Range<u64>)>> = SpinLock::named("amdgpu.ih.bo", None);
-static IH_DOORBELL: ksync::Once<Arc<hal::mmio::IoMem>> = ksync::Once::new();
-static IH_ARMED: ksync::Once<crate::gpucore::ih::IhAddrs> = ksync::Once::new();
-static IH_WANTED: AtomicBool = AtomicBool::new(true);
 
 /// A running IH ring.
 struct IhUp {
@@ -516,15 +470,199 @@ struct IhUp {
     found: crate::gpucore::ih::Found,
 }
 
+/// GP-GPU1 (plan/spec/gpu-rdna4.md piece 3): what the PSP run of one 780M keeps across calls. These were this module's statics while
+/// the kernel knew one GPU; they belong to the device (`devs::Device::psp`), so a second function can never read or
+/// move another's ring, buffers or counts. The stop note's port to the kernel (`NOTE_IO`, `INHERITED`, `LAST`) stays
+/// the kernel's one slot: its format names no device yet.
+pub struct State {
+    arms: ksync::Once<Arms>,
+    /// The pieces mapped in this boot: (CPU phys, mapping). Never given back (VA is not reused); at most one per
+    /// 2 MiB of carve-out the PSP's buffers touch.
+    chunks: Mutex<Vec<(u64, Arc<hal::mmio::IoMem>)>>,
+    /// The PSP buffers of this boot (`pspbringup::Pool`): taken from the manager once, never given back to it.
+    pool: Mutex<Pool>,
+    /// A ring kept by `keep` (with its owner, for the Quiesce hook and `until=stop`).
+    live: Mutex<Option<Live>>,
+    /// GPY: `live` is Some, kept beside it so a reader needs no lock (every GPU job holds `live` for its submit).
+    kept: AtomicBool,
+    /// This driver switched the function's bus master on (the firmware had it off).
+    bus_master_ours: AtomicBool,
+    /// M2 runs in this boot (a second load in one power cycle has no Linux model, V1-20 OPEN-13).
+    m2_runs: AtomicU32,
+    /// Set when a run ended in a state only a reboot clears (ring never ready, a fence lost).
+    reboot_needed: AtomicBool,
+    /// GX-7e: GC stages run in this boot (a second EnableGfxImu on a booted GC has no Linux model but resume).
+    gfx_runs: AtomicU32,
+    /// GX-7e: the last GC stage failed after EnableGfxImu reached PMFW.
+    gc_failed: AtomicBool,
+    /// GX-7h: GMC stages run in this boot, and the GART table's BO (kept for the boot: the hubs point at it).
+    gmc_runs: AtomicU32,
+    gart_table: SpinLock<Option<TableBo>>,
+    /// GX-7i: the GART of this boot's last passed GMC stage (`None` after a failed one), the SDMA stages run, the
+    /// SDMA buffer (kept for the boot: an engine left running reads its ring) and the firmware's burst NOP (0 unknown,
+    /// 1 off, 2 on; read when a run loaded the firmware).
+    gart_up: SpinLock<Option<GartUse>>,
+    sdma_runs: AtomicU32,
+    sdma_bo: SpinLock<Option<SdmaBo>>,
+    burst_nop: AtomicU8,
+    /// GX-7i: an SDMA stage began in this boot (armed before its first SDMA write): the Quiesce hook halts SDMA 0
+    /// through its registers. A `Once`, so the hook reads it without any lock (a run may hold every other one).
+    sdma_armed: ksync::Once<SdmaAddrs>,
+    /// GX-7j: GFX stages run in this boot, the GFX buffer (kept for the boot: a CP left running reads its ring) and
+    /// the arming of the Quiesce halt (a `Once`, read without any lock).
+    gfx_ring_runs: AtomicU32,
+    gfx_bo: SpinLock<Option<GfxBo>>,
+    gfx_armed: ksync::Once<GfxAddrs>,
+    /// GX-7k: MES stages run in this boot, the MES buffer (kept for the boot: MES reads its MQDs and rings while it
+    /// runs), the MES firmware starts of this boot's firmware load, MES left running by a run of this boot (with its
+    /// buffer's MC base and whether legacy queues are mapped), and the arming of the Quiesce halt.
+    mes_runs: AtomicU32,
+    mes_bo: SpinLock<Option<MesBo>>,
+    mes_uc: SpinLock<[Option<u64>; 2]>,
+    mes_up: SpinLock<Option<(MesAddrs, Option<u64>, bool)>>,
+    /// GX-8a: what INFO reports as loaded: the files of the last run that loaded firmware, MES's versions as it reported them.
+    fw_versions: SpinLock<Vec<drm::gpu::Firmware>>,
+    mes_versions: SpinLock<(Option<u32>, Option<u32>)>,
+    /// PMFW's answer to GetPmfwVersion in this boot's last GC stage (`gfxup::GfxReport::pmfw`).
+    pmfw_version: SpinLock<Option<u32>>,
+    mes_armed: ksync::Once<MesAddrs>,
+    /// Legacy queues MES did not unmap (a failed gfx_mes run or stop with MES deaf), or left by the VM stage's recovery
+    /// (`vmring::VmReport::stranded`): their HQDs stay active with no firmware owning them, so no stage may start the CP or its firmware again in this boot. Cleared by a passed
+    /// gfx_mes run (MES owns both queues again).
+    mes_stranded: AtomicBool,
+    /// GX-7m: this run's `ack=linux` (until=vm). Stored by every continue on a kept run before the stage runs, so the
+    /// initial value is never read; the default (linux for until=vm) is `parse_args`'s alone.
+    vm_ack_linux: AtomicBool,
+    /// GX-7m: the test VM a passed `until=vm` left (until=stop, a later MES/GFX stage or until=vm tear it down).
+    vm_up: SpinLock<Option<(VmAddrs, VmUp)>>,
+    /// GX-8b: the Quiesce hook runs: the job thread leaves the chain alone from now on (the hook wants `LIVE`, and the engines
+    /// it halts would look hung).
+    jobs_off: AtomicBool,
+    /// GX-7n: the IH ring: running; its buffer (kept for the boot: the chip's write pointer stays there until the next start
+    /// moves it); the doorbell page; the Quiesce hook's arming; whether a backend starts one (`until=irq_poll`).
+    ih: Mutex<Option<IhUp>>,
+    ih_bo: SpinLock<Option<(u32, Range<u64>)>>,
+    ih_doorbell: ksync::Once<Arc<hal::mmio::IoMem>>,
+    ih_armed: ksync::Once<crate::gpucore::ih::IhAddrs>,
+    ih_wanted: AtomicBool,
+    /// GPY: `ih` is Some, for the same lock-free reading as `kept`.
+    ih_on: AtomicBool,
+    /// GX-9a: the full reset's picture to compare with: from before its first step.
+    reset_picture: SpinLock<Option<Arc<(alloc::collections::BTreeMap<u32, u32>, dcn::Marks)>>>,
+    /// GX-9a: the ladder went on without the full reset step in progress (`Chain::reset_abandoned`).
+    reset_abandoned: AtomicBool,
+    /// A mode 2 ran since the IH ring last started: the re-init starts it again.
+    mode2_sent: AtomicBool,
+    /// GX-8b: what `until=jobs` compares against: the picture when the node came up.
+    picture_at_node: SpinLock<Option<(alloc::collections::BTreeMap<u32, u32>, dcn::Marks)>>,
+    /// GX-7j: NBIO's doorbell aperture as this boot's first doorbell stage (SDMA or GFX) found it: what a stop puts back.
+    aper_first: SpinLock<Option<u32>>,
+    /// GX-7i2: NBIO's doorbell side (aperture, CSDMA range) as this boot's first SDMA stage found it.
+    nbio_found: SpinLock<Option<sdma::NbioFound>>,
+    /// GX-7i2: this boot's SDMA stage turned the doorbell aperture on and no stop put it back (the classifier's trace).
+    aperture_ours: AtomicBool,
+    /// The kernel before left bus master on (its note): taken over once by this boot's first run.
+    bus_master_inherited: AtomicBool,
+    /// PSPs whose buffers the PSP may still hold (failed undo, wedged ring): their BOs are never given back in this
+    /// boot (`Psp` has no Drop, so dropping it keeps them allocated), bus master stays on, runs are refused.
+    quarantined: AtomicU32,
+    /// The heaps of this boot: one set over the device's manager, whatever comes and goes on top (their cushion of slabs
+    /// stays, so a later backend finds it again).
+    heaps: ksync::Once<Arc<crate::hw::heap::Heaps>>,
+    /// GX-8v: the VCN buffer (kept for the boot: a VCPU reads its context and ring) and the Quiesce halt's arming.
+    vcn_bo: SpinLock<Option<crate::gpucore::vcn::VcnBo>>,
+    vcn_armed: ksync::Once<(crate::gpucore::vcn::VcnAddrs, crate::ipmod::smu13::Addrs)>,
+}
+
+/// The Quiesce arming as the stages call it: closures over one device's state, made once (the stages' inputs keep a
+/// `'static` reference to them).
+struct Arms {
+    mes: alloc::boxed::Box<dyn Fn(MesAddrs) + Send + Sync>,
+    gfx: alloc::boxed::Box<dyn Fn(GfxAddrs) + Send + Sync>,
+    sdma: alloc::boxed::Box<dyn Fn(SdmaAddrs) + Send + Sync>,
+}
+
+fn arms(dv: &'static State) -> &'static Arms {
+    dv.arms.get_or_init(|| Arms {
+        mes: alloc::boxed::Box::new(move |a| arm_mes(dv, a)),
+        gfx: alloc::boxed::Box::new(move |a| arm_gfx(dv, a)),
+        sdma: alloc::boxed::Box::new(move |a| arm_sdma(dv, a)),
+    })
+}
+
+impl State {
+    pub fn new() -> State {
+        State {
+            arms: ksync::Once::new(),
+            chunks: Mutex::named("amdgpu.psp_chunks", Vec::new()),
+            pool: Mutex::named("amdgpu.psp_pool", Pool::new()),
+            live: Mutex::named("amdgpu.psp_live", None),
+            kept: AtomicBool::new(false),
+            bus_master_ours: AtomicBool::new(false),
+            m2_runs: AtomicU32::new(0),
+            reboot_needed: AtomicBool::new(false),
+            gfx_runs: AtomicU32::new(0),
+            gc_failed: AtomicBool::new(false),
+            gmc_runs: AtomicU32::new(0),
+            gart_table: SpinLock::named("amdgpu.gart_table", None),
+            gart_up: SpinLock::named("amdgpu.gart_up", None),
+            sdma_runs: AtomicU32::new(0),
+            sdma_bo: SpinLock::named("amdgpu.sdma_bo", None),
+            burst_nop: AtomicU8::new(0),
+            sdma_armed: ksync::Once::new(),
+            gfx_ring_runs: AtomicU32::new(0),
+            gfx_bo: SpinLock::named("amdgpu.gfx_bo", None),
+            gfx_armed: ksync::Once::new(),
+            mes_runs: AtomicU32::new(0),
+            mes_bo: SpinLock::named("amdgpu.mes_bo", None),
+            mes_uc: SpinLock::named("amdgpu.mes_uc", [None, None]),
+            mes_up: SpinLock::named("amdgpu.mes_up", None),
+            fw_versions: SpinLock::named("amdgpu.fw_versions", Vec::new()),
+            mes_versions: SpinLock::named("amdgpu.mes_versions", (None, None)),
+            pmfw_version: SpinLock::named("amdgpu.pmfw_version", None),
+            mes_armed: ksync::Once::new(),
+            mes_stranded: AtomicBool::new(false),
+            vm_ack_linux: AtomicBool::new(false),
+            vm_up: SpinLock::named("amdgpu.vm_up", None),
+            jobs_off: AtomicBool::new(false),
+            ih: Mutex::named("amdgpu.ih.up", None),
+            ih_bo: SpinLock::named("amdgpu.ih.bo", None),
+            ih_doorbell: ksync::Once::new(),
+            ih_armed: ksync::Once::new(),
+            ih_wanted: AtomicBool::new(true),
+            ih_on: AtomicBool::new(false),
+            reset_picture: SpinLock::named("amdgpu.hw.reset_picture", None),
+            reset_abandoned: AtomicBool::new(false),
+            mode2_sent: AtomicBool::new(false),
+            picture_at_node: SpinLock::named("amdgpu.hw.picture", None),
+            aper_first: SpinLock::named("amdgpu.aper_first", None),
+            nbio_found: SpinLock::named("amdgpu.nbio_found", None),
+            aperture_ours: AtomicBool::new(false),
+            bus_master_inherited: AtomicBool::new(false),
+            quarantined: AtomicU32::new(0),
+            heaps: ksync::Once::new(),
+            vcn_bo: SpinLock::named("amdgpu.vcn_bo", None),
+            vcn_armed: ksync::Once::new(),
+        }
+    }
+}
+
+impl Default for State {
+    fn default() -> State {
+        State::new()
+    }
+}
+
 /// The kept chain as the job half sees it.
-struct LiveChain;
+struct LiveChain(&'static Gpu);
 
 impl crate::hw::chain::Chain for LiveChain {
     fn with(&self, f: &mut dyn FnMut(&mut dyn crate::hw::chain::ChainOwner)) -> bool {
-        if JOBS_OFF.load(Ordering::Acquire) {
+        let dv = self.0.st();
+        if dv.jobs_off.load(Ordering::Acquire) {
             return false;
         }
-        let Some(mut g) = LIVE.lock_timeout(WAIT_NS) else {
+        let Some(mut g) = dv.live.lock_timeout(WAIT_NS) else {
             klog::event!(Warn, "gx", "hw.chain_busy");
             return false;
         };
@@ -533,59 +671,56 @@ impl crate::hw::chain::Chain for LiveChain {
         true
     }
     fn note_stranded(&self) {
-        note_stranded(&["a kernel ring, after a recovery"]);
+        note_stranded(self.0.st(), &["a kernel ring, after a recovery"]);
     }
     fn suspend_gc(&self, lines: &mut Vec<String>) -> bool {
-        let Some(g) = Gpu::get() else { return false };
-        let Some(_one) = reset_gate(lines) else { return false };
+        let g = self.0;
+        let Some(_one) = reset_gate(g, lines) else { return false };
         reset_base(g);
         let (r, halted) = stop_chain(g, lines, true);
         r == Ok(true) && halted
     }
     fn mode2_reset(&self, lines: &mut Vec<String>) -> Option<bool> {
-        let g = Gpu::get()?;
-        let _one = reset_gate(lines)?;
+        let g = self.0;
+        let _one = reset_gate(g, lines)?;
         mode2_chip(g, lines)
     }
     fn reinit_gc(&self, lines: &mut Vec<String>) -> Option<crate::hw::chain::Reinit> {
-        let g = Gpu::get()?;
-        let _one = reset_gate(lines)?;
+        let g = self.0;
+        let _one = reset_gate(g, lines)?;
         let r = reinit_chip(g, lines);
         // A failed one leaves no base for a next rung's first look: that takes its own. The map goes after the lock.
-        let _old = RESET_PICTURE.lock().take();
+        let _old = g.st().reset_picture.lock().take();
         r
     }
     fn reset_abandoned(&self, gone: bool) {
-        RESET_ABANDONED.store(gone, Ordering::Release);
+        self.0.st().reset_abandoned.store(gone, Ordering::Release);
     }
     fn proven_halted(&self) {
-        let n = crate::hw::live::HELD.engines_proven_halted();
+        let n = self.0.hw().held.engines_proven_halted();
         klog::event!(Info, "gx", "hw.held_let_go", jobs = n; "a full reset passed: what an earlier stop held goes, the flag with it");
     }
     fn device_lost(&self) {
-        crate::hw::boot::note_device_lost();
+        self.0.dev.boot.note_device_lost();
     }
 }
 
-/// GX-9a: the full reset's picture to compare with: from before its first step.
-static RESET_PICTURE: SpinLock<Option<Arc<(alloc::collections::BTreeMap<u32, u32>, dcn::Marks)>>> = SpinLock::named("amdgpu.hw.reset_picture", None);
-/// GX-9a: the ladder went on without the full reset step in progress (`Chain::reset_abandoned`).
-static RESET_ABANDONED: AtomicBool = AtomicBool::new(false);
 
 /// The DCN snapshot, once per full reset (no CRC: that would write DCN; a read of every scanout register and the display's
 /// write count). The reads, on a chip that just hung, with no lock held: a slow one must not keep this CPU from preempting.
 /// One step at a time (`reset_gate`), so nobody else fills it meanwhile.
 fn reset_base(g: &Gpu) {
-    if RESET_PICTURE.lock().is_some() {
+    let dv = g.st();
+    if dv.reset_picture.lock().is_some() {
         return;
     }
     let base = Arc::new((snapshot::take(g.regs, false).regs, dcn::marks()));
-    *RESET_PICTURE.lock() = Some(base);
+    *dv.reset_picture.lock() = Some(base);
 }
 
 /// The ladder left this step behind: it starts nothing more.
-fn reset_gone(lines: &mut Vec<String>) -> bool {
-    let gone = RESET_ABANDONED.load(Ordering::Acquire);
+fn reset_gone(dv: &'static State, lines: &mut Vec<String>) -> bool {
+    let gone = dv.reset_abandoned.load(Ordering::Acquire);
     if gone {
         lines.push(String::from("reset: the ladder went on without this step: it stops here"));
     }
@@ -593,12 +728,12 @@ fn reset_gone(lines: &mut Vec<String>) -> bool {
 }
 
 /// The tool's gate, for a reset thread: a `gx_bringup` that holds it ends soon or waits for this very reset; never for long.
-fn reset_gate(lines: &mut Vec<String>) -> Option<crate::hw::live::ToolRun<'static>> {
+fn reset_gate(g: &'static Gpu, lines: &mut Vec<String>) -> Option<crate::hw::live::ToolRun<'static>> {
     for _ in 0..200 {
-        if reset_gone(lines) {
+        if reset_gone(g.st(), lines) {
             return None;
         }
-        if let Some(one) = crate::hw::live::TOOL.enter() {
+        if let Some(one) = g.hw().tool.enter() {
             return Some(one);
         }
         sched::sleep_ns(10_000_000);
@@ -609,7 +744,8 @@ fn reset_gate(lines: &mut Vec<String>) -> Option<crate::hw::live::ToolRun<'stati
 
 /// The picture against `RESET_PICTURE`, its lines said. No base: not equal, nothing vouches for it.
 fn reset_picture(g: &Gpu, lines: &mut Vec<String>) -> bool {
-    let base = RESET_PICTURE.lock().clone();
+    let dv = g.st();
+    let base = dv.reset_picture.lock().clone();
     let Some(base) = base else {
         lines.push(String::from("reset: no DCN snapshot from before it"));
         return false;
@@ -620,60 +756,56 @@ fn reset_picture(g: &Gpu, lines: &mut Vec<String>) -> bool {
     same
 }
 
-/// GX-9a: GfxDeviceDriverReset(2), behind `gx_mode2=on`: the rung's second lock (`boot::mode2_open`, next to `Policy`'s) and
-/// the watch that blocks every display write. `suspend_gc` halted everything first, as Linux's does (`gfxup::MODE2_REFUSED`),
-/// so an owner of its own, for this one message. No answer: a reboot, and nothing is read or written after it.
+/// GX-9a: GfxDeviceDriverReset(2), the ladder's last rung on this chip as in Linux (soc21.c:377-380), under the watch
+/// that blocks every display write. `suspend_gc` halted everything first, as Linux's does, so an owner of its own, for
+/// this one message. No answer: a reboot, and nothing is read or written after it.
 fn mode2_chip(g: &'static Gpu, lines: &mut Vec<String>) -> Option<bool> {
-    if !crate::hw::boot::mode2_open() {
-        lines.push(String::from(gfxup::MODE2_REFUSED));
-        return None;
-    }
+    let dv = g.st();
     let a = g.display.as_ref().ok()?;
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs)).ok()?;
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs)).ok()?;
     let d = disc::parse(&found.bytes).ok()?;
     let addrs = Addrs::from_discovery(&d)?;
     let gi = GfxInputs::from_discovery(&d)?;
     let win = carve_window(g, a, &d).ok()?;
     let mut guard = DisplayGuard::from_discovery(&d);
     guard.vram_mc = Some(win.mc_base);
-    let hw = PspHw::new(g.regs, &d, &addrs, Some(&gi), win, Vec::new());
+    let hw = PspHw::new(g.st(), g.regs, &d, &addrs, Some(&gi), win, Vec::new());
     let mut owner = Bringup::new(Watch::new(hw, guard, Mode::Block), Gate::Allow, LOG_KEEP);
     let r = gfxup::mode2(&mut owner, gi.smu, &gi.gc, &gi.t);
     lines.extend(gfxup::render(&r));
     let blocked = owner.hw().total();
     if r.error.is_some() || blocked != 0 {
         lines.push(format!("reset: mode 2 did not pass ({blocked} display writes stopped): reboot before more GPU work"));
-        REBOOT_NEEDED.store(true, Ordering::Release);
+        dv.reboot_needed.store(true, Ordering::Release);
         return None;
     }
     // GC was reset: no HQD outlives that, so no queue is stranded any more.
-    MES_STRANDED.store(false, Ordering::Release);
-    MODE2_SENT.store(true, Ordering::Release);
+    dv.mes_stranded.store(false, Ordering::Release);
+    dv.mode2_sent.store(true, Ordering::Release);
     Some(reset_picture(g, lines))
 }
 
-/// A mode 2 ran since the IH ring last started: the re-init starts it again.
-static MODE2_SENT: AtomicBool = AtomicBool::new(false);
 
 /// GX-9a: `until=stop` (bus master stays: the IH thread goes on, and the run after it needs it) unless a suspend did it, the
 /// backend's stages from the PSP, and the job half's queues on what they left. Everything `until=stop` and
 /// `until=backend again=true` do, with the node staying and no program told more than the reset counter.
 #[inline(never)]
 fn reinit_chip(g: &'static Gpu, lines: &mut Vec<String>) -> Option<crate::hw::chain::Reinit> {
+    let dv = g.st();
     reset_base(g);
-    let kept = LIVE.lock_timeout(WAIT_NS)?.is_some();
+    let kept = dv.live.lock_timeout(WAIT_NS)?.is_some();
     if kept {
         let (r, halted) = stop_chain(g, lines, true);
         if r != Ok(true) || !halted {
             lines.push(String::from("reset: the stop did not prove the engines halted: no re-init"));
             return None;
         }
-    } else if !crate::hw::live::HALTS.proven() {
+    } else if !g.hw().halts.proven() {
         lines.push(String::from("reset: no chain, and the last stop left an engine running: no re-init"));
         return None;
     }
     for until in Until::BACKEND_STAGES {
-        if reset_gone(lines) {
+        if reset_gone(dv, lines) {
             return None;
         }
         let args = Args { action: Action::Run(until), keep: true, variant: None, ack_linux: false, again: true };
@@ -682,18 +814,18 @@ fn reinit_chip(g: &'static Gpu, lines: &mut Vec<String>) -> Option<crate::hw::ch
             return None;
         }
     }
-    if reset_gone(lines) {
+    if reset_gone(dv, lines) {
         return None;
     }
     let same = reset_picture(g, lines);
     let a = g.display.as_ref().ok()?;
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs)).ok()?;
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs)).ok()?;
     let d = disc::parse(&found.bytes).ok()?;
     let win = carve_window(g, a, &d).ok()?;
-    let ih = IH.lock().as_ref().map(|u| u.addrs);
-    let mut live = LIVE.lock_timeout(WAIT_NS)?;
+    let ih = dv.ih.lock().as_ref().map(|u| u.addrs);
+    let mut live = dv.live.lock_timeout(WAIT_NS)?;
     let l = live.as_mut()?;
-    let mut vmi = vm_inputs(&d, &win, l.sdma).ok()?;
+    let mut vmi = vm_inputs(dv, &d, &win, l.sdma).ok()?;
     vmi.ack = vmring::AckWait::Linux;
     l.owner.hw().hw().allow_gmc(vmi.addrs.readable(), vmi.addrs.writable());
     let queues = match vmring::kept_queues(&mut l.owner, &vmi) {
@@ -705,7 +837,7 @@ fn reinit_chip(g: &'static Gpu, lines: &mut Vec<String>) -> Option<crate::hw::ch
     };
     if let Some(a) = ih {
         l.owner.hw().hw().allow_ih(&a);
-        ih_again(&mut l.owner, &a, vmi.carve, lines);
+        ih_again(dv, &mut l.owner, &a, vmi.carve, lines);
     }
     klog::event!(Warn, "gx", "hw.reinit_passed", picture_same = same);
     Some(crate::hw::chain::Reinit { vmi, queues, display_equal: same })
@@ -713,10 +845,10 @@ fn reinit_chip(g: &'static Gpu, lines: &mut Vec<String>) -> Option<crate::hw::ch
 
 /// What a re-init reset of the IH: the CP's and SDMA's sources are GC's, and the bring-up cleared them; after a mode 2 also
 /// the ring's registers, whose reach is one of the things the desk's measurement shows.
-fn ih_again(owner: &mut Owner, a: &crate::gpucore::ih::IhAddrs, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<String>) {
+fn ih_again(dv: &'static State, owner: &mut Owner, a: &crate::gpucore::ih::IhAddrs, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<String>) {
     use crate::gpucore::ih as chip_ih;
-    if MODE2_SENT.swap(false, Ordering::AcqRel) {
-        let bo = IH_BO.lock().clone();
+    if dv.mode2_sent.swap(false, Ordering::AcqRel) {
+        let bo = dv.ih_bo.lock().clone();
         let again = bo.and_then(|b| chip_ih::IhPlace::in_carve(carve, b.1.start)).map(|place| chip_ih::start(owner, a, &place, true));
         lines.push(format!("reset: the IH ring started again after mode 2: {}", match again {
             Some(Ok(_)) => String::from("done"),
@@ -730,13 +862,12 @@ fn ih_again(owner: &mut Owner, a: &crate::gpucore::ih::IhAddrs, carve: amdgpu_fm
     }
 }
 
-/// GX-8b: what `until=jobs` compares against: the picture when the node came up.
-static PICTURE_AT_NODE: SpinLock<Option<(alloc::collections::BTreeMap<u32, u32>, dcn::Marks)>> = SpinLock::named("amdgpu.hw.picture", None);
 
 /// GX-8b: `until=jobs`: the backend's job half and the GX-D9 watch, read only.
 #[inline(never)]
 fn jobs_status(g: &'static Gpu, lines: &mut Vec<String>) -> Result<bool, ()> {
-    let Some(gpu) = crate::hw::live::NODE.gpu() else {
+    let dv = g.st();
+    let Some(gpu) = g.hw().node.gpu() else {
         return refuse(lines, String::from("no backend on the render node: until=backend first"));
     };
     let Some(j) = gpu.jobs() else {
@@ -744,15 +875,15 @@ fn jobs_status(g: &'static Gpu, lines: &mut Vec<String>) -> Result<bool, ()> {
     };
     lines.extend(j.describe());
     // GX-7n: the registers as they read now, for when the counts do not add up.
-    let addrs = IH.lock().as_ref().map(|u| u.addrs);
+    let addrs = dv.ih.lock().as_ref().map(|u| u.addrs);
     if let Some(a) = addrs
-        && let Some(mut live) = LIVE.lock_timeout(WAIT_NS)
+        && let Some(mut live) = dv.live.lock_timeout(WAIT_NS)
         && let Some(l) = live.as_mut()
     {
         lines.push(format!("backend interrupts: {}", crate::gpucore::ih::describe(&mut l.owner, &a)));
     }
     let after = snapshot::take(g.regs, false);
-    let base = PICTURE_AT_NODE.lock().clone();
+    let base = dv.picture_at_node.lock().clone();
     let same = match base {
         Some((regs, marks)) => {
             let (same, pl) = picture(regs, &after.regs, &marks, &dcn::marks());
@@ -771,55 +902,53 @@ fn jobs_status(g: &'static Gpu, lines: &mut Vec<String>) -> Result<bool, ()> {
 /// engine 17), bounded. A failed CPU part is put back for the next GFX/MES stage or until=vm to retry, except at a
 /// stop (GC is unloaded after it: no later write to GFXHUB; a stale base in a context no queue uses is harmless);
 /// a process queue MES did not remove counts as stranded.
-fn vm_teardown<H: Hw>(owner: &mut Bringup<Watch<H>>, why: &str, lines: &mut Vec<String>) {
-    let Some((a, up)) = VM_UP.lock().take() else { return };
+fn vm_teardown<H: Hw>(dv: &'static State, owner: &mut Bringup<Watch<H>>, why: &str, lines: &mut Vec<String>) {
+    let Some((a, up)) = dv.vm_up.lock().take() else { return };
     let t = vmring::teardown(owner, &a, &up, gmc::LINUX_FLUSH_US, crate::ipmod::mes11::API_TIMEOUT_US);
     lines.extend(t.lines);
     if t.stranded {
-        note_stranded(&["a queue of the VM stage (the compute ring or the MES process queue)"]);
+        note_stranded(dv, &["a queue of the VM stage (the compute ring or the MES process queue)"]);
     }
     let retry = t.retry.filter(|_| why != "stop");
     if let Some(r) = retry {
-        *VM_UP.lock() = Some((a, r));
+        *dv.vm_up.lock() = Some((a, r));
     }
     lines.push(format!("{why}: the test VM (VMID {}) torn down first: {}", up.vmid, if t.ok { "done" } else if retry.is_some() { "a step failed (see above): kept for a retry" } else { "a step failed (see above)" }));
 }
 
 /// Notes a stop's or a run's stranded queues (never clears: only a passed gfx_mes does).
-fn note_stranded(stranded: &[&'static str]) {
+fn note_stranded(dv: &'static State, stranded: &[&'static str]) {
     if !stranded.is_empty() {
-        MES_STRANDED.store(true, Ordering::Release);
+        dv.mes_stranded.store(true, Ordering::Release);
     }
 }
 
 /// The MES stage's `arm` hook (`MesInputs::arm`): the Quiesce hook registered first, then armed.
-fn arm_mes(a: MesAddrs) {
+fn arm_mes(dv: &'static State, a: MesAddrs) {
     register_quiesce();
-    if !MES_ARMED.is_completed() {
+    if !dv.mes_armed.is_completed() {
         klog::event!(Info, "gx", "mes.armed"; "MES is halted by the Quiesce hook from now on");
     }
-    MES_ARMED.get_or_init(|| a);
+    dv.mes_armed.get_or_init(|| a);
 }
 
-/// GX-7j: NBIO's doorbell aperture as this boot's first doorbell stage (SDMA or GFX) found it: what a stop puts back.
-static APER_FIRST: SpinLock<Option<u32>> = SpinLock::named("amdgpu.aper_first", None);
 
 /// The GFX stage's `arm` hook (`GfxRingInputs::arm`): the Quiesce hook registered first, then armed.
-fn arm_gfx(a: GfxAddrs) {
+fn arm_gfx(dv: &'static State, a: GfxAddrs) {
     register_quiesce();
-    if !GFX_ARMED.is_completed() {
+    if !dv.gfx_armed.is_completed() {
         klog::event!(Info, "gx", "gfx.armed"; "the CP is halted by the Quiesce hook from now on");
     }
-    GFX_ARMED.get_or_init(|| a);
+    dv.gfx_armed.get_or_init(|| a);
 }
 
 /// The stage's `arm` hook (`SdmaInputs::arm`): the Quiesce hook registered first, then armed.
-fn arm_sdma(a: SdmaAddrs) {
+fn arm_sdma(dv: &'static State, a: SdmaAddrs) {
     register_quiesce();
-    if !SDMA_ARMED.is_completed() {
+    if !dv.sdma_armed.is_completed() {
         klog::event!(Info, "gx", "sdma.armed"; "SDMA 0 is halted by the Quiesce hook from now on");
     }
-    SDMA_ARMED.get_or_init(|| a);
+    dv.sdma_armed.get_or_init(|| a);
 }
 
 pub use crate::gpucore::handoff::NoteIo;
@@ -828,12 +957,6 @@ static NOTE_IO: ksync::Once<NoteIo> = ksync::Once::new();
 static INHERITED: ksync::Once<handoff::Arrival> = ksync::Once::new();
 /// The note this boot's last run, stop or Quiesce left (`None`: nothing done to the PSP in this boot).
 static LAST: SpinLock<Option<StopNote>> = SpinLock::named("amdgpu.psp_note", None);
-/// GX-7i2: NBIO's doorbell side (aperture, CSDMA range) as this boot's first SDMA stage found it.
-static NBIO_FOUND: SpinLock<Option<sdma::NbioFound>> = SpinLock::named("amdgpu.nbio_found", None);
-/// GX-7i2: this boot's SDMA stage turned the doorbell aperture on and no stop put it back (the classifier's trace).
-static APERTURE_OURS: AtomicBool = AtomicBool::new(false);
-/// The kernel before left bus master on (its note): taken over once by this boot's first run.
-static BUS_MASTER_INHERITED: AtomicBool = AtomicBool::new(false);
 
 /// Binds the note's way across a Reload (first binding wins). Unbound: no note is written or read. It also reads
 /// the inherited note now (outside Quiesce, where `take` may allocate) and registers the Quiesce hook, so a kernel
@@ -842,6 +965,11 @@ pub fn bind_note_io(io: NoteIo) {
     NOTE_IO.get_or_init(|| io);
     let _ = inherited_note();
     register_quiesce();
+}
+
+/// GP-GPU2: the note's way for another device (an RX 9070 XT keys its own note by address, `NoteIo::put_note_for`).
+pub fn note_io() -> Option<&'static NoteIo> {
+    NOTE_IO.get()
 }
 
 /// The note the kernel before handed on (read once, outside the Quiesce path).
@@ -883,25 +1011,40 @@ pub(crate) fn log_arrival(a: &handoff::Arrival, bound: bool) {
 
 /// GX-7i2: BitsOS's own traces for the classifier: this boot's SDMA stage turned the doorbell aperture on (and no
 /// stop has put it back yet).
-pub fn own_traces() -> classify::Own {
-    classify::Own { doorbell_aperture: APERTURE_OURS.load(Ordering::Acquire) }
+pub fn own_traces(dv: &State) -> classify::Own {
+    classify::Own { doorbell_aperture: dv.aperture_ours.load(Ordering::Acquire) }
+}
+
+/// GPY: what this boot's bring-up holds now, without taking `live` or `ih`: every GPU job of the desktop holds
+/// `live` for its submit, and a reading that depended on the lock being free said "no run" now and then.
+pub fn this_boot(dv: &State) -> classify::ThisBoot {
+    let run = dv.kept.load(Ordering::Acquire);
+    let ih_ring = dv.ih_on.load(Ordering::Acquire);
+    classify::ThisBoot { run, ih_ring, gart: dv.gart_up.lock().is_some() }
+}
+
+/// GPY: the tests' stand-in for a kept run and a running IH ring (the stores beside `*live = Some(..)` and `ih_up`).
+#[cfg(test)]
+pub(crate) fn mark_this_boot(dv: &State, kept: bool, ih_on: bool) {
+    dv.kept.store(kept, Ordering::Release);
+    dv.ih_on.store(ih_on, Ordering::Release);
 }
 
 /// GX-7i2: after an SDMA stage: NBIO's doorbell side as this boot's first stage found it (kept for the stops), and
 /// whether the aperture is on by this driver.
-fn note_sdma(r: &sdma::SdmaReport) {
-    let first = keep_aper_first(&mut APER_FIRST.lock(), r.nbio_found().map(|n| n.aper));
-    if keep_nbio_found(&mut NBIO_FOUND.lock(), r) || aperture_ours(first, r.nbio.first().and_then(|x| x.2)) {
-        APERTURE_OURS.store(true, Ordering::Release);
+fn note_sdma(dv: &'static State, r: &sdma::SdmaReport) {
+    let first = keep_aper_first(&mut dv.aper_first.lock(), r.nbio_found().map(|n| n.aper));
+    if keep_nbio_found(&mut dv.nbio_found.lock(), r) || aperture_ours(first, r.nbio.first().and_then(|x| x.2)) {
+        dv.aperture_ours.store(true, Ordering::Release);
     }
 }
 
 /// GX-7j: after a GFX stage: the aperture as this boot's first doorbell stage found it, and whether it is on by
 /// this driver now.
-fn note_gfx(r: &gfxring::GfxReport) {
-    let first = keep_aper_first(&mut APER_FIRST.lock(), r.aper_found());
+fn note_gfx(dv: &'static State, r: &gfxring::GfxReport) {
+    let first = keep_aper_first(&mut dv.aper_first.lock(), r.aper_found());
     if aperture_ours(first, r.aper.1) {
-        APERTURE_OURS.store(true, Ordering::Release);
+        dv.aperture_ours.store(true, Ordering::Release);
     }
 }
 
@@ -930,24 +1073,24 @@ pub(crate) fn keep_nbio_found(kept: &mut Option<sdma::NbioFound>, r: &sdma::Sdma
 
 /// GX-7i2: after SDMA 0 is halted (until=stop, or a run that keeps nothing): what the stages turned on goes back to
 /// what this boot's first stage found (`sdma::doorbell_back`), and the line says so.
-fn sdma_back(owner: &mut Owner, sa: &SdmaAddrs, lines: &mut Vec<String>) {
+fn sdma_back(dv: &'static State, owner: &mut Owner, sa: &SdmaAddrs, lines: &mut Vec<String>) {
     // GX-7j: the aperture back to what the boot's first doorbell stage found (a GFX stage may have come first).
-    let first = *APER_FIRST.lock();
-    let found = (*NBIO_FOUND.lock()).map(|n| sdma::NbioFound { aper: first.unwrap_or(n.aper), ..n });
+    let first = *dv.aper_first.lock();
+    let found = (*dv.nbio_found.lock()).map(|n| sdma::NbioFound { aper: first.unwrap_or(n.aper), ..n });
     if put_doorbell_back(owner, sa, found, lines) {
-        APERTURE_OURS.store(false, Ordering::Release);
+        dv.aperture_ours.store(false, Ordering::Release);
     }
 }
 
 /// GX-7j: after the CP is halted (until=stop, or a run that keeps nothing): its doorbell off and, when no SDMA stage
 /// puts it back after this (`aperture`), NBIO's aperture to what the boot's first doorbell stage found.
-fn gfx_back(owner: &mut Owner, xa: &GfxAddrs, aperture: bool, lines: &mut Vec<String>) {
-    let first = if aperture { *APER_FIRST.lock() } else { None };
+fn gfx_back(dv: &'static State, owner: &mut Owner, xa: &GfxAddrs, aperture: bool, lines: &mut Vec<String>) {
+    let first = if aperture { *dv.aper_first.lock() } else { None };
     let (ok, l) = gfxring::doorbell_back(owner, xa, first);
     lines.extend(l);
     lines.push(format!("stop: GFX ring 0's doorbell side {}", if ok { "back as found" } else { "NOT fully back (see the lines above)" }));
     if ok && first.is_some_and(|f| f & 1 == 0) {
-        APERTURE_OURS.store(false, Ordering::Release);
+        dv.aperture_ours.store(false, Ordering::Release);
     }
 }
 
@@ -977,8 +1120,8 @@ fn set_note(n: StopNote) {
     }
 }
 
-fn note_of(hw: &mut dyn Hw, a: &Addrs, ring: RingFate, gc: GcFate, tmr_destroyed: bool) -> StopNote {
-    handoff::read_note(hw, a, ring, gc, tmr_destroyed, BUS_MASTER_OURS.load(Ordering::Acquire))
+fn note_of(dv: &'static State, hw: &mut dyn Hw, a: &Addrs, ring: RingFate, gc: GcFate, tmr_destroyed: bool) -> StopNote {
+    handoff::read_note(hw, a, ring, gc, tmr_destroyed, dv.bus_master_ours.load(Ordering::Acquire))
 }
 
 /// GC as this boot last left it (a run that did not touch GC leaves it as it was).
@@ -1016,9 +1159,6 @@ pub struct Args {
     pub ack_linux: bool,
 }
 
-/// PSPs whose buffers the PSP may still hold (failed undo, wedged ring): their BOs are never given back in this
-/// boot (`Psp` has no Drop, so dropping it keeps them allocated), bus master stays on, runs are refused.
-static QUARANTINED: AtomicU32 = AtomicU32::new(0);
 
 struct PspQuiesce;
 
@@ -1059,15 +1199,27 @@ impl devmodel::Quiesce for PspQuiesce {
         // into the next kernel, whose BOs may reuse the ring's and wptr shadow's carve-out pages.
         // GX-7k: MES before the CP (the scheduler stops feeding the queues before their engines halt).
         // GX-8b: no frame or poll of the job thread from here on; it holds LIVE only for one short step.
-        JOBS_OFF.store(true, Ordering::Release);
+        // The 780M's device, if this boot has one (the registry is only looked at, never built here); a machine
+        // without one still hands the inherited note on, over a state nothing ever ran on.
+        let none;
+        let dv: &State = match crate::devs::registry_now().and_then(|r| r.first(crate::devs::Family::Phoenix)) {
+            Some(d) => &d.psp,
+            None => {
+                none = State::new();
+                &none
+            }
+        };
+        dv.jobs_off.store(true, Ordering::Release);
         // GX-7n: no IH write into memory the next kernel owns; first, nothing after it needs interrupts.
-        quiesce_ih();
-        quiesce_mes();
-        quiesce_gfx();
-        quiesce_sdma();
+        quiesce_ih(dv);
+        // GX-8v: no VCPU on this kernel's buffers (Linux's fini order: VCN first).
+        vcnlive::quiesce(dv);
+        quiesce_mes(dv);
+        quiesce_gfx(dv);
+        quiesce_sdma(dv);
         let mut tries = 0;
         let live = loop {
-            match LIVE.try_lock() {
+            match dv.live.try_lock() {
                 Some(g) => break Some(g),
                 None if tries < QUIESCE_LOCK_TRIES => {
                     tries += 1;
@@ -1086,25 +1238,25 @@ impl devmodel::Quiesce for PspQuiesce {
                     hw.hw().atomic = true;
                     // GX-7f: GC may still be booting from the TMR (Unsettled): nothing destroyed, the next kernel refuses.
                     // GX-7j3: a booted GC is unloaded toward PMFW first (bounded, no log), as Linux's shutdown does.
-                    let (r, n) = handoff::quiesce_kept(&mut l.psp, hw, &l.addrs, l.gc, l.un.as_ref(), BUS_MASTER_OURS.load(Ordering::Acquire));
+                    let (r, n) = handoff::quiesce_kept(&mut l.psp, hw, &l.addrs, l.gc, l.un.as_ref(), dv.bus_master_ours.load(Ordering::Acquire));
                     (r.map_or(QuiesceSeen::Left, QuiesceSeen::Stopped), Some(n))
                 }
             },
         };
-        if quiesce_bus_master_off(seen, QUARANTINED.load(Ordering::Acquire) > 0)
-            && BUS_MASTER_OURS.swap(false, Ordering::AcqRel)
+        if quiesce_bus_master_off(seen, dv.quarantined.load(Ordering::Acquire) > 0)
+            && dv.bus_master_ours.swap(false, Ordering::AcqRel)
             && let Some(r) = DcnRegs::attached_now()
         {
             let _ = r.pci().disable_device();
         }
         // The note last (bus master as now left); Busy hands on nothing: the next kernel reads the registers.
-        let ours = BUS_MASTER_OURS.load(Ordering::Acquire);
+        let ours = dv.bus_master_ours.load(Ordering::Acquire);
         let note = match seen {
             QuiesceSeen::Busy => None,
             QuiesceSeen::Idle => {
                 // A busy lock (a stop setting it right now) counts as no own note: the inherited one goes on.
                 let last = LAST.try_lock().and_then(|g| *g);
-                handoff::idle_hand_on(last, INHERITED.get().and_then(handoff::Arrival::note), BUS_MASTER_INHERITED.load(Ordering::Acquire), ours)
+                handoff::idle_hand_on(last, INHERITED.get().and_then(handoff::Arrival::note), dv.bus_master_inherited.load(Ordering::Acquire), ours)
             }
             QuiesceSeen::Stopped(_) | QuiesceSeen::Left => stopped.map(|n| StopNote { bus_master_left_on: ours, ..n }),
         };
@@ -1115,18 +1267,18 @@ impl devmodel::Quiesce for PspQuiesce {
 }
 
 /// GX-7n: the Quiesce path's IH off through the raw registers (no owner, no lock, no allocation, no wait).
-fn quiesce_ih() {
+fn quiesce_ih(dv: &State) {
     let Some(regs) = DcnRegs::attached_now() else { return };
-    if let Some(a) = IH_ARMED.get() {
+    if let Some(a) = dv.ih_armed.get() {
         let ok = crate::gpucore::ih::quiesce(&mut RawRegs(regs), a);
         klog::try_event!(Info, "gx", "ih.quiesce_off", ok = ok; "the IH ring off before the hand-over");
     }
 }
 
 /// GX-7k: the Quiesce path's MES halt through the raw registers (no owner, no lock, no allocation, no wait).
-fn quiesce_mes() {
+fn quiesce_mes(dv: &State) {
     let Some(regs) = DcnRegs::attached_now() else { return };
-    if let Some(ok) = quiesce_halt_mes(MES_ARMED.get(), &mut RawRegs(regs)) {
+    if let Some(ok) = quiesce_halt_mes(dv.mes_armed.get(), &mut RawRegs(regs)) {
         klog::try_event!(Info, "gx", "mes.quiesce_halt", ok = ok; "MES halted before the hand-over");
     }
 }
@@ -1137,9 +1289,9 @@ pub(crate) fn quiesce_halt_mes(armed: Option<&MesAddrs>, hw: &mut dyn Hw) -> Opt
 }
 
 /// GX-7j: the Quiesce path's CP halt through the raw registers (no owner, no lock, no allocation, no wait).
-fn quiesce_gfx() {
+fn quiesce_gfx(dv: &State) {
     let Some(regs) = DcnRegs::attached_now() else { return };
-    if let Some(ok) = quiesce_halt_gfx(GFX_ARMED.get(), &mut RawRegs(regs)) {
+    if let Some(ok) = quiesce_halt_gfx(dv.gfx_armed.get(), &mut RawRegs(regs)) {
         // INT-W26 (RB-16 CR-3a applied to GX-7j's halt too): `try_event!`, never waits in the Quiesce.
         klog::try_event!(Info, "gx", "gfx.quiesce_halt", ok = ok; "the CP halted before the hand-over");
     }
@@ -1151,9 +1303,9 @@ pub(crate) fn quiesce_halt_gfx(armed: Option<&GfxAddrs>, hw: &mut dyn Hw) -> Opt
 }
 
 /// GX-7i: the Quiesce path's SDMA halt through the raw registers (no owner, no lock, no allocation, no wait).
-fn quiesce_sdma() {
+fn quiesce_sdma(dv: &State) {
     let Some(regs) = DcnRegs::attached_now() else { return };
-    if let Some(ok) = quiesce_halt(SDMA_ARMED.get(), &mut RawRegs(regs)) {
+    if let Some(ok) = quiesce_halt(dv.sdma_armed.get(), &mut RawRegs(regs)) {
         // RB-16: `try_event!` (one try of the ring lock, never waits): a Quiesce runs with the other CPUs parked
         // and interrupts off, where a plain event may wait for a lock a parked CPU holds.
         klog::try_event!(Info, "gx", "sdma.quiesce_halt", ok = ok; "SDMA 0 halted before the hand-over");
@@ -1166,8 +1318,8 @@ pub(crate) fn quiesce_halt(armed: Option<&SdmaAddrs>, hw: &mut dyn Hw) -> Option
 }
 
 /// Runs `f` while this module's run lock is held (`true`) when it was free: the tests' "a run holds the PSP".
-pub(crate) fn with_live_held<T>(f: impl FnOnce(bool) -> T) -> T {
-    let g = LIVE.try_lock();
+pub(crate) fn with_live_held<T>(dv: &State, f: impl FnOnce(bool) -> T) -> T {
+    let g = dv.live.try_lock();
     let r = f(g.is_some());
     drop(g);
     r
@@ -1199,12 +1351,15 @@ impl Hw for RawRegs {
 
 /// Runs `f` while no gx_bringup run or stop holds the PSP (`None` after the usual wait): the probe's MM_INDEX
 /// fetch, so it never lands inside a run's before/after count of the display's writes.
-pub fn while_idle<T>(f: impl FnOnce() -> T) -> Option<T> {
-    let g = LIVE.lock_timeout(WAIT_NS)?;
+pub fn while_idle<T>(dv: &State, f: impl FnOnce() -> T) -> Option<T> {
+    let g = dv.live.lock_timeout(WAIT_NS)?;
     let r = f();
     drop(g);
     Some(r)
 }
+
+/// The hook is the kernel's, registered once per boot, device or not (it hands the note on): its latch is no device's.
+static QUIESCE_ON: AtomicBool = AtomicBool::new(false);
 
 fn register_quiesce() {
     if !QUIESCE_ON.swap(true, Ordering::AcqRel) {
@@ -1214,9 +1369,9 @@ fn register_quiesce() {
 
 /// Bus master off on the function again when this driver switched it on (bridges stay, as `disable_device` does)
 /// and no PSP is quarantined.
-fn bus_master_back(regs: &DcnRegs, out: &mut Vec<String>) {
-    let quarantined = QUARANTINED.load(Ordering::Acquire) > 0;
-    let ours = !quarantined && BUS_MASTER_OURS.swap(false, Ordering::AcqRel);
+fn bus_master_back(dv: &'static State, regs: &DcnRegs, out: &mut Vec<String>) {
+    let quarantined = dv.quarantined.load(Ordering::Acquire) > 0;
+    let ours = !quarantined && dv.bus_master_ours.swap(false, Ordering::AcqRel);
     let off = ours.then(|| regs.pci().disable_device_logged()).map(|d| (d.bus_master_was_on, d.refused, d.incomplete));
     out.push(bus_line(bus_choice(quarantined, ours, regs.pci().command() & 0x4 != 0), off));
 }
@@ -1260,9 +1415,9 @@ pub fn bus_line(c: BusChoice, off: Option<(bool, bool, bool)>) -> String {
 }
 
 /// Parks a PSP that may still hold its buffers: never freed, later runs refused until a reboot.
-fn quarantine(p: Psp<Mailbox13>, out: &mut Vec<String>) {
-    QUARANTINED.fetch_add(1, Ordering::AcqRel);
-    REBOOT_NEEDED.store(true, Ordering::Release);
+fn quarantine(dv: &'static State, p: Psp<Mailbox13>, out: &mut Vec<String>) {
+    dv.quarantined.fetch_add(1, Ordering::AcqRel);
+    dv.reboot_needed.store(true, Ordering::Release);
     for b in p.buffers() {
         out.push(format!("quarantined: carve-out {:#x}..{:#x} (MC {:#x}) stays allocated until a reboot", b.offset, b.offset + b.size, b.mc));
     }
@@ -1280,10 +1435,9 @@ fn dma_lines(regs: &DcnRegs, when: &str) -> Vec<String> {
 }
 
 /// The tool: `Ok(text)` for every run (its first line says PASS, FAIL or REFUSED), `Err` when there is no GPU.
-pub fn tool(args: Args) -> Result<String, String> {
-    let g = Gpu::get().ok_or_else(|| String::from("no AMD GPU function (QEMU has none)"))?;
+pub fn tool(g: &'static Gpu, args: Args) -> Result<String, String> {
     let mut lines = Vec::new();
-    let Some(_one) = crate::hw::live::TOOL.enter() else {
+    let Some(_one) = g.hw().tool.enter() else {
         klog::event!(Info, "gx", "hw.tool_busy");
         return Ok(String::from("gx_bringup: REFUSED (no PSP or SMU register written)\nbusy: another gx_bringup runs\n"));
     };
@@ -1291,13 +1445,13 @@ pub fn tool(args: Args) -> Result<String, String> {
         Action::Stop => stop_action(g, &mut lines),
         Action::Backend => backend(g, args, &mut lines),
         Action::Jobs => jobs_status(g, &mut lines),
-        Action::Irq(on) => irq_mode(on, &mut lines),
-        Action::IrqLoad => irq_load(&mut lines),
-        Action::Ladder(from) => ladder(from, &mut lines),
+        Action::Irq(on) => irq_mode(g, on, &mut lines),
+        Action::IrqLoad => irq_load(g, &mut lines),
+        Action::Ladder(from) => ladder(g, from, &mut lines),
         // The kept chain is the render node's now: a stage or a reset would pull it away (`until=stop` asks first).
-        Action::Run(_) | Action::Reset if crate::hw::live::NODE.minor().is_some() => refuse(&mut lines, String::from("the hardware backend is up on the render node: until=stop first")),
+        Action::Run(_) | Action::Reset if g.hw().node.minor().is_some() => refuse(&mut lines, String::from("the hardware backend is up on the render node: until=stop first")),
         Action::Run(until) => run(g, until, args, &mut lines),
-        Action::Reset => reset(args, &mut lines),
+        Action::Reset => reset(g.st(), args, &mut lines),
     };
     let head = match r {
         Ok(true) => "gx_bringup: PASS",
@@ -1315,12 +1469,12 @@ pub fn tool(args: Args) -> Result<String, String> {
 
 /// `until=stop` on whatever runs, the node first (the tool, and GX-8c's boot after a failure).
 fn stop_action(g: &'static Gpu, lines: &mut Vec<String>) -> Result<bool, ()> {
-    match crate::hw::live::NODE.stop_gate() {
+    match g.hw().node.stop_gate(&g.hw().held) {
         Ok(note) => {
             lines.extend(note);
             ih_down(g, lines);
             let r = stop_kept(g, lines);
-            match crate::hw::live::HELD.after_stop(r) {
+            match g.hw().held.after_stop(r) {
                 Ok(0) | Err(0) => {}
                 Ok(n) => lines.push(format!("backend: the {n} held jobs let go: the engines are halted")),
                 Err(n) => lines.push(format!("backend: the {n} held jobs stay held with all they reach: no stop proved the engines halted")),
@@ -1345,16 +1499,17 @@ fn backend(g: &'static Gpu, args: Args, lines: &mut Vec<String>) -> Result<bool,
 /// GX-8c: `node_by` (the boot's bound) past: no stage begins and no node comes.
 #[inline(never)]
 fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec<String>) -> Result<u32, BootFail> {
+    let dv = g.st();
     let refused = |lines: &mut Vec<String>, why: String| {
         let _ = refuse(lines, why);
         BootFail::Refused
     };
     let in_time = || node_by.is_none_or(|t| crate::hw::boot::in_time(crate::hw::clock_ns(), t));
-    if let Some(m) = crate::hw::live::NODE.minor() {
+    if let Some(m) = g.hw().node.minor() {
         lines.push(format!("backend: already up on renderD{m}"));
         return Ok(m);
     }
-    let Some(guard) = LIVE.lock_timeout(WAIT_NS) else {
+    let Some(guard) = dv.live.lock_timeout(WAIT_NS) else {
         return Err(refused(lines, String::from("busy: another run holds the PSP")));
     };
     let sdma_up = guard.as_ref().is_some_and(|l| l.sdma.is_some());
@@ -1363,7 +1518,7 @@ fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec
     if mes_up && !sdma_up {
         return Err(refused(lines, String::from("MES runs on a kept run without SDMA 0: until=stop first (until=backend starts both)")));
     }
-    if VM_UP.lock().is_some() {
+    if dv.vm_up.lock().is_some() {
         return Err(refused(lines, String::from("until=vm's test VM is kept (VMID 1 and a MES process queue): until=stop first, the backend's jobs take the kernel's VMIDs")));
     }
     let mut wrote = false;
@@ -1390,6 +1545,23 @@ fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec
             Err(()) => return Err(BootFail::Refused),
         }
     }
+    // GX-8v: VCN on the kept chain, at every boot (no self-test: Georg 18.11.). A VCN that fails does not cost the
+    // GPU: the backend goes on and offers no video ring.
+    let vcn_kept = dv.live.lock_timeout(WAIT_NS).is_some_and(|l| l.as_ref().is_some_and(|l| l.vcn.is_some()));
+    if !vcn_kept && in_time() {
+        match vcnlive::run(g, lines) {
+            Ok(true) => wrote = true,
+            Ok(false) => {
+                wrote = true;
+                lines.push(String::from("backend: the VCN stage failed (see above): the GPU goes on without video; report the journal"));
+            }
+            Err(()) => lines.push(String::from("backend: the VCN stage was refused (see above): the GPU goes on without video; report the journal")),
+        }
+    }
+    // GS-1: the boot's mark between the PSP/GFX/MES bring-up and the proof (the desk's start table).
+    if node_by.is_some() {
+        klog::event!(Info, "gx", "boot.engines_up", wrote = wrote, at_ms = time::now_ns() / 1_000_000);
+    }
     let before = snapshot::take(g.regs, false);
     let base = before.regs.clone();
     let dcn0 = dcn::marks();
@@ -1404,10 +1576,12 @@ fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec
     let mut checked = crate::hw::check::run(&gpu);
     if let Ok(l) = &mut checked {
         let feed = ih_up(g, vmi.carve, lines);
-        let cfg = crate::hw::jobs::JobCfg { mode2: crate::hw::boot::mode2_open().then_some(crate::hw::boot::MODE2_PROOF), ..crate::hw::jobs::JobCfg::default() };
-        let jobs = gpu.start_jobs_irq(Arc::new(LiveChain), vmi, cfg, feed).and_then(|()| crate::hw::check::jobs(&gpu));
+        let jobs = gpu.start_jobs_irq(Arc::new(LiveChain(g)), vmi, crate::hw::jobs::JobCfg::default(), feed).and_then(|()| crate::hw::check::jobs(&gpu));
         match jobs {
-            Ok(j) => l.extend(j),
+            Ok(j) => {
+                l.extend(j);
+                vcnlive::backend_half(g, &gpu, l);
+            }
             Err(why) => checked = Err(format!("jobs: {why}")),
         }
     }
@@ -1435,13 +1609,14 @@ fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec
         lines.extend(j.describe());
     }
     if let Err(f) = verdict {
-        crate::hw::live::HELD.hold(gpu.stop_jobs());
+        g.hw().held.hold(gpu.stop_jobs());
         lines.push(String::from("backend verdict: FAIL"));
         return Err(f);
     }
-    *PICTURE_AT_NODE.lock() = Some((base, dcn0));
-    match crate::hw::live::NODE.register(gpu.clone()) {
+    *dv.picture_at_node.lock() = Some((base, dcn0));
+    match g.hw().node.register(gpu.clone()) {
         Ok(m) => {
+            crate::dpm_live::start(g, &gpu);
             let mem = drm::gpu::GpuDevice::memory(&*gpu);
             lines.push(format!("backend: renderD{m} up; carve-out {} MiB ({} MiB kernel and table reserve), GTT {} MiB", mem.vram_total >> 20, mem.vram_pinned >> 20, mem.gtt_total >> 20));
             lines.push(String::from("backend verdict: PASS"));
@@ -1449,7 +1624,7 @@ fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec
         }
         Err(why) => {
             lines.push(format!("backend: no node: {why}; until=stop"));
-            crate::hw::live::HELD.hold(gpu.stop_jobs());
+            g.hw().held.hold(gpu.stop_jobs());
             Err(BootFail::Node)
         }
     }
@@ -1459,12 +1634,13 @@ fn backend_up(g: &'static Gpu, args: Args, node_by: Option<u64>, lines: &mut Vec
 /// as it did, and the line says why. A ring from an earlier failed backend is taken over.
 #[inline(never)]
 fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<String>) -> Option<Arc<crate::hw::ih::IrqFeed>> {
+    let dv = g.st();
     use crate::gpucore::ih as chip_ih;
-    if !IH_WANTED.load(Ordering::Acquire) {
+    if !dv.ih_wanted.load(Ordering::Acquire) {
         lines.push(String::from("backend interrupts: none (until=irq_poll): the job thread polls"));
         return None;
     }
-    if let Some(up) = IH.lock().as_ref() {
+    if let Some(up) = dv.ih.lock().as_ref() {
         lines.push(String::from("backend interrupts: the ring of an earlier run goes on"));
         return Some(up.ih.feed.clone());
     }
@@ -1473,7 +1649,7 @@ fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<Str
         klog::event!(Warn, "gx", "ih.no_ring", why = why.as_str());
         None
     };
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs));
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs));
     let d = match found.and_then(|f| disc::parse(&f.bytes).map_err(|w| format!("{w}"))) {
         Ok(d) => d,
         Err(why) => return no(lines, format!("no discovery table: {why}")),
@@ -1482,12 +1658,12 @@ fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<Str
     let Some(db_phys) = bar2(g) else { return no(lines, String::from("no doorbell BAR")) };
     let Some(bos) = &g.bos else { return no(lines, String::from("no BO manager")) };
     let bo = {
-        let kept = IH_BO.lock().clone();
+        let kept = dv.ih_bo.lock().clone();
         match kept {
             Some(b) => b,
-            None => match chip_ih::alloc_bo(&mut SharedBos(bos)) {
+            None => match chip_ih::alloc_bo(&mut SharedBos(bos, &g.st().pool)) {
                 Ok(b) => {
-                    *IH_BO.lock() = Some(b.clone());
+                    *dv.ih_bo.lock() = Some(b.clone());
                     b
                 }
                 Err(e) => return no(lines, format!("its buffer: {e:?}")),
@@ -1497,10 +1673,10 @@ fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<Str
     let Some(place) = chip_ih::IhPlace::in_carve(carve, bo.1.start) else { return no(lines, String::from("its buffer is outside the carve-out")) };
     let cio = crate::hw::live::LiveCarve { carve };
     let Some(win) = crate::hw::heap::CarveIo::map(&cio, bo.1.clone(), crate::hw::heap::MemKind::Tables) else { return no(lines, String::from("no CPU window on its buffer")) };
-    let doorbell = match IH_DOORBELL.get() {
+    let doorbell = match dv.ih_doorbell.get() {
         Some(m) => m.clone(),
         None => match hal::mmio::map_device(db_phys, PAGE_4K as usize, hal::paging::CacheType::Uncached) {
-            Ok(m) => IH_DOORBELL.get_or_init(|| Arc::new(m)).clone(),
+            Ok(m) => dv.ih_doorbell.get_or_init(|| Arc::new(m)).clone(),
             Err(e) => return no(lines, format!("the doorbell page: {e:?}")),
         },
     };
@@ -1513,7 +1689,7 @@ fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<Str
         Ok(i) => i,
         Err(why) => return no(lines, why),
     };
-    let Some(mut live) = LIVE.lock_timeout(WAIT_NS) else {
+    let Some(mut live) = dv.live.lock_timeout(WAIT_NS) else {
         ih.stop();
         return no(lines, String::from("busy: another run holds the PSP"));
     };
@@ -1523,7 +1699,7 @@ fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<Str
         return no(lines, String::from("no kept run"));
     };
     l.owner.hw().hw().allow_ih(&a);
-    IH_ARMED.get_or_init(|| a);
+    dv.ih_armed.get_or_init(|| a);
     let started = chip_ih::start(&mut l.owner, &a, &place, true);
     let on = started.and_then(|f| {
         ih.ring_on();
@@ -1543,21 +1719,24 @@ fn ih_up(g: &'static Gpu, carve: amdgpu_fmt::addr::Carveout, lines: &mut Vec<Str
     lines.push(format!("backend interrupts: ring at MC {:#x}, 256 KiB, {}; {}", place.ring_mc, ih.line.describe(), chip_ih::describe(&mut l.owner, &a)));
     drop(live);
     let feed = ih.feed.clone();
-    *IH.lock() = Some(IhUp { ih, addrs: a, found });
+    *dv.ih.lock() = Some(IhUp { ih, addrs: a, found });
+    dv.ih_on.store(true, Ordering::Release);
     Some(feed)
 }
 
 /// GX-7n: the running ring's table, for DS: `set_hook` on a source it has turned on itself.
-pub fn ih_feed() -> Option<Arc<crate::hw::ih::IrqFeed>> {
-    IH.lock().as_ref().map(|u| u.ih.feed.clone())
+pub fn ih_feed(dv: &'static State) -> Option<Arc<crate::hw::ih::IrqFeed>> {
+    dv.ih.lock().as_ref().map(|u| u.ih.feed.clone())
 }
 
 /// GX-7n: `until=stop`'s first step: sources off, ring off, the thread gone, the vector free. The buffer stays.
 #[inline(never)]
 fn ih_down(g: &'static Gpu, lines: &mut Vec<String>) {
-    let Some(up) = IH.lock().take() else { return };
+    let dv = g.st();
+    let Some(up) = dv.ih.lock().take() else { return };
+    dv.ih_on.store(false, Ordering::Release);
     up.ih.ring_off();
-    match LIVE.lock_timeout(WAIT_NS) {
+    match dv.live.lock_timeout(WAIT_NS) {
         Some(mut live) if live.is_some() => {
             if let Some(l) = live.as_mut() {
                 let (_, ls) = crate::gpucore::ih::stop(&mut l.owner, &up.addrs, &up.found);
@@ -1574,9 +1753,9 @@ fn ih_down(g: &'static Gpu, lines: &mut Vec<String>) {
 }
 
 /// GX-7n: `until=irq_on` / `until=irq_poll`.
-fn irq_mode(on: bool, lines: &mut Vec<String>) -> Result<bool, ()> {
-    IH_WANTED.store(on, Ordering::Release);
-    let feed = crate::hw::live::NODE.gpu().and_then(|g| g.jobs()).and_then(|j| j.feed().cloned());
+fn irq_mode(g: &'static Gpu, on: bool, lines: &mut Vec<String>) -> Result<bool, ()> {
+    g.st().ih_wanted.store(on, Ordering::Release);
+    let feed = g.hw().node.gpu().and_then(|g| g.jobs()).and_then(|j| j.feed().cloned());
     match feed {
         Some(f) => {
             f.force_poll.store(!on, Ordering::Release);
@@ -1588,8 +1767,8 @@ fn irq_mode(on: bool, lines: &mut Vec<String>) -> Result<bool, ()> {
 }
 
 /// GX-9a: `until=ladder`: the job half's next hangs start at `from`. Changes nothing on the chip.
-fn ladder(from: crate::hw::jobs::Rung, lines: &mut Vec<String>) -> Result<bool, ()> {
-    let Some(j) = crate::hw::live::NODE.gpu().and_then(|g| g.jobs()) else {
+fn ladder(g: &'static Gpu, from: crate::hw::jobs::Rung, lines: &mut Vec<String>) -> Result<bool, ()> {
+    let Some(j) = g.hw().node.gpu().and_then(|g| g.jobs()) else {
         return refuse(lines, String::from("no backend on the render node: until=backend first"));
     };
     j.shared.ladder_from.store(from as u8, Ordering::Release);
@@ -1599,8 +1778,8 @@ fn ladder(from: crate::hw::jobs::Rung, lines: &mut Vec<String>) -> Result<bool, 
 }
 
 /// GX-7n: `until=irq_load`.
-fn irq_load(lines: &mut Vec<String>) -> Result<bool, ()> {
-    let Some(gpu) = crate::hw::live::NODE.gpu() else {
+fn irq_load(g: &'static Gpu, lines: &mut Vec<String>) -> Result<bool, ()> {
+    let Some(gpu) = g.hw().node.gpu() else {
         return refuse(lines, String::from("no backend on the render node: until=backend first"));
     };
     match crate::hw::check::hold_load(&gpu, 500_000_000, &|| {}) {
@@ -1618,14 +1797,14 @@ fn irq_load(lines: &mut Vec<String>) -> Result<bool, ()> {
 /// GX-8c: the chip as the boot's bring-up drives it: the tool's own paths under the tool's own gate.
 pub struct LiveBoot(&'static Gpu);
 
-/// `None`: this machine has no AMD GPU function.
-pub fn live_boot() -> Option<LiveBoot> {
-    Gpu::get().map(LiveBoot)
+/// `None`: the device is not one the 780M's driver drives (a card attached read-only, or its read gate refused it).
+pub fn live_boot(dev: &'static crate::devs::Device) -> Option<LiveBoot> {
+    dev.gpu().map(LiveBoot)
 }
 
 impl crate::hw::boot::Chip for LiveBoot {
     fn gate(&self) -> &crate::hw::live::ToolGate {
-        &crate::hw::live::TOOL
+        &self.0.hw().tool
     }
     fn now_ns(&self) -> u64 {
         crate::hw::clock_ns()
@@ -1645,14 +1824,12 @@ impl crate::hw::boot::Chip for LiveBoot {
     }
 }
 
-/// The heaps of this boot: one set over the device's manager, whatever comes and goes on top (their cushion of slabs
-/// stays, so a later backend finds it again).
-static HEAPS: ksync::Once<Arc<crate::hw::heap::Heaps>> = ksync::Once::new();
 
 /// The backend on the kept run: the carve-out from the hardware, the facts from the chip.
 fn backend_device(g: &'static Gpu) -> Result<(Arc<crate::hw::HardwareGpu>, vmring::VmInputs), String> {
+    let dv = g.st();
     let (Ok(a), Some(bos)) = (&g.display, &g.bos) else { return Err(String::from("display or BO manager gone")) };
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs))?;
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs))?;
     let d = disc::parse(&found.bytes).map_err(|w| format!("no discovery table: {w}"))?;
     let win = carve_window(g, a, &d)?;
     let carve = amdgpu_fmt::addr::Carveout::new(win.mc_base, win.phys_base, win.size).ok_or_else(|| format!("carve-out {win:?} is not page aligned"))?;
@@ -1663,27 +1840,27 @@ fn backend_device(g: &'static Gpu) -> Result<(Arc<crate::hw::HardwareGpu>, vmrin
     if d.reg(crate::gpucore::hwid::GC, 0, 0, crate::hw::chip::GB_ADDR_CONFIG_SEG0) != Some(gb) {
         return Err(format!("GB_ADDR_CONFIG is not at {gb:#x} here: the captured register list does not fit this chip"));
     }
-    let mut live = LIVE.lock_timeout(WAIT_NS).ok_or("busy: another run holds the PSP")?;
+    let mut live = dv.live.lock_timeout(WAIT_NS).ok_or("busy: another run holds the PSP")?;
     let l = live.as_mut().ok_or("no kept run")?;
     // GX-8b: the rings' queues as until=vm found them; the flush itself is in the rings, Linux's way of waiting for its ack.
-    let mut vmi = vm_inputs(&d, &win, l.sdma)?;
+    let mut vmi = vm_inputs(dv, &d, &win, l.sdma)?;
     vmi.ack = vmring::AckWait::Linux;
     l.owner.hw().hw().allow_gmc(vmi.addrs.readable(), vmi.addrs.writable());
     let started = crate::hw::chip::Started { device: g.device, revision: g.revision, gfx: l.mes.is_some_and(|m| m.2), compute: l.mes.is_some_and(|m| m.2), sdma: l.sdma.is_some() };
     l.owner.hw().hw().allow_gmc(alloc::vec![gb * 4], Vec::new());
     let gb_value = l.owner.reg_read(gb * 4).filter(|&v| v != 0 && v != u32::MAX).ok_or("GB_ADDR_CONFIG did not read")?;
-    let firmware = FW_VERSIONS.lock().clone();
+    let firmware = dv.fw_versions.lock().clone();
     if firmware.is_empty() {
         return Err(String::from("no firmware loaded in this boot"));
     }
-    let firmware = crate::hw::chip::with_smc(crate::hw::chip::with_mes(firmware, *MES_VERSIONS.lock()), *PMFW_VERSION.lock());
+    let firmware = crate::hw::chip::with_smc(crate::hw::chip::with_mes(firmware, *dv.mes_versions.lock()), *dv.pmfw_version.lock());
     let facts = crate::hw::chip::read_facts(&mut l.owner, &gfx, &profile, gb_value, started, firmware)?;
     drop(live);
     let tsc = crate::hw::chip::tsc_regs(&d);
     let mut allowed: Vec<u32> = profile.registers.iter().map(|r| r.offset * 4).collect();
     allowed.extend(tsc.iter().flat_map(|t| [t.upper, t.lower]));
     let regs = Arc::new(crate::hw::live::LiveRegs { regs: g.regs, allowed });
-    let heaps = HEAPS.get_or_init(|| crate::hw::heap::Heaps::new(carve, Arc::new(crate::hw::live::LiveCarve { carve }), alloc::boxed::Box::new(bos))).clone();
+    let heaps = dv.heaps.get_or_init(|| crate::hw::heap::Heaps::new(carve, Arc::new(crate::hw::live::LiveCarve { carve }), alloc::boxed::Box::new(bos))).clone();
     if heaps.carve != carve {
         return Err(format!("the carve-out moved: {:?} after {:?}", carve, heaps.carve));
     }
@@ -1701,17 +1878,20 @@ fn stop_kept(g: &Gpu, lines: &mut Vec<String>) -> Result<bool, ()> {
 /// after, and the IH ring goes on through it: bus master stays.
 #[inline(never)]
 fn stop_chain(g: &Gpu, lines: &mut Vec<String>, reset: bool) -> (Result<bool, ()>, bool) {
-    let Some(mut guard) = LIVE.lock_timeout(WAIT_NS) else {
+    let dv = g.st();
+    let Some(mut guard) = dv.live.lock_timeout(WAIT_NS) else {
         lines.push(String::from("busy: another run holds the PSP"));
         return (Err(()), false);
     };
-    let Some(mut l) = guard.take() else {
+    let taken = guard.take();
+    dv.kept.store(false, Ordering::Release);
+    let Some(mut l) = taken else {
         lines.push(String::from("no ring kept: nothing to stop"));
-        crate::hw::live::HELD.stop_found_no_chain();
+        g.hw().held.stop_found_no_chain();
         if !reset {
-            bus_master_back(g.regs, lines);
+            bus_master_back(dv, g.regs, lines);
         }
-        let halted = crate::hw::live::HALTS.proven();
+        let halted = g.hw().halts.proven();
         if !halted {
             lines.push(String::from("stop: the last stop left an engine running: this one vouches for nothing"));
         }
@@ -1719,16 +1899,21 @@ fn stop_chain(g: &Gpu, lines: &mut Vec<String>, reset: bool) -> (Result<bool, ()
     };
     let mut halted = true;
     let all_engines = l.gfx.is_some() && l.sdma.is_some();
-    vm_teardown(&mut l.owner, "stop", lines);
+    if !vcnlive::stop(&mut l, lines) {
+        lines.push(String::from("stop: VCN not proven powered down"));
+        g.hw().held.engines_left_running();
+        halted = false;
+    }
+    vm_teardown(dv, &mut l.owner, "stop", lines);
     if let Some((ma, bo_mc, queues)) = l.mes.take() {
         let st = mes::stop(&mut l.owner, &ma, bo_mc, queues);
-        note_stranded(&st.stranded);
+        note_stranded(dv, &st.stranded);
         lines.extend(st.lines);
         lines.push(format!("stop: MES stopped first (legacy queues unmapped, pipes dequeued, MES halted): {}", if st.ok { "done" } else { "a step failed (see above)" }));
-        *MES_UP.lock() = None;
+        *dv.mes_up.lock() = None;
         if !st.mes_halted {
             lines.push(String::from("stop: MES not proven halted"));
-            crate::hw::live::HELD.engines_left_running();
+            g.hw().held.engines_left_running();
             halted = false;
         }
     }
@@ -1736,10 +1921,10 @@ fn stop_chain(g: &Gpu, lines: &mut Vec<String>, reset: bool) -> (Result<bool, ()
         let ok = gfxring::halt(&mut l.owner, &xa);
         lines.push(format!("stop: the CP halted first (CP_ME_CNTL CE/PFP/ME halt, CP_MEC_CNTL MEC ME1 halt): {}", if ok { "done" } else { "a write was refused" }));
         if ok {
-            gfx_back(&mut l.owner, &xa, l.sdma.is_none(), lines);
+            gfx_back(dv, &mut l.owner, &xa, l.sdma.is_none(), lines);
         } else {
             lines.push(String::from("stop: the CP not halted: its doorbell side is left on"));
-            crate::hw::live::HELD.engines_left_running();
+            g.hw().held.engines_left_running();
             halted = false;
         }
     }
@@ -1747,10 +1932,10 @@ fn stop_chain(g: &Gpu, lines: &mut Vec<String>, reset: bool) -> (Result<bool, ()
         let ok = sdma::halt(&mut l.owner, &sa);
         lines.push(format!("stop: SDMA 0 halted first (ring and IBs off, F32 halted): {}", if ok { "done" } else { "a write was refused" }));
         if ok {
-            sdma_back(&mut l.owner, &sa, lines);
+            sdma_back(dv, &mut l.owner, &sa, lines);
         } else {
             lines.push(String::from("stop: SDMA 0 not halted: its doorbell side is left on"));
-            crate::hw::live::HELD.engines_left_running();
+            g.hw().held.engines_left_running();
             halted = false;
         }
     }
@@ -1764,7 +1949,7 @@ fn stop_chain(g: &Gpu, lines: &mut Vec<String>, reset: bool) -> (Result<bool, ()
         lines.push(format!("stop: GC unloaded toward PMFW before the PSP (Linux's smu_hw_fini): {}", u.text()));
         if u.prepared.is_err_and(|e| e.needs_reboot()) {
             lines.push(String::from("stop: PMFW did not answer PrepareMp1ForUnload: its mailbox is stuck; reboot before more GPU work"));
-            REBOOT_NEEDED.store(true, Ordering::Release);
+            dv.reboot_needed.store(true, Ordering::Release);
         }
     }
     l.gc = gc;
@@ -1772,27 +1957,27 @@ fn stop_chain(g: &Gpu, lines: &mut Vec<String>, reset: bool) -> (Result<bool, ()
     lines.push(format!("stop: {}", match &r { Ok(()) => String::from("DESTROY_TMR and DESTROY_RINGS answered"), Err(e) => format!("FAILED {e:?}") }));
     let quiet = r.is_ok() && l.psp.quiet();
     if r.is_err() {
-        REBOOT_NEEDED.store(true, Ordering::Release);
+        dv.reboot_needed.store(true, Ordering::Release);
     }
     if !quiet {
-        crate::hw::live::HELD.engines_left_running();
+        g.hw().held.engines_left_running();
         halted = false;
     }
     let (gc, addrs) = (l.gc, l.addrs);
     match (&g.bos, quiet) {
-        (Some(bos), true) => l.psp.free(&mut SharedBos(bos)),
+        (Some(bos), true) => l.psp.free(&mut SharedBos(bos, &g.st().pool)),
         // Without the manager the buffers cannot go back (the display left): they stay allocated either way.
         (None, true) => {}
-        (_, false) => quarantine(l.psp, lines),
+        (_, false) => quarantine(dv, l.psp, lines),
     }
     if !reset {
-        bus_master_back(g.regs, lines);
+        bus_master_back(dv, g.regs, lines);
     }
     // The note after bus master is settled (it says whether bus master is still ours and on).
-    let n = note_of(&mut l.owner, &addrs, if quiet { RingFate::Destroyed } else { RingFate::NotDestroyed }, gc, r.is_ok());
+    let n = note_of(dv, &mut l.owner, &addrs, if quiet { RingFate::Destroyed } else { RingFate::NotDestroyed }, gc, r.is_ok());
     lines.push(format!("note for the next kernel: {}", n.text()));
     set_note(n);
-    crate::hw::live::HALTS.stop_ran(halted, all_engines);
+    g.hw().halts.stop_ran(halted, all_engines);
     (Ok(quiet), halted)
 }
 
@@ -1839,30 +2024,30 @@ pub struct Pre {
 /// booted in it. Each spin lock is taken in a statement of its own and the copy used after: a guard taken inside
 /// one expression (a struct literal's field) lives to the end of the statement, so a second `.lock()` of the same
 /// `SpinLock` in it spins on its own CPU forever (INT-W28's `mes_up`/`mes_queues` pair hung every `gx_bringup`
-/// on the Mini-PC, plan/notes/gx-GX-7j3-hang.md).
-pub(crate) fn pre_now(until: Until, again: bool, kept: Option<bool>, display: Result<(), String>, has_bos: bool, reset: bool) -> Pre {
-    let mes = *MES_UP.lock();
-    let gart_up = !reset && GART_UP.lock().is_some();
+/// on the Mini-PC).
+pub(crate) fn pre_now(dv: &State, until: Until, again: bool, kept: Option<bool>, display: Result<(), String>, has_bos: bool, reset: bool) -> Pre {
+    let mes = *dv.mes_up.lock();
+    let gart_up = !reset && dv.gart_up.lock().is_some();
     Pre {
-        reboot_needed: REBOOT_NEEDED.load(Ordering::Acquire),
-        quarantined: QUARANTINED.load(Ordering::Acquire) > 0,
+        reboot_needed: dv.reboot_needed.load(Ordering::Acquire),
+        quarantined: dv.quarantined.load(Ordering::Acquire) > 0,
         display,
         has_bos,
         until,
-        m2_runs: M2_RUNS.load(Ordering::Acquire),
+        m2_runs: dv.m2_runs.load(Ordering::Acquire),
         again,
         kept: kept.is_some(),
-        gfx_runs: GFX_RUNS.load(Ordering::Acquire),
-        gc_failed: GC_FAILED.load(Ordering::Acquire),
+        gfx_runs: dv.gfx_runs.load(Ordering::Acquire),
+        gc_failed: dv.gc_failed.load(Ordering::Acquire),
         reset,
-        gmc_runs: GMC_RUNS.load(Ordering::Acquire),
+        gmc_runs: dv.gmc_runs.load(Ordering::Acquire),
         kept_gc_booted: kept == Some(true),
-        sdma_runs: SDMA_RUNS.load(Ordering::Acquire),
+        sdma_runs: dv.sdma_runs.load(Ordering::Acquire),
         gart_up,
-        gfx_ring_runs: GFX_RING_RUNS.load(Ordering::Acquire),
-        mes_runs: MES_RUNS.load(Ordering::Acquire),
+        gfx_ring_runs: dv.gfx_ring_runs.load(Ordering::Acquire),
+        mes_runs: dv.mes_runs.load(Ordering::Acquire),
         mes_up: mes.is_some(),
-        mes_stranded: MES_STRANDED.load(Ordering::Acquire),
+        mes_stranded: dv.mes_stranded.load(Ordering::Acquire),
         mes_queues: mes.is_some_and(|m| m.2),
     }
 }
@@ -1940,8 +2125,23 @@ pub fn preflight(p: &Pre) -> Result<(), String> {
 /// snapshot only the registers the compositor's own writes explain may differ, and only on the pipes it touched
 /// during the run: a flip's HUBP surface address (and _HIGH), its flip control, and the hardware's copy of the
 /// address the HUBP took (SURFACE_EARLIEST_INUSE and _HIGH); a cursor update's CURSOR0_/CNVC_CUR registers. They
-/// are listed as the compositor's; every other difference fails the run as before (GX-D9).
+/// are listed as the compositor's; every other difference fails the run as before (GX-D9). GPY: a cursor image's
+/// HUBPREQn_CURSOR_SETTINGS too (`snapshot::cursor_pipe`), and the sound's endpoint index selects are not counted
+/// (`dcn::Owner::AudioIndex`).
 pub fn picture(before: alloc::collections::BTreeMap<u32, u32>, after: &alloc::collections::BTreeMap<u32, u32>, m0: &dcn::Marks, m1: &dcn::Marks) -> (bool, Vec<String>) {
+    picture_with(before, after, m0, m1, &dcn::foreign_writes())
+}
+
+/// `picture` with the foreign writes' ring given (host tests). GPY: the sound's endpoint index selects are listed
+/// apart like the compositor's, and the counted writes the foreign ring still holds are named by register, so a red
+/// run says whose writes they were.
+pub fn picture_with(
+    before: alloc::collections::BTreeMap<u32, u32>,
+    after: &alloc::collections::BTreeMap<u32, u32>,
+    m0: &dcn::Marks,
+    m1: &dcn::Marks,
+    ring: &[dcn::LoggedWrite],
+) -> (bool, Vec<String>) {
     let reference = snapshot::Reference { regs: before, scope: snapshot::Scope::Snapshot { wide: false } };
     let mut cmp = snapshot::compare(&reference, after, false);
     let others = m0.others_until(m1);
@@ -1963,12 +2163,36 @@ pub fn picture(before: alloc::collections::BTreeMap<u32, u32>, after: &alloc::co
             pipes(&moved)
         ));
     }
+    let audio = m1.audio.wrapping_sub(m0.audio);
+    if audio > 0 {
+        lines.push(format!("display writes of the sound during the run (audio endpoint index selects, each put back; not counted): {audio}"));
+    }
+    if others > 0 {
+        lines.push(others_by_register(ring, m0, m1));
+    }
     lines.push(format!("scanout (DCN snapshot before/after): {}", snapshot::render(&cmp).trim_end()));
     if !theirs.is_empty() {
         let r = snapshot::Report { compared: theirs.len(), differ: theirs, ..snapshot::Report::default() };
         lines.push(format!("scanout: changed by the compositor's own writes (not counted): {}", snapshot::render(&r).trim_end().replacen("differ: ", "", 1)));
     }
     (cmp.equal() && others == 0, lines)
+}
+
+/// GPY: the counted writes of the run that the foreign writes' ring still holds (the last 32 of them; owned writes
+/// never push one out), by register.
+fn others_by_register(ring: &[dcn::LoggedWrite], m0: &dcn::Marks, m1: &dcn::Marks) -> String {
+    let mut by: alloc::collections::BTreeMap<u32, u64> = alloc::collections::BTreeMap::new();
+    let mut seen = 0u64;
+    let run = m0.others_range(m1);
+    for w in ring.iter().filter(|w| w.owner == dcn::Owner::Other && run.contains(&w.seq)) {
+        *by.entry(w.offset).or_default() += 1;
+        seen += 1;
+    }
+    if by.is_empty() {
+        return String::from("counted writes by register: none left in the log's ring (it keeps the last 32 counted writes)");
+    }
+    let list: Vec<String> = by.iter().map(|(&b, &n)| format!("{b:05X} {} x{n}", snapshot::name(b))).collect();
+    format!("counted writes by register ({seen} of them in the log's ring, which keeps the last 32 counted writes): {}", list.join(", "))
 }
 
 /// The first carve-out range of `forbid` that meets `r`.
@@ -1978,11 +2202,12 @@ pub fn meets(r: Range<u64>, forbid: &[Range<u64>]) -> Option<Range<u64>> {
 
 #[inline(never)]
 fn run(g: &Gpu, until: Until, args: Args, lines: &mut Vec<String>) -> Result<bool, ()> {
-    let Some(mut live) = LIVE.lock_timeout(WAIT_NS) else {
+    let dv = g.st();
+    let Some(mut live) = dv.live.lock_timeout(WAIT_NS) else {
         return refuse(lines, String::from("busy: another run holds the PSP"));
     };
     let kept = live.as_ref().map(|l| l.gc == GcFate::Booted);
-    let pre = pre_now(until, args.again, kept, g.display.as_ref().map(|_| ()).map_err(|e| format!("{e}")), g.bos.is_some(), false);
+    let pre = pre_now(dv, until, args.again, kept, g.display.as_ref().map(|_| ()).map_err(|e| format!("{e}")), g.bos.is_some(), false);
     if let Err(why) = preflight(&pre) {
         return refuse(lines, why);
     }
@@ -1994,7 +2219,7 @@ fn run(g: &Gpu, until: Until, args: Args, lines: &mut Vec<String>) -> Result<boo
     if live.is_some() {
         // Every continue on a kept, GC-booted run gets here (preflight): `until=gart`/`sdma`/`gfx_ring`, and also
         // `gfx_mes` and `vm` through `gart_continue`; the store gives `until=vm` its `ack` (default: parse_args).
-        VM_ACK_LINUX.store(args.ack_linux, Ordering::Release);
+        dv.vm_ack_linux.store(args.ack_linux, Ordering::Release);
         return gart_continue(g, &mut live, until, args.variant, lines);
     }
     fresh(g, until, args, &mut live, lines)
@@ -2014,6 +2239,7 @@ pub fn restart_by_stop(until: Until, again: bool, cp_runs_direct_ring: bool) -> 
 /// a manual stop.
 #[inline(never)]
 fn restart(g: &Gpu, until: Until, args: Args, lines: &mut Vec<String>) -> Result<bool, ()> {
+    let dv = g.st();
     lines.push(String::from(
         "gfx_ring again: GFX ring 0 of the earlier run still runs on the CP: stopped first as until=stop does (a restart on the running CP failed the ring test 2 of 3 times on 29.10.; after a stop it passed every time), then started from the PSP",
     ));
@@ -2025,11 +2251,11 @@ fn restart(g: &Gpu, until: Until, args: Args, lines: &mut Vec<String>) -> Result
         }
     }
     // The stop wrote: a refusal from here on is a FAIL with its reason, not "nothing written".
-    let Some(mut live) = LIVE.lock_timeout(WAIT_NS) else {
+    let Some(mut live) = dv.live.lock_timeout(WAIT_NS) else {
         lines.push(String::from("gfx_ring again: busy after the stop (another run holds the PSP): nothing started"));
         return Ok(false);
     };
-    let pre = pre_now(until, args.again, live.as_ref().map(|l| l.gc == GcFate::Booted), g.display.as_ref().map(|_| ()).map_err(|e| format!("{e}")), g.bos.is_some(), false);
+    let pre = pre_now(dv, until, args.again, live.as_ref().map(|l| l.gc == GcFate::Booted), g.display.as_ref().map(|_| ()).map_err(|e| format!("{e}")), g.bos.is_some(), false);
     if let Err(why) = preflight(&pre) {
         lines.push(format!("gfx_ring again: refused after the stop: {why}"));
         return Ok(false);
@@ -2045,11 +2271,12 @@ fn restart(g: &Gpu, until: Until, args: Args, lines: &mut Vec<String>) -> Result
 /// large and a continue (`gart_continue`, e.g. `until=vm`) must not carry them on MCP's 64 KiB thread.
 #[inline(never)]
 fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut Vec<String>) -> Result<bool, ()> {
+    let dv = g.st();
     let (Ok(a), Some(bos)) = (&g.display, &g.bos) else {
         return refuse(lines, String::from("display or BO manager gone"));
     };
     // The discovery table of this boot (the carve-out's top is closed to the CPU: the indirect copy).
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs));
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs));
     let d = match found.and_then(|f| disc::parse(&f.bytes).map_err(|w| format!("{w}"))) {
         Ok(d) => d,
         Err(e) => return refuse(lines, format!("no discovery table: {e}")),
@@ -2065,7 +2292,7 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
     // GX-7j3 fixer: the unload's registers come from discovery, not from this run's GC input: a later run
     // without a GC stage (until=psp) must still unload a GC an earlier stop left `Booted` (its unload refused).
     let un_addrs = GfxInputs::from_discovery(&d).map(|g| handoff::UnloadAddrs { smu: g.smu, gc: g.gc });
-    let (st, _) = crate::state::classify_live(g.regs, &d);
+    let (st, _) = crate::state::classify_live(g.st(), g.regs, &d);
     lines.push(format!("state: {}", st.start.name()));
     for w in &st.why {
         lines.push(format!("state why: {w}"));
@@ -2078,13 +2305,14 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
         Err(e) => return refuse(lines, e),
     };
     let gmc_in = if until.runs_gmc() {
-        match gmc_inputs(&d, &win) {
+        match gmc_inputs(dv, &d, &win) {
             Ok(m) => Some(m),
             Err(e) => return refuse(lines, e),
         }
     } else {
         None
     };
+    // GX-8v: VCN's microcode is in the list (no DMCUB, GX-D9).
     let opts = ListOpts::PSP13_0_4;
     let plan = ipmod::plan(&d);
     let (fw, notes) = match fwload::load(&plan.files(), &mut StickSource, &opts) {
@@ -2096,11 +2324,12 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
         Err(e) => return refuse(lines, format!("firmware list: {e:?}")),
     };
     lines.push(format!("firmware: {} files, {} images to load ({} needs skipped, {} fallbacks)", fw.files.len(), list.len(), notes.skipped.len(), notes.fallbacks.len()));
-    *FW_VERSIONS.lock() = crate::hw::chip::loaded_firmware(&drm::profile_780m::RADEON_780M, &fw);
-    BURST_NOP.store(if sdma::burst_nop(&fw) { 2 } else { 1 }, Ordering::Release);
+    let versions = crate::hw::chip::loaded_firmware(&drm::profile_780m::RADEON_780M, &fw);
+    *dv.fw_versions.lock() = crate::hw::chip::with_vcn(versions, &fw);
+    dv.burst_nop.store(if sdma::burst_nop(&fw) { 2 } else { 1 }, Ordering::Release);
     let sys = LiveSys;
     let sdma_in = if until == Until::Sdma {
-        match sdma_inputs(&d, &win, &sys) {
+        match sdma_inputs(dv, &d, &win, &sys) {
             Ok(s) => Some(s),
             Err(e) => return refuse(lines, e),
         }
@@ -2108,7 +2337,7 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
         None
     };
     let gfx_in = if until.runs_gfx_stage() {
-        match gfx_inputs(&d, &win, until, args.variant, lines) {
+        match gfx_inputs(dv, &d, &win, until, args.variant, lines) {
             Ok(x) => Some(x),
             Err(e) => return refuse(lines, e),
         }
@@ -2116,9 +2345,9 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
         None
     };
     // GX-7k: the MES firmware starts of this load, kept for a later run that continues on the kept one.
-    *MES_UC.lock() = fw.mes_uc_starts();
+    *dv.mes_uc.lock() = fw.mes_uc_starts();
     let mes_in = if until.runs_mes() {
-        match mes_inputs(&d, &win) {
+        match mes_inputs(dv, &d, &win) {
             Ok(x) => Some(x),
             Err(e) => return refuse(lines, e),
         }
@@ -2133,13 +2362,13 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
     lines.extend(dma_lines(g.regs, "before"));
     let had_master = g.regs.pci().command() & 0x4 != 0;
     register_quiesce();
-    if had_master && !BUS_MASTER_OURS.load(Ordering::Acquire) && inherited_note().is_some_and(|n| n.bus_master_left_on) && !BUS_MASTER_INHERITED.swap(true, Ordering::AcqRel) {
-        BUS_MASTER_OURS.store(true, Ordering::Release);
+    if had_master && !dv.bus_master_ours.load(Ordering::Acquire) && inherited_note().is_some_and(|n| n.bus_master_left_on) && !dv.bus_master_inherited.swap(true, Ordering::AcqRel) {
+        dv.bus_master_ours.store(true, Ordering::Release);
         lines.push(String::from("bus master: found on, left by the kernel before (its note): this driver switches it off again"));
     }
     // Recorded before the switch: a failure half-way (some bridges set) is still ours to set back.
     if !had_master {
-        BUS_MASTER_OURS.store(true, Ordering::Release);
+        dv.bus_master_ours.store(true, Ordering::Release);
     }
     match g.regs.pci().enable_device(true) {
         Ok(e) => {
@@ -2147,7 +2376,7 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
         }
         Err(e) => {
             lines.push(format!("enable_device failed: {e}"));
-            bus_master_back(g.regs, lines);
+            bus_master_back(dv, g.regs, lines);
             return refuse(lines, String::from("bus master could not be switched on: no PSP register written"));
         }
     }
@@ -2155,8 +2384,8 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
 
     // Everything in use before the run but the boot's PSP pool: protected by the watcher, never mapped by the
     // PSP's pieces.
-    let Some(pool) = POOL.lock_timeout(WAIT_NS) else {
-        bus_master_back(g.regs, lines);
+    let Some(pool) = dv.pool.lock_timeout(WAIT_NS) else {
+        bus_master_back(dv, g.regs, lines);
         return refuse(lines, String::from("busy: the PSP buffer pool is locked"));
     };
     let forbid: Vec<Range<u64>> = bos.lock().used().filter(|r| !pool.holds(r)).collect();
@@ -2169,7 +2398,7 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
         guard.protect(win.mc_base + r.start, r.end - r.start);
     }
     let lists = gmc_in.as_ref().map(|m| gmc_lists(m, &guard));
-    let mut hw = PspHw::with_gmc(g.regs, &d, &addrs, gfx.as_ref(), lists, win, forbid);
+    let mut hw = PspHw::with_gmc(g.st(), g.regs, &d, &addrs, gfx.as_ref(), lists, win, forbid);
     if let Some(s) = &sdma_in {
         hw.allow_sdma(&s.addrs, bar2(g));
     }
@@ -2200,56 +2429,56 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
     };
     let gfx_variant = inp.gfx_ring.as_ref().map(|x| x.variant).filter(|_| until == Until::GfxRing);
     let gc_before = gc_now();
-    let mut out = pspbringup::run(&mut owner, &mut SharedBos(bos), &inp);
+    let mut out = pspbringup::run(&mut owner, &mut SharedBos(bos, &g.st().pool), &inp);
     if out.gfx.is_some() {
-        GFX_RUNS.fetch_add(1, Ordering::AcqRel);
-        GC_FAILED.store(pspbringup::gc_latch(GC_FAILED.load(Ordering::Acquire), &out), Ordering::Release);
+        dv.gfx_runs.fetch_add(1, Ordering::AcqRel);
+        dv.gc_failed.store(pspbringup::gc_latch(dv.gc_failed.load(Ordering::Acquire), &out), Ordering::Release);
     }
     if let Some(v) = out.gfx.as_ref().and_then(|x| x.pmfw) {
-        *PMFW_VERSION.lock() = Some(v);
+        *dv.pmfw_version.lock() = Some(v);
     }
     if until.loads_fw() && out.report.steps.iter().any(|s| matches!(s, crate::gpucore::psp::Step::Load(_))) {
-        M2_RUNS.fetch_add(1, Ordering::AcqRel);
+        dv.m2_runs.fetch_add(1, Ordering::AcqRel);
     }
     if out.needs_reboot() {
-        REBOOT_NEEDED.store(true, Ordering::Release);
+        dv.reboot_needed.store(true, Ordering::Release);
     }
     if let Some(m) = &out.gmc {
-        GMC_RUNS.fetch_add(1, Ordering::AcqRel);
-        keep_table(m.table);
-        *GART_UP.lock() = if m.passed() { inp.gmc.as_ref().and_then(|gi| pspbringup::gart_use(m, gi)) } else { None };
+        dv.gmc_runs.fetch_add(1, Ordering::AcqRel);
+        keep_table(dv, m.table);
+        *dv.gart_up.lock() = if m.passed() { inp.gmc.as_ref().and_then(|gi| pspbringup::gart_use(m, gi)) } else { None };
     }
     let sdma_ran = out.sdma.as_ref().map(|s| {
-        SDMA_RUNS.fetch_add(1, Ordering::AcqRel);
-        note_sdma(s);
-        keep_sdma_bo(s.bo);
+        dv.sdma_runs.fetch_add(1, Ordering::AcqRel);
+        note_sdma(dv, s);
+        keep_sdma_bo(dv, s.bo);
         s.left_running
     });
     let gfx_ran = out.gfx_ring.as_ref().map(|x| {
-        GFX_RING_RUNS.fetch_add(1, Ordering::AcqRel);
-        note_gfx(x);
-        keep_gfx_bo(x.bo);
+        dv.gfx_ring_runs.fetch_add(1, Ordering::AcqRel);
+        note_gfx(dv, x);
+        keep_gfx_bo(dv, x.bo);
         x.left_running
     });
     let mes_up = out.mes.as_ref().and_then(|m| {
-        MES_RUNS.fetch_add(1, Ordering::AcqRel);
-        note_mes(m);
-        keep_mes_bo(m.bo);
+        dv.mes_runs.fetch_add(1, Ordering::AcqRel);
+        note_mes(dv, m);
+        keep_mes_bo(dv, m.bo);
         let a = inp.mes.as_ref()?.addrs;
         // A failed halt counts too: until=stop tries again (without unmapping: MES did not pass).
         (m.left_running || m.halt_failed.is_some()).then(|| (a, m.layout.map(|l| l.bo_mc), m.queues && m.left_running))
     });
     if !out.mes_pre.is_empty() {
-        *MES_UP.lock() = None;
+        *dv.mes_up.lock() = None;
     }
     if out.mes_pre_stranded {
-        MES_STRANDED.store(true, Ordering::Release);
+        dv.mes_stranded.store(true, Ordering::Release);
     }
     lines.extend(pspbringup::render(&out, &inp));
     let passed = out.passed();
     let quarantined_now = out.quarantined.is_some();
     if let Some(p) = out.quarantined.take() {
-        quarantine(p, lines);
+        quarantine(dv, p, lines);
     }
     let gc = match &out.gfx {
         Some(x) if x.gc_touched && x.error.is_none() => GcFate::Booted,
@@ -2260,45 +2489,46 @@ fn fresh(g: &Gpu, until: Until, args: Args, live: &mut Option<Live>, lines: &mut
     let sdma_addrs = sdma_ran.and(inp.sdma.as_ref().map(|s| s.addrs));
     let gfx_addrs = gfx_ran.and(inp.gfx_ring.as_ref().map(|x| x.addrs));
     if let Some(psp) = out.kept.take() {
-        let n = note_of(&mut owner, &addrs, RingFate::NotDestroyed, gc, false);
+        let n = note_of(dv, &mut owner, &addrs, RingFate::NotDestroyed, gc, false);
         set_note(n);
         lines.push(bus_line(BusChoice::Kept, None));
-        *MES_UP.lock() = mes_up;
-        *live = Some(Live { owner, psp, gc, addrs, sdma: sdma_addrs, gfx: gfx_addrs, mes: mes_up, un: un_addrs });
+        *dv.mes_up.lock() = mes_up;
+        *live = Some(Live { owner, psp, gc, addrs, sdma: sdma_addrs, gfx: gfx_addrs, mes: mes_up, un: un_addrs, vcn: None });
+        dv.kept.store(true, Ordering::Release);
     } else {
         // No kept run to halt them later: MES, the CP and SDMA 0 are halted now (an engine must never outlive its
         // owner); MES first, while the CP still runs the queues it unmaps.
         if let Some((ma, bo_mc, queues)) = mes_up {
             let st = mes::stop(&mut owner, &ma, bo_mc, queues);
-            note_stranded(&st.stranded);
+            note_stranded(dv, &st.stranded);
             lines.extend(st.lines);
             lines.push(format!("mes: stopped now (no kept run holds it): {}", st.ok));
             if !st.mes_halted {
-                crate::hw::live::HALTS.halt_failed();
+                g.hw().halts.halt_failed();
             }
         }
         if let Some(xa) = gfx_addrs {
             let ok = gfxring::halt(&mut owner, &xa);
             lines.push(format!("gfx: the CP and MEC halted now (no kept run holds it): {ok}"));
             if ok {
-                gfx_back(&mut owner, &xa, sdma_addrs.is_none(), lines);
+                gfx_back(dv, &mut owner, &xa, sdma_addrs.is_none(), lines);
             } else {
-                crate::hw::live::HALTS.halt_failed();
+                g.hw().halts.halt_failed();
             }
         }
         if let Some(sa) = sdma_addrs {
             let ok = sdma::halt(&mut owner, &sa);
             lines.push(format!("sdma: halted now (no kept run holds it): {ok}"));
             if ok {
-                sdma_back(&mut owner, &sa, lines);
+                sdma_back(dv, &mut owner, &sa, lines);
             } else {
-                crate::hw::live::HALTS.halt_failed();
+                g.hw().halts.halt_failed();
             }
         }
-        bus_master_back(g.regs, lines);
+        bus_master_back(dv, g.regs, lines);
         if touched_rings || gc != gc_before {
             let ring = if quarantined_now { RingFate::NotDestroyed } else { RingFate::Destroyed };
-            set_note(note_of(&mut owner, &addrs, ring, gc, !quarantined_now));
+            set_note(note_of(dv, &mut owner, &addrs, ring, gc, !quarantined_now));
         }
     }
     lines.extend(dma_lines(g.regs, "after the run"));
@@ -2337,69 +2567,69 @@ pub fn verdict(until: Until, stages: bool, picture_same: bool, crc_same: bool) -
 }
 
 /// GX-7h: the hubs and the carve-out for the GMC stage (the table of an earlier run of this boot reused).
-fn gmc_inputs(d: &Discovery, win: &CarveWin) -> Result<GmcInputs, String> {
+fn gmc_inputs(dv: &'static State, d: &Discovery, win: &CarveWin) -> Result<GmcInputs, String> {
     let carve = amdgpu_fmt::addr::Carveout::new(win.mc_base, win.phys_base, win.size).ok_or_else(|| format!("carve-out {win:?} is not page aligned"))?;
     let mut m = GmcInputs::new(d, carve).ok_or_else(|| String::from("no GC/MMHUB bases in the discovery table: hub registers unknown"))?;
     // A blocking lock: it is held only for a copy of the handle, and a busy lock must never make the stage
     // allocate a second table (the first would leak and the hubs could point at an untracked table).
-    m.table = *GART_TABLE.lock();
+    m.table = *dv.gart_table.lock();
     Ok(m)
 }
 
-fn keep_table(t: Option<TableBo>) {
+fn keep_table(dv: &'static State, t: Option<TableBo>) {
     if let Some(t) = t {
-        *GART_TABLE.lock() = Some(t);
+        *dv.gart_table.lock() = Some(t);
     }
 }
 
-fn keep_sdma_bo(b: Option<SdmaBo>) {
+fn keep_sdma_bo(dv: &'static State, b: Option<SdmaBo>) {
     if let Some(b) = b {
-        *SDMA_BO.lock() = Some(b);
+        *dv.sdma_bo.lock() = Some(b);
     }
 }
 
-fn keep_mes_bo(b: Option<MesBo>) {
+fn keep_mes_bo(dv: &'static State, b: Option<MesBo>) {
     if let Some(b) = b {
-        *MES_BO.lock() = Some(b);
+        *dv.mes_bo.lock() = Some(b);
     }
 }
 
 /// GX-7k: after a MES stage: the aperture as this boot's first doorbell stage found it, and whether it is on by
 /// this driver now (MES turns it on: its rings are doorbell-driven).
-fn note_mes(r: &mes::MesReport) {
-    note_stranded(&r.stranded);
-    *MES_VERSIONS.lock() = r.versions;
+fn note_mes(dv: &'static State, r: &mes::MesReport) {
+    note_stranded(dv, &r.stranded);
+    *dv.mes_versions.lock() = r.versions;
     if r.queues && r.left_running {
-        MES_STRANDED.store(false, Ordering::Release);
+        dv.mes_stranded.store(false, Ordering::Release);
     }
-    let first = keep_aper_first(&mut APER_FIRST.lock(), r.aper_found());
+    let first = keep_aper_first(&mut dv.aper_first.lock(), r.aper_found());
     if aperture_ours(first, r.aper.1) {
-        APERTURE_OURS.store(true, Ordering::Release);
+        dv.aperture_ours.store(true, Ordering::Release);
     }
 }
 
 /// GX-7k: MES's registers, its buffer of an earlier run, the firmware starts of this boot's load, MES left by an
 /// earlier run (stopped first), the Quiesce arming.
-fn mes_inputs(d: &Discovery, win: &CarveWin) -> Result<MesInputs<'static>, String> {
+fn mes_inputs(dv: &'static State, d: &Discovery, win: &CarveWin) -> Result<MesInputs<'static>, String> {
     let carve = amdgpu_fmt::addr::Carveout::new(win.mc_base, win.phys_base, win.size).ok_or_else(|| format!("carve-out {win:?} is not page aligned"))?;
-    let uc = *MES_UC.lock();
+    let uc = *dv.mes_uc.lock();
     let x = MesInputs::new(d, carve, uc).ok_or_else(|| String::from("no GC bases in the discovery table: MES registers unknown"))?;
     if x.addrs.aper_en.is_none() {
         return Err(String::from("no NBIF segment 2 in the discovery table: the doorbell aperture is unknown"));
     }
-    let prev = (*MES_UP.lock()).map(|(_, bo, q)| (bo, q));
-    Ok(MesInputs { bo: *MES_BO.lock(), arm: Some(&arm_mes), prev, ..x })
+    let prev = (*dv.mes_up.lock()).map(|(_, bo, q)| (bo, q));
+    Ok(MesInputs { bo: *dv.mes_bo.lock(), arm: Some(&*arms(dv).mes), prev, ..x })
 }
 
-fn keep_gfx_bo(b: Option<GfxBo>) {
+fn keep_gfx_bo(dv: &'static State, b: Option<GfxBo>) {
     if let Some(b) = b {
-        *GFX_BO.lock() = Some(b);
+        *dv.gfx_bo.lock() = Some(b);
     }
 }
 
 /// GX-7j: GC's CP registers, the GFX buffer of an earlier run, the Quiesce arming; GX-7j2: the variant (its line
 /// says which and whether it was the default).
-fn gfx_inputs(d: &Discovery, win: &CarveWin, until: Until, variant: Option<gfxring::Variant>, lines: &mut Vec<String>) -> Result<GfxRingInputs<'static>, String> {
+fn gfx_inputs(dv: &'static State, d: &Discovery, win: &CarveWin, until: Until, variant: Option<gfxring::Variant>, lines: &mut Vec<String>) -> Result<GfxRingInputs<'static>, String> {
     let carve = amdgpu_fmt::addr::Carveout::new(win.mc_base, win.phys_base, win.size).ok_or_else(|| format!("carve-out {win:?} is not page aligned"))?;
     let x = GfxRingInputs::new(d, carve).ok_or_else(|| String::from("no GC bases in the discovery table: CP registers unknown"))?;
     if x.addrs.aper_en.is_none() {
@@ -2411,7 +2641,7 @@ fn gfx_inputs(d: &Discovery, win: &CarveWin, until: Until, variant: Option<gfxri
     } else {
         lines.push(String::from("gfx stage: Linux 7.1's cp_resume order before MES (mes)"));
     }
-    Ok(GfxRingInputs { bo: *GFX_BO.lock(), arm: Some(&arm_gfx), variant: v, ..x })
+    Ok(GfxRingInputs { bo: *dv.gfx_bo.lock(), arm: Some(&*arms(dv).gfx), variant: v, ..x })
 }
 
 /// GX-7i: the doorbell BAR's address (BAR2 of the function; `None` when it is not a memory BAR of a page or more).
@@ -2423,14 +2653,14 @@ fn bar2(g: &Gpu) -> Option<u64> {
 }
 
 /// GX-7i: SDMA 0, its buffer of an earlier run, the firmware's burst NOP and rung 3's system pages.
-fn sdma_inputs<'a>(d: &Discovery, win: &CarveWin, sys: &'a LiveSys) -> Result<SdmaInputs<'a>, String> {
+fn sdma_inputs<'a>(dv: &'static State, d: &Discovery, win: &CarveWin, sys: &'a LiveSys) -> Result<SdmaInputs<'a>, String> {
     let carve = amdgpu_fmt::addr::Carveout::new(win.mc_base, win.phys_base, win.size).ok_or_else(|| format!("carve-out {win:?} is not page aligned"))?;
-    let burst = BURST_NOP.load(Ordering::Acquire) == 2;
+    let burst = dv.burst_nop.load(Ordering::Acquire) == 2;
     let s = SdmaInputs::new(d, carve, burst).ok_or_else(|| String::from("no GC bases in the discovery table: SDMA registers unknown"))?;
     if s.addrs.nbio.is_none() {
         return Err(String::from("no NBIF segments 1-3 in the discovery table: the doorbell side is unknown"));
     }
-    Ok(SdmaInputs { bo: *SDMA_BO.lock(), sys: Some(sys), arm: Some(&arm_sdma), ..s })
+    Ok(SdmaInputs { bo: *dv.sdma_bo.lock(), sys: Some(sys), arm: Some(&*arms(dv).sdma), ..s })
 }
 
 /// GX-7i: rung 3's system pages: MM-14 `DmaPages` (write-back, snooped), pinned for the device while held.
@@ -2467,10 +2697,11 @@ impl SysPages for LivePages {
 /// GX-7i: `until=sdma` the same, then the SDMA stage; the GMC stage only when this boot has no passed one.
 #[inline(never)]
 fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option<gfxring::Variant>, lines: &mut Vec<String>) -> Result<bool, ()> {
+    let dv = g.st();
     let (Ok(a), Some(bos), Some(l)) = (&g.display, &g.bos, live.as_mut()) else {
         return refuse(lines, String::from("display, BO manager or the kept run gone"));
     };
-    let found = probe::kept().map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs));
+    let found = probe::kept(g.regs).map(Ok).unwrap_or_else(|| probe::fetch_indirect(g.regs));
     let d = match found.and_then(|f| disc::parse(&f.bytes).map_err(|w| format!("{w}"))) {
         Ok(d) => d,
         Err(e) => return refuse(lines, format!("no discovery table: {e}")),
@@ -2479,14 +2710,14 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
         Ok(w) => w,
         Err(e) => return refuse(lines, e),
     };
-    let (gm, gi) = match (gmc_inputs(&d, &win), GfxInputs::from_discovery(&d)) {
+    let (gm, gi) = match (gmc_inputs(dv, &d, &win), GfxInputs::from_discovery(&d)) {
         (Ok(m), Some(gi)) => (m, gi),
         (Err(e), _) => return refuse(lines, e),
         (_, None) => return refuse(lines, String::from("no GC bases in the discovery table")),
     };
     let sys = LiveSys;
     let sdma_in = if until == Until::Sdma {
-        match sdma_inputs(&d, &win, &sys) {
+        match sdma_inputs(dv, &d, &win, &sys) {
             Ok(s) => Some(s),
             Err(e) => return refuse(lines, e),
         }
@@ -2494,7 +2725,7 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
         None
     };
     let gfx_in = if until.runs_gfx_stage() {
-        match gfx_inputs(&d, &win, until, variant, lines) {
+        match gfx_inputs(dv, &d, &win, until, variant, lines) {
             Ok(x) => Some(x),
             Err(e) => return refuse(lines, e),
         }
@@ -2502,7 +2733,7 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
         None
     };
     let mes_in = if until.runs_mes() {
-        match mes_inputs(&d, &win) {
+        match mes_inputs(dv, &d, &win) {
             Ok(x) => Some(x),
             Err(e) => return refuse(lines, e),
         }
@@ -2523,7 +2754,7 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
     if !booted {
         return refuse(lines, String::from("GC is not booted now: no hub register written"));
     }
-    let gart_up = *GART_UP.lock();
+    let gart_up = *dv.gart_up.lock();
     let run_gmc = until == Until::Gart || gart_up.is_none();
     if run_gmc {
         let (r, w) = gmc_lists(&gm, l.owner.hw().guard());
@@ -2546,11 +2777,11 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
     let mut pass = true;
     let mut gu = gart_up;
     if run_gmc {
-        let rep = gmc::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos)), &gm);
-        GMC_RUNS.fetch_add(1, Ordering::AcqRel);
-        keep_table(rep.table);
+        let rep = gmc::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos, &g.st().pool)), &gm);
+        dv.gmc_runs.fetch_add(1, Ordering::AcqRel);
+        keep_table(dv, rep.table);
         gu = if rep.passed() { pspbringup::gart_use(&rep, &gm) } else { None };
-        *GART_UP.lock() = gu;
+        *dv.gart_up.lock() = gu;
         lines.extend(gmc::render(&rep));
         for c in pspbringup::gmc_checks(Some(&rep)) {
             lines.push(format!("{}: {} ({})", c.name, if c.pass { "PASS" } else { "FAIL" }, c.why));
@@ -2563,10 +2794,10 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
     if let Some(s) = &sdma_in {
         let rep = match gu {
             Some(gu) if pass => {
-                let rep = sdma::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos)), s, &gu);
-                SDMA_RUNS.fetch_add(1, Ordering::AcqRel);
-                note_sdma(&rep);
-                keep_sdma_bo(rep.bo);
+                let rep = sdma::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos, &g.st().pool)), s, &gu);
+                dv.sdma_runs.fetch_add(1, Ordering::AcqRel);
+                note_sdma(dv, &rep);
+                keep_sdma_bo(dv, rep.bo);
                 l.sdma = Some(s.addrs);
                 resumes = rep.resumes.iter().map(|&(db, _, x, y)| (db, (x - seq0) as usize, (y - seq0) as usize)).collect();
                 lines.extend(sdma::render(&rep));
@@ -2582,27 +2813,27 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
     let mut gmarks = Vec::new();
     // GX-7m: a later GFX or MES stage remaps the queues and may reuse the MES buffer: the test VM goes first.
     if pass && (gfx_in.is_some() || mes_in.is_some()) {
-        vm_teardown(&mut l.owner, "gfx", lines);
+        vm_teardown(dv, &mut l.owner, "gfx", lines);
     }
     // GX-7k: a MES that runs (an earlier run's, or Linux's) is stopped before the GFX stage halts the CP.
     if let Some(m) = &mes_in
         && pass
         && let Some(st) = mes::pre_stop(&mut l.owner, m)
     {
-        note_stranded(&st.stranded);
+        note_stranded(dv, &st.stranded);
         lines.extend(st.lines);
         l.mes = None;
-        *MES_UP.lock() = None;
+        *dv.mes_up.lock() = None;
         pass &= st.ok;
     }
     let mut gfx_rep = None;
     if let Some(x) = &gfx_in {
         let rep = match gu {
             Some(_) if pass => {
-                let rep = gfxring::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos)), &pspbringup::gfx_stage_inputs(x, until), &gm.addrs.gfx);
-                GFX_RING_RUNS.fetch_add(1, Ordering::AcqRel);
-                note_gfx(&rep);
-                keep_gfx_bo(rep.bo);
+                let rep = gfxring::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos, &g.st().pool)), &pspbringup::gfx_stage_inputs(x, until), &gm.addrs.gfx);
+                dv.gfx_ring_runs.fetch_add(1, Ordering::AcqRel);
+                note_gfx(dv, &rep);
+                keep_gfx_bo(dv, rep.bo);
                 l.gfx = Some(x.addrs);
                 gmarks = pspbringup::gfx_marks(&rep, seq0);
                 lines.extend(gfxring::render(&rep));
@@ -2620,13 +2851,13 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
         let rep = match gfx_rep.as_ref() {
             Some(gr) if pass => {
                 let mi = MesInputs { queues: until == Until::GfxMes, ..*m };
-                let rep = mes::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos)), &mi, &gm.addrs.gfx, gr.layout.as_ref());
-                MES_RUNS.fetch_add(1, Ordering::AcqRel);
-                note_mes(&rep);
-                keep_mes_bo(rep.bo);
+                let rep = mes::enable(&mut l.owner, &mut pspbringup::Pieces(&mut SharedBos(bos, &g.st().pool)), &mi, &gm.addrs.gfx, gr.layout.as_ref());
+                dv.mes_runs.fetch_add(1, Ordering::AcqRel);
+                note_mes(dv, &rep);
+                keep_mes_bo(dv, rep.bo);
                 let up = (rep.left_running || rep.halt_failed.is_some()).then(|| (m.addrs, rep.layout.map(|x| x.bo_mc), rep.queues && rep.left_running));
                 l.mes = up;
-                *MES_UP.lock() = up;
+                *dv.mes_up.lock() = up;
                 gmarks.extend(rep.marks.iter().map(|&(n, a, b)| (n, (a - seq0) as usize, (b - seq0) as usize)));
                 lines.extend(mes::render(&rep));
                 Some(rep)
@@ -2640,18 +2871,18 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
     }
     if until == Until::Vm {
         // GX-7m: the test VM on the queues the kept gfx_mes mapped and SDMA 0's kept queue.
-        let rep = match vm_inputs(&d, &win, l.sdma) {
+        let rep = match vm_inputs(dv, &d, &win, l.sdma) {
             Ok(vi) if pass => {
                 l.owner.hw().hw().allow_gmc(vi.addrs.readable(), vi.addrs.writable());
                 if let Some(s) = &vi.sdma {
                     l.owner.hw().hw().allow_sdma(&s.addrs, bar2(g));
                 }
                 l.owner.hw().hw().allow_vm_doorbell(bar2(g));
-                let prev = VM_UP.lock().take().map(|(_, u)| u);
+                let prev = dv.vm_up.lock().take().map(|(_, u)| u);
                 let rep = vmring::enable(&mut l.owner, &vi, prev);
-                *VM_UP.lock() = rep.kept.or(rep.retry).map(|u| (vi.addrs, u));
+                *dv.vm_up.lock() = rep.kept.or(rep.retry).map(|u| (vi.addrs, u));
                 if rep.stranded {
-                    note_stranded(&["a queue of the VM stage (the compute ring or the MES process queue)"]);
+                    note_stranded(dv, &["a queue of the VM stage (the compute ring or the MES process queue)"]);
                 }
                 lines.extend(vmring::render(&rep));
                 Some(rep)
@@ -2704,20 +2935,20 @@ fn gart_continue(g: &Gpu, live: &mut Option<Live>, until: Until, variant: Option
 
 /// GX-7m: the VM stage's inputs from this boot's kept buffers: the MES and GFX stages' (gfx_mes), SDMA 0's queue
 /// when a kept until=sdma left it (`sdma`: its registers).
-fn vm_inputs(d: &Discovery, win: &CarveWin, sdma: Option<SdmaAddrs>) -> Result<vmring::VmInputs, String> {
+fn vm_inputs(dv: &'static State, d: &Discovery, win: &CarveWin, sdma: Option<SdmaAddrs>) -> Result<vmring::VmInputs, String> {
     let carve = amdgpu_fmt::addr::Carveout::new(win.mc_base, win.phys_base, win.size).ok_or_else(|| format!("carve-out {win:?} is not page aligned"))?;
     let a = VmAddrs::from_discovery(d).ok_or_else(|| String::from("no GC/OSSSYS bases in the discovery table: GFXHUB and the IH LUT unknown"))?;
-    let mb = (*MES_BO.lock()).ok_or_else(|| String::from("no MES buffer in this boot (until=gfx_mes first)"))?;
-    let gb = (*GFX_BO.lock()).ok_or_else(|| String::from("no GFX buffer in this boot (until=gfx_mes first)"))?;
+    let mb = (*dv.mes_bo.lock()).ok_or_else(|| String::from("no MES buffer in this boot (until=gfx_mes first)"))?;
+    let gb = (*dv.gfx_bo.lock()).ok_or_else(|| String::from("no GFX buffer in this boot (until=gfx_mes first)"))?;
     let ml = mes::Layout::new(carve.mc_base() + mb.offset).ok_or_else(|| String::from("MES layout"))?;
     let gl = gfxring::Layout::new(carve.mc_base() + gb.offset).ok_or_else(|| String::from("GFX layout"))?;
-    let side = match (sdma, *SDMA_BO.lock()) {
-        (Some(addrs), Some(sb)) => sdma::Layout::new(carve.mc_base() + sb.offset).map(|layout| vmring::SdmaSide { addrs, layout, burst_nop: BURST_NOP.load(Ordering::Acquire) == 2 }),
+    let side = match (sdma, *dv.sdma_bo.lock()) {
+        (Some(addrs), Some(sb)) => sdma::Layout::new(carve.mc_base() + sb.offset).map(|layout| vmring::SdmaSide { addrs, layout, burst_nop: dv.burst_nop.load(Ordering::Acquire) == 2 }),
         _ => None,
     };
-    let token = u64::from(MES_RUNS.load(Ordering::Acquire)) << 32 | u64::from(GMC_RUNS.load(Ordering::Acquire));
+    let token = u64::from(dv.mes_runs.load(Ordering::Acquire)) << 32 | u64::from(dv.gmc_runs.load(Ordering::Acquire));
     let mut vi = vmring::VmInputs::new(a, carve, mb, ml, gl, side, token);
-    vi.ack = if VM_ACK_LINUX.load(Ordering::Acquire) { vmring::AckWait::Linux } else { vmring::AckWait::Helper };
+    vi.ack = if dv.vm_ack_linux.load(Ordering::Acquire) { vmring::AckWait::Linux } else { vmring::AckWait::Helper };
     Ok(vi)
 }
 
@@ -2788,8 +3019,8 @@ fn carve_window(g: &Gpu, a: &crate::attach::Attach, d: &Discovery) -> Result<Car
 
 /// GX-7e/GX-7f: the mode-2 reset of GC. Refused before anything is written (`gfxup::MODE2_REFUSED`, `preflight`).
 #[inline(never)]
-fn reset(args: Args, lines: &mut Vec<String>) -> Result<bool, ()> {
-    let pre = pre_now(Until::Gfx, args.again, None, Ok(()), true, true);
+fn reset(dv: &'static State, args: Args, lines: &mut Vec<String>) -> Result<bool, ()> {
+    let pre = pre_now(dv, Until::Gfx, args.again, None, Ok(()), true, true);
     let why = preflight(&pre).err().unwrap_or_else(|| String::from(gfxup::MODE2_REFUSED));
     refuse(lines, why)
 }

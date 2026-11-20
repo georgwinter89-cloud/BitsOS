@@ -67,6 +67,9 @@ fn commit_room() -> u64 {
     mm::commit::limit().saturating_sub(mm::commit::committed()).saturating_sub(8 * MIB / P)
 }
 
+/// Looks for a millisecond without reclaim after the spike.
+const SETTLE_TRIES: u64 = 2000;
+
 fn preload_reclaim() -> TestResult {
     let total = mm_core::frames().map_or(0, |f| f.stats().total_bytes);
     if total == 0 || total > 5 * (512 * MIB) {
@@ -114,24 +117,47 @@ fn preload_reclaim() -> TestResult {
     for i in 0..n {
         a.write_u64(m + i * P, MAGIC | i).map_err(|e| format!("program page {i} of {n}: {e:?} (free {} pages, cache {:?})", free_pages(), vr::stats()))?;
     }
-    let (s1, d1) = (vr::stats(), mm_core::reclaim::direct_stats());
-    let (took, pre_took) = (s1.pages - s0.pages, s1.preloaded_pages - s0.preloaded_pages);
+    let d1 = mm_core::reclaim::direct_stats();
+    // What went and what is left, at one moment: kcompactd clears blocks by position in its own runs (below) and may
+    // still be in one after the spike, so the counters and the pages left are read until no page went in the
+    // millisecond around the look at the pages (int/atomic3: a block cleared on after the counters were read took
+    // one used page more than they said). A page leaves its cache a moment before it is counted.
+    let mut settle = 0u64;
+    let (s1, lost, used_left, page0) = loop {
+        settle += 1;
+        let a = vr::stats();
+        let lost = touched.iter().filter(|&&i| pre.cached(i).is_none()).count() as u64;
+        let (used_left, page0) = (used.pages(), pre.cached(0).is_some());
+        sched::sleep_ms(1);
+        let z = vr::stats();
+        if (a.pages, a.frame_pages) == (z.pages, z.frame_pages) {
+            break (z, lost, used_left, page0);
+        }
+        kassert!(settle < SETTLE_TRIES, "reclaim did not pause for a millisecond in {SETTLE_TRIES} looks");
+    };
+    // W35 MM-3: the spike's 2 MiB faults note order 9 and kcompactd clears blocks for it by position, whatever
+    // their pages are (`reclaim_frame`, up to 64 MiB a run, until MM-2 copies instead): those pages are in no
+    // order and are judged apart from the reclaimer's (the gate of 11.11.: 16384 of them counted as "other").
+    let (by_frame, pre_by_frame) = (s1.frame_pages - s0.frame_pages, s1.frame_preloaded_pages - s0.frame_preloaded_pages);
+    let (took, pre_took) = (s1.pages - s0.pages - by_frame, s1.preloaded_pages - s0.preloaded_pages);
     klog::event!(Info, "vfs", "ktest.preload_reclaim", total_mb = total / MIB, floor_mb = floor / MIB, preloaded_mb = b.pages * P / MIB, free_mb = free1 * P / MIB,
-        program_mb = n * P / MIB, reclaimed = took, preloaded_reclaimed = pre_took, direct_runs = d1.runs - d0.runs, cache_after_mb = pre.pages() * P / MIB);
+        program_mb = n * P / MIB, reclaimed = took, preloaded_reclaimed = pre_took, by_frame = by_frame, preloaded_by_frame = pre_by_frame,
+        direct_runs = d1.runs - d0.runs, cache_after_mb = pre.pages() * P / MIB, settle = settle);
     kassert!(d1.failed == d0.failed, "{} allocations failed although preloaded pages could go", d1.failed - d0.failed);
-    // Preloaded first: a direct call that finds the preloaded cache's lock taken (kswapd is in it) goes on with
-    // the clock over the other caches (MM-9: no waiting), so a few other pages may go; the first QEMU run took 32
-    // of 76455 that way.
+    // Preloaded first: a direct call that finds the preloaded cache's lock taken while kswapd runs takes no other
+    // page (it takes what kswapd freed); one that finds a reader in it goes on with the clock over the other caches
+    // (MM-9: no waiting), so a few other pages may go.
     let other = took - pre_took;
     kassert!(pre_took > 0 && other <= took / 100 + 256, "reclaimed {took} pages, only {pre_took} of them preloaded ones");
-    kassert!(used.pages() + other >= used_n, "the read file lost {} pages, more than the {other} not preloaded ones reclaimed", used_n - used.pages());
+    // From here on `other` is every page that went and was no never-used preloaded one, the cleared blocks' too.
+    let other = other + (by_frame - pre_by_frame);
+    kassert!(used_left + other >= used_n, "the read file lost {} pages, more than the {other} not preloaded ones reclaimed", used_n - used_left);
     // The spike took half of the preloaded pages: the never-used ones suffice, so a used one may go only by the
-    // clock fallback above (counted in `other`).
-    let lost = touched.iter().filter(|&&i| pre.cached(i).is_none()).count() as u64;
+    // clock fallback above or in a cleared block (both counted in `other`).
     let untouched_left = pre.pages().saturating_sub(touched.len() as u64 - lost);
     klog::event!(Info, "vfs", "ktest.preload_reclaim_used", touched = touched.len() as u64, lost = lost, untouched_left = untouched_left);
-    kassert!(lost <= other, "{lost} of {} used preloaded pages went, more than the {other} pages the clock took", touched.len());
-    kassert!(pre.cached(0).is_some() || other > 0, "the used preloaded page 0 went before never-used ones");
+    kassert!(lost <= other, "{lost} of {} used preloaded pages went, more than the {other} pages the clock and the cleared blocks took", touched.len());
+    kassert!(page0 || other > 0, "the used preloaded page 0 went before never-used ones");
     for i in 0..n {
         let got = a.read_u64(m + i * P).map_err(|e| format!("read back page {i}: {e:?}"))?;
         kassert!(got == MAGIC | i, "program page {i} reads {got:#x}");
@@ -144,3 +170,28 @@ fn preload_reclaim() -> TestResult {
     check(&used, used_n)
 }
 ktest!("fs.preload.reclaim", QemuOnly, preload_reclaim);
+
+/// A page taken by its frame (compaction or the heap clears a block by position) is counted as that, a never-used
+/// preloaded one among them too, and is no pressure to a preload pass: its budget goes on.
+fn frame_take() -> TestResult {
+    let Some(buddy) = mm_core::boot_buddy() else { return ktest::fail("no boot allocator") };
+    let pre = file(8);
+    let mut b = Budget::new(u64::MAX, 0, false);
+    preload::prefetch_ranges(&pre, &all(8), &mut b).map_err(|e| format!("prefetch: {e}"))?;
+    kassert!(pre.pages() == 8 && b.stopped.is_none(), "preloaded {} of 8 pages, stopped {:?}", pre.pages(), b.stopped);
+    // Page 1 is read by a program: an ordinary cache page from then on.
+    let mut v = [0u8; 8];
+    pre.read_at(P, &mut v).map_err(|e| format!("read page 1: {e}"))?;
+    let phys = |i: u64| pre.cached(i).and_then(|p| p.phys());
+    let (Some(unused), Some(read)) = (phys(0), phys(1)) else { return ktest::fail("pages not cached") };
+    let s0 = vr::stats();
+    kassert!(vr::reclaim_frame(unused, buddy.owner(unused)) && vr::reclaim_frame(read, buddy.owner(read)), "a clean page nobody holds did not go by its frame");
+    let s1 = vr::stats();
+    // The machine's own reclaim may count beside these two: at least, not exactly.
+    let (by_frame, pre_by_frame) = (s1.frame_pages - s0.frame_pages, s1.frame_preloaded_pages - s0.frame_preloaded_pages);
+    kassert!(pre.cached(0).is_none() && pre.cached(1).is_none() && pre.pages() == 6, "{} pages left", pre.pages());
+    kassert!(by_frame >= 2 && pre_by_frame >= 1 && by_frame > pre_by_frame, "by frame {by_frame}, preloaded among them {pre_by_frame}");
+    kassert!(b.go(0), "the pass stopped ({:?}) for a page taken by its frame", b.stopped);
+    check(&pre, 8)
+}
+ktest!("fs.preload.frame_take", Safe, frame_take);

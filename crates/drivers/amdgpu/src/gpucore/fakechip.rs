@@ -31,6 +31,8 @@ const IPS_780M: &[(u16, IpVersion, &[u32])] = &[
     (hwid::NBIF, v(7, 7, 0), &[0x0, 0x14, 0xD20, 0x1_0400, 0x241_B000, 0x404_0000]),
     (hwid::MP0, v(13, 0, 4), &[0x4000, 0x16000, 0xDC_0000, 0xE0_0000, 0xE4_0000, 0x243_FC00]),
     (hwid::DMU, v(3, 1, 4), &[0x12, 0xC0, 0x34C0, 0x9000, 0x240_3C00]),
+    // GX-8v: UVD (VCN) 4.0.2, minipc-780m-ip.txt:16.
+    (hwid::VCN, v(4, 0, 2), &[0x7800, 0x7E00]),
 ];
 
 pub fn discovery_780m() -> Discovery {

@@ -34,6 +34,12 @@ abi-mm5b reserve 256
 abi-mm5b zap
 abi-mm12
 abi-fork
+# L7-RESTE-AB 1: execve of a program the caller may not read is not dumpable (would_dump; also in ktest ab.l7.execdump).
+abi-execdump
+# L7-RESTE-AB 2: pidfs file handles (name_to_handle_at/open_by_handle_at) and setns(pidfd, several CLONE_NEW*); also
+# in ktest ab.l7.pidfs.
+abi-pidfs handle
+abi-pidfs setns
 abi-threads
 abi-rs-threads
 abi-pipeline
@@ -42,6 +48,14 @@ abi-futex pi
 abi-futex multi
 abi-futex robust-die /dev/shm/abi-futex-robust
 abi-futex robust-check /dev/shm/abi-futex-robust
+abi-futex7 robust
+abi-futex7 futex2
+abi-futex7 exit
+abi-futex7 fixup
+abi-time7 prctl
+abi-time7 clocks
+abi-time7 restore
+abi-time7 timers
 abi-pthread mutex
 abi-pthread condvar
 abi-pthread barrier
@@ -94,6 +108,7 @@ abi-ab5 prctl
 abi-ab5 misc
 abi-ab5 flock
 abi-ab5 fcntl
+abi-ab5 created
 abi-sigframe info
 abi-sigframe context
 abi-sigframe mask
@@ -167,6 +182,8 @@ dyn-hello stack
 dyn-threads
 dyn-vdso
 dyn-vdso-static
+dyn-getrandom glibc
+dyn-getrandom direct
 dyn-cat stdin="first line\nsecond line\n"
 dyn-cat /proc/self/comm
 dyn-ls -d / /dev/null /proc/self
@@ -190,8 +207,10 @@ abi-pty jobs
 abi-pty hangup
 abi-pty devtty
 abi-pty peer
+# IN-PTY: ptys of a devpts instance of its own (posix_openpt in a new mount namespace, numbers per instance).
+abi-ptyns
 abi-nplb
-# BR-3: what Brave met on V2 (plan/notes/br-BR-3.md)
+# BR-3: what Brave met on V2
 abi-br3 tasknlink
 abi-br3 siocgiw
 abi-br3 uevent
@@ -214,6 +233,7 @@ abi-seccomp checks
 abi-ns-unshare
 abi-ns-unshare threadfs
 abi-ns-unshare threadexec
+abi-ns-unshare empty
 abi-ns-clone
 abi-ns-idmap
 abi-ns-idmap pwrite
@@ -222,6 +242,7 @@ abi-ns-setns fsshared
 abi-ns-chroot
 abi-ns-chroot trick
 abi-ns-chroot files
+abi-ns-chroot fchroot
 abi-ns-pid
 abi-ns-net
 abi-ns-net nw
@@ -242,7 +263,23 @@ abi-ns-mount nslimit
 abi-ns-mount pdeath
 abi-ns-mount fdpath
 abi-ns-mount hardlink
-# DR-5: dma-buf fds from /dev/udmabuf (the mapping cases separately: they need CR-DR5-1/2, plan/notes/dr-DR-5.md).
+abi-linkat-empty
+# DESK-LEFT 5 (WY): a Chromium-shaped tree (browser, zygotes in pid namespaces, renderers, zombies of living
+# zygotes) ends by itself, by SIGTERM to each in pid order, by SIGKILL to the browser; orphans to init or to the
+# test as subreaper. No process may be left. Run by abi-diff only (no ktest: no kernel fault was found to guard).
+abi-ns-reap close
+abi-ns-reap term
+abi-ns-reap kill
+abi-ns-reap sub-close
+abi-ns-reap sub-term
+abi-ns-reap sub-kill
+abi-reap-threads term
+abi-reap-threads leader-gone
+abi-reap-threads thread-exit
+abi-reap-threads handler
+abi-reap-threads ns-init
+abi-reap-threads ns-kill
+# DR-5: dma-buf fds from /dev/udmabuf (the mapping cases separately: they need CR-DR5-1/2).
 abi-dmabuf
 abi-dmabuf mmap
 # DR-6: GEM objects and PRIME on the amdgpu render node (CachyOS: the real GPU; V2: the fake).
@@ -257,16 +294,16 @@ abi-drm-list
 abi-drm-jobs
 abi-ntsync
 abi-ntsync threads
-# PF-1: read path check only (plan/notes/fs-PF-1.md); `abi-pfread bench` measures and never goes here
+# PF-1: read path check only (plan/guides/read-path-measurements.md); `abi-pfread bench` measures and never goes here
 abi-pfread check
-# PF-7: the credentials, the cwd and the fd count from the very next call (plan/notes/fs-PF-7.md)
+# PF-7: the credentials, the cwd and the fd count from the very next call (plan/spec/storage.md §3.3)
 abi-pfcalls ids
 abi-pfcalls idsns
 abi-pfcalls cwd
 abi-pfcalls fds
-# PF-4: read/pread into a buffer whose later part faults stop at that page, every byte checked (fs-PF-4.md)
+# PF-4: read/pread into a buffer whose later part faults stop at that page, every byte checked
 abi-pffault
-# PF-3: close and dup2/dup3 against threads using the same numbers (plan/notes/fs-PF-3.md)
+# PF-3: close and dup2/dup3 against threads using the same numbers
 abi-fdrace inflight
 abi-fdrace storm
 abi-fdrace rules
@@ -274,6 +311,12 @@ abi-fdrace locks
 abi-fdrace exec
 abi-fdrace range
 abi-fdrace unshare
+abi-fpos dup
+abi-fpos fork
+abi-fpos threads
+abi-fpos procs
+abi-fpos alone
+abi-fpos devnull
 abi-sysv-sem basic
 abi-sysv-sem order
 abi-sysv-sem signals
@@ -293,4 +336,15 @@ abi-sysv-msg plain
 abi-sysv-ns ns
 abi-sysv-ns proc
 abi-sysv-ns plainproc
+abi-sysv-ns writes
 abi-fadvise
+# L7-NET: socket answers that changed from Linux 6.6 to 7.3 (receive options, SO_PASSRIGHTS, SO_INQ, SCM_PIDFD,
+# rtnetlink's checks in a namespace). `abi-l7net gcbench` prints times: never add it here.
+abi-l7net opts
+abi-l7net rights
+abi-l7net inq
+abi-l7net pidfd
+abi-l7net rtnl
+abi-pagemap
+abi-pagemap sticky
+abi-pagemap exec

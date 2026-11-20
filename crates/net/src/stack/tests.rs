@@ -4,6 +4,8 @@
 //! routing refusals. (Waits on the host have no deadline, so every test waits only for things that come.)
 
 extern crate std;
+mod table;
+
 use super::*;
 use alloc::collections::VecDeque;
 use core::sync::atomic::AtomicBool;
@@ -1129,7 +1131,7 @@ fn tcp_ack(f: &[u8]) -> Option<u32> {
     tcp_of(f).and_then(|x| x.1)
 }
 
-/// NW-7 fixer, back pressure (Linux `sk_stream_wait_memory`, linux-6.6/net/core/stream.c:117): a writer whose peer
+/// NW-7 fixer, back pressure (Linux `sk_stream_wait_memory`, linux-7.3.1/net/core/stream.c:121): a writer whose peer
 /// does not read blocks once the peer's window and its own send buffer are full and ends with TimedOut at its
 /// bound (B4); what it queued is bounded by those buffers and arrives in order without a gap. Then, with a TX ring
 /// of 4 frames that refuses most of a window (the card's ring full), a slow reader still gets 2 MB intact and in
@@ -1294,7 +1296,7 @@ fn tcp_quickack_option_switches_pingpong() {
 fn program_connections_wake_on_every_change() {
     use crate::conn::Conn;
     let n = net();
-    let prog = policy::Subject { program: policy::ProgramId(1), pid: 7, uid: 1000 };
+    let prog = policy::Subject { program: policy::ProgramId(1), pid: 7, uid: 1000, tree: 0 };
     let l = n.b.listen_prog(at(Ipv4::ANY, 7122), crate::loopback::Side::V4, 4, prog, 64 * 1024, 64 * 1024).unwrap();
     let accept = || {
         let mut got = None;
@@ -1315,7 +1317,8 @@ fn program_connections_wake_on_every_change() {
     let _ = c.state();
     let seen = c.change_seq().unwrap();
     eventually("the handshake ends", || !c.state().connecting);
-    assert_ne!(c.change_seq().unwrap(), seen, "the handshake's end moved the counter");
+    // (The round fires its wakes after the card's lock is gone: the new state can be seen a moment earlier.)
+    eventually("the handshake's end moved the counter", || c.change_seq().unwrap() != seen);
     let s = accept();
     woke(&c, "data arrives", &mut || assert_eq!(s.try_send(b"data").unwrap(), 4));
     assert!(c.state().readable);

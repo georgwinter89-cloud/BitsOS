@@ -33,6 +33,8 @@ pub struct QemuOpts {
     /// `--boot nvme`: the stick stays plugged in without a boot index, an NVMe device among the extra arguments
     /// carries `bootindex=0` (bitsboot from an NVMe ESP, NV's boot scenario).
     pub boot_nvme: bool,
+    /// `--boot nvme-only` (GP-R3): no stick plugged in at all, as the Mini-PC since its move to the Lexar.
+    pub no_stick: bool,
 }
 
 impl QemuOpts {
@@ -40,7 +42,7 @@ impl QemuOpts {
         QemuOpts {
             name: name.into(), smp: 2, mem: "2G".into(), net: "none".into(), hostfwd: vec![], res: None,
             display: "none".into(), timeout: 60, serial_log: None, extra: vec![], echo: true, boot_retries: 3,
-            boot_nvme: false,
+            boot_nvme: false, no_stick: false,
         }
     }
 
@@ -64,7 +66,8 @@ impl QemuOpts {
         match a.value("--boot")?.as_deref() {
             None | Some("stick") => {}
             Some("nvme") => o.boot_nvme = true,
-            Some(other) => return Err(format!("--boot {other}: want stick|nvme")),
+            Some("nvme-only") => (o.boot_nvme, o.no_stick) = (true, true),
+            Some(other) => return Err(format!("--boot {other}: want stick|nvme|nvme-only")),
         }
         o.extra = a.extra.clone();
         Ok(o)
@@ -92,14 +95,13 @@ pub fn assemble(root: &Path, lane: &str, o: &QemuOpts, vars: &Path, img: &Path, 
     add(&["-drive", &format!("if=pflash,format=raw,readonly=on,file={OVMF_CODE}")]);
     add(&["-drive", &format!("if=pflash,format=raw,file={}", vars.display())]);
     add(&["-device", "qemu-xhci,id=xhci"]);
-    add(&["-drive", &format!("if=none,id=stick,format=raw,file={}", img.display())]);
-    if o.boot_nvme {
-        if !o.extra.iter().any(|x| x.starts_with("nvme,") && x.contains("bootindex=0")) {
-            return Err("--boot nvme needs an NVMe -device with bootindex=0 among the extra arguments".into());
-        }
-        add(&["-device", "usb-storage,bus=xhci.0,drive=stick,removable=on"]);
-    } else {
-        add(&["-device", "usb-storage,bus=xhci.0,drive=stick,removable=on,bootindex=0"]);
+    if o.boot_nvme && !o.extra.iter().any(|x| x.starts_with("nvme,") && x.contains("bootindex=0")) {
+        return Err("--boot nvme needs an NVMe -device with bootindex=0 among the extra arguments".into());
+    }
+    if !o.no_stick {
+        add(&["-drive", &format!("if=none,id=stick,format=raw,file={}", img.display())]);
+        let index = if o.boot_nvme { "" } else { ",bootindex=0" };
+        add(&["-device", &format!("usb-storage,bus=xhci.0,drive=stick,removable=on{index}")]);
     }
     add(&["-serial", &format!("file:{}", log.display())]);
     add(&["-monitor", "none"]);
@@ -174,7 +176,8 @@ pub fn run(root: &Path, o: &QemuOpts) -> Result<RunResult, String> {
 }
 
 /// LO-1 review: OVMF's "No bootable option" (its USB stick "Not Found") comes within seconds and is a coin toss at
-/// many vCPUs (measured 30.10.: about 1 in 3 boots loads bitsboot at -smp 16, the image does not matter), so such a
+/// many vCPUs (measured 30.10.: about 1 in 3 boots loads bitsboot at -smp 16, the image does not matter; OV 17.11.:
+/// QEMU's io_uring main loop, 0 of 20 under `qemu_command`'s filter, so this stays a rare safety net), so such a
 /// boot is retried more often than a slow stall: it costs seconds, not the stall bound. A bound for one run, not a
 /// count of things (R1). `--boot-retries 0` stays 0.
 const FIRMWARE_MISS_RETRIES: u32 = 11;
@@ -246,6 +249,60 @@ fn vcpus(o: &QemuOpts) -> u32 {
     n
 }
 
+/// OV (17.11.): QEMU 11.1 watches its main loop's file descriptors through io_uring, and on the host's kernel 7.3.4
+/// that loop sleeps through wakeups: an NVMe doorbell or a finished disk read waits until something else wakes the
+/// loop, so OVMF's BDS waits for its NVMe (or USB) read forever, or gives up with "Not Found" (nv/43's image: 21 of
+/// 40 boots stalled, 0 of 40 with `io_uring_setup` refused; plan/hw/ovmf-stall-2026-11-17.txt). QEMU has no switch
+/// for it; when `io_uring_setup` fails (ENOSYS) it falls back to ppoll by itself. So every QEMU runs under
+/// util-linux's setpriv with a seccomp filter that refuses only that call (the same PID, no namespace).
+const IO_URING_SETUP: u32 = 425;
+
+/// The classic BPF program: on x86_64 `io_uring_setup` -> ENOSYS, every other call allowed.
+fn no_io_uring_filter() -> Vec<u8> {
+    const LD_ABS_W: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const RET_ERRNO_ENOSYS: u32 = 0x0005_0000 | 38;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    // struct seccomp_data: nr at offset 0, arch at 4.
+    let prog: [(u16, u8, u8, u32); 6] = [
+        (LD_ABS_W, 0, 0, 4),
+        (JEQ_K, 0, 3, AUDIT_ARCH_X86_64),
+        (LD_ABS_W, 0, 0, 0),
+        (JEQ_K, 0, 1, IO_URING_SETUP),
+        (RET_K, 0, 0, RET_ERRNO_ENOSYS),
+        (RET_K, 0, 0, RET_ALLOW),
+    ];
+    let mut v = Vec::with_capacity(prog.len() * 8);
+    for (code, jt, jf, k) in prog {
+        v.extend_from_slice(&code.to_le_bytes());
+        v.extend_from_slice(&[jt, jf]);
+        v.extend_from_slice(&k.to_le_bytes());
+    }
+    v
+}
+
+/// `setpriv --nnp --seccomp-filter <filter> qemu-system-x86_64`, the filter file in `x` (written atomically:
+/// several xtasks may start at once). A setpriv without `--seccomp-filter` (util-linux before 2.39) is an error with
+/// its reason, never a QEMU that stalls.
+fn qemu_command(x: &Path) -> Result<Command, String> {
+    let help = Command::new("setpriv").arg("--help").output()
+        .map_err(|e| format!("cannot start setpriv (util-linux), which every QEMU runs under (OV): {e}"))?;
+    if !String::from_utf8_lossy(&help.stdout).contains("--seccomp-filter") {
+        return Err("setpriv has no --seccomp-filter (util-linux 2.39 or newer needed), and QEMU's io_uring main loop stalls OVMF on this host (OV)".into());
+    }
+    let filter = x.join("qemu-no-io-uring.bpf");
+    let want = no_io_uring_filter();
+    if std::fs::read(&filter).ok().as_deref() != Some(&want[..]) {
+        let tmp = x.join(format!("qemu-no-io-uring.bpf.{}", std::process::id()));
+        std::fs::write(&tmp, &want).and_then(|_| std::fs::rename(&tmp, &filter)).map_err(|e| format!("write {}: {e}", filter.display()))?;
+    }
+    let mut c = Command::new("setpriv");
+    c.args(["--nnp", "--seccomp-filter"]).arg(&filter).arg("qemu-system-x86_64");
+    Ok(c)
+}
+
 fn reached_bitsboot(log: &Path) -> bool {
     std::fs::read(log).map(|b| b.windows(9).any(|w| w == b"bitsboot:")).unwrap_or(false)
 }
@@ -254,6 +311,8 @@ fn run_once(root: &Path, o: &QemuOpts, lane: &str, x: &Path, img: &Path, log: &P
     let vars = x.join(format!("{}-vars.fd", o.name));
     // OVMF often hangs on its first boot with fresh variables (it builds its boot entries then); variables
     // saved after a boot that reached bitsboot avoid that (measured 15.10.: 8 of 8 boots instead of ~2 of 3).
+    // OV 17.11.: most likely QEMU's io_uring main loop as well (`qemu_command`): under its filter fresh variables
+    // and the seed both boot 20 of 20; the seed stays, it costs nothing.
     let seed = x.join(SEED_VARS);
     let from = if seed.is_file() { seed.clone() } else { PathBuf::from(OVMF_VARS) };
     std::fs::copy(&from, &vars).map_err(|e| format!("copy {}: {e}", from.display()))?;
@@ -262,11 +321,11 @@ fn run_once(root: &Path, o: &QemuOpts, lane: &str, x: &Path, img: &Path, log: &P
     if let Err(r) = refuse::check_qemu_args(lane, root, &args) {
         return Err(format!("{r}\nxtask: QEMU was not started."));
     }
-    let mut child = Command::new("qemu-system-x86_64")
+    let mut child = qemu_command(x)?
         .args(&args)
         .stdin(Stdio::null())
         .spawn()
-        .map_err(|e| format!("cannot start qemu-system-x86_64: {e}"))?;
+        .map_err(|e| format!("cannot start qemu-system-x86_64 under setpriv: {e}"))?;
     let pid = child.id();
     let pidfile = x.join(format!("qemu-{}.pid", o.name));
     let _ = std::fs::write(&pidfile, format!("{pid}\n"));
@@ -392,6 +451,12 @@ mod tests {
         assert!(stick(&o).is_err(), "no NVMe device to boot");
         o.extra = ["-device", "nvme,id=n0,serial=x,drive=nv0,bootindex=0"].iter().map(|s| s.to_string()).collect();
         assert_eq!(stick(&o).unwrap().as_deref(), Some("usb-storage,bus=xhci.0,drive=stick,removable=on"));
+        // nvme-only: neither the stick's device nor its drive.
+        o.no_stick = true;
+        let a = assemble(root, "nv", &o, vars, img, log).unwrap();
+        assert!(!a.iter().any(|x| x.starts_with("usb-storage") || x.contains("id=stick")), "{a:?}");
+        o.extra.clear();
+        assert!(assemble(root, "nv", &o, vars, img, log).is_err(), "nvme-only still needs the NVMe to boot");
     }
 
     #[test]
@@ -417,6 +482,35 @@ mod tests {
         assert!(!keep_as_seed(true, false, true));
         assert!(!keep_as_seed(false, true, true), "the seed is written once");
         assert!(!keep_as_seed(false, false, false));
+    }
+
+    #[test]
+    fn qemu_starts_with_io_uring_setup_refused() {
+        let f = no_io_uring_filter();
+        assert_eq!(f.len(), 6 * 8, "six sock_filter instructions");
+        assert_eq!(u32::from_le_bytes(f[28..32].try_into().unwrap()), IO_URING_SETUP);
+        assert_eq!(u32::from_le_bytes(f[36..40].try_into().unwrap()), 0x0005_0026, "SECCOMP_RET_ERRNO | ENOSYS");
+        let x = std::env::temp_dir().join(format!("xtask-ov-{}", std::process::id()));
+        std::fs::create_dir_all(&x).unwrap();
+        let c = qemu_command(&x).unwrap();
+        let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(c.get_program(), "setpriv");
+        assert_eq!(args, ["--nnp", "--seccomp-filter", &x.join("qemu-no-io-uring.bpf").to_string_lossy(), "qemu-system-x86_64"]);
+        assert_eq!(std::fs::read(x.join("qemu-no-io-uring.bpf")).unwrap(), f);
+        // The kernel takes the filter, and under it io_uring_setup fails with ENOSYS while other calls work.
+        let probe = "import ctypes,os\nl=ctypes.CDLL(None,use_errno=True)\nr=l.syscall(425,1,ctypes.create_string_buffer(120))\nprint(r,ctypes.get_errno(),os.getpid()>0)";
+        let out = |filtered: bool| {
+            let mut c = Command::new(if filtered { "setpriv" } else { "python3" });
+            if filtered {
+                c.args(["--nnp", "--seccomp-filter"]).arg(x.join("qemu-no-io-uring.bpf")).arg("python3");
+            }
+            let o = c.args(["-I", "-c", probe]).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        assert_eq!(out(true), "-1 38 True", "io_uring_setup refused with ENOSYS under the filter");
+        assert!(!out(false).starts_with("-1 38"), "without the filter the host has io_uring (else this test proves nothing)");
+        let _ = std::fs::remove_dir_all(&x);
     }
 
     #[test]

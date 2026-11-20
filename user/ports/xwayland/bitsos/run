@@ -1,8 +1,8 @@
 #!/bin/sh
 # WY-3b: starts a program of this tree's clients/ (glxgears, glxinfo, xdpyinfo) or a path, as the Mesa tree's run does,
-# with this tree's lib/ before the Mesa tree's: libGLX_mesa.so.0 lies here, and libGLX finds it by name. Both trees lie
-# side by side (\BITSOS2\xwayland\ and \BITSOS2\mesa\ on the stick, the stage directory on the host). The caller
-# sets DISPLAY; DRI_PRIME and the like are not touched.
+# with this tree's lib/ before the Mesa tree's: libGLX_mesa.so.0 lies here or in the Mesa tree (whichever staged it), and
+# libGLX finds it by name. Both trees lie side by side (\BITSOS2\xwayland\ and \BITSOS2\mesa\ on the stick, the stage
+# directory on the host). The caller sets DISPLAY; DRI_PRIME and the like are not touched.
 T=$(cd "$(dirname "$0")" && pwd)
 M=$(dirname "$T")/mesa
 L=$T/lib:$M/lib

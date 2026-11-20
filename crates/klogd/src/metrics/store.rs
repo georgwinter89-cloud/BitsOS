@@ -28,6 +28,8 @@ pub enum Unit {
     Celsius,
     /// Milliwatts.
     Watt,
+    /// A clock in kHz (cpufreq's unit), shown by the mean as every level.
+    KHz,
     /// A total (registered counters, error tallies) or a level (queue length).
     Count,
 }
@@ -41,6 +43,7 @@ impl Unit {
             Unit::PerS => "/s",
             Unit::Celsius => "C",
             Unit::Watt => "W",
+            Unit::KHz => "kHz",
             Unit::Count => "n",
         }
     }
@@ -195,6 +198,15 @@ impl Store {
     pub fn len(&self) -> usize {
         self.series.len()
     }
+
+    /// SYS-K: the values of the newest round, by name (series a source no longer feeds are left out).
+    pub fn current(&self) -> impl Iterator<Item = (&str, Unit, u64)> {
+        let cur = self.end_round().checked_sub(1).filter(|_| !self.times.is_empty());
+        self.series.iter().filter_map(move |(k, s)| {
+            let c = cur.filter(|&c| s.last == c)?;
+            s.at(c).map(|v| (k.as_str(), s.unit, v))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +223,7 @@ mod tests {
         };
         assert_eq!((r(Unit::Pct, 1250), r(Unit::Pct, 10000), r(Unit::Pct, 3)), ("12.5".into(), "100".into(), "0.03".into()));
         assert_eq!((r(Unit::Celsius, 48125), r(Unit::Watt, 7004), r(Unit::Bytes, 4096)), ("48.125".into(), "7.004".into(), "4096".into()));
+        assert_eq!((r(Unit::KHz, 4_440_000), Unit::KHz.label(), Unit::KHz.is_total()), ("4440000".into(), "kHz", false));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! bitsact against a fake kernel registry and a fake settingsd (std Unix sockets): registration, a read action, the
-//! permission gate of a change action (deny, unreachable, an allow over MCP or without a journal entry refused,
-//! Georg's allow), cancel, an unknown tool, typed-argument errors, a panicking action still answering.
+//! permission gate of a change action (allow by default, Georg's deny, unreachable, an allow set back over MCP
+//! refused), cancel, an unknown tool, typed-argument errors, a panicking action still answering.
 
 use bitsact::events::Events;
 use bitsact::{Action, Config, Ctx, Handler, Json, Reply, Safety};
@@ -30,7 +30,8 @@ impl Handler for H {
     }
 }
 
-/// A fake settingsd: `get` answers the current value of the one key (None = unknown), `register` makes it deny;
+/// A fake settingsd: `get` answers the current value of the one key (None = unknown), `register` gives it the
+/// registered default;
 /// `history` answers the source of its newest change (`src`, None = no entry).
 fn settingsd(path: std::path::PathBuf, value: Arc<Mutex<Option<String>>>, src: Arc<Mutex<Option<String>>>, log: Arc<Mutex<Vec<String>>>) {
     let l = UnixListener::bind(&path).unwrap();
@@ -45,7 +46,8 @@ fn settingsd(path: std::path::PathBuf, value: Arc<Mutex<Option<String>>>, src: A
                 Some("register") => {
                     let mut v = value.lock().unwrap();
                     if v.is_none() {
-                        *v = Some("deny".into());
+                        let def = j.get("keys").and_then(Json::as_array).and_then(|k| k[0].get("default")).and_then(Json::as_str);
+                        *v = def.map(str::to_string);
                     }
                     r#"{"ok":true,"registered":1}"#.to_string()
                 }
@@ -138,36 +140,33 @@ fn register_gate_cancel() {
     let (e, t) = k.answer(20);
     assert!(e && t.contains("cannot be read now") && t.contains("claude.actions.t_change"), "{t}");
 
-    // settingsd up, key unknown: registered as deny, refused with the way to allow it.
+    // settingsd up, key unknown: registered with the default allow, and the call runs.
     let value = Arc::new(Mutex::new(None));
     let src = Arc::new(Mutex::new(None));
     let slog = Arc::new(Mutex::new(Vec::new()));
     settingsd(ssock.clone(), value.clone(), src.clone(), slog.clone());
     k.call(21, "t_change", "{}", 5000);
-    let (e, t) = k.answer(21);
-    assert!(e && t.contains("not permitted") && t.contains("settings set claude.actions.t_change allow --confirm"), "{t}");
+    assert_eq!(k.answer(21), (false, "changed".into()));
     let reg = slog.lock().unwrap().iter().find(|l| l.contains("\"register\"")).cloned().unwrap();
-    for want in [r#""key":"claude.actions.t_change""#, r#""default":"deny""#, r#""safety":"confirm""#, r#""owner":"acttest""#, "Test darf ändern"] {
+    for want in [r#""key":"claude.actions.t_change""#, r#""default":"allow""#, r#""safety":"confirm""#, r#""owner":"acttest""#, "Test darf ändern"] {
         assert!(reg.contains(want), "{want} in {reg}");
     }
-    // An MCP client allows it itself (settings_set confirmed: the journal's source is mcp): still refused.
+    // Georg forbids it: refused, with the way back.
+    *value.lock().unwrap() = Some("deny".into());
+    *src.lock().unwrap() = Some("cli".into());
+    k.call(22, "t_change", "{}", 5000);
+    let (e, t) = k.answer(22);
+    assert!(e && t.contains("Georg has forbidden it") && t.contains("settings reset claude.actions.t_change --confirm"), "{t}");
+    // An MCP client sets it back to allow itself (settings_set confirmed: the journal's source is mcp): refused.
     *value.lock().unwrap() = Some("allow".into());
     *src.lock().unwrap() = Some("mcp".into());
     k.call(24, "t_change", "{}", 5000);
     let (e, t) = k.answer(24);
     assert!(e && t.contains("over MCP") && t.contains("not by Georg"), "{t}");
-    // allow without a journal entry (trimmed away): refused, Georg sets it again.
-    *src.lock().unwrap() = None;
-    k.call(25, "t_change", "{}", 5000);
-    let (e, t) = k.answer(25);
-    assert!(e && t.contains("no longer says who set it"), "{t}");
-    // Georg allows it (shell: source cli): the next call runs.
+    // Georg allows it again (shell: source cli): the next call runs.
     *src.lock().unwrap() = Some("cli".into());
-    k.call(22, "t_change", "{}", 5000);
-    assert_eq!(k.answer(22), (false, "changed".into()));
-    *value.lock().unwrap() = Some("deny".into());
     k.call(23, "t_change", "{}", 5000);
-    assert!(k.answer(23).0);
+    assert_eq!(k.answer(23), (false, "changed".into()));
 
     // A panicking action still answers (an error), and the service goes on.
     k.call(26, "t_panic", "{}", 5000);
@@ -188,7 +187,7 @@ fn register_gate_cancel() {
     drop(k);
     assert!(svc.join().unwrap().is_ok());
     let ev = events.lock().unwrap().join("\n");
-    for want in ["acttest registered tools=4", "perm.refused tool=t_change", "perm.self_granted tool=t_change", "perm.no_journal", "perm.allowed tool=t_change", "call.panicked tool=t_panic", "call.cancelled id=30", "acttest ended"] {
+    for want in ["acttest registered tools=4", "perm.refused tool=t_change", "perm.self_granted tool=t_change", "perm.allowed tool=t_change key=claude.actions.t_change source=default", "perm.allowed tool=t_change key=claude.actions.t_change source=cli", "call.panicked tool=t_panic", "call.cancelled id=30", "acttest ended"] {
         assert!(ev.contains(want), "{want} in\n{ev}");
     }
     let _ = std::fs::remove_dir_all(&dir);

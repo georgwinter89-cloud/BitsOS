@@ -168,7 +168,7 @@ mcp_tool!(
     name: "pci_read",
     owner: "PC",
     safety: Read,
-    description: "Reads PCI configuration space of one function (ECAM: 4096 bytes for PCIe, else 256): count values of width 1, 2 or 4 bytes (default 4) from offset, at most 65536 bytes. A function left untouched by its key (the WLAN until wlan=on) is read only in its 64-byte header.",
+    description: "Reads PCI configuration space of one function (ECAM: 4096 bytes for PCIe, else 256): count values of width 1, 2 or 4 bytes (default 4) from offset, at most 65536 bytes. A function a rule keeps untouched (the Gaming-PC's never-touch list) is read only in its 64-byte header.",
     schema: r#"{"type":"object","properties":{"function":{"type":"string","description":"bus:dev.func or seg:bus:dev.func in hex, e.g. \"03:00.0\""},"offset":{"type":["integer","string"]},"width":{"type":["integer","string"]},"count":{"type":["integer","string"]}},"required":["function","offset"]}"#,
     handler: pci_read,
 );

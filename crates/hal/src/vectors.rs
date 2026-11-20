@@ -376,7 +376,9 @@ pub(crate) fn dispatch(vector: u8, _frame: &mut TrapFrame) {
     // valid `IrqHandler` (fn pointer cast to usize).
     let f: IrqHandler = unsafe { core::mem::transmute::<usize, IrqHandler>(h) };
     crate::percpu::irq_enter();
+    let outer = crate::percpu::set_irq_frame(_frame as *mut TrapFrame as u64);
     f(vector);
+    crate::percpu::set_irq_frame(outer);
     crate::percpu::irq_exit();
     crate::apic::eoi();
 }

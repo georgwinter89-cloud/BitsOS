@@ -1,7 +1,7 @@
 //! SX-2: the UTS, IPC and network namespaces. Each belongs to the user namespace that was current when it was
 //! made (its capabilities decide `sethostname`, `setns`), and lives while a group's set names it.
 //!
-//! - UTS (linux-6.6/kernel/utsname.c `copy_utsname`): a copy of the creator's host and domain name; the
+//! - UTS (linux-7.3.1/kernel/utsname.c:79 `copy_utsname`): a copy of the creator's host and domain name; the
 //!   syscall crate's `uts` reads and writes the caller's.
 //! - IPC (linux-7.3.1/ipc/namespace.c): an IPC namespace holds its SysV semaphores, segments and queues
 //!   (`crate::ipc::Tables`) and they go with it; V2 has no POSIX message queues.
@@ -124,7 +124,7 @@ pub fn init_ipc() -> &'static Arc<IpcNs> {
 }
 
 pub fn init_net() -> &'static Arc<NetNs> {
-    INIT_NET.get_or_init(|| Arc::new(NetNs { inum: super::alloc_inum(), user_ns: super::user::init_user_ns().clone(), init: true, _charge: None, view: None }))
+    INIT_NET.get_or_init(|| Arc::new(NetNs { inum: super::INIT_NET_INUM, user_ns: super::user::init_user_ns().clone(), init: true, _charge: None, view: None }))
 }
 
 /// `copy_utsname`: the names of `from`, owned by `user_ns`, made by `euid` (ENOSPC past its

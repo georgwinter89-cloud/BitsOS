@@ -1,9 +1,9 @@
-//! The /sys entries libdrm's `drmGetDevices2` walks (gx-scout-uapi.md §2; linux-6.6/drivers/gpu/drm/drm_sysfs.c,
-//! drivers/pci/pci-driver.c:1571 `pci_uevent`): `dev/char/226:<m>` and `class/drm/renderD<m>` as relative links
+//! The /sys entries libdrm's `drmGetDevices2` walks (linux-7.3.1/drivers/gpu/drm/drm_sysfs.c,
+//! drivers/pci/pci-driver.c:1611 `pci_uevent`): `dev/char/226:<m>` and `class/drm/renderD<m>` as relative links
 //! to `<function>/drm/renderD<m>` (with `dev`, `uevent`, `device` back to the function, `subsystem` to class/drm),
 //! `class/drm/version`, and for a device without a PCI function behind it (the fake) the function directory itself:
 //! vendor, device, subsystem_*, revision, class, modalias, uevent (PCI_SLOT_NAME), config, the `subsystem` link to
-//! bus/pci. A real function's own files are PC's (change request in plan/notes/dr-DR-2.md). One `procdir!` on /sys:
+//! bus/pci. A real function's own files are PC's. One `procdir!` on /sys:
 //! the synthetic file system merges it with PCI's and AB's sources. Nothing is listed while no device exists.
 
 use crate::device::{self, Device, Place, DRM_MAJOR};
@@ -148,12 +148,13 @@ pub fn entries_of(devs: &[Arc<Device>]) -> Vec<FlatEntry> {
         link(&mut out, format!("{mdir}/subsystem"), format!("{}class/drm", up(&mdir)));
         link(&mut out, format!("class/drm/{name}"), format!("../../{mdir}"));
         link(&mut out, format!("dev/char/{DRM_MAJOR}:{m}"), format!("../../{mdir}"));
+        crate::sysfs_pm::entries(&mut out, d, &fdir);
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
 fn view() -> Arc<dyn DirSource> {
-    Arc::new(FlatView::new(entries))
+    Arc::new(FlatView::new(|| Arc::new(entries())))
 }
 vfs::procdir!("/sys", view);

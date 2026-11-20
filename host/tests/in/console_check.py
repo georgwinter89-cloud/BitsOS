@@ -9,7 +9,7 @@ the default console level (warn) keeps MCP's Info request lines off the screen; 
 for pixel (cargo test ... screendump_matches_model); an injected `poweroff` line is refused by init (R8f, UL-7) and the
 machine stays up; a mouse move draws the pointer; at console_log info the request lines show and a half-typed
 command stays whole below them.
-monitor (CONFIG init=off: no session holds the console, so the kernel monitor `bits>` reads it): `log level off` +
+monitor (test key ktest_init=off: no session holds the console, so the kernel monitor `bits>` reads it): `log level off` +
 clear leaves only the prompt; an injected `reboot` line is refused (R8c).
 Exit status 0 = green."""
 import http.client
@@ -269,7 +269,7 @@ def shell(c, q):
 
 
 def monitor(c, q):
-    quiet_by_default(c, MONITOR_PROMPT, "the monitor's prompt (init=off)")
+    quiet_by_default(c, MONITOR_PROMPT, "the monitor's prompt (ktest_init=off)")
     q.type("log level off\n")
     q.type("clear\n")
     only_prompt(c, MONITOR_PROMPT, ["clear", "log level"])

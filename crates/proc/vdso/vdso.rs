@@ -1,7 +1,10 @@
-//! BitsOS V2's vDSO (AB-14): the clock functions programs call without entering the kernel, as Linux's x86-64
-//! vDSO exports them (linux-6.6/arch/x86/entry/vdso/vdso.lds.S: `__vdso_clock_gettime`, `__vdso_gettimeofday`,
-//! `__vdso_time`, `__vdso_getcpu`, `__vdso_clock_getres` and the plain names, version LINUX_2.6; behaviour as
-//! lib/vdso/gettimeofday.c and vgetcpu.c). Own code.
+//! BitsOS V2's vDSO (AB-14, L7-SYNC): the functions programs call without entering the kernel, as Linux 7.3.1's
+//! x86-64 vDSO exports them (linux-7.3.1/arch/x86/entry/vdso/vdso64/vdso64.lds.S:17: `__vdso_clock_gettime`,
+//! `__vdso_gettimeofday`, `__vdso_time`, `__vdso_getcpu`, `__vdso_clock_getres`, `__vdso_getrandom` and the plain
+//! names, and with CONFIG_FUTEX_ROBUST_UNLOCK and CONFIG_COMPAT, as on CachyOS,
+//! `__vdso_futex_robust_list64_try_unlock` and `__vdso_futex_robust_list32_try_unlock`, version LINUX_2.6;
+//! behaviour as lib/vdso/gettimeofday.c, vgetcpu.c, lib/vdso/getrandom.c (`getrandom`) and common/vfutex.c
+//! (`futex`)). Own code.
 //!
 //! User code: it runs in the program's mode and stack, mapped read+exec into every process right after the
 //! read-only vvar page the kernel keeps current (`../src/vdso/layout.rs`). Built by `crates/proc/build.rs` for
@@ -21,6 +24,9 @@ use core::ptr::read_volatile;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 include!("../src/vdso/layout.rs");
+
+mod futex;
+mod getrandom;
 
 const NSEC: u64 = 1_000_000_000;
 
@@ -289,6 +295,9 @@ global_asm!(
     ".weak clock_getres",
     ".type clock_getres, @function",
     ".set clock_getres, __vdso_clock_getres",
+    ".weak getrandom",
+    ".type getrandom, @function",
+    ".set getrandom, __vdso_getrandom",
     ".pushsection .note.Linux, \"a\", @note",
     ".balign 4",
     ".long 6",

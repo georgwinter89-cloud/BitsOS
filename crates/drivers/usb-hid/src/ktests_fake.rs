@@ -20,6 +20,8 @@ use usb_core::{
     Urb, UsbError, XferResult, registry,
 };
 
+mod battery;
+
 const MS: u64 = 1_000_000;
 const VENDOR: u16 = 0xB175;
 /// A vendor-only report descriptor (HID++-like): one application on page 0xFF00, 8 bytes in.
@@ -513,7 +515,7 @@ fn no_strings(fake: &Fake) -> TestResult {
 }
 
 fn want_poll(h: &HidIface, b: u8) -> TestResult {
-    let want = if pci::registry::opted_in("usbhid_pad_binterval") { None } else { Some(b) };
+    let want = Some(b);
     kassert!(h.pad && h.poll_want == want, "pad {} poll_want {:?}, want {want:?}", h.pad, h.poll_want);
     Ok(())
 }
@@ -621,7 +623,7 @@ fn sixaxis_bound(fake: &Fake, h: Option<Arc<HidIface>>) -> TestResult {
 }
 
 /// Hostile reports on a numbered 64-byte pad (report_len = max(descriptor, MPS)), Linux `hid_report_raw_event`
-/// (linux-6.6/drivers/hid/hid-core.c:1999-2030): an empty report and an unknown ID are dropped and counted; an
+/// (linux-7.3.1/drivers/hid/hid-core.c:2043-2119): an empty report and an unknown ID are dropped and counted; an
 /// over-long report is read up to its fields (the rest is ignored); a short one is padded with zeros, so what it
 /// cannot reach reads as released or 0. `held` is the last report (Select held, X 0, pressure 0x40).
 fn hostile_reports(fake: &Fake, h: &HidIface, n: &[u32], held: &[u8; 49]) -> TestResult {

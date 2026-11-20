@@ -1,6 +1,6 @@
-//! The two fd types of DR-3: a sync_file (one fence as an fd, linux-6.6/drivers/dma-buf/sync_file.c: poll,
+//! The two fd types of DR-3: a sync_file (one fence as an fd, linux-7.3.1/drivers/dma-buf/sync_file.c: poll,
 //! SYNC_IOC_MERGE, SYNC_IOC_FILE_INFO, and SYNC_IOC_SET_DEADLINE of newer Linux) and a syncobj file
-//! (`anon_inode:syncobj_file`, drm_syncobj.c:664, no operations: it only carries the object to another
+//! (`anon_inode:syncobj_file`, drm_syncobj.c:673, no operations: it only carries the object to another
 //! process or file). Both are opened read-only and close-on-exec, as Linux's `anon_inode_getfile(.., 0)`.
 //!
 //! The VFS has no downcast for `dyn File`; the registry below finds the object behind an fd by its address

@@ -1,4 +1,4 @@
-//! kcmp(2) (AB-17; linux-6.6/kernel/kcmp.c `SYSCALL_DEFINE5(kcmp)` :135). Mesa compares dma-buf fds with
+//! kcmp(2) (AB-17; linux-7.3.1/kernel/kcmp.c `SYSCALL_DEFINE5(kcmp)` :135). Mesa compares dma-buf fds with
 //! KCMP_FILE when F_DUPFD_QUERY is missing, Wine and bwrap compare address spaces with KCMP_VM.
 //!
 //! Order as Linux: both pids are looked up in the caller's pid namespace (a thread id names that thread; a
@@ -12,7 +12,7 @@
 //!   when either is not open or the task ended;
 //! - KCMP_VM: the address space; KCMP_FILES: the fd table; KCMP_FS: the thread's cwd/root/umask state;
 //! - KCMP_SIGHAND: the signal actions, which V2 keeps per thread group (CLONE_SIGHAND without CLONE_THREAD
-//!   copies them, plan/notes/ab-AB-4.md), so the group; it stays until the reap, as `sighand` does;
+//!   copies them, plan/spec/abi.md §3), so the group; it stays until the reap, as `sighand` does;
 //! - KCMP_SYSVSEM compares undo lists (SX-IPC; two tasks without one compare equal, as Linux's NULLs);
 //! - KCMP_IO: V2 has no I/O contexts, so every task has NULL there, Linux's answer for tasks that never used
 //!   ioprio: equal;
@@ -96,10 +96,10 @@ fn epoll_target(c: &SysCtx<'_>, t1: &Task, t2: &Task, idx1: u64, slot: u64) -> i
     let tfd = i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
     let toff = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as u64;
     let Some(filp) = t1.file(idx1 as u32) else { return -EBADF };
-    // `fget_task` looks up with mask 0 (linux-6.6/fs/file.c:945): an O_PATH fd is found, then is no epoll.
+    // `fget_task` looks up with mask 0 (linux-7.3.1/fs/file.c:1122): an O_PATH fd is found, then is no epoll.
     let Some(ep) = t2.file(efd) else { return -EBADF };
     let Some(epoll) = ep.file.as_epoll() else { return -EINVAL };
-    // `get_epoll_tfile_raw_ptr` (linux-6.6/fs/eventpoll.c:1060): ENOENT when no item matches.
+    // `get_epoll_tfile_raw_ptr` (linux-7.3.1/fs/eventpoll.c:2915): ENOENT when no item matches.
     match epoll.target(tfd, toff) {
         Some(tgt) => kcmp_ptr(Arc::as_ptr(&filp) as usize, Arc::as_ptr(&tgt) as usize, KCMP_FILE),
         None => -ENOENT,

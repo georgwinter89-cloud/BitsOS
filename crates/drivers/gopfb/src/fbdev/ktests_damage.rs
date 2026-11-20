@@ -4,7 +4,7 @@
 //! write fault and no device fault may happen after the warm-up, and the picture is the program's; the plain
 //! run after a damage run still faults (the hold's end armed the tracked path again). Each run reports faults,
 //! write-protected pages and copied bytes per frame (event `dp ktest.fbdev_damage`): the numbers of the DP-6
-//! decision (plan/notes/dp-DP-6.md). `dp.fbdev.damage_rules` checks the refusals a program cannot provoke on
+//! decision (plan/spec/gpu.md §11.3). `dp.fbdev.damage_rules` checks the refusals a program cannot provoke on
 //! itself (EPERM for a kernel caller, EBUSY for a non-holder) and the work bound of one call (a huge `count`
 //! degrades to a whole copy after a bounded number of reads); `dp.fbdev.damage_end` ends the mode with
 //! BITSOS_DAMAGE_END and expects write-protect, faults and one whole copy back. All Safe and rerunnable: every
@@ -190,7 +190,7 @@ fn run(seed: u32, n: u64, how: &str, shape: &str) -> Result<Option<Run>, String>
         let line = r.width as u64 * 4;
         let window_pages = (r.height as u64 * line).div_ceil(4096);
         let copied = if how == "plain" { d.flush_px * 4 } else { d.damage.px * 4 };
-        // Option A (dirty bits of the page-table entries, plan/notes/dp-DP-6.md) finds the pages the tracked path
+        // Option A (dirty bits of the page-table entries, not built: plan/spec/gpu.md §11.3) finds the pages the tracked path
         // faulted on, copies their rows like `flush`, and walks the whole window each frame with one shootdown.
         klog::event!(Info, "dp", "ktest.fbdev_damage", how = how, shape = shape, frames = r.frames, width = r.width, height = r.height,
             faults_per_frame = d.write_faults / r.frames, dev_faults_per_frame = d.dev_faults / r.frames,

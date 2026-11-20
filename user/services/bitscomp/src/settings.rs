@@ -5,7 +5,7 @@
 //! goes to the main loop through a calloop channel; `App::settings_msg` rebuilds the theme and applies it live.
 //! No settingsd (nested on CachyOS): the built-in defaults, retried with a back-off.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -23,9 +23,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// A reply that does not come within this ends the connection (the next try starts after the back-off).
 const READ_LIMIT: Duration = Duration::from_secs(5);
 
-/// Key -> value as text (ints in decimal, bools as true/false).
+/// Key -> value as text (ints in decimal, bools as true/false), and (CL-5) which keys have a value of their
+/// own stored: a secret always reads `***`, so "is a key stored" is only this.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Values(BTreeMap<String, String>);
+pub struct Values(BTreeMap<String, String>, BTreeSet<String>);
 
 impl Values {
     pub fn text(&self, k: &str) -> Option<&str> {
@@ -47,6 +48,17 @@ impl Values {
     pub fn remove(&mut self, k: &str) {
         self.0.remove(k);
     }
+    /// settingsd holds a value of its own for `k` (not the default).
+    pub fn stored(&self, k: &str) -> bool {
+        self.1.contains(k)
+    }
+    pub fn set_stored(&mut self, k: &str, yes: bool) {
+        if yes {
+            self.1.insert(k.into());
+        } else {
+            self.1.remove(k);
+        }
+    }
 }
 
 fn shown(j: &Json) -> Option<String> {
@@ -63,6 +75,8 @@ pub enum Msg {
     /// settings page's rows).
     All(Values, Vec<(String, String)>, Vec<Spec>),
     Changed(String, Option<String>),
+    /// CL-5: a change left the key with a value of its own (true) or at its default; sent before its `Changed`.
+    Stored(String, bool),
     /// settingsd's storage directory when it is the stick (persistent), else `None`.
     Place(Option<String>),
     /// The connection is gone: the values stay as they were (the next `All` refreshes them).
@@ -165,6 +179,7 @@ fn all(socket: &str, tx: &Sender<Msg>) -> Result<(), Stop> {
         if let Some(val) = k.get("value").and_then(shown) {
             v.set(key, &val);
         }
+        v.set_stored(key, k.get("changed").and_then(Json::as_bool) == Some(true));
         let text = k.get("text").and_then(Json::as_str).unwrap_or("").to_string();
         let mut spec = page_schema::spec_of(k);
         if spec.is_none() && open {
@@ -212,7 +227,12 @@ fn session(socket: &str, tx: &Sender<Msg>) -> Result<(), Stop> {
             Ok(_) => {}
         }
         match event(&line) {
-            Event::Changed(k, v) => send(tx, Msg::Changed(k, v))?,
+            Event::Changed(k, v) => {
+                if let Some(own) = stored(&line) {
+                    send(tx, Msg::Stored(k.clone(), own))?;
+                }
+                send(tx, Msg::Changed(k, v))?
+            }
             // Events were dropped for us: read everything again.
             Event::Lagged => all(socket, tx)?,
             Event::Other => {}
@@ -245,9 +265,27 @@ fn event(line: &str) -> Event {
     }
 }
 
+/// Whether a `changed` line left its key with a value of its own (settingsd's `default`: false); None: the line
+/// does not say.
+fn stored(line: &str) -> Option<bool> {
+    Json::parse(line.trim()).ok()?.get("default")?.as_bool().map(|d| !d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_says_whether_a_value_is_stored() {
+        assert_eq!(stored(r#"{"event":"changed","key":"ai.provider.a.key","value":null,"default":false}"#), Some(true));
+        assert_eq!(stored(r#"{"event":"changed","key":"ai.provider.a.key","value":null,"default":true}"#), Some(false));
+        assert_eq!(stored(r#"{"event":"changed","key":"theme.mode","value":"light"}"#), None);
+        let mut v = Values::default();
+        v.set_stored("ai.provider.a.key", true);
+        assert!(v.stored("ai.provider.a.key") && !v.stored("ai.provider.b.key"));
+        v.set_stored("ai.provider.a.key", false);
+        assert!(!v.stored("ai.provider.a.key"));
+    }
 
     #[test]
     fn values_read_as_their_type() {

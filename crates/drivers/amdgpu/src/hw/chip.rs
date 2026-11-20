@@ -76,6 +76,18 @@ pub fn loaded_firmware(profile: &ChipProfile, fw: &FwSet) -> Vec<Firmware> {
         .collect()
 }
 
+/// GX-8v: VCN's entry once its microcode was loaded: the file's `ucode_version`, feature 0, as
+/// Linux answers (amdgpu_kms.c:301-304: `vcn.fw_version`, feature 0; the 780M's 0x09118022).
+pub fn with_vcn(mut v: Vec<Firmware>, fw: &FwSet) -> Vec<Firmware> {
+    if let Some(f) = fw.get(Kind::Vcn) {
+        for e in v.iter_mut().filter(|e| e.fw_type == AMDGPU_INFO_FW_VCN) {
+            e.ver = f.header.ucode_version;
+            e.feature = 0;
+        }
+    }
+    v
+}
+
 impl ChipFacts {
     /// The answer's line about the chip: what the desk compares with the capture.
     pub fn describe(&self) -> String {

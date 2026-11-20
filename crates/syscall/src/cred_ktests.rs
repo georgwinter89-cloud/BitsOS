@@ -1,5 +1,5 @@
 //! AB-13 ktests: the credential calls through the real dispatcher on held test processes (the harness of
-//! `wave_a_ktests`), as root and as a user, against linux-6.6/kernel/sys.c and kernel/groups.c. The ABI diff
+//! `wave_a_ktests`), as root and as a user, against linux-7.3.1/kernel/sys.c and kernel/groups.c. The ABI diff
 //! (`abi-ids`) runs the user paths on CachyOS too; the root paths are only here. All `Safe` and rerunnable.
 
 use crate::ab7_ktests::text;
@@ -200,7 +200,7 @@ fn without_names(s: &str) -> String {
 }
 
 ktest!("ab.cred.chpst", Safe, chpst);
-/// The proof Georg's Cobalt start needs (desk-minipc-w7.md): BusyBox `chpst -u 1000:1000 id` as root, and a
+/// The proof Georg's Cobalt start needs: BusyBox `chpst -u 1000:1000 id` as root, and a
 /// `su`-like drop from a root shell whose own ids stay root (fork copies, execve keeps the dropped ids).
 fn chpst() -> TestResult {
     if !crate::ab7_ktests::have("/bin/busybox") {
@@ -288,7 +288,7 @@ fn inherit() -> TestResult {
     Ok(())
 }
 
-/// Whether FS has applied change requests 2 and 3 of plan/notes/ab-AB-13.md (file checks on fsuid/fsgid and
+/// Whether FS has applied AB-13's change requests 2 and 3 (file checks on fsuid/fsgid and
 /// the supplementary groups). The desk sets it to true in the same integration; until then a difference
 /// in `ab.cred.files` is a failure that names the gap, afterwards it is a failure.
 const FS_CR_MERGED: bool = true;
@@ -309,7 +309,7 @@ fn files() -> TestResult {
     }
     if !FS_CR_MERGED && code == 0 && out.starts_with("files made: yes\n") {
         klog::event!(Warn, "ktest", "cred.files_gap", lines = out.lines().count(); "file checks still use the exec-time ids");
-        return ktest::fail("FS change requests 2+3 of ab-AB-13.md not applied: file checks use the exec-time uid/gid, no supplementary groups");
+        return ktest::fail("FS change requests 2+3 of AB-13 (plan/spec/abi.md §5) not applied: file checks use the exec-time uid/gid, no supplementary groups");
     }
     Err(format!("abi-cred files: exit {code}\n{out}"))
 }

@@ -3,7 +3,7 @@
 
 extern crate std;
 
-use crate::ctrl::{Config, Controller, HdaError, Kind, OutputId, State};
+use crate::ctrl::{Controller, HdaError, Kind, OutputId, State};
 use crate::fake::{Ev, FakeHda, FakeHw};
 use crate::link::Mode;
 use crate::regs::*;
@@ -65,15 +65,15 @@ pub(crate) fn duplex_text(mixer: bool) -> String {
 }
 
 fn ctrl(kind: Kind, codecs: &[(u8, &str)]) -> (Arc<FakeHda>, Controller<FakeHw>) {
-    ctrl_cfg(kind, codecs, Config::default())
+    ctrl_cfg(kind, codecs)
 }
 
-fn ctrl_cfg(kind: Kind, codecs: &[(u8, &str)], cfg: Config) -> (Arc<FakeHda>, Controller<FakeHw>) {
+fn ctrl_cfg(kind: Kind, codecs: &[(u8, &str)]) -> (Arc<FakeHda>, Controller<FakeHw>) {
     let f = FakeHda::new(QEMU_GCAP);
     for &(cad, t) in codecs {
         f.add_codec(cad, t);
     }
-    let c = Controller::new("hda0".into(), kind, FakeHw(f.clone()), cfg);
+    let c = Controller::new("hda0".into(), kind, FakeHw(f.clone()));
     (f, c)
 }
 
@@ -114,11 +114,10 @@ fn bring_up_alc269() {
 
 #[test]
 fn amd_fch_quirks() {
-    let (f, c) = up(Kind::AmdFch, &[(0, ALC269)]);
+    let (f, _c) = up(Kind::AmdFch, &[(0, ALC269)]);
     // ATI snoop byte 0x42 = 2 (bits 18:16 of dword 0x40), no TCSEL.
     assert!(f.has(&Ev::PciModify(0x40, 7 << 16, 2 << 16)));
     assert!(!f.trace.lock().iter().any(|e| matches!(e, Ev::PciModify(PCI_TCSEL, ..))));
-    assert!(c.snooped());
 }
 
 #[test]
@@ -148,7 +147,6 @@ fn gpu_controller_streams_after_display_side() {
     c.bring_up().unwrap();
     assert!(!c.read_only() && f.has(&Ev::Enable(true)));
     assert_eq!(c.link_mode(), Some(Mode::Rings));
-    assert!(c.snooped());
     assert_ne!(f.reg32(GCTL) & GCTL_CRST, 0, "out of reset");
     let outs = c.outputs();
     let playable: Vec<u8> = outs.iter().filter(|o| o.playable).map(|o| o.id.pin).collect();
@@ -398,20 +396,6 @@ fn qemu_duplex_codec() {
         f.advance(8192);
         assert_eq!(f.sd(OUT0).sink, signal::bytes(0, 2048, false));
     }
-}
-
-#[test]
-fn no_snoop_falls_back_without_uc() {
-    let (f, c) = ctrl_cfg(Kind::Intel, &[(0, ALC269)], Config { force_no_snoop: true });
-    assert!(!c.snooped());
-    c.bring_up().unwrap();
-    assert!(f.has(&Ev::Alloc(crate::link::RINGS_BYTES, false)));
-    f.no_uc.store(true, Ordering::Release);
-    let sid = c.open(HP, F48, 1024, 256).unwrap();
-    assert!(c.snooped(), "fell back to snooping");
-    // No-snoop descriptors carry the traffic-priority bit (Linux); after the fallback this one does not.
-    assert_eq!(f.sd(OUT0).ctl & SD_CTL_TP, 0);
-    c.close(sid).unwrap();
 }
 
 #[test]

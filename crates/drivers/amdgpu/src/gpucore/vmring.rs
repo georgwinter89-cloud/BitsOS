@@ -1,4 +1,4 @@
-//! GX-7m, `until=vm`: a GPU virtual memory in the rings (ladder rung 4, gx-scout-vm-rings.md sections 4 and 10).
+//! GX-7m, `until=vm`: a GPU virtual memory in the rings (ladder rung 4).
 //! It continues a passed `until=gfx_mes` (MES running, the compute ring and GFX ring 0 mapped as legacy kernel
 //! queues) and the SDMA 0 queue a kept `until=sdma` left running, and runs on each queue what Linux's
 //! amdgpu_vm_flush emits before a job of a non-zero VMID, then the job:
@@ -953,7 +953,8 @@ fn pm4_queue(hw: &mut dyn Hw, name: &'static str, base: u64, bytes: u64, rptr: u
     if rp != Some(at & (size - 1)) && rp != Some(at & 0xffff_ffff) {
         return Err(VmError::NotIdle { queue: name, rptr: rp, wptr: wp });
     }
-    let ring = Ring::new(Kind::Gfx, size, at).map_err(VmError::Ring)?;
+    // A GFX or compute ring: gfx_v11_ring_insert_nop's counted NOP (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c:7110, :7156).
+    let ring = Ring::new(Kind::Gfx, size, at).map_err(VmError::Ring)?.with_counted_nops();
     Ok(Queue::Pm4 { q: PmQueue { ring, base, rptr_wb: Some(rptr), wptr_mc: wptr, doorbell, rptr_dw: at }, gfx })
 }
 

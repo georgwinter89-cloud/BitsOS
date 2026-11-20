@@ -135,6 +135,15 @@ pub fn scan(point: &Path) -> Result<SysState, String> {
 /// Bound for reading CONFIG.TXT (a few hundred bytes in practice).
 const MAX_CONFIG: u64 = 1 << 20;
 
+/// The version a KERNEL file carries (bitsver's mark): None for a development build (no mark, or number 0).
+pub fn version_of(kernel: &[u8]) -> Result<Option<u32>, String> {
+    match bitsver::find(kernel, bitsver::Found::None) {
+        bitsver::Found::None | bitsver::Found::One(0) => Ok(None),
+        bitsver::Found::One(n) => Ok(Some(n)),
+        bitsver::Found::Conflict(a, b) => Err(format!("refused: the KERNEL carries two version marks ({a} and {b}); no number can be trusted")),
+    }
+}
+
 /// `sys_keep=` from `\BITSOS2\CONFIG.TXT` (last line wins, `#` comments), with what to tell about it. The
 /// pruning deletes by this number, so a CONFIG.TXT that exists but cannot be read, or a sys_keep that is no
 /// number, refuses instead of falling back to the default (Georg may have asked to keep more).
@@ -310,10 +319,16 @@ impl<'a> Planner<'a> {
             return Err(format!("refused: KERNEL and INITRD are the same as generation {}'s; nothing to write (--force writes them anyway)", g.number));
         }
         let replace = newest.as_ref().filter(|g| !g.ok).cloned();
-        let number = match (&newest, &replace) {
-            (_, Some(g)) => g.number,
-            (Some(g), None) => g.number.checked_add(1).ok_or("refused: the newest generation number is already the largest possible")?,
-            (None, None) => 1,
+        // UPDATE (Georg 15.11.: one number for everything): a numbered build goes under its own number, as the
+        // kernel's install path names its slots, so the stick and the other machines agree.
+        let number = match (version_of(&b.kernel)?, &newest, &replace) {
+            (Some(n), Some(g), _) if n <= g.number => {
+                return Err(format!("refused: the bundle is version {n}, but the stick already holds generation {}; a number is never reused or lowered", g.number));
+            }
+            (Some(n), _, _) => n,
+            (None, _, Some(g)) => g.number,
+            (None, Some(g), None) => g.number.checked_add(1).ok_or("refused: the newest generation number is already the largest possible")?,
+            (None, None, None) => 1,
         };
         if loader.is_none() && b.bitsboot.is_none() {
             return Err("refused: the stick has no \\EFI\\BOOT\\BOOTX64.EFI and the bundle brings no bitsboot; it would not start".into());
@@ -391,6 +406,43 @@ impl<'a> Planner<'a> {
         self.ensure_sys();
         let b2 = self.st.bitsos2.clone().unwrap_or_else(|| "BITSOS2".into());
         self.steps.push(Step::Write { to: format!("{b2}/CONFIG.TXT"), bytes: text.to_vec(), from: Some(from.display().to_string()) });
+    }
+
+    /// GP-R2: an extra firmware set into `\BITSOS2\firmware\` (`xtask stick --firmware`): a file the stick holds
+    /// byte for byte stays, every other one is written over the stick's own name for it (a different one is
+    /// replaced); nothing else in the folder changes. One line per file for the plan: path, bytes, SHA-256, what
+    /// happens.
+    pub fn firmware(&mut self, files: &[crate::firmware::SetFile]) -> Vec<String> {
+        let b2 = self.st.bitsos2.clone().unwrap_or_else(|| "BITSOS2".into());
+        if self.st.bitsos2.is_none() {
+            self.steps.push(Step::Mkdir(b2.clone()));
+            self.st.bitsos2 = Some(b2.clone());
+        }
+        let mut made: Vec<String> = Vec::new();
+        let mut lines = Vec::new();
+        for f in files {
+            let rel = format!("{b2}/firmware/{}", f.rel);
+            let have = resolve_ci(self.point, &rel).filter(|p| p.is_file());
+            let state = match &have {
+                Some(p) if std::fs::read(p).is_ok_and(|b| b == f.bytes) => "unchanged",
+                Some(_) => "replaces a different file",
+                None => "new",
+            };
+            if state != "unchanged" {
+                let parts: Vec<&str> = rel.split('/').collect();
+                for i in 2..parts.len() {
+                    let dir = parts[..i].join("/");
+                    if resolve_ci(self.point, &dir).is_none() && !made.contains(&dir) {
+                        self.steps.push(Step::Mkdir(dir.clone()));
+                        made.push(dir);
+                    }
+                }
+                let to = have.as_ref().and_then(|p| p.strip_prefix(self.point).ok()).map_or(rel, |p| p.to_string_lossy().to_string());
+                self.steps.push(Step::Write { to, bytes: f.bytes.clone(), from: Some(f.from.clone()) });
+            }
+            lines.push(format!("{} {} bytes sha256 {} ({state})", f.rel, f.bytes.len(), crate::image::package::sha256(&f.bytes)));
+        }
+        lines
     }
 
     /// Stale markers next to `OK` (a confirmation cut short) go, then generations beyond `keep` confirmed ones.

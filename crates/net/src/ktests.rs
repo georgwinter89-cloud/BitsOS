@@ -4,12 +4,14 @@
 //! a host client through hostfwd 24521 -> 24520; the fake LAN of `host/tests/nw/40-fake-lan.sh`) skip at once
 //! when the partner is missing, and the scenario scripts require them to pass.
 
+mod atomic3;
 mod hardening;
 mod lifeline;
 mod netlink;
 mod netns;
 mod parallel;
 mod sha256;
+mod table;
 
 use crate::http;
 use crate::stack::{self, Stack};

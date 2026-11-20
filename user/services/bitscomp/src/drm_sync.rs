@@ -1,6 +1,8 @@
 //! WY-16: the DRM sync object ioctls bitscomp (wp_linux_drm_syncobj_v1) and wyclient (`--syncobj`) use, on a DRM
-//! node (the render node). Struct layouts and numbers as in Linux's uapi (linux-6.6/include/uapi/drm/drm.h:778,
-//! :863-955, :1018, :1151-1199); every ioctl answers an `io::Error` with the kernel's errno, nothing panics.
+//! node (the render node). Struct layouts and numbers as in Linux 7.3.1's uapi (linux-7.3.1/include/uapi/drm/drm.h:939
+//! `drm_syncobj_handle` with `point`, :980 `drm_syncobj_timeline_wait` with `deadline_nsec`: 24 and 48 bytes, so the
+//! numbers are 7.3.1's; older kernels zero-extend the shorter structs, newer sizes are what they copy); every ioctl
+//! answers an `io::Error` with the kernel's errno, nothing panics.
 //! Only syncobj objects: no GPU work is ever submitted through this file.
 #![allow(dead_code)] // bitscomp and wyclient (`#[path]`) use different parts
 
@@ -38,6 +40,8 @@ struct Handle {
     flags: u32,
     fd: i32,
     pad: u32,
+    /// Only with DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE (not used: 0).
+    point: u64,
 }
 
 #[repr(C)]
@@ -50,6 +54,8 @@ struct TimelineWait {
     flags: u32,
     first_signaled: u32,
     pad: u32,
+    /// Only with DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE (not used: 0).
+    deadline_nsec: u64,
 }
 
 #[repr(C)]
@@ -111,7 +117,7 @@ impl Drm {
     }
 
     /// DRM_CAP_SYNCOBJ_TIMELINE and DRM_IOCTL_SYNCOBJ_EVENTFD both work here (the eventfd probe on handle 0, which
-    /// never exists, must say ENOENT: linux-6.6/drivers/gpu/drm/drm_syncobj.c:1403-1422 checks in that order).
+    /// never exists, must say ENOENT: linux-7.3.1/drivers/gpu/drm/drm_syncobj.c:1461-1482 checks in that order).
     pub fn has_timelines_and_eventfd(&self) -> Result<(), String> {
         let mut cap = GetCap { capability: DRM_CAP_SYNCOBJ_TIMELINE, value: 0 };
         self.ioctl(GET_CAP, &mut cap).map_err(|e| format!("DRM_CAP_SYNCOBJ_TIMELINE: {e}"))?;
@@ -140,7 +146,7 @@ impl Drm {
 
     /// The syncobj file of `handle` (HANDLE_TO_FD without flags), what import_timeline sends.
     pub fn export(&self, handle: u32) -> io::Result<OwnedFd> {
-        let mut a = Handle { handle, flags: 0, fd: -1, pad: 0 };
+        let mut a = Handle { handle, fd: -1, ..Default::default() };
         self.ioctl(HANDLE_TO_FD, &mut a)?;
         // SAFETY: the kernel just installed this fd for us; nobody else owns it.
         Ok(unsafe { OwnedFd::from_raw_fd(a.fd) })
@@ -148,7 +154,7 @@ impl Drm {
 
     /// A handle on this file for a syncobj fd (FD_TO_HANDLE without flags).
     pub fn import(&self, fd: BorrowedFd<'_>) -> io::Result<u32> {
-        let mut a = Handle { handle: 0, flags: 0, fd: fd.as_raw_fd(), pad: 0 };
+        let mut a = Handle { fd: fd.as_raw_fd(), ..Default::default() };
         self.ioctl(FD_TO_HANDLE, &mut a)?;
         Ok(a.handle)
     }
@@ -213,14 +219,14 @@ pub fn node_of(rdev: u64) -> Option<String> {
 mod tests {
     #[test]
     fn ioctl_numbers_are_linux_ones() {
-        // Linux 6.6's sizes (checked with a C compiler; CachyOS's newer drm.h grew drm_syncobj_handle to 24 and
-        // drm_syncobj_timeline_wait to 48 bytes, and drm_ioctl zero-fills a shorter caller's struct,
-        // linux-6.6/drivers/gpu/drm/drm_ioctl.c:853-890, as V2's size-tolerant dispatcher does, dr-DR-3.md).
+        // Linux 7.3.1's sizes (CachyOS's /usr/include/drm/drm.h: DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD 0xc01864c1,
+        // DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT 0xc03064ca); V2's dispatcher takes these and 6.6's shorter ones
+        // (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:874-916 zero-fills, crates/drm l7_syncobj_sizes).
         assert_eq!(super::GET_CAP, 0xc010_640c);
         assert_eq!(super::CREATE, 0xc008_64bf);
-        assert_eq!(super::HANDLE_TO_FD, 0xc010_64c1);
-        assert_eq!(super::FD_TO_HANDLE, 0xc010_64c2);
-        assert_eq!(super::TIMELINE_WAIT, 0xc028_64ca);
+        assert_eq!(super::HANDLE_TO_FD, 0xc018_64c1);
+        assert_eq!(super::FD_TO_HANDLE, 0xc018_64c2);
+        assert_eq!(super::TIMELINE_WAIT, 0xc030_64ca);
         assert_eq!(super::TIMELINE_SIGNAL, 0xc018_64cd);
         assert_eq!(super::EVENTFD, 0xc018_64cf);
     }

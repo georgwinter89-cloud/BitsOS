@@ -13,8 +13,8 @@
 //!
 //! Each controller has a service thread `hda/<n>` (KernelRt, V2-PLAN §5): it sleeps on its MSI (period
 //! completions, RIRB) with a deadline of a quarter period (100 ms idle), then reads positions, calls period
-//! callbacks, handles unsolicited plug events and polls the jacks that cannot send them. Without MSI (CONFIG
-//! `hda_irq=off`, or none could be had) the same thread polls on its deadline.
+//! callbacks, handles unsolicited plug events and polls the jacks that cannot send them. Without MSI (none could be
+//! had, or the test key `ktest_poll=hda`) the same thread polls on its deadline.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -47,7 +47,7 @@ mod tests_quiesce;
 #[cfg(test)]
 mod tests_shutdown;
 
-pub use ctrl::{CodecStop, Config, Controller, DP_AUDIO_PIN, QuiesceResult, HdaError, InputInfo, JackFn, Kind, OutputId, OutputInfo, PeriodFn, State, StreamId};
+pub use ctrl::{CodecStop, Controller, DP_AUDIO_PIN, QuiesceResult, HdaError, InputInfo, JackFn, Kind, OutputId, OutputInfo, PeriodFn, State, StreamId};
 pub use mmio_hw::MmioHw;
 
 use alloc::format;
@@ -68,7 +68,7 @@ static MATCHES: [pci::Match; 5] = [
     pci::Match::Class { class: 0x04_03_00, mask: 0xFF_FF_00 },
 ];
 
-pci::pci_driver!(pci::DriverEntry { name: "hda", matches: &MATCHES, opt_in_key: None, probe });
+pci::pci_driver!(pci::DriverEntry { name: "hda", matches: &MATCHES, probe });
 
 /// A controller in the kernel with its interrupt set.
 pub struct Hda {
@@ -91,12 +91,9 @@ pub fn is_hda(f: &pci::PciFunction) -> bool {
     MATCHES.iter().any(|m| m.hits(f.vendor, f.device, f.class))
 }
 
-fn config() -> Config {
-    Config { force_no_snoop: pci::registry::config_value("hda_snoop").is_some_and(|v| v.trim() == "off") }
-}
-
+/// MSI unless the test key `ktest_poll=hda` (`host/tests/sn/10-hda.sh`, `sn/30-mix.sh`) tests the polled path.
 fn irqs_wanted() -> bool {
-    !pci::registry::config_value("hda_irq").is_some_and(|v| v.trim() == "off")
+    !pci::registry::poll_test("hda")
 }
 
 fn probe(f: &pci::PciFunction) -> Result<(), String> {
@@ -115,7 +112,7 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
         let mut devs = DEVICES.lock();
         let index = devs.len();
         let dev = Arc::new(Hda {
-            ctrl: Controller::new(format!("hda{index}"), kind, hw, config()),
+            ctrl: Controller::new(format!("hda{index}"), kind, hw),
             irqs: SpinLock::named("hda.irqs", None),
             handle: SpinLock::named("hda.handle", None),
             thread: core::sync::atomic::AtomicBool::new(false),

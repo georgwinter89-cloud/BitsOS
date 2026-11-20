@@ -8,7 +8,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use ksync::{SpinLock, WaitQueue};
+use ksync::{Spare, SpinLock, WaitQueue};
 use uapi::errno::*;
 use vfs::{Errno, Events, File};
 
@@ -33,13 +33,26 @@ impl Capture {
     }
     /// Everything kept so far.
     pub fn contents(&self) -> Vec<u8> {
-        self.inner.lock().data.clone()
+        self.since(0).0
     }
-    /// Bytes kept from `from` on (for progress), and the new end.
+    /// Bytes kept from `from` on (for progress), and the new end. The copy's memory is made with the lock
+    /// dropped (the kept output is up to `cap` bytes, and under a spin lock the heap may not reclaim for it);
+    /// output that arrived meanwhile asks again.
     pub fn since(&self, from: usize) -> (Vec<u8>, usize) {
-        let g = self.inner.lock();
-        let from = from.min(g.data.len());
-        (g.data[from..].to_vec(), g.data.len())
+        let mut out = Vec::new();
+        loop {
+            let want = {
+                let g = self.inner.lock();
+                let from = from.min(g.data.len());
+                let want = g.data.len() - from;
+                if want <= out.capacity() {
+                    out.extend_from_slice(&g.data[from..]);
+                    return (out, g.data.len());
+                }
+                want
+            };
+            out.reserve_exact(want);
+        }
     }
     pub fn len(&self) -> usize {
         self.inner.lock().data.len()
@@ -58,14 +71,22 @@ impl File for Capture {
         Err(EBADF)
     }
     fn write_at(&self, _pos: u64, buf: &[u8]) -> Result<usize, Errno> {
-        {
+        // Before the guard: the buffer it replaces is freed after the unlock.
+        let mut spare = Spare::new();
+        loop {
             let mut g = self.inner.lock();
             let room = self.cap.saturating_sub(g.data.len()).min(buf.len());
-            if room > 0 && g.data.try_reserve(room).is_ok() {
+            if spare.fits(&mut g.data, room) {
                 g.data.extend_from_slice(&buf[..room]);
                 g.dropped += (buf.len() - room) as u64;
-            } else {
-                g.dropped += buf.len() as u64;
+                break;
+            }
+            // The larger buffer is made with the lock dropped; another writer's bytes that came meanwhile are
+            // kept (the room is worked out again), each write stays whole.
+            drop(g);
+            if spare.grow().is_err() {
+                self.inner.lock().dropped += buf.len() as u64;
+                break;
             }
         }
         self.wq.wake_all();
@@ -127,6 +148,53 @@ mod tests {
         assert_eq!(c.since(6), (b"worl".to_vec(), 10));
         assert_eq!(c.since(99), (Vec::new(), 10));
         assert_eq!(c.read_at(0, &mut [0u8; 4]), Err(EBADF));
+    }
+
+    /// The kept output grows past many pages through the spare only (never under the lock), in order, with
+    /// writers from several threads; copies taken meanwhile are prefixes of the end result.
+    #[test]
+    fn capture_grows_outside_its_lock_and_keeps_every_write_whole() {
+        extern crate std;
+        const WRITERS: u8 = 4;
+        const EACH: usize = 400;
+        const LINE: usize = 64;
+        let cap = WRITERS as usize * EACH * LINE - 1000;
+        let c = Capture::new(cap);
+        let hs: std::vec::Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for i in 0..EACH {
+                        let mut line = [b'a' + w; LINE];
+                        line[0] = (i % 251) as u8;
+                        assert_eq!(c.write_at(0, &line).unwrap(), LINE);
+                    }
+                })
+            })
+            .collect();
+        let mut seen = Vec::new();
+        while hs.iter().any(|h| !h.is_finished()) {
+            let (more, end) = c.since(seen.len());
+            seen.extend_from_slice(&more);
+            assert_eq!(seen.len(), end);
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let all = c.contents();
+        assert_eq!(all.len(), cap, "kept up to the bound");
+        assert_eq!(c.dropped(), 1000);
+        assert_eq!(&all[..seen.len()], &seen[..], "an earlier copy is not a prefix of the kept output");
+        // Whole writes: every 64-byte line is one writer's, and each writer's lines come in its order.
+        let mut next = [0usize; WRITERS as usize];
+        for line in all.chunks(LINE) {
+            let w = (line[line.len().min(2) - 1] - b'a') as usize;
+            assert!(line[1..].iter().all(|&b| b == b'a' + w as u8), "two writes mixed in one line");
+            if line.len() == LINE {
+                assert_eq!(line[0], (next[w] % 251) as u8, "writer {w}: a line out of order or lost before the bound");
+                next[w] += 1;
+            }
+        }
     }
 
     #[test]

@@ -3,6 +3,9 @@
 # Run: `cargo xtask fullrun` (no ktest class names it, so the plain gate does not start it); by hand `cargo xtask scenario cx/10-ctxd`.
 # CX-1: ctxd host tests (unit + integration): recall@10 on host/cx-eval, kill -9 during indexing and commit,
 # private roots never in MCP output, snippet limit, MCP/socket bad input, hostile files, rename identity.
+# CX-5: the V2 service mode against a stand-in settingsd (tests/system.rs); CX-3: learning and the replay of
+# host/tests/cx/sessions/ (tests/learning.rs). The test knobs (fake embedder, CTXD_TEST_*) exist only in the
+# build the tests make: the dev-dependency on ctxd itself turns on its feature test-knobs.
 # ctxd is its own cargo workspace (user/services/ctxd), so `cargo xtask test` does not build it; this does.
 # The tests with the real model need user/services/ctxd/third_party/ (gitignored downloads and the llama.cpp build,
 # one copy per machine is enough): CTXD_THIRD_PARTY=<dir>, else this worktree's, else lane CX's, linked in here.

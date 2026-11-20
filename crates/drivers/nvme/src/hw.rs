@@ -24,7 +24,7 @@ pub enum IrqMode {
     /// MSI-X with this many vectors.
     MsiX(u16),
     Msi,
-    /// No vectors (CONFIG `nvme_irq=off`, none granted, or host tests): the waiter polls.
+    /// No vectors (none granted, the test key `ktest_poll=nvme`, or host tests): the waiter polls.
     Polled,
 }
 

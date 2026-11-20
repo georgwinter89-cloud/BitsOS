@@ -1,4 +1,4 @@
-//! SX-3b: one proc super block per proc mount, bound to the mounter's pid namespace (linux-6.6/fs/proc/root.c:226
+//! SX-3b: one proc super block per proc mount, bound to the mounter's pid namespace (linux-7.3.1/fs/proc/root.c:321
 //! `proc_get_tree` = `get_tree_nodev`, `proc_fill_super` keeps `fc->pid_ns`; SX-3a decision 8 showed the boot
 //! instance instead). The boot /proc (devfs::populate) and every instance are built from the same registries:
 //! the `procfile!`/`procdir!` entries below /proc. A source that depends on the pid namespace (the process

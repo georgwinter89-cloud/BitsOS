@@ -111,7 +111,7 @@ def main():
     print(f"--- alsa-hw capture 2: {st}\n{out}{err}")
     got = [l for l in out.splitlines() if not l.startswith("# ")]
     want = open(EXPECTED).read().splitlines()
-    need(ok(st) and got == want, "alsa-hw capture: every answer as linux-6.6 gives it",
+    need(ok(st) and got == want, "alsa-hw capture: every answer as linux-7.3.1 gives it",
          "\n".join(f"  got  {g}\n  want {w}" for g, w in zip(got + [""] * 40, want + [""] * 40) if g != w))
     st, out, err = run(c, "/bin/aplay", argv=["arecord", "-D", "hw:0,0", "-f", "S16_LE", "-r", "48000", "-c", "2", "-d", "2", "/tmp/rec48.wav"])
     print(f"--- arecord -D hw:0,0 2 s: {st}\n{out}{err}")

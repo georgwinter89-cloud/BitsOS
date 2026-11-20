@@ -1,4 +1,4 @@
-//! Control messages of sendmsg (linux-6.6/net/core/scm.c `__scm_send`, `scm_fp_copy`, `scm_check_creds`;
+//! Control messages of sendmsg (linux-7.3.1/net/core/scm.c `__scm_send`, `scm_fp_copy`, `scm_check_creds`;
 //! include/linux/socket.h `CMSG_OK`, `__cmsg_nxthdr`). The control buffer is a kernel copy; descriptors are
 //! looked up through the caller's fd table as they are met (EBADF stops the parse).
 
@@ -84,7 +84,7 @@ pub fn parse_unix(ctl: &[u8], caller: &Caller, mut fd: impl FnMut(i32) -> Option
     Ok(out)
 }
 
-/// `scm_check_creds` and `__scm_send` (linux-6.6/net/core/scm.c:45-63, :166-196): the ids as the sender names
+/// `scm_check_creds` and `__scm_send` (linux-7.3.1/net/core/scm.c:49-67, :166-252): the ids as the sender names
 /// them must map into its user namespace (EINVAL; -1 never does); a program may send its own pid and its real,
 /// effective or saved uid and gid only (CAP_SYS_ADMIN over its pid namespace: any pid; CAP_SETUID/CAP_SETGID:
 /// any uid/gid), else EPERM; the

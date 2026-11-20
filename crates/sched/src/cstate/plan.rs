@@ -1,11 +1,18 @@
 //! Which deep states an idle CPU may use (pure; host-tested). The rules are Linux's for ACPI `_CST` states
-//! (linux-6.6/drivers/acpi/processor_idle.c `acpi_processor_power_verify` l.410-460, `verify_c3` l.310-390,
-//! `lapic_timer_check_state` l.125-146, `tsc_check_state` l.186-206; arch/x86/kernel/acpi/cstate.c
-//! `acpi_processor_power_init_bm_check` l.29-104), in BitsOS's shape: where Linux would need a broadcast timer
+//! (linux-7.3.1/drivers/acpi/processor_idle.c `acpi_processor_power_verify` l.420-468, `verify_c3` l.321-398,
+//! `lapic_timer_check_state` l.132-153, `tsc_check_state` l.193-213; arch/x86/kernel/acpi/cstate.c
+//! `acpi_processor_power_init_bm_check` l.32-107), in BitsOS's shape: where Linux would need a broadcast timer
 //! or an unstable-TSC fallback, BitsOS stays in C1 altogether.
+//!
+//! Hybrid Intel (GP-CPU2) takes MWAIT states instead, as Linux's `intel_idle` does on a CPU it has no table for
+//! (the 265K, model 0xC6, is not in `intel_idle_ids`, drivers/idle/intel_idle.c:1688-1735; the driver loads through
+//! `intel_mwait_ids`, :1737-1740, and builds its states from `_CST`, :1957-1986): see `mwait`.
 
 use acpi::cst::{CState, Entry};
 use alloc::vec::Vec;
+use hal::cpu::mwait::MwaitCaps;
+
+pub use super::mwait::{MwaitSource, ARROW_LAKE_S};
 
 /// Exit latencies above this are taken as a table error (ACPI's own FADT limits are 100 us for C2 and 1 ms
 /// for C3; `_CST` has none, 10 ms leaves room for any real state).
@@ -30,12 +37,36 @@ pub struct CpuIdle {
     pub vendor: Vendor,
     pub family: u32,
     pub model: u32,
+    /// CPUID.7.0:EDX bit 15: P and E cores (Intel).
+    pub hybrid: bool,
+    /// CPUID 1 and 5 about MONITOR/MWAIT (read on Intel only; empty elsewhere).
+    pub mwait: MwaitCaps,
 }
 
 impl CpuIdle {
     /// The Mini-PC's Ryzen 7 PRO 8845HS (family 0x19 model 0x75), for tests.
-    pub const ZEN4: CpuIdle =
-        CpuIdle { hypervisor: false, arat: true, invariant_tsc: true, vendor: Vendor::Amd, family: 0x19, model: 0x75 };
+    pub const ZEN4: CpuIdle = CpuIdle {
+        hypervisor: false,
+        arat: true,
+        invariant_tsc: true,
+        vendor: Vendor::Amd,
+        family: 0x19,
+        model: 0x75,
+        hybrid: false,
+        mwait: MwaitCaps { monitor: false, ecx: 0, substates: 0 },
+    };
+
+    /// The Gaming-PC's Core Ultra 7 265K (family 6 model 0xC6), for tests.
+    pub const ARROW_LAKE: CpuIdle = CpuIdle {
+        hypervisor: false,
+        arat: true,
+        invariant_tsc: true,
+        vendor: Vendor::Intel,
+        family: 6,
+        model: 0xC6,
+        hybrid: true,
+        mwait: MwaitCaps::ARROW_LAKE,
+    };
 
     /// This CPU.
     pub fn live() -> CpuIdle {
@@ -55,6 +86,8 @@ impl CpuIdle {
             },
             family,
             model,
+            hybrid: v.has("hybrid_cpu"),
+            mwait: if f.intel { MwaitCaps::live() } else { MwaitCaps::default() },
         }
     }
 
@@ -99,6 +132,13 @@ pub enum C1Only {
     NoInvariantTsc,
     NoCst,
     NoUsableState,
+    /// Hybrid Intel whose deep states BitsOS cannot know: no usable all-MWAIT `_CST` was found and the model has no
+    /// built-in table (GP-CPU2; until then every hybrid Intel CPU stayed here). A system-I/O variant of `_CST` is
+    /// not taken on hybrid Intel: Linux's `intel_idle` refuses it too (intel_idle.c:1791-1806) and nobody has run it.
+    HybridIntel,
+    /// Hybrid Intel without MONITOR/MWAIT, its extensions, the interrupt break or any sub-state in CPUID 5
+    /// (Linux's `intel_idle_init` returns -ENODEV then, intel_idle.c:2856-2861).
+    NoMwait,
 }
 
 impl C1Only {
@@ -109,6 +149,8 @@ impl C1Only {
             C1Only::NoInvariantTsc => "no_invariant_tsc",
             C1Only::NoCst => "no_cst",
             C1Only::NoUsableState => "no_usable_state",
+            C1Only::HybridIntel => "hybrid_intel",
+            C1Only::NoMwait => "no_mwait",
         }
     }
 }
@@ -135,6 +177,10 @@ pub enum Refused {
     C3NeedsFlush,
     /// C3 needs the bus-master status, but no PM1 status port is usable.
     C3NoBmStatus,
+    /// An MWAIT hint for which CPUID 5 lists no sub-state (Linux: "ACPI MWAIT C-state ... not supported by HW").
+    MwaitHint,
+    /// Hybrid Intel: a state that is not MWAIT (Linux's `intel_idle` takes only an all-FFH `_CST`).
+    NotMwait,
 }
 
 impl Refused {
@@ -150,6 +196,8 @@ impl Refused {
             Refused::Duplicate => "duplicate",
             Refused::C3NeedsFlush => "c3_needs_flush",
             Refused::C3NoBmStatus => "c3_no_bm_status",
+            Refused::MwaitHint => "mwait_hint",
+            Refused::NotMwait => "not_mwait",
         }
     }
 }
@@ -162,6 +210,8 @@ pub struct Deep {
     pub latency_ns: u64,
     /// Look at the bus-master status before entering (C3 with `bm_check`); busy -> a shallower state.
     pub bm_check: bool,
+    /// GP-CPU2: entered by MWAIT with this hint instead of a port read (`port` is 0 then).
+    pub mwait: Option<u8>,
 }
 
 /// The idle plan: the deep states by rising exit latency and how to enter them.
@@ -177,6 +227,16 @@ pub struct Plan {
     /// The table's latencies did not rise with the state depth; they were sorted (Linux "FW issue: working
     /// around C-state latencies out of order").
     pub latency_reordered: bool,
+    /// GP-CPU2: where the MWAIT states came from (`None`: port states or none). Such a plan is used only after the
+    /// idle self-check passed (`cstate::check`).
+    pub mwait_source: Option<MwaitSource>,
+}
+
+impl Plan {
+    /// Its states are MWAIT states, which wait for the self-check.
+    pub fn needs_check(&self) -> bool {
+        self.mwait_source.is_some() && !self.deep.is_empty()
+    }
 }
 
 /// The plan for `cpu` and `fw` (`None`: no tables). `port_ok(port, bytes)` asks the ACPI register guard; it
@@ -191,6 +251,9 @@ pub fn plan(cpu: &CpuIdle, fw: Option<&Firmware<'_>>, port_ok: &mut dyn FnMut(u1
     }
     if !cpu.invariant_tsc {
         return c1(C1Only::NoInvariantTsc);
+    }
+    if cpu.hybrid && cpu.vendor == Vendor::Intel {
+        return super::mwait::plan(cpu, fw);
     }
     let Some(fw) = fw.filter(|f| !f.states.is_empty()) else {
         return c1(C1Only::NoCst);
@@ -213,15 +276,7 @@ pub fn plan(cpu: &CpuIdle, fw: Option<&Firmware<'_>>, port_ok: &mut dyn FnMut(u1
             Err(why) => p.refused.push((*c, why)),
         }
     }
-    p.deep.sort_by_key(|d| (d.kind, d.latency_ns));
-    let mut lat: Vec<u64> = p.deep.iter().map(|d| d.latency_ns).collect();
-    if lat.windows(2).any(|w| w[1] < w[0]) {
-        lat.sort_unstable();
-        for (d, l) in p.deep.iter_mut().zip(lat) {
-            d.latency_ns = l;
-        }
-        p.latency_reordered = true;
-    }
+    sort_states(&mut p);
     if p.deep.iter().any(|d| d.bm_check) {
         p.bm_status = bm_ports.flatten().unwrap_or_default();
     }
@@ -232,6 +287,19 @@ pub fn plan(cpu: &CpuIdle, fw: Option<&Firmware<'_>>, port_ok: &mut dyn FnMut(u1
         p.c1_only = Some(C1Only::NoUsableState);
     }
     p
+}
+
+/// By kind, and latencies made to rise with the kind as Linux does (`acpi_processor_power_verify`).
+pub(super) fn sort_states(p: &mut Plan) {
+    p.deep.sort_by_key(|d| (d.kind, d.latency_ns));
+    let mut lat: Vec<u64> = p.deep.iter().map(|d| d.latency_ns).collect();
+    if lat.windows(2).any(|w| w[1] < w[0]) {
+        lat.sort_unstable();
+        for (d, l) in p.deep.iter_mut().zip(lat) {
+            d.latency_ns = l;
+        }
+        p.latency_reordered = true;
+    }
 }
 
 /// One state by itself: `Ok(None)` for C1 (entered by `hlt`), `Ok(Some)` for a deep state the table
@@ -258,7 +326,7 @@ fn judge(c: &CState, bm_check: bool, taken: &[Deep]) -> Result<Option<Deep>, Ref
     if c3 && !bm_check {
         return Err(Refused::C3NeedsFlush);
     }
-    Ok(Some(Deep { kind: c.kind, port, latency_ns: c.latency_us as u64 * 1000, bm_check: c3 }))
+    Ok(Some(Deep { kind: c.kind, port, latency_ns: c.latency_us as u64 * 1000, bm_check: c3, mwait: None }))
 }
 
 /// The PM1 status ports, if every one the FADT names may be read and written (BM_STS is write-1-to-clear).

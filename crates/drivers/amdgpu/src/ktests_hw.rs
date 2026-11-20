@@ -280,7 +280,7 @@ impl Rig {
         let a = GfxAddrs::from_discovery(d).ok_or("GFX addresses")?;
         let s = Started { device: 0x1900, revision: 0xd5, gfx: true, compute: true, sdma: true };
         let facts = chip::read_facts(&mut *owner, &a, &profile, GB, s, firmware)?;
-        let owner: Shared = Arc::new(SpinLock::named("gx.ktest.owner", owner));
+        let owner: Shared = Arc::new(ksync::Mutex::named("gx.ktest.owner", owner));
         let bos = Arc::new(SpinLock::named("gx.ktest.bos", bo));
         let slabs = Arc::new(SpinLock::named("gx.ktest.slabs", Vec::new()));
         let heaps = Heaps::new(carve, Arc::new(ChainIo { owner: owner.clone(), carve, slabs: slabs.clone() }), Box::new(bos.clone()));
@@ -1531,7 +1531,8 @@ pub(crate) fn check_proof(d: &Discovery) -> ktest::TestResult {
 fn stop_gate() -> ktest::TestResult {
     let s = sparse(512 * M)?;
     let slot = crate::hw::live::NodeSlot::new();
-    kassert!(slot.stop_gate() == Ok(None) && slot.minor().is_none(), "an empty slot");
+    let held = crate::hw::live::HeldJobs::new();
+    kassert!(slot.stop_gate(&held) == Ok(None) && slot.minor().is_none(), "an empty slot");
     let m = slot.register(s.gpu.clone())?;
     kassert!(slot.minor() == Some(m), "minor");
     // A second backend must not lose the first: nothing could count its files or remove it any more.
@@ -1546,13 +1547,13 @@ fn stop_gate() -> ktest::TestResult {
     let dev = drm::device::devices().into_iter().find(|d| d.render_minor() == m).ok_or("not registered")?;
     let f = open_device(dev.clone(), MinorKind::Render, false).map_err(|e| format!("open: errno {e}"))?;
     let f2 = open_device(dev.clone(), MinorKind::Render, false).map_err(|e| format!("open: errno {e}"))?;
-    let why = slot.stop_gate().err().ok_or("stop with open files")?;
+    let why = slot.stop_gate(&held).err().ok_or("stop with open files")?;
     kassert!(why.contains("2 open files"), "{why}");
     kassert!(slot.minor() == Some(m), "the node went on a refusal");
     drop(f);
-    kassert!(slot.stop_gate().err().is_some_and(|w| w.contains("1 open files")), "one file open");
+    kassert!(slot.stop_gate(&held).err().is_some_and(|w| w.contains("1 open files")), "one file open");
     drop(f2);
-    kassert!(slot.stop_gate().is_ok_and(|n| n.is_some()), "no file open");
+    kassert!(slot.stop_gate(&held).is_ok_and(|n| n.is_some()), "no file open");
     kassert!(slot.minor().is_none() && !drm::device::devices().iter().any(|d| Arc::ptr_eq(d, &dev)), "the node stayed");
     kassert!(open_device(dev, MinorKind::Render, false).is_err(), "an open after the stop");
     Ok(())

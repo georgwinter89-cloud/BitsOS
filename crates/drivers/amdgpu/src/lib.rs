@@ -2,8 +2,8 @@
 //! the MMIO owner (`dcn::DcnRegs`); GX-D2: IP blocks by version (`ip`); the display engine is the `dcn` part:
 //! the read-only attach (`attach`, V1 gates 1-8), the KMS view (`kms`, GX-D5), the snapshot and its MCP tools
 //! (`snapshot`, `tools`); GX-D3: buffer objects over the carve-out (`bo`); GX-3: page flips (`flip` register
-//! sequences, `scanout` state, `live` kernel glue and gopfb's fbdev engine). Design notes for GX-D3..D6 and D9:
-//! plan/notes/gx-GX-2.md. GX-6/GX-6m (render side): the common core (`gpucore`: discovery, firmware names), one
+//! sequences, `scanout` state, `live` kernel glue and gopfb's fbdev engine). Design: V2-PLAN.md §8a.7
+//! (GX-D1..D9), plan/spec/gpu.md §11. GX-6/GX-6m (render side): the common core (`gpucore`: discovery, firmware names), one
 //! module per IP block and version chosen from the discovery table (`ipmod`), the read-only probe (`probe`,
 //! `tools_gx`). GX-7a: the PSP bring-up against a fake (`gpucore::psp`, `ucode`, `fwload`, `pspfake`,
 //! `ipmod::psp13`). GX-7b: the bring-up register owner and the start-state classifier (`gpucore::bringup`,
@@ -13,8 +13,8 @@
 //! pspbringup` the run, `psplive` the live device, bus master and Quiesce, MCP `gx_bringup`; `ktests_bringup`).
 //! GX-7h: the GART and VMID 0 on both hubs (`gpucore::{gmc, carvetable, hubfake}`, `gx_bringup {"until":"gart"}`;
 //! `ktests_gmc`). GX-8a: the memory half of the hardware backend behind `drm::GpuDevice` (`hw`, `gx_bringup
-//! {"until":"backend"}`; `ktests_hw`). GX-8b: its job half (`hw::jobs`, `ktests_hw_jobs`). GX-8c: the same at boot,
-//! CONFIG `gpu=on` (`hw::boot`, `ktests_hw_boot`).
+//! {"until":"backend"}`; `ktests_hw`). GX-8b: its job half (`hw::jobs`, `ktests_hw_jobs`). GX-8c: the same at every boot
+//! (`hw::boot`, `ktests_hw_boot`).
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -27,6 +27,7 @@ pub mod bo;
 pub mod carve;
 pub mod cursor;
 pub mod dcn;
+pub mod devs;
 pub mod edid_modes;
 pub mod flip;
 pub mod flip_test;
@@ -46,6 +47,7 @@ pub mod mode;
 pub mod modeset;
 pub mod probe;
 pub mod psplive;
+pub mod rdna4;
 pub mod switch;
 pub mod refusal;
 pub mod scanout;
@@ -58,6 +60,7 @@ pub mod tools_gx;
 
 mod ktests;
 mod ktests_bringup;
+pub(crate) mod ktests_devs;
 pub(crate) mod ktests_dpm;
 pub(crate) mod ktests_dpm_edges;
 mod ktests_fakes;
@@ -69,13 +72,27 @@ mod ktests_hw_ih;
 mod ktests_hw_jobs;
 mod ktests_hw_ladder;
 mod ktests_hw_lost;
+mod ktests_hw_queue;
 mod ktests_hw_reset;
 mod ktests_psp;
+mod ktests_rdna4;
+mod ktests_rdna4cp;
+mod ktests_rdna4gc;
+mod ktests_rdna4mess;
+mod ktests_rdna4nb;
+pub(crate) mod ktests_rdna4pmfw;
+mod ktests_rdna4mes;
+pub(crate) mod ktests_rdna4ring;
+pub(crate) mod ktests_rdna4sdma;
+mod ktests_rdna4thermal;
+pub(crate) mod ktests_rdna4w43;
 mod ktests_gfxring;
 mod ktests_mes;
 mod ktests_sdma;
 mod ktests_reinit;
 mod ktests_vm;
+pub(crate) mod ktests_vcn;
+pub(crate) mod ktests_vcn_jobs;
 
 #[cfg(test)]
 mod tests;

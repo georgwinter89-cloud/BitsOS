@@ -176,7 +176,7 @@ const WRITABLE_BURST: u64 = 192;
 
 /// `snap.load`'s deletes without its 100 takes on /data: ext4 on a private pool in RAM, an fsync writer through a burst
 /// of deletes. Red when a write fails or the volume went read-only after it. No count of deletes behind: the RAM device
-/// never sleeps, so that count is the writer's share of the CPU (see plan/notes/vs-VS-H.md); `delete_yields` has a
+/// never sleeps, so that count is the writer's share of the CPU; `delete_yields` has a
 /// sleeping flush and `load` a real one for that.
 fn delete_writable() -> TestResult {
     super::with_private_mib(128, |ns, t| {

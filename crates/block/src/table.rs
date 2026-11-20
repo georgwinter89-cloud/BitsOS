@@ -2,12 +2,12 @@
 //! Partition, and where do its partitions start (the boot-stick match compares their first bytes)?
 //!
 //! Stricter than Linux on purpose (a doubt refuses writes, it never allows them):
-//! - MBR (linux-6.6/block/partitions/msdos.c:610-650): signature 55AAh; a boot indicator other than 0/80h
-//!   means "a file system's boot sector, no table" (msdos.c:623-639). Types 07h (NTFS/exFAT), 17h (hidden
+//! - MBR (linux-7.3.1/block/partitions/msdos.c:589-660): signature 55AAh; a boot indicator other than 0/80h
+//!   means "a file system's boot sector, no table" (msdos.c:596-618). Types 07h (NTFS/exFAT), 17h (hidden
 //!   NTFS), 27h (Windows RE), 42h (dynamic disk), 86h/87h (NT volume sets) = Windows, EFh = EFI, EEh = GPT
 //!   follows, 05h/0Fh/85h = extended: the EBR chain is walked (at most `EBR_HOPS` links, as msdos.c:148's
 //!   `loopct > 100`; a bound against a hostile disk, not a count of things).
-//! - GPT (linux-6.6/block/partitions/efi.c:335-433 `is_gpt_valid`, :581-640 `find_valid_gpt`): header
+//! - GPT (linux-7.3.1/block/partitions/efi.c:334-450 `is_gpt_valid`, :580-666 `find_valid_gpt`): header
 //!   "EFI PART", header size 92..=block size, header CRC, my_lba, entry size a multiple of 128, entry-array CRC;
 //!   the backup header (alternate_lba, else the last block) when the primary is bad. Unlike Linux the GPT is
 //!   looked for even without a protective MBR (an "EFI PART" at LBA 1 is enough), and a GPT that is announced

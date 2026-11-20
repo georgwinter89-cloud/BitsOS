@@ -37,13 +37,28 @@ fn sys_mmap(c: &mut SysCtx<'_>) -> i64 {
             None => {}
         }
         let r = c.proc.mm.sys_mmap_file(addr, len, prot, flags, off, &mut |len| vfs::mmap::check(&f, prot, flags, off >> 12, len));
+        if let Ok(a) = r {
+            perf_mmapped(c, a, len, prot);
+        }
         return r.map(|a| a as i64).unwrap_or_else(|e| -e);
     }
-    c.proc.mm.sys_mmap(addr, len, prot, flags, off).map(|a| a as i64).unwrap_or_else(|e| -e.code())
+    let r = c.proc.mm.sys_mmap(addr, len, prot, flags, off);
+    if let Ok(a) = r {
+        perf_mmapped(c, a, len, prot);
+    }
+    r.map(|a| a as i64).unwrap_or_else(|e| -e.code())
 }
 crate::syscall!(MMAP, sys_mmap);
 
-/// FS-5: msync with linux-6.6/mm/msync.c's rules (MM's `sys_msync`; the write-back is the file's).
+/// SELFOPT-1: `perf_event_mmap` for a new executable mapping (the profiler's MMAP2 record); one load otherwise.
+fn perf_mmapped(c: &SysCtx<'_>, addr: u64, len: u64, prot: u64) {
+    const PROT_EXEC: u64 = 4;
+    if prot & PROT_EXEC != 0 {
+        crate::perf::mmapped(c.proc, c.thread.tid(), addr, len);
+    }
+}
+
+/// FS-5: msync with the rules of linux-7.3.1/mm/msync.c:33 (MM's `sys_msync`; the write-back is the file's).
 fn sys_msync(c: &mut SysCtx<'_>) -> i64 {
     c.proc.mm.sys_msync(c.args[0], c.args[1], c.args[2] as u32 as u64).map(|_| 0).unwrap_or_else(|e| -e)
 }
@@ -62,7 +77,7 @@ crate::syscall!(MPROTECT, sys_mprotect);
 // Protection keys as Linux 6.6 answers without OSPKE (V2 never turns PKU on): arch_max_pkey() is 1 and no key is
 // allocated, not even 0 (arch/x86/include/asm/pkeys.h:10, :81-97; the allocation map is only set up with OSPKE).
 
-/// `do_mprotect_pkey` (linux-6.6/mm/mprotect.c:690-731): pkey -1 is mprotect; any other key fails the
+/// `do_mprotect_pkey` (linux-7.3.1/mm/mprotect.c:871-911): pkey -1 is mprotect; any other key fails the
 /// "allocated" check with EINVAL, after the argument checks that come before it.
 fn sys_pkey_mprotect(c: &mut SysCtx<'_>) -> i64 {
     const PROT_GROWSDOWN: u64 = 0x0100_0000;
@@ -107,7 +122,7 @@ fn sys_pkey_free(_c: &mut SysCtx<'_>) -> i64 {
 }
 crate::syscall!(PKEY_FREE, sys_pkey_free);
 
-/// GM-2a CR 4: RLIMIT_MEMLOCK and CAP_IPC_LOCK of the caller (linux-6.6/mm/mlock.c `can_do_mlock`).
+/// GM-2a CR 4: RLIMIT_MEMLOCK and CAP_IPC_LOCK of the caller (linux-7.3.1/mm/mlock.c:40 `can_do_mlock`).
 fn lock_limit(c: &SysCtx<'_>) -> mm::LockLimit {
     let bytes = c.proc.limits.get(uapi::ab::rlimit::RLIMIT_MEMLOCK).map_or(u64::MAX, |l| l.cur);
     mm::LockLimit { bytes, capable: c.proc.capable(proc::cred::Cap::IpcLock) }
@@ -160,7 +175,8 @@ crate::syscall!(MINCORE, sys_mincore);
 const ARCH_GET_CPUID: u64 = 0x1011;
 const ARCH_SET_CPUID: u64 = 0x1012;
 
-/// arch_prctl (linux-6.6/arch/x86/kernel/process_64.c `do_arch_prctl_64` + process.c `do_arch_prctl_common`).
+/// arch_prctl (linux-6.6/arch/x86/kernel/process_64.c `do_arch_prctl_64` + process.c `do_arch_prctl_common`)
+/// (Linux 7.3.1 differs: linux-7.3.1/arch/x86/kernel/process.c:1064, see plan/spec/linux7-differences.md).
 fn sys_arch_prctl(c: &mut SysCtx<'_>) -> i64 {
     use uapi::arch_prctl::*;
     let option = c.args[0] as u32 as u64;

@@ -50,13 +50,19 @@ pub fn run() -> R<Infallible> {
             Vec::new()
         }
     };
-    let (config, safe) = choose_profile(&file);
-    // RB-18: CONFIG.TXT holds secrets and this RAM is free once the kernel runs.
-    file.zeroize();
-    let hook = if cpu::hypervisor() { config::test_hook(&config) } else { TestHook::None };
+    // Test hooks are read from the stick's own file, and only under a hypervisor.
+    let hook = if cpu::hypervisor() { config::test_hook(&file) } else { TestHook::None };
     if hook != TestHook::None {
         warn!("test hook {}: {hook:?} (honoured only under a hypervisor)", config::TEST_KEY);
     }
+    let Chosen { config, safe, tiers } = if hook == TestHook::OldLoader {
+        warn!("bitsboot profile.skipped: test hook old_loader, no profile is chosen and the file goes to the kernel as it is");
+        Chosen { config: file.clone(), safe: false, tiers: profile::Tiers::SAFE }
+    } else {
+        choose_profile(&file)
+    };
+    // RB-18: CONFIG.TXT holds secrets and this RAM is free once the kernel runs.
+    file.zeroize();
 
     let gens_found = generation::scan(&mut root)?;
     let pin = generation::read_pin(&mut root);
@@ -64,13 +70,20 @@ pub fn run() -> R<Infallible> {
     // inside load_generation; after it only the stick probe, the screen and the hand-over remain).
     let fw = load_fw(&mut root)?;
     let flood = !safe && after_sync_flood();
-    let (generation, kernel, segments, initrd) = load_generation(&mut root, &gens_found, pin, safe, flood)?;
+    // GP-GUARD: with gp_stick=on the Gaming-PC's stick follows the normal marker rule (a new generation gets its
+    // one try and its fallback, as on the Mini-PC); without it safe mode writes nothing.
+    let read_only = safe && tiers.markers_read_only();
+    // GP-GUARD: under the profile only a kernel that knows the disk guard is started.
+    let rules = Rules { read_only, flood, guard: safe };
+    let (generation, kernel, segments, initrd) = load_generation(&mut root, &gens_found, pin, rules)?;
     let mut modules = alloc::vec![initrd];
     modules.extend(fw);
     let mut stick = stick::probe(device, &mut root);
     stick::log(&stick, volume);
-    if safe {
+    if safe && tiers.stick_id_withheld() {
         stick::withhold_id(&mut stick);
+    } else if safe {
+        stick::log_id_handed(&stick);
     }
     drop(root);
 
@@ -82,9 +95,16 @@ pub fn run() -> R<Infallible> {
     handover::hand_over(Loaded { cpu, generation, kernel, segments, modules, config, stick, screen, edid, hook })
 }
 
-/// The boot profile (BT-5): logs the machine and the choice; returns the CONFIG text for the kernel (the file
-/// itself in the normal profile) and whether this is safe mode.
-fn choose_profile(file: &[u8]) -> (Vec<u8>, bool) {
+/// What [`choose_profile`] decided: the CONFIG text for the kernel (the file itself in the normal profile),
+/// whether this is safe mode, and what the stick's tier lines release there.
+struct Chosen {
+    config: Vec<u8>,
+    safe: bool,
+    tiers: profile::Tiers,
+}
+
+/// The boot profile (BT-5, GP-GUARD): logs the machine, the choice and the tiers.
+fn choose_profile(file: &[u8]) -> Chosen {
     let cpu = machine::cpu();
     machine::log_cpu(&cpu);
     let dmi = machine::dmi();
@@ -96,12 +116,32 @@ fn choose_profile(file: &[u8]) -> (Vec<u8>, bool) {
     if d.profile.safe() {
         // Another colour on the screen: Georg should see at once that this boot is the safe one.
         warn!("bitsboot {line}");
-        warn!("bitsboot safe mode: no network driver, no writes to the stick, NVMe, USB disks or WLAN, the firmware's picture");
-        if d.reason == profile::Reason::Cpuid {
-            // Not the Gaming-PC's DMI names: any Intel machine on bare metal lands here, so say how to leave.
-            warn!("bitsboot profile.intel_fallback: no Gaming-PC DMI names; an Intel CPU on bare metal is taken for the Gaming-PC");
+        let t = d.tiers;
+        warn!("bitsboot profile.tiers net={} stick={} nvme={}", if t.net { "on" } else { "off" }, if t.stick { "on" } else { "off" }, if t.nvme { "on" } else { "off" });
+        if t.nvme {
+            // GP-DISK: the line as the stick has it; the kernel compares place and ids with its PCI scan.
+            let named = gp_platform::disk_rule::named::named(config::get(file, gp_platform::tiers::NVME_KEY)).map(|n| n.render()).unwrap_or_default();
+            warn!("bitsboot safe mode: only the NVMe controller gp_nvme={named} may get a driver, with the Mini-PC's rules for it; no other internal disk, no writes to other USB disks, no WLAN, the firmware's picture");
+        } else {
+            warn!("bitsboot safe mode: no driver for the internal disks (NVMe, SATA), no writes to other USB disks, no WLAN, the firmware's picture");
         }
-        warn!("bitsboot safe mode ends with the line profile=normal in \\BITSOS2\\CONFIG.TXT");
+        warn!(
+            "bitsboot safe mode: network {}; boot stick {}",
+            if t.net { "drivers for the cable allowed (gp_net=on)" } else { "off (gp_net=on in CONFIG.TXT allows the cable)" },
+            if t.stick { "writable below \\BITSOS2 (gp_stick=on)" } else { "read-only (gp_stick=on in CONFIG.TXT makes it writable)" }
+        );
+        if d.normal_refused {
+            warn!("bitsboot profile.normal_refused: CONFIG profile=normal is not honoured on this machine: its internal disks stay without a driver");
+        }
+        match d.reason {
+            profile::Reason::Dmi => warn!("bitsboot safe mode cannot be ended on this board; only gp_net=on, gp_stick=on and gp_nvme= release something"),
+            profile::Reason::Cpuid => {
+                // Not the Gaming-PC's DMI names: any Intel machine on bare metal lands here, so say how to leave.
+                warn!("bitsboot profile.intel_fallback: no Gaming-PC DMI names; an Intel CPU on bare metal is taken for the Gaming-PC");
+                warn!("bitsboot safe mode ends with the line profile=normal in \\BITSOS2\\CONFIG.TXT when the DMI names of another machine can be read");
+            }
+            _ => warn!("bitsboot safe mode ends when the line profile=gaming-pc leaves \\BITSOS2\\CONFIG.TXT"),
+        }
     } else {
         info!("bitsboot {line}");
     }
@@ -109,7 +149,7 @@ fn choose_profile(file: &[u8]) -> (Vec<u8>, bool) {
     if config.len() != file.len() {
         info!("CONFIG for the kernel: {} bytes ({} from bitsboot's profile)", config.len(), config.len() - file.len());
     }
-    (config, d.profile.safe())
+    Chosen { config, safe: d.profile.safe(), tiers: d.tiers }
 }
 
 /// RB-14 CR-3: whether the FCH says the last start ended in a sync flood (read only; logged either way).
@@ -130,18 +170,30 @@ fn after_sync_flood() -> bool {
     }
 }
 
-type Chosen = (bootinfo::Generation, elf::Loaded, Vec<bitsboot_pure::elf::Segment>, ModuleFile);
+type Started = (bootinfo::Generation, elf::Loaded, Vec<bitsboot_pure::elf::Segment>, ModuleFile);
+
+/// How a generation is chosen and checked in this boot.
+#[derive(Clone, Copy)]
+struct Rules {
+    /// Safe mode without `gp_stick=on`: `gens::choose_read_only`, no marker is ever written.
+    read_only: bool,
+    /// A start after a sync flood (RB-14 CR-3): `gens::choose_after_flood`, a new generation keeps its one try.
+    flood: bool,
+    /// GP-GUARD: the profile keeps the internal disks without a driver, and only the kernel can hold that up. A
+    /// KERNEL without the guard's mark (built before `nvme_bind`) would bind the NVMe driver, so it counts as a bad
+    /// file: the rule goes on to the next generation, and with none left bitsboot stops and says so.
+    guard: bool,
+}
 
 /// The marker rule (`bitsboot_pure::gens::choose`, V2-PLAN §7): load what it picks; a generation whose files
 /// fail the checks, or whose TRY cannot be written, goes back to the rule, which then picks the next one.
-/// Safe mode (`safe`) chooses by `gens::choose_read_only`: no marker is ever written. A start after a sync flood
-/// (`flood`, RB-14 CR-3) chooses by `gens::choose_after_flood`: a new generation keeps its one try.
-fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens::Pin, safe: bool, flood: bool) -> R<Chosen> {
+/// `rules` says which form of the rule applies and whether a kernel must carry the disk guard's mark.
+fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens::Pin, rules: Rules) -> R<Started> {
     let (mut bad, mut mark_failed, mut problems) = (Vec::new(), Vec::new(), Vec::<String>::new());
     loop {
-        let choice = if safe {
+        let choice = if rules.read_only {
             gens::choose_read_only(gens_found, pin, &bad)
-        } else if flood {
+        } else if rules.flood {
             gens::choose_after_flood(gens_found, pin, &bad, &mark_failed)
         } else {
             gens::choose(gens_found, pin, &bad, &mark_failed)
@@ -154,7 +206,7 @@ fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens:
             }
         };
         let number = record.number;
-        let (kernel, segments, initrd) = match load_files(root, number) {
+        let (kernel, segments, initrd) = match load_files(root, number, rules.guard) {
             Ok(f) => f,
             Err(p) => {
                 warn!("bitsboot generation.bad_files number={number}: {p}");
@@ -188,8 +240,9 @@ fn load_generation(root: &mut Directory, gens_found: &[gens::GenDir], pin: gens:
 }
 
 /// A generation's KERNEL (ELF checks, placed in `BITS_KERNEL` pages) and INITRD (cpio header, `BITS_MODULE`
-/// pages). `Err` names the file and its problem; nothing stays allocated then.
-fn load_files(root: &mut Directory, number: u32) -> Result<(elf::Loaded, Vec<bitsboot_pure::elf::Segment>, ModuleFile), String> {
+/// pages). `Err` names the file and its problem; nothing stays allocated then. `guard`: the KERNEL must carry the
+/// disk guard's mark in a loaded segment (`gp_platform::disk_rule::marker`).
+fn load_files(root: &mut Directory, number: u32, guard: bool) -> Result<(elf::Loaded, Vec<bitsboot_pure::elf::Segment>, ModuleFile), String> {
     let kpath = generation::path(number, "KERNEL");
     let file = match files::read(root, &kpath) {
         Ok(Some(f)) => f,
@@ -200,6 +253,10 @@ fn load_files(root: &mut Directory, number: u32) -> Result<(elf::Loaded, Vec<bit
         warn!("{kpath} ({} bytes) is not a valid BitsOS kernel: {why}", file.len());
         format!("{kpath}: {why}")
     })?;
+    if guard && !profile::kernel_guarded(&file, &parsed.segs) {
+        warn!("bitsboot generation.unguarded number={number}: {kpath} is older than the disk guard; on this machine it would give the internal disks a driver");
+        return Err(format!("{kpath}: {}", profile::UNGUARDED));
+    }
     let ipath = generation::path(number, "INITRD");
     let (iphys, isize) = match files::read_to_pages(root, &ipath, memtype::BITS_MODULE) {
         Ok(Some(p)) => p,

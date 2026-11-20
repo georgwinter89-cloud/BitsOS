@@ -1,8 +1,8 @@
 //! GX-8a: a client VM on the chip (`drm::gpu::GpuVm`, Linux `amdgpu_vm`): real GFX 11 page tables in the carve-out,
 //! built by GR-1's core (`amdgpu_fmt::vm`) and written by the CPU, uncached, one store per entry (the path the chip
 //! ran under `until=vm`; Linux's `amdgpu_vm_cpu.c`, not SDMA). PTE flags as gmc_v11_0.c:521 `gmc_v11_0_get_vm_pte`
-//! and amdgpu_ttm.c:1084 set them: MTYPE from the VA flags (default NC; the UC of COHERENT/UNCACHED objects,
-//! gmc_v11_0.c:544, does not arise: GEM_CREATE refuses those flags, only KFD sets them), SYSTEM and SNOOPED by where
+//! and amdgpu_ttm.c:1084 set them: MTYPE from the VA flags (default NC; COHERENT/UNCACHED objects come as UC from
+//! `drm::vm`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c:509), SYSTEM and SNOOPED by where
 //! the memory is, read/write/execute from the VA flags, PRT without VALID.
 //!
 //! A job takes a VMID with `begin_job` (Linux amdgpu_ids.c:397 `amdgpu_vmid_grab`): the slot this VM still owns with
@@ -195,6 +195,13 @@ pub struct VmJob {
 }
 
 impl VmJob {
+    /// GX-8v: a VCN job flushes its VMID on MMHUB in its own frame and never on GFXHUB, while the manager wrote the
+    /// grant's flush down as done (GFXHUB's record): the VM's slots forget it, so its next GFX, compute or SDMA job
+    /// flushes GFXHUB again.
+    pub fn forget_gfxhub_flush(&self) {
+        self.vm.ids.mgr.lock().mgr.forget(self.vm.owner);
+    }
+
     /// The job never reached a ring (ring full, a refused submit). `grab` wrote its flush down as done when it handed
     /// it out; one that never ran must not count, or the next job of this VM runs on stale TLB entries, translations
     /// of freed memory among them. The VM's slots forget it, so its next job flushes (`VmidMgr::forget`; a whole VM
@@ -582,7 +589,7 @@ impl GpuVm for HwVm {
 impl Drop for HwVm {
     /// `amdgpu_vm_fini`: no job holds the VM any more (each holds an `Arc`). Waiters for a deferred update must not
     /// hang, and must not hear that it ran: its fence ends with ESRCH, as an entity's killed jobs do
-    /// (linux-6.6/drivers/gpu/drm/scheduler/sched_entity.c:168). The tables go, so nothing is reachable.
+    /// (linux-7.3.1/drivers/gpu/drm/scheduler/sched_entity.c:278). The tables go, so nothing is reachable.
     fn drop(&mut self) {
         let g = self.st.get_mut();
         let deferred = core::mem::take(&mut g.deferred);

@@ -82,6 +82,19 @@ fn counts_per_cpu() -> TestResult {
     Ok(())
 }
 
+ktest!("ab.syscall.counts_at_init", Safe, counts_at_init);
+/// ATOMIC-2: every CPU the firmware lists has its array since kernel init, so no syscall makes one (the first
+/// call on a CPU used to, two pages with interrupts off inside `PerCpu`). Having the arrays now proves little:
+/// earlier tests ran programs on every CPU, and a first syscall would have made a missing one. So the syscalls
+/// that had to are counted.
+fn counts_at_init() -> TestResult {
+    let (have, cpus) = (crate::counts::cpus_with_arrays(), hal::percpu::possible_cpus());
+    kassert!(have == cpus, "{have} of {cpus} CPUs have their syscall counters");
+    let late = crate::counts::late_installs();
+    kassert!(late == 0, "{late} syscall(s) had to make the counters of a CPU the firmware lists: init did not cover it");
+    Ok(())
+}
+
 ktest!("ab.syscall.counts_past_table", QemuOnly, counts_past_table);
 /// Numbers past the table (its first free number and one from 4096 on) answer ENOSYS without touching any
 /// registered number's counters: only the program's exit_group is counted.

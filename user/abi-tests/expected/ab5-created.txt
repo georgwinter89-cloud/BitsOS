@@ -1,0 +1,6 @@
+F_CREATED_QUERY after O_CREAT|O_EXCL made it = 1
+F_CREATED_QUERY after O_CREAT found it = 0
+F_CREATED_QUERY on a dup of the creating open = 1
+F_CREATED_QUERY on an O_PATH fd = 0
+F_CREATED_QUERY(999) = -EBADF
+ab5 created: done

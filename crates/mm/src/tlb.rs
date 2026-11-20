@@ -54,7 +54,10 @@ klog::counter!(IPIS_DEVICE, "mm.tlb.ipis.device");
 klog::counter!(IPIS_EXIT, "mm.tlb.ipis.exit");
 klog::counter!(IPIS_VMAP, "mm.tlb.ipis.vmap");
 klog::counter!(IPIS_KERNEL, "mm.tlb.ipis.kernel");
+klog::counter!(IPIS_MIGRATE, "mm.tlb.ipis.migrate");
 klog::counter!(IPIS_OTHER, "mm.tlb.ipis.other");
+// MEMCRASH: gather batch pages refused (the unmap flushed early instead of growing its list through the heap).
+klog::counter!(GATHER_NOBATCH, "mm.tlb.gather_nobatch");
 static IPIS_BY: [&klog::metrics::Counter; tlb::CAUSES] = [
     &IPIS_MUNMAP,
     &IPIS_MAP_FIXED,
@@ -69,6 +72,7 @@ static IPIS_BY: [&klog::metrics::Counter; tlb::CAUSES] = [
     &IPIS_EXIT,
     &IPIS_VMAP,
     &IPIS_KERNEL,
+    &IPIS_MIGRATE,
     &IPIS_OTHER,
 ];
 
@@ -119,6 +123,7 @@ pub(crate) fn report() {
     RESENDS.add(now.resends.saturating_sub(before.resends));
     IPIS.add(now.ipis.saturating_sub(before.ipis));
     IRQS.add(now.irqs.saturating_sub(before.irqs));
+    GATHER_NOBATCH.add(now.gather_nobatch.saturating_sub(before.gather_nobatch));
     for (i, c) in IPIS_BY.iter().enumerate() {
         c.add(now.by_cause[i].ipis.saturating_sub(before.by_cause[i].ipis));
     }
@@ -215,7 +220,7 @@ pub(crate) fn causes_event(s: &TlbStats) {
     use tlb::Cause as C;
     klog::event!(Info, "mm", "tlb.causes", munmap = f(C::Munmap), map_fixed = f(C::MapFixed), mremap = f(C::Mremap), mprotect = f(C::Mprotect),
         madvise = f(C::Madvise), cow = f(C::Cow), fault = f(C::Fault), reclaim = f(C::Reclaim), fork = f(C::Fork), device = f(C::Device),
-        exit = f(C::Exit), vmap = f(C::Vmap), kernel = f(C::Kernel), other = f(C::Other);
+        exit = f(C::Exit), vmap = f(C::Vmap), kernel = f(C::Kernel), migrate = f(C::Migrate), other = f(C::Other);
         "TLB shootdowns by cause since boot: flushes/rounds/ipis/tables");
 }
 

@@ -19,23 +19,6 @@ pub enum Motion {
     Off,
 }
 
-/// theme.effects: the level the user chose. `Gpu` is drawn where a renderer has shaders and a GPU (WY-19, `fx`:
-/// `effects_gpu`); elsewhere (the rescue build, Pixman, a software rasteriser) it is drawn like `Cheap`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Effects {
-    Cheap,
-    Gpu,
-}
-
-impl Effects {
-    pub fn word(self) -> &'static str {
-        match self {
-            Effects::Cheap => "cheap",
-            Effects::Gpu => "gpu",
-        }
-    }
-}
-
 /// What `theme.layout.*` switches on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
@@ -72,7 +55,7 @@ impl Preset {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub dark: bool,
-    /// Colours (premultiplied, what pixman blends with). Names as in the mock-up.
+    /// Colours (premultiplied, as the images and the renderer blend them). Names as in the mock-up.
     pub bg: Rgba,
     pub panel: Rgba,
     pub panel2: Rgba,
@@ -82,7 +65,7 @@ pub struct Theme {
     pub text: Rgba,
     pub muted: Rgba,
     pub accent: Rgba,
-    /// The accent at glow strength (14-18 %) and half of it: the cheap level's glow lines.
+    /// The accent at glow strength (14-18 %) and half of it: the glow lines in the images.
     pub glow: Rgba,
     pub glow_soft: Rgba,
     /// The accent behind selected things (workspace, suggestion, hovered menu item).
@@ -113,12 +96,7 @@ pub struct Theme {
     pub board: f64,
     /// The typeface of each family (theme.font.display/ui/mono; an unknown name keeps the design's).
     pub fonts: Families,
-    /// The chosen effect level (theme.effects).
-    pub effects: Effects,
-    /// Whether the GPU level is drawn: the renderer's to say, frame by frame (`App::fx_follow`); never from `build`.
-    pub effects_gpu: bool,
-    /// theme.scanlines: the design's scanlines (dark mode): baked into bitscomp's own ground at the cheap level, over
-    /// the ground at the GPU level (`fx::plan::ground`).
+    /// theme.scanlines: the design's scanlines (dark mode), drawn over the ground (`fx::plan::ground`).
     pub scanlines: bool,
     pub motion: Motion,
     pub layout: Layout,
@@ -213,7 +191,7 @@ impl Theme {
         let text = |k: &str, d: &str| v.text(k).unwrap_or(d).to_string();
         let int = |k: &str, d: i64, lo: i64, hi: i64| v.int(k).unwrap_or(d).clamp(lo, hi);
         let flag = |k: &str, d: bool| v.flag(k).unwrap_or(d);
-        let dark = text("theme.mode", "dark") != "light";
+        let dark = crate::theme_auto::dark_now(v);
         let (pal, mode) = if dark { (&DARK, "dark") } else { (&LIGHT, "light") };
         let col = |name: &str, d: &str| {
             v.text(&format!("theme.{mode}.{name}")).and_then(hex).unwrap_or_else(|| hex(d).unwrap())
@@ -291,8 +269,6 @@ impl Theme {
                 ui: family("theme.font.ui", design.ui),
                 mono: family("theme.font.mono", design.mono),
             },
-            effects: if text("theme.effects", "cheap") == "gpu" { Effects::Gpu } else { Effects::Cheap },
-            effects_gpu: false,
             scanlines: flag("theme.scanlines", true),
             motion: match text("theme.motion", "medium").as_str() {
                 "off" => Motion::Off,

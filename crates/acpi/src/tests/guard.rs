@@ -2,7 +2,7 @@
 
 #[allow(unused_imports)]
 use alloc::{string::String, vec, vec::Vec};
-use crate::guard::{bar_range, BarRange, Guard, PciFn, PciSnapshot, PciUnreadable, PciView, Refusal, BAR_GUESS_MAX};
+use crate::guard::{bar_range, bar_range_until, BarRange, FIXED_RANGE, Guard, PciFn, PciSnapshot, PciUnreadable, PciView, Refusal, BAR_GUESS_MAX};
 use crate::mcfg::Ecam;
 use crate::memmap::{MemMap, Region};
 use crate::sdt::{Gas, Space};
@@ -141,6 +141,51 @@ fn bar_sizes_from_alignment() {
     assert_eq!(bar_range(Space::Memory, 0), None);
     assert_eq!(bar_range(Space::Memory, 1 << 63).map(|b| b.end), Some((1 << 63) + BAR_GUESS_MAX), "capped");
     assert_eq!(bar_range(Space::Memory, 0xFFFF_FFFF_FF00_0000).map(|b| b.end), Some(u64::MAX), "no overflow");
+}
+
+/// GP-GUARD CR10, with the Gaming-PC's BAR values (read from the Gaming-PC's sysfs):
+/// VMD's 32 MiB BAR is whole, the NVMe guesses end before the SPI controller and the network card.
+#[test]
+fn the_first_scan_cuts_at_the_next_bar_on_the_gaming_pc() {
+    // 01:00.0, 86:00.0, 81:00.0 (NVMe), VMD 00:0e.0's two BARs, SPI 00:1f.5, RTL8126 83:00.0, WLAN 85:00.0.
+    let known = [0x8d20_0000, 0xb800_0000, 0xb850_0000, 0xb4_3000_0000, 0xb4_3200_0000, 0x8d30_0000, 0xb830_0000, 0xb831_0000, 0xb860_0000];
+    let end = |a: u64| bar_range_until(Space::Memory, a, &known).map(|b| b.end);
+    assert_eq!(end(0xb4_3000_0000), Some(0xb4_3200_0000), "VMD's 32 MiB BAR whole (the old guess stopped at 16 MiB)");
+    assert_eq!(end(0x8d20_0000), Some(0x8d30_0000), "01:00.0 stops before the SPI controller");
+    assert_eq!(end(0xb800_0000), Some(0xb830_0000), "86:00.0 stops before the network card");
+    assert_eq!(end(0xb850_0000), Some(0xb860_0000), "81:00.0 stops before the WLAN card");
+    for a in known {
+        let r = bar_range_until(Space::Memory, a, &known).unwrap();
+        assert!(r.end > r.start && known.iter().all(|&k| k <= r.start || k >= r.end), "{a:#x}: {r:?} covers another BAR");
+    }
+    // Nothing after it: the alignment, but never into the chipset's fixed range.
+    assert_eq!(bar_range_until(Space::Memory, 0xC000_0000, &[]).map(|b| b.end), Some(FIXED_RANGE));
+    assert_eq!(bar_range_until(Space::Memory, 0xC000_0000, &[0xC000_0000]).map(|b| b.end), Some(FIXED_RANGE), "itself is not the next");
+    assert_eq!(bar_range_until(Space::Memory, 0, &known), None);
+    assert_eq!(bar_range_until(Space::Io, 0xE000, &known), bar_range(Space::Io, 0xE000), "I/O as before");
+    assert_eq!(bar_range_until(Space::Memory, 0xFFFF_FFFF_FF00_0000, &[]).map(|b| b.end), Some(u64::MAX), "no overflow");
+    // Never smaller than the old guess where the next BAR is farther than 16 MiB away and the alignment allows.
+    let far = bar_range_until(Space::Memory, 0x80_0000_0000, &[0x90_0000_0000]).unwrap();
+    assert!(far.end - far.start >= BAR_GUESS_MAX);
+}
+
+/// Checker finding 8 (fixer of GP-ROUND): a disabled expansion ROM's leftover address inside a storage BAR does not
+/// end that BAR's guess; an enabled ROM does, as any decoding BAR.
+#[test]
+fn a_disabled_rom_inside_a_storage_bar_does_not_cut_it() {
+    use crate::kpci::{decoding, rom, Bar};
+    let nvme = Bar { space: Space::Memory, addr: 0x8d20_0000, decodes: true };
+    // A neighbour's ROM register: address 0x8d208000, enable bit clear; then the same address enabled.
+    let off = rom(0x8d20_8000);
+    assert_eq!((off.addr, off.decodes), (0x8d20_8000, false));
+    let spi = Bar { space: Space::Memory, addr: 0x8d30_0000, decodes: true };
+    let known: Vec<u64> = decoding(&[nvme, off, spi]).collect();
+    assert_eq!(known, vec![0x8d20_0000, 0x8d30_0000], "the disabled ROM is not a boundary");
+    assert_eq!(bar_range_until(Space::Memory, nvme.addr, &known).map(|b| b.end), Some(0x8d30_0000), "the NVMe's guess runs to the next decoding BAR");
+    let on = rom(0x8d20_8001);
+    assert!(on.decodes);
+    let known: Vec<u64> = decoding(&[nvme, on, spi]).collect();
+    assert_eq!(bar_range_until(Space::Memory, nvme.addr, &known).map(|b| b.end), Some(0x8d20_8000), "an enabled ROM decodes there, so the disk's BAR ends before it");
 }
 
 #[test]

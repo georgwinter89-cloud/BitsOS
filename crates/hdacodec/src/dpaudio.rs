@@ -455,7 +455,8 @@ pub const LINK_GATES: core::ops::Range<usize> = 4..10;
 /// audio ones, so a monitor is sensed before anything is written. Linux reports a pin's monitor present when a
 /// connector with an enabled stream holds its audio instance (linux-6.6/drivers/gpu/drm/amd/display/amdgpu_dm/
 /// amdgpu_dm.c:932-952, set at the stream's commit :8490-8501; patch_hdmi.c:1827-1834 takes it as
-/// `monitor_present`).
+/// `monitor_present`; Linux 7.3.1 differs: linux-7.3.1/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_audio.c:41,
+/// see plan/spec/linux7-differences.md).
 pub fn sense<R: Regs>(r: &mut R) -> Sense {
     if !present(r) || !matches!(check(r, &GATES[..2]), Ok(None)) {
         return Sense::Absent;

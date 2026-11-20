@@ -81,7 +81,7 @@ fn a_rewritten_file_has_one_size_everywhere() {
     disk_agrees(&dir, &dev, A, 50, false, false);
 
     // settingsd's way (write_atomic): a.txt.new, then rename over a.txt. The path shows the new file; the
-    // older open file keeps the replaced inode (linux-6.6/fs/namei.c vfs_rename: the victim lives on unlinked).
+    // older open file keeps the replaced inode (linux-7.3.1/fs/namei.c:6074 vfs_rename: the victim lives on unlinked).
     ns.create_file_bytes(format!("{a}.new").as_bytes(), 0o644, &pattern(120, 3)).unwrap();
     c.rename(None, format!("{a}.new").as_bytes(), None, a.as_bytes(), 0).unwrap();
     sizes_agree(&ns, A, 120);
@@ -139,7 +139,7 @@ fn a_replaced_file_written_later_leaves_the_new_size_alone() {
 fn config_rewrites_keep_one_size_and_the_view_is_shorter() {
     let token = "0123456789abcdef0123456789abcdef";
     let psk = "geheim1234";
-    let mut cfg = format!("nvme_write=off\nscreen=2560x1440\ntoken={token}\nwlan=on\nwlan_ssid=FRITZ!Box 7590 XY\nwlan_psk={psk}\nsnd_output=hdmi\n");
+    let mut cfg = format!("nvme_write=off\nscreen=2560x1440\ntoken={token}\ntz=UTC\nwlan_ssid=FRITZ!Box 7590 XY\nwlan_psk={psk}\nsnd_output=hdmi\n");
     while cfg.len() < 179 {
         cfg.push_str("#\n");
     }

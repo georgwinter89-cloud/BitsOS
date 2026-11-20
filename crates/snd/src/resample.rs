@@ -8,7 +8,7 @@
 //! is scaled to a DC gain of exactly 1 (no phase ripple) and kept as Q20 i32; the sum runs in i64 and is
 //! rounded and clamped to 16 bit. Output n uses input i = floor(n*M/L) and phase (n*M) mod L:
 //! y[n] = sum_k h[k*L + phase] * x[i - k] (times L for the zero stuffing). Delay: T/2 input frames.
-//! Measured THD+N (host tests, `cargo test -p snd -- --nocapture thd`): see plan/notes/sn-SN-3.md.
+//! Measured THD+N (host tests, `cargo test -p snd -- --nocapture thd`): see plan/spec/sound.md §5.
 
 use crate::fmath;
 use alloc::sync::Arc;

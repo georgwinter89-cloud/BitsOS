@@ -68,7 +68,8 @@ pub const OTG_V_TOTAL: u32 = r::otg0_otg_v_total::REG.byte();
 pub const OTG_H_BLANK: u32 = r::otg0_otg_h_blank_start_end::REG.byte();
 pub const OTG_V_BLANK: u32 = r::otg0_otg_v_blank_start_end::REG.byte();
 // GX-3: flips, vblank timing, CRC (linux-6.6 dc/dcn10/dcn10_optc.c:655 frame count, :692 position, :1456 CRC;
-// dc/dcn30/dcn30_optc.c:119 optc3_lock).
+// dc/dcn30/dcn30_optc.c:119 optc3_lock; Linux 7.3.1 differs: linux-7.3.1/drivers/gpu/drm/amd/display/dc/optc/
+// dcn10/dcn10_optc.c:656, see plan/spec/linux7-differences.md).
 pub const OTG_POSITION: u32 = r::otg0_otg_status_position::REG.byte();
 pub const OTG_FRAME_COUNT: u32 = r::otg0_otg_status_frame_count::REG.byte();
 pub const OTG_GLOBAL_CONTROL2: u32 = r::otg0_otg_global_control2::REG.byte();
@@ -113,7 +114,8 @@ pub const SCL_UPDATE_PENDING: u32 = r::dscl0_dscl_update::SCL_UPDATE_PENDING.mas
 pub const LUT_MEM_PWR_STATE: u32 = r::dscl0_dscl_mem_pwr_status::LUT_MEM_PWR_STATE.mask();
 /// GX-4b: the manual scaler's ratios, initial phases and taps (DPP-0 offset, bits held), in the order of
 /// linux-6.6/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c:510-560 (dpp1_dscl_set_manual_ratio_init)
-/// and :684 (SCL_TAP_CONTROL). Index 0 and 1 are the luma H and V ratios.
+/// and :684 (SCL_TAP_CONTROL) (Linux 7.3.1 differs: linux-7.3.1/drivers/gpu/drm/amd/display/dc/dpp/dcn10/
+/// dcn10_dpp_dscl.c:510, see plan/spec/linux7-differences.md). Index 0 and 1 are the luma H and V ratios.
 pub const SCL_FILTER: [(u32, u32); 11] = {
     use r::{
         dscl0_scl_horz_filter_init as hi, dscl0_scl_horz_filter_init_c as hic,
@@ -296,8 +298,10 @@ pub const WINDOW_TOP: u32 = 0x1FFF_FFFF;
 
 // GX-5a: the hardware cursor (linux-6.6 dc/dcn20/dcn20_hubp.c:589 hubp2_cursor_set_attributes, :970
 // hubp2_cursor_set_position; dc/dcn30/dcn30_dpp.c:351 dpp3_set_cursor_attributes; dc/dcn10/dcn10_dpp.c:431
-// dpp1_set_cursor_position; dc/dcn10/dcn10_mpc.c:476 mpc1_cursor_lock). The CURSOR0_n block sits in the HUBP
-// stride, CNVC_CURn in the DPP stride (tests::layout checks both against every instance).
+// dpp1_set_cursor_position; dc/dcn10/dcn10_mpc.c:476 mpc1_cursor_lock; Linux 7.3.1 differs:
+// linux-7.3.1/drivers/gpu/drm/amd/display/dc/hubp/dcn20/dcn20_hubp.c:607, see plan/spec/linux7-differences.md). The
+// CURSOR0_n block sits in the HUBP stride, CNVC_CURn in the DPP stride (tests::layout checks both against every
+// instance).
 pub const CUR_CONTROL: u32 = r::cursor0_0_cursor_control::REG.byte();
 pub const CUR_ADDR: u32 = r::cursor0_0_cursor_surface_address::REG.byte();
 pub const CUR_ADDR_HI: u32 = r::cursor0_0_cursor_surface_address_high::REG.byte();

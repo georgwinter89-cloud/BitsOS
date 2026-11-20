@@ -462,3 +462,21 @@ fn writes_on_every_queue_stay_in_both_windows() {
     let st = hw.st.lock();
     assert_eq!(st.seen_cmds.iter().filter(|s| s.op == 0x09 && s.epoch == st.enables).count(), 0);
 }
+
+/// ATOMIC-3: the page pool has room for everything it keeps from the start: `put_pages` runs under the spin lock
+/// `nvme.pool`, where the heap may not reclaim, and never grows it (6.5 KiB eleven times in a browser start).
+#[test]
+fn the_page_pool_never_grows_under_its_lock() {
+    let q: IoQueue<VecMem> = IoQueue::new(1, 6, mem(0x1000, 6 * 64), mem(0x2000, 6 * 16), Some(1), None, (0x1008, 0x100C), 130, 1000).unwrap();
+    assert!(q.pool_room() >= 130, "room for the 130 pages it keeps");
+    let room = q.pool_room();
+    let mut pages: Vec<VecMem> = (0..200).map(|i| mem(0x10_0000 + i * 0x1000, 4096)).collect();
+    q.put_pages(&mut pages);
+    assert!(pages.is_empty(), "the pages beyond the pool's keep went back");
+    assert_eq!(q.pool_len(), 130);
+    assert_eq!(q.pool_room() + q.pool_len(), room, "the pool kept its first block");
+    let p = q.take_page(&|| None).expect("a page from the pool");
+    let mut back = vec![p];
+    q.put_pages(&mut back);
+    assert_eq!(q.pool_len(), 130);
+}

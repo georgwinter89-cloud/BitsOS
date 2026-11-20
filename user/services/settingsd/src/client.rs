@@ -11,7 +11,10 @@ const USAGE: &str = "usage: settings [--socket PATH] [--json] [--source NAME] <c
   list [PREFIX]            keys with their values (* = changed)
   get KEY | describe KEY
   set KEY VALUE [--confirm]
-  reset KEY                back to the default
+  reset KEY [--confirm]    back to the default
+                           --confirm says Georg agreed. For a stored secret (a provider's key) and for
+                           taking a provider off ai.providers it counts only as root at the console;
+                           otherwise that is done on the settings page \"KI\"
   undo [N]                 revert the last N changes (default 1)
   history [N] [PREFIX]     the last N changes (default 5)
   status | watch [PREFIX] | raw JSON";
@@ -74,7 +77,10 @@ fn build(a: &[&str], source: &str, confirm: bool) -> Result<String, String> {
     let j = match a.first().copied() {
         None => return Err("no command".into()),
         Some("list") => base("list").with("prefix", arg(1).unwrap_or("")),
-        Some(op @ ("get" | "describe" | "reset")) => base(op).with("key", need(1, "a key")?),
+        Some(op @ ("get" | "describe")) => base(op).with("key", need(1, "a key")?),
+        // `reset --confirm KEY` as root is how a stored provider key is removed at the console (the key_bound
+        // message names it); from another user settingsd refuses it (`vouch.rs`).
+        Some("reset") => base("reset").with("key", need(1, "a key")?).with("confirmed", confirm),
         Some("set") => {
             base("set").with("key", need(1, "a key")?).with("value", need(2, "a value")?).with("confirmed", confirm)
         }
@@ -185,5 +191,20 @@ fn show(cmd: &str, line: &str) {
             }
         }
         _ => println!("{line}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build;
+
+    /// The key_bound message tells Georg to run `settings reset --confirm <key>`: the flag must reach settingsd
+    /// (Mini-PC 12.11.2026: it did not, and a stored provider key could not be removed from the command line).
+    #[test]
+    fn reset_passes_the_confirmation() {
+        let with = build(&["reset", "ai.provider.p.key"], "cli", true).unwrap();
+        assert!(with.contains("\"confirmed\":true"), "{with}");
+        let without = build(&["reset", "theme.scale"], "cli", false).unwrap();
+        assert!(!without.contains("\"confirmed\":true"), "{without}");
     }
 }

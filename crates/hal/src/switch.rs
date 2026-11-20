@@ -236,70 +236,66 @@ pub fn retired_count() -> u64 {
 /// What one `reap_stacks` pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackReap {
-    /// Stacks unmapped in this pass (they wait for `sync_gen`).
+    /// Stacks unmapped in this pass.
     pub unmapped: usize,
     /// Stacks freed in this pass (frames and range given back).
     pub freed: usize,
     /// Unmapped stacks still waiting for their generation.
     pub waiting: usize,
-    /// The generation the newly unmapped stacks wait for (0: none unmapped).
+    /// The generation the newly unmapped stacks wait for (0: none waits).
     pub sync_gen: u64,
 }
 
-/// One pass of the stack reaper (thread context, interrupts on or off; allocates a little): unmaps every
-/// retired stack (local `invlpg`), requests a sync generation for them, and frees every unmapped stack whose
-/// generation all CPUs have passed. The caller makes the other CPUs reach a quiescent point (sched: its
+/// One pass of the stack reaper (thread context, interrupts on or off; allocates a little): clears the pages of
+/// every retired stack, shoots them down in one confirmed round (MM-6) and gives frames and ranges back; stacks
+/// a CPU did not confirm, or outside MM's vmap check, wait for a sync generation instead and are freed by a later
+/// pass once all CPUs have passed it. The caller makes the other CPUs reach a quiescent point (sched: its
 /// reschedule IPI) and calls again. `None`: another pass runs right now.
 pub fn reap_stacks() -> Option<StackReap> {
     if REAPING.swap(true, Ordering::Acquire) {
         return None;
     }
     let mut r = StackReap::default();
-    let fresh = take_list(&RETIRED);
-    if !fresh.is_empty() {
+    let mut batch = take_list(&RETIRED);
+    if !batch.is_empty() {
         let root = stack_root();
+        r.unmapped = batch.len();
         let mut wait = alloc::vec::Vec::new();
-        for s in fresh {
-            r.unmapped += 1;
-            // MM-6: one confirmed TLB shootdown per stack (no allocation for a stack); frames come back only
-            // after every CPU answered, so slot and frames are free at once.
-            let len = s.frames.len() as u64 * 4096;
-            let mut back = 0u64;
-            let n = paging::unmap_kernel_pages(root, s.bounds.bottom, len, &mut |f| {
-                (s.free_frame)(f);
-                back += 1;
-            });
-            if n > 0 || len == 0 {
-                if back == n {
-                    (s.release)(s.bounds.guard);
-                    r.freed += 1;
-                }
-                // Otherwise a CPU did not answer: MM keeps those frames out of use; the range stays reserved.
-                RETIRED_COUNT.fetch_sub(1, Ordering::Relaxed);
-                continue;
+        let (mut lo, mut hi, mut i) = (u64::MAX, 0u64, 0);
+        while i < batch.len() {
+            let (bottom, len) = (batch[i].bounds.bottom, batch[i].frames.len() as u64 * 4096);
+            if len == 0 || paging::clear_kernel_pages(root, bottom, len) > 0 {
+                lo = lo.min(bottom);
+                hi = hi.max(bottom + len);
+                i += 1;
+            } else {
+                wait.push(batch.swap_remove(i));
             }
-            // Outside MM's vmap check (or nothing mapped there): the SC-3 way, local unmaps and a sync generation.
-            for i in 0..s.frames.len() as u64 {
-                paging::unmap_4k(root, s.bounds.bottom + i * 4096);
-            }
-            wait.push(s);
         }
-        if !wait.is_empty() {
-            // After every unmap: a CPU that sees this generation flushes after the PTEs were cleared.
+        // One round for the whole pass, not one per stack: a round waits for the slowest CPU (milliseconds for a
+        // vCPU the host took away), and 16 CPUs of exiting threads then outran the reaper until memory was gone.
+        let confirmed = lo >= hi || paging::tlb::flush_kernel(lo, hi, false).confirmed();
+        if !confirmed || !wait.is_empty() {
+            // After every clear: a CPU that sees this generation flushes after the PTEs were cleared.
             r.sync_gen = request_sync();
-            for mut s in wait {
+        }
+        for mut s in batch {
+            if confirmed {
+                free_stack(s);
+                r.freed += 1;
+            } else {
                 s.sync_gen = r.sync_gen;
                 push_list(&UNMAPPED, s);
             }
         }
+        for mut s in wait {
+            s.sync_gen = r.sync_gen;
+            push_list(&UNMAPPED, s);
+        }
     }
     for s in take_list(&UNMAPPED) {
         if sync_passed(s.sync_gen) {
-            for &f in &s.frames {
-                (s.free_frame)(f);
-            }
-            (s.release)(s.bounds.guard);
-            RETIRED_COUNT.fetch_sub(1, Ordering::Relaxed);
+            free_stack(s);
             r.freed += 1;
         } else {
             r.waiting += 1;
@@ -308,6 +304,15 @@ pub fn reap_stacks() -> Option<StackReap> {
     }
     REAPING.store(false, Ordering::Release);
     Some(r)
+}
+
+/// Frames and range of a stack no CPU can reach any more go back to their owner.
+fn free_stack(s: Box<StackInner>) {
+    for &f in &s.frames {
+        (s.free_frame)(f);
+    }
+    (s.release)(s.bounds.guard);
+    RETIRED_COUNT.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Asks every CPU to pass a quiescent point; returns the generation to wait for with `sync_passed`.
@@ -855,9 +860,13 @@ pub fn current_id() -> u64 {
     CPUS.get().id.load(Ordering::Relaxed)
 }
 
-/// Stack bounds of the context running on this CPU (zeros for the boot thread). Lock-free, for fault hooks.
+/// Stack bounds of the context running on this CPU (zeros for the boot thread). Lock-free and never allocating,
+/// for fault hooks and the heap: before this CPU's `CPUS` value exists nothing was switched to on it, so it runs
+/// the boot thread. Growing `CPUS` here would allocate, and from inside the heap that re-entered this very call
+/// with the grow flag held (12.11.: the release kernel spun at boot in `BuddyFrames::from_memory_map`'s first
+/// large block, whose atomic-request check asks for the boot thread's stack).
 pub fn current_stack() -> StackBounds {
-    let c = CPUS.get();
+    let Some(c) = CPUS.find_for(crate::percpu::this_cpu()) else { return StackBounds { guard: 0, bottom: 0, top: 0 } };
     StackBounds { guard: c.guard.load(Ordering::Relaxed), bottom: c.bottom.load(Ordering::Relaxed), top: c.top.load(Ordering::Relaxed) }
 }
 

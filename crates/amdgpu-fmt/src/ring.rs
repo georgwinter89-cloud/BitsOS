@@ -1,10 +1,12 @@
 //! Ring buffers as the driver writes them: geometry, 64-bit write pointer, reservation, NOP padding on commit,
 //! IB padding, and the frame helpers (IB and fence packets with their alignment rules).
 //!
-//! Rules (linux-6.6/drivers/gpu/drm/amd/amdgpu/): a submission reserves `ndw` rounded up to the ring's
+//! Rules (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/): a submission reserves `ndw` rounded up to the ring's
 //! alignment (amdgpu_ring.c:81-90), writes at most that many dwords, and commit pads with NOPs to the
 //! alignment before the write pointer moves (amdgpu_ring.c:140-147). Alignment: GFX 256 dwords with the
-//! one-dword NOP 0xffff1000 (gfx_v11_0.c:6084-6085), SDMA 16 dwords with NOP 0 (sdma_v6_0.c:1557-1558).
+//! one-dword NOP 0xffff1000 (gfx_v11_0.c:7075), SDMA 16 dwords with NOP 0 (sdma_v6_0.c:1557-1558). GFX and
+//! compute rings pad with one counted NOP whose body is filler (`gfx_v11_ring_insert_nop`, gfx_v11_0.c:566: the
+//! CP skips it as one packet); KIQ and MES rings one NOP per dword (`amdgpu_ring_insert_nop`, :7189).
 //! IBs: SDMA pads to 8 (sdma_v6_0.c:1129), GFX to the alignment the caller names (amdgpu_ring.c:125).
 //! Pointers are 64-bit dword counters; SDMA registers and writeback hold bytes (`<< 2`, sdma_v6_0.c:126/175),
 //! GFX ones dwords. The ring size is the caller's choice (a power of two), nothing here fixes it (R1).
@@ -12,7 +14,7 @@
 use alloc::vec::Vec;
 
 use crate::encode::EncodeError;
-use crate::{pm4, sdma};
+use crate::{pm4, sdma, vcn};
 
 /// SDMA ring alignment in dwords.
 pub const SDMA_RING_ALIGN_DW: u64 = 16;
@@ -27,6 +29,8 @@ pub enum Kind {
     Gfx,
     /// `burst_nop`: the firmware takes the counted NOP (Linux reads it from the firmware header).
     Sdma { burst_nop: bool },
+    /// GX-8v: VCN 4's unified queue: 64-dword frames, NOP 0, pointers in dwords (vcn_v4_0.c:2003-2033).
+    Vcn,
 }
 
 impl Kind {
@@ -34,20 +38,21 @@ impl Kind {
         match self {
             Kind::Gfx => GFX_RING_ALIGN_DW,
             Kind::Sdma { .. } => SDMA_RING_ALIGN_DW,
+            Kind::Vcn => vcn::RING_ALIGN_DW,
         }
     }
     /// The hardware form of a pointer (bytes for SDMA, dwords for GFX), as written to the wptr register,
     /// doorbell or wptr poll slot.
     pub fn hw_ptr(self, ptr_dw: u64) -> u64 {
         match self {
-            Kind::Gfx => ptr_dw,
+            Kind::Gfx | Kind::Vcn => ptr_dw,
             Kind::Sdma { .. } => ptr_dw << 2,
         }
     }
     /// A pointer read back from the hardware (rptr register or writeback) as a dword counter.
     pub fn ptr_from_hw(self, hw: u64) -> u64 {
         match self {
-            Kind::Gfx => hw,
+            Kind::Gfx | Kind::Vcn => hw,
             Kind::Sdma { .. } => hw >> 2,
         }
     }
@@ -55,6 +60,7 @@ impl Kind {
     pub fn nops(self, out: &mut Vec<u32>, n: u64) {
         match self {
             Kind::Gfx => out.extend(core::iter::repeat_n(pm4::PAD, n as usize)),
+            Kind::Vcn => out.extend(core::iter::repeat_n(vcn::cmd::NO_OP, n as usize)),
             Kind::Sdma { burst_nop } => {
                 // A burst NOP covers at most 0x4000 dwords; longer padding is split.
                 let mut left = n;
@@ -156,6 +162,21 @@ pub struct Ring {
     wptr: u64,
     staged: Vec<u32>,
     reserved: Option<u64>,
+    /// Commit pads with [`gfx_insert_nop`] (GFX and compute rings) instead of single NOPs.
+    counted_nop: bool,
+}
+
+/// `gfx_v11_ring_insert_nop` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c:566): one NOP is the filler
+/// alone; more are a NOP header counting up to 0x3FFF following dwords, then fillers, `n` dwords in all.
+pub fn gfx_insert_nop(out: &mut Vec<u32>, n: u64) {
+    match n {
+        0 => {}
+        1 => out.push(pm4::PAD),
+        _ => {
+            out.push(pm4::packet3(pm4::op::NOP, (n - 2).min(pm4::MAX_COUNT as u64 - 1) as u32));
+            out.extend(core::iter::repeat_n(pm4::PAD, (n - 1) as usize));
+        }
+    }
 }
 
 impl Ring {
@@ -168,7 +189,12 @@ impl Ring {
         if start & (kind.ring_align_dw() - 1) != 0 {
             return Err(RingError::BadRptr(start));
         }
-        Ok(Ring { kind, size_dw, wptr: start, staged: Vec::new(), reserved: None })
+        Ok(Ring { kind, size_dw, wptr: start, staged: Vec::new(), reserved: None, counted_nop: false })
+    }
+    /// A GFX or compute ring: commit pads with one counted NOP (see [`gfx_insert_nop`]); no effect on SDMA.
+    pub fn with_counted_nops(mut self) -> Ring {
+        self.counted_nop = self.kind == Kind::Gfx;
+        self
     }
     pub fn kind(&self) -> Kind {
         self.kind
@@ -247,7 +273,11 @@ impl Ring {
             return Err(RingError::Overrun);
         }
         let mut staged = core::mem::take(&mut self.staged);
-        self.kind.nops(&mut staged, pad);
+        if self.counted_nop {
+            gfx_insert_nop(&mut staged, pad);
+        } else {
+            self.kind.nops(&mut staged, pad);
+        }
         for (i, &dw) in staged.iter().enumerate() {
             sink.put(self.wptr.wrapping_add(i as u64) & self.mask(), dw);
         }
@@ -277,6 +307,7 @@ impl Ring {
                 })
             }
             Kind::Gfx => self.emit(|v| pm4::indirect_buffer(v, addr, len_dw, vmid, cnst, 0)),
+            Kind::Vcn => self.emit(|v| vcn::ib(v, vmid, addr, len_dw)),
         }
     }
 
@@ -285,6 +316,9 @@ impl Ring {
         match self.kind {
             Kind::Sdma { .. } => self.emit(|v| sdma::emit_fence(v, addr, seq, wide, int)),
             Kind::Gfx => self.emit(|v| pm4::fence(v, addr, seq, wide, int)),
+            // 32-bit only, the TRAP always (vcn_v2_0_enc_ring_emit_fence WARNs on the 64-bit flag).
+            Kind::Vcn if wide => Err(RingError::Encode(EncodeError::Field { what: "64-bit VCN fence", value: seq })),
+            Kind::Vcn => self.emit(|v| vcn::fence(v, addr, seq)),
         }
     }
 }

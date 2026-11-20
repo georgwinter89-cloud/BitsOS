@@ -1,7 +1,7 @@
 //! GM-PROTON ktests (`gm.wine.*`): the kernel sequences Proton's Wine runs on its 64-bit path, as the `abi-wine`
 //! program (user/abi-tests/c/wine.c) prints them, against CachyOS's transcripts (`expected/wine-*.txt`): the
 //! preloader's reservations, fault decoding, the TEB in GS, thread suspend, fsync's shared waits and the seccomp
-//! filter by instruction pointer (plan/notes/gm-PROTON.md 1.4).
+//! filter by instruction pointer (plan/spec/programs.md §5.3).
 //!
 //! `Safe` and rerunnable: each mode is its own process (the seccomp filter dies with it), ended with a deadline.
 

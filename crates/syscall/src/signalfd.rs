@@ -1,12 +1,12 @@
-//! signalfd (AB-6), after linux-6.6/fs/signalfd.c: `signalfd4` (289) and `signalfd` (282) make or change an
-//! anonymous file whose reads take the reading thread's pending signals of its mask (its own queue, then
-//! its group's) as 128-byte `signalfd_siginfo` records; poll says EPOLLIN while one is pending. Wayland
-//! compositors and many daemons block the signals and read them here.
+//! signalfd (AB-6), after linux-7.3.1/fs/signalfd.c: `signalfd4` (289, :299) and `signalfd` (282, :311) make or change
+//! an anonymous file whose reads take the reading thread's pending signals of its mask (its own queue, then its
+//! group's) as 128-byte `signalfd_siginfo` records; poll says EPOLLIN while one is pending. Wayland compositors and
+//! many daemons block the signals and read them here.
 //!
 //! As on Linux the file belongs to no process: a reader always reads its own signals (after fork, the
 //! child's). Poll wake-ups come from the group that made the file (`Group::sig_poll`), which is the reader in
 //! every program known; a forked child polling an inherited signalfd sees its readiness only when it looks
-//! again (decision in plan/notes/ab-AB-6.md).
+//! again (plan/spec/abi.md §4).
 
 use crate::SysCtx;
 use alloc::collections::BTreeMap;
@@ -143,7 +143,7 @@ impl Pollable for SignalFd {
 }
 
 /// `do_signalfd4`.
-/// AB-7a: `signalfd_show_fdinfo` (linux-6.6/fs/signalfd.c :232) for `/proc/<pid>/fdinfo`: the mask as given,
+/// AB-7a: `signalfd_show_fdinfo` (linux-7.3.1/fs/signalfd.c :230) for `/proc/<pid>/fdinfo`: the mask as given,
 /// without SIGKILL and SIGSTOP (Linux never stores them). None for other files.
 pub(crate) fn fdinfo(f: &OpenFile) -> Option<String> {
     let addr = Arc::as_ptr(&f.file) as *const u8 as usize;

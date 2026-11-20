@@ -105,7 +105,7 @@ impl<E: Env> RootPorts<'_, E> {
 
 impl<E: Env> RootPorts<'_, E> {
     /// A reset with a device on a USB 3 port (US-R): hot (PR), or warm (WPR) as the second step
-    /// (linux-6.6/drivers/usb/core/hub.c:2948); then enabled with the link in U0.
+    /// (linux-7.3.1/drivers/usb/core/hub.c:3068); then enabled with the link in U0.
     fn hard_usb3(&self, port: u8, warm: bool) -> Result<u32, UsbError> {
         if warm {
             WARM_RESETS.inc();

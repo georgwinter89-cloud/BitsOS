@@ -1,5 +1,5 @@
 //! `struct termios` as the x86-64 Linux kernel keeps it (include/uapi/asm-generic/termbits.h, termbits-common.h,
-//! ioctls.h of linux-6.6): the flag bits, the control-character indices, the three user layouts (`termios` 36
+//! ioctls.h of linux-7.3.1): the flag bits, the control-character indices, the three user layouts (`termios` 36
 //! bytes for TCGETS/TCSETS, `termios2` 44 bytes with the speeds for TCGETS2/TCSETS2, the old `termio` 18 bytes
 //! for TCGETA/TCSETA) and the terminal ioctl numbers. Pure data, host-tested.
 
@@ -218,15 +218,15 @@ impl Termios {
             ospeed: 38400,
         }
     }
-    /// The Linux VT's start settings: `tty_std_termios` plus IUTF8 (`default_utf8`, linux-6.6/drivers/tty/vt/
-    /// vt.c:3554-3556), what TCGETS answers on a fresh console.
+    /// The Linux VT's start settings: `tty_std_termios` plus IUTF8 (`default_utf8`, linux-7.3.1/drivers/tty/vt/
+    /// vt.c:3977-3979), what TCGETS answers on a fresh console.
     pub const fn vt() -> Termios {
         let mut t = Termios::std();
         t.iflag |= IUTF8;
         t
     }
     /// A pty slave's start settings (IN-7): `tty_std_termios` with `c_cflag = B38400 | CS8 | CREAD` (no HUPCL,
-    /// no IUTF8; linux-6.6/drivers/tty/pty.c:914-917).
+    /// no IUTF8; linux-7.3.1/drivers/tty/pty.c:890-891).
     pub const fn pty() -> Termios {
         let mut t = Termios::std();
         t.cflag = B38400 | CS8 | CREAD;

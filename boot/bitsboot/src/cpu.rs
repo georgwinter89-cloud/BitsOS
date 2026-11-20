@@ -62,6 +62,11 @@ fn max_ext() -> u32 {
     cpuid(0x8000_0000).0
 }
 
+/// Physical address bits (CPUID 0x80000008 EAX[7:0]); 0 when the leaf is missing.
+pub fn phys_bits() -> u32 {
+    if max_ext() >= 0x8000_0008 { cpuid(0x8000_0008).0 & 0xFF } else { 0 }
+}
+
 pub fn has_nx() -> bool {
     max_ext() >= 0x8000_0001 && cpuid(0x8000_0001).3 & (1 << 20) != 0
 }

@@ -295,8 +295,16 @@ impl PciFunction {
             return Err(EnableError::Busy);
         }
         let driver = driver_of(at);
+        // GP B7: asked before anything is read or written. With an IOMMU the firmware left translating, a device
+        // given bus master would only time out or fault; the screen names the cause instead. No DMAR table (the
+        // Mini-PC, every AMD machine, QEMU without an Intel IOMMU): the gate is open and nothing changes.
+        if let Err(e) = enable::dma_allowed(dma, acpi::dma_gate().map_err(|v| v.name())) {
+            klog::event!(Error, "pci", "enable.refused", function = fname.as_str(), driver = driver.unwrap_or("-"), dma = dma, reason = format!("{e}");
+                "bus master is not set: the firmware's IOMMU is active (see acpi dma.blocked)");
+            return Err(e);
+        }
         let clear_msi = !STATE.lock().get(&at).is_some_and(|s| s.msi_checked);
-        let nodes = NODES.lock().clone();
+        let nodes = NODES.get();
         let Some(idx) = nodes.iter().position(|n| n.loc == at) else {
             klog::event!(Error, "pci", "enable.failed", function = fname.as_str(), reason = "not_scanned");
             return Err(EnableError::NotScanned);
@@ -316,9 +324,11 @@ impl PciFunction {
             return Err(e);
         }
         if let Some(b) = o.sized {
-            if let Some(n) = NODES.lock().iter_mut().find(|n| n.loc == at) {
-                n.bars = Some(b);
-            }
+            NODES.update(|nodes| {
+                if let Some(n) = nodes.iter_mut().find(|n| n.loc == at) {
+                    n.bars = Some(b);
+                }
+            });
             for (i, bar) in b.iter().enumerate() {
                 if let Some(bar) = bar {
                     klog::event!(Info, "pci", "bar.sized_after_wake", function = fname.as_str(), index = i, start = hex(bar.start()), size = hex(bar.size()));
@@ -413,7 +423,7 @@ impl PciFunction {
             return None;
         }
         let _serial = lock_enable(&format!("{}", self.loc())).ok()?;
-        let pcie = NODES.lock().iter().find(|n| n.loc == self.loc()).map_or(0, enable::pcie_cap);
+        let pcie = NODES.get().iter().find(|n| n.loc == self.loc()).map_or(0, enable::pcie_cap);
         let s = enable::save(&Locked, self.loc(), pcie);
         STATE.lock().entry(self.loc()).or_default().saved = Some(s);
         Some(s)
@@ -459,7 +469,7 @@ impl PciFunction {
 
     /// The bridges from this function up to its root bus (nearest first).
     pub fn upstream_bridges(&self) -> Vec<PciFunction> {
-        let nodes = NODES.lock();
+        let nodes = NODES.get();
         let Some(i) = nodes.iter().position(|n| n.loc == self.loc()) else { return Vec::new() };
         crate::node::ancestors(&nodes, i).into_iter().map(|p| nodes[p].function()).collect()
     }
@@ -468,7 +478,7 @@ impl PciFunction {
     /// the function and every bridge above it, each logged (Warn where bus master is off or an abort / UR
     /// shows). Reads only.
     pub fn dma_status(&self) -> Vec<DmaStatus> {
-        let nodes = NODES.lock().clone();
+        let nodes = NODES.get();
         let Some(i) = nodes.iter().position(|n| n.loc == self.loc()) else { return Vec::new() };
         let v = enable::dma_status(&Locked, &nodes, i);
         for s in &v {

@@ -1,4 +1,4 @@
-//! AB-7b: `/proc/cpuinfo` as linux-6.6/arch/x86/kernel/cpu/proc.c `show_cpuinfo` prints it (moved from FS-2's
+//! AB-7b: `/proc/cpuinfo` as linux-7.3.1/arch/x86/kernel/cpu/proc.c:63 `show_cpuinfo` prints it (moved from FS-2's
 //! `vfs-sys/src/sysinfo.rs`), now with each CPU's own topology (`hal::smp::topology`): physical id, siblings
 //! (CPUs of the package), core id, cpu cores (cores of the package), apicid. Cache size and TLB size as
 //! common.c `cpu_detect_cache_sizes` (AMD: L2 from 0x80000006) and cacheinfo.c (Intel: L3, else L2, from leaf

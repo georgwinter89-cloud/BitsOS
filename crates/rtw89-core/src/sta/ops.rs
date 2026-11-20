@@ -303,7 +303,7 @@ pub fn add_pkt_offload<B: Bus + ?Sized>(
     Ok(None)
 }
 
-// Linux: none (mac80211 ieee80211_pspoll_get (linux-6.6/net/mac80211/tx.c:5668)): control
+// Linux: none (mac80211 ieee80211_pspoll_get (linux-7.3.1/net/mac80211/tx.c:6147)): control
 // PS-Poll to the BSSID, AID with its two top bits set
 pub fn ps_poll_frame(bssid: &[u8; 6], own: &[u8; 6], aid: u16) -> [u8; 16] {
     let mut f = [0u8; 16];
@@ -316,7 +316,7 @@ pub fn ps_poll_frame(bssid: &[u8; 6], own: &[u8; 6], aid: u16) -> [u8; 16] {
 
 // Linux: rtw89_fw_h2c_general_pkt (fw.c:3114) with rtw89_fw_h2c_add_general_pkt (fw.c:3024);
 // the frames of mac80211's ieee80211_pspoll_get and ieee80211_nullfunc_get
-// (linux-6.6/net/mac80211/tx.c:5703; the AP's station is not WME, so the "QoS null" offload gets
+// (linux-7.3.1/net/mac80211/tx.c:6182; the AP's station is not WME, so the "QoS null" offload gets
 // a plain null frame too)
 pub fn general_pkt<B: Bus + ?Sized>(
     bus: &mut B,

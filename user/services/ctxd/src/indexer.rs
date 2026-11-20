@@ -13,7 +13,7 @@ use crate::store::{CachedText, Catalog, DocRec, PathRec, RootRec, Store};
 use crate::vindex::VecIndex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -84,6 +84,8 @@ pub struct Outcome {
     pub failed: usize,
     pub embedded_chunks: usize,
     pub seconds: f64,
+    /// The model failed during this run: the generation is keyword-only and the vectors are tried again soon.
+    pub embedder_failed: bool,
 }
 
 fn hash_file(path: &Path) -> std::io::Result<String> {
@@ -225,11 +227,14 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
     p.set("scan", 0);
     let (roots, denied) = roots::resolve(&cfg.roots, &cfg.forbidden_roots);
     let scan_ns = now_ns();
-    let scan = roots::scan(&roots, &cfg.excludes, cfg.index.max_file_mb << 20);
+    // Never the service's own folder (it holds the text of private roots) nor a forbidden place below a root.
+    let mut skip: Vec<PathBuf> = cfg.forbidden_roots.iter().map(|f| std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())).collect();
+    skip.push(std::fs::canonicalize(&ctx.store.dir).unwrap_or_else(|_| ctx.store.dir.clone()));
+    let scan = roots::scan(&roots, &cfg.excludes, cfg.index.max_file_mb << 20, &skip);
     let root_recs: Vec<RootRec> =
         roots.iter().map(|r| RootRec { path: r.path.display().to_string(), private: r.private }).collect();
-    let emb_id = ctx.embedder.map(|e| e.id().to_string());
-    let dim = ctx.embedder.map(|e| e.dim()).unwrap_or(0);
+    let mut emb_id = ctx.embedder.map(|e| e.id().to_string());
+    let mut dim = ctx.embedder.map(|e| e.dim()).unwrap_or(0);
     let sig = chunk_sig(cfg);
 
     // 1. Content hashes, reusing the previous catalog when (dev, inode, size, mtime, ctime, path) are unchanged
@@ -411,6 +416,7 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
     // 4. Vectors: cached per (embedder, content, chunking, title); the rest in batches.
     let mut vectors: Vec<f32> = Vec::new();
     let mut embedded_chunks = 0;
+    let mut embedder_failed = false;
     if let Some(emb) = ctx.embedder {
         let eid = emb.id().to_string();
         let mut per_doc: Vec<Option<Vec<f32>>> = vec![None; docs.len()];
@@ -433,6 +439,9 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
         queue.reverse();
         let mut cur: Option<(usize, CachedText)> = None;
         while !queue.is_empty() {
+            if cfg.index.background {
+                crate::prio::QUIET.between();
+            }
             let take: Vec<(usize, usize)> = (0..batch).filter_map(|_| queue.pop()).collect();
             let mut texts = Vec::with_capacity(take.len());
             for &(i, c) in &take {
@@ -444,10 +453,16 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
                 texts.push(passage_text(&docs[i].title, ct.text.get(s as usize..e as usize).unwrap_or("")));
             }
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            let vecs = emb.embed(EmbedKind::Passage, &refs, timeout).map_err(|e| {
-                crate::event!("error", "embedder.failed", reason = e.to_string());
-                format!("embedder: {e}")
-            })?;
+            // Once more after a failure (llama.rs revives a dead server); then this run goes on without
+            // vectors: a keyword generation now beats no generation until the next rescan.
+            let vecs = match emb.embed(EmbedKind::Passage, &refs, timeout).or_else(|_| emb.embed(EmbedKind::Passage, &refs, timeout)) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::event!("error", "embedder.failed", reason = e.to_string(), fallback = "keyword_only");
+                    embedder_failed = true;
+                    break;
+                }
+            };
             for (&(i, _), v) in take.iter().zip(vecs) {
                 let e = pending.entry(i).or_insert_with(|| (0, Vec::with_capacity(ranges[i].len() * dim)));
                 e.0 += 1;
@@ -464,9 +479,14 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
             }
             embedded_chunks += take.len();
         }
-        vectors.reserve(n_chunks * dim);
-        for v in per_doc {
-            vectors.extend(v.ok_or("vectors missing after embedding")?);
+        if embedder_failed {
+            // The finished documents' vectors are in the cache already; the retry takes them from there.
+            (emb_id, dim) = (None, 0);
+        } else {
+            vectors.reserve(n_chunks * dim);
+            for v in per_doc {
+                vectors.extend(v.ok_or("vectors missing after embedding")?);
+            }
         }
     }
 
@@ -487,7 +507,7 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
     std::fs::write(gdir.join("chunks.bin"), &chunk_bin).map_err(werr)?;
     let mut calib = crate::store::Calib { floor: 0.0, ceil: 1.0 };
     let mut vectors_sum = String::new();
-    if ctx.embedder.is_some() {
+    if let Some(emb) = ctx.embedder.filter(|_| emb_id.is_some()) {
         let mut f = std::io::BufWriter::new(std::fs::File::create(gdir.join("vectors.f32")).map_err(werr)?);
         let mut h = blake3::Hasher::new();
         for v in &vectors {
@@ -498,13 +518,8 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
         f.flush().map_err(werr)?;
         vectors_sum = h.finalize().to_hex()[..32].to_string();
         let vi = VecIndex::new(dim, vectors, chunk_doc);
-        calib = match ctx.embedder {
-            Some(emb) => {
-                calibrate_with_titles(emb, &docs, &vi, Duration::from_millis(cfg.embedder.batch_timeout_ms.max(1000)))
-                    .unwrap_or_else(|| vi.calibrate())
-            }
-            None => vi.calibrate(),
-        };
+        calib = calibrate_with_titles(emb, &docs, &vi, Duration::from_millis(cfg.embedder.batch_timeout_ms.max(1000)))
+            .unwrap_or_else(|| vi.calibrate());
     }
     {
         let texts: Vec<Option<CachedText>> =
@@ -561,5 +576,83 @@ fn run_inner(ctx: &Ctx, prev: Option<&Catalog>, t0: Instant) -> Result<Outcome, 
         failed: failed.load(Ordering::Relaxed) as usize,
         embedded_chunks,
         seconds: t0.elapsed().as_secs_f64(),
+        embedder_failed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RootCfg;
+    use crate::embed::fake::Fake;
+    use crate::embed::{EmbedError, Health};
+    use crate::extract::pool::Isolation;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Answers its first `ok` calls, then fails as a killed llama-server would.
+    struct Dies {
+        ok: usize,
+        calls: AtomicUsize,
+        inner: Fake,
+    }
+
+    impl Embedder for Dies {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn max_tokens(&self) -> usize {
+            self.inner.max_tokens()
+        }
+        fn batch(&self) -> usize {
+            2
+        }
+        fn embed(&self, kind: EmbedKind, texts: &[&str], t: Duration) -> Result<Vec<Vec<f32>>, EmbedError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) < self.ok {
+                self.inner.embed(kind, texts, t)
+            } else {
+                Err(EmbedError::Unavailable("killed".into()))
+            }
+        }
+        fn health(&self) -> Health {
+            Health::Ready
+        }
+    }
+
+    /// Checker 12.11.: a model dying mid-run still gives a (keyword) generation, and the next run with a
+    /// working model adds the vectors.
+    #[test]
+    fn a_model_that_dies_mid_run_leaves_a_keyword_generation() {
+        let d = std::env::temp_dir().join(format!("ctxd-dies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let docs = d.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        for i in 0..8 {
+            std::fs::write(docs.join(format!("brief-{i}.txt")), format!("Brief {i}\n\nSteuerbescheid Nummer {i}.\n")).unwrap();
+        }
+        let mut cfg = Context::default();
+        cfg.roots = vec![RootCfg { path: docs, private: false }];
+        cfg.index.background = false;
+        let store = Store::open(&d.join("data"), true).unwrap();
+        let pool = Pool::new(Isolation::InProcess, 1, Duration::from_secs(10), crate::extract::Limits::default());
+        let progress = Progress::default();
+        let dies = Dies { ok: 1, calls: AtomicUsize::new(0), inner: Fake::new(64) };
+        let ctx = Ctx { cfg: &cfg, store: &store, embedder: Some(&dies), pool: &pool, progress: &progress };
+        let o = run_once(&ctx, None).unwrap();
+        assert!(o.embedder_failed && o.generation.is_some() && o.docs == 8, "{o:?}");
+        let g = crate::engine::Generation::load(&store, usize::MAX).unwrap().unwrap();
+        assert!(g.cat.embedder.is_none() && g.vec.is_none(), "keyword-only");
+        assert_eq!(g.kidx.num_docs(), 8, "every document is searchable by keyword");
+
+        let well = Fake::new(64);
+        let ctx = Ctx { embedder: Some(&well), ..ctx };
+        let o = run_once(&ctx, Some(&g.cat)).unwrap();
+        assert!(!o.embedder_failed && o.generation.is_some(), "{o:?}");
+        assert!(o.embedded_chunks < 8, "the first batch came from the cache: {o:?}");
+        let g = crate::engine::Generation::load(&store, usize::MAX).unwrap().unwrap();
+        assert_eq!(g.cat.embedder.as_deref(), Some(well.id()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

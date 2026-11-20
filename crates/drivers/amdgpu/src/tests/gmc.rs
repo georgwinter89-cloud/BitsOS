@@ -1,7 +1,7 @@
-//! GX-7h: the GMC stage on the host. The ktests' checks (`ktests_gmc`, also on the real discovery blob when it
-//! is here), Linux's values against the 27.10. capture (the fixture tests/data/linux-780m-gmc-writes.txt, public;
-//! compared with the capture itself where plan/ is), the register map against the generated tables, and the
-//! pure parts (plan decision, CRC compare, watcher passes).
+//! GX-7h: the GMC stage on the host. The ktests' checks (`ktests_gmc`, also on the real discovery blob),
+//! Linux's values against the 27.10. capture (the fixture tests/data/linux-780m-gmc-writes.txt, public;
+//! compared with the capture itself, host/tests/gx/fixtures), the register map against the generated tables,
+//! and the pure parts (plan decision, CRC compare, watcher passes).
 
 use super::regdiff::{capture, table_names};
 use crate::gpucore::fakechip::{self, StartAs};
@@ -175,10 +175,7 @@ fn fixture_text(linux: &[(u32, u32)], names: &super::regdiff::Names) -> String {
 
 #[test]
 fn gmc_fixture_is_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED gmc_fixture_is_the_capture: no capture (plan/ is not public); the fixture stands in");
-        return;
-    };
+    let t = capture();
     let want = fixture_text(&t.writes(false), &table_names());
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/linux-780m-gmc-writes.txt");
     let have = std::fs::read_to_string(&p).unwrap_or_default();
@@ -211,11 +208,10 @@ fn gmc_phases_against_linux() {
     // MMHUB: nothing written on a cold start (display fields differ): every Linux write is missing.
     let m = regdiff::diff_phase(gmc_phases()[0], &linux, &done, &names, &[]);
     assert!(m.ours == 0 && m.count(DiffKind::Missing) == m.linux, "{m:?}");
-    // The real capture (where it is) gives the same verdict.
-    if let Some(t) = capture() {
-        for rep in regdiff::diff(PHASES_GMC(), &t.writes(false), &ours, &names, &[]) {
-            assert!(rep.diffs.is_empty(), "{}", regdiff::render(&[rep.clone()]));
-        }
+    // The real capture gives the same verdict.
+    let t = capture();
+    for rep in regdiff::diff(PHASES_GMC(), &t.writes(false), &ours, &names, &[]) {
+        assert!(rep.diffs.is_empty(), "{}", regdiff::render(&[rep.clone()]));
     }
 }
 

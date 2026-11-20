@@ -90,7 +90,7 @@ pub(crate) trait Chain: Send + Sync {
         lines.push(String::from("reset: this chain has no suspend"));
         false
     }
-    /// GfxDeviceDriverReset(2), behind `gx_mode2=on` (GX-D9). The picture still equal, or None: no answer, or refused.
+    /// GfxDeviceDriverReset(2) (the ladder's last rung). The picture still equal, or None: no answer, or refused.
     fn mode2_reset(&self, lines: &mut Vec<String>) -> Option<bool> {
         lines.push(String::from("reset: this chain has no mode 2"));
         None

@@ -1,4 +1,4 @@
-//! The end of a thread and of a thread group, and how parents collect children (linux-6.6/kernel/exit.c:
+//! The end of a thread and of a thread group, and how parents collect children (linux-7.3.1/kernel/exit.c:
 //! `do_exit`, `exit_notify`, `forget_original_parent`, `do_wait`, `wait_task_zombie`; kernel/signal.c
 //! `do_notify_parent`).
 
@@ -19,13 +19,22 @@ use vfs::Errno;
 /// group. The group's current image is used, not the one the loop held (an execve may have just replaced it).
 pub(crate) fn thread_ends(t: &Arc<Thread>) {
     let g = t.group();
+    // Linux `perf_event_exit_task` before `exit_mm` (linux-7.3.1/kernel/exit.c): the EXIT record goes first, and
+    // from here samples take no program part (`exit_mm` clears `current->mm`): the thread never returns to user
+    // mode, and its memory is torn down below.
+    if let Some(k) = t.sched_thread() {
+        k.note_user_regs(0, 0, 0);
+    }
+    crate::perf_hook::exit(g.tgid, g.ppid(), t.tid());
     // `exit_sem` and `exit_shm` of `do_exit`: before anyone can see the group finished (a parent's wait sees the undo
     // done, as on Linux).
     crate::ipc::thread_exit(t);
     // SC-6: off the live list first, then the time goes to the group (a reader never counts it twice; see
     // `Group::cpu_times`), before anyone can collect the group.
     let (last, cld) = g.remove_thread(t);
+    t.uncount();
     g.cpu.thread_ended(sched::cputime::current());
+    g.io_ended.add_all(sched::ioac::current());
     if let Some(c) = cld {
         // Its end completed a group stop the others had already joined (`exit_signals`).
         crate::deliver::notify_parent_cld(g, c);
@@ -48,6 +57,11 @@ pub(crate) fn thread_ends(t: &Arc<Thread>) {
         g.set_leader_code(t.code());
     }
     task::unregister(t);
+    if !last && !t.is_leader() {
+        // L7-PROC: a thread pidfd of this thread turns readable with EPOLLHUP (`do_notify_pidfd` and the release
+        // of an untraced sub-thread, linux-7.3.1/kernel/exit.c:772, :141).
+        crate::pidfd::notify(g, true);
+    }
     if last {
         if !g.group_exited() {
             g.end_by_last_thread(t.code());
@@ -218,8 +232,8 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
     let (parent, reaper, orphans) = {
         let t = TABLE.lock();
         // Orphans go to the nearest child subreaper above (AB-5, PR_SET_CHILD_SUBREAPER), else to init (pid 1)
-        // while it lives, as Linux's `find_new_reaper`/`find_child_reaper` (linux-6.6/kernel/exit.c:583, :623,
-        // :688); otherwise to the kernel, and the sweep below collects the zombies among them. A reparented
+        // while it lives, as Linux's `find_new_reaper`/`find_child_reaper` (linux-7.3.1/kernel/exit.c:608, :647,
+        // :709); otherwise to the kernel, and the sweep below collects the zombies among them. A reparented
         // child reports with SIGCHLD from now on (`reparent_leader`).
         // SX-2: in a pid namespace below the initial one its init is the reaper (`find_child_reaper`); when
         // that init itself ends, the namespace's other members were killed (`zap_ns`) and its children go to
@@ -249,21 +263,22 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
     };
     // AB-12: pidfds of this process turn readable (Linux `do_notify_pidfd` from `do_notify_parent`); outside
     // the table lock, before the parent hears of it.
-    if g.exit_poll.waiter_count() != 0 {
-        g.exit_poll.wake_poll(vfs::poll::Events::IN | vfs::poll::Events::RDNORM);
-    }
+    crate::pidfd::notify(g, false);
     // AB-5: every reparented child's parent-death signals (`forget_original_parent`).
     send_pdeath(g, &orphans);
     // AB-6: process groups this end orphans get SIGHUP + SIGCONT when they hold stopped members (POSIX
     // 3.2.2.2, `kill_orphaned_pgrp`): this group's own, and those of the children just handed over.
     orphaned_pgrps(g, parent.as_ref(), &orphans);
     drop(orphans);
-    let mut autoreap = false;
+    // L7-PROC: a CLONE_AUTOREAP child is reaped at once and sends no signal (`do_notify_parent`,
+    // linux-7.3.1/kernel/signal.c:2327); its parent's wait only wakes.
+    let own_autoreap = g.autoreap.load(core::sync::atomic::Ordering::Acquire);
+    let mut autoreap = own_autoreap;
     if let Some(pp) = &parent {
         let sig = g.exit_signal();
         let (reap, send) = parent_wants(pp, sig);
-        autoreap = reap;
-        if send && !pp.is_finished() {
+        autoreap |= reap;
+        if send && !own_autoreap && !pp.is_finished() {
             let _ = pp.send_info(child_info(g, sig, pp), To::Group, false);
         }
     }
@@ -281,7 +296,11 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
             x
         };
         match gone {
-            Some(x) => drop(x),
+            Some(x) => {
+                // L7-PROC: its pidfds read EPOLLHUP now (`__unhash_process`, linux-7.3.1/kernel/exit.c:141).
+                crate::pidfd::notify(x.group(), true);
+                drop(x)
+            }
             None => break,
         }
     }
@@ -299,7 +318,7 @@ fn finish_group(g: &Arc<Group>, p: Option<&Arc<Process>>) {
     g.complete_done();
 }
 
-/// SX-2 `zap_pid_ns_processes` (linux-6.6/kernel/pid_namespace.c:169): the init of `g`'s pid namespace ended,
+/// SX-2 `zap_pid_ns_processes` (linux-7.3.1/kernel/pid_namespace.c:192): the init of `g`'s pid namespace ended,
 /// so the namespace takes no new member (fork there is ENOMEM from now on) and every other member, in this
 /// namespace and below it, gets SIGKILL. No lock is held across the sends.
 fn zap_ns(g: &Arc<Group>) {
@@ -510,11 +529,16 @@ pub fn wait_for(parent: &Arc<Process>, caller_tid: u32, o: &WaitOpts) -> Result<
             return Ok(Some(r));
         }
         if let Some((c, vpid)) = found {
+            if !o.nowait {
+                crate::pidfd::notify(c.group(), true);
+            }
             let r = Reaped { pid: c.pid, vpid, status: c.status().unwrap_or(ExitStatus::Exited(0)), uid: c.real_uid(), times: c.cpu.with_children(), maxrss_pages: c.both_maxrss_pages(&c.mm), event: WaitEvent::Ended };
             // SC-6: a collected child's times go to the parent's children (`psig->cutime += ...`); WNOWAIT
             // leaves the child as it is and counts nothing.
             if !o.nowait {
                 parent.cpu.reap(&c.cpu);
+                // SYS-K: and its I/O (`psig->ioac += p->ioac + sig->ioac`, linux-7.3.1/kernel/exit.c:1268).
+                parent.io_ended.add_all(c.io_counts());
                 // AB-7c: the child's peak (its image's mm keeps its high-water mark after the teardown).
                 parent.note_child_maxrss(&c);
             }

@@ -1,5 +1,5 @@
-//! DR-9: GEM_USERPTR objects (linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c:378, amdgpu_hmm.c,
-//! amdgpu_ttm.c:659 `amdgpu_ttm_tt_get_user_pages`): a GPU object over a range of the creating program's own
+//! DR-9: GEM_USERPTR objects (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c:519, amdgpu_hmm.c,
+//! amdgpu_ttm.c:753 `amdgpu_ttm_tt_get_user_pages`): a GPU object over a range of the creating program's own
 //! memory, page-aligned, read-only with AMDGPU_GEM_USERPTR_READONLY (the GPU cannot write it: its writes fault).
 //!
 //! The pages come from a `UserPages` source, the address-space side of Linux's `hmm_range_fault` (MM provides it;

@@ -26,13 +26,29 @@ impl App {
         let pos = self.pointer;
         let mut focus = None;
         self.reveal_motion(crate::pacer::now());
+        self.ws_ask_motion();
+        self.habit_hint_motion();
+        self.confirm_motion();
+        self.prog_note_motion();
         if self.install.shown() {
             // MC-9b: no window has the pointer (nor its own cursor image) while the overlay is shown.
             self.install_motion();
             self.cursor_deco = Some(CursorIcon::Default);
+        } else if self.sofa.listens() && self.menu.is_none() {
+            // GM-6a: a sofa screen or the quick menu has the pointer: the hover sets the focus.
+            self.sofa_motion();
+            self.cursor_deco = Some(CursorIcon::Default);
         } else if self.lib.open && self.menu.is_none() {
             // PK-L1b: no window has the pointer while the library is open.
             self.library_motion();
+            self.cursor_deco = Some(CursorIcon::Default);
+        } else if self.feld.open {
+            // FELD: nor while the Feld is open.
+            self.feld_motion();
+            self.cursor_deco = Some(CursorIcon::Default);
+        } else if self.rewind.open {
+            // REWIND: nor while the rewind view is open.
+            self.rewind_motion();
             self.cursor_deco = Some(CursorIcon::Default);
         } else if let Some(m) = &self.menu {
             let hover = match menu::hit(m.centre, &m.items, &self.theme, pos.x, pos.y) {
@@ -53,6 +69,7 @@ impl App {
                     w,
                     _,
                     p @ (Part::Float
+                    | Part::Minimize
                     | Part::Max
                     | Part::Close
                     | Part::Tab(_)
@@ -72,8 +89,11 @@ impl App {
                 Hit::Spot(s) => Some(*s),
                 _ => None,
             };
-            if spot != self.desk.hover {
+            // DESK-LEFT: the same index on the open "+N" list and on a chip or entry is drawn on one of them only.
+            let on_list = spot.is_some() && self.min_list_spot(pos.x, pos.y) == spot;
+            if spot != self.desk.hover || on_list != self.desk.min_list.pointer_on {
                 self.desk.hover = spot;
+                self.desk.min_list.pointer_on = on_list;
                 self.chrome_dirty();
             }
             self.cursor_deco = match hit {
@@ -103,11 +123,54 @@ impl App {
         if !pressed && self.install.buttons.remove(&code) {
             return;
         }
+        // DB3: Durchblick's panel keeps a press on it (and so its release); elsewhere the windows get theirs.
+        if pressed && self.db_takes_press() {
+            self.swallowed.insert(code);
+            return self.db_click();
+        }
+        // PE-1: the program-error card lies over the library and every window: a press on it is its own.
+        if pressed && self.prog_note_press() {
+            self.swallowed.insert(code);
+            return;
+        }
         // PK-L1b: the open library keeps every press (the middle one too) and so its release; its circle menu
         // takes the usual way.
+        // DESK-LEFT: a press on the bottom row (a minimised window, "+N", Startseite) closes it and acts at once.
+        if pressed && self.lib.open && self.menu.is_none() && self.library_passes(self.pointer.x, self.pointer.y) {
+            self.library_close("click on the bottom row");
+        }
         if pressed && self.lib.open && self.menu.is_none() {
             self.swallowed.insert(code);
             return self.library_press(code);
+        }
+        // REWIND: the open rewind view keeps every press (and so its release).
+        if pressed && self.rewind.open {
+            self.swallowed.insert(code);
+            return self.rewind_press(code);
+        }
+        // FELD: the open Feld keeps every press (and so its release).
+        if pressed && self.feld.open {
+            self.swallowed.insert(code);
+            return self.feld_press(code);
+        }
+        // GM-6a: the sofa layer keeps every press over it (and so its release).
+        if pressed && self.sofa.listens() && self.menu.is_none() {
+            self.swallowed.insert(code);
+            return self.sofa_press(code);
+        }
+        if pressed {
+            self.min_list_press();
+            self.assist_menu_press();
+        }
+        // VB-1: "Ja" or "Zurück zur vorherigen" on the confirmation card (a press on the card is the card's).
+        if pressed && self.confirm_press() {
+            self.swallowed.insert(code);
+            return;
+        }
+        // DB4: the habit hint's "Rückgängig" (a press on the card is the card's).
+        if pressed && self.habit_hint_press() {
+            self.swallowed.insert(code);
+            return;
         }
         let kept = if code == BTN_MIDDLE {
             false
@@ -151,6 +214,7 @@ impl App {
         }
         if !matches!(hit, Hit::Spot(_)) {
             self.page_edit_end();
+            self.assist_blur();
         }
         match hit {
             Hit::Spot(s) => self.spot_press(s, code == BTN_RIGHT),
@@ -189,7 +253,7 @@ impl App {
                 } else if code == BTN_LEFT {
                     self.grab = match part {
                         Part::Body | Part::Tab(_) => Some(Grab::Pending { window: target, start: pos }),
-                        Part::Float | Part::Max | Part::Close | Part::More | Part::TabClose(_) | Part::Kill | Part::Wait | Part::Address => {
+                        Part::Float | Part::Minimize | Part::Max | Part::Close | Part::More | Part::TabClose(_) | Part::Kill | Part::Wait | Part::Address => {
                             Some(Grab::Button { window: target, part })
                         }
                         Part::Resize(edges) => {
@@ -262,6 +326,9 @@ impl App {
             (Part::Close, _) => self.act_on(Some(window), Action::Close),
             (Part::Float, _) => self.act_on(Some(window), Action::Float),
             (Part::Max, _) => self.act_on(Some(window), Action::Maximise),
+            (Part::Minimize, _) => {
+                self.minimize(window, "button");
+            }
             (Part::Kill, _) => {
                 let _ = self.end_window(window, "Beenden");
             }
@@ -297,11 +364,23 @@ impl App {
 
     /// The wheel on a tile's header turns its pages; elsewhere it goes to the client.
     pub(crate) fn wheel(&mut self, steps: f64, time: u32) {
+        if self.sofa.listens() {
+            return self.sofa_wheel(steps);
+        }
         if self.lib.open {
             return self.library_wheel(steps);
         }
+        if self.feld.open {
+            return;
+        }
+        if self.rewind.open {
+            return self.rewind_wheel(steps);
+        }
         if let Hit::Spot(crate::desk::Spot::Page(pid, _)) = self.hit(self.pointer) {
             return self.page_scroll(pid, steps);
+        }
+        if let Hit::Spot(crate::desk::Spot::Assist(_)) = self.hit(self.pointer) {
+            return self.assist_wheel(steps);
         }
         if let Hit::Deco(_, Place::Tiled { tile, .. }, _) = self.hit(self.pointer) {
             if self.ws.flip(tile, if steps > 0.0 { 1 } else { -1 }) {

@@ -16,7 +16,7 @@ FWD=$((LO + 100))
 TOKEN="mc2-scenario-token-7f3a"
 LOG="$RUN_DIR/serial.log"
 
-# Needs two kernel lines the desk applies (plan/notes/mc-MC-2.md, change request 1): without net::init the MCP
+# Needs two kernel lines the desk applies (mcp::set_boot_info and net::init): without net::init the MCP
 # server listens on the loopback only, without mcp::set_boot_info the generation is unknown.
 if ! grep -q "mcp::set_boot_info" kernel/src/main.rs || ! grep -q "net::init" kernel/src/main.rs; then
     echo "SKIP: kernel/src/main.rs lacks mcp::set_boot_info or net::init (desk change request 1 of MC-2 / NW-3); MCP is not reachable from the host yet"

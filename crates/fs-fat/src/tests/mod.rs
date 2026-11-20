@@ -1,6 +1,7 @@
 //! Host tests on real FAT32 images (mkfs.fat, mtools, fsck.fat).
 mod basic;
 mod cut;
+mod fsinfo;
 mod rules;
 mod tricky;
 mod util;
@@ -13,3 +14,6 @@ mod prio;
 mod cold;
 mod sizes;
 mod pf4;
+mod crash;
+mod unzeroed;
+mod trash;

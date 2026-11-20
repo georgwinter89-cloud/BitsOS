@@ -443,6 +443,15 @@ fn fallocate_on_a_memfd_charges_punches_and_obeys_the_seals() {
     assert_eq!(fallocate(&s, fd, PUNCH | KEEP, 0, P), -EPERM);
     assert_eq!(fallocate(&s, fd, 0, 0, P), 0);
     assert_eq!(cache().charged(), 8);
+    // L7-VFS: an end in the last page below MAX_FILE_SIZE is EFBIG (shmem's wraparound check), KEEP_SIZE too;
+    // a punch there is not checked.
+    let near = i64::MAX as u64 - P;
+    assert_eq!(fallocate(&s, fd, 0, near, 100), -EPERM, "F_SEAL_GROW is checked first");
+    let g = memfd(&s, &mem, b"far", 0);
+    assert_eq!(fallocate(&s, g, 0, near, 100), -EFBIG);
+    assert_eq!(fallocate(&s, g, KEEP, near, 100), -EFBIG);
+    assert_eq!(fallocate(&s, g, KEEP, near - P, P), 0, "an end one page lower is no wraparound");
+    assert_eq!(fallocate(&s, g, PUNCH | KEEP, near, 100), 0);
     let _ = ns;
 }
 

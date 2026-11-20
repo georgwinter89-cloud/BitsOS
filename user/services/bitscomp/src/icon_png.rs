@@ -1,5 +1,5 @@
 //! PK-L1a: the library's PNG decoder (PNG spec, 3rd edition: chunks, CRC-32, filters, colour types) on miniz_oxide's
-//! inflate, and the box filter that brings an icon to the tile size in premultiplied ARGB (Pixman's a8r8g8b8). Every
+//! inflate, and the box filter that brings an icon to the tile size in premultiplied ARGB (a8r8g8b8). Every
 //! colour type and bit depth, no Adam7 interlace (such a file gets the fallback icon); at most `MAX_SIDE` per side.
 //! A broken or hostile file is refused with a reason, never a panic.
 

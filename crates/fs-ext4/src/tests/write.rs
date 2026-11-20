@@ -125,7 +125,7 @@ fn open_unlinked_file_lives_on_the_orphan_list() {
     let img = mkfs(&s, "32M", &[], None);
     let (dev, v) = mount(img);
     let f = file(&v, ROOT, "tmp");
-    v.hold(f).unwrap();
+    let hold = v.hold(f).unwrap();
     put(&v, f, 0, &pattern(200_000, 3));
     let free_before = v.statfs().unwrap().bfree;
     v.remove(ROOT, b"tmp", f).unwrap();
@@ -139,7 +139,7 @@ fn open_unlinked_file_lives_on_the_orphan_list() {
     assert_eq!(crate::le::g32(&v2.st.lock().sb, crate::sb::LAST_ORPHAN), 0);
     v2.sync_fs().unwrap();
     assert_clean(&s, &d2.image(), "orphan cleanup at mount");
-    v.forget(f);
+    v.forget(hold.slot);
     let _ = v.stat(ROOT);
     assert!(v.statfs().unwrap().bfree > free_before);
     v.sync_fs().unwrap();

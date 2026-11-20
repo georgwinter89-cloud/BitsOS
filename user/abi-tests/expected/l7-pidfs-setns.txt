@@ -1,0 +1,46 @@
+target ready = yes
+setns(pidfd, 0) = -EINVAL
+setns(pidfd, CLONE_NEWUTS|CLONE_VM) = -EINVAL
+setns(pidfd, CLONE_NEWUTS) unprivileged = -EPERM
+setns(pidfd, CLONE_NEWNET|CLONE_NEWUTS) unprivileged = -EPERM
+setns(own pidfd, CLONE_NEWUSER) = -EINVAL
+setns(own pidfd, CLONE_NEWUSER|CLONE_NEWUTS) = -EINVAL
+setns(eventfd, CLONE_NEWUTS) = -EINVAL
+setns(closed fd, CLONE_NEWUTS) = -EBADF
+parent: nodename not the target's = yes
+child: setns(pidfd, CLONE_NEWUSER|CLONE_NEWPID) = -EPERM
+child: still in the parent's user namespace = yes
+child: uid 1000
+user+pid: exit 0
+child: setns(pidfd, CLONE_NEWUSER|CLONE_NEWUTS|CLONE_NEWNET) = 0
+child: nodename pidfs-target
+child: user, uts, net as the target's = yes yes yes, mnt not = yes
+child: uid 65534
+user+uts+net: exit 0
+child: chdir(/proc) = 0
+child: setns(pidfd, USER|MNT|UTS|IPC|NET) = 0
+child: cwd /
+child: user, mnt, uts, ipc, net as the target's = yes yes yes yes yes
+child: setns(pidfd, CLONE_NEWUTS) again = 0
+child: setns(pidfd, CLONE_NEWUSER) again = -EINVAL
+all: exit 0
+child: setns(pidfd, CLONE_NEWUSER|CLONE_NEWUTS) with a CLONE_FS sibling = -EINVAL
+sibling: exit 0
+shared fs: exit 0
+child: setns(thread pidfd, CLONE_NEWUSER|CLONE_NEWUTS) = 0
+child: nodename pidfs-target
+thread pidfd: exit 0
+child: setns(zombie's pidfd, CLONE_NEWUTS) = -ESRCH
+zombie: exit 0
+target: exit 0
+setns(reaped's pidfd, CLONE_NEWUTS) = -ESRCH
+setns(non-dumpable's pidfd, CLONE_NEWUTS) = -EPERM
+setns(non-dumpable's pidfd, 0) = -EINVAL
+non-dumpable: exit 0
+pid namespace target ready = yes
+child: setns(pidfd, CLONE_NEWUSER|CLONE_NEWPID) = 0
+child: pid_for_children is the target's pid namespace = yes, own pid namespace unchanged = yes
+grandchild: NSpid levels 2
+grandchild: exit 0
+user+pid: exit 0
+pid namespace target: exit 0

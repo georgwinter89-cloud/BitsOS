@@ -10,7 +10,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hal::mmio::IoMem;
 use crate::layout as l;
-use ksync::{IrqSpinLock, IrqSpinLockGuard, Once};
+use ksync::{IrqSpinLock, IrqSpinLockGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DcnError {
@@ -29,7 +29,7 @@ pub const AZ_ENDPOINT_DATA: u32 = 0xE11C;
 /// `try_pair` gives up after this many tries: a holder on another CPU is done with one access within
 /// microseconds; one that never lets go (a stopped CPU) is not waited for (B4).
 const PAIR_TRIES: u32 = 1 << 16;
-/// GX-6 fixer: the MM_INDEX/MM_DATA/MM_INDEX_HI window (byte 0x0, 0x4, 0x18; linux-6.6 amdgpu_discovery.c:94-97).
+/// GX-6 fixer: the MM_INDEX/MM_DATA/MM_INDEX_HI window (byte 0x0, 0x4, 0x18; linux-7.3.1 amdgpu_discovery.c:144-146).
 /// `read`/`write` refuse these offsets (OutOfRange): only the holder of [`MmWindow`] touches them, so nobody can
 /// move the index under a reader's feet.
 pub const MM_INDEX: u32 = 0x0;
@@ -44,7 +44,10 @@ pub static AZ_ENDPOINT_PAIR: IrqSpinLock<()> = IrqSpinLock::named("dcn.az_pair",
 /// interrupts off and maybe on the panic path, so it takes no lock and does not log through klog). The ring is a
 /// diagnostic window, not a limit: every write is counted and made.
 const LOG_SLOTS: usize = 64;
-struct WriteLog {
+/// GPY: the foreign writes' own ring. The shared ring holds well under a second of a desktop with a moving pointer
+/// (3 cursor writes per move, the flips, the sound's selects), so a red GX-D9 run could not name its writes.
+const FOREIGN_SLOTS: usize = 32;
+pub(crate) struct WriteLog {
     total: AtomicU64,
     mismatched: AtomicU64,
     /// owner << 61 | offset << 32 | value written (bit 63: masked); the read-back sits in `read` at the same slot.
@@ -55,32 +58,144 @@ struct WriteLog {
     /// address): the picture proof lists them apart from the writes it must not see.
     flips: AtomicU64,
     cursor: AtomicU64,
+    /// GPY: the sound's endpoint index selects (`Owner::AudioIndex`).
+    audio: AtomicU64,
     flip_pipes: [AtomicU64; l::PIPES as usize],
     cursor_pipes: [AtomicU64; l::PIPES as usize],
+    /// GPY: the writes of no owner, counted on their own (`Marks::others_until` subtracts nothing, so an owned
+    /// write in flight cannot pull the count down): `begun` before the write is made, `done` after it.
+    others_begun: AtomicU64,
+    others_done: AtomicU64,
+    /// GPY: the last foreign writes, packed as `slots`, with their number among the foreign writes plus 1 (0: empty).
+    foreign: [AtomicU64; FOREIGN_SLOTS],
+    foreign_read: [AtomicU32; FOREIGN_SLOTS],
+    foreign_n: [AtomicU64; FOREIGN_SLOTS],
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
 const SLOT: AtomicU64 = AtomicU64::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const RSLOT: AtomicU32 = AtomicU32::new(0);
-static LOG: WriteLog = WriteLog {
-    total: AtomicU64::new(0),
-    mismatched: AtomicU64::new(0),
-    slots: [SLOT; LOG_SLOTS],
-    read: [RSLOT; LOG_SLOTS],
-    flips: AtomicU64::new(0),
-    cursor: AtomicU64::new(0),
-    flip_pipes: [SLOT; l::PIPES as usize],
-    cursor_pipes: [SLOT; l::PIPES as usize],
-};
+impl WriteLog {
+    pub(crate) const fn new() -> WriteLog {
+        WriteLog {
+        total: AtomicU64::new(0),
+        mismatched: AtomicU64::new(0),
+        slots: [SLOT; LOG_SLOTS],
+        read: [RSLOT; LOG_SLOTS],
+        flips: AtomicU64::new(0),
+        cursor: AtomicU64::new(0),
+        audio: AtomicU64::new(0),
+        flip_pipes: [SLOT; l::PIPES as usize],
+        cursor_pipes: [SLOT; l::PIPES as usize],
+        others_begun: AtomicU64::new(0),
+        others_done: AtomicU64::new(0),
+        foreign: [SLOT; FOREIGN_SLOTS],
+        foreign_read: [RSLOT; FOREIGN_SLOTS],
+        foreign_n: [SLOT; FOREIGN_SLOTS],
+        }
+    }
+
+    /// Before a write is made: a foreign write's number among the foreign writes.
+    pub(crate) fn begin(&self, owner: Owner) -> Option<u64> {
+        (owner == Owner::Other).then(|| self.others_begun.fetch_add(1, Ordering::AcqRel))
+    }
+
+    /// After the write (`made`: it reached the register; `read`: its read-back): counts it and logs it. Returns
+    /// whether the read-back differs in the compared bits.
+    pub(crate) fn end(&self, n: Option<u64>, made: bool, offset: u32, value: u32, read: u32, check: u32, owner: Owner) -> bool {
+        if !made {
+            if n.is_some() {
+                self.others_done.fetch_add(1, Ordering::AcqRel);
+            }
+            return false;
+        }
+        let seq = self.total.fetch_add(1, Ordering::AcqRel);
+        match owner {
+            Owner::Other => {}
+            Owner::Flip => {
+                self.flips.fetch_add(1, Ordering::AcqRel);
+            }
+            Owner::Cursor => {
+                self.cursor.fetch_add(1, Ordering::AcqRel);
+            }
+            Owner::AudioIndex => {
+                self.audio.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        if let Some(p) = pipe_of(owner, offset) {
+            let per = if owner == Owner::Flip { &self.flip_pipes } else { &self.cursor_pipes };
+            per[p].fetch_add(1, Ordering::AcqRel);
+        }
+        let flag = if check == u32::MAX { 0 } else { MASKED };
+        let packed = flag | owner.bits() << OWNER_SHIFT | u64::from(offset & 0x1FFF_FFFF) << 32 | u64::from(value);
+        let i = (seq % LOG_SLOTS as u64) as usize;
+        self.slots[i].store(packed, Ordering::Release);
+        self.read[i].store(read, Ordering::Release);
+        if let Some(n) = n {
+            let i = (n % FOREIGN_SLOTS as u64) as usize;
+            self.foreign_n[i].store(0, Ordering::Release);
+            self.foreign[i].store(packed, Ordering::Release);
+            self.foreign_read[i].store(read, Ordering::Release);
+            self.foreign_n[i].store(n + 1, Ordering::Release);
+            self.others_done.fetch_add(1, Ordering::AcqRel);
+        }
+        let mismatch = (read ^ value) & check != 0;
+        if mismatch {
+            self.mismatched.fetch_add(1, Ordering::AcqRel);
+        }
+        mismatch
+    }
+
+    pub(crate) fn marks(&self) -> Marks {
+        let ld = |a: &AtomicU64| a.load(Ordering::Acquire);
+        Marks {
+            total: ld(&self.total),
+            others_begun: ld(&self.others_begun),
+            others_done: ld(&self.others_done),
+            flips: ld(&self.flips),
+            cursor: ld(&self.cursor),
+            audio: ld(&self.audio),
+            flip_pipes: core::array::from_fn(|i| ld(&self.flip_pipes[i])),
+            cursor_pipes: core::array::from_fn(|i| ld(&self.cursor_pipes[i])),
+        }
+    }
+
+    /// The foreign writes the own ring still holds, oldest first; `seq` is the number among the foreign writes.
+    pub(crate) fn foreign(&self) -> alloc::vec::Vec<LoggedWrite> {
+        let mut v: alloc::vec::Vec<LoggedWrite> = (0..FOREIGN_SLOTS)
+            .filter_map(|i| {
+                let n = self.foreign_n[i].load(Ordering::Acquire);
+                let s = self.foreign[i].load(Ordering::Acquire);
+                let read = self.foreign_read[i].load(Ordering::Acquire);
+                // A slot rewritten while it was read is left out (a diagnostic window, not the count).
+                (n != 0 && self.foreign_n[i].load(Ordering::Acquire) == n).then(|| unpack(n - 1, s, read))
+            })
+            .collect();
+        v.sort_by_key(|w| w.seq);
+        v
+    }
+}
+
+fn unpack(seq: u64, s: u64, read: u32) -> LoggedWrite {
+    LoggedWrite { seq, offset: (s >> 32) as u32 & 0x1FFF_FFFF, wrote: s as u32, read, masked: s & MASKED != 0, owner: Owner::from_bits(s >> OWNER_SHIFT) }
+}
 
 /// GX-7m2: who made a display write. The picture proof of a GX run (GX-D9) counts every write but the
 /// compositor's own page flips (`flip::order`) and cursor updates (`cursor`), which it lists apart.
+///
+/// GPY (desk 15.11., GX-D9 red at Gen 159/160): `AudioIndex` is the sound's audio endpoint index select and its
+/// put-back under the AZ pair (`hda::hdmi`, every read of the display side's audio state, e.g. each read of
+/// /sys/bitsos/snd_output_status, which the music service makes once a second). It selects which endpoint
+/// register the data port shows and is written back before the pair is let go: no picture register moves (Linux
+/// writes the same index for its reads, dce_audio.c:70-84 read_indirect_azalia_reg). Only a write of
+/// AZ_ENDPOINT_INDEX can carry it (`Owner::of`); the endpoint's data writes stay `Other` and count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     Other,
     Flip,
     Cursor,
+    AudioIndex,
 }
 
 impl Owner {
@@ -89,6 +204,7 @@ impl Owner {
             Owner::Other => 0,
             Owner::Flip => 1,
             Owner::Cursor => 2,
+            Owner::AudioIndex => 3,
         }
     }
 
@@ -96,33 +212,48 @@ impl Owner {
         match b & 3 {
             1 => Owner::Flip,
             2 => Owner::Cursor,
+            3 => Owner::AudioIndex,
             _ => Owner::Other,
+        }
+    }
+
+    /// The owner a write of `offset` is logged under: an endpoint index select only on the index register, so a
+    /// wrong label can never hide a picture write.
+    pub fn of(self, offset: u32) -> Owner {
+        match self {
+            Owner::AudioIndex if offset != AZ_ENDPOINT_INDEX => Owner::Other,
+            o => o,
         }
     }
 }
 
-/// GX-7m2: the write counts by owner at one moment (`marks`); two of them bound a run. `total` is read before the
-/// owners' counts and `total_after` after them (a writer adds to the total first), so a write in flight at either
-/// end is counted against the run, never hidden.
+/// GX-7m2: the write counts by owner at one moment (`marks`); two of them bound a run. GPY: the foreign writes are
+/// counted on their own, begun and done, so a foreign write in flight at either end is counted against the run,
+/// never hidden, and no owned write can make up for one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Marks {
+    /// Every write (owned or not) since boot.
     pub total: u64,
-    pub total_after: u64,
+    pub others_begun: u64,
+    pub others_done: u64,
     pub flips: u64,
     pub cursor: u64,
+    /// GPY: the sound's endpoint index selects (`Owner::AudioIndex`).
+    pub audio: u64,
     pub flip_pipes: [u64; l::PIPES as usize],
     pub cursor_pipes: [u64; l::PIPES as usize],
 }
 
 impl Marks {
-    /// Every write between `self` and `later` (at least).
-    pub fn all_until(&self, later: &Marks) -> u64 {
-        later.total_after.wrapping_sub(self.total)
+    /// Writes between `self` and `later` that were neither the compositor's nor the sound's index selects (at
+    /// least): every one begun before `later` and not done before `self`.
+    pub fn others_until(&self, later: &Marks) -> u64 {
+        later.others_begun.wrapping_sub(self.others_done)
     }
 
-    /// Writes between `self` and `later` that were not the compositor's (at least).
-    pub fn others_until(&self, later: &Marks) -> u64 {
-        self.all_until(later).saturating_sub(later.flips.wrapping_sub(self.flips)).saturating_sub(later.cursor.wrapping_sub(self.cursor))
+    /// The foreign writes' numbers (`LoggedWrite::seq` of `foreign_writes`) that may belong between the two.
+    pub fn others_range(&self, later: &Marks) -> core::ops::Range<u64> {
+        self.others_done..later.others_begun
     }
 
     /// The pipes the compositor flipped (`flip`) or moved the cursor on between `self` and `later`.
@@ -132,14 +263,18 @@ impl Marks {
     }
 }
 
+/// The display engine's write log (GP-GPU1: its register owner's, `DcnRegs`; no owner attached, no write made).
+fn log_now() -> Option<&'static WriteLog> {
+    DcnRegs::attached_now().map(|r| &r.log)
+}
+
 pub fn marks() -> Marks {
-    let ld = |a: &AtomicU64| a.load(Ordering::Acquire);
-    let total = ld(&LOG.total);
-    let flips = ld(&LOG.flips);
-    let cursor = ld(&LOG.cursor);
-    let flip_pipes = core::array::from_fn(|i| ld(&LOG.flip_pipes[i]));
-    let cursor_pipes = core::array::from_fn(|i| ld(&LOG.cursor_pipes[i]));
-    Marks { total, total_after: ld(&LOG.total), flips, cursor, flip_pipes, cursor_pipes }
+    log_now().map_or_else(Marks::default, WriteLog::marks)
+}
+
+/// GPY: the last foreign writes (at most 32), oldest first, numbered among the foreign writes since boot.
+pub fn foreign_writes() -> alloc::vec::Vec<LoggedWrite> {
+    log_now().map_or_else(alloc::vec::Vec::new, WriteLog::foreign)
 }
 
 /// The pipe an owned write names (`None` for the lock and other registers of the sequence).
@@ -147,25 +282,19 @@ fn pipe_of(owner: Owner, offset: u32) -> Option<usize> {
     (0..l::PIPES).find(|&p| match owner {
         Owner::Flip => offset == l::hubp(p, l::HUBP_ADDR),
         Owner::Cursor => [l::CUR_POSITION, l::CUR_CONTROL, l::CUR_ADDR].iter().any(|&r| offset == l::hubp(p, r)),
-        Owner::Other => false,
+        Owner::Other | Owner::AudioIndex => false,
     }).map(|p| p as usize)
 }
 
-/// The window's lock, interrupts off while held (Linux: mmio_idx_lock, amdgpu_device.c:260).
-static MM_INDEX_PAIR: IrqSpinLock<()> = IrqSpinLock::named("amdgpu.mm_index", ());
-/// Index writes through the window since boot: counted here, not in the display log, so a discovery read
-/// (about 2 100 index writes) does not push the display writes out of the ring that read-back and undo use.
-static WINDOW_WRITES: AtomicU64 = AtomicU64::new(0);
-
-/// Index writes made through [`MmWindow`] since boot.
+/// Index writes made through [`MmWindow`] since boot (the display engine's register owner's count).
 pub fn window_writes() -> u64 {
-    WINDOW_WRITES.load(Ordering::Acquire)
+    DcnRegs::attached_now().map_or(0, |r| r.window_writes.load(Ordering::Acquire))
 }
 
 /// The held MM_INDEX window: the only way to the three window offsets.
 pub struct MmWindow<'a> {
     regs: &'a DcnRegs,
-    _g: IrqSpinLockGuard<'static, ()>,
+    _g: IrqSpinLockGuard<'a, ()>,
 }
 
 impl MmWindow<'_> {
@@ -190,7 +319,7 @@ impl MmWindow<'_> {
         }
         let o = self.check(offset)?;
         self.regs.io.write32(o, value).map_err(|_| DcnError::OutOfRange)?;
-        WINDOW_WRITES.fetch_add(1, Ordering::AcqRel);
+        self.regs.window_writes.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -215,25 +344,18 @@ const OWNER_SHIFT: u32 = 61;
 
 /// Writes made since boot, and how many of them read back another value.
 pub fn write_counts() -> (u64, u64) {
-    (LOG.total.load(Ordering::Acquire), LOG.mismatched.load(Ordering::Acquire))
+    log_now().map_or((0, 0), |log| (log.total.load(Ordering::Acquire), log.mismatched.load(Ordering::Acquire)))
 }
 
 /// The most recent writes, oldest first (at most the ring's size; `seq` numbers them since boot).
 pub fn recent_writes() -> alloc::vec::Vec<LoggedWrite> {
-    let total = LOG.total.load(Ordering::Acquire);
+    let Some(log) = log_now() else { return alloc::vec::Vec::new() };
+    let total = log.total.load(Ordering::Acquire);
     let first = total.saturating_sub(LOG_SLOTS as u64);
     (first..total)
         .map(|seq| {
             let i = (seq % LOG_SLOTS as u64) as usize;
-            let s = LOG.slots[i].load(Ordering::Acquire);
-            LoggedWrite {
-                seq,
-                offset: (s >> 32) as u32 & 0x1FFF_FFFF,
-                wrote: s as u32,
-                read: LOG.read[i].load(Ordering::Acquire),
-                masked: s & MASKED != 0,
-                owner: Owner::from_bits(s >> OWNER_SHIFT),
-            }
+            unpack(seq, log.slots[i].load(Ordering::Acquire), log.read[i].load(Ordering::Acquire))
         })
         .collect()
 }
@@ -246,17 +368,30 @@ pub struct DcnRegs {
     pci: pci::PciFunction,
     /// BAR5 phys, size.
     bar5: (u64, u64),
+    /// GP-GPU1: this owner's write log, the MM_INDEX window's lock (interrupts off while held; Linux: mmio_idx_lock,
+    /// amdgpu_device.c:260) and its index writes since boot (counted apart from the log, so a discovery read of about
+    /// 2 100 index writes does not push the display writes out of the ring that read-back and undo use). They were
+    /// statics while the kernel knew one GPU.
+    log: WriteLog,
+    mm_pair: IrqSpinLock<()>,
+    window_writes: AtomicU64,
+    /// The discovery copy of this boot that parsed (`probe::keep`), and the probe owners' totals (`state`).
+    pub(crate) disc_copy: ksync::Mutex<Option<crate::probe::Found>>,
+    pub(crate) probe_totals: ksync::Mutex<crate::gpucore::bringup::Totals>,
 }
-
-static ATTACH: Once<Option<DcnRegs>> = Once::new();
 
 fn refuse(function: &str, why: &str) -> Option<DcnRegs> {
     klog::event!(Warn, "dcn", "attach.refused", function = function, why = why; "no display engine");
     None
 }
 
-fn probe() -> Option<DcnRegs> {
-    let f = pci::devices().into_iter().find(|f| f.vendor == 0x1002 && f.class_code() == 0x03)?;
+/// The register owner of a device of the 780M's family (`devs::Device::regs`): the function the registry found (the
+/// first AMD display function that is no card of another family, as this probe always took it), decided by the gate.
+pub(crate) fn probe(dev: &crate::devs::Device) -> Option<DcnRegs> {
+    if dev.family != crate::devs::Family::Phoenix {
+        return None;
+    }
+    let f = dev.pci.clone()?;
     let name = alloc::format!("{}", f.addr);
     if f.command() & 0x2 == 0 {
         return refuse(&name, "memory decode off");
@@ -279,18 +414,28 @@ fn probe() -> Option<DcnRegs> {
     }
     klog::event!(Info, "dcn", "attached", function = name.as_str(), bar5 = phys, size = size;
         "display registers mapped uncached");
-    Some(DcnRegs { io, function: name, pci: f, bar5: (phys, size) })
+    Some(DcnRegs {
+        io,
+        function: name,
+        pci: f,
+        bar5: (phys, size),
+        log: WriteLog::new(),
+        mm_pair: IrqSpinLock::named("amdgpu.mm_index", ()),
+        window_writes: AtomicU64::new(0),
+        disc_copy: ksync::Mutex::named("amdgpu.disc_copy", None),
+        probe_totals: ksync::Mutex::named("amdgpu.bringup", Default::default()),
+    })
 }
 
 impl DcnRegs {
     /// The display engine, attached on first use (thread context: it maps BAR5 and logs).
     pub fn attached() -> Option<&'static DcnRegs> {
-        ATTACH.get_or_init(probe).as_ref()
+        crate::devs::registry().first(crate::devs::Family::Phoenix).and_then(|d| d.regs())
     }
 
     /// The engine only if an earlier call attached it: for Quiesce and interrupt context (never maps or logs).
     pub fn attached_now() -> Option<&'static DcnRegs> {
-        ATTACH.get().and_then(Option::as_ref)
+        crate::devs::registry_now().and_then(|r| r.first(crate::devs::Family::Phoenix)).and_then(|d| d.dcn.get()).and_then(Option::as_ref)
     }
 
     pub fn function(&self) -> &str {
@@ -336,30 +481,15 @@ impl DcnRegs {
     /// `write_masked` on behalf of `owner` (GX-7m2: the compositor's flips and cursor updates are told apart).
     pub fn write_owned(&self, offset: u32, value: u32, check: u32, owner: Owner) -> Result<(), DcnError> {
         let o = self.check(offset)?;
-        self.io.write32(o, value).map_err(|_| DcnError::OutOfRange)?;
-        let read = self.io.read32(o).unwrap_or(u32::MAX);
-        // The total before the owner's counts (`marks` reads the total on both sides of them): a write in flight
-        // while a run is bounded is counted against the run, never hidden.
-        let seq = LOG.total.fetch_add(1, Ordering::AcqRel);
-        match owner {
-            Owner::Other => {}
-            Owner::Flip => {
-                LOG.flips.fetch_add(1, Ordering::AcqRel);
-            }
-            Owner::Cursor => {
-                LOG.cursor.fetch_add(1, Ordering::AcqRel);
-            }
+        let owner = owner.of(offset);
+        let n = self.log.begin(owner);
+        let made = self.io.write32(o, value).is_ok();
+        let read = if made { self.io.read32(o).unwrap_or(u32::MAX) } else { 0 };
+        let mismatch = self.log.end(n, made, offset, value, read, check, owner);
+        if !made {
+            return Err(DcnError::OutOfRange);
         }
-        if let Some(p) = pipe_of(owner, offset) {
-            let per = if owner == Owner::Flip { &LOG.flip_pipes } else { &LOG.cursor_pipes };
-            per[p].fetch_add(1, Ordering::AcqRel);
-        }
-        let i = (seq % LOG_SLOTS as u64) as usize;
-        let flag = if check == u32::MAX { 0 } else { MASKED };
-        LOG.slots[i].store(flag | owner.bits() << OWNER_SHIFT | u64::from(offset & 0x1FFF_FFFF) << 32 | u64::from(value), Ordering::Release);
-        LOG.read[i].store(read, Ordering::Release);
-        if (read ^ value) & check != 0 {
-            LOG.mismatched.fetch_add(1, Ordering::AcqRel);
+        if mismatch {
             return Err(DcnError::ReadBackMismatch { offset, wrote: value, read });
         }
         Ok(())
@@ -384,7 +514,7 @@ impl DcnRegs {
     /// (B4), `None` = busy.
     pub fn try_mm_window(&self) -> Option<MmWindow<'_>> {
         for _ in 0..PAIR_TRIES {
-            if let Some(g) = MM_INDEX_PAIR.try_lock() {
+            if let Some(g) = self.mm_pair.try_lock() {
                 return Some(MmWindow { regs: self, _g: g });
             }
             core::hint::spin_loop();

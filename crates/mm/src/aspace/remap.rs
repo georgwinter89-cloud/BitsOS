@@ -182,6 +182,8 @@ impl AsCore {
         if len == 0 {
             return Ok(());
         }
+        // L7-VFS: the guards move with the entries (`move_page_tables` moves the markers).
+        let guards = g.guards.plan_move(old, len).map_err(|_| Errno::NoMem)?;
         if self.ctr.huge() > 0 {
             self.split_edges(g, old, old + len, tlb::Cause::Mremap);
             if (to ^ old) & (HUGE - 1) != 0 {
@@ -229,6 +231,9 @@ impl AsCore {
         if failed {
             return Err(Errno::NoMem);
         }
+        g.guards.apply_move(&guards, old, len, to);
+        // W35 MM-2: the program frames' owner words name their new addresses.
+        self.note_anon_range(to, to + len);
         REMAP_MOVED_PAGES.add(moved);
         Ok(())
     }

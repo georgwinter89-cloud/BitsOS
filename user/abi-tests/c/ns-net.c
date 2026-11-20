@@ -1,4 +1,4 @@
-/* SX-2: what a new network namespace offers (linux-6.6/net/core/net_namespace.c setup_net,
+/* SX-2: what a new network namespace offers (linux-7.3.1/net/core/net_namespace.c:433 setup_net,
  * drivers/net/loopback.c): only lo, and it is down, so no address and no route: connect/sendto ENETUNREACH,
  * bind to an address EADDRNOTAVAIL, the interface ioctls know only lo (net/core/dev_ioctl.c, net/ipv4/
  * devinet.c). AF_UNIX keeps working. `nw`: what NW-11's per-namespace views must add (see nw()). Uses only

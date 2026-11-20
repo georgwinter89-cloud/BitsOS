@@ -4,6 +4,7 @@
 //! as well, a read-only mount replays into memory and writes nothing, freeze leaves a clean image, a freed
 //! and reused metadata block is not overwritten by replay, hostile journals never panic.
 
+use super::lay::{cut_image, last_barrier};
 use super::util::*;
 use super::write::{file, put};
 use crate::inode::ROOT;
@@ -141,7 +142,7 @@ fn fsynced_changes(v: &Volume, dev: &MemDev) -> Vec<(usize, String, Vec<u8>)> {
 /// with the index of the request each came from.
 fn block_writes(log: &crate::dev::WriteLog, bs: usize) -> Vec<(usize, u64, Vec<u8>)> {
     let mut out = Vec::new();
-    for (i, (at, d)) in log.iter().filter(|(a, _)| *a != u64::MAX).enumerate() {
+    for (i, (at, d)) in log.iter().filter(|(a, _)| !crate::dev::is_mark(*a)).enumerate() {
         for (k, c) in d.chunks(bs).enumerate() {
             out.push((i + 1, at + (k * bs) as u64, c.to_vec()));
         }
@@ -212,8 +213,9 @@ impl Rng {
     }
 }
 
-/// Each cut keeps everything before the last flush and a random half of the block writes after it: the
-/// flushes around the commit block are what makes the journal safe on a disk with a volatile cache.
+/// Each cut keeps everything before the last flush, the commit blocks written through and a random half of the
+/// other block writes after that flush (`lay::cut_image`): the flush before the commit block and the block's
+/// own way through are what makes the journal safe on a disk with a volatile cache.
 #[test]
 fn reordered_cuts_with_a_journal_are_clean() {
     for (name, o) in jlayouts() {
@@ -232,22 +234,11 @@ fn reordered_cuts_with_a_journal_are_clean() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let step = (log.len() / 60).max(1);
         for k in (0..log.len()).step_by(step).chain([log.len()]) {
-            let flush = log[..k].iter().rposition(|(a, _)| *a == u64::MAX).map_or(0, |i| i + 1);
-            let durable = log[..flush].iter().filter(|(a, _)| *a != u64::MAX).count();
-            let mut img = before.clone();
-            for (i, (at, d)) in log[..k].iter().enumerate() {
-                if *at == u64::MAX {
-                    continue;
-                }
-                for (c, chunk) in d.chunks(v_bs(o)).enumerate() {
-                    if i >= flush && rng.next() & 1 == 0 {
-                        continue;
-                    }
-                    let a = *at as usize + c * chunk.len();
-                    img[a..a + chunk.len()].copy_from_slice(chunk);
-                }
-            }
-            check_replayed(&s, img, &want, durable, &format!("{name}: cut at request {k} of {} (flush at {flush}), half of the rest", log.len()), k % (4 * step) == 0);
+            let (img, flush) = cut_image(&before, &log, k, v_bs(o), Some(&mut || rng.next() & 1 == 1));
+            // An fsync that returned before the cut keeps its files, whatever the cache lost behind its commit
+            // block (FS-W: no second flush stands behind that block any more).
+            let returned = log[..k].iter().filter(|(a, _)| !crate::dev::is_mark(*a)).count();
+            check_replayed(&s, img, &want, returned, &format!("{name}: cut at request {k} of {} (flush at {flush}), half of the rest", log.len()), k % (4 * step) == 0);
         }
     }
 }
@@ -271,13 +262,7 @@ fn a_committed_transaction_is_replayed_by_us_and_by_e2fsck() {
         put(&v, f, 0, &data);
         v.flush().unwrap();
         let log = dev.take_log();
-        let last = log.iter().rposition(|(a, _)| *a == u64::MAX).unwrap();
-        let mut img = before.clone();
-        for (at, d) in &log[..last] {
-            if *at != u64::MAX {
-                img[*at as usize..*at as usize + d.len()].copy_from_slice(d);
-            }
-        }
+        let (img, _) = cut_image(&before, &log, last_barrier(&log), usize::MAX, None);
         assert_ne!(incompat(&img) & RECOVER, 0, "{name}: needs_recovery on disk");
         // e2fsck's replay.
         let (r1, r2, out) = repair(&s, &img);
@@ -369,7 +354,7 @@ fn the_log_wraps() {
     assert!(crate::journal::tail_resets() > resets, "the log never filled");
     let log = dev.take_log();
     drop(v);
-    let writes: Vec<_> = log.iter().filter(|(a, _)| *a != u64::MAX).collect();
+    let writes: Vec<_> = log.iter().filter(|(a, _)| !crate::dev::is_mark(*a)).collect();
     let step = (writes.len() / 30).max(1);
     for k in (writes.len() / 2..writes.len()).step_by(step).chain([writes.len()]) {
         let mut img = before.clone();
@@ -457,13 +442,7 @@ fn hostile_journals_never_panic() {
         }
         v.flush().unwrap();
         let log = dev.take_log();
-        let last = log.iter().rposition(|(a, _)| *a == u64::MAX).unwrap();
-        let mut img = before;
-        for (at, dd) in &log[..last] {
-            if *at != u64::MAX {
-                img[*at as usize..*at as usize + dd.len()].copy_from_slice(dd);
-            }
-        }
+        let (img, _) = cut_image(&before, &log, last_barrier(&log), usize::MAX, None);
         let jblocks: Vec<u64> = {
             let st = v.lock();
             let di = st.inode(None, 8).unwrap();

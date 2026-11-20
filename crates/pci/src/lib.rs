@@ -1,5 +1,5 @@
-//! PCI and the driver registry (owner: PC; contract `C: PciFunction, scan, devices, pci_driver!` with `Match`
-//! and `opt_in_key`, kept as G0 defined it and extended).
+//! PCI and the driver registry (owner: PC; contract `C: PciFunction, scan, devices, pci_driver!` with `Match`,
+//! kept as G0 defined it and extended).
 //!
 //! PC-1: configuration access over ECAM from CP-2's MCFG (every segment and bus range; 0xCF8 only as the
 //! fallback when there is no MCFG, with an event), a walk through the bridges as the firmware numbered them
@@ -34,11 +34,15 @@ pub mod device;
 pub mod ecam;
 pub mod enable;
 pub mod enumerate;
+pub mod failed;
+pub mod gp;
 pub mod guardview;
 pub mod irq;
 pub mod msi;
 pub mod node;
+pub mod nodes;
 pub mod optin;
+pub mod peer;
 pub mod raw;
 pub mod raw_kernel;
 pub mod registry;
@@ -50,6 +54,7 @@ mod ktest_bind;
 mod ktest_enable;
 mod ktest_msi;
 mod ktest_pc5;
+mod ktest_peer;
 mod ktests;
 #[cfg(test)]
 mod tests;
@@ -97,10 +102,12 @@ static ECAM: Once<ecam::EcamSpace> = Once::new();
 static GUARD_VIEW: guardview::GuardView = guardview::GuardView;
 
 /// The device tree of the last scan.
-pub(crate) static NODES: SpinLock<Vec<Node>> = SpinLock::named("pci.devices", Vec::new());
+pub(crate) static NODES: nodes::Nodes = nodes::Nodes::new();
 static SCANNED: Once<()> = Once::new();
 /// The root bus ranges `scan` walked (a rescan walks the same).
 static ROOTS: Once<Vec<Root>> = Once::new();
+/// What `peer` made of each MCFG range (empty on every machine but the Gaming-PC and the peer-root test boot).
+static PEER: Once<Vec<peer::Planned>> = Once::new();
 /// One rescan at a time; a second caller gets `Busy` instead of waiting (B4).
 static RESCANNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -204,16 +211,15 @@ impl PciFunction {
 
     /// Standard capability list (offset, id) pairs, loop- and pointer-checked.
     pub fn capabilities(&self) -> Vec<(u8, u8)> {
-        let _g = CFG_LOCK.lock();
-        let c = access();
-        let status = access::read16(c, self.loc(), 6);
-        caps::walk_std(c, self.loc(), status, &mut Vec::new())
+        // `pci.cfg` per access, as the walk: the list is made with no spin lock held.
+        let c = PerAccess(access());
+        let status = access::read16(&c, self.loc(), 6);
+        caps::walk_std(&c, self.loc(), status, &mut Vec::new())
     }
     /// Extended capability list (offset, id); empty without ECAM or for a conventional function.
     pub fn ext_capabilities(&self) -> Vec<(u16, u16)> {
         let space = self.config_size();
-        let _g = CFG_LOCK.lock();
-        caps::walk_ext(access(), self.loc(), space, &mut Vec::new()).into_iter().map(|(o, i, _)| (o, i)).collect()
+        caps::walk_ext(&PerAccess(access()), self.loc(), space, &mut Vec::new()).into_iter().map(|(o, i, _)| (o, i)).collect()
     }
     pub fn find_capability(&self, id: u8) -> Option<u8> {
         self.capabilities().into_iter().find(|&(_, i)| i == id).map(|(o, _)| o)
@@ -231,7 +237,7 @@ impl PciFunction {
             return None;
         }
         // `enable_device` may have sized it after a wake since this copy was made.
-        let known = self.bars.or_else(|| NODES.lock().iter().find(|n| n.loc == self.loc()).and_then(|n| n.bars));
+        let known = self.bars.or_else(|| NODES.get().iter().find(|n| n.loc == self.loc()).and_then(|n| n.bars));
         let bars = match known {
             Some(b) => b,
             None => {
@@ -244,10 +250,11 @@ impl PciFunction {
                     let keep = self.class >> 8 == 0x0600;
                     bars::size_bars(c, self.loc(), self.header_type, keep, phys_limit(), &mut Vec::new())
                 };
-                let mut nodes = NODES.lock();
-                if let Some(n) = nodes.iter_mut().find(|n| n.loc == self.loc()) {
-                    n.bars = Some(b);
-                }
+                NODES.update(|nodes| {
+                    if let Some(n) = nodes.iter_mut().find(|n| n.loc == self.loc()) {
+                        n.bars = Some(b);
+                    }
+                });
                 b
             }
         };
@@ -255,7 +262,7 @@ impl PciFunction {
     }
     /// All six slots as sized (`None` if the function was not sized: untouched, or still in D3hot).
     pub fn bars(&self) -> Option<Bars> {
-        self.bars.or_else(|| NODES.lock().iter().find(|n| n.loc == self.loc()).and_then(|n| n.bars))
+        self.bars.or_else(|| NODES.get().iter().find(|n| n.loc == self.loc()).and_then(|n| n.bars))
     }
     /// The CONFIG key that keeps this function untouched (R8d), if any.
     pub fn untouched(&self) -> Option<&'static str> {
@@ -298,22 +305,65 @@ pub fn build(c: &dyn ConfigAccess, roots: &[Root], key_for: impl Fn(&Node) -> Op
 
 /// Everything after the walk: untouched marking, BAR sizing (not for untouched functions, not in D3hot),
 /// MSI-X placement. `phys_limit`: first address past the CPU's physical address bits.
-pub fn finish(c: &dyn ConfigAccess, mut nodes: Vec<Node>, key_for: impl Fn(&Node) -> Option<&'static str>, phys_limit: u64) -> Vec<Node> {
+pub fn finish(c: &dyn ConfigAccess, nodes: Vec<Node>, key_for: impl Fn(&Node) -> Option<&'static str>, phys_limit: u64) -> Vec<Node> {
+    finish_with(nodes, key_for, |n| rescan::size_node(c, n, phys_limit))
+}
+
+/// `finish` with the sizing step the caller's (`scan` sizes under `pci.cfg`, a function at a time).
+fn finish_with(mut nodes: Vec<Node>, key_for: impl Fn(&Node) -> Option<&'static str>, mut size: impl FnMut(&mut Node) -> bool) -> Vec<Node> {
     optin::mark_untouched(&mut nodes, key_for);
     for n in nodes.iter_mut() {
-        rescan::size_node(c, n, phys_limit);
+        size(n);
     }
     nodes
 }
 
-/// Walks until no function answers "not ready" or the deadline passed (`rescan::crs_loop`). The lock is
-/// held per walk only; between walks the thread sleeps (B4). Returns the tree and the functions still "not
-/// ready" at the deadline (a rescan holds those instead of treating them as gone).
-fn walk_until_ready(c: &dyn ConfigAccess, roots: &[Root]) -> (Vec<Node>, Vec<Loc>) {
-    let mut walk = || {
+/// One configuration access at a time under `pci.cfg` (`device::Locked` for a given back end): what the walk
+/// reads through.
+struct PerAccess<'a>(&'a dyn ConfigAccess);
+
+impl ConfigAccess for PerAccess<'_> {
+    fn read32(&self, at: Loc, off: u16) -> u32 {
         let _g = CFG_LOCK.lock();
-        enumerate::walk(c, roots)
-    };
+        self.0.read32(at, off)
+    }
+    fn write32(&self, at: Loc, off: u16, v: u32) -> bool {
+        let _g = CFG_LOCK.lock();
+        self.0.write32(at, off, v)
+    }
+    fn modify32(&self, at: Loc, off: u16, f: &mut dyn FnMut(u32) -> Option<u32>) -> u32 {
+        let _g = CFG_LOCK.lock();
+        self.0.modify32(at, off, f)
+    }
+    fn space_size(&self, segment: u16, bus: u8) -> u16 {
+        self.0.space_size(segment, bus)
+    }
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+
+/// Sizes one function's BARs with `pci.cfg` held across the whole sequence (`bars`' rule: nobody else's access
+/// to the function falls between the all-ones write and the restore). The room for the problems it may note is
+/// made first, so nothing allocates under the lock.
+fn size_locked(c: &dyn ConfigAccess, n: &mut Node, phys_limit: u64) -> bool {
+    n.problems.reserve(rescan::sizing_problems(n));
+    let _g = CFG_LOCK.lock();
+    rescan::size_node(c, n, phys_limit)
+}
+
+/// Walks until no function answers "not ready" or the deadline passed (`rescan::crs_loop`); between walks the
+/// thread sleeps (B4). Returns the tree and the functions still "not ready" at the deadline (a rescan holds
+/// those instead of treating them as gone).
+///
+/// No lock is held across a walk. `pci.cfg` is taken for each access, so the lists the walk builds (the tree
+/// alone is several pages on the Mini-PC) grow where the heap may reclaim; under the lock it could not, and a
+/// machine with its memory in the page cache had no run of frames for them (generation 130, 12.11.2026). The
+/// walk only reads, and what it keeps of a function is safe against others' accesses in between: see
+/// plan/spec/usb.md §8.1.
+fn walk_until_ready(c: &dyn ConfigAccess, roots: &[Root]) -> (Vec<Node>, Vec<Loc>) {
+    let c = PerAccess(c);
+    let mut walk = || enumerate::walk(&c, roots);
     let mut wait = |ns: u64, not_ready: &[Loc]| {
         if let Some(first) = not_ready.first() {
             klog::event!(Debug, "pci", "crs.wait", functions = not_ready.len(), first = alloc::format!("{first}"), wait_ms = ns / 1_000_000;
@@ -397,7 +447,7 @@ pub fn usable_windows(mcfg: &[acpi::mcfg::Ecam], phys_bits: u32) -> (Vec<acpi::m
 /// be sized again). Returns the number of functions.
 pub fn scan() -> usize {
     if SCANNED.get().is_some() {
-        let n = NODES.lock().len();
+        let n = NODES.get().len();
         klog::event!(Warn, "pci", "scan.again", functions = n; "the tree was scanned already; kept");
         return n;
     }
@@ -408,17 +458,47 @@ pub fn scan() -> usize {
     PHYS_LIMIT.store(limit, core::sync::atomic::Ordering::Release);
     let (c, roots) = choose_access();
     ACCESS.set(c);
+    // B2, before `ROOTS` is set: planning walks and may sleep, like the walk below.
+    let roots = with_peer_roots(c, roots);
     let roots = ROOTS.get_or_init(|| roots);
     let (walked, _) = walk_until_ready(c, roots);
-    let nodes = {
-        let _g = CFG_LOCK.lock();
-        finish(c, walked, |n| registry::untouched_key(n.vendor, n.device, n.class), limit)
-    };
+    let nodes = finish_with(walked, |n| registry::untouched_key_at((n.loc.segment == 0).then_some((n.loc.bus, n.loc.dev, n.loc.func)), n.vendor, n.device, n.class), |n| size_locked(c, n, limit));
     log_tree(&nodes, c.name());
+    gp::log_after_scan(&nodes);
     let n = nodes.len();
-    *NODES.lock() = nodes;
+    NODES.set(nodes);
     acpi::set_pci_view(&GUARD_VIEW);
     n
+}
+
+/// B2: the ranges to walk, cut at root buses no bridge leads to (every machine, as Linux scans every host bridge;
+/// one without a second root keeps its ranges as they came).
+fn with_peer_roots(c: &'static dyn ConfigAccess, roots: Vec<Root>) -> Vec<Root> {
+    let (roots, planned) = peer::plan_all(&PerAccess(c), roots, gp::active(), &mut |r| walk_until_ready(c, r).0);
+    PEER.get_or_init(|| planned);
+    roots
+}
+
+/// The root bus ranges the scan walked (empty before `scan`).
+pub fn roots() -> Vec<Root> {
+    ROOTS.get().cloned().unwrap_or_default()
+}
+
+/// What the peer-root planner made of each MCFG range (empty before `scan`).
+pub fn peer_plan() -> Vec<peer::Planned> {
+    PEER.get().cloned().unwrap_or_default()
+}
+
+/// The PCI part of the Gaming-PC's report page, in plain German (plan/spec/gaming-pc.md §8).
+pub fn gp_report_lines() -> Vec<String> {
+    let nodes = NODES.get();
+    gp::report_lines(&nodes, &roots(), &peer_plan(), &|at| bind::binding(at).map(|b| String::from(b.driver)), &failed::last)
+}
+
+/// The picture line of the Gaming-PC's report page (plan/spec/gaming-pc.md §8): which card's memory holds the
+/// framebuffer the loader handed over (address, bytes, width, height; `None` = no picture).
+pub fn gp_picture_line(fb: Option<(u64, u64, u32, u32)>) -> String {
+    gp::picture_line(&NODES.get(), fb)
 }
 
 fn log_tree(nodes: &[Node], method: &str) {
@@ -450,39 +530,55 @@ fn log_node(n: &Node, nodes: &[Node]) {
             klog::event!(Debug, "pci", "bar", function = f.as_str(), index = i, kind = kind, start = klog::Hex(b.start()), size = klog::Hex(b.size()),
                 prefetch = prefetch, is64 = is64);
         }
-        if let Some(k) = n.untouched {
-            klog::event!(Info, "pci", "untouched", function = f.as_str(), key = k; "left untouched by its key (R8d: wlan=on etc. releases it; net_drivers=off holds network functions)");
+        match n.untouched {
+            Some(k) if gp_platform::never_touch::is_key(k) => {
+                klog::event!(Info, "pci", "untouched", function = f.as_str(), key = k; "on the Gaming-PC's never-touch list: no BAR sizing, no write, no driver, and no switch releases it");
+            }
+            Some(k) => {
+                klog::event!(Info, "pci", "untouched", function = f.as_str(), key = k; "left untouched by a rule (R8d: the Gaming-PC's network rule until gp_net=on, the disk guard while nvme_bind=off)");
+            }
+            None => {}
         }
         for p in &n.problems {
-            klog::event!(Warn, "pci", p.name(), function = f.as_str(), detail = alloc::format!("{p:?}"));
+            if p.normal() {
+                klog::event!(Info, "pci", p.name(), function = f.as_str(), detail = alloc::format!("{p:?}"));
+            } else {
+                klog::event!(Warn, "pci", p.name(), function = f.as_str(), detail = alloc::format!("{p:?}"));
+            }
         }
     }
 }
 
 /// Every function of the last scan (contract).
 pub fn devices() -> Vec<PciFunction> {
-    NODES.lock().iter().map(Node::function).collect()
+    NODES.get().iter().map(Node::function).collect()
 }
 
 /// Reads one register of AMD's System Management Network through the root complex 00:00.0's index/data
 /// pair (config 0x60/0x64), holding `pci.cfg` across both steps so no other configuration access splits the
-/// pair (linux-6.6/arch/x86/kernel/amd_nb.c:174-215, `amd_smn_read` under `smn_mutex`). `None` when 00:00.0
-/// is not AMD's root complex (QEMU's q35 has Intel's) or the index write fails. RB-7b CR1.
+/// pair (linux-7.3.1/arch/x86/kernel/amd_node.c:85-128, `amd_smn_read` under `smn_mutex`). `None` when 00:00.0
+/// is not AMD's root complex (QEMU's q35 has Intel's), the index write fails, or the data reads all ones
+/// (`PCI_POSSIBLE_ERROR`: Linux answers -ENODEV, so a dead read never shows as a value). RB-7b CR1.
 pub fn smn_read(addr: u32) -> Option<u32> {
     let root = Loc::new(0, 0, 0, 0);
     if function(root)?.vendor != 0x1022 {
         return None;
     }
     let _g = CFG_LOCK.lock();
-    if !access().write32(root, 0x60, addr) {
+    smn_read_on(access(), root, addr)
+}
+
+/// The index/data pair of `smn_read` on one back end (the caller holds `pci.cfg`).
+pub(crate) fn smn_read_on(acc: &dyn ConfigAccess, root: Loc, addr: u32) -> Option<u32> {
+    if !acc.write32(root, 0x60, addr) {
         return None;
     }
-    Some(access().read32(root, 0x64))
+    Some(acc.read32(root, 0x64)).filter(|&v| v != u32::MAX)
 }
 
 /// One function of the tree by its place.
 pub fn function(at: Loc) -> Option<PciFunction> {
-    NODES.lock().iter().find(|n| n.loc == at).map(Node::function)
+    NODES.get().iter().find(|n| n.loc == at).map(Node::function)
 }
 
 /// ktests: holds the one-rescan flag as a running rescan would (false when one is running).
@@ -521,11 +617,11 @@ pub fn rescan() -> Result<Rescan, BindError> {
     let c = access();
     let roots = ROOTS.get().cloned().unwrap_or_default();
     let (walked, not_ready) = walk_until_ready(c, &roots);
-    let old = NODES.lock().clone();
-    let m = {
-        let _g = CFG_LOCK.lock();
-        rescan::merge(c, &old, walked, &not_ready, |n| registry::untouched_key(n.vendor, n.device, n.class), phys_limit())
-    };
+    let old = NODES.get();
+    // The merge copies the tree (17 KiB on the Mini-PC): with no lock held; only a new function's BAR sizing
+    // takes `pci.cfg`.
+    let limit = phys_limit();
+    let m = rescan::merge_with(&old, walked, &not_ready, |n| registry::untouched_key_at((n.loc.segment == 0).then_some((n.loc.bus, n.loc.dev, n.loc.func)), n.vendor, n.device, n.class), |n| size_locked(c, n, limit));
     for h in &m.held {
         klog::event!(Warn, "pci", "rescan.uncertain", function = alloc::format!("{h}");
             "not ready at the deadline (or behind a function that was): kept as it was, driver stays");
@@ -535,15 +631,16 @@ pub fn rescan() -> Result<Rescan, BindError> {
     }
     let added: Vec<Loc> = m.added.iter().map(|&i| m.nodes[i].loc).collect();
     {
-        let mut cur = NODES.lock();
         let mut nodes = m.nodes;
-        // A function `enable_device` sized after a wake while we walked keeps those BARs.
-        for n in nodes.iter_mut().filter(|n| n.bars.is_none()) {
-            if let Some(now) = cur.iter().find(|c| rescan::same(c, n)) {
-                n.bars = now.bars;
+        NODES.update(|cur| {
+            // A function `enable_device` sized after a wake while we walked keeps those BARs.
+            for n in nodes.iter_mut().filter(|n| n.bars.is_none()) {
+                if let Some(now) = cur.iter().find(|c| rescan::same(c, n)) {
+                    n.bars = now.bars;
+                }
             }
-        }
-        *cur = nodes;
+            *cur = nodes.clone();
+        });
     }
     // After the tree no longer has them, so no new probe can claim them; a probe already running is marked
     // gone and removes again when it ends. Children before the bridge that carries them (Linux
@@ -562,12 +659,17 @@ pub fn rescan() -> Result<Rescan, BindError> {
 
 /// The device tree of the last scan, with bridges, capabilities, BARs and problems (`hw_info`, sysfs).
 pub fn tree() -> Vec<Node> {
-    NODES.lock().clone()
+    NODES.get().to_vec()
+}
+
+/// The same tree without a copy (sysfs asks on every lookup).
+pub fn nodes() -> nodes::Snapshot {
+    NODES.get()
 }
 
 /// The device tree as text lines for `hw_info`'s PCI section, with the driver bound to each function.
 pub fn tree_lines() -> Vec<String> {
     // pci.devices and pci.state are both leaves: never one under the other.
-    let nodes = NODES.lock().clone();
+    let nodes = NODES.get();
     tree::lines_with(&nodes, method(), &bind::driver_note)
 }

@@ -1,0 +1,19 @@
+[package]
+name = "bitsrun"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS program launcher (PK-3, B2/D8): a program's view from its per-program root tree, then the program"
+publish = false
+
+# bitspkg reads the store (current version, manifest, ProgramId, data folder); usys gives geteuid and prctl
+# without unsafe here.
+[dependencies]
+bitspkg = { path = "../bitspkg" }
+usys = { path = "../usys" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsrun"
+path = "src/main.rs"

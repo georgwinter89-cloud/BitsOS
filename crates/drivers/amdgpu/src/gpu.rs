@@ -13,9 +13,11 @@ use crate::ip::{self, IpBlock};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ksync::{Once, SpinLock};
+use ksync::SpinLock;
 
 pub struct Gpu {
+    /// The device this object is the 780M part of: its key, its node, its PSP run.
+    pub dev: &'static crate::devs::Device,
     pub regs: &'static DcnRegs,
     pub device: u16,
     pub revision: u8,
@@ -28,12 +30,23 @@ pub struct Gpu {
     pub bos: Option<SpinLock<BoManager>>,
 }
 
-static GPU: Once<Option<Gpu>> = Once::new();
-
 impl Gpu {
-    /// The device object, built on first use (thread context).
+    /// The 780M's device object of this machine (the registry's first device of its family), built on first use
+    /// (thread context). For the callers that mean "the APU": the boot's hooks and the hardware ktests.
     pub fn get() -> Option<&'static Gpu> {
-        GPU.get_or_init(build).as_ref()
+        crate::devs::registry().first(crate::devs::Family::Phoenix).and_then(|d| d.gpu())
+    }
+
+    /// The PSP run's state of this device.
+    pub fn st(&self) -> &'static crate::psplive::State {
+        let d: &'static crate::devs::Device = self.dev;
+        &d.psp
+    }
+
+    /// The node, held jobs and tool gate of this device.
+    pub fn hw(&self) -> &'static crate::hw::live::Slots {
+        let d: &'static crate::devs::Device = self.dev;
+        &d.hw
     }
 
     pub fn function(&self) -> &str {
@@ -95,8 +108,8 @@ pub fn evaluate(regs: &DcnRegs) -> Result<Attach, Refusal> {
     attach::gates(&pci_facts(regs), gop(), regs)
 }
 
-fn build() -> Option<Gpu> {
-    let regs = DcnRegs::attached()?;
+pub(crate) fn build(dev: &'static crate::devs::Device) -> Option<Gpu> {
+    let regs = dev.regs()?;
     let f = regs.pci();
     let bar0 = match f.bar(0) {
         Some(b @ pci::Bar::Mem { .. }) => Some((b.start(), b.size())),
@@ -120,7 +133,7 @@ fn build() -> Option<Gpu> {
     let bos = display.as_ref().ok().map(|a| {
         SpinLock::named("amdgpu.bos", BoManager::new(bo::carve_size(a), bo::reserved_from(a)))
     });
-    Some(Gpu { regs, device: f.device, revision: f.revision, bar0, blocks, display, bos })
+    Some(Gpu { dev, regs, device: f.device, revision: f.revision, bar0, blocks, display, bos })
 }
 
 /// A short text of the device object (the snapshot tool's first lines).

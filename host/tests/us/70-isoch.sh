@@ -74,7 +74,7 @@ finish() { # $1 = ktest name
     if grep -aq "xhci.failed\|xhci.slot_leaked\|lock.violation\|PANIC" "$log"; then fail "$NAME: failure line"; fi
 }
 
-boot us-isoch-stream "ktest=us.isoch.stream;usb_audio=off;loglevel=info"
+boot us-isoch-stream "ktest=us.isoch.stream;usb_iso_test=on;loglevel=info"
 finish us.isoch.stream
 frames=$(grep -ao "ktest.iso_stream .*frames=[0-9]*" "$RUN_DIR/$NAME.log" | sed 's/.*frames=//' | head -1)
 [ -n "$frames" ] || fail "no frame count in the log"

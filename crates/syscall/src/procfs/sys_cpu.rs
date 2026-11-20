@@ -1,6 +1,7 @@
-//! AB-7b: `/sys/devices/system/cpu` (linux-6.6 drivers/base/cpu.c: online, possible, present, offline,
-//! kernel_max, isolated, cpuN/online; drivers/base/topology.c: cpuN/topology/*). CPU lists in
-//! `bitmap_print_list_to_buf` form ("0-15"), masks as `%*pb` over `nr_cpu_ids` (the possible CPUs) bits.
+//! AB-7b: `/sys/devices/system/cpu` (linux-7.3.1/drivers/base/cpu.c:513 `cpu_root_attrs`: online, possible,
+//! present, kernel_max, offline, enabled, isolated, housekeeping, nohz_full (CachyOS builds NO_HZ_FULL), cpuN/online;
+//! drivers/base/topology.c: cpuN/topology/*). CPU lists in `bitmap_print_list_to_buf`
+//! form ("0-15"), masks as `%*pb` over `nr_cpu_ids` (the possible CPUs) bits.
 //! Topology comes from each CPU's own CPUID (`hal::smp::topology`); only online CPUs have a topology and a
 //! cache directory (Linux makes both in CPU-hotplug callbacks, `CPUHP_TOPOLOGY_PREPARE` and
 //! `cacheinfo_cpu_online`), and the masks hold online CPUs, as Linux's. `smt/` is kernel/cpu.c's.
@@ -108,6 +109,8 @@ impl DirSource for CpuDir {
         if online_set().contains(&n) {
             v.push(SynthEntry::dir("topology", Arc::new(TopologyDir(n))).with_perm(0o755).cookie(2));
             v.push(SynthEntry::dir("cache", Arc::new(CacheDir(n))).with_perm(0o755).cookie(3));
+            // SYS-K: the measured clock.
+            v.extend(super::sys_cpufreq::dir(n).map(|d| d.cookie(4)));
         }
         Ok(v)
     }
@@ -174,8 +177,13 @@ impl CpuRoot {
     fn files() -> Vec<SynthEntry> {
         let f = |name: &str, g: fn() -> String| SynthEntry::file(name, 0o444, Arc::new(Live::new(PAGE, move || Ok(g()))));
         alloc::vec![
+            // `register_cpu` sets every present CPU enabled (linux-7.3.1/drivers/base/cpu.c:441).
+            f("enabled", || list_line(0..possible(), possible())),
+            // No isolcpus= and no nohz_full= in V2: housekeeping is not enabled, the nohz_full mask is empty.
+            f("housekeeping", || String::from("\n")),
             f("isolated", || String::from("\n")),
             f("kernel_max", || format!("{KERNEL_MAX}\n")),
+            f("nohz_full", || String::from("\n")),
             f("offline", || {
                 let on = online_set();
                 list_line((0..possible()).filter(|c| !on.contains(c)), possible())

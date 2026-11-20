@@ -6,9 +6,12 @@ use crate::events::{Events, Level, q};
 use crate::journal::Journal;
 use crate::json::Json;
 use crate::key::{self, Applier, KeyDef, Safety};
+use crate::owners::Records;
+use crate::peer::Peer;
 use crate::store::{Paths, Place, Writer};
 use crate::value::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -47,6 +50,16 @@ pub struct Registry {
     pub(crate) journal: Journal,
     /// Namespace (first segment) -> the owner that defines keys in it (shared namespaces are not listed).
     pub(crate) owners: BTreeMap<String, String>,
+    /// Secret key -> the program it belongs to (`owners.rs`); kept in `owners.list`, also for keys whose owner
+    /// has not registered again since the start.
+    pub(crate) secrets: Records,
+    /// The providers whose keys settingsd made from the list `ai.providers` (`providers.rs`).
+    pub(crate) made: BTreeSet<String>,
+    /// Where the system's own programs live (settingsd's directory): `builtin::HOLDERS` are looked for
+    /// here.
+    pub(crate) sysdir: Option<PathBuf>,
+    /// The kernel's word on who holds the screen (`vouch.rs`: whose `confirmed` is Georg's own yes).
+    pub(crate) holder: crate::vouch::Holder,
     /// Keys changed while on the fallback, carried to the stick at the resync.
     pub(crate) pending: BTreeSet<String>,
     /// Shared with every snapshot, so a watcher can be added without the registry lock.
@@ -61,6 +74,12 @@ pub struct Registry {
     pub(crate) retry_every: Duration,
     /// A migration marker not written yet (the stick was still read-only at the start): path, content, next try.
     pub(crate) marker_due: Option<crate::migrate::Marker>,
+    /// GP-START: since when the fallback waits for the stick's own big write (data.img), and when it was last seen
+    /// busy; the plain line at the resync says how long it waited.
+    pub(crate) busy_since: Option<Instant>,
+    pub(crate) busy_seen: Option<Instant>,
+    /// How long that wait lasts at most (`sync::BUSY_MAX`; tests shorten it).
+    pub(crate) busy_max: Duration,
 }
 
 pub fn now_ms() -> u64 {
@@ -87,6 +106,10 @@ impl Registry {
             orphans: BTreeMap::new(),
             journal: Journal::default(),
             owners: BTreeMap::new(),
+            secrets: Records::new(),
+            made: BTreeSet::new(),
+            sysdir: std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)),
+            holder: Arc::new(crate::vouch::holder_file),
             pending: BTreeSet::new(),
             watches: Arc::new(Mutex::new(Vec::new())),
             ev,
@@ -96,6 +119,9 @@ impl Registry {
             retry_at: Instant::now(),
             retry_every: Duration::from_secs(10),
             marker_due: None,
+            busy_since: None,
+            busy_seen: None,
+            busy_max: crate::sync::BUSY_MAX,
         };
         for d in builtin::all() {
             match d.validate() {
@@ -106,7 +132,15 @@ impl Registry {
             }
         }
         r.load();
+        r.settle_load();
         r
+    }
+
+    /// What follows every time the values came from files (a start, the stick coming back): old key names
+    /// move to their new ones, and the listed providers get their keys.
+    pub(crate) fn settle_load(&mut self) {
+        self.rename_old_keys();
+        self.sync_providers(false);
     }
 
     /// A copy for readers (`list`, `get`, `describe`, `history`, `status`, `watch`): the server answers them
@@ -121,6 +155,10 @@ impl Registry {
             orphans: self.orphans.clone(),
             journal: self.journal.clone(),
             owners: self.owners.clone(),
+            secrets: self.secrets.clone(),
+            made: self.made.clone(),
+            sysdir: self.sysdir.clone(),
+            holder: self.holder.clone(),
             pending: self.pending.clone(),
             watches: self.watches.clone(),
             ev: self.ev.clone(),
@@ -130,7 +168,23 @@ impl Registry {
             retry_at: self.retry_at,
             retry_every: self.retry_every,
             marker_due: None,
+            busy_since: self.busy_since,
+            busy_seen: self.busy_seen,
+            busy_max: self.busy_max,
         }
+    }
+
+    /// For a registry held by another program (tests, a tool that brings its own settingsd): the directory
+    /// whose programs count as the system's.
+    pub fn set_system_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.sysdir = Some(dir.into());
+        // The provider keys are for the program `assist` of that directory.
+        self.sync_providers(false);
+    }
+
+    /// For tests: how long settingsd waits at most for the kernel's data.img before the stick counts as hung.
+    pub fn set_busy_max(&mut self, d: Duration) {
+        self.busy_max = d;
     }
 
     /// Gives up on the stick worker after a timeout and starts a fresh one.
@@ -179,7 +233,11 @@ impl Registry {
 
     pub fn describe(&self, key: &str) -> Result<Json, Error> {
         let d = self.def(key)?;
-        Ok(Json::obj().with("ok", true).with("key", d.describe(self.values.get(key))))
+        let mut j = d.describe(self.values.get(key));
+        if let Some(b) = self.secrets.get(key) {
+            j = j.with("owner_program", b.exe.as_str());
+        }
+        Ok(Json::obj().with("ok", true).with("key", j))
     }
 
     pub(crate) fn def(&self, key: &str) -> Result<&KeyDef, Error> {
@@ -187,14 +245,17 @@ impl Registry {
         self.defs.get(key).ok_or_else(|| err("unknown_key", format!("{key}: no such setting")))
     }
 
-    /// `as_owner`: a secret value is shown only to the key's owner.
-    pub fn get(&self, key: &str, as_owner: Option<&str>) -> Result<Json, Error> {
+    /// `as_owner`: asks for a secret in clear. It is given only when `peer` is the owner's program
+    /// (`owners.rs`); otherwise the request is refused and logged. Without `as_owner` a secret shows as `***`.
+    pub fn get(&self, key: &str, as_owner: Option<&str>, peer: &Peer) -> Result<Json, Error> {
         let d = self.def(key)?;
         let v = self.effective(key).unwrap_or_else(|| d.default.clone());
-        let value = if d.safety == Safety::Secret && as_owner == Some(d.owner.as_str()) {
-            v.to_json()
-        } else {
-            self.shown(d, &v)
+        let value = match as_owner {
+            Some(o) if d.safety == Safety::Secret => {
+                self.check_reveal(d, o, peer)?;
+                v.to_json()
+            }
+            _ => self.shown(d, &v),
         };
         Ok(Json::obj()
             .with("ok", true)
@@ -276,7 +337,7 @@ impl Registry {
 
     /// Tells every watcher whose prefix covers one of `keys` that `owner`'s keys came or went (WY-10/1), so a
     /// page reads its rows again: `{"event":"registered"|"unregistered","owner":..,"keys":[..]}`.
-    fn notify_keys(&self, event: &str, owner: &str, keys: &BTreeSet<String>) {
+    pub(crate) fn notify_keys(&self, event: &str, owner: &str, keys: &BTreeSet<String>) {
         let line = Json::obj()
             .with("event", event)
             .with("owner", owner)
@@ -297,8 +358,9 @@ impl Registry {
         });
     }
 
-    /// Registers keys of `owner` (a service at its start). All or nothing.
-    pub fn register(&mut self, owner: &str, defs: Vec<KeyDef>) -> Result<Json, Error> {
+    /// Registers keys of `owner` (a service at its start). All or nothing. `peer` is who asks: a secret
+    /// becomes that program's (`owners.rs`).
+    pub fn register(&mut self, owner: &str, defs: Vec<KeyDef>, peer: &Peer) -> Result<Json, Error> {
         if owner.is_empty()
             || !owner.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
         {
@@ -308,6 +370,7 @@ impl Registry {
         if names.len() != defs.len() {
             return Err(err("bad_request", "a key is listed twice"));
         }
+        self.check_register(owner, &defs, peer)?;
         for d in &defs {
             d.validate().map_err(|e| {
                 err(if crate::guard::refuse_key(&d.name).is_err() { "refused_r8" } else { "bad_request" }, e)
@@ -339,6 +402,7 @@ impl Registry {
                 ));
             }
         }
+        self.record(owner, &defs, peer);
         let n = defs.len();
         let all: BTreeSet<String> = defs.iter().map(|d| d.name.clone()).collect();
         let mut touched = BTreeSet::new();
@@ -370,10 +434,11 @@ impl Registry {
 
     /// Removes `owner`'s keys below `prefix`. `forget`: their values and journal entries go too (a package
     /// removed without leftovers, PK-2); otherwise the values stay for a later registration.
-    pub fn unregister(&mut self, owner: &str, prefix: &str, forget: bool) -> Result<Json, Error> {
+    pub fn unregister(&mut self, owner: &str, prefix: &str, forget: bool, peer: &Peer) -> Result<Json, Error> {
         if owner == "settingsd" {
             return Err(err("not_owner", "built-in keys stay"));
         }
+        self.check_owner("unregister", owner, peer)?;
         let keys: BTreeSet<String> =
             self.defs.values().filter(|d| d.owner == owner && under(&d.name, prefix)).map(|d| d.name.clone()).collect();
         if keys.is_empty() {
@@ -389,15 +454,14 @@ impl Registry {
                 self.orphans.insert(k.clone(), v);
             }
         }
-        let still: BTreeSet<&str> =
-            self.defs.values().filter(|d| d.owner == owner).map(|d| key::group(&d.name)).collect();
-        self.owners.retain(|ns, o| o != owner || still.contains(ns.as_str()));
+        self.release_namespaces();
         if forget {
             let hs = keys.iter().cloned().collect();
             if self.journal.forget(&hs) {
                 self.rewrite_journal();
             }
             self.rewrite_groups(&keys);
+            self.forget_records(&keys);
         }
         self.ev.emit(
             Level::Info,
@@ -406,6 +470,12 @@ impl Registry {
         );
         self.notify_keys("unregistered", owner, &keys);
         Ok(Json::obj().with("ok", true).with("removed", keys.len()))
+    }
+
+    /// A namespace is its owner's while the owner has a key in it.
+    pub(crate) fn release_namespaces(&mut self) {
+        let defs = &self.defs;
+        self.owners.retain(|ns, o| defs.values().any(|d| d.owner == *o && key::group(&d.name) == ns));
     }
 
     /// A value from a file in the key's normal form; None = the default (not stored).

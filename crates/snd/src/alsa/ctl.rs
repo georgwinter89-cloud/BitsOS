@@ -1,4 +1,4 @@
-//! `/dev/snd/controlC0` (`linux-6.6/sound/core/control.c`, the PCM part of `pcm.c:83`): card info, five
+//! `/dev/snd/controlC0` (`linux-7.3.1/sound/core/control.c`, the PCM part of `pcm.c:83`): card info, five
 //! elements (master volume and switch on the mixer, the headphone jack read from `hda`, SN-9's capture switch
 //! and volume applied by `capture` as frames are read), value-change events, the PCM device queries libasound
 //! makes when it opens `hw:0,0`.
@@ -239,6 +239,25 @@ impl Ctl {
                 let mut b = [0u8; CARD_INFO_SIZE];
                 card_info(&mut b);
                 Self::put(mem, arg, &b)
+            }
+            CTL_CARD_BYTES => {
+                // snd_ctl_card_bytes (linux-7.3.1/sound/core/control.c:903): the full components string with its
+                // NUL; the card has no components, so one byte.
+                let b = Self::get::<CARD_BYTES_SIZE>(mem, arg)?;
+                if get_u32(&b, 0) != CARD_BTYPE_COMPONENTS {
+                    return Err(EINVAL);
+                }
+                let components: &[u8] = b"\0";
+                let (allocated, data) = (get_u32(&b, 4), get_u64(&b, 16));
+                if data != 0 && allocated != 0 {
+                    if (allocated as usize) < components.len() {
+                        return Err(ENOMEM);
+                    }
+                    if !mem.write(data, components) {
+                        return Err(EFAULT);
+                    }
+                }
+                Self::put(mem, arg.wrapping_add(8), &(components.len() as u32).to_le_bytes())
             }
             CTL_ELEM_LIST => {
                 let mut b = Self::get::<ELEM_LIST_SIZE>(mem, arg)?;

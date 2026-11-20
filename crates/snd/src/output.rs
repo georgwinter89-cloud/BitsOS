@@ -278,8 +278,8 @@ fn sys_status() -> String {
     status_text(mixer_state(), playing.as_deref(), clients, hdmi)
 }
 
-/// Read-only: Linux's kernfs refuses a write open of a file without a store with EACCES (linux-6.6/fs/kernfs/
-/// file.c kernfs_fop_open), root too; the attribute layer only checks the uid at open, so root gets it here.
+/// Read-only: Linux's kernfs refuses a write open of a file without a store with EACCES (linux-7.3.1/fs/kernfs/
+/// file.c:603 kernfs_fop_open), root too; the attribute layer only checks the uid at open, so root gets it here.
 fn sys_status_set(_v: &str) -> Result<(), Errno> {
     Err(EACCES)
 }

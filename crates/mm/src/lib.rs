@@ -21,6 +21,7 @@ extern crate alloc;
 pub mod abi;
 mod around_ktest;
 mod as_ktest;
+mod atomic3_ktest;
 mod aspace;
 pub mod commit;
 mod commit_ktest;
@@ -36,9 +37,24 @@ pub mod dma_pages;
 mod dma_pages_ktest;
 pub mod fault;
 mod frames_ktest;
+mod guard_ktest;
+#[cfg(not(bitsos_no_ktests))]
+mod ptr_ktest;
+// Their hooks (vfs's test-only calls, a late initcall) are not in the lean kernel.
+#[cfg(not(bitsos_no_ktests))]
+mod boot_heap_ktest;
 mod grouping_ktest;
+mod highatomic;
+mod highatomic_load_ktest;
 mod heap_ktest;
 mod highatomic_ktest;
+mod load_ktest;
+mod memcrash_ktest;
+pub mod migrate;
+mod migrate_ktest;
+#[cfg(not(bitsos_no_ktests))]
+mod migrate_race_ktest;
+mod migrate_wb_ktest;
 mod mlock_ktest;
 pub mod kernel_tables;
 pub mod kmap;

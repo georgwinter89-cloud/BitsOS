@@ -4,9 +4,9 @@
 //! [`Mlme::eapol`]) and tells it after every RX poll ([`Mlme::poll_done`]), which runs the timers.
 //!
 //! The order and the timing are sta-link.mjs's (proven on the Mini-PC, join + DHCP), which is
-//! mac80211 mlme.c's: IEEE80211_AUTH_TIMEOUT (linux-6.6/net/mac80211/mlme.c:34) and
-//! IEEE80211_ASSOC_TIMEOUT (linux-6.6/net/mac80211/mlme.c:41) 200 ms (HZ / 5),
-//! IEEE80211_AUTH_MAX_TRIES (linux-6.6/net/mac80211/mlme.c:38) 3, and
+//! mac80211 mlme.c's: IEEE80211_AUTH_TIMEOUT (linux-7.3.1/net/mac80211/mlme.c:36) and
+//! IEEE80211_ASSOC_TIMEOUT (linux-7.3.1/net/mac80211/mlme.c:43) 200 ms (HZ / 5),
+//! IEEE80211_AUTH_MAX_TRIES (linux-7.3.1/net/mac80211/mlme.c:40) 3, and
 //! an exchange waits at least three RX polls; the handshake gets 8 s, ends with reason 15 when
 //! no PTK came (4-way handshake timeout). The keys go in in wpa_supplicant's order (hostap wpa.c):
 //! 3/4 -> 4/4 out, then the PTK, then the GTK; group 1/2 -> the GTK, then 2/2 out. Not in the JS's
@@ -298,10 +298,10 @@ impl Mlme {
         }
     }
 
-    // Linux: none (mac80211 ieee80211_rx_mgmt_auth (linux-6.6/net/mac80211/mlme.c:3652),
-    // ieee80211_rx_mgmt_assoc_resp (linux-6.6/net/mac80211/mlme.c:5279), ieee80211_rx_mgmt_deauth
-    // (linux-6.6/net/mac80211/mlme.c:3817), ieee80211_rx_mgmt_disassoc
-    // (linux-6.6/net/mac80211/mlme.c:3861) for a station): one management frame from the air.
+    // Linux: none (mac80211 ieee80211_rx_mgmt_auth (linux-7.3.1/net/mac80211/mlme.c:5414),
+    // ieee80211_rx_mgmt_assoc_resp (linux-7.3.1/net/mac80211/mlme.c:7190), ieee80211_rx_mgmt_deauth
+    // (linux-7.3.1/net/mac80211/mlme.c:5646), ieee80211_rx_mgmt_disassoc
+    // (linux-7.3.1/net/mac80211/mlme.c:5692) for a station): one management frame from the air.
     // Frames not for this join are ignored.
     pub fn frame(&mut self, m: &Mgmt, now: u64) -> Vec<Action> {
         match (*m, self.phase) {
@@ -354,8 +354,8 @@ impl Mlme {
                 let disassoc = matches!(m, Mgmt::Disassoc { .. });
                 // mac80211 ends a join only where it holds state the frame names: a
                 // deauthentication from association on (assoc_data or associated,
-                // linux-6.6/net/mac80211/mlme.c:3832-3852), a disassociation once associated
-                // (linux-6.6/net/mac80211/mlme.c:3872); earlier the frame can only end an older
+                // linux-7.3.1/net/mac80211/mlme.c:5664-5688), a disassociation once associated
+                // (linux-7.3.1/net/mac80211/mlme.c:5703); earlier the frame can only end an older
                 // session the AP still held for our address (the reason 8 on the first join
                 // after a reboot, 24.10.) and the exchange goes on with its retries.
                 if p == Phase::Auth || (disassoc && p == Phase::Assoc) {

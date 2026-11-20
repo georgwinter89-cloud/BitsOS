@@ -148,7 +148,7 @@ fn program_isig() -> TestResult {
 ktest!("in.tty.program_isig", Screen, program_isig);
 
 /// `abi-evdev v2`: the MCP keyboard's node through the syscalls, compared with the transcript written from
-/// linux-6.6/drivers/input/evdev.c. Needs the integration patch (per-open clients, `ioctl_user` return values):
+/// linux-7.3.1/drivers/input/evdev.c. Needs the integration patch (per-open clients, `ioctl_user` return values):
 /// without it EVIOCGNAME answers 0 and the test says so as a failure.
 fn evdev_program() -> TestResult {
     let _console = console::ktest_lease::ConsoleLease::take()?;
@@ -175,7 +175,7 @@ fn evdev_program() -> TestResult {
     }
     let got = text();
     if got.contains("EVIOCGNAME(256) = 0\n") {
-        return ktest::fail("the integration patch (plan/notes/in-IN-4-integration.patch) is not applied: ioctl return values and per-open clients are missing");
+        return ktest::fail("the IN-4 integration (plan/spec/usb.md §4.3) is not applied: ioctl return values and per-open clients are missing");
     }
     let want = include_str!("../../../user/abi-tests/expected/in4-evdev.txt");
     for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {

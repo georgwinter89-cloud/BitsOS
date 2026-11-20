@@ -1,5 +1,5 @@
 //! GM-2a CR 5: the xattr family (188-199), readahead (187) and sync_file_range (277). No file system of V2 has extended
-//! attributes, so every inode is Linux's inode without IOP_XATTR (linux-6.6/fs/xattr.c:62-65 `xattr_resolve_name`). The
+//! attributes, so every inode is Linux's inode without IOP_XATTR (linux-7.3.1/fs/xattr.c:62-71 `xattr_resolve_name`). The
 //! order of the checks is CachyOS 7.3's, the ABI oracle's, which copies from the program before it looks at the path
 //! (Linux 6.6 looked at the path first; seen in `cargo xtask abi-diff abi-gm2a`):
 //! - set: flags EINVAL, the name (EFAULT, or ERANGE when empty or 256 bytes and more), a value above 64 KiB E2BIG, the value
@@ -20,11 +20,11 @@ use uapi::errno::*;
 
 const XATTR_CREATE: u64 = 1;
 const XATTR_REPLACE: u64 = 2;
-/// `sizeof(struct xattr_name)`: XATTR_NAME_MAX + 1 (linux-6.6/include/uapi/linux/limits.h).
+/// `sizeof(struct xattr_name)`: XATTR_NAME_MAX + 1 (linux-7.3.1/include/uapi/linux/limits.h:15).
 const NAME_BUF: usize = 256;
 const XATTR_SIZE_MAX: u64 = 65536;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
-/// WAIT_BEFORE | WRITE | WAIT_AFTER (linux-6.6/fs/sync.c `VALID_FLAGS`).
+/// WAIT_BEFORE | WRITE | WAIT_AFTER (linux-7.3.1/fs/sync.c:22 `VALID_FLAGS`).
 const SYNC_VALID_FLAGS: u64 = 7;
 
 /// A named node, or an open file.
@@ -204,9 +204,9 @@ fn file_mode(f: &OpenFile) -> u32 {
     f.inode().map_or_else(|| f.stat().mode, |i| i.meta.mode()) & uapi::S_IFMT
 }
 
-/// readahead(fd, offset, count) (linux-6.6/mm/readahead.c:721 and `generic_fadvise`): EBADF unless open for reading, EINVAL
-/// unless a regular file or block device (CachyOS 7.3) or for an offset or count negative as `loff_t` (the offset: CachyOS
-/// 7.3 on tmpfs); then what fadvise's WILLNEED does (FS-12).
+/// readahead(fd, offset, count) (linux-7.3.1/mm/readahead.c:724 and `generic_fadvise`): EBADF unless open for reading,
+/// EINVAL unless a regular file or block device (CachyOS 7.3) or for an offset or count negative as `loff_t` (the offset:
+/// CachyOS 7.3 on tmpfs); then what fadvise's WILLNEED does (FS-12).
 pub fn readahead(s: &Sys<'_>, a: Args) -> i64 {
     ret((|| {
         let f = s.file(a[0] as u32 as u64)?;
@@ -223,7 +223,7 @@ pub fn readahead(s: &Sys<'_>, a: Args) -> i64 {
     })())
 }
 
-/// sync_file_range(fd, offset, nbytes, flags) (linux-6.6/fs/sync.c:228, :355): EBADF; EINVAL for other flags, a negative
+/// sync_file_range(fd, offset, nbytes, flags) (linux-7.3.1/fs/sync.c:224, :348): EBADF; EINVAL for other flags, a negative
 /// offset or end, or a wrap; ESPIPE unless a regular file, block device, directory or link. SYNC_FILE_RANGE_WRITE writes
 /// the whole file back (fsync), V2 keeps no write-back per range; only an I/O error reaches the caller, as in Linux.
 pub fn sync_file_range(s: &Sys<'_>, a: Args) -> i64 {

@@ -169,7 +169,7 @@ fn known_cases(root: &Path) -> Vec<(String, String)> {
         }
         for line in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || !line.starts_with("abi-") {
+            if line.is_empty() || line.starts_with('#') || !(line.starts_with("abi-") || line.starts_with("dyn-")) {
                 continue;
             }
             if let Some((case, why)) = line.split_once(": ") {

@@ -1,4 +1,4 @@
-//! A thread's seccomp state (linux-6.6/include/linux/seccomp_types.h `struct seccomp`): the mode and the
+//! A thread's seccomp state (linux-7.3.1/include/linux/seccomp_types.h:22 `struct seccomp`): the mode and the
 //! newest filter of its stack, and what changes them: strict mode, attaching a filter, TSYNC from a sibling,
 //! fork/clone (`copy_seccomp`), a kill action (MODE_DEAD). execve keeps all of it.
 //!
@@ -123,7 +123,7 @@ impl TaskSeccomp {
 
     /// A new thread entering its group's thread list, under the list lock TSYNC's walk takes: it takes its
     /// creator's mode and stack again when a TSYNC synced the creator after `inherit` (Linux copies them under
-    /// the siglock its TSYNC holds, linux-6.6/kernel/fork.c `copy_seccomp`). True when anything changed.
+    /// the siglock its TSYNC holds, linux-7.3.1/kernel/fork.c:1805 `copy_seccomp`). True when anything changed.
     pub fn resync(&self, from: &TaskSeccomp) -> bool {
         let (top, mode) = from.snapshot();
         let same = mode == self.mode()

@@ -1,7 +1,7 @@
-//! Signal calls (linux-6.6/kernel/signal.c): rt_sigaction (:4446), rt_sigprocmask (:3177), rt_sigpending
-//! (:3249), sigaltstack (:4263), kill (:3807, `kill_something_info` :1604), tkill (:4004), tgkill (:3988,
-//! `do_send_specific` :3934); AB-6: rt_sigreturn (arch/x86/kernel/signal_64.c:241), rt_sigsuspend (:4628),
-//! pause (:4588), rt_sigtimedwait (:3683), rt_sigqueueinfo (:4058), rt_tgsigqueueinfo (:4104). The state and
+//! Signal calls (linux-7.3.1/kernel/signal.c): rt_sigaction (:4702), rt_sigprocmask (:3392), rt_sigpending
+//! (:3464), sigaltstack (:4519), kill (:4032, `kill_something_info` :1615), tkill (:4262), tgkill (:4246,
+//! `do_send_specific` :4198); AB-6: rt_sigreturn (arch/x86/kernel/signal_64.c:246), rt_sigsuspend (:4925),
+//! pause (:4895), rt_sigtimedwait (:3878), rt_sigqueueinfo (:4287), rt_tgsigqueueinfo (:4324). The state and
 //! its rules live in `proc::signal`, delivery in `proc::deliver`, the thread's part in `proc::sigapi`.
 
 use proc::cred::{Cap, Cred};
@@ -110,21 +110,7 @@ crate::syscall!(SIGALTSTACK, sys_sigaltstack);
 /// process needs its uid or root (CAP_KILL); SIGCONT may also go within the session. B3 (`policy::check`,
 /// Access::Signal) asks about signals to other programs.
 pub(crate) fn send(c: &SysCtx<'_>, target: &Arc<Process>, sig: i32, info: SigInfo, to: To) -> Result<(), i64> {
-    if !(0..=64).contains(&sig) {
-        return Err(-EINVAL);
-    }
-    let from_user = info.code() <= 0;
-    let same_session = sig == uapi::ab::signal::SIGCONT as i32 && target.sid() == c.proc.sid();
-    if from_user && !may_signal(c.proc.pid, &c.proc.cred(), target.pid, &target.cred()) && !same_session {
-        klog::event!(Info, "syscall", "signal.refused", pid = c.proc.pid, target = target.pid, signal = sig, reason = "uid");
-        return Err(-EPERM);
-    }
-    if target.pid != c.proc.pid
-        && let Err(d) = policy::check(&c.proc.subject(), &policy::Access::Signal { target_pid: target.pid, signal: sig as u32 })
-    {
-        klog::event!(Info, "syscall", "signal.refused", pid = c.proc.pid, target = target.pid, signal = sig, reason = d.reason.as_str());
-        return Err(-EPERM);
-    }
+    may_send(c, target, sig, &info)?;
     if sig != 0 && !target.is_finished() {
         // SX-2 (`send_signal_locked`): si_uid in the target's user namespace; a sender the target's pid
         // namespace cannot see (an ancestor's process) shows as pid 0 and forces SIGKILL/SIGSTOP onto a
@@ -151,8 +137,29 @@ pub(crate) fn send(c: &SysCtx<'_>, target: &Arc<Process>, sig: i32, info: SigInf
     Ok(())
 }
 
+/// `check_kill_permission` and B3 alone: what `send` asks before it queues anything (also for a target whose
+/// thread is gone, as a zombie leader that still takes a thread-directed signal and drops it).
+pub(crate) fn may_send(c: &SysCtx<'_>, target: &Process, sig: i32, info: &SigInfo) -> Result<(), i64> {
+    if !(0..=64).contains(&sig) {
+        return Err(-EINVAL);
+    }
+    let from_user = info.code() <= 0;
+    let same_session = sig == uapi::ab::signal::SIGCONT as i32 && target.sid() == c.proc.sid();
+    if from_user && !may_signal(c.proc.pid, &c.proc.cred(), target.pid, &target.cred()) && !same_session {
+        klog::event!(Info, "syscall", "signal.refused", pid = c.proc.pid, target = target.pid, signal = sig, reason = "uid");
+        return Err(-EPERM);
+    }
+    if target.pid != c.proc.pid
+        && let Err(d) = policy::check(&c.proc.subject(), &policy::Access::Signal { target_pid: target.pid, signal: sig as u32 })
+    {
+        klog::event!(Info, "syscall", "signal.refused", pid = c.proc.pid, target = target.pid, signal = sig, reason = d.reason.as_str());
+        return Err(-EPERM);
+    }
+    Ok(())
+}
+
 /// Whether process `pid` with credentials `me` may signal process `target_pid` with `t` (pure, host-tested):
-/// the same process, or linux-6.6/kernel/signal.c:779 `kill_ok_by_cred` (the sender's real or effective uid
+/// the same process, or linux-7.3.1/kernel/signal.c:789 `kill_ok_by_cred` (the sender's real or effective uid
 /// is the target's real or saved uid, or CAP_KILL).
 pub(crate) fn may_signal(pid: u32, me: &Cred, target_pid: u32, t: &Cred) -> bool {
     pid == target_pid || me.euid == t.suid || me.euid == t.uid || me.uid == t.suid || me.uid == t.uid || proc::cred::ns_capable(me, &t.user_ns, Cap::Kill)
@@ -166,7 +173,7 @@ pub(crate) fn kill_info(c: &SysCtx<'_>, sig: i32, code: i32) -> SigInfo {
 }
 
 /// The processes of group `pgid` (live and zombies, as Linux's pid lists).
-fn group(pgid: u32) -> Vec<Arc<Process>> {
+pub(crate) fn group(pgid: u32) -> Vec<Arc<Process>> {
     proc::processes().into_iter().filter(|p| p.pgid() == pgid).collect()
 }
 

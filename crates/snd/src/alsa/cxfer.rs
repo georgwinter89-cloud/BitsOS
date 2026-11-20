@@ -1,5 +1,5 @@
 //! SN-9: moving recorded frames to the program: READI_FRAMES and read(2) (`__snd_pcm_lib_xfer` for capture,
-//! `linux-6.6/sound/core/pcm_lib.c:2207`: the automatic start at :2261, `wait_for_avail` :1885), appl_ptr
+//! `linux-7.3.1/sound/core/pcm_lib.c:2274`: the automatic start at :2335, `wait_for_avail` :1949), appl_ptr
 //! moves (SYNC_PTR, FORWARD: frames dropped unread), and the conversion from the source's 16-bit stereo to
 //! the program's format and channels.
 

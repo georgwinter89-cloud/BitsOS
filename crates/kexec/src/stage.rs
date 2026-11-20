@@ -226,6 +226,13 @@ fn read_file(what: &str, f: &FileRef, limit: u64, deadline_ns: u64, sink: &mut d
     Ok(bytes)
 }
 
+/// GP-GUARD: a Reload jumps straight into the new kernel, with no loader in between to judge it. Where the
+/// internal disks are off limits (`nvme_bind=off`), an image without the disk guard's mark would bind the NVMe
+/// driver, so it is refused; everywhere else every kernel passes (pure; host-tested).
+pub fn reload_guard(marked: bool, internal_off: bool) -> Result<(), &'static str> {
+    if internal_off && !marked { Err(crate::install::check::UNGUARDED) } else { Ok(()) }
+}
+
 /// Streams the kernel ELF into a new image block.
 /// Returns the layout, the image's frames, the file's bytes and its kernel id (FNV-1a 64 of the file).
 fn fetch_kernel(f: &FileRef, frames: &mut Frames, deadline_ns: u64, budget: u64) -> Result<(Layout, u64, u64, u64), StageError> {
@@ -234,8 +241,11 @@ fn fetch_kernel(f: &FileRef, frames: &mut Frames, deadline_ns: u64, budget: u64)
     let mut sink = KernelSink { frames, block: None, budget };
     let mut err: Option<ElfError> = None;
     let mut fnv = Fnv::new();
+    // GP-GUARD: the disk guard's mark, looked for while the file streams by.
+    let mut mark = gp_platform::disk_rule::marker::Scan::new();
     let r = read_file("kernel", f, KERNEL_FILE_MAX, deadline_ns, &mut |d| {
         fnv.update(d);
+        mark.feed(d);
         stream.feed(d, &mut sink).map_err(|e| err = Some(e))
     });
     if let Some(e) = err {
@@ -247,6 +257,10 @@ fn fetch_kernel(f: &FileRef, frames: &mut Frames, deadline_ns: u64, budget: u64)
         Err(ReadError::Failed(e)) => return Err(e),
     };
     let l = stream.finish().map_err(|e| StageError::Bad(format!("kernel {label}: {}", e.describe())))?;
+    if let Err(why) = reload_guard(mark.found(), block::policy::internal_disks_off()) {
+        klog::event!(Warn, "kexec", "reload.unguarded"; "the kernel is older than the disk guard: not started on this machine");
+        return Err(StageError::Bad(format!("kernel {label}: {why}")));
+    }
     let (phys, _) = sink.block.ok_or_else(|| StageError::Bad(format!("kernel {label}: no image")))?;
     Ok((l, phys, bytes, fnv.finish()))
 }

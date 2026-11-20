@@ -231,7 +231,7 @@ fn session_keys(sh: &Arc<Process>, err: &Capture) -> TestResult {
     let sid = sh.pid;
     let e = || text(err);
     // The full gate (UL-5, all console ktests in one boot) once handed ash a stray '{' before the first line
-    // ("/bin/sh: {echo: not found"; cause not found, an open bug in plan/notes/ul-UL-5.md): let the VT drain its
+    // ("/bin/sh: {echo: not found"; cause not found, an open item in plan/notes/desk-offen.md): let the VT drain its
     // events, drop what the line discipline holds (tcflush(TCIFLUSH)), Ctrl+U clears what ash's line editor read
     // already. A failed first line is typed once more with a marker of its own (A3A), and only when the first
     // one's answer has still not come: so a slow answer is never typed twice, and the history check below asks

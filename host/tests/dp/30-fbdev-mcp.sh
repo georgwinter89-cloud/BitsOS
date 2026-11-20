@@ -3,8 +3,7 @@
 # DP-2: a normal boot (not ktest) with MCP reached from the host at 1024x768 (a full-frame PNG stays far below
 # the 4 MB answer): /bin/abi-fbdev draw started through MCP `run`; MCP `screen` PNG == the program's own pattern
 # == QEMU screendump; after the kernel kills it (kill_after_ms) the console's picture is back, again
-# screen == screendump. Needs MCP's screen to read display::with_screen (change request DP-2/1); without it the
-# script says SKIP.
+# screen == screendump. MCP's screen reads the scanout owner's picture through display::copy_screen (DP-2/1).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/dp-30-fbdev-mcp}"
@@ -17,12 +16,7 @@ LOG="$RUN_DIR/serial.log"
 QMP="$RUN_DIR/qmp.sock"
 NAME=dp-fbdev-mcp
 
-if ! grep -q "display::with_screen" crates/mcp/src/tools/screen.rs; then
-    echo "SKIP: MCP screen does not read display::with_screen yet (change request DP-2/1, plan/notes/dp-DP-2-mc-screen.patch)"
-    exit 0
-fi
-
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=warn;screen=1024x768;init=off"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=warn;screen=1024x768;ktest_init=off"
 rm -f "$LOG" "$QMP"
 cargo xtask qemu --name "$NAME" --net virtio --hostfwd "$FWD:8765" --timeout 300 --serial-log "$LOG" \
     -- -qmp "unix:$QMP,server=on,wait=off" > "$RUN_DIR/qemu.out" 2>&1 &

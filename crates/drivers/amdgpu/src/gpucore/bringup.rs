@@ -7,10 +7,15 @@
 //! owner of GX-7b is built with the gate shut (`Gate::Refuse`), so this item writes nothing to the real GPU;
 //! refused writes are logged too (refused memory writes are counted and klogged; their bytes are not kept).
 //!
+//! GX-10: an owner asked for a trail (`with_trail`, `super::trail`) also keeps every read, each poll as one wait
+//! and each sleep, in order, and one told `without_read_back` writes as Linux does; the RX 9070 XT's stages use
+//! both, so their accesses can be held against the register trace of Linux's own start (`rdna4::linuxseq`).
+//!
 //! No fixed counts (R1): the log keeps the newest `keep` entries (chosen by the owner; `LOG_KEEP` by default) and
 //! counts every write, per register, without limit.
 
-use super::psp::Hw;
+use super::psp::{Bound, Cond, Hw};
+use super::trail::Trail;
 use alloc::collections::{BTreeMap, VecDeque};
 
 /// The default number of recent writes kept in full (a whole GX-7d bring-up is a few hundred writes).
@@ -119,11 +124,39 @@ pub struct Bringup<H> {
     gate: Gate,
     /// Bits that must read back as written, per register (absent: mailboxes and self-clearing bits, only logged).
     checks: BTreeMap<u32, u32>,
+    /// GX-10: every access in order, when the owner was asked to keep them (`with_trail`).
+    trail: Option<Trail>,
+    /// GX-10: false makes every write a `write_blind` (`without_read_back`).
+    read_back: bool,
 }
 
 impl<H: Hw> Bringup<H> {
     pub fn new(hw: H, gate: Gate, keep: usize) -> Bringup<H> {
-        Bringup { hw, log: WriteLog::new(keep), gate, checks: BTreeMap::new() }
+        Bringup { hw, log: WriteLog::new(keep), gate, checks: BTreeMap::new(), trail: None, read_back: true }
+    }
+
+    /// GX-10: keeps the newest `keep` accesses (reads and waits too) in order, for `rdna4::linuxseq`.
+    pub fn with_trail(mut self, keep: usize) -> Bringup<H> {
+        self.trail = Some(Trail::new(keep));
+        self
+    }
+
+    /// GX-10: Linux reads no register back after writing it, and a read-back is a bus access of its own: an owner
+    /// whose accesses are compared with Linux's trace writes as Linux does.
+    pub fn without_read_back(mut self) -> Bringup<H> {
+        self.read_back = false;
+        self
+    }
+
+    pub fn trail(&self) -> Option<&Trail> {
+        self.trail.as_ref()
+    }
+
+    fn note_write(&mut self, e: Entry) -> Entry {
+        if let Some(t) = self.trail.as_mut() {
+            t.write(e.byte, e.value, matches!(e.outcome, Outcome::Ok | Outcome::Mismatch));
+        }
+        e
     }
 
     pub fn log(&self) -> &WriteLog {
@@ -138,6 +171,11 @@ impl<H: Hw> Bringup<H> {
         &mut self.hw
     }
 
+    /// The device back, when the owner's work is done (GP-GPU1: a fake's record after a read-only attach).
+    pub fn into_hw(self) -> H {
+        self.hw
+    }
+
     /// From now on a write to `byte` counts as a mismatch when `mask`'s bits read back differently.
     pub fn expect_read_back(&mut self, byte: u32, mask: u32) {
         self.checks.insert(byte, mask);
@@ -148,24 +186,32 @@ impl<H: Hw> Bringup<H> {
     pub fn write_blind(&mut self, byte: u32, value: u32) -> Entry {
         if let Gate::Refuse(why) = self.gate {
             klog::event!(Debug, "gx", "bringup.write_refused", byte = klog::Hex(u64::from(byte)), value = klog::Hex(u64::from(value)), why = why);
-            return self.log.push(byte, value, None, Outcome::Refused);
+            let e = self.log.push(byte, value, None, Outcome::Refused);
+            return self.note_write(e);
         }
         if !self.hw.reg_write(byte, value) {
             klog::event!(Warn, "gx", "bringup.write_failed", byte = klog::Hex(u64::from(byte)), value = klog::Hex(u64::from(value)));
-            return self.log.push(byte, value, None, Outcome::Failed);
+            let e = self.log.push(byte, value, None, Outcome::Failed);
+            return self.note_write(e);
         }
-        self.log.push(byte, value, None, Outcome::Ok)
+        let e = self.log.push(byte, value, None, Outcome::Ok);
+        self.note_write(e)
     }
 
     /// One write with its read-back; the entry as logged.
     pub fn write(&mut self, byte: u32, value: u32) -> Entry {
+        if !self.read_back {
+            return self.write_blind(byte, value);
+        }
         if let Gate::Refuse(why) = self.gate {
             klog::event!(Debug, "gx", "bringup.write_refused", byte = klog::Hex(u64::from(byte)), value = klog::Hex(u64::from(value)), why = why);
-            return self.log.push(byte, value, None, Outcome::Refused);
+            let e = self.log.push(byte, value, None, Outcome::Refused);
+            return self.note_write(e);
         }
         if !self.hw.reg_write(byte, value) {
             klog::event!(Warn, "gx", "bringup.write_failed", byte = klog::Hex(u64::from(byte)), value = klog::Hex(u64::from(value)));
-            return self.log.push(byte, value, None, Outcome::Failed);
+            let e = self.log.push(byte, value, None, Outcome::Failed);
+            return self.note_write(e);
         }
         let read_back = self.hw.reg_read(byte);
         let mask = self.checks.get(&byte).copied().unwrap_or(0);
@@ -178,16 +224,42 @@ impl<H: Hw> Bringup<H> {
             klog::event!(Warn, "gx", "bringup.read_back", byte = klog::Hex(u64::from(byte)), wrote = klog::Hex(u64::from(value)),
                 read = klog::Hex(u64::from(read_back.unwrap_or(u32::MAX))));
         }
-        self.log.push(byte, value, read_back, outcome)
+        let e = self.log.push(byte, value, read_back, outcome);
+        self.note_write(e);
+        // The read-back is a bus access the device saw: the trail holds it after its write.
+        if let Some(t) = self.trail.as_mut() {
+            t.read(byte, read_back);
+        }
+        e
     }
 }
 
 impl<H: Hw> Hw for Bringup<H> {
     fn reg_read(&mut self, byte: u32) -> Option<u32> {
-        self.hw.reg_read(byte)
+        let value = self.hw.reg_read(byte);
+        if let Some(t) = self.trail.as_mut() {
+            t.read(byte, value);
+        }
+        value
     }
     fn reg_write(&mut self, byte: u32, value: u32) -> bool {
         matches!(self.write(byte, value).outcome, Outcome::Ok | Outcome::Mismatch)
+    }
+    fn wait_begin(&mut self, byte: u32, cond: Cond, bound: Bound) {
+        if self.trail.is_some() {
+            let now = self.hw.now_us();
+            if let Some(t) = self.trail.as_mut() {
+                t.begin(byte, cond, bound, now);
+            }
+        }
+    }
+    fn wait_end(&mut self) {
+        if self.trail.is_some() {
+            let now = self.hw.now_us();
+            if let Some(t) = self.trail.as_mut() {
+                t.end(now);
+            }
+        }
     }
     fn mem_read(&mut self, mc: u64, buf: &mut [u8]) -> bool {
         self.hw.mem_read(mc, buf)
@@ -204,6 +276,9 @@ impl<H: Hw> Hw for Bringup<H> {
         self.hw.now_us()
     }
     fn delay_us(&mut self, us: u64) {
+        if let Some(t) = self.trail.as_mut() {
+            t.delay(us);
+        }
         self.hw.delay_us(us)
     }
     fn flush_hdp(&mut self) {
@@ -222,11 +297,19 @@ impl<H: Hw> Hw for Bringup<H> {
     }
     fn store_barrier(&mut self) {
         self.hw.store_barrier()
-    }    fn doorbell_write64(&mut self, index_dw: u32, value: u64) -> bool {
+    }
+    fn doorbell_write64(&mut self, index_dw: u32, value: u64) -> bool {
         if let Gate::Refuse(why) = self.gate {
             klog::event!(Debug, "gx", "bringup.doorbell_refused", index = index_dw, why = why);
             return false;
         }
         self.hw.doorbell_write64(index_dw, value)
+    }
+    fn doorbell_write32(&mut self, index_dw: u32, value: u32) -> bool {
+        if let Gate::Refuse(why) = self.gate {
+            klog::event!(Debug, "gx", "bringup.doorbell_refused", index = index_dw, why = why);
+            return false;
+        }
+        self.hw.doorbell_write32(index_dw, value)
     }
 }

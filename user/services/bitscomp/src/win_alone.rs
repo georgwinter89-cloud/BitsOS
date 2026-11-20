@@ -1,5 +1,5 @@
 //! PK-L1b (D7): the Win key pressed and released alone opens the program library, as Windows' start menu does.
-//! "Alone" (desk-PK67-plan.md §3 "Keys today"): Super went down, no other key, button, wheel or pad button came
+//! "Alone" (plan/spec/program-library.md section 5): Super went down, no other key, button, wheel or pad button came
 //! before it went up, and less than `ALONE_MS` passed. Any combination (Super+Up, Super+Down, later Win+Space ...)
 //! keeps its own meaning. A pure state machine fed with every key press and release and every other input (the
 //! times are the keyboard's milliseconds), so the timing is tested on the host.

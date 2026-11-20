@@ -166,8 +166,9 @@ fn no_compaction_where_reclaim_may_not_run() {
 struct Mover(&'static Buddy);
 
 impl Migrate for Mover {
-    fn migrate(&self, phys: u64, kind: Kind, owner: u64, dest: &mut dyn FnMut() -> Option<u64>) -> Moved {
-        let Some(d) = dest() else { return Moved::Stays };
+    fn migrate<'b>(&self, phys: u64, kind: Kind, owner: u64, dest: &mut dyn FnMut() -> Option<crate::Target<'b>>) -> Moved {
+        let Some(t) = dest() else { return Moved::Stays };
+        let d = t.into_phys();
         assert!(d / PB > phys / PB, "the target lies above the block being cleared");
         self.0.set_owner(d, owner);
         self.0.set_owner(phys, 0);

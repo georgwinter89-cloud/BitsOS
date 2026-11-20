@@ -1,5 +1,6 @@
 //! PCM formats: the 16-bit format word for converters and stream descriptors (Linux
-//! `snd_hdac_calc_stream_format`, `linux-6.6/sound/hda/hdac_device.c:700-790`) and the formats a converter's
+//! `snd_hdac_calc_stream_format`, `linux-6.6/sound/hda/hdac_device.c:700-790`; Linux 7.3.1 differs:
+//! `linux-7.3.1/sound/hda/core/device.c:787`, see plan/spec/linux7-differences.md) and the formats a converter's
 //! PCM caps (parameter 0x0A) allow.
 
 use alloc::vec::Vec;

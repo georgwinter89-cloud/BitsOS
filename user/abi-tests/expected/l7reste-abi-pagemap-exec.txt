@@ -1,0 +1,8 @@
+open the child's = 0
+read before the exec = 8
+read after the exec = 0
+unaligned after the exec = 0
+open again = 0
+read the new image = 8
+child exit 0
+read after the end = 0

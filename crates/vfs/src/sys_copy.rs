@@ -1,6 +1,6 @@
 //! FS-1b I/O calls: preadv/pwritev/preadv2/pwritev2 on the iovec code of `sys`, sendfile and copy_file_range
 //! (a copy loop through one 64 KiB bounce buffer: never what the program asks for), fadvise64 (accepted).
-//! linux-6.6/fs/read_write.c (`do_preadv`, `do_sendfile`, `vfs_copy_file_range`), mm/fadvise.c.
+//! linux-7.3.1/fs/read_write.c (`do_preadv` :1121, `do_sendfile` :1303, `vfs_copy_file_range` :1553), mm/fadvise.c.
 
 use crate::abi::{MAX_FILE_SIZE, MAX_RW_COUNT, O_NONBLOCK};
 use crate::fd::OpenFile;

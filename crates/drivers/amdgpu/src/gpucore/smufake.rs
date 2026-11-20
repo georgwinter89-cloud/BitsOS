@@ -9,7 +9,7 @@
 //! EnableGfxImu answered after 29.3 ms (Linux sends it without waiting, smu_v13_0.c:2302; the next message's
 //! pre-poll waited 5418 reads; BitsOS on the Mini-PC 28.10.: 30244 us, the fake's value), PowerUpVcn 1.28 ms.
 //! GfxDeviceDriverReset(2) is never answered unless `mode2_answers` (the Mini-PC 28.10.: no answer after a GC
-//! stage without Linux's suspend around it, then the box hung; gx-GX-7f.md). Messages that change GC's power go out as `SmuEvent`s for
+//! stage without Linux's suspend around it, then the box hung). Messages that change GC's power go out as `SmuEvent`s for
 //! the GC fake (`gcfake`). `SmuHostile` entries compose: each changes one message or the whole firmware.
 
 use super::psp::Hw;
@@ -145,8 +145,9 @@ pub const GFX_RANGE: (u32, u32) = (800, 2700);
 
 impl SmuFake {
     /// The mailboxes at MP1's segment-1 base (dwords). Cold: both last answers OK (the capture's first read of
-    /// C2PMSG_91 was 0x1; linux-6.6's first message pre-polls C2PMSG_90 and gives up on 0, smu_cmn.c:369, so the
-    /// BIOS leaves it non-zero: an assumption, the capture's 7.1 kernel skipped that read), no message id.
+    /// C2PMSG_91 was 0x1; an assumption for C2PMSG_90: the capture's 7.1 kernel skipped that read, as Linux 7.3.1's
+    /// first message after the SMC start does, linux-7.3.1/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c:508), no message
+    /// id.
     pub fn new(mp1_seg1: u32) -> SmuFake {
         let at = |dw: u32| mp1_seg1.saturating_add(dw).saturating_mul(4);
         SmuFake {

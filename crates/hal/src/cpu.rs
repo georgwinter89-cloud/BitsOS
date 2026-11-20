@@ -13,21 +13,27 @@
 //! - **Timer**: TSC-deadline wherever CPUID 1 ECX[24] says so (the 265K, KVM `-cpu host` on it), else the
 //!   calibrated one-shot LAPIC timer (the 8845HS has no TSC-deadline); `apic::timer::setup`, `time::lapic`.
 //!   Linux additionally refuses TSC-deadline on Haswell..Kaby Lake with old microcode
-//!   (linux-6.6/arch/x86/kernel/apic/apic.c:530-575); V2 does not, neither machine is affected (see cp-CP-6.md).
+//!   (linux-7.3.1/arch/x86/kernel/apic/apic.c:513-571); V2 does not, neither machine is affected.
 //! - **AMD-only MSRs**: SYSCFG, TOM, TOM2 only when `amd_mtrr_msrs` (AuthenticAMD, family 0xF or later), like
-//!   linux-6.6/arch/x86/kernel/cpu/mtrr/generic.c:107; the AMD RAPL MSRs only with CPUID 0x8000_0007 EDX[14].
+//!   linux-7.3.1/arch/x86/kernel/cpu/mtrr/generic.c:111; the AMD RAPL MSRs only with CPUID 0x8000_0007 EDX[14].
 //!   On Intel `amd_syscfg_fix` does nothing, `mtrr_load` never touches SYSCFG, and `msr::access` refuses them.
-//! - **Intel-only MSRs**: IA32_PM_ENABLE with CPUID 6 EAX[7] `hwp`; IA32_HWP_CAPABILITIES only when its bit 0 is
-//!   set (read only on hybrid CPUs, by `smp`); the Intel RAPL counters by model list and never in a guest
-//!   (`msr::intel_rapl_model`).
+//! - **Intel-only MSRs**: IA32_PM_ENABLE with CPUID 6 EAX[7] `hwp`; IA32_HWP_CAPABILITIES and IA32_HWP_REQUEST only
+//!   when its bit 0 is set; the Intel RAPL counters by model list and never in a guest (`msr::intel_rapl_model`).
+//! - **HWP** (CP-265K, `hwp`): each Intel CPU with `hwp` and `hwp_epp` switches it on itself as Linux's intel_pstate
+//!   does, so the cores turbo by themselves; never under a hypervisor, never on AMD.
+//! - **Speculation** (CP-265K): `spec_ctrl_wanted` sets enhanced IBRS on Intel CPUs that have it, on each CPU, once.
 //! - **Hybrid cores**: core type from CPUID 0x1A and the capacity hint for SC from the HWP numbers
 //!   (`smp::capacity`; the module text of `smp` has the details). QEMU hides the hybrid bit, so the hybrid path
-//!   is proven by recorded CPUID values (tests here and in `smp`) and on the Gaming-PC itself.
+//!   is proven by the real CPUID of the 265K (`real_265k`, tests here and in `smp`) and on the Gaming-PC itself.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+pub mod hwp;
+pub mod mwait;
+#[cfg(test)]
+pub(crate) mod real_265k;
 pub mod reset;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +192,10 @@ pub static FLAGS: &[FlagDef] = &[
     fl("hypervisor", 1, 0, Ecx, 31),
     fl("arat", 6, 0, Eax, 2),
     fl("hwp", 6, 0, Eax, 7),
+    fl("hwp_notify", 6, 0, Eax, 8),
+    fl("hwp_act_window", 6, 0, Eax, 9),
+    fl("hwp_epp", 6, 0, Eax, 10),
+    fl("hwp_pkg_req", 6, 0, Eax, 11),
     fl("fsgsbase", 7, 0, Ebx, 0),
     fl("tsc_adjust", 7, 0, Ebx, 1),
     fl("bmi1", 7, 0, Ebx, 3),
@@ -227,6 +237,10 @@ pub static FLAGS: &[FlagDef] = &[
     fl("avx512_vp2intersect", 7, 0, Edx, 8),
     fl("serialize", 7, 0, Edx, 14),
     fl("hybrid_cpu", 7, 0, Edx, 15),
+    fl("spec_ctrl", 7, 0, Edx, 26),
+    fl("arch_capabilities", 7, 0, Edx, 29),
+    fl("rrsba_ctrl", 7, 2, Edx, 2),
+    fl("bhi_ctrl", 7, 2, Edx, 4),
     fl("ibt", 7, 0, Edx, 20),
     fl("amx_bf16", 7, 0, Edx, 22),
     fl("avx512_fp16", 7, 0, Edx, 23),
@@ -330,7 +344,9 @@ impl Features {
             pdpe1gb: v.has("pdpe1gb"),
             mce: v.has("mce"),
             mca: v.has("mca"),
-            smca: v.has("smca"),
+            // GP-CPU audit: the bit is AMD's (CPUID 0x8000_0007 EBX is reserved on Intel, 0 on the 265K); a
+            // reserved bit that reads 1 one day must not send the MCA code to the 0xC000_2000 MSRs.
+            smca: vendor.ebx == u32::from_le_bytes(*b"Auth") && v.has("smca"),
             pge: v.has("pge"),
             pat: v.has("pat"),
             la57: v.has("la57"),
@@ -424,7 +440,7 @@ pub const XSTATE_HI16_ZMM: u64 = 1 << 7;
 pub const XSTATE_AVX512: u64 = XSTATE_OPMASK | XSTATE_ZMM_HI256 | XSTATE_HI16_ZMM;
 /// User states BitsOS enables when CPUID 0xD offers them: x87, SSE, AVX and the three AVX-512 states (the ones
 /// that make programs faster; dav1d/libvpx pick their AVX2/AVX-512 paths from CPUID and XCR0). A deliberate
-/// deviation from spec/core.md §3.3's "every user state", decided in CP-1 (notes/cp-CP-1.md):
+/// deviation from spec/core.md §3.3's "every user state", decided in CP-1:
 /// - MPX (3, 4): gone from current CPUs, Linux dropped it.
 /// - PKRU (9): Linux turns it on with CPUID PKU, but without `pkey_alloc`/`pkey_mprotect` (ENOSYS today) no
 ///   program can tag a page, so it brings nothing; with CR4.PKE on, a program's PKRU would also govern the
@@ -722,6 +738,7 @@ impl Drop for IrqGuard {
     fn drop(&mut self) {
         if self.was_enabled {
             imp::enable_interrupts();
+            crate::percpu::resched_point();
         }
     }
 }
@@ -751,15 +768,17 @@ pub struct SetupReport {
     /// IA32_U_CET / IA32_S_CET as found (0 without CPUID SHSTK/IBT); both are zeroed when set.
     pub u_cet_before: u64,
     pub s_cet_before: u64,
+    /// IA32_SPEC_CTRL as written (`spec_ctrl_wanted`), 0 where it was not touched.
+    pub spec_ctrl: u64,
 }
 
-const SETUP_WORDS: usize = 8;
+const SETUP_WORDS: usize = 9;
 static BSP_SETUP: [core::sync::atomic::AtomicU64; SETUP_WORDS] = [const { core::sync::atomic::AtomicU64::new(0) }; SETUP_WORDS];
 
 /// The BSP's set-up as `init_bsp` did it (the boot event is emitted later, once klog exists).
 pub fn bsp_setup() -> SetupReport {
     let g = |i: usize| BSP_SETUP[i].load(Ordering::Relaxed);
-    SetupReport { cr0_before: g(0), cr0: g(1), cr4_before: g(2), cr4: g(3), efer: g(4), xcr0: g(5), u_cet_before: g(6), s_cet_before: g(7) }
+    SetupReport { cr0_before: g(0), cr0: g(1), cr4_before: g(2), cr4: g(3), efer: g(4), xcr0: g(5), u_cet_before: g(6), s_cet_before: g(7), spec_ctrl: g(8) }
 }
 
 /// The per-CPU set-up of spec/core.md §3 (the BSP now, every AP with CP-4): CR0 written whole, CR4 with a
@@ -806,13 +825,26 @@ fn init_this_cpu_like(f: &Features, cpu_index: u32, node: u32, extra_cr4: u64) -
     // MSRs #GP on a CPU without it.
     if cet_msrs_exist(&live()) {
         use crate::msr::{IA32_S_CET, IA32_U_CET};
-        r.u_cet_before = crate::msr::read(IA32_U_CET);
-        r.s_cet_before = crate::msr::read(IA32_S_CET);
+        // Fault-safe (GP-CPU): the first CPU with these registers that BitsOS meets bare is the Gaming-PC's. One
+        // that faults reads as 0 and is left alone.
+        r.u_cet_before = crate::msr::try_read(IA32_U_CET).unwrap_or(0);
+        r.s_cet_before = crate::msr::try_read(IA32_S_CET).unwrap_or(0);
         for (msr, was) in [(IA32_U_CET, r.u_cet_before), (IA32_S_CET, r.s_cet_before)] {
             if was != 0 {
-                crate::msr::write(msr, 0);
+                let _ = crate::msr::try_write(msr, 0);
             }
         }
+    }
+
+    // This CPU's own CPUID for the same reason as CET; the MSRs are only asked on Intel with the bits.
+    // Reads and write are fault-safe (GP-CPU): KVM shows the value works in a guest, a bare CPU nobody has booted
+    // may still refuse. A capabilities register that faults reads as 0 (no enhanced IBRS: nothing is written); a
+    // refused value leaves the register as the firmware set it and the report says 0. Each fault is named in
+    // `msr::faults`.
+    if let Some(x) = spec_ctrl_wanted(&live(), &mut |m| crate::msr::try_read(m).unwrap_or(0))
+        && crate::msr::try_write(crate::msr::IA32_SPEC_CTRL, x)
+    {
+        r.spec_ctrl = x;
     }
 
     let mut efer = crate::msr::read(crate::msr::IA32_EFER) | crate::msr::EFER_SCE;
@@ -838,11 +870,48 @@ pub fn cet_msrs_exist(v: &CpuidView) -> bool {
     v.has("shstk") || v.has("ibt")
 }
 
+/// IA32_SPEC_CTRL bits Linux decides itself (linux-7.3.1/arch/x86/include/asm/msr-index.h:72-86): a Reload's earlier
+/// kernel or the firmware may have left them, so they are cleared before the wanted ones are set
+/// (linux-7.3.1/arch/x86/kernel/cpu/bugs.c:3277-3284).
+const SPEC_CTRL_IBRS: u64 = 1 << 0;
+const SPEC_CTRL_RRSBA_DIS_S: u64 = 1 << 6;
+const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
+const SPEC_CTRL_MITIGATIONS_MASK: u64 = SPEC_CTRL_IBRS | 1 << 1 | 1 << 2 | SPEC_CTRL_RRSBA_DIS_S | SPEC_CTRL_BHI_DIS_S;
+/// IA32_ARCH_CAPABILITIES: enhanced IBRS is there (linux-7.3.1/arch/x86/include/asm/msr-index.h:129).
+const ARCH_CAP_IBRS_ALL: u64 = 1 << 1;
+
+/// IA32_SPEC_CTRL for an Intel CPU with enhanced IBRS: the value Linux 7.3.1 runs with in its default Spectre v2
+/// mode there ("Enhanced / Automatic IBRS"), which is what this host's Linux reports on the 265K.
+/// - `IBRS` once at boot, no write on the entry paths (linux-7.3.1/arch/x86/kernel/cpu/bugs.c:2280-2286).
+/// - `BHI_DIS_S` where CPUID 7.2 EDX bit 4 offers it (bugs.c:2042-2047 `spec_ctrl_bhi_dis`, reached at :2122):
+///   every Intel CPU with enhanced IBRS counts as open to branch history injection
+///   (linux-7.3.1/arch/x86/kernel/cpu/common.c:1593-1596; no Intel model is on the NO_BHI list).
+/// - `RRSBA_DIS_S` is NOT set: Linux sets it only where RETs stand in for indirect branches (the retpoline modes,
+///   bugs.c:2318-2321 and :2112-2113), and this kernel is built without retpolines, like Linux's plain
+///   enhanced-IBRS mode. A stale one is cleared with the mask.
+///
+/// `None`: nothing to do and no MSR was asked (every other vendor, Intel without the bits). Pure; `read` is asked
+/// only for MSRs CPUID promises.
+pub fn spec_ctrl_wanted(v: &CpuidView, read: &mut dyn FnMut(u32) -> u64) -> Option<u64> {
+    if !crate::msr::is_intel(v) || !v.has("spec_ctrl") || !v.has("arch_capabilities") {
+        return None;
+    }
+    let caps = read(crate::msr::IA32_ARCH_CAPABILITIES);
+    if caps & ARCH_CAP_IBRS_ALL == 0 {
+        return None;
+    }
+    let mut x = (read(crate::msr::IA32_SPEC_CTRL) & !SPEC_CTRL_MITIGATIONS_MASK) | SPEC_CTRL_IBRS;
+    if v.has("bhi_ctrl") {
+        x |= SPEC_CTRL_BHI_DIS_S;
+    }
+    Some(x)
+}
+
 /// BSP set-up (kernel start order in the desk's main.rs).
 pub fn init_bsp(f: &Features) -> SetupReport {
     // Node 0 until CP-4 reads the topology (SRAT/CPUID); both machines have one node.
     let r = init_this_cpu(f, 0, 0);
-    let words: [u64; SETUP_WORDS] = [r.cr0_before, r.cr0, r.cr4_before, r.cr4, r.efer, r.xcr0, r.u_cet_before, r.s_cet_before];
+    let words: [u64; SETUP_WORDS] = [r.cr0_before, r.cr0, r.cr4_before, r.cr4, r.efer, r.xcr0, r.u_cet_before, r.s_cet_before, r.spec_ctrl];
     for (i, v) in words.into_iter().enumerate() {
         BSP_SETUP[i].store(v, Ordering::Relaxed);
     }
@@ -1307,7 +1376,8 @@ pub fn mca_report(f: &Features) -> McaReport {
     let mcg_cap = msr::read(msr::IA32_MCG_CAP);
     let banks = (mcg_cap & 0xFF) as u32;
     let smca = f.smca;
-    let reg = |b: u32, r: u32| msr::mc_reg(smca, b, r).map_or(0, msr::read);
+    // Fault-safe (GP-CPU): a bank register a CPU does not implement reads as 0 (no error recorded), not as a #GP.
+    let reg = |b: u32, r: u32| msr::mc_reg(smca, b, r).and_then(msr::try_read).unwrap_or(0);
     let records = mca_collect(mca_readable_banks(banks, smca), smca, &mut |b, r| match r {
         McaReg::Status => reg(b, msr::MC_STATUS),
         McaReg::Addr => reg(b, msr::MC_ADDR),
@@ -1369,28 +1439,6 @@ mod tests {
         Table(t)
     }
 
-    /// Arrow Lake like the Gaming-PC's Core Ultra 7 265K: v3, hybrid, no AVX-512, TSC-deadline.
-    fn arrow_lake() -> Table {
-        let mut t = BTreeMap::new();
-        vendor(&mut t, 0x23, b"GenuineIntel");
-        let ecx1 = bits(&[0, 1, 3, 9, 12, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
-        t.insert((1, 0), r(0x000C_0662, 0x0080_0800, ecx1, bits(EDX1)));
-        // The host's flags: turbo, arat, pln, pts, hwp, hwp_notify, hwp_act_window, hwp_epp, hwp_pkg_req.
-        t.insert((6, 0), r(bits(&[1, 2, 4, 6, 7, 8, 9, 10, 11]), 0, 0, 0));
-        let ebx7 = bits(&[0, 1, 3, 5, 7, 8, 9, 10, 18, 19, 20, 23, 24, 29]);
-        let ecx7 = bits(&[2, 5, 8, 9, 10, 22, 27, 28]);
-        t.insert((7, 0), r(1, ebx7, ecx7, bits(&[4, 14, 15])));
-        t.insert((7, 1), r(bits(&[4]), 0, 0, 0));
-        t.insert((0xD, 0), r(0x207, 0x340, 0xA88, 0));
-        t.insert((0xD, 1), r(0xF, 0x670, 0, 0));
-        t.insert((0x8000_0000, 0), r(0x8000_0008, 0, 0, 0));
-        t.insert((0x8000_0001, 0), r(0, 0, bits(&[0, 5, 8]), bits(&[11, 20, 26, 27, 29])));
-        brand(&mut t, "Intel(R) Core(TM) Ultra 7 265K");
-        t.insert((0x8000_0007, 0), r(0, 0, 0, bits(&[8])));
-        t.insert((0x8000_0008, 0), r(0x3027, 0, 0, 0));
-        Table(t)
-    }
-
     /// An Ivy-Bridge-like CPU: AVX but no AVX2/BMI/FMA/MOVBE/LZCNT.
     fn old() -> Table {
         let mut t = BTreeMap::new();
@@ -1439,33 +1487,206 @@ mod tests {
         assert_eq!(x, XSTATE_X87 | XSTATE_SSE | XSTATE_AVX | XSTATE_AVX512, "PKRU (bit 9) stays off");
     }
 
+    /// The real 265K's P core in this module's table form.
+    fn arrow_lake() -> Table {
+        Table(real_265k::cpu0().into_map())
+    }
+
+    /// Runs `f` on a dump of the real 265K (`real_265k`).
+    fn real<T>(d: &real_265k::Dump, f: impl FnOnce(&CpuidView) -> T) -> T {
+        let g = d.getter();
+        f(&CpuidView::new(&g))
+    }
+
+    /// All four dumps: P core, favoured P core, two E cores.
+    fn real_all() -> [real_265k::Dump; 4] {
+        [real_265k::cpu0(), real_265k::cpu3(), real_265k::cpu8(), real_265k::cpu19()]
+    }
+
+    /// The committed captures of the real machine hold nothing that names this one machine. Every line of a
+    /// CPUID dump is a leaf, a sub-leaf and four registers (no free text, so no address or serial can hide in
+    /// one), the processor serial number is neither offered (leaf 1 EDX bit 18) nor present (leaf 3 reads zero),
+    /// and the topology file holds only small numbers under known names.
     #[test]
-    fn arrow_lake_features() {
-        let t = arrow_lake();
-        let (f, facts) = with(&t, |v| (Features::from_view(v), CpuFacts::from_view(v)));
-        assert!(f.intel && !f.amd && !f.avx512f && f.tsc_deadline && f.fsgsbase && f.pcid && f.invpcid && !f.smca);
-        assert_eq!((facts.family, facts.model, facts.stepping), (6, 0xC6, 2));
-        assert!(facts.missing_v3.is_empty(), "{:?}", facts.missing_v3);
-        assert!(facts.has("hybrid_cpu") && facts.has("avx_vnni") && facts.has("serialize"));
-        assert_eq!(xcr0_wanted(facts.xcr0_supported), XSTATE_X87 | XSTATE_SSE | XSTATE_AVX);
-        assert_eq!(facts.brand, "Intel(R) Core(TM) Ultra 7 265K");
-        assert_eq!(facts.phys_addr_bits, 39);
-        assert!(facts.has("hwp") && facts.has("arat"));
+    fn real_265k_captures_hold_no_serial() {
+        let hex = |w: &str, len: usize| w.len() == len && w.bytes().all(|b| b.is_ascii_hexdigit());
+        let dumps = [
+            include_str!("cpu/real_265k/cpuid-cpu0.txt"),
+            include_str!("cpu/real_265k/cpuid-cpu3.txt"),
+            include_str!("cpu/real_265k/cpuid-cpu8.txt"),
+            include_str!("cpu/real_265k/cpuid-cpu19.txt"),
+        ];
+        for text in dumps {
+            for line in text.lines() {
+                let w: Vec<&str> = line.split(' ').collect();
+                let shaped = w.len() == 6 && hex(w[0], 8) && w[1].strip_suffix(':').is_some_and(|s| hex(s, 2)) && w[2..].iter().all(|r| hex(r, 8));
+                assert!(shaped, "not a CPUID line: {line:?}");
+            }
+        }
+        for d in real_all() {
+            let get = d.getter();
+            assert_eq!(get(1, 0).edx & 1 << 18, 0, "the processor serial number is offered");
+            let psn = get(3, 0);
+            assert_eq!((psn.eax, psn.ebx, psn.ecx, psn.edx), (0, 0, 0, 0), "leaf 3 holds a serial number");
+        }
+        const NAMES: [&str; 8] = ["core", "die", "cluster", "cap", "highest_perf", "nominal", "l2", "apic"];
+        for line in include_str!("cpu/real_265k/topology.txt").lines() {
+            let mut w = line.split(' ');
+            assert!(w.next().and_then(|c| c.strip_prefix("cpu")).is_some_and(|n| n.parse::<u8>().is_ok()), "{line:?}");
+            for field in w {
+                let (name, value) = field.split_once('=').expect("name=value");
+                assert!(NAMES.contains(&name), "unknown field in {line:?}");
+                assert!(value.split('-').all(|n| n.parse::<u16>().is_ok()), "{field:?} is not a small number");
+            }
+        }
+    }
+
+    #[test]
+    fn real_265k_features() {
+        for d in real_all() {
+            let (f, facts) = real(&d, |v| (Features::from_view(v), CpuFacts::from_view(v)));
+            assert!(f.intel && !f.amd && !f.avx512f && f.tsc_deadline && f.fsgsbase && f.pcid && f.invpcid && !f.smca && !f.hypervisor);
+            assert!(f.x2apic && f.xsave && f.xsaves && f.smep && f.smap && f.umip && f.invariant_tsc && f.rdtscp && f.rdpid && !f.la57);
+            assert!(f.shstk && f.ibt, "CET exists: its MSRs are zeroed at set-up");
+            assert_eq!((facts.family, facts.model, facts.stepping), (6, 0xC6, 2));
+            assert!(facts.missing_v3.is_empty(), "{:?}", facts.missing_v3);
+            assert!(facts.has("hybrid_cpu") && facts.has("avx_vnni") && facts.has("serialize") && facts.has("arat"));
+            assert!(facts.has("hwp") && facts.has("hwp_notify") && facts.has("hwp_act_window") && facts.has("hwp_epp") && facts.has("hwp_pkg_req"));
+            assert!(facts.has("spec_ctrl") && facts.has("arch_capabilities") && facts.has("rrsba_ctrl") && facts.has("bhi_ctrl"));
+            assert_eq!(xcr0_wanted(facts.xcr0_supported), XSTATE_X87 | XSTATE_SSE | XSTATE_AVX, "PKRU off, no AVX-512");
+            assert_eq!(facts.brand.trim(), "Intel(R) Core(TM) Ultra 7 265K");
+            assert_eq!(facts.phys_addr_bits, 46);
+        }
+    }
+
+    /// GP-CPU audit: AMD's bits in the leaf Intel keeps reserved (0x8000_0007: SMCA in EBX, RAPL in EDX) never open
+    /// an AMD path on an Intel CPU, even should a later model set them.
+    #[test]
+    fn amd_only_bits_do_nothing_on_intel() {
+        let mut d = real_265k::cpu0();
+        d.patch(0x8000_0007, 0, |r| {
+            r.ebx |= 1 << 3;
+            r.edx |= 1 << 14;
+        });
+        let (f, amd, mtrr) = real(&d, |v| (Features::from_view(v), crate::msr::is_amd(v), amd_mtrr_msrs(v)));
+        assert!(f.intel && !f.smca, "SMCA bank addresses on Intel");
+        assert!(!amd && !mtrr);
+        assert_eq!(mca_readable_banks(40, f.smca), crate::msr::LEGACY_MCA_BANKS, "banks stay at the legacy addresses");
+    }
+
+    /// What differs between P and E cores on the real CPU must end in one safe set: no AP refused, one XSAVE layout,
+    /// no feature difference at all to log, TSC-deadline everywhere, the same TSC and crystal from 0x15.
+    #[test]
+    fn real_265k_p_and_e_cores_agree() {
+        let all = real_all();
+        let bsp = &all[0];
+        let (bsp_flags, bsp_xsave, bsp15) = real(bsp, |v| (FlagBits::from_view(v), XsaveSig::from_view(v), v.get(0x15, 0)));
+        assert_eq!((bsp15.eax, bsp15.ebx, bsp15.ecx), (2, 202, 38_400_000), "38.4 MHz crystal, ratio 202/2");
+        for ap in &all {
+            let g_b = bsp.getter();
+            let g_a = ap.getter();
+            let (b, a) = (CpuidView::new(&g_b), CpuidView::new(&g_a));
+            assert_eq!(ap_missing(&b, &a), None);
+            assert_eq!(xsave_mismatch(&bsp_xsave, &XsaveSig::from_view(&a)), None);
+            assert!(bsp_flags.differences(&FlagBits::from_view(&a)).is_empty(), "{:?}", bsp_flags.differences(&FlagBits::from_view(&a)));
+            assert!(a.has("tsc_deadline_timer"));
+            let l15 = a.get(0x15, 0);
+            assert_eq!((l15.eax, l15.ebx, l15.ecx), (bsp15.eax, bsp15.ebx, bsp15.ecx));
+            assert_eq!(a.get(0x16, 0).eax, 3900, "base MHz, both kinds");
+            // The kinds really differ where they should, and only leaf 0x16's maximum is the core's own.
+            assert_eq!(a.get(0xD, 0), b.get(0xD, 0));
+        }
+        assert_ne!(real(&all[0], |v| v.get(0x16, 0).ebx), real(&all[2], |v| v.get(0x16, 0).ebx), "maximum MHz differs by kind");
+        assert_ne!(real(&all[0], |v| v.get(0x1A, 0).eax), real(&all[2], |v| v.get(0x1A, 0).eax), "core type differs by kind");
+    }
+
+    /// An E-core BSP against a P-core AP gives the same answer: no order of bring-up matters.
+    #[test]
+    fn real_265k_either_kind_can_be_the_bsp() {
+        let (p, e) = (real_265k::cpu0(), real_265k::cpu19());
+        let (gp, ge) = (p.getter(), e.getter());
+        let (vp, ve) = (CpuidView::new(&gp), CpuidView::new(&ge));
+        assert_eq!(ap_missing(&ve, &vp), None);
+        assert_eq!(xsave_mismatch(&XsaveSig::from_view(&ve), &XsaveSig::from_view(&vp)), None);
+    }
+
+    /// C1 is `sti; hlt` on every kind; should a later item use MWAIT C1, CPUID 5 and ARAT are the same on both kinds:
+    /// MONITOR/MWAIT with the interrupt break extension, the C1 sub-states, and a timer that runs on in C-states.
+    #[test]
+    fn real_265k_idle_facts_are_the_same_on_both_kinds() {
+        for d in real_all() {
+            real(&d, |v| {
+                let five = v.get(5, 0);
+                assert!(v.has("monitor") && v.has("arat") && v.has("constant_tsc"));
+                assert_eq!(five.ecx & 3, 3, "MWAIT extensions and interrupt break");
+                assert_eq!((five.edx >> 4) & 0xF, 2, "two C1 sub-states: hint 0 is valid");
+                assert_eq!(five.edx, 0x1010_2020);
+            });
+        }
     }
 
     /// CP-6: the Intel paths never take an AMD-only MSR, and Intel RAPL is decided by model, never in a guest.
     #[test]
     fn intel_msr_paths() {
-        let arl = arrow_lake();
-        assert!(!with(&arl, amd_mtrr_msrs), "no SYSCFG/TOM/TOM2 on Intel");
-        assert!(with(&arl, crate::msr::intel_rapl_model), "265K (family 6 model 0xC6) has RAPL");
+        let arl = real_265k::cpu0();
+        assert!(!real(&arl, amd_mtrr_msrs), "no SYSCFG/TOM/TOM2 on Intel");
+        assert!(real(&arl, crate::msr::intel_rapl_model), "265K (family 6 model 0xC6) has RAPL");
+        assert!(real(&arl, crate::msr::intel_hwp));
         assert!(!with(&zen4(), crate::msr::intel_rapl_model) && with(&zen4(), amd_mtrr_msrs));
         assert!(!with(&zen4(), |v| v.has("hwp")));
         assert!(!with(&old(), crate::msr::intel_rapl_model), "Ivy Bridge is not on the list");
-        let mut guest = arrow_lake();
-        let one = guest.0.get_mut(&(1, 0)).unwrap();
-        one.ecx |= 1 << 31;
-        assert!(!with(&guest, crate::msr::intel_rapl_model), "KVM passes the model through but has no RAPL MSRs");
+        let mut guest = real_265k::cpu0();
+        guest.patch(1, 0, |r| r.ecx |= 1 << 31);
+        assert!(!real(&guest, crate::msr::intel_rapl_model), "KVM passes the model through but has no RAPL MSRs");
+        assert!(!real(&guest, crate::msr::intel_hwp), "nor HWP MSRs");
+    }
+
+    /// Enhanced IBRS: only Intel with the bits, the firmware's other bits kept, the mitigation bits decided here.
+    #[test]
+    fn spec_ctrl_on_intel_only() {
+        use crate::msr::{IA32_ARCH_CAPABILITIES, IA32_SPEC_CTRL};
+        let arl = real_265k::cpu0();
+        let wanted = |d: &real_265k::Dump, caps: u64, ctrl: u64| {
+            real(d, |v| spec_ctrl_wanted(v, &mut |m| match m {
+                IA32_ARCH_CAPABILITIES => caps,
+                IA32_SPEC_CTRL => ctrl,
+                _ => panic!("MSR {m:#x}"),
+            }))
+        };
+        assert_eq!(wanted(&arl, 0, 0), None, "no enhanced IBRS: nothing");
+        // The real 265K has CPUID 7.2 EDX bit 4: Linux's value on this CPU is IBRS | BHI_DIS_S = 0x401.
+        assert!(real(&arl, |v| v.has("bhi_ctrl") && v.has("rrsba_ctrl")));
+        assert_eq!(wanted(&arl, ARCH_CAP_IBRS_ALL, 0), Some(0x401));
+        assert_eq!(wanted(&arl, ARCH_CAP_IBRS_ALL, 0), Some(SPEC_CTRL_IBRS | SPEC_CTRL_BHI_DIS_S));
+        // RRSBA (bit 19) in the capabilities changes nothing: no retpolines here, as Linux's enhanced-IBRS mode.
+        assert_eq!(wanted(&arl, ARCH_CAP_IBRS_ALL | 1 << 19, 0), Some(SPEC_CTRL_IBRS | SPEC_CTRL_BHI_DIS_S));
+        assert_eq!(
+            wanted(&arl, ARCH_CAP_IBRS_ALL, 1 << 2 | SPEC_CTRL_RRSBA_DIS_S | 1 << 7),
+            Some(SPEC_CTRL_IBRS | SPEC_CTRL_BHI_DIS_S | 1 << 7),
+            "SSBD and RRSBA_DIS_S from before go, an unknown bit stays"
+        );
+        let no_bhi_ctrl = {
+            let mut d = real_265k::cpu0();
+            d.patch(7, 2, |r| r.edx &= !(1 << 4));
+            d
+        };
+        assert_eq!(wanted(&no_bhi_ctrl, ARCH_CAP_IBRS_ALL, SPEC_CTRL_BHI_DIS_S), Some(SPEC_CTRL_IBRS), "no bit 10 without its CPUID bit, a stale one goes");
+        let no_caps = {
+            let mut d = real_265k::cpu0();
+            d.patch(7, 0, |r| r.edx &= !(1 << 29));
+            d
+        };
+        let mut asked = false;
+        assert_eq!(real(&no_caps, |v| spec_ctrl_wanted(v, &mut |_| {
+            asked = true;
+            0
+        })), None);
+        assert!(!asked, "no MSR without CPUID");
+        // AMD: never an MSR, even with a bit pattern that looks like Intel's.
+        let mut amd = zen4();
+        let seven = amd.0.get_mut(&(7, 0)).unwrap();
+        seven.edx |= 1 << 26 | 1 << 29;
+        assert_eq!(with(&amd, |v| spec_ctrl_wanted(v, &mut |m| panic!("MSR {m:#x} on AMD"))), None);
     }
 
     #[test]

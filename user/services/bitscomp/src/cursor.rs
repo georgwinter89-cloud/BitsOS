@@ -22,7 +22,7 @@ const ARROW: [&str; 19] = [
 ];
 
 /// The smallest size >= `n` that is a whole number of logical points at scale `s` (the element is then shown
-/// 1:1, without pixman's filter blurring the outline).
+/// 1:1, without the renderer's filter blurring the outline).
 pub fn padded(n: i32, s: f64) -> i32 {
     (n..n + 16).find(|&m| ((m as f64 / s) - (m as f64 / s).round()).abs() < 1e-6).unwrap_or(n)
 }
@@ -48,13 +48,10 @@ pub fn arrow(k: i32, w: i32, h: i32) -> (i32, i32, Vec<u8>) {
     (w, h, px.iter().flat_map(|p| p.to_le_bytes()).collect())
 }
 
-/// The pointer's elements (topmost first), empty when it is hidden or the host draws it; WY-7's "starting" mark
-/// beside it while a started program has no window yet (shown also when a client hid the pointer, and in software
-/// beside a hardware cursor).
+/// The pointer's elements (topmost first), empty when it is hidden or the hardware cursor shows it; WY-7's
+/// "starting" mark beside it while a started program has no window yet (shown also when a client hid the pointer, and
+/// in the frames beside a hardware cursor).
 pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement<R>> {
-    if !app.draw_pointer {
-        return Vec::new();
-    }
     let mut out = if app.cursor.on_hw { Vec::new() } else { pointer(app, renderer) };
     if app.launches.busy() {
         out.extend(starting(app, renderer));

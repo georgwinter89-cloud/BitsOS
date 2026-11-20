@@ -103,7 +103,7 @@ pub struct EdcaParams {
     pub txop: u32,
 }
 
-// Linux: none (mac80211 ieee80211_set_wmm_default (linux-6.6/net/mac80211/util.c:1699),
+// Linux: none (mac80211 ieee80211_set_wmm_default (linux-7.3.1/net/mac80211/util.c:1025),
 // enable_qos false: a non-QoS link):
 // every AC the 802.11 DCF values aCWmin 15 (31 for 11b only), aCWmax 1023, AIFSN 2, no TXOP
 pub fn wmm_default(use_11b: bool) -> [EdcaParams; 4] {
@@ -627,9 +627,9 @@ pub fn vif_type_mapping(vif: &mut Vif, assoc: bool) {
 
 // Linux: rtw89_ops_add_interface (mac80211.c:169) with __rtw89_ops_add_iface_link
 // (mac80211.c:107), then the rest of mac80211's ieee80211_do_open
-// (linux-6.6/net/mac80211/iface.c:1226) for the first interface: the ERP reset (link_info_changed
+// (linux-7.3.1/net/mac80211/iface.c:1401) for the first interface: the ERP reset (link_info_changed
 // ERP_SLOT -> rtw89_conf_tx with the zeroed tx_params), ieee80211_set_wmm_default
-// (linux-6.6/net/mac80211/iface.c:1419: enable_qos false for a station), hw_config(~0) ->
+// (linux-7.3.1/net/mac80211/iface.c:1614: enable_qos false for a station), hw_config(~0) ->
 // rtw89_ops_config with CHANGE_CHANNEL
 // (rtw89_get_default_chandef: 2.4 GHz channel 1) and CHANGE_MONITOR, and the RX filter of the
 // netdev's rx-mode work.

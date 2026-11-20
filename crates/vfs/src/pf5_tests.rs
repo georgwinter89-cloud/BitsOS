@@ -145,7 +145,10 @@ fn readers_check_every_byte_while_pages_are_evicted_and_reused() {
     let r = Reclaimer::of(&[&c]);
     let t0 = Instant::now();
     let (mut evicted, mut rounds) = (0u64, 0u64);
-    while t0.elapsed() < Duration::from_millis(400) || rounds < 50 {
+    // On until pages were evicted and read again while the readers ran (60 s at most): on a busy host the readers
+    // may not run during the first 400 ms (the race is judged, not how soon it comes).
+    let raced = |evicted: u64| evicted > 0 && d.reads.load(Ordering::Relaxed) > PAGES;
+    while t0.elapsed() < Duration::from_millis(400) || rounds < 50 || !raced(evicted) && t0.elapsed() < Duration::from_secs(60) {
         rounds += 1;
         evicted += r.shrink(PAGES, Mode::Background, true).freed;
         // What passed its grace period is freed now (no wait: readers may still be in their sections).

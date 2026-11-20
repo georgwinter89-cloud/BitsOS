@@ -2,7 +2,7 @@
 //! started no more commands and waited for its last one): the controller's transfers in flight per kind, and a
 //! bounded wait until no bulk transfer is live and the command ring is idle. It does not halt the controller:
 //! that stays the lock-free `Quiesce` (RS off, HCH, bus master off; Linux `xhci_shutdown` halts too,
-//! linux-6.6/drivers/usb/host/xhci.c:631-662), so the reset path keeps one order and the HID pipes run until
+//! linux-7.3.1/drivers/usb/host/xhci.c:750-784), so the reset path keeps one order and the HID pipes run until
 //! then. A zombie TD (an endpoint that did not stop for a cancel, `bulk.rs`) may still be run by the controller:
 //! it is counted and named, the halt in `Quiesce` ends it.
 

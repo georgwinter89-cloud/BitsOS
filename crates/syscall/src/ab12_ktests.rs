@@ -30,6 +30,7 @@ const CLONE_PARENT_SETTID: u64 = 0x10_0000;
 const CLONE_PARENT: u64 = 0x8000;
 const SIGCHLD: u64 = 17;
 const POLLIN: u16 = 1;
+const POLLHUP: u16 = 0x10;
 // nanosleep({100, 0}); jmp .
 const SLEEPER: [u8; 18] = [0x6a, 0x00, 0x6a, 0x64, 0x48, 0x89, 0xe7, 0x31, 0xf6, 0xb8, 0x23, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xfe];
 
@@ -150,7 +151,8 @@ fn open() -> TestResult {
     // Reaped: gone for every call, still readable.
     kassert!(t.call(PIDFD_SEND_SIGNAL, &[fd as u64, 0, 0, 0]) == -ESRCH, "signal after the reap");
     kassert!(waitid(&mut t, P_PIDFD, fd, WEXITED | WNOHANG).0 == -ECHILD, "waitid after the reap");
-    kassert!(revents(&mut t, fd) == POLLIN, "still readable");
+    // linux-7.3.1/fs/pidfs.c:318: a pid without its task also reports EPOLLHUP.
+    kassert!(revents(&mut t, fd) == POLLIN | POLLHUP, "still readable, and hung up");
     let info = fdinfo(&mut t, fd);
     kassert!(info.ends_with("Pid:\t-1\nNSpid:\t-1\n"), "fdinfo after the reap {info:?}");
     kassert!(t.call(PIDFD_OPEN, &[cpid, 0]) == -ESRCH, "pidfd_open of a reaped pid");
@@ -169,7 +171,10 @@ fn signal_rules() -> TestResult {
     let op = t.call(PIDFD_OPEN, &[other.p.pid as u64, 0]);
     let rp = t.call(PIDFD_OPEN, &[root.p.pid as u64, 0]);
     kassert!(own >= 0 && pp >= 0 && op >= 0 && rp >= 0, "pidfds {own} {pp} {op} {rp}");
-    kassert!(t.call(PIDFD_SEND_SIGNAL, &[pp as u64, 0, 0, 1]) == -EINVAL, "flags");
+    // 1, 2 and 4 are the PIDFD_SIGNAL_* scopes (one at a time); 8 is unknown.
+    kassert!(t.call(PIDFD_SEND_SIGNAL, &[pp as u64, 0, 0, 8]) == -EINVAL, "flags");
+    kassert!(t.call(PIDFD_SEND_SIGNAL, &[pp as u64, 0, 0, 6]) == -EINVAL, "two scopes");
+    kassert!(t.call(PIDFD_SEND_SIGNAL, &[pp as u64, 0, 0, 2]) == 0, "PIDFD_SIGNAL_THREAD_GROUP");
     kassert!(t.call(PIDFD_SEND_SIGNAL, &[999_999, 0, 0, 0]) == -EBADF, "closed fd");
     let efd = t.call(nr::EVENTFD2, &[0, 0]);
     kassert!(t.call(PIDFD_SEND_SIGNAL, &[efd as u64, 0, 0, 0]) == -EBADF, "not a pidfd");
@@ -207,7 +212,7 @@ fn signal_rules() -> TestResult {
 }
 
 /// clone3 with a VER0 `struct clone_args` (64 bytes) at `at`: SIGCHLD as the exit signal (none with CLONE_THREAD
-/// or CLONE_PARENT, which clone3 refuses with one: linux-6.6/kernel/fork.c clone3_args_valid).
+/// or CLONE_PARENT, which clone3 refuses with one: linux-7.3.1/kernel/fork.c:3045 clone3_args_valid).
 fn clone3(t: &mut T, at: u64, flags: u64, pidfd: u64) -> i64 {
     let mut b = [0u8; 64];
     b[0..8].copy_from_slice(&flags.to_le_bytes());
@@ -230,9 +235,8 @@ fn clone() -> TestResult {
     let again = t.call(nr::EVENTFD2, &[0, 0]);
     kassert!(again == probe, "an fd leaked: {again} != {probe}");
     t.call(nr::CLOSE, &[again as u64]);
-    let thread = CLONE_PIDFD | CLONE_THREAD | 0x800 | 0x100 | 0x200 | 0x400;
+    // CLONE_PIDFD | CLONE_THREAD makes a thread pidfd since Linux 6.9 (ktest ab.l7.pidfd_thread).
     let a1300 = t.a(1300);
-    kassert!(clone3(&mut t, 1200, thread, a1300) == -EINVAL, "CLONE_PIDFD | CLONE_THREAD");
     // clone3: the child (the held image's exit_group(0)) and its pidfd.
     t.put(1300, &[0xff; 4]);
     let pid = clone3(&mut t, 1200, CLONE_PIDFD, a1300);
@@ -273,7 +277,7 @@ fn clone() -> TestResult {
 
 ktest!("ab.pidfd.clone_parent", Safe, clone_parent);
 /// CLONE_PIDFD | CLONE_PARENT: the child is the caller's sibling, so waitid through the caller's pidfd is ECHILD
-/// (linux-6.6/kernel/exit.c `eligible_child` sees only the caller's own children), while poll still works and
+/// (linux-7.3.1/kernel/exit.c:1153 `eligible_child` sees only the caller's own children), while poll still works and
 /// the caller's parent collects it.
 fn clone_parent() -> TestResult {
     let mut outer = T::new("ab12-cparent-outer")?;

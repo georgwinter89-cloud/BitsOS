@@ -2,8 +2,8 @@
 //! `syscall::sched_sys`): the **nice value** (-20..19) and the **policy** (SCHED_OTHER, SCHED_BATCH, SCHED_IDLE)
 //! feed the fair class's weights; the **CPU affinity mask** limits where a thread runs.
 //!
-//! Weights: Linux's `sched_prio_to_weight` (linux-6.6/kernel/sched/core.c:11542), SCHED_IDLE = 3
-//! (`WEIGHT_IDLEPRIO`, kernel/sched/sched.h:2179). The B4 class sets a thread's base nice (Interactive -5,
+//! Weights: Linux's `sched_prio_to_weight` (linux-7.3.1/kernel/sched/core.c:10673), SCHED_IDLE = 3
+//! (`WEIGHT_IDLEPRIO`, kernel/sched/sched.h:2548). The B4 class sets a thread's base nice (Interactive -5,
 //! Normal 0, Background 10: the class weights SC-3 used); the program's nice is added to it (clamped to
 //! -20..19), so a program can never lift itself above what policy granted its class, only move inside it.
 //! SCHED_BATCH keeps the weight but never preempts on wake-up, SCHED_IDLE has weight 3 and is preempted by any
@@ -15,7 +15,7 @@
 //! SC-7a (B4): SCHED_FIFO/SCHED_RR are accepted only for a thread whose group holds an Interactive grant
 //! (`interactive`; the grant takes the place of Linux's privilege, root alone is not enough: "granted by policy,
 //! never self-raised") or, without one, as Linux allows with RLIMIT_RTPRIO 0: the same RT policy at the same or
-//! a lower priority (linux-6.6/kernel/sched/core.c:7572-7582). They run in the Interactive class (fair weight of
+//! a lower priority (linux-7.3.1/kernel/sched/syscalls.c:445-456). They run in the Interactive class (fair weight of
 //! nice -5, the program's nice does not count, as Linux ignores it for RT); the priority is stored and reported,
 //! not used for ordering (a strict RT order could starve, B4). SCHED_IDLE runs in the Background class (weight
 //! 3 as Linux). A thread's class follows from its spawn class, its policy and its group's grant
@@ -38,7 +38,7 @@ use ksync::SpinLock;
 
 pub const MIN_NICE: i32 = -20;
 pub const MAX_NICE: i32 = 19;
-/// Linux's `sched_prio_to_weight`, nice -20 first (linux-6.6/kernel/sched/core.c:11542).
+/// Linux's `sched_prio_to_weight`, nice -20 first (linux-7.3.1/kernel/sched/core.c:10673).
 const NICE_WEIGHTS: [u64; 40] = [
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526,
     423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
@@ -147,7 +147,7 @@ pub fn boosted_class(own: Class, boost: u8) -> Class {
 
 /// Whether a program may move a thread from `cur` (RT priority `cur_prio`) to the RT policy `new` at `prio`:
 /// with a grant always; without one only as Linux allows with RLIMIT_RTPRIO 0 (same policy, priority not
-/// raised; linux-6.6/kernel/sched/core.c:7575-7582).
+/// raised; linux-7.3.1/kernel/sched/syscalls.c:445-456).
 pub fn rt_change_allowed(cur: Policy, cur_prio: u8, new: Policy, prio: u8, granted: bool) -> bool {
     granted || (new == cur && prio <= cur_prio)
 }
@@ -245,6 +245,12 @@ impl Thread {
     /// SCHED_BATCH and SCHED_IDLE threads never preempt on wake-up (Linux `check_preempt_wakeup`).
     pub(crate) fn wakeup_preempts(policy: u8) -> bool {
         policy != Policy::Batch as u8 && policy != Policy::Idle as u8
+    }
+    /// GP-CPU2: whether a misfit pull may move it (no pin and the full affinity mask). Linux's misfit skips a task
+    /// bound to one CPU (`update_misfit_status`, kernel/sched/fair.c) and its balancer asks `cpus_ptr`; a narrowed
+    /// mask is left to the ordinary balancing, which asks `may_run_on`.
+    pub fn misfit_free(&self) -> bool {
+        self.pin.load(Ordering::Relaxed) == NO_CPU && self.affine_all.load(Ordering::Acquire)
     }
     /// Whether it may run on `cpu` (its kernel pin first, then its affinity mask). Allocation- and lock-free.
     pub fn may_run_on(&self, cpu: usize) -> bool {
@@ -444,7 +450,7 @@ pub fn set_affinity(id: u64, mask: &[u64]) -> Result<(), AttrError> {
 
 /// Copies nice, policy and affinity from thread `from` to `to` (fork and clone: Linux `sched_fork` and the
 /// mask `dup_task_struct` copies). With reset-on-fork the child gets nice 0 if the parent's was negative, keeps
-/// a fair policy, and the flag is cleared (linux-6.6/kernel/sched/core.c `sched_fork`).
+/// a fair policy, and the flag is cleared (linux-7.3.1/kernel/sched/core.c:4826 `sched_fork`).
 pub fn copy_attrs(from: u64, to: u64) -> Result<(), AttrError> {
     let p = thread(from)?;
     let c = thread(to)?;
@@ -569,7 +575,7 @@ mod tests {
         assert_eq!(nice_weight(-100), 88761, "clamped");
         assert_eq!(nice_weight(100), 15, "clamped");
         assert_eq!(nice_weight(5), 335);
-        // Spot checks against linux-6.6/kernel/sched/core.c:11542 beyond the ends, and the table's sum.
+        // Spot checks against linux-7.3.1/kernel/sched/core.c:10673 beyond the ends, and the table's sum.
         assert_eq!((nice_weight(-5), nice_weight(-1), nice_weight(1), nice_weight(10)), (3121, 1277, 820, 110));
         assert_eq!(NICE_WEIGHTS.iter().sum::<u64>(), 445_163, "the table differs from Linux's");
         // The class weights SC-3 used are the base nice values of the classes.

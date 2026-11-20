@@ -2,8 +2,8 @@
 //! recorded per executable path (`recorder`), kept in a small record on /data (`record`), and after the next
 //! boot a Background task (vfs-sys `preload`) reads those pages into the page cache before the program is
 //! started again. No Linux counterpart in the kernel (userland ureadahead/systemd-readahead traced boots the
-//! same way); the reads go through the ordinary fill path (linux-6.6/mm/readahead.c
-//! `force_page_cache_readahead` is the closest), so preloaded pages are ordinary clean page-cache pages.
+//! same way); the reads go through the ordinary fill path (linux-7.3.1/mm/readahead.c:356
+//! `force_page_cache_ra` is the closest), so preloaded pages are ordinary clean page-cache pages.
 //!
 //! The hot paths pay one atomic load while no session records (`ACTIVE`): `note_fill` in `PageCache::fill_with`
 //! and in the read-ahead queueing, `opened` in `Ctx::open`. While a program's window runs (20 s after its

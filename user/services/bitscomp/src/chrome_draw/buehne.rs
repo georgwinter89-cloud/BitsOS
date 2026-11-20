@@ -1,6 +1,6 @@
 //! DS-3: drawing the Bühne's header, headline and right column (Main.dc.html redrawn in Rust; geometry from
 //! `chrome_render::buehne`). Each is one cached image, redrawn only when its look changes; nothing here moves by
-//! itself (theme.effects cheap: no breathing dots, no radar, no beam), so a still desktop draws 0 frames.
+//! itself (the breathing dots, the radar and the beam are the shaders', `fx::plan`).
 
 use crate::canvas::{Box2, Canvas};
 use crate::chrome::Part as C;
@@ -37,6 +37,8 @@ pub struct HeaderLook {
     pub notices: usize,
     /// PK-L1b: the library is open (its button is lit).
     pub library: bool,
+    /// A (12.11.): which workspaces may close (their chip shows the x on hover).
+    pub closable: Vec<bool>,
 }
 
 /// Board px to this image's pixels.
@@ -56,17 +58,16 @@ pub fn header(l: &HeaderLook, t: &Theme) -> Canvas {
     let m = p.r(g.mark);
     let (mx, my) = (m.x as f32 + 13.0 * kk, m.y as f32 + m.h as f32 / 2.0);
     c.ring(mx, my, 10.0 * kk, 2.2 * kk, t.text);
-    // WY-19b: at the gpu level the core breathes (`fx::plan::mark`).
-    if !t.effects_gpu {
-        c.disc(mx, my, 3.6 * kk, t.accent);
-    }
+    // WY-19b: the core breathes (`fx::plan::mark`).
     let brand = t.bfont(Family::Display, 17.0, Weight::SemiBold).spaced(-0.01);
     let bx = m.x + (36.0 * kk) as i32;
     c.text_fit(&brand, Rect { x: bx, w: m.x + m.w - bx, ..m }, "BitsOS", t.text);
     divider(&mut c, m.x + m.w + (24.0 * kk) as i32, h, t);
     for (i, (name, colour)) in l.chips.iter().enumerate().take(g.shown) {
-        let hover = l.hover == Some(Hover::Chrome(C::Ws(i)));
-        chip(&mut c, p.b(g.chips[i]), name, t.kontext[*colour % 3], i == l.active, hover, t);
+        let on_x = l.hover == Some(Hover::Chrome(C::WsClose(i)));
+        let hover = on_x || l.hover == Some(Hover::Chrome(C::Ws(i)));
+        let x = (hover && l.closable.get(i) == Some(&true)).then_some(on_x);
+        chip(&mut c, p.b(g.chips[i]), name, t.kontext[*colour % 3], i == l.active, hover, x, t);
     }
     if let Some(r) = g.more {
         let b = p.b(r);
@@ -129,7 +130,9 @@ fn divider(c: &mut Canvas, x: i32, h: i32, t: &Theme) {
 
 /// A workspace chip: the shown one filled with its context colour and ringed in the accent, the others glass
 /// with a dot of their colour.
-fn chip(c: &mut Canvas, b: Box2, name: &str, colour: Rgba, active: bool, hover: bool, t: &Theme) {
+/// A workspace chip; `x`: its close x in the dot's place (Some(true) while the pointer is on the x itself).
+#[allow(clippy::too_many_arguments)]
+fn chip(c: &mut Canvas, b: Box2, name: &str, colour: Rgba, active: bool, hover: bool, x: Option<bool>, t: &Theme) {
     let kk = k(t);
     let r = b.h / 2.0;
     let (dot, ink, weight) = if active {
@@ -141,11 +144,26 @@ fn chip(c: &mut Canvas, b: Box2, name: &str, colour: Rgba, active: bool, hover: 
         c.rrect_line(b, r, kk, if hover { t.line_strong } else { t.line });
         (colour, if hover { t.text } else { t.muted }, Weight::Medium)
     };
-    c.disc(b.x + 18.0 * kk, b.y + b.h / 2.0, 4.0 * kk, dot);
+    let (dx, dy) = (b.x + 18.0 * kk, b.y + b.h / 2.0);
+    match x {
+        None => c.disc(dx, dy, 4.0 * kk, dot),
+        Some(lit) => {
+            if lit {
+                c.disc(dx, dy, 10.0 * kk, alpha(ink, 0.22));
+            }
+            close_x(c, dx, dy, 4.5 * kk, 1.6 * kk, ink);
+        }
+    }
     let f = t.bfont(Family::Ui, 13.0, weight);
     let x = (b.x + 30.0 * kk) as i32;
     let band = Rect { x, y: b.y as i32, w: (b.x + b.w) as i32 - x - (10.0 * kk) as i32, h: b.h as i32 };
     c.text_fit(&f, band, name, ink);
+}
+
+/// A close x centred on (x, y), arms `r` long.
+pub fn close_x(c: &mut Canvas, x: f32, y: f32, r: f32, w: f32, col: Rgba) {
+    c.line((x - r, y - r), (x + r, y + r), w, col);
+    c.line((x - r, y + r), (x + r, y - r), w, col);
 }
 
 /// The context address (read-only), or the text being edited with Super+L in its place.
@@ -256,27 +274,25 @@ fn bell(c: &mut Canvas, x: f32, y: f32, kk: f32, col: Rgba) {
 pub struct HeadlineLook {
     pub rect: Rect,
     pub theme: u64,
-    pub slug: String,
     pub text: String,
 }
 
-/// The Absicht over the stage: "ABSICHT · KONTEXT/…" with a dot, the typed headline in the display face.
+/// Where the headline's dot sits in its rect (board px): centre x, centre y, radius. `fx::plan::headline_dot` uses it.
+pub const HEADLINE_DOT: (f32, f32, f32) = (6.0, 24.0, 6.0);
+/// Where the headline's text begins after the dot (board px).
+const HEADLINE_TEXT_X: f32 = 26.0;
+
+/// The Absicht over the stage (Georg 15.11.): the dot, then the workspace's typed headline in the display face; the
+/// context address is in the top bar already, so no label line.
 pub fn headline(l: &HeadlineLook, t: &Theme) -> Canvas {
     let kk = k(t);
     let p = Px::new(l.rect, t.scale);
     let (w, h) = p.size();
     let mut c = Canvas::new(w, h);
-    // WY-19b: at the gpu level the dot pulses (`fx::plan::headline_dot`).
-    if !t.effects_gpu {
-        c.disc(4.0 * kk, 8.0 * kk, 4.0 * kk, t.accent);
-    }
-    let lab = t.style(Style::Label);
-    let label = Theme::label(Style::Label, &format!("Absicht · kontext/{}", l.slug));
-    let x = (18.0 * kk) as i32;
-    c.text_fit(&lab, Rect { x, y: 0, w: w - x, h: (16.0 * kk) as i32 }, &label, t.muted);
+    // WY-19b: the dot before the text pulses (`fx::plan::headline_dot`).
     let f = t.style(Style::Absicht);
-    let y = (28.0 * kk) as i32;
-    c.text_fit(&f, Rect { x: 0, y, w, h: (48.0 * kk) as i32 }, &l.text, t.text);
+    let x = (HEADLINE_TEXT_X * kk) as i32;
+    c.text_fit(&f, Rect { x, y: 0, w: w - x, h: (48.0 * kk) as i32 }, &l.text, t.text);
     c
 }
 
@@ -302,7 +318,6 @@ pub fn padded(r: Rect, t: &Theme, keep_left: i32) -> Rect {
 pub fn frame(c: &mut Canvas, b: Box2, t: &Theme, brackets: bool) {
     let kk = k(t);
     let r = t.radius_card as f32 * kk;
-    hud::panel_shadow(c, b, r, &t.shadow_raised, t);
     c.rrect(b, r, hud::glass(t, Glass::Card));
     c.rrect_line(b, r, kk, alpha(t.accent, 0.18));
     if brackets {

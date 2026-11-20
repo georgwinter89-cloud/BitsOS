@@ -232,7 +232,7 @@ fn icons_scale_to_the_tile_premultiplied() {
     assert!(up.px.iter().all(|&p| p == 0xff00_00ff) && up.px.len() == 128 * 128);
 }
 
-/// Every PNG of the build host's hicolor 128x128 against Python's zlib reference (host/tests/wy/png_ref.py).
+/// Every PNG of the build host's hicolor 128x128 against Python's zlib reference (tools/png_ref.py in this crate).
 #[test]
 fn png_corpus_matches_the_python_reference() {
     let dir = scratch("png-corpus");
@@ -241,7 +241,7 @@ fn png_corpus_matches_the_python_reference() {
             let _ = std::fs::copy(e.path(), dir.join(e.file_name()));
         }
     }
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/wy/png_ref.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/png_ref.py");
     let out = std::process::Command::new("python3").arg("-I").arg(&script).arg(&dir).output().expect("python3 runs the reference");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let copied = super::files_with(&dir, "png").len();
@@ -305,7 +305,7 @@ fn fake(root: &Path) -> Roots {
         std::fs::write(r.join(format!("usr/share/icons/hicolor/{s}/apps/foot.png")), &png).unwrap();
     }
     std::os::unix::fs::symlink("2", apps.join("foot/current")).unwrap();
-    Roots { bin, apps, path: String::new() }
+    Roots { bin, apps, path: String::new(), steam: None }
 }
 
 #[test]
@@ -315,14 +315,17 @@ fn sources_duplicates_icons_and_search() {
     let mut s = scan(&roots, &exe);
     let ids: Vec<(&str, String)> = s.index.entries.iter().map(|e| (e.id.as_str(), e.source.word())).collect();
     assert_eq!(ids, [("einstellungen", "builtin".into()), ("terminal", "package:foot".into()), ("jq", "package:jq".into()),
-        ("tryyes", "stick".into()), ("writer", "stick".into())], "A-Z by name: Einstellungen, Fuß-Terminal, Jq, TryYes, Writer; {:?}", s.notes);
+        ("sofa-modus", "builtin".into()), ("system", "builtin".into()), ("tryyes", "stick".into()), ("writer", "stick".into())], "A-Z by name: Einstellungen, Fuß-Terminal, Jq, Sofa-Modus, System, TryYes, Writer; {:?}", s.notes);
     let notes = s.notes.join("\n");
     assert!(notes.contains("terminal from package:foot wins over stick") && notes.contains("wins over builtin"), "{notes}");
     assert!(notes.contains("ghost") && notes.contains("broken.desktop: refused") && notes.contains("NoDisplay"), "{notes}");
     assert!(notes.contains("tryno.desktop: left out: TryExec does-not-exist not found"), "{notes}");
     assert!(notes.contains("pkgtry.desktop: left out: TryExec nothere not in the package"), "{notes}");
     let foot = &s.index.entries[1];
-    assert_eq!(foot.exec, [r_path(&roots, "foot/current/root/usr/bin/foot")]);
+    // Started in its own view (bitsrun), the program's path as the view shows it (Georg 16.11.: Brave from the
+    // repository ended at once when the desktop started its script outside the view).
+    assert_eq!(foot.exec, ["/bin/bitsrun", "--exec", "/usr/bin/foot", "foot"]);
+    assert_eq!(foot.program_name(), "", "foot is a terminal: its name says nothing about the window, as before");
     assert_eq!(foot.address, "programm/terminal");
     assert!(matches!(&foot.icon, Icon::Pending(p) if p.ends_with("256x256/apps/foot.png")), "the smallest size >= 128: {:?}", foot.icon);
     let writer = s.index.by_address("programm/writer").unwrap();
@@ -332,7 +335,8 @@ fn sources_duplicates_icons_and_search() {
     assert_eq!(s.index.by_address("einstellungen").map(|e| e.id.as_str()), Some("einstellungen"));
     assert!(s.index.by_address("einstellungen/aussehen").is_none());
     let jq = s.index.by_address("programm/jq").unwrap();
-    assert_eq!(jq.exec, [r_path(&roots, "jq/current/bin/jq")]);
+    assert_eq!(jq.exec, ["/bin/bitsrun", "jq"]);
+    assert_eq!(jq.program_name(), "jq");
     assert_eq!(jq.icon_state(), "fallback:J (no .desktop file)");
     let mut cache = IconCache::default();
     decode_icons(&mut s.index, &mut cache, &mut s.notes);
@@ -346,7 +350,7 @@ fn sources_duplicates_icons_and_search() {
     assert_eq!(names("SHELL"), ["terminal"]);
     assert_eq!(names("in"), ["einstellungen", "terminal"]);
     assert_eq!(names("writerl"), ["writer"], "the launcher's file name");
-    assert_eq!(names("").len(), 5);
+    assert_eq!(names("").len(), 7);
     assert!(names("zzz").is_empty());
     let lines = Index::lines(&s.index.matches(""));
     assert!(lines.lines().all(|l| l.split('\t').count() == 5), "{lines}");
@@ -371,9 +375,9 @@ fn hidden_masks_lower_sources_and_terminal_programs_run_in_foot() {
     write(&apps.join("p/1/usr/share/applications/vi.desktop"), &desktop("Vi", "vi", "Hidden=true\n"));
     std::os::unix::fs::symlink("1", apps.join("p/current")).unwrap();
     write(&bin.join("einstellungen.desktop"), &desktop("X", "edl", "Hidden=true\n"));
-    let s = scan(&Roots { bin: bin.clone(), apps, path: String::new() }, &exe);
+    let s = scan(&Roots { bin: bin.clone(), apps, path: String::new(), steam: None }, &exe);
     let ids: Vec<&str> = s.index.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, ["ed", "terminal"], "{:?}", s.notes);
+    assert_eq!(ids, ["ed", "sofa-modus", "system", "terminal"], "{:?}", s.notes);
     let notes = s.notes.join("\n");
     assert!(notes.contains("vi from stick left out: Hidden=true in package:p"), "{notes}");
     assert!(notes.contains("einstellungen from builtin left out: Hidden=true in stick"), "{notes}");
@@ -398,10 +402,6 @@ fn icon_names_with_an_extension_and_xpm() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-fn r_path(roots: &Roots, rel: &str) -> String {
-    roots.apps.join(rel).to_string_lossy().into_owned()
-}
-
 /// The watch: a program added to the fake /apps shows up, a removed one goes, without a restart.
 #[test]
 fn programs_added_and_removed_while_watched() {
@@ -418,7 +418,7 @@ fn programs_added_and_removed_while_watched() {
             ev.dispatch(Duration::from_millis(50), data).unwrap();
         }
     };
-    until(&mut data, "the five entries", &|i| i.entries.len() == 5);
+    until(&mut data, "the seven entries", &|i| i.entries.len() == 7);
     script(&roots.apps.join("htop/3/bin/htop"));
     write(&roots.apps.join("htop/3/manifest.toml"), "program = \"bin/htop\"\n");
     std::os::unix::fs::symlink("3", roots.apps.join("htop/current")).unwrap();
@@ -458,4 +458,66 @@ fn program_name_sees_through_wrappers() {
     assert!(!e.owns("java"), "a minimised window of another java program is not this one's");
     e.exec = vec!["env".into(), "A=1".into(), "gimp".into()];
     assert!(e.owns("gimp") && e.owns("tool"));
+}
+
+/// GM-6b: Steam's installed games as the index's fourth source (sofa-mode.md 3.1, 3.3), from a fixture root.
+#[test]
+fn steam_games_are_the_fourth_source() {
+    let d = crate::sofa_model::tests::scratch("steam-source");
+    let roots = crate::sofa_model::tests::roots(&d);
+    let s = scan(&roots, &|p: &Path| p.is_file());
+    let steam: Vec<&Entry> = s.index.entries.iter().filter(|e| matches!(e.source, Source::Steam(_))).collect();
+    let ids: Vec<&str> = steam.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, ["steam-900001", "steam-1044720", "steam-900002", "steam-900003", "steam-32360"], "A-Z among all; no tool, not the one being removed");
+    assert!(s.notes.iter().any(|n| n.contains("steam-900004") && n.contains("not installed")), "{:?}", s.notes);
+    let ff = steam.iter().find(|e| e.id == "steam-1044720").unwrap();
+    assert_eq!((ff.address.as_str(), ff.categories.clone(), ff.wm_class.as_str()), ("programm/steam-1044720", vec!["Game".to_string()], "steam_app_1044720"));
+    assert_eq!(ff.source, Source::Steam(crate::library_steam::Steam { appid: 1044720, proton: true, last_played: (crate::sofa_model::tests::NOW - 7200) as u64, size: 12_500_000_000, loading: false }));
+    assert_eq!(ff.source.word(), "steam:proton");
+    assert_eq!(ff.exec, vec!["/bin/sh".to_string(), roots.bin.join("steam").display().to_string(), "steam://rungameid/1044720".into()]);
+    // Its windows are its X11 class's, never Steam's own.
+    assert!(ff.owns("steam_app_1044720"));
+    assert!(!ff.owns("steam") && !ff.owns("steamwebhelper"));
+    assert!(s.index.entries.iter().find(|e| e.id == "steam").is_some_and(|e| e.owns("steam")));
+    assert!(s.dirs.contains(&roots.steam.as_ref().unwrap().join("steamapps")), "steamapps/ is watched: {:?}", s.dirs);
+    // No Steam: no games, and the nearest folder that is there is watched for it to come.
+    let none = Roots { steam: Some(d.join("kein/Steam")), ..roots.clone() };
+    let s = scan(&none, &|p: &Path| p.is_file());
+    assert!(!s.index.entries.iter().any(|e| matches!(e.source, Source::Steam(_))));
+    assert!(s.dirs.contains(&d), "{:?}", s.dirs);
+    assert!(!s.notes.iter().any(|n| n.starts_with("steam:")), "a missing Steam is no problem: {:?}", s.notes);
+    // Without the stick's launcher the games start `steam` from PATH.
+    std::fs::remove_file(roots.bin.join("steam.desktop")).unwrap();
+    let s = scan(&roots, &|p: &Path| p.is_file());
+    let mi = s.index.entries.iter().find(|e| e.id == "steam-32360").unwrap();
+    assert_eq!(mi.exec, vec!["steam".to_string(), "steam://rungameid/32360".into()]);
+}
+
+#[test]
+fn brave_from_the_repositories_is_the_sticks_one_tile() {
+    // BR-9: the stick's `brave` launcher and brave-bin's brave-browser.desktop are one program: one tile "Brave",
+    // id brave (the sofa's tiles and pinned programm/brave name it), started through bitsrun.
+    let root = scratch("twin");
+    let (bin, apps) = (root.join("bin"), root.join("apps"));
+    script(&bin.join("brave"));
+    write(&bin.join("brave.desktop"), &desktop("Brave", "brave", "StartupWMClass=brave-browser\n"));
+    let roots = Roots { bin: bin.clone(), apps: apps.clone(), path: String::new(), steam: None };
+    let only_stick = scan(&roots, &exe);
+    let e = only_stick.index.by_address("programm/brave").unwrap();
+    assert_eq!((e.source.word(), e.exec[0].as_str()), ("stick".into(), "/bin/sh"), "without the package: the stick's Brave");
+    let r = apps.join("brave-bin/e0_1.98.1-1+1/root");
+    script(&r.join("usr/bin/brave"));
+    script(&r.join("opt/brave-bin/brave"));
+    write(&r.join("usr/share/applications/brave-browser.desktop"), &desktop("Brave", "brave %U", "StartupWMClass=brave-browser\nCategories=Network;WebBrowser;\n"));
+    std::os::unix::fs::symlink("e0_1.98.1-1+1", apps.join("brave-bin/current")).unwrap();
+    let s = scan(&roots, &exe);
+    let braves: Vec<_> = s.index.entries.iter().filter(|e| e.name == "Brave").collect();
+    assert_eq!(braves.len(), 1, "one Brave tile: {:?}", s.index.entries.iter().map(|e| (&e.id, &e.name)).collect::<Vec<_>>());
+    let b = braves[0];
+    assert_eq!((b.id.as_str(), b.address.as_str(), b.source.word()), ("brave", "programm/brave", "package:brave-bin".into()));
+    assert_eq!(b.exec, ["/bin/bitsrun", "--exec", "/usr/bin/brave", "brave-bin"]);
+    assert!(b.owns("brave-browser"), "its windows are this tile's");
+    assert!(s.notes.iter().any(|n| n == "brave from package:brave-bin wins over stick"), "{:?}", s.notes);
+    assert!(s.index.by_address("programm/brave-browser").is_none());
+    std::fs::remove_dir_all(&root).unwrap();
 }

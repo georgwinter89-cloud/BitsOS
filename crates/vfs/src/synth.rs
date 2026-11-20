@@ -31,6 +31,13 @@ pub trait FileSource: Send + Sync {
     fn may_open(&self, _who: Cred, _write: bool) -> Result<(), Errno> {
         Ok(())
     }
+    /// L7-RESTE: what this one open reads, asked once after `may_open` with the opener as the current task
+    /// (Linux's `file->private_data` and `file->f_cred`: the mm `proc_mem_open` binds for pagemap, so a descriptor
+    /// never follows the target into a new image; SELFOPT-1: /proc/kallsyms decides once whether this open shows
+    /// addresses). None: the shared source itself.
+    fn bind(&self, _who: Cred) -> Result<Option<Arc<dyn FileSource>>, Errno> {
+        Ok(None)
+    }
     /// SX-3b: a file with its own `permission` op instead of the mode bits (Linux `proc_sys_permission`: the
     /// user namespace limits show 0644 and answer by the caller's capability). `want` is MAY_* bits; None: the
     /// mode bits decide (`Inode::permission`).
@@ -79,6 +86,17 @@ pub trait DirSource: Send + Sync {
     /// Asked when a program opens the directory (Linux's `permission` op at open, e.g. /proc/<pid>/fdinfo's
     /// ptrace check): EACCES and friends. AB-7a CR4.
     fn may_open(&self) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// The directory's own permission op (Linux `i_op->permission`: `proc_fdinfo_permission`,
+    /// `proc_fd_permission`, `failfs_permission`), asked by every walk through it, chdir and access. `want` is
+    /// MAY_* bits. Some(answer) decides; None: the mode bits decide.
+    fn permission(&self, _who: Cred, _want: u32) -> Option<Result<(), Errno>> {
+        None
+    }
+    /// Asked when a walk ends on the directory by a jump (the caller's root as "/", a proc magic link) without a
+    /// component that `permission` checked: Linux's `d_weak_revalidate` (failfs refuses it, fs/failfs.c).
+    fn jumped_to(&self) -> Result<(), Errno> {
         Ok(())
     }
     /// Links stat adds at getattr time (Linux's `proc_task_getattr`: 2 + threads for /proc/<pid>/task).
@@ -195,6 +213,13 @@ impl SynthDir {
     }
     pub fn sources(&self) -> Vec<Arc<dyn DirSource>> {
         self.sources.lock().clone()
+    }
+    /// The first source with its own permission op answers (the sources of one name are one directory).
+    pub fn permission(&self, who: Cred, want: u32) -> Option<Result<(), Errno>> {
+        self.sources().iter().find_map(|s| s.permission(who, want))
+    }
+    pub fn jumped_to(&self) -> Result<(), Errno> {
+        self.sources().iter().try_for_each(|s| s.jumped_to())
     }
     pub fn extra_nlink(&self) -> u32 {
         self.sources().iter().map(|s| s.extra_nlink()).sum()
@@ -357,7 +382,7 @@ impl File for SynthFile {
             let n = buf.len().min((size - pos) as usize);
             return self.src.read_live(self.who, pos, &mut buf[..n]);
         }
-        // A read at offset 0 makes the text again, as seq_file does (linux-6.6/fs/seq_file.c:180-187, the
+        // A read at offset 0 makes the text again, as seq_file does (linux-7.3.1/fs/seq_file.c:185-192, the
         // `ki_pos == 0` reset): top, free and vmstat keep /proc files open and pread them at 0 (AB-7a CR10).
         let text = if pos == 0 { self.fresh()? } else { self.text()? };
         let p = pos.min(text.len() as u64) as usize;
@@ -404,6 +429,7 @@ impl FileSource for Attr {
 }
 
 /// What a flat view lists: a path relative to where the view is attached (`bus/pci/devices/0000:00:00.0`).
+#[derive(Clone)]
 pub enum FlatKind {
     Dir,
     /// A sysfs attribute with this text (0444).
@@ -414,20 +440,22 @@ pub enum FlatKind {
     File { perm: u32, src: Arc<dyn FileSource> },
 }
 
+#[derive(Clone)]
 pub struct FlatEntry {
     pub path: String,
     pub kind: FlatKind,
 }
 
-/// A `DirSource` over a flat, path-sorted list made fresh on each question (PCI's `pci::sysfs::entries()`): one
-/// instance per directory level, `prefix` = that directory's path in the list ("" at the top).
+/// A `DirSource` over a flat, path-sorted list asked for on each question (PCI's view, DRM's): one instance per
+/// directory level, `prefix` = that directory's path in the list ("" at the top). The list is shared, so an
+/// owner that keeps its view while nothing changed answers a lookup without building it again.
 pub struct FlatView {
-    list: fn() -> Vec<FlatEntry>,
+    list: fn() -> Arc<Vec<FlatEntry>>,
     prefix: String,
 }
 
 impl FlatView {
-    pub fn new(list: fn() -> Vec<FlatEntry>) -> Self {
+    pub fn new(list: fn() -> Arc<Vec<FlatEntry>>) -> Self {
         FlatView { list, prefix: String::new() }
     }
     fn child_name<'a>(&self, path: &'a str) -> Option<&'a str> {
@@ -454,10 +482,9 @@ impl SynthEntry {
 impl DirSource for FlatView {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         let mut out = Vec::new();
-        for e in (self.list)() {
+        for e in (self.list)().iter() {
             if let Some(n) = self.child_name(&e.path) {
-                let n = String::from(n);
-                out.push(self.entry(&n, e.path, e.kind));
+                out.push(self.entry(n, e.path.clone(), e.kind.clone()));
             }
         }
         Ok(out)
@@ -465,6 +492,6 @@ impl DirSource for FlatView {
     fn lookup(&self, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
         let Ok(name) = core::str::from_utf8(name) else { return Ok(None) };
         let want = if self.prefix.is_empty() { String::from(name) } else { alloc::format!("{}/{}", self.prefix, name) };
-        Ok((self.list)().into_iter().find(|e| e.path == want).map(|e| self.entry(name, e.path, e.kind)))
+        Ok((self.list)().iter().find(|e| e.path == want).map(|e| self.entry(name, e.path.clone(), e.kind.clone())))
     }
 }

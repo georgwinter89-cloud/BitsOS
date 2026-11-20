@@ -31,6 +31,11 @@ pub trait FsOps: Send + Sync {
     fn fold(&self, name: &[u8]) -> Vec<u8> {
         name.to_vec()
     }
+    /// Whether `fold` is the identity (names are looked up by their own bytes): a lookup then makes no key.
+    /// An implementation that folds must leave this false.
+    fn exact_names(&self) -> bool {
+        false
+    }
     /// Puts every child of `dir` into the tree (`Dentry::attach_loaded`). Called once per directory.
     fn load_dir(&self, dir: &Arc<Dentry>) -> Result<(), Errno>;
     /// The real name of the child of `dir` that `name` names in another way (FAT: its 8.3 alias), if any.
@@ -79,7 +84,7 @@ pub trait FsOps: Send + Sync {
     /// The end of a freeze (Linux `unfreeze_fs`).
     fn thaw_fs(&self) {}
     /// Whether the file system has a `freeze_fs` of its own (Linux `s_op->freeze_fs != NULL`): FIFREEZE on
-    /// one without answers EOPNOTSUPP (linux-6.6/fs/ioctl.c:395). The default is no.
+    /// one without answers EOPNOTSUPP (linux-7.3.1/fs/ioctl.c:393). The default is no.
     fn can_freeze(&self) -> bool {
         false
     }
@@ -95,5 +100,11 @@ pub trait FsOps: Send + Sync {
     /// them (ext4: the directory's blocks); None keeps the VFS's own (tmpfs-style, 20 bytes a name).
     fn dir_attr(&self, _dir: &crate::inode::Inode) -> Option<(u64, u64)> {
         None
+    }
+    /// EINS-C (K6): the directory below the top that holds the assistant's trash (`.papierkorb`), as names from
+    /// the top; empty: the top itself. The boot stick says `BITSOS2/home` (its top takes no writes, and there the
+    /// trash is the desktop user's like the rest of `home`).
+    fn trash_home(&self) -> &'static [&'static [u8]] {
+        &[]
     }
 }

@@ -8,13 +8,14 @@
 //! Results are `Result<_, Errno>` with Linux's raw errno, so a transcript shows exactly what the kernel said.
 //!
 //! The calls go straight to `syscall` (no musl wrapper in between), so musl's own emulations and fallbacks never
-//! hide a kernel difference (linux-6.6/arch/x86/entry/syscalls/syscall_64.tbl for the numbers).
+//! hide a kernel difference (linux-7.3.1/arch/x86/entry/syscalls/syscall_64.tbl for the numbers).
 
 use std::ffi::CString;
 use std::fmt;
 use std::sync::atomic::AtomicU32;
 
 pub mod dev;
+pub mod perf;
 pub mod power;
 pub mod session;
 
@@ -101,12 +102,16 @@ pub mod nr {
     pub const STATFS: usize = 137;
     pub const FSTATFS: usize = 138;
     pub const SCHED_GETPARAM: usize = 143;
+    pub const SCHED_SETSCHEDULER: usize = 144;
     pub const SCHED_GETSCHEDULER: usize = 145;
     pub const SCHED_GET_PRIORITY_MAX: usize = 146;
     pub const SCHED_GET_PRIORITY_MIN: usize = 147;
     pub const PRCTL: usize = 157;
     pub const ARCH_PRCTL: usize = 158;
     pub const MOUNT: usize = 165;
+    pub const UMOUNT2: usize = 166;
+    pub const PIVOT_ROOT: usize = 155;
+    pub const UNSHARE: usize = 272;
     pub const SETHOSTNAME: usize = 170;
     pub const GETTID: usize = 186;
     pub const TKILL: usize = 200;
@@ -382,7 +387,7 @@ pub fn fdatasync(fd: usize) -> SysResult {
 pub fn ftruncate(fd: usize, len: i64) -> SysResult {
     ints(nr::FTRUNCATE, &[fd, len as usize])
 }
-/// memfd_create(name, flags) (linux-6.6/mm/memfd.c): a new fd.
+/// memfd_create(name, flags) (linux-7.3.1/mm/memfd.c:503): a new fd.
 pub fn memfd_create(name: &str, flags: usize) -> SysResult {
     let p = cpath(name);
     // SAFETY: p is a NUL-terminated string the kernel only reads.
@@ -414,6 +419,16 @@ pub fn epoll_create1(flags: usize) -> SysResult {
 }
 pub fn sched_getscheduler(pid: usize) -> SysResult {
     ints(nr::SCHED_GETSCHEDULER, &[pid])
+}
+pub const SCHED_OTHER: usize = 0;
+pub const SCHED_BATCH: usize = 3;
+/// The Background class on V2 (sched::attr, SC-6); on Linux the idle policy.
+pub const SCHED_IDLE: usize = 5;
+/// sched_setscheduler(pid, policy, &{prio}); pid 0 is the calling thread.
+pub fn sched_setscheduler(pid: usize, policy: usize, prio: i32) -> SysResult {
+    let p = prio;
+    // SAFETY: the kernel reads one struct sched_param (an int) from p.
+    ret(unsafe { raw(nr::SCHED_SETSCHEDULER, [pid, policy, &p as *const i32 as usize, 0, 0, 0]) })
 }
 pub fn sched_get_priority_max(policy: usize) -> SysResult {
     ints(nr::SCHED_GET_PRIORITY_MAX, &[policy])
@@ -716,6 +731,19 @@ pub fn statfs(path: &str) -> SysResult<(u64, u64)> {
     // SAFETY: the kernel reads p and writes one struct statfs (120 bytes) into b.
     ret(unsafe { raw(nr::STATFS, [p.as_ptr() as usize, b.as_mut_ptr() as usize, 0, 0, 0, 0]) })
         .map(|_| (u64_at(&b, 0), u64_at(&b, 8)))
+}
+/// statfs's sizes: (unit, blocks, bfree, bavail), the counts in `unit` bytes. The unit is f_frsize (offset 72)
+/// when the file system sets it, else f_bsize, as glibc's statvfs and df do; the counts are offsets 16, 24, 32.
+pub fn statfs_blocks(path: &str) -> SysResult<(u64, u64, u64, u64)> {
+    let p = cpath(path);
+    let mut b = [0u8; 120];
+    // SAFETY: the kernel reads p and writes one struct statfs (120 bytes) into b.
+    ret(unsafe { raw(nr::STATFS, [p.as_ptr() as usize, b.as_mut_ptr() as usize, 0, 0, 0, 0]) })?;
+    let unit = match u64_at(&b, 72) {
+        0 => u64_at(&b, 8),
+        f => f,
+    };
+    Ok((unit, u64_at(&b, 16), u64_at(&b, 24), u64_at(&b, 32)))
 }
 pub fn fstatfs(fd: usize) -> SysResult<(u64, u64)> {
     let mut b = [0u8; 120];
@@ -1318,6 +1346,26 @@ pub fn mount(source: &str, target: &str, fstype: &str, flags: usize, data: Optio
     ret(unsafe { raw(nr::MOUNT, [s.as_ptr() as usize, t.as_ptr() as usize, f.as_ptr() as usize, flags, dp, 0]) })
 }
 
+pub const CLONE_NEWNS: usize = 0x0002_0000;
+pub const CLONE_NEWUSER: usize = 0x1000_0000;
+pub const MNT_DETACH: usize = 2;
+/// unshare(flags): no pointer.
+pub fn unshare(flags: usize) -> SysResult {
+    ints(nr::UNSHARE, &[flags])
+}
+/// pivot_root(new_root, put_old).
+pub fn pivot_root(new_root: &str, put_old: &str) -> SysResult {
+    let (n, o) = (cpath(new_root), cpath(put_old));
+    // SAFETY: two NUL-terminated strings, read only.
+    ret(unsafe { raw(nr::PIVOT_ROOT, [n.as_ptr() as usize, o.as_ptr() as usize, 0, 0, 0, 0]) })
+}
+/// umount2(target, flags).
+pub fn umount2(target: &str, flags: usize) -> SysResult {
+    let t = cpath(target);
+    // SAFETY: one NUL-terminated string, read only.
+    ret(unsafe { raw(nr::UMOUNT2, [t.as_ptr() as usize, flags, 0, 0, 0, 0]) })
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Sockets
 
@@ -1403,6 +1451,57 @@ pub fn getsockopt_int(fd: usize, level: usize, opt: usize) -> SysResult<i32> {
     // SAFETY: the kernel writes at most 4 bytes into v and the length into len.
     ret(unsafe { raw(nr::GETSOCKOPT, [fd, level, opt, &mut v as *mut i32 as usize, &mut len as *mut u32 as usize, 0]) }).map(|_| v)
 }
+/// A socket option whose value is bytes: the kernel writes into `buf` and says how many it wrote. For an
+/// option that names the length it needs when `buf` is too short (SO_PEERSEC: ERANGE), that length is in
+/// the error's second field.
+pub fn getsockopt_bytes(fd: usize, level: usize, opt: usize, buf: &mut [u8]) -> Result<usize, (Errno, usize)> {
+    let mut len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // SAFETY: the kernel writes at most `len` (never more than buf.len()) bytes into buf, which this call
+    // borrows for writing, and the length into the local `len`.
+    let r = ret(unsafe { raw(nr::GETSOCKOPT, [fd, level, opt, buf.as_mut_ptr() as usize, &mut len as *mut u32 as usize, 0]) });
+    match r {
+        Ok(_) => Ok((len as usize).min(buf.len())),
+        Err(e) => Err((e, len as usize)),
+    }
+}
+
+/// SO_PEERCRED of a connected Unix socket: (pid, uid, gid) of the peer as the kernel recorded them at
+/// connect, in the reader's namespaces (linux/net/unix/af_unix.c `init_peercred`). A later exit, exec or
+/// setuid does not change them. A socket without a peer answers pid 0 and ids -1.
+pub fn peer_cred(fd: usize) -> SysResult<(u32, u32, u32)> {
+    let mut b = [0u8; 12];
+    match getsockopt_bytes(fd, 1, 17, &mut b) {
+        Ok(12) => {
+            let at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+            Ok((at(0), at(4), at(8)))
+        }
+        Ok(_) => Err(Errno(22)),
+        Err((e, _)) => Err(e),
+    }
+}
+
+/// SO_PEERSEC of a connected Unix socket: the label the kernel recorded at connect for the program at the
+/// other end, without its closing NUL. BitsOS names the program there (kernel: `proc::peer`); a Linux
+/// without such a label answers ENOPROTOOPT. The label has no fixed length: a buffer that is too short is
+/// answered with the length it takes, and the call is made again with that.
+pub fn peer_label(fd: usize) -> SysResult<Vec<u8>> {
+    let mut buf = vec![0u8; 256];
+    loop {
+        match getsockopt_bytes(fd, 1, 31, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                if buf.last() == Some(&0) {
+                    buf.pop();
+                }
+                return Ok(buf);
+            }
+            // ERANGE with a longer length: once more with that much room.
+            Err((Errno(34), need)) if need > buf.len() => buf.resize(need, 0),
+            Err((e, _)) => return Err(e),
+        }
+    }
+}
+
 pub fn socketpair(domain: usize, ty: usize) -> SysResult<(usize, usize)> {
     let mut fds = [0i32; 2];
     // SAFETY: the kernel writes two ints into fds.
@@ -1460,9 +1559,47 @@ mod tests {
         assert!(parse_dirents(&b).is_empty());
     }
 
+    /// A socket pair names this process (the real kernel's answer); its label is the kernel's or, on a Linux
+    /// without one, ENOPROTOOPT.
+    #[test]
+    fn peer_of_a_socket_pair() {
+        let (a, b) = socketpair(1, 1).unwrap();
+        let (pid, uid, gid) = peer_cred(a).unwrap();
+        assert_eq!((pid as usize, uid as usize, gid as usize), (getpid().unwrap(), geteuid().unwrap(), getegid().unwrap()));
+        match peer_label(a) {
+            Ok(l) => assert!(!l.contains(&0), "{l:?}"),
+            Err(e) => assert_eq!(e, Errno(92), "{e}"),
+        }
+        let mut short = [0u8; 4];
+        assert!(matches!(getsockopt_bytes(a, 1, 17, &mut short), Ok(4)), "a short buffer gets the first bytes");
+        // An fd that is no socket.
+        assert_eq!(peer_cred(1 << 20), Err(Errno(9)));
+        let _ = (close(a), close(b));
+    }
+
     #[test]
     fn status_texts() {
         assert_eq!(status_text(7 << 8), "exit 7");
         assert_eq!(status_text(11), "signal 11");
+    }
+}
+
+#[cfg(test)]
+mod tests_pk {
+    #[test]
+    fn statfs_blocks_counts_the_root() {
+        let (unit, blocks, bfree, bavail) = super::statfs_blocks("/").expect("statfs /");
+        assert!(unit >= 512 && blocks > 0, "unit {unit} blocks {blocks}");
+        assert!(bfree <= blocks && bavail <= bfree, "blocks {blocks} bfree {bfree} bavail {bavail}");
+        assert_eq!(super::statfs_blocks("/does/not/exist").err(), Some(super::Errno(2)));
+    }
+
+    #[test]
+    fn background_class_for_this_thread() {
+        let t = std::thread::spawn(|| {
+            super::sched_setscheduler(0, super::SCHED_IDLE, 0).expect("SCHED_IDLE");
+            super::sched_getscheduler(0)
+        });
+        assert_eq!(t.join().unwrap(), Ok(super::SCHED_IDLE));
     }
 }

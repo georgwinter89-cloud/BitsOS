@@ -44,6 +44,9 @@ fn log_setup(f: &cpu::Features) {
         klog::event!(Warn, "cpu", "cet.was_on", u_cet_was = Hex(s.u_cet_before), s_cet_was = Hex(s.s_cet_before);
             "firmware left CET enables in IA32_U_CET/IA32_S_CET; zeroed (CET stays off)");
     }
+    if s.spec_ctrl != 0 {
+        klog::event!(Info, "cpu", "spec_ctrl", value = Hex(s.spec_ctrl); "enhanced IBRS on every CPU, with the branch-history control where the CPU has it (Intel; the value Linux 7.3.1 sets)");
+    }
     if s.cr0_before & (cpu::CR0_CD | cpu::CR0_NW) != 0 {
         klog::event!(Warn, "cpu", "cache.was_off", cr0_was = Hex(s.cr0_before); "firmware left CR0.CD/NW set; cleared");
     }

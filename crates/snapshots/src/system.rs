@@ -1,7 +1,6 @@
 //! VS-3, "the whole system as at 15:00" (B1, V2-PLAN §1a planner's choices): the system generation that ran at a
 //! time (RB-9's `system::at_time`: the newest confirmed generation installed by then) and the PIN that brings it
-//! back (RB-9's MCP tool `system_pin`, called as a tool so it takes RB's `Busy` and lock itself; rb-RB-9.md
-//! decision 9). /data's part is `schedule_rollback`; `restore_at` puts the two together for `bitssnap restore-system`, the
+//! back (RB-9's MCP tool `system_pin`, called as a tool so it takes RB's `Busy` and lock itself). /data's part is `schedule_rollback`; `restore_at` puts the two together for `bitssnap restore-system`, the
 //! MCP tool `restore` (kind system) and the console's `restore_at`.
 
 use crate::Target;

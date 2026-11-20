@@ -74,8 +74,13 @@ fn sync_all_flushes_files_then_file_systems_then_stops() {
     assert!(log.iter().all(|l| l.starts_with("flush ")), "sync_durable never stops: {log:?}");
     assert!(log.len() >= 4, "{log:?}");
     let _ = q;
+    let gone: Vec<Weak<dyn Flush>> = [&file, &a, &b, &c].iter().map(|x| Arc::downgrade(x)).collect();
     drop((file, a, b, c));
-    // Dropped objects are pruned, not flushed.
+    // Dropped objects are pruned, not flushed. Another test's flush of every file (fs5, sync(2)) may still hold one
+    // it took before the drop and flush it: only once nobody holds them is a flush of them wrong.
+    while gone.iter().any(|w| w.strong_count() > 0) {
+        std::thread::yield_now();
+    }
     LOG.lock().clear();
     writeback::sync_all();
     assert!(!LOG.lock().iter().any(|l| l.contains("fs8c-")));

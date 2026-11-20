@@ -1,0 +1,9 @@
+# linuxseq nbif: plan/hw/gaming-pc-gpu-2026-11-18/init.txt.zst sha256 62289898e3bbb5cb41a52a202eb686b6c6448b5d38f5c25426876ed29f1e7007, init lines 9-16, by host/gaming-pc/gx-trace-seq.py; regenerate: python3 host/gaming-pc/gx-trace-seq.py plan/hw/gaming-pc-gpu-2026-11-18/init.txt.zst crates/drivers/amdgpu/src/rdna4/linuxseq
+9 R RCC_DEV0_EPF2_STRAP2 0x404d102 0x03132000
+10 W RCC_DEV0_EPF2_STRAP2 0x404d102 0x03132000
+11 W BIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL 0xe4d 0x0007f000
+12 W BIF_BX0_REMAP_HDP_REG_FLUSH_CNTL 0xe4e 0x0007f004
+13 R NCSConfigurationRegister1 0x12400901 0x0a400001
+14 W NCSConfigurationRegister1 0x12400901 0x0a410031
+15 R RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN 0xde0 0x00000000
+16 W RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN 0xde0 0x00000001

@@ -1,7 +1,7 @@
 //! AB-6: the signal calls' work on a thread (the syscall layer checks arguments and copies; this file does
 //! what Linux does under the siglock): masks, sigsuspend, pause, sigtimedwait, signalfd's dequeue, and the
-//! temporary masks of ppoll/pselect/epoll_pwait for FS (linux-6.6/kernel/signal.c :3177, :4553, :3601;
-//! fs/signalfd.c :153; `set_user_sigmask`/`restore_saved_sigmask_unless`).
+//! temporary masks of ppoll/pselect/epoll_pwait for FS (linux-7.3.1/kernel/signal.c :3346, :4906, :3819;
+//! fs/signalfd.c :154; `set_user_sigmask`/`restore_saved_sigmask_unless`).
 
 use crate::group::{Group, kick};
 use crate::signal::{SigInfo, UNBLOCKABLE};

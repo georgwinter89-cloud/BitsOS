@@ -1,5 +1,7 @@
-//! clone, clone3, fork and vfork (linux-6.6/kernel/fork.c: `SYSCALL_DEFINE5(clone)` :3036 in the x86-64
-//! argument order, `copy_clone_args_from_user` :3058, `clone3_args_valid` :3155); the work is `proc::clone`.
+//! clone, clone3, fork and vfork (linux-7.3.1/kernel/fork.c: `SYSCALL_DEFINE5(clone)` :2910 in the x86-64 argument
+//! order, `copy_clone_args_from_user` :2930, `clone3_args_valid` :3024 with Linux 7's CLONE_AUTOREAP, CLONE_NNP,
+//! CLONE_PIDFD_AUTOKILL and CLONE_EMPTY_MNTNS, which `kernel_clone` turns into CLONE_NEWNS as well :2744); the work
+//! is `proc::clone`.
 
 use crate::SysCtx;
 use proc::CloneArgs;
@@ -80,7 +82,7 @@ pub(crate) fn clone3_copy_checks(k: &Clone3, size: u64, tail_zero: bool) -> Resu
 /// `clone3_args_valid` (pure, host-tested): the args as `CloneArgs`, or EINVAL. `set_tid`: the first set_tid
 /// entry when one was given (proc checks it where Linux's `alloc_pid` does).
 pub(crate) fn clone3_args(k: &Clone3, set_tid: Option<i32>) -> Result<CloneArgs, i64> {
-    if k.flags & !(CLONE_LEGACY_FLAGS | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0 {
+    if k.flags & !(CLONE_LEGACY_FLAGS | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP | CLONE_AUTOREAP | CLONE_NNP | CLONE_PIDFD_AUTOKILL | CLONE_EMPTY_MNTNS) != 0 {
         return Err(-EINVAL);
     }
     if k.flags & (CLONE_DETACHED | (CSIGNAL & !CLONE_NEWTIME)) != 0 {
@@ -99,7 +101,7 @@ pub(crate) fn clone3_args(k: &Clone3, set_tid: Option<i32>) -> Result<CloneArgs,
         (s, n) => s.checked_add(n).filter(|&e| e <= hal::USER_TOP).ok_or(-EINVAL)?,
     };
     Ok(CloneArgs {
-        flags: k.flags,
+        flags: if k.flags & CLONE_EMPTY_MNTNS != 0 { k.flags | CLONE_NEWNS } else { k.flags },
         exit_signal: k.exit_signal as u32,
         stack,
         parent_tid: k.parent_tid,
@@ -177,6 +179,12 @@ mod tests {
         assert_eq!(clone3_args(&ok(CLONE_DETACHED), None), Err(-EINVAL));
         assert_eq!(clone3_args(&ok(17), None), Err(-EINVAL), "CSIGNAL bits in flags");
         assert_eq!(clone3_args(&ok(1 << 40), None), Err(-EINVAL), "unknown flag");
+        assert_eq!(clone3_args(&ok(1 << 38), None), Err(-EINVAL), "the first bit after Linux 7.3.1's last");
+        // Linux 7: the four new flags pass clone3's own checks (copy_process judges them).
+        for f in [CLONE_AUTOREAP, CLONE_NNP, CLONE_PIDFD_AUTOKILL | CLONE_PIDFD | CLONE_AUTOREAP] {
+            assert_eq!(clone3_args(&ok(f), None).map(|a| a.flags), Ok(f), "{f:#x}");
+        }
+        assert_eq!(clone3_args(&ok(CLONE_EMPTY_MNTNS), None).map(|a| a.flags), Ok(CLONE_EMPTY_MNTNS | CLONE_NEWNS), "implies CLONE_NEWNS");
         assert_eq!(clone3_args(&ok(CLONE_SIGHAND | CLONE_VM | CLONE_CLEAR_SIGHAND), None), Err(-EINVAL));
         let thread_sig = Clone3 { flags: CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, exit_signal: 17, ..Default::default() };
         assert_eq!(clone3_args(&thread_sig, None), Err(-EINVAL), "threads have no exit signal");

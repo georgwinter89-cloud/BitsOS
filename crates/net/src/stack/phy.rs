@@ -17,7 +17,7 @@ pub(crate) struct TxState {
     pub full: bool,
     pub discovers: u32,
     /// A frame the full ring refused, sent before any other (Linux `dev_requeue_skb`,
-    /// linux-6.6/net/sched/sch_generic.c:139: the qdisc keeps the packet while the driver's queue is stopped).
+    /// linux-7.3.1/net/sched/sch_generic.c:169: the qdisc keeps the packet while the driver's queue is stopped).
     pub held: Vec<u8>,
     pub holding: bool,
     /// Frames held this round (`net.tx_requeued`).

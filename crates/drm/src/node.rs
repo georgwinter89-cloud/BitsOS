@@ -163,6 +163,10 @@ impl File for OpenDrm {
     fn show_fdinfo(&self, out: &mut String) {
         let p = self.dev.driver().pci();
         let _ = write!(out, "drm-driver:\t{}\ndrm-client-id:\t{}\ndrm-pdev:\t{}\n", self.dev.driver().info().name, self.file.client_id(), p.slot_name());
+        // linux-7.3.1/drivers/gpu/drm/drm_file.c:995: the name SET_CLIENT_NAME gave, after the PCI slot.
+        if let Some(n) = self.file.client_name() {
+            let _ = writeln!(out, "drm-client-name:\t{n}");
+        }
         self.dev.driver().fdinfo(&self.file, out);
     }
     /// Linux takes `unsigned int cmd`: the upper half of the register is not part of the number.

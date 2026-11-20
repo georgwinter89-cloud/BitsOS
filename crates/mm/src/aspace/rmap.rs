@@ -1,5 +1,5 @@
 //! MM-rmap (FS-14 change request 1): which address spaces map a file, so a hole punch or a truncate can take
-//! the file's pages out of every mapping (Linux `unmap_mapping_range`, linux-6.6/mm/memory.c:3565, over the
+//! the file's pages out of every mapping (Linux `unmap_mapping_range`, linux-7.3.1/mm/memory.c:4579, over the
 //! file's `i_mmap` tree; here at space granularity: the file's entry lists the spaces, each space's own VMA
 //! tree gives the ranges). Then the page cache can free the pages and give their charge back, and the next
 //! touch faults a fresh zero page inside the file or SIGBUS past its end.
@@ -9,7 +9,7 @@
 //! are the file's `Inode` address: a mapping keeps its inode alive, so a live entry never names another file
 //! (a stale one only costs a look at that space).
 //!
-//! Locking: `mm.rmap` (spin, short, allocates) is taken under `mm.as` and never the other way round: an unmap
+//! Locking: `mm.rmap` (spin, short, never allocates: `add` grows the list with it dropped) is taken under `mm.as` and never the other way round: an unmap
 //! copies the spaces out first and then takes each space's `mm.as` alone, one at a time. vfs calls the
 //! unmapper without any of its own locks (before `vfs.inode.data`), so the order stays `vfs.file.pos` > `mm.as`
 //! > `mm.rmap`, `vfs.inode.data`, `vfs.map.pins` (R5).
@@ -38,6 +38,7 @@ impl Entry {
 static FILES: SpinLock<Vec<Entry>> = SpinLock::named("mm.rmap", Vec::new());
 
 klog::counter!(RMAP_MISSED, "mm.rmap.missed");
+klog::counter!(RMAP_GROWN, "mm.rmap.grown");
 klog::counter!(RMAP_UNMAPS, "mm.rmap.unmaps");
 klog::counter!(RMAP_SPACES, "mm.rmap.spaces_visited");
 
@@ -58,22 +59,35 @@ fn key_of_owner(o: &Owner) -> Option<usize> {
 }
 
 /// Remembers that `space` maps file `key` (once). False: no room (the caller refuses the mapping).
+///
+/// The registry grows with the lock dropped (`ksync::Spare`): it holds every (file, space) pair of the machine,
+/// so its doubling is pages long (16 KiB from a browser's fork on the Mini-PC, 12.11.2026), and under `mm.rmap`
+/// the heap may not reclaim. Every look is made again after the relock.
 pub(crate) fn add(key: usize, space: &Weak<AsCore>) -> bool {
     let want = (key, space.as_ptr() as usize);
-    let mut g = FILES.lock();
-    match g.binary_search_by(|e| e.order().cmp(&want)) {
-        Ok(_) => true,
-        Err(i) => {
-            if g.try_reserve(1).is_err() {
-                drop(g);
+    // Before the guard: the emptied old registry is freed after the unlock.
+    let mut spare = ksync::Spare::new();
+    loop {
+        let mut g = FILES.lock();
+        let Err(i) = g.binary_search_by(|e| e.order().cmp(&want)) else { return true };
+        if !spare.fits(&mut *g, 1) {
+            drop(g);
+            if spare.grow().is_err() {
                 RMAP_MISSED.inc();
                 klog::event!(Warn, "mm", "rmap.no_room"; "no room in the reverse map: the mapping is refused (ENOMEM)");
                 return false;
             }
-            g.insert(i, Entry { key, space: space.clone() });
-            true
+            RMAP_GROWN.inc();
+            continue;
         }
+        g.insert(i, Entry { key, space: space.clone() });
+        return true;
     }
+}
+
+/// How often the registry was grown (ktests: the growth is made with `mm.rmap` dropped).
+pub fn grown() -> u64 {
+    RMAP_GROWN.get()
 }
 
 /// Forgets that the space at `space` maps file `key`.

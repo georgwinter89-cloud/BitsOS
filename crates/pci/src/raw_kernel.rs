@@ -92,7 +92,7 @@ fn node_index(nodes: &[crate::Node], at: Loc) -> Option<usize> {
 
 /// `pci_read`: `count` values of `width` bytes from `off`.
 pub fn config_read(at: Loc, off: u64, width: u8, count: u64) -> Result<CfgRead, RawError> {
-    let nodes = NODES.lock().clone();
+    let nodes = NODES.get();
     let Some(i) = node_index(&nodes, at) else { return Err(refused("pci_read", at, Refusal::NotFound, String::new())) };
     let n = &nodes[i];
     let space = raw::cfg_space(n, access().space_size(at.segment, at.bus));
@@ -121,7 +121,7 @@ pub fn config_read(at: Loc, off: u64, width: u8, count: u64) -> Result<CfgRead, 
 
 /// `pci_write`: one value of `width` bytes at `off`, read back afterwards.
 pub fn config_write(at: Loc, off: u64, width: u8, value: u32) -> Result<CfgWrite, RawError> {
-    let nodes = NODES.lock().clone();
+    let nodes = NODES.get();
     let Some(i) = node_index(&nodes, at) else { return Err(refused("pci_write", at, Refusal::NotFound, String::new())) };
     let c = access();
     let space = raw::cfg_space(&nodes[i], c.space_size(at.segment, at.bus));
@@ -187,7 +187,7 @@ fn decode_state(nodes: &[crate::Node], i: usize) -> raw::DecodeState {
 
 #[allow(clippy::too_many_arguments)]
 fn mmio_span(tool: &str, at: Loc, bar: u8, off: u64, width: u8, count: u64, write: bool) -> Result<MmioSpan, RawError> {
-    let nodes = NODES.lock().clone();
+    let nodes = NODES.get();
     let Some(i) = node_index(&nodes, at) else { return Err(refused(tool, at, Refusal::NotFound, String::new())) };
     let detail = || format!("bar={bar} offset={off:#x} width={width} count={count}");
     let span = raw::mmio_check(&nodes[i], bar, off, width, count, write).map_err(|r| refused(tool, at, r, detail()))?;

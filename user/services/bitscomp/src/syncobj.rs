@@ -188,8 +188,8 @@ pub struct Release(Point);
 
 impl Release {
     /// Release points signal in this order (timeline, then value): a lower point signalled after a higher one on
-    /// one timeline would be an out-of-order point (linux-6.6/drivers/gpu/drm/drm_syncobj.c:327-343), whose waiter
-    /// may never see it.
+    /// one timeline would be an out-of-order point (linux-7.3.1/drivers/gpu/drm/drm_syncobj.c:333-350), whose
+    /// waiter may never see it.
     pub fn order_key(&self) -> (usize, u64) {
         (Arc::as_ptr(&self.0.tl) as usize, self.0.value)
     }

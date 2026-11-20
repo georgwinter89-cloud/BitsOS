@@ -53,7 +53,7 @@ fn records_with_wall_time_per_open() -> TestResult {
     let a = devevents::open_for_test();
     let s = klog::next_seq();
     // The reader starts at the journal start, so an earlier run's marker is read first: each run tags its marker
-    // with its own start sequence number and counts only that one (desk-minipc-w13 FAIL 2).
+    // with its own start sequence number and counts only that one (found on the Mini-PC, 23.10.).
     let run = alloc::format!("run={s}");
     klog::ktests::with_trace("rbjournal", || {
         klog::event!(Info, "rbjournal", "t.marker", n = 7u32, run = s, peer = "10.0.2.2:443"; "two\nlines")
@@ -112,7 +112,7 @@ fn trace_and_metrics_arrive() -> TestResult {
     }, 20)?;
     kassert!(t.is_some() || !rings, "trace mark not read");
     if !rounds {
-        return ktest::fail("no metric rounds (metrics=off or the sampler did not run yet)");
+        return ktest::fail("no metric rounds (the sampler did not run yet)");
     }
     let m = m.ok_or("no metric round read")?;
     kassert!(m.split(' ').nth(4).is_some_and(|kv| kv.contains('=')), "{}", m);

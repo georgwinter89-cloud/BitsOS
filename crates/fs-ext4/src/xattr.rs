@@ -1,7 +1,7 @@
-//! Extended attributes, read (linux-6.6/fs/ext4/xattr.h, xattr.c): in the inode after `i_extra_isize` and in
+//! Extended attributes, read (linux-7.3.1/fs/ext4/xattr.h, xattr.c): in the inode after `i_extra_isize` and in
 //! one shared block (`i_file_acl`, with its reference count). V2's VFS has no xattr calls yet (getxattr and the
 //! rest answer ENOSYS); today only inline data reads `system.data` here. The syscalls (read side: ext4, an empty
-//! list or ENODATA for tmpfs/proc; write side through the Tx) are an open FS item (C1, plan/notes/desk-C1.md),
+//! list or ENODATA for tmpfs/proc; write side through the Tx) are an open FS item,
 //! and the volume frees the blocks right.
 
 use crate::crc::crc32c;
@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use crate::errno::*;
 
 const MAGIC: u32 = 0xEA02_0000;
-/// linux-6.6/fs/ext4/xattr.h:82: the consistency bound on a value size (bigger is corruption).
+/// linux-7.3.1/fs/ext4/xattr.h:84: the consistency bound on a value size (bigger is corruption).
 const SIZE_MAX: usize = 1 << 24;
 
 fn prefix(index: u8) -> &'static [u8] {

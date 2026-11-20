@@ -116,7 +116,7 @@ fn is_elf(p: &Path) -> bool {
 }
 
 /// Test-only programs a V2_LEAN image leaves out (the ABI-diff set is skipped as a whole).
-const LEAN_DROP: &[&str] = &["hello", "hello-rs", "abi-a", "abi-b", "abi-c", "evtest", "fbtest", "mcp-fakesvc", "memstress", "stress"];
+const LEAN_DROP: &[&str] = &["hello", "hello-rs", "abi-a", "abi-b", "abi-c", "evtest", "fbtest", "mcp-fakesvc", "memstress", "stress", "atspid-fake"];
 
 /// The `executable` paths of cargo's `compiler-artifact` messages (`--message-format=json`); cargo writes paths
 /// as JSON strings, so a backslash or quote in a path is escaped and such a path is skipped (none in the tree).
@@ -133,6 +133,22 @@ fn built_executables(json_lines: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// PK-6b CR: the clock floor for bitspkg's key validity (pgp/trust.rs `clock_floor`): the time of the commit the
+/// generation is built from, in Unix seconds. A commit time, not the build time, so a rebuild of the same commit
+/// gives the same programs; it is never later than the build. Empty when git cannot say (bitspkg then keeps its
+/// hand floor).
+pub fn build_epoch(root: &Path) -> String {
+    Command::new("git")
+        .current_dir(root)
+        .args(["log", "-1", "--format=%ct"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or_default()
+}
+
 fn build_user(root: &Path, lean: bool) -> Result<Vec<(String, PathBuf)>, String> {
     let user = root.join("user");
     let mut out: Vec<(String, PathBuf)> = Vec::new();
@@ -143,6 +159,7 @@ fn build_user(root: &Path, lean: bool) -> Result<Vec<(String, PathBuf)>, String>
         c.current_dir(&user)
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("RUSTUP_TOOLCHAIN")
+            .env("BITSOS_BUILD_EPOCH", build_epoch(root))
             .args(["build", "--manifest-path", "Cargo.toml", "--target", "x86_64-unknown-linux-musl", "--release"])
             .args(["--message-format=json-render-diagnostics", "--target-dir"])
             .arg(&tdir)
@@ -200,8 +217,65 @@ fn build_user(root: &Path, lean: bool) -> Result<Vec<(String, PathBuf)>, String>
             out.push(("bwrap".to_string(), bw));
         }
     }
+    bwrap_beside_bitsrun(&out, lean, package::optional())?;
+    // DB5a: the accessibility bus and Durchblick's bridge (and its test program, not in the lean image).
+    out.retain(|(n, _)| !crate::image_atspid::PROGRAMS.contains(&n.as_str()));
+    out.extend(crate::image_atspid::build(root)?.into_iter().filter(|(n, _)| !lean || !LEAN_DROP.contains(&n.as_str())));
+    // CX-5: the context service and its model runner (static musl both); the model file is data, never here.
+    out.retain(|(n, _)| n != "ctxd" && n != "ctxd-llama");
+    out.push(("ctxd".to_string(), build_ctxd(root)?));
+    match sysroot_ready.then(|| build_port(root, "llama-cpp", "ctxd-llama")).flatten() {
+        Some(l) => out.push(("ctxd-llama".to_string(), l)),
+        None => {
+            let what = "no /bin/ctxd-llama (user/ports/llama-cpp needs the musl sysroot and its tarball in the download cache): the context service searches by keywords only";
+            if lean && !package::optional() {
+                return Err(format!("{what}; V2_PKG_OPTIONAL=1 builds the image without it"));
+            }
+            eprintln!("xtask: note: {what}");
+        }
+    }
     out.sort();
     Ok(out)
+}
+
+/// CX-5: ctxd is a cargo workspace of its own (its crates.io set stays out of user/Cargo.lock): built static
+/// musl like the user programs (`--locked --offline`, the stable toolchain of user/), then stripped into
+/// target/xtask/ctxd (8.9 instead of 11.5 MB in the initramfs).
+fn build_ctxd(root: &Path) -> Result<PathBuf, String> {
+    let dir = root.join("user/services/ctxd");
+    let tdir = root.join("target/ctxd");
+    let mut c = Command::new("cargo");
+    c.current_dir(&dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .args(["build", "--release", "--locked", "--offline", "--target", "x86_64-unknown-linux-musl", "--target-dir"])
+        .arg(&tdir);
+    run_status(&mut c, "building ctxd (user/services/ctxd)")?;
+    let built = tdir.join("x86_64-unknown-linux-musl/release/ctxd");
+    let out = xdir(root).join("ctxd");
+    let tmp = xdir(root).join(format!("ctxd.tmp{}", std::process::id()));
+    let st = Command::new("llvm-strip").arg("-o").arg(&tmp).arg(&built).status().map_err(|e| format!("llvm-strip: {e}"))?;
+    if !st.success() {
+        return Err(format!("llvm-strip {} failed ({st})", built.display()));
+    }
+    std::fs::rename(&tmp, &out).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), out.display()))?;
+    Ok(out)
+}
+
+/// PK-B D3: bitsrun starts every repository program through /bin/bwrap, and bwrap comes only with the musl
+/// sysroot. A lean image goes to a real machine, so one without it is an error there (a note under
+/// V2_PKG_OPTIONAL=1); a test image without it only says so.
+fn bwrap_beside_bitsrun(programs: &[(String, PathBuf)], lean: bool, optional: bool) -> Result<(), String> {
+    let has = |name: &str| programs.iter().any(|(n, _)| n == name);
+    if !has("bitsrun") || has("bwrap") {
+        return Ok(());
+    }
+    let what = "the image has /bin/bitsrun but no /bin/bwrap, so installed programs will not start: bwrap needs the musl sysroot (set V2_SYSROOT, or cargo xtask abi-diff builds it once)";
+    if lean && !optional {
+        return Err(format!("{what}; V2_PKG_OPTIONAL=1 builds the image without it"));
+    }
+    eprintln!("xtask: note: {what}");
+    Ok(())
 }
 
 /// UL-3a: BusyBox from user/ports/busybox (build.sh is idempotent and never downloads here: V2_OFFLINE=1; its
@@ -294,6 +368,16 @@ fn initrd_entries(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<cpi
             }
         }
     }
+    // EINS-D: the scripting set's commands (python3, git, ...) start through bits (user/tools/bits/skripte.txt).
+    if programs.iter().any(|(n, _)| n == "bits") {
+        let set = std::fs::read_to_string(root.join("user/tools/bits/skripte.txt")).unwrap_or_default();
+        for c in set.lines().map(|l| l.split('#').next().unwrap_or("")).flat_map(|l| l.split_whitespace().skip(1).map(str::to_string).collect::<Vec<_>>()) {
+            let link = format!("bin/{c}");
+            if !programs.iter().any(|(n, _)| *n == c) && !v.iter().any(|e| e.name == link) {
+                v.push(cpio::symlink(&link, "bits"));
+            }
+        }
+    }
     // UL-5: merged-/usr links, the UL-4a CA bundle (/etc/ssl/certs/ca-certificates.crt, where musl programs and
     // fetch look first), licence texts, /usr/share/bitsos/package.txt.
     v.extend(package::initrd_extra(root, programs)?);
@@ -301,7 +385,27 @@ fn initrd_entries(root: &Path, programs: &[(String, PathBuf)]) -> Result<Vec<cpi
     if extra.is_dir() {
         add_dir(&extra, &extra, &mut v)?;
     }
+    // GP-NET: firmware a driver needs before the stick is readable; nothing unless V2_FW_INITRD=1.
+    v.extend(crate::firmware::initrd(root)?);
+    // UPDATE: the build's version number beside the kernel's mark (both halves of a bundle name the same one). Read
+    // at run time: the kernel's build sees the same variable (crates/bitsver/build.rs), xtask's own build may not.
+    if let Some(n) = version_env()? {
+        v.push(cpio::file(&String::from_utf8_lossy(bitsver::INITRD_ENTRY), 0o644, format!("{n}\n").into_bytes()));
+    }
     Ok(v)
+}
+
+/// `BITSOS_VERSION` as crates/bitsver/build.rs takes it (unset or empty: a development build).
+pub fn version_env() -> Result<Option<u32>, String> {
+    let Ok(v) = std::env::var("BITSOS_VERSION") else { return Ok(None) };
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    match v.parse::<u32>() {
+        Ok(n) if v.bytes().all(|b| b.is_ascii_digit()) && (1..=99_999_999).contains(&n) => Ok(Some(n)),
+        _ => Err(format!("BITSOS_VERSION={v:?}: a version is a whole number from 1 to 99999999")),
+    }
 }
 
 fn add_dir(base: &Path, d: &Path, v: &mut Vec<cpio::Entry>) -> Result<(), String> {
@@ -375,6 +479,9 @@ impl ImageOpts {
     pub fn parse(a: &mut Args) -> Result<ImageOpts, String> {
         let name = a.value("--name")?.unwrap_or_else(|| "test".into());
         let generation = a.num::<u32>("--gen")?.unwrap_or(1);
+        if let Some(sets) = a.value("--firmware")? {
+            crate::firmware::ask(&sets)?;
+        }
         let extra = a.value("--config-extra")?.unwrap_or_default();
         let config_extra = extra.split(';').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
         Ok(ImageOpts { name, generation, config_extra, build: BuildOpts::parse(a) })
@@ -474,6 +581,11 @@ pub fn make_image_from(root: &Path, o: &ImageOpts, art: &Artefacts) -> Result<Pa
         cp(p, to)?;
     }
     tree_lists(&esp, art.stick.iter().map(|(rel, _)| rel.as_str()).filter(|rel| package::is_tree_file(rel) && tree_wanted(rel, env.as_deref())))?;
+    // UPD-4: every stick file (trees too, whether this image carries them or not) for `update-release`.
+    if let Some(list) = std::env::var_os("V2_STICK_LIST") {
+        let text: String = art.stick.iter().map(|(rel, p)| format!("{rel}\t{}\n", p.display())).collect();
+        std::fs::write(&list, text).map_err(|e| format!("V2_STICK_LIST {}: {e}", std::path::Path::new(&list).display()))?;
+    }
     // GX-7a: the GPU firmware the amdgpu modules need, decompressed from the host's linux-firmware-amdgpu, with
     // its licence (crate::firmware; never in git).
     crate::firmware::copy(root, &esp)?;
@@ -545,6 +657,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_lean_image_with_bitsrun_needs_bwrap() {
+        let p = |names: &[&str]| names.iter().map(|n| (n.to_string(), PathBuf::from(n))).collect::<Vec<_>>();
+        assert!(bwrap_beside_bitsrun(&p(&["bitsrun", "bwrap"]), true, false).is_ok());
+        assert!(bwrap_beside_bitsrun(&p(&["init"]), true, false).is_ok(), "no bitsrun, nothing to ask");
+        assert!(bwrap_beside_bitsrun(&p(&["bitsrun"]), true, false).unwrap_err().contains("bwrap"));
+        assert!(bwrap_beside_bitsrun(&p(&["bitsrun"]), true, true).is_ok(), "V2_PKG_OPTIONAL: a note");
+        assert!(bwrap_beside_bitsrun(&p(&["bitsrun"]), false, false).is_ok(), "a test image: a note");
+    }
+
+    #[test]
     fn only_built_executables_go_into_the_image() {
         let j = concat!(
             r#"{"reason":"compiler-artifact","target":{"name":"usys"},"executable":null}"#, "\n",
@@ -586,10 +708,7 @@ mod tests {
 
     #[test]
     fn image_has_the_stick_layout() {
-        if !have_tool("mkfs.fat") || !have_tool("mcopy") || !have_tool("mdir") {
-            eprintln!("mtools/mkfs.fat missing, skipped");
-            return;
-        }
+        crate::util::need_tools("image_has_the_stick_layout", &[("mkfs.fat", "dosfstools"), ("mcopy", "mtools"), ("mdir", "mtools")]);
         let root = std::env::temp_dir().join(format!("xt-image-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -635,6 +754,27 @@ mod tests {
         assert!(tree_wanted(f, Some("1")) && tree_wanted(f, Some("cobalt, Brave")));
         assert!(!tree_wanted(f, Some("cobalt")) && !tree_wanted(f, Some("")));
         assert!(tree_wanted("BITSOS2/libreoffice/program/soffice.bin", Some("libreoffice")));
+    }
+
+    /// EINS-D: with bits in the image every command of the scripting set is a link to it, unless a program of
+    /// that name is there itself.
+    #[test]
+    fn the_scripting_commands_link_to_bits() {
+        let root = std::env::temp_dir().join(format!("xt-bits-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("user/tools/bits")).unwrap();
+        std::fs::write(root.join("user/tools/bits/skripte.txt"), "# set\npython python3 python\njq jq # json\n").unwrap();
+        let mut programs = Vec::new();
+        for n in ["bits", "jq"] {
+            std::fs::write(root.join(n), b"\x7fELF").unwrap();
+            programs.push((n.to_string(), root.join(n)));
+        }
+        let e = initrd_entries(&root, &programs).unwrap();
+        let link = |n: &str| e.iter().find(|x| x.name == n).map(|x| (x.mode & 0o170000 == 0o120000, x.data.clone()));
+        assert_eq!(link("bin/python3"), Some((true, b"bits".to_vec())));
+        assert_eq!(link("bin/python"), Some((true, b"bits".to_vec())));
+        assert_eq!(link("bin/jq").map(|l| l.0), Some(false), "a real jq wins");
+        assert!(link("bin/set").is_none() && link("bin/json").is_none(), "comments are no commands");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// UL-5: the same inputs give the same initramfs bytes, the package list is sorted by path and complete

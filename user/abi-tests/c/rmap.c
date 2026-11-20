@@ -1,6 +1,6 @@
 /* abi-rmap (MM-rmap): a hole punch or a truncate of a tmpfs/memfd file takes its pages out of every mapping and
- * frees them (Linux unmap_mapping_range from shmem_fallocate, linux-6.6/mm/shmem.c:3061, even_cows = 0, and from
- * shmem_setattr :1194/:1201, even_cows = 1). Prints results, errno names, st_blocks (512-byte units: the pages the
+ * frees them (Linux unmap_mapping_range from shmem_fallocate, linux-7.3.1/mm/shmem.c:3667, even_cows = 0, and from
+ * shmem_setattr :1372/:1379, even_cows = 1). Prints results, errno names, st_blocks (512-byte units: the pages the
  * file holds) and the values the mappings read. Modes (argv[1]):
  *   punch     a shared and a private mapping, whole and partial punches, a second process mapping the file
  *   truncate  a truncate below mapped pages (SIGBUS in a child past the end, also for a private copy), growing

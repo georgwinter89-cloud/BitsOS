@@ -100,6 +100,8 @@ pub struct KtestOpts {
     pub net: String,
     /// QEMU arguments after `--` (extra devices for topology tests).
     pub extra: Vec<String>,
+    /// Tests every boot leaves out by name (`xtask test --interim`: the stable ones; see `stable::ktest_exclude`).
+    pub exclude: Vec<String>,
 }
 
 fn label(f: &str, i: usize, n: usize) -> String {
@@ -166,7 +168,7 @@ fn run_boots(root: &Path, o: &KtestOpts, sums: &mut Vec<Summary>) -> Result<(), 
     let mut handles = Vec::new();
     for (i, f) in o.filters.iter().enumerate() {
         let name = label(f, i, n);
-        let io = ImageOpts { name: name.clone(), generation: 1, config_extra: [format!("ktest={f}")].into_iter().chain(o.config.iter().cloned()).collect(), build: b };
+        let io = ImageOpts { name: name.clone(), generation: 1, config_extra: [format!("ktest={}", crate::stable::with_exclude(f, &o.exclude))].into_iter().chain(o.config.iter().cloned()).collect(), build: b };
         image::make_image_from(root, &io, &art)?;
         let mut q = QemuOpts::new(&name);
         q.timeout = o.timeout;
@@ -201,6 +203,7 @@ fn run_boots(root: &Path, o: &KtestOpts, sums: &mut Vec<Summary>) -> Result<(), 
             problems.push(qemu::describe_exit(r.exit, false).1);
         }
         let fl = if filter.is_empty() { "(all)".to_string() } else { filter };
+        let fl = if o.exclude.is_empty() { fl } else { format!("{fl} without {} stable name(s)", o.exclude.len()) };
         match s.done {
             Some((p, f, k)) => println!("ktest {name} filter {fl}: passed={p} failed={f} skipped={k}"),
             None => println!("ktest {name} filter {fl}: ok={} fail={} skip={} (no done line)", s.ok.len(), s.fails.len(), s.skips.len()),
@@ -225,6 +228,7 @@ pub fn cmd_ktest(root: &Path, mut a: Args) -> Result<(), String> {
     let split = a.value("--split")?;
     let net = a.value("--net")?.unwrap_or_else(|| "virtio".into());
     let extra_cfg = a.value("--config-extra")?.unwrap_or_default();
+    let exclude_stable = a.flag("--exclude-stable");
     let config = extra_cfg.split(';').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
     let build = BuildOpts::parse(&mut a);
     let pos = a.positionals()?;
@@ -233,7 +237,8 @@ pub fn cmd_ktest(root: &Path, mut a: Args) -> Result<(), String> {
         None => vec![pos.first().cloned().unwrap_or_default()],
     };
     let extra = a.extra.clone();
-    run_ktests(root, &KtestOpts { filters, timeout, build, net, extra, config })
+    let exclude = if exclude_stable { crate::stable::boot_exclude(root, &crate::stable::load(root)?) } else { Vec::new() };
+    run_ktests(root, &KtestOpts { filters, timeout, build, net, extra, config, exclude })
 }
 
 #[cfg(test)]

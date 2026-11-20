@@ -85,11 +85,11 @@ fn a_batch_run_from_an_assets_folder() {
     assert!(crate::flow::run(r.opts(&r.host(), "--erase sdb-0.3G-0000 --cable-only --remote no")).unwrap_err().contains("refused"));
     let id = devices::make_id("image", 256 << 20);
     let psk = r.s.0.join("psk");
-    crate::flow::run(r.opts(&r.host(), &format!("--erase {id} --remote yes --wifi Lab --wifi-psk-file {} --extra-config desktop=on", psk.display()))).unwrap();
+    crate::flow::run(r.opts(&r.host(), &format!("--erase {id} --remote yes --wifi Lab --wifi-psk-file {} --extra-config data_img_mb=64", psk.display()))).unwrap();
     let mut f = devices::open_image(&r.img, None).unwrap();
     let v = kernel_view(&mut f);
     let cfg = String::from_utf8(kernel_read(&v, &[b"BITSOS2", b"CONFIG.TXT"]).unwrap()).unwrap();
-    assert!(cfg.contains("\nmcp=service\n") && cfg.contains("\nwlan_ssid=Lab\nwlan_psk=a long passphrase\n") && cfg.contains("\ndesktop=on\n"), "{cfg}");
+    assert!(cfg.contains("\nmcp=service\n") && cfg.contains("\nwlan_ssid=Lab\nwlan_psk=a long passphrase\n") && cfg.contains("\ndata_img_mb=64\n"), "{cfg}");
     let stick_id = String::from_utf8(kernel_read(&v, &[b"BITSOS2", b"STICK.ID"]).unwrap()).unwrap();
     let host = r.host().join("sticks").join(&stick_id);
     let token = std::fs::read_to_string(host.join("token.txt")).unwrap();

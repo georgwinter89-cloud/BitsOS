@@ -3,8 +3,9 @@
 //!
 //! Linux tries soft recovery, then a full reset (amdgpu_job.c:34, amdgpu_device.c:5160). BitsOS puts a queue reset
 //! between them, so a hung process need not stop the others, and its full reset is GC's re-init from the PSP, which
-//! kept the picture in every run on the chip. Mode 2 is Linux's method for MP1 13.0.4 (soc21.c:365) but stays
-//! refused until GX-9a has measured what it does to DCN (GX-D9). Mode 1 and BACO are no actions at all. When every
+//! kept the picture in every run on the chip. Mode 2 is Linux's method for MP1 13.0.4 (soc21.c:365) and is the last
+//! rung on the chips where Linux uses it; a reset that changed the display engine closes it and GC's re-init for the
+//! rest of the boot (GX-D9). Mode 1 and BACO are no actions at all. When every
 //! allowed rung failed the device is dead until a reboot; the picture stays, and programs get their errors.
 //!
 //! Every wait has a deadline and the ladder only moves up, so a recovery ends in a bounded number of steps (B4).
@@ -24,15 +25,13 @@ use crate::watch::{
     Cause, HangReport, IbWords, JobMeta, Owner, Pending, Polled, QueueReset, RingCfg, RingId, RingState, RingWatch, Sample,
 };
 
-/// Why mode 2 is refused by default.
-pub const MODE2_UNMEASURED: &str = "mode 2 is refused on SMU 13.0.4 until GX-9a has measured what it does to the display engine (GX-D9)";
 /// Why it is refused for good in this boot.
 pub const MODE2_MOVED_PICTURE: &str = "mode 2 is refused for this boot: a reset changed the display engine's state (GX-D9)";
 /// Why GC's re-init was skipped: a reset moved the picture earlier in this boot.
 pub const REINIT_MOVED_PICTURE: &str = "GC re-init is refused for this boot: a reset changed the display engine's state (GX-D9)";
 /// Why GC's re-init was skipped: too many in the window.
 pub const REINIT_LOOP: &str = "GC re-init is refused: the reset limit of its time window is used up";
-/// Why it can never open on this chip.
+/// Why this chip has no mode-2 rung.
 pub const MODE2_WRONG_CHIP: &str = "this chip's Linux reset method is mode 1 or BACO, which BitsOS never uses";
 
 /// An IP version.
@@ -42,14 +41,6 @@ pub struct IpVersion(pub u8, pub u8, pub u8);
 /// Mode 2 is Linux's method only on these MP1 versions (soc21.c:377-380).
 pub fn linux_uses_mode2(mp1: IpVersion) -> bool {
     matches!(mp1, IpVersion(13, 0, 4) | IpVersion(13, 0, 11))
-}
-
-/// Whether mode 2 may run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode2Gate {
-    Refused(&'static str),
-    /// `proof` names the measurement (GX-9a's run).
-    Measured { proof: &'static str },
 }
 
 /// How many re-inits or mode-2 resets a time window may hold: a program restarting into the same hang must not
@@ -65,7 +56,8 @@ pub struct ReinitLimit {
 pub struct Policy {
     /// false: a hung ring only gets its report and is frozen (`Outcome::RecoveryOff`). Linux's `gpu_recovery`.
     pub recovery: bool,
-    pub mode2: Mode2Gate,
+    /// The ladder has the mode-2 rung: Linux's reset method for this chip is mode 2 ([`linux_uses_mode2`]).
+    pub mode2: bool,
     pub reinit_limit: ReinitLimit,
     /// Linux's 10 ms (amdgpu_ring.c:438).
     pub kill_us: u64,
@@ -78,12 +70,12 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The default for a chip: mode 2 closed. `queue_us` covers MES's API wait of 2.1 s (ipmod/mes11.rs), `reinit_us`
+    /// The default for a chip. `queue_us` covers MES's API wait of 2.1 s (ipmod/mes11.rs), `reinit_us`
     /// a bring-up that took 0.7 s on the chip with room for its SMU and PSP waits.
     pub fn for_mp1(mp1: IpVersion) -> Policy {
         Policy {
             recovery: true,
-            mode2: Mode2Gate::Refused(if linux_uses_mode2(mp1) { MODE2_UNMEASURED } else { MODE2_WRONG_CHIP }),
+            mode2: linux_uses_mode2(mp1),
             reinit_limit: ReinitLimit { count: 3, window_us: 60_000_000 },
             kill_us: 10_000,
             queue_us: 2_500_000,
@@ -92,14 +84,6 @@ impl Policy {
             mode2_us: 5_000_000,
             expire_slack_us: 1_000_000,
         }
-    }
-    /// Opens mode 2 after GX-9a's measurement. Refuses a chip whose Linux method is not mode 2.
-    pub fn open_mode2(&mut self, mp1: IpVersion, proof: &'static str) -> Result<(), &'static str> {
-        if !linux_uses_mode2(mp1) {
-            return Err(MODE2_WRONG_CHIP);
-        }
-        self.mode2 = Mode2Gate::Measured { proof };
-        Ok(())
     }
 }
 
@@ -134,7 +118,7 @@ pub enum Action {
     RestartSdma { ring: RingId },
     /// Linux's IP suspend before mode 2 (see the driver's `MODE2_REFUSED`).
     SuspendGc,
-    /// GfxDeviceDriverReset(2). Only with [`Mode2Gate::Measured`].
+    /// GfxDeviceDriverReset(2). Only on a chip with [`Policy::mode2`].
     Mode2Reset,
     /// Run GC's bring-up again (`again: true`). Answer with `Reply::Reset`.
     ReinitGc,
@@ -518,7 +502,6 @@ impl ResetDomain {
         if !display_equal {
             rec.display_changed = true;
             self.gc_closed = true;
-            self.policy.mode2 = Mode2Gate::Refused(MODE2_MOVED_PICTURE);
         }
     }
 
@@ -578,7 +561,7 @@ impl ResetDomain {
                 self.queue_ring_tests(rec);
             }
             Rung::Mode2 => {
-                if matches!(self.policy.mode2, Mode2Gate::Refused(_)) || self.reinit_refusal(now_us).is_some() {
+                if !self.policy.mode2 || self.reinit_refusal(now_us).is_some() {
                     return;
                 }
                 self.enter_full(rec, now_us);
@@ -675,9 +658,13 @@ impl ResetDomain {
         rec.todo.clear();
         self.counters.in_reset = false;
         self.dead = true;
-        let mode2 = match self.policy.mode2 {
-            Mode2Gate::Refused(why) => Some(why),
-            Mode2Gate::Measured { .. } => None,
+        let mode2 = if !self.policy.mode2 {
+            Some(MODE2_WRONG_CHIP)
+        } else if self.gc_closed {
+            Some(MODE2_MOVED_PICTURE)
+        } else {
+            // Mode 2 ends in GC's re-init, so the re-init's limit closed it too.
+            rec.reinit_refused
         };
         self.finish_common(rec, Outcome::NeedsReboot { mode2 })
     }

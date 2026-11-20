@@ -4,8 +4,8 @@
 //! Before, every emitter took a klog serial lock and wrote its own line with interrupts off: the other CPUs
 //! waited for each line in turn (a real 16550 at 115200 baud needs 87 us a byte, the early screen console draws
 //! every byte, QEMU exits to the host for every port write), and a caller with interrupts already off stayed
-//! deaf for all of it. Now, as Linux's `console_unlock` does (linux-6.6/kernel/printk/printk.c:3012,
-//! `console_flush_all` at :2945, one record per `console_emit_next_record` at :2864): the emitter stores its
+//! deaf for all of it. Now, as Linux's `console_unlock` does (linux-7.3.1/kernel/printk/printk.c:3414,
+//! `console_flush_all` at :3341, one record per `console_emit_next_record` at :3126): the emitter stores its
 //! record and then tries the printer flag once. The winner prints every record from `PRINTED` up to the
 //! newest, its own line straight from its stack and the
 //! others copied out of the ring one at a time (one short ring hold each, the text only; the prefix is

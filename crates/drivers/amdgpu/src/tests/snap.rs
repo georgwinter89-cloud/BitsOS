@@ -16,7 +16,7 @@ const G1: &str = include_str!("../../../../dcn314-regs/tests/data/p1-decoded.txt
 #[test]
 fn register_list() {
     let r = snapshot::registers();
-    assert_eq!(r.len(), 326, "the snapshot list (notes: gx-GX-2.md)");
+    assert_eq!(r.len(), 326, "the snapshot list (plan/spec/gpu.md §11.3)");
     assert!(r.windows(2).all(|w| w[0].byte < w[1].byte), "sorted, each once");
     for &(b, _) in dcn314_regs::P1_SNAPSHOT {
         assert!(r.iter().any(|e| e.byte == b), "G-1 register {b:#x} missing");

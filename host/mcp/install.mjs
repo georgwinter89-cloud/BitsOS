@@ -3,7 +3,7 @@
 // KERNEL and INITRD on a small HTTP server bound to this machine's LAN address, calls `install_kernel` with
 // that URL, prints the answer and checks that the hashes BitsOS names are those of the local files.
 //
-//   node install.mjs <BitsOS host[:port]> (--bundle <dir> | --kernel <file> --initrd <file>) --bind <LAN address>
+//   node install.mjs <BitsOS host[:port]> (--bundle <dir> | --kernel <file> --initrd <file>) (--bind <LAN address> | --upload)
 //        [--me <address>] [--port <8770-8799>] [--dry-run] [--config <file>] [--unpin] [--allow-no-fallback]
 //        [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file <path>] [--tls <key store>|auto]
 //
@@ -13,8 +13,8 @@
 // --port: the server's port, in 8770-8799 (default: the first free one there). The server answers only GET (and
 // HEAD) of <random dir>/KERNEL and <random dir>/INITRD, only while this runs.
 // --dry-run: BitsOS fetches and checks everything and plans the generation, and writes nothing.
-// --config: a whole new \BITSOS2\CONFIG.TXT (BitsOS refuses one that adds or changes nvme_write,
-// stick_write or usb_msd_write, or drops the token). --unpin, --allow-no-fallback: as install_kernel takes them.
+// --config: a whole new \BITSOS2\CONFIG.TXT (BitsOS refuses one that adds or changes a guarded key,
+// README section 5, or drops the token). --unpin, --allow-no-fallback: as install_kernel takes them.
 // --upload: no HTTP server; the files go up with write_file into /tmp/install-<pid>/ (hash checked) and
 // install_kernel reads them there (kernel_path/initrd_path; needs a kernel whose install_kernel has them), the
 // uploads are deleted afterwards. Slower (about 1,000 requests for a 120 MB kernel), for when no port is open.
@@ -32,6 +32,7 @@ import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connect, fnv1a64, McpError, readToken, upload } from './mcp-call.mjs';
+import { tokenFileFor } from './token.mjs';
 
 // The install server's ports (the desk's range, open in the Gaming-PC's firewall). BITSOS_INSTALL_PORTS=<lo>-<hi>
 // moves it, for the lane's own tests only (host/tests convention: scenarios use their lane's port range).
@@ -48,7 +49,7 @@ function fail(why, code = 1) {
 }
 
 const VALUE = ['--bundle', '--kernel', '--initrd', '--bind', '--me', '--port', '--config', '--timeout-ms', '--back-s', '--confirm-s', '--token-file', '--tls'];
-const SWITCH = ['--dry-run', '--unpin', '--allow-no-fallback', '--upload', '--reboot'];
+const SWITCH = ['--dry-run', '--unpin', '--allow-no-fallback', '--upload', '--reboot', '--gaming-pc'];
 const opts = {}, rest = [];
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -60,7 +61,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a.startsWith('--')) fail(`unknown option ${a}`, 2);
   else rest.push(a);
 }
-const USAGE = 'usage: node install.mjs <host[:port]> (--bundle DIR | --kernel F --initrd F) --bind A [--me A] [--port 8770-8799] [--dry-run] [--config F] [--unpin] [--allow-no-fallback] [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file F] [--tls DIR|auto]';
+const USAGE = 'usage: node install.mjs <host[:port]> (--bundle DIR | --kernel F --initrd F) (--bind A | --upload) [--me A] [--port 8770-8799] [--dry-run] [--config F] [--unpin] [--allow-no-fallback] [--timeout-ms N] [--upload] [--reboot [--back-s S] [--confirm-s S]] [--token-file F] [--gaming-pc] [--tls DIR|auto]';
 const [host] = rest;
 if (!host || rest.length > 1) fail(USAGE, 2);
 if (opts.bundle && (opts.kernel || opts.initrd)) fail('--bundle or --kernel/--initrd, not both', 2);
@@ -75,12 +76,13 @@ function privateIpv4(a) {
   const [x, y] = [Number(m[1]), Number(m[2])];
   return x === 10 || x === 127 || (x === 172 && y >= 16 && y <= 31) || (x === 192 && y === 168) || (x === 169 && y === 254);
 }
+// GP-R3: --upload serves nothing, so it needs no --bind (the remote desk on Windows has no open port).
 const bind = opts.bind;
-if (!bind) fail(`--bind <this machine's LAN address> is missing (the server listens only there)\n${USAGE}`, 2);
+if (!bind && !opts.upload) fail(`--bind <this machine's LAN address> is missing (the server listens only there; --upload needs none)\n${USAGE}`, 2);
 if (bind === '0.0.0.0') fail('--bind 0.0.0.0 would serve the kernel on every network of this machine; give its LAN address', 2);
-if (!privateIpv4(bind)) fail(`--bind ${bind}: an IPv4 address of this machine on a private network (BitsOS fetches only from those)`, 2);
-const me = opts.me ?? (bind.startsWith('127.') ? '10.0.2.2' : bind);
-if (!privateIpv4(me)) fail(`--me ${me}: BitsOS fetches only from private IPv4 addresses`, 2);
+if (bind && !privateIpv4(bind)) fail(`--bind ${bind}: an IPv4 address of this machine on a private network (BitsOS fetches only from those)`, 2);
+const me = opts.me ?? (bind?.startsWith('127.') ? '10.0.2.2' : bind);
+if (!opts.upload && !privateIpv4(me)) fail(`--me ${me}: BitsOS fetches only from private IPv4 addresses`, 2);
 let port = null;
 if (opts.port !== undefined) {
   port = Number(opts.port);
@@ -107,7 +109,7 @@ const fnv = { KERNEL: fnv1a64(kernel), INITRD: fnv1a64(initrd) };
 console.log(`bundle: KERNEL ${kernel.length} bytes (fnv ${fnv.KERNEL}) from ${kernelFile}; INITRD ${initrd.length} bytes (fnv ${fnv.INITRD}) from ${initrdFile}`);
 
 let token;
-try { token = readToken(opts['token-file']); } catch (e) { fail(e.message, 2); }
+try { token = readToken(tokenFileFor(opts['token-file'], opts['gaming-pc'])); } catch (e) { fail(e.message, 2); }
 
 // ---- the HTTP server (not with --upload) ----
 const dir = `/install-${randomBytes(6).toString('hex')}/`;

@@ -2,7 +2,7 @@
 //!
 //! AB-2 built the process model and the static ELF loader; AB-4 adds threads, fork, vfork, clone/clone3,
 //! execve/execveat, exit_group with every thread, wait4/waitid and process groups and sessions, with Linux
-//! 6.6's rules (linux-6.6/kernel/fork.c, fs/exec.c, kernel/exit.c, kernel/sys.c).
+//! 7.3.1's rules (linux-7.3.1/kernel/fork.c, fs/exec.c, kernel/exit.c, kernel/sys.c).
 //!
 //! The model, in Linux's words:
 //! - `Group` (`group.rs`) is the thread group: pid (tgid), parent, process group, session, exit status,
@@ -51,6 +51,7 @@ mod ktests_ab14;
 pub mod load;
 pub mod locks;
 mod mcp_run;
+pub mod peer;
 pub mod pidfd;
 pub mod prctl_state;
 pub mod rlimit;
@@ -60,13 +61,20 @@ pub mod stack;
 pub mod status;
 pub mod stdio;
 mod task;
+mod tree;
+#[cfg(not(bitsos_no_ktests))]
+mod tree_ktest;
 pub mod wait;
 pub mod ns;
+mod oom;
+#[cfg(not(bitsos_no_ktests))]
+mod oom_ktest;
+pub mod perf_hook;
 pub mod ipc;
 
 pub use mcp_run::MCP_PROGRAM;
 pub use clone::{CloneArgs, clone, forks_total};
-pub use exec::{ArgList, ExecRequest, ExecTarget, execve};
+pub use exec::{ArgList, ExecRequest, ExecTarget, OpenedProgram, exec_flags_valid, exec_open, execve};
 pub use exit::{MmPin, Reaped, WaitEvent, WaitOpts, pin_mm, wait_child, wait_for};
 pub use group::Group;
 pub use image::min_sigstack_size;
@@ -91,7 +99,7 @@ pub const STACK_TOP: u64 = hal::USER_TOP;
 /// Linux's default `pid_max` on 64-bit; pids wrap to 300 like Linux (`RESERVED_PIDS`). A namespace size, not a
 /// count of things (R1): the table itself grows as needed.
 pub(crate) const PID_MAX: u32 = 4_194_304;
-const PID_WRAP: u32 = 300;
+pub(crate) const PID_WRAP: u32 = 300;
 /// The first pid handed out (pids below stay free for init and early services).
 const PID_FIRST: u32 = 100;
 
@@ -120,6 +128,11 @@ pub struct Process {
     pub ns: Arc<MountNs>,
     /// AB-5: the address space's prctl flags (PR_SET_DUMPABLE, PR_SET_THP_DISABLE; Linux `mm->flags`).
     pub mm_flags: prctl_state::MmFlags,
+    /// L7-PROC: the user namespace of the image's execve, kept by fork (linux-7.3.1/include/linux/sched/
+    /// exec_state.h `task_exec_state.user_ns`, fs/exec.c:269 and kernel/exec_state.c:71). A later
+    /// unshare(CLONE_NEWUSER) does not move it: the dumpable check and the owner of a non-dumpable image's /proc
+    /// files ask it, not the credentials' namespace.
+    pub exec_user_ns: Arc<ns::user::UserNs>,
     /// AB-5: the auxiliary vector the image started with (Linux `mm->saved_auxv`; PR_GET_AUXV). fork copies it.
     pub saved_auxv: SpinLock<Vec<u64>>,
     /// AB-7a: the image's layout and executable for /proc (Linux `mm->{start_code.., exe_file}`). fork copies it.
@@ -156,7 +169,7 @@ impl Process {
         drop(old);
     }
     pub fn subject(&self) -> Subject {
-        Subject { program: self.program, pid: self.pid, uid: self.group().call_ids().euid }
+        Subject { program: self.program, pid: self.pid, uid: self.group().call_ids().euid, tree: self.group().tree_id() }
     }
     /// The thread group behind this image.
     pub fn group(&self) -> &Arc<Group> {
@@ -204,6 +217,8 @@ pub fn init() {
     hal::entry::set_user_irq_hook(Some(user_irq));
     // AB-6 fixer: the service that fires interval and POSIX timers.
     itimer::start();
+    // MEMCRASH: the OOM killer for allocations that must not fail (`mm_core::oom`).
+    oom::start();
 }
 
 fn user_irq() -> bool {
@@ -218,7 +233,7 @@ fn resolve_copy_fault(addr: u64, write: bool) -> bool {
     // and sets dirty marks, and refuses pages that really are read-only (EFAULT).
     // MM-tlb2 CR 5 (INT-W7): an access the page table allows faulted on a stale, narrower TLB entry this CPU
     // still held (MM's grants skip the shootdown round): a spurious fault. Drop the entry and retry, as Linux
-    // does (linux-6.6/mm/memory.c:4995-5017, flush_tlb_fix_spurious_fault). It cannot loop: the fast copy
+    // does (linux-7.3.1/mm/memory.c:6477-6497, flush_tlb_fix_spurious_fault). It cannot loop: the fast copy
     // returns EFAULT when the same address faults twice in a row (hal::usercopy).
     if let Some((_, fl)) = hal::paging::translate(p.mm.root(), addr & !0xFFF)
         && fl.contains(hal::paging::PageFlags::USER)
@@ -244,24 +259,15 @@ pub fn last_pid() -> u32 {
     NEXT_PID.load(Ordering::Acquire).saturating_sub(1)
 }
 
-/// `/proc/sys/kernel/pid_max`: ids stay below it; root may move it within Linux's bounds.
-static PID_LIMIT: AtomicU32 = AtomicU32::new(PID_MAX);
-
-/// The largest id plus one (`/proc/sys/kernel/pid_max`).
+/// The initial pid namespace's `pid_max`: global ids stay below it.
 pub fn pid_max() -> u32 {
-    PID_LIMIT.load(Ordering::Relaxed)
+    ns::pid::init_pid_ns().pid_max()
 }
 
-/// Sets `pid_max` as `proc_dointvec_minmax` with `pid_max_min`/`pid_max_max` (linux-6.6/kernel/pid.c :61,
-/// kernel/sysctl.c): EINVAL outside RESERVED_PIDS + 1 ..= PID_MAX_LIMIT. Live processes keep their ids; the
-/// next id wraps when the cursor is at or above the new limit (`alloc_pid`).
+/// Sets the initial pid namespace's `pid_max` (`ns::pid::PidNs::set_pid_max`; each pid namespace has its own since
+/// linux-7.3.1/kernel/pid.c:782).
 pub fn set_pid_max(v: u64) -> Result<(), Errno> {
-    if !(PID_WRAP as u64 + 1..=PID_MAX as u64).contains(&v) {
-        return Err(uapi::errno::EINVAL);
-    }
-    PID_LIMIT.store(v as u32, Ordering::Relaxed);
-    klog::event!(Info, "proc", "pid_max.set", value = v);
-    Ok(())
+    ns::pid::init_pid_ns().set_pid_max(v)
 }
 
 /// The process with pid `pid` (its current image).
@@ -580,14 +586,18 @@ fn spawn_inner(path: &str, src: image::Source<'_>, o: &SpawnOptions<'_>, exe: Op
             let sigs = signal::SignalState::default();
             sigs.raw(|s| s.unkillable = pid == 1);
             let g = Group::new(ids, uapi::ab::signal::SIGCHLD, o.class, sigs, rlimit::Limits::new_system(ram_pages), time::now_ns());
-            make_image(pid, base_name(path), String::from(path), args, o.program, &cred, mm, fds, Arc::new(vfs::FsState::new()), ns, g, hal::entry::segs::LdtSlot::new())
+            make_image(pid, base_name(path), String::from(path), args, o.program, &cred, mm, fds, Arc::new(vfs::FsState::new()), ns, g, hal::entry::segs::LdtSlot::new(), cred.user_ns.clone())
         },
         o.pid1.then_some(1),
         ns::pid::init_pid_ns(),
     )?;
     p.group.set_image(&p);
     *p.saved_auxv.lock() = l.auxv;
+    // MC-L CR 1 (INT-CL3T): as execve does; the image is not released yet.
+    mcp_run::local::close_door_program(&p, exe.as_ref());
     *p.image_info.lock() = procinfo::ImageInfo { exe, deny, ..l.info };
+    // DB2: before the program runs, so its first records already name it.
+    if let Some(x) = &preload.0 { vfs::access::exec(p.pid, p.uid, x, false) }
     if !o.held {
         p.release();
     }
@@ -597,6 +607,7 @@ fn spawn_inner(path: &str, src: image::Source<'_>, o: &SpawnOptions<'_>, exe: Op
     klog::event!(Info, "proc", "spawn", pid = p.pid, ppid = p.ppid(), path = path, entry = klog::Hex(l.entry), pie = elf.is_pie, bias = klog::Hex(l.bias), interp_base = klog::Hex(l.interp_base), program = o.program.0);
     let t = Thread::new(p.pid, &p.group);
     t.prctl().set_comm(prctl_state::comm_of(p.name.as_bytes()));
+    perf_hook::image(&p, p.pid);
     if let Err(e) = task::start(&p, t, UserContext::new(l.entry, l.rsp), None, None, 0, 0, None) {
         klog::event!(Warn, "proc", "spawn.no_thread", pid = p.pid, path = path);
         drop(remove(p.pid));
@@ -626,8 +637,9 @@ pub(crate) fn make_image(
     ns: Arc<MountNs>,
     group: Arc<Group>,
     ldt: Arc<hal::entry::segs::LdtSlot>,
+    exec_user_ns: Arc<ns::user::UserNs>,
 ) -> Arc<Process> {
-    Arc::new(Process { pid, name, path, argv, program, uid: cred.euid, gid: cred.egid, mm, fds, ns, mm_flags: prctl_state::MmFlags::new(), saved_auxv: SpinLock::named("proc.auxv", Vec::new()), image_info: SpinLock::named("proc.image", procinfo::ImageInfo::default()), fs: SpinLock::named("proc.fs", fs), group, ldt })
+    Arc::new(Process { pid, name, path, argv, program, uid: cred.euid, gid: cred.egid, mm, fds, ns, mm_flags: prctl_state::MmFlags::new(), exec_user_ns, saved_auxv: SpinLock::named("proc.auxv", Vec::new()), image_info: SpinLock::named("proc.image", procinfo::ImageInfo::default()), fs: SpinLock::named("proc.fs", fs), group, ldt })
 }
 
 /// Random bytes for AT_RANDOM and getrandom: FS-2's ChaCha20 generator (seeded from RDSEED/RDRAND, never

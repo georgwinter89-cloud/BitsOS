@@ -9,6 +9,8 @@ use crate::store::{Store, manifests_in};
 pub struct Removed {
     pub versions: Vec<String>,
     pub data_removed: bool,
+    /// PK-6e: `.pkgs` entries no version uses any more (plan 1.9 "Removal").
+    pub pkgs_gone: usize,
     pub freed: u64,
 }
 
@@ -32,8 +34,9 @@ pub fn remove(st: &Store, name: &str, keep_data: bool) -> Result<Removed, String
         return Err(format!("{name} is removed, but {e}; the next bitspkg command takes the rest back (its trash entry stays until then)"));
     }
     fsx::remove_tree(&t)?;
+    let pkgs_gone = pkgs_after_commit(st);
     let freed = st.gc_content_after_commit();
-    Ok(Removed { versions, data_removed, freed })
+    Ok(Removed { versions, data_removed, pkgs_gone, freed })
 }
 
 /// Removes one version; the current one is refused (switch or roll back first).
@@ -62,14 +65,23 @@ pub fn remove_version(st: &Store, name: &str, v: &str) -> Result<u64, String> {
 pub struct Collected {
     pub versions: Vec<(String, String)>,
     pub empty_packages: Vec<String>,
+    pub pkgs_gone: usize,
     pub freed: u64,
+}
+
+/// `.pkgs` entries no version uses, after a command's commit point (a failure is an event; gc_content repeats it).
+fn pkgs_after_commit(st: &Store) -> usize {
+    st.gc_pkgs().unwrap_or_else(|e| {
+        eprintln!("bitspkg: event=gc.failed reason=\"{e}\" (the command itself is complete; run bitspkg gc)");
+        0
+    })
 }
 
 /// Versions that are neither current nor previous, packages a cut left without any version (and their data
 /// folder only when it is still empty), store files nobody uses, and everything `recover` finds.
 pub fn gc(st: &Store) -> Result<Collected, String> {
     let _lock = st.lock()?;
-    let mut c = Collected { versions: Vec::new(), empty_packages: Vec::new(), freed: 0 };
+    let mut c = Collected { versions: Vec::new(), empty_packages: Vec::new(), pkgs_gone: 0, freed: 0 };
     for name in st.packages()? {
         for v in gc_versions(st, &name)? {
             c.versions.push((name.clone(), v));
@@ -85,6 +97,7 @@ pub fn gc(st: &Store) -> Result<Collected, String> {
             c.empty_packages.push(name);
         }
     }
+    c.pkgs_gone = st.gc_pkgs()?;
     c.freed = st.gc_content()?;
     Ok(c)
 }

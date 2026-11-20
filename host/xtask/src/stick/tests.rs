@@ -311,6 +311,30 @@ fn dry_run_is_the_default() {
 }
 
 #[test]
+fn a_numbered_bundle_goes_under_its_own_number() {
+    let e = env("numbered");
+    e.v2();
+    let numbered = |name: &str, n: u32| {
+        let d = e.dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut tag = format!("BITSOS-VERSION={n:08};").into_bytes();
+        tag.extend_from_slice(b"\xb7\n");
+        std::fs::write(d.join("KERNEL"), fake_kernel(&tag)).unwrap();
+        std::fs::write(d.join("INITRD"), fake_initrd(name.as_bytes())).unwrap();
+        std::fs::write(d.join("BOOTX64.EFI"), fake_bitsboot(b"boot1")).unwrap();
+        d.display().to_string()
+    };
+    let b1 = e.bundle("dev", "k1", "boot1");
+    e.run(&["--bundle", &b1, "--write"], "J").unwrap();
+    assert_eq!(e.gens(), vec![1], "a development build keeps the old rule");
+    let v = numbered("v167", 167);
+    e.run(&["--bundle", &v, "--write"], "J").unwrap();
+    assert_eq!(e.gens(), vec![167], "version 167 takes slot 167 (the unconfirmed 1 is replaced)");
+    let s = e.snap();
+    refused(&e, e.run(&["--bundle", &numbered("v160", 160), "--write"], "J"), &s, "never reused or lowered");
+}
+
+#[test]
 fn generations_bundle_confirm_replace_prune() {
     let e = env("gens");
     e.v2();
@@ -733,4 +757,80 @@ fn retire_reports_how_it_compared() {
     e.run(&["--retire-v1", "--backup", &bk.display().to_string(), "--write"], "J").unwrap();
     let r = std::fs::read_to_string(bk.join("RESULT.txt")).unwrap();
     assert!(r.contains("O_DIRECT"), "{r}");
+}
+
+/// GP-R2: `--firmware gaming-pc` puts exactly the set's files into \\BITSOS2\\firmware\\ (a dry run first): a file the
+/// stick holds byte for byte stays, a different one is replaced under the stick's own name, the rest of the folder
+/// (the Mini-PC's firmware, the cable card's) is untouched; a set the host lacks a file of plans nothing.
+#[test]
+fn the_firmware_set_goes_where_the_drivers_look_and_nothing_else_changes() {
+    let e = env("fw");
+    e.v2();
+    let list = "crates/drivers/amdgpu/firmware-gaming-pc.list";
+    std::fs::create_dir_all(e.dir.join(list).parent().unwrap()).unwrap();
+    std::fs::write(e.dir.join(list), "# test\namdgpu/a.bin\namdgpu/b.bin\namdgpu/c.bin\n").unwrap();
+    let host = e.dir.join("host-fw");
+    std::fs::create_dir_all(host.join("amdgpu")).unwrap();
+    std::fs::create_dir_all(e.dir.join("lic/linux-firmware-amdgpu")).unwrap();
+    std::fs::write(e.dir.join("lic/linux-firmware-amdgpu/LICENSE.amdgpu"), b"licence").unwrap();
+    for (n, b) in [("a", b"AAAA"), ("b", b"BBBB"), ("c", b"CCCC")] {
+        std::fs::write(host.join(format!("amdgpu/{n}.bin")), b).unwrap();
+        assert!(std::process::Command::new("zstd").arg("-qf").arg("--rm").arg(host.join(format!("amdgpu/{n}.bin"))).status().unwrap().success());
+    }
+    e.put("BITSOS2/firmware/amdgpu/a.bin", b"AAAA");
+    e.put("BITSOS2/firmware/AMDGPU/B.BIN", b"old!");
+    e.put("BITSOS2/firmware/amdgpu/gc_11_0_1_me.bin", b"the Mini-PC's");
+    e.put("BITSOS2/firmware/rtl_nic/rtl8126a-3.fw", b"the cable card's");
+    let run = |args: &[&str], answer: &str| {
+        let mut v: Vec<String> = vec!["--target".into(), e.stick.display().to_string(), "--id".into(), ID.into()];
+        v.extend(args.iter().map(|s| s.to_string()));
+        let mut o = Opts::parse(&e.dir, &mut Args::new(v))?;
+        o.lock_dir = e.dir.clone();
+        o.fw_from = (host.clone(), e.dir.join("lic"));
+        run(&e.fake, &o, &mut |_| answer.to_string())
+    };
+    let s0 = e.snap();
+    run(&["--firmware", "gaming-pc"], "J").unwrap();
+    assert_eq!(e.snap(), s0, "a dry run first");
+    run(&["--firmware", "gaming-pc", "--write"], "n").unwrap_err();
+    assert_eq!(e.snap(), s0, "no J, nothing");
+    run(&["--firmware", "gaming-pc", "--write"], "J").unwrap();
+    assert_eq!(e.get("BITSOS2/firmware/amdgpu/a.bin"), b"AAAA");
+    assert_eq!(e.get("BITSOS2/firmware/AMDGPU/B.BIN"), b"BBBB", "replaced under the stick's own name");
+    assert_eq!(e.get("BITSOS2/firmware/amdgpu/c.bin"), b"CCCC");
+    assert_eq!(e.get("BITSOS2/firmware/LICENSE.amdgpu"), b"licence");
+    let mut want = s0.clone();
+    want.insert("BITSOS2/firmware/AMDGPU/B.BIN".into(), Some(b"BBBB".to_vec()));
+    want.insert("BITSOS2/firmware/amdgpu/c.bin".into(), Some(b"CCCC".to_vec()));
+    want.insert("BITSOS2/firmware/LICENSE.amdgpu".into(), Some(b"licence".to_vec()));
+    assert_eq!(e.snap(), want, "exactly the set changed");
+    // Again: everything is unchanged, nothing to write.
+    run(&["--firmware", "gaming-pc", "--write"], "J").unwrap();
+    assert_eq!(e.snap(), want);
+    // A file the host lacks: refused before anything is planned.
+    std::fs::remove_file(host.join("amdgpu/c.bin.zst")).unwrap();
+    let err = run(&["--firmware", "gaming-pc", "--write"], "J").unwrap_err();
+    assert!(err.contains("c.bin.zst") && err.contains("nothing was planned"), "{err}");
+    assert!(Opts::parse(&e.dir, &mut Args::new(vec!["--target".into(), "/x".into(), "--firmware".into(), "minipc".into()])).is_err());
+}
+
+/// GP-R2 fix: `--tree` lands below target/ or outside the repository, judged on real paths: `..` and a symlink below
+/// target/ that points into the tree are refused (std::path::absolute let both through into a git-tracked folder).
+#[test]
+fn the_firmware_tree_never_lands_in_the_repository() {
+    let e = env("fwtree");
+    let (repo, out) = (e.dir.join("repo"), e.dir.join("outside"));
+    std::fs::create_dir_all(repo.join("target")).unwrap();
+    std::fs::create_dir_all(repo.join("plan")).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let r = |d: PathBuf| tree_dir(&repo, &d);
+    assert_eq!(r(repo.join("target/fw/x")).unwrap(), repo.join("target/fw/x"));
+    assert_eq!(r(out.join("new dir")).unwrap(), out.join("new dir"));
+    assert!(r(repo.join("plan/fw")).unwrap_err().contains("lies in the repository"));
+    assert!(r(repo.join("target/../plan/fw")).unwrap_err().contains("'..'"));
+    std::os::unix::fs::symlink(repo.join("plan"), repo.join("target/link")).unwrap();
+    assert!(r(repo.join("target/link/fw")).unwrap_err().contains("lies in the repository"));
+    std::os::unix::fs::symlink(&out, repo.join("target/away")).unwrap();
+    assert_eq!(r(repo.join("target/away/fw")).unwrap(), out.join("fw"));
+    assert!(!repo.join("plan/fw").exists(), "nothing made before the refusal");
 }

@@ -6,12 +6,18 @@ description = "Block layer: request queue with merging and B4 priorities, write-
 
 [dependencies]
 devmodel = { path = "../devmodel" }
+# GP-GUARD: the Gaming-PC's disk rule (policy.rs; pure, no dependencies).
+gp-platform = { path = "../gp-platform" }
 ksync = { path = "../ksync" }
 klog = { path = "../klog" }
 ktest = { path = "../ktest" }
 sched = { path = "../sched" }
 uapi = { path = "../uapi" }
 vfs = { path = "../vfs" }
+
+[dev-dependencies]
+# The spin-lock probe of the ATOMIC-3 tests (a GlobalAlloc front; tests outside src/ may not use unsafe).
+mm-core = { path = "../mm-core", features = ["host-count"] }
 
 [lints]
 workspace = true

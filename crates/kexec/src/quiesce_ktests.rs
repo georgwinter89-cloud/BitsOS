@@ -283,7 +283,7 @@ fn nmi_refused() -> TestResult {
 }
 ktest!("rb.quiesce.nmi_refused", QemuOnly, nmi_refused);
 
-/// The body of change request 1 (`platform::power::park_others`, plan/notes/rb-RB-quiesce.md) word for word,
+/// The body of change request 1 (`platform::power::park_others`) word for word,
 /// but logging under "rb", so the scenario runs the glue as the desk will paste it before it is pasted.
 fn park_others(what: &'static str) -> hal::kexec_stub::ShutdownPark {
     let park = hal::kexec_stub::park_for_shutdown(&hal::kexec_stub::live_stop_options(time::now_ns), sched::pin_current);
@@ -306,7 +306,7 @@ fn wait(ns: u64) {
 /// - `reboot` / `poweroff`: the RB-quiesce order itself (park, `quiesce_all`, `acpi::power`), what the glue in
 ///   `platform::power` and MCP's `reboot` does;
 /// - `platform-reboot` / `platform-poweroff`: `platform::power::reboot` / `poweroff` (park only once the desk
-///   applied the change request of plan/notes/rb-RB-quiesce.md).
+///   put `park_others` into crates/platform/src/power.rs).
 /// Comes back only when the power-off failed.
 fn qemu_action() -> TestResult {
     let Some(what) = crate::boot::config("rb_quiesce_test") else {

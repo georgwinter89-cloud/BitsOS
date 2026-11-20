@@ -80,6 +80,64 @@ fn present_full() -> TestResult {
 }
 ktest!("dp.gopfb.present_full", Screen, present_full);
 
+/// SHOT: what was presented reads back exactly through the streaming read (hal's `stream16` on the real write-combined
+/// framebuffer, or the scanout buffer shown while the display engine flips), the whole frame and regions that start
+/// and end inside a 16-byte block. The whole read is timed (the Mini-PC's old plain read: 214 ms at 2560x1440).
+fn read_back() -> TestResult {
+    let Some(dev) = display::device() else { return ktest::fail("no display") };
+    let m = dev.current_mode();
+    let (w, h) = (m.width, m.height);
+    let mut g = display::take_scanout("dp.gopfb.read_back").map_err(|e| format!("{e:?}"))?;
+    let mut f = RamFrame::new(w, h);
+    for (i, p) in f.pixels_mut().iter_mut().enumerate() {
+        *p = check::pattern(i as u32 % w, i as u32 / w) ^ (i as u32).wrapping_mul(0x9E37) & 0x00FF_FFFF;
+    }
+    f.mark_all();
+    let st = g.present(&mut f);
+    kassert!(st.errors == 0, "{st:?}");
+    let r = (|| -> TestResult {
+        let read = read_fn()?;
+        let mut px = alloc::vec![0u32; w as usize * h as usize];
+        let t0 = time::now_ns();
+        kassert!(read((0, 0, w, h), &mut px), "the whole frame cannot be read");
+        let ns = time::now_ns() - t0;
+        let bad = px.iter().zip(f.pixels()).filter(|(a, b)| a != b).count();
+        kassert!(bad == 0, "{bad} of {} pixels read back differ", px.len());
+        for (x, y, rw, rh) in [(1, 0, 1, 1), (3, 5, 5, 3), (w - 7, h - 3, 7, 3), (2, 1, w - 5, 2), (w / 2 + 1, h / 2, 13, 17)] {
+            let mut cut = alloc::vec![0u32; (rw * rh) as usize];
+            kassert!(read((x, y, rw, rh), &mut cut), "region {x},{y} {rw}x{rh} cannot be read");
+            for (i, &p) in cut.iter().enumerate() {
+                let (cx, cy) = (x + i as u32 % rw, y + i as u32 / rw);
+                kassert!(p == f.pixels()[(cy * w + cx) as usize], "region {x},{y} {rw}x{rh}: pixel {cx},{cy} reads {p:#x}");
+            }
+        }
+        let bytes = u64::from(w) * u64::from(h) * 4;
+        klog::event!(Info, "dp", "read_back.full", width = w, height = h, us = ns / 1000, mb_per_s = bytes * 1000 / ns.max(1),
+            ms_at_1440p = ns * (2560 * 1440 * 4) / bytes.max(1) / 1_000_000; "whole-frame read of write-combined memory (SHOT; Mini-PC plain read: 214 ms at 2560x1440)");
+        Ok(())
+    })();
+    drop(g);
+    r
+}
+ktest!("dp.gopfb.read_back", Screen, read_back);
+
+type Read = alloc::boxed::Box<dyn Fn((u32, u32, u32, u32), &mut [u32]) -> bool>;
+
+/// How to read rectangles of what shows: the engine's buffer shown while it flips, else the live framebuffer.
+fn read_fn() -> Result<Read, alloc::string::String> {
+    if let Some(e) = crate::fbdev::flip::active() {
+        let wnd = e.shown().ok_or("the engine flips but names no buffer shown")?;
+        return Ok(alloc::boxed::Box::new(move |r, dst| e.read_window(wnd, r, dst)));
+    }
+    let (fb, target) = live().ok_or("no GOP framebuffer")?;
+    kassert!(fb.format == bootinfo::PixelFormat::Bgrx, "the GOP framebuffer is not BGRX: the test reads pixels as the RAM frame holds them");
+    let line = fb.stride as usize * 4;
+    Ok(alloc::boxed::Box::new(move |(x, y, w, h), dst: &mut [u32]| {
+        let w = w as usize;
+        (0..h as usize).all(|r| target.read_pixels((y as usize + r) * line + x as usize * 4, &mut dst[r * w..r * w + w]))
+    }))
+}
+
 /// The display's timer estimate (its `VblankClock`, which fbdev's `clock_now` reads through `live_vblank` while
 /// GopFb is the installed display; `last_vblank`, `VblankClock::next`): 60 Hz by default,
 /// a known refresh replaces it, the sequence never goes back, and the next vblank comes when it said.

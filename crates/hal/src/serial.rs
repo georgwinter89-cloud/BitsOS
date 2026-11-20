@@ -1,8 +1,8 @@
-//! COM1 (desk): the log line QEMU, the gate and xtask parse. CONFIG `serial=auto|on|off` (D1, 19.10.): `auto`
-//! (the default) uses the port only under a hypervisor; on bare metal nobody listens to COM1 (logs go to the
-//! mirror, the screen and MCP), and the Mini-PC's FCH UART answers at 0x3F8 without a connector: every byte
-//! there waits ~87 us for the line. `off`, or `auto` on bare metal, touches no port at all; bytes still reach
-//! the mirror hook (the early screen console).
+//! COM1 (desk): the log line QEMU, the gate and xtask parse (D1, 19.10.). The port is used only under a hypervisor;
+//! on bare metal nobody listens to COM1 (logs go to the mirror, the screen and MCP), and the Mini-PC's FCH UART
+//! answers at 0x3F8 without a connector: every byte there waits ~87 us for the line. Bare metal touches no port at
+//! all; bytes still reach the mirror hook (the early screen console). The test key `ktest_serial=on` uses the port
+//! wherever a UART answers (`host/tests/cp/69-intel-bare.sh` hides QEMU's hypervisor bit).
 //!
 //! No writer keeps interrupts off while it waits for the line: a slow UART is waited for with interrupts as the
 //! caller had them, and only the burst into an empty FIFO (and taking the line flag) runs masked. Under QEMU the
@@ -28,42 +28,10 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 /// Bytes one look at an empty transmitter may write (16 with the 16550 FIFO, else 1).
 static BURST: AtomicUsize = AtomicUsize::new(1);
 
-/// CONFIG `serial=`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// The port under a hypervisor (QEMU), none on bare metal.
-    Auto,
-    /// The port wherever a UART answers (a real cable on bare metal).
-    On,
-    /// Never a port.
-    Off,
-}
-
-impl Mode {
-    pub fn parse(s: &str) -> Option<Mode> {
-        match s.trim() {
-            "auto" | "" => Some(Mode::Auto),
-            "on" => Some(Mode::On),
-            "off" => Some(Mode::Off),
-            _ => None,
-        }
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Auto => "auto",
-            Mode::On => "on",
-            Mode::Off => "off",
-        }
-    }
-}
-
-/// Whether `mode` wants the port on a machine with (`hypervisor`) or without the CPUID hypervisor bit.
-pub fn wanted(mode: Mode, hypervisor: bool) -> bool {
-    match mode {
-        Mode::On => true,
-        Mode::Off => false,
-        Mode::Auto => hypervisor,
-    }
+/// Whether the port is wanted on a machine with (`hypervisor`) or without the CPUID hypervisor bit; `test`: the test
+/// key `ktest_serial=on`.
+pub fn wanted(test: bool, hypervisor: bool) -> bool {
+    test || hypervisor
 }
 
 /// The CPUID hypervisor bit (leaf 1, ECX bit 31). No allocation: it runs before the heap.
@@ -86,14 +54,14 @@ pub fn set_mirror(f: Option<fn(u8)>) {
     MIRROR.store(f.map_or(0, |f| f as usize), Ordering::Release);
 }
 
-/// The first decision, at kernel entry, before CONFIG is read: `auto`. On bare metal no port is touched.
+/// The first decision, at kernel entry, before CONFIG is read. On bare metal no port is touched.
 pub fn init() {
-    apply(wanted(Mode::Auto, under_hypervisor()));
+    apply(wanted(false, under_hypervisor()));
 }
 
-/// CONFIG `serial=` once it is read (only the boot CPU runs then). Returns whether the port is in use.
-pub fn configure(mode: Mode) -> bool {
-    apply(wanted(mode, under_hypervisor()));
+/// The test key `ktest_serial=` once CONFIG is read (only the boot CPU runs then). Returns whether the port is in use.
+pub fn configure(test: bool) -> bool {
+    apply(wanted(test, under_hypervisor()));
     present()
 }
 
@@ -314,23 +282,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_uses_the_port_only_under_a_hypervisor() {
-        assert!(wanted(Mode::Auto, true));
-        assert!(!wanted(Mode::Auto, false), "bare metal: the Mini-PC's FCH UART has no connector");
-        assert!(wanted(Mode::On, false) && wanted(Mode::On, true));
-        assert!(!wanted(Mode::Off, true) && !wanted(Mode::Off, false));
-    }
-
-    #[test]
-    fn modes_parse() {
-        assert_eq!(Mode::parse(" auto "), Some(Mode::Auto));
-        assert_eq!(Mode::parse(""), Some(Mode::Auto));
-        assert_eq!(Mode::parse("on"), Some(Mode::On));
-        assert_eq!(Mode::parse("off"), Some(Mode::Off));
-        assert_eq!(Mode::parse("maybe"), None);
-        for m in [Mode::Auto, Mode::On, Mode::Off] {
-            assert_eq!(Mode::parse(m.name()), Some(m));
-        }
+    fn the_port_only_under_a_hypervisor() {
+        assert!(wanted(false, true));
+        assert!(!wanted(false, false), "bare metal: the Mini-PC's FCH UART has no connector");
+        assert!(wanted(true, false) && wanted(true, true), "the test key");
     }
 
     #[test]
@@ -344,9 +299,9 @@ mod tests {
 
     #[test]
     fn no_port_without_a_uart() {
-        // Host portio reads 0xFF: the scratch test fails, so even `on` leaves the port unused.
-        assert!(!configure(Mode::On));
-        assert!(!configure(Mode::Auto));
+        // Host portio reads 0xFF: the scratch test fails, so even the test key leaves the port unused.
+        assert!(!configure(true));
+        assert!(!configure(false));
         write_line(b"nothing happens"); // no port, no mirror: returns
         assert!(!has_output());
     }

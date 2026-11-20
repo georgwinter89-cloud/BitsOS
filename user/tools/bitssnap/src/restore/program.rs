@@ -69,7 +69,7 @@ pub fn on_data(p: &Path) -> Option<String> {
 }
 
 /// The version folder current in the snapshot under `apps_rel/name` (checked: real folders, a valid version).
-fn snapshot_version(snap: &Path, apps_rel: &str, name: &str) -> Option<(String, PathBuf)> {
+pub(crate) fn snapshot_version(snap: &Path, apps_rel: &str, name: &str) -> Option<(String, PathBuf)> {
     let pkg = in_snapshot(snap, &format!("{apps_rel}/{name}/current")).ok()?;
     let v = bitspkg::fsx::read_link(&pkg).filter(|v| bitspkg::names::check_version(v).is_ok())?;
     let dir = in_snapshot(snap, &format!("{apps_rel}/{name}/{v}")).ok()?;

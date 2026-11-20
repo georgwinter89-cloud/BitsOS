@@ -1,7 +1,7 @@
 //! The space report (PK-5): per program what its versions, its data folder and the caches in it take, and for the
 //! store what gc would free. Read-only, metadata only (nothing is hashed).
 //!
-//! Counting follows GNU du: disk use is `st_blocks * 512` (linux-6.6/fs/stat.c generic_fillattr), a hard-linked
+//! Counting follows GNU du: disk use is `st_blocks * 512` (linux-7.3.1/fs/stat.c:82 generic_fillattr), a hard-linked
 //! inode counts once. Version files are hard links into `apps/.store/` and shared between versions and between
 //! programs, so a program's package is split into `own` (inodes no other program uses: removing the program frees
 //! them) and `shared` (also used by another program), and each version says what only it uses (`alone`:

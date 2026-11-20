@@ -2,7 +2,7 @@
 # RB-1: klog under a real boot with CONFIG `loglevel=` per subsystem and `log_buf=`.
 # Runs the rb ktests (early ring, try_event, levels, deferred sink, filters; the `log` tool and the drain thread
 # once klogd is linked) and checks the CONFIG side: the level settings and the ring size from `log_buf`.
-# Until the kernel calls `klog::configure` (change request in plan/notes/rb-RB-1.md) the CONFIG part is skipped
+# Until the kernel calls `klog::configure` the CONFIG part is skipped
 # with a note, the ktests still have to pass.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"

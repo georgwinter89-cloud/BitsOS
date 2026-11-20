@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Erledigt: "}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"GEMINI-DONE."}]},"index":0,"finishReason":"STOP"}],"modelVersion":"gemini-rec","responseId":"rec","usageMetadata":{"promptTokenCount":400,"candidatesTokenCount":20,"totalTokenCount":420}}
+

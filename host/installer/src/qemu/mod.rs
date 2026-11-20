@@ -181,7 +181,7 @@ pub fn run(o: &Opts) -> Result<(), String> {
         println!("  or the shortcut {}", s.display());
     }
     if let Some(s) = slow {
-        println!("note: QEMU emulates the processor (slow: minutes to the desktop): {s}");
+        println!("note: QEMU emulates the processor (slow: minutes to the text console): {s}");
     }
     if let Some(p) = port {
         println!("\nRemote control: QEMU forwards 127.0.0.1:{p} to BitsOS's port {}; the token is in {}.", args::GUEST_MCP_PORT, l.token().display());
@@ -279,7 +279,7 @@ fn programs(m: &Manifest, o: &Opts) -> Result<(String, bool, bool), String> {
     if o.batch() || offered.is_empty() {
         return Ok(("none".into(), steam, brave));
     }
-    println!("\nThe image gets the system and the desktop. The program trees are made for the real machine and are untested in QEMU.");
+    println!("\nThe image gets the system (QEMU shows the boot screen and the text console, no desktop). The program trees are made for the real machine and are untested in QEMU.");
     if !ui::yes("Add any of them anyway?", false)? {
         return Ok(("none".into(), steam, brave));
     }

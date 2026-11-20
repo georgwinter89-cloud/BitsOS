@@ -260,7 +260,7 @@ impl crate::synth::DirSource for ProcSysFs {
             SynthEntry::file("nr_open", 0o444, Arc::new(Text(alloc::format!("{}\n", abi::NR_OPEN)))).cookie(2),
             // FS-3: the pipe limits, root-writable as on Linux (0644). pipe-max-size rules F_SETPIPE_SZ and new
             // pipes; the user-pages numbers are kept but not enforced (R1).
-            SynthEntry::file("pipe-max-size", 0o644, Arc::new(crate::sysctl::Knob { get: crate::pipe::max_size, set: crate::pipe::set_max_size, uint: true })).cookie(3),
+            SynthEntry::file("pipe-max-size", 0o644, Arc::new(crate::sysctl::Knob { get: crate::pipe::max_size, set: crate::pipe::set_max_size })).cookie(3),
             SynthEntry::file("pipe-user-pages-hard", 0o644, Arc::new(crate::pipe::user_pages_knob(true))).cookie(4),
             SynthEntry::file("pipe-user-pages-soft", 0o644, Arc::new(crate::pipe::user_pages_knob(false))).cookie(5),
         ])

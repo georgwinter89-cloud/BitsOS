@@ -13,6 +13,8 @@ use uapi::errno::*;
 pub const EOC: u32 = 0x0FFF_FFFF;
 pub const BAD: u32 = 0x0FFF_FFF7;
 const MASK: u32 = 0x0FFF_FFFF;
+/// Sectors per command of `write_out_runs` and `preload` (32 KiB at 512-byte sectors, as `scan` reads).
+const RUN: usize = 64;
 
 pub struct Fat {
     first: u64,
@@ -171,14 +173,83 @@ impl Fat {
         Ok(())
     }
 
-    /// Counts the free clusters (the whole FAT is read once, in 64-sector pieces, around the cache).
+    /// GP-START: `write_out` with neighbouring changed sectors written together (at most `RUN` per write): the same
+    /// bytes, FAT 1 before FAT 2, in far fewer commands (a USB-2 stick takes each 512-byte write as a command of its
+    /// own). Only `Volume::allocate_unzeroed` uses it; every other path keeps `write_out`.
+    pub fn write_out_runs(&mut self, dev: &dyn Dev) -> Result<(), i64> {
+        let idx: Vec<u64> = self.dirty.iter().copied().collect();
+        for copy in 0..self.copies as u64 {
+            let mut i = 0;
+            while i < idx.len() {
+                let mut j = i + 1;
+                while j < idx.len() && idx[j] == idx[j - 1] + 1 && j - i < RUN {
+                    j += 1;
+                }
+                let mut buf = Vec::new();
+                buf.try_reserve_exact((j - i) * self.ss).map_err(|_| ENOMEM)?;
+                for k in &idx[i..j] {
+                    buf.extend_from_slice(self.cache.get(k).ok_or(EIO)?);
+                }
+                dev.write(self.first + copy * self.size + idx[i], &buf)?;
+                i = j;
+            }
+        }
+        self.dirty.clear();
+        Ok(())
+    }
+
+    /// GP-START: reads the FAT into the cache `RUN` sectors at a time from the sector of cluster `from` (wrapping to
+    /// cluster 2) until the sectors hold `need` free entries at or after `from` the way `find_free` walks, so its
+    /// `get`s (one sector read per miss) find everything cached. Sectors already cached keep their (maybe changed)
+    /// bytes. Stops at the whole FAT.
+    pub fn preload(&mut self, dev: &dyn Dev, from: u32, need: u32) -> Result<(), i64> {
+        let from = if self.valid(from) { from } else { 2 };
+        let per = (self.ss / 4) as u64;
+        let last = self.at(self.clusters + 1).0;
+        let (start, _) = self.at(from);
+        let total = last + 1;
+        let (mut done, mut free) = (0u64, 0u64);
+        while done < total && free < need as u64 {
+            let idx = (start + done) % total;
+            let k = (total - idx).min(RUN as u64).min(total - done);
+            if (idx..idx + k).any(|i| !self.cache.contains_key(&i)) {
+                let mut buf = vec![0u8; k as usize * self.ss];
+                dev.read(self.read_from + idx, &mut buf)?;
+                for (j, s) in buf.chunks(self.ss).enumerate() {
+                    self.cache.entry(idx + j as u64).or_insert_with(|| s.to_vec());
+                }
+            }
+            for i in idx..idx + k {
+                let s = self.cache.get(&i).ok_or(EIO)?;
+                for (e, v) in s.chunks_exact(4).enumerate() {
+                    let c = i * per + e as u64;
+                    let past = if done == 0 { c >= from as u64 } else { true };
+                    if past && self.valid(c as u32) && u32::from_le_bytes([v[0], v[1], v[2], v[3]]) & MASK == 0 {
+                        free += 1;
+                    }
+                }
+            }
+            done += k;
+        }
+        Ok(())
+    }
+
+    /// Counts the free clusters (`scan`).
     pub fn count_free(&mut self, dev: &dyn Dev) -> Result<u32, i64> {
         if let Some(f) = self.free {
             return Ok(f);
         }
+        let mut free = 0u32;
+        self.scan(dev, |_, v| free += (v == 0) as u32)?;
+        self.free = Some(free);
+        Ok(free)
+    }
+
+    /// Calls `f(cluster, entry)` for every data cluster: the whole FAT read once, in 64-sector pieces, around the
+    /// cache (its changed sectors count, not the disk's).
+    pub fn scan(&mut self, dev: &dyn Dev, mut f: impl FnMut(u32, u32)) -> Result<(), i64> {
         let per = (self.ss / 4) as u64;
         let last_idx = (self.clusters as u64 + 1) / per;
-        let mut free = 0u32;
         let mut idx = 0u64;
         let mut buf = Vec::new();
         while idx <= last_idx {
@@ -192,14 +263,13 @@ impl Fat {
                 };
                 for (j, e) in s.chunks_exact(4).enumerate() {
                     let c = (idx + k) * per + j as u64;
-                    if c >= 2 && c <= self.clusters as u64 + 1 && u32::from_le_bytes([e[0], e[1], e[2], e[3]]) & MASK == 0 {
-                        free += 1;
+                    if c >= 2 && c <= self.clusters as u64 + 1 {
+                        f(c as u32, u32::from_le_bytes([e[0], e[1], e[2], e[3]]) & MASK);
                     }
                 }
             }
             idx += n;
         }
-        self.free = Some(free);
-        Ok(free)
+        Ok(())
     }
 }

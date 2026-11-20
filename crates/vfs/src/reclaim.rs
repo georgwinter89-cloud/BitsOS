@@ -1,5 +1,5 @@
-//! MM-9: page-cache reclaim, the Linux way but small (linux-6.6/mm/vmscan.c `shrink_folio_list` :1705,
-//! `folio_check_references` :1524). Only clean, unmapped pages of block file systems (FAT, ext4, block files)
+//! MM-9: page-cache reclaim, the Linux way but small (linux-7.3.1/mm/vmscan.c `shrink_folio_list` :1058,
+//! `folio_check_references` :868). Only clean, unmapped pages of block file systems (FAT, ext4, block files)
 //! go: their content is on the device and a later miss reads it again. tmpfs and memfd pages never go (no swap),
 //! nor a page anyone else holds (a mapping's pin, a running read or write-back, a block request: the index's
 //! reference is then not the only one) or a dirty one (the flusher writes it back first, `writeback`).
@@ -8,7 +8,8 @@
 //! every cache (second chance: a used page is passed over once and marked `COLD`, an unused one is taken),
 //! which approximates "least recently used" without a list per page. Two rings name the caches (weakly, so a
 //! dropped inode leaves by itself): every reclaimable cache, and the caches that may still hold unused preloaded
-//! pages.
+//! pages. That order is `shrink`'s. `reclaim_frame` takes the page of one frame, whatever its state: the heap and
+//! compaction clear a block by position with it (W35 MM-3, in place of a copy until MM-2), counted apart.
 //!
 //! Callers: the allocator's slow path (`Mode::Direct`, through crate mm's `mm_core::reclaim::Reclaim`): try-locks
 //! only and no allocation (the caller may hold any lock, a cache's own `vfs.inode.data` included); the
@@ -21,7 +22,7 @@
 use crate::pagecache::{frames_held, invalidate_clean, tmpfs_frames, Inner, Invalidated, COLD, PRELOADED, REFERENCED};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use ksync::{Mutex, MutexGuard, SpinLock, SpinLockGuard};
+use ksync::{Mutex, MutexGuard, Spare, SpinLock, SpinLockGuard};
 
 type Cache = Mutex<Inner>;
 
@@ -89,18 +90,30 @@ impl Ring {
         Ring { slots: SpinLock::named(name, Slots { caches: Vec::new(), hand: 0 }) }
     }
 
-    /// Lists `c` (false: the list could not grow; the cache is then not reclaimed through this ring).
+    /// Lists `c` (false: no memory for a longer list, even after reclaim; the cache is then not reclaimed through
+    /// this ring). The list grows with the ring's lock dropped (`ksync::Spare`): it has an entry per cached file,
+    /// and under the spin lock the heap could neither reclaim nor build a large block from single frames (a
+    /// browser start doubled it to 256 KiB there, Mini-PC 12.11.2026). Thread context only (`PageCache::build`,
+    /// `note_preloaded` under the cache's sleeping lock).
     pub(crate) fn add(&self, c: &Arc<Cache>) -> bool {
-        let mut s = self.slots.lock();
-        if s.caches.len() == s.caches.capacity() {
-            s.caches.retain(|w| w.strong_count() > 0);
-            s.hand = 0;
+        let w = Arc::downgrade(c);
+        let mut spare = Spare::new();
+        loop {
+            let mut s = self.slots.lock();
+            if s.caches.len() == s.caches.capacity() {
+                s.caches.retain(|w| w.strong_count() > 0);
+                s.hand = 0;
+            }
+            if !spare.fits(&mut s.caches, 1) {
+                drop(s);
+                if spare.grow().is_err() {
+                    return false;
+                }
+                continue;
+            }
+            s.caches.push(w);
+            return true;
         }
-        if s.caches.try_reserve(1).is_err() {
-            return false;
-        }
-        s.caches.push(Arc::downgrade(c));
-        true
     }
 
     /// Entries listed now (dead ones included until a walk meets them).
@@ -252,7 +265,15 @@ impl Reclaimer {
                 }
             }
         });
-        if !done(&out, budget) {
+        // A cache with unused preloaded pages was passed over while kswapd runs: kswapd holds it and is freeing
+        // exactly those pages, so a light direct call does not go on to take used pages of other files for them
+        // (each such call took a cluster of them, up to a whole read file in one allocation spike). Its caller
+        // takes what kswapd freed instead (`busy`, `Buddy::alloc_reclaiming`), as Linux's direct reclaimers wait
+        // for one another (`too_many_isolated` -> `reclaim_throttle`). A thorough call (the allocator's later
+        // rounds) goes on with the clock: a slow kswapd in a large cache must not leave the allocation to the
+        // reserve while other caches have clean pages. Another holder (a reader of the file) leaves the clock on.
+        let yield_to_kswapd = mode == Mode::Direct && !thorough && out.busy > 0 && mm_core::reclaim::kswapd_running();
+        if !done(&out, budget) && !yield_to_kswapd {
             self.all.walk(mode, &mut |c| {
                 if done(&out, budget) {
                     return Step::Stop;
@@ -478,81 +499,227 @@ pub fn reclaim_frame(phys: u64, owner: u64) -> bool {
     let (id, index) = (owner >> INDEX_BITS, owner & ((1 << INDEX_BITS) - 1));
     let Some(c) = ids::get(id) else { return false };
     let mut spins = SPINS;
+    // Some(state): the page went.
     let taken = match lock(&c, Mode::Direct, &mut spins) {
         Some(g) => {
-            let ok = g.pages.next_with(index, |i, p| i == index && p.phys() == Some(phys) && p.strong_count() == 1 && !p.is_dirty()).is_some_and(|(_, ok)| ok);
-            match ok.then(|| g.pages.try_take_alone(index)).flatten() {
-                Some(page) => {
-                    page.drop_nowait();
-                    true
-                }
-                None => false,
-            }
+            let st = g.pages.next_with(index, |i, p| (i == index && p.phys() == Some(phys) && p.strong_count() == 1 && !p.is_dirty()).then(|| p.state())).and_then(|(_, st)| st);
+            st.filter(|_| g.pages.try_take_alone(index).map(|page| page.drop_nowait()).is_some())
         }
-        None => false,
+        None => None,
     };
     release(c);
-    if taken {
+    if let Some(st) = taken {
         PAGES.inc();
         FRAME_PAGES.inc();
+        // Counted apart from `PRELOADED_PAGES`: that one tells the preload pass of pressure (`preloaded_taken`),
+        // and a block cleared by position is none.
+        if st == PRELOADED {
+            FRAME_PRELOADED_PAGES.inc();
+        }
     }
-    taken
+    taken.is_some()
 }
 
 klog::counter!(pub FRAME_PAGES, "vfs.reclaim.frame_pages");
+klog::counter!(FRAME_PRELOADED_PAGES, "vfs.reclaim.frame_preloaded_pages");
+
+/// What `migrate_frame` did with one page-cache frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Migrated {
+    /// The page lives on the target now; the old frame goes back after a grace period.
+    Moved,
+    /// Dirty (CONTRACTS BL-3/MM-2: dirty pages stay; write-back cleans them first).
+    Dirty,
+    /// Someone besides the index holds it: a mapping's pin, a read, a block request (I/O), a write-back batch.
+    Held,
+    /// The file's lock or its index's write side was taken, or a thread sleeps for the lock (never waited for).
+    Busy,
+    /// The owner word names no page with this frame (freed meanwhile, being read in, a reused id).
+    Stale,
+    /// No target frame (the free scanner found none), or none it could use.
+    NoTarget,
+}
+
+/// W35 MM-2 (CONTRACTS BL-3/MM-2): moves the clean, unmapped page frame `phys` holds (found through its owner word,
+/// as `reclaim_frame`) to a target from `dest` (a `Target`: an allocated page-cache frame nobody else knows; it
+/// either becomes the page's or goes back when its handle drops): a new `CachePage` on the target with the
+/// bytes copied replaces the index entry under the file's lock (`vfs.inode.data`, try-lock) and the index's write
+/// side (try), the epoch unchanged; the old page is retired through PF-5's grace queue, so a lockless reader still
+/// holding it finishes on the old frame. Direct reclaim's rules: try-locks only; one page is allocated (the new
+/// `CachePage`, a small heap object) with no spin lock held.
+pub fn migrate_frame<'b>(phys: u64, owner: u64, dest: &mut dyn FnMut() -> Option<mm_core::Target<'b>>) -> Migrated {
+    let (id, index) = (owner >> INDEX_BITS, owner & ((1 << INDEX_BITS) - 1));
+    let Some(c) = ids::get(id) else { return Migrated::Stale };
+    // One try, no spinning: a busy file's pages stay for this run. The scanner hands over frame after frame of
+    // the same file, and `SPINS` tries for each (as a reclaim call has for all of its caches together) kept a
+    // compaction run spinning for one file's lock for most of its time.
+    // A thread sleeping for the lock (a read, a write, a write-back) goes first, as the anonymous side stands back
+    // for `mm.as` (`aspace::migrate::waited_for`): a scanner taking the lock frame after frame would otherwise win
+    // it every time its holder lets go (generation 137: waits for `vfs.inode.data` up to 1.57 s).
+    let r = if c.contended() {
+        MIGRATE_YIELDED.inc();
+        Migrated::Busy
+    } else {
+        match c.try_lock() {
+            Some(g) => migrate_locked(&g, index, phys, dest),
+            None => Migrated::Busy,
+        }
+    };
+    release(c);
+    r
+}
+
+klog::counter!(pub MIGRATE_YIELDED, "mm.migrate.cache_yielded");
+
+fn migrate_locked<'b>(g: &Inner, index: u64, phys: u64, dest: &mut dyn FnMut() -> Option<mm_core::Target<'b>>) -> Migrated {
+    let Some(old) = g.pages.get(index).filter(|p| p.phys() == Some(phys)) else { return Migrated::Stale };
+    // The index's reference and this one: anything more is a holder (pin, read, request, write-back).
+    if Arc::strong_count(&old) > 2 {
+        return Migrated::Held;
+    }
+    if old.is_dirty() {
+        return Migrated::Dirty;
+    }
+    let Some(t) = dest() else { return Migrated::NoTarget };
+    let Some(new) = old.moved_to(t) else { return Migrated::NoTarget };
+    drop(old);
+    let keep = new.clone();
+    // On a refusal the new page drops with `keep` (its frame goes back); the old one stays.
+    match g.pages.try_replace_alone(index, phys, new) {
+        Ok(gone) => {
+            if let Some(gone) = gone {
+                keep.take_charge(&gone);
+                gone.drop_nowait();
+            }
+            Migrated::Moved
+        }
+        Err(true) => Migrated::Busy,
+        Err(false) => Migrated::Held,
+    }
+}
+
 
 /// Ids of reclaimable caches: a slot per live cache, reused after its drop. A stale owner word naming a reused
 /// slot finds another cache, whose page at that index has another frame: `reclaim_frame` checks the frame.
+/// The free slots are chained through the table itself, so `remove` (a cache's drop, under any lock) never needs
+/// room; the table grows with its lock dropped (`ksync::Spare`, as `Ring::add`).
 mod ids {
     use super::Cache;
     use alloc::sync::{Arc, Weak};
     use alloc::vec::Vec;
-    use ksync::SpinLock;
+    use ksync::{Spare, SpinLock};
 
-    struct Table {
-        slots: Vec<Weak<Cache>>,
-        free: Vec<u32>,
+    enum Slot {
+        Live(Weak<Cache>),
+        /// Free; the next free slot's index plus one (0: none).
+        Free(u32),
     }
 
-    static IDS: SpinLock<Table> = SpinLock::named("vfs.reclaim.ids", Table { slots: Vec::new(), free: Vec::new() });
+    struct Table {
+        slots: Vec<Slot>,
+        /// The first free slot's index plus one (0: none).
+        free: u32,
+    }
+
+    static IDS: SpinLock<Table> = SpinLock::named("vfs.reclaim.ids", Table::new());
+
+    /// Ids above 24 bits do not fit the owner word: such a cache is reclaimed by the clock only.
+    const MAX: usize = (1 << 24) - 1;
+
+    impl Table {
+        const fn new() -> Table {
+            Table { slots: Vec::new(), free: 0 }
+        }
+    }
 
     pub(super) fn add(c: &Arc<Cache>) -> u64 {
-        let mut t = IDS.lock();
-        if let Some(i) = t.free.pop() {
-            t.slots[i as usize] = Arc::downgrade(c);
-            return u64::from(i) + 1;
-        }
-        // Ids above 24 bits do not fit the owner word: such a cache is reclaimed by the clock only.
-        let room = t.slots.len() + 1 - t.free.len();
-        if t.slots.len() >= (1 << 24) - 1 || t.slots.try_reserve(1).is_err() || t.free.try_reserve(room).is_err() {
-            return 0;
-        }
-        t.slots.push(Arc::downgrade(c));
-        t.slots.len() as u64
+        add_in(&IDS, c)
     }
 
     pub(super) fn remove(id: u64) {
-        if id == 0 {
-            return;
-        }
-        let mut t = IDS.lock();
-        let i = (id - 1) as usize;
-        if i < t.slots.len() {
-            t.slots[i] = Weak::new();
-            // Room was reserved when the slot was made.
-            if t.free.len() < t.free.capacity() {
-                t.free.push(i as u32);
-            }
-        }
+        remove_in(&IDS, id)
     }
 
     /// The live cache of `id`; never waits for the table (reclaim).
     pub(super) fn get(id: u64) -> Option<Arc<Cache>> {
-        let t = IDS.try_lock()?;
-        t.slots.get(id.checked_sub(1)? as usize)?.upgrade()
+        get_in(&IDS, id)
+    }
+
+    fn add_in(ids: &SpinLock<Table>, c: &Arc<Cache>) -> u64 {
+        let w = Arc::downgrade(c);
+        let mut spare = Spare::new();
+        loop {
+            let mut t = ids.lock();
+            let head = t.free as usize;
+            if let Some(&Slot::Free(next)) = head.checked_sub(1).and_then(|i| t.slots.get(i)) {
+                t.free = next;
+                t.slots[head - 1] = Slot::Live(w);
+                return head as u64;
+            }
+            if t.slots.len() >= MAX {
+                return 0;
+            }
+            if !spare.fits(&mut t.slots, 1) {
+                drop(t);
+                if spare.grow().is_err() {
+                    return 0;
+                }
+                continue;
+            }
+            t.slots.push(Slot::Live(w));
+            return t.slots.len() as u64;
+        }
+    }
+
+    fn remove_in(ids: &SpinLock<Table>, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let mut t = ids.lock();
+        let i = (id - 1) as usize;
+        if matches!(t.slots.get(i), Some(Slot::Live(_))) {
+            let next = t.free;
+            let gone = core::mem::replace(&mut t.slots[i], Slot::Free(next));
+            t.free = id as u32;
+            drop(t);
+            drop(gone);
+        }
+    }
+
+    fn get_in(ids: &SpinLock<Table>, id: u64) -> Option<Arc<Cache>> {
+        let t = ids.try_lock()?;
+        match t.slots.get(id.checked_sub(1)? as usize)? {
+            Slot::Live(w) => w.upgrade(),
+            Slot::Free(_) => None,
+        }
+    }
+
+    /// Ids freed (under a spin lock, as a cache's drop may be) come back newest first, a freed id names nothing,
+    /// a twice-freed one is not chained twice, and the table only grows when no slot is free.
+    #[test]
+    fn freed_ids_are_chained_and_reused() {
+        let t = SpinLock::named("vfs.test.ids", Table::new());
+        let held = SpinLock::named("vfs.test.ids.held", ());
+        // tmpfs caches: never registered globally, so this table is the only one naming them.
+        let files: Vec<crate::pagecache::PageCache> = (0..64).map(|_| crate::pagecache::PageCache::tmpfs(Arc::new(crate::pool::Pool::new("ids")))).collect();
+        let caches: Vec<Arc<Cache>> = files.iter().map(|f| f.inner_arc().clone()).collect();
+        let ids: Vec<u64> = caches.iter().map(|c| add_in(&t, c)).collect();
+        assert_eq!(ids, (1..=64).collect::<Vec<u64>>());
+        for (c, &id) in caches.iter().zip(&ids) {
+            assert!(get_in(&t, id).is_some_and(|g| Arc::ptr_eq(&g, c)), "id {id} names its cache");
+        }
+        {
+            let _g = held.lock();
+            ids[..32].iter().for_each(|&id| remove_in(&t, id));
+        }
+        remove_in(&t, ids[0]);
+        assert!(ids[..32].iter().all(|&id| get_in(&t, id).is_none()), "a freed id names no cache");
+        let again: Vec<u64> = caches[..33].iter().map(|c| add_in(&t, c)).collect();
+        assert_eq!(&again[..32], &(1..=32).rev().collect::<Vec<u64>>()[..], "newest first, each once");
+        assert_eq!(again[32], 65, "a new slot only when none is free");
+        assert_eq!(t.lock().slots.len(), 65);
     }
 }
-
 
 /// A cache got its first unused preloaded page (`fill_as`, under its lock).
 pub(crate) fn note_preloaded(c: &Arc<Cache>) {
@@ -570,8 +737,9 @@ static DROP_QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// devices' own): the clean pages nobody else holds leave every block file system cache and every block device
 /// cache (ext4's metadata under `CachedDiskDev`, `block::bdev::DiskFile`), all of them listed in the reclaim
 /// ring; dirty, mapped and held pages stay (`invalidate_clean`), tmpfs is never listed. Bit 2 (`drop_slab`): the
-/// kernel heap's magazines and empty slabs go back (`mm_core::HEAP.shrink`; V2's dentries and inodes are no
-/// LRU cache, they live while used, so there is nothing more to shrink). Bit 4 only quiets the event from then on,
+/// kernel heap's magazines and empty slabs go back (`mm_core::HEAP.shrink`), after the file systems gave back
+/// what they can make again (`meta_shrink`: ext4's directory indexes; V2's dentries and inodes are no LRU
+/// cache, they live while used). Bit 4 only quiets the event from then on,
 /// as Linux's `stfu`. Thread context with no lock held: it takes each cache's data lock in turn.
 pub fn drop_caches(what: u64, by: &str, pid: u64) -> Invalidated {
     let mut out = Invalidated::default();
@@ -582,6 +750,7 @@ pub fn drop_caches(what: u64, by: &str, pid: u64) -> Invalidated {
         DROP_PAGECACHE.inc();
     }
     if what & 2 != 0 {
+        crate::meta_shrink::run(crate::meta_shrink::Level::All);
         mm_core::HEAP.shrink();
         DROP_SLAB.inc();
     }
@@ -602,6 +771,11 @@ pub fn drop_caches_done() -> u64 {
 /// Reclaims up to `want` pages from every block file system cache (see the module docs), counted.
 pub fn shrink(want: u64, mode: Mode, thorough: bool) -> Outcome {
     let o = GLOBAL.shrink(want, mode, thorough);
+    // BIGDIR: memory the file systems can make again (directory indexes). Only from the background thread: the
+    // allocator's own slow path may hold any lock.
+    if mode == Mode::Background {
+        crate::meta_shrink::run(if thorough { crate::meta_shrink::Level::Hard } else { crate::meta_shrink::Level::Idle });
+    }
     let (calls, pages) = match mode {
         Mode::Direct => (&DIRECT_CALLS, &DIRECT_PAGES),
         Mode::Background => (&BACKGROUND_CALLS, &BACKGROUND_PAGES),
@@ -623,6 +797,10 @@ pub fn shrink(want: u64, mode: Mode, thorough: bool) -> Outcome {
 pub struct Stats {
     pub pages: u64,
     pub preloaded_pages: u64,
+    /// Of `pages`, those taken by their frame (`reclaim_frame`: a block cleared by position, in no order), and
+    /// the never-used preloaded ones among them (not part of `preloaded_pages`, which is `shrink`'s).
+    pub frame_pages: u64,
+    pub frame_preloaded_pages: u64,
     pub scanned: u64,
     pub direct_calls: u64,
     pub direct_pages: u64,
@@ -639,6 +817,8 @@ pub fn stats() -> Stats {
     Stats {
         pages: PAGES.get(),
         preloaded_pages: PRELOADED_PAGES.get(),
+        frame_pages: FRAME_PAGES.get(),
+        frame_preloaded_pages: FRAME_PRELOADED_PAGES.get(),
         scanned: SCANNED.get(),
         direct_calls: DIRECT_CALLS.get(),
         direct_pages: DIRECT_PAGES.get(),

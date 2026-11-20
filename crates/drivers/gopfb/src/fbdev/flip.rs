@@ -1,7 +1,8 @@
 //! GX-3 (written by lane GX; the GX-3 brief grants gopfb's fbdev): page flips of a display engine as fbdev and
 //! the live GopFb use them. amdgpu implements `ScanoutFlip` (`amdgpu::scanout`) and installs it from an
-//! initcall; gopfb does not depend on amdgpu. Without an installed or ready engine (QEMU, a refused attach, a
-//! late flip) everything stays on the copy path into the GOP framebuffer.
+//! initcall; gopfb does not depend on amdgpu. Without an installed or ready engine (QEMU, a refused attach: no GPU,
+//! the text console's picture) everything goes into the GOP framebuffer. With one, frames reach the screen only by
+//! flips: a late flip drops its frame, the next one flips again (no copy stands in).
 //!
 //! Two buffers: A0 (the GOP framebuffer) and A1. Every present of the live GopFb (console, kernel pointer, panic)
 //! goes to the buffer that is shown (`present_shown`); fbdev's frames go to the hidden one (`begin` .. `commit`) and are
@@ -16,10 +17,10 @@ use ksync::OnceRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlipError {
-    /// No engine flips (not installed, not attached, or fell back to one image).
+    /// No engine flips (not installed, not attached).
     Off,
-    /// The last flip did not land within its time: the engine fell back to A0 and one image; the next present
-    /// must be whole (A0 lacks the frames that went to A1).
+    /// The last flip did not land within its time, or this one could not be ordered: the frame is dropped (the
+    /// engine gave the late flip up, the next frame flips again).
     Late,
     /// Another frame is being prepared.
     Busy,
@@ -67,11 +68,6 @@ pub trait ScanoutFlip: Send + Sync {
     fn ready(&self) -> bool;
     /// Any context, lock-free, never attaches: the engine flips now.
     fn active(&self) -> bool;
-    /// Any context, lock-free: the live GopFb's presents go through `present_shown` (while flipping, and while
-    /// the engine is not sure which buffer shows after a failed fall-back).
-    fn redirects(&self) -> bool {
-        self.active()
-    }
     /// Any context (panic included), lock-free: presents the rectangle `(x, y, w, h)` of the full frame `src` into
     /// the buffer shown now (what `DisplayDevice::present` does on the live GopFb while the engine flips).
     fn present_shown(&self, src: &[u32], stride: u32, rect: (u32, u32, u32, u32)) -> Result<Fence, DevError>;
@@ -82,13 +78,10 @@ pub trait ScanoutFlip: Send + Sync {
     fn begin(&self, src: &[u32], stride: u32) -> Result<&dyn DisplayDevice, FlipError>;
     /// Orders the flip to the buffer `begin` prepared; returns its sequence number (1, 2, ...).
     fn commit(&self) -> Result<u64, FlipError>;
-    /// Sleeps until flip `seq` landed (at most the per-surface timeout; Late: it fell back).
+    /// Sleeps until flip `seq` landed (at most the per-surface timeout; Late: it was given up).
     fn wait(&self, seq: u64) -> Result<(), FlipError>;
     /// The engine's vblank (None while it does not flip).
     fn vblank(&self) -> Option<Vblank>;
-    /// Thread context, at a rare state change (fbdev's take of the screen): after a late flip, flipping starts
-    /// again if the engine shows A0 settled (V1 kept one image until the next start; V2 re-arms per surface).
-    fn rearm(&self);
     /// WY-17, thread context: scanout buffer `window` (0 = A0, 1 = A1), when the engine flips and the buffer can be
     /// handed out (None: fbdev's own windows go out instead).
     fn direct_buffer(&self, _window: usize) -> Option<DirectBuffer> {
@@ -104,9 +97,14 @@ pub trait ScanoutFlip: Send + Sync {
     fn direct_flip(&self, _window: usize) -> Result<u64, FlipError> {
         Err(FlipError::Off)
     }
-    /// WY-17, thread context: the buffer shown now into `dst` (`stride` pixels per line, the visible size), for MCP
-    /// `screen` while no copy of the picture exists. False: it cannot be read.
-    fn read_shown(&self, _dst: &mut [u32], _stride: u32) -> bool {
+    /// SHOT, any context, lock-free: the scanout buffer shown now (the last one ordered), None while it does not flip.
+    /// SeqCst against the store of a new order, so fbdev's hold of a buffer and the holder's next BEGIN see each other.
+    fn shown(&self) -> Option<usize> {
+        None
+    }
+    /// SHOT, thread context: rectangle `(x, y, w, h)` of scanout buffer `window` into `dst` (`w * h` pixels row by
+    /// row), for MCP `screen` while no copy of the picture exists. False: it cannot be read.
+    fn read_window(&self, _window: usize, _rect: (u32, u32, u32, u32), _dst: &mut [u32]) -> bool {
         false
     }
     /// GX-5a, any context, lock-free: a hardware cursor is there (default: none, the compositor draws its own).
@@ -152,7 +150,7 @@ pub fn active() -> Option<&'static dyn ScanoutFlip> {
 
 /// The live GopFb's redirect: Some(result) when the engine flips (the present went to the buffer shown).
 pub fn present_shown(src: &[u32], stride: u32, rect: (u32, u32, u32, u32)) -> Option<Result<Fence, DevError>> {
-    get().filter(|f| f.redirects()).map(|f| f.present_shown(src, stride, rect))
+    get().filter(|f| f.active()).map(|f| f.present_shown(src, stride, rect))
 }
 
 /// What became of one fb0 frame.
@@ -160,14 +158,19 @@ pub fn present_shown(src: &[u32], stride: u32, rect: (u32, u32, u32, u32)) -> Op
 pub enum Shown {
     /// Into the hidden buffer, flip `seq` ordered.
     Flipped(u64),
-    /// The caller copies it to the screen; `whole`: the whole frame (the shown buffer lacks frames that went to
-    /// the other one, or this frame's damage went into a buffer that is not flipped in).
+    /// The caller copies it to the screen; `whole`: the whole frame (no engine flips any more, and the GOP
+    /// framebuffer lacks the frames that went to the other buffer).
     Copy { whole: bool },
+    /// The engine flips, but this frame's flip was not ordered (the last flip was late, or the order failed):
+    /// nothing reached the screen and nothing is copied. What the frame still owes the screen stays in it (a
+    /// failed `begin` took none of its damage; what went into the hidden buffer is repaired from the frame by the
+    /// next `begin`), so the next frame carries it.
+    Dropped,
 }
 
 /// One fb0 frame `fr` through the engine `f` (None: none flips): `begin` with `src(fr)` (the full frame and its
 /// stride), `into` presents the damage through the hidden buffer's device, `commit`. `flipping` remembers that frames went to the hidden buffer, so the first
-/// copy after flipping stopped (a late flip, a fall-back) is whole.
+/// copy after the engine went away is whole.
 pub fn frame<T: ?Sized>(
     f: Option<&dyn ScanoutFlip>,
     flipping: &AtomicBool,
@@ -187,23 +190,25 @@ pub fn frame<T: ?Sized>(
                     flipping.store(true, Ordering::Release);
                     Shown::Flipped(seq)
                 }
-                Err(_) => {
+                Err(FlipError::Off) => {
                     flipping.store(false, Ordering::Release);
                     Shown::Copy { whole: true }
                 }
+                Err(_) => Shown::Dropped,
             }
         }
         // Another frame is being prepared (a program and the kernel at once): copy into the shown buffer.
         Err(FlipError::Busy) => Shown::Copy { whole: false },
-        Err(_) => {
+        Err(FlipError::Late) => Shown::Dropped,
+        Err(FlipError::Off) => {
             flipping.store(false, Ordering::Release);
             Shown::Copy { whole: true }
         }
     }
 }
 
-/// FBIOPAN_DISPLAY's end: flip `seq` (0 = none) landed or fell back; the pan succeeds either way (the fall-back
-/// copies the next frame whole, `frame`).
+/// FBIOPAN_DISPLAY's end: flip `seq` (0 = none) landed or was given up; the pan succeeds either way (a given-up
+/// flip's frame is dropped, the next one flips).
 pub fn landed(f: Option<&dyn ScanoutFlip>, seq: u64) {
     if seq != 0
         && let Some(f) = f
@@ -344,9 +349,6 @@ mod tests {
                 refresh_mhz: 60_000,
             })
         }
-        fn rearm(&self) {
-            self.note("rearm");
-        }
     }
 
     fn run(f: &Fake, flipping: &AtomicBool) -> Shown {
@@ -372,25 +374,26 @@ mod tests {
     }
 
     #[test]
-    fn errors_fall_back_to_a_whole_copy() {
+    fn a_late_flip_drops_the_frame_and_no_engine_copies_whole() {
         let f = Fake::new();
         let on = AtomicBool::new(false);
-        // A late flip (begin waited for the last one): copy, whole.
+        // A late flip (begin waited for the last one): dropped, nothing copied, no commit.
         assert_eq!(run(&f, &on), Shown::Flipped(1));
         *f.begin.lock() = Err(FlipError::Late);
-        assert_eq!(run(&f, &on), Shown::Copy { whole: true });
+        assert_eq!(run(&f, &on), Shown::Dropped);
         assert_eq!(f.calls(), ["begin", "into", "commit", "begin"], "no commit after a failed begin");
-        // A commit that fails: the damage went into a buffer not flipped in.
+        assert!(on.load(Ordering::Acquire), "the engine still flips");
+        // A commit that fails: the damage went into the hidden buffer, which the next begin repairs: dropped too.
         *f.begin.lock() = Ok(());
         *f.commit.lock() = Err(FlipError::Late);
-        assert_eq!(run(&f, &on), Shown::Copy { whole: true });
+        assert_eq!(run(&f, &on), Shown::Dropped);
         // Busy: copy only the damage into the shown buffer, flipping stays as it was.
         *f.commit.lock() = Ok(2);
         assert_eq!(run(&f, &on), Shown::Flipped(2));
         *f.begin.lock() = Err(FlipError::Busy);
         assert_eq!(run(&f, &on), Shown::Copy { whole: false });
         assert!(on.load(Ordering::Acquire));
-        // The wait times out (the engine fell back): the pan still ends, and once the engine no longer flips the
+        // The wait times out (the flip was given up): the pan still ends. Once no engine flips (it went away), the
         // first copy is whole, the next ones are not.
         *f.wait.lock() = Err(FlipError::Late);
         landed(Some(&f), 2);
@@ -398,6 +401,11 @@ mod tests {
         let none = frame(None, &on, px, |p| (p, 4), |_, _| panic!("no device without an engine"));
         assert_eq!(none, Shown::Copy { whole: true });
         assert_eq!(frame(None, &on, px, |p| (p, 4), |_, _| {}), Shown::Copy { whole: false });
+        // An engine that says Off copies whole once as well.
+        on.store(true, Ordering::Release);
+        *f.begin.lock() = Err(FlipError::Off);
+        assert_eq!(run(&f, &on), Shown::Copy { whole: true });
+        assert!(!on.load(Ordering::Acquire));
     }
 
     #[test]

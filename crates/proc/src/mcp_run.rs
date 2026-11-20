@@ -16,6 +16,7 @@
 
 mod caller;
 mod ktests;
+pub(crate) mod local;
 pub(crate) mod progs;
 #[cfg(bitsos_fd_measure)]
 mod prof;
@@ -455,8 +456,7 @@ pub(crate) fn room_for_a_job(available: u64, total: u64, running: usize) -> Resu
 /// pinned to that CPU preempts it: the reschedule IPI is that interrupt. The CPU is read anew on every nudge:
 /// a nudge that lands on a CPU the thread just left is harmless and the next one (200 ms later) follows it; a
 /// thread still in user mode can only have moved by being preempted, which delivered the kill anyway.
-/// Runs at most 5 times a second per killed job that has not ended. A stop-gap until `Process::kill` interrupts the thread's CPU itself (change request 1
-/// in plan/notes/mc-MC-5a.md).
+/// Runs at most 5 times a second per killed job that has not ended. A stop-gap until `Process::kill` interrupts the thread's CPU itself.
 fn nudge(pid: u32, tid: u64) {
     let Some(t) = sched::thread_stat(tid) else {
         klog::event!(Debug, "proc", "run.nudge_no_thread", pid = pid, thread = tid; "its thread is not in the table any more (on its way out)");
@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn policy_is_asked_before_anything_starts() {
         policy::set_engine(&DENY);
-        let denied = policy::Subject { program: DENIED, pid: 9, uid: 1000 };
+        let denied = policy::Subject { program: DENIED, pid: 9, uid: 1000, tree: 0 };
         let ctx = ToolContext { caller: denied, deadline_ns: u64::MAX };
         // A file: reading its path is asked. Refused (not Failed): nothing was looked up or spawned, since on
         // the host a spawn would fail with "Failed".
@@ -875,7 +875,7 @@ mod tests {
         assert!(matches!(run(&ctx, &Json::parse("{}").unwrap()), Err(ToolError::BadArgument(_))));
         let r = parse(&Json::parse(r#"{"path":"hello"}"#).unwrap()).unwrap();
         assert_eq!(admit(&policy::Subject::KERNEL, &r), Ok(()));
-        assert_eq!(admit(&policy::Subject { program: ProgramId(7), pid: 9, uid: 1000 }, &r), Ok(()));
+        assert_eq!(admit(&policy::Subject { program: ProgramId(7), pid: 9, uid: 1000, tree: 0 }, &r), Ok(()));
     }
 
     #[test]

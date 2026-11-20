@@ -89,6 +89,10 @@ fn answer(r: &Report, dry: bool) -> String {
         i.entries,
         if dry { "" } else { "; both read back from the stick and equal" }
     ));
+    match r.version {
+        Some(v) => t.push_str(&format!("\nversion {v} (the slot is named by it)")),
+        None => t.push_str("\nversion: none (a development build; the slot got the next free number)"),
+    }
     if let Some(old) = p.replaced {
         t.push_str(&format!("\nreplaced: the unconfirmed generation {old} {}", if dry { "would be removed" } else { "was removed" }));
     }

@@ -87,7 +87,7 @@ pub fn draw(look: &Look, t: &Theme) -> Canvas {
     let frame = b(f);
     let rad = if look.maximised { 0.0 } else { v(t.radius as f32) };
     if look.focused {
-        c.glow(frame, rad, if t.effects_gpu { 6 } else { 2 }, t.glow);
+        c.glow(frame, rad, 6, t.glow);
     }
     c.rrect(frame, rad, t.panel2);
     c.rrect_line(frame, rad, v(1.0).max(1.0), if look.focused { t.accent } else { t.line });
@@ -152,8 +152,9 @@ pub fn draw(look: &Look, t: &Theme) -> Canvas {
     }
     let glyph = if look.floating { Glyph::Tile } else { Glyph::Float };
     let max = look.floating.then(|| (Part::Max, if look.maximised { Glyph::Restore } else { Glyph::Maximise }, zones::max_button(f, t)));
+    let min = (Part::Minimize, Glyph::Minimize, zones::min_button(f, look.floating, t));
     for (part, g, r) in
-        [(Part::Float, glyph, zones::float_button(f, t)), (Part::Close, Glyph::Close, zones::close_button(f, t))].into_iter().chain(max)
+        [(Part::Float, glyph, zones::float_button(f, t)), (Part::Close, Glyph::Close, zones::close_button(f, t))].into_iter().chain(max).chain([min])
     {
         let bb = b(r);
         let on = hovered(part);

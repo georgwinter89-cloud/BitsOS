@@ -1,0 +1,23 @@
+[package]
+name = "rtl8126"
+version = "0.1.0"
+edition = "2024"
+description = "Realtek RTL8126A 5 GbE, the Gaming-PC's cable card (owner: NW)"
+publish = false
+
+[dependencies]
+devmodel = { path = "../../devmodel" }
+pci = { path = "../../pci" }
+ksync = { path = "../../ksync" }
+klog = { path = "../../klog" }
+kreg = { path = "../../kreg" }
+mm = { path = "../../mm" }
+hal = { path = "../../hal" }
+time = { path = "../../time" }
+sched = { path = "../../sched" }
+net = { path = "../../net" }
+vfs = { path = "../../vfs" }
+ktest = { path = "../../ktest" }
+
+[lints]
+workspace = true

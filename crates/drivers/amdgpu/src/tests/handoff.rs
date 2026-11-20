@@ -175,3 +175,68 @@ fn own_note_and_traces_before_the_linux_signs() {
     // A note that no longer matches (something wrote the ring since) is no word of BitsOS: Linux's sign again.
     assert_eq!(cls(&mut f, Some(&StopNote { wptr: 0x20, ..n }), Own::default()).start, Start::AfterLinux);
 }
+
+/// GPY (desk 15.11.): after a cold start BitsOS's own boot bring-up turns on the IH ring, the doorbell aperture and
+/// GART and keeps its PSP run; gx_probe said "after Linux" (IH ring on). The kernel's own word (`ThisBoot`) tells
+/// that from a Linux before; without it the same registers, and Linux's real leftovers, still read as Linux's.
+#[test]
+fn this_boots_own_bring_up_is_no_linux_sign_and_linux_still_is() {
+    use crate::gpucore::classify::{Own, ThisBoot};
+    let d = discovery_780m();
+    let at = |n: &str| classify::addresses(&d).into_iter().find(|(x, _)| *x == n).and_then(|(_, b)| b).unwrap_or_else(|| panic!("{n} not read"));
+    // This boot: its PSP ring kept (frames written, TMR held), then the backend's IH ring, NBIO's aperture, GART.
+    let mut f = FakeGpu::new(Hostile::None);
+    f.start_as(&d, StartAs::AfterCrash(Crash::RingLeft));
+    for (n, v) in [("IH_RB_CNTL", 0x4033_0121), ("RCC_DOORBELL_APER_EN", 1), ("MMVM_CONTEXT0_CNTL", 0x01ff_fe01)] {
+        assert!(f.reg_write(at(n), v), "{n}");
+        assert_eq!(f.reg_read(at(n)), Some(v), "{n}");
+    }
+    let cls = |f: &mut FakeGpu, own: Own, this: ThisBoot| classify::classify_boot(&d, &mut |b| f.reg_read(b), None, own, this);
+    let ours = ThisBoot { run: true, ih_ring: true, gart: true };
+    let st = cls(&mut f, Own { doorbell_aperture: true }, ours);
+    assert_eq!(st.start, Start::ThisBoot, "{:?}", st.why);
+    assert_eq!(st.start.name(), "brought up by BitsOS itself in this boot (its own run holds the GPU)");
+    for s in ["IH ring on: turned on by this boot's bring-up", "doorbell aperture on: turned on", "GART (MMHUB VMID 0) on: turned on"] {
+        assert!(st.why.iter().any(|w| w.starts_with(s)), "{s}: {:?}", st.why);
+    }
+    assert!(admit(st.start).is_err(), "no fresh run over this boot's own");
+    // Without the kernel's word the same registers are Linux's, as before (gx_probe's old answer).
+    let st = cls(&mut f, Own::default(), ThisBoot::default());
+    assert_eq!(st.start, Start::AfterLinux, "{:?}", st.why);
+    assert!(st.why.iter().any(|w| w.starts_with("IH ring on: Linux's amdgpu sets it")), "{:?}", st.why);
+    // A run no longer kept, the IH ring and GART still this boot's: no Linux sign (the KM ring without a note is
+    // still unclean, as with the aperture's trace).
+    let st = cls(&mut f, Own { doorbell_aperture: true }, ThisBoot { run: false, ..ours });
+    assert_eq!(st.start, Start::AfterCrash, "{:?}", st.why);
+    assert!(st.why.iter().any(|w| w.starts_with("IH ring on: this boot's bring-up turned it on")), "{:?}", st.why);
+    // Only GART is this boot's: the IH ring a Linux left still says Linux.
+    let st = cls(&mut f, Own { doorbell_aperture: true }, ThisBoot { run: false, ih_ring: false, gart: true });
+    assert_eq!(st.start, Start::AfterLinux, "{:?}", st.why);
+    assert!(st.why.iter().any(|w| w.starts_with("IH ring on: Linux's")) && !st.why.iter().any(|w| w.starts_with("GART (MMHUB VMID 0) on: Linux's")), "{:?}", st.why);
+    // A real Linux before (the capture's leftovers) and no run of this boot: after Linux.
+    let mut l = FakeGpu::new(Hostile::None);
+    l.start_as(&d, StartAs::AfterLinux);
+    let st = classify::classify_boot(&d, &mut |b| l.reg_read(b), None, Own::default(), ThisBoot::default());
+    assert_eq!(st.start, Start::AfterLinux, "{:?}", st.why);
+    // A cold start without any run: cold, whatever the (empty) traces say.
+    let mut c = FakeGpu::new(Hostile::None);
+    c.start_as(&d, StartAs::Cold);
+    assert_eq!(classify::classify_boot(&d, &mut |b| c.reg_read(b), None, Own::default(), ThisBoot { run: false, ih_ring: true, gart: true }).start, Start::Cold);
+}
+
+/// GPY (checker): every GPU job of the running desktop holds the PSP run's lock for its submit; a probe landing then
+/// must still see this boot's run and IH ring (it read "no run" and said "after a crash" when it took the lock's state).
+#[test]
+fn this_boot_is_seen_while_a_job_holds_the_run_lock() {
+    use crate::gpucore::classify::ThisBoot;
+    let dv = crate::psplive::State::new();
+    assert_eq!(crate::psplive::this_boot(&dv), ThisBoot::default(), "nothing of this boot yet");
+    crate::psplive::mark_this_boot(&dv, true, true);
+    let seen = crate::psplive::with_live_held(&dv, |held| {
+        assert!(held, "the test holds the run lock as a job does");
+        crate::psplive::this_boot(&dv)
+    });
+    assert_eq!(seen, ThisBoot { run: true, ih_ring: true, gart: false });
+    crate::psplive::mark_this_boot(&dv, false, false);
+    assert_eq!(crate::psplive::this_boot(&dv), ThisBoot::default(), "a stop clears both");
+}

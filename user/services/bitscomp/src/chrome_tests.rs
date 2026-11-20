@@ -187,3 +187,43 @@ fn minimised_windows_are_listed_above_the_start_link_and_hit() {
     assert!(!many.min_items.is_empty() && many.min_items.len() < 500);
     assert_eq!(many.ws_shown(), 1);
 }
+
+#[test]
+fn classic_has_plus_n_and_a_list_when_not_every_minimised_window_fits() {
+    let t = theme(&[]);
+    let mid = |r: Rect| ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
+    for size in [(1280, 800), (2048, 1152), (1920, 1080)] {
+        let fit = layout(&t, &Inputs { minimized: 1, ..inputs(size, 1) });
+        assert!(fit.min_more.is_none() && fit.min_list.is_empty(), "{size:?}: one fits");
+        let c = layout(&t, &Inputs { minimized: 40, ..inputs(size, 1) });
+        let more = c.min_more.expect("+N");
+        assert!(!c.min_items.is_empty() && c.min_items.len() < 40, "{size:?}");
+        assert!(c.min_items.iter().all(|r| r.y + r.h <= more.y), "{size:?}: the entries above +N");
+        assert!(more.y + more.h <= c.home.y && more.y >= c.min_title.y + c.min_title.h, "{size:?}: +N above Startseite");
+        assert_eq!(c.hit(mid(more).0, mid(more).1), Some(Part::MinMore), "{size:?}");
+        assert_eq!(c.ws_shown(), 1, "{size:?}: the workspace entry stays");
+        assert_eq!(c.min_list.len(), 40);
+        let shown: Vec<Rect> = c.min_list.iter().copied().filter(|r| r.w > 0).collect();
+        assert!(shown.len() >= 10, "{size:?}: most are in the list");
+        for w in shown.windows(2) {
+            assert!(apart(w[0], w[1]) && w[0].y < w[1].y, "{size:?}: oldest at the top");
+        }
+        let last = *shown.last().unwrap();
+        assert_eq!(last.y + last.h, more.y + more.h, "{size:?}: the list ends at +N's foot");
+        assert!(shown.iter().all(|r| r.x == c.list.x + c.list.w + 8 && r.y >= c.list.y && r.x + r.w <= size.0), "{size:?}");
+        // The x of an entry hits before the entry, the entry's middle is still the entry.
+        for (i, (r, x)) in c.min_items.iter().zip(&c.min_close).enumerate() {
+            assert!(inside(*x, *r), "{size:?}");
+            assert_eq!(c.hit(mid(*x).0, mid(*x).1), Some(Part::MinClose(i)));
+            assert_eq!(c.hit(mid(*r).0, mid(*r).1), Some(Part::Min(i)));
+        }
+        for (r, x) in c.min_list.iter().zip(&c.min_list_close).filter(|(r, _)| r.w > 0) {
+            assert!(inside(*x, *r), "{size:?}");
+        }
+    }
+    // With room for a single line only, "+N" alone stands for all of them.
+    let one = layout(&t, &Inputs { minimized: 3, ..inputs((1280, 400), 1) });
+    if one.min_more.is_some() {
+        assert!(one.min_items.is_empty() && one.min_list.len() == 3);
+    }
+}

@@ -25,6 +25,7 @@ pub mod check;
 pub mod fbdev;
 mod ktests;
 pub mod layout;
+pub mod reach;
 mod scene;
 pub mod setup;
 pub mod target;
@@ -142,6 +143,14 @@ impl GopFb {
     /// From the BootInfo framebuffer record; None (with an event) if there is no usable linear framebuffer.
     /// Maps the framebuffer WC through the vmap; may wait for the vmap mutex (boot thread only).
     pub fn from_bootinfo(fb: &Framebuffer) -> Option<Self> {
+        Self::from_bootinfo_within(fb, reach::cpu_limit())
+    }
+
+    /// `from_bootinfo` for a CPU whose physical addresses end at `phys_limit` (B9: a framebuffer past it is
+    /// refused with a line before anything is mapped; a mapping there would fault at the first pixel).
+    pub fn from_bootinfo_within(fb: &Framebuffer, phys_limit: u64) -> Option<Self> {
+        // The format first: a record without a framebuffer (bitsboot writes format None with address 0 for a
+        // screen it cannot draw on) keeps the line it always had, on every machine.
         let layout = match Layout::from_bootinfo(fb) {
             Ok(l) => l,
             Err(e) => {
@@ -150,6 +159,13 @@ impl GopFb {
                 return None;
             }
         };
+        // An empty range is not this check's case: the mapping and the geometry check below refuse it with the
+        // lines they always had.
+        if let Err(e @ (reach::Unreachable::Wraps | reach::Unreachable::PastCpu { .. })) = reach::reachable(fb.phys, fb.size, phys_limit) {
+            klog::event!(Error, "gopfb", "range.refused", phys = klog::Hex(fb.phys), size = fb.size, limit = klog::Hex(phys_limit), error = alloc::format!("{e:?}");
+                "the picture's memory cannot be reached by this CPU: no picture, the kernel runs headless (serial + MCP)");
+            return None;
+        }
         let (target, via): (Arc<dyn FbTarget>, &'static str) = match hal::drv_dp::FbWindow::map_wc(fb.phys, fb.size) {
             Ok(w) => (Arc::new(w), "vmap"),
             Err(e) => match hal::mmio::framebuffer(fb) {
@@ -368,6 +384,47 @@ impl DisplayDevice for GopFb {
 #[cfg(test)]
 mod visible_tests {
     use super::*;
+
+    fn record(phys: u64) -> Framebuffer {
+        let size = 2560 * 1440 * 4;
+        Framebuffer { phys, virt: bootinfo::layout::VMAP_BASE, size, width: 2560, height: 1440, stride: 2560, format: bootinfo::PixelFormat::Bgrx, masks: [0; 4], mode_index: 0 }
+    }
+
+    /// B9: a made-up framebuffer past the CPU's address bits is refused with its own line before any mapping is
+    /// tried; one inside them goes on to the mapping (which no host has, so that ends in `map.failed`).
+    #[test]
+    fn a_framebuffer_past_the_cpus_address_bits_is_refused_with_a_line() {
+        // Other tests of this crate log too: only the lines about this test's two made-up addresses count.
+        let events = |seq: u64, phys: &str| -> alloc::vec::Vec<alloc::string::String> {
+            klog::read_since(seq, usize::MAX).into_iter().filter(|r| r.subsystem == "gopfb" && r.text.contains(phys)).map(|r| alloc::string::String::from(r.name)).collect()
+        };
+        let seq = klog::next_seq();
+        assert!(GopFb::from_bootinfo_within(&record(0xa0_1234_5000), 1 << 39).is_none());
+        assert_eq!(events(seq, "phys=0xa012345000"), ["range.refused"], "refused before the mapping was tried");
+        assert!(GopFb::from_bootinfo_within(&record(0xa0_6789_a000), 1 << 46).is_none(), "no window on a host");
+        assert_eq!(events(seq, "phys=0xa06789a000"), ["map.failed"], "inside the CPU's bits the range check lets it through");
+    }
+
+    /// A hand-over without a framebuffer (bitsboot: format None, address 0, 0 bytes, for a screen it cannot draw
+    /// on) is refused for its format, as before the range check existed: on the Mini-PC and in QEMU the log
+    /// names the same cause as ever, and never the CPU's reach.
+    #[test]
+    fn a_hand_over_without_a_framebuffer_keeps_its_format_line() {
+        let seq = klog::next_seq();
+        // The masks are this test's mark in the log (other tests of this crate log too).
+        let none = Framebuffer { phys: 0, virt: 0, size: 0, format: bootinfo::PixelFormat::None, masks: [0xabc1, 0, 0, 0], ..record(0) };
+        assert!(GopFb::from_bootinfo_within(&none, 1 << 48).is_none());
+        let log = klog::read_since(seq, usize::MAX);
+        let mine: alloc::vec::Vec<&str> = log.iter().filter(|r| r.subsystem == "gopfb" && r.text.contains("abc1")).map(|r| r.name).collect();
+        assert_eq!(mine, ["format.refused"]);
+        let line = &log.iter().find(|r| r.text.contains("abc1")).unwrap().text;
+        assert!(line.contains("NoFramebuffer"), "{line}");
+        // A real format with an empty range is not called unreachable either: it ends where it always did.
+        let empty = Framebuffer { phys: 0, virt: 0, size: 0, ..record(0) };
+        assert!(GopFb::from_bootinfo_within(&empty, 1 << 48).is_none());
+        let log = klog::read_since(seq, usize::MAX);
+        assert!(!log.iter().any(|r| r.subsystem == "gopfb" && r.name == "range.refused" && r.text.contains("size=0 ")), "an empty range was blamed on the CPU");
+    }
 
     /// GX-4 CR 1: a GopFb that shows a smaller part of its framebuffer reports it as its mode and refuses presents
     /// outside it (same stride, same target).

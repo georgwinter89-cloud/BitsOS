@@ -207,7 +207,7 @@ static void v6errors_part(void) {
 static void v6opts_part(void) {
     int t = socket(AF_INET6, SOCK_STREAM, 0), u = socket(AF_INET6, SOCK_DGRAM, 0), v4 = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
-    /* nplb's PosixSocketSetOptionsTest.TryThemAll on AF_INET6 (yt-YT-4a CR 3). */
+    /* nplb's PosixSocketSetOptionsTest.TryThemAll on AF_INET6 (YT-4a CR 3). */
     struct { int fd, level, name; const char *what; } nplb[] = {
         { t, SOL_SOCKET, SO_REUSEADDR, "tcp SO_REUSEADDR" }, { t, SOL_SOCKET, SO_RCVBUF, "tcp SO_RCVBUF" }, { t, SOL_SOCKET, SO_SNDBUF, "tcp SO_SNDBUF" },
         { t, SOL_SOCKET, SO_KEEPALIVE, "tcp SO_KEEPALIVE" }, { t, SOL_SOCKET, SO_BROADCAST, "tcp SO_BROADCAST" }, { t, IPPROTO_TCP, TCP_KEEPIDLE, "tcp TCP_KEEPIDLE" },

@@ -1,6 +1,6 @@
 //! GX-7k: the MES stage on the host. The ktests' checks (`ktests_mes`), Linux's MES start against the 27.10.
-//! capture (the fixture tests/data/linux-780m-mes-writes.txt, public; compared with the capture itself where
-//! plan/ is), and the register map against the generated tables.
+//! capture (the fixture tests/data/linux-780m-mes-writes.txt, public; compared with the capture itself,
+//! host/tests/gx/fixtures), and the register map against the generated tables.
 
 use super::regdiff::{capture, table_names};
 use crate::gpucore::fakechip::{self, StartAs};
@@ -81,10 +81,7 @@ fn fixture_text(linux: &[(u32, u32)], names: &super::regdiff::Names) -> String {
 
 #[test]
 fn mes_fixture_is_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED mes_fixture_is_the_capture: no capture (plan/ is not public); the fixture stands in");
-        return;
-    };
+    let t = capture();
     let want = fixture_text(&t.writes(false), &table_names());
     if std::env::var_os("GX_WRITE_FIXTURE").is_some() {
         std::fs::write(fixture_path(), &want).unwrap();
@@ -111,12 +108,11 @@ fn mes_phase_against_linux() {
             assert!(ph.linux == 29 && ph.matched == 29 && ph.diffs.is_empty(), "{until:?}: {}", regdiff::render(core::slice::from_ref(&ph)));
         }
     }
-    if let Some(t) = capture() {
-        let (out, ..) = k::mes_run(&d, 512 << 20, StartAs::Cold, Until::Mes, &|_| {}).unwrap();
-        let ours = mes::linux_sequence(out.mes.as_ref().unwrap(), &a);
-        let ph = regdiff::diff_phase(phase(), &t.writes(false), &ours, &names, &[]);
-        assert!(ph.diffs.is_empty() && ph.matched == 29, "{}", regdiff::render(core::slice::from_ref(&ph)));
-    }
+    let t = capture();
+    let (out, ..) = k::mes_run(&d, 512 << 20, StartAs::Cold, Until::Mes, &|_| {}).unwrap();
+    let ours = mes::linux_sequence(out.mes.as_ref().unwrap(), &a);
+    let ph = regdiff::diff_phase(phase(), &t.writes(false), &ours, &names, &[]);
+    assert!(ph.diffs.is_empty() && ph.matched == 29, "{}", regdiff::render(core::slice::from_ref(&ph)));
 }
 
 /// The tool's answer for until=mes and gfx_mes ends with the stage's verdict line; the W lines are the run's.

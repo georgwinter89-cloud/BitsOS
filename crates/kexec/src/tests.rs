@@ -796,7 +796,7 @@ fn reload_loss_counts_only_what_had_a_value_and_has_a_reader() {
     assert_eq!(missing(&blanked(b"wlan_psk=x\r\n"), b""), vec!["wlan_psk"]);
     assert!(!loss_blocks_reload(&[], true));
     assert!(loss_blocks_reload(&["wlan_psk"], true));
-    assert!(!loss_blocks_reload(&["wlan_psk"], false), "WLAN off: nothing to join");
+    assert!(!loss_blocks_reload(&["wlan_psk"], false), "no WLAN named: nothing to join");
     assert!(loss_blocks_reload(&["token"], false));
 }
 
@@ -847,4 +847,16 @@ fn reload_plan_lines_tell_the_truth_about_secrets() {
     assert_eq!(slow, "CONFIG: the boot copy (40 bytes, boot_copy_slow)");
     assert!(describe(&plan(Some(b"token=fake-t\n"), Outcome::Fresh), &r(false), 8).contains("does not fit the KEEP block"));
     assert!(describe(&plan(Some(b"token=fake-t\nx=1\n"), Outcome::Fresh), &r(true), 4096).contains("the stick's CONFIG.TXT (17 bytes, boot copy 40)"));
+}
+
+/// GP-GUARD: the kernel's imposed lines win over the record (the last one for a key counts; an empty value means the
+/// key is gone), and keys it did not impose fall through to the record.
+#[test]
+fn imposed_lines_answer_before_the_record() {
+    use crate::boot::imposed_value;
+    let lines = [("nvme_bind", "off"), ("nvme_data", ""), ("profile", "gaming-pc"), ("nvme_bind", "off")];
+    assert_eq!(imposed_value(&lines, "nvme_bind"), Some("off"));
+    assert_eq!(imposed_value(&lines, "nvme_data"), Some(""), "imposed away");
+    assert_eq!(imposed_value(&lines, "token"), None, "not imposed: the record answers");
+    assert_eq!(imposed_value(&[], "nvme_bind"), None, "nothing imposed on the Mini-PC");
 }

@@ -1,7 +1,7 @@
 //! `/dev/kmsg` (1:11; UL-2 change request 4, applied by INT-A1): a program's write becomes one klog event per
 //! line (subsystem `user`, name `kmsg`), so init's lines reach MCP `log` and the mirror on a machine without
-//! COM1. A leading `<n>` is the syslog priority as Linux's `devkmsg_emit` reads it (linux-6.6/kernel/printk/
-//! printk.c): its level part (n & 7) chooses the event level (0-3 Error, 4 Warn, 5-6 Info, 7 Debug); without
+//! COM1. A leading `<n>` is the syslog priority as Linux's `devkmsg_write` reads it (linux-7.3.1/kernel/printk/
+//! printk.c:739): its level part (n & 7) chooses the event level (0-3 Error, 4 Warn, 5-6 Info, 7 Debug); without
 //! it the line is Info. Reads answer end of file (V2 has no record reader on this node yet; the log is MCP's
 //! `log` tool). Lines are cut at 240 bytes per event, at most 1 KiB per write (Linux: LOG_LINE_MAX ~1 KiB).
 

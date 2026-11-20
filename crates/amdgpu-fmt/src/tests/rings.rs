@@ -27,7 +27,7 @@ fn pointer_forms() {
 
 #[test]
 fn commit_pads_to_alignment() {
-    for (kind, a) in [(SDMA, 16usize), (Kind::Sdma { burst_nop: false }, 16), (Kind::Gfx, 256)] {
+    for (kind, a) in [(SDMA, 16usize), (Kind::Sdma { burst_nop: false }, 16), (Kind::Gfx, 256), (Kind::Vcn, 64)] {
         let mut r = Ring::new(kind, 4096, 0).unwrap();
         let mut mem = vec![0xEEEE_EEEEu32; 4096];
         r.begin(5, 0).unwrap();
@@ -42,7 +42,7 @@ fn commit_pads_to_alignment() {
                 assert!(mem[4..a].iter().all(|&d| d == sdma::NOP));
                 assert_eq!(sdma::packet_len(&mem[3..]), Ok(a - 3));
             }
-            Kind::Sdma { .. } => assert!(mem[3..a].iter().all(|&d| d == 0)),
+            Kind::Sdma { .. } | Kind::Vcn => assert!(mem[3..a].iter().all(|&d| d == 0)),
         }
         assert_eq!(mem[a], 0xEEEE_EEEE);
     }
@@ -146,4 +146,44 @@ fn ib_padding() {
         i += sdma::packet_len(&big[i..]).unwrap();
     }
     assert_eq!(i, big.len());
+}
+
+/// L7 row 47: GFX and compute rings pad as `gfx_v11_ring_insert_nop` (linux-7.3.1 gfx_v11_0.c:566): one counted NOP
+/// over the whole pad (its body the filler), a pad of one is the filler alone; the decoder sees one packet.
+#[test]
+fn gfx_commit_pads_with_one_counted_nop() {
+    let mut out = Vec::new();
+    crate::ring::gfx_insert_nop(&mut out, 1);
+    assert_eq!(out, [pm4::PAD]);
+    for n in [2u64, 3, 255, 0x4000, 0x4001, 0x5000] {
+        out.clear();
+        crate::ring::gfx_insert_nop(&mut out, n);
+        assert_eq!(out.len() as u64, n);
+        let count = (n - 2).min(0x3ffe) as u32;
+        assert_eq!(out[0], pm4::packet3(pm4::op::NOP, count), "{n}");
+        assert!(out[1..].iter().all(|&d| d == pm4::PAD), "{n}");
+    }
+    let mut r = Ring::new(Kind::Gfx, 512, 0).unwrap().with_counted_nops();
+    let mut sink = vec![0u32; 512];
+    r.begin(4, 0).unwrap();
+    r.write(&[1, 2, 3, 4]).unwrap();
+    assert_eq!(r.commit(&mut sink[..]).unwrap(), 256);
+    assert_eq!(&sink[..5], &[1, 2, 3, 4, pm4::packet3(pm4::op::NOP, 250)]);
+    assert!(sink[5..256].iter().all(|&d| d == pm4::PAD));
+    // Without it (KIQ, MES): single NOPs, as before; SDMA ignores the switch.
+    let mut k = Ring::new(Kind::Gfx, 512, 0).unwrap();
+    k.begin(1, 0).unwrap();
+    k.write(&[9]).unwrap();
+    k.commit(&mut sink[..]).unwrap();
+    assert!(sink[1..256].iter().all(|&d| d == pm4::PAD));
+    let s = Ring::new(SDMA, 64, 0).unwrap().with_counted_nops();
+    let mut s2 = Ring::new(SDMA, 64, 0).unwrap();
+    let (mut a, mut b) = (vec![0u32; 64], vec![0u32; 64]);
+    for (ring, sink) in [(s, &mut a), (core::mem::replace(&mut s2, Ring::new(SDMA, 64, 0).unwrap()), &mut b)] {
+        let mut ring = ring;
+        ring.begin(1, 0).unwrap();
+        ring.write(&[7]).unwrap();
+        ring.commit(&mut sink[..]).unwrap();
+    }
+    assert_eq!(a, b);
 }

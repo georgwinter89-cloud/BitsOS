@@ -1,4 +1,4 @@
-//! Frame counters for the software path's cost (WY-0 measures what the Mini-PC will pay on the CPU).
+//! Frame counters: what each frame costs bitscomp on the CPU beside the GPU's work.
 
 use std::time::Duration;
 
@@ -70,5 +70,22 @@ impl Stats {
             self.acquire_pending,
             self.held_now,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stats;
+    use std::time::Duration;
+
+    /// bitsbench's nightly `desktop_frame` reads these keys of `ctl stats` (user/services/bitsbench/src/bench/desktop.rs).
+    #[test]
+    fn the_report_has_what_bitsbench_reads() {
+        let s = Stats { frames: 4, render: Duration::from_millis(10), present: Duration::from_millis(2), ..Default::default() };
+        let r = s.report();
+        let get = |k: &str| r.split_whitespace().find_map(|w| w.strip_prefix(k)?.strip_prefix('=')?.parse::<f64>().ok());
+        assert_eq!(get("frames"), Some(4.0));
+        assert_eq!(get("render_avg_ms"), Some(2.5));
+        assert_eq!(get("present_avg_ms"), Some(0.5));
     }
 }

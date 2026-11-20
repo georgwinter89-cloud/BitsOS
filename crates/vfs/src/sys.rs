@@ -402,7 +402,7 @@ pub(crate) fn write_from(s: &Sys<'_>, buf: u64, count: u64, mut wr: impl FnMut(u
 
 /// read on an open file: seekable files keep their position locked for the whole call and advance it only
 /// by what reached the program.
-pub(crate) fn file_read(s: &Sys<'_>, f: &OpenFile, buf: u64, count: u64) -> Result<i64, Errno> {
+pub(crate) fn file_read(s: &Sys<'_>, f: &Arc<OpenFile>, buf: u64, count: u64) -> Result<i64, Errno> {
     if !f.can_read() {
         return Err(EBADF);
     }
@@ -421,7 +421,8 @@ pub(crate) fn file_read(s: &Sys<'_>, f: &OpenFile, buf: u64, count: u64) -> Resu
         s.copy_out(buf, &b[..got])?;
         return Ok(got as i64);
     }
-    f.with_pos(|pos| {
+    // `fdget_pos`: the position is locked unless this call is the description's only user.
+    f.with_pos_as(f.alone(s.fds), |pos| {
         let start = *pos;
         let r = match f.file.read_cache() {
             Some(c) => crate::sys_page::read_cached(s, c, buf, count, start),
@@ -434,7 +435,7 @@ pub(crate) fn file_read(s: &Sys<'_>, f: &OpenFile, buf: u64, count: u64) -> Resu
     })
 }
 
-pub(crate) fn file_write(s: &Sys<'_>, f: &OpenFile, buf: u64, count: u64) -> Result<i64, Errno> {
+pub(crate) fn file_write(s: &Sys<'_>, f: &Arc<OpenFile>, buf: u64, count: u64) -> Result<i64, Errno> {
     if !f.can_write() {
         return Err(EBADF);
     }
@@ -454,7 +455,7 @@ pub(crate) fn file_write(s: &Sys<'_>, f: &OpenFile, buf: u64, count: u64) -> Res
     if let Some(p) = &f.path {
         p.dentry.sb.wait_thawed()?;
     }
-    f.with_pos(|pos| {
+    f.with_pos_as(f.alone(s.fds), |pos| {
         // FS-10: a sealed tmpfs file decides on the whole request (Linux writes it in one pass).
         let count = f.seal_clip(*pos, count)?;
         write_from(s, buf, count, |_, chunk| f.write_locked(pos, chunk))
@@ -534,7 +535,7 @@ pub fn pwrite64(s: &Sys<'_>, a: Args) -> i64 {
     })())
 }
 
-/// The iovec array (`import_iovec`, linux-6.6/lib/iov_iter.c): EINVAL above UIO_MAXIOV, EFAULT for the array,
+/// The iovec array (`import_iovec`, linux-7.3.1/lib/iov_iter.c:1436): EINVAL above UIO_MAXIOV, EFAULT for the array,
 /// EINVAL for a negative length (while copying, so before any address check), then EFAULT for a segment that
 /// fails `access_ok`; the total is clipped to MAX_RW_COUNT.
 pub(crate) fn iovecs(s: &Sys<'_>, iov: u64, cnt: u64) -> Result<Vec<(u64, u64)>, Errno> {
@@ -684,7 +685,7 @@ pub fn lseek(s: &Sys<'_>, a: Args) -> i64 {
         if whence > abi::SEEK_HOLE {
             return Err(EINVAL);
         }
-        f.seek(a[1] as i64, whence).map(|p| p as i64)
+        f.seek_as(f.alone(s.fds), a[1] as i64, whence).map(|p| p as i64)
     })())
 }
 
@@ -725,7 +726,7 @@ pub fn dup(s: &Sys<'_>, a: Args) -> i64 {
     ret(s.raw(a[0]).and_then(|f| s.fds.install_flags(f, 0, false)).map(|fd| fd as i64))
 }
 
-/// dup3 (`ksys_dup3`, linux-6.6/fs/file.c:1266): the new fd and the file it replaced, which the syscall glue
+/// dup3 (`ksys_dup3`, linux-7.3.1/fs/file.c:1423): the new fd and the file it replaced, which the syscall glue
 /// `filp_close`s (POSIX locks) and drops. The look-up of `old` and the install are one table step (`dup_to`).
 pub fn dup3_take(s: &Sys<'_>, old: u64, new: u64, flags: u64) -> Result<(i64, Option<Arc<OpenFile>>), Errno> {
     if flags & !abi::O_CLOEXEC != 0 {
@@ -800,11 +801,11 @@ const F_UNLCK: i16 = 2;
 
 static LOCKS_UNTRACKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// POSIX and OFD record locks (linux-6.6/fs/locks.c `fcntl_getlk`, `fcntl_setlk`, `flock64_to_posix_lock`,
-/// `check_fmode_for_setlk`), checked like Linux but not recorded yet: every lock is granted and F_GETLK always
-/// answers F_UNLCK. Within one process that is exactly Linux's answer (a process never conflicts with its own
-/// POSIX locks); between processes locks do not exclude each other until a lock table exists (open point in
-/// plan/notes/fs-FS-1.md).
+/// POSIX and OFD record locks (linux-7.3.1/fs/locks.c:2437 `fcntl_getlk`, :2565 `fcntl_setlk`, :510
+/// `flock64_to_posix_lock`, :2548 `check_fmode_for_setlk`), checked like Linux but not recorded yet: every lock is
+/// granted and F_GETLK always answers F_UNLCK. Within one process that is exactly Linux's answer (a process never
+/// conflicts with its own POSIX locks); between processes locks do not exclude each other until a lock table exists
+/// (open item in plan/notes/desk-offen.md, group G3).
 fn posix_lock(s: &Sys<'_>, f: &OpenFile, cmd: u64, arg: u64) -> Result<i64, Errno> {
     // struct flock (x86-64): l_type i16, l_whence i16, pad, l_start i64, l_len i64, l_pid i32, pad: 32 bytes.
     let mut fl = [0u8; 32];
@@ -948,7 +949,7 @@ fn do_access(s: &Sys<'_>, dirfd: u64, path: u64, mode: u64, flags: u64) -> Resul
         return Ok(0);
     }
     let m = &p.dentry.inode.meta;
-    // FS-13: X_OK of a regular file on a noexec mount (linux-6.6/fs/open.c:489), before the permission bits.
+    // FS-13: X_OK of a regular file on a noexec mount (linux-7.3.1/fs/open.c:494), before the permission bits.
     if mode as u32 & abi::X_OK != 0 && m.file_type() == uapi::S_IFREG && p.noexec() {
         return Err(EACCES);
     }
@@ -983,7 +984,7 @@ pub fn readlinkat_inner(s: &Sys<'_>, dirfd: u64, path: u64, buf: u64, size: u64)
         let base = s.base(dirfd, &p)?;
         s.ctx().lookup(base.as_ref(), &p, false)?
     };
-    // An empty path naming something that is not a link: ENOENT, a named one EINVAL (linux-6.6/fs/stat.c:494).
+    // An empty path naming something that is not a link: ENOENT, a named one EINVAL (linux-7.3.1/fs/stat.c:586).
     let body = target.dentry.inode.readlink().map_err(|e| if e == EINVAL && p.is_empty() { ENOENT } else { e })?;
     let n = body.len().min(size as u32 as usize);
     s.copy_out(buf, &body[..n])?;
@@ -1070,20 +1071,28 @@ fn do_link(s: &Sys<'_>, od: u64, op: u64, nd: u64, np: u64, flags: u64) -> Resul
     if flags & !(abi::AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
-    // AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH: without it Linux answers ENOENT before it reads any name, also for
-    // a name that is not empty (linux-6.6/fs/namei.c:4648).
-    if flags & AT_EMPTY_PATH != 0 && s.cred.uid != 0 {
-        return Err(ENOENT);
-    }
     let o = s.path(op, flags & AT_EMPTY_PATH != 0)?;
-    let old = if o.is_empty() {
-        s.empty_target(od)?
+    // AT_EMPTY_PATH (LOOKUP_LINKAT_EMPTY, linux-7.3.1/fs/namei.c:2750 in `path_init`): a start fd someone else opened
+    // is ENOENT without CAP_DAC_READ_SEARCH, after EBADF and the name copy and before ENOTDIR, also for a name that
+    // is not empty; the cwd and an absolute name are not checked. "Opened by the caller" is V2's: first installed
+    // in the caller's fd table (`FdTable::serial`); the capability is fsuid 0, as V2's other fs checks.
+    if flags & AT_EMPTY_PATH != 0 && o.first() != Some(&b'/') && od as u32 as i32 != AT_FDCWD {
+        let f = s.raw(od)?;
+        if f.opener() != s.fds.serial() && s.cred.uid != 0 {
+            return Err(ENOENT);
+        }
+    }
+    // An fd without a path (pipe, eventfd) is None: EXDEV in `link_to`, after the new name's checks.
+    let old = if o.is_empty() && od as u32 as i32 != AT_FDCWD {
+        s.raw(od)?.path.clone()
+    } else if o.is_empty() {
+        Some(s.empty_target(od)?)
     } else {
         let ob = s.base(od, &o)?;
-        s.ctx().lookup(ob.as_ref(), &o, flags & abi::AT_SYMLINK_FOLLOW != 0)?
+        Some(s.ctx().lookup(ob.as_ref(), &o, flags & abi::AT_SYMLINK_FOLLOW != 0)?)
     };
     let (nb, n) = at_path(s, nd, np)?;
-    s.ctx().link_to(&old, nb.as_ref(), &n).map(|_| 0)
+    s.ctx().link_to(old.as_ref(), nb.as_ref(), &n).map(|_| 0)
 }
 
 pub fn link(s: &Sys<'_>, a: Args) -> i64 {
@@ -1137,7 +1146,7 @@ pub fn ftruncate(s: &Sys<'_>, a: Args) -> i64 {
     })())
 }
 
-/// fallocate(fd, mode, offset, len) (`ksys_fallocate` + `vfs_fallocate`, linux-6.6/fs/open.c:244-330, with the
+/// fallocate(fd, mode, offset, len) (`ksys_fallocate` + `vfs_fallocate`, linux-7.3.1/fs/open.c:250-362, with the
 /// mode rules of CachyOS's kernel, see `fallocate_mode_ok`) in Linux's order: EBADF (no fd, O_PATH), EINVAL
 /// (offset < 0, len <= 0), EOPNOTSUPP (a mode that is not one of the known ones), EBADF (not open for writing),
 /// EPERM (immutable), ESPIPE (pipe, FIFO), EISDIR, ENODEV (anything but a regular file or block device: devices,

@@ -3,7 +3,7 @@
 //! it are kept and put back before the console draws there). Runs under `display.frame`: no allocation except
 //! the pointer's saved pixels (reserved once per sprite size), no lock, no log.
 
-use crate::font::{Font, blend};
+use crate::font::{Font, Glyph, blend};
 use crate::screen::{self, Cell, Screen};
 use alloc::vec::Vec;
 use display::{RamFrame, Rect};
@@ -22,29 +22,93 @@ pub fn cell_pixel(font: &Font, cell: Cell, cursor: bool, x: u32, y: u32) -> u32 
     blend(fg, bg, font.coverage(cell.ch, x, y))
 }
 
-/// Draws one cell at grid position (`col`, `row`) and marks it.
+/// One attribute's 256 blends of its foreground over its background: a pixel is then one table look-up
+/// (GP-START: the blend per pixel was most of a whole screen's 9 ms). Made again only when the attribute changes.
+pub struct Shade {
+    attr: Option<u8>,
+    lut: [u32; 256],
+}
+
+impl Shade {
+    pub const fn new() -> Shade {
+        Shade { attr: None, lut: [0; 256] }
+    }
+
+    fn table(&mut self, attr: u8) -> &[u32; 256] {
+        if self.attr != Some(attr) {
+            let (fg, bg) = (screen::fg_of(attr), screen::bg_of(attr));
+            for (a, v) in self.lut.iter_mut().enumerate() {
+                *v = blend(fg, bg, a as u8);
+            }
+            self.attr = Some(attr);
+        }
+        &self.lut
+    }
+}
+
+impl Default for Shade {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Draws one cell at grid position (`col`, `row`) and marks it. Builds a blend table for this one cell: for a
+/// single cell (tests); every drawing path keeps a `Shade` and calls `draw_cell_shaded`.
 pub fn draw_cell(f: &mut RamFrame, font: &Font, col: u32, row: u32, cell: Cell, cursor: bool) {
+    draw_cell_shaded(f, font, col, row, cell, cursor, &mut Shade::new());
+}
+
+/// `draw_cell` with a table kept over many cells: the same pixels as `cell_pixel`, with the glyph looked up once
+/// per cell and a pixel row written as one slice.
+pub fn draw_cell_shaded(
+    f: &mut RamFrame, font: &Font, col: u32, row: u32, cell: Cell, cursor: bool, shade: &mut Shade,
+) {
     let (x0, y0) = (col * font.w, row * font.h);
     if x0 + font.w > f.width || y0 + font.h > f.height {
         return;
     }
-    let stride = f.width as usize;
+    let lut = shade.table(cell.attr);
+    let glyph = font.glyph(cell.ch);
+    let underline = if cursor { font.h - cursor_height(font) } else { font.h };
+    let (stride, w) = (f.width as usize, font.w as usize);
     let px = f.pixels_mut();
     for y in 0..font.h {
-        let line = (y0 + y) as usize * stride + x0 as usize;
-        for x in 0..font.w {
-            px[line + x as usize] = cell_pixel(font, cell, cursor, x, y);
+        let at = (y0 + y) as usize * stride + x0 as usize;
+        let dst = &mut px[at..at + w];
+        if y >= underline {
+            dst.fill(lut[255]);
+            continue;
+        }
+        match glyph {
+            Glyph::Raster(r) => {
+                let src = r.get(y as usize).copied().unwrap_or(&[]);
+                let n = src.len().min(w);
+                for (d, &a) in dst[..n].iter_mut().zip(src) {
+                    *d = lut[a as usize];
+                }
+                dst[n..].fill(lut[0]);
+            }
+            g => {
+                for (x, d) in dst.iter_mut().enumerate() {
+                    *d = lut[g.at(font, x as u32, y) as usize];
+                }
+            }
         }
     }
     f.mark(Rect::new(x0, y0, font.w, font.h));
 }
 
-/// Draws screen row `r` as the view shows it.
+/// Draws screen row `r` as the view shows it (one blend table for this row; see `draw_cell`).
 pub fn draw_row(f: &mut RamFrame, font: &Font, s: &Screen, r: u32) {
+    draw_row_shaded(f, font, s, r, &mut Shade::new());
+}
+
+/// `draw_row` with the caller's table.
+pub fn draw_row_shaded(f: &mut RamFrame, font: &Font, s: &Screen, r: u32, shade: &mut Shade) {
     let cur = s.cursor();
     let cells = s.visible_row(r);
     for (c, cell) in cells.iter().enumerate() {
-        draw_cell(f, font, c as u32, r, *cell, cur == Some((c as u32, r)));
+        draw_cell_shaded(f, font, c as u32, r, *cell, cur == Some((c as u32, r)), shade);
     }
 }
 
@@ -76,9 +140,10 @@ pub fn render(f: &mut RamFrame, font: &Font, s: &mut Screen, last_cursor: &mut O
     }
     redo.sort_unstable();
     redo.dedup();
+    let mut shade = Shade::new();
     for r in redo {
         if r < s.rows {
-            draw_row(f, font, s, r);
+            draw_row_shaded(f, font, s, r, &mut shade);
         }
     }
     *last_cursor = cur;

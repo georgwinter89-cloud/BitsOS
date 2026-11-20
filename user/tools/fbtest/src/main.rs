@@ -12,8 +12,8 @@
 //! `--dev PATH` (default /dev/fb0) for every mode. The program always ends by itself (finite holds), so the
 //! console gets the screen back (V2: the screen returns when the drawing program ends).
 //! Exit codes: 0 ok, 1 error or failed check, 2 usage, 4 not an fbdev device (ENOTTY).
-//! Linux: linux-6.6/include/uapi/linux/fb.h, drivers/video/fbdev/core/fb_chrdev.c (ioctls), fbmem.c:727 (pan
-//! bounds: EINVAL past yres_virtual - yres).
+//! Linux: linux-7.3.1/include/uapi/linux/fb.h, drivers/video/fbdev/core/fb_chrdev.c:62 (ioctls), fbmem.c:189
+//! (pan bounds: EINVAL past yres_virtual - yres).
 #![forbid(unsafe_code)]
 
 mod fb;

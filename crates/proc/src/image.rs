@@ -1,6 +1,6 @@
 //! Loading an ELF image into a fresh address space (AB-2's loader, used by spawn and execve): segments with
 //! their final protection, the heap start, the stack and Linux's initial stack with the auxiliary vector
-//! (linux-6.6/fs/binfmt_elf.c `load_elf_binary`, `load_elf_interp`, `create_elf_tables`).
+//! (linux-7.3.1/fs/binfmt_elf.c `load_elf_binary` :829, `load_elf_interp` :642, `create_elf_tables` :165).
 //!
 //! AB-8: a program file's segments are file-backed `MAP_PRIVATE` mappings of its page cache (FS-5; MM-5b
 //! copies a page on the first write), the rest of a writable segment's last file page is cleared (`padzero`),

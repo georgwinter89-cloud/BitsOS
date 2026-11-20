@@ -221,7 +221,7 @@ fn hda_source_reads_the_mic_jack() {
 fn hda_alc269() -> (Arc<hda::fake::FakeHda>, hda::Controller<hda::fake::FakeHw>) {
     let f = hda::fake::FakeHda::new(0x4401);
     f.add_codec(0, include_str!("../../hdacodec/fixtures/alc269-synthetic.txt"));
-    let c = hda::Controller::new("hda0".into(), hda::Kind::Intel, hda::fake::FakeHw(f.clone()), hda::Config::default());
+    let c = hda::Controller::new("hda0".into(), hda::Kind::Intel, hda::fake::FakeHw(f.clone()));
     c.bring_up().unwrap();
     (f, c)
 }

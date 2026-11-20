@@ -1,6 +1,6 @@
 //! Brief CX-1: recall@10 per topic on host/cx-eval. The keyword part alone must beat the BM25 floor of
 //! `baseline.py` (0.42 / 0.34); with the real model (when built in third_party/) the hybrid must reach the
-//! CX-1 numbers in plan/notes/CX-1.md (a regression guard; CX-2 tunes and sets the targets).
+//! CX-1 numbers in user/services/ctxd/DESIGN.md 14.2 (a regression guard; CX-2 tunes and sets the targets).
 
 mod common;
 use common::*;
@@ -48,7 +48,7 @@ fn real_model_recall() {
     }
     let rep = run("llama");
     assert_eq!(rep["partial_queries"], 0);
-    // Measured 15.10. on the Gaming-PC: 0.66 / 0.51 (plan/notes/CX-1.md); margin for float noise.
+    // Measured on the Gaming-PC: 0.66 / 0.51 (DESIGN.md 14.2); margin for float noise.
     assert!(mean(&rep, "query") >= 0.62 && mean(&rep, "query_alt") >= 0.47, "{}", eval::table(&rep));
     for t in rep["topics"].as_array().unwrap() {
         assert!(t["query"]["mrr"].as_f64().unwrap() >= 0.5, "first relevant hit in the top 2: {}", t["id"]);

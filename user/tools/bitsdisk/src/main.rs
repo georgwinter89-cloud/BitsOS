@@ -1,10 +1,11 @@
 //! `bitsdisk`: gives BitsOS one partition of a disk (NV-2p). It runs at the console and only shows and asks; the
 //! kernel (`/dev/bitsos/disksetup`) checks everything and reads the typed code from the keyboard itself. Over MCP the
-//! device does not open. `nvme_write=on` stays Georg's own edit.
+//! device does not open. `nvme_write=on` stays Georg's own edit. `bitsdisk umzug` (GP-DISK) copies the stick's old
+//! data to the new /data once; it asks for the same device first, so it too runs only as root at the machine.
 
 #![forbid(unsafe_code)]
 
-use bitsdisk::{Dialog, parse_list, refusal_text, render, setup};
+use bitsdisk::{Dialog, parse_list, refusal_text, render, setup, umzug};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
 use std::process::ExitCode;
@@ -65,6 +66,9 @@ fn run() -> io::Result<bool> {
         }
         Err(e) => return Err(e),
     };
+    if arg.as_deref() == Some("umzug") {
+        return move_data();
+    }
     let a = ask(&mut dev, "list\n")?;
     let Some(l) = parse_list(&a) else {
         println!("Die Antwort des Kerns ist nicht lesbar: {a}");
@@ -80,10 +84,31 @@ fn run() -> io::Result<bool> {
         }
         None => setup(&mut Console(&mut dev), &l),
         Some(_) => {
-            println!("bitsdisk [list]");
+            println!("bitsdisk [list|umzug]");
             Ok(false)
         }
     }
+}
+
+/// `bitsdisk umzug`: the stick's old data onto the SSD's /data, once (`bitsdisk::umzug`).
+fn move_data() -> io::Result<bool> {
+    let window = std::fs::read_to_string("/proc/bitsos/data-window").unwrap_or_default();
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let stick = mounts.lines().any(|l| l.split(' ').nth(1) == Some("/stickdata"));
+    let marker = std::path::Path::new("/data").join(umzug::MARKER).exists();
+    if let Some(why) = umzug::refuse(window.contains("window=armed"), stick, marker) {
+        println!("{why}");
+        return Ok(false);
+    }
+    println!("Die Daten vom Stick werden nach /data kopiert. Das kann ein paar Minuten dauern ...");
+    let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let mut copy = || -> io::Result<bool> {
+        let ok = std::process::Command::new("/bin/cp").args(["-a", "/stickdata/.", "/data/"]).status()?.success();
+        Ok(ok && std::process::Command::new("/bin/sync").status()?.success())
+    };
+    let r = umzug::run(std::path::Path::new("/stickdata"), std::path::Path::new("/data"), start, &mut copy)?;
+    say(&umzug::result_text(&r));
+    Ok(r.is_ok())
 }
 
 fn main() -> ExitCode {

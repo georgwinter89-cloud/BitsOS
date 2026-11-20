@@ -17,12 +17,13 @@
 // a token file); this host's certificate names it "bitsos-desk <hostname>" (the dialog shows that name).
 // Exit code 0 paired, 1 the service refused, 2 not asked (unreachable, token, a pin is there already).
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { connect, McpError, plainRequest, readToken } from './mcp-call.mjs';
+import { tokenFileFor } from './token.mjs';
 import { clientKey, defaultStore, fingerprint, KeyError, pinFile, writePin } from './mcp-keys.mjs';
 import { existsSync } from 'node:fs';
+import { isMain } from './is-main.mjs';
 
-const USAGE = 'usage: node pair.mjs <host[:port]> (--expect SHA256 | --trust-first-use) [--store DIR] [--token-file F]\n'
+const USAGE = 'usage: node pair.mjs <host[:port]> (--expect SHA256 | --trust-first-use) [--store DIR] [--token-file F] [--gaming-pc]\n'
   + '  --expect  the fingerprint on the Mini-PC\'s start line "bitsmcp: TLS server key sha256 ..."\n'
   + '  --store   the key store (default: BITSOS_MCP_STORE, else bitsos-mcp/ next to the token file, else ~/.config/bitsos-mcp);\n'
   + '            the token from BITSOS_TOKEN or --token-file';
@@ -32,6 +33,7 @@ async function main(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (['--store', '--token-file', '--expect'].includes(argv[i])) opts[argv[i].slice(2)] = argv[++i];
     else if (argv[i] === '--trust-first-use') opts.tofu = true;
+    else if (argv[i] === '--gaming-pc') opts['gaming-pc'] = true;
     else rest.push(argv[i]);
   }
   const [host] = rest;
@@ -48,7 +50,7 @@ async function main(argv) {
       return 2;
     }
     if (!opts.expect) console.error('WARNING: pairing without --expect: whatever answers at this address is trusted from now on; compare the key printed below with the Mini-PC\'s start line');
-    const token = readToken(opts['token-file']);
+    const token = readToken(tokenFileFor(opts['token-file'], opts['gaming-pc']));
     const me = clientKey(store, { make: true });
     console.log(`${me.made ? 'made' : 'using'} this host's key: sha256 ${fingerprint(me.der)} (${resolve(store)})`);
     console.log('pairing; under mcp=service Georg confirms it at the Mini-PC\'s keyboard (up to 5 minutes)');
@@ -82,4 +84,4 @@ async function main(argv) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) process.exitCode = await main(process.argv.slice(2));
+if (isMain(import.meta.url)) process.exitCode = await main(process.argv.slice(2));

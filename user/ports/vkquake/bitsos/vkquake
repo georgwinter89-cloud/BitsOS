@@ -8,8 +8,8 @@
 #   vkquake --check      check the tree, libraries, drivers, device nodes, desktop, user, home and sound; start and write nothing
 #   vkquake --env        print the environment the game gets (one VAR=value per line); start nothing
 # Keys and mouse come from the desktop, a pad from /dev/input (SDL's joystick interface on evdev), sound through ALSA.
-# Vulkan only on the chip: MESA_VK_DRIVERS (default radeon_icd) picks the Mesa tree's drivers, so without a render node the
-# game says so instead of drawing on the CPU. Never as root: started by root (MCP as root) it runs as uid 1000 (BusyBox
+# Vulkan only on the chip: RADV, the Mesa tree's one Vulkan driver (DECISIONS 18.11.: no software driver), so without a
+# render node the game says so. Never as root: started by root (MCP as root) it runs as uid 1000 (BusyBox
 # chpst, the same process, so its pid stays the one bitscomp lists). HOME is /data/home/1000 when the data volume has it
 # (config and saves in ~/.vkquake stay), else in RAM (gone at the next boot; the launcher says so).
 # The VKQ_* settings exist for tests: a tree, Mesa tree, data folder, RAM folder, device folder and home of their own.
@@ -53,12 +53,8 @@ libs_ok() {
 }
 
 drivers() {
-  VK_DRIVER_FILES=
-  for d in ${MESA_VK_DRIVERS:-radeon_icd}; do
-    case $d in */*|.*) say "MESA_VK_DRIVERS: '$d' is not a driver name of the Mesa tree"; return 1 ;; esac
-    [ -f "$ICD/$d.json" ] || { say "driver $d: $ICD/$d.json is missing"; return 1; }
-    VK_DRIVER_FILES="$VK_DRIVER_FILES${VK_DRIVER_FILES:+:}$ICD/$d.json"
-  done
+  VK_DRIVER_FILES=$ICD/radeon_icd.json
+  [ -f "$VK_DRIVER_FILES" ] || { say "driver radeon_icd: $VK_DRIVER_FILES is missing"; return 1; }
 }
 
 # The desktop's own process (bitscomp's helpers `bitscomp page/ctl ...` are not desktops); sets WD (the Wayland socket's
@@ -134,7 +130,7 @@ own_run() {
 game_env() {
   exec env -i PATH="$PATH" HOME="$H" LANG=C ${WD:+XDG_RUNTIME_DIR="${WD%/*}"} ${WD:+WAYLAND_DISPLAY="${WD##*/}"} \
     SDL_VIDEODRIVER=wayland SDL_AUDIODRIVER=alsa SDL_VIDEO_WAYLAND_WMCLASS=vkquake LD_LIBRARY_PATH="$L" \
-    VK_DRIVER_FILES="$VK_DRIVER_FILES" VK_ICD_FILENAMES="$VK_DRIVER_FILES" VK_IMPLICIT_LAYER_PATH="$M/share/vulkan/implicit_layer.d" \
+    VK_DRIVER_FILES="$VK_DRIVER_FILES" VK_IMPLICIT_LAYER_PATH="$M/share/vulkan/implicit_layer.d" \
     VK_LAYER_PATH="$M/share/vulkan/explicit_layer.d" DRIRC_CONFIGDIR="$M/share/drirc.d" AMDGPU_ASIC_ID_TABLE_PATHS="$M/share/libdrm" "$@"
 }
 
@@ -148,7 +144,7 @@ case "$1" in
   --check)
     rc=0
     if tree_ok; then say "tree $T: ok ($(head -n 1 "$T/VERSION.txt" 2>/dev/null | cut -d' ' -f1,2))"; libs_ok || rc=1; else rc=1; fi
-    if drivers; then say "drivers: ${MESA_VK_DRIVERS:-radeon_icd}"; else rc=1; fi
+    if drivers; then say "drivers: radeon_icd"; else rc=1; fi
     if [ -d "$DEV/dri" ]; then say "render nodes: $(ls "$DEV/dri" | tr '\n' ' ')"; else say "render nodes: none ($DEV/dri missing): the game cannot start on the chip"; fi
     nodes_ok || rc=1
     if find_desk; then say "desktop: $WD"; else say "desktop: $why"; fi

@@ -81,7 +81,6 @@ pub enum Look {
 
 impl Look {
     /// Whether the shader needs the new scene as a texture (the others let it show through).
-    #[cfg(feature = "gpu")]
     pub fn wants_live(&self) -> bool {
         matches!(self, Look::Glitch { .. } | Look::Carousel { .. })
     }
@@ -132,7 +131,6 @@ pub fn look(what: Play, k: f32, (w, h): (i32, i32), board: f32, ground: Rgba, ca
 /// A card's offset from the middle to its picture: (x shift as a share of the width, scale, turn in radians): the
 /// Wechsel cards' `translateX(-off * 30px) rotateY(-off * 18deg) scale(.88 / 1.06)`, spread so one card leaves as the
 /// next arrives.
-#[cfg(feature = "gpu")]
 pub fn card(off: f32) -> (f32, f32, f32) {
     let a = off.abs().min(1.0);
     (off * 0.94, mix(1.0, 0.88, a), (-off * 18.0).to_radians())

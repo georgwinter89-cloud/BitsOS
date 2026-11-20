@@ -11,13 +11,11 @@ use crate::gpucore::watch::{self, Class, DisplayGuard};
 use crate::ktests_fakes as k;
 use std::vec::Vec;
 
-fn blob() -> Option<Discovery> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/gx/fixtures/minipc-780m-discovery.bin");
-    let Ok(buf) = std::fs::read(&p) else {
-        std::eprintln!("skip: {} missing", p.display());
-        return None;
-    };
-    Some(disc::parse(&buf).unwrap())
+/// The Mini-PC's real discovery blob (host/tests/gx/fixtures, tracked; missing is a failure).
+fn blob() -> Discovery {
+    let p = super::regdiff::fixture("minipc-780m-discovery.bin");
+    let buf = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e} (tracked fixture)", p.display()));
+    disc::parse(&buf).unwrap()
 }
 
 #[test]
@@ -33,23 +31,21 @@ fn gc_fake_gfxoff_imu_and_autoload() {
 #[test]
 fn every_start_state_classified_and_met() {
     k::check_stale(&fakechip::discovery_780m()).unwrap();
-    if let Some(d) = blob() {
-        k::check_stale(&d).unwrap();
-    }
+    let d = blob();
+    k::check_stale(&d).unwrap();
 }
 
 #[test]
 fn scanout_watcher() {
     let hubp = dcn314_regs::lookup("HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS").unwrap().byte;
     k::check_watch(&fakechip::discovery_780m(), hubp).unwrap();
-    if let Some(d) = blob() {
-        k::check_watch(&d, hubp).unwrap();
-    }
+    let d = blob();
+    k::check_watch(&d, hubp).unwrap();
 }
 
 #[test]
 fn the_fakes_table_is_the_real_one() {
-    let Some(real) = blob() else { return };
+    let real = blob();
     let fake = fakechip::discovery_780m();
     for ip in &fake.ips {
         let r = real.find(ip.hw_id, 0).unwrap_or_else(|| panic!("hw {} not in the real table", ip.hw_id));

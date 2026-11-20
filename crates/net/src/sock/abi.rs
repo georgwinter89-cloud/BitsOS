@@ -1,4 +1,4 @@
-//! The socket ABI of x86-64 Linux (values from linux-6.6/include/linux/socket.h,
+//! The socket ABI of x86-64 Linux (values from linux-7.3.1/include/linux/socket.h,
 //! include/uapi/asm-generic/socket.h, include/uapi/linux/in.h, include/uapi/linux/tcp.h, include/net/scm.h and
 //! include/uapi/linux/net.h). Kept here, not in `uapi`, because only the socket layer reads them.
 
@@ -54,6 +54,7 @@ pub const SO_SNDLOWAT: u32 = 19;
 pub const SO_RCVTIMEO_OLD: u32 = 20;
 pub const SO_SNDTIMEO_OLD: u32 = 21;
 pub const SO_ACCEPTCONN: u32 = 30;
+pub const SO_PEERSEC: u32 = 31;
 pub const SO_SNDBUFFORCE: u32 = 32;
 pub const SO_RCVBUFFORCE: u32 = 33;
 pub const SO_PROTOCOL: u32 = 38;
@@ -74,6 +75,13 @@ pub const SO_TIMESTAMPING_NEW: u32 = 65;
 /// IFNAMSIZ: SO_BINDTODEVICE reads at most IFNAMSIZ - 1 bytes of the name.
 pub const IFNAMSIZ: usize = 16;
 pub const SO_SNDTIMEO_NEW: u32 = 67;
+/// L7-NET: the receive options Linux 7 has besides SO_PASSCRED (include/uapi/asm-generic/socket.h:54, :135,
+/// :148-153). SO_INQ and SO_RIGHTS_NOTRUNC are AF_UNIX's own (`unix_setsockopt`).
+pub const SO_PASSSEC: u32 = 34;
+pub const SO_PASSPIDFD: u32 = 76;
+pub const SO_PASSRIGHTS: u32 = 83;
+pub const SO_INQ: u32 = 84;
+pub const SO_RIGHTS_NOTRUNC: u32 = 85;
 
 pub const TCP_NODELAY: u32 = 1;
 pub const TCP_MAXSEG: u32 = 2;
@@ -85,6 +93,9 @@ pub const TCP_QUICKACK: u32 = 12;
 
 pub const SCM_RIGHTS: u32 = 1;
 pub const SCM_CREDENTIALS: u32 = 2;
+/// The sender as a pidfd (SO_PASSPIDFD), the bytes left in the queue (SO_INQ).
+pub const SCM_PIDFD: u32 = 4;
+pub const SCM_INQ: u32 = SO_INQ;
 /// `SCM_MAX_FD`: descriptors in one SCM_RIGHTS message (a bound per message, include/net/scm.h).
 pub const SCM_MAX_FD: usize = 253;
 
@@ -103,9 +114,9 @@ pub const MSG_WAITFORONE: u32 = 0x10000;
 pub const MSG_BATCH: u32 = 0x40000;
 pub const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 pub const MSG_CMSG_COMPAT: u32 = 0x8000_0000;
-/// `MSG_INTERNAL_SENDMSG_FLAGS` (MSG_SPLICE_PAGES | MSG_SENDPAGE_NOPOLICY | MSG_SENDPAGE_DECRYPTED): stripped
-/// from what a program passes.
-pub const MSG_INTERNAL_SENDMSG_FLAGS: u32 = 0x0800_0000 | 0x0001_0000 | 0x0010_0000;
+/// `MSG_INTERNAL_SENDMSG_FLAGS` (MSG_SPLICE_PAGES | MSG_SENDPAGE_NOPOLICY | MSG_SENDPAGE_DECRYPTED |
+/// MSG_NO_SHARED_FRAGS, linux-7.3.1/include/linux/socket.h:358): stripped from what a program passes.
+pub const MSG_INTERNAL_SENDMSG_FLAGS: u32 = 0x0800_0000 | 0x0001_0000 | 0x0010_0000 | 0x0008_0000;
 
 pub const SHUT_RD: u64 = 0;
 pub const SHUT_WR: u64 = 1;

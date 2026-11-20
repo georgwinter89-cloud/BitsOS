@@ -211,21 +211,21 @@ fn ktest_tool() -> TestResult {
     // The hardware rule, decided here as on the Mini-PC: QEMU's classes another run, Display run, the switch classes
     // refused.
     let ctx = ToolContext::detached(u64::MAX);
-    let hw = run_ktests::Here { hardware: true, wlan_on: false, screen_held: false, picture_on: false, georg_on: false, runs: "" };
+    let hw = run_ktests::Here { hardware: true, wlan_set: false, screen_held: false, picture_on: false, georg_on: false, runs: "", gaming_pc: false };
     let r = run_ktests::run(&ctx, "nw.stack.tcp_host,mcp.class_probe", hw).map_err(|e| format!("{e:?}"))?;
     let t = match r.first() {
         Some(ToolOutput::Text(t)) => t.clone(),
         _ => return Err(String::from("no text")),
     };
     kassert!(
-        t.contains("skip nw.stack.tcp_host: belongs to a QEMU run") && t.contains("ok mcp.class_probe.display") && t.contains("refused mcp.class_probe.audible: Audible") && t.contains("refused mcp.class_probe.wlan: wlan: needs wlan=on"),
+        t.contains("skip nw.stack.tcp_host: belongs to a QEMU run") && t.contains("ok mcp.class_probe.display") && t.contains("refused mcp.class_probe.audible: Audible") && t.contains("refused mcp.class_probe.wlan: wlan: needs wlan_ssid"),
         "{t}"
     );
     kassert!(t.starts_with("ktest") && t.contains("passed=1 failed=0 skipped=1 refused=2"), "{t}");
     let only = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", hw);
     kassert!(matches!(only, Err(crate::ToolError::Refused(_))), "only refused tests: the call is refused, {only:?}");
-    // WL-4 CR 3: with wlan=on the Wlan class runs on hardware, Audible stays refused.
-    let on = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", run_ktests::Here { wlan_on: true, ..hw }).map_err(|e| format!("{e:?}"))?;
+    // WL-4 CR 3: with a WLAN in CONFIG the Wlan class runs on hardware, Audible stays refused.
+    let on = run_ktests::run(&ctx, "mcp.class_probe.audible,mcp.class_probe.wlan", run_ktests::Here { wlan_set: true, ..hw }).map_err(|e| format!("{e:?}"))?;
     let t = match on.first() {
         Some(ToolOutput::Text(t)) => t.clone(),
         _ => return Err(String::from("no text")),
@@ -394,10 +394,10 @@ fn after(ctx: &ToolContext, _: &Json) -> ToolResult {
 const NO_ARGS: &str = r#"{"type":"object","properties":{}}"#;
 const CALL_ARG: &str = r#"{"type":"object","properties":{"call":{"type":"integer"}}}"#;
 static CALL_TOOLS: [ToolEntry; 4] = [
-    ToolEntry { name: "t_spin", description: "test", input_schema: NO_ARGS, owner: "MC", safety: Safety::Read, handler: spin },
-    ToolEntry { name: "t_after", description: "test", input_schema: NO_ARGS, owner: "MC", safety: Safety::Change, handler: after },
-    ToolEntry { name: "output", description: "test", input_schema: CALL_ARG, owner: "MC", safety: Safety::Read, handler: crate::server_only },
-    ToolEntry { name: "stop", description: "test", input_schema: CALL_ARG, owner: "MC", safety: Safety::Change, handler: crate::server_only },
+    ToolEntry { name: "t_spin", description: "test", input_schema: NO_ARGS, owner: "MC", safety: Safety::Read, local: false, handler: spin },
+    ToolEntry { name: "t_after", description: "test", input_schema: NO_ARGS, owner: "MC", safety: Safety::Change, local: false, handler: after },
+    ToolEntry { name: "output", description: "test", input_schema: CALL_ARG, owner: "MC", safety: Safety::Read, local: false, handler: crate::server_only },
+    ToolEntry { name: "stop", description: "test", input_schema: CALL_ARG, owner: "MC", safety: Safety::Change, local: false, handler: crate::server_only },
 ];
 
 fn output_stop() -> TestResult {

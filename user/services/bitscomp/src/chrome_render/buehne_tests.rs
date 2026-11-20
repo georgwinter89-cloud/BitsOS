@@ -127,7 +127,7 @@ fn hits_reach_wy_parts_and_the_buehne_parts() {
     assert_eq!((c.address.y, c.address.h), (l.header.h, 0));
     assert_eq!(c.address, l.suggest);
     assert!(c.address.w >= t.bl(560.0) && c.address.x + c.address.w <= 2048);
-    for (r, p) in [(l.sun, Part::Sun), (l.bell, Part::Bell), (l.feld, Part::Feld), (l.strip.unwrap(), Part::Strip)] {
+    for (r, p) in [(l.sun, Part::Sun), (l.bell, Part::Bell), (l.feld, Part::Feld), (l.strip.unwrap(), Part::Strip), (l.rewind.unwrap(), Part::Rewind)] {
         let (x, y) = mid(r);
         assert_eq!(l.hit(x, y), Some(p));
         assert_eq!(c.hit(x, y), None, "{p:?} is no WY part");
@@ -215,4 +215,44 @@ fn slugs_keys_colours_and_the_hint_line() {
     assert_eq!(hint_text(1, 0), "1 Teil auf der Bühne");
     assert_eq!(hint_text(4, 1), "4 Teile auf der Bühne · 1 Programm hängt");
     assert_eq!(hint_text(2, 3), "2 Teile auf der Bühne · 3 Programme hängen");
+}
+
+#[test]
+fn many_minimised_windows_fold_into_plus_n_and_its_list() {
+    let t = theme(&[]);
+    for size in [(2560, 1440), (2048, 1152), (1280, 720)] {
+        let mut i = inputs(size, 2);
+        i.min_labels = (0..12).map(|k| format!("Ein recht langer Fenstertitel {k}")).collect();
+        let l = layout(&t, &i);
+        let Some(home) = l.home else { continue };
+        let more = l.min_more.expect("+N when not all fit");
+        assert!(l.min_items.len() < 12, "{size:?}");
+        for r in &l.min_items {
+            assert!(apart(*r, more) && apart(*r, home) && r.x >= l.hint.x + l.hint.w, "{size:?}: {r:?} {more:?}");
+        }
+        assert_eq!(l.hit(mid(more).0, mid(more).1), None, "{size:?}: \"+N\" is the chrome's");
+        let c = l.chrome();
+        assert_eq!(c.hit(mid(more).0, mid(more).1), Some(crate::chrome::Part::MinMore), "{size:?}");
+        // DESK-LEFT: each chip's x lies in its letter's place, inside the chip; the list's x inside its line.
+        for (k, (r, x)) in l.min_items.iter().zip(&l.min_close).enumerate() {
+            assert!(inside(*x, *r) && x.x < r.x + r.w / 2, "{size:?}: {x:?} {r:?}");
+            assert_eq!(c.hit(mid(*x).0, mid(*x).1), Some(crate::chrome::Part::MinClose(k)), "{size:?}");
+            assert_eq!(c.hit((r.x + r.w - 4) as f64, mid(*r).1), Some(crate::chrome::Part::Min(k)), "{size:?}");
+        }
+        for (r, x) in l.min_list.iter().zip(&l.min_list_close).filter(|(r, _)| r.w > 0) {
+            assert!(inside(*x, *r) && x.x > r.x + r.w / 2, "{size:?}");
+        }
+        assert_eq!(l.min_list.len(), 12);
+        let row = l.bottom.unwrap();
+        let shown: Vec<Rect> = l.min_list.iter().copied().filter(|r| r.w > 0).collect();
+        assert!(shown.len() >= 6, "{size:?}: most of them are in the list");
+        for w in shown.windows(2) {
+            assert!(apart(w[0], w[1]) && w[0].y < w[1].y, "{size:?}: the list goes down to the row");
+        }
+        assert!(shown.iter().all(|r| r.y >= l.header.h && r.y + r.h <= row.y && r.x + r.w == home.x + home.w), "{size:?}");
+    }
+    // Two short titles fit: no "+N".
+    let mut i = inputs((2560, 1440), 2);
+    i.min_labels = vec!["foot".into(), "Brave".into()];
+    assert!(layout(&t, &i).min_more.is_none());
 }

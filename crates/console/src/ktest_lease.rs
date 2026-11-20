@@ -10,7 +10,7 @@
 //! - drop: the session, foreground group and settings come back, test input is dropped, SIGCONT.
 //!
 //! A program in the shell's foreground (Georg's `vi`, say) is never stopped: the test fails then. Without
-//! a session on the console (ktest boots, `init=off`) a lease changes nothing.
+//! a session on the console (ktest boots, `ktest_init=off`) a lease changes nothing.
 
 use crate::jobs::{self, Ctl, SIGCONT, SIGSTOP};
 use crate::termios::Termios;

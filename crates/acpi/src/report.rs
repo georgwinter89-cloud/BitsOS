@@ -75,6 +75,9 @@ pub fn summary(a: &Acpi, sci_en: Option<bool>) -> Vec<String> {
     }
     if let Some(m) = &a.madt {
         v.push(format!("acpi: MADT lapic {:#x}, cpus {} ({} enabled, {} x2apic entries), 8259 {}", m.lapic_address, m.cpus.len(), m.enabled_cpus(), m.cpus.iter().filter(|c| c.x2apic).count(), m.has_8259()));
+        if m.empty_slots != 0 {
+            v.push(format!("acpi: MADT {} unused processor slots (no CPUs, no problem)", m.empty_slots));
+        }
         for io in &m.ioapics {
             v.push(format!("acpi: I/O APIC id {} at {:#x}, gsi base {}", io.id, io.address, io.gsi_base));
         }
@@ -133,6 +136,10 @@ pub fn log(a: &Acpi, sci_en: Option<bool>) {
     }
     if let Some(m) = &a.madt {
         klog::event!(Info, "acpi", "madt", lapic = Hex(m.lapic_address), cpus = m.cpus.len(), enabled = m.enabled_cpus(), ioapics = m.ioapics.len(), overrides = m.overrides.len(), lapic_nmis = m.lapic_nmis.len(), pic8259 = m.has_8259());
+        // Its own line, and only where there are any, so a machine without them logs what it always did.
+        if m.empty_slots != 0 {
+            klog::event!(Info, "acpi", "madt.empty_slots", count = m.empty_slots; "unused processor slots in the table (broadcast ID, not enabled): no CPUs and no problem");
+        }
         for io in &m.ioapics {
             klog::event!(Info, "acpi", "madt.ioapic", id = io.id, addr = Hex(io.address as u64), gsi_base = io.gsi_base);
         }

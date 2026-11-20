@@ -1,5 +1,5 @@
 /* SX-IPC: IPC namespaces (linux-7.3.1/ipc/namespace.c, kernel/nsproxy.c, kernel/fork.c) and the /proc files of
- * ipc_sysctl.c and util.c. Modes: ns, proc, plainproc. */
+ * ipc_sysctl.c and util.c. Modes: ns, proc, plainproc, writes. */
 #include "sysv.h"
 
 static void text(const char *path) {
@@ -201,11 +201,75 @@ static void plainproc(void) {
     printf("%s", b);
 }
 
+/* Writes of `n` bytes (a NUL inside counts), so "\t" or " \n" are what is written. */
+static void wrn(const char *label, const char *name, const char *text, size_t n, long pos) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/sys/kernel/%s", name);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        rep(label, -1);
+        return;
+    }
+    long r = pos ? pwrite(fd, text, n, pos) : write(fd, text, n);
+    int e = errno;
+    close(fd);
+    errno = e;
+    rep(label, r);
+}
+#define W(label, name, text) wrn(label, name, text, sizeof text - 1, 0)
+
+/* L7-RESTE: the knobs' writes as kernel/sysctl.c do_proc_vec answers every knob: only white space EINVAL, the
+ * count ending behind the number's white space, signs refused for the unsigned longs, "-0" taken as 0 by ints. */
+static void writes(void) {
+    fresh_ns();
+    W("shmmax blank", "shmmax", " \n");
+    W("shmall blank", "shmall", " \n");
+    W("shmmax 5 junk", "shmmax", "5 junk");
+    text("/proc/sys/kernel/shmmax");
+    W("shmmax -0", "shmmax", "-0");
+    W("shmall max", "shmall", "18446744073709551615\n");
+    text("/proc/sys/kernel/shmall");
+    W("shmall over", "shmall", "18446744073709551616");
+    W("msgmax -0", "msgmax", "-0");
+    text("/proc/sys/kernel/msgmax");
+    W("msgmax 9 junk", "msgmax", "9 junk");
+    text("/proc/sys/kernel/msgmax");
+    W("msgmax tab", "msgmax", "\t");
+    W("msgmax -1", "msgmax", "-1");
+    W("msgmax spaces after", "msgmax", "12 \t\n\n");
+    text("/proc/sys/kernel/msgmax");
+    W("msgmax 5x", "msgmax", "5x");
+    W("msgmnb int max", "msgmnb", "2147483647");
+    W("msgmni -0x10", "msgmni", "-0x10");
+    W("shmmni blank", "shmmni", " \n");
+    W("shmmni octal", "shmmni", "010\n");
+    text("/proc/sys/kernel/shmmni");
+    wrn("msgmax past the start", "msgmax", "77", 2, 1);
+    text("/proc/sys/kernel/msgmax");
+    W("sem blank", "sem", " \n");
+    W("sem 4 values junk", "sem", "250 32000 32 128 junk");
+    text("/proc/sys/kernel/sem");
+    W("sem bad third", "sem", "1 2 x 4");
+    text("/proc/sys/kernel/sem");
+    W("sem five values", "sem", "5 6 7 8 9\n");
+    text("/proc/sys/kernel/sem");
+    W("sem too big", "sem", "1 2147483648");
+    text("/proc/sys/kernel/sem");
+    W("shm_rmid_forced -0", "shm_rmid_forced", "-0\n");
+    W("auto_msgmni hex junk", "auto_msgmni", "0x1 junk");
+    W("msg_next_id -0", "msg_next_id", "-0");
+    text("/proc/sys/kernel/msg_next_id");
+    W("msg_next_id -1", "msg_next_id", "-1");
+    W("shm_next_id int max", "shm_next_id", "2147483647 x");
+    text("/proc/sys/kernel/shm_next_id");
+}
+
 int main(int argc, char **argv) {
     const char *m = argc > 1 ? argv[1] : "plainproc";
     setvbuf(stdout, 0, _IOLBF, 0);
     if (!strcmp(m, "ns")) ns();
     else if (!strcmp(m, "proc")) proc();
+    else if (!strcmp(m, "writes")) writes();
     else plainproc();
     return 0;
 }

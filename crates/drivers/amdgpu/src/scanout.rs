@@ -10,9 +10,10 @@
 //! presents its first frame whole, and the marks make both buffers equal to it within two frames.
 //!
 //! Waits are sleeps in thread context (B4: bounded by `LATE_NS` per surface); landing is checked by whoever
-//! waits (no IH yet: GX-D6 needs bus master). A flip not landed `LATE_NS` after its order makes the surface fall
-//! back to A0 and the copy path (logged) until `rearm` (fbdev's next take); V1 stayed on one image until restart.
-//! Reload/reboot (`Quiesce`) puts A0 and the found flip types back, only if GX ever ordered a flip.
+//! waits (no IH yet: GX-D6 needs bus master). A flip not landed `LATE_NS` after its order is given up (logged when
+//! a run of late flips begins): its frame is dropped, the next frame orders the next flip. Frames reach the screen
+//! only by flips: no copy into the shown buffer stands in (Georg 18.11.). Reload/reboot (`Quiesce`) puts A0 and the
+//! found flip types back, only if GX ever ordered a flip.
 
 use crate::attach::{Attach, Pipe, Settle};
 use crate::cursor::{self, CursorError, Shape};
@@ -151,8 +152,6 @@ impl DisplayDevice for BufDev {
     }
 }
 
-const READY: u8 = 1;
-const FAILED: u8 = 2;
 /// `prep`: no frame being prepared; CLAIMED = `begin` runs.
 const NONE: u8 = 0xFF;
 const CLAIMED: u8 = 0xFE;
@@ -170,7 +169,6 @@ pub enum NewError {
 /// Counts and state for the MCP tool (no counter on the flip path beyond the fence numbers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
-    pub flipping: bool,
     pub shown: u8,
     pub ordered: u64,
     pub landed: u64,
@@ -190,7 +188,6 @@ pub struct Scanout<R: Rw, C: Clock> {
     otg: u32,
     cur: AtomicU8,
     prep: AtomicU8,
-    state: AtomicU8,
     /// GX ordered at least one flip (the Quiesce restore runs only then).
     touched: AtomicBool,
     settled: bool,
@@ -198,12 +195,11 @@ pub struct Scanout<R: Rw, C: Clock> {
     ordered_at: AtomicU64,
     landed: AtomicU64,
     late: AtomicU64,
+    /// The flips given up since the last one that landed (the log line is said once per run).
+    late_run: AtomicBool,
     /// The frame counter extended to 64 bits (24-bit wraps counted).
     frames: AtomicU64,
     lock_unseen_logged: AtomicBool,
-    /// A fall-back could not order A0 (lock stuck, write mismatch): which buffer shows is not known, so presents
-    /// of the shown picture go into both and `rearm` orders A0 again.
-    a0_unsure: AtomicBool,
     /// One writer of the register sequence at a time (the address pair must not interleave, spec §4); GX-5a:
     /// it also holds the cursor's state (the cursor writes are register sequences too).
     pair: ksync::SpinLock<cursor::State>,
@@ -243,16 +239,15 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
             otg,
             cur: AtomicU8::new(0),
             prep: AtomicU8::new(NONE),
-            state: AtomicU8::new(READY),
             touched: AtomicBool::new(false),
             settled: false,
             ordered: AtomicU64::new(0),
             ordered_at: AtomicU64::new(0),
             landed: AtomicU64::new(0),
             late: AtomicU64::new(0),
+            late_run: AtomicBool::new(false),
             frames: AtomicU64::new(0),
             lock_unseen_logged: AtomicBool::new(false),
-            a0_unsure: AtomicBool::new(false),
             pair: ksync::SpinLock::named("amdgpu.flip", cursor::State::new()),
             cursor_buf: None,
             cursor_used: AtomicBool::new(false),
@@ -290,19 +285,8 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
         Ok(())
     }
 
-    pub fn active(&self) -> bool {
-        self.state.load(Ordering::Acquire) == READY
-    }
-
-    /// The live GopFb's presents go through `present_shown`: while flipping, and after a fall-back whose A0 order
-    /// failed (the picture may still be A1).
-    pub fn redirects(&self) -> bool {
-        self.active() || self.a0_unsure.load(Ordering::Acquire)
-    }
-
     pub fn state(&self) -> State {
         State {
-            flipping: self.active(),
             shown: self.cur.load(Ordering::Acquire),
             ordered: self.ordered.load(Ordering::Acquire),
             landed: self.landed.load(Ordering::Acquire),
@@ -389,19 +373,12 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
             }
             let r = self.bufs[c].present(src, stride, rect);
             self.marks.busy[c].fetch_sub(1, Ordering::SeqCst);
-            if self.a0_unsure.load(Ordering::Acquire) {
-                // Not flipping (FAILED): no `begin` repairs either buffer, both get the picture.
-                return self.bufs[1 - c].present(src, stride, rect).and(r);
-            }
             return r;
         }
     }
 
     /// Waits for the last flip, repairs the hidden buffer from `src` and hands out its device.
     pub fn begin(&self, src: &[u32], stride: u32) -> Result<&BufDev, FlipError> {
-        if !self.active() {
-            return Err(FlipError::Off);
-        }
         if self.prep.compare_exchange(NONE, CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(FlipError::Busy);
         }
@@ -443,9 +420,6 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
     /// wrote into either buffer since this one's last turn (`begin` would repair that from a RAM frame; here no RAM
     /// frame exists and the program redraws it). Nothing is claimed: `direct_flip` does.
     pub fn direct_begin(&self) -> Result<DirectFrame, FlipError> {
-        if !self.active() {
-            return Err(FlipError::Off);
-        }
         let seq = self.ordered.load(Ordering::Acquire);
         if seq != 0 {
             self.wait(seq)?;
@@ -464,9 +438,6 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
     /// WY-17: orders the flip to `window`, which a program finished drawing. Busy while a kernel frame is being
     /// prepared. The buffer already shown is no flip: its last order's number.
     pub fn direct_flip(&self, window: usize) -> Result<u64, FlipError> {
-        if !self.active() {
-            return Err(FlipError::Off);
-        }
         if self.prep.compare_exchange(NONE, CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(FlipError::Busy);
         }
@@ -486,18 +457,24 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
         self.commit()
     }
 
-    /// WY-17: the buffer shown now into `dst`, row by row (`stride` pixels apart, `dst` holds the visible size).
-    /// False when the target cannot be read. May tear with a flip or a store under way: this is a look, not a frame.
-    pub fn read_shown(&self, dst: &mut [u32], stride: u32) -> bool {
-        let c = usize::from(self.cur.load(Ordering::SeqCst) & 1);
-        let fb = &self.bufs[c].fb;
+    /// SHOT: the buffer shown now (the last one ordered: a pending flip's buffer is complete already). SeqCst like the
+    /// store in `commit`: fbdev's hold of a buffer pairs with it.
+    pub fn shown(&self) -> usize {
+        usize::from(self.cur.load(Ordering::SeqCst) & 1)
+    }
+
+    /// SHOT: rectangle `(x, y, w, h)` of scanout buffer `window` into `dst` (`w * h` pixels row by row), only those
+    /// rows and columns. False when it does not lie in the size shown or the target cannot be read. Whether the buffer
+    /// stays still meanwhile is the caller's business (fbdev holds it back from the holder's next BEGIN).
+    pub fn read_window(&self, window: usize, (x, y, w, h): (u32, u32, u32, u32), dst: &mut [u32]) -> bool {
+        let fb = &self.bufs[window & 1].fb;
         let line = fb.stride() as usize * 4;
-        let (w, h) = self.marks.size();
-        let (w, stride) = (w as usize, stride as usize);
-        if stride < w || dst.len() < stride.saturating_mul(h as usize) {
+        let (sw, sh) = self.marks.size();
+        if x.checked_add(w).is_none_or(|e| e > sw) || y.checked_add(h).is_none_or(|e| e > sh) || dst.len() < w as usize * h as usize {
             return false;
         }
-        (0..h as usize).all(|y| fb.target().read_pixels(y * line, &mut dst[y * stride..y * stride + w]))
+        let (x, y, w) = (x as usize, y as usize, w as usize);
+        (0..h as usize).all(|r| fb.target().read_pixels((y + r) * line + x * 4, &mut dst[r * w..r * w + w]))
     }
 
     /// Orders the flip to the buffer `begin` prepared.
@@ -526,8 +503,14 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
                 Ok(seq)
             }
             Err(e) => {
+                // Nothing was ordered (the lock is released on every error path): the frame is dropped, `cur` still
+                // names the buffer shown, the next frame tries again.
                 self.prep.store(NONE, Ordering::Release);
-                self.fall_back("order", Some(e));
+                self.late.fetch_add(1, Ordering::AcqRel);
+                if !self.late_run.swap(true, Ordering::AcqRel) {
+                    klog::event!(Error, "dcn", "flip.order_failed", error = reg_error_text(e).as_str(), ordered = self.ordered.load(Ordering::Acquire);
+                        "a flip could not be ordered: its frame is dropped, the next frame flips again");
+                }
                 Err(FlipError::Late)
             }
         }
@@ -543,12 +526,13 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
         let done = flip::landed(&self.regs, &self.pipes, self.gpu[c])?;
         if done {
             self.landed.fetch_max(o, Ordering::AcqRel);
+            self.late_run.store(false, Ordering::Release);
         }
         Ok(done)
     }
 
     /// Sleeps until flip `seq` landed: first to the expected vblank, then every millisecond, at most until
-    /// `LATE_NS` after its order; then the surface falls back.
+    /// `LATE_NS` after its order; then it is given up (`give_up`).
     pub fn wait(&self, seq: u64) -> Result<(), FlipError> {
         if seq > self.ordered.load(Ordering::Acquire) {
             return Err(FlipError::Off);
@@ -559,21 +543,18 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
             if self.landed.load(Ordering::Acquire) >= seq {
                 return Ok(());
             }
-            if !self.active() {
-                return Err(FlipError::Late);
-            }
             match self.check() {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => {
-                    self.fall_back("read", Some(e));
+                    self.give_up("read", Some(e));
                     return Err(FlipError::Late);
                 }
             }
             let now = self.clock.now_ns();
             let deadline = self.ordered_at.load(Ordering::Acquire) + LATE_NS;
             if now >= deadline {
-                self.fall_back("late", None);
+                self.give_up("late", None);
                 return Err(FlipError::Late);
             }
             let mut until = now + POLL_NS;
@@ -587,58 +568,16 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
         }
     }
 
-    /// One image again (A0, the copy path), logged; Quiesce or the next `rearm` go on from here.
-    fn fall_back(&self, why: &'static str, e: Option<RegError>) {
-        if self.state.compare_exchange(READY, FAILED, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return;
+    /// The newest order did not land in `LATE_NS` (or its landing could not be read): it is given up, so the next
+    /// frame orders the next flip; its frame is dropped (no copy into the screen). Logged once per run of late flips.
+    fn give_up(&self, why: &'static str, e: Option<RegError>) {
+        let ordered = self.ordered.load(Ordering::Acquire);
+        let landed = self.landed.fetch_max(ordered, Ordering::AcqRel);
+        let late = self.late.fetch_add(1, Ordering::AcqRel) + 1;
+        if !self.late_run.swap(true, Ordering::AcqRel) {
+            klog::event!(Error, "dcn", "flip.late", why = why, error = alloc::format!("{e:?}").as_str(), ordered = ordered, landed = landed, late = late;
+                "a flip did not land in 50 ms: its frame is dropped, the next frame flips again");
         }
-        self.late.fetch_add(1, Ordering::AcqRel);
-        let back = {
-            let _g = self.pair.lock();
-            flip::order(&self.regs, &self.pipes, self.gpu[0], Types::Found)
-        };
-        self.a0_unsure.store(back.is_err(), Ordering::Release);
-        self.cur.store(0, Ordering::SeqCst);
-        klog::event!(Warn, "dcn", "flip.fallback", why = why, error = alloc::format!("{e:?}").as_str(),
-            ordered = self.ordered.load(Ordering::Acquire), landed = self.landed.load(Ordering::Acquire),
-            a0_ordered = back.is_ok(); "a flip did not land in 50 ms or a write failed: one image (A0, copying) until the next take");
-    }
-
-    /// After a fall-back: flipping again once A0 shows and nothing is pending. A0 is ordered again first if the
-    /// fall-back could not order it.
-    pub fn rearm(&self) -> bool {
-        if self.state.load(Ordering::Acquire) != FAILED {
-            return self.active();
-        }
-        if self.a0_unsure.load(Ordering::Acquire) {
-            let r = {
-                let _g = self.pair.lock();
-                flip::order(&self.regs, &self.pipes, self.gpu[0], Types::Found)
-            };
-            match r {
-                Ok(_) => {
-                    self.a0_unsure.store(false, Ordering::Release);
-                    klog::event!(Info, "dcn", "flip.a0_ordered"; "A0 ordered again after a fall-back whose A0 order failed");
-                }
-                Err(e) => {
-                    klog::event!(Warn, "dcn", "flip.a0_retry", error = reg_error_text(e).as_str();
-                        "A0 order failed again: presents keep going into both buffers");
-                    return false;
-                }
-            }
-        }
-        if !flip::landed(&self.regs, &self.pipes, self.gpu[0]).unwrap_or(false) {
-            return false;
-        }
-        let (w, h) = self.size();
-        self.marks.written[0].store(0, Ordering::Release);
-        self.marks.written[1].store(pack((0, 0, w, h)), Ordering::Release);
-        self.landed.store(self.ordered.load(Ordering::Acquire), Ordering::Release);
-        let ok = self.state.compare_exchange(FAILED, READY, Ordering::AcqRel, Ordering::Acquire).is_ok();
-        if ok {
-            klog::event!(Info, "dcn", "flip.rearmed", late = self.late.load(Ordering::Acquire); "A0 settled: flipping again");
-        }
-        ok
     }
 
     /// The engine's vblank: the frame counter (extended) and the time of the last vblank start from the scan line.
@@ -716,9 +655,6 @@ impl<R: Rw, C: Clock> Scanout<R, C> {
         let r = flip::order(&self.regs, &self.pipes, self.gpu[0], Types::Found);
         drop(g);
         self.cur.store(0, Ordering::SeqCst);
-        if r.is_ok() {
-            self.a0_unsure.store(false, Ordering::Release);
-        }
         c.and(m).and(r.map(|_| ()))
     }
 

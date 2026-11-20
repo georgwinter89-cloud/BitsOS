@@ -88,16 +88,20 @@ impl KernelHeap {
         // kvmalloc: every round tries the run first (what `regain` just freed may be one), then single frames
         // (which reclaim does produce).
         let scatter = self.may_scatter(pages, align_pages);
-        // A run up to the costly order insists on contiguous frames first (the cheap, usual case) and takes single
-        // frames only once reclaim and compaction did not make it one.
+        // A run up to the costly order takes a free run if there is one and single frames otherwise, with no direct
+        // reclaim or compaction for the run: Linux 7.x `kmalloc_gfp_adjust` drops __GFP_DIRECT_RECLAIM for the kmalloc
+        // try of every kvmalloc above a page and goes to vmalloc, kswapd and kcompactd kicked to make runs in the
+        // background (the order is noted below). Before, these blocks compacted first and took single frames only
+        // after two rounds: the ten-minute load (mm.migrate.load_long, 13.11.2026) made 8500 direct compactions a
+        // minute from 12 and 28 KiB buffers alone, 190 million frames read by the free scanner and 37000 drains.
         let late = self.may_scatter_late(pages, align_pages);
         // A block single frames serve at once asks nobody to make a run: no order for kswapd and kcompactd, no
         // direct compaction (Linux's kvmalloc tries the run with __GFP_NORETRY | __GFP_NOWARN and goes to vmalloc).
         // Mini-PC 11.11.2026: Steam verifying files reads through 500 KiB buffers, 40 of these a second, each one a
         // compaction run over up to 2 GiB of frames and a wake of kcompactd (33 million frames scanned a second).
         let mut noted = exact.is_none() || scatter;
-        let mut try_once = |pressed: bool| {
-            if let Some(v) = self.large_try(pages, align_pages) {
+        let mut try_once = || {
+            if let Some(v) = self.large_try(pages, align_pages, scatter || late) {
                 return Some(v);
             }
             if !noted {
@@ -107,16 +111,19 @@ impl KernelHeap {
                     crate::reclaim::HEAP_ORDER_WANTED.inc();
                 }
             }
-            if scatter || (late && pressed) { self.scatter_alloc(pages) } else { None }
+            if scatter || late { self.scatter_alloc(pages) } else { None }
         };
         let mut regain = super::Regain::default();
         // The reserve as in `small_alloc`.
-        let mut keep = crate::reclaim::keep_reserve();
+        let keep = crate::reclaim::keep_reserve();
+        if pages > 1 && !crate::reclaim::context_allows() {
+            self.note_atomic_large(size);
+        }
         for attempt in 0u32.. {
-            if attempt == super::KEEP_TRIES && keep.as_ref().is_some_and(crate::reclaim::Keep::held) {
-                keep = None;
+            if attempt == super::KEEP_TRIES && let Some(k) = &keep {
+                k.dip();
             }
-            if let Some(v) = try_once(attempt >= 2) {
+            if let Some(v) = try_once() {
                 if attempt >= 2 {
                     crate::reclaim::HEAP_RESCUED.inc();
                 }
@@ -126,15 +133,24 @@ impl KernelHeap {
                 break;
             }
         }
-        if keep.as_ref().is_some_and(crate::reclaim::Keep::held) {
-            drop(keep);
-            return try_once(true).unwrap_or(0);
+        if let Some(k) = keep.as_ref().filter(|k| k.held()) {
+            k.last();
+            if let Some(v) = try_once() {
+                return v;
+            }
+            // MEMCRASH row 2: up to the costly order the block does not fail (`never_fail`). A block single frames
+            // may serve (Linux kvmalloc's vmalloc side) asks for order 0 frames, which never fail either, unless it
+            // is larger than all memory (`__vmalloc_node_range` refuses that).
+            let all = crate::frames().map_or(0, |f| f.stats().total_bytes / PAGE);
+            let nofail_order = if (scatter || late) && pages <= all { 0 } else { order };
+            return self.never_fail(nofail_order, k, &mut try_once).unwrap_or(0);
         }
         0
     }
 
-    fn large_try(&self, pages: u64, align_pages: u64) -> Option<usize> {
-        let v = self.src.alloc_run(pages, align_pages, Kind::Heap)?;
+    /// `light`: single frames serve the block as well, so the run is taken only if it is free now.
+    fn large_try(&self, pages: u64, align_pages: u64, light: bool) -> Option<usize> {
+        let v = if light { self.src.alloc_run_light(pages, align_pages, Kind::Heap) } else { self.src.alloc_run(pages, align_pages, Kind::Heap) }?;
         self.large_bytes.fetch_add(pages * PAGE, Relaxed);
         self.large_blocks.fetch_add(1, Relaxed);
         if self.src.in_seed(v) {

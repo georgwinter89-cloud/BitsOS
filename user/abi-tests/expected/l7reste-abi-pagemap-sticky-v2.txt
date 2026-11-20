@@ -1,0 +1,6 @@
+open = 0
+install 1 = 0
+with a guard gu = yes
+remove 1 = 0
+removed 0 = frame0 yes
+after the remove gu = no

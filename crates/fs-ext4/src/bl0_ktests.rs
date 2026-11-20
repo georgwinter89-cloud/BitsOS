@@ -168,7 +168,7 @@ ktest!("fs.drop_caches.sysctl", Safe, drop_caches_sysctl);
 
 /// The drop host/tests/minipc/blk0.sh asks for before every measured run: "3" through the sysctl file, as root's
 /// `echo 3 > /proc/sys/vm/drop_caches` (MCP's `run` starts programs as uid 1000 and `write_file` stays out of
-/// /proc: plan/notes/bl-BL-0.md, change request). The clean page cache of every file and disk leaves.
+/// /proc). The clean page cache of every file and disk leaves.
 fn drop_caches_all() -> TestResult {
     let before = vfs::reclaim::drop_caches_done();
     let got = vfs::root_ns().write_file("/proc/sys/vm/drop_caches", b"3\n", Some(0));

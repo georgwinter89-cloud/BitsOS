@@ -167,7 +167,7 @@ fn starts() -> ktest::TestResult {
 }
 // INT-W28 post-integration made the fake chains here QemuOnly (52-121 KiB of stack in a release build, over MCP's
 // 64 KiB request thread). GX-7m2 boxed the chains' outcomes and owners and gave every engine stage its own frame:
-// at most 33 KiB with `ktest_stack=48` (29.10., release, QEMU; plan/notes/gx-GX-7m2.md): Safe again.
+// at most 33 KiB with `ktest_stack=48` (release, QEMU): Safe again.
 ktest::ktest!("gx.bringup.starts", Safe, starts);
 
 /// M1 only, a kept M2 and the Quiesce undo, DMCUB/VCN refused, the watcher's last line of defence.
@@ -193,11 +193,13 @@ pub(crate) fn check_modes(d: &Discovery) -> ktest::TestResult {
     kassert!(owner.log().totals().writes == logged, "the Quiesce path went through the owner's log");
     p.free(&mut bo);
     kassert!(bo.count() == 0);
-    // DMCUB (GX-D9) and VCN (not this item) never reach the PSP.
-    for (o, id) in [(ListOpts { keep_display_firmware: false, ..opts }, UcodeId::Dmcub), (ListOpts { vcn: true, ..opts }, UcodeId::Vcn)] {
-        let (out, mut owner, bo, _) = one(d, 512 << 20, StartAs::Cold, Until::Fw, false, Hostile::None, &o, &[])?;
-        kassert!(out.error == Some(PspError::Forbidden(id)) && owner.hw().hw().writes.is_empty() && bo.count() == 0, "{id:?}: {:?}", out.error);
-    }
+    // DMCUB (GX-D9) never reaches the PSP; VCN's microcode is in BitsOS's list (GX-8v) and DMCUB is not.
+    let (fw, _) = fwload::load(&pspfake::plan_780m().files(), &mut MapSource(pspfake::synthetic_780m()), &opts).map_err(|e| format!("{e:?}"))?;
+    let list = fw.load_list(&opts).map_err(|e| format!("{e:?}"))?;
+    kassert!(list.iter().any(|u| u.id == UcodeId::Vcn) && !list.iter().any(|u| u.id == UcodeId::Dmcub), "the list: {:?}", list.iter().map(|u| u.id).collect::<Vec<_>>());
+    let o = ListOpts { keep_display_firmware: false, ..opts };
+    let (out, mut owner, bo, _) = one(d, 512 << 20, StartAs::Cold, Until::Fw, false, Hostile::None, &o, &[])?;
+    kassert!(out.error == Some(PspError::Forbidden(UcodeId::Dmcub)) && owner.hw().hw().writes.is_empty() && bo.count() == 0, "DMCUB: {:?}", out.error);
     // A buffer the BO manager would give out over a surface the display reads: the watcher blocks the write,
     // the device never sees it, the run fails before ring create.
     let (out, mut owner, bo, _) = one(d, 512 << 20, StartAs::Cold, Until::Fw, false, Hostile::None, &opts, &[(pspfake::FB_MC + GOP, 2 << 20)])?;
@@ -733,7 +735,7 @@ fn bringup_tool() -> ktest::TestResult {
 }
 ktest::ktest!("gx.bringup.tool", Safe, bringup_tool);
 
-/// The hang of 29.10. (plan/notes/gx-GX-7j3-hang.md): the tool's state read after the `LIVE` lock, the one step
+/// The `Pre` hang (plan/spec/gpu.md §11.5, code traps): the tool's state read after the `LIVE` lock, the one step
 /// before its first klog event that QEMU never reached (no GPU: `tool` refuses first). INT-W28 took `MES_UP` twice
 /// in it: there it spun and this test timed out; now it comes back with no recursive lock seen (debug builds' order
 /// checker). Reads statics and takes two spin locks briefly, so Safe on the Mini-PC too (a kept run is not touched).
@@ -741,10 +743,10 @@ fn pre_state() -> ktest::TestResult {
     use crate::psplive;
     let before = ksync::lockdep::counts().unexpected;
     for until in [Until::Ring, Until::Fw, Until::Gfx, Until::GfxRing, Until::GfxMes, Until::Vm] {
-        let p = psplive::pre_now(until, false, None, Ok(()), true, false);
+        let p = psplive::pre_now(&psplive::State::new(), until, false, None, Ok(()), true, false);
         kassert!(p.until == until && !p.kept && !p.reset && (p.mes_up || !p.mes_queues), "{until:?}: {p:?}");
     }
-    let p = psplive::pre_now(Until::Gfx, false, None, Ok(()), true, true);
+    let p = psplive::pre_now(&psplive::State::new(), Until::Gfx, false, None, Ok(()), true, true);
     kassert!(p.reset && !p.gart_up && psplive::preflight(&p).is_err(), "reset: {p:?}");
     let after = ksync::lockdep::counts().unexpected;
     kassert!(after == before, "lock order checker: {} new violations ({:?})", after - before, ksync::lockdep::list());

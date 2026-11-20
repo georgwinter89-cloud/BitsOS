@@ -394,6 +394,8 @@ pub struct FakeBus<'a> {
     pub hostile: SdmaHostile,
     /// GX-7j: the GFXHUB client the accesses come from (SDMA0 or the CP).
     pub cid: u32,
+    /// GX-8v: the hub the client reaches memory through (GFXHUB for GC's engines, MMHUB for VCN).
+    pub hub: Hub,
 }
 
 /// 8 bytes of the carve-out at a host-physical address (the hub fake's table reads).
@@ -421,7 +423,7 @@ impl FakeBus<'_> {
             // the access (CP_DEBUG's halt-disable bit, the chip's GFX ring), CPC has no such bit and halts (the chip's
             // compute ring, 30.10.); SDMA is not known yet: it goes on here unless `FaultStalls`.
             let n0 = self.hubs.faults.len();
-            let p = self.hubs.translate_vm(Hub::Gfx, vmid, addr, access, cid, &|p| carve8(mem, fb_mc, fb_phys, fb_size, p));
+            let p = self.hubs.translate_vm(self.hub, vmid, addr, access, cid, &|p| carve8(mem, fb_mc, fb_phys, fb_size, p));
             let halts = match cid {
                 super::gfxfake::CID_CPC => self.hubs.hostile != HubHostile::CpcGoesOn,
                 super::gfxfake::CID_CPG | super::gfxfake::CID_CPF => self.hubs.hostile == HubHostile::CpgHalts,
@@ -429,7 +431,7 @@ impl FakeBus<'_> {
             };
             return if self.hubs.faults.len() != n0 && halts { Err(fault) } else { p.ok_or(fault) };
         }
-        self.hubs.translate(Hub::Gfx, addr, write, cid, &mut |p| carve8(mem, fb_mc, fb_phys, fb_size, p)).ok_or(fault)
+        self.hubs.translate(self.hub, addr, write, cid, &mut |p| carve8(mem, fb_mc, fb_phys, fb_size, p)).ok_or(fault)
     }
 
     /// The bridge, for a page neither the carve-out nor the fake's system memory holds.

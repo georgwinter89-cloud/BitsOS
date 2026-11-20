@@ -1,10 +1,11 @@
-//! The jbd2 journal of a volume (internal journal inode, linux-6.6/fs/jbd2): every metadata transaction
+//! The jbd2 journal of a volume (internal journal inode, linux-7.3.1/fs/jbd2): every metadata transaction
 //! (`tx::Tx`) joins the running journal transaction in memory; a commit writes it to the log (descriptor
 //! blocks with the logged copies, revoke blocks, then a commit block) and then to the blocks' home places.
 //!
 //! Commit order (`jbd2_journal_commit_transaction`, commit.c:347, ordered mode): the file data a transaction
-//! points at was written before its mapping joined (vol_data `write_file`); log blocks; device flush (data and
-//! log stable); commit block; device flush (the commit is stable: fsync may return); home writes
+//! points at was written before its mapping joined (`flight`: a step's one transaction joins after its data); log blocks; device flush (data and
+//! log stable); the commit block, written through (`Dev::write_through`: it is stable, fsync may return; FS-W: not
+//! a second flush of everything, which on a disk wrote out all file data that arrived meanwhile); home writes
 //! (checkpoint). The log tail moves only when the log is full (`tail_reset`: a flush makes the home writes
 //! stable first) and at `empty` (sync_fs, freeze: `s_start` 0, nothing to replay).
 //!
@@ -153,6 +154,8 @@ pub struct Plan {
     home_only: bool,
     #[cfg(test)]
     home_nomem: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
+    #[cfg(test)]
+    log_nomem: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
     dev: Arc<dyn Dev>,
     map: Map,
     lay: Layout,
@@ -187,6 +190,11 @@ pub struct Journal {
     pub tid: u32,
     /// The journal superblock on disk has `s_start` != 0.
     active: bool,
+    /// FSR: a write of "log empty" to the journal superblock failed after it was sent (`empty_journal`): the disk
+    /// may hold it now or later (a timed-out request, a page left dirty in the disk's cache) while `active` still
+    /// says the log is in use. The next commit writes the superblock with its own start, as when the log was empty,
+    /// so a replay never skips a committed transaction whose home writes a cut interrupted.
+    sb_unsure: bool,
     /// Home blocks logged since the tail (they need a revoke when freed).
     logged: BTreeSet<u64>,
     pub run: Running,
@@ -206,6 +214,9 @@ pub struct Journal {
     /// Host tests: the home writes find no buffer this many more times.
     #[cfg(test)]
     pub test_home_nomem: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
+    /// Host tests: the log writer finds no buffer this many more times (before it writes anything).
+    #[cfg(test)]
+    pub test_log_nomem: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
 }
 
 impl Journal {
@@ -238,6 +249,7 @@ impl Journal {
             used: 0,
             tid: next_tid,
             active: false,
+            sb_unsure: false,
             logged: BTreeSet::new(),
             run: Running::default(),
             want_commit: false,
@@ -248,6 +260,8 @@ impl Journal {
             test_cap: u32::MAX,
             #[cfg(test)]
             test_home_nomem: alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0)),
+            #[cfg(test)]
+            test_log_nomem: alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0)),
         }
     }
     fn capacity(&self) -> u32 {
@@ -287,7 +301,7 @@ impl State {
             return true;
         }
         let busy: u64 = j.run.busy.iter().chain(j.committing.iter().flat_map(|c| c.busy.iter())).map(|(s, e)| e - s).sum();
-        busy > 0 && self.free_blocks() < self.keep_for(None) + busy
+        busy > 0 && self.free_now() < self.keep_for(None) + busy
     }
 
     /// Joins a finished transaction's blocks to the running journal transaction (see `tx` for the order
@@ -303,7 +317,7 @@ impl State {
             // Rare: one operation bigger than three quarters of the log. Its earlier transactions are
             // committed apart from this one: a cut between them can leave blocks or an inode marked used that
             // nothing references (e2fsck's bitmap differences, never a wrong pointer). A file write is one
-            // transaction (`write_file`) and never splits here.
+            // transaction (`flight`'s `write_end`) and never splits here.
             klog::event!(Info, "ext4", "journal.full_midop", blocks = blocks.len(), running = j.run.blocks.len());
             self.jcommit_inner()?;
         }
@@ -421,7 +435,7 @@ impl State {
             j.retry = false;
             let home_only = j.home_only;
             let full = j.used as u64 + tx.need > j.capacity() as u64;
-            return Ok(Some(Plan { tx, home_only, #[cfg(test)] home_nomem: j.test_home_nomem.clone(), dev, map: j.map.clone(), lay: j.lay, jsb: j.jsb.clone(), block0: j.block0.clone(), first: j.first, end: j.end, head: j.head, active: j.active, full, now, bs, blocks, first_data_block }));
+            return Ok(Some(Plan { tx, home_only, #[cfg(test)] home_nomem: j.test_home_nomem.clone(), #[cfg(test)] log_nomem: j.test_log_nomem.clone(), dev, map: j.map.clone(), lay: j.lay, jsb: j.jsb.clone(), block0: j.block0.clone(), first: j.first, end: j.end, head: j.head, active: j.active && !j.sb_unsure, full, now, bs, blocks, first_data_block }));
         }
         if empty || logless {
             // Only busy blocks (their freeing was written around the log): nothing to log.
@@ -445,7 +459,7 @@ impl State {
         j.want_commit = false;
         j.committing = Some(tx.clone());
         let home_only = false;
-        Ok(Some(Plan { tx, home_only, #[cfg(test)] home_nomem: j.test_home_nomem.clone(), dev, map: j.map.clone(), lay: j.lay, jsb: j.jsb.clone(), block0: j.block0.clone(), first: j.first, end: j.end, head: j.head, active: j.active, full, now, bs, blocks, first_data_block }))
+        Ok(Some(Plan { tx, home_only, #[cfg(test)] home_nomem: j.test_home_nomem.clone(), #[cfg(test)] log_nomem: j.test_log_nomem.clone(), dev, map: j.map.clone(), lay: j.lay, jsb: j.jsb.clone(), block0: j.block0.clone(), first: j.first, end: j.end, head: j.head, active: j.active && !j.sb_unsure, full, now, bs, blocks, first_data_block }))
     }
 
     /// Books a written commit, or keeps a failed one for its retry (`Journal::retry`). Only for the commit in
@@ -500,6 +514,10 @@ impl State {
                 }
                 j.head = l.head;
                 j.active = true;
+                // Only a commit that wrote the superblock (its own start, or the tail reset's) settles it.
+                if l.sb_start.is_some() {
+                    j.sb_unsure = false;
+                }
                 self.written += l.bytes;
                 COMMITS.inc();
                 LOGGED.add(tx.blocks.len() as u64);
@@ -524,7 +542,7 @@ impl State {
         if j.committing.is_some() {
             return Err(ENOMEM);
         }
-        if !j.active {
+        if !j.active && !j.sb_unsure {
             return Ok(());
         }
         self.dev.flush()?;
@@ -534,12 +552,17 @@ impl State {
         let mut b0 = j.block0.clone();
         b0[..jbd2::SB_SIZE].copy_from_slice(&s);
         let p0 = j.map.phys(0).ok_or(EUCLEAN)?;
-        self.write_blocks(p0, &b0)?;
-        self.dev.flush()?;
+        // Every transaction up to the head is home and flushed: from here the disk may say "empty" at any time.
+        let r = self.write_blocks(p0, &b0).and_then(|()| self.dev.flush());
         let j = self.jnl.as_mut().ok_or(EINVAL)?;
+        if let Err(e) = r {
+            j.sb_unsure = true;
+            return Err(e);
+        }
         j.used = 0;
         j.logged.clear();
         j.active = false;
+        j.sb_unsure = false;
         Ok(())
     }
 
@@ -559,8 +582,8 @@ impl Plan {
     }
 
     /// The commit's device work, no volume lock held (`jbd2_journal_commit_transaction`, ordered mode): the data
-    /// went to the device before its mapping joined; log blocks; flush; commit block; flush (fsync may return);
-    /// home writes. `lift`: the commit lock's waiters, whose priority the requests take.
+    /// went to the device before its mapping joined; log blocks; flush; commit block written through (fsync may
+    /// return); home writes. `lift`: the commit lock's waiters, whose priority the requests take.
     pub fn run(&self, lift: Option<&Lift>) -> Result<Logged, Failed> {
         let log_err = |errno| Failed { errno, home: false, logged: None };
         let floor = || lift.map(|l| block::prio::floor(l.prio()));
@@ -579,6 +602,10 @@ impl Plan {
         }
         let tpd = self.lay.tags_per_desc().max(1);
         let mut log: Vec<(u32, Vec<u8>)> = Vec::new();
+        #[cfg(test)]
+        if self.log_nomem.try_update(core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1)).is_ok() {
+            return Err(log_err(ENOMEM));
+        }
         log.try_reserve(tx.need as usize + 1).map_err(|_| log_err(ENOMEM))?;
         let start = self.head;
         let mut pos = self.head;
@@ -629,9 +656,16 @@ impl Plan {
             self.dev.flush().map_err(log_err)?;
         }
         {
+            // The commit block alone behind its barrier (`Dev::write_through`): on a disk the flush above wrote
+            // every dirty page of the device's cache, and a second one would write all the file data that arrived
+            // since (FS-W: seconds of a download inside `ext4.commit`, for one block).
             let _f = floor();
-            self.write_log(core::slice::from_ref(&commit), &mut bytes).map_err(log_err)?;
-            self.dev.flush().map_err(log_err)?;
+            let p = self.map.phys(commit.0).ok_or(EUCLEAN).map_err(log_err)?;
+            if p >= self.blocks || p < self.first_data_block {
+                return Err(log_err(EUCLEAN));
+            }
+            bytes += commit.1.len() as u64;
+            self.dev.write_through(p * self.bs, &commit.1).map_err(log_err)?;
         }
         // Checkpoint: the home places, in runs of neighbouring blocks.
         let sb_start = if self.full { Some(self.head) } else if !self.active { Some(start) } else { None };

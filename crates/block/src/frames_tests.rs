@@ -209,6 +209,7 @@ fn reads_into_frames_queued_together_reach_the_device_in_one_call() {
     let lbas = [0u64, 8, 100, 300, 500];
     let reqs: Vec<FrameIo> = lbas.iter().zip(&bufs).map(|(&lba, b)| FrameIo { lba, buf: b.clone() }).collect();
     let base = d.stats().copied_bytes;
+    let io0 = d.io_stat();
     r.record();
     let calls0 = r.frame_calls();
     d.read_frames(&reqs, Normal).unwrap();
@@ -222,6 +223,10 @@ fn reads_into_frames_queued_together_reach_the_device_in_one_call() {
     assert!(got.contains(&(0, 16)), "the adjacent pair merged: {got:?}");
     assert_eq!(d.stats().merged, 1);
     assert_eq!(d.stats().copied_bytes, base);
+    // SYS-K: four requests reached the device, one of them two merged reads.
+    let io = d.io_stat();
+    let rd = crate::iostat::READ;
+    assert_eq!((io.ios[rd] - io0.ios[rd], io.merges[rd] - io0.merges[rd]), (4, 1));
     // With one slot they go one after another, still without a copy.
     let r1 = ram(4096, 1);
     let d1 = Disk::open(r1.clone(), DiskKind::Ram, Dispatch::Inline).unwrap();

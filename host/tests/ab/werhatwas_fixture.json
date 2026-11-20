@@ -1,0 +1,19 @@
+{"since": 0, "now": 0, "on": true, "lost": 0, "oldest": 0, "programs": [
+ {"app": "/apps/brave/brave", "name": "brave", "system": false, "pids": [412], "first": "@-3600", "last": "@-60", "new": true,
+  "files": [
+   {"folder": "/data/home/1000/Briefe", "private": true, "read": 4, "write": 0, "create": 0, "delete": 0, "rename": 0, "last": "@-300", "new": true},
+   {"folder": "/data/home/1000/Downloads", "private": false, "read": 0, "write": 0, "create": 2, "delete": 0, "rename": 1, "last": "@-120", "new": false, "example": "rechnung.pdf"}
+  ], "files_more": 0,
+  "net": [
+   {"host": "93.184.216.34", "words": "93.184.216.34", "proto": "tcp", "port": 443, "port_words": "Port 443, sicheres Web", "connect": 12, "accept": 0, "listen": 0, "tx": 48200, "rx": 3400000, "last": "@-60", "new": false},
+   {"host": "203.0.113.9", "words": "203.0.113.9", "proto": "tcp", "port": 443, "port_words": "Port 443, sicheres Web", "connect": 1, "accept": 0, "listen": 0, "tx": 900, "rx": 1200, "last": "@-200", "new": true}
+  ], "net_more": 0,
+  "devices": [
+   {"class": "mikrofon", "label": "Mikrofon", "paths": ["/dev/snd/pcmC0D0c"], "count": 1, "last": "@-240", "new": true, "write": false},
+   {"class": "grafik", "label": "Grafik", "paths": ["/dev/dri/renderD128"], "count": 3, "last": "@-3500", "new": false, "write": true}
+  ], "rights": []},
+ {"app": "/bin/access-probe", "name": "access-probe", "system": true, "pids": [520], "first": "@-900", "last": "@-900", "new": false,
+  "files": [{"folder": "/tmp/db2-scn", "private": false, "read": 0, "write": 0, "create": 2, "delete": 2, "rename": 1, "last": "@-900", "new": false}], "files_more": 0,
+  "net": [{"host": "127.0.0.1", "words": "dieser Rechner", "proto": "tcp", "port": 41000, "port_words": "Port 41000", "connect": 1, "accept": 0, "listen": 1, "tx": 5, "rx": 0, "last": "@-900", "new": false}], "net_more": 0,
+  "devices": [{"class": "mikrofon", "label": "Mikrofon", "paths": ["/dev/snd/pcmC0D0c"], "count": 1, "last": "@-900", "new": false, "write": false}], "rights": []}
+]}

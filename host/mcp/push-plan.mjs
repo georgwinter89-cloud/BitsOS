@@ -8,7 +8,7 @@ import { join } from 'node:path';
 // Names directly below \BITSOS2\ a push never targets: the generations, Georg's settings, the stick's identity,
 // the user's home (YT-2) and anything hidden (staging trees are .push-<name>).
 export const RESERVED = ['sys', 'config.txt', 'stick.id', 'home', 'efi'];
-// FAT keeps files below 4 GiB (linux-6.6/fs/fat/inode.c: s_maxbytes 0xFFFFFFFF).
+// FAT keeps files below 4 GiB (linux-7.3.1/fs/fat/inode.c:1697: s_maxbytes 0xFFFFFFFF).
 export const FAT_MAX = 0xFFFFFFFF;
 
 // FAT compares names without case and without trailing dots/spaces.
@@ -58,7 +58,7 @@ export function journalProblem(plan, root, name) {
   return null;
 }
 
-// Why a relative path cannot go onto FAT (null = fine): vfat's invalid characters (linux-6.6/fs/fat/namei_vfat.c
+// Why a relative path cannot go onto FAT (null = fine): vfat's invalid characters (linux-7.3.1/fs/fat/namei_vfat.c:201
 // vfat_bad_char: control characters and "*/:<>?\|), names ending in a dot or space, more than 255 UTF-16 units.
 export function fatProblem(rel) {
   for (const c of rel.split('/')) {

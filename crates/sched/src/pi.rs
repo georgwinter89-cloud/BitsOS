@@ -1,5 +1,5 @@
-//! Priority passing (SC-7b, B4: "kernel mutexes pass on priority"; V2-PLAN §1a; Linux linux-6.6/kernel/locking/
-//! rtmutex.c `rt_mutex_adjust_prio_chain`, kernel/sched/core.c `rt_mutex_setprio`).
+//! Priority passing (SC-7b, B4: "kernel mutexes pass on priority"; V2-PLAN §1a; Linux linux-7.3.1/kernel/locking/
+//! rtmutex.c:686 `rt_mutex_adjust_prio_chain`, kernel/sched/core.c:7693 `rt_mutex_setprio`).
 //!
 //! A thread that sleeps for a lock another thread holds lends its class to the holder while it holds: the
 //! holder runs in the most urgent class of all waiters of all locks it holds (`attr::boosted_class`: only among
@@ -450,6 +450,16 @@ pub(crate) fn own_of(t: &Thread) -> u8 {
 }
 
 const NO_OWNER: u64 = u64::MAX;
+
+/// `SchedHooks::holds_waited`: the calling thread owns a lock somebody waits for. Without any waiter in the book
+/// (the usual case) no lock is taken.
+pub(crate) fn holds_waited() -> bool {
+    if RECS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let me = ksync::thread_id();
+    me != 0 && book().owned_by(me).next().is_some()
+}
 
 /// `SchedHooks::pi_wait`.
 pub(crate) fn mutex_wait(lock: usize, owner: &AtomicU64) -> bool {

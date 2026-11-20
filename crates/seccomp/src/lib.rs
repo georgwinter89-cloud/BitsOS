@@ -1,4 +1,4 @@
-//! seccomp-bpf (owner: SX; SX-1, linux-6.6/kernel/seccomp.c as the reference for behaviour).
+//! seccomp-bpf (owner: SX; SX-1, linux-7.3.1/kernel/seccomp.c as the reference for behaviour).
 //!
 //! - `bpf`: the classic-BPF verifier (Linux's rules for seccomp programs) and the interpreter.
 //! - `filter`: installed filters, their stack, the action precedence and the action cache.

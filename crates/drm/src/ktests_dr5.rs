@@ -148,7 +148,7 @@ fn program_mmap() -> TestResult {
     let b = udmabuf::build(Some(&fds), &[Item { memfd: n, offset: 0, size: P }]).map_err(|e| format!("build: errno {e}"))?;
     let of = OpenFile::anon(b, vfs::abi::O_RDWR);
     if mm::device::lookup(&of).is_none() {
-        return ktest::fail("MM cannot map dma-buf fds yet (CR-DR5-1/2, plan/notes/dr-DR-5.md)");
+        return ktest::fail("MM cannot map dma-buf fds yet (CR-DR5-1/2, plan/spec/gpu.md §11.6)");
     }
     run(&["abi-dmabuf", "mmap"], EXPECTED_MMAP)
 }

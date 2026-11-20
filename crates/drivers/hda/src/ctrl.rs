@@ -4,7 +4,7 @@
 //! tests run it against `fake.rs`. Logs every state change, error, retry, timeout and fallback (B6).
 
 use crate::format as fmtw;
-use crate::hw::{AllocError, DmaUse, Hw, Mem};
+use crate::hw::{Hw, Mem};
 use crate::link::{self, CmdError, Link, Mode, Unsol};
 use crate::regs::*;
 use crate::stream::{self, Layout, Position};
@@ -21,7 +21,8 @@ use hdacodec::setup::{self, Action};
 use hdacodec::{NoResponse, VerbSource};
 use ksync::{Mutex, SpinLock};
 
-/// Which controller family: decides the PCI quirks, snooping, the position rule and whether we stream at all.
+/// Which controller family: decides the PCI quirks, the position rule and whether we stream at all. Every family
+/// snoops (Linux takes them without `_NS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Intel and QEMU's intel-hda: TCSEL cleared, snooped, LPIB (Linux `POS_FIX_AUTO` picks posbuf; see notes).
@@ -29,8 +30,8 @@ pub enum Kind {
     /// AMD FCH (1022:15E3): `AZX_DCAPS_PRESET_AMD_SB`: no TCSEL, ATI snoop byte, FIFO position fix (32 frames).
     AmdFch,
     /// AMD/ATI GPU HDMI/DP audio (1002:xxxx): enumerated only (immediate registers, no bus master, back into
-    /// reset) until SN-5's display side runs; then [`Controller::set_streaming`] makes it a no-snoop controller
-    /// like the others.
+    /// reset) until SN-5's display side runs; then [`Controller::set_streaming`] makes it a controller like the
+    /// others.
     AtiHdmi,
     Generic,
 }
@@ -173,19 +174,6 @@ struct Slot<M: Mem> {
     errors: u8,
 }
 
-/// Bring-up switches (CONFIG keys in the kernel).
-#[derive(Clone, Copy, Debug)]
-pub struct Config {
-    /// `hda_snoop=off`: no-snoop DMA with UC/WC buffers even where snooping works (tests the UC/WC path).
-    pub force_no_snoop: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config { force_no_snoop: false }
-    }
-}
-
 const JACK_POLL_NS: u64 = 1_000_000_000;
 
 mod capture;
@@ -205,7 +193,6 @@ pub struct Controller<H: Hw> {
     pub hw: H,
     gcap: Gcap,
     state: AtomicU8,
-    snoop: AtomicBool,
     link: Mutex<Option<Link<H::Mem>>>,
     codecs: SpinLock<Vec<Arc<CodecEntry>>>,
     slots: Mutex<Vec<Option<Slot<H::Mem>>>>,
@@ -251,7 +238,9 @@ impl<H: Hw> VerbSource for LinkSource<'_, H> {
 
 impl<H: Hw> Controller<H> {
     /// Reads GCAP; touches nothing else.
-    pub fn new(name: String, kind: Kind, hw: H, cfg: Config) -> Controller<H> {
+    /// Every controller snoops: Linux 6.6 takes 1002:1640 by the generic ATI class entry (`hda_intel.c:2735-2738`,
+    /// `AZX_DCAPS_PRESET_ATI_HDMI`, without `_NS`), so the GPU controller snoops too.
+    pub fn new(name: String, kind: Kind, hw: H) -> Controller<H> {
         let gcap = Gcap::parse(hw.rd16(GCAP));
         Controller {
             name,
@@ -259,9 +248,6 @@ impl<H: Hw> Controller<H> {
             hw,
             gcap,
             state: AtomicU8::new(State::Down as u8),
-            // Snooped everywhere unless `hda_snoop=off`: Linux 6.6 takes 1002:1640 by the generic ATI class entry
-            // (`hda_intel.c:2735-2738`, `AZX_DCAPS_PRESET_ATI_HDMI`, without `_NS`), so the GPU controller snoops too.
-            snoop: AtomicBool::new(!cfg.force_no_snoop),
             link: Mutex::named("hda.link", None),
             codecs: SpinLock::named("hda.codecs", Vec::new()),
             slots: Mutex::named("hda.slots", Vec::new()),
@@ -305,9 +291,6 @@ impl<H: Hw> Controller<H> {
     }
     pub fn state(&self) -> State {
         State::from(self.state.load(Ordering::Acquire))
-    }
-    pub fn snooped(&self) -> bool {
-        self.snoop.load(Ordering::Acquire)
     }
     pub fn link_mode(&self) -> Option<Mode> {
         self.link.lock().as_ref().map(|l| l.mode)
@@ -447,15 +430,14 @@ impl<H: Hw> Controller<H> {
         match self.kind {
             Kind::Intel => self.hw.pci_modify32(PCI_TCSEL, 0x7, 0),
             Kind::AmdFch => {
-                let set = if self.snooped() { ATI_ENABLE_SNOOP << 16 } else { 0 };
-                self.hw.pci_modify32(PCI_ATI_MISC2 & !3, 0x7 << 16, set);
+                self.hw.pci_modify32(PCI_ATI_MISC2 & !3, 0x7 << 16, ATI_ENABLE_SNOOP << 16);
             }
             _ => {}
         }
     }
 
     fn start_rings(&self) -> Link<H::Mem> {
-        let mem = match self.alloc(link::RINGS_BYTES, DmaUse::Control) {
+        let mem = match self.alloc(link::RINGS_BYTES) {
             Ok(m) => m,
             Err(e) => {
                 klog::event!(Warn, "snd", "hda.rings_fallback", ctrl = self.name.as_str(), error = e.as_str(); "no ring memory: immediate commands");
@@ -468,7 +450,7 @@ impl<H: Hw> Controller<H> {
                 // One read proves the rings move (a bridge without bus master leaves the CORB unread).
                 match l.cmd(&self.hw, self.first_codec(), 0, hdacodec::verb::get_param(hdacodec::verb::PAR_VENDOR_ID)) {
                     Ok(_) => {
-                        klog::event!(Info, "snd", "hda.rings", ctrl = self.name.as_str(), addr = klog::Hex(addr), snoop = self.snooped());
+                        klog::event!(Info, "snd", "hda.rings", ctrl = self.name.as_str(), addr = klog::Hex(addr));
                         l
                     }
                     Err(e) => {
@@ -512,21 +494,9 @@ impl<H: Hw> Controller<H> {
         0
     }
 
-    /// DMA memory with the snoop rule; UC/WC refused (MM-4 before MM-6) falls back to snooping where the
-    /// controller can snoop (not the GPU controller).
-    fn alloc(&self, len: usize, usage: DmaUse) -> Result<H::Mem, String> {
-        let limit32 = !self.gcap.ok64;
-        match self.hw.alloc(len, usage, limit32, self.snooped()) {
-            Ok(m) => Ok(m),
-            Err((AllocError::Unsupported, e)) if !self.snooped() => {
-                klog::event!(Warn, "snd", "hda.snoop_fallback", ctrl = self.name.as_str(), error = e.as_str();
-                    "uncached/write-combining DMA memory not available: snooped write-back memory instead");
-                self.snoop.store(true, Ordering::Release);
-                self.pci_quirks();
-                self.hw.alloc(len, usage, limit32, true).map_err(|(_, e)| e)
-            }
-            Err((_, e)) => Err(e),
-        }
+    /// DMA memory (write-back: the controller snoops), below 4 GiB without 64OK in GCAP.
+    fn alloc(&self, len: usize) -> Result<H::Mem, String> {
+        self.hw.alloc(len, !self.gcap.ok64)
     }
 
     /// One walk over the codec (`hdacodec::walk`), kept as a dump; the model and outputs are made from it.
@@ -641,8 +611,8 @@ impl<H: Hw> Controller<H> {
             klog::event!(Warn, "snd", "hda.open_failed", ctrl = self.name.as_str(), what = what, error = e);
             HdaError::NoMemory
         };
-        let bdl = self.alloc(layout.bdl_bytes(), DmaUse::Control).map_err(|e| fail("bdl", &e))?;
-        let data = self.alloc(layout.ring_bytes as usize, DmaUse::Data).map_err(|e| fail("ring", &e))?;
+        let bdl = self.alloc(layout.bdl_bytes()).map_err(|e| fail("bdl", &e))?;
+        let data = self.alloc(layout.ring_bytes as usize).map_err(|e| fail("ring", &e))?;
         let ioc = self.irq_driven();
         if !stream::write_bdl(&bdl, data.dev_addr(), &layout, ioc) {
             return Err(fail("bdl", "write"));
@@ -660,12 +630,12 @@ impl<H: Hw> Controller<H> {
         if !stream::reset(&self.hw, desc) {
             klog::event!(Warn, "snd", "hda.stream_reset_slow", ctrl = self.name.as_str(), desc = desc);
         }
-        stream::program(&self.hw, desc, tag, word, bdl.dev_addr(), &layout, !self.snooped());
+        stream::program(&self.hw, desc, tag, word, bdl.dev_addr(), &layout);
         let g = self.generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1) & 0xFF_FFFF;
         let sid = g << 8 | n as u32;
         klog::event!(Info, "snd", "hda.open", ctrl = self.name.as_str(), stream = sid, desc = desc, tag = tag, cad = id.cad,
             pin = klog::Hex(id.pin as u64), rate = fmt.rate, bits = fmt.bits, ring_frames = layout.ring_frames(),
-            period_frames = layout.period_frames(), periods = layout.periods, ioc = ioc, snoop = self.snooped());
+            period_frames = layout.period_frames(), periods = layout.periods, ioc = ioc);
         slots[n] = Some(Slot {
             id: sid,
             input: false,

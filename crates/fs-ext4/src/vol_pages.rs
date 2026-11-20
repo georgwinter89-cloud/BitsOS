@@ -23,7 +23,7 @@ static ZEROS: [u8; PAGE] = [0; PAGE];
 
 /// Appends the pages of window bytes [pos, pos + len) to `segs` (a piece continuing in the page of the one before
 /// widens its segment: one segment per page and run).
-fn add_segs(segs: &mut Vec<PageSeg>, pages: &[Arc<CachePage>], mut pos: usize, mut len: usize) -> Result<(), i64> {
+pub(crate) fn add_segs(segs: &mut Vec<PageSeg>, pages: &[Arc<CachePage>], mut pos: usize, mut len: usize) -> Result<(), i64> {
     while len > 0 {
         let (i, off) = (pos / PAGE, pos % PAGE);
         let n = (PAGE - off).min(len);

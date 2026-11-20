@@ -1,6 +1,6 @@
 /* NW-12: addresses, MTU and the /proc/net view of a new network namespace's lo (run unprivileged inside
  * unshare(CLONE_NEWUSER|CLONE_NEWNET), the manual cross-check is `unshare -rn; ip link set lo up; ip addr`).
- * lo comes up with 127.0.0.1/8 and ::1 (linux-6.6/net/ipv4/devinet.c inetdev_event, net/ipv6/addrconf.c
+ * lo comes up with 127.0.0.1/8 and ::1 (linux-7.3.1/net/ipv4/devinet.c:1580 inetdev_event, net/ipv6/addrconf.c:3297
  * init_loopback); addresses come and go by SIOCSIFADDR and RTM_NEWADDR/RTM_DELADDR; an MTU below 68 takes IPv4
  * away; /proc/net/{dev,if_inet6,route,tcp,udp,unix} show the namespace (fs/proc/proc_net.c), /sys/class/net keeps its
  * mounter's (fs/sysfs/mount.c). Prints no inode numbers, pointers or host values; addresses are loopback and
@@ -383,7 +383,7 @@ static int inside(void) {
     R("down again: bind 127.0.0.9", udp_bind("127.0.0.9"));
     R("down again: sendto 127.0.0.9", udp_send("127.0.0.9"));
     printf("/sys/class/net/lo/mtu: %s", rd("/sys/class/net/lo/mtu", buf, sizeof buf) > 0 ? buf : "-\n");
-    /* INT-W21 (NW-12 CR 2): /proc/<pid>/net is that task's namespace (linux-6.6/fs/proc/proc_net.c
+    /* INT-W21 (NW-12 CR 2): /proc/<pid>/net is that task's namespace (linux-7.3.1/fs/proc/proc_net.c:269
      * get_proc_task_net): ours equals /proc/net, the parent's (the initial namespace) lists its cards too. */
     char own[8192], mine[8192], parent[8192], path[64];
     long a = rd("/proc/self/net/dev", own, sizeof own), b = rd("/proc/net/dev", mine, sizeof mine);

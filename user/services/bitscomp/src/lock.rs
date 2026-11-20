@@ -246,6 +246,8 @@ impl App {
             && let Some(place) = hint_place(hint, *origin, size, self.lock_output(mode.size.w, mode.size.h))
         {
             self.pointer = place;
+            // CL-3b: a client put the pointer there, not Georg's hand.
+            self.pointer_origin = crate::input::Origin::Injected;
             self.motion(self.now_ms());
             self.cursor_moved(std::time::Instant::now());
         }
@@ -256,9 +258,7 @@ impl App {
     }
 
     fn lock_shape(&mut self) {
-        if self.draw_pointer {
-            self.needs_frame = true;
-        }
+        self.needs_frame = true;
         self.cursor_sync();
     }
 

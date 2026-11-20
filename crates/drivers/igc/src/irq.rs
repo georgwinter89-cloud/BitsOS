@@ -1,12 +1,12 @@
 //! Interrupt causes. Two ways, chosen by what PC-3's `alloc_irqs` gives (NW-4):
 //!
 //! **MSI-X, two vectors** (Linux `igc_configure_msix` + `igc_irq_enable`,
-//! linux-6.6/drivers/net/ethernet/intel/igc/igc_main.c:4026-4084; igb does the same for the 82576): vector 0 takes
+//! linux-7.3.1/drivers/net/ethernet/intel/igc/igc_main.c:4265-4323; igb does the same for the 82576): vector 0 takes
 //! the "other" causes (ICR, link change) through IVAR_MISC, vector 1 queue 0's receive and transmit through IVAR0.
 //! GPIE = MSIX_MODE | PBA | EIAME | NSICR; both bits in EIAC (the EICR bit is cleared when the message goes) and
 //! EIAM (the vector masks itself in EIMS when it fires). The driver writes EIMS again once it has looked: the
-//! queue vector when its ring is empty (NAPI), the other vector after reading ICR (`igc_msix_other`, :5385-5410).
-//! MSI-X has to be enabled in the capability before these registers are written, or they do not hold (:4037);
+//! queue vector when its ring is empty (NAPI), the other vector after reading ICR (`igc_msix_other`, :5638-5666).
+//! MSI-X has to be enabled in the capability before these registers are written, or they do not hold (:4276);
 //! the PCI core armed MSI-X before this.
 //! With one MSI-X vector both go to vector 0.
 //!
@@ -18,7 +18,7 @@
 //! - acknowledging = reading ICR **and** writing EICR = ~0 before looking at descriptors, so a frame arriving
 //!   after the look raises the next MSI.
 //!
-//! Without either (no vectors, `net_irq=off`) the card runs polled with every cause masked (`reset::quiet`).
+//! Without either (no vectors) the card runs polled with every cause masked (`reset::quiet`).
 
 use crate::hw::Hw;
 use crate::regs::{self, Model};

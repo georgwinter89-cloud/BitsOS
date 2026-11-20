@@ -1,0 +1,11 @@
+[package]
+name = "rdna4-gen"
+version = "0.1.0"
+edition = "2024"
+description = "Generates crates/rdna4-regs from Linux 7.3.1's asic_reg headers of the RX 9070 XT's blocks (owner: GX)"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

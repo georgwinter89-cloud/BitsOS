@@ -6,7 +6,7 @@
 #     the shell; QEMU's screendump must equal the Rust model's picture pixel for pixel; MCP send_keys (injected)
 #     cannot power off (UL-7, R8f); a mouse move draws the pointer. IN-quiet: the console's default level keeps MCP's Info request
 #     lines off the screen; console_log info (/sys/bitsos) shows them and a command typed halfway stays whole below.
-#  2. monitor (CONFIG init=off): `log level off` and clear at `bits>`; an injected reboot is refused (R8c).
+#  2. monitor (test key ktest_init=off): `log level off` and clear at `bits>`; an injected reboot is refused (R8c).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/in-20-console}"
@@ -69,8 +69,8 @@ grep -aq 'console log.level level=off was=warn source=sysfs' "$RUN_DIR/serial-sh
 if grep -aq "power reboot.requested\|mcp reboot.requested" "$RUN_DIR/serial-shell.log"; then echo "RED: a reboot was asked for in the shell boot"; exit 1; fi
 
 NAME=in-console-mon
-boot monitor ";init=off"
-grep -aq "ul init.off" "$RUN_DIR/serial-monitor.log" || { echo "RED: no ul init.off event (CONFIG init=off)"; exit 1; }
+boot monitor ";ktest_init=off"
+grep -aq "ul init.off" "$RUN_DIR/serial-monitor.log" || { echo "RED: no ul init.off event (test key ktest_init=off)"; exit 1; }
 grep -aq "console monitor.refused .*reboot" "$RUN_DIR/serial-monitor.log" || { echo "RED: no monitor.refused event for the injected reboot"; exit 1; }
 grep -aq 'console log.level level=off was=warn source=monitor' "$RUN_DIR/serial-monitor.log" || { echo "RED: no log.level event for 'log level off' (default warn)"; exit 1; }
-echo "in console: green (shell: quiet by default, umlauts and AltGr typed, screendump = model, injected poweroff refused, pointer, typed line whole under log lines; monitor with init=off: quiet, clear, injected reboot refused)"
+echo "in console: green (shell: quiet by default, umlauts and AltGr typed, screendump = model, injected poweroff refused, pointer, typed line whole under log lines; monitor with ktest_init=off: quiet, clear, injected reboot refused)"

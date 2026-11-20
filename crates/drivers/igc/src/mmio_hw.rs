@@ -99,7 +99,10 @@ impl Hw for MmioHw {
     fn enable(&self, dma: bool) -> Result<(), PciFail> {
         // The PCI core logs every change and every failure (`pci enable ...`); nothing to add here.
         self.pci.enable_device(dma).map(|_| ()).map_err(|e| PciFail {
-            refused: matches!(e, pci::EnableError::Untouched(_) | pci::EnableError::Storage | pci::EnableError::BridgeUntouched(_)),
+            refused: matches!(
+                e,
+                pci::EnableError::Untouched(_) | pci::EnableError::Storage | pci::EnableError::BridgeUntouched(_) | pci::EnableError::DmaBlocked(_)
+            ),
             text: format!("enable_device({dma}): {e}"),
         })
     }

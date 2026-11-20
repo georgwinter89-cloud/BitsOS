@@ -1,0 +1,6 @@
+[package]
+name = "bitstree"
+version = "0.1.0"
+edition = "2024"
+description = "EINS-D (PLAN K5): is a process in the assistant's tree? One query for bits and bitscomp, std only"
+publish = false

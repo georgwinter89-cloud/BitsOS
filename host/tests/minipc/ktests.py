@@ -11,7 +11,7 @@ A run sets its own conditions and puts them back, also when it ends red:
   - bare: `bitscomp ctl quit` first (the console takes the screen and the input back; dp.*, in.*, the screen tools get
     them to themselves), no process may keep /dev/fb* or /dev/input/event* open, and the desktop again at the end:
     `bitscomp` typed into the console shell, as Georg can. A desktop that does not come back is RED. In a boot with
-    CONFIG desktop=off (the other way to this run, by hand) nothing holds the screen: nothing is stopped or started.
+    no desktop (no graphics chip came up) nothing holds the screen: nothing is stopped or started.
 
 Safe by what MCP's class rule does: Audible and WithGeorg are refused, Picture too (GX-D9), QEMU's classes belong to
 another run. A CONFIG.TXT with nvme_write=on, ktest_georg=on or ktest_picture=on is refused here: no NVMe write,
@@ -269,7 +269,7 @@ def main():
                 quit_sent = True
                 stop_desktop(o)
             else:
-                say("nothing holds the screen (a boot with desktop=off?): nothing to stop, nothing to start afterwards")
+                say("nothing holds the screen (a boot without the desktop?): nothing to stop, nothing to start afterwards")
         err, text, _ = mp.call(o, "ktest", {"filter": BARE_FILTER if run == "bare" else "", "timeout_ms": 1500000}, timeout=1600)
         with open(path, "w") as f:
             f.write(text)

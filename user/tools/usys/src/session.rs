@@ -1,7 +1,7 @@
 //! Starting a program as the leader of a new session that owns the terminal on its fd 0, the way getty or a
 //! terminal emulator starts a login shell (setsid, TIOCSCTTY, tcsetpgrp). ash enables job control only when
-//! its process group is the terminal's foreground group (linux-6.6/drivers/tty/tty_jobctrl.c:360 tiocsctty,
-//! :488 tiocspgrp).
+//! its process group is the terminal's foreground group (linux-7.3.1/drivers/tty/tty_jobctrl.c:365 tiocsctty,
+//! :493 tiocspgrp).
 
 use std::os::unix::process::CommandExt;
 use std::process::Command;

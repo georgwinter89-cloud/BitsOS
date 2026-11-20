@@ -31,7 +31,7 @@ refusal() {
     local name="$1" expect="$2" cfg="$3"; shift 3
     if [ $# -gt 0 ]; then MKIMG real "$SMALL" $BLOCKS 512 5 "$@"; else good_small; fi
     local before; before=$(sum "$SMALL")
-    ktests "refused-$name" "$SMALL" "nv_expect=$expect;$cfg" refused
+    ktests "refused-$name" "$SMALL" "ktest_nv_expect=$expect;$cfg" refused
     [ "$(sum "$SMALL")" = "$before" ] || fail "refused-$name: the image changed"
 }
 refusal no-write   no_nvme_write "nvme_data=$OK"

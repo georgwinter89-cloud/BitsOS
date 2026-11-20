@@ -29,8 +29,10 @@ cycle (the stick starts with generation 1 = OK, CONFIG boot_confirm_s=20, sys_ke
      (FALLBACK_AFTER_TRY skipped=4).
   8. install_kernel <good>/ with a CONFIG.TXT that adds a comment line: generation 5, 4 removed, CONFIG.TXT
      written.
-  9. QMP system_reset: 5 starts as its one try; MCP answers (every 2 s); the kernel logs boot.confirm_pending,
-     and after MCP has answered over boot_confirm_s it writes OK (kexec boot.confirmed generation=5 pruned=[1]:
+  9. QMP system_reset: 5 starts as its one try; the kernel logs boot.confirm_pending. GP-R2: MCP silent for 10 s
+     (over the 6 s the proof allows at boot_confirm_s=20) restarts the proof (boot.confirm_gap); then the remote
+     desk's collect.mjs with its heartbeat (reload_info every 2 s here) keeps MCP answering and waits, and after MCP
+     has answered over boot_confirm_s without a pause the kernel writes OK (kexec boot.confirmed generation=5 pruned=[1]:
      sys_keep=1). reload_info says confirmed. SYS lists only 5, with KERNEL INITRD OK. RB-10: a Reload then hands
     5 on as NEWEST_OK (its OK marker read at the jump): reboot and hw_info of the new kernel say confirmed.
   10. QMP system_reset: bitsboot starts 5 as NEWEST_OK; reload_info: nothing to confirm.
@@ -40,6 +42,8 @@ Each step prints one line; exit 0 = green."""
 import base64
 import http.client
 import json
+import os
+import subprocess
 import threading
 import re
 import socket
@@ -350,20 +354,23 @@ def cycle():
     wait_for(r"kexec boot\.confirm_pending generation=5", pos, 60, "the kernel of 5 waits for its confirmation")
     err, t = call(c, "reload_info")
     need("generation 5 waits for its confirmation" in t, "reload_info shows the confirmation pending", t)
-    end = time.time() + 120
-    while "kexec boot.confirmed generation=5" not in serial()[pos:]:
-        if time.time() > end:
-            need(False, "generation 5 confirms itself within 120 s of MCP answers")
-        call(c, "reload_info")
-        time.sleep(2)
+    # GP-R2: a pause longer than the proof allows starts it again, as the round of 15.11. met it (gap_s=30 there).
+    time.sleep(10)
+    wait_for(r"kexec boot\.confirm_gap generation=5 gap_s=6", pos, 10, "10 s without an MCP answer restart the proof (gap 6 s at boot_confirm_s=20)")
+    need("kexec boot.confirmed generation=5" not in serial()[pos:], "no confirmation across the pause")
+    hb_pos = len(serial())
+    out = os.path.join(os.path.dirname(sys.argv[7]), "collect-heartbeat")
+    r = subprocess.run(["node", "host/remote-desk/collect.mjs", f"127.0.0.1:{PORT}", "--only", "01", "--heartbeat-s", "2", "--confirm-wait-s", "120", "--out", out],
+                       env={"PATH": os.environ["PATH"], "BITSOS_TOKEN": TOKEN, "HOME": out}, capture_output=True, text=True, timeout=240)
+    need(r.returncode == 0 and re.search(r"^ok {3}(confirm|heartbeat): generation 5 confirmed", r.stdout, re.M), "the remote desk's heartbeat kept MCP answering until 5 confirmed itself", r.stdout + r.stderr)
     wait_for(r"kexec boot\.confirmed generation=5 pruned=\"?\[1\]", pos, 5, "generation 5 confirmed (OK), 1 pruned (sys_keep=1)")
     need(True, "generation 5 confirmed itself (OK), 1 pruned by sys_keep=1")
-    need("boot.confirm_gap" not in serial()[pos:], "MCP answered without a pause over the bound")
+    need("boot.confirm_gap" not in serial()[hb_pos:], "with the heartbeat MCP answered without a pause over the bound")
     err, t = call(c, "reload_info")
     need("generation 5 confirmed (OK) in this boot" in t, "reload_info shows the confirmation", t)
     need(listing(c, "/boot/BITSOS2/SYS") == ["5"], "SYS holds only 5")
     need(listing(c, "/boot/BITSOS2/SYS/5") == ["INITRD", "KERNEL", "OK"], "SYS/5 holds KERNEL INITRD OK")
-    # RB-10 (desk-minipc-w12 follow-up 5): a Reload after the confirmation hands 5 on as confirmed, read from the
+    # RB-10 (found on the Mini-PC, 23.10.): a Reload after the confirmation hands 5 on as confirmed, read from the
     # stick's OK marker at the jump, so `reboot` and `hw_info` of the new kernel no longer say "on trial".
     pos = len(serial())
     err, t = call(c, "reload", {"url": f"{base}/good/", "timeout_ms": 60000})

@@ -3,7 +3,7 @@
 //! static form firmware uses (the Mini-PC's AMI firmware has one per CPU in an SSDT, all alike). A `_CST` a
 //! Method returns is not a `Name` and is not read. Every read stays inside the package and the table.
 //!
-//! The checks follow Linux's `acpi_processor_evaluate_cst` (linux-6.6/drivers/acpi/acpi_processor.c:828-990):
+//! The checks follow Linux's `acpi_processor_evaluate_cst` (linux-7.3.1/drivers/acpi/acpi_processor.c:832-993):
 //! the whole `_CST` is refused when its first element does not equal the number of states that follow; one
 //! state that is not a 4-element package of (buffer, integer, integer, integer) is skipped, the others stay.
 //! What a state means (entry method, type, latency) is judged by the idle code (`sched::cstate`), not here:

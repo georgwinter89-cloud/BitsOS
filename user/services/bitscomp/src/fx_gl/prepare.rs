@@ -163,7 +163,7 @@ fn settle(r: &GlesRenderer, key: Key, done: Result<(), String>, now: Instant) {
 /// changed, a new transition's snapshot (`last` copies the last frame on the screen into a texture), the new scene
 /// for the transitions that want it, the reveal's blur. A failure stays with its element: the others still get theirs.
 /// What no element of this frame uses goes back: every full-size picture ends with its transition, and a frame without
-/// effects (the cheap level, a fullscreen window with motion off) holds no texture at all.
+/// effects (a fullscreen window with motion off) holds no texture at all.
 pub fn prepare(
     r: &mut GlesRenderer,
     elements: &[CompElement<GlesRenderer>],

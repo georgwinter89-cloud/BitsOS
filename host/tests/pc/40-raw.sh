@@ -5,8 +5,8 @@
 #    master refused, every BAR access refused while its memory decoding is off),
 #  - a PCIe root port with a slot and an e1000e behind it (Slot Control lost and restored, the saved copy
 #    names Slot/Root Control and the "2" registers),
-# plus the plain machine's AHCI (class 01: every raw write and mapping refused) and the q35 MCH/SMBus with
-# test keys (untouched: header reads only, every write refused). The QEMU-only tests must pass here.
+# plus the plain machine's AHCI (class 01: every raw write and mapping refused) and the q35 SMBus the test rule
+# holds (untouched: header reads only, every write refused). The QEMU-only tests must pass here.
 set -eu
 cd "$BITSOS_ROOT"
 RUN="$BITSOS_RUN_DIR"
@@ -28,7 +28,7 @@ for t in pc.tool.registry pc.tool.read_host_bridge pc.tool.storage_refused pc.to
 done
 check 'W pci raw.refused tool=pci_write function=00:1f.2 reason=storage' "AHCI config write refused (R8a)"
 check 'W pci raw.refused tool=mmio_read function=00:1f.2 reason=storage' "AHCI BAR read refused (R8a)"
-check 'W pci raw.refused tool=pci_write function=00:00.0 reason=untouched' "untouched MCH write refused (R8d)"
+check 'W pci raw.refused tool=pci_write function=00:1f.3 reason=untouched' "untouched SMBus write refused (R8d)"
 check 'I pci raw.cfg_write function=00:0[0-9a-f].0 driver=- offset=0x3c width=1' "pci-testdev interrupt line written"
 check 'I pci raw.mmio_write function=00:0[0-9a-f].0 bar=0' "pci-testdev MMIO written"
 check 'I pci ktest.restore_ctl function=00:0[0-9a-f].0 register=dev_ctl2' "a Device Control 2 restored"

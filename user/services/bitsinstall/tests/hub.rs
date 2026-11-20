@@ -128,31 +128,29 @@ fn grants_over_the_socket_need_real_input() {
 
 #[test]
 fn a_refused_peer_is_told_why_and_never_holds_the_place() {
-    let (h, _, p) = hub("refused", Box::new(|_| Err(String::from("pid 5 runs /tmp/bi, not /bin/bitscomp"))));
+    let (h, _, p) = hub("refused", Box::new(|_| Err(String::from("pid 5 runs /tmp/bi, not /boot/BITSOS2/bin/bitscomp"))));
     let mut c = Peer::connect(&p);
-    assert!(c.line().contains("not /bin/bitscomp"));
+    assert!(c.line().contains("not /boot/BITSOS2/bin/bitscomp"));
     std::thread::sleep(Duration::from_millis(50));
     assert!(!h.connected());
     let _ = std::fs::remove_file(&p);
 }
 
-/// INT-W24 (WY-14 CR 3): the gpu build on the stick is a confirmer like /bin/bitscomp, under the same compositor
-/// holder check; anything else, or either build without the grant, is refused.
+/// INT-W24 (WY-14 CR 3): bitscomp on the stick is the confirmer, under the compositor holder check; anything else,
+/// or bitscomp without the grant, is refused.
 #[test]
-fn the_gpu_build_confirms_only_while_it_holds_the_compositor() {
+fn bitscomp_confirms_only_while_it_holds_the_compositor() {
     use bitsinstall::{judge_peer, CONFIRMERS};
     use std::path::Path;
-    let gpu = Path::new("/boot/BITSOS2/bin/bitscomp-gpu");
-    let ok = judge_peer(&CONFIRMERS, 7, 1000, gpu, Some("holder=7\n")).unwrap();
-    assert!(ok.contains("bitscomp-gpu") && ok.contains("holds the compositor grant"), "{ok}");
-    assert!(judge_peer(&CONFIRMERS, 7, 1000, gpu, Some("holder=9\n")).unwrap_err().contains("pid 9 holds"));
-    assert!(judge_peer(&CONFIRMERS, 7, 1000, gpu, Some("holder=none\n")).unwrap_err().contains("no process holds"));
-    assert!(judge_peer(&CONFIRMERS, 7, 1000, Path::new("/bin/bitscomp"), Some("holder=7")).is_ok());
-    assert!(judge_peer(&CONFIRMERS, 7, 1000, Path::new("/bin/bitscomp"), Some("holder=8")).is_err());
+    let comp = Path::new("/boot/BITSOS2/bin/bitscomp");
+    let ok = judge_peer(&CONFIRMERS, 7, 1000, comp, Some("holder=7\n")).unwrap();
+    assert!(ok.contains("/boot/BITSOS2/bin/bitscomp") && ok.contains("holds the compositor grant"), "{ok}");
+    assert!(judge_peer(&CONFIRMERS, 7, 1000, comp, Some("holder=9\n")).unwrap_err().contains("pid 9 holds"));
+    assert!(judge_peer(&CONFIRMERS, 7, 1000, comp, Some("holder=none\n")).unwrap_err().contains("no process holds"));
     // No holder file: uid and executable decide, as before INT-W17.
-    assert!(judge_peer(&CONFIRMERS, 7, 0, gpu, None).is_ok());
-    assert!(judge_peer(&CONFIRMERS, 7, 1000, Path::new("/tmp/bitscomp-gpu"), Some("holder=7")).unwrap_err().contains("not /bin/bitscomp or"));
-    assert!(judge_peer(&CONFIRMERS, 7, 1001, gpu, Some("holder=7")).unwrap_err().contains("uid 1001"));
+    assert!(judge_peer(&CONFIRMERS, 7, 0, comp, None).is_ok());
+    assert!(judge_peer(&CONFIRMERS, 7, 1000, Path::new("/bin/bitscomp"), Some("holder=7")).unwrap_err().contains("not /boot/BITSOS2/bin/bitscomp"));
+    assert!(judge_peer(&CONFIRMERS, 7, 1001, comp, Some("holder=7")).unwrap_err().contains("uid 1001"));
     // The test confirmer has no holder check.
     assert!(judge_peer(&[bitsinstall::TEST_CONFIRMER], 7, 0, Path::new("/bin/bitsinstall"), Some("holder=none")).is_ok());
 }

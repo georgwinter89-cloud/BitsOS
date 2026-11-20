@@ -1,5 +1,5 @@
-//! SX-2: `/proc/<pid>/ns/` (linux-6.6/fs/proc/namespaces.c) and the user namespace files `uid_map`,
-//! `gid_map`, `projid_map`, `setgroups` (fs/proc/base.c :3037-3200, kernel/user_namespace.c).
+//! SX-2: `/proc/<pid>/ns/` (linux-7.3.1/fs/proc/namespaces.c:15) and the user namespace files `uid_map`,
+//! `gid_map`, `projid_map`, `setgroups` (fs/proc/base.c :3066-3196, kernel/user_namespace.c).
 //!
 //! The ns links: readlink shows `<kind>:[<inum>]`, an open gives a namespace file (setns takes it), a walk
 //! through them lands on nsfs's place (`proc::ns::file`); readlink and follow need ptrace read access

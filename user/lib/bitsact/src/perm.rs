@@ -1,15 +1,18 @@
 //! The permission gate for actions that change something (`Safety::Change`, `Safety::DeleteOverwrite`): each one
-//! has a settings key `claude.actions.<tool>` (choice `deny`/`allow`, default `deny`, safety `confirm`) that the
-//! service registers with settingsd (`/run/bitsos/settings.sock`). A call runs only while its key is `allow`;
-//! settingsd unreachable, the key missing or any other value refuse it (fail closed). Georg allows it on the
-//! settings page or in the shell (`settings set claude.actions.brave_download allow --confirm`). An `allow` that
-//! came over MCP does not count: settingsd's own MCP tools write with the source `mcp` (a source the caller
-//! cannot choose), and the gate reads the key's newest journal entry (`history`) at every call: an MCP client
-//! cannot grant itself the action with `settings_set {confirmed: true}`. An `allow` without a journal entry
-//! (trimmed away) is refused too: Georg sets it again. Limits: a client that may run programs (the kernel's `run`
-//! tool) can run the `settings` command itself, so against such a client the gate is advice, not a wall; the wall
-//! is the kernel's per-client policy (a change request to MC/PM). The value is read at every call, so a change
-//! applies at once. PM-3 (permd) replaces this by its own rules (`perm.<program>.*`, with `ask`).
+//! has a settings key `claude.actions.<tool>` (choice `deny`/`allow`, default `allow` since DECISIONS 18.11.:
+//! everything built is on; safety `confirm`) that the service registers with settingsd (`/run/bitsos/settings.sock`).
+//! A call runs while its key is `allow`; Georg forbids an action by setting `deny` (settings page, or `settings set
+//! claude.actions.brave_download deny --confirm`). settingsd unreachable, the key missing after registering or any
+//! other value refuse the call (fail closed). The fixed rules live in the actions themselves (no password or payment
+//! field typed, `brave/actions`), whatever the key says.
+//!
+//! An `allow` that came over MCP after Georg's `deny` does not count: settingsd's own MCP tools write with the
+//! source `mcp` (a source the caller cannot choose), and the gate reads the key's newest journal entry (`history`)
+//! for an `allow`: an MCP client cannot take back Georg's `deny` with `settings_set {confirmed: true}` or an undo.
+//! No journal entry is the default (or a change trimmed away) and runs. Limits: a client that may run programs (the
+//! kernel's `run` tool) can run the `settings` command itself, so against such a client the gate is advice, not a
+//! wall; the wall is the kernel's per-client policy (a change request to MC/PM). The value is read at every call,
+//! so a change applies at once. PM-3 (permd) replaces this by its own rules (`perm.<program>.*`, with `ask`).
 
 use crate::events::{Events, Level, q};
 use mcpreg::Json;
@@ -59,7 +62,7 @@ impl Permissions {
             Json::obj(vec![
                 ("key", Json::Str(key_for(&g.tool))),
                 ("schema", Json::obj(vec![("type", Json::str("choice")), ("choices", Json::Arr(vec![Json::str("deny"), Json::str("allow")]))])),
-                ("default", Json::str("deny")),
+                ("default", Json::str("allow")),
                 ("text", Json::obj(vec![("de", Json::str(&g.de)), ("en", Json::str(&g.en))])),
                 ("restart", Json::str("none")),
                 ("safety", Json::str("confirm")),
@@ -75,7 +78,8 @@ impl Permissions {
         }
     }
 
-    /// Ok when the tool's key is `allow`; Err is the refusal the caller sees.
+    /// Ok when the tool's key is `allow` (the default) and no client set it back after Georg's deny; Err is the
+    /// refusal the caller sees.
     pub fn check(&self, tool: &str) -> Result<(), String> {
         let key = key_for(tool);
         let v = match self.value(&key) {
@@ -92,29 +96,22 @@ impl Permissions {
             Ok((v, src)) if v == "allow" && NOT_GEORG.contains(&src.as_str()) => {
                 self.ev.emit(Level::Warn, "perm.self_granted", &format!("tool={} key={key} source={}", q(tool), q(&src)));
                 Err(format!(
-                    "{tool} is refused: {key} was set to allow over MCP (source {src:?}), not by Georg. A client cannot \
-allow itself a change action. Georg allows it on the settings page or in the shell; as the value is allow already, \
-he sets it to deny and then to allow again (settingsd journals only changes). / {tool} abgelehnt: {key} wurde über MCP \
-erlaubt, nicht von Georg: einmal auf deny und wieder auf allow stellen."
-                ))
-            }
-            Ok((v, src)) if v == "allow" && src.is_empty() => {
-                self.ev.emit(Level::Warn, "perm.no_journal", &format!("tool={} key={key}", q(tool)));
-                Err(format!(
-                    "{tool} is refused: {key} is allow, but settingsd's journal no longer says who set it. Georg sets it \
-again (settings page, or `settings set {key} allow --confirm` in the shell)."
+                    "{tool} is refused: {key} was set back to allow over MCP (source {src:?}), not by Georg. A client \
+cannot take back Georg's deny. Georg allows it again on the settings page or in the shell (`settings reset {key} \
+--confirm`). / {tool} abgelehnt: {key} wurde über MCP wieder erlaubt, nicht von Georg."
                 ))
             }
             Ok((v, src)) if v == "allow" => {
-                self.ev.emit(Level::Info, "perm.allowed", &format!("tool={} key={key} source={}", q(tool), q(&src)));
+                let src = if src.is_empty() { "default" } else { src.as_str() };
+                self.ev.emit(Level::Info, "perm.allowed", &format!("tool={} key={key} source={}", q(tool), q(src)));
                 Ok(())
             }
             Ok((v, _)) => {
                 self.ev.emit(Level::Info, "perm.refused", &format!("tool={} key={key} value={}", q(tool), q(&v)));
                 Err(format!(
-                    "{tool} changes something and is not permitted: the setting {key} is {v:?}. Ask Georg; when he \
-agrees, he sets it himself on the settings page or in the shell (`settings set {key} allow --confirm`); an allow \
-set over MCP (settings_set) does not count. / {tool} ist nicht erlaubt ({key} = {v}); Georg kann es erlauben."
+                    "{tool} changes something and Georg has forbidden it: the setting {key} is {v:?}. Ask Georg; when \
+he agrees, he allows it himself on the settings page or in the shell (`settings reset {key} --confirm`); an allow set \
+over MCP (settings_set) does not count. / {tool} hat Georg verboten ({key} = {v}); nur er kann es wieder erlauben."
                 ))
             }
             Err(e) => {

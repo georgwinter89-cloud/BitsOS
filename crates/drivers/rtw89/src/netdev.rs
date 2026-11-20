@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 use devmodel::DevError;
-use devmodel::net::{LinkState, MacAddr, NetDevice, NetStats};
+use devmodel::net::{LinkState, MacAddr, NetDevice, NetStats, Wireless};
 
 use crate::card::Card;
 
@@ -41,6 +41,12 @@ impl NetDevice for WlanNet {
     /// The panic mirror never goes over the WLAN: no chip access without the thread's lock
     fn poll_tx(&self, _frame: &[u8]) -> bool {
         false
+    }
+    /// SYS-K: from the status the driver thread keeps (`signal_dbm` is the AP link's averaged RSSI).
+    fn wireless(&self) -> Option<Wireless> {
+        let s = self.0.status.lock();
+        let associated = s.state == "connected" && s.bssid.is_some();
+        Some(Wireless { associated, signal_dbm: s.signal_dbm.filter(|_| associated) })
     }
     fn stats(&self) -> NetStats {
         let c = &self.0;

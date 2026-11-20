@@ -1,5 +1,5 @@
 //! The volume's state behind its lock (`ext4.vol`): superblock, group descriptors, the inodes in memory, and
-//! block and inode I/O through a transaction.
+//! block and inode I/O through a transaction. A file's data is written without the lock (`flight`).
 
 use crate::dev::Dev;
 use crate::gd::{self, Table};
@@ -38,6 +38,10 @@ pub struct State {
     pub nodes: BTreeMap<u32, Node>,
     /// Blocks promised to cached file data (the sum of the nodes' reservations, in blocks).
     pub reserved: u64,
+    /// FS-W: the write-back steps whose data is at the device now, and the blocks they claimed.
+    pub flights: crate::flight::Flights,
+    /// FS-W2, no journal: freed blocks that wait for the device flush that makes their free durable.
+    pub held: crate::held::Held,
     pub now: fn() -> Time,
     pub next_gen: u32,
     pub writable: bool,
@@ -55,6 +59,10 @@ pub struct State {
     /// not hold ends it with `MISS` (noted in `miss`), the caller reads it with the lock released and asks again.
     pub no_io: Cell<bool>,
     pub miss: Cell<Option<(u64, usize)>>,
+    /// BIGDIR: the directories' indexes and their numbers for fstat (`vol_dirx`).
+    pub dirx: crate::vol_dirx::Dirs,
+    /// Extent lookups of `reserve_pages` on this volume (`runs`; read by its tests).
+    pub map_lookups: Cell<u64>,
 }
 
 /// The internal errno of a read that stopped at a block not in the device's cache (`State::no_io`); never leaves the
@@ -106,11 +114,22 @@ impl State {
     }
     /// Reads `n` consecutive blocks into `buf` (file data).
     pub fn read_blocks(&self, blk: u64, buf: &mut [u8]) -> Result<(), i64> {
+        self.read_blocks_as(blk, buf, false)
+    }
+    /// `read_blocks` for file data the caller writes back with `write_data_block` (`Dev::read_data`).
+    pub fn read_data_block(&self, blk: u64, buf: &mut [u8]) -> Result<(), i64> {
+        self.read_blocks_as(blk, buf, true)
+    }
+    fn read_blocks_as(&self, blk: u64, buf: &mut [u8], data: bool) -> Result<(), i64> {
         let n = (buf.len() as u64).div_ceil(self.geo.bs);
         if blk.checked_add(n).is_none_or(|e| e > self.geo.blocks) {
             return Err(EUCLEAN);
         }
-        self.dev_read(blk * self.geo.bs, buf)?;
+        if data {
+            self.dev.read_data(blk * self.geo.bs, buf)?;
+        } else {
+            self.dev_read(blk * self.geo.bs, buf)?;
+        }
         // Metadata of the running journal transaction and of the one in flight (directory blocks, slow symlinks)
         // is not home yet; the running one is newer.
         if let Some(j) = self.jnl.as_ref() {
@@ -131,6 +150,15 @@ impl State {
         }
         self.written += data.len() as u64;
         self.dev.write(blk * self.geo.bs, data)
+    }
+    /// `write_blocks` for blocks of file data: `Dev::write_data` (on a disk straight to it, beside its cache).
+    pub fn write_data_block(&mut self, blk: u64, data: &[u8]) -> Result<(), i64> {
+        let n = (data.len() as u64).div_ceil(self.geo.bs);
+        if blk.checked_add(n).is_none_or(|e| e > self.geo.blocks) || blk < self.geo.first_data_block {
+            return Err(EUCLEAN);
+        }
+        self.written += data.len() as u64;
+        self.dev.write_data(blk * self.geo.bs, data)
     }
 
     /// Where inode `ino` lives: (block, byte offset in it).
@@ -165,7 +193,7 @@ impl State {
     /// Writes `di` (sealed with its checksum) into its inode-table block in `tx`, and into the node.
     pub fn put_inode(&mut self, tx: &mut Tx, di: &mut DiskInode) -> Result<(), i64> {
         if di.size() > 0x7FFF_FFFF && g32(&self.sb, sb::FEATURE_RO_COMPAT) & sb::ro::LARGE_FILE == 0 {
-            // `ext4_do_update_inode` (linux-6.6/fs/ext4/inode.c:5088-5118): the first size past 2 GiB sets
+            // `ext4_do_update_inode` (linux-7.3.1/fs/ext4/inode.c:5792-5822): the first size past 2 GiB sets
             // large_file in the same change (sync with it here: the superblock goes in this transaction).
             self.save_sb(tx);
             let f = g32(&self.sb, sb::FEATURE_RO_COMPAT) | sb::ro::LARGE_FILE;
@@ -179,6 +207,9 @@ impl State {
         let mut b = self.read(Some(tx), blk)?;
         b.get_mut(off..off + self.geo.inode_size).ok_or(EUCLEAN)?.copy_from_slice(&di.raw);
         tx.put(blk, b);
+        if di.is_dir() {
+            self.dirx.inode_put(tx, di, &self.geo);
+        }
         if let Some(n) = self.nodes.get_mut(&di.ino) {
             tx.undo_nodes.entry(di.ino).or_insert_with(|| n.di.raw.clone());
             n.di = di.clone();
@@ -204,14 +235,17 @@ impl State {
     }
     /// Forgets a transaction that will not be committed: the in-memory superblock, descriptors and inodes
     /// are as before it (the disk never saw it).
-    pub fn abort(&mut self, tx: Tx) {
-        if let Some(s) = tx.undo_sb {
+    pub fn abort(&mut self, mut tx: Tx) {
+        self.dirx.abort(&tx.settle_dirs());
+        let late = self.flights.late_among(&tx.freed);
+        self.flights.late_unfreed(late);
+        if let Some(s) = tx.undo_sb.take() {
             self.sb = s;
         }
-        for (g, d) in tx.undo_gd {
+        for (g, d) in core::mem::take(&mut tx.undo_gd) {
             self.gd.desc_mut(g).copy_from_slice(&d);
         }
-        for (ino, raw) in tx.undo_nodes {
+        for (ino, raw) in core::mem::take(&mut tx.undo_nodes) {
             if let Some(n) = self.nodes.get_mut(&ino) {
                 n.di.raw = raw;
                 n.blocks.store(n.di.blocks512(&self.geo), Ordering::Relaxed);
@@ -220,6 +254,7 @@ impl State {
     }
     /// A failed write leaves memory ahead of the disk: no more writes until e2fsck (Linux errors=remount-ro).
     pub fn failed(&mut self, e: i64) -> i64 {
+        self.dirx.clear();
         if self.writable {
             self.writable = false;
             self.stopped.store(true, Ordering::Release);
@@ -237,6 +272,19 @@ impl State {
         // that cannot say so per request.
         if self.writable && (e == ETIMEDOUT || (e == EIO && self.dev.take_timed_out())) {
             klog::event!(Warn, "ext4", "commit.timeout", errno = e; "the device timed out; the volume stays writable, the next commit writes it again");
+            return true;
+        }
+        false
+    }
+    /// The commit a full log asked for in the middle of an operation (`join`) found no memory for the log
+    /// writer's buffers: nothing of it is on the disk that the next commit does not write again (`commit_failed`
+    /// lets the same failure of the 5-second commit pass), and the transaction that waited for it has not joined.
+    /// So the operation answers ENOMEM and the volume stays writable; a /data that went read-only because memory
+    /// was short for a moment would need a restart and an e2fsck. False once something else stopped the volume
+    /// (failed home writes: `end_commit`).
+    pub fn just_nomem(&mut self, e: i64) -> bool {
+        if self.writable && e == ENOMEM {
+            klog::event!(Warn, "ext4", "commit.nomem"; "no memory for a commit in the middle of an operation; the operation fails, the volume stays writable, the next commit writes it again");
             return true;
         }
         false
@@ -274,9 +322,12 @@ impl State {
     /// blocks' home places.
     pub fn commit(&mut self, mut tx: Tx) -> Result<(), i64> {
         if tx.is_empty() {
+            // It changed no block; whatever it noted of a directory is not worth trusting.
+            self.dirx.abort(&tx.settle_dirs());
             return Ok(());
         }
         if !self.writable {
+            self.dirx.abort(&tx.settle_dirs());
             return Err(EROFS);
         }
         if self.frozen {
@@ -287,14 +338,20 @@ impl State {
         let before = if self.dirty { None } else { tx.undo_sb.clone() };
         self.timeout_begin();
         let r = self.ensure_dirty_from(before).and_then(|()| if self.jnl.is_some() { self.join_tx(&mut tx) } else { self.commit_inner(&mut tx) });
-        let Err(e) = r else { return Ok(()) };
+        let Err(e) = r else {
+            // Written or joined: the indexes are as the disk will be.
+            tx.settle_dirs();
+            return Ok(());
+        };
         // With a journal, a failure here left this transaction out of the running one (`join` commits the running
         // one before it adds to it; a write around the log stops the volume itself): forgotten like a frozen
         // volume's. Without a journal its blocks may be half written, so it stops the volume whatever the cause.
-        if self.jnl.is_some() && self.just_slow(e) {
+        if self.jnl.is_some() && (self.just_slow(e) || self.just_nomem(e)) {
             self.abort(tx);
             return Err(if e == ETIMEDOUT { EIO } else { e });
         }
+        // `failed` forgets every index.
+        tx.settle_dirs();
         Err(self.failed(e))
     }
     /// The blocks of `tx` in FS-8a's order (early, descriptors, superblock, the rest).
@@ -323,7 +380,13 @@ impl State {
     fn join_tx(&mut self, tx: &mut Tx) -> Result<(), i64> {
         let blocks = self.tx_blocks(tx, true)?;
         let freed = core::mem::take(&mut tx.freed);
-        self.join(blocks, freed)
+        // The frees leave `tx` here: if the join fails, `abort` no longer sees them.
+        let late = self.flights.late_among(&freed);
+        let r = self.join(blocks, freed);
+        if r.is_err() {
+            self.flights.late_unfreed(late);
+        }
+        r
     }
     fn commit_inner(&mut self, tx: &mut Tx) -> Result<(), i64> {
         let late = tx.take_late();
@@ -411,6 +474,7 @@ impl State {
         let di = n.di.clone();
         let mapped_end = di.size().div_ceil(4096);
         let mut add: Vec<(u64, u32)> = Vec::new();
+        let mut runs = crate::runs::Runs::default();
         for p in first..=last {
             if n.reserved.contains_key(&p) {
                 continue;
@@ -418,7 +482,8 @@ impl State {
             let mut need = 0u32;
             for k in 0..bpp {
                 let l = p * bpp + k;
-                let mapped = p < mapped_end && l < 1 << 32 && matches!(crate::extent::lookup(self, None, &di, l as u32)?, crate::extent::Found::Ext(_));
+                // A block a step in flight writes is mapped when the step ends (its blocks are claimed).
+                let mapped = self.flights.covers(ino, l) || (p < mapped_end && l < 1 << 32 && runs.mapped(self, &di, l as u32)?);
                 if !mapped {
                     need += 1;
                 }
@@ -434,9 +499,9 @@ impl State {
         // The root reserve is for root (and s_def_resuid/resgid) only; extent-tree blocks a write-back may
         // need come out of it for anyone.
         // The caller's credentials are asked only when the reserve decides (not on every write).
-        if self.free_blocks() < self.keep_for(None) + total {
+        if self.free_now() < self.keep_for(None) + total {
             let who = vfs::inode::current_cred().map(|c| (c.uid, c.gid));
-            if who.is_none() || self.free_blocks() < self.keep_for(who) + total {
+            if who.is_none() || self.free_now() < self.keep_for(who) + total {
                 return Err(ENOSPC);
             }
         }
@@ -449,7 +514,7 @@ impl State {
 
     /// Free blocks a metadata allocation for `who` (uid, gid; None: not known, treated as a user) must leave:
     /// the blocks promised to dirty pages, and the root reserve unless `who` may use it (root, `s_def_resuid`
-    /// or `s_def_resgid`: `ext4_has_free_clusters`, linux-6.6/fs/ext4/balloc.c:612).
+    /// or `s_def_resgid`: `ext4_has_free_clusters`, linux-7.3.1/fs/ext4/balloc.c:624).
     pub fn keep_for(&self, who: Option<(u32, u32)>) -> u64 {
         let (resuid, resgid) = (g16(&self.sb, sb::DEF_RESUID) as u32, g16(&self.sb, sb::DEF_RESGID) as u32);
         let root = who.is_some_and(|(u, g)| u == 0 || u == resuid || (resgid != 0 && g == resgid));

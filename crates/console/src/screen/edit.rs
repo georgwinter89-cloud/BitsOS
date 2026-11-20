@@ -4,7 +4,6 @@
 //! inside it and is forgotten when the cursor leaves or the rows move.
 
 use super::{Cell, DEFAULT_ATTR, Esc, FG_INDEX, SAVED0, Saved, Screen};
-use alloc::vec;
 use alloc::vec::Vec;
 
 impl Screen {
@@ -182,17 +181,24 @@ impl Screen {
 
     /// Rows `top..bot` move up by `n`. `keep`: the whole main screen scrolling puts the top rows into the
     /// scrollback (a line feed at the bottom); the alternate screen and the editing sequences never do.
+    /// Nothing is allocated here once the writer prepared (`stock`): the row that leaves is the row that comes.
     pub(super) fn scroll_up(&mut self, top: u32, bot: u32, n: u32, keep: bool) {
         let bot = bot.min(self.rows);
         if top >= bot {
             return;
         }
         let n = n.min(bot - top);
-        let blank = vec![self.erase_cell(); self.cols as usize];
+        let (e, cols) = (self.erase_cell(), self.cols as usize);
         let whole = top == 0 && bot == self.rows;
         if whole && keep && self.alt.is_none() {
             for _ in 0..n {
-                self.hist.push_back(blank.clone());
+                let mut row = self.scrollback_row();
+                row.clear();
+                row.resize(cols, e);
+                if self.hist.len() == self.hist.capacity() {
+                    self.unprepared += 1;
+                }
+                self.hist.push_back(row);
                 self.trim();
                 if self.view > 0 {
                     // Looking back: the picture stays where it is (Linux keeps the view too).
@@ -205,8 +211,7 @@ impl Screen {
         }
         let b = self.base();
         for _ in 0..n {
-            self.hist.remove(b + top as usize);
-            self.hist.insert(b + bot as usize - 1, blank.clone());
+            self.move_row(b + top as usize, b + bot as usize - 1, e);
         }
         if whole && self.view == 0 {
             self.note_scroll(n);
@@ -222,13 +227,19 @@ impl Screen {
             return;
         }
         let n = n.min(bot - top);
-        let blank = vec![self.erase_cell(); self.cols as usize];
-        let b = self.base();
+        let (e, b) = (self.erase_cell(), self.base());
         for _ in 0..n {
-            self.hist.remove(b + bot as usize - 1);
-            self.hist.insert(b + top as usize, blank.clone());
+            self.move_row(b + bot as usize - 1, b + top as usize, e);
         }
         self.touch_rows(top, bot);
+    }
+
+    /// Takes the row at `from` out and puts it back blank at `to`: the rows between move by one.
+    fn move_row(&mut self, from: usize, to: usize, blank: Cell) {
+        if let Some(mut row) = self.hist.remove(from) {
+            row.fill(blank);
+            self.hist.insert(to, row);
+        }
     }
 
     /// The whole live screen moved up by `n`: the renderer moves pixels and draws the new rows.
@@ -290,6 +301,8 @@ impl Screen {
         (self.top, self.bot) = (0, self.rows);
         (self.attr, self.reverse) = (DEFAULT_ATTR, false);
         (self.autowrap, self.insert, self.origin, self.cursor_on) = (true, false, false, true);
+        // `reset_terminal` (linux-7.3.1/drivers/tty/vt/vt.c:2275).
+        self.bracketed_paste = false;
         self.erase_display(2);
         (self.col, self.row) = (0, 0);
         self.saved = SAVED0;

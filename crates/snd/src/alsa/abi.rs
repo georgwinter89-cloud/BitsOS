@@ -1,9 +1,14 @@
-//! The ALSA user ABI for x86-64 (`linux-6.6/include/uapi/sound/asound.h`): ioctl numbers, struct sizes and field
-//! offsets, little-endian accessors. Structs are handled as byte arrays (no unsafe, no layout assumptions); the
-//! offsets below are the 64-bit layout (`snd_pcm_uframes_t` = 8 bytes, 64-bit `time_t`), checked by host tests.
+//! The ALSA user ABI for x86-64 (`linux-7.3.1/include/uapi/sound/asound.h`): ioctl numbers, struct sizes
+//! and field offsets, little-endian accessors. Structs are handled as byte arrays (no unsafe, no layout assumptions);
+//! the offsets below are the 64-bit layout (`snd_pcm_uframes_t` = 8 bytes, 64-bit `time_t`), checked by host tests.
 
-pub const SNDRV_PCM_VERSION: u32 = (2 << 16) | 15; // asound.h:145, 2.0.15
-pub const SNDRV_CTL_VERSION: u32 = (2 << 16) | 9; // asound.h:1038, 2.0.9
+/// asound.h:145, 2.0.18. What the steps since 2.0.15 promise and BitsOS keeps: 2.0.16 the MSBITS subformats
+/// (the subformat rule and the fixup in `params`), 2.0.17 the sync ID in hw_params (bytes 544-559, returned as the
+/// program gave it: no driver sync ID) and an empty `snd_pcm_info` sync, 2.0.18 the PERFECT_DRAIN info bit
+/// (not set: the device needs the silence after the end).
+pub const SNDRV_PCM_VERSION: u32 = (2 << 16) | 18;
+/// asound.h:1061, 2.0.10: CARD_BYTES (`ctl`).
+pub const SNDRV_CTL_VERSION: u32 = (2 << 16) | 10;
 
 /// `_IOC(dir, type, nr, size)` (asm-generic/ioctl.h): dir 1 = write (to the kernel), 2 = read.
 const fn ioc(dir: u64, ty: u8, nr: u8, size: usize) -> u64 {
@@ -72,6 +77,10 @@ pub const CTL_EVENT_SIZE: usize = 72;
 
 pub const CTL_PVERSION: u64 = ior(b'U', 0x00, 4);
 pub const CTL_CARD_INFO: u64 = ior(b'U', 0x01, CARD_INFO_SIZE);
+/// `struct snd_ctl_card_bytes` (asound.h:1086): type 0, data_allocated 4, data_len 8, reserved 12, data 16.
+pub const CARD_BYTES_SIZE: usize = 24;
+pub const CTL_CARD_BYTES: u64 = iowr(b'U', 0x02, CARD_BYTES_SIZE);
+pub const CARD_BTYPE_COMPONENTS: u32 = 1;
 pub const CTL_ELEM_LIST: u64 = iowr(b'U', 0x10, ELEM_LIST_SIZE);
 pub const CTL_ELEM_INFO: u64 = iowr(b'U', 0x11, ELEM_INFO_SIZE);
 pub const CTL_ELEM_READ: u64 = iowr(b'U', 0x12, ELEM_VALUE_SIZE);
@@ -86,7 +95,7 @@ pub const CTL_RAWMIDI_NEXT_DEVICE: u64 = iowr(b'U', 0x40, 4);
 pub const CTL_POWER: u64 = iowr(b'U', 0xd0, 4);
 pub const CTL_POWER_STATE: u64 = ior(b'U', 0xd1, 4);
 
-// PCM states (asound.h:304).
+// PCM states (asound.h:307).
 pub const STATE_OPEN: u32 = 0;
 pub const STATE_SETUP: u32 = 1;
 pub const STATE_PREPARED: u32 = 2;
@@ -96,7 +105,7 @@ pub const STATE_DRAINING: u32 = 5;
 pub const STATE_PAUSED: u32 = 6;
 pub const STATE_DISCONNECTED: u32 = 8;
 
-// hw_params info bits (asound.h:272).
+// hw_params info bits (asound.h:275).
 pub const INFO_INTERLEAVED: u32 = 0x100;
 pub const INFO_BATCH: u32 = 0x10;
 pub const INFO_BLOCK_TRANSFER: u32 = 0x1_0000;
@@ -112,7 +121,9 @@ pub const ACCESS_RW_INTERLEAVED: u32 = 3;
 pub const FORMAT_S16_LE: u32 = 2;
 pub const FORMAT_S32_LE: u32 = 10;
 pub const FORMAT_FLOAT_LE: u32 = 14;
+pub const FORMAT_LAST: u32 = 52;
 pub const SUBFORMAT_STD: u32 = 0;
+pub const SUBFORMAT_MSBITS_MAX: u32 = 1;
 
 pub const SYNC_PTR_HWSYNC: u32 = 1;
 pub const SYNC_PTR_APPL: u32 = 2;
@@ -155,9 +166,9 @@ pub fn put_str(b: &mut [u8], off: usize, len: usize, s: &str) {
     b[off + n] = 0;
 }
 
-/// `struct snd_pcm_info` (asound.h:336): device 0, subdevice 4, stream 8, card 12, id[64] 16, name[80] 80,
-/// subname[32] 160, dev_class 192, dev_subclass 196, subdevices_count 200, subdevices_avail 204, sync 208,
-/// reserved 224.
+/// `struct snd_pcm_info` (asound.h:339): device 0, subdevice 4, stream 8, card 12, id[64] 16, name[80] 80,
+/// subname[32] 160, dev_class 192, dev_subclass 196, subdevices_count 200, subdevices_avail 204, pad1 208 (was
+/// the sync ID, zero since 2.0.17), reserved 224.
 pub mod pcm_info {
     pub const DEVICE: usize = 0;
     pub const SUBDEVICE: usize = 4;
@@ -170,7 +181,7 @@ pub mod pcm_info {
     pub const AVAIL: usize = 204;
 }
 
-/// `struct snd_pcm_sw_params` (asound.h:448).
+/// `struct snd_pcm_sw_params` (asound.h:433).
 pub mod sw {
     pub const TSTAMP_MODE: usize = 0;
     pub const PERIOD_STEP: usize = 4;
@@ -184,7 +195,7 @@ pub mod sw {
     pub const TSTAMP_TYPE: usize = 76;
 }
 
-/// `struct snd_pcm_status` / kernel `snd_pcm_status64` on x86-64 (asound.h:500).
+/// `struct snd_pcm_status` / kernel `snd_pcm_status64` on x86-64 (asound.h:481).
 pub mod status {
     pub const STATE: usize = 0;
     pub const TRIGGER_TSTAMP: usize = 8;
@@ -201,7 +212,7 @@ pub mod status {
     pub const DRIVER_TSTAMP: usize = 112;
 }
 
-/// `struct snd_pcm_sync_ptr` (64-bit = `__snd_pcm_sync_ptr64`, asound.h:617): flags 0; status union at 8
+/// `struct snd_pcm_sync_ptr` (64-bit = `__snd_pcm_sync_ptr64`, asound.h:594): flags 0; status union at 8
 /// (state 8, hw_ptr 16, tstamp 24, suspended_state 40, audio_tstamp 48); control union at 72 (appl_ptr 72,
 /// avail_min 80).
 pub mod sync {
@@ -215,7 +226,7 @@ pub mod sync {
     pub const AVAIL_MIN: usize = 80;
 }
 
-/// `struct snd_ctl_card_info` (asound.h:1040).
+/// `struct snd_ctl_card_info` (asound.h:1063).
 pub mod card {
     pub const CARD: usize = 0;
     pub const ID: usize = 8;

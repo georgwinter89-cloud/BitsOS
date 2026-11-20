@@ -114,7 +114,7 @@ fn drop_grant(pid: u32, why: &'static str) {
 
 /// INT-W17 (MC-9b CR 2): `/proc/bitsos/compositor` (0444) names the process holding this grant, `holder=<pid>`
 /// or `holder=none`, so the installer takes only the real compositor as the one that confirms (MC-9a open point
-/// 2: a second /bin/bitscomp started while the session's is down is not the screen's holder).
+/// 2: a second bitscomp started while the session's is down is not the screen's holder).
 fn proc_render() -> alloc::string::String {
     let pid = GRANTED.load(Ordering::Acquire);
     if pid != 0 && proc::find(pid).is_some_and(|p| !p.has_exited()) {

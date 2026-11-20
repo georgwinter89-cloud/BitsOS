@@ -1,4 +1,4 @@
-//! The seccomp program bitsmcp runs under once its setup is done (classic BPF, linux-6.6/kernel/seccomp.c's
+//! The seccomp program bitsmcp runs under once its setup is done (classic BPF, linux-7.3.1/kernel/seccomp.c's
 //! rules, SX-1 on V2): x86-64 only (another arch or an x32 number ends the process), the calls a std program
 //! needs to serve accepted sockets with threads, `clone` only for threads (CLONE_THREAD), `clone3` ENOSYS (libc
 //! falls back), program start and tracing end the process, everything else EPERM: no open, no new socket, no

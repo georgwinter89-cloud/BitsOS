@@ -1,4 +1,4 @@
-//! How many namespaces of each kind a user owns (linux-6.6/kernel/ucount.c `inc_ucount`, the
+//! How many namespaces of each kind a user owns (linux-7.3.1/kernel/ucount.c:218 `inc_ucount`, the
 //! `user.max_*_namespaces` limits): every new namespace is charged to a user, and a charge past the limit is
 //! ENOSPC (`create_user_ns`, `create_pid_namespace`, `clone_uts_ns`, `create_ipc_ns`, `copy_net_ns`).
 //!

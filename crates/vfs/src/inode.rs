@@ -61,7 +61,7 @@ pub fn id_view(uid: u32, gid: u32) -> (u32, u32) {
     }
 }
 
-/// Linux `in_group_p` (linux-6.6/kernel/groups.c): the fs gid or one of the supplementary groups.
+/// Linux `in_group_p` (linux-7.3.1/kernel/groups.c:227): the fs gid or one of the supplementary groups.
 pub fn in_group(cred: Cred, gid: u32) -> bool {
     cred.gid == gid || GROUP_CHECK.get().is_some_and(|f| f(cred, gid))
 }
@@ -192,7 +192,7 @@ impl Meta {
         let t = *self.times.lock();
         (t.atime, t.mtime, t.ctime)
     }
-    /// FS-1b `setattr_copy` (linux-6.6/fs/attr.c:303): owner, times and mode of `a`, under the times lock so a
+    /// FS-1b `setattr_copy` (linux-7.3.1/fs/attr.c:342): owner, times and mode of `a`, under the times lock so a
     /// concurrent stat sees all or nothing of one change. `a.mode` keeps the type (the caller built it so).
     pub fn apply(&self, a: &crate::setattr::SetAttr) {
         use crate::setattr::*;
@@ -325,6 +325,10 @@ pub struct Inode {
     pub linkable: AtomicBool,
     /// Linux `S_IMMUTABLE` (proc's process directories): any write access to it is EPERM, before the mode bits.
     pub immutable: AtomicBool,
+    /// EINS-C (K6): the assistant tree whose process made it and no process outside that tree opened since
+    /// (0: none); such a file of the tree's own is deleted for real by the tree (`trash`). Kept in memory only:
+    /// an inode read again from its disk has none, and is then treated as Georg's.
+    pub born_tree: core::sync::atomic::AtomicU32,
     /// Its metadata charge (tmpfs inodes: `INODE_BYTES` plus a symlink's target), given back with the inode.
     _charge: Option<crate::pool::MetaCharge>,
     /// FS-10: a proc "magic" link (`/proc/<pid>/fd/<n>`): following it leads to the open file's place itself
@@ -362,22 +366,23 @@ impl Drop for DenyWrite {
 }
 
 impl Inode {
-    /// The permission check of a node (Linux `inode_permission`): a synthetic file with its own permission op
-    /// answers itself (`FileSource::permission`, SX-3b: /proc/sys/user), every other node by its mode bits.
+    /// The permission check of a node (Linux `inode_permission`): a synthetic file or directory with its own
+    /// permission op answers itself (`FileSource::permission`, SX-3b: /proc/sys/user; `DirSource::permission`,
+    /// L7-RESTE-FS: /proc/<pid>/fd, fdinfo, failfs), every other node by its mode bits.
     pub fn permission(&self, cred: Cred, want: u32) -> Result<(), Errno> {
-        if let Data::Synth(f) = &self.data
-            && let Some(r) = f.permission(cred, want)
-        {
-            return r;
-        }
-        self.meta.permission(cred, want)
+        let own = match &self.data {
+            Data::Synth(f) => f.permission(cred, want),
+            Data::SynthDir(d) => d.permission(cred, want),
+            _ => None,
+        };
+        own.unwrap_or_else(|| self.meta.permission(cred, want))
     }
     pub fn new(ino: u64, mode: u32, cred: Cred, data: Data) -> Arc<Inode> {
         Self::with_charge(ino, mode, cred, data, None)
     }
     /// An inode that holds `charge` (its metadata in its file system's pool) until it is freed.
     pub fn with_charge(ino: u64, mode: u32, cred: Cred, data: Data, charge: Option<crate::pool::MetaCharge>) -> Arc<Inode> {
-        Arc::new(Inode { meta: Meta::new(ino, mode, cred), data, linkable: AtomicBool::new(false), immutable: AtomicBool::new(false), _charge: charge, magic: None, write_count: AtomicI64::new(0), marks: Default::default() })
+        Arc::new(Inode { meta: Meta::new(ino, mode, cred), data, linkable: AtomicBool::new(false), immutable: AtomicBool::new(false), born_tree: core::sync::atomic::AtomicU32::new(0), _charge: charge, magic: None, write_count: AtomicI64::new(0), marks: Default::default() })
     }
     /// FS-15: one more link (`shmem_link` + `inc_nlink`): a tmpfs non-directory that had a name already takes
     /// one more inode slot (statfs `f_ffree`). The slot is decided by this call's own link-count step, and it is
@@ -410,6 +415,7 @@ impl Inode {
             data: Data::Symlink(text),
             linkable: AtomicBool::new(false),
             immutable: AtomicBool::new(false),
+            born_tree: core::sync::atomic::AtomicU32::new(0),
             _charge: None,
             magic: Some(magic),
             write_count: AtomicI64::new(0),
@@ -453,7 +459,7 @@ impl Inode {
             _ => 0,
         }
     }
-    /// `get_write_access` (linux-6.6/include/linux/fs.h `atomic_inc_unless_negative`): ETXTBSY while a running
+    /// `get_write_access` (linux-7.3.1/include/linux/fs.h:2836 `atomic_inc_unless_negative`): ETXTBSY while a running
     /// program denies writes.
     pub fn get_write_access(self: &Arc<Self>) -> Result<WriteAccess, Errno> {
         self.write_count.try_update(Ordering::AcqRel, Ordering::Acquire, |v| (v >= 0).then_some(v + 1)).map_err(|_| ETXTBSY)?;
@@ -561,7 +567,7 @@ impl Inode {
         }
         // MM-rmap: a shrink first takes the cut-off page-cache pages out of every mapping, so the cut can free
         // them, and after a successful cut again with the private copies and the pages a fault mapped in between
-        // (`shmem_setattr`, linux-6.6/mm/shmem.c:1191-1202: unmap, truncate, "unmap again to remove racily COWed
+        // (`shmem_setattr`, linux-7.3.1/mm/shmem.c:1369-1381: unmap, truncate, "unmap again to remove racily COWed
         // private pages"; even_cows = 1), so a later touch past the end gives SIGBUS. The first round keeps the
         // private copies (even_cows = 0): a cut that fails (EIO, EROFS from a file system) only costs refaults,
         // never a program's private data (Linux checks before it unmaps).
@@ -621,7 +627,7 @@ impl Inode {
         }
         let Data::Reg(c) = &self.data else { return Err(EOPNOTSUPP) };
         // MM-rmap: a hole punch first takes the whole pages of the hole out of every mapping (`shmem_fallocate`,
-        // linux-6.6/mm/shmem.c:3061, even_cows = 0: private copies keep their data), so the cache can free them;
+        // linux-7.3.1/mm/shmem.c:3666, even_cows = 0: private copies keep their data), so the cache can free them;
         // partly punched pages are zeroed in place. Not for a mode the cache refuses (vfs_fallocate's own checks,
         // `sys::fallocate`, refuse PUNCH_HOLE without KEEP_SIZE before this), nor when the seals refuse the punch:
         // a refused call keeps every mapping as it was.

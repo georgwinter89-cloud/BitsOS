@@ -2,14 +2,15 @@
 //! the scanners call for each frame they isolate, the sysctl knobs, the counters of /proc/vmstat and kcompactd's
 //! doorbell. The scanners themselves are `buddy/compact.rs`; the kcompactd thread is crate mm's `compact`.
 //!
-//! Page migration (MM-2) comes after this item (Georg 6.11.: lane BL before MM-2), so until a migrator is installed
-//! (`Buddy::set_migrator`) the only way to move a frame is `DropClean`: a clean, unmapped page-cache page is taken
-//! back through the page cache's `Reclaim::reclaim_frame` (it is read again when needed) and an anonymous frame
-//! stays, counted (`mm.compact.skipped_anon`). MM-2 puts the real copy behind the same trait; the scanners do not
-//! change.
+//! W35 MM-2: crate mm installs the real migrator on the boot allocator at start (`mm::migrate::Migrator`: page-cache
+//! pages get a new `CachePage` on the target, anonymous frames are copied behind migration entries; Linux 7.x
+//! `migrate_pages`). Without one (staged allocators, host tests) the only way to move a frame is `DropClean`: a
+//! clean, unmapped page-cache page is taken back through the page cache's `Reclaim::reclaim_frame` (it is read
+//! again when needed) and an anonymous frame stays, counted (`mm.compact.skipped_anon`). The scanners are the same
+//! for both; `drops()` switches the rules that only make sense when moving loses the contents.
 
 use crate::reclaim::{context_allows, Reclaim};
-use crate::Kind;
+use crate::{Buddy, FrameAlloc, Kind, Zone, PAGE};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 /// What became of one frame the migrate scanner handed over.
@@ -22,18 +23,100 @@ pub enum Moved {
     Dropped,
     /// Still in use (dirty, mapped, held, locked by someone else): the frame stays where it is.
     Stays,
-    /// A kind this migrator cannot move (anonymous memory before MM-2): stays, counted by the scanner.
+    /// A kind or frame this migrator cannot move (`DropClean`: anonymous memory; the real one: an anonymous frame
+    /// something besides its mappings holds, or one in an mlocked VMA with `compact_unevictable_allowed` 0):
+    /// stays, counted by the scanner.
     Unsupported,
+}
+
+/// W35 MM-2: a migration target: an allocated block (`order`, `kind`) that nobody else knows, owned by this
+/// handle (Linux: the folio `compaction_alloc` or `alloc_migration_target` returns). Only the allocator makes one
+/// (`Buddy::compaction_alloc`, `Buddy::alloc_target`), so holding one proves the block is unshared: that is what
+/// lets `copy_from` write it and `PageFrame` adopt it from safe code. Dropping it frees the block;
+/// `into_phys` hands it over (the caller maps it, the handle no longer frees it).
+pub struct Target<'b> {
+    b: &'b Buddy,
+    phys: u64,
+    order: u32,
+    kind: Kind,
+}
+
+impl<'b> Target<'b> {
+    /// Crate-private: only for a block `b` just allocated for this handle.
+    pub(crate) fn new(b: &'b Buddy, phys: u64, order: u32, kind: Kind) -> Target<'b> {
+        Target { b, phys, order, kind }
+    }
+    pub fn phys(&self) -> u64 {
+        self.phys
+    }
+    pub fn order(&self) -> u32 {
+        self.order
+    }
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+    pub(crate) fn buddy(&self) -> &'b Buddy {
+        self.b
+    }
+    /// The block leaves the handle (now in a page table, or a `PageFrame`'s): no longer freed by it.
+    pub fn into_phys(self) -> u64 {
+        let me = core::mem::ManuallyDrop::new(self);
+        me.phys
+    }
+    /// Copies the allocated block `src` of the same order and kind into this target: false (nothing copied) when
+    /// `src` is not such a block right now or is this target. The caller keeps `src` from changing (its holders'
+    /// translations frozen, or its owner's lock held); a racing store into it only races a plain byte copy, the
+    /// frame is plain data.
+    pub fn copy_from(&self, src: u64) -> bool {
+        let ok_kind = matches!((self.kind, self.order), (Kind::PageCache, 0) | (Kind::User, 0) | (Kind::User, crate::HUGE_ORDER));
+        let bytes = PAGE << self.order;
+        if !ok_kind || src.abs_diff(self.phys) < bytes || !self.b.run_allocated(src, 1 << self.order, self.kind) {
+            return false;
+        }
+        #[cfg(target_os = "none")]
+        // SAFETY: `src` is an allocated RAM block of a page-cache or user kind (checked), plain data reachable through
+        // the direct map; the destination is this handle's block, which nobody else knows (a `Target` exists only for
+        // a block the allocator just handed it, and it is not passed on while `&self` lives), and they do not overlap
+        // (checked).
+        unsafe {
+            core::ptr::copy_nonoverlapping(hal::phys_to_virt(src) as *const u8, hal::phys_to_virt(self.phys) as *mut u8, bytes as usize)
+        };
+        true
+    }
+}
+
+impl core::fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Target({:#x}, order {}, {:?})", self.phys, self.order, self.kind)
+    }
+}
+
+impl Drop for Target<'_> {
+    fn drop(&mut self) {
+        FrameAlloc::free(self.b, self.phys, self.order, self.kind);
+    }
+}
+
+impl Buddy {
+    /// A target from the allocator itself (callers outside compaction: `alloc`'s full path).
+    pub fn alloc_target(&self, order: u32, zone: Zone, kind: Kind) -> Option<Target<'_>> {
+        FrameAlloc::alloc(self, order, zone, kind).map(|p| Target::new(self, p, order, kind))
+    }
+    /// As `alloc_target`, only from what is free now (`FrameAlloc::alloc_light`).
+    pub fn alloc_target_light(&self, order: u32, zone: Zone, kind: Kind) -> Option<Target<'_>> {
+        FrameAlloc::alloc_light(self, order, zone, kind).map(|p| Target::new(self, p, order, kind))
+    }
 }
 
 /// Moves one order-0 frame of a movable kind (`Kind::PageCache` or `Kind::User`) out of the way (Linux
 /// `migrate_pages` with `compaction_alloc` as the target source). Called without any allocator lock held, from a
 /// context that may reclaim (`reclaim::context_allows`), inside `reclaim::enter`. Must not wait for a lock
-/// (try-locks only, as `Reclaim`).
+/// (try-locks only, as `Reclaim`). A target `dest` hands out is the migrator's: it becomes the moved page's frame
+/// (`Target::into_phys`, or a `PageFrame` adopts it) or it drops and goes back.
 pub trait Migrate: Sync {
     /// `phys`: the frame; `owner`: its owner word (`Buddy::owner`); `dest`: a free frame of `kind` for the copy,
     /// isolated by the free scanner (None: none left).
-    fn migrate(&self, phys: u64, kind: Kind, owner: u64, dest: &mut dyn FnMut() -> Option<u64>) -> Moved;
+    fn migrate<'b>(&self, phys: u64, kind: Kind, owner: u64, dest: &mut dyn FnMut() -> Option<Target<'b>>) -> Moved;
     /// Whether moving a frame loses its contents (`DropClean`): the scanners then clear only blocks that end up
     /// free and cap what one background run may drop.
     fn drops(&self) -> bool {
@@ -41,12 +124,12 @@ pub trait Migrate: Sync {
     }
 }
 
-/// The migrator until MM-2: drop-if-clean through the page cache's reclaimer (vfs `reclaim_frame`: clean, not
-/// dirty, nobody else holds the page; mapped and held pages stay).
+/// The migrator where crate mm's is not installed (staged allocators, host tests): drop-if-clean through the page
+/// cache's reclaimer (vfs `reclaim_frame`: clean, not dirty, nobody else holds the page; mapped and held pages stay).
 pub struct DropClean<'a>(pub &'a dyn Reclaim);
 
 impl Migrate for DropClean<'_> {
-    fn migrate(&self, phys: u64, kind: Kind, owner: u64, _dest: &mut dyn FnMut() -> Option<u64>) -> Moved {
+    fn migrate<'b>(&self, phys: u64, kind: Kind, owner: u64, _dest: &mut dyn FnMut() -> Option<Target<'b>>) -> Moved {
         match kind {
             Kind::PageCache if owner != 0 => {
                 if self.0.reclaim_frame(phys, owner) {
@@ -71,8 +154,8 @@ static PROACTIVENESS: AtomicU32 = AtomicU32::new(20);
 /// `vm.extfrag_threshold` (0..=1000, default 500): below it a costly order's failure is lack of memory, not
 /// fragmentation, and compaction is not tried (`compaction_suitable`).
 static EXTFRAG_THRESHOLD: AtomicU32 = AtomicU32::new(500);
-/// `vm.compact_unevictable_allowed` (0..=1, default 1). Kept as written: no migrator moves mlocked pages yet
-/// (cache pages mapped by anyone stay, anonymous frames are not moved before MM-2).
+/// `vm.compact_unevictable_allowed` (0..=1, default 1): with 0 the migrator leaves anonymous frames of mlocked
+/// VMAs where they are (W35 MM-2; mapped cache pages never move, CONTRACTS BL-3/MM-2).
 static UNEVICTABLE_ALLOWED: AtomicU32 = AtomicU32::new(1);
 
 pub fn proactiveness() -> u32 {
@@ -131,10 +214,15 @@ klog::counter!(pub ISOLATED, "mm.compact.isolated");
 klog::counter!(pub STALL, "mm.compact.stall");
 klog::counter!(pub FAIL, "mm.compact.fail");
 klog::counter!(pub SUCCESS, "mm.compact.success");
+// W35 MM-2: last tries after a run whose scanners met (targets out of any pageblock, `Buddy::compact_last`), and
+// those that made the block.
+klog::counter!(pub LAST_TRIES, "mm.compact.last_tries");
+klog::counter!(pub LAST_MADE, "mm.compact.last_made");
 klog::counter!(pub DAEMON_WAKE, "mm.compact.daemon_wake");
 klog::counter!(pub DAEMON_MIGRATE_SCANNED, "mm.compact.daemon_migrate_scanned");
 klog::counter!(pub DAEMON_FREE_SCANNED, "mm.compact.daemon_free_scanned");
-// Anonymous frames the migrate scanner found in a block it would have cleared (none can move before MM-2).
+// Anonymous frames the migrate scanner found in a block it would have cleared and could not move (with a copying
+// migrator: those something besides their mappings holds, or an mlocked VMA's with compact_unevictable_allowed 0).
 klog::counter!(pub SKIPPED_ANON, "mm.compact.skipped_anon");
 // Page-cache frames dropped instead of moved (`DropClean`).
 klog::counter!(pub DROPPED, "mm.compact.dropped");

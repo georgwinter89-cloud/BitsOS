@@ -19,7 +19,12 @@
 extern crate alloc;
 
 pub mod bitsos;
+mod access;
+mod tree;
+mod tree_ktests;
+mod access_ktests;
 mod fs2_ktests;
+mod ioac;
 mod fs3_ktests;
 mod fs4_ktests;
 mod fs5_ktests;
@@ -32,6 +37,7 @@ mod kmsg;
 mod mount_sys;
 mod pf3_ktests;
 mod pf4_ktests;
+mod fpos_ktests;
 mod pf5_ktests;
 mod pf6_ktests;
 mod pf7_ktests;
@@ -72,7 +78,7 @@ impl UserMem for ProcMem<'_> {
     fn direct_page_copy(&self) -> bool {
         true
     }
-    /// PF-6 (fs-PF-4 CR 2): straight from the frame: no-fault first, then `copy_frames_to_user` (one `mm.as`,
+    /// PF-6 (PF-4's CR 2): straight from the frame: no-fault first, then `copy_frames_to_user` (one `mm.as`,
     /// user pages filled) from the first byte it left. A heap page (never in the kernel) through the stack.
     fn write_page(&self, addr: u64, page: &vfs::pagecache::CachePage, off: usize, n: usize) -> usize {
         let n = n.min(vfs::frame::PAGE.saturating_sub(off));
@@ -85,7 +91,7 @@ impl UserMem for ProcMem<'_> {
         }
         d + self.0.mm.copy_frames_to_user(addr + d as u64, &[(pf, off + d, n - d)])
     }
-    /// PF-6 (fs-PF-5 CR 2): the lockless read section's copy: no lock, no fault handled.
+    /// PF-6 (PF-5's CR 2): the lockless read section's copy: no lock, no fault handled.
     fn nofault_page_copy(&self) -> bool {
         true
     }
@@ -174,10 +180,10 @@ fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     // FS-16: the calling thread's cwd/root/umask, apart from the fd table; PF-7: looked up when a call asks.
     let fs = proc::ThreadFs::new(c.thread, p);
     // PF-7: no write to a line the program's threads share: `proc.fs`, `proc.cred` and the `Arc` counts of the fs
-    // state, the credentials and the mount view were each one per syscall (plan/notes/fs-PF-7.md).
+    // state, the credentials and the mount view were each one per syscall (plan/spec/storage.md §3.3).
     let ns = proc::ns::mnt::CallView::new(p);
     let ids = p.group().call_ids();
-    let subject = policy::Subject { program: p.program, pid: p.pid, uid: ids.euid };
+    let subject = policy::Subject { program: p.program, pid: p.pid, uid: ids.euid, tree: p.group().tree_id() };
     let s = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns: &ns, cred: ids.fs, subject };
     let a: Args = c.args;
     f(&s, a)
@@ -239,8 +245,8 @@ fn writev_any(s: &Sys<'_>, a: Args) -> i64 {
     if on_socket(&f) { net::sock::sys::writev(s, a) } else { v::writev_file(s, f, a, 0) }
 }
 
-fs_call!(READ, read_any);
-fs_call!(WRITE, write_any);
+fs_call!(READ, ioac::read_any);
+fs_call!(WRITE, ioac::write_any);
 fs_call!(OPEN, v::open);
 // AB-5 (integration patch): close, dup2, dup3 and fcntl are AB's `syscall::fcntl::{sys_close, sys_dup2, sys_dup3,
 // sys_fcntl}` (FS's calls plus the POSIX lock release of `filp_close` and AB's fcntl commands).
@@ -248,10 +254,10 @@ fs_call!(STAT, v::stat);
 fs_call!(FSTAT, v::fstat);
 fs_call!(LSTAT, v::lstat);
 fs_call!(LSEEK, v::lseek);
-fs_call!(PREAD64, v::pread64);
-fs_call!(PWRITE64, v::pwrite64);
-fs_call!(READV, readv_any);
-fs_call!(WRITEV, writev_any);
+fs_call!(PREAD64, ioac::pread64);
+fs_call!(PWRITE64, ioac::pwrite64);
+fs_call!(READV, ioac::readv_any);
+fs_call!(WRITEV, ioac::writev_any);
 fs_call!(ACCESS, v::access);
 fs_call!(DUP, v::dup);
 fs_call!(FSYNC, v::fsync);
@@ -331,7 +337,7 @@ fs_call!(268, "fchmodat", va::fchmodat);
 fs_call!(UTIMENSAT, va::utimensat);
 fs_call!(306, "syncfs", va::syncfs);
 fs_call!(452, "fchmodat2", va::fchmodat2);
-fs_call!(40, "sendfile", vc::sendfile);
+fs_call!(40, "sendfile", ioac::sendfile);
 fs_call!(221, "fadvise64", vc::fadvise64);
 fs_call!(187, "readahead", vx::readahead);
 fs_call!(188, "setxattr", vx::setxattr);
@@ -347,11 +353,11 @@ fs_call!(197, "removexattr", vx::removexattr);
 fs_call!(198, "lremovexattr", vx::lremovexattr);
 fs_call!(199, "fremovexattr", vx::fremovexattr);
 fs_call!(277, "sync_file_range", vx::sync_file_range);
-fs_call!(295, "preadv", vc::preadv);
-fs_call!(296, "pwritev", vc::pwritev);
-fs_call!(326, "copy_file_range", vc::copy_file_range);
-fs_call!(327, "preadv2", preadv2_any);
-fs_call!(328, "pwritev2", pwritev2_any);
+fs_call!(295, "preadv", ioac::preadv);
+fs_call!(296, "pwritev", ioac::pwritev);
+fs_call!(326, "copy_file_range", ioac::copy_file_range);
+fs_call!(327, "preadv2", ioac::preadv2_any);
+fs_call!(328, "pwritev2", ioac::pwritev2_any);
 
 /// preadv2/pwritev2 at the current position (offset -1) on a socket are its readv/writev (one datagram stays
 /// one); flags other than 6.6's RWF_SUPPORTED are EOPNOTSUPP, the known ones change nothing for a socket here.

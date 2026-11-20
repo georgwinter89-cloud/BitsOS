@@ -1,16 +1,16 @@
-//! GX-7a: the firmware files' headers and the microcode list the PSP loads. Formats from linux-6.6
-//! amdgpu/amdgpu_ucode.h (`common_firmware_header` :28 and the per-block headers), the per-microcode size and
-//! offset rules of amdgpu_ucode.c `amdgpu_ucode_init_single_fw` (:740-960, PSP loading), the registration rules
-//! of gfx_v11_0.c:486-560 (RS64 from the PFP header), amdgpu_rlc.c:518-555 (RLC v2.x), amdgpu_mes.c:1390-1460,
-//! amdgpu_sdma.c:260-280, imu_v11_0.c:55-70, amdgpu_vcn.c:1040, amdgpu_dm.c:2140, and the skip and order rules
-//! of amdgpu_psp.c (`psp_load_non_psp_fw` :2560 walks the microcode IDs in enum order, `fw_load_skip_check`
-//! :2519). Every offset and size a file states is checked against the file before it is used; a part outside
-//! the file, a header too short for the fields its version has, or a version the Linux code does not read is a
-//! refusal (`Why`), never a panic.
+//! GX-7a: the firmware files' headers and the microcode list the PSP loads. Formats from linux-7.3.1
+//! amdgpu/amdgpu_ucode.h (`common_firmware_header` :30 and the per-block headers), the per-microcode size and offset
+//! rules of amdgpu_ucode.c `amdgpu_ucode_init_single_fw` (:851-1122, PSP loading), the registration rules of
+//! gfx_v11_0.c:738-844 (RS64 from the PFP header), amdgpu_rlc.c:552-585 (RLC v2.x), amdgpu_mes.c:768-850,
+//! amdgpu_sdma.c:203-309, imu_v11_0.c:49-94, amdgpu_vcn.c:1130, amdgpu_dm/amdgpu_dm_dmub.c:579, and the skip and order
+//! rules of amdgpu_psp.c (`psp_load_non_psp_fw` :3515 walks the microcode IDs in enum order, `fw_load_skip_check`
+//! :3471). Every offset and size a file states is checked against the file before it is used; a part outside the file,
+//! a header too short for the fields its version has, or a version the Linux code does not read is a refusal (`Why`),
+//! never a panic.
 //!
 //! The header's `crc32` is kept but not checked: Linux never checks it (amdgpu_ucode.c:43 only prints it) and
 //! in the linux-firmware-amdgpu 20261019 files for the 780M it matches the payload's CRC-32 only for
-//! vcn_4_0_2 (measured 27.10.; plan/notes/gx-GX-7a.md), so a check would refuse good files.
+//! vcn_4_0_2 (plan/spec/gpu.md §11.1), so a check would refuse good files.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -470,13 +470,11 @@ pub struct ListOpts {
     pub mes_kiq: bool,
     /// BitsOS (GX-D9): the DMCUB the firmware started keeps running under the scanout; it is not reloaded.
     pub keep_display_firmware: bool,
-    /// Load VCN's microcode (GX-7d: not yet; the video item turns it on).
-    pub vcn: bool,
 }
 
 impl ListOpts {
-    /// PSP 13.0.4 on the 780M as BitsOS runs it (GX-7d: no DMCUB, no VCN).
-    pub const PSP13_0_4: ListOpts = ListOpts { autoload: true, mes_kiq: true, keep_display_firmware: true, vcn: false };
+    /// PSP 13.0.4 on the 780M as BitsOS runs it (GX-7d: no DMCUB; GX-8v: VCN's microcode with the rest).
+    pub const PSP13_0_4: ListOpts = ListOpts { autoload: true, mes_kiq: true, keep_display_firmware: true };
 }
 
 impl FwSet {
@@ -513,8 +511,7 @@ impl FwSet {
                 }
                 let skip = range.is_empty()
                     || (opts.autoload && id == UcodeId::CpMec1Jt)
-                    || (opts.keep_display_firmware && id == UcodeId::Dmcub)
-                    || (!opts.vcn && id == UcodeId::Vcn);
+                    || (opts.keep_display_firmware && id == UcodeId::Dmcub);
                 if !skip {
                     out.push(Ucode { id, file: i, range });
                 }

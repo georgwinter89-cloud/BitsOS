@@ -1,5 +1,5 @@
-//! process_vm_readv(2) and process_vm_writev(2) (AB-17; linux-6.6/mm/process_vm_access.c `process_vm_rw` :253,
-//! `process_vm_rw_core` :150, `process_vm_rw_single_vec` :60). Wine's server reads and writes its clients'
+//! process_vm_readv(2) and process_vm_writev(2) (AB-17; linux-7.3.1/mm/process_vm_access.c `process_vm_rw` :254,
+//! `process_vm_rw_core` :151, `process_vm_rw_single_vec` :73). Wine's server reads and writes its clients'
 //! memory this way and falls back to ptrace + /proc/pid/mem only on ENOSYS/EPERM, so the errors are Linux's
 //! in Linux's order:
 //! 1. flags != 0: EINVAL;
@@ -24,7 +24,7 @@ use mm::AddressSpace;
 use uapi::errno::*;
 
 const PAGE: u64 = 4096;
-/// `UIO_MAXIOV` (linux-6.6/include/uapi/linux/uio.h:47).
+/// `UIO_MAXIOV` (linux-7.3.1/include/uapi/linux/uio.h:46).
 const UIO_MAXIOV: u64 = 1024;
 /// `MAX_RW_COUNT` (INT_MAX & PAGE_MASK).
 const MAX_RW_COUNT: u64 = 0x7fff_f000;
@@ -129,7 +129,7 @@ fn copy(c: &SysCtx<'_>, rmm: &AddressSpace, local: &[(u64, u64)], remote: &[(u64
     done as i64
 }
 
-/// `import_iovec` (linux-6.6/lib/iov_iter.c:1456): one segment is clipped before its `access_ok`, several
+/// `import_iovec` (linux-7.3.1/lib/iov_iter.c:1436): one segment is clipped before its `access_ok`, several
 /// are checked whole and then clipped so the total stays within MAX_RW_COUNT.
 fn import_iovec(mm: &AddressSpace, uvec: u64, n: u64) -> Result<Vec<(u64, u64)>, i64> {
     if n == 1 {
@@ -152,7 +152,7 @@ fn import_iovec(mm: &AddressSpace, uvec: u64, n: u64) -> Result<Vec<(u64, u64)>,
     Ok(v)
 }
 
-/// `iovec_from_user` (linux-6.6/lib/iov_iter.c:1397): 0 segments are none, more than UIO_MAXIOV EINVAL.
+/// `iovec_from_user` (linux-7.3.1/lib/iov_iter.c:1304): 0 segments are none, more than UIO_MAXIOV EINVAL.
 pub(crate) fn iovec_from_user(mm: &AddressSpace, uvec: u64, n: u64) -> Result<Vec<(u64, u64)>, i64> {
     if n == 0 {
         return Ok(Vec::new());

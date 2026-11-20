@@ -20,8 +20,8 @@ pub(crate) const HASH_MAX_DEFAULT: u64 = 256 * 1024 * 1024;
 fn lookup(path: &str, follow: bool) -> Result<(alloc::sync::Arc<vfs::MountNs>, Path), ToolError> {
     let ns = vfs::root_ns();
     let p = Ctx::kernel(&ns).lookup(None, path.as_bytes(), follow).map_err(|e| fail(path, e))?;
-    // MC-10: by the place it resolves to (a link or `..` does not get around it).
-    if let Some(why) = super::access_store_refusal(&canonical(&ns, &p)) {
+    // MC-10, CL-S CR 4: by the place it resolves to (a link or `..` does not get around it).
+    if let Some(why) = super::kept_refusal(&canonical(&ns, &p)) {
         return Err(super::refuse("files", path, why));
     }
     Ok((ns, p))

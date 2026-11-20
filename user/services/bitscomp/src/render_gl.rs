@@ -1,16 +1,11 @@
-//! WY-15 (gx-scout-mesa.md step C1): the GLES renderer of the gpu build. Smithay's `GlesRenderer` on an EGL display
-//! of Mesa's surfaceless platform (no window system, no KMS): the frame is drawn into a GL texture, the damaged
-//! rectangles are read back (`ExportMem::copy_framebuffer`) into a CPU-side XRGB8888 buffer, and the back ends copy
-//! that to `/dev/fb0` exactly as Pixman's shadow image (DP-6 damage copy). So the picture path stays fbdev.
+//! WY-15: the GLES renderer. Smithay's `GlesRenderer` on an EGL display of Mesa's surfaceless platform (no window
+//! system, no KMS), radeonsi on the render node.
 //!
-//! WY-17: the frame can go straight into fbdev's windows instead (`adopt_scanout`, `backend::scanout`): the windows
-//! are dma-bufs imported as render targets, the frame is drawn into the hidden one and flipped, and nothing is read
-//! back but on request (`sync_pixels`). The readback above stays the path for everything else.
+//! WY-17: every frame goes straight into fbdev's windows (`adopt_scanout`, `backend::scanout`): the windows are
+//! dma-bufs imported as render targets, the frame is drawn into the hidden one and flipped, and nothing is read back
+//! but on request (`sync_pixels`: `ctl shot`, Durchblick's picture, the bench).
 //!
-//! `gles` means radeonsi on the machine with a render node, else Mesa's software rasteriser (llvmpipe,
-//! `LIBGL_ALWAYS_SOFTWARE`; `flavour::gl_software` decides). glvnd and Mesa find the tree's files through environment
-//! variables set for bitscomp only (`set_env`); the programs bitscomp starts never get them (`flavour::GLES_ENV`,
-//! removed in `App::spawn`).
+//! The effect shaders are compiled when the renderer is made (`create`); the tree's environment is `mesa::set_env`.
 
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::{Format, Fourcc, Modifier};
@@ -19,32 +14,26 @@ use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture, ffi};
-use smithay::backend::renderer::{Bind, Blit, Color32F, ExportMem, Offscreen, TextureFilter};
+use smithay::backend::renderer::{Bind, Blit, Color32F, ExportMem, TextureFilter};
 use smithay::utils::{Physical, Rectangle};
 
 use crate::backend::scanout::{Aim, Redraw, Windows};
 use crate::readback::{self, Order};
 use crate::render::{CompElement, CompRenderer};
 
-/// The GLES renderer's picture: the GL texture it draws into, kept across frames (the damage tracker draws only
-/// what changed, age 1), and its read-back copy that `pixels` hands out.
+/// The GLES renderer's picture: the scanout windows it draws into, and the read-back copy of the frame on the screen
+/// that `pixels` hands out (filled by `sync_pixels` only).
 pub struct GlesPicture {
-    tex: GlesTexture,
     px: Vec<u32>,
     w: i32,
     h: i32,
     /// Which byte order GL reads in: BGRA first; RGBA (every GLES has it) once BGRA was refused.
     order: Order,
-    /// The next frame reads the whole picture back, not only its damage: true at first and after a frame whose
-    /// readback failed (the texture then holds more than `px`, and the damage tracker would not draw it again).
-    full: readback::Full,
     /// WY-16: the sync point of a frame whose GPU work outlasted `GPU_WAIT`; client buffers stay held until it is
     /// reached (`gpu_idle`).
     busy: Option<smithay::backend::renderer::sync::SyncPoint>,
-    /// WY-17: the scanout windows as render targets, while frames go there.
+    /// WY-17: the scanout windows as render targets (None until `adopt_scanout`).
     direct: Option<Direct>,
-    /// WY-17: the direct path ended: the texture lacks every frame since it began, the next one draws it whole.
-    redraw: bool,
 }
 
 /// WY-17: the windows and the frame under way.
@@ -57,8 +46,7 @@ struct Direct {
 }
 
 /// WY-16: how long a frame waits for its GPU work on the main loop (B4: never unbounded; a client dma-buf whose
-/// implicit fence never signals must not stop input and every other client). A time, not a count; several frames
-/// of a slow llvmpipe in QEMU.
+/// implicit fence never signals must not stop input and every other client). A time, not a count.
 const GPU_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Waits at most `limit` for `sync` (an EGL fence with a timeout; a point without a fence is reached).
@@ -77,7 +65,7 @@ impl CompRenderer for GlesRenderer {
 
     fn create() -> Result<Self, String> {
         // Smithay's EGL loader panics when libEGL.so.1 does not load (egl/ffi.rs:148): never call it then.
-        if crate::flavour::egl_probe() != "loadable" {
+        if crate::mesa::egl_probe() != "loadable" {
             return Err("gles: libEGL.so.1 does not load".into());
         }
         // SAFETY: every EGL display in bitscomp comes from this call (Smithay's condition for `new`: no foreign
@@ -85,7 +73,7 @@ impl CompRenderer for GlesRenderer {
         // (EGL_DEFAULT_DISPLAY). On a mode change `follow_mode` makes the new compositor while the old one lives:
         // EGL hands out the same display then, and Smithay shares one handle for it (egl/display.rs:236-246, its
         // DISPLAYS set) whose eglTerminate runs only when the last renderer drops, so dropping the old one leaves
-        // the new context working whatever Mesa does on a second eglInitialize (wy/98 changes the mode seven times).
+        // the new context working whatever Mesa does on a second eglInitialize.
         let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.map_err(|e| format!("gles: EGL display: {e}"))?;
         // WY-21: a robust context, so that a lost GPU is reported (`reset_status`) instead of Mesa ending the process at
         // the next submission it cannot make (amdgpu winsys: a non-robust context aborts).
@@ -100,9 +88,8 @@ impl CompRenderer for GlesRenderer {
         // SAFETY: the context is new and handed over whole; nothing else makes it current on this thread.
         let mut r = unsafe { GlesRenderer::new(context) }.map_err(|e| format!("gles: renderer: {e}"))?;
         let gl = gl_strings(&mut r);
-        let soft = crate::dmabuf::software_gl(&gl);
-        SOFTWARE.store(soft, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("bitscomp: renderer gles: {gl}; {} threads in bitscomp{}", threads(), if robust { "; robust context" } else { "" });
+        eprintln!("bitscomp: renderer gles: {gl}{}", if robust { "; robust context" } else { "" });
+        crate::fx_gl::ready(&mut r).map_err(|e| format!("gles: the effect shaders: {e}"))?;
         Ok(r)
     }
 
@@ -122,10 +109,7 @@ impl CompRenderer for GlesRenderer {
 
     fn target(&mut self, w: i32, h: i32) -> Result<Self::Target, String> {
         let (w, h) = (w.max(1), h.max(1));
-        // RGBA8, the colour format every GLES can render into; read back as BGRA (`draw`).
-        let tex = Offscreen::<GlesTexture>::create_buffer(self, Fourcc::Abgr8888, (w, h).into())
-            .map_err(|e| format!("gles: no {w}x{h} texture: {e}"))?;
-        Ok(GlesPicture { tex, px: vec![0; w as usize * h as usize], w, h, order: Order::Bgra, full: readback::Full::new(), busy: None, direct: None, redraw: false })
+        Ok(GlesPicture { px: vec![0; w as usize * h as usize], w, h, order: Order::Bgra, busy: None, direct: None })
     }
 
     fn draw(
@@ -135,47 +119,9 @@ impl CompRenderer for GlesRenderer {
         elements: &[CompElement<Self>],
         clear: Color32F,
     ) -> Result<(Vec<Rectangle<i32, Physical>>, RenderElementStates), String> {
-        let GlesPicture { tex, px, w, h, order, full, busy, direct, redraw } = target;
-        if let Some(d) = direct {
-            return draw_direct(self, d, busy, tracker, elements, clear);
-        }
-        let mut fb = self.bind(tex).map_err(|e| format!("gles bind: {e}"))?;
-        let was_full = full.begin();
-        let age = if std::mem::take(redraw) { 0 } else { 1 };
-        let result = tracker.render_output(self, &mut fb, age, elements, clear).map_err(|e| format!("gles render: {e:?}"))?;
-        // WY-16: the GPU's work on client buffers is over before the frame ends, so `release` may give them back
-        // after it. Bounded (B4): past `GPU_WAIT` the frame is not read back (that would wait for the GPU too), the
-        // next one reads the whole picture (`full` stays set) and the held buffers wait for this point (`gpu_idle`).
-        if !wait_bounded(&result.sync, gpu_wait()) {
-            LATE_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if busy.is_none() {
-                eprintln!("bitscomp: render gles: the frame's GPU work outlasted {} ms; buffers stay held, the frame is read back later", GPU_WAIT.as_millis());
-            }
-            *busy = Some(result.sync);
-            return Ok((Vec::new(), result.states));
-        }
-        if busy.take().is_some() {
-            eprintln!("bitscomp: render gles: the GPU finished a late frame");
-        }
-        let rects: Vec<_> = result.damage.into_iter().flatten().map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)).collect();
-        let states = result.states;
-        let plan = readback::plan(&rects, was_full, *w, *h);
-        // The readback is part of the frame: `render_avg_ms` counts it (the cost GLES adds over Pixman on fb0).
-        for &rect in &plan {
-            // Picture coordinates as they are: the texture's row 0 is the picture's top row (readback.rs).
-            let region = Rectangle::new((rect.0, rect.1).into(), (rect.2, rect.3).into());
-            let mapping = readback::read_with_fallback(
-                order,
-                |e| matches!(e, GlesError::UnsupportedPixelFormat(_)),
-                |o| self.copy_framebuffer(&fb, region, fourcc(o)),
-            )
-            .map_err(|e| format!("gles readback: {e}"))?;
-            let bytes = self.map_texture(&mapping).map_err(|e| format!("gles readback map: {e}"))?;
-            readback::copy_rows(px, *w as usize, rect, bytes, *order);
-        }
-        full.done();
-        let damage = plan.iter().map(|r| Rectangle::new((r.0, r.1).into(), (r.2, r.3).into())).collect();
-        Ok((damage, states))
+        let GlesPicture { busy, direct, .. } = target;
+        let d = direct.as_mut().ok_or("no scanout windows to draw into")?;
+        draw_direct(self, d, busy, tracker, elements, clear)
     }
 
     fn target_size(target: &Self::Target) -> (i32, i32) {
@@ -190,13 +136,6 @@ impl CompRenderer for GlesRenderer {
         let _ = smithay::backend::renderer::Renderer::cleanup_texture_cache(self);
     }
 
-    fn maps_dmabufs(&self) -> bool {
-        SOFTWARE.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    fn reads_by_cpu(&self) -> bool {
-        SOFTWARE.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     fn gpu_idle(target: &mut Self::Target) -> bool {
         // Later GL work finishes after earlier work: a reached later point covers the late frame too.
         if target.busy.as_ref().is_some_and(|s| s.is_reached()) {
@@ -206,15 +145,8 @@ impl CompRenderer for GlesRenderer {
     }
 
     fn adopt_scanout(&mut self, target: &mut Self::Target, windows: Windows) -> Result<(), String> {
-        // llvmpipe's stores and blends would read and write write-combined device memory for every pixel.
-        if windows.engine && SOFTWARE.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("a software rasteriser would draw in the scanout buffers' write-combined memory".into());
-        }
         if windows.size != (target.w, target.h) {
             return Err(format!("the windows are {}x{}, the picture {}x{}", windows.size.0, windows.size.1, target.w, target.h));
-        }
-        if SOFTWARE.load(std::sync::atomic::Ordering::Relaxed) {
-            windows.list.iter().try_for_each(|w| w.maps(target.h))?;
         }
         let code = Fourcc::try_from(windows.fourcc).map_err(|_| format!("format {:#x}", windows.fourcc))?;
         let format = Format { code, modifier: Modifier::Linear };
@@ -227,7 +159,7 @@ impl CompRenderer for GlesRenderer {
             b.add_plane(w.fd, 0, w.offset, w.stride);
             bufs.push(b.build().ok_or("a dma-buf without planes")?);
         }
-        // The import and the framebuffer are checked now, not at the first frame: failing here leaves the readback.
+        // The import and the framebuffer are checked now, not at the first frame.
         for b in &mut bufs {
             self.bind(b).map_err(|e| format!("EGL refuses the window: {e}"))?;
         }
@@ -235,20 +167,13 @@ impl CompRenderer for GlesRenderer {
         Ok(())
     }
 
-    fn aim(target: &mut Self::Target, aim: Option<Aim>) -> bool {
-        match (aim, &mut target.direct) {
-            (Some(a), Some(d)) => {
-                d.aim = a;
+    fn aim(target: &mut Self::Target, aim: Aim) -> bool {
+        match &mut target.direct {
+            Some(d) => {
+                d.aim = aim;
                 true
             }
-            (Some(_), None) => false,
-            (None, Some(_)) => {
-                target.direct = None;
-                target.redraw = true;
-                target.full = readback::Full::new();
-                true
-            }
-            (None, None) => true,
+            None => false,
         }
     }
 
@@ -274,20 +199,7 @@ impl CompRenderer for GlesRenderer {
         }
     }
 
-    fn draws_direct(target: &Self::Target) -> bool {
-        target.direct.is_some()
-    }
-
-    fn fx_capable(&mut self, on_software: bool) -> Result<(), String> {
-        // Without a GPU the level stays cheap (desktop.md §0 answer 7): shaders on llvmpipe would take every core.
-        if SOFTWARE.load(std::sync::atomic::Ordering::Relaxed) && !on_software {
-            return Err("the renderer is a software rasteriser (`--fx-on-software` or `ctl fx software on` draws it anyway)".into());
-        }
-        crate::fx_gl::ready(self)
-    }
-
     fn fx_prepare(&mut self, target: &mut Self::Target, elements: &[CompElement<Self>], scale: smithay::utils::Scale<f64>) {
-        // The same work for both paths: a blur or a snapshot never depends on where the frame goes.
         let size = (target.w, target.h);
         crate::fx_gl::prepare(self, elements, scale, size, |r, tex| last_picture(r, target, tex));
     }
@@ -306,14 +218,12 @@ impl CompRenderer for GlesRenderer {
     }
 }
 
-/// WY-19c: the last frame on the screen into `tex` (a transition's old picture): the texture frames are drawn into, or
-/// the scanout window shown last.
+/// WY-19c: the last frame on the screen into `tex` (a transition's old picture): the scanout window shown last.
 fn last_picture(r: &mut GlesRenderer, target: &mut GlesPicture, tex: &mut GlesTexture) -> Result<(), String> {
     let all: Rectangle<i32, Physical> = Rectangle::from_size((target.w, target.h).into());
     let src = match &mut target.direct {
         Some(Direct { bufs, drawn: Some(i), .. }) => r.bind(&mut bufs[*i]),
-        Some(_) => return Err("no frame on the screen yet".into()),
-        None => r.bind(&mut target.tex),
+        _ => return Err("no frame on the screen yet".into()),
     }
     .map_err(|e| format!("bind the last frame: {e}"))?;
     let mut to = r.bind(tex).map_err(|e| format!("bind the snapshot: {e}"))?;
@@ -363,7 +273,6 @@ fn draw_direct(
     Ok((damage, result.states))
 }
 
-/// WY-16: GL_RENDERER names a software rasteriser (llvmpipe today, always): its EGL dma-buf import is an mmap.
 /// WY-21: whether the context was made robust (`robust_context`); only then does GL report a reset.
 static ROBUST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// glGetGraphicsResetStatus's answers (GLES 3.2, KHR_robustness).
@@ -371,7 +280,7 @@ const GUILTY_CONTEXT_RESET: u32 = 0x8253;
 const INNOCENT_CONTEXT_RESET: u32 = 0x8254;
 
 /// WY-21: Smithay's own contexts are not robust: this one is made by hand, LOSE_CONTEXT_ON_RESET
-/// (EGL_EXT_create_context_robustness, which radeonsi and llvmpipe both offer), on a config of the surfaceless display
+/// (EGL_EXT_create_context_robustness, which radeonsi offers), on a config of the surfaceless display
 /// (Smithay's raw constructor needs one; nothing draws into a surface of it). The display stays alive with the context:
 /// Smithay's raw display does not end it, and the handle of `display` is never dropped.
 fn robust_context(display: &EGLDisplay) -> Result<EGLContext, String> {
@@ -424,8 +333,6 @@ impl Drop for DestroyContext {
     }
 }
 
-static SOFTWARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 fn fourcc(order: Order) -> Fourcc {
     match order {
         Order::Bgra => Fourcc::Argb8888,
@@ -433,7 +340,7 @@ fn fourcc(order: Order) -> Fourcc {
     }
 }
 
-/// GL_RENDERER and GL_VERSION, for the log: says which driver draws (llvmpipe).
+/// GL_RENDERER and GL_VERSION, for the log: says which driver draws.
 fn gl_strings(r: &mut GlesRenderer) -> String {
     let get = |gl: &ffi::Gles2, name| {
         // SAFETY: the context is current inside `with_context`; GetString returns a static NUL-terminated string
@@ -445,54 +352,4 @@ fn gl_strings(r: &mut GlesRenderer) -> String {
     };
     r.with_context(|gl| format!("GL_RENDERER={} GL_VERSION={}", get(gl, ffi::RENDERER), get(gl, ffi::VERSION)))
         .unwrap_or_else(|e| format!("GL strings: {e}"))
-}
-
-/// How many threads bitscomp has (llvmpipe starts its own rasteriser threads).
-fn threads() -> usize {
-    std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
-}
-
-/// The variables glvnd and Mesa need to find the tree's files instead of /usr's: the EGL vendor file, the DRI and
-/// GBM drivers, the driver defaults; llvmpipe forced; no shader cache written (no home to write it to on V2, and
-/// it must never land on the stick). Called by the gpu build before any thread exists, only when GLES is chosen.
-pub fn set_env(tree: &str, software: bool) {
-    let tree = tree.trim_end_matches('/');
-    let vars = env_values(tree, software);
-    for (k, v) in &vars {
-        // SAFETY: called from `main` before `run` starts any thread (the hand-over check was a process, not a
-        // thread), so nothing reads the environment concurrently.
-        unsafe { std::env::set_var(k, v) };
-    }
-}
-
-/// The values `set_env` sets, every name of `flavour::GLES_ENV` but the software switch on a real GPU.
-pub fn env_values(tree: &str, software: bool) -> Vec<(&'static str, String)> {
-    let vars = vec![
-        ("__EGL_VENDOR_LIBRARY_FILENAMES", format!("{tree}/share/glvnd/egl_vendor.d/50_mesa.json")),
-        ("LIBGL_DRIVERS_PATH", format!("{tree}/lib/dri")),
-        ("GBM_BACKENDS_PATH", format!("{tree}/lib/gbm")),
-        ("DRIRC_CONFIGDIR", format!("{tree}/share/drirc.d")),
-        ("LIBGL_ALWAYS_SOFTWARE", "1".into()),
-        ("MESA_SHADER_CACHE_DISABLE", "true".into()),
-    ];
-    vars.into_iter().filter(|(k, _)| software || *k != "LIBGL_ALWAYS_SOFTWARE").collect()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn env_names_are_the_ones_children_lose() {
-        let vals = super::env_values("/t", true);
-        let names: Vec<&str> = vals.iter().map(|(k, _)| *k).collect();
-        assert_eq!(names, crate::flavour::GLES_ENV);
-        assert_eq!(vals[0].1, "/t/share/glvnd/egl_vendor.d/50_mesa.json");
-    }
-
-    #[test]
-    fn a_real_gpu_only_loses_the_software_switch() {
-        let vals = super::env_values("/t", false);
-        let names: Vec<&str> = vals.iter().map(|(k, _)| *k).collect();
-        let want: Vec<&str> = crate::flavour::GLES_ENV.iter().copied().filter(|k| *k != "LIBGL_ALWAYS_SOFTWARE").collect();
-        assert_eq!(names, want);
-    }
 }

@@ -12,10 +12,11 @@ use crate::mount_ns::Path;
 use crate::node::File;
 use crate::Errno;
 use crate::epoll::EpItem;
+use crate::fpos::{FilePos, Kind as PosKind, PosGuard, Users};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use ksync::{Mutex, SpinLock};
+use ksync::SpinLock;
 use mm_core::grace::{self, Retire};
 use mm_core::rcu_index::RcuIndex;
 use uapi::errno::*;
@@ -60,10 +61,8 @@ pub struct OpenFile {
     /// F_GETFL shows O_LARGEFILE (every open by name on 64-bit Linux); pseudo files (pipes, eventfd,
     /// sockets) never have it.
     largefile: bool,
-    pos: Mutex<u64>,
-    /// The position as of the last unlock, for readers that must not take `pos` (fdinfo; Linux reads
-    /// `f_pos` unlocked there). AB-7a CR3.
-    pos_mirror: AtomicU64,
+    /// The position and its lock (`fpos`: taken as Linux 7's `fdget_pos` takes `f_pos_lock`).
+    pos: FilePos,
     /// Where it was opened (None for objects without a name: captures, pipes, sockets).
     pub path: Option<Path>,
     /// FS-4: the epoll items watching this open file description (Linux `file->f_ep`); they leave their epolls
@@ -71,29 +70,66 @@ pub struct OpenFile {
     ep: SpinLock<Vec<Weak<EpItem>>>,
     /// An open for writing of a regular file holds its inode's write access until the last close (ETXTBSY).
     _write: Option<crate::inode::WriteAccess>,
+    /// L7-VFS: the serial of the fd table it was first installed in (0: none yet), V2's stand-in for Linux's
+    /// `f_cred` (see `FdTable::serial`).
+    opener: AtomicU64,
+    /// FMODE_CREATED (linux-7.3.1/fs/namei.c:4561): this open's O_CREAT made the file (F_CREATED_QUERY).
+    created: bool,
+}
+
+/// FMODE_ATOMIC_POS (`do_dentry_open`): regular files and directories. By the inode when opened by name (a device
+/// node is its inode's type), else by what the object says about itself.
+fn pos_kind(file: &dyn File, path: Option<&Path>) -> PosKind {
+    let mode = path.map_or_else(|| file.mode(), |p| p.dentry.inode.meta.mode());
+    match mode & uapi::S_IFMT {
+        uapi::S_IFREG => PosKind::Regular,
+        uapi::S_IFDIR => PosKind::Dir,
+        _ => PosKind::Free,
+    }
 }
 
 impl OpenFile {
     pub fn new(file: Arc<dyn File>, flags: OpenFlags) -> Arc<Self> {
-        Arc::new(OpenFile { file, flags, status: AtomicU64::new(flags.to_linux()), largefile: true, pos: Mutex::named("vfs.file.pos", 0), pos_mirror: AtomicU64::new(0), path: None, ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: None })
+        Arc::new(OpenFile { pos: FilePos::new(pos_kind(&*file, None)), file, flags, status: AtomicU64::new(flags.to_linux()), largefile: true, path: None, ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: None, opener: AtomicU64::new(0), created: false })
     }
     /// FS-3: a pseudo file without a name (`alloc_file_pseudo`: pipe ends, eventfd): `status` is its whole
     /// F_GETFL (access mode and status flags), without O_LARGEFILE.
     pub fn anon(file: Arc<dyn File>, status: u64) -> Arc<Self> {
         let flags = OpenFlags::from_linux(status);
-        Arc::new(OpenFile { file, flags, status: AtomicU64::new(status & !abi::OPEN_ONLY), largefile: false, pos: Mutex::named("vfs.file.pos", 0), pos_mirror: AtomicU64::new(0), path: None, ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: None })
+        Arc::new(OpenFile { pos: FilePos::new(pos_kind(&*file, None)), file, flags, status: AtomicU64::new(status & !abi::OPEN_ONLY), largefile: false, path: None, ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: None, opener: AtomicU64::new(0), created: false })
     }
     /// `with_path` holding the inode's write access (an open for writing of a regular file).
     pub fn with_path_writing(file: Arc<dyn File>, status: u64, path: Path, write: Option<crate::inode::WriteAccess>) -> Arc<Self> {
         let flags = OpenFlags::from_linux(status);
         let status = status & !abi::OPEN_ONLY;
-        Arc::new(OpenFile { file, flags, status: AtomicU64::new(status), largefile: true, pos: Mutex::named("vfs.file.pos", 0), pos_mirror: AtomicU64::new(0), path: Some(path), ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: write })
+        Arc::new(OpenFile { pos: FilePos::new(pos_kind(&*file, Some(&path))), file, flags, status: AtomicU64::new(status), largefile: true, path: Some(path), ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: write, opener: AtomicU64::new(0), created: false })
+    }
+    /// `with_path_writing` for an open whose O_CREAT made the file (`lookup_open` sets FMODE_CREATED).
+    pub(crate) fn created_by_open(file: Arc<dyn File>, status: u64, path: Path, write: Option<crate::inode::WriteAccess>) -> Arc<Self> {
+        let flags = OpenFlags::from_linux(status);
+        let status = status & !abi::OPEN_ONLY;
+        Arc::new(OpenFile { pos: FilePos::new(pos_kind(&*file, Some(&path))), file, flags, status: AtomicU64::new(status), largefile: true, path: Some(path), ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: write, opener: AtomicU64::new(0), created: true })
+    }
+    /// F_CREATED_QUERY (linux-7.3.1/fs/fcntl.c `f_created_query`): an O_TMPFILE open, a reopen and every
+    /// object without a name answer false.
+    pub fn created(&self) -> bool {
+        self.created
     }
     /// An open by name: `status` are the open flags without the open-only bits.
     pub fn with_path(file: Arc<dyn File>, status: u64, path: Path) -> Arc<Self> {
         let flags = OpenFlags::from_linux(status);
         let status = status & !abi::OPEN_ONLY;
-        Arc::new(OpenFile { file, flags, status: AtomicU64::new(status), largefile: true, pos: Mutex::named("vfs.file.pos", 0), pos_mirror: AtomicU64::new(0), path: Some(path), ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: None })
+        Arc::new(OpenFile { pos: FilePos::new(pos_kind(&*file, Some(&path))), file, flags, status: AtomicU64::new(status), largefile: true, path: Some(path), ep: SpinLock::named("vfs.file.ep", Vec::new()), _write: None, opener: AtomicU64::new(0), created: false })
+    }
+    /// The serial of the fd table that installed it first (0: never installed).
+    pub fn opener(&self) -> u64 {
+        self.opener.load(Ordering::Relaxed)
+    }
+    /// The first table to install it names the opener; later installs (dup, SCM_RIGHTS, fork) do not.
+    fn claim(&self, table: u64) {
+        if self.opener.load(Ordering::Relaxed) == 0 {
+            let _ = self.opener.compare_exchange(0, table, Ordering::Relaxed, Ordering::Relaxed);
+        }
     }
     /// F_GETFL: access mode and status flags. 64-bit Linux adds O_LARGEFILE at every open
     /// (`force_o_largefile`), but `build_open_flags` strips it again for O_PATH.
@@ -262,16 +298,20 @@ impl OpenFile {
     }
     /// lseek (SEEK_SET/CUR/END/DATA/HOLE). Directories and proc files take only SET and CUR.
     pub fn seek(&self, off: i64, whence: u32) -> Result<u64, Errno> {
+        self.seek_as(false, off, whence)
+    }
+    /// `seek` for a caller that showed it is the description's only user (`alone`).
+    pub fn seek_as(&self, alone: bool, off: i64, whence: u32) -> Result<u64, Errno> {
         if let Some(r) = self.file.lseek(off, whence) {
             if let Ok(v) = r {
-                *self.pos_guard() = v;
+                *self.pos.guard(alone) = v;
             }
             return r;
         }
         if !self.file.seekable() {
             return Err(ESPIPE);
         }
-        let mut p = self.pos_guard();
+        let mut p = self.pos.guard(alone);
         let cur = *p as i64;
         let data = self.data_inode();
         // Regular data: VFS files, or nameless objects that say they are regular. Directories and proc files
@@ -303,21 +343,39 @@ impl OpenFile {
         *p = new as u64;
         Ok(*p)
     }
+    /// The position without waiting for a call that holds it: Linux reads `f_pos` unlocked where this is asked
+    /// (fcntl locks' SEEK_CUR, FIONREAD, sendfile and copy_file_range without an offset).
     pub fn pos(&self) -> u64 {
-        *self.pos_guard()
+        self.pos.racy()
     }
     /// The position without its lock (the value at the last unlock; it may change at once). For fdinfo,
     /// whose own read holds a position lock of the same class (AB-7a CR3).
     pub fn pos_racy(&self) -> u64 {
-        self.pos_mirror.load(Ordering::Relaxed)
+        self.pos.racy()
+    }
+    /// How often a read, write, lseek or getdents took the position lock (ktest `fs.fpos.contention`).
+    pub fn pos_locks(&self) -> u64 {
+        self.pos.locks()
     }
     fn pos_guard(&self) -> PosGuard<'_> {
-        PosGuard { g: self.pos.lock(), mirror: &self.pos_mirror }
+        self.pos.guard(false)
     }
     /// Runs `f` with the position locked (getdents64 reads and advances it in one step).
     pub fn with_pos<R>(&self, f: impl FnOnce(&mut u64) -> R) -> R {
-        let mut p = self.pos_guard();
+        self.with_pos_as(false, f)
+    }
+    /// `with_pos` for a caller that showed it is the description's only user (`alone`): a regular file's
+    /// position is then not locked (Linux `fdget_pos`).
+    pub fn with_pos_as<R>(&self, alone: bool, f: impl FnOnce(&mut u64) -> R) -> R {
+        let mut p = self.pos.guard(alone);
         f(&mut p)
+    }
+    /// Linux 7's `file_needs_f_pos_lock` is false: one thread uses `fds` (`FdTable::one_user`) and the only
+    /// references to this description are its slot there and `self`, the caller's own from that table's look-up.
+    /// Nobody else can then read or move the position during the call. Conservative: any other holder (a dup, a
+    /// fork, an epoll item, a mapping, a descriptor in flight) means locked.
+    pub fn alone(self: &Arc<Self>, fds: &FdTable) -> bool {
+        fds.one_user() && Arc::strong_count(self) <= 2
     }
     /// fstat: the inode's stat when opened by name, else what the object says about itself.
     pub fn stat(&self) -> Attr {
@@ -349,7 +407,7 @@ impl Drop for OpenFile {
     }
 }
 
-/// A thread's file-system state (Linux `fs_struct`, linux-6.6/include/linux/fs_struct.h): working directory, root
+/// A thread's file-system state (Linux `fs_struct`, linux-7.3.1/include/linux/fs_struct.h:11): working directory, root
 /// and umask. FS-16: it lives apart from the fd table, as in Linux (kernel/fork.c `copy_fs`/`copy_files`): the
 /// process layer holds it behind an `Arc` per thread, CLONE_FS shares it, a clone without CLONE_FS and
 /// unshare(CLONE_FS) take a `copy` (`copy_fs_struct`); CLONE_FILES shares only the fd table.
@@ -521,17 +579,28 @@ pub struct FdTable {
     high: AtomicUsize,
     limit: AtomicUsize,
     /// PF-3b: the published files by number, read with no lock inside a grace section (`get`; Linux reads
-    /// `fdt->fd[]` under RCU, linux-6.6/fs/file.c:888-900). Changed only under `fds`, right after the slot, so
+    /// `fdt->fd[]` under RCU, linux-7.3.1/fs/file.c:1017-1091). Changed only under `fds`, right after the slot, so
     /// it never holds a file the slot does not; a number it lacks (no room for a node, a reserved number) is
     /// looked up under the lock.
     view: RcuIndex<Pub>,
     locked: AtomicU64,
+    /// The threads that use the table (`fpos::FdUse`; Linux `files_struct.count`).
+    users: Users,
+    /// L7-VFS: unique per table (never 0, never reused). A file first installed here was opened by this
+    /// table's program, which is what linkat(AT_EMPTY_PATH) asks of Linux's `f_cred == current_cred()`: a fork
+    /// (a new table, as Linux's new cred) or another program fails it, the threads of one program pass. execve
+    /// takes a new one (`close_on_exec`), as Linux's `prepare_exec_creds`: the fds the program inherits fail.
+    /// Changed and read under `fds`.
+    serial: AtomicU64,
     /// Tests: the view stays empty, every look-up takes the lock.
     #[cfg(test)]
     unviewed: bool,
 }
 
 pub const DEFAULT_NOFILE: usize = abi::NOFILE_DEFAULT;
+
+/// The next `FdTable::serial`.
+static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
 impl FdTable {
     pub fn new() -> Self {
@@ -542,9 +611,15 @@ impl FdTable {
             limit: AtomicUsize::new(DEFAULT_NOFILE),
             view: RcuIndex::named("vfs.fds.view"),
             locked: AtomicU64::new(0),
+            users: Users::default(),
+            serial: AtomicU64::new(NEXT_TABLE.fetch_add(1, Ordering::Relaxed)),
             #[cfg(test)]
             unviewed: false,
         }
+    }
+    /// See the field.
+    pub fn serial(&self) -> u64 {
+        self.serial.load(Ordering::Relaxed)
     }
     /// A table whose lockless view stays empty (as after its nodes found no room): every look-up locks.
     #[cfg(test)]
@@ -629,6 +704,7 @@ impl FdTable {
             let mut fds = self.fds.lock();
             match fds.get_mut(fd) {
                 Some(Some(slot)) if slot.file.is_none() => {
+                    f.claim(self.serial());
                     late = self.show(fd, &f);
                     slot.file = Some(f);
                     None
@@ -667,6 +743,9 @@ impl FdTable {
                     return Err(EMFILE);
                 }
                 if i < fds.len() {
+                    if let Some(f) = &f {
+                        f.claim(self.serial());
+                    }
                     let late = f.as_ref().and_then(|f| self.show(i, f));
                     fds[i] = Some(Slot { file: f, cloexec });
                     self.high.fetch_max(i, Ordering::Relaxed);
@@ -752,6 +831,7 @@ impl FdTable {
                 Some(Some(s)) if s.file.is_none() => return Err(EBUSY),
                 Some(slot) => {
                     self.high.fetch_max(fd, Ordering::Relaxed);
+                    f.claim(self.serial());
                     let old = slot.replace(Slot { file: Some(f.clone()), cloexec });
                     late = self.show(fd, &f);
                     old
@@ -768,7 +848,7 @@ impl FdTable {
         self.install_at_flags(fd, f, false)
     }
     /// The open file at `fd` (`fget_raw`), with a reference of its own. PF-3b: first without the table lock
-    /// (Linux `__fget_files_rcu`, linux-6.6/fs/file.c:888-900): inside a grace section the view's entry, its file
+    /// (Linux `__fget_files_rcu`, linux-7.3.1/fs/file.c:1017-1091): inside a grace section the view's entry, its file
     /// taken with `Weak::upgrade` (inc-not-zero: a file whose last reference went never comes back). The load of
     /// the entry is the moment the look-up answers for: the entry names one file (its memory is not reused while
     /// the section lives), and every change of the number replaces or removes the entry under the table lock,
@@ -786,6 +866,13 @@ impl FdTable {
     fn get_lockless(&self, fd: usize) -> Option<Arc<OpenFile>> {
         let s = grace::enter()?;
         self.view.get(&s, fd as u64)?.file.upgrade()
+    }
+    pub(crate) fn users(&self) -> &Users {
+        &self.users
+    }
+    /// Exactly one thread counts itself on this table (a table nobody counts is never one thread's).
+    pub fn one_user(&self) -> bool {
+        self.users.one()
     }
     /// Look-ups of this table that took its lock (PF-3 tests and ktests).
     pub fn lookup_stats(&self) -> LookupStats {
@@ -828,7 +915,7 @@ impl FdTable {
         // Returned (and so dropped) outside the lock: the last close may wake or take locks.
         Ok(file)
     }
-    /// dup2/dup3's table half (Linux `ksys_dup3` + `do_dup2`, linux-6.6/fs/file.c:1266, :1105): `old`'s file
+    /// dup2/dup3's table half (Linux `ksys_dup3` + `do_dup2`, linux-7.3.1/fs/file.c:1423, :1292): `old`'s file
     /// (an O_PATH one too) goes to `new` with its own close-on-exec flag. The look-up of `old` and the
     /// replacement are one step under the table lock, so a close of `old` racing with it comes either before
     /// (EBADF, nothing changed) or after (the copy stays). Returns what `new` held before, for the caller's
@@ -871,6 +958,7 @@ impl FdTable {
                 let mut fds = self.fds.lock();
                 let want = fds.iter().flatten().filter(|s| s.cloexec && s.file.is_some()).count();
                 if want <= out.capacity() {
+                    self.serial.store(NEXT_TABLE.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
                     self.hint.store(0, Ordering::Relaxed);
                     for (i, s) in fds.iter_mut().enumerate() {
                         if s.as_ref().is_some_and(|s| s.cloexec && s.file.is_some())
@@ -1063,27 +1151,3 @@ mod tests {
     }
 }
 
-/// The locked position; its value goes to `pos_mirror` on unlock.
-struct PosGuard<'a> {
-    g: ksync::MutexGuard<'a, u64>,
-    mirror: &'a AtomicU64,
-}
-
-impl core::ops::Deref for PosGuard<'_> {
-    type Target = u64;
-    fn deref(&self) -> &u64 {
-        &self.g
-    }
-}
-
-impl core::ops::DerefMut for PosGuard<'_> {
-    fn deref_mut(&mut self) -> &mut u64 {
-        &mut self.g
-    }
-}
-
-impl Drop for PosGuard<'_> {
-    fn drop(&mut self) {
-        self.mirror.store(*self.g, Ordering::Relaxed);
-    }
-}

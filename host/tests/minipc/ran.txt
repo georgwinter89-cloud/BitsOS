@@ -434,16 +434,13 @@ gx.hw.job_refused desktop 2026-11-05 -
 gx.hw.job_stop desktop 2026-11-05 -
 gx.hw.job_user_fence desktop 2026-11-05 -
 gx.hw.job_vmids desktop 2026-11-05 -
-gx.hw.ladder_config desktop 2026-11-05 -
 gx.hw.ladder_expire desktop 2026-11-05 -
 gx.hw.ladder_gc desktop 2026-11-05 -
 gx.hw.ladder_gc_fails desktop 2026-11-05 -
 gx.hw.ladder_gc_limit desktop 2026-11-05 -
 gx.hw.ladder_gfx_hqd desktop 2026-11-05 -
 gx.hw.ladder_halt_proof desktop 2026-11-05 -
-gx.hw.ladder_mode2_closed desktop 2026-11-05 -
 gx.hw.ladder_mode2_no_answer desktop 2026-11-05 -
-gx.hw.ladder_mode2_open desktop 2026-11-05 -
 gx.hw.ladder_mode2_unproven desktop 2026-11-05 -
 gx.hw.ladder_picture_moved desktop 2026-11-05 -
 gx.hw.ladder_queue_compute desktop 2026-11-05 -
@@ -1170,3 +1167,4 @@ ul.tools.evtest bare 2026-11-05 -
 ul.tools.fbtest bare 2026-11-05 -
 ul.tools.memstress_truncate bare 2026-11-05 -
 ul.tools.procs bare 2026-11-05 -
+sn.usb.jacks desktop 2026-11-15 163

@@ -90,16 +90,29 @@ pub struct Tool {
     pub description: String,
     pub input_schema: Json,
     pub safety: Safety,
+    /// MC-L: also offered on the local tools socket (`/run/bitsos/tools.sock`). Only for tools that tell what a
+    /// program of the session's user may read anyway; the kernel takes the mark only from services of uid 0.
+    pub local: bool,
 }
 
 impl Tool {
     /// `schema`: the JSON schema of the arguments as text (an object of type "object").
     pub fn new(name: &str, description: &str, schema: &str, safety: Safety) -> Result<Tool, Error> {
         let input_schema = Json::parse(schema).map_err(|e| Error::Refused(format!("tool {name}: schema is not JSON: {e}")))?;
-        Ok(Tool { name: name.to_string(), description: description.to_string(), input_schema, safety })
+        Ok(Tool { name: name.to_string(), description: description.to_string(), input_schema, safety, local: false })
+    }
+    /// Marks the tool for the local tools socket (MC-L).
+    pub fn local(mut self) -> Tool {
+        self.local = true;
+        self
     }
     fn to_json(&self) -> Json {
-        Json::obj(vec![("name", Json::str(&self.name)), ("description", Json::str(&self.description)), ("inputSchema", self.input_schema.clone()), ("safety", Json::str(self.safety.as_str()))])
+        let mut fields = vec![("name", Json::str(&self.name)), ("description", Json::str(&self.description)), ("inputSchema", self.input_schema.clone()), ("safety", Json::str(self.safety.as_str()))];
+        // Only when set: a kernel from before MC-L never sees the field.
+        if self.local {
+            fields.push(("local", Json::Bool(true)));
+        }
+        Json::obj(fields)
     }
 }
 
@@ -111,6 +124,19 @@ pub struct Call {
     pub arguments: Json,
     /// How long the caller waits (ms, from when the kernel sent it).
     pub timeout_ms: u64,
+    /// MC-L: the program on this machine that called, through the local tools socket. None: the network
+    /// side (the token's holder). The kernel writes it, never the caller.
+    pub caller: Option<Caller>,
+    /// DB1: the kernel's gate runs this call for a client with a live full-access grant (MC-10, Georg's keyboard
+    /// release). The kernel writes it into `_meta`, never the caller.
+    pub full_access: bool,
+}
+
+/// A local program behind a call (`Call::caller`), as the kernel knows it (SO_PEERCRED of its connection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    pub pid: u32,
+    pub uid: u32,
 }
 
 /// What comes from the kernel.
@@ -329,6 +355,10 @@ fn event_of(m: &Json) -> Option<Event> {
             name: p.and_then(|p| p.get("name")).and_then(Json::as_str).unwrap_or("").to_string(),
             arguments: p.and_then(|p| p.get("arguments")).cloned().unwrap_or(Json::Obj(Vec::new())),
             timeout_ms: p.and_then(|p| p.get("_meta")).and_then(|m| m.get("timeout_ms")).and_then(Json::as_u64).unwrap_or(0),
+            caller: p.and_then(|p| p.get("_meta")).and_then(|m| m.get("caller")).and_then(|c| {
+                Some(Caller { pid: c.get("pid").and_then(Json::as_u64)? as u32, uid: c.get("uid").and_then(Json::as_u64)? as u32 })
+            }),
+            full_access: p.and_then(|p| p.get("_meta")).and_then(|m| m.get("access")).and_then(Json::as_str) == Some("full"),
         })),
         "notifications/cancelled" => Some(Event::Cancelled {
             id: p.and_then(|p| p.get("requestId")).and_then(Json::as_u64)?,
@@ -354,6 +384,16 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    /// MC-L: `local` goes into the register line only when set (older kernels never see the field).
+    #[test]
+    fn local_mark_in_the_register_line() {
+        let plain = Tool::new("a", "d", r#"{"type":"object"}"#, Safety::Read).unwrap();
+        assert!(plain.to_json().get("local").is_none());
+        let marked = plain.clone().local();
+        assert_eq!(marked.to_json().get("local").and_then(Json::as_bool), Some(true));
+        assert_eq!(marked.to_json().get("safety").and_then(Json::as_str), Some("read"));
+    }
+
     /// A fake kernel: answers register, sends one call and a cancel, and checks the answer.
     #[test]
     fn register_serve_and_reply() {
@@ -375,7 +415,7 @@ mod tests {
             let t = &p.get("tools").unwrap().as_array().unwrap()[0];
             assert_eq!(t.get("safety").and_then(Json::as_str), Some("change"));
             // A call before the answer is queued, not lost.
-            w.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"t\",\"arguments\":{\"x\":\"a\\\"b\"},\"_meta\":{\"progressToken\":5,\"timeout_ms\":900}}}\n").unwrap();
+            w.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"t\",\"arguments\":{\"x\":\"a\\\"b\"},\"_meta\":{\"progressToken\":5,\"timeout_ms\":900,\"caller\":{\"pid\":77,\"uid\":1000}}}}\n").unwrap();
             w.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"registered\":[\"t\"]}}\n").unwrap();
             let mut a = String::new();
             r.read_line(&mut a).unwrap();
@@ -393,6 +433,9 @@ mod tests {
         let names = s.register(&[Tool::new("t", "test", r#"{"type":"object"}"#, Safety::Change).unwrap()]).unwrap();
         assert_eq!(names, vec!["t".to_string()]);
         let Some(Event::Call(c)) = s.next().unwrap() else { panic!("no call") };
+        // MC-L: the local program behind the call, as the kernel named it.
+        assert_eq!(c.caller, Some(Caller { pid: 77, uid: 1000 }));
+        assert!(!c.full_access, "a call without the kernel's access mark is narrow");
         s.replier().progress(c.id, "half").unwrap();
         let x = c.arguments.get("x").and_then(Json::as_str).unwrap().to_string();
         s.replier().reply(c.id, Reply::text(format!("got {x} in {}", c.timeout_ms))).unwrap();
@@ -408,5 +451,20 @@ mod tests {
         let mut s = String::new();
         base64_into(b"\x89PNG", &mut s);
         assert_eq!(s, "iVBORw==");
+    }
+
+    #[test]
+    fn full_access_is_read_from_the_kernels_meta_only() {
+        let call = |line: &str| match event_of(&Json::parse(line).unwrap()) {
+            Some(Event::Call(c)) => c,
+            _ => panic!("no call: {line}"),
+        };
+        let full = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"t","arguments":{},"_meta":{"timeout_ms":5,"access":"full"}}}"#);
+        assert!(full.full_access);
+        // An argument of the caller's own never counts, nor another word.
+        let forged = call(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"t","arguments":{"access":"full","_meta":{"access":"full"}},"_meta":{"timeout_ms":5}}}"#);
+        assert!(!forged.full_access);
+        let other = call(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"t","arguments":{},"_meta":{"access":"narrow"}}}"#);
+        assert!(!other.full_access);
     }
 }

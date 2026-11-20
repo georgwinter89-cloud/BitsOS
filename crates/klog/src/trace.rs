@@ -379,7 +379,7 @@ fn push(kind: Kind, name_id: u32, a: u64, b: u64) {
     push_on(hal::percpu::this_cpu(), kind, hal::percpu::current(), name_id, a, b);
 }
 
-// ---- hooks (the callers' lanes wire them in; see plan/notes/rb-RB-7a.md) ----
+// ---- hooks (the callers' lanes wire them in) ----
 
 /// sched: a switch from thread `prev` to thread `next` (ids).
 #[inline]

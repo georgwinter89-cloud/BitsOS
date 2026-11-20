@@ -1,6 +1,5 @@
 //! DS-5: the boot scene's model and picture. The pins are pixels of the kernel's own picture of `KERNEL`
-//! (crates/console tests_boot.rs `bootscreen_matches_model` with BITSOS_BOOT_PPM, 28.10.); host/tests/ds/60-boot.sh
-//! compares the whole picture.
+//! (crates/console tests_boot.rs `bootscreen_matches_model` with BITSOS_BOOT_PPM, 28.10.).
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -87,7 +86,7 @@ fn only_this_starts_handover_shows_the_scene() {
 }
 
 #[test]
-fn a_key_skips_once_the_shell_is_ready_and_without_a_fade() {
+fn a_key_skips_once_the_shell_is_ready_and_without_the_wipe() {
     use super::boot::{ends, fades, key_seen};
     assert!(key_seen(4, 3) && !key_seen(3, 3));
     // A key before settings and status: noted, the scene stays until they are there (or the cap).
@@ -101,7 +100,7 @@ fn a_key_skips_once_the_shell_is_ready_and_without_a_fade() {
     assert_eq!(ends(false, Own::Ready, false), Some("ready"));
     assert_eq!(ends(false, Own::Window, true), Some("cap (no window yet)"));
     assert_eq!(ends(false, Own::Services, true), Some("cap (settings or status missing)"));
-    // A key cuts to the desktop (transition 0), so does motion off; otherwise the cheap fade.
+    // A key cuts to the desktop (transition 0), so does motion off; otherwise the circle wipe.
     assert!(!fades("key", false) && !fades("ready", true) && fades("ready", false) && fades("cap (no window yet)", false));
 }
 
@@ -118,8 +117,7 @@ fn the_desktop_waits_for_its_own_part_and_the_first_window_only() {
     let ready = s.with_desktop(Some(&Own::Ready.step("", 5400)));
     assert_eq!(ready.get("desktop").unwrap().state, State::Done);
     assert_eq!(ready.progress(), (8, 10));
-    // The fade is the cheap level's transition (at most 400 ms), the cap ends a wait that does not end.
-    assert!(super::boot::FADE <= Duration::from_millis(400));
+    // The cap ends a wait that does not end.
     assert!(super::boot::CAP <= Duration::from_secs(2) && super::boot::POLL <= Duration::from_millis(100));
     assert!(crate::anim::START <= Duration::from_millis(400));
 }

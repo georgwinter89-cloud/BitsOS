@@ -35,6 +35,7 @@ pub mod pool;
 mod refs;
 mod scan;
 mod tree;
+mod trim;
 pub mod volume;
 
 #[cfg(test)]

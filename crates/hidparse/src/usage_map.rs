@@ -1,7 +1,8 @@
 //! One usage to one Linux input code: the page switch of `hidinput_configure_usage` in
-//! linux-6.6/drivers/hid/hid-input.c:687-1460, checked line by line against the source in IN-2a.
-//! Pure: whether a non-"clear" code is a duplicate is decided in `map.rs`. Left out on purpose
-//! (plan/notes/in-IN-2a.md): the Digitizer page (pens and touch screens, a tool state machine in
+//! linux-7.3.1/drivers/hid/hid-input.c:723-1523 (first checked against 6.6 in IN-2a, moved to 7.3.1 in L7-HW:
+//! Do Not Disturb, Accessibility, the D-pad before the System Control ignore, pen Z as distance, the AL
+//! keys 0x1CC-0x1CE and Haptic usages in output fields).
+//! Pure: whether a non-"clear" code is a duplicate is decided in `map.rs`. Left out on purpose: the Digitizer page (pens and touch screens, a tool state machine in
 //! `hidinput_hid_event`), battery reporting (EV_PWR, a power-supply class in Linux) and the
 //! per-driver `input_mapping` hooks of hid-generic's siblings.
 
@@ -24,7 +25,7 @@ pub enum Special {
         low: u16,
     },
     /// A key whose release the device never sends: press, frame, release (Linux sets the field's
-    /// RELATIVE flag for the RF-kill button, hid-input.c:907-910).
+    /// RELATIVE flag for the RF-kill button, hid-input.c:968-975).
     Pulse,
 }
 
@@ -53,6 +54,9 @@ const GD_WIRELESS_RADIO_CTLS: u32 = 0x0001_000C;
 const GD_SYSTEM_CONTROL: u32 = 0x0001_0080;
 const CP_CONSUMER_CONTROL: u32 = 0x000C_0001;
 const CP_PROGRAMMABLE_BUTTONS: u32 = 0x000C_0003;
+const DG_DIGITIZER: u32 = 0x000D_0001;
+const DG_PEN: u32 = 0x000D_0002;
+const DG_STYLUS: u32 = 0x000D_0020;
 
 /// Pages with their own case in Linux's switch, and the highest usage id handled one by one
 /// (above it the page's default applies). Other pages take the "unknown" default.
@@ -140,7 +144,9 @@ pub(crate) fn map_usage(field: &Field, usage: u32) -> Raw {
     }
     let page = usage >> 16;
     let id = usage & 0xFFFF;
-    if field.kind == ReportKind::Output && page != 0x08 {
+    // Only LED and Haptic usages count in output fields (hid-input.c:742-747); Haptic has no case of
+    // its own and takes the unknown default.
+    if field.kind == ReportKind::Output && page != 0x08 && page != 0x0E {
         return Raw::Ignore;
     }
     match page {
@@ -237,11 +243,25 @@ fn generic_desktop(field: &Field, id: u32) -> Raw {
                 key_clear(code)
             };
         }
+        // D-pad and Do Not Disturb come before the System Control ignore below (hid-input.c:871-892): the
+        // first D-pad usage takes ABS_HAT0X with its direction, the field's others are ignored
+        // (field->dpad; here as duplicates of the non-clear code).
+        0x90 => {
+            let dir = match id {
+                0x90 => 1,
+                0x91 => 5,
+                0x92 => 3,
+                0x93 => 7,
+                0x9B => return key_clear(KEY_DO_NOT_DISTURB),
+                _ => return unknown(field),
+            };
+            return make(EV_ABS, ABS_HAT0X as u32, false, Special::HatDir(dir));
+        }
         0xA0 => {
-            return if id & 0xF == 0x9 {
-                key_clear(KEY_MICMUTE)
-            } else {
-                Raw::Ignore
+            return match id & 0xF {
+                0x9 => key_clear(KEY_MICMUTE),
+                0xA => key_clear(KEY_ACCESSIBILITY),
+                _ => Raw::Ignore,
             };
         }
         0xB0 => {
@@ -253,26 +273,16 @@ fn generic_desktop(field: &Field, id: u32) -> Raw {
         }
         _ => {}
     }
-    // "Some lazy vendors declare 255 usages for System Control" (hid-input.c:850-857).
+    // "Some lazy vendors declare 255 usages for System Control" (hid-input.c:909-916).
     if field.application == GD_SYSTEM_CONTROL {
         return Raw::Ignore;
-    }
-    if id & 0xF0 == 0x90 {
-        // D-pad: the first takes ABS_HAT0X with its direction, the field's others are ignored
-        // (field->dpad, hid-input.c:859-873; here as duplicates of the non-clear code).
-        let dir = match id {
-            0x90 => 1,
-            0x91 => 5,
-            0x92 => 3,
-            0x93 => 7,
-            _ => return unknown(field),
-        };
-        return make(EV_ABS, ABS_HAT0X as u32, false, Special::HatDir(dir));
     }
     match id {
         // X, Y, Z, Rx, Ry, Rz map straight to codes 0-5; absolute ones "clear", so a repeated X
         // (the 0079:0011 SNES clones declare it four times) keeps every copy, and the last one wins.
         0x30..=0x35 if field.is_relative() => rel((id & 0xF) as u16),
+        // An absolute Z in a pen or digitizer is the hover distance (hid-input.c:928-942).
+        0x32 if is_pen(field) => make(EV_ABS, ABS_DISTANCE as u32, true, Special::None),
         0x30..=0x35 => make(EV_ABS, id & 0xF, true, Special::None),
         0x38 if field.is_relative() => make(
             EV_REL,
@@ -298,6 +308,14 @@ fn generic_desktop(field: &Field, id: u32) -> Raw {
         }
         _ => unknown(field),
     }
+}
+
+fn is_pen(field: &Field) -> bool {
+    field.application == DG_PEN
+        || field.physical == DG_PEN
+        || field.logical == DG_STYLUS
+        || field.physical == DG_STYLUS
+        || field.application == DG_DIGITIZER
 }
 
 fn led(id: u32) -> Raw {
@@ -340,7 +358,7 @@ fn button(field: &Field, id: u32) -> Raw {
     make(EV_KEY, code, false, Special::None)
 }
 
-/// The Consumer page, hid-input.c:1069-1262 entry for entry.
+/// The Consumer page, linux-7.3.1/drivers/hid/hid-input.c:1128-1323 entry for entry.
 fn consumer(id: u32) -> Raw {
     let code = match id {
         0x000 => return Raw::Ignore,
@@ -466,6 +484,9 @@ fn consumer(id: u32) -> Raw {
         0x1BC => KEY_MESSENGER,
         0x1BD => KEY_INFO,
         0x1CB => KEY_ASSISTANT,
+        0x1CC => KEY_ACTION_ON_SELECTION,
+        0x1CD => KEY_CONTEXTUAL_INSERT,
+        0x1CE => KEY_CONTEXTUAL_QUERY,
         0x201 => KEY_NEW,
         0x202 => KEY_OPEN,
         0x203 => KEY_CLOSE,

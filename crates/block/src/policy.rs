@@ -18,6 +18,11 @@
 //! changes what `switches().nvme_write` answers; steps 1 and 2 come first, so a disk with a Windows or EFI
 //! partition table stays refused whatever was ticked (R8). NV-2p (Georg 5.11.): the tick opens nothing by itself, an
 //! NVMe write needs a window (gpt/window.rs), and the window reads CONFIG's own `nvme_write`, not this switch.
+//!
+//! GP-GUARD (plan/spec/gaming-pc.md §2, Georg 5.11.: the Gaming-PC's internal SSDs are not even read): while CONFIG
+//! says `nvme_bind=off` (forced by the Gaming-PC profile, `gp_platform::disk_rule`) `nvme_write` never answers on and
+//! `open_nvme_until` is refused, so the tick opens nothing there. PCI leaves the controllers without a driver on
+//! such a machine; this is the second layer. Without the line nothing changes.
 
 use crate::error::Refusal;
 use crate::queue::Kind;
@@ -170,9 +175,38 @@ pub(crate) struct Facts {
     pub config: Option<fn(&str) -> Option<String>>,
     pub stick: Option<StickIdentity>,
     pub configured: bool,
+    /// GP-GUARD: CONFIG `nvme_bind=off` as read once in `configure` (CONFIG does not change within a boot), so the
+    /// write path pays no lookup for it.
+    pub internal_off: bool,
+    /// GP-DISK: under `nvme_bind=off`, CONFIG's `gp_nvme=` names a controller (the only one PCI lets the NVMe
+    /// driver have): its disks follow CONFIG's `nvme_write` as on the Mini-PC, the tick still opens nothing.
+    pub named: bool,
 }
 
-pub(crate) static FACTS: SpinLock<Facts> = SpinLock::named("block.facts", Facts { config: None, stick: None, configured: false });
+pub(crate) static FACTS: SpinLock<Facts> = SpinLock::named("block.facts", Facts { config: None, stick: None, configured: false, internal_off: false, named: false });
+
+/// GP-DISK: whether CONFIG names one controller under the guard (pure: host-tested). Without `nvme_bind=off` the
+/// line means nothing (the Mini-PC); it counts only under the Gaming-PC profile and with the loader's word behind it
+/// (`tiers::nvme_released`), as in the kernel's map that PCI reads.
+pub fn named(config: &dyn Fn(&str) -> Option<String>) -> bool {
+    use gp_platform::tiers;
+    gp_platform::disk_rule::bind_off(config(gp_platform::disk_rule::BIND_KEY).as_deref())
+        && tiers::nvme_released(config("profile").as_deref(), config(tiers::NVME_KEY).as_deref(), config(tiers::NVME_LOADER_KEY).as_deref())
+}
+
+/// GP-GUARD: what `configure` keeps of the boot facts (pure: host-tested). `nvme_bind=off` is remembered, and a
+/// profile the kernel had to choose itself (`profile_reason=kernel`: the loader is older than the profile and
+/// handed STICK.ID over as on any machine) drops the identity, so the stick stays read-only as the profile means.
+pub fn guarded(config: &dyn Fn(&str) -> Option<String>, stick: Option<StickIdentity>) -> (bool, Option<StickIdentity>) {
+    let internal_off = gp_platform::disk_rule::bind_off(config(gp_platform::disk_rule::BIND_KEY).as_deref());
+    let by_kernel = config("profile_reason").is_some_and(|r| r.trim() == "kernel");
+    (internal_off, if by_kernel { stick.map(|s| StickIdentity { id: None, ..s }) } else { stick })
+}
+
+/// GP-GUARD: this machine's internal disks are off limits (`nvme_bind=off`).
+pub fn internal_disks_off() -> bool {
+    FACTS.lock().internal_off
+}
 
 fn on(f: Option<fn(&str) -> Option<String>>, key: &str) -> bool {
     f.and_then(|f| f(key)).is_some_and(|v| v.trim() == "on")
@@ -181,8 +215,17 @@ fn on(f: Option<fn(&str) -> Option<String>>, key: &str) -> bool {
 /// The switches now (all off before `configure`: the safe side). `nvme_write` is CONFIG's or the run-time
 /// opener's (MC-10).
 pub fn switches() -> Switches {
-    let f = FACTS.lock().config;
-    Switches { stick_write: on(f, "stick_write"), usb_msd_write: on(f, "usb_msd_write"), nvme_write: on(f, "nvme_write") || nvme_open_now() }
+    let (f, off, named) = {
+        let g = FACTS.lock();
+        (g.config, g.internal_off, g.named)
+    };
+    let bind = off.then_some("off");
+    let config_on = on(f, "nvme_write");
+    // The tick is asked exactly when it was before the guard: `config_on || nvme_open_now()` never reached the
+    // tick with CONFIG on, and asking has an effect (it closes an expired tick and logs that), so the Mini-PC's
+    // events stay what they were. Under the guard it is never asked: `open_nvme_until` set nothing to close.
+    let tick = !off && !config_on && nvme_open_now();
+    Switches { stick_write: on(f, "stick_write"), usb_msd_write: on(f, "usb_msd_write"), nvme_write: gp_platform::disk_rule::nvme_write_named(bind, named, config_on, tick) }
 }
 
 /// MC-10: the run-time NVMe opener's end (monotonic ns; 0: closed).
@@ -209,10 +252,25 @@ fn nvme_open_now() -> bool {
     false
 }
 
+/// GP-GUARD: `open_nvme_until` was refused in this boot (logged once).
+static TICK_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// GP-GUARD: whether a full-access NVMe tick was refused in this boot (ktests, `/proc` texts).
+pub fn nvme_tick_refused() -> bool {
+    TICK_REFUSED.load(Ordering::Acquire)
+}
+
 /// MC-10: opens NVMe writes until `until_ns` (monotonic) for the full-access grant Georg ticked at the keyboard;
 /// a later call replaces the end. Only the MCP gate calls it (the installer's table). Windows/EFI disks stay
-/// refused (`decide` step 2).
+/// refused (`decide` step 2). Refused altogether while `nvme_bind=off` (GP-GUARD).
 pub fn open_nvme_until(until_ns: u64, why: &str) {
+    if internal_disks_off() {
+        // GP-GUARD: said once; the grant itself stays the MCP gate's business.
+        if !TICK_REFUSED.swap(true, Ordering::AcqRel) {
+            klog::event!(Warn, "block", "nvme.runtime_refused", reason = why; "nvme_bind=off: this machine's internal disks have no driver, the full-access tick opens nothing");
+        }
+        return;
+    }
     let old = NVME_UNTIL.swap(until_ns.max(1), Ordering::AcqRel);
     if old != until_ns.max(1) {
         let left = until_ns.saturating_sub(ksync::now_ns().unwrap_or(0)) / 1_000_000_000;
@@ -342,6 +400,75 @@ mod tests {
             assert!(decide(Nvme, false, &v, StickMatch::No, open).is_err(), "{v:?} stays refused with the gate open");
         }
         assert_eq!(decide(Nvme, true, &CLEAN, StickMatch::No, open), Err(Refusal::DeviceReadOnly));
+    }
+
+    /// GP-GUARD B3b: under `nvme_bind=off` the NVMe switch is off whatever CONFIG and the tick say, so `decide`
+    /// refuses every NVMe write; without the line the switch is CONFIG's or the tick's, as before.
+    #[test]
+    fn nvme_bind_off_beats_config_and_the_tick() {
+        use gp_platform::disk_rule::nvme_write_now;
+        for config_on in [false, true] {
+            for tick in [false, true] {
+                let guarded = sw(true, true, nvme_write_now(Some("off"), config_on, tick));
+                for stick in [StickMatch::Yes, StickMatch::No, StickMatch::Unknown] {
+                    assert!(decide(Nvme, false, &CLEAN, stick, guarded).is_err(), "config={config_on} tick={tick} {stick:?}");
+                }
+                let plain = sw(false, false, nvme_write_now(None, config_on, tick));
+                assert_eq!(decide(Nvme, false, &CLEAN, StickMatch::No, plain).is_ok(), config_on || tick, "unchanged without the line");
+            }
+        }
+    }
+
+    /// GP-GUARD: what `configure` keeps. Only `nvme_bind=off` arms the guard; only a profile the kernel chose
+    /// itself drops the stick's identity; on every other CONFIG the facts pass through untouched.
+    #[test]
+    fn configure_keeps_the_guard_and_drops_an_identity_the_profile_withholds() {
+        let id = StickIdentity { block0: Some([0x55; crate::table::FIRST_BYTES]), usb: Some((1, 2)), id: Some([7; 16]), nvme: false };
+        let cfg = |lines: &'static [(&'static str, &'static str)]| move |k: &str| lines.iter().find(|(key, _)| *key == k).map(|(_, v)| String::from(*v));
+        // The Mini-PC, QEMU: nothing changes.
+        for lines in [&[][..], &[("nvme_write", "on")], &[("nvme_bind", "on")], &[("profile", "normal")], &[("profile_reason", "dmi")]] {
+            assert_eq!(guarded(&cfg(lines), Some(id)), (false, Some(id)), "{lines:?}");
+        }
+        assert_eq!(guarded(&cfg(&[]), None), (false, None));
+        // The Gaming-PC as the loader hands it over: the guard, and the identity as the loader decided it.
+        assert_eq!(guarded(&cfg(&[("nvme_bind", "off"), ("profile_reason", "dmi")]), Some(id)), (true, Some(id)));
+        assert_eq!(guarded(&cfg(&[("nvme_bind", " off ")]), None), (true, None));
+        // The kernel's own fallback: the loader was too old to withhold STICK.ID.
+        let (off, kept) = guarded(&cfg(&[("nvme_bind", "off"), ("profile_reason", "kernel")]), Some(id));
+        assert!(off);
+        assert_eq!(kept, Some(StickIdentity { id: None, ..id }));
+        assert!(!stick_takes_fat_writes(kept), "no identity: the stick takes no FAT write");
+        assert!(stick_takes_fat_writes(Some(id)));
+    }
+
+    /// GP-DISK: `gp_nvme=` counts only under the guard and only as a line naming a controller; with it CONFIG's
+    /// `nvme_write=on` is the NVMe switch again (for the named controller's disks, the only ones registered), and
+    /// the tick never is.
+    #[test]
+    fn a_named_controller_takes_configs_nvme_write_only() {
+        let cfg = |lines: &'static [(&'static str, &'static str)]| move |k: &str| lines.iter().find(|(key, _)| *key == k).map(|(_, v)| String::from(*v));
+        const P: (&str, &str) = ("profile", "gaming-pc");
+        const L: (&str, &str) = ("gp_nvme_loader", "on");
+        assert!(named(&cfg(&[P, L, ("nvme_bind", "off"), ("gp_nvme", "81:00.0/1d97:5236")])));
+        for lines in [
+            &[P, L, ("gp_nvme", "81:00.0/1d97:5236")][..],
+            &[P, L, ("nvme_bind", "off")],
+            &[P, L, ("nvme_bind", "off"), ("gp_nvme", "01:00.0/144d:a80d")],
+            &[P, L, ("nvme_bind", "off"), ("gp_nvme", "x")],
+            // An older loader (no word of its own), and outside the profile.
+            &[P, ("nvme_bind", "off"), ("gp_nvme", "81:00.0/1d97:5236")],
+            &[("profile", "normal"), L, ("nvme_bind", "off"), ("gp_nvme", "81:00.0/1d97:5236")],
+            &[L, ("nvme_bind", "off"), ("gp_nvme", "81:00.0/1d97:5236")],
+            &[],
+        ] {
+            assert!(!named(&cfg(lines)), "{lines:?}");
+        }
+        use gp_platform::disk_rule::nvme_write_named;
+        for (config_on, tick) in [(false, false), (true, false), (false, true), (true, true)] {
+            let sw = |w| Switches { stick_write: false, usb_msd_write: false, nvme_write: w };
+            assert_eq!(decide(Nvme, false, &CLEAN, StickMatch::No, sw(nvme_write_named(Some("off"), true, config_on, tick))).is_ok(), config_on, "named: CONFIG's word only");
+            assert!(decide(Nvme, false, &CLEAN, StickMatch::No, sw(nvme_write_named(Some("off"), false, config_on, tick))).is_err(), "not named: never");
+        }
     }
 
     #[test]

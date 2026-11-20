@@ -1,6 +1,6 @@
-//! `/proc/<pid>/maps`, `smaps` and `smaps_rollup` (linux-6.6/fs/proc/task_mmu.c `show_vma_header_prefix` :240,
-//! `show_map_vma`, `show_smap` :851, `show_smaps_rollup` :877, `__show_smap` :809) and the memory sums `status`, `stat` and
-//! `statm` share (`task_mem` :31).
+//! `/proc/<pid>/maps`, `smaps` and `smaps_rollup` (linux-7.3.1/fs/proc/task_mmu.c `show_vma_header_prefix` :475,
+//! `show_map_vma` :496, `show_smap` :1459, `show_smaps_rollup` :1487, `__show_smap` :1419) and the memory sums
+//! `status`, `stat` and `statm` share (`task_mem` :37).
 //!
 //! The program's segments are copied into anonymous memory at load (AB-8 maps them from the file): their lines
 //! show the file's device, inode and page offset and its path, split into the file part and the anonymous
@@ -48,13 +48,14 @@ fn shared(v: &Vma) -> bool {
 pub(super) fn mem_of(p: &Process) -> Mem {
     let mut m = Mem { rss_pages: p.mm.rss_pages(), ..Default::default() };
     let mut heap = None;
-    for v in p.mm.vmas() {
+    // MEMCRASH: summed under the space's lock, no copy of the list (status is read for every process by ps/top).
+    p.mm.for_each_vma(&mut |v| {
         let len = v.end - v.start;
         m.total += len;
         let stack = v.kind == VmaKind::Stack;
         if stack {
             m.stack += len;
-        } else if v.prot.write && !shared(&v) {
+        } else if v.prot.write && !shared(v) {
             m.data += len;
         }
         if v.prot.exec && !v.prot.write && !stack {
@@ -63,7 +64,7 @@ pub(super) fn mem_of(p: &Process) -> Mem {
         if v.kind == VmaKind::Heap {
             heap = Some(heap.map_or(v.start, |h: u64| h.min(v.start)));
         }
-    }
+    });
     // `mm->start_brk`: where the heap starts (the break itself before the first brk call grew it).
     m.start_brk = heap.unwrap_or_else(|| p.mm.current_brk());
     m
@@ -218,8 +219,9 @@ fn usage_rows(s: &mut String, u: &PageUsage, rollup: bool, anon_huge: u64) {
 
 /// `show_smap_vma_flags` (task_mmu.c:636) in bit order for the flags V2 has. `me` from the file's VM_MAYEXEC
 /// (`FileRef::may_exec`: clear on a noexec mount, FS-13 CR3). No `sd`: V2 has no soft-dirty tracking
-/// (a kernel without CONFIG_MEM_SOFT_DIRTY).
-fn vm_flags(s: &mut String, v: &Vma) {
+/// (a kernel without CONFIG_MEM_SOFT_DIRTY). `gu` (VM_MAYBE_GUARD) while the VMA holds a guard: Linux sets it at
+/// MADV_GUARD_INSTALL and keeps it (sticky, also after MADV_GUARD_REMOVE and into merges); V2 has no such flag yet.
+fn vm_flags(s: &mut String, v: &Vma, guarded: bool) {
     let f = v.file.as_ref();
     let device = f.is_some_and(|f| f.device.is_some());
     let may_share = f.is_some_and(|f| f.shared || f.backing.file().is_some_and(|m| m.may_share()));
@@ -235,6 +237,7 @@ fn vm_flags(s: &mut String, v: &Vma) {
         (v.kind == VmaKind::Stack || v.flags.growsdown, "gd"),
         // A device mapping is Linux's `io_remap_pfn_range`: VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP.
         (device, "pf"),
+        (guarded, "gu"),
         (v.flags.locked, "lo"),
         (device, "io"),
         (v.flags.seq_read, "sr"),
@@ -310,7 +313,7 @@ pub(super) fn render_smaps(g: &Group, p: &Process) -> Result<String, Errno> {
             let _ = write!(s, "Size:           {:>8} kB\nKernelPageSize: {:>8} kB\nMMUPageSize:    {:>8} kB\n", b.saturating_sub(a) >> 10, 4, 4);
             usage_rows(s, &part, false, p.mm.anon_huge_in(a, b));
             let _ = writeln!(s, "THPeligible:    {:>8}", p.mm.thp_eligible(v) as u8);
-            vm_flags(s, v);
+            vm_flags(s, v, p.mm.has_guard(a, b));
         });
     }
     Ok(s)
@@ -322,9 +325,11 @@ pub(super) fn render_smaps_rollup(g: &Group, p: &Process) -> String {
     if g.is_finished() {
         return s;
     }
-    let vmas = p.mm.vmas();
-    let (Some(first), Some(last)) = (vmas.first(), vmas.last()) else { return s };
-    line(&mut s, first.start, last.end, *b"---p", 0, 0, 0, Some("[rollup]"));
+    // The span of all mappings, read without a copy of the list.
+    let mut span: Option<(u64, u64)> = None;
+    p.mm.for_each_vma(&mut |v| span = Some((span.map_or(v.start, |s| s.0), v.end)));
+    let Some((first, last)) = span else { return s };
+    line(&mut s, first, last, *b"---p", 0, 0, 0, Some("[rollup]"));
     usage_rows(&mut s, &p.mm.page_usage_total(), true, p.mm.anon_huge_bytes());
     s
 }

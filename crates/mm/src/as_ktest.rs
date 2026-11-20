@@ -469,7 +469,7 @@ fn kva_reserve() -> TestResult {
 }
 ktest!("mm.vmap.reserve", Safe, kva_reserve);
 
-/// msync's argument checks and holes (linux-6.6/mm/msync.c:32-108; the same table answered on CachyOS 7.2, and
+/// msync's argument checks and holes (linux-7.3.1/mm/msync.c:33-109; the same table answered on CachyOS 7.2, and
 /// `abi-mm5b msync` diffs it from a program): EINVAL for flags, an unaligned start and ASYNC|SYNC together; the
 /// length page-aligned with wrap-around (2^64-1 becomes 0: answer 0; 2^64-4096 wraps past the top: ENOMEM); a
 /// hole answers ENOMEM at the end, a plain MS_ASYNC at once.

@@ -273,7 +273,7 @@ pub(crate) fn check_again(d: &Discovery) -> ktest::TestResult {
     kassert!(r3.passed(), "third: {:?}", r3.error);
     let t0 = owner.hw().hw().now;
     let n0 = owner.log().totals().writes;
-    let (none, ok) = crate::psplive::with_live_held(|_| (crate::psplive::quiesce_halt_mes(None, owner.hw()), crate::psplive::quiesce_halt_mes(Some(&a), owner.hw())));
+    let (none, ok) = crate::psplive::with_live_held(&crate::psplive::State::new(), |_| (crate::psplive::quiesce_halt_mes(None, owner.hw()), crate::psplive::quiesce_halt_mes(Some(&a), owner.hw())));
     kassert!(none.is_none() && ok == Some(true), "quiesce halt: {none:?} {ok:?}");
     kassert!(owner.hw().hw().now == t0 && owner.log().totals().writes == n0, "quiesce halt waited or went through the owner's log");
     kassert!(halted(owner.hw().hw()), "quiesce halt left MES running");
@@ -327,7 +327,7 @@ fn starts() -> ktest::TestResult {
 }
 // INT-W28 post-integration made the fake chains here QemuOnly (52-121 KiB of stack in a release build, over MCP's
 // 64 KiB request thread). GX-7m2 boxed the chains' outcomes and owners and gave every engine stage its own frame:
-// at most 33 KiB with `ktest_stack=48` (29.10., release, QEMU; plan/notes/gx-GX-7m2.md): Safe again.
+// at most 33 KiB with `ktest_stack=48` (release, QEMU): Safe again.
 ktest::ktest!("gx.mes.starts", Safe, starts);
 
 fn failures() -> ktest::TestResult {

@@ -1,5 +1,5 @@
 //! Breadcrumbs (RB-16): how far the last shutdown, Reload or reboot got, in places that outlive the machine's
-//! RAM. The Mini-PC's reset and its sync flood clear RAM (rb-RB-13, rb-RB-14), so the crash page cannot say
+//! RAM. The Mini-PC's reset and its sync flood clear RAM (plan/spec/robustness.md §1), so the crash page cannot say
 //! which device's quiesce or which step a flood interrupted. Each step and each device's quiesce leaves a crumb
 //! *before* it runs; the crumb goes to two stores:
 //!

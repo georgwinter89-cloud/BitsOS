@@ -6,7 +6,7 @@ use std::vec::Vec;
 use super::watch::client;
 use crate::errno;
 use crate::recover::{
-    Action, IpVersion, MODE2_MOVED_PICTURE, MODE2_UNMEASURED, MODE2_WRONG_CHIP, Mode2Gate, Next, Outcome, Policy, REINIT_LOOP,
+    Action, IpVersion, MODE2_MOVED_PICTURE, MODE2_WRONG_CHIP, Next, Outcome, Policy, REINIT_LOOP,
     REINIT_MOVED_PICTURE, RecoverError, Reply, ResetDomain, Scope, SubmitError, linux_uses_mode2,
 };
 use crate::told::{Fate, query2};
@@ -26,6 +26,12 @@ fn cfg(class: RingClass) -> RingCfg {
 
 fn domain() -> ResetDomain {
     ResetDomain::new(Policy::for_mp1(MP1))
+}
+
+/// A chip whose Linux reset method is mode 1: its ladder ends at GC's re-init. Tests about other rungs use it so
+/// their step lists stay short.
+fn no_mode2_chip() -> ResetDomain {
+    ResetDomain::new(Policy::for_mp1(IpVersion(13, 0, 7)))
 }
 
 fn s(fence: u64) -> Sample {
@@ -67,21 +73,12 @@ fn fails_on(pred: impl Fn(&Action) -> bool) -> impl FnMut(&Action) -> Reply {
     move |a| if pred(a) { Reply::Failed } else { good(a) }
 }
 
-fn no_mode2(acts: &[Action]) {
-    assert!(!acts.iter().any(|a| matches!(a, Action::Mode2Reset | Action::SuspendGc)), "{acts:?}");
-}
-
 #[test]
-fn mode2_gate_is_closed_by_default_and_opens_only_on_mode2_chips() {
+fn mode2_is_a_rung_exactly_on_the_chips_where_linux_uses_it() {
     assert!(linux_uses_mode2(MP1) && linux_uses_mode2(IpVersion(13, 0, 11)));
     assert!(!linux_uses_mode2(IpVersion(13, 0, 7)), "mode 1 on the big chips");
-    let mut p = Policy::for_mp1(MP1);
-    assert_eq!(p.mode2, Mode2Gate::Refused(MODE2_UNMEASURED));
-    assert_eq!(Policy::for_mp1(IpVersion(13, 0, 7)).mode2, Mode2Gate::Refused(MODE2_WRONG_CHIP));
-    assert_eq!(p.open_mode2(IpVersion(13, 0, 7), "x"), Err(MODE2_WRONG_CHIP));
-    assert_eq!(p.mode2, Mode2Gate::Refused(MODE2_UNMEASURED));
-    p.open_mode2(MP1, "gx9a").unwrap();
-    assert_eq!(p.mode2, Mode2Gate::Measured { proof: "gx9a" });
+    assert!(Policy::for_mp1(MP1).mode2);
+    assert!(!Policy::for_mp1(IpVersion(13, 0, 7)).mode2);
 }
 
 #[test]
@@ -285,8 +282,8 @@ fn nothing_left_means_reboot_never_an_smu_message_and_programs_get_errors() {
     d.submit(other, client(2), 0, 64, 0).unwrap();
     let next = hang(&mut d, ring, 0, 0);
     let (acts, f) = run(&mut d, next, T, |_| Reply::Failed);
-    no_mode2(&acts);
-    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_UNMEASURED) });
+    assert_eq!(acts[acts.len() - 2..], [Action::ReinitGc, Action::SuspendGc], "mode 2 was tried; its suspend failed");
+    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: None });
     assert_eq!(f.fates.len(), 2);
     assert_eq!(f.guilty, vec![1]);
     assert!(!f.counters.in_reset, "programs must not wait for a reset that will not end");
@@ -301,10 +298,8 @@ fn nothing_left_means_reboot_never_an_smu_message_and_programs_get_errors() {
 }
 
 #[test]
-fn mode2_runs_only_after_its_measurement_and_after_the_suspend() {
-    let mut p = Policy::for_mp1(MP1);
-    p.open_mode2(MP1, "gx9a").unwrap();
-    let mut d = ResetDomain::new(p);
+fn mode2_runs_after_a_failed_reinit_and_after_the_suspend() {
+    let mut d = domain();
     let ring = d.add_ring(cfg(RingClass::GfxDirect)).unwrap();
     d.submit(ring, KERNEL, 0, 256, 0).unwrap();
     let next = hang(&mut d, ring, 0, 0);
@@ -347,9 +342,7 @@ fn lost_vram_moves_the_generation_once_and_new_contexts_start_clean() {
 
 #[test]
 fn a_reset_that_moved_the_picture_closes_every_reset_for_this_boot() {
-    let mut p = Policy::for_mp1(MP1);
-    p.open_mode2(MP1, "gx9a").unwrap();
-    let mut d = ResetDomain::new(p);
+    let mut d = domain();
     let ring = d.add_ring(cfg(RingClass::GfxDirect)).unwrap();
     d.submit(ring, KERNEL, 0, 256, 0).unwrap();
     let next = hang(&mut d, ring, 0, 0);
@@ -359,7 +352,6 @@ fn a_reset_that_moved_the_picture_closes_every_reset_for_this_boot() {
     });
     assert!(f.display_changed);
     assert_eq!(f.outcome, Outcome::Recovered(Scope::Gc), "this one is done, the harm too");
-    assert_eq!(d.policy().mode2, Mode2Gate::Refused(MODE2_MOVED_PICTURE));
     d.submit(ring, KERNEL, 0, 256, 2 * T).unwrap();
     let next = hang(&mut d, ring, 2 * T, 1);
     let (acts, f) = run(&mut d, next, 2 * T, good);
@@ -420,7 +412,7 @@ fn bringup_runs_again_and_again_but_not_in_a_tight_loop() {
             assert_eq!(f.outcome, Outcome::Recovered(Scope::Gc));
         } else {
             assert!(acts.is_empty(), "{acts:?}");
-            assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_UNMEASURED) });
+            assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(REINIT_LOOP) }, "mode 2 ends in a re-init too");
             assert_eq!(f.reinit_refused, Some(REINIT_LOOP));
         }
         now += 2 * T;
@@ -496,7 +488,7 @@ fn a_second_hung_ring_waits_its_turn_unless_a_full_reset_took_it_along() {
 
 #[test]
 fn wrong_replies_count_as_failures_and_overruns_are_counted() {
-    let mut d = domain();
+    let mut d = no_mode2_chip();
     let ring = d.add_ring(cfg(PROC)).unwrap();
     d.submit(ring, client(1), 0, 256, 0).unwrap();
     let next = hang(&mut d, ring, 0, 0);
@@ -507,7 +499,7 @@ fn wrong_replies_count_as_failures_and_overruns_are_counted() {
         a => good(a),
     });
     assert_eq!(acts.len(), 3);
-    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_UNMEASURED) });
+    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_WRONG_CHIP) });
     assert!(!f.vram_lost && !f.display_changed, "a reply of the wrong kind says nothing");
 
     let mut d = domain();
@@ -603,10 +595,16 @@ fn a_recovery_nobody_answers_ends_by_itself() {
             }
         }
     };
-    // Blame cannot fail; Unmap is lost, so the queue rung ends. ReinitGc is lost too, and nothing else is allowed.
-    assert_eq!(seen, [Action::Blame { ctx: 1, entity: 10 }, Action::Unmap { ring, queue: d.ring(ring).unwrap().cfg().queue }, Action::ReinitGc]);
-    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_UNMEASURED) });
-    assert_eq!(f.expired, 3);
+    // Blame cannot fail; Unmap is lost, so the queue rung ends. ReinitGc is lost too, then mode 2's suspend, and
+    // nothing else is left.
+    assert_eq!(seen, [
+        Action::Blame { ctx: 1, entity: 10 },
+        Action::Unmap { ring, queue: d.ring(ring).unwrap().cfg().queue },
+        Action::ReinitGc,
+        Action::SuspendGc,
+    ]);
+    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: None });
+    assert_eq!(f.expired, 4);
     assert_eq!(f.overruns, 0, "nobody replied late");
     assert_eq!(f.fates.len(), 2, "every job ended");
     assert!(!d.counters().in_reset, "no program waits for this reset any more");
@@ -650,7 +648,7 @@ fn an_unanswered_kill_is_still_judged_by_the_fence() {
 
 #[test]
 fn a_ring_added_during_a_recovery_would_miss_its_steps_and_is_refused() {
-    let mut d = domain();
+    let mut d = no_mode2_chip();
     let ring = d.add_ring(cfg(PROC)).unwrap();
     d.submit(ring, client(1), 0, 256, 0).unwrap();
     let mut next = hang(&mut d, ring, 0, 0);
@@ -667,7 +665,7 @@ fn a_ring_added_during_a_recovery_would_miss_its_steps_and_is_refused() {
     assert_eq!(d.add_ring(cfg(PROC)).unwrap_err(), RecoverError::Busy, "full reset");
     let next = d.reply(Reply::Failed, T).unwrap();
     let (_, f) = run(&mut d, next, T, good);
-    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_UNMEASURED) });
+    assert_eq!(f.outcome, Outcome::NeedsReboot { mode2: Some(MODE2_WRONG_CHIP) });
     assert_eq!(d.add_ring(cfg(PROC)).unwrap_err(), RecoverError::Dead);
 
     let mut d = domain();

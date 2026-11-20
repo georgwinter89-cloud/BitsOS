@@ -96,6 +96,10 @@ fn vt_ioctls_with_one_vt() {
     m.put(48, &[7]);
     assert_eq!(io(&tty, &p, &m, TIOCLINUX, BASE + 48), Ok(0));
     assert_eq!(m.at(48, 1), [0], "no mouse reporting");
+    m.put(48, &[18]);
+    assert_eq!(io(&tty, &p, &m, TIOCLINUX, BASE + 48), Ok(0), "TIOCL_GETBRACKETEDPASTE (Linux 7): mode 2004 off");
+    m.put(48, &[19]);
+    assert_eq!(io(&tty, &p, &m, TIOCLINUX, BASE + 48), Err(EINVAL), "the first type after Linux 7.3.1's last");
     // Back to VT_AUTO for the other tests (the mode is the VT's, global).
     m.put(16, &[VT_AUTO, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(io(&tty, &p, &m, VT_SETMODE, BASE + 16), Ok(0));

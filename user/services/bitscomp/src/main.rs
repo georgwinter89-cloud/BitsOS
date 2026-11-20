@@ -1,42 +1,63 @@
-//! bitscomp: BitsOS's Wayland compositor (V2-PLAN §8a.2). WY-0: nested on CachyOS, software composition;
-//! WY-1a: on V2 itself (`--backend fbdev`, the default without the `nested` feature).
+//! bitscomp: BitsOS's Wayland compositor (V2-PLAN §8a.2), on V2's fbdev and evdev (WY-1a). It draws only on the GPU:
+//! GLES through the Mesa tree's radeonsi, every frame straight into the screen's scanout windows (WY-17), with all
+//! effects (WY-19), the hardware cursor (WY-11) and Xwayland with glamor (WY-3b). A machine without a render node has
+//! no desktop: bitscomp ends with one line and the console keeps the screen (`mesa::gpu_or_why`).
 //!
 //! WY-4: never waits for a client (B4: `hung`, `answer`, `ending`, `veil`, the MCP tools in `mcp`).
 //!
 //! WY-5: the approved look (plan/spec/desktop.md): chrome, workspaces, start page, theme from settingsd, live.
 //!
-//! bitscomp [--backend winit|headless|fbdev] [--fb PATH] [--size WxH] [--socket NAME] [--stats SECS] [--run CMD]...
-//!          [--mcp SOCKET|none] [--settings SOCKET|none] [--fixed-status] [--fb-pan|--fb-copy] [--no-grant] [--user UID[:GID]]
-//!          [--pointer none|soft|fake] (WY-11, headless only: no pointer, the software one, a fake hardware cursor)
-//!          [--installer SOCKET|none] (MC-9b: bitsinstall's confirmer socket; default /run/bitsos/install.sock)
-//!          [--fx-on-software] (WY-19: the gpu effect level on a software rasteriser too: tests, measuring)
-//!          [--scanout auto|direct|readback] (WY-17: frames straight into fbdev's windows, `backend::scanout`; auto: GLES with a render node; direct: without asking for one)
-//!          [--fake-scanout ok|badfd|nostride|refuse|vsync] (WY-17, headless only: memfds stand in for fbdev's windows; WY-20 vsync: at 60 Hz)
-//!          [--main-device auto|render] (WY-17b: what linux-dmabuf names; auto: the render node for a GPU renderer, none for one reading by CPU)
-//!          [--watch-node PATH] (WY-21, a test's: the GPU watch looks at PATH instead of the render node)
-//!          [--xwayland PATH|none] (WY-3: the Xwayland started by the first X11 client; default /boot/BITSOS2/xwayland/bin/Xwayland)
-//!          [--xwayland-glamor auto|off|force:PATH] (WY-3b: auto: glamor and DRI3 when bitscomp draws on a render node that opens; force: a test's, glamor whatever draws, PATH watched as the node)
-//!          [--build rescue|gpu] [--gpu-exe PATH] [--config PATH] (WY-14, `flavour`: hand over to the gpu build; default CONFIG.TXT
-//!          `bitscomp=`, else rescue (WY-17: `bitscomp=auto`: gles when a render node is up and the check proves it); the gpu build at /boot/BITSOS2/bin/bitscomp-gpu)
+//! bitscomp [--fb PATH] [--socket NAME] [--stats SECS] [--user UID[:GID]]
+//!          Every service link is always on, at the system's sockets: MCP, settingsd, the installer's confirmer
+//!          (MC-9b), bitspkgd (PK-7a), bitssnap (REWIND), `assist serve` in the session (CL-3b, only the helper may
+//!          answer, `assist_peer`) and the Xwayland started by the first X11 client (WY-3).
 //! bitscomp ctl [--socket NAME] COMMAND...
 //! bitscomp exec PPID PROGRAM [ARG]... (WY-7, internal: how bitscomp starts a program, `spawn`)
 //! bitscomp licenses (the Exo 2 font licence, OFL 1.1)
-//! bitscomp check-build (WY-14, internal: the gpu build proves it loads and makes a renderer before the hand-over)
-//! bitscomp page ADDRESS (WY-5b: the window of a settings page; bitscomp draws its content, `page_client`)
+//! bitscomp page ADDRESS (WY-5b: the window of a settings page, PK-7a: or of `programme/`; bitscomp draws its
+//! content, `page_client`)
 
 mod acquire;
+mod bootmark;
+mod alsa_ctl;
 mod address;
+mod confirm_note;
+mod crash_note;
 mod anim;
+mod assist;
+mod assist_app;
+mod assist_client;
+mod assist_ctl;
+mod assist_desk;
+#[cfg(test)]
+mod assist_fake;
+mod assist_draw;
+mod assist_layout;
+mod assist_level;
+mod assist_menu;
+mod assist_menu_app;
+mod assist_menu_draw;
+mod assist_paste;
+mod assist_peer;
+mod assist_route;
+mod assist_serve;
+mod assist_tree;
+mod assist_views;
 mod answer;
 mod apply;
 mod backend;
-mod bench;
 mod canvas;
 mod chrome;
 mod chrome_draw;
 mod chrome_render;
 mod clients;
+mod clip_read;
 mod ctl;
+// EINS-D: the control socket's part for `bits` (user/tools/bits).
+mod ctl_bits;
+mod ctl_bits_card;
+mod ctl_bits_clip;
+mod ctl_bits_gate;
 mod ctl_desk;
 mod desktop_entry;
 mod ctl_mouse;
@@ -48,13 +69,18 @@ mod dmabuf;
 mod drm_sync;
 mod drop_root;
 mod ending;
-mod flavour;
+mod feld;
+mod feld_app;
+mod feld_draw;
+mod feld_view;
 mod foot;
+mod symbols;
 mod gpu_watch;
 mod grab;
 mod grant;
 mod handlers;
 mod header;
+mod helpers;
 mod hung;
 mod cursor_surface;
 mod hwcursor;
@@ -66,10 +92,86 @@ mod install_app;
 mod install_dialog;
 mod install_draw;
 mod install_link;
+mod ki;
+mod ki_app;
+mod leistung;
+// DB4: the one memory (ctxd): habits, "Gerade passend", the page "Was BitsOS über dich gelernt hat".
+mod gelernt;
+mod gelernt_app;
+mod habit_app;
+mod habit_ask;
+mod habit_client;
+mod habit_hint;
+mod habit_vorrang;
+// DB3: the glue to foreign programs' trees (C3) and Durchblick's "Erklär mir das".
+mod ui_fetch;
+mod db_act;
+mod desk_paste;
+mod desk_write;
+mod desk_write_app;
+mod db_act_app;
+mod db_act_draw;
+mod db_app;
+mod db_ctl;
+mod db_draw;
+mod db_input;
+mod db_layout;
+mod db_question;
+mod db_settings;
+mod db_shot;
+mod db_ui;
+mod db_worker;
+mod passend;
+mod leistung_app;
+mod werhatwas;
+mod werhatwas_app;
+mod update_app;
+mod update_page;
+// SYS-A: the program "System" (overview, measurements, task manager).
+mod sys_act;
+mod sys_amdgpu;
+mod sys_app;
+mod sys_chart;
+mod sys_clip;
+mod sys_ctl;
+mod sys_draw;
+mod sys_draw2;
+mod sys_group;
+mod sys_layout;
+mod sys_limit;
+mod sys_model;
+mod sys_model2;
+mod sys_model3;
+mod sys_parse;
+mod sys_report;
+mod sys_ring;
+mod sys_rules;
+mod sys_sample;
+mod sys_snap;
+mod sys_sources;
+mod sys_text;
+mod sys_ui;
+mod sys_view;
+mod sys_wer;
+mod ki_ask;
+mod ki_guard;
+mod ki_key;
+mod ki_kinds;
+mod ki_helpers;
+mod ki_change;
+mod ki_probe;
 mod launch;
 mod lock;
 mod layout;
+mod home;
+mod min_close;
+mod min_row;
+mod ws_close;
 mod library;
+mod library_add;
+mod library_facts;
+mod library_steam;
+mod library_twin;
 mod library_draw;
 mod library_ui;
 mod library_view;
@@ -77,35 +179,80 @@ mod minimize;
 mod pad;
 mod pad_app;
 mod mcp;
+mod mcp_start;
 mod menu;
 mod menu_draw;
 mod menu_input;
+mod mesa;
 mod pacer;
+mod playtime;
 mod page;
 mod page_app;
 mod page_client;
 mod page_confirm;
 mod page_draw;
+mod page_kind;
+mod page_layout;
 mod page_schema;
+mod page_join;
+mod page_paste;
+mod page_rail;
+mod page_tabs;
+mod page_tabs_app;
+mod page_view;
 mod place;
 mod pointer;
+mod pkg_client;
+mod prog_end;
+mod prog_note;
+mod prog_note_draw;
+mod programme;
+mod programme_app;
+mod programme_draw;
+mod programme_layout;
+mod programme_text;
+mod programme_view;
+mod rewind;
+mod rewind_app;
+mod rewind_draw;
+mod rewind_view;
 mod rundir;
 mod paint;
-// Used by the GLES renderer only; tested in every build.
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 mod readback;
+mod recent_name;
 mod release;
 mod fx;
-#[cfg(feature = "gpu")]
 mod fx_gl;
 mod render;
-#[cfg(feature = "gpu")]
 mod render_gl;
 mod reveal;
 mod ring;
 mod session;
 mod settings;
 mod settings_write;
+mod snap_client;
+mod sofa;
+mod sofa_app;
+mod sofa_body;
+mod sofa_draw;
+mod sofa_focus;
+mod sofa_header_draw;
+mod sofa_io;
+mod sofa_layout;
+mod sofa_library_draw;
+mod sofa_model;
+mod sofa_music;
+mod sofa_music_serve;
+mod bench_serve;
+mod sofa_quick;
+mod sofa_quick_draw;
+mod sofa_search;
+mod sofa_search_app;
+mod sofa_search_draw;
+mod sofa_settings;
+mod sofa_settings_draw;
+mod sofa_start_draw;
+mod sofa_tile_draw;
 mod spawn;
 mod spin;
 mod spots;
@@ -119,7 +266,21 @@ mod syncobj;
 mod tabs;
 mod terminal;
 mod text;
+mod text_in;
 mod theme;
+mod theme_auto;
+// DB1 (Durchblick): the desktop as a list (ctl ui, ui-act, ui-history; MCP ui_list, ui_act).
+mod ui_act;
+mod ui_client;
+mod ui_ctl;
+mod ui_desk;
+mod ui_history;
+mod ui_keys;
+mod ui_mcp;
+mod ui_page;
+mod ui_reg;
+mod ui_sofa;
+mod ui_stack;
 mod veil;
 mod win;
 mod win_alone;
@@ -146,7 +307,7 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::wayland::compositor::CompositorClientState;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use backend::Backend;
+use backend::fbdev::Fbdev;
 use state::App;
 
 #[derive(Default)]
@@ -198,133 +359,28 @@ impl ClientData for ClientState {
 const GPU_POLL: Duration = Duration::from_millis(20);
 
 struct Args {
-    backend: String,
     fb: String,
-    size: (i32, i32),
     socket: String,
     stats_every: Option<u64>,
-    run: Vec<String>,
-    mcp: String,
-    settings: String,
-    fixed_status: bool,
-    /// `--main-device render` (`dmabuf::advertised`).
-    main_render: bool,
-    /// WY-17: `--scanout` and `--fake-scanout`.
-    scanout: backend::scanout::Want,
-    fake_scanout: Option<String>,
-    /// WY-19: `--fx-on-software`: the gpu effect level on a software rasteriser too (tests, measuring).
-    fx_on_software: bool,
-    /// WY-8 (GX-3 CR 2): fbdev draws two windows shown by a pan (`--fb-pan`) instead of one whose damage the
-    /// kernel copies (`--fb-copy`, the default until the Mini-PC has compared both: QEMU timing decides nothing).
-    fb_pan: bool,
-    grant: bool,
-    /// WY-7: whom a root bitscomp on fbdev runs as once its devices are open (`drop_root`; 0 keeps root).
+    /// WY-7: whom a root bitscomp runs as once its devices are open (`drop_root`; 0 keeps root).
     user: (u32, u32),
-    /// WY-11, headless: `none` (default), `soft` or `fake` (`backend::headless`).
-    pointer: String,
-    /// MC-9b: the installer's confirmer socket (`install_link`), or `none`.
-    installer: String,
-    /// WY-14: `--build rescue|gpu` (`flavour`; unset: CONFIG.TXT `bitscomp=` decides) and where the gpu build is.
-    build: Option<String>,
-    gpu_exe: String,
-    /// `--config PATH`: the CONFIG.TXT to read `bitscomp=` from (host tests; default the stick's).
-    config: String,
-    /// WY-15: `--renderer pixman|gles` (unset: `--build gles` or CONFIG.TXT `bitscomp=gles` decide; `flavour`).
-    renderer: Option<String>,
-    /// WY-3: `--xwayland PATH|none`: the Xwayland started on demand (none: no X11 display).
-    xwayland: String,
-    /// WY-3b: `--xwayland-glamor`.
-    xwayland_glamor: xwayland::Glamor,
-    /// WY-21: `--watch-node PATH`.
-    watch_node: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut a = Args {
-        backend: if cfg!(feature = "nested") { "winit".into() } else { "fbdev".into() },
         fb: "/dev/fb0".into(),
-        size: (1600, 1000),
         socket: "wayland-bits-0".into(),
         stats_every: None,
-        run: Vec::new(),
-        mcp: mcpreg::DEFAULT_SOCKET.into(),
-        settings: std::env::var("SETTINGS_SOCKET").unwrap_or_else(|_| settings::SOCKET.into()),
-        fixed_status: false,
-        main_render: false,
-        scanout: backend::scanout::Want::Auto,
-        fake_scanout: None,
-        fx_on_software: false,
-        fb_pan: false,
-        grant: true,
         user: drop_root::DESKTOP,
-        pointer: "none".into(),
-        installer: install_link::SOCKET.into(),
-        build: None,
-        gpu_exe: flavour::GPU_EXE.into(),
-        config: flavour::CONFIG.into(),
-        renderer: None,
-        xwayland: xwayland::DEFAULT_EXE.into(),
-        xwayland_glamor: xwayland::Glamor::Auto,
-        watch_node: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut val = || it.next().cloned().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
-            "--backend" => a.backend = val()?,
             "--fb" => a.fb = val()?,
             "--socket" => a.socket = val()?,
-            "--size" => {
-                let v = val()?;
-                let (w, h) = v.split_once('x').ok_or("--size WxH")?;
-                a.size = (w.parse().map_err(|_| "--size WxH")?, h.parse().map_err(|_| "--size WxH")?);
-            }
-            "--fx-on-software" => a.fx_on_software = true,
             "--stats" => a.stats_every = Some(val()?.parse().map_err(|_| "--stats SECS")?),
-            "--run" => a.run.push(val()?),
-            "--mcp" => a.mcp = val()?,
-            "--no-grant" => a.grant = false,
-            "--settings" => a.settings = val()?,
-            "--installer" => a.installer = val()?,
-            "--xwayland" => a.xwayland = val()?,
-            "--watch-node" => a.watch_node = Some(val()?),
-            "--xwayland-glamor" => a.xwayland_glamor = xwayland::Glamor::parse(&val()?).ok_or("--xwayland-glamor auto|off|force:PATH")?,
-            "--build" => a.build = Some(val()?),
-            "--gpu-exe" => a.gpu_exe = val()?,
-            "--config" => a.config = val()?,
-            "--renderer" => {
-                let v = val()?;
-                flavour::Renderer::parse(&v).ok_or("--renderer pixman|gles")?;
-                a.renderer = Some(v);
-            }
-            "--fixed-status" => a.fixed_status = true,
-            "--main-device" => {
-                a.main_render = match val()?.as_str() {
-                    "auto" => false,
-                    "render" => true,
-                    _ => return Err("--main-device auto|render".into()),
-                }
-            }
-            "--scanout" => {
-                let v = val()?;
-                a.scanout = backend::scanout::Want::parse(&v).ok_or("--scanout auto|direct|readback")?;
-            }
-            "--fake-scanout" => {
-                let v = val()?;
-                if !matches!(v.as_str(), "ok" | "badfd" | "nostride" | "refuse" | "vsync") {
-                    return Err("--fake-scanout ok|badfd|nostride|refuse|vsync".into());
-                }
-                a.fake_scanout = Some(v);
-            }
-            "--fb-pan" => a.fb_pan = true,
-            "--fb-copy" => a.fb_pan = false,
             "--user" => a.user = drop_root::parse_user(&val()?)?,
-            "--pointer" => {
-                a.pointer = val()?;
-                if !["none", "soft", "fake"].contains(&a.pointer.as_str()) {
-                    return Err("--pointer none|soft|fake".into());
-                }
-            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -332,12 +388,9 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 }
 
 fn main() {
-    flavour::set_comm();
-    flavour::take_rescue();
+    // GS-1: the start's marks (/dev/kmsg is opened while the console's start is still root).
+    bootmark::begin();
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().map(String::as_str) == Some(flavour::CHECK_ARG) {
-        std::process::exit(check_build(&argv[1..]));
-    }
     if argv.first().map(String::as_str) == Some("licenses") {
         print!("The interface fonts built into bitscomp (SIL Open Font License 1.1):\n\n{}", text::LICENCE);
         return;
@@ -366,99 +419,50 @@ fn main() {
         eprintln!("bitscomp: {e}");
         std::process::exit(2);
     });
-    // WY-14: before anything is opened, while bitscomp has one thread.
-    // WY-21: Some when the gpu build it handed over to gave the GPU up or crashed: this rescue build takes over.
-    let takeover = flavour::hand_over(args.build.as_deref(), args.renderer.as_deref(), &args.gpu_exe, &args.config, &argv);
-    let renderer = if takeover.is_some() { flavour::Renderer::Pixman } else { choose_renderer(&args) };
-    if let Err(e) = run(args, renderer, takeover) {
+    // Before anything is opened: without a render node there is no desktop, and the console keeps the screen.
+    let node = mesa::gpu_or_why(dmabuf::render_device().1.as_deref(), |n| gpu_watch::look_within(n, Duration::from_secs(1))).unwrap_or_else(|why| {
+        eprintln!("bitscomp: {why}");
+        std::process::exit(NO_GPU_EXIT);
+    });
+    // The tree's EGL, while bitscomp has one thread.
+    mesa::set_env();
+    if let Err(e) = run(args, node) {
         eprintln!("bitscomp: {e}");
         std::process::exit(1);
     }
 }
 
-/// WY-15: the renderer this process draws with: Pixman in the rescue build; in the gpu build GLES when chosen, its
-/// EGL variables set now, while bitscomp has one thread.
-fn choose_renderer(args: &Args) -> flavour::Renderer {
-    if !flavour::GPU {
-        return flavour::Renderer::Pixman;
-    }
-    let config = std::fs::read_to_string(&args.config).map_err(|_| "unreadable");
-    let node = dmabuf::render_device().1.is_some();
-    let (r, why) = flavour::renderer_wanted(args.renderer.as_deref(), args.build.as_deref(), config.as_deref().map_err(|e| *e), node);
-    if why != "default" {
-        eprintln!("bitscomp: renderer {} ({why})", r.name());
-    }
-    #[cfg(feature = "gpu")]
-    if r == flavour::Renderer::Gles {
-        match flavour::tree_root() {
-            Some(tree) => {
-                let (software, gl_why) = flavour::gl_software(&args.config);
-                eprintln!("bitscomp: renderer gles: {} ({gl_why})", if software { "the software rasteriser" } else { "the GPU" });
-                render_gl::set_env(tree, software);
-            }
-            None => {
-                eprintln!("bitscomp: renderer gles: this gpu build names no Mesa tree; drawing with pixman");
-                return flavour::Renderer::Pixman;
-            }
-        }
-    }
-    r
-}
+/// bitscomp's exit status on a machine without a GPU render node: it ended before it touched the screen.
+const NO_GPU_EXIT: i32 = 69;
 
-/// `check-build [--renderer pixman|gles]` (`flavour::check_build`).
-fn check_build(args: &[String]) -> i32 {
-    match flavour::check_renderer(args) {
-        Ok(flavour::Renderer::Pixman) => flavour::check_build::<render::DefaultRenderer>(),
-        #[cfg(feature = "gpu")]
-        Ok(flavour::Renderer::Gles) => match flavour::tree_root() {
-            Some(tree) => {
-                render_gl::set_env(tree, flavour::gl_software(flavour::CONFIG).0);
-                flavour::check_build::<smithay::backend::renderer::gles::GlesRenderer>()
-            }
-            None => {
-                eprintln!("bitscomp check-build: build=gpu: no Mesa tree named at build time");
-                1
-            }
-        },
-        #[cfg(not(feature = "gpu"))]
-        Ok(flavour::Renderer::Gles) => {
-            eprintln!("bitscomp check-build: build=rescue: no gles renderer in the rescue build");
-            1
-        }
-        Err(e) => {
-            eprintln!("bitscomp check-build: {e}");
-            2
-        }
-    }
-}
-
-fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result<(), String> {
+fn run(args: Args, node: String) -> Result<(), String> {
     // WY-7: a root start (the console) runs as the desktop user once its devices are open (`drop_root`).
-    let drop_to = drop_root::plan(drop_root::euid(), &args.backend, args.user);
+    let drop_to = drop_root::plan(drop_root::euid(), args.user);
     // Before any thread exists (set_var); made and checked after the drop, as the user.
     let rundir = rundir::select(drop_to.map(|(uid, _)| uid));
     let mut event_loop: EventLoop<'static, App> = EventLoop::try_new().map_err(|e| e.to_string())?;
     // A plain kill ends like Strg+Alt+Q, so the socket files and the started programs are cleaned up.
-    // Blocked here, before any back end starts threads, so every thread inherits the mask.
+    // Blocked here, before the back end starts threads, so every thread inherits the mask.
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP]).map_err(|e| e.to_string())?;
     event_loop.handle().insert_source(signals, |_, _, app| app.quit = true).map_err(|e| e.to_string())?;
-    let mut backend: Box<dyn Backend> = match args.backend.as_str() {
-        #[cfg(feature = "nested")]
-        "winit" => Box::new(backend::winit::Winit::new(args.size)?),
-        "headless" => Box::new(backend::headless::Headless::new(args.size, &args.pointer, args.fake_scanout.as_deref())),
-        "fbdev" => Box::new(backend::fbdev::Fbdev::new(&args.fb, args.fb_pan, &event_loop.handle())?),
-        other => return Err(format!("unknown back end {other}")),
-    };
+    let mut backend = Fbdev::new(&args.fb, &event_loop.handle())?;
     // The grant needs the screen's holder, which the back end just became (and root's fb0 open, when dropping).
-    let grant = (args.grant && args.backend == "fbdev").then(|| grant::Grant::request(&args.fb)).flatten();
+    let grant = grant::Grant::request(&args.fb);
+    // PE-1: the kernel log for the program lines, while root may still open it.
+    prog_note::open_journal();
     if let Some((uid, gid)) = drop_to {
         // Still root: a stale root-owned lock or font cache of an older root run can be probed and cleared.
         rundir::clear_foreign(&rundir, &args.socket, uid);
+        // SYS-A: the session's RLIMIT_NICE (the task manager's Vorrang), set while root may still raise it.
+        if let Err(e) = sys_limit::session_nice() {
+            eprintln!("bitscomp: RLIMIT_NICE {} for the session not set: {e}", sys_limit::SESSION);
+        }
         drop_root::drop_to(uid, gid).map_err(|e| format!("giving up root for uid {uid}: {e} (--user 0 runs as root on purpose)"))?;
         user_env(uid);
         eprintln!("bitscomp: devices open, now running as uid {uid} gid {gid}");
-        flavour::rearm_death_signal();
     }
+    // The shader cache in the desktop user's home on the data volume, before the first EGL display.
+    mesa::set_shader_cache(&helpers::home(drop_root::euid()));
     rundir::ensure(&rundir)?;
 
     let mut display: Display<App> = Display::new().map_err(|e| e.to_string())?;
@@ -487,11 +491,6 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
             Ok(PostAction::Continue)
         })
         .map_err(|e| e.to_string())?;
-    if let Some(fd) = backend.wake_fd() {
-        handle
-            .insert_source(Generic::new(fd, Interest::READ, Mode::Level), |_, _, _| Ok(PostAction::Continue))
-            .map_err(|e| e.to_string())?;
-    }
     let ctl_path = ctl::listen(&handle, &args.socket).map_err(|e| format!("control socket: {e}"))?;
     let mut pacer = pacer::Pacer::new()?;
     let timer = pacer.fd().try_clone_to_owned().map_err(|e| format!("timerfd: {e}"))?;
@@ -504,46 +503,75 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
         .map_err(|e| e.to_string())?;
 
     let mut app = App::new(dh, args.socket.clone(), backend.size());
-    app.fx.on_software = args.fx_on_software;
     app.grant = grant;
-    if args.mcp != "none" {
-        mcp::start(&handle, args.mcp.clone())?;
+    mcp::start(&handle, mcpreg::DEFAULT_SOCKET.into())?;
+    // The installer's confirmer: its peer must be the boot's bitsinstall as root.
+    install_link::start(&handle, install_link::SOCKET.into())?;
+    settings::start(&handle, settings::SOCKET.into())?;
+    match settings_write::start(&handle, settings::SOCKET.into()) {
+        Ok(w) => app.settings_writer = Some(w),
+        Err(e) => eprintln!("bitscomp: {e} (the settings page shows values only)"),
     }
-    if args.fixed_status {
-        app.status = status::Status::fixed();
+    // PK-7a: the "Programme" page's client (a thread per request; nothing is asked before a page opens).
+    app.prog_client = Some(pkg_client::start(&handle, pkg_client::SOCKET.into())?);
+    // REWIND: "Zurückspulen"'s client (a thread per request; a list once a minute for the strip's button).
+    app.snap_client = Some(snap_client::start(&handle, snap_client::SOCKET.into())?);
+    // CL-5: "Testen" on the page "KI" (a thread per test; nothing runs before Georg clicks it).
+    match ki_probe::start(&handle, drop_root::euid()) {
+        Ok(p) => app.ki.prober = Some(p),
+        Err(e) => eprintln!("bitscomp: ki: no channel for the provider tests: {e} (the page says so)"),
     }
-    app.headless = args.backend == "headless";
-    if args.installer != "none" {
-        // Only the real socket's peer must be the boot's /bin/bitsinstall as root; another path is a test's.
-        let check = args.installer == install_link::SOCKET;
-        if !check {
-            eprintln!("bitscomp: installer socket {} (a test socket: its peer is not checked)", args.installer);
-        }
-        install_link::start(&handle, args.installer.clone(), check)?;
-    }
-    if args.settings != "none" {
-        settings::start(&handle, args.settings.clone())?;
-        match settings_write::start(&handle, args.settings.clone()) {
-            Ok(w) => app.settings_writer = Some(w),
-            Err(e) => eprintln!("bitscomp: {e} (the settings page shows values only)"),
-        }
+    // CL-3b: the assistant's socket (two threads of its own; the sidebar draws from the model they fill), guarded
+    // (`assist_peer`): only the helper may answer there.
+    let assist_guard = std::sync::Arc::new(assist_peer::Guard::new(std::path::Path::new(assist_serve::EXE), drop_root::euid()));
+    // The desktop starts without the assistant too: its sidebar then stays as it was.
+    match assist_client::start(&handle, assist_client::socket(&rundir), Some(assist_guard.clone())) {
+        Ok(c) => app.assist_client = Some(c),
+        Err(e) => eprintln!("bitscomp: {e} (no conversation in the sidebar)"),
     }
     session::start(&handle, &mut app, &rundir)?;
     // PK-L1a: the program index (its own thread; a failure leaves the built-in programs).
-    if let Err(e) = library::start(&handle, library::Roots::from_env(), |app: &mut App, ix| {
+    if let Err(e) = library::start(&handle, library::Roots::system(), |app: &mut App, ix| {
         app.library = ix;
         app.chrome_dirty();
     }) {
         eprintln!("bitscomp: library: {e} (only the built-in programs)");
     }
-    // WY-21: the gpu build's session comes back as it was saved, without the start page's offer.
-    app.session.restore_since = takeover;
-    app.xwayland = xwayland::setup(&handle, &args.xwayland, args.xwayland_glamor.clone());
-    app.draw_pointer = backend.draws_pointer();
-    // WY-11: the hardware cursor, if the back end has one; the first image tells whether it works.
-    app.cursor.hw = if app.draw_pointer { backend.hw_cursor() } else { None };
+    // GM-6b: the play-time file's thread and the music player's (the sofa mode's Start and Bibliothek).
+    app.sofa_body_start(&handle);
+    // GM-6c: the quick menu's thread (volume, outputs, the pad's battery, the power request).
+    app.sofa_io_start(&handle, true);
+    // SELFOPT-1: the page "Leistung"'s data (its own thread).
+    app.leistung_start(&handle);
+    // DB4: what Georg does goes to ctxd; what it learned comes back.
+    app.habit_start(&handle);
+    // DB3: foreign programs' trees come from a thread.
+    app.ui_fetch_start(&handle);
+    app.db_start(&handle);
+    app.desk_write_start(&handle);
+    app.prog_start_loop(&handle);
+    // DB2: the page "Wer hat was gemacht"'s data from bitsaccess (its own thread).
+    app.wer_start(&handle);
+    // UPDATE: the page "Aktualisieren" talks to bitspkgd on its own thread.
+    app.upd_start(&handle, pkg_client::SOCKET.into());
+    // VB-1: "Version N läuft. Bestätigen?" while the kernel asks.
+    app.confirm_start(&handle, pkg_client::SOCKET.into());
+    // GPY-PASTE: a paste into a page's field comes back from its reading thread.
+    app.page_paste_start(&handle);
+    // SYS-A: the program "System"'s sampler (asleep until a System window opens).
+    app.sys_start(&handle);
+    // INT-GM6 (GM-6m's change request 1): the music player of this session.
+    sofa_music_serve::start(drop_root::euid());
+    // SELFOPT-1: the nightly benchmark runner of this session (it measures only when Georg switched it on).
+    bench_serve::start(drop_root::euid(), &args.socket);
+    // CL-3b: the assistant's helper of this session.
+    assist_serve::start(drop_root::euid(), assist_guard);
+    app.xwayland = xwayland::setup(&handle, xwayland::DEFAULT_EXE, &node);
+    // WY-11: the hardware cursor; the first image tells whether it works (else the frames draw the pointer).
+    app.cursor.hw = backend.hw_cursor();
     app.cursor_sync();
     app.spawn_env = terminal::prepare(&rundir);
+    app.crash_note(&rundir);
     terminal::cursor_env(|k| std::env::var(k).ok(), &mut app.spawn_env, app.cursor.size);
     app.foot.path = Some(foot::path(&rundir));
     app.foot_sync();
@@ -553,41 +581,34 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
     }
     let (mut period, mut phase) = backend.pacing().unwrap_or((pacer::DEFAULT_PERIOD, Duration::ZERO));
     app.refresh = period;
-    let mut comp = render::make(&app, renderer)?;
-    backend::scanout::start(&mut *backend, &mut *comp, args.scanout, dmabuf::render_device().1.as_deref());
-    app.dma.main_render = args.main_render;
+    let mut comp = render::make(&app)?;
+    bootmark::mark("renderer_up");
+    backend::scanout::start(&mut backend, &mut *comp).map_err(|e| format!("scanout: {e}"))?;
     dmabuf::init(&mut app, &*comp, handle.clone());
-    let node = args.watch_node.clone().or(dmabuf::render_device().1);
-    let mut gpu = GpuSide::new(&*comp, node);
+    let mut gpu = GpuSide::new(node);
     println!(
-        "WAYLAND_DISPLAY={} XDG_RUNTIME_DIR={} control={} pid={} backend={} size={}x{} refresh_us={} build={} renderer={} egl={}",
+        "WAYLAND_DISPLAY={} XDG_RUNTIME_DIR={} control={} pid={} size={}x{} refresh_us={} renderer={}",
         args.socket,
         rundir.display(),
         ctl_path.display(),
         std::process::id(),
-        args.backend,
         backend.size().0,
         backend.size().1,
         period.as_micros(),
-        flavour::name(),
-        comp.renderer(),
-        flavour::egl_probe()
+        comp.renderer()
     );
     let _ = std::io::stdout().flush();
-    for cmd in &args.run {
-        let argv: Vec<&str> = cmd.split_whitespace().collect();
-        app.spawn(&argv);
-    }
 
     let mut next_frame = pacer::now();
     let mut next_stats = Instant::now();
-    let mut bench_run: Option<bench::Run> = None;
-    let mut bench_due: Option<Duration> = None;
+    // Why the desktop ends on its own (a lost GPU, windows that cannot be taken again): said at the end.
+    let mut ended: Option<String> = None;
     let mut guard = spin::Guard::default();
     let mut missed = clients::Missed::default();
     let mut gpu_late = false;
     while !app.quit {
-        let busy = app.needs_frame || app.layout_dirty;
+        // A screenshot waiting for its frame (`ctl::run_queue`) keeps the frame timer on until it is taken.
+        let busy = app.needs_frame || app.layout_dirty || app.shot_wait.is_some();
         // Asleep until a client, an input device, the control socket or the frame timer wakes us, or a ping, a
         // "hung" deadline or a SIGKILL is due; the 1 s cap reaps children.
         let mono_now = pacer::now();
@@ -595,18 +616,23 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
         let busy = busy || app.anim.running(mono_now, &app.theme);
         let wake = spin::earliest(&[
             (busy.then_some(next_frame), "frame"),
-            (bench_due, "bench"),
             (app.answer_due(), "answer"),
             (app.ending_due(), "ending"),
             (app.status.due(), "status"),
             (app.session.due, "session"),
             (app.notice_tick(mono_now), "notice"),
+            (app.habit_hint_tick(mono_now), "hint"),
+            (app.min_close_tick(mono_now), "min-close"),
             (app.veil_next, "veil"),
             (app.repeat_due(), "repeat"),
+            (app.assist_due(), "assist"),
             (app.pad_due(), "pad"),
+            (app.sofa_due(), "sofa"),
             (app.desk.reveal.due(), "reveal"),
             (app.launches.due(), "launches"),
             (app.install_due(), "install"),
+            (app.crash_due(), "crash"),
+            (app.confirm_due(), "confirm"),
             (app.fx.due(), "fx"),
             (gpu_late.then_some(mono_now + GPU_POLL), "gpu"),
         ]);
@@ -623,10 +649,9 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
         clients::read_missed(&mut display, &mut app, &mut missed, mono_now);
         // WY-16: new dma-bufs checked by the renderer, answered before this turn's flush.
         comp.dmabuf_turn(&mut app);
-        backend.dispatch(&mut app);
-        bench::take(&mut app, &*comp, &mut bench_run);
-        bench_due = bench::step(&mut app, &*comp, backend.as_mut(), &mut bench_run, period);
         ctl::run_queue(&mut app, &mut *comp);
+        // DB3: the picture Durchblick asked for, from the frame on the screen.
+        db_shot::take(&mut app, &mut *comp);
         app.lock_sync();
         // WY-11: a new shape (a client's set_cursor, a commit of its cursor surface) goes to the cursor now.
         app.cursor_sync();
@@ -646,14 +671,19 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
             app.chrome_dirty();
         }
         app.session_tick(mono);
+        app.theme_auto_tick(mono);
         app.notice_tick(mono);
         app.repeat_tick(mono);
+        app.assist_tick(mono);
         app.pad_tick(mono);
+        app.sofa_tick(mono);
         app.reveal_tick(mono);
         if app.launches.tick(mono) {
             app.needs_frame = true;
         }
         app.install_tick(mono);
+        app.crash_tick(mono);
+        app.confirm_tick(mono);
         if app.fx.tick(mono) {
             app.needs_frame = true;
         }
@@ -669,13 +699,10 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
             app.needs_frame = false;
             // After an idle stretch the frame is drawn at once, with its true time.
             app.frame_time = pacer::frame_time(next_frame, mono, period);
-            // WY-17: into the hidden scanout window when frames go there (may wait for the last flip).
-            gpu.waiting(true);
-            let aim = backend.scanout_frame();
-            gpu.waiting(false);
-            if !comp.aim(&app, aim) {
-                backend.scanout_lost("the picture lost its windows");
-                comp.aim(&app, None);
+            // WY-17: into the hidden scanout window (may wait for the last flip).
+            if let Err(e) = aim_frame(&app, &mut backend, &mut *comp, &gpu) {
+                ended = Some(format!("scanout: {e}"));
+                break;
             }
             let damage = comp.render(&mut app);
             // WY-21: the frame callbacks and buffer releases leave before a present that waits for the flip. Sent
@@ -684,18 +711,15 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
             // Xwayland on the Mini-PC, wy/86).
             let _ = app.dh.flush_clients();
             gpu.waiting(true);
-            // WY-21: `ctl stall`: this present waits as one stuck in the driver would.
-            if let Some(d) = app.stall.take() {
-                std::thread::sleep(d);
-            }
             if !damage.is_empty() {
                 let t0 = Instant::now();
-                backend.present(&*comp, &damage);
+                backend.present(&damage);
                 app.stats.present += t0.elapsed();
+                bootmark::presented(comp.renderer());
             }
             gpu.waiting(false);
+            // The windows ended with this flip: the next frame takes new ones and draws them whole.
             if backend.scanout_left() {
-                comp.aim(&app, None);
                 app.needs_frame = true;
             }
             if let Some((p, ph)) = backend.pacing() {
@@ -703,27 +727,24 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
                 app.refresh = p;
             }
             next_frame = pacer::next_frame(app.frame_time, pacer::now(), period, phase);
-            backend.dispatch(&mut app);
         }
-        let t0 = Instant::now();
-        gpu.waiting(true);
-        backend.flush(&*comp);
-        gpu.waiting(false);
-        app.stats.present += t0.elapsed();
         app.space.refresh();
         app.popups.cleanup();
         app.reap_children();
         app.prune_pending();
         // WY-16: after the frame (its draw has finished) the replaced buffers go back.
         app.dma.gpu_busy = !comp.gpu_idle();
-        // WY-19: a frame that outlasted `GPU_WAIT` was neither read back nor flipped: once the GPU is done the next
-        // frame shows it, even when nothing else asks for one (a first blur on a slow rasteriser).
+        // WY-19: a frame that outlasted `GPU_WAIT` was not flipped: once the GPU is done the next frame shows it, even
+        // when nothing else asks for one (a first blur on a cold shader cache).
         if gpu_late && !app.dma.gpu_busy {
             app.needs_frame = true;
         }
         gpu_late = app.dma.gpu_busy;
         if let Some(why) = gpu.lost(&mut *comp, gpu_late, pacer::now()) {
-            leave_gpu(&mut app, &mut comp, backend.as_mut(), &mut gpu, &why)?;
+            if let Err(e) = leave_gpu(&mut app, &mut comp, &mut backend, &mut gpu, &why) {
+                ended = Some(e);
+                break;
+            }
             gpu_late = false;
         }
         app.give_back();
@@ -740,29 +761,51 @@ fn run(args: Args, renderer: flavour::Renderer, takeover: Option<i64>) -> Result
     end_children(&mut app.children);
     // WY-11: the hardware cursor off while bitscomp still holds the screen.
     app.cursor.shutdown();
-    // The fbdev back end unmaps and gives the console back here.
+    // The fbdev back end gives the console back here.
     drop(backend);
+    if let Some(why) = ended {
+        // A compositor on a lost GPU is never dropped: its teardown would wait on a driver that may not answer.
+        std::mem::forget(comp);
+        return Err(why);
+    }
     eprintln!("bitscomp: ended");
     Ok(())
 }
 
-/// WY-21: what the loop knows of the GPU it draws on (`gpu_watch`). Nothing for a renderer that draws by CPU.
+/// WY-17: the window this frame is drawn into. When the windows of this hold ended (a refused pan, a screen that went
+/// back) or the picture has none (a new one after a reset or a mode change), they are taken again (`scanout::start`);
+/// an error when that fails, since frames have no other way to the screen.
+fn aim_frame(app: &App, backend: &mut Fbdev, comp: &mut dyn render::Composer, gpu: &GpuSide) -> Result<(), String> {
+    for _ in 0..2 {
+        gpu.waiting(true);
+        let aim = backend.scanout_frame();
+        gpu.waiting(false);
+        if aim.is_some_and(|a| comp.aim(app, a)) {
+            return Ok(());
+        }
+        backend.end_direct("the picture has no windows of this hold");
+        let _ = backend.scanout_left();
+        backend::scanout::start(backend, comp)?;
+    }
+    Err("the windows just taken again have ended at once".into())
+}
+
+/// WY-21: what the loop knows of the GPU it draws on (`gpu_watch`).
 struct GpuSide {
     watch: Option<gpu_watch::Watch>,
-    node: Option<String>,
+    node: String,
     late_since: Option<Duration>,
     next_reset_look: Duration,
-    /// GLES renderers made after a reset the device lived through: the next one is Pixman.
+    /// GLES renderers made after a reset the device lived through.
     rebuilds: u32,
 }
 
-/// How many times a reset the device lived through gets a new GLES renderer before Pixman draws for good.
+/// How many times a reset the device lived through gets a new GLES renderer before the desktop ends.
 const GPU_REBUILDS: u32 = 2;
 
 impl GpuSide {
-    fn new(comp: &dyn render::Composer, node: Option<String>) -> GpuSide {
-        let on_gpu = comp.renderer() == "gles";
-        let watch = node.as_deref().filter(|_| on_gpu).and_then(gpu_watch::Watch::start);
+    fn new(node: String) -> GpuSide {
+        let watch = gpu_watch::Watch::start(&node);
         GpuSide { watch, node, late_since: None, next_reset_look: Duration::ZERO, rebuilds: 0 }
     }
 
@@ -772,7 +815,7 @@ impl GpuSide {
         }
     }
 
-    /// A wait on the display (the last flip, a present, a flush) begins or ends: `gpu_watch::STALL` counts only these.
+    /// A wait on the display (the last flip, a present) begins or ends: `gpu_watch::STALL` counts only these.
     fn waiting(&self, on: bool) {
         if let Some(w) = &self.watch {
             w.waiting(on.then(pacer::now));
@@ -781,9 +824,6 @@ impl GpuSide {
 
     /// Why this renderer cannot draw on, once one of the signs says so.
     fn lost(&mut self, comp: &mut dyn render::Composer, late: bool, now: Duration) -> Option<String> {
-        if comp.renderer() != "gles" {
-            return None;
-        }
         self.late_since = if late { self.late_since.or(Some(now)) } else { None };
         if let Some(why) = self.watch.as_ref().and_then(gpu_watch::Watch::lost) {
             return Some(why);
@@ -799,31 +839,25 @@ impl GpuSide {
     }
 }
 
-/// WY-21: the renderer on a lost GPU is replaced in this process, so every client keeps its window: GLES again when the
-/// device lived through a reset (its node opens, the GL context alone was lost), else Pixman for good. The old compositor
-/// is never dropped: its teardown would wait on a driver that may not answer. A GPU that a frame waits on for ever is
-/// `gpu_watch`'s stall, not this.
-fn leave_gpu(app: &mut App, comp: &mut Box<dyn render::Composer>, backend: &mut dyn Backend, gpu: &mut GpuSide, why: &str) -> Result<(), String> {
-    let recovered = why.starts_with("the GL context")
-        && gpu.rebuilds < GPU_REBUILDS
-        && gpu.node.as_deref().is_some_and(|n| gpu_watch::look_within(n, Duration::from_secs(1)) == gpu_watch::Look::Opens);
-    let next = if recovered { flavour::Renderer::Gles } else { flavour::Renderer::Pixman };
-    eprintln!("bitscomp: gpu: {why}: the desktop goes on with {}, the windows stay", if recovered { "a new gles renderer" } else { "pixman" });
-    backend.scanout_lost("the GPU is lost");
-    let _ = backend.scanout_left();
-    let fresh = render::make(app, next)?;
-    std::mem::forget(std::mem::replace(comp, fresh));
-    comp.aim(app, None);
-    if comp.renderer() == "gles" {
-        gpu.rebuilds += 1;
-    } else {
-        gpu.watch = None;
+/// WY-21: a reset the device lived through (its node opens, the GL context alone was lost) gets a new GLES renderer in
+/// this process, so every client keeps its window; the windows are taken again at the next frame (`aim_frame`). Any
+/// other loss, or one reset too many, ends the desktop with the line why. The old compositor is never dropped: its
+/// teardown would wait on a driver that may not answer. A GPU that a frame waits on for ever is `gpu_watch`'s stall.
+fn leave_gpu(app: &mut App, comp: &mut Box<dyn render::Composer>, backend: &mut Fbdev, gpu: &mut GpuSide, why: &str) -> Result<(), String> {
+    let recovered = why.starts_with("the GL context") && gpu.rebuilds < GPU_REBUILDS && gpu_watch::look_within(&gpu.node, Duration::from_secs(1)) == gpu_watch::Look::Opens;
+    if !recovered {
+        return Err(format!("gpu: {why}: the desktop ends, the console takes the screen back"));
     }
+    eprintln!("bitscomp: gpu: {why}: the desktop goes on with a new gles renderer, the windows stay");
+    backend.end_direct("the GPU was reset");
+    let _ = backend.scanout_left();
+    let fresh = render::make(app)?;
+    std::mem::forget(std::mem::replace(comp, fresh));
+    gpu.rebuilds += 1;
     gpu.late_since = None;
     app.dma.gpu_busy = false;
     dmabuf::renew(app, &**comp);
     app.needs_frame = true;
-    eprintln!("bitscomp: gpu: renderer={} from now on", comp.renderer());
     Ok(())
 }
 

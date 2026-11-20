@@ -64,7 +64,7 @@ impl Rig {
     fn named(name: &str) -> Rig {
         let f = FakeHda::new(0x4401);
         f.add_codec(0, ALC269);
-        let c = Arc::new(Controller::new(name.into(), Kind::Intel, FakeHw(f.clone()), hda::Config::default()));
+        let c = Arc::new(Controller::new(name.into(), Kind::Intel, FakeHw(f.clone())));
         c.bring_up().unwrap();
         let sh = Arc::new(Shared::new());
         let core = Core::new(OnFake(c.clone()), sh.clone(), Config::latency_ms(40));
@@ -308,11 +308,11 @@ fn switch_to_hdmi_and_back() {
     use core::sync::atomic::{AtomicBool, Ordering};
     let fj = FakeHda::new(0x4401);
     fj.add_codec(0, ALC269);
-    let jack = Arc::new(Controller::new("hda0".into(), Kind::Intel, FakeHw(fj.clone()), hda::Config::default()));
+    let jack = Arc::new(Controller::new("hda0".into(), Kind::Intel, FakeHw(fj.clone())));
     jack.bring_up().unwrap();
     let fg = FakeHda::new(0x4401);
     fg.add_codec(0, AA01);
-    let gpu = Arc::new(Controller::new("hda1".into(), Kind::AtiHdmi, FakeHw(fg.clone()), hda::Config::default()));
+    let gpu = Arc::new(Controller::new("hda1".into(), Kind::AtiHdmi, FakeHw(fg.clone())));
     gpu.bring_up().unwrap();
     let changed = Arc::new(AtomicBool::new(false));
     let sh = Arc::new(Shared::new());

@@ -89,9 +89,9 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "dismiss",
-            "Hide a document in a workspace (undo with undo=true). Dokument im Arbeitsbereich ausblenden.",
+            "Hide a document in a workspace (undo with undo=true); scope query or everywhere also lowers it in later searches. Dokument im Arbeitsbereich ausblenden.",
             s(
-                json!({"workspace": {"type": "string"}, "doc": {"type": "string"}, "scope": {"type": "string", "enum": ["workspace"]},
+                json!({"workspace": {"type": "string"}, "doc": {"type": "string"}, "scope": {"type": "string", "enum": ["workspace", "query", "everywhere"]},
                      "undo": {"type": "boolean"}}),
                 &["workspace", "doc"],
             ),
@@ -150,7 +150,13 @@ pub fn handle_rpc(e: &Engine, req: &Value) -> Option<Value> {
             "instructions": "BitsOS context service (prototype): search Georg's documents and build workspaces. Results carry title, path and a short snippet only; private roots are never shown.",
         }),
         "ping" => json!({}),
+        // No folder named (V2's default): nothing to offer an AI yet, so a chat carries no empty tools.
+        "tools/list" if e.cfg.roots.is_empty() => json!({"tools": []}),
         "tools/list" => json!({"tools": tools()}),
+        "tools/call" if e.cfg.roots.is_empty() => json!({
+            "content": [{"type": "text", "text": "Der Kontextdienst durchsucht noch keinen Ordner (Einstellung context.roots)."}],
+            "isError": true,
+        }),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             if api::canonical(name) != Some(name) {

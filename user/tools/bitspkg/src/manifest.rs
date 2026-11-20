@@ -1,7 +1,10 @@
 //! `manifest.toml` (plan/PACKAGES.md): what a package is, what it brings and what it wants. `from_text` checks
 //! everything a hostile package could get wrong; a `Manifest` that exists is safe to install.
 
-use crate::names::{check_abs_path, check_ident, check_link_target, check_name, check_rel_path, check_sha256, check_version};
+use crate::names::{
+    COMPONENT_MAX, check_abs_path, check_ident, check_link_target, check_name, check_rel_path, check_repo_path, check_sha256, check_version,
+    check_view_link,
+};
 use crate::perm::Permission;
 use crate::toml::{self, Doc, Table, Value};
 use settingsd::json::Json;
@@ -9,6 +12,9 @@ use settingsd::key::KeyDef;
 use std::collections::HashSet;
 
 pub const FORMAT: i64 = 1;
+/// PK-6d (PACKAGES.md 6.7): a program from the repositories: its root tree, where every file came from, the
+/// `.pkgs` entries it is linked from, its launchers and the outputs of the emulated hooks.
+pub const FORMAT_REPO: i64 = 2;
 pub const FILE_NAME: &str = "manifest.toml";
 /// MCP tool names stay short enough for every client (the MCP spec allows 1..128).
 const TOOL_NAME_MAX: usize = 128;
@@ -57,8 +63,50 @@ pub struct Setting {
     pub table: Table,
 }
 
+/// Format 2: one closure package (plan 1.6): where its files came from and who signed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Origin {
+    pub repo: String,
+    pub name: String,
+    /// pacman's spelling (`1:2.3-1`).
+    pub version: String,
+    pub filename: String,
+    pub sha256: String,
+    pub packager: String,
+    /// The fingerprint of the key that signed the package.
+    pub key: String,
+}
+
+/// Format 2: a `.pkgs` entry the version is linked from (`apps/.pkgs/<pkg>/<version>`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Uses {
+    pub pkg: String,
+    pub version: String,
+}
+
+/// Format 2: a `.desktop` file that is not NoDisplay: what the program library shows (desk plan section 3).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Launch {
+    pub desktop: String,
+    pub name: String,
+    pub exec: String,
+    pub icon: String,
+    pub categories: String,
+}
+
+/// Format 2: the output file of an emulated alpm hook (plan 1.7), hashed: its `[[file]]` entry carries the same.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriggerOut {
+    pub hook: String,
+    pub tool: String,
+    pub output: String,
+    pub sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
+    /// 1 (a package folder from `bitspkg build`) or 2 (a program from the repositories, PK-6d).
+    pub format: i64,
     pub name: String,
     pub version: String,
     pub de: String,
@@ -72,6 +120,10 @@ pub struct Manifest {
     pub actions: Vec<Action>,
     pub services: Vec<Service>,
     pub settings: Vec<Setting>,
+    pub origins: Vec<Origin>,
+    pub uses: Vec<Uses>,
+    pub launch: Vec<Launch>,
+    pub triggers: Vec<TriggerOut>,
 }
 
 pub(crate) struct Fields<'a> {
@@ -160,11 +212,11 @@ impl Manifest {
 
     pub fn from_doc(doc: &Doc) -> Result<Manifest, String> {
         let mut f = Fields::new(&doc.root, "manifest".into());
-        match f.opt_int("format")? {
-            Some(FORMAT) => {}
-            Some(n) => return Err(f.err(format!("format {n} is newer than this bitspkg ({FORMAT})"))),
+        let format = match f.opt_int("format")? {
+            Some(n @ (FORMAT | FORMAT_REPO)) => n,
+            Some(n) => return Err(f.err(format!("format {n} is newer than this bitspkg ({FORMAT_REPO})"))),
             None => return Err(f.err("format missing")),
-        }
+        };
         let name = f.str("name")?;
         f.wrap(check_name(&name))?;
         let version = f.str("version")?;
@@ -174,6 +226,7 @@ impl Manifest {
         let program = f.opt_str("program")?;
         f.done()?;
         let mut m = Manifest {
+            format,
             name,
             version,
             de,
@@ -186,6 +239,10 @@ impl Manifest {
             actions: Vec::new(),
             services: Vec::new(),
             settings: Vec::new(),
+            origins: Vec::new(),
+            uses: Vec::new(),
+            launch: Vec::new(),
+            triggers: Vec::new(),
         };
         for (kind, t) in &doc.arrays {
             m.entry(kind, t)?;
@@ -197,10 +254,54 @@ impl Manifest {
 
     fn entry(&mut self, kind: &str, t: &Table) -> Result<(), String> {
         let mut f = Fields::new(t, format!("[[{kind}]]"));
+        let repo = self.format == FORMAT_REPO;
+        let path_ok = |p: &str| if repo { check_repo_path(p) } else { check_rel_path(p) };
         match kind {
+            "origin" | "uses" | "launch" | "trigger" if !repo => return Err(f.err("only in format 2 (a program from the repositories)")),
+            "origin" => {
+                let o = Origin {
+                    repo: f.str("repo")?,
+                    name: f.str("name")?,
+                    version: f.str("version")?,
+                    filename: f.str("filename")?,
+                    sha256: f.str("sha256")?,
+                    packager: f.opt_str("packager")?.unwrap_or_default(),
+                    key: f.opt_str("key")?.unwrap_or_default(),
+                };
+                f.wrap(check_sha256(&o.sha256))?;
+                for (what, v) in [("repo", &o.repo), ("name", &o.name), ("version", &o.version), ("filename", &o.filename)] {
+                    if v.is_empty() || v.len() > COMPONENT_MAX || v.contains('/') || v.chars().any(char::is_control) {
+                        return Err(f.err(format!("{what} {v:?}: one name without / or control characters")));
+                    }
+                }
+                self.origins.push(o);
+            }
+            "uses" => {
+                let u = Uses { pkg: f.str("pkg")?, version: f.str("version")? };
+                f.wrap(crate::repo::syncdb::check_name(&u.pkg))?;
+                f.wrap(check_version(&u.version))?;
+                self.uses.push(u);
+            }
+            "launch" => {
+                let l = Launch {
+                    desktop: f.str("desktop")?,
+                    name: f.str("name")?,
+                    exec: f.str("exec")?,
+                    icon: f.opt_str("icon")?.unwrap_or_default(),
+                    categories: f.opt_str("categories")?.unwrap_or_default(),
+                };
+                f.wrap(check_repo_path(&l.desktop))?;
+                self.launch.push(l);
+            }
+            "trigger" => {
+                let t = TriggerOut { hook: f.str("hook")?, tool: f.str("tool")?, output: f.str("output")?, sha256: f.str("sha256")? };
+                f.wrap(check_repo_path(&t.output))?;
+                f.wrap(check_sha256(&t.sha256))?;
+                self.triggers.push(t);
+            }
             "file" => {
                 let path = f.str("path")?;
-                f.wrap(check_rel_path(&path))?;
+                f.wrap(path_ok(&path))?;
                 let sha256 = f.str("sha256")?;
                 f.wrap(check_sha256(&sha256))?;
                 let size = f.opt_int("size")?.ok_or_else(|| f.err("size missing"))?;
@@ -210,14 +311,14 @@ impl Manifest {
             }
             "symlink" => {
                 let path = f.str("path")?;
-                f.wrap(check_rel_path(&path))?;
+                f.wrap(path_ok(&path))?;
                 let target = f.str("target")?;
-                f.wrap(check_link_target(&path, &target))?;
+                f.wrap(if repo { check_view_link(&path, &target) } else { check_link_target(&path, &target) })?;
                 self.symlinks.push(Symlink { path, target });
             }
             "dir" => {
                 let path = f.str("path")?;
-                f.wrap(check_rel_path(&path))?;
+                f.wrap(path_ok(&path))?;
                 self.dirs.push(path);
             }
             "permission" => self.permissions.push(Permission::from_fields(&mut f)?),
@@ -262,15 +363,17 @@ impl Manifest {
     /// Every path once (also ASCII case-blind: the package is copied over FAT), `manifest.toml` reserved at
     /// the top, and no file or link used as a folder of another entry (so no install ever writes through a link).
     fn check_tree(&self) -> Result<(), String> {
+        // Format 2 trees are never copied over FAT, and Linux trees have case twins (terminfo's `A/` and `a/`).
+        let fold = |p: &str| if self.format == FORMAT_REPO { p.to_string() } else { p.to_ascii_lowercase() };
         let mut seen: HashSet<String> = HashSet::new();
         let mut leaves: HashSet<String> = HashSet::new();
         let leaf_paths = self.files.iter().map(|e| &e.path).chain(self.symlinks.iter().map(|s| &s.path));
         for p in leaf_paths.clone() {
-            leaves.insert(p.to_ascii_lowercase());
+            leaves.insert(fold(p));
         }
         for p in leaf_paths.chain(self.dirs.iter()) {
-            let low = p.to_ascii_lowercase();
-            if low == FILE_NAME {
+            let low = fold(p);
+            if low.eq_ignore_ascii_case(FILE_NAME) {
                 return Err(format!("{p}: {FILE_NAME} at the top is the manifest's own name"));
             }
             if !seen.insert(low.clone()) {
@@ -293,7 +396,7 @@ impl Manifest {
             self.files.iter().any(|e| e.path == p && e.exec) || self.symlinks.iter().any(|s| s.path == p)
         };
         if let Some(p) = &self.program {
-            check_rel_path(p)?;
+            if self.format == FORMAT_REPO { check_repo_path(p)? } else { check_rel_path(p)? };
             if !runnable(p) {
                 return Err(format!("program {p} is not an executable file or symlink of the package"));
             }
@@ -326,7 +429,7 @@ impl Manifest {
         let s = |v: &str| Value::Str(v.to_string());
         let mut root = Table::default();
         let put = |t: &mut Table, k: &str, v: Value| t.entries.push((k.to_string(), v));
-        put(&mut root, "format", Value::Int(FORMAT));
+        put(&mut root, "format", Value::Int(self.format));
         put(&mut root, "name", s(&self.name));
         put(&mut root, "version", s(&self.version));
         for (k, v) in [("de", &self.de), ("en", &self.en)] {
@@ -342,6 +445,32 @@ impl Manifest {
             let t = Table { line: 0, entries: entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect() };
             arrays.push((kind.to_string(), t));
         };
+        for o in &self.origins {
+            let mut v = vec![("repo", s(&o.repo)), ("name", s(&o.name)), ("version", s(&o.version)), ("filename", s(&o.filename)), ("sha256", s(&o.sha256))];
+            if !o.packager.is_empty() {
+                v.push(("packager", s(&o.packager)));
+            }
+            if !o.key.is_empty() {
+                v.push(("key", s(&o.key)));
+            }
+            add("origin", v);
+        }
+        for u in &self.uses {
+            add("uses", vec![("pkg", s(&u.pkg)), ("version", s(&u.version))]);
+        }
+        for l in &self.launch {
+            let mut v = vec![("desktop", s(&l.desktop)), ("name", s(&l.name)), ("exec", s(&l.exec))];
+            if !l.icon.is_empty() {
+                v.push(("icon", s(&l.icon)));
+            }
+            if !l.categories.is_empty() {
+                v.push(("categories", s(&l.categories)));
+            }
+            add("launch", v);
+        }
+        for t in &self.triggers {
+            add("trigger", vec![("hook", s(&t.hook)), ("tool", s(&t.tool)), ("output", s(&t.output)), ("sha256", s(&t.sha256))]);
+        }
         for e in &self.files {
             let mut v = vec![("path", s(&e.path)), ("sha256", s(&e.sha256)), ("size", Value::Int(e.size as i64))];
             if e.exec {

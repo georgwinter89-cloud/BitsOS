@@ -23,6 +23,7 @@ ktest!("cp.cpu.facts", Safe, facts);
 ktest!("cp.cpu.mca", Safe, mca);
 ktest!("cp.cpu.fpu_reset", Safe, fpu_reset);
 ktest!("cp.msr.read_checked", Safe, msr_read_checked);
+ktest!("cp.msr.try_read", Safe, msr_try_read);
 ktest!("cp.cpu.vendor_paths", Safe, vendor_paths);
 ktest!("cp.percpu.gs", Safe, percpu_gs);
 ktest!("cp.trap.gp_resume", Safe, gp_resume);
@@ -187,7 +188,7 @@ fn vendor_paths() -> R {
         kassert!(msr::read_checked(msr::AMD_PKG_ENERGY_STATUS).is_none(), "AMD RAPL allowed on Intel");
     }
     if f.amd {
-        for m in [msr::INTEL_RAPL_POWER_UNIT, msr::INTEL_PKG_ENERGY_STATUS, msr::IA32_PM_ENABLE, msr::IA32_HWP_CAPABILITIES] {
+        for m in [msr::INTEL_RAPL_POWER_UNIT, msr::INTEL_PKG_ENERGY_STATUS, msr::IA32_PM_ENABLE, msr::IA32_HWP_CAPABILITIES, msr::IA32_HWP_REQUEST, msr::IA32_SPEC_CTRL, msr::IA32_ARCH_CAPABILITIES] {
             kassert!(msr::read_checked(m).is_none(), "Intel-only MSR {m:#x} allowed on AMD");
         }
     }
@@ -201,14 +202,13 @@ fn vendor_paths() -> R {
         kassert!(hal::smp::max_perf() != 0, "hybrid CPU with HWP on but no performance number");
     }
     let deadline = v.has("tsc_deadline_timer");
-    let cfg = time::lapic::config();
-    if cfg == time::lapic::Config::Poll {
-        return ktest::fail("hrtimer=poll: no LAPIC timers to check");
+    if time::lapic::poll_test() {
+        return ktest::fail("ktest_timer=poll: no LAPIC timers to check");
     }
     for c in 0..hal::percpu::cpu_count() {
         let Some(kind) = time::lapic::cpu_stats(c).and_then(|s| s.kind) else { continue };
-        let want = if deadline && cfg != time::lapic::Config::OneShot { time::lapic::Kind::TscDeadline } else { time::lapic::Kind::OneShot };
-        kassert!(kind == want, "CPU {c}: timer {} with tsc_deadline_timer={deadline}, config {}", kind.name(), cfg.name());
+        let want = if deadline { time::lapic::Kind::TscDeadline } else { time::lapic::Kind::OneShot };
+        kassert!(kind == want, "CPU {c}: timer {} with tsc_deadline_timer={deadline}", kind.name());
     }
     Ok(())
 }
@@ -217,7 +217,15 @@ fn vendor_paths() -> R {
 fn msr_read_checked() -> R {
     use hal::msr;
     let f = cpu::detect();
+    let open = cpu::interrupts_enabled();
     kassert!(msr::read_checked(msr::IA32_EFER) == Some(msr::read(msr::IA32_EFER)));
+    kassert!(cpu::interrupts_enabled() == open, "read_checked left interrupts changed");
+    {
+        let _irq = cpu::IrqGuard::new();
+        kassert!(msr::read_checked(msr::IA32_EFER).is_some());
+        kassert!(!cpu::interrupts_enabled(), "read_checked opened interrupts inside a caller's guard");
+    }
+    kassert!(cpu::interrupts_enabled() == open);
     kassert!(msr::read_checked(0x10).is_none(), "TSC is not on the list");
     kassert!(msr::read_checked(0x480).is_none(), "VMX_BASIC is never a bank");
     kassert!(msr::read_checked(msr::IA32_TSC_AUX).is_some() == (f.rdtscp || f.rdpid));
@@ -237,6 +245,45 @@ fn msr_read_checked() -> R {
         let past = msr::mc_reg(caps.smca, caps.mca_banks, msr::MC_STATUS);
         kassert!(past.is_none_or(|m| msr::read_checked(m).is_none()), "bank past MCG_CAP.Count allowed");
     }
+    Ok(())
+}
+
+/// An MSR number no vendor uses (Intel: 0..0x1FFF and 0xC000_0000..; AMD adds 0xC001_xxxx; hypervisors 0x4000_0000..).
+const NO_SUCH_MSR: u32 = 0x8000_0000;
+
+/// GP-CPU: the fault-safe read and write. A register every CPU has reads as `read` does; one no CPU has gives `None`
+/// (or false) through the #GP path's fixup, with interrupts on or off, and nothing else about the trap path changes
+/// (the #GP hook slot stays as it was, the next ordinary read still works).
+fn msr_try_read() -> R {
+    use hal::msr;
+    let (site, landing) = msr::try_read_site();
+    kassert!(site != 0 && landing > site && landing - site < 64, "fault site {site:#x}, landing {landing:#x}");
+    let hook = idt::exception_hook(idt::GENERAL_PROTECTION).map(|h| h as usize);
+    let open = cpu::interrupts_enabled();
+    kassert!(msr::try_read(msr::IA32_EFER) == Some(msr::read(msr::IA32_EFER)), "an existing register reads differently");
+    let before = msr::try_read_faults();
+    kassert!(msr::try_read(NO_SUCH_MSR).is_none(), "MSR {NO_SUCH_MSR:#x} read without a fault");
+    kassert!(msr::try_read_faults() > before, "the fault was not counted");
+    kassert!(cpu::interrupts_enabled() == open, "try_read left interrupts changed");
+    {
+        let _irq = cpu::IrqGuard::new();
+        kassert!(msr::try_read(NO_SUCH_MSR).is_none());
+        kassert!(!cpu::interrupts_enabled(), "the fixup opened interrupts inside a caller's guard");
+    }
+    kassert!(cpu::interrupts_enabled() == open);
+    kassert!(idt::exception_hook(idt::GENERAL_PROTECTION).map(|h| h as usize) == hook, "the #GP hook slot changed");
+    kassert!(msr::try_read(msr::IA32_PAT) == Some(msr::read(msr::IA32_PAT)), "a read after a fault");
+    // The write twin: a register nobody has refuses, one every CPU has takes its own value back unchanged.
+    let (wsite, wlanding) = msr::try_write_site();
+    kassert!(wsite != 0 && wlanding > wsite && wlanding - wsite < 64 && wsite != site, "write site {wsite:#x}, landing {wlanding:#x}");
+    let pat = msr::read(msr::IA32_PAT);
+    let before = msr::try_read_faults();
+    kassert!(!msr::try_write(NO_SUCH_MSR, 0), "MSR {NO_SUCH_MSR:#x} written without a fault");
+    kassert!(msr::try_read_faults() > before, "the write fault was not counted");
+    kassert!(msr::try_write(msr::IA32_PAT, pat), "PAT refused its own value");
+    kassert!(msr::read(msr::IA32_PAT) == pat, "PAT changed: {:#x} -> {:#x}", pat, msr::read(msr::IA32_PAT));
+    kassert!(cpu::interrupts_enabled() == open, "try_write left interrupts changed");
+    kassert!(idt::exception_hook(idt::GENERAL_PROTECTION).map(|h| h as usize) == hook, "the #GP hook slot changed");
     Ok(())
 }
 

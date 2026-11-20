@@ -1,0 +1,34 @@
+[package]
+name = "atspid"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS Durchblick DB5a: the accessibility bus and the bridge from foreign programs' AT-SPI trees to the element list"
+publish = false
+
+# Own workspace like ctxd: its crates.io set (zbus, busd) stays out of user/Cargo.lock; built static musl by
+# host/xtask/src/image.rs.
+[workspace]
+
+[[bin]]
+name = "atspid"
+path = "src/main.rs"
+
+# The fake program for the tests (host and QEMU): a known tree on the accessibility bus.
+[[bin]]
+name = "atspid-fake"
+path = "src/bin/fake.rs"
+
+[dependencies]
+busd = { version = "=0.7.0", default-features = false }
+zbus = { version = "=6.3.0", default-features = false, features = ["default-rt", "proxy", "service"] }
+zruntime = { version = "=0.2.2", features = ["unblock", "lock", "helper", "unix"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["alloc", "io", "async-await-macro"] }
+rustix = { version = "=1.1.6", features = ["net", "thread", "process"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+# SO_PEERSEC (the kernel's record of the asking program) without unsafe code here, as ctxd and assist use it.
+usys = { path = "../../tools/usys" }
+
+[profile.release]
+opt-level = 3
+debug = false

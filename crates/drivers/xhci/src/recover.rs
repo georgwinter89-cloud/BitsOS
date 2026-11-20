@@ -1,8 +1,10 @@
 //! US-R: what the controller adds to the recovery of a wedged device. `look_ep` answers "did this endpoint really
 //! stand still?" with what the controller itself shows, after handing on whatever it already wrote to the event
 //! ring (`usb_core::Device::still_moving`). `reset_slot` is the slot's part of a device reset in place (Linux
-//! `xhci_discover_or_reset_device`, linux-6.6/drivers/usb/host/xhci.c:3643): after the port reset, Reset Device
-//! keeps the slot and its address-0 state; Address Device (`set_address`) and Configure Endpoint follow.
+//! `xhci_discover_or_reset_device`, linux-7.3.1/drivers/usb/host/xhci.c:3923): after the port reset, Reset
+//! Device keeps the slot and its address-0 state; Address Device (`set_address`) and Configure Endpoint follow.
+//! Not followed: Linux's Etron EJ168/EJ188 path (:3975, a new slot in place of Reset Device), because the slot
+//! ID is the handle `usb_core` keeps and the Etron chips are in neither machine.
 
 use crate::bulk::dci_of;
 use crate::hc::{Controller, Env, Source};

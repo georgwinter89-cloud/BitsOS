@@ -266,25 +266,20 @@ fn settingsd_defaults_match_the_built_in_ones() {
         "theme.layout.claude_sidebar",
         "theme.layout.statusbar",
         "desktop.favourites",
-        "claude.name",
+        "ai.assistant.name",
     ] {
         assert!(src.contains(k), "settingsd lacks {k}");
     }
 }
 
 #[test]
-fn the_gpu_level_is_chosen_here_and_drawn_by_the_renderers_word_and_scanlines_switch() {
-    use crate::theme::Effects;
+fn the_scanlines_switch_changes_nothing_else() {
     let mut v = Values::default();
     let t = Theme::build(&v);
-    assert_eq!((t.effects, t.effects_gpu, t.scanlines), (Effects::Cheap, false, true));
-    v.set("theme.effects", "gpu");
+    assert!(t.scanlines);
     v.set("theme.scanlines", "false");
     let g = Theme::build(&v);
-    assert_eq!((g.effects, g.effects.word()), (Effects::Gpu, "gpu"));
-    assert!(!g.effects_gpu, "a setting alone draws nothing: `App::fx_follow` asks the renderer");
     assert!(!g.scanlines);
-    // Everything drawn is the same: only the chosen level and the scanline switch differ.
-    let same = Theme { effects: Effects::Cheap, scanlines: true, ..g };
+    let same = Theme { scanlines: true, ..g };
     assert_eq!(same, t);
 }

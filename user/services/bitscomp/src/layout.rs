@@ -426,6 +426,9 @@ mod moves;
 mod mins;
 pub use mins::Minimized;
 
+#[path = "layout_merge.rs"]
+mod merge;
+
 #[cfg(test)]
 #[path = "layout_tests.rs"]
 mod tests;

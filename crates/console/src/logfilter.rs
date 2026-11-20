@@ -66,7 +66,6 @@ pub const IMPORTANT: &[(&str, &str)] = &[
     ("mcp", "server.start"),
     ("mcp", "reboot.requested"),
     ("watchdog", "armed"),
-    ("watchdog", "off"),
     ("watchdog", "absent"),
     ("watchdog", "resumed"),
     ("ul", "init."),
@@ -75,6 +74,24 @@ pub const IMPORTANT: &[(&str, &str)] = &[
     ("power", "off.requested"),
     ("input", "device.registered"),
     ("input", "device.removed"),
+];
+
+/// GP-ROUND (`plan/spec/gaming-pc.md` section 8, raised lines): under the profile gaming-pc the quiet console also shows
+/// these Info events, so a photo of the screen holds them even when the report page never comes: the DMA verdict,
+/// the clock's decision, HWP per CPU, the CPUs that came up, and the network card's stages. Nothing else is raised,
+/// and no other machine ever sees them on its screen.
+pub const PROFILE_IMPORTANT: &[(&str, &str)] = &[
+    ("acpi", "dma."),
+    ("time", "hpet.untrusted"),
+    ("time", "clock.cross_check"),
+    ("cpu", "hwp.on"),
+    ("cpu", "hwp.failed"),
+    ("smp", "done"),
+    ("smp", "shape"),
+    ("net", "rtl8126.stage"),
+    // The report page's own thread: a page that never comes leaves the line naming the getter it waited for.
+    ("kernel", "gp.report"),
+    ("kernel", "gp.report.reading"),
 ];
 
 /// Whether (subsystem, name) is on the important list.
@@ -98,14 +115,24 @@ pub fn head(line: &str) -> Option<(char, &str, &str)> {
     Some((l, subsystem, name))
 }
 
+/// Whether (subsystem, name) is on the profile's own list (`PROFILE_IMPORTANT`).
+pub fn profile_important(subsystem: &str, name: &str) -> bool {
+    PROFILE_IMPORTANT.iter().any(|&(s, n)| s == subsystem && if n.ends_with('.') { name.starts_with(n) } else { name == n })
+}
+
 /// Whether the console at `level` shows a line of klog level `l`.
 pub fn shows(level: u8, l: Level, line: &str) -> bool {
+    shows_with(level, l, line, false)
+}
+
+/// `shows`; `profile`: the Gaming-PC's profile is on, so `PROFILE_IMPORTANT` counts as important too.
+pub fn shows_with(level: u8, l: Level, line: &str, profile: bool) -> bool {
     match level {
         OFF => false,
         ERROR => l == Level::Error,
         WARN => match l {
             Level::Error | Level::Warn => true,
-            Level::Info => head(line).is_some_and(|(_, s, n)| important(s, n)),
+            Level::Info => head(line).is_some_and(|(_, s, n)| important(s, n) || (profile && profile_important(s, n))),
             _ => false,
         },
         INFO => l <= Level::Info,

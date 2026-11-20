@@ -241,6 +241,25 @@ fn a_csw_in_the_data_phase_is_taken_as_the_status() {
 }
 
 #[test]
+fn a_skipped_data_phase_leaves_no_csw_bytes_in_the_buffer() {
+    // linux-7.3.1/drivers/usb/storage/transport.c:1205-1219: the 13 CSW bytes that came in the data phase are
+    // zeroed, so no reader of the buffer sees them as data.
+    let dev = SimDev::new(vec![Lun::new(512, 4096)]);
+    dev.with(|s| s.luns[0].pending.clear());
+    let link = SimLink(dev.clone());
+    let buf = link.alloc(4096).unwrap();
+    assert!(buf.write(0, &[0xEE; 4096]));
+    let mut bot = Bot::new(link);
+    dev.fault(Fault::CswInData);
+    let r = bot.command(Op::read(0, scsi::rw(false, 0, 8, false, false), Request::new(buf.clone(), 0, 4096)));
+    assert!(matches!(r, Ok(o) if o.passed && o.moved == 0 && o.residue == 4096), "{r:?}");
+    let mut b = [0xAAu8; 16];
+    assert!(buf.read(0, &mut b));
+    assert_eq!(b[..13], [0; 13], "the CSW bytes are gone");
+    assert_eq!(b[13..], [0xEE; 3], "the rest is untouched");
+}
+
+#[test]
 fn phase_errors_wrong_tags_and_timeouts_get_reset_recovery() {
     for f in [Fault::PhaseError, Fault::WrongTag, Fault::Timeout(Stage::Csw), Fault::Timeout(Stage::Data), Fault::Timeout(Stage::Cbw), Fault::StallCbw] {
         let (dev, d) = setup(Lun::new(512, 4096));

@@ -16,10 +16,8 @@ fn probe(last: &str) -> (String, Option<i32>) {
 fn the_filter_refuses_and_kills_on_linux() {
     for last in ["exec", "fork"] {
         let (out, sig) = probe(last);
-        if out.contains("filter: seccomp") || out.contains("filter: prctl") {
-            eprintln!("skip: no seccomp on this host: {out}");
-            return;
-        }
+        let refused = out.contains("filter: seccomp") || out.contains("filter: prctl");
+        assert!(!refused, "{last}: the host kernel refused the seccomp filter (a Linux with seccomp is needed):\n{out}");
         for want in ["filter: on", "open: errno 1", "socket: errno 1", "thread: ok"] {
             assert!(out.lines().any(|l| l == want), "{last}: no '{want}' in:\n{out}");
         }

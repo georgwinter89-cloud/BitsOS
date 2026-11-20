@@ -4,14 +4,16 @@
 //! - **Start** (`wdt.start` thread from a Service initcall): waits (bounded) for the PCI scan, looks for the FCH
 //!   SMBus function 00:14.0 = 1022:790B revision >= 0x51 (`V1:hw/watchdog.asm:135-154`), maps the ACPI MMIO
 //!   window uncached, enables decode and seconds, reads and clears FIRED (`watchdog.fired`), then arms with
-//!   the timeout or stops it (`watchdog=off`; a Reload's earlier kernel may have left it running).
+//!   the timeout (a Reload's earlier kernel may have left it running).
 //! - **Kicker**: a `time::HrTimer` once a second (timer context: no heap, no lock, no log) runs `Dog::check` and
 //!   kicks only when every online CPU is alive (`live`). Not starvable by threads: while CP-5 is missing the
 //!   timers are polled by the poll-duty CPU; with CP-5 they fire from the LAPIC timer interrupt.
 //! - **Reporter** (`wdt.report`, KernelRt, waits at most 5 s): logs every change between alive and stalled; for
 //!   a stalled CPU an NMI sample of the other CPUs (RB-2, `hal::nmi::sample_others`) gives its registers and
-//!   backtrace before the reset comes (the kick was withheld; the chip resets `timeout` s after the last kick).
-//! - **Quiesce** (`fch-wdt`): Reload stops it (CONFIG `watchdog_reload=grace` keeps it with the grace count);
+//!   backtrace before the reset comes (the kick was withheld; the chip resets `timeout` s after the last kick);
+//!   CRASHDISK: a stall still there 3 s before that reset becomes a panic, so its record is written like any
+//!   panic's (RAM and the boot ESP).
+//! - **Quiesce** (`fch-wdt`): Reload stops it (held until the jump, RB-17);
 //!   anything else (reboot) keeps it armed with the grace count and stops the kicks (a safety net). A Reload
 //!   whose jump fails arms it again without kicks (the machine has no network then; the reset brings it back).
 
@@ -47,8 +49,6 @@ pub enum State {
     Starting = 1,
     /// No FCH watchdog on this machine (QEMU, another chipset).
     Absent = 2,
-    /// CONFIG watchdog=off (or the hypervisor default): found, FIRED read, stopped.
-    Off = 3,
     /// Found but not usable (decode refused, disabled by the firmware, the window could not be mapped).
     Unusable = 4,
     Armed = 5,
@@ -63,7 +63,6 @@ impl State {
         match v {
             1 => State::Starting,
             2 => State::Absent,
-            3 => State::Off,
             4 => State::Unusable,
             5 => State::Armed,
             6 => State::Stopped,
@@ -76,7 +75,6 @@ impl State {
             State::NotStarted => "not started",
             State::Starting => "starting",
             State::Absent => "absent",
-            State::Off => "off",
             State::Unusable => "unusable",
             State::Armed => "armed",
             State::Stopped => "stopped",
@@ -236,14 +234,7 @@ impl CpuSource for SchedCpus {
 
 fn read_config() -> (Config, Option<&'static str>) {
     let c = |k: &str| kexec::boot::config(k);
-    config::parse(
-        c("watchdog").as_deref(),
-        c("watchdog_timeout").as_deref(),
-        c("watchdog_alive").as_deref(),
-        c("watchdog_grace").as_deref(),
-        c("watchdog_reload").as_deref(),
-        hal::cpu::detect().hypervisor,
-    )
+    config::parse(c("watchdog_timeout").as_deref(), c("watchdog_alive").as_deref(), c("watchdog_grace").as_deref())
 }
 
 kreg::initcall!(kreg::Level::Service, "fch-wdt.start", start_thread);
@@ -297,7 +288,7 @@ fn start() {
     let f = match find_fch() {
         Ok(f) => f,
         Err(why) => {
-            klog::event!(Info, "watchdog", "absent", reason = why.as_str(), wanted = cfg.on; "no FCH watchdog: nothing resets a hung machine");
+            klog::event!(Info, "watchdog", "absent", reason = why.as_str(); "no FCH watchdog: nothing resets a hung machine");
             FOUND.get_or_init(|| why);
             start_verdict(State::Absent);
             return;
@@ -360,13 +351,6 @@ fn boot_with(r: Box<dyn Regs>, cfg: Config) {
         klog::event!(Warn, "watchdog", "mmio_en.off", pm4 = klog::Hex(pm4 as u64);
             "PM 0x04 bit 1 (ACPI MMIO decode) reads clear: Linux would not use 0xFED80B00; V1 did and it worked, so armed anyway");
     }
-    if !cfg.on {
-        regs::stop(&*r);
-        klog::event!(Info, "watchdog", "off", from_config = cfg.on_from_config, was_running = st.was_running;
-            "watchdog off (CONFIG watchdog=off, or the default under a hypervisor)");
-        set_state(State::Off);
-        return;
-    }
     let window = cfg.alive_s as u64 * SEC;
     let dog: &'static Dog = Box::leak(Box::new(Dog::new(r, Box::new(SchedCpus::new(window)), time::now_ns, Policy::new(window), cfg.timeout_s)));
     if !SYSTEM.set(dog) {
@@ -409,7 +393,7 @@ fn go(dog: &'static Dog, cfg: &Config) {
     let t = TIMER.get_or_init(|| time::HrTimer::new(tick, 0));
     t.arm_in(PERIOD_NS);
     klog::event!(Info, "watchdog", "armed", timeout_s = cfg.timeout_s, alive_s = cfg.alive_s, grace_s = cfg.grace_s, cpus = dog.cpus(),
-        reload = if cfg.reload_grace { "grace" } else { "stop" }, fake = on_fake();
+        fake = on_fake();
         "kicked once a second while every CPU is alive");
 }
 
@@ -467,6 +451,53 @@ pub fn report(d: &Dog) {
     }
     backtraces(&cpus, "stall");
     klog::drain_deferred(usize::MAX);
+    end_hang(d, &cpus);
+}
+
+/// CRASHDISK: how long before the chip's reset a stall that is still there becomes a panic.
+const HANG_LEAD_NS: u64 = 3 * SEC;
+
+/// CRASHDISK: a stall the chip's reset is about to end becomes a panic (`kexec::crash::hang_panic`), so the
+/// report (every CPU by NMI, the log) is written like a panic's, to RAM and to the boot ESP; a CPU that recovers
+/// first ends the wait. Only with the chip armed (no reset would come otherwise). The reporter waits here.
+/// On the fake chip (QEMU ktests) no reset ever comes: only `rb.crashdisk.hang` asks for the panic there.
+pub static FAKE_HANG_PANIC: AtomicBool = AtomicBool::new(false);
+
+fn end_hang(d: &Dog, cpus: &[usize]) {
+    if !d.armed() || (on_fake() && !FAKE_HANG_PANIC.load(Ordering::Acquire)) {
+        return;
+    }
+    loop {
+        let still: Vec<usize> = cpus.iter().copied().filter(|&c| d.view(c).is_some_and(|v| !v.live.alive())).collect();
+        if still.is_empty() {
+            return;
+        }
+        let since = d.now().saturating_sub(d.last_kick_ns());
+        let left = (d.timeout_s() as u64 * SEC).saturating_sub(since);
+        if left <= HANG_LEAD_NS {
+            let quiet = still.iter().filter_map(|&c| d.view(c)).map(|v| v.age_ns).max().unwrap_or(0);
+            let w = hang_grace();
+            klog::event!(Error, "watchdog", "hang.panic", grace = format!("{w:?}"); "the stall becomes a panic; the chip waits for its record");
+            kexec::crash::hang_panic(&format!(
+                "CPU {still:?} stalled (no heartbeat for {} s, no answer to probes); the watchdog would reset the machine in {} s",
+                quiet / SEC,
+                left / SEC
+            ));
+        }
+        sched::sleep_ns(100 * MS);
+    }
+}
+
+/// CRASHDISK fixer: the chip's count, 3 s from its reset here, would not wait for the panic's report (the NMI
+/// stop, the console, then the disk write); the panic path's own grace (step 1) comes too late for that. So the
+/// chip counts from the panic's delay plus the margin now, as for any panic; a halting panic (`panic=halt`) gets
+/// the margin alone, so the reset still comes.
+pub(crate) fn hang_grace() -> kexec::crash::Watchdog {
+    let delay = match kexec::crash::action() {
+        kexec::crash::Action::Reboot { secs } => secs,
+        kexec::crash::Action::Halt { .. } => 0,
+    };
+    panic_grace(kexec::crash::watchdog_secs(delay))
 }
 
 /// NMI-samples the other CPUs (RB-2) and logs registers and backtrace of `cpus` (all when empty).
@@ -561,16 +592,13 @@ impl devmodel::Quiesce for WdtQuiesce {
 /// RB-17: set by a Reload's quiesce that holds the chip for the stop at the jump ([`stop_at_jump`]).
 static STOP_AT_JUMP: AtomicBool = AtomicBool::new(false);
 
-/// RB-17: a Reload's quiesce. With `watchdog_reload=grace` as [`quiesce_now`]. Otherwise the chip is held
+/// RB-17: a Reload's quiesce. The chip is held
 /// (no kicks, still counting) instead of stopped: a stopped chip keeps the count it stopped with, so the crumbs
 /// after this one (`reload_sweep`, `reload_jump`) would not reach the next start (on the Mini-PC it read this
 /// Quiesce's own crumb, `device fch-wdt`, after every Reload). kexec's before-jump hook stops it right after the
 /// `reload_jump` crumb. Until then a hang between here and the jump is reset by the crumbs' own counts (minutes);
 /// before RB-17 it stayed hung. Returns the state it left. No lock, no log.
 pub fn quiesce_for_jump() -> State {
-    if CONFIG.get().is_some_and(|c| c.reload_grace) {
-        return quiesce_now(true);
-    }
     QUIESCED.store(true, Ordering::Release);
     let Some(d) = SYSTEM.get() else { return state() };
     if !d.armed() && state() != State::Armed {
@@ -604,7 +632,7 @@ pub fn quiesce_now(reload: bool) -> State {
     QUIESCED.store(true, Ordering::Release);
     let Some(d) = SYSTEM.get() else { return state() };
     let grace = CONFIG.get().map_or(config::DEFAULT_GRACE_S, |c| c.grace_s);
-    let keep = !reload || CONFIG.get().is_some_and(|c| c.reload_grace);
+    let keep = !reload;
     if !d.armed() && state() != State::Armed {
         return state();
     }
@@ -679,8 +707,7 @@ pub fn start_fake(fake: Box<dyn Regs>) -> bool {
         return resume().is_ok();
     }
     FAKE.store(true, Ordering::Release);
-    let (mut cfg, _) = read_config();
-    cfg.on = true;
+    let (cfg, _) = read_config();
     CONFIG.get_or_init(|| cfg);
     boot_with(fake, cfg);
     SYSTEM.get().is_some()

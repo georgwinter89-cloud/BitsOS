@@ -1,7 +1,7 @@
 //! IRQ storm sampler (RB-7a): every `PERIOD_NS` klogd reads each CPU's per-vector interrupt counts (hal counts
 //! them anyway, so the interrupt path pays nothing more) and, where a CPU takes more than
 //! `trace::Limits::irq_per_s`, writes a trace entry into that CPU's ring. The log gets one line when a storm
-//! starts and one when it ends, never one per sample.
+//! starts and one when it ends, never one per sample. The start line names the vector's owner (`irqsource`).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -21,10 +21,13 @@ struct Cpu {
 pub struct Sampler {
     cpus: Vec<Cpu>,
     last_ns: u64,
+    /// Shootdown IPIs per cause at the last look (GP-R3: a storm on the shootdown vector names its cause).
+    tlb_ipis: [u64; hal::paging::tlb::CAUSES],
 }
 
-/// The vector with the most new interrupts and the total of new interrupts between two snapshots.
-pub fn busiest(before: &[u64; 256], now: &[u64; 256]) -> (u8, u64) {
+/// The vector with the most new interrupts, its own new interrupts, and the total of new interrupts (every vector)
+/// between two snapshots.
+pub fn busiest(before: &[u64; 256], now: &[u64; 256]) -> (u8, u64, u64) {
     let mut top = (0u8, 0u64);
     let mut total = 0u64;
     for v in FIRST_VECTOR..256 {
@@ -34,7 +37,7 @@ pub fn busiest(before: &[u64; 256], now: &[u64; 256]) -> (u8, u64) {
             top = (v as u8, d);
         }
     }
-    (top.0, total)
+    (top.0, top.1, total)
 }
 
 pub fn per_s(delta: u64, dt_ns: u64) -> u64 {
@@ -44,8 +47,9 @@ pub fn per_s(delta: u64, dt_ns: u64) -> u64 {
 /// What one look found on one CPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// A storm began: trace entry and one Warn line.
-    Start { vector: u8, per_s: u64 },
+    /// A storm began: trace entry and one Warn line. `per_s` is the CPU's rate over every vector (what the limit
+    /// judges), `vector_per_s` the busiest vector's own share.
+    Start { vector: u8, per_s: u64, vector_per_s: u64 },
     /// The storm goes on: trace entry only.
     Goes { vector: u8, per_s: u64 },
     /// The storm ended: one Info line.
@@ -57,14 +61,18 @@ impl Sampler {
     pub fn step(&mut self, now: u64) {
         let limit = klog::trace::limits().irq_per_s;
         let read = |c: usize, v: u8| count(Vector { cpu: c as u32, vector: v });
+        let looks = now.saturating_sub(self.last_ns) >= PERIOD_NS;
+        let (before, ipis) = (self.tlb_ipis, if looks { crate::irqsource::tlb_ipis() } else { self.tlb_ipis });
         self.step_with(now, hal::percpu::cpu_count(), limit, read, |c, ch| match ch {
-            Change::Start { vector, per_s } => {
+            Change::Start { vector, per_s, vector_per_s } => {
                 klog::trace::irq_storm(c, vector, per_s);
-                klog::event!(Warn, "irq", "storm.start", cpu = c, vector = vector, per_s = per_s, limit = limit);
+                let (source, cause) = crate::irqsource::describe(c as u32, vector, Some((&before, &ipis)));
+                klog::event!(Warn, "irq", "storm.start", cpu = c, vector = vector, per_s = per_s, vector_per_s = vector_per_s, limit = limit, source = source.as_str(), cause = cause.as_str());
             }
             Change::Goes { vector, per_s } => klog::trace::irq_storm(c, vector, per_s),
             Change::End { ms, max_per_s } => klog::event!(Info, "irq", "storm.end", cpu = c, ms = ms, max_per_s = max_per_s),
         });
+        self.tlb_ipis = ipis;
     }
 
     /// `step` over any count source (`read(cpu, vector)`), handing each change to `on` (host tests).
@@ -85,7 +93,7 @@ impl Sampler {
                 *n = read(c, v as u8);
             }
             let st = &mut self.cpus[c];
-            let (vector, delta) = busiest(&st.counts, &fresh);
+            let (vector, own, delta) = busiest(&st.counts, &fresh);
             *st.counts = fresh;
             if first || new {
                 continue;
@@ -94,7 +102,7 @@ impl Sampler {
             match (&mut st.storm, rate >= limit) {
                 (None, true) => {
                     st.storm = Some((now, rate));
-                    on(c, Change::Start { vector, per_s: rate });
+                    on(c, Change::Start { vector, per_s: rate, vector_per_s: per_s(own, dt) });
                 }
                 (Some((_, max)), true) => {
                     *max = (*max).max(rate);
@@ -122,7 +130,7 @@ mod tests {
         b[0x41] = 5100;
         b[0x30] = 10;
         b[0x05] = 1_000_000; // exceptions do not count
-        assert_eq!(busiest(&a, &b), (0x41, 5010));
+        assert_eq!(busiest(&a, &b), (0x41, 5000, 5010));
         assert_eq!(per_s(5000, 100_000_000), 50_000);
         assert_eq!(per_s(1, 0), 1_000_000_000);
     }
@@ -158,11 +166,30 @@ mod tests {
         assert_eq!(
             got,
             [
-                (1, Change::Start { vector: 0x41, per_s: 100_000 }),
+                (1, Change::Start { vector: 0x41, per_s: 100_000, vector_per_s: 100_000 }),
                 (1, Change::Goes { vector: 0x41, per_s: 200_000 }),
                 (1, Change::Goes { vector: 0x41, per_s: 60_000 }),
                 (1, Change::End { ms: 300, max_per_s: 200_000 }),
             ]
         );
+    }
+
+    /// GP-R3 (the Mini-PC's storm at 56 087/s): the rate the limit judges is the CPU's total; the busiest vector's
+    /// own share is a field of its own, so the line never makes one vector of the whole.
+    #[test]
+    fn the_start_says_the_total_and_the_busiest_vectors_own_rate() {
+        let mut s = Sampler::default();
+        let mut got = Vec::new();
+        let p = PERIOD_NS;
+        // CPU 0 per 100 ms look: 2 000 on the shootdown vector, 1 500 resched, 1 000 timer: 45 000/s together.
+        let at = |n: u64| move |_c: usize, v: u8| match v {
+            0xF2 => 2_000 * n,
+            0xF3 => 1_500 * n,
+            0xF0 => 1_000 * n,
+            _ => 0,
+        };
+        s.step_with(p, 1, 40_000, at(1), |c, ch| got.push((c, ch)));
+        s.step_with(2 * p, 1, 40_000, at(2), |c, ch| got.push((c, ch)));
+        assert_eq!(got, [(0, Change::Start { vector: 0xF2, per_s: 45_000, vector_per_s: 20_000 })]);
     }
 }

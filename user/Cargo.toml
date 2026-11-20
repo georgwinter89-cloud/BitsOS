@@ -2,7 +2,7 @@
 # Owner of the folder layout: desk; programs: UL (and the lanes named in V2-LANES.md §2).
 [workspace]
 resolver = "3"
-members = ["smoke/hello-rs", "init", "tools/usys", "tools/stress", "tools/fetch", "tools/procs", "tools/evtest", "tools/fbtest", "tools/memstress", "tools/blkbench", "abi-tests", "lib/mcpreg", "lib/bitsact", "ports/brave/actions", "services/settingsd", "tools/bitspkg", "tools/bitssnap", "tools/bitsdisk", "services/bitsjournal", "services/bitsmcp", "services/bitsinstall", "ports/steam/reaper"]
+members = ["smoke/hello-rs", "init", "tools/usys", "tools/stress", "tools/fetch", "tools/procs", "tools/bitsprof", "tools/evtest", "tools/fbtest", "tools/memstress", "tools/blkbench", "abi-tests", "lib/mcpreg", "lib/bitsupdate", "lib/bitsact", "ports/brave/actions", "services/settingsd", "services/assist", "tools/bitspkg", "tools/bitsrun", "tools/bitssnap", "tools/bitsdisk", "tools/gpu-messung", "services/bitsjournal", "services/bitsmusik", "services/bitsbench", "services/bitsmcp", "services/bitsinstall", "services/bitspkgd", "ports/steam/reaper", "lib/steamlib", "lib/uilist", "services/bitsaccess", "lib/bitstree", "tools/bits"]
 
 [profile.release]
 opt-level = 2

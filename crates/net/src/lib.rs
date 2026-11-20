@@ -29,6 +29,7 @@ mod ring;
 pub mod route;
 pub mod sock;
 pub mod stack;
+pub mod wireless;
 #[cfg(not(target_os = "none"))]
 pub mod host;
 

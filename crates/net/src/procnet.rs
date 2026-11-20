@@ -1,5 +1,5 @@
 //! `/proc/net` (NW-12): the network files of the reading program's network namespace, as Linux's per-task
-//! `/proc/net` shows them (linux-6.6/fs/proc/proc_net.c:267 `get_proc_task_net`: the namespace of the task that
+//! `/proc/net` shows them (linux-7.3.1/fs/proc/proc_net.c:269 `get_proc_task_net`: the namespace of the task that
 //! looks the name up, not of whoever mounted /proc). `dev`, `if_inet6`, `route`, `tcp`, `udp` and `unix` in
 //! Linux's column layout; V2's own `dhcp` only in the initial namespace (a namespace has no DHCP client: the
 //! name does not exist there, ENOENT).
@@ -33,9 +33,11 @@ pub enum Kind {
     Unix,
     Dhcp,
     IfInet6,
+    /// SYS-K: `wireless` (`wireless.rs`).
+    Wireless,
 }
 
-const FILES: &[(&str, Kind)] = &[("dev", Kind::Dev), ("dhcp", Kind::Dhcp), ("if_inet6", Kind::IfInet6), ("route", Kind::Route), ("tcp", Kind::Tcp), ("udp", Kind::Udp), ("unix", Kind::Unix)];
+const FILES: &[(&str, Kind)] = &[("dev", Kind::Dev), ("dhcp", Kind::Dhcp), ("if_inet6", Kind::IfInet6), ("route", Kind::Route), ("tcp", Kind::Tcp), ("udp", Kind::Udp), ("unix", Kind::Unix), ("wireless", Kind::Wireless)];
 
 /// Who reads: the namespace whose files these are and the reader's ids (uids are shown as it names them).
 #[derive(Clone)]
@@ -75,10 +77,11 @@ pub fn render(kind: Kind, r: &Reader) -> String {
         Kind::Unix => unix(r),
         Kind::Dhcp => crate::dhcpview::text(),
         Kind::IfInet6 => if_inet6(&ifview::links_in(&r.net)),
+        Kind::Wireless => crate::wireless::text(&ifview::links_in(&r.net), |n| crate::netdev::by_name(n).and_then(|d| d.wireless())),
     }
 }
 
-/// `if6_seq_show` (linux-6.6/net/ipv6/addrconf.c): address, ifindex, prefix, the IPv6 scope class
+/// `if6_seq_show` (linux-7.3.1/net/ipv6/addrconf.c:4519): address, ifindex, prefix, the IPv6 scope class
 /// (`ipv6_addr_scope`: host 0x10, link 0x20, global 0) and the low byte of the address flags, the name right
 /// aligned to 8. V2's only IPv6 address is ::1 on a namespace's lo while it is UP.
 pub fn if_inet6(links: &[Link]) -> String {
@@ -99,7 +102,7 @@ pub fn if_inet6(links: &[Link]) -> String {
     s
 }
 
-/// `dev_seq_show` / `dev_seq_printf_stats` (linux-6.6/net/core/net-procfs.c:77, :105).
+/// `dev_seq_show` / `dev_seq_printf_stats` (linux-7.3.1/net/core/net-procfs.c:72, :44).
 pub fn dev(links: &[Link]) -> String {
     let mut s = String::from(concat!(
         "Inter-|   Receive                                                |  Transmit\n",
@@ -134,7 +137,7 @@ const RTF_UP: u32 = 0x1;
 const RTF_GATEWAY: u32 = 0x2;
 const RTF_HOST: u32 = 0x4;
 
-/// `fib_route_seq_show` (linux-6.6/net/ipv4/fib_trie.c:2967): the main table only, 127 characters a line.
+/// `fib_route_seq_show` (linux-7.3.1/net/ipv4/fib_trie.c:2936): the main table only, 127 characters a line.
 pub fn route(routes: Vec<ifview::Route4>) -> String {
     let mut s = String::new();
     padded(&mut s, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT", 127);
@@ -147,8 +150,8 @@ pub fn route(routes: Vec<ifview::Route4>) -> String {
     s
 }
 
-/// `tcp4_seq_show` (149 characters a line) and `udp4_seq_show` (127), linux-6.6/net/ipv4/tcp_ipv4.c:2737,
-/// net/ipv4/udp.c:3057. The slot number of a TCP line counts the lines; a UDP line shows the hash bucket, here
+/// `tcp4_seq_show` (149 characters a line) and `udp4_seq_show` (127), linux-7.3.1/net/ipv4/tcp_ipv4.c:2855,
+/// net/ipv4/udp.c:3340. The slot number of a TCP line counts the lines; a UDP line shows the hash bucket, here
 /// the port (Linux's table size depends on the memory).
 fn inet(tcp: bool, r: &Reader) -> String {
     let mut s = String::new();
@@ -210,7 +213,7 @@ fn inet(tcp: bool, r: &Reader) -> String {
     s
 }
 
-/// `unix_seq_show` (linux-6.6/net/unix/af_unix.c:3261): every AF_UNIX socket of the namespace; an abstract
+/// `unix_seq_show` (linux-7.3.1/net/unix/af_unix.c:3558): every AF_UNIX socket of the namespace; an abstract
 /// name starts with '@' and its NUL bytes show as '@'.
 fn unix(r: &Reader) -> String {
     let mut s = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");

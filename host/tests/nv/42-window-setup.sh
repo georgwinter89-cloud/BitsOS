@@ -37,6 +37,11 @@ check setup || { grep -a "nvme \|ext4 data\|window" "$LOG" | tail -40; fail "set
 wait "$QPID" || true
 QPID=""
 rm -f "$QMP"
+# data.img as the setup boot left it, read on the host while no QEMU runs: since GP-START it is root's alone (0600),
+# so MCP's run (uid 1000) cannot hash it; it must stay byte for byte the same while it is /stickdata.
+mcopy -n -i "target/xtask/$NAME.img" ::BITSOS2/data.img "$RUN_DIR/data.img" || fail "the stick has no data.img after the setup"
+sum "$RUN_DIR/data.img" > "$RUN_DIR/data-img.sum"
+rm -f "$RUN_DIR/data.img"
 LOG="$RUN_DIR/moved.log"
 NV_TIMEOUT=1200 start "$BIG" "$LOG" -machine i8042=off -device qemu-xhci,id=xb -device usb-kbd,bus=xb.0,port=1,id=kbd1 -qmp "unix:$QMP,server=on,wait=off"
 check moved || { grep -a "nvme \|ext4 data\|window" "$LOG" | tail -40; fail "moved"; }

@@ -1,6 +1,6 @@
 /* SX-3b fixer: does a pid namespace's init whose parent is outside the namespace die by its PR_SET_PDEATHSIG
- * when that parent ends? bubblewrap's "--die-with-parent --unshare-pid" check needs it (linux-6.6/kernel/
- * signal.c:1233: the signal from a sender invisible in the init's namespace is forced). Without it the suite
+ * when that parent ends? bubblewrap's "--die-with-parent --unshare-pid" check needs it (linux-7.3.1/kernel/
+ * signal.c:1213: the signal from a sender invisible in the init's namespace is forced). Without it the suite
  * would hang in its lock wait, so patches/test-run-lockf.patch skips that one check when this answers no.
  * Exit 0 = yes, 1 = no (the init is killed here then), 2 = the probe itself could not run. 5 s bound. */
 #define _GNU_SOURCE

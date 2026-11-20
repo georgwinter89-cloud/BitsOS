@@ -21,6 +21,8 @@ pub mod rings;
 mod rungs;
 mod run;
 pub mod vm;
+pub mod vcn;
+pub mod vcnframe;
 
 use crate::dpm::{Dpm, DpmCfg, Wire};
 use crate::hw::bo::{GttPool, SysBo, VramBo};
@@ -109,6 +111,8 @@ pub struct HardwareGpu {
     jobs: SpinLock<Option<Arc<Jobs>>>,
     /// GX-9b: the kept chain as the job half sees it; clocks and GFXOFF from `start_dpm` on.
     dpm: SpinLock<Option<Arc<Dpm>>>,
+    /// GX-8v: VCN's ring, once the VCN stage left it running.
+    vcn: SpinLock<Option<Arc<vcn::VcnJobs>>>,
 }
 
 impl HardwareGpu {
@@ -131,6 +135,7 @@ impl HardwareGpu {
             sys_note: i.sys_note,
             jobs: SpinLock::named("amdgpu.hw.jobs_slot", None),
             dpm: SpinLock::named("amdgpu.hw.dpm_slot", None),
+            vcn: SpinLock::named("amdgpu.hw.vcn_slot", None),
         }))
     }
 
@@ -189,6 +194,23 @@ impl HardwareGpu {
         self.dpm.lock().clone()
     }
 
+    /// GX-8v: VCN's job half on the ring the VCN stage left; programs may submit from here on.
+    pub(crate) fn start_vcn(&self, chain: Arc<dyn Chain>, up: vcn::VcnUp) -> Result<(), String> {
+        let mut slot = self.vcn.lock();
+        if slot.is_some() {
+            return Err(String::from("the VCN half runs already"));
+        }
+        drop(slot);
+        let j = vcn::VcnJobs::new(chain, up)?;
+        slot = self.vcn.lock();
+        *slot = Some(j);
+        Ok(())
+    }
+
+    pub fn vcn(&self) -> Option<Arc<vcn::VcnJobs>> {
+        self.vcn.lock().clone()
+    }
+
     /// Tests: a register the profile lets INFO read, and that read.
     pub(crate) fn chip_profile_register(&self) -> Option<Register> {
         self.profile.registers.iter().find(|r| !r.indexed && r.offset != drm::profile_780m::GB_ADDR_CONFIG).copied()
@@ -206,6 +228,11 @@ impl HardwareGpu {
         // GFXOFF ends before anything stops: the stop's registers are GC's.
         if let Some(d) = self.dpm() {
             d.stop();
+        }
+        // The slot's spin lock goes before the stop takes VCN's mutex (R5).
+        let v = self.vcn.lock().take();
+        if let Some(v) = v {
+            v.stop(2_000_000);
         }
         let j = self.jobs.lock().take()?;
         Some(j.stop())
@@ -266,6 +293,10 @@ impl GpuDevice for HardwareGpu {
         self.facts.firmware.iter().find(|f| f.fw_type == fw_type && f.index == index).copied()
     }
     fn rings_ready(&self, ty: u32) -> u32 {
+        // GX-8v: the unified ring counts while its job half runs and is not lost.
+        if ty == AMDGPU_HW_IP_VCN_ENC && self.vcn().is_some_and(|v| v.users()) {
+            return 1;
+        }
         self.facts.rings.get(ty as usize).copied().unwrap_or(0)
     }
     /// The carve-out as the hardware says. All of it is CPU-visible, whatever BAR0's size: the CPU reaches an APU's
@@ -331,6 +362,12 @@ impl GpuDevice for HardwareGpu {
     fn sensor(&self, s: Sensor) -> Option<u32> {
         self.dpm()?.metrics().ok()?.0.sensor(s)
     }
+    /// SYS-K: one SMU exchange for every sysfs/hwmon value (smu_v13_0_4_get_smu_metrics_data's fields).
+    fn pm_sample(&self) -> Option<drm::pm::PmSample> {
+        let d = self.dpm().filter(|d| d.enabled())?;
+        let m = d.metrics().ok()?.0;
+        Some(crate::dpm_table::pm_sample(&m))
+    }
     fn reset_counter(&self) -> u32 {
         self.jobs().map_or(0, |j| j.shared.reset_counter.load(Ordering::Acquire))
     }
@@ -369,6 +406,15 @@ impl GpuDevice for HardwareGpu {
         Ok(self.new_vm(client)?)
     }
     fn submit(&self, sub: Submission) -> Result<(), Errno> {
+        if sub.jobs.iter().any(|j| j.entity.ip_type == AMDGPU_HW_IP_VCN_ENC) {
+            return match self.vcn() {
+                Some(v) => v.submit(sub),
+                None => {
+                    sub.cancel(ENODEV);
+                    Err(ENODEV)
+                }
+            };
+        }
         match self.jobs() {
             Some(j) => j.submit(sub),
             None => {
@@ -381,6 +427,9 @@ impl GpuDevice for HardwareGpu {
         if let Some(j) = self.jobs() {
             j.kick();
         }
+        if let Some(v) = self.vcn() {
+            v.kick();
+        }
     }
 }
 
@@ -389,6 +438,10 @@ impl Drop for HardwareGpu {
     fn drop(&mut self) {
         if let Some(j) = self.jobs.lock().take() {
             j.leave();
+        }
+        let v = self.vcn.lock().take();
+        if let Some(v) = v {
+            v.stop(0);
         }
     }
 }

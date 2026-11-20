@@ -545,7 +545,7 @@ fn children_times() -> TestResult {
     Ok(())
 }
 
-// ---- FS-12: ioprio_set / ioprio_get (linux-6.6/block/ioprio.c)
+// ---- FS-12: ioprio_set / ioprio_get (linux-7.3.1/block/ioprio.c)
 
 ktest!("fs.ioprio.calls", Safe, ioprio_calls);
 fn ioprio_calls() -> TestResult {

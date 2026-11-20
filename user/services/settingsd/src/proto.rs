@@ -5,23 +5,38 @@
 //! |---|---|---|
 //! | `list` | `prefix` | `keys: [{key,type,value,changed,text}]` |
 //! | `describe` | `key` | `key: {schema,default,value,text{de,en},applier,restart,safety,owner}` |
-//! | `get` | `key`, `owner` (reveals a secret to its owner) | `value`, `changed` |
-//! | `set` | `key`, `value`, `source`, `confirmed` | `old`, `new`, `applied`, `restart`, `seq`, `stored` |
-//! | `reset` | `key`, `source` | as `set` |
-//! | `undo` | `n` (default 1), `source`, `expect_seq` (with n 1: the change it may undo) | `undone: [...]`, `stopped` |
+//! | `get` | `key`, `owner` (asks for a secret in clear: only the owner's program gets it, others `not_owner`) | `value`, `changed` |
+//! | `set` | `key`, `value`, `source`, `confirmed` (a secret: from its owner's program, or confirmed by the session's compositor or root), `while` (`{key: value}`: only while these are in effect, else `changed_meanwhile`) | `old`, `new`, `applied`, `restart`, `seq`, `stored` |
+//! | `reset` | `key`, `source`, `confirmed` | as `set` |
+//! | `undo` | `n` (default 1), `source`, `expect_seq` (the newest change it may undo) | `undone: [...]`, `stopped` |
 //! | `history` | `n` (default 5), `prefix` | `entries` newest first |
 //! | `register` | `owner`, `keys: [{key,schema,default,text{de,en},restart,safety}]` | `registered` |
 //! | `unregister` | `owner`, `prefix`, `forget` | `removed` |
 //! | `watch` | `prefix` | `watching`, then `{"event":"changed",...}` and `registered`/`unregistered` lines |
-//! | `status` | – | `place` (stick/fallback), `reason`, `dir`, counts |
+//! | `status` | – | `place` (stick/fallback), `reason`, `dir`, counts, `asker` (the asking program as settingsd tells it: `pid`, `uid`, `exe`, `by` kernel/proc) |
 //!
 //! Errors: `{"ok":false,"error":<code>,"message":...}` with code `bad_request`, `unknown_key`, `bad_value`,
-//! `refused_r8`, `needs_confirm`, `not_owner`, `apply_failed`, `config_refused`, `nothing_to_undo`, `not_undoable`,
-//! `changed_meanwhile`.
+//! `refused_r8`, `needs_confirm`, `not_owner`, `not_confirmer` (the change needs Georg's own yes and the asking
+//! program's `confirmed` is not that, `vouch.rs`; the message says in German where he gives it),
+//! `peer_unknown` (as `not_owner` or `not_confirmer`, but because settingsd could not
+//! tell the asking program: it left before it was looked at; a client waits for its answer before it goes),
+//! `apply_failed`, `config_refused`, `nothing_to_undo`, `not_undoable`, `changed_meanwhile`, `key_bound` (the
+//! address, kind or place of an AI provider whose key is stored: `redirect.rs`).
+//!
+//! The AI providers (`providers.rs`): `set ai.providers` with one more name makes that provider's five keys
+//! `ai.provider.<id>.*` (watchers get `registered`); with a name less it removes that provider, its values and
+//! its stored key (watchers get `unregistered`), and needs `"confirmed": true` from the session's compositor or
+//! from root when anything was stored for it (`needs_confirm` to those two without it, `not_confirmer` to
+//! everybody else, confirmed or not); the roles `ai.role.*` that named it lose the name just before, each as a
+//! change of its own. A name that cannot be part of a key is `bad_value`.
+//!
+//! Who asks is the kernel's answer for the connection (`peer.rs`), never a field of the request: `owner` is a
+//! claim that counts only from the owner's program (`owners.rs`).
 
 use crate::change::Who;
 use crate::json::{self, Json};
 use crate::key::KeyDef;
+use crate::peer::Peer;
 use crate::registry::{Error, Registry, err};
 use crate::server::Shared;
 
@@ -50,7 +65,7 @@ fn need<'a>(j: &'a Json, key: &str) -> Result<&'a str, Error> {
 
 /// Reads are answered from the last snapshot (they never wait behind a change that waits for the stick);
 /// changes take the registry lock and publish a new snapshot afterwards, also when they failed half-way.
-pub fn handle(shared: &Shared, line: &str) -> Reply {
+pub fn handle(shared: &Shared, peer: &Peer, line: &str) -> Reply {
     let r = (|| -> Result<Reply, Error> {
         let j = json::parse(line).map_err(|e| err("bad_request", format!("not JSON: {e}")))?;
         let op = need(&j, "op")?;
@@ -62,9 +77,9 @@ pub fn handle(shared: &Shared, line: &str) -> Reply {
             Ok(Some(match op {
                 "list" => v.list(j.str("prefix").unwrap_or("")),
                 "describe" => v.describe(need(&j, "key")?)?,
-                "get" => v.get(need(&j, "key")?, j.str("owner"))?,
+                "get" => v.get(need(&j, "key")?, j.str("owner"), peer)?,
                 "history" => v.history(count(&j, "n", 5)?, j.str("prefix")),
-                "status" => v.status(),
+                "status" => v.status().with("asker", peer.json()),
                 _ => return Ok(None),
             }))
         };
@@ -72,23 +87,30 @@ pub fn handle(shared: &Shared, line: &str) -> Reply {
             return Ok(Reply::Line(out.to_text()));
         }
         let mut r = shared.lock();
-        let out = change(&mut r, op, &j);
+        let out = change(&mut r, op, &j, peer);
         shared.publish(&r);
         Ok(Reply::Line(out?.to_text()))
     })();
     r.unwrap_or_else(|e| Reply::Line(error_line(&e)))
 }
 
-fn change(r: &mut Registry, op: &str, j: &Json) -> Result<Json, Error> {
+fn change(r: &mut Registry, op: &str, j: &Json, peer: &Peer) -> Result<Json, Error> {
     let source = j.str("source").unwrap_or("socket");
     let confirmed = j.get("confirmed").and_then(Json::as_bool).unwrap_or(false);
-    let who = Who { source, confirmed };
+    let who = Who { source, confirmed, asker: Some(peer) };
     Ok(match op {
         "set" => {
             let v = j.get("value").ok_or_else(|| err("bad_request", "value missing"))?;
+            r.check_secret_write(need(j, "key")?, peer, confirmed)?;
+            if let Some(cond) = j.get("while") {
+                r.check_while(cond)?;
+            }
             r.set(need(j, "key")?, v, &who)?
         }
-        "reset" => r.reset(need(j, "key")?, &who)?,
+        "reset" => {
+            r.check_secret_write(need(j, "key")?, peer, confirmed)?;
+            r.reset(need(j, "key")?, &who)?
+        }
         "undo" => {
             let expect = match j.get("expect_seq") {
                 None | Some(Json::Null) => None,
@@ -109,11 +131,11 @@ fn change(r: &mut Registry, op: &str, j: &Json) -> Result<Json, Error> {
                         .map_err(|e| err(if e.contains("R8") { "refused_r8" } else { "bad_request" }, e))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            r.register(owner, defs)?
+            r.register(owner, defs, peer)?
         }
         "unregister" => {
             let forget = j.get("forget").and_then(Json::as_bool).unwrap_or(false);
-            r.unregister(need(j, "owner")?, need(j, "prefix")?, forget)?
+            r.unregister(need(j, "owner")?, need(j, "prefix")?, forget, peer)?
         }
         other => return Err(err("bad_request", format!("unknown op {other:?}"))),
     })

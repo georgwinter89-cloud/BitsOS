@@ -1,0 +1,9 @@
+[package]
+name = "rdna4-core"
+version = "0.1.0"
+edition = "2024"
+description = "Radeon RX 9070 XT (Navi 48): measured IP table, firmware names, layout and register arithmetic, card choice, never-send lists; pure data, not linked into the kernel (owner: GP, then GX)"
+publish = false
+
+[lints]
+workspace = true

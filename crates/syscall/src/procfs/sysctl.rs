@@ -1,7 +1,7 @@
-//! AB-7b: `/proc/sys/kernel` (linux-6.6 kernel/utsname_sysctl.c, kernel/pid.c `pid_max`, drivers/char/random.c
-//! `random_table`, kernel/sysctl.c `kern_table`, kernel/capability.c `cap_last_cap`) and `/proc/sys/vm`
-//! (mm/util.c, kernel/sysctl.c `vm_table`, security/min_addr.c), a second source beside FS's `memfd_noexec`
-//! on the same directory.
+//! AB-7b: `/proc/sys/kernel` (linux-7.3.1 kernel/utsname_sysctl.c, kernel/pid.c:769 `pid_table` (one per pid
+//! namespace since `register_pidns_sysctls` :782), drivers/char/random.c `random_table`, kernel/sysctl.c:1420
+//! `cap_last_cap`) and `/proc/sys/vm` (mm/util.c:853, mm/mmap.c:1498, security/min_addr.c:45), a second source
+//! beside FS's `memfd_noexec` on the same directory.
 //!
 //! Knobs V2 cannot carry out (overcommit, ASLR, map and thread ceilings) keep showing what V2 does; a write
 //! inside Linux's range is accepted so `sysctl -p` and systemd-sysctl do not fail, and leaves a
@@ -18,7 +18,7 @@ use core::ops::RangeInclusive;
 use core::sync::atomic::{AtomicU64, Ordering};
 use uapi::errno::*;
 use vfs::synth::{DirSource, SynthEntry};
-use vfs::sysctl::Knob;
+use vfs::sysctl::{IntKnob, Knob, non_negative};
 use vfs::{Cred, Errno};
 
 /// `proc_dostring` on a write: the bytes up to the first NUL or newline, at most 64 (`maxlen - 1`); the whole
@@ -88,13 +88,50 @@ fn random_uuid() -> String {
 /// `boot_id`: made at its first read, the same until the next boot.
 static BOOT_ID: ksync::Once<String> = ksync::Once::new();
 
-fn pid_max() -> u64 {
-    proc::pid_max() as u64
+/// The reader's active pid namespace (`task_active_pid_ns(current)`; the initial one for kernel readers).
+fn reader_pid_ns() -> Arc<proc::ns::pid::PidNs> {
+    proc::current().map_or_else(|| proc::ns::pid::init_pid_ns().clone(), |me| me.pid_ns.clone())
 }
 
-/// `pid_max_min`..=`pid_max_max` (301..=4194304), checked by proc; later ids stay below the new value.
-fn set_pid_max(v: u64) -> Result<(), Errno> {
-    proc::set_pid_max(v)
+/// `kernel.pid_max` of the reader's pid namespace (linux-7.3.1/kernel/pid.c:769): owned by the root of the
+/// namespace's user namespace; `pid_table_root_permissions` (:735) gives the owner's bits (rw) to a caller with
+/// CAP_SYS_ADMIN over that user namespace or whose euid is its root, the others' (r) to everyone else.
+struct PidMax;
+
+impl PidMax {
+    fn may_write(ns: &proc::ns::pid::PidNs) -> bool {
+        let Some(me) = proc::current() else { return true };
+        let c = me.cred();
+        let root = ns.user_ns.to_kernel(proc::ns::user::MapKind::Uid, 0);
+        proc::cred::ns_capable(&c, &ns.user_ns, proc::cred::Cap::SysAdmin) || Some(c.euid) == root
+    }
+    /// The file's owner as `pid_table_root_set_ownership` makes it (global root when 0 is not mapped).
+    fn owner() -> (u32, u32) {
+        let ns = reader_pid_ns();
+        let u = &ns.user_ns;
+        (u.to_kernel(proc::ns::user::MapKind::Uid, 0).unwrap_or(0), u.to_kernel(proc::ns::user::MapKind::Gid, 0).unwrap_or(0))
+    }
+}
+
+impl vfs::synth::FileSource for PidMax {
+    fn permission(&self, _who: Cred, want: u32) -> Option<Result<(), Errno>> {
+        use vfs::inode::{MAY_EXEC, MAY_WRITE};
+        let denied = want & MAY_EXEC != 0 || (want & MAY_WRITE != 0 && !Self::may_write(&reader_pid_ns()));
+        Some(if denied { Err(EACCES) } else { Ok(()) })
+    }
+    fn may_open(&self, _who: Cred, write: bool) -> Result<(), Errno> {
+        if write && !Self::may_write(&reader_pid_ns()) {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+    fn render(&self, _who: Cred) -> Result<Vec<u8>, Errno> {
+        Ok(alloc::format!("{}\n", reader_pid_ns().pid_max()).into_bytes())
+    }
+    /// `proc_dointvec_minmax` with `pid_max_min`..=`pid_max_max`, on the writer's own namespace.
+    fn write(&self, _who: Cred, data: &[u8]) -> Result<usize, Errno> {
+        vfs::sysctl::write_int(data, |v| reader_pid_ns().set_pid_max(non_negative(v)?))
+    }
 }
 
 /// `max_threads` as `fork_init` sets it (RLIMIT_NPROC's default is half of it); V2 has no global ceiling.
@@ -103,7 +140,8 @@ fn threads_max() -> u64 {
 }
 
 /// `sysctl_max_threads`: MIN_THREADS..=MAX_THREADS (FUTEX_TID_MASK).
-fn set_threads_max(v: u64) -> Result<(), Errno> {
+fn set_threads_max(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     not_honoured("threads-max", v, 20..=0x3fff_ffff)
 }
 
@@ -112,8 +150,10 @@ fn randomize() -> u64 {
     0
 }
 
-fn set_randomize(v: u64) -> Result<(), Errno> {
-    not_honoured("randomize_va_space", v, 0..=INT_MAX)
+/// Plain `proc_dointvec` (linux-7.3.1/mm/memory.c:134): every int is in range, negative ones too.
+fn set_randomize(v: i64) -> Result<(), Errno> {
+    klog::event!(Info, "syscall", "sysctl.not_honoured", knob = "randomize_va_space", asked = v);
+    Ok(())
 }
 
 static OVERFLOW_UID: AtomicU64 = AtomicU64::new(65534);
@@ -125,13 +165,15 @@ static TAINTED: AtomicU64 = AtomicU64::new(0);
 fn overflowuid() -> u64 {
     OVERFLOW_UID.load(Ordering::Relaxed)
 }
-fn set_overflowuid(v: u64) -> Result<(), Errno> {
+fn set_overflowuid(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     store("overflowuid", &OVERFLOW_UID, v, 0..=65535)
 }
 fn overflowgid() -> u64 {
     OVERFLOW_GID.load(Ordering::Relaxed)
 }
-fn set_overflowgid(v: u64) -> Result<(), Errno> {
+fn set_overflowgid(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     store("overflowgid", &OVERFLOW_GID, v, 0..=65535)
 }
 fn tainted() -> u64 {
@@ -158,7 +200,7 @@ impl DirSource for RandomDir {
     }
 }
 
-/// `kernel.yama.ptrace_scope` (linux-6.6/security/yama/yama_lsm.c:27,432): default 1 (relational). V2 has no
+/// `kernel.yama.ptrace_scope` (linux-7.3.1/security/yama/yama_lsm.c:28,432): default 1 (relational). V2 has no
 /// ptrace(2), so no attach exists; the attach-mode checks that do (pidfd_getfd, process_vm_readv/writev:
 /// `Process::may_ptrace`) do not apply the scope yet (they act as scope 0 would; C1: an AB item, V2-LANES AB-18).
 /// The value answers readers such as Chromium's sandbox check; a write needs CAP_SYS_PTRACE
@@ -171,14 +213,11 @@ fn set_ptrace_scope(data: &[u8]) -> Result<usize, Errno> {
         klog::event!(Info, "syscall", "sysctl.denied", knob = "yama.ptrace_scope");
         return Err(EPERM);
     }
-    if data.is_empty() {
-        return Ok(0);
-    }
-    if let Some(v) = vfs::sysctl::parse_ulong(data)? {
+    vfs::sysctl::write_int(data, |v| {
+        let v = non_negative(v)?;
         let min = if PTRACE_SCOPE.load(Ordering::Relaxed) == YAMA_SCOPE_NO_ATTACH { YAMA_SCOPE_NO_ATTACH } else { 0 };
-        store("yama.ptrace_scope", &PTRACE_SCOPE, v, min..=YAMA_SCOPE_NO_ATTACH)?;
-    }
-    Ok(data.len())
+        store("yama.ptrace_scope", &PTRACE_SCOPE, v, min..=YAMA_SCOPE_NO_ATTACH)
+    })
 }
 
 struct YamaDir;
@@ -196,7 +235,8 @@ struct KernelDir;
 impl DirSource for KernelDir {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         let fixed = |s: &'static str| Arc::new(Live::new(0, move || Ok(alloc::format!("{s}\n"))));
-        let knob = |get: fn() -> u64, set: fn(u64) -> Result<(), Errno>| Arc::new(Knob { get, set, uint: false });
+        let knob = |get: fn() -> u64, set: fn(u64) -> Result<(), Errno>| Arc::new(Knob { get, set });
+        let int = |get: fn() -> u64, set: fn(i64) -> Result<(), Errno>| Arc::new(IntKnob { get, set });
         let mut v = alloc::vec![
             // CAP_LAST_CAP of 6.6: CAP_CHECKPOINT_RESTORE.
             SynthEntry::file("cap_last_cap", 0o444, fixed("40")),
@@ -206,13 +246,16 @@ impl DirSource for KernelDir {
             SynthEntry::file("ngroups_max", 0o444, fixed("65536")),
             SynthEntry::file("osrelease", 0o444, fixed(crate::info::RELEASE)),
             SynthEntry::file("ostype", 0o444, fixed("Linux")),
-            SynthEntry::file("overflowgid", 0o644, knob(overflowgid, set_overflowgid)),
-            SynthEntry::file("overflowuid", 0o644, knob(overflowuid, set_overflowuid)),
-            SynthEntry::file("pid_max", 0o644, knob(pid_max, set_pid_max)),
+            SynthEntry::file("overflowgid", 0o644, int(overflowgid, set_overflowgid)),
+            SynthEntry::file("overflowuid", 0o644, int(overflowuid, set_overflowuid)),
+            {
+                let (u, g) = PidMax::owner();
+                SynthEntry::file("pid_max", 0o644, Arc::new(PidMax)).owner(u, g)
+            },
             SynthEntry::dir("random", Arc::new(RandomDir)),
-            SynthEntry::file("randomize_va_space", 0o644, knob(randomize, set_randomize)),
+            SynthEntry::file("randomize_va_space", 0o644, int(randomize, set_randomize)),
             SynthEntry::file("tainted", 0o644, knob(tainted, set_tainted)),
-            SynthEntry::file("threads-max", 0o644, knob(threads_max, set_threads_max)),
+            SynthEntry::file("threads-max", 0o644, int(threads_max, set_threads_max)),
             SynthEntry::file("version", 0o444, fixed(crate::info::VERSION)),
             SynthEntry::dir("yama", Arc::new(YamaDir)),
         ];
@@ -233,7 +276,8 @@ fn overcommit() -> u64 {
     2
 }
 
-fn set_overcommit(v: u64) -> Result<(), Errno> {
+fn set_overcommit(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     if v == 2 {
         return Ok(());
     }
@@ -251,8 +295,10 @@ pub(super) fn ratio_of(limit_pages: u64, total_pages: u64) -> u64 {
     if total_pages == 0 { 50 } else { (limit_pages.min(total_pages) as u128 * 100 / total_pages as u128) as u64 }
 }
 
-fn set_overcommit_ratio(v: u64) -> Result<(), Errno> {
-    not_honoured("overcommit_ratio", v, 0..=INT_MAX)
+/// Plain `proc_dointvec` (linux-7.3.1/mm/util.c:795): every int is in range, negative ones too.
+fn set_overcommit_ratio(v: i64) -> Result<(), Errno> {
+    klog::event!(Info, "syscall", "sysctl.not_honoured", knob = "overcommit_ratio", asked = v);
+    Ok(())
 }
 
 /// 0: the ratio decides (V2's limit is not a fixed size).
@@ -270,7 +316,8 @@ fn max_map_count() -> u64 {
     INT_MAX - 5
 }
 
-fn set_max_map_count(v: u64) -> Result<(), Errno> {
+fn set_max_map_count(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     not_honoured("max_map_count", v, 0..=INT_MAX)
 }
 
@@ -290,7 +337,8 @@ fn swappiness() -> u64 {
     SWAPPINESS.load(Ordering::Relaxed)
 }
 
-fn set_swappiness(v: u64) -> Result<(), Errno> {
+fn set_swappiness(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     store("swappiness", &SWAPPINESS, v, 0..=200)
 }
 
@@ -309,20 +357,18 @@ impl vfs::synth::FileSource for DropCaches {
         Ok(Vec::new())
     }
     fn write(&self, _who: Cred, data: &[u8]) -> Result<usize, Errno> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-        let Some(v) = vfs::sysctl::parse_ulong(data)? else { return Ok(data.len()) };
-        if !(1..=4).contains(&v) {
-            klog::event!(Info, "syscall", "sysctl.out_of_range", knob = "drop_caches", asked = v);
-            return Err(EINVAL);
-        }
-        let (comm, pid) = match proc::current_thread() {
-            Some(t) => (t.prctl().comm_str(), proc::current().map_or(0, |p| p.pid as u64)),
-            None => (String::from("kernel"), 0),
-        };
-        vfs::reclaim::drop_caches(v, &comm, pid);
-        Ok(data.len())
+        vfs::sysctl::write_int(data, |v| {
+            if !(1..=4).contains(&v) {
+                klog::event!(Info, "syscall", "sysctl.out_of_range", knob = "drop_caches", asked = v);
+                return Err(EINVAL);
+            }
+            let (comm, pid) = match proc::current_thread() {
+                Some(t) => (t.prctl().comm_str(), proc::current().map_or(0, |p| p.pid as u64)),
+                None => (String::from("kernel"), 0),
+            };
+            vfs::reclaim::drop_caches(v as u64, &comm, pid);
+            Ok(())
+        })
     }
 }
 
@@ -332,7 +378,8 @@ fn compact_memory() -> u64 {
     0
 }
 
-fn set_compact_memory(v: u64) -> Result<(), Errno> {
+fn set_compact_memory(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     if v != 1 {
         return Err(EINVAL);
     }
@@ -345,7 +392,8 @@ fn compaction_proactiveness() -> u64 {
     u64::from(mm_core::compact::proactiveness())
 }
 
-fn set_compaction_proactiveness(v: u64) -> Result<(), Errno> {
+fn set_compaction_proactiveness(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     if mm_core::compact::set_proactiveness(v) { Ok(()) } else { Err(EINVAL) }
 }
 
@@ -354,7 +402,8 @@ fn extfrag_threshold() -> u64 {
     u64::from(mm_core::compact::extfrag_threshold())
 }
 
-fn set_extfrag_threshold(v: u64) -> Result<(), Errno> {
+fn set_extfrag_threshold(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     if mm_core::compact::set_extfrag_threshold(v) { Ok(()) } else { Err(EINVAL) }
 }
 
@@ -363,7 +412,8 @@ fn compact_unevictable_allowed() -> u64 {
     u64::from(mm_core::compact::unevictable_allowed())
 }
 
-fn set_compact_unevictable_allowed(v: u64) -> Result<(), Errno> {
+fn set_compact_unevictable_allowed(v: i64) -> Result<(), Errno> {
+    let v = non_negative(v)?;
     if mm_core::compact::set_unevictable_allowed(v) { Ok(()) } else { Err(EINVAL) }
 }
 
@@ -371,19 +421,20 @@ struct VmDir;
 
 impl DirSource for VmDir {
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
-        let knob = |get: fn() -> u64, set: fn(u64) -> Result<(), Errno>| Arc::new(Knob { get, set, uint: false });
+        let knob = |get: fn() -> u64, set: fn(u64) -> Result<(), Errno>| Arc::new(Knob { get, set });
+        let int = |get: fn() -> u64, set: fn(i64) -> Result<(), Errno>| Arc::new(IntKnob { get, set });
         let mut v = alloc::vec![
-            SynthEntry::file("compact_memory", 0o200, knob(compact_memory, set_compact_memory)),
-            SynthEntry::file("compact_unevictable_allowed", 0o644, knob(compact_unevictable_allowed, set_compact_unevictable_allowed)),
-            SynthEntry::file("compaction_proactiveness", 0o644, knob(compaction_proactiveness, set_compaction_proactiveness)),
+            SynthEntry::file("compact_memory", 0o200, int(compact_memory, set_compact_memory)),
+            SynthEntry::file("compact_unevictable_allowed", 0o644, int(compact_unevictable_allowed, set_compact_unevictable_allowed)),
+            SynthEntry::file("compaction_proactiveness", 0o644, int(compaction_proactiveness, set_compaction_proactiveness)),
             SynthEntry::file("drop_caches", 0o200, Arc::new(DropCaches)),
-            SynthEntry::file("extfrag_threshold", 0o644, knob(extfrag_threshold, set_extfrag_threshold)),
-            SynthEntry::file("max_map_count", 0o644, knob(max_map_count, set_max_map_count)),
+            SynthEntry::file("extfrag_threshold", 0o644, int(extfrag_threshold, set_extfrag_threshold)),
+            SynthEntry::file("max_map_count", 0o644, int(max_map_count, set_max_map_count)),
             SynthEntry::file("mmap_min_addr", 0o644, knob(mmap_min_addr, set_mmap_min_addr)),
             SynthEntry::file("overcommit_kbytes", 0o644, knob(overcommit_kbytes, set_overcommit_kbytes)),
-            SynthEntry::file("overcommit_memory", 0o644, knob(overcommit, set_overcommit)),
-            SynthEntry::file("overcommit_ratio", 0o644, knob(overcommit_ratio, set_overcommit_ratio)),
-            SynthEntry::file("swappiness", 0o644, knob(swappiness, set_swappiness)),
+            SynthEntry::file("overcommit_memory", 0o644, int(overcommit, set_overcommit)),
+            SynthEntry::file("overcommit_ratio", 0o644, int(overcommit_ratio, set_overcommit_ratio)),
+            SynthEntry::file("swappiness", 0o644, int(swappiness, set_swappiness)),
         ];
         for (i, e) in v.iter_mut().enumerate() {
             e.cookie = i as u64 + 1;
@@ -397,7 +448,7 @@ fn vm_dir() -> Arc<dyn DirSource> {
 }
 vfs::procdir!("/proc/sys/vm", vm_dir);
 
-/// SX-3b: `/proc/sys/user` (linux-6.6/kernel/ucount.c `user_table`): the namespace limits of the reader's user
+/// SX-3b: `/proc/sys/user` (linux-7.3.1/kernel/ucount.c:76 `user_table`): the namespace limits of the reader's user
 /// namespace, the kinds V2 counts (`proc::ns::count`). stat shows the table's 0644 owned by root, as Linux; access
 /// is `set_permissions` through the file's own permission op (`proc_sys_permission`): read and write for a
 /// caller with CAP_SYS_RESOURCE over its own user namespace, read only for everyone else, never exec.
@@ -428,10 +479,10 @@ fn reader_user_ns() -> (Arc<proc::ns::user::UserNs>, bool) {
 struct NsLimit(proc::ns::count::Counted);
 
 impl vfs::synth::FileSource for NsLimit {
-    /// `test_perm` with `set_permissions`' mode (linux-6.6/fs/proc/proc_sysctl.c:416, kernel/ucount.c:40): the
+    /// `test_perm` with `set_permissions`' mode (linux-7.3.1/fs/proc/proc_sysctl.c:425, kernel/ucount.c:43): the
     /// mode is the same for owner, group and others, so only the capability counts.
     /// access(2) (MAY_ACCESS) asks with the real ids, whose capabilities count only for the namespace's root
-    /// uid (linux-6.6/fs/open.c:420 `access_override_creds`; AT_EACCESS keeps them).
+    /// uid (linux-7.3.1/fs/open.c:414 `access_override_creds`; AT_EACCESS keeps them).
     fn permission(&self, _who: Cred, want: u32) -> Option<Result<(), Errno>> {
         use vfs::inode::{MAY_ACCESS, MAY_EXEC, MAY_WRITE};
         let may_write = || {
@@ -455,9 +506,9 @@ impl vfs::synth::FileSource for NsLimit {
     fn write(&self, who: Cred, data: &[u8]) -> Result<usize, Errno> {
         self.write_at(who, 0, data)
     }
-    /// `proc_dointvec_minmax` with 0..=INT_MAX (linux-6.6/kernel/sysctl.c:471 `__do_proc_dointvec`): a write at a
-    /// non-zero position changes nothing and counts as written (SYSCTL_WRITES_STRICT, the default: `goto out`
-    /// keeps `*lenp`); one made only of white space is EINVAL.
+    /// `proc_doulongvec_minmax` with 0..=INT_MAX (linux-7.3.1/kernel/ucount.c:72; `do_proc_vec`, sysctl.c:646):
+    /// a sign is EINVAL, also "-0"; a write at a non-zero position changes nothing and counts as written
+    /// (SYSCTL_WRITES_STRICT, the default: `goto out` keeps `*lenp`); one made only of white space is EINVAL.
     fn write_at(&self, _who: Cred, pos: u64, data: &[u8]) -> Result<usize, Errno> {
         let (ns, may) = reader_user_ns();
         if !may {
@@ -466,10 +517,11 @@ impl vfs::synth::FileSource for NsLimit {
         if data.is_empty() || pos != 0 {
             return Ok(data.len());
         }
-        let v = vfs::sysctl::parse_ulong(data)?.ok_or(EINVAL)?;
-        ns.limits.set(self.0, v)?;
-        klog::event!(Info, "syscall", "sysctl.ns_limit", kind = self.0.name(), value = v, userns = ns.inum);
-        Ok(data.len())
+        vfs::sysctl::write_value(data, |v| {
+            ns.limits.set(self.0, v)?;
+            klog::event!(Info, "syscall", "sysctl.ns_limit", kind = self.0.name(), value = v, userns = ns.inum);
+            Ok(())
+        })
     }
 }
 

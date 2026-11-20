@@ -286,10 +286,9 @@ pub(crate) mod tests {
         assert!(decode_rgb(&broken).is_err());
     }
 
-    /// Time and size of a 2560x1440 console-like picture on the host (release: `cargo test -p mcp --release
-    /// png_1440p -- --ignored --nocapture`). The Mini-PC number is the desk's (check list).
+    /// A 2560x1440 console-like picture round trip; the time is only printed (`--nocapture`), it is judged on
+    /// the Mini-PC (the desk's check list). Runs in the gate's host tests (about 0.1 s).
     #[test]
-    #[ignore]
     fn png_1440p_timing() {
         let (w, h) = (2560u32, 1440u32);
         let font = include_bytes!("../../display/src/font/cp437-8x16.bin");

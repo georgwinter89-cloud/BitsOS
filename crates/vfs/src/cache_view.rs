@@ -3,7 +3,7 @@
 //! Every change still happens with `vfs.inode.data` held (the Mutex keeps writers, truncate, fills, reclaim and
 //! read-ahead in one order), and under the write side of the index's own lock `vfs.inode.index` too.
 //!
-//! PF-5 (Linux 4c0f369's idea, plan/notes/pf-scout-memory.md section 4): the index is an `RcuIndex`, so a read
+//! PF-5 (Linux 4c0f369's idea, plan/spec/storage.md §3.2): the index is an `RcuIndex`, so a read
 //! finds and copies cached pages with no lock and no reference at all (`Shared::quick`): inside a
 //! `grace::Section` it loads the size and the pages and copies them through a sink that never sleeps or
 //! faults (a kernel buffer, or a user copy that turns a fault into "stop here"); a page that leaves the index
@@ -238,6 +238,28 @@ impl Pages {
         let old = self.prepared(i)?.insert_prepared(i, v).map_err(|_| NoRoom)?;
         drop(old.map(|r| Gone(Some(r))));
         Ok(())
+    }
+    /// W35 MM-2 (CONTRACTS BL-3/MM-2): puts `new` at `i` in place of the page there when that page has frame
+    /// `phys`, only the index holds it and it is clean, checked under the write side (never waiting for it): the
+    /// old page then, for the caller to drop after the lock (a lockless reader still copying from it finishes on
+    /// its frame, which goes back after a grace period); the new frame's owner word names (cache, `i`). Err(busy):
+    /// not replaced (`busy`: the write side was taken; else the page changed, gained a holder or is gone), `new`
+    /// is dropped (its frame goes back). The page never leaves the index, so the seqcount stays (readers see the
+    /// old page or its copy: the same bytes).
+    pub(crate) fn try_replace_alone(&self, i: u64, phys: u64, new: Arc<CachePage>) -> Result<Option<Gone>, bool> {
+        let np = new.phys().ok_or(false)?;
+        let mut w = self.0.index.try_write().ok_or(true)?;
+        if !w.get(i).is_some_and(|p| p.strong_count() == 1 && p.phys() == Some(phys) && !p.is_dirty()) {
+            return Err(false);
+        }
+        let id = self.0.owner_id.load(Ordering::Relaxed);
+        // The path to `i` exists (a page is there): the swap allocates nothing and cannot fail.
+        let old = w.insert_prepared(i, new).ok().flatten();
+        if id != 0 {
+            mm_core::reclaim::set_frame_owner(np, crate::reclaim::owner_word(id, i));
+        }
+        drop(w);
+        Ok(old.map(|r| Gone(Some(r))))
     }
     pub(crate) fn remove(&self, i: u64) -> Option<Gone> {
         let mut w = self.0.index.write();

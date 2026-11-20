@@ -9,5 +9,5 @@ runs on the glibc, Vulkan loader and RADV of `\BITSOS2\mesa\`: one needs the oth
 | `patches/` | the one change to vkQuake: SDL2 asks for the output's real pixels |
 | `bitsos/vkquake` | the launcher, `\BITSOS2\bin\vkquake`: `vkquake`, `vkquake --check`, `vkquake --env`, `vkquake -nosound +map start` |
 
-Tests: `host/tests/gm/50-vkquake.sh` (launcher on made-up trees), `51-vkquake-window.sh` (the tree on the build host, lavapipe in a
-headless bitscomp), `ul.pkg.vkquake*` (the stick), `host/tests/minipc/quake.sh` (the chip). Notes: `plan/notes/gm-GM-8.md`.
+Tests: `host/tests/gm/50-vkquake.sh` (launcher on made-up trees), `ul.pkg.vkquake*` (the stick); the game on the chip is
+Georg's check (the Mesa tree has no software driver since 18.11., so no window test runs without a GPU). Spec: `plan/spec/programs.md` §6; Mini-PC check list: `plan/guides/games.md`.

@@ -1,4 +1,4 @@
-//! The VFS's notification points, named after Linux's fsnotify hooks (linux-6.6/include/linux/fsnotify.h) and
+//! The VFS's notification points, named after Linux's fsnotify hooks (linux-7.3.1/include/linux/fsnotify.h) and
 //! called where Linux calls them, in Linux's order:
 //! - `created` (`fsnotify_create`/`fsnotify_mkdir`): IN_CREATE on the directory; `linked` (`fsnotify_link`):
 //!   IN_ATTRIB on the inode, then IN_CREATE;
@@ -107,6 +107,18 @@ pub(crate) fn rmdir(dir: &Inode, victim: &Arc<Dentry>, name: &[u8], holders: usi
         inode_removed(&victim.inode);
     }
     name_event(dir, IN_DELETE | IN_ISDIR, name, 0);
+}
+
+/// EINS-C: `name` left `dir` for the assistant tree's trash (its unlink or rmdir): to `dir`'s watches it is
+/// deleted (IN_ATTRIB on a file first, as `unlinked` sends); the inode lives on in the trash, so no IN_DELETE_SELF.
+pub(crate) fn trashed(dir: &Inode, inode: &Inode, name: &[u8]) {
+    if !active() {
+        return;
+    }
+    if !inode.is_dir() {
+        inode_event(inode, IN_ATTRIB);
+    }
+    name_event(dir, IN_DELETE | isdir(inode), name, 0);
 }
 
 /// `fsnotify_move`: `moved` went from `oname` in `odir` to `nname` in `ndir`; `target` is the dentry it replaced

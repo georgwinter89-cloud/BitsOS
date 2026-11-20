@@ -211,7 +211,7 @@ fn config_txt_lines_only_georg_sets() {
     assert!(config_guard(b"", b" NVME_WRITE = on \r\n").is_err(), "case and spaces");
     assert!(config_guard(b"nvme_write=off\n", b"nvme_write=on\n").is_err(), "changed");
     assert_eq!(config_guard(b"nvme_write=on\nx=1\n", b"x=2\nnvme_write=on\n"), Ok(()), "kept as it was");
-    assert_eq!(config_guard(b"wlan=off\n", b"wlan=on\n"), Ok(()), "wlan is free (R8d, 21.10.)");
+    assert_eq!(config_guard(b"tz=UTC\n", b"tz=Europe/Berlin\n"), Ok(()), "other keys are free");
     assert_eq!(config_guard(b"nvme_write=on\n", b"x=1\n"), Ok(()), "dropping it is allowed");
     assert!(config_guard(b"", b"\xef\xbb\xbfnvme_write=on").is_err(), "behind a BOM");
     // NV-2p: the window key arrives through no file tool.
@@ -229,8 +229,8 @@ fn config_txt_lines_only_georg_sets() {
     assert!(refused("write_file", r#"{"path":"/h4/config.txt","text":"nvme_data=S:G:1:2"}"#).contains("R8a"));
     assert!(refused("fetch", r#"{"url":"http://10.0.2.2/c","path":"/h4/CONFIG.TXT"}"#).contains("never writes a CONFIG.TXT"));
     ok("write_file", r#"{"path":"/h4/CONFIG.TXT","text":"token=u\nstick_write=","offset":0}"#);
-    ok("write_file", r#"{"path":"/h4/CONFIG.TXT","text":"\nx=1\nwlan=on\n","append":true}"#);
-    assert_eq!(read_all("/h4/CONFIG.TXT"), b"token=u\nstick_write=\nx=1\nwlan=on\n");
+    ok("write_file", r#"{"path":"/h4/CONFIG.TXT","text":"\nx=1\ntz=UTC\n","append":true}"#);
+    assert_eq!(read_all("/h4/CONFIG.TXT"), b"token=u\nstick_write=\nx=1\ntz=UTC\n");
 }
 
 #[test]
@@ -368,7 +368,7 @@ fn stat_sizes_on_fat_and_the_redacted_config() {
     assert_eq!(num(&s, "size"), Some(9003), "after a pwrite past the end: {}", s.to_string());
     assert!(s.get("redacted").is_none());
     let (token, psk) = ("abcdefghijklmnop", "a long wlan passphrase");
-    let cfg = format!("mcp_port=8765\ntoken={token}\nwlan_psk={psk}\nwlan=on\n");
+    let cfg = format!("mcp_port=8765\ntoken={token}\nwlan_psk={psk}\nwlan_ssid=net\n");
     ns.write_file("/boot/BITSOS2/CONFIG.TXT", cfg.as_bytes(), Some(0)).unwrap();
     let real = ns.lookup_path(b"/boot/BITSOS2/CONFIG.TXT", true).unwrap().attr().size;
     assert_eq!(real, cfg.len() as u64);

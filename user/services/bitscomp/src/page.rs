@@ -23,6 +23,71 @@ pub enum Kind {
     Field { colour: bool, max: usize },
     /// No control, the value only; the text says why.
     Fixed(String),
+    /// CL-5 (the page "KI"): pills `w` wide, (value, name) each. One of them is the value, or with `multi` the
+    /// value is a list and a click puts a name on it or takes it off. `notes`: one line beside each choice
+    /// (empty: none); with notes the choices stand one under the other.
+    Pills { opts: Vec<(String, String)>, multi: bool, w: i32, notes: Vec<String> },
+    /// CL-5: a secret. The row shows only whether one is stored; its field never shows what is typed. `clear`:
+    /// a button that removes the stored one.
+    Secret { clear: bool },
+    /// CL-5: buttons, (name in `ctl hot`, text) each.
+    Buttons(Vec<(String, String)>),
+    /// DESK-LEFT: a way to another page: its "Öffnen" button opens the address (as typed into the address bar).
+    Link(String),
+    /// SELFOPT-1: a benchmark's last nights as a small line chart (the value is `leistung::chart_value`'s text).
+    Chart,
+    /// WY-SET: a card's "Mehr" line: open or closed, how many rows it holds and how many of them differ from
+    /// their default. The whole row is its button.
+    Fold { open: bool, count: usize, changed: usize },
+    /// WY-SET: several keys in one row (a consolidation, `page_join`): each a small switch or a number chip that
+    /// is typed into. The row's value is the keys' values joined by `;`.
+    Subs(Vec<Sub>),
+}
+
+/// WY-SET: one key of a `Subs` row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sub {
+    pub key: String,
+    pub label: String,
+    pub unit: String,
+    pub switch: bool,
+}
+
+/// WY-SET: how the section heads are drawn: above the card in capitals (the pages "KI" and "Wer hat was
+/// gemacht"), as a card's title inside it (the settings tabs), or as a search result's path inside it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Heads {
+    #[default]
+    Above,
+    Title,
+    Crumb,
+}
+
+/// WY-SET: a row's marks on the settings tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flag {
+    /// Its key differs from the default (a dot after the label).
+    pub changed: bool,
+    /// It offers "Zurücksetzen" (the list "Nur geänderte" and the search).
+    pub reset: bool,
+}
+
+/// DESK-LEFT: the Programme group's last row, the way to programme/hinzufuegen (a key settingsd never has: it only
+/// names the row, so `einstellungen/programme/hinzufuegen` scrolls to it).
+pub const ADD_LINK_KEY: &str = "pkg.hinzufuegen";
+pub const LINK_TEXT: &str = "Öffnen";
+
+pub fn add_programs_row() -> Row {
+    Row {
+        key: ADD_LINK_KEY.into(),
+        kind: Kind::Link("programme/hinzufuegen".into()),
+        default: String::new(),
+        label: "Programme hinzufügen".into(),
+        short: "Programme hinzufügen".into(),
+        note: String::new(),
+        confirm: false,
+        stack: false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +103,9 @@ pub struct Row {
     pub note: String,
     /// settingsd's safety class `confirm`: a change goes through the page's own dialog first (WY-10).
     pub confirm: bool,
+    /// The controls go under the label, so the sentence under it has the row's whole width (a refusal that
+    /// says what to do must not be cut).
+    pub stack: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +120,11 @@ pub enum Section {
 pub struct Model {
     pub rows: Vec<Row>,
     pub sections: Vec<Section>,
+    /// WY-SET: the heads' look, one mark per row (empty: none), and the narrowest column two columns may have
+    /// (0: `page_layout::COL_MIN`).
+    pub heads: Heads,
+    pub flags: Vec<Flag>,
+    pub col_min: i32,
 }
 
 pub const FAVOURITES: &str = "desktop.favourites";
@@ -91,6 +164,10 @@ pub fn prefix_of(path: &str) -> String {
         "aussehen" => "theme",
         "aufbau" => "theme.layout",
         "favoriten" => FAVOURITES,
+        // PK-7a: bitspkgd's keys (sources, CPU level, space, updates; plan/spec/program-library.md section 4).
+        "programme" => "pkg",
+        // WY-SET: a tab without a namespace of its own names no key: the tab's top.
+        "schreibtisch" | "ton" | "netz" | "assistent" | "sicherungen" | "system" if rest.is_empty() => "",
         w => w,
     };
     let mut out = head.to_string();
@@ -107,7 +184,9 @@ pub fn address_of_key(key: &str) -> String {
     if key == FAVOURITES {
         return "einstellungen/favoriten".into();
     }
-    let (head, rest) = if let Some(r) = key.strip_prefix("theme.layout.") {
+    let (head, rest) = if let Some(r) = key.strip_prefix("pkg.") {
+        ("einstellungen/programme", r)
+    } else if let Some(r) = key.strip_prefix("theme.layout.") {
         ("einstellungen/aufbau", r)
     } else if let Some(r) = key.strip_prefix("theme.") {
         ("einstellungen/aussehen", r)
@@ -141,6 +220,25 @@ pub enum Part {
     /// The buttons of the page's confirmation dialog (`page_confirm`).
     DialogCancel,
     DialogOk,
+    /// PK-7a: a control of the "Programme" page (`programme_view`).
+    Prog(crate::programme_view::ProgPart),
+    /// CL-5: pill `o` of a `Pills` row, button `o` of a `Buttons` row (0 of a `Secret` row: its "Löschen").
+    Pill(usize, usize),
+    Button(usize, usize),
+    /// DESK-LEFT: the "Öffnen" of a `Link` row.
+    Link(usize),
+    /// SYS-A: a control of the program "System" (`sys_view`).
+    Sys(crate::sys_view::SysPart),
+    /// WY-SET: the settings' rail: tab `i`, the search field and its ×, "Zeigen" of the changed keys; the head's
+    /// filter (false: Alle, true: Nur geänderte); a card's "Mehr"; a row's "Zurücksetzen"; key `k` of a Subs row.
+    Tab(usize),
+    Search,
+    SearchClear,
+    Changed,
+    Filter(bool),
+    Fold(usize),
+    Reset(usize),
+    Sub(usize, usize),
 }
 
 /// The name of `p` in `ctl hot` (scenarios click by it): `choice=KEY=VALUE`, `switch=KEY`, `less=KEY` ...
@@ -166,6 +264,35 @@ pub fn part_name(rows: &[Row], p: Part) -> String {
         Part::Body => "body".into(),
         Part::DialogCancel => "dialog-cancel".into(),
         Part::DialogOk => "dialog-ok".into(),
+        // Named by the programme page itself (programme_view::part_name).
+        Part::Prog(_) => "programme".into(),
+        Part::Sys(p) => format!("system={}", crate::sys_view::part_name(p)),
+        Part::Pill(r, o) => match rows.get(r).map(|r| &r.kind) {
+            Some(Kind::Pills { opts, multi, .. }) => {
+                format!("{}={}={}", if *multi { "toggle" } else { "choice" }, key(r), opts.get(o).map_or("?", |o| o.0.as_str()))
+            }
+            _ => "pill".into(),
+        },
+        Part::Link(r) => match rows.get(r).map(|r| &r.kind) {
+            Some(Kind::Link(a)) => format!("link={a}"),
+            _ => "link".into(),
+        },
+        Part::Tab(i) => format!("tab={}", crate::page_tabs::TABS.get(i).map_or("?", |t| t.word)),
+        Part::Search => "search".into(),
+        Part::SearchClear => "search-clear".into(),
+        Part::Changed => "changed".into(),
+        Part::Filter(on) => format!("filter={}", if on { "geaendert" } else { "alle" }),
+        Part::Fold(r) => format!("fold={}", key(r).strip_prefix(crate::page_tabs::FOLD).unwrap_or("?")),
+        Part::Reset(r) => format!("reset={}", key(r)),
+        Part::Sub(r, k) => match rows.get(r).map(|r| &r.kind) {
+            Some(Kind::Subs(s)) => format!("sub={}", s.get(k).map_or("?", |s| s.key.as_str())),
+            _ => "sub".into(),
+        },
+        Part::Button(r, o) => match rows.get(r).map(|r| &r.kind) {
+            Some(Kind::Buttons(b)) => format!("button={}={}", key(r), b.get(o).map_or("?", |b| b.0.as_str())),
+            Some(Kind::Secret { .. }) => format!("button={}=clear", key(r)),
+            _ => "button".into(),
+        },
     }
 }
 
@@ -199,6 +326,11 @@ pub struct Layout {
     pub parts: Vec<(Part, Rect)>,
     /// The page's full height (for the scroll limit).
     pub total: i32,
+    /// WY-SET: per row, the room left of its controls for its "Zurücksetzen" (empty: none anywhere).
+    pub extra: Vec<i32>,
+    /// WY-SET: how the heads are drawn, and the settings' rail left of the page (None: no rail).
+    pub heads_look: Heads,
+    pub rail: Option<crate::page_rail::Rail>,
 }
 
 pub const ROW_H: i32 = 68;
@@ -213,12 +345,14 @@ pub const NUM_W: i32 = 84;
 /// The width of a value without a control.
 pub const VALUE_W: i32 = 260;
 pub const UNDO_W: i32 = 150;
-const HEAD_H: i32 = 18;
+/// SELFOPT-1: a history chart's width.
+pub const CHART_W: i32 = 300;
+pub(crate) const HEAD_H: i32 = 18;
 /// The fixed head of the page.
 pub const HEAD_AREA: i32 = 136;
-const MAX_W: i32 = 920;
+pub(crate) const MAX_W: i32 = 920;
 /// Below this content width the controls go under their label.
-const NARROW: i32 = 640;
+pub(crate) const NARROW: i32 = 640;
 /// Controls go under the label also when they would leave it less than this, or less than its text needs
 /// (estimated: LABEL_CHAR per character of the 15 px label font; the layout knows no font).
 const MIN_LABEL: i32 = 240;
@@ -226,21 +360,43 @@ const LABEL_CHAR: i32 = 8;
 /// Gap between lines of wrapped choices.
 const LINE_GAP: i32 = 8;
 
-/// Choices per line in width `avail` (at least one).
-fn per_line(avail: i32) -> usize {
-    (avail.saturating_add(4) / (OPT_W + 4)).max(1) as usize
+/// The width of a choice's pills: the longest name's (at least OPT_W).
+fn choice_w(opts: &[(String, String)]) -> i32 {
+    pill_w(opts.iter().map(|(_, n)| n.as_str()))
+}
+
+fn per_line_of(avail: i32, w: i32) -> usize {
+    (avail.saturating_add(4) / (w.max(1) + 4)).max(1) as usize
+}
+
+/// WY-SET: the width of a Subs row's chip, of a row's "Zurücksetzen" and the height of a "Mehr" line.
+pub const SUB_W: i32 = 190;
+pub const RESET_W: i32 = 130;
+pub const FOLD_H: i32 = 52;
+
+/// CL-5: the width of a secret's field and of a button with `text` (estimated like the labels).
+pub const SECRET_W: i32 = 150;
+pub fn button_w(text: &str) -> i32 {
+    ((text.chars().count() as i32) * 9 + 36).clamp(96, 260)
+}
+
+/// CL-5: the width of pills that hold the longest of `names`.
+pub fn pill_w<'a>(names: impl Iterator<Item = &'a str>) -> i32 {
+    (names.map(|n| n.chars().count() as i32).max().unwrap_or(0) * 9 + 32).clamp(OPT_W, 260)
 }
 
 /// Controls of `row` (number `r`) placed from `x` at `y` within width `avail` (logical pixels). Choices wrap.
-fn controls(row: &Row, r: usize, x: i32, y: i32, avail: i32) -> Vec<(Part, Rect)> {
+pub(crate) fn controls(row: &Row, r: usize, x: i32, y: i32, avail: i32) -> Vec<(Part, Rect)> {
     let at = |dx: i32, w: i32| Rect { x: x + dx, y, w, h: CTL_H };
     match &row.kind {
         Kind::Choice(opts) => {
-            let n = per_line(avail);
+            // WY-SET: pills as wide as the longest name needs ("Tiefe Schlafzustände" was cut at 112).
+            let w = choice_w(opts).min(avail);
+            let n = per_line_of(avail, w);
             (0..opts.len())
                 .map(|o| {
                     let (line, col) = ((o / n) as i32, (o % n) as i32);
-                    (Part::Choice(r, o), Rect { x: x + col * (OPT_W + 4), y: y + line * (CTL_H + LINE_GAP), w: OPT_W, h: CTL_H })
+                    (Part::Choice(r, o), Rect { x: x + col * (w + 4), y: y + line * (CTL_H + LINE_GAP), w, h: CTL_H })
                 })
                 .collect()
         }
@@ -264,7 +420,43 @@ fn controls(row: &Row, r: usize, x: i32, y: i32, avail: i32) -> Vec<(Part, Rect)
         Kind::Switch => vec![(Part::Switch(r), Rect { x, y: y + 4, w: 52, h: 28 })],
         Kind::Field { colour: true, .. } => vec![(Part::Field(r), at(SWATCH + 8, HEX_W))],
         Kind::Field { colour: false, .. } => vec![(Part::Field(r), at(0, FIELD_W.min(avail)))],
-        Kind::Fixed(_) => Vec::new(),
+        Kind::Fixed(_) | Kind::Chart | Kind::Fold { .. } => Vec::new(),
+        Kind::Subs(subs) => {
+            let n = per_line_of(avail, SUB_W);
+            (0..subs.len())
+                .map(|k| {
+                    let (line, col) = ((k / n) as i32, (k % n) as i32);
+                    (Part::Sub(r, k), Rect { x: x + col * (SUB_W + 8), y: y + line * (CTL_H + LINE_GAP), w: SUB_W.min(avail), h: CTL_H })
+                })
+                .collect()
+        }
+        Kind::Pills { opts, w, notes, .. } => {
+            let n = if notes.is_empty() { per_line_of(avail, *w) } else { 1 };
+            (0..opts.len())
+                .map(|o| {
+                    let (line, col) = ((o / n) as i32, (o % n) as i32);
+                    (Part::Pill(r, o), Rect { x: x + col * (w + 4), y: y + line * (CTL_H + LINE_GAP), w: (*w).min(avail), h: CTL_H })
+                })
+                .collect()
+        }
+        Kind::Secret { clear } => {
+            let mut v = vec![(Part::Field(r), at(0, SECRET_W.min(avail)))];
+            if *clear {
+                v.push((Part::Button(r, 0), at(SECRET_W + 8, button_w("Löschen"))));
+            }
+            v
+        }
+        Kind::Link(_) => vec![(Part::Link(r), at(0, button_w(LINK_TEXT)))],
+        Kind::Buttons(b) => {
+            let mut dx = 0;
+            let mut v = Vec::new();
+            for (o, (_, text)) in b.iter().enumerate() {
+                let w = button_w(text);
+                v.push((Part::Button(r, o), at(dx, w)));
+                dx += w + 8;
+            }
+            v
+        }
     }
 }
 
@@ -272,6 +464,8 @@ fn controls(row: &Row, r: usize, x: i32, y: i32, avail: i32) -> Vec<(Part, Rect)
 pub fn controls_width(row: &Row, avail: i32) -> i32 {
     match row.kind {
         Kind::Fixed(_) => VALUE_W.min(avail),
+        Kind::Chart => CHART_W.min(avail),
+        Kind::Fold { .. } => 0,
         _ => controls(row, 0, 0, 0, avail).iter().map(|(_, b)| b.x + b.w).max().unwrap_or(0),
     }
 }
@@ -279,99 +473,36 @@ pub fn controls_width(row: &Row, avail: i32) -> i32 {
 /// Lines of `row`'s controls in width `avail`.
 fn lines(row: &Row, avail: i32) -> i32 {
     match &row.kind {
-        Kind::Choice(o) if !o.is_empty() => o.len().div_ceil(per_line(avail)) as i32,
+        Kind::Choice(o) if !o.is_empty() => o.len().div_ceil(per_line_of(avail, choice_w(o).min(avail))) as i32,
+        Kind::Pills { opts, notes, .. } if !notes.is_empty() => opts.len().max(1) as i32,
+        Kind::Pills { opts, w, .. } if !opts.is_empty() => opts.len().div_ceil(per_line_of(avail, *w)) as i32,
+        Kind::Subs(s) if !s.is_empty() => s.len().div_ceil(per_line_of(avail, SUB_W)) as i32,
         _ => 1,
     }
 }
 
 /// Where `row`'s controls start in its rect `b` of page width `w`: (x, y, avail); and the row's height.
 pub fn control_place(row: &Row, x: i32, y: i32, w: i32, narrow: bool) -> (i32, i32, i32, i32) {
-    let wide = controls_width(row, i32::MAX);
+    control_place_beside(row, x, y, w, narrow, 0)
+}
+
+/// `control_place` with `extra` logical pixels more beside the controls (a row's "Zurücksetzen" left of them).
+pub fn control_place_beside(row: &Row, x: i32, y: i32, w: i32, narrow: bool, extra: i32) -> (i32, i32, i32, i32) {
+    if let Kind::Fold { .. } = row.kind {
+        return (x + w - 20, y, 0, FOLD_H);
+    }
+    let wide = controls_width(row, i32::MAX) + extra;
     let label = (row.label.chars().count() as i32).saturating_mul(LABEL_CHAR).max(MIN_LABEL);
-    if !narrow && wide <= w - 64 - label {
-        (x + w - 20 - wide, y + (ROW_H - CTL_H) / 2, wide, ROW_H)
+    let noted = matches!(&row.kind, Kind::Pills { notes, .. } if !notes.is_empty());
+    if !narrow && !noted && !row.stack && wide <= w - 64 - label {
+        (x + w - 20 - wide + extra, y + (ROW_H - CTL_H) / 2, wide - extra, ROW_H)
     } else {
         let avail = (w - 40).max(1);
         (x + 20, y + 58, avail, ROW_H_NARROW + (lines(row, avail) - 1) * (CTL_H + LINE_GAP))
     }
 }
 
-/// The page of model `m` in content rectangle `c`, scrolled by `i.scroll` logical pixels.
-pub fn layout(c: Rect, m: &Model, i: &Inputs) -> Layout {
-    let pad = (c.w / 24).clamp(16, 40);
-    let w = (c.w - 2 * pad).clamp(200, MAX_W);
-    let x = c.x + pad;
-    let narrow = w < NARROW;
-    // The head (title, address, answer line, Rückgängig) stays; the rest scrolls below it.
-    let mut y = c.y + 24;
-    let title = Rect { x, y, w: w - UNDO_W - 12, h: 40 };
-    let undo = Rect { x: x + w - UNDO_W, y: y + 2, w: UNDO_W, h: CTL_H };
-    y += 46;
-    let sub = Rect { x, y, w, h: 18 };
-    y += 24;
-    let msg = Rect { x, y, w, h: 20 };
-    let head = Rect { x: c.x, y: c.y, w: c.w, h: HEAD_AREA };
-    let mut parts = Vec::new();
-    let mut y = c.y + HEAD_AREA + 16 - i.scroll;
-    let (mut heads, mut cards) = (Vec::new(), Vec::new());
-    let mut rows = vec![Rect::default(); m.rows.len()];
-    let mut last = vec![false; m.rows.len()];
-    let mut favs = Vec::new();
-    let mut fav_add_row = Rect::default();
-    for s in &m.sections {
-        match s {
-            Section::Rows(name, range) => {
-                let range = range.start.min(m.rows.len())..range.end.min(m.rows.len());
-                if range.is_empty() {
-                    continue;
-                }
-                heads.push((name.clone(), Rect { x, y, w, h: HEAD_H }));
-                y += HEAD_H + 10;
-                let top = y;
-                for r in range.clone() {
-                    let row = &m.rows[r];
-                    let (cx, cy, avail, h) = control_place(row, x, y, w, narrow);
-                    parts.extend(controls(row, r, cx, cy, avail));
-                    rows[r] = Rect { x, y, w, h };
-                    last[r] = r + 1 == range.end;
-                    y += h;
-                }
-                cards.push(Rect { x, y: top, w, h: y - top });
-                y += 28;
-            }
-            Section::Favourites => {
-                heads.push(("FAVORITEN".into(), Rect { x, y, w, h: HEAD_H }));
-                y += HEAD_H + 10;
-                let top = y;
-                for f in 0..i.favourites {
-                    let b = Rect { x, y, w, h: FAV_H };
-                    let bx = x + w - 16 - 32;
-                    parts.push((Part::FavRemove(f), Rect { x: bx, y: y + 8, w: 32, h: 32 }));
-                    if f > 0 {
-                        parts.push((Part::FavUp(f), Rect { x: bx - 36, y: y + 8, w: 32, h: 32 }));
-                    }
-                    favs.push(b);
-                    y += FAV_H;
-                }
-                fav_add_row = Rect { x, y, w, h: FAV_H + 12 };
-                let add_w = 130;
-                parts.push((Part::FavField, Rect { x: x + 16, y: y + 12, w: w - 32 - add_w - 8, h: CTL_H }));
-                parts.push((Part::FavAdd, Rect { x: x + w - 16 - add_w, y: y + 12, w: add_w, h: CTL_H }));
-                y += FAV_H + 12 + 12;
-                cards.push(Rect { x, y: top, w, h: y - top });
-                y += 28;
-            }
-        }
-    }
-    // Only what can be seen can be hit.
-    let below = c.y + HEAD_AREA;
-    parts.retain(|(_, b)| b.y >= below && b.y + b.h <= c.y + c.h);
-    if undo.y + undo.h <= c.y + c.h {
-        parts.insert(0, (Part::Undo, undo));
-    }
-    let total = y + i.scroll - c.y;
-    Layout { content: c, narrow, head, scrolled: i.scroll > 0, title, sub, msg, heads, cards, rows, last, favs, fav_add_row, parts, total }
-}
+pub use crate::page_layout::layout;
 
 impl Layout {
     pub fn hit(&self, x: f64, y: f64) -> Option<Part> {
@@ -411,7 +542,7 @@ impl Layout {
         rows.iter()
             .position(|r| hit(&r.key))
             .and_then(|i| self.rows.get(i).copied())
-            .or_else(|| hit(FAVOURITES).then(|| self.heads.iter().find(|(n, _)| n == "FAVORITEN").map(|(_, r)| *r)).flatten())
+            .or_else(|| hit(FAVOURITES).then(|| self.heads.iter().find(|(n, _)| n.eq_ignore_ascii_case("FAVORITEN")).map(|(_, r)| *r)).flatten())
     }
 
     /// The y (unscrolled, from the content's top) of the first row of `prefix`.

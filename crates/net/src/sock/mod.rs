@@ -2,8 +2,9 @@
 //! `Pollable` so read/write/poll/close work on them like on any file.
 //!
 //! - [`unix`]: AF_UNIX stream, datagram and seqpacket sockets with path and abstract names, socketpair,
-//!   SCM_RIGHTS (open files in flight, closed with the socket that holds them, cycles collected by [`unix_gc`])
-//!   and SCM_CREDENTIALS / SO_PEERCRED, with Linux 6.6's semantics (linux-6.6/net/unix/af_unix.c).
+//!   SCM_RIGHTS (open files in flight, closed with the socket that holds them, cycles collected by [`unix_gc`]),
+//!   SCM_CREDENTIALS, SCM_PIDFD, SCM_INQ and SO_PEERCRED, with Linux 7.3.1's semantics
+//!   (linux-7.3.1/net/unix/af_unix.c) except MSG_OOB, which is EOPNOTSUPP as with CONFIG_AF_UNIX_OOB off.
 //! - [`inet`]: AF_INET TCP and UDP on the kernel's smoltcp stack and its 127.0.0.1 loopback, with
 //!   `policy::check` at connect/bind/listen and a `ConnRecord` per connection (B3); AF_INET6 on the same
 //!   machinery (its `inet6` part: ::1 and v4-mapped peers, no IPv6 on the wire).
@@ -22,6 +23,7 @@
 //! address (the VFS `File` trait has no downcast; change request to FS).
 
 pub mod abi;
+pub mod access;
 pub mod addr;
 pub mod cmsg;
 pub mod devioctl;
@@ -40,6 +42,7 @@ use abi::*;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use ksync::{RwSpinLock, WaitQueue};
 use uapi::errno::*;
@@ -59,6 +62,22 @@ pub struct Caller {
     /// The real, effective and saved uid and gid (kernel ids) that `scm_check_creds` accepts as the sender's
     /// own; `Caller::new` gives all three as `uid`/`gid`, the namespace hook the process's own.
     pub cred: CredIds,
+    /// The caller's program image, filled only for the calls that record it in an AF_UNIX socket (connect,
+    /// listen, socketpair: `sys::connect_by` and its like); None for every other call and for the kernel itself.
+    pub program: Option<Arc<Program>>,
+}
+
+/// The program image behind a socket's peer credentials, taken with them (INT-CL3T; CL-S CR 2, MC-L CR 2).
+/// The pid of SO_PEERCRED says who called connect only until that process execs or ends and its number goes
+/// to another; this says which program made the call, whatever the pid runs by the time anyone looks. Linux
+/// keeps the connecting task's security label the same way (`security_unix_stream_connect`, read back with
+/// SO_PEERSEC); BitsOS's label names the program.
+pub struct Program {
+    /// SO_PEERSEC's answer, without the closing NUL (the process layer writes it: `proc::peer`).
+    pub label: Vec<u8>,
+    /// The image itself (proc's `Process`), for the kernel's own listeners to compare. Weak: a socket must
+    /// not keep a program's image alive, nor close a cycle through the image's own fd table.
+    pub image: Weak<dyn Any + Send + Sync>,
 }
 
 /// Real, effective and saved ids, in this order (kernel numbers).
@@ -106,7 +125,7 @@ pub mod cap {
 impl Caller {
     /// A caller in the initial namespaces (root is uid 0).
     pub const fn new(pid: u32, uid: u32, gid: u32, subject: policy::Subject) -> Caller {
-        Caller { pid, uid, gid, subject, net: None, ids: None, cred: CredIds { uid: [uid; 3], gid: [gid; 3] } }
+        Caller { pid, uid, gid, subject, net: None, ids: None, cred: CredIds { uid: [uid; 3], gid: [gid; 3] }, program: None }
     }
 
     /// The kernel itself (pid 0, root, the initial namespaces).
@@ -161,7 +180,12 @@ impl PartialEq for Caller {
             (Some(a), Some(b)) => core::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
             _ => false,
         };
-        self.pid == o.pid && self.uid == o.uid && self.gid == o.gid && self.subject == o.subject && self.cred == o.cred && crate::netns::same(&self.net, &o.net) && ids
+        let program = match (&self.program, &o.program) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        self.pid == o.pid && self.uid == o.uid && self.gid == o.gid && self.subject == o.subject && self.cred == o.cred && crate::netns::same(&self.net, &o.net) && ids && program
     }
 }
 
@@ -177,6 +201,7 @@ impl core::fmt::Debug for Caller {
             .field("net", &self.net)
             .field("ids", &self.ids.is_some())
             .field("cred", &self.cred)
+            .field("program", &self.program.is_some())
             .finish()
     }
 }
@@ -229,6 +254,54 @@ pub(crate) fn sigpipe() {
 
 pub(crate) fn pid_exists(pid: u32) -> bool {
     HOOKS.get().map_or(true, |h| (h.pid_exists)(pid))
+}
+
+/// L7-NET: the sender's process as a message holds it for SCM_PIDFD (Linux: the `struct pid` reference that
+/// `unix_maybe_add_creds` and `__scm_send` take at send): proc's thread group, opaque to net.
+pub type PinnedPid = Arc<dyn core::any::Any + Send + Sync>;
+
+/// L7-NET: how SCM_PIDFD names the sender (proc owns pidfds), installed by the syscall glue beside `Hooks`.
+/// The process is held from the send on, so a pid that ends and is reused before the receive never gives a
+/// pidfd of another process (dbus-broker and polkit check peers by it).
+pub struct PidfdHook {
+    /// At send (`get_pid`, `find_get_pid`): the process with this kernel pid, None when there is none. Called
+    /// with no socket lock held; nearly always the caller itself.
+    pub pin: fn(u32) -> Option<PinnedPid>,
+    /// At receive (`pidfd_prepare(pid, PIDFD_STALE)`, linux-7.3.1/net/core/scm.c:510): a pidfd of the held
+    /// process, also when it has ended or was reaped since; else the errno a program finds instead of an fd.
+    pub open: fn(&PinnedPid) -> Result<Arc<vfs::OpenFile>, Errno>,
+}
+
+static PIDFD_HOOK: ksync::OnceRef<PidfdHook> = ksync::OnceRef::new();
+
+pub fn set_pidfd_hook(h: &'static PidfdHook) {
+    PIDFD_HOOK.set(h);
+}
+
+pub(crate) fn pidfd_hooked() -> bool {
+    PIDFD_HOOK.get().is_some()
+}
+
+pub(crate) fn pin_pid(pid: u32) -> Option<PinnedPid> {
+    PIDFD_HOOK.get().and_then(|h| (h.pin)(pid))
+}
+
+/// SCM_PIDFD's fd; a sender that could not be held (no hook, or gone before its send finished) is ESRCH, as
+/// for a pid that is gone.
+pub(crate) fn pidfd_of(p: Option<&PinnedPid>) -> Result<Arc<vfs::OpenFile>, Errno> {
+    match (PIDFD_HOOK.get(), p) {
+        (Some(h), Some(p)) => (h.open)(p),
+        _ => Err(ESRCH),
+    }
+}
+
+/// What SCM_PIDFD has to go on for one received message.
+pub enum ScmPid {
+    /// The message carries no credentials (`!scm->pid`): no SCM_PIDFD.
+    Nobody,
+    /// It carries a pid whose process was not held: ESRCH in place of the fd.
+    Unheld,
+    Held(PinnedPid),
 }
 
 /// The calling program, or the kernel itself (pid 0, root).
@@ -294,7 +367,7 @@ pub(crate) fn now() -> u64 {
 }
 
 /// A blocking call looks at the kill flag at least this often.
-const SLICE_NS: u64 = 50_000_000;
+pub(crate) const SLICE_NS: u64 = 50_000_000;
 
 /// How long a blocking call may wait: `None` without end, `Some(0)` not at all.
 #[derive(Clone, Copy, Debug)]
@@ -341,7 +414,7 @@ pub(crate) fn wait(wq: &WaitQueue, dl: Deadline, mut ready: impl FnMut() -> bool
 }
 
 /// NW-7 fixer: a waiter's memory of its connection's change counter (`Conn::change_seq`). Every AF_INET waiter
-/// sleeps on the one `inet::READY` (Linux: on the socket's own wait queue, linux-6.6/net/core/sock.c:3315
+/// sleeps on the one `inet::READY` (Linux: on the socket's own wait queue, linux-7.3.1/net/core/sock.c:3659
 /// `sock_def_readable`), so each wake meant for another socket would make every waiter take the card's lock to
 /// look: the thundering herd NW-7 removed for kernel connections. While the counter stands still the look is
 /// skipped, except once per `SLICE_NS` (B4: a change nobody reported is still seen).
@@ -419,6 +492,17 @@ pub mod flag {
     pub const RCVTSTAMP: u32 = 4096;
     pub const RCVTSTAMPNS: u32 = 8192;
     pub const TSTAMP_NEW: u32 = 16384;
+    /// L7-NET: SO_PASSSEC, SO_PASSPIDFD (`sk_scm_security`, `sk_scm_pidfd`); SO_PASSRIGHTS 0 (`sk_scm_rights`
+    /// is 1 on a new AF_UNIX socket, so the bit stores its opposite); AF_UNIX's SO_INQ and SO_RIGHTS_NOTRUNC
+    /// (`recvmsg_inq`, `scm_rights_notrunc`).
+    pub const PASSSEC: u32 = 1 << 15;
+    pub const PASSPIDFD: u32 = 1 << 16;
+    pub const NO_RIGHTS: u32 = 1 << 17;
+    pub const INQ: u32 = 1 << 18;
+    pub const RIGHTS_NOTRUNC: u32 = 1 << 19;
+    /// What a connection on an AF_UNIX listener takes from it (`sk_scm_recv_flags`, `scm_rights_notrunc`,
+    /// linux-7.3.1/net/unix/af_unix.c:1750-1755).
+    pub const UNIX_INHERITED: u32 = PASSCRED | PASSSEC | PASSPIDFD | NO_RIGHTS | RIGHTS_NOTRUNC;
 }
 
 impl Opts {
@@ -453,8 +537,8 @@ impl Opts {
     pub fn rcvbuf(&self) -> usize {
         self.rcvbuf.load(Ordering::Relaxed) as usize
     }
-    /// What `accept` copies from the listener (Linux clones the listening sock for TCP; AF_UNIX inherits only
-    /// SO_PASSCRED, `unix_sock_inherit_flags`).
+    /// What `accept` copies from the listener (Linux clones the listening sock for TCP; AF_UNIX connections
+    /// take only `flag::UNIX_INHERITED`, when they are made).
     pub fn copy_from(&self, o: &Opts) {
         for (a, b) in [(&self.sndbuf, &o.sndbuf), (&self.rcvbuf, &o.rcvbuf), (&self.rcvlowat, &o.rcvlowat), (&self.priority, &o.priority), (&self.busy_poll, &o.busy_poll), (&self.bound_dev, &o.bound_dev)] {
             a.store(b.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -557,6 +641,12 @@ impl SockFile {
             Kind::Inet(i) => i.net(),
             Kind::Netlink(n) => n.net(),
         }
+    }
+
+    /// `sk_may_scm_recv` (linux-7.3.1/include/net/sock.h:2996): the families whose messages can carry
+    /// credentials and labels (AF_UNIX, AF_NETLINK; V2 has no Bluetooth).
+    pub(crate) fn may_scm_recv(&self) -> bool {
+        matches!(self.kind, Kind::Unix(_) | Kind::Netlink(_))
     }
 
     pub fn unix(&self) -> Option<&Arc<unix::UnixSock>> {
@@ -681,8 +771,8 @@ impl File for SockFile {
             Kind::Netlink(n) => n.send(&mut src, buf.len(), 0, nonblock, None, &current(), None),
         }
     }
-    /// `sock_ioctl` and the protocols' ioctls (linux-6.6/net/socket.c:1247, net/unix/af_unix.c:3017,
-    /// net/ipv4/tcp.c:604, net/ipv4/udp.c:1666). FIONBIO, FIOCLEX and FIOASYNC are the fd layer's (AB). The
+    /// `sock_ioctl` and the protocols' ioctls (linux-7.3.1/net/socket.c:1352, net/unix/af_unix.c:3299,
+    /// net/ipv4/tcp.c:639, net/ipv4/udp.c:1923). FIONBIO, FIOCLEX and FIOASYNC are the fd layer's (AB). The
     /// interface ioctls (SIOCGIF*, SIOCGIFCONF, the 0x89xx device range) read and write the program's `ifreq`
     /// and are `sys::dev_ioctl`'s (NW-6; the ioctl syscall asks it first). SIOCSPGRP/FIOSETOWN need the int the
     /// program passes and the fd's owner (AB change request), so they stay ENOTTY here.
@@ -764,6 +854,13 @@ pub struct Received {
     pub from: Option<Vec<u8>>,
     /// SCM_CREDENTIALS for a receiver with SO_PASSCRED.
     pub creds: Option<Ucred>,
+    /// SCM_PIDFD for an AF_UNIX receiver with SO_PASSPIDFD: the sender as the message holds it.
+    pub pidfd: Option<ScmPid>,
+    /// The receiver has SO_PASSSEC: no SCM_SECURITY follows (no security module gives a label, as on CachyOS),
+    /// but a recvmsg without control space is told MSG_CTRUNC (`scm_has_secdata`).
+    pub sec: bool,
+    /// SCM_INQ for an AF_UNIX stream receiver with SO_INQ: the bytes still queued after this read.
+    pub inq: Option<u32>,
     /// SCM_RIGHTS: open files to install.
     pub fds: Vec<Arc<vfs::OpenFile>>,
     /// NETLINK_PKTINFO: the group a netlink datagram was sent to (0 for unicast).
@@ -807,3 +904,5 @@ mod tests_inet6;
 mod tests_netlink;
 #[cfg(test)]
 mod tests_netns;
+#[cfg(test)]
+mod tests_l7;

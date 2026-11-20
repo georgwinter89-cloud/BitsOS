@@ -1,0 +1,18 @@
+{
+  "note": "CX-3 replay (DESIGN 11.4): three sessions in which Georg searches 'Steuer' and opens steuer-12 and then steuer-07 together; a recipe he opens after the same search ten times; then all learning forgotten. Paths are relative to the root (host/cx-eval/docs).",
+  "steps": [
+    {"report": "Steuer", "label": "kalt", "n": 20},
+    {"search": "Steuer"}, {"wait_s": 20}, {"open": "steuer-12.md"}, {"wait_s": 40}, {"open": "steuer-07.txt"}, {"wait_s": 1800},
+    {"search": "Steuer"}, {"wait_s": 15}, {"open": "steuer-12.md"}, {"wait_s": 30}, {"open": "steuer-07.txt"}, {"wait_s": 86400},
+    {"search": "Steuer"}, {"wait_s": 25}, {"open": "steuer-12.md"}, {"wait_s": 50}, {"open": "steuer-07.txt"}, {"wait_s": 3600},
+    {"report": "Steuer", "label": "nach drei Sitzungen", "n": 20},
+    {"search": "Steuer"}, {"wait_s": 5}, {"open": "rezept-01.md"}, {"open": "rezept-01.md"}, {"open": "rezept-01.md"},
+    {"open": "rezept-01.md"}, {"open": "rezept-01.md"}, {"open": "rezept-01.md"}, {"open": "rezept-01.md"},
+    {"open": "rezept-01.md"}, {"open": "rezept-01.md"}, {"open": "rezept-01.md"}, {"wait_s": 3600},
+    {"report": "Steuer", "label": "Rezept oft geöffnet", "n": 40},
+    {"wait_days": 180},
+    {"report": "Steuer", "label": "nach 180 Tagen", "n": 20},
+    {"forget": "usage"},
+    {"report": "Steuer", "label": "vergessen", "n": 20}
+  ]
+}

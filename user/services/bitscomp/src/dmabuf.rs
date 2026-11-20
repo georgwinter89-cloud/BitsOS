@@ -1,10 +1,9 @@
-//! WY-16 (gx-scout-mesa.md step C2): client dma-bufs. zwp_linux_dmabuf_v1 version 4 with a default feedback
-//! whose main device is the render node for a GPU renderer (226:128, what Mesa's WSI compares with its own node's
-//! rdev, gx-scout-uapi.md §6) and none (0:0) for a renderer reading by CPU (`advertised`), and whose one tranche lists
-//! the renderer's formats, LINEAR first (`table`). Pixman imports a LINEAR buffer by mmap (DR-5's dma-buf mmap);
-//! GLES through an EGL image. Every import is checked by the renderer before the client gets its wl_buffer
-//! (`Composer::dmabuf_turn`), so a buffer the renderer cannot read (a non-linear modifier under Pixman, a bad
-//! stride) is `failed`, never a crash at draw time.
+//! WY-16: client dma-bufs. zwp_linux_dmabuf_v1 version 4 with a default feedback whose main device is the render node
+//! bitscomp draws on (226:128, what Mesa's WSI compares with its own node's rdev: a client on the same GPU shares its
+//! VRAM images), and whose one tranche lists the renderer's formats, LINEAR first (`table`). GLES imports them through
+//! an EGL image. Every import is checked by the renderer before the client gets its wl_buffer
+//! (`Composer::dmabuf_turn`), so a buffer the renderer cannot read (a bad stride, a format EGL refuses) is `failed`,
+//! never a crash at draw time.
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Format, Fourcc, Modifier};
@@ -17,8 +16,8 @@ use crate::state::App;
 
 /// The render node clients render on; its char device is the feedback's main device.
 pub const RENDER_NODE: &str = "/dev/dri/renderD128";
-/// 226:128, the render node's number on Linux and on V2 (DR-2), used when the node is missing (no GPU driver
-/// yet, the Mini-PC with drm=auto): a client's own node is then the same number or there is none.
+/// 226:128, the render node's number on Linux and on V2 (DR-2), answered when no node is there (only the host
+/// tests: bitscomp itself ends without a node, `mesa::gpu_or_why`).
 pub const RENDER_RDEV: (u32, u32) = (226, 128);
 
 pub struct Dma {
@@ -36,16 +35,9 @@ pub struct Dma {
     /// Buffers (and release points) replaced by a commit, given back after the frame (`release`).
     pub hold: crate::release::Hold,
     pub sync: Option<crate::syncobj::Syncobj>,
-    /// The renderer needs every plane mappable (`probe`).
-    pub map_probe: bool,
     /// The last frame's GPU work had not finished within the renderer's wait (`CompRenderer::gpu_idle`): held
     /// buffers stay held until it has.
     pub gpu_busy: bool,
-    /// `--main-device render`: `advertised` names the render node under a CPU-reading renderer too.
-    pub main_render: bool,
-    /// WY-3b: what `init` found, for Xwayland's glamor: the main device named (0: none) and how the renderer reads.
-    pub main_device: u64,
-    pub reads_by_cpu: bool,
 }
 
 impl Dma {
@@ -59,16 +51,12 @@ impl Dma {
             cleanup_due: false,
             hold: Default::default(),
             sync: None,
-            map_probe: false,
             gpu_busy: false,
-            main_render: false,
-            main_device: 0,
-            reads_by_cpu: true,
         }
     }
 }
 
-/// The feedback's format table: LINEAR first (every client and Pixman can use it, and Mesa's WSI takes the first
+/// The feedback's format table: LINEAR first (every client can use it, and Mesa's WSI takes the first
 /// usable entry it can render), then explicit modifiers, then the implicit one (`Modifier::Invalid`); within each
 /// group XRGB8888 and ARGB8888 first, then by fourcc and modifier, so the table is the same every start.
 pub fn table(formats: impl IntoIterator<Item = Format>) -> Vec<Format> {
@@ -109,29 +97,6 @@ pub fn render_device() -> (u64, Option<String>) {
     (libc::makedev(RENDER_RDEV.0, RENDER_RDEV.1), None)
 }
 
-/// The main device the default feedback names (WY-17b, CR-GM1d-2 way b). A renderer reading by CPU (Pixman, llvmpipe's
-/// GLES) can only map a buffer in memory the CPU may touch, and RADV's swapchain images on the same GPU are VRAM with
-/// NO_CPU_ACCESS: mapping them is EPERM, as on Linux, and every Vulkan window would fail. So such a renderer names no
-/// device, 0:0: Mesa's WSI then finds no same_gpu (wsi_common_wayland.c, display->same_gpu; 0 also means "not
-/// advertised" to its pick_format_from_surface_dmabuf_feedback) and hands over a linear copy in GTT
-/// (wsi_common_drm.c, prime_select_buffer_memory_type refuses DEVICE_LOCAL), which maps. `render_node` (`--main-device
-/// render`) names the node anyway, for a test of a client's path that needs it.
-pub fn advertised(reads_by_cpu: bool, render_node: bool, rdev: u64) -> u64 {
-    if reads_by_cpu && !render_node { 0 } else { rdev }
-}
-
-/// Whether a GL renderer string means a software rasteriser, which reads client buffers by CPU like Pixman.
-#[cfg(any(test, feature = "gpu"))]
-pub fn software_gl(gl: &str) -> bool {
-    ["llvmpipe", "softpipe", "swrast"].iter().any(|n| gl.contains(n))
-}
-
-/// What a CPU reader (llvmpipe's mmap import) can take: one-plane formats of known pixel size, LINEAR or implicit.
-pub fn cpu_readable(f: Format) -> bool {
-    let one = Plane { offset: 0, stride: u32::MAX, size: u64::MAX };
-    check_layout(&[one], 1, 1, f, true).is_ok()
-}
-
 pub fn fourcc_name(f: Format) -> String {
     let code = (f.code as u32).to_le_bytes();
     let name: String = code.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' }).collect();
@@ -144,10 +109,11 @@ pub fn fourcc_name(f: Format) -> String {
     format!("{name}:{m}")
 }
 
-/// DMA_BUF_IOCTL_SYNC, _IOW('b', 0, struct dma_buf_sync { u64 flags }) (linux-6.6/include/uapi/linux/dma-buf.h:171).
+/// DMA_BUF_IOCTL_SYNC, _IOW('b', 0, struct dma_buf_sync { u64 flags })
+/// (linux-7.3.1/include/uapi/linux/dma-buf.h:172).
 const DMA_BUF_IOCTL_SYNC: u64 = 0x4008_6200;
 /// A flag outside DMA_BUF_SYNC_VALID_FLAGS_MASK: a dma-buf answers EINVAL before touching anything
-/// (linux-6.6/drivers/dma-buf/dma-buf.c:455-456, V2's crates/drm dma_buf.rs the same), any other file ENOTTY.
+/// (linux-7.3.1/drivers/dma-buf/dma-buf.c:555-556, V2's crates/drm dma_buf.rs the same), any other file ENOTTY.
 const SYNC_NO_SUCH_FLAG: u64 = 1 << 63;
 
 /// One plane as the client described it, and the size of its file.
@@ -158,13 +124,11 @@ pub struct Plane {
     pub size: u64,
 }
 
-/// The layout rules of `probe`, without files (unit-tested). Every plane starts inside its file. A LINEAR plane 0
-/// (and an implicit one a software renderer reads as linear, `cpu`) has rows of at least width x bytes per pixel,
-/// and all `height` rows fit the file: a shorter stride would let Pixman or llvmpipe read past the mapping (a
-/// SIGSEGV/SIGBUS of the compositor, Linux's framebuffer checks refuse it with EINVAL as well,
-/// linux-6.6/drivers/gpu/drm/drm_gem_framebuffer_helper.c:173-190). A renderer reading by CPU (`cpu`) takes only
-/// one-plane formats whose pixel size is known; a GPU import is checked further by its driver.
-pub fn check_layout(planes: &[Plane], w: u32, h: u32, f: Format, cpu: bool) -> Result<(), String> {
+/// The layout rules of `probe`, without files (unit-tested). Every plane starts inside its file. A LINEAR plane 0 has
+/// rows of at least width x bytes per pixel, and all `height` rows fit the file: a shorter stride would let the GPU
+/// read past the buffer (Linux's framebuffer checks refuse it with EINVAL as well,
+/// linux-7.3.1/drivers/gpu/drm/drm_gem_framebuffer_helper.c:186-196). The rest is checked by the driver at import.
+pub fn check_layout(planes: &[Plane], w: u32, h: u32, f: Format) -> Result<(), String> {
     use smithay::backend::allocator::format::get_bpp;
     if w == 0 || h == 0 || planes.is_empty() {
         return Err(format!("{w}x{h} with {} planes", planes.len()));
@@ -174,12 +138,7 @@ pub fn check_layout(planes: &[Plane], w: u32, h: u32, f: Format, cpu: bool) -> R
             return Err(format!("plane {i}: offset {} past the end ({} bytes)", p.offset, p.size));
         }
     }
-    let linear = f.modifier == Modifier::Linear || (cpu && f.modifier == Modifier::Invalid);
-    let bpp = get_bpp(f.code);
-    if cpu && (planes.len() != 1 || bpp.is_none() || !linear) {
-        return Err(format!("{} with {} planes: not readable by the CPU", fourcc_name(f), planes.len()));
-    }
-    let (Some(bpp), true) = (bpp, linear) else { return Ok(()) };
+    let (Some(bpp), true) = (get_bpp(f.code), f.modifier == Modifier::Linear) else { return Ok(()) };
     let p = planes[0];
     let row = u64::from(w).checked_mul(bpp as u64).map(|b| b.div_ceil(8)).ok_or("row size overflows")?;
     if u64::from(p.stride) < row {
@@ -195,10 +154,8 @@ pub fn check_layout(planes: &[Plane], w: u32, h: u32, f: Format, cpu: bool) -> R
 
 /// Checks a client's dma-buf before any renderer touches it: every plane fd is a dma-buf (a plain memfd or file
 /// could be truncated under the mapping, a SIGBUS of the compositor; a dma-buf keeps its size), then the layout
-/// (`check_layout`). With `map`, every plane must also map for reading: Mesa's llvmpipe imports by mmap and draws
-/// from a null mapping when that fails (a SIGSEGV of bitscomp, seen with a RADV buffer Linux refuses to map,
-/// NO_CPU_ACCESS), so a software GLES asks for it.
-pub fn probe(buf: &Dmabuf, map: bool) -> Result<(), String> {
+/// (`check_layout`).
+pub fn probe(buf: &Dmabuf) -> Result<(), String> {
     use smithay::backend::allocator::Buffer as _;
     use std::os::fd::AsRawFd;
     let mut planes = Vec::new();
@@ -220,14 +177,7 @@ pub fn probe(buf: &Dmabuf, map: bool) -> Result<(), String> {
         }
         planes.push(Plane { offset: off, stride, size: size as u64 });
     }
-    check_layout(&planes, buf.width(), buf.height(), buf.format(), map)?;
-    if map {
-        for i in 0..planes.len() {
-            buf.map_plane(i, smithay::backend::allocator::dmabuf::DmabufMappingMode::READ)
-                .map_err(|e| format!("plane {i} does not map: {e:?}"))?;
-        }
-    }
-    Ok(())
+    check_layout(&planes, buf.width(), buf.height(), buf.format())
 }
 
 /// Makes the dma-buf global (version 4, default feedback) for the renderer's formats, and the syncobj global
@@ -239,13 +189,12 @@ pub fn init(app: &mut App, comp: &dyn crate::render::Composer, handle: smithay::
     app.dma.sync = crate::syncobj::Syncobj::start(&app.dh.clone(), node.as_deref(), handle);
 }
 
-/// WY-21: another renderer took over (`main.rs` `leave_gpu`). The global stays; its default feedback and every
-/// surface's feedback say what the new renderer takes (main device, format table), so a client already bound hears it
+/// WY-21: a new renderer took over after a GPU reset (`main.rs` `leave_gpu`). The global stays; its default feedback and
+/// every surface's feedback say what the new renderer takes (main device, format table), so a client already bound hears it
 /// and allocates its next buffers to fit (Mesa's EGL and Vulkan WSI follow a feedback's `done`). A buffer made before
 /// it heard can still be refused by the new renderer: a `create_immed` that fails ends that client, as linux-dmabuf
 /// says. Without feedback (a version 3 global) the old global is hidden and a new one made.
 pub fn renew(app: &mut App, comp: &dyn crate::render::Composer) {
-    (app.dma.main_device, app.dma.reads_by_cpu) = (0, comp.reads_by_cpu());
     advertise_as(app, comp, true);
 }
 
@@ -269,19 +218,13 @@ fn tell_surfaces(app: &App, feedback: &smithay::wayland::dmabuf::DmabufFeedback)
 }
 
 fn advertise_as(app: &mut App, comp: &dyn crate::render::Composer, renew: bool) {
-    app.dma.map_probe = comp.maps_dmabufs();
-    // A renderer that reads by CPU gets only what `check_layout` lets through: no entry the client must fail on.
-    let cpu = app.dma.map_probe;
-    let all = comp.dmabuf_formats().into_iter().filter(|f| !cpu || cpu_readable(*f));
-    let (formats, renderer) = (table(all), comp.renderer());
+    let (formats, renderer) = (table(comp.dmabuf_formats()), comp.renderer());
     if formats.is_empty() {
         eprintln!("bitscomp: dmabuf: renderer {renderer} imports no dma-buf format: no zwp_linux_dmabuf_v1 (clients use wl_shm)");
         return;
     }
-    let (rdev, node) = render_device();
-    let dev = advertised(comp.reads_by_cpu(), app.dma.main_render, rdev);
-    (app.dma.main_device, app.dma.reads_by_cpu) = (dev, comp.reads_by_cpu());
-    let shown = if dev == 0 { "none" } else { node.as_deref().unwrap_or("no node") };
+    let (dev, node) = render_device();
+    let shown = node.as_deref().unwrap_or("no node");
     let dh: DisplayHandle = app.dh.clone();
     let names: Vec<String> = formats.iter().take(8).map(|f| fourcc_name(*f)).collect();
     let more = formats.len().saturating_sub(names.len());
@@ -319,9 +262,6 @@ fn advertise_as(app: &mut App, comp: &dyn crate::render::Composer, renew: bool) 
         names.join(" "),
         if more > 0 { format!(" and {more} more") } else { String::new() }
     );
-    if dev == 0 {
-        eprintln!("bitscomp: dmabuf: no main device: renderer {renderer} reads by CPU, a GPU client hands over a linear copy it can map");
-    }
 }
 
 impl App {
@@ -347,7 +287,7 @@ impl DmabufHandler for App {
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
         // Checked here, at once: a create_immed buffer that fails ends its client before any commit of it is read.
-        if let Err(e) = probe(&dmabuf, self.dma.map_probe) {
+        if let Err(e) = probe(&dmabuf) {
             self.stats.dmabuf_failed += 1;
             let n = self.stats.dmabuf_failed;
             if n <= 8 || n % 100 == 0 {
@@ -385,71 +325,36 @@ mod tests {
     }
 
     #[test]
-    fn pixman_table_is_linear_only_and_starts_with_xrgb() {
-        use smithay::backend::renderer::ImportDma;
-        let r = smithay::backend::renderer::pixman::PixmanRenderer::new().unwrap();
-        let t = table(r.dmabuf_formats());
-        assert!(!t.is_empty());
-        assert!(t.iter().all(|x| x.modifier == Modifier::Linear));
-        assert_eq!(t[0].code, Fourcc::Xrgb8888);
-        assert_eq!(t[1].code, Fourcc::Argb8888);
-    }
-
-    #[test]
     fn layouts_that_would_read_past_the_buffer_are_refused() {
         let xr = f(Fourcc::Xrgb8888, Modifier::Linear);
         let one = |offset, stride, size| [Plane { offset, stride, size }];
         // 64x4 XRGB8888: rows of 256 bytes.
-        assert!(check_layout(&one(0, 256, 1024), 64, 4, xr, false).is_ok());
-        assert!(check_layout(&one(0, 256, 1024), 64, 4, xr, true).is_ok());
-        assert!(check_layout(&one(0, 252, 4096), 64, 4, xr, false).is_err(), "stride a pixel short of a row");
-        assert!(check_layout(&one(0, 4, 16), 4096, 4, xr, false).is_err(), "the tiny-stride attack");
-        assert!(check_layout(&one(0, 256, 1023), 64, 4, xr, false).is_err(), "one byte short");
-        assert!(check_layout(&one(4096, 256, 4096), 64, 4, xr, false).is_err(), "rows past the end after the offset");
-        assert!(check_layout(&one(8192, 256, 4096), 64, 4, xr, false).is_err(), "offset past the end");
-        assert!(check_layout(&one(0, u32::MAX, u64::MAX), u32::MAX / 4, u32::MAX, xr, false).is_ok(), "no overflow");
-        assert!(check_layout(&one(0, u32::MAX, 1 << 40), u32::MAX / 4, u32::MAX, xr, false).is_err());
-        assert!(check_layout(&one(0, 256, 1024), 0, 4, xr, false).is_err(), "no width");
-        assert!(check_layout(&[], 64, 4, xr, false).is_err(), "no plane");
+        assert!(check_layout(&one(0, 256, 1024), 64, 4, xr).is_ok());
+        assert!(check_layout(&one(0, 252, 4096), 64, 4, xr).is_err(), "stride a pixel short of a row");
+        assert!(check_layout(&one(0, 4, 16), 4096, 4, xr).is_err(), "the tiny-stride attack");
+        assert!(check_layout(&one(0, 256, 1023), 64, 4, xr).is_err(), "one byte short");
+        assert!(check_layout(&one(4096, 256, 4096), 64, 4, xr).is_err(), "rows past the end after the offset");
+        assert!(check_layout(&one(8192, 256, 4096), 64, 4, xr).is_err(), "offset past the end");
+        assert!(check_layout(&one(0, u32::MAX, u64::MAX), u32::MAX / 4, u32::MAX, xr).is_ok(), "no overflow");
+        assert!(check_layout(&one(0, u32::MAX, 1 << 40), u32::MAX / 4, u32::MAX, xr).is_err());
+        assert!(check_layout(&one(0, 256, 1024), 0, 4, xr).is_err(), "no width");
+        assert!(check_layout(&[], 64, 4, xr).is_err(), "no plane");
     }
 
     #[test]
-    fn a_cpu_reader_takes_only_linear_single_plane_formats_of_known_size() {
+    fn tiled_and_many_plane_buffers_are_the_drivers_to_check() {
         let one = [Plane { offset: 0, stride: 256, size: 1 << 20 }];
-        let tiled = f(Fourcc::Xrgb8888, Modifier::from(0x0200_0000_0000_0001u64));
-        // A GPU import of a tiled buffer is its driver's to check; a CPU reader cannot read it.
-        assert!(check_layout(&one, 64, 4, tiled, false).is_ok());
-        assert!(check_layout(&one, 64, 4, tiled, true).is_err());
-        // Implicit is linear to llvmpipe, so its rows are checked like LINEAR ones.
-        let implicit = f(Fourcc::Xrgb8888, Modifier::Invalid);
-        assert!(check_layout(&one, 64, 4, implicit, true).is_ok());
-        assert!(check_layout(&[Plane { offset: 0, stride: 4, size: 1 << 20 }], 64, 4, implicit, true).is_err());
+        assert!(check_layout(&one, 64, 4, f(Fourcc::Xrgb8888, Modifier::from(0x0200_0000_0000_0001u64))).is_ok());
+        assert!(check_layout(&one, 64, 4, f(Fourcc::Xrgb8888, Modifier::Invalid)).is_ok());
         let two = [one[0], Plane { offset: 1024, stride: 256, size: 1 << 20 }];
-        assert!(check_layout(&two, 64, 4, f(Fourcc::Nv12, Modifier::Linear), true).is_err(), "two planes");
-        assert!(check_layout(&two, 64, 4, f(Fourcc::Nv12, Modifier::Linear), false).is_ok());
-        assert!(cpu_readable(f(Fourcc::Argb8888, Modifier::Linear)));
-        assert!(!cpu_readable(f(Fourcc::Nv12, Modifier::Linear)));
-        assert!(!cpu_readable(tiled));
+        assert!(check_layout(&two, 64, 4, f(Fourcc::Nv12, Modifier::Linear)).is_ok());
+        assert!(check_layout(&[Plane { offset: 4096, stride: 256, size: 1024 }], 64, 4, f(Fourcc::Nv12, Modifier::Linear)).is_err(), "a plane past its file");
     }
 
     #[test]
     fn the_sync_ioctl_number_is_linux_one() {
-        // _IOW('b', 0, struct dma_buf_sync), 8 bytes (linux-6.6/include/uapi/linux/dma-buf.h:171).
+        // _IOW('b', 0, struct dma_buf_sync), 8 bytes (linux-7.3.1/include/uapi/linux/dma-buf.h:172).
         assert_eq!(DMA_BUF_IOCTL_SYNC, (1 << 30) | (8 << 16) | ((b'b' as u64) << 8));
-    }
-
-    #[test]
-    fn only_a_gpu_renderer_names_a_main_device() {
-        let rdev = libc::makedev(226, 128);
-        // Pixman and llvmpipe's GLES: no device, whatever the machine has. RADV then makes a copy they can map.
-        assert_eq!(advertised(true, false, rdev), 0);
-        assert_eq!((libc::major(0), libc::minor(0)), (0, 0));
-        // GLES on the chip imports RADV's VRAM images itself.
-        assert_eq!(advertised(false, false, rdev), rdev);
-        assert_eq!(advertised(true, true, rdev), rdev);
-        // What decides for GLES: the renderer string, so llvmpipe counts as CPU and radeonsi names the node (WY-17).
-        assert_eq!(advertised(software_gl("Mesa / llvmpipe (LLVM 20.1.8, 256 bits)"), false, rdev), 0);
-        assert_eq!(advertised(software_gl("AMD / AMD Radeon 780M Graphics (radeonsi, phoenix, LLVM 20.1.8, DRM 3.57)"), false, rdev), rdev);
     }
 
     #[test]

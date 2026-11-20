@@ -3,8 +3,9 @@
 # in a real bootstrap tar, a real zip, a real provider tar), fake mount tables, a fake desktop and a fake /proc. --env (the pure
 # environment), --check and what it names, root's hand-over, the first and second start with their stages and exit code,
 # --status, one start at a time, the end after a signal, --stop; GM-2b: the stand-in over steamrt64/reaper, on the fake tree (a fake
-# stand-in: the real one has its own tests, user/ports/steam/reaper/tests); files/realpath; then steam_check.py against a stand-in
-# for the machine (host/tests/sx/steam_stand_in.py); GM-PROTON: PROTON_USE_WOW64=1 in the environment, --check's Proton lines.
+# stand-in: the real one has its own tests, user/ports/steam/reaper/tests); files/realpath; GM-PROTON: PROTON_USE_WOW64=1 in
+# the environment, --check's Proton lines.
+# GM-6s: a second start with one steam:// URL while the client runs goes to it (a fake steam.sh records it), bounded.
 # Host only, a few seconds; nothing of Steam runs (Georg 30.10.), no QEMU, no screen. Red when it cannot do its work.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -55,6 +56,16 @@ chmod 755 "$R/mesa/lib/ld-linux-x86-64.so.2"
 echo fake >"$T/dbus/dbus-daemon"
 echo fake >"$T/dbus/session.conf"
 cat >"$X/boot/steam.sh" <<'S'
+# GM-6s: the client's forward of a steam:// URL to a running Steam: records what it got, where (beside the tree), and ends.
+case "$*" in steam://*)
+  F=$PWD/..
+  echo "$*" >>"$F/fake-forwarded"
+  env | sort >"$F/fake-forward-env"
+  [ ! -e /proc/self/fd/9 ] || echo open >"$F/fake-forward-fd9"
+  # Hangs with a child of its own: the deadline must reach both (the forward's process group).
+  if [ -e "$F/fake-forward-hang" ]; then sleep 30 & echo $! >"$F/fake-forward-child"; wait; fi
+  exit "$(cat "$F/fake-forward-rc" 2>/dev/null || echo 0)" ;;
+esac
 if [ -e "$PWD/fake-hold" ]; then
   # A Steam that takes a moment to end, and says when it has.
   trap 'sleep 1; touch "$PWD/term-done"; exit 9' TERM
@@ -269,6 +280,41 @@ cp "$ST" "$R/stages.before"; cp "$R/user/steam/steam.log" "$R/log.before"; ls -l
 ARGS=; run
 check "a second start is refused and says who runs" '[ $rc = 1 ] && grep -q "already running (launcher $BG, .*stage=steam" "$R/out"'
 check "a second start changes nothing: stages, log, tree" 'cmp -s "$ST" "$R/stages.before" && cmp -s "$R/user/steam/steam.log" "$R/log.before" && { ls -lR "$RT" | cmp -s - "$R/tree.before"; } && [ "$(cat "$R/user/steam/lock")" = "$BG" ]'
+# GM-6s: one steam:// URL while Steam's client runs goes to it; anything else stays refused.
+U=steam://rungameid/32360
+FW=$RT/..
+SD=$R/data/home/1000/.steam
+# Steam's client as the forward sees it: a steam process, the FIFO ~/.steam/steam.pipe, a live pid in ~/.steam/steam.pid.
+client_up() { mkdir -p "$R/proc/4242" "$SD"; ln -sfn "$RT/steamrt64/steam" "$R/proc/4242/exe"; [ -p "$SD/steam.pipe" ] || "$BB" mkfifo "$SD/steam.pipe"; echo 4242 >"$SD/steam.pid"; }
+client_down() { rm -rf "$R/proc/4242" "$SD/steam.pipe" "$SD/steam.pid"; }
+unchanged() { [ ! -e "$FW/fake-forwarded" ] && cmp -s "$ST" "$R/stages.before" && cmp -s "$R/user/steam/steam.log" "$R/log.before"; }
+ARGS=$U; run SB_FORWARD_READY=1
+check "a URL before Steam's client runs waits (bounded), is not handed over, changes nothing" '[ $rc = 1 ] && grep -q "client does not run (yet): $U not handed over (waited 1 s)" "$R/out" && unchanged'
+mkdir -p "$R/proc/4242" "$SD"; ln -s "$RT/steamrt64/steam" "$R/proc/4242/exe"
+ARGS=$U; run SB_FORWARD_READY=0
+check "a steam process without its pipe (starting or ending) is not handed a URL" '[ $rc = 1 ] && grep -q "no pipe $SD/steam.pipe" "$R/out" && unchanged'
+"$BB" mkfifo "$SD/steam.pipe"; echo 999999 >"$SD/steam.pid"
+ARGS=$U; run SB_FORWARD_READY=0
+check "a stale pipe whose client has ended is not handed a URL" '[ $rc = 1 ] && grep -q "client 999999 of $SD/steam.pid has ended" "$R/out" && unchanged'
+rm -f "$SD/steam.pid"
+( sleep 0.6; echo 4242 >"$SD/steam.pid" ) &
+ARGS=$U; run SB_FORWARD_READY=10
+check "forward: a URL goes to the running client (its steam.sh), code 0" '[ $rc = 0 ] && [ "$(cat "$FW/fake-forwarded")" = "$U" ] && grep -q "stage forward $U to the running client" "$R/out"'
+check "forward: one stage line in the log, stages, lock and tree untouched" '[ "$(diff "$R/log.before" "$R/user/steam/steam.log" | grep -c "^> .*stage=forward $U to the running client (steam.sh)")" = 1 ] && [ "$(($(wc -l <"$R/user/steam/steam.log") - $(wc -l <"$R/log.before")))" = 1 ] && cmp -s "$ST" "$R/stages.before" && { ls -lR "$RT" | cmp -s - "$R/tree.before"; } && [ "$(cat "$R/user/steam/lock")" = "$BG" ]'
+check "forward: the launcher's environment, the desktop's bus, no lock fd" 'grep -qx "DISPLAY=:0" "$FW/fake-forward-env" && grep -qx "PROTON_USE_WOW64=1" "$FW/fake-forward-env" && grep -qx "DBUS_SESSION_BUS_ADDRESS=unix:path=$R/xdg/bus" "$FW/fake-forward-env" && grep -qx "HOME=$R/data/home/1000" "$FW/fake-forward-env" && [ ! -e "$FW/fake-forward-fd9" ]'
+cp "$R/user/steam/steam.log" "$R/log.before"; rm -f "$FW/fake-forwarded"
+for a in "-foo" "$U -foo" "steam://run/1;x"; do
+  ARGS=$a; run
+  check "still refused while Steam runs: '$a'" '[ $rc = 1 ] && grep -q "already running (launcher $BG\|not a plain steam:// URL" "$R/out" && [ ! -e "$FW/fake-forwarded" ] && cmp -s "$R/user/steam/steam.log" "$R/log.before" && cmp -s "$ST" "$R/stages.before"'
+done
+echo 5 >"$FW/fake-forward-rc"
+ARGS=$U; run
+check "forward: the client's own code when it fails, said in the log" '[ $rc = 5 ] && tail -n 1 "$R/user/steam/steam.log" | grep -q "stage=forward-failed $U: code 5" && cmp -s "$ST" "$R/stages.before"'
+rm -f "$FW/fake-forward-rc"; touch "$FW/fake-forward-hang"
+ARGS=$U; run SB_FORWARD_WAIT=1
+check "forward: a client that does not answer gets TERM after the deadline" '[ $rc = 1 ] && grep -q "did not answer in 1 s" "$R/out" && tail -n 1 "$R/user/steam/steam.log" | grep -q "stage=forward-failed $U: the client did not answer" && [ ! -e "$R/user/steam/forward-late."* ] && cmp -s "$ST" "$R/stages.before"'
+check "forward: the deadline reaches what the client started too (its process group)" 'c=$(cat "$FW/fake-forward-child") && upto "! kill -0 $c 2>/dev/null"'
+rm -rf "$FW/fake-forward-hang" "$FW/fake-forwarded" "$FW/fake-forward-child"; client_down
 ARGS=--check; run
 check "--check says a launcher runs, and stays green" '[ $rc = 0 ] && grep -q "running: launcher $BG, .*stage=steam" "$R/out"'
 ARGS=--status; run
@@ -284,6 +330,17 @@ check "--status after the end: no launcher" 'grep -q "launcher: none" "$R/out"'
 start_helper
 ARGS=; run
 check "a start with Steam's programs left and no launcher is refused" '[ $rc = 1 ] && grep -q "still running without a launcher: $HELPER" "$R/out" && tail -n 1 "$ST" | grep -q "stage=ended code 9"'
+client_up
+ARGS=$U; run
+check "forward: a URL goes to a client left without a launcher too" '[ $rc = 0 ] && [ "$(cat "$FW/fake-forwarded")" = "$U" ] && tail -n 1 "$ST" | grep -q "stage=ended code 9"'
+rm -f "$FW/fake-forwarded"
+# Without the client's steam.sh the forward goes to steamrt64/steam itself.
+mv "$RT/steam.sh" "$R/steam.sh.away"; mv "$RT/steamrt64/steam" "$R/steamrt64.away"
+printf '#!%s sh\necho "$*" >>"$PWD/../fake-forwarded"\n' "$BB" >"$RT/steamrt64/steam"; chmod +x "$RT/steamrt64/steam"
+ARGS=$U; run
+check "forward: without steam.sh the URL goes to steamrt64/steam, the log says so" '[ $rc = 0 ] && [ "$(cat "$FW/fake-forwarded")" = "$U" ] && tail -n 1 "$R/user/steam/steam.log" | grep -q "stage=forward $U to the running client (steamrt64/steam)"'
+mv "$R/steam.sh.away" "$RT/steam.sh"; mv -f "$R/steamrt64.away" "$RT/steamrt64/steam"
+rm -f "$FW/fake-forwarded"; client_down
 ARGS=--check; run
 check "--check names them too" '[ $rc = 1 ] && grep -q "still running without a launcher: $HELPER" "$R/out"'
 kill -TERM $HELPER; wait $HELPER 2>/dev/null
@@ -323,11 +380,6 @@ RP() { (cd "$R" && env PATH="$R/bin" "$BB" sh "$wt/user/ports/steam/files/realpa
 check "realpath --no-symlinks: dots and .. go, the link stays" '[ "$(RP --no-symlinks /a/./b/../c//d/)" = /a/c/d ] && [ "$(RP --no-symlinks "$R/link")" = "$R/link" ]'
 check "realpath --no-symlinks: a relative name from the cwd; the root" '[ "$(RP --no-symlinks link)" = "$R/link" ] && [ "$(RP -s /..)" = / ]'
 check "realpath: two names" '[ "$(RP --no-symlinks /a /b | tr "\n" " ")" = "/a /b " ]'
-
-python3 -I "$here/steam_stand_in.py" "$RUN_DIR/check" >"$R/out" 2>&1
-rc=$?
-check "steam_check.py against the stand-in" '[ $rc = 0 ]'
-cat "$R/out" | grep -E '^(ok|RED)' || true
 
 [ $fails = 0 ] || { echo "RED: $fails"; exit 1; }
 echo "GREEN: the steam launcher"

@@ -1,7 +1,7 @@
 //! Starting and watching init.
 //!
-//! The kernel calls [`start_init`] once it is ready (after MCP). CONFIG `init=` picks the program (default
-//! `/bin/init`, `init=off` starts nothing). A supervisor thread (class Normal: it waits for a user program, which
+//! The kernel calls [`start_init`] once it is ready (after MCP); the program is `/bin/init` (the test key
+//! `ktest_init=off` starts nothing, for the console scenarios that need the kernel monitor). A supervisor thread (class Normal: it waits for a user program, which
 //! B4 allows only outside KernelRt/Interactive) spawns it with the console as stdin/stdout/stderr and waits for
 //! its end. Linux panics when init dies ("Attempted to kill init!"); BitsOS keeps the kernel, MCP and the
 //! console and restarts init after a back-off instead (1 s doubling to 60 s; a run of 60 s or more counts as
@@ -9,31 +9,18 @@
 //! event (`ul init.given_up` / `ul init.missing`): Claude sees it in `log`, Georg sees the kernel console.
 //!
 //! B6 events (subsystem `ul`): `init.off`, `init.start`, `init.died`, `init.restart`, `init.spawn_failed`,
-//! `init.missing`, `init.given_up`, `init.bad_config`.
+//! `init.missing`, `init.given_up`.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 const SEC: u64 = 1_000_000_000;
 
-/// What CONFIG `init=` asks for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InitChoice {
-    Off,
-    Path(String),
-    /// Not an absolute path: the default is used and the value logged.
-    Bad(String),
-}
-
 pub const DEFAULT_INIT: &str = "/bin/init";
 
-pub fn parse_init(v: Option<&str>) -> InitChoice {
-    match v.map(str::trim) {
-        None | Some("") => InitChoice::Path(String::from(DEFAULT_INIT)),
-        Some("off" | "none" | "no" | "0") => InitChoice::Off,
-        Some(p) if p.starts_with('/') && !p.contains(char::is_whitespace) => InitChoice::Path(String::from(p)),
-        Some(other) => InitChoice::Bad(String::from(other)),
-    }
+/// The test key `ktest_init=off` (`host/tests/in/20-console.sh`, `in/30-tty.sh`, `dp/30-fbdev-mcp.sh`): no user
+/// program, so the kernel monitor has the console.
+pub fn test_off(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim() == "off")
 }
 
 /// The restart rule (numbers are policy, not resource limits; desk may make them CONFIG keys later).
@@ -98,6 +85,7 @@ pub use runtime::*;
 mod runtime {
     use super::*;
     use alloc::format;
+    use alloc::string::String;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};
     use ksync::SpinLock;
@@ -124,17 +112,11 @@ mod runtime {
 
     /// Starts init once (a second call is refused). Returns at once; the supervisor runs in its own thread.
     pub fn start_init(get: &dyn Fn(&str) -> Option<String>) -> Result<(), &'static str> {
-        let path = match parse_init(get("init").as_deref()) {
-            InitChoice::Off => {
-                klog::event!(Info, "ul", "init.off"; "CONFIG init=off: no user program is started");
-                return Ok(());
-            }
-            InitChoice::Path(p) => p,
-            InitChoice::Bad(v) => {
-                klog::event!(Warn, "ul", "init.bad_config", value = v.as_str(), using = DEFAULT_INIT; "init= wants an absolute path or off");
-                String::from(DEFAULT_INIT)
-            }
-        };
+        if test_off(get("ktest_init").as_deref()) {
+            klog::event!(Info, "ul", "init.off"; "test key ktest_init=off: no user program is started");
+            return Ok(());
+        }
+        let path = String::from(DEFAULT_INIT);
         if STARTED.swap(true, Ordering::AcqRel) {
             return Err("init was started already");
         }
@@ -217,13 +199,11 @@ mod tests {
     }
 
     #[test]
-    fn config_values() {
-        assert_eq!(parse_init(None), InitChoice::Path("/bin/init".into()));
-        assert_eq!(parse_init(Some(" ")), InitChoice::Path("/bin/init".into()));
-        assert_eq!(parse_init(Some("off")), InitChoice::Off);
-        assert_eq!(parse_init(Some("/sbin/init")), InitChoice::Path("/sbin/init".into()));
-        assert_eq!(parse_init(Some("init")), InitChoice::Bad("init".into()));
-        assert_eq!(parse_init(Some("/bin/x y")), InitChoice::Bad("/bin/x y".into()));
+    fn the_test_key() {
+        assert!(test_off(Some("off")) && test_off(Some(" off ")));
+        for v in [None, Some(""), Some("on"), Some("/sbin/init")] {
+            assert!(!test_off(v), "{v:?}");
+        }
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! every disk is closed, drained and its cache flushed (SYNCHRONIZE CACHE, Linux `sd_shutdown`); here no
 //! command may start any more (not the scan's, not a raw one) and the one under way is waited for, so no
 //! Bulk-Only transfer of a stick is on the bus when the host controller halts. Linux's usb-storage has no
-//! shutdown hook of its own (linux-6.6/drivers/usb/storage/usb.c: suspend only); the SCSI disk above it syncs,
-//! and on a restart it does not stop the unit (drivers/scsi/sd.c:3853-3859), nor does this.
+//! shutdown hook of its own (linux-7.3.1/drivers/usb/storage/usb.c:1244: suspend only); the SCSI disk above it
+//! syncs, and on a restart it does not stop the unit (drivers/scsi/sd.c:4244-4254), nor does this.
 //!
 //! US-R: a device that is not well at this point (a command never ended, a recovery under way or given up) gets a
 //! clean stop on top: its port's power off and on where the port can do that, and a warm reset, so that the firmware

@@ -35,7 +35,7 @@ pub fn seccomp(prog: &[Insn]) -> Result<(), String> {
     Ok(())
 }
 
-/// The peer of a connected Unix socket: (pid, uid, gid) as it was at connect (linux-6.6/net/unix/af_unix.c).
+/// The peer of a connected Unix socket: (pid, uid, gid) as it was at connect (linux-7.3.1/net/unix/af_unix.c).
 pub fn peer_cred(s: &impl AsRawFd) -> Result<(u32, u32, u32), String> {
     let mut c = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;

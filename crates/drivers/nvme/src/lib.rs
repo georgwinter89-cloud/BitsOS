@@ -14,7 +14,8 @@
 //! - `ns::NsDevice`: a namespace as `C: BlockDevice` (read-only without a window), registered with FS-6's block layer as
 //!   `DiskKind::Nvme`; its partitions (`gpt`) as `DiskKind::Stacked` disks on top, each through its own
 //!   `Disk::part_port`, so a write passes the whole disk's hook and only the window's partition takes any;
-//! - `tool`: the MCP tools `nvme` (read-only) and `data_move`; `ktests`: `nv.*`.
+//! - `tool`: the MCP tools `nvme` (read-only) and `data_move`; `ktests`: `nv.*`;
+//! - `panic` (CRASHDISK, owner RB): the panic record's polled write to the boot ESP, handed to kexec (`provider`).
 //!
 //! Probe maps BAR0 and starts a thread per controller (`nvme-init:<name>`, class Normal) that brings it up and
 //! registers its disks: the block layer reads each partition table through the new queue, which waits.
@@ -32,6 +33,7 @@ mod fake;
 /// Partitions as block devices (NV's file in FS's crate).
 pub use block::gpt;
 pub mod hw;
+mod hwmon;
 pub mod ident;
 mod io;
 mod ktests;
@@ -42,6 +44,7 @@ mod ktests_window;
 mod mmio_hw;
 mod mq;
 pub mod ns;
+pub mod panic;
 pub mod prp;
 pub mod queue;
 pub mod regs;
@@ -72,7 +75,7 @@ pub type Nvme = Controller<MmioHw>;
 const CLASS_NVME: u32 = 0x01_08_02;
 static MATCHES: [pci::Match; 1] = [pci::Match::Class { class: CLASS_NVME, mask: 0xFF_FF_FF }];
 
-pci::pci_driver!(pci::DriverEntry { name: "nvme", matches: &MATCHES, opt_in_key: None, probe });
+pci::pci_driver!(pci::DriverEntry { name: "nvme", matches: &MATCHES, probe });
 
 struct Entry {
     ctrl: Arc<Nvme>,
@@ -130,13 +133,10 @@ pub fn test_pattern(seed: u8, off: u64) -> u8 {
     ((off >> 9).wrapping_mul(31).wrapping_add((off & 511) * 7).wrapping_add(seed as u64)) as u8
 }
 
-/// CONFIG `nvme_irq=off` keeps every controller polled (a way back if MSI-X misbehaves on a machine).
+/// The test key `ktest_poll=nvme` (`host/tests/nv/10-nvme.sh`) keeps every controller polled, the path a controller
+/// without vectors takes.
 fn config() -> Config {
-    let mut c = Config::default();
-    if pci::registry::config_value("nvme_irq").is_some_and(|v| v.trim() == "off") {
-        c.irqs = false;
-    }
-    c
+    Config { irqs: !pci::registry::poll_test("nvme"), ..Config::default() }
 }
 
 struct Q(Arc<Nvme>);
@@ -151,6 +151,15 @@ impl Quiesce for Q {
 
 fn probe(f: &pci::PciFunction) -> Result<(), String> {
     let function = format!("{}", f.addr);
+    // GP-GUARD (B3a): under `nvme_bind=off` the PCI core never offers a storage function (it stays untouched). Should
+    // it be offered all the same, refuse before the first register write: no reset, no queue, no bus master.
+    // GP-DISK: the one controller `gp_nvme=` names (place and ids) is the exception, as the scan decided it.
+    let place = (f.segment == 0).then_some((f.addr.bus, f.addr.dev, f.addr.func));
+    let (bind, line) = (pci::registry::config_value(gp_platform::disk_rule::BIND_KEY), pci::registry::config_value(gp_platform::tiers::NVME_KEY));
+    if pci::registry::storage_kept_off_at(f.class, bind.as_deref(), line.as_deref(), place, (f.vendor, f.device)) {
+        klog::event!(Error, "nvme", "probe_refused", function = function.as_str(); "nvme_bind=off: this machine's internal disks get no driver");
+        return Err(String::from("nvme_bind=off: internal disks get no driver on this machine"));
+    }
     // MSI and bus master off before anything else: a controller left running by the firmware or the previous
     // kernel must DMA nowhere until its queues are ours (PC-2 `disable_device`).
     let _ = f.disable_device();
@@ -173,14 +182,16 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
         }
     });
     let c = ctrl.clone();
+    let slot = format!("{:04x}:{}", f.segment, f.addr);
     let job = move || {
         let up = c.start().is_ok();
         if up {
             register_disks(&c);
+            hwmon::added(&c, &slot);
         }
         PENDING.fetch_sub(1, Ordering::AcqRel);
         window::all_looked();
-        if up && pci::registry::opted_in("nvme_busy") {
+        if up && pci::registry::opted_in("ktest_nvme_busy") {
             busy(&c);
         }
     };
@@ -191,7 +202,7 @@ fn probe(f: &pci::PciFunction) -> Result<(), String> {
     Ok(())
 }
 
-/// CONFIG `nvme_busy=on`, for the Reload scenario only (off by default; when off it costs one CONFIG look per
+/// CONFIG `ktest_nvme_busy=on`, for the Reload scenario only (off by default; when off it costs one CONFIG look per
 /// controller start): the init thread then reads the first usable namespace without pause until the controller
 /// is gone, so every Reload quiesces the controller with a read in flight.
 fn busy(c: &Arc<Nvme>) {
@@ -218,6 +229,25 @@ fn busy(c: &Arc<Nvme>) {
         lba = if lba + 2 * n > ns.id.nsze { 0 } else { lba + n };
     }
 }
+
+/// CRASHDISK: the panic writer for the namespace disk `disk` (`nvme0n1`), with a `bytes` buffer.
+fn crash_provider(disk: &str, bytes: usize) -> Result<Arc<dyn kexec::crash::disk::Device>, String> {
+    for c in controllers() {
+        for ns in c.info().namespaces.iter().filter(|n| n.unusable.is_none()) {
+            if format!("{}n{}", c.name, ns.nsid) == disk {
+                return panic::PanicWriter::new(c.clone(), ns.nsid, bytes).map(|w| Arc::new(w) as Arc<dyn kexec::crash::disk::Device>);
+            }
+        }
+    }
+    Err(format!("{disk} is not a namespace of an NVMe controller"))
+}
+
+fn crash_init() -> Result<(), &'static str> {
+    static P: kexec::crash::disk::Provider = crash_provider;
+    kexec::crash::disk::set_provider(&P);
+    Ok(())
+}
+kreg::initcall!(kreg::Level::Core, "nvme.crashdisk", crash_init);
 
 /// Registers every usable namespace and its partitions with the block layer (may wait: table reads).
 pub fn register_disks(c: &Arc<Nvme>) {
@@ -273,6 +303,7 @@ pub fn unregister_disks(c: &Arc<Nvme>) {
 fn remove(c: &Arc<Nvme>) {
     klog::event!(Info, "nvme", "remove", ctrl = c.name.as_str());
     unregister_disks(c);
+    hwmon::removed(c);
     c.remove();
     DEVICES.lock().retain(|e| !Arc::ptr_eq(&e.ctrl, c));
 }

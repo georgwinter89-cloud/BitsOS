@@ -180,10 +180,12 @@ fn udmabuf_errors_match_linux() {
     let (_a, plain) = memfd(&fds, 4, 0);
     let (_b, wsealed) = memfd(&fds, 4, SHRINK | vfs::memfd::F_SEAL_WRITE);
     let (_c, ok) = memfd(&fds, 4, SHRINK);
+    let (_d, fsealed) = memfd(&fds, 4, SHRINK | vfs::memfd::F_SEAL_FUTURE_WRITE);
     let efd = fds.install_flags(vfs::eventfd::new_eventfd(0, 0), 0, false).unwrap() as u32;
     let cases: &[(u32, u64, u64, i64, &str)] = &[
         (plain, 0, 4 * P, EINVAL, "no F_SEAL_SHRINK"),
         (wsealed, 0, 4 * P, EINVAL, "F_SEAL_WRITE"),
+        (fsealed, 0, 4 * P, EINVAL, "F_SEAL_FUTURE_WRITE"),
         (ok, 1, P, EINVAL, "offset unaligned"),
         (ok, 0, P + 1, EINVAL, "size unaligned"),
         (ok, 0, 0, EINVAL, "size 0"),
@@ -569,4 +571,23 @@ fn udmabuf_ref_limit_bounds_the_page_lists() {
     let fd = udmabuf::ioctl_with(UDMABUF_CREATE_LIST, BASE, &m, Some(&fds)).unwrap();
     assert_eq!(buf_of(&fds, fd).size(), 12 * P, "overlap is allowed within the budget");
     assert!(udmabuf::refs_held() >= 12);
+}
+
+/// L7 row 3 (checker): a udmabuf pins its memfd's pages; F_SEAL_WRITE then is EBUSY (Linux's
+/// memfd_wait_for_pins, CachyOS: EBUSY, 0 after the buffer closed), so the dma-buf cannot outlive a write seal.
+#[test]
+fn udmabuf_pins_against_a_write_seal() {
+    let fds = FdTable::new();
+    let (f, n) = memfd(&fds, 2, SHRINK);
+    let seal = |s: u32| vfs::memfd::seal_fcntl(&f, vfs::memfd::F_ADD_SEALS, u64::from(s));
+    let buf = udmabuf::build(Some(&fds), &[Item { memfd: n, offset: 0, size: 2 * P }]).unwrap();
+    assert_eq!(seal(vfs::memfd::F_SEAL_WRITE).map(|_| ()), Err(EBUSY));
+    // F_SEAL_FUTURE_WRITE leaves what exists writable (Linux too); only F_SEAL_WRITE waits for pins.
+    let (g, k) = memfd(&fds, 2, SHRINK);
+    let other = udmabuf::build(Some(&fds), &[Item { memfd: k, offset: 0, size: 2 * P }]).unwrap();
+    assert!(vfs::memfd::seal_fcntl(&g, vfs::memfd::F_ADD_SEALS, u64::from(vfs::memfd::F_SEAL_FUTURE_WRITE)).is_ok());
+    drop(other);
+    drop(buf);
+    assert!(seal(vfs::memfd::F_SEAL_WRITE).is_ok(), "the pin went with the buffer");
+    assert_eq!(udmabuf::build(Some(&fds), &[Item { memfd: n, offset: 0, size: 2 * P }]).map(|_| ()), Err(EINVAL));
 }

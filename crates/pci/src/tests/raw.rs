@@ -53,8 +53,8 @@ fn configuration_reads() {
     let (_, wl) = node(&nodes, at(WLAN));
     assert_eq!(raw::cfg_read_check(wl, 256, 4, 2, 1), Ok(()));
     assert_eq!(raw::cfg_read_check(wl, 256, 0, 4, 16), Ok(()));
-    assert_eq!(raw::cfg_read_check(wl, 256, 0x3C, 4, 2), Err(Refusal::Untouched("wlan")));
-    assert_eq!(raw::cfg_read_check(wl, 256, 0x50, 4, 1), Err(Refusal::Untouched("wlan")), "its MSI capability");
+    assert_eq!(raw::cfg_read_check(wl, 256, 0x3C, 4, 2), Err(Refusal::Untouched(super::HELD)));
+    assert_eq!(raw::cfg_read_check(wl, 256, 0x50, 4, 1), Err(Refusal::Untouched(super::HELD)), "its MSI capability");
     assert_eq!(raw::cfg_read_check(wl, 256, 0x100, 4, 1), Err(Refusal::OutOfRange));
 }
 
@@ -75,8 +75,8 @@ fn configuration_writes() {
     assert_eq!(w(Loc::new(0, 0, 1, 1), 0x04, 2, true), Err(Refusal::StoragePath), "root port above NVMe 01:00.0");
     assert_eq!(w(Loc::new(0, 0, 2, 4), 0x18, 4, true), Err(Refusal::StoragePath), "root port above NVMe 05:00.0");
     assert_eq!(w(Loc::new(0, 0, 2, 1), 0x04, 2, true), Ok(()), "root port above the I226");
-    assert_eq!(w(at(WLAN), 0x04, 2, true), Err(Refusal::Untouched("wlan")));
-    assert_eq!(w(at(WLAN_BRIDGE), 0x04, 2, true), Err(Refusal::Untouched("wlan")));
+    assert_eq!(w(at(WLAN), 0x04, 2, true), Err(Refusal::Untouched(super::HELD)));
+    assert_eq!(w(at(WLAN_BRIDGE), 0x04, 2, true), Err(Refusal::Untouched(super::HELD)));
     assert_eq!(w(Loc::new(0, 0, 0, 0), 0x04, 2, true), Ok(()), "the host bridge is no bridge in the tree");
     assert!(raw::storage_below(&nodes, node(&nodes, Loc::new(0, 0, 1, 1)).0));
     assert!(!raw::storage_below(&nodes, node(&nodes, Loc::new(0, 0, 8, 1)).0), "the GPU's bridge");
@@ -205,7 +205,7 @@ fn memory_bars() {
     let (_, nvme) = node(&nodes, at(NVME0));
     assert_eq!(raw::mmio_check(nvme, 0, 0, 4, 1, false), Err(Refusal::Storage), "not even a read");
     let (_, wl) = node(&nodes, at(WLAN));
-    assert_eq!(raw::mmio_check(wl, 2, 0, 4, 1, false), Err(Refusal::Untouched("wlan")));
+    assert_eq!(raw::mmio_check(wl, 2, 0, 4, 1, false), Err(Refusal::Untouched(super::HELD)));
     let (_, hb) = node(&nodes, Loc::new(0, 0, 0, 0));
     assert_eq!(raw::mmio_check(hb, 0, 0, 4, 1, false), Err(Refusal::NoBar));
 }
@@ -241,7 +241,7 @@ fn the_radeon() {
 
 #[test]
 fn rule_refusals_are_rules() {
-    for r in [Refusal::Untouched("wlan"), Refusal::Storage, Refusal::StoragePath, Refusal::IndexPair, Refusal::MsixTable, Refusal::NarrowWrite] {
+    for r in [Refusal::Untouched(super::HELD), Refusal::Storage, Refusal::StoragePath, Refusal::IndexPair, Refusal::MsixTable, Refusal::NarrowWrite] {
         assert!(r.is_rule(), "{r:?}");
     }
     for r in [Refusal::NotFound, Refusal::BadWidth, Refusal::Unaligned, Refusal::OutOfRange, Refusal::NoBar, Refusal::IoBar, Refusal::NotSized] {

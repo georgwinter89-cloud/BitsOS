@@ -179,8 +179,8 @@ pub struct Previous {
     pub base: u32,
     /// The decoded crumb, None: the count is outside the range.
     pub id: Option<u16>,
-    /// The counter still ran at this start (a Reload with `watchdog_reload=grace`): it went on counting through
-    /// the start, so the slot is only approximate.
+    /// The counter still ran at this start (a reboot keeps it armed with the grace count): it went on counting
+    /// through the start, so the slot is only approximate.
     pub running: bool,
 }
 

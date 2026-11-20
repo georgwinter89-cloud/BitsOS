@@ -1,5 +1,5 @@
-//! timerfd (AB-5), after linux-6.6/fs/timerfd.c: `timerfd_create` (283), `timerfd_settime` (286),
-//! `timerfd_gettime` (287) and the file they make (read, poll, TFD_IOC_SET_TICKS through `ioctl.rs`).
+//! timerfd (AB-5), after linux-7.3.1/fs/timerfd.c: `timerfd_create` (283, :424), `timerfd_settime` (286, :567),
+//! `timerfd_gettime` (287, :585) and the file they make (read, poll, TFD_IOC_SET_TICKS through `ioctl.rs`).
 //!
 //! The state is Linux's `timerfd_ctx`: `expires` (in the clock's own time, ns), `interval`, `ticks` (expiries
 //! not read yet), `expired` (the timer fired since it was last armed), the cancel-on-set fields. An expiry is a
@@ -115,8 +115,8 @@ struct Ctx {
     /// The expiry in `base`'s time (Linux `hrtimer_get_expires`; 0 when set to "disarmed").
     expires: i64,
     /// The clock the current setting runs on: CLOCK_REALTIME only for an absolute REALTIME setting; a
-    /// relative one runs on the monotonic clock, as `__hrtimer_init` turns CLOCK_REALTIME + HRTIMER_MODE_REL
-    /// into CLOCK_MONOTONIC (linux-6.6/kernel/time/hrtimer.c), so a wall-clock jump never moves it.
+    /// relative one runs on the monotonic clock, as `__hrtimer_setup` turns CLOCK_REALTIME + HRTIMER_MODE_REL
+    /// into CLOCK_MONOTONIC (linux-7.3.1/kernel/time/hrtimer.c:1933), so a wall-clock jump never moves it.
     base: TfdClock,
     interval: i64,
     ticks: u64,
@@ -297,7 +297,7 @@ pub(crate) fn of(f: &OpenFile) -> Option<Arc<Shared>> {
     OBJECTS.lock().get(&addr).map(|(sh, _)| sh.clone())
 }
 
-/// AB-7a: `timerfd_show` (linux-6.6/fs/timerfd.c :318) for `/proc/<pid>/fdinfo`: None for other files.
+/// AB-7a: `timerfd_show` (linux-7.3.1/fs/timerfd.c :352) for `/proc/<pid>/fdinfo`: None for other files.
 pub(crate) fn fdinfo(f: &OpenFile) -> Option<String> {
     let sh = of(f)?;
     // Copied under the IRQ-safe lock, formatted after it.

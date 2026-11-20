@@ -39,7 +39,7 @@ pub fn menu(items: &Items, hover: Option<usize>, t: &Theme) -> Canvas {
         let on = hover == Some(d) && it.enabled;
         let rad = v(t.radius_small);
         if on {
-            c.glow(b, rad, if t.effects_gpu { 6 } else { 2 }, t.glow);
+            c.glow(b, rad, 6, t.glow);
         }
         c.rrect(b, rad, t.panel2);
         if on {

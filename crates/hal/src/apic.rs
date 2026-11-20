@@ -1,7 +1,7 @@
 //! Local APIC, IPIs and the legacy 8259s (owner: CP, item CP-3; spec/core.md §5.1, §5.2, §11.10, §11.13).
 //!
 //! The BSP's LAPIC is switched to **x2APIC** (MSR access, no MMIO window per core, no delivery-status polling)
-//! when CPUID offers it; QEMU CPU models without x2APIC (and `apic=xapic` in CONFIG.TXT) keep the **xAPIC** at its
+//! when CPUID offers it; QEMU CPU models without x2APIC keep the **xAPIC** at its
 //! MMIO page, mapped uncached through `hal::mmio`. Firmware that already turned x2APIC on keeps it (leaving it
 //! needs a full disable). `init_bsp` then sets TPR 0, the spurious vector 0xFF (EDK2 leaves 0x0F, an exception
 //! vector), LINT0 masked, NMI on the pin the MADT names (LINT1 by default), the LVT timer masked with its vector
@@ -325,15 +325,13 @@ pub struct NmiPin {
 /// What `init_bsp` should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LapicConfig {
-    /// Switch to x2APIC when CPUID offers it (default true; `apic=xapic` in CONFIG.TXT turns it off).
-    pub want_x2apic: bool,
     /// `None`: LINT1, active high (the virtual-wire convention, Linux's default without a MADT entry).
     pub nmi: Option<NmiPin>,
 }
 
 impl Default for LapicConfig {
     fn default() -> Self {
-        LapicConfig { want_x2apic: true, nmi: None }
+        LapicConfig { nmi: None }
     }
 }
 
@@ -373,8 +371,6 @@ pub struct LapicReport {
     /// In-service vectors the firmware left, acknowledged with EOIs.
     pub stale_isr_acked: u32,
     pub nmi: NmiPin,
-    /// xAPIC was asked for, but the firmware had x2APIC on already, so it stays.
-    pub kept_firmware_x2apic: bool,
     /// xAPIC was wanted but its page could not be mapped, so x2APIC is used.
     pub xapic_map_failed: bool,
 }
@@ -389,7 +385,7 @@ pub fn init_bsp(cfg: &LapicConfig) -> Result<LapicReport, ApicError> {
     let before_base = msr::read(msr::IA32_APIC_BASE);
     let cpuid_x2 = crate::cpu::live().has("x2apic");
     let fw = mode_of_base(before_base);
-    let mut target = if fw == Mode::X2Apic || (cfg.want_x2apic && cpuid_x2) { Mode::X2Apic } else { Mode::XApic };
+    let mut target = if fw == Mode::X2Apic || cpuid_x2 { Mode::X2Apic } else { Mode::XApic };
     let mut map_failed = false;
     let base_phys = before_base & APIC_BASE_ADDR;
     if before_base & APIC_BASE_EN == 0 {
@@ -435,7 +431,6 @@ pub fn init_bsp(cfg: &LapicConfig) -> Result<LapicReport, ApicError> {
         esr,
         stale_isr_acked: acked,
         nmi,
-        kept_firmware_x2apic: fw == Mode::X2Apic && !cfg.want_x2apic,
         xapic_map_failed: map_failed,
     })
 }

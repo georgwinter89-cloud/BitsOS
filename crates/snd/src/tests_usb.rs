@@ -237,3 +237,54 @@ fn pair_routes_targets() {
     assert_eq!(crate::parse_output("usb"), Some(Target::Prefer(Port::Usb)));
     assert_eq!(usb().name(), USB);
 }
+
+/// A machine whose only jacks are USB (the Gaming-PC): hda has nothing; the USB side answers `jack` with the board's
+/// speaker and everything else with the headset, as `UsbBackend` does.
+struct NoHda;
+impl Backend for NoHda {
+    fn resolve(&mut self, _: &Target) -> Option<Endpoint> {
+        None
+    }
+    fn endpoints(&mut self) -> Vec<Endpoint> {
+        Vec::new()
+    }
+    fn open(&mut self, _: &Endpoint, _: u32, _: u32, _: WakeFn, _: u64) -> Result<Box<dyn Stream>, OutError> {
+        Err(OutError::NoSuch)
+    }
+    fn take_jack_events(&mut self) -> bool {
+        false
+    }
+}
+
+fn board() -> Endpoint {
+    Endpoint { dev: "usb:xhci1-12.1".into(), port: Port::Usb, cad: 0, pin: 3 }
+}
+
+struct GamingUsb;
+impl Backend for GamingUsb {
+    fn resolve(&mut self, t: &Target) -> Option<Endpoint> {
+        Some(if *t == Target::Prefer(Port::Jack) { board() } else { usb() })
+    }
+    fn endpoints(&mut self) -> Vec<Endpoint> {
+        alloc::vec![usb(), board()]
+    }
+    fn open(&mut self, _: &Endpoint, _: u32, _: u32, _: WakeFn, _: u64) -> Result<Box<dyn Stream>, OutError> {
+        Err(OutError::NoSuch)
+    }
+    fn take_jack_events(&mut self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn jack_reaches_the_board_jacks_when_hda_has_none() {
+    let mut p = Pair { first: GamingUsb, second: NoHda };
+    assert_eq!(p.resolve(&Target::Auto), Some(usb()), "the headset is the default");
+    assert_eq!(p.resolve(&Target::Prefer(Port::Jack)), Some(board()), "GP-SOUND AU-5: jack asks the USB side for its jacks");
+    assert_eq!(p.resolve(&Target::Prefer(Port::Hdmi)), Some(usb()), "hdmi falls back to auto as before");
+    // With hda jacks (the Mini-PC) jack stays with hda.
+    let plug = Plug::default();
+    plug.present.store(true, Ordering::Release);
+    let mut m = Pair { first: UsbFake(plug), second: Jack };
+    assert_eq!(m.resolve(&Target::Prefer(Port::Jack)), Some(hp()));
+}

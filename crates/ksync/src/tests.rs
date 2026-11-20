@@ -251,6 +251,33 @@ fn checker_reports_an_order_violation() {
     assert_eq!(n, 0);
 }
 
+/// A mutex taken `lock_as` another class is checked as that class: the upper file's write-back lock, a volume
+/// lock, then a backing image's write-back lock (the same mutex type and name) is no inversion; taken plainly,
+/// the second lock of the name would be one.
+#[test]
+fn a_lock_taken_as_another_class_is_ordered_as_that_class() {
+    if !lockdep::enabled() {
+        return;
+    }
+    static BELOW: crate::AsClass = crate::AsClass::new("t.as_wb.below");
+    let (file, image) = (Mutex::named("t.as_wb", ()), Mutex::named("t.as_wb", ()));
+    let vol = Mutex::named("t.as_vol", ());
+    let (_, n) = lockdep::expect_violations(|| {
+        {
+            let _f = file.lock();
+            let _v = vol.lock();
+        }
+        let _v = vol.lock();
+        let _i = image.lock_as(&BELOW);
+    });
+    assert_eq!(n, 0, "{:?}", lockdep::list());
+    let (_, n) = lockdep::expect_violations(|| {
+        let _v = vol.lock();
+        let _i = image.lock();
+    });
+    assert_eq!(n, 1);
+}
+
 #[test]
 fn checker_finds_an_inversion_between_unordered_classes() {
     if !lockdep::enabled() {

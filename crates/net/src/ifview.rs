@@ -60,12 +60,20 @@ pub struct Addr {
     pub label: Option<String>,
     /// NW-12: a broadcast address a program gave a loopback address (cards compute theirs, `broadcast`).
     pub brd: Option<[u8; 4]>,
+    /// L7-NET: `ifa_proto` and `ifa_rt_priority` as a request gave them (IFA_PROTO, IFA_RT_PRIORITY; 0: none).
+    pub proto: u8,
+    pub metric: u32,
 }
 
 impl Addr {
     /// An address without extra flags, label or set broadcast address.
     pub fn plain(ip: [u8; 4], prefix: u8, scope: u8, valid_s: u32, preferred_s: u32) -> Addr {
-        Addr { ip, prefix, scope, valid_s, preferred_s, extra: 0, label: None, brd: None }
+        Addr { ip, prefix, scope, valid_s, preferred_s, extra: 0, label: None, brd: None, proto: 0, metric: 0 }
+    }
+    /// What the change notifications compare: an address whose lifetimes count down, or whose protocol or metric
+    /// a replace set (it announces itself, `inet_rtm_newaddr`), is not a new address.
+    pub fn announced(&self) -> Addr {
+        Addr { valid_s: 0, preferred_s: 0, proto: 0, metric: 0, ..self.clone() }
     }
     pub fn flags(&self) -> u32 {
         self.extra | if self.valid_s == INFINITY { IFA_F_PERMANENT } else { 0 }
@@ -115,7 +123,7 @@ pub struct Addr6 {
 pub const IFAPROT_KERNEL_LO: u8 = 1;
 pub const IFA_F_SECONDARY: u32 = 0x01;
 
-/// lo's ::1/128 (`init_loopback`, linux-6.6/net/ipv6/addrconf.c:3214).
+/// lo's ::1/128 (`init_loopback`, linux-7.3.1/net/ipv6/addrconf.c:3297).
 pub fn lo6() -> Addr6 {
     let mut ip = [0u8; 16];
     ip[15] = 1;
@@ -198,7 +206,7 @@ fn loopback() -> Link {
     lo_link(IFF_UP, alloc::vec![lo_addr()], Vec::new(), LOOPBACK_MTU, TX_QUEUE_LEN)
 }
 
-/// lo's 127.0.0.1/8 (`inetdev_event` NETDEV_UP for a loopback, linux-6.6/net/ipv4/devinet.c:1575).
+/// lo's 127.0.0.1/8 (`inetdev_event` NETDEV_UP for a loopback, linux-7.3.1/net/ipv4/devinet.c:1610).
 pub fn lo_addr() -> Addr {
     Addr::plain([127, 0, 0, 1], 8, RT_SCOPE_HOST, INFINITY, INFINITY)
 }

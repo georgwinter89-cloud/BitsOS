@@ -9,7 +9,9 @@ pub const R8_SWITCHES: &[&str] = &["nvme_write", "nvme_data", "stick_write", "us
 /// CONFIG.TXT keys the kernel never shows; they stay out of journal, history and answers.
 pub const KERNEL_SECRETS: &[&str] = &["token", "wlan_psk", "claude_api_key"];
 /// FS-7's guarded CONFIG keys (MC-10: `mcp`, `mcp_confirmer` too; fs-fat also keeps `mcp` from being dropped).
-const GUARDED: &[&str] = &["nvme_write", "nvme_data", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+/// GP-GUARD CR11: `nvme_boot` and the Gaming-PC's tier lines `gp_net`, `gp_stick`, as fs-fat's list has them;
+/// GP-DISK: `gp_nvme`.
+pub const GUARDED: &[&str] = &["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer", "gp_net", "gp_stick", "gp_nvme"];
 
 fn is_switch(s: &str) -> bool {
     let s = s.trim().trim_start_matches('\u{feff}').to_ascii_lowercase();

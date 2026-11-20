@@ -268,14 +268,13 @@ mod tests {
         assert_eq!(n.by_dword.get(&(0x16000 + 0x29a)).map(|v| v[0].as_str()), Some("MP1_SMN_C2PMSG_90"));
     }
 
-    /// The tables in the tree are what the Linux headers give (skipped without the read-only Linux tree).
+    /// The tables in the tree are what the Linux headers give. Decision (SK, 17.11.): the Linux tree (ref/, not
+    /// tracked, not public) is an input like a tool; without it the test fails with the place it looked. The gate
+    /// runs on the desk's machine, where `$HOME/BitsOS/V2/ref/linux-6.6` is; elsewhere set BITSOS_LINUX.
     #[test]
     fn tables_up_to_date() {
         let linux = default_linux();
-        if !linux.join(ASIC_REG).exists() {
-            eprintln!("skip: no Linux tree at {}", linux.display());
-            return;
-        }
+        assert!(linux.join(ASIC_REG).exists(), "no Linux 6.6 tree at {} (set BITSOS_LINUX to one)", linux.display());
         let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("tables");
         for (name, rel) in HEADERS {
             let (text, _) = table_text(&format!("linux-6.6/{ASIC_REG}/{rel}"), &std::fs::read(linux.join(ASIC_REG).join(rel)).unwrap()).unwrap();

@@ -1,7 +1,10 @@
-//! AB-14: the vDSO (Linux's x86-64 vDSO, linux-6.6/arch/x86/entry/vdso/vma.c for the mapping and
-//! kernel/time/vsyscall.c for the data; own code). Every program gets two mappings from exec on, as Linux
-//! places them: `[vvar]`, one read-only page the kernel keeps current (`layout.rs`), and right after it
-//! `[vdso]`, the ELF image `build.rs` makes from `../vdso/vdso.rs` (read+exec). AT_SYSINFO_EHDR names the image;
+//! AB-14: the vDSO (Linux's x86-64 vDSO, linux-7.3.1/arch/x86/entry/vdso/vma.c:156 `map_vdso` for the mapping,
+//! lib/vdso/datastore.c and kernel/time/vsyscall.c for the data; own code). L7-SYNC adds the getrandom data
+//! (`publish_rng`, datastore.c's `vdso_rng_data`) and the robust-unlock fixup (`unlock`). Linux 7 maps three
+//! areas (`[vvar]` data store pages, `[vvar_vclock]`, `[vdso]`); V2 keeps two, decided in the reference check
+//! (the layout is private between kernel and vDSO, only /proc/<pid>/maps readers see it): `[vvar]`, one
+//! read-only page the kernel keeps current (`layout.rs`), and right after it `[vdso]`, the ELF image `build.rs`
+//! makes from `../vdso/vdso.rs` (read+exec). AT_SYSINFO_EHDR names the image;
 //! glibc and musl find `__vdso_clock_gettime` & co. there (version LINUX_2.6) and stop making those syscalls.
 //!
 //! Both are one device mapping (`mm::device`, MM-5b) over a write-back DMA buffer: the frames are shared by all
@@ -20,6 +23,7 @@
 //! rate never answers and CLOCK_MONOTONIC never steps back when the page catches up.
 
 pub mod layout;
+pub mod unlock;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering, compiler_fence};
@@ -38,6 +42,9 @@ const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
 const MAP_PRIVATE: u64 = 2;
+const MAP_DROPPABLE: u64 = 0x08;
+/// The vDSO's getrandom fetches a new key at least this often (the kernel generator's own reseed interval).
+const RNG_EPOCH_NS: u64 = 60_000_000_000;
 
 klog::counter!(PUBLISHED, "proc.vdso.published");
 
@@ -126,7 +133,12 @@ fn make() -> Option<Vdso> {
         }
     };
     let file = OpenFile::anon(Arc::new(NoFile), vfs::abi::O_RDONLY);
-    klog::event!(Info, "proc", "vdso.ready", image_bytes = IMAGE.len(), pages = pages);
+    // getrandom's states need MAP_DROPPABLE (wiped on fork); the params query names it only when mmap takes it.
+    let droppable = mm::linux::Space::new(mm::linux::TASK_SIZE).plan_mmap(0, PAGE, PROT_READ | PROT_WRITE, MAP_DROPPABLE | mm::linux::MAP_ANONYMOUS, 0).is_ok();
+    buf.write_u32(RNG_FLAGS, if droppable { RNG_F_DROPPABLE } else { 0 });
+    publish_rng(&buf);
+    buf.write_u32(RNG_READY, 1);
+    klog::event!(Info, "proc", "vdso.ready", image_bytes = IMAGE.len(), pages = pages, getrandom = droppable);
     Some(Vdso { buf, map, file })
 }
 
@@ -347,11 +359,17 @@ pub fn hold_odd_for_test<R>(f: impl FnOnce() -> R) -> Option<R> {
     Some(r)
 }
 
-/// Publishes when the clock changed since the last time (rate, wall offset, mode, CPU facts).
+/// `vdso_rng_data.generation`: Linux counts the base generator's reseeds; V2's reseeds on demand once a minute
+/// has passed (`vfs::random`), so the count is the minutes since boot plus one (never 0, never back). A store of
+/// one aligned word: the vDSO reads it without the sequence count.
+fn publish_rng(b: &DmaBuffer) {
+    b.write_u64(RNG_GEN, 1 + time::now_ns() / RNG_EPOCH_NS);
+}
+
+/// Publishes when the clock changed since the last time (rate, wall offset, mode, CPU facts), and the RNG count.
 pub fn refresh() {
-    if VDSO.get().and_then(|v| v.as_ref()).is_none() {
-        return;
-    }
+    let Some(v) = VDSO.get().and_then(|v| v.as_ref()) else { return };
+    publish_rng(&v.buf);
     let _g = PUB.lock();
     let now = current();
     match published() {
@@ -401,8 +419,8 @@ mod tests {
 
     #[test]
     fn layout_fits_the_page() {
-        assert!(FLAGS + 4 <= TIMENS && TIMENS < VVAR_SIZE);
-        for (o, w) in [(SEQ, 4), (MODE, 4), (BASE_TSC, 8), (BASE_NS, 8), (MULT, 8), (REAL_OFF, 8), (TAI_OFF, 8), (BOOT_OFF, 8), (RES_NS, 4), (COARSE_RES_NS, 4), (FLAGS, 4)] {
+        assert!(FLAGS + 4 <= RNG_GEN && RNG_FLAGS + 4 <= TIMENS && TIMENS < VVAR_SIZE);
+        for (o, w) in [(SEQ, 4), (MODE, 4), (BASE_TSC, 8), (BASE_NS, 8), (MULT, 8), (REAL_OFF, 8), (TAI_OFF, 8), (BOOT_OFF, 8), (RES_NS, 4), (COARSE_RES_NS, 4), (FLAGS, 4), (RNG_GEN, 8), (RNG_READY, 4), (RNG_FLAGS, 4)] {
             assert_eq!(o % w, 0, "field at {o} not aligned");
         }
     }

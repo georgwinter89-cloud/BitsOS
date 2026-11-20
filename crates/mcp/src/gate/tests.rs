@@ -24,12 +24,12 @@ fn raw(_: &ToolContext, _: &Json) -> ToolResult {
 }
 
 static TOOLS: [ToolEntry; 6] = [
-    ToolEntry { name: "hw_info", description: "Facts.", input_schema: r#"{"type":"object","properties":{"section":{"type":"string"}}}"#, owner: "MC", safety: Safety::Read, handler: facts },
-    ToolEntry { name: "events", description: "Slow.", input_schema: r#"{"type":"object"}"#, owner: "RB", safety: Safety::Read, handler: slow },
-    ToolEntry { name: "read_phys", description: "Raw.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, handler: raw },
-    ToolEntry { name: "reload", description: "Reload.", input_schema: r#"{"type":"object","properties":{"url":{"type":"string"}}}"#, owner: "RB", safety: Safety::Change, handler: raw },
-    ToolEntry { name: "output", description: "Output.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, handler: crate::server_only },
-    ToolEntry { name: "stop", description: "Stop.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Change, handler: crate::server_only },
+    ToolEntry { name: "hw_info", description: "Facts.", input_schema: r#"{"type":"object","properties":{"section":{"type":"string"}}}"#, owner: "MC", safety: Safety::Read, local: false, handler: facts },
+    ToolEntry { name: "events", description: "Slow.", input_schema: r#"{"type":"object"}"#, owner: "RB", safety: Safety::Read, local: false, handler: slow },
+    ToolEntry { name: "read_phys", description: "Raw.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, local: false, handler: raw },
+    ToolEntry { name: "reload", description: "Reload.", input_schema: r#"{"type":"object","properties":{"url":{"type":"string"}}}"#, owner: "RB", safety: Safety::Change, local: false, handler: raw },
+    ToolEntry { name: "output", description: "Output.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Read, local: false, handler: crate::server_only },
+    ToolEntry { name: "stop", description: "Stop.", input_schema: r#"{"type":"object"}"#, owner: "MC", safety: Safety::Change, local: false, handler: crate::server_only },
 ];
 
 fn gate() -> Gate {

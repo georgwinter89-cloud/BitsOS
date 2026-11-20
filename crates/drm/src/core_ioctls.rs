@@ -1,5 +1,7 @@
-//! The core ioctls (linux-6.6/drivers/gpu/drm/drm_ioctl.c, drm_gem.c) and Linux 6.6's core table: every number
-//! with its flags, so the render node refuses what Linux refuses there (EACCES) before it says "not done yet".
+//! The core ioctls (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c, drm_gem.c) and Linux 7.3.1's core table: every number
+//! with its flags, so the render node refuses what Linux refuses there (EACCES) before it says "not done yet". The
+//! legacy numbers (contexts, maps, buffers, AGP, SG, LOCK, MODESET_CTL) are gone from the table since Linux 6.8:
+//! holes, EINVAL before anything is copied.
 
 use crate::dispatch::{flags as F, Ctx, Desc, Handler};
 use crate::syncobj as so;
@@ -9,7 +11,7 @@ use linux::errno::*;
 use vfs::Errno;
 use vfs::sys::UserMem;
 
-/// `overflowuid` (GET_CLIENT's uid; Linux 6.6 hollowed the ioctl out, drm_ioctl.c:182).
+/// `overflowuid` (GET_CLIENT's uid; the ioctl is hollowed out, linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:182).
 const OVERFLOW_UID: u64 = 65534;
 
 fn put(data: &mut [u8], off: usize, v: &[u8]) -> Result<(), Errno> {
@@ -32,12 +34,13 @@ fn copy_field(mem: &dyn UserMem, buf: u64, len: &mut u64, value: &str) -> Result
     Ok(())
 }
 
-/// `drm_version` (drm_ioctl.c:509). Fields are written one by one, so the caller's padding comes back as it was.
+/// `drm_version` (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:540): the date is "0" for every driver ("userspace
+/// expects a non-empty string"). Fields are written one by one, so the caller's padding comes back as it was.
 fn version(ctx: &Ctx, data: &mut [u8]) -> Result<i64, Errno> {
     let mut v: drm_version = get(data)?;
     let i = ctx.dev.driver().info();
     let r = copy_field(ctx.mem, v.name, &mut v.name_len, i.name)
-        .and_then(|()| copy_field(ctx.mem, v.date, &mut v.date_len, i.date))
+        .and_then(|()| copy_field(ctx.mem, v.date, &mut v.date_len, "0"))
         .and_then(|()| copy_field(ctx.mem, v.desc, &mut v.desc_len, i.desc));
     put(data, 0, &i.major.to_le_bytes())?;
     put(data, 4, &i.minor.to_le_bytes())?;
@@ -79,7 +82,7 @@ fn get_stats(_ctx: &Ctx, data: &mut [u8]) -> Result<i64, Errno> {
     Ok(0)
 }
 
-/// `drm_getcap` (drm_ioctl.c:235): value 0 first; four caps for every driver, the rest only for KMS drivers
+/// `drm_getcap` (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:235): value 0 first; four caps for every driver, the rest only for KMS drivers
 /// (EOPNOTSUPP otherwise), unknown ones EINVAL.
 fn get_cap(ctx: &Ctx, data: &mut [u8]) -> Result<i64, Errno> {
     let req: drm_get_cap = get(data)?;
@@ -109,6 +112,7 @@ pub fn cap_value(i: &crate::device::DriverInfo, cap: u64) -> Result<u64, Errno> 
         DRM_CAP_CURSOR_HEIGHT => if m.cursor_height != 0 { m.cursor_height as u64 } else { 64 },
         DRM_CAP_ADDFB2_MODIFIERS => m.fb_modifiers as u64,
         DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
+        DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP => (f.atomic && m.async_page_flip) as u64,
         _ => return Err(EINVAL),
     };
     Ok(v)
@@ -124,73 +128,85 @@ fn gem_close(ctx: &Ctx, data: &mut [u8]) -> Result<i64, Errno> {
     Ok(0)
 }
 
+/// `drm_noop`: the permission checks were the whole work.
+fn noop(_ctx: &Ctx, _data: &mut [u8]) -> Result<i64, Errno> {
+    Ok(0)
+}
+
+/// `drm_invalid_op`: EINVAL after the permission checks.
+fn invalid_op(_ctx: &Ctx, _data: &mut [u8]) -> Result<i64, Errno> {
+    Err(EINVAL)
+}
+
+/// `DRM_CLIENT_NAME_MAX_LEN` (linux-7.3.1/include/uapi/drm/drm.h:1059).
+const CLIENT_NAME_MAX: u64 = DRM_CLIENT_NAME_MAX_LEN as u64;
+
+/// `drm_set_client_name` (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:577): `struct drm_set_client_name { u64 name_len;
+/// u64 name; }`; longer than 64 EINVAL, the copy EFAULT, a NUL inside or a byte that is not printable ASCII without
+/// space EINVAL; length 0 clears the name.
+fn set_client_name(ctx: &Ctx, data: &mut [u8]) -> Result<i64, Errno> {
+    let len = u64::from_le_bytes(data.get(0..8).ok_or(EINVAL)?.try_into().map_err(|_| EINVAL)?);
+    let ptr = u64::from_le_bytes(data.get(8..16).ok_or(EINVAL)?.try_into().map_err(|_| EINVAL)?);
+    if len > CLIENT_NAME_MAX {
+        return Err(EINVAL);
+    }
+    let name = if len == 0 {
+        None
+    } else {
+        let mut b = alloc::vec![0u8; len as usize];
+        if !ctx.mem.read(ptr, &mut b) {
+            return Err(EFAULT);
+        }
+        // `strlen(new_name) != len` (a NUL inside) and `drm_validate_value_string` (isascii && isgraph).
+        if !b.iter().all(|c| c.is_ascii_graphic()) {
+            return Err(EINVAL);
+        }
+        Some(alloc::string::String::from_utf8(b).map_err(|_| EINVAL)?)
+    };
+    ctx.file.set_client_name(name);
+    Ok(0)
+}
+
 const U: Handler = Handler::Unsupported;
+const NOOP: Handler = Handler::Core(noop);
+const INVALID: Handler = Handler::Core(invalid_op);
+
 
 const fn d(cmd: u32, flags: u32, name: &'static str, handler: Handler) -> Desc {
     Desc { cmd, flags, name, handler }
 }
 
-/// Linux 6.6's `drm_ioctls[]` (drm_ioctl.c:569-719): numbers and flags as there; the legacy entries
-/// (`DRM_LEGACY_IOCTL_DEF`, `drm_invalid_op` without CONFIG_DRM_LEGACY) are kept for their flags.
+/// Linux 7.3.1's `drm_ioctls[]` (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:644-747): numbers, flags and the entries
+/// that are `drm_noop` / `drm_invalid_op` there as there.
 const LIST: &[Desc] = &[
     d(DRM_IOCTL_VERSION, F::RENDER_ALLOW, "VERSION", Handler::Core(version)),
     d(DRM_IOCTL_GET_UNIQUE, 0, "GET_UNIQUE", Handler::Core(get_unique)),
     d(DRM_IOCTL_GET_MAGIC, 0, "GET_MAGIC", U),
-    d(DRM_IOCTL_IRQ_BUSID, F::MASTER | F::ROOT_ONLY, "IRQ_BUSID", U),
-    d(DRM_IOCTL_GET_MAP, 0, "GET_MAP", U),
     d(DRM_IOCTL_GET_CLIENT, 0, "GET_CLIENT", Handler::Core(get_client)),
     d(DRM_IOCTL_GET_STATS, 0, "GET_STATS", Handler::Core(get_stats)),
     d(DRM_IOCTL_GET_CAP, F::RENDER_ALLOW, "GET_CAP", Handler::Core(get_cap)),
     d(DRM_IOCTL_SET_CLIENT_CAP, 0, "SET_CLIENT_CAP", U),
     d(DRM_IOCTL_SET_VERSION, F::MASTER, "SET_VERSION", U),
-    d(DRM_IOCTL_SET_UNIQUE, F::AUTH | F::MASTER | F::ROOT_ONLY, "SET_UNIQUE", U),
-    d(DRM_IOCTL_BLOCK, F::AUTH | F::MASTER | F::ROOT_ONLY, "BLOCK", U),
-    d(DRM_IOCTL_UNBLOCK, F::AUTH | F::MASTER | F::ROOT_ONLY, "UNBLOCK", U),
+    d(DRM_IOCTL_SET_UNIQUE, F::AUTH | F::MASTER | F::ROOT_ONLY, "SET_UNIQUE", INVALID),
+    d(DRM_IOCTL_BLOCK, F::AUTH | F::MASTER | F::ROOT_ONLY, "BLOCK", NOOP),
+    d(DRM_IOCTL_UNBLOCK, F::AUTH | F::MASTER | F::ROOT_ONLY, "UNBLOCK", NOOP),
     d(DRM_IOCTL_AUTH_MAGIC, F::MASTER, "AUTH_MAGIC", U),
-    d(DRM_IOCTL_ADD_MAP, F::AUTH | F::MASTER | F::ROOT_ONLY, "ADD_MAP", U),
-    d(DRM_IOCTL_RM_MAP, F::AUTH, "RM_MAP", U),
-    d(DRM_IOCTL_SET_SAREA_CTX, F::AUTH | F::MASTER | F::ROOT_ONLY, "SET_SAREA_CTX", U),
-    d(DRM_IOCTL_GET_SAREA_CTX, F::AUTH, "GET_SAREA_CTX", U),
     d(DRM_IOCTL_SET_MASTER, 0, "SET_MASTER", U),
     d(DRM_IOCTL_DROP_MASTER, 0, "DROP_MASTER", U),
-    d(DRM_IOCTL_ADD_CTX, F::AUTH | F::ROOT_ONLY, "ADD_CTX", U),
-    d(DRM_IOCTL_RM_CTX, F::AUTH | F::MASTER | F::ROOT_ONLY, "RM_CTX", U),
-    d(DRM_IOCTL_MOD_CTX, F::AUTH | F::MASTER | F::ROOT_ONLY, "MOD_CTX", U),
-    d(DRM_IOCTL_GET_CTX, F::AUTH, "GET_CTX", U),
-    d(DRM_IOCTL_SWITCH_CTX, F::AUTH | F::MASTER | F::ROOT_ONLY, "SWITCH_CTX", U),
-    d(DRM_IOCTL_NEW_CTX, F::AUTH | F::MASTER | F::ROOT_ONLY, "NEW_CTX", U),
-    d(DRM_IOCTL_RES_CTX, F::AUTH, "RES_CTX", U),
-    d(DRM_IOCTL_ADD_DRAW, F::AUTH | F::MASTER | F::ROOT_ONLY, "ADD_DRAW", U),
-    d(DRM_IOCTL_RM_DRAW, F::AUTH | F::MASTER | F::ROOT_ONLY, "RM_DRAW", U),
-    d(DRM_IOCTL_LOCK, F::AUTH, "LOCK", U),
-    d(DRM_IOCTL_UNLOCK, F::AUTH, "UNLOCK", U),
-    d(DRM_IOCTL_FINISH, F::AUTH, "FINISH", U),
-    d(DRM_IOCTL_ADD_BUFS, F::AUTH | F::MASTER | F::ROOT_ONLY, "ADD_BUFS", U),
-    d(DRM_IOCTL_MARK_BUFS, F::AUTH | F::MASTER | F::ROOT_ONLY, "MARK_BUFS", U),
-    d(DRM_IOCTL_INFO_BUFS, F::AUTH, "INFO_BUFS", U),
-    d(DRM_IOCTL_MAP_BUFS, F::AUTH, "MAP_BUFS", U),
-    d(DRM_IOCTL_FREE_BUFS, F::AUTH, "FREE_BUFS", U),
-    d(DRM_IOCTL_DMA, F::AUTH, "DMA", U),
-    d(DRM_IOCTL_CONTROL, F::AUTH | F::MASTER | F::ROOT_ONLY, "CONTROL", U),
-    d(DRM_IOCTL_AGP_ACQUIRE, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_ACQUIRE", U),
-    d(DRM_IOCTL_AGP_RELEASE, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_RELEASE", U),
-    d(DRM_IOCTL_AGP_ENABLE, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_ENABLE", U),
-    d(DRM_IOCTL_AGP_INFO, F::AUTH, "AGP_INFO", U),
-    d(DRM_IOCTL_AGP_ALLOC, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_ALLOC", U),
-    d(DRM_IOCTL_AGP_FREE, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_FREE", U),
-    d(DRM_IOCTL_AGP_BIND, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_BIND", U),
-    d(DRM_IOCTL_AGP_UNBIND, F::AUTH | F::MASTER | F::ROOT_ONLY, "AGP_UNBIND", U),
-    d(DRM_IOCTL_SG_ALLOC, F::AUTH | F::MASTER | F::ROOT_ONLY, "SG_ALLOC", U),
-    d(DRM_IOCTL_SG_FREE, F::AUTH | F::MASTER | F::ROOT_ONLY, "SG_FREE", U),
-    d(DRM_IOCTL_WAIT_VBLANK, F::UNLOCKED, "WAIT_VBLANK", U),
-    d(DRM_IOCTL_MODESET_CTL, 0, "MODESET_CTL", U),
-    d(DRM_IOCTL_UPDATE_DRAW, F::AUTH | F::MASTER | F::ROOT_ONLY, "UPDATE_DRAW", U),
+    d(DRM_IOCTL_ADD_DRAW, F::AUTH | F::MASTER | F::ROOT_ONLY, "ADD_DRAW", NOOP),
+    d(DRM_IOCTL_RM_DRAW, F::AUTH | F::MASTER | F::ROOT_ONLY, "RM_DRAW", NOOP),
+    d(DRM_IOCTL_FINISH, F::AUTH, "FINISH", NOOP),
+    d(DRM_IOCTL_WAIT_VBLANK, 0, "WAIT_VBLANK", U),
+    d(DRM_IOCTL_UPDATE_DRAW, F::AUTH | F::MASTER | F::ROOT_ONLY, "UPDATE_DRAW", NOOP),
     d(DRM_IOCTL_GEM_CLOSE, F::RENDER_ALLOW, "GEM_CLOSE", Handler::Core(gem_close)),
     d(DRM_IOCTL_GEM_FLINK, F::AUTH, "GEM_FLINK", Handler::Core(crate::gem_name::flink)),
     d(DRM_IOCTL_GEM_OPEN, F::AUTH, "GEM_OPEN", Handler::Core(crate::gem_name::open)),
+    // Disabled in Linux for security reasons (drm_gem.c:1018): `drm_invalid_op`.
+    d(DRM_IOCTL_GEM_CHANGE_HANDLE, F::RENDER_ALLOW, "GEM_CHANGE_HANDLE", INVALID),
     d(DRM_IOCTL_MODE_GETRESOURCES, 0, "MODE_GETRESOURCES", U),
     d(DRM_IOCTL_PRIME_HANDLE_TO_FD, F::RENDER_ALLOW, "PRIME_HANDLE_TO_FD", Handler::Core(crate::prime::handle_to_fd)),
     d(DRM_IOCTL_PRIME_FD_TO_HANDLE, F::RENDER_ALLOW, "PRIME_FD_TO_HANDLE", Handler::Core(crate::prime::fd_to_handle)),
+    d(DRM_IOCTL_SET_CLIENT_NAME, F::RENDER_ALLOW, "SET_CLIENT_NAME", Handler::Core(set_client_name)),
     d(DRM_IOCTL_MODE_GETPLANERESOURCES, 0, "MODE_GETPLANERESOURCES", U),
     d(DRM_IOCTL_MODE_GETCRTC, 0, "MODE_GETCRTC", U),
     d(DRM_IOCTL_MODE_SETCRTC, F::MASTER, "MODE_SETCRTC", U),
@@ -201,8 +217,8 @@ const LIST: &[Desc] = &[
     d(DRM_IOCTL_MODE_SETGAMMA, F::MASTER, "MODE_SETGAMMA", U),
     d(DRM_IOCTL_MODE_GETENCODER, 0, "MODE_GETENCODER", U),
     d(DRM_IOCTL_MODE_GETCONNECTOR, 0, "MODE_GETCONNECTOR", U),
-    d(DRM_IOCTL_MODE_ATTACHMODE, F::MASTER, "MODE_ATTACHMODE", U),
-    d(DRM_IOCTL_MODE_DETACHMODE, F::MASTER, "MODE_DETACHMODE", U),
+    d(DRM_IOCTL_MODE_ATTACHMODE, F::MASTER, "MODE_ATTACHMODE", NOOP),
+    d(DRM_IOCTL_MODE_DETACHMODE, F::MASTER, "MODE_DETACHMODE", NOOP),
     d(DRM_IOCTL_MODE_GETPROPERTY, 0, "MODE_GETPROPERTY", U),
     d(DRM_IOCTL_MODE_SETPROPERTY, F::MASTER, "MODE_SETPROPERTY", U),
     d(DRM_IOCTL_MODE_GETPROPBLOB, 0, "MODE_GETPROPBLOB", U),
@@ -211,6 +227,7 @@ const LIST: &[Desc] = &[
     d(DRM_IOCTL_MODE_ADDFB, 0, "MODE_ADDFB", U),
     d(DRM_IOCTL_MODE_ADDFB2, 0, "MODE_ADDFB2", U),
     d(DRM_IOCTL_MODE_RMFB, 0, "MODE_RMFB", U),
+    d(DRM_IOCTL_MODE_CLOSEFB, 0, "MODE_CLOSEFB", U),
     d(DRM_IOCTL_MODE_PAGE_FLIP, F::MASTER, "MODE_PAGE_FLIP", U),
     d(DRM_IOCTL_MODE_DIRTYFB, F::MASTER, "MODE_DIRTYFB", U),
     d(DRM_IOCTL_MODE_CREATE_DUMB, 0, "MODE_CREATE_DUMB", U),

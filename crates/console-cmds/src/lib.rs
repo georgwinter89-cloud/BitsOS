@@ -74,15 +74,24 @@ fn snd_cmd(c: &mut Ctx) -> Result<(), String> {
             c.println(&line);
             Ok(())
         }
-        _ => Err(String::from("usage: snd output auto|jack|hdmi|usb, or snd hdmi off")),
+        // GP-SOUND: the tone check, the one thing that makes a sound unasked (one quiet second).
+        ["ton"] => {
+            c.println(&snd::tone::tone_check(None));
+            Ok(())
+        }
+        ["ton", v] => {
+            c.println(&snd::tone::tone_check(Some(v)));
+            Ok(())
+        }
+        _ => Err(String::from("usage: snd output auto|jack|hdmi|usb, snd hdmi off, or snd ton [number|headset|lautsprecher|kopfhoerer|spdif]")),
     }
 }
-console::command!(name: "snd", args: "output auto|jack|hdmi|usb | hdmi off", help: "where sound plays; HDMI sound off", physical_only: false, run: snd_cmd);
+console::command!(name: "snd", args: "output auto|jack|hdmi|usb | hdmi off | ton [output]", help: "where sound plays; HDMI sound off; one quiet test tone", physical_only: false, run: snd_cmd);
 
 fn run(c: &mut Ctx) -> Result<(), String> {
     let Some(&path) = c.args.first() else { return Err(String::from("usage: run <path> [args]")) };
     let argv: Vec<&str> = c.args.clone();
-    let subject = policy::Subject { program: CONSOLE_PROGRAM, pid: 0, uid: 0 };
+    let subject = policy::Subject { program: CONSOLE_PROGRAM, pid: 0, uid: 0, tree: 0 };
     if let Err(d) = policy::check(&subject, &policy::Access::Path { path, write: false, create: false }) {
         return Err(format!("refused: {}", d.reason));
     }
@@ -195,7 +204,7 @@ impl console::jobs::Procs for ProcHook {
         let pid = t.group().image().map_or(t.tid(), |p| p.pid);
         Some((pid, t.prctl().comm()))
     }
-    /// `will_become_orphaned_pgrp` (linux-6.6/kernel/exit.c:326): members whose parent is init (pid 1), the
+    /// `will_become_orphaned_pgrp` (linux-7.3.1/kernel/exit.c:359): members whose parent is init (pid 1), the
     /// kernel (0) or gone (Linux re-parents those to init) do not count.
     fn pgrp_orphaned(&self, pgrp: u32) -> bool {
         let all = proc::processes();

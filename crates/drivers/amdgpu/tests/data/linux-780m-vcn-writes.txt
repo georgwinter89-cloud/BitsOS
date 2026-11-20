@@ -1,0 +1,15 @@
+# Linux amdgpu load on the 780M (27.10.2026 capture): VCN 0's CPU writes of vcn_v4_0_start_dpg_mode (the SRAM list goes
+# through the PSP and is not in the trace) and of the stop one second later. W <BAR5 byte> <value>; the ring's address as 0.
+# Test: tests::vcn (the stage's writes on the fakes).
+W 0x1f808 0x1 # UVD_POWER_STATUS
+W 0x1f808 0x105 # UVD_POWER_STATUS
+W 0x1fba8 0x0 # UVD_RB_BASE_LO
+W 0x1fbac 0x0 # UVD_RB_BASE_HI
+W 0x1fbb0 0x400 # UVD_RB_SIZE
+W 0x1fa14 0x1fb # VCN_RB_ENABLE
+W 0x1fab0 0x0 # UVD_RB_RPTR
+W 0x1fab4 0x0 # UVD_RB_WPTR
+W 0x1fab4 0x0 # UVD_RB_WPTR
+W 0x1fa14 0x1ff # VCN_RB_ENABLE
+W 0x1f9c8 0x40000c48 # VCN_RB1_DB_CTRL
+W 0x1f808 0x101 # UVD_POWER_STATUS

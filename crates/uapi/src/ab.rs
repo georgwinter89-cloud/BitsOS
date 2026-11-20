@@ -31,6 +31,14 @@ pub mod clone {
     /// clone3 only.
     pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
     pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    /// clone3 only (linux-7.3.1/include/uapi/linux/sched.h:39): the child is reaped at once when it ends, no
+    /// signal; no_new_privs on the child; SIGKILL when the clone pidfd closes; an empty mount namespace.
+    pub const CLONE_AUTOREAP: u64 = 1 << 34;
+    pub const CLONE_NNP: u64 = 1 << 35;
+    pub const CLONE_PIDFD_AUTOKILL: u64 = 1 << 36;
+    pub const CLONE_EMPTY_MNTNS: u64 = 1 << 37;
+    /// unshare(2)'s 32-bit alias of CLONE_EMPTY_MNTNS (sched.h:54; CLONE_PARENT_SETTID's bit).
+    pub const UNSHARE_EMPTY_MNTNS: u64 = 0x0010_0000;
     /// Every namespace flag (V2 has no namespaces yet: EINVAL, as a kernel built without them).
     pub const CLONE_NAMESPACES: u64 = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME;
     /// Linux `CLONE_LEGACY_FLAGS`: the 32 bits clone(2) can carry.
@@ -122,7 +130,7 @@ pub mod siginfo {
     pub const NSIGCHLD: i32 = 6;
     pub const NSIGPOLL: i32 = 6;
     pub const NSIGSYS: i32 = 2;
-    /// Kernel-internal restart answers (linux-6.6/include/linux/errno.h:13).
+    /// Kernel-internal restart answers (linux-7.3.1/include/linux/errno.h:14).
     pub const ERESTARTSYS: i64 = 512;
     pub const ERESTARTNOINTR: i64 = 513;
     pub const ERESTARTNOHAND: i64 = 514;
@@ -178,7 +186,9 @@ pub mod exec {
     pub const ARG_MAX: u64 = 32 * 4096;
     /// Three quarters of `_STK_LIM` (8 MiB): the argument space is never above it (`bprm_stack_limits`).
     pub const STK_LIM_3_4: u64 = (8 << 20) / 4 * 3;
-    /// `bprm_stack_limits` (linux-6.6/fs/exec.c:487): the bytes argv + envp pointers and strings may take for a
+    /// execveat: only check that the file could be run (linux-7.3.1/include/uapi/linux/fcntl.h:191).
+    pub const AT_EXECVE_CHECK: u64 = 0x10000;
+    /// `bprm_stack_limits` (linux-7.3.1/fs/exec.c:403): the bytes argv + envp pointers and strings may take for a
     /// soft RLIMIT_STACK of `rlim`.
     pub const fn arg_limit(rlim: u64) -> u64 {
         let l = if STK_LIM_3_4 < rlim / 4 { STK_LIM_3_4 } else { rlim / 4 };
@@ -198,8 +208,8 @@ pub mod auxv_more {
     pub const AT_HWCAP4: u64 = 30;
 }
 
-/// Signal ABI values (linux-6.6/arch/x86/include/uapi/asm/signal.h, include/uapi/asm-generic/signal-defs.h,
-/// include/linux/signal_types.h `UAPI_SA_FLAGS`, include/uapi/linux/signal.h).
+/// Signal ABI values (linux-7.3.1/arch/x86/include/uapi/asm/signal.h:64, include/uapi/asm-generic/signal-defs.h,
+/// include/linux/signal_types.h:84 `UAPI_SA_FLAGS`, include/uapi/linux/signal.h).
 pub mod sigabi {
     /// Signals 1..=64 (`_NSIG`); a sigset is one u64 on x86-64.
     pub const NSIG: u32 = 64;
@@ -228,7 +238,7 @@ pub mod sigabi {
     pub const MINSIGSTKSZ: u64 = 2048;
 }
 
-/// Resource limits (linux-6.6/include/uapi/asm-generic/resource.h, include/asm-generic/resource.h).
+/// Resource limits (linux-7.3.1/include/uapi/asm-generic/resource.h:16, include/asm-generic/resource.h:11).
 pub mod rlimit {
     pub const RLIMIT_CPU: u32 = 0;
     pub const RLIMIT_FSIZE: u32 = 1;
@@ -260,7 +270,8 @@ pub mod rlimit {
     pub const MQ_BYTES_MAX: u64 = 819_200;
 }
 
-/// Clocks and timer flags (linux-6.6/include/uapi/linux/time.h).
+/// Clocks and timer flags (linux-6.6/include/uapi/linux/time.h) (Linux 7.3.1 differs:
+/// linux-7.3.1/include/uapi/linux/time.h:74, see plan/spec/linux7-differences.md).
 pub mod clock {
     pub const CLOCK_REALTIME: i32 = 0;
     pub const CLOCK_MONOTONIC: i32 = 1;
@@ -276,7 +287,7 @@ pub mod clock {
     pub const TIMER_ABSTIME: u64 = 1;
 }
 
-/// poll(2) bits (linux-6.6/include/uapi/asm-generic/poll.h).
+/// poll(2) bits (linux-7.3.1/include/uapi/asm-generic/poll.h:6).
 pub mod poll {
     pub const POLLIN: u16 = 0x001;
     pub const POLLPRI: u16 = 0x002;
@@ -319,7 +330,7 @@ pub mod nr_more {
     pub const GETRESUID: usize = 118;
     pub const GETRESGID: usize = 120;
     pub const GETGROUPS: usize = 115;
-    /// AB-13: credentials (linux-6.6/arch/x86/entry/syscalls/syscall_64.tbl).
+    /// AB-13: credentials (linux-7.3.1/arch/x86/entry/syscalls/syscall_64.tbl:125).
     pub const SETREUID: usize = 113;
     pub const SETREGID: usize = 114;
     pub const SETGROUPS: usize = 116;
@@ -371,9 +382,14 @@ pub mod nr_more {
     pub const PROCESS_VM_READV: usize = 310;
     pub const PROCESS_VM_WRITEV: usize = 311;
     pub const KCMP: usize = 312;
+    /// L7-PROC: chroot to an open directory (linux-7.3.1/arch/x86/entry/syscalls/syscall_64.tbl:399).
+    pub const FCHROOT: usize = 472;
+    /// L7-RESTE-AB 2: file handles (syscall_64.tbl:314, :315).
+    pub const NAME_TO_HANDLE_AT: usize = 303;
+    pub const OPEN_BY_HANDLE_AT: usize = 304;
 }
 
-/// AB-17: kcmp types (linux-6.6/include/uapi/linux/kcmp.h:9).
+/// AB-17: kcmp types (linux-7.3.1/include/uapi/linux/kcmp.h:9).
 pub mod kcmp {
     pub const KCMP_FILE: u32 = 0;
     pub const KCMP_VM: u32 = 1;
@@ -388,13 +404,68 @@ pub mod kcmp {
     pub const EPOLL_SLOT_SIZE: usize = 12;
 }
 
-/// AB-12: pidfd flags (linux-6.6/include/uapi/linux/pidfd.h:10).
+/// AB-12, L7-PROC: pidfd flags, the pidfd_info layout and the pidfs ioctls (linux-7.3.1/include/uapi/linux/pidfd.h:12).
 pub mod pidfd {
-    /// `PIDFD_NONBLOCK` = O_NONBLOCK: pidfd_open's only flag; waitid on such a pidfd does not wait (EAGAIN).
+    /// `PIDFD_NONBLOCK` = O_NONBLOCK: waitid on such a pidfd does not wait (EAGAIN).
     pub const PIDFD_NONBLOCK: u64 = 0o4000;
+    /// `PIDFD_THREAD` = O_EXCL: a pidfd for one thread (pidfd_open's second flag, shown in F_GETFL).
+    pub const PIDFD_THREAD: u64 = 0o200;
+    /// pidfd_send_signal's scope flags (one at a time).
+    pub const PIDFD_SIGNAL_THREAD: u32 = 1;
+    pub const PIDFD_SIGNAL_THREAD_GROUP: u32 = 2;
+    pub const PIDFD_SIGNAL_PROCESS_GROUP: u32 = 4;
+    /// Pseudo fds for the caller itself (linux-7.3.1/include/uapi/linux/fcntl.h:122).
+    pub const PIDFD_SELF_THREAD: i32 = -10000;
+    pub const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
+    /// open_by_handle_at's anchors for pidfs's and nsfs's roots (fcntl.h:125, :126).
+    pub const FD_PIDFS_ROOT: i32 = -10002;
+    pub const FD_NSFS_ROOT: i32 = -10003;
+    /// fchroot's root that fails every operation (fcntl.h:127).
+    pub const FD_FAILFS_ROOT: i32 = -10004;
+    /// `struct pidfd_info` mask bits and sizes.
+    pub const PIDFD_INFO_PID: u64 = 1 << 0;
+    pub const PIDFD_INFO_CREDS: u64 = 1 << 1;
+    pub const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
+    pub const PIDFD_INFO_EXIT: u64 = 1 << 3;
+    pub const PIDFD_INFO_COREDUMP: u64 = 1 << 4;
+    pub const PIDFD_INFO_SUPPORTED_MASK: u64 = 1 << 5;
+    pub const PIDFD_INFO_COREDUMP_SIGNAL: u64 = 1 << 6;
+    pub const PIDFD_INFO_COREDUMP_CODE: u64 = 1 << 7;
+    pub const PIDFD_INFO_SIZE_VER0: usize = 64;
+    pub const PIDFD_INFO_SIZE_VER3: usize = 88;
+    pub const PIDFD_COREDUMP_SKIP: u32 = 1 << 1;
+    pub const PIDFD_COREDUMP_USER: u32 = 1 << 2;
+    pub const PIDFD_COREDUMP_ROOT: u32 = 1 << 3;
+    /// pidfs ioctls (`PIDFS_IOCTL_MAGIC` 0xFF): `_IO(0xFF, 1..=10)` give namespace fds, `_IOWR(0xFF, 11, ..)` is
+    /// PIDFD_GET_INFO with the caller's struct size.
+    pub const PIDFS_IOCTL_MAGIC: u64 = 0xFF;
+    pub const PIDFD_GET_INFO_NR: u64 = 11;
+    /// `FS_IOC_GETVERSION` (`_IOR('v', 1, long)`): the inode generation.
+    pub const FS_IOC_GETVERSION: u64 = 0x8008_7601;
 }
 
-/// Interval and POSIX timers (linux-6.6/include/uapi/linux/time.h, asm-generic/siginfo.h `sigevent`).
+/// L7-RESTE-AB 2: file handles (linux-7.3.1/include/uapi/linux/fcntl.h:184, include/linux/exportfs.h:15, :133).
+pub mod fhandle {
+    /// name_to_handle_at's flags.
+    pub const AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x001;
+    pub const AT_HANDLE_CONNECTABLE: u64 = 0x002;
+    pub const AT_HANDLE_FID: u64 = 0x200;
+    /// The largest `handle_bytes`.
+    pub const MAX_HANDLE_SZ: u32 = 128;
+    /// Handle types: a pidfs handle (the pid's inode number), and "does not fit".
+    pub const FILEID_KERNFS: i32 = 0xfe;
+    pub const FILEID_INVALID: i32 = 0xff;
+    /// 32-bit inode number and generation (`generic_encode_ino32_fh`; tmpfs's own handle has the same type).
+    pub const FILEID_INO32_GEN: i32 = 1;
+    /// 64-bit inode number and generation, AT_HANDLE_FID of a file system without export operations.
+    pub const FILEID_INO64_GEN: i32 = 0x81;
+    /// The type's user flag bits and the two that are known.
+    pub const FILEID_USER_FLAGS_MASK: u32 = 0xffff_0000;
+    pub const FILEID_IS_CONNECTABLE: u32 = 0x1_0000;
+    pub const FILEID_IS_DIR: u32 = 0x2_0000;
+}
+
+/// Interval and POSIX timers (linux-7.3.1/include/uapi/linux/time.h:42, asm-generic/siginfo.h:336 `sigevent`).
 pub mod timers {
     pub const ITIMER_REAL: i32 = 0;
     pub const ITIMER_VIRTUAL: i32 = 1;
@@ -494,6 +565,7 @@ pub mod fcntl {
     pub const F_GETLEASE: u64 = 1025;
     pub const F_NOTIFY: u64 = 1026;
     pub const F_DUPFD_QUERY: u64 = 1027;
+    pub const F_CREATED_QUERY: u64 = 1028;
     pub const F_CANCELLK: u64 = 1029;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
     pub const F_SETPIPE_SZ: u64 = 1031;
@@ -504,6 +576,10 @@ pub mod fcntl {
     pub const F_SET_RW_HINT: u64 = 1036;
     pub const F_GET_FILE_RW_HINT: u64 = 1037;
     pub const F_SET_FILE_RW_HINT: u64 = 1038;
+    /// linux-7.3.1/include/uapi/linux/fcntl.h:84: delegations, `struct delegation` (8 bytes) as the argument.
+    pub const F_GETDELEG: u64 = 1039;
+    pub const F_SETDELEG: u64 = 1040;
+    pub const DELEGATION_SIZE: usize = 8;
     pub const F_OWNER_TID: i32 = 0;
     pub const F_OWNER_PID: i32 = 1;
     pub const F_OWNER_PGRP: i32 = 2;

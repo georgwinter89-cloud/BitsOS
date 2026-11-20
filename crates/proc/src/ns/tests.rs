@@ -253,3 +253,20 @@ fn namespace_limits_per_level() {
     assert_eq!(used_in(l1.inum, Counted::User, uid), 0);
     assert_eq!(used(Counted::User, uid), before);
 }
+
+#[test]
+fn initial_namespaces_have_linux_7_inode_numbers() {
+    // linux-7.3.1/include/uapi/linux/nsfs.h:48: every initial namespace V2 has a fixed number; the first one
+    // made afterwards comes from PROC_DYNAMIC_FIRST up.
+    let fixed = [
+        (super::misc::init_ipc().inum, 0xEFFF_FFFF),
+        (super::misc::init_uts().inum, 0xEFFF_FFFE),
+        (init_user_ns().inum, 0xEFFF_FFFD),
+        (init_pid_ns().inum, 0xEFFF_FFFC),
+        (super::misc::init_net().inum, 0xEFFF_FFF9),
+    ];
+    for (got, want) in fixed {
+        assert_eq!(got, want);
+    }
+    assert!(super::alloc_inum() >= 0xF000_0000);
+}

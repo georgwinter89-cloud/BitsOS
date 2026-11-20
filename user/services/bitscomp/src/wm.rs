@@ -50,11 +50,24 @@ pub enum Action {
     Maximise,
     /// WY-12: minimise the focused window (Super+Down, `ctl minimize`).
     Minimize,
+    /// C (12.11.): the newest minimised window of the shown workspace comes back (Super+Shift+Up).
+    Unminimize,
     /// WY-12: Alt+Tab (1) and Shift+Alt+Tab (-1): the next window; a minimised one is restored.
     Switch(i32),
     /// PK-L1b: the circle menu of a library tile: pin to (or loosen from) the start page, start in a new tile.
     LibraryPin,
     LibraryTile,
+    /// PK-7a: "Programm verwalten" and "Entfernen" of a package tile: the "Programme" page.
+    LibraryManage,
+    LibraryRemove,
+    /// GM-6a: Win+Esc: into the sofa mode or out of it.
+    Sofa,
+    /// FELD: Win+Space: the Feld opens or closes.
+    Feld,
+    /// REWIND: Win+Tab (1) and Shift+Win+Tab (-1): the next or the previous workspace, wrapping around.
+    CycleWorkspace(i32),
+    /// REWIND: Win+Z: the rewind view opens or closes (grey: says why).
+    Rewind,
 }
 
 impl App {
@@ -82,6 +95,17 @@ impl App {
 
     pub fn placements(&self) -> Vec<Placement<Window>> {
         self.fit(self.ws.arrange(self.area(), self.area_full(), self.theme.gap))
+    }
+
+    /// The placements as drawn and hit: while "Startseite" puts the start page over the workspace's windows (B,
+    /// 12.11.) none is shown or takes the pointer; they keep their places (layout and configure use `placements`)
+    /// and come back unchanged.
+    pub fn drawn_placements(&self) -> Vec<Placement<Window>> {
+        let mut v = self.placements();
+        if self.desk.start_forced {
+            v.iter_mut().for_each(|p| p.visible = false);
+        }
+        v
     }
 
     /// WY-8: a fullscreen window's frame is grown by the header and border, so that its client part
@@ -140,11 +164,16 @@ impl App {
         let focus = self.ws.focused().filter(|w| !self.is_hung(w)).and_then(|w| w.surface());
         let kb = self.seat.get_keyboard().unwrap();
         if kb.current_focus() != focus {
+            // CL-3b: a window that takes the focus takes the keys from the assistant's input line too.
+            if focus.is_some() {
+                self.assist_blur();
+            }
             kb.set_focus(self, focus, SERIAL_COUNTER.next_serial());
         }
     }
 
     pub fn forget_window(&mut self, w: &Window) {
+        self.habit_closed(w);
         self.lock.changed();
         self.ws.remove(w);
         self.forget_parked(w);
@@ -175,11 +204,21 @@ impl App {
         }
         self.layout_dirty = true;
         self.session_dirty();
+        self.play_gone(w);
+        self.sofa_window_gone();
     }
 
     /// The suggestions first, then floating windows (WY-5c: above every bar), then the chrome and the start page,
     /// the gaps, the tiles.
     pub fn hit(&self, pos: Point<f64, Logical>) -> Hit {
+        // A (12.11.): the question about closing a workspace is modal: it takes every click.
+        if let Some(s) = self.ws_ask_spot(pos.x, pos.y) {
+            return Hit::Spot(s);
+        }
+        // C (12.11.): the open list of minimised windows lies over the windows.
+        if let Some(s) = self.min_list_spot(pos.x, pos.y) {
+            return Hit::Spot(s);
+        }
         if let Some(i) = self.suggest_at(pos.x, pos.y) {
             return Hit::Spot(crate::desk::Spot::Suggest(i));
         }
@@ -190,7 +229,7 @@ impl App {
                 return Hit::Surface(s, (loc + at).to_f64());
             }
         }
-        let placements: Vec<_> = self.placements().into_iter().rev().filter(|p| p.visible).collect();
+        let placements: Vec<_> = self.drawn_placements().into_iter().rev().filter(|p| p.visible).collect();
         if let Some(p) = placements.iter().find(|p| p.fullscreen) {
             // WY-8: the whole screen is the client's: no bars, no frame, no resize edges (a hung one keeps the
             // veil's buttons).
@@ -284,9 +323,20 @@ impl App {
     }
 
     pub fn act(&mut self, action: Action) {
+        // GM-6a: a workspace key in the sofa mode shows the desktop first (then the key does what it does there).
+        if self.sofa.active && matches!(action, Action::NewWorkspace | Action::RemoveWorkspace | Action::Workspace(_)) {
+            self.sofa_switch(crate::sofa::Way::Workspace);
+        }
         let focused = self.ws.focused().cloned();
         match action {
             Action::None => return,
+            Action::Sofa => {
+                self.rewind_close("Win+Esc");
+                return self.sofa_switch(crate::sofa::Way::WinEsc);
+            }
+            Action::Rewind => return self.rewind_button("Win+Z"),
+            Action::Feld => return self.feld_toggle("Win+Space"),
+            Action::CycleWorkspace(dir) => return self.ws_cycle(dir),
             Action::Float => {
                 if let Some(w) = focused {
                     self.ws.toggle_float(&w, self.area());
@@ -309,9 +359,16 @@ impl App {
                     self.minimize(&w, "keys");
                 }
             }
+            Action::Unminimize => {
+                if let Some(w) = self.ws.minimized.last().map(|m| m.win.clone()) {
+                    self.unminimize(&w, "keys");
+                }
+            }
             Action::Switch(dir) => self.switch_window(dir),
             Action::LibraryPin => self.library_pin(),
             Action::LibraryTile => self.library_new_tile(),
+            Action::LibraryManage => self.library_manage(false),
+            Action::LibraryRemove => self.library_manage(true),
             Action::Grow(d) => {
                 self.ws.grow_focused(d);
             }
@@ -337,7 +394,7 @@ impl App {
             }
             Action::Workspace(i) => {
                 if self.ws_switch(i) {
-                    // WY-19c: the arrival (Wechsel.dc.html's circle wipe), at the gpu level.
+                    // WY-19c: the arrival (Wechsel.dc.html's circle wipe).
                     self.fx_play(crate::fx::plan::WIPE);
                 }
             }
@@ -374,7 +431,18 @@ impl App {
         self.layout_dirty = true;
     }
 
+    /// A start that keeps bitscomp's stderr for its output (`ctl spawn`).
     pub fn spawn(&mut self, argv: &[&str]) -> Option<u32> {
+        self.spawn_as(argv, false)
+    }
+
+    /// PE-1: a start from the desktop: its output goes into a pipe of its own and an early or failed end shows a
+    /// notice (`prog_note`).
+    pub fn spawn_desktop(&mut self, argv: &[&str]) -> Option<u32> {
+        self.spawn_as(argv, true)
+    }
+
+    fn spawn_as(&mut self, argv: &[&str], desktop: bool) -> Option<u32> {
         let (cmd, args) = argv.split_first()?;
         // The child's PATH (spawn_env wins over ours): the trampoline's execvp searches that one.
         let path = crate::spawn::child_path(&self.spawn_env, std::env::var("PATH").ok());
@@ -412,14 +480,36 @@ impl App {
         // WY-5b: foot gets the theme's colours; only the exec sees it (the session keeps `argv`).
         let foot = crate::foot::is_foot(cmd);
         let foot_file = foot && self.foot_config_arg().map(|a| c.arg(a)).is_some();
-        c.args(args);
+        if foot {
+            // GPY: the symbol fonts as foot's fallbacks; only the exec sees them (the session keeps `argv`).
+            c.args(args.iter().map(|a| crate::terminal::with_symbols(a).unwrap_or_else(|| a.to_string())));
+        } else {
+            c.args(args);
+        }
         child_env(&mut c, &self.socket_name, crate::xwayland::display(self).as_deref(), &self.spawn_env);
         // Never bitscomp's own stdin (a root start's console terminal: not the user's to read or write).
         c.stdin(std::process::Stdio::null());
         // Own process group (pgid = its pid): the SIGTERM/SIGKILL at bitscomp's end goes to the group and so also
         // reaches helpers it started in the same group.
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
-        match c.spawn() {
+        // PE-1: a page is bitscomp's own window; its lines stay in the journal as before.
+        let pipe = match (desktop && crate::page_app::is_page_argv(argv).is_none()).then(|| self.prog_pipe()).flatten() {
+            Some((p, w)) => match w.try_clone() {
+                Ok(e) => {
+                    c.stdout(std::process::Stdio::from(w)).stderr(std::process::Stdio::from(e));
+                    Some(p)
+                }
+                Err(_) => {
+                    self.prog_unused(p);
+                    None
+                }
+            },
+            None => None,
+        };
+        let spawned = c.spawn();
+        // The write ends belong to the child now: ours close here, so the pipe ends when the program's do.
+        drop(c);
+        match spawned {
             Ok(child) => {
                 let pid = child.id();
                 self.children.push((child, std::time::Instant::now()));
@@ -431,9 +521,15 @@ impl App {
                     self.foot.started(pid, foot_file);
                 }
                 self.page_spawned(pid, argv);
+                if let Some(p) = pipe {
+                    self.prog_started(p, pid, argv, foot);
+                }
                 Some(pid)
             }
             Err(e) => {
+                if let Some(p) = pipe {
+                    self.prog_unused(p);
+                }
                 eprintln!("bitscomp: cannot start {cmd}: {e}");
                 None
             }
@@ -450,8 +546,9 @@ impl App {
             _ => true,
         });
         for (pid, st) in ended {
-            self.library_ended(pid, st);
+            self.prog_ended(pid, st);
         }
+        self.prog_tick();
         if self.spawned.len() > self.children.len() {
             let alive: Vec<u32> = self.children.iter().map(|(c, _)| c.id()).collect();
             if self.launches.retain_alive(|p| alive.contains(&p)) {
@@ -465,14 +562,14 @@ impl App {
 }
 
 /// The environment a started program gets on top of bitscomp's own: our Wayland socket, our X display (WY-3: when
-/// Xwayland is set up; never one bitscomp inherited), none of the gpu build's EGL variables (WY-15: they name the
-/// Mesa tree, which only bitscomp's own glibc may load), then the settings' `spawn_env` (it wins).
+/// Xwayland is set up; never one bitscomp inherited), none of bitscomp's EGL variables (WY-15: they name the Mesa tree,
+/// which only bitscomp's own glibc may load, and its shader cache), then the settings' `spawn_env` (it wins).
 fn child_env(c: &mut std::process::Command, socket: &str, display: Option<&str>, spawn_env: &[(String, String)]) {
     c.env("WAYLAND_DISPLAY", socket).env_remove("DISPLAY");
     if let Some(d) = display {
         c.env("DISPLAY", d);
     }
-    for k in crate::flavour::GLES_ENV {
+    for k in crate::mesa::GLES_ENV {
         c.env_remove(k);
     }
     for (k, v) in spawn_env {
@@ -488,12 +585,12 @@ mod tests {
     fn a_started_program_loses_every_egl_variable() {
         let mut c = std::process::Command::new("env");
         // As if bitscomp's own environment had them: an explicit value set earlier is removed as well.
-        for k in crate::flavour::GLES_ENV {
+        for k in crate::mesa::GLES_ENV {
             c.env(k, "/tree");
         }
         super::child_env(&mut c, "wayland-7", None, &[("FOO".into(), "bar".into())]);
         let envs: Vec<(&OsStr, Option<&OsStr>)> = c.get_envs().collect();
-        for k in crate::flavour::GLES_ENV {
+        for k in crate::mesa::GLES_ENV {
             assert!(envs.contains(&(OsStr::new(k), None)), "{k} not removed: {envs:?}");
         }
         assert!(envs.contains(&(OsStr::new("DISPLAY"), None)));
@@ -515,12 +612,12 @@ mod tests {
 
     #[test]
     fn a_started_program_really_runs_without_them() {
-        // bitscomp's own environment carries one (as the gpu build's `set_env` does); the child must not see it.
-        let k = crate::flavour::GLES_ENV[0];
+        // bitscomp's own environment carries one (as `mesa::set_env` does); the child must not see it.
+        let k = crate::mesa::GLES_ENV[0];
         let mut c = std::process::Command::new("env");
         c.env(k, "/tree");
         super::child_env(&mut c, "wayland-7", None, &[]);
-        let Ok(out) = c.output() else { return }; // no `env` on this host: the first test covers the list
+        let out = c.output().expect("the build host has `env`");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(!text.lines().any(|l| l.starts_with(&format!("{k}="))), "{k} leaked: {text}");
         assert!(text.lines().any(|l| l == "WAYLAND_DISPLAY=wayland-7"));

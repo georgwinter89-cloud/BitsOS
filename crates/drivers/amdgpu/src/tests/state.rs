@@ -17,13 +17,11 @@ use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
-fn blob() -> Option<Discovery> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/gx/fixtures/minipc-780m-discovery.bin");
-    let Ok(buf) = std::fs::read(&p) else {
-        std::eprintln!("skip: {} missing", p.display());
-        return None;
-    };
-    Some(disc::parse(&buf).unwrap())
+/// The Mini-PC's real discovery blob (host/tests/gx/fixtures, tracked; missing is a failure).
+fn blob() -> Discovery {
+    let p = super::regdiff::fixture("minipc-780m-discovery.bin");
+    let buf = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e} (tracked fixture)", p.display()));
+    disc::parse(&buf).unwrap()
 }
 
 type Img = BTreeMap<u32, u32>;
@@ -58,7 +56,7 @@ fn run(d: &Discovery, img: &BTreeMap<u32, u32>) -> (classify::State, Vec<u32>) {
 
 #[test]
 fn fixture_addresses_are_the_classifiers() {
-    let Some(d) = blob() else { return };
+    let d = blob();
     let (_, _, names) = images();
     let addrs: BTreeMap<_, _> = classify::addresses(&d).into_iter().collect();
     for (n, b) in &names {
@@ -73,7 +71,7 @@ fn fixture_addresses_are_the_classifiers() {
 
 #[test]
 fn cold_start_from_the_trace() {
-    let Some(d) = blob() else { return };
+    let d = blob();
     let (cold, _, names) = images();
     let (st, seen) = run(&d, &cold);
     assert_eq!(st.start, Start::Cold, "{:?}", st.why);
@@ -96,7 +94,7 @@ fn cold_start_from_the_trace() {
 
 #[test]
 fn after_linux_from_the_read_back() {
-    let Some(d) = blob() else { return };
+    let d = blob();
     let (_, after, _) = images();
     let (st, _) = run(&d, &after);
     assert_eq!(st.start, Start::AfterLinux);
@@ -113,7 +111,7 @@ fn after_linux_from_the_read_back() {
 /// The other starts, from the cold image with the registers that tell them apart changed.
 #[test]
 fn bitsos_crash_and_dead_psp() {
-    let Some(d) = blob() else { return };
+    let d = blob();
     let (cold, _, names) = images();
     let at = |n: &str| names.get(n).copied().unwrap_or_else(|| classify::addresses(&d).into_iter().find(|(x, _)| *x == n).unwrap().1.unwrap());
     let with = |ch: &[(&str, u32)]| {
@@ -215,7 +213,7 @@ fn carve_plan_for_any_memsize() {
     let p = CarvePlan::new(0x840, 512).unwrap();
     assert_eq!((p.base, p.size), (0x8_4000_0000, 512 << 20));
     let at: Vec<(&str, u64, usize)> = p.samples.iter().map(|s| (s.what, p.phys(s), s.len)).collect();
-    assert_eq!(at, [(vram::START, 0x8_4000_0000, 4096), (vram::BELOW, 0x8_5FFE_F000, 4096), (vram::DISCOVERY, 0x8_5FFF_0000, 8192)]);
+    assert_eq!(at, [(vram::START, 0x8_4000_0000, 4096), (vram::BELOW, 0x8_5FFE_F000, 4096), (vram::DISCOVERY, 0x8_5FFF_0000, disc::TMR_SIZE)]);
     // 8 GB and 16 GB at the same offset; only bits 23:0 count.
     assert_eq!(CarvePlan::new(0xFF00_0840, 8192).unwrap().phys(&CarvePlan::new(0x840, 8192).unwrap().samples[2]), 0x8_4000_0000 + (8 << 30) - (64 << 10));
     assert_eq!(CarvePlan::new(0x840, 16384).unwrap().size, 16 << 30);
@@ -282,7 +280,7 @@ fn gc_addrs(d: &Discovery) -> Vec<u32> {
 /// GC powered at the check but gated before the re-check: the GC values are thrown away, GC's power unknown.
 #[test]
 fn gc_gating_during_the_reads_discards_gc() {
-    let Some(d) = blob() else { return };
+    let d = blob();
     let (cold, _, names) = images();
     let smuio = classify::addresses(&d).into_iter().find(|(n, _)| *n == "SMUIO_GFX_MISC_CNTL").unwrap().1.unwrap();
     let imu = classify::addresses(&d).into_iter().find(|(n, _)| *n == "GFX_IMU_MSG_FLAGS").unwrap().1.unwrap();
@@ -313,7 +311,7 @@ fn gc_gating_during_the_reads_discards_gc() {
 /// unless SMUIO said "on" (GX-7f: the IMU flags are read always and decide nothing), a defined verdict.
 #[test]
 fn hostile_register_values() {
-    let Some(d) = blob() else { return };
+    let d = blob();
     let smuio = classify::addresses(&d).into_iter().find(|(n, _)| *n == "SMUIO_GFX_MISC_CNTL").unwrap().1.unwrap();
     let imu = classify::addresses(&d).into_iter().find(|(n, _)| *n == "GFX_IMU_MSG_FLAGS").unwrap().1.unwrap();
     let gc: Vec<u32> = gc_addrs(&d).into_iter().filter(|b| *b != imu).collect();
@@ -376,7 +374,7 @@ fn carve_offset_cross_check() {
 fn probe_reports_every_section() {
     use crate::carve::Carve;
     use crate::probe::{Found, Via, assemble, bringup_line};
-    let Some(d) = blob() else { return };
+    let d = blob();
     let bin = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/gx/fixtures/minipc-780m-discovery.bin")).unwrap();
     let head = String::from("gpu: 0000:c4:00.0 1002:1900 rev 0xc1, BAR0 0x7c00000000 (262144 KiB)\nmemsize: 512 MiB (RCC_CONFIG_MEMSIZE)\n");
     let iommu = [String::from("iommu 00:00.2 (IVHD 0x40) at 0xfd200000: control 0x0, IommuEn 0 (translation off), EFR 0x0")];
@@ -399,14 +397,14 @@ fn probe_reports_every_section() {
         assert!(a.lines().any(|l| l.starts_with(p)), "no {p} line in:\n{a}");
     }
     // 2. The carve-out bytes are all 0xff and no copy: the REFUSED detail of those bytes is kept.
-    let c = Carve { lines: std::vec![verdict.clone()], discovery: Some((0x8_5FFF_0000, std::vec![0xFF; 8192])) };
+    let c = Carve { lines: std::vec![verdict.clone()], discovery: Some((0x8_5FFF_0000, std::vec![0xFF; disc::TMR_SIZE])) };
     let (a, keep) = assemble(head.clone(), c, None, &table, false, &mut state, &iommu);
     assert!(keep.is_none(), "garbage is not kept");
     let l = a.lines().find(|l| l.starts_with("discovery: ")).unwrap();
-    assert!(l.starts_with("discovery: REFUSED (") && l.contains("read via carve-out at phys 0x85fff0000") && l.ends_with("8192 bytes"), "{l}");
+    assert!(l.starts_with("discovery: REFUSED (") && l.contains("read via carve-out at phys 0x85fff0000") && l.ends_with("10240 bytes"), "{l}");
     assert!(a.lines().any(|l| l.starts_with("state: not classified")) && a.lines().any(|l| l.starts_with("iommu ")));
     // 3. Garbage at the carve-out but a copy kept this boot: classified with the copy, which is not kept again.
-    let c = Carve { lines: std::vec![verdict.clone()], discovery: Some((0x8_5FFF_0000, std::vec![0xFF; 8192])) };
+    let c = Carve { lines: std::vec![verdict.clone()], discovery: Some((0x8_5FFF_0000, std::vec![0xFF; disc::TMR_SIZE])) };
     let copy = Found { via: Via::Indirect { pos: 0x1FFF_0000 }, bytes: bin.clone() };
     let (a, keep) = assemble(head.clone(), c, Some(copy), &table, false, &mut state, &iommu);
     assert!(keep.is_none());
@@ -420,7 +418,7 @@ fn probe_reports_every_section() {
     let ind = || Found { via: Via::Indirect { pos: 0x1FFF_0000 }, bytes: bin.clone() };
     let (got, l) = probe_copy(None, false, || Some((Ok(ind()), 34)));
     assert!(got.is_some() && l.as_deref() == Some("discovery fetch: through MM_INDEX/MM_DATA as gx_bringup does (34 index writes, index restored; no other register written)"), "{l:?}");
-    let c = Carve { lines: std::vec![verdict.clone()], discovery: Some((0x8_5FFF_0000, std::vec![0xFF; 8192])) };
+    let c = Carve { lines: std::vec![verdict.clone()], discovery: Some((0x8_5FFF_0000, std::vec![0xFF; disc::TMR_SIZE])) };
     let (a, _) = assemble(head.clone(), c, got, &table, false, &mut state, &iommu);
     assert!(!a.contains("discovery: REFUSED") && a.lines().any(|l| l == "state: cold (firmware state)"), "{a}");
     let (got, l) = probe_copy(None, false, || None);

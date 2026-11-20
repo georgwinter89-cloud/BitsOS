@@ -142,7 +142,7 @@ def main():
     st, out, err = run(c, ["/bin/alsa-hw", "selftest"])
     print(f"--- alsa-hw selftest: {st}\n{out}{err}")
     want = open(EXPECTED).read()
-    need(ok(st) and out.rstrip("\n") == want.rstrip("\n"), "alsa-hw: every answer as linux-6.6 gives it",
+    need(ok(st) and out.rstrip("\n") == want.rstrip("\n"), "alsa-hw: every answer as linux-7.3.1 gives it",
          "\n".join(f"  got  {g}\n  want {w}" for g, w in zip(out.splitlines() + [""] * 40, want.splitlines()) if g != w))
     for argv in (["/bin/aplay", "-v", "-D", "hw:0,0", "/tmp/s48.wav"], ["/bin/aplay", "-D", "hw:0,0", "/tmp/f48.wav"],
                  ["/bin/aplay", "-v", "/tmp/s441.wav"]):

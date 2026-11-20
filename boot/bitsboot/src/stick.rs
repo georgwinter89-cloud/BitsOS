@@ -144,3 +144,14 @@ pub fn withhold_id(s: &mut StickInfo) {
         warn!("bitsboot stick.id_withheld: safe mode, the kernel keeps the stick read-only");
     }
 }
+
+/// GP-GUARD, safe mode with `gp_stick=on`: the identity goes to the kernel as on the Mini-PC, so FS-7 can open
+/// this one stick below `\BITSOS2\` (install_kernel, push). Said on the screen, because it is the one write path
+/// safe mode has. Without a valid STICK.ID there is nothing to hand over and the stick stays read-only.
+pub fn log_id_handed(s: &StickInfo) {
+    if s.flags & stick_flags::STICK_ID_VALID != 0 {
+        warn!("bitsboot stick.id_handed: gp_stick=on, the kernel may write this stick below \\BITSOS2 (no other disk)");
+    } else {
+        warn!("bitsboot stick.id_missing: gp_stick=on but the stick has no valid STICK.ID: the kernel keeps it read-only");
+    }
+}

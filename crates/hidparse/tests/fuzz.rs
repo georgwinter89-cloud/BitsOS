@@ -114,6 +114,10 @@ fn exercise(r: &mut Rng, desc: &[u8]) {
         }
         let _ = state.process(&d, &map, &report, &mut out);
         out.clear();
+        // GM-6p: the battery reading of the same report.
+        for b in hidparse::BatteryMap::find_all(&d) {
+            let _ = b.read(&report);
+        }
     }
 }
 

@@ -454,3 +454,37 @@ fn buddy_exact_runs_merge_back() {
     assert_eq!(b.zone_info(0).free_blocks, initial, "everything merged back");
     assert_eq!(b.reports().bad_frees.load(Relaxed), 0);
 }
+
+/// A patient allocation stops its rounds after `REGAIN_HELD_NS` only when others wait for its caller, and the
+/// scheduler is asked only then (it takes the priority-passing book's lock).
+#[test]
+fn patience_is_cut_only_for_a_waited_for_caller_after_its_bound() {
+    use crate::heap::{cut_patience, REGAIN_HELD_NS};
+    let asked = core::cell::Cell::new(0);
+    let held = |v: bool| {
+        let a = &asked;
+        move || {
+            a.set(a.get() + 1);
+            v
+        }
+    };
+    assert!(!cut_patience(true, Some(0), Some(REGAIN_HELD_NS - 1), held(true)), "before the bound");
+    assert_eq!(asked.get(), 0, "not asked before the bound");
+    assert!(cut_patience(true, Some(0), Some(REGAIN_HELD_NS), held(true)), "waited for, past the bound");
+    assert!(!cut_patience(true, Some(0), Some(10 * REGAIN_HELD_NS), held(false)), "nobody waits: patient as before");
+    assert!(!cut_patience(false, Some(0), Some(10 * REGAIN_HELD_NS), held(true)), "not patient: its own bounds apply");
+    assert!(!cut_patience(true, Some(5), None, held(true)), "no clock");
+    assert!(!cut_patience(true, None, Some(10 * REGAIN_HELD_NS), held(true)), "rounds that began before the clock");
+    assert_eq!(asked.get(), 2);
+}
+
+/// A round before the clock existed starts no count; the first round with one does (checkers of MM2-NIGHT: the
+/// old `unwrap_or(0)` counted from 0, a huge `regain_max_us` on the Mini-PC's watch list).
+#[test]
+fn rounds_begin_at_the_first_round_with_a_clock() {
+    use crate::heap::rounds_began;
+    let mut since = None;
+    assert_eq!(rounds_began(&mut since, None), None, "no clock yet");
+    assert_eq!(rounds_began(&mut since, Some(7_000)), Some(7_000), "the clock came");
+    assert_eq!(rounds_began(&mut since, Some(9_000)), Some(7_000), "later rounds keep the start");
+}

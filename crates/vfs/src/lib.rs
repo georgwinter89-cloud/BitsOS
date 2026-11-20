@@ -12,24 +12,30 @@
 //! (`special`). FS-4 epoll on `Pollable`, FS-5 the page cache, FS-10 memfd and file seals (`memfd`), FS-11 per-program views.
 #![no_std]
 #![forbid(unsafe_code)]
+// `Arc::try_new`: page migration makes a page inside allocations, where a panic on an empty heap is no answer.
+#![feature(allocator_ext)]
 
 extern crate alloc;
 
 pub mod abi;
+pub mod access;
 pub mod cpio;
 pub mod dentry;
 pub mod devfs;
 pub mod epoll;
 pub mod eventfd;
 pub mod fd;
+pub mod fpos;
 pub mod frame;
 pub mod fsops;
+pub mod hwmon;
 pub mod index;
 pub mod inotify;
 pub mod inode;
 mod kapi;
 pub use kapi::read_secret;
 pub mod memfd;
+pub mod meta_shrink;
 mod ktests;
 mod pm_cost_ktest;
 mod fs5_ktests;
@@ -37,6 +43,7 @@ pub mod mmap;
 pub mod mount_ns;
 pub mod mount_fs;
 pub mod mount_ops;
+mod mount_binds;
 mod mount_tree;
 pub mod mountinfo;
 pub mod node;
@@ -66,6 +73,7 @@ pub mod sys_xattr;
 pub mod sys_mount;
 pub mod sysctl;
 pub mod tmpfs;
+pub mod trash;
 pub mod tty;
 pub mod walk;
 pub mod writeback;
@@ -114,6 +122,12 @@ mod fs13_preload_tests;
 mod mm9_reclaim_tests;
 #[cfg(test)]
 mod bl0_tests;
+#[cfg(test)]
+mod fsw2_tests;
+#[cfg(test)]
+mod fpos_tests;
+#[cfg(test)]
+mod l7r_tests;
 
 pub use dentry::{Dentry, SuperBlock};
 pub use fsops::FsOps;

@@ -93,10 +93,10 @@ fn wlan_and_its_bridge_untouched() {
     let w = minipc();
     let nodes = build(&w, &ALL, keys_off);
     let wl = find(&nodes, WLAN.0, 0, 0).unwrap();
-    assert_eq!(wl.untouched, Some("wlan"));
+    assert_eq!(wl.untouched, Some(super::HELD));
     assert_eq!(wl.bars, None);
     let br = find(&nodes, WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2).unwrap();
-    assert_eq!(br.untouched, Some("wlan"));
+    assert_eq!(br.untouched, Some(super::HELD));
     assert_eq!(w.writes_to(WLAN.0, 0, 0), 0);
     assert_eq!(w.writes_to(WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2), 0);
     // Its neighbours are sized as usual.
@@ -104,7 +104,7 @@ fn wlan_and_its_bridge_untouched() {
     assert!(w.writes_to(I226.0, 0, 0) > 0);
     // The contract view refuses: no BAR, and a write is refused before reaching the device.
     let f = wl.function();
-    assert_eq!(f.untouched(), Some("wlan"));
+    assert_eq!(f.untouched(), Some(super::HELD));
     assert_eq!(f.bar(2), None);
     assert!(!f.write32_ext(4, 0x6));
     // With the key on (no key returned) the WLAN is sized.
@@ -133,8 +133,8 @@ fn bridge_untouched_only_when_everything_below_is() {
     w.add(4, 0, 0, FakeFn::new(0x8086, 0x125C, 0x02_00_00, 0));
     let nodes = build(&w, &ALL, keys_off);
     let key = |b, d, f| find(&nodes, b, d, f).unwrap().untouched;
-    assert_eq!(key(3, 0, 0), Some("wlan"));
-    assert_eq!(key(2, 0, 0), Some("wlan"), "downstream port above only the WLAN");
+    assert_eq!(key(3, 0, 0), Some(super::HELD));
+    assert_eq!(key(2, 0, 0), Some(super::HELD), "downstream port above only the WLAN");
     assert_eq!(key(2, 1, 0), None);
     assert_eq!(key(1, 0, 0), None, "upstream port also serves the NIC");
     assert_eq!(key(0, 1, 0), None);
@@ -322,8 +322,8 @@ fn tree_text() {
     let lines = tree::lines(&nodes, "fake");
     assert!(lines[0].starts_with("pci: 32 functions"), "{}", lines[0]);
     let text = lines.join("\n");
-    assert!(text.contains("\n  04:00.0 [10ec:b852] 028000 network (wlan), untouched until wlan=on"), "{text}");
-    assert!(text.contains("00:02.2 [1022:14ee] 060400 pci bridge -> bus 04-04, root port link 8GT/s x4, untouched until wlan=on"), "{text}");
+    assert!(text.contains("\n  04:00.0 [10ec:b852] 028000 network (wlan), untouched by held"), "{text}");
+    assert!(text.contains("00:02.2 [1022:14ee] 060400 pci bridge -> bus 04-04, root port link 8GT/s x4, untouched by held"), "{text}");
     assert!(text.contains("      bar0 mem 0x7c00000000 256M 64bit prefetch"), "{text}");
     assert!(text.contains("caps pm(D0) msi(16) msix(5) pcie aer dsn l1ss@0x1c0(0x5) ptm(off)"), "{text}");
     assert!(!text.contains("00:03.2"));

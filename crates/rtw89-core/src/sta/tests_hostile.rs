@@ -170,7 +170,7 @@ fn frames_from_the_air_never_panic_the_station() {
 }
 
 // mac80211 takes a deauthentication or disassociation only when its BSSID is its sender
-// (linux-6.6/net/mac80211/mlme.c:3828, :3876); one from our AP's address naming another BSSID
+// (linux-7.3.1/net/mac80211/mlme.c:5659, :5709); one from our AP's address naming another BSSID
 // never reaches the MLME
 #[test]
 fn deauth_with_another_bssid_is_not_the_aps() {

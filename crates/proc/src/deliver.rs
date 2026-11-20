@@ -1,6 +1,6 @@
-//! AB-6: signals on the way back to user mode (linux-6.6/arch/x86/kernel/signal.c `arch_do_signal_or_restart`
-//! :331, `handle_signal` :234; signal_64.c `x64_setup_rt_frame` :160, `rt_sigreturn` :241; kernel/signal.c
-//! `get_signal` :2668, `do_signal_stop` :2486, `do_notify_parent_cldstop` :2180), the faults that raise
+//! AB-6: signals on the way back to user mode (linux-7.3.1/arch/x86/kernel/signal.c `arch_do_signal_or_restart`
+//! :333, `handle_signal` :255; signal_64.c `x64_setup_rt_frame` :164, `rt_sigreturn` :246; kernel/signal.c
+//! `get_signal` :2876, `do_signal_stop` :2627, `do_notify_parent_cldstop` :2356), the faults that raise
 //! them (arch/x86/kernel/traps.c, mm/fault.c), and the parent's job-control notices.
 //!
 //! Every thread passes `exit_to_user` before it runs user code again after a syscall, a fault or an
@@ -111,6 +111,14 @@ fn exit_inner(t: &Arc<Thread>, ctx: &mut UserContext, sys: Option<SysExit>, may_
     }
     let g = t.group();
     let key = t.sig_key();
+    // `futex_fixup_robust_unlock` right before `arch_do_signal_or_restart` (linux-7.3.1/kernel/entry/common.c:65):
+    // a thread stopped inside the vDSO's robust try-unlock after its cmpxchg gets list_op_pending cleared before
+    // any signal is taken. A syscall return is never inside that section (no syscall instruction there).
+    if t.signal_pending()
+        && let Some(p) = g.image()
+    {
+        crate::vdso::unlock::fixup_robust_unlock(&p, t, ctx);
+    }
     // The outer loop is `exit_to_user_mode_loop` re-reading its work bits: a signal sent after `next_for`
     // found nothing (or one the restored mask lets through) is taken before the return to user mode.
     'work: loop {
@@ -492,7 +500,7 @@ pub fn signal_current_thread(sig: u32) -> bool {
     }
 }
 
-/// SX-1 glue: a seccomp TRAP's SIGSYS (linux-6.6/kernel/seccomp.c `force_sig_seccomp` with HANDLER_CURRENT):
+/// SX-1 glue: a seccomp TRAP's SIGSYS (linux-7.3.1/kernel/signal.c:1854 `force_sig_seccomp` with HANDLER_CURRENT):
 /// si_code SYS_SECCOMP, si_errno the filter's data, si_call_addr the address after the `syscall`
 /// instruction, si_syscall and si_arch what the filter saw. Forced like a fault: a blocked or ignored SIGSYS
 /// goes back to its default action (the process ends) instead of waiting.

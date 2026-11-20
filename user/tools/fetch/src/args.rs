@@ -18,12 +18,16 @@ options:
                         silence while sending or receiving (default 30)
   --max-time SECS       limit for the whole run, redirects included (default: none)
   --max-redirects N     default 10
+  --max-size BYTES      stop (exit 12, nothing kept) when the body is larger (default: no limit)
   --verify-time SECS    check certificates against this Unix time instead of the clock (wrong-clock machines)
+  --accept TYPE         the Accept header (default */*)
+  --auth-stdin          read a bearer token from the first line of stdin and send it as Authorization, to the
+                        URL's own scheme, host and port only: a redirect anywhere else drops it (curl's rule)
   -q, --quiet           no progress or redirect lines (errors and the hash line stay)
 exit codes:
   0 ok   2 usage   3 name lookup   4 connect   5 TLS (handshake, certificate, CA bundle)
   6 certificate not valid at this time (clock?)   7 HTTP status not 2xx   8 bad or truncated response,
-  too many or insecure redirects   9 writing the output   10 SHA-256 mismatch   11 timeout
+  too many or insecure redirects   9 writing the output   10 SHA-256 mismatch   11 timeout   12 too large
 A run killed by a signal can leave FILE.part (or FILE.part.N) behind.";
 
 #[derive(Debug, PartialEq)]
@@ -36,13 +40,16 @@ pub struct Opts {
     pub timeout: Duration,
     pub max_time: Option<Duration>,
     pub max_redirects: u32,
+    pub max_size: Option<u64>,
     pub verify_time: Option<UnixTime>,
     pub quiet: bool,
+    pub accept: Option<String>,
+    pub auth_stdin: bool,
 }
 
 pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Option<Opts>, String> {
     let mut o =
-        Opts { url: String::new(), out: None, ca: None, sha256: None, timeout: Duration::from_secs(30), max_time: None, max_redirects: 10, verify_time: None, quiet: false };
+        Opts { url: String::new(), out: None, ca: None, sha256: None, timeout: Duration::from_secs(30), max_time: None, max_redirects: 10, max_size: None, verify_time: None, quiet: false, accept: None, auth_stdin: false };
     let mut url = None;
     let mut only_args = false;
     while let Some(a) = it.next() {
@@ -68,6 +75,14 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Option<Opts>, Strin
                 return Ok(None);
             }
             "-q" | "--quiet" => o.quiet = true,
+            "--auth-stdin" => o.auth_stdin = true,
+            "--accept" => {
+                let v = value(&name)?;
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+                    return Err(format!("--accept wants a media type on one line, got {v:?}"));
+                }
+                o.accept = Some(v);
+            }
             "-o" | "--output" => o.out = Some(value(&name)?),
             "--ca" => o.ca = Some(value(&name)?),
             "--sha256" => {
@@ -90,6 +105,10 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Option<Opts>, Strin
             "--max-redirects" => {
                 let v = value(&name)?;
                 o.max_redirects = v.parse().map_err(|_| format!("--max-redirects wants a number, got {v:?}"))?;
+            }
+            "--max-size" => {
+                let v = value(&name)?;
+                o.max_size = Some(v.parse().map_err(|_| format!("--max-size wants bytes, got {v:?}"))?);
             }
             "--verify-time" => {
                 let v = value(&name)?;
@@ -116,15 +135,18 @@ mod tests {
 
     #[test]
     fn options() {
-        let o = p(&["-q", "--ca=/c.pem", "https://h/x", "-o", "/tmp/y", "--timeout", "5", "--sha256", &"AB".repeat(32), "--verify-time", "1800000000", "--max-time", "60"])
+        let o = p(&["-q", "--ca=/c.pem", "https://h/x", "-o", "/tmp/y", "--timeout", "5", "--sha256", &"AB".repeat(32), "--verify-time", "1800000000", "--max-time", "60", "--max-size", "1000"])
             .unwrap()
             .unwrap();
         assert_eq!((o.url.as_str(), o.out.as_deref(), o.ca.as_deref(), o.quiet), ("https://h/x", Some("/tmp/y"), Some("/c.pem"), true));
         assert_eq!((o.timeout.as_secs(), o.sha256.as_deref()), (5, Some("ab".repeat(32).as_str())));
         assert_eq!(o.verify_time.map(|t| t.as_secs()), Some(1_800_000_000));
         assert_eq!(o.max_time, Some(Duration::from_secs(60)));
+        assert_eq!(o.max_size, Some(1000));
         assert_eq!(p(&["--help"]).unwrap(), None);
         assert_eq!(p(&["--", "-weird"]).unwrap().unwrap().url, "-weird");
+        let o = p(&["--accept", "application/octet-stream", "--auth-stdin", "https://h/x"]).unwrap().unwrap();
+        assert_eq!((o.accept.as_deref(), o.auth_stdin), (Some("application/octet-stream"), true));
     }
 
     #[test]
@@ -140,6 +162,9 @@ mod tests {
             &["u", "--max-time", "-1"],
             &["u", "-o", ""],
             &["u", "--verify-time", "x"],
+            &["u", "--max-size", "-1"],
+            &["u", "--accept", "a\r\nX: y"],
+            &["u", "--accept", ""],
         ] {
             assert!(p(a).is_err(), "{a:?}");
         }

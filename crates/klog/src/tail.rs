@@ -43,6 +43,18 @@ pub fn try_tail_text(out: &mut [u8]) -> Option<usize> {
 /// As `try_tail_text`, with only the records whose sequence number is below `seq` (the panic path passes
 /// `next_seq()` from its start, so the record keeps what happened before the panic, not the report itself).
 pub fn try_tail_text_before(out: &mut [u8], seq: u64) -> Option<usize> {
+    let mut at = 0;
+    let n = out.len();
+    try_tail_visit_before(n, seq, &mut |s| {
+        out[at..at + s.len()].copy_from_slice(s);
+        at += s.len();
+    })?;
+    Some(at)
+}
+
+/// CRASHDISK: as `try_tail_text_before` for at most `max` bytes, handed to `put` piece by piece (the disk record
+/// takes far more than a stack buffer holds); returns the bytes handed. One try of the ring lock, no allocation.
+pub fn try_tail_visit_before(max: usize, seq: u64, put: &mut dyn FnMut(&[u8])) -> Option<usize> {
     let g = crate::lock_ring(Wait::Never)?;
     let r = g.active_ref();
     let (head, end) = r.span();
@@ -51,21 +63,16 @@ pub fn try_tail_text_before(out: &mut [u8], seq: u64) -> Option<usize> {
     let mut total = 0usize;
     while first > head {
         let len = line_len(r, &r.hdr(first - 1));
-        if total + len > out.len() {
+        if total + len > max {
             break;
         }
         total += len;
         first -= 1;
     }
-    let mut at = 0;
     for i in first..end {
         let h = r.hdr(i);
         let p = prefix(&h);
         let (a, b) = r.text_parts(&h);
-        let mut put = |s: &[u8]| {
-            out[at..at + s.len()].copy_from_slice(s);
-            at += s.len();
-        };
         put(&p.b[..p.n]);
         if !a.is_empty() || !b.is_empty() {
             put(b" ");
@@ -74,6 +81,5 @@ pub fn try_tail_text_before(out: &mut [u8], seq: u64) -> Option<usize> {
         }
         put(b"\n");
     }
-    Some(at)
+    Some(total)
 }
-

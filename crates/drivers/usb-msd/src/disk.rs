@@ -1051,6 +1051,9 @@ impl<L: Link + 'static> BlockDevice for MsdDisk<L> {
             has_volatile_cache: !i.no_sync_cache,
         }
     }
+    fn removable(&self) -> bool {
+        self.info.lock().removable
+    }
     fn read_blocks(&self, lba: u64, buf: &mut [u8], prio: IoPriority) -> Result<(), DevError> {
         self.rw(false, lba, Data::In(buf), false, prio)
     }

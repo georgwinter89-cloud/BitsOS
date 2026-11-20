@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use drm::fence::{self, FenceCb, Registration, Waiter};
 use drm::job::{SchedPriority, Submission};
 use drm::uapi::AMDGPU_IB_FLAGS_SECURE;
-use ksync::{Mutex, SpinLock};
+use ksync::{Mutex, Spare, SpinLock};
 use linux::ab::errno_more::ECANCELED;
 use linux::errno::{EINVAL, ENODEV, ENOMEM};
 use vfs::Errno;
@@ -40,7 +40,7 @@ const IDLE_NS: u64 = 1_000_000_000;
 /// The numbers a test may change; the default is what the chip runs.
 #[derive(Clone, Copy, Debug)]
 pub struct JobCfg {
-    /// Per `RingType::index`; None: Linux's by class (gr-GR-3.md).
+    /// Per `RingType::index`; None: Linux's by class (`amdgpu_fmt::watch`).
     pub timeouts_us: Option<[u64; 3]>,
     /// The poll's period right after progress and at its longest.
     pub poll_min_ns: u64,
@@ -51,8 +51,6 @@ pub struct JobCfg {
     pub close_us: u64,
     /// GX-7n: the thread's look while jobs run and interrupts are trusted: the most a lost one can cost.
     pub irq_check_ns: u64,
-    /// GX-9a: the mode-2 rung is open, on this proof (GX-D9; CONFIG `gx_mode2=on`, `boot::mode2_open`).
-    pub mode2: Option<&'static str>,
     /// GX-9a: the first rung a hang may use: `Rung`, lower ones answer `Failed` (the tool's `until=ladder`).
     pub ladder_from: Rung,
     /// GX-9a: instead of `Policy`'s: how long a re-init may take, and how long after that `expire` waits for its answer.
@@ -106,7 +104,7 @@ impl Rung {
 
 impl Default for JobCfg {
     fn default() -> JobCfg {
-        JobCfg { timeouts_us: None, poll_min_ns: 100_000, poll_max_ns: 2_000_000, stall_grace_us: 5_000, close_us: 2_000_000, irq_check_ns: 20_000_000, mode2: None, ladder_from: Rung::Soft, reinit_us: None, expire_slack_us: None }
+        JobCfg { timeouts_us: None, poll_min_ns: 100_000, poll_max_ns: 2_000_000, stall_grace_us: 5_000, close_us: 2_000_000, irq_check_ns: 20_000_000, ladder_from: Rung::Soft, reinit_us: None, expire_slack_us: None }
     }
 }
 
@@ -146,6 +144,35 @@ impl Shared {
     /// The job thread's sleep ends: a thread of the job half has something to say.
     pub(super) fn kick_thread(&self) {
         self.wake.call();
+    }
+
+    /// `submit`'s push. The list grows with the lock dropped (`ksync::Spare`): under it the heap cannot reclaim, and a
+    /// list of a few pages then needs a free run of frames (the Mini-PC's panics of 11. and 12.11.2026 were such
+    /// requests). Whatever came between the unlock and the relock is looked at again: `closing` and `lost`, and the list,
+    /// which the thread may have taken or another submitter filled. `unlocked` runs in that window (the tests' other thread).
+    fn queue(&self, p: Pend, unlocked: &mut dyn FnMut()) -> Result<(), Errno> {
+        // Before the guard: the emptied old list is freed after the unlock.
+        let mut spare = Spare::new();
+        loop {
+            let mut q = self.pending.lock();
+            // Under the lock: the thread drains after `closing` is set and then leaves, so whoever pushes now sees it or
+            // is still drained. A push after the last drain would never signal, and WAIT_CS would wait for good.
+            if self.lost.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+                drop(q);
+                p.sub.cancel(ENODEV);
+                return Err(ENODEV);
+            }
+            if spare.fits(&mut *q, 1) {
+                q.push(p);
+                return Ok(());
+            }
+            drop(q);
+            unlocked();
+            if spare.grow().is_err() {
+                p.sub.cancel(ENOMEM);
+                return Err(ENOMEM);
+            }
+        }
     }
 }
 
@@ -188,7 +215,7 @@ impl Jobs {
             found = vmring::kept_queues(o.io(), &vmi).map_err(|e| format!("a kept queue: {e:?}"));
         });
         let queues = found?;
-        let mut domain = ResetDomain::new(policy(&cfg)?);
+        let mut domain = ResetDomain::new(policy(&cfg));
         let mut rings = Vec::new();
         for (q, ty) in queues.into_iter().zip(RingType::ALL) {
             let id = domain.add_ring(ring_cfg(ty, &q, &cfg)).map_err(|e| format!("{} in the reset domain: {e:?}", ty.name()))?;
@@ -328,6 +355,11 @@ impl Jobs {
 
     /// The trait's `submit`.
     pub fn submit(&self, sub: Submission) -> Result<(), Errno> {
+        self.submit_with(sub, &mut || {})
+    }
+
+    /// `submit`; `unlocked` runs each time the queue's lock is dropped for the list to grow (see `Shared::queue`).
+    pub(crate) fn submit_with(&self, sub: Submission, unlocked: &mut dyn FnMut()) -> Result<(), Errno> {
         let s = &self.shared;
         if s.lost.load(Ordering::Acquire) || s.closing.load(Ordering::Acquire) {
             sub.cancel(ENODEV);
@@ -356,21 +388,7 @@ impl Jobs {
             }
         }
         let prio = sub.jobs.iter().map(|j| j.entity.priority).max().unwrap_or(SchedPriority::Normal);
-        let mut q = s.pending.lock();
-        // Again under the lock: the thread drains after `closing` is set and then leaves, so whoever pushes now sees it or is
-        // still drained. A push after the last drain would never signal, and WAIT_CS would wait for good.
-        if s.lost.load(Ordering::Acquire) || s.closing.load(Ordering::Acquire) {
-            drop(q);
-            sub.cancel(ENODEV);
-            return Err(ENODEV);
-        }
-        if q.try_reserve(1).is_err() {
-            drop(q);
-            sub.cancel(ENOMEM);
-            return Err(ENOMEM);
-        }
-        q.push(Pend { sub, prio, regs, later: false });
-        Ok(())
+        s.queue(Pend { sub, prio, regs, later: false }, unlocked)
     }
 
     /// The trait's `kick`: the CS dropped its locks.
@@ -412,6 +430,12 @@ impl Jobs {
         self.inner.lock()
     }
 
+    /// Tests: how many more submissions the list takes before it has to grow.
+    pub(crate) fn queue_room(&self) -> usize {
+        let q = self.shared.pending.lock();
+        q.capacity() - q.len()
+    }
+
     /// Asks the thread to end, waiting for nothing (a device being dropped).
     pub fn leave(&self) {
         self.shared.closing.store(true, Ordering::Release);
@@ -435,20 +459,16 @@ impl Jobs {
     }
 }
 
-/// GR-3's policy for this chip, what the chip's boot and the tests say on top.
-fn policy(cfg: &JobCfg) -> Result<Policy, String> {
-    let mp1 = IpVersion(13, 0, 4);
-    let mut p = Policy::for_mp1(mp1);
-    if let Some(proof) = cfg.mode2 {
-        p.open_mode2(mp1, proof).map_err(String::from)?;
-    }
+/// GR-3's policy for this chip (mode 2 is its last rung, as Linux's for MP1 13.0.4), what the tests say on top.
+fn policy(cfg: &JobCfg) -> Policy {
+    let mut p = Policy::for_mp1(IpVersion(13, 0, 4));
     if let Some(us) = cfg.reinit_us {
         p.reinit_us = us;
     }
     if let Some(us) = cfg.expire_slack_us {
         p.expire_slack_us = us;
     }
-    Ok(p)
+    p
 }
 
 /// ECANCELED for a queued job when the device is lost or going.

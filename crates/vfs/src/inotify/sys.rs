@@ -1,5 +1,5 @@
 //! The inotify calls (inotify_init 253, inotify_add_watch 254, inotify_rm_watch 255, inotify_init1 294) in
-//! Linux's order of checks (linux-6.6/fs/notify/inotify/inotify_user.c:680-830), and the per-user limits under
+//! Linux's order of checks (linux-7.3.1/fs/notify/inotify/inotify_user.c:682-798), and the per-user limits under
 //! `/proc/sys/fs/inotify` (R1: only Linux's own configurable limits; root may change them).
 //!
 //! - `max_user_instances` (128) and `max_user_watches` (1% of RAM by Linux's `INOTIFY_WATCH_COST`, clamped to
@@ -143,7 +143,7 @@ fn add_watch(s: &Sys<'_>, a: Args) -> Result<i64, Errno> {
     if mask & IN_ONLYDIR != 0 && !path.dentry.is_dir() {
         return Err(ENOTDIR);
     }
-    path.dentry.inode.meta.permission(s.cred, crate::inode::MAY_READ)?;
+    path.dentry.inode.permission(s.cred, crate::inode::MAY_READ)?;
     c.policy(&path, None, false, false)?;
     g.update_watch(&path.dentry.inode, mask).map(|wd| wd as i64)
 }
@@ -187,11 +187,12 @@ struct ProcSysInotify;
 impl crate::synth::DirSource for ProcSysInotify {
     fn entries(&self) -> Result<alloc::vec::Vec<crate::synth::SynthEntry>, Errno> {
         use crate::synth::SynthEntry;
-        use crate::sysctl::Knob;
+        use crate::sysctl::{IntKnob, Knob, non_negative};
+        let queued = IntKnob { get: get_queued, set: |v| set_queued(non_negative(v)?) };
         Ok(alloc::vec![
-            SynthEntry::file("max_queued_events", 0o644, Arc::new(Knob { get: get_queued, set: set_queued, uint: true })).cookie(1),
-            SynthEntry::file("max_user_instances", 0o644, Arc::new(Knob { get: get_instances, set: set_instances, uint: false })).cookie(2),
-            SynthEntry::file("max_user_watches", 0o644, Arc::new(Knob { get: max_watches, set: set_watches, uint: false })).cookie(3),
+            SynthEntry::file("max_queued_events", 0o644, Arc::new(queued)).cookie(1),
+            SynthEntry::file("max_user_instances", 0o644, Arc::new(Knob { get: get_instances, set: set_instances })).cookie(2),
+            SynthEntry::file("max_user_watches", 0o644, Arc::new(Knob { get: max_watches, set: set_watches })).cookie(3),
         ])
     }
 }

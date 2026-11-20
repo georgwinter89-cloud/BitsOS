@@ -69,7 +69,7 @@ fn percpu_stats() -> R {
     kassert!(s.acquired - before == want, "acquired grew by {}, want {want}: {s:?}", s.acquired - before);
     // PF-2: each pinned thread counted in its own CPU's slot. With several CPUs the boot gave every class slots
     // for them all (`ksync::prepare_cpus` on the multi-CPU path), and a class made later covers them at
-    // creation, so a missing slot is a failure. One CPU (smp=off) may count in the shared slot, which is
+    // creation, so a missing slot is a failure. One CPU (a machine whose APs did not start) may count in the shared slot, which is
     // correct there (nobody to share a line with); the event says whether the check ran (`slots_checked`).
     let sp = stats::spread(CLASS).ok_or("no spread for sc.kt.percpu")?;
     kassert!(n == 1 || sp.covered >= n, "{n} CPUs but the class has slots for only {}: {sp:?}", sp.covered);

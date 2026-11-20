@@ -1,8 +1,9 @@
 //! The reaper (SC-3): frees what threads leave behind once no CPU can still use it.
 //!
 //! - Kernel stacks: hal retires a finished thread's stack instead of freeing it; `hal::switch::reap_stacks`
-//!   unmaps it and frees it once every CPU has flushed its TLB after the unmap (a sync generation). Until MM-6's
-//!   TLB shootdown this is what lets threads move between CPUs (SC-1 change request 2).
+//!   unmaps the retired stacks and frees them once every CPU dropped their translations: one TLB shootdown for
+//!   all stacks of a pass, or a sync generation where a CPU did not confirm it. Exits can still outrun the
+//!   reaper (16 CPUs, a shootdown that waits for a CPU): `relieve_backlog` makes a spawn wait for it then.
 //! - Thread records: an exited thread leaves the table at its last switch, but an interrupt-time wake-up on
 //!   another CPU may still hold a reference it took from the table just before. The record goes to the
 //!   graveyard and is dropped after a sync generation: by then every CPU finished the interrupt handlers it was
@@ -31,12 +32,22 @@ static KICKED: AtomicBool = AtomicBool::new(false);
 static PASS_BUSY: AtomicBool = AtomicBool::new(false);
 /// A sync generation not passed, or a grace epoch not advanced while frames wait, this long is a stall.
 const STALL_NS: u64 = 1_000_000_000;
+/// Spawners waiting for dead stacks to come back (`relieve_backlog`, `await_freed`); woken by every pass that
+/// freed some.
+static FREED: WaitQueue = WaitQueue::new();
+/// Dead stacks from which on a spawn first waits for the reaper: one chunk of slots, so the pool reuses slots
+/// instead of carving the next chunk while that much memory only waits for a pass.
+pub(crate) const BACKLOG_STACKS: u64 = crate::stack::SLOTS_PER_CHUNK;
+/// How long one spawn waits for the backlog to shrink. A bound, not a promise: a CPU that does not answer the
+/// shootdown holds a pass for up to hal's give-up time, and spawns must not stop with it.
+const BACKLOG_WAIT_NS: u64 = 50_000_000;
 
 klog::counter!(pub STACKS_FREED, "sched.stacks_reaped");
 klog::counter!(pub THREADS_FREED, "sched.threads_reaped");
 klog::counter!(pub GRAVES_LEAKED, "sched.graves_leaked");
 klog::counter!(pub GRACE_FREED, "mm.grace.reaped_pages");
 klog::counter!(pub REAP_STALLS, "sched.reap_stalls");
+klog::counter!(pub BACKLOG_WAITS, "sched.reap_backlog_waits");
 
 /// Makes room in the graveyard for every thread that exists now plus one (`spawn`, before the new thread is
 /// listed), so `bury` never has to allocate. `Err`: no memory (the spawn fails).
@@ -79,6 +90,36 @@ pub(crate) fn kick() {
     }
 }
 
+/// Whether the caller may sleep for the reaper: the scheduler runs, and no spin lock is held, no interrupt
+/// handler runs and interrupts are on (what the heap asks before it reclaims).
+fn may_wait() -> bool {
+    crate::STARTED.load(Ordering::Acquire) && mm_core::reclaim::context_allows()
+}
+
+/// Before a spawn takes a stack: with `BACKLOG_STACKS` dead stacks or more waiting, the caller sleeps (bounded)
+/// until the reaper brought them back. Without it threads that exit without a pause on many CPUs take fresh
+/// frames faster than any reaper returns the dead ones, until memory is gone (sc/20-smp, 16 CPUs).
+pub(crate) fn relieve_backlog() {
+    let small = || hal::switch::retired_count() < BACKLOG_STACKS;
+    if small() || !may_wait() {
+        return;
+    }
+    BACKLOG_WAITS.inc();
+    kick();
+    FREED.wait_until_timeout(small, BACKLOG_WAIT_NS);
+}
+
+/// After a spawn found no memory for its stack: waits (bounded by `limit_ns`) until the reaper freed a dead
+/// stack. False when none is waiting, the caller may not sleep or the time ran out: the spawn fails then.
+pub(crate) fn await_freed(limit_ns: u64) -> bool {
+    if hal::switch::retired_count() == 0 || !may_wait() {
+        return false;
+    }
+    let seen = STACKS_FREED.get();
+    kick();
+    FREED.wait_until_timeout(|| STACKS_FREED.get() != seen, limit_ns)
+}
+
 /// Makes the CPUs that have not passed generation `g` reach a quiescent point (IPI; this CPU directly).
 fn nudge(g: u64) {
     let me = hal::percpu::this_cpu();
@@ -114,6 +155,9 @@ pub(crate) fn pass() -> bool {
     // Free the stacks the nudge let through, and the records whose generation passed.
     let r2 = hal::switch::reap_stacks().unwrap_or_default();
     STACKS_FREED.add(r2.freed as u64);
+    if r.freed + r2.freed > 0 {
+        FREED.wake_all();
+    }
     // The graveyard keeps its memory (what `reserve_grave` set aside): the freed records move into a vector
     // reserved here, outside the lock. Generation 0: buried after the stamping above, waits for the next pass.
     let mut gone: Vec<Arc<Thread>> = Vec::new();

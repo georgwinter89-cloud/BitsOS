@@ -190,6 +190,8 @@ mod tests {
 
     #[test]
     fn cpuid_leaf_15() {
+        // The Gaming-PC's 265K (its real CPUID 0x15, E and P cores alike): 38.4 MHz, 202/2.
+        assert_eq!(cpuid15_hz(2, 202, 38_400_000), Some(3_878_400_000));
         // An Intel part with a 38.4 MHz crystal and ratio 188/2: 3.6096 GHz.
         assert_eq!(cpuid15_hz(2, 188, 38_400_000), Some(3_609_600_000));
         assert_eq!(cpuid15_hz(2, 188, 0), None, "crystal not enumerated");

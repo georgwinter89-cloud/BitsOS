@@ -220,7 +220,7 @@ fn jobs_checked(g: &HardwareGpu) -> Result<Vec<String>, String> {
 }
 
 /// A moment for the job thread (host tests have none: a round here).
-fn nap(g: &HardwareGpu) {
+pub(super) fn nap(g: &HardwareGpu) {
     #[cfg(not(test))]
     {
         let _ = g;
@@ -319,7 +319,7 @@ fn hold(g: &HardwareGpu, ns: u64) {
     }
 }
 
-fn wait(g: &HardwareGpu, f: &Arc<Fence>, ns: u64) -> bool {
+pub(super) fn wait(g: &HardwareGpu, f: &Arc<Fence>, ns: u64) -> bool {
     let t0 = super::clock_ns();
     while !fence::is_signaled(f) {
         if super::clock_ns().saturating_sub(t0) > ns {

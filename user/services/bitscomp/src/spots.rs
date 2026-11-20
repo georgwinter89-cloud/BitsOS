@@ -22,12 +22,21 @@ impl App {
     /// The spot under (x, y) besides the suggestions (`hit` asks those first, then floating windows): the chrome,
     /// then the start page.
     pub fn spot_at(&self, x: f64, y: f64) -> Option<Spot> {
+        if let Some(s) = self.ws_ask_spot(x, y) {
+            return Some(s);
+        }
+        if let Some(s) = self.min_list_spot(x, y) {
+            return Some(s);
+        }
         if let Some(p) = self.buehne_spot(x, y) {
             return Some(Spot::Buehne(p));
         }
         let ch = self.chrome();
         if let Some(p) = ch.hit(x, y) {
             return Some(Spot::Chrome(p));
+        }
+        if let Some(p) = self.assist_at(x, y) {
+            return Some(Spot::Assist(p));
         }
         if self.start_shown() && ch.work.contains(x, y) {
             let can = self.session.offered && self.session.saved.is_some();
@@ -42,6 +51,9 @@ impl App {
         if !keeps_edit {
             self.address_end();
         }
+        if !matches!(s, Spot::Assist(_)) {
+            self.assist_blur();
+        }
         match s {
             // A page's right press opens the circle menu (no spot press then: the menu takes the release).
             Spot::Page(pid, part) if !self.page_press(pid, part, right) => return true,
@@ -49,6 +61,7 @@ impl App {
             _ => self.page_edit_end(),
         }
         self.desk.press = Some(s);
+        self.desk.press_origin = self.input_origin;
         true
     }
 
@@ -81,17 +94,19 @@ impl App {
                 }
             }
             Spot::Chrome(Part::Min(i)) => {
+                self.desk.min_list.open = false;
                 if let Some(w) = self.ws.minimized.get(i).map(|m| m.win.clone()) {
                     self.unminimize(&w, "window list");
                 }
             }
+            Spot::Chrome(Part::MinMore) => self.min_more_press(),
+            Spot::Chrome(Part::MinClose(i)) => self.min_close(i, "its x"),
             Spot::Chrome(Part::Ws(i)) => self.act(Action::Workspace(i)),
+            Spot::Chrome(Part::WsClose(i)) => self.ws_close_press(i),
+            Spot::WsAsk(Some(yes)) => self.ws_ask_answer(yes),
+            Spot::WsAsk(None) => {}
             Spot::Chrome(Part::WsNew) => self.act(Action::NewWorkspace),
-            Spot::Chrome(Part::Home) => {
-                let has = !self.ws.tiles.is_empty() || !self.ws.floating.is_empty();
-                self.desk.start_forced = has && !self.desk.start_forced;
-                self.chrome_dirty();
-            }
+            Spot::Chrome(Part::Home) => self.home_press(),
             Spot::Suggest(i) => {
                 let rows = self.suggestions();
                 let tile = self.desk.edit.as_ref().and_then(|e| e.tile);
@@ -102,6 +117,7 @@ impl App {
             }
             Spot::Start(p) => self.start_act(p),
             Spot::Buehne(p) => self.buehne_act(p),
+            Spot::Assist(p) => self.assist_act(p),
             Spot::Page(pid, part) => self.page_act(pid, part),
         }
     }

@@ -204,9 +204,9 @@ fn sta_rx_status(sta: &mut Sta, f: &RxFrame) {
     }
 }
 
-// mac80211 ieee80211_rx_h_check_dup (linux-6.6/net/mac80211/rx.c:1411, wifi's DupCheck): a
+// mac80211 ieee80211_rx_h_check_dup (linux-7.3.1/net/mac80211/rx.c:1521, wifi's DupCheck): a
 // unicast retransmission of our AP; seqno_idx as ieee80211_parse_qos
-// (linux-6.6/net/mac80211/rx.c:875) gives it
+// (linux-7.3.1/net/mac80211/rx.c:984) gives it
 pub(super) fn duplicate(sta: &mut Sta, f: &RxFrame) -> bool {
     let Some(ap) = sta.ap.as_mut() else {
         return false;
@@ -229,7 +229,7 @@ pub(super) fn duplicate(sta: &mut Sta, f: &RxFrame) -> bool {
 
 // Linux: none (sta-link.mjs rxFrames): one RX poll (plus what H2C waits left): C2Hs handled, the
 // AP's RSSI averaged where rtw89_core_rx_process_phy_sts iterates the stations, rx stats, then
-// mac80211's ieee80211_rx_h_check_dup (linux-6.6/net/mac80211/rx.c:1411). Frames an exchange did
+// mac80211's ieee80211_rx_h_check_dup (linux-7.3.1/net/mac80211/rx.c:1521). Frames an exchange did
 // not take come first. The coex act1 work and the track work run first when they are due.
 pub fn rx_frames<B: Bus + ?Sized>(
     bus: &mut B,
@@ -379,7 +379,7 @@ pub(super) fn mgmt_of(mpdu: &[u8]) -> Option<Mgmt> {
             capability,
         },
         // a deauthentication or disassociation whose BSSID is not its sender is a TDLS
-        // teardown, never the AP ending our session (linux-6.6/net/mac80211/mlme.c:3828, :3876)
+        // teardown, never the AP ending our session (linux-7.3.1/net/mac80211/mlme.c:5659, :5709)
         MgmtKind::Deauth { .. } | MgmtKind::Disassoc { .. } if m.hdr.addr3 != Some(a2) => {
             return None;
         }
@@ -504,7 +504,7 @@ fn act<B: Bus + ?Sized>(
 }
 
 // Linux: none (mac80211 mlme.c ieee80211_mgd_auth/_assoc, ieee80211_assoc_success
-// (linux-6.6/net/mac80211/mlme.c:5104)) driving
+// (linux-7.3.1/net/mac80211/mlme.c:6979)) driving
 // rtw89_ops_config (mac80211.c:75), _link_info_changed (:750), _sta_state (:973),
 // _vif_cfg_changed (:699), _conf_tx (:912), _set_key (:987). `bss`: an entry of the scan; `sup`:
 // the link's handshake context (PMK, addresses, our and the AP's RSN element), closed when the
@@ -662,12 +662,12 @@ enum RxOne {
 
 // mac80211's RX for an associated link (from the handshake on, sta-link.mjs rxLink/ethOf): a
 // deauthentication or disassociation of our AP to the MLME (it ends the link,
-// ieee80211_rx_mgmt_deauth (linux-6.6/net/mac80211/mlme.c:3817)), data through the station's
+// ieee80211_rx_mgmt_deauth (linux-7.3.1/net/mac80211/mlme.c:5646)), data through the station's
 // checks (wifi's data_allowed: decrypted, PN replay per TID as ieee80211_crypto_ccmp_decrypt
-// (linux-6.6/net/mac80211/wpa.c:506), the control port of ieee80211_802_1x_port_control
-// (linux-6.6/net/mac80211/rx.c:2379) and ieee80211_frame_allowed
-// (linux-6.6/net/mac80211/rx.c:2550), ieee80211_drop_unencrypted
-// (linux-6.6/net/mac80211/rx.c:2387)), EAPOL to the MLME's supplicant, the rest up as Ethernet
+// (linux-7.3.1/net/mac80211/wpa.c:518), the control port of ieee80211_802_1x_port_control
+// (linux-7.3.1/net/mac80211/rx.c:2538) and ieee80211_frame_allowed
+// (linux-7.3.1/net/mac80211/rx.c:2727), ieee80211_drop_unencrypted
+// (linux-7.3.1/net/mac80211/rx.c:2546)), EAPOL to the MLME's supplicant, the rest up as Ethernet
 fn rx_one<B: Bus + ?Sized>(
     bus: &mut B,
     sta: &mut Sta,
@@ -733,13 +733,13 @@ fn rx_one<B: Bus + ?Sized>(
     Ok(RxOne::Eth(w.eth))
 }
 
-// Linux: ieee80211_set_disassoc (linux-6.6/net/mac80211/mlme.c:2885) for an associated link:
+// Linux: ieee80211_set_disassoc (linux-7.3.1/net/mac80211/mlme.c:4506) for an associated link:
 // with our deauthentication a dropping flush, the frame, a flush; the AP's station destroyed
 // (__sta_info_destroy_part1/2: AUTHORIZED -> ASSOC, flush, its keys, ASSOC -> AUTH -> NONE ->
 // NOTEXIST); then the ERP reset and one notify (vif_cfg_changed ASSOC, link_info_changed BSSID
-// and ERP_SLOT -> rtw89_conf_tx), ieee80211_set_wmm_default (linux-6.6/net/mac80211/mlme.c:3023,
+// and ERP_SLOT -> rtw89_conf_tx), ieee80211_set_wmm_default (linux-7.3.1/net/mac80211/mlme.c:4688,
 // enable_qos false); cfg80211 deletes the group keys after that. A link never associated ends as
-// ieee80211_destroy_auth_data (linux-6.6/net/mac80211/mlme.c:3498): the station, then the BSSID.
+// ieee80211_destroy_auth_data (linux-7.3.1/net/mac80211/mlme.c:5259): the station, then the BSSID.
 // Every step runs even when one before it failed (mac80211's teardown has no error path either):
 // the link ends locally in any case (no AP station, no keys, the handshake context wiped), and
 // the first error is returned at the end. A failed deauthentication frame or H2C must never leave
@@ -910,11 +910,11 @@ pub fn poll<B: Bus + ?Sized>(
     Ok(out)
 }
 
-// Linux: rtw89_pci_napi_poll (linux-6.6/drivers/net/wireless/realtek/rtw89/pci.c:3704) runs on
+// Linux: rtw89_pci_napi_poll (linux-7.3.1/drivers/net/wireless/realtek/rtw89/pci.c:4517) runs on
 // every interrupt while the chip runs, with or without a BSS: the release reports and the RX
 // queue are taken, C2Hs handled, and mac80211 drops the frames no interface wants. Here: the
 // interface is up without a link (between bring-up and the first join, between joins): a ring
-// left full raises RDU again after every acknowledgement, an MSI storm (desk-minipc-w13 24.10.).
+// left full raises RDU again after every acknowledgement, an MSI storm (seen on the Mini-PC, 24.10.).
 // Returns the frames dropped; what a join left (backlog, pending, rx_eth) goes too.
 pub fn idle_poll<B: Bus + ?Sized>(
     bus: &mut B,

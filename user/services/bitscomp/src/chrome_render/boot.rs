@@ -3,9 +3,9 @@
 //! frame is the same picture (`boot_draw`), lying over the whole desktop, which is built under it as usual. The
 //! scene goes on with the kernel's list (read again every `POLL` while it is up, a wake through `Status::due`, no
 //! frame when nothing changed) and bitscomp's own steps in the desktop row: its start, the shell and status
-//! services, the first program's window. Once the desktop is ready the scene fades out in `FADE` (cheap level;
-//! motion off: at once); it never waits for itself, and `CAP` ends a wait for a window that does not come. A key
-//! skips the fade: the desktop shows as soon as its own part (settings, status) is ready. Anything odd (no file,
+//! services, the first program's window. Once the desktop is ready the scene is the old picture of the circle wipe
+//! (WY-19c; motion off: at once); it never waits for itself, and `CAP` ends a wait for a window that does not come. A
+//! key skips the wipe: the desktop shows as soon as its own part (settings, status) is ready. Anything odd (no file,
 //! another format, a small screen, a desktop step of an earlier start) means no scene, straight to the desktop.
 
 use std::time::{Duration, Instant};
@@ -23,12 +23,8 @@ use crate::state::App;
 use crate::theme::Motion;
 
 pub const PATH: &str = "/proc/bitsos/boot";
-/// Another file instead of /proc/bitsos/boot (host tests: a headless bitscomp shows the scene from a fixture).
-pub const PATH_ENV: &str = "BITSCOMP_BOOT_FILE";
 /// The list is read again this often while the scene is up (DS-4: "e.g. 10 Hz").
 pub const POLL: Duration = Duration::from_millis(100);
-/// The cheap level's transition (at most 400 ms, Georg's answer 7; the circle wipe is the GPU level's).
-pub const FADE: Duration = Duration::from_millis(300);
 /// The longest the scene waits for the first program's window (scout's WY-23: hard cap 1.8 s).
 pub const CAP: Duration = Duration::from_millis(1800);
 /// How long the desktop waits for settingsd's first answer (so it opens in the user's theme, not the default).
@@ -56,7 +52,6 @@ enum Phase {
 }
 
 struct Up {
-    path: String,
     art: Art,
     scene: Scene,
     buf: MemoryRenderBuffer,
@@ -69,7 +64,6 @@ struct Up {
     next_poll: Duration,
     keys: u64,
     key: bool,
-    fade: Option<Duration>,
     read_failed: bool,
 }
 
@@ -134,28 +128,23 @@ impl App {
         if !matches!(self.images.boot.phase, Phase::Up(_)) {
             return None;
         }
-        let alpha = self.boot_tick(now)?;
+        self.boot_tick(now)?;
         let Phase::Up(up) = &self.images.boot.phase else { return None };
         let full = self.area_full();
         let o = crate::header::px_rect(full, self.theme.scale);
         let src: Rectangle<f64, Logical> = Rectangle::from_size(Size::from((up.scene.w as f64, up.scene.h as f64)));
         let at: Point<f64, Physical> = Point::from((o.x as f64, o.y as f64));
         let size: Size<i32, Logical> = (full.w, full.h).into();
-        let a = (alpha < 1.0).then_some(alpha.max(0.0));
-        MemoryRenderBufferRenderElement::from_buffer(renderer, at, &up.buf, a, Some(src), Some(size), Kind::Unspecified)
+        MemoryRenderBufferRenderElement::from_buffer(renderer, at, &up.buf, None, Some(src), Some(size), Kind::Unspecified)
             .ok()
             .map(CompElement::from)
     }
 
     fn boot_begin(&mut self, now: Duration) -> Result<Up, String> {
-        let env = std::env::var(PATH_ENV).ok().filter(|p| !p.is_empty());
-        if env.is_none() && self.headless {
-            return Err(String::new());
-        }
-        let path = env.unwrap_or_else(|| PATH.to_string());
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-        let kernel = Steps::parse(&text).ok_or_else(|| format!("{path}: not the format bitsos-boot 1"))?;
-        eligible(&kernel, ms(now).saturating_sub(ms(self.start.elapsed())))?;
+        let text = std::fs::read_to_string(PATH).map_err(|e| format!("{PATH}: {e}"))?;
+        let kernel = Steps::parse(&text).ok_or_else(|| format!("{PATH}: not the format bitsos-boot 1"))?;
+        // GS-1: the kernel's desktop step is this start's.
+        eligible(&kernel, crate::bootmark::started_ms())?;
         let (w, h) = super::wallpaper::output_px(self);
         let scene = Scene::new(w, h).ok_or_else(|| format!("the screen is {w}x{h}, the scene needs 2560x1440"))?;
         let t0 = Instant::now();
@@ -169,7 +158,7 @@ impl App {
         let opaque: Rectangle<i32, Buffer> = Rectangle::from_size(Size::from((w, h)));
         let buf = MemoryRenderBuffer::from_slice(&bytes(&px), Fourcc::Argb8888, (w, h), 1, Transform::Normal, Some(vec![opaque]));
         eprintln!(
-            "bitscomp: boot scene: shown ({path}: seq {}, the kernel drew {}, screen {}); pieces {} ms, picture {} ms, {} ms after bitscomp's start",
+            "bitscomp: boot scene: shown ({PATH}: seq {}, the kernel drew {}, screen {}); pieces {} ms, picture {} ms, {} ms after bitscomp's start",
             kernel.seq,
             kernel.drawn,
             kernel.screen,
@@ -180,7 +169,6 @@ impl App {
         self.anim.hold = true;
         self.status.boot_poll = Some(now + POLL);
         Ok(Up {
-            path,
             art,
             scene,
             buf,
@@ -193,7 +181,6 @@ impl App {
             next_poll: now + POLL,
             keys: self.stats.key_presses,
             key: false,
-            fade: None,
             read_failed: false,
         })
     }
@@ -204,8 +191,8 @@ impl App {
         argv.and_then(|a| a.first()).map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default()
     }
 
-    /// One frame of the scene: its alpha, None once the desktop shows alone.
-    fn boot_tick(&mut self, now: Duration) -> Option<f32> {
+    /// One frame of the scene; None once the desktop shows alone.
+    fn boot_tick(&mut self, now: Duration) -> Option<()> {
         let motion_off = self.theme.motion == Motion::Off;
         let settings = self.settings_live || self.settings_writer.is_none();
         let status = !self.status.clock.is_empty();
@@ -218,20 +205,13 @@ impl App {
         if key_seen(keys, up.keys) {
             up.key = true;
         }
-        if let Some(f0) = up.fade {
-            if up.key || now >= f0 + FADE {
-                return self.boot_end(now, "faded");
-            }
-            let k = (now.saturating_sub(f0).as_secs_f32() / FADE.as_secs_f32()).clamp(0.0, 1.0);
-            return Some(1.0 - k * k * (3.0 - 2.0 * k));
-        }
         if now >= up.next_poll {
             up.next_poll = now + POLL;
-            match std::fs::read_to_string(&up.path).ok().as_deref().and_then(Steps::parse) {
+            match std::fs::read_to_string(PATH).ok().as_deref().and_then(Steps::parse) {
                 Some(s) => up.kernel = s,
                 None if !up.read_failed => {
                     up.read_failed = true;
-                    eprintln!("bitscomp: boot scene: {} unreadable now, the list keeps its last state", up.path);
+                    eprintln!("bitscomp: boot scene: {PATH} unreadable now, the list keeps its last state");
                 }
                 None => {}
             }
@@ -261,7 +241,7 @@ impl App {
         }
         if !end {
             self.status.boot_poll = Some(up.next_poll);
-            return Some(1.0);
+            return Some(());
         }
         eprintln!(
             "bitscomp: boot scene: desktop ready {} ms after bitscomp's start ({reason}; scene {} ms, settings {}, window {})",
@@ -276,14 +256,9 @@ impl App {
         if !fades(reason, motion_off) {
             return self.boot_end(now, reason);
         }
-        // WY-19c: the gpu level's way into the desktop: the scene is the old picture of the circle wipe.
-        if self.theme.effects_gpu {
-            self.fx_play(crate::fx::plan::WIPE);
-            return self.boot_end(now, "wipe");
-        }
-        up.fade = Some(now);
-        self.anim.boot_fade = Some(now + FADE);
-        Some(1.0)
+        // WY-19c: the way into the desktop: the scene is the old picture of the circle wipe.
+        self.fx_play(crate::fx::plan::WIPE);
+        self.boot_end(now, "wipe")
     }
 
     /// WY-19b: the boot scene is up: nothing moves over it, it shows the kernel's picture to the pixel.
@@ -291,17 +266,13 @@ impl App {
         matches!(self.images.boot.phase, Phase::Up(_))
     }
 
-    fn boot_end(&mut self, now: Duration, how: &str) -> Option<f32> {
-        if let Phase::Up(up) = &self.images.boot.phase {
-            eprintln!(
-                "bitscomp: boot scene: desktop shown {} ms after bitscomp's start ({how}; transition {} ms)",
-                self.start.elapsed().as_millis(),
-                up.fade.map_or(0, |f| ms(now.saturating_sub(f)))
-            );
+    fn boot_end(&mut self, now: Duration, how: &str) -> Option<()> {
+        if matches!(self.images.boot.phase, Phase::Up(_)) {
+            eprintln!("bitscomp: boot scene: desktop shown {} ms after bitscomp's start ({how})", self.start.elapsed().as_millis());
+            crate::bootmark::mark_at("shown", ms(now));
         }
         self.images.boot.phase = Phase::Gone;
         self.anim.hold = false;
-        self.anim.boot_fade = None;
         self.status.boot_poll = None;
         None
     }
@@ -319,7 +290,7 @@ pub fn ends(key: bool, next: Own, capped: bool) -> Option<&'static str> {
     }
 }
 
-/// Whether the end fades (FADE) or cuts: a key or motion off shows the desktop at once (transition 0).
+/// Whether the end plays the circle wipe or cuts: a key or motion off shows the desktop at once (transition 0).
 pub fn fades(reason: &str, motion_off: bool) -> bool {
     !motion_off && reason != "key"
 }

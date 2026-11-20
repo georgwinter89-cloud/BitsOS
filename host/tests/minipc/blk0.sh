@@ -1,5 +1,5 @@
 #!/bin/bash
-# BL-0: the read-path measurement of plan/notes/desk-W35-mm-blk.md ("BL-0 procedure"), by the desk against the real
+# BL-0: the read-path measurement of plan/guides/blk0.md, by the desk against the real
 # Mini-PC over MCP (TLS). Usage:
 #   bash host/tests/minipc/blk0.sh <host[:port]> --tls auto --token-file <F> [--label idle|x4] [--state BL-0] [blk0.py options]
 #   bash host/tests/minipc/blk0.sh --proof     the same script against a QEMU guest of this lane (plain HTTP, a stick

@@ -137,7 +137,7 @@ fn claim(at: Loc, name: &'static str, rank: (u8, u8)) -> Result<(), BindError> {
 
 /// The node is still in the tree (a rescan may have dropped it between our copy and the claim).
 fn in_tree(n: &Node) -> bool {
-    crate::NODES.lock().iter().any(|t| crate::rescan::same(t, n))
+    crate::NODES.get().iter().any(|t| crate::rescan::same(t, n))
 }
 
 /// After a failed probe: switch the device off if the probe had enabled it, then free the record (the
@@ -182,6 +182,8 @@ pub(crate) fn bind_node(n: &Node, cands: &[Candidate]) -> Result<&'static str, B
     if let Some(b) = binding(n.loc) {
         return Err(if b.state == BindState::Bound { BindError::AlreadyBound(b.driver) } else { BindError::Busy });
     }
+    // A note about an earlier failed probe describes that try, not this one.
+    crate::failed::forget(n.loc);
     let order = registry::ordered(cands, n.vendor, n.device, n.class);
     if order.is_empty() {
         return Err(BindError::NoDriver);
@@ -196,11 +198,6 @@ pub(crate) fn bind_node(n: &Node, cands: &[Candidate]) -> Result<&'static str, B
     let f = n.function();
     let mut failed: Vec<&'static str> = Vec::new();
     for (c, rank) in order {
-        // The function itself is touched; an opt-in driver whose key is off still never probes (R8d).
-        if let Some(k) = c.opt_in_key.filter(|k| !registry::opted_in(k)) {
-            klog::event!(Info, "pci", "opt_in.skip", driver = c.name, function = loc.as_str(), key = k);
-            continue;
-        }
         if !crate::optin::may_bind(c.name, n) {
             klog::event!(Warn, "pci", "bind.refused", driver = c.name, function = loc.as_str(), class = klog::Hex(n.class as u64);
                 "mass storage binds only to the NVMe driver (R8a)");
@@ -231,9 +228,12 @@ pub(crate) fn bind_node(n: &Node, cands: &[Candidate]) -> Result<&'static str, B
                     return Err(BindError::NotScanned);
                 }
                 klog::event!(Info, "pci", "bound", driver = c.name, function = loc.as_str(), matched = how, failed_before = failed.len());
+                crate::failed::forget(n.loc);
                 return Ok(c.name);
             }
             Err(e) => {
+                // Kept past the record `release_failed` frees: the report page names the driver and its reason.
+                crate::failed::note(n.loc, c.name, &e);
                 klog::event!(Warn, "pci", "probe.failed", driver = c.name, function = loc.as_str(), matched = how, error = e);
                 release_failed(&f);
                 failed.push(c.name);
@@ -247,7 +247,7 @@ pub(crate) fn bind_node(n: &Node, cands: &[Candidate]) -> Result<&'static str, B
 }
 
 fn node(at: Loc) -> Option<Node> {
-    crate::NODES.lock().iter().find(|n| n.loc == at).cloned()
+    crate::NODES.get().iter().find(|n| n.loc == at).cloned()
 }
 
 /// Binds the registered drivers to every function that has none yet (the kernel calls it once after

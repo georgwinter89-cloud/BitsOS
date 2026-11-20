@@ -73,6 +73,12 @@ impl Font {
         if x >= self.w || y >= self.h {
             return 0;
         }
+        self.glyph(c).at(self, x, y)
+    }
+
+    /// Where the cell for `c` takes its coverage from. GP-START: looked up once per cell, not per pixel: the lookup
+    /// (Noto's character match, the CP437 table) cost more than the pixel, 12 ms for a 2560x1440 screen.
+    pub fn glyph(&self, c: char) -> Glyph {
         let size = match self.noto {
             32 => Some(RasterHeight::Size32),
             24 => Some(RasterHeight::Size24),
@@ -82,21 +88,38 @@ impl Font {
         match size {
             Some(size) => {
                 if let Some(r) = get_raster(c, FontWeight::Regular, size) {
-                    return r.raster().get(y as usize).and_then(|row| row.get(x as usize)).copied().unwrap_or(0);
+                    return Glyph::Raster(r.raster());
                 }
                 if let Some(bits) = extra_glyph(c) {
-                    // The 8x16 bitmap stretched over the cell (nearest pixel).
-                    let (fx, fy) = (x * 8 / self.w, y * 16 / self.h);
-                    return if bits[fy as usize] & (0x80 >> fx) != 0 { 255 } else { 0 };
+                    return Glyph::Stretched(bits);
                 }
-                let q = get_raster('?', FontWeight::Regular, size);
-                q.and_then(|r| r.raster().get(y as usize).and_then(|row| row.get(x as usize)).copied()).unwrap_or(0)
+                Glyph::Raster(get_raster('?', FontWeight::Regular, size).map_or(&[], |r| r.raster()))
             }
-            None => {
-                let bits = vga_bits(c);
-                let (fx, fy) = (x / self.scale, y / self.scale);
-                if bits[fy as usize] & (0x80 >> fx) != 0 { 255 } else { 0 }
-            }
+            None => Glyph::Scaled(vga_bits(c)),
+        }
+    }
+}
+
+/// A cell's coverage source ([`Font::glyph`]).
+#[derive(Clone, Copy)]
+pub enum Glyph {
+    /// Noto's grey levels, one row of bytes per pixel row (missing rows and columns are background).
+    Raster(&'static [&'static [u8]]),
+    /// An 8x16 bitmap stretched over the cell (nearest pixel): a glyph Noto lacks.
+    Stretched(&'static [u8]),
+    /// A VGA 8x16 bitmap scaled by the font's whole number.
+    Scaled(&'static [u8]),
+}
+
+impl Glyph {
+    /// Coverage of pixel (`x`, `y`) inside the cell (`x < font.w`, `y < font.h`).
+    #[inline]
+    pub fn at(self, font: &Font, x: u32, y: u32) -> u8 {
+        let on = |bits: &[u8], fx: u32, fy: u32| if bits[fy as usize] & (0x80 >> fx) != 0 { 255 } else { 0 };
+        match self {
+            Glyph::Raster(r) => r.get(y as usize).and_then(|row| row.get(x as usize)).copied().unwrap_or(0),
+            Glyph::Stretched(bits) => on(bits, x * 8 / font.w, y * 16 / font.h),
+            Glyph::Scaled(bits) => on(bits, x / font.scale, y / font.scale),
         }
     }
 }

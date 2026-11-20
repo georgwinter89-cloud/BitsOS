@@ -2,7 +2,7 @@
 //! `/boot/BITSOS2/firmware/amdgpu/<name>.bin`, tries a need's fallback name when the first is missing (MES
 //! `_mes_2` → `_mes`, amdgpu_mes.c:1410-1418), and checks each file's common header (`ucode::header`). The stick
 //! holds plain `.bin` files: BitsOS has no zstd decoder, so `cargo xtask image` decompresses linux-firmware's
-//! `.bin.zst` on the host (desk change request in plan/notes/gx-GX-7a.md); a `.zst` alone is named as such.
+//! `.bin.zst` on the host (host/xtask/src/firmware.rs); a `.zst` alone is named as such.
 //! The files are never in git (public repository).
 
 use crate::gpucore::ucode::{FwFile, FwSet, Kind, ListOpts, Why};

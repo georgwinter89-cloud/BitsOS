@@ -1,4 +1,4 @@
-//! DR-5: the reservation object of a buffer (Linux `dma_resv`, linux-6.6/drivers/dma-buf/dma-resv.c), as far as
+//! DR-5: the reservation object of a buffer (Linux `dma_resv`, linux-7.3.1/drivers/dma-buf/dma-resv.c), as far as
 //! dma-buf needs it: a set of fences, each with its usage, that poll, EXPORT_SYNC_FILE and IMPORT_SYNC_FILE read
 //! and fill. DR-6 gives GEM objects the same object (a GEM buffer and its dma-buf share one, as `dmabuf->resv =
 //! obj->resv`) and adds the driver's submissions to it.

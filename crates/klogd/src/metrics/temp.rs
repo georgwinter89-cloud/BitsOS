@@ -1,8 +1,8 @@
-//! CPU temperatures as Linux' k10temp reads them (linux-6.6/drivers/hwmon/k10temp.c): Tctl from SMN
+//! CPU temperatures as Linux' k10temp reads them (linux-7.3.1/drivers/hwmon/k10temp.c): Tctl from SMN
 //! `0x59800`, per-CCD temperatures from `0x59800 + ccd_offset + 4*i` where bit 11 says the CCD exists. SMN is
 //! reached through the root complex 00:00.0's index/data pair at config 0x60/0x64
-//! (linux-6.6/arch/x86/kernel/amd_nb.c:174-215). Only reads: the index write selects a register, nothing
-//! on the chip changes. Not AMD Zen or no AMD root complex (QEMU): no temperatures, never a guess.
+//! (linux-7.3.1/arch/x86/kernel/amd_node.c:85-128; a read of all ones is an error there and gives no value
+//! here). Only reads: the index write selects a register, nothing on the chip changes. Not AMD Zen or no AMD root complex (QEMU): no temperatures, never a guess.
 
 use alloc::format;
 use alloc::string::String;
@@ -26,18 +26,21 @@ pub fn family_model(eax: u32) -> (u32, u32) {
 }
 
 /// Zen families k10temp reads through SMN, and their CCD register offset and how many CCDs to probe
-/// (linux-6.6/drivers/hwmon/k10temp.c:423-480). `Some((None, 0))`: Tctl only.
+/// (linux-7.3.1/drivers/hwmon/k10temp.c:478-535). `Some((None, 0))`: Tctl only.
 pub fn layout(family: u32, model: u32) -> Option<(Option<u32>, u32)> {
     let ccd = match (family, model) {
         (0x17 | 0x18, 0x01 | 0x08 | 0x11 | 0x18) => Some((0x154, 4)),
-        (0x17 | 0x18, 0x31 | 0x60 | 0x68 | 0x71) => Some((0x154, 8)),
+        (0x17 | 0x18, 0x31 | 0x47 | 0x60 | 0x68 | 0x71) => Some((0x154, 8)),
         (0x17 | 0x18, 0xa0..=0xaf) => Some((0x300, 8)),
         (0x17 | 0x18, _) => None,
-        (0x19, 0x00..=0x01 | 0x21 | 0x50..=0x5f) => Some((0x154, 8)),
+        (0x19, 0x00..=0x01 | 0x08 | 0x21 | 0x50..=0x5f) => Some((0x154, 8)),
         (0x19, 0x40..=0x4f) => Some((0x300, 8)),
         (0x19, 0x60..=0x7f) => Some((0x308, 8)),
         (0x19, 0x10..=0x1f | 0xa0..=0xaf) => Some((0x300, 12)),
-        (0x19 | 0x1a, _) => None,
+        (0x19, _) => None,
+        (0x1a, 0x00..=0x1f) => Some((0x1f0, 16)),
+        (0x1a, 0x40..=0x4f) => Some((0x308, 8)),
+        (0x1a, _) => None,
         _ => return None,
     };
     Some(ccd.map_or((None, 0), |(o, n)| (Some(o), n)))
@@ -50,7 +53,7 @@ pub fn tctl_mc(reg: u32) -> u64 {
     t.max(0) as u64
 }
 
-/// A CCD's temperature in thousandths of a degree (k10temp.c:227).
+/// A CCD's temperature in thousandths of a degree (k10temp.c:256).
 pub fn ccd_mc(reg: u32) -> u64 {
     ((reg & CCD_MASK) as i64 * 125 - 49_000).max(0) as u64
 }
@@ -69,7 +72,8 @@ pub trait SmnPort {
     fn read(&self, addr: u32) -> Result<u32, Smn>;
 }
 
-/// SMN through the AMD root complex 00:00.0 (linux-6.6/arch/x86/kernel/amd_nb.c:174-215).
+/// SMN through the AMD root complex 00:00.0 (linux-7.3.1/arch/x86/kernel/amd_node.c:85-128); `Failed` also for a
+/// read of all ones (`pci::smn_read`).
 pub struct RootSmn;
 
 impl SmnPort for RootSmn {
@@ -174,6 +178,13 @@ mod tests {
         assert_eq!(layout(0x19, 0x75), Some((Some(0x308), 8)));
         assert_eq!(layout(0x1a, 0x24), Some((None, 0)));
         assert_eq!(layout(0x17, 0x90), Some((None, 0)));
+        // Linux 7 knows more: Cyan Skillfish, Zen3 Threadripper Chagall, Zen5 Turin and Zen5 Ryzen desktop.
+        assert_eq!(layout(0x17, 0x47), Some((Some(0x154), 8)));
+        assert_eq!(layout(0x19, 0x08), Some((Some(0x154), 8)));
+        assert_eq!(layout(0x1a, 0x00), Some((Some(0x1f0), 16)));
+        assert_eq!(layout(0x1a, 0x1f), Some((Some(0x1f0), 16)));
+        assert_eq!(layout(0x1a, 0x44), Some((Some(0x308), 8)));
+        assert_eq!(layout(0x1a, 0x50), Some((None, 0)));
         assert_eq!(layout(0x06, 0x9a), None, "Intel family 6");
         assert_eq!(family_model(0x0009_06a3), (6, 0x9a));
     }

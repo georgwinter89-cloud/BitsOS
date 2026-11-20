@@ -32,8 +32,8 @@ fn minipc_plan_has_c2_and_c3_with_the_bus_master_check() {
     assert_eq!(
         p.deep,
         vec![
-            Deep { kind: 2, port: 0x414, latency_ns: 18_000, bm_check: false },
-            Deep { kind: 3, port: 0x415, latency_ns: 350_000, bm_check: true },
+            Deep { kind: 2, port: 0x414, latency_ns: 18_000, bm_check: false, mwait: None },
+            Deep { kind: 3, port: 0x415, latency_ns: 350_000, bm_check: true, mwait: None },
         ]
     );
     assert_eq!((p.c1_only, p.bm_status, p.dummy_read), (None, [Some(PM1A), None], None), "AMD: no dummy read");
@@ -85,7 +85,7 @@ fn hostile_states_are_refused_one_by_one() {
     let why: Vec<Refused> = p.refused.iter().map(|r| r.1).collect();
     use Refused::*;
     assert_eq!(why, vec![Kind, Kind, Kind, Ffh, Space, PortZero, PortRange, Latency, Latency, Latency, Duplicate, Duplicate, Guard]);
-    assert_eq!(p.deep, vec![Deep { kind: 2, port: 0x414, latency_ns: 18_000, bm_check: false }]);
+    assert_eq!(p.deep, vec![Deep { kind: 2, port: 0x414, latency_ns: 18_000, bm_check: false, mwait: None }]);
 }
 
 #[test]
@@ -140,16 +140,6 @@ fn latencies_out_of_order_are_sorted_like_linux() {
     let two_c2 = plan_of(&CpuIdle::ZEN4, &[io(2, 0x416, 60), io(2, 0x414, 18)]);
     assert!(!two_c2.latency_reordered);
     assert_eq!(two_c2.deep.iter().map(|d| d.port).collect::<Vec<_>>(), vec![0x414, 0x416], "several of one type: by latency");
-}
-
-#[test]
-fn config_key() {
-    assert_eq!(parse_config(None), (Mode::Auto, false));
-    assert_eq!(parse_config(Some("deep")), (Mode::Auto, false));
-    assert_eq!(parse_config(Some(" c1 ")), (Mode::C1, false));
-    assert_eq!(parse_config(Some("")), (Mode::Auto, false));
-    assert_eq!(parse_config(Some("hlt")), (Mode::Auto, true));
-    assert_eq!(parse_config(Some("C1")), (Mode::Auto, true), "values are lower case like every CONFIG key");
 }
 
 fn minipc_deep() -> Vec<Deep> {
@@ -223,13 +213,12 @@ fn entry_steps_match_linux_io_idle_and_enter_bm() {
     );
 }
 
-/// `idle=c1` and a CPU unlike the boot CPU: no port is touched, not even the timer queue is asked.
+/// The measuring build's C1 mode and a CPU unlike the boot CPU: no port is touched, not even the timer queue is asked.
 #[test]
 fn c1_mode_and_c1_only_cpus_touch_no_port() {
     let p = plan_of(&CpuIdle::ZEN4, &minipc_states());
     let hw = Recorder::default();
-    let (c1, bad) = parse_config(Some("c1"));
-    assert!(!bad);
+    let c1 = Mode::C1;
     let asked = core::cell::Cell::new(false);
     let gap = || {
         asked.set(true);
@@ -242,8 +231,8 @@ fn c1_mode_and_c1_only_cpus_touch_no_port() {
     assert_eq!(step(&hw, None, Mode::Auto, false, gap, u64::MAX, 4), Entered::C1, "no plan yet");
     assert_eq!(hw.take(), vec![Op::Halt]);
     assert!(!asked.get(), "the timer queue is asked only when a deep state is possible");
-    // The same quiet CPU with idle=deep: C3.
-    let (deep, _) = parse_config(Some("deep"));
+    // The same quiet CPU in the normal mode: C3.
+    let deep = Mode::Auto;
     assert_eq!(step(&hw, Some(&p), deep, false, || None, u64::MAX, 4), Entered::Deep(1));
     assert_eq!(hw.take(), vec![Op::In16(PM1A), Op::In8(0x415), Op::Sti]);
     // A busy timer queue (gap 0): C1.
@@ -267,20 +256,53 @@ fn refused_ports_fail_closed() {
     assert_eq!(enter(&hw, &p, Some(1)), Entered::Demoted { from: 1, to: Some(0) });
 }
 
-/// An unknown `idle=` value is a Warn and keeps deep; `c1` switches; the mode is put back afterwards.
+/// The 265K's `_CST` as Linux shows it (cpuidle `desc`/`latency` of P and E cores alike, 5.11.2026): C1 by MWAIT 0x0,
+/// C2 by MWAIT 0x21 (127 us), C3 by MWAIT 0x60 (1048 us).
+fn arrow_lake_states() -> Vec<CState> {
+    let ffh = |kind, hint, latency_us| CState { kind, entry: Entry::FixedHw(hint), latency_us };
+    vec![ffh(1, 0x00, 1), ffh(2, 0x21, 127), ffh(3, 0x60, 1048)]
+}
+
+/// GP-CPU2 (replaces CP-265K's `arrow_lake_stays_in_c1_by_hlt`, whose subject this item changes): on the 265K the
+/// plan holds the MWAIT states Linux's `intel_idle` takes, from an all-FFH `_CST`, else from the model's table when
+/// `_CST` holds port states; no port is ever asked, and nothing is entered before the self-check.
 #[test]
-fn configure_warns_on_unknown_values() {
-    let before = mode();
-    let since = klog::next_seq();
-    configure(&|k: &str| (k == "idle").then(|| alloc::string::String::from("foo")));
-    let after_foo = mode();
-    configure(&|k: &str| (k == "idle").then(|| alloc::string::String::from("c1")));
-    let after_c1 = mode();
-    set_mode(before);
-    assert_eq!(after_foo, Mode::Auto);
-    assert_eq!(after_c1, Mode::C1);
-    let warned = klog::read_since(since, 10_000)
-        .iter()
-        .any(|r| r.level == klog::Level::Warn && r.name == "config.unknown" && r.text.contains("idle") && r.text.contains("foo"));
-    assert!(warned, "a Warn for idle=foo");
+fn arrow_lake_takes_mwait_states_like_intel_idle() {
+    let cpu = CpuIdle::ARROW_LAKE;
+    for (states, src) in [(arrow_lake_states(), MwaitSource::Cst), (vec![io(1, 0x1814, 1), io(2, 0x1815, 127), io(3, 0x1816, 1048)], MwaitSource::Model)] {
+        let mut asked = false;
+        let p = plan(&cpu, Some(&fw(&states)), &mut |_, _| {
+            asked = true;
+            true
+        });
+        assert_eq!((p.c1_only, p.mwait_source), (None, Some(src)));
+        let got: Vec<(u8, Option<u8>, u64)> = p.deep.iter().map(|d| (d.kind, d.mwait, d.latency_ns / 1000)).collect();
+        assert_eq!(got, vec![(2, Some(0x21), 127), (3, Some(0x60), 1048)]);
+        assert!(p.dummy_read.is_none() && p.bm_status == [None, None] && !asked && p.needs_check(), "no port asked: {p:?}");
+        assert_eq!(usable(Some(&p), CheckState::Pending), None, "nothing deep before the check");
+        assert_eq!(usable(Some(&p), CheckState::Failed), None);
+        let hw = Recorder::default();
+        assert_eq!(enter(&hw, &p, Some(1)), Entered::Deep(1));
+        assert_eq!(hw.take(), vec![Op::Mwait(0x60), Op::Sti], "mwait with the hint, then sti");
+        assert_eq!(enter(&hw, &p, None), Entered::C1);
+        assert_eq!(hw.take(), vec![Op::Halt], "C1 stays sti; hlt");
+    }
+}
+
+/// The FFH states alone (a non-hybrid Intel with the same table) are refused by name, and C1 remains.
+#[test]
+fn intel_ffh_states_are_refused_and_c1_remains() {
+    let cpu = CpuIdle { hybrid: false, ..CpuIdle::ARROW_LAKE };
+    let s = arrow_lake_states();
+    let p = plan_of(&cpu, &s);
+    assert_eq!(p.c1_only, Some(C1Only::NoUsableState));
+    assert_eq!(p.refused.iter().map(|(c, why)| (c.kind, *why)).collect::<Vec<_>>(), vec![(2, Refused::Ffh), (3, Refused::Ffh)]);
+}
+
+/// A hypervisor says so first, and the hybrid bit changes nothing on AMD: the Mini-PC's plan is untouched.
+#[test]
+fn hybrid_reason_only_on_bare_metal_intel() {
+    let s = minipc_states();
+    assert_eq!(plan_of(&CpuIdle { hypervisor: true, ..CpuIdle::ARROW_LAKE }, &s).c1_only, Some(C1Only::Hypervisor));
+    assert_eq!(plan_of(&CpuIdle { hybrid: true, ..CpuIdle::ZEN4 }, &s), plan_of(&CpuIdle::ZEN4, &s));
 }

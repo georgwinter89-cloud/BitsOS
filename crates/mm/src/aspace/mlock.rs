@@ -1,5 +1,5 @@
-//! GM-2a CR 4: mlock, munlock, mlockall, munlockall and mlock2 (linux-6.6/mm/mlock.c). V2 has no swap and never takes a
-//! mapped page away, so a locked page stays by itself: what is left of the calls is Linux's answers, the limit, the
+//! GM-2a CR 4: mlock, munlock, mlockall, munlockall and mlock2 (linux-7.3.1/mm/mlock.c). V2 has no swap and never takes
+//! a mapped page away, so a locked page stays by itself: what is left of the calls is Linux's answers, the limit, the
 //! population and VM_LOCKED's effects on other calls (madvise, msync, fork, VmLck).
 //!
 //! The locked pages are not counted along: `Space::locked_pages` walks the VMAs at each call, which only programs that

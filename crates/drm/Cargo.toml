@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 # DR-2: the render node (vfs File, devnode!, /sys view), events, locks, the caller's pid and capabilities (proc),
-# the hypervisor bit for drm=auto (hal), the ktests (ktest, policy for spawning the ABI program).
+# the user address limit and the hypervisor bit for the ktests' own fake (hal), the ktests (ktest, policy for spawning the ABI program).
 vfs = { path = "../vfs" }
 klog = { path = "../klog" }
 kreg = { path = "../kreg" }

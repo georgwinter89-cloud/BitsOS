@@ -44,7 +44,7 @@ cargo xtask qemu --name "$NAME" --smp 4 --timeout 300 --serial-log "$RUN_DIR/poo
 grep -aq "KTEST ok nv.window.pool_first " "$RUN_DIR/pool.log" || { grep -a "KTEST\|window" "$RUN_DIR/pool.log" | tail; fail "the pool was not made"; }
 
 # C1 (INT-W27b): squeezed like rb/20-reload.sh.
-export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-384}
+export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-512}
 export RB18_PSK="rb18-fake-psk-not-real"
 cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;wlan_psk=$RB18_PSK;mcp_port=8765;loglevel=info;rb_squeeze_mb=$RB_SQUEEZE_MB;rb_choke_mb=10;nvme_write=on;nvme_data=$KEY;data_img_mb=0"
 BUNDLES="$RUN_DIR/bundles"

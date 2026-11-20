@@ -97,7 +97,7 @@ impl DevConfig {
 
 /// A chip that runs, with the interface added. The module states of more than a few hundred
 /// bytes live on the heap: a Device by value went through four frames of the bring-up, each with
-/// its own copy, and at opt-level 1 the driver thread's 64 KiB stack overflowed (Mini-PC, wlan=on).
+/// its own copy, and at opt-level 1 the driver thread's 64 KiB stack overflowed (Mini-PC, 22.10.).
 #[derive(Debug)]
 pub struct Device {
     pub run: Box<Bringup>,
@@ -271,7 +271,7 @@ impl Device {
         let opts = at(Stage::Mac, run.pwr_opts())?;
         at(Stage::Mac, run.core_start_mac(bus, fw, &opts))?;
         // rtw89_coex_recognize_ver at firmware load, rtw89_btc_init at probe (a fresh state per
-        // bring-up: WL-2-btc.md, an init cut short leaves it refusing), btc_ntfy_poweron at stage mac
+        // bring-up: an init cut short leaves it refusing), btc_ntfy_poweron at stage mac
         let mut btc = at(Stage::Mac, try_boxed(|| BtcState::new(fw.suit.ver.code)))?;
         btc::power_on(&mut btc);
         // rtw89_fw_recognize_elements / rtw89_core_setup_rfe_parms / rtw89_regd_setup at probe

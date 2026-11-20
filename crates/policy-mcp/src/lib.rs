@@ -114,9 +114,9 @@ fn install_owners() -> Result<(), &'static str> {
 mcp::__kreg::initcall!(mcp::__kreg::Level::Core, "pm.owners", install_owners);
 
 /// A process's name in the view: the file name of the executable it runs (`path`, resolved at execve as
-/// /proc/<pid>/exe is), not its comm (`comm`, the file name execve was given, linux-6.6/fs/exec.c:1366
-/// `__set_task_comm(me, kbasename(bprm->filename), true)`): Chromium's helpers exec /proc/self/exe and are all
-/// `exe`. The comm when the path has no file name.
+/// /proc/<pid>/exe is), not its comm (`comm`: linux-7.3.1/fs/exec.c:1281, the last part of the name execve was
+/// given, or the file's own name after fexecve): Chromium's helpers exec /proc/self/exe and are all `exe`. The
+/// comm when the path has no file name.
 pub(crate) fn program_name<'a>(path: &'a str, comm: &'a str) -> &'a str {
     path.rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or(comm)
 }

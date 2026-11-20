@@ -65,6 +65,8 @@ pub struct Reading {
     pub pkg_energy: Option<(u32, u32)>,
     /// What the previous round cost the sampler (ns).
     pub cost_ns: u64,
+    /// SYS-K: (CPU, kHz) from APERF/MPERF since the previous round (`clocks.rs`).
+    pub clocks: Vec<(usize, u64)>,
 }
 
 pub const KIND_NAMES: [&str; 8] = ["heap", "pagetable", "user", "dma", "stack", "pagecache", "driver", "other"];
@@ -133,6 +135,9 @@ impl Sampler {
                 store.put("power.pkg", Unit::Watt, mw.min(u64::MAX as u128 - 1) as u64);
             }
             self.energy = Some(raw);
+        }
+        for (cpu, khz) in &r.clocks {
+            store.put(&format!("cpu.{cpu}.khz"), Unit::KHz, *khz);
         }
         if let Some(dt) = dt {
             store.put("metrics.cost", Unit::Pct, pct(r.cost_ns, dt));
@@ -244,6 +249,7 @@ mod tests {
             temps: alloc::vec![("tctl".into(), 48_125)],
             pkg_energy: Some((energy, 16)),
             cost_ns: 2_000_000,
+            clocks: alloc::vec![(0, 4_440_000)],
         }
     }
 
@@ -265,6 +271,8 @@ mod tests {
         assert_eq!(val(&s, "disk.usb0.requests"), Some(2000), "4 requests in 2 s = 2.000/s");
         assert_eq!(val(&s, "power.pkg"), Some(1000), "2 J in 2 s = 1 W across the 32-bit wrap");
         assert_eq!(val(&s, "metrics.cost"), Some(10), "2 ms of 2 s = 0.1 %");
+        assert_eq!(val(&s, "cpu.0.khz"), Some(4_440_000), "SYS-K: the clock as measured");
+        assert_eq!(s.series().find(|x| x.0 == "cpu.0.khz").map(|x| x.1.unit.label()), Some("kHz"), "a clock, not a tally");
     }
 
     #[test]

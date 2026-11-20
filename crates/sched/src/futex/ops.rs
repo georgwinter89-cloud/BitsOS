@@ -1,9 +1,10 @@
-//! The two-futex operations and futex_waitv: FUTEX_REQUEUE / FUTEX_CMP_REQUEUE (linux-6.6/kernel/futex/
-//! requeue.c:364, non-PI), FUTEX_WAKE_OP (waitwake.c:236 with `futex_atomic_op_inuser` :186 and x86's
-//! `arch_futex_atomic_op_inuser`), futex_waitv (waitwake.c:396-544, syscalls.c:273).
+//! The two-futex operations and futex_waitv: FUTEX_REQUEUE / FUTEX_CMP_REQUEUE and futex2's futex_requeue
+//! (linux-7.3.1/kernel/futex/requeue.c:390, non-PI), FUTEX_WAKE_OP (waitwake.c:278 with `futex_atomic_op_inuser`
+//! :229 and x86's `arch_futex_atomic_op_inuser`), futex_waitv (waitwake.c:403-620, syscalls.c:223
+//! `futex_parse_waitv`: an entry may carry FUTEX2_NUMA and FUTEX2_MPOL, keyed by `key_of`).
 
 use super::table::{self, Key};
-use super::{KeyRef, Space, Table, buckets, cancel_block, expired, me, wake_entry};
+use super::{Flags, KeyRef, Room, Space, Table, buckets, cancel_block, expired, key_of, me, wake_entry};
 use super::{Deadline, REQUEUED, TIMEOUTS, WAITS, begin, enqueue, not_loaded, retry_fault, sleep, unqueue};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -13,15 +14,18 @@ use uapi::errno::{EAGAIN, EFAULT, EINVAL, ENOMEM, ENOSYS, ETIMEDOUT};
 /// FUTEX_REQUEUE (`cmp` None) and FUTEX_CMP_REQUEUE: wakes `nr_wake` waiters of `a1` and moves up to
 /// `nr_requeue` more to `a2`. EINVAL for negative counts, EAGAIN when `*a1 != cmp` (read under both bucket
 /// locks). Returns woken + moved.
-pub fn requeue(sp: &dyn Space, a1: u64, a2: u64, shared: bool, nr_wake: i32, nr_requeue: i32, cmp: Option<u32>) -> Result<i64, i64> {
+pub fn requeue(sp: &dyn Space, a1: u64, a2: u64, flags: impl Into<Flags>, nr_wake: i32, nr_requeue: i32, cmp: Option<u32>) -> Result<i64, i64> {
+    let f: Flags = flags.into();
+    let shared = f.shared;
     if nr_wake < 0 || nr_requeue < 0 {
         return Err(EINVAL);
     }
     let t = buckets()?;
     let mut faults = 0;
+    let mut room = Room::new();
     'retry: loop {
-        let k1 = sp.key(a1, shared, false)?;
-        let k2 = sp.key(a2, shared, false)?;
+        let k1 = key_of(sp, a1, f, false)?;
+        let k2 = key_of(sp, a2, f, false)?;
         let (i1, i2) = (t.index(&k1.key), t.index(&k2.key));
         loop {
             let (mut q1, mut q2) = t.lock2(i1, i2);
@@ -45,12 +49,17 @@ pub fn requeue(sp: &dyn Space, a1: u64, a2: u64, shared: bool, nr_wake: i32, nr_
                     }
                 }
             }
-            if let Some(q2) = q2.as_deref_mut() {
-                let cap = (nr_wake as usize).saturating_add(nr_requeue as usize);
-                let need = table::count(&q1, &k1.key, cap);
-                if q2.try_reserve(need).is_err() {
-                    return Err(ENOMEM);
-                }
+            let cap = (nr_wake as usize).saturating_add(nr_requeue as usize);
+            let fits = match q2.as_deref_mut() {
+                Some(q2) => room.fits(q2, table::count(&q1, &k1.key, cap)),
+                None => true,
+            };
+            if !fits {
+                // Nobody was woken or moved yet: with both locks dropped the target's room is made, then the
+                // word is compared and the waiters are counted again.
+                drop((q1, q2));
+                room.grow()?;
+                continue;
             }
             let (mut moved, k2key) = (0u64, k2.key);
             let n = table::requeue(&mut q1, q2.as_deref_mut(), &k1.key, &k2key, nr_wake, nr_requeue, &mut wake_entry, &mut |e| {
@@ -182,7 +191,7 @@ pub struct WaitvItem {
     pub addr: u64,
     /// `(u32)waitv.val`.
     pub val: u32,
-    pub shared: bool,
+    pub flags: Flags,
 }
 
 /// Takes slots 0..n off; the highest slot a waker had taken (Linux `unqueue_multiple`), or None.
@@ -207,15 +216,16 @@ pub fn wait_multiple(sp: &dyn Space, items: &[WaitvItem], deadline: Option<Deadl
     keys.try_reserve_exact(items.len()).map_err(|_| ENOMEM)?;
     WAITS.inc();
     let mut faults = 0;
+    let mut room = Room::new();
     loop {
         // futex_wait_multiple_setup: keys first (they may sleep), then queue one by one.
         let mut retry = false;
         'setup: loop {
             for (i, it) in items.iter().enumerate() {
-                if !it.shared && retry {
+                if !it.flags.shared && retry {
                     continue;
                 }
-                let k = sp.key(it.addr, it.shared, false)?;
+                let k = key_of(sp, it.addr, it.flags, false)?;
                 if i < keys.len() {
                     keys[i] = k;
                 } else {
@@ -227,7 +237,7 @@ pub fn wait_multiple(sp: &dyn Space, items: &[WaitvItem], deadline: Option<Deadl
                 let key: Key = keys[i].key;
                 let bi = t.index(&key);
                 let mut q = t.lock(bi);
-                let r = if q.try_reserve(1).is_err() { Err(None) } else { sp.word(it.addr, WordOp::Load).map_err(Some) };
+                let r = if room.fits(&mut q, 1) { sp.word(it.addr, WordOp::Load).map_err(Some) } else { Err(None) };
                 match r {
                     Ok(v) if v == it.val => {
                         enqueue(&mut q, bi, &me, key, super::BITSET_MATCH_ANY, i as u32);
@@ -242,7 +252,13 @@ pub fn wait_multiple(sp: &dyn Space, items: &[WaitvItem], deadline: Option<Deadl
                     return Ok(w as i64);
                 }
                 match r {
-                    Err(None) => return Err(ENOMEM),
+                    // The bucket is full: its room is made with nothing queued (the slots before this one were
+                    // taken off above, as for a fault), then the whole setup runs again.
+                    Err(None) => {
+                        room.grow()?;
+                        retry = true;
+                        continue 'setup;
+                    }
                     Err(Some(WordError::NotLoaded)) => {
                         not_loaded();
                         return Err(EFAULT);
@@ -258,6 +274,7 @@ pub fn wait_multiple(sp: &dyn Space, items: &[WaitvItem], deadline: Option<Deadl
             }
             break;
         }
+        room.release();
         sleep(&me, sp, deadline);
         if let Some(w) = unqueue_multiple(t, &me, items.len()) {
             return Ok(w as i64);

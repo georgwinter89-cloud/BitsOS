@@ -3,6 +3,7 @@
 //! split wrote a growing file twice); a cut at any write still finds written data under the size on the disk.
 
 use super::cut::check_disk;
+use super::lay::{cut_image, Rng};
 use super::util::*;
 use super::vfs::fresh_ns;
 use crate::{MemDev, Volume};
@@ -130,16 +131,6 @@ fn fsync_refused_after(dev: &MemDev, ns: &vfs::MountNs, writes: u64) {
     assert!(r.is_err(), "the device stopped and fsync said {r:?}");
 }
 
-struct Rng(u64);
-impl Rng {
-    fn bit(&mut self) -> bool {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 & 1 == 1
-    }
-}
-
 /// A cut at any write of a long run: without a journal the size on the disk stops at a step's end with the data under
 /// it (and, seen from the cut, each step is one short: the bound itself); with a journal a step's mapping joins after
 /// its data, and a cut with the writes after the last flush half lost and reordered still shows only written data.
@@ -166,15 +157,9 @@ fn a_cut_during_a_long_run_finds_the_data_under_the_size() {
         let mut sizes = BTreeSet::new();
         let step = (log.len() / 20).max(1);
         for k in (0..log.len()).step_by(step).chain([log.len()]) {
-            let flush = log[..k].iter().rposition(|(a, _)| *a == u64::MAX).map_or(0, |i| i + 1);
-            let mut img = before.clone();
-            for (i, (at, d)) in log[..k].iter().enumerate() {
-                // Reordering shows nothing about a journal-less disk (Linux's neither): its order is the prefix's.
-                if *at == u64::MAX || (journal && i >= flush && !rng.bit()) {
-                    continue;
-                }
-                img[*at as usize..*at as usize + d.len()].copy_from_slice(d);
-            }
+            // Reordering shows nothing about a journal-less disk (Linux's neither): its order is the prefix's.
+            let mut kept = || rng.bit();
+            let (img, _) = cut_image(&before, &log, k, usize::MAX, if journal { Some(&mut kept) } else { None });
             let what = format!("{name}: cut after {k} of {}", log.len());
             sizes.insert(data_under_the_size(img.clone(), &want, &what));
             check_disk(&s, img, &what);

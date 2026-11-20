@@ -30,13 +30,13 @@ pub const HOME_OWNER: Cred = Cred { uid: 1000, gid: 1000 };
 fn keep(c: Class) -> (Cred, bool) {
     match c {
         Class::Home => (HOME_OWNER, true),
-        Class::Private => (Cred::ROOT, true),
+        Class::Private | Class::Crash => (Cred::ROOT, true),
         _ => (Cred::ROOT, false),
     }
 }
 
 /// The umask a node shows: 022 (Linux vfat's default), for a kept class dmask 077 / fmask 177
-/// (linux-6.6/fs/fat/inode.c:518 `fat_make_mode` with those mount options).
+/// (linux-7.3.1/fs/fat/fat.h:210 `fat_make_mode` with those mount options).
 fn mask(kept: bool, dir: bool) -> u32 {
     match (kept, dir) {
         (false, _) => 0o022,
@@ -106,14 +106,19 @@ impl FatOps {
 
 impl vfs::FsOps for FatOps {
     /// Linux's vfat has no byte limit of its own: a name counts 255 UTF-16 units (`xlate_to_uni`,
-    /// linux-6.6/fs/fat/namei_vfat.c:525), checked by `name::to_utf16` at create and rename. The VFS lets
+    /// linux-7.3.1/fs/fat/namei_vfat.c:523), checked by `name::to_utf16` at create and rename. The VFS lets
     /// through what such a name can be in UTF-8 at most (FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE, the bound vfat
-    /// itself sizes its name buffers by, linux-6.6/fs/fat/inode.c:841); a longer lookup is simply not found.
+    /// itself sizes its name buffers by, linux-7.3.1/fs/fat/inode.c:886); a longer lookup is simply not found.
     fn name_max(&self) -> usize {
         255 * 6
     }
     fn fold(&self, name: &[u8]) -> Vec<u8> {
         crate::name::fold(name)
+    }
+    /// EINS-C (K6): the stick's top takes no writes (R8b): the assistant's trash is `\BITSOS2\home\.papierkorb`,
+    /// the desktop user's (0700) like the rest of `home`; without `home` a removal there is refused (EROFS).
+    fn trash_home(&self) -> &'static [&'static [u8]] {
+        if self.vol.stick { &[b"BITSOS2", b"home"] } else { &[] }
     }
 
     fn load_dir(&self, dir: &Arc<Dentry>) -> Result<(), i64> {
@@ -186,7 +191,7 @@ impl vfs::FsOps for FatOps {
         self.vol.sync(true)
     }
 
-    /// `fat_setattr` (linux-6.6/fs/fat/file.c:480) without the `quiet` option: owner other than root or a mode
+    /// `fat_setattr` (linux-7.3.1/fs/fat/file.c:517) without the `quiet` option: owner other than root or a mode
     /// with suid/sgid/sticky bits is EPERM; a mode whose r/x bits differ from what FAT shows is dropped
     /// silently (`fat_sanitize_mode`, umask 022), else the owner's w bit is the read-only attribute; times are
     /// rounded as FAT keeps them (ctime follows mtime, a ctime-only change is ignored; the root's times stay).
@@ -251,7 +256,7 @@ impl vfs::FsOps for FatOps {
 /// A super block and root dentry for `vol` (fstype "vfat", as Linux names it).
 pub fn super_block(vol: &Arc<Volume>) -> (Arc<SuperBlock>, Arc<Dentry>) {
     let sb = SuperBlock::with_ops("vfat", Arc::new(FatOps { vol: vol.clone() }));
-    // AB-7c: `fat_show_options` (linux-6.6/fs/fat/inode.c:939) for what V2 does: root-owned, masks 0022 (files
+    // AB-7c: `fat_show_options` (linux-7.3.1/fs/fat/inode.c:980) for what V2 does: root-owned, masks 0022 (files
     // and directories 0755), codepage 437 short names, long names as UTF-8, Linux's defaults otherwise.
     sb.set_options(",fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro");
     let root = Inode::new(ROOT, uapi::S_IFDIR | 0o755, Cred::ROOT, Data::Dir);

@@ -15,7 +15,7 @@ policy = { path = "../policy" }
 sched = { path = "../sched" }
 time = { path = "../time" }
 kexec = { path = "../kexec" }
-# VS-3: system_pin through the MCP registry (rb-RB-9.md decision 9) and the console commands; neither depends
+# VS-3: system_pin through the MCP registry (plan/spec/robustness.md §7) and the console commands; neither depends
 # on snapshots (no cycle).
 mcp = { path = "../mcp" }
 console = { path = "../console" }

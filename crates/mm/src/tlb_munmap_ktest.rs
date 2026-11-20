@@ -27,7 +27,7 @@ const PF_U: u64 = 4;
 const PF_W: u64 = 2;
 const SEC: u64 = 1_000_000_000;
 /// The buffer sizes, 64 KiB up to 16 MiB; 13.8 MB is Chromium's 1080p layer (1920 x 1080 x 4 rounded to its
-/// tiles, plan/notes/sc-FD-1.md).
+/// tiles).
 const SIZES: [u64; 6] = [64 * KB, 256 * KB, MB, 4 * MB, 3372 * P, 16 * MB];
 
 fn e<T: core::fmt::Debug>(x: T) -> String {

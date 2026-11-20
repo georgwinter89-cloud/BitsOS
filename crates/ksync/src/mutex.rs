@@ -27,6 +27,18 @@ const NO_OWNER: u64 = u64::MAX;
 /// need_resched). Short holds (an address space's lock handed between a program's threads) end well within it.
 const OWNER_SPIN_NS: u64 = 20_000;
 
+/// A lock class a mutex is taken as instead of its own (Linux's `lockdep_set_class`): for a lock whose place in
+/// the lock order follows from what its owner is used for, not from its type. A page cache's write-back lock is
+/// one: an ordinary file's is taken above a volume's locks, the same lock of a file that backs a block device
+/// (a loop image) below them. Its name is resolved once, like a lock's own.
+pub struct AsClass(Meta);
+
+impl AsClass {
+    pub const fn new(name: &'static str) -> Self {
+        AsClass(Meta::new(name))
+    }
+}
+
 pub struct Mutex<T: ?Sized> {
     meta: Meta,
     locked: AtomicBool,
@@ -98,7 +110,16 @@ impl<T: ?Sized> Mutex<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        let c = self.meta.before(self.addr(), LockKind::Mutex);
+        self.lock_by(&self.meta)
+    }
+
+    /// `lock`, checked and counted as a lock of `class` (`AsClass`).
+    pub fn lock_as(&self, class: &'static AsClass) -> MutexGuard<'_, T> {
+        self.lock_by(&class.0)
+    }
+
+    fn lock_by(&self, meta: &Meta) -> MutexGuard<'_, T> {
+        let c = meta.before(self.addr(), LockKind::Mutex);
         if self.try_acquire() {
             return self.guard(c, None);
         }
@@ -193,6 +214,14 @@ impl<T: ?Sized> Mutex<T> {
     /// Threads sleeping for it now.
     pub fn waiters(&self) -> usize {
         self.wq.waiter_count()
+    }
+    /// Whether a thread went to sleep for it and has not got it yet. Unlike `waiters` this stays true between a
+    /// release's wake-up and the woken thread's take (the waker takes the sleeper off the queue; its record for
+    /// priority passing stays until it holds the lock), which is the moment a `try_lock` in a loop would
+    /// otherwise win every time. For holders that only try (W35 MM-2: page migration): they stand back while
+    /// this is true. A sleeper the scheduler could not record (no memory for the record) shows only while queued.
+    pub fn contended(&self) -> bool {
+        self.pi.load(Ordering::SeqCst) != 0 || self.wq.waiter_count() != 0
     }
     pub fn get_mut(&mut self) -> &mut T {
         self.val.get_mut()

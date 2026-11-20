@@ -190,9 +190,8 @@ fn udmabuf(fx: &Fx, pages: u64) -> (Arc<vfs::fd::OpenFile>, i32) {
 #[test]
 fn create_checks_in_linux_order() {
     let fx = Fx::new();
-    assert_eq!(fx.create(P, AMDGPU_GEM_DOMAIN_DOORBELL as u64, 0), Err(EINVAL), "6.6 refuses doorbell objects");
     assert_eq!(fx.create(P, GTT, 1 << 30), Err(EINVAL));
-    assert_eq!(fx.create(P, GTT, AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS as u64), Err(EINVAL), "not in 6.6's list");
+    assert_eq!(fx.create(P, GTT, AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS as u64), Err(EINVAL), "not in the settable mask");
     assert_eq!(fx.create(P, 0x80, 0), Err(EINVAL));
     assert_eq!(fx.create(P, GTT | 1 << 32, 0), Err(EINVAL));
     assert_eq!(fx.create(1, AMDGPU_GEM_DOMAIN_GDS as u64, AV), Err(EINVAL));
@@ -227,9 +226,12 @@ fn create_info_reports_linuxs_shapes() {
         ((5, 2, gds, 0), (8 * P, 4 * P, gds, NO_CPU)),
         ((3, 1, oa, 0), (3 * P, P, oa, NO_CPU)),
     ];
+    // Linux 7.3.1 adds VRAM_CLEARED (amdgpu_gem.c:455) and VRAM_WIPE_ON_RELEASE (:180) to every user object.
+    let always = (AMDGPU_GEM_CREATE_VRAM_CLEARED | AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE) as u64;
     for ((s, a, d, f), want) in cases {
         let h = fx.create_in(0, s, a, d, f).unwrap();
         let i = fx.info(0, h).unwrap();
+        let want = (want.0, want.1, want.2, want.3 | always);
         assert_eq!((i.bo_size, i.alignment, i.domains, i.domain_flags), want, "create {s} {a} {d} {f:#x}");
         fx.close(0, h).unwrap();
     }
@@ -250,7 +252,7 @@ fn create_info_reports_linuxs_shapes() {
     assert_eq!(fx.info(0, h).unwrap().domains, 7);
     // A CPU fault remembers CPU access (amdgpu_bo_fault_reserve_notify).
     bo.cpu_touched();
-    assert_eq!(fx.info(0, h).unwrap().domain_flags, CAR);
+    assert_eq!(fx.info(0, h).unwrap().domain_flags, CAR | always);
 }
 
 /// Any carve-out size: objects count in INFO's usage, a full carve-out sends VRAM objects to GTT (the retry of
@@ -505,7 +507,7 @@ fn prime_modes_and_refusals() {
     let i = fx.to_handle(0, ub).unwrap();
     assert_eq!(fx.to_handle(0, ub), Ok(i));
     let info = fx.info(0, i).unwrap();
-    assert_eq!((info.bo_size, info.alignment, info.domains, info.domain_flags), (2 * P, P, GTT, 0));
+    assert_eq!((info.bo_size, info.alignment, info.domains, info.domain_flags), (2 * P, P, GTT, AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE as u64));
     let ibo = fx.bo(0, i);
     assert!(ibo.is_import() && Arc::ptr_eq(ibo.resv(), fx.buf(ub).resv()));
     assert_eq!(fx.op(i, AMDGPU_GEM_OP_SET_PLACEMENT, VRAM), Err(EINVAL));

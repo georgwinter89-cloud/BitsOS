@@ -1,5 +1,6 @@
 //! DR-6: PRIME, GEM objects as dma-bufs and back (linux-6.6/drivers/gpu/drm/drm_prime.c:295-523,
-//! amd/amdgpu/amdgpu_dma_buf.c:288-470).
+//! amd/amdgpu/amdgpu_dma_buf.c:288-470; Linux 7.3.1 differs: linux-7.3.1/drivers/gpu/drm/drm_prime.c:516,
+//! see plan/spec/linux7-differences.md).
 //!
 //! - HANDLE_TO_FD: flags CLOEXEC|RDWR only (EINVAL), ENOENT for an unknown handle, the file's PRIME cache first,
 //!   then the buffer the object already is (an import's original, or its earlier export while a handle exists),
@@ -114,11 +115,12 @@ impl Bo {
     }
 }
 
-/// `amdgpu_dma_buf_create_obj` (amdgpu_dma_buf.c:340): a GTT object of the buffer's size over its pages, the
-/// buffer's reservation object, the flags another amdgpu device's object had for its CPU view.
+/// `amdgpu_dma_buf_create_obj` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c:457): a GTT object of
+/// the buffer's size over its pages, the buffer's reservation object, the caching flags another amdgpu device's
+/// object had, and VRAM_WIPE_ON_RELEASE as every object of `amdgpu_gem_object_create` (amdgpu_gem.c:180).
 fn import_obj(gpu: &dyn GpuDevice, buf: &Arc<DmaBuf>) -> Result<Arc<Bo>, Errno> {
-    let keep = (AMDGPU_GEM_CREATE_CPU_GTT_USWC | AMDGPU_GEM_CREATE_COHERENT | AMDGPU_GEM_CREATE_UNCACHED) as u64;
-    let flags = buf.exporter().gem_bo().map(|o| o.flags() & keep).unwrap_or(0);
+    let keep = AMDGPU_GEM_CREATE_CPU_GTT_USWC as u64 | crate::gem::UC_FLAGS;
+    let flags = buf.exporter().gem_bo().map(|o| o.flags() & keep).unwrap_or(0) | AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE as u64;
     let n = NewBo {
         userptr: None,
         size: buf.size(),

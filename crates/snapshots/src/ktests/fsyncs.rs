@@ -95,6 +95,7 @@ fn fsyncs() -> TestResult {
         Err(r) => return r,
     };
     let ns = vfs::root_ns();
+    let lockdep0 = ksync::lockdep::counts().unexpected;
     let dir = format!("/data/vs-fsyncs-{}", RUN.fetch_add(1, Ordering::Relaxed));
     ns.mkdir_p(&dir).map_err(e)?;
     let l = Arc::new(Load { stop: AtomicBool::new(false), steps: AtomicU64::new(0), errors: AtomicU64::new(0), max_step_ns: AtomicU64::new(0), slow_steps: AtomicU64::new(0), settlers: WRITERS / 2, pool: t.pool.clone() });
@@ -159,6 +160,11 @@ fn fsyncs() -> TestResult {
     let inside: u64 = taken.iter().map(|k| k.pause_barriers).sum();
     kassert!(inside == 0, "{inside} device barriers inside the pauses");
     kassert!(t.pool.owed_flushes() == 0, "{} deferred flushes never committed", t.pool.owed_flushes());
+    // Both lock paths of a volume in an image file ran here: a file's write-back down to the pool (fsync), the
+    // pool's commit down to the image file's write-back (each take). 12.11.: the image's write-back lock had
+    // the files' class, and the checker saw an inversion in every round (debug kernels; release counts none).
+    let lockdep = ksync::lockdep::counts().unexpected - lockdep0;
+    kassert!(lockdep == 0, "{lockdep} lock-order violations under the load: {:?}", ksync::lockdep::list());
     Ok(())
 }
 ktest!("snap.fsyncs", Run("vs/30-snapshots"), fsyncs);

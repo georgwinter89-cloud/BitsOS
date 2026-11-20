@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BL-0 Mini-PC measurement (plan/notes/desk-W35-mm-blk.md "BL-0 procedure", plan/notes/bl-BL-0.md), over MCP.
+"""BL-0 Mini-PC measurement (plan/guides/blk0.md, plan/guides/read-path-measurements.md), over MCP.
 
 Usage: blk0.py <host:port> <out dir> [--tls DIR|auto] [--token-file F] [--state BL-0] [--label idle] [--part nvme1n1p3]
                [--dir /data/home/1000/bench] [--prepare] [--seq-mb 4096] [--rand-mb 1024] [--small 4000] [--runs 3]

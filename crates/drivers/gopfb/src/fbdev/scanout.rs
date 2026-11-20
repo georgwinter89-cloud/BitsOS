@@ -1,4 +1,4 @@
-//! WY-17 (gx-scout-mesa.md C3): the compositor draws straight into what the screen shows. One BitsOS ioctl on
+//! WY-17: the compositor draws straight into what the screen shows. One BitsOS ioctl on
 //! /dev/fb0 in DP-3's private 'F' range (ENOTTY on Linux, where bitscomp reads back as before):
 //!
 //! ```c
@@ -27,7 +27,7 @@
 //!   EIO until END, and the program goes back to drawing into fb0's mapping. Whichever way it ends, the view goes back
 //!   on window 0, unseen, so the next store is a plain one; fb0's memory holds none of the program's frames, so a
 //!   hold that ended this way leaves it to be seeded with the console's picture at the next take (`seed`).
-//!   A refused pan changes nothing (fb_pan_display, linux-6.6/drivers/video/fbdev/core/fbmem.c:726-736: the var moves
+//!   A refused pan changes nothing (fb_pan_display, linux-7.3.1/drivers/video/fbdev/core/fbmem.c:189-196: the var moves
 //!   only after the driver said yes).
 //! - **Without one (QEMU, the engine off):** the windows are fb0's own RAM, one dma-buf over all of it with an
 //!   `offset` per window (a window need not start on a page). The rest stays as it is: FBIO_BITSOS_DAMAGE and the pan
@@ -38,10 +38,11 @@
 //! draws again. The program already passed `allowed` (B3, class Gpu) and held the whole screen.
 
 use super::abi::{self, UserIo, Var};
+use super::shot::Hold;
 use super::{flip, Fb};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use ksync::OnceRef;
 use drm::dma_buf::{DmaBuf, Exporter};
 use flip::{DirectBuffer, DirectFrame, FlipError, ScanoutFlip};
@@ -116,7 +117,7 @@ fn stand_in() -> Option<&'static dyn ScanoutFlip> {
 fn ready() -> Option<&'static dyn ScanoutFlip> {
     stand_in().or_else(flip::ready)
 }
-fn active() -> Option<&'static dyn ScanoutFlip> {
+pub(super) fn active() -> Option<&'static dyn ScanoutFlip> {
     stand_in().or_else(flip::active)
 }
 /// Sets the test's engine (the same one every time: `OnceRef`); `on`: this protocol talks to it until `false`.
@@ -129,11 +130,18 @@ pub(super) fn stand_in_for_test(f: &'static dyn ScanoutFlip, on: bool) {
 pub struct State {
     kind: AtomicU8,
     drawing: AtomicBool,
+    /// How often the direct state ended (a look that saw it change may hold a kernel frame's rows).
+    ends: AtomicU64,
+    /// SHOT: the buffer MCP `screen` reads, held from the holder's BEGIN.
+    pub hold: Hold,
 }
 
 impl State {
     pub const fn new() -> State {
-        State { kind: AtomicU8::new(NOTHING), drawing: AtomicBool::new(false) }
+        State { kind: AtomicU8::new(NOTHING), drawing: AtomicBool::new(false), ends: AtomicU64::new(0), hold: Hold::new() }
+    }
+    pub fn ends(&self) -> u64 {
+        self.ends.load(Ordering::SeqCst)
     }
     /// The holder draws into the scanout buffers now: a pan is a flip and fb0's memory holds nothing.
     pub fn drawing(&self) -> bool {
@@ -153,6 +161,7 @@ impl State {
     fn off(&self, why: &'static str) -> bool {
         let was = self.drawing.swap(false, Ordering::AcqRel);
         if was {
+            self.ends.fetch_add(1, Ordering::SeqCst);
             klog::event!(Info, "fbdev", "scanout.off", why = why; "frames go through fb0's memory again");
         }
         was
@@ -164,28 +173,6 @@ pub(super) fn view_home(fb: &Fb) {
     let mut m = fb.meta.lock();
     m.var.0[abi::YOFFSET] = 0;
     fb.yoffset.store(0, Ordering::Release);
-}
-
-/// MCP `screen` while the GPU's frames pass fb0's frame by: what shows, read from the scanout buffer into a buffer of
-/// its own. Without `fbdev.screen`: a read of write-combined memory takes tens of ms for a whole frame, and the
-/// holder's pan needs that lock. May tear with a flip: this is a look. False: it cannot be read (the caller shows
-/// fb0's frame, which is stale, and that is said).
-pub(super) fn look(fb: &Fb, f: &mut dyn FnMut(&[u32], u32, u32)) -> bool {
-    let Some(e) = active() else { return false };
-    let g = fb.g();
-    let n = g.width as usize * g.height as usize;
-    let mut px: Vec<u32> = Vec::new();
-    if px.try_reserve_exact(n).is_err() {
-        klog::event!(Warn, "fbdev", "scanout.no_look", why = "no memory"; "the picture is stale");
-        return false;
-    }
-    px.resize(n, 0);
-    if !e.read_shown(&mut px, g.width) {
-        klog::event!(Warn, "fbdev", "scanout.no_look", why = "unreadable"; "the picture is stale");
-        return false;
-    }
-    f(&px, g.width, g.height);
-    true
 }
 
 fn refuse(pid: u32, op: u32, why: &'static str, e: Errno) -> Result<Vec<u8>, Errno> {
@@ -343,8 +330,22 @@ pub(super) fn ioctl(fb: &Fb, arg: u64, io: &dyn UserIo, who: Option<&Arc<Process
         OP_EXPORT => export(fb, &mut a, me)?,
         OP_BEGIN if kind == ENGINE => match begin_engine(active()) {
             Ok((window, flags)) => {
-                // After the first BEGIN the frames are the holder's: the RAM frame stops being the truth.
+                // SHOT: MCP `screen` may be reading this buffer; it is not drawn into before the copy ended.
+                fb.direct.hold.wait_free(window as usize);
+                // After the first BEGIN the frames are the holder's: the RAM frame stops being the truth. Under the
+                // screen's lock (the one `release` holds), because the console may have taken the screen back
+                // while BEGIN waited: a stale `drawing` would turn the next holder's pans into flips (`pan`).
+                let scr = fb.screen.lock();
+                let now = fb.direct.kind.load(Ordering::Acquire);
+                if scr.guard.is_none() || fb.holder_pid() != me.pid || now != ENGINE {
+                    drop(scr);
+                    return match now {
+                        ENDED => refuse(me.pid, a.op, "the engine stopped flipping", EIO),
+                        _ => refuse(me.pid, a.op, "the screen went back meanwhile", EBUSY),
+                    };
+                }
                 fb.direct.drawing.store(true, Ordering::Release);
+                drop(scr);
                 (a.window, a.flags) = (window, flags);
             }
             Err(e) => {
@@ -487,7 +488,6 @@ mod tests {
         fn vblank(&self) -> Option<flip::Vblank> {
             None
         }
-        fn rearm(&self) {}
         fn direct_begin(&self) -> Result<DirectFrame, FlipError> {
             self.0
         }

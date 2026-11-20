@@ -1,6 +1,6 @@
 //! File mappings (FS-5): the file side of MM's file-backed VMAs.
 //!
-//! `check` is the part of Linux's `do_mmap` that looks at the file (linux-6.6/mm/mmap.c:1279-1337, after the
+//! `check` is the part of Linux's `do_mmap` that looks at the file (linux-7.3.1/mm/mmap.c:431-501, after the
 //! address checks MM does), in Linux's order, and makes a `FileMap`: one per `mmap` call, shared by the VMAs
 //! a later split makes of it (and by a fork's copy). MM reaches it through the `MapBacking` trait:
 //!
@@ -37,7 +37,7 @@ pub const MAP_SHARED_VALIDATE: u64 = 0x03;
 pub const MAP_TYPE: u64 = 0x0f;
 pub const MAP_GROWSDOWN: u64 = 0x100;
 pub const MAP_SYNC: u64 = 0x8_0000;
-/// linux-6.6/include/linux/mman.h:41 `LEGACY_MAP_MASK`: SHARED, PRIVATE, FIXED, ANONYMOUS, DENYWRITE,
+/// linux-7.3.1/include/linux/mman.h:42 `LEGACY_MAP_MASK`: SHARED, PRIVATE, FIXED, ANONYMOUS, DENYWRITE,
 /// EXECUTABLE, UNINITIALIZED, GROWSDOWN, LOCKED, NORESERVE, POPULATE, NONBLOCK, STACK, HUGETLB, 32BIT,
 /// ABOVE4G, HUGE_2MB, HUGE_1GB (x86-64 values).
 pub const LEGACY_MAP_MASK: u64 = 0x01 | 0x02 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x400_0000 | 0x100 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000 | 0x2_0000 | 0x4_0000 | 0x40 | 0x80 | (21 << 26) | (30 << 26);
@@ -78,7 +78,7 @@ pub trait MapBacking: Send + Sync {
 }
 
 /// MM-rmap (FS-14 change request 1): MM's reverse map, which removes a file's pages from every mapping
-/// (Linux `unmap_mapping_range`, linux-6.6/mm/memory.c:3565). Called without any vfs lock held: MM takes each
+/// (Linux `unmap_mapping_range`, linux-7.3.1/mm/memory.c:4579). Called without any vfs lock held: MM takes each
 /// address space's lock (`mm.as`), which comes before `vfs.inode.data` and `vfs.map.pins` (R5).
 pub trait Unmapper: Sync {
     /// Removes the entries of file pages `first..=last` of `inode` from every address space (with the TLB
@@ -137,7 +137,7 @@ pub fn fd_for_mmap(f: Option<Arc<OpenFile>>) -> Result<Arc<OpenFile>, Errno> {
     }
 }
 
-/// `file_mmap_size_max` (linux-6.6/mm/mmap.c:1163): regular files, block devices and sockets allow
+/// `file_mmap_size_max` (linux-7.3.1/mm/mmap.c:248): regular files, block devices and sockets allow
 /// MAX_LFS_FILESIZE, everything else the whole unsigned range.
 fn size_max(f: &OpenFile) -> u64 {
     match f.file.mode() & uapi::S_IFMT {
@@ -187,7 +187,7 @@ pub fn check(f: &OpenFile, prot: u64, flags: u64, pgoff: u64, len: u64) -> Resul
     if !f.can_read() {
         return Err(EACCES);
     }
-    // FS-13: `path_noexec` in the PRIVATE/SHARED arms (linux-6.6/mm/mmap.c:1323): PROT_EXEC is EPERM,
+    // FS-13: `path_noexec` in the PRIVATE/SHARED arms (linux-7.3.1/mm/mmap.c:479): PROT_EXEC is EPERM,
     // otherwise VM_MAYEXEC goes.
     let noexec = f.path.as_ref().is_some_and(|p| p.noexec());
     if noexec && prot & PROT_EXEC != 0 {

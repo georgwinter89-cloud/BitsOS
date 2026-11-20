@@ -1,4 +1,4 @@
-//! AB-7b: the network interfaces under `/sys` (linux-6.6 net/core/net-sysfs.c `net_class_attrs` and the
+//! AB-7b: the network interfaces under `/sys` (linux-7.3.1 net/core/net-sysfs.c:767 `net_class_attrs` and the
 //! `statistics` group): `/sys/class/net/<if>` links to `/sys/devices/virtual/net/<if>` (see the notes: V2's
 //! stack does not say which PCI function a card is, so cards sit beside `lo`). The interfaces come from
 //! `net::ifview::links()` at every question (a card can appear after boot); each attribute is read at open.

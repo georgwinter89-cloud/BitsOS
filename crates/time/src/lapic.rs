@@ -6,8 +6,8 @@
 //! TSC-deadline, ARAT). Each CPU starts its own timer (`start_this_cpu`: the BSP from `acpi::irq::init`, the
 //! APs through CP-4's cross-CPU call), and only then do timers armed on it leave the polled queue.
 //!
-//! CONFIG `lapic_timer=auto|oneshot|deadline` (auto: deadline where offered) and `hrtimer=interrupt|poll` (poll
-//! keeps every timer on the polled queue: an escape hatch should a LAPIC timer misbehave on some machine).
+//! A CPU whose timer cannot start (no LAPIC, the vector taken, an implausible calibration) keeps its timers on the
+//! polled queue.
 //!
 //! The interrupt (`on_timer`, system vector 0xF0) runs this CPU's due timers, then the scheduler's tick hook
 //! (`sched::timer_tick`, installed by `platform`). The interrupt exit's preemption is hal's hook (CP-5).
@@ -25,71 +25,16 @@ pub const CAL_ROUNDS: usize = 3;
 pub const MIN_COUNTS_PER_MS: u64 = 100;
 pub const MAX_COUNTS_PER_MS: u64 = 10_000_000;
 
-/// CONFIG `lapic_timer=` / `hrtimer=`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Config {
-    Auto,
-    OneShot,
-    Deadline,
-    /// `hrtimer=poll`: no LAPIC timer at all.
-    Poll,
+static POLL_TEST: AtomicBool = AtomicBool::new(false);
+
+/// The test key `ktest_timer=poll` (`host/tests/cp/65-timers.sh`): no CPU starts its LAPIC timer, so every hrtimer
+/// stays on the polled queue, the path a CPU whose timer failed takes.
+pub(crate) fn set_poll_test(on: bool) {
+    POLL_TEST.store(on, Ordering::Release);
 }
 
-impl Config {
-    fn from_u8(v: u8) -> Config {
-        match v {
-            1 => Config::OneShot,
-            2 => Config::Deadline,
-            3 => Config::Poll,
-            _ => Config::Auto,
-        }
-    }
-    fn as_u8(self) -> u8 {
-        match self {
-            Config::Auto => 0,
-            Config::OneShot => 1,
-            Config::Deadline => 2,
-            Config::Poll => 3,
-        }
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Config::Auto => "auto",
-            Config::OneShot => "oneshot",
-            Config::Deadline => "deadline",
-            Config::Poll => "poll",
-        }
-    }
-}
-
-/// The CONFIG values to a mode (pure; host-tested). Unknown values fall back to `Auto` and are named in the
-/// second field so the caller can warn.
-pub fn parse_config(lapic_timer: Option<&str>, hrtimer: Option<&str>) -> (Config, Option<&'static str>) {
-    match hrtimer.map(str::trim) {
-        Some("poll") => return (Config::Poll, None),
-        None | Some("") | Some("interrupt") => {}
-        Some(_) => return (parse_lapic(lapic_timer).0, Some("hrtimer")),
-    }
-    parse_lapic(lapic_timer)
-}
-
-fn parse_lapic(v: Option<&str>) -> (Config, Option<&'static str>) {
-    match v.map(str::trim) {
-        None | Some("") | Some("auto") => (Config::Auto, None),
-        Some("oneshot") => (Config::OneShot, None),
-        Some("deadline") => (Config::Deadline, None),
-        Some(_) => (Config::Auto, Some("lapic_timer")),
-    }
-}
-
-static CONFIG: AtomicU8 = AtomicU8::new(0);
-
-pub(crate) fn set_config(c: Config) {
-    CONFIG.store(c.as_u8(), Ordering::Release);
-}
-
-pub fn config() -> Config {
-    Config::from_u8(CONFIG.load(Ordering::Acquire))
+pub fn poll_test() -> bool {
+    POLL_TEST.load(Ordering::Acquire)
 }
 
 /// How a CPU's timer counts.
@@ -110,7 +55,7 @@ impl Kind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartError {
-    /// `hrtimer=poll`.
+    /// The test key `ktest_timer=poll`.
     Disabled,
     /// The LAPIC is not set up, or refused the mode.
     NoLapic,
@@ -273,8 +218,7 @@ pub fn start_this_cpu() -> Result<Kind, StartError> {
 }
 
 fn start_inner() -> Result<Kind, StartError> {
-    let cfg = config();
-    if cfg == Config::Poll {
+    if poll_test() {
         return Err(StartError::Disabled);
     }
     let _irq = hal::cpu::IrqGuard::new();
@@ -293,8 +237,7 @@ fn start_inner() -> Result<Kind, StartError> {
         return Err(StartError::NoArat);
     }
     let offers_deadline = hal::cpu::live().has("tsc_deadline_timer");
-    let use_deadline = offers_deadline && cfg != Config::OneShot;
-    let kind = if use_deadline {
+    let kind = if offers_deadline {
         hw::setup(TimerMode::TscDeadline, false).map_err(|_| StartError::NoLapic)?;
         c.deadline.store(true, Ordering::Release);
         Kind::TscDeadline
@@ -416,16 +359,6 @@ fn on_timer(_v: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn config_values() {
-        assert_eq!(parse_config(None, None), (Config::Auto, None));
-        assert_eq!(parse_config(Some("oneshot"), None), (Config::OneShot, None));
-        assert_eq!(parse_config(Some(" deadline "), Some("interrupt")), (Config::Deadline, None));
-        assert_eq!(parse_config(Some("deadline"), Some("poll")), (Config::Poll, None), "poll wins");
-        assert_eq!(parse_config(Some("fast"), None), (Config::Auto, Some("lapic_timer")));
-        assert_eq!(parse_config(None, Some("sometimes")), (Config::Auto, Some("hrtimer")));
-    }
 
     #[test]
     fn start_codes() {

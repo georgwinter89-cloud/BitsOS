@@ -3,7 +3,7 @@
 //! own line (`wlan_psk=`, `token=`), never in a comment, and nothing here prints them.
 
 /// fs-fat `protect::GUARDED_KEYS`: the keys only the person's own edit may set (README section 5).
-pub const GUARDED: &[&str] = &["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer"];
+pub const GUARDED: &[&str] = &["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp", "mcp_confirmer", "gp_net", "gp_stick", "gp_nvme"];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Wifi {
@@ -21,8 +21,7 @@ pub struct Answers {
     pub screen: Option<String>,
     /// Test only (`--image`): lines a scenario needs, never guarded keys.
     pub extra: Vec<String>,
-    /// An image for QEMU's window (`--qemu`): QEMU's network card, and the desktop, which on its own starts on real
-    /// hardware only.
+    /// An image for QEMU's window (`--qemu`): QEMU's network card.
     pub qemu: bool,
 }
 
@@ -77,18 +76,19 @@ pub fn render(a: &Answers, version: &str) -> Result<String, String> {
     let mut s = format!(
         "# BitsOS CONFIG.TXT, written by bitsos-install {version}.\n\
          # name=value, '#' starts a comment, the last line of a name wins (README section 5 lists every key).\n\
-         # The installer never sets nvme_write, nvme_data, nvme_boot, stick_write, usb_msd_write or mcp_confirmer:\n\
+         # The installer never sets nvme_write, nvme_data, nvme_boot, stick_write, usb_msd_write, mcp_confirmer,\n\
+         # gp_net, gp_stick or gp_nvme:\n\
          # those stay your own edit. It sets mcp=service only when you said yes to remote control.\n"
     );
     match &a.wifi {
         Some(w) => {
             check_ssid(&w.ssid)?;
             check_psk(&w.psk)?;
-            s.push_str("\n# Wi-Fi (the RTL8852BE; the firmware is in \\BITSOS2\\firmware\\rtw89\\).\nwlan=on\n");
+            s.push_str("\n# Wi-Fi (the RTL8852BE; the firmware is in \\BITSOS2\\firmware\\rtw89\\).\n");
             s.push_str(&format!("wlan_ssid={}\nwlan_psk={}\n", w.ssid, w.psk));
         }
         None if a.qemu => s.push_str("\n# Network: QEMU's virtio card; QEMU gives it an address by DHCP.\n"),
-        None => s.push_str("\n# Network: cable only (Intel I226/82576 take an address by DHCP). Wi-Fi: wlan=on, wlan_ssid=, wlan_psk=.\n"),
+        None => s.push_str("\n# Network: cable only (Intel I226/82576 take an address by DHCP). Wi-Fi: wlan_ssid=, wlan_psk=.\n"),
     }
     match &a.token {
         Some(t) => {
@@ -103,9 +103,6 @@ pub fn render(a: &Answers, version: &str) -> Result<String, String> {
     if let Some(sc) = &a.screen {
         check_screen(sc)?;
         s.push_str(&format!("\n# Screen mode bitsboot sets (default: the panel's native mode).\nscreen={sc}\n"));
-    }
-    if a.qemu {
-        s.push_str("\n# Made for QEMU's window (bitsos-install --qemu): the desktop starts there too.\ndesktop=on\n");
     }
     if !a.extra.is_empty() {
         s.push_str("\n# Test lines (--extra-config).\n");
@@ -125,7 +122,7 @@ pub fn render(a: &Answers, version: &str) -> Result<String, String> {
 pub fn check_extra(line: &str) -> Result<(), String> {
     let Some((k, v)) = line.split_once('=') else { return Err(format!("--extra-config '{line}': not key=value")) };
     let k = k.trim();
-    if GUARDED.contains(&k) || ["token", "wlan_psk", "wlan_ssid", "claude_api_key", "wlan"].contains(&k) {
+    if GUARDED.contains(&k) || ["token", "wlan_psk", "wlan_ssid", "claude_api_key"].contains(&k) {
         return Err(format!("refused: --extra-config may not set {k}"));
     }
     if !k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') || k.is_empty() || !plain(v.trim()) {
@@ -166,8 +163,8 @@ mod tests {
         assert_eq!(lines_with(&s, PSK), [format!("wlan_psk={PSK}")]);
         assert_eq!(lines_with(&s, TOKEN), [format!("token={TOKEN}")]);
         assert!(!s.lines().filter(|l| l.starts_with('#')).any(|l| l.contains(PSK) || l.contains(TOKEN)), "no secret in a comment");
-        assert!(s.contains("\nwlan=on\nwlan_ssid=Home Net\n") && s.contains("\nscreen=1920x1080\n"));
-        for k in ["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp_confirmer"] {
+        assert!(s.contains("rtw89\\).\nwlan_ssid=Home Net\n") && s.contains("\nscreen=1920x1080\n"));
+        for k in ["nvme_write", "nvme_data", "nvme_boot", "stick_write", "usb_msd_write", "mcp_confirmer", "gp_net", "gp_stick", "gp_nvme"] {
             assert!(!s.lines().any(|l| key_of(l) == Some(k)), "{k}");
         }
     }
@@ -187,7 +184,7 @@ mod tests {
         for bad in ["mcp=kernel", "nvme_write=on", "token=x", "wlan_psk=y", "mcp_confirmer=test", "x", "A=b", "k=a#b"] {
             assert!(check_extra(bad).is_err(), "{bad}");
         }
-        check_extra("desktop=on").unwrap();
+        check_extra("data_img_mb=64").unwrap();
         // Even past the checks, render refuses a guarded key.
         let a = Answers { extra: vec!["stick_write=on".into()], ..Answers::default() };
         assert!(render(&a, "v").unwrap_err().contains("guarded"));

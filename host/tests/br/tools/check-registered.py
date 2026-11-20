@@ -6,7 +6,7 @@ Reads the syscall names Brave called (the "syscalls by count" table of host/test
 every registration in crates/*/src (syscall!, syscall_nr!, fs_call!, sock_call!, both the uapi-name and the
 number + "name" forms). Fails (exit 1) when a name Brave calls is unregistered but not in EXPECTED (a registration
 the notes rely on went missing), or when the scan finds implausibly few registrations (the pattern broke).
-A name of EXPECTED that is registered by now only prints a hint to update plan/notes/br-BR-1.md.
+A name of EXPECTED that is registered by now only prints a hint to update the list in plan/spec/programs.md §1.1.
 BR-6b: br6-sandbox.txt is the same run with Chromium's own sandbox on (no --no-sandbox); the namespace calls of
 SANDBOX_CALLS it makes are listed as registered, and one without a registration fails.
 """
@@ -14,7 +14,7 @@ import pathlib
 import re
 import sys
 
-# plan/notes/br-BR-1.md, "Not registered in V2".
+# plan/spec/programs.md §1.1, the syscalls Brave calls that V2 does not register.
 # pkey_alloc and pkey_mprotect are registered since INT-W10 (BR-3 CR 4), the xattr family since INT-W32a (GM-2a CR 5).
 EXPECTED = {"rseq", "landlock_create_ruleset"}
 REFS = ("br1-local.txt", "br1-net.txt", "br6-sandbox.txt")
@@ -71,7 +71,7 @@ def main():
             print(f"FAIL: {n} is called by Brave and the notes count it as registered, but no registration found")
             bad = True
     for n in sorted(EXPECTED - missing_all):
-        print(f"note: {n} is registered now; update the forecast in plan/notes/br-BR-1.md")
+        print(f"note: {n} is registered now; update the list in plan/spec/programs.md §1.1")
     print(f"{len(reg)} registered names scanned")
     return 1 if bad else 0
 

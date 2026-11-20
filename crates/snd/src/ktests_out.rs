@@ -51,7 +51,7 @@ fn sysfs() -> TestResult {
         use vfs::inode::Cred;
         use vfs::ops::Ctx;
         let ns = vfs::root_ns();
-        let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0 };
+        let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0, tree: 0 };
         let root = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 0, gid: 0 }, umask: 0o022, subject };
         let user = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { uid: 1000, ..subject } };
         let path = b"/sys/bitsos/snd_output";
@@ -148,7 +148,7 @@ ktest!("sn.out.tool", Safe, tool);
 /// stays auto with the reason logged, the target unchanged and nothing handed to the display registers. With it
 /// (the Mini-PC) only what writes nothing: a stored `jack` does nothing, a stored `hdmi` after a request is left
 /// to that request, and the monitor sense (reads only) is logged. "Written" counts display writes only: the endpoint
-/// index selects of a state read (`hdmi_possible`'s `display_state_now`) are not (SN-13, desk-minipc-w13 FAIL 1).
+/// index selects of a state read (`hdmi_possible`'s `display_state_now`) are not (SN-13, Mini-PC 23.10.).
 fn boot() -> TestResult {
     use crate::boot::{Boot, switch};
     keeping_target(|m| {
@@ -175,7 +175,7 @@ fn boot() -> TestResult {
 }
 ktest!("sn.out.boot", Safe, boot);
 
-/// SN-12 (desk-minipc-w12 follow-up 1): every output request path takes its locks in table order. The real
+/// SN-12 (found on the Mini-PC, 23.10.): every output request path takes its locks in table order. The real
 /// `snd.output` with the real `hda.hdmi` under it, as the boot switch takes them (`monitor`, reads only), and,
 /// without HDMI sound (QEMU), `hdmi_on`'s refusal as `apply`/`set_output` reach it (it takes `hda.hdmi` before it
 /// looks for the GPU function); with HDMI sound (the Mini-PC) `hdmi_on` would write display registers, so only
@@ -214,7 +214,7 @@ fn order() -> TestResult {
         };
         let before = ours();
         let ns = vfs::root_ns();
-        let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0 };
+        let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0, tree: 0 };
         let root = vfs::ops::Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: vfs::inode::Cred { uid: 0, gid: 0 }, umask: 0o022, subject };
         let f = root.open(None, b"/sys/bitsos/snd_output", vfs::abi::O_WRONLY, 0).map_err(|e| format!("open for writing: {e}"))?;
         kassert!(f.write(b"jack\n") == Ok(5), "write jack");

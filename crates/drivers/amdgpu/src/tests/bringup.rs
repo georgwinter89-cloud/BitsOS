@@ -15,17 +15,18 @@ use crate::ktests_bringup as k;
 use crate::psplive::{self, Action, Args, CarveWin, CHUNK};
 use std::vec::Vec;
 
-fn blob() -> Option<disc::Discovery> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/gx/fixtures/minipc-780m-discovery.bin");
-    std::fs::read(p).ok().map(|b| disc::parse(&b).unwrap())
+/// The Mini-PC's real discovery blob (host/tests/gx/fixtures, tracked; missing is a failure).
+fn blob() -> disc::Discovery {
+    let p = super::regdiff::fixture("minipc-780m-discovery.bin");
+    let buf = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e} (tracked fixture)", p.display()));
+    disc::parse(&buf).unwrap()
 }
 
 #[test]
 fn every_start_state_and_size() {
     k::check_starts(&fakechip::discovery_780m()).unwrap();
-    if let Some(d) = blob() {
-        k::check_starts(&d).unwrap();
-    }
+    let d = blob();
+    k::check_starts(&d).unwrap();
 }
 
 #[test]
@@ -144,7 +145,7 @@ fn psp_phase_against_the_linux_capture() {
     };
     let cold = regdiff::diff_phase(&PHASES[0], &linux, &ours(StartAs::Cold), &names, core::slice::from_ref(&frames));
     std::eprintln!("{}", regdiff::render(core::slice::from_ref(&cold)));
-    assert_eq!((cold.linux, cold.ours, cold.matched), (31, 24, 24));
+    assert_eq!((cold.linux, cold.ours, cold.matched), (31, 25, 25));
     assert_eq!(cold.failures().count(), 0, "{}", regdiff::render(core::slice::from_ref(&cold)));
     let frames = Allow { count: 6, why: "the stale path's DESTROY_TMR is one more frame: 21 of Linux's 27", ..frames };
     let destroy = Allow {
@@ -156,7 +157,7 @@ fn psp_phase_against_the_linux_capture() {
     };
     let stale = regdiff::diff_phase(&PHASES[0], &linux, &ours(StartAs::AfterLinux), &names, &[frames, destroy]);
     std::eprintln!("{}", regdiff::render(core::slice::from_ref(&stale)));
-    assert_eq!((stale.linux, stale.ours, stale.matched), (31, 26, 25));
+    assert_eq!((stale.linux, stale.ours, stale.matched), (31, 27, 26));
     assert_eq!(stale.failures().count(), 0, "{}", regdiff::render(core::slice::from_ref(&stale)));
     assert_eq!(stale.count(DiffKind::Extra), 1);
 }
@@ -321,9 +322,8 @@ fn bus_master_line_per_case() {
 #[test]
 fn reload_after_a_clean_stop_is_clean() {
     k::check_reload_note(&fakechip::discovery_780m()).unwrap();
-    if let Some(b) = blob() {
-        k::check_reload_note(&b).unwrap();
-    }
+    let b = blob();
+    k::check_reload_note(&b).unwrap();
 }
 
 /// GX-7d fixer: the picture check around the run: the DCN snapshot unchanged and no display write counted.
@@ -332,14 +332,14 @@ fn picture_before_and_after() {
     use crate::dcn::Marks;
     let regs = crate::snapshot::registers();
     let before: std::collections::BTreeMap<u32, u32> = regs.iter().take(40).enumerate().map(|(i, e)| (e.byte, i as u32 * 3)).collect();
-    let m = |t: u64| Marks { total: t, total_after: t, ..Marks::default() };
+    let m = |t: u64| Marks { total: t, others_begun: t, others_done: t, ..Marks::default() };
     let (same, lines) = psplive::picture(before.clone(), &before, &m(7), &m(7));
     assert!(same, "{lines:?}");
     assert!(lines[0].contains("display writes during the run: 0"));
     let (same, lines) = psplive::picture(before.clone(), &before, &m(7), &m(8));
     assert!(!same && lines[0].contains(": 1 (must be 0)"));
-    // A write in flight at the start (the total read after the owners' counts moved) still counts.
-    let (same, lines) = psplive::picture(before.clone(), &before, &Marks { total: 7, total_after: 8, ..Marks::default() }, &m(8));
+    // A foreign write in flight at the start (begun, not done yet) still counts.
+    let (same, lines) = psplive::picture(before.clone(), &before, &Marks { total: 7, others_begun: 8, others_done: 7, ..Marks::default() }, &m(8));
     assert!(!same && lines[0].contains(": 1 (must be 0)"), "{lines:?}");
     let mut moved = before.clone();
     // The lowest bit the register's rule compares (not a volatile field) flips.
@@ -371,10 +371,10 @@ fn picture_attributes_the_compositors_flips() {
     after.insert(l::hubp(0, l::HUBP_CNTL), 0x100f_100a ^ 0x100f_1002); // HUBP_IN_BLANK only
     after.insert(l::hubp(0, l::HUBP_ADDR), 0x0200_0000);
     after.insert(l::hubp(0, l::HUBP_INUSE), 0x0200_0000);
-    let m0 = Marks { total: 100, total_after: 100, ..Marks::default() };
+    let m0 = Marks { total: 100, others_begun: 100, others_done: 100, ..Marks::default() };
     let mut fp = [0u64; l::PIPES as usize];
     fp[0] = 1;
-    let m1 = Marks { total: 104, total_after: 104, flips: 4, flip_pipes: fp, ..Marks::default() };
+    let m1 = Marks { total: 104, flips: 4, flip_pipes: fp, ..m0 };
     let (same, lines) = psplive::picture(before.clone(), &after, &m0, &m1);
     assert!(same, "{lines:#?}");
     assert!(lines[0] == "display writes during the run: 0 (must be 0)", "{lines:?}");
@@ -382,7 +382,7 @@ fn picture_attributes_the_compositors_flips() {
     assert!(lines[2].contains("equal"), "{lines:?}");
     assert!(lines.iter().any(|x| x.contains("changed by the compositor") && x.contains("PRIMARY_SURFACE_ADDRESS")), "{lines:?}");
     // One more write by someone else: counted.
-    let (same, lines) = psplive::picture(before.clone(), &after, &m0, &Marks { total: 105, total_after: 105, ..m1 });
+    let (same, lines) = psplive::picture(before.clone(), &after, &m0, &Marks { total: 105, others_begun: 101, others_done: 101, ..m1 });
     assert!(!same && lines[0].contains(": 1 (must be 0)"), "{lines:?}");
     // The same address change on pipe 1, which the compositor did not flip: a difference.
     let mut other = before.clone();
@@ -400,13 +400,81 @@ fn picture_attributes_the_compositors_flips() {
     cur.insert(cb, 0x0010_0020);
     let mut cp = [0u64; l::PIPES as usize];
     cp[0] = 1;
-    let mc = Marks { total: 105, total_after: 105, cursor: 5, cursor_pipes: cp, ..Marks::default() };
+    let mc = Marks { total: 105, cursor: 5, cursor_pipes: cp, ..m0 };
     let (same, lines) = psplive::picture(before.clone(), &cur, &m0, &mc);
     assert!(same, "{cb:#x}: {lines:?}");
     // The same change with no cursor update counted: a difference.
     let (same, _) = psplive::picture(before.clone(), &cur, &m0, &m0);
     assert!(!same);
     assert!(lines[0].contains(": 0 (must be 0)") && lines[1].contains("5 by its cursor updates (pipe 0)"), "{lines:?}");
+}
+
+/// GPY (desk 15.11., GX-D9 red on the Mini-PC, Gen 159/160): the GPU desktop ran, the pointer moved and took a new
+/// image during `until=jobs`. A cursor image writes HUBPREQ0_CURSOR_SETTINGS (0x0 -> 0x300, CHUNK_HDL_ADJUST 3) with
+/// its CURSOR0_0_ registers: the compositor's, listed, not counted. The sound's endpoint index selects (every read
+/// of the audio state) are not counted either. One write of anyone else still fails, and is named by register.
+#[test]
+fn picture_lets_the_desktops_cursor_and_the_sounds_selects_pass_and_names_a_foreign_write() {
+    use crate::dcn::{LoggedWrite, Marks, Owner};
+    use crate::layout as l;
+    let before: std::collections::BTreeMap<u32, u32> = crate::snapshot::registers().iter().map(|e| (e.byte, 0)).collect();
+    let settings = l::hubp(0, l::CUR_SETTINGS);
+    assert!(before.contains_key(&settings), "the snapshot reads HUBPREQ0_CURSOR_SETTINGS");
+    assert_eq!(crate::snapshot::name(settings), "HUBPREQ0_CURSOR_SETTINGS");
+    assert_eq!(crate::snapshot::cursor_pipe(settings), Some(0));
+    assert_eq!(crate::snapshot::cursor_pipe(l::hubp(1, l::CUR_SETTINGS)), Some(1));
+    let mut after = before.clone();
+    after.insert(settings, 0x300);
+    let mut cp = [0u64; l::PIPES as usize];
+    cp[0] = 3;
+    let m0 = Marks { total: 500, others_begun: 40, others_done: 40, ..Marks::default() };
+    // 13 cursor writes (image: lock, 8 registers, position, enable x2, unlock), 6 index selects (3 reads).
+    let m1 = Marks { total: 519, cursor: 13, audio: 6, cursor_pipes: cp, ..m0 };
+    let ring: Vec<LoggedWrite> = (500..519)
+        .map(|seq| LoggedWrite { seq, offset: if seq < 513 { settings } else { crate::dcn::AZ_ENDPOINT_INDEX }, wrote: 0, read: 0, masked: false, owner: if seq < 513 { Owner::Cursor } else { Owner::AudioIndex } })
+        .collect();
+    let (same, lines) = psplive::picture_with(before.clone(), &after, &m0, &m1, &ring);
+    assert!(same, "{lines:#?}");
+    assert_eq!(lines[0], "display writes during the run: 0 (must be 0)");
+    assert!(lines.iter().any(|x| x.contains("13 by its cursor updates (pipe 0)")), "{lines:?}");
+    assert!(lines.iter().any(|x| x.contains("of the sound") && x.ends_with(": 6")), "{lines:?}");
+    assert!(lines.iter().any(|x| x.contains("changed by the compositor") && x.contains("HUBPREQ0_CURSOR_SETTINGS")), "{lines:?}");
+    // The same settings change without a cursor update of pipe 0: a difference, as before.
+    let (same, lines) = psplive::picture_with(before.clone(), &after, &m0, &Marks { cursor_pipes: [0; l::PIPES as usize], ..m1 }, &ring);
+    assert!(!same && lines.iter().any(|x| x.contains("HUBPREQ0_CURSOR_SETTINGS")), "{lines:?}");
+    // One foreign display write during the run (OTG0's master lock written by someone else): counted, named.
+    let lock = l::otg(0, l::OTG_LOCK);
+    let mut ring2 = ring.clone();
+    ring2.push(LoggedWrite { seq: 40, offset: lock, wrote: 1, read: 1, masked: false, owner: Owner::Other });
+    let m2 = Marks { total: 520, others_begun: 41, others_done: 41, ..m1 };
+    let (same, lines) = psplive::picture_with(before.clone(), &after, &m0, &m2, &ring2);
+    assert!(!same, "{lines:#?}");
+    assert_eq!(lines[0], "display writes during the run: 1 (must be 0)");
+    let named = lines.iter().find(|x| x.starts_with("counted writes by register")).expect("the counted writes named");
+    assert!(named.contains(&alloc::format!("{lock:05X}")) && named.contains("x1"), "{named}");
+    // A foreign write before the run is not the run's: not named.
+    let mut ring3 = ring2.clone();
+    ring3.insert(0, LoggedWrite { seq: 39, offset: l::otg(1, l::OTG_LOCK), wrote: 1, read: 1, masked: false, owner: Owner::Other });
+    let (_, lines) = psplive::picture_with(before.clone(), &after, &m0, &m2, &ring3);
+    let named = lines.iter().find(|x| x.starts_with("counted writes by register")).expect("named");
+    assert!(named.contains("(1 of them") && !named.contains(&alloc::format!("{:05X}", l::otg(1, l::OTG_LOCK))), "{named}");
+    // The ring has moved on: still counted, the line says so.
+    let (same, lines) = psplive::picture_with(before, &after, &m0, &m2, &ring);
+    assert!(!same && lines.iter().any(|x| x.contains("none left in the log's ring")), "{lines:?}");
+}
+
+/// GPY: the sound's owner sticks only to the audio endpoint index register; on any other offset it is `Other`, so
+/// a wrong label cannot hide a display write from the picture proof.
+#[test]
+fn the_sounds_owner_only_on_the_endpoint_index() {
+    use crate::dcn::{AZ_ENDPOINT_DATA, AZ_ENDPOINT_INDEX, Owner};
+    use crate::layout as l;
+    assert_eq!(Owner::AudioIndex.of(AZ_ENDPOINT_INDEX), Owner::AudioIndex);
+    for b in [AZ_ENDPOINT_DATA, l::hubp(0, l::HUBP_ADDR), l::hubp(0, l::CUR_SETTINGS), l::otg(0, l::OTG_LOCK)] {
+        assert_eq!(Owner::AudioIndex.of(b), Owner::Other, "{b:#x}");
+    }
+    assert_eq!(Owner::Cursor.of(AZ_ENDPOINT_INDEX), Owner::Cursor);
+    assert_eq!(Owner::Other.of(AZ_ENDPOINT_INDEX), Owner::Other);
 }
 
 /// A device for the Quiesce path: every delay is one of the bounded waits (no long sleep), the total is
@@ -491,13 +559,10 @@ fn psp_fixture_text(linux: &[(u32, u32)], names: &super::regdiff::Names) -> std:
     s
 }
 
-/// The fixture is the capture's PSP phase (runs where plan/ and zstd are; the comparison below never skips).
+/// The fixture is the capture's PSP phase (needs zstd; a missing capture or zstd fails).
 #[test]
 fn psp_fixture_is_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED psp_fixture_is_the_capture: no capture (plan/ is not public); the fixture stands in");
-        return;
-    };
+    let t = capture();
     let want = psp_fixture_text(&t.writes(false), &table_names());
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/linux-780m-psp-writes.txt");
     let have = std::fs::read_to_string(&p).unwrap_or_default();
@@ -542,11 +607,10 @@ fn gfx_stage_starts_failures_recovery() {
     k::check_gfx_failures(&d).unwrap();
     k::check_forbidden().unwrap();
     k::check_recovery(&d).unwrap();
-    if let Some(b) = blob() {
-        k::check_gfx(&b).unwrap();
-        k::check_gfx_failures(&b).unwrap();
-        k::check_recovery(&b).unwrap();
-    }
+    let b = blob();
+    k::check_gfx(&b).unwrap();
+    k::check_gfx_failures(&b).unwrap();
+    k::check_recovery(&b).unwrap();
 }
 
 /// GX-7e: the answer of a cold M3 run as the desk reads it: the stage's steps in Linux's order, each message with
@@ -636,10 +700,7 @@ fn smu_fixture_text(linux: &[(u32, u32)], names: &super::regdiff::Names) -> std:
 
 #[test]
 fn smu_fixture_is_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED smu_fixture_is_the_capture: no capture (plan/ is not public); the fixture stands in");
-        return;
-    };
+    let t = capture();
     let want = smu_fixture_text(&t.writes(false), &table_names());
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/linux-780m-smu-writes.txt");
     let have = std::fs::read_to_string(&p).unwrap_or_default();
@@ -750,4 +811,61 @@ fn gfx_reboot_policy() {
 #[test]
 fn reinit_without_reboot() {
     crate::ktests_reinit::check_reinit(&fakechip::discovery_780m()).unwrap();
+}
+
+/// GPY (checker): the write log itself. A foreign write stays named after far more owned writes than the shared
+/// ring keeps (a moving pointer writes 3 per move), and an owned write in flight at the start mark cannot make up
+/// for a foreign write in the run (the old count subtracted the owners' counts from the total).
+#[test]
+fn the_write_log_keeps_foreign_writes_apart_and_counts_them_alone() {
+    use crate::dcn::{Owner, WriteLog};
+    use crate::layout as l;
+    let log = WriteLog::new();
+    let w = |o: Owner, offset: u32| {
+        let n = log.begin(o);
+        log.end(n, true, offset, 1, 1, u32::MAX, o)
+    };
+    let cur = l::hubp(0, l::CUR_POSITION);
+    let lock = l::otg(0, l::OTG_LOCK);
+    let m0 = log.marks();
+    // An owned write begun before the start mark and logged after it.
+    let n = log.begin(Owner::Cursor);
+    let m0b = log.marks();
+    log.end(n, true, cur, 1, 1, u32::MAX, Owner::Cursor);
+    w(Owner::Other, lock);
+    for _ in 0..200 {
+        w(Owner::Cursor, cur);
+    }
+    let m1 = log.marks();
+    assert_eq!(m0.others_until(&m1), 1);
+    assert_eq!(m0b.others_until(&m1), 1, "the owned write in flight hides nothing");
+    assert_eq!(m1.cursor - m0.cursor, 201);
+    let ring = log.foreign();
+    assert_eq!(ring.len(), 1, "{ring:?}");
+    assert!(ring[0].offset == lock && ring[0].owner == Owner::Other && m0.others_range(&m1).contains(&ring[0].seq), "{ring:?}");
+    let before: std::collections::BTreeMap<u32, u32> = crate::snapshot::registers().iter().map(|e| (e.byte, 0)).collect();
+    let (same, lines) = psplive::picture_with(before.clone(), &before, &m0, &m1, &ring);
+    assert!(!same && lines[0] == "display writes during the run: 1 (must be 0)", "{lines:?}");
+    let named = lines.iter().find(|x| x.starts_with("counted writes by register")).expect("named");
+    assert!(named.contains(&alloc::format!("{lock:05X}")) && named.contains("x1"), "{named}");
+    // A foreign write in flight at either end belongs to the run.
+    let m2 = log.marks();
+    let n = log.begin(Owner::Other);
+    let m3 = log.marks();
+    assert_eq!(m2.others_until(&m3), 1, "begun before the end mark");
+    log.end(n, true, lock, 1, 1, u32::MAX, Owner::Other);
+    assert_eq!(m3.others_until(&log.marks()), 1, "not done at the start mark");
+    // A write that never reached the register is done all the same: later runs do not inherit it.
+    let n = log.begin(Owner::Other);
+    log.end(n, false, lock, 1, 0, u32::MAX, Owner::Other);
+    let m4 = log.marks();
+    w(Owner::Flip, l::hubp(0, l::HUBP_ADDR));
+    assert_eq!(m4.others_until(&log.marks()), 0);
+    // The own ring keeps the last 32 foreign writes, oldest first.
+    for i in 0..40u32 {
+        w(Owner::Other, lock + 4 * (i % 2));
+    }
+    let ring = log.foreign();
+    assert_eq!(ring.len(), 32);
+    assert!(ring.windows(2).all(|p| p[0].seq + 1 == p[1].seq), "{ring:?}");
 }

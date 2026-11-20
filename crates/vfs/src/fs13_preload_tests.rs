@@ -456,10 +456,9 @@ fn prefetch_fills_missing_pages_and_stops_when_told() {
     assert_eq!(t.prefetch(0, 10, &mut |_| true), Ok((0, 0)));
 }
 
-/// A backend that takes `ms` per call.
+/// A backend whose first read stays at the device until a second read came (60 s at most); each call's time.
 struct Slow {
-    ms: u64,
-    calls: SpinLock<Vec<(u64, u64)>>,
+    calls: SpinLock<Vec<(u64, u64, std::time::Instant)>>,
 }
 
 impl Backend for Slow {
@@ -467,8 +466,15 @@ impl Backend for Slow {
         self.read_pages(pgoff, core::slice::from_ref(page))
     }
     fn read_pages(&self, first: u64, pages: &[Arc<CachePage>]) -> Result<(), i64> {
-        self.calls.lock().push((first, pages.len() as u64));
-        std::thread::sleep(core::time::Duration::from_millis(self.ms));
+        let n = {
+            let mut c = self.calls.lock();
+            c.push((first, pages.len() as u64, std::time::Instant::now()));
+            c.len()
+        };
+        let t0 = std::time::Instant::now();
+        while n == 1 && self.calls.lock().len() < 2 && t0.elapsed() < core::time::Duration::from_secs(60) {
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
         for (i, p) in pages.iter().enumerate() {
             p.write(0, &[(first + i as u64) as u8]);
         }
@@ -484,12 +490,13 @@ impl Backend for Slow {
 
 #[test]
 fn a_fault_does_not_wait_long_for_the_preloads_read() {
-    use crate::pagecache::{BG_FILL_WAIT_NS, FILL_WAIT_NS};
-    // The preload's read takes longer than a foreground miss's whole wait for another reader.
-    let ms = FILL_WAIT_NS / 1_000_000 * 3;
-    let b = Arc::new(Slow { ms, calls: SpinLock::new(Vec::new()) });
+    use crate::pagecache::FILL_WAIT_NS;
+    // Judged by order: the preload's read stays at the device until the fault's own read came. The fault's time to
+    // its own read is the short wait (BG_FILL_WAIT_NS), never FILL_WAIT_NS: a long wait always takes that long, so
+    // the bound fails a wrong wait on any machine, and the right one has FILL_WAIT_NS - BG_FILL_WAIT_NS to spare.
+    let b = Arc::new(Slow { calls: SpinLock::new(Vec::new()) });
     let c = Arc::new(PageCache::with_backend(b.clone(), 64 * P));
-    std::thread::scope(|s| {
+    let t0 = std::thread::scope(|s| {
         let c1 = c.clone();
         let pre = s.spawn(move || c1.prefetch(0, 64, &mut |_| true).unwrap());
         while b.calls.lock().is_empty() {
@@ -497,12 +504,12 @@ fn a_fault_does_not_wait_long_for_the_preloads_read() {
         }
         let t0 = std::time::Instant::now();
         c.page_for_map(5, false).unwrap();
-        let took = t0.elapsed().as_nanos() as u64;
-        // Its own read (ms) after the short wait, not FILL_WAIT_NS first.
-        assert!(took < BG_FILL_WAIT_NS + ms * 1_000_000 + FILL_WAIT_NS / 2, "the fault took {} ms", took / 1_000_000);
         pre.join().unwrap();
+        t0
     });
-    let calls = b.calls.lock().clone();
+    let calls: Vec<(u64, u64)> = b.calls.lock().iter().map(|&(f, n, _)| (f, n)).collect();
+    let took = b.calls.lock().get(1).map_or(u128::MAX, |c| c.2.duration_since(t0).as_nanos());
+    assert!(took < FILL_WAIT_NS as u128, "the fault's own read came after {} ms: {calls:?}", took / 1_000_000);
     assert_eq!(calls[0], (0, 64), "the preload's read: {calls:?}");
     assert!(calls[1].0 <= 5 && calls[1].0 + calls[1].1 > 5, "the fault read its own window: {calls:?}");
     assert_eq!(c.pages(), 64);

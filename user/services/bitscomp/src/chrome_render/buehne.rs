@@ -31,10 +31,12 @@ pub enum Part {
     Sun,
     /// The notices (count 0 until there are notices).
     Bell,
-    /// The Feld bar (the Feld itself opens in a later item).
+    /// The Feld bar: a click opens the Feld (feld_app.rs).
     Feld,
     /// The time strip (filled by the snapshots later).
     Strip,
+    /// REWIND: the strip's "Zurückspulen" (rewind_app.rs).
+    Rewind,
     /// The "+N" chip of workspaces that do not fit.
     More,
 }
@@ -47,6 +49,8 @@ pub struct Buehne {
     pub mark: Rect,
     /// One per workspace in order; only the first `shown` are on screen.
     pub chips: Vec<Rect>,
+    /// A (12.11.): each chip's close x, over its colour dot (shown on hover; none with a single workspace).
+    pub chip_close: Vec<Rect>,
     pub shown: usize,
     /// The "+N" chip when not every chip fits.
     pub more: Option<Rect>,
@@ -69,12 +73,22 @@ pub struct Buehne {
     /// The right column's two frames (map, "Als Nächstes"); none when folded or when the output is too narrow.
     pub column: Option<(Rect, Rect)>,
     pub strip: Option<Rect>,
+    /// REWIND: the strip's "Zurückspulen" button (none without the strip).
+    pub rewind: Option<Rect>,
     /// The bottom row: hint line, Feld bar, minimised windows and Startseite.
     pub bottom: Option<Rect>,
     pub hint: Rect,
     pub feld: Rect,
     pub home: Option<Rect>,
     pub min_items: Vec<Rect>,
+    /// DESK-LEFT: each chip's x, in its letter's place (shown while the pointer is on the chip).
+    pub min_close: Vec<Rect>,
+    /// C (12.11.): "+N" when not every minimised window has a chip, and the list it opens (one entry per minimised
+    /// window, above the row's right end; drawn and hit only while open).
+    pub min_more: Option<Rect>,
+    pub min_list: Vec<Rect>,
+    /// DESK-LEFT: each list line's x at its right end.
+    pub min_list_close: Vec<Rect>,
 }
 
 /// Board px of the parts (Main.dc.html).
@@ -94,9 +108,11 @@ const STRIP_H: f32 = 128.0;
 const ROW_H: f32 = 64.0;
 const FELD_W: f32 = 960.0;
 const HINT_W: f32 = 400.0;
-/// The headline's place on the stage: label, 12 px, the 48 px line, then the tiles' gap.
+/// C (12.11.): a minimised window's chip: the letter square and its gap.
+pub const MIN_LETTER: f32 = 22.0;
+/// The headline's place on the stage: the 48 px line (dot and text), then the tiles' gap.
 const HEAD_TOP: f32 = 28.0;
-const HEAD_H: f32 = 76.0;
+const HEAD_H: f32 = 48.0;
 /// Narrower than this the stage keeps the column's room (the column goes).
 const STAGE_MIN: f32 = 800.0;
 /// Lower than this (with the strip) the stage keeps the strip's room: the strip goes.
@@ -229,24 +245,53 @@ pub fn layout(t: &Theme, i: &Inputs) -> Buehne {
     };
     let home = (bottom.is_some() && home_w <= zone.w).then(|| Rect { x: zone.x + zone.w - home_w, w: home_w, ..zone });
     let mut min_items = Vec::new();
+    let mut min_more = None;
+    let mut min_list = Vec::new();
     if let Some(hr) = home {
         let mut x = hr.x - b(10.0);
         let f = t.bfont(Family::Mono, 12.0, Weight::Medium);
-        for l in &i.min_labels {
-            let iw = (logical_width(&f, l, t.scale) + b(24.0)).min(b(180.0));
-            if x - iw < zone.x {
+        let n = i.min_labels.len();
+        // The "+N" chip's room is kept while chips are left over (its count is at most two digits wide here).
+        let more_w = more_w(t, n.max(10));
+        for (k, l) in i.min_labels.iter().enumerate() {
+            // C: the program's letter square left of the title.
+            let iw = (logical_width(&f, l, t.scale) + b(24.0) + b(MIN_LETTER)).min(b(200.0));
+            let reserve = if k + 1 < n { more_w + b(CHIP_GAP) } else { 0 };
+            if x - iw - reserve < zone.x {
                 break;
             }
             x -= iw;
             min_items.push(Rect { x, y: zone.y + b(4.0), w: iw, h: b(CHIP_H) });
             x -= b(CHIP_GAP);
         }
+        if min_items.len() < n {
+            let mw = more_w.min((x - zone.x).max(0));
+            min_more = (mw > 0).then(|| Rect { x: x - mw, y: zone.y + b(4.0), w: mw, h: b(CHIP_H) });
+        }
+        // The list: right-aligned with Startseite, upwards from above the row, the oldest at the top.
+        let (lw, lh) = (b(320.0), b(40.0));
+        let bottom_y = zone.y - b(12.0);
+        for k in 0..n {
+            let y = bottom_y - (n - k) as i32 * (lh + b(4.0));
+            // The oldest that would reach into the header are left out (Alt+Tab reaches them).
+            min_list.push(if y < header.h + b(8.0) { gone(h) } else { Rect { x: hr.x + hr.w - lw, y, w: lw, h: lh } });
+        }
     }
+    let xs = b(24.0);
+    let min_close = min_items.iter().map(|c| Rect { x: c.x + b(6.0), y: c.y + (c.h - xs) / 2, w: xs, h: xs }).collect();
+    let min_list_close = min_list.iter().map(|r| if r.w > 0 { Rect { x: r.x + r.w - b(10.0) - xs, y: r.y + (r.h - xs) / 2, w: xs, h: xs } } else { *r }).collect();
+    let close = b(22.0);
+    let chip_close = if chips.len() < 2 {
+        Vec::new()
+    } else {
+        chips.iter().map(|c| Rect { x: c.x + b(18.0) - close / 2, y: c.y + (c.h - close) / 2, w: close, h: close }).collect()
+    };
     Buehne {
         size: (w, h),
         header,
         mark,
         chips,
+        chip_close,
         shown,
         more,
         ws_new,
@@ -263,11 +308,16 @@ pub fn layout(t: &Theme, i: &Inputs) -> Buehne {
         work,
         column,
         strip,
+        rewind: strip.and_then(|s| crate::chrome_draw::strip::rewind_rect(s, t)),
         bottom,
         hint,
         feld,
         home,
         min_items,
+        min_close,
+        min_more,
+        min_list,
+        min_list_close,
     }
 }
 
@@ -286,7 +336,7 @@ impl Buehne {
             (Some(s), None) => Some(s),
         };
         let row_y = self.bottom.map_or(h, |b| b.y);
-        let min_title = if self.min_items.is_empty() { gone(h) } else { Rect { x: 0, y: row_y, w: 0, h: 0 } };
+        let min_title = if self.min_items.is_empty() && self.min_more.is_none() { gone(h) } else { Rect { x: 0, y: row_y, w: 0, h: 0 } };
         Chrome {
             top: self.header,
             mark: self.mark,
@@ -304,9 +354,14 @@ impl Buehne {
             ws_button: None,
             ws_title: gone(h),
             ws_items: self.chips.clone(),
+            ws_close: self.chip_close.clone(),
             ws_new: self.ws_new,
             min_title,
             min_items: self.min_items.clone(),
+            min_close: self.min_close.clone(),
+            min_more: self.min_more,
+            min_list: self.min_list.clone(),
+            min_list_close: self.min_list_close.clone(),
             home: self.home.unwrap_or(gone(h)),
             side: column,
             side_docked: column.is_some(),
@@ -323,6 +378,9 @@ impl Buehne {
         }
         if self.bottom.is_some() && self.feld.contains(x, y) {
             return Some(Part::Feld);
+        }
+        if self.rewind.is_some_and(|r| r.contains(x, y)) {
+            return Some(Part::Rewind);
         }
         self.strip.filter(|s| s.contains(x, y)).map(|_| Part::Strip)
     }

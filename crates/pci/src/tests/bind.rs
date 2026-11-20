@@ -18,7 +18,7 @@ fn ok(_: &PciFunction) -> Result<(), String> {
 }
 
 fn cand(name: &'static str, matches: &'static [Match]) -> Candidate {
-    Candidate { name, matches, opt_in_key: None, probe: ok }
+    Candidate { name, matches, probe: ok }
 }
 
 const XHCI_CLASS: Match = Match::Class { class: 0x0C_03_30, mask: 0xFF_FF_FF };
@@ -158,8 +158,8 @@ fn rescan_sizes_only_new_functions() {
     }
     assert_eq!(m.nodes[n.parent.unwrap()].loc, Loc::new(0, 0, 2, 5));
     // The WLAN and its bridge stay untouched.
-    assert_eq!(find(&m.nodes, WLAN.0, WLAN.1, WLAN.2).unwrap().untouched, Some("wlan"));
-    assert_eq!(find(&m.nodes, WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2).unwrap().untouched, Some("wlan"));
+    assert_eq!(find(&m.nodes, WLAN.0, WLAN.1, WLAN.2).unwrap().untouched, Some(super::HELD));
+    assert_eq!(find(&m.nodes, WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2).unwrap().untouched, Some(super::HELD));
 }
 
 #[test]
@@ -191,8 +191,8 @@ fn rescan_keeps_untouched_state_whatever_appears() {
     let m = merge(&w, &old, walked, &[], keys_off, 1 << 48);
     let added: Vec<Loc> = m.added.iter().map(|&i| m.nodes[i].loc).collect();
     assert_eq!(added, [Loc::new(0, WLAN.0, 0, 1)]);
-    assert_eq!(find(&m.nodes, WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2).unwrap().untouched, Some("wlan"));
-    assert_eq!(find(&m.nodes, WLAN.0, WLAN.1, WLAN.2).unwrap().untouched, Some("wlan"));
+    assert_eq!(find(&m.nodes, WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2).unwrap().untouched, Some(super::HELD));
+    assert_eq!(find(&m.nodes, WLAN.0, WLAN.1, WLAN.2).unwrap().untouched, Some(super::HELD));
     assert_eq!(find(&m.nodes, WLAN.0, 0, 1).unwrap().untouched, None);
     assert_eq!(w.writes_to(WLAN.0, 0, 0) + w.writes_to(WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2), 0);
     // And a new WLAN card elsewhere is untouched from the start.
@@ -201,7 +201,7 @@ fn rescan_keeps_untouched_state_whatever_appears() {
     w.add(6, 0, 0, wl2);
     w.writes.lock().unwrap().clear();
     let m2 = merge(&w, &m.nodes, enumerate::enumerate(&w, &ALL), &[], keys_off, 1 << 48);
-    assert_eq!(find(&m2.nodes, 6, 0, 0).unwrap().untouched, Some("wlan"));
+    assert_eq!(find(&m2.nodes, 6, 0, 0).unwrap().untouched, Some(super::HELD));
     assert!(w.writes.lock().unwrap().is_empty(), "the new WLAN or its bridge was written");
 }
 
@@ -418,14 +418,112 @@ fn rescan_of_all_ones_reports_gone_without_writes() {
     }
 }
 
-/// BT-5: `net_drivers=off` keeps network-class functions (and only those) untouched.
 #[test]
-fn net_drivers_off_keeps_network_class() {
-    use crate::registry::net_kept_off;
-    assert!(net_kept_off(0x02_00_00, Some("off")));
-    assert!(net_kept_off(0x02_80_00, Some(" off\n")));
-    assert!(!net_kept_off(0x02_00_00, Some("on")));
-    assert!(!net_kept_off(0x02_00_00, None));
-    assert!(!net_kept_off(0x01_08_02, Some("off")));
-    assert!(!net_kept_off(0x0C_03_30, Some("off")));
+fn the_poll_test_key_names_drivers() {
+    use crate::registry::poll_named;
+    assert!(poll_named(Some("nvme"), "nvme") && poll_named(Some("hda, nvme"), "nvme") && poll_named(Some(" hda "), "hda"));
+    assert!(!poll_named(None, "nvme") && !poll_named(Some(""), "nvme") && !poll_named(Some("nvme2"), "nvme") && !poll_named(Some("hda"), "nvme"));
+}
+
+/// GP-GUARD: the profile's network rule. Wireless controllers are held for good, every other network function
+/// until `gp_net=on`; nothing else is held by it, and nothing at all without the profile.
+#[test]
+fn the_profile_holds_the_network() {
+    use crate::gp::network_key;
+    for class in [0x02_80_00, 0x02_80_01, 0x0D_00_00, 0x0D_11_00] {
+        for net in [false, true] {
+            assert_eq!(network_key(true, net, class), Some("gp_wlan"), "{class:#x}");
+            assert_eq!(network_key(false, net, class), None, "{class:#x}");
+        }
+    }
+    for class in [0x02_00_00, 0x02_01_00] {
+        assert_eq!(network_key(true, false, class), Some("gp_net"), "{class:#x}");
+        assert_eq!(network_key(true, true, class), None, "{class:#x}");
+        assert_eq!(network_key(false, false, class), None, "{class:#x}");
+    }
+    for class in [0x01_08_02, 0x0C_03_30, 0x03_00_00, 0x06_04_00] {
+        assert_eq!(network_key(true, false, class), None, "{class:#x}");
+    }
+}
+
+/// GP-GUARD B3a: `nvme_bind=off` keeps mass-storage functions (and only those) untouched; without the line, or
+/// with any other value, nothing is kept.
+#[test]
+fn nvme_bind_off_keeps_storage_class() {
+    use crate::registry::{Until, storage_kept_off};
+    for class in [0x01_08_02, 0x01_06_01, 0x01_04_00, 0x01_01_8A, 0x01_00_00, 0x01_07_00, 0x01_80_00] {
+        assert!(storage_kept_off(class, Some("off")), "{class:#x}");
+        assert!(storage_kept_off(class, Some(" off\r\n")), "{class:#x}");
+        for v in [None, Some("on"), Some(""), Some("OFF"), Some("0"), Some("no")] {
+            assert!(!storage_kept_off(class, v), "{class:#x} {v:?}");
+        }
+    }
+    // The boot stick's controller, network, display, bridges, the host bridge: never by this key.
+    for class in [0x0C_03_30, 0x02_00_00, 0x02_80_00, 0x03_00_00, 0x06_04_00, 0x06_00_00, 0x00_01_08, 0x10_01_00] {
+        assert!(!storage_kept_off(class, Some("off")), "{class:#x}");
+    }
+    assert_eq!(alloc::format!("{}", Until("nvme_bind")), "while nvme_bind=off");
+    assert_eq!(alloc::format!("{}", Until("gp_net")), "until gp_net=on");
+    assert_eq!(alloc::format!("{}", Until(super::HELD)), "by held");
+}
+
+/// GP-GUARD B3a on a whole tree: with the rule `nvme_bind=off` gives, both NVMe controllers and the root ports
+/// above them are untouched, never sized and never written; every other function is as it is without the rule.
+#[test]
+fn nvme_bind_off_leaves_the_controllers_and_their_ports_unwritten() {
+    use super::world::NVME1;
+    use crate::registry::storage_kept_off;
+    let off = |n: &crate::node::Node| if storage_kept_off(n.class, Some("off")) { Some("nvme_bind") } else { keys_off(n) };
+    let w = minipc();
+    let nodes = build(&w, &ALL, off);
+    let plain = build(&minipc(), &ALL, keys_off);
+    let (nvme_ports, mut seen) = ([(0u8, 1u8, 1u8), (0, 2, 4)], 0);
+    for (a, b) in nodes.iter().zip(&plain) {
+        assert_eq!(a.loc, b.loc);
+        let nvme = [NVME0, NVME1].contains(&(a.loc.bus, a.loc.dev, a.loc.func));
+        let port = nvme_ports.contains(&(a.loc.bus, a.loc.dev, a.loc.func));
+        if nvme || port {
+            assert_eq!(a.untouched, Some("nvme_bind"), "{}", a.loc);
+            assert!(a.bars.is_none(), "{} was sized", a.loc);
+            assert_eq!(w.writes_to(a.loc.bus, a.loc.dev, a.loc.func), 0, "{} was written", a.loc);
+            assert!(b.untouched.is_none(), "{} is touched without the line", b.loc);
+            seen += 1;
+        } else {
+            assert_eq!(a.untouched, b.untouched, "{}", a.loc);
+            assert_eq!(a.bars.is_some(), b.bars.is_some(), "{}", a.loc);
+        }
+    }
+    assert_eq!(seen, 4, "two controllers and their two root ports");
+}
+
+/// GP-GUARD: untouched storage functions are never sized, yet the ACPI guard still gets their register ranges (read
+/// from the header, not sized) instead of refusing every register; nothing is written to them for it. An unsized
+/// storage function that is not untouched keeps the old answer.
+#[test]
+fn the_guard_view_covers_untouched_storage_without_sizing_it() {
+    use crate::guardview::{storage_ranges, storage_ranges_with};
+    use crate::registry::storage_kept_off;
+    use crate::ConfigAccess;
+    let off = |n: &crate::node::Node| if storage_kept_off(n.class, Some("off")) { Some("nvme_bind") } else { keys_off(n) };
+    let w = minipc();
+    let nodes = build(&w, &ALL, off);
+    assert!(storage_ranges(&nodes).is_err(), "without a header reader the old rule stands");
+    let read = |n: &crate::node::Node, o: u8| w.read32(n.loc, o as u16);
+    let r = storage_ranges_with(&nodes, Some(&read)).expect("untouched storage is guessed, not refused");
+    // The real BARs of the sized tree lie inside the guessed ranges.
+    let sized = storage_ranges(&build(&minipc(), &ALL, keys_off)).unwrap();
+    assert!(!sized.is_empty());
+    for real in &sized {
+        assert!(r.iter().any(|g| g.space == real.space && g.start <= real.start && real.end <= g.end), "{:#x}..{:#x} is not covered", real.start, real.end);
+    }
+    for g in &r {
+        assert!(g.end - g.start <= acpi::guard::BAR_GUESS_MAX, "a guess of {:#x} bytes", g.end - g.start);
+    }
+    for (b, d, f) in [NVME0, super::world::NVME1] {
+        assert_eq!(w.writes_to(b, d, f), 0, "the guard view wrote to an untouched controller");
+    }
+    // Unsized but not untouched (D3hot): refused as before, reader or not.
+    let mut d3 = build(&minipc(), &ALL, keys_off);
+    d3.iter_mut().filter(|n| n.is_storage()).for_each(|n| n.bars = None);
+    assert!(storage_ranges_with(&d3, Some(&read)).is_err());
 }

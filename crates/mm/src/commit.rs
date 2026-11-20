@@ -2,7 +2,7 @@
 //! it is promised, not when it is touched, so a page fault never finds the pool empty and no running program is
 //! ever killed for memory; the asking call gets ENOMEM instead.
 //!
-//! What is charged, as Linux's `accountable_mapping` (linux-6.6/mm/mmap.c:2699, `VM_ACCOUNT`) with mode 2's rule
+//! What is charged, as Linux's `accountable_mapping` (linux-7.3.1/mm/vma.c:2463, `VM_ACCOUNT`) with mode 2's rule
 //! that `MAP_NORESERVE` is ignored (mm/mmap.c:1342): every private writable mapping at `mmap` (anonymous or a
 //! file's private copy), a private mapping that `mprotect` makes writable for the first time
 //! (mm/mprotect.c:633), `brk` growth (mm/mmap.c `do_brk_flags`), `mremap` growth, every accounted mapping again

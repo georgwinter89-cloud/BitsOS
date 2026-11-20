@@ -1,7 +1,7 @@
-//! Firmware file names from IP versions: `amdgpu/<ip>_<major>_<minor>_<rev><suffix>.bin`, the rule of
-//! linux-6.6 amdgpu_ucode.c `amdgpu_ucode_ip_version_decode` for GPUs without legacy names (every GC 11 and later;
-//! the legacy codenames of GC 9/10 have no BitsOS module). On the stick the files come from the host's
-//! linux-firmware package (xtask copies them with their licence; never into git).
+//! Firmware file names from IP versions: `amdgpu/<ip>_<major>_<minor>_<rev><suffix>.bin`, the rule of linux-7.3.1
+//! amdgpu_ucode.c:1445 `amdgpu_ucode_ip_version_decode` for GPUs without legacy names (every GC 11 and later; the
+//! legacy codenames of GC 9/10 have no BitsOS module). On the stick the files come from the host's linux-firmware
+//! package (xtask copies them with their licence; never into git).
 
 use crate::ip::IpVersion;
 use alloc::format;
@@ -13,6 +13,11 @@ pub const DIR: &str = "amdgpu";
 /// `amdgpu/<prefix>_<maj>_<min>_<rev><suffix>.bin`.
 pub fn file(prefix: &str, v: IpVersion, suffix: &str) -> String {
     format!("{DIR}/{prefix}_{}_{}_{}{suffix}.bin", v.major, v.minor, v.rev)
+}
+
+/// `amdgpu/<name>.bin` for a file with a fixed name (`ipmod::Firmware::Named`).
+pub fn named(name: &str) -> String {
+    format!("{DIR}/{name}.bin")
 }
 
 /// One file a module needs; `fallback` is tried when `suffix` is missing (Linux: MES `_mes_2` falls back to

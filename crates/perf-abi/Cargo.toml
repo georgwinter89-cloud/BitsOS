@@ -1,0 +1,13 @@
+[package]
+name = "perf-abi"
+version = "0.1.0"
+edition = "2024"
+description = "perf_event_open's ABI (linux-7.3.1 include/uapi/linux/perf_event.h): constants, the attribute, record encoding and decoding, ring-buffer space rules; shared by the kernel (SO, SELFOPT-1) and bitsprof"
+publish = false
+
+# No dependencies on purpose: the kernel (no_std) and bitsprof (std, user/ workspace on the stable toolchain)
+# both build it.
+[dependencies]
+
+[lints]
+workspace = true

@@ -73,7 +73,7 @@ pub use serial::pending as serial_pending;
 pub use fields::FieldFilter;
 pub use reader::{Filter, Gap, Page, read, read_span, read_tail, read_tail_span};
 pub use render::LINE_BYTES;
-pub use tail::{try_tail_text, try_tail_text_before};
+pub use tail::{try_tail_text, try_tail_text_before, try_tail_visit_before};
 pub use sinks::{SinkId, add_deferred_sink, drain_deferred, drainer, pending, remove_sink, set_drainer};
 #[doc(hidden)]
 pub use kreg as __kreg;

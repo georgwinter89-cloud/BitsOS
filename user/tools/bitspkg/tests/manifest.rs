@@ -141,7 +141,7 @@ fn hostile_names_and_values_are_refused() {
         ("version", "\"current.new\"", "bad version"),
         ("version", "\"previous.new\"", "bad version"),
         ("version", "\"1.0.new\"", "bad version"),
-        ("format", "2", "newer than this bitspkg"),
+        ("format", "3", "newer than this bitspkg"),
         ("format", "\"1\"", "must be an integer"),
         ("size", "-1", "negative"),
         ("size", "99999999999999999999", "out of range"),
@@ -205,4 +205,34 @@ fn hostile_entries_are_refused() {
     let not_exec = base().replace("exec = true\n", "") + "";
     let with_program = not_exec.replace("version = \"1.0\"\n", "version = \"1.0\"\nprogram = \"bin/x\"\n");
     assert!(Manifest::from_text(&with_program).unwrap_err().contains("not an executable"));
+}
+
+/// PK-6d, PACKAGES.md 6.7: format 2 (a program from the repositories) round-trips; its entry kinds are refused in
+/// format 1; its paths may carry non-ASCII names only in the locale folders and case twins; links read in the view.
+#[test]
+fn format_2_round_trip_and_rules() {
+    let sha = "ab".repeat(32);
+    let text = format!(
+        "format = 2\nname = \"foot\"\nversion = \"e1_1.28.0-2.1+1\"\nprogram = \"root/usr/bin/foot\"\n\n\
+         [[origin]]\nrepo = \"fixture\"\nname = \"foot\"\nversion = \"1:1.28.0-2.1\"\nfilename = \"foot-1:1.28.0-2.1-x86_64_v3.pkg.tar.zst\"\nsha256 = \"{sha}\"\npackager = \"CachyOS <admin@cachyos.org>\"\nkey = \"882DCFE48E2051D48E2562ABF3B607488DB35A47\"\n\n\
+         [[uses]]\npkg = \"foot\"\nversion = \"e1_1.28.0-2.1\"\n\n\
+         [[launch]]\ndesktop = \"root/usr/share/applications/foot.desktop\"\nname = \"Foot\"\nexec = \"foot\"\nicon = \"foot\"\ncategories = \"System;TerminalEmulator;\"\n\n\
+         [[trigger]]\nhook = \"11-glibc-ldconfig\"\ntool = \"ldconfig\"\noutput = \"root/etc/ld.so.cache\"\nsha256 = \"{sha}\"\n\n\
+         [[file]]\npath = \"root/usr/bin/foot\"\nsha256 = \"{sha}\"\nsize = 1\nexec = true\n\n\
+         [[file]]\npath = \"root/etc/ld.so.cache\"\nsha256 = \"{sha}\"\nsize = 1\n\n\
+         [[file]]\npath = \"root/usr/share/locale/fr/LC_MESSAGES/caf\u{e9}.mo\"\nsha256 = \"{sha}\"\nsize = 1\n\n\
+         [[file]]\npath = \"root/usr/share/terminfo/A/x\"\nsha256 = \"{sha}\"\nsize = 1\n\n\
+         [[file]]\npath = \"root/usr/share/terminfo/a/x\"\nsha256 = \"{sha}\"\nsize = 1\n\n\
+         [[symlink]]\npath = \"root/etc/fonts/conf.d/50-user.conf\"\ntarget = \"/usr/share/fontconfig/conf.default/50-user.conf\"\n"
+    );
+    let m = Manifest::from_text(&text).unwrap();
+    assert_eq!(m.format, 2);
+    assert_eq!((m.origins.len(), m.uses.len(), m.launch.len(), m.triggers.len(), m.files.len()), (1, 1, 1, 1, 5));
+    assert_eq!(Manifest::from_text(&m.to_text()).unwrap(), m, "round trip");
+    let one = text.replacen("format = 2", "format = 1", 1);
+    assert!(Manifest::from_text(&one).unwrap_err().contains("only in format 2"), "format 1 knows no [[origin]]");
+    let outside = text.replace("root/usr/share/terminfo/a/x", "root/usr/bin/caf\u{e9}");
+    assert!(Manifest::from_text(&outside).unwrap_err().contains("non-ASCII"));
+    let dup = text.replace("root/usr/share/terminfo/a/x", "root/usr/share/terminfo/A/x");
+    assert!(Manifest::from_text(&dup).unwrap_err().contains("listed twice"));
 }

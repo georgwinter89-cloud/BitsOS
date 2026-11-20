@@ -31,7 +31,7 @@ fn devices() -> Arc<dyn DirSource> {
 }
 
 fn class() -> Arc<dyn DirSource> {
-    Arc::new(Fixed(&[("net", net_class)]))
+    Arc::new(Fixed(&[("net", net_class), ("power_supply", super::power_supply::class)]))
 }
 
 /// MM-13: `/sys/kernel/mm/transparent_hugepage/enabled` (Linux `enabled_show`/`enabled_store`, mode 0644; a word
@@ -103,6 +103,6 @@ fn kernel() -> Arc<dyn DirSource> {
 }
 
 fn sys_root() -> Arc<dyn DirSource> {
-    Arc::new(Fixed(&[("class", class), ("devices", devices), ("kernel", kernel)]))
+    Arc::new(Fixed(&[("block", super::sys_block::block_root), ("class", class), ("devices", devices), ("kernel", kernel)]))
 }
 vfs::procdir!("/sys", sys_root);

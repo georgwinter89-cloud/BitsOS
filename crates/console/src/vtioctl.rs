@@ -1,8 +1,8 @@
 //! The VT ioctls beyond the screen and keyboard modes (IN-4 fixer): what VT tools and seat managers ask of
 //! /dev/tty0 before KDSETMODE/KDSKBMODE (libseat's builtin backend and seatd, weston and wlroots without logind,
-//! busybox openvt/chvt/deallocvt/kbd_mode, setleds). After linux-6.6/drivers/tty/vt/vt_ioctl.c (`vt_k_ioctl`
-//! :269, `vt_ioctl` :725, `vt_reldisp` :555), keyboard.c (`vt_do_kdskled` :2112, `vt_do_kdskbmeta` :1880,
-//! `kbd_rate` :312) and vt.c (`tioclinux` :3143).
+//! busybox openvt/chvt/deallocvt/kbd_mode, setleds). After linux-7.3.1/drivers/tty/vt/vt_ioctl.c (`vt_k_ioctl`
+//! :283, `vt_ioctl` :731, `vt_reldisp` :555), keyboard.c (`vt_do_kdskled` :2124, `vt_do_kdskbmeta` :1914,
+//! `kbd_rate` :313) and vt.c (`tioclinux` :3564).
 //!
 //! BitsOS has one VT (tty1, the console): it is always the active one and in use, so VT_OPENQRY finds no free VT
 //! (-1, Linux's answer when all are taken), VT_ACTIVATE/VT_WAITACTIVE of VT 1 answer at once and of any other VT
@@ -323,6 +323,9 @@ fn tioclinux(arg: u64, mem: &dyn UserMem, perm: bool, root: bool) -> Result<i64,
         }
         // TIOCL_BLANKEDSCREEN: none.
         15 => Ok(0),
+        // TIOCL_GETBRACKETEDPASTE (linux-7.3.1/drivers/tty/vt/vt.c:3647, :1907): the VT's DEC mode 2004 as the
+        // return value (V2's one VT is every console tty's).
+        18 => Ok(crate::vt::bracketed_paste() as i64),
         // The selection calls (SETSEL, PASTESEL, SELLOADLUT) are not built; unknown types: EINVAL.
         _ => Err(EINVAL),
     }

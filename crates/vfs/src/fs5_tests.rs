@@ -114,7 +114,7 @@ fn truncate_keeps_pinned_pages_alive() {
     assert_eq!(b, [0; 4]);
 }
 
-/// Linux's file checks of do_mmap (linux-6.6/mm/mmap.c:1279-1337) in their order.
+/// Linux's file checks of do_mmap (linux-7.3.1/mm/mmap.c:431-501) in their order.
 #[test]
 fn mmap_file_checks() {
     let (ns, _m) = shm_view();

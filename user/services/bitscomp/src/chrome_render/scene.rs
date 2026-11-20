@@ -13,6 +13,7 @@ use crate::chrome_draw::{self as draw, RingLook};
 use crate::desk::Spot;
 use crate::fx::plan as fx;
 use crate::layout::Rect;
+use crate::chrome::Part as C;
 use crate::render::{CompElement, CompRenderer};
 use crate::state::App;
 use crate::theme::Preset;
@@ -23,6 +24,8 @@ pub struct Images {
     header: Option<(HeaderLook, MemoryRenderBuffer)>,
     headline: Option<(HeadlineLook, MemoryRenderBuffer)>,
     column: Option<(ColumnLook, MemoryRenderBuffer)>,
+    /// CL-3b: the conversation's panel in the column.
+    assist: Option<(crate::assist_draw::PanelLook, MemoryRenderBuffer)>,
     strip: Option<(StripLook, MemoryRenderBuffer)>,
     bottom: Option<(BottomLook, MemoryRenderBuffer)>,
     pub(crate) stage: Option<((Rect, u64, (i32, i32)), MemoryRenderBuffer)>,
@@ -40,7 +43,7 @@ impl App {
         let full = self.area_full();
         let inputs = buehne::Inputs {
             size: (full.w, full.h),
-            names: self.desk.names.clone(),
+            names: self.shown_names(),
             active: self.desk.active,
             min_labels: self.ws.minimized.iter().map(|m| crate::minimize::label(&m.win)).collect(),
             absicht: self.absicht().is_some(),
@@ -50,9 +53,26 @@ impl App {
 
     /// The shown workspace's Absicht headline (`desktop.absicht.<slug>`), if the user typed one.
     pub fn absicht(&self) -> Option<String> {
-        let name = self.desk.names.get(self.desk.active)?;
+        self.absicht_of(self.desk.active)
+    }
+
+    /// Workspace `i`'s Absicht headline, if the user typed one.
+    pub fn absicht_of(&self, i: usize) -> Option<String> {
+        let name = self.desk.names.get(i)?;
         let s = self.settings.text(&buehne::absicht_key(name, &self.desk.names))?.trim();
         (!s.is_empty()).then(|| s.chars().take(200).collect())
+    }
+
+    /// What the tabs, the strip and the desktop list call each workspace (Georg 15.11.): its headline, cut to
+    /// `SHOWN_MAX` characters, else its own name ("Arbeitsraum 2"). Keys, colours and `ctl ws` keep the own name.
+    pub fn shown_names(&self) -> Vec<String> {
+        (0..self.desk.names.len())
+            .map(|i| match self.absicht_of(i) {
+                Some(h) if h.chars().count() > SHOWN_MAX => h.chars().take(SHOWN_MAX - 1).chain(['…']).collect(),
+                Some(h) => h,
+                None => self.desk.names[i].clone(),
+            })
+            .collect()
     }
 
     /// The tiles' area moved (a headline typed or removed, the column folded, the preset switched): the tiles are laid
@@ -86,7 +106,8 @@ impl App {
     }
 
     /// A click on a Bühne part: the sun switches theme.mode (kept in settingsd like a fold, local without it);
-    /// the bell, the Feld bar, the strip and "+N" have nothing to open yet (later items), so they only say so.
+    /// the Feld bar opens the Feld (FELD), "+N" its list, the strip's "Zurückspulen" the rewind view (REWIND); the
+    /// bell and the strip have nothing to open yet (later items), so they only say so.
     pub fn buehne_act(&mut self, p: Part) {
         match p {
             Part::Sun => {
@@ -97,6 +118,8 @@ impl App {
                 let sent = self.settings_live && self.settings_writer.as_ref().is_some_and(|w| w.send(crate::desk::DESK_PID, req));
                 eprintln!("bitscomp: theme.mode = {mode} by the sun ({})", if sent { "kept in settingsd" } else { "local only" });
             }
+            Part::Feld => self.feld_open("Feld bar"),
+            Part::Rewind => self.rewind_button("Zurückspulen"),
             other => eprintln!("bitscomp: {other:?} has nothing to open yet"),
         }
     }
@@ -128,7 +151,7 @@ impl App {
     }
 
     fn buehne_hover(&self) -> Option<Hover> {
-        match self.desk.hover {
+        match self.bar_hover() {
             Some(Spot::Chrome(p)) => Some(Hover::Chrome(p)),
             Some(Spot::Buehne(p)) => Some(Hover::Buehne(p)),
             _ => None,
@@ -153,9 +176,10 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
         app.layout_dirty = true;
     }
     // Each image follows only its own buttons: a hover elsewhere must not draw it again.
-    let in_bottom = |h: &Hover| matches!(h, Hover::Buehne(Part::Feld) | Hover::Chrome(crate::chrome::Part::Min(_) | crate::chrome::Part::Home));
+    let in_bottom = |h: &Hover| matches!(h, Hover::Buehne(Part::Feld) | Hover::Chrome(C::Min(_) | C::MinMore | C::MinClose(_) | C::Home));
     let hover = app.buehne_hover();
-    let (hover_top, hover_bottom) = (hover.filter(|h| !in_bottom(h)), hover.filter(in_bottom));
+    let on_rewind = hover == Some(Hover::Buehne(Part::Rewind));
+    let (hover_top, hover_bottom) = (hover.filter(|h| !in_bottom(h) && !on_rewind), hover.filter(in_bottom));
     let slug = app.slug();
     let mut out = Vec::new();
     let put = |renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement<R>>| {
@@ -163,7 +187,7 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
     };
     // Claude's ring in the header: its own sprite over the header image.
     let ring = app.desk.ring;
-    let step = app.status.ring.shown(crate::ring::sprite_moves(ring, &t), now, &t);
+    let step = app.status.ring.shown(crate::ring::sprite_moves(ring), now, &t);
     let size = t.bl(40.0) as f32 * 48.0 / 44.0 * 0.9;
     let rl = RingLook { rect: b.ring, ring, step, size, theme: tg };
     out.extend(fx::ring(app, "ring-top", b.ring, size, ring, -glide).map(CompElement::from));
@@ -173,7 +197,7 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
     let look = HeaderLook {
         geo: b.clone(),
         theme: tg,
-        chips: app.desk.names.iter().map(|n| (n.clone(), buehne::colour_of(n))).collect(),
+        chips: app.shown_names().into_iter().zip(&app.desk.names).map(|(s, n)| (s, buehne::colour_of(n))).collect(),
         active: app.desk.active,
         slug: slug.clone(),
         edit,
@@ -182,18 +206,29 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
         hover: hover_top,
         notices: 0,
         library: app.lib.open,
+        closable: (0..app.ws_count()).map(|i| app.ws_closable(i)).collect(),
     };
     out.extend(fx::mark(app, b, -glide).map(CompElement::from));
     let buf = cached(&mut app.images.buehne.header, &look, |l| bd::header(l, &t));
     put(renderer, buf, b.header, -glide, &mut out);
     if let (Some(r), Some(text)) = (b.headline, app.absicht()) {
-        let look = HeadlineLook { rect: r, theme: tg, slug: slug.clone(), text };
+        let look = HeadlineLook { rect: r, theme: tg, text };
         out.extend(fx::headline_dot(app, r).map(CompElement::from));
         let buf = cached(&mut app.images.buehne.headline, &look, |l| bd::headline(l, &t));
         put(renderer, buf, r, 0.0, &mut out);
         out.extend(fx::halo(app, "headline-halo", r).map(CompElement::from));
     }
-    if let Some((map, next)) = b.column {
+    // CL-3b: once an assistant answered, its conversation is the column (the two frames are still empty boards);
+    // without one the column is as the design drew it.
+    let chat = if b.column.is_some() { app.assist_panel_look() } else { None };
+    if let Some(pl) = &chat {
+        let area = bd::padded(pl.rect, &t, b.stage.x + b.stage.w);
+        let buf = cached(&mut app.images.buehne.assist, pl, |l| crate::assist_draw::panel(l, &t, area));
+        put(renderer, buf, area, 0.0, &mut out);
+        out.extend(fx::chat(app, pl.rect).into_iter().map(CompElement::from));
+        app.images.buehne.column = None;
+    } else if let Some((map, next)) = b.column {
+        app.images.buehne.assist = None;
         let look = ColumnLook { map, next, theme: tg, workspaces: app.ws_count() };
         let area = bd::padded(Rect { h: next.y + next.h - map.y, ..map }, &t, b.stage.x + b.stage.w);
         out.extend(fx::radar(app, map).map(CompElement::from));
@@ -205,9 +240,10 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
         let look = StripLook {
             rect: r,
             theme: tg,
-            lanes: app.desk.names.iter().map(|n| (n.clone(), buehne::colour_of(n))).collect(),
+            lanes: app.shown_names().into_iter().zip(&app.desk.names).map(|(s, n)| (s, buehne::colour_of(n))).collect(),
             active: app.desk.active,
             now: strip::hour_minute(&app.status.clock),
+            rewind: (app.rewind.avail.ready(), on_rewind, app.rewind.avail.short()),
         };
         // The strip's image stops short of the stage (it lies over the stage's lower margin, not its tiles).
         let area = Rect { y: r.y - t.bl(20.0), h: r.h + t.bl(44.0), ..bd::padded(r, &t, 0) };
@@ -224,10 +260,13 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R, b: &Buehne) ->
             feld: b.feld,
             home: b.home,
             min_items: b.min_items.clone(),
+            min_close: b.min_close.clone(),
             theme: tg,
-            text: buehne::hint_text(tiles, hung),
+            text: app.home_hint(buehne::hint_text(tiles, hung)),
             grant: app.install_marker(),
             minimized: app.ws.minimized.iter().map(|m| crate::minimize::label(&m.win)).collect(),
+            letters: app.min_items_shown().into_iter().map(|(c, _)| c).collect(),
+            min_more: b.min_more.map(|r| (r, app.ws.minimized.len().saturating_sub(b.min_items.len()), app.desk.min_list.open)),
             home_lit: app.start_shown(),
             hover: hover_bottom,
         };
@@ -260,3 +299,6 @@ pub fn stage_element<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Option
     let p = crate::header::px_rect(area, t.scale);
     crate::deco::image(renderer, buf, area, (p.w, p.h), t.scale)
 }
+
+/// A headline longer than this is cut in a tab (with "…"); the stage shows it whole.
+const SHOWN_MAX: usize = 32;

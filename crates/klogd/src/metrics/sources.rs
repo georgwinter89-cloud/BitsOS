@@ -17,9 +17,12 @@ pub enum Sensors {
 /// What the sources found once (sensors, energy unit), kept between rounds.
 pub struct Sources {
     pub zen: Sensors,
-    /// RAPL energy status unit (bits 12:8 of the power unit MSR, linux-6.6/arch/x86/events/rapl.c), or why not.
+    /// RAPL energy status unit (bits 12:8 of the power unit MSR, linux-7.3.1/arch/x86/events/rapl.c:618), or why not.
     pub esu: Result<u32, &'static str>,
 }
+
+/// hal's user-copy counters, which join klog's in every reading.
+const USERCOPY_COUNTERS: usize = 5;
 
 impl Sources {
     pub fn detect() -> Sources {
@@ -45,7 +48,9 @@ impl Sources {
         true
     }
 
-    pub fn read(&self, now_ns: u64, cost_ns: u64) -> Reading {
+    /// None when the counters' list (one block of 30 KiB and more) cannot be had: a sample is skipped then, the
+    /// kernel goes on (rb/20's choke, gate of 13.11.: the infallible list panicked the kernel there).
+    pub fn read(&self, now_ns: u64, cost_ns: u64) -> Option<Reading> {
         let cpus = sched::cpu_stats()
             .into_iter()
             .filter(|c| c.online)
@@ -80,7 +85,10 @@ impl Sources {
         };
         // hal cannot use klog's counters (klog sits above it): its user-copy counters join them here.
         let u = hal::usercopy::stats();
-        let mut counters: alloc::vec::Vec<(&'static str, u64)> = klog::metrics::snapshot().collect();
+        let snap = klog::metrics::snapshot();
+        let mut counters: alloc::vec::Vec<(&'static str, u64)> = alloc::vec::Vec::new();
+        counters.try_reserve_exact(snap.size_hint().0 + USERCOPY_COUNTERS).ok()?;
+        counters.extend(snap);
         counters.extend([
             ("hal.usercopy.fast_faults", u.fast_faults),
             ("hal.usercopy.resolved", u.resolved),
@@ -88,6 +96,6 @@ impl Sources {
             ("hal.usercopy.hook_replaced", u.hook_replaced),
             ("hal.usercopy.nofault_short", u.nofault_short),
         ]);
-        Reading { now_ns, cpus, procs, mem, nets, disks, counters, temps, pkg_energy, cost_ns }
+        Some(Reading { now_ns, cpus, procs, mem, nets, disks, counters, temps, pkg_energy, cost_ns, clocks: alloc::vec::Vec::new() })
     }
 }

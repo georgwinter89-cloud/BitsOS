@@ -2,7 +2,7 @@
 //! CachyOS's glibc (`dyn-<stem>`, PIE, PT_INTERP `/lib64/ld-linux-x86-64.so.2`; `*-static.c` as static-PIE), CachyOS's own `ls` and `cat`
 //! are copied unchanged (`dyn-ls`, `dyn-cat`), and the libraries `ldd` lists for them (the loader, libc.so.6,
 //! libcap.so.2) go into the image's `/bin` under their sonames. On V2 they belong to `/lib64` and `/usr/lib`:
-//! until the image puts them there (UL-5, desk change request in plan/notes/ab-AB-8.md) the harness writes
+//! until the image puts them there (UL-5) the harness writes
 //! them there over MCP (`install_libs`) and the ktests link them (`proc::ktests_ab8`). Without gcc or ldd the
 //! dynamic programs are left out with a warning (their ktests then skip).
 

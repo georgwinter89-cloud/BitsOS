@@ -113,3 +113,10 @@ fn offer_table_with_and_without_a_grant() {
     assert_eq!(service_offer_for(Safety::Change, true, false), Some(Offer::Installer));
     assert_eq!(service_offer_for(Safety::Read, true, false), Some(Offer::Gate));
 }
+
+/// DB2: the access log is a root service's looking tool, yet only a client with full access gets it.
+#[test]
+fn the_access_log_needs_full_access() {
+    assert!(grant_only("access_log"));
+    assert!(!grant_only("journal") && !grant_only("settings_get"));
+}

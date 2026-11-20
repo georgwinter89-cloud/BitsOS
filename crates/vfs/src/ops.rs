@@ -69,6 +69,10 @@ impl<'a> Ctx<'a> {
 
     /// B3: asks the policy for an access outside the program's own folders. Refusals are EACCES.
     pub(crate) fn policy(&self, at: &Path, name: Option<&[u8]>, write: bool, create: bool) -> Result<(), Errno> {
+        // EINS-C (F3): the guarded files and the trash stay closed to the assistant's tree.
+        if write && self.subject.tree != 0 {
+            crate::trash::guard::check(self, at, name)?;
+        }
         // PM-1: no path is built while this program's path rules cannot depend on it (allow-all programs).
         if policy::allows_any(&self.subject, policy::AccessClass::Path) {
             return Ok(());
@@ -94,6 +98,18 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// EINS-C: whether `self` could make the name `name` in `dir` itself (a trash restore puts it there for the
+    /// caller with the kernel's rights, so the caller's own checks run first): read-only mount, name length,
+    /// the guard and the policy, write and search on `dir`.
+    pub(crate) fn may_put(&self, dir: &Path, name: &[u8]) -> Result<(), Errno> {
+        if dir.mnt.is_readonly() {
+            return Err(EROFS);
+        }
+        Self::check_name(dir, name)?;
+        self.policy(dir, Some(name), true, true)?;
+        self.may_create(dir)
+    }
+
     fn may_create(&self, dir: &Path) -> Result<(), Errno> {
         if dir.dentry.is_dead_dir() {
             return Err(ENOENT);
@@ -101,7 +117,7 @@ impl<'a> Ctx<'a> {
         if dir.dentry.inode.immutable.load(core::sync::atomic::Ordering::Relaxed) {
             return Err(EPERM);
         }
-        dir.dentry.inode.meta.permission(self.cred, MAY_WRITE | MAY_EXEC)
+        dir.dentry.inode.permission(self.cred, MAY_WRITE | MAY_EXEC)
     }
 
     /// `may_delete`: write+search on the directory, the sticky-bit rule, the type rule.
@@ -111,7 +127,7 @@ impl<'a> Ctx<'a> {
         if dir.dentry.inode.immutable.load(core::sync::atomic::Ordering::Relaxed) {
             return Err(EPERM);
         }
-        dm.permission(self.cred, MAY_WRITE | MAY_EXEC)?;
+        dir.dentry.inode.permission(self.cred, MAY_WRITE | MAY_EXEC)?;
         if dm.mode() & abi::S_ISVTX != 0 && self.cred.uid != 0 && self.cred.uid != dm.uid() && self.cred.uid != victim.inode.meta.uid() {
             return Err(EPERM);
         }
@@ -272,6 +288,7 @@ impl<'a> Ctx<'a> {
                         self.may_create(&dir)?;
                         let perm = mode & 0o7777 & !self.umask;
                         let d = dir.dentry.create_child(&last.name, uapi::S_IFREG | perm, self.cred, crate::kapi::reg_data(&dir.dentry.sb))?;
+                        crate::trash::born(self, &d);
                         drop(guard);
                         created = true;
                         break Path { mnt: dir.mnt.clone(), dentry: d };
@@ -288,10 +305,15 @@ impl<'a> Ctx<'a> {
         }
         let ftype = d.inode.meta.file_type();
         if !created {
+            crate::trash::seen(self, &d);
+            // EINS-C (F3): the assistant's tree hears EPERM first, whatever else would refuse (a read-only stick).
+            if want & MAY_WRITE != 0 && self.subject.tree != 0 {
+                crate::trash::guard::check(self, &found, None)?;
+            }
             match ftype {
                 uapi::S_IFLNK if !path_only => return Err(ELOOP),
                 uapi::S_IFDIR if want & MAY_WRITE != 0 => return Err(EISDIR),
-                // FS-13: `may_open_dev` (linux-6.6/fs/namei.c:3250); O_PATH skips `may_open` (do_o_path).
+                // FS-13: `may_open_dev` (linux-7.3.1/fs/namei.c:4252); O_PATH skips `may_open` (do_o_path).
                 uapi::S_IFCHR | abi::S_IFBLK if !path_only && found.nodev() => {
                     klog::event!(Info, "vfs", "open.nodev", mount = found.mnt.id);
                     return Err(EACCES);
@@ -325,12 +347,13 @@ impl<'a> Ctx<'a> {
         // never waits for a program there (B4): its opens are non-blocking (O_WRONLY without a reader: ENXIO).
         let node_flags = if self.is_kernel() { flags | abi::O_NONBLOCK } else { flags };
         let file: Arc<dyn File> =
-            if path_only { Arc::new(PathFile { mode: d.inode.meta.mode() }) } else { node::open_file_flags(&d, self.cred, node_flags, want & MAY_WRITE != 0)? };
+            if path_only { Arc::new(PathFile { mode: d.inode.meta.mode() }) } else { node::open_file_at(&found, self.cred, node_flags, want & MAY_WRITE != 0)? };
         // FS-13: a recording program's opened file (its fills count for the program's preload record).
         if ftype == uapi::S_IFREG && !path_only {
             crate::preload::opened(self, &found);
         }
-        let of = OpenFile::with_path_writing(file, flags, found, write);
+        if !path_only { crate::access::opened(self, &found, ftype, want & MAY_WRITE != 0, created) }
+        let of = if created { OpenFile::created_by_open(file, flags, found, write) } else { OpenFile::with_path_writing(file, flags, found, write) };
         // FS-14: `fsnotify_open` at the end of `do_dentry_open` (an O_PATH open returns before it), then
         // `handle_truncate`'s notify_change(ATTR_SIZE | ATTR_MTIME | ATTR_CTIME): IN_OPEN before IN_MODIFY.
         crate::inotify::hooks::file(&of, crate::inotify::IN_OPEN);
@@ -439,6 +462,7 @@ impl<'a> Ctx<'a> {
             }
         };
         let d = dir.dentry.create_child(&last.name, ftype | perm, self.cred, data)?;
+        crate::trash::born(self, &d);
         if let Some(f) = fifo {
             f.attach(&d.inode);
         }
@@ -457,6 +481,8 @@ impl<'a> Ctx<'a> {
         // The kernel builds the static directories of proc and sysfs: they can carry computed names.
         let data = if dir.dentry.sb.fixed.is_some() { Data::SynthDir(Arc::new(crate::synth::SynthDir::new())) } else { Data::Dir };
         let d = dir.dentry.create_child(&last.name, uapi::S_IFDIR | perm, self.cred, data)?;
+        crate::trash::born(self, &d);
+        crate::access::named(self, crate::access::Kind::Create, &dir);
         Ok(Path { mnt: dir.mnt.clone(), dentry: d })
     }
 
@@ -472,17 +498,19 @@ impl<'a> Ctx<'a> {
         let _g = sb.lock_names();
         self.create_checks(&dir, &last, false)?;
         let d = dir.dentry.create_child(&last.name, uapi::S_IFLNK | 0o777, self.cred, Data::Symlink(target.to_vec()))?;
+        crate::trash::born(self, &d);
         Ok(Path { mnt: dir.mnt.clone(), dentry: d })
     }
 
     /// link/linkat (`follow` = AT_SYMLINK_FOLLOW).
     pub fn link(&self, obase: Option<&Path>, opath: &[u8], nbase: Option<&Path>, npath: &[u8], follow: bool) -> Result<(), Errno> {
         let old = self.walker().lookup(self.start(obase), opath, follow)?;
-        self.link_to(&old, nbase, npath)
+        self.link_to(Some(&old), nbase, npath)
     }
 
-    /// A new name `npath` for the object at `old`.
-    pub fn link_to(&self, old: &Path, nbase: Option<&Path>, npath: &[u8]) -> Result<(), Errno> {
+    /// A new name `npath` for the object at `old`. None: a file without a path (a pipe, an eventfd), which
+    /// Linux finds on its pseudo file system's mount: EXDEV after the new name's checks.
+    pub fn link_to(&self, old: Option<&Path>, nbase: Option<&Path>, npath: &[u8]) -> Result<(), Errno> {
         let (dir, last) = self.create_slot(nbase, npath)?;
         if dir.dentry.sb.fixed.is_some() && !self.is_kernel() {
             if self.walker().child(&dir, &last.name)?.is_some() {
@@ -493,7 +521,9 @@ impl<'a> Ctx<'a> {
         // B3: a new name for an outside object must not turn it into an own-folder file the policy never sees
         // again (a later open of the link is not asked). The source is asked as a write, since the link
         // could be opened for writing.
-        if !old.dentry.is_dir() {
+        if let Some(old) = old
+            && !old.dentry.is_dir()
+        {
             self.policy(old, None, true, false)?;
         }
         self.policy(&dir, Some(&last.name), true, true)?;
@@ -506,11 +536,12 @@ impl<'a> Ctx<'a> {
         if last.trailing {
             return Err(ENOENT);
         }
-        // Linux's order (linux-6.6/fs/namei.c do_linkat): filename_create's EROFS, the EXDEV of two mounts (a
-        // bind of the same file system counts as another), may_linkat's EPERM, then vfs_link's may_create.
+        // Linux's order (linux-7.3.1/fs/namei.c:5948 filename_linkat): filename_create's EROFS, the EXDEV of two
+        // mounts (a bind of the same file system counts as another), may_linkat's EPERM, then vfs_link's may_create.
         if dir.mnt.is_readonly() {
             return Err(EROFS);
         }
+        let Some(old) = old else { return Err(EXDEV) };
         if !Arc::ptr_eq(&old.mnt, &dir.mnt) {
             return Err(EXDEV);
         }
@@ -571,6 +602,16 @@ impl<'a> Ctx<'a> {
         if self.ns.is_covered(&dir.mnt, &victim) {
             return Err(EBUSY);
         }
+        // EINS-C (K6): the assistant's tree removes into the trash.
+        if crate::trash::applies(self, &dir) && !crate::trash::removed_for_real(self, &victim) {
+            let name = victim.name();
+            let m = crate::trash::divert(self, &dir, &victim, crate::trash::What::Unlink)?;
+            crate::inotify::hooks::trashed(&dir.dentry.inode, &victim.inode, &name);
+            drop((_g, _w));
+            m.finish();
+            crate::access::named(self, crate::access::Kind::Unlink, &dir);
+            return Ok(());
+        }
         if let Some(o) = &sb.ops {
             o.remove(&dir.dentry, &victim)?;
         }
@@ -582,6 +623,7 @@ impl<'a> Ctx<'a> {
             // FS-14: `victim` and `v` are the remover's own references.
             crate::inotify::hooks::unlinked(&dir.dentry.inode, &v, &name, 2);
         }
+        crate::access::named(self, crate::access::Kind::Unlink, &dir);
         Ok(())
     }
 
@@ -613,6 +655,20 @@ impl<'a> Ctx<'a> {
         if victim.child_count() != 0 {
             return Err(ENOTEMPTY);
         }
+        // EINS-C (K6): an empty directory of the tree's removal is in its entry already, else it goes there.
+        let mut held = false;
+        if crate::trash::applies(self, &dir) && !crate::trash::removed_for_real(self, &victim) {
+            held = crate::trash::holds(self, &dir, &victim);
+            if !held {
+                let name = victim.name();
+                let m = crate::trash::divert(self, &dir, &victim, crate::trash::What::Rmdir)?;
+                crate::inotify::hooks::trashed(&dir.dentry.inode, &victim.inode, &name);
+                drop((_g, _w));
+                m.finish();
+                crate::access::named(self, crate::access::Kind::Unlink, &dir);
+                return Ok(());
+            }
+        }
         if let Some(o) = &sb.ops {
             o.remove(&dir.dentry, &victim)?;
         }
@@ -628,6 +684,12 @@ impl<'a> Ctx<'a> {
         if let Some(v) = &gone {
             crate::inotify::hooks::rmdir(&dir.dentry.inode, v, &name, 2);
         }
+        let took = if held { crate::trash::took(self, &dir, &name) } else { None };
+        drop((_g, _w));
+        if let Some(m) = took {
+            m.finish();
+        }
+        crate::access::named(self, crate::access::Kind::Unlink, &dir);
         Ok(())
     }
 
@@ -672,6 +734,7 @@ impl<'a> Ctx<'a> {
         }
         self.policy(&odir, Some(&olast.name), true, false)?;
         self.policy(&ndir, Some(&nlast.name), true, true)?;
+        crate::trash::guard::check_source(self, &odir, &olast.name)?;
         let sb = odir.dentry.sb.clone();
         let _w = sb.write_begin()?;
         let _g = sb.lock_names();
@@ -738,6 +801,32 @@ impl<'a> Ctx<'a> {
         {
             return Err(ENOTEMPTY);
         }
+        // EINS-C (K6): the name the tree's rename replaces goes to the trash (`trash::replace` does the moves).
+        if let Some(n) = &new
+            && !exchange
+            && crate::trash::applies(self, &ndir)
+            && !crate::trash::removed_for_real(self, n)
+        {
+            let (old_name, new_name) = (old.name(), n.name());
+            let m = match crate::trash::replace(self, &odir, &old, &ndir, n) {
+                Ok(m) => m,
+                Err((e, left)) => {
+                    drop((_g, _w));
+                    if let Some(m) = left {
+                        m.finish();
+                    }
+                    return Err(e);
+                }
+            };
+            old.inode.meta.touch_ctime();
+            odir.dentry.inode.meta.touch_mtime();
+            ndir.dentry.inode.meta.touch_mtime();
+            crate::inotify::hooks::moved(&odir.dentry.inode, &old_name, &ndir.dentry.inode, &new_name, &old.inode, None);
+            drop((_g, _w));
+            m.finish();
+            crate::access::named(self, crate::access::Kind::Rename, &ndir);
+            return Ok(());
+        }
         if let Some(o) = &sb.ops {
             match (&new, exchange) {
                 (Some(n), true) => o.exchange(&old, n)?,
@@ -778,10 +867,13 @@ impl<'a> Ctx<'a> {
             ndir.dentry.inode.meta.touch_mtime();
             // FS-14: a replaced target's references here: `new` and `replaced`.
             crate::inotify::hooks::moved(&odir.dentry.inode, &old_name, &ndir.dentry.inode, &new_name, &moved.inode, replaced.as_ref().map(|g| (g, 2)));
+            drop((_g, _w));
+            crate::access::named(self, crate::access::Kind::Rename, &ndir);
             return Ok(());
         }
         odir.dentry.inode.meta.touch_mtime();
         ndir.dentry.inode.meta.touch_mtime();
+        crate::access::named(self, crate::access::Kind::Rename, &ndir);
         Ok(())
     }
 
@@ -805,7 +897,7 @@ impl<'a> Ctx<'a> {
             return Ok(());
         }
         let m = &p.dentry.inode.meta;
-        // FS-13: X_OK of a regular file on a noexec mount (linux-6.6/fs/open.c:489), before the permission bits.
+        // FS-13: X_OK of a regular file on a noexec mount (linux-7.3.1/fs/open.c:494), before the permission bits.
         if mode & abi::X_OK != 0 && m.file_type() == uapi::S_IFREG && p.noexec() {
             return Err(EACCES);
         }
@@ -857,7 +949,7 @@ impl<'a> Ctx<'a> {
         if !p.dentry.is_dir() {
             return Err(ENOTDIR);
         }
-        p.dentry.inode.meta.permission(cred, MAY_EXEC)
+        p.dentry.inode.permission(cred, MAY_EXEC)
     }
 }
 
@@ -908,24 +1000,17 @@ pub fn read_dir_into(f: &OpenFile, max: usize, sink: impl FnOnce(&[u8]) -> Resul
                 }
                 pos = 2;
             }
-            while pos < synth::DYN_BASE {
-                let batch = d.children_from(pos - 1, 64);
-                if batch.is_empty() {
-                    // Static names done: computed ones (proc, sysfs) follow at their own positions.
-                    pos = synth::DYN_BASE;
-                    break;
+            if pos < synth::DYN_BASE {
+                // BIGDIR: the children's records straight from the directory, a batch per hold of its lock
+                // (`Dentry::list_into`). A child renamed or removed meanwhile is listed at its new place (if any).
+                let mut from = pos - 1;
+                let end = d.list_into(&mut from, &mut out, max)?;
+                pos = from + 1;
+                if !end {
+                    break 'fill;
                 }
-                for (seq, c) in batch {
-                    // Renamed or removed since the batch was taken: it is listed at its new place (if any).
-                    let Some(name) = c.name_at(seq) else {
-                        pos = seq + 2;
-                        continue;
-                    };
-                    if !push(&mut out, c.inode.meta.ino, seq + 2, abi::dtype(c.inode.meta.mode()), &name)? {
-                        break 'fill;
-                    }
-                    pos = seq + 2;
-                }
+                // Static names done: computed ones (proc, sysfs) follow at their own positions.
+                pos = synth::DYN_BASE;
             }
             if let Data::SynthDir(sd) = &d.inode.data {
                 loop {

@@ -65,15 +65,17 @@ pub mod madv {
     pub const COLLAPSE: u64 = 25;
     pub const HWPOISON: u64 = 100;
     pub const SOFT_OFFLINE: u64 = 101;
+    pub const GUARD_INSTALL: u64 = 102;
+    pub const GUARD_REMOVE: u64 = 103;
 
-    /// `madvise_behavior_valid` (linux-6.6/mm/madvise.c:1166) with CachyOS's config (KSM, THP and memory failure
+    /// `madvise_behavior_valid` (linux-7.3.1/mm/madvise.c:1526) with CachyOS's config (KSM, THP and memory failure
     /// built in).
     pub fn valid(b: u64) -> bool {
-        matches!(b, 0..=4 | 8..=25 | HWPOISON | SOFT_OFFLINE)
+        matches!(b, 0..=4 | 8..=25 | HWPOISON | SOFT_OFFLINE | GUARD_INSTALL | GUARD_REMOVE)
     }
 }
 
-/// The checks of `do_madvise` (linux-6.6/mm/madvise.c:1407) before the VMA walk: `Ok(None)` = nothing to do
+/// The checks of `do_madvise` (linux-7.3.1/mm/madvise.c:1993) before the VMA walk: `Ok(None)` = nothing to do
 /// (an empty range), else the page-aligned range. `behavior` is the `int` argument.
 pub fn plan_madvise(start: u64, len_in: u64, behavior: u64) -> Result<Option<(u64, u64)>, Errno> {
     if !madv::valid(behavior) || start & (PAGE - 1) != 0 {
@@ -291,7 +293,7 @@ impl Space {
         Ok(MmapPlan { addr: start, len, prot, replaces: overlaps, populate, shared, account: !shared && prot.write, nohugepage, growsdown })
     }
 
-    /// MM-13: `__thp_get_unmapped_area` (linux-6.6/mm/huge_memory.c:632, used for anonymous memory since 6.7):
+    /// MM-13: `__thp_get_unmapped_area` (linux-7.3.1/mm/huge_memory.c:1279, used for anonymous memory since 6.7):
     /// the top-down search asks for 2 MiB more and the mapping takes the first 2 MiB boundary of the gap found,
     /// or the gap's top when its start is aligned already. None: no such gap, the plain search decides.
     fn place_huge(&self, len: u64) -> Option<u64> {
@@ -351,7 +353,7 @@ impl Space {
         self.tree.overlapping(start, end).iter().filter(|v| v.flags.account).map(|v| (v.end.min(end) - v.start.max(start)) / PAGE).sum()
     }
 
-    /// Whether `mprotect` to `prot` charges VMA `v` (linux-6.6/mm/mprotect.c:633: a private mapping that becomes
+    /// Whether `mprotect` to `prot` charges VMA `v` (linux-7.3.1/mm/mprotect.c:811: a private mapping that becomes
     /// writable and was neither writable nor accounted before).
     pub fn protect_charges(v: &Vma, prot: Prot) -> bool {
         prot.write && !v.prot.write && !v.flags.account && v.private()
@@ -404,7 +406,7 @@ impl Space {
         let mut applied_end = self.tree.covered_from(start, end);
         let mut error = (applied_end < end).then_some(Errno::NoMem);
         // Linux's mprotect stops at the first VMA that may not get the new rights (VM_MAYWRITE of a shared
-        // mapping of a read-only fd, VM_MAYEXEC of a file on a noexec mount: EACCES, linux-6.6/mm/mprotect.c:789),
+        // mapping of a read-only fd, VM_MAYEXEC of a file on a noexec mount: EACCES, linux-7.3.1/mm/mprotect.c:973),
         // after changing the ones before it.
         let refused = |f: &FileRef| (prot & PROT_WRITE != 0 && !f.may_write) || (prot & PROT_EXEC != 0 && !f.may_exec);
         if prot & (PROT_WRITE | PROT_EXEC) != 0

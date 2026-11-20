@@ -1,6 +1,6 @@
 //! GX-7i: the SDMA stage on the host. The ktests' checks (`ktests_sdma`), Linux's start sequence against the
-//! 27.10. capture (the fixture tests/data/linux-780m-sdma-writes.txt, public; compared with the capture itself
-//! where plan/ is) and the register map against the generated tables.
+//! 27.10. capture (the fixture tests/data/linux-780m-sdma-writes.txt, public; compared with the capture itself,
+//! host/tests/gx/fixtures) and the register map against the generated tables.
 
 use super::regdiff::{capture, table_names};
 use crate::gpucore::fakechip::{self, StartAs};
@@ -85,10 +85,7 @@ fn fixture_text(linux: &[(u32, u32)], names: &super::regdiff::Names) -> String {
 
 #[test]
 fn sdma_fixture_is_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED sdma_fixture_is_the_capture: no capture (plan/ is not public); the fixture stands in");
-        return;
-    };
+    let t = capture();
     let want = fixture_text(&t.writes(false), &table_names());
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/linux-780m-sdma-writes.txt");
     let have = std::fs::read_to_string(&p).unwrap_or_default();
@@ -129,10 +126,9 @@ fn sdma_phase_against_linux() {
     assert!(rep2.matched == 26 && rep2.diffs.is_empty(), "{}", regdiff::render(core::slice::from_ref(&rep2)));
     let r = out.sdma.as_ref().unwrap();
     assert!(r.rewinds.len() == 1 && r.rewinds[0].found.0 != 0 && r.rewinds[0].after == (0, 0, 0), "{:x?}", r.rewinds);
-    if let Some(t) = capture() {
-        let rep = regdiff::diff_phase(sdma_phase(), &t.writes(false), &ours, &names, &[]);
-        assert!(rep.diffs.is_empty(), "{}", regdiff::render(core::slice::from_ref(&rep)));
-    }
+    let t = capture();
+    let rep = regdiff::diff_phase(sdma_phase(), &t.writes(false), &ours, &names, &[]);
+    assert!(rep.diffs.is_empty(), "{}", regdiff::render(core::slice::from_ref(&rep)));
 }
 
 /// The OTG CRC is a pass rule of `until=sdma` (and `gart`): a changed CRC fails the run even when every stage

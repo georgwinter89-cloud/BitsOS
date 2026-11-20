@@ -1,7 +1,8 @@
 //! DS-4 host tests of the desktop start's decisions (`desktop.rs`): waiting for init, one start's outcome and
 //! what follows it (the 3-failure fallback without QEMU).
 
-use crate::desktop::{ATTEMPTS, Hold, InitWait, Next, Outcome, TAKE_SCREEN_NS, WAIT_INIT_NS, hold_wait, init_wait, next, poll};
+use crate::desktop::{ATTEMPTS, Hold, InitWait, Next, Outcome, TAKE_SCREEN_NS, WAIT_INIT_NS, WAIT_UNTOLD_NS, hold_wait, init_wait, next, poll};
+use console::bootscreen::DesktopGpu;
 use console::bootsteps::Init;
 
 /// Runs the start loop's decisions over one outcome per attempt; returns what ended it and the attempts used.
@@ -34,21 +35,21 @@ fn a_spawn_error_counts_as_a_failed_start() {
 #[test]
 fn a_program_that_ended_after_taking_the_screen_is_not_restarted() {
     // Ended within the same poll as it took the screen (`took`, owner already reset by reclaim).
-    assert_eq!(poll(7, Some("crashed"), false, true, 50_000_000), Some(Outcome::TookThenEnded("crashed")));
+    assert_eq!(poll(7, Some("crashed"), false, true, 50_000_000, TAKE_SCREEN_NS), Some(Outcome::TookThenEnded("crashed")));
     // Ended while still the owner.
-    assert_eq!(poll(7, Some("ended"), true, true, 50_000_000), Some(Outcome::TookThenEnded("ended")));
+    assert_eq!(poll(7, Some("ended"), true, true, 50_000_000, TAKE_SCREEN_NS), Some(Outcome::TookThenEnded("ended")));
     assert_eq!(run(&[Outcome::TookThenEnded("crashed")]), (Next::Ended("crashed"), 1));
 }
 
 #[test]
 fn up_needs_the_program_itself_to_own_the_screen() {
     // Another program has KD_GRAPHICS (has_screen false for this pid): keep waiting, not "up".
-    assert_eq!(poll(7, None, false, false, 1_000_000), None);
-    assert_eq!(poll(7, None, true, true, 1_000_000), Some(Outcome::Up(7)));
+    assert_eq!(poll(7, None, false, false, 1_000_000, TAKE_SCREEN_NS), None);
+    assert_eq!(poll(7, None, true, true, 1_000_000, TAKE_SCREEN_NS), Some(Outcome::Up(7)));
     // Ended before it ever took the screen: a failed start.
-    assert_eq!(poll(7, Some("ended"), false, false, 1_000_000), Some(Outcome::Failed("ended")));
+    assert_eq!(poll(7, Some("ended"), false, false, 1_000_000, TAKE_SCREEN_NS), Some(Outcome::Failed("ended")));
     // Runs without the screen for too long: slow (the text console, the program keeps running).
-    assert_eq!(poll(7, None, false, false, TAKE_SCREEN_NS + 1), Some(Outcome::Slow(7)));
+    assert_eq!(poll(7, None, false, false, TAKE_SCREEN_NS + 1, TAKE_SCREEN_NS), Some(Outcome::Slow(7)));
     assert_eq!(run(&[Outcome::Slow(7)]), (Next::Slow(7), 1));
 }
 
@@ -63,12 +64,18 @@ fn init_off_given_up_or_late_means_no_desktop() {
     assert_eq!(init_wait(Init::Unknown, false, WAIT_INIT_NS + 1), InitWait::Timeout);
 }
 
-/// GX-8c: a driver's hold keeps the start back to its bound, no longer.
+/// GX-8c: the GPU's hold keeps the start back to its bound, no longer; without a GPU there is no desktop.
 #[test]
 fn hold() {
-    assert_eq!(hold_wait(None, 0), Hold::Free);
-    assert_eq!(hold_wait(None, u64::MAX), Hold::Free);
-    assert_eq!(hold_wait(Some(100), 0), Hold::Wait);
-    assert_eq!(hold_wait(Some(100), 100), Hold::Wait);
-    assert_eq!(hold_wait(Some(100), 101), Hold::Over);
+    assert_eq!(hold_wait(DesktopGpu::Up, 0, 0), Hold::Free);
+    assert_eq!(hold_wait(DesktopGpu::Up, u64::MAX, u64::MAX), Hold::Free);
+    assert_eq!(hold_wait(DesktopGpu::Held(100), 0, 0), Hold::Wait);
+    assert_eq!(hold_wait(DesktopGpu::Held(100), 100, 100), Hold::Wait);
+    assert_eq!(hold_wait(DesktopGpu::Held(100), 101, 101), Hold::Over);
+    // A failed bring-up, or a machine without a GPU: at once, whatever the time.
+    assert_eq!(hold_wait(DesktopGpu::None, 0, 0), Hold::NoGpu);
+    assert_eq!(hold_wait(DesktopGpu::None, u64::MAX, 0), Hold::NoGpu);
+    // Nothing said yet: a wait with its own bound.
+    assert_eq!(hold_wait(DesktopGpu::Untold, 5, WAIT_UNTOLD_NS), Hold::Wait);
+    assert_eq!(hold_wait(DesktopGpu::Untold, 5, WAIT_UNTOLD_NS + 1), Hold::Over);
 }

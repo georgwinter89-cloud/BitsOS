@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # BR-2: builds the tree that `cargo xtask image` puts into \BITSOS2\brave\ on the stick (manifest line
-# `tree brave host:/var/tmp/claude-v2/stage/brave`) from CachyOS's Brave (pacman brave-bin, /opt/brave-bin; read
+# `tree brave host:/var/tmp/claude-v2/stage/brave-w41`) from CachyOS's Brave (pacman brave-bin, /opt/brave-bin; read
 # only, nothing is downloaded):
 #   brave, *.pak, icudtl.dat, v8_context_snapshot.bin, libvulkan/libvk_swiftshader, MEIPreload/, ...
 #                      as installed, without: chrome-sandbox (setuid helper; FAT has no setuid, and Brave's
@@ -10,10 +10,19 @@
 #                      brave-browser (bitsos/brave replaces it), and every UI language but de, en-US, en-GB
 #                      (79 -> 3 MB; Chromium falls back to en-US)
 #   lib/               the libraries Chromium dlopens itself (BR-1/BR-2 strace): GTK 3 (ui/gtk: file dialogs, theme)
-#                      and NSS's soft token + freebl (loaded next to libnss3, by NSS). xtask adds everything they and
-#                      the programs link (ldd) beyond the initramfs set. Left out on purpose: libpulse (Chromium then
-#                      takes ALSA at once), mesa's dri_gbm/gallium/LLVM (only with a DRM render node; --disable-gpu),
-#                      libva, the pipewire ALSA plugin, GTK 4 (only probed with RTLD_NOLOAD)
+#                      and NSS's soft token + freebl (loaded next to libnss3, by NSS); BR-8 (the GPU process): glvnd's
+#                      libEGL.so.1 and libGLESv2.so.2 with Mesa's EGL vendor libEGL_mesa.so.0, libgbm.so.1 and its
+#                      backend gbm/dri_gbm.so, libva.so.2 and libva-drm.so.2 with Mesa's VA driver
+#                      dri/radeonsi_drv_video.so (a stand-in as in the Mesa tree: one DT_NEEDED on libgallium). xtask
+#                      adds everything they and the programs link (ldd) beyond the initramfs set (libgallium, libLLVM,
+#                      libdrm_amdgpu, ...). The host's Mesa is the Mesa tree's (both the installed pacman packages),
+#                      and the libraries run on the initramfs glibc like Brave: the Mesa tree's own lib/ (its glibc)
+#                      never goes onto Brave's LD_LIBRARY_PATH. Left out on purpose: libGL.so.1 (GLX: X11 only, Brave
+#                      draws through EGL on Wayland), libpulse (Chromium then takes ALSA at once), the pipewire ALSA
+#                      plugin, GTK 4 (only probed with RTLD_NOLOAD)
+#   share/glvnd/egl_vendor.d/50_mesa.json, share/drirc.d/, share/libdrm/amdgpu.ids
+#                      glvnd's vendor file, Mesa's driver defaults for radeonsi, libdrm_amdgpu's product names (the
+#                      launcher points __EGL_VENDOR_LIBRARY_FILENAMES, DRIRC_CONFIGDIR and AMDGPU_ASIC_ID_TABLE_PATHS here)
 #   fonts/             Noto Sans/Serif/Mono, Noto Color Emoji, Noto Sans CJK, Arabic, Hebrew, symbols, DejaVu
 #   etc/fonts/         fonts.conf (files/fonts.conf: V2 paths) and the package conf.d rules for these fonts
 #   fontcache/         fontconfig's cache for /boot/BITSOS2/brave/fonts, made by fc-cache against a staged root,
@@ -30,7 +39,8 @@
 #                      (found through XDG_DATA_DIRS)
 #   libexec/bwrap      files/bwrap: answers glycin as Bubblewrap does without user namespaces, so glycin runs its
 #                      loader without a sandbox (it fails every image when it cannot start bwrap at all); on V2 the
-#                      real /bin/bwrap (SX-3b) wins, so only a run without it uses this one (BR retires it, desk-C1)
+#                      real /bin/bwrap (SX-3b) wins, so only a run without it uses this one (BR retires it:
+#                      plan/notes/desk-offen.md, group G6)
 #   etc/gdk-pixbuf/loaders.cache  gdk-pixbuf's module list (GDK_PIXBUF_MODULE_FILE): no module beyond the built-in
 #                      glycin ones, so nothing outside the tree is read
 #   share/glib-2.0/schemas/  GTK 3's GSettings schemas (GTK aborts without org.gtk.Settings.FileChooser)
@@ -38,7 +48,7 @@
 # The stage is replaced as a whole (new dir, rename). Run it again after a Brave update (pacman -Syu).
 set -euo pipefail
 SRC=${BRAVE_SRC:-/opt/brave-bin}
-DEST=${BRAVE_STAGE:-/var/tmp/claude-v2/stage/brave}
+DEST=${BRAVE_STAGE:-/var/tmp/claude-v2/stage/brave-w41}
 V2=/boot/BITSOS2/brave
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 die() { echo "stage-v2: $*" >&2; exit 1; }
@@ -46,7 +56,7 @@ for f in brave resources.pak icudtl.dat v8_context_snapshot.bin locales/en-US.pa
   [ -e "$SRC/$f" ] || die "$SRC/$f is missing (pacman -S brave-bin)"
 done
 for t in fc-cache glib-compile-schemas update-mime-database gtk-encode-symbolic-svg rsvg-convert gtk-update-icon-cache \
-    pacman python3; do command -v $t >/dev/null || die "no $t on this host"; done
+    pacman python3 readelf ld; do command -v $t >/dev/null || die "no $t on this host"; done
 
 # Work dirs next to the stage (TMPD: the MIME database's and the schemas' sources), all gone at exit, also after die.
 NEW=$DEST.new ROOT=$DEST.root TMPD=$DEST.tmp
@@ -65,11 +75,35 @@ for l in de en-US en-GB; do cp "$SRC/locales/$l.pak" "$NEW/locales/"; done
 # Packages whose files are copied (for LICENSES/).
 PKGS=$(LC_ALL=C pacman -Qoq "$SRC/brave")
 
-mkdir "$NEW/lib"
-for so in libgtk-3.so.0 libsoftokn3.so libfreeblpriv3.so; do
+mkdir -p "$NEW/lib/gbm" "$NEW/lib/dri"
+for so in libgtk-3.so.0 libsoftokn3.so libfreeblpriv3.so libEGL.so.1 libEGL_mesa.so.0 libGLESv2.so.2 libgbm.so.1 \
+    gbm/dri_gbm.so libva.so.2 libva-drm.so.2; do
+  [ -e "/usr/lib/$so" ] || die "/usr/lib/$so is missing (pacman -S mesa libglvnd libva)"
   cp -L "/usr/lib/$so" "$NEW/lib/$so"
   PKGS="$PKGS $(pacman -Qoq "/usr/lib/$so")"
 done
+# BR-8: libva's radeonsi driver. Arch's /usr/lib/dri/radeonsi_drv_video.so is a link to libgallium, which FAT cannot
+# hold; as in the Mesa tree (user/ports/mesa/scripts/stage-v2.sh) the stand-in is an empty library whose one entry is
+# DT_NEEDED on libgallium's soname, so libva's dlsym finds __vaDriverInit there and Brave's GPU process shares the one
+# libgallium of Mesa's EGL (xtask adds it to lib/ as a need of libEGL_mesa.so.0).
+va=/usr/lib/dri/radeonsi_drv_video.so
+[ -L "$va" ] || die "$va is no longer a link to libgallium: copy it instead of the stand-in"
+gal=$(basename "$(readlink "$va")")
+case $gal in libgallium-*.so) ;; *) die "$va points to $gal, not to libgallium" ;; esac
+syms=$(readelf --dyn-syms -W "/usr/lib/$gal") || die "readelf fails on /usr/lib/$gal"
+grep -q ' __vaDriverInit_1_[0-9]*@@' <<<"$syms" || die "$gal exports no __vaDriverInit_1_*: Mesa built without VA-API"
+ld -shared --no-as-needed -z noexecstack -z relro -z now -soname radeonsi_drv_video.so \
+  -o "$NEW/lib/dri/radeonsi_drv_video.so" "/usr/lib/$gal" || die "the VA stand-in does not link"
+PKGS="$PKGS $(pacman -Qoq "/usr/lib/$gal")"
+mkdir -p "$NEW/share/glvnd/egl_vendor.d" "$NEW/share/drirc.d" "$NEW/share/libdrm"
+f=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+grep -q '"library_path" *: *"libEGL_mesa.so.0"' "$f" || die "$f does not name libEGL_mesa.so.0"
+cp "$f" "$NEW/share/glvnd/egl_vendor.d/"
+for c in 00-mesa-defaults 00-radeonsi-defaults; do
+  cp "/usr/share/drirc.d/$c.conf" "$NEW/share/drirc.d/" || die "/usr/share/drirc.d/$c.conf is missing"
+done
+cp /usr/share/libdrm/amdgpu.ids "$NEW/share/libdrm/" || die "/usr/share/libdrm/amdgpu.ids is missing (pacman -S libdrm)"
+PKGS="$PKGS $(pacman -Qoq "$f") $(pacman -Qoq /usr/share/libdrm/amdgpu.ids)"
 
 mkdir "$NEW/fonts"
 fonts="noto/NotoSans-Regular.ttf noto/NotoSans-Bold.ttf noto/NotoSans-Italic.ttf noto/NotoSans-BoldItalic.ttf
@@ -235,7 +269,8 @@ Brave $ver (pacman brave-bin from CachyOS, /opt/brave-bin), packaged for BitsOS 
 user/ports/brave-launcher/scripts/stage-v2.sh of the BitsOS V2 tree; started by \\BITSOS2\\bin\\brave.
   brave.txt   Brave's LICENSE (Brave and Chromium; brave://credits lists every third-party part)
   <package>/  the licence texts of the CachyOS package each other file comes from (fonts, GTK 3, NSS, fontconfig
-              rules, the icon themes, the MIME database, the glycin image loaders). The libraries xtask adds
+              rules, the icon themes, the MIME database, the glycin image loaders, Mesa, libglvnd, libva,
+              libdrm). The libraries xtask adds
               to lib/ have their texts in /usr/share/licenses of V2.
 TXT
 

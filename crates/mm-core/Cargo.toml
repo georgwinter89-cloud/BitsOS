@@ -10,5 +10,9 @@ ksync = { path = "../ksync" }
 bootinfo = { path = "../bootinfo" }
 klog = { path = "../klog" }
 
+[features]
+# Host test binaries only (dev-dependencies): a counting front for the system allocator.
+host-count = []
+
 [lints]
 workspace = true

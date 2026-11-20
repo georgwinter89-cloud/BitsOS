@@ -1,6 +1,7 @@
-//! MCP tools of bitscomp (WY-4), registered over MC-6's service socket (user/lib/mcpreg, plan/notes/mc-MC-6.md):
+//! MCP tools of bitscomp (WY-4), registered over MC-6's service socket (user/lib/mcpreg, plan/spec/net.md §11.3):
 //! `windows` (read: every window with id, title, app_id, pid, hung, workspace, tile) and `window_kill` (change:
-//! ends a window's program like "Programm beenden"). mcpreg's calls block, so they run on a thread of their own;
+//! ends a window's program like "Programm beenden") and `program_start` (starts a program of the library by its
+//! name, `mcp_start`). mcpreg's calls block, so they run on a thread of their own;
 //! each call is handed to the main loop through a calloop channel and answered from there in one turn. The thread
 //! waits for that answer at most `ANSWER_WAIT` (B4: neither side ever waits on the other without a bound). A call
 //! the thread has given up on is never carried out later: `Request::state` decides once who has it.
@@ -25,6 +26,11 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 pub enum Ask {
     Windows,
     Kill(u64),
+    /// Start the library's program of this name.
+    Start(String),
+    /// DB1: the desktop as a list (a window, or the focused one's elements), an action on one element.
+    UiList(Option<String>),
+    UiAct { element: String, action: String, text: Option<String> },
 }
 
 pub struct Request {
@@ -68,6 +74,18 @@ fn tools() -> Vec<Tool> {
             id,
             Safety::Change,
         ),
+        Tool::new(
+            "program_start",
+            "Starts a program on the desktop: one entry of the program library, by its name or id as the library lists it \
+             (for example \"terminal\" or \"Einstellungen\"). Not a command line: no options, no path. A name that fits \
+             several programs starts none and the answer lists them with their ids; a name that fits none lists what the \
+             library has.",
+            r#"{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":200,"description":"name or id of a program in the library"}},"required":["name"],"additionalProperties":false}"#,
+            // Runs a program: the class that always asks its owner first.
+            Safety::DeleteOverwrite,
+        ),
+        crate::ui_mcp::list_tool(),
+        crate::ui_mcp::act_tool(),
     ]
     .into_iter()
     .filter_map(Result::ok)
@@ -84,8 +102,23 @@ pub fn start(handle: &LoopHandle<'static, App>, socket: String) -> Result<(), St
                     eprintln!("bitscomp: MCP call dropped: its caller stopped waiting before the main loop came to it");
                     return;
                 }
+                // DB3: the list waits for a foreign program's provider on a thread, acting on it too.
+                if let Ask::UiList(w) = &req.ask {
+                    let (full, answer, w) = (app.ui_full_of(w.as_deref()), req.answer.clone(), w.clone());
+                    if app.ui_fetch_then(&full, move || crate::ui_fetch::Then::McpList(w, answer)) {
+                        return;
+                    }
+                }
+                let act = matches!(req.ask, Ask::UiAct { .. });
+                if act {
+                    app.ui_fetch.pending = Some(crate::ui_fetch::To::Mcp(req.answer.clone()));
+                }
+                let reply = app.mcp_answer(req.ask);
+                if act && app.ui_fetch.pending.take().is_none() {
+                    return;
+                }
                 // try_send into a channel of one that only this answer uses: never blocks.
-                let _ = req.answer.try_send(app.mcp_answer(req.ask));
+                let _ = req.answer.try_send(reply);
             }
         })
         .map_err(|e| e.to_string())?;
@@ -149,7 +182,8 @@ fn session(socket: &str, tx: &Sender<Request>, note: &mut impl FnMut(String)) ->
                 return Ok(true);
             }
         };
-        let reply = match ask_of(&call.name, &call.arguments) {
+        // DB1: the list and acting on it only under Georg's keyboard release (MC-10), asked of the kernel's mark.
+        let reply = match crate::ui_mcp::refused(&call.name, call.full_access).map_or_else(|| ask_of(&call.name, &call.arguments), Err) {
             Err(r) => r,
             Ok(ask) => {
                 let (atx, arx) = sync_channel(1);
@@ -157,7 +191,9 @@ fn session(socket: &str, tx: &Sender<Request>, note: &mut impl FnMut(String)) ->
                 if tx.send(Request { ask, answer: atx, state: state.clone() }).is_err() {
                     return Err(Stop);
                 }
-                let wait = if call.timeout_ms > 0 { ANSWER_WAIT.min(Duration::from_millis(call.timeout_ms)) } else { ANSWER_WAIT };
+                // DB3: the list and acting on it may wait for a foreign program's provider (`ui_fetch::WAIT`).
+                let most = if matches!(call.name.as_str(), "ui_list" | "ui_act") { ANSWER_WAIT + crate::ui_fetch::WAIT } else { ANSWER_WAIT };
+                let wait = if call.timeout_ms > 0 { most.min(Duration::from_millis(call.timeout_ms)) } else { most };
                 match arx.recv_timeout(wait) {
                     Ok(r) => r,
                     Err(_) if abandon(&state) => Reply::error("bitscomp did not answer in time (nothing was done)"),
@@ -180,6 +216,12 @@ fn ask_of(name: &str, args: &Json) -> Result<Ask, Reply> {
             Some(id) if id > 0 => Ok(Ask::Kill(id)),
             _ => Err(Reply::bad_argument("id must be a window id (a positive integer from windows)")),
         },
+        "program_start" => match args.get("name").and_then(Json::as_str).map(crate::mcp_start::name_of) {
+            Some(Ok(name)) => Ok(Ask::Start(name.to_string())),
+            Some(Err(why)) => Err(Reply::bad_argument(why)),
+            None => Err(Reply::bad_argument("name must be the name or id of a program in the library (one line of text)")),
+        },
+        "ui_list" | "ui_act" => crate::ui_mcp::ask_of(name, args),
         other => Err(Reply::error(format!("bitscomp has no tool {other}"))),
     }
 }
@@ -187,6 +229,9 @@ fn ask_of(name: &str, args: &Json) -> Result<Ask, Reply> {
 impl App {
     fn mcp_answer(&mut self, ask: Ask) -> Reply {
         match ask {
+            Ask::Start(name) => self.mcp_start(&name),
+            Ask::UiList(w) => self.ui_mcp_list(w),
+            Ask::UiAct { element, action, text } => self.ui_mcp_act(&element, &action, text.as_deref()),
             Ask::Windows => {
                 let mut list = String::new();
                 // The shown workspace's windows, then those of the parked ones (not visible).
@@ -269,8 +314,9 @@ mod tests {
     #[test]
     fn tools_are_valid_and_named_as_planned() {
         let t = tools();
-        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["windows", "window_kill"]);
-        assert_eq!((t[0].safety, t[1].safety), (Safety::Read, Safety::Change));
+        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["windows", "window_kill", "program_start", "ui_list", "ui_act"]);
+        assert_eq!((t[3].safety, t[4].safety), (Safety::Read, Safety::Change));
+        assert_eq!((t[0].safety, t[1].safety, t[2].safety), (Safety::Read, Safety::Change, Safety::DeleteOverwrite));
     }
 
     #[test]
@@ -281,6 +327,11 @@ mod tests {
         assert!(matches!(ask_of("window_kill", &args(r#"{}"#)), Err(Reply::BadArgument(_))));
         assert!(matches!(ask_of("windows", &args(r#"{}"#)), Ok(Ask::Windows)));
         assert!(matches!(ask_of("nope", &args(r#"{}"#)), Err(Reply::Error(_))));
+        assert!(matches!(ask_of("program_start", &args(r#"{"name":" Terminal "}"#)), Ok(Ask::Start(n)) if n == "Terminal"));
+        let long = format!(r#"{{"name":"{}"}}"#, "x".repeat(201));
+        for bad in [r#"{}"#, r#"{"name":""}"#, r#"{"name":"  "}"#, r#"{"name":7}"#, r#"{"name":["foot"]}"#, r#"{"name":"a\nb"}"#, long.as_str()] {
+            assert!(matches!(ask_of("program_start", &args(bad)), Err(Reply::BadArgument(_))), "{bad}");
+        }
         for bad in [r#"{"id":-1}"#, r#"{"id":"3"}"#, r#"{"id":1.5}"#, r#"{"id":18446744073709551616}"#, r#"{"id":null}"#, r#"{"id":[3]}"#] {
             assert!(matches!(ask_of("window_kill", &args(bad)), Err(Reply::BadArgument(_))), "{bad}");
         }

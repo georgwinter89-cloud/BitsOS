@@ -1,5 +1,5 @@
 //! GX-7a: a fake PSP 13.0.4 for the bring-up in this wave (host tests and the QEMU ktests; nothing touches the
-//! real GPU). It models what linux-6.6 amdgpu_psp.c and psp_v13_0_4.c expect from the device: the mailbox
+//! real GPU). It models what linux-7.3.1 amdgpu_psp.c and psp_v13_0_4.c expect from the device: the mailbox
 //! (C2PMSG_64 response bit and status, ring address/size in 69/70/71, the KM write pointer in 67, the sOS sign
 //! of life in 81), the KM ring read from GPU memory frame by frame, command buffers with their responses and
 //! fence write-back, LOAD_TOC answering a TMR size, SETUP_TMR, LOAD_IP_FW (copies are checked by a hash), RLC
@@ -200,6 +200,8 @@ pub struct FakeGpu {
     pub mes: super::mesfake::MesFake,
     /// GX-7n: the IH ring (`ihfake`).
     pub ih: super::ihfake::IhFake,
+    /// GX-8v: VCN 0 (`vcnfake`): gated until PowerUpVcn, booted by the PSP's SRAM list, its unified ring.
+    pub vcn: super::vcnfake::VcnFake,
 }
 
 const PAGE: u64 = 4096;
@@ -274,6 +276,7 @@ impl FakeGpu {
             gfx: super::gfxfake::GfxFake::new(d),
             mes: super::mesfake::MesFake::new(d),
             ih: super::ihfake::IhFake::new(d),
+            vcn: super::vcnfake::VcnFake::new(d),
         };
         f.gfx.cold_gc(&mut f.gc);
         crate::gpucore::fakechip::cold_image(&mut f, d);
@@ -335,10 +338,68 @@ impl FakeGpu {
             gpu_writes: &mut writes,
             hostile,
             cid: super::sdmafake::CID_SDMA0,
+            hub: crate::ipmod::gmc11::Hub::Gfx,
         };
         self.sdma.kick(&mut bus);
         self.sdma.gpu_writes = writes;
         self.ih_collect();
+    }
+
+    /// GX-8v: VCN's VCPU runs its ring through MMHUB; each TRAP becomes an IH entry (client VCN, the unified ring's
+    /// source).
+    pub fn vcn_kick(&mut self) {
+        let sys = self.sdma.sys.clone();
+        let host = self.sdma.host.clone();
+        let mut writes = Vec::new();
+        let traps0 = self.vcn.traps;
+        let mut bus = super::sdmafake::FakeBus {
+            hubs: &mut self.hubs,
+            mem: &mut self.mem,
+            sys: &sys,
+            host: host.as_deref(),
+            fb_mc: self.fb_mc,
+            fb_phys: self.fb_phys,
+            fb_size: self.fb_size,
+            gpu_writes: &mut writes,
+            hostile: super::sdmafake::SdmaHostile::None,
+            cid: super::vcnfake::CID_VCN,
+            hub: crate::ipmod::gmc11::Hub::Mm,
+        };
+        self.vcn.kick(&mut bus, &mut || {});
+        self.vcn.gpu_writes.extend(writes);
+        for _ in traps0..self.vcn.traps {
+            let iv = crate::ipmod::ih6::Iv { client: crate::ipmod::vcn4::IH_CLIENT_VCN as u8, src: crate::ipmod::vcn4::IH_SRC_ENC_GENERAL_PURPOSE as u8, ring_id: 0, vmid: 0, vmid_src: 1, timestamp: self.now, timestamp_src: 0, pasid: 0, node_id: 0, data: [0; 4] };
+            let _ = self.ih_raise(&iv);
+        }
+    }
+
+    /// GX-8v: whether the VCPU would run its ring now: everything the start must give it is there (no packet runs).
+    pub fn vcn_booted(&mut self) -> bool {
+        let sys = self.sdma.sys.clone();
+        let host = self.sdma.host.clone();
+        let mut writes = Vec::new();
+        let mut bus = super::sdmafake::FakeBus {
+            hubs: &mut self.hubs,
+            mem: &mut self.mem,
+            sys: &sys,
+            host: host.as_deref(),
+            fb_mc: self.fb_mc,
+            fb_phys: self.fb_phys,
+            fb_size: self.fb_size,
+            gpu_writes: &mut writes,
+            hostile: super::sdmafake::SdmaHostile::None,
+            cid: super::vcnfake::CID_VCN,
+            hub: crate::ipmod::gmc11::Hub::Mm,
+        };
+        self.vcn.booted(&mut bus)
+    }
+
+    /// GX-8v: NBIO routes VCN 0's doorbell: the aperture on and GDC0_BIF_VCN0_DOORBELL_RANGE naming 0x310, size 8.
+    fn vcn_routed(&self) -> bool {
+        let Some(n) = self.vcn.a.and_then(|a| a.nbio) else { return false };
+        let aper = self.regs.get(&n.aper_en).is_some_and(|v| v & 1 != 0);
+        let want = crate::ipmod::vcn4::doorbell_range(0, crate::ipmod::vcn4::DOORBELL_RANGE_START_DW, crate::ipmod::vcn4::DOORBELL_RANGE_SIZE);
+        aper && self.sdma.port.get(&n.range).is_some_and(|&v| v & 0x001f_0ffc == want)
     }
 
     /// GX-7j: the CP runs ring 0 on this fake's memory (GFXHUB VMID 0) and GC's registers.
@@ -358,6 +419,7 @@ impl FakeGpu {
             gpu_writes: &mut writes,
             hostile: super::sdmafake::SdmaHostile::None,
             cid: super::gfxfake::CID_CPG,
+            hub: crate::ipmod::gmc11::Hub::Gfx,
         };
         let mut bus = super::gfxfake::GfxBus { mem, gc: &mut self.gc, hostile };
         self.gfx.kick(&mut bus);
@@ -394,6 +456,7 @@ impl FakeGpu {
             gpu_writes: &mut writes,
             hostile: super::sdmafake::SdmaHostile::None,
             cid,
+            hub: crate::ipmod::gmc11::Hub::Gfx,
         };
         let mut bus = super::gfxfake::GfxBus { mem, gc: &mut self.gc, hostile: super::gfxfake::GfxHostile::None };
         self.mes.kick(&mut bus, what, value, gfx_runs, mec_runs);
@@ -632,6 +695,7 @@ impl FakeGpu {
 
     fn tick(&mut self) {
         self.smu.tick(self.now);
+        self.vcn.power(self.smu.vcn_on);
         // GX-9b: PMFW writes its tables itself: no CPU store for the watchers to judge.
         for (mc, bytes) in core::mem::take(&mut self.smu.table_writes) {
             self.poke(mc, &bytes);
@@ -762,8 +826,17 @@ impl FakeGpu {
                     status = ST_BAD_PARAM;
                 }
             }
+            // GX-8v: VCN's SRAM list goes to the VCPU, not into the TMR (amdgpu_vcn_psp_update_sram).
+            cmd::LOAD_IP_FW if w(self, 3) == crate::ipmod::vcn4::FW_TYPE_VCN0_RAM => {
+                let (fmc, size) = (q(self, 0), w(self, 2));
+                let mut b = vec![0u8; size as usize];
+                status = if self.tmr.is_none() || size == 0 || !self.peek(fmc, &mut b) { ST_BAD_FW } else { self.vcn.load_sram(&b) };
+            }
             cmd::LOAD_IP_FW => {
                 let (fmc, size, ty) = (q(self, 0), w(self, 2), w(self, 3));
+                if ty == UcodeId::Vcn.fw_type() {
+                    self.vcn.fw_loaded = true;
+                }
                 match self.tmr {
                     None => status = ST_NO_TMR,
                     Some((tmc, tsize)) if fmc % PAGE == 0 && size != 0 && ty != 0 && ty < 98 => {
@@ -820,6 +893,7 @@ impl Hw for FakeGpu {
             Hostile::WptrKept(v) if byte == a.c2pmsg_67 && self.wptr_writes == 0 => v,
             _ if byte == a.c2pmsg_67 => self.wptr,
             _ if self.ih.owns_ptr(byte) => self.ih.read_ptr(byte),
+            _ if self.vcn.owns(byte) => self.vcn.read(byte, self.smu.vcn_on),
             // SDMA0 lives in GC: gated with it.
             _ if self.sdma.owns_gc(byte) && self.gc.power != super::gcfake::Power::On => self.gc.read(byte).unwrap_or(u32::MAX),
             _ if self.sdma.owns_gc(byte) || self.sdma.owns_port(byte) => self.sdma.read(byte),
@@ -892,6 +966,10 @@ impl Hw for FakeGpu {
                 if cntl & crate::ipmod::ih6::f::RPTR_REARM != 0 && cntl & crate::ipmod::ih6::f::ENABLE_INTR != 0 {
                     self.ih.send();
                 }
+            }
+        } else if self.vcn.owns(byte) {
+            if self.vcn.write(byte, value, self.smu.vcn_on) {
+                self.vcn_kick();
             }
         } else if self.smu.write(byte, value, self.now) {
             // PMFW takes the message now: its effect on GC starts now, its answer comes later.
@@ -1015,6 +1093,20 @@ impl Hw for FakeGpu {
         true
     }
 
+    fn doorbell_write32(&mut self, index_dw: u32, value: u32) -> bool {
+        if self.refuse_doorbells > 0 {
+            self.refuse_doorbells -= 1;
+            return false;
+        }
+        if index_dw == crate::ipmod::vcn4::DOORBELL_DW && self.smu.vcn_on {
+            let routed = self.vcn_routed();
+            if self.vcn.doorbell(value, routed) {
+                self.vcn_kick();
+            }
+        }
+        true
+    }
+
     fn delay_us(&mut self, us: u64) {
         self.now = self.now.saturating_add(us);
         self.tick();
@@ -1131,7 +1223,7 @@ impl FwSource for MapSource {
 // ---- the whole sequence against the fake (host tests and ktests) ----
 
 /// The microcodes the 780M loads, in Linux's order, as BitsOS runs it (`ListOpts::PSP13_0_4`: no MEC jump
-/// table, no MES KIQ, no DMCUB, GX-7d: no VCN), the same for the synthetic and the real files.
+/// table, no DMCUB; MES's KIQ pipe, GX-7k; VCN's, GX-8v), the same for the synthetic and the real files.
 pub const EXPECT_780M: &[UcodeId] = &[
     UcodeId::SdmaTh0,
     UcodeId::SdmaTh1,
@@ -1150,6 +1242,7 @@ pub const EXPECT_780M: &[UcodeId] = &[
     UcodeId::RlcDram,
     UcodeId::RlcP,
     UcodeId::RlcG,
+    UcodeId::Vcn,
 ];
 
 #[derive(Debug)]

@@ -344,7 +344,7 @@ fn run_job(job: &Job) -> Option<Job> {
             break;
         };
         let mut note = Note { inner: &inner, done: &job.done, range: None };
-        let end = {
+        let (end, mark) = {
             let mut g = inner.lock();
             if g.epoch != job.epoch {
                 stop = Some("truncated");
@@ -363,10 +363,11 @@ fn run_job(job: &Job) -> Option<Job> {
                 end += 1;
             }
             // Noted only if the list can grow; without the note a reader may read the same pages.
-            if g.note_reading((idx, end, bg)) {
+            let noted = g.note_reading((idx, end, bg));
+            if noted {
                 note.range = Some((idx, end, bg));
             }
-            end
+            (end, g.direct.mark(noted, &inner))
         };
         let mut pages = Vec::new();
         if pages.try_reserve_exact((end - idx) as usize).is_err() {
@@ -390,7 +391,8 @@ fn run_job(job: &Job) -> Option<Job> {
             break;
         }
         let mut g = inner.lock();
-        if g.epoch != job.epoch {
+        // FS-W2: also what a write beside the cache made old while it was read (`cache_around`).
+        if g.epoch != job.epoch || !g.direct.fresh(&mark, idx, end) {
             stop = Some("truncated");
             break;
         }

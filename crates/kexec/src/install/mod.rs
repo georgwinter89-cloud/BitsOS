@@ -11,24 +11,40 @@
 //!
 //! The confirmation (`confirm`): a kernel bitsboot started as the one try of a new generation (`NEWEST_TRY`,
 //! started by the firmware, not by a Reload) writes `OK` and clears `TRY`/`NEW` once MCP has answered requests
-//! over 2 minutes (CONFIG `boot_confirm_s=`).
+//! over 2 minutes (CONFIG `boot_confirm_s=`), or the desktop proved itself, or Georg said "Ja" at the machine
+//! (VB-1, `confirm_ask`).
 //!
 //! Every stick operation of this module runs under one lock (`kexec.install`), so an install and the
 //! confirmation never interleave.
 
 pub mod check;
 pub mod confirm;
+pub mod parts;
+pub(crate) mod parts_boot;
+pub mod parts_rules;
+pub mod confirm_ask;
 pub mod plan;
 pub mod system;
 pub mod system_stick;
 pub mod system_tool;
 mod tool;
+pub mod update_node;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod system_tests;
+#[cfg(test)]
+mod update_tests;
+#[cfg(test)]
+mod parts_tests;
+#[cfg(test)]
+mod confirm_ask_tests;
 mod system_ktests;
+mod update_ktests;
+mod parts_ktests;
+mod parts_gc_ktests;
+mod parts_node_ktests;
 mod ktests;
 
 use alloc::format;
@@ -55,6 +71,10 @@ pub trait Stick {
     fn config(&self) -> Result<Option<Vec<u8>>, i64>;
     /// Replaces `\BITSOS2\CONFIG.TXT` (crash-safe: a sibling, then renamed over it), durable.
     fn write_config(&self, data: &[u8]) -> Result<(), i64>;
+    /// UPD-4: removes the parts no slot names any more (after pruning); the bytes freed.
+    fn gc_parts(&self) -> Result<u64, String> {
+        Ok(0)
+    }
 }
 
 /// The lock every stick operation of `install`/`confirm` holds (sleeping; an install takes seconds).
@@ -147,6 +167,9 @@ impl Stick for FatStick<'_> {
         c.rename(None, temp.as_bytes(), None, path.as_bytes(), 0)?;
         self.0.vol.sync(true)
     }
+    fn gc_parts(&self) -> Result<u64, String> {
+        parts::gc(self.0, &[])
+    }
 }
 
 /// What the caller asked besides the bundle.
@@ -186,6 +209,8 @@ pub struct Report {
     /// What bitsboot starts at the next boot (after this install), as `bitsboot_pure::gens::choose` says.
     pub next_boot: String,
     pub warnings: Vec<String>,
+    /// UPDATE: the bundle's version number (None: a development build; the slot then got the old rule's number).
+    pub version: Option<u32>,
 }
 
 /// Rounded up to whole clusters, plus one cluster for the folder's directory.
@@ -208,9 +233,19 @@ fn stick_err(what: &str, e: i64) -> String {
 
 /// Checks the bundle and installs it as a new generation on `st` (see the module text). The caller holds `LOCK`.
 pub fn install_on(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&[u8]>, o: &Opts) -> Result<Report, InstallError> {
+    install_with(st, kernel, initrd, config, None, o)
+}
+
+/// `install_on` with the new slot's `FILES` (UPD-4: the parts it runs with, sealed in STORE already), written
+/// first into its folder: a cut later leaves a slot whose KERNEL bitsboot refuses, never a slot that would run
+/// without its parts.
+pub fn install_with(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&[u8]>, files: Option<&[u8]>, o: &Opts) -> Result<Report, InstallError> {
     let refused = InstallError::Refused;
     let kf = check::kernel(kernel).map_err(refused)?;
+    // GP-GUARD: no kernel older than the disk guard becomes a generation where the internal disks are off limits.
+    check::disk_guard(kernel, block::policy::internal_disks_off()).map_err(refused)?;
     let inf = check::initrd(initrd).map_err(refused)?;
+    let version = check::bundle_version(&kf, &inf).map_err(refused)?;
     let gens = st.generations().map_err(|e| refused(stick_err("listing \\BITSOS2\\SYS", e)))?;
     let pin = st.pin().map_err(|e| refused(stick_err("reading \\BITSOS2\\SYS\\PIN", e)))?;
     let live = st.config().map_err(|e| refused(stick_err("reading \\BITSOS2\\CONFIG.TXT", e)))?;
@@ -229,13 +264,13 @@ pub fn install_on(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&
             None
         }
     };
-    let mut p = plan::install(&gens, pin, keep.unwrap_or(1), o.unpin, o.allow_no_fallback).map_err(|e| refused(e.describe()))?;
+    let mut p = plan::install_versioned(&gens, pin, keep.unwrap_or(1), o.unpin, o.allow_no_fallback, version).map_err(|e| refused(e.describe()))?;
     if keep.is_none() {
         p.prune.clear();
         p.freed = gens.iter().filter(|g| Some(g.n) == p.replaced).map(|g| g.bytes).sum();
     }
     let (cluster, free) = st.space().map_err(|e| refused(stick_err("reading the stick's free space", e)))?;
-    let need = on_stick(kf.bytes, cluster) + on_stick(inf.bytes, cluster) + 4 * cluster.max(512);
+    let need = on_stick(kf.bytes, cluster) + on_stick(inf.bytes, cluster) + on_stick(files.map_or(0, |f| f.len() as u64), cluster) + 4 * cluster.max(512);
     if free.saturating_add(p.freed) < need {
         return Err(refused(format!(
             "the stick has {} KiB free (+{} KiB from the generations this install removes) and the bundle needs {} KiB: lower sys_keep or remove files below \\BITSOS2\\",
@@ -249,7 +284,13 @@ pub fn install_on(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&
             "\\BITSOS2\\SYS\\PIN names generation {q}: bitsboot keeps starting it, not the new generation, until the pin goes (unpin=true)"
         ));
     }
-    let mut r = Report { plan: p.clone(), kernel: Some(kf.clone()), initrd: Some(inf.clone()), sys_keep: keep, warnings, ..Report::default() };
+    if version.is_none() && gens.iter().any(|g| g.n >= FIRST_VERSION) {
+        warnings.push(format!(
+            "this bundle carries no version number (a development build): it takes slot {}, so the desk's next version must be numbered above it",
+            p.number
+        ));
+    }
+    let mut r = Report { plan: p.clone(), kernel: Some(kf.clone()), initrd: Some(inf.clone()), sys_keep: keep, warnings, version, ..Report::default() };
     if o.dry_run {
         r.next_boot = String::from("unchanged (dry run)");
         return Ok(r);
@@ -273,6 +314,13 @@ pub fn install_on(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&
             .map_err(|e| failed(stick_err(&format!("pruning generation {g}"), e)))?;
         klog::event!(Info, "kexec", "install.pruned", generation = g, sys_keep = keep.unwrap_or(0));
     }
+    if !p.prune.is_empty() || p.replaced.is_some() {
+        match st.gc_parts() {
+            Ok(b) if b > 0 => klog::event!(Info, "kexec", "install.parts_removed", bytes = b),
+            Ok(_) => {}
+            Err(t) => r.warnings.push(format!("parts no slot uses stayed on the medium: {t}")),
+        }
+    }
     let n = p.number;
     st.create_generation(n).map_err(|e| failed(stick_err(&format!("making \\BITSOS2\\SYS\\{n}"), e)))?;
     // Anything wrong from here removes the new folder again (an unmarked complete folder would get a try).
@@ -286,10 +334,15 @@ pub fn install_on(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&
     };
     // INITRD first: a cut while KERNEL is written leaves a KERNEL whose segments run past its end, which bitsboot
     // refuses at once (fallback without a try).
-    for (name, data) in [("INITRD", initrd), ("KERNEL", kernel)] {
+    let mut order: Vec<(&str, &[u8])> = Vec::new();
+    if let Some(f) = files {
+        order.push((parts_rules::FILES, f));
+    }
+    order.extend([("INITRD", initrd), ("KERNEL", kernel)]);
+    for &(name, data) in &order {
         st.write_file(n, name, data).map_err(|e| undo(stick_err(&format!("writing {name}"), e)))?;
     }
-    for (name, data) in [("INITRD", initrd), ("KERNEL", kernel)] {
+    for &(name, data) in &order {
         let differs = verify(st, n, name, data).map_err(|e| undo(stick_err(&format!("reading {name} back"), e)))?;
         if let Some(t) = differs {
             return Err(undo(format!("{name} read back differs from what was written: {t}")));
@@ -310,10 +363,13 @@ pub fn install_on(st: &dyn Stick, kernel: &[u8], initrd: &[u8], config: Option<&
         klog::event!(Info, "kexec", "install.config_written", bytes = c.len());
     }
     r.next_boot = next_boot_text(st);
-    klog::event!(Info, "kexec", "install.done", generation = n, replaced = p.replaced.unwrap_or(0), pruned = p.prune.len(),
+    klog::event!(Info, "kexec", "install.done", generation = n, version = version.unwrap_or(0), replaced = p.replaced.unwrap_or(0), pruned = p.prune.len(),
         fallback = p.fallback.unwrap_or(0), next_boot = r.next_boot.as_str());
     Ok(r)
 }
+
+/// UPDATE: the first number the desk gives a version (above every generation in use on 15.11.2026: Mini-PC 163).
+pub const FIRST_VERSION: u32 = 164;
 
 /// Bytes of one read-back piece.
 const VERIFY_CHUNK: usize = 1 << 20;
@@ -401,6 +457,11 @@ pub fn confirm_on(st: &dyn Stick, n: u32) -> Result<Confirmed, String> {
         if st.set_marker(g, Marker::Ok, false).and_then(|()| st.remove_generation(g)).is_ok() {
             pruned.push(g);
         }
+    }
+    if !pruned.is_empty()
+        && let Err(t) = st.gc_parts()
+    {
+        klog::event!(Warn, "kexec", "boot.parts_left", error = t.as_str(); "the next install removes them");
     }
     Ok(if now { Confirmed::Now { pruned } } else { Confirmed::Already { pruned } })
 }

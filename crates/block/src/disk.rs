@@ -45,7 +45,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoBuf, IoPriority};
 use devmodel::DevError;
-use ksync::{Completion, SpinLock, WaitQueue};
+use ksync::{Completion, Spare, SpinLock, WaitQueue};
 
 pub use crate::frames::PageSeg;
 
@@ -70,7 +70,7 @@ klog::counter!(SPLIT_RETRIES, "block.merge_retries");
 // BL-2: byte reads that went straight into the caller's buffer; groups of reads given to a device in one call.
 vfs::pcpu_counter!(DIRECT_READS, "block.direct_reads", vfs::pcpu::EVENTS_BATCH);
 klog::counter!(GROUPS, "block.read_groups");
-// BL-0: bytes copied per copy site of the read path (plan/notes/bl-BL-0.md), per CPU.
+// BL-0: bytes copied per copy site of the read path (plan/guides/read-path-measurements.md), per CPU.
 vfs::pcpu_counter!(COPY_READVEC_ZERO, "block.copy_bytes.readvec_zero", vfs::pcpu::BYTES_BATCH);
 vfs::pcpu_counter!(COPY_DISK, "block.copy_bytes.disk_copy", vfs::pcpu::BYTES_BATCH);
 vfs::pcpu_counter!(COPY_BOUNCE, "block.copy_bytes.bounce", vfs::pcpu::BYTES_BATCH);
@@ -189,6 +189,8 @@ struct Req {
     /// Its waiter sleeps on `kick` (a slot that comes free wakes such a one, BL-2).
     sleeping: AtomicBool,
     kick: WaitQueue,
+    /// SYS-K: when it was submitted (ns; Linux's `rq->start_time_ns` for the diskstats times).
+    start_ns: u64,
 }
 
 impl Req {
@@ -267,6 +269,8 @@ struct Stats {
     write_bytes: AtomicU64,
     busy_ns: AtomicU64,
     copied: AtomicU64,
+    /// SYS-K: per-direction diskstats numbers.
+    io: crate::iostat::IoCounters,
 }
 
 pub struct Disk {
@@ -416,6 +420,10 @@ impl Disk {
     pub fn dev_info(&self) -> BlockInfo {
         self.dev.info()
     }
+    /// SYS-K: the device says its medium can be taken out.
+    pub fn removable(&self) -> bool {
+        self.dev.removable()
+    }
     /// BL-4 CR 4: the device's largest request in 4 KiB pages (Linux `bdi->io_pages` from max_sectors,
     /// linux-7/block/blk-settings.c); NVMe: MDTS. A stacked disk reports its lowest device's.
     pub fn request_pages(&self) -> u64 {
@@ -464,6 +472,27 @@ impl Disk {
             inflight_max: s.inflight_max.load(Ordering::Relaxed),
             copied_bytes: s.copied.load(Ordering::Relaxed),
         }
+    }
+
+    /// SYS-K: what the submitting thread made the storage move (`/proc/<pid>/io` read_bytes/write_bytes), counted
+    /// at the bottom disk only (a partition hands its requests down on the same thread). A write is counted when
+    /// it goes to the disk, by whoever sends it: Linux counts it when the page is dirtied, so the write-back
+    /// thread's writes are nobody's here.
+    fn account_caller(&self, kind: Kind, blocks: u64) {
+        if self.passthrough {
+            return;
+        }
+        let bytes = blocks * self.block_size as u64;
+        match kind {
+            Kind::Read => sched::ioac::storage_read(bytes),
+            Kind::Write { .. } => sched::ioac::storage_write(bytes),
+            Kind::Discard | Kind::Flush => {}
+        }
+    }
+
+    /// SYS-K: the diskstats numbers per direction.
+    pub fn io_stat(&self) -> crate::iostat::IoStat {
+        self.stats.io.snapshot()
     }
 
     /// The partition-table look (copy).
@@ -741,28 +770,47 @@ impl Disk {
             queued: AtomicBool::new(false),
             sleeping: AtomicBool::new(false),
             kick: WaitQueue::new(),
+            start_ns: now(),
         });
-        {
+        // The lists grow with `block.queue` dropped (`ksync::Spare`): under the spin lock the heap can neither
+        // reclaim nor wait (10 KiB on the preloader's reads, Mini-PC 12.11.2026). Every check is made again after
+        // the relock. While the lock is dropped the request is in no list and its submit has not returned, so it
+        // has no order to keep yet: it enters by its id (`Elevator::push`) and waits behind what the device has
+        // that it overlaps (`held_by`), as a submit that took its id just before another's.
+        let entry = Entry { id, kind, lba, blocks, prio, at_ns: now() };
+        let (mut held, mut reqs, mut elev) = (Spare::new(), Spare::new(), Spare::new());
+        loop {
             let mut q = self.q.lock();
             if q.stopped {
                 return Err(BlockError::Gone);
             }
-            let entry = Entry { id, kind, lba, blocks, prio, at_ns: now() };
-            if q.closed {
-                if q.held.try_reserve(1).is_err() {
-                    return Err(BlockError::NoMemory);
+            let grow = if q.closed {
+                if !held.fits(&mut q.held, 1) {
+                    drop(q);
+                    held.grow()
+                } else {
+                    q.held.push((entry, req.clone()));
+                    break;
                 }
-                q.held.push((entry, req.clone()));
+            } else if !reqs.fits(&mut q.reqs, 1) {
+                drop(q);
+                reqs.grow()
+            } else if !q.elev.fits(&mut elev) {
+                drop(q);
+                elev.grow()
             } else {
-                if q.reqs.try_reserve(1).is_err() || q.elev.push(entry).is_err() {
+                if q.elev.push(entry).is_err() {
                     return Err(BlockError::NoMemory);
                 }
                 q.reqs.push(req.clone());
                 req.queued.store(true, Ordering::SeqCst);
-            }
+                break;
+            };
+            grow.map_err(|()| BlockError::NoMemory)?;
         }
         SUBMITTED.inc();
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        self.account_caller(kind, blocks);
         Ok(Ticket { disk: self.clone(), req, waited: false })
     }
 
@@ -794,6 +842,8 @@ impl Disk {
             return Err(BlockError::BeyondEnd);
         }
         if let Some(slot) = self.direct(lba, blocks, prio) {
+            let started = now();
+            self.account_caller(Kind::Read, blocks);
             SUBMITTED.inc();
             DIRECT_READS.inc();
             self.stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -807,6 +857,7 @@ impl Disk {
             self.report(Kind::Read, lba, blocks, r);
             if r.is_ok() {
                 self.stats.read_bytes.fetch_add(len, Ordering::Relaxed);
+                self.stats.io.done(Kind::Read, len, now().saturating_sub(started));
             }
             return r;
         }
@@ -962,7 +1013,10 @@ impl BlockDevice for DiskDevice {
         self.0.settle().map_err(BlockError::to_dev)
     }
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
-        self.0.discard(lba, blocks, IoPriority::Background).map_err(BlockError::to_dev)
+        self.discard_at(lba, blocks, IoPriority::Background)
+    }
+    fn discard_at(&self, lba: u64, blocks: u64, prio: IoPriority) -> Result<(), DevError> {
+        self.0.discard(lba, blocks, prio).map_err(BlockError::to_dev)
     }
     fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {
         self.0.read_frames(reqs, prio).map_err(BlockError::to_dev)
@@ -1017,7 +1071,10 @@ impl BlockDevice for PartPort {
         self.disk.settle().map_err(BlockError::to_dev)
     }
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
-        let t = self.disk.submit_via(Some(self.port), Kind::Discard, lba, blocks, Data::None, IoPriority::Background).map_err(BlockError::to_dev)?;
+        self.discard_at(lba, blocks, IoPriority::Background)
+    }
+    fn discard_at(&self, lba: u64, blocks: u64, prio: IoPriority) -> Result<(), DevError> {
+        let t = self.disk.submit_via(Some(self.port), Kind::Discard, lba, blocks, Data::None, prio).map_err(BlockError::to_dev)?;
         t.wait().map(|_| ()).map_err(BlockError::to_dev)
     }
     /// Reads stay unchecked, as `read_blocks`.

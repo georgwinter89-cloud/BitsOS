@@ -135,8 +135,8 @@ fn an_unmovable_block_under_a_spin_lock_comes_from_the_reserve() {
     assert!((TOP..END).contains(&p) && p % (8 * PAGE) == 0 && in_reserve(&b, p), "{p:#x}");
     assert!(!in_reserve(&b, single));
     assert_eq!(b.zone_info(0).free_highatomic, 2 * PAGEBLOCK_FRAMES - 8);
-    // The heap's last try (no `keep_reserve` slot: null would be next) gets one too, wherever it runs.
-    let q = b.alloc(2, Zone::Normal, Kind::Heap).expect("the heap's last try");
+    // The heap without a `keep_reserve` slot (its caller cannot wait: it says so by holding none) gets one too.
+    let q = b.alloc(2, Zone::Normal, Kind::Heap).expect("the heap for a caller that cannot wait");
     assert!(in_reserve(&b, q));
     assert_eq!(b.stats().used_by_kind[Kind::Heap as usize], 4 * PAGE);
     b.free(q, 2, Kind::Heap);

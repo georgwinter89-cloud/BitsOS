@@ -16,7 +16,16 @@ pub use timers::*;
 #[derive(Clone, Debug, Default)]
 pub struct SigQueue {
     pub set: u64,
-    q: Vec<SigInfo>,
+    q: Vec<Queued>,
+}
+
+/// One queued siginfo (`struct sigqueue`). `timer` is the tag of the POSIX timer whose preallocated siginfo
+/// this is (Linux's SIGQUEUE_PREALLOC), 0 for every other: kept beside the bytes, so a program's own SI_TIMER
+/// siginfo can never pass for a timer's.
+#[derive(Clone, Copy, Debug)]
+struct Queued {
+    info: SigInfo,
+    timer: u32,
 }
 
 impl SigQueue {
@@ -28,17 +37,28 @@ impl SigQueue {
     }
     /// `collect_signal`: the first queued entry of `sig` (zeros with SI_USER when none was queued: a
     /// fast-pathed or overflowed send); the bit stays set while another entry of `sig` is queued. The bool
-    /// says whether an entry was taken.
-    fn take(&mut self, sig: u32) -> (SigInfo, bool) {
-        let first = self.q.iter().position(|i| i.signo() == sig);
-        let more = first.is_some_and(|f| self.q[f + 1..].iter().any(|i| i.signo() == sig));
+    /// says whether an entry was taken, the u32 is its timer tag (`Queued::timer`).
+    fn take(&mut self, sig: u32) -> (SigInfo, bool, u32) {
+        let first = self.q.iter().position(|e| e.info.signo() == sig);
+        let more = first.is_some_and(|f| self.q[f + 1..].iter().any(|e| e.info.signo() == sig));
         if !more {
             self.set &= !bit(sig);
         }
         match first {
-            Some(f) => (self.q.remove(f), true),
-            None => (SigInfo::user(sig, SI_USER, 0, 0), false),
+            Some(f) => {
+                let e = self.q.remove(f);
+                (e.info, true, e.timer)
+            }
+            None => (SigInfo::user(sig, SI_USER, 0, 0), false, 0),
         }
+    }
+    /// Queues `info` (`timer`: see `Queued`); false when there is no memory for the entry.
+    fn push(&mut self, info: SigInfo, timer: u32) -> bool {
+        if self.q.try_reserve(1).is_err() {
+            return false;
+        }
+        self.q.push(Queued { info, timer });
+        true
     }
     /// `flush_sigqueue_mask`: drops every signal in `mask`; returns how many queued entries went.
     fn flush_mask(&mut self, mask: u64) -> usize {
@@ -47,7 +67,7 @@ impl SigQueue {
         }
         self.set &= !mask;
         let before = self.q.len();
-        self.q.retain(|i| bit_checked(i.signo()) & mask == 0);
+        self.q.retain(|e| bit_checked(e.info.signo()) & mask == 0);
         before - self.q.len()
     }
     fn clear(&mut self) -> usize {
@@ -70,12 +90,12 @@ impl SigQueue {
         if self.set & !blocked & SYNCHRONOUS_MASK == 0 {
             return None;
         }
-        let f = self.q.iter().position(|i| i.is_kernel_fault() && bit(i.signo()) & !blocked != 0)?;
-        let sig = self.q[f].signo();
-        if !self.q[f + 1..].iter().any(|i| i.signo() == sig) {
+        let f = self.q.iter().position(|e| e.info.is_kernel_fault() && bit(e.info.signo()) & !blocked != 0)?;
+        let sig = self.q[f].info.signo();
+        if !self.q[f + 1..].iter().any(|e| e.info.signo() == sig) {
             self.set &= !bit(sig);
         }
-        Some(self.q.remove(f))
+        Some(self.q.remove(f).info)
     }
 }
 
@@ -218,6 +238,8 @@ pub struct Signals {
     queued: u64,
     /// Interval and POSIX timers (`timers.rs`; Linux's `signal_struct` keeps them under the siglock too).
     pub timers: Timers,
+    /// Sends of timers unparked by sigaction, for the timer service's next pass (`timers_unignored`).
+    timer_sends: Vec<(u32, Outcome)>,
 }
 
 impl Default for Signals {
@@ -238,6 +260,7 @@ impl Default for Signals {
             curr_target: 0,
             queued: 0,
             timers: Timers::default(),
+            timer_sends: Vec::new(),
         }
     }
 }
@@ -289,6 +312,7 @@ impl Signals {
         let mut cld = None;
         if let Some(mut t) = self.threads.remove(&key) {
             self.queued = self.queued.saturating_sub(t.pending.clear() as u64);
+            self.timers_lost_thread(key);
             if t.stop_pending && !self.exiting && self.participate_count() {
                 cld = Some(Cld::Stopped(self.stop_code));
             }
@@ -450,15 +474,19 @@ impl Signals {
         if let Some(mut a) = new {
             a.flags &= UAPI_SA_FLAGS;
             a.mask &= !UNBLOCKABLE;
+            let was_ignored = old.handler == SIG_IGN;
             self.actions[(sig - 1) as usize] = a;
             if self.ignored(sig) {
                 self.flush_everywhere(bit(sig));
+            } else if was_ignored {
+                self.timers_unignored(sig);
             }
         }
         Ok(old)
     }
 
     fn flush_everywhere(&mut self, mask: u64) {
+        self.timers_flushed(mask);
         let mut n = self.shared.flush_mask(mask);
         for t in self.threads.values_mut() {
             n += t.pending.flush_mask(mask);
@@ -592,8 +620,7 @@ impl Signals {
             }
         };
         if store {
-            if q.q.try_reserve(1).is_ok() {
-                q.q.push(info);
+            if q.push(info, 0) {
                 self.queued += 1;
             } else if sig >= SIGRTMIN && info.code() != SI_USER {
                 return Err(EAGAIN);
@@ -681,25 +708,38 @@ impl Signals {
 
     /// `dequeue` with the monotonic clock's `now` (the timers' re-arm; host tests pass it).
     pub fn dequeue_at(&mut self, key: u64, allowed: u64, now: u64) -> Option<(SigInfo, bool)> {
-        let t = self.threads.get_mut(&key)?;
-        let (info, queued, shared) = if let Some(sig) = t.pending.next(allowed) {
-            let (i, q) = t.pending.take(sig);
-            (i, q, false)
-        } else if let Some(sig) = self.shared.next(allowed) {
-            let (i, q) = self.shared.take(sig);
-            (i, q, true)
-        } else {
-            return None;
-        };
-        if queued {
-            self.queued = self.queued.saturating_sub(1);
+        loop {
+            let t = self.threads.get_mut(&key)?;
+            let (info, queued, timer, shared) = if let Some(sig) = t.pending.next(allowed) {
+                let (i, q, tm) = t.pending.take(sig);
+                (i, q, tm, false)
+            } else if let Some(sig) = self.shared.next(allowed) {
+                let (i, q, tm) = self.shared.take(sig);
+                (i, q, tm, true)
+            } else {
+                self.recalc(key);
+                return None;
+            };
+            if queued {
+                self.queued = self.queued.saturating_sub(1);
+            }
+            let mut info = info;
+            let mut deliver = true;
+            if info.signo() == SIGALRM || timer != 0 {
+                let (d, rearmed) = self.timer_dequeued(&mut info, timer, now);
+                deliver = d;
+                if rearmed {
+                    crate::itimer::nudge();
+                }
+            }
+            // A timer's siginfo that is void (timer deleted or set again): taken off and the next one looked at
+            // (`dequeue_signal`'s `goto again`).
+            if !deliver {
+                continue;
+            }
+            self.recalc(key);
+            return Some((info, shared));
         }
-        let mut info = info;
-        if (info.signo() == SIGALRM || info.code() == SI_TIMER) && self.timer_dequeued(&mut info, now) {
-            crate::itimer::nudge();
-        }
-        self.recalc(key);
-        Some((info, shared))
     }
 
     /// Whether thread `key` could take a signal of `set` now (signalfd's poll, sigtimedwait's look).

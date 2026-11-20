@@ -1,5 +1,6 @@
 //! Output reports: LED states into the bytes of the output reports that carry them (Linux
-//! `hidinput_input_event` -> `hid_set_field` -> `hid_output_report`, linux-6.6/drivers/hid/hid-core.c:1810-1858).
+//! `hidinput_input_event` -> `hid_set_field` -> `hid_output_report`, linux-7.3.1/drivers/hid/hid-core.c:1861-1905,
+//! :1933).
 
 use crate::codes::EV_LED;
 use crate::descriptor::{ReportDescriptor, ReportKind};

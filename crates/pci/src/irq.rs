@@ -952,7 +952,7 @@ impl PciFunction {
         if self.class >> 16 == 0x01 && device::driver_of_loc(at) != Some(crate::optin::STORAGE_DRIVER) {
             return refuse(IrqError::Storage);
         }
-        let Some(node) = NODES.lock().iter().find(|n| n.loc == at).cloned() else { return refuse(IrqError::NotScanned) };
+        let Some(node) = NODES.get().iter().find(|n| n.loc == at).cloned() else { return refuse(IrqError::NotScanned) };
         if !device::dma_on(at) {
             return refuse(IrqError::NotEnabled);
         }

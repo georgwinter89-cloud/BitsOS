@@ -422,7 +422,12 @@ fn close_and_reopen_on_one_number_never_hands_out_a_closed_file() {
             }
         }));
     }
-    for r in 1..=ROUNDS {
+    // At least ROUNDS, and on until a look-up found a file: on a busy host the readers may not run during the
+    // first ROUNDS at all (the race is what is judged, not how soon it happens).
+    let t0 = std::time::Instant::now();
+    let mut r = 0;
+    while r < ROUNDS || found.load(Ordering::Relaxed) == 0 && t0.elapsed() < std::time::Duration::from_secs(60) {
+        r += 1;
         let k = r as usize % K;
         gen_of[k].store(r, Ordering::SeqCst);
         t.install_at(NUM, f[k].clone()).unwrap();

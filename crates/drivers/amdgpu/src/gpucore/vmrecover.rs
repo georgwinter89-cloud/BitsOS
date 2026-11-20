@@ -31,7 +31,7 @@
 //! `cpc_release` is the one step Linux does not have (no Linux source writes CPC_UTCL1_ERROR): if the sticky halt bit
 //! is still set with the queue gone, it is written 0 before the map, so one round on the chip shows both the bit and
 //! whether the fresh queue runs. The bit was already set, so the write cannot start a halt; the register is GC's, no
-//! display field moves (GX-D9). Decision and reason: plan/notes/gx-GX-7m3.md.
+//! display field moves (GX-D9). Decision and reason: plan/spec/gpu.md §11.4.
 //!
 //! GX-9a: the same rung for a plain hang of GFX ring 0 (`gfx`): 7.1's gfx_v11_0_reset_kgq with the REMOVE_QUEUE this module
 //! already trusts: the HQD through CP_GFX_HQD_* if still active (mes_v11_0_reset_queue_mmio, 7.1), the MQD and ring rewritten,
@@ -193,7 +193,7 @@ pub(crate) fn compute<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, r: &
     }
     cpc_release(owner, &a, d);
     let cp = l.compute_prop();
-    let mq = PmQueue::new(l.compute_ring, mes::COMPUTE_RING_BYTES, Some(l.comp_rptr), l.comp_wptr, mes11::COMPUTE_DOORBELL_DW).map_err(|_| "no ring")?;
+    let mq = PmQueue::new_gfx(l.compute_ring, mes::COMPUTE_RING_BYTES, Some(l.comp_rptr), l.comp_wptr, mes11::COMPUTE_DOORBELL_DW).map_err(|_| "no ring")?;
     mes::zero(owner, l.compute_ring, mes::COMPUTE_RING_BYTES).map_err(|_| "the ring's memory")?;
     mes::mem(owner, cp.mqd, &mesmqd::bytes(&mesmqd::compute_mqd(&cp))).map_err(|_| "the MQD's memory")?;
     mq.reset(owner).map_err(|_| "the pointer slots' memory")?;
@@ -290,7 +290,7 @@ pub(crate) fn gfx<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, r: &mut 
         return Err(gfx_stuck(owner, &l, r, d, "the HQD stays active after the reset"));
     }
     let gp = l.gfx_prop(&inp.gfx);
-    let mq = PmQueue::new(gp.ring, gp.ring_bytes, Some(gp.rptr), gp.wptr, gfx11::DOORBELL_DW).map_err(|_| "no ring")?;
+    let mq = PmQueue::new_gfx(gp.ring, gp.ring_bytes, Some(gp.rptr), gp.wptr, gfx11::DOORBELL_DW).map_err(|_| "no ring")?;
     mes::zero(owner, gp.ring, gp.ring_bytes).map_err(|_| "the ring's memory")?;
     mes::mem(owner, gp.mqd, &mesmqd::bytes(&mesmqd::gfx_mqd(&gp))).map_err(|_| "the MQD's memory")?;
     mq.reset(owner).map_err(|_| "the pointer slots' memory")?;

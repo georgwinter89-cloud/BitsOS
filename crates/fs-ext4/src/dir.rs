@@ -1,4 +1,4 @@
-//! Directory blocks (linux-6.6/fs/ext4/ext4.h:2309 `struct ext4_dir_entry_2`, namei.c): entries, the
+//! Directory blocks (linux-7.3.1/fs/ext4/ext4.h:2528 `struct ext4_dir_entry_2`, namei.c): entries, the
 //! metadata_csum tail (`struct ext4_dir_entry_tail`), recognising htree index blocks, inserting into free
 //! space and removing as `ext4_generic_delete_entry` does (the space goes to the entry before, or the inode
 //! field is cleared when it is the first of its block).
@@ -52,23 +52,77 @@ pub fn area(bs: usize, csum: bool) -> usize {
     if csum { bs - TAIL } else { bs }
 }
 
-/// Every entry of a leaf block's area (empty ones included), checked as `ext4_check_dir_entry` does.
-pub fn entries(b: &[u8], end: usize) -> Result<Vec<DirEnt>, i64> {
-    let end = end.min(b.len());
-    let mut out = Vec::new();
-    let mut off = 0;
-    while off < end {
-        let ino = g32(b, off);
+/// One entry of a leaf block, its name left in the block (`name`): walking 620 blocks of a big directory must
+/// not make a heap block per name.
+#[derive(Clone, Copy, Debug)]
+pub struct Raw {
+    pub off: usize,
+    pub ino: u32,
+    pub rec_len: usize,
+    pub name_len: usize,
+    pub ftype: u8,
+}
+
+impl Raw {
+    pub fn name<'a>(&self, b: &'a [u8]) -> &'a [u8] {
+        &b[self.off + 8..self.off + 8 + self.name_len]
+    }
+    /// The largest record that fits here: all of an empty entry, the space behind the name of a live one.
+    pub fn slack(&self) -> usize {
+        if self.ino == 0 { self.rec_len } else { self.rec_len - rec_len(self.name_len) }
+    }
+    pub fn owned(&self, b: &[u8]) -> DirEnt {
+        DirEnt { off: self.off, ino: self.ino, rec_len: self.rec_len, ftype: self.ftype, name: self.name(b).to_vec() }
+    }
+}
+
+/// The entries of a leaf block's area in order (empty ones included), each checked as `ext4_check_dir_entry`
+/// does; ends after the first bad one.
+pub struct Walk<'a> {
+    b: &'a [u8],
+    end: usize,
+    off: usize,
+}
+
+pub fn walk(b: &[u8], end: usize) -> Walk<'_> {
+    Walk { b, end: end.min(b.len()), off: 0 }
+}
+
+impl Iterator for Walk<'_> {
+    type Item = Result<Raw, i64>;
+    fn next(&mut self) -> Option<Result<Raw, i64>> {
+        let (b, off, end) = (self.b, self.off, self.end);
+        if off >= end {
+            return None;
+        }
+        if off + 8 > end {
+            self.off = end;
+            return Some(Err(EUCLEAN));
+        }
         let rl = g16(b, off + 4) as usize;
         let nl = g8(b, off + 6) as usize;
         if rl < 12 || rl % 4 != 0 || off + rl > end || rec_len(nl) > rl {
             klog::event!(Warn, "ext4", "dir.bad_entry", off = off, rec_len = rl, name_len = nl);
-            return Err(EUCLEAN);
+            self.off = end;
+            return Some(Err(EUCLEAN));
         }
-        out.push(DirEnt { off, ino, rec_len: rl, ftype: g8(b, off + 7), name: b[off + 8..off + 8 + nl].to_vec() });
-        off += rl;
+        self.off = off + rl;
+        Some(Ok(Raw { off, ino: g32(b, off), rec_len: rl, name_len: nl, ftype: g8(b, off + 7) }))
     }
-    Ok(out)
+}
+
+/// Every entry of a leaf block's area (empty ones included), checked as `ext4_check_dir_entry` does.
+pub fn entries(b: &[u8], end: usize) -> Result<Vec<DirEnt>, i64> {
+    walk(b, end).map(|e| e.map(|e| e.owned(b))).collect()
+}
+
+/// The largest record that fits into this block (0: it is full).
+pub fn room(b: &[u8], end: usize) -> Result<usize, i64> {
+    let mut most = 0;
+    for e in walk(b, end) {
+        most = most.max(e?.slack());
+    }
+    Ok(most)
 }
 
 /// An htree interior block: one fake entry over the whole block (`dx_node`).
@@ -127,33 +181,49 @@ pub fn first_block(bs: usize, seed: Option<u32>, me: u32, parent: u32) -> Vec<u8
     b
 }
 
-/// Puts a name into free space of this block; false when it does not fit.
-pub fn insert(b: &mut [u8], end: usize, name: &[u8], ino: u32, ftype: u8) -> Result<bool, i64> {
+/// Puts a name into free space of this block (the first entry with room); returns where, None when it does
+/// not fit.
+pub fn insert_at(b: &mut [u8], end: usize, name: &[u8], ino: u32, ftype: u8) -> Result<Option<usize>, i64> {
     let need = rec_len(name.len());
-    for e in entries(b, end)? {
-        if e.ino == 0 && e.rec_len >= need {
-            put_entry(b, e.off, ino, e.rec_len, ftype, name);
-            return Ok(true);
-        }
-        let used = rec_len(e.name.len());
-        if e.ino != 0 && e.rec_len - used >= need {
-            p16(b, e.off + 4, used as u16);
-            put_entry(b, e.off + used, ino, e.rec_len - used, ftype, name);
-            return Ok(true);
+    let mut fit = None;
+    for e in walk(b, end) {
+        let e = e?;
+        if e.slack() >= need {
+            fit = Some(e);
+            break;
         }
     }
-    Ok(false)
+    let Some(e) = fit else { return Ok(None) };
+    if e.ino == 0 {
+        put_entry(b, e.off, ino, e.rec_len, ftype, name);
+        return Ok(Some(e.off));
+    }
+    let used = rec_len(e.name_len);
+    p16(b, e.off + 4, used as u16);
+    put_entry(b, e.off + used, ino, e.rec_len - used, ftype, name);
+    Ok(Some(e.off + used))
+}
+
+pub fn insert(b: &mut [u8], end: usize, name: &[u8], ino: u32, ftype: u8) -> Result<bool, i64> {
+    Ok(insert_at(b, end, name, ino, ftype)?.is_some())
 }
 
 /// Removes the entry at `off` (it must be one of this block's).
 pub fn remove(b: &mut [u8], end: usize, off: usize) -> Result<(), i64> {
-    let es = entries(b, end)?;
-    let i = es.iter().position(|e| e.off == off).ok_or(EUCLEAN)?;
-    if i == 0 {
-        p32(b, off, 0);
-    } else {
-        let p = &es[i - 1];
-        p16(b, p.off + 4, (p.rec_len + es[i].rec_len) as u16);
+    let mut prev: Option<Raw> = None;
+    let mut found = None;
+    for e in walk(b, end) {
+        let e = e?;
+        if e.off == off {
+            found = Some(e);
+            break;
+        }
+        prev = Some(e);
+    }
+    let e = found.ok_or(EUCLEAN)?;
+    match prev {
+        None => p32(b, off, 0),
+        Some(p) => p16(b, p.off + 4, (p.rec_len + e.rec_len) as u16),
     }
     Ok(())
 }

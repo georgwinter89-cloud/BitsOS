@@ -6,6 +6,7 @@ description = "ACPI tables and CP's kernel-side CPU set-up (owner: CP)"
 
 [dependencies]
 bootinfo = { path = "../bootinfo" }
+gp-platform = { path = "../gp-platform" }
 hal = { path = "../hal" }
 kreg = { path = "../kreg" }
 klog = { path = "../klog" }

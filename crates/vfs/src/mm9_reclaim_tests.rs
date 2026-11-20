@@ -157,6 +157,36 @@ fn direct_reclaim_never_waits_for_a_lock() {
     assert_eq!(r.shrink(8, Mode::Direct, true).freed, 8);
 }
 
+/// ATOMIC-3 reclaim fixer: a light direct call that finds the preloaded cache's lock taken while kswapd runs (kswapd
+/// is in it, freeing those very pages) takes no used page of another file; a thorough one (the allocator's later
+/// rounds) and one without kswapd go on with the clock. Before, every light call took a cluster of used pages
+/// (the read file of `fs.preload.reclaim` lost all 4096); with 03d9f33c a thorough one took nothing even while
+/// kswapd held the cache for the whole allocation.
+#[test]
+fn a_busy_preloaded_cache_under_kswapd_spares_the_other_files_in_light_rounds_only() {
+    let (used, _) = file(32);
+    read_all(&used, 32);
+    let (pre, _) = file(32);
+    assert_eq!(pre.prefetch(0, 32, &mut |_| true).map(|x| x.0), Ok(32));
+    let r = Reclaimer::of(&[&used, &pre]);
+    let g = pre.inner_arc().lock();
+    mm_core::reclaim::set_kswapd_running(true);
+    let light = r.shrink(8, Mode::Direct, false);
+    assert_eq!(light.freed, 0, "{light:?}");
+    assert!(light.busy > 0, "the caller is told to wait: {light:?}");
+    assert_eq!(used.pages(), 32, "the read file kept its pages");
+    // kswapd still holds the cache: the thorough round takes the other file's clean pages.
+    let thorough = r.shrink(8, Mode::Direct, true);
+    mm_core::reclaim::set_kswapd_running(false);
+    assert_eq!((thorough.freed, thorough.preloaded), (8, 0), "{thorough:?}");
+    // Not kswapd's: a light call goes on with the clock too.
+    let o = r.shrink(8, Mode::Direct, false);
+    assert_eq!((o.freed, o.preloaded), (8, 0), "{o:?}");
+    drop(g);
+    let o = r.shrink(8, Mode::Direct, false);
+    assert_eq!((o.freed, o.preloaded), (8, 8), "the lock free again, preloaded first: {o:?}");
+}
+
 /// A file dropped while a reclaimer still holds its state (a visit that runs, as `Ring::walk`'s, or the
 /// reference `release` left in the grace queue): the pages go at the drop, not when the reclaimer lets go, and
 /// nothing can be put into the state any more.
@@ -363,6 +393,10 @@ fn reclaim_races_the_file_calls() {
     let r = Reclaimer::of(&[&c]);
     let stop = AtomicBool::new(false);
     let taken = AtomicU64::new(0);
+    // The readers go on past ROUNDS until reclaim took something while they ran: on a busy host the
+    // reclaimer may not have run during their first ROUNDS (the race is judged, not how soon it comes).
+    let t0 = std::time::Instant::now();
+    let racing = |k: u64| k < ROUNDS || taken.load(Ordering::Relaxed) == 0 && t0.elapsed() < std::time::Duration::from_secs(60);
     std::thread::scope(|s| {
         s.spawn(|| {
             let mut k = 0u64;
@@ -381,11 +415,13 @@ fn reclaim_races_the_file_calls() {
         });
         let readers: vec::Vec<_> = (0..2)
             .map(|t| {
-                let c = &c;
+                let (c, racing) = (&c, &racing);
                 s.spawn(move || {
-                    for k in 0..ROUNDS {
+                    let mut k = 0;
+                    while racing(k) {
                         let i = (k * 7 + t) % FIXED;
                         assert_eq!(read8(c, i * P), i.to_le_bytes(), "read of page {i}");
+                        k += 1;
                     }
                 })
             })

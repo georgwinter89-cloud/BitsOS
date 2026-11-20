@@ -1,6 +1,6 @@
-//! `/dev/snd/pcmC0D0p`: one mixer client per open (Linux's substream + runtime, `linux-6.6/sound/core/
+//! `/dev/snd/pcmC0D0p`: one mixer client per open (Linux's substream + runtime, `linux-7.3.1/sound/core/
 //! pcm_native.c`). The data ring is the client's ring (RW_INTERLEAVED only, no mmap; libasound then uses
-//! SYNC_PTR, pcm_native.c:3034). States are Linux's; while a stream is set up, PREPARED/RUNNING/PAUSED/
+//! SYNC_PTR, pcm_native.c:3161). States are Linux's; while a stream is set up, PREPARED/RUNNING/PAUSED/
 //! DRAINING/XRUN come from the client (`Playback::state`), SETUP and OPEN are this file's own.
 
 use super::abi::*;
@@ -237,7 +237,7 @@ pub struct PcmFile {
     name: String,
     cons: Constraints,
     /// Calls per ioctl number ('A' nr 0..=0x7f), logged at close: the trace that is compared with what
-    /// libasound does on Linux (plan/notes/sn-SN-4.md).
+    /// libasound does on Linux (plan/spec/sound.md §7).
     calls: [AtomicU32; 128],
 }
 
@@ -251,7 +251,7 @@ impl PcmFile {
     }
 
     /// The open file's O_NONBLOCK now. `ioctl_user` gets no file flags and fcntl(F_SETFL) is not passed to the
-    /// object (change request in plan/notes/sn-SN-4.md), while libasound opens with O_NONBLOCK and clears it
+    /// object (open: plan/spec/sound.md §7), while libasound opens with O_NONBLOCK and clears it
     /// with F_SETFL (`defaults.pcm.nonblock 1`): the caller's fd table is searched for this object. Kernel
     /// callers (ktests) have none: the open flag.
     /// O_NONBLOCK of the ioctl's open file as the syscall layer hands it over; `nonblock` where it does not.
@@ -634,7 +634,7 @@ impl PcmFile {
                 let mut p = HwParams::decode(&raw);
                 if cmd == PCM_HW_REFINE {
                     self.cons.refine(&mut p)?;
-                    self.cons.fixup(&mut p);
+                    self.cons.fixup(&mut p)?;
                 } else {
                     self.hw_params(&mut p)?;
                 }

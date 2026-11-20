@@ -1,4 +1,4 @@
-//! DR-6: amdgpu's GEM buffer objects (linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c, amdgpu_object.c) on the
+//! DR-6: amdgpu's GEM buffer objects (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c, amdgpu_object.c) on the
 //! memory a `GpuDevice` hands out (`GpuDevice::bo_memory`: `DmaPages` for GTT, the carve-out for VRAM).
 //!
 //! A `Bo` has its size (page-aligned at create), page alignment, create flags, preferred and allowed domains,
@@ -42,16 +42,41 @@ pub const MMAP_PAGES: u64 = MMAP_END_PG - MMAP_START_PG;
 /// The share of managed RAM one DRM file may pin (MM-14's suggestion: Linux's TTM limit, half of RAM).
 pub const FILE_PIN_SHARE: u64 = 50;
 
-/// `amdgpu_gem_create_ioctl`'s accepted flags (amdgpu_gem.c:297-305).
+/// `AMDGPU_GEM_CREATE_GFX12_DCC` (Linux 7.3.1's uapi amdgpu_drm.h:185; not in the generated 6.6 header).
+pub const AMDGPU_GEM_CREATE_GFX12_DCC: u64 = 1 << 16;
+/// `AMDGPU_GEM_CREATE_SETTABLE_MASK` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.h:76-88): the flags
+/// GEM_CREATE takes.
 const CREATE_FLAGS: u64 = (AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED
     | AMDGPU_GEM_CREATE_NO_CPU_ACCESS
     | AMDGPU_GEM_CREATE_CPU_GTT_USWC
     | AMDGPU_GEM_CREATE_VRAM_CLEARED
     | AMDGPU_GEM_CREATE_VM_ALWAYS_VALID
     | AMDGPU_GEM_CREATE_EXPLICIT_SYNC
+    | AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE
     | AMDGPU_GEM_CREATE_ENCRYPTED
-    | AMDGPU_GEM_CREATE_DISCARDABLE) as u64;
+    | AMDGPU_GEM_CREATE_DISCARDABLE
+    | AMDGPU_GEM_CREATE_COHERENT
+    | AMDGPU_GEM_CREATE_UNCACHED
+    | AMDGPU_GEM_CREATE_EXT_COHERENT) as u64
+    | AMDGPU_GEM_CREATE_GFX12_DCC;
+/// The object flags that make GFX 11 page-table entries uncached (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/
+/// gmc_v11_0.c:509).
+pub const UC_FLAGS: u64 = (AMDGPU_GEM_CREATE_COHERENT | AMDGPU_GEM_CREATE_EXT_COHERENT | AMDGPU_GEM_CREATE_UNCACHED) as u64;
+/// Domains with on-chip storage instead of pages: no CPU access, never always-valid.
 const SPECIAL: u32 = AMDGPU_GEM_DOMAIN_GDS | AMDGPU_GEM_DOMAIN_GWS | AMDGPU_GEM_DOMAIN_OA;
+/// Domains without memory pages here: the on-chip ones and DOORBELL. Linux's doorbell objects are pages of the
+/// doorbell BAR for user-mode queues (AMDGPU_USERQ); V2 has no user queues, so such an object exists (create,
+/// handles, GET_GEM_CREATE_INFO, its share of the BAR: `DoorbellShare`) but nothing maps it (CPU mmap EINVAL, as
+/// for GDS; GEM_VA EFAULT where Linux maps the BAR pages).
+const NO_PAGES: u32 = SPECIAL | AMDGPU_GEM_DOMAIN_DOORBELL;
+
+/// `amdgpu_gem_are_domains_valid` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c:403): every domain
+/// besides CPU/GTT/VRAM is special; a special one comes alone, never with a normal one or another special one.
+fn domains_valid(domains: u64) -> bool {
+    let normal = (AMDGPU_GEM_DOMAIN_CPU | AMDGPU_GEM_DOMAIN_GTT | AMDGPU_GEM_DOMAIN_VRAM) as u64;
+    let special = domains & AMDGPU_GEM_DOMAIN_MASK as u64 & !normal;
+    special == 0 || (domains & normal == 0 && special.is_power_of_two())
+}
 
 klog::counter!(BOS, "drm.gem.created");
 klog::counter!(BOS_FREED, "drm.gem.freed");
@@ -72,6 +97,8 @@ pub struct GemShared {
     userptr_warned: AtomicBool,
     /// DR-9: this device's own source of user pages (tests); None: the kernel's (`userptr::set_source`).
     user_pages: SpinLock<Option<Arc<dyn crate::userptr::UserPages>>>,
+    /// Bytes of the doorbell BAR the live DOORBELL objects hold.
+    doorbell_used: AtomicU64,
 }
 
 impl GemShared {
@@ -81,6 +108,7 @@ impl GemShared {
             names: SpinLock::named("drm.gem.names", crate::handles::Handles::new()),
             userptr_warned: AtomicBool::new(false),
             user_pages: SpinLock::named("drm.gem.user_pages", None),
+            doorbell_used: AtomicU64::new(0),
         })
     }
 
@@ -378,15 +406,46 @@ impl Drop for Bo {
     }
 }
 
-/// The memory of a GDS/GWS/OA object: none (Linux keeps them in the system domain without pages until a CS).
-pub(crate) struct NoPages(pub(crate) u64);
+/// The memory of a GDS/GWS/OA or DOORBELL object: none (Linux keeps the on-chip ones in the system domain without
+/// pages until a CS); a DOORBELL object holds its share of the BAR.
+pub(crate) struct NoPages {
+    size: u64,
+    _share: Option<DoorbellShare>,
+}
+
+/// A DOORBELL object's bytes of the doorbell BAR, given back on drop. Linux's range manager refuses an object
+/// with no room left with ENOMEM (CachyOS: 1 GiB on a 2 MiB BAR); a counter stands in for its free list.
+pub(crate) struct DoorbellShare {
+    shared: Arc<GemShared>,
+    bytes: u64,
+}
+
+impl DoorbellShare {
+    fn take(shared: &Arc<GemShared>, bytes: u64, room: u64) -> Result<DoorbellShare, Errno> {
+        let used = &shared.doorbell_used;
+        let mut cur = used.load(Ordering::Relaxed);
+        loop {
+            let next = cur.checked_add(bytes).filter(|&n| n <= room).ok_or(ENOMEM)?;
+            match used.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(DoorbellShare { shared: shared.clone(), bytes }),
+                Err(c) => cur = c,
+            }
+        }
+    }
+}
+
+impl Drop for DoorbellShare {
+    fn drop(&mut self) {
+        self.shared.doorbell_used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
 
 impl Exporter for NoPages {
     fn name(&self) -> &'static str {
         "amdgpu"
     }
     fn size(&self) -> u64 {
-        self.0
+        self.size
     }
     fn aperture(&self) -> Option<Aperture> {
         None
@@ -518,12 +577,14 @@ pub(crate) fn create_bo(gpu: &dyn GpuDevice, file: &FileGem, size: u64, align: u
     if flags & AMDGPU_GEM_CREATE_DISCARDABLE as u64 == 0 && allowed == AMDGPU_GEM_DOMAIN_VRAM {
         allowed |= AMDGPU_GEM_DOMAIN_GTT;
     }
-    let mut flags = flags;
-    if gpu.profile().ras_features.is_some_and(|m| m != 0) {
-        flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE as u64;
-    }
-    let (mem, place): (Arc<dyn Exporter>, Option<BoPlace>) = if domain & SPECIAL != 0 {
-        (Arc::new(NoPages(size)), None)
+    // amdgpu_gem_object_create (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c:180) asks for it on every
+    // user object, with or without RAS.
+    let mut flags = flags | AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE as u64;
+    let (mem, place): (Arc<dyn Exporter>, Option<BoPlace>) = if domain & NO_PAGES != 0 {
+        let share = (domain & AMDGPU_GEM_DOMAIN_DOORBELL != 0)
+            .then(|| DoorbellShare::take(&gpu.shared().gem, size, gpu.profile().doorbell_room))
+            .transpose()?;
+        (Arc::new(NoPages { size, _share: share }), None)
     } else {
         let mut order: Vec<BoPlace> = Vec::new();
         if domain & AMDGPU_GEM_DOMAIN_VRAM != 0 {
@@ -553,10 +614,8 @@ pub(crate) fn create_bo(gpu: &dyn GpuDevice, file: &FileGem, size: u64, align: u
 /// DR-9: the object of a GEM_USERPTR (`amdgpu_gem_object_create(.., DOMAIN_CPU, 0, ..)`, then GTT as preferred
 /// and allowed domain, amdgpu_gem.c:413): its memory is the user range.
 pub(crate) fn userptr_bo(gpu: &dyn GpuDevice, size: u64, resv: Arc<Resv>, mem: Arc<crate::userptr::UserptrMem>) -> Result<Arc<Bo>, Errno> {
-    let mut flags = 0u64;
-    if gpu.profile().ras_features.is_some_and(|m| m != 0) {
-        flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE as u64;
-    }
+    // Through amdgpu_gem_object_create too (amdgpu_gem.c:180).
+    let flags = AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE as u64;
     let n = NewBo {
         size,
         page_align: 0,
@@ -572,19 +631,21 @@ pub(crate) fn userptr_bo(gpu: &dyn GpuDevice, size: u64, resv: Arc<Resv>, mem: A
     Bo::new(&gpu.shared().gem, n)
 }
 
-/// `amdgpu_gem_create_ioctl` (amdgpu_gem.c:278): checks in Linux's order, the two retries (without
-/// CPU_ACCESS_REQUIRED, then VRAM with GTT), a handle; `out` replaces the whole union.
+/// `amdgpu_gem_create_ioctl` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c:425): flags, domain bits,
+/// the domain mix, TMZ, in that order; VRAM_CLEARED always (:455); the two retries (without CPU_ACCESS_REQUIRED,
+/// then VRAM with GTT), a handle; `out` replaces the whole union.
 pub fn create_ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, Errno> {
     let args = drm_amdgpu_gem_create::decode(data).ok_or(EINVAL)?;
     let a = args.r#in();
     let mut flags = a.domain_flags;
-    if a.domains & AMDGPU_GEM_DOMAIN_DOORBELL as u64 != 0 || flags & !CREATE_FLAGS != 0 || a.domains & !(AMDGPU_GEM_DOMAIN_MASK as u64) != 0 {
+    if flags & !CREATE_FLAGS != 0 || a.domains & !(AMDGPU_GEM_DOMAIN_MASK as u64) != 0 || !domains_valid(a.domains) {
         return Err(EINVAL);
     }
     if flags & AMDGPU_GEM_CREATE_ENCRYPTED as u64 != 0 && !tmz(gpu) {
         klog::event!(Info, "drm", "gem.no_tmz"; "an encrypted buffer was asked for, the chip has TMZ off: EINVAL");
         return Err(EINVAL);
     }
+    flags |= AMDGPU_GEM_CREATE_VRAM_CLEARED as u64;
     let always_valid = flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID as u64 != 0;
     if a.domains & SPECIAL as u64 != 0 {
         if always_valid {

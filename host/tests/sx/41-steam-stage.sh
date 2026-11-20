@@ -32,6 +32,8 @@ check "every library the client's ELF files name is there: $(tail -n 1 "$RUN_DIR
 check "BusyBox tar unpacks Valve's bootstrap, steam.sh with the 64-bit branch" '"$BB" tar -xJf "$S/bootstraplinux_ubuntu12_32.tar.xz" -C "$RUN_DIR/tools" && grep -q "steamrt64/steam" "$RUN_DIR/tools/steam.sh" && grep -q ".steam-enable-steamrt64-client" "$RUN_DIR/tools/steam.sh"'
 check "BusyBox unzip gives steamrt64/steam, an x86-64 ELF" '"$BB" unzip -o -q "$S"/package/steam_steamrt_ubuntu12.zip.* steamrt64/steam -d "$RUN_DIR/tools" && [ "$(head -c 5 "$RUN_DIR/tools/steamrt64/steam" | od -An -tx1 | tr -d " ")" = 7f454c4602 ]'
 check "BusyBox tar unpacks the provider, with its links" 'mkdir -p "$RUN_DIR/tools/g" && "$BB" tar -xzf "$S/gfx.tar.gz" -C "$RUN_DIR/tools/g" && [ -f "$RUN_DIR/tools/g/gfx/usr/lib/libc.so.6" ] && [ -L "$RUN_DIR/tools/g/gfx/lib64" ]'
+# DECISIONS 18.11.: everything draws on the GPU, so the provider holds radeonsi and RADV and no software driver.
+check "the provider has radeonsi and RADV and no software driver" '[ -f "$RUN_DIR/tools/g/gfx/usr/lib/dri/radeonsi_dri.so" ] && [ -f "$RUN_DIR/tools/g/gfx/usr/share/vulkan/icd.d/radeon_icd.json" ] && [ -z "$(cd "$RUN_DIR/tools/g/gfx" && find . -name "*swrast*" -o -name "*lvp*" -o -name "*lavapipe*")" ]'
 # Its own PATH: no desktop that happens to run on this machine is asked anything.
 mkdir -p "$RUN_DIR/x"
 for a in $("$BB" --list); do ln -sf "$BB" "$RUN_DIR/x/$a"; done

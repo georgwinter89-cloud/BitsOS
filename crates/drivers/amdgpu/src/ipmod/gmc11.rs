@@ -1,6 +1,6 @@
-//! Memory controller side of GC 11 (Linux `gmc_v11_0`, linux-6.6 amdgpu/gmc_v11_0.c) with its two hubs: GFXHUB
+//! Memory controller side of GC 11 (Linux `gmc_v11_0`, linux-7.3.1 amdgpu/gmc_v11_0.c) with its two hubs: GFXHUB
 //! 3.0 (Linux `gfxhub_v3_0`, inside GC) and MMHUB 3.0.1 (Linux `mmhub_v3_0_1`). GART, VM contexts, the carve-out
-//! (on APUs its CPU address is MMHUB's FB offset, gmc_v11_0.c:720-723). GX-7 (GART) and GX-8 (VM per fd).
+//! (on APUs its CPU address is MMHUB's FB offset, gmc_v11_0.c:701-704). GX-7 (GART) and GX-8 (VM per fd).
 //!
 //! GX-7h: both hubs' registers by name (`R`, as (segment, dword) of GC 11.0.0 / MMHUB 3.0.1:
 //! gc_11_0_0_offset.h, mmhub_3_0_1_offset.h), the values Linux's gart_enable gives them (gfxhub_v3_0.c:119-352,

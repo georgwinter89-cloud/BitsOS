@@ -38,6 +38,8 @@ pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ENODATA: i64 = 61;
 pub const ETIME: i64 = 62;
+/// "Object is remote": pidfs answers it for a pid outside the caller's pid namespace tree.
+pub const EREMOTE: i64 = 66;
 pub const EBADMSG: i64 = 74;
 pub const EOVERFLOW: i64 = 75;
 pub const ENOTSOCK: i64 = 88;
@@ -62,6 +64,8 @@ pub const ECONNREFUSED: i64 = 111;
 pub const EHOSTUNREACH: i64 = 113;
 pub const EALREADY: i64 = 114;
 pub const EINPROGRESS: i64 = 115;
+/// "Stale file handle": open_by_handle_at's answer for a handle that names nothing (any more).
+pub const ESTALE: i64 = 116;
 pub const EUCLEAN: i64 = 117;
 pub const EDOM: i64 = 33;
 pub const ESOCKTNOSUPPORT: i64 = 94;

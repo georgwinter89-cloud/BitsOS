@@ -349,7 +349,7 @@ pub fn smap_all() -> Option<bool> {
 
 /// `index` when it is below `size`, else 0, without a branch the CPU could predict past: a bounds check the
 /// processor speculates through cannot hand a later load an index chosen by a program (Spectre v1; Linux's
-/// `array_index_nospec` on the syscall number, linux-6.6/arch/x86/entry/common.c:48).
+/// `array_index_nospec` on the syscall number, linux-7.3.1/arch/x86/entry/syscall_64.c:60).
 #[inline(always)]
 pub fn index_nospec(index: usize, size: usize) -> usize {
     let mask: usize;
@@ -500,7 +500,7 @@ mod imp {
 
     /// STAR: [47:32] kernel CS (SS = +8), [63:48] base for SYSRET (64-bit CS = +16 | 3; SS = +8, with RPL 3
     /// only on Intel unless the base carries it, so it does: `__USER32_CS` 0x23, as Linux writes it,
-    /// linux-6.6/arch/x86/kernel/cpu/common.c:2074). The test variant without RPL is 0x20 (AMD's SS 0x28).
+    /// linux-7.3.1/arch/x86/kernel/cpu/common.c:2311). The test variant without RPL is 0x20 (AMD's SS 0x28).
     fn star(rpl3: bool) -> u64 {
         let base = (crate::gdt::USER32_CS as u64 & !3) | if rpl3 { 3 } else { 0 };
         ((crate::gdt::KERNEL_CS as u64) << 32) | (base << 48)

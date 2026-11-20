@@ -16,6 +16,37 @@ pub fn check_name(n: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(format!("bad package name {n:?} (a-z, 0-9, _ and -, starting with a letter)")) }
 }
 
+/// PK-6d: a pacman package name as a BitsOS program name. pacman allows alphanumerics and `@ . _ + -`, not
+/// starting with `-` or `.` (doc/PKGBUILD.5 pkgname); a program name is check_name's narrow grammar. A name that
+/// already fits stays; otherwise upper case goes lower, `.` becomes `_`, `+` becomes `plus`, `@` becomes `_at_`,
+/// and a name that does not start with a letter gets `pkg-` in front (`7zip` -> `pkg-7zip`, `libsigc++` ->
+/// `libsigcplusplus`). The mapping is not one to one (`a.b` and `a_b` meet): the install refuses a program folder
+/// whose packages do not include this pacman name. The pacman name stays in the manifest's [[origin]].
+pub fn program_of(pkgname: &str) -> Result<String, String> {
+    if check_name(pkgname).is_ok() {
+        return Ok(pkgname.to_string());
+    }
+    if pkgname.is_empty() {
+        return Err("leerer Paketname".into());
+    }
+    let mut p = String::new();
+    for c in pkgname.chars() {
+        match c {
+            'a'..='z' | '0'..='9' | '_' | '-' => p.push(c),
+            'A'..='Z' => p.push(c.to_ascii_lowercase()),
+            '.' => p.push('_'),
+            '+' => p.push_str("plus"),
+            '@' => p.push_str("_at_"),
+            _ => return Err(format!("{pkgname:?}: Zeichen {c:?} passt in keinen Programmnamen")),
+        }
+    }
+    if !p.starts_with(|c: char| c.is_ascii_lowercase()) {
+        p.insert_str(0, "pkg-");
+    }
+    check_name(&p).map_err(|_| format!("{pkgname:?}: als Programmname {p:?} zu lang oder ungültig (a-z, 0-9, _ und -, vorn ein Buchstabe, höchstens {NAME_MAX} Zeichen)"))?;
+    Ok(p)
+}
+
 /// An action or service name: the same grammar as a package name.
 pub fn check_ident(what: &str, n: &str) -> Result<(), String> {
     check_name(n).map_err(|_| format!("bad {what} name {n:?} (a-z, 0-9, _ and -, starting with a letter)"))
@@ -110,5 +141,129 @@ pub fn check_sha256(h: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("bad sha256 {h:?} (64 lower-case hex digits)"))
+    }
+}
+
+/// PK-6d (plan 1.6): a pacman version (`[epoch:]pkgver-pkgrel`) as a folder name: the epoch `N:` is spelled `eN_`
+/// (a `:` is no folder name), everything else stays. A version whose other characters no folder may carry is
+/// refused with the reason (pacman allows little more than check_version: libmakepkg/lint_pkgbuild/pkgver.sh).
+/// A version without an epoch that already looks like the spelling (`e1_2-1`) is refused, so the mapping stays
+/// one to one. The folder name is for the file system only: the real pacman version is the manifest's [[origin]].
+pub fn folder_of(pacver: &str) -> Result<String, String> {
+    let f = match pacver.split_once(':') {
+        Some((e, rest)) if digits(e) => format!("e{e}_{rest}"),
+        Some(_) => return Err(format!("Version {pacver:?}: die Epoche ist keine Zahl")),
+        None if pacver.strip_prefix('e').and_then(|r| r.split_once('_')).is_some_and(|(e, _)| digits(e)) => {
+            return Err(format!("Version {pacver:?}: sieht aus wie BitsOS' Schreibweise einer Epoche (e<N>_), abgelehnt"));
+        }
+        None => pacver.to_string(),
+    };
+    check_version(&f).map_err(|e| format!("Version {pacver:?} passt in keinen Ordnernamen: {e}"))?;
+    Ok(f)
+}
+
+/// The program version of a closure: the top level's folder name, then `+<n>` counting the closure changes of
+/// that same top-level version (`e1_1.98.63-1+2`).
+pub fn program_version(pacver: &str, n: u32) -> Result<String, String> {
+    let v = format!("{}+{n}", folder_of(pacver)?);
+    check_version(&v)?;
+    Ok(v)
+}
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// The way back for `info` and `list`: a program version folder as pacman spells it (`e1_1.0-1+2` -> `1:1.0-1`
+/// and the closure count 2). A pacman version ends in `-<pkgrel>`, and a pkgrel is `integer[.integer]`
+/// (libmakepkg/lint_pkgbuild/pkgrel.sh): bitspkg's own suffixes, `~<8 hex>` (another build of the same version
+/// in .pkgs) and `+<n>` (the closure count), are read only after the last `-`, where a pkgver's own `~` and `+`
+/// cannot be (`1.0~rc1-1` stays itself). A folder bitspkg did not make comes back as it is, without a count.
+pub fn pacman_of(folder: &str) -> (String, Option<u32>) {
+    let Some((head, tail)) = folder.rsplit_once('-') else { return (folder.to_string(), None) };
+    let (tail, n) = match tail.split_once('+') {
+        Some((t, n)) if digits(n) => (t, n.parse().ok()),
+        _ => (tail, None),
+    };
+    let tail = match tail.split_once('~') {
+        Some((t, h)) if h.len() == 8 && h.bytes().all(|c| c.is_ascii_hexdigit()) => t,
+        _ => tail,
+    };
+    let base = format!("{head}-{tail}");
+    let v = match base.strip_prefix('e').and_then(|r| r.split_once('_')) {
+        Some((e, rest)) if digits(e) => format!("{e}:{rest}"),
+        _ => base,
+    };
+    (v, n)
+}
+
+
+/// Where a repository package may keep non-ASCII names (plan 1.6, PACKAGES.md 6.7): glibc's locales and
+/// translations and ICU's data need them; anywhere else such a name is dropped at unpack and reported.
+pub const NON_ASCII_DIRS: [&str; 5] = ["usr/share/locale/", "usr/share/i18n/", "usr/lib/locale/", "usr/share/icu/", "usr/lib/icu/"];
+
+/// May `p` (relative to a root tree, or `root/...` inside a format-2 version) carry a non-ASCII name?
+pub fn non_ascii_allowed(p: &str) -> bool {
+    let q = p.strip_prefix("root/").unwrap_or(p);
+    NON_ASCII_DIRS.iter().any(|d| q.starts_with(d))
+}
+
+/// A path of a format-2 version (PK-6d): check_rel_path's rules, except that `\` is a name byte like any other
+/// (these trees are never copied over FAT) and non-ASCII UTF-8 is allowed below NON_ASCII_DIRS.
+pub fn check_repo_path(p: &str) -> Result<(), String> {
+    if p.is_empty() || p.len() > PATH_MAX {
+        return Err(format!("bad path {p:?} (empty or longer than {PATH_MAX})"));
+    }
+    if p.starts_with('/') {
+        return Err(format!("absolute path {p:?} (paths are inside the package)"));
+    }
+    if let Some(b) = p.bytes().find(|&b| b < 0x20 || b == 0x7f) {
+        return Err(format!("path {p:?}: control byte 0x{b:02x}"));
+    }
+    if !p.is_ascii() && !non_ascii_allowed(p) {
+        return Err(format!("path {p:?}: non-ASCII name outside {}", NON_ASCII_DIRS.join(", ")));
+    }
+    for c in p.split('/') {
+        if c.is_empty() || c == "." || c == ".." || c.len() > COMPONENT_MAX {
+            return Err(format!("bad path {p:?} (empty, . or .. component, or one longer than {COMPONENT_MAX})"));
+        }
+    }
+    Ok(())
+}
+
+/// A symlink of a format-2 version: it is read in the program's view, where the root tree is `/`, so an absolute
+/// target (`/usr/share/fontconfig/conf.default/x`) or a relative one with `..` names a file of the same view;
+/// nothing on the host follows these links (install and verify read them, bitsrun binds folders, not links).
+pub fn check_view_link(link: &str, target: &str) -> Result<(), String> {
+    if target.is_empty() || target.len() > PATH_MAX || target.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(format!("symlink {link}: target {target:?} empty, too long or with a control byte"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn epoch_round_trip() {
+        for (a, b) in [("foot", "foot"), ("7zip", "pkg-7zip"), ("0ad", "pkg-0ad"), ("libsigc++", "libsigcplusplus"), ("dvd+rw-tools", "dvdplusrw-tools"), ("python-foo.bar", "python-foo_bar"), ("lib32-x@y", "lib32-x_at_y"), ("Foo", "foo")] {
+            assert_eq!(program_of(a).unwrap(), b, "{a}");
+        }
+        assert!(program_of("a b").is_err() && program_of("").is_err() && program_of(&"x.".repeat(40)).is_err());
+        assert_eq!(folder_of("1:1.98.63-1").unwrap(), "e1_1.98.63-1");
+        assert_eq!(folder_of("2.44+r50+g1848099f063e-3").unwrap(), "2.44+r50+g1848099f063e-3");
+        assert_eq!(program_version("1:1.98.63-1", 2).unwrap(), "e1_1.98.63-1+2");
+        assert_eq!(pacman_of("e1_1.98.63-1+2"), ("1:1.98.63-1".to_string(), Some(2)));
+        assert_eq!(pacman_of("2.44+r50+g1848099f063e-3+1"), ("2.44+r50+g1848099f063e-3".to_string(), Some(1)));
+        assert_eq!(pacman_of("1.8.2-1.1~0a1b2c3d"), ("1.8.2-1.1".to_string(), None));
+        assert_eq!(pacman_of("1.0~rc1-1"), ("1.0~rc1-1".to_string(), None));
+        assert_eq!(pacman_of("1.0~rc1-1+3"), ("1.0~rc1-1".to_string(), Some(3)));
+        assert_eq!(pacman_of("1.0+1-1"), ("1.0+1-1".to_string(), None));
+        assert_eq!(pacman_of("e2_1.0+1-1~deadbeef"), ("2:1.0+1-1".to_string(), None));
+        assert!(folder_of("e1_2-1").is_err(), "a pkgver that looks like the epoch spelling");
+        assert_eq!(folder_of("e1x_2-1").unwrap(), "e1x_2-1");
+        assert!(folder_of("x:1-1").is_err());
+        assert!(folder_of("1:a b-1").is_err());
     }
 }

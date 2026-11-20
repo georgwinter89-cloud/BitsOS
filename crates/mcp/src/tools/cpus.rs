@@ -43,6 +43,7 @@ mcp_tool!(
     name: "cpus",
     owner: "MC",
     safety: Read,
+    local: true,
     description: "The processors: CPUs online in the kernel and the ones the firmware lists (APIC id, enabled), and every kernel thread with its scheduling class and state.",
     schema: r#"{"type":"object","properties":{}}"#,
     handler: cpus,

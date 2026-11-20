@@ -10,7 +10,7 @@ pub fn test_model() -> Model {
     s.push(more("kernel.snd_output", ch(&["auto", "jack", "hdmi", "usb"]), "normal"));
     s.push(more("theme.glow", Ty::Int { min: 0, max: 100, unit: "%".into(), word: None }, "normal"));
     s.push(more("theme.dark.bg", Ty::Color, "normal"));
-    s.push(more("claude.name", Ty::Text { max: 64 }, "normal"));
+    s.push(more("ai.assistant.name", Ty::Text { max: 64 }, "normal"));
     s.push(more("net.wifi.psk", Ty::Text { max: 64 }, "secret"));
     model(&s)
 }
@@ -66,7 +66,7 @@ fn controls_fit_and_hit_at_both_widths() {
             "choice=kernel.snd_output=hdmi",
             "choice=kernel.console_log=all",
             "field=theme.dark.bg",
-            "field=claude.name",
+            "field=ai.assistant.name",
         ] {
             assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
         }
@@ -89,7 +89,7 @@ fn the_hand_made_rows_keep_their_place() {
     let m = test_model();
     let l = layout(c, &m, &Inputs { favourites: 2, scroll: 0 });
     let (pad, top) = (40, HEAD_AREA + 16 + HEAD_H + 10);
-    for (i, k) in ["theme.mode", "theme.accent", "theme.scale", "theme.motion", "theme.effects"].iter().enumerate() {
+    for (i, k) in ["theme.mode", "theme.accent", "theme.scale", "theme.motion"].iter().enumerate() {
         assert_eq!(l.rows[row(&m, k)], Rect { x: pad, y: top + i as i32 * ROW_H, w: 920, h: ROW_H }, "{k}");
     }
     let more = l.part(Part::More(row(&m, "theme.scale"))).unwrap();

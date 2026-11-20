@@ -1,5 +1,5 @@
 //! FS-1b syscalls that change or report a node's attributes: chmod/chown/utimes and their *at and f-forms
-//! (linux-6.6/fs/open.c:629-868, fs/utimes.c), statfs/fstatfs (fs/statfs.c), sync/syncfs (fs/sync.c).
+//! (linux-7.3.1/fs/open.c:667-908, fs/utimes.c), statfs/fstatfs (fs/statfs.c), sync/syncfs (fs/sync.c).
 //! Argument checks and error order as Linux; the change itself is `setattr`.
 
 use crate::abi::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};

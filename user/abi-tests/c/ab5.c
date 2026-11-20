@@ -1240,6 +1240,40 @@ static void fcntl_owner(void) {
     int nul = open("/dev/null", O_RDWR);
     show("F_SETLEASE(F_RDLCK) on /dev/null", fcntl(nul, F_SETLEASE, F_RDLCK));
     show("F_GETLEASE on /dev/null", fcntl(nul, F_GETLEASE));
+    /* Delegations (linux-7.3.1/fs/locks.c:1881 fcntl_getdeleg, :2206 fcntl_setdeleg): struct delegation is
+     * d_flags (must be 0), d_type, __pad (must be 0). fd is open for writing, so a read delegation conflicts. */
+    struct { uint32_t flags; uint16_t type, pad; } dg = {0, 99, 0};
+    SYS("F_GETDELEG", SYS_fcntl, fd, 1039, &dg);
+    printf("  d_type %u\n", dg.type);
+    dg.flags = 1;
+    SYS("F_GETDELEG(d_flags 1)", SYS_fcntl, fd, 1039, &dg);
+    dg.flags = 0, dg.pad = 1;
+    SYS("F_GETDELEG(__pad 1)", SYS_fcntl, fd, 1039, &dg);
+    SYS("F_GETDELEG(kernel address)", SYS_fcntl, fd, 1039, KERNEL_ADDR);
+    dg.pad = 0, dg.type = F_UNLCK;
+    SYS("F_SETDELEG(F_UNLCK) without a delegation", SYS_fcntl, fd, 1040, &dg);
+    dg.type = F_RDLCK;
+    SYS("F_SETDELEG(F_RDLCK) while open for writing", SYS_fcntl, fd, 1040, &dg);
+    dg.type = 7;
+    SYS("F_SETDELEG(7)", SYS_fcntl, fd, 1040, &dg);
+    dg.type = F_RDLCK;
+    SYS("F_SETDELEG(F_RDLCK) on /dev/null", SYS_fcntl, nul, 1040, &dg);
+    /* A directory: no write delegation, no lease at all (checked before the owner); /tmp is root's. */
+    char dpath[64];
+    snprintf(dpath, sizeof dpath, "/tmp/ab5-deleg-%d", getpid());
+    mkdir(dpath, 0700);
+    int dirfd = open(dpath, O_RDONLY | O_DIRECTORY), tmpfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+    dg.type = F_WRLCK;
+    SYS("F_SETDELEG(F_WRLCK) on an own directory", SYS_fcntl, dirfd, 1040, &dg);
+    SYS("F_SETDELEG(F_WRLCK) on /tmp", SYS_fcntl, tmpfd, 1040, &dg);
+    SYS("F_SETLEASE(F_RDLCK) on an own directory", SYS_fcntl, dirfd, F_SETLEASE, F_RDLCK);
+    SYS("F_SETLEASE(F_UNLCK) on /tmp", SYS_fcntl, tmpfd, F_SETLEASE, F_UNLCK);
+    close(dirfd);
+    close(tmpfd);
+    rmdir(dpath);
+    dg.flags = 1;
+    SYS("F_SETDELEG(d_flags 1)", SYS_fcntl, fd, 1040, &dg);
+    SYS("F_SETDELEG(kernel address)", SYS_fcntl, fd, 1040, KERNEL_ADDR);
     uint64_t h = 99;
     show("F_GET_RW_HINT fresh", fcntl(fd, F_GET_RW_HINT, &h));
     printf("  hint %lu\n", (unsigned long)h);
@@ -1263,6 +1297,7 @@ static void fcntl_owner(void) {
     struct flock lp = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
     SYS("F_GETOWN on an O_PATH fd", SYS_fcntl, pa, F_GETOWN);
     SYS("F_GETLK on an O_PATH fd", SYS_fcntl, pa, F_GETLK, &lp);
+    SYS("F_GETDELEG on an O_PATH fd", SYS_fcntl, pa, 1039, &dg);
     close(pa);
     close(d);
     int sp[2];
@@ -1285,6 +1320,27 @@ static void fcntl_owner(void) {
     SYS("unknown command 9999", SYS_fcntl, fd, 9999, 0);
     SYS("F_GETOWN(999)", SYS_fcntl, 999, F_GETOWN);
     close(nul);
+    close(fd);
+    unlink(path);
+}
+
+/* F_CREATED_QUERY (linux-7.3.1/fs/fcntl.c:418): whether this open created the file (FMODE_CREATED), also on
+ * an O_PATH fd (0 there: O_PATH opens never create). Its own mode, added before V2 answered it. */
+static void fcntl_created(void) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/ab5-created-%d", getpid());
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    SYS("F_CREATED_QUERY after O_CREAT|O_EXCL made it", SYS_fcntl, fd, 1028, 0);
+    int again = open(path, O_RDWR | O_CREAT, 0600);
+    SYS("F_CREATED_QUERY after O_CREAT found it", SYS_fcntl, again, 1028, 0);
+    int dup_fd = dup(fd);
+    SYS("F_CREATED_QUERY on a dup of the creating open", SYS_fcntl, dup_fd, 1028, 0);
+    int pa = open(path, O_PATH);
+    SYS("F_CREATED_QUERY on an O_PATH fd", SYS_fcntl, pa, 1028, 0);
+    SYS("F_CREATED_QUERY(999)", SYS_fcntl, 999, 1028, 0);
+    close(pa);
+    close(dup_fd);
+    close(again);
     close(fd);
     unlink(path);
 }
@@ -1316,8 +1372,10 @@ int main(int argc, char **argv) {
         fcntl_locks();
         fcntl_release();
         fcntl_owner();
+    } else if (strcmp(m, "created") == 0) {
+        fcntl_created();
     } else {
-        printf("usage: abi-ab5 timerfd|prctl|misc|flock|fcntl\n");
+        printf("usage: abi-ab5 timerfd|prctl|misc|flock|fcntl|created\n");
         return 2;
     }
     printf("ab5 %s: done\n", m);

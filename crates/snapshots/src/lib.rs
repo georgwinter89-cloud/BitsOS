@@ -3,8 +3,8 @@
 //! A snapshot is taken with the file system frozen (`FsFreeze`: writers drained, dirty pages written back,
 //! ext4 committed and marked clean, new changes held back), so every snapshot mounts and checks clean without a
 //! journal replay; the pool's snapshot is made while frozen and committed after the thaw (VS-2b, `take`). Linux does the same in two steps
-//! (`fsfreeze -f`, `lvcreate -s`, `fsfreeze -u`: linux-6.6/fs/super.c freeze_super, fs/ext4/super.c:6369
-//! ext4_freeze, drivers/md/dm-thin-metadata.c:1235 dm_pool_create_snap); here the freeze never outlives the
+//! (`fsfreeze -f`, `lvcreate -s`, `fsfreeze -u`: linux-7.3.1/fs/super.c:2248 freeze_super, fs/ext4/super.c:6529
+//! ext4_freeze, drivers/md/dm-thin-metadata.c:1239 dm_pool_create_snap); here the freeze never outlives the
 //! call that took it, so a dying caller cannot leave /data frozen.
 //!
 //! - `Target`: what is snapshotted (the boot mount `/data`, or any pool volume a test mounted).
@@ -151,7 +151,7 @@ pub struct Taken {
 /// it); `if_changed`: no new snapshot when nothing was written since the newest one (checked while frozen, so the
 /// dirty pages are in).
 ///
-/// VS-2b keeps the frozen pause short (desk-minipc-w11.md S4: 71-405 ms on the stick): everything that can
+/// VS-2b keeps the frozen pause short (it measured 71-405 ms on the stick before): everything that can
 /// happen with writers going on happens before the freeze (write-back, then the ext4 commit and checkpoint,
 /// `sync_fs`), so the freeze only holds what changed in the last moment; inside it the device barriers wait
 /// (`PoolHandle::window`: the pool's copy window keeps every power-cut state a prefix of the writes, so the
@@ -180,16 +180,20 @@ pub fn take(t: &Target, label: &str, auto: bool, if_changed: bool) -> Result<Tak
         klog::event!(Info, "snap", "busy", pool = t.pool_name.as_str(); "the volume is frozen by someone else");
         return Err(EBUSY);
     }
+    // The volume's flushes wait from the window until this take's `freeze` is done (drain included): the freeze's
+    // own, and those of fsyncs under way meanwhile (the block dispatcher sends both, bitsvol cannot tell them
+    // apart). Those are durable with the commit right after the thaw; every power-cut state stays a prefix of the
+    // writes (the copy window), and an fsync returns only then (ext4 ends it with `settle`; plan/spec/snapshots.md
+    // §2). Deferring from the window on, not only from
+    // the freeze on, and `window` waiting for the flushes it came too late for, keep device barriers out of the
+    // pause: 12.11. a writer's fsync commit that still ran (or began between the window and the freeze) was in
+    // every pause, 1 to 3 barriers and 30 to 50 ms each. Writers go on until the freeze.
+    let freezing = Arc::new(AtomicBool::new(true));
+    let f2 = freezing.clone();
+    let window = t.pool.window(t.vol, Arc::new(move || f2.load(Ordering::Acquire))).map_err(dev_errno)?;
+    // The pause begins with the freeze.
     let b0 = t.pool.lock().map(|p| p.barriers()).unwrap_or_default();
     let t0 = now();
-    // The volume's flushes wait while this take's `freeze` runs (drain included): the freeze's own, and those of
-    // fsyncs under way meanwhile (the block dispatcher sends both, bitsvol cannot tell them apart). Those are
-    // durable with the commit right after the thaw; every power-cut state stays a prefix of the writes, and an
-    // fsync that asks `PoolHandle::settle` returns only then (notes vs-VS-2b.md, decision 2 and the fixer's
-    // change request for the fsync path).
-    let (sb, freezing) = (t.sb.clone(), Arc::new(AtomicBool::new(false)));
-    let f2 = freezing.clone();
-    let window = t.pool.window(t.vol, Arc::new(move || f2.load(Ordering::Acquire) && sb.is_frozen())).map_err(dev_errno)?;
     let r = frozen_part(t, &freezing, label, created_ns, auto, if_changed);
     let t3 = now();
     let b1 = t.pool.lock().map(|p| p.barriers()).unwrap_or_default();
@@ -203,6 +207,9 @@ pub fn take(t: &Target, label: &str, auto: bool, if_changed: bool) -> Result<Tak
     }
     drop(window);
     let t4 = now();
+    // The discards of chunks freed since the last take, a bounded part, with the copy window closed (every write
+    // goes in place again) and the commit answered (an fsync's `settle` does not wait for them).
+    t.pool.trim_owed();
     if let Err(e) = c {
         klog::event!(Warn, "snap", "commit_failed", pool = t.pool_name.as_str(), errno = e, owed = t.pool.owed_flushes(); "the freeze's writes and the snapshot are not durable yet");
     }
@@ -236,7 +243,6 @@ pub fn take(t: &Target, label: &str, auto: bool, if_changed: bool) -> Result<Tak
 
 /// Freeze, the pool's snapshot in memory, thaw: (id, new, frozen at, snapshot made at).
 fn frozen_part(t: &Target, freezing: &AtomicBool, label: &str, created_ns: u64, auto: bool, if_changed: bool) -> Result<(u64, bool, u64, u64), Errno> {
-    freezing.store(true, Ordering::Release);
     let f = t.sb.freeze();
     freezing.store(false, Ordering::Release);
     if let Err(e) = f {

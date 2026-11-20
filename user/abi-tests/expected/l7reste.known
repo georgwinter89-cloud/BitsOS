@@ -1,0 +1,2 @@
+# Known DIFF cases of `cargo xtask abi-diff` for L7-RESTE-FS's program (abi-pagemap): "<case>: <owner>: <why>".
+abi-pagemap sticky: mm: smaps shows "gu" only while the VMA holds a guard; Linux's VM_MAYBE_GUARD stays after MADV_GUARD_REMOVE (sticky, linux-7.3.1/mm/madvise.c:1146, include/linux/mm.h:650) and needs a VMA flag in crates/mm (merge ignores it, a merge ORs it), not added while MEMCRASH edits crates/mm. Open item in plan/notes/desk-offen.md, group G3; remove this line when the flag is there ("after the remove gu = yes" on V2)

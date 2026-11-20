@@ -13,9 +13,8 @@ use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-/// The app id bitscomp knows its pages by (with the pid of a page it started).
-pub const APP_ID: &str = "bitscomp.einstellungen";
-pub const TITLE: &str = "Einstellungen";
+// The app id bitscomp knows a page by (with the pid of a page it started): PK-7a, each page kind has its own id
+// and title (`page_kind`).
 
 #[derive(Default)]
 struct State {
@@ -108,8 +107,9 @@ fn serve(address: &str) -> Result<(), String> {
         eprintln!("bitscomp page {address}: no wp_viewporter: the buffer stays 1x1 (window geometry only)");
     }
     st.xdg = Some(xdg);
-    top.set_app_id(APP_ID.into());
-    top.set_title(TITLE.into());
+    let kind = crate::page_kind::PageKind::of_address(address);
+    top.set_app_id(kind.app_id().into());
+    top.set_title(kind.title().into());
     surface.commit();
     st.surface = Some(surface);
     // The address is in our argv (bitscomp reads it from what it started); printed for the log only.

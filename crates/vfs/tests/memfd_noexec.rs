@@ -1,5 +1,5 @@
-//! FS-10: `vm.memfd_noexec` (linux-6.6/kernel/pid_sysctl.h, `check_sysctl_memfd_noexec`). Its own test binary:
-//! the value is system-wide and would change what the unit tests' memfds get.
+//! FS-10: `vm.memfd_noexec` (linux-7.3.1/kernel/pid_sysctl.h:8, mm/memfd.c:345 `check_sysctl_memfd_noexec`).
+//! Its own test binary: the value is system-wide and would change what the unit tests' memfds get.
 
 use std::cell::RefCell;
 use std::sync::Arc;

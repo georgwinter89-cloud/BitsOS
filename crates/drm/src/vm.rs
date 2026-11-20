@@ -1,7 +1,7 @@
-//! DR-7: the GPU VM of one DRM file (Linux `amdgpu_fpriv.vm`, linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c):
+//! DR-7: the GPU VM of one DRM file (Linux `amdgpu_fpriv.vm`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c):
 //! the interval map of the client's GPU addresses, one bo_va per object the file has handles for (with the
 //! mappings of that object), the PRT bo_va for mappings without memory, the VMID reservation flag, and the queue
-//! of page-table jobs for the backend (`gpu::GpuVm`). GEM_VA (amdgpu_gem.c:664) and AMDGPU_VM (amdgpu_vm.c:2463)
+//! of page-table jobs for the backend (`gpu::GpuVm`). GEM_VA (amdgpu_gem.c:837) and AMDGPU_VM (amdgpu_vm.c:2903)
 //! end in `vm_ioctl`. The backend's VM is made at the first GEM_VA (Linux makes it at open; nothing a program sees
 //! differs) and dropped at the last close.
 
@@ -538,6 +538,12 @@ fn clear_range(g: &mut State, s: u64, e: u64) -> bool {
     any
 }
 
+/// The flags a Map hands the backend: COHERENT/UNCACHED objects map uncached whatever the VA asked
+/// (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c:509); the mapping itself keeps the flags it was given.
+pub(crate) fn pte_flags(bo_flags: u64, flags: u32) -> u32 {
+    if bo_flags & crate::gem::UC_FLAGS != 0 { (flags & !AMDGPU_VM_MTYPE_MASK) | AMDGPU_VM_MTYPE_UC } else { flags }
+}
+
 /// MAP and REPLACE after the ioctl's checks: `va` in the index space.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn map(vm: &FileVm, owner: Owner, bo: Option<&Arc<Bo>>, va: u64, offset: u64, size: u64, flags: u32, replace: bool) -> Result<(), Errno> {
@@ -560,7 +566,7 @@ pub(crate) fn map(vm: &FileVm, owner: Owner, bo: Option<&Arc<Bo>>, va: u64, offs
             first: offset >> PAGE_SHIFT,
             place: b.place(),
             uswc: b.flags() & AMDGPU_GEM_CREATE_CPU_GTT_USWC as u64 != 0,
-            flags: op_flags,
+            flags: pte_flags(b.flags(), op_flags),
         },
         None => PtOp::Prt { va, pages: e - s + 1, flags: op_flags },
     };

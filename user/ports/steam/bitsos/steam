@@ -1,8 +1,9 @@
 #!/bin/sh
-# GM-2a: `steam` starts Valve's Steam client (beta channel, the 64-bit client in its container) on BitsOS V2, in software
-# through Xwayland, up to the login window. Lives in \BITSOS2\bin\ (on PATH); Valve's files in \BITSOS2\steam\ (manifest
+# GM-2a: `steam` starts Valve's Steam client (beta channel, the 64-bit client in its container) on BitsOS V2, on the GPU
+# through Xwayland (glamor, DRI3), up to the login window. Lives in \BITSOS2\bin\ (on PATH); Valve's files in \BITSOS2\steam\ (manifest
 # `tree steam`, made by user/ports/steam/scripts/stage-v2.sh).
-#   steam [ARGS]    start it in the desktop; ARGS go to Steam (for example -cef-disable-sandbox); ends when Steam ends
+#   steam [ARGS]    start it in the desktop; ARGS go to Steam (for example -cef-disable-sandbox); ends when Steam ends. While it
+#                   runs, one steam:// URL (steam steam://rungameid/ID) goes to the running Steam and the launcher ends at once
 #   steam --check   check the tree, /bin/bash, the desktop, Xwayland, the user, the data volume, the reaper, Proton; start and write nothing
 #   steam --env     print the environment Steam gets (one VAR=value per line); start nothing
 #   steam --status  the launcher's last stage, Steam's processes, the X11 windows, where the logs are; change nothing
@@ -10,12 +11,13 @@
 # It never runs as root: started by root (console, MCP as root) it runs as uid 1000 (BusyBox chpst -u 1000:1000) or refuses.
 # Steam needs a real file system (links, hard links, several GB), so it refuses without an ext4 data volume at /data.
 # One at a time: a flock on $RUN/lock, gone with the launcher however it ends. A second start, or one while Steam's programs still
-# run without a launcher, says so and changes nothing (not the tree, not the log, not the stages).
+# run without a launcher, says so and changes nothing (not the tree, not the log, not the stages). GM-6s: the one exception is a
+# second start with exactly one steam:// URL while Steam's client runs: it goes to that client (forward, below), one log line.
 # First start: Valve's bootstrap into $HOME/.local/share/Steam, Steam's package/ folder seeded from the stick (the client then
 # unpacks it itself; a newer client comes from Valve's CDN as usual), the opt-in to the beta and its 64-bit client, and the
-# graphics provider (Mesa + glibc, software only here) into $HOME/.local/share/bitsos-steam/gfx.
+# graphics provider (Mesa + glibc: radeonsi and RADV) into $HOME/.local/share/bitsos-steam/gfx.
 # Xwayland belongs to the desktop (bitscomp holds :0 and starts it at the first X11 client); no second one is started.
-# Every stage goes to $RUN/steam.log with Steam's own output; `steam_check.py` (host/tests/minipc/steam.sh) reads it.
+# Every stage goes to $RUN/steam.log with Steam's own output.
 # GM-2b: Steam starts every game through steamrt64/reaper, which is 32-bit (V2 cannot run it). Once Steam's file check is over the
 # stand-in /bin/reaper (user/ports/steam/reaper) is put there as a real file and kept there; the stage `reaper` and --check say
 # which one is there. It counts among Steam's programs: --stop and a signal reach a game through it.
@@ -29,6 +31,12 @@ HOME_DATA=$DATA/home/1000
 STATE=${SB_DATA_STATE:-/run/bitsos/data-state}
 MOUNTS=${SB_MOUNTS:-/proc/self/mounts}
 USER_RUN=${SB_USER_RUN:-/run/user/1000}
+# Durchblick (DB5a; DECISIONS 18.11.: on by default): while atspid runs the accessibility bus, Steam hands its library
+# (the web helper) to it, as Brave and LibreOffice do; its environment reaches every game, which then finds the bus
+# too. ACCESSIBILITY_ENABLED is Chromium's switch for an assistive program. Without the bus: nothing.
+A11Y_BUS=${SB_A11Y_BUS:-$USER_RUN/at-spi/bus}
+A11Y_ENV=
+if [ -S "$A11Y_BUS" ]; then A11Y_ENV="AT_SPI_BUS_ADDRESS=unix:path=$A11Y_BUS ACCESSIBILITY_ENABLED=1"; fi
 BASH_BIN=${SB_BASH:-/bin/bash}
 X11_DIR=${SB_X11_DIR:-/tmp/.X11-unix}
 PATH=${SB_PATH:-/bin:/sbin:/usr/bin:/boot/BITSOS2/bin}
@@ -37,8 +45,7 @@ UID_NOW=$(id -u 2>/dev/null)
 CHANNEL=publicbeta
 # The client, the runtime and pressure-vessel's copy of it, a provider and Steam's own download cache, in KiB.
 NEED_KB=${SB_NEED_KB:-6000000}
-# The web helper draws on the GPU like the rest (WY-3b gave Xwayland glamor and DRI3); SB_STEAM_FLAGS="-cef-disable-gpu" goes back.
-FLAGS=${SB_STEAM_FLAGS-}
+# The web helper draws on the GPU like the rest (WY-3b gave Xwayland glamor and DRI3).
 
 say() { echo "steam: $*"; }
 case $UID_NOW in ''|*[!0-9]*) say "id -u gave no uid ('$UID_NOW'): nothing started"; exit 1 ;; esac
@@ -102,8 +109,6 @@ bash_ok() {
 desk_pids() {
   ps_=
   for p in $(pidof bitscomp); do
-    # The rescue build waits beside the gpu build as its parent (WY-CHIP): not a desktop of its own.
-    [ "$(cat "/proc/$p/comm" 2>/dev/null)" != bitscomp-rescue ] || continue
     case "$(tr '\0' ' ' 2>/dev/null <"/proc/$p/cmdline")" in
       *" page "* | *" ctl "* | *" page" | *" ctl") ;;
       *) ps_="$ps_${ps_:+ }$p" ;;
@@ -211,14 +216,15 @@ data_ok() {
 # variables: the client is X11 only. PRESSURE_VESSEL_ARCHITECTURES: V2 runs no 32-bit programs yet, so pressure-vessel does not
 # look for a 32-bit graphics stack. PROTON_USE_WOW64: for the same reason every Proton game takes Proton's 64-bit-only Wine
 # (files/bin-wow64); the classic files/bin/wine is i386 and Wine starts it for any 32-bit Windows program, also in a 64-bit game's
-# prefix (plan/notes/gm-PROTON.md). Games get it from Steam's environment; native games ignore it. The session bus is the
+# prefix (plan/spec/programs.md §5.2). Games get it from Steam's environment; native games ignore it. The session bus is the
 # launcher's own (start_bus): Valve's container tools will not run without one. No system bus.
+# shellcheck disable=SC2086
 steam_env() {
   exec env -i PATH="$T/bin:/bin:/sbin:/usr/bin" HOME="$H" USER="$NAME" LOGNAME="$NAME" LANG=C.UTF-8 ${TZ:+TZ=$TZ} \
     XDG_RUNTIME_DIR="$XDG" XDG_SESSION_TYPE=x11 DISPLAY=:0 \
     PRESSURE_VESSEL_GRAPHICS_PROVIDER="$BITS/gfx" PRESSURE_VESSEL_ARCHITECTURES=x86_64-linux-gnu PROTON_USE_WOW64=1 \
     ${STEAM_SILENT:+SDL_AUDIODRIVER=dummy} ${STEAM_SILENT:+ALSA_CONFIG_PATH="$BITS/asound.conf"} \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG:-$USER_RUN}/bus" DBUS_SYSTEM_BUS_ADDRESS=disabled: STEAM_RUNTIME_LOGGER=0 \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG:-$USER_RUN}/bus" DBUS_SYSTEM_BUS_ADDRESS=disabled: STEAM_RUNTIME_LOGGER=0 $A11Y_ENV \
     ${SB_VERBOSE:+PRESSURE_VESSEL_VERBOSE=1} ${SB_VERBOSE:+STEAM_LINUX_RUNTIME_VERBOSE=1} ${SB_VERBOSE:+STEAM_BOOTSTRAP_LOG_VERBOSE=1} ${SB_VERBOSE:+LIBGL_DEBUG=verbose} \
     "$@"
 }
@@ -331,8 +337,70 @@ proton_lines() {
   [ -n "$found" ] || say "proton: none in $STEAMROOT/steamapps/common yet (Steam installs it with the first Windows game)"
 }
 
+# GM-6s (sofa-mode.md 3.2): one steam:// URL while Steam's client runs goes to it, as Valve's own `steam URL` does: the client's
+# steam.sh starts a client that hands its command line over Steam's single-instance pipe and ends. The lock is let go first (this
+# start holds nothing), the stages stay the running launcher's, the log gets one line.
+# Ready means: a steam process, the FIFO ~/.steam/steam.pipe and a live pid in ~/.steam/steam.pid. A client still shutting down
+# (pipe or pid gone) would make Valve's steam.sh start a whole second client outside the lock, so then it is refused.
+# `forward URL WAIT`: while a launcher still starts Steam, a tile pressed early waits up to WAIT s for the client to be ready.
+# Bounded: a forward that does not end in $SB_FORWARD_WAIT s (60) gets TERM, its whole process group (setsid), KILL 5 s later.
+# Ends the script with the client's code.
+client_ready() {
+  [ -n "$(procs steam)" ] || { why="Steam's client does not run (yet)"; return 1; }
+  [ -p "$H/.steam/steam.pipe" ] || { why="Steam's client has no pipe $H/.steam/steam.pipe (yet)"; return 1; }
+  p_=$(cat "$H/.steam/steam.pid" 2>/dev/null)
+  case $p_ in ''|*[!0-9]*) why="no pid in $H/.steam/steam.pid (yet)"; return 1 ;; esac
+  [ -d "$PROC/$p_" ] || { why="the client $p_ of $H/.steam/steam.pid has ended"; return 1; }
+}
+secs() { case $1 in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+forward() {
+  exec 9>&-
+  url=$1
+  case $url in *[!A-Za-z0-9:/._?=\&%+,-]*) say "not a plain steam:// URL: '$url': nothing changed"; exit 1 ;; esac
+  n=0
+  until client_ready; do
+    n=$((n + 1))
+    [ $n -le $(($2 * 2)) ] || { say "$why: $url not handed over (waited $2 s), nothing changed. steam --status shows where it is."; exit 1; }
+    sleep 0.5
+  done
+  find_desk || XDG=$USER_RUN
+  if [ -f "$STEAMROOT/steam.sh" ] && [ -x "$BASH_BIN" ]; then via=steam.sh; set -- "$BASH_BIN" "$STEAMROOT/steam.sh" "$url"
+  elif [ -x "$STEAMROOT/steamrt64/steam" ]; then via=steamrt64/steam; set -- "$STEAMROOT/steamrt64/steam" "$url"
+  else say "no steam.sh and no steamrt64/steam in $STEAMROOT: $url not handed over"; exit 1; fi
+  # Its own process group, so the deadline reaches what steam.sh starts too; without setsid only steam.sh itself.
+  ss=$(command -v setsid) && set -- "$ss" "$@"
+  cd "$STEAMROOT" || { say "cannot enter $STEAMROOT"; exit 1; }
+  echo "$(date +%s) stage=forward $url to the running client ($via)" >>"$LOG" 2>/dev/null
+  say "stage forward $url to the running client"
+  late=$RUN/forward-late.$$
+  rm -f "$late"
+  fw=$(secs "$SB_FORWARD_WAIT" 60)
+  (steam_env "$@") 9>&- >>"$LOG" 2>&1 </dev/null &
+  c=$!
+  # The watcher ends at most half a second after the client: it polls, no sleep of its outlives it.
+  (n=0
+   while kill -0 $c 2>/dev/null; do
+     n=$((n + 1))
+     if [ $n = $((fw * 2 + 1)) ]; then : >"$late"; kill -TERM -$c $c 2>/dev/null
+     elif [ $n = $((fw * 2 + 11)) ]; then kill -KILL -$c $c 2>/dev/null; fi
+     sleep 0.5
+   done) 9>&- >/dev/null 2>&1 &
+  w=$!
+  wait $c
+  rc=$?
+  wait $w
+  if [ -e "$late" ]; then
+    rm -f "$late"
+    echo "$(date +%s) stage=forward-failed $url: the client did not answer in $fw s" >>"$LOG" 2>/dev/null
+    say "the client did not answer in $fw s: $url maybe not handed over"
+    exit 1
+  fi
+  [ $rc = 0 ] || { echo "$(date +%s) stage=forward-failed $url: code $rc" >>"$LOG" 2>/dev/null; say "the client ended with code $rc"; }
+  exit $rc
+}
+
 case "$1" in
-  -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   --check)
     rc=0
     if tree_ok; then say "tree $T: ok, $(sed -n 's/^client //p' "$T/VERSION.txt")"; else say "$why"; rc=1; fi
@@ -393,12 +461,16 @@ mkdir -p "$RUN" || { say "cannot make $RUN"; exit 1; }
 # Fd 9 stays open for the launcher's life; Steam itself does not get it (a stray helper must not hold the lock). Append: this
 # open must not wipe the pid of the launcher that holds it.
 exec 9>>"$LOCK" || { say "cannot open $LOCK"; exit 1; }
+URL=
+[ $# != 1 ] || case $1 in steam://*) URL=$1 ;; esac
 err=$(flock -n 9 2>&1) || {
   [ -z "$err" ] || { say "cannot take $LOCK: $err"; exit 1; }
+  [ -z "$URL" ] || forward "$URL" "$(secs "$SB_FORWARD_READY" 60)"
   say "already running (launcher $(cat "$LOCK" 2>/dev/null), $(tail -n 1 "$STAGES" 2>/dev/null)): nothing changed. steam --status shows it, steam --stop ends it."
   exit 1
 }
 steam_left
+[ -z "$left" ] || [ -z "$URL" ] || forward "$URL" 0
 [ -z "$left" ] || { say "still running without a launcher: $left: nothing changed. steam --stop ends them."; exit 1; }
 echo $$ >"$LOCK"
 : >"$STAGES"
@@ -416,12 +488,12 @@ install_client
 install_provider
 start_bus
 [ "$(pwd)" != / ] || cd "$H" 2>/dev/null || :
-stage steam "bash steam.sh $FLAGS $*"
+stage steam "bash steam.sh $*"
 CHILD= sig=
 trap 'sig=1; [ -z "$CHILD" ] || kill -TERM $CHILD 2>/dev/null' INT TERM HUP
 cd "$STEAMROOT" || fail steam "cannot enter $STEAMROOT"
 # shellcheck disable=SC2086
-(steam_env "$BASH_BIN" "$STEAMROOT/steam.sh" $FLAGS "$@") 9>&- >>"$LOG" 2>&1 &
+(steam_env "$BASH_BIN" "$STEAMROOT/steam.sh" "$@") 9>&- >>"$LOG" 2>&1 &
 CHILD=$!
 # Steam's file check at its start compares sizes: a stand-in there means a repair and a new start, again and again. So the stand-in
 # comes only once the check is over (the web helper runs), and returns whenever an update has put Valve's back.

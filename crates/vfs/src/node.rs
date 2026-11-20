@@ -30,7 +30,7 @@ pub trait File: Send + Sync {
         false
     }
     /// FS-16: Linux's FMODE_PWRITE, whether pwrite64/pwritev/pwritev2 may name a position (else ESPIPE before
-    /// any other check, linux-6.6/fs/read_write.c `ksys_pwrite64`, `do_pwritev`). seq_file files clear it
+    /// any other check, linux-7.3.1/fs/read_write.c:783 `ksys_pwrite64`, :1142 `do_pwritev`). seq_file files clear it
     /// (fs/seq_file.c `seq_open`); write(2) at the file position still works there. `opened_for_write`: the
     /// open file may write (kernfs gives the mode back only then). Default: `seekable`.
     fn positional_write(&self, _opened_for_write: bool) -> bool {
@@ -87,6 +87,11 @@ pub trait File: Send + Sync {
     fn open_node(&self, _flags: u64, _who: crate::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
         None
     }
+    /// IN-PTY: `open_node` with the place the node is opened at (Linux's `filp->f_path`): a ptmx finds its devpts
+    /// instance from it (`devpts_acquire`). Opens by name come here; the default is `open_node`.
+    fn open_node_at(&self, _at: &crate::Path, flags: u64, who: crate::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
+        self.open_node(flags, who)
+    }
     /// FS-3: read(2)/readv(2) on the whole request at once (Linux `read_iter`): pipes need the full count
     /// (one read takes from every buffer), eventfd its total length. `status` is the open file's F_GETFL.
     /// None: the object reads through `read_stream`/`read_at` in chunks.
@@ -126,6 +131,10 @@ pub trait File: Send + Sync {
             add(q);
         }
     }
+    /// L7-VFS: an EPOLLET item watches this object (epoll_ctl ADD or MOD with EPOLLET: the key Linux's
+    /// `f_op->poll` then sees). A pipe's read end then wakes its readers on every write (`pipe_poll`'s
+    /// `pseudo_edgetrigger`, linux-7.3.1/fs/pipe.c:747); nothing for every other object.
+    fn poll_edge(&self) {}
     /// FS-4: whether the object has a poll operation (Linux `file_can_poll`): epoll_ctl refuses the others
     /// with EPERM, and poll/select see them always ready (DEFAULT_POLLMASK, never waited for). Default: FIFOs,
     /// sockets, character devices and every object that names a `PollQueue` (anonymous objects such as a
@@ -398,7 +407,8 @@ pub fn open_file(d: &Arc<Dentry>, who: crate::inode::Cred, write: bool) -> Resul
     match &d.inode.data {
         Data::Synth(src) => {
             src.may_open(who, write)?;
-            Ok(Arc::new(crate::synth::SynthFile::new(src.clone(), who, d.inode.meta.mode())))
+            let src = src.bind(who)?.unwrap_or_else(|| src.clone());
+            Ok(Arc::new(crate::synth::SynthFile::new(src, who, d.inode.meta.mode())))
         }
         Data::SynthDir(sd) => {
             for src in sd.sources() {
@@ -419,6 +429,16 @@ pub fn open_file_flags(d: &Arc<Dentry>, who: crate::inode::Cred, flags: u64, wri
         return r;
     }
     open_file(d, who, write)
+}
+
+/// `open_file_flags` for an open by name: the node's own open sees where it is opened (`File::open_node_at`).
+pub fn open_file_at(at: &crate::Path, who: crate::inode::Cred, flags: u64, write: bool) -> Result<Arc<dyn File>, Errno> {
+    if let Data::Device(f) = &at.dentry.inode.data
+        && let Some(r) = f.open_node_at(at, flags, who)
+    {
+        return r;
+    }
+    open_file(&at.dentry, who, write)
 }
 
 /// A dentry opened as a pollable `File` (contract `C: Pollable` test and kernel users).
@@ -495,6 +515,9 @@ impl File for NodeFile {
     }
     fn poll_wait(&self, add: &mut dyn FnMut(&PollQueue)) {
         self.file.poll_wait(add)
+    }
+    fn poll_edge(&self) {
+        self.file.poll_edge()
     }
     fn can_poll(&self) -> bool {
         self.file.can_poll()

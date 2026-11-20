@@ -31,7 +31,10 @@ operations (a bundle, --confirm, --unpin and --config combine; --prune runs with
   --config <file>                   \\BITSOS2\\CONFIG.TXT, only on a stick without one
   --confirm <n>                     generation <n> (the newest, with TRY) had a green round: OK, TRY goes
   --unpin                           remove \\BITSOS2\\SYS\\PIN
-  --prune [--sys-keep <n>]          keep the newest <n> confirmed generations (CONFIG.TXT sys_keep, default 5)";
+  --prune [--sys-keep <n>]          keep the newest <n> confirmed generations (CONFIG.TXT sys_keep, default 5)
+  --firmware <set>                  the extra firmware set (gaming-pc: the RX 9070 XT's files) into
+                                    \\BITSOS2\\firmware\\, decompressed from /usr/lib/firmware, sizes and SHA-256 shown
+  --firmware <set> --tree <dir>     no stick: the same files as a tree <dir>/firmware for host/mcp/push.mjs --add";
 
 pub struct Opts {
     pub target: PathBuf,
@@ -49,6 +52,12 @@ pub struct Opts {
     pub prune: bool,
     pub unpin: bool,
     pub sys_keep: Option<u32>,
+    /// GP-R2: the extra firmware sets to write (`--firmware`).
+    pub firmware: Vec<String>,
+    /// The repository (the firmware lists live in it).
+    pub root: PathBuf,
+    /// Where `--firmware` reads its files: the host's linux-firmware (tests put a folder of their own in).
+    pub fw_from: (PathBuf, PathBuf),
     /// Where the per-stick lock file lives (outside the stick): $XDG_RUNTIME_DIR, else the temp folder.
     pub lock_dir: PathBuf,
 }
@@ -102,6 +111,9 @@ impl Opts {
             prune: a.flag("--prune"),
             unpin: a.flag("--unpin"),
             sys_keep: a.num("--sys-keep")?,
+            firmware: crate::firmware::parse_sets(&a.value("--firmware")?.unwrap_or_default())?,
+            root: root.to_path_buf(),
+            fw_from: (crate::firmware::host().firmware.to_path_buf(), crate::firmware::host().licences.to_path_buf()),
             lock_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir),
         };
         if !a.positionals()?.is_empty() {
@@ -117,11 +129,14 @@ impl Opts {
     }
 
     fn has_sys_ops(&self) -> bool {
-        self.bundle.is_some() || self.build.is_some() || self.confirm.is_some() || self.prune || self.unpin || self.config.is_some() || self.sys_keep.is_some()
+        self.bundle.is_some() || self.build.is_some() || self.confirm.is_some() || self.prune || self.unpin || self.config.is_some() || self.sys_keep.is_some() || !self.firmware.is_empty()
     }
 }
 
 pub fn cmd_stick(root: &Path, mut a: Args) -> Result<(), String> {
+    if a.args.iter().any(|x| x == "--tree") {
+        return firmware_tree(root, &mut a);
+    }
     let Some(o) = prepare(root, &mut a, &mut build_bundle)? else { return Ok(()) };
     run(&gate::HostProbe, &o, &mut |prompt: &str| {
         print!("{prompt}");
@@ -130,6 +145,55 @@ pub fn cmd_stick(root: &Path, mut a: Args) -> Result<(), String> {
         let _ = std::io::stdin().lock().read_line(&mut l);
         l
     })
+}
+
+/// GP-R2: `--firmware <set> --tree <dir>`: the set as `<dir>/firmware/...` on this host, for a stick that sits in the
+/// running Gaming-PC (gp_stick=on): `push.mjs --tree <dir>/firmware --name firmware --add` puts it where the drivers
+/// look. Never inside the repository except below target/ (no firmware file in git).
+fn firmware_tree(root: &Path, a: &mut Args) -> Result<(), String> {
+    let dir = PathBuf::from(a.value("--tree")?.ok_or("stick: --tree needs a directory")?);
+    let sets = crate::firmware::parse_sets(&a.value("--firmware")?.ok_or("stick: --tree goes with --firmware <set>")?)?;
+    if !a.positionals()?.is_empty() {
+        return Err(format!("stick: --firmware --tree takes nothing else, not {:?}", a.args));
+    }
+    let out = tree_dir(root, &dir)?.join("firmware");
+    for set in &sets {
+        let files = crate::firmware::set_files(root, set, &crate::firmware::host())?;
+        println!("firmware set {set} (from {}, decompressed) into {}:", crate::firmware::host().firmware.display(), out.display());
+        for f in &files {
+            let to = out.join(&f.rel);
+            if let Some(d) = to.parent() {
+                std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+            }
+            std::fs::write(&to, &f.bytes).map_err(|e| format!("{}: {e}", to.display()))?;
+            println!("  {} {} bytes sha256 {}", f.rel, f.bytes.len(), crate::image::package::sha256(&f.bytes));
+        }
+    }
+    println!("next (the stick in the running Gaming-PC, gp_stick=on): node host/mcp/push.mjs <address> --tree {} --name firmware --add --via write --gaming-pc --dry-run, then without --dry-run", out.display());
+    Ok(())
+}
+
+/// Where `--tree` really lands, refused inside the repository except below target/. The comparison is on real paths:
+/// `..` is refused outright and the deepest existing part is canonicalized, so neither `target/../plan` nor a
+/// symlink below target/ that points into the tree passes (std::path::absolute keeps both).
+fn tree_dir(root: &Path, dir: &Path) -> Result<PathBuf, String> {
+    if dir.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("refused: {} holds '..'; give the folder without it", dir.display()));
+    }
+    let abs = std::path::absolute(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (mut base, mut tail) = (abs.as_path(), Vec::new());
+    while std::fs::symlink_metadata(base).is_err() {
+        tail.push(base.file_name().ok_or_else(|| format!("{}: no existing folder above it", abs.display()))?);
+        base = base.parent().ok_or_else(|| format!("{}: no existing folder above it", abs.display()))?;
+    }
+    let mut real = std::fs::canonicalize(base).map_err(|e| format!("{}: {e}", base.display()))?;
+    real.extend(tail.iter().rev());
+    let repo = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let target = std::fs::canonicalize(repo.join("target")).unwrap_or_else(|_| repo.join("target"));
+    if real.starts_with(&repo) && !real.starts_with(&target) {
+        return Err(format!("refused: {} lies in the repository; firmware never goes into git (use target/ or a folder outside)", real.display()));
+    }
+    Ok(real)
 }
 
 /// A build step: (repo root, release) -> the built bundle's files. Tests put a fake in.
@@ -267,6 +331,14 @@ pub fn run(p: &dyn Probe, o: &Opts, ask: &mut dyn FnMut(&str) -> String) -> Resu
     }
     if let Some((t, f)) = &config {
         pl.config(t, f);
+    }
+    for set in &o.firmware {
+        let from = crate::firmware::FwFrom { firmware: &o.fw_from.0, licences: &o.fw_from.1 };
+        let files = crate::firmware::set_files(&o.root, set, &from)?;
+        println!("firmware set {set} (from {}, decompressed):", from.firmware.display());
+        for l in pl.firmware(&files) {
+            println!("  {l}");
+        }
     }
     pl.finish(keep);
     for n in &pl.notes {

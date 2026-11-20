@@ -114,8 +114,8 @@ fn pipeline() -> TestResult {
     // From here the programs hold the only ends: the consumer sees EOF when the producer exits.
     drop((r, w));
     let ps = ended(&producer, 60 * SEC, "producer")?;
-    // The producer's files close only when its process is freed (AB: no `exit_files` at exit yet, change
-    // request in plan/notes/fs-FS-3.md); this test holds the last reference, so it lets go first.
+    // The producer's files close only when its process is freed (AB: no `exit_files` at exit
+    // yet); this test holds the last reference, so it lets go first.
     drop(producer);
     let cs = ended(&consumer, 60 * SEC, "consumer")?;
     let us = (time::now_ns() - t0) / 1000;
@@ -253,7 +253,7 @@ fn many_writers() -> TestResult {
     for (i, p) in writers.into_iter().enumerate() {
         let s = ended(&p, 60 * SEC, "records")?;
         kassert!(s == proc::ExitStatus::Exited(0), "writer {i} ended {s:?}: {}", String::from_utf8_lossy(&err.contents()));
-        // Its files close only when the process is freed (change request 1 in plan/notes/fs-FS-3.md).
+        // Its files close only when the process is freed (no `exit_files` at exit).
         drop(p);
     }
     let s = ended(&consumer, 60 * SEC, "check-records")?;

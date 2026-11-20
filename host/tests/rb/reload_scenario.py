@@ -344,11 +344,12 @@ def main():
     need(not err and "passed=1" in t, "squeezed the running kernel's free memory", t)
     err, t = call(c, "reload_info")
     m = re.search(r"free for a Reload now: (\d+) MiB", t)
-    # 20-reload.sh squeezes to rb_squeeze_mb=$RB_SQUEEZE_MB, 384 (40 until wave 2, 128 until wave 4, 192 until
-    # INT-W15, 256 until INT-W27b: the test bundle's initramfs grew to ~26 MB, then ~46 MB with WY-1b's foot, ~77 MB
-    # with WY-11's Adwaita cursor theme, ~92 MB with SX-3b's bwrap and the whole glibc set, and it must fit in one
-    # piece among the squeeze's leftovers).
-    squeeze = int(os.environ.get("RB_SQUEEZE_MB", "384"))
+    # 20-reload.sh squeezes to rb_squeeze_mb=$RB_SQUEEZE_MB, 512 (40 until wave 2, 128 until wave 4, 192 until
+    # INT-W15, 256 until INT-W27b, 384 until CTX: the test bundle's initramfs grew to ~26 MB, then ~46 MB with WY-1b's
+    # foot, ~77 MB with WY-11's Adwaita cursor theme, ~92 MB with SX-3b's bwrap and the whole glibc set, ~145 MB with
+    # ctxd and its llama-server, and it must fit in one piece among the squeeze's leftovers: kexec stages it as a
+    # power-of-two block, 256 MiB from 128 MiB on, while the downloaded pieces are still held).
+    squeeze = int(os.environ.get("RB_SQUEEZE_MB", "512"))
     need(m and int(m.group(1)) < squeeze + 8, f"reload_info: only {m.group(1) if m else '?'} MiB to spare", t)
     c, pos = reload_once(c, 11, base_files, hz0, 11)
     after = free_mb(serial()[serial().rfind("BitsOS V2 kernel: entry"):])

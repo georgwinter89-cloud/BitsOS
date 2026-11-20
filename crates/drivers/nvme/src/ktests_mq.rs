@@ -99,15 +99,15 @@ fn queues() -> TestResult {
     let nq = i.queues.len();
     kassert!(nq >= 1 && nq <= cpus, "{} queues for {cpus} CPUs", nq);
     // The scenario's matrix boots say how many (min of the CPUs and QEMU's max_ioqpairs).
-    if let Some(want) = pci::registry::config_value("nv_mq_queues").and_then(|v| v.trim().parse::<usize>().ok()) {
+    if let Some(want) = pci::registry::config_value("ktest_nv_mq_queues").and_then(|v| v.trim().parse::<usize>().ok()) {
         kassert!(nq == want, "{nq} queues, the scenario wants {want} ({cpus} CPUs)");
     }
     for (k, q) in i.queues.iter().enumerate() {
         kassert!(q.qid as usize == k + 1, "queue {k} has qid {}", q.qid);
     }
-    // Every mode has its own shape; the scenario's boots name the one they expect (nvme_irq=off: polled).
+    // Every mode has its own shape; the scenario's boots name the one they expect (ktest_poll=nvme: polled).
     let mode = i.irq.unwrap_or(crate::hw::IrqMode::Polled);
-    if let Some(want) = pci::registry::config_value("nv_mq_irq") {
+    if let Some(want) = pci::registry::config_value("ktest_nv_mq_irq") {
         kassert!(mode.name() == want.trim(), "interrupt mode {}, the scenario wants {}", mode.name(), want.trim());
     }
     match mode {
@@ -276,7 +276,7 @@ fn restart() -> TestResult {
     kassert!(c.state() == crate::State::Ready, "state {}", c.state().name());
     let nq = c.info().queues.len();
     kassert!(nq == before, "{nq} queues after the restart, {before} before");
-    if let Some(want) = pci::registry::config_value("nv_mq_queues").and_then(|v| v.trim().parse::<usize>().ok()) {
+    if let Some(want) = pci::registry::config_value("ktest_nv_mq_queues").and_then(|v| v.trim().parse::<usize>().ok()) {
         kassert!(nq == want, "{nq} queues, the scenario wants {want}");
     }
     let qs = c.queue_stats();

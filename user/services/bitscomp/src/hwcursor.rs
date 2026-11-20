@@ -27,21 +27,13 @@ pub const HW_MAX: u32 = 256;
 const RETRY: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(16);
 
-/// A hardware cursor door: `/dev/fb0`'s ioctl (`backend::fbcursor`) or the headless fake. Errors are errnos.
+/// A hardware cursor door: `/dev/fb0`'s ioctl (`backend::fbcursor`), a stand-in in the tests. Errors are errnos.
 pub trait HwCursor {
     /// A new image, shown with its hotspot at `at` (screen pixels).
     fn image(&mut self, img: &CursorImage, at: (i32, i32)) -> Result<(), i32>;
     /// The hotspot to `at`.
     fn moved(&mut self, at: (i32, i32)) -> Result<(), i32>;
     fn hide(&mut self) -> Result<(), i32>;
-    /// What `ctl cursor` adds (the fake's record).
-    fn report(&self) -> String {
-        String::new()
-    }
-    /// `ctl cursor fail ERRNO N`: the next N calls fail with ERRNO (the fake only; false elsewhere).
-    fn inject(&mut self, _errno: i32, _n: u32) -> bool {
-        false
-    }
 }
 
 /// The shape the pointer should have now; a change uploads a new image.
@@ -117,9 +109,8 @@ impl Pointer {
         self.hide_hw();
         self.on_hw = false;
         if e == ENODEV || e == ENOTTY {
-            let last = self.hw.take().map(|h| h.report()).unwrap_or_default();
-            let sep = if last.is_empty() { "" } else { ": " };
-            eprintln!("bitscomp: cursor: no hardware cursor ({what}: errno {e}); the pointer is drawn into the frames{sep}{last}");
+            self.hw = None;
+            eprintln!("bitscomp: cursor: no hardware cursor ({what}: errno {e}); the pointer is drawn into the frames");
             self.retry_at = None;
             return;
         }
@@ -151,21 +142,14 @@ impl Pointer {
         if let Some(mut hw) = self.hw.take() {
             let r = hw.hide();
             self.hw_visible = false;
-            let fake = hw.report();
-            eprintln!("bitscomp: cursor: hidden at exit ({}){}{fake}", if r.is_ok() { "ok" } else { "refused" }, if fake.is_empty() { "" } else { ": " });
+            eprintln!("bitscomp: cursor: hidden at exit ({})", if r.is_ok() { "ok" } else { "refused" });
         }
-    }
-
-    /// `ctl cursor fail ERRNO N`.
-    pub fn inject(&mut self, errno: i32, n: u32) -> bool {
-        self.hw.as_mut().is_some_and(|h| h.inject(errno, n))
     }
 
     pub fn report(&self) -> String {
         let mode = if self.on_hw { "hw" } else { "software" };
-        let fake = self.hw.as_ref().map(|h| h.report()).unwrap_or_default();
         format!(
-            "mode={mode} hw={} shape={} theme={} size={} moves={} uploads={} refused={} retries={} move_us_last={} move_us_max={}{}{fake}",
+            "mode={mode} hw={} shape={} theme={} size={} moves={} uploads={} refused={} retries={} move_us_last={} move_us_max={}",
             self.hw.is_some(),
             self.shown,
             self.theme,
@@ -176,7 +160,6 @@ impl Pointer {
             self.retries,
             self.move_us.0,
             self.move_us.1,
-            if fake.is_empty() { "" } else { " " },
         )
     }
 }
@@ -220,9 +203,6 @@ impl App {
 
     /// Brings the image up to date with the shape (bitscomp's own, the client's, hidden): cheap when unchanged.
     pub fn cursor_sync(&mut self) {
-        if !self.draw_pointer {
-            return;
-        }
         if self.cursor.retry_due() {
             eprintln!("bitscomp: cursor: trying the hardware cursor again");
         }
@@ -311,72 +291,69 @@ impl App {
     }
 }
 
-/// The headless back end's stand-in (`--pointer fake`): records what a hardware cursor would be told.
-#[derive(Default)]
-pub struct Fake {
-    pub images: u64,
-    pub moves: u64,
-    pub hides: u64,
-    pub at: (i32, i32),
-    pub visible: bool,
-    pub last: String,
-    pub last_move: Option<Instant>,
-    /// `ctl cursor fail`: the next `fail.1` calls answer errno `fail.0`.
-    pub fail: (i32, u32),
-}
-
-impl Fake {
-    fn failing(&mut self) -> Result<(), i32> {
-        if self.fail.1 == 0 {
-            return Ok(());
-        }
-        self.fail.1 -= 1;
-        Err(self.fail.0)
-    }
-}
-
-impl HwCursor for Fake {
-    fn image(&mut self, img: &CursorImage, at: (i32, i32)) -> Result<(), i32> {
-        // The engine's checks (gopfb fbdev/cursor.rs of gx-GX-5a-cr.patch: size, hotspot inside, pixel count).
-        let bad = img.w == 0 || img.h == 0 || img.w > HW_MAX || img.h > HW_MAX || img.hot.0 >= img.w || img.hot.1 >= img.h;
-        if bad || img.px.len() != (img.w * img.h) as usize {
-            return Err(EINVAL);
-        }
-        self.failing()?;
-        self.images += 1;
-        self.at = at;
-        self.visible = true;
-        self.last = format!("{}x{}+{},{}", img.w, img.h, img.hot.0, img.hot.1);
-        Ok(())
-    }
-    fn moved(&mut self, at: (i32, i32)) -> Result<(), i32> {
-        self.failing()?;
-        self.moves += 1;
-        self.at = at;
-        self.visible = true;
-        self.last_move = Some(Instant::now());
-        Ok(())
-    }
-    fn hide(&mut self) -> Result<(), i32> {
-        self.hides += 1;
-        self.visible = false;
-        Ok(())
-    }
-    fn report(&self) -> String {
-        format!(
-            "fake_images={} fake_moves={} fake_hides={} fake_at={},{} fake_visible={} fake_image={}",
-            self.images, self.moves, self.hides, self.at.0, self.at.1, self.visible, self.last
-        )
-    }
-    fn inject(&mut self, errno: i32, n: u32) -> bool {
-        self.fail = (errno, n);
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tests' stand-in: records what a hardware cursor would be told.
+    #[derive(Default)]
+    struct Fake {
+        images: u64,
+        moves: u64,
+        hides: u64,
+        at: (i32, i32),
+        visible: bool,
+        last: String,
+        last_move: Option<Instant>,
+        /// The next `fail.1` calls answer errno `fail.0`.
+        fail: (i32, u32),
+    }
+
+    impl Fake {
+        fn failing(&mut self) -> Result<(), i32> {
+            if self.fail.1 == 0 {
+                return Ok(());
+            }
+            self.fail.1 -= 1;
+            Err(self.fail.0)
+        }
+    }
+
+    impl HwCursor for Fake {
+        fn image(&mut self, img: &CursorImage, at: (i32, i32)) -> Result<(), i32> {
+            // The engine's checks (gopfb fbdev/cursor.rs: size, hotspot inside, pixel count).
+            let bad = img.w == 0 || img.h == 0 || img.w > HW_MAX || img.h > HW_MAX || img.hot.0 >= img.w || img.hot.1 >= img.h;
+            if bad || img.px.len() != (img.w * img.h) as usize {
+                return Err(EINVAL);
+            }
+            self.failing()?;
+            self.images += 1;
+            self.at = at;
+            self.visible = true;
+            self.last = format!("{}x{}+{},{}", img.w, img.h, img.hot.0, img.hot.1);
+            Ok(())
+        }
+        fn moved(&mut self, at: (i32, i32)) -> Result<(), i32> {
+            self.failing()?;
+            self.moves += 1;
+            self.at = at;
+            self.visible = true;
+            self.last_move = Some(Instant::now());
+            Ok(())
+        }
+        fn hide(&mut self) -> Result<(), i32> {
+            self.hides += 1;
+            self.visible = false;
+            Ok(())
+        }
+    }
+
+    impl Fake {
+        fn inject(&mut self, errno: i32, n: u32) -> bool {
+            self.fail = (errno, n);
+            true
+        }
+    }
 
     #[test]
     fn fake_refuses_what_the_engine_refuses() {

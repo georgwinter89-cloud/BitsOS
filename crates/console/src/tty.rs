@@ -4,13 +4,13 @@
 //!
 //! Keys arrive as the bytes a Linux VT sends (`keymap::key_bytes`: Enter is `\r`, Backspace DEL, arrows
 //! `ESC [ A`...), so with the VT's start settings (`Termios::vt`: Linux's `tty_std_termios` plus IUTF8, as
-//! linux-6.6/drivers/tty/vt/vt.c:3554-3556) a program sees exactly what it sees on a Linux console: cooked lines
+//! linux-7.3.1/drivers/tty/vt/vt.c:3977-3979) a program sees exactly what it sees on a Linux console: cooked lines
 //! with echo, Ctrl+C/Ctrl+\/Ctrl+Z raising SIGINT/SIGQUIT/SIGTSTP for the foreground process group, Ctrl+D as end
 //! of file, Ctrl+S/Ctrl+Q stopping output; and raw mode, VMIN/VTIME and the rest after `tcsetattr`.
 //!
-//! Reads (`n_tty_read`, linux-6.6/drivers/tty/n_tty.c:2151) wait in slices of at most 50 ms that ask `abort`
+//! Reads (`n_tty_read`, linux-7.3.1/drivers/tty/n_tty.c:2184) wait in slices of at most 50 ms that ask `abort`
 //! (the reader's program was ended; B4: no wait without an end), and do the background check of job control
-//! except on `/dev/console` (`job_control` :2117, `redirected_tty_write`). Writes run through OPOST and wait
+//! except on `/dev/console` (`job_control` :2090, `redirected_tty_write`). Writes run through OPOST and wait
 //! while output is stopped.
 //!
 //! Locking: `tty.state` is a subsystem lock; under it only memory work. Echo goes to the caller's `draw` after
@@ -122,20 +122,9 @@ impl Tty {
         self.st.lock().ld.t
     }
 
-    /// How many bytes OPOST makes of one written byte at most: 8 with XTABS (a tab to the next tab stop), 2 with
-    /// ONLCR (`\n` to `\r\n`), else 1 (`do_output_char`, linux-6.6/drivers/tty/n_tty.c:417).
+    /// How many bytes OPOST makes of one written byte at most now (`growth`).
     pub fn output_growth(&self) -> usize {
-        use crate::termios::flag::{ONLCR, OPOST, TABDLY, XTABS};
-        let t = self.termios();
-        if !t.o(OPOST) {
-            1
-        } else if t.oflag & TABDLY == XTABS {
-            8
-        } else if t.o(ONLCR) {
-            2
-        } else {
-            1
-        }
+        growth(&self.termios())
     }
 
     /// Sets the termios as TCSETS does (VT: the hardware bits stay; `copy_hw`) and wakes readers and writers.
@@ -145,7 +134,7 @@ impl Tty {
             let old = s.ld.t;
             t.load_speeds();
             if self.port.is_some() {
-                // `pty_set_termios` (linux-6.6/drivers/tty/pty.c:276): CS8 and CREAD always, no parity.
+                // `pty_set_termios` (linux-7.3.1/drivers/tty/pty.c:269): CS8 and CREAD always, no parity.
                 t.cflag = (t.cflag & !(flag::CSIZE | flag::PARENB)) | flag::CS8 | flag::CREAD;
             } else {
                 t.copy_hw(&old);
@@ -472,12 +461,27 @@ impl Tty {
             let me = p.current();
             self.with_ctl(p, |ctl, send| ctl.check_change(me.as_ref(), p, SIGTTOU, send))?;
         }
+        // The screen's bytes go into room made with `tty.state` dropped: under that spin lock the heap can
+        // neither reclaim nor wait (5 to 11 KiB per written piece, Mini-PC 12.11.2026). The termios may change
+        // meanwhile, so the room is measured again under the lock.
+        let mut out = Vec::new();
         loop {
-            {
+            let short = {
                 let mut s = self.st.lock();
-                if !s.ld.stopped() {
-                    return Ok(s.ld.output(data));
+                if s.ld.stopped() {
+                    0
+                } else {
+                    let need = data.len().saturating_mul(growth(&s.ld.t));
+                    if out.capacity() >= need {
+                        s.ld.output_into(data, &mut out);
+                        return Ok(out);
+                    }
+                    need
                 }
+            };
+            if short > 0 {
+                out.reserve_exact(short);
+                continue;
             }
             if nonblock {
                 return Err(EAGAIN);
@@ -487,6 +491,21 @@ impl Tty {
             }
             self.wq.wait_until_timeout(|| !self.st.lock().ld.stopped(), SLICE_NS);
         }
+    }
+}
+
+/// How many bytes OPOST makes of one written byte at most under `t`: 8 with XTABS (a tab to the next tab stop), 2
+/// with ONLCR (`\n` to `\r\n`), else 1 (`do_output_char`, linux-7.3.1/drivers/tty/n_tty.c:402).
+pub fn growth(t: &crate::termios::Termios) -> usize {
+    use crate::termios::flag::{ONLCR, OPOST, TABDLY, XTABS};
+    if !t.o(OPOST) {
+        1
+    } else if t.oflag & TABDLY == XTABS {
+        8
+    } else if t.o(ONLCR) {
+        2
+    } else {
+        1
     }
 }
 

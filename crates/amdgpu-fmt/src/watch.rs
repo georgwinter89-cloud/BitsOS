@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::fence::{FenceError, Observed, Timeline};
-use crate::hang::{Dump, Line, decode_ring, decode_stream};
+use crate::hang::{Dump, Line, decode_ring_by, decode_stream};
 use crate::ring::Kind;
 use crate::sim::{self, Isa, Report, Stop};
 
@@ -61,11 +61,14 @@ pub enum TimeoutClass {
 }
 
 impl TimeoutClass {
-    /// Linux's default on bare metal.
+    /// Linux's default on bare metal. Video: 7.3.1's 2 s (amdgpu_device.c:3582, `video_timeout`); the other classes
+    /// keep the 10 s / 60 s the GFX/SDMA/compute rings were measured with (7.3.1 sets 2 s for all four: an open
+    /// point for GX-9a, not changed here).
     pub fn linux_us(self) -> u64 {
         match self {
             TimeoutClass::Compute => 60_000_000,
-            TimeoutClass::Gfx | TimeoutClass::Sdma | TimeoutClass::Video => 10_000_000,
+            TimeoutClass::Gfx | TimeoutClass::Sdma => 10_000_000,
+            TimeoutClass::Video => 2_000_000,
         }
     }
 }
@@ -83,7 +86,7 @@ pub enum QueueReset {
     SdmaRestart,
 }
 
-/// The kinds of ring on the 780M, with what each allows (decision table in plan/notes/gr-GR-3.md).
+/// The kinds of ring on the 780M, with what each allows (the policy in plan/spec/gpu.md §11.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingClass {
     /// CP_RB0, started by register writes: GC's re-init is its only reset.
@@ -93,6 +96,9 @@ pub enum RingClass {
     Sdma { burst_nop: bool },
     GfxProcess { doorbell_dw: u32, gang_ctx: u64 },
     ComputeProcess { doorbell_dw: u32, gang_ctx: u64 },
+    /// GX-8v: VCN 4's unified ring. Not a member of GC's reset domain: the VCN path restarts the block itself
+    /// (vcn_v4_0_ring_reset, :2011: stop and start), so the domain sees no queue reset.
+    Vcn,
 }
 
 /// One ring's configuration.
@@ -132,6 +138,7 @@ impl RingCfg {
             RingClass::ComputeProcess { doorbell_dw, gang_ctx } => {
                 (Kind::Gfx, TimeoutClass::Compute, false, QueueReset::MesProcess { doorbell_dw, gang_ctx })
             }
+            RingClass::Vcn => (Kind::Vcn, TimeoutClass::Video, false, QueueReset::None),
         };
         RingCfg {
             name: String::from(name),
@@ -396,9 +403,10 @@ impl RingWatch {
     pub fn report(&self, now_us: u64, ring: &[u32], ibs: &[IbWords<'_>]) -> Option<HangReport> {
         let cause = self.cause(now_us)?;
         let job = *self.jobs.front()?;
-        let isa = match self.cfg.kind {
-            Kind::Gfx => Isa::Pm4,
-            Kind::Sdma { .. } => Isa::Sdma,
+        let stream = |w: &[u32], base: u64| match self.cfg.kind {
+            Kind::Gfx => decode_stream(Isa::Pm4, w, base),
+            Kind::Sdma { .. } => decode_stream(Isa::Sdma, w, base),
+            Kind::Vcn => crate::vcn::decode_stream(w, base),
         };
         Some(HangReport {
             ring: self.id,
@@ -409,8 +417,8 @@ impl RingWatch {
             rptr: self.rptr,
             wptr: self.wptr,
             job,
-            ring_dump: decode_ring(isa, ring, job.start, self.rptr, self.wptr),
-            ibs: ibs.iter().map(|ib| IbDump { addr: ib.addr, lines: decode_stream(isa, ib.words, 0) }).collect(),
+            ring_dump: decode_ring_by(ring, job.start, self.rptr, self.wptr, &stream),
+            ibs: ibs.iter().map(|ib| IbDump { addr: ib.addr, lines: stream(ib.words, 0) }).collect(),
         })
     }
 

@@ -1,6 +1,6 @@
 //! Identify Controller, Identify Namespace, the active namespace list and the SMART / Health log, parsed from
-//! the controller's 4 KiB pages (layouts: linux-6.6/include/linux/nvme.h `struct nvme_id_ctrl`,
-//! `struct nvme_id_ns`, `struct nvme_smart_log`). Device data: every field is read with bounds checks and
+//! the controller's 4 KiB pages (layouts: linux-7.3.1/include/linux/nvme.h:309 `struct nvme_id_ctrl`,
+//! :434 `struct nvme_id_ns`, :742 `struct nvme_smart_log`). Device data: every field is read with bounds checks and
 //! every count is checked against the page, never trusted.
 
 use alloc::string::String;
@@ -122,7 +122,8 @@ pub fn parse_ns(b: &[u8]) -> NsId {
 
 impl NsId {
     /// The format in use: FLBAS bits 3:0, with bits 6:5 as the upper bits when more than 16 formats exist
-    /// (linux-6.6/include/linux/nvme.h `nvme_lbaf_index`).
+    /// (linux-6.6/include/linux/nvme.h `nvme_lbaf_index`) (Linux 7.3.1 differs:
+    /// linux-7.3.1/include/linux/nvme.h:640, see plan/spec/linux7-differences.md).
     pub fn format_index(&self) -> usize {
         let lo = (self.flbas & 0xF) as usize;
         if self.nlbaf > 16 { lo | (((self.flbas >> 5) & 3) as usize) << 4 } else { lo }

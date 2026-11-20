@@ -1,8 +1,8 @@
 //! The ground under everything (DS-2, Main.dc.html / Hell.dc.html): the dotted grid every 24 board px, the big
-//! radial glow behind the stage and a second one low right, the vignette (dark), and the scanlines (dark,
-//! theme.scanlines), all baked into one opaque image per theme and output size and drawn as the bottom element.
-//! It is never redrawn while the theme and the output stay, so a still desktop costs nothing; the glows are
-//! dithered so their 4-13 % alpha shows no bands. Only the GPU level (a later wave) would move anything here.
+//! radial glow behind the stage and a second one low right and the vignette (dark), all baked into one opaque image
+//! per theme and output size and drawn as the bottom element. It is never redrawn while the theme and the output stay,
+//! so a still desktop costs nothing; the glows are dithered so their 4-13 % alpha shows no bands. The scanlines (dark,
+//! theme.scanlines) are drawn right over it by the shaders (`fx::plan::ground`, WY-19b).
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
@@ -55,8 +55,6 @@ pub struct Paper {
     dot_in: f32,
     dot_out: f32,
     glows: Vec<Glow>,
-    /// (period px, colour, alpha) of the scanlines.
-    scan: Option<(i32, [f32; 3], f32)>,
     /// DS-3: the Bühne's stage glass over the ground (box px, radius px, colour, alpha), for what samples `pixel`
     /// (the tile corners); the stage itself is its own image above the wallpaper (`scene::stage_element`).
     stage: Option<(crate::canvas::Box2, f32, [f32; 3], f32)>,
@@ -104,7 +102,6 @@ impl Paper {
                 glow(900.0, -120.0, 600.0, 600.0, t.accent, vec![(0.0, 0.16), (1.0, 0.0)]),
             ]
         };
-        let ink = rgb(t.text);
         Paper {
             w: w.max(0),
             h: h.max(0),
@@ -114,12 +111,6 @@ impl Paper {
             dot_in: k,
             dot_out: 1.3 * k,
             glows,
-            // 1 px every 3 board px at 2.8 %: on the physical grid one line every round(3 k) px, the same mean.
-            // WY-19b: the gpu level draws them right over the ground (`fx::plan::ground`), not into it.
-            scan: (t.dark && t.scanlines && !t.effects_gpu).then(|| {
-                let p = (3.0 * k).round().max(2.0) as i32;
-                (p, ink, 0.028 * p as f32 / 3.0)
-            }),
             stage: None,
         }
     }
@@ -152,11 +143,6 @@ impl Paper {
             for i in 0..3 {
                 c[i] += (self.dot[i] - self.base[i]) * dot * self.through(x, y);
             }
-        }
-        if let Some((p, ink, a)) = self.scan
-            && y.rem_euclid(p) == 0
-        {
-            over(&mut c, ink, a);
         }
         c
     }
@@ -211,15 +197,12 @@ impl Paper {
             row.extend((0..knots).map(|i| self.ground((i * STEP) as f32 + 0.5, py)));
             let dot_row = (py.rem_euclid(self.period) - half).abs() < reach;
             let line = &mut out[(y * w * 4) as usize..((y + 1) * w * 4) as usize];
-            let scan = self.scan.filter(|(p, _, _)| y.rem_euclid(*p) == 0);
             for (x, px) in line.chunks_exact_mut(4).enumerate() {
                 let (i, f) = (x / STEP as usize, (x % STEP as usize) as f32 / STEP as f32);
                 let (a, b) = (row[i], row[i + 1]);
                 let mut g = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
                 if dot_row && dot_col[x] {
                     g = self.finish(x as i32, y, g, self.dot_cov(x as f32 + 0.5, py));
-                } else if let Some((_, ink, a)) = scan {
-                    over(&mut g, ink, a);
                 }
                 px.copy_from_slice(&Self::quantise(g, x as i32, y).to_le_bytes());
             }
@@ -311,7 +294,8 @@ mod tests {
             let lum = |c: [i32; 3]| c[0] + c[1] + c[2];
             let at_dot = split(p.pixel(2560 - 16, 16 + 32 * 10));
             let between = split(p.pixel(2560 - 32, 32 * 10));
-            assert!((lum(at_dot) - lum(dot)).abs() < (lum(at_dot) - lum(bg)).abs(), "{mode}: dot {at_dot:?}");
+            // The dot stands out of the ground beside it by at least half the line's contrast (the vignette darkens both).
+            assert!((lum(at_dot) - lum(between)).abs() * 2 > (lum(dot) - lum(bg)).abs(), "{mode}: dot {at_dot:?} line {dot:?} bg {bg:?} between {between:?}");
             assert!((lum(between) - lum(bg)).abs() < 40, "{mode}: ground {between:?} vs {bg:?}");
         }
     }
@@ -332,37 +316,10 @@ mod tests {
     }
 
     #[test]
-    fn at_the_gpu_level_the_scanlines_are_not_in_the_ground() {
-        let mut t = theme(&[("theme.mode", "dark")]);
-        let baked = Paper::new(&t, 64, 36);
-        t.effects_gpu = true;
-        let drawn = Paper::new(&t, 64, 36);
-        assert!(baked.scan.is_some() && drawn.scan.is_none(), "fx::plan::ground draws them");
-    }
-
-    #[test]
-    fn scanlines_only_dark_and_only_when_on() {
-        let on = Paper::new(&theme(&[("theme.mode", "dark")]), 640, 360);
-        let off = Paper::new(&theme(&[("theme.mode", "dark"), ("theme.scanlines", "false")]), 640, 360);
-        let light = Paper::new(&theme(&[("theme.mode", "light")]), 640, 360);
-        assert!(on.scan.is_some() && off.scan.is_none() && light.scan.is_none());
-        let (p, _, a) = on.scan.unwrap();
-        assert_eq!(p, 4);
-        assert!((a - 0.028 * 4.0 / 3.0).abs() < 1e-6, "the design's mean strength");
-        // A scan row is lighter than the next row, at the same place.
-        let lum = |pp: &Paper, x: i32, y: i32| split(pp.pixel(x, y)).iter().sum::<i32>();
-        let sum = |pp: &Paper, y: i32| (0..64).map(|x| lum(pp, x + 300, y)).sum::<i32>();
-        assert!(sum(&on, 200) > sum(&on, 201) + 64 * 3, "scan row lighter");
-        assert_eq!(sum(&off, 200) / 64, sum(&off, 201) / 64);
-    }
-
-    #[test]
-    fn gpu_level_draws_exactly_the_cheap_wallpaper_and_the_key_follows_the_theme() {
-        let cheap = Paper::new(&theme(&[("theme.effects", "cheap")]), 320, 200);
-        let gpu = Paper::new(&theme(&[("theme.effects", "gpu")]), 320, 200);
-        assert_eq!(cheap.bytes(), gpu.bytes());
+    fn the_glow_follows_the_accent() {
+        let a = Paper::new(&theme(&[]), 320, 200);
         let other = Paper::new(&theme(&[("theme.accent", "#ff8800")]), 320, 200);
-        assert_ne!(cheap.bytes(), other.bytes(), "the glow follows the accent");
+        assert_ne!(a.bytes(), other.bytes());
     }
 
     #[test]

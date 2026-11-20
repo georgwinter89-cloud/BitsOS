@@ -1,5 +1,6 @@
 //! DS-4: the boot screen at run time. The console shows it from `configure` on (the first moment the kernel has
-//! a picture and its CONFIG) when the desktop will start (`desktop=`) and the screen is big enough for the scene.
+//! a picture and its CONFIG) when the screen is big enough for the scene, on every machine but the Gaming-PC (its
+//! screen is the report page and the text console until its GPU driver is done).
 //!
 //! - The step sink (`bootsteps`) gets every kernel log line, also the ones from before the console (replay), and
 //!   only updates the model: it never draws, logs or waits (it runs in klogd, or in an emitter before klogd).
@@ -38,28 +39,31 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 0 never shown, 1 shown, 2 handed to a program, 3 ended to the text console.
 static SCREEN: AtomicU8 = AtomicU8::new(0);
 static DRAWN: AtomicU64 = AtomicU64::new(0);
-/// CONFIG `desktop=` resolved: the console starts the desktop (console-cmds reads it).
+/// The console starts the desktop (console-cmds reads it): everywhere but under the Gaming-PC's profile.
 static DESKTOP: AtomicBool = AtomicBool::new(false);
 static PROGRAM: SpinLock<Option<String>> = SpinLock::named("console.desktop_program", None);
 static SINK_ADDED: AtomicBool = AtomicBool::new(false);
-/// GX-8c: the desktop's start waits until this `time::now_ns` (0: nothing holds it).
+/// GX-8c: the desktop's start waits until this `time::now_ns` while `DESKTOP_GPU` is `GPU_HELD`.
 static DESKTOP_HOLD: AtomicU64 = AtomicU64::new(0);
+/// GX-8c: what the GPU's start told the desktop's start (`GPU_*`).
+static DESKTOP_GPU: AtomicU8 = AtomicU8::new(GPU_UNTOLD);
+/// The one line for the text console when there is no GPU for the desktop.
+static NO_GPU_LINE: SpinLock<Option<String>> = SpinLock::named("console.no_gpu_line", None);
+const GPU_UNTOLD: u8 = 0;
+const GPU_HELD: u8 = 1;
+const GPU_UP: u8 = 2;
+const GPU_NONE: u8 = 3;
 /// A panic ended the boot screen and the text console is not painted over it yet: every emergency line retries
 /// until one gets the VT and the frame (the first may find either busy).
 static PANIC_REPAINT: AtomicBool = AtomicBool::new(false);
 
-/// The desktop program when CONFIG `desktop_program=` names none.
-pub const DEFAULT_PROGRAM: &str = "/bin/bitscomp";
+/// The desktop program (the test key `ktest_desktop_program=` names a stand-in for the boot-screen scenario).
+pub const DEFAULT_PROGRAM: &str = "/boot/BITSOS2/bin/bitscomp";
 
-/// `desktop=`: (start the desktop, why). `auto` (default) = on real hardware, off under a hypervisor (QEMU tests
-/// keep today's console unless they ask with `desktop=on`, like `serial=auto`).
-pub fn resolve(value: Option<&str>, hypervisor: bool) -> Result<(bool, &'static str), ()> {
-    match value.map(str::trim) {
-        None | Some("auto") => Ok(if hypervisor { (false, "auto, hypervisor") } else { (true, "auto") }),
-        Some("on") => Ok((true, "on")),
-        Some("off") => Ok((false, "off")),
-        Some(_) => Err(()),
-    }
+/// (start the desktop, why): always, but not under the Gaming-PC's profile (no GPU driver there yet: the text
+/// console stays). Where it starts and the GPU does not come up, console-cmds keeps the text console too.
+pub fn resolve(gaming_pc: bool) -> (bool, &'static str) {
+    if gaming_pc { (false, "gaming_pc") } else { (true, "start") }
 }
 
 /// The boot screen is on the display (the VT draws nothing meanwhile).
@@ -76,22 +80,54 @@ pub fn desktop_program() -> String {
     PROGRAM.lock().clone().unwrap_or_else(|| String::from(DEFAULT_PROGRAM))
 }
 
-/// What became of init so far (from the log).
+/// GX-8c: what the GPU's start said to the desktop's start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopGpu {
+    /// Nothing yet (the kernel tells before init starts, so the desktop's start, which waits for init, finds this
+    /// only for a moment).
+    Untold,
+    /// The GPU comes up first, until this `time::now_ns` at the latest (the hang guard).
+    Held(u64),
+    /// Up: the desktop may start.
+    Up,
+    /// No GPU for the desktop (a failed bring-up, or none on this machine): no desktop, the text console with
+    /// `no_gpu_line`.
+    None,
+}
+
 /// GX-8c: a driver that comes up at boot holds the desktop's start until `until_ns` at the latest.
 pub fn hold_desktop(until_ns: u64) {
     DESKTOP_HOLD.store(until_ns, Ordering::Release);
+    DESKTOP_GPU.store(GPU_HELD, Ordering::Release);
 }
 
-/// GX-8c: its end; the desktop may start.
-pub fn release_desktop() {
-    DESKTOP_HOLD.store(0, Ordering::Release);
+/// GX-8c: the GPU is up; the desktop may start.
+pub fn desktop_gpu_up() {
+    DESKTOP_GPU.store(GPU_UP, Ordering::Release);
 }
 
-/// GX-8c: until when the desktop's start waits, if anything holds it.
-pub fn desktop_hold() -> Option<u64> {
-    Some(DESKTOP_HOLD.load(Ordering::Acquire)).filter(|&t| t != 0)
+/// GX-8c: there is no GPU for the desktop; `line` is what the text console says (one plain line).
+pub fn desktop_no_gpu(line: String) {
+    *NO_GPU_LINE.lock() = Some(line);
+    DESKTOP_GPU.store(GPU_NONE, Ordering::Release);
 }
 
+/// GX-8c: what the GPU's start said so far.
+pub fn desktop_gpu() -> DesktopGpu {
+    match DESKTOP_GPU.load(Ordering::Acquire) {
+        GPU_HELD => DesktopGpu::Held(DESKTOP_HOLD.load(Ordering::Acquire)),
+        GPU_UP => DesktopGpu::Up,
+        GPU_NONE => DesktopGpu::None,
+        _ => DesktopGpu::Untold,
+    }
+}
+
+/// The text console's line for `DesktopGpu::None`.
+pub fn no_gpu_line() -> String {
+    NO_GPU_LINE.lock().clone().unwrap_or_default()
+}
+
+/// What became of init so far (from the log).
 pub fn init_state() -> Init {
     STEPS.lock().init
 }
@@ -133,18 +169,10 @@ pub fn watched_lines() -> (u64, u64) {
 }
 
 /// CONFIG and the start of the boot screen (from `configure`, before the console's log sink is attached so the
-/// replayed boot lines go into the text model only). `desktop=auto|on|off`, `desktop_program=<path> [args]`.
+/// replayed boot lines go into the text model only). Test key `ktest_desktop_program=<path> [args]`.
 pub(crate) fn configure(get: &dyn Fn(&str) -> Option<String>) {
-    let value = get("desktop");
-    let hv = hal::cpu::detect().hypervisor;
-    let (on, why) = match resolve(value.as_deref(), hv) {
-        Ok(r) => r,
-        Err(()) => {
-            klog::event!(Warn, "console", "config.bad", key = "desktop", value = value.as_deref().unwrap_or(""); "want auto, on or off; keeping auto");
-            resolve(None, hv).unwrap_or((false, "auto"))
-        }
-    };
-    if let Some(p) = get("desktop_program").filter(|p| p.trim().starts_with('/')) {
+    let (on, why) = resolve(crate::gaming_pc());
+    if let Some(p) = get("ktest_desktop_program").filter(|p| p.trim().starts_with('/')) {
         *PROGRAM.lock() = Some(String::from(p.trim()));
     }
     DESKTOP.store(on, Ordering::Release);
@@ -209,10 +237,18 @@ pub fn panic_repaint_pending() -> bool {
 }
 
 /// ktest `in.boot.emergency`: the boot screen's state without its thread (the VT draws nothing meanwhile), so the
-/// panic path is tested on every QEMU run, not only with `desktop=on` at 2560x1440.
+/// panic path is tested on every QEMU run, not only at 2560x1440.
 pub(crate) fn pretend_up() {
     if !ACTIVE.swap(true, Ordering::AcqRel) {
         SCREEN.store(1, Ordering::Release);
+    }
+}
+
+/// No desktop in this boot (no render node, no init): the boot screen ends and the text console shows, without a
+/// message of its own (the step list says why).
+pub fn end_quietly(reason: &'static str) {
+    if stop(reason, false) {
+        crate::vt::show_text();
     }
 }
 

@@ -34,11 +34,13 @@ pub enum Cause {
     Vmap,
     /// Other kernel-half changes: stacks, the CPU area, the direct map's memory types.
     Kernel,
+    /// W35 MM-2: a page migration took a leaf out of reach before its frame was copied (compaction).
+    Migrate,
     /// User-half changes of a single page outside the paths above.
     Other,
 }
 
-pub const CAUSES: usize = 14;
+pub const CAUSES: usize = 15;
 
 impl Cause {
     pub const ALL: [Cause; CAUSES] = [
@@ -55,6 +57,7 @@ impl Cause {
         Cause::Exit,
         Cause::Vmap,
         Cause::Kernel,
+        Cause::Migrate,
         Cause::Other,
     ];
 
@@ -73,6 +76,7 @@ impl Cause {
             Cause::Exit => "exit",
             Cause::Vmap => "vmap",
             Cause::Kernel => "kernel",
+            Cause::Migrate => "migrate",
             Cause::Other => "other",
         }
     }

@@ -335,9 +335,6 @@ const QMP_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x4e, 0x57, 0x01];
 fn irq() -> TestResult {
     let Some(d) = card("nw.virtio.irq")? else { return Ok(()) };
     if d.irq_setup() == "polled" {
-        if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-            return ktest::fail("net_irq=off: polled by request");
-        }
         return Err("virtio-net runs polled: no MSI-X (see virtio.irq_fallback / pci msi.refused)".into());
     }
     let (stats, released) = d.irq_stats().ok_or("no interrupt set kept")?;

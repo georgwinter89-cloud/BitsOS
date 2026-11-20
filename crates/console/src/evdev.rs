@@ -2,11 +2,11 @@
 //! Events injected by MCP `send_keys`/`send_mouse` carry `injected = true` and can never trigger
 //! physical-only actions (R8c/R8f: recovery code, poweroff).
 //!
-//! IN-2a adds what the Linux input core does between a driver and evdev (linux-6.6/drivers/input/input.c):
+//! IN-2a adds what the Linux input core does between a driver and evdev (linux-7.3.1/drivers/input/input.c):
 //! - **Input devices** (`register`): one per HID application (hid-generic), numbered from 0 with the smallest
 //!   free number like evdev minors, with their capabilities (what EVIOCGBIT/EVIOCGABS will answer, IN-4).
-//! - **Filtering** (`InputDevice::emit`; `input_get_disposition`, `input_handle_abs_event`, input.c:189-345 and
-//!   376-385): unchanged keys, zero relative moves, absolute values inside the fuzz, codes the device does not
+//! - **Filtering** (`InputDevice::emit`; `input_get_disposition`, `input_handle_abs_event`, input.c:156-316 and
+//!   358-372): unchanged keys, zero relative moves, absolute values inside the fuzz, codes the device does not
 //!   have and empty frames never reach the ring.
 //! - **Unplug** (`InputDevice::unregister`; `input_dev_release_keys`, input.c:732-750): every key the device
 //!   still holds is released at once, then its number is free again.
@@ -113,7 +113,7 @@ struct Pending {
 
 impl Pending {
     /// IN-6b: the time of an injected event, once per packet (Linux `input_get_timestamp`,
-    /// linux-6.6/drivers/input/input.c:2083-2088: the packet's first event stamps it, the SYN_REPORT ends it).
+    /// linux-7.3.1/drivers/input/input.c:2121-2130: the packet's first event stamps it, the SYN_REPORT ends it).
     /// The first event keeps its caller's time (MCP takes one per call) unless that is older than the newest
     /// event queued (`last`; a real report came in after the caller took it) or the event was written to
     /// `/dev/input` (Linux evdev_write never passes the writer's time): then the sink's clock, read here under
@@ -214,7 +214,7 @@ pub(crate) fn note_clamp(src: Source, behind_ns: u64) {
 
 /// IN-6: an event stamped before one already handed out (two devices stamped on two CPUs, pushed in the other
 /// order) gets the newer time, so every reader sees non-decreasing times as from Linux's one monotonic clock
-/// (linux-6.6/drivers/input/input.c input_set_timestamp: one ktime per packet). Called under the queue's lock;
+/// (linux-7.3.1/drivers/input/input.c:2106 input_set_timestamp: one ktime per packet). Called under the queue's lock;
 /// returns the event and how far it was behind (0: not clamped), which the caller counts after the lock.
 pub(crate) fn monotonic(last: &AtomicU64, ev: InputEvent) -> (InputEvent, u64) {
     let prev = last.load(Ordering::Relaxed);
@@ -828,7 +828,8 @@ impl Caps {
     pub fn is_pointer(&self) -> bool {
         !self.rel.is_empty() || (self.abs.contains_key(&0) && self.abs.contains_key(&1))
     }
-    /// Drives the screen's pointer as Linux's mousedev takes a device (linux-6.6/drivers/input/mousedev.c:1002-1046):
+    /// Drives the screen's pointer as Linux's mousedev takes a device (linux-6.6/drivers/input/mousedev.c:1002-1046
+    /// (Linux 7.3.1 differs: linux-7.3.1/drivers/input/mousedev.c:1002-1049, see plan/spec/linux7-differences.md)):
     /// REL_X and REL_Y with BTN_LEFT, or ABS_X and ABS_Y with BTN_TOUCH, BTN_TOOL_FINGER, BTN_TOOL_PEN or BTN_LEFT.
     /// A gamepad's or joystick's sticks (ABS_X/ABS_Y with BTN_GAMEPAD or BTN_JOYSTICK only) do not (IN-6b grab switch).
     pub fn moves_pointer(&self) -> bool {
@@ -904,6 +905,9 @@ pub fn register_virtual(info: DeviceInfo, alias: u32) -> Arc<InputDevice> {
 }
 
 fn register_as(sink: &'static EvdevSink, info: DeviceInfo, alias: Option<u32>) -> Arc<InputDevice> {
+    // Here, with no lock held: a device's events reach the sink under the device's lock (`emit`), where the
+    // first one would make the ring's 98 KiB (a sink of a test or tool; the kernel's is made at init).
+    sink.make_room();
     let dev = {
         let mut l = DEVICES.lock();
         let used: BTreeSet<u32> = l.iter().map(|d| d.number).collect();

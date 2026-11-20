@@ -285,21 +285,59 @@ impl crate::FsFreeze for SuperBlock {
 }
 
 struct Link {
-    name: Vec<u8>,
+    /// Shared with the parent's listing entry (`Listed`).
+    name: Arc<[u8]>,
     parent: Option<Arc<Dentry>>,
     /// Position in the parent's listing (getdents cookies stay valid while others come and go).
     seq: u64,
     unlinked: bool,
 }
 
+/// BIGDIR: one child in listing order with what getdents64 shows of it, so a listing copies its records under the
+/// directory's lock alone: no lock of the child and no heap block per entry (`dentry_list`). The name is the one
+/// the child was attached with at this position; a rename gives it a new position, so a position never changes
+/// its name (RENAME_EXCHANGE in one directory swaps the two positions' children instead).
+struct Listed {
+    d: Arc<Dentry>,
+    name: Arc<[u8]>,
+    ino: u64,
+    dt: u8,
+}
+
+impl Listed {
+    fn of(d: &Arc<Dentry>, name: Arc<[u8]>) -> Listed {
+        Listed { d: d.clone(), name, ino: d.inode.meta.ino, dt: crate::abi::dtype(d.inode.meta.mode()) }
+    }
+    fn bytes(&self) -> u64 {
+        crate::abi::dirent64_len(&self.name) as u64
+    }
+}
+
 #[derive(Default)]
 struct DirMap {
     by_name: BTreeMap<Vec<u8>, Arc<Dentry>>,
-    by_seq: BTreeMap<u64, Arc<Dentry>>,
+    by_seq: BTreeMap<u64, Listed>,
     next_seq: u64,
     /// The directory was removed: nothing may be created in it any more (`IS_DEADDIR`).
     dead: bool,
+    /// The bytes a listing of every child takes: a listing makes its buffer's room by it.
+    listed_bytes: u64,
 }
+
+impl DirMap {
+    fn list(&mut self, seq: u64, e: Listed) {
+        self.listed_bytes += e.bytes();
+        self.by_seq.insert(seq, e);
+    }
+    fn unlist(&mut self, seq: u64) -> Option<Listed> {
+        let e = self.by_seq.remove(&seq)?;
+        self.listed_bytes = self.listed_bytes.saturating_sub(e.bytes());
+        Some(e)
+    }
+}
+
+#[path = "dentry_list.rs"]
+mod list;
 
 pub struct Dentry {
     pub id: u64,
@@ -377,7 +415,7 @@ impl Dentry {
             id: NEXT_DENTRY.fetch_add(1, Ordering::Relaxed),
             sb,
             inode,
-            link: SpinLock::named("vfs.dentry.link", Link { name, parent, seq: 0, unlinked: false }),
+            link: SpinLock::named("vfs.dentry.link", Link { name: name.into(), parent, seq: 0, unlinked: false }),
             dir: SpinLock::named("vfs.dentry.dir", DirMap { next_seq: 1, ..Default::default() }),
             mounted: AtomicU32::new(0),
             loaded: AtomicBool::new(true),
@@ -406,7 +444,14 @@ impl Dentry {
         self.inode.is_dir()
     }
     pub fn name(&self) -> Vec<u8> {
-        self.link.lock().name.clone()
+        self.link.lock().name.to_vec()
+    }
+    /// The access log's hold on where this dentry sits: its parent (weak) and its name, with no allocation and
+    /// no strong reference taken or dropped. Only tried (the log calls it under its ring's lock): None while a
+    /// rename or removal holds the link.
+    pub(crate) fn try_place(&self) -> Option<(alloc::sync::Weak<Dentry>, Arc<[u8]>)> {
+        let l = self.link.try_lock()?;
+        Some((l.parent.as_ref().map_or_else(alloc::sync::Weak::new, Arc::downgrade), l.name.clone()))
     }
     /// The parent inside the same file system (None for its root).
     pub fn parent(&self) -> Option<Arc<Dentry>> {
@@ -416,7 +461,7 @@ impl Dentry {
     /// read together with the position, so a listing never shows a renamed entry's new name at its old place.
     pub fn name_at(&self, seq: u64) -> Option<Vec<u8>> {
         let l = self.link.lock();
-        (l.seq == seq && !l.unlinked).then(|| l.name.clone())
+        (l.seq == seq && !l.unlinked).then(|| l.name.to_vec())
     }
     pub fn is_unlinked(&self) -> bool {
         self.link.lock().unlinked
@@ -439,6 +484,11 @@ impl Dentry {
     }
     pub fn child(self: &Arc<Self>, name: &[u8]) -> Option<Arc<Dentry>> {
         self.load_quiet();
+        // BIGDIR: where names are looked up by their own bytes (tmpfs, ext4) a lookup makes no copy of the name
+        // and a miss ends here: one search of the loaded directory, the file system is not asked.
+        if self.sb.ops.as_ref().is_none_or(|o| o.exact_names()) {
+            return self.dir.lock().by_name.get(name).cloned();
+        }
         let key = self.sb.key(name);
         if let Some(d) = self.dir.lock().by_name.get(&key).cloned() {
             return Some(d);
@@ -482,7 +532,7 @@ impl Dentry {
                 let d = self.dir.lock();
                 let want = d.by_seq.len().min(max);
                 if want <= out.capacity() {
-                    out.extend(d.by_seq.range(from..).take(max).map(|(s, d)| (*s, d.clone())));
+                    out.extend(d.by_seq.range(from..).take(max).map(|(s, e)| (*s, e.d.clone())));
                     return out;
                 }
                 want
@@ -551,8 +601,8 @@ impl Dentry {
     /// O_TMPFILE: a regular inode below this directory without a name in it (nlink 0, already unlinked; it
     /// goes away with its last open file unless `linkable` lets linkat give it a name).
     /// Owner and mode of a new node in this directory: a set-group-ID directory gives its group, and its
-    /// S_ISGID to new directories (`inode_init_owner`, linux-6.6/fs/inode.c:2370); a new group-executable
-    /// file keeps S_ISGID only when the creator is in that group or root (`mode_strip_sgid`, inode.c:2582).
+    /// S_ISGID to new directories (`inode_init_owner`, linux-7.3.1/fs/inode.c:2718); a new group-executable
+    /// file keeps S_ISGID only when the creator is in that group or root (`mode_strip_sgid`, inode.c:3060).
     pub fn init_owner(&self, mut mode: u32, mut cred: Cred) -> (u32, Cred) {
         const S_IXGRP: u32 = 0o010;
         let dir_mode = self.inode.meta.mode();
@@ -609,7 +659,9 @@ impl Dentry {
         Ok(d)
     }
     fn attach(&self, d: &Arc<Dentry>) -> Result<(), Errno> {
-        let name = self.sb.key(&d.name());
+        let real = d.link.lock().name.clone();
+        let name = self.sb.key(&real);
+        let listed = Listed::of(d, real);
         let seq = {
             let mut m = self.dir.lock();
             if m.dead {
@@ -621,7 +673,7 @@ impl Dentry {
             let seq = m.next_seq;
             m.next_seq += 1;
             m.by_name.insert(name, d.clone());
-            m.by_seq.insert(seq, d.clone());
+            m.list(seq, listed);
             seq
         };
         d.link.lock().seq = seq;
@@ -630,12 +682,13 @@ impl Dentry {
     /// Removes the name `child` from this directory (unlink/rmdir/rename-over). Returns the removed dentry.
     pub fn detach(&self, name: &[u8]) -> Option<Arc<Dentry>> {
         let key = self.sb.key(name);
-        let d = {
+        // The listing entry is dropped after the lock (nothing is freed under it).
+        let (d, _listed) = {
             let mut m = self.dir.lock();
             let d = m.by_name.remove(&key)?;
             let seq = d.link.lock().seq;
-            m.by_seq.remove(&seq);
-            d
+            let listed = m.unlist(seq);
+            (d, listed)
         };
         d.link.lock().unlinked = true;
         Some(d)
@@ -648,6 +701,8 @@ impl Dentry {
     /// caller detached a target first).
     pub fn reattach(self: &Arc<Self>, d: &Arc<Dentry>, name: &[u8]) -> Result<(), Errno> {
         let key = self.sb.key(name);
+        let real: Arc<[u8]> = Arc::from(name);
+        let listed = Listed::of(d, real.clone());
         let seq = {
             let mut m = self.dir.lock();
             if m.dead {
@@ -659,25 +714,25 @@ impl Dentry {
             let seq = m.next_seq;
             m.next_seq += 1;
             m.by_name.insert(key, d.clone());
-            m.by_seq.insert(seq, d.clone());
+            m.list(seq, listed);
             seq
         };
-        let old_parent = {
+        let old = {
             let mut l = d.link.lock();
-            l.name = name.to_vec();
+            let old_name = core::mem::replace(&mut l.name, real);
             l.seq = seq;
             l.unlinked = false;
             d.parent_quiet.store(0, Ordering::Release);
-            l.parent.replace(self.clone())
+            (l.parent.replace(self.clone()), old_name)
         };
-        drop(old_parent);
+        drop(old);
         Ok(())
     }
     /// Swaps the names of two dentries (RENAME_EXCHANGE). Caller holds `lock_names`.
     pub fn exchange(a_dir: &Arc<Dentry>, a_name: &[u8], b_dir: &Arc<Dentry>, b_name: &[u8]) -> Result<(), Errno> {
         if Arc::ptr_eq(a_dir, b_dir) {
             let (ka, kb) = (a_dir.sb.key(a_name), a_dir.sb.key(b_name));
-            let (a, b) = {
+            let (a, b, name_a, name_b) = {
                 let mut m = a_dir.dir.lock();
                 let a = m.by_name.get(&ka).cloned().ok_or(ENOENT)?;
                 let b = m.by_name.get(&kb).cloned().ok_or(ENOENT)?;
@@ -686,21 +741,29 @@ impl Dentry {
                 // One link lock at a time (same lock class: never nested).
                 let sa = a.link.lock().seq;
                 let sb = b.link.lock().seq;
-                m.by_seq.insert(sa, b.clone());
-                m.by_seq.insert(sb, a.clone());
-                (a, b)
+                // Each position keeps its name and shows the other child now.
+                let mut swap = |seq: u64, d: &Arc<Dentry>| {
+                    m.by_seq.get_mut(&seq).map(|e| {
+                        *e = Listed::of(d, e.name.clone());
+                        e.name.clone()
+                    })
+                };
+                let name_a = swap(sa, &b).ok_or(ENOENT)?;
+                let name_b = swap(sb, &a).ok_or(ENOENT)?;
+                (a, b, name_a, name_b)
             };
-            let sa = {
+            let (sa, old_a) = {
                 let mut l = a.link.lock();
-                l.name = b_name.to_vec();
-                l.seq
+                let old = core::mem::replace(&mut l.name, name_b);
+                (l.seq, old)
             };
-            let sb = {
+            let (sb, old_b) = {
                 let mut l = b.link.lock();
-                l.name = a_name.to_vec();
-                core::mem::replace(&mut l.seq, sa)
+                let old = core::mem::replace(&mut l.name, name_a);
+                (core::mem::replace(&mut l.seq, sa), old)
             };
             a.link.lock().seq = sb;
+            drop((old_a, old_b));
             return Ok(());
         }
         let a = a_dir.detach(a_name).ok_or(ENOENT)?;

@@ -127,12 +127,13 @@ impl AskDialog {
 
 /// The kinds a grant can be for (mcp-wire installer `Kind::grantable`: not nvme, not other): wire name, what
 /// Claude may then do, the short name in the bar.
-pub const KINDS: [(&str, &str, &str); 5] = [
+pub const KINDS: [(&str, &str, &str); 6] = [
     ("install", "Kernel und Generationen installieren", "installieren"),
     ("pin", "die startende Generation festlegen", "festlegen"),
     ("reload", "den Kernel neu laden (Reload)", "Reload"),
     ("reboot", "den Rechner neu starten", "Neustart"),
     ("settings", "geschützte Einstellungen ändern", "Einstellungen"),
+    ("program", "Programme installieren und entfernen", "Programme"),
 ];
 
 pub fn kind_short(kind: &str) -> &str {
@@ -195,7 +196,7 @@ pub enum GrantStep {
 pub struct GrantDialog {
     pub kind: usize,
     pub dur: usize,
-    /// The duration choices (a headless test adds a few seconds in front: `ctl install test-seconds N`).
+    /// The duration choices.
     pub durs: Vec<Dur>,
     pub focus: Stop,
     /// Grants run now: "Alle zurücknehmen" is offered.
@@ -428,10 +429,13 @@ mod tests {
         // Values: Left/Right on a row, a click cycles.
         g.focus = Stop::Kind;
         assert_eq!(g.key(Keysym::Left, Origin::Physical), GrantStep::Stay(true));
-        assert_eq!(g.kind_name(), "settings");
+        assert_eq!(g.kind_name(), "program");
         assert_eq!(g.click(Some(Stop::Until), Origin::Physical), GrantStep::Stay(true));
         assert_eq!(g.durs[g.dur], Dur::Secs(7200));
-        assert_eq!(g.sentence("08:00"), "Claude darf bis 08:00 Uhr ohne Rückfrage geschützte Einstellungen ändern.");
+        assert_eq!(g.sentence("08:00"), "Claude darf bis 08:00 Uhr ohne Rückfrage Programme installieren und entfernen.");
+        g.focus = Stop::Kind;
+        assert_eq!(g.key(Keysym::Left, Origin::Physical), GrantStep::Stay(true));
+        assert_eq!(g.kind_name(), "settings");
         let mut r = GrantDialog::new(DURS.to_vec(), true);
         assert!(r.stops().contains(&Stop::Revoke));
         assert_eq!(r.click(Some(Stop::Revoke), Origin::Physical), GrantStep::RevokeAll);

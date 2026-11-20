@@ -39,7 +39,7 @@ pub struct SysEntry {
 }
 
 /// What the view needs to know about a function beyond its node.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FnInfo {
     pub driver: Option<&'static str>,
     pub enabled: bool,
@@ -191,7 +191,7 @@ pub fn view(nodes: &[Node], info: &dyn Fn(Loc) -> FnInfo, drivers: &[&'static st
         push(file("resource"), txt(resource(n)));
         push(file("irq"), txt(format!("{}\n", fi.irq)));
         push(file("enable"), txt(String::from(if fi.enabled { "1\n" } else { "0\n" })));
-        // DR-2 CR (INT-W23): uevent and the subsystem link, as linux-6.6/drivers/pci/pci-driver.c pci_uevent
+        // DR-2 CR (INT-W23): uevent and the subsystem link, as linux-7.3.1/drivers/pci/pci-driver.c:1611 pci_uevent
         // and the device core give every function; udev-less user space (libdrm, Mesa) reads them.
         let mut ue = String::new();
         if let Some(d) = fi.driver {
@@ -239,17 +239,49 @@ pub fn view(nodes: &[Node], info: &dyn Fn(Loc) -> FnInfo, drivers: &[&'static st
     out
 }
 
-/// The live view of the current tree, with the bound drivers and every registered driver's directory.
-pub fn entries() -> Vec<SysEntry> {
-    let nodes = crate::tree();
+/// What the view is made from: the tree, each function's `FnInfo` and the registered drivers.
+struct Made {
+    nodes: crate::nodes::Snapshot,
+    infos: Vec<FnInfo>,
+    drivers: Vec<&'static str>,
+    entries: alloc::sync::Arc<Vec<SysEntry>>,
+}
+
+/// The last view made. Mini-PC 12.11.2026: every lookup under /sys/bus/pci built all ~700 entries again (7 ms
+/// idle, up to 28 ms under memory pressure; Mesa asks a few hundred times at each program start).
+static MADE: ksync::SpinLock<Option<Made>> = ksync::SpinLock::named("pci.sysfs_view", None);
+
+/// The live view of the current tree, with the bound drivers and every registered driver's directory. Made
+/// again only when the tree, a function's driver, enable state or interrupt, or the driver list changed since
+/// the last question (asked each time: a few lock rounds, no formatting).
+pub fn entries_shared() -> alloc::sync::Arc<Vec<SysEntry>> {
+    let nodes = crate::nodes();
     let bound = crate::bindings();
     let info = |at: Loc| FnInfo {
         driver: bound.iter().find(|b| b.function == at && b.state == crate::BindState::Bound).map(|b| b.driver),
         enabled: crate::device::is_enabled(at),
         irq: crate::irq::first_vector(at).map_or(0, |v| v.vector as u32),
     };
+    let infos: Vec<FnInfo> = nodes.iter().map(|n| info(n.loc)).collect();
     let drivers: Vec<&'static str> = crate::DRIVERS.entries().iter().map(|d| d.name).collect();
-    view(&nodes, &info, &drivers)
+    {
+        let made = MADE.lock();
+        if let Some(m) = made.as_ref().filter(|m| m.nodes.same(&nodes) && m.infos == infos && m.drivers == drivers) {
+            return m.entries.clone();
+        }
+    }
+    let by_loc = |at: Loc| nodes.iter().position(|n| n.loc == at).map_or_else(FnInfo::default, |i| infos[i]);
+    let entries = alloc::sync::Arc::new(view(&nodes, &by_loc, &drivers));
+    let new = Some(Made { nodes: nodes.clone(), infos, drivers, entries: entries.clone() });
+    let old = core::mem::replace(&mut *MADE.lock(), new);
+    // Freed with the lock released.
+    drop(old);
+    entries
+}
+
+/// `entries_shared` as an owned list.
+pub fn entries() -> Vec<SysEntry> {
+    entries_shared().to_vec()
 }
 
 /// Reads configuration space for the `config` file: up to `buf.len()` bytes from `off`, stopping at the

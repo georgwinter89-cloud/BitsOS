@@ -2,8 +2,8 @@
 //!
 //! The order is Linux's (amdgpu_job.c:34): the job's waves killed (amdgpu_ring.c:425; only GFX has it, gfx_v11_0.c:6128), then
 //! what 6.6 does not have and 7.1 does, the queue reset through MES (`vmrecover`), then the full reset. BitsOS's full reset is
-//! GC's bring-up again from the PSP, which is the stop and the bring-up the tool runs; mode 2 comes behind it, closed unless
-//! CONFIG `gx_mode2=on` (GX-D9: what it does to DCN is unmeasured). Every step ends: an inline one by its own bound, a full
+//! GC's bring-up again from the PSP, which is the stop and the bring-up the tool runs; mode 2 comes behind it, as Linux's method
+//! for MP1 13.0.4 (soc21.c:377-380); a reset that moved the display engine closes both for the boot (GX-D9). Every step ends: an inline one by its own bound, a full
 //! reset's by `ResetDomain::expire` on the job thread, which gives up on a thread that does not answer.
 //!
 //! The kill and the queue steps run on the job thread: at worst MES's 2.1 s per frame, with the owner's lock taken as for any

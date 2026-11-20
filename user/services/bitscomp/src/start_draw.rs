@@ -143,7 +143,7 @@ fn paint(l: &StartLook, t: &Theme, at: Rect, layer: Layer) -> Canvas {
         let b = p.b(r);
         if lit {
             hud::glow_soft(c, b, p.v(16.0), t);
-            c.glow(b, p.v(16.0), if t.effects_gpu { 6 } else { 2 }, t.glow);
+            c.glow(b, p.v(16.0), 6, t.glow);
         }
         c.rrect(b, p.v(16.0), fill(hover));
         c.rrect_line(b, p.v(16.0), p.line(), if lit { t.accent } else { t.line });

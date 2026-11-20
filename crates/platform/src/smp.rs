@@ -8,16 +8,13 @@
 //!    do not refuse the AP are a warning (relaxed compare, V2-PLAN §2.3); one `smp.done` and one `smp.shape`.
 //!
 //! The APs then idle with interrupts on until SC-3 calls `hal::smp::hand_over_aps`.
-//!
-//! CP-4b: CONFIG `smp=off` keeps the APs offline (one `smp not_started` event, nothing prepared), `cpus=N` stops
-//! starting APs once N CPUs are online (`smp limited`); the keys are read by `crate::limit`.
 
-use crate::limit::{self, Limit};
 use crate::plan::{self, PlannedAp};
 use crate::report;
 use crate::tsc::{self, TscOffset};
 use alloc::string::String;
 use alloc::vec::Vec;
+use hal::cpu::hwp;
 use hal::smp::{ApRequest, ApStarted, Env, MtrrOutcome, StartError};
 use klog::Hex;
 use ksync::SpinLock;
@@ -42,6 +39,8 @@ pub struct ApRecord {
     pub tsc_adjust: Option<u64>,
     /// FLAGS names that differ from the BSP's (logged, not refused).
     pub differs: Vec<&'static str>,
+    /// HWP on this AP.
+    pub hwp: hal::cpu::hwp::Outcome,
 }
 
 /// The bring-up's result.
@@ -51,16 +50,13 @@ pub struct Outcome {
     /// Why nothing was started (no trampoline, no MADT, one CPU, ...).
     pub not_started: Option<&'static str>,
     pub planned: usize,
-    /// What CONFIG `smp=`/`cpus=` asked for (CP-4b).
-    pub limit: Limit,
-    /// Planned APs not started because `cpus=` was reached (never touched by this kernel: they stay in whatever
-    /// state the firmware left them, which on real UEFI boards need not be wait-for-SIPI).
-    pub held_back: usize,
     pub up: Vec<ApRecord>,
     pub failed: Vec<StartError>,
     pub bsp_mtrr_ranges: usize,
     pub bsp_tsc_adjust: Option<u64>,
     pub total_ns: u64,
+    /// HWP on the BSP (`hwp_on_bsp`).
+    pub bsp_hwp: hal::cpu::hwp::Outcome,
 }
 
 static OUTCOME: SpinLock<Option<Outcome>> = SpinLock::named("cp.smp.outcome", None);
@@ -74,11 +70,82 @@ klog::counter!(APS_UP, "smp.aps_up");
 klog::counter!(APS_FAILED, "smp.aps_failed");
 
 fn bring_up() -> Result<(), &'static str> {
-    let out = run();
+    // First: the BSP's topology, recorded on every path of `run`, needs its real HWP number.
+    let bsp_hwp = hwp_on_bsp();
+    let mut out = run();
+    out.bsp_hwp = bsp_hwp;
     // CP-8: every CPU that will ever run kernel code has its CR4 now; kernel faults may read the GS base.
     hal::idt::arm_gs_base_check();
     *OUTCOME.lock() = Some(out);
+    report_msr_faults("smp");
     Ok(())
+}
+
+/// How many of `hal::msr::faults`' registers a boot line has named.
+static FAULTS_NAMED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// GP-CPU: one line for the registers whose fault-safe access faulted and that no earlier line named. `stage` is
+/// "smp" (every CPU ran its set-up and HWP) or "boot" (the drivers and services started). A machine on which
+/// nothing faults, as the Mini-PC, gets no line; later faults show in `hw_info` (`msr_faults_line`).
+fn report_msr_faults(stage: &'static str) {
+    let f = hal::msr::faults();
+    let seen = FAULTS_NAMED.swap(f.distinct, core::sync::atomic::Ordering::AcqRel);
+    if let Some(new) = report::new_fault_registers(&f, seen) {
+        klog::event!(Warn, "cpu", "msr.faults", stage = stage, count = f.count, new = new, all = alloc::format!("{f}");
+            "this CPU refused these registers: each access was skipped and nothing else changed");
+    }
+}
+
+kreg::initcall!(kreg::Level::Late, "cpu.msr_faults", msr_faults_at_boot_end);
+fn msr_faults_at_boot_end() -> Result<(), &'static str> {
+    report_msr_faults("boot");
+    Ok(())
+}
+
+/// One text line for `hw_info` (CPU section) and the screen report: every fault-safe MSR access that faulted since
+/// boot, `cpu msr faults count=0 registers=none` on a machine where none did.
+pub fn msr_faults_line() -> String {
+    alloc::format!("cpu msr faults {}", hal::msr::faults())
+}
+
+/// HWP on the BSP wherever the CPU offers it (the APs follow on themselves), with the user's energy preference
+/// (settings key `kernel.cpu_policy`, handed over as CONFIG `cpu_policy`).
+fn hwp_on_bsp() -> hwp::Outcome {
+    let keys = acpi::cpu_keys();
+    // GP-CPU2: the EPP policy; read only where HWP can run, so a machine without it logs nothing new.
+    let (policy, bad_policy) = keys.map_or((hwp::Policy::Balanced, false), |k| hwp::parse_policy(k.cpu_policy.as_deref()));
+    if bad_policy && hwp::gate(&hal::cpu::live()).is_none() {
+        klog::event!(Warn, "cpu", "config.bad", key = "cpu_policy", value = keys.and_then(|k| k.cpu_policy.clone()).unwrap_or_default();
+            "cpu_policy= takes balanced|performance; balanced kept");
+    }
+    let o = hal::smp::hwp_bsp(policy);
+    log_hwp(0, o);
+    o
+}
+
+/// B6: what HWP did on `cpu`. A refusal is said once by the BSP; an AP says something when it switched HWP on or
+/// failed (the refusal of an AP follows from the BSP's: the same CPUID bits and mode).
+fn log_hwp(cpu: u32, o: hwp::Outcome) {
+    match o {
+        hwp::Outcome::On { was_on, lowest, highest, request } => {
+            klog::event!(Info, "cpu", "hwp.on", cpu = cpu, was_on = was_on, lowest = lowest, highest = highest, request = Hex(request),
+                epp = Hex(request >> 24 & 0xFF), policy = hal::smp::hwp_policy().name());
+        }
+        hwp::Outcome::Refused(r) if cpu == 0 => {
+            klog::event!(Info, "cpu", "hwp.refused", cpu = cpu, reason = r.name(); "the clocks stay as the firmware left them");
+        }
+        hwp::Outcome::Refused(_) => {}
+        hwp::Outcome::Failed(f) => {
+            let (a, b) = match f {
+                hwp::Failure::NotEnabled => (0, 0),
+                hwp::Failure::BadCapabilities(c) => (c, 0),
+                hwp::Failure::RequestDiffers(w, r) => (w, r),
+                // GP-CPU: `value` is the register whose access raised #GP.
+                hwp::Failure::MsrFault(msr) => (msr as u64, 0),
+            };
+            klog::event!(Warn, "cpu", "hwp.failed", cpu = cpu, reason = f.name(), value = Hex(a), read = Hex(b); "the clocks stay as the firmware left them");
+        }
+    }
 }
 
 fn skip(why: &'static str) -> Outcome {
@@ -96,40 +163,13 @@ fn record_bsp_alone() {
     }
 }
 
-/// The CPU limit from CONFIG `smp=`/`cpus=` (kept by `acpi::irq::init`); key values it does not understand are
-/// logged here, once.
-/// When the kernel never handed the keys over (`acpi::irq::init` did not run before `cpu.smp`), the answer is one
-/// CPU, never "all": `smp=off` in CONFIG must hold even then.
-pub fn config_limit() -> (Limit, Vec<limit::Problem>) {
-    match acpi::cpu_keys() {
-        Some(k) => limit::parse(k.smp.as_deref(), k.cpus.as_deref()),
-        None => (Limit::keys_missing(), Vec::new()),
-    }
-}
-
 fn run() -> Outcome {
     let start = time::now_ns();
-    let (lim, problems) = config_limit();
-    let keys = acpi::cpu_keys();
-    for p in &problems {
-        klog::event!(Warn, "smp", "config.bad", problem = p.name(), smp = keys.and_then(|k| k.smp.clone()).unwrap_or_default(),
-            cpus = keys.and_then(|k| k.cpus.clone()).unwrap_or_default(), hint = p.hint(); "a value that does not parse never means all CPUs: one CPU runs");
-    }
-    if keys.is_none() {
-        klog::event!(Warn, "smp", "keys.missing"; "the CONFIG keys smp=/cpus= were never handed over (acpi::irq::init): one CPU runs");
-    }
-    if lim.bsp_only() {
-        let listed = acpi::tables().and_then(|a| a.madt.as_ref()).map_or(1, |m| m.enabled_cpus());
-        klog::event!(Info, "smp", "not_started", reason = lim.reason(), offline = listed.saturating_sub(1);
-            "the other CPUs stay offline (single-CPU Reload works until RB-5b)");
-        record_bsp_alone();
-        return Outcome { ran: true, not_started: Some(lim.reason()), limit: lim, ..Outcome::default() };
-    }
-    let Some(tramp) = acpi::trampoline() else { return Outcome { limit: lim, ..skip("BootInfo has no trampoline record") } };
-    let Some(tables) = acpi::tables() else { return Outcome { limit: lim, ..skip("no ACPI tables") } };
-    let Some(madt) = tables.madt.as_ref() else { return Outcome { limit: lim, ..skip("no MADT") } };
+    let Some(tramp) = acpi::trampoline() else { return skip("BootInfo has no trampoline record") };
+    let Some(tables) = acpi::tables() else { return skip("no ACPI tables") };
+    let Some(madt) = tables.madt.as_ref() else { return skip("no MADT") };
     if hal::apic::mode() == hal::apic::Mode::Off {
-        return Outcome { limit: lim, ..skip("the BSP's LAPIC is not set up (CP-3)") };
+        return skip("the BSP's LAPIC is not set up (CP-3)");
     }
     let possible = hal::percpu::possible_cpus();
     // Before any AP takes a lock (SC-2 change request 4).
@@ -145,7 +185,7 @@ fn run() -> Outcome {
         Err(e) => {
             klog::event!(Error, "smp", "prepare.failed", error = alloc::format!("{e:?}"); "the APs stay off");
             record_bsp_alone();
-            return Outcome { ran: true, not_started: Some("prepare failed"), limit: lim, ..Outcome::default() };
+            return Outcome { ran: true, not_started: Some("prepare failed"), ..Outcome::default() };
         }
     };
     let bt = prep.bsp_topology;
@@ -168,7 +208,7 @@ fn run() -> Outcome {
     let hyper = hal::cpu::detect().hypervisor;
     let ready_ns = if hyper { READY_NS_HYPERVISOR } else { READY_NS_HARDWARE };
     let bsp_flags = hal::cpu::FlagBits::from_view(&hal::cpu::live());
-    let mut out = Outcome { ran: true, planned: p.aps.len(), limit: lim, bsp_mtrr_ranges: prep.mtrr.as_ref().map_or(0, |m| m.ranges.len()), bsp_tsc_adjust: prep.bsp_tsc_adjust, ..Outcome::default() };
+    let mut out = Outcome { ran: true, planned: p.aps.len(), bsp_mtrr_ranges: prep.mtrr.as_ref().map_or(0, |m| m.ranges.len()), bsp_tsc_adjust: prep.bsp_tsc_adjust, ..Outcome::default() };
     let mut stack_page = || mm_core::frames()?.alloc(0, mm_core::Zone::Normal, mm_core::Kind::Stack);
     let mut free_page = |phys: u64| {
         if let Some(fa) = mm_core::frames() {
@@ -176,13 +216,7 @@ fn run() -> Outcome {
         }
     };
     let mut table = mm_core::alloc_table_frame;
-    for (i, ap) in p.aps.iter().enumerate() {
-        if !lim.allows_another(hal::percpu::cpu_count()) {
-            out.held_back = p.aps.len() - i;
-            klog::event!(Info, "smp", "limited", max_cpus = lim.max_cpus.unwrap_or(0), held_back = out.held_back,
-                first_held_back = ap.apic_id; "CONFIG cpus= reached: the remaining APs stay offline");
-            break;
-        }
+    for ap in &p.aps {
         let mut env = Env { alloc_stack_page: &mut stack_page, free_stack_page: &mut free_page, alloc_table: &mut table, free_frame: free_stack_frame, clock: time::now_ns };
         match start_one(ap, madt, srat, ready_ns, &mut env) {
             Err(e) => {
@@ -209,7 +243,7 @@ fn run() -> Outcome {
         min_capacity = s.min_capacity, max_perf = hal::smp::max_perf(), hwp = hwp_state());
     let worst = out.up.iter().filter_map(|r| r.tsc).map(|t| t.magnitude()).max().unwrap_or(0);
     klog::event!(Info, "smp", "done", cpus = hal::percpu::cpu_count(), planned = out.planned, up = out.up.len(),
-        failed = out.failed.len(), total_ms = out.total_ns / 1_000_000, tsc_worst_ticks = worst, held_back = out.held_back);
+        failed = out.failed.len(), total_ms = out.total_ns / 1_000_000, tsc_worst_ticks = worst);
     out
 }
 
@@ -263,6 +297,7 @@ fn log_ap(st: &ApStarted, bsp_flags: &hal::cpu::FlagBits, hyper: bool, bsp_tsc_a
     if st.setup.cr0_before & (hal::cpu::CR0_CD | hal::cpu::CR0_NW) != 0 {
         klog::event!(Debug, "cpu", "ap.cache_was_off", cpu = st.cpu, cr0_was = Hex(st.setup.cr0_before));
     }
+    log_hwp(st.cpu, st.hwp);
     log_topology(st.cpu, &st.topology);
     match tsc {
         Some(t) => {
@@ -282,11 +317,11 @@ fn log_ap(st: &ApStarted, bsp_flags: &hal::cpu::FlagBits, hyper: bool, bsp_tsc_a
         klog::event!(Warn, "cpu", "ap.differs", cpu = st.cpu, flags = report::joined(&differs);
             "CPUID differs from the BSP's in features the kernel does not rely on (relaxed compare): kept");
     }
-    ApRecord { cpu: st.cpu, apic_id: st.apic_id, sipis: st.sipis, ns_ready: st.ns_ready, mtrr: st.mtrr, tsc, tsc_adjust: st.tsc_adjust, differs }
+    ApRecord { cpu: st.cpu, apic_id: st.apic_id, sipis: st.sipis, ns_ready: st.ns_ready, mtrr: st.mtrr, tsc, tsc_adjust: st.tsc_adjust, differs, hwp: st.hwp }
 }
 
-/// HWP on the BSP for the shape event (B6: with "off" the capacity hint falls back to the core types, since V2
-/// never switches HWP on): none (no Intel CPUID hwp), off (firmware left IA32_PM_ENABLE bit 0 clear), on.
+/// HWP on the BSP for the shape event (B6: with "off" the capacity hint falls back to the core types): none (no Intel
+/// CPUID hwp on bare metal), off (IA32_PM_ENABLE bit 0 clear: the firmware left it so and enabling failed), on.
 fn hwp_state() -> &'static str {
     let caps = hal::msr::ReadCaps::live();
     match (caps.hwp, caps.hwp_enabled) {
@@ -299,8 +334,23 @@ fn hwp_state() -> &'static str {
 fn log_topology(cpu: u32, t: &hal::smp::Topology) {
     klog::event!(Info, "cpu", "topology", cpu = cpu, apic_id = t.apic_id, package = t.package_id, die = t.die_id,
         core = t.core_id, thread = t.thread_id, threads_per_core = t.threads_per_core,
-        sibling_of = t.smt_sibling_of.map_or(-1, |s| s as i64), cluster = t.cluster_id, node = t.node,
+        sibling_of = t.smt_sibling_of.map_or(-1, |s| s as i64), cluster = t.cluster_id, l2 = t.l2_id, node = t.node,
         core_type = report::core_type_name(t.core_type), perf_highest = t.perf_highest, leaf = Hex(t.source_leaf as u64));
+}
+
+/// One text line for `hw_info` (CPU section): HWP and speculation control as this CPU has them.
+pub fn hwp_line() -> String {
+    let m = |x: Option<u64>| x.map_or(String::from("none"), |v| alloc::format!("{v:#x}"));
+    let on = outcome().map_or(0, |o| usize::from(o.bsp_hwp.is_on()) + o.up.iter().filter(|r| r.hwp.is_on()).count());
+    alloc::format!(
+        "cpu hwp state={} on_cpus={on}/{} bsp={} request={} max_perf={} spec_ctrl={}",
+        hwp_state(),
+        hal::percpu::cpu_count(),
+        outcome().map_or("not_run", |o| o.bsp_hwp.name()),
+        m(hal::msr::read_checked(hal::msr::IA32_HWP_REQUEST)),
+        hal::smp::max_perf(),
+        m(hal::msr::read_checked(hal::msr::IA32_SPEC_CTRL)),
+    )
 }
 
 /// Text lines for `hw_info` (CPU section) and the Mini-PC check list: one line per CPU with its topology, time
@@ -312,28 +362,28 @@ pub fn summary() -> Vec<String> {
         out.push(alloc::format!("smp: not started ({why})"));
     }
     out.push(alloc::format!(
-        "smp cpus={} planned={} up={} failed={} held_back={} limit={} total_ms={}",
+        "smp cpus={} planned={} up={} failed={} total_ms={}",
         hal::percpu::cpu_count(),
         o.planned,
         o.up.len(),
         o.failed.len(),
-        o.held_back,
-        o.limit.max_cpus.map_or(String::from("none"), |m| alloc::format!("{m}")),
         o.total_ns / 1_000_000
     ));
     for cpu in 0..hal::percpu::cpu_count() {
         let Some(t) = hal::smp::topology(cpu) else { continue };
         let rec = o.up.iter().find(|r| r.cpu as usize == cpu);
         out.push(alloc::format!(
-            "cpu {cpu} apic={} pkg={} die={} core={} thread={} cluster={} type={} capacity={} ready_us={} tsc_offset={}{} tsc_adjust={:#x} mtrr={}",
+            "cpu {cpu} apic={} pkg={} die={} core={} thread={} cluster={} l2={} type={} capacity={} hwp={} ready_us={} tsc_offset={}{} tsc_adjust={:#x} mtrr={}",
             t.apic_id,
             t.package_id,
             t.die_id,
             t.core_id,
             t.thread_id,
             t.cluster_id,
+            t.l2_id,
             report::core_type_name(t.core_type),
             t.capacity(hal::smp::max_perf()),
+            rec.map_or(o.bsp_hwp, |r| r.hwp).name(),
             rec.map_or(0, |r| r.ns_ready / 1000),
             rec.and_then(|r| r.tsc).map_or(0, |x| x.median),
             if rec.and_then(|r| r.tsc).is_some_and(|x| x.magnitude() > tsc::CHECK_TICKS) { " (over 38)" } else { "" },

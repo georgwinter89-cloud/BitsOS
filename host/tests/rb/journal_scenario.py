@@ -20,7 +20,7 @@ import time
 
 PHASE, PORT, TOKEN, HTTP = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 next_id = 0
-# MCP's reboot drains the journal once the desk applied change request 2 of plan/notes/rb-RB-8.md; until then the
+# MCP's reboot drains the journal once the desk applied RB-8's change request 2; until then the
 # boot's last lines are written by the 5 s flush, so the run waits for it before rebooting.
 REBOOT_DRAINS = os.environ.get("RB8_REBOOT_DRAIN") == "1"
 FETCHES = {"subsystem": "pm", "name": "conn.closed", "fields": f"peer=10.0.2.2:{HTTP} pid>0", "since": "1"}
@@ -73,7 +73,7 @@ def wait_tool(c, name, wait_s):
         if name in tools:
             return
         time.sleep(1)
-    raise SystemExit(f"RED: tool {name} not registered within {wait_s} s (does init start bitsjournal? CR 1 of plan/notes/rb-RB-8.md)")
+    raise SystemExit(f"RED: tool {name} not registered within {wait_s} s (does init start bitsjournal? RB-8's CR 1, plan/spec/robustness.md §8)")
 
 
 def shown(t):

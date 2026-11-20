@@ -1,7 +1,7 @@
 //! The statistics of one lock class, kept per CPU (PF-2): every CPU counts in its own cache-line slot, so
 //! taking a lock writes no line another CPU writes; readers (`stats`) sum the slots (the `*_max` fields
-//! combine with max), as Linux's `lock_stats` sums its per-CPU `cpu_lock_stats` (linux-6.6/kernel/locking/
-//! lockdep.c:244, :294). Unlike Linux there is no fixed class bound (R1): each class owns a list of slot
+//! combine with max), as Linux's `lock_stats` sums its per-CPU `cpu_lock_stats` (linux-7.3.1/kernel/locking/
+//! lockdep.c:250, :300). Unlike Linux there is no fixed class bound (R1): each class owns a list of slot
 //! chunks that covers CPUs [0, covered); a CPU outside it (no chunk yet: before `prepare_cpus`, an
 //! allocation that could not be made) counts in the class's `shared` slot, so no count is ever lost.
 //!

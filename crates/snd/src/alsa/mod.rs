@@ -1,6 +1,7 @@
-//! SN-4: the ALSA kernel interface libasound talks to (card 0 = the mixer): `/dev/snd/pcmC0D0p` (`pcm`,
-//! `xfer`, the refine engine in `params`), `/dev/snd/pcmC0D0c` (SN-9: `cpcm`, `cxfer`, recording),
-//! `/dev/snd/controlC0` (`ctl`), `/proc/asound/{cards,devices,pcm,version}` and `card0/id`. ABI: `abi` (x86-64 layouts of `linux-6.6/include/uapi/sound/asound.h`).
+//! SN-4: the ALSA kernel interface libasound talks to (card 0 = the mixer): `/dev/snd/pcmC0D0p` (`pcm`, `xfer`, the
+//! refine engine in `params`), `/dev/snd/pcmC0D0c` (SN-9: `cpcm`, `cxfer`, recording), `/dev/snd/controlC0` (`ctl`),
+//! `/proc/asound/{cards,devices,pcm,version}` and `card0/id`. ABI: `abi` (x86-64 layouts of
+//! `linux-7.3.1/include/uapi/sound/asound.h`).
 //!
 //! Card 0 always exists once the mixer runs: without a controller it plays into the mixer's null output (SN-3
 //! decision 9), so programs that keep time by the sound clock (Cobalt) work on machines without sound. Every

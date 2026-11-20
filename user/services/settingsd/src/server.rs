@@ -3,6 +3,7 @@
 
 use crate::events::{Level, q};
 use crate::json::Json;
+use crate::peer::{self, Peer, Seen};
 use crate::proto::{self, Reply};
 use crate::registry::{Registry, err};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -85,6 +86,11 @@ impl Shared {
 }
 
 pub fn serve(listener: UnixListener, reg: Arc<Shared>) {
+    serve_by(listener, reg, Seen::settle)
+}
+
+/// [`serve`] with the second step of the peer lookup given (tests bring one that hangs).
+pub fn serve_by(listener: UnixListener, reg: Arc<Shared>, settle: fn(Seen) -> Peer) {
     let r = reg.clone();
     let _ = std::thread::Builder::new().name("settings-tick".into()).spawn(move || {
         loop {
@@ -99,8 +105,15 @@ pub fn serve(listener: UnixListener, reg: Arc<Shared>) {
         match conn {
             Ok(s) => {
                 let reg = reg.clone();
-                if let Err(e) =
-                    std::thread::Builder::new().name("settings-client".into()).spawn(move || client(s, &reg))
+                // Here and not in the client's thread: where the kernel keeps no record of who connected
+                // (`peer.rs`), the less time passes since the connect, the less room the peer has to become
+                // another program before it is looked at. Only what the kernel answers from memory is asked
+                // here; the walk over the program's path, which may wait for a hung stick, is the client's
+                // thread's (B4: this loop is everyone's).
+                let seen = peer::seen(&s);
+                if let Err(e) = std::thread::Builder::new()
+                    .name("settings-client".into())
+                    .spawn(move || client(s, &settle(seen), &reg))
                 {
                     // Out of threads: this client is dropped, the next one may succeed.
                     eprintln!("settingsd client.spawn_failed error={}", q(&e.to_string()));
@@ -114,7 +127,7 @@ pub fn serve(listener: UnixListener, reg: Arc<Shared>) {
     }
 }
 
-fn client(s: UnixStream, reg: &Arc<Shared>) {
+fn client(s: UnixStream, who: &Peer, reg: &Arc<Shared>) {
     let Ok(rs) = s.try_clone() else { return };
     let mut rd = BufReader::new(rs);
     let mut w = s;
@@ -133,7 +146,7 @@ fn client(s: UnixStream, reg: &Arc<Shared>) {
         if line.trim().is_empty() {
             continue;
         }
-        match proto::handle(reg, &line) {
+        match proto::handle(reg, who, &line) {
             Reply::Line(a) => {
                 if writeln!(w, "{a}").is_err() {
                     return;
@@ -187,7 +200,7 @@ pub fn bind(path: &Path, reg: &Registry) -> Result<UnixListener, String> {
     }
     let _ = std::fs::remove_file(path);
     // Every local program may talk to settingsd (programs MCP starts run as uid 1000; connect needs write
-    // permission on the socket, linux-6.6/net/unix/af_unix.c unix_find_bsd); who may change what is B3's
+    // permission on the socket, linux-7.3.1/net/unix/af_unix.c:1201 unix_find_bsd); who may change what is B3's
     // policy (PM-3), not a file mode. bind gives 0777 & ~umask and init runs services with umask 022, so the
     // umask is 0111 for the bind alone (0666). Only this thread runs now; the workers are idle after load.
     let old = usys::umask(0o111).ok();

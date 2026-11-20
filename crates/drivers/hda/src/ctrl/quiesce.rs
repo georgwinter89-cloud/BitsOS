@@ -304,8 +304,8 @@ impl<R: Hw> Hw for Timed<'_, R> {
             None => self.regs.delay_us(us),
         }
     }
-    fn alloc(&self, len: usize, usage: DmaUse, limit32: bool, snoop: bool) -> Result<Self::Mem, (AllocError, String)> {
-        self.regs.alloc(len, usage, limit32, snoop)
+    fn alloc(&self, len: usize, limit32: bool) -> Result<Self::Mem, String> {
+        self.regs.alloc(len, limit32)
     }
     fn enable(&self, dma: bool) -> Result<(), String> {
         self.regs.enable(dma)

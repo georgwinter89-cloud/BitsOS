@@ -55,6 +55,24 @@ fn std_capability_loop_and_bad_pointers() {
     assert!(one(f).caps.is_empty());
 }
 
+/// GP-R2: the two problems Linux meets as normal are Info, every other one stays a warning (the Gaming-PC's
+/// 00:0d.0 and 80:14.0 carry a vendor capability of length 0 at 0xb0; 80:15.0 and 80:15.2 sit in D3hot).
+#[test]
+fn only_what_linux_takes_as_normal_is_info() {
+    let vendor = |at, len| Problem::CapBadLength { id: id::VENDOR as u16, at, len };
+    assert!(vendor(0xB0, 0).normal());
+    assert!(Problem::BarPowerState { state: 3 }.normal() && Problem::BarPowerState { state: 1 }.normal());
+    for broken in [vendor(0xB0, 1), vendor(0xB0, 2), vendor(0xF8, 0x20), Problem::CapBadLength { id: id::MSI as u16, at: 0xF0, len: 0 },
+        Problem::CapBadLength { id: id::VENDOR as u16, at: 0x100, len: 0 }, Problem::CapLoop { at: 0x40 }, Problem::BarBeyondPhys { index: 0, phys: 1 << 52, size: 1 << 20 }]
+    {
+        assert!(!broken.normal(), "{broken:?}");
+    }
+    // The scan itself still records both (the device page lists them; only the log level changes).
+    let mut f = FakeFn::new(0x8086, 0x7ec0, 0x0c_03_30, 0);
+    f.cap(0xB0, id::VENDOR, 0).w8(0xB2, 0);
+    assert_eq!(one(f).problems, [vendor(0xB0, 0)]);
+}
+
 #[test]
 fn std_capability_lengths() {
     // Vendor capability with length 0, and one running past 0x100.

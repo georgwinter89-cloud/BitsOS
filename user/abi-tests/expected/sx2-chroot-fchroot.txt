@@ -1,0 +1,20 @@
+fchroot(-1) = -EBADF
+fchroot(dir, 1) = -EINVAL
+fchroot(a file) = -ENOTDIR
+fchroot(dir) unprivileged = -EPERM
+fchroot(failfs) without no_new_privs = -EPERM
+child: unshare(CLONE_NEWUSER) = 0
+child: fchroot(O_PATH dir) = 0
+child: stat(/proc) under /tmp = -ENOENT
+fchroot child: exit 0
+nnp child: fchroot(failfs) = 0
+nnp child: open(/bin/sh) = -EOPNOTSUPP
+nnp child: open(/) = -EOPNOTSUPP
+nnp child: stat(/) = -EOPNOTSUPP
+nnp child: stat(/..) = -EOPNOTSUPP
+nnp child: chdir(/) = -EOPNOTSUPP
+nnp child: chdir(/..) = -EOPNOTSUPP
+nnp child: open(/, O_PATH) = -EOPNOTSUPP
+nnp child: access(/, X_OK) = -EOPNOTSUPP
+nnp child: fchroot(failfs) again = -EPERM
+nnp child: exit 0

@@ -1,4 +1,4 @@
-//! SX-3a: mount(2), umount2(2) and pivot_root(2) (linux-6.6/fs/namespace.c `SYSCALL_DEFINE5(mount)`,
+//! SX-3a: mount(2), umount2(2) and pivot_root(2) (linux-7.3.1/fs/namespace.c `SYSCALL_DEFINE5(mount)`,
 //! `path_mount`, `ksys_umount`, `SYSCALL_DEFINE2(pivot_root)`): argument copies, lookups and the dispatch, in
 //! Linux's order. What only the process layer knows (capabilities in which user namespace, the mounter's ids,
 //! re-pointing every task's root) comes through `MountPerms` (vfs-sys implements it; host tests fake it).
@@ -43,8 +43,6 @@ const MS_MGC_MSK: u64 = 0xFFFF_0000;
 pub trait MountPerms {
     /// `may_mount`: CAP_SYS_ADMIN in the caller's mount namespace's owner.
     fn may_mount(&self) -> bool;
-    /// `capable(CAP_SYS_ADMIN)` in the initial user namespace (MNT_FORCE).
-    fn capable_init(&self) -> bool;
     /// `mount_capable` for a new mount of `fstype`: CAP_SYS_ADMIN in the namespace that will own it (tmpfs,
     /// devpts: the caller's; proc: its pid namespace's owner; sysfs: its network namespace's; mqueue: its IPC
     /// namespace's).
@@ -57,8 +55,9 @@ pub trait MountPerms {
     fn ns_owned_by_init(&self) -> bool;
     /// The caller as mounter (ids and how option ids map).
     fn with_mounter(&self, f: &mut dyn FnMut(&Mounter<'_>) -> Result<(), Errno>) -> Result<(), Errno>;
-    /// The system's pty multiplexer (`/dev/ptmx`) for a devpts instance's `ptmx`.
-    fn ptmx(&self) -> Option<Arc<dyn crate::File>>;
+    /// The `ptmx` node's object of a new devpts instance (IN-PTY: the pty layer's ptmx, whose ptys get their
+    /// numbers and slave nodes in `inst`). None: the instance has no `ptmx`.
+    fn ptmx(&self, inst: mount_fs::PtsSuper) -> Option<Arc<dyn crate::File>>;
     /// The machine's RAM in bytes (tmpfs `size=N%`).
     fn ram_bytes(&self) -> u64;
     /// `chroot_fs_refs` after pivot_root: every task whose root or cwd is `old` gets `new`.
@@ -227,7 +226,7 @@ fn new_mount(s: &Sys<'_>, at: &Path, fstype: Option<Vec<u8>>, dev: Option<Vec<u8
             }
             "devpts" => {
                 let d = mount_fs::devpts_opts(&o, who)?;
-                Some(mount_fs::devpts(&d, who, perms.ptmx()))
+                Some(mount_fs::devpts(&d, who, &|inst| perms.ptmx(inst)))
             }
             "mqueue" => Some(mount_fs::mqueue(&o, who)?),
             "proc" => {
@@ -310,7 +309,9 @@ fn do_umount(s: &Sys<'_>, a: Args, perms: &dyn MountPerms) -> Result<(), Errno> 
     if !p.is_mount_root() || !s.ns.check_mnt(&p.mnt) || p.mnt.flags() & MNT_LOCKED != 0 {
         return Err(EINVAL);
     }
-    if flags & MNT_FORCE != 0 && !perms.capable_init() {
+    // `can_umount` (linux-7.3.1/fs/namespace.c:2077): MNT_FORCE needs CAP_SYS_ADMIN over the file system, so a
+    // user namespace's root may force the unmount of its own tmpfs.
+    if flags & MNT_FORCE != 0 && !perms.admin_over(&p.mnt.sb) {
         return Err(EPERM);
     }
     // `do_umount`: the caller's own root mount is only made read-only (`do_umount_root`).
@@ -334,10 +335,9 @@ pub fn pivot_root(s: &Sys<'_>, a: Args, perms: &dyn MountPerms) -> i64 {
     ret(do_pivot(s, a, perms).map(|_| 0))
 }
 
+/// The syscall looks both paths up (LOOKUP_DIRECTORY) before `path_pivot_root` asks `may_mount`
+/// (linux-7.3.1/fs/namespace.c:4934, :4837): a bad pointer or a missing path is answered before EPERM.
 fn do_pivot(s: &Sys<'_>, a: Args, perms: &dyn MountPerms) -> Result<(), Errno> {
-    if !perms.may_mount() {
-        return Err(EPERM);
-    }
     let c = s.ctx();
     let dir = |ptr: u64| -> Result<Path, Errno> {
         let name = s.path(ptr, false)?;
@@ -346,6 +346,9 @@ fn do_pivot(s: &Sys<'_>, a: Args, perms: &dyn MountPerms) -> Result<(), Errno> {
     };
     let new = dir(a[0])?;
     let old = dir(a[1])?;
+    if !perms.may_mount() {
+        return Err(EPERM);
+    }
     let root = c.root.clone();
     s.ns.pivot_root(&root, &new, &old)?;
     perms.chroot_fs_refs(&root, &new);

@@ -1,6 +1,6 @@
-//! Moving frames: WRITEI_FRAMES and write(2) (`__snd_pcm_lib_xfer`, `linux-6.6/sound/core/pcm_lib.c:2207`,
-//! its wait `wait_for_avail` :1885), DRAIN (pcm_native.c:2090), appl_ptr moves (SYNC_PTR, FORWARD;
-//! `pcm_lib_apply_appl_ptr` pcm_lib.c:2163), and the conversion of S32_LE/FLOAT_LE to the mixer's 16 bit.
+//! Moving frames: WRITEI_FRAMES and write(2) (`__snd_pcm_lib_xfer`, `linux-7.3.1/sound/core/pcm_lib.c:2274`,
+//! its wait `wait_for_avail` :1949), DRAIN (pcm_native.c:2140), appl_ptr moves (SYNC_PTR, FORWARD;
+//! `pcm_lib_apply_appl_ptr` pcm_lib.c:2230), and the conversion of S32_LE/FLOAT_LE to the mixer's 16 bit.
 
 use super::abi::*;
 use super::pcm::{try_buf, PcmFile, Phase, St};

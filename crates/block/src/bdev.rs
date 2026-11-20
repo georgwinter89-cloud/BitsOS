@@ -32,11 +32,13 @@ pub struct DiskFile {
     /// The errno of a write or flush that timed out: EIO, or ETIMEDOUT for an owner that tells a timeout from a
     /// media error per request (ext4's device, FS-STALL review E5: the disk's flag is shared by every request).
     timeout_errno: i64,
+    /// FS-W2: the cache's owner flushes the device itself after a durable write-back (`page_cache_owner_flushes`).
+    owner_flushes: bool,
 }
 
 impl DiskFile {
     pub fn new(disk: Arc<Disk>) -> Arc<DiskFile> {
-        Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::EIO })
+        Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::EIO, owner_flushes: false })
     }
 
     /// The disk's size in bytes.
@@ -53,7 +55,17 @@ impl DiskFile {
 
     /// `page_cache` whose write-back answers ETIMEDOUT for a request that timed out (EIO for other failures).
     pub fn page_cache_telling_timeouts(disk: Arc<Disk>) -> PageCache {
-        let f = Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::ETIMEDOUT });
+        let f = Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::ETIMEDOUT, owner_flushes: false });
+        let size = f.size();
+        PageCache::for_block_device(f, size)
+    }
+
+    /// `page_cache_telling_timeouts` whose durable write-back does not flush the device: the owner does, once per
+    /// barrier. FS-W2: ext4 writes file data to the disk beside this cache, so "no dirty page here" no longer
+    /// means "nothing in the device's cache to make durable"; a flush tied to the pages would be skipped exactly
+    /// then, or sent twice.
+    pub fn page_cache_owner_flushes(disk: Arc<Disk>) -> PageCache {
+        let f = Arc::new(DiskFile { disk, background: AtomicU32::new(0), durable: AtomicU32::new(0), timeout_errno: uapi::errno::ETIMEDOUT, owner_flushes: true });
         let size = f.size();
         PageCache::for_block_device(f, size)
     }
@@ -169,7 +181,7 @@ impl Backend for DiskFile {
                 Err(now) => n = now,
             }
         }
-        if why.durable() && self.disk.dev_info().has_volatile_cache {
+        if why.durable() && !self.owner_flushes && self.disk.dev_info().has_volatile_cache {
             self.disk.flush(crate::prio::higher(IoPriority::Normal, crate::prio::current())).map_err(|e| self.write_errno(e))?;
         }
         Ok(())

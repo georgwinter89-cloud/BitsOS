@@ -7,7 +7,7 @@ typed at the shell puts the console in raw mode; a, b and q typed on the keyboar
 read times out, the settings are restored and the shell's prompt comes back; then `/bin/abi-rawtty wait` blocks in
 a canonical read and Ctrl+C ends it with SIGINT (the shell's `echo $?` says 130); the evdev nodes of MCP's devices
 and of the USB keyboard and mouse exist (MCP `log`).
-monitor (CONFIG init=off: no session holds the console, so the kernel monitor `bits>` reads it): the same two
+monitor (test key ktest_init=off: no session holds the console, so the kernel monitor `bits>` reads it): the same two
 programs started with the monitor's `run`; the monitor reports `exit code 130` for the Ctrl+C.
 Exit status 0 = green."""
 import http.client
@@ -174,7 +174,7 @@ def shell(c, q):
 
 
 def monitor(c, q):
-    wait_screen(c, [MONITOR_PROMPT.rstrip()], "the monitor's prompt (init=off)", timeout=60)
+    wait_screen(c, [MONITOR_PROMPT.rstrip()], "the monitor's prompt (ktest_init=off)", timeout=60)
     tool(c, "send_keys", {"text": "log level off\n"})
     time.sleep(0.5)
     q.keys("ctrl", "u")

@@ -1,14 +1,14 @@
 //! Reading the discovery binary out of graphics memory, two ways:
 //!
 //! - **Indirect (Linux's way):** the MM_INDEX/MM_INDEX_HI/MM_DATA window in the register BAR
-//!   (linux-6.6 amdgpu_device.c:246-276 `amdgpu_device_mm_access`; amdgpu_discovery.c:94-97 the dword offsets
+//!   (linux-7.3.1 amdgpu_device.c:717-752 `amdgpu_device_mm_access`; amdgpu_discovery.c:144-146 the dword offsets
 //!   0x0/0x6/0x1). Every dword is an index **write** and a data read. The window is a driver-owned indirect pair
 //!   (`dcn::MmWindow` is the only way to it): BitsOS saves both index registers first and puts them back after
 //!   each chunk, so whatever was there before is there afterwards. Linux holds its lock for the whole access;
 //!   BitsOS holds it (interrupts off) for one short chunk only (B4).
 //! - **Carve-out (BitsOS's read-only way, APUs):** the carve-out is system memory; its CPU address is MMHUB's
 //!   MMMC_VM_FB_OFFSET (bits 23:0, << 24: CPU address bits 47:24), which Linux takes as the APU's aperture
-//!   (linux-6.6 gmc_v11_0.c:720-723, mmhub_v3_0_1.c:510-515); the display hub's DCN_VM_FB_OFFSET holds the same
+//!   (linux-7.3.1 gmc_v11_0.c:701-704, mmhub_v3_0_1.c:514-517); the display hub's DCN_VM_FB_OFFSET holds the same
 //!   value (both 0x840 on the Mini-PC, 27.10.: CPU 0x8_4000_0000). The binary lies at that address plus VRAM
 //!   size (MEMSIZE, any size: 512 MiB that day, 8 GB as Georg usually sets it) minus 64 KiB.
 //!   GX-7b: on 27.10. that address read all ones although the arithmetic matches Linux's; `CarvePlan` samples
@@ -101,6 +101,18 @@ pub fn read_indirect(r: &impl IndexRegs, pos: u64, len: usize) -> Result<Vec<u8>
         done += n * 4;
     }
     Ok(out)
+}
+
+/// The discovery binary through the window (`amdgpu_discovery_read_binary_from_mem` after `_get_tmr_info`,
+/// linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c:321-366): where it was read and the bytes. The
+/// default place is read whole first and its first dword decides (`disc::tmr_place`), so a table found there costs
+/// no index writes beyond its own chunks (gx.disc.indirect counts them); only a missing signature reads the place
+/// DRIVER_SCRATCH names.
+pub fn read_tmr(r: &impl IndexRegs, default_pos: u64, scratch: impl Fn(u32) -> Option<u32>, vram_bytes: u64) -> (u64, Result<Vec<u8>, VramError>) {
+    let at_default = read_indirect(r, default_pos, super::disc::TMR_SIZE);
+    let sig = at_default.as_ref().ok().and_then(|b| b.get(..4)).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let (pos, len) = super::disc::tmr_place(default_pos, sig, scratch, vram_bytes);
+    if pos == default_pos { (pos, at_default) } else { (pos, read_indirect(r, pos, len)) }
 }
 
 /// Where the discovery binary lies in graphics memory: VRAM size (MEMSIZE in MB) minus 64 KiB; `None` for

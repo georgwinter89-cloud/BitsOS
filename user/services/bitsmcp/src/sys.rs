@@ -24,7 +24,7 @@ pub fn private_mounts() -> Result<(), String> {
 }
 
 /// Gives root up for `(uid, gid)` as chpst does: supplementary groups = [gid], all three gids, all three uids;
-/// checked afterwards, and that root cannot come back (linux-6.6/kernel/sys.c `__sys_setresuid`).
+/// checked afterwards, and that root cannot come back (linux-7.3.1/kernel/sys.c:708 `__sys_setresuid`).
 pub fn drop_to(uid: u32, gid: u32) -> Result<(), String> {
     let groups = [gid as libc::gid_t];
     // SAFETY: setgroups reads one gid from `groups`, which outlives the call.

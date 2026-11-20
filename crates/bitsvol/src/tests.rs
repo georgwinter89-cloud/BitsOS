@@ -13,6 +13,8 @@ mod commit_time;
 mod delete_steps;
 mod flush_outside;
 mod lockfree_read;
+mod trim;
+mod trim_faults;
 mod window;
 
 pub(crate) fn dev(bs: u32, chunks: u64, chunk: u32, max: u32) -> Arc<MemDev> {
@@ -64,6 +66,21 @@ fn model_random_64k_chunks() {
 fn model_random_4k_blocks() {
     for seed in 21..=24 {
         let c = RunCfg { block_size: 4096, chunk_size: 8192, dev_chunks: 120, vol_chunks: 16, max_req: 3, ..RunCfg::small(seed, 2000) };
+        run(c);
+    }
+}
+
+/// The discard queue (trim.rs) in random order with everything else: rounds taken, discards carried out by the
+/// device at any later step (also after a timeout), answers of every kind, space running short. Every volume
+/// reads as the model after each of those steps, and the pool reopens as it counts itself.
+#[test]
+fn model_random_with_the_discard_queue() {
+    for seed in 41..=48 {
+        let dev_chunks = if seed % 2 == 0 { 64 } else { 160 };
+        run(RunCfg { dev_chunks, trim: true, ..RunCfg::small(seed, 3000) });
+    }
+    for seed in 51..=52 {
+        let c = RunCfg { block_size: 512, chunk_size: 65536, dev_chunks: 64, vol_chunks: 12, max_req: 64, cache_pages: 8, trim: true, ..RunCfg::small(seed, 1500) };
         run(c);
     }
 }
@@ -578,12 +595,23 @@ fn lock_wait_is_bounded_and_close_never_waits() {
     h.lock().unwrap().delete(id).unwrap();
 }
 
-/// Long sweep, not in the gate: `BITSVOL_SEEDS=200 cargo test -p bitsvol --lib sweep -- --ignored`.
+/// Long sweep. Decision (SK): ignored in the host tests because 50 seeds take about a minute; its first two
+/// seeds (a crash image and a normal run) run in the gate as `sweep_two_seeds`, the long run is
+/// host/tests/vs/20-sweep.sh (`BITSVOL_SEEDS=200 cargo test -p bitsvol --lib sweep -- --ignored`).
 #[test]
 #[ignore]
 fn sweep() {
     let n: u64 = std::env::var("BITSVOL_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-    for seed in 1000..1000 + n {
+    sweep_seeds(1000..1000 + n);
+}
+
+#[test]
+fn sweep_two_seeds() {
+    sweep_seeds(1000..1002);
+}
+
+fn sweep_seeds(seeds: core::ops::Range<u64>) {
+    for seed in seeds {
         let dev_chunks = [44, 64, 96, 160][(seed % 4) as usize];
         let chunk_size = [4096, 8192, 65536][(seed % 3) as usize];
         let dev_chunks = if chunk_size == 65536 { dev_chunks / 3 + 12 } else { dev_chunks };

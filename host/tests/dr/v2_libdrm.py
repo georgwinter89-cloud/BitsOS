@@ -31,7 +31,7 @@ def main():
     open(os.path.join(v.RUN, "libdrm-info.out"), "w").write(text)
     out = text.splitlines()
     report = {"head": out[:4]}
-    need("amdgpu_device_initialize: 0 (DRM 3.54)" in text, "amdgpu_device_initialize works on the fake", text[-3000:])
+    need("amdgpu_device_initialize: 0 (DRM 3.64)" in text, "amdgpu_device_initialize works on the fake", text[-3000:])
     need("amdgpu_query_gpu_info: 0" in text, "amdgpu_query_gpu_info works", text[-3000:])
     got_q = [l for l in out if l.startswith("Q ")]
     want_q = lines(os.path.join(FIX, "780m-info.txt"), "Q")

@@ -27,10 +27,10 @@ fn sources() -> TestResult {
     let src = Sources::detect();
     let mut store = Store::new(1 << 20);
     let mut m = Sampler::default();
-    let r1 = src.read(klog::now(), 0);
+    let r1 = src.read(klog::now(), 0).ok_or("no memory for a reading")?;
     m.step(&r1, &mut store);
     sched::sleep_ms(200);
-    let r2 = src.read(klog::now(), 1000);
+    let r2 = src.read(klog::now(), 1000).ok_or("no memory for a reading")?;
     m.step(&r2, &mut store);
     let cpu = sched::cpu_stats().into_iter().find(|c| c.online).ok_or("no online CPU")?.cpu;
     for what in ["busy", "user", "system"] {
@@ -138,9 +138,9 @@ fn rapl() -> TestResult {
     }
     let mut store = Store::new(1 << 16);
     let mut m = Sampler::default();
-    m.step(&src.read(klog::now(), 0), &mut store);
+    m.step(&src.read(klog::now(), 0).ok_or("no memory for a reading")?, &mut store);
     sched::sleep_ms(500);
-    m.step(&src.read(klog::now(), 0), &mut store);
+    m.step(&src.read(klog::now(), 0).ok_or("no memory for a reading")?, &mut store);
     let (_, mw) = latest(&store, "power.pkg").ok_or("no power.pkg")?;
     kassert!((100..=200_000).contains(&mw), "power.pkg {mw} mW");
     klog::event!(Info, "rb", "ktest.rapl", mw = mw);

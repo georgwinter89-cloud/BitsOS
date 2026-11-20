@@ -6,7 +6,7 @@
 //! 3. installs `sched::irq_exit_preempt` at every interrupt exit from kernel mode
 //!    (`hal::vectors::set_irq_exit_hook`), so a busy kernel thread no longer keeps its CPU from the others, once
 //!    the scheduler says it is ready for it: `sched::timers::tick_preempts()` (SC returns `time::interrupt_driven()`
-//!    there with change request 1 of plan/notes/cp-CP-5.md, together with the guard that keeps
+//!    there, together with the guard that keeps
 //!    `run_exclusive` unpreempted). Until then nothing is preempted at an interrupt exit, as before CP-5;
 //! 4. logs one summary.
 
@@ -67,7 +67,7 @@ fn start() -> Result<(), &'static str> {
         hal::vectors::set_irq_exit_hook(Some(sched::irq_exit_preempt));
     } else {
         klog::event!(Info, "time", "preempt.waiting", interrupt_driven = time::interrupt_driven();
-            "sched::timers::tick_preempts() is false: no preemption at interrupt exit yet (change request 1, plan/notes/cp-CP-5.md)");
+            "sched::timers::tick_preempts() is false: no preemption at interrupt exit yet (CP-5's change request 1, plan/spec/core.md §7.4)");
     }
     let kinds: Vec<&str> = (0..n).filter_map(|c| time::lapic::cpu_stats(c).and_then(|s| s.kind)).map(|k| k.name()).collect();
     let mode = if kinds.iter().all(|k| *k == "tsc_deadline") && !kinds.is_empty() {

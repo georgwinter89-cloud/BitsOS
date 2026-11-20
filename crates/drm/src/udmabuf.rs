@@ -1,7 +1,7 @@
-//! DR-5: `/dev/udmabuf` (linux-6.6/drivers/dma-buf/udmabuf.c): turns pages of sealed memfds into a dma-buf, so a
-//! program without a GPU buffer (lavapipe, a Wayland client, the tests) can hand memory to the compositor as a
-//! dma-buf. The buffer holds the memfd's own page-cache pages: what is written through the memfd is seen through
-//! the dma-buf and back, also after the memfd is closed (`shmem_read_mapping_page` + `get_page`).
+//! DR-5: `/dev/udmabuf` (linux-7.3.1/drivers/dma-buf/udmabuf.c): turns pages of sealed memfds
+//! into a dma-buf, so a program without a GPU buffer (lavapipe, a Wayland client, the tests) can hand memory to the
+//! compositor as a dma-buf. The buffer holds the memfd's own page-cache pages: what is written through the memfd is
+//! seen through the dma-buf and back, also after the memfd is closed (`shmem_read_mapping_page` + `get_page`).
 //!
 //! The node is a misc device (char 10:258, the minor a 6.x kernel hands out dynamically) with mode 0666: a
 //! buffer only references pages the caller already owns through its memfd, so it gives nobody more than they
@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use linux::errno::*;
 use mm::device::Aperture;
 use vfs::fd::FdTable;
-use vfs::pagecache::{CachePage, PageFault};
+use vfs::pagecache::{CachePage, CachePin, PageFault};
 use vfs::sys::UserMem;
 use vfs::{Errno, File};
 
@@ -38,7 +38,9 @@ pub const UDMABUF_CREATE_LIST: u32 = 0x4008_7543;
 const ITEM_SIZE: usize = 24;
 const PAGE: u64 = 4096;
 const F_SEAL_SHRINK: u32 = vfs::memfd::F_SEAL_SHRINK;
-const F_SEAL_WRITE: u32 = vfs::memfd::F_SEAL_WRITE;
+/// SEALS_DENIED (linux-7.3.1/drivers/dma-buf/udmabuf.c:270): memory sealed against writes, now or future ones,
+/// must not come back writable through the dma-buf.
+const SEALS_DENIED: u32 = vfs::memfd::F_SEAL_WRITE | vfs::memfd::F_SEAL_FUTURE_WRITE;
 
 /// `misc` major and the minor of the node.
 pub const MAJOR: u32 = 10;
@@ -143,6 +145,8 @@ impl Item {
 pub struct ShmemPages {
     /// Shared so a mapping can hold the pages themselves (CR-DR5-2: MM maps only frames whose owner it holds).
     pages: Arc<Vec<Arc<CachePage>>>,
+    /// One hold per item on its memfd: F_SEAL_WRITE there is EBUSY while the buffer lives.
+    _pins: Vec<CachePin>,
     /// The list's share of `ref_limit`; lives as long as the list (a mapping keeps the exporter alive).
     _charge: Charge,
 }
@@ -231,10 +235,12 @@ impl Exporter for Udmabuf {
     }
 }
 
-/// `udmabuf_create` (udmabuf.c:197-292) for the items of one call: the size checks over all items first, then
-/// each memfd (EBADFD: no open file or not shmem; EINVAL: F_SEAL_SHRINK missing or F_SEAL_WRITE set, a page past
-/// the memfd's end), then the buffer and its fd (O_RDWR, close-on-exec with UDMABUF_FLAGS_CLOEXEC; other flag
-/// bits are ignored as in Linux 6.6).
+/// `udmabuf_create` (linux-7.3.1/drivers/dma-buf/udmabuf.c:348-447) for the items of one call: the size checks
+/// over all items first, then each memfd (EBADFD: no open file or not shmem; EINVAL: F_SEAL_SHRINK missing or
+/// F_SEAL_WRITE / F_SEAL_FUTURE_WRITE set (`check_memfd_seals` :272), a page past the memfd's end), then the
+/// buffer and its fd (O_RDWR, close-on-exec with UDMABUF_FLAGS_CLOEXEC; other flag bits are ignored). Linux also
+/// takes hugetlbfs memfds; V2 has no hugetlbfs (MFD_HUGETLB is ENOSYS), so no such file reaches this. The pages are pinned in
+/// the step that checks the seals (`PageCache::pin_sealed`): a later F_SEAL_WRITE is EBUSY while the buffer lives.
 pub fn create(fds: Option<&FdTable>, flags: u32, items: &[Item]) -> Result<i32, Errno> {
     let r = build(fds, items).and_then(|b| b.install(fds, flags & UDMABUF_FLAGS_CLOEXEC != 0));
     match r {
@@ -269,13 +275,18 @@ pub fn build(fds: Option<&FdTable>, items: &[Item]) -> Result<Arc<DmaBuf>, Errno
     // make the kernel reserve memory for pages that do not exist (Linux allocates the whole array first, bounded
     // by its 64 MiB default).
     let mut pages: Vec<Arc<CachePage>> = Vec::new();
+    let mut pins: Vec<CachePin> = Vec::new();
+    pins.try_reserve_exact(items.len()).map_err(|_| ENOMEM)?;
     for it in items {
         let f = fds.ok_or(EBADFD)?.get(it.memfd as usize).map_err(|_| EBADFD)?;
         let Some(cache) = f.inode().and_then(|i| i.page_cache()) else { return Err(EBADFD) };
-        // A tmpfs/memfd page cache is the one with seals (`shmem_mapping`); every other file is EBADFD.
-        let Some(seals) = cache.seals() else { return Err(EBADFD) };
-        if seals & F_SEAL_SHRINK == 0 || seals & F_SEAL_WRITE != 0 {
-            return Err(EINVAL);
+        // A tmpfs/memfd page cache is the one with seals (`shmem_mapping`); every other file is EBADFD. The
+        // seals are checked and the pin taken in one step, so a write seal added meanwhile either comes first
+        // (EINVAL here) or finds the pin (EBUSY there).
+        match cache.pin_sealed(|s| s & F_SEAL_SHRINK != 0 && s & SEALS_DENIED == 0) {
+            None => return Err(EBADFD),
+            Some(Err(_)) => return Err(EINVAL),
+            Some(Ok(pin)) => pins.push(pin),
         }
         // Past the end of the file: `shmem_read_mapping_page`'s EINVAL.
         if it.offset.checked_add(it.size).is_none_or(|end| end > cache.size().div_ceil(PAGE) * PAGE) {
@@ -294,7 +305,7 @@ pub fn build(fds: Option<&FdTable>, items: &[Item]) -> Result<Arc<DmaBuf>, Errno
             pages.push(p);
         }
     }
-    let exp = Arc::new(Udmabuf { pages: Arc::new(ShmemPages { pages: Arc::new(pages), _charge: charge }), sg: AtomicBool::new(false) });
+    let exp = Arc::new(Udmabuf { pages: Arc::new(ShmemPages { pages: Arc::new(pages), _pins: pins, _charge: charge }), sg: AtomicBool::new(false) });
     DmaBuf::export(exp, None)
 }
 

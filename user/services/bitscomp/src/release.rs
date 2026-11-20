@@ -1,7 +1,7 @@
 //! WY-16: the release path. A buffer goes back to its client (wl_buffer.release, and its explicit-sync release
 //! point) only when the renderer is done with it: a commit that replaces or removes a surface's buffer moves the
 //! old one here instead of letting Smithay release it at once; everything goes back right after the turn's draw
-//! (Pixman composites on the CPU; GLES waits for the frame's sync point and reads the picture back, render_gl.rs)
+//! (GLES waits for the frame's sync point, bounded, render_gl.rs)
 //! and before its frame callbacks, so a client that reuses a buffer on `done` already has its release (wy/60
 //! starved when the release came after the callback); a turn without a frame gives back at its end. The same for shm and dma-buf buffers, and for
 //! hung clients' windows (their surfaces are not drawn, so the old buffer goes back at the end of the turn).

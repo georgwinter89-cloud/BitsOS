@@ -277,7 +277,7 @@ pub unsafe fn copy_to_user_partial_raw(root: u64, dst: u64, src: *const u8, len:
 }
 
 /// PF-6: a copy to user memory that never handles a fault (Linux `copy_to_user_nofault`,
-/// linux-6.6/mm/maccess.c:221: `pagefault_disable` around `__copy_to_user_inatomic`): for a lockless reader
+/// linux-7.3.1/mm/maccess.c:149: `pagefault_disable` around `__copy_to_user_inatomic`): for a lockless reader
 /// inside a grace section, which must not sleep, take a lock or run the fault resolver. One `rep movsb` through
 /// the user mapping of the loaded `root`; a fault (a page not present or not writable) ends it at the exception
 /// fixup and the bytes before it count, exactly those before the first user page that cannot be written. 0 when
@@ -304,6 +304,26 @@ pub unsafe fn copy_to_user_nofault_raw(root: u64, dst: u64, src: *const u8, len:
 pub fn copy_to_user_nofault(root: u64, dst: u64, src: &[u8]) -> usize {
     // SAFETY: the slice is valid for its length for the whole call.
     unsafe { copy_to_user_nofault_raw(root, dst, src.as_ptr(), src.len()) }
+}
+
+/// SELFOPT-1: a read of user memory that never handles a fault (Linux `copy_from_user_nofault`,
+/// linux-7.3.1/mm/maccess.c), for the sampling profiler's walk of a program's frame pointers from an interrupt
+/// handler: one `rep movsb` through the user mapping of the loaded `root`; a page that is not present ends it at the
+/// exception fixup. Returns the bytes read, those before the first page that cannot be read; 0 when the fast path
+/// is not open for `root` (see `copy_to_user_nofault_raw`). Takes no lock, never waits, never runs the resolver.
+pub fn copy_from_user_nofault(root: u64, dst: &mut [u8], src: u64) -> usize {
+    let len = dst.len();
+    if len == 0 || check(src, len).is_err() || !fast_ok(root) {
+        return 0;
+    }
+    let smap = crate::entry::smap_all().unwrap_or(false);
+    // SAFETY: src..src+len is below USER_TOP (checked) in the loaded address space (`fast_ok`), whose faults the #PF
+    // fixup turns into a short count; dst is `len` bytes of the caller's buffer.
+    let left = unsafe { imp::copy(dst.as_mut_ptr(), src as *const u8, len, smap) };
+    if left != 0 {
+        NOFAULT_SHORT.fetch_add(1, Ordering::Relaxed);
+    }
+    len - left.min(len)
 }
 
 /// As `copy_to_user` but also into read-only user pages (program loading); still only USER pages. Always

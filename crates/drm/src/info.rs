@@ -1,6 +1,7 @@
-//! DR-4: `DRM_IOCTL_AMDGPU_INFO` (Linux `amdgpu_info_ioctl`, linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c:535)
-//! against a `GpuDevice`. The answer goes to `return_pointer`, `min(return_size, sizeof answer)` bytes; the
-//! 32-byte request itself is not written back. Unknown queries answer EINVAL like Linux's default case.
+//! DR-4: `DRM_IOCTL_AMDGPU_INFO` (Linux `amdgpu_info_ioctl`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c:654)
+//! against a `GpuDevice`. The answer goes to `return_pointer`, `min(return_size,
+//! sizeof answer)` bytes; the 32-byte request itself is not written back. Unknown queries answer EINVAL like Linux's
+//! default case.
 
 use crate::device::Device;
 use crate::dispatch::Ctx;
@@ -103,28 +104,7 @@ pub fn ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, Err
         }
         AMDGPU_INFO_VRAM_LOST_COUNTER => u32_out(gpu.vram_lost_counter()),
         AMDGPU_INFO_RAS_ENABLED_FEATURES => u64_out(p.ras_features.ok_or(EINVAL)?),
-        AMDGPU_INFO_VIDEO_CAPS => {
-            let (dec, enc) = p.video.as_ref().ok_or(EINVAL)?;
-            let table = match q.video_cap().r#type {
-                AMDGPU_INFO_VIDEO_CAPS_DECODE => dec,
-                AMDGPU_INFO_VIDEO_CAPS_ENCODE => enc,
-                _ => return Err(EINVAL),
-            };
-            let mut caps = drm_amdgpu_info_video_caps::ZERO;
-            for (c, slot) in table.iter().zip(caps.codec_info.iter_mut()) {
-                if let Some(c) = c {
-                    *slot = drm_amdgpu_info_video_codec_info {
-                        valid: 1,
-                        max_width: c.max_width,
-                        max_height: c.max_height,
-                        max_pixels_per_frame: c.max_pixels_per_frame,
-                        max_level: c.max_level,
-                        pad: 0,
-                    };
-                }
-            }
-            out(ctx, ptr, size, &bytes(&caps))
-        }
+        AMDGPU_INFO_VIDEO_CAPS => out(ctx, ptr, size, &bytes(&video_caps(gpu, q.video_cap().r#type)?)),
         // DR-9: not in 6.6; CachyOS's kernel (and libdrm's header) have it: the last GPU page fault of the
         // file's VM, zero before any (there is always a VM, so never EINVAL for that).
         AMDGPU_INFO_GPUVM_FAULT => {
@@ -135,6 +115,7 @@ pub fn ioctl(ctx: &Ctx, gpu: &dyn GpuDevice, data: &mut [u8]) -> Result<i64, Err
             let m = p.max_ibs.ok_or(EINVAL)?;
             out(ctx, ptr, size, &bytes(&m))
         }
+        AMDGPU_INFO_UQ_FW_AREAS => uq_fw_areas(ctx, &p.uq_fw_areas, q.query_hw_ip().r#type, ptr, size),
         other => {
             unknown(ctx.dev, other);
             Err(EINVAL)
@@ -162,6 +143,30 @@ pub fn hw_ip_info(gpu: &dyn GpuDevice, q: &drm_amdgpu_info__query_hw_ip) -> Resu
     r.ib_start_alignment = h.ib_start_alignment;
     r.ib_size_alignment = h.ib_size_alignment;
     Ok(r)
+}
+
+/// `AMDGPU_INFO_VIDEO_CAPS`: the profile's decode or encode table, one slot per codec, `valid` set where it has one.
+pub fn video_caps(gpu: &dyn GpuDevice, ty: u32) -> Result<drm_amdgpu_info_video_caps, Errno> {
+    let (dec, enc) = gpu.profile().video.as_ref().ok_or(EINVAL)?;
+    let table = match ty {
+        AMDGPU_INFO_VIDEO_CAPS_DECODE => dec,
+        AMDGPU_INFO_VIDEO_CAPS_ENCODE => enc,
+        _ => return Err(EINVAL),
+    };
+    let mut caps = drm_amdgpu_info_video_caps::ZERO;
+    for (c, slot) in table.iter().zip(caps.codec_info.iter_mut()) {
+        if let Some(c) = c {
+            *slot = drm_amdgpu_info_video_codec_info {
+                valid: 1,
+                max_width: c.max_width,
+                max_height: c.max_height,
+                max_pixels_per_frame: c.max_pixels_per_frame,
+                max_level: c.max_level,
+                pad: 0,
+            };
+        }
+    }
+    Ok(caps)
 }
 
 /// VRAM_GTT (kms.c:672): the usable parts after pins and the VM's reserve.
@@ -265,7 +270,25 @@ fn sensor(ty: u32) -> Option<Sensor> {
         AMDGPU_INFO_SENSOR_STABLE_PSTATE_GFX_MCLK => Sensor::StablePstateMclk,
         AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_SCLK => Sensor::PeakPstateSclk,
         AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_MCLK => Sensor::PeakPstateMclk,
-        // GPU_INPUT_POWER (0xc) is newer than Linux 6.6.
+        AMDGPU_INFO_SENSOR_GPU_INPUT_POWER => Sensor::GpuInputPower,
         _ => return None,
     })
+}
+
+/// `AMDGPU_INFO_UQ_FW_AREAS` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c:1389-1420): a 16-byte union by
+/// queue type (GFX, COMPUTE, DMA; others EINVAL), EOPNOTSUPP when the block has no answer. Linux answers 0 even
+/// when the copy to the caller faults (`ret` is set and then `return 0`), so this does too.
+fn uq_fw_areas(ctx: &Ctx, a: &crate::gpu::UqFwAreas, ty: u32, ptr: u64, size: u32) -> Result<i64, Errno> {
+    let words: Vec<u32> = match ty {
+        AMDGPU_HW_IP_GFX => a.gfx.ok_or(EOPNOTSUPP)?.iter().flat_map(|&(s, al)| [s, al]).collect(),
+        AMDGPU_HW_IP_COMPUTE => a.compute.map(|(s, al)| alloc::vec![s, al]).ok_or(EOPNOTSUPP)?,
+        AMDGPU_HW_IP_DMA => a.sdma.map(|(s, al)| alloc::vec![s, al]).ok_or(EOPNOTSUPP)?,
+        _ => return Err(EINVAL),
+    };
+    let mut b = [0u8; 16];
+    for (i, w) in words.iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    let _ = out(ctx, ptr, size, &b);
+    Ok(0)
 }

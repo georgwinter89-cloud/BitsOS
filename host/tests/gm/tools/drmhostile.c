@@ -1,5 +1,5 @@
-// GM-1c: odd and hostile DRM calls for drmtrace.so to survive, run with the tracer preloaded (20-radv-fake.sh,
-// 30-drmtrace-tools.sh): bad pointers and counts the kernel refuses, an ioctl of type 'd' on a file that is no DRM
+// GM-1c: odd and hostile DRM calls for drmtrace.so to survive, run with the tracer preloaded
+// (30-drmtrace-tools.sh): bad pointers and counts the kernel refuses, an ioctl of type 'd' on a file that is no DRM
 // node, fork() while another thread is inside the tracer, and a buffer whose CPU mapping lost its front and tail
 // before a CS runs an IB in the part still mapped.
 //   drmhostile [--node PATH] [--host]

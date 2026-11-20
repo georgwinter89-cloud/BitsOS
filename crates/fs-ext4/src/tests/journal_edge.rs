@@ -254,7 +254,7 @@ fn a_transaction_bigger_than_the_log_is_marked_for_e2fsck_while_written() {
     let img = dev.image();
     assert_eq!(g16(&img, 1024 + sb::STATE) & sb::STATE_ERROR, 0, "the error mark stayed");
     assert_clean(&s, &img, "transactions written around the log");
-    let writes: Vec<_> = log.iter().filter(|(a, _)| *a != u64::MAX).collect();
+    let writes: Vec<_> = log.iter().filter(|(a, _)| !crate::dev::is_mark(*a)).collect();
     let mut marked = 0;
     for k in 0..=writes.len() {
         let mut im = before.clone();

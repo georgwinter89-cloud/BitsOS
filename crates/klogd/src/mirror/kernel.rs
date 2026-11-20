@@ -27,12 +27,9 @@ const NOTE_EVERY: u32 = 100;
 /// While stopped: how long one look for a resume waits (a resume kicks earlier).
 const STOPPED_LOOK_NS: u64 = 1_000_000_000;
 
-/// The listener from CONFIG: `mirror=`, else V1's `console=`.
-fn configured() -> Option<(&'static str, String)> {
-    if let Some(v) = kexec::boot::config("mirror") {
-        return Some(("mirror", v));
-    }
-    kexec::boot::config("console").map(|v| ("console", v))
+/// The listener from CONFIG `mirror=`.
+fn configured() -> Option<String> {
+    kexec::boot::config("mirror")
 }
 
 fn total_ram() -> u64 {
@@ -40,7 +37,7 @@ fn total_ram() -> u64 {
 }
 
 fn start() -> Result<(), &'static str> {
-    let Some((key, value)) = configured() else {
+    let Some(value) = configured() else {
         // R9: no listener named, nothing is ever sent.
         klog::event!(Info, "klog", "mirror.off"; "no mirror= in CONFIG");
         return Ok(());
@@ -48,7 +45,7 @@ fn start() -> Result<(), &'static str> {
     let target = match wire::parse_target(&value) {
         Ok(t) => t,
         Err(why) => {
-            klog::event!(Warn, "klog", "mirror.config_bad", key = key, value = value.as_str(), why = why; "mirror off");
+            klog::event!(Warn, "klog", "mirror.config_bad", key = "mirror", value = value.as_str(), why = why; "mirror off");
             return Ok(());
         }
     };
@@ -69,7 +66,7 @@ fn start() -> Result<(), &'static str> {
     if !MIRROR.set(m) {
         return Ok(());
     }
-    klog::event!(Info, "klog", "mirror.config", target = ip_port(target).as_str(), ring_bytes = bytes, from = key);
+    klog::event!(Info, "klog", "mirror.config", target = ip_port(target).as_str(), ring_bytes = bytes);
     // From the oldest record klog still holds: the boot before the network is buffered here.
     klog::add_deferred_sink("mirror", m, true);
     if let Err(e) = sched::spawn("mirror", sched::Class::Normal, move || run(m)) {

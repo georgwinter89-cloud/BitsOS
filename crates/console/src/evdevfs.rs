@@ -1,4 +1,4 @@
-//! `/dev/input/eventN` for programs (IN-4): Linux evdev (linux-6.6/drivers/input/evdev.c) on the input core of
+//! `/dev/input/eventN` for programs (IN-4): Linux evdev (linux-7.3.1/drivers/input/evdev.c) on the input core of
 //! `evdev`. One node per input device of the kernel's sink, made when the device registers (or as soon as
 //! devtmpfs exists) and removed when it goes; MCP's injected keyboard and pointer are devices too
 //! (`register_mcp_devices`), so a program reading evdev (bitscomp, A5) sees what Claude types.
@@ -401,6 +401,22 @@ fn note_clamps((n, behind): (u64, u64)) {
 klog::counter!(OVERFLOWS, "input.evdev_overflows");
 klog::counter!(LOST, "input.evdev_lost");
 klog::counter!(FILTERED, "input.evdev_written_filtered");
+// UPDATE: real key presses and pointer moves handed to readers that take physical input only (the compositor
+// reads its devices that way): kexec's desktop confirmation of a new version counts its rises.
+klog::counter!(PHYSICAL_READ, "input.physical_read");
+/// VB-1: when a physical-only reader last read a real key or button press (0: never). Pointer moves do not count:
+/// kexec takes an answer to "Version N läuft. Bestätigen?" through its node only right after a real press.
+static LAST_PRESS_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The time a physical-only reader last read a real key or button press (`time::now_ns`, 0: none this boot).
+pub fn last_physical_press_ns() -> u64 {
+    LAST_PRESS_NS.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn set_last_physical_press_ns(v: u64) {
+    LAST_PRESS_NS.store(v, Ordering::Release);
+}
 
 impl Listener for Queue {
     fn push(&self, ev: InputEvent) {
@@ -574,6 +590,12 @@ impl Handle {
                 let Some(ev) = ev else { break };
                 if first == 0 {
                     first = ev.time_ns;
+                }
+                if !ev.injected && ((ev.kind == EV_KEY && ev.value == 1) || ev.kind == EV_REL) && self.q.physical.load(Ordering::Relaxed) {
+                    PHYSICAL_READ.inc();
+                    if ev.kind == EV_KEY {
+                        LAST_PRESS_NS.store(time::now_ns(), Ordering::Release);
+                    }
                 }
                 out[n..n + EVENT_SIZE].copy_from_slice(&event_bytes(&ev, clock, off));
                 n += EVENT_SIZE;

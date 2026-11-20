@@ -1,12 +1,12 @@
 //! tmpfs memory pools (FS-5, V2-PLAN R2). FS-14: a tmpfs file or memfd is charged page by page when a page
 //! is allocated (write, fault, fallocate), as Linux charges its VM_NORESERVE shmem files (`shmem_inode_acct_block`
-//! from `shmem_alloc_and_add_folio`, linux-6.6/mm/shmem.c:210): a growing ftruncate costs nothing, holes are
+//! from `shmem_alloc_and_add_folio`, linux-7.3.1/mm/shmem.c:222): a growing ftruncate costs nothing, holes are
 //! free, and a page given back (truncate, hole punch, the file's end) returns its charge. A refusal is ENOSPC
 //! to a write or fallocate and SIGBUS to a fault, as on Linux. Only the kernel's nameless objects (MM's shared
 //! anonymous memory: Linux `shmem_kernel_file_setup` without VM_NORESERVE under overcommit mode 2) are still
 //! charged by size when it grows, so a fault inside them never meets an empty pool.
 //!
-//! Two levels, in Linux's order (linux-6.6/mm/shmem.c `shmem_inode_acct_block`: the memory account first,
+//! Two levels, in Linux's order (linux-7.3.1/mm/shmem.c:222 `shmem_inode_acct_blocks`: the memory account first,
 //! then the mount's `max_blocks`; `Pool::charge` names which said no, ENOMEM or ENOSPC, and the page cache
 //! answers ENOSPC for a page as shmem does; a size-charged object's growth keeps the two answers):
 //! - the **system pool**: what all tmpfs files together may hold, the frame allocator's memory minus
@@ -19,7 +19,7 @@
 //!   target) and every name (`DENTRY_BYTES` plus the name) is charged to the system pool too, in whole pages as a
 //!   mount's metadata bytes grow (`charge_meta`, held by a `MetaCharge` until the inode or name goes). Not to the
 //!   mount's own size: Linux's `size=` bounds blocks only. Refused: **ENOSPC** (Linux `shmem_reserve_inode`,
-//!   linux-6.6/mm/shmem.c:330). Without it an empty file or a symlink cost kernel heap no pool saw, and a program
+//!   linux-7.3.1/mm/shmem.c:348). Without it an empty file or a symlink cost kernel heap no pool saw, and a program
 //!   filling the 1777 `/tmp` with them exhausted the heap (a panic) instead of getting ENOSPC.
 //!
 //! All counters are atomics (no lock), so charging may happen under any file lock.

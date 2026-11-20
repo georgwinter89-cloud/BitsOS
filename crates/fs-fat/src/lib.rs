@@ -1,6 +1,6 @@
 //! FAT32 on the boot stick (owner: FS; FS-7).
 //!
-//! Our own implementation in safe Rust (decision and reasons in `plan/notes/fs-FS-7.md`): the write order is
+//! Our own implementation in safe Rust (decision and reasons in `plan/spec/storage.md` §1.1): the write order is
 //! the point of this crate, and it lives in a few hundred lines we control instead of being retrofitted into a
 //! library that writes when it likes.
 //!
@@ -21,6 +21,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod bpb;
+pub mod crash_area;
+mod crash_alone;
 pub mod dev;
 pub mod dirent;
 pub mod fat;
@@ -29,6 +31,7 @@ pub mod gate;
 pub mod glue;
 pub mod lift;
 mod ktests;
+mod ktests_gp;
 mod prio_ktests;
 mod cold_ktests;
 pub mod listing;
@@ -37,6 +40,8 @@ pub mod protect;
 pub mod stick;
 mod stick_rules;
 pub mod sysapi;
+pub mod store;
+pub mod binds;
 pub mod vol;
 mod vol_dir;
 pub mod vol_file;

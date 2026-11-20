@@ -7,26 +7,31 @@
 //! windows are the scanout buffers, a pan is a flip and nothing is copied, a refused pan changes nothing, MCP's look
 //! does not need `fbdev.screen`, every way out puts the view home, and after a holder's death the next take shows the
 //! console's picture, not what fb0's memory held. The real engine's half: `cargo test -p amdgpu` (the flip against
-//! its fake registers) and the desk's Mini-PC list (plan/notes/wy-WY-17.md).
+//! its fake registers) and the desk's Mini-PC list (plan/guides/desktop.md).
 
 use super::abi::{self, UserIo};
 use super::flip::{DirectBuffer, DirectFrame, FlipError, ScanoutFlip, Vblank};
 use super::ktests::{fb, finish, handed_back, need_program, start, text, wait_for, Started, SEC};
 use super::scanout::{self, Args, FBIO_BITSOS_SCANOUT, FLAG_ENGINE, FLAG_WHOLE, OP_BEGIN, OP_END, OP_EXPORT, SIZE, XRGB8888};
 use super::{fix_node_owner, stats, Fb};
+use super::MS;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use devmodel::display::{DisplayDevice, Fence};
 use devmodel::DevError;
 use display::ScanoutSource;
+use ksync::Once;
 use ktest::{kassert, ktest, TestResult};
+use proc::Process;
 use uapi::errno::{EBUSY, EFAULT, EINVAL, EIO, EPERM};
 
 /// One argument at a fake address; any other address faults.
-struct Arg(Cell<[u8; SIZE]>);
-const AT: u64 = 0x7400_0000;
+pub(super) struct Arg(pub(super) Cell<[u8; SIZE]>);
+pub(super) const AT: u64 = 0x7400_0000;
 
 impl UserIo for Arg {
     fn read(&self, addr: u64, out: &mut [u8]) -> bool {
@@ -42,12 +47,17 @@ impl UserIo for Arg {
 }
 
 fn raw(fb: &Fb, s: Option<&Started>, a: Args) -> Result<Args, i64> {
-    let out = fb.ioctl(FBIO_BITSOS_SCANOUT, AT, &Arg(Cell::new(a.to_bytes())), s.map(|s| &s.p))?;
+    raw_as(fb, s.map(|s| &s.p), a)
+}
+
+/// The ioctl as process `p` asks it (a kernel thread may stand in for the program's own thread).
+pub(super) fn raw_as(fb: &Fb, p: Option<&Arc<Process>>, a: Args) -> Result<Args, i64> {
+    let out = fb.ioctl(FBIO_BITSOS_SCANOUT, AT, &Arg(Cell::new(a.to_bytes())), p)?;
     let b: [u8; SIZE] = out.as_slice().try_into().map_err(|_| EINVAL)?;
     Ok(Args::from_bytes(&b))
 }
 
-fn call(fb: &Fb, s: Option<&Started>, op: u32, window: u32) -> Result<Args, i64> {
+pub(super) fn call(fb: &Fb, s: Option<&Started>, op: u32, window: u32) -> Result<Args, i64> {
     raw(fb, s, Args { op, window, fd: -1, ..Args::default() })
 }
 
@@ -159,20 +169,32 @@ fn rules() -> TestResult {
 ktest!("dp.fbdev.scanout", QemuOnly, rules);
 
 /// The fake engine: two buffers at the framebuffer's real address (a program maps them, the kernel never touches them),
-/// counting what it is asked.
-struct Engine {
-    phys: AtomicU64,
-    len: AtomicU64,
-    stride: AtomicU32,
-    shown: AtomicU32,
-    ordered: AtomicU64,
-    flips: AtomicU64,
-    waits: AtomicU64,
-    stopped: AtomicBool,
-    whole: AtomicBool,
+/// counting what it is asked. SHOT (`dp.fbdev.shot`) gives it two RAM pictures to read instead, slowed down like
+/// device memory.
+pub(super) struct Engine {
+    pub(super) phys: AtomicU64,
+    pub(super) len: AtomicU64,
+    pub(super) stride: AtomicU32,
+    pub(super) shown: AtomicU32,
+    pub(super) ordered: AtomicU64,
+    pub(super) flips: AtomicU64,
+    pub(super) waits: AtomicU64,
+    pub(super) stopped: AtomicBool,
+    pub(super) whole: AtomicBool,
+    /// SHOT: what each buffer holds, read while `use_pics`; each read of a band takes `delay_ns` first.
+    pub(super) pics: Once<Pics>,
+    pub(super) use_pics: AtomicBool,
+    pub(super) delay_ns: AtomicU64,
 }
 
-static ENGINE: Engine = Engine {
+/// SHOT: the fake buffers' pixels, `w` x `h` each.
+pub(super) struct Pics {
+    pub(super) w: u32,
+    pub(super) h: u32,
+    pub(super) bufs: [Vec<AtomicU32>; 2],
+}
+
+pub(super) static ENGINE: Engine = Engine {
     phys: AtomicU64::new(0),
     len: AtomicU64::new(0),
     stride: AtomicU32::new(0),
@@ -182,9 +204,12 @@ static ENGINE: Engine = Engine {
     waits: AtomicU64::new(0),
     stopped: AtomicBool::new(false),
     whole: AtomicBool::new(true),
+    pics: Once::new(),
+    use_pics: AtomicBool::new(false),
+    delay_ns: AtomicU64::new(0),
 };
 
-/// What `read_shown` hands out for buffer `w`: not a picture anything else could have drawn.
+/// What `read_window` hands out for buffer `w` without pictures: not a picture anything else could have drawn.
 const fn look_px(w: u32) -> u32 {
     0x00A0_B0C0 + w
 }
@@ -214,7 +239,6 @@ impl ScanoutFlip for Engine {
     fn vblank(&self) -> Option<Vblank> {
         None
     }
-    fn rearm(&self) {}
     fn direct_buffer(&self, _window: usize) -> Option<DirectBuffer> {
         Some(DirectBuffer { phys: self.phys.load(Ordering::Acquire), len: self.len.load(Ordering::Acquire), stride: self.stride.load(Ordering::Acquire) })
     }
@@ -228,19 +252,50 @@ impl ScanoutFlip for Engine {
         if self.stopped.load(Ordering::Acquire) {
             return Err(FlipError::Late);
         }
-        if self.shown.swap(window as u32, Ordering::AcqRel) == window as u32 {
+        if self.shown.swap(window as u32, Ordering::SeqCst) == window as u32 {
             return Ok(self.ordered.load(Ordering::Acquire));
         }
         self.flips.fetch_add(1, Ordering::AcqRel);
         Ok(self.ordered.fetch_add(1, Ordering::AcqRel) + 1)
     }
-    fn read_shown(&self, dst: &mut [u32], _stride: u32) -> bool {
-        dst.fill(look_px(self.shown.load(Ordering::Acquire)));
+    fn shown(&self) -> Option<usize> {
+        (!self.stopped.load(Ordering::SeqCst)).then(|| self.shown.load(Ordering::SeqCst) as usize)
+    }
+    fn read_window(&self, window: usize, (x, y, w, h): (u32, u32, u32, u32), dst: &mut [u32]) -> bool {
+        let d = self.delay_ns.load(Ordering::Acquire);
+        if d >= 2 * MS {
+            sched::sleep_ns(d);
+        } else if d > 0 {
+            let end = time::now_ns() + d;
+            while time::now_ns() < end {
+                core::hint::spin_loop();
+            }
+        }
+        let n = w as usize * h as usize;
+        let Some(p) = self.pics.get().filter(|_| self.use_pics.load(Ordering::Acquire)) else {
+            dst[..n].fill(look_px(window as u32));
+            return true;
+        };
+        if x + w > p.w || y + h > p.h || dst.len() < n {
+            return false;
+        }
+        let buf = &p.bufs[window & 1];
+        for r in 0..h as usize {
+            let at = (y as usize + r) * p.w as usize + x as usize;
+            for (d, s) in dst[r * w as usize..(r + 1) * w as usize].iter_mut().zip(&buf[at..at + w as usize]) {
+                *d = s.load(Ordering::Relaxed);
+            }
+        }
         true
     }
 }
 
 fn pan_to(fb: &Fb, s: &Started, yoffset: u32) -> Result<(), i64> {
+    pan_as(fb, &s.p, yoffset)
+}
+
+/// FBIOPAN_DISPLAY to `yoffset` as process `p` asks it.
+pub(super) fn pan_as(fb: &Fb, p: &Arc<Process>, yoffset: u32) -> Result<(), i64> {
     struct Pan([u8; abi::VAR_SIZE]);
     impl UserIo for Pan {
         fn read(&self, _: u64, out: &mut [u8]) -> bool {
@@ -253,7 +308,7 @@ fn pan_to(fb: &Fb, s: &Started, yoffset: u32) -> Result<(), i64> {
     }
     let mut var = fb.meta.lock().var;
     var.0[abi::YOFFSET] = yoffset;
-    fb.ioctl(abi::FBIOPAN_DISPLAY, AT, &Pan(var.to_bytes()), Some(&s.p)).map(|_| ())
+    fb.ioctl(abi::FBIOPAN_DISPLAY, AT, &Pan(var.to_bytes()), Some(p)).map(|_| ())
 }
 
 /// The view as the var and the atomic say; they must agree.
@@ -264,7 +319,7 @@ fn view(fb: &Fb) -> Result<u32, String> {
 }
 
 /// EXPORT both windows and BEGIN: frames go straight to the scanout from here.
-fn draw_direct(fb: &Fb, s: &Started) -> Result<Args, String> {
+pub(super) fn draw_direct(fb: &Fb, s: &Started) -> Result<Args, String> {
     let a = call(fb, Some(s), OP_EXPORT, 0).map_err(|e| format!("export 0: {e}"))?;
     call(fb, Some(s), OP_EXPORT, 1).map_err(|e| format!("export 1: {e}"))?;
     let b = call(fb, Some(s), OP_BEGIN, 0).map_err(|e| format!("begin: {e}"))?;

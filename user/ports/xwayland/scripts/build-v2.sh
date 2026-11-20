@@ -7,8 +7,8 @@
 #                               gpu build does (never the initramfs glibc)
 #   lib/                        the libraries they link that the Mesa tree lacks (the host's files, by soname), and
 #                               libGLX_mesa.so.0, which an X11 GL client's libGLX loads by name
-#   clients/                    glxgears, glxinfo, xdpyinfo from the distribution's signed packages, for the Mini-PC's
-#                               x11gpu.sh (they would be on nobody's stick otherwise); started by `run`
+#   clients/                    glxgears, glxinfo, xdpyinfo from the distribution's signed packages, for checks by
+#                               hand on the Mini-PC (they would be on nobody's stick otherwise); started by `run`
 #   run                         starts a program of clients/ or a path with both trees' loader, libraries and drivers
 #   share/X11/xkb/              xkeyboard-config's data (xkbcomp compiles the keymaps bitscomp sends)
 #   LICENSES/                   the licence texts; SOURCES.txt what was built from what
@@ -46,7 +46,7 @@ SOURCES=(
 )
 TEST_PKGS="xterm xorg-xeyes xorg-xclock xorg-xdpyinfo xorg-xinput xorg-xrandr xclip wl-clipboard"
 TEST_BINS="xterm xeyes xclock xdpyinfo xinput xrandr xclip wl-copy wl-paste"
-# WY-3b: on the stick (x11gpu.sh needs them there): package|program...
+# WY-3b: on the stick (for checks by hand on the Mini-PC): package|program...
 CLIENTS=("mesa-utils|glxgears glxinfo" "xorg-xdpyinfo|xdpyinfo")
 # What an X11 GL client's libGLX loads by name, so nothing lists it as needed.
 DLOPEN="libGLX_mesa.so.0"

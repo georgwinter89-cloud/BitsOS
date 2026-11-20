@@ -15,5 +15,8 @@ policy = { path = "../policy" }
 uapi = { path = "../uapi" }
 zeroize = { version = "=1.9.1", default-features = false }
 
+[dev-dependencies]
+mm-core = { path = "../mm-core", features = ["host-count"] }
+
 [lints]
 workspace = true

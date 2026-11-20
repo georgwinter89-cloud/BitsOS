@@ -1,5 +1,5 @@
-//! Resource limits per process (`getrlimit`/`setrlimit`/`prlimit64`; linux-6.6/kernel/sys.c `do_prlimit`
-//! :1455). The table has Linux's `RLIM_NLIMITS` entries (an ABI constant). Defaults are the kernel's
+//! Resource limits per process (`getrlimit`/`setrlimit`/`prlimit64`; linux-7.3.1/kernel/sys.c `do_prlimit`
+//! :1500). The table has Linux's `RLIM_NLIMITS` entries (an ABI constant). Defaults are the kernel's
 //! `INIT_RLIMITS` (include/asm-generic/resource.h) with NPROC and SIGPENDING computed from RAM as `fork_init`
 //! does. RLIMIT_NOFILE acts on the fd table (FS), RLIMIT_NPROC on fork and clone (AB-4), RLIMIT_STACK on
 //! execve's argument space (AB-4); the others are kept and reported (R1: the memory hook, not rlimits, bounds

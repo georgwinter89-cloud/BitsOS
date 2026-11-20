@@ -1,6 +1,7 @@
 //! SX-3a: what mount(2), umount2(2) and pivot_root(2) do to a view, with Linux's checks in Linux's order
-//! (linux-6.6/fs/namespace.c `do_loopback`, `do_add_mount`, `do_reconfigure_mnt`, `do_remount`,
-//! `do_change_type`, `do_move_mount`, `can_umount`/`do_umount`, `pivot_root`, `mnt_already_visible`). The caller
+//! (linux-7.3.1/fs/namespace.c:3106 `do_loopback`, :3857 `do_add_mount`, :3457 `do_reconfigure_mnt`, :3494
+//! `do_remount`, :2976 `do_change_type`, :3765 `do_move_mount`, :2077 `can_umount`/:1921 `do_umount`, :4837
+//! `path_pivot_root`, :6573 `mnt_already_visible`). The caller
 //! (vfs-sys) looked the paths up, copied the arguments and checked the capabilities (`may_mount` and the file
 //! system's own); these functions check the tree.
 
@@ -158,10 +159,15 @@ impl MountNs {
         Ok(())
     }
 
-    /// `do_move_mount` (MS_MOVE): the mount at the mount root `from` moves onto the topmost mount at `to`.
-    /// EINVAL: not of this view, locked, not a mount root, a directory onto a file, a shared parent, an
-    /// unbindable tree onto a shared place; ELOOP: onto itself or below.
+    /// `do_move_mount` (MS_MOVE, linux-7.3.1/fs/namespace.c:3765): the mount at the mount root `from` moves onto
+    /// the topmost mount at `to`. Before `to` is locked (so before its ENOENT): EINVAL for `from` not a mount root
+    /// and for a directory onto a file or back (:3773). Then EINVAL: not of this view, locked, a shared parent, an
+    /// unbindable tree onto a shared place; ELOOP: onto itself or below. A source that is the root of an
+    /// anonymous namespace (open_tree) cannot exist: V2 has no open_tree.
     pub fn move_mount(&self, from: &Path, to: &Path) -> Result<(), Errno> {
+        if !from.is_mount_root() || to.dentry.is_dir() != from.dentry.is_dir() {
+            return Err(EINVAL);
+        }
         let to = self.lock_mount(to)?;
         let old = from.mnt.clone();
         let mut g = Grave::default();
@@ -169,10 +175,7 @@ impl MountNs {
             let mut t = TOPO.lock();
             let to = tree::topmost(&t, &to);
             let Some((parent, _)) = old.mountpoint() else { return Err(EINVAL) };
-            if !self.check_mnt(&to.mnt) || !self.check_mnt(&old) || old.flags() & MNT_LOCKED != 0 || !from.is_mount_root() {
-                return Err(EINVAL);
-            }
-            if to.dentry.is_dir() != from.dentry.is_dir() || parent.propagation().0 != 0 {
+            if !self.check_mnt(&to.mnt) || !self.check_mnt(&old) || old.flags() & MNT_LOCKED != 0 || parent.propagation().0 != 0 {
                 return Err(EINVAL);
             }
             if to.mnt.propagation().0 != 0 && tree::subtree(&t, &old).iter().any(|m| m.flags() & MNT_UNBINDABLE != 0) {

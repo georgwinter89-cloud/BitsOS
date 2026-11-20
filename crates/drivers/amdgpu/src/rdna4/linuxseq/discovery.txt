@@ -1,0 +1,9 @@
+# linuxseq discovery: plan/hw/gaming-pc-gpu-2026-11-18/init.txt.zst sha256 62289898e3bbb5cb41a52a202eb686b6c6448b5d38f5c25426876ed29f1e7007, init lines 1-8, by host/gaming-pc/gx-trace-seq.py; regenerate: python3 host/gaming-pc/gx-trace-seq.py plan/hw/gaming-pc-gpu-2026-11-18/init.txt.zst crates/drivers/amdgpu/src/rdna4/linuxseq
+1 R RCC_DEV0_EPF0_RCC_IOV_FUNC_IDENTIFIER 0xde5 0x00000000
+2 R MPASP_SMN_C2PMSG_33 0x16061 0x80000000
+3 R RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE 0xde3 0x00003fb0
+4 MEM 0x3faff0000 1
+5 MEM 0x3faff0000 2560
+6 R RCC_STRAP0_RCC_DEV0_EPF0_STRAP0 0xd3c 0x310c7550
+7 R MPASP_SMN_C2PMSG_81 0x16091 0x00000000
+8 R BIF_BX0_BIOS_SCRATCH_7 0x53 0x006a020a

@@ -1,6 +1,6 @@
 # user/ports/steamrt: the Steam Linux Runtime 3.0 (sniper) for the V2 scenario (SX-3c)
 
-`build.sh` puts Valve's runtime tree with pressure-vessel and a software graphics provider into `out/` (git
+`build.sh` puts Valve's runtime tree with pressure-vessel and a graphics provider into `out/` (git
 ignores it, ~1.1 GB); `host/tests/sx/20-pressure-vessel.sh` streams both to V2 in QEMU and runs `true` and
 `steam-runtime-system-info` in the container; `record-host.sh` makes the same runs on CachyOS as the reference.
 Nothing of it goes into the image or onto the stick.
@@ -8,7 +8,7 @@ Nothing of it goes into the image or onto the stick.
 | Path | What |
 |---|---|
 | `out/SteamLinuxRuntime_sniper/` | Valve's tree as published (`run`, `pressure-vessel/`, `sniper_platform_<version>/`), the arm64 pressure-vessel left out |
-| `out/gfx/` | the graphics provider (`PRESSURE_VESSEL_GRAPHICS_PROVIDER`): an Arch-shaped sysroot with the GM-1a Mesa tree (llvmpipe, lavapipe, RADV, radeonsi, glvnd, the Vulkan loader; `user/ports/mesa/scripts/stage-v2.sh`, staged into `out/mesa-stage/`) and the whole glibc of the same signature-checked package, `usr/lib` + `lib`/`lib64` links, `etc/ld.so.cache` from `ldconfig -r` |
+| `out/gfx/` | the graphics provider (`PRESSURE_VESSEL_GRAPHICS_PROVIDER`): an Arch-shaped sysroot with the GM-1a Mesa tree (RADV, radeonsi, glvnd, the Vulkan loader; no software driver; `user/ports/mesa/scripts/stage-v2.sh`, staged into `out/mesa-stage/`) and the whole glibc of the same signature-checked package, `usr/lib` + `lib`/`lib64` links, `etc/ld.so.cache` from `ldconfig -r` |
 
 ## Download (download cache `$V2_DOWNLOADS`, SHA256 checked on every build)
 

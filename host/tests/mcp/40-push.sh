@@ -74,7 +74,7 @@ TOTAL=$(find "$T" -type f | wc -l)
 echo "tree: $TOTAL files, $(du -sm "$T" | cut -f1) MB"
 
 # ---- the image ----
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;wlan=off" | tail -1
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info" | tail -1
 ESP="target/xtask/esp-$NAME"
 IMG="target/xtask/$NAME.img"
 CONTENT=$(du -sb "$ESP" | cut -f1)

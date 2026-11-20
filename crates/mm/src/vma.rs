@@ -60,7 +60,7 @@ pub struct FileRef {
     pub shared: bool,
     pub may_write: bool,
     /// Linux's VM_MAYEXEC: false for a file on a noexec mount (`vfs::mmap::Mapped::may_exec`, FS-13 CR2), so
-    /// mprotect cannot add PROT_EXEC later (linux-6.6/mm/mprotect.c:789).
+    /// mprotect cannot add PROT_EXEC later (linux-7.3.1/mm/mprotect.c:973).
     pub may_exec: bool,
     pub device: Option<Arc<DeviceMap>>,
 }

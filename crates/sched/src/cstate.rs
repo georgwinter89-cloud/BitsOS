@@ -2,7 +2,7 @@
 //!
 //! Until FD-1 every idle CPU ran `sti; hlt` (C1): the core stays powered at its voltage. Linux enters the
 //! deeper states the firmware lists in `_CST` (acpi_idle); on the Mini-PC (Ryzen 7 PRO 8845HS) C2 = a byte read
-//! from I/O port 0x414 (CC6, 18 us exit) and C3 = port 0x415 (350 us). Measured there (plan/notes/sc-FD-1.md):
+//! from I/O port 0x414 (CC6, 18 us exit) and C3 = port 0x415 (350 us). Measured there (plan/spec/core.md §11):
 //! package power of the idle console 4.4 W with C1 only, 3.4 W with this; the single-core clock stays 4.44 GHz
 //! either way, video frame drops unchanged.
 //!
@@ -11,24 +11,25 @@
 //! choice (Linux `menu`/`teo` in small): the deepest state whose target residency (`residency_factor` times its
 //! exit latency) fits both the time to this CPU's next own timer and the predicted idle length (a running
 //! average of this CPU's recent idle periods, so a CPU woken every few hundred microseconds by a futex
-//! ping-pong stays in C1 and keeps its fast wake-up). CONFIG `idle=deep|c1` (default deep) switches it off.
+//! ping-pong stays in C1 and keeps its fast wake-up).
 
+pub mod check;
 mod entry;
 pub mod fake;
+pub mod mwait;
 mod plan;
 
 pub use entry::{enter, Entered, IdleHw, BM_STS};
-pub use plan::{plan, C1Only, CpuIdle, Deep, Firmware, Plan, Refused, Vendor, MAX_LATENCY_US};
+pub use plan::{plan, C1Only, CpuIdle, Deep, Firmware, MwaitSource, Plan, Refused, Vendor, ARROW_LAKE_S, MAX_LATENCY_US};
 
 use crate::cpus::CpuSched;
-use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// Target residency = this many times the exit latency (Linux acpi_idle uses 2; a bit more caution here).
 pub const DEFAULT_RESIDENCY_FACTOR: u32 = 4;
 
-/// `Auto` (CONFIG `idle=deep`, the default): choose by timer and prediction; `C1` (`idle=c1`): `sti; hlt`
-/// only, the behaviour before FD-1; `Forced`: always the shallowest deep state (measuring build only).
+/// `Auto` (always, outside the measuring build): choose by timer and prediction; `C1`: `sti; hlt` only, the
+/// behaviour before FD-1, and `Forced`: always the shallowest deep state (both for the measuring build's A/B runs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Auto = 0,
@@ -50,29 +51,79 @@ static MODE: AtomicU8 = AtomicU8::new(Mode::Auto as u8);
 static FACTOR: AtomicU32 = AtomicU32::new(DEFAULT_RESIDENCY_FACTOR);
 static PLAN: ksync::Once<Plan> = ksync::Once::new();
 static DEMOTION_LOGGED: AtomicBool = AtomicBool::new(false);
+/// GP-CPU2: the self-check of an MWAIT plan (`CheckState` as u8).
+static CHECK: AtomicU8 = AtomicU8::new(CheckState::NotNeeded as u8);
+static CHECK_RESULT: ksync::Once<CheckOutcome> = ksync::Once::new();
 static REFUSAL_LOGGED: AtomicBool = AtomicBool::new(false);
 klog::counter!(pub BM_DEMOTIONS, "sched.idle.bm_demotions");
 
-/// CONFIG `idle=` to a mode (pure; host-tested): `deep` (or missing) -> `Auto`, `c1` -> `C1`. An unknown value
-/// keeps the default and says so (`true`), so the caller can warn.
-pub fn parse_config(v: Option<&str>) -> (Mode, bool) {
-    match v.map(str::trim) {
-        None | Some("") | Some("deep") => (Mode::Auto, false),
-        Some("c1") => (Mode::C1, false),
-        Some(_) => (Mode::Auto, true),
+/// Where the self-check of MWAIT states stands. Port states (the Mini-PC) never need one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckState {
+    NotNeeded = 0,
+    Pending = 1,
+    Passed = 2,
+    Failed = 3,
+}
+
+impl CheckState {
+    pub fn name(self) -> &'static str {
+        match self {
+            CheckState::NotNeeded => "not_needed",
+            CheckState::Pending => "pending",
+            CheckState::Passed => "passed",
+            CheckState::Failed => "failed",
+        }
+    }
+
+    /// The state at init (pure): an MWAIT plan waits for its check.
+    pub fn at_init(needs_check: bool) -> CheckState {
+        if needs_check { CheckState::Pending } else { CheckState::NotNeeded }
     }
 }
 
-/// Reads CONFIG `idle=` (the kernel hands its getter over, before or after `init`).
-pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
-    let v = get("idle");
-    let (m, bad) = parse_config(v.as_deref());
-    if bad {
-        klog::event!(Warn, "sched", "config.unknown", key = "idle", value = v.unwrap_or_default(); "idle= takes deep|c1; deep kept");
+/// The check's result: per state and CPU what it showed, or the first fault (CPU, hint, fault).
+pub type CheckOutcome = Result<alloc::vec::Vec<(usize, u8, check::Passed)>, (usize, u8, check::Fault)>;
+
+pub fn check_state() -> CheckState {
+    match CHECK.load(Ordering::Acquire) {
+        1 => CheckState::Pending,
+        2 => CheckState::Passed,
+        3 => CheckState::Failed,
+        _ => CheckState::NotNeeded,
     }
-    set_mode(m);
-    if m == Mode::C1 {
-        klog::event!(Info, "sched", "idle.mode", mode = m.name(), source = "config");
+}
+
+/// The self-check's result (`None` while it runs, or where none is needed).
+pub fn check_outcome() -> Option<&'static CheckOutcome> {
+    CHECK_RESULT.get()
+}
+
+/// The plan the idle loop may use now: an MWAIT plan only after its self-check passed.
+pub fn usable(p: Option<&Plan>, state: CheckState) -> Option<&Plan> {
+    p.filter(|p| !p.needs_check() || state == CheckState::Passed)
+}
+
+/// Records the self-check's result and says it: one Info line when it passed, one Warn line when not. Only the
+/// machine's check thread (and the host tests) call it.
+#[cfg(any(target_os = "none", test))]
+pub(crate) fn finish_check(p: &Plan, r: CheckOutcome) {
+    let r = CHECK_RESULT.get_or_init(|| r);
+    match r {
+        Ok(v) => {
+            CHECK.store(CheckState::Passed as u8, Ordering::Release);
+            for (cpu, hint, ok) in v {
+                klog::event!(Info, "sched", "idle.check_state", cpu = *cpu, hint = klog::Hex(u64::from(*hint)), wake_us = ok.median_late_us,
+                    residency_pct = ok.residency_pct.map_or(alloc::string::String::from("none"), |x| alloc::format!("{x}")));
+            }
+            klog::event!(Info, "sched", "idle.check", result = "ok", states = p.deep.len(), samples = v.len();
+                "deep idle states checked on a P and an E core: the cores sleep deeply when idle");
+        }
+        Err((cpu, hint, f)) => {
+            CHECK.store(CheckState::Failed as u8, Ordering::Release);
+            klog::event!(Warn, "sched", "idle.check", result = "failed", cpu = *cpu, hint = klog::Hex(u64::from(*hint)), reason = f.name(),
+                detail = f.german(); "deep idle off, every core sleeps lightly (C1) as before");
+        }
     }
 }
 
@@ -109,6 +160,13 @@ pub(crate) fn init() {
         }
     }
     log_plan(p, mode());
+    // GP-CPU2: MWAIT states wait for their self-check.
+    let st = CheckState::at_init(p.needs_check());
+    CHECK.store(st as u8, Ordering::Release);
+    if st == CheckState::Pending {
+        #[cfg(target_os = "none")]
+        check::spawn(p);
+    }
 }
 
 fn log_plan(p: &Plan, m: Mode) {
@@ -120,8 +178,15 @@ fn log_plan(p: &Plan, m: Mode) {
         klog::event!(Info, "sched", "idle.latency_reordered"; "firmware latencies out of order, sorted as Linux does");
     }
     for d in &p.deep {
-        klog::event!(Info, "sched", "idle.state", kind = d.kind, port = klog::Hex(d.port as u64), latency_us = d.latency_ns / 1000,
-            bm_check = d.bm_check);
+        match d.mwait {
+            Some(h) => klog::event!(Info, "sched", "idle.state_mwait", kind = d.kind, hint = klog::Hex(u64::from(h)), latency_us = d.latency_ns / 1000),
+            None => klog::event!(Info, "sched", "idle.state", kind = d.kind, port = klog::Hex(d.port as u64), latency_us = d.latency_ns / 1000,
+                bm_check = d.bm_check),
+        }
+    }
+    if let Some(src) = p.mwait_source {
+        klog::event!(Info, "sched", "idle.mwait", source = src.name(), states = p.deep.len(), check = "pending";
+            "MWAIT states as Linux's intel_idle takes them; used after the self-check");
     }
     match p.c1_only {
         Some(why) => klog::event!(Info, "sched", "idle.c1_only", reason = why.name()),
@@ -137,6 +202,8 @@ pub fn mode() -> Mode {
     }
 }
 
+/// Thread context once the scheduler runs (ktests, the measuring build's MCP tool). Deep states are still used
+/// only after their self-check (`usable`).
 pub fn set_mode(m: Mode) {
     MODE.store(m as u8, Ordering::Relaxed);
 }
@@ -214,6 +281,9 @@ impl IdleHw for Ports {
     fn sti(&self) {
         hal::cpu::enable_interrupts();
     }
+    fn mwait(&self, hint: u8) {
+        hal::cpu::mwait::idle(hint);
+    }
 }
 
 /// An AP at bring-up: the plan was judged on the boot CPU's CPUID; a CPU that lacks ARAT or an invariant TSC
@@ -245,7 +315,7 @@ pub fn step<H: IdleHw>(hw: &H, plan: Option<&Plan>, m: Mode, cpu_c1_only: bool, 
 /// interrupts on). No lock, no allocation before the sleep.
 pub(crate) fn sleep(cs: &CpuSched) {
     let t0 = time::now_ns();
-    let plan = PLAN.get();
+    let plan = usable(PLAN.get(), check_state());
     let gap = || match time::hrtimer::next_deadline_on(cs.cpu) {
         Some(None) => None,
         Some(Some(d)) => Some(d.saturating_sub(t0)),
@@ -293,3 +363,5 @@ pub(crate) fn sleep(cs: &CpuSched) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod mwait_tests;

@@ -102,7 +102,7 @@ fn session(b: &Bridge, st: &mut State) -> bool {
                 }
             }
             Ok(Some(Event::Call(c))) => {
-                let r = mcp_tools::call(&b.shared, &c.name, &c.arguments);
+                let r = mcp_tools::call(&b.shared, &c.name, &c.arguments, c.caller.is_some());
                 if let Err(e) = replier.reply(c.id, r) {
                     break format!("reply: {e}");
                 }
@@ -139,7 +139,7 @@ fn changes(rx: Receiver<(Call, Option<Instant>)>, shared: &Shared, ev: &Events, 
             ev.emit(Level::Warn, "mcp.skipped", &format!("tool={} key={} reason=deadline", c.name, q(&key)));
             continue;
         }
-        let r = mcp_tools::call(shared, &c.name, &c.arguments);
+        let r = mcp_tools::call(shared, &c.name, &c.arguments, c.caller.is_some());
         let result = match &r {
             mcpreg::Reply::Ok(_) => "ok".to_string(),
             mcpreg::Reply::Error(t) => t.split(':').next().unwrap_or("error").to_string(),

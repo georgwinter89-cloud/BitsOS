@@ -1,16 +1,18 @@
 #!/bin/bash
 # slow
-# GX-8c: CONFIG gpu=on in QEMU, which has no chip. Whatever the boot's bring-up does, the desktop comes up and MCP answers.
-# gpu_boot_fake= plays the bring-up (only under a hypervisor); the chain itself is the gx.hw.boot_* ktests' on the fake chain.
-#  1. up: passes on the fake's node (drm=fake): the desktop starts after the end, the row says ready.
-#  2. fail: a stage fails: stopped, reason in the log, the desktop still starts after the end, renderD128 is the fake's.
-#  3. hang: the chain outlives the bound: the desktop goes on at the bound, no later, the failure comes behind it.
-#  4. nochip: gpu=on with no script: no AMD function, nothing is held.
-#  5. off: gpu=off (WY-21: no key is gpu=on now): nothing happens, and no line of the boot's bring-up in the log. Then, over MCP, gx.hw.boot_thread:
-#     the thread and the hold on the wall clock.
+# GX-8c in QEMU, which has no chip: the GPU's bring-up runs at every boot (no key keeps it down). Up: the desktop's start
+# follows its end. Failed, past its bound, or no GPU at all: no desktop, one plain line on the text console, MCP answers.
+# gpu_boot_fake= (test only) plays the bring-up (only under a hypervisor); the chain itself is the gx.hw.boot_* ktests'.
+#  1. up: passes on the fake's node (drm=fake): the desktop's start comes after the end, the row says ready; again
+#     after a Reload.
+#  2. fail: a stage fails: stopped, reason in the log, no desktop: the text console's one line.
+#  3. hang: the chain outlives the bound: at the bound no desktop, the line; the failure comes behind it.
+#  4. nochip: no script: no AMD function, nothing is held, no desktop either (the line says so). Then, over MCP,
+#     gx.hw.boot_thread: the thread and the hold on the wall clock.
+# In boots 1-3, over MCP, gx.hw.boot_report: what the run left (the desktop told, a render node only when up).
 # One image, its CONFIG.TXT replaced before each boot: an image costs minutes while the gate runs its chains (600 s for a
-# script), and this script has five boots.
-# After a Reload (up) the new kernel does it again. In each boot gx_bringup until=boot answers how it went, /proc/bitsos/boot has the row, MCP answers.
+# script), and this script has four boots.
+# In each boot gx_bringup until=boot answers how it went, /proc/bitsos/boot has the row, MCP answers.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/gx-10-boot}"
@@ -71,26 +73,43 @@ wait_line() {
     done
 }
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;desktop=on;ktest_run=gx/10-boot" > "$RUN_DIR/image.out" 2>&1
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;ktest_run=gx/10-boot" > "$RUN_DIR/image.out" 2>&1
 IMG="$TARGET/xtask/$NAME.img"
 BASE="$TARGET/xtask/esp-$NAME/BITSOS2/CONFIG.TXT"
 [ -f "$IMG" ] && [ -f "$BASE" ] || { echo "RED: no image $IMG with $BASE"; exit 1; }
 
-# boot <mode> <lines of config>: up to the desktop's taking the screen, MCP's answer and the boot's bring-up's end.
+START="console desktop.start program=/boot/BITSOS2/bin/bitscomp"
+NO_GPU="console desktop.no_gpu"
+# boot <mode> <end> <lines of config>: up to <end> (the desktop's start, or its no_gpu line) and MCP's answer.
 boot() {
     MODE="$1"
     LOG="$RUN_DIR/serial-$MODE.log"
-    { cat "$BASE"; printf '%s\n' "${@:2}"; } > "$RUN_DIR/config-$MODE"
+    { cat "$BASE"; printf '%s\n' "${@:3}"; } > "$RUN_DIR/config-$MODE"
     mcopy -o -i "$IMG" "$RUN_DIR/config-$MODE" ::/BITSOS2/CONFIG.TXT
     stop_qemu
     rm -f "$LOG"
     cargo xtask qemu --name "$NAME" --mem 4G --net virtio --hostfwd "$FWD:8765" --timeout 400 --serial-log "$LOG" -- \
         -machine i8042=off -device qemu-xhci,id=xb -device usb-kbd,bus=xb.0,port=1,id=kbd1 > "$RUN_DIR/qemu-$MODE.out" 2>&1 &
     QPID=$!
-    wait_line "console desktop.up program=/bin/bitscomp" 240
+    wait_line "$2" 240
     none "PANIC"
     none "lock.violation"
-    echo "ok   $MODE: the desktop took the screen"
+    echo "ok   $MODE: '$2'"
+}
+# No desktop: the one line on the text console (the event carries it), and nothing started.
+text_console() {
+    need "$NO_GPU reason=$1"
+    need "$2"
+    none "$START"
+    echo "ok   $MODE: no desktop, the line '$2'"
+}
+# A ktest of class Run("gx/10-boot") over MCP; the ledger counts what a run's logs say.
+ktest() {
+    local a
+    a="$(call ktest "{\"filter\":\"$1\"}")" || red "ktest failed: $a"
+    case "$a" in *"ok $1"*) ;; *) red "$1: $a" ;; esac
+    printf '%s\n' "$a" | sed -n "s/^ok $1/KTEST ok $1/p" | head -1 >> "$RUN_DIR/ktest.txt"
+    echo "ok   $MODE: $1"
 }
 # How much the machine answers at the end of a boot.
 answers() {
@@ -106,21 +125,24 @@ answers() {
     echo "ok   $MODE: MCP, until=boot, the row '$2'"
 }
 
+rm -f "$RUN_DIR/ktest.txt"
+
 # 1. Up.
-boot up drm=fake gpu=on gpu_boot_fake=up
+boot up "$START" drm=fake gpu_boot_fake=up
 need "gx boot.start bound_s=30"
 need "gx boot.up minor=128"
 # hold_end only when the thread looked before the end: the order below is the rule.
-before "gx boot.up minor=128" "console desktop.start program=/bin/bitscomp"
+before "gx boot.up minor=128" "$START"
 none "gx boot.failed"
-none "console desktop.hold_over"
+none "$NO_GPU"
 answers "^boot: up on renderD128" "gpu bereit, renderD128" "renderD128"
+ktest gx.hw.boot_report
 # The new kernel of a Reload does it again by itself, with no `again`.
 node host/mcp/reload.mjs "127.0.0.1:$FWD" --name "$NAME" --no-build --bind 127.0.0.1 --port $((LO + 111)) --token-file "$TF" > "$RUN_DIR/reload.out" 2>&1 || { cat "$RUN_DIR/reload.out"; red "the Reload failed"; }
 s=0
-until [ "$(grep -ac "console desktop.up program=/bin/bitscomp" "$LOG")" -ge 2 ]; do
+until [ "$(grep -ac "$START" "$LOG")" -ge 2 ]; do
     s=$((s + 1))
-    [ "$s" -le 120 ] || red "no desktop after the Reload"
+    [ "$s" -le 120 ] || red "no desktop start after the Reload"
     sleep 1
 done
 [ "$(grep -ac "gx boot.up minor=128" "$LOG")" -eq 2 ] || red "the Reload's kernel did not bring it up"
@@ -129,46 +151,39 @@ answers "^boot: up on renderD128" "gpu bereit, renderD128" "renderD128"
 echo "ok   up: again after a Reload"
 cleanup
 
-# 2. A stage fails.
-boot fail drm=fake gpu=on gpu_boot_fake=fail
+# 2. A stage fails: no desktop, the line.
+boot fail "$NO_GPU" gpu_boot_fake=fail
 need "gx boot.failed stage=sdma stop=done"
-before "gx boot.failed" "console desktop.start program=/bin/bitscomp"
+before "gx boot.failed" "$NO_GPU"
 none "gx boot.up"
-answers "^gx_bringup: FAIL" "gestoppt bei sdma, ohne gpu" "renderD128"
+text_console gpu "Die Grafik ist nicht hochgekommen (sdma)"
+answers "^gx_bringup: FAIL" "gestoppt bei sdma, textkonsole" "."
 grep -q "script: stopped as until=stop does" "$RUN_DIR/answer-fail.txt" || red "no stop in the answer"
+ktest gx.hw.boot_report
 cleanup
 
-# 3. The chain outlives the bound: the desktop goes on at the bound, the failure comes behind it.
-boot hang drm=fake gpu=on gpu_boot_fake=hang
+# 3. The chain outlives the bound: at the bound no desktop, the line; the failure comes behind it.
+boot hang "$NO_GPU" gpu_boot_fake=hang
 need "console desktop.held"
-need "console desktop.hold_over"
-before "console desktop.hold_over" "console desktop.start program=/bin/bitscomp"
+text_console late "Die Grafik ist nicht rechtzeitig hochgekommen"
 wait_line "gx boot.failed stage=late stop=done" 30
-before "console desktop.start program=/bin/bitscomp" "gx boot.failed stage=late"
-answers "^gx_bringup: FAIL" "gestoppt bei late, ohne gpu" "renderD128"
+before "$NO_GPU" "gx boot.failed stage=late"
+answers "^gx_bringup: FAIL" "gestoppt bei late, textkonsole" "."
+ktest gx.hw.boot_report
 cleanup
 
-# 4. gpu=on on a machine without the chip: nothing is held, the row says so, the tool's answers are as without the key.
-boot nochip gpu=on
+# 4. A machine without the chip: nothing is held, no desktop (the line says why), the tool answers as without a chip.
+# drm=fake (test only) gives gx.hw.boot_thread's stand-in a node.
+boot nochip "$NO_GPU" drm=fake
 need "gx boot.no_chip"
 none "gx boot.start"
 none "console desktop.held"
 none "gx boot.failed"
-answers "no AMD GPU function on this machine" "keine amd-gpu" "."
+text_console gpu "Dieser Rechner hat keine Grafik, die BitsOS hochf"
+answers "no AMD GPU function on this machine" "keine amd-gpu" "renderD128"
 a="$(call gx_bringup '{"until":"stop"}' || true)"
 case "$a" in *"no AMD GPU function"*) ;; *) red "until=stop without a chip: $a" ;; esac
-cleanup
-
-# 5. gpu=off: the boot without the chip's bring-up. Then the thread and the hold, in a boot where nothing else used them.
-boot off drm=fake gpu=off
-none "gx boot."
-none "console desktop.held"
-answers "CONFIG gpu=off" "gpu" "renderD128"
-a="$(call ktest '{"filter":"gx.hw.boot_thread"}')" || red "ktest failed: $a"
-case "$a" in *"ok gx.hw.boot_thread"*) ;; *) red "gx.hw.boot_thread: $a" ;; esac
-# The ledger counts what a run's logs say.
-printf '%s\n' "$a" | sed -n 's/^ok gx.hw.boot_thread/KTEST ok gx.hw.boot_thread/p' > "$RUN_DIR/ktest.txt"
-echo "ok   off: gx.hw.boot_thread"
+ktest gx.hw.boot_thread
 cleanup
 
 echo "gx 10-boot: green"

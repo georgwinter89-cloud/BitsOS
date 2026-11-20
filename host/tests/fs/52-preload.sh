@@ -11,7 +11,7 @@ export BITSOS_KTEST_RUN=fs/50-data # shares the data volume's tests with fs/50-d
 export LC_ALL=C
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 if ! grep -q "vfs::preload::exec_started" crates/proc/src/exec.rs; then
-    echo "SKIP: proc's execve does not call vfs::preload::exec_started yet (change request FS-13p/1, plan/notes/fs-FS-13-preload-integration.patch)"
+    echo "SKIP: proc's execve does not call vfs::preload::exec_started yet (change request FS-13p/1)"
     exit 0
 fi
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/fs-52-preload}"

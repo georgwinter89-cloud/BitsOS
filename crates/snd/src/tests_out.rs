@@ -192,7 +192,7 @@ fn boot_wait() {
     assert!(now.get() - start >= 100_000_000 && now.get() - start < 130_000_000, "waited {} ns", now.get() - start);
 }
 
-/// SN-12 (desk-minipc-w12 follow-up 1): the lock sequence every output request takes, in table order. The boot
+/// SN-12 (found on the Mini-PC, 23.10.): the lock sequence every output request takes, in table order. The boot
 /// switch: `snd.output`, then `hda.hdmi` (`monitor`, then `hdmi_on` through `apply_locked`); sysfs, MCP and the
 /// console: `snd.output`, the mixer (`snd.mixer`, start), `hda.hdmi` (`hdmi_on`/`hdmi_off`), the GPU function's
 /// PCI chain (its restart), then the mixer's target and the scheduler (the make-before-break sleeps). The real

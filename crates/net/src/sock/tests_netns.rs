@@ -31,7 +31,7 @@ fn cur() -> super::NsNow {
 static HOOKS: NsHooks = NsHooks { current: cur };
 
 /// Calls on this thread from now on come from namespaces `net` / `ids`.
-fn enter(net: &Net, ids: Option<Arc<dyn Ids>>) {
+pub(super) fn enter(net: &Net, ids: Option<Arc<dyn Ids>>) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| super::set_ns_hooks(&HOOKS));
     CUR.with(|c| *c.borrow_mut() = (net.clone(), ids));
@@ -85,15 +85,15 @@ impl Ids for FakeIds {
 }
 
 /// Root of a user namespace mapping kernel uid/gid 1000 to 0, kernel pid `kpid` as 1.
-fn ns_root(kpid: u32, caps: bool) -> Arc<dyn Ids> {
+pub(super) fn ns_root(kpid: u32, caps: bool) -> Arc<dyn Ids> {
     Arc::new(FakeIds { pids: alloc::vec![(kpid, 1)], uid: (1000, 0), gid: (1000, 0), caps, init_caps: false })
 }
 
-fn view(inum: u32) -> Net {
+pub(super) fn view(inum: u32) -> Net {
     Some(NetView::new(inum))
 }
 
-fn up(net: &Net) {
+pub(super) fn up(net: &Net) {
     net.as_ref().unwrap().change_lo_flags(crate::ifview::IFF_UP).unwrap();
 }
 
@@ -221,13 +221,13 @@ fn lo_of_a_new_namespace_starts_down() {
     assert_eq!(Arc::strong_count(net.as_ref().unwrap()), 1, "closed sockets keep no view");
 }
 
-fn req(ty: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
+pub(super) fn req(ty: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
     let mut m = Msg::new(ty, flags, seq, 0, body);
     m.set_flags(flags);
     m.done()
 }
 
-fn msgs(d: &[u8]) -> Vec<(Hdr, Vec<u8>)> {
+pub(super) fn msgs(d: &[u8]) -> Vec<(Hdr, Vec<u8>)> {
     let mut v = Vec::new();
     let mut rest = d;
     while let Some(h) = Hdr::parse(rest) {
@@ -242,7 +242,7 @@ fn msgs(d: &[u8]) -> Vec<(Hdr, Vec<u8>)> {
 }
 
 /// Every message waiting on `fd` (non-blocking reads until EAGAIN).
-fn drain(p: &Prog, fd: u64) -> Vec<(Hdr, Vec<u8>)> {
+pub(super) fn drain(p: &Prog, fd: u64) -> Vec<(Hdr, Vec<u8>)> {
     let mut v = Vec::new();
     loop {
         let (r, d) = p.recv(fd, 65536, MSG_DONTWAIT);
@@ -253,7 +253,7 @@ fn drain(p: &Prog, fd: u64) -> Vec<(Hdr, Vec<u8>)> {
     }
 }
 
-fn ifinfo(index: i32, flags: u32, change: u32) -> [u8; 16] {
+pub(super) fn ifinfo(index: i32, flags: u32, change: u32) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[4..8].copy_from_slice(&index.to_le_bytes());
     b[8..12].copy_from_slice(&flags.to_le_bytes());
@@ -262,7 +262,7 @@ fn ifinfo(index: i32, flags: u32, change: u32) -> [u8; 16] {
 }
 
 /// The error of the NLMSG_ERROR answering a request (0: an ACK).
-fn ack(m: &[(Hdr, Vec<u8>)]) -> i32 {
+pub(super) fn ack(m: &[(Hdr, Vec<u8>)]) -> i32 {
     let (_, b) = m.iter().find(|(h, _)| h.ty == NLMSG_ERROR).expect("an ack");
     i32::from_le_bytes(b[..4].try_into().unwrap())
 }

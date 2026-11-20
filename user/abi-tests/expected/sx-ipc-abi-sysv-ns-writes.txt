@@ -1,0 +1,40 @@
+shmmax blank = -EINVAL
+shmall blank = -EINVAL
+shmmax 5 junk = 2
+/proc/sys/kernel/shmmax: 5
+shmmax -0 = -EINVAL
+shmall max = 21
+/proc/sys/kernel/shmall: 18446744073709551615
+shmall over = -EINVAL
+msgmax -0 = 2
+/proc/sys/kernel/msgmax: 0
+msgmax 9 junk = 2
+/proc/sys/kernel/msgmax: 9
+msgmax tab = -EINVAL
+msgmax -1 = -EINVAL
+msgmax spaces after = 6
+/proc/sys/kernel/msgmax: 12
+msgmax 5x = -EINVAL
+msgmnb int max = 10
+msgmni -0x10 = -EINVAL
+shmmni blank = -EINVAL
+shmmni octal = 4
+/proc/sys/kernel/shmmni: 8
+msgmax past the start = 2
+/proc/sys/kernel/msgmax: 12
+sem blank = -EINVAL
+sem 4 values junk = 17
+/proc/sys/kernel/sem: 250	32000	32	128
+sem bad third = -EINVAL
+/proc/sys/kernel/sem: 1	2	32	128
+sem five values = 8
+/proc/sys/kernel/sem: 5	6	7	8
+sem too big = -EINVAL
+/proc/sys/kernel/sem: 1	6	7	8
+shm_rmid_forced -0 = 3
+auto_msgmni hex junk = 4
+msg_next_id -0 = 2
+/proc/sys/kernel/msg_next_id: 0
+msg_next_id -1 = -EINVAL
+shm_next_id int max = 11
+/proc/sys/kernel/shm_next_id: 2147483647

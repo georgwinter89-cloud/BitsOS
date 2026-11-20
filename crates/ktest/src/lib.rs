@@ -31,8 +31,8 @@ pub enum Class {
     Audible,
     /// Writes display registers (no switch since 21.10., R8c): runs on hardware like `Safe` over MCP.
     Display,
-    /// Touches the WLAN chip: runs on hardware only while `wlan=on` is in CONFIG (R8d/R8e; the desk may set it
-    /// since 21.10.).
+    /// Touches the WLAN chip: runs on hardware over MCP only where CONFIG names a WLAN (`wlan_ssid`, R8e; the desk
+    /// may set it since 21.10.).
     Wlan,
     /// QEMU plain only (only meaningful or only safe under QEMU, e.g. a real #DF; or a debug kernel's own checks).
     QemuOnly,
@@ -44,6 +44,9 @@ pub enum Class {
     Program,
     /// Only the real machine has what it tests (the 780M, RAPL, the firmware's EDID): Mini-PC, either run.
     Hardware,
+    /// GP-ROUND: only the Gaming-PC has what it tests (the RTL8126, the RX 9070 XT, the 265K's own tables): over MCP
+    /// on that machine (the kernel runs the profile gaming-pc there), never on the Mini-PC and never under QEMU.
+    GamingPc,
     /// Needs the screen and the input for itself: QEMU plain and release (no desktop there), and on the Mini-PC
     /// only the run with the desktop stopped.
     Screen,
@@ -80,6 +83,7 @@ impl Class {
         Class::QemuAll,
         Class::Program,
         Class::Hardware,
+        Class::GamingPc,
         Class::Screen,
         Class::Picture,
         Class::WithGeorg,
@@ -94,10 +98,24 @@ impl Class {
         match self {
             Class::Safe | Class::Display | Class::Screen => true,
             Class::QemuAll => hypervisor,
-            Class::Program | Class::Hardware | Class::Picture | Class::WithGeorg => !hypervisor,
+            Class::Program | Class::Hardware | Class::GamingPc | Class::Picture | Class::WithGeorg => !hypervisor,
             Class::QemuOnly | Class::Audible | Class::Wlan => hypervisor && !hw,
             Class::Run(r) => hypervisor && run_named(runs, r),
             Class::RunHw(r) => !hypervisor || run_named(runs, r),
+        }
+    }
+}
+
+impl Class {
+    /// GP-ROUND: which real machine a test belongs to, apart from the run: `gaming_pc` = the kernel runs the
+    /// Gaming-PC's profile. `Hardware` is the Mini-PC's (its parts: the 780M, the I226, RAPL), `GamingPc` the
+    /// Gaming-PC's; every other class is the same on both. On the Mini-PC (`gaming_pc` false) only `GamingPc` changes:
+    /// it never ran there.
+    pub fn on_machine(self, gaming_pc: bool) -> bool {
+        match self {
+            Class::Hardware => !gaming_pc,
+            Class::GamingPc => gaming_pc,
+            _ => true,
         }
     }
 }
@@ -273,6 +291,15 @@ mod tests {
         }
     }
 
+    /// GP-ROUND: the machine rule changes nothing on the Mini-PC except that the Gaming-PC's own tests are not its.
+    #[test]
+    fn each_machine_runs_its_own_parts() {
+        for &c in Class::ALL {
+            assert_eq!(c.on_machine(false), c != Class::GamingPc, "{c:?} on the Mini-PC");
+            assert_eq!(c.on_machine(true), c != Class::Hardware, "{c:?} on the Gaming-PC");
+        }
+    }
+
     #[test]
     fn filters() {
         assert!(matches("", "mm.x"));
@@ -295,7 +322,7 @@ mod tests {
         for c in [Class::QemuOnly, Class::Audible, Class::Wlan] {
             assert!(plain(c) && !release(c) && !minipc(c), "{c:?}");
         }
-        for c in [Class::Program, Class::Hardware, Class::Picture, Class::WithGeorg] {
+        for c in [Class::Program, Class::Hardware, Class::GamingPc, Class::Picture, Class::WithGeorg] {
             assert!(!plain(c) && !release(c) && minipc(c), "{c:?}");
         }
         assert!(!plain(Class::Run("nv/10")) && !minipc(Class::Run("nv/10")));

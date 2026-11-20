@@ -96,7 +96,7 @@ pub const DOORBELL_VALUE: u32 = 0xD00D_6F11;
 /// The rungs' names (also the checks' names), in order.
 pub const RUNGS: [&str; 5] = ["GFX ring test (SCRATCH_REG0)", "GFX IB test (WRITE_DATA)", "GFX golden IB (capture)", "GFX RELEASE_MEM 64-bit fence (M5)", "GFX doorbell"];
 
-/// GX-7j2: the order of the CP start (the desk's unhalt experiments, gx-GX-7j-unhalt-scout.md).
+/// GX-7j2: the order of the CP start (the desk's unhalt experiments, plan/spec/gpu.md §11.4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Variant {
     /// Linux's captured unhalt and nothing more: doorbell ranges, MEC unhalt, ME/PFP unhalt, CP_STAT watched, then
@@ -106,9 +106,9 @@ pub enum Variant {
     /// rungs (tests whether an active ring at the unhalt is what kept the PFP busy). The default (`DEFAULT`).
     #[default]
     E1b,
-    /// MEC unhalted, ring 0 programmed and active on the halted CP, then the ME/PFP unhalt: linux-6.6's direct
-    /// order with amdgpu_async_gfx_ring=0 (cp_resume :4115 doorbell range, kcq_resume :4069 cp_compute_enable,
-    /// cp_gfx_resume :3230), i.e. GX-7j's order plus MEC.
+    /// MEC unhalted, ring 0 programmed and active on the halted CP, then the ME/PFP unhalt: Linux's direct order
+    /// with amdgpu_async_gfx_ring=0 (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c:4682 cp_resume, :4666
+    /// kcq_resume, :3789 cp_gfx_resume with KMD_QUEUE in CP_RB0_CNTL :3811), i.e. GX-7j's order plus MEC.
     E1c,
     /// GX-7k: Linux 7.1's cp_resume up to amdgpu_mes_kiq_hw_init (doorbell ranges, MEC unhalt, ME/PFP unhalt
     /// with the ring at its defaults, CP_STAT watched), then the CP left running for MES (`until=mes`/`gfx_mes`,
@@ -933,7 +933,7 @@ fn dwords(v: &[u32]) -> Vec<u8> {
 
 impl<H: Hw> Queue<'_, H> {
     fn reset(&mut self, start_dw: u64) -> Result<(), GfxError> {
-        self.ring = Ring::new(Kind::Gfx, gfx11::RING_DW, start_dw).map_err(GfxError::Ring)?;
+        self.ring = Ring::new(Kind::Gfx, gfx11::RING_DW, start_dw).map_err(GfxError::Ring)?.with_counted_nops();
         self.shadow = vec![0; gfx11::RING_DW as usize];
         self.rptr_dw = start_dw;
         self.doorbell = false;
@@ -1127,7 +1127,7 @@ fn run<H: Hw>(owner: &mut Bringup<Watch<H>>, bo: &mut dyn BoAlloc, inp: &GfxRing
     r.golden = t.golden;
     r.shape = Some(t.shape);
     klog::event!(Info, "gx", "gfx.tail", writes = t.writes, se = t.shape.0, sa = t.shape.1, sa_active = klog::Hex(u64::from(t.shape.2)));
-    let mut q = Queue { o: owner, a, l, ring: Ring::new(Kind::Gfx, gfx11::RING_DW, 0).map_err(GfxError::Ring)?, shadow: Vec::new(), rptr_dw: 0, doorbell: false, t: inp.timeout_us, doorbells: Vec::new() };
+    let mut q = Queue { o: owner, a, l, ring: Ring::new(Kind::Gfx, gfx11::RING_DW, 0).map_err(GfxError::Ring)?.with_counted_nops(), shadow: Vec::new(), rptr_dw: 0, doorbell: false, t: inp.timeout_us, doorbells: Vec::new() };
     let res = start(&mut q, r, inp.variant).and_then(|()| if inp.variant.runs_ring() { rungs(&mut q, r) } else { Ok(()) });
     r.doorbells = core::mem::take(&mut q.doorbells);
     res

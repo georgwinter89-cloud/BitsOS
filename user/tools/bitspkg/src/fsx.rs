@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-/// x86_64 Linux open flags (linux-6.6/include/uapi/asm-generic/fcntl.h): O_NOFOLLOW refuses a package file that
+/// x86_64 Linux open flags (linux-7.3.1/include/uapi/asm-generic/fcntl.h): O_NOFOLLOW refuses a package file that
 /// is a symlink; O_NONBLOCK keeps a FIFO from blocking the open (fs/fifo.c:fifo_open waits for a writer without
 /// it) and does nothing on a regular file; O_NOCTTY keeps a tty from becoming our controlling terminal.
 const O_NOFOLLOW: i32 = 0o400000;
@@ -124,7 +124,7 @@ pub fn exchange(a: &Path, b: &Path) -> Result<(), String> {
 }
 
 /// Moves a sealed version folder elsewhere: moving a folder to another parent needs write access to the folder
-/// itself (its `..` changes; linux-6.6/fs/namei.c:4802 vfs_rename), so it is opened up first.
+/// itself (its `..` changes; linux-7.3.1/fs/namei.c:6119 vfs_rename), so it is opened up first.
 pub fn move_dir(a: &Path, b: &Path) -> Result<(), String> {
     fs::set_permissions(a, fs::Permissions::from_mode(0o755)).map_err(|e| err(a, e))?;
     rename(a, b)
@@ -137,7 +137,7 @@ pub fn rename(a: &Path, b: &Path) -> Result<(), String> {
 }
 
 /// fsync of a folder makes its new names durable (ext4). A file system that cannot sync a folder (EINVAL,
-/// ENOSYS, EOPNOTSUPP: linux-6.6/fs/sync.c vfs_fsync_range without ->fsync) loses nothing by it; that is logged
+/// ENOSYS, EOPNOTSUPP: linux-7.3.1/fs/sync.c:178 vfs_fsync_range without ->fsync) loses nothing by it; that is logged
 /// once per run instead of failing work that is already done.
 pub fn sync_dir(p: &Path) -> Result<(), String> {
     match File::open(p).and_then(|f| f.sync_all()) {
@@ -178,7 +178,7 @@ pub fn remove_tree(p: &Path) -> Result<(), String> {
         Err(e) => return Err(err(p, e)),
     };
     if md.is_dir() {
-        // Only a sealed folder needs opening; chmod is the owner's (or CAP_FOWNER's, linux-6.6/fs/attr.c:199
+        // Only a sealed folder needs opening; chmod is the owner's (or CAP_FOWNER's, linux-7.3.1/fs/attr.c:205
         // setattr_prepare): a folder the program made is left as it is, and a refusal shows up below.
         if md.mode() & 0o700 != 0o700 {
             let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));

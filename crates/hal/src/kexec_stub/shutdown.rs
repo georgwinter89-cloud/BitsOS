@@ -1,6 +1,6 @@
 //! RB-quiesce: the other CPUs parked before a reboot's or power-off's quiesce, with Reload's stop (`park`,
-//! step 1 only). Linux does the same in `native_machine_shutdown` (linux-6.6/arch/x86/kernel/reboot.c:717,
-//! `stop_other_cpus` at :742; smp.c:149 `native_stop_other_cpus`: REBOOT_VECTOR first, NMI after a timeout), so a
+//! step 1 only). Linux does the same in `native_machine_shutdown` (linux-7.3.1/arch/x86/kernel/reboot.c:670,
+//! `stop_other_cpus` at :703; smp.c:150 `native_stop_other_cpus`: REBOOT_VECTOR first, NMI after a timeout), so a
 //! driver's Quiesce undo (SN-5 DP audio, GX-3 scanout restore, WL-4 chip off) never meets its own work running on
 //! another CPU.
 //!

@@ -1,4 +1,4 @@
-//! epoll (FS-4), after linux-6.6/fs/eventpoll.c.
+//! epoll (FS-4), after linux-7.3.1/fs/eventpoll.c.
 //!
 //! An `Epoll` is Linux's `struct eventpoll` behind an anonymous file ("[eventpoll]", F_GETFL O_RDWR, fstat
 //! the anon inode, `/proc/<pid>/fd` "anon_inode:[eventpoll]"). Its items (`EpItem` = `struct epitem`) are keyed
@@ -129,7 +129,7 @@ impl EpItem {
 
 impl PollWaker for EpItem {
     /// `ep_poll_callback`. The answer counts only for an EPOLLEXCLUSIVE item (`PollQueue::subscribe_exclusive`):
-    /// it woke an epoll_wait sleeper of its epoll with a key it waits for (linux-6.6/fs/eventpoll.c:1214).
+    /// it woke an epoll_wait sleeper of its epoll with a key it waits for (linux-7.3.1/fs/eventpoll.c:1544).
     fn poll_wake(&self, key: u32, depth: u32) -> bool {
         let ev = self.events.load(Ordering::SeqCst);
         // Disabled (EPOLLONESHOT after its event) or a key that does not concern the item.
@@ -564,7 +564,7 @@ impl Epoll {
     }
 
     /// AB-17 (kcmp KCMP_EPOLL_TFD): the open file of the `toff`-th item watching fd `tfd`, walking the items in
-    /// key order (file address, fd) as `ep_find_tfd` does (linux-6.6/fs/eventpoll.c:1048). None: no such item
+    /// key order (file address, fd) as `ep_find_tfd` does (linux-7.3.1/fs/eventpoll.c:2896). None: no such item
     /// (Linux's ENOENT), or its open file is already going away.
     pub fn target(&self, tfd: i32, toff: u64) -> Option<Arc<OpenFile>> {
         let items = self.inner.items.lock();
@@ -620,9 +620,9 @@ impl Epoll {
         }
         let inner = &ep.inner;
         // Nested topologies are checked under the global mutex (`epnested_mutex`), taken before `ep->mtx`. Linux
-        // decides under `ep->mtx` (linux-6.6/fs/eventpoll.c:2246): an ADD into an epoll that is watched, or that
-        // another ctl's loop check is walking right now (`ep->gen == loop_check_gen`), or of an epoll needs the
-        // full check; the first look is made without the mutex and made again under it.
+        // decides under `ep->mtx` (`ep_ctl_lock`, linux-7.3.1/fs/eventpoll.c:2595): an ADD into an epoll that is
+        // watched, or that another ctl's loop check is walking right now (`ep->gen == loop_check_gen`), or of an
+        // epoll needs the full check; the first look is made without the mutex and made again under it.
         let mut full_check = op == EPOLL_CTL_ADD && (!me.ep_links_empty() || target_ep.is_some());
         let mut check_files: Vec<Arc<OpenFile>> = Vec::new();
         let (_nest, mut items) = loop {
@@ -738,6 +738,10 @@ impl Epoll {
             *removed = Some(Removed(it));
             return Err(e);
         }
+        // `ep_item_poll` with the item's events as the key.
+        if event.0 & EPOLLET != 0 {
+            tf.file.poll_edge();
+        }
         if it.poll() != 0 {
             inner.queue(&it, 0);
         }
@@ -746,6 +750,9 @@ impl Epoll {
 
     /// `ep_modify`: new events and data, then the item is queued if its file is ready for them now.
     fn modify(inner: &EpInner, it: &Arc<EpItem>, event: (u32, u64)) {
+        if event.0 & EPOLLET != 0 {
+            it.file.poll_edge();
+        }
         it.events.store(event.0, Ordering::SeqCst);
         it.data.store(event.1, Ordering::SeqCst);
         core::sync::atomic::fence(Ordering::SeqCst);
@@ -762,7 +769,7 @@ impl Epoll {
 
     /// `ep_poll` with Linux's two checks: `fatal()` (`fatal_signal_pending`, the caller is being ended) ends
     /// even a harvest with EINTR; `signal()` (`signal_pending`: a signal waits for its handler) ends the wait
-    /// with EINTR only when no event is there (events first, linux-6.6/fs/eventpoll.c:1898).
+    /// with EINTR only when no event is there (events first, linux-7.3.1/fs/eventpoll.c:2301).
     pub fn wait_sig(&self, sink: &mut dyn EventSink, max: usize, end: Option<u64>, fatal: &dyn Fn() -> bool, signal: &dyn Fn() -> bool) -> Result<usize, Errno> {
         let interrupted = fatal;
         let inner = &self.inner;
@@ -874,7 +881,7 @@ impl Drop for Epoll {
 }
 
 impl File for Epoll {
-    /// linux-6.6/fs/eventpoll.c:904 `ep_show_fdinfo`: one line per item in key order, the watched file's position
+    /// linux-7.3.1/fs/eventpoll.c:1357 `ep_show_fdinfo`: one line per item in key order, the watched file's position
     /// read unlocked, `sdev` as the kernel's dev_t (MAJOR << 20 | MINOR).
     fn show_fdinfo(&self, out: &mut alloc::string::String) {
         use core::fmt::Write;

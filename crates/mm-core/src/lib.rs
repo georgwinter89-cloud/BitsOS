@@ -11,17 +11,22 @@
 extern crate alloc;
 
 mod bitmap;
+pub mod callers;
 pub mod compact;
 pub mod dma;
 pub mod dma_pages;
 pub mod grace;
+pub mod boost;
 pub mod buddy;
 pub mod fixtures;
 mod heap;
 mod heap_stats;
+#[cfg(feature = "host-count")]
+pub mod host_count;
 mod mags;
 pub mod map;
 mod meta;
+pub mod oom;
 mod page_frame;
 mod pages;
 mod pcp;
@@ -37,6 +42,7 @@ pub use buddy::{boot_buddy, BlockCensus, BlockHolder, Buddy, BuddyFrames, BuildE
 pub use heap::{GlobalHeap, KernelHeap, OrderWant, HEAP, MAX_WANTED};
 pub use heap_stats::{HeapStats, PROBE_REFUSALS};
 pub use page_frame::PageFrame;
+pub use compact::Target;
 pub use pages::SeedStats;
 pub use slab::{CacheStats, CheckError, SlabBox, SlabCache};
 pub use map::{MapRange, RangeUse};
@@ -159,6 +165,13 @@ pub fn alloc_table_frame() -> Option<u64> {
     frames()?.alloc(0, Zone::Normal, Kind::PageTable)
 }
 
+/// MEMCRASH: a frame for an unmap's gather batch (`hal::paging::set_batch_frames`): only what is free now, as
+/// Linux's `__get_free_page(GFP_NOWAIT)` in `tlb_next_batch` (no drain, no reclaim, no wait; the caller flushes
+/// instead). Given back with `free_table_frame`.
+pub fn gather_batch_frame() -> Option<u64> {
+    frames()?.alloc_light(0, Zone::Normal, Kind::PageTable)
+}
+
 /// Gives back a page-table frame from `alloc_table_frame` (hal::paging frees tables that became empty).
 pub fn free_table_frame(phys: u64) {
     if let Some(f) = frames() {
@@ -204,10 +217,11 @@ pub fn merge_user_block(phys: u64, order: u32) -> bool {
 }
 
 /// Crate-private: only for a frame the caller just got from `frames()` and has not passed on.
-fn zero_frame(phys: u64) {
+pub(crate) fn zero_frame(phys: u64) {
     #[cfg(target_os = "none")]
     // SAFETY: the only callers (`alloc_zeroed_block`, `alloc_zeroed_light`, `alloc_zeroed_huge_light`,
-    // `dma_pages::alloc_runs`) pass a frame of a block the allocator just handed them and nobody else knows yet,
+    // `dma_pages::alloc_runs`, `PageFrame::from_target` with the migration target's handle consumed) pass a
+    // frame of a block the allocator just handed them and nobody else knows yet,
     // RAM reachable through the direct map (WB: `alloc_runs` zeroes before any retype).
     unsafe {
         core::ptr::write_bytes(hal::phys_to_virt(phys) as *mut u8, 0, PAGE as usize)

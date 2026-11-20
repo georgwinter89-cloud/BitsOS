@@ -1,4 +1,4 @@
-//! SX-2: namespace files (Linux nsfs, linux-6.6/fs/nsfs.c and fs/proc/namespaces.c): what an open of
+//! SX-2: namespace files (Linux nsfs, linux-7.3.1/fs/nsfs.c and fs/proc/namespaces.c): what an open of
 //! `/proc/<pid>/ns/<kind>` gives. The file holds the namespace (it lives while the fd does, as Linux's
 //! `ns_get_path` keeps it), fstat shows the namespace's inode number, setns(2) takes it.
 //!

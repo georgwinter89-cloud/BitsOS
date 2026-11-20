@@ -1,5 +1,6 @@
-//! Behaviour checked against the Linux 6.6 source in IN-2a (linux-6.6/drivers/hid/hid-input.c and
-//! include/linux/hid.h), for the points IN-1 had written from memory or left out.
+//! Behaviour checked against the Linux source (IN-2a against 6.6, L7-HW against
+//! linux-7.3.1/drivers/hid/hid-input.c and include/linux/hid.h), for the points IN-1 had written from memory
+//! or left out.
 
 mod common;
 
@@ -63,18 +64,85 @@ fn system_and_consumer_control_join_the_keyboard_but_not_a_mouse() {
 }
 
 #[test]
-fn system_control_ignores_lazy_usages_and_a0_has_only_micmute() {
-    // A System Control application declaring X and Y (hid-input.c:850-857) and usages 0xA9/0xAA.
+fn system_control_ignores_lazy_usages_and_a0_has_micmute_and_accessibility() {
+    // A System Control application declaring X and Y (hid-input.c:909-916) and usages 0xA9/0xAA/0xAB;
+    // 0xAA is KEY_ACCESSIBILITY since Linux 7 (:895), 0xAB stays ignored.
     let d = desc(
-        "05 01 09 80 a1 01 09 81 09 30 09 31 09 a9 09 aa 15 00 25 01 75 01 95 05 81 02 95 03 81 01 c0",
+        "05 01 09 80 a1 01 09 81 09 30 09 31 09 a9 09 aa 09 ab 15 00 25 01 75 01 95 06 81 02 95 02 81 01 c0",
     );
     let g = &InputMap::new(&d).groups[0];
     assert!(g.abs.is_empty() && g.rel.is_empty(), "no axes from System Control");
-    assert_eq!(g.keys.iter().copied().collect::<Vec<_>>(), [KEY_POWER, KEY_MICMUTE]);
+    assert_eq!(
+        g.keys.iter().copied().collect::<Vec<_>>(),
+        [KEY_POWER, KEY_MICMUTE, KEY_ACCESSIBILITY]
+    );
 }
 
 #[test]
-fn consumer_table_is_linux_66() {
+fn system_control_dpad_and_do_not_disturb() {
+    // Linux 7 (hid-input.c:871-892) looks at 0x90-0x9F before the System Control ignore: the D-pad of
+    // a System Control application is a hat, 0x9B is Do Not Disturb, 0x94 takes the unknown default.
+    let d = desc(
+        "05 01 09 80 a1 01 09 90 09 91 09 92 09 93 09 9b 09 94 15 00 25 01 75 01 95 06 81 02 95 02 81 01 c0",
+    );
+    let map = InputMap::new(&d);
+    let g = &map.groups[0];
+    assert_eq!(g.abs.keys().copied().collect::<Vec<_>>(), [ABS_HAT0X, ABS_HAT0Y]);
+    assert_eq!(
+        g.keys.iter().copied().collect::<Vec<_>>(),
+        [BTN_MISC, KEY_DO_NOT_DISTURB]
+    );
+    // Only the first D-pad usage maps (the others lose ABS_HAT0X), and Linux reports its fixed
+    // direction (up) on every report whatever the bit says (hid-input.c:1604-1610); the input core
+    // drops the repeats. Do Not Disturb is an ordinary key.
+    let up = [(0, EV_ABS, ABS_HAT0X, 0), (0, EV_ABS, ABS_HAT0Y, -1)];
+    let dnd = [(0, EV_MSC, MSC_SCAN, 0x0001_009b), (0, EV_KEY, KEY_DO_NOT_DISTURB, 1)];
+    assert_eq!(
+        events(&d, &[&[0b10], &[0b1_0000]]),
+        [
+            [&up[..], &[syn()]].concat(),
+            [&up[..], &dnd[..], &[syn()]].concat(),
+        ]
+    );
+}
+
+#[test]
+fn absolute_z_of_a_pen_is_the_distance() {
+    // hid-input.c:928-942: an absolute Z in a Pen application (or a Stylus logical/physical
+    // collection, or a Digitizer application) is ABS_DISTANCE; a relative Z and a Z elsewhere stay Z.
+    let pen = desc(
+        "05 0d 09 02 a1 01 05 01 09 30 09 32 15 00 26 ff 00 75 08 95 02 81 02 c0",
+    );
+    let g = &InputMap::new(&pen).groups[0];
+    assert_eq!(g.abs.keys().copied().collect::<Vec<_>>(), [ABS_X, ABS_DISTANCE]);
+    let stylus = desc(
+        "05 0d 09 01 a1 01 09 20 a1 02 05 01 09 32 15 00 26 ff 00 75 08 95 01 81 02 c0 c0",
+    );
+    let g = &InputMap::new(&stylus).groups[0];
+    assert_eq!(g.abs.keys().copied().collect::<Vec<_>>(), [ABS_DISTANCE]);
+    let rel = desc("05 0d 09 02 a1 01 05 01 09 32 15 81 25 7f 75 08 95 01 81 06 c0");
+    let g = &InputMap::new(&rel).groups[0];
+    assert_eq!(g.rel.iter().copied().collect::<Vec<_>>(), [REL_Z]);
+    let pad = desc("05 01 09 05 a1 01 09 32 15 00 26 ff 00 75 08 95 01 81 02 c0");
+    let g = &InputMap::new(&pad).groups[0];
+    assert_eq!(g.abs.keys().copied().collect::<Vec<_>>(), [ABS_Z]);
+}
+
+#[test]
+fn haptic_output_fields_take_the_unknown_default() {
+    // hid-input.c:742-747: Haptic (page 0x0E) usages count in output fields like LEDs; with no case
+    // of their own they take the unknown default: one bit is LED_MISC, eight bits ABS_MISC.
+    let one = desc("05 01 09 05 a1 01 05 0e 09 21 15 00 25 01 75 01 95 01 91 02 95 07 91 01 c0");
+    assert_eq!(InputMap::new(&one).groups[0].leds.iter().copied().collect::<Vec<_>>(), [LED_MISC]);
+    let byte = desc("05 01 09 05 a1 01 05 0e 09 21 15 00 26 ff 00 75 08 95 01 91 02 c0");
+    assert_eq!(InputMap::new(&byte).groups[0].abs.keys().copied().collect::<Vec<_>>(), [ABS_MISC]);
+    // Another page in an output field is still ignored.
+    let vendor = desc("05 01 09 05 a1 01 05 09 09 01 15 00 25 01 75 01 95 01 91 02 95 07 91 01 c0");
+    assert!(InputMap::new(&vendor).groups[0].is_empty());
+}
+
+#[test]
+fn consumer_table_is_linux_7() {
     let d = desc("05 0c 09 01 a1 01 15 00 26 ff 03 19 00 2a ff 03 75 10 95 01 81 00 c0");
     let map = InputMap::new(&d);
     let code = |u: u64| map.target(&d, 0, 0, u).map(|t| t.code);
@@ -85,6 +153,10 @@ fn consumer_table_is_linux_66() {
         (0x084, KEY_ENTER),
         (0x0E5, KEY_BASSBOOST),
         (0x1CB, KEY_ASSISTANT),
+        (0x1CC, KEY_ACTION_ON_SELECTION),
+        (0x1CD, KEY_CONTEXTUAL_INSERT),
+        (0x1CE, KEY_CONTEXTUAL_QUERY),
+        (0x1CF, KEY_UNKNOWN),
         (0x22D, KEY_ZOOMIN),
         (0x26A, KEY_DELETE),
         (0x29F, KEY_SCALE),

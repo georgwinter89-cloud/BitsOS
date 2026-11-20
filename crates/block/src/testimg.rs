@@ -15,14 +15,27 @@ fn put64(b: &mut [u8], i: usize, v: u64) {
 /// of 128 bytes, primary at LBA 1, backup at the end, a protective MBR.
 pub fn gpt(bs: usize, blocks: u64, parts: &[([u8; 16], u64, u64)]) -> Vec<u8> {
     let mut img = vec![0u8; bs * blocks as usize];
+    for (lba, bytes) in gpt_pieces(bs, blocks, parts) {
+        let at = lba as usize * bs;
+        img[at..at + bytes.len()].copy_from_slice(&bytes);
+    }
+    img
+}
+
+/// The same table as pieces (first LBA, bytes), everything else zero: for a disk too large to hold in memory
+/// (GP-DISK's 2 TB Lexar).
+pub fn gpt_pieces(bs: usize, blocks: u64, parts: &[([u8; 16], u64, u64)]) -> Vec<(u64, Vec<u8>)> {
+    let mut out = Vec::new();
     let entries_blocks = (128 * 128usize).div_ceil(bs) as u64;
     // Protective MBR.
+    let mut mbr = vec![0u8; bs];
     let o = 0x1BE;
-    img[o + 4] = MBR_GPT;
-    put32(&mut img, o + 8, 1);
-    put32(&mut img, o + 12, (blocks - 1).min(0xFFFF_FFFF) as u32);
-    img[510] = 0x55;
-    img[511] = 0xAA;
+    mbr[o + 4] = MBR_GPT;
+    put32(&mut mbr, o + 8, 1);
+    put32(&mut mbr, o + 12, (blocks - 1).min(0xFFFF_FFFF) as u32);
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    out.push((0, mbr));
     let mut arr = vec![0u8; 128 * 128];
     for (i, (t, first, last)) in parts.iter().enumerate() {
         let e = &mut arr[i * 128..(i + 1) * 128];
@@ -35,7 +48,7 @@ pub fn gpt(bs: usize, blocks: u64, parts: &[([u8; 16], u64, u64)]) -> Vec<u8> {
     let last = blocks - 1;
     let backup_entries = last - entries_blocks;
     for (my, alt, entries_lba) in [(1u64, last, 2u64), (last, 1, backup_entries)] {
-        let mut h = vec![0u8; 92];
+        let mut h = vec![0u8; bs];
         h[..8].copy_from_slice(b"EFI PART");
         put32(&mut h, 8, 0x0001_0000);
         put32(&mut h, 12, 92);
@@ -47,14 +60,14 @@ pub fn gpt(bs: usize, blocks: u64, parts: &[([u8; 16], u64, u64)]) -> Vec<u8> {
         put32(&mut h, 80, 128);
         put32(&mut h, 84, 128);
         put32(&mut h, 88, arr_crc);
-        let c = crc32(&h);
+        let c = crc32(&h[..92]);
         put32(&mut h, 16, c);
-        let at = my as usize * bs;
-        img[at..at + 92].copy_from_slice(&h);
-        let ea = entries_lba as usize * bs;
-        img[ea..ea + arr.len()].copy_from_slice(&arr);
+        out.push((my, h));
+        let mut a = arr.clone();
+        a.resize(entries_blocks as usize * bs, 0);
+        out.push((entries_lba, a));
     }
-    img
+    out
 }
 
 /// A zeroed image with an MBR holding `parts` (type, first LBA, blocks).

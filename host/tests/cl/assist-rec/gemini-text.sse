@@ -1,0 +1,8 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hallo Georg, "}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hier antwortet die Aufzeichnung "}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"GEMINI-OK. "}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Grüße mit Umlauten: äöüß."}]},"index":0,"finishReason":"STOP"}],"modelVersion":"gemini-rec","responseId":"rec","usageMetadata":{"promptTokenCount":400,"candidatesTokenCount":20,"totalTokenCount":420}}
+

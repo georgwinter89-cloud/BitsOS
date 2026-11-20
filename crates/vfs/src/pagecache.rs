@@ -23,6 +23,9 @@
 //! released and inserts it after, B4). `vfs.cache.sync` (Mutex per file) keeps one write-back of a file at a
 //! time, taken before `vfs.inode.data`, which is released while the backend writes.
 
+#[path = "cache_around.rs"]
+mod cache_around;
+
 use crate::cache_view::{Gone, Pages, Shared, NO_MARK};
 pub use crate::cache_view::{QuickSink, Stop};
 use crate::frame::{Frame, PAGE};
@@ -183,6 +186,30 @@ impl Drop for DirtyLimitOverride {
     }
 }
 
+/// `PageCache::hold_data_for_test`'s guard.
+#[cfg(not(bitsos_no_ktests))]
+pub struct DataHold<'a>(#[allow(dead_code)] ksync::MutexGuard<'a, Inner>);
+
+/// ktests (MM2-NIGHT): the next `moved_to` finds no heap for its page, as an empty heap would (the kernel heap
+/// cannot be made to fail one object on purpose). Not in the lean kernel.
+#[cfg(not(bitsos_no_ktests))]
+pub fn fail_next_move_for_test() {
+    FAIL_NEXT_MOVE.store(true, Ordering::Relaxed);
+}
+
+#[cfg(not(bitsos_no_ktests))]
+static FAIL_NEXT_MOVE: AtomicBool = AtomicBool::new(false);
+
+/// The migrated page's `Arc`, None when the heap has none (`Arc::try_new`).
+fn new_moved(p: CachePage) -> Option<Arc<CachePage>> {
+    #[cfg(not(bitsos_no_ktests))]
+    if FAIL_NEXT_MOVE.swap(false, Ordering::Relaxed) {
+        drop(p);
+        return None;
+    }
+    Arc::try_new(p).ok()
+}
+
 /// Frames held by the page cache now.
 pub fn frames_held() -> u64 {
     FRAMES_HELD.load(Ordering::Relaxed)
@@ -300,6 +327,45 @@ impl CachePage {
 }
 
 impl CachePage {
+    /// W35 MM-2 (CONTRACTS BL-3/MM-2): a copy of this page on the migration target `t` (an order-0 page-cache
+    /// block the caller isolated, its handle proving nobody else knows it): the bytes, the pool, the reclaim state
+    /// and the wipe mark; clean (only clean pages migrate). The pool charge moves when the copy takes the old
+    /// page's place (`take_charge`). None: no page could be made (the target went back). The caller holds the
+    /// file's data lock, so no write changes this page during the copy, and nobody but the index holds it (no
+    /// mapping can store into it).
+    pub(crate) fn moved_to(&self, t: mm_core::Target<'_>) -> Option<Arc<CachePage>> {
+        let src = self.frame.page_frame()?;
+        // Not the boot allocator's order-0 page-cache block (cannot happen from compaction): no move, the target
+        // drops and goes back.
+        let frame = Frame::from_page_frame(mm_core::PageFrame::from_target(t).ok()?);
+        frame.page_frame()?.copy_from(src);
+        FRAMES_HELD.fetch_add(1, Ordering::Relaxed);
+        if self.pool.is_some() {
+            TMPFS_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
+        // Fallible: compaction runs inside allocations, and an empty heap answers NoTarget here instead of a panic
+        // (the page dropped on a failure gives its target back and leaves the counts as they were).
+        new_moved(CachePage {
+            frame,
+            dirty: AtomicBool::new(false),
+            pool: self.pool.clone(),
+            carries_charge: AtomicBool::new(false),
+            state: AtomicU8::new(self.state()),
+            reads: AtomicU32::new(0),
+            out: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            wipe: AtomicBool::new(self.wipe.load(Ordering::Acquire)),
+        })
+    }
+    /// W35 MM-2: the pool charge `old` carries moves to this page, which took its place in the index.
+    pub(crate) fn take_charge(&self, old: &CachePage) {
+        if old.carries_charge.swap(false, Ordering::AcqRel) {
+            self.carries_charge.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl CachePage {
     /// PF-5: the page left the index with no other reference (`cache_view::Gone`): it leaves the cache's numbers
     /// now (frames held, tmpfs frames, a carried pool charge, R2) instead of at its drop, which waits for a grace
     /// period. Returns the bytes that wait (once; 0 when it was accounted out already).
@@ -384,6 +450,13 @@ pub trait Backend: Send + Sync {
     fn commit(&self, _why: SyncKind) -> Result<(), Errno> {
         Ok(())
     }
+    /// FS-W2: the most dirty pages one write-back batch takes before it is written (the rest in further batches,
+    /// each its own runs). A page in a batch is no longer counted dirty and not yet written: a backend whose
+    /// `write_run` waits for a device (ext4 since FS-W2) keeps the batch small, so the dirty limit still means the
+    /// pages that are not on the disk. Default: no bound (a run is never split: FAT sizes a file by its run).
+    fn batch_pages(&self) -> usize {
+        usize::MAX
+    }
     /// FS-12: the most pages `readahead` may read ahead of a sequential reader (0: none; the backend reads
     /// ahead itself or not at all).
     fn read_ahead_pages(&self) -> u64 {
@@ -433,14 +506,17 @@ pub(crate) enum Reach {
     /// The page alone (a partly written page).
     One,
     /// read(): the page and the pages after it that the call still wants, at least the backend's window
-    /// (linux-6.6/mm/filemap.c `filemap_get_pages` -> `page_cache_sync_readahead`).
+    /// (linux-7.3.1/mm/filemap.c:2686 `filemap_get_pages` -> `page_cache_sync_ra`).
     Forward(u64),
     /// BL-3: read() of a page whose page before is not cached, on a backend with its own read-ahead and a window:
     /// only the pages the call wants (linux-7/mm/readahead.c:630 "Standalone, small random read. Read as is"), not
     /// the window.
     Request(u64),
-    /// A mapping's fault: the backend's window around the page (linux-6.6/mm/filemap.c:3195
-    /// `do_sync_mmap_readahead`, "mmap read-around": start = pgoff - ra_pages / 2, size = ra_pages).
+    /// A mapping's fault: the backend's window around the page (linux-7.3.1/mm/filemap.c:3435
+    /// `do_sync_mmap_readahead`, "mmap read-around": start = pgoff - ra_pages / 2, size = ra_pages). Also for code
+    /// on a backend without read-ahead (FAT), where Linux 7.3.1 reads forward from the page inside the VMA (:3407,
+    /// as `fault_ra` does with read-ahead): measured (plan/spec/storage.md §3.1), forward needed up to 2.3
+    /// times the device requests for scattered code faults on a 32-page window, so around stays there.
     Around,
     /// BL-4: the read-ahead window [first, first + len) the missed page lies in (`readahead::Window`).
     Window(u64, u64),
@@ -472,6 +548,9 @@ pub(crate) struct Inner {
     /// FS-10: shared mappings that may write (Linux `i_mmap_writable`: VM_SHARED with VM_MAYWRITE), counted
     /// per mmap call (`mmap::FileMap`) while any part of it is mapped; F_SEAL_WRITE is EBUSY while it is not 0.
     writable_maps: u64,
+    /// L7 row 3: device buffers that hold this file's pages (udmabuf, `udmabuf_pin_folios`); F_SEAL_WRITE is EBUSY
+    /// while it is not 0, as Linux's `memfd_wait_for_pins` finds their extra folio references.
+    dma_pins: u64,
     /// FS-12: bumped when pages leave the index by truncate or hole punch; a read that started before does not
     /// insert its page (`fill`, `readahead`).
     pub(crate) epoch: u64,
@@ -487,6 +566,8 @@ pub(crate) struct Inner {
     /// FS-STALL round 5: pages `write` made dirty that no write-back took yet (a mapping's are not counted): this
     /// file's share of the dirty pages, for `writeback::balance_dirty`.
     own_dirty: u64,
+    /// FS-W2: writes that go to the storage beside this cache (`cache_around`).
+    pub(crate) direct: cache_around::Direct,
 }
 
 impl Inner {
@@ -552,7 +633,7 @@ impl Inner {
 }
 
 /// FS-12, BL-4: the read-ahead state of one file (Linux `file_ra_state`; per file here, per open file there: see
-/// plan/notes/bl-BL-4.md).
+/// plan/spec/storage.md §3.1).
 #[derive(Default)]
 pub(crate) struct Ra {
     /// The last window (size 0 = none yet).
@@ -660,6 +741,16 @@ struct Batch {
     oom: bool,
 }
 
+/// L7 row 3: one `PageCache::pin_sealed` hold, given back on drop.
+pub struct CachePin(Arc<Mutex<Inner>>);
+
+impl Drop for CachePin {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        g.dma_pins = g.dma_pins.saturating_sub(1);
+    }
+}
+
 /// The cached content of one file.
 pub struct PageCache {
     /// Shared (Arc) only with a queued read-ahead job, which holds it weakly.
@@ -673,6 +764,9 @@ pub struct PageCache {
     /// FS-10: a tmpfs file (seals apply); false for block file systems (F_GET_SEALS is EINVAL there).
     sealable: bool,
     sync_lock: Mutex<()>,
+    /// The file backs a block device (a loop image under a volume pool, `back_a_device`): its write-back lock is
+    /// taken as `vfs.cache.sync.backing`.
+    backs_device: AtomicBool,
     /// FS-12: the backend's read-ahead maximum (pages; 0 = none).
     ra_max: u64,
     /// BL-3: the byte where the last read(2) of the file ended (u64::MAX: none yet), Linux's `ra->prev_pos`
@@ -730,7 +824,7 @@ impl PageCache {
         let sealable = pool.is_some() && backend.is_none();
         let pages = Pages::new(size);
         let view = pages.shared();
-        let inner = Arc::new(Mutex::named("vfs.inode.data", Inner { size, charged: 0, pages, seals: if sealable { F_SEAL_SEAL } else { 0 }, writable_maps: 0, epoch: 0, ra: Ra::default(), reading: Vec::new(), clock: 0, preload_at: None, own_dirty: 0 }));
+        let inner = Arc::new(Mutex::named("vfs.inode.data", Inner { size, charged: 0, pages, seals: if sealable { F_SEAL_SEAL } else { 0 }, writable_maps: 0, dma_pins: 0, epoch: 0, ra: Ra::default(), reading: Vec::new(), clock: 0, preload_at: None, own_dirty: 0, direct: Default::default() }));
         // MM-9: a block file system's clean pages can be read again, so reclaim may take them; tmpfs pages
         // (the pool's) never go (no swap).
         let owner_id = if Self::may_reclaim(&pool, &backend) { crate::reclaim::register(&inner) } else { 0 };
@@ -746,6 +840,7 @@ impl PageCache {
             pool,
             backend,
             sync_lock: Mutex::named("vfs.cache.sync", ()),
+            backs_device: AtomicBool::new(false),
             done: Arc::new(FillDone { fills: AtomicU64::new(0), wq: WaitQueue::new() }),
             mmap_miss: AtomicU32::new(0),
             ident: NEXT_IDENT.fetch_add(1, Ordering::Relaxed),
@@ -765,6 +860,13 @@ impl PageCache {
     #[cfg(test)]
     pub(crate) fn hold_data_lock(&self) -> ksync::MutexGuard<'_, Inner> {
         self.inner.lock()
+    }
+
+    /// ktests (MM2-NIGHT): holds `vfs.inode.data` until the guard drops (a migration must stand back while a
+    /// thread sleeps for it). Not in the lean kernel.
+    #[cfg(not(bitsos_no_ktests))]
+    pub fn hold_data_for_test(&self) -> DataHold<'_> {
+        DataHold(self.inner.lock())
     }
 
     /// The locked state, for a reclaim ring (`reclaim::Ring`).
@@ -831,7 +933,7 @@ impl PageCache {
         }
     }
 
-    /// FS-10: F_ADD_SEALS after the fd checks (`memfd_add_seals`, linux-6.6/mm/memfd.c:178-208): EINVAL for a
+    /// FS-10: F_ADD_SEALS after the fd checks (`memfd_add_seals`, linux-7.3.1/mm/memfd.c:231-311): EINVAL for a
     /// file without seals, EPERM once F_SEAL_SEAL is set, EBUSY for F_SEAL_WRITE while a shared mapping may
     /// write; F_SEAL_EXEC on a file with an exec bit adds the write seals too (W^X). `exec_bits`: the mode has an
     /// x bit. Returns the seals now in place.
@@ -843,21 +945,39 @@ impl PageCache {
         if g.seals & F_SEAL_SEAL != 0 {
             return Err(EPERM);
         }
-        // `mapping_deny_writable`. Linux then waits up to ~150 ms for pages pinned by get_user_pages
-        // (`memfd_wait_for_pins`); V2 has no such pins (direct I/O, io_uring), only mapping pins.
-        if seals & F_SEAL_WRITE != 0 && g.seals & F_SEAL_WRITE == 0 && g.writable_maps > 0 {
-            return Err(EBUSY);
-        }
+        // W^X first, so an exec seal's implied F_SEAL_WRITE meets the same checks (memfd.c:285).
         let mut add = seals;
         if add & F_SEAL_EXEC != 0 && exec_bits {
             add |= F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+        }
+        // `mapping_deny_writable`, then `memfd_wait_for_pins`: Linux waits up to ~150 ms for the pins to go
+        // before EBUSY. V2's pins are device buffers (`pin_sealed`), held until their fds close, never within
+        // such a wait: EBUSY at once.
+        if add & F_SEAL_WRITE != 0 && g.seals & F_SEAL_WRITE == 0 && (g.writable_maps > 0 || g.dma_pins > 0) {
+            return Err(EBUSY);
         }
         g.seals |= add;
         Ok(g.seals)
     }
 
-    /// FS-10: a new MAP_SHARED mapping (`seal_check_write` + `mapping_map_writable` in Linux's mmap_region, as
-    /// CachyOS's kernel does it; linux-6.6/include/linux/mm.h:4010 has the FUTURE_WRITE half). With a write seal
+    /// L7 row 3: a device buffer's hold on the pages, taken in the same locked step that checks the seals
+    /// (udmabuf's `check_memfd_seals` and `udmabuf_pin_folios` under `inode_lock_shared`, linux-7.3.1/drivers/
+    /// dma-buf/udmabuf.c:399-409, against F_ADD_SEALS' `inode_lock`). None: a file without seals; Err(seals):
+    /// `accept` refused them. While the pin lives F_SEAL_WRITE is EBUSY.
+    pub fn pin_sealed(&self, accept: impl FnOnce(u32) -> bool) -> Option<Result<CachePin, u32>> {
+        if !self.sealable {
+            return None;
+        }
+        let mut g = self.inner.lock();
+        if !accept(g.seals) {
+            return Some(Err(g.seals));
+        }
+        g.dma_pins += 1;
+        Some(Ok(CachePin(self.inner.clone())))
+    }
+
+    /// FS-10: a new MAP_SHARED mapping (`memfd_check_seals_mmap` in do_mmap, linux-7.3.1/mm/memfd.c:395, +
+    /// `mapping_map_writable` in mmap_region, mm/vma.c:2982, as CachyOS's kernel does it). With a write seal
     /// a writable mapping of a writable fd is EPERM and a read-only one is mapped without VM_MAYWRITE (mprotect
     /// cannot add PROT_WRITE later); otherwise a writable fd's mapping may write and is counted until
     /// `unmap_writable`. Returns whether the mapping may write (and was counted).
@@ -920,7 +1040,7 @@ impl PageCache {
     }
 
     /// A new zeroed page. A lazily charged file's page takes its page of charge first and carries it until it
-    /// is freed (`shmem_inode_acct_block`, linux-6.6/mm/shmem.c:210: ENOSPC whichever level refuses, the
+    /// is freed (`shmem_inode_acct_blocks`, linux-7.3.1/mm/shmem.c:222: ENOSPC whichever level refuses, the
     /// memory account or the mount's size).
     /// `charged`: the caller took that page of charge already (fallocate).
     fn new_page(&self, charged: bool) -> Result<Arc<CachePage>, Errno> {
@@ -996,7 +1116,7 @@ impl PageCache {
         let win = b.read_window().clamp(1, MAX_WINDOW);
         let mut alone = false;
         let mut past_bg = false;
-        let (first, end, epoch) = loop {
+        let (first, end, epoch, mark) = loop {
             let mut g = self.inner.lock();
             if idx >= pages_for(g.size) || g.pages.contains(idx) {
                 return Ok(0);
@@ -1021,10 +1141,11 @@ impl PageCache {
             }
             let (first, end) = if alone { (idx, idx + 1) } else { Self::window(&g, idx, reach, win, past_bg) };
             // Noted only if the list can grow; without the note a second reader may read the same pages.
-            if g.reading.try_reserve(1).is_ok() {
+            let noted = g.reading.try_reserve(1).is_ok();
+            if noted {
                 g.reading.push((first, end, bg));
             }
-            break (first, end, g.epoch);
+            break (first, end, g.epoch, g.direct.mark(noted, &self.inner));
         };
         let mut done = Reading { cache: self, range: Some((first, end, bg)) };
         let (mut start, mut pages) = self.alloc_run(first, end, idx)?;
@@ -1037,7 +1158,7 @@ impl PageCache {
                 return Err(e);
             }
             // A bad neighbour must not fail a good page (filemap_fault reads the needed page alone after a
-            // failed read-ahead, linux-6.6/mm/filemap.c:3368): the window is dropped, the page read by itself.
+            // failed read-ahead, linux-7.3.1/mm/filemap.c:3681): the window is dropped, the page read by itself.
             FILL_WINDOW_ERRORS.inc();
             klog::event!(Warn, "vfs", "cache.fill_window_failed", page = idx, first = start, pages = pages.len() as u64, errno = e; "reading the page alone");
             drop(pages);
@@ -1049,7 +1170,7 @@ impl PageCache {
         let mut g = self.inner.lock();
         let mut res = Ok(());
         let mut inserted = 0u64;
-        if g.epoch == epoch {
+        if g.epoch == epoch && g.direct.fresh(&mark, first, end) {
             let n = pages_for(g.size);
             for (k, p) in pages.into_iter().enumerate() {
                 let i = start + k as u64;
@@ -1561,7 +1682,7 @@ impl PageCache {
         if buf.is_empty() {
             return Ok(0);
         }
-        // FS-10 (`shmem_write_begin`, linux-6.6/mm/shmem.c:2680): seals before any space is charged.
+        // FS-10 (`shmem_write_begin`, linux-7.3.1/mm/shmem.c:3256): seals before any space is charged.
         let buf = &buf[..seal_write_limit(g.seals, pos, buf.len(), g.size)?];
         let want_end = pos.checked_add(buf.len() as u64).ok_or(EFBIG)?;
         let mut limit = want_end;
@@ -1655,7 +1776,7 @@ impl PageCache {
     }
 
     /// ftruncate/truncate/O_TRUNC: growing only sets the size for a lazily charged file (`shmem_setattr`,
-    /// linux-6.6/mm/shmem.c:1153: i_size only; pages are charged when allocated) and charges the new pages
+    /// linux-7.3.1/mm/shmem.c:1357: i_size only; pages are charged when allocated) and charges the new pages
     /// first for a size-charged one (all or nothing: ENOMEM from the system pool, ENOSPC from the mount);
     /// shrinking drops the pages past the end (`Inode::truncate` has taken them out of every mapping first,
     /// MM-rmap; one a fault mapped again meanwhile stays alive in its mapping until the second unmap after the cut),
@@ -1665,9 +1786,9 @@ impl PageCache {
     /// truncate_inode_pages waits on pages under writeback): a batch collected before the truncate carries the
     /// old size and would otherwise write the cut-off pages back after the file system shrank the file (FS-7).
     pub fn truncate(&self, size: u64) -> Result<(), Errno> {
-        let _wb = self.backend.as_ref().map(|_| self.sync_lock.lock());
+        let _wb = self.backend.as_ref().map(|_| self.wb_lock());
         let mut g = self.inner.lock();
-        // FS-10 (`shmem_setattr`, linux-6.6/mm/shmem.c:1177): F_SEAL_SHRINK/F_SEAL_GROW before the charge.
+        // FS-10 (`shmem_setattr`, linux-7.3.1/mm/shmem.c:1353): F_SEAL_SHRINK/F_SEAL_GROW before the charge.
         if (size < g.size && g.seals & F_SEAL_SHRINK != 0) || (size > g.size && g.seals & F_SEAL_GROW != 0) {
             return Err(EPERM);
         }
@@ -1750,7 +1871,7 @@ impl PageCache {
             // A tmpfs file: the cache is its content.
             return self.pages();
         }
-        let _wb = self.sync_lock.lock();
+        let _wb = self.wb_lock();
         let g = self.inner.lock();
         let (mut at, mut stayed) = (0, 0);
         while let Some((i, dirty)) = g.pages.next_with(at, |_, p| {
@@ -1766,9 +1887,12 @@ impl PageCache {
         stayed
     }
 
-    /// fallocate on a tmpfs file after `vfs_fallocate`'s checks (`shmem_fallocate`, linux-6.6/mm/shmem.c:2995-3130;
+    /// fallocate on a tmpfs file after `vfs_fallocate`'s checks (`shmem_fallocate`, linux-7.3.1/mm/shmem.c:3626;
     /// `offset + len` fits MAX_FILE_SIZE). Block file systems' files have no fallocate (EOPNOTSUPP; glibc's
     /// posix_fallocate then writes zeros itself), nor does any mode but KEEP_SIZE and PUNCH_HOLE.
+    ///
+    /// - Allocation whose end rounded up to a page passes MAX_FILE_SIZE: EFBIG after the F_SEAL_GROW check, before
+    ///   any size check (shmem.c:3691, the wraparound check).
     ///
     /// - PUNCH_HOLE (always with KEEP_SIZE): EPERM under F_SEAL_WRITE or F_SEAL_FUTURE_WRITE (F_SEAL_SHRINK does
     ///   not stop it, as in Linux); the range reads as zeros afterwards (`punch_locked`).
@@ -1798,6 +1922,9 @@ impl PageCache {
         }
         if g.seals & F_SEAL_GROW != 0 && end > g.size {
             return Err(EPERM);
+        }
+        if end > crate::abi::MAX_FILE_SIZE - (P - 1) {
+            return Err(EFBIG);
         }
         if let Some(limit) = pool.size()
             && pages_for(end) - offset / P > limit
@@ -2006,7 +2133,7 @@ impl PageCache {
         }
     }
 
-    /// FS-12: posix_fadvise(POSIX_FADV_WILLNEED) (linux-6.6/mm/fadvise.c -> `force_page_cache_readahead`): the
+    /// FS-12: posix_fadvise(POSIX_FADV_WILLNEED) (linux-7.3.1/mm/fadvise.c:106 -> `force_page_cache_readahead`): the
     /// pages of `[pos, pos + len)` (len 0: to the end of the file) are queued for the Background read-ahead
     /// thread; the call does not wait. Only for backends that take read-ahead, and not while this file's job runs.
     pub fn will_need(&self, pos: u64, len: u64) {
@@ -2146,14 +2273,30 @@ impl PageCache {
         if self.backend.is_none() {
             return Ok(());
         }
-        let one = self.sync_lock.lock();
+        let one = self.wb_lock();
         self.sync_ranges_locked(&one, &[(first, last)], why)
+    }
+
+    /// This file holds a block device from now on (an image under a volume pool): its write-back lock becomes the
+    /// class `vfs.cache.sync.backing`, below the locks of the device's users. A file system's file is written
+    /// back under `vfs.cache.sync`, then its volume's lock, then the pool's; the pool's commit makes the image
+    /// file durable under the pool's lock, so the image's write-back lock comes after those. With one class for
+    /// both the lock checker saw an inversion (12.11., vs/30 and vs/70: `vfs.cache.sync` <-> `bitsvol.pool` and
+    /// `ext4.vol`); the two are different files, and an image's write-back only goes down (its file system, its
+    /// disk), never back up to the pool on it. As Linux's bdev mapping gets a class apart from a file's.
+    pub fn back_a_device(&self) {
+        self.backs_device.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn wb_lock(&self) -> ksync::MutexGuard<'_, ()> {
+        static BACKING: ksync::AsClass = ksync::AsClass::new("vfs.cache.sync.backing");
+        if self.backs_device.load(Ordering::Acquire) { self.sync_lock.lock_as(&BACKING) } else { self.sync_lock.lock() }
     }
 
     /// FS-STALL: this cache's write-back lock, for an owner that picks the pages to write while no other write-back
     /// runs (`sync_ranges_locked`).
     pub fn lock_sync(&self) -> ksync::MutexGuard<'_, ()> {
-        self.sync_lock.lock()
+        self.wb_lock()
     }
 
     /// `sync_range` over several [first, last] ranges in one write-back (one `begin`, one `commit`), under
@@ -2209,6 +2352,7 @@ impl PageCache {
     /// lost). Room is reserved before a flag is cleared, so a page that does not fit stays dirty; `next` is
     /// where the next batch starts then (None: the range is done).
     fn collect_dirty(&self, start: u64, last: u64) -> Batch {
+        let most = self.backend.as_ref().map_or(usize::MAX, |b| b.batch_pages()).max(1);
         let mut g = self.inner.lock();
         let mut batch = Batch { idx: Vec::new(), pages: Vec::new(), size: g.size, next: None, oom: false };
         let mut at = start;
@@ -2217,13 +2361,19 @@ impl PageCache {
             if i > last {
                 break;
             }
-            if p.is_dirty() {
+            // FS-W2: a page written beside the cache now is not this write-back's (`cache_around`).
+            if p.is_dirty() && !g.direct.covers(i) {
                 #[cfg(test)]
                 let capped = matches!(self.batch_cap.load(Ordering::Relaxed), c if c != 0 && batch.idx.len() + 1 >= c);
                 #[cfg(not(test))]
                 let capped = false;
                 if capped || batch.idx.try_reserve(1).is_err() || batch.pages.try_reserve(1).is_err() {
                     batch.oom = true;
+                    batch.next = Some(i);
+                    break;
+                }
+                // FS-W2: a full batch is written before the next is taken (`Backend::batch_pages`).
+                if batch.idx.len() >= most {
                     batch.next = Some(i);
                     break;
                 }
@@ -2271,14 +2421,14 @@ impl PageCache {
     }
 }
 
-/// FS-10: the step of `generic_perform_write` a tmpfs write goes in. Linux 6.6 stepped by pages
-/// (linux-6.6/mm/filemap.c:3948); CachyOS's kernel steps by the mapping's largest folio, 2 MiB for tmpfs
+/// FS-10: the step of `generic_perform_write` a tmpfs write goes in. Linux 6.6 stepped by pages;
+/// Linux 7.3.1 (CachyOS's kernel) steps by the mapping's largest folio (linux-7.3.1/mm/filemap.c:4352), 2 MiB for tmpfs
 /// (measured: under F_SEAL_GROW a write across the end is refused whole unless it crosses a 2 MiB boundary).
 /// The oracle's step is taken.
 const WRITE_STEP: u64 = 2 << 20;
 
 /// FS-10: how much of a write of `len` bytes at `pos` the seals let in (Linux checks them per step of
-/// `generic_perform_write` in `shmem_write_begin`, linux-6.6/mm/shmem.c:2680): EPERM for any write under
+/// `generic_perform_write` in `shmem_write_begin`, linux-7.3.1/mm/shmem.c:3256): EPERM for any write under
 /// F_SEAL_WRITE or F_SEAL_FUTURE_WRITE; under F_SEAL_GROW the steps that end inside the file, EPERM when not
 /// even the first does. A short count makes the caller's next call answer EPERM, so the program sees the bytes
 /// written.

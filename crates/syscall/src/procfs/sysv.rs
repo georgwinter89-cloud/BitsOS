@@ -1,6 +1,8 @@
 //! SX-IPC: `/proc/sys/kernel/{sem,shmmax,shmall,shmmni,shm_rmid_forced,msgmax,msgmnb,msgmni,auto_msgmni,
 //! *_next_id}` per IPC namespace (linux-7.3.1/ipc/ipc_sysctl.c) and `/proc/sysvipc/{sem,shm,msg}`. A second source
 //! beside `sysctl.rs` on the same directory. Every file belongs to the reader's namespace, as Linux's `set_lookup`.
+//! Writes go through the one sysctl writer (`vfs::sysctl`, kernel/sysctl.c `do_proc_vec`): same parsing, signs,
+//! errors and count as every other knob.
 
 use super::attr::Live;
 use alloc::string::String;
@@ -32,7 +34,8 @@ fn ns_root(ns: &IpcNs) -> (u32, u32) {
 /// One number or row of numbers.
 struct Knob {
     read: fn(&Tables) -> String,
-    write: fn(&Arc<IpcNs>, &[u8]) -> Result<(), Errno>,
+    /// The count written, as the one sysctl writer (`vfs::sysctl`) answers it.
+    write: fn(&Arc<IpcNs>, &[u8]) -> Result<usize, Errno>,
     /// `*_next_id`: 0444, but open to CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN over the namespace (`ipc_permissions`).
     next_id: bool,
 }
@@ -73,86 +76,67 @@ impl FileSource for Knob {
         if data.is_empty() || pos != 0 {
             return Ok(data.len());
         }
-        (self.write)(&reader_ns(), data)?;
-        Ok(data.len())
+        (self.write)(&reader_ns(), data)
     }
 }
 
-/// `proc_dointvec_minmax` on one int: only white space or a value outside the range is EINVAL.
-fn int_in(data: &[u8], max: u64) -> Result<i32, Errno> {
-    let v = vfs::sysctl::parse_ulong(data)?.ok_or(EINVAL)?;
-    if v > max {
-        return Err(EINVAL);
-    }
-    Ok(v as i32)
+/// `proc_dointvec_minmax` on one int in 0..=max, stored by `store`.
+fn int_in(data: &[u8], max: u64, store: impl FnOnce(i32)) -> Result<usize, Errno> {
+    vfs::sysctl::write_int(data, |v| {
+        let v = vfs::sysctl::non_negative(v)?;
+        if v > max {
+            return Err(EINVAL);
+        }
+        store(v as i32);
+        Ok(())
+    })
 }
 
 fn int_text(a: &AtomicI32) -> String {
     alloc::format!("{}\n", a.load(Ordering::Relaxed))
 }
 
-/// `proc_dointvec`'s numbers: each may have a sign, separated by white space, at most `sem_ctls`' four.
-fn sem_values(data: &[u8]) -> Result<Vec<i32>, Errno> {
-    let mut out = Vec::new();
-    for tok in data.split(|c| matches!(c, b' ' | b'\t' | b'\n')).filter(|t| !t.is_empty()).take(4) {
-        let (neg, digits) = match tok.first() {
-            Some(b'-') => (true, &tok[1..]),
-            _ => (false, tok),
-        };
-        let v = vfs::sysctl::parse_ulong(digits)?.ok_or(EINVAL)?;
-        if v > if neg { INT_MAX + 1 } else { INT_MAX } {
-            return Err(EINVAL);
-        }
-        out.try_reserve(1).map_err(|_| ENOMEM)?;
-        out.push(if neg { (v as i64).wrapping_neg() as i32 } else { v as i32 });
-    }
-    if out.is_empty() {
-        return Err(EINVAL);
-    }
-    Ok(out)
-}
-
-/// `proc_ipc_sem_dointvec`: what was given is stored; semmni out of 0..=IPCMNI is ERANGE and goes back alone.
-fn write_sem(ns: &Arc<IpcNs>, data: &[u8]) -> Result<(), Errno> {
+/// `proc_ipc_sem_dointvec`: `proc_dointvec` over the four ints stores what it read; on any error, or semmni out
+/// of 0..=IPCMNI (ERANGE), semmni goes back alone.
+fn write_sem(ns: &Arc<IpcNs>, data: &[u8]) -> Result<usize, Errno> {
     let l = &ns.tables.limits;
     let old = l.sem[SC_SEMMNI].load(Ordering::Relaxed);
-    for (i, v) in sem_values(data)?.iter().enumerate() {
-        l.sem[i].store(*v, Ordering::Relaxed);
-    }
-    let mni = l.sem[SC_SEMMNI].load(Ordering::Relaxed);
-    if !(0..=IPC_MNI).contains(&mni) {
+    let r = vfs::sysctl::write_ints(data, l.sem.len(), |i, v| {
+        l.sem[i].store(v as i32, Ordering::Relaxed);
+        Ok(())
+    })
+    .and_then(|n| if (0..=IPC_MNI).contains(&l.sem[SC_SEMMNI].load(Ordering::Relaxed)) { Ok(n) } else { Err(ERANGE) });
+    if r.is_err() {
         l.sem[SC_SEMMNI].store(old, Ordering::Relaxed);
-        return Err(ERANGE);
     }
-    Ok(())
+    r
 }
 
-fn write_shm_rmid_forced(ns: &Arc<IpcNs>, data: &[u8]) -> Result<(), Errno> {
-    let v = int_in(data, 1)?;
-    ns.tables.limits.shm_rmid_forced.store(v, Ordering::Relaxed);
-    if v != 0 {
+fn write_shm_rmid_forced(ns: &Arc<IpcNs>, data: &[u8]) -> Result<usize, Errno> {
+    let n = int_in(data, 1, |v| ns.tables.limits.shm_rmid_forced.store(v, Ordering::Relaxed))?;
+    if ns.tables.limits.shm_rmid_forced.load(Ordering::Relaxed) != 0 {
         shm::destroy_orphaned(ns);
     }
-    Ok(())
+    Ok(n)
 }
 
-/// `proc_doulongvec_minmax`: only white space changes nothing.
-fn write_ulong(data: &[u8], store: impl FnOnce(u64)) -> Result<(), Errno> {
-    if let Some(v) = vfs::sysctl::parse_ulong(data)? {
+/// `proc_doulongvec_minmax` without bounds: any unsigned long, no sign.
+fn write_ulong(data: &[u8], store: impl FnOnce(u64)) -> Result<usize, Errno> {
+    vfs::sysctl::write_value(data, |v| {
         store(v);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn knobs() -> [(&'static str, u32, Knob); 12] {
     let k = |read, write| Knob { read, write, next_id: false };
     let id = |read, write| Knob { read, write, next_id: true };
     [
-        ("auto_msgmni", 0o644, k(|_| String::from("0\n"), |_, d| int_in(d, 1).map(|_| ()))),
-        ("msg_next_id", 0o444, id(|t| alloc::format!("{}\n", t.msg.ids.read().next_id), |n, d| int_in(d, INT_MAX).map(|v| n.tables.msg.ids.write().next_id = v))),
-        ("msgmax", 0o644, k(|t| int_text(&t.limits.msgmax), |n, d| int_in(d, INT_MAX).map(|v| n.tables.limits.msgmax.store(v, Ordering::Relaxed)))),
-        ("msgmnb", 0o644, k(|t| int_text(&t.limits.msgmnb), |n, d| int_in(d, INT_MAX).map(|v| n.tables.limits.msgmnb.store(v, Ordering::Relaxed)))),
-        ("msgmni", 0o644, k(|t| int_text(&t.limits.msgmni), |n, d| int_in(d, IPC_MNI as u64).map(|v| n.tables.limits.msgmni.store(v, Ordering::Relaxed)))),
+        ("auto_msgmni", 0o644, k(|_| String::from("0\n"), |_, d| int_in(d, 1, |_| ()))),
+        ("msg_next_id", 0o444, id(|t| alloc::format!("{}\n", t.msg.ids.read().next_id), |n, d| int_in(d, INT_MAX, |v| n.tables.msg.ids.write().next_id = v))),
+        ("msgmax", 0o644, k(|t| int_text(&t.limits.msgmax), |n, d| int_in(d, INT_MAX, |v| n.tables.limits.msgmax.store(v, Ordering::Relaxed)))),
+        ("msgmnb", 0o644, k(|t| int_text(&t.limits.msgmnb), |n, d| int_in(d, INT_MAX, |v| n.tables.limits.msgmnb.store(v, Ordering::Relaxed)))),
+        ("msgmni", 0o644, k(|t| int_text(&t.limits.msgmni), |n, d| int_in(d, IPC_MNI as u64, |v| n.tables.limits.msgmni.store(v, Ordering::Relaxed)))),
         (
             "sem",
             0o644,
@@ -164,12 +148,12 @@ fn knobs() -> [(&'static str, u32, Knob); 12] {
                 write_sem,
             ),
         ),
-        ("sem_next_id", 0o444, id(|t| alloc::format!("{}\n", t.sem.ids.read().next_id), |n, d| int_in(d, INT_MAX).map(|v| n.tables.sem.ids.write().next_id = v))),
-        ("shm_next_id", 0o444, id(|t| alloc::format!("{}\n", t.shm.ids.read().next_id), |n, d| int_in(d, INT_MAX).map(|v| n.tables.shm.ids.write().next_id = v))),
+        ("sem_next_id", 0o444, id(|t| alloc::format!("{}\n", t.sem.ids.read().next_id), |n, d| int_in(d, INT_MAX, |v| n.tables.sem.ids.write().next_id = v))),
+        ("shm_next_id", 0o444, id(|t| alloc::format!("{}\n", t.shm.ids.read().next_id), |n, d| int_in(d, INT_MAX, |v| n.tables.shm.ids.write().next_id = v))),
         ("shm_rmid_forced", 0o644, k(|t| int_text(&t.limits.shm_rmid_forced), write_shm_rmid_forced)),
         ("shmall", 0o644, k(|t| alloc::format!("{}\n", t.limits.shmall.load(Ordering::Relaxed)), |n, d| write_ulong(d, |v| n.tables.limits.shmall.store(v, Ordering::Relaxed)))),
         ("shmmax", 0o644, k(|t| alloc::format!("{}\n", t.limits.shmmax.load(Ordering::Relaxed)), |n, d| write_ulong(d, |v| n.tables.limits.shmmax.store(v, Ordering::Relaxed)))),
-        ("shmmni", 0o644, k(|t| int_text(&t.limits.shmmni), |n, d| int_in(d, IPC_MNI as u64).map(|v| n.tables.limits.shmmni.store(v, Ordering::Relaxed)))),
+        ("shmmni", 0o644, k(|t| int_text(&t.limits.shmmni), |n, d| int_in(d, IPC_MNI as u64, |v| n.tables.limits.shmmni.store(v, Ordering::Relaxed)))),
     ]
 }
 

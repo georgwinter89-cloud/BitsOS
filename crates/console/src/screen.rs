@@ -12,6 +12,9 @@
 
 mod csi;
 mod edit;
+mod stock;
+
+pub use stock::Stock;
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -126,14 +129,28 @@ pub struct Screen {
     insert: bool,
     origin: bool,
     cursor_on: bool,
+    /// DEC private mode 2004 (linux-7.3.1/drivers/tty/vt/vt.c:2040 `vc_bracketed_paste`): only kept for
+    /// TIOCL_GETBRACKETEDPASTE, V2 has no selection to paste.
+    bracketed_paste: bool,
     saved: Saved,
     /// The main screen's rows while the alternate screen is shown.
     alt: Option<Vec<Vec<Cell>>>,
     /// Reports for the terminal's input (Linux's `respond_string`).
     reply: Vec<u8>,
+    /// Blank rows the current write brought for its scrolls (`stock`: empty between writes).
+    spare: Vec<Vec<Cell>>,
+    /// The buffer `write_above` carries the open line in (kept, so a log line allocates nothing for it).
+    open_buf: Vec<Cell>,
+    /// Scrolls that had to make their own memory (`took_unprepared`).
+    unprepared: u32,
 }
 
 impl Screen {
+    /// DEC mode 2004 as `CSI ? 2004 h/l` and `ESC c` left it (TIOCL_GETBRACKETEDPASTE).
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
     pub fn new(cols: u32, rows: u32) -> Screen {
         let (cols, rows) = (cols.max(1), rows.max(1));
         let mut hist = VecDeque::new();
@@ -163,9 +180,13 @@ impl Screen {
             insert: false,
             origin: false,
             cursor_on: true,
+            bracketed_paste: false,
             saved: SAVED0,
             alt: None,
             reply: Vec::new(),
+            spare: Vec::new(),
+            open_buf: Vec::new(),
+            unprepared: 0,
         }
     }
 
@@ -193,6 +214,8 @@ impl Screen {
         self.line_below = 0;
         self.wrap_cr = false;
         (self.top, self.bot) = (0, rows);
+        // Rows of the old width.
+        self.spare.clear();
         self.trim();
     }
 
@@ -380,16 +403,15 @@ impl Screen {
         (self.reverse, self.insert, self.wrap_cr) = (false, false, false);
         let b = self.base();
         let cur = b + self.row as usize;
-        let first = cur.saturating_sub(self.line_rows as usize).max(b);
-        let last = (cur + self.line_below as usize).min(self.hist.len() - 1);
+        let (first, last, end) = self.open_span();
         let cols = self.cols as usize;
         let col = self.col.min(self.cols) as usize;
-        // The last row up to its text, on the cursor's row at least up to the cursor (`\r` progress lines).
-        let mut end = self.hist[last].iter().rposition(|c| *c != Cell::BLANK).map(|i| i + 1).unwrap_or(0);
-        if last == cur {
-            end = end.max(col);
+        // The kept buffer has the room when the writer prepared (`stock`); it goes back below.
+        let mut open = core::mem::take(&mut self.open_buf);
+        open.clear();
+        if open.capacity() < (last - first) * cols + end {
+            self.unprepared += 1;
         }
-        let mut open: Vec<Cell> = Vec::new();
         for row in self.hist.range(first..last) {
             open.extend_from_slice(row);
         }
@@ -431,6 +453,7 @@ impl Screen {
             self.lf(true);
         }
         self.esc = esc;
+        self.open_buf = open;
     }
 
     /// The text of the open line (from its first wrapped row up to the cursor), for tests.

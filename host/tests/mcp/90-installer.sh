@@ -6,7 +6,7 @@
 # test confirmer answers no, yes (the tool runs), silence (timeout), an injected yes (refused); a grant for `pin`
 # lets a pin through without a dialog until it expires by itself; every decision is a kernel event; a confirmed
 # real reboot answers first and then restarts the machine (installer_check.py). bitsmcp and bitsinstall come from
-# init's glue (plan/notes/mc-MC-8a-init.patch, mc-MC-9a-init.patch) or, without it, are typed into the root
+# init's glue (init starts /bin/bitsmcp and /bin/bitsinstall) or, without it, are typed into the root
 # console shell through QEMU's USB keyboard and QMP.
 set -eu -o pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"

@@ -1,11 +1,12 @@
 //! PK-L1c: the pads bitscomp reads (`backend::evdev` opens them without a grab) and where their presses go. A pad
-//! acts only on bitscomp's own surfaces that understand it: Home (or Select+Start held 500 ms) toggles the library
-//! from anywhere, fullscreen programs too (the program still gets the button: nothing is grabbed); while the library
-//! is open the D-pad/stick move the focus, A starts, B closes, X opens the circle menu on the focused tile, Y
-//! focuses the search field (the on-screen keyboard comes with GM-6). Everything else is ignored by bitscomp. A pad
+//! acts only on bitscomp's own surfaces that understand it: Home (or Select+Start held 500 ms) switches the sofa
+//! mode from anywhere, fullscreen programs too (GM-6a, sofa-mode.md §5; the program still gets the button: nothing
+//! is grabbed); a sofa screen takes every press (sofa_app.rs), a program in front on `Sofa` gets them all but Home;
+//! while the library is open the D-pad/stick move the focus, A starts, B closes, X opens the circle menu on the
+//! focused tile, Y focuses the search field. Everything else is ignored by bitscomp. Plugging a pad in starts the
+//! sofa mode while `sofa.start_on_pad` is on. A pad
 //! never answers the installer's question, a grant or the full-access dialog: its B refuses as injected input
-//! may, every other press there is ignored (MC-9b). `ctl pad` lists the pads; `ctl phys pad-event` is the headless
-//! test path into the same state machine.
+//! may, every other press there is ignored (MC-9b). `ctl pad` lists the pads.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -29,6 +30,10 @@ pub struct PadDev {
     pub id: (u16, u16),
     pub origin: Origin,
     pub pad: Pad,
+    /// GM-6c: its EV_KEY codes (a learned mapping is made of them again when `sofa.pad.map` changes).
+    pub keys: Vec<u16>,
+    /// GM-6c: its evdev phys (EVIOCGPHYS), the HID_PHYS its battery's `device/uevent` names (sofa_io::pad_battery).
+    pub phys: String,
     /// The last logical press and when (ms of bitscomp's clock), for `ctl pad`.
     pub last: Option<(&'static str, u64)>,
 }
@@ -36,7 +41,7 @@ pub struct PadDev {
 impl PadDev {
     pub fn new(label: &str, name: &str, id: (u16, u16), keys: &[u16], stick: (Option<Axis>, Option<Axis>), origin: Origin) -> PadDev {
         let map = crate::pad::mapping(id.0, id.1, keys);
-        PadDev { label: label.into(), name: name.into(), id, origin, pad: Pad::new(map, stick.0, stick.1), last: None }
+        PadDev { label: label.into(), name: name.into(), id, origin, pad: Pad::new(map, stick.0, stick.1), keys: keys.to_vec(), phys: String::new(), last: None }
     }
 
     fn home(&self) -> &'static str {
@@ -63,42 +68,18 @@ fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
 
-/// Headless test pads for `ctl phys pad-event plug KIND` (their bitmaps as the kernel's fakes report them).
-fn test_pad(kind: &str) -> Option<PadDev> {
-    let label = format!("test:{kind}");
-    let byte = Axis { min: 0, max: 255, flat: 15 };
-    Some(match kind {
-        "dragonrise" => PadDev::new(&label, "DragonRise Inc.   Generic   USB  Joystick  ", (0x0079, 0x0006), &(0x120..=0x12b).collect::<Vec<_>>(), (Some(byte), Some(byte)), Origin::Physical),
-        "xbox" => {
-            let keys = [0x130, 0x131, 0x133, 0x134, 0x136, 0x137, 0x13a, 0x13b, 0x13c, 0x13d, 0x13e];
-            let a = Axis { min: -32768, max: 32767, flat: 128 };
-            PadDev::new(&label, "Microsoft X-Box 360 pad", (0x045e, 0x028e), &keys, (Some(a), Some(a)), Origin::Physical)
-        }
-        "stick2" => {
-            let a = Axis { min: -127, max: 127, flat: 0 };
-            PadDev::new(&label, "Two-button stick", (0x1234, 0x5678), &[0x120, 0x121], (Some(a), Some(a)), Origin::Physical)
-        }
-        _ => return None,
-    })
-}
-
-fn num(w: Option<&&str>) -> Result<i64, String> {
-    let w = w.ok_or("missing number")?;
-    let r = if let Some(h) = w.strip_prefix("0x") { i64::from_str_radix(h, 16) } else { w.parse::<i64>() };
-    r.map_err(|e| format!("{w}: {e}"))
-}
-
-/// `pad` and `pad-event ...`; None for other commands.
+/// `pad`; None for other commands.
 pub fn ctl(app: &mut App, words: &[&str]) -> Option<Result<String, String>> {
-    match words.first().copied() {
-        Some("pad") => Some(Ok(app.pad_list())),
-        Some("pad-event") => Some(app.pad_event_ctl(&words[1..])),
-        _ => None,
-    }
+    (words.first() == Some(&"pad")).then(|| Ok(app.pad_list()))
 }
 
 impl App {
     pub fn pad_plug(&mut self, id: u64, d: PadDev) {
+        let mut d = d;
+        // GM-6c: a mapping learned on the sofa mode's screen wins (sofa.pad.map).
+        if let Some(m) = crate::pad::learned(&self.sofa.prefs.pad_map, d.id.0, d.id.1, &d.keys) {
+            d.pad.map = m;
+        }
         let src = d.pad.map.source;
         eprintln!(
             "bitscomp: input: pad {} \"{}\" {:04x}:{:04x}: mapping {}, Home {}",
@@ -113,7 +94,10 @@ impl App {
             let home = if d.pad.map.chord() { "buttons 9 and 10 guessed as Select and Start" } else { "no Home on this pad (fewer than ten buttons)" };
             eprintln!("bitscomp: input: pad {}: unknown pad, its first four buttons are A, B, X, Y (fallback); {home}", d.label);
         }
+        d.pad.chord_off = !self.sofa.prefs.chord;
+        d.pad.help = crate::db_settings::pad_button(&self.settings);
         self.pads.list.push((id, d));
+        self.sofa_pad_plugged();
     }
 
     /// The pad went away: its held buttons and its repeat are forgotten (nothing comes out of it any more).
@@ -124,8 +108,29 @@ impl App {
         }
     }
 
+    /// GM-6c: `sofa.pad.map` changed: every pad takes its learned mapping (or its own again).
+    pub fn pad_remap(&mut self) {
+        let text = self.sofa.prefs.pad_map.clone();
+        for (_, d) in &mut self.pads.list {
+            let m = crate::pad::mapping_for(d.id.0, d.id.1, &d.keys, &text);
+            if m != d.pad.map {
+                eprintln!("bitscomp: input: pad {}: mapping {} now (sofa.pad.map)", d.label, m.source.name());
+                d.pad.map = m;
+                d.pad.reset();
+            }
+        }
+    }
+
     pub fn pad_feed(&mut self, id: u64, evs: &[(u16, u16, i32)]) {
         let now = ms(crate::pacer::now());
+        // GM-6c: the learn screen takes the learned pad's raw button presses (nothing else of it acts meanwhile).
+        if self.sofa.set.learn.as_ref().is_some_and(|l| l.pad == id) {
+            let downs: Vec<u16> = evs.iter().filter(|(t, _, v)| *t == crate::backend::evdev_map::EV_KEY && *v == 1).map(|(_, c, _)| *c).collect();
+            for c in downs {
+                self.sofa_learn_raw(id, c);
+            }
+            return;
+        }
         let Some((_, d)) = self.pads.list.iter_mut().find(|(k, _)| *k == id) else { return };
         let mut out = Vec::new();
         for &(ty, code, value) in evs {
@@ -136,15 +141,16 @@ impl App {
         }
     }
 
-    /// Repeats wake the loop only while the library listens; the Select+Start hold always (Home works anywhere).
+    /// Repeats wake the loop only while the library or a sofa screen listens; the Select+Start hold always (Home
+    /// works anywhere).
     pub fn pad_due(&self) -> Option<Duration> {
-        let open = self.lib.open;
+        let open = self.lib.open || self.sofa.listens();
         self.pads.list.iter().filter_map(|(_, d)| if open { d.pad.due() } else { d.pad.chord_due() }).min().map(Duration::from_millis)
     }
 
     pub fn pad_tick(&mut self, now: Duration) {
         let now = ms(now);
-        let open = self.lib.open;
+        let open = self.lib.open || self.sofa.listens();
         if !self.install.shown() {
             self.pads.noted.clear();
         }
@@ -168,6 +174,9 @@ impl App {
         let Some((_, d)) = self.pads.list.iter_mut().find(|(k, _)| *k == id) else { return };
         d.last = Some((p.name(), now));
         let origin = d.origin;
+        if origin == Origin::Physical {
+            self.leistung_input();
+        }
         if matches!(p, Press::Btn(_)) {
             self.lib.alone.other();
         }
@@ -196,8 +205,20 @@ impl App {
             return;
         }
         self.input_origin = origin;
+        // DB3: Select with the chosen button opens Durchblick; while its panel is open the pad is its.
+        if self.db_pad(p) {
+            return;
+        }
         if p == Press::Btn(Btn::Home) {
-            return self.library_toggle("pad Home");
+            return self.sofa_switch(crate::sofa::Way::Home);
+        }
+        // GM-6a: in the sofa mode the pad is the sofa screens' (or the quick menu's); behind a program in front it
+        // is the program's alone.
+        if self.sofa.active {
+            if self.sofa.listens() {
+                self.sofa_pad(p);
+            }
+            return;
         }
         if !self.lib.open {
             return;
@@ -281,45 +302,5 @@ impl App {
         }
         out.push_str("end");
         out
-    }
-
-    /// Test path (headless build, only through `phys`): `plug dragonrise|xbox|stick2`, `unplug`, or raw events
-    /// `key CODE VALUE` / `abs CODE VALUE` ... for the newest test pad, followed by a SYN_REPORT.
-    fn pad_event_ctl(&mut self, w: &[&str]) -> Result<String, String> {
-        if !(cfg!(feature = "nested") && self.headless && self.ctl_origin == Origin::Physical) {
-            return Err("pad-event: a test command, only as `phys pad-event` in the headless test build".into());
-        }
-        let newest = self.pads.list.iter().rev().find(|(_, d)| d.label.starts_with("test:")).map(|(k, _)| *k);
-        match w.first().copied() {
-            Some("plug") => {
-                let d = test_pad(w.get(1).copied().unwrap_or("")).ok_or("pad-event plug dragonrise|xbox|stick2")?;
-                let id = next_id();
-                self.pad_plug(id, d);
-                Ok(format!("pad {id}"))
-            }
-            Some("unplug") => {
-                let id = newest.ok_or("no test pad")?;
-                self.pad_gone(id);
-                Ok(format!("pad {id} gone"))
-            }
-            Some(_) => {
-                let id = newest.ok_or("no test pad: pad-event plug KIND first")?;
-                let mut evs = Vec::new();
-                for c in w.chunks(3) {
-                    let ty = match c[0] {
-                        "key" => crate::backend::evdev_map::EV_KEY,
-                        "abs" => crate::backend::evdev_map::EV_ABS,
-                        o => return Err(format!("pad-event: {o}? (key|abs CODE VALUE)")),
-                    };
-                    let code = u16::try_from(num(c.get(1))?).map_err(|e| e.to_string())?;
-                    let value = i32::try_from(num(c.get(2))?).map_err(|e| e.to_string())?;
-                    evs.push((ty, code, value));
-                }
-                evs.push((crate::backend::evdev_map::EV_SYN, crate::backend::evdev_map::SYN_REPORT, 0));
-                self.pad_feed(id, &evs);
-                Ok(self.pad_list())
-            }
-            None => Err("pad-event plug KIND | unplug | key|abs CODE VALUE ...".into()),
-        }
     }
 }

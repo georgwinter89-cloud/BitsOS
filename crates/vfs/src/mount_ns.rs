@@ -2,7 +2,7 @@
 //!
 //! A `Mount` puts a file system's dentry (its root, or any directory or file of it for a bind mount) onto a
 //! dentry of another mount. A `MountNs` is one view (Linux `mnt_namespace`): its root mount and every mount
-//! attached below it. As in Linux (linux-6.6/fs/namespace.c `mount_hashtable`) the table "which mount sits on
+//! attached below it. As in Linux (linux-7.3.1/fs/namespace.c:80 `mount_hashtable`) the table "which mount sits on
 //! (mount, dentry)" is one for the whole system: mount ids never repeat, so a key names one view's place, and a
 //! walk crosses mounts without knowing the view (a cwd or an open directory of another view keeps walking in
 //! that view, as on Linux). A view's root is kept in the same table under the key (0, view id).
@@ -17,7 +17,7 @@
 //! make them): a view's mounts are a walk from its root, a peer group's members and slaves are ranges of the
 //! table's indexes (`groups`, `masters`).
 //!
-//! Propagation (linux-6.6/fs/pnode.c) is kept by peer group ids: `group` is the mount's peer group ("shared:N"),
+//! Propagation (linux-7.3.1/fs/pnode.c) is kept by peer group ids: `group` is the mount's peer group ("shared:N"),
 //! `master` the peer group it receives from ("master:N"). The tree operations are in `mount_tree.rs`, the
 //! calls of mount(2), umount2(2) and pivot_root(2) in `mount_ops.rs`, /proc's two files in `mountinfo.rs`.
 
@@ -162,15 +162,15 @@ pub struct Path {
 }
 
 impl Path {
-    /// Linux `path_noexec` (linux-6.6/fs/exec.c:110): no program runs and nothing maps PROT_EXEC from here.
+    /// Linux `path_noexec` (linux-7.3.1/fs/exec.c:117): no program runs and nothing maps PROT_EXEC from here.
     pub fn noexec(&self) -> bool {
         self.mnt.flags() & MNT_NOEXEC != 0
     }
-    /// Linux `may_open_dev` negated (linux-6.6/fs/namei.c:3226): device nodes here do not open.
+    /// Linux `may_open_dev` negated (linux-7.3.1/fs/namei.c:4225): device nodes here do not open.
     pub fn nodev(&self) -> bool {
         self.mnt.flags() & MNT_NODEV != 0
     }
-    /// Linux `path_nosuid`-style test of `bprm_fill_uid` (linux-6.6/fs/exec.c:1611): set-id bits are ignored.
+    /// Linux `path_nosuid`-style test of `bprm_fill_uid` (linux-7.3.1/fs/exec.c:1643): set-id bits are ignored.
     /// No caller yet: V2 has no set-id exec; when it comes, exec calls it next to `noexec` (CONTRACTS §7a).
     pub fn nosuid(&self) -> bool {
         self.mnt.flags() & MNT_NOSUID != 0
@@ -473,7 +473,7 @@ impl MountNs {
         path_of(root, p)
     }
     /// FS-10: what Linux's `d_path` shows for `p` seen from `root`: the path in this view, or, for a place
-    /// `root` does not reach, the path up to the top of `p`'s own mount chain (linux-6.6/fs/d_path.c
+    /// `root` does not reach, the path up to the top of `p`'s own mount chain (linux-7.3.1/fs/d_path.c:104
     /// `__prepend_path` answers 1 or 2 and `d_path` keeps what it built): a file of another view (an fd opened
     /// before a container's pivot_root, SX-3c) shows its path in that view, a detached tree's file and the
     /// internal tmpfs of memfds (Linux's `shm_mnt`, `/memfd:<name>`) the path from their mount's root.
@@ -493,7 +493,7 @@ impl MountNs {
     pub fn copy_view(&self) -> MountNs {
         self.copy_for(self.owner)
     }
-    /// `copy_mnt_ns` (linux-6.6/fs/namespace.c:3744): a new view owned by `owner` with copies of every mount.
+    /// `copy_mnt_ns` (linux-7.3.1/fs/namespace.c:4398): a new view owned by `owner` with copies of every mount.
     /// For another owner shared mounts become slaves of their groups and the whole copy is locked
     /// (`CL_SHARED_TO_SLAVE`, `lock_mnt_tree`): its flags stay, its mounts cannot be unmounted one by one.
     pub fn copy_for(&self, owner: u32) -> MountNs {
@@ -514,6 +514,31 @@ impl MountNs {
         drop(g);
         let ns = Self::build(id, root, owner, Some(Source { ns: self.id, map }));
         klog::event!(Info, "vfs", "ns.copy", from = self.id, ns = id, owner = owner, mounts = ns.mounts().len());
+        ns
+    }
+    /// `copy_mnt_ns` with CLONE_EMPTY_MNTNS (linux-7.3.1/fs/namespace.c:4420-4460): a new view owned by `owner`
+    /// holding one copy of this view's root mount (`clone_mnt`, no submounts): a peer of a shared root for the
+    /// same owner, for another owner a slave of it (CL_SLAVE) and locked. The caller puts root and cwd on its root
+    /// (`FsState::place`).
+    pub fn copy_root_only(&self, owner: u32) -> MountNs {
+        use crate::mount_tree::CL_SLAVE;
+        let id = NEXT_NS.fetch_add(1, Ordering::Relaxed);
+        let other = owner != self.owner;
+        // Root read, clone and lock under TOPO, as copy_mnt_ns under `namespace_excl` (namespace.c:4421): a
+        // pivot_root or a propagation change of the root meanwhile must not give a stale root or peer group.
+        let (old, root) = {
+            let t = TOPO.lock();
+            let old = self.root_mount();
+            let root = crate::mount_tree::clone_mnt(&old, &old.root, if other { CL_SLAVE } else { 0 }, id);
+            if other {
+                crate::mount_tree::lock_tree(&t, &root);
+            }
+            (old, root)
+        };
+        let mut map = BTreeMap::new();
+        map.insert(old.id, Arc::downgrade(&root));
+        let ns = Self::build(id, root, owner, Some(Source { ns: self.id, map }));
+        klog::event!(Info, "vfs", "ns.copy_empty", from = self.id, ns = id, owner = owner);
         ns
     }
     /// The view this one was copied from.
@@ -610,7 +635,7 @@ pub(crate) fn path_of(root: &Path, p: &Path) -> Option<Vec<u8>> {
 
 /// `p`'s path from the top of its mount chain: up through dentries and, at each mount root, to the mountpoint,
 /// until a mount without one (another view's root, a detached tree, an internal mount). getcwd puts
-/// "(unreachable)" in front of it (linux-6.6/fs/d_path.c:432).
+/// "(unreachable)" in front of it (linux-7.3.1/fs/d_path.c:435).
 pub(crate) fn path_to_top(p: &Path) -> Vec<u8> {
     let mut parts: Vec<Vec<u8>> = Vec::new();
     let mut cur = p.clone();

@@ -33,11 +33,20 @@ pub(crate) const IO_WAIT_NS: u64 = LOCK_WAIT_NS * IO_WAIT_ROUNDS as u64;
 /// How long `lock_behind` lets those ahead go first before it queues with them, so a steady stream of foreground
 /// I/O slows a delete but does not stop it.
 const BEHIND_WAIT_NS: u64 = 1_000_000_000;
+/// Runs of freed chunks one round of `trim_out` discards with the pool lock released (at most `Pool::round_chunks`
+/// chunks), and the rounds `trim_owed` sends (a delete sends what was queued when its commit ended). Commits only
+/// queue them: a flush or FUA write comes from the block dispatcher or from under a file system's lock, and
+/// `commit` answers a take whose copy window is still open and fsync's `settle`.
+const TRIM_RUNS: usize = 64;
+const TRIM_ROUNDS_OWED: usize = 4;
 /// Tree pages one step of a delete opens with the pool locked, each at most one device read.
 const DELETE_STEP_PAGES: u64 = 64;
 /// BL-2: reads mapped under the pool lock and read without it before one reads under it (the chunks it mapped were
 /// released and given out again during each of them: a commit beside a stream of reads).
 pub(crate) const READ_TRIES: u32 = 3;
+
+/// Runs of chunks, or of device blocks: (first, count).
+type Runs = Vec<(u64, u64)>;
 
 klog::counter!(READ_RETRIES, "bitsvol.read_retries");
 klog::counter!(READ_LOCKED, "bitsvol.read_locked");
@@ -81,6 +90,10 @@ pub struct PoolHandle {
     deferred: AtomicU64,
     /// How many of `deferred` a successful commit has made durable since (`commit`, `settle`).
     durable: AtomicU64,
+    /// Volume flushes under way that no window held back (`defer_now` counts them under `defer`'s lock), and
+    /// woken when the last one ends: a window opens once those are done (`window`).
+    through: AtomicU64,
+    through_done: WaitQueue,
     /// Woken when a window ends (`settle` waits for the window's commit).
     window_closed: WaitQueue,
     /// The snapshot of a scheduled rollback an open could not carry out (0: none): it stays scheduled, and the
@@ -103,6 +116,9 @@ pub struct PoolHandle {
     no_one_ahead: WaitQueue,
     /// A delete's rest given up because the lock did not come (`delete`): the next holder counts it in `leaks`.
     lost_deletes: AtomicU64,
+    /// Chunks under way to their discard whose round could not take the lock back (`trim_out`): the next holder
+    /// counts them lost (`Pool::trim_orphaned`).
+    trim_orphans: AtomicU64,
     behind: AtomicU64,
     gave_way: AtomicU64,
 }
@@ -113,7 +129,8 @@ impl PoolHandle {
     }
 
     /// As `new`, with another bound for lock waits (tests).
-    pub fn with_wait(pool: Pool, name: &str, wait_ns: u64) -> Arc<PoolHandle> {
+    pub fn with_wait(mut pool: Pool, name: &str, wait_ns: u64) -> Arc<PoolHandle> {
+        pool.set_trim_later();
         let (dev, owed, io, reuse) = (pool.device().clone(), pool.owed_counter(), pool.barrier_state(), pool.reuse_counter());
         Arc::new(PoolHandle {
             dev,
@@ -129,12 +146,15 @@ impl PoolHandle {
             deferred: AtomicU64::new(0),
             durable: AtomicU64::new(0),
             window_closed: WaitQueue::new(),
+            through: AtomicU64::new(0),
+            through_done: WaitQueue::new(),
             rollback_failed: AtomicU64::new(0),
             longest: AtomicU64::new(0),
             last: SpinLock::named("bitsvol.last_commit", CommitTime::default()),
             ahead: AtomicU64::new(0),
             no_one_ahead: WaitQueue::new(),
             lost_deletes: AtomicU64::new(0),
+            trim_orphans: AtomicU64::new(0),
             behind: AtomicU64::new(0),
             gave_way: AtomicU64::new(0),
         })
@@ -149,12 +169,21 @@ impl PoolHandle {
     /// no write to `vol` lands in a chunk a commit holds (`Pool::begin_copy_window`), and a flush of `vol` for
     /// which `defer` answers true returns at once (counted in `deferred_flushes`); the caller
     /// commits before or after dropping it; until that commit those flushes are not durable (a power cut leaves
-    /// `vol` as of the last commit). `defer` bounds that: `snapshots::take` answers true only while its own
-    /// freeze runs and commits right after the thaw.
+    /// `vol` as of the last commit). `defer` bounds that: `snapshots::take` answers true from the window until
+    /// its own freeze is done and commits right after the thaw.
+    ///
+    /// Returns once the volume flushes that began before the deferral (and so go to the device) have ended,
+    /// bounded by the pool's lock wait: a freeze begun after this meets no device barrier of those flushes
+    /// (VS-2b; 12.11.: one to three per pause, each a writer's fsync whose commit or cache flush was still
+    /// running when the take froze, 30 to 50 ms of every pause).
     pub fn window(self: &Arc<Self>, vol: u64, defer: DeferFlush) -> Result<Window, DevError> {
         self.lock()?.begin_copy_window(vol).map_err(VolError::to_dev)?;
         *self.defer.lock() = Some((vol, defer));
-        Ok(Window(self.clone()))
+        let w = Window(self.clone());
+        if !self.through_done.wait_until_timeout(|| self.through.load(Ordering::Acquire) == 0, self.wait_ns) {
+            klog::event!(Info, "bitsvol", "window.flushes_under_way", pool = self.name.clone(), count = self.through.load(Ordering::Acquire), wait_ns = self.wait_ns; "the freeze begins beside them");
+        }
+        Ok(w)
     }
 
     /// Flushes a window let return without a commit (all time; `owed_flushes` says how many are not durable).
@@ -178,6 +207,13 @@ impl PoolHandle {
         self.timed("commit", |p| p.commit())
     }
 
+    /// Discards a bounded part of the freed chunks commits queued (`TRIM_ROUNDS_OWED` rounds), with the pool lock
+    /// released while the device works. For a caller that holds no file system lock and keeps no one waiting:
+    /// a snapshot's take after its window closed (`snapshots::take`).
+    pub fn trim_owed(&self) {
+        self.trim_out(TRIM_ROUNDS_OWED, u64::MAX);
+    }
+
     /// The last commit of this pool through its handle (flush, FUA write, `commit`) as it was measured.
     pub fn last_commit(&self) -> CommitTime {
         *self.last.lock()
@@ -190,8 +226,8 @@ impl PoolHandle {
     /// lock: on an image file that flush is the fsync that writes the volume's data back (2 s for 4 MiB on a
     /// 2 MiB/s stick), and every read of the pool would wait for it under the lock. The commit's own barrier
     /// still runs and then only finds the metadata and what was written meanwhile. dm-thin flushes its data
-    /// device before each metadata commit too (linux-6.6/drivers/md/dm-thin.c:3216, called from
-    /// dm-thin-metadata.c:899), under its metadata lock; here the pool lock also holds up the reads' mapping step (BL-2:
+    /// device before each metadata commit too (linux-7.3.1/drivers/md/dm-thin.c:3212, called from
+    /// dm-thin-metadata.c:902), under its metadata lock; here the pool lock also holds up the reads' mapping step (BL-2:
     /// their data no longer waits for it).
     fn timed(&self, why: &'static str, f: impl FnOnce(&mut Pool) -> crate::error::Result<()>) -> Result<(), DevError> {
         self.timed_by(why, Self::lock_io, 0, f)
@@ -225,6 +261,46 @@ impl PoolHandle {
         *self.last.lock() = t;
         timing::record(&self.name, &self.longest, &t);
         r
+    }
+
+    /// Discards chunks commits freed (`Pool::take_trim`), `TRIM_RUNS` runs per round, at most `rounds` rounds and
+    /// `chunks` chunks, with the pool lock released while the device works (trim.rs). A run whose discard did not
+    /// settle (`trim::settled`), and a round whose lock does not come back, stay out of the pool until the next open.
+    pub(crate) fn trim_out(&self, rounds: usize, chunks: u64) {
+        let mut left = chunks;
+        for _ in 0..rounds {
+            let (runs, blocks): (Runs, Runs) = match self.lock() {
+                Ok(mut p) => {
+                    let runs = p.take_trim(TRIM_RUNS, left);
+                    let blocks = runs.iter().map(|&r| p.run_blocks(r)).collect();
+                    (runs, blocks)
+                }
+                Err(_) => return,
+            };
+            if runs.is_empty() {
+                return;
+            }
+            let taken: u64 = runs.iter().map(|r| r.1).sum();
+            left -= taken;
+            let (mut freed, mut lost) = (Vec::new(), Vec::new());
+            for (&(lba, n), &run) in blocks.iter().zip(&runs) {
+                // Normal, as the commit's own writes: at Background each one waited out the aging of the queues
+                // below it (2 x 250 ms per disk) whenever readers kept them busy.
+                if crate::trim::settled(self.dev.discard_at(lba, n, IoPriority::Normal), run.0) {
+                    freed.push(run);
+                } else {
+                    lost.push(run);
+                }
+            }
+            match self.lock_io() {
+                Ok(mut p) => p.trim_done(&freed, &lost),
+                Err(_) => {
+                    self.trim_orphans.fetch_add(taken, Ordering::Relaxed);
+                    klog::event!(Warn, "bitsvol", "trim.lost", pool = self.name.clone(), chunks = taken; "freed chunks stay out of the pool until its next open");
+                    return;
+                }
+            }
+        }
     }
 
     /// A volume's flush. When the pool has nothing to commit it is only the device's cache flush, and that runs
@@ -289,13 +365,23 @@ impl PoolHandle {
         r
     }
 
+    /// Whether this flush of `vol` waits for the window's commit; one that does not counts in `through` until
+    /// `through_end`. Both decided under `defer`'s lock, so `window` sees every flush its deferral missed.
     fn defer_now(&self, vol: u64) -> bool {
-        let d = self.defer.lock().clone();
-        let yes = d.is_some_and(|(v, f)| v == vol && f());
+        let d = self.defer.lock();
+        let yes = d.as_ref().is_some_and(|(v, f)| *v == vol && f());
         if yes {
             self.deferred.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.through.fetch_add(1, Ordering::AcqRel);
         }
         yes
+    }
+
+    fn through_end(&self) {
+        if self.through.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.through_done.wake_all();
+        }
     }
 
     /// One bounded wait for the pool lock, ahead of `lock_behind`.
@@ -381,7 +467,15 @@ impl PoolHandle {
             })?;
         }
         drop(p);
-        self.timed_by("delete", Self::lock_behind, 0, |p| p.commit())?;
+        let mut owed = 0;
+        self.timed_by("delete", Self::lock_behind, 0, |p| {
+            p.commit()?;
+            owed = p.trim_len();
+            Ok(())
+        })?;
+        // What the delete freed, all of it (its caller waits, the pool's other users do not), and no more: commits
+        // meanwhile keep queueing, and a delete that chased them would never end.
+        self.trim_out(usize::MAX, owed);
         note!(quiet, "volume.delete", id = id);
         Ok(())
     }
@@ -392,6 +486,10 @@ impl PoolHandle {
         }
         let lost = self.lost_deletes.swap(0, Ordering::Relaxed);
         p.leaks += lost;
+        let orphans = self.trim_orphans.swap(0, Ordering::Relaxed);
+        if orphans != 0 {
+            p.trim_orphaned(orphans);
+        }
         let mut r = self.releases.lock();
         r.live -= r.ids.len();
         for id in r.ids.drain(..) {
@@ -546,7 +644,9 @@ impl BlockDevice for VolumeDevice {
         if self.h.defer_now(self.id) {
             return Ok(());
         }
-        self.h.flush_volume()
+        let r = self.h.flush_volume();
+        self.h.through_end();
+        r
     }
     /// fsync's answer after a flush that a snapshot's freeze held back (VS-2b CR 3).
     fn settle(&self) -> Result<(), DevError> {

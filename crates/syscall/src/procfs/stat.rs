@@ -1,6 +1,6 @@
-//! `/proc/<pid>/{stat,status,statm}` and their per-thread forms (linux-6.6/fs/proc/array.c `do_task_stat`
-//! :467, `proc_pid_status` :439 with `task_state`, `task_sig`, `task_cap`, `task_seccomp`,
-//! `task_cpus_allowed`, `task_context_switch_counts`; fs/proc/task_mmu.c `task_mem` :31, `task_statm` :88).
+//! `/proc/<pid>/{stat,status,statm}` and their per-thread forms (linux-7.3.1/fs/proc/array.c `do_task_stat`
+//! :466, `proc_pid_status` :438 with `task_state`, `task_sig`, `task_cap`, `task_seccomp` :332,
+//! `task_cpus_allowed`, `task_context_switch_counts`; fs/proc/task_mmu.c `task_mem` :37, `task_statm` :94).
 //! The process view (`whole`) sums CPU time over the group and shows the leader's state, signals and switches
 //! as Linux does; a thread view shows that thread.
 
@@ -261,7 +261,7 @@ pub(super) fn render_status(t: &Target, g: &Group, p: &Process, th: Option<&Thre
         let m = mem_of(p);
         let info = p.image_info.lock().clone();
         let kb = |b: u64| b / 1024;
-        // Counters (task_mem, linux-6.6/fs/proc/task_mmu.c:31): the peaks are read after the walk, so a
+        // Counters (task_mem, linux-7.3.1/fs/proc/task_mmu.c:37): the peaks are read after the walk, so a
         // mapping added in between may lift the current value above them; Linux's hiwater_* are maxima too.
         let st = p.mm.mem_stats();
         let vm = kb(m.total);
@@ -292,7 +292,7 @@ pub(super) fn render_status(t: &Target, g: &Group, p: &Process, th: Option<&Thre
     let bset = th.map_or(CAP_FULL, |t| t.prctl().cap_bset());
     let (prm, eff) = proc::cred::cap_sets(&k, bset);
     let nnp = th.is_some_and(|t| t.prctl().no_new_privs()) as u8;
-    // SX-1: `task_seccomp` (linux-6.6/fs/proc/array.c): the thread's mode and its filter count.
+    // SX-1: `task_seccomp` (linux-7.3.1/fs/proc/array.c:332): the thread's mode and its filter count.
     let (sc, scf) = th.map_or((0, 0), |t| (t.prctl().seccomp().mode(), t.prctl().seccomp().filter_count()));
     let _ = write!(
         s,
@@ -331,6 +331,6 @@ pub(super) fn render_statm(g: &Group, p: &Process) -> String {
     let st = p.mm.mem_stats();
     let info = p.image_info.lock().clone();
     let text = (info.end_code.next_multiple_of(4096).saturating_sub(info.start_code & !4095)) / 4096;
-    // shared = file + shmem pages (task_statm, linux-6.6/fs/proc/task_mmu.c:88).
+    // shared = file + shmem pages (task_statm, linux-7.3.1/fs/proc/task_mmu.c:94).
     format!("{} {} {} {} 0 {} 0\n", m.total / 4096, st.rss, st.file + st.shmem, text, (m.data + m.stack) / 4096)
 }

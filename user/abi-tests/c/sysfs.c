@@ -113,7 +113,7 @@ static void meminfo(void) {
         "KReclaimable", "Slab", "SReclaimable", "SUnreclaim", "KernelStack", "PageTables", "SecPageTables",
         "NFS_Unstable", "Bounce", "WritebackTmp", "CommitLimit", "Committed_AS", "VmallocTotal", "VmallocUsed",
         "VmallocChunk", "Percpu", "HardwareCorrupted", "AnonHugePages", "ShmemHugePages", "ShmemPmdMapped",
-        "FileHugePages", "FilePmdMapped", "CmaTotal", "CmaFree", "Unaccepted", "HugePages_Total", "HugePages_Free",
+        "FileHugePages", "FilePmdMapped", "CmaTotal", "CmaFree", "Unaccepted", "Balloon", "GPUActive", "GPUReclaim", "HugePages_Total", "HugePages_Free",
         "HugePages_Rsvd", "HugePages_Surp", "Hugepagesize", "Hugetlb", 0};
     const char *last = m;
     int order = 1, well = 1;
@@ -136,7 +136,7 @@ static void meminfo(void) {
                     well = 0;
         }
     }
-    yes("meminfo 6.6 keys in Linux order", order);
+    yes("meminfo 7.3 keys in Linux order", order);
     yes("meminfo kB lines padded as show_val_kb", well);
     unsigned long long tot = num_after(m, "MemTotal:"), fr = num_after(m, "MemFree:"), av = num_after(m, "MemAvailable:");
     yes("meminfo MemFree and MemAvailable within MemTotal", tot > 0 && fr <= tot && av <= tot);
@@ -346,8 +346,17 @@ static void cpus(void) {
     yes("present = possible", !strcmp(pr, po));
     yes("offline = possible - online", list_count(off, 4096) == np - n);
     printf("kernel_max = %sisolated empty: %s\n", km, strcmp(iso, "\n") ? "no" : "yes");
+    /* linux-7.3.1/drivers/base/cpu.c:513: enabled (every registered CPU), housekeeping and nohz_full (empty
+     * without isolcpus=/nohz_full= on the command line). */
+    char *en = text("/sys/devices/system/cpu/enabled"), *hk = text("/sys/devices/system/cpu/housekeeping");
+    char *nz = text("/sys/devices/system/cpu/nohz_full");
+    yes("enabled = present", !strcmp(en, pr));
+    printf("housekeeping empty: %s\nnohz_full empty: %s\n", strcmp(hk, "\n") ? "no" : "yes", strcmp(nz, "\n") ? "no" : "yes");
+    free(en);
+    free(hk);
+    free(nz);
     yes("kernel_max >= the highest possible CPU", strtol(km, 0, 10) >= np - 1);
-    static const char *top[] = {"online", "possible", "present", "offline", "kernel_max", "isolated", 0};
+    static const char *top[] = {"online", "possible", "present", "offline", "kernel_max", "enabled", "isolated", "housekeeping", "nohz_full", 0};
     for (int i = 0; top[i]; i++) {
         char p[80];
         snprintf(p, sizeof p, "%s/%s", d, top[i]);

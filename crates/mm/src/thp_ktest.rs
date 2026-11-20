@@ -68,10 +68,10 @@ const ROOM_BLOCKS: usize = 8;
 
 /// W35 MM-3: earlier tests (the reclaim and file system load tests) leave memory full of clean file cache, spread
 /// over the 2 MiB blocks. The tests that need huge pages ask direct compaction for `ROOM_BLOCKS` free blocks (it
-/// drops clean cache out of Movable pageblocks until MM-2 moves pages), up to 2 s, instead of dropping the whole
+/// moves pages out of Movable pageblocks, W35 MM-2), up to 2 s, instead of dropping the whole
 /// cache as before; the heap's empty slabs and what waits for a grace period go back first. The blocks are held
 /// while more are made, then freed for the test.
-fn room() {
+pub(crate) fn room() {
     mm_core::HEAP.shrink();
     mm_core::grace::expedite();
     let (Some(f), Some(b)) = (mm_core::frames(), mm_core::boot_buddy()) else { return };
@@ -79,14 +79,17 @@ fn room() {
     if held.try_reserve_exact(ROOM_BLOCKS).is_err() {
         return;
     }
+    let mut grace = mm_core::grace::WaitBudget::default();
     let t0 = time::now_ns();
     while held.len() < ROOM_BLOCKS && time::now_ns() - t0 < 2_000_000_000 {
         if let Some(p) = f.alloc_light(mm_core::HUGE_ORDER, mm_core::Zone::Normal, mm_core::Kind::Other) {
             held.push(p);
             continue;
         }
-        // Deferred after a failure, or nothing to clear right now: try again shortly.
-        if !b.compact_direct(mm_core::HUGE_ORDER) {
+        // Deferred after a failure, or nothing to clear right now: try again shortly. W35 MM-2: compaction keeps
+        // what it moves and needs free frames for that (Linux `compaction_suitable`); the allocator's own step
+        // (`reclaim_for_heap`: compaction, else clean cache back) gives it those, as Linux's slow path does.
+        if !b.compact_direct(mm_core::HUGE_ORDER) && !b.reclaim_for_heap(mm_core::HUGE_ORDER, &mut grace) {
             sched::sleep_ms(10);
         }
     }

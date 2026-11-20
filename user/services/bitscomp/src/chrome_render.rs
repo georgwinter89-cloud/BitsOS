@@ -124,7 +124,7 @@ impl App {
             .iter()
             .map(|r| {
                 let when = crate::status::when_text(&crate::status::tm_of(r.when, self.status.fixed), &now);
-                (crate::session::kind(&r.addr).to_string(), crate::suggest::short_name(&r.addr), when)
+                (crate::session::kind(&r.addr).to_string(), self.recent_name(&r.addr), when)
             })
             .collect();
         let hover = match self.desk.hover {
@@ -162,7 +162,16 @@ pub fn over<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompElement
     let (alpha, _) = app.anim.chrome(now, &t);
     let tg = app.theme_gen;
     let ch = app.chrome();
-    let mut out = Vec::new();
+    // A (12.11.): the question about closing a workspace lies over everything else.
+    let mut out = app.ws_ask_elements(renderer);
+    // PE-1: a program's error card.
+    out.extend(app.prog_note_elements(renderer));
+    // C (12.11.): the list of minimised windows behind "+N", over the stage.
+    out.extend(app.min_list_elements(renderer));
+    // DB4: the habit hint with its "Rückgängig".
+    out.extend(app.habit_hint_elements(renderer));
+    // VB-1: the confirmation card.
+    out.extend(app.confirm_elements(renderer));
     let put = |renderer: &mut R, buf: &MemoryRenderBuffer, r: Rect, dy: f32, out: &mut Vec<CompElement<R>>| {
         put(renderer, buf, r, dy, s, alpha, out)
     };
@@ -205,7 +214,7 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
     let (alpha, glide) = app.anim.chrome(now, &t);
     let tg = app.theme_gen;
     let ch = app.chrome();
-    let hover = match app.desk.hover {
+    let hover = match app.bar_hover() {
         Some(Spot::Chrome(p)) => Some(p),
         _ => None,
     };
@@ -229,7 +238,7 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
     };
     // The busy ring's step: the same for both rings; asks for the next step's frame only while it moves.
     let ring = app.desk.ring;
-    let step = app.status.ring.shown(crate::ring::sprite_moves(ring, &t), now, &t);
+    let step = app.status.ring.shown(crate::ring::sprite_moves(ring), now, &t);
     let rl = RingLook { rect: ch.ring, ring, step, size: draw::TOP_RING, theme: tg };
     out.extend(fx::ring(app, "ring-top", ch.ring, draw::TOP_RING, ring, -glide).map(CompElement::from));
     let rbuf = cached(&mut app.images.top_ring, &rl, |l| draw::ring_sprite(l, &t));
@@ -258,7 +267,12 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
         let rl = RingLook { rect: rr, ring, step, size: draw::SIDE_RING, theme: tg };
         let rbuf = cached(&mut app.images.side_ring, &rl, |l| draw::ring_sprite(l, &t));
         put(renderer, rbuf, rr, 0.0, &mut out);
-        let look = SideLook { rect: r, theme: tg, name: app.desk.claude_name.clone(), ring, solid: !ch.side_docked };
+        let conv = app.assist_look();
+        let a = &app.assist;
+        let (name, word) = if conv.is_some() { (a.name.clone(), a.phase.word()) } else { (app.desk.claude_name.clone(), ring.word()) };
+        let menu = conv.as_ref().and_then(|_| app.assist_menu_look());
+        let a = &app.assist;
+        let look = SideLook { rect: r, theme: tg, name, ring, solid: !ch.side_docked, word, notice: a.notice.clone(), tool: a.tool.clone(), conv, menu };
         let buf = cached(&mut app.images.side, &look, |l| draw::side(l, &t));
         put(renderer, buf, r, 0.0, &mut out);
         out.extend(fx::bar(app, "bar-side", r).map(CompElement::from));
@@ -274,7 +288,9 @@ pub fn elements<R: CompRenderer>(app: &mut App, renderer: &mut R) -> Vec<CompEle
         .collect();
     if ch.list_shown {
         let minimized = app.ws.minimized.iter().map(|m| crate::minimize::label(&m.win)).collect();
-        let look = ListLook { chrome: ch.clone(), theme: tg, entries, minimized, active: app.desk.active, hover };
+        let closable = (0..app.ws_count()).map(|i| app.ws_closable(i)).collect();
+        let more_open = app.desk.min_list.open;
+        let look = ListLook { chrome: ch.clone(), theme: tg, entries, minimized, active: app.desk.active, hover, closable, more_open, home_lit: app.start_shown() };
         let buf = cached(&mut app.images.list, &look, |l| draw::list(l, &t));
         put(renderer, buf, ch.list, 0.0, &mut out);
         out.extend(fx::bar(app, "bar-list", ch.list).map(CompElement::from));

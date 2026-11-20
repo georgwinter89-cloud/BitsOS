@@ -10,7 +10,7 @@
 # Needs the musl sysroot for the image's /bin/sh, the shell v2_radv.py runs everything through: V2_SYSROOT=<dir> or
 # user/sysroot/out/sysroot, built here when it is missing. Anything missing: RED, naming it, before the image is built.
 # No xtask change: the tree and the probe go onto the stick image here, the FAT image is made again larger from
-# xtask's ESP tree (as host/tests/gm/10-mesa.sh).
+# xtask's ESP tree.
 set -euo pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 ROOT=$PWD

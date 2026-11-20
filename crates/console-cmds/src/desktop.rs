@@ -1,24 +1,31 @@
-//! DS-4: the desktop starts by itself after boot (CONFIG `desktop=`, resolved by `console::bootscreen`). The
-//! `desktop` thread waits for init (pid 1 alive and user 1000's runtime directory made), then starts the desktop
-//! program the way init's console shell starts it when Georg types `bitscomp` (root, the shell's environment; the
-//! program gives up root itself). The start counts as done when the program takes the screen (`vt::graphics`);
-//! a program that ends before is a failed start. After `ATTEMPTS` failed starts (1 s, then 2 s apart) the console
-//! shows the text console with a message; typing `bitscomp` in the shell still works, `desktop start` on the
-//! monitor tries again. A desktop that ends after it took the screen is not restarted here (also when it ends
-//! within the same poll): the console takes the screen back. The decisions are pure functions (`init_wait`,
-//! `poll`, `next`) so host tests cover them without QEMU. GX-8c: a driver that comes up at boot holds the start
-//! (`console::bootscreen::hold_desktop`, CONFIG `gpu=on`): after init's wait, and never past the hold's own bound.
-//! WY-21: a child of the started program that takes the screen counts as the program (bitscomp's gpu build).
+//! DS-4: the desktop starts by itself after boot, on every machine but the Gaming-PC (`console::bootscreen::resolve`).
+//! The `desktop` thread waits for init (pid 1 alive and user 1000's runtime directory made; a boot without init, a
+//! test boot, has no desktop), then for the GPU's start (GX-8c, `console::bootscreen::desktop_gpu`, told before init
+//! starts, never past the hold's own bound). Without a GPU (the bring-up failed or passed its bound, or the machine has
+//! none, as QEMU) there is no desktop: the text console says so in one line; that is the hardware, not a fallback.
+//! Else it starts the desktop program the way init's console shell starts it when Georg types `bitscomp` (root, the
+//! shell's environment; the program gives up root itself). The start counts as done when the program takes the screen
+//! (`vt::graphics`); a program that ends before is a failed start. After `ATTEMPTS` failed starts (1 s, then 2 s apart)
+//! the console shows the text console with a message; typing `bitscomp` in the shell still works, `desktop start` on
+//! the monitor tries again (Georg's own start, which does not wait for the GPU). A desktop that ends after it took the
+//! screen is not restarted here (also when it ends within the same poll): the console takes the screen back. The
+//! decisions are pure functions (`init_wait`, `poll`, `next`, `hold_wait`) so host tests cover them without QEMU.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use console::bootscreen::DesktopGpu;
 use console::bootsteps::Init;
 use console::monitor::Ctx;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub(crate) const ATTEMPTS: u32 = 3;
 const POLL_NS: u64 = 100_000_000;
+/// GS-1: the waits for init and for the GPU's hold look this often: the desktop's start lies behind them, and a
+/// 100 ms poll cost up to 100 ms each for nothing. A look is an atomic load and a path lookup.
+const START_POLL_NS: u64 = 10_000_000;
+/// How long the start waits for the GPU's start to say anything at all (it says so before init starts).
+pub(crate) const WAIT_UNTOLD_NS: u64 = 30_000_000_000;
 /// How long the start waits for init and its runtime directory.
 pub(crate) const WAIT_INIT_NS: u64 = 120_000_000_000;
 /// A running desktop that has not taken the screen by then: the text console comes back (it keeps running).
@@ -36,18 +43,19 @@ static FAILED: AtomicU32 = AtomicU32::new(0);
 
 fn start() -> Result<(), &'static str> {
     if console::bootscreen::desktop_on() {
-        spawn_start();
+        spawn_start(true);
     }
     Ok(())
 }
 kreg::initcall!(kreg::Level::Late, "console-desktop", start);
 
-/// Starts the `desktop` thread unless one runs; false if it could not start.
-fn spawn_start() -> bool {
+/// Starts the `desktop` thread unless one runs; false if it could not start. `boot`: the start after boot, which
+/// waits for the GPU's bring-up.
+fn spawn_start(boot: bool) -> bool {
     if RUNNING.swap(true, Ordering::AcqRel) {
         return true;
     }
-    match sched::spawn("desktop", sched::Class::Normal, thread) {
+    match sched::spawn("desktop", sched::Class::Normal, move || thread(boot)) {
         Ok(_) => true,
         Err(e) => {
             RUNNING.store(false, Ordering::Release);
@@ -77,20 +85,27 @@ pub(crate) fn init_wait(state: Init, ready: bool, waited_ns: u64) -> InitWait {
     }
 }
 
-/// GX-8c: the look at the hold (`until`: `console::bootscreen::desktop_hold`).
+/// GX-8c: the look at the GPU's start (`console::bootscreen::desktop_gpu`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Hold {
+    /// The GPU is up: the desktop starts.
     Free,
     Wait,
-    /// The bound passed with the driver still at work: the desktop goes on without it.
+    /// No GPU: no desktop, the text console with the GPU start's line.
+    NoGpu,
+    /// The bound passed with the driver still at work (or nothing was said at all): no desktop either.
     Over,
 }
 
-pub(crate) fn hold_wait(until: Option<u64>, now_ns: u64) -> Hold {
-    match until {
-        None => Hold::Free,
-        Some(t) if now_ns > t => Hold::Over,
-        Some(_) => Hold::Wait,
+/// `waited_ns`: since the wait began.
+pub(crate) fn hold_wait(gpu: DesktopGpu, now_ns: u64, waited_ns: u64) -> Hold {
+    match gpu {
+        DesktopGpu::Up => Hold::Free,
+        DesktopGpu::None => Hold::NoGpu,
+        DesktopGpu::Held(t) if now_ns > t => Hold::Over,
+        DesktopGpu::Held(_) => Hold::Wait,
+        DesktopGpu::Untold if waited_ns > WAIT_UNTOLD_NS => Hold::Over,
+        DesktopGpu::Untold => Hold::Wait,
     }
 }
 
@@ -99,7 +114,7 @@ pub(crate) fn hold_wait(until: Option<u64>, now_ns: u64) -> Hold {
 pub(crate) enum Outcome {
     /// The program (pid) has the screen.
     Up(u32),
-    /// It runs but has not taken the screen within `TAKE_SCREEN_NS`.
+    /// It runs but has not taken the screen within its bound (`TAKE_SCREEN_NS`).
     Slow(u32),
     /// It could not start, or ended before it took the screen (the reason word).
     Failed(&'static str),
@@ -109,12 +124,12 @@ pub(crate) enum Outcome {
 
 /// One look at a started program: `ended` its exit reason once it ended, `has_screen` it is the screen's owner
 /// now, `took` it took the screen at some point. None: keep waiting.
-pub(crate) fn poll(pid: u32, ended: Option<&'static str>, has_screen: bool, took: bool, waited_ns: u64) -> Option<Outcome> {
+pub(crate) fn poll(pid: u32, ended: Option<&'static str>, has_screen: bool, took: bool, waited_ns: u64, take_ns: u64) -> Option<Outcome> {
     match ended {
         Some(r) if took || has_screen => Some(Outcome::TookThenEnded(r)),
         Some(r) => Some(Outcome::Failed(r)),
         None if has_screen => Some(Outcome::Up(pid)),
-        None if waited_ns > TAKE_SCREEN_NS => Some(Outcome::Slow(pid)),
+        None if waited_ns > take_ns => Some(Outcome::Slow(pid)),
         None => None,
     }
 }
@@ -142,12 +157,12 @@ pub(crate) fn next(attempt: u32, o: Outcome) -> Next {
     }
 }
 
-fn thread() {
-    run();
+fn thread(boot: bool) {
+    run(boot);
     RUNNING.store(false, Ordering::Release);
 }
 
-fn run() {
+fn run(boot: bool) {
     let line = console::bootscreen::desktop_program();
     let argv: Vec<&str> = line.split_whitespace().collect();
     let Some(&program) = argv.first() else { return };
@@ -156,10 +171,10 @@ fn run() {
     loop {
         match init_wait(console::bootscreen::init_state(), init_ready(), time::now_ns().saturating_sub(t0)) {
             InitWait::Ready => break,
-            InitWait::Wait => sched::sleep_ns(POLL_NS),
+            InitWait::Wait => sched::sleep_ns(START_POLL_NS),
             InitWait::NoInit => {
-                klog::event!(Warn, "console", "desktop.no_init"; "init is off or gave up: no desktop, the text console stays");
-                console::bootscreen::fallback("no-init", "\nOhne init startet keine Arbeitsfläche: Textkonsole.\n");
+                klog::event!(Info, "console", "desktop.no_init"; "a boot without init (a test boot) has no desktop: the text console stays");
+                console::bootscreen::end_quietly("no-init");
                 return;
             }
             InitWait::Timeout => {
@@ -169,11 +184,15 @@ fn run() {
             }
         }
     }
-    wait_hold();
+    if boot && !wait_hold() {
+        return;
+    }
     for attempt in 1.. {
-        klog::event!(Info, "console", "desktop.start", program = program, attempt = attempt);
         let t = time::now_ns();
-        let o = start_once(&argv);
+        // GS-1: `at_ms` on the monotonic clock, for the desk's start table.
+        klog::event!(Info, "console", "desktop.start", program = program, attempt = attempt, at_ms = t / 1_000_000);
+        let take_ns = TAKE_SCREEN_NS;
+        let o = start_once(&argv, take_ns);
         if let Outcome::Failed(reason) = o {
             FAILED.fetch_add(1, Ordering::AcqRel);
             klog::event!(Warn, "console", "desktop.failed", program = program, attempt = attempt, reason = reason);
@@ -185,7 +204,7 @@ fn run() {
                 return;
             }
             Next::Slow(pid) => {
-                klog::event!(Warn, "console", "desktop.slow", program = program, pid = pid, waited_s = TAKE_SCREEN_NS / 1_000_000_000;
+                klog::event!(Warn, "console", "desktop.slow", program = program, pid = pid, waited_s = take_ns / 1_000_000_000;
                     "the desktop runs but has not taken the screen: text console");
                 console::bootscreen::fallback("desktop-slow", &format!("\n{program} läuft (pid {pid}), hat den Bildschirm aber nicht übernommen.\n"));
                 return;
@@ -211,29 +230,39 @@ fn run() {
     }
 }
 
-/// GX-8c: until the driver that holds the start let go, or its bound passed.
-fn wait_hold() {
+/// GX-8c: until the GPU is up (true: the desktop starts), or there is none (false: the text console says so).
+fn wait_hold() -> bool {
     let t0 = time::now_ns();
     let mut held = false;
     loop {
-        match hold_wait(console::bootscreen::desktop_hold(), time::now_ns()) {
+        let now = time::now_ns();
+        let waited_ms = now.saturating_sub(t0) / 1_000_000;
+        match hold_wait(console::bootscreen::desktop_gpu(), now, now.saturating_sub(t0)) {
             Hold::Free => {
                 if held {
-                    klog::event!(Info, "console", "desktop.hold_end", waited_ms = time::now_ns().saturating_sub(t0) / 1_000_000);
+                    klog::event!(Info, "console", "desktop.hold_end", waited_ms = waited_ms);
                 }
-                return;
+                return true;
             }
             Hold::Wait => {
                 if !held {
-                    klog::event!(Info, "console", "desktop.held"; "a driver comes up first, within its bound");
+                    klog::event!(Info, "console", "desktop.held"; "the GPU comes up first, within its bound");
                 }
                 held = true;
-                sched::sleep_ns(POLL_NS);
+                sched::sleep_ns(START_POLL_NS);
+            }
+            Hold::NoGpu => {
+                let line = console::bootscreen::no_gpu_line();
+                klog::event!(Error, "console", "desktop.no_gpu", reason = "gpu", waited_ms = waited_ms, line = line.as_str(); "no desktop: the text console stays");
+                console::bootscreen::fallback("desktop-no-gpu", &format!("\n{line}\n"));
+                return false;
             }
             Hold::Over => {
-                klog::event!(Warn, "console", "desktop.hold_over", waited_ms = time::now_ns().saturating_sub(t0) / 1_000_000; "the driver is still at work: the desktop starts without it");
-                console::bootscreen::release_desktop();
-                return;
+                let line = String::from("Die Grafik ist nicht rechtzeitig hochgekommen: keine Arbeitsfläche, Textkonsole.");
+                klog::event!(Error, "console", "desktop.no_gpu", reason = "late", waited_ms = waited_ms, line = line.as_str(); "the GPU passed its bound: no desktop, the text console stays");
+                console::bootscreen::fallback("desktop-no-gpu", &format!("\n{line}\n"));
+                console::bootscreen::desktop_no_gpu(line);
+                return false;
             }
         }
     }
@@ -245,16 +274,16 @@ fn init_ready() -> bool {
 }
 
 /// One start of `argv` (argv[0] the program's path), watched until `poll` decides.
-fn start_once(argv: &[&str]) -> Outcome {
+fn start_once(argv: &[&str], take_ns: u64) -> Outcome {
     match spawn_once(argv) {
-        Ok(p) => watch(&p),
+        Ok(p) => watch(&p, take_ns),
         Err(reason) => Outcome::Failed(reason),
     }
 }
 
 fn spawn_once(argv: &[&str]) -> Result<alloc::sync::Arc<proc::Process>, &'static str> {
     let program = argv[0];
-    let subject = policy::Subject { program: crate::CONSOLE_PROGRAM, pid: 0, uid: 0 };
+    let subject = policy::Subject { program: crate::CONSOLE_PROGRAM, pid: 0, uid: 0, tree: 0 };
     if policy::check(&subject, &policy::Access::Path { path: program, write: false, create: false }).is_err() {
         return Err("refused");
     }
@@ -277,7 +306,7 @@ fn spawn_once(argv: &[&str]) -> Result<alloc::sync::Arc<proc::Process>, &'static
     Ok(p)
 }
 
-fn watch(p: &proc::Process) -> Outcome {
+fn watch(p: &proc::Process, take_ns: u64) -> Outcome {
     let t = time::now_ns();
     loop {
         let ended = p.wait(Some(POLL_NS)).map(|_| match p.status() {
@@ -286,17 +315,15 @@ fn watch(p: &proc::Process) -> Outcome {
             _ => "exit_code",
         });
         let has = holds_screen(p.pid);
-        if let Some(o) = poll(p.pid, ended, has, console::vt::took_screen(p.pid), time::now_ns().saturating_sub(t)) {
+        if let Some(o) = poll(p.pid, ended, has, console::vt::took_screen(p.pid), time::now_ns().saturating_sub(t), take_ns) {
             return o;
         }
     }
 }
 
-/// Whether the started program has the screen: itself, or (WY-21) its child: bitscomp's rescue build starts the gpu
-/// build as its child and waits beside it, to take the screen back when the GPU is lost.
+/// Whether the started program has the screen.
 fn holds_screen(pid: u32) -> bool {
-    let owner = console::vt::kd_owner();
-    owner != 0 && (owner == pid || proc::find(owner).is_some_and(|o| o.ppid() == pid))
+    pid != 0 && console::vt::kd_owner() == pid
 }
 
 fn desktop_cmd(c: &mut Ctx) -> Result<(), String> {
@@ -320,7 +347,7 @@ fn desktop_cmd(c: &mut Ctx) -> Result<(), String> {
             if pid != 0 && holds_screen(pid) && console::jobs::procs().alive(pid) {
                 return Err(format!("desktop: runs already (pid {pid}) and has the screen"));
             }
-            if spawn_start() {
+            if spawn_start(false) {
                 c.println("desktop: starting");
                 Ok(())
             } else {
@@ -330,4 +357,4 @@ fn desktop_cmd(c: &mut Ctx) -> Result<(), String> {
         Some(_) => Err(String::from("usage: desktop [status|start]")),
     }
 }
-console::command!(name: "desktop", args: "[status|start]", help: "the desktop the console starts after boot (CONFIG desktop=)", physical_only: false, run: desktop_cmd);
+console::command!(name: "desktop", args: "[status|start]", help: "the desktop the console starts after boot", physical_only: false, run: desktop_cmd);

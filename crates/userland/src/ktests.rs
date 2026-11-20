@@ -19,6 +19,7 @@ const SEC: u64 = 1_000_000_000;
 const MS: u64 = 1_000_000;
 const SIGKILL: u32 = uapi::ab::signal::SIGKILL;
 
+mod atspi;
 mod bb;
 mod brave;
 mod cobalt;

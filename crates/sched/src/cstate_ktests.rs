@@ -14,7 +14,7 @@ type R = ktest::TestResult;
 
 ktest!("sc.idle.fake_cst", Safe, fake_cst);
 ktest!("sc.idle.live_plan", Safe, live_plan);
-ktest!("sc.idle.config", Safe, config);
+ktest!("sc.idle.modes", Safe, modes);
 ktest!("sc.idle.next_deadline", Safe, next_deadline);
 
 const PM1A: u16 = 0x800;
@@ -84,38 +84,21 @@ impl Drop for ModeBack {
     }
 }
 
-/// CONFIG `idle=`: c1 switches the choice off (no port on the fake Mini-PC plan), deep (or nothing) back on,
-/// an unknown value is a Warn and keeps deep.
-fn config() -> R {
+/// The modes on the fake Mini-PC plan for a quiet CPU: C1 (the measuring build's) touches no port, the normal mode
+/// goes to C3; C1 set on this CPU keeps the idle loop working (a short sleep wakes again).
+fn modes() -> R {
     let _back = ModeBack(cstate::mode());
-    let get = |v: &'static str| move |k: &str| (k == "idle").then(|| String::from(v));
-    let since = klog::next_seq();
-    cstate::configure(&get("foo"));
-    let foo = cstate::mode();
-    let warned = klog::read_since(since, 4096)
-        .iter()
-        .any(|r| r.level == klog::Level::Warn && r.name == "config.unknown" && r.text.contains("foo"));
-    cstate::configure(&get("c1"));
-    let c1 = cstate::mode();
-    cstate::configure(&get("deep"));
-    let deep = cstate::mode();
-    cstate::configure(&|_: &str| None);
-    let none = cstate::mode();
-    kassert!(foo == Mode::Auto && warned, "idle=foo: mode {foo:?}, warned {warned}");
-    kassert!(c1 == Mode::C1 && deep == Mode::Auto && none == Mode::Auto, "c1 {c1:?} deep {deep:?} none {none:?}");
-    // What the modes do on the fake Mini-PC plan for a quiet CPU: c1 touches no port, deep goes to C3.
     let table = build::table(&build::name(&build::MINIPC));
     let states = acpi::cst::find(&table).map(|c| c.states).unwrap_or_default();
     let fw = Firmware { states: &states, pm_timer: Some(0x808), pm1_status: [Some(PM1A), None] };
     let p = cstate::plan(&CpuIdle::ZEN4, Some(&fw), &mut guard);
     let hw = Recorder::default();
-    let got = cstate::step(&hw, Some(&p), c1, false, || None, u64::MAX, cstate::DEFAULT_RESIDENCY_FACTOR);
+    let got = cstate::step(&hw, Some(&p), Mode::C1, false, || None, u64::MAX, cstate::DEFAULT_RESIDENCY_FACTOR);
     let ops = hw.take();
-    kassert!(got == Entered::C1 && ops == vec![Op::Halt], "idle=c1: {got:?} {ops:?}");
-    let got = cstate::step(&hw, Some(&p), deep, false, || None, u64::MAX, cstate::DEFAULT_RESIDENCY_FACTOR);
+    kassert!(got == Entered::C1 && ops == vec![Op::Halt], "C1: {got:?} {ops:?}");
+    let got = cstate::step(&hw, Some(&p), Mode::Auto, false, || None, u64::MAX, cstate::DEFAULT_RESIDENCY_FACTOR);
     let ops = hw.take();
-    kassert!(got == Entered::Deep(1) && ops == vec![Op::In16(PM1A), Op::In8(0x415), Op::Sti], "idle=deep: {got:?} {ops:?}");
-    // C1 mode on this CPU: the idle loop keeps working (a short sleep wakes again).
+    kassert!(got == Entered::Deep(1) && ops == vec![Op::In16(PM1A), Op::In8(0x415), Op::Sti], "auto: {got:?} {ops:?}");
     cstate::set_mode(Mode::C1);
     crate::sleep_ns(2_000_000);
     Ok(())

@@ -4,6 +4,7 @@
 mod common;
 use common::*;
 use settingsd::builtin;
+use settingsd::change::Who;
 use settingsd::guard;
 use settingsd::json::Json;
 use settingsd::key::{Applier, KeyDef};
@@ -17,6 +18,8 @@ fn sample(d: &KeyDef) -> Value {
         (Type::Int { min, word: Some(_), .. }, Value::Text(_)) => Value::Int(*min),
         (Type::Choice { values: c, .. }, v) => Value::Text(c.iter().find(|x| Value::Text((*x).clone()) != *v).unwrap().clone()),
         (Type::Color, _) => Value::Text("#123abc".into()),
+        // The provider list and the roles take provider names only (providers.rs).
+        (Type::Text { .. }, _) if d.name == "ai.providers" || d.name.starts_with("ai.role.") => Value::Text("probe".into()),
         (Type::Text { .. }, _) => Value::Text("Test Font".into()),
         (Type::LogSpec, _) => Value::Text("warn,net=debug".into()),
         other => panic!("no sample for {other:?}"),
@@ -38,12 +41,10 @@ fn builtins_are_valid_and_named_for_wy5() {
         "theme.font.mono",
         "theme.scale",
         "theme.motion",
-        "theme.effects",
         "theme.dark.bg",
         "theme.light.bg",
         "kernel.loglevel",
         "kernel.console_log",
-        "kernel.idle",
         "kernel.snd_output",
         "kernel.preload.enabled",
         "kernel.preload.max_mb",
@@ -81,7 +82,9 @@ fn every_key_set_apply_undo() {
     let (rx, _) = r.watch("");
     for d in builtin::all() {
         let v = sample(&d);
-        let a = r.set(&d.name, &v.to_json(), &WHO).unwrap_or_else(|e| panic!("{}: {e:?}", d.name));
+        // A change that loosens an assistant's level, and its undo, is Georg's own yes (leash.rs).
+        let who = if settingsd::leash::leashed(&d.name) { Who { confirmed: true, ..WHO } } else { WHO };
+        let a = r.set(&d.name, &v.to_json(), &who).unwrap_or_else(|e| panic!("{}: {e:?}", d.name));
         assert_eq!(a.get("changed"), Some(&Json::Bool(true)), "{}", d.name);
         assert_eq!(value(&r, &d.name), v.to_json(), "{}", d.name);
         assert_eq!(a.str("stored"), Some("stick"), "{}", d.name);
@@ -107,7 +110,7 @@ fn every_key_set_apply_undo() {
             }
             Applier::Settingsd => {}
         }
-        let u = r.undo(1, &WHO).unwrap();
+        let u = r.undo(1, &who).unwrap();
         assert_eq!(u.get("undone").map(|x| matches!(x, Json::Arr(a) if a.len() == 1)), Some(true));
         assert_eq!(value(&r, &d.name), d.default.to_json(), "{} after undo", d.name);
         if let Applier::Kernel { config, sys: Some(s) } = &d.applier {
@@ -171,7 +174,7 @@ fn r8_switches_are_never_keys() {
     let (mut r, _) = env.open();
     for k in ["nvme_write", "nvme_data", "stick_write", "usb_msd_write", "kernel.stick_write", "net.nvme_write", "disk.nvme_data", "x.Usb_Msd_Write"] {
         assert_eq!(r.set(k, &s("on"), &WHO).unwrap_err().code, "refused_r8", "{k}");
-        assert_eq!(r.get(k, None).unwrap_err().code, "refused_r8", "{k}");
+        assert_eq!(r.get(k, None, &settingsd::peer::INSIDE).unwrap_err().code, "refused_r8", "{k}");
     }
     let reg = settingsd::json::parse(
         r#"{"key":"disk.nvme_write","schema":{"type":"bool"},"default":false,"text":{"de":"x","en":"x"}}"#,
@@ -216,6 +219,22 @@ fn config_edit_rules() {
     assert_eq!(guard::config_guard(b"", b"mcp_confirmer=test\n").unwrap_err(), "mcp_confirmer");
     assert!(guard::config_guard(b"mcp_confirmer=test\nmcp=service\n", b"mcp=service\n").is_ok());
     assert!(guard::edit_config("mcp=service\n", "mcp", Some("kernel")).is_err());
+    // GP-GUARD CR11: the boot partition's line and the Gaming-PC's tier lines are guarded as fs-fat guards them.
+    for k in ["nvme_boot", "gp_net", "gp_stick", "gp_nvme"] {
+        assert_eq!(guard::config_guard(b"", format!("{k}=on\n").as_bytes()).unwrap_err(), k);
+        assert_eq!(guard::config_guard(format!("{k}=off\n").as_bytes(), format!("{k}=on\n").as_bytes()).unwrap_err(), k);
+        assert!(guard::config_guard(format!("{k}=on\n").as_bytes(), b"").is_ok(), "{k}: dropping a line is allowed");
+        assert!(guard::edit_config("", k, Some("on")).is_err(), "{k}");
+    }
+}
+
+/// GP-GUARD CR11: settingsd's copy names every key fs-fat guards (fs-fat has the last word; settingsd refuses first).
+#[test]
+fn the_guarded_list_is_fs_fats() {
+    let src = include_str!("../../../../crates/fs-fat/src/protect.rs");
+    let line = src.lines().find(|l| l.starts_with("pub const GUARDED_KEYS")).expect("fs-fat's GUARDED_KEYS");
+    let theirs: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+    assert_eq!(theirs, guard::GUARDED);
 }
 
 #[test]
@@ -236,7 +255,7 @@ fn kernel_secrets_are_never_keys() {
     let (mut r, _) = env.open();
     for k in ["kernel.token", "kernel.wlan_psk", "kernel.claude_api_key", "token", "x.wlan_psk"] {
         assert_eq!(r.set(k, &Json::from("x"), &WHO).unwrap_err().code, "refused_r8", "{k}");
-        assert_eq!(r.get(k, Some("settingsd")).unwrap_err().code, "refused_r8", "{k}");
+        assert_eq!(r.get(k, Some("settingsd"), &settingsd::peer::INSIDE).unwrap_err().code, "refused_r8", "{k}");
         if !k.contains('.') {
             continue; // not a key name at all
         }

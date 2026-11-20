@@ -113,6 +113,10 @@ pub struct Group {
     /// SC-6 (AB-5 wiring): CPU time of the threads that ended and of the children collected by wait (Linux
     /// `signal_struct` utime/stime, cutime/cstime); live threads are read from `sched::cputime`.
     pub cpu: sched::cputime::ProcessTimes,
+    /// SYS-K: the I/O accounting of its ended threads and its collected children (Linux `signal->ioac`).
+    pub(crate) io_ended: sched::ioac::IoAcct,
+    /// SYS-K: what `io_counts` reported last (they never go back).
+    io_seen: sched::ioac::IoAcct,
     /// AB-5 `PR_SET_CHILD_SUBREAPER` (Linux `signal->is_child_subreaper`): orphaned descendants come here instead
     /// of to init. Not inherited by fork, kept across execve.
     child_subreaper: AtomicBool,
@@ -126,6 +130,15 @@ pub struct Group {
     pub(crate) maxrss: AtomicU64,
     /// AB-7c: the largest peak of the children collected by wait (Linux `signal->cmaxrss`, wait_task_zombie).
     pub(crate) cmaxrss: AtomicU64,
+    /// L7-PROC: clone3's CLONE_AUTOREAP (Linux `signal->autoreap`): reaped at its end without a signal to the
+    /// parent; kept across execve.
+    pub(crate) autoreap: AtomicBool,
+    /// L7-PROC: the pidfs inode number of the leader's pid (0 until the first pidfd asks; `pidfd::ino_of`).
+    pub(crate) pidfs_ino: AtomicU64,
+    /// EINS-C (K5): the assistant tree (`tree.rs`), set once by an entry or at fork, kept across execve.
+    pub(crate) tree: ksync::Once<Arc<policy::tree::Tree>>,
+    /// EINS-C: the chat label a tree process gave itself; fork and execve keep it.
+    pub(crate) chat: SpinLock<Option<Arc<str>>>,
 }
 
 impl Group {
@@ -168,11 +181,17 @@ impl Group {
             first_kthread: AtomicU64::new(0),
             image_ref: SpinLock::named("proc.gen", Weak::new()),
             cpu: sched::cputime::ProcessTimes::new(),
+            io_ended: sched::ioac::IoAcct::new(),
+            io_seen: sched::ioac::IoAcct::new(),
             child_subreaper: AtomicBool::new(false),
             timers_listed: AtomicBool::new(false),
             oom: AtomicU64::new(0),
             maxrss: AtomicU64::new(0),
             cmaxrss: AtomicU64::new(0),
+            autoreap: AtomicBool::new(false),
+            pidfs_ino: AtomicU64::new(0),
+            tree: ksync::Once::new(),
+            chat: SpinLock::named("proc.chat", None),
         })
     }
 
@@ -362,6 +381,17 @@ impl Group {
             }
         }
         self.cpu.monotonic(t)
+    }
+    /// SYS-K: the group's I/O accounting (Linux `do_io_accounting` with `whole`): its ended threads and collected
+    /// children, and the live threads.
+    ///
+    /// Consistency as `cpu_times`: an ending thread leaves `threads` before its counts reach `io_ended`
+    /// (`exit::thread_ends`), and the tally is read before the list, so a thread is never counted twice; one that
+    /// ends in between is missed by this read, which `io_seen` hides (Linux reads both under `stats_lock`).
+    pub fn io_counts(&self) -> sched::ioac::IoCounts {
+        let ended = self.io_ended.counts();
+        let live = self.threads().iter().filter_map(|th| sched::ioac::of_thread(th.kthread())).fold(Default::default(), sched::ioac::IoCounts::plus);
+        self.io_seen.raise_to(ended.plus(live))
     }
     /// All CPU time of the group in ns (user + system).
     pub fn cpu_ns(&self) -> u64 {

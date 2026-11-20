@@ -1,5 +1,5 @@
 //! AB-6 fixer: the senders of SIGALRM, SIGVTALRM, SIGPROF and SI_TIMER signals — setitimer/getitimer/alarm
-//! (linux-6.6/kernel/time/itimer.c) and POSIX timers (kernel/time/posix-timers.c, posix-cpu-timers.c). The
+//! (linux-7.3.1/kernel/time/itimer.c) and POSIX timers (kernel/time/posix-timers.c, posix-cpu-timers.c). The
 //! timers' state is part of the group's signal state (`signal::Timers`, under `proc.signals`, where Linux keeps
 //! it under the siglock); this file is the service that fires them and the group's calls the syscall layer uses.
 //!
@@ -71,7 +71,7 @@ fn service() {
         let gen0 = GEN.load(Ordering::SeqCst);
         PASSES.inc();
         // AB-14: the vDSO's page follows a rate change or a new wall time within a second (until the time
-        // crate publishes itself, change request in plan/notes/ab-AB-14.md).
+        // crate publishes itself).
         crate::vdso::refresh();
         let groups: Vec<Arc<Group>> = ARMED.lock().iter().filter_map(Weak::upgrade).collect();
         let mut wake_at = time::now_ns().saturating_add(MAX_SLEEP_NS);

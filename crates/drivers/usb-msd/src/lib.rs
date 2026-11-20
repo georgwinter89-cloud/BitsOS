@@ -19,7 +19,7 @@
 //! R8 (FS-6): every disk is registered with the block layer (`block::register`, kind Usb), whose write-refusal
 //! hook decides: the boot stick only with `stick_write=on`, other USB disks only with `usb_msd_write=on` (a test
 //! switch), never a disk with a Windows or EFI partition. With both switches off the units refuse writes
-//! themselves too (`block::usb_writes_possible`). CONFIG `usb_msd_skip=on` keeps the driver off every device
+//! themselves too (`block::usb_writes_possible`). CONFIG `ktest_usb_msd_skip=on` keeps the driver off every device
 //! (scenario `host/tests/us/40-xfer.sh` needs the sticks unbound for US-3's raw transfer tests).
 #![no_std]
 #![forbid(unsafe_code)]
@@ -99,6 +99,10 @@ pub fn scanning() -> usize {
     SCANNING.load(Ordering::Acquire)
 }
 
+fn scan_running() -> bool {
+    scanning() > 0
+}
+
 /// The attached devices (also those whose scan still runs), for tests and tools.
 pub fn storages() -> Vec<Arc<Storage<UsbLink>>> {
     ATTACHED.lock().iter().map(|a| a.storage.clone()).collect()
@@ -122,8 +126,8 @@ fn bulk_endpoints(f: &Interface) -> Option<(u8, u8)> {
 }
 
 fn probe(dev: &Arc<Device>, f: &Interface) -> Result<(), String> {
-    if pci::registry::opted_in("usb_msd_skip") {
-        return Err("usb_msd_skip=on".into());
+    if pci::registry::opted_in("ktest_usb_msd_skip") {
+        return Err("ktest_usb_msd_skip=on".into());
     }
     // US-R: a reset of the device in place costs this driver only its transfers under way, which end `Cancelled`
     // and go again.
@@ -148,6 +152,8 @@ fn probe(dev: &Arc<Device>, f: &Interface) -> Result<(), String> {
         klog::event!(Debug, "usb", "msd.read_only", device = storage.path.clone(); "usb_msd_write is off: units read-only (R8)");
     }
     let (id, iface) = (dev.id, f.number);
+    // GP-R3: registered before the first scan counts, so block's wait never sees "nobody busy" in between.
+    block::add_usb_busy(scan_running);
     SCANNING.fetch_add(1, Ordering::AcqRel);
     let s = storage.clone();
     if let Err(e) = sched::spawn("usb-msd-scan", sched::Class::Normal, move || scan(s, id, iface)) {

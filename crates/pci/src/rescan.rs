@@ -79,6 +79,13 @@ pub fn size_node(c: &dyn ConfigAccess, n: &mut Node, phys_limit: u64) -> bool {
     true
 }
 
+/// The most problems `size_node` can note for `n`: its power state or one per BAR slot, and two per MSI-X
+/// capability (`caps::check_msix`). Whoever sizes under a spin lock reserves this much first.
+pub fn sizing_problems(n: &Node) -> usize {
+    let msix = n.caps.iter().filter(|c| matches!(c.info, caps::CapInfo::MsiX { .. })).count();
+    bars::slots(n.header_type).max(1) + 2 * msix
+}
+
 /// The tree after a rescan.
 #[derive(Debug)]
 pub struct Merged {
@@ -114,6 +121,18 @@ pub fn merge(
     not_ready: &[Loc],
     key_for: impl Fn(&Node) -> Option<&'static str>,
     phys_limit: u64,
+) -> Merged {
+    merge_with(old, walked, not_ready, key_for, |n| size_node(c, n, phys_limit))
+}
+
+/// `merge` with the sizing step the caller's: the kernel takes `pci.cfg` for it, a function at a time, and
+/// for nothing else here (the tree is copied twice, which must not happen under a spin lock).
+pub fn merge_with(
+    old: &[Node],
+    walked: Vec<Node>,
+    not_ready: &[Loc],
+    key_for: impl Fn(&Node) -> Option<&'static str>,
+    mut size: impl FnMut(&mut Node) -> bool,
 ) -> Merged {
     // What a fresh boot would mark untouched; applied to the new functions only.
     let mut fresh = walked.clone();
@@ -157,7 +176,7 @@ pub fn merge(
     let gone: Vec<Node> = old.iter().filter(|o| !nodes.iter().any(|n| same(n, o))).cloned().collect();
     let mut sized = 0;
     for &i in &added {
-        if size_node(c, &mut nodes[i], phys_limit) {
+        if size(&mut nodes[i]) {
             sized += 1;
         }
     }

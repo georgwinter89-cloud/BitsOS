@@ -50,9 +50,10 @@ struct ub_create { uint32_t memfd, flags; uint64_t offset, size; };
 #define F_USWC 4u
 #define F_ALWAYS_VALID 0x40u
 #define F_EXPLICIT 0x80u
-/* The create flags every amdgpu reports back as given: not VRAM_CLEARED (newer kernels set it on every create)
- * or VRAM_WIPE_ON_RELEASE (added with RAS). Doorbell objects are left out too: 6.6 refuses them, 7.x not. */
-#define F_SHOWN 0x10f7ull
+#define DOORBELL 0x40u
+#define GWS 0x10u
+/* Every create flag (Linux 7.3.1 adds VRAM_CLEARED and VRAM_WIPE_ON_RELEASE to each object). */
+#define F_SHOWN 0x1ffffull
 #define CLOEXEC 0x80000u
 #define RDWR 2u
 #define PAGE 4096l
@@ -133,6 +134,14 @@ static void create_checks(void) {
     res("CREATE unknown domain 0x80", create(fd, PAGE, 0, 0x80, 0, &h));
     res("CREATE domain bit 32", create(fd, PAGE, 0, GTT | 1ull << 32, 0, &h));
     res("CREATE GDS always valid", create(fd, 1, 0, GDS, F_ALWAYS_VALID, &h));
+    res("CREATE GDS|GTT", create(fd, 1, 0, GDS | GTT, 0, &h));
+    res("CREATE GDS|GWS", create(fd, 1, 0, GDS | GWS, 0, &h));
+    res("CREATE DOORBELL|GTT", create(fd, PAGE, 0, DOORBELL | GTT, 0, &h));
+    res("CREATE DOORBELL|GDS", create(fd, PAGE, 0, DOORBELL | GDS, 0, &h));
+    /* Past the doorbell BAR's room (AMDGPU_PL_DOORBELL's range manager). */
+    res("CREATE DOORBELL 1 GiB", create(fd, 1ull << 30, 0, DOORBELL, 0, &h));
+    res("CREATE VRAM_CONTIGUOUS", create(fd, PAGE, 0, GTT, 0x20, &h));
+    res("CREATE bad domain mix with an unknown flag", create(fd, PAGE, 0, GDS | GTT, 1ull << 30, &h));
     res("CREATE GDS 2^40 entries", create(fd, 1ull << 40, 0, GDS, 0, &h));
     res("CREATE GTT 2^62", create(fd, 1ull << 62, 0, GTT, 0, &h));
     res("CREATE VRAM 2^62", create(fd, 1ull << 62, 0, VRAM, 0, &h));
@@ -147,6 +156,13 @@ static void create_checks(void) {
         {PAGE, 0, CPU, 0},
         {PAGE, 0, 0, 0},
         {PAGE, 0, GTT, F_NO_CPU},
+        {PAGE, 0, DOORBELL, 0},
+        {PAGE, 0, GTT, 0x2000},
+        {PAGE, 0, GTT, 0x4000},
+        {PAGE, 0, GTT, 0x8000},
+        {PAGE, 0, VRAM, 0x10000},
+        {PAGE, 0, VRAM, 0x200},
+        {PAGE, 0, VRAM, 0x8},
     };
     for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
         char l[96];

@@ -1,6 +1,6 @@
-//! DR-8: a context's scheduler entities (`amdgpu_ctx_entity`, linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c):
+//! DR-8: a context's scheduler entities (`amdgpu_ctx_entity`, linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c):
 //! one per HW IP ring a program names, made at first use, each with its sequence numbers and the fences of its
-//! recent jobs (`amdgpu_ctx_add_fence`/`get_fence`, :748/:775), and the bounded waits CS, WAIT_CS and the end of
+//! recent jobs (`amdgpu_ctx_add_fence`/`get_fence`, :738/:765), and the bounded waits CS, WAIT_CS and the end of
 //! a context use.
 //!
 //! Linux keeps `amdgpu_sched_jobs` (32) fence slots per entity and makes the 33rd CS wait for the oldest job

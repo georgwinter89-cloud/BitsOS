@@ -1,12 +1,13 @@
-//! DR-6: `mmap` of the render node at a GEM object's fake offset (linux-6.6/drivers/gpu/drm/drm_gem.c:1095
-//! `drm_gem_mmap`): the range must start exactly at an object's offset and fit in it (EINVAL), the object must
-//! be one the file has a handle for (EACCES, `drm_vma_node_is_allowed`), with CPU access (EPERM,
-//! `amdgpu_gem_object_mmap`); then the exporter's own rule. Pages come from the object's memory.
+//! DR-6: `mmap` of the render node at a GEM object's fake offset (linux-7.3.1/drivers/gpu/drm/drm_gem.c:1376
+//! `drm_gem_mmap`, checks in `drm_gem_object_lookup_at_offset` :1273): the range must start exactly at an object's
+//! offset and fit in it (EINVAL), the object must be one the file has a handle for (EACCES, `drm_vma_node_is_allowed`),
+//! with CPU access (EPERM, `amdgpu_gem_object_mmap`); then the exporter's own rule. Pages come from the object's
+//! memory.
 //!
 //! MM's hook asks the file for one `DeviceMap` without the offset (`File::device_map`), so today the file hands
 //! out a view of all its objects (`FileGem::device_map`, rebuilt after a handle change). A mapping keeps the
 //! memory of every object in the view it was made from until it is unmapped. A file without a mappable object
-//! gets a view that refuses every range (EINVAL/EACCES as Linux, not ENODEV). CR-DR6-1 (plan/notes/dr-DR-6.md)
+//! gets a view that refuses every range (EINVAL/EACCES as Linux, not ENODEV). CR-DR6-1
 //! passes the offset (`OpenDrm::object_map`): then each mapping holds its own object's memory only.
 
 use crate::dma_buf::Exporter;

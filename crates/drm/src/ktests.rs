@@ -120,7 +120,8 @@ fn ioctls_through_the_file() -> TestResult {
         let m = KMem::new(4096);
         let io = |cmd: u32, arg: u64| of.file.ioctl_user(cmd as u64, arg, &m).unwrap_or(Err(ENOTTY));
         kassert!(io(DRM_IOCTL_VERSION, BASE) == Ok(0));
-        kassert!(m.u64(16) == 6 && m.u64(32) == 8 && m.u64(48) == 7, "lengths {} {} {}", m.u64(16), m.u64(32), m.u64(48));
+        // Date "0" (linux-7.3.1/drivers/gpu/drm/drm_ioctl.c:554): length 1.
+        kassert!(m.u64(16) == 6 && m.u64(32) == 1 && m.u64(48) == 7, "lengths {} {} {}", m.u64(16), m.u64(32), m.u64(48));
         m.set(16, &16u64.to_le_bytes());
         m.set(24, &(BASE + 1024).to_le_bytes());
         kassert!(io(DRM_IOCTL_VERSION, BASE) == Ok(0));

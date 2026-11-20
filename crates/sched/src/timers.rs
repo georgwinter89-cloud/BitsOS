@@ -27,7 +27,7 @@
 //!
 //! Since CP-5 HrTimers fire from each CPU's LAPIC timer interrupt (`time::interrupt_driven()`), the tick on its
 //! own CPU, and the interrupt exit preempts (`tick_preempts`). While timers are still polled (early boot,
-//! `hrtimer=poll`, a CPU without a live LAPIC timer) `time`'s poller fires them from the idle CPU on poll duty or
+//! `ktest_timer=poll`, a CPU without a live LAPIC timer) `time`'s poller fires them from the idle CPU on poll duty or
 //! the `poll` thread, a tick fires on whichever CPU polls (it kicks its CPU by IPI), and busy threads'
 //! preemption points wake overdue sleepers as a fallback (`fallback`).
 
@@ -49,7 +49,7 @@ klog::counter!(pub TICK_IPIS, "sched.tick_ipis");
 klog::counter!(pub SLEEP_CONTENDED, "sched.sleep_timer_contended");
 
 /// A sleeper overdue by this much is woken at a busy thread's preemption point instead of by the timer (the
-/// timer may be polled (`hrtimer=poll`, early boot); with every CPU busy nobody polls it in time).
+/// timer may be polled (`ktest_timer=poll`, early boot); with every CPU busy nobody polls it in time).
 pub const FALLBACK_SLACK_NS: u64 = 100_000;
 
 /// A sleep-timer pass that could not get the sleeper lock tries again this much later at the earliest, so a
@@ -209,6 +209,9 @@ pub(crate) fn work_queued(cs: &CpuSched) {
     if cs.cpu != hal::percpu::this_cpu() {
         TICK_IPIS.inc();
         cpus::send_resched(cs.cpu);
+    } else if !hal::percpu::in_hard_irq() {
+        // A spin lock held here: the tick is armed at the point where the count drops to 0 (`preempt_deferred`).
+        hal::percpu::defer_resched();
     }
 }
 

@@ -1,4 +1,4 @@
-//! GFX 11.0.1 (gfx1103): Linux `gfx_v11_0` with `imu_v11_0` (linux-6.6 amdgpu/gfx_v11_0.c, imu_v11_0.c). With
+//! GFX 11.0.1 (gfx1103): Linux `gfx_v11_0` with `imu_v11_0` (linux-7.3.1 amdgpu/gfx_v11_0.c, imu_v11_0.c). With
 //! PSP loading the microcode (APUs, `AMDGPU_FW_LOAD_PSP`), the files go to the PSP ring as LOAD_IP_FW
 //! commands; the RLC backdoor path (imu_v11_0.c program_rlc_ram) is not this GPU's.
 //!
@@ -28,7 +28,7 @@ pub static MODULE: Module = Module {
 
 /// GX-7b, read-only facts (gc_11_0_0_offset.h; (segment, dword) in GC's bases). All of them are GC registers:
 /// read only while GC is powered (`gpucore::classify` checks SMUIO's GFXOFF status, then these flags first).
-/// Bits 2:1: 0 GC off, 1 leaving GFXOFF, 2 on, 3 entering GFXOFF (gx-scout-bringup.md section 7).
+/// Bits 2:1: 0 GC off, 1 leaving GFXOFF, 2 on, 3 entering GFXOFF (plan/spec/gpu.md §11.4).
 pub const GFX_IMU_MSG_FLAGS: (usize, u32) = (1, 0x403f);
 /// GC 11.0.1 reads its bootload status at this alias (gfx_v11_0.c:61-62, :2566-2570); bit 31 BOOTLOAD_COMPLETE.
 pub const RLC_RLCS_BOOTLOAD_STATUS_11_0_1: (usize, u32) = (1, 0x4e7e);
@@ -373,6 +373,8 @@ pub mod f {
     pub const MEC_ME1_HALT: u32 = 1 << 30;
     pub const RB_BUFSZ_MASK: u32 = 0x3f;
     pub const RB_BLKSZ_MASK: u32 = 0x3f00;
+    /// CP_RB0_CNTL.KMD_QUEUE (gc_11_0_0_sh_mask.h:15119).
+    pub const RB_KMD_QUEUE: u32 = 0x2000_0000;
     pub const RB_NO_UPDATE: u32 = 1 << 27;
     pub const RB_RPTR_WR_ENA: u32 = 1 << 31;
     pub const RPTR_ADDR_HI_MASK: u32 = 0xffff;
@@ -464,11 +466,12 @@ pub const LINUX_TIMEOUT_US: u64 = 100_000;
 /// `cp_gfx_resume`'s mdelay(1) between the first and the second CP_RB0_CNTL write.
 pub const RESUME_DELAY_US: u64 = 1000;
 
-/// CP_RB0_CNTL as `cp_gfx_resume` writes it: RB_BUFSZ = log2(bytes / 8), RB_BLKSZ = RB_BUFSZ - 2, nothing else
-/// (written from 0: gfx_v11_0.c:3249-3252).
+/// CP_RB0_CNTL as `cp_gfx_resume` writes it: RB_BUFSZ = log2(bytes / 8), RB_BLKSZ = RB_BUFSZ - 2, KMD_QUEUE 1
+/// (a kernel queue), nothing else (written from 0: linux-7.3.1/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c:3808-3812;
+/// KMD_QUEUE bit 29, gc_11_0_0_sh_mask.h:15119).
 pub fn rb0_cntl(ring_dw: u64) -> u32 {
     let bufsz = (ring_dw * 4 / 8).trailing_zeros();
-    (bufsz & f::RB_BUFSZ_MASK) | ((bufsz.saturating_sub(2) << 8) & f::RB_BLKSZ_MASK)
+    (bufsz & f::RB_BUFSZ_MASK) | ((bufsz.saturating_sub(2) << 8) & f::RB_BLKSZ_MASK) | f::RB_KMD_QUEUE
 }
 
 /// CP_ME_CNTL with PFP and ME unhalted (`cp_gfx_enable(true)`, CE as found) or halted (`false`).
@@ -476,8 +479,8 @@ pub fn me_cntl(v: u32, run: bool) -> u32 {
     if run { v & !f::GFX_HALTS } else { v | f::GFX_HALTS }
 }
 
-/// CP_MEC_CNTL with MEC ME1 unhalted (`cp_compute_enable(true)` with enable_mes_kiq, linux-6.6
-/// gfx_v11_0.c:3358-3364: ME2 left as found) or halted again (`false`). Only ME1: Linux's disable also sets
+/// CP_MEC_CNTL with MEC ME1 unhalted (`cp_compute_enable(true)` with enable_mes_kiq, linux-7.3.1
+/// gfx_v11_0.c:3918-3929: ME2 left as found) or halted again (`false`). Only ME1: Linux's disable also sets
 /// MEC_ME2_HALT, but the 780M's cold value has ME2 clear and our unhalt never clears it, so setting ME1 alone
 /// puts back exactly what was found (0x40000000).
 pub fn mec_cntl(v: u32, run: bool) -> u32 {

@@ -1,4 +1,4 @@
-//! `/proc/<pid>/mem` (linux-6.6/fs/proc/base.c `mem_open` :823, `mem_rw` :844): the process's memory read
+//! `/proc/<pid>/mem` (linux-7.3.1/fs/proc/base.c `mem_open` :851, `mem_rw` :880): the process's memory read
 //! at the file position as an address. Opening needs ptrace access (EACCES); a read stops at the first page
 //! that cannot be read and answers EIO when not one byte came (`access_remote_vm` returned 0); once the
 //! memory is gone a read gives 0 bytes.

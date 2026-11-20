@@ -1,8 +1,8 @@
 //! brave-act end to end on the host: the real binary against a fake kernel registry and a fake settingsd (Unix
 //! sockets), the staged Brave tree headless (tests/host-launcher.sh; no window), the AC-3 test site
 //! (host/tests/ac/site) from a small HTTP server on 127.0.0.1 by the name ac3.test (every other name NOTFOUND: no
-//! internet). Every action once; the change actions refused without permission and with an allow set over MCP,
-//! then allowed (Georg's shell); file: URLs refused; a hanging page against timeout_ms; a page larger than an
+//! internet). Every action once; the change actions allowed by default, refused after Georg's deny and with an
+//! allow set back over MCP, then allowed (Georg's shell); file: URLs refused; a hanging page against timeout_ms; a page larger than an
 //! answer; Brave killed and started again by the next call. Needs the stage (bash
 //! user/ports/brave-launcher/scripts/stage-v2.sh): without it the test fails.
 
@@ -70,7 +70,7 @@ fn settingsd(path: PathBuf, values: Arc<Mutex<Vec<(String, String)>>>, src: Arc<
                     for k in j.get("keys").and_then(Json::as_array).unwrap_or(&[]) {
                         let key = k.get("key").and_then(Json::as_str).unwrap().to_string();
                         if !v.iter().any(|(n, _)| *n == key) {
-                            v.push((key, "deny".into()));
+                            v.push((key, k.get("default").and_then(Json::as_str).unwrap_or("?").to_string()));
                         }
                     }
                     r#"{"ok":true}"#.to_string()
@@ -163,7 +163,7 @@ fn s<'a>(j: &'a Json, k: &str) -> &'a str {
 
 #[test]
 fn every_action_on_headless_brave() {
-    let stage = std::env::var("BRAVE_STAGE").unwrap_or_else(|_| "/var/tmp/claude-v2/stage/brave".into());
+    let stage = std::env::var("BRAVE_STAGE").unwrap_or_else(|_| "/var/tmp/claude-v2/stage/brave-w41".into());
     assert!(Path::new(&stage).join("brave").is_file(), "no staged Brave in {stage}: stage it (no test is skipped, Georg 30.10.)");
     let dir = std::env::temp_dir().join(format!("brave-act-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -246,7 +246,13 @@ fn every_action_on_headless_brave() {
     assert!(k.call("brave_click_link", &format!(r#"{{"tab":"{tab}","text":"Skript"}}"#), 10_000).text.contains("only http"));
     assert!(k.call("brave_click_link", &format!(r#"{{"tab":"{tab}","text":"nirgends"}}"#), 10_000).text.contains("no link fits"));
 
-    // The change actions: refused while their keys are deny (registered by brave-act), then allowed.
+    // The change actions: registered by brave-act as allow (the default); refused once Georg sets deny (his
+    // shell: source cli), then allowed again.
+    assert!(values.lock().unwrap().iter().all(|(_, v)| v == "allow"), "{:?}", values.lock().unwrap());
+    *src.lock().unwrap() = "cli".into();
+    for (_, v) in values.lock().unwrap().iter_mut() {
+        *v = "deny".into();
+    }
     let fill = format!(r#"{{"tab":"{tab}","fields":{{"who":"Claude","agree":true,"color":"blau"}},"submit":true}}"#);
     let a = k.call("brave_fill_form", &fill, 30_000);
     assert!(a.err && a.text.contains("claude.actions.brave_fill_form"), "{}", a.text);
@@ -254,7 +260,7 @@ fn every_action_on_headless_brave() {
     let a = k.call("brave_download", &dl, 30_000);
     assert!(a.err && a.text.contains("claude.actions.brave_download"), "{}", a.text);
     assert!(!dir.join("dl").exists(), "nothing downloaded while refused");
-    // An allow that an MCP client set itself (settings_set; the journal says source mcp) does not count.
+    // An allow that an MCP client set back itself (settings_set; the journal says source mcp) does not count.
     *src.lock().unwrap() = "mcp".into();
     for (_, v) in values.lock().unwrap().iter_mut() {
         *v = "allow".into();

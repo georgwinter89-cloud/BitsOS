@@ -1,10 +1,10 @@
 //! GX-8a: the backend on the chip: the CPU's windows into the carve-out (`hal::drv_gx::CarveWindow`, through MM's vmap
 //! allocator: programs reach this path, so it must hold the allocator's lock, and a window can go), the registers INFO
 //! may read, and the node's life. The node exists only between a passed
-//! `gx_bringup {"until":"backend"}` (GX-8c: or the same run at boot, CONFIG `gpu=on`) and `until=stop`; a machine without it
+//! `gx_bringup {"until":"backend"}` (GX-8c: or the same run at every boot) and `until=stop`; a machine without it
 //! has none.
 //!
-//! `until=stop` refuses while files are open on the node, naming how many (decision in plan/notes/gx-GX-8a.md): the
+//! `until=stop` refuses while files are open on the node, naming how many (plan/spec/gpu.md §11.5): the
 //! rings and the VMs' VMIDs would go under programs that have no way to know; they can be asked to close. A Reload
 //! needs nothing here: the Quiesce hook halts the engines, the programs die with the kernel.
 //!
@@ -164,14 +164,44 @@ struct Up {
 }
 
 /// The node's place: empty until a passed bring-up, empty again after a stop.
-pub struct NodeSlot(Mutex<Option<Up>>);
+pub struct NodeSlot(Mutex<Option<Up>>, ksync::Once<u32>);
 
-/// The chip's node.
-pub static NODE: NodeSlot = NodeSlot::new();
+/// GP-GPU1 (plan/spec/gpu-rdna4.md piece 3): one device's render node, its job keeping and its tool gate. These were statics
+/// (`NODE`, `HALTS`, `HELD`, `TOOL`) while the kernel knew one GPU; a device owns them now (`devs::Device::hw`).
+pub struct Slots {
+    pub node: NodeSlot,
+    pub halts: HaltProof,
+    pub held: HeldJobs,
+    pub tool: ToolGate,
+    /// GX-9b: what the device's power hook works on at a Reload.
+    pub(crate) dpm_hook: crate::dpm_live::Hook,
+}
+
+impl Slots {
+    pub const fn new() -> Slots {
+        Slots { node: NodeSlot::new(), halts: HaltProof::new(), held: HeldJobs::new(), tool: ToolGate::new(), dpm_hook: crate::dpm_live::Hook::new() }
+    }
+
+    /// Once, when the device has its place: the tool gate keeps this node's GC awake, and in a machine with several
+    /// devices the node asks for the number of the device's place (`wish`), so a card keeps `renderD<128 + index>`
+    /// whichever comes up first. A lone device registers as it always did (the lowest free minor).
+    pub fn bind(&'static self, wish: Option<u32>) {
+        self.tool.node.get_or_init(|| &self.node);
+        if let Some(w) = wish {
+            self.node.1.get_or_init(|| w);
+        }
+    }
+}
+
+impl Default for Slots {
+    fn default() -> Slots {
+        Slots::new()
+    }
+}
 
 impl NodeSlot {
     pub const fn new() -> NodeSlot {
-        NodeSlot(Mutex::named("amdgpu.hw.up", None))
+        NodeSlot(Mutex::named("amdgpu.hw.up", None), ksync::Once::new())
     }
 
     /// The render minor of the running backend.
@@ -186,19 +216,18 @@ impl NodeSlot {
             // A second node would lose the first: nothing could count its files or remove it any more.
             return Err(format!("already up on renderD{}", u.dev.render_minor()));
         }
-        let dev = drm::add_device(gpu.clone()).map_err(|e| format!("errno {e}"))?;
+        let dev = drm::add_device_at(gpu.clone(), self.1.get().copied()).map_err(|e| format!("errno {e}"))?;
         let m = dev.render_minor();
         klog::event!(Info, "gx", "hw.node_up", minor = m; "the 780M answers on the render node");
         *up = Some(Up { dev, gpu: gpu.clone() });
         drop(up);
-        crate::dpm_live::start(&gpu);
         Ok(m)
     }
 
     /// `until=stop`'s first step: `Err(why)` while files are open on the node; `Ok(note)` when the node went (or
     /// never was). The look and the removal are one step under the lock; a file opened after the look answers
     /// ENODEV, as after a hot unplug.
-    pub fn stop_gate(&self) -> Result<Option<String>, String> {
+    pub fn stop_gate(&self, held: &HeldJobs) -> Result<Option<String>, String> {
         let mut up = self.0.lock();
         let Some(u) = up.as_ref() else { return Ok(None) };
         let n = u.gpu.open_files();
@@ -208,7 +237,7 @@ impl NodeSlot {
             return Err(format!("backend: {n} open files on renderD{m}: close them first (the rings would go under them); nothing was stopped"));
         }
         drm::remove_device(&u.dev);
-        let kept = HELD.hold(u.gpu.stop_jobs());
+        let kept = held.hold(u.gpu.stop_jobs());
         *up = None;
         klog::event!(Info, "gx", "hw.node_down", minor = m, held = kept);
         Ok(Some(format!("backend: renderD{m} removed (no file was open){}", if kept > 0 { format!("; {kept} jobs the engines may still run stay held until they are halted") } else { String::new() })))
@@ -226,9 +255,6 @@ impl NodeSlot {
 pub struct HaltProof {
     failed: AtomicBool,
 }
-
-/// The chip's.
-pub static HALTS: HaltProof = HaltProof::new();
 
 impl HaltProof {
     pub const fn new() -> HaltProof {
@@ -267,9 +293,6 @@ pub struct HeldJobs {
     jobs: SpinLock<Vec<Held>>,
     left_running: AtomicBool,
 }
-
-/// The chip's.
-pub static HELD: HeldJobs = HeldJobs::new();
 
 impl HeldJobs {
     pub const fn new() -> HeldJobs {
@@ -325,6 +348,8 @@ pub struct ToolGate {
     busy: AtomicBool,
     /// GX-9b: the hold of a run that started the backend.
     late: SpinLock<Option<crate::dpm::Awake>>,
+    /// The node of the gate's device (`Slots::bind`); a gate of a test or of the scenario's stand-in has none.
+    node: ksync::Once<&'static NodeSlot>,
 }
 
 /// The running tool call; dropping it lets the next one in. GX-9b: GC stays awake for it: its stages read and write
@@ -336,12 +361,12 @@ pub struct ToolRun<'a> {
 
 impl ToolGate {
     pub const fn new() -> ToolGate {
-        ToolGate { busy: AtomicBool::new(false), late: SpinLock::named("amdgpu.hw.tool_late", None) }
+        ToolGate { busy: AtomicBool::new(false), late: SpinLock::named("amdgpu.hw.tool_late", None), node: ksync::Once::new() }
     }
     /// None: another call runs. (No `then_some`: its argument is made either way, and its drop would open the gate
     /// under the call that holds it.)
     pub fn enter(&self) -> Option<ToolRun<'_>> {
-        (!self.busy.swap(true, Ordering::AcqRel)).then(|| ToolRun { gate: self, _awake: NODE.gpu().and_then(|g| g.dpm()).map(|d| d.awake()) })
+        (!self.busy.swap(true, Ordering::AcqRel)).then(|| ToolRun { gate: self, _awake: self.node.get().and_then(|n| n.gpu()).and_then(|g| g.dpm()).map(|d| d.awake()) })
     }
     /// GC stays awake for the rest of the running call; no call runs: nothing to hold it for.
     pub fn hold(&self, a: crate::dpm::Awake) {
@@ -359,9 +384,6 @@ impl Drop for ToolRun<'_> {
         self.gate.busy.store(false, Ordering::Release);
     }
 }
-
-/// The tool's gate.
-pub static TOOL: ToolGate = ToolGate::new();
 
 /// The GPU function as libdrm finds it below /sys (PC's PCI view holds its files).
 pub fn pci_identity(g: &crate::gpu::Gpu) -> Option<PciIdentity> {

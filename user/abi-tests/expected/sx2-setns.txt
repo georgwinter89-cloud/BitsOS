@@ -1,10 +1,17 @@
 net: readlink type net:, stat inode is the number = yes
+net: initial namespace inode 0xeffffff9
 uts: readlink type uts:, stat inode is the number = yes
+uts: initial namespace inode 0xeffffffe
 ipc: readlink type ipc:, stat inode is the number = yes
+ipc: initial namespace inode 0xefffffff
 pid: readlink type pid:, stat inode is the number = yes
+pid: initial namespace inode 0xeffffffc
 pid_for_children: readlink type pid:, stat inode is the number = yes
+pid_for_children: initial namespace inode 0xeffffffc
 user: readlink type user:, stat inode is the number = yes
+user: initial namespace inode 0xeffffffd
 mnt: readlink type mnt:, stat inode is the number = yes
+mnt: initial namespace inode 0xeffffff8
 pid and pid_for_children are one namespace = yes
 user differs from net = yes
 opened = yes

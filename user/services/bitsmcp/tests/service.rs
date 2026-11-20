@@ -388,10 +388,8 @@ fn without_tls_pairing_is_refused_and_plain_stays() {
 fn the_host_tools_pair_pin_and_refuse() {
     use bitsmcp::{keys, tls::Tls};
     use std::process::Command;
-    if Command::new("node").arg("--version").output().is_err() {
-        eprintln!("skip: node is not installed (host/mcp's tools not tried)");
-        return;
-    }
+    let node = Command::new("node").arg("--version").output();
+    assert!(node.is_ok(), "node is needed for host/mcp's pair.mjs and mcp-call.mjs (pacman -S nodejs): {node:?}");
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let (dir, store, other) = (key_dir("node"), key_dir("node-store"), key_dir("node-other"));
     let s = store.to_str().unwrap();

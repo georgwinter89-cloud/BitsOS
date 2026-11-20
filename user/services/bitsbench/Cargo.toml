@@ -1,0 +1,22 @@
+[package]
+name = "bitsbench"
+version = "0.1.0"
+edition = "2024"
+description = "SELFOPT-1: the nightly benchmark runner (level 1 of plan/spec/self-optimise.md): a fixed set, 5 runs each, median and spread as JSON under /data/leistung/bench/, the profiler beside it, one report line in the morning"
+publish = false
+
+# mcpreg: the JSON of the files and requests (no serde in the user workspace). usys: the ALSA control ioctls
+# without unsafe here. settingsd: only its key parser, so the tests read the registration as settingsd does.
+[dependencies]
+mcpreg = { path = "../../lib/mcpreg" }
+usys = { path = "../../tools/usys" }
+
+[dev-dependencies]
+settingsd = { path = "../settingsd" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsbench"
+path = "src/main.rs"

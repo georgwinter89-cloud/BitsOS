@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 use bitsboot_pure::config::TestHook;
 use bitsboot_pure::edid;
-use bitsboot_pure::pixel::{self, bytes_per_pixel, check_framebuffer, from_uefi};
+use bitsboot_pure::pixel::{self, bytes_per_pixel, check_framebuffer, check_reachable, from_uefi};
 use bitsboot_pure::screen::{self, Pick, Want};
 use core::sync::atomic::{AtomicU32, Ordering};
 use bootinfo::layout::VMAP_BASE;
@@ -185,6 +185,7 @@ fn screen_of(raw: &RawGop) -> Option<Screen> {
     let size = m.fb_size as u64;
     if fmt != PixelFormat::None
         && let Err(why) = check_framebuffer(m.fb_base, size, cur.width, cur.height, cur.stride, bytes_per_pixel(fmt, masks))
+            .and_then(|()| check_reachable(m.fb_base, size, crate::cpu::phys_bits()))
     {
         warn!("the current mode's framebuffer is not usable ({why}): running headless");
         fmt = PixelFormat::None;

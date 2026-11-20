@@ -57,14 +57,15 @@ pub fn window_items(floating: bool, maximised: Option<bool>, can_stack: bool, in
     m
 }
 
-/// PK-L1b: a library tile's menu (desk-PK67-plan.md §3 "Favourites"); "Programm verwalten" waits for PK-7,
-/// "Entfernen" for PK-6 (greyed until then).
-pub fn library_items(pinned: bool) -> Items {
+/// PK-L1b: a library tile's menu (plan/spec/program-library.md section 5, circle menu). PK-7a: "Programm verwalten" and
+/// "Entfernen" open the "Programme" page for a package of /apps (`package`); the stick's and built-in programs
+/// are no packages, for them both stay greyed.
+pub fn library_items(pinned: bool, package: bool) -> Items {
     let mut m: Items = [None; 8];
     m[0] = item(if pinned { "Lösen" } else { "An Startseite anheften" }, Action::LibraryPin, true);
     m[2] = item("In neuer Kachel öffnen", Action::LibraryTile, true);
-    m[4] = item("Programm verwalten", Action::None, false);
-    m[6] = item("Entfernen", Action::None, false);
+    m[4] = item("Programm verwalten", Action::LibraryManage, package);
+    m[6] = item("Entfernen", Action::LibraryRemove, package);
     m
 }
 
@@ -144,13 +145,14 @@ mod tests {
     const C: (f64, f64) = (500.0, 400.0);
 
     #[test]
-    fn a_library_tile_menu_pins_or_loosens_and_greys_what_comes_later() {
-        for pinned in [false, true] {
-            let m = library_items(pinned);
+    fn a_library_tile_menu_pins_or_loosens_and_manages_packages_only() {
+        for (pinned, package) in [(false, false), (true, false), (false, true), (true, true)] {
+            let m = library_items(pinned, package);
             let labels: Vec<(&str, bool)> = m.iter().flatten().map(|i| (i.label, i.enabled)).collect();
             let pin = if pinned { "Lösen" } else { "An Startseite anheften" };
-            assert_eq!(labels, [(pin, true), ("In neuer Kachel öffnen", true), ("Programm verwalten", false), ("Entfernen", false)]);
+            assert_eq!(labels, [(pin, true), ("In neuer Kachel öffnen", true), ("Programm verwalten", package), ("Entfernen", package)]);
             assert_eq!(m[0].unwrap().action, Action::LibraryPin);
+            assert_eq!((m[4].unwrap().action, m[6].unwrap().action), (Action::LibraryManage, Action::LibraryRemove));
         }
     }
 

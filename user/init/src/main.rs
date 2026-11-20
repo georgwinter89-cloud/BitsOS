@@ -10,13 +10,18 @@
 //!
 //! UL-7 (`shutdown.rs`): as PID 1 it takes busybox's halt/poweroff/reboot signals and the desktop's power socket,
 //! ends every program (SIGTERM, a bounded wait, SIGKILL), syncs and calls reboot(2); a power-off only after
-//! the kernel's R8f judgement (`/proc/bitsos/power`) allows it.
+//! the kernel's R8f judgement (`/proc/bitsos/power`) allows it. GM-6w: a restart or power-off over the socket only
+//! for the compositor grant holder with its real-input statement (`power_req`).
 //!
 //! Log lines start with "init: " and go to stdout (the console) and to /dev/kmsg when the kernel has one.
 #![forbid(unsafe_code)]
 
 use initlib::{Backoff, Card, Dedup, Opts};
 
+mod access;
+mod apps;
+mod atspid;
+mod ctxd;
 mod shutdown;
 use std::panic::AssertUnwindSafe;
 use std::process::Command;
@@ -49,6 +54,10 @@ struct Init {
     bitsjournal: Option<Shell>,
     bitsjournal_next: Instant,
     bitsjournal_backoff: Backoff,
+    /// PK-6f: the program service (`/bin/bitspkgd serve`, /run/bitsos/pkg.sock), restarted with its own back-off.
+    bitspkgd: Option<Shell>,
+    bitspkgd_next: Instant,
+    bitspkgd_backoff: Backoff,
     /// MC-8a: the user-space MCP service (`/bin/bitsmcp serve`) under CONFIG.TXT mcp=both|service, restarted with
     /// its own back-off; `bitsmcp_wanted` comes from the first successful read of /proc/bitsos/mcp (it holds for
     /// the boot).
@@ -60,6 +69,18 @@ struct Init {
     bitsinstall: Option<Shell>,
     bitsinstall_next: Instant,
     bitsinstall_backoff: Backoff,
+    /// CX-5: the context service as uid 1000 (ctxd.rs).
+    ctxd: ctxd::Ctxd,
+    /// DB5a: Durchblick's bridge to foreign programs (atspid.rs).
+    atspid: atspid::Atspid,
+    /// DB2: the access log's service as root (access.rs).
+    access: access::Access,
+    /// PK-0: /apps on /data (apps.rs), and `bitspkg register` once settingsd listens.
+    apps: apps::Apps,
+    register: Option<Shell>,
+    register_next: Instant,
+    register_backoff: Backoff,
+    register_done: bool,
     born: Instant,
     reaped: u64,
     /// `\BITSOS2\home\` on the stick exists (made or found); until then tried once per round.
@@ -118,6 +139,9 @@ impl Init {
             bitsjournal: None,
             bitsjournal_next: Instant::now(),
             bitsjournal_backoff: Backoff::default(),
+            bitspkgd: None,
+            bitspkgd_next: Instant::now(),
+            bitspkgd_backoff: Backoff::default(),
             bitsmcp: None,
             bitsmcp_next: Instant::now(),
             bitsmcp_backoff: Backoff::default(),
@@ -125,6 +149,14 @@ impl Init {
             bitsinstall: None,
             bitsinstall_next: Instant::now(),
             bitsinstall_backoff: Backoff::default(),
+            ctxd: ctxd::Ctxd::default(),
+            atspid: atspid::Atspid::default(),
+            access: access::Access::default(),
+            apps: apps::Apps::Waiting,
+            register: None,
+            register_next: Instant::now(),
+            register_backoff: Backoff::default(),
+            register_done: false,
             born: Instant::now(),
             reaped: 0,
             home_done: false,
@@ -313,9 +345,15 @@ impl Init {
         self.bitsmcp();
         self.bitsinstall();
         self.network_files();
+        self.apps();
         self.settingsd();
+        self.bitspkgd();
+        self.pkg_register();
         self.bitssnap();
         self.bitsjournal();
+        self.ctxd();
+        self.atspid();
+        self.access_log();
         self.stick_home();
         self.shell();
     }
@@ -356,6 +394,9 @@ impl Init {
                 Ok((0, _)) | Err(usys::ECHILD) => break,
                 Ok((pid, st)) => {
                     self.reaped += 1;
+                    if self.register_ended(pid, st) {
+                        continue;
+                    }
                     let what = usys::status_text(st);
                     if let Some(bs) = self.bitssnap.take_if(|bs| bs.pid == pid) {
                         let ran = bs.started.elapsed();
@@ -376,6 +417,25 @@ impl Init {
                         let delay = self.bitsmcp_backoff.next(ran.as_millis() as u64);
                         self.bitsmcp_next = Instant::now() + Duration::from_millis(delay);
                         self.log(&format!("bitsmcp (pid {pid}) ended: {what} after {} s; next start in {} s", ran.as_secs(), delay / 1000));
+                        continue;
+                    }
+                    if let Some(bp) = self.bitspkgd.take_if(|bp| bp.pid == pid) {
+                        let ran = bp.started.elapsed();
+                        let delay = self.bitspkgd_backoff.next(ran.as_millis() as u64);
+                        self.bitspkgd_next = Instant::now() + Duration::from_millis(delay);
+                        self.log(&format!("bitspkgd (pid {pid}) ended: {what} after {} s; next start in {} s", ran.as_secs(), delay / 1000));
+                        continue;
+                    }
+                    if let Some(line) = self.ctxd.ended(pid, &what) {
+                        self.log(&line);
+                        continue;
+                    }
+                    if let Some(line) = self.atspid.ended(pid, &what) {
+                        self.log(&line);
+                        continue;
+                    }
+                    if let Some(line) = self.access.ended(pid, &what) {
+                        self.log(&line);
                         continue;
                     }
                     if let Some(bj) = self.bitsjournal.take_if(|bj| bj.pid == pid) {
@@ -457,7 +517,7 @@ impl Init {
     /// VS-2: starts `/bin/bitssnap serve` (uid 0, no terminal; it logs to /dev/kmsg and waits by itself until
     /// /data is a writable pool) once settingsd was started, and restarts it with a back-off. Only as pid 1.
     fn bitssnap(&mut self) {
-        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || self.bitssnap.is_some() || self.settingsd.is_none() || Instant::now() < self.bitssnap_next {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || self.bitssnap.is_some() || !self.services_may_start() || Instant::now() < self.bitssnap_next {
             return;
         }
         let path = self.opts.at("/bin/bitssnap");
@@ -579,10 +639,60 @@ impl Init {
         }
     }
 
+    /// DB2: `/bin/bitsaccess serve` as root once settingsd was started. Only as pid 1 on a real boot.
+    fn access_log(&mut self) {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || !self.services_may_start() {
+            return;
+        }
+        match self.access.tick(&self.opts.at(access::EXE), SHELL_PATH, initlib::power::signal_mask()) {
+            Some((Some(key), l)) => self.log_repeat(key, &l),
+            Some((None, l)) => {
+                self.dedup.clear("nobitsaccess");
+                self.dedup.clear("bitsaccessspawn");
+                self.log(&l);
+            }
+            None => {}
+        }
+    }
+
+    /// CX-5: `/bin/ctxd serve --system` as uid 1000 once settingsd was started. Only as pid 1 on a real boot.
+    fn ctxd(&mut self) {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || !self.services_may_start() {
+            return;
+        }
+        let path = self.opts.at(ctxd::EXE);
+        match self.ctxd.tick(&path, RUNTIME_DIR, "/data/home/1000", SHELL_PATH, initlib::power::signal_mask()) {
+            Some(ctxd::Say::Line(l)) => {
+                self.dedup.clear("noctxd");
+                self.dedup.clear("ctxdspawn");
+                self.log(&l);
+            }
+            Some(ctxd::Say::Repeat(key, l)) => self.log_repeat(key, &l),
+            None => {}
+        }
+    }
+
+    /// DB5a: `/bin/atspid serve` (as root; it drops to uid 1000 itself) once settingsd was started. Only as pid 1.
+    fn atspid(&mut self) {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || !self.services_may_start() {
+            return;
+        }
+        let path = self.opts.at(atspid::EXE);
+        match self.atspid.tick(&path, RUNTIME_DIR, SHELL_PATH, initlib::power::signal_mask()) {
+            Some(atspid::Say::Line(l)) => {
+                self.dedup.clear("noatspid");
+                self.dedup.clear("atspidspawn");
+                self.log(&l);
+            }
+            Some(atspid::Say::Repeat(key, l)) => self.log_repeat(key, &l),
+            None => {}
+        }
+    }
+
     /// RB-8: starts `/bin/bitsjournal serve` (uid 0, no terminal; it logs to /dev/kmsg and waits by itself until
     /// /data is writable) once settingsd was started, and restarts it with a back-off. Only as pid 1.
     fn bitsjournal(&mut self) {
-        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || self.bitsjournal.is_some() || self.settingsd.is_none() || Instant::now() < self.bitsjournal_next {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || self.bitsjournal.is_some() || !self.services_may_start() || Instant::now() < self.bitsjournal_next {
             return;
         }
         let path = self.opts.at("/bin/bitsjournal");
@@ -612,6 +722,45 @@ impl Init {
         }
     }
 
+    /// PK-6f: starts `/bin/bitspkgd serve` (uid 0, no terminal; its events go to /dev/kmsg) once settingsd runs,
+    /// restarted with a back-off. Only on a real boot as pid 1, as the other services.
+    fn bitspkgd(&mut self) {
+        if !self.opts.root.is_empty() || self.opts.once || std::process::id() != 1 || self.bitspkgd.is_some() || !self.services_may_start() || Instant::now() < self.bitspkgd_next {
+            return;
+        }
+        let path = self.opts.at("/bin/bitspkgd");
+        if !usys::stat(&path).is_ok_and(|s| s.file_type() == "regular" && s.mode & 0o111 != 0) {
+            self.log_repeat("nobitspkgd", &format!("no {path}: programs can only be changed with bitspkg on the console"));
+            self.bitspkgd_next = Instant::now() + Duration::from_secs(60);
+            return;
+        }
+        self.dedup.clear("nobitspkgd");
+        let mut cmd = Command::new(&path);
+        usys::power::unblock_in_child(&mut cmd, initlib::power::signal_mask());
+        cmd.arg("serve").env_clear().env("PATH", SHELL_PATH).env("HOME", "/root").current_dir(self.opts.at("/"));
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id() as usize;
+                drop(child);
+                self.dedup.clear("bitspkgdspawn");
+                self.log(&format!("started the program service {path} (pid {pid})"));
+                self.bitspkgd = Some(Shell { pid, path, started: Instant::now() });
+            }
+            Err(e) => {
+                let delay = self.bitspkgd_backoff.next(0);
+                self.bitspkgd_next = Instant::now() + Duration::from_millis(delay);
+                self.log_repeat("bitspkgdspawn", &format!("cannot start {path} ({e}); retrying in {} s", delay / 1000));
+            }
+        }
+    }
+
+    /// The services that start once settingsd runs: also only once /apps is settled (PK-0: they see the packages'
+    /// /apps from their start), or the stick's wait is over (as when settingsd itself waited for /apps).
+    fn services_may_start(&self) -> bool {
+        self.settingsd.is_some() && (self.apps_decided() || self.born.elapsed() >= STICK_WAIT)
+    }
+
     /// CL-1/2: starts `/bin/settingsd serve` (uid 0, umask 022, no terminal; it logs to /dev/kmsg) and restarts it
     /// with a back-off. Only on a real boot as pid 1: a test root or a one-pass run never starts services.
     fn settingsd(&mut self) {
@@ -628,8 +777,12 @@ impl Init {
         }
         self.dedup.clear("nosettingsd");
         // Its values live on the stick: wait for /boot (the FAT stick mounts a moment after init starts) so the
-        // first reads are the stick's, at most STICK_WAIT; without a stick it starts on its fallback.
-        if !usys::stat(&self.opts.at("/boot/BITSOS2")).is_ok_and(|s| s.file_type() == "directory") && self.born.elapsed() < STICK_WAIT {
+        // first reads are the stick's, at most STICK_WAIT; without a stick it starts on its fallback. GS-1: not for
+        // /apps (settingsd reads nothing there; `bitspkg register` hands it the packages' keys later): the desktop
+        // waits for its first answer, and the data volume may come seconds after the stick. The services that start
+        // after settingsd still wait for /apps (`services_may_start`), as PK-0 has them.
+        let stick = usys::stat(&self.opts.at("/boot/BITSOS2")).is_ok_and(|s| s.file_type() == "directory");
+        if !stick && self.born.elapsed() < STICK_WAIT {
             self.settingsd_next = Instant::now() + Duration::from_millis(200);
             return;
         }
@@ -647,6 +800,7 @@ impl Init {
                 self.dedup.clear("settingsdspawn");
                 self.log(&format!("started the settings registry {path} (pid {pid})"));
                 self.settingsd = Some(Shell { pid, path, started: Instant::now() });
+                self.register_again();
             }
             Err(e) => {
                 let delay = self.settingsd_backoff.next(0);
@@ -728,7 +882,7 @@ fn write_all(fd: usize, mut b: &[u8]) {
 }
 
 /// mkdir with parents (parents 0755). The umask is 0 during init's own mkdir calls, so every directory gets its
-/// mode exactly, sticky bit included (Linux keeps S_ISVTX in mkdir, linux-6.6/fs/namei.c:4113), without a chmod
+/// mode exactly, sticky bit included (Linux keeps S_ISVTX in mkdir, linux-7.3.1/fs/namei.c:5396), without a chmod
 /// (which a young kernel may not have).
 fn mkdir_p(path: &str, mode: u32) -> Result<(), usys::Errno> {
     let old = usys::umask(0).unwrap_or(0o022);
@@ -773,6 +927,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--power") {
         usys::exit_group(shutdown::client(args.get(1).map_or("status", String::as_str)));
+    }
+    if args.first().map(String::as_str) == Some("--power-holder") {
+        let no_input = args.get(2).map(String::as_str) == Some("--no-input");
+        usys::exit_group(shutdown::holder_client(args.get(1).map_or("status", String::as_str), no_input));
     }
     let opts = Opts::parse(args);
     let interval = Duration::from_millis(opts.interval_ms);

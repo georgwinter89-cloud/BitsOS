@@ -41,7 +41,7 @@ impl Sink {
 }
 
 /// Follows `p` while it is a symlink (also a dangling one, whose target is then created), so the rename replaces
-/// the target and the link stays. Linux gives up after 40 links (ELOOP, linux-6.6/include/linux/namei.h:13); so
+/// the target and the link stays. Linux gives up after 40 links (ELOOP, linux-7.3.1/include/linux/namei.h:14); so
 /// does this, keeping the last path, which then fails or is replaced like any other file.
 fn resolve(p: &Path) -> PathBuf {
     let mut p = p.to_path_buf();

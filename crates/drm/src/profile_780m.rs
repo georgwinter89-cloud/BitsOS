@@ -205,6 +205,12 @@ pub const RADEON_780M: ChipProfile = ChipProfile {
     vbios: Vbios { size: 0, name: "", pn: "113-PHXGENERIC-001", version: 0, ver_str: "", date: "" },
     gds: Gds { gds_size: 0x1000, gws_size: 64, oa_size: 16 },
     ras_features: None,
+    // GFX 11 (gfx_v11_0.c:1070-1085: MQD_SHADOW_BASE_*, MQD_FWWORKAREA_*, GFX11_MEC_HPD_SIZE) and SDMA 6
+    // (sdma_v6_0.c:1256-1257), as Linux 7.3.1 answers on GC 11.0.1.
+    uq_fw_areas: crate::gpu::UqFwAreas { gfx: Some([(73728, 256), (484, 256)]), compute: Some((2048, 256)), sdma: Some((32, 4)) },
+    // BAR2 is 2 MiB on the 780M (lspci); the kernel keeps 0x321 dwords (soc21.c:516: max_assignment 0x190 << 1,
+    // plus one) rounded to a page, and one more page for MES.
+    doorbell_room: (2 << 20) - 2 * 4096,
 };
 
 /// pm_info after the load (MHz, millidegrees, %, W, mV); peak pstate clocks were not reported.
@@ -220,5 +226,7 @@ pub const SENSORS: &[(crate::gpu::Sensor, u32)] = {
         (Vddgfx, 1165),
         (StablePstateSclk, 0),
         (StablePstateMclk, 0),
+        // Not in the capture (the 7.1 kernel had no such query): the fake answers the average.
+        (GpuInputPower, 9),
     ]
 };

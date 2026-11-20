@@ -1,4 +1,4 @@
-//! FS-12 host tests: ioprio values as linux-6.6/block/ioprio.c checks them, the mapping onto the request
+//! FS-12 host tests: ioprio values as linux-7.3.1/block/ioprio.c checks them, the mapping onto the request
 //! priorities, the per-thread table.
 
 use crate::prio::*;

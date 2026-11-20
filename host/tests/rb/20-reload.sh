@@ -24,7 +24,7 @@ LOG="$RUN_DIR/serial.log"
 NAME=rb-reload
 SMP="${RB_SMP:-16}"
 
-# Needs the desk's kernel lines (plan/notes/rb-RB-5a.md, change request 1): without kexec::set_boot_info the
+# Needs the desk's kernel lines (RB-5a's change request 1): without kexec::set_boot_info the
 # kernel cannot hand its BootInfo on, without net::init MCP is not reachable from the host.
 if ! grep -q "kexec::set_boot_info" kernel/src/main.rs || ! grep -q "net::init" kernel/src/main.rs; then
     echo "FAIL: kernel/src/main.rs lacks kexec::set_boot_info or net::init (desk change request 1 of RB-5a / NW-3)"
@@ -35,8 +35,9 @@ fi
 python3 -I "$HERE/reload_scenario.py" --selftest > "$RUN_DIR/selftest.out" || { cat "$RUN_DIR/selftest.out"; exit 1; }
 
 # INT-W27b (SX-3b/3c CR6): the squeeze leaves room for the test bundle's initramfs in one piece; 256 MiB stopped
-# fitting the ~92 MB initramfs (bwrap and the whole glibc set), reload_scenario.py reads the same value.
-export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-384}
+# fitting the ~92 MB initramfs (bwrap and the whole glibc set), 384 MiB the ~145 MB one with ctxd (a 256 MiB block,
+# CTX); reload_scenario.py reads the same value.
+export RB_SQUEEZE_MB=${RB_SQUEEZE_MB:-512}
 # RB-18: a made-up passphrase (no WLAN card here): blanked in the boot record, named in the summary after each Reload.
 cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;wlan_psk=$RB18_PSK;mcp_port=8765;loglevel=info;rb_squeeze_mb=$RB_SQUEEZE_MB;rb_choke_mb=10"
 BUNDLES="$RUN_DIR/bundles"

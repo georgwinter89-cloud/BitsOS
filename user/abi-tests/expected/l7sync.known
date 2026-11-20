@@ -1,0 +1,2 @@
+# Known DIFF cases of `cargo xtask abi-diff` for L7-SYNC's programs: "<case>: <owner>: <why>".
+dyn-getrandom glibc: mm: V2's mmap refuses MAP_DROPPABLE (EINVAL, crates/mm/src/linux.rs map type), so the vDSO's getrandom params query answers -ENOSYS and glibc keeps making the syscall ("glibc fills from the vDSO" no); CachyOS answers 0 and glibc fills from the vDSO. Open item in plan/notes/desk-offen.md, group G1; remove this line when mmap takes MAP_DROPPABLE (the vDSO then says 0 by itself)

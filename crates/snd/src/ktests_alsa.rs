@@ -138,6 +138,19 @@ fn ctl() -> TestResult {
         (r, mem.get(ARG, data.len()))
     };
     kassert!(call(CTL_PVERSION, &[0; 4]).1 == SNDRV_CTL_VERSION.to_le_bytes());
+    // L7-HW: CARD_BYTES (CTL 2.0.10): the components string with its NUL (one byte, the card lists none), the
+    // length alone without a buffer; another type is EINVAL.
+    let mut cb = [0u8; CARD_BYTES_SIZE];
+    put_u32(&mut cb, 0, CARD_BTYPE_COMPONENTS);
+    let (r, v) = call(CTL_CARD_BYTES, &cb);
+    kassert!(r == Ok(0) && get_u32(&v, 8) == 1, "CARD_BYTES length query {r:?} {}", get_u32(&v, 8));
+    mem.set(DATA, &[0xFF; 4]);
+    put_u32(&mut cb, 4, 4);
+    put_u64(&mut cb, 16, DATA);
+    let (r, v) = call(CTL_CARD_BYTES, &cb);
+    kassert!(r == Ok(0) && get_u32(&v, 8) == 1 && mem.get(DATA, 2) == [0, 0xFF], "CARD_BYTES copy {r:?}");
+    put_u32(&mut cb, 0, 2);
+    kassert!(call(CTL_CARD_BYTES, &cb).0 == Err(EINVAL), "CARD_BYTES type 2");
     let (r, c) = call(CTL_CARD_INFO, &[0; CARD_INFO_SIZE]);
     kassert!(r == Ok(0) && &c[card::DRIVER..card::DRIVER + 7] == b"BitsOS\0", "CARD_INFO {r:?}");
     let mut l = [0u8; ELEM_LIST_SIZE];
@@ -310,7 +323,8 @@ fn threads_on(m: &Arc<Mixer>) -> TestResult {
                         return (Err(EPIPE), total);
                     }
                 }
-                // xferi.result holds -EPIPE (linux-6.6/sound/core/pcm_native.c, snd_pcm_xferi_frames_ioctl), not 0.
+                // xferi.result holds -EPIPE (linux-7.3.1/sound/core/pcm_native.c:3323, snd_pcm_xferi_frames_ioctl), not
+                // 0.
                 (Err(EPIPE), _) if xruns < ROUNDS => {
                     xruns += 1;
                     if t.call(PCM_PREPARE, 0).is_err() {

@@ -1,7 +1,7 @@
 //! One bound HID interface: probe (descriptor, protocol, input devices, the interrupt pipe), the report path
 //! (pipe sink -> hidparse -> `console::evdev` input devices) and the unplug path (every held key released).
 //!
-//! Probe follows Linux usbhid (linux-6.6/drivers/hid/usbhid/hid-core.c:979-1058 `usbhid_parse`, 1060-1192
+//! Probe follows Linux usbhid (linux-7.3.1/drivers/hid/usbhid/hid-core.c:983-1081 `usbhid_parse`, 1082-1227
 //! `usbhid_start`): SET_IDLE 0, the report descriptor read with up to four tries, hid-generic's input devices.
 //! Unlike Linux, an interface that supports the boot protocol falls back to it (V1's path, spec usb.md §4.2)
 //! when the report descriptor cannot be read, does not parse or maps to no input at all. Like Linux, the report
@@ -9,7 +9,7 @@
 //! and some receivers misbehave on an unexpected SET_PROTOCOL.
 //!
 //! Gamepads (IN-2b): a Joystick or Gamepad application gets its endpoint polled every 1 ms whatever bInterval
-//! says (`class::fast_interval`, V1 `pad_fast`; CONFIG `usbhid_pad_binterval=on` keeps the descriptor's), and
+//! says (`class::fast_interval`, V1 `pad_fast`), and
 //! Sixaxis-family pads (DualShock 3) are woken with GET_REPORT of feature reports 0xF2 and 0xF5 before their
 //! pipe starts (Linux hid-sony). String descriptors are never read: Georg's DragonRise answers an index it does
 //! not name with 255 bytes of its memory (spec usb.md §2).
@@ -101,6 +101,8 @@ pub struct HidIface {
     /// Bytes per interrupt transfer (the longest report, at least the packet size).
     pub report_len: usize,
     pub leds: Leds,
+    /// GM-6p: the battery its descriptor declares, as `/sys/class/power_supply/<name>`.
+    pub battery: Option<crate::battery::PadBattery>,
     st: SpinLock<St>,
     pipe: SpinLock<Option<PipeHandle>>,
     stopping: AtomicBool,
@@ -152,10 +154,11 @@ pub fn take(dev: &Device, iface: u8) -> Option<Arc<HidIface>> {
     Some(l.remove(at))
 }
 
-/// CONFIG keys that leave HID devices unbound: `usbhid_raw`, and US's scenarios that drive HID devices with
-/// their own test drivers or raw pipes (`usb_xfer_test` for 40-xfer.sh, `usb_unplug_test` for 30-unplug.sh).
+/// The test keys that leave HID devices unbound: US's scenarios that drive HID devices with their own timed pipes,
+/// test drivers or raw pipes (`usb_ev_test` for 60-ev.sh, `usb_xfer_test` for 40-xfer.sh, `usb_unplug_test` for
+/// 30-unplug.sh).
 pub fn left_raw() -> Option<&'static str> {
-    ["usbhid_raw", "usb_xfer_test", "usb_unplug_test"].into_iter().find(|k| pci::registry::opted_in(k))
+    ["usb_ev_test", "usb_xfer_test", "usb_unplug_test"].into_iter().find(|k| pci::registry::opted_in(k))
 }
 
 pub fn probe(dev: &Arc<Device>, f: &Interface) -> Result<Arc<HidIface>, String> {
@@ -177,7 +180,7 @@ fn probe_inner(dev: &Arc<Device>, f: &Interface) -> Result<Arc<HidIface>, String
     let boot_kind = (f.subclass == class::SUBCLASS_BOOT)
         .then_some(f.protocol)
         .filter(|&p| p == class::PROTOCOL_KEYBOARD || p == class::PROTOCOL_MOUSE);
-    let hid = class::hid_descriptor(&f.extra);
+    let hid = class::hid_descriptor(&f.extra, f.endpoints.first().map(|e| f.endpoint_extra(e.address)));
     // Linux sends SET_IDLE(0) before reading the report descriptor; many devices stall it, that is fine.
     if let Err(e) = dev.control_out(class::set_idle(f.number, 0), &[]) {
         klog::event!(Debug, "input", "hid.set_idle_refused", device = dev.path(), interface = f.number, error = e.as_str());
@@ -220,8 +223,9 @@ fn probe_inner(dev: &Arc<Device>, f: &Interface) -> Result<Arc<HidIface>, String
     let input = InputState::new(&desc, &map, report_len);
     let inputs = register_inputs(dev, f.number, &desc, &map);
     let leds = Leds::new(&map);
+    let battery = crate::battery::probe(dev, f.number, &desc);
     let pad = map.groups.iter().zip(&inputs).any(|(g, d)| d.is_some() && class::is_pad(g.application));
-    let poll_want = class::pad_poll(pad, pci::registry::opted_in("usbhid_pad_binterval"), dev.speed(), ep.interval);
+    let poll_want = class::pad_poll(pad, dev.speed(), ep.interval);
     let hid = Arc::new(HidIface {
         dev: dev.clone(),
         iface: f.number,
@@ -236,6 +240,7 @@ fn probe_inner(dev: &Arc<Device>, f: &Interface) -> Result<Arc<HidIface>, String
         poll_want,
         report_len,
         leds,
+        battery,
         st: SpinLock::named("hid.iface", St { input, gone: false, events: Vec::new(), pending: Vec::new() }),
         pipe: SpinLock::named("hid.pipe", None),
         stopping: AtomicBool::new(false),
@@ -247,7 +252,8 @@ fn probe_inner(dev: &Arc<Device>, f: &Interface) -> Result<Arc<HidIface>, String
         bad_reports: AtomicU64::new(0),
         errors: AtomicU64::new(0),
     });
-    if hid.inputs.iter().any(Option::is_some) {
+    // A battery needs its reports too, also beside an application that maps to no event.
+    if hid.inputs.iter().any(Option::is_some) || hid.battery.is_some() {
         // Running before the start: a pipe given up at once must find it running to be restarted.
         hid.pipe_state.store(PIPE_RUNNING, Ordering::Release);
         match hid.start_pipe() {
@@ -485,6 +491,9 @@ impl HidIface {
                 return;
             }
         }
+        if let Some(b) = &self.battery {
+            b.on_report(r);
+        }
         // One report belongs to one group (hidparse maps reports, not fields, to input devices).
         let Some(group) = events.first().map(|e| e.group) else { return };
         let Some(Some(dev)) = self.inputs.get(group) else { return };
@@ -504,6 +513,9 @@ impl HidIface {
             d.unregister(now);
         }
         crate::leds::detach(self);
+        if let Some(b) = &self.battery {
+            b.remove();
+        }
         // Taken out first: stopping waits for the controller, never under the spin lock.
         let pipe = self.pipe.lock().take();
         if let Some(p) = pipe

@@ -243,20 +243,20 @@ fn untouched_function_is_refused_without_any_write() {
     let mut d = device();
     d.pm(0x40, 0x50, 3, false);
     let w = chain(d);
-    let key = |n: &Node| (n.loc == DEV).then_some("wlan");
+    let key = |n: &Node| (n.loc == DEV).then_some(super::HELD);
     let nodes = build(&w, &ALL, key);
     // Its bridge serves only it: untouched too.
-    assert_eq!(nodes[idx(&nodes, BR)].untouched, Some("wlan"));
+    assert_eq!(nodes[idx(&nodes, BR)].untouched, Some(super::HELD));
     w.writes.lock().unwrap().clear();
     let (o, waits) = run(&w, &nodes, DEV, true, false);
-    assert_eq!(o.error, Some(EnableError::Untouched("wlan")));
+    assert_eq!(o.error, Some(EnableError::Untouched(super::HELD)));
     assert_eq!(o.error.unwrap().name(), "enable.refused");
     assert!(waits.is_empty() && o.changes.is_empty());
     assert!(w.writes.lock().unwrap().is_empty());
     // A touched function below an untouched bridge (cannot come from the scan) is refused too.
     let mut nodes = build(&w, &ALL, no_keys);
     let b = idx(&nodes, BR);
-    nodes[b].untouched = Some("wlan");
+    nodes[b].untouched = Some(super::HELD);
     w.writes.lock().unwrap().clear();
     assert_eq!(run(&w, &nodes, DEV, true, false).0.error, Some(EnableError::BridgeUntouched(BR)));
     assert!(w.writes.lock().unwrap().is_empty());
@@ -403,9 +403,9 @@ fn minipc_i226_switches_on_only_its_root_port() {
     // The WLAN and its port: refused, not a single write (R8d).
     w.writes.lock().unwrap().clear();
     let (o, _) = run(&w, &nodes, Loc::new(0, WLAN.0, 0, 0), true, false);
-    assert_eq!(o.error, Some(EnableError::Untouched("wlan")));
+    assert_eq!(o.error, Some(EnableError::Untouched(super::HELD)));
     let wb = find(&nodes, WLAN_BRIDGE.0, WLAN_BRIDGE.1, WLAN_BRIDGE.2).unwrap();
-    assert_eq!(wb.untouched, Some("wlan"));
+    assert_eq!(wb.untouched, Some(super::HELD));
     assert!(w.writes.lock().unwrap().is_empty());
     // The NVMe without the NVMe driver: refused, nothing written.
     let (o, _) = run(&w, &nodes, Loc::new(0, 1, 0, 0), true, false);
@@ -579,4 +579,19 @@ fn quiet_access_does_not_wait_for_a_held_cfg_lock() {
     // On the host 0xCF8 reads all ones: nothing was on, nothing written; the pair itself was free.
     assert_eq!(d, enable::Disabled::default());
     assert!(!q.gave_up());
+}
+
+/// GP B7: only an enable that would set bus master is refused, only while the IOMMU verdict blocks, and the error
+/// carries the verdict's name. With the gate open (no DMAR table: the Mini-PC) both kinds pass.
+#[test]
+fn dma_gate_refuses_only_bus_master_under_a_blocking_verdict() {
+    assert_eq!(enable::dma_allowed(true, Ok(())), Ok(()));
+    assert_eq!(enable::dma_allowed(false, Ok(())), Ok(()));
+    for verdict in ["translation_on", "protected_memory_on"] {
+        assert_eq!(enable::dma_allowed(true, Err(verdict)), Err(EnableError::DmaBlocked(verdict)));
+        assert_eq!(enable::dma_allowed(false, Err(verdict)), Ok(()), "no bus master asked: nothing to refuse");
+    }
+    let e = EnableError::DmaBlocked("translation_on");
+    assert_eq!(e.name(), "enable.refused");
+    assert!(alloc::format!("{e}").contains("translation_on"));
 }

@@ -12,7 +12,7 @@
 //! Commands are in `command.rs`, event handling in `events.rs` (further `impl` blocks of `Controller`).
 
 use crate::mem::DmaMem;
-use crate::quirks::Quirks;
+use crate::quirks::{Quirks, Timing};
 use crate::regs::{self, cmd, crcr, iman, legacy, portsc, sts, Caps, ExtCaps};
 use crate::ring::{EventRing, ProducerRing, RingError};
 use crate::slot::SlotEntry;
@@ -30,12 +30,12 @@ pub const RESET_NS: u64 = 1000 * MS;
 /// After writing HCRST nothing is read for 1 ms (Linux `xhci_reset`: some Intel controllers hang otherwise).
 pub const HCRST_QUIET_NS: u64 = MS;
 /// RB-13: the panic path's bound for HCRST and CNR (Linux `xhci_shutdown`'s XHCI_RESET_SHORT_USEC,
-/// linux-6.6/drivers/usb/host/xhci.h:233).
+/// linux-7.3.1/drivers/usb/host/xhci.h:156).
 pub const PANIC_RESET_NS: u64 = 250 * MS;
 pub const BIOS_NS: u64 = 1000 * MS;
 /// A command waits at most this long, then the command ring is aborted: 5 s as Linux's XHCI_CMD_DEFAULT_TIMEOUT
-/// (linux-6.6/drivers/usb/host/xhci.h:1580). V1 had 1 s; US-R: a wedged stick's Address Device may take longer, and an
-/// abort for that would fail the reset that was about to bring it back.
+/// (linux-7.3.1/drivers/usb/host/xhci.h:1323). V1 had 1 s; US-R: a wedged stick's Address Device may take longer,
+/// and an abort for that would fail the reset that was about to bring it back.
 pub const CMD_NS: u64 = 5000 * MS;
 pub const ABORT_NS: u64 = 1000 * MS;
 /// How long a caller waits for its turn on the command ring (one command at a time, each bounded).
@@ -186,6 +186,7 @@ pub struct Controller<E: Env> {
     pub(crate) caps: Caps,
     pub(crate) ext: ExtCaps,
     pub(crate) quirks: Quirks,
+    timing: Timing,
     pub(crate) state: AtomicU8,
     reason: SpinLock<String>,
     pub(crate) cmd: SpinLock<Option<CmdState<E::Mem>>>,
@@ -244,7 +245,7 @@ pub(crate) enum Wait {
 pub struct PanicStop {
     /// The registers read all ones: nothing more was written.
     pub gone: bool,
-    /// HCH within `HALT_NS`.
+    /// HCH within the controller's halt bound (`Timing::halt_ns`).
     pub halted: bool,
     /// HCRST written (only on a halted controller).
     pub reset: bool,
@@ -309,6 +310,7 @@ impl<E: Env> Controller<E> {
             caps,
             ext,
             quirks: Quirks::default(),
+            timing: Timing::V1,
             state: AtomicU8::new(State::Down as u8),
             reason: SpinLock::named("xhci.reason", String::new()),
             cmd: SpinLock::named("xhci.cmd", None),
@@ -345,8 +347,17 @@ impl<E: Env> Controller<E> {
         self
     }
 
+    /// The bring-up's time bounds for this controller's vendor (`quirks::timing_for`); V1's by default.
+    pub fn with_timing(mut self, t: Timing) -> Self {
+        self.timing = t;
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+    pub fn timing(&self) -> Timing {
+        self.timing
     }
     pub fn quirks(&self) -> Quirks {
         self.quirks
@@ -588,15 +599,16 @@ impl<E: Env> Controller<E> {
             return Err("halt: registers read all ones (device gone)".into());
         }
         self.wr(c, v & !(cmd::RS | cmd::INTE | cmd::HSEE));
-        self.poll_or(self.caps.op(regs::USBSTS), sts::HCH, sts::HCH, HALT_NS, "halt (HCH)")
+        self.poll_or(self.caps.op(regs::USBSTS), sts::HCH, sts::HCH, self.timing.halt_ns, "halt (HCH)")
     }
 
     fn reset(&self) -> Result<(), String> {
         self.wr(self.caps.op(regs::USBCMD), cmd::HCRST);
         self.env.delay_ns(HCRST_QUIET_NS);
         let start = self.now();
-        self.poll_or(self.caps.op(regs::USBCMD), cmd::HCRST, 0, RESET_NS, "reset (HCRST)")?;
-        let left = RESET_NS.saturating_sub(self.now().saturating_sub(start));
+        let t = self.timing;
+        self.poll_or(self.caps.op(regs::USBCMD), cmd::HCRST, 0, t.hcrst_ns, "reset (HCRST)")?;
+        let left = t.cnr_ns.unwrap_or_else(|| t.hcrst_ns.saturating_sub(self.now().saturating_sub(start)));
         self.poll_or(self.caps.op(regs::USBSTS), sts::CNR, 0, left, "reset (CNR)")
     }
 
@@ -694,7 +706,7 @@ impl<E: Env> Controller<E> {
         let c = self.caps.op(regs::USBCMD);
         let v = self.rd(c);
         self.wr(c, (v & !(cmd::INTE | cmd::HSEE | cmd::HCRST)) | cmd::RS);
-        self.poll_or(self.caps.op(regs::USBSTS), sts::HCH, 0, HALT_NS, "run (HCH clear)")?;
+        self.poll_or(self.caps.op(regs::USBSTS), sts::HCH, 0, self.timing.halt_ns, "run (HCH clear)")?;
         let s = self.usbsts();
         if s & sts::HSE != 0 {
             return Err("HSE right after start: DMA does not reach memory (bridge bus master?)".into());
@@ -755,7 +767,8 @@ impl<E: Env> Controller<E> {
     // ---------------------------------------------------------------------------------------------------
     // Quiesce and restart
 
-    /// Stops DMA: RS off, wait for HCH (spinning, bounded), bus master off. Lock-free and without klog (the panic
+    /// Stops DMA: RS off, wait for HCH (spinning, bounded by the same halt bound as the bring-up: a controller
+    /// that needs Linux's 32 ms to halt needs them here too), bus master off. Lock-free and without klog (the panic
     /// path may hold klog's locks); a note is left for the event thread. The controller stays stopped until
     /// `restart`.
     pub fn quiesce(&self) {
@@ -767,7 +780,7 @@ impl<E: Env> Controller<E> {
         let mut halted = false;
         if v != u32::MAX {
             self.wr(c, v & !(cmd::RS | cmd::INTE | cmd::HSEE));
-            halted = self.poll(self.caps.op(regs::USBSTS), sts::HCH, sts::HCH, HALT_NS, false).is_ok();
+            halted = self.poll(self.caps.op(regs::USBSTS), sts::HCH, sts::HCH, self.timing.halt_ns, false).is_ok();
         }
         let _ = self.env.bus_master(false);
         self.quiesce_note.store(0x80 | if halted { 0x40 } else { 0 } | (was & 0x3F), Ordering::Release);
@@ -776,10 +789,10 @@ impl<E: Env> Controller<E> {
     }
 
     /// RB-13, the panic path before the machine reset (granted to RB with `driver::panic_stop_all`): halt (RS
-    /// off, HCH within `HALT_NS`), on a halted controller HCRST with CNR clear within `PANIC_RESET_NS`, then bus
-    /// master off. Linux's `xhci_shutdown` halts and resets only for some controllers
-    /// (linux-6.6/drivers/usb/host/xhci.c:631-662; no reset when not halted, as in `xhci_reset`, :171-186);
-    /// here every halted one is reset, so the firmware takes the root ports over as after power-on (the
+    /// off, HCH within the controller's halt bound: `HALT_NS`, Linux's 32 ms for Intel), on a halted controller
+    /// HCRST with CNR clear within `PANIC_RESET_NS`, then bus master off. Linux's `xhci_shutdown` halts and resets
+    /// only for some controllers (linux-7.3.1/drivers/usb/host/xhci.c:750-784; no reset when not halted, as in
+    /// `xhci_reset`, :182-199); here every halted one is reset, so the firmware takes the root ports over as after power-on (the
     /// Mini-PC booted Windows instead of the stick after a panic reset, 27.10.). Spinning waits only; no lock,
     /// heap, klog or sleep. The controller stays `Quiesced`: after HCRST its rings are stale, nothing may restart it.
     ///
@@ -797,7 +810,7 @@ impl<E: Env> Controller<E> {
             r.gone = true;
         } else {
             self.wr(c, v & !(cmd::RS | cmd::INTE | cmd::HSEE));
-            match self.panic_poll(s, sts::HCH, sts::HCH, HALT_NS, now) {
+            match self.panic_poll(s, sts::HCH, sts::HCH, self.timing.halt_ns, now) {
                 Ok(()) => r.halted = true,
                 Err(Wait::Gone) => r.gone = true,
                 Err(Wait::Timeout) => {}

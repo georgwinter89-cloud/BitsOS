@@ -1,7 +1,8 @@
-//! The controller's link: reset, codec detection, the command rings (CORB/RIRB) and the immediate command
-//! registers as fallback. Sequences after `linux-6.6/sound/hda/hdac_controller.c` (`init_cmd_io` :43,
-//! `stop_cmd_io` :112, `update_rirb` :190, `reset_link` :422) and V1 `snd/hda.asm` (`hda_reset` :180) and
-//! `snd/verb.asm` (`hda_cmd` :48, `hda_rings` :95), without klog: the caller logs (B6).
+//! The controller's link: reset, codec detection, the command rings (CORB/RIRB) and the immediate command registers as
+//! fallback. Sequences after `linux-6.6/sound/hda/hdac_controller.c` (`init_cmd_io` :43, `stop_cmd_io` :112,
+//! `update_rirb` :190, `reset_link` :422; Linux 7.3.1 differs: `linux-7.3.1/sound/hda/core/controller.c:43`, see
+//! plan/spec/linux7-differences.md) and V1 `snd/hda.asm` (`hda_reset` :180) and `snd/verb.asm` (`hda_cmd` :48,
+//! `hda_rings` :95), without klog: the caller logs (B6).
 
 use crate::hw::{until, Hw, Mem};
 use crate::regs::*;

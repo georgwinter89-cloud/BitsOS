@@ -1,8 +1,13 @@
-//! AB-6 fixer: interval timers and POSIX timers, the senders of SIGALRM, SIGVTALRM, SIGPROF and SI_TIMER
-//! signals (linux-6.6/kernel/time/itimer.c: getitimer :112, setitimer :336, alarm :312; kernel/time/
-//! posix-timers.c: timer_create :551, timer_gettime :648, timer_getoverrun :714, timer_settime :911,
-//! timer_delete :996). This file checks and copies; the timers live in the group's signal state and fire from
+//! AB-6 fixer: interval timers and POSIX timers, the senders of SIGALRM, SIGVTALRM, SIGPROF and SI_TIMER signals
+//! (linux-7.3.1/kernel/time/itimer.c: getitimer :113, setitimer :351, alarm :325; kernel/time/posix-timers.c:
+//! timer_create :574 (`do_timer_create` :466), timer_gettime :752, timer_getoverrun :800, timer_settime :962,
+//! timer_delete :1067). This file checks and copies; the timers live in the group's signal state and fire from
 //! `proc::itimer`'s service.
+//!
+//! L7-SYNC: timer_create on an auxiliary clock (16..23) is EOPNOTSUPP (no `timer_create` in `clock_aux`). With
+//! PR_TIMER_CREATE_RESTORE_IDS on (CRIU), timer_create takes the id the caller put into `*created_timer_id`
+//! (EFAULT when unreadable, EINVAL above INT_MAX, EBUSY when taken; posix-timers.c:157 `posix_timer_add`) and
+//! the next free id moves past it.
 //!
 //! Clocks of timer_create: REALTIME and TAI (absolute times are wall times; V2's wall clock never jumps, so they
 //! count on the monotonic clock), MONOTONIC, BOOTTIME (= MONOTONIC: V2 never suspends), the CPU clocks
@@ -106,6 +111,7 @@ fn timer_clock(id: i32) -> Result<(ClockSpec, bool, Option<i64>), i64> {
     Ok(match clock {
         Clock::Cpu { pid, thread, which } => (ClockSpec::Cpu { pid, thread, which }, false, None),
         Clock::Alarm { real } => (ClockSpec::Mono, real, Some(-EPERM)),
+        Clock::Aux => return Err(-EOPNOTSUPP),
         Clock::Realtime | Clock::Monotonic => match id {
             CLOCK_REALTIME | CLOCK_TAI => (ClockSpec::Mono, true, None),
             CLOCK_MONOTONIC | CLOCK_BOOTTIME => (ClockSpec::Mono, false, None),
@@ -131,10 +137,30 @@ fn sys_timer_create(c: &mut SysCtx<'_>) -> i64 {
         Err(e) => return e,
     };
     let g = c.proc.group();
-    let (id, notify, signo, value) = match g.timer_prepare(ev) {
-        Ok(x) => x,
-        Err((_, e)) => return -e,
+    // `posix_timer_add` with a requested id: the free-id counter is pointed at it, so the allocation takes exactly
+    // it. RESTORING keeps other restore-mode calls from moving the counter between the two steps; a call that
+    // still gets another id (the mode switched off in another thread meanwhile) answers EBUSY, never that id.
+    let req = match restore_id(c, idp) {
+        Ok(r) => r,
+        Err(e) => return e,
     };
+    let held = req.map(|_| RESTORING.lock());
+    let old = match req.map(|r| point_counter_at(c, r)).transpose() {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let (id, notify, signo, value) = match g.timer_prepare(ev) {
+        Ok(x) if req.is_none_or(|r| x.0 == r) => x,
+        Ok(_) => return -EBUSY,
+        Err((at, e)) => {
+            if let (None, Some(old)) = (at, old) {
+                // Refused before an id was taken (RLIMIT_SIGPENDING): the counter is as it was.
+                c.proc.signals.raw(|s| s.timers.next_id = old);
+            }
+            return -e;
+        }
+    };
+    drop(held);
     if c.proc.mm.copy_to_user(idp, &id.to_le_bytes()).is_err() {
         return -EFAULT;
     }
@@ -151,10 +177,43 @@ fn sys_timer_create(c: &mut SysCtx<'_>) -> i64 {
     t.wall = wall;
     match g.timer_insert(id, t) {
         Ok(()) => 0,
+        // Two restore-mode calls for the same id (the first not yet inserted when the second looked): the later
+        // one finds it taken, as `posix_timer_add_at` would.
+        Err(_) if req.is_some() => -EBUSY,
         Err(e) => -e,
     }
 }
 crate::syscall_nr!(uapi::ab::nr_more::TIMER_CREATE, "timer_create", sys_timer_create);
+
+/// Held by a restore-mode timer_create from pointing the counter to taking the id (one lock for all processes:
+/// only checkpoint restore uses the mode, and the hold is two short signal-lock sections).
+static RESTORING: ksync::Mutex<()> = ksync::Mutex::named("syscall.timer_restore", ());
+
+/// PR_TIMER_CREATE_RESTORE_IDS mode: the id at `idp` (EFAULT, EINVAL above INT_MAX). None outside the mode.
+fn restore_id(c: &SysCtx<'_>, idp: u64) -> Result<Option<i32>, i64> {
+    if !c.proc.signals.raw(|s| s.timers.restore_ids) {
+        return Ok(None);
+    }
+    let mut b = [0u8; 4];
+    if c.proc.mm.copy_from_user(&mut b, idp).is_err() {
+        return Err(-EFAULT);
+    }
+    let req = i32::from_le_bytes(b);
+    if req < 0 {
+        return Err(-EINVAL);
+    }
+    Ok(Some(req))
+}
+
+/// EBUSY when timer `req` exists, else the free-id counter is set to it; returns the counter before.
+fn point_counter_at(c: &SysCtx<'_>, req: i32) -> Result<i32, i64> {
+    c.proc.signals.raw(|s| {
+        if s.timers.posix.contains_key(&req) {
+            return Err(-EBUSY);
+        }
+        Ok(core::mem::replace(&mut s.timers.next_id, req))
+    })
+}
 
 fn sys_timer_settime(c: &mut SysCtx<'_>) -> i64 {
     let [id, flags, new, old, ..] = c.args;
@@ -172,6 +231,7 @@ fn sys_timer_settime(c: &mut SysCtx<'_>) -> i64 {
         Ok(r) => r,
         Err(e) => return -e,
     };
+    c.proc.signals.raw(|s| s.posix_fire_if_due(id as i32, time::now_ns()));
     if old != 0 && c.proc.mm.copy_to_user(old, &itimerspec_bytes(oiv, ov)).is_err() {
         return -EFAULT;
     }
@@ -238,6 +298,9 @@ mod tests {
         assert_eq!(timer_clock(CLOCK_MONOTONIC_RAW), Err(-EOPNOTSUPP));
         assert_eq!(timer_clock(CLOCK_REALTIME_COARSE), Err(-EOPNOTSUPP));
         assert_eq!(timer_clock(10), Err(-EINVAL));
+        assert_eq!(timer_clock(16), Err(-EOPNOTSUPP), "CLOCK_AUX");
+        assert_eq!(timer_clock(23), Err(-EOPNOTSUPP), "CLOCK_AUX_LAST");
+        assert_eq!(timer_clock(24), Err(-EINVAL));
         assert_eq!(timer_clock(CLOCK_BOOTTIME_ALARM).map(|x| x.2), Ok(Some(-EPERM)));
         assert!(matches!(timer_clock(CLOCK_PROCESS_CPUTIME_ID), Ok((ClockSpec::Cpu { pid: 0, thread: false, .. }, false, None))));
     }

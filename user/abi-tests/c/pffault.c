@@ -1,8 +1,8 @@
 /* PF-4: read and pread of a cached file into a buffer whose later part faults (a PROT_NONE page, a read-only
  * page, an unmapped page). Linux copies page by page and stops at the first user page that cannot be written:
  * the call returns the bytes before it (EFAULT when there are none) and read(2) moves the position by exactly
- * those (linux-6.6/mm/shmem.c shmem_file_read_iter, mm/filemap.c:2703-2709 filemap_read). Every byte that
- * reached the buffer is compared with the file. readv/preadv the same over several segments: the copy goes
+ * those (linux-7.3.1/mm/shmem.c:3307 shmem_file_read_iter, mm/filemap.c:2875-2884 filemap_read). Every
+ * byte that reached the buffer is compared with the file. readv/preadv the same over several segments: the copy goes
  * segment by segment and stops at the first faulting byte, a later writable segment stays untouched.
  * Argument: the directory for the file (default /tmp). */
 #include "abi.h"

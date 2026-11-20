@@ -6,11 +6,11 @@ use crate::bytes::u32_at;
 use crate::mem::{self, Loaded, Metered, PhysMem, TableError, PARSE_BUDGET};
 use crate::rsdp::{self, Rsdp, RsdpError};
 use crate::sdt::{self, Signature, HEADER_LEN};
-use crate::{cst, fadt, hpet, ivrs, madt, mcfg, s5, srat, Acpi, Note, Notes, RootKind, TableInfo};
+use crate::{cst, dmar, fadt, hpet, ivrs, madt, mcfg, s5, srat, Acpi, Note, Notes, RootKind, TableInfo};
 use alloc::vec::Vec;
 
 /// Tables copied and parsed (the first good one of each signature counts, as in V1 and Linux).
-const USED: [Signature; 6] = [sdt::FADT, sdt::MADT, sdt::HPET, sdt::MCFG, sdt::IVRS, sdt::SRAT];
+const USED: [Signature; 7] = [sdt::FADT, sdt::MADT, sdt::HPET, sdt::MCFG, sdt::IVRS, sdt::SRAT, sdt::DMAR];
 
 /// Reads every table with the default total budget (`mem::PARSE_BUDGET`).
 pub fn parse(mem: &mut dyn PhysMem, rsdp_phys: u64) -> Acpi {
@@ -178,6 +178,13 @@ fn avoid_registers(mem: &mut dyn PhysMem, sig: &Signature, a: &Acpi) {
                 mem.avoid(s, e);
             }
         }
+        b"DMAR" => {
+            if let Some(d) = &a.dmar {
+                for u in &d.units {
+                    page(u.address, u.reg_bytes());
+                }
+            }
+        }
         b"IVRS" => {
             if let Some(r) = &a.ivrs {
                 // The IOMMU's MMIO block: 16 KiB, 512 KiB with extended features (Linux MMIO_REG_END_OFFSET).
@@ -217,6 +224,10 @@ fn use_table(t: &Loaded, a: &mut Acpi) -> bool {
         b"SRAT" => {
             a.srat = srat::parse(b, p, n);
             a.srat.is_some()
+        }
+        b"DMAR" => {
+            a.dmar = dmar::parse(b, p, n);
+            a.dmar.is_some()
         }
         _ => false,
     }

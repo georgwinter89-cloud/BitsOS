@@ -57,6 +57,24 @@ fn current() -> Option<net::sock::Caller> {
 
 static HOOKS: net::sock::Hooks = net::sock::Hooks { interrupted: killed, sigpipe, pid_exists, current };
 
+/// SCM_PIDFD (L7-NET): the sender's thread group, held by the message from the send on (`get_pid`); nearly
+/// always the caller, so its own thread is looked at before the process table.
+fn pin_pid(pid: u32) -> Option<net::sock::PinnedPid> {
+    let g = match proc::current_thread() {
+        Some(t) if t.group().tgid == pid => t.group().clone(),
+        _ => proc::find(pid)?.group().clone(),
+    };
+    Some(g)
+}
+
+/// `pidfd_prepare(pid, PIDFD_STALE)`: a pidfd of the held group, also once it has ended or was reaped.
+fn open_pidfd(p: &net::sock::PinnedPid) -> Result<alloc::sync::Arc<vfs::OpenFile>, vfs::Errno> {
+    let g = p.clone().downcast::<proc::Group>().map_err(|_| ESRCH)?;
+    Ok(proc::pidfd::new_file(&g, None, false, false))
+}
+
+static PIDFD_HOOK: net::sock::PidfdHook = net::sock::PidfdHook { pin: pin_pid, open: open_pidfd };
+
 /// NW-11: a calling program's pid and user namespaces as the socket layer asks for them (`pid_vnr`,
 /// `find_vpid`, `make_kuid`, `from_kuid_munged`, `ns_capable`).
 struct ProcIds {
@@ -126,7 +144,12 @@ static NS_HOOKS: net::sock::NsHooks = net::sock::NsHooks { current: ns_current }
 
 
 fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
+    with_sys(c, |sys, a| f(sys, a))
+}
+
+fn with_sys(c: &mut SysCtx<'_>, f: impl FnOnce(&Sys<'_>, Args) -> i64) -> i64 {
     net::sock::set_hooks(&HOOKS);
+    net::sock::set_pidfd_hook(&PIDFD_HOOK);
     net::sock::set_ns_hooks(&NS_HOOKS);
     vfs::dentry::set_interrupt_check(killed);
     let p = c.proc;
@@ -137,6 +160,13 @@ fn run(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     let sys = Sys { mem: &mem, fds: &p.fds, fs: &fs, ns, cred: p.fs_cred(), subject: p.subject() };
     let a: Args = c.args;
     f(&sys, a)
+}
+
+/// connect, listen and socketpair (INT-CL3T): an AF_UNIX socket keeps the calling program image with the peer
+/// credentials (`proc::peer`), so a listener learns which program connected, not only which pid.
+fn run_recorded(c: &mut SysCtx<'_>, f: fn(&Sys<'_>, Args, s::Who<'_>) -> i64) -> i64 {
+    let image = c.proc;
+    with_sys(c, |sys, a| f(sys, a, &|| Some(proc::peer::record(image))))
 }
 
 /// NW-6: the interface ioctls of a socket fd, asked by `ioctl.rs` before the file's own ioctl: Some(result) when
@@ -171,8 +201,19 @@ macro_rules! sock_call {
     };
 }
 
+macro_rules! sock_recorded {
+    ($NR:ident, $f:path) => {
+        const _: () = {
+            fn h(c: &mut SysCtx<'_>) -> i64 {
+                run_recorded(c, $f)
+            }
+            crate::syscall!($NR, h);
+        };
+    };
+}
+
 sock_call!(SOCKET, s::socket);
-sock_call!(CONNECT, s::connect);
+sock_recorded!(CONNECT, s::connect_by);
 sock_call!(ACCEPT, s::accept);
 sock_call!(SENDTO, s::sendto);
 sock_call!(RECVFROM, s::recvfrom);
@@ -180,10 +221,10 @@ sock_call!(SENDMSG, s::sendmsg);
 sock_call!(RECVMSG, s::recvmsg);
 sock_call!(SHUTDOWN, s::shutdown);
 sock_call!(BIND, s::bind);
-sock_call!(LISTEN, s::listen);
+sock_recorded!(LISTEN, s::listen_by);
 sock_call!(GETSOCKNAME, s::getsockname);
 sock_call!(GETPEERNAME, s::getpeername);
-sock_call!(SOCKETPAIR, s::socketpair);
+sock_recorded!(SOCKETPAIR, s::socketpair_by);
 /// setsockopt/getsockopt: an option the stack does not know is logged once (YT-4a CR 11).
 fn sockopt(c: &mut SysCtx<'_>, f: SysFn) -> i64 {
     let r = run(c, f);

@@ -187,7 +187,7 @@ impl InodeOps for Ops {
         f.register();
         f.cache.write_at(pos, &buf[..n])
     }
-    /// `fat_fallocate` (linux-6.6/fs/fat/file.c:260): mode 0 is an expanding truncate (the new bytes read as
+    /// `fat_fallocate` (linux-7.3.1/fs/fat/file.c:263): mode 0 is an expanding truncate (the new bytes read as
     /// zeros); FALLOC_FL_KEEP_SIZE promises the clusters up to the end (ENOSPC now, the size stays: V2 allocates
     /// at write-back, so the promise is what Linux's preallocated clusters give a program); other modes
     /// EOPNOTSUPP.

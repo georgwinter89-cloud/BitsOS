@@ -32,6 +32,8 @@ fn cpu() -> Vec<String> {
     out.push(format!("cpus online={} (hal::percpu)", hal::percpu::cpu_count()));
     // CP-4/CP-6: one line per CPU (topology, capacity, ready time, TSC offset, MTRR outcome).
     out.extend(platform::smp::summary());
+    out.push(platform::smp::hwp_line());
+    out.push(platform::smp::msr_faults_line());
     let f = hal::cpu::detect();
     // Interrupts off for the few MSR reads: no preemption, so the banks and the CPU number belong together.
     let (cpu, m) = {
@@ -132,16 +134,37 @@ fn section(name: &str, now_ns: u64) -> Vec<String> {
     }
 }
 
+/// GP-ROUND: the Gaming-PC's report page, the same text as on its screen and in its file on the stick.
+fn report() -> Vec<String> {
+    match crate::boot::report() {
+        Some(Some(l)) => l,
+        Some(None) => alloc::vec![String::from("report: not ready yet (the page appears within about a minute after the start)")],
+        None => alloc::vec![String::from("report: none on this machine (only the Gaming-PC's profile makes one)")],
+    }
+}
+
 fn hw_info(ctx: &ToolContext, args: &Json) -> ToolResult {
+    // The report is part of "all" only where it exists, so the answer on every other machine is what it was.
+    let has_report = crate::boot::report().is_some();
     let pick = match opt_str(args, "section")? {
-        None | Some("all") => SECTIONS.to_vec(),
-        Some(s) if SECTIONS.contains(&s) => alloc::vec![s],
+        None | Some("all") => {
+            let mut v = SECTIONS.to_vec();
+            if has_report {
+                v.push("report");
+            }
+            v
+        }
+        Some(s) if SECTIONS.contains(&s) || s == "report" => alloc::vec![s],
         Some(_) => return Err(bad("section")),
     };
     let mut out = Vec::new();
     for s in pick {
         out.push(format!("== {s} =="));
-        out.extend(section(s, ctx.now_ns()));
+        if s == "report" {
+            out.extend(report());
+        } else {
+            out.extend(section(s, ctx.now_ns()));
+        }
     }
     text(out)
 }
@@ -150,7 +173,7 @@ mcp_tool!(
     name: "hw_info",
     owner: "MC",
     safety: Read,
-    description: "The machine as the kernel sees it, by section: kernel (version, system generation and why it was started, Reload counter, which generation the next start brings, MCP request counters), cpu (CPUID facts, control registers, machine-check banks), memory (frames, heap, firmware memory map), firmware (ACPI tables), interrupts (APIC, I/O APICs), msi (MSI/MSI-X vectors per device: CPU, vector, delivery count, storms), pci (device tree). Without section: all.",
-    schema: r#"{"type":"object","properties":{"section":{"type":"string","enum":["all","kernel","cpu","memory","firmware","interrupts","msi","pci"]}}}"#,
+    description: "The machine as the kernel sees it, by section: kernel (version, system generation and why it was started, Reload counter, which generation the next start brings, MCP request counters), cpu (CPUID facts, control registers, machine-check banks), memory (frames, heap, firmware memory map), firmware (ACPI tables), interrupts (APIC, I/O APICs), msi (MSI/MSI-X vectors per device: CPU, vector, delivery count, storms), pci (device tree), report (the Gaming-PC's report page as text; only on that machine). Without section: all.",
+    schema: r#"{"type":"object","properties":{"section":{"type":"string","enum":["all","kernel","cpu","memory","firmware","interrupts","msi","pci","report"]}}}"#,
     handler: hw_info,
 );

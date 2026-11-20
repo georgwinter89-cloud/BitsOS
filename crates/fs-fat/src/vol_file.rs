@@ -21,6 +21,9 @@ const CHUNK: usize = 1 << 20;
 
 /// The largest FAT file size.
 pub const MAX_SIZE: u64 = 0xFFFF_FFFF;
+/// `allocate_unzeroed` grows by this much per step: what a cut can leave reached by no entry (a 2 GiB image on a
+/// stick of 32 KiB clusters: 32 steps of a few sector writes each).
+const UNZEROED_STEP: u64 = 64 << 20;
 
 /// A piece of a byte range of a file on the disk: (first sector, offset in the range, bytes).
 type Extent = (u64, usize, usize);
@@ -320,13 +323,83 @@ impl Volume {
         self.finish(&mut st)
     }
 
+    /// GP-START: grows the empty file `ino` to `size` by allocating and linking its clusters without writing them
+    /// (the chain and the entry only: seconds on a USB-2 stick where zeros took minutes). The clusters then hold
+    /// whatever the stick held there before, which is why Linux never offers it (FALLOC_FL_NO_HIDE_STALE stays a
+    /// reserved codepoint, linux-7.3.1/include/uapi/linux/falloc.h:8) and Windows only to the privileged
+    /// (SetFileValidData). Kernel only, no system call reaches it: for an image whose one reader never reads a
+    /// block before writing it (a bitsvol pool, `fs-ext4` data.rs). A file with bytes (written or cached) is refused.
+    pub fn allocate_unzeroed(&self, ino: u64, size: u64) -> Result<(), i64> {
+        self.allocate_unzeroed_in(ino, size, UNZEROED_STEP)
+    }
+
+    /// `allocate_unzeroed` in steps of `step` bytes, each step in the order `grow_with_data` keeps (the new chain,
+    /// the link from the old last cluster, the entry with the grown size): a cut leaves at most one step's
+    /// clusters reached by no entry, as the zero-filled growth did, never the whole image.
+    pub(crate) fn allocate_unzeroed_in(&self, ino: u64, size: u64, step: u64) -> Result<(), i64> {
+        if size > MAX_SIZE {
+            return Err(EFBIG);
+        }
+        let mut st = self.lock()?;
+        let class = Self::node(&st, ino)?.class;
+        self.rules().write(class).map_err(|e| self.refused("allocate", ino, e))?;
+        self.reap(&mut st)?;
+        let n = Self::node(&st, ino)?;
+        if n.is_dir() {
+            return Err(EISDIR);
+        }
+        // `reserved`: bytes only cached so far promised their clusters (a write not written back yet).
+        if n.e.size != 0 || n.e.first != 0 || n.reserved != 0 {
+            return Err(EINVAL);
+        }
+        let cb = self.geo.cluster_bytes() as u64;
+        let need = size.div_ceil(cb);
+        // All or nothing for the room: a step that fails later would leave a part-grown image.
+        let free = st.fat.count_free(&*self.dev)? as u64;
+        if free < need + st.reserved {
+            klog::event!(Info, "fat", "nospace", ino = ino, want = need, free = free, promised = st.reserved);
+            return Err(ENOSPC);
+        }
+        Self::bump(&st, ino)?;
+        self.begin(&mut st)?;
+        let per = (step / cb).max(1);
+        let mut have = 0u64;
+        while have < need {
+            let k = (need - have).min(per) as usize;
+            let hint = st.fat.hint;
+            st.fat.preload(&*self.dev, hint, k as u32)?;
+            let new = self.allocate(&mut st, Some(ino), k)?;
+            st.fat.link(&*self.dev, &new)?;
+            st.fat.write_out_runs(&*self.dev)?;
+            let last = Self::node(&st, ino)?.chain.as_ref().and_then(|c| c.last().copied());
+            if let Some(last) = last {
+                st.fat.set(&*self.dev, last, new[0])?;
+                st.fat.write_out_runs(&*self.dev)?;
+            }
+            have += k as u64;
+            let n = Self::node_mut(&mut st, ino)?;
+            if last.is_none() {
+                n.e.first = new[0];
+            }
+            n.chain.get_or_insert_with(Vec::new).extend_from_slice(&new);
+            n.e.size = (have * cb).min(size) as u32;
+            self.stamp_write(&mut st, ino)?;
+            self.write_entry(&mut st, ino)?;
+        }
+        if need == 0 {
+            self.stamp_write(&mut st, ino)?;
+            self.write_entry(&mut st, ino)?;
+        }
+        self.finish(&mut st)
+    }
+
     /// utimensat: the entry's modification time and access date (FAT keeps no access time of day), UTC
     /// seconds; one sector. The same rules as a content change (`\BITSOS2\` files only on the stick).
     pub fn set_times(&self, ino: u64, mtime: Option<i64>, atime: Option<i64>) -> Result<(), i64> {
         self.set_entry(ino, None, mtime, atime)
     }
 
-    /// FS-1b setattr in one step (chmod: `fat_setattr` after `fat_sanitize_mode`, linux-6.6/fs/fat/file.c:421, the
+    /// FS-1b setattr in one step (chmod: `fat_setattr` after `fat_sanitize_mode`, linux-7.3.1/fs/fat/file.c:458, the
     /// read-only attribute follows the owner's w bit, `fat_make_attrs`): the read-only attribute (None: kept) and the times, checked by the rules
     /// once and written as one sector, so a refusal leaves the entry as it was (no half-done change).
     pub fn set_entry(&self, ino: u64, ro: Option<bool>, mtime: Option<i64>, atime: Option<i64>) -> Result<(), i64> {
@@ -365,7 +438,8 @@ impl Volume {
     }
 
     /// The time FAT keeps for `t` (UTC seconds): the modification time to 2 seconds, the access time to the
-    /// start of its local day (`fat_truncate_mtime`/`fat_truncate_atime`, linux-6.6/fs/fat/misc.c:287-308).
+    /// start of its local day (`fat_timespec64_trunc_2secs`/`fat_truncate_atime`,
+    /// linux-7.3.1/fs/fat/misc.c:284-303).
     pub fn kept_time(&self, t: i64, atime: bool) -> i64 {
         if atime {
             let off = (self.clock.offset)(t) as i64 * 60;

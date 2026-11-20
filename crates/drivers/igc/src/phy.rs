@@ -197,7 +197,7 @@ const RESET_WAIT_US: u64 = 50_000;
 const RESET_STEP_US: u64 = 100;
 const RESET_AFTER_US: u64 = 1_000;
 
-/// I226 PHY reset (Linux `igc_phy_hw_reset`, linux-6.6/drivers/net/ethernet/intel/igc/igc_phy.c:163-208,
+/// I226 PHY reset (Linux `igc_phy_hw_reset`, linux-7.3.1/drivers/net/ethernet/intel/igc/igc_phy.c:160-205,
 /// `V1:igcphy.asm:67-92`), PHY0 held by the caller. Completion is PHPM bit 8; when it never shows, the PHY ID
 /// (Linux `igc_get_phy_id`) tells a PHY that is out of reset from one that is not.
 pub fn reset<H: Hw + ?Sized>(hw: &H) -> PhyReset {

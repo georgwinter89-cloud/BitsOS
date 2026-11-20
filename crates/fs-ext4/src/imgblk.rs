@@ -43,6 +43,9 @@ impl ImageBlock {
             return Err(EINVAL);
         }
         let w = if writable { Some(file.get_write_access()?) } else { None };
+        if let Some(c) = file.page_cache() {
+            c.back_a_device();
+        }
         Ok(ImageBlock { name: name.into(), blocks: file.size() / BS, file, _write: w })
     }
     pub fn inode(&self) -> &Arc<Inode> {

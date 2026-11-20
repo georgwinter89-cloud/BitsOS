@@ -67,6 +67,8 @@ pub(crate) fn check_format() -> ktest::TestResult {
         (0x0a, 0, Source::GfxFault),
         (0x12, 0, Source::MmhubFault),
         (0x00, 0, Source::IhSelf),
+        (0x10, 119, Source::VcnTrap),
+        (0x10, 160, Source::Unknown),
         (0x04, 9, Source::DcnHpd),
         (0x04, 0x1e, Source::DcnVline0),
         (0x04, 0x3c, Source::DcnVblank),
@@ -334,9 +336,14 @@ ktest::ktest!("gx.ih.chip_side", Safe, check_chip_side);
 pub(crate) fn check_rearm_masked() -> ktest::TestResult {
     let (r, x) = rig()?;
     let trap = iv(ih6::CLIENT_GFX, ih6::SRC_SDMA_TRAP, 0, 0, 0);
+    // The IH thread reads the same ring and can be the faster one (int/gp, 15.11.: it took both entries 3 times of 3).
+    // So its lock is held while the two entries arrive, and what counts is what was read, whoever read it.
+    let held = x.ih.hold_reader();
     kassert!(r.fake(|f| f.ih_raise(&trap) && f.ih_raise(&trap)), "the ring refuses");
     kassert!(r.fake(|f| f.ih.messages) == 1, "two messages with no read pointer update");
-    kassert!(x.ih.pass_now().entries == 2, "the reader");
+    drop(held);
+    x.ih.pass_now();
+    kassert!(x.ih.feed.count(Source::SdmaTrap) == 2, "the reader: {} entries read", x.ih.feed.count(Source::SdmaTrap));
     kassert!(r.fake(|f| f.ih.messages) == 1 && x.ih.feed.count(Source::SdmaTrap) == 2, "a message for nothing");
     kassert!(r.fake(|f| f.ih_raise(&trap)), "the ring");
     kassert!(r.fake(|f| f.ih.messages) == 2, "no message after the read pointer moved: the classic");

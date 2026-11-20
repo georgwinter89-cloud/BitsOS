@@ -1,0 +1,34 @@
+Anschluss-Stränge: 2 (Bus 00 bis 7f und 80 bis df), 41 Geräte und Abzweige gefunden
+Strang 1 (ab Bus 00): 15 Geräte direkt am Strang
+  00:02.0 Grafik [8086:7d67]: erkannt, ohne Treiber
+  00:04.0 Mainboard-Baustein [8086:ad03]: erkannt, ohne Treiber
+  00:08.0 Mainboard-Baustein [8086:ae4c]: erkannt, ohne Treiber
+  00:0b.0 Mainboard-Baustein [8086:ad1d]: erkannt, ohne Treiber
+  00:0d.0 USB-Anschlüsse [8086:7ec0]: läuft mit xhci
+  00:0d.2 Thunderbolt/USB4 [8086:7ec2]: wird nie angefasst
+  00:0e.0 Intel VMD (Laufwerks-Verwaltung) [8086:ad0b]: wird nie angefasst
+  00:14.0 Mainboard-Baustein [8086:ae7f]: erkannt, ohne Treiber
+  00:1f.0 Mainboard-Baustein [8086:ae0d]: erkannt, ohne Treiber
+  00:1f.5 Baustein mit der Firmware des Mainboards [8086:ae23]: wird nie angefasst
+  01:00.0 SSD [144d:a80d]: abgeschaltet, nicht angefasst
+  04:00.0 Grafik [1002:7550]: läuft mit amdgpu-rdna4
+  04:00.1 Ton der Grafikkarte [1002:ab40]: wird nie angefasst
+Strang 2 (ab Bus 80): 15 Geräte direkt am Strang
+  80:14.0 USB-Anschlüsse [8086:7f6e]: läuft mit xhci
+  80:14.5 Mainboard-Baustein [8086:7f2f]: erkannt, ohne Treiber
+  80:15.0 Mainboard-Baustein [8086:7f4c]: erkannt, ohne Treiber
+  80:15.2 Mainboard-Baustein [8086:7f4e]: erkannt, ohne Treiber
+  80:16.0 Intel-Verwaltungschip [8086:7f68]: wird nie angefasst
+  80:1f.0 Mainboard-Baustein [8086:7f04]: erkannt, ohne Treiber
+  80:1f.3 Ton vom Mainboard-Chip [8086:7f50]: wird nie angefasst
+  80:1f.4 Mainboard-Sensorleitung [8086:7f23]: erkannt, ohne Treiber
+  80:1f.5 Baustein mit der Firmware des Mainboards [8086:7f24]: wird nie angefasst
+  81:00.0 SSD [1d97:5236]: abgeschaltet, nicht angefasst
+  82:00.0 SATA-Anschlüsse [1b21:0612]: abgeschaltet, nicht angefasst
+  83:00.0 Netzwerkkarte (Kabel) [10ec:8126]: läuft mit rtl8126
+  84:00.0 SATA-Anschlüsse [1b21:0612]: abgeschaltet, nicht angefasst
+  85:00.0 WLAN-Karte [8086:272b]: wird nie angefasst
+  86:00.0 SSD [144d:a80a]: abgeschaltet, nicht angefasst
+Nie angefasst: 9 Geräte (00:0d.2, 00:0e.0, 00:1f.5, 04:00.1, 80:16.0, 80:1c.3, 80:1f.3, 80:1f.5, 85:00.0)
+Intel VMD ist im BIOS eingeschaltet (00:0e.0). BitsOS fasst es nicht an. SSDs hinter VMD wären unsichtbar; gefunden wurden 3 SSDs.
+

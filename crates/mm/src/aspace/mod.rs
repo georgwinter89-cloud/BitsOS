@@ -37,11 +37,15 @@ pub(crate) mod counters;
 mod devmap;
 pub(crate) mod fault;
 mod fork;
+mod guard;
 mod huge;
+pub(crate) mod migrate;
 mod mlock;
+mod oom;
 mod remap;
 pub mod rmap;
 mod shm;
+pub(crate) mod spaces;
 mod sysv;
 mod stats;
 
@@ -153,6 +157,8 @@ pub(crate) struct Inner {
     pub(crate) deposit: Vec<u64>,
     /// ktest hook (MM-13): no 2 MiB block for this space's faults.
     pub(crate) huge_fail: bool,
+    /// L7-VFS: the guarded pages (MADV_GUARD_INSTALL, `guard.rs`); always inside VMAs.
+    pub(crate) guards: guard::Guards,
 }
 
 impl Inner {
@@ -167,6 +173,7 @@ impl Inner {
             around_fail_after: None,
             deposit: Vec::new(),
             huge_fail: false,
+            guards: guard::Guards::default(),
         }
     }
 
@@ -215,6 +222,8 @@ pub struct AsCore {
     root: u64,
     inner: Mutex<Inner>,
     me: Weak<AsCore>,
+    /// W35 MM-2: this space's id in `spaces` (0: none), in the owner word of every anonymous frame it maps.
+    id: u32,
     /// The kept page and table numbers (`counters.rs`; changed under `inner`, read without it).
     ctr: Counters,
     /// MM-tlb2 fixer: whether the last fault on a missing page ended as an anonymous fill; only then does the
@@ -269,6 +278,8 @@ fn linux_prot(p: Prot) -> u64 {
 }
 
 pub(crate) fn free_user(phys: u64) {
+    // W35 MM-2: the owner word goes with the frame (its next owner never starts a migration's search from it).
+    mm_core::reclaim::set_frame_owner(phys, 0);
     if let Some(fa) = mm_core::frames() {
         fa.free(phys, 0, mm_core::Kind::User);
     }
@@ -302,6 +313,7 @@ impl AddressSpace {
             root,
             inner: Mutex::named("mm.as", inner),
             me: me.clone(),
+            id: spaces::add(me),
             ctr,
             anon_hint: core::sync::atomic::AtomicBool::new(true),
             thp_off: core::sync::atomic::AtomicBool::new(false),
@@ -342,8 +354,35 @@ impl AsCore {
         v
     }
 
+    /// Every VMA, copied: for /proc's maps and tests. A lookup of one address takes `vma_at`, a walk that only
+    /// reads `for_each_vma`. MEMCRASH: the list's block is allocated with `mm.as` released (an allocation under it
+    /// that has to reclaim keeps every faulting thread of the program waiting), then filled under the lock if the
+    /// list still fits (else again with its new length).
     pub fn vmas(&self) -> Vec<Vma> {
-        self.inner.lock().space.tree.to_vec()
+        let mut want = self.inner.lock().space.tree.len();
+        loop {
+            let mut v: Vec<Vma> = Vec::with_capacity(want + 4);
+            let g = self.inner.lock();
+            let tree = &g.space.tree;
+            if tree.len() <= v.capacity() {
+                v.extend(tree.iter().cloned());
+                return v;
+            }
+            want = tree.len();
+        }
+    }
+
+    /// Calls `f` for each VMA in address order, under `mm.as` and without a copy (`f` must not allocate much or
+    /// wait: /proc/<pid>/status sums, Linux's VMA iterator under the mmap lock).
+    pub fn for_each_vma(&self, f: &mut dyn FnMut(&Vma)) {
+        self.inner.lock().space.tree.iter().for_each(f);
+    }
+
+    /// The VMA containing `addr`, copied alone (its file reference is a counted handle: nothing is allocated).
+    /// MEMCRASH: the futex key and the vDSO's robust-unlock check copied the whole list for this (22 KiB under
+    /// `mm.as` on the Mini-PC, 13.11.2026, whose allocation failed); Linux's `get_futex_key` looks the one VMA up.
+    pub fn vma_at(&self, addr: u64) -> Option<Vma> {
+        self.inner.lock().space.tree.find(addr).cloned()
     }
 
     /// The current program break.
@@ -576,14 +615,17 @@ impl AsCore {
     /// Removes [start, end) from the tree and its pages, giving the commit back (munmap, MAP_FIXED, mremap).
     /// `cause`: munmap, MAP_FIXED or mremap (`tlb::stats().by_cause`). Page tables go only where no neighbouring
     /// VMA shares them (Linux `free_pgtables`).
+    /// The range's guards go with it (Linux's unmap drops the guard markers with the page tables).
     pub(crate) fn remove_range(&self, g: &mut Inner, start: u64, end: u64, cause: tlb::Cause) -> Result<(), Errno> {
         let segs = Self::segments(g, start, end)?;
+        g.guards.reserve_cut().map_err(|_| Errno::NoMem)?;
         let before = g.space.committed;
         if g.space.commit_munmap(start, end)? {
             let free = g.space.tree.gap_around(start, end);
             self.unmap_pages(g, start, end, &segs, cause, free);
             self.rmap_forget(g, &segs);
         }
+        g.guards.remove(start, end);
         g.settle(before, 0);
         Ok(())
     }
@@ -720,11 +762,11 @@ impl AsCore {
         p.error.map_or(Ok(()), Err)
     }
 
-    /// msync(start, len, flags) as linux-6.6/mm/msync.c:32-108: EINVAL for unknown flags, an unaligned start or
+    /// msync(start, len, flags) as linux-7.3.1/mm/msync.c:33-109: EINVAL for unknown flags, an unaligned start or
     /// ASYNC|SYNC; the length page-aligned with wrap-around (a length within a page of 2^64 is 0: answer 0);
     /// ENOMEM for a range past 2^64; holes are skipped but answer ENOMEM at the end (at once for
     /// a plain MS_ASYNC); MS_SYNC writes the range of every shared file VMA back (`MapBacking::sync`), after
-    /// the space's lock is released. MS_INVALIDATE on a locked VMA is EBUSY (msync.c:79).
+    /// the space's lock is released. MS_INVALIDATE on a locked VMA is EBUSY (msync.c:85).
     pub fn sys_msync(&self, start: u64, len: u64, flags: u64) -> Result<(), i64> {
         use uapi::errno::{EBUSY, EINVAL, ENOMEM};
         if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || start & (PAGE - 1) != 0 || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0) {
@@ -799,7 +841,8 @@ impl AsCore {
             BrkPlan::Move { map: Some((s, e)), .. } => (e - s) / PAGE,
             _ => 0,
         };
-        if g.charge(need, 0).is_err() {
+        // A shrink takes its guards (`remove` cannot fail with the room taken first).
+        if g.guards.reserve_cut().is_err() || g.charge(need, 0).is_err() {
             return old;
         }
         let before = g.space.committed;
@@ -812,6 +855,7 @@ impl AsCore {
             if let Some((s, e)) = unmap {
                 let free = g.space.tree.gap_around(s, e);
                 self.unmap_pages(&mut g, s, e, &Vec::new(), tlb::Cause::Munmap, free);
+                g.guards.remove(s, e);
             }
             if let Some((s, e)) = map
                 && (g.fill == Fill::Eager || (g.space.def_lock.0 && !g.space.def_lock.1))
@@ -902,6 +946,7 @@ impl Drop for AsCore {
         // Every CPU that still has the root loaded (this one, or one that keeps it lazily) switches to the kernel
         // root first (MM-6); freeing the tables before that could hand out frames a CPU still walks.
         let o = paging::tlb::leave(root);
+        spaces::remove(self.id);
         Self::rmap_drop_of(self as *const AsCore);
         let g = self.inner.get_mut();
         // The program is gone: its charge goes back whatever happens to the frames.

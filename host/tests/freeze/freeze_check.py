@@ -176,7 +176,7 @@ def run_once(c, hog_stop):
         need(f"focus={probe}\n" in text and re.search(r"threads ([3-9]|\d\d+)", text), f"the probe (pid {probe}) is in front with all its threads", text)
     else:
         lack("sched_focus cannot make a program Interactive (user threads carry no tgid in the scheduler: "
-             "plan/notes/sc-SC-7a-integration.patch, proc::task spawns with spawn_in_group)", text)
+             "SC-7a, plan/spec/core.md §9.3; proc::task spawns with spawn_in_group)", text)
     t0 = time.time()
 
     # 2. The load: busy threads, a hung program, disk hogs.
@@ -185,11 +185,11 @@ def run_once(c, hog_stop):
         hold, hold_out = start(c, ["abi-freeze", "hold"] + ([] if EXPECT_B4 else ["nopi-ok"]), "freeze hold ready")
     except SystemExit as e:
         if "lock_pi ENOSYS" in str(e):
-            raise SystemExit("RED: FUTEX_LOCK_PI answers ENOSYS (plan/notes/sc-SC-7b-integration.patch: the PI "
+            raise SystemExit("RED: FUTEX_LOCK_PI answers ENOSYS (SC-7b, plan/spec/core.md §9.3: the PI "
                              f"operations in syscall::futex)\n{e}")
         raise
     if "pi=no" in hold_out:
-        lack("FUTEX_LOCK_PI answers ENOSYS (plan/notes/sc-SC-7b-integration.patch: the PI operations in syscall::futex)", hold_out)
+        lack("FUTEX_LOCK_PI answers ENOSYS (SC-7b, plan/spec/core.md §9.3: the PI operations in syscall::futex)", hold_out)
         need(re.search(r"freeze hold ready pid=\d+ pi=no", hold_out), "the hung program blocks in plain futex waits", hold_out)
     else:
         need(re.search(r"freeze hold ready pid=\d+ pi=yes owner=me waiters=yes", hold_out), "the hung program holds a PI futex with a waiter blocked on it", hold_out)

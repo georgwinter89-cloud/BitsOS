@@ -2,7 +2,7 @@
 //! own. The initial namespace is `None` everywhere (`Net`): its sockets keep the crate's tables, the kernel's
 //! stack and every card, exactly as before namespaces existed.
 //!
-//! A new namespace starts as Linux's does (linux-6.6/drivers/net/loopback.c:208 `loopback_net_init`): one
+//! A new namespace starts as Linux's does (linux-7.3.1/drivers/net/loopback.c:207 `loopback_net_init`): one
 //! interface, `lo` at index 1, administratively DOWN and without addresses. Setting it UP (SIOCSIFFLAGS or
 //! RTM_NEWLINK with CAP_NET_ADMIN over the namespace's user namespace) gives it 127.0.0.1/8 (devinet.c
 //! `inetdev_event` NETDEV_UP for a loopback device); the address stays when it goes down again, its local
@@ -61,7 +61,7 @@ pub(crate) struct LoDev {
     /// addresses.
     pub(crate) inet: bool,
     /// The local routing table exists (its first local route, i.e. the first address, made it): before that
-    /// every IPv4 address passes a bind (`__inet_dev_addr_type`, linux-6.6/net/ipv4/fib_frontend.c:206) and
+    /// every IPv4 address passes a bind (`__inet_dev_addr_type`, linux-7.3.1/net/ipv4/fib_frontend.c:227) and
     /// /proc/net/route is empty (local and main share one table until custom rules exist).
     pub(crate) table: bool,
     /// ::1 is on lo: added at every UP (`init_loopback`), removed at DOWN and by an MTU below 1280
@@ -119,10 +119,11 @@ impl LoDev {
         }
     }
 
-    /// `__inet_insert_ifa` (linux-6.6/net/ipv4/devinet.c:476) after `find_matching_ifa`: an address of the
-    /// subnet of an existing primary becomes its secondary (EINVAL for a different scope), the same local
-    /// address in the same subnet is EEXIST, 0.0.0.0 is ignored. A primary goes after the last primary whose
-    /// scope is not below its own, a secondary to the end.
+    /// `__inet_insert_ifa` (linux-7.3.1/net/ipv4/devinet.c:490) after `find_matching_ifa`, with the 0.0.0.0 rule
+    /// of the ioctl path's `inet_insert_ifa` (:571; netlink tests it before the device, `inet_rtm_newaddr`): an
+    /// address of the subnet of an existing primary becomes its secondary (EINVAL for a different scope), the
+    /// same local address in the same subnet is EEXIST, 0.0.0.0 is ignored. A primary goes after the last
+    /// primary whose scope is not below its own, a secondary to the end.
     pub(crate) fn insert(&mut self, mut a: Addr) -> Result<(), NlFail> {
         if !self.inet {
             return Err(NlFail(ENOBUFS, None));
@@ -155,7 +156,7 @@ impl LoDev {
         Ok(())
     }
 
-    /// `__inet_del_ifa` (linux-6.6/net/ipv4/devinet.c) with `promote_secondaries` on, as every systemd
+    /// `__inet_del_ifa` (linux-7.3.1/net/ipv4/devinet.c:370) with `promote_secondaries` on, as every systemd
     /// system sets it (CachyOS's new namespaces inherit it): deleting a primary promotes the first secondary of
     /// its subnet, which moves behind the last primary of a scope not narrower than the deleted one's.
     pub(crate) fn delete(&mut self, i: usize) -> Addr {
@@ -273,19 +274,33 @@ impl NetView {
         ifview::lo_link(if d.up { ifview::IFF_UP } else { 0 } | d.flags, d.addrs, six, d.mtu, d.txqlen)
     }
 
+    /// L7-NET: the RTM_NEWADDR a replace of `a` sends whatever it changed (`rtmsg_ifa` with the request's
+    /// sequence number and port, linux-7.3.1/net/ipv4/devinet.c:1035).
+    pub(crate) fn announce_replace(&self, a: &Addr, seq: u32, portid: u32) {
+        let _g = self.change.lock();
+        let m = crate::sock::rtnl::addr_msg(&self.lo_link(), a, crate::sock::rtnl::RTM_NEWADDR, 0, seq, portid);
+        netlink::announce_one(&self.netlink, crate::sock::rtnl::RTNLGRP_IPV4_IFADDR, &m);
+    }
+
     /// One change of lo (`f` on a copy of its state, kept when it answers Ok): serialised by `change`; the
     /// namespace's netlink members hear what differs (RTM_NEWLINK, RTM_NEWADDR/RTM_DELADDR for IPv4 and ::1).
     pub(crate) fn edit<T>(self: &Arc<Self>, what: &'static str, f: impl FnOnce(&mut LoDev) -> Result<T, NlFail>) -> Result<T, NlFail> {
-        self.apply(what, false, f)
+        self.apply(what, false, (0, 0), f)
+    }
+
+    /// As `edit` for an RTM_NEWADDR/RTM_DELADDR request: its address notifications carry the request's sequence
+    /// number and port (`rtmsg_ifa(event, ifa, nlh, portid)`, linux-7.3.1/net/ipv4/devinet.c:565, :430).
+    pub(crate) fn edit_for<T>(self: &Arc<Self>, what: &'static str, seq: u32, portid: u32, f: impl FnOnce(&mut LoDev) -> Result<T, NlFail>) -> Result<T, NlFail> {
+        self.apply(what, false, (seq, portid), f)
     }
 
     /// As `edit`, but what `f` changed is kept (and announced) when it fails too: `devinet_ioctl` deletes the
     /// old address before it inserts the changed one, and a failed insert does not bring the old one back.
     pub(crate) fn edit_partial<T>(self: &Arc<Self>, what: &'static str, f: impl FnOnce(&mut LoDev) -> Result<T, NlFail>) -> Result<T, NlFail> {
-        self.apply(what, true, f)
+        self.apply(what, true, (0, 0), f)
     }
 
-    fn apply<T>(self: &Arc<Self>, what: &'static str, keep_failed: bool, f: impl FnOnce(&mut LoDev) -> Result<T, NlFail>) -> Result<T, NlFail> {
+    fn apply<T>(self: &Arc<Self>, what: &'static str, keep_failed: bool, req: (u32, u32), f: impl FnOnce(&mut LoDev) -> Result<T, NlFail>) -> Result<T, NlFail> {
         let _g = self.change.lock();
         let net = Some(self.clone());
         let before = ifview::links_in(&net);
@@ -300,14 +315,14 @@ impl NetView {
         if !netlink::same_view(&before, &after) {
             klog::event!(Info, "net", "netns.lo", inum = self.inum, what = what, up = up, flags = klog::Hex(flags as u64), mtu = mtu, addrs = n);
         }
-        netlink::announce(&self.netlink, &before, &after);
+        netlink::announce(&self.netlink, &before, &after, req);
         if let Err(e) = &r {
             klog::event!(Warn, "net", "netns.lo_partial", inum = self.inum, what = what, errno = e.0);
         }
         r
     }
 
-    /// `__dev_change_flags` on lo (linux-6.6/net/core/dev.c): `flags` is what its flags are to become. IFF_UP
+    /// `__dev_change_flags` on lo (linux-7.3.1/net/core/dev.c:9817): `flags` is what its flags are to become. IFF_UP
     /// brings it up or down; every UP gives it 127.0.0.1/8 unless that is there (`inetdev_event` NETDEV_UP, its
     /// EEXIST ignored), and ::1 (`init_loopback`); DOWN keeps the IPv4 addresses and drops ::1. The other
     /// changeable flags (IFF_DEBUG, IFF_NOARP, IFF_PROMISC, IFF_ALLMULTI, ...) are kept and shown (they change

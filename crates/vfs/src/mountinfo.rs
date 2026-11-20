@@ -1,5 +1,5 @@
-//! SX-3a: `/proc/<pid>/mountinfo` and `/proc/<pid>/mounts` of a view seen from a root (linux-6.6/fs/
-//! proc_namespace.c `show_mountinfo`, `show_vfsmnt`, `show_mnt_opts`, `mangle`; fs/pnode.c
+//! SX-3a: `/proc/<pid>/mountinfo` and `/proc/<pid>/mounts` of a view seen from a root (linux-7.3.1/fs/
+//! proc_namespace.c:135 `show_mountinfo`, `show_vfsmnt`, `show_vfsmnt_opts`, `mangle`; fs/pnode.c
 //! `get_dominating_id`). Mounts the root does not reach (outside a chroot or a pivoted root) are left out,
 //! as `seq_path_root` skips them. The per-mount part shows the mount's own read-only flag, the super block part
 //! the file system's; propagation tags as Linux prints them ("shared:N", "master:N", "propagate_from:N",
@@ -150,8 +150,8 @@ pub fn render(ns: &MountNs, root: &Path, info: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    // INT-W26: the line pieces the old procfs formatter's host test checked (linux-6.6/fs/proc_namespace.c
-    // `show_mnt_opts` :73, `mangle`), now that SX-3a renders the files here.
+    // INT-W26: the line pieces the old procfs formatter's host test checked (linux-7.3.1/fs/proc_namespace.c
+    // `show_vfsmnt_opts` :63, `mangle`), now that SX-3a renders the files here.
     use super::*;
 
     #[test]

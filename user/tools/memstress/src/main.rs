@@ -5,7 +5,7 @@
 //!   then of all: they read zero, the rest keeps its bytes.
 //! - `memstress commit [--mb N] [--step-mb S]`: a PROT_NONE MAP_NORESERVE reserve of N MiB (default 64) made
 //!   writable by mprotect in S MiB steps (default 4) until all of it or ENOMEM (V2's strict commit,
-//!   linux-6.6/mm/util.c:931 `__vm_enough_memory` mode 2), each step touched; then given back by munmap and
+//!   linux-7.3.1/mm/util.c:959 `__vm_enough_memory` mode 2), each step touched; then given back by munmap and
 //!   done once more, which must reach the same amount (nothing leaked). ENOMEM comes as an errno, never as a
 //!   signal.
 //!   `--mmap`: each step is a fresh mmap(MAP_PRIVATE, PROT_READ|PROT_WRITE) instead (V2 charges at mmap too).

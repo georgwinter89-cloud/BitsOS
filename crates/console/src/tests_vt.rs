@@ -390,3 +390,17 @@ fn rendering_after_editing_sequences_equals_a_full_redraw() {
         assert!(f.pixels() == fresh.pixels(), "after {st:?} the incremental picture differs from a full redraw");
     }
 }
+
+#[test]
+fn dec_mode_2004_is_kept_until_reset() {
+    let mut s = Screen::new(10, 4);
+    assert!(!s.bracketed_paste(), "off on a new VT (linux-7.3.1/drivers/tty/vt/vt.c:2275)");
+    out(&mut s, b"\x1b[?2004h");
+    assert!(s.bracketed_paste());
+    out(&mut s, b"\x1b[?25;2004l");
+    assert!(!s.bracketed_paste(), "one of several modes in one sequence");
+    out(&mut s, b"\x1b[?2004h\x1b[2004l");
+    assert!(s.bracketed_paste(), "without `?` it is an ANSI mode, not DEC 2004");
+    out(&mut s, b"\x1bc");
+    assert!(!s.bracketed_paste(), "ESC c resets it");
+}

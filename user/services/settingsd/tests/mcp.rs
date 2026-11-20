@@ -175,6 +175,8 @@ fn sample(d: &KeyDef) -> Value {
         (Type::Int { min, word: Some(_), .. }, Value::Text(_)) => Value::Int(*min),
         (Type::Choice { values: c, .. }, v) => Value::Text(c.iter().find(|x| Value::Text((*x).clone()) != *v).unwrap().clone()),
         (Type::Color, _) => Value::Text("#123abc".into()),
+        // The provider list and the roles take provider names only (providers.rs).
+        (Type::Text { .. }, _) if d.name == "ai.providers" || d.name.starts_with("ai.role.") => Value::Text("probe".into()),
         (Type::Text { .. }, _) => Value::Text("Test Font".into()),
         (Type::LogSpec, _) => Value::Text("warn,net=debug".into()),
         other => panic!("no sample for {other:?}"),
@@ -229,7 +231,8 @@ fn tools_set_apply_undo_every_key() {
     assert!(cut.get("more").and_then(Json::as_i64).unwrap() > 0);
     let desc = k.call("settings_describe", r#"{"key":"theme.mode"}"#).ok("describe");
     assert!(desc.get("key").and_then(|k| k.get("text")).is_some(), "{desc:?}");
-    for def in &all {
+    // An assistant's levels are loosened by Georg alone (leash.rs): checked after this loop.
+    for def in all.iter().filter(|d| !settingsd::leash::leashed(&d.name)) {
         let before = k.get(&def.name);
         let journal = k.call("settings_history", r#"{"n":1}"#).text;
         for bad in wrong(def) {
@@ -268,6 +271,17 @@ fn tools_set_apply_undo_every_key() {
         assert_eq!(&k.get(key), old, "{key} after undo 3");
     }
     assert_eq!(k.call("settings_undo", "{}").code(), "nothing_to_undo");
+    // Tightening the assistant's level is anyone's; loosening it, also by an undo, is not this program's to do.
+    k.call("settings_set", r#"{"key":"ai.level","value":"answer"}"#).ok("tighten");
+    assert_eq!(k.call("settings_set", r#"{"key":"ai.level","value":"auto"}"#).code(), "not_confirmer");
+    assert_eq!(k.call("settings_set", r#"{"key":"ai.level","value":"ask"}"#).code(), "not_confirmer");
+    assert_eq!(k.call("settings_undo", "{}").code(), "not_confirmer");
+    assert_eq!(k.get("ai.level"), Json::Str("answer".into()));
+    // The same for letting `assist --mcp` ask nobody: on by default, turning it off is anyone's, back on is not.
+    assert_eq!(k.get("ai.mcp.ask_tools"), Json::Bool(true));
+    k.call("settings_set", r#"{"key":"ai.mcp.ask_tools","value":false}"#).ok("ask_tools off");
+    assert_eq!(k.call("settings_set", r#"{"key":"ai.mcp.ask_tools","value":true}"#).code(), "not_confirmer");
+    assert_eq!(k.get("ai.mcp.ask_tools"), Json::Bool(false));
     // The kernel checks `value` against this union (crates/mcp/src/schema.rs); the QEMU scenario proves it.
     let set = k.tools.iter().find(|t| t.str("name") == Some("settings_set")).unwrap();
     let ty = set.get("inputSchema").and_then(|s| s.get("properties")).and_then(|p| p.get("value")).and_then(|v| v.get("type"));
@@ -324,13 +338,26 @@ fn confirm_secret_and_bad_arguments() {
     assert_eq!(k.get("test.risky"), Json::Int(1));
 
     let secret = "hunter2-geheim";
+    // CL-S: a secret is written by its owner's program or after Georg agreed, never on a model's own word.
     let a = k.call("settings_set", &format!(r#"{{"key":"test.pass","value":"{secret}"}}"#));
+    assert_eq!(a.code(), "not_owner");
     assert!(!a.text.contains(secret), "{a:?}");
-    a.ok("secret set");
+    // INT-CL-4: nor on a model's word that he agreed: over these tools `confirmed` is nobody's own yes.
+    let a = k.call("settings_set", &format!(r#"{{"key":"test.pass","value":"{secret}","confirmed":true}}"#));
+    assert_eq!(a.code(), "not_confirmer");
+    assert!(!a.text.contains(secret) && a.text.contains("Seite „KI“") && a.text.contains("als root an der Konsole"), "{a:?}");
+    assert_eq!(k.call("settings_history", r#"{"n":50}"#).text.matches("test.pass").count(), 0, "a refused write is not journaled");
+    // The owner's program stores it (this test registered the key on `c`).
+    c.write_all(format!("{{\"op\":\"set\",\"key\":\"test.pass\",\"value\":\"{secret}\"}}\n").as_bytes()).unwrap();
+    let set = read_json(&mut BufReader::new(c.try_clone().unwrap()));
+    assert_eq!(set.get("ok"), Some(&Json::Bool(true)), "{set:?}");
     assert_eq!(k.get("test.pass"), Json::from("***"));
-    // `owner` would reveal a secret on the socket; the tool does not take it over.
+    // Clearing it is no more these tools' to do than writing it.
+    assert_eq!(k.call("settings_set", r#"{"key":"test.pass","value":"","confirmed":true}"#).code(), "not_confirmer");
+    // `owner` asks for a secret in clear on the socket; the tool does not take it over.
     let a = k.call("settings_get", r#"{"key":"test.pass","owner":"testsvc"}"#);
     assert!(!a.text.contains(secret), "{a:?}");
+    a.ok("a masked get");
     for t in [("settings_list", "{}"), ("settings_history", r#"{"n":50}"#), ("settings_describe", r#"{"key":"test.pass"}"#)] {
         assert!(!k.call(t.0, t.1).text.contains(secret), "{t:?}");
     }

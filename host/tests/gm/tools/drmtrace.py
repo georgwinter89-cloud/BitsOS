@@ -23,7 +23,7 @@ NAMES = {0x00: "VERSION", 0x09: "GEM_CLOSE", 0x0c: "GET_CAP", 0x0d: "SET_CLIENT_
          0x45: "AMDGPU_INFO", 0x46: "AMDGPU_GEM_METADATA", 0x47: "AMDGPU_GEM_WAIT_IDLE", 0x48: "AMDGPU_GEM_VA",
          0x49: "AMDGPU_WAIT_CS", 0x50: "AMDGPU_GEM_OP", 0x51: "AMDGPU_GEM_USERPTR", 0x52: "AMDGPU_WAIT_FENCES",
          0x53: "AMDGPU_VM", 0x54: "AMDGPU_FENCE_TO_HANDLE", 0x55: "AMDGPU_SCHED"}
-# PM4 type-3 opcodes RADV and radeonsi use most (the values of linux-6.6/drivers/gpu/drm/amd/amdgpu/nvd.h).
+# PM4 type-3 opcodes RADV and radeonsi use most (the values of linux-7.3.1/drivers/gpu/drm/amd/amdgpu/nvd.h).
 PM4 = {0x10: "NOP", 0x12: "CLEAR_STATE", 0x13: "INDEX_BUFFER_SIZE", 0x15: "DISPATCH_DIRECT", 0x16: "DISPATCH_INDIRECT",
        0x20: "SET_PREDICATION", 0x22: "COND_EXEC", 0x26: "INDEX_BASE", 0x27: "DRAW_INDEX_2", 0x28: "CONTEXT_CONTROL",
        0x2a: "INDEX_TYPE", 0x2d: "DRAW_INDEX_AUTO", 0x2f: "NUM_INSTANCES", 0x37: "WRITE_DATA", 0x3c: "WAIT_REG_MEM",

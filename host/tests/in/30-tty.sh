@@ -6,7 +6,7 @@
 # Since UL-3a init keeps BusyBox ash on the console (`/ # `) and the kernel monitor (`bits>`) reads only while no
 # session holds it, so two boots (as 20-console.sh):
 #  1. shell (a normal boot): the programs typed at ash; `echo $?` says 130 after the Ctrl+C.
-#  2. monitor (CONFIG init=off): the programs started with the monitor's `run`; it shows `exit code 130`.
+#  2. monitor (test key ktest_init=off): the programs started with the monitor's `run`; it shows `exit code 130`.
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"
 RUN_DIR="${BITSOS_RUN_DIR:-target/xtask/runs/in-30-tty}"
@@ -70,6 +70,6 @@ boot() {
 
 boot shell ""
 grep -aq "init: started the console shell" "$RUN_DIR/serial-shell.log" || { echo "RED: init did not start the console shell"; exit 1; }
-boot monitor ";init=off"
-grep -aq "ul init.off" "$RUN_DIR/serial-monitor.log" || { echo "RED: no ul init.off event (CONFIG init=off)"; exit 1; }
+boot monitor ";ktest_init=off"
+grep -aq "ul init.off" "$RUN_DIR/serial-monitor.log" || { echo "RED: no ul init.off event (test key ktest_init=off)"; exit 1; }
 echo "in tty: green (shell and monitor: raw program read physical keys, VTIME, settings restored, Ctrl+C = SIGINT for the foreground program, evdev nodes)"

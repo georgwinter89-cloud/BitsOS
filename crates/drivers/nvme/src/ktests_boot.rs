@@ -64,6 +64,9 @@ ktest!("nv.boot.esp", Run("nv/43-boot-nvme"), boot_esp);
 fn raw_refusals(c: &Arc<Nvme>, d: &Arc<Disk>, esp: (u64, u64), win: (u64, u64)) -> TestResult {
     let bs = d.block_size() as usize;
     let one = vec![0xE5u8; bs];
+    // CRASHDISK: the boot thread `crash.disk` makes \BITSOS2\CRASH\SLOTS.BIN (1 MiB, inside the boot window) once
+    // /boot is writable; its legal writes must be over before the count below (gate INT-N13: they landed in it).
+    let _ = kexec::crash::disk::ktests_wait_decided(150);
     let m0 = c.stats.media_writes();
     let p3 = part(d, 3)?;
     for lba in [0u64, 1, 6, 32, esp.1 - 1] {

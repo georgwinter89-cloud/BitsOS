@@ -34,8 +34,8 @@ impl Marker {
     }
 }
 
-/// The files a generation holds.
-pub const FILES: &[&str] = &["KERNEL", "INITRD"];
+/// The files a generation holds. UPD-4: `FILES` names the parts it runs with (kexec's `install::parts_rules`).
+pub const FILES: &[&str] = &["KERNEL", "INITRD", "FILES"];
 
 /// One generation as it is on the stick.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

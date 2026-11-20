@@ -217,8 +217,9 @@ pub const EITR_START: u32 = 648;
 /// TXDW, LSC, RXSEQ, RXDMT0, RXT0 (Linux igc `IMS_ENABLE_MASK`).
 pub const IMS_CAUSES: u32 = 0x9D;
 
-// MSI-X (NW-4), the same registers on the I226 and the 82576 (linux-6.6/drivers/net/ethernet/intel/igc/igc_regs.h:48-60,
-// igc_defines.h:295-300; igb's e1000_regs.h has the same offsets for the 82576).
+// MSI-X (NW-4), the same registers on the I226 and the 82576
+// (linux-7.3.1/drivers/net/ethernet/intel/igc/igc_regs.h:49-61, igc_defines.h:299-304; igb's e1000_regs.h has the
+// same offsets for the 82576).
 /// Extended interrupt auto clear: an EICR bit set here is cleared when its MSI-X message is sent.
 pub const EIAC: usize = 0x152C;
 /// Extended interrupt auto mask: with GPIE.EIAME, an EIMS bit set here is cleared when its message is sent (the
@@ -234,8 +235,9 @@ pub const GPIE_PBA: u32 = 1 << 31;
 /// which only count or reset; V2's health check covers both).
 pub const ICR_LSC: u32 = 1 << 2;
 
-/// EITR bit 31: the write does not reset the moderation counters (linux-6.6 igc_defines.h:295; `igc_write_itr`,
-/// igc_main.c:5425, sets it on every write). NW-4 checker finding, applied by INT-A1.
+/// EITR bit 31: the write does not reset the moderation counters
+/// (linux-7.3.1/drivers/net/ethernet/intel/igc/igc_defines.h:299; `igc_write_itr`, igc_main.c:5668, sets it on
+/// every write). NW-4 checker finding, applied by INT-A1.
 pub const EITR_CNT_IGNR: u32 = 0x8000_0000;
 
 /// EITR of vector `n`.
@@ -249,7 +251,7 @@ pub const fn eitr_interval(us: u32) -> u32 {
 }
 
 /// Default gap on the queue vector: 49 µs, at most ~20,000 interrupts a second (Linux `IGC_20K_ITR` = 196,
-/// linux-6.6/drivers/net/ethernet/intel/igc/igc.h:370: the low-latency end of its adaptive range). The first
+/// linux-7.3.1/drivers/net/ethernet/intel/igc/igc.h:444: the low-latency end of its adaptive range). The first
 /// interrupt after a quiet spell is not delayed, so a lone MCP request gets its interrupt at once; a burst is
 /// batched into one interrupt per 49 µs, far below PC-3's storm limit (100 per ms).
 pub const ITR_US_DEFAULT: u32 = 49;

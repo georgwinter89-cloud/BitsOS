@@ -1,4 +1,4 @@
-//! FS-14: inotify (linux-6.6/fs/notify/inotify/inotify_user.c, inotify_fsnotify.c, fs/notify/fsnotify.c) on every
+//! FS-14: inotify (linux-7.3.1/fs/notify/inotify/inotify_user.c, inotify_fsnotify.c, fs/notify/fsnotify.c) on every
 //! file system: the VFS calls `hooks` where Linux calls its fsnotify hooks (namei.c, open.c, read_write.c,
 //! attr.c, dcache.c, file_table.c, readdir.c), so tmpfs, devtmpfs (`/dev/input` hot plug), proc, sysfs and FAT
 //! all report.
@@ -54,7 +54,7 @@ pub const IN_MASK_ADD: u32 = 0x2000_0000;
 pub const IN_ISDIR: u32 = 0x4000_0000;
 pub const IN_ONESHOT: u32 = 0x8000_0000;
 pub const IN_ALL_EVENTS: u32 = 0xfff;
-/// `ALL_INOTIFY_BITS` (linux-6.6/include/linux/inotify.h): any other bit of a mask is EINVAL.
+/// `ALL_INOTIFY_BITS` (linux-7.3.1/include/linux/inotify.h:12): any other bit of a mask is EINVAL.
 pub const ALL_INOTIFY_BITS: u32 = IN_ALL_EVENTS
     | IN_UNMOUNT
     | IN_Q_OVERFLOW
@@ -91,7 +91,7 @@ pub(crate) fn active() -> bool {
     WATCHING.active.load(Ordering::Relaxed) != 0
 }
 
-/// PF-7, Linux's `DCACHE_FSNOTIFY_PARENT_WATCHED` test (linux-6.6/include/linux/fsnotify.h, `fsnotify_parent`) by
+/// PF-7, Linux's `DCACHE_FSNOTIFY_PARENT_WATCHED` test (linux-7.3.1/include/linux/fsnotify.h:76, `fsnotify_parent`) by
 /// another road: whether no watch on the parent directory of `d` asks for its children's events
 /// (`fsnotify_inode_watches_children`), without `vfs.dentry.link` once it was seen so. Linux walks the children of a
 /// directory when such a watch comes; here the dentry remembers the generation it looked at, the first such watch

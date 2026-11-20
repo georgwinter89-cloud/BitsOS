@@ -9,8 +9,15 @@ publish = false
 # the registry will (PK-2 registers them there); usys gives renameat2 (RENAME_EXCHANGE) without unsafe here.
 [dependencies]
 sha2 = { version = "=0.10.9", default-features = false }
+# The OpenPGP verifier (src/pgp, PK-6b): RSA PKCS#1 v1.5, Ed25519 and SHA-1 fingerprints; the version fetch pins.
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 usys = { path = "../usys" }
 settingsd = { path = "../../services/settingsd" }
+# PK-6a: sync databases are gzip (Arch) or zstd (CachyOS) tars. miniz_oxide is already in the user lock;
+# ruzstd 0.8.1 as in the root lock (plan/spec/rust-ecosystem.md). Without its `hash` feature (twox-hash is not
+# cached): a frame's xxhash is not checked, the database's signature and sha256 are.
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+ruzstd = { version = "=0.8.1", default-features = false, features = ["std"] }
 
 [lib]
 path = "src/lib.rs"

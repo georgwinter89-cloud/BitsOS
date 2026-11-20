@@ -1,5 +1,5 @@
 //! DS-5: the boot scene's picture, the kernel's boot screen (crates/console/src/bootdraw.rs: the design's board
-//! "Start", Absicht dunkel, cheap level) drawn again by bitscomp with the same integer maths, layout and colours, so
+//! "Start", Absicht dunkel, without effects) drawn again by bitscomp with the same integer maths, layout and colours, so
 //! the handover shows no jump. The scene is the 1920x1080 design at 4/3, centred on screens of at least 2560x1440.
 //! `draw` paints every part that meets the frame's rectangle, so a row drawn again equals the whole picture there.
 
@@ -417,7 +417,7 @@ impl Scene {
         }
     }
 
-    /// The live dot of the header (static at the cheap level) with its soft glow.
+    /// The live dot of the header (static, as the kernel draws it) with its soft glow.
     fn dot(&self, f: &mut Frame, cx: i32, cy: i32, clip: Rect) {
         let (cx16, cy16) = ((self.ox + cx) * 16, (self.oy + cy) * 16);
         disc(f, cx16, cy16, 12 * 16, 14 * 16, ACCENT, 60, clip);

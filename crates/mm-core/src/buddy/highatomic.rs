@@ -22,10 +22,27 @@
 //! Who takes from it (`alloc_highatomic`, the last step of `FrameAlloc::alloc`, after the ordinary lists, the
 //! per-CPU drain and the grace wait found nothing): an unmovable kind where the caller may not reclaim, any order
 //! below the pageblock order, a single frame included (Linux lets `ALLOC_NON_BLOCK` order 0 in the same way:
-//! failing now is worse than failing a larger one later). Never program or cache memory.
+//! failing now is worse than failing a larger one later). Never program or cache memory. A caller that may wait
+//! does not take it while it waits (Linux: no `ALLOC_NON_BLOCK`, no `ALLOC_HIGHATOMIC` with
+//! `__GFP_DIRECT_RECLAIM`): it reclaims and compacts for its block. Only the heap's last try does, the one after
+//! which null is next (Linux `should_reclaim_retry` gives the reserve up before OOM,
+//! `unreserve_highatomic_pageblock(ac, true)`; null here is a kernel panic, the worse of the two). Until
+//! 12.11.2026 the heap opened the reserve to every caller from its fourth try on: under the load of
+//! `mm.frames.highatomic.load` the slabs of a thread that could have waited took all of it within seconds and
+//! 5-page blocks under a spin lock failed. That night the Mini-PC's reserve went from whole to nothing for such a
+//! block in 25 s; who had taken it was not recorded (`stats` names the takers since).
 //!
-//! Not done here: giving the reserve back when everything else failed (Linux `unreserve_highatomic_pageblock`) and
-//! making it again after long-lived blocks settled in it. `mm.frames.highatomic_free` shows what is left.
+//! What is taken may stay for good (a slab page): the reserve is made whole again in the background and a
+//! pageblock that such blocks settled in is handed to the type living in it (`refill`), so its size stays what
+//! `reserve_pageblocks` says.
+
+mod refill;
+mod stats;
+
+pub use refill::Refill;
+pub(super) use stats::Reserve;
+pub use stats::ReserveStats;
+pub(crate) use stats::flush as flush_takers;
 
 use super::{Buddy, MigrateType, Region, ZoneState, ORDERS, PAGEBLOCK_FRAMES, PAGEBLOCK_ORDER, ZONES};
 use crate::meta::{Meta, State};
@@ -33,7 +50,6 @@ use crate::{reclaim, Kind, Zone, MAX_ORDER, PAGE};
 use core::sync::atomic::Ordering::Relaxed;
 
 klog::counter!(pub(super) PAGEBLOCK_HIGHATOMIC, "mm.frames.pageblock_highatomic");
-klog::counter!(HIGHATOMIC_ALLOCS, "mm.frames.highatomic_allocs");
 // Free frames of the reserve now: it goes down and up (as the pageblock counters do).
 klog::counter!(HIGHATOMIC_FREE, "mm.frames.highatomic_free");
 
@@ -52,14 +68,34 @@ pub fn reserve_pageblocks(managed: u64) -> u64 {
     share.max(2).min((managed / 100).div_ceil(PAGEBLOCK_FRAMES))
 }
 
-/// Whether an allocation of `kind` made now may take from the reserve. The heap calls with its own locks held, so
-/// it says what its caller may do: it holds a `reclaim::keep_reserve` slot while it may still reclaim, and none
-/// under a spin lock or on its last try, where the next answer is null.
-fn may_take(kind: Kind) -> bool {
-    match kind {
-        Kind::Heap => !reclaim::keeps_reserve(),
-        k => MigrateType::of(k) == MigrateType::Unmovable && !reclaim::context_allows(),
+/// Why an allocation may take from the reserve.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Taker {
+    /// Its caller cannot reclaim: a spin lock held, interrupts off, a handler, inside reclaim.
+    Atomic,
+    /// A heap caller that may wait, on the try after which null is next.
+    LastTry,
+}
+
+/// Whether an allocation of `kind` made now may take from the reserve, and as what. The heap calls with its own
+/// locks held, so it says what its caller may do: it holds a `reclaim::keep_reserve` slot for as long as it may
+/// still reclaim and try again, and none under a spin lock or on its last try.
+fn taker(kind: Kind) -> Option<Taker> {
+    if MigrateType::of(kind) != MigrateType::Unmovable {
+        return None;
     }
+    match kind {
+        Kind::Heap if reclaim::heap_waits() => None,
+        // The heap's own locks are held here: what its caller may do was settled before it took them.
+        Kind::Heap if reclaim::heap_last_try() => Some(Taker::LastTry),
+        Kind::Heap => Some(Taker::Atomic),
+        _ => (!reclaim::context_allows()).then_some(Taker::Atomic),
+    }
+}
+
+/// Whether a failed allocation of `kind` is the asker's last word (else the heap comes again: not a failure yet).
+pub(super) fn final_try(kind: Kind) -> bool {
+    !(kind == Kind::Heap && reclaim::heap_waits())
 }
 
 impl ZoneState {
@@ -91,8 +127,9 @@ impl Buddy {
 
     /// Brings zone `zone`'s reserve up to `pageblocks` wholly free pageblocks, from the top of the zone down: the
     /// lowest free block is handed out first (`first_free`), so the top is used last, and address limits (DMA) are
-    /// low. Returns the zone's reserve in pageblocks afterwards.
+    /// low. Returns the zone's reserve in pageblocks afterwards. `pageblocks` is the size `refill` keeps it at.
     pub fn reserve_highatomic_in(&self, zone: usize, pageblocks: u64) -> u64 {
+        self.ha.target[zone].store(pageblocks, Relaxed);
         let mut zs = self.zones[zone].lock();
         for r in self.regions.iter().rev().filter(|r| r.zone == zone) {
             let mut pb = r.end & !(PAGEBLOCK_FRAMES - 1);
@@ -141,12 +178,14 @@ impl Buddy {
 
     /// Linux `rmqueue_buddy`'s last step (`__rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC)` for
     /// `ALLOC_HIGHATOMIC`, and for `ALLOC_NON_BLOCK` once `__rmqueue` found nothing): a block of `order` out of the
-    /// reserve for a caller that `may_take`, the zones in `take_free`'s order.
+    /// reserve for a caller that may take it (`taker`), the zones in `take_free`'s order. A take that leaves a
+    /// zone's reserve below its low mark asks the background for a refill (`refill`); nobody waits for it.
     #[cold]
     pub(super) fn alloc_highatomic(&self, order: u32, zone: Zone, kind: Kind) -> Option<u64> {
-        if order >= PAGEBLOCK_ORDER || !may_take(kind) {
+        if order >= PAGEBLOCK_ORDER {
             return None;
         }
+        let who = taker(kind)?;
         let tries: &[usize] = match zone {
             Zone::Dma32 => &[0],
             Zone::Normal => &[1, 0],
@@ -157,11 +196,13 @@ impl Buddy {
             let mut zs = self.zones[z].lock();
             let Some((ri, pfn)) = self.smallest_typed(z, &mut zs, order, MigrateType::HighAtomic, u64::MAX) else { continue };
             self.set_meta(&self.regions[ri], pfn, Meta::new(State::Alloc, order, kind as usize));
+            let low = zs.free_highatomic < self.reserve_low_mark(z);
             drop(zs);
             self.used[kind as usize].fetch_add(1 << order, Relaxed);
             drop(counted);
-            if self.global_reports {
-                HIGHATOMIC_ALLOCS.inc();
+            self.count_take(order, kind, who == Taker::LastTry);
+            if low && self.global_reports {
+                refill::ask();
             }
             return Some(pfn * PAGE);
         }

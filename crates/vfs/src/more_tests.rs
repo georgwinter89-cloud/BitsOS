@@ -123,7 +123,7 @@ pub(crate) fn install_policy() {
 
 /// Program 9 as uid 1000 in `ns`.
 pub(crate) fn p9_ctx(ns: &MountNs) -> Ctx<'_> {
-    let subject = policy::Subject { program: policy::ProgramId(9), pid: 900, uid: 1000 };
+    let subject = policy::Subject { program: policy::ProgramId(9), pid: 900, uid: 1000, tree: 0 };
     Ctx { ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0, subject }
 }
 
@@ -136,7 +136,7 @@ fn policy_hook_b3() {
     k.mkdir(None, b"/home", 0o755).unwrap();
     k.mkdir(None, b"/home/p9", 0o777).unwrap();
     k.open(None, b"/secret/old", O_CREAT | O_WRONLY, 0o666).unwrap();
-    let subject = policy::Subject { program: policy::ProgramId(9), pid: 900, uid: 1000 };
+    let subject = policy::Subject { program: policy::ProgramId(9), pid: 900, uid: 1000, tree: 0 };
     let c = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0, subject };
     let before = ASKED_P9.load(Ordering::Relaxed);
     // Inside its own folder nothing is asked.

@@ -183,6 +183,9 @@ fn meminfo_lines_as_show_val_kb() {
     let pos = |k: &str| keys.iter().position(|x| *x == k).unwrap();
     assert!(pos("SwapFree") < pos("Zswap") && pos("Shmem") < pos("KReclaimable") && pos("CommitLimit") < pos("Committed_AS"));
     assert!(pos("FileHugePages") < pos("FilePmdMapped") && pos("Unaccepted") < pos("HugePages_Total"));
+    // linux-7.3.1/fs/proc/meminfo.c:164: three lines after Unaccepted, before the hugetlb report.
+    assert_eq!(pos("Balloon"), pos("Unaccepted") + 1);
+    assert!(pos("Balloon") < pos("GPUActive") && pos("GPUActive") + 1 == pos("GPUReclaim") && pos("GPUReclaim") < pos("HugePages_Total"));
 }
 
 #[test]
@@ -207,8 +210,8 @@ fn uptime_and_loadavg_formats() {
 
 #[test]
 fn interrupts_format() {
-    // Linux 6.6 on a 2-CPU machine (prec 3): 11 blanks, CPUn left-aligned in 8, rows "%*s: " + "%10u ".
-    let want = "           CPU0       CPU1       \nRES:          5 4294967295   Rescheduling interrupts\nTLB:          0          7   TLB shootdowns\n";
+    // Linux 7.3.1 on a 2-CPU machine (prec 4): 12 blanks, CPUn left-aligned in 8, rows "%*s:" + " %10u".
+    let want = "            CPU0       CPU1       \n RES:          5 4294967295  Rescheduling interrupts\n TLB:          0          7  TLB shootdowns\n";
     assert_eq!(super::system::interrupts(&[(0, 5, 0), (1, u64::from(u32::MAX), 7)]), want);
 }
 

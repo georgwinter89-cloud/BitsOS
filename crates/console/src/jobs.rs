@@ -1,4 +1,4 @@
-//! Job control of the console terminal (IN-4; linux-6.6/drivers/tty/tty_jobctrl.c): the controlling session and
+//! Job control of the console terminal (IN-4; linux-7.3.1/drivers/tty/tty_jobctrl.c): the controlling session and
 //! the foreground process group, TIOCSCTTY/TIOCNOTTY/TIOCGPGRP/TIOCSPGRP/TIOCGSID, the background check that
 //! sends SIGTTIN/SIGTTOU (`__tty_check_change`), and the signals the terminal raises (ISIG characters, SIGWINCH,
 //! SIGHUP when the session leader is gone).
@@ -151,7 +151,7 @@ impl Ctl {
     }
 
     /// `refresh` for a VT (`cont`: SIGHUP and SIGCONT) or a pty slave (SIGHUP only: `disassociate_ctty(1)` on a
-    /// pty kills the foreground group with SIGHUP alone, linux-6.6/drivers/tty/tty_jobctrl.c:274-284).
+    /// pty kills the foreground group with SIGHUP alone, linux-7.3.1/drivers/tty/tty_jobctrl.c:274-283).
     pub fn refresh_as(&mut self, p: &dyn Procs, out: &mut Send, cont: bool) {
         if let Some(sid) = self.session
             && !p.alive(sid)

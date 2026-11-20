@@ -2,6 +2,8 @@
 //! no fault recovery, so the API is limited to named ones the kernel needs; MCP's `msr_read` goes through
 //! `read_checked`, which allows only MSRs that CPUID (or a bank's STATUS) says exist.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 pub const IA32_APIC_BASE: u32 = 0x1B;
 /// TSC adjust (exists with CPUID 7.0 EBX bit 1, `tsc_adjust`); firmware may leave it non-zero per core.
 pub const IA32_TSC_ADJUST: u32 = 0x3B;
@@ -14,19 +16,26 @@ pub const IA32_PAT: u32 = 0x277;
 pub const AMD_RAPL_POWER_UNIT: u32 = 0xC001_0299;
 pub const AMD_CORE_ENERGY_STATUS: u32 = 0xC001_029A;
 pub const AMD_PKG_ENERGY_STATUS: u32 = 0xC001_029B;
-/// Intel RAPL energy unit, package and core (PP0) energy counters (linux-6.6/arch/x86/include/asm/msr-index.h:391,
-/// 394, 404). Intel has no CPUID bit for them; `intel_rapl_model` decides (CP-6). PSys (0x64D) is left out: it
+/// Intel RAPL energy unit, package and core (PP0) energy counters (linux-7.3.1/arch/x86/include/asm/msr-index.h:490,
+/// 493, 503). Intel has no CPUID bit for them; `intel_rapl_model` decides (CP-6). PSys (0x64D) is left out: it
 /// is missing on some desktop parts and `read` cannot recover from the #GP.
 pub const INTEL_RAPL_POWER_UNIT: u32 = 0x606;
 pub const INTEL_PKG_ENERGY_STATUS: u32 = 0x611;
 pub const INTEL_PP0_ENERGY_STATUS: u32 = 0x639;
 /// HWP enable (bit 0; exists with CPUID 6 EAX bit 7, `hwp`). SDM Vol. 3B 15.4.2: the other HWP MSRs may only be
-/// accessed once this bit is set, else #GP; firmware may leave it clear and V2 never sets it (Linux's intel_pstate
-/// does, linux-6.6/drivers/cpufreq/intel_pstate.c:1731, before it reads the capabilities at :920).
+/// accessed once this bit is set, else #GP; firmware may leave it clear and `cpu::hwp` sets it like Linux's
+/// intel_pstate (linux-7.3.1/drivers/cpufreq/intel_pstate.c:2007, before it reads the capabilities at :1166).
 pub const IA32_PM_ENABLE: u32 = 0x770;
 /// Highest/guaranteed/efficient/lowest performance in HWP units (CPUID `hwp` and IA32_PM_ENABLE bit 0; SDM Vol.
 /// 3B 15.4.3). `smp` reads byte 0 (highest) on hybrid Intel CPUs for the capacity hint (CP-6).
 pub const IA32_HWP_CAPABILITIES: u32 = 0x771;
+/// HWP notification enables (CPUID `hwp_notify`); the one HWP MSR that may be written with HWP off.
+pub const IA32_HWP_INTERRUPT: u32 = 0x773;
+/// This CPU's HWP request: minimum, maximum, desired, EPP, activity window (`cpu::hwp::request_value`).
+pub const IA32_HWP_REQUEST: u32 = 0x774;
+/// Speculation control (CPUID 7.0 EDX bit 26) and what the CPU says about itself (bit 29), `cpu::spec_ctrl_wanted`.
+pub const IA32_SPEC_CTRL: u32 = 0x48;
+pub const IA32_ARCH_CAPABILITIES: u32 = 0x10A;
 /// TSC-deadline timer target (exists with CPUID 1 ECX bit 24, `tsc_deadline_timer`; CP-5's `apic::timer`).
 pub const IA32_TSC_DEADLINE: u32 = 0x6E0;
 /// CET enables for user and supervisor mode (exist with CPUID SHSTK or IBT).
@@ -107,8 +116,12 @@ pub struct ReadCaps {
     pub intel_rapl: bool,
     /// CPUID `hwp` on Intel (`intel_hwp`): IA32_PM_ENABLE.
     pub hwp: bool,
-    /// IA32_PM_ENABLE bit 0 (HWP switched on): IA32_HWP_CAPABILITIES.
+    /// IA32_PM_ENABLE bit 0 (HWP switched on): IA32_HWP_CAPABILITIES and IA32_HWP_REQUEST.
     pub hwp_enabled: bool,
+    /// CPUID `spec_ctrl` on Intel: IA32_SPEC_CTRL.
+    pub spec_ctrl: bool,
+    /// CPUID `arch_capabilities` on Intel: IA32_ARCH_CAPABILITIES.
+    pub arch_caps: bool,
     /// FD-1 measuring build only: which of its extra clock and C-state MSRs exist.
     #[cfg(bitsos_fd_measure)]
     pub fd: FdMsrs,
@@ -144,8 +157,9 @@ impl FdMsrs {
 }
 
 /// Intel client models whose RAPL MSRs (0x606, 0x611, 0x639) exist: the hybrid generations from Linux's model
-/// list (linux-6.6/arch/x86/events/rapl.c:805-814: Alder, Raptor, Meteor Lake) plus Arrow Lake (0xC5/0xC6,
-/// linux-6.6/arch/x86/include/asm/intel-family.h:128-129; the Gaming-PC's 265K is 0xC6 and its Linux shows
+/// list (linux-6.6/arch/x86/events/rapl.c:805-814 (Linux 7.3.1 differs: linux-7.3.1/arch/x86/events/rapl.c:875-888,
+/// see plan/spec/linux7-differences.md): Alder, Raptor, Meteor Lake) plus Arrow Lake (0xC5/0xC6,
+/// linux-7.3.1/arch/x86/include/asm/intel-family.h:148-149; the Gaming-PC's 265K is 0xC6 and its Linux shows
 /// `intel-rapl:0`). Intel has no CPUID bit for RAPL and `read` has no fault recovery, so unknown models and every
 /// guest (CPUID `hypervisor`: KVM passes the host model through but #GPs on these MSRs) get no.
 const INTEL_RAPL_MODELS: &[u32] = &[0x97, 0x9A, 0xAA, 0xAC, 0xB7, 0xBA, 0xBF, 0xC5, 0xC6];
@@ -164,13 +178,18 @@ pub fn hwp_enabled(v: &crate::cpu::CpuidView, read: &mut dyn FnMut(u32) -> u64) 
     intel_hwp(v) && read(IA32_PM_ENABLE) & 1 != 0
 }
 
-/// CPUID `hwp` on a GenuineIntel CPU: the HWP MSRs are Intel-only, and a set leaf-6 bit 7 on another vendor
-/// (reserved there) must not open them.
+/// CPUID `hwp` on a GenuineIntel CPU on bare metal: the HWP MSRs are Intel-only, a set leaf-6 bit 7 on another vendor
+/// (reserved there) must not open them, and a hypervisor that showed the bit would still have no such MSRs.
 pub fn intel_hwp(v: &crate::cpu::CpuidView) -> bool {
-    is_intel(v) && v.has("hwp")
+    is_intel(v) && v.has("hwp") && !v.has("hypervisor")
 }
 
-fn is_intel(v: &crate::cpu::CpuidView) -> bool {
+pub(crate) fn is_amd(v: &crate::cpu::CpuidView) -> bool {
+    let vendor = v.get(0, 0);
+    vendor.ebx == u32::from_le_bytes(*b"Auth") && vendor.ecx == u32::from_le_bytes(*b"cAMD")
+}
+
+pub(crate) fn is_intel(v: &crate::cpu::CpuidView) -> bool {
     let vendor = v.get(0, 0);
     vendor.ebx == u32::from_le_bytes(*b"Genu") && vendor.ecx == u32::from_le_bytes(*b"ntel")
 }
@@ -179,17 +198,21 @@ impl ReadCaps {
     pub fn live() -> Self {
         let v = crate::cpu::live();
         let mca = v.has("mca") && v.has("mce");
+        // GP-CPU audit: `smca` and `rapl` are AMD's bits in a leaf Intel keeps reserved; they open AMD MSRs.
+        let amd = is_amd(&v);
         ReadCaps {
             mtrr: v.has("mtrr"),
             tsc_aux: v.has("rdtscp") || v.has("rdpid"),
             mca,
             mca_banks: if mca { (read(IA32_MCG_CAP) & 0xFF) as u32 } else { 0 },
-            smca: mca && v.has("smca"),
-            rapl: v.has("rapl"),
+            smca: amd && mca && v.has("smca"),
+            rapl: amd && v.has("rapl"),
             tsc_deadline: v.has("tsc_deadline_timer"),
             intel_rapl: intel_rapl_model(&v),
             hwp: intel_hwp(&v),
-            hwp_enabled: hwp_enabled(&v, &mut |m| read(m)),
+            hwp_enabled: hwp_enabled(&v, &mut |m| try_read(m).unwrap_or(0)),
+            spec_ctrl: is_intel(&v) && v.has("spec_ctrl"),
+            arch_caps: is_intel(&v) && v.has("arch_capabilities"),
             #[cfg(bitsos_fd_measure)]
             fd: FdMsrs::live(),
         }
@@ -220,7 +243,9 @@ pub fn access(msr: u32, caps: &ReadCaps) -> Access {
         IA32_TSC_DEADLINE => return yes(caps.tsc_deadline),
         INTEL_RAPL_POWER_UNIT | INTEL_PKG_ENERGY_STATUS | INTEL_PP0_ENERGY_STATUS => return yes(caps.intel_rapl),
         IA32_PM_ENABLE => return yes(caps.hwp),
-        IA32_HWP_CAPABILITIES => return yes(caps.hwp && caps.hwp_enabled),
+        IA32_HWP_CAPABILITIES | IA32_HWP_REQUEST => return yes(caps.hwp && caps.hwp_enabled),
+        IA32_SPEC_CTRL => return yes(caps.spec_ctrl),
+        IA32_ARCH_CAPABILITIES => return yes(caps.arch_caps),
         // FD-1 measuring build only: APERF/MPERF, the AMD Zen clock and C-state registers (HWCR, P-state limit,
         // control, status and definitions, C-state base address) and CPPC (capabilities/enable/request/status).
         #[cfg(bitsos_fd_measure)]
@@ -276,18 +301,288 @@ pub fn read(_msr: u32) -> u64 {
 #[cfg(not(target_os = "none"))]
 pub fn write(_msr: u32, _value: u64) {}
 
-/// For MCP `msr_read` (input from the network): refuses MSRs that might not exist instead of faulting.
+/// Reads an MSR that may not exist: `None` when the read raised #GP (GP-CPU: Intel registers with no CPUID bit,
+/// such as the package C-state limit or TjMax, on a machine nobody has booted yet). The one `rdmsr` this is built
+/// on has a fixed address, and the kernel's #GP path resumes behind it (`fault_fixup`); every other `rdmsr` still
+/// panics on a fault, so `read` stays for registers CPUID vouches for. Any context; the answer is this CPU's.
+#[cfg(target_os = "none")]
+pub fn try_read(msr: u32) -> Option<u64> {
+    let mut v = 0u64;
+    // SAFETY: the routine only executes rdmsr and stores eight bytes through the pointer to `v`; a #GP at its
+    // rdmsr is turned into a 0 return by `fault_fixup`, with no other effect.
+    let ok = unsafe { hal_rdmsr_safe(msr, &mut v) };
+    if ok == 0 {
+        FAULTS.note(msr);
+        return None;
+    }
+    Some(v)
+}
+
+/// On the host `read` answers 0 for every register and nothing faults; this agrees with it, so host tests of the
+/// callers see what they saw when those called `read`.
+#[cfg(not(target_os = "none"))]
+pub fn try_read(msr: u32) -> Option<u64> {
+    Some(read(msr))
+}
+
+/// Writes an MSR that may not exist or may refuse the value: false when the write raised #GP (nothing was written
+/// then). For Intel registers only a bare machine has (HWP, SPEC_CTRL bits), so that a CPU nobody has booted yet
+/// answers "failed" in the log instead of ending the boot. The same fixed-site rule as `try_read`.
+#[cfg(target_os = "none")]
+pub fn try_write(msr: u32, value: u64) -> bool {
+    // SAFETY: the routine only executes wrmsr with the caller's register and value (the callers are the trusted
+    // base's, as for `write`); a #GP at it is turned into a 0 return by `fault_fixup`.
+    let ok = unsafe { hal_wrmsr_safe(msr, value) } != 0;
+    if !ok {
+        FAULTS.note(msr);
+    }
+    ok
+}
+
+/// On the host, as `write`: nothing happens and nothing faults.
+#[cfg(not(target_os = "none"))]
+pub fn try_write(msr: u32, value: u64) -> bool {
+    write(msr, value);
+    true
+}
+
+/// Which registers refused a fault-safe access. A swallowed #GP must not be a silent one: on a machine nobody has
+/// booted, the boot log, `hw_info` and the screen report name each register that faulted, so one stick round tells
+/// which it was. Atomics only: `note` runs before the heap exists and inside interrupts (the frequency sampler).
+pub struct FaultLog {
+    count: AtomicU64,
+    /// Distinct registers in the order they first faulted: 0 = free, else the register number with bit 32 set.
+    slots: [AtomicU64; FaultLog::SLOTS],
+    /// A register faulted that found no free slot.
+    more: AtomicU64,
+}
+
+/// A copy of the `FaultLog` (the registers in first-fault order).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Faults {
+    pub count: u64,
+    pub registers: [u32; FaultLog::SLOTS],
+    pub distinct: usize,
+    /// More distinct registers faulted than the list holds.
+    pub more: bool,
+}
+
+impl FaultLog {
+    pub const SLOTS: usize = 8;
+    const TAKEN: u64 = 1 << 32;
+
+    pub const fn new() -> Self {
+        Self { count: AtomicU64::new(0), slots: [const { AtomicU64::new(0) }; Self::SLOTS], more: AtomicU64::new(0) }
+    }
+
+    pub fn note(&self, msr: u32) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let key = u64::from(msr) | Self::TAKEN;
+        for slot in &self.slots {
+            match slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(held) if held == key => return,
+                Err(_) => {}
+            }
+        }
+        self.more.store(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> Faults {
+        let mut f = Faults { count: self.count.load(Ordering::Relaxed), more: self.more.load(Ordering::Relaxed) != 0, ..Faults::default() };
+        for slot in &self.slots {
+            let v = slot.load(Ordering::Relaxed);
+            if v == 0 {
+                break;
+            }
+            f.registers[f.distinct] = v as u32;
+            f.distinct += 1;
+        }
+        f
+    }
+}
+
+impl Default for FaultLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Faults {
+    pub fn registers(&self) -> &[u32] {
+        &self.registers[..self.distinct]
+    }
+}
+
+/// `count=3 registers=0xe2,0x48` (`registers=none` without a fault, `,more` behind a full list): the form of the
+/// boot event, `hw_info` and the screen report.
+impl core::fmt::Display for Faults {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "count={} registers=", self.count)?;
+        if self.distinct == 0 {
+            return f.write_str("none");
+        }
+        for (i, r) in self.registers().iter().enumerate() {
+            write!(f, "{}{r:#x}", if i == 0 { "" } else { "," })?;
+        }
+        if self.more { f.write_str(",more") } else { Ok(()) }
+    }
+}
+
+static FAULTS: FaultLog = FaultLog::new();
+
+/// How many `try_read`s and `try_write`s faulted (ktests).
+pub fn try_read_faults() -> u64 {
+    FAULTS.count.load(Ordering::Relaxed)
+}
+
+/// Every fault a `try_read` or `try_write` absorbed since boot, with the registers (boot report, `hw_info`, the
+/// screen report of wave B10).
+pub fn faults() -> Faults {
+    FAULTS.snapshot()
+}
+
+/// The #GP path's first question (`idt::hal_kernel_trap`): a fault at `try_read`'s `rdmsr` in kernel mode goes on
+/// at its "absent" return. True when the frame was redirected. Nothing else is ever resumed here.
+pub(crate) fn fault_fixup(rip: &mut u64, cs: u64) -> bool {
+    if cs & 3 != 0 {
+        return false;
+    }
+    for (site, landing) in [try_read_site(), try_write_site()] {
+        if site != 0 && *rip == site {
+            *rip = landing;
+            return true;
+        }
+    }
+    false
+}
+
+/// (address of `try_write`'s `wrmsr`, address it resumes at after a #GP); zeros on the host.
+pub fn try_write_site() -> (u64, u64) {
+    #[cfg(target_os = "none")]
+    {
+        (&raw const hal_wrmsr_safe_insn as u64, &raw const hal_wrmsr_safe_fault as u64)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        (0, 0)
+    }
+}
+
+/// (address of `try_read`'s `rdmsr`, address it resumes at after a #GP); zeros on the host.
+pub fn try_read_site() -> (u64, u64) {
+    #[cfg(target_os = "none")]
+    {
+        (&raw const hal_rdmsr_safe_insn as u64, &raw const hal_rdmsr_safe_fault as u64)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        (0, 0)
+    }
+}
+
+#[cfg(target_os = "none")]
+unsafe extern "C" {
+    static hal_rdmsr_safe_insn: u8;
+    static hal_rdmsr_safe_fault: u8;
+    static hal_wrmsr_safe_insn: u8;
+    static hal_wrmsr_safe_fault: u8;
+    fn hal_rdmsr_safe(msr: u32, out: *mut u64) -> u64;
+    fn hal_wrmsr_safe(msr: u32, value: u64) -> u64;
+}
+
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    r#"
+    .text
+    .p2align 4
+    # (msr in edi, out in rsi): rax = 1 and *out = the value, or rax = 0 when the rdmsr raised #GP.
+    .global hal_rdmsr_safe
+hal_rdmsr_safe:
+    movl %edi, %ecx
+    .global hal_rdmsr_safe_insn
+hal_rdmsr_safe_insn:
+    rdmsr
+    shlq $32, %rdx
+    movl %eax, %eax
+    orq %rdx, %rax
+    movq %rax, (%rsi)
+    movl $1, %eax
+    ret
+    .global hal_rdmsr_safe_fault
+hal_rdmsr_safe_fault:
+    xorl %eax, %eax
+    ret
+
+    .p2align 4
+    # (msr in edi, value in rsi): rax = 1 when written, 0 when the wrmsr raised #GP.
+    .global hal_wrmsr_safe
+hal_wrmsr_safe:
+    movl %edi, %ecx
+    movl %esi, %eax
+    movq %rsi, %rdx
+    shrq $32, %rdx
+    .global hal_wrmsr_safe_insn
+hal_wrmsr_safe_insn:
+    wrmsr
+    movl $1, %eax
+    ret
+    .global hal_wrmsr_safe_fault
+hal_wrmsr_safe_fault:
+    xorl %eax, %eax
+    ret
+"#,
+    options(att_syntax)
+);
+
+/// For MCP `msr_read` (input from the network): refuses MSRs that might not exist instead of faulting. Interrupts stay
+/// off from the check to the read: HWP state is per CPU (a CPU can be left without it), and a thread moved in between
+/// would read on a CPU nobody checked, where the #GP cannot be recovered.
 pub fn read_checked(msr: u32) -> Option<u64> {
+    let _irq = crate::cpu::IrqGuard::new();
+    // GP-CPU: the list decides, and the read itself is fault-safe on top. Several entries rest on a model list or on
+    // a state another CPU set (Intel RAPL, HWP); should one be wrong on a machine nobody has booted, the answer is
+    // "refused", as for an MSR that is not on the list.
     match access(msr, &ReadCaps::live()) {
         Access::No => None,
-        Access::Yes => Some(read(msr)),
-        Access::IfStatus { status, valid_bit } => (read(status) & valid_bit != 0).then(|| read(msr)),
+        Access::Yes => try_read(msr),
+        Access::IfStatus { status, valid_bit } => (try_read(status)? & valid_bit != 0).then(|| try_read(msr)).flatten(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A swallowed fault names its register: each distinct one once, in first-fault order, every fault counted.
+    #[test]
+    fn fault_log_names_the_registers() {
+        extern crate alloc;
+        use alloc::string::ToString;
+        let log = FaultLog::new();
+        assert_eq!(log.snapshot(), Faults::default());
+        assert_eq!(log.snapshot().to_string(), "count=0 registers=none");
+        // MSR 0 is a register too (its slot is not "free").
+        for m in [0xE2, IA32_SPEC_CTRL, 0xE2, 0, IA32_SPEC_CTRL, 0xE8] {
+            log.note(m);
+        }
+        let f = log.snapshot();
+        assert_eq!((f.count, f.registers(), f.more), (6, &[0xE2, 0x48, 0, 0xE8][..], false));
+        assert_eq!(f.to_string(), "count=6 registers=0xe2,0x48,0x0,0xe8");
+        // The list is full after eight: the count goes on, the text says there were more.
+        for m in 0x700..0x700 + 5 {
+            log.note(m);
+        }
+        let f = log.snapshot();
+        assert_eq!((f.count, f.distinct, f.more), (11, FaultLog::SLOTS, true));
+        assert_eq!(f.registers()[4..], [0x700, 0x701, 0x702, 0x703]);
+        assert!(f.to_string().ends_with(",0x703,more"), "{f}");
+        log.note(0xE2);
+        assert_eq!(log.snapshot().count, 12);
+        // On the host nothing faults, so the kernel's own log stays empty whatever ran before.
+        assert_eq!(try_read(0x8000_0000), Some(0));
+        assert_eq!(faults().count, try_read_faults());
+    }
 
     fn legacy(bank: u32, reg: u32) -> u32 {
         mc_reg(false, bank, reg).unwrap()
@@ -324,7 +619,7 @@ mod tests {
             assert_eq!(access(m, &zen4), Access::Yes);
         }
         assert_eq!(access(IA32_TSC_DEADLINE, &ReadCaps { tsc_deadline: true, ..Default::default() }), Access::Yes);
-        let hwp_msrs = [IA32_PM_ENABLE, IA32_HWP_CAPABILITIES];
+        let hwp_msrs = [IA32_PM_ENABLE, IA32_HWP_CAPABILITIES, IA32_HWP_REQUEST, IA32_SPEC_CTRL, IA32_ARCH_CAPABILITIES];
         for m in [INTEL_RAPL_POWER_UNIT, INTEL_PKG_ENERGY_STATUS, INTEL_PP0_ENERGY_STATUS].into_iter().chain(hwp_msrs) {
             assert_eq!(access(m, &zen4), Access::No, "{m:#x}: Intel-only");
             assert_eq!(access(m, &intel), Access::No, "{m:#x}: needs the model or CPUID hwp");
@@ -333,8 +628,9 @@ mod tests {
         let hwp_off = ReadCaps { hwp: true, ..intel };
         assert_eq!(access(IA32_PM_ENABLE, &hwp_off), Access::Yes);
         assert_eq!(access(IA32_HWP_CAPABILITIES, &hwp_off), Access::No, "HWP MSRs #GP until PM_ENABLE bit 0");
+        assert_eq!(access(IA32_HWP_REQUEST, &hwp_off), Access::No, "HWP MSRs #GP until PM_ENABLE bit 0");
         assert_eq!(access(IA32_HWP_CAPABILITIES, &ReadCaps { hwp_enabled: true, ..intel }), Access::No);
-        let arl = ReadCaps { intel_rapl: true, hwp: true, hwp_enabled: true, ..intel };
+        let arl = ReadCaps { intel_rapl: true, hwp: true, hwp_enabled: true, spec_ctrl: true, arch_caps: true, ..intel };
         for m in [INTEL_RAPL_POWER_UNIT, INTEL_PKG_ENERGY_STATUS, INTEL_PP0_ENERGY_STATUS].into_iter().chain(hwp_msrs) {
             assert_eq!(access(m, &arl), Access::Yes);
         }

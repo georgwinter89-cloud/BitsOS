@@ -1,8 +1,8 @@
 # user/ports/steam: Valve's Steam client on V2 (GM-2a)
 
 `bitsos/steam` is the launcher (`\BITSOS2\bin\steam`), `scripts/stage-v2.sh` makes the tree `\BITSOS2\steam\` from Valve's
-own files. Nothing of Valve's is in git: `pins.txt` holds names and hashes. Steam runs only on the Mini-PC (Georg 30.10.):
-`bash host/tests/minipc/steam.sh <host> --tls auto --token-file F`. The tree holds regular files only (FAT): the client stays in
+own files. Nothing of Valve's is in git: `pins.txt` holds names and hashes. Steam runs only on the Mini-PC (Georg 30.10.;
+check list `plan/guides/minipc-steam.md`). The tree holds regular files only (FAT): the client stays in
 its published zips, the provider in a tar. Georg logs in himself; no credential is read, stored or passed anywhere.
 
 | Tree path | What |
@@ -16,7 +16,7 @@ its published zips, the provider in a tar. Georg logs in himself; no credential 
 
 `reaper/` is not part of the tree: a small crate, `/bin/reaper` on the image. Steam starts every game through `steamrt64/reaper`, which
 is a 32-bit program V2 cannot run, so before every start the launcher copies the 64-bit stand-in over it (stage `reaper`; `steam --check`
-says which one is there). Differences from Valve's and the list of other i386 files: `plan/notes/sx-GM-2b.md`.
+says which one is there). Differences from Valve's and the list of other i386 files: `plan/spec/sandbox.md` §6.
 
 The start follows Valve's own path: `steam.sh` sees `package/beta` (not a stable name) and `.steam-enable-steamrt64-client`, runs
 `steamrt64/steam` (64-bit), which installs its packages, then `pv-run.sh` -> `srt-client-container` -> pressure-vessel (the client's
@@ -25,7 +25,14 @@ own steamrt3c runtime, in `runtime_steamrt_ubuntu12.zip`) -> the client in the c
 
 Windows games go through Proton in Wine's new WoW64 mode: the launcher gives Steam `PROTON_USE_WOW64=1`, so Proton takes its
 64-bit-only Wine (`files/bin-wow64/`) instead of the classic one, whose `files/bin/wine` is i386. `steam --check` lists the
-installed Proton versions and whether each has that Wine. Why, and the Mini-PC check list: `plan/notes/gm-PROTON.md`.
+installed Proton versions and whether each has that Wine. Why: `plan/spec/programs.md` §5.2; the Mini-PC check list: `plan/guides/games.md`.
+
+Games start as `steam steam://rungameid/<appid>` (GM-6s, sofa-mode.md 3.2). While Steam's client runs, such a second start (exactly one
+`steam://` URL) is handed to it through the client's own `steam.sh` (Valve's single-instance pipe) and ends at once, bounded at 60 s
+(TERM to its whole process group). Ready means a `steam` process, the FIFO `~/.steam/steam.pipe` and a live pid in
+`~/.steam/steam.pid`; while a launcher still starts Steam, a forward waits up to 60 s for that (`SB_FORWARD_READY`).
+One `stage=forward` line goes to the log, the stages are left alone; any other second start is refused as before. Which games are
+installed: `user/lib/steamlib` (only `libraryfolders.vdf` and the appmanifests). Decisions: `plan/spec/programs.md` §5.1.
 
 ## Downloads (cache `$V2_DOWNLOADS/steam`, 720 MB; the stage 825 MB; Georg's OK for fetching Steam: 2.11.)
 

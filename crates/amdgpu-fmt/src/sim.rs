@@ -19,7 +19,7 @@
 use alloc::vec::Vec;
 
 use crate::bus::{GpuBus, MemFault, read_u32};
-use crate::{pm4, sdma};
+use crate::{pm4, sdma, sdma7};
 
 /// Which packet language the engine speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +189,10 @@ pub struct Engine {
     armed: Option<Where>,
     /// [`Engine::refuse_non_canonical_ibs`].
     canonical_ibs: bool,
+    /// [`Engine::speak_sdma7`].
+    sdma7: bool,
+    /// [`Engine::speak_gfx12`].
+    gfx12: bool,
 }
 
 /// Why [`Engine::new`] refused.
@@ -208,12 +212,24 @@ impl Engine {
         if !ring_dw.is_power_of_two() || ring_base & 0xFF != 0 || ring_base.checked_add(bytes).is_none() {
             return Err(EngineError::BadRing);
         }
-        Ok(Engine { isa, ring_base, ring_dw, rptr: start, stack: Vec::new(), halted: None, limits, armed: None, canonical_ibs: false })
+        Ok(Engine { isa, ring_base, ring_dw, rptr: start, stack: Vec::new(), halted: None, limits, armed: None, canonical_ibs: false, sdma7: false, gfx12: false })
     }
     /// A compute queue (MEC): a PM4 INDIRECT_BUFFER whose address is not sign-extended from bit 47 halts the engine,
     /// as CP_HQD_ERROR.SUA_ERROR does on the 780M (measured 4.11.; gfx_v11_0_ring_emit_ib_compute writes it unmasked).
     pub fn refuse_non_canonical_ibs(&mut self) {
         self.canonical_ibs = true;
+    }
+    /// An SDMA 7.0 engine (GX-10 wave 43, a change request to GR): 6.0's packets with the two forms of
+    /// [`crate::sdma7`], a copy of eight dwords with CPV and a fill with COMPRESS; a 6.0 copy halts it. No effect on
+    /// a PM4 engine.
+    pub fn speak_sdma7(&mut self) {
+        self.sdma7 = self.isa == Isa::Sdma;
+    }
+    /// A GFX 12 command processor's gfx or compute queue (GX-10 wave 44, a change request to GR): it runs only the
+    /// packets Linux's gfx_v12_0.c emits on such a ring ([`crate::gfx12::OPCODES`]); a CE packet, a KIQ packet, a
+    /// type-0 or type-2 packet or any other opcode halts it. RUN_CLEANER_SHADER starts a shader the model does not execute. No effect on an SDMA engine.
+    pub fn speak_gfx12(&mut self) {
+        self.gfx12 = self.isa == Isa::Pm4;
     }
     pub fn isa(&self) -> Isa {
         self.isa
@@ -307,7 +323,7 @@ impl Engine {
                         pm4::DecodeError::Truncated { need, .. } => Len::More(need as u64),
                         e => Len::Hang(Hang::Pm4(e)),
                     }),
-                    Isa::Sdma => sdma::packet_len(&buf).map_err(|e| match e {
+                    Isa::Sdma => if self.sdma7 { sdma7::packet_len(&buf) } else { sdma::packet_len(&buf) }.map_err(|e| match e {
                         sdma::DecodeError::Truncated { need, .. } => Len::More(need as u64),
                         e => Len::Hang(Hang::Sdma(e)),
                     }),
@@ -358,7 +374,9 @@ impl Engine {
             let at = self.here();
             let armed = self.armed == Some(at);
             let step = match self.isa {
+                Isa::Pm4 if self.gfx12 => exec_gfx12(bus, vmid, &buf, &mut events, &mut bytes_left, self.limits.max_bytes, armed),
                 Isa::Pm4 => exec_pm4(bus, vmid, &buf, &mut events, &mut bytes_left, self.limits.max_bytes, armed),
+                Isa::Sdma if self.sdma7 => exec_sdma7(bus, vmid, &buf, &mut events, &mut bytes_left, self.limits.max_bytes, armed),
                 Isa::Sdma => exec_sdma(bus, vmid, &buf, &mut events, &mut bytes_left, self.limits.max_bytes, armed),
             };
             let step = match step {
@@ -828,6 +846,33 @@ fn exec_pm4<B: GpuBus + ?Sized>(bus: &mut B, vmid: u8, words: &[u32], ev: &mut V
             Step::Next
         }
         P::Other { .. } => Step::Hang(Hang::Unsupported { header }),
+    }
+}
+
+/// One GFX 12 packet: only what Linux's gfx_v12_0.c emits runs, as GFX 11's does.
+fn exec_gfx12<B: GpuBus + ?Sized>(bus: &mut B, vmid: u8, words: &[u32], ev: &mut Vec<Event>, bytes_left: &mut u64, max_bytes: u64, armed: bool) -> Step {
+    let header = words[0];
+    if !crate::gfx12::emitted(header) {
+        return Step::Hang(Hang::Unsupported { header });
+    }
+    if pm4::hdr_opcode(header) == crate::gfx12::RUN_CLEANER_SHADER {
+        ev.push(Event::NoEffect { header });
+        return Step::Next;
+    }
+    exec_pm4(bus, vmid, words, ev, bytes_left, max_bytes, armed)
+}
+
+/// One SDMA 7.0 packet: the two forms that differ from 6.0 are held to what Linux emits (a copy with CPV and
+/// a DCC dword of 0, a fill with COMPRESS), then run as 6.0's.
+fn exec_sdma7<B: GpuBus + ?Sized>(bus: &mut B, vmid: u8, words: &[u32], ev: &mut Vec<Event>, bytes_left: &mut u64, max_bytes: u64, armed: bool) -> Step {
+    let header = words[0];
+    match (sdma::hdr_op(header), sdma7::decode(words)) {
+        (_, Err(e)) => Step::Hang(Hang::Sdma(e)),
+        // A compressed copy (a DCC dword that says so) is not modelled.
+        (sdma::op::COPY, Ok((_, _, Some(dcc)))) if dcc != 0 => Step::Hang(Hang::Unsupported { header }),
+        (sdma::op::COPY, Ok(_)) => exec_sdma(bus, vmid, &words[..sdma7::COPY_DW - 1], ev, bytes_left, max_bytes, armed),
+        (sdma::op::CONST_FILL, Ok(_)) if header & sdma7::FILL_COMPRESS == 0 => Step::Hang(Hang::BadField { header, what: "CONST_FILL without COMPRESS" }),
+        (_, Ok(_)) => exec_sdma(bus, vmid, words, ev, bytes_left, max_bytes, armed),
     }
 }
 

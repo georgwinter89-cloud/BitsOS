@@ -2,7 +2,7 @@
 name = "amdgpu"
 version = "0.1.0"
 edition = "2024"
-description = "Radeon 780M whole-GPU device object (dcn first) (owner: GX)"
+description = "amdgpu: one device object per GPU function (Radeon 780M driven, RX 9070 XT attached read-only) (owner: GX)"
 
 [dependencies]
 devmodel = { path = "../../devmodel" }
@@ -40,6 +40,12 @@ proc = { path = "../../proc" }
 drm = { path = "../../drm" }
 mm-core = { path = "../../mm-core" }
 linux = { package = "uapi", path = "../../uapi" }
+
+# GP-GPU1: the RX 9070 XT's measured facts and its pure rules (blob place and acceptance, the card with the picture,
+# firmware names, the never-send lists).
+rdna4-core = { path = "../rdna4-core" }
+# Wave 44: the orderly power-off the RX 9070 XT's software CTF check calls (Linux's `orderly_poweroff(true)`).
+platform = { path = "../../platform" }
 
 [lints]
 workspace = true

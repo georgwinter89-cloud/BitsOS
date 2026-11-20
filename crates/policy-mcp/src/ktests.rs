@@ -10,7 +10,7 @@ use policy::{IpAddr, NetProto, ProgramId, Subject};
 static RUN: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn fresh() -> Subject {
-    Subject { program: ProgramId(0x504D_0040), pid: 0x7e00_0000 + RUN.fetch_add(1, Ordering::Relaxed), uid: 1000 }
+    Subject { program: ProgramId(0x504D_0040), pid: 0x7e00_0000 + RUN.fetch_add(1, Ordering::Relaxed), uid: 1000, tree: 0 }
 }
 
 /// A DNS answer for `name` with one A record (RFC 1035 §4.1, the answer's name compressed to the question).
@@ -88,7 +88,7 @@ fn self_exec_named_by_its_executable() -> TestResult {
             break None;
         }
     };
-    let s = Subject { program: p.program, pid: p.pid, uid: p.uid };
+    let s = Subject { program: p.program, pid: p.pid, uid: p.uid, tree: 0 };
     // A name another process of the same program (ProgramId 1) resolved: the forget below must keep it. Before
     // PM-2c it took every name of the program, so this fails then even when the table starts empty.
     let other = Subject { program: p.program, ..fresh() };
@@ -146,7 +146,7 @@ fn named_after_the_owner_ended() -> TestResult {
         Err(proc::SpawnError::NotFound) => return ktest::fail("no /bin/sh (BusyBox) in this image"),
         Err(e) => return Err(alloc::format!("spawn /bin/sh: {e}")),
     };
-    let s = Subject { program: p.program, pid: p.pid, uid: p.uid };
+    let s = Subject { program: p.program, pid: p.pid, uid: p.uid, tree: 0 };
     let r = (|| {
         let q = proc::find(p.pid).ok_or("the shell is not in the table")?;
         let (exe, comm) = (String::from(crate::program_name(&q.path, &q.name)), q.name.clone());
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn header_shows_a_differing_comm() {
-        let s = policy::Subject { program: policy::ProgramId(7), pid: 0x7e7f_0001, uid: 1000 };
+        let s = policy::Subject { program: policy::ProgramId(7), pid: 0x7e7f_0001, uid: 1000, tree: 0 };
         let h = policy::open_conn(s, policy::NetProto::Tcp, false, 40005, policy::IpAddr::V4([192, 0, 2, 13]), 443);
         let mut v = policy::connections(&policy::ConnFilter { pid: Some(s.pid), ..Default::default() }, usize::MAX);
         let clock = crate::Clock { mono_ns: 0, wall_ns: None, offset_min: 0 };

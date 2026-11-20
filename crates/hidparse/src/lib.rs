@@ -6,11 +6,12 @@
 //! - [`InputMap`] maps usages to Linux evdev codes like drivers/hid/hid-input.c with hid-generic
 //!   (one group = one input device per application collection), and [`InputState`] turns reports
 //!   into the events hid-input would send.
+//! - [`battery`] finds a device's battery values (GM-6p) as hid-input does.
 //! - [`boot`] has the boot-protocol fallback layouts; [`output`] builds LED output reports.
 //!
 //! Hostile descriptors and reports never panic; there is no cap on counts (R1), memory stays
 //! proportional to the descriptor. Where V2 deliberately differs from V1 and from Linux:
-//! `plan/notes/IN-1.md`.
+//! `plan/spec/usb.md` §4.3.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -18,6 +19,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod battery;
 pub mod boot;
 pub mod codes;
 mod covered;
@@ -32,6 +34,7 @@ pub mod parse;
 mod usage_map;
 pub mod usages;
 
+pub use battery::BatteryMap;
 pub use descriptor::{Collection, Field, Report, ReportDescriptor, ReportKind};
 pub use extract::ExtractError;
 pub use input::{Event, InputError, InputState};

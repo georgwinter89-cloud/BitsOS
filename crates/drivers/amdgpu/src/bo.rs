@@ -3,7 +3,7 @@
 //! Handles, size, placement, reference counts, mmap offsets; reserved ranges (the GOP framebuffer, the DMCUB's
 //! windows, the IP discovery blob) are never handed out. Scanout buffers are plain BOs: GX-3 adopts the GOP
 //! framebuffer as BO "gop" and creates its back buffer at the place the attach gates checked (`create_at`).
-//! GEM handles and dma-buf export map onto this 1:1 later (design: plan/notes/gx-GX-2.md §GX-D3).
+//! GEM handles and dma-buf export map onto this 1:1 later (design: V2-PLAN.md §8a.7 GX-D3).
 //!
 //! Pure bookkeeping (no hardware, no locks): the device object holds one manager under its own lock.
 //! No fixed counts (R1): BTreeMaps, u32 handles and u64 offsets that only grow.
@@ -14,7 +14,8 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 /// Linux reserves the top 64 KiB of VRAM for the IP discovery blob (`amdgpu_discovery.h:28`
-/// DISCOVERY_TMR_OFFSET, `amdgpu_ttm.c:1733`); the blob itself is the first 8 KiB of it.
+/// DISCOVERY_TMR_OFFSET, `amdgpu_ttm.c:1733`); the blob itself is the first 10 KiB of it (DISCOVERY_TMR_SIZE,
+/// linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.h:29).
 pub const DISCOVERY_RESERVE: u64 = 64 << 10;
 pub const PAGE: u64 = 4096;
 /// The first fake mmap offset (as DRM's `DRM_FILE_PAGE_OFFSET_START`: above anything a file offset means).

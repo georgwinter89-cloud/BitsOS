@@ -105,6 +105,8 @@ calls `workspace_add`; ctxd itself stays read-only on his files.
 
 Everything below `/data/appdata/ctxd/`, nothing elsewhere. The data volume is snapshotted (B1), so the whole
 folder can be taken back to yesterday 15:00; the layout is made so that any consistent snapshot is a valid state.
+It is a system service's folder, not a package's: removing a package never touches it (host/tests/pk/50's B2
+check allows it by name, SK 17.11.).
 
 ```
 /data/appdata/ctxd/
@@ -495,8 +497,8 @@ only tell where to look.
 
 ## 14. CX-1: the prototype and where it differs (15.10.)
 
-Code: `user/services/ctxd/` (own cargo workspace; `src/` modules match the sections above). Numbers, how to try
-it and open points: `plan/notes/CX-1.md`. Decisions taken in CX-1, each changeable later:
+Code: `user/services/ctxd/` (own cargo workspace; `src/` modules match the sections above). How to try it:
+`plan/guides/ctxd.md`. Pins and measured numbers: 14.1 and 14.2. Decisions taken in CX-1, each changeable later:
 
 - **llama.cpp as a child process** (question 3): upstream `llama-server --embeddings` (release b11303, CPU,
   x86-64-v3), started and supervised by ctxd, talking HTTP over a Unix socket in `<data>/tmp/` (no TCP port).
@@ -527,3 +529,97 @@ it and open points: `plan/notes/CX-1.md`. Decisions taken in CX-1, each changeab
   screen yet); `context_status` over MCP shows private roots only as `{"private": true}`. Default MCP deadline
   3 s (Claude is not a pointer), socket default 300 ms as designed.
 - **Not yet:** `ctxd inspect`/`export`, the UI (CX-4), Strata (CX-2), attachments, OCR (CX-7).
+
+### 14.1 Downloads and pins (all under `user/services/ctxd/third_party/`, gitignored)
+
+| What | URL | SHA256 |
+|---|---|---|
+| llama.cpp source, release b11303 | https://github.com/ggml-org/llama.cpp/archive/refs/tags/b11303.tar.gz | aff0ea04d2ba1bc7ef4c3ee44f020bd85973cbcfa0f585b5caef266de18b1b12 |
+| multilingual-e5-small q8_0 GGUF (TwinSunsLLC, base intfloat/multilingual-e5-small, 132 439 008 bytes) | https://huggingface.co/TwinSunsLLC/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small-q8_0.gguf | e011debc1208e31bf7b6aebee2d9fc8bd2ca11694a77ed66ac9d0c9d0a877c93 |
+
+The cstr/multilingual-e5-small-GGUF q8_0 file does not load in this llama.cpp ("bert model needs to define token
+type count"). Downloads of llama.cpp, the crates and the model are covered by Georg's OK.
+
+llama.cpp on the host: `cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_AVX=ON
+-DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
+-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_OPENSSL=OFF`, target `llama-server` (x86-64-v3, runs on both machines).
+
+Crates (crates.io, pinned with `=` in `Cargo.lock`): tantivy 0.26.2 (features mmap + lz4 only, no zstd C code),
+mail-parser 0.11.9, pdf-extract 0.12.1, zip 9.0.3 (deflate), quick-xml 0.42.0, instant-distance 0.6.1, blake3 1.8.7,
+encoding_rs 0.8.42, unicode-normalization 0.1.25, rlimit 0.11.0, serde 1.0.229, serde_json 1.0.154, toml 1.1.8,
+inotify 0.11.0 (default features off; inotify-sys 0.1.8).
+
+### 14.2 Measured numbers (Gaming-PC, `taskset -c 0-7` = the Mini-PC's 8 cores, no AVX-512)
+
+Quality, capped recall@10 on `host/cx-eval` (mean of `query` / `query_alt`); `tests/eval_set.rs` guards the hybrid row:
+
+| Ranking | query | query_alt |
+|---|---|---|
+| baseline.py BM25 4-grams (floor) | 0.42 | 0.34 |
+| ctxd keyword only (tantivy, title boost) | 0.54 | 0.38 |
+| **ctxd hybrid, e5-small, default weights** | **0.66** | **0.51** |
+| e5-small vector only (w_b = 0, no gate) | 0.67 | 0.63 |
+| hybrid with RRF fusion | 0.66 | 0.52 |
+
+MRR is 1.00 for every topic. The targets of 11.1 (0.75 / 0.60) are not reached with e5-small; the weak spots are
+documents that share no word with the query (topic pc). Sensitivity: v_min 0.2 gives 0.68/0.53, w_b 0.15 gives
+0.64/0.56.
+
+Speed (10 000 generated documents, one chunk each): first index 99 docs/s on 8 cores (embedding > 95 %); re-index of
+1 510 changed files 16-17 s; llama-server throughput the same with 2, 4 or 8 slots (compute-bound, 2 chosen);
+llama-server 307 MB RSS, ctxd 21-57 MB; search p50/p95 idle 6/9 ms (exact scan), 3/5 ms (HNSW), while indexing
+83/93 ms (with small requests of 8 chunks; 32-chunk requests gave 300+ ms).
+
+PDF text, the pure-Rust crate against pdftotext on 108 PDFs: word-set Jaccard median 1.000, min 0.935; 1.5 ms against
+5.8 ms per file. Hence the crate (V2 must not depend on pdftotext). Real-world PDFs (scans, odd fonts) are untested.
+
+## 15. CX-5 (ctxd on V2) and CX-3 (learning), 12.11.
+
+The Mini-PC check list: `plan/guides/ctxd.md`. Decisions, each changeable later:
+
+- **Build:** static musl like the other services, from its own workspace (`host/xtask/src/image.rs`
+  `build_ctxd`, stripped, 8.9 MB); llama-server as `/bin/ctxd-llama` from `user/ports/llama-cpp` (release
+  b11303, static-pie against the UL-1 musl sysroot with libc++, x86-64-v3, no curl/OpenSSL/OpenMP, 16.9 MB).
+  Both in the initramfs: they travel with every Reload; the glibc tree of the GPU desktop was not needed.
+  The model is **not** in the image.
+- **Start:** init starts `/bin/ctxd serve --system` as uid 1000 (gid 1000, no extra groups) once settingsd
+  was started, restarts it with its back-off, and hands its stderr to the kernel log (`user/init/src/ctxd.rs`).
+  Not the desktop: the desktop is another wave's tonight, and the service must run without a desktop too.
+- **Folder and socket:** `/data/appdata/ctxd` (0700; the kernel makes `/data/appdata` for uid 1000), the
+  socket `$XDG_RUNTIME_DIR/ctxd.sock` = `/run/user/1000/ctxd.sock` (0600; `/run/bitsos` is root's). ctxd waits
+  for `/data` instead of ending. No TCP door on V2 (`context.mcp` off).
+- **Settings:** ctxd registers `context.*` with settingsd as owner `ctxd` (`settings.rs`): `context.enabled`,
+  `context.roots`, `context.private_roots` (text, `;` between folders, settingsd has no list type; empty
+  by default), `context.excludes`, `context.claude.snippet_chars`, `context.claude.allow_forget`,
+  `context.index.workers`, `context.index.max_file_mb`, `context.index.rescan_minutes`,
+  `context.index.watch`, `context.embedder.kind` (local | keywords), `context.embedder.threads` (auto = half
+  the cores). Looked at every 5 s; a change (or the model file arriving) restarts the service by exec in the
+  same process, so every part sees one configuration and init sees no end.
+- **Refusals on V2:** the CX-1 rules stay; the system service adds `/boot` (the stick), `/apps`, `/proc`,
+  `/sys`, `/dev`, `/run`; the walk never enters ctxd's own folder or a forbidden place below a root (its text
+  cache holds private documents). The Windows partitions are refused by file system and partition type of
+  the mount that holds a root, not by the whole disk: on the Mini-PC `/data` shares the Lexar with Windows.
+- **B4/B5:** the indexer thread takes `SCHED_IDLE` (V2's Background class); its helper threads and the
+  extraction workers inherit it, llama-server is started from a thread that took it. The socket's threads
+  (searches) stay normal. On top, the embedding loop looks every 5 s (0.4 s, while ctxd does nothing) how idle
+  the machine is and waits while less than half is (`prio::Quiet`): V2 balances threads by count, so the
+  class alone left a busy machine about one CPU short (QEMU, 12.11.). Memory: workers keep their RLIMIT_AS; llama-server about 300 MB.
+- **Model:** `ctxd model-install FILE` checks size and BLAKE3 of the one file CX-1 measured and copies it to
+  `models/`; without it searches run on keywords and say so (`partial`, `embedder.error`, the event
+  `embedder.model_missing`). The LAN back end (`LocalHttp`) is not built: CX-1 has none; CX-2's.
+- **Tools for the assistant:** assist asks ctxd on its socket (op `mcp`: one JSON-RPC message of the MCP door,
+  `Caller::Mcp`, so the same privacy as over HTTP), checks the listener is its own uid on every connection,
+  and keeps its own class table: `context_search`, `context_status`, `context_explain`, `workspace_list`
+  read; `workspace_open/add/rename/pin`, `dismiss` ask; `context_forget` is not offered (Georg forgets
+  himself). While no folder is named ctxd lists no tools, so a chat carries none.
+- **C1:** the fake embedder and `CTXD_TEST_*` exist only with the feature `test-knobs`; the integration tests
+  turn it on through a dev-dependency on ctxd itself. The shipped binary has neither.
+- **Learning (CX-3, `learn.rs`, `replay.rs`):** events in `usage/events-NNNNNN.jsonl` (rotated at 8 MB, all
+  kept); queries as a salted BLAKE3 hash plus their vector (base64 f32), never their text. Opens come from the
+  desktop over the socket (op `open`, not an MCP tool). Edges, ties and dismissals decay with 90 days
+  half-life as a running sum of `w * 2^(t/H)` (no compaction needed); `C` uses the workspace's items as
+  anchors, else the documents opened after similar queries (and the document's own tie); `X` counts
+  dismissals of similar queries (scope `workspace`/`query` 0.5, `everywhere` 2). Recency uses the later of the
+  file's time and the last open. `ctxd replay FILE` runs recorded sessions (`host/tests/cx/sessions/`).
+  Not yet: `edges.snap`, the opener's program from FS-9 (`program` is taken when the desktop sends it), the
+  "accepted suggestion" add (needs CX-6), `context.log_queries`.

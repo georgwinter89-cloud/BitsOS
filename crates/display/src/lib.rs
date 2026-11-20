@@ -34,11 +34,13 @@ use ksync::{Mutex, OnceRef, SpinLock};
 
 pub mod font;
 mod frame;
+mod picture;
 mod rect;
 pub mod edid;
 pub mod vblank;
 
 pub use frame::{PresentStats, RamFrame};
+pub use picture::{copy_rect, rect_fits, PictureError};
 pub use rect::Rect;
 pub use vblank::{RefreshSource, VblankClock};
 
@@ -62,6 +64,14 @@ pub trait ScanoutSource: Send + Sync {
     /// Runs `f` on the picture (pixels 0x00RRGGBB, width, height) under the owner's own lock; false = no picture
     /// now (`f` not called). `f` must be short: it only copies.
     fn with_picture(&self, f: &mut dyn FnMut(&[u32], u32, u32)) -> bool;
+    /// SHOT: rectangle `r` of the picture into `dst` (cleared first, `r.w * r.h` pixels row by row, room reserved by
+    /// the caller) and the picture's size. One whole picture, never rows of two. The default copies out of
+    /// `with_picture`; an owner whose picture is slow to read reads only `r`.
+    fn copy_rect(&self, r: Rect, dst: &mut Vec<u32>) -> Result<(u32, u32), PictureError> {
+        let mut out = Err(PictureError::NoPicture);
+        self.with_picture(&mut |px, w, h| out = copy_rect(px, w, h, r, dst));
+        out
+    }
 }
 
 /// The VT's side of a program taking the screen (IN registers `console::vt::hand_over`/`take_back`): called
@@ -361,6 +371,22 @@ pub fn with_screen<R>(f: impl FnOnce(&[u32], u32, u32) -> R) -> Option<R> {
     }
 }
 
+/// SHOT: rectangle `r` of the picture the screen shows (`with_screen`'s picture) into `dst` (`r.w * r.h` pixels row
+/// by row) and the picture's size, for MCP `screen`: only `r` is read, which matters for an owner whose picture lies
+/// in slow device memory. The room is reserved here, before any lock; under the console frame's lock only the rows
+/// are copied.
+pub fn copy_screen(r: Rect, dst: &mut Vec<u32>) -> Result<(u32, u32), PictureError> {
+    dst.clear();
+    if dst.try_reserve_exact(r.w as usize * r.h as usize).is_err() {
+        return Err(PictureError::NoMemory);
+    }
+    let src = FRAME.lock().as_ref().ok_or(PictureError::NoPicture)?.source.clone();
+    match src {
+        Some(src) => src.copy_rect(r, dst),
+        None => FRAME.lock().as_ref().ok_or(PictureError::NoPicture).and_then(|s| copy_rect(s.frame.pixels(), s.frame.width, s.frame.height, r, dst)),
+    }
+}
+
 /// A copy of the picture the screen shows (`with_screen`) for MCP `screen` and tests (width, height, pixels);
 /// None without a display, when the owner has no picture, or when the copy cannot be allocated. The buffer is
 /// allocated before any lock is taken (14.7 MB at 1440p: never under the lock); the lock then covers one memcpy,
@@ -602,6 +628,10 @@ pub(crate) mod tests {
         assert_eq!(BACK.load(Ordering::SeqCst), 0, "a second sync changes nothing");
         assert_eq!(snapshot(), Some((50, 40, alloc::vec![7; 2000])), "MCP screen shows the owner's picture");
         assert_eq!(with_screen(|p, w, h| (p[0], w, h)), Some((7, 50, 40)));
+        let mut cut = Vec::new();
+        assert_eq!(copy_screen(Rect::new(48, 39, 2, 1), &mut cut), Ok((50, 40)));
+        assert_eq!(cut, alloc::vec![7, 7], "SHOT: the owner's picture, only the region");
+        assert_eq!(copy_screen(Rect::new(49, 0, 2, 1), &mut cut), Err(PictureError::Size(50, 40)));
         let g0 = release_generation();
         request_scanout_back();
         assert_eq!(release_generation(), g0 + 1);
@@ -612,7 +642,11 @@ pub(crate) mod tests {
         assert_eq!(&REC.rects.lock()[n..], &[(0, 0, 50, 40)], "the console frame copied once");
         assert_eq!(returned_pixels(), 2000, "the return's own copy");
         assert_eq!(scanout_holder(), None);
-        assert_eq!(snapshot().map(|s| s.2), Some(console.2), "the console frame again");
+        assert_eq!(snapshot().map(|s| s.2).as_ref(), Some(&console.2), "the console frame again");
+        assert_eq!(copy_screen(Rect::new(1, 2, 3, 4), &mut cut), Ok((50, 40)));
+        let mut want = Vec::new();
+        copy_rect(&console.2, 50, 40, Rect::new(1, 2, 3, 4), &mut want).unwrap();
+        assert_eq!(cut, want, "SHOT: the console frame's region");
         let k = take_scanout("kernel").unwrap();
         assert_eq!(scanout_holder(), Some(("kernel", 0)));
         sync_vt();

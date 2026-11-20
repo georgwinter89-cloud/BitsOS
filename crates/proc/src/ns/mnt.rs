@@ -1,5 +1,7 @@
-//! SX-3a: mount namespaces (linux-6.6/fs/namespace.c `alloc_mnt_ns`, `copy_mnt_ns`, `mntns_install`,
-//! `chroot_fs_refs`): a `MntNs` is FS's view (`vfs::MountNs`) with what the process layer knows about it, its
+//! SX-3a: mount namespaces (linux-7.3.1/fs/namespace.c `alloc_mnt_ns` :4361, `copy_mnt_ns` :4398, `mntns_install`
+//! :6703, fs/fs_struct.c `chroot_fs_refs`; the initial one has the fixed inode MNT_NS_INIT_INO, :6355; an empty mount
+//! namespace, CLONE_EMPTY_MNTNS / UNSHARE_EMPTY_MNTNS, holds a copy of the root mount alone, :4420): a
+//! `MntNs` is FS's view (`vfs::MountNs`) with what the process layer knows about it, its
 //! nsfs inode number and its owning user namespace. The view itself (mounts, propagation, locks) is vfs's.
 //!
 //! The view's owner key for vfs is the owning user namespace's inode number (0 for the initial one): vfs
@@ -18,6 +20,8 @@ pub struct MntNs {
     pub inum: u32,
     pub user_ns: Arc<UserNs>,
     pub view: Arc<MountNs>,
+    /// Made empty (CLONE_EMPTY_MNTNS): its maker's root and cwd move onto its root, not onto their copies.
+    empty: bool,
     _charge: Option<Charge>,
 }
 
@@ -39,7 +43,7 @@ pub fn owner_key(ns: &UserNs) -> u32 {
 
 /// The initial mount namespace: the boot view.
 pub fn init_mnt() -> &'static Arc<MntNs> {
-    INIT.get_or_init(|| Arc::new(MntNs { inum: super::alloc_inum(), user_ns: user::init_user_ns().clone(), view: vfs::root_ns(), _charge: None }))
+    INIT.get_or_init(|| Arc::new(MntNs { inum: super::INIT_MNT_INUM, user_ns: user::init_user_ns().clone(), view: vfs::root_ns(), empty: false, _charge: None }))
 }
 
 /// Mount namespaces made after boot that still live (ktests).
@@ -49,12 +53,14 @@ pub fn live() -> usize {
 
 /// `copy_mnt_ns` for CLONE_NEWNS: a copy of `old`'s view owned by `user_ns`, charged to `euid` (ENOSPC past
 /// `max_mnt_namespaces`). Another owner gets slaves of shared mounts and a locked copy (vfs `copy_for`).
-pub(crate) fn copy(old: &MntNs, user_ns: &Arc<UserNs>, euid: u32) -> Result<Arc<MntNs>, Errno> {
+/// `empty` (CLONE_EMPTY_MNTNS): a copy of the root mount alone (vfs `copy_root_only`).
+pub(crate) fn copy(old: &MntNs, user_ns: &Arc<UserNs>, euid: u32, empty: bool) -> Result<Arc<MntNs>, Errno> {
     let c = count::charge(Counted::Mnt, user_ns, euid)?;
-    let view = Arc::new(old.view.copy_for(owner_key(user_ns)));
+    let owner = owner_key(user_ns);
+    let view = Arc::new(if empty { old.view.copy_root_only(owner) } else { old.view.copy_for(owner) });
     LIVE.fetch_add(1, Ordering::Relaxed);
-    let n = Arc::new(MntNs { inum: super::alloc_inum(), user_ns: user_ns.clone(), view, _charge: Some(c) });
-    klog::event!(Info, "ns", "mnt.new", inum = n.inum, view = n.view.id, owner = owner_key(user_ns));
+    let n = Arc::new(MntNs { inum: super::alloc_inum(), user_ns: user_ns.clone(), view, empty, _charge: Some(c) });
+    klog::event!(Info, "ns", "mnt.new", inum = n.inum, view = n.view.id, owner = owner, empty = empty);
     Ok(n)
 }
 
@@ -62,6 +68,12 @@ pub(crate) fn copy(old: &MntNs, user_ns: &Arc<UserNs>, euid: u32) -> Result<Arc<
 /// was the old view's root is set explicitly, so callers that still fall back to `Process::ns` (the boot
 /// view) find the new view's places.
 pub(crate) fn enter(fs: &vfs::FsState, ns: &MntNs) {
+    if ns.empty {
+        // `copy_mnt_ns` with CLONE_EMPTY_MNTNS: root and pwd are the cloned mount's root.
+        let r = ns.view.root_path();
+        fs.place(&ns.view, r.clone(), r);
+        return;
+    }
     fs.move_into(&ns.view);
     if fs.root().is_none() {
         fs.set_root(ns.view.root_path());

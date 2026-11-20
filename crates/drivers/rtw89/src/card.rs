@@ -312,7 +312,7 @@ pub fn log(ifname: &str, evs: impl Iterator<Item = DevEvent>) {
 }
 
 /// The firmware file: the first path that reads and parses
-fn load_firmware(paths: &[String]) -> Result<(String, Firmware), String> {
+fn load_firmware(paths: &[&str]) -> Result<(String, Firmware), String> {
     let ns = vfs::root_ns();
     let mut why = Vec::new();
     for p in paths {
@@ -379,9 +379,7 @@ fn start(card: &Arc<Card>) -> bool {
         if card.quiesced.load(Ordering::Acquire) {
             return false;
         }
-        // read again on every try: CONFIG.TXT's wlan_fw= comes from the stick as well
-        let paths = config::fw_paths(&|k| net::config(k));
-        match load_firmware(&paths) {
+        match load_firmware(&config::FW_PATHS) {
             Ok((from, fw)) => {
                 klog::event!(Info, "wlan", "fw.file", ifname = card.name.as_str(), path = from.as_str());
                 break fw;
@@ -461,13 +459,8 @@ fn mac_off_first(card: &Card) {
     }
 }
 
-/// One MSI vector (the chip has no MSI-X; capability 0x50) whose hook wakes the thread; polled
-/// without one, or with CONFIG `net_irq=off` (NW's existing way back for every card)
+/// One MSI vector (the chip has no MSI-X; capability 0x50) whose hook wakes the thread; polled without one
 fn setup_msi(card: &Arc<Card>, pci: &pci::PciFunction) -> bool {
-    if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-        klog::event!(Info, "wlan", "irq.polled", ifname = card.name.as_str(), reason = "net_irq=off");
-        return false;
-    }
     let c = card.clone();
     let hook: pci::IrqHook = Arc::new(move |_| {
         c.irq_count.fetch_add(1, Ordering::Relaxed);
@@ -639,7 +632,7 @@ impl Quiesce for Card {
 // turn may sleep (a delay of SPIN_US or more, an H2C wait), so a CPU parked inside it left the Quiesce with
 // the chip held: bus master off beside a running chip and its firmware's DMA (the 4 floods in 20 reboots came
 // with wlan0 up). Linux stops the chip before a reboot through the interface going down (`rtw89_ops_stop` ->
-// `rtw89_core_stop`, linux-6.6/drivers/net/wireless/realtek/rtw89/mac80211.c:69, core.c:3571: HCI deinit, MAC off
+// `rtw89_core_stop`, linux-7.3.1/drivers/net/wireless/realtek/rtw89/mac80211.c:66, core.c:6727: HCI deinit, MAC off
 // and the HCI reset), while every thread runs; here the same chip stop as the Quiesce's, under the lock the
 // thread lets go of within its turn. `quiesced` first: the thread's next bus access ends its turn at once,
 // and it never starts another. The Quiesce later finds the chip off and only switches bus master off and

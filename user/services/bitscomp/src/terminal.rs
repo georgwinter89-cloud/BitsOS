@@ -13,6 +13,28 @@ pub const TERMINAL: &[&str] = &[
     "--override=main.utmp-helper=none",
 ];
 
+/// GPY: the exec-time form of a `--font=` naming V2's shipped family: the symbol fonts appended as foot's fallbacks
+/// (foot.ini(5): the fonts after the first are used for glyphs the first lacks) at its size, so Claude Code's ✳ ❯ ✻ ⏵
+/// ⚠ ⎿ are drawn. Only the exec sees it, as with `--config=`: a saved session keeps the plain argument and gets the
+/// fallbacks of the day it is restored. Another family or a list of the user's own stays as it is.
+pub fn with_symbols(arg: &str) -> Option<String> {
+    let spec = arg.strip_prefix("--font=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (family, opts) = spec.split_once(':').unwrap_or((spec, ""));
+    if family.trim() != "Noto Sans Mono" {
+        return None;
+    }
+    let size: String =
+        opts.split(':').filter(|o| o.starts_with("size=") || o.starts_with("pixelsize=")).map(|o| format!(":{o}")).collect();
+    let mut s = arg.to_string();
+    for (name, _) in crate::symbols::FONTS {
+        s.push_str(&format!(",{name}{size}"));
+    }
+    Some(s)
+}
+
 /// Variables set for started programs where bitscomp's own environment lacks them (`get` reads it, `writable`
 /// says whether a directory can take files). A variable that is set is never changed.
 ///
@@ -127,6 +149,27 @@ mod tests {
         let mut w = Vec::new();
         cursor_env(|k| (k == "XCURSOR_THEME").then(|| "breeze".to_string()), &mut w, 24);
         assert_eq!(w, vec![("XCURSOR_SIZE".into(), "24".into())]);
+    }
+
+    #[test]
+    fn the_shipped_font_gets_the_symbol_fonts_at_its_size() {
+        assert_eq!(
+            with_symbols("--font=Noto Sans Mono:size=11").as_deref(),
+            Some("--font=Noto Sans Mono:size=11,Noto Sans Symbols 2:size=11,Noto Sans Symbols:size=11,DejaVu Sans Mono:size=11")
+        );
+        assert_eq!(
+            with_symbols("--font=Noto Sans Mono:weight=bold:pixelsize=20").as_deref(),
+            Some("--font=Noto Sans Mono:weight=bold:pixelsize=20,Noto Sans Symbols 2:pixelsize=20,Noto Sans Symbols:pixelsize=20,DejaVu Sans Mono:pixelsize=20")
+        );
+        assert_eq!(
+            with_symbols("--font=Noto Sans Mono").as_deref(),
+            Some("--font=Noto Sans Mono,Noto Sans Symbols 2,Noto Sans Symbols,DejaVu Sans Mono")
+        );
+        // The user's own choice: another family, an own list, not a font argument.
+        for a in ["--font=Hack:size=12", "--font=Noto Sans Mono:size=11,Twemoji", "--font", "-fNoto Sans Mono", "--override=x"] {
+            assert_eq!(with_symbols(a), None, "{a}");
+        }
+        assert!(TERMINAL.iter().any(|a| with_symbols(a).is_some()), "bitscomp's own terminal gets them");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! GX-4b: the monitor's modes beyond its detailed timings, from the EDID base block, as Linux adds them after the
-//! detailed ones: standard, then established timings (linux-6.6/drivers/gpu/drm/drm_edid.c:6730-6733;
-//! :3296 `drm_mode_std`, :3859 `add_established_modes`, :608 `edid_est_modes`). Not read (open point): CVT 3-byte
+//! detailed ones: standard, then established timings (linux-7.3.1/drivers/gpu/drm/drm_edid.c:7087-7090;
+//! :3380 `drm_mode_std`, :3951 `add_established_modes`, :657 `edid_est_modes`). Not read (open point): CVT 3-byte
 //! and 0xFA standard-timing descriptors, CTA-861 VICs.
 //! Sizes and nominal rates only: the scaled switch keeps the link's timing. The caller validated the block
 //! (`display::edid::timings` is Ok); a short buffer yields nothing.

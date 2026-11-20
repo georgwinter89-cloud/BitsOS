@@ -1,10 +1,10 @@
 //! Nodes mknod makes that are neither files nor FIFOs (FS-3): socket names and device numbers.
 //!
-//! A socket name (S_IFSOCK) is only a name until NW-5's AF_UNIX bind gives it a listener; opening it answers
-//! ENXIO (linux-6.6/net/socket.c `bad_sock_fops`, `sock_no_open`). A character or block device node made by
-//! number (root only: CAP_MKNOD) opens the device the kernel registered under that number, as Linux's
-//! `chrdev_open`/`blkdev_open` find the driver by number; without one the open answers ENXIO. Every device
-//! node the kernel makes (`MountNs::create_device`: devfs at boot, `devnode!`) is registered here by number.
+//! A socket name (S_IFSOCK) is only a name until NW-5's AF_UNIX bind gives it a listener; opening it answers ENXIO
+//! (linux-7.3.1/fs/inode.c:208 `no_open`, left by `init_special_inode` :2694). A character or block device node
+//! made by number (root only: CAP_MKNOD) opens the device the kernel registered under that number, as Linux's
+//! `chrdev_open`/`blkdev_open` find the driver by number; without one the open answers ENXIO. Every device node the
+//! kernel makes (`MountNs::create_device`: devfs at boot, `devnode!`) is registered here by number.
 
 use crate::node::File;
 use crate::{abi, Errno};
@@ -68,11 +68,25 @@ impl File for Special {
         self.rdev
     }
     fn open_node(&self, flags: u64, who: crate::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
+        self.open_dev(None, flags, who)
+    }
+    /// IN-PTY: a mknod'd ptmx (5:2) finds its devpts instance from where it is opened, as Linux's does.
+    fn open_node_at(&self, at: &crate::Path, flags: u64, who: crate::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
+        self.open_dev(Some(at), flags, who)
+    }
+}
+
+impl Special {
+    fn open_dev(&self, at: Option<&crate::Path>, flags: u64, who: crate::inode::Cred) -> Option<Result<Arc<dyn File>, Errno>> {
         if self.ftype == abi::S_IFSOCK {
             return Some(Err(ENXIO));
         }
+        let open = |dev: &Arc<dyn File>| match at {
+            Some(at) => dev.open_node_at(at, flags, who),
+            None => dev.open_node(flags, who),
+        };
         Some(match lookup(self.ftype, self.rdev) {
-            Some(dev) => dev.open_node(flags, who).unwrap_or(Ok(dev)),
+            Some(dev) => open(&dev).unwrap_or(Ok(dev)),
             None => {
                 klog::event!(Debug, "vfs", "devnum.none", major = abi::dev_major(self.rdev), minor = abi::dev_minor(self.rdev), block = self.ftype == abi::S_IFBLK; "no device under this number: ENXIO");
                 Err(ENXIO)

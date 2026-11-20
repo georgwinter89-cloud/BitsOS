@@ -367,7 +367,7 @@ fn exit_boot_services(mut buf: u64, mut buf_len: usize, room: usize, hook: TestH
         let stale = match hook {
             TestHook::EbsRetry => attempt == 1,
             TestHook::EbsFail => true,
-            TestHook::None | TestHook::EdidActive | TestHook::EdidFallback => false,
+            TestHook::None | TestHook::EdidActive | TestHook::EdidFallback | TestHook::OldLoader => false,
         };
         if stale {
             // Changes the memory map, so the key just read is stale.

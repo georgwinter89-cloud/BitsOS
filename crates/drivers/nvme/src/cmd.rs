@@ -6,7 +6,7 @@
 //! no bug above can write outside it.
 //! Admin and I/O commands are different types, so an admin opcode (01h = Create I/O SQ) can never be placed
 //! in an I/O queue, where the same byte means Write.
-//! Opcodes: linux-6.6/include/linux/nvme.h:821-840 (I/O), :1136-1165 (admin).
+//! Opcodes: linux-7.3.1/include/linux/nvme.h:956-974 (I/O), :1306-1335 (admin).
 
 /// Admin opcodes this driver can build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub const IO_OPS: [IoOp; 4] = [IoOp::Flush, IoOp::Write, IoOp::Read, IoOp::Dsm];
 pub const MEDIA_WRITE_IO_OPS: [u8; 7] = [0x01, 0x04, 0x08, 0x09, 0x19, 0x79, 0x7D];
 /// Of those, the ones the builder has no constructor for at all.
 pub const NEVER_BUILT_IO_OPS: [u8; 5] = [0x04, 0x08, 0x19, 0x79, 0x7D];
-/// CDW12 bit 30, Force Unit Access (linux-6.6/include/linux/nvme.h `NVME_RW_FUA` = 1 << 14 in the upper half).
+/// CDW12 bit 30, Force Unit Access (linux-7.3.1/include/linux/nvme.h:1120 `NVME_RW_FUA` = 1 << 14 in the upper half).
 pub const CDW12_FUA: u32 = 1 << 30;
 /// CDW11 bit 2 of Dataset Management: deallocate (nvme.h `NVME_DSMGMT_AD`).
 pub const DSM_DEALLOCATE: u32 = 1 << 2;
@@ -135,7 +135,8 @@ impl AdminCmd {
     pub fn get_features(fid: u8) -> AdminCmd {
         admin(AdminOp::GetFeatures, 0, 0, [fid as u32, 0, 0, 0, 0, 0])
     }
-    /// Set Features, Number of Queues (0-based counts in CDW11; linux-6.6 core.c `nvme_set_queue_count`).
+    /// Set Features, Number of Queues (0-based counts in CDW11; linux-7.3.1/drivers/nvme/host/core.c:1752
+    /// `nvme_set_queue_count`).
     pub fn set_num_queues(sq: u16, cq: u16) -> AdminCmd {
         let v = (sq.max(1) - 1) as u32 | ((cq.max(1) - 1) as u32) << 16;
         admin(AdminOp::SetFeatures, 0, 0, [FEAT_NUM_QUEUES as u32, v, 0, 0, 0, 0])

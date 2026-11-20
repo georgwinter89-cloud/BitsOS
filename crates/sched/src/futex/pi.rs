@@ -1,6 +1,8 @@
-//! PI futexes (SC-7b; linux-6.6/kernel/futex/pi.c: `futex_lock_pi` :930, `futex_lock_pi_atomic` :514,
-//! `attach_to_pi_state` :202, `attach_to_pi_owner` :410, `handle_exit_race` :320, `futex_unlock_pi` :1100,
-//! `wake_futex_pi` :613, `fixup_pi_state_owner` :683; core.c `exit_pi_state_list`).
+//! PI futexes (SC-7b; linux-7.3.1/kernel/futex/pi.c: `futex_lock_pi` :988, `futex_lock_pi_atomic` :581,
+//! `attach_to_pi_state` :255, `attach_to_pi_owner` :456, `handle_exit_race` :373, `__futex_unlock_pi` :1196,
+//! `wake_futex_pi` :680, `__fixup_pi_state_owner` :739; core.c:1353 `exit_pi_state_list`). `futex_unlock_pi`
+//! (:1360) with FUTEX_ROBUST_UNLOCK clears the robust list's pending pointer after the unlock: the syscall layer
+//! does that around `unlock_pi`.
 //!
 //! The word holds the owner's TID (`FUTEX_TID_MASK`), `FUTEX_WAITERS` while the kernel knows of waiters and
 //! `FUTEX_OWNER_DIED` after a robust owner died. Programs take and release an uncontended lock in user space;
@@ -158,14 +160,18 @@ pub fn lock_pi(sp: &dyn Space, addr: u64, shared: bool, deadline: Option<Deadlin
     me.futex.reserve(1)?;
     LOCKS.inc();
     let (mut faults, mut races) = (0u32, 0u32);
+    let mut room = super::Room::new();
     loop {
         let kr = sp.key(addr, shared, true)?;
         let key = kr.key;
         let lock = LockId::Futex(key);
         let bi = t.index(&key);
         let mut q = t.lock(bi);
-        if q.try_reserve(1).is_err() {
-            return Err(ENOMEM);
+        if !room.fits(&mut q, 1) {
+            // Before the word is looked at: nothing to undo.
+            drop(q);
+            room.grow()?;
+            continue;
         }
         let (owner, fresh, word) = match atomic(sp, &q[..], addr, &key, tid) {
             Step::Taken => return Ok(()),
@@ -236,6 +242,7 @@ pub fn lock_pi(sp: &dyn Space, addr: u64, shared: bool, deadline: Option<Deadlin
             },
         }
         drop(q);
+        room.release();
         live.apply();
         WAITS.inc();
         let r = wait_granted(t, &me, sp, deadline);

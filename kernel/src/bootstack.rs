@@ -37,6 +37,11 @@ fn bottom() -> usize {
     core::ptr::addr_of!(boot_stack_bottom) as usize
 }
 
+/// The boot stack as [bottom, top).
+pub fn bounds() -> (u64, u64) {
+    (bottom() as u64, (bottom() + SIZE) as u64)
+}
+
 fn here() -> usize {
     let probe = 0u8;
     core::ptr::addr_of!(probe) as usize

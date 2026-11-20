@@ -1,0 +1,22 @@
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"Ich sehe nach "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"und stelle es um."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_rec_get","type":"function","function":{"name":"settings_get","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"key\": \"theme.scale\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_rec_set","type":"function","function":{"name":"settings_set","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"key\": \"theme.sc"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"ale\", \"va"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"lue\": 150}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

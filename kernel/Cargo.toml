@@ -21,6 +21,8 @@ acpi = { path = "../crates/acpi" }
 bitsvol = { path = "../crates/bitsvol" }
 block = { path = "../crates/block" }
 bootinfo = { path = "../crates/bootinfo" }
+# UPDATE: the build's version number and its mark in the image (crates/bitsver).
+bitsver = { path = "../crates/bitsver" }
 console = { path = "../crates/console" }
 console-cmds = { path = "../crates/console-cmds" }
 crypt = { path = "../crates/crypt" }
@@ -34,6 +36,7 @@ gopfb = { path = "../crates/drivers/gopfb" }
 hda = { path = "../crates/drivers/hda" }
 igc = { path = "../crates/drivers/igc" }
 nvme = { path = "../crates/drivers/nvme" }
+rtl8126 = { path = "../crates/drivers/rtl8126" }
 rtw89 = { path = "../crates/drivers/rtw89" }
 usb-core = { path = "../crates/drivers/usb-core" }
 usb-hid = { path = "../crates/drivers/usb-hid" }
@@ -42,6 +45,12 @@ virtio-net = { path = "../crates/drivers/virtio-net" }
 xhci = { path = "../crates/drivers/xhci" }
 fs-ext4 = { path = "../crates/fs-ext4" }
 fs-fat = { path = "../crates/fs-fat" }
+# GP-GUARD: the Gaming-PC profile's never-relaxed CONFIG lines (config.rs).
+gp-platform = { path = "../crates/gp-platform" }
+# GP-ROUND: the Gaming-PC report page (rows, pages, file names).
+gp-report = { path = "../crates/gp-report" }
+# GP-ROUND: the report page's sound row (which USB outputs play).
+usb-audio = { path = "../crates/drivers/usb-audio" }
 hal = { path = "../crates/hal" }
 kexec = { path = "../crates/kexec" }
 klog = { path = "../crates/klog" }

@@ -114,7 +114,7 @@ pub fn quiesce_matching(name: &str) -> usize {
 }
 
 /// RB-16: the thread-context half of a device's stop, before the reboot, power-off or Reload parks the other
-/// CPUs. Linux runs `device_shutdown` with every CPU and thread alive (linux-6.6/kernel/reboot.c:76
+/// CPUs. Linux runs `device_shutdown` with every CPU and thread alive (linux-7.3.1/kernel/reboot.c:110
 /// `kernel_restart_prepare`, before `machine_restart` stops the CPUs); here the park comes first (RB-quiesce),
 /// so a driver whose own thread holds the device's lock across a sleep would find it held in its Quiesce and
 /// could only switch bus master off beside a running engine. `stop` may sleep, at most `budget_ns`; it
@@ -264,7 +264,7 @@ pub enum DevError {
     Gone,
     Timeout,
     Io,
-    /// Refused by a safety rule (R8: write gate, opt-in key).
+    /// Refused by a safety rule (R8: write gate, a function kept untouched).
     Refused,
     NoMemory,
     Unsupported,

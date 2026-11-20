@@ -1,4 +1,4 @@
-//! rtnetlink, the kernel side of NETLINK_ROUTE (linux-6.6/net/core/rtnetlink.c `rtnetlink_rcv_msg`,
+//! rtnetlink, the kernel side of NETLINK_ROUTE (linux-7.3.1/net/core/rtnetlink.c `rtnetlink_rcv_msg`,
 //! `rtnl_getlink`, `rtnl_dump_ifinfo`, `rtnl_fill_ifinfo`, `rtnl_dump_all`; net/ipv4/devinet.c `inet_dump_ifaddr`,
 //! `inet_fill_ifaddr`): what `getifaddrs`, `if_nameindex`, `ip link`/`ip addr` and Chromium's address tracker ask.
 //!
@@ -188,7 +188,7 @@ pub fn rcv_msg(msg: &[u8], ctx: &ReqCtx) -> Result<Action, NlErr> {
         if let Some(v) = &ctx.net {
             match h.ty {
                 RTM_NEWLINK | RTM_SETLINK => return setlink_ns(v, &h, body).map(|()| Action::Nothing),
-                RTM_NEWADDR | RTM_DELADDR if family == AF_INET => return addr_ns(v, &h, body).map(|()| Action::Nothing),
+                RTM_NEWADDR | RTM_DELADDR if family == AF_INET => return addr_ns(v, &h, body, ctx.portid).map(|()| Action::Nothing),
                 _ => {}
             }
         }
@@ -245,24 +245,33 @@ fn name_attr(d: &[u8]) -> Result<&[u8], NlErr> {
     Ok(&d[..d.iter().position(|b| *b == 0).unwrap_or(d.len())])
 }
 
-/// `rtnl_newlink` / `rtnl_setlink` on an existing device of a namespace below the initial one
-/// (linux-6.6/net/core/rtnetlink.c:3140, :3638-3645): the device by index, else by name (ENODEV; RTM_SETLINK
-/// without either is EINVAL); RTM_NEWLINK with NLM_F_EXCL is EEXIST, with NLM_F_REPLACE EOPNOTSUPP; then the
-/// flags as `rtnl_dev_combine_flags` combines them (ifi_change 0 is all bits). Attributes that would change
-/// more than the flags are EOPNOTSUPP (V2 changes nothing else).
+/// `__rtnl_newlink` / `rtnl_setlink` on an existing device of a namespace below the initial one
+/// (linux-7.3.1/net/core/rtnetlink.c:4045, :3561, `rtnl_changelink` :3848): the device by index, else by name
+/// (RTM_SETLINK without either is EINVAL); RTM_NEWLINK with a negative index is EINVAL, and for a device that is
+/// not there ENODEV, or with NLM_F_CREATE EOPNOTSUPP (V2 makes no devices: no link kind is known); with
+/// NLM_F_EXCL it is EEXIST, with NLM_F_REPLACE EOPNOTSUPP, and IFLA_LINKINFO with kind data is EOPNOTSUPP (lo has no
+/// `rtnl_link_ops`, nor a master); then the flags as `rtnl_dev_combine_flags` combines them (ifi_change 0 is all
+/// bits). IFLA_LINKINFO is parsed by RTM_NEWLINK only (`rtnl_setlink` ignores it). Attributes that would change
+/// more than the flags are EOPNOTSUPP where `do_setlink` would apply them, after every check above (V2 changes
+/// nothing else).
 fn setlink_ns(v: &alloc::sync::Arc<crate::netns::NetView>, h: &Hdr, body: &[u8]) -> Result<(), NlErr> {
     const NLM_F_REPLACE: u16 = 0x100;
     const NLM_F_EXCL: u16 = 0x200;
+    const NLM_F_CREATE: u16 = 0x400;
     if body.len() < IFINFOMSG {
         return Err(NlErr::new(EINVAL));
     }
     let (_, _, index, flags, change) = ifinfo(body);
     let mut name = None;
     let (mut mtu, mut txqlen) = (None, None);
+    // IFLA_INFO_DATA or IFLA_INFO_SLAVE_DATA in IFLA_LINKINFO; IFLA_GROUP; an attribute V2 cannot apply.
+    let (mut kind_data, mut group, mut refused) = (false, None, None);
     for (t, d) in attrs(&body[IFINFOMSG..]) {
         match t {
             // NLA_U32 (`ifla_policy`): a shorter attribute fails the policy.
-            IFLA_MTU | IFLA_TXQLEN if d.len() < 4 => return Err(NlErr::msg(ERANGE, "Attribute failed policy validation")),
+            IFLA_MTU | IFLA_TXQLEN | IFLA_GROUP if d.len() < 4 => {
+                return Err(NlErr::msg(ERANGE, "Attribute failed policy validation"));
+            }
             IFLA_MTU => mtu = Some(u32_at(d, 0)),
             IFLA_TXQLEN => txqlen = Some(u32_at(d, 0)),
             // `set_operstate` moves only between UP/UNKNOWN and DORMANT/TESTING; lo's UNKNOWN takes DORMANT and
@@ -277,28 +286,49 @@ fn setlink_ns(v: &alloc::sync::Arc<crate::netns::NetView>, h: &Hdr, body: &[u8])
             }
             IFLA_EXT_MASK => {}
             IFLA_TARGET_NETNSID => return Err(NlErr::msg(EINVAL, "Invalid target network namespace id")),
-            _ => {
-                unsupported(h.ty, "changing a link attribute");
-                return Err(NlErr::new(EOPNOTSUPP));
-            }
+            // `ifla_info_policy`: IFLA_INFO_DATA (2) and IFLA_INFO_SLAVE_DATA (5) are what `rtnl_changelink` hands
+            // to a kind; IFLA_INFO_KIND alone changes nothing on an existing device.
+            IFLA_LINKINFO => kind_data |= h.ty == RTM_NEWLINK && attrs(d).iter().any(|(k, _)| matches!(k, 2 | 5)),
+            IFLA_GROUP => group = Some(u32_at(d, 0)),
+            _ => refused = refused.or(Some(t)),
         }
     }
+    let refuse = |what: &'static str| {
+        unsupported(h.ty, what);
+        Err(NlErr::new(EOPNOTSUPP))
+    };
     let net = Some(v.clone());
     let link = if index > 0 {
         ifview::by_index_in(&net, index as u32)
+    } else if index < 0 && h.ty == RTM_NEWLINK {
+        return Err(NlErr::msg(EINVAL, "ifindex can't be negative"));
     } else if let Some(n) = name {
         ifview::by_name_in(&net, n)
     } else if h.ty == RTM_SETLINK {
         return Err(NlErr::new(EINVAL));
+    } else if h.flags & NLM_F_CREATE == 0 && group.is_some() {
+        // `rtnl_group_changelink`: every device of the group; V2 does not change groups.
+        return refuse("changing a link group");
     } else {
         None
     };
-    let link = link.ok_or(NlErr::new(ENODEV))?;
+    let link = match link {
+        Some(l) => l,
+        None if h.ty == RTM_NEWLINK && h.flags & NLM_F_CREATE != 0 => return Err(NlErr::msg(EOPNOTSUPP, "Unknown device type")),
+        None => return Err(NlErr::new(ENODEV)),
+    };
     if h.ty == RTM_NEWLINK && h.flags & NLM_F_EXCL != 0 {
         return Err(NlErr::new(EEXIST));
     }
     if h.ty == RTM_NEWLINK && h.flags & NLM_F_REPLACE != 0 {
         return Err(NlErr::new(EOPNOTSUPP));
+    }
+    if kind_data {
+        return Err(NlErr::new(EOPNOTSUPP));
+    }
+    // lo stays in the default group 0 (`netif_set_group` to the same group changes nothing).
+    if refused.is_some() || group.is_some_and(|g| g != 0) {
+        return refuse("changing a link attribute");
     }
     // `do_setlink`'s order: the MTU (`dev_validate_mtu`: lo has no bounds, only a negative int is EINVAL), the
     // flags when the request names some, the queue length.
@@ -363,9 +393,12 @@ fn ip4(d: &[u8]) -> [u8; 4] {
     [d[0], d[1], d[2], d[3]]
 }
 
-/// NW-12: `inet_rtm_newaddr` (with `rtm_to_ifaddr`) and `inet_rtm_deladdr` (linux-6.6/net/ipv4/devinet.c:946,
-/// :840, :647) on a namespace's lo. Finite lifetimes (IFA_CACHEINFO) are EOPNOTSUPP: V2 does not age addresses.
-fn addr_ns(v: &alloc::sync::Arc<crate::netns::NetView>, h: &Hdr, body: &[u8]) -> Result<(), NlErr> {
+/// NW-12: `inet_rtm_newaddr` (with `inet_validate_rtm` and `inet_rtm_to_ifa`) and `inet_rtm_deladdr`
+/// (linux-7.3.1/net/ipv4/devinet.c:960, :844, :882, :652) on a namespace's lo. The request is checked first
+/// (prefix, IFA_LOCAL, IFA_CACHEINFO), 0.0.0.0 is accepted and ignored next, the device is looked up last. A
+/// replace (NLM_F_REPLACE) of an existing address takes the new IFA_PROTO and IFA_RT_PRIORITY and is announced.
+/// Finite lifetimes are EOPNOTSUPP where Linux would set them: V2 does not age addresses.
+fn addr_ns(v: &alloc::sync::Arc<crate::netns::NetView>, h: &Hdr, body: &[u8], portid: u32) -> Result<(), NlErr> {
     const NLM_F_REPLACE: u16 = 0x100;
     const NLM_F_EXCL: u16 = 0x200;
     if body.len() < IFADDRMSG {
@@ -388,7 +421,7 @@ fn addr_ns(v: &alloc::sync::Arc<crate::netns::NetView>, h: &Hdr, body: &[u8]) ->
         let address = get(IFA_ADDRESS).map(ip4);
         let name = link.name.clone();
         return v
-            .edit("deladdr", |d| {
+            .edit_for("deladdr", h.seq, portid, |d| {
                 let i = d.addrs.iter().position(|x| {
                     local.is_none_or(|l| x.ip == l)
                         && label.as_deref().is_none_or(|l| x.label_or(&name) == l)
@@ -404,30 +437,57 @@ fn addr_ns(v: &alloc::sync::Arc<crate::netns::NetView>, h: &Hdr, body: &[u8]) ->
         return Err(NlErr::msg(EINVAL, "ipv4: Invalid prefix length"));
     }
     let local = get(IFA_LOCAL).map(ip4).ok_or(NlErr::msg(EINVAL, "ipv4: Local address is not supplied"))?;
-    let link = link.ok_or(NlErr::msg(ENODEV, "ipv4: Device not found"))?;
+    let mut finite = false;
     if let Some(ci) = get(IFA_CACHEINFO) {
         let (preferred, valid) = (u32_at(ci, 0), u32_at(ci, 4));
         if valid == 0 || preferred > valid {
             return Err(NlErr::msg(EINVAL, "ipv4: address lifetime invalid"));
         }
-        if valid != ifview::INFINITY || preferred != ifview::INFINITY {
-            unsupported(h.ty, "an address with a finite lifetime");
-            return Err(NlErr::new(EOPNOTSUPP));
-        }
+        finite = valid != ifview::INFINITY || preferred != ifview::INFINITY;
+    }
+    if local == [0; 4] {
+        return Ok(());
+    }
+    let link = link.ok_or(NlErr::msg(ENODEV, "ipv4: Device not found"))?;
+    if !v.with_dev(|d| d.inet) {
+        return Err(NlErr::new(ENOBUFS));
     }
     let flags = get(IFA_FLAGS).map(|d| u32_at(d, 0)).unwrap_or(ifm_flags);
     let label = label.filter(|l| *l != link.name);
-    let new = Addr { extra: flags & !IFA_F_PERMANENT_DEPRECATED, label, brd: get(IFA_BROADCAST).map(ip4), ..Addr::plain(local, prefix, scope, ifview::INFINITY, ifview::INFINITY) };
+    let new = Addr {
+        extra: flags & !IFA_F_PERMANENT_DEPRECATED,
+        label,
+        brd: get(IFA_BROADCAST).map(ip4),
+        proto: get(IFA_PROTO).map_or(0, |d| d[0]),
+        metric: get(IFA_RT_PRIORITY).map_or(0, |d| u32_at(d, 0)),
+        ..Addr::plain(local, prefix, scope, ifview::INFINITY, ifview::INFINITY)
+    };
     let replace = h.flags & NLM_F_REPLACE != 0 && h.flags & NLM_F_EXCL == 0;
-    v.edit("newaddr", |d| {
-        // `find_matching_ifa`: the same local address in the same subnet; only NLM_F_REPLACE may meet it (the
-        // lifetimes it would renew are infinite here).
-        if d.addrs.iter().any(|x| x.prefix == new.prefix && new.covers(x.ip) && x.ip == new.ip) {
-            return if replace { Ok(()) } else { Err(crate::netns::NlFail(EEXIST, Some("ipv4: Address already assigned"))) };
-        }
-        d.insert(new)
-    })
-    .map_err(nl)
+    let finite_unsupported = || {
+        unsupported(h.ty, "an address with a finite lifetime");
+        crate::netns::NlFail(EOPNOTSUPP, None)
+    };
+    // `find_matching_ifa`: the same local address in the same subnet; only NLM_F_REPLACE may meet it, and then
+    // the address keeps its place and takes the request's protocol and metric.
+    let replaced = v
+        .edit_for("newaddr", h.seq, portid, |d| match d.addrs.iter().position(|x| x.prefix == new.prefix && new.covers(x.ip) && x.ip == new.ip) {
+            Some(_) if !replace => Err(crate::netns::NlFail(EEXIST, Some("ipv4: Address already assigned"))),
+            _ if finite => Err(finite_unsupported()),
+            Some(i) => {
+                let x = &mut d.addrs[i];
+                x.proto = new.proto;
+                x.metric = new.metric;
+                Ok(Some(x.clone()))
+            }
+            None => d.insert(new).map(|()| None),
+        })
+        .map_err(nl)?;
+    // `rtmsg_ifa(RTM_NEWADDR, ifa, nlh, portid)`: a replace is announced whether or not it changed anything (the
+    // view's comparison leaves protocol and metric out, `Addr::announced`, so it is announced once).
+    if let Some(a) = replaced {
+        v.announce_replace(&a, h.seq, portid);
+    }
+    Ok(())
 }
 
 /// `rtnl_getlink`: one link by index, else by IFLA_IFNAME / IFLA_ALT_IFNAME.
@@ -719,8 +779,9 @@ fn stats32(l: &Link) -> [u8; 96] {
     b
 }
 
-/// `inet_fill_ifaddr`: ADDRESS before LOCAL (musl's getifaddrs reads them in this order), BROADCAST for a card,
-/// the label, IFA_FLAGS and the lifetimes. The creation and update stamps are 0 (V2 does not keep them).
+/// `inet_fill_ifaddr` (linux-7.3.1/net/ipv4/devinet.c:1759): ADDRESS before LOCAL (musl's getifaddrs reads them
+/// in this order), BROADCAST for a card, the label, IFA_PROTO when set, IFA_FLAGS, IFA_RT_PRIORITY when set and
+/// the lifetimes. The creation and update stamps are 0 (V2 does not keep them).
 pub fn addr_msg(l: &Link, a: &Addr, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
     let mut fixed = [0u8; IFADDRMSG];
     fixed[0] = AF_INET;
@@ -736,11 +797,19 @@ pub fn addr_msg(l: &Link, a: &Addr, ty: u16, flags: u16, seq: u32, pid: u32) -> 
     let mut ci = [0u8; 16];
     ci[0..4].copy_from_slice(&a.preferred_s.to_le_bytes());
     ci[4..8].copy_from_slice(&a.valid_s.to_le_bytes());
-    m.str(IFA_LABEL, a.label_or(&l.name).as_bytes()).u32(IFA_FLAGS, a.flags()).attr(IFA_CACHEINFO, &ci);
+    m.str(IFA_LABEL, a.label_or(&l.name).as_bytes());
+    if a.proto != 0 {
+        m.u8(IFA_PROTO, a.proto);
+    }
+    m.u32(IFA_FLAGS, a.flags());
+    if a.metric != 0 {
+        m.u32(IFA_RT_PRIORITY, a.metric);
+    }
+    m.attr(IFA_CACHEINFO, &ci);
     m.done()
 }
 
-/// NW-12: `inet6_fill_ifaddr` (linux-6.6/net/ipv6/addrconf.c): IFA_ADDRESS (no peer), the lifetimes (infinite;
+/// NW-12: `inet6_fill_ifaddr` (linux-7.3.1/net/ipv6/addrconf.c:5165): IFA_ADDRESS (no peer), the lifetimes (infinite;
 /// the stamps 0 as for IPv4), IFA_FLAGS, IFA_PROTO when set.
 pub fn addr6_msg(l: &Link, a: &ifview::Addr6, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
     let mut fixed = [0u8; IFADDRMSG];

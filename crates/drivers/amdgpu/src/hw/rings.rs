@@ -78,13 +78,13 @@ pub fn fence_slot(inp: &VmInputs, ty: RingType) -> u64 {
     inp.carve.mc_base() + inp.mes_bo.offset + lay::FENCES + ty.index() as u64 * 0x40
 }
 
-/// The watch's configuration of a queue (gr-GR-3.md's table).
+/// The watch's configuration of a queue (`amdgpu_fmt::watch`'s table).
 pub(crate) fn ring_cfg(ty: RingType, q: &Queue, cfg: &JobCfg) -> RingCfg {
     let class = match (ty, q.kind()) {
         (RingType::Gfx, _) => RingClass::GfxMesLegacy { queue_type: mesapi::qtype::GFX, pipe: mes11::GFX_PIPE, queue: mes11::GFX_QUEUE, doorbell_dw: gfx11::DOORBELL_DW },
         (RingType::Compute, _) => RingClass::ComputeMesLegacy { queue_type: mesapi::qtype::COMPUTE, pipe: mes11::COMPUTE_PIPE, queue: mes11::COMPUTE_QUEUE, doorbell_dw: mes11::COMPUTE_DOORBELL_DW },
         (RingType::Sdma, Kind::Sdma { burst_nop }) => RingClass::Sdma { burst_nop },
-        (RingType::Sdma, Kind::Gfx) => RingClass::Sdma { burst_nop: false },
+        (RingType::Sdma, Kind::Gfx | Kind::Vcn) => RingClass::Sdma { burst_nop: false },
     };
     let mut c = RingCfg::for_780m(ty.name(), class, q.size_dw(), q.wptr(), q.size_dw() / q.kind().ring_align_dw());
     if let Some(t) = cfg.timeouts_us {

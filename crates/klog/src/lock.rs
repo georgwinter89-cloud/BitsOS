@@ -5,7 +5,7 @@
 //! The owner tag is the lock: whoever swaps it from 0 to its CPU tag owns the lock, and only then takes the
 //! `SpinLock` (uncontended, so it never spins), which merely gives safe access to the data. So a nested user on
 //! the owning CPU sees the tag in every moment of a hold, and klog never needs `SpinLock::try_lock` (whose
-//! G0 version releases the lock when it fails; change request to SC in plan/notes/rb-RB-1.md).
+//! G0 version releases the lock when it fails).
 //!
 //! Interrupts are masked for the whole hold (as Linux holds its console and log locks with irqsave): an IRQ
 //! handler that logs never finds its own CPU holding a klog lock, so it never spins on a holder that cannot run,

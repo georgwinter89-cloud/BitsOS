@@ -99,13 +99,38 @@ mark() {
     done
 }
 
+# Free bytes in an image, as mdir's last line says them.
+free_bytes() {
+    mdir -i "$(img "$1")" "::/" 2>/dev/null | sed -n 's/^ *\([0-9 ]*\) bytes free.*/\1/p' | tr -d ' ' | tail -1
+}
+
+# Makes image $1 larger by at least $2 bytes: every file goes out, a larger FAT32 with the same label is made and
+# every file goes back (markers and earlier generations stay; mtools has no way to grow a FAT in place). xtask sizes
+# an image for its content plus a quarter; since the initramfs passed 160 MB that is less than a second generation.
+grow_image() {
+    local im="$1" more="$2" d="$RUN_DIR/grow-$1" old kib
+    old="$(stat -c %s "$(img "$im")")"
+    kib=$(( (old + more + (32 << 20)) / 1024 / 1024 * 1024 + 1024 ))
+    rm -rf "$d"; mkdir -p "$d"
+    mcopy -s -n -i "$(img "$im")" "::/*" "$d/" >/dev/null 2>&1 || { echo "RED: cannot read image $im to grow it"; exit 1; }
+    rm -f "$(img "$im")"
+    mkfs.fat -F 32 -n BITSOS -C "$(img "$im")" "$kib" >/dev/null || { echo "RED: cannot make the larger image $im"; exit 1; }
+    mcopy -s -i "$(img "$im")" "$d"/* "::/" || { echo "RED: cannot fill the larger image $im"; exit 1; }
+    rm -rf "$d"
+    echo "  image $im grown to $((kib / 1024)) MiB for another generation"
+}
+
 # A copy of generation $3 of image $1 as generation $2 (KERNEL + INITRD), no markers. The kernel copy loses
-# its debug sections (objcopy --strip-debug: the debug ktest kernel is ~22 MB, the 64 MB test stick holds two).
+# its debug sections (objcopy --strip-debug: the debug ktest kernel is hundreds of MB). The image is grown first
+# when the copy does not fit.
 copy_gen() {
-    local im="$1" to="$2" from="${3:-1}"
+    local im="$1" to="$2" from="${3:-1}" need free
     mkdir -p "$RUN_DIR/gen-copy"
     mcopy -o -i "$(img "$im")" "::/BITSOS2/SYS/$from/KERNEL" "::/BITSOS2/SYS/$from/INITRD" "$RUN_DIR/gen-copy/"
     objcopy --strip-debug "$RUN_DIR/gen-copy/KERNEL" 2>/dev/null || true  # a broken ELF stays as it is
+    need=$(( $(stat -c %s "$RUN_DIR/gen-copy/KERNEL") + $(stat -c %s "$RUN_DIR/gen-copy/INITRD") + (4 << 20) ))
+    free="$(free_bytes "$im")"
+    if [ "${free:-0}" -lt "$need" ]; then grow_image "$im" "$need"; fi
     mmd -i "$(img "$im")" "::/BITSOS2/SYS/$to" 2>/dev/null || true
     mcopy -o -i "$(img "$im")" "$RUN_DIR/gen-copy/KERNEL" "$RUN_DIR/gen-copy/INITRD" "::/BITSOS2/SYS/$to/"
 }

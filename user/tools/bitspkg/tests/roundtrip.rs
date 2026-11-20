@@ -62,7 +62,7 @@ fn install_upgrade_rollback_remove() {
 
     let r = remove::remove(&st, "demo", false).unwrap();
     assert!(r.data_removed);
-    assert_eq!(tree_list(&root), vec!["d apps", "d apps/.store", "d apps/.trash", "d data", "d data/appdata", "f apps/.lock", "f apps/.next-id"]);
+    assert_eq!(tree_list(&root), vec!["d apps", "d apps/.pkgs", "d apps/.store", "d apps/.trash", "d data", "d data/appdata", "f apps/.lock", "f apps/.next-id"]);
 
     // A new install gets a new id: ids are never reused.
     let r = install::install(&st, &p1).unwrap();

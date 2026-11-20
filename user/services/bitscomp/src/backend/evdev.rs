@@ -1,5 +1,5 @@
-//! Input on V2 without udev or libinput (WY-1a decision, notes wy-WY-1a.md): bitscomp opens `/dev/input/event*`
-//! itself, probes each with EVIOCGBIT/EVIOCGABS (linux-6.6/drivers/input/evdev.c `evdev_do_ioctl`), grabs keyboards
+//! Input on V2 without udev or libinput (WY-1a decision, plan/spec/bitscomp.md §2): bitscomp opens `/dev/input/event*`
+//! itself, probes each with EVIOCGBIT/EVIOCGABS (linux-7.3.1/drivers/input/evdev.c:1032 `evdev_do_ioctl`), grabs keyboards
 //! and pointers (EVIOCGRAB: the VT gets nothing while bitscomp runs; PK-L1c: pads are never grabbed), reads whole `struct input_event`s and turns them into
 //! `InputEvent`s through `evdev_map`. Hot plug: a node that goes away answers ENODEV (its held keys are released,
 //! the source removed); new nodes are found by an inotify watch on `/dev/input` (`hotplug`; once a second where
@@ -155,7 +155,7 @@ fn ioctl_int(fd: i32, req: u64, v: i32) -> std::io::Result<()> {
 }
 
 /// For requests that take the value itself: EVIOCGRAB grabs on any non-zero argument and releases on 0
-/// (linux-6.6/drivers/input/evdev.c:1086), so a pointer would always grab.
+/// (linux-7.3.1/drivers/input/evdev.c:1089), so a pointer would always grab.
 fn ioctl_val(fd: i32, req: u64, v: libc::c_ulong) -> std::io::Result<()> {
     // SAFETY: the argument is a plain value; the kernel dereferences nothing.
     let r = unsafe { libc::ioctl(fd, req as libc::Ioctl, v) };
@@ -179,6 +179,8 @@ struct Probe {
     stick: (Option<crate::pad::Axis>, Option<crate::pad::Axis>),
     /// The values of the stick's X/Y and the hat's X/Y when opened.
     rest: (Option<i32>, Option<i32>, (i32, i32)),
+    /// GM-6c: EVIOCGPHYS (a pad's battery is found by it).
+    phys: String,
 }
 
 fn open(path: &Path) -> std::io::Result<Option<Probe>> {
@@ -250,7 +252,7 @@ fn open(path: &Path) -> std::io::Result<Option<Probe>> {
         (Vec::new(), (None, None), (None, None, (0, 0)))
     };
     let ids = (u16::from_le_bytes([id[2], id[3]]), u16::from_le_bytes([id[4], id[5]]));
-    Ok(Some(Probe { file, caps, name, origin, why, keys: pad_keys, id: ids, stick, rest }))
+    Ok(Some(Probe { file, caps, name, origin, why, keys: pad_keys, id: ids, stick, rest, phys }))
 }
 
 fn add(handle: &LoopHandle<'static, App>, file: File, caps: Caps, name: &str, (origin, why): Counts, key: Key) -> bool {
@@ -307,6 +309,7 @@ fn add_pad(handle: &LoopHandle<'static, App>, p: Probe, key: Key) -> bool {
     let id = crate::pad_app::next_id();
     let mut dev = crate::pad_app::PadDev::new(&label, &p.name, p.id, &p.keys, p.stick, p.origin);
     dev.pad.seed(p.rest.0, p.rest.1, p.rest.2);
+    dev.phys = p.phys.clone();
     eprintln!("bitscomp: input: {label} \"{}\" pad (not grabbed: programs read it too), {counts}", p.name);
     let plug = Rc::new(RefCell::new(Some(dev)));
     let (first, unread) = (plug.clone(), plug.clone());

@@ -195,7 +195,7 @@ impl Store {
     /// commit between the two steps so the kill -9 test can hit exactly that window.
     pub fn commit(&self, n: u64) -> io::Result<()> {
         sync_tree(&self.gen_dir(n))?;
-        if let Some(ms) = std::env::var("CTXD_TEST_COMMIT_PAUSE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        if let Some(ms) = crate::knobs::millis("CTXD_TEST_COMMIT_PAUSE_MS") {
             eprintln!("ctxd-test: commit pause g{n}");
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }

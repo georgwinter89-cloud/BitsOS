@@ -22,6 +22,14 @@ pub struct NetStats {
     pub tx_dropped: u64,
 }
 
+/// SYS-K: what `/proc/net/wireless` shows of a station (Linux's `cfg80211_wireless_stats`): whether it is
+/// associated, and the AP's signal in dBm when the driver keeps it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wireless {
+    pub associated: bool,
+    pub signal_dbm: Option<i32>,
+}
+
 pub trait NetDevice: Send + Sync {
     fn name(&self) -> &str;
     fn mac(&self) -> MacAddr;
@@ -44,5 +52,9 @@ pub trait NetDevice: Send + Sync {
     /// the cable keeps the default route whatever order the leases came in.
     fn route_metric(&self) -> u32 {
         100
+    }
+    /// SYS-K: a wireless card's station state (None: not a wireless card). Must answer at once (a kept value).
+    fn wireless(&self) -> Option<Wireless> {
+        None
     }
 }

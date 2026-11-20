@@ -221,6 +221,11 @@ impl AsCore {
         self.ctr.rss()
     }
 
+    /// VmPTE in pages, without the lock (the OOM killer's `oom_badness`).
+    pub fn page_table_pages(&self) -> u64 {
+        self.ctr.tables()
+    }
+
     /// VmHWM in pages, without the lock.
     pub fn hiwater_rss_pages(&self) -> u64 {
         self.ctr.hiwater_rss()

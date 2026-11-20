@@ -145,7 +145,17 @@ pub(crate) fn idle_line() -> String {
     let mut s = format!("idle mode={} factor={} states=C1", cstate::mode().name(), cstate::residency_factor());
     let Some(p) = cstate::current_plan() else { return s };
     for d in &p.deep {
-        s += &format!(",C{}@io:{:#x}/{}us{}", d.kind, d.port, d.latency_ns / 1000, if d.bm_check { "/bm" } else { "" });
+        match d.mwait {
+            Some(h) => s += &format!(",C{}@mwait:{:#x}/{}us", d.kind, h, d.latency_ns / 1000),
+            None => s += &format!(",C{}@io:{:#x}/{}us{}", d.kind, d.port, d.latency_ns / 1000, if d.bm_check { "/bm" } else { "" }),
+        }
+    }
+    // GP-CPU2: MWAIT states are used only after their self-check.
+    if let Some(src) = p.mwait_source {
+        s += &format!(" source={} check={}", src.name(), cstate::check_state().name());
+        if let Some(Err((cpu, hint, f))) = cstate::check_outcome() {
+            s += &format!(" check_failed=cpu{cpu}/{hint:#x}/{}", f.name());
+        }
     }
     if let Some(why) = p.c1_only {
         s += &format!(" c1_only={}", why.name());
@@ -182,6 +192,7 @@ mcp::mcp_tool!(
     name: "sched",
     owner: "SC",
     safety: Read,
+    local: true,
     description: "Scheduler state per CPU: online/idle/halted/busy, queued threads, busy and idle time since boot with busy percent, switches, threads migrated in, steals, pushes, reschedule IPIs, interrupt-time wake-ups, heartbeat, tick on/off, last idle entry (ms since boot, IF), user and nice time (ms, SC-6), topology, and the sched.* counters (sleep timer, ticks, fallbacks, halts) (APIC ID, core, SMT thread, cache cluster, P/E core type). SC-7a: the interactive line (group in front, granted groups, wake-to-run waits of Interactive threads: count, average, largest since boot and in the last 10-20 s, late ones). With threads=true also every thread (busiest first): class, state, CPU, pin, KernelRt priority (FIFO/RR: the program's priority), CPU time, migrations, wake-ups, user and system time (ms), nice, policy (other/fifo/rr/batch/idle/ext), affinity (all or set), voluntary and involuntary switches, thread group (tgid, 0 = kernel), longest Interactive wake-to-run wait (us).",
     schema: r#"{"type":"object","properties":{"threads":{"type":"boolean","description":"also list the threads"},"max":{"type":"integer","minimum":1,"maximum":10000,"description":"at most this many thread lines (default 200)"}}}"#,
     handler: tool,

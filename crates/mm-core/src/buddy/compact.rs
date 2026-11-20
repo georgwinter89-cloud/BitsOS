@@ -14,15 +14,16 @@
 //! The migrate scanner works in aligned chunks of the wanted order (a pageblock for whole-zone runs): before it
 //! moves anything it reads the chunk's frame states (lock-free, a hint: the retry decides) and touches the chunk
 //! only when every frame is free, on a per-CPU list or an order-0 frame the migrator can move. Linux isolates
-//! every movable page of a block regardless; while the only migrator drops clean cache (`DropClean`, until MM-2), a
-//! frame dropped in a block that cannot end up free is cache lost for nothing. Whole-zone runs (compact_memory,
-//! proactive) with a dropping migrator clear only chunks that hold a free frame already: clearing a block full of
-//! cache would be reclaim, not compaction.
+//! every movable page of a block regardless; where the only migrator drops clean cache (`DropClean`: no copying
+//! migrator installed), a frame dropped in a block that cannot end up free is cache lost for nothing. Whole-zone
+//! runs (compact_memory, proactive) with a dropping migrator clear only chunks that hold a free frame already:
+//! clearing a block full of cache would be reclaim, not compaction.
 //!
 //! Pageblock skip hints (Linux `PB_migrate_skip`): one bit per pageblock in the region's side array, set where a
 //! scanner found nothing to take (a frame that stays, an unmovable frame, no free target), honoured by direct and
-//! kcompactd runs, ignored by whole-zone runs, cleared when the scanners of a direct or kcompactd run met and
-//! kcompactd goes to sleep (Linux: kswapd going to sleep with `compact_blockskip_flush`, set by direct runs only).
+//! kcompactd runs, ignored by whole-zone runs (both scanners: `Targets`), cleared when the scanners of a direct or
+//! kcompactd run met and kcompactd goes to sleep (Linux: kswapd going to sleep with `compact_blockskip_flush`, set
+//! by direct runs only). A pageblock that is free whole gets none.
 //! Rebuilt zeroed with the buddy at boot and Reload: nothing to hand over.
 
 use super::{zone_index, Buddy, Region, ZONES};
@@ -38,12 +39,21 @@ const COSTLY_ORDER: u32 = 3;
 pub const MAX_DEFER_SHIFT: u32 = 6;
 /// Free frames the free scanner isolates per step (Linux `COMPACT_CLUSTER_MAX`).
 const CLUSTER: usize = 32;
-/// Frames the migrate scanner reads per direct run (1 GiB of frame states, about a millisecond).
+/// Frames the migrate scanner reads per direct run (1 GiB of frame states, about a millisecond; a chunk that
+/// fails at its first frame counts whole).
 pub const DIRECT_SCAN: u64 = 1 << 18;
+/// Frames the free scanner reads per slice of any run (256 MiB of frame states): the run then stops where it
+/// is, the next one goes on from there (the cached positions). 12.11.2026, Mini-PC generation 137: the free
+/// scanner had no bound and no cached position, every run walked down from the top of the zone again, 1.2
+/// billion frames in 30 minutes.
+pub const FREE_SCAN: u64 = 1 << 16;
 /// Frames one direct run may drop (16 MiB of clean cache, as kswapd's old `ORDER_PAGES`).
 pub const DIRECT_DROP: u64 = 4096;
 /// Frames per slice of a background run (kcompactd yields between slices).
 pub const SLICE: u64 = 1 << 16;
+/// Slices one pass of kcompactd for an order makes at most (2 GiB of frame states for each scanner); what is left
+/// of the zone is the next pass's, from the cached positions.
+pub const PASS_SLICES: u32 = 8;
 /// Frames one kcompactd run for an order may drop while the migrator drops (64 MiB).
 pub const DAEMON_DROP: u64 = 4 * DIRECT_DROP;
 /// Frames one proactive run may drop while the migrator drops (it compacts for the score, nobody waits).
@@ -56,10 +66,24 @@ pub enum How {
     Direct,
     /// kcompactd for a wanted order (`kcompactd_do_work`).
     Daemon,
-    /// kcompactd for the fragmentation score (`proactive_compact_node`): whole zone, until the low mark.
+    /// kcompactd for the fragmentation score (`proactive_compact_node`): the whole zone pass by pass, until the
+    /// low mark.
     Proactive,
     /// /proc/sys/vm/compact_memory (`compact_node`): whole zone.
     Manual,
+}
+
+/// Where the free scanner takes its targets and what the skip hints count for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Targets {
+    /// Movable pageblocks without a skip hint; one that gave nothing gets the hint (runs for an order).
+    Hinted,
+    /// Movable pageblocks, hints neither read nor set: whole-zone runs (Linux `compact_node` sets
+    /// `ignore_skip_hint`, which `isolation_suitable` obeys for both scanners). 12.11.2026: hints left by the runs of
+    /// a moment before kept `compact_memory` off nine pageblocks in ten.
+    Unhinted,
+    /// Every pageblock but the reserve's, hints neither read nor set (a last try, Linux `ignore_block_suitable`).
+    Any,
 }
 
 impl How {
@@ -91,6 +115,13 @@ pub enum Status {
 pub(super) struct ZoneCompact {
     migrate_pfn: AtomicU64,
     free_pfn: AtomicU64,
+    /// Where the last tries stopped (`Buddy::compact_last`): they read no hints, so they keep positions of their
+    /// own, and one bounded try after the other goes round the zone.
+    last_migrate_pfn: AtomicU64,
+    last_free_pfn: AtomicU64,
+    /// Where the proactive runs stopped: each is one pass (`Buddy::pass`), the next goes on.
+    pro_migrate_pfn: AtomicU64,
+    pro_free_pfn: AtomicU64,
     considered: AtomicU32,
     defer_shift: AtomicU32,
     order_failed: AtomicU32,
@@ -98,10 +129,25 @@ pub(super) struct ZoneCompact {
 }
 
 impl ZoneCompact {
+    /// The cached scanner positions `c` starts from and stops at (migrate, free): the hinted runs', the last
+    /// tries' or the proactive runs'; none for compact_memory (one run from end to end).
+    fn cached(&self, c: &Control) -> Option<(&AtomicU64, &AtomicU64)> {
+        match c.how {
+            _ if c.last => Some((&self.last_migrate_pfn, &self.last_free_pfn)),
+            How::Proactive => Some((&self.pro_migrate_pfn, &self.pro_free_pfn)),
+            How::Manual => None,
+            How::Direct | How::Daemon => Some((&self.migrate_pfn, &self.free_pfn)),
+        }
+    }
+
     pub(super) const fn new() -> Self {
         ZoneCompact {
             migrate_pfn: AtomicU64::new(0),
             free_pfn: AtomicU64::new(0),
+            last_migrate_pfn: AtomicU64::new(0),
+            last_free_pfn: AtomicU64::new(0),
+            pro_migrate_pfn: AtomicU64::new(0),
+            pro_free_pfn: AtomicU64::new(0),
             considered: AtomicU32::new(0),
             defer_shift: AtomicU32::new(0),
             order_failed: AtomicU32::new(MAX_ORDER + 1),
@@ -162,6 +208,35 @@ impl CompactCounters {
     }
 }
 
+/// How a last try ended (`Buddy::compact_last`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Last {
+    Made,
+    /// Its scanners met without a block (or the migrator drops: no last try).
+    Failed,
+    /// Its budget ended first.
+    Stopped,
+}
+
+/// The free scanner of a run.
+struct FreeScan {
+    /// The end of what it has not read yet (a pageblock's end or the zone's); it reads downwards.
+    pfn: u64,
+    /// Where it goes on inside the pageblock below `pfn` (0: at the pageblock's start).
+    resume: u64,
+    /// Target frames taken and not used yet.
+    frames: [u64; CLUSTER],
+    n: usize,
+    /// Frames it may still read in this slice (`FREE_SCAN`).
+    left: u64,
+}
+
+impl FreeScan {
+    fn at(&mut self, pfn: u64) {
+        (self.pfn, self.resume) = (pfn, 0);
+    }
+}
+
 /// One run over one zone (Linux `struct compact_control`).
 pub struct Control {
     order: Option<u32>,
@@ -169,9 +244,7 @@ pub struct Control {
     zone: usize,
     started: bool,
     migrate_pfn: u64,
-    free_pfn: u64,
-    free: [u64; CLUSTER],
-    nfree: usize,
+    fs: FreeScan,
     /// Frames dropped or moved by this run whose frames have not been waited for yet.
     unsettled: u64,
     drop_cap: u64,
@@ -181,6 +254,11 @@ pub struct Control {
     pb_at: u64,
     pb_good: bool,
     pb_bad: bool,
+    /// The last try after a run whose scanners met (`Buddy::compact_last`).
+    last: bool,
+    /// A last try that did not start at the zone's ends starts there once when its scanners meet (`wrapped`).
+    wrap: bool,
+    wrapped: bool,
     s: CompactStats,
 }
 
@@ -193,15 +271,16 @@ impl Control {
             zone: zone.min(ZONES - 1),
             started: false,
             migrate_pfn: 0,
-            free_pfn: 0,
-            free: [0; CLUSTER],
-            nfree: 0,
+            fs: FreeScan { pfn: 0, resume: 0, frames: [0; CLUSTER], n: 0, left: 0 },
             unsettled: 0,
             drop_cap: u64::MAX,
             grace: crate::grace::WaitBudget::default(),
             pb_at: u64::MAX,
             pb_good: false,
             pb_bad: false,
+            last: false,
+            wrap: false,
+            wrapped: false,
             s: CompactStats::default(),
         }
     }
@@ -209,6 +288,12 @@ impl Control {
     /// What this run counted so far.
     pub fn stats(&self) -> CompactStats {
         self.s
+    }
+
+    /// The run starts at the zone's ends and neither reads nor sets skip hints (Linux `whole_zone` and
+    /// `ignore_skip_hint`): whole-zone runs and a last try.
+    fn unhinted(&self) -> bool {
+        self.how.whole() || self.last
     }
 
     fn chunk(&self) -> u64 {
@@ -270,8 +355,8 @@ pub fn extfrag_for_order(free_blocks: &[u64], order: u32) -> u32 {
 }
 
 impl Buddy {
-    /// Installs the migrator (MM-2). False: one was installed already. Without one, compaction drops clean cache
-    /// through the reclaimer (`DropClean`).
+    /// Installs the migrator (MM-2: crate mm's, on the boot allocator). False: one was installed already. Without
+    /// one, compaction drops clean cache through the reclaimer (`DropClean`).
     pub fn set_migrator(&self, m: &'static dyn Migrate) -> bool {
         self.migrator.set(m)
     }
@@ -412,7 +497,7 @@ impl Buddy {
     /// Linux `compaction_suitable` with the min watermark: enough free frames for the targets (`compact_gap`, more
     /// for costly orders) and, for a costly order, a fragmentation index above `extfrag_threshold` (below, the
     /// failure is lack of memory: reclaim, not compaction). Both are about a migrator that needs targets and keeps
-    /// what it moves: with a dropping one (`DropClean`, until MM-2) compaction is reclaim aimed at one block, which
+    /// what it moves: with a dropping one (`DropClean`, where no copying one is installed) compaction is reclaim aimed at one block, which
     /// for a high order beats reclaim spread over memory (the cursor scan it replaced did the same), so it is always
     /// suitable then.
     pub fn compaction_suitable(&self, zone: usize, order: u32) -> bool {
@@ -439,10 +524,11 @@ impl Buddy {
 
     // ---- the run ----
 
-    /// One slice of a run over `c`'s zone, at most `budget` frames read by the migrate scanner. Call from a context
-    /// that may reclaim and inside `reclaim::enter` (the callers below check).
+    /// One slice of a run over `c`'s zone, at most `budget` frames read by the migrate scanner and `FREE_SCAN` by
+    /// the free scanner. Call from a context that may reclaim and inside `reclaim::enter` (the callers below check).
     pub fn compact_zone(&self, c: &mut Control, budget: u64) -> Status {
         let Some((zs, ze)) = self.zone_span(c.zone) else { return Status::Skipped };
+        c.fs.left = budget.min(FREE_SCAN);
         let st = self.with_migrator(|m| self.run(c, m, zs, ze, budget)).unwrap_or(Status::Skipped);
         self.release_free(c);
         if st != Status::Continue && c.unsettled > 0 {
@@ -463,32 +549,53 @@ impl Buddy {
                     How::Manual => u64::MAX,
                 };
             }
-            if c.how.whole() {
-                (c.migrate_pfn, c.free_pfn) = (zs, ze);
-            } else {
-                let (mp, fp) = (zc.migrate_pfn.load(Relaxed), zc.free_pfn.load(Relaxed));
-                c.migrate_pfn = if mp > zs && mp < ze { mp } else { zs };
-                c.free_pfn = if fp > zs && fp <= ze { fp } else { ze };
+            c.migrate_pfn = zs;
+            c.fs.at(ze);
+            if let Some((m, f)) = zc.cached(c) {
+                let (mp, fp) = (m.load(Relaxed), f.load(Relaxed));
+                if mp > zs && mp < ze {
+                    c.migrate_pfn = mp;
+                }
+                if fp > zs && fp <= ze {
+                    c.fs.at(fp);
+                }
+                c.wrap = c.last && (c.migrate_pfn, c.fs.pfn) != (zs, ze);
             }
         }
         let chunk = c.chunk();
         let mut read = 0u64;
         loop {
             if self.finished(c) {
-                if !c.how.whole() {
-                    zc.migrate_pfn.store(c.migrate_pfn, Relaxed);
-                }
+                self.park(c, c.migrate_pfn);
                 return Status::Success;
             }
             let at = c.migrate_pfn.next_multiple_of(chunk);
-            if at + chunk > c.free_pfn {
+            if at + chunk > c.fs.pfn {
                 self.pb_done(c);
+                if c.last {
+                    zc.last_migrate_pfn.store(0, Relaxed);
+                    zc.last_free_pfn.store(0, Relaxed);
+                    if c.wrap {
+                        // The tries before this one read the zone's ends: this one goes on there with what is
+                        // left of its budget, and only a try that read from end to end has failed.
+                        (c.wrap, c.wrapped) = (false, true);
+                        self.release_free(c);
+                        (c.migrate_pfn, c.pb_at) = (zs, u64::MAX);
+                        c.fs.at(ze);
+                        continue;
+                    }
+                    return Status::Complete;
+                }
+                if c.how == How::Proactive {
+                    zc.pro_migrate_pfn.store(0, Relaxed);
+                    zc.pro_free_pfn.store(0, Relaxed);
+                }
                 // Linux `reset_cached_positions`; the run asks for the hints to be cleared when kcompactd sleeps
                 // (Linux asks only for direct runs; here kcompactd may be the only one compacting, as callers under
                 // a spin lock only note their order, and stale hints would keep it off memory for good).
                 zc.migrate_pfn.store(0, Relaxed);
                 zc.free_pfn.store(0, Relaxed);
-                if !c.how.whole() {
+                if !c.unhinted() {
                     zc.flush.store(true, Relaxed);
                     // kcompactd clears the hints on its next pass: a direct run rings it, so a hint set by a
                     // transient blocker (a dirty or held cache page) lasts one pass, not until the next wake.
@@ -499,19 +606,15 @@ impl Buddy {
                 return Status::Complete;
             }
             if c.s.dropped >= c.drop_cap {
-                if !c.how.whole() {
-                    zc.migrate_pfn.store(at, Relaxed);
-                }
+                self.park(c, at);
                 return Status::Partial;
             }
-            if read >= budget {
-                if !c.how.whole() {
-                    zc.migrate_pfn.store(at, Relaxed);
-                }
+            if read >= budget || c.fs.left == 0 {
+                self.park(c, at);
                 return Status::Continue;
             }
             let Some(r) = self.region_at_or_above(c.zone, at) else {
-                c.migrate_pfn = c.free_pfn;
+                c.migrate_pfn = c.fs.pfn;
                 continue;
             };
             if at < r.start || at + chunk > r.end {
@@ -530,29 +633,54 @@ impl Buddy {
                 self.pb_done(c);
                 (c.pb_at, c.pb_good, c.pb_bad) = (pb, false, false);
             }
-            if !c.how.whole() && self.chunk_skipped(r, at, chunk) {
+            if !c.unhinted() && self.chunk_skipped(r, at, chunk) {
                 c.migrate_pfn = (at + chunk).max(pb + PAGEBLOCK_FRAMES);
                 continue;
             }
             read += chunk;
             c.s.migrate_scanned += chunk;
+            let cleared = c.s.cleared;
             match self.clear_chunk(c, m, r, at, chunk) {
                 Ok(()) => c.pb_good = true,
+                // The free scanner's budget ran out under this chunk: no fault of the chunk's (no hint), and the
+                // next slice or run takes it up again.
+                Err(_) if c.fs.left == 0 => {
+                    self.park(c, at);
+                    return Status::Continue;
+                }
                 Err(blocker) => {
                     c.pb_bad = true;
-                    if chunk >= PAGEBLOCK_FRAMES && !c.how.whole() && let Some(b) = blocker {
+                    if chunk >= PAGEBLOCK_FRAMES && !c.unhinted() && let Some(b) = blocker {
                         self.set_skip(r, b);
                     }
                 }
             }
             c.migrate_pfn = at + chunk;
+            // A direct run made its block: done, whoever takes it (the asker tries again, and comes back if another
+            // CPU was first). Looking for the block first (`finished`) and going on when it is gone already made
+            // one allocation clear chunk after chunk for the others, up to its whole budget. Linux isolates
+            // COMPACT_CLUSTER_MAX pages at a time for the same reason. A dropping migrator keeps its drop cap.
+            if c.how == How::Direct && c.order.is_some() && !m.drops() && c.s.cleared > cleared {
+                self.park(c, c.migrate_pfn);
+                return Status::Success;
+            }
         }
+    }
+
+    /// The run stops here for now: the next run for an order goes on from these positions (Linux
+    /// `compact_cached_migrate_pfn`, `compact_cached_free_pfn`). The free scanner goes back above the highest
+    /// target it took and did not use (`release_free` gives those back).
+    fn park(&self, c: &Control, migrate_pfn: u64) {
+        let Some((m, f)) = self.compact[c.zone].cached(c) else { return };
+        let unused = c.fs.frames[..c.fs.n].iter().copied().max().map_or(0, |p| (p | (PAGEBLOCK_FRAMES - 1)) + 1);
+        m.store(migrate_pfn, Relaxed);
+        f.store(c.fs.pfn.max(unused), Relaxed);
     }
 
     /// The migrate scanner left pageblock `c.pb_at`: below the pageblock order its skip hint is set when no chunk
     /// of it came free and one could not (Linux `update_pageblock_skip` when nothing was isolated).
     fn pb_done(&self, c: &mut Control) {
-        if c.pb_at != u64::MAX && c.chunk() < PAGEBLOCK_FRAMES && c.pb_bad && !c.pb_good && !c.how.whole()
+        if c.pb_at != u64::MAX && c.chunk() < PAGEBLOCK_FRAMES && c.pb_bad && !c.pb_good && !c.unhinted()
             && let Some(r) = self.region_at_or_above(c.zone, c.pb_at)
             && r.start >> PAGEBLOCK_ORDER <= c.pb_at >> PAGEBLOCK_ORDER
         {
@@ -605,7 +733,7 @@ impl Buddy {
                         return Err(Some(p));
                     }
                     if kind == Kind::User && m.drops() {
-                        // Anonymous memory cannot be dropped: it waits for MM-2's copy.
+                        // Anonymous memory cannot be dropped: only a migrator that copies moves it (MM-2).
                         c.s.skipped_anon += 1;
                         return Err(Some(p));
                     }
@@ -630,6 +758,10 @@ impl Buddy {
             return Err(None);
         }
         let mut p = at;
+        // The free scanner takes no more targets than this chunk still has frames to move (Linux
+        // `isolate_freepages` stops at `nr_migratepages`): what a run takes and does not use, the next run reads
+        // again.
+        let mut todo = movable;
         while p < end {
             let mt = self.get_meta(r, p);
             match mt.state {
@@ -638,7 +770,10 @@ impl Buddy {
                 State::Alloc if mt.order == 0 => {
                     let Some(kind) = kind_of(mt.kind) else { return Err(Some(p)) };
                     let owner = self.owner(p * PAGE);
-                    let mut dest = || self.compaction_alloc(c.zone, &mut c.free, &mut c.nfree, &mut c.free_pfn, end, &mut c.s, kind);
+                    let from = if c.last { Targets::Any } else if c.how.whole() { Targets::Unhinted } else { Targets::Hinted };
+                    let want = todo.clamp(1, CLUSTER as u64) as usize;
+                    let mut dest = || self.compaction_alloc(c.zone, &mut c.fs, want, end, &mut c.s, kind, from).map(|t| crate::compact::Target::new(self, t, 0, kind));
+                    todo = todo.saturating_sub(1);
                     match m.migrate(p * PAGE, kind, owner, &mut dest) {
                         Moved::Moved => c.s.moved += 1,
                         Moved::Dropped => c.s.dropped += 1,
@@ -675,16 +810,17 @@ impl Buddy {
 
     /// Linux `compaction_alloc`: a free target frame of `kind`, from the free scanner's isolated frames (refilled
     /// from the top of the zone down, never at or below the migrate scanner).
+    /// `want`: the targets the caller can still use.
     #[allow(clippy::too_many_arguments)]
-    fn compaction_alloc(&self, zone: usize, free: &mut [u64; CLUSTER], nfree: &mut usize, free_pfn: &mut u64, low: u64, s: &mut CompactStats, kind: Kind) -> Option<u64> {
-        if *nfree == 0 {
-            self.isolate_free(zone, free, nfree, free_pfn, low, s);
+    fn compaction_alloc(&self, zone: usize, fs: &mut FreeScan, want: usize, low: u64, s: &mut CompactStats, kind: Kind, from: Targets) -> Option<u64> {
+        if fs.n == 0 {
+            self.isolate_free(zone, fs, want, low, s, from);
         }
-        if *nfree == 0 {
+        if fs.n == 0 {
             return None;
         }
-        *nfree -= 1;
-        let pfn = free[*nfree];
+        fs.n -= 1;
+        let pfn = fs.frames[fs.n];
         let r = self.region_of(pfn)?;
         let _moving = ksync::PreemptGuard::new();
         self.set_meta(r, pfn, Meta::new(State::Alloc, 0, kind as usize));
@@ -694,49 +830,74 @@ impl Buddy {
     }
 
     /// Linux `isolate_freepages` / `isolate_freepages_block`: free blocks below the pageblock order out of Movable
-    /// pageblocks from `free_pfn` down to the pageblock above `low` (the end of the chunk being cleared; a pageblock with a free pageblock-sized block is no target: Linux
-    /// `suitable_migration_target`), split into frames until `free` is full. Each block is taken under the zone
-    /// lock after the lock-free read saw it.
-    fn isolate_free(&self, zone: usize, free: &mut [u64; CLUSTER], nfree: &mut usize, free_pfn: &mut u64, low: u64, s: &mut CompactStats) {
+    /// pageblocks from `fs.pfn` down to the pageblock above `low` (the end of the chunk being cleared; a pageblock
+    /// with a free pageblock-sized block is no target: Linux `suitable_migration_target`), split into frames until
+    /// `want` are taken or `fs.left` frames were read. Each block is taken under the zone lock after the lock-free
+    /// read saw it. `from` says which pageblocks and what the skip hints count for (`Targets`).
+    fn isolate_free(&self, zone: usize, fs: &mut FreeScan, want: usize, low: u64, s: &mut CompactStats, from: Targets) {
         let floor = low.next_multiple_of(PAGEBLOCK_FRAMES);
-        while *nfree < CLUSTER {
-            let Some(r) = self.region_below(zone, *free_pfn) else { return };
-            let top = (*free_pfn).min(r.end);
+        let want = want.clamp(1, CLUSTER);
+        while fs.n < want && fs.left > 0 {
+            // A pageblock passed without a look inside costs one frame of the budget: the walk is bounded too.
+            fs.left -= 1;
+            let Some(r) = self.region_below(zone, fs.pfn) else { return };
+            let top = fs.pfn.min(r.end);
             let pb = (top - 1) & !(PAGEBLOCK_FRAMES - 1);
             if pb < floor || top <= r.start {
                 return;
             }
             let lo = pb.max(r.start);
-            if self.pb_type(r, lo) == MigrateType::Movable && !self.skip(r, lo) {
-                let mut p = lo;
-                let mut took = false;
-                while p < top && *nfree < CLUSTER {
+            let mt = self.pb_type(r, lo);
+            let target = match from {
+                Targets::Any => mt != MigrateType::HighAtomic,
+                Targets::Unhinted => mt == MigrateType::Movable,
+                Targets::Hinted => mt == MigrateType::Movable && !self.skip(r, lo),
+            };
+            // A pageblock that is free whole is no target by rule, not for want of free frames: it gets no hint
+            // (Linux skips it before `isolation_suitable`), or the hint would keep the scanner off it once it is in
+            // use and has holes.
+            if target && !self.in_free_pageblock(r, lo) {
+                // A step that stopped inside this pageblock left the frames below `resume` read.
+                let resumed = fs.resume > lo && fs.resume < top;
+                let mut p = if resumed { fs.resume } else { lo };
+                let mut took = resumed;
+                while p < top && fs.n < want && fs.left > 0 {
                     let m = self.get_meta(r, p);
                     s.free_scanned += 1;
+                    fs.left -= 1;
                     match m.state {
                         State::Free if m.order >= PAGEBLOCK_ORDER => break,
                         State::Free => {
-                            let n = self.take_free_block(r, p, m.order, &mut free[*nfree..]);
+                            let n = self.take_free_block(r, p, m.order, &mut fs.frames[fs.n..want]);
                             took |= n > 0;
-                            *nfree += n;
+                            fs.n += n;
                             s.isolated += n as u64;
-                            p += 1 << m.order;
+                            // Only the part taken is behind the scanner: the rest of the block is still free.
+                            p += if n > 0 { n as u64 } else { 1 << m.order };
                         }
                         State::Alloc => p += 1 << m.order,
                         _ => p += 1,
                     }
                 }
-                if *nfree >= CLUSTER && p < top {
-                    // Room ran out inside this pageblock: the next step goes on here.
-                    *free_pfn = top;
+                if (fs.n >= want || fs.left == 0) && p < top {
+                    // Enough targets, or the budget ran out, inside this pageblock: the next step goes on here.
+                    (fs.pfn, fs.resume) = (top, p);
                     return;
                 }
-                if !took {
+                if !took && from == Targets::Hinted {
                     self.set_skip(r, lo);
                 }
             }
-            *free_pfn = lo;
+            fs.at(lo);
         }
+    }
+
+    /// Whether the pageblock at `pb` lies in a free block of the pageblock order or more (a hint: no lock).
+    fn in_free_pageblock(&self, r: &Region, pb: u64) -> bool {
+        (PAGEBLOCK_ORDER..=MAX_ORDER).any(|o| {
+            let head = pb & !((1u64 << o) - 1);
+            r.holds(head, o) && self.get_meta(r, head) == Meta::new(State::Free, o, 0)
+        })
     }
 
     /// Takes the free block of `order` at `pfn` (if it still is one) or its first part that fits `room`; the rest
@@ -765,14 +926,14 @@ impl Buddy {
 
     /// Linux `release_free_list`: isolated targets not used go back.
     fn release_free(&self, c: &mut Control) {
-        for &pfn in &c.free[..c.nfree] {
+        for &pfn in &c.fs.frames[..c.fs.n] {
             self.free(pfn * PAGE, 0, Kind::Other);
         }
-        c.nfree = 0;
+        c.fs.n = 0;
     }
 
     /// Adds a finished run's counts to this allocator's and (boot allocator) the global ones.
-    fn count_run(&self, c: &Control, outcome: Option<bool>) {
+    pub(super) fn count_run(&self, c: &Control, outcome: Option<bool>) {
         let s = &c.s;
         let k = &self.compact_counts;
         let daemon = c.how.daemon();
@@ -850,11 +1011,17 @@ impl Buddy {
             let st = self.compact_zone(&mut c, DIRECT_SCAN);
             *grace = c.grace;
             made = st == Status::Success || self.zone_has_block(zone, order);
+            let mut last = Last::Failed;
+            if !made && st == Status::Complete {
+                last = self.compact_last(order, How::Direct, zone, grace, None);
+                made = last == Last::Made;
+            }
             if made {
                 self.defer_reset(zone, order);
-            } else if st == Status::Complete {
+            } else if st == Status::Complete && last == Last::Failed {
                 // Linux defers after a sync run whose scanners met (COMPACT_COMPLETE); a run stopped by the drop
-                // cap (Partial) or the scan budget (Continue) was still making progress and leaves the shift.
+                // cap (Partial) or a scan budget (Continue) leaves the shift: the next asker goes on where it
+                // stopped, and the askers together read the zone once before the scanners meet.
                 self.defer(zone, order);
             }
             ran = Some(c);
@@ -869,9 +1036,66 @@ impl Buddy {
         made
     }
 
-    /// Linux `kcompactd_do_work` for `order`: each zone that is neither deferred nor unsuitable, compacted in slices
-    /// of `SLICE` frames with `between` called after each (kcompactd yields there), until a block exists. True: a
-    /// free block of the order exists now.
+    /// W35 MM-2: the last try for a block of `order` in `zone`, after a run whose scanners met without one: one
+    /// more run from the zone's ends that reads no skip hints and takes its targets out of any pageblock but the
+    /// reserve's (Linux 7.x `compact_zone_order` at `MIN_COMPACT_PRIORITY`: `whole_zone`, `ignore_skip_hint`,
+    /// `ignore_block_suitable`). A migrator that copies needs free frames as targets, and the free scanner takes
+    /// them from Movable pageblocks only; where the free frames lie between kernel frames (a heap that grew and
+    /// shrank), a zone half free had no target at all, every run ended with its scanners met, and after six of
+    /// them compaction was deferred for the next 64 askers. Not for a migrator that drops: it needs no target.
+    /// `between`: a background run in slices (None: one direct run). The tries go round the zone: each goes on
+    /// where the one before stopped (re-reading the ends each time was most of the free scanner's work under
+    /// load). A try stopped by its budget has not failed, and nothing is deferred for it.
+    fn compact_last(&self, order: u32, how: How, zone: usize, grace: &mut crate::grace::WaitBudget, between: Option<&mut dyn FnMut()>) -> Last {
+        if self.with_migrator(|m| m.drops()) != Some(false) {
+            return Last::Failed;
+        }
+        let mut c = Control::new(Some(order), how, zone);
+        c.last = true;
+        c.grace = *grace;
+        let st = match between {
+            None => self.compact_zone(&mut c, DIRECT_SCAN),
+            Some(between) => {
+                // kcompactd's try that started at the ends only after its scanners met gets a whole pass from
+                // there: on a zone a pass covers it then reads all of it in this wake, as a try from the ends does.
+                match self.pass(&mut c, between) {
+                    Status::Continue if c.wrapped => self.pass(&mut c, between),
+                    st => st,
+                }
+            }
+        };
+        *grace = c.grace;
+        self.count_run(&c, None);
+        let made = st == Status::Success || self.zone_has_block(zone, order);
+        if self.global_reports {
+            cp::LAST_TRIES.inc();
+            if made {
+                cp::LAST_MADE.inc();
+            }
+        }
+        match st {
+            _ if made => Last::Made,
+            Status::Continue => Last::Stopped,
+            _ => Last::Failed,
+        }
+    }
+
+    /// One pass of a background run for an order: at most `PASS_SLICES` slices with `between` after each
+    /// (kcompactd yields there). `Continue`: the pass's budget is spent, the cached positions say where the next
+    /// one goes on.
+    fn pass(&self, c: &mut Control, between: &mut dyn FnMut()) -> Status {
+        for _ in 0..PASS_SLICES {
+            let st = self.compact_zone(c, SLICE);
+            if st != Status::Continue {
+                return st;
+            }
+            between();
+        }
+        Status::Continue
+    }
+
+    /// Linux `kcompactd_do_work` for `order`: each zone that is neither deferred nor unsuitable gets one pass
+    /// (`pass`), until a block exists. True: a free block of the order exists now.
     pub fn kcompactd_work(&self, order: u32, between: &mut dyn FnMut()) -> bool {
         let order = order.clamp(1, MAX_ORDER);
         self.compact_counts.add(6, 1);
@@ -892,13 +1116,7 @@ impl Buddy {
                 continue;
             }
             let mut c = Control::new(Some(order), How::Daemon, zone);
-            let st = loop {
-                let st = self.compact_zone(&mut c, SLICE);
-                if st != Status::Continue {
-                    break st;
-                }
-                between();
-            };
+            let st = self.pass(&mut c, between);
             self.count_run(&c, None);
             if st == Status::Success || self.zone_has_block(zone, order) {
                 self.defer_reset(zone, order);
@@ -908,10 +1126,18 @@ impl Buddy {
             // Linux: frames stranded on per-CPU lists may merge now; then defer as a sync run whose scanners met
             // does (a run stopped by the drop cap was making progress: no deferral).
             self.drain_all();
-            if st == Status::Complete {
-                self.defer(zone, order);
-            }
             made = self.zone_has_block(zone, order);
+            if st == Status::Complete {
+                let last = if made { Last::Failed } else { self.compact_last(order, How::Daemon, zone, &mut crate::grace::WaitBudget::default(), Some(&mut *between)) };
+                match last {
+                    Last::Made => {
+                        self.defer_reset(zone, order);
+                        made = true;
+                    }
+                    Last::Failed => self.defer(zone, order),
+                    Last::Stopped => {}
+                }
+            }
             if made {
                 break;
             }
@@ -933,12 +1159,18 @@ impl Buddy {
                 continue;
             }
             let mut c = Control::new(None, how, zone);
-            let st = loop {
-                let st = self.compact_zone(&mut c, SLICE);
-                if st != Status::Continue {
-                    break st;
+            // A proactive run is one pass: on 24 GiB a run from end to end read 12 million frame states, and with
+            // little free memory the score asks for one every period (Mini-PC 12.11.2026: twelve a minute).
+            let st = if how == How::Proactive {
+                self.pass(&mut c, between)
+            } else {
+                loop {
+                    let st = self.compact_zone(&mut c, SLICE);
+                    if st != Status::Continue {
+                        break st;
+                    }
+                    between();
                 }
-                between();
             };
             self.count_run(&c, None);
             let s = c.stats();

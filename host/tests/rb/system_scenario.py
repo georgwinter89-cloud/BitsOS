@@ -275,7 +275,7 @@ def main():
     need(True, "generation 4 came up and confirmed itself (OK)")
     t = system_list(c)
     need(gen_line(t, 4).split()[1] == "OK" and "RUNNING, NEXT START" in gen_line(t, 4) and gen_line(t, 3) == "", "system_list: 4 OK running and next, 3 gone", t)
-    # RB-11 (desk-minipc-w13 FAIL 5): named as reboot and hw_info name it.
+    # RB-11 (found on the Mini-PC, 23.10.): named as reboot and hw_info name it.
     need("running: generation 4 (newest, confirmed (OK) in this boot; bitsboot: NEWEST_TRY)" in t, "system_list: 4 confirmed in this boot", t)
 
     # 7. Back to 1 and to the newest at once.

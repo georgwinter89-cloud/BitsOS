@@ -12,6 +12,7 @@ pub const MADT: Signature = *b"APIC";
 pub const HPET: Signature = *b"HPET";
 pub const MCFG: Signature = *b"MCFG";
 pub const IVRS: Signature = *b"IVRS";
+pub const DMAR: Signature = *b"DMAR";
 pub const SRAT: Signature = *b"SRAT";
 pub const DSDT: Signature = *b"DSDT";
 pub const SSDT: Signature = *b"SSDT";

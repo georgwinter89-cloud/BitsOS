@@ -18,7 +18,8 @@
 //!   sends `MAX_ERRORS` bad messages in a row is closed;
 //! - trust follows the peer's uid until PM-1 decides who may register (B3): only uid 0 (services init starts)
 //!   gets its declared safety listed as `readOnlyHint`/`destructiveHint`, only uid 0 may take names starting
-//!   with `settings` (settingsd's), and services of other uids together get half of `LIST_BUDGET`.
+//!   with `settings` (settingsd's), and services of other uids together get half of `LIST_BUDGET`; only uid 0 may
+//!   mark a tool `local` (MC-L: offered on the local tools socket too).
 
 pub mod link;
 pub mod proto;
@@ -35,7 +36,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use ksync::{SpinLock, WaitQueue};
-pub use link::{Link, Listen, Peer};
+pub use link::{By, Link, Listen, Peer};
 
 /// Where services register (V2-PLAN §6).
 pub const SOCKET_PATH: &str = "/run/bitsos/mcp.sock";
@@ -76,7 +77,7 @@ static PID_ALIVE: SpinLock<Option<fn(u32) -> bool>> = SpinLock::named("mcp.svc.p
 
 /// Installs the process check the watchdog uses to drop a service whose process ended while another process
 /// (a forked child) still holds its socket: Linux gives EOF only when the last holder closes it
-/// (linux-6.6/net/unix/af_unix.c unix_release_sock).
+/// (linux-7.3.1/net/unix/af_unix.c:665 unix_release_sock).
 pub fn set_pid_alive(f: fn(u32) -> bool) {
     *PID_ALIVE.lock() = Some(f);
 }
@@ -99,8 +100,38 @@ pub struct SvcTool {
     pub pid: u32,
     /// The service's uid (SO_PEERCRED): only uid 0's declared safety is listed as MCP hints.
     pub uid: u32,
+    /// MC-L: the service marked it for the local tools socket (taken only from uid 0).
+    pub local: bool,
+    /// DB1: this call comes from a client with a live full-access grant (MC-10); the service is told so in the
+    /// call's `_meta` (`access: full`), so a tool that answers only under Georg's keyboard release can check it.
+    pub full_access: bool,
     listed: usize,
     service: Weak<Service>,
+}
+
+impl SvcTool {
+    /// Tests: a tool of no live service.
+    #[cfg(test)]
+    pub(crate) fn test(name: &str) -> SvcTool {
+        SvcTool { name: name.into(), description: String::new(), schema: String::from("{}"), safety: Safety::Read, owner: String::from("t"), pid: 0, uid: 0, local: false, full_access: false, listed: 0, service: Weak::new() }
+    }
+
+    /// The same tool for one call of a client with full access (the gate's `run` with `full`).
+    pub fn for_full_access(&self) -> SvcTool {
+        SvcTool {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            schema: self.schema.clone(),
+            safety: self.safety,
+            owner: self.owner.clone(),
+            pid: self.pid,
+            uid: self.uid,
+            local: self.local,
+            full_access: true,
+            listed: self.listed,
+            service: self.service.clone(),
+        }
+    }
 }
 
 /// One call waiting for its service's answer.
@@ -645,6 +676,10 @@ impl Registry {
         if !root && let Some(t) = tools.iter().find(|t| proto::root_only(&t.name)) {
             return Err(format!("{}: names starting with {} are for services of uid 0 (until PM decides who may register)", t.name, proto::ROOT_PREFIX));
         }
+        // MC-L: the local door trusts a mark as it trusts a safety class: only from services init starts.
+        if !root && let Some(t) = tools.iter().find(|t| t.local) {
+            return Err(format!("{}: local (the local tools socket) is for services of uid 0 (until PM decides who may register)", t.name));
+        }
         // Names are set only under `inner`; one service's name lock at a time (never two of the same class).
         let mut inner = self.inner.lock();
         let have = svc.name.lock().clone();
@@ -679,7 +714,7 @@ impl Registry {
         let mut names = Vec::with_capacity(tools.len());
         for t in tools {
             names.push(t.name.clone());
-            let st = SvcTool { name: t.name, description: t.description, schema: t.schema, safety: t.safety, owner: owner.clone(), pid: svc.peer.pid, uid: svc.peer.uid, listed: t.listed, service: weak.clone() };
+            let st = SvcTool { name: t.name, description: t.description, schema: t.schema, safety: t.safety, owner: owner.clone(), pid: svc.peer.pid, uid: svc.peer.uid, local: t.local, full_access: false, listed: t.listed, service: weak.clone() };
             inner.tools.insert(st.name.clone(), Arc::new(st));
         }
         inner.listed += added;
@@ -743,7 +778,9 @@ pub(crate) fn forward(t: &SvcTool, ctx: &ToolContext, args: &Json) -> ToolResult
     let timeout_ms = ctx.deadline_ns.saturating_sub(t0) / 1_000_000;
     let r = (|| {
         let write_by = ctx.deadline_ns.min(t0.saturating_add(REQUEST_WRITE_NS));
-        if let Err(why) = svc.send(&proto::call_line(id, &t.name, args, timeout_ms), write_by, &|| ctx.stop_requested()) {
+        // Only the local tools socket calls as a program; the network side's caller is the kernel.
+        let caller = (ctx.caller != policy::Subject::KERNEL).then_some((ctx.caller.pid, ctx.caller.uid));
+        if let Err(why) = svc.send(&proto::call_line(id, &t.name, args, timeout_ms, caller, t.full_access), write_by, &|| ctx.stop_requested()) {
             klog::event!(Warn, "mcp", "svc.send_failed", service = t.owner.as_str(), tool = t.name.as_str(), reason = why);
             // Closing a half-written line ends the reader at once: report why, not only that it is gone.
             return Err(if why == "the service ended" { gone() } else { ToolError::Failed(format!("{}: {why}", t.owner)) });

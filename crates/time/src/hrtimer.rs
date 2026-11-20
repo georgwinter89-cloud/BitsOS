@@ -19,7 +19,7 @@
 //!   scheduler keeps polling); only when that is full too is the arm lost, counted and logged by the poller.
 //! - Dropping the last clone marks the timer dead first: no arm (a late re-arm racing the drop, the adoption of
 //!   the polled queue) can queue it again, and the drop cancels until no queue and no other CPU holds it.
-//! - Until a CPU's LAPIC timer runs (early boot, CONFIG `hrtimer=poll`, a CPU whose timer failed its
+//! - Until a CPU's LAPIC timer runs (early boot, the test key `ktest_timer=poll`, a CPU whose timer failed its
 //!   calibration), timers armed there go to one **polled** queue that the `time.timers` poller fires (thread
 //!   context, as in G0). `interrupt_driven()` says when nothing depends on polling any more.
 //!

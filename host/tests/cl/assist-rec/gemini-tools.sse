@@ -1,0 +1,8 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Ich sehe nach "}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"und stelle es um."}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"settings_get","args":{"key":"theme.scale"}},"thoughtSignature":"recordedGeminiSignatureGet=="}]},"index":0}],"modelVersion":"gemini-rec","responseId":"rec"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"settings_set","args":{"key":"theme.scale","value":150}}}]},"index":0,"finishReason":"STOP"}],"modelVersion":"gemini-rec","responseId":"rec","usageMetadata":{"promptTokenCount":400,"candidatesTokenCount":20,"totalTokenCount":420}}
+

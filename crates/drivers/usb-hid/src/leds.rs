@@ -4,9 +4,9 @@
 //! changes on two CPUs can never leave an older state on the keyboards. It sends the output reports: on the
 //! interrupt OUT endpoint when the interface has one, else SET_REPORT(Output) on endpoint 0 (Linux
 //! `__usbhid_submit_report` with `hid_submit_out`/`hid_submit_ctrl`,
-//! linux-6.6/drivers/hid/usbhid/hid-core.c:335-420, 521-640). A new keyboard gets the current state at once
+//! linux-7.3.1/drivers/hid/usbhid/hid-core.c:338-422, 525-642). A new keyboard gets the current state at once
 //! (Linux sets the LEDs of boot keyboards at start: "some keyboards don't work until their LEDs have been
-//! set", hid-core.c:1179-1189). A report that fails is sent again on the worker's next tick (1 s), up to
+//! set", hid-core.c:1201-1212). A report that fails is sent again on the worker's next tick (1 s), up to
 //! `TRIES` times per lock state; then it waits for the next lock change.
 
 use crate::iface::HidIface;

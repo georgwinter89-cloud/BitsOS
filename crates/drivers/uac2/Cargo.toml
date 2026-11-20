@@ -1,0 +1,13 @@
+[package]
+name = "uac2"
+version = "0.1.0"
+edition = "2024"
+description = "USB Audio Class 2 descriptors, stream plan, clock and feature unit requests for the board jacks of the Gaming-PC; pure, used by usb-audio (owner: SN)"
+publish = false
+
+[features]
+# The board device's configuration descriptor for usb-audio's host tests.
+fixture = []
+
+[lints]
+workspace = true

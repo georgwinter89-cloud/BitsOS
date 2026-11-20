@@ -103,14 +103,16 @@ static void sync_call(int buf, const char *label, uint64_t flags) {
 static void errors(int dev) {
     int plain = memfd(4, 0);
     int write_sealed = memfd(4, F_SEAL_SHRINK | F_SEAL_WRITE);
+    int future_sealed = memfd(4, F_SEAL_SHRINK | F_SEAL_FUTURE_WRITE);
     int ok = memfd(4, F_SEAL_SHRINK);
     int p[2];
-    if (plain < 0 || write_sealed < 0 || ok < 0 || pipe(p) != 0) {
+    if (plain < 0 || write_sealed < 0 || future_sealed < 0 || ok < 0 || pipe(p) != 0) {
         printf("setup = -%s\n", en(errno));
         return;
     }
     res("create without F_SEAL_SHRINK", create(dev, plain, 0, 0, 4 * PAGE));
     res("create with F_SEAL_WRITE", create(dev, write_sealed, 0, 0, 4 * PAGE));
+    res("create with F_SEAL_FUTURE_WRITE", create(dev, future_sealed, 0, 0, 4 * PAGE));
     res("create offset unaligned", create(dev, ok, 0, 1, PAGE));
     res("create size unaligned", create(dev, ok, 0, 0, PAGE + 1));
     res("create size 0", create(dev, ok, 0, 0, 0));
@@ -124,9 +126,26 @@ static void errors(int dev) {
     res("create_list count 0", ioctl(dev, UDMABUF_CREATE_LIST, &l));
     close(plain);
     close(write_sealed);
+    close(future_sealed);
     close(ok);
     close(p[0]);
     close(p[1]);
+}
+
+/* A udmabuf holds the memfd's pages: a new F_SEAL_WRITE finds them pinned (EBUSY after memfd_wait_for_pins);
+ * once the buffer is closed it goes through. */
+static void seal_while_held(int dev) {
+    int m = memfd(2, F_SEAL_SHRINK);
+    long b = create(dev, m, 0, 0, 2 * PAGE);
+    if (res("create for the seal check", b) < 0) {
+        close(m);
+        return;
+    }
+    res("F_SEAL_WRITE while a udmabuf holds the pages", fcntl(m, F_ADD_SEALS, F_SEAL_WRITE));
+    close((int)b);
+    res("F_SEAL_WRITE after the udmabuf closed", fcntl(m, F_ADD_SEALS, F_SEAL_WRITE));
+    res("create with the new F_SEAL_WRITE", create(dev, m, 0, 0, 2 * PAGE));
+    close(m);
 }
 
 static void file_calls(int buf) {
@@ -276,8 +295,10 @@ int main(int argc, char **argv) {
     }
     struct stat st;
     printf("udmabuf is a char device = %s\n", fstat(dev, &st) == 0 && S_ISCHR(st.st_mode) ? "yes" : "no");
-    if (!maps)
+    if (!maps) {
         errors(dev);
+        seal_while_held(dev);
+    }
     int m = memfd(4, F_SEAL_SHRINK);
     int buf = (int)create(dev, m, 0, 0, 4 * PAGE);
     if (res("create", buf) < 0)

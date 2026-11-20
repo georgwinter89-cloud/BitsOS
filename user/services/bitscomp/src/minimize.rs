@@ -76,6 +76,8 @@ impl App {
             // The keyboard focus moves in this pass, so no key goes to the hidden window.
             self.apply_layout();
             self.motion(self.now_ms());
+            // GM-6b: a game minimised on Sofa (by itself or by `ctl`) leaves the pad to the start screen.
+            self.sofa_window_gone();
         }
         self.chrome_dirty();
         true

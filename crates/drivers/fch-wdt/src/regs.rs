@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-/// The FCH's ACPI MMIO block (`EFCH_PM_ACPI_MMIO_ADDR`, linux-6.6/drivers/watchdog/sp5100_tco.h:85).
+/// The FCH's ACPI MMIO block (`EFCH_PM_ACPI_MMIO_ADDR`, linux-7.3.1/drivers/watchdog/sp5100_tco.h:85).
 pub const ACPI_MMIO: u64 = 0xFED8_0000;
 /// PM registers inside it (`V1:hw/watchdog.asm:15`, sp5100_tco.h:86).
 pub const PM_OFF: usize = 0x300;
@@ -109,8 +109,8 @@ impl Regs for Mmio {
 /// runs longer than its count without a kick (`would_fire`, with the test's clock).
 ///
 /// RB-17: the count register is two things, as on the Mini-PC: a write sets the value a kick loads, a read
-/// returns the counter (`tco_timer_get_timeleft` reads the time left from it, linux-6.6/drivers/watchdog/
-/// sp5100_tco.c:160). The counter takes the written value only at a kick of a running chip, so a stopped chip
+/// returns the counter (`tco_timer_get_timeleft` reads the time left from it, linux-7.3.1/drivers/watchdog/
+/// sp5100_tco.c:163). The counter takes the written value only at a kick of a running chip, so a stopped chip
 /// keeps reading what it had: after a Reload the Mini-PC read the crumb of the watchdog's own Quiesce, not the two
 /// crumbs written after its stop (desk 28.10.).
 pub struct Fake {

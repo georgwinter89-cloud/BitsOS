@@ -1,7 +1,6 @@
-//! The HUD kit at the cheap effect level (DS-2, plan/notes/wy-design-v2-scout.md §3): what the design draws with
-//! blur and live layers, drawn once into bitscomp's own cached images. Glass is a translucent fill over the baked
-//! wallpaper (behind a panel lies the still wallpaper, so a live blur would change nothing visible) and a
-//! precomputed solid blend where a panel lies over windows; the HUD corner brackets; box shadows from a cached
+//! The HUD kit's images (DS-2, plan/spec/desktop-v2/INVENTORY.md §1): what bitscomp draws once into its own cached
+//! images, under the shaders' blur, shadows and glows (`fx`). Glass is a translucent fill (the blur under it is the
+//! shaders'); the HUD corner brackets; box shadows from a cached
 //! nine-patch coverage sprite (drawn only outside the box, as CSS does); the soft glow is the same sprite in the
 //! accent. Sizes are board px (`Theme::b`, 4/3 on 2560x1440).
 
@@ -28,30 +27,19 @@ fn glass_parts(t: &Theme, g: Glass) -> (Rgba, f32) {
     }
 }
 
-/// The translucent fill over the wallpaper (premultiplied).
+/// The translucent fill over the wallpaper and over windows alike (premultiplied; WY-19a: the blur under it).
 pub fn glass(t: &Theme, g: Glass) -> Rgba {
     let (c, k) = glass_parts(t, g);
     alpha(c, k)
 }
 
-/// The same glass as an opaque colour, for a panel over windows (a revealed bar): the blend over the ground.
-pub fn glass_solid(t: &Theme, g: Glass) -> Rgba {
-    let (c, k) = glass_parts(t, g);
-    let mix = |i: usize| c[i] * k + t.bg[i] * (1.0 - k);
-    [mix(0), mix(1), mix(2), 1.0]
-}
 
-/// The glass for a panel: translucent over the wallpaper, solid over windows.
-pub fn glass_for(t: &Theme, g: Glass, over_windows: bool) -> Rgba {
-    // WY-19a: the gpu level blurs what lies under it, so the panel stays glass over windows too.
-    if over_windows && !t.effects_gpu { glass_solid(t, g) } else { glass(t, g) }
-}
 
 /// How far the brackets reach outside their panel (board px): the margin an image needs around a bracketed panel.
 pub const BRACKET_OUT: f32 = 7.0;
 
 /// The brackets' colour: the accent at 85 % (dark) / 70 % (light, Hell.dc.html), raised to 85 % by the light pass
-/// (plan/notes/ds-DS-2.md: 70 % gave 2.9:1 on the sage grey, under the 3:1 of a graphic; 85 % gives 3.8:1).
+/// (plan/spec/desktop.md §0a: 70 % gave 2.9:1 on the sage grey, under the 3:1 of a graphic; 85 % gives 3.8:1).
 pub fn bracket_colour(t: &Theme) -> Rgba {
     alpha(t.accent, 0.85)
 }
@@ -226,20 +214,6 @@ pub fn shadow(c: &mut Canvas, b: Box2, r: f32, s: &Shadow, t: &Theme) {
     }
 }
 
-/// A glass panel's shadow in its image: only at the cheap level, the gpu level draws it as `fx::Kind::Shadow`.
-pub fn panel_shadow(c: &mut Canvas, b: Box2, r: f32, s: &Shadow, t: &Theme) {
-    if !t.effects_gpu {
-        shadow(c, b, r, s, t);
-    }
-}
-
-/// A lit panel's glow in its image, likewise.
-pub fn panel_glow(c: &mut Canvas, b: Box2, r: f32, t: &Theme) {
-    if !t.effects_gpu {
-        glow_soft(c, b, r, t);
-    }
-}
-
 /// The design's soft glow (`glowSoft`: 0 0 40px accent 22 % at theme.glow 60) around a lit panel.
 pub fn glow_soft(c: &mut Canvas, b: Box2, r: f32, t: &Theme) {
     // t.glow carries theme.glow's strength (18 % dark at the default); 22 % is the design's value at it.
@@ -251,12 +225,8 @@ pub fn glow_soft(c: &mut Canvas, b: Box2, r: f32, t: &Theme) {
 mod tests {
     use super::*;
 
-    fn rgb(p: u32) -> (u32, u32, u32) {
-        ((p >> 16) & 255, (p >> 8) & 255, p & 255)
-    }
-
     #[test]
-    fn glass_is_translucent_and_its_solid_twin_is_the_blend_over_the_ground() {
+    fn glass_is_translucent() {
         for mode in ["dark", "light"] {
             let mut v = crate::settings::Values::default();
             v.set("theme.mode", mode);
@@ -264,15 +234,6 @@ mod tests {
             for g in [Glass::Bar, Glass::Card] {
                 let a = glass(&t, g)[3];
                 assert!(a > 0.5 && a < 0.8, "{mode} {g:?}: alpha {a}");
-                let mut c = Canvas::new(1, 1);
-                c.fill(0, 0, 1, 1, t.bg);
-                c.fill(0, 0, 1, 1, glass(&t, g));
-                let mut d = Canvas::new(1, 1);
-                d.fill(0, 0, 1, 1, glass_solid(&t, g));
-                let (p, q) = (rgb(c.pixel(0, 0)), rgb(d.pixel(0, 0)));
-                let near = |a: u32, b: u32| a.abs_diff(b) <= 2;
-                assert!(near(p.0, q.0) && near(p.1, q.1) && near(p.2, q.2), "{mode} {g:?}: {p:?} vs {q:?}");
-                assert_eq!(d.pixel(0, 0) >> 24, 255);
             }
         }
     }

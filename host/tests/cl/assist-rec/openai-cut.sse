@@ -1,0 +1,5 @@
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chunk","created":1762860000,"model":"gpt-rec","choices":[{"index":0,"delta":{"content":"Dieser Satz wird mitten"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rec","object":"chat.completion.chu

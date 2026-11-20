@@ -94,11 +94,27 @@ impl Metrics {
             Sensor::GpuTemp => Some(self.gfx_temp_centi / 100 * 1000),
             Sensor::GpuLoad => Some(self.gfx_activity_centi / 100),
             Sensor::GpuAvgPower => Some(self.avg_socket_mw / 1000),
+            // CurrentSocketPower (linux-7.3.1/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_4_ppt.c:605).
+            Sensor::GpuInputPower => Some(self.socket_mw / 1000),
             Sensor::Vddnb => Some(self.soc_mv),
             Sensor::Vddgfx => Some(self.vdd_mv),
             Sensor::StablePstateSclk | Sensor::StablePstateMclk => Some(0),
             Sensor::PeakPstateSclk | Sensor::PeakPstateMclk => None,
         }
+    }
+}
+
+/// SYS-K: the hwmon/sysfs reading (linux-7.3.1/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_4_ppt.c:319-362): edge in whole
+/// degrees as Linux truncates it, power in the table's mW.
+pub fn pm_sample(m: &Metrics) -> drm::pm::PmSample {
+    drm::pm::PmSample {
+        gfx_mhz: Some(m.gfx_mhz),
+        edge_mc: Some(m.gfx_temp_centi / 100 * 1000),
+        busy_pct: Some(m.gfx_activity_centi / 100),
+        avg_mw: Some(m.avg_socket_mw),
+        cur_mw: Some(m.socket_mw),
+        vddgfx_mv: Some(m.vdd_mv),
+        vddnb_mv: Some(m.soc_mv),
     }
 }
 

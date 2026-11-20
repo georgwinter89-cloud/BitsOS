@@ -7,6 +7,8 @@
 //! apps/<name>/id              the program's ProgramId (never reused)
 //! apps/.store/<sha256>[.x]    content store: version files are hard links to these (.x = executable)
 //! apps/.trash/                removals in progress (finished by `recover`)
+//! apps/.pkgs/<pkg>/<version>/ one pacman package, unpacked once (PK-6d): hard links into .store, read-only;
+//!                             `.meta/` keeps its metadata and file list; gone once no version `[[uses]]` it
 //! apps/.lock, apps/.next-id   one changing command at a time; the next ProgramId
 //! data/appdata/<name>/        the program's data folder
 //! ```
@@ -30,6 +32,8 @@ pub struct Store {
     pub root: PathBuf,
     pub apps: PathBuf,
     pub data: PathBuf,
+    /// PK-0: init's word where `apps/` lives (`run/bitsos/apps-state` under the root).
+    pub apps_state: PathBuf,
     /// settingsd, permd, MC-7 (PK-2): what install registers and removal takes back.
     pub hooks: Hooks,
 }
@@ -38,7 +42,13 @@ pub struct Lock(#[allow(dead_code)] File);
 
 impl Store {
     pub fn new(root: &Path) -> Store {
-        Store { root: root.to_path_buf(), apps: root.join("apps"), data: root.join("data/appdata"), hooks: Hooks::for_root(root) }
+        Store {
+            root: root.to_path_buf(),
+            apps: root.join("apps"),
+            data: root.join("data/appdata"),
+            apps_state: root.join("run/bitsos/apps-state"),
+            hooks: Hooks::for_root(root),
+        }
     }
     pub fn pkg(&self, name: &str) -> PathBuf {
         self.apps.join(name)
@@ -52,6 +62,13 @@ impl Store {
     pub fn trash(&self) -> PathBuf {
         self.apps.join(".trash")
     }
+    /// PK-6d: the unpacked pacman packages (D8).
+    pub fn pkgs(&self) -> PathBuf {
+        self.apps.join(".pkgs")
+    }
+    pub fn pkgs_entry(&self, pkg: &str, v: &str) -> PathBuf {
+        self.pkgs().join(pkg).join(v)
+    }
     pub fn data_trash(&self) -> PathBuf {
         self.data.join(".trash")
     }
@@ -62,8 +79,27 @@ impl Store {
         self.content().join(if exec { format!("{sha}.x") } else { sha.to_string() })
     }
 
+    /// init's line for `apps/` (PK-0: `data: ...`, `tmpfs: ...`, `waiting: ...`); None without one (a scratch
+    /// root, or an init before PK-0).
+    pub fn apps_state(&self) -> Option<String> {
+        let t = fs::read(&self.apps_state).ok()?;
+        let t = String::from_utf8_lossy(&t[..t.len().min(4096)]).into_owned();
+        Some(t.lines().next().unwrap_or("").trim().to_string())
+    }
+
+    /// While init has not settled `apps/` yet, a change would land in the tmpfs the bind is about to cover.
+    fn ready(&self) -> Result<(), String> {
+        match self.apps_state() {
+            Some(l) if l.starts_with("waiting") => {
+                eprintln!("bitspkg: event=store.not_ready state=\"{l}\"");
+                Err(format!("/apps ist noch nicht bereit: das Datenlaufwerk wird noch eingebunden ({l}); bitte gleich noch einmal versuchen"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn ensure_layout(&self) -> Result<(), String> {
-        for d in [&self.apps, &self.content(), &self.trash(), &self.data] {
+        for d in [&self.apps, &self.content(), &self.trash(), &self.pkgs(), &self.data] {
             if !d.is_dir() {
                 fs::create_dir_all(d).map_err(|e| err(d, e))?;
                 // First creation: make the new names durable up to the root (a cut must not lose `apps/`).
@@ -77,6 +113,7 @@ impl Store {
 
     /// Takes the store lock (flock, so a killed holder never leaves it taken) and finishes what a cut left.
     pub fn lock(&self) -> Result<Lock, String> {
+        self.ready()?;
         self.ensure_layout()?;
         let p = self.apps.join(".lock");
         let f = File::options().create(true).truncate(false).write(true).open(&p).map_err(|e| err(&p, e))?;
@@ -165,6 +202,16 @@ impl Store {
         for n in list_names(&self.apps, |n, ft| !ft.is_dir() && n.starts_with('.') && n.ends_with(".new"))? {
             fsx::remove_tree(&self.apps.join(n))?;
         }
+        // PK-6d: half-unpacked package entries (`.pkgs/<pkg>/.new-<version>`) and folders left empty by them.
+        for p in list_names(&self.pkgs(), |n, ft| ft.is_dir() && !n.starts_with('.'))? {
+            let d = self.pkgs().join(&p);
+            for n in list_names(&d, |n, _| n.starts_with(".new-"))? {
+                fsx::remove_tree(&d.join(n))?;
+            }
+            if list_names(&d, |_, _| true)?.is_empty() {
+                fsx::remove_tree(&d)?;
+            }
+        }
         Ok(())
     }
 
@@ -228,13 +275,61 @@ impl Store {
                 }
             }
         }
+        // PK-6d: an entry's files are store content as long as the entry exists (gc_pkgs removes it first).
+        for (p, v) in crate::repo::pkgs::entries(self)? {
+            for f in crate::repo::pkgs::read_list(self, &p, &v)?.files {
+                used.insert(content_name(&f.sha256, f.exec));
+            }
+        }
         Ok(used)
+    }
+
+    /// The `.pkgs` entries some installed version's manifest names in `[[uses]]` (PK-6d).
+    pub fn pkgs_used(&self) -> Result<HashSet<(String, String)>, String> {
+        let mut used = HashSet::new();
+        for name in self.packages()? {
+            for v in self.versions(&name)? {
+                for u in self.manifest(&name, &v)?.uses {
+                    used.insert((u.pkg, u.version));
+                }
+            }
+        }
+        Ok(used)
+    }
+
+    /// Removes `.pkgs` entries no version uses (plan 1.9: after a removal they go, their store files with them).
+    /// When a manifest cannot be read, nothing is removed (event `gc.partial`).
+    pub fn gc_pkgs(&self) -> Result<usize, String> {
+        let used = match self.pkgs_used() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("bitspkg: event=gc.partial reason=\"{e}\" (.pkgs entries are kept)");
+                return Ok(0);
+            }
+        };
+        let mut gone = 0;
+        for (p, v) in crate::repo::pkgs::entries(self)? {
+            if used.contains(&(p.clone(), v.clone())) {
+                continue;
+            }
+            let t = self.trash_name("pkgs", &p);
+            fsx::move_dir(&self.pkgs_entry(&p, &v), &t)?;
+            fsx::remove_tree(&t)?;
+            eprintln!("bitspkg: event=pkg.pkgs.gone pkg={p} version={v}");
+            gone += 1;
+            let d = self.pkgs().join(&p);
+            if list_names(&d, |_, _| true)?.is_empty() {
+                fsx::remove_tree(&d)?;
+            }
+        }
+        Ok(gone)
     }
 
     /// Removes store files no version uses: not named by any manifest, or with no hard link left (after a copy
     /// fallback, or a cut between storing and linking). When a manifest cannot be read, only files without any
     /// link go (they belong to no version whatever the manifests say).
     pub fn gc_content(&self) -> Result<u64, String> {
+        self.gc_pkgs()?;
         let used = match self.referenced() {
             Ok(u) => Some(u),
             Err(e) => {

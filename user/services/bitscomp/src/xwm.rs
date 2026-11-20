@@ -70,7 +70,7 @@ pub struct Xwm {
     xfixes: u8,
     pub xfixes_event: u8,
     xres: u8,
-    /// WY-3b: the X server offers DRI3: glamor came up (Xwayland falls back to software on its own otherwise).
+    /// WY-3b: the X server offers DRI3: its glamor draws on the GPU.
     pub dri3: bool,
     pub client: Client,
     wins: HashMap<u32, Rc<XState>>,
@@ -511,10 +511,14 @@ impl Xwm {
             crate::ctl::win_id(&win)
         );
         app.place_new(win.clone());
+        app.habit_initial(&win);
+        app.min_close_answer(&win);
         app.layout_dirty = true;
         if x.wants_full.get() {
             app.window_fullscreen(&win, true);
         }
+        app.sofa_window_new(&win);
+        app.play_mapped(&win);
         if x.pid.get() > 0 {
             app.x11_mapped(x.pid.get());
         }

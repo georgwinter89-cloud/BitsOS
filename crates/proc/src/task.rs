@@ -73,6 +73,12 @@ pub struct Thread {
     own_fs: SpinLock<Option<Arc<vfs::FsState>>>,
     /// SX-IPC: its SEM_UNDO list and the namespaces it made segments in.
     ipc: crate::ipc::ThreadIpc,
+    /// FSR: its place on the count of its image's fd table (`vfs::fpos::FdUse`): a table one thread uses lets
+    /// read, write and lseek skip a regular file's position lock (Linux `fdget_pos`). Taken before the thread
+    /// runs, moved by execve to a new table, given back when it ends.
+    fd_use: SpinLock<Option<vfs::fpos::FdUse>>,
+    /// L7-PROC: the pidfs inode number of this thread's pid (0 until a thread pidfd asks; `pidfd::ino_of`).
+    pub(crate) pidfs_ino: AtomicU64,
 }
 
 /// PF-7: a syscall's view of the calling thread's cwd/root/umask (`vfs::sys::Sys::fs`): taken from the thread (and
@@ -120,7 +126,19 @@ impl Thread {
             attrs_ready: Completion::new(),
             own_fs: SpinLock::named("proc.ownfs", None),
             ipc: crate::ipc::ThreadIpc::new(),
+            fd_use: SpinLock::named("proc.fduse", None),
+            pidfs_ino: AtomicU64::new(0),
         })
+    }
+    /// FSR: from now on this thread counts on `fds` (and no longer on the table it counted on before).
+    pub(crate) fn count_on(&self, fds: &vfs::fd::FdTable) {
+        let old = self.fd_use.lock().replace(vfs::fpos::FdUse::new(fds));
+        drop(old);
+    }
+    /// FSR: the thread ended (or never ran): its table has one user less.
+    pub(crate) fn uncount(&self) {
+        let old = self.fd_use.lock().take();
+        drop(old);
     }
     /// SX-IPC: what this thread holds of SysV IPC.
     pub fn ipc(&self) -> &crate::ipc::ThreadIpc {
@@ -215,9 +233,12 @@ impl Thread {
     pub(crate) fn take_fault_msg(&self) -> Option<crate::deliver::FaultNote> {
         self.fault_msg.lock().take()
     }
-    /// A non-leader's execve takes the leader's id (linux-6.6/fs/exec.c `exchange_tids`).
+    /// A non-leader's execve takes the leader's id (linux-7.3.1/fs/exec.c:1010 `exchange_tids`).
     pub(crate) fn set_tid(&self, tid: u32) {
         self.tid.store(tid, Ordering::Release);
+        if let Some(k) = self.kt.get() {
+            k.set_user_ids(self.group.tgid, tid);
+        }
     }
     pub fn kthread(&self) -> u64 {
         self.kthread.load(Ordering::Acquire)
@@ -231,7 +252,7 @@ impl Thread {
     pub fn is_leader(&self) -> bool {
         self.tid() == self.group.tgid
     }
-    pub(crate) fn exit_requested(&self) -> bool {
+    pub fn exit_requested(&self) -> bool {
         self.exit_req.load(Ordering::Acquire)
     }
     /// Ends this thread alone (exit(2)); the loop stops after the syscall.
@@ -239,7 +260,8 @@ impl Thread {
         self.code.store(code & 0xFF, Ordering::Release);
         self.exit_req.store(true, Ordering::Release);
     }
-    pub(crate) fn code(&self) -> u32 {
+    /// Its exit(2) code (the low 8 bits; 0 for a thread a group exit or signal ended).
+    pub fn code(&self) -> u32 {
         self.code.load(Ordering::Acquire)
     }
     /// A sibling's execve ends it: interrupt it wherever it is.
@@ -405,6 +427,8 @@ pub(crate) fn release_tid_words(t: &Thread, p: &Arc<Process>, others_see_it: boo
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(p: &Arc<Process>, t: Arc<Thread>, ctx: UserContext, fpu: Option<RegDump>, segs: Option<hal::entry::segs::Snapshot>, child_settid: u64, attrs_from: u64, creator: Option<&Thread>) -> Result<(), SpawnError> {
     p.group().add_thread(&t, creator)?;
+    // Before the thread runs and before its creator returns: no call of either sees the table as one thread's.
+    t.count_on(&p.fds);
     register(&t);
     let tc = t.clone();
     // SC-7a: the thread joins its process's group (the tgid), so an Interactive grant to the process (the
@@ -429,6 +453,7 @@ pub(crate) fn start(p: &Arc<Process>, t: Arc<Thread>, ctx: UserContext, fpu: Opt
         Err(_) => {
             unregister(&t);
             p.group().remove_thread(&t);
+            t.uncount();
             Err(SpawnError::NoMemory)
         }
     }
@@ -441,6 +466,10 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, segs: Option<
         let _ = t.attrs_ready.wait_timeout(1_000_000_000);
     }
     t.set_kthread(k, sched::current_thread());
+    // SELFOPT-1: the ids a sample names this thread by (read lock-free in the sampling interrupt).
+    if let Some(s) = t.sched_thread() {
+        s.set_user_ids(t.group.tgid, t.tid());
+    }
     tasks_insert(k, &t);
     t.group.note_kthread(k);
     // Held at spawn: wait for `release` (or a kill). A Normal-class thread may wait for that (B4).
@@ -482,7 +511,11 @@ fn run(t: Arc<Thread>, mut ctx: UserContext, fpu: Option<RegDump>, segs: Option<
         #[cfg(bitsos_fd_measure)]
         hal::entry::steps::mark(hal::entry::steps::EXEC);
         match t.sched_thread() {
-            Some(k) => sched::cputime::user_exit_of(k),
+            Some(k) => {
+                sched::cputime::user_exit_of(k);
+                // SELFOPT-1: the program's part of a sample taken while this thread runs kernel code.
+                k.note_user_regs(ctx.regs.rip, ctx.regs.rbp, ctx.regs.rsp);
+            }
             None => sched::cputime::user_exit(),
         }
         #[cfg(bitsos_fd_measure)]

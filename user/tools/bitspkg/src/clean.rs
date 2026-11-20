@@ -57,7 +57,7 @@ done
 "#;
 
 /// The uid the program runs as when bitspkg runs as root (Brave's, BR-2).
-const PROGRAM_UID: u32 = 1000;
+pub const PROGRAM_UID: u32 = 1000;
 
 /// A stand-in for permd (rules) or MC-7 (actions): what install registered, per package.
 pub struct Ledger {
@@ -177,7 +177,7 @@ pub fn round_trip(work: &Path) -> Result<Vec<String>, String> {
     st.hooks = hooks("boot1.sock");
     let s1 = Settings { socket: run.join("boot1.sock") };
     // A system with a history: a value and a journal entry of its own (with an empty journal settingsd leaves an
-    // empty journal.log behind after a forget: change request to CL, plan/notes/pk-PK-2.md).
+    // empty journal.log behind after a forget: a change request to CL).
     ask(&s1, Json::obj().with("op", "set").with("key", "theme.accent").with("value", "#123456").with("source", "bitspkg-selftest"))?;
     // The store exists before (its lock, the ProgramId counter after a first package): only `clean` is new.
     crate::verify::list(&st)?;

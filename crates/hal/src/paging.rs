@@ -11,8 +11,10 @@
 //! their CPU mask and generation, PCID per CPU, lazy TLB, and every unmap or protection change here shoots
 //! the old translations down on the other CPUs before frames or tables are handed back.
 
+mod gather;
 mod kernel;
 mod kva;
+mod migrate;
 pub mod probe;
 mod retype;
 pub mod tlb;
@@ -22,11 +24,13 @@ mod walk;
 /// Frames one unmap round gathers at most (Linux's mmu_gather bound; tests derive round counts from it).
 pub use tlb_plan::GATHER_MAX;
 
+pub use gather::set_batch_frames;
 pub use kernel::{
     adopt_leaves, device_mapper, flush_all, free_unused_root, kernel_image, kernel_root, map_device_window, map_kernel,
-    new_kernel_root, set_device_mapper, set_table_frames, switch_kernel_root, table_frames_ready, unmap_kernel, DeviceMapper,
+    new_kernel_root, set_device_mapper, set_table_frames, switch_kernel_root, table_frames_ready, unmap_kernel, unmap_kernel_frames, DeviceMapper,
     DeviceWindow, SwitchError, VmapError, KERNEL_HALF,
 };
+pub use migrate::{freeze_user_leaf, migration_entry, thaw_user_leaf, MIGRATION};
 pub use kva::{kernel_va_ready, release_kernel_va, reserve_kernel_va, set_kernel_va, KernelVaRelease, KernelVaReserve};
 pub use retype::{set_direct_map_cache, RetypeStats};
 pub use tlb::{activate_lazy_kernel, home_root, thread_root, Outcome};
@@ -273,7 +277,7 @@ pub fn huge_slot_free(root: u64, virt: u64) -> bool {
 /// MM-13: splits the 2 MiB user leaf at `virt` (2 MiB aligned) of `root` into 512 4 KiB entries in the page
 /// table `pt` (a frame the caller owns and hands over on success; its old content does not matter). Same frames,
 /// rights, memory type and accessed/dirty bits. Linux's order (`__split_huge_pmd_locked`,
-/// linux-6.6/mm/huge_memory.c:2066, `pmdp_invalidate`): the 2 MiB entry is taken out and shot down first, so no
+/// linux-7.3.1/mm/huge_memory.c:3323, `pmdp_invalidate`): the 2 MiB entry is taken out and shot down first, so no
 /// CPU ever holds a 2 MiB and a 4 KiB translation of one address (the CPUs' large-page TLB errata), then the
 /// table goes in; a thread that touches the range meanwhile takes a fault that waits for the caller's lock and
 /// finds the entries. Lockless software walkers (`translate` from ksync's futex word access or the panic
@@ -361,18 +365,18 @@ pub fn unmap_4k(root: u64, virt: u64) -> Option<u64> {
 }
 
 /// Unmaps the 4 KiB pages of [virt, virt + len) in the kernel half of `root` (tables stay), shoots them down on
-/// every CPU in one round (or one per `GATHER` pages), then hands each frame to `free`; frames of a round a CPU
+/// every CPU in one round (or one per `GATHER_MAX` pages, or per gather batch the frame allocator could not give), then hands each frame to `free`; frames of a round a CPU
 /// did not confirm stay out of use (counted in `tlb::stats().kept_pages`). Returns how many pages were mapped.
-/// For SC's `KernelStack::drop`: one shootdown per stack instead of one per page, no allocation for a stack.
+/// One shootdown per block instead of one per page (mm's scattered heap blocks).
 /// Only the vmap range is accepted (as in `unmap_4k`); anything else returns 0 and changes nothing.
 pub fn unmap_kernel_pages(root: u64, virt: u64, len: u64, free: &mut dyn FnMut(u64)) -> u64 {
     let Some(end) = virt.checked_add(len) else { return 0 };
     if virt & 0xFFF != 0 || len & 0xFFF != 0 || !kernel::in_vmap(virt, len) {
         return 0;
     }
-    let mut g = Gather::for_pages(len / 4096);
-    let mut give = |g: &mut Gather, ok: bool| {
-        g.drain(&mut |(f, _, _)| {
+    let mut g = gather::List::new(GATHER_MAX);
+    let mut give = |g: &mut gather::List, ok: bool| {
+        g.drain(&mut |f, _, _| {
             if ok {
                 free(f)
             } else {
@@ -386,14 +390,14 @@ pub fn unmap_kernel_pages(root: u64, virt: u64, len: u64, free: &mut dyn FnMut(u
             // SAFETY: leaf_ptr returns a pointer into a live page table.
             let e = unsafe { p.read_volatile() };
             if e & PageFlags::PRESENT != 0 {
-                if g.full() {
+                if !g.room() {
                     let ok = tlb::flush_kernel(lo, va, false).confirmed();
                     give(&mut g, ok);
                     lo = va;
                 }
                 // SAFETY: as above.
                 unsafe { p.write_volatile(0) };
-                g.push((e & ADDR_MASK, PageSize::Size4K, 0));
+                g.push(e & ADDR_MASK, PageSize::Size4K, 0);
                 n += 1;
             }
         }
@@ -402,6 +406,30 @@ pub fn unmap_kernel_pages(root: u64, virt: u64, len: u64, free: &mut dyn FnMut(u
     if n > 0 {
         let ok = tlb::flush_kernel(lo, end, false).confirmed();
         give(&mut g, ok);
+    }
+    n
+}
+
+/// Clears the present 4 KiB entries of [virt, virt + len) in the kernel half of `root` (tables stay) and returns
+/// how many there were, without a shootdown: the caller clears several ranges, flushes once over all of them
+/// (`tlb::flush_kernel`) and keeps their frames out of use until every CPU confirmed that round. For SC's stack
+/// reaper: one round per pass, not one per stack. Only the vmap range is accepted (as in `unmap_kernel_pages`).
+pub fn clear_kernel_pages(root: u64, virt: u64, len: u64) -> u64 {
+    let Some(end) = virt.checked_add(len) else { return 0 };
+    if virt & 0xFFF != 0 || len & 0xFFF != 0 || !kernel::in_vmap(virt, len) {
+        return 0;
+    }
+    let mut n = 0;
+    for va in (virt..end).step_by(4096) {
+        if let Some(p) = leaf_ptr(root, va) {
+            // SAFETY: leaf_ptr returns a pointer into a live page table.
+            let e = unsafe { p.read_volatile() };
+            if e & PageFlags::PRESENT != 0 {
+                // SAFETY: as above.
+                unsafe { p.write_volatile(0) };
+                n += 1;
+            }
+        }
     }
     n
 }
@@ -435,59 +463,6 @@ pub fn for_each_leaf(root: u64, lo: u64, hi: u64, f: &mut dyn FnMut(Unmapped)) {
     walk::for_each_leaf(&Reader, root, lo, hi, f)
 }
 
-/// The growth step of the frame list a user unmap gathers before it shoots them down and hands them back: the
-/// list grows by this much while the heap allows, up to `tlb_plan::GATHER_MAX` frames (Linux's mmu_gather
-/// bound); only a larger range, or no heap, takes several rounds (MM-tlb2: an 8 MiB munmap was 5 rounds, each a
-/// whole-context flush on every other CPU of the mask). Without heap for the list, `GATHER_STACK` on the stack.
-const GATHER: usize = 512;
-const GATHER_STACK: usize = 32;
-
-/// A gathered frame: its address, its size and the caller's tag (`UserGather::unmap`).
-type Gathered = (u64, PageSize, u32);
-
-struct Gather {
-    heap: alloc::vec::Vec<Gathered>,
-    stack: [Gathered; GATHER_STACK],
-    n: usize,
-    on_heap: bool,
-}
-
-impl Gather {
-    fn new() -> Self {
-        Self::for_pages(u64::MAX)
-    }
-    /// A list for at most `pages` frames: on the stack when they fit (no allocation, e.g. in the switch path).
-    fn for_pages(pages: u64) -> Self {
-        let mut heap = alloc::vec::Vec::new();
-        let on_heap = pages > GATHER_STACK as u64 && heap.try_reserve_exact(GATHER).is_ok();
-        Gather { heap, stack: [(0, PageSize::Size4K, 0); GATHER_STACK], n: 0, on_heap }
-    }
-    /// No room for another frame: the list is at `GATHER_MAX` or cannot grow (no heap).
-    fn full(&mut self) -> bool {
-        if !self.on_heap {
-            return self.n >= GATHER_STACK;
-        }
-        let n = self.heap.len();
-        n >= tlb_plan::GATHER_MAX || (n == self.heap.capacity() && self.heap.try_reserve(GATHER.min(tlb_plan::GATHER_MAX - n)).is_err())
-    }
-    fn push(&mut self, x: Gathered) {
-        if self.on_heap {
-            self.heap.push(x);
-        } else {
-            self.stack[self.n] = x;
-            self.n += 1;
-        }
-    }
-    fn drain(&mut self, f: &mut dyn FnMut(Gathered)) {
-        if self.on_heap {
-            self.heap.drain(..).for_each(f);
-        } else {
-            self.stack[..self.n].iter().copied().for_each(f);
-            self.n = 0;
-        }
-    }
-}
-
 /// A frame or page table a user unmap took out of `root`. `confirmed`: every CPU dropped its translations,
 /// free it; otherwise keep it out of use (a CPU did not answer the shootdown).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,14 +478,14 @@ pub struct Released {
 pub struct UserUnmap {
     pub leaves: u64,
     pub tables_freed: u64,
-    /// Shootdown rounds (one per `GATHER` frames, at least one when anything changed).
+    /// Shootdown rounds (one per full gather, at least one when anything changed).
     pub shootdowns: u32,
     pub outcome: Outcome,
 }
 
-/// MM-11: one user unmap over one or more ranges (Linux's mmu_gather, linux-6.6/mm/mmu_gather.c): the leaves of
+/// MM-11: one user unmap over one or more ranges (Linux's mmu_gather, linux-7.3.1/mm/mmu_gather.c): the leaves of
 /// every `unmap` go into one list, and one shootdown round for all of them (`finish`) hands the frames back, then
-/// the emptied page tables; only a list that cannot grow (`GATHER_MAX` frames, no heap) takes a round on the way
+/// the emptied page tables; only a list that cannot grow (`GATHER_MAX` frames, no batch page to be had without waiting: `gather`) takes a round on the way
 /// (`tlb_flush_mmu`). One munmap, madvise or hole punch over several VMAs is so one round, not one per VMA. The
 /// round covers the span of the leaves actually removed; more than `tlb::RANGE_PAGES` pages, or freed tables,
 /// flush the whole context (Linux `flush_tlb_mm_range`). Must be finished: what is gathered is handed back only
@@ -518,8 +493,8 @@ pub struct UserUnmap {
 pub struct UserGather {
     root: u64,
     cause: tlb::Cause,
-    frames: Gather,
-    tables: alloc::vec::Vec<u64>,
+    frames: gather::List,
+    tables: gather::List,
     /// The span of the leaves gathered since the last round (`lo >= hi`: none).
     lo: u64,
     hi: u64,
@@ -542,8 +517,8 @@ impl UserGather {
         UserGather {
             root,
             cause,
-            frames: Gather::new(),
-            tables: alloc::vec::Vec::new(),
+            frames: gather::List::new(GATHER_MAX),
+            tables: gather::List::new(usize::MAX),
             lo: u64::MAX,
             hi: 0,
             small: false,
@@ -557,9 +532,10 @@ impl UserGather {
     /// Removes every leaf in [virt, virt + len) of the root's user half into the list, each frame with `tag`
     /// (handed back to `release` with it). A page table that became empty is unlinked and freed after the last
     /// round only when its whole span lies in [free.0, free.1): the gap between the neighbouring VMAs for a
-    /// munmap (Linux `free_pgtables`' floor and ceiling, linux-6.6/mm/memory.c:301/363), an empty window for
-    /// madvise and reclaim (Linux's `zap_page_range_single`, mm/memory.c:1750, frees none), so their round need
-    /// not ask CPUs that hold the root lazily. Nothing changes on an error (`PartialHugePage`, a bad range).
+    /// munmap (Linux `free_pgtables`' floor and ceiling, linux-7.3.1/mm/memory.c:298/373), an empty window for
+    /// madvise and reclaim, so their round need not ask CPUs that hold the root lazily. Linux 7.3.1 with
+    /// CONFIG_PT_RECLAIM frees a page table a MADV_DONTNEED empties whole (memory.c:2113, `zap_vma_range` :2372);
+    /// V2 does not, measured slower (plan/spec/storage.md §3.4). Nothing changes on an error (`PartialHugePage`, a bad range).
     pub fn unmap(&mut self, virt: u64, len: u64, tag: u32, free: (u64, u64), release: &mut dyn FnMut(Released, u32)) -> Result<UnmapStats, MapError> {
         user_range(virt, len)?;
         let root = self.root;
@@ -568,11 +544,14 @@ impl UserGather {
         let st = walk::unmap(&mut t, root, virt, len, 4, &mut |u| {
             let mut b = p.borrow_mut();
             let Pending { g, release } = &mut *b;
-            if g.frames.full() {
+            if !g.frames.room() {
                 tlb::count_gather_early();
                 g.round(false, &mut **release);
             }
-            g.frames.push((u.phys, u.size, tag));
+            // After a round the stack batch has room: a frame is never dropped.
+            if g.frames.room() {
+                g.frames.push(u.phys, u.size, tag);
+            }
             g.small |= u.size == PageSize::Size4K;
             g.lo = g.lo.min(u.virt);
             g.hi = g.hi.max(u.virt + u.size.bytes());
@@ -598,11 +577,9 @@ impl UserGather {
         self.out.add(o);
         self.rounds += 1;
         let ok = o.confirmed();
-        self.frames.drain(&mut |(phys, size, tag)| release(Released { phys, size, table: false, confirmed: ok }, tag));
+        self.frames.drain(&mut |phys, size, tag| release(Released { phys, size, table: false, confirmed: ok }, tag));
         if tables {
-            for f in self.tables.drain(..) {
-                release(Released { phys: f, size: PageSize::Size4K, table: true, confirmed: ok }, 0);
-            }
+            self.tables.drain(&mut |phys, _, _| release(Released { phys, size: PageSize::Size4K, table: true, confirmed: ok }, 0));
         }
         (self.lo, self.hi, self.small) = (u64::MAX, 0, false);
         ok
@@ -644,8 +621,8 @@ impl walk::Tables for UserTables<'_, '_, '_> {
     fn free_table(&mut self, t: u64) {
         let mut b = self.p.borrow_mut();
         let Pending { g, release } = &mut *b;
-        if g.tables.try_reserve(1).is_ok() {
-            g.tables.push(t);
+        if g.tables.room() {
+            g.tables.push(t, PageSize::Size4K, 0);
         } else {
             // No room to defer: shoot the whole root down now (with what is gathered), then hand the table back.
             tlb::count_gather_early();
@@ -704,7 +681,7 @@ pub fn replace_user_4k(root: u64, virt: u64, phys: u64, flags: PageFlags) -> Res
 /// Rewrites user leaves without losing the Accessed/Dirty bits another CPU's page walker sets between the read and
 /// the write (it may still hold the old writable TLB entry until the shootdown): the write is a compare-exchange
 /// against the value read, and bits the hardware set meanwhile are kept unless the new flags cleared them on
-/// purpose (linux-6.6/mm/mprotect.c change_pte_range: ptep_modify_prot_start/commit).
+/// purpose (linux-7.3.1/mm/mprotect.c:331 change_pte_range: modify_prot_start_ptes/commit_ptes).
 struct LeafWriter {
     /// The last entry read: (table, index, value).
     last: core::cell::Cell<(u64, usize, u64)>,
@@ -774,8 +751,8 @@ fn flush_leaves(root: u64, lo: u64, hi: u64, small: bool, cause: tlb::Cause) -> 
 /// `protect_user` for the fault path, which only widens rights (a write to a read-only page that may be
 /// written: copy-on-write reuse, a dirty mark of a shared file or device page, an entry behind its VMA): leaves
 /// whose change only grants (`tlb_plan::grant_only`: WRITABLE set, NX cleared, Accessed/Dirty kept) are rewritten
-/// without a shootdown round, as Linux's `wp_page_reuse` (linux-6.6/mm/memory.c:3030, `ptep_set_access_flags`
-/// arch/x86/mm/pgtable.c:499: no flush); a CPU holding the narrower translation takes one spurious fault, which
+/// without a shootdown round, as Linux's `wp_page_reuse` (linux-7.3.1/mm/memory.c:3891, `ptep_set_access_flags`
+/// arch/x86/mm/pgtable.c:380: no flush); a CPU holding the narrower translation takes one spurious fault, which
 /// flushes it there (`mm`'s fault path; a kernel copy needs `tlb::set_spurious_copy_retry`, else the round is
 /// kept, `tlb::grants_allowed`). This CPU drops its own entries now when it has `root` loaded. A leaf
 /// change that is more than a grant shoots the range down as `protect_user` does (MM-tlb2: the fbdev

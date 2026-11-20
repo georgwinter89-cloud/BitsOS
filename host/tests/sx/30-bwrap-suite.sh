@@ -5,8 +5,8 @@
 # test-utils program, each TAP line against expected/<suite>.tap (CachyOS 7.3 with the same stage, user/ports/
 # bubblewrap/tests/record-host.sh). Lines V2 cannot answer the same way are listed with their reason in
 # expected/known.txt; a known line that passes after all is reported so it can go.
-# Without the tarballs in the download cache (V2_OFFLINE=1, no download here) it prints "SKIPPED, NOTHING CHECKED"
-# and passes; SX_REQUIRE_BWRAP=1 makes that a failure.
+# Without the tarballs in the download cache (V2_OFFLINE=1, no download here) it prints "SKIPPED, NOTHING CHECKED",
+# which every run xtask starts counts red (a skip is red, ledger.rs skip_line); SX_REQUIRE_BWRAP=1 also exits 1.
 # SX3B_KEEP=1 leaves QEMU running for the next try (development).
 set -euo pipefail
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"

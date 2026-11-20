@@ -167,9 +167,6 @@ ktest!("nw.igc.probe", RunHw("nw/20-igb"), probe);
 fn irq() -> TestResult {
     let d = card!(true);
     if d.irq_setup() == "polled" {
-        if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-            return ktest::fail("net_irq=off: polled by request");
-        }
         return Err(format!("{} runs polled: no MSI-X or MSI (see igc.irq_fallback / pci msi.refused)", d.name()));
     }
     let hw = d.hw();

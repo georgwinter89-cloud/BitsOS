@@ -1,4 +1,6 @@
-//! What prctl(2) keeps (AB-5; linux-6.6/kernel/sys.c `prctl`, security/commoncap.c `cap_task_prctl`): per task
+//! What prctl(2) keeps (AB-5; linux-7.3.1/kernel/sys.c:2534 `prctl`, security/commoncap.c:1301 `cap_task_prctl`;
+//! L7-SYNC: Linux 7.3.1's PR_FUTEX_HASH state is `FutexHash`, PR_TIMER_CREATE_RESTORE_IDS lives with the timers in
+//! `signal::Timers`, PR_RSEQ_SLICE_EXTENSION has nothing to keep without rseq): per task
 //! (`TaskPrctl` in every `Thread`) and per address space (`MmFlags` in every `Process` image). The syscall
 //! itself is `syscall::prctl`; the rules for fork, clone and execve are here, next to the state.
 //!
@@ -15,6 +17,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ksync::SpinLock;
+use uapi::errno::{EBUSY, EINVAL};
 
 /// `TASK_COMM_LEN`.
 pub const COMM_LEN: usize = 16;
@@ -77,7 +80,7 @@ impl TaskPrctl {
         }
     }
     /// A new task made by `from` (fork/clone): everything but the parent-death signal; the default slack is
-    /// the creator's current slack (linux-6.6/kernel/fork.c `copy_process`).
+    /// the creator's current slack (linux-7.3.1/kernel/fork.c:2238 `copy_process`).
     pub fn inherit(&self, from: &TaskPrctl) {
         *self.comm.lock() = from.comm();
         self.pdeath_signal.store(0, Ordering::Relaxed);
@@ -130,7 +133,8 @@ impl TaskPrctl {
         self.personality.store(p, Ordering::Relaxed);
     }
     /// `begin_new_exec` with set-id bits: `me->personality &= ~bprm->per_clear` (`PER_CLEAR_ON_SETID`:
-    /// READ_IMPLIES_EXEC, ADDR_NO_RANDOMIZE, ADDR_COMPAT_LAYOUT, MMAP_PAGE_ZERO; linux-6.6/include/uapi/linux/personality.h).
+    /// READ_IMPLIES_EXEC, ADDR_NO_RANDOMIZE, ADDR_COMPAT_LAYOUT, MMAP_PAGE_ZERO;
+    /// linux-7.3.1/include/uapi/linux/personality.h:31).
     pub fn clear_personality_on_setid(&self) {
         self.personality.fetch_and(!0x0074_0000, Ordering::Relaxed);
     }
@@ -184,8 +188,9 @@ impl TaskPrctl {
 pub const DUMPABLE_MASK: u32 = 3;
 pub const DISABLE_THP: u32 = 4;
 
-/// `mm->flags` bits V2 keeps (per image, shared by the threads that share its memory).
-pub struct MmFlags(AtomicU32);
+/// `mm->flags` bits V2 keeps (per image, shared by the threads that share its memory), and the address space's
+/// futex hash as PR_FUTEX_HASH sees it (`FutexHash`).
+pub struct MmFlags(AtomicU32, FutexHash);
 
 impl Default for MmFlags {
     fn default() -> Self {
@@ -196,7 +201,11 @@ impl Default for MmFlags {
 impl MmFlags {
     /// A new address space: dumpable (SUID_DUMP_USER), THP allowed.
     pub const fn new() -> MmFlags {
-        MmFlags(AtomicU32::new(1))
+        MmFlags(AtomicU32::new(1), FutexHash(AtomicU64::new(0)))
+    }
+    /// The address space's futex hash (not copied by fork or kept by execve: a new mm has none).
+    pub fn futex_hash(&self) -> &FutexHash {
+        &self.1
     }
     pub fn get(&self) -> u32 {
         self.0.load(Ordering::Acquire)
@@ -227,6 +236,45 @@ impl MmFlags {
     /// execve: the new memory keeps THP's flag and is dumpable again.
     pub fn for_exec(&self, old: &MmFlags) {
         self.0.store((old.get() & DISABLE_THP) | 1, Ordering::Release);
+    }
+}
+
+/// L7-SYNC: the per-process futex hash of Linux 7.3.1 as far as programs see it (kernel/futex/core.c:2071
+/// `futex_hash_prctl`, :1848 `futex_hash_allocate`, :1986 `futex_hash_allocate_default`, :2019
+/// `futex_hash_get_slots`): none until the first CLONE_VM clone, then `clamp(roundup_pow_of_two(4 *
+/// min(threads, CPUs)), 16, global buckets)` slots, grown at later clones and never shrunk; PR_FUTEX_HASH_SET_SLOTS
+/// fixes a size (custom), and 0 switches to the global hash for good (then GET says 0 and any custom size is
+/// EBUSY). V2 keeps every futex in its one global table (why: plan/spec/core.md §9.3,
+/// futexes); this is the bookkeeping the prctl answers from.
+pub struct FutexHash(AtomicU64);
+
+/// `FutexHash` word: the slots in the low 32 bits, then these flags.
+const FH_CUSTOM: u64 = 1 << 32;
+const FH_GLOBAL: u64 = 1 << 33;
+
+impl FutexHash {
+    /// PR_FUTEX_HASH_GET_SLOTS: the private hash's size, 0 for none or the global one.
+    pub fn slots(&self) -> u32 {
+        let v = self.0.load(Ordering::Acquire);
+        if v & FH_GLOBAL != 0 { 0 } else { v as u32 }
+    }
+    /// PR_FUTEX_HASH_SET_SLOTS (`futex_hash_allocate(n, FH_CUSTOM)`): EINVAL for 1 or a size that is not a power
+    /// of two, EBUSY once the global hash was chosen.
+    pub fn set_custom(&self, n: u32) -> Result<(), i64> {
+        if n != 0 && (n == 1 || !n.is_power_of_two()) {
+            return Err(EINVAL);
+        }
+        let new = FH_CUSTOM | if n == 0 { FH_GLOBAL } else { n as u64 };
+        self.0.try_update(Ordering::AcqRel, Ordering::Acquire, |v| (v & FH_GLOBAL == 0).then_some(new)).map(|_| ()).map_err(|_| EBUSY)
+    }
+    /// `futex_hash_allocate_default` at a CLONE_VM clone that found `threads` threads (`get_nr_threads`) with
+    /// `cpus` online and a global table of `global` buckets.
+    pub fn grow_default(&self, threads: u32, cpus: u32, global: u32) {
+        let want = (4 * threads.min(cpus).max(1)).next_power_of_two().clamp(16, global.max(16)) as u64;
+        let _ = self.0.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            let current = if v & FH_GLOBAL != 0 { 1 } else { v & 0xffff_ffff };
+            (v & (FH_CUSTOM | FH_GLOBAL) == 0 && current < want).then_some(want)
+        });
     }
 }
 
@@ -266,6 +314,37 @@ mod tests {
         let c = TaskPrctl::new();
         c.inherit(&a);
         assert_eq!(c.seccomp().mode(), seccomp::consts::MODE_STRICT, "seccomp follows fork/clone");
+    }
+
+    #[test]
+    fn futex_hash_as_linux() {
+        let h = MmFlags::new();
+        let f = h.futex_hash();
+        assert_eq!(f.slots(), 0, "none before a thread");
+        f.grow_default(1, 24, 8192);
+        assert_eq!(f.slots(), 16, "the first thread: 4 rounded up to the minimum");
+        f.grow_default(5, 24, 8192);
+        assert_eq!(f.slots(), 32);
+        f.grow_default(2, 24, 8192);
+        assert_eq!(f.slots(), 32, "never shrinks");
+        f.grow_default(100, 24, 8192);
+        assert_eq!(f.slots(), 128, "threads count up to the CPUs only");
+        assert_eq!(f.set_custom(3), Err(EINVAL));
+        assert_eq!(f.set_custom(1), Err(EINVAL));
+        assert_eq!(f.set_custom(64), Ok(()));
+        f.grow_default(100, 24, 8192);
+        assert_eq!(f.slots(), 64, "a custom size stays");
+        assert_eq!(f.set_custom(0), Ok(()), "to the global hash");
+        assert_eq!(f.slots(), 0);
+        assert_eq!(f.set_custom(16), Err(EBUSY), "no way back");
+        assert_eq!(f.set_custom(0), Err(EBUSY));
+        let g = MmFlags::new();
+        g.futex_hash().set_custom(0).unwrap();
+        g.futex_hash().grow_default(8, 24, 8192);
+        assert_eq!(g.futex_hash().slots(), 0, "a clone after the switch keeps the global hash");
+        let k = MmFlags::new();
+        k.copy_from(&h);
+        assert_eq!(k.futex_hash().slots(), 0, "fork: a new mm has no private hash");
     }
 
     #[test]

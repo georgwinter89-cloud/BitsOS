@@ -156,6 +156,18 @@ mod jobs {
         k::idle_and_stop().unwrap();
     }
     #[test]
+    fn queue_grows_with_its_lock_dropped() {
+        crate::ktests_hw_queue::grows().unwrap();
+    }
+    #[test]
+    fn queue_taken_or_filled_while_it_grows() {
+        crate::ktests_hw_queue::window().unwrap();
+    }
+    #[test]
+    fn queue_stopped_while_it_grows() {
+        crate::ktests_hw_queue::closing().unwrap();
+    }
+    #[test]
     fn gang_keeps_a_lost_flush() {
         crate::ktests_hw_lost::gang_flush().unwrap();
     }
@@ -212,12 +224,8 @@ mod jobs {
         crate::ktests_hw_ladder::gc_fails().unwrap();
     }
     #[test]
-    fn ladder_mode2_closed() {
-        crate::ktests_hw_ladder::mode2_closed().unwrap();
-    }
-    #[test]
-    fn ladder_mode2_open() {
-        crate::ktests_hw_ladder::mode2_open().unwrap();
+    fn ladder_mode2() {
+        crate::ktests_hw_ladder::mode2().unwrap();
     }
     #[test]
     fn ladder_mode2_no_answer() {
@@ -234,10 +242,6 @@ mod jobs {
     #[test]
     fn ladder_tool() {
         crate::ktests_hw_ladder::tool_word().unwrap();
-    }
-    #[test]
-    fn ladder_config() {
-        crate::ktests_hw_ladder::config().unwrap();
     }
     #[test]
     fn a_hang_the_ladder_refuses_still_ends() {

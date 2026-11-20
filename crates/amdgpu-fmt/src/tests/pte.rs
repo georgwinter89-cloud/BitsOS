@@ -1,4 +1,4 @@
-//! Encoders against the bit values of linux-6.6 amdgpu_vm.h:57-112 and gmc_v11_0.c:446-545.
+//! Encoders against the bit values of linux-7.3.1 amdgpu_vm.h:57-118 and gmc_v11_0.c:413-545.
 
 use crate::pte::*;
 use crate::store::TableAddr;

@@ -60,6 +60,8 @@ pub enum Btn {
     Select,
     Start,
     Home,
+    /// DB3: Select held with the chosen button (`durchblick.pad`): Durchblick's key.
+    Help,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +90,7 @@ impl Press {
             Press::Btn(Btn::Select) => "Select",
             Press::Btn(Btn::Start) => "Start",
             Press::Btn(Btn::Home) => "Home",
+            Press::Btn(Btn::Help) => "Help",
             Press::Move(Dir::Left) => "left",
             Press::Move(Dir::Right) => "right",
             Press::Move(Dir::Up) => "up",
@@ -101,6 +104,8 @@ pub enum Source {
     Standard,
     Table,
     Fallback,
+    /// GM-6c: learned on the sofa mode's "Tasten zuordnen" screen (`sofa.pad.map`).
+    Learned,
 }
 
 impl Source {
@@ -109,6 +114,7 @@ impl Source {
             Source::Standard => "standard",
             Source::Table => "table",
             Source::Fallback => "fallback",
+            Source::Learned => "learned",
         }
     }
 }
@@ -172,7 +178,7 @@ struct Row {
 }
 
 /// DragonRise Inc. Generic USB Joystick 0079:0006: SDL's community mapping for that id
-/// (gabomdq/SDL_GameControllerDB, zlib licence; plan/notes/wy-PK-L1c.md): a:b2 b:b1 x:b3 y:b0 leftshoulder:b4
+/// (gabomdq/SDL_GameControllerDB, zlib licence; plan/spec/bitscomp.md §2): a:b2 b:b1 x:b3 y:b0 leftshoulder:b4
 /// rightshoulder:b5 back:b8 start:b9, the hat as the D-pad.
 const TABLE: &[Row] = &[Row {
     vendor: 0x0079,
@@ -225,6 +231,55 @@ pub fn mapping(vendor: u16, product: u16, keys: &[u16]) -> Mapping {
     Mapping { source: Source::Fallback, buttons }
 }
 
+/// GM-6c: the buttons the learn screen asks for, in its order, with their names in `sofa.pad.map` (SDL's words for
+/// the face buttons; lb, rb, select, start for the rest).
+pub const LEARN: [(Btn, &str); 8] = [(Btn::A, "a"), (Btn::B, "b"), (Btn::X, "x"), (Btn::Y, "y"), (Btn::LB, "lb"), (Btn::RB, "rb"), (Btn::Select, "select"), (Btn::Start, "start")];
+
+fn learn_btn(name: &str) -> Option<Btn> {
+    LEARN.iter().find(|(_, n)| *n == name).map(|(b, _)| *b).or((name == "home").then_some(Btn::Home))
+}
+
+fn pad_key(vendor: u16, product: u16) -> String {
+    format!("{vendor:04x}:{product:04x}")
+}
+
+/// GM-6c: the learned mapping of `vendor:product` from `sofa.pad.map` ("0079:0006=a:b2,b:b1,...", several pads
+/// separated by ';'; `b<n>` is SDL's button number, `sdl_order`). None when the text has no usable entry for the
+/// pad (then the standard, table or fallback mapping applies); a bad part is skipped, never a panic.
+pub fn learned(text: &str, vendor: u16, product: u16, keys: &[u16]) -> Option<Mapping> {
+    let order = sdl_order(keys);
+    let want = pad_key(vendor, product);
+    let body = text.split(';').find_map(|e| e.trim().split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case(&want)).map(|(_, v)| v))?;
+    let mut buttons: Vec<(u16, Btn)> = Vec::new();
+    for part in body.split(',') {
+        let Some((n, b)) = part.trim().split_once(':') else { continue };
+        let (Some(btn), Some(i)) = (learn_btn(n.trim()), b.trim().strip_prefix('b').and_then(|i| i.parse::<usize>().ok())) else { continue };
+        if let Some(&code) = order.get(i)
+            && !buttons.iter().any(|(c, x)| *c == code || *x == btn)
+        {
+            buttons.push((code, btn));
+        }
+    }
+    (!buttons.is_empty()).then_some(Mapping { source: Source::Learned, buttons })
+}
+
+/// The pad's mapping: the learned one of `sofa.pad.map`, else `mapping`.
+pub fn mapping_for(vendor: u16, product: u16, keys: &[u16], learned_text: &str) -> Mapping {
+    learned(learned_text, vendor, product, keys).unwrap_or_else(|| mapping(vendor, product, keys))
+}
+
+/// `sofa.pad.map` with the pad's entry replaced by `got` (logical button, raw code); the other pads' entries stay.
+/// Codes not in the pad's SDL order are left out.
+pub fn learned_text(old: &str, vendor: u16, product: u16, keys: &[u16], got: &[(Btn, u16)]) -> String {
+    let order = sdl_order(keys);
+    let want = pad_key(vendor, product);
+    let name = |b: Btn| LEARN.iter().find(|(x, _)| *x == b).map(|(_, n)| *n).unwrap_or("home");
+    let parts: Vec<String> = got.iter().filter_map(|(b, c)| Some(format!("{}:b{}", name(*b), order.iter().position(|x| x == c)?))).collect();
+    let mut entries: Vec<String> = old.split(';').map(str::trim).filter(|e| !e.is_empty() && !e.split_once('=').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(&want))).map(String::from).collect();
+    entries.push(format!("{want}={}", parts.join(",")));
+    entries.join(";")
+}
+
 /// One pad's state between events.
 pub struct Pad {
     pub map: Mapping,
@@ -242,13 +297,21 @@ pub struct Pad {
     chord: Option<(u64, bool)>,
     frame: Vec<Press>,
     dropping: bool,
+    /// GM-6a: `sofa.home_chord` = aus: Select+Start held is no Home.
+    pub chord_off: bool,
+    /// Select and Start were held together during this hold (their own presses are then not given).
+    chord_seen: bool,
+    /// DB3: the button that gives `Help` while Select is held (None: off).
+    pub help: Option<Btn>,
+    /// That chord came during this hold of Select (its own release is then not given).
+    help_seen: bool,
 }
 
 impl Pad {
     /// `x`/`y`: the left stick's axes (None: the device has no such axis).
     pub fn new(map: Mapping, x: Option<Axis>, y: Option<Axis>) -> Pad {
         let stick = (x.map_or(0, Axis::mid), y.map_or(0, Axis::mid));
-        Pad { map, x, y, stick, hat: (0, 0), dpad: [false; 4], held: BTreeSet::new(), stick_dir: None, dir: None, chord: None, frame: Vec::new(), dropping: false }
+        Pad { map, x, y, stick, hat: (0, 0), dpad: [false; 4], held: BTreeSet::new(), stick_dir: None, dir: None, chord: None, frame: Vec::new(), dropping: false, chord_off: false, chord_seen: false, help: Some(Btn::Y), help_seen: false }
     }
 
     /// The axes' values when the pad was opened (EVIOCGABS `value`): a stick or hat already deflected then is
@@ -293,11 +356,30 @@ impl Pad {
                 if self.held.insert(c)
                     && let Some(b) = self.map.of(c)
                 {
-                    self.frame.push(Press::Btn(b));
+                    if Some(b) == self.help && b != Btn::Select && self.held_btn(Btn::Select) {
+                        self.frame.push(Press::Btn(Btn::Help));
+                        self.help_seen = true;
+                    } else if !self.held_back(b) {
+                        self.frame.push(Press::Btn(b));
+                    }
                 }
             }
             (EV_KEY, c) if value == 0 => {
-                self.held.remove(&c);
+                if self.held.remove(&c)
+                    && let Some(b) = self.map.of(c)
+                {
+                    if self.held_back(b) {
+                        if !self.chord_seen && !(b == Btn::Select && self.help_seen) {
+                            self.frame.push(Press::Btn(b));
+                        }
+                        if !self.held_btn(Btn::Select) && !self.held_btn(Btn::Start) {
+                            self.chord_seen = false;
+                        }
+                    }
+                    if b == Btn::Select {
+                        self.help_seen = false;
+                    }
+                }
             }
             (EV_ABS, ABS_X) => self.stick.0 = value,
             (EV_ABS, ABS_Y) => self.stick.1 = value,
@@ -317,13 +399,25 @@ impl Pad {
                 out.push(Press::Move(d));
             }
         }
-        let both = self.map.chord() && self.held_btn(Btn::Select) && self.held_btn(Btn::Start);
+        let both = !self.chord_off && self.map.chord() && self.held_btn(Btn::Select) && self.held_btn(Btn::Start);
+        self.chord_seen |= both;
         match (both, self.chord) {
             (true, None) => self.chord = Some((now, false)),
             (false, Some(_)) => self.chord = None,
             _ => {}
         }
         self.tick(now, out);
+    }
+
+    /// GM-6a: on a pad whose Home is Select+Start, those two come out when let go and only when they were not
+    /// held together (the sofa mode's Start opens the quick menu; the chord must not do that on its way to Home).
+    fn held_back(&self, b: Btn) -> bool {
+        !self.chord_off && self.map.chord() && matches!(b, Btn::Select | Btn::Start)
+    }
+
+    /// GM-6d: whether `b` is held now (the sofa keyboard repeats a held A).
+    pub fn holds(&self, b: Btn) -> bool {
+        self.held_btn(b)
     }
 
     fn held_btn(&self, b: Btn) -> bool {
@@ -415,6 +509,7 @@ impl Pad {
         self.stick_dir = None;
         self.dir = None;
         self.chord = None;
+        self.chord_seen = false;
         self.frame.clear();
     }
 }

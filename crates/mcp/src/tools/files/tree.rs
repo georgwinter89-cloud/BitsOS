@@ -62,8 +62,8 @@ fn walk(ctx: &ToolContext, ns: &MountNs, root: &Path) -> Result<Vec<(String, Pat
             let name = utf8(&p.dentry.name());
             let r = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             let mount = ns.is_mountpoint(&p);
-            // MC-10: the installer's grants are neither listed nor hashed.
-            if p.dentry.is_dir() && super::access_store_refusal(&super::canonical(ns, &p)).is_some() {
+            // MC-10, CL-S CR 4: the installer's grants and settingsd's folder are neither listed nor hashed.
+            if p.dentry.is_dir() && super::kept_refusal(&super::canonical(ns, &p)).is_some() {
                 continue;
             }
             if p.dentry.is_dir() && !mount {
@@ -132,7 +132,7 @@ fn manifest(ctx: &ToolContext, args: &Json) -> ToolResult {
         Err(e) => return Err(fail(path, e)),
     };
     let canon = canonical(&ns, &root);
-    if let Some(why) = super::access_store_refusal(&canon) {
+    if let Some(why) = super::kept_refusal(&canon) {
         return Err(super::refuse("manifest", path, why));
     }
     policy_path(ctx, "manifest", &canon, false, false)?;

@@ -1,0 +1,21 @@
+[package]
+name = "bitsaccess"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS access log (DB2, Durchblick): what each program touched, from /dev/bitsos/access, kept on /data/system/access, served on /run/bitsos/access.sock and as the MCP tool access_log"
+publish = false
+
+# Workspace crates only: settingsd (its JSON for the access.* keys), mcpreg (the MCP tool and the data's JSON),
+# bitsjournal (/data's state and the time helpers), usys (the socket peer's uid).
+[dependencies]
+settingsd = { path = "../settingsd" }
+mcpreg = { path = "../../lib/mcpreg" }
+bitsjournal = { path = "../bitsjournal" }
+usys = { path = "../../tools/usys" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsaccess"
+path = "src/main.rs"

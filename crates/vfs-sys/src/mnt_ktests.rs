@@ -2,8 +2,7 @@
 //! - `sx.mnt.views`: in the kernel, on views of their own: a locked unprivileged copy, binds, propagation into
 //!   the copy, pivot_root with a lazy unmount, mountinfo seen from a root, and everything given back;
 //! - `sx.mnt.programs`: `/bin/abi-ns-mount` (user/abi-tests/c/ns-mount.c, the bwrap-like container and its
-//!   propagation, error, clone, setns and read-only overlay cases) as uid 1000 against expected/sx3-*.txt (CachyOS's transcripts; the
-//!   errors case ends with Linux 6.6's answer to MNT_FORCE);
+//!   propagation, error, clone, setns and read-only overlay cases) as uid 1000 against expected/sx3-*.txt (CachyOS's transcripts);
 //! - `sx.mnt.errors`: the refusals (ELOOP, EINVAL for unbindable, a shared parent of pivot_root and a locked
 //!   copy) on views of its own, each leaving the view as it was;
 //! - `sx.mnt.lifetime`: the programs' mount namespaces are gone when they end (`proc::ns::mnt::live`);
@@ -252,8 +251,8 @@ fn proc_instance() -> TestResult {
 
 ktest!("sx.mnt.pdeath", Safe, pdeath);
 /// SX-3b: the parent-death SIGKILL of a pid namespace's init whose parent is outside the namespace (bwrap
-/// `--die-with-parent --unshare-pid`, the suite's check 38). Skips while AB's glue (SX-3b CR1,
-/// plan/notes/sx-SX-3b-glue.patch) is not applied: the init then keeps running and the program kills it.
+/// `--die-with-parent --unshare-pid`, the suite's check 38). Skips while AB's glue (SX-3b CR1) is not
+/// applied: the init then keeps running and the program kills it.
 fn pdeath() -> TestResult {
     if !have(PROG) {
         return ktest::fail("no /bin/abi-ns-mount in this image");

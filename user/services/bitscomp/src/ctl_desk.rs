@@ -1,6 +1,6 @@
 //! Control socket commands of WY-5, so tests drive the desktop without a hand:
 //!
-//! ws | ws new | ws N (show workspace N, 1-based) | ws remove
+//! ws | ws new | ws N (show workspace N, 1-based) | ws remove [N] [--move]
 //! address [TEXT] (edit the top bar, with TEXT typed) | address open TEXT [tab|tile]
 //! sidebar (fold Claude's sidebar in or out) | ring idle|listening|thinking|working|waiting
 //! workspaces (fold the workspace list in or out) | reveal left|right|none (show a folded bar over the tiles, as the
@@ -20,8 +20,16 @@ pub fn execute(app: &mut App, words: &[&str], line: &str) -> Option<Result<Strin
         "ws" => match words.get(1).copied() {
             None => Ok(ws_list(app)),
             Some("new") => Ok(format!("ws {}", app.ws_new() + 1)),
+            // ws remove [N] [--move]: workspace N (1-based, the shown one without N); only an empty one, unless
+            // --move moves its windows into the neighbour as the x's question does on "Schließen".
             Some("remove") => {
-                if app.ws_remove(app.desk.active) { Ok("ok".into()) } else { Err("only an empty workspace that is not the only one".into()) }
+                let moving = words.contains(&"--move");
+                let n = words.get(2).filter(|w| **w != "--move").map(|w| w.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= app.ws_count()));
+                match n {
+                    Some(None) => Err(format!("no workspace {}", words[2])),
+                    Some(Some(n)) => remove(app, n - 1, moving),
+                    None => remove(app, app.desk.active, moving),
+                }
             }
             Some(n) => match n.parse::<usize>() {
                 Ok(i) if i >= 1 && i <= app.ws_count() => {
@@ -188,13 +196,12 @@ fn theme_line(app: &App) -> String {
     let t = &app.theme;
     let hex = |c: [f32; 4]| format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8);
     format!(
-        "mode={} accent={} bg={} scale={} motion={:?} effects={} address={} favourites={} sidebar={} statusbar={} workspaces={} name={:?} settingsd={} gen={}",
+        "mode={} accent={} bg={} scale={} motion={:?} address={} favourites={} sidebar={} statusbar={} workspaces={} name={:?} settingsd={} gen={}",
         if t.dark { "dark" } else { "light" },
         hex(t.accent),
         hex(t.bg),
         t.scale,
         t.motion,
-        t.effects.word(),
         if t.layout.address_top { "top" } else { "tile" },
         t.layout.favourites,
         t.layout.sidebar,
@@ -204,4 +211,12 @@ fn theme_line(app: &App) -> String {
         app.settings_live,
         app.theme_gen
     )
+}
+
+/// `ws remove`: the old refusal of a workspace with windows unless told to move them.
+fn remove(app: &mut App, i: usize, moving: bool) -> Result<String, String> {
+    if app.ws_counts(i) != (0, 0) && moving {
+        return if app.ws_close_moving(i) { Ok("ok".into()) } else { Err("not the only workspace, not the sofa mode's".into()) };
+    }
+    if app.ws_remove(i) { Ok("ok".into()) } else { Err("only an empty workspace that is not the only one (--move moves its windows)".into()) }
 }

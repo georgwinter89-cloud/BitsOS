@@ -1,6 +1,6 @@
 //! SHA-256 (FIPS 180-4) in safe Rust, for MC-push's `manifest` tool: the host side (`host/mcp/push.mjs`) compares
 //! a package tree with the stick's copy by SHA-256 per file. Own code instead of the `sha2` crate, which
-//! `plan/spec/rust-ecosystem.md` does not name (plan/notes/mc-MC-push.md). Plain integer code: no SIMD (R10's
+//! `plan/spec/rust-ecosystem.md` does not name. Plain integer code: no SIMD (R10's
 //! SHA-NI would need SSE registers, which the kernel does not use).
 
 const K: [u32; 64] = [

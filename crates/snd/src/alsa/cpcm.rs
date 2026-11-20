@@ -637,7 +637,7 @@ impl CapFile {
                 let mut p = HwParams::decode(&raw);
                 if cmd == PCM_HW_REFINE {
                     self.cons.refine(&mut p)?;
-                    self.cons.fixup(&mut p);
+                    self.cons.fixup(&mut p)?;
                 } else {
                     self.hw_params(&mut p)?;
                 }
@@ -751,7 +751,7 @@ impl File for CapFile {
         vfs::abi::encode_dev(super::ALSA_MAJOR, super::PCM_CAPTURE_MINOR)
     }
     fn ioctl_user(&self, cmd: u64, arg: u64, mem: &dyn UserMem) -> Option<Result<i64, Errno>> {
-        // No per-ioctl counter as the playback file keeps (a debug trace: open question in sn-SN-9.md).
+        // No per-ioctl counter as the playback file keeps (a debug trace: open question in plan/notes/desk-offen.md).
         let r = self.ioctl(cmd, arg, mem);
         if let Err(e) = r
             && cmd != PCM_READI_FRAMES

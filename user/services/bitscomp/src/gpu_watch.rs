@@ -1,4 +1,4 @@
-//! WY-21: the GPU desktop notices a lost device and never stays a frozen picture (desk-INT-W31 open point 1).
+//! WY-21: the GPU desktop notices a lost device and never stays a frozen picture.
 //!
 //! Four signs, any of them is enough:
 //! - a new open of the render node answers ENODEV (or the node is gone): what V2's amdgpu does once GX-9a's ladder found
@@ -7,19 +7,19 @@
 //! - the GL context reports a reset (`render_gl`: a robust context, so Mesa reports instead of aborting the process);
 //! - the GPU has not finished a frame for `LATE` (`late`);
 //! - a present (or the wait for the last flip before a frame) has not returned for `STALL`: stuck in the driver. Nothing in
-//!   this process can draw any more, so the stall thread ends it with `LOST_EXIT`, and the rescue build that handed
-//!   over and waits (`flavour`) takes the screen with the session. Only the waits on the display count: a slow first
-//!   frame (shaders on a cold boot), a new renderer or a burst of imports is work, not a hang; a loop turn as a whole
-//!   gets `TURN_STALL`, the bound for a hang anywhere else.
+//!   this process can draw any more, so the stall thread ends it with `LOST_EXIT`, and the console takes the screen back.
+//!   Only the waits on the display count: a slow first frame (shaders on a cold boot), a new renderer or a burst of
+//!   imports is work, not a hang; a loop turn as a whole gets `TURN_STALL`, the bound for a hang anywhere else.
 //!
-//! The first three switch the renderer in this process (`main.rs` `leave_gpu`), so every client that survives the loss
-//! keeps its window. The looks cost one open and close of the node a second and one atomic store per loop turn.
+//! A reset the device lived through gets a new GLES renderer in this process (`main.rs` `leave_gpu`), so every client
+//! keeps its window; a lost device ends the desktop with one line. The looks cost one open and close of the node a
+//! second and one atomic store per loop turn.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// The gpu build's exit status when it gave the GPU up and cannot draw on: the waiting rescue build takes over.
+/// bitscomp's exit status when it lost the GPU and cannot draw on: the console takes the screen back.
 pub const LOST_EXIT: i32 = 75;
 /// How often the node is looked at.
 pub const LOOK_EVERY: Duration = Duration::from_secs(1);
@@ -29,8 +29,8 @@ pub const STALL: Duration = Duration::from_secs(6);
 /// A loop turn longer than this, outside the presents, is a hang elsewhere (a driver call that never returns). Far above
 /// a cold first frame or a new renderer.
 pub const TURN_STALL: Duration = Duration::from_secs(30);
-/// The GPU's work on a frame unfinished this long: the device does not come back by itself. Above slow GL work (a
-/// software rasteriser's first blur), the ladder's own timeouts are GX-9a's.
+/// The GPU's work on a frame unfinished this long: the device does not come back by itself. Far above slow GL work (a
+/// first blur on a cold cache); the ladder's own timeouts are GX-9a's.
 pub const LATE: Duration = Duration::from_secs(10);
 
 /// What one look at the node says.
@@ -150,7 +150,7 @@ fn end_stuck(what: &str, held: Duration) -> ! {
     let mut out = std::io::Cursor::new(&mut buf[..]);
     let _ = writeln!(
         out,
-        "bitscomp: gpu: {what} for {} ms (stuck in the driver): ending with {LOST_EXIT}, the rescue build takes over",
+        "bitscomp: gpu: {what} for {} ms (stuck in the driver): ending with {LOST_EXIT}, the console takes the screen back",
         held.as_millis()
     );
     let n = out.position() as usize;

@@ -6,12 +6,17 @@ description = "BitsOS settings registry (CL-1): typed keys, journal with undo, s
 publish = false
 
 # A member of the user workspace (INT-W3). No crates.io dependencies on purpose: the user workspace has no
-# serde/toml. usys (UL's raw system calls) gives umask without unsafe here.
+
 
 [dependencies]
 usys = { path = "../../tools/usys" }
 # MC-6 client library (no dependencies of its own): registers the settings_* MCP tools (CL-2).
 mcpreg = { path = "../../lib/mcpreg" }
+# INT-CL-4: whose "confirmed" counts (vouch.rs) is the installer's and bitspkgd's judgement of the session's
+# compositor: one rule, bitsinstall::judge_peer. A workspace crate, nothing new to download.
+bitsinstall = { path = "../bitsinstall" }
+# PLAN K2 F3: a peer in the assistant's process tree is never Georg's yes (vouch.rs); the one place user space asks.
+bitstree = { path = "../../lib/bitstree" }
 
 [lib]
 path = "src/lib.rs"

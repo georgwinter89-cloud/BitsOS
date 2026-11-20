@@ -1,6 +1,6 @@
-//! Partitions as block devices (NV-1; the file is NV's inside FS's crate, fs-FS-6.md:171). The partition
-//! table itself is read once by `table::scan` at registration (GPT: linux-6.6/block/partitions/efi.c:335-433,
-//! :581-640; MBR: msdos.c); its `Scan::parts` (first LBA, blocks, type, Linux number) become `Partition`s here,
+//! Partitions as block devices (NV-1; the file is NV's inside FS's crate). The partition
+//! table itself is read once by `table::scan` at registration (GPT: linux-7.3.1/block/partitions/efi.c:334-450,
+//! :580-666; MBR: msdos.c); its `Scan::parts` (first LBA, blocks, type, Linux number) become `Partition`s here,
 //! each a `C: BlockDevice` over the whole disk's `DiskDevice`, registered as `DiskKind::Stacked`. So every
 //! write to a partition passes the whole disk's write-refusal hook (R8a: a disk with a Windows or EFI System
 //! partition refuses for good, NVMe without `nvme_write=on` too) before its own.
@@ -9,6 +9,8 @@
 //! `block/src/lib.rs` (change request NV-1 CR 1).
 
 pub mod window;
+#[cfg(test)]
+mod gp_lexar;
 
 use alloc::format;
 use alloc::string::String;
@@ -17,7 +19,7 @@ use alloc::vec::Vec;
 use devmodel::DevError;
 use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoBuf, IoPriority};
 
-/// Linux's partition name (linux-6.6/block/partitions/core.c:349): a disk name ending in a digit gets a
+/// Linux's partition name (linux-7.3.1/block/partitions/core.c:337): a disk name ending in a digit gets a
 /// `p` before the number (`nvme0n1p1`), others not (`sda1`).
 pub fn part_name(disk: &str, number: u32) -> String {
     if disk.chars().last().is_some_and(|c| c.is_ascii_digit()) { format!("{disk}p{number}") } else { format!("{disk}{number}") }
@@ -79,6 +81,10 @@ impl BlockDevice for Partition {
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
         let at = self.range(lba, blocks)?;
         self.lower.discard(at, blocks)
+    }
+    fn discard_at(&self, lba: u64, blocks: u64, prio: IoPriority) -> Result<(), DevError> {
+        let at = self.range(lba, blocks)?;
+        self.lower.discard_at(at, blocks, prio)
     }
     /// BL-2: the same frames down, each read moved by the partition's offset (Linux `blk_partition_remap`).
     fn read_frames(&self, reqs: &[FrameIo], prio: IoPriority) -> Result<(), DevError> {

@@ -1,7 +1,8 @@
-//! SMU 13.0.4 (MP1): Linux's `smu_v13_0` block with the 13.0.4 table (linux-6.6 pm/swsmu/smu13/smu_v13_0_4_ppt.c).
-//! The APU's SMU firmware lives in the BIOS: there is no file to load (Linux's microcode init returns early for
-//! APUs). The driver talks to it through a mailbox: message C2PMSG_66, argument C2PMSG_82, response C2PMSG_90
-//! (smu_v13_0_4_ppt.c:1127-1134). Power-up of GFX through the IMU on APUs goes through it (GX-7).
+//! SMU 13.0.4 (MP1): Linux's `smu_v13_0` block with the 13.0.4 table (linux-7.3.1 pm/swsmu/smu13/smu_v13_0_4_ppt.c).
+//! The APU's SMU firmware lives in the BIOS: there is no file to load (Linux's microcode init returns early for APUs).
+//! The driver talks to it through a mailbox: message C2PMSG_66, argument C2PMSG_82, response C2PMSG_90
+//! (smu_v13_0_4_ppt.c:1127-1141 `smu_v13_0_4_init_msg_ctl`). Power-up of GFX through the IMU on APUs goes through it
+//! (GX-7).
 //!
 //! GX-7e: the message ids and answer codes (the real client `gpucore::smu` and the fake `smufake` share them),
 //! the driver mailbox's addresses from the discovery table, and the SMN window FIRMWARE_FLAGS is read through.
@@ -39,7 +40,7 @@ pub const RESP: (usize, u32) = (1, 0x29a);
 /// GX-7b: the GFXOFF state without a message: SMUIO_GFX_MISC_CNTL bits 2:1 PWR_GFXOFF_STATUS, 0 in GFXOFF,
 /// 1 leaving, 2 not in GFXOFF (GC powered), 3 entering (segment 0 of SMUIO). Linux defines and reads it for the
 /// SMU 13.0.1/13.0.3 APUs (yellow_carp_ppt.c:45-48, :616-626); 6.6's 13.0.4 table has no reader, so on the
-/// 780M it is unverified until the Mini-PC answers (gx-GX-7b.md).
+/// 780M it is unverified until the Mini-PC answers (plan/spec/gpu.md §11.4).
 pub const SMUIO_GFX_MISC_CNTL: (usize, u32) = (0, 0xc5);
 /// The DCN's own mailbox to PMFW (C2PMSG_67/83/91 of MP1): read-only here, owned by the display (dmub).
 pub const DCN_RESP: (usize, u32) = (1, 0x29b);

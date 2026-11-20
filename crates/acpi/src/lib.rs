@@ -2,7 +2,7 @@
 //! Owner: CP. CP's CPU set-up and SMP bring-up live in `crates/platform` (CP-4), on top of this crate.
 //!
 //! Tables are read without an AML interpreter (spec/core.md §4): RSDP from BootInfo, XSDT (RSDT as
-//! fallback), FADT, MADT, HPET, MCFG, IVRS, SRAT, the DSDT for `\_S5`. Firmware data is hostile input:
+//! fallback), FADT, MADT, HPET, MCFG, IVRS, DMAR, SRAT, the DSDT for `\_S5`. Firmware data is hostile input:
 //! every read is bounded by the table's own length, checksums are checked, nothing panics.
 //! - pure parsing: `parse::parse` over a `mem::PhysMem` (host-tested with table builders),
 //! - the kernel side: `live::init(&BootInfo)` reads the tables once (`kmem` reads physical memory), keeps
@@ -17,6 +17,8 @@ pub mod bytes;
 pub mod clock;
 pub mod cpu_keys;
 pub mod cst;
+pub mod dmar;
+pub mod dmi;
 pub mod fadt;
 pub mod guard;
 pub mod hpet;
@@ -39,6 +41,7 @@ pub mod rsdp;
 pub mod s5;
 pub mod sdt;
 pub mod srat;
+pub mod tco;
 #[doc(hidden)]
 pub mod testkit;
 
@@ -49,6 +52,7 @@ mod ktests;
 mod tests;
 
 pub use cpu_keys::cpu_keys;
+pub use dmar::dma_gate;
 pub use live::{check_gas, check_io, check_mem, init, set_pci_view, tables, trampoline};
 
 use alloc::vec::Vec;
@@ -154,6 +158,8 @@ pub struct Acpi {
     pub hpet: Option<hpet::Hpet>,
     pub mcfg: Vec<mcfg::Ecam>,
     pub ivrs: Option<ivrs::Ivrs>,
+    /// The Intel VT-d table (GP B7); the IOMMUs' state at handover is `dmar::found()`.
+    pub dmar: Option<dmar::Dmar>,
     pub srat: Option<srat::Srat>,
     pub dsdt: Option<TableInfo>,
     /// `\_S5` and where it was found (signature, physical address of that table).

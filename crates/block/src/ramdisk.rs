@@ -5,7 +5,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoPriority};
+use devmodel::block::{BlockDevice, BlockInfo, FrameIo, IoBuf, IoPriority};
 use devmodel::DevError;
 use ksync::{SpinLock, WaitQueue};
 
@@ -281,14 +281,44 @@ impl BlockDevice for RamDisk {
         }
         Ok(())
     }
+    /// One call log entry per request of at most `max_blocks_per_request`, the bytes copied from the frames straight
+    /// into the disk's memory: no bounce buffer (a megabyte from the heap per write-back step otherwise, which an
+    /// NVMe controller taking the frames by DMA does not cost either).
+    fn write_frames(&self, lba: u64, buf: &IoBuf, fua: bool, prio: IoPriority) -> Result<(), DevError> {
+        if self.read_only {
+            return Err(DevError::Refused);
+        }
+        let bs = self.block_size as usize;
+        if buf.is_empty() || !buf.len().is_multiple_of(bs) {
+            return Err(DevError::InvalidArgument);
+        }
+        let max = (self.max_blocks.load(Ordering::Relaxed).max(1) as usize).saturating_mul(bs);
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = (buf.len() - done).min(max);
+            let at = lba.checked_add((done / bs) as u64).ok_or(DevError::InvalidArgument)?;
+            self.enter(CallOp::Write { fua }, at, (n / bs) as u64, prio)?;
+            let mut d = self.data.lock();
+            let r = self.range(at, n, d.len())?;
+            if !buf.read(done, &mut d[r]) {
+                return Err(DevError::InvalidArgument);
+            }
+            done += n;
+        }
+        Ok(())
+    }
     fn queue_depth(&self) -> u32 {
         self.depth.load(Ordering::Relaxed)
     }
     fn discard(&self, lba: u64, blocks: u64) -> Result<(), DevError> {
+        self.discard_at(lba, blocks, IoPriority::Background)
+    }
+    /// The call log shows the priority the layers above passed down.
+    fn discard_at(&self, lba: u64, blocks: u64, prio: IoPriority) -> Result<(), DevError> {
         if self.read_only {
             return Err(DevError::Refused);
         }
-        self.enter(CallOp::Discard, lba, blocks, IoPriority::Background)?;
+        self.enter(CallOp::Discard, lba, blocks, prio)?;
         let bs = self.block_size as usize;
         let mut d = self.data.lock();
         let len = usize::try_from(blocks).ok().and_then(|b| b.checked_mul(bs)).ok_or(DevError::InvalidArgument)?;

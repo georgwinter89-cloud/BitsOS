@@ -26,6 +26,24 @@ pub struct Tx {
     pub undo_nodes: BTreeMap<u32, Vec<u8>>,
     /// Block ranges (first, count) this transaction frees.
     pub freed: Vec<(u64, u64)>,
+    /// BIGDIR: the directories whose blocks or inode it changed: what memory knows of them beside the inode
+    /// (`dirx`: the index, the numbers for fstat) is forgotten when it is not committed (`State::abort`).
+    /// Emptied by `settle_dirs` only: a transaction dropped with directories in it trips `drop`.
+    dirs: Vec<u32>,
+}
+
+impl Drop for Tx {
+    /// A transaction that changed a directory ends in `State::commit` or `State::abort`: both take its
+    /// directories (`settle_dirs`). One that is just dropped (an early return between `Tx::new` and the commit)
+    /// would leave the index in memory ahead of the disk with nothing to say so.
+    fn drop(&mut self) {
+        // A test that already fails drops its transactions on the way out: its own message is the one to show.
+        #[cfg(test)]
+        if std::thread::panicking() {
+            return;
+        }
+        debug_assert!(self.dirs.is_empty(), "a transaction that changed directories {:?} was dropped without commit or abort", self.dirs);
+    }
 }
 
 impl Tx {
@@ -71,5 +89,15 @@ impl Tx {
     }
     pub fn blocks(&self) -> usize {
         self.at.len()
+    }
+    pub fn touch_dir(&mut self, ino: u32) {
+        if !self.dirs.contains(&ino) {
+            self.dirs.push(ino);
+        }
+    }
+    /// The directories it changed, taken by whoever decides what memory keeps of them: the commit that wrote
+    /// (or joined) it, or the abort that forgets their indexes.
+    pub fn settle_dirs(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.dirs)
     }
 }

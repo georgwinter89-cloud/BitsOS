@@ -13,10 +13,12 @@
 //! under `ext4.vol` on the common paths. A commit writes the log with the lock released (`commit_out`, lock
 //! `ext4.commit` > `ext4.vol`, one commit at a time; `journal`'s module text); a file read maps under the lock and
 //! reads the blocks after it; read-only calls never read the device under it (`read_op`); `writable` and a file's
-//! st_blocks need no lock. Left under the lock: a change's own metadata reads on a cache miss, and the copy of a
-//! write-back step's data into the device's cache.
+//! st_blocks need no lock. Left under the lock: a change's own metadata reads on a cache miss. FS-W: a write-back
+//! step's data goes to the device with the lock released too (`flight`).
 
 use crate::dev::Dev;
+pub use crate::dropped::Slot;
+use crate::dropped::Dropped;
 use crate::gd::{self, Table};
 use crate::inode::DiskInode;
 use crate::le::*;
@@ -53,8 +55,8 @@ pub struct Volume {
     pub st: Mutex<State>,
     pub dev: Arc<dyn Dev>,
     /// Inodes the VFS let go of (`forget`): freed under the lock at the next call (a drop may come under
-    /// other locks).
-    dropped: SpinLock<Vec<u32>>,
+    /// other locks, so noting one allocates nothing: `dropped`'s module text).
+    dropped: SpinLock<Dropped>,
     pub label: [u8; 16],
     /// Frozen for a snapshot (`freeze`); changes wait in `lock_rw` until `thaw`.
     frozen: AtomicBool,
@@ -67,6 +69,10 @@ pub struct Volume {
     commit_lift: block::prio::Lift,
     /// `State::stopped`: a failed write made the volume read-only.
     stopped: Arc<AtomicBool>,
+    /// FS-W: counts the write-back steps that ended; who waits for a file's step (`lock_file`) or for all of them
+    /// (`freeze`) sleeps on `flight_done` until it moves.
+    flights_ended: AtomicU64,
+    flight_done: WaitQueue,
 }
 
 /// Rounds of a read-only call that met blocks the device's cache did not hold (`read_op`): each round reads the
@@ -86,6 +92,14 @@ fn user_errno(e: i64) -> i64 {
 /// writers to drain before a freeze (10 s), so a freeze holder that never thaws cannot hang the flusher, a
 /// sync or a Reload.
 const WRITEBACK_WAIT: u64 = 100;
+
+/// What `Volume::hold` gives the holder of an inode.
+pub struct Hold {
+    /// The file's st_blocks as the volume keeps it.
+    pub blocks: Arc<AtomicU64>,
+    /// For `Volume::forget`, when the holder goes.
+    pub slot: Slot,
+}
 
 /// What `stat` needs of a node.
 pub type Stat = DiskInode;
@@ -152,7 +166,7 @@ impl Volume {
         let seed = g32(&raw, sb::WTIME) ^ geo.uuid.iter().fold(0u32, |a, &b| a.rotate_left(5) ^ b as u32);
         let recover = g32(&raw, sb::FEATURE_INCOMPAT) & sb::incompat::RECOVER != 0;
         let stopped = Arc::new(AtomicBool::new(false));
-        let mut st = State { dev: dev.clone(), geo: geo.clone(), sb: raw, gd, nodes: BTreeMap::new(), reserved: 0, now: opts.now, next_gen: seed, writable: access == Access::ReadWrite, written: 0, jnl: None, dirty: false, frozen: false, stopped: stopped.clone(), no_io: Cell::new(false), miss: Cell::new(None) };
+        let mut st = State { dev: dev.clone(), geo: geo.clone(), sb: raw, gd, nodes: BTreeMap::new(), reserved: 0, flights: Default::default(), held: Default::default(), now: opts.now, next_gen: seed, writable: access == Access::ReadWrite, written: 0, jnl: None, dirty: false, frozen: false, stopped: stopped.clone(), no_io: Cell::new(false), miss: Cell::new(None), dirx: Default::default(), map_lookups: Cell::new(0) };
         if geo.has_compat(sb::compat::HAS_JOURNAL) {
             match crate::journal::load(&st, st.writable)? {
                 Ok((j, disk)) if recover && disk.start != 0 && replayed.is_none() => return Volume::recover(dev, opts, &st, j, disk),
@@ -178,14 +192,17 @@ impl Volume {
             st.counts_from_groups();
         }
         let lift_dev = dev.clone();
-        let vol = Arc::new(Volume { geo, access, st: Mutex::named("ext4.vol", st), dev, dropped: SpinLock::named("ext4.dropped", Vec::new()), label, frozen: AtomicBool::new(false), thawed: WaitQueue::new(), wb_gave_up: AtomicBool::new(false), commit_lock: Mutex::named("ext4.commit", ()), commit_lift: block::prio::Lift::new(), stopped });
+        let vol = Arc::new(Volume { geo, access, st: Mutex::named("ext4.vol", st), dev, dropped: SpinLock::named("ext4.dropped", Dropped::new()), label, frozen: AtomicBool::new(false), thawed: WaitQueue::new(), wb_gave_up: AtomicBool::new(false), commit_lock: Mutex::named("ext4.commit", ()), commit_lift: block::prio::Lift::new(), stopped, flights_ended: AtomicU64::new(0), flight_done: WaitQueue::new() });
         let _ = lift_dev;
         if writable {
-            crate::file::write_bufs_init();
+            // FS-W2: a disk with 4 KiB blocks writes its files' pages themselves and needs no buffer.
+            if !(vol.geo.bs == 4096 && vol.dev.takes_pages()) {
+                crate::file::write_bufs_init();
+            }
             let mut st = vol.st.lock();
             st.ensure_dirty()?;
             if let Err(e) = st.orphan_cleanup() {
-                // `ext4_orphan_cleanup` (linux-6.6/fs/ext4/orphan.c): an orphan it cannot read ends the list
+                // `ext4_orphan_cleanup` (linux-7.3.1/fs/ext4/orphan.c:466): an orphan it cannot read ends the list
                 // (s_last_orphan = 0) and the mount goes on; what is left over is e2fsck's.
                 klog::event!(Warn, "ext4", "orphan.cleanup_failed", errno = e; "orphan list dropped, mount goes on");
                 if st.writable {
@@ -266,9 +283,9 @@ impl Volume {
         };
         let mut st = VolGuard { _held: lift.map(|l| l.hold()), g };
         if !st.frozen {
-            let gone: Vec<u32> = core::mem::take(&mut *self.dropped.lock());
-            for ino in gone {
-                self.reap(&mut st, ino);
+            let gone = self.dropped.lock().take();
+            for slot in gone.oldest_first() {
+                self.reap(&mut st, slot);
             }
         }
         st
@@ -310,6 +327,40 @@ impl Volume {
         }
     }
 
+    /// `lock_rw` (`lock_wb` for a write-back) for a call that changes file `ino`'s mapping or frees its blocks:
+    /// a write-back step of the file whose data is at the device ends first (`flight`). `interruptible`: the
+    /// wait for that step ends with EINTR when the calling program has a signal (`wait_flight`).
+    fn lock_file(&self, ino: u32, writeback: bool, interruptible: bool) -> Result<VolGuard<'_>, i64> {
+        loop {
+            let st = self.lock_change(writeback)?;
+            if !st.flights.has(ino) {
+                return Ok(st);
+            }
+            self.wait_flight(st, interruptible)?;
+        }
+    }
+
+    /// Releases the lock and sleeps until a step ended (the count is read under the lock, with the step still
+    /// there, so its end is never missed). The step ends when the device answers or times out; a wait of 10 s is
+    /// logged once. `interruptible` is for callers that have changed nothing yet (fallocate, a freeze): EINTR
+    /// when the program was killed or has a signal, as while frozen (`wait_thawed`). A truncate is not: the VFS
+    /// has cut its pages already, and Linux's truncate waits for write-back without a way out too.
+    fn wait_flight(&self, st: VolGuard<'_>, interruptible: bool) -> Result<(), i64> {
+        let seen = self.flights_ended.load(Ordering::Acquire);
+        drop(st);
+        let mut slices = 0u64;
+        while !self.flight_done.wait_until_timeout(|| self.flights_ended.load(Ordering::Acquire) != seen, 100_000_000) {
+            if interruptible && vfs::dentry::interrupted() {
+                return Err(EINTR);
+            }
+            slices += 1;
+            if slices == 100 {
+                klog::event!(Warn, "ext4", "flight.change_waits", waited_ms = slices * 100; "a change waits for a file's data write at the device");
+            }
+        }
+        Ok(())
+    }
+
     fn wait_thawed(&self, writeback: bool) -> Result<(), i64> {
         let mut slices = 0u64;
         while self.frozen.load(Ordering::Acquire) {
@@ -333,7 +384,14 @@ impl Volume {
         Ok(())
     }
 
-    fn reap(&self, st: &mut State, ino: u32) {
+    fn reap(&self, st: &mut State, slot: Slot) {
+        let ino = slot.ino();
+        if st.flights.has(ino) {
+            // Its step at the device still writes to its blocks: dealt with at a `lock` after the step ended
+            // (in the slot it came in: the volume lock is held, but nothing is asked of the heap for it).
+            self.dropped.lock().note(slot);
+            return;
+        }
         let Some(n) = st.nodes.get_mut(&ino) else { return };
         n.holders = n.holders.saturating_sub(1);
         if n.holders > 0 {
@@ -351,8 +409,10 @@ impl Volume {
         st.nodes.remove(&ino);
     }
 
-    /// The VFS holds inode `ino` (a regular file's ops object exists): its st_blocks as the volume keeps it.
-    pub fn hold(&self, ino: u32) -> Result<Arc<AtomicU64>, i64> {
+    /// The VFS holds inode `ino` (a regular file's ops object exists): its st_blocks as the volume keeps it,
+    /// and the slot its `forget` will need, made here where the heap may wait.
+    pub fn hold(&self, ino: u32) -> Result<Hold, i64> {
+        let slot = Slot::new(ino);
         // Read once without the lock held over the device, then again under it (from memory now): the inode may
         // have changed in between.
         self.read_op(|st| st.inode(None, ino))?;
@@ -361,14 +421,14 @@ impl Volume {
         let blocks = di.blocks512(&st.geo);
         let n = st.nodes.entry(ino).or_insert_with(|| Node { di, holders: 0, reserved: BTreeMap::new(), blocks: Arc::new(AtomicU64::new(blocks)) });
         n.holders += 1;
-        Ok(n.blocks.clone())
+        Ok(Hold { blocks: n.blocks.clone(), slot })
     }
 
     /// The VFS let go of inode `ino` (the last reference to its ops object went). Only noted: the drop may
     /// come under any lock, freeing needs the volume lock and the device (done by the next `lock`; a cut
-    /// before leaves it on the orphan list for the next mount).
-    pub fn forget(&self, ino: u32) {
-        self.dropped.lock().push(ino);
+    /// before leaves it on the orphan list for the next mount). `slot`: the one `hold` gave for it.
+    pub fn forget(&self, slot: Slot) {
+        self.dropped.lock().note(slot);
     }
 
     /// FS-STALL: a read-only call under the lock that never waits for the device there. A block the device's
@@ -399,6 +459,11 @@ impl Volume {
         }
         let mut st = self.lock();
         f(&mut st)
+    }
+
+    /// Inodes the VFS holds now (`hold`), after the ones it let go of are reaped.
+    pub fn held_inodes(&self) -> usize {
+        self.lock().nodes.len()
     }
 
     pub fn stat(&self, ino: u32) -> Result<DiskInode, i64> {
@@ -473,16 +538,39 @@ impl Volume {
         })
     }
 
-    /// Writes a run of a file's pages (`write_run`): the disk size follows up to `size`.
+    /// Writes a step of a file's pages (`write_run`): the disk size follows up to `size`. The data goes to the
+    /// device with the volume lock released (`flight`, FS-W): the blocks are claimed under the lock, mapped under
+    /// it again after the device took the data.
     pub fn write(&self, ino: u32, off: u64, data: &[u8], size: u64, pages: core::ops::Range<u64>) -> Result<(), i64> {
-        let mut st = self.lock_wb()?;
-        // This run's promises are used now; the others' stay out of reach.
-        // A run may use as much of the root reserve as it was promised (root's writes reserve from it). A promise
-        // into the reserve can be smaller than what the reserve still has to give: `write_run`'s steps, and any short
-        // run of root's with the volume already below the reserve. What was promised is always there (`reserve_pages`).
-        let promised = st.release_reserved(ino, pages);
-        let keep = (st.reserved + sb::reserved_blocks(&st.sb, &st.geo).saturating_sub(promised)).min(st.free_blocks().saturating_sub(promised));
-        st.write_file(ino, off, data, size, keep)
+        self.write_step(ino, off, &crate::flight::Src::Bytes(data), size, pages)
+    }
+
+    /// FS-W2: `write` from the file's cache pages themselves (`len` bytes from the first page's start): on a disk
+    /// they are the request's memory, nothing is copied (`Dev::write_pages`).
+    pub fn write_pages(&self, ino: u32, off: u64, from: &[Arc<vfs::pagecache::CachePage>], len: usize, size: u64, pages: core::ops::Range<u64>) -> Result<(), i64> {
+        self.write_step(ino, off, &crate::flight::Src::Pages(from, len), size, pages)
+    }
+
+    fn write_step(&self, ino: u32, off: u64, data: &crate::flight::Src<'_>, size: u64, pages: core::ops::Range<u64>) -> Result<(), i64> {
+        let step = {
+            let mut st = self.lock_file(ino, true, false)?;
+            // This run's promises are used now; the others' stay out of reach.
+            // A run may use as much of the root reserve as it was promised (root's writes reserve from it). A promise
+            // into the reserve can be smaller than what the reserve still has to give: `write_run`'s steps, and any short
+            // run of root's with the volume already below the reserve. What was promised is always there (`reserve_pages`).
+            let promised = st.release_reserved(ino, pages);
+            let keep = (st.reserved + sb::reserved_blocks(&st.sb, &st.geo).saturating_sub(promised)).min(st.free_now().saturating_sub(promised));
+            st.write_begin(ino, off, data.len(), keep)?
+        };
+        let wrote = crate::flight::write_segs(&*self.dev, &self.geo, &step, data);
+        // The plain lock: a freeze waits for this step (`freeze`), so the volume is not frozen under it.
+        let r = {
+            let mut st = self.lock();
+            st.write_end(&step, wrote, off, data.len(), size)
+        };
+        self.flights_ended.fetch_add(1, Ordering::AcqRel);
+        self.flight_done.wake_all();
+        r.map_err(user_errno)
     }
 
     /// Promises blocks for the file pages [first, last] that `write_at` makes dirty and the disk does not
@@ -497,15 +585,15 @@ impl Volume {
 
     /// fallocate's blocks for [off, off + len): unwritten extents now (`State::fallocate`).
     pub fn fallocate(&self, ino: u32, off: u64, len: u64) -> Result<(), i64> {
-        let mut st = self.lock_rw()?;
+        let mut st = self.lock_file(ino, false, true)?;
         let keep = st.keep_for(None);
         st.fallocate(ino, off, len, keep)
     }
 
     pub fn set_size(&self, ino: u32, size: u64) -> Result<(), i64> {
-        let mut st = self.lock_rw()?;
+        let mut st = self.lock_file(ino, false, false)?;
         st.release_reserved(ino, size.div_ceil(4096)..u64::MAX);
-        st.set_file_size(ino, size)
+        st.set_file_size(ino, size).map_err(user_errno)
     }
 
     /// Stores what the VFS holds of an inode: mode, owner and times (`setattr`, a file's write-back).
@@ -553,7 +641,7 @@ impl Volume {
                 overhead += di.blocks512(geo) / (geo.bs / 512);
             }
         }
-        let free = st.free_blocks().saturating_sub(st.reserved);
+        let free = st.free_now().saturating_sub(st.reserved);
         let r = sb::reserved_blocks(&st.sb, geo);
         let u = &geo.uuid;
         let fsid = u64::from_le_bytes([u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]]) ^ u64::from_le_bytes([u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]]);
@@ -611,9 +699,20 @@ impl Volume {
             None => false,
         };
         if !logged {
-            self.dev.flush()?;
+            self.flush_dev()?;
         }
         self.dev.settle()
+    }
+
+    /// The device's flush; on a volume without a journal it also lets the allocator have the blocks whose free it
+    /// made durable (`held`).
+    fn flush_dev(&self) -> Result<(), i64> {
+        let held = self.st.lock().held.mark();
+        self.dev.flush()?;
+        if let Some(mark) = held {
+            self.st.lock().held.release(mark);
+        }
+        Ok(())
     }
 
     /// Commits the journal (FS-STALL): a transaction is taken out under the volume lock, written and flushed
@@ -701,7 +800,7 @@ impl Volume {
 
     fn sync_fs_inner(&self) -> Result<(), i64> {
         self.commit_out(None)?;
-        self.dev.flush()?;
+        self.flush_dev()?;
         {
             let mut st = self.lock();
             st.make_clean()?;
@@ -717,14 +816,21 @@ impl Volume {
         if self.frozen.swap(true, Ordering::AcqRel) {
             return Err(EBUSY);
         }
-        let r = {
-            let mut st = self.lock();
-            let r = st.make_clean();
-            if r.is_ok() {
-                st.frozen = true;
-            }
-            r
-        };
+        let r = (|| {
+            // FS-W: the steps whose data is at the device end first (no new one begins: `wait_thawed`), so nothing
+            // reaches the disk after the freeze and no step's end meets a frozen volume. A freezer with a signal
+            // gives the freeze up (EINTR, thawed below).
+            let mut st = loop {
+                let st = self.lock();
+                if st.flights.is_empty() {
+                    break st;
+                }
+                self.wait_flight(st, true)?;
+            };
+            st.make_clean()?;
+            st.frozen = true;
+            Ok(())
+        })();
         match r.and_then(|()| self.dev.flush()) {
             Ok(()) => {
                 klog::event!(Info, "ext4", "frozen");
@@ -778,7 +884,9 @@ impl vfs::writeback::Flush for Volume {
         if self.is_frozen() {
             return Ok(());
         }
-        self.commit_out(None).map(|_| ())
+        self.commit_out(None)?;
+        // No journal: this pass is what makes a delete's free durable when nobody syncs (`held`).
+        if self.st.lock().held.is_empty() { Ok(()) } else { self.flush_dev().map_err(user_errno) }
     }
     /// Before a Reload or power-off: committed, checkpointed, clean on disk (`sync_fs`); a frozen volume was
     /// made clean by its freeze and stays as it is.

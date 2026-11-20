@@ -1,6 +1,6 @@
 //! Names on the volume: create (files, directories, symlinks fast and slow, device nodes, FIFOs, sockets),
 //! hard links, unlink/rmdir with the orphan list, rename (over an existing name, across directories) and
-//! RENAME_EXCHANGE, following linux-6.6/fs/ext4/namei.c. Each is one transaction; freeing an inode is
+//! RENAME_EXCHANGE, following linux-7.3.1/fs/ext4/namei.c. Each is one transaction; freeing an inode is
 //! `evict`'s two more. An inode whose last name goes is put on the orphan list in the same transaction, so a
 //! cut before it is freed leaves it to the next mount's orphan cleanup, not to e2fsck.
 
@@ -72,7 +72,7 @@ impl State {
     }
 
     /// A directory whose link count may pass LINK_MAX (it then stays 1): an htree directory on a dir_nlink
-    /// volume (`EXT4_DIR_LINK_MAX`, linux-6.6/fs/ext4/ext4.h:2435; `ext4_inc_count`, namei.c:2766). Asked
+    /// volume (`EXT4_DIR_LINK_MAX`, linux-7.3.1/fs/ext4/ext4.h:2642; `ext4_inc_count`, namei.c:2761). Asked
     /// before an insert turns the directory linear (`add_name`), as Linux would still see it indexed.
     fn may_overflow(&self, d: &DiskInode) -> bool {
         self.geo.has_ro(crate::sb::ro::DIR_NLINK) && self.geo.has_compat(crate::sb::compat::DIR_INDEX) && d.flags() & FL_INDEX != 0
@@ -101,6 +101,20 @@ impl State {
     /// A victim lost its last name: on the orphan list (freed at `forget`, or right after the commit).
     fn last_link(&mut self, tx: &mut Tx, v: &mut DiskInode) {
         self.orphan_add(tx, v);
+    }
+
+    /// Frees inode `ino`, whose last name went in a transaction that is committed. A failure here must not
+    /// become the answer of the unlink or rename: the name is gone on the disk, and an error would leave the VFS
+    /// holding a name the directory no longer has. What is left of the inode is found without this mount's help:
+    /// `last_link` put it on the orphan list in the transaction that took the name, and it stays there until
+    /// `evict`'s transaction, so a failure up to that one leaves it to the next mount's `orphan_cleanup`. With a
+    /// journal that one transaction also gives the blocks and the bit back (FSR). Without one they go in a second:
+    /// a failure there (the inode is deleted, its blocks and its bit are not given back yet) leaves bitmap
+    /// differences for e2fsck, as a power cut between the two does.
+    fn evict_after_commit(&mut self, ino: u32) {
+        if let Err(e) = self.evict_unheld(ino) {
+            klog::event!(Warn, "ext4", "evict.failed", ino = ino, errno = e; "an unlinked inode was not freed; the unlink stands, the next mount or e2fsck frees the rest");
+        }
     }
 
     fn create_in(&mut self, tx: &mut Tx, dir_ino: u32, name: &[u8], mode: u16, uid: u32, gid: u32, kind: Kind) -> Result<DiskInode, i64> {
@@ -195,7 +209,7 @@ impl State {
     /// unlink/rmdir; returns whether the victim must be freed now (no VFS holder).
     fn remove_in(&mut self, tx: &mut Tx, dir_ino: u32, name: &[u8], ino: u32) -> Result<bool, i64> {
         let mut parent = self.dir_inode(tx, dir_ino)?;
-        let slot = self.find(Some(tx), &parent, name)?.ok_or(ENOENT)?;
+        let slot = self.locate_sure(tx, &parent, name)?.ok_or(ENOENT)?;
         if slot.e.ino != ino {
             klog::event!(Warn, "ext4", "remove.mismatch", dir = dir_ino, want = ino, found = slot.e.ino);
             return Err(ENOENT);
@@ -205,6 +219,7 @@ impl State {
             if !self.is_empty_dir(&v)? {
                 return Err(ENOTEMPTY);
             }
+            self.dirx.forget(ino);
             v.set_links(0);
             Self::dec_dir_links(&mut parent);
         } else {
@@ -229,7 +244,7 @@ impl State {
         if ndir != odir {
             dirs.insert(ndir, self.dir_inode(tx, ndir)?);
         }
-        let oslot = self.find(Some(tx), &dirs[&odir], oname)?.ok_or(ENOENT)?;
+        let oslot = self.locate_sure(tx, &dirs[&odir], oname)?.ok_or(ENOENT)?;
         if oslot.e.ino != ino {
             return Err(ENOENT);
         }
@@ -241,7 +256,7 @@ impl State {
         match target {
             Some(t) => {
                 let nd = dirs[&ndir].clone();
-                let ts = self.find(Some(tx), &nd, nname)?.ok_or(ENOENT)?;
+                let ts = self.locate_sure(tx, &nd, nname)?.ok_or(ENOENT)?;
                 if ts.e.ino != t {
                     return Err(ENOENT);
                 }
@@ -250,6 +265,7 @@ impl State {
                     if !self.is_empty_dir(&tv)? {
                         return Err(ENOTEMPTY);
                     }
+                    self.dirx.forget(t);
                     tv.set_links(0);
                     Self::dec_dir_links(dirs.get_mut(&ndir).ok_or(EUCLEAN)?);
                 } else {
@@ -272,8 +288,9 @@ impl State {
                 dirs.insert(ndir, nd);
             }
         }
+        // The old name's slot still stands: an insert never moves an entry, and `remove_name` takes the block as
+        // the transaction has it now and checks the entry before it writes.
         let od = dirs[&odir].clone();
-        let oslot = self.find(Some(tx), &od, oname)?.ok_or(EUCLEAN)?;
         self.remove_name(tx, &od, &oslot)?;
         if mv_dir && odir != ndir {
             if mv.flags() & FL_INDEX != 0 {
@@ -297,8 +314,8 @@ impl State {
         let mut dirs: BTreeMap<u32, DiskInode> = BTreeMap::new();
         dirs.insert(adir, self.dir_inode(tx, adir)?);
         dirs.insert(bdir, self.dir_inode(tx, bdir)?);
-        let sa = self.find(Some(tx), &dirs[&adir], aname)?.ok_or(ENOENT)?;
-        let sb = self.find(Some(tx), &dirs[&bdir], bname)?.ok_or(ENOENT)?;
+        let sa = self.locate_sure(tx, &dirs[&adir], aname)?.ok_or(ENOENT)?;
+        let sb = self.locate_sure(tx, &dirs[&bdir], bname)?.ok_or(ENOENT)?;
         if sa.e.ino != a || sb.e.ino != b {
             return Err(ENOENT);
         }
@@ -352,7 +369,7 @@ impl Volume {
     pub fn remove(&self, dir: u32, name: &[u8], ino: u32) -> Result<(), i64> {
         let mut st = self.lock_rw()?;
         if st.with_tx(|st, tx| st.remove_in(tx, dir, name, ino))? {
-            st.evict(ino, true)?;
+            st.evict_after_commit(ino);
         }
         Ok(())
     }
@@ -361,7 +378,7 @@ impl Volume {
         let mut st = self.lock_rw()?;
         st.migrate(ndir)?;
         if let Some(v) = st.with_tx(|st, tx| st.rename_in(tx, odir, oname, ino, ndir, nname, target))? {
-            st.evict(v, true)?;
+            st.evict_after_commit(v);
         }
         Ok(())
     }

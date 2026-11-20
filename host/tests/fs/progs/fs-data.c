@@ -1,4 +1,4 @@
-/* fs-data: what Brave's profile needs from the data volume (FS-8c; plan/notes/br-BR-1.md: flock on Local State,
+/* fs-data: what Brave's profile needs from the data volume (FS-8c; plan/spec/programs.md §1.1: flock on Local State,
  * F_SETLK read/write/unlock, the SingletonLock symlink, rename over, fsync/fdatasync, pwrite/pread, ftruncate,
  * fallocate mode 0, utimensat, fstatfs; SQLite's and LevelDB's shared file mappings with msync, the F2FS feature
  * ioctl SQLite asks on every file, a directory of many names after renames and unlinks), run in a directory of the volume under test. CachyOS is the oracle

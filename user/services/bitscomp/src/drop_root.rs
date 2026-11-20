@@ -1,7 +1,7 @@
 //! WY-7: bitscomp started as root (Georg's console shell is init's, uid 0) runs as the desktop user. It opens
 //! what needs root first (the framebuffer, the input devices, the console's terminal, the compositor grant),
-//! then gives root up for good (setgroups, setresgid, setresuid, in that order as chpst does; linux-6.6/
-//! kernel/sys.c `__sys_setresuid` :667, `__sys_setresgid` :769, kernel/groups.c `setgroups` :198), before any
+//! then gives root up for good (setgroups, setresgid, setresuid, in that order as chpst does; linux-7.3.1/
+//! kernel/sys.c `__sys_setresuid` :708, `__sys_setresgid` :810, kernel/groups.c `setgroups` :198), before any
 //! thread, socket or file of the session exists: the sockets, the session file, the foot colours and the font
 //! cache are the user's, `bitscomp ctl` and MCP's programs (uid 1000) reach the sockets, and every program it
 //! starts (foot, Cobalt's launcher) runs as that user too. File descriptors opened before stay open (the kernel
@@ -9,7 +9,7 @@
 //! /dev/input/event* belong to uid 1000 (console evdevfs NODE_UID, mode 0660), as /dev/fb0 does.
 //!
 //! A drop that fails ends bitscomp (it never runs the desktop as root by accident); `--user 0` keeps root on
-//! purpose. Only the fbdev back end drops: headless and nested runs are a developer's own uid already.
+//! purpose.
 
 /// The desktop user V2 has (MCP's programs, the stick's home, the device nodes): uid and gid 1000.
 pub const DESKTOP: (u32, u32) = (1000, 1000);
@@ -23,9 +23,9 @@ pub fn parse_user(s: &str) -> Result<(u32, u32), String> {
     }
 }
 
-/// Whether to drop and to whom: only a root bitscomp on fbdev with a non-root target.
-pub fn plan(euid: u32, backend: &str, target: (u32, u32)) -> Option<(u32, u32)> {
-    (euid == 0 && backend == "fbdev" && target.0 != 0).then_some(target)
+/// Whether to drop and to whom: only a root bitscomp with a non-root target.
+pub fn plan(euid: u32, target: (u32, u32)) -> Option<(u32, u32)> {
+    (euid == 0 && target.0 != 0).then_some(target)
 }
 
 /// HOME and the user name of `uid` from passwd text (`name:pw:uid:gid:gecos:home:shell` lines).
@@ -96,11 +96,9 @@ mod tests {
 
     #[test]
     fn only_root_on_fbdev_drops() {
-        assert_eq!(plan(0, "fbdev", DESKTOP), Some(DESKTOP));
-        assert_eq!(plan(0, "fbdev", (0, 0)), None, "--user 0 keeps root");
-        assert_eq!(plan(1000, "fbdev", DESKTOP), None, "already the user (MCP's start)");
-        assert_eq!(plan(0, "headless", DESKTOP), None);
-        assert_eq!(plan(0, "winit", DESKTOP), None);
+        assert_eq!(plan(0, DESKTOP), Some(DESKTOP));
+        assert_eq!(plan(0, (0, 0)), None, "--user 0 keeps root");
+        assert_eq!(plan(1000, DESKTOP), None, "already the user (MCP's start)");
     }
 
     #[test]

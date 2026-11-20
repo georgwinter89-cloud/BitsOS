@@ -124,8 +124,8 @@ pub struct ShadowLayer {
     pub color: Rgba,
 }
 
-/// shadow-raised or shadow-lifted: two layers, the inner first. The cheap level draws them as stepped
-/// lines or a cached sprite (no blur); the GPU level as written.
+/// shadow-raised or shadow-lifted: two layers, the inner first. The shaders draw them as written (`fx::Kind::Shadow`);
+/// an image that carries its own shadow draws it from a cached sprite (`deco::hud::shadow`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shadow(pub [ShadowLayer; 2]);
 

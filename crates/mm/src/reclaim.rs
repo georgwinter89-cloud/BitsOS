@@ -1,6 +1,6 @@
 //! MM-9: the driver of page-cache reclaim. Installs vfs's reclaimer into the frame allocator's slow path
 //! (direct reclaim, `mm_core::reclaim`) and runs `mm.kswapd`, the Background thread that keeps free memory
-//! between the low and the high watermark (linux-6.6/mm/vmscan.c `kswapd` :7713, `balance_pgdat` :7391).
+//! between the low and the high watermark (linux-7.3.1/mm/vmscan.c `kswapd` :7492, `balance_pgdat` :7157).
 //!
 //! W35 MM-1: the thread is woken (Linux `wakeup_kswapd`): a heap block that found no free run notes its order
 //! (`mm_core::OrderWant`), so does a huge-page fault without a free 2 MiB block (`want_order`) and every frame
@@ -48,6 +48,10 @@ static DIRECT: Direct = Direct;
 fn install() -> Result<(), &'static str> {
     if !mr::set_reclaimer(&DIRECT) {
         return Err("no boot frame allocator, or a reclaimer is installed already");
+    }
+    // W35 MM-2: compaction moves pages instead of dropping clean cache.
+    if !crate::migrate::install() {
+        return Err("a migrator is installed already");
     }
     Ok(())
 }
@@ -99,6 +103,7 @@ impl Balancer {
     pub fn look(&mut self) -> u64 {
         let freed = self.balance_count();
         self.balance_order();
+        crate::highatomic::check();
         freed
     }
 
@@ -116,13 +121,25 @@ impl Balancer {
         mm_core::HEAP.drain_scattered();
         let Some((total, mut free)) = frames() else { return 0 };
         let w = mr::watermarks(total);
+        // MEMCRASH row 1 (linux-7.3.1/mm/vmscan.c:7186 `balance_pgdat`): the boost seen at the look's start raises
+        // the high watermark the look reclaims to, also when free memory is above the low one; at the end it comes
+        // off and kcompactd is woken for the pageblock order (`mm_core::boost::clear`). A boost raised meanwhile
+        // stays for the next look.
+        let boost = mm_core::boost::get();
+        let high = w.high.saturating_add(boost);
         if free < w.low && mm_core::grace::pending_bytes() > 0 {
             mm_core::grace::expedite();
             free = frames().map_or(free, |(_, f)| f);
         }
-        if free >= w.low && !(pushed && free < w.high) {
+        if free >= w.low && !(pushed && free < w.high) && free >= high {
             self.end_episode(free);
+            mm_core::boost::clear(boost);
             return 0;
+        }
+        // Below the min watermark the heap's kept blocks (`scatter`) go back. Not below the low one: beside a
+        // full page cache that is every look, and the blocks would be made and given back all the time.
+        if free < w.min {
+            crate::scatter::trim();
         }
         if !self.active {
             self.active = true;
@@ -130,14 +147,14 @@ impl Balancer {
             self.freed = 0;
             self.told_stuck = false;
             info_once!(self.episodes == 1, "mm", "kswapd.pressure", free_kb = free * 4, low_kb = w.low * 4, high_kb = w.high * 4,
-                episode = self.episodes; "free memory below the low watermark: taking clean page-cache pages back");
+                boost_kb = boost * 4, episode = self.episodes; "free memory below the low watermark (or a boosted high one): taking clean page-cache pages back");
         }
         let mut freed = 0;
         let mut thorough = false;
-        while free < w.high {
+        while free < high {
             let o = {
                 let _inside = mr::enter();
-                vr::shrink(STEP.min(w.high - free), Mode::Background, thorough)
+                vr::shrink(STEP.min(high - free), Mode::Background, thorough)
             };
             freed += o.freed;
             if o.freed == 0 {
@@ -162,6 +179,7 @@ impl Balancer {
         if free >= w.high {
             self.end_episode(free);
         }
+        mm_core::boost::clear(boost);
         // `self.direct` stays the snapshot of this look's start: runs and failures during the look are seen by
         // the next one.
         freed
@@ -223,6 +241,9 @@ impl Balancer {
 fn start() -> Result<(), &'static str> {
     let w = watermarks();
     sched::spawn("mm.kswapd", sched::Class::Background, || {
+        // Linux PF_MEMALLOC for kswapd's whole life: its allocations take the reserves and never loop for the
+        // OOM killer (a kswapd in that loop would wait for itself).
+        mm_core::oom::mark_memalloc();
         let mut b = Balancer::default();
         loop {
             sched::sleep_ms(MIN_GAP_MS);
@@ -230,6 +251,8 @@ fn start() -> Result<(), &'static str> {
             // Wakes left for later under a spin lock (kswapd's own, kcompactd's: a THP fault under the space's
             // lock, an order noted under the heap's lock) are rung here at the latest, once per period.
             mm_core::reclaim::wake_deferred();
+            // W35 MM-2: address spaces whose last reference a migration held end here, not inside an allocation.
+            crate::aspace::migrate::drop_dying();
             mm_core::reclaim::set_kswapd_running(true);
             b.look();
             mm_core::reclaim::set_kswapd_running(false);

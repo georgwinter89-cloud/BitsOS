@@ -1,6 +1,7 @@
-//! `snd_pcm_hw_params` and Linux's refine engine (`linux-6.6/sound/core/pcm_native.c:284-647`, the interval
-//! arithmetic of `pcm_lib.c:539-800,1030,1617-1700`, `include/sound/pcm_params.h`), so libasound's hw_params
-//! search (set_*_near, plug's choices) ends where it ends on Linux. Kernel-free; host tests drive it.
+//! `snd_pcm_hw_params` and Linux's refine engine (`linux-7.3.1/sound/core/pcm_native.c:289-610`, the fixup
+//! :478-548, the subformat rule :2537; the interval arithmetic of `pcm_lib.c:626-850,1050,1427`,
+//! `include/sound/pcm_params.h`), so libasound's hw_params search (set_*_near, plug's choices) ends where it
+//! ends on Linux. Kernel-free; host tests drive it.
 
 use super::abi::*;
 
@@ -56,7 +57,7 @@ impl Interval {
     pub fn test(&self, v: u32) -> bool {
         !(self.min > v || (self.min == v && self.openmin) || self.max < v || (self.max == v && self.openmax))
     }
-    /// `snd_interval_refine` (pcm_lib.c:606).
+    /// `snd_interval_refine` (pcm_lib.c:626).
     pub fn refine(&mut self, v: &Interval) -> Result<bool, i64> {
         if self.empty {
             return Err(EINVAL);
@@ -306,6 +307,30 @@ impl Mask {
     }
 }
 
+/// `snd_pcm_format_width` (linux-7.3.1/sound/core/pcm_misc.c:32-236), by format number; 0 = no width (MPEG,
+/// GSM, SPECIAL, the unused numbers).
+pub fn format_width(f: u32) -> u32 {
+    match f {
+        0 | 1 | 20 | 21 | 48 => 8,
+        2..=5 | 49 | 51 => 16,
+        6..=9 | 32..=35 => 24,
+        10..=15 | 18 | 19 | 50 | 52 => 32,
+        16 | 17 => 64,
+        22 => 4,
+        25..=28 | 36..=39 => 20,
+        40..=43 => 18,
+        44 | 45 => 3,
+        46 | 47 => 5,
+        _ => 0,
+    }
+}
+
+/// `snd_pcm_format_linear` (pcm_misc.c:282): the table's `signd` is not -1. The unused numbers 29 and 30 have a
+/// zeroed table entry and so count as linear, as in Linux.
+pub fn format_linear(f: u32) -> bool {
+    matches!(f, 0..=13 | 25..=30 | 32..=43 | 48..=52)
+}
+
 /// `snd_pcm_format_physical_width` (pcm_misc.c), by format number; 0 = no width (MPEG, GSM, SPECIAL).
 pub fn phys_width(f: u32) -> u32 {
     match f {
@@ -322,7 +347,7 @@ pub fn phys_width(f: u32) -> u32 {
 }
 
 /// `struct snd_pcm_hw_params` decoded (offsets: abi's sizes; masks at 4, intervals at 260, rmask 512, cmask
-/// 516, info 520, msbits 524, rate_num 528, rate_den 532, fifo_size 536). `raw` keeps the bytes the program
+/// 516, info 520, msbits 524, rate_num 528, rate_den 532, fifo_size 536, sync 544). `raw` keeps the bytes the program
 /// gave (reserved masks and intervals go back unchanged, as Linux copies its whole struct back).
 #[derive(Clone)]
 pub struct HwParams {
@@ -441,7 +466,7 @@ pub struct Hw {
     pub msbits32: u32,
 }
 
-/// `snd_pcm_known_rates` (pcm_native.c:2448).
+/// `snd_pcm_known_rates` (pcm_native.c:2503).
 pub const KNOWN_RATES: [u32; 15] = [5512, 8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000, 352800, 384000];
 
 #[derive(Clone, Copy)]
@@ -455,6 +480,7 @@ enum Func {
     Rate,
     BufferBytesMax,
     MsBits,
+    Subformats,
 }
 
 #[derive(Clone, Copy)]
@@ -469,9 +495,9 @@ const fn r(var: usize, func: Func, deps: &'static [usize]) -> Rule {
     Rule { var: Some(var), func, deps }
 }
 
-/// `snd_pcm_hw_constraints_init` (pcm_native.c:2486), `_complete` (:2610) and the driver's msbits rule, in
+/// `snd_pcm_hw_constraints_init` (pcm_native.c:2572), `_complete` (:2696) and the driver's msbits rule, in
 /// their order (the order matters: Linux applies them in sequence until nothing changes).
-const RULES: [Rule; 23] = [
+const RULES: [Rule; 24] = [
     r(FORMAT, Func::Format, &[SAMPLE_BITS]),
     r(SAMPLE_BITS, Func::SampleBits, &[FORMAT, SAMPLE_BITS]),
     r(SAMPLE_BITS, Func::Div, &[FRAME_BITS, CHANNELS]),
@@ -492,6 +518,8 @@ const RULES: [Rule; 23] = [
     r(BUFFER_BYTES, Func::MulDivK(8), &[BUFFER_SIZE, FRAME_BITS]),
     r(PERIOD_TIME, Func::MulKDiv(1_000_000), &[PERIOD_SIZE, RATE]),
     r(BUFFER_TIME, Func::MulKDiv(1_000_000), &[BUFFER_SIZE, RATE]),
+    // snd_pcm_hw_constraint_subformats (:2563): no variable of its own (changes are not reported in cmask).
+    Rule { var: None, func: Func::Subformats, deps: &[SUBFORMAT, FORMAT] },
     r(BUFFER_BYTES, Func::BufferBytesMax, &[BUFFER_BYTES]),
     r(RATE, Func::Rate, &[RATE]),
     Rule { var: None, func: Func::MsBits, deps: &[SAMPLE_BITS] },
@@ -518,7 +546,8 @@ impl Constraints {
         c.masks[ACCESS].0[0] = 1 << ACCESS_RW_INTERLEAVED;
         c.masks[FORMAT].0[0] = hw.formats as u32;
         c.masks[FORMAT].0[1] = (hw.formats >> 32) as u32;
-        c.masks[SUBFORMAT].0[0] = 1 << SUBFORMAT_STD;
+        // No subformat mask: the subformat rule decides (Linux 7 dropped the STD-only mask constraint).
+        c.masks[SUBFORMAT] = Mask([!0; 8]);
         for (k, lo, hi) in [
             (CHANNELS, hw.channels_min, hw.channels_max),
             (RATE, hw.rate_min, hw.rate_max),
@@ -563,7 +592,7 @@ impl Constraints {
                 t
             }
             Func::Rate => {
-                // snd_interval_list over the known rates the device has (pcm_lib.c:1030).
+                // snd_interval_list over the known rates the device has (pcm_lib.c:1050).
                 let i = *p.iv(RATE);
                 let mut t = Interval { min: u32::MAX, max: 0, ..Interval::any() };
                 for (k, &rate) in KNOWN_RATES.iter().enumerate() {
@@ -577,11 +606,21 @@ impl Constraints {
             }
             Func::BufferBytesMax => Interval { min: 0, max: self.hw.buffer_bytes_max, integer: true, ..Interval::any() },
             Func::MsBits => {
+                // snd_pcm_hw_rule_msbits (pcm_lib.c:1427) with width 32.
                 let i = p.iv(SAMPLE_BITS);
                 if i.single() && i.value() == 32 {
                     p.msbits = if p.msbits == 0 { self.hw.msbits32 } else { p.msbits.min(self.hw.msbits32) };
                 }
                 return Ok(false);
+            }
+            Func::Subformats => {
+                // snd_pcm_hw_rule_subformats (pcm_native.c:2537): STD always, MSBITS_MAX for every linear format
+                // left (the device declares no S32 subformats, `hw->subformats` 0).
+                let mut m = Mask::of(&[SUBFORMAT_STD]);
+                if (0..=FORMAT_LAST).any(|f| p.masks[FORMAT].test(f) && format_linear(f)) {
+                    m = Mask::of(&[SUBFORMAT_STD, SUBFORMAT_MSBITS_MAX]);
+                }
+                return p.masks[SUBFORMAT].refine(&m);
             }
         };
         match rule.var {
@@ -590,7 +629,7 @@ impl Constraints {
         }
     }
 
-    /// `snd_pcm_hw_refine` (pcm_native.c:522).
+    /// `snd_pcm_hw_refine` (pcm_native.c:551).
     pub fn refine(&self, p: &mut HwParams) -> Result<(), i64> {
         p.info = 0;
         p.fifo_size = 0;
@@ -617,7 +656,7 @@ impl Constraints {
                 p.cmask |= bit(k);
             }
         }
-        // constrain_params_by_rules (:347): stamps decide which rules see changed dependencies.
+        // constrain_params_by_rules (:361): stamps decide which rules see changed dependencies.
         let mut rstamps = [0u32; RULES.len()];
         let mut vstamps = [0u32; LAST + 1];
         for (k, v) in vstamps.iter_mut().enumerate() {
@@ -647,12 +686,26 @@ impl Constraints {
         Ok(())
     }
 
-    /// `fixup_unreferenced_params` (pcm_native.c:458); fifo_size stays 0 (`hw.fifo_size` is 0).
-    pub fn fixup(&self, p: &mut HwParams) {
+    /// `fixup_unreferenced_params` (pcm_native.c:478-548); fifo_size stays 0 (`hw.fifo_size` is 0), and the
+    /// sync ID is left as the program gave it (the driver calls no `snd_pcm_set_sync`, see plan/spec/usb.md §7.6).
+    pub fn fixup(&self, p: &mut HwParams) -> Result<(), i64> {
         if p.msbits == 0 {
             let i = p.iv(SAMPLE_BITS);
             if i.single() {
                 p.msbits = i.value();
+            }
+            let m = p.mask(FORMAT);
+            if m.single() {
+                p.msbits = format_width(m.min());
+            }
+        }
+        if p.msbits != 0 {
+            let m = *p.mask(FORMAT);
+            if m.single() && format_linear(m.min()) && format_width(m.min()) != p.msbits {
+                p.masks[SUBFORMAT].reset(SUBFORMAT_MSBITS_MAX);
+                if p.masks[SUBFORMAT].empty() {
+                    return Err(EINVAL);
+                }
             }
         }
         if p.rate_den == 0 {
@@ -666,6 +719,7 @@ impl Constraints {
             // No mmap (the data ring is the mixer's client ring): MMAP bits off as `hw_support_mmap` false.
             p.info = self.hw.info & !(INFO_FIFO_IN_FRAMES | INFO_DRAIN_TRIGGER | INFO_MMAP | INFO_MMAP_VALID);
         }
+        Ok(())
     }
 
     fn first_last(&self, p: &mut HwParams, k: usize, last: bool) -> Result<(), i64> {
@@ -688,7 +742,7 @@ impl Constraints {
         if single { Ok(()) } else { Err(EINVAL) }
     }
 
-    /// `snd_pcm_hw_params_choose` (pcm_native.c:636): first access, format, subformat, min channels, rate,
+    /// `snd_pcm_hw_params_choose` (pcm_native.c:690): first access, format, subformat, min channels, rate,
     /// period time, max buffer size, min tick time.
     pub fn choose(&self, p: &mut HwParams) -> Result<(), i64> {
         for k in [ACCESS, FORMAT, SUBFORMAT, CHANNELS, RATE, PERIOD_TIME, BUFFER_SIZE, TICK_TIME] {
@@ -702,7 +756,6 @@ impl Constraints {
         p.rmask = !0;
         self.refine(p)?;
         self.choose(p)?;
-        self.fixup(p);
-        Ok(())
+        self.fixup(p)
     }
 }

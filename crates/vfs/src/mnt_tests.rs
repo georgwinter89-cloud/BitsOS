@@ -9,7 +9,7 @@ use crate::fd::{FdTable, FsState};
 use crate::inode::Cred;
 use crate::mount_fs::Mounter;
 use crate::mount_ns::*;
-use crate::mount_ops::{MNT_DETACH, MNT_EXPIRE, Propagation};
+use crate::mount_ops::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE, Propagation};
 use crate::ops::Ctx;
 use crate::sys::Sys;
 use crate::sys_mount::{self, *};
@@ -255,14 +255,13 @@ fn fs_state_follows_the_copy() {
 struct Fake {
     admin: bool,
     pivots: Cell<usize>,
+    /// CAP_SYS_ADMIN over every super block's user namespace (`admin_over`); off unless a test sets it.
+    sb_admin: Cell<bool>,
 }
 
 impl MountPerms for Fake {
     fn may_mount(&self) -> bool {
         self.admin
-    }
-    fn capable_init(&self) -> bool {
-        false
     }
     fn may_mount_fs(&self, _: &str) -> bool {
         self.admin
@@ -271,7 +270,7 @@ impl MountPerms for Fake {
         None
     }
     fn admin_over(&self, _: &SuperBlock) -> bool {
-        false
+        self.sb_admin.get()
     }
     fn ns_owned_by_init(&self) -> bool {
         false
@@ -280,7 +279,7 @@ impl MountPerms for Fake {
         let map = |n: u32| (n < 1).then_some(n + 1000);
         f(&Mounter { fsuid: 1000, fsgid: 1000, uid_in: &map, gid_in: &map, init_ns: false, ns_root: Some((1000, 1000)) })
     }
-    fn ptmx(&self) -> Option<Arc<dyn crate::File>> {
+    fn ptmx(&self, _inst: crate::mount_fs::PtsSuper) -> Option<Arc<dyn crate::File>> {
         None
     }
     fn ram_bytes(&self) -> u64 {
@@ -300,7 +299,7 @@ fn syscalls_in_linux_order() {
     let fds = FdTable::new();
     let fs = FsState::new();
     let s = Sys { mem: &mem, fds: &fds, fs: &fs, ns: &ns, cred: Cred::ROOT, subject: policy::Subject::KERNEL };
-    let p = Fake { admin: true, pivots: Cell::new(0) };
+    let p = Fake { admin: true, pivots: Cell::new(0), sb_admin: Cell::new(false) };
     let st = |x: &[u8]| mem.cstr(x);
     let call = |f: fn(&Sys<'_>, crate::sys::Args, &dyn MountPerms) -> i64, a: [u64; 6]| f(&s, a, &p);
     // Type unknown, no type, bad options, a bad pointer, a missing directory.
@@ -330,22 +329,44 @@ fn syscalls_in_linux_order() {
     // MS_MOVE.
     assert_eq!(call(sys_mount::mount, [st(b"/c"), st(b"/d"), 0, MS_MOVE, 0, 0]), 0);
     assert!(Ctx::kernel(&ns).lookup(None, b"/d/f", true).is_ok());
+    // L7-VFS: not a mount root, or a directory onto a file, is EINVAL before a removed target's ENOENT
+    // (linux-7.3.1/fs/namespace.c:3773).
+    let k = Ctx::kernel(&ns);
+    k.mkdir(None, b"/gone", 0o755).unwrap();
+    let gone = k.lookup(None, b"/gone", true).unwrap();
+    k.rmdir(None, b"/gone").unwrap();
+    k.open(None, b"/gonef", O_CREAT | O_WRONLY, 0o644).unwrap();
+    let gonef = k.lookup(None, b"/gonef", true).unwrap();
+    k.unlink(None, b"/gonef").unwrap();
+    let d = k.lookup(None, b"/d", true).unwrap();
+    assert_eq!(ns.move_mount(&k.lookup(None, b"/a/sub", true).unwrap(), &gone).err(), Some(EINVAL), "not a mount root");
+    assert_eq!(ns.move_mount(&d, &gonef).err(), Some(EINVAL), "a directory onto a file");
+    assert_eq!(ns.move_mount(&d, &gone).err(), Some(ENOENT));
+    drop((k, d, gone, gonef));
     // umount2: flags, then lookup, then the tree.
     assert_eq!(call(sys_mount::umount2, [st(b"/d"), 0x10, 0, 0, 0, 0]), -EINVAL);
     assert_eq!(call(sys_mount::umount2, [st(b"/c"), 0, 0, 0, 0, 0]), -EINVAL);
-    assert_eq!(call(sys_mount::umount2, [st(b"/d"), 0, 0, 0, 0, 0]), 0);
+    // MNT_FORCE (`can_umount`, linux-7.3.1/fs/namespace.c:2077): after the mount-root EINVAL, EPERM without
+    // CAP_SYS_ADMIN over the file system's user namespace, also for a caller that may mount.
+    assert_eq!(call(sys_mount::umount2, [st(b"/c"), MNT_FORCE as u64, 0, 0, 0, 0]), -EINVAL);
+    assert_eq!(call(sys_mount::umount2, [st(b"/d"), MNT_FORCE as u64, 0, 0, 0, 0]), -EPERM);
+    p.sb_admin.set(true);
+    assert_eq!(call(sys_mount::umount2, [st(b"/d"), MNT_FORCE as u64, 0, 0, 0, 0]), 0, "the owner forces it");
+    p.sb_admin.set(false);
     // pivot_root: a file is ENOTDIR; then the view's root changes and the roots are re-pointed.
     Ctx::kernel(&ns).open(None, b"/b/file", O_CREAT | O_WRONLY, 0o644).unwrap();
     assert_eq!(call(sys_mount::pivot_root, [st(b"/b/file"), st(b"/b"), 0, 0, 0, 0]), -ENOTDIR);
     Ctx::kernel(&ns).mkdir(None, b"/b/old", 0o755).unwrap();
     assert_eq!(call(sys_mount::pivot_root, [st(b"/b"), st(b"/b/old"), 0, 0, 0, 0]), 0);
     assert_eq!(p.pivots.get(), 1);
-    // Without the capability: EPERM after the lookup (mount), before it (pivot_root).
-    let q = Fake { admin: false, pivots: Cell::new(0) };
+    // Without the capability: EPERM after the lookups (mount, and pivot_root's two: linux-7.3.1/fs/namespace.c:4934).
+    let q = Fake { admin: false, pivots: Cell::new(0), sb_admin: Cell::new(false) };
     let s2 = Sys { mem: &mem, fds: &fds, fs: &fs, ns: &ns, cred: USER, subject: policy::Subject::KERNEL };
     assert_eq!(sys_mount::mount(&s2, [0, st(b"/nope"), st(b"tmpfs"), 0, 0, 0], &q), -ENOENT);
     assert_eq!(sys_mount::mount(&s2, [0, st(b"/"), st(b"tmpfs"), 0, 0, 0], &q), -EPERM);
-    assert_eq!(sys_mount::pivot_root(&s2, [st(b"/nope"), st(b"/"), 0, 0, 0, 0], &q), -EPERM);
+    assert_eq!(sys_mount::pivot_root(&s2, [st(b"/nope"), st(b"/"), 0, 0, 0, 0], &q), -ENOENT);
+    assert_eq!(sys_mount::pivot_root(&s2, [st(b"/"), 0x10, 0, 0, 0, 0], &q), -EFAULT);
+    assert_eq!(sys_mount::pivot_root(&s2, [st(b"/"), st(b"/"), 0, 0, 0, 0], &q), -EPERM);
     assert_eq!(sys_mount::umount2(&s2, [st(b"/old"), 0, 0, 0, 0, 0], &q), -EPERM);
 }
 
@@ -391,7 +412,7 @@ fn refused_remount_changes_nothing() {
     let fds = FdTable::new();
     let fs = FsState::new();
     let s = Sys { mem: &mem, fds: &fds, fs: &fs, ns: &ns, cred: Cred::ROOT, subject: policy::Subject::KERNEL };
-    let p = Fake { admin: true, pivots: Cell::new(0) };
+    let p = Fake { admin: true, pivots: Cell::new(0), sb_admin: Cell::new(false) };
     let st = |x: &[u8]| mem.cstr(x);
     assert_eq!(sys_mount::mount(&s, [st(b"tmpfs"), st(b"/b"), st(b"tmpfs"), 0, st(b"size=1m"), 0], &p), 0);
     // do_remount: a bad option is EINVAL, the missing capability over the super block EPERM, and neither
@@ -406,7 +427,7 @@ fn refused_remount_changes_nothing() {
 
 #[test]
 fn hostile_tmpfs_options() {
-    let p = Fake { admin: true, pivots: Cell::new(0) };
+    let p = Fake { admin: true, pivots: Cell::new(0), sb_admin: Cell::new(false) };
     let parse = |s: &[u8]| {
         let o = mount_fs_opts(s);
         let mut r = Err(0);
@@ -477,7 +498,7 @@ fn proc_instance_per_mount() {
 }
 
 /// SX-3c: `d_path` of a place the reader's root does not reach is its path up to the top of its own mount
-/// chain (linux-6.6/fs/d_path.c `__prepend_path`): pressure-vessel's /proc/self/fd links of files opened before
+/// chain (linux-7.3.1/fs/d_path.c:104 `__prepend_path`): pressure-vessel's /proc/self/fd links of files opened before
 /// the container showed "/sub/f" (the path inside the tmpfs) instead of "/a/sub/f".
 #[test]
 fn d_path_of_unreachable_places() {
@@ -506,7 +527,7 @@ fn d_path_of_unreachable_places() {
 
 /// getcwd of the places d_path reaches only from the top of their mount chain: "(unreachable)" in front, the
 /// buffer must hold that string and its NUL (ERANGE one byte short), a removed cwd is ENOENT
-/// (linux-6.6/fs/d_path.c:415-445).
+/// (linux-7.3.1/fs/d_path.c:414-449).
 #[test]
 fn getcwd_of_unreachable_places() {
     let (ns, _) = view();
@@ -559,10 +580,10 @@ fn d_path_of_a_removed_unreachable_file() {
 }
 
 /// SX-3c: the hard links pressure-vessel's --copy-runtime makes, as tmpfs answers them in Linux's order
-/// (linux-6.6/fs/namei.c do_linkat, may_linkat, vfs_link): the second name keeps the data when the first goes,
-/// a bind of the same file system is another mount (EXDEV), a read-only target is EROFS before EXDEV,
-/// fs.protected_hardlinks refuses what a user could not open read-write, AT_EMPTY_PATH without
-/// CAP_DAC_READ_SEARCH is ENOENT even with a name.
+/// (linux-7.3.1/fs/namei.c:5948 filename_linkat, :1360 may_linkat, :5874 vfs_link): the second name keeps the data
+/// when the first goes, a bind of the same file system is another mount (EXDEV), a read-only target is EROFS
+/// before EXDEV, fs.protected_hardlinks refuses what a user could not open read-write, AT_EMPTY_PATH with a start
+/// fd someone else opened is ENOENT without CAP_DAC_READ_SEARCH, even with a name (:2750).
 #[test]
 fn hard_links_on_tmpfs() {
     use crate::abi::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_FOLLOW, O_RDWR};
@@ -571,7 +592,7 @@ fn hard_links_on_tmpfs() {
     let fds = FdTable::new();
     let fs = FsState::new();
     let s = Sys { mem: &mem, fds: &fds, fs: &fs, ns: &ns, cred: Cred::ROOT, subject: policy::Subject::KERNEL };
-    let p = Fake { admin: true, pivots: Cell::new(0) };
+    let p = Fake { admin: true, pivots: Cell::new(0), sb_admin: Cell::new(false) };
     let st = |x: &[u8]| mem.cstr(x);
     let c = Ctx::kernel(&ns);
     let nlink = |path: &[u8]| c.lookup(None, path, false).unwrap().dentry.inode.meta.nlink();
@@ -602,10 +623,24 @@ fn hard_links_on_tmpfs() {
     assert_eq!(link(&s, b"/c/g", b"/c/i"), -EROFS);
     assert_eq!(link(&s, b"/a/sub/g", b"/c/i"), -EROFS, "filename_create's EROFS comes before EXDEV");
     assert_eq!(link(&s, b"/a/sub/g", b"/c/g"), -EEXIST);
-    // AT_EMPTY_PATH: ENOENT without the capability, even with a name; root links the fd's file.
+    // AT_EMPTY_PATH: a start fd of another table (passed over a socket, inherited by a fork) is ENOENT without the
+    // capability, even with a name, after EBADF and EFAULT; the table that opened it, and root, link the file.
     let user = Sys { cred: USER, ..s };
     let la = |s: &Sys<'_>, d: u64, a: &[u8], b: &[u8], fl: u64| crate::sys::linkat(s, [d, st(a), AT_FDCWD as u64, st(b), fl, 0]);
-    assert_eq!(la(&user, AT_FDCWD as u64, b"/a/sub/g", b"/a/sub/j", AT_EMPTY_PATH), -ENOENT);
+    let other = FdTable::new();
+    let og = other.install(fds.get(g as usize).unwrap()).unwrap() as u64;
+    let od = other.install(fds.get(crate::sys::openat(&s, [AT_FDCWD as u64, st(b"/a/sub"), 0, 0, 0, 0]) as usize).unwrap()).unwrap() as u64;
+    let elsewhere = Sys { fds: &other, ..user };
+    assert_eq!(la(&elsewhere, og, b"", b"/a/sub/j", AT_EMPTY_PATH), -ENOENT);
+    assert_eq!(la(&elsewhere, od, b"g", b"/a/sub/j", AT_EMPTY_PATH), -ENOENT, "with a name too");
+    assert_eq!(la(&elsewhere, og, b"g", b"/a/sub/j", AT_EMPTY_PATH), -ENOENT, "before ENOTDIR");
+    assert_eq!(la(&elsewhere, 99, b"", b"/a/sub/j", AT_EMPTY_PATH), -EBADF);
+    assert_eq!(crate::sys::linkat(&elsewhere, [og, 0x10, AT_FDCWD as u64, st(b"/a/sub/j"), AT_EMPTY_PATH, 0]), -EFAULT);
+    assert_eq!(la(&elsewhere, od, b"g", b"/a/sub/j", 0), -EPERM, "without the flag no check: on to fs.protected_hardlinks");
+    assert_eq!(la(&Sys { fds: &other, ..s }, og, b"", b"/a/sub/j", AT_EMPTY_PATH), 0, "root has the capability");
+    assert_eq!(crate::sys::unlink(&s, [st(b"/a/sub/j"), 0, 0, 0, 0, 0]), 0);
+    drop(other);
+    assert_eq!(la(&user, g as u64, b"", b"/a/sub/j", AT_EMPTY_PATH), -EPERM, "its own fd: on to fs.protected_hardlinks");
     assert_eq!(la(&s, g as u64, b"", b"/a/sub/j", AT_EMPTY_PATH), 0);
     assert_eq!(la(&s, AT_FDCWD as u64, b"/a/sub/g", b"/a/sub/k", 0x2000), -EINVAL);
     assert_eq!(la(&s, AT_FDCWD as u64, b"/a/sub/g", b"/a/sub/k", AT_SYMLINK_FOLLOW), 0);
@@ -644,4 +679,65 @@ fn hard_links_on_tmpfs() {
     // may_linkat comes before may_create: a refused source in a directory the user cannot write is EPERM.
     assert_eq!(link(&user, b"/a/u/root_ro", b"/a/sub/x"), -EPERM);
     assert_eq!(link(&user, b"/a/u/root_rw", b"/a/sub/x"), -EACCES);
+}
+
+/// linkat(AT_EMPTY_PATH) after an execve: the program has new credentials (linux-7.3.1/fs/exec.c
+/// prepare_exec_creds), so an fd it inherited is someone else's (ENOENT), a new open is its own. An fd without a
+/// path (a pipe, an eventfd) is on Linux's pseudo file system: EXDEV, after the new name's EEXIST and ENOENT.
+#[test]
+fn linkat_empty_after_exec_and_without_a_path() {
+    use crate::abi::{AT_EMPTY_PATH, AT_FDCWD, O_RDWR};
+    let (ns, _) = view();
+    let mem = Mem::new();
+    let fds = FdTable::new();
+    let fs = FsState::new();
+    let root = Sys { mem: &mem, fds: &fds, fs: &fs, ns: &ns, cred: Cred::ROOT, subject: policy::Subject::KERNEL };
+    let s = Sys { cred: USER, ..root };
+    let st = |x: &[u8]| mem.cstr(x);
+    let c = Ctx::kernel(&ns);
+    c.mkdir(None, b"/a/u", 0o777).unwrap();
+    let la = |d: u64, a: &[u8], b: &[u8]| crate::sys::linkat(&s, [d, st(a), AT_FDCWD as u64, st(b), AT_EMPTY_PATH, 0]);
+    let f = crate::sys::openat(&s, [AT_FDCWD as u64, st(b"/a/u/f"), O_CREAT | O_RDWR, 0o600, 0, 0]);
+    assert!(f >= 0);
+    assert_eq!(la(f as u64, b"", b"/a/u/before"), 0, "its own fd");
+    drop(fds.close_on_exec());
+    assert_eq!(la(f as u64, b"", b"/a/u/after"), -ENOENT, "inherited across the execve");
+    let g = crate::sys::openat(&s, [AT_FDCWD as u64, st(b"/a/u/f"), O_RDWR, 0, 0, 0]);
+    assert_eq!(la(g as u64, b"", b"/a/u/after"), 0, "opened after the execve");
+    assert_eq!(crate::sys::linkat(&root, [f as u64, st(b""), AT_FDCWD as u64, st(b"/a/u/r"), AT_EMPTY_PATH, 0]), 0, "root");
+    let p = mem.alloc_zero(8);
+    assert_eq!(crate::sys::pipe2(&s, [p, 0, 0, 0, 0, 0]), 0);
+    let rd = u32::from_ne_bytes(mem.get(p, 4).try_into().unwrap()) as u64;
+    assert_eq!(la(rd, b"", b"/a/u/p"), -EXDEV);
+    assert_eq!(la(rd, b"", b"/a/u/f"), -EEXIST, "filename_create comes first");
+    assert_eq!(la(rd, b"", b"/a/none/p"), -ENOENT);
+    let e = crate::sys::eventfd2(&s, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(la(e as u64, b"", b"/a/u/e"), -EXDEV);
+}
+
+/// UPD-4: a kernel mount with binds of its own directories, all visible in one step, and its recursive unmount.
+#[test]
+fn a_mount_with_its_binds_and_its_recursive_umount() {
+    let (ns, top) = view();
+    let c = Ctx::kernel(&ns);
+    for d in [&b"/a/place"[..], b"/a/store", b"/a/store/x"] {
+        c.mkdir(None, d, 0o755).unwrap();
+    }
+    c.open(None, b"/a/store/x/f2", O_CREAT | O_WRONLY, 0o644).unwrap();
+    let place = c.lookup(None, b"/a/place", true).unwrap().dentry;
+    let from = c.lookup(None, b"/a/store/x", true).unwrap().dentry;
+    let file = c.lookup(None, b"/a/sub/f", true).unwrap().dentry;
+    let at = c.lookup(None, b"/d", true).unwrap();
+    let (sb, root) = (top.mnt.sb.clone(), top.dentry.clone());
+    assert_eq!(errno(ns.mount_with_binds(&at, sb.clone(), root.clone(), false, &[(file, from.clone())])), ENOTDIR);
+    assert_eq!(errno(ns.mount_with_binds(&at, sb.clone(), root.clone(), false, &[(place.clone(), from.clone()), (place.clone(), from.clone())])), EBUSY);
+    assert!(c.lookup(None, b"/d/sub", true).is_err(), "a refused mount leaves nothing");
+    ns.mount_with_binds(&at, sb, root, false, &[(place, from)]).unwrap();
+    assert!(c.lookup(None, b"/d/place/f2", true).is_ok(), "the bind shows its folder at once");
+    assert!(c.lookup(None, b"/d/sub/f", true).is_ok());
+    assert!(c.lookup(None, b"/a/place/f2", true).is_err(), "the other mount of the same file system has no bind");
+    let d = c.lookup(None, b"/d", true).unwrap();
+    assert_eq!(errno(ns.umount(&d)), EBUSY, "a plain umount refuses while the bind is there");
+    ns.umount_recursive(&d).unwrap();
+    assert!(c.lookup(None, b"/d/sub", true).is_err() && c.lookup(None, b"/d/place", true).is_err(), "both gone");
 }

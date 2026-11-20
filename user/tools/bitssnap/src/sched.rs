@@ -1,7 +1,7 @@
 //! When `serve` takes its automatic rounds (VS-2b): on the wall clock's multiples of `snap.interval_min`
 //! (:00, :05, ...), the first one at start. The loop wakes at least once a minute to read the settings again
 //! (a new interval or `snap.enabled` takes effect within a minute), but a wake-up is not a round: a round runs
-//! only when its time has come. VS-2 ran a round at every wake-up, so one per minute (desk-minipc-w11.md S3).
+//! only when its time has come. VS-2 ran a round at every wake-up, so one per minute.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

@@ -1,6 +1,6 @@
-//! One on-disk inode (linux-6.6/fs/ext4/ext4.h:766 `struct ext4_inode`), kept as its raw bytes so fields V2
+//! One on-disk inode (linux-7.3.1/fs/ext4/ext4.h:794 `struct ext4_inode`), kept as its raw bytes so fields V2
 //! does not use survive a rewrite: owner, times with nanoseconds and epoch bits, sizes above 4 GiB, block
-//! counts (huge_file), flags, the i_version counter and the checksum (`ext4_inode_csum`, inode.c:52).
+//! counts (huge_file), flags, the i_version counter and the checksum (`ext4_inode_csum`, inode.c:60).
 
 use crate::crc::crc32c;
 use crate::le::*;

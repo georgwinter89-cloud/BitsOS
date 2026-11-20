@@ -1,4 +1,4 @@
-//! SX-3a: the mount tree operations under `TOPO` (linux-6.6/fs/namespace.c `clone_mnt`, `copy_tree`,
+//! SX-3a: the mount tree operations under `TOPO` (linux-7.3.1/fs/namespace.c `clone_mnt`, `copy_tree`,
 //! `attach_recursive_mnt`, `umount_tree`, `lock_mnt_tree`; fs/pnode.c `change_mnt_propagation`,
 //! `propagate_mnt`, `propagate_umount`). Every function takes the locked table and a `Grave` for what it lets
 //! go; nothing here drops a mount or dentry.
@@ -160,7 +160,8 @@ pub(crate) fn clone_mnt(old: &Arc<Mount>, root: &Arc<Dentry>, cl: u32, ns: u64) 
     let (og, om) = old.propagation();
     let (mut group, mut master) = (0, 0);
     if cl & CL_SLAVE != 0 || (cl & CL_SHARED_TO_SLAVE != 0 && og != 0) {
-        master = og;
+        // A slave of `old`'s group; `old` in none: a slave of `old`'s own master, as `old` is.
+        master = if og != 0 { og } else { om };
     } else if cl & CL_PRIVATE == 0 {
         group = og;
         master = om;

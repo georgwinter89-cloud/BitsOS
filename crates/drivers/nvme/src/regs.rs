@@ -1,4 +1,4 @@
-//! Controller registers (NVMe 1.4 §3.1; linux-6.6/include/linux/nvme.h:121-240) and their fields.
+//! Controller registers (NVMe 1.4 §3.1; linux-7.3.1/include/linux/nvme.h:131-276) and their fields.
 
 pub const CAP: usize = 0x00;
 pub const VS: usize = 0x08;
@@ -80,7 +80,8 @@ pub fn doorbell(qid: u16, cq: bool, stride: usize) -> usize {
     DOORBELLS + (2 * qid as usize + cq as usize) * stride
 }
 
-/// The enable value (linux-6.6/drivers/nvme/host/core.c:2223-2252 `nvme_enable_ctrl`) without EN.
+/// The enable value (linux-6.6/drivers/nvme/host/core.c:2223-2252 `nvme_enable_ctrl`) without EN (Linux 7.3.1
+/// differs: linux-7.3.1/drivers/nvme/host/core.c:2796, see plan/spec/linux7-differences.md).
 pub fn cc_config() -> u32 {
     CC_CSS_NVM | ((PAGE.trailing_zeros() - 12) << CC_MPS_SHIFT) | CC_AMS_RR | CC_IOSQES | CC_IOCQES
 }

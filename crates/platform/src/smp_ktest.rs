@@ -35,6 +35,11 @@ ktest!("cp.smp.apic_map", Safe, apic_map);
 ktest!("cp.smp.call_owners", RunHw("cp/50-smp"), call_owners);
 ktest!("cp.smp.start_guards", Safe, start_guards);
 ktest!("cp.smp.tsc_offsets_hardware", Hardware, tsc_offsets_hardware);
+ktest!("cp.smp.hwp", Safe, hwp_every_cpu);
+ktest!("cp.smp.spec_ctrl", Safe, spec_ctrl_every_cpu);
+// Not under `cp.smp.`: cp/50-smp counts the tests of that prefix which belong to another run.
+ktest!("cp.host.kvm_265k", Run("cp/68-265k"), host_265k);
+ktest!("cp.host.intel_view", Run("cp/69-intel-bare"), intel_host_view);
 
 const CALL_NS: u64 = 1_000_000_000;
 
@@ -56,16 +61,13 @@ fn call(cpu: usize, f: fn(u64) -> u64, arg: u64) -> Result<u64, String> {
 fn all_up() -> R {
     let o = outcome().ok_or("the bring-up initcall did not run")?;
     if let Some(why) = o.not_started {
-        if o.limit.bsp_only() {
-            return ktest::fail(why);
-        }
-        // Not started at all is only fine where there is nothing to start (or CONFIG asked for one CPU).
+        // Not started at all is only fine where there is nothing to start.
         let madt_cpus = acpi::tables().and_then(|a| a.madt.as_ref()).map_or(1, |m| m.enabled_cpus());
         kassert!(madt_cpus <= 1, "bring-up did not start ({why}) but the MADT lists {madt_cpus} CPUs");
         return ktest::fail(why);
     }
     kassert!(o.failed.is_empty(), "{} AP(s) failed: {:?}", o.failed.len(), o.failed.iter().map(|f| (f.apic_id, report::stage_name(f.stage), f.reason)).collect::<Vec<_>>());
-    kassert!(o.up.len() + o.failed.len() + o.held_back == o.planned, "{} of {} APs up, {} failed, {} held back by CONFIG cpus=", o.up.len(), o.planned, o.failed.len(), o.held_back);
+    kassert!(o.up.len() + o.failed.len() == o.planned, "{} of {} APs up, {} failed", o.up.len(), o.planned, o.failed.len());
     kassert!(percpu::cpu_count() == 1 + o.up.len(), "cpu_count {} with {} APs up", percpu::cpu_count(), o.up.len());
     for (i, r) in o.up.iter().enumerate() {
         kassert!(r.cpu as usize == i + 1, "CPU numbers not dense: record {i} is cpu {}", r.cpu);
@@ -549,5 +551,131 @@ fn ldtr_null() -> R {
         let sel = call(c, read_ldtr, 0)?;
         kassert!(sel == 0, "cpu {c}: LDTR selector {sel:#x}, wanted the null selector (lldt 0 in gdt::load)");
     }
+    Ok(())
+}
+
+/// On this CPU: what `cpu::hwp` promises, read back without asking an MSR the CPU may not have. 0 = fine, else a code
+/// the caller names.
+fn hwp_here(_: u64) -> u64 {
+    use hal::cpu::hwp;
+    use hal::msr;
+    let v = cpu::live();
+    let caps = msr::ReadCaps::live();
+    if hwp::gate(&v).is_none() {
+        // The sequence ran here: on, the bounds from this CPU's own capabilities, desired 0, the EPP.
+        if !caps.hwp_enabled {
+            return 1;
+        }
+        // Fault-safe: this test is on the Gaming-PC's remote list, and a remote test must not end the machine the
+        // desk is working on.
+        let (Some(c), Some(r)) = (msr::try_read(msr::IA32_HWP_CAPABILITIES), msr::try_read(msr::IA32_HWP_REQUEST)) else { return 4 };
+        // GP-CPU2: the EPP of this model and the `cpu_policy=` in force (Linux's table, `hwp::epp_for`).
+        let wanted = hwp::request_value(r, (c >> 24) as u8, c as u8, hwp::epp_for(&v, hal::smp::hwp_policy()));
+        if r != wanted {
+            return 2;
+        }
+    } else if !msr::intel_hwp(&v) {
+        // Not Intel, or a guest: every HWP MSR is refused, nothing can have been touched.
+        let refused = [msr::IA32_PM_ENABLE, msr::IA32_HWP_CAPABILITIES, msr::IA32_HWP_REQUEST].iter().all(|&m| msr::read_checked(m).is_none());
+        if !refused {
+            return 3;
+        }
+    }
+    0
+}
+
+/// CP-265K: HWP on every CPU as CPUID says, the recorded outcome agreeing. Read-only (rerunnable on the
+/// Mini-PC, where every CPU answers "not Intel").
+fn hwp_every_cpu() -> R {
+    let o = outcome().ok_or("the bring-up initcall did not run")?;
+    let v = cpu::live();
+    let refused = hal::cpu::hwp::gate(&v);
+    match refused {
+        Some(r) => kassert!(o.bsp_hwp == hal::cpu::hwp::Outcome::Refused(r), "BSP: {:?}, gate says {r:?}", o.bsp_hwp),
+        None => kassert!(o.bsp_hwp.is_on(), "BSP: {:?} with the gate open", o.bsp_hwp),
+    }
+    for c in 0..percpu::cpu_count() {
+        let code = if c == percpu::this_cpu() { hwp_here(0) } else { call(c, hwp_here, 0)? };
+        kassert!(code == 0, "CPU {c}: {}", ["", "PM_ENABLE clear", "HWP_REQUEST is not what the sequence wrote", "an HWP MSR is readable where it must not exist", "an HWP register faulted"][code as usize]);
+    }
+    for r in &o.up {
+        kassert!(r.hwp == o.bsp_hwp || r.hwp.is_on() == o.bsp_hwp.is_on(), "CPU {}: {:?}, BSP {:?}", r.cpu, r.hwp, o.bsp_hwp);
+    }
+    if cpu::detect().amd {
+        kassert!(o.bsp_hwp == hal::cpu::hwp::Outcome::Refused(hal::cpu::hwp::Refusal::NotIntel), "AMD: {:?}", o.bsp_hwp);
+    }
+    Ok(())
+}
+
+/// On this CPU: IA32_SPEC_CTRL as `init_this_cpu` left it. 0 = fine.
+fn spec_ctrl_here(_: u64) -> u64 {
+    use hal::msr;
+    let v = cpu::live();
+    // Fault-safe reads, as the set-up's own (a remote test must not end the machine): a capabilities register
+    // that faults reads as 0 there and here, a control register that faults is code 3.
+    match cpu::spec_ctrl_wanted(&v, &mut |m| msr::try_read(m).unwrap_or(0)) {
+        Some(want) => match msr::try_read(msr::IA32_SPEC_CTRL) {
+            Some(have) => u64::from(have != want),
+            None => 3,
+        },
+        // No enhanced IBRS or not Intel: AMD must not even offer the MSR through `read_checked`.
+        None => u64::from(cpu::detect().amd && msr::read_checked(msr::IA32_SPEC_CTRL).is_some()) * 2,
+    }
+}
+
+/// CP-265K: enhanced IBRS on every CPU where Intel offers it; AMD untouched. Read-only.
+fn spec_ctrl_every_cpu() -> R {
+    for c in 0..percpu::cpu_count() {
+        let code = if c == percpu::this_cpu() { spec_ctrl_here(0) } else { call(c, spec_ctrl_here, 0)? };
+        kassert!(code == 0, "CPU {c}: code {code} (1 SPEC_CTRL is not as wanted, 2 readable on AMD, 3 SPEC_CTRL faulted)");
+    }
+    Ok(())
+}
+
+/// CP-265K, scenario `cp/68-265k`: this very CPU under KVM with `-cpu host -smp 20`. It runs on the Gaming-PC only (the
+/// gate's machine); on another CPU it cannot do its work, and that is red.
+fn host_265k() -> R {
+    let f = cpu::detect();
+    let facts = cpu::facts();
+    kassert!(f.intel && f.hypervisor, "this run is the 265K under KVM: intel={} hypervisor={}", f.intel, f.hypervisor);
+    kassert!((facts.family, facts.model) == (6, 0xC6), "this run needs the Gaming-PC's CPU (family 6 model 0xC6), found {:#x} {:#x}", facts.family, facts.model);
+    kassert!(percpu::cpu_count() == 20, "-smp 20 gave {} CPUs", percpu::cpu_count());
+    kassert!(facts.missing_v3.is_empty() && !f.avx512f && f.tsc_deadline && f.x2apic, "the host's features: {:?}", facts.missing_v3);
+    let o = outcome().ok_or("the bring-up initcall did not run")?;
+    let refused = hal::cpu::hwp::Outcome::Refused(hal::cpu::hwp::Refusal::Hypervisor);
+    kassert!(o.bsp_hwp == refused, "BSP: {:?}", o.bsp_hwp);
+    kassert!(o.up.len() == 19 && o.failed.is_empty(), "{} APs up, {} failed", o.up.len(), o.failed.len());
+    for r in &o.up {
+        kassert!(r.hwp == refused, "CPU {}: {:?}", r.cpu, r.hwp);
+        kassert!(r.differs.is_empty(), "CPU {} differs from the BSP: {:?}", r.cpu, r.differs);
+    }
+    kassert!(hal::smp::max_perf() == 0, "no HWP number in a guest");
+    let idle = sched::cstate::current_plan().ok_or("no idle plan")?;
+    kassert!(idle.c1_only == Some(sched::cstate::C1Only::Hypervisor), "{:?}", idle.c1_only);
+    Ok(())
+}
+
+/// GP-CPU, scenario `cp/69-intel-bare`, its third boot: this CPU as every other suite boot sees it (`-cpu host`, the
+/// hypervisor bit shown). The counterpart of the scenario's bare view, whose facts the script reads from the log (a
+/// `Run` test never runs without the hypervisor bit): here MWAIT is hidden, so the HPET is trusted and started as
+/// always; there is no DMAR table, so nothing was read and the gate is open; QEMU's chipset has no function 31.4, so
+/// no watchdog is described; and the model-keyed energy registers stay shut in a guest. On another CPU it cannot do
+/// its work, and that is red.
+fn intel_host_view() -> R {
+    let f = cpu::detect();
+    let facts = cpu::facts();
+    kassert!(f.intel && f.hypervisor, "this boot is the 265K under KVM: intel={} hypervisor={}", f.intel, f.hypervisor);
+    kassert!((facts.family, facts.model) == (6, 0xC6), "this run needs the Gaming-PC's CPU (family 6 model 0xC6), found {:#x} {:#x}", facts.family, facts.model);
+    kassert!(acpi::clock::hpet_trust() == gp_platform::clock::HpetTrust::Trusted, "MWAIT is hidden in a guest: {:?}", acpi::clock::hpet_trust());
+    let c = time::calibration().ok_or("time::calibrate never ran")?;
+    kassert!(c.hpet_trust == gp_platform::clock::HpetTrust::Trusted && c.settled.is_none(), "trust {:?}, settled {:?}", c.hpet_trust, c.settled);
+    kassert!(c.hpet.is_some() && time::hpet_read().is_some(), "QEMU's HPET was not started ({:?})", c.hpet_error);
+    kassert!(acpi::tables().is_some_and(|a| a.dmar.is_none()) && acpi::dmar::found().is_none(), "a DMAR table without -device intel-iommu");
+    kassert!(acpi::dmar::verdict() == acpi::dmar::DmaVerdict::NoTable && acpi::dma_gate().is_ok());
+    kassert!(acpi::tco::found().is_none(), "a TCO watchdog on QEMU's q35: {:?}", acpi::tco::found());
+    kassert!(hal::msr::read_checked(hal::msr::INTEL_RAPL_POWER_UNIT).is_none(), "Intel energy registers open in a guest");
+    kassert!(hal::msr::read_checked(hal::msr::AMD_RAPL_POWER_UNIT).is_none() && hal::msr::read_checked(hal::msr::AMD_SYSCFG).is_none(), "an AMD register open on Intel");
+    let m = acpi::tables().and_then(|a| a.madt.as_ref()).ok_or("no MADT")?;
+    kassert!(m.empty_slots == 0, "QEMU's MADT has no padding, {} slots counted", m.empty_slots);
     Ok(())
 }

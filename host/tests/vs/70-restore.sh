@@ -38,7 +38,7 @@ stop_qemu() {
 }
 trap stop_qemu EXIT
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;wlan=off;nvme_write=off;data_img_mb=64" | tail -1
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info;nvme_write=off;data_img_mb=64" | tail -1
 ESP="target/xtask/esp-$NAME"
 objcopy --strip-debug "$ESP/BITSOS2/SYS/1/KERNEL" "$RUN_DIR/KERNEL"
 cp "$RUN_DIR/KERNEL" "$ESP/BITSOS2/SYS/1/KERNEL"

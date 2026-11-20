@@ -394,6 +394,11 @@ impl PageSrc {
         self.buddy().is_some_and(|b| b.reclaim_for_heap(order, grace))
     }
 
+    /// `reclaim_for` with what the round did (MEMCRASH: the heap's never-failing loop).
+    pub fn heap_round(&self, order: u32, grace: &mut crate::grace::WaitBudget) -> crate::buddy::HeapRound {
+        self.buddy().map(|b| b.heap_round(order, grace)).unwrap_or_default()
+    }
+
     /// `pages` contiguous pages aligned to `align_pages` (a power of two) for a large block: an exact run
     /// from the buddy allocator, or from the seed's tail before the frame allocator exists.
     pub fn alloc_run(&self, pages: u64, align_pages: u64, kind: Kind) -> Option<usize> {
@@ -404,6 +409,15 @@ impl PageSrc {
             return s.carve_run(&t, usize::try_from(pages).ok()?, align);
         };
         let p = b.alloc_exact(pages, align_pages, Zone::Normal, kind)?;
+        self.held[kind as usize].fetch_add(pages * PAGE, Relaxed);
+        Some(p2v(p))
+    }
+
+    /// `alloc_run` only from what is free now: for a block that single frames serve as well (`scatter`). The
+    /// full try drains every CPU's frame lists when it finds no run, and such a block asks for one on every
+    /// allocation: 1900 drains of sixteen CPUs' lists a second on the Mini-PC, 12.11.2026.
+    pub fn alloc_run_light(&self, pages: u64, align_pages: u64, kind: Kind) -> Option<usize> {
+        let p = self.buddy()?.alloc_exact_light(pages, align_pages, Zone::Normal, kind)?;
         self.held[kind as usize].fetch_add(pages * PAGE, Relaxed);
         Some(p2v(p))
     }

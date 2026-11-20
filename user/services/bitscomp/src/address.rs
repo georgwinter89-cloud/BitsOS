@@ -22,6 +22,8 @@ pub struct Held {
     pub mods: ModifiersState,
     /// When it repeats next (`pacer` time).
     pub at: Duration,
+    /// Where the press came from (R8c): its repeats are that input's, whatever event came since.
+    pub origin: crate::input::Origin,
 }
 
 /// Enter and Esc end the editing, modifiers do nothing by themselves: these never repeat.
@@ -33,7 +35,7 @@ pub fn repeat_every() -> Duration {
     Duration::from_secs(1) / KEY_REPEAT.rate.max(1) as u32
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Edit {
     pub text: String,
     /// Cursor position in characters.
@@ -47,11 +49,19 @@ pub struct Edit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Open {
     Terminal,
+    /// GM-6a: the sofa mode (`sofa/`).
+    Sofa,
     /// LO-1: LibreOffice with one of its modules.
     Office(Office),
     /// A key prefix of the settings registry.
     Settings(String),
+    /// PK-7a: the "Programme" page (`programme/`, `apps/`) and its tab or program.
+    Programme(String),
+    /// SYS-A: the program "System" (`system`, `system/<tab>`).
+    System(String),
     Web(String),
+    /// CRASHDISK: the newest crash record in a terminal.
+    Crash,
     Unknown(String),
 }
 
@@ -106,14 +116,29 @@ pub enum Where {
 }
 
 /// German address words; the English short forms resolve to the same thing (desktop.md §1a).
+/// GM-6a: the sofa mode's address (the library's built-in tile has it).
+pub const SOFA: &str = "sofa/";
+
 pub fn normalise(addr: &str) -> String {
     let a = addr.trim().to_lowercase();
-    for (en, de) in [("app/", "programm/"), ("settings/", "einstellungen/"), ("docs/", "dokumente/"), ("device/", "geraet/"), ("context/", "kontext/")] {
+    for (en, de) in [("app/", "programm/"), ("apps/", "programme/"), ("settings/", "einstellungen/"), ("docs/", "dokumente/"), ("device/", "geraet/"), ("context/", "kontext/")] {
         if let Some(rest) = a.strip_prefix(en) {
             return format!("{de}{rest}");
         }
     }
-    if a == "settings" { "einstellungen".into() } else { a }
+    match a.as_str() {
+        "settings" => "einstellungen".into(),
+        "apps" => "programme".into(),
+        // DB4: the page "Was BitsOS über dich gelernt hat".
+        "gelernt" | "gelernt/" => crate::gelernt::ADDRESS.into(),
+        // DB2: the page "Wer hat was gemacht" lives in the settings window.
+        "werhatwas" | "wer-hat-was" | "werhatwas/" => crate::werhatwas::ADDRESS.into(),
+        // UPDATE: the page "Aktualisieren" lives in the settings window.
+        "aktualisieren" | "aktualisieren/" | "update" => crate::update_page::ADDRESS.into(),
+        // DB5b: the page "Durchblick" is its group of the settings page.
+        "durchblick" | "durchblick/" => format!("einstellungen/{}", crate::db_settings::GROUP),
+        _ => a,
+    }
 }
 
 pub fn resolve(addr: &str) -> Open {
@@ -121,10 +146,19 @@ pub fn resolve(addr: &str) -> Open {
     match a.as_str() {
         "terminal" | "foot" | "programm/terminal" | "programm/foot" => return Open::Terminal,
         "einstellungen" => return Open::Settings(String::new()),
+        "programme" => return Open::Programme(String::new()),
+        "sofa" | SOFA | "sofa-modus" | "programm/sofa-modus" => return Open::Sofa,
+        "absturz" | "absturz/" | "absturzbericht" | "crash" => return Open::Crash,
         _ => {}
     }
     if let Some(o) = Office::of_word(a.strip_prefix("programm/").unwrap_or(&a)) {
         return Open::Office(o);
+    }
+    if let Some(rest) = a.strip_prefix("programme/") {
+        return Open::Programme(rest.trim_matches('/').to_string());
+    }
+    if crate::sys_view::tab_of(&a).is_some() {
+        return Open::System(a);
     }
     if let Some(rest) = a.strip_prefix("einstellungen/") {
         // German words for the keys (`aussehen/akzent` = theme.accent); other paths are key prefixes.
@@ -225,6 +259,7 @@ impl App {
         .unwrap_or_default();
         let cursor = text.chars().count();
         self.page_edit_end();
+        self.assist_blur();
         self.desk.edit = Some(Edit { text, cursor, pick: None, tile });
         self.menu = None;
         self.chrome_dirty();
@@ -237,11 +272,12 @@ impl App {
         }
     }
 
-    /// A key went down while editing: it repeats after the delay while held (a new key replaces it).
+    /// A key went down while editing: it repeats after the delay while held (a new key replaces it). A paste
+    /// does not repeat (GPY-PASTE: a held Ctrl+V would put the text in again and again).
     pub fn address_hold(&mut self, code: Keycode, sym: Keysym, mods: ModifiersState) {
-        if (self.desk.edit.is_some() || self.page_edit_pid().is_some()) && repeats(sym) {
+        if (self.feld.open || self.desk.edit.is_some() || self.page_edit_pid().is_some() || self.assist_takes_keys()) && repeats(sym) && !crate::clip_read::is_paste(sym, &mods) {
             let at = crate::pacer::now() + Duration::from_millis(KEY_REPEAT.delay_ms.max(0) as u64);
-            self.desk.held = Some(Held { code, sym, mods, at });
+            self.desk.held = Some(Held { code, sym, mods, at, origin: self.input_origin });
         }
     }
 
@@ -259,7 +295,9 @@ impl App {
     pub fn repeat_tick(&mut self, now: Duration) {
         let Some(mut h) = self.desk.held else { return };
         let page = self.page_edit_pid();
-        if self.desk.edit.is_none() && page.is_none() {
+        let assist = self.assist_takes_keys();
+        let feld = self.feld.open;
+        if !feld && self.desk.edit.is_none() && page.is_none() && !assist {
             self.desk.held = None;
             return;
         }
@@ -268,10 +306,17 @@ impl App {
         }
         h.at = (h.at + repeat_every()).max(now);
         self.desk.held = Some(h);
+        // The repeat is handled as input of its press's origin (a page's field reads `input_origin`).
+        let latest = std::mem::replace(&mut self.input_origin, h.origin);
         match page {
+            _ if feld => {
+                self.feld_key(h.sym, &h.mods);
+            }
             Some(pid) if self.desk.edit.is_none() => self.page_key(pid, h.sym, &h.mods),
+            None if self.desk.edit.is_none() && assist => self.assist_key(h.sym, &h.mods, h.origin),
             _ => self.address_key(h.sym, &h.mods),
         }
+        self.input_origin = latest;
     }
 
     /// A key while the address bar is edited; every key stays with bitscomp then.
@@ -289,6 +334,7 @@ impl App {
                 let tile = e.tile;
                 let w = if mods.ctrl { Where::Tile } else { Where::Tab };
                 self.address_end();
+                self.habit_pick("address", &text);
                 self.open_address(&text, w, tile);
                 return;
             }
@@ -325,6 +371,10 @@ impl App {
             Open::Terminal => {
                 let _ = self.open_program(crate::terminal::TERMINAL.iter().map(|s| s.to_string()).collect(), w, tile);
             }
+            Open::Sofa => {
+                self.recent_add(SOFA);
+                return self.sofa_switch(crate::sofa::Way::Address);
+            }
             Open::Office(_) if !std::path::Path::new(OFFICE_LAUNCHER).is_file() => {
                 return self.notice("LibreOffice ist nicht auf dem Stick (\\BITSOS2\\libreoffice\\ und \\BITSOS2\\bin\\libreoffice fehlen)");
             }
@@ -333,6 +383,13 @@ impl App {
             }
             // WY-5b: bitscomp's own settings page (its prefix comes from the address again).
             Open::Settings(_) => self.open_page(&normalise(addr), w, tile),
+            // PK-7a: the "Programme" page, a page window of the same kind.
+            Open::Programme(_) => self.open_page(&normalise(addr), w, tile),
+            // SYS-A: the program "System", a page window too.
+            Open::System(_) => self.open_page(&normalise(addr), w, tile),
+            Open::Crash => {
+                let _ = self.open_program(crate::crash_note::argv(), w, tile);
+            }
             Open::Web(a) => self.notice(format!("Webseiten kann BitsOS noch nicht öffnen: {a}")),
             Open::Unknown(a) => self.notice(format!("Unbekannte Adresse: {a}")),
         }
@@ -350,7 +407,7 @@ impl App {
             (Where::Tab, None) => self.ws.focused().cloned(),
         };
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let pid = self.spawn(&refs);
+        let pid = self.spawn_desktop(&refs);
         if let Some(pid) = pid {
             self.pending_open.push((pid, target, argv));
         }
@@ -386,6 +443,13 @@ mod tests {
         assert_eq!(resolve("einstellungen/aussehen/akzent"), Open::Settings("theme.accent".into()));
         assert_eq!(resolve("Einstellungen/Aufbau/Statusleiste"), Open::Settings("theme.layout.statusbar".into()));
         assert_eq!(resolve("settings/favoriten"), Open::Settings("desktop.favourites".into()));
+        // PK-7a: the program page; `apps/` as `app/` is for programm/ (its office words stay apart).
+        assert_eq!(resolve("programme/"), Open::Programme(String::new()));
+        assert_eq!(resolve("apps"), Open::Programme(String::new()));
+        assert_eq!(resolve("Apps/hinzufuegen"), Open::Programme("hinzufuegen".into()));
+        assert_eq!(resolve("programme/foot"), Open::Programme("foot".into()));
+        assert_eq!(resolve("app/writer"), Open::Office(Office::Writer));
+        assert_eq!(resolve("einstellungen/programme"), Open::Settings("pkg".into()));
         for a in ["https://www.elster.de", "youtube.com", "www.example.org", "example.org/a/b"] {
             assert_eq!(resolve(a), Open::Web(a.into()), "{a}");
         }

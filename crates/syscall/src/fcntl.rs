@@ -1,8 +1,9 @@
-//! fcntl(2) complete and flock(2) (AB-5; linux-6.6/fs/fcntl.c `do_fcntl` :316, `SYSCALL_DEFINE3(fcntl)` :441,
-//! fs/locks.c `fcntl_getlk`/`fcntl_setlk`/`flock`, `fcntl_setlease`, fs/notify/dnotify `fcntl_dirnotify`).
+//! fcntl(2) complete and flock(2) (AB-5; linux-7.3.1/fs/fcntl.c `do_fcntl` :447, `SYSCALL_DEFINE3(fcntl)` :590,
+//! fs/locks.c `fcntl_getlk`/`fcntl_setlk`/`flock`, `fcntl_setlease` :2186, `fcntl_getdeleg` :1881,
+//! `fcntl_setdeleg` :2206, fs/notify/dnotify `fcntl_dirnotify`).
 //!
 //! fcntl: the fd is looked up raw (an O_PATH fd allows only F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD,
-//! F_GETFL and F_DUPFD_QUERY, else EBADF). Then:
+//! F_GETFL, F_DUPFD_QUERY and F_CREATED_QUERY, else EBADF). Then:
 //! - F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_SETPIPE_SZ, F_GETPIPE_SZ and unknown
 //!   commands go to FS's `vfs::sys::fcntl` (FS-1/FS-3, host-tested there); F_SETFL first gets Linux's `setfl`
 //!   refusals FS's part leaves out (O_NOATIME for a file the caller does not own: EPERM; O_DIRECT on a file
@@ -13,15 +14,18 @@
 //!   `memfd_fcntl` answers);
 //! - F_SETOWN/F_GETOWN(_EX), F_GETOWNER_UIDS, F_SETSIG/F_GETSIG: the open file description's owner, kept here
 //!   (`OWNERS`); no SIGIO is sent yet (no FASYNC sources in V2);
-//! - F_SETLEASE/F_GETLEASE: Linux's checks, then every lease request answers EAGAIN (V2 cannot break leases;
-//!   EAGAIN is Linux's own answer for a conflicting open), F_GETLEASE F_UNLCK;
+//! - F_SETLEASE/F_GETLEASE and the delegations F_SETDELEG/F_GETDELEG (Linux 6.19): Linux's checks, then every
+//!   request answers EAGAIN (V2 cannot break leases; EAGAIN is Linux's own answer for a conflicting open), the
+//!   getters F_UNLCK;
+//! - F_CREATED_QUERY (linux-7.3.1/fs/fcntl.c `f_created_query` :418, allowed on O_PATH fds by `check_fcntl_cmd`):
+//!   1 when the open behind the fd created the file (vfs's FMODE_CREATED, `OpenFile::created`), else 0;
 //! - F_NOTIFY: EINVAL, Linux's answer with `fs.dir-notify-enable = 0` (no dnotify in V2);
 //! - F_GET_RW_HINT/F_SET_RW_HINT: the inode's write-life hint (kept here; the block layer has no use yet);
 //! - F_DUPFD_QUERY (Linux 6.10, CachyOS): whether another fd names the same open file.
 //!
 //! `sys_fcntl` and the lock-releasing `sys_close`/`sys_dup2`/`sys_dup3` are registered by FS's vfs-sys's
 //! plain versions until the desk applies AB-5's integration patch, which removes those four `fs_call!` lines
-//! and registers these here (plan/notes/ab-AB-5.md); the ktests call them directly meanwhile, and
+//! and registers these here; the ktests call them directly meanwhile, and
 //! `ab.ab5.programs` runs the fcntl transcript once they are registered. flock (73) and close_range (436, with
 //! the lock release for each fd it closes) are registered here.
 
@@ -45,6 +49,7 @@ const O_NOATIME: u64 = 0o1000000;
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
 /// `_NSIG`.
 const NSIG: u64 = 64;
 
@@ -94,8 +99,8 @@ fn vfs_fcntl(c: &SysCtx<'_>) -> i64 {
 
 // ---- close and dup2/dup3 over an open fd: the POSIX locks go (`filp_close` → `locks_remove_posix`) ------
 
-/// `close(fd)` (linux-6.6/fs/open.c `close` -> `close_fd` -> `filp_close`): the table hands over the very file
-/// it took out of `fd` (PF-3: one step, `FdTable::close_get`), the caller's POSIX locks on it go, then the
+/// `close(fd)` (linux-7.3.1/fs/open.c:1545 `close` -> `file_close_fd` -> `filp_flush`): the table hands over the very
+/// file it took out of `fd` (PF-3: one step, `FdTable::close_get`), the caller's POSIX locks on it go, then the
 /// reference is dropped. Registered by the integration patch in place of vfs-sys's `fs_call!(CLOSE, v::close)`.
 pub fn sys_close(c: &mut SysCtx<'_>) -> i64 {
     let fd = c.args[0] as u32 as i32;
@@ -112,7 +117,7 @@ pub fn sys_close(c: &mut SysCtx<'_>) -> i64 {
 }
 
 /// dup2/dup3 that replaced an open fd: `do_dup2` calls `filp_close` on the replaced file whatever it was, also
-/// when it is the very open file now installed there (linux-6.6/fs/file.c:1139), so the caller's POSIX locks
+/// when it is the very open file now installed there (linux-7.3.1/fs/file.c:1336), so the caller's POSIX locks
 /// on it go. dup2(fd, fd) replaces nothing. PF-3: the replaced file is the one the table step returned.
 fn dup_over(c: &mut SysCtx<'_>, dup2: bool) -> i64 {
     let a = c.args;
@@ -141,7 +146,7 @@ pub fn sys_dup3(c: &mut SysCtx<'_>) -> i64 {
 const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
 
-/// `close_range(fd, max_fd, flags)` (linux-6.6/fs/file.c `__close_range` :732): EINVAL for unknown flags or
+/// `close_range(fd, max_fd, flags)` (linux-7.3.1/fs/file.c `close_range` :818): EINVAL for unknown flags or
 /// fd > max_fd; then every open fd in the range (up to the table's end) is closed, each close dropping the
 /// caller's POSIX locks on its file, or with CLOSE_RANGE_CLOEXEC only marked close-on-exec.
 /// CLOSE_RANGE_UNSHARE on a table nobody else uses changes nothing (as Linux, whose `unshare_fd` then keeps
@@ -185,7 +190,7 @@ pub fn sys_fcntl(c: &mut SysCtx<'_>) -> i64 {
     let cmd = c.args[1] as u32 as u64;
     let arg = c.args[2];
     let Ok(f) = c.proc.fds.get(fd) else { return -EBADF };
-    if f.is_path_only() && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL | F_DUPFD_QUERY) {
+    if f.is_path_only() && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL | F_DUPFD_QUERY | F_CREATED_QUERY) {
         return -EBADF;
     }
     match cmd {
@@ -224,8 +229,11 @@ pub fn sys_fcntl(c: &mut SysCtx<'_>) -> i64 {
         }
         F_GETLEASE => LockType::Unlock.linux() as i64,
         F_SETLEASE => ret(setlease(c, &f, arg as i32)),
+        F_GETDELEG => ret(getdeleg(c, arg)),
+        F_SETDELEG => ret(setdeleg(c, &f, arg)),
         F_NOTIFY => -EINVAL,
         F_GET_RW_HINT | F_SET_RW_HINT => ret(rw_hint(c, &f, cmd, arg)),
+        F_CREATED_QUERY => f.created() as i64,
         F_DUPFD_QUERY => {
             // `f_dupfd_query` (Linux 6.10+, CachyOS): whether the raw fd `argi` names this very open file;
             // EBADF when it names none.
@@ -235,6 +243,11 @@ pub fn sys_fcntl(c: &mut SysCtx<'_>) -> i64 {
                 None => -EBADF,
             }
         }
+        // L7-PROC: a pidfd keeps PIDFD_THREAD and PIDFD_AUTOKILL in `f_flags` (linux-7.3.1/fs/pidfs.c:961).
+        F_GETFL => match proc::pidfd::shown_flags(&f) {
+            Some(extra) => vfs_fcntl(c) | extra as i64,
+            None => vfs_fcntl(c),
+        },
         _ => vfs_fcntl(c),
     }
 }
@@ -527,22 +540,57 @@ fn getown_ex(c: &SysCtx<'_>, f: &Arc<OpenFile>, arg: u64) -> Result<i64, Errno> 
 
 static LEASE_NOTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// `fcntl_setlease`: the type (`lease_alloc` → `assign_type`), then `vfs_setlease`'s owner check (EACCES) and
-/// regular-file check (EINVAL); an unlock without a lease and every lease request answer EAGAIN.
+/// `fcntl_setlease`: a directory is EINVAL first; an unlock goes straight to `vfs_setlease`, any other type
+/// through `lease_alloc` → `assign_type` (EINVAL) before it.
 fn setlease(c: &SysCtx<'_>, f: &OpenFile, arg: i32) -> Result<i64, Errno> {
+    if f.file.mode() & S_IFMT == S_IFDIR {
+        return Err(EINVAL);
+    }
     let typ = i16::try_from(arg).ok().and_then(LockType::from_linux).ok_or(EINVAL)?;
-    let st = f.stat();
-    // `generic_setlease`: the fsuid owns the file, or CAP_LEASE.
-    if st.uid != c.proc.cred().fsuid && !c.proc.capable(Cap::Lease) {
+    vfs_setlease(c, f, typ)
+}
+
+/// `vfs_setlease` → `generic_setlease` without a lease table: the fsuid owns the file or CAP_LEASE (EACCES);
+/// only regular files and directories take leases (EINVAL), a directory no write lease; then an unlock finds
+/// no lease and every request answers EAGAIN.
+fn vfs_setlease(c: &SysCtx<'_>, f: &OpenFile, typ: LockType) -> Result<i64, Errno> {
+    if f.stat().uid != c.proc.cred().fsuid && !c.proc.capable(Cap::Lease) {
         return Err(EACCES);
     }
-    if f.file.mode() & S_IFMT != S_IFREG {
+    let ty = f.file.mode() & S_IFMT;
+    if (ty != S_IFREG && ty != S_IFDIR) || (ty == S_IFDIR && typ == LockType::Write) {
         return Err(EINVAL);
     }
     if typ != LockType::Unlock && !LEASE_NOTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         klog::event!(Info, "syscall", "lease.refused", program = c.proc.name.as_str(); "file leases are not built (nothing could break them): EAGAIN, Linux's answer for a conflicting open (logged once)");
     }
     Err(EAGAIN)
+}
+
+/// `struct delegation` read from `arg` (EFAULT) with `d_flags` and `__pad` 0 (EINVAL): its `d_type`.
+fn read_deleg(c: &SysCtx<'_>, arg: u64) -> Result<u16, Errno> {
+    let mut b = [0u8; DELEGATION_SIZE];
+    c.proc.mm.copy_from_user(&mut b, arg).map_err(|_| EFAULT)?;
+    if b[..4] != [0; 4] || b[6..] != [0; 2] {
+        return Err(EINVAL);
+    }
+    Ok(u16::from_le_bytes([b[4], b[5]]))
+}
+
+/// F_GETDELEG: no delegation is ever held, so `d_type` comes back F_UNLCK.
+fn getdeleg(c: &SysCtx<'_>, arg: u64) -> Result<i64, Errno> {
+    read_deleg(c, arg)?;
+    let mut b = [0u8; DELEGATION_SIZE];
+    b[4..6].copy_from_slice(&(LockType::Unlock.linux() as u16).to_le_bytes());
+    c.proc.mm.copy_to_user(arg, &b).map_err(|_| EFAULT)?;
+    Ok(0)
+}
+
+/// F_SETDELEG: as `fcntl_setlease` but a directory may take a read delegation (no up-front EINVAL for it).
+fn setdeleg(c: &SysCtx<'_>, f: &OpenFile, arg: u64) -> Result<i64, Errno> {
+    let t = read_deleg(c, arg)?;
+    let typ = i16::try_from(t).ok().and_then(LockType::from_linux).ok_or(EINVAL)?;
+    vfs_setlease(c, f, typ)
 }
 
 /// What a write-life hint belongs to, held weakly.

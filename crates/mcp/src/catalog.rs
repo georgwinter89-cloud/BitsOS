@@ -64,6 +64,14 @@ impl Tool {
     pub fn is_service(&self) -> bool {
         matches!(self, Tool::Service(_))
     }
+    /// MC-L: offered on the local tools socket: a built-in tool marked `local`, or a service's tool that the
+    /// service marked itself (the registry takes the mark only from services of uid 0).
+    pub fn local(&self) -> bool {
+        match self {
+            Tool::Static(t) => t.local,
+            Tool::Service(t) => t.local,
+        }
+    }
     /// Runs the handler (built in) or forwards the call to its service, bounded by `ctx.deadline_ns`.
     pub fn invoke(&self, ctx: &ToolContext, args: &Json) -> ToolResult {
         match self {
@@ -97,6 +105,22 @@ impl<'a> Catalog<'a> {
             v.extend(r.snapshot().into_iter().map(Tool::Service));
         }
         v.sort_by(|a, b| a.name().cmp(b.name()));
+        v
+    }
+}
+
+/// MC-L: what the local tools socket sees: the tools marked `local`, nothing else. Any other name is unknown
+/// there, as if the tool did not exist.
+#[derive(Clone, Copy)]
+pub struct LocalCatalog<'a>(pub Catalog<'a>);
+
+impl LocalCatalog<'_> {
+    pub fn find(&self, name: &str) -> Option<Tool> {
+        self.0.find(name).filter(Tool::local)
+    }
+    pub fn sorted(&self) -> Vec<Tool> {
+        let mut v = self.0.sorted();
+        v.retain(Tool::local);
         v
     }
 }

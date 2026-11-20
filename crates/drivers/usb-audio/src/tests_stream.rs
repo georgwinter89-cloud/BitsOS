@@ -40,7 +40,7 @@ impl XferMem for Mem {
     }
 }
 
-fn alloc(n: usize) -> Result<Buffer, UsbError> {
+pub(crate) fn alloc(n: usize) -> Result<Buffer, UsbError> {
     Ok(Arc::new(Mem(Mutex::new(vec![0; n]))))
 }
 
@@ -56,7 +56,7 @@ struct Shared {
 }
 
 #[derive(Clone)]
-struct FakePipe(Arc<Shared>);
+pub(crate) struct FakePipe(Arc<Shared>);
 
 impl Pipe for FakePipe {
     fn room(&self) -> usize {
@@ -89,11 +89,11 @@ impl Pipe for FakePipe {
 }
 
 impl FakePipe {
-    fn new(window: usize, mps: usize) -> FakePipe {
+    pub(crate) fn new(window: usize, mps: usize) -> FakePipe {
         FakePipe(Arc::new(Shared { window, mps, ..Default::default() }))
     }
     /// Completes the oldest `n` requests: OUT data recorded; IN packets filled by `fill` (bytes per packet).
-    fn complete(&self, n: usize, error: Option<UsbError>, fill: &dyn Fn(usize) -> Vec<u8>) {
+    pub(crate) fn complete(&self, n: usize, error: Option<UsbError>, fill: &dyn Fn(usize) -> Vec<u8>) {
         for _ in 0..n {
             let Some((req, done)) = self.0.pending.lock().unwrap().pop_front() else { return };
             let mut packets = Vec::new();
@@ -118,12 +118,12 @@ impl FakePipe {
         self.0.queued.fetch_sub(req.packets.len(), Ordering::AcqRel);
         done(f(req.packets.len()));
     }
-    fn pending(&self) -> usize {
+    pub(crate) fn pending(&self) -> usize {
         self.0.pending.lock().unwrap().len()
     }
 }
 
-fn none(_: usize) -> Vec<u8> {
+pub(crate) fn none(_: usize) -> Vec<u8> {
     Vec::new()
 }
 

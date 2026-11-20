@@ -548,11 +548,14 @@ fn reap_sync() -> R {
 
 /// Threads that exit without a pause for 2 s: every reaper pass leaves new stacks and records behind, while each
 /// sync generation passes at once. That is no stall (gate 9's sc/20-smp: `reap.stalled` from work pending 1 s,
-/// not from a generation that did not pass), and everything is freed afterwards.
+/// not from a generation that did not pass), and everything is freed afterwards. The dead stacks stay few
+/// meanwhile: the spawns wait for the reaper (gate of 11.11.: 16 CPUs left 27 900 dead stacks, 1.7 GiB, within a
+/// second and the next spawn found no memory).
 fn reap_churn() -> R {
     let ncpu = crate::wait_cpus_online(5 * SEC);
-    let stalls0 = crate::reap::REAP_STALLS.get();
-    let (live0, threads0) = (crate::stack_stats().live, crate::thread_count());
+    let (stalls0, waits0) = (crate::reap::REAP_STALLS.get(), crate::reap::BACKLOG_WAITS.get());
+    let (live0, threads0, chunks0) = (crate::stack_stats().live, crate::thread_count(), crate::stack_stats().chunks);
+    let last0 = crate::threads().last().map_or(0, |t| t.0);
     let (t0, mut rounds, mut exited) = (time::now_ns(), 0u64, 0u64);
     while time::now_ns() - t0 < 2 * SEC {
         let hs: Vec<JoinHandle> = (0..ncpu).map(|_| spawn_on("sched-churn", Class::Normal, None, false, 0, || spin(200))).collect::<Result<_, _>>()?;
@@ -561,62 +564,85 @@ fn reap_churn() -> R {
         rounds += 1;
     }
     let stalls = crate::reap::REAP_STALLS.get() - stalls0;
-    // The backlog of that many exits (16 CPUs: some 15000 stacks) takes the reaper longer than `reap`'s 2 s.
+    // What is left of that many exits may still take longer than `reap`'s 2 s on a slow machine.
     let (t1, backlog) = (time::now_ns(), hal::switch::retired_count());
     let mut freed = false;
     while !freed && time::now_ns() - t1 < 30 * SEC {
         freed = crate::reap();
     }
+    let chunks = crate::stack_stats().chunks - chunks0;
     klog::event!(Info, "sched", "ktest.reap_churn", cpus = ncpu, rounds = rounds, exited = exited, stalls = stalls, backlog = backlog,
-        drained_ms = (time::now_ns() - t1) / MS);
+        drained_ms = (time::now_ns() - t1) / MS, chunks = chunks, waits = crate::reap::BACKLOG_WAITS.get() - waits0);
     kassert!(stalls == 0, "{stalls} stall reports while {exited} threads exited and every generation passed");
+    // `BACKLOG_STACKS` dead ones, a round's live ones and a spawn per wait that ran out fit in two chunks.
+    kassert!(chunks <= 4, "{chunks} new chunks of stack slots for {ncpu} threads at a time (dead stacks at the end: {backlog})");
     kassert!(freed, "the reaper did not free everything within 30 s (stacks retired: {})", hal::switch::retired_count());
-    kassert!(crate::stack_stats().live <= live0 && crate::thread_count() <= threads0, "stacks {} (before {live0}), threads {} (before {threads0})",
-        crate::stack_stats().live, crate::thread_count());
+    // A driver may start a long-lived thread meanwhile (as `sc.threads.many` allows: `fat.mount` came up during
+    // the churn of a boot that ran this test alone on a loaded host); none of the churn's own may stay.
+    let new: Vec<(u64, String, &str)> = crate::threads().into_iter().filter(|t| t.0 > last0).map(|t| (t.0, t.1, t.3)).collect();
+    let foreign = new.iter().filter(|t| t.1 != "sched-churn").count();
+    kassert!(crate::stack_stats().live <= live0 + foreign && crate::thread_count() <= threads0 + foreign,
+        "stacks {} (before {live0}), threads {} (before {threads0}), new: {new:?}", crate::stack_stats().live, crate::thread_count());
     Ok(())
 }
 
 /// The interrupt-exit hook: it never preempts with a spin lock held or when the interrupted code had interrupts
-/// off; with a reschedule pending it switches to the waiting KernelRt thread and returns once this thread runs
-/// again.
+/// off; a reschedule it could not act on under a lock happens where the lock drops (`preempt_deferred`); with a
+/// reschedule pending and nothing deferred it switches to the waiting KernelRt thread itself and returns once this
+/// thread runs again. The KernelRt threads wait on completions first: a wake-up on this CPU outside a lock now
+/// switches at once (`cpus::kick`), so each is woken where the step under test is the only way to it.
 fn preempt_hook() -> R {
     let me = current_cpu();
     let _pin = crate::pin_for_now(me).ok_or("could not pin")?;
-    let ran = Arc::new(AtomicBool::new(false));
-    let r = ran.clone();
-    // KernelRt: it deserves the CPU over the (fair) caller whatever the virtual runtimes say.
-    let x = spawn_on("sched-preempted", Class::KernelRt, Some(me), true, crate::RT_PRIO_DEFAULT, move || r.store(true, Ordering::Release))?;
+    let waiter = |name: &'static str| -> Result<(JoinHandle, Arc<Completion>, Arc<AtomicBool>), String> {
+        let (go, ran) = (Arc::new(Completion::new()), Arc::new(AtomicBool::new(false)));
+        let (g, r) = (go.clone(), ran.clone());
+        // KernelRt: it deserves the CPU over the (fair) caller whatever the virtual runtimes say.
+        let h = spawn_on(name, Class::KernelRt, Some(me), true, crate::RT_PRIO_DEFAULT, move || {
+            g.wait();
+            r.store(true, Ordering::Release);
+        })?;
+        Ok((h, go, ran))
+    };
+    let (x, go_x, ran_x) = waiter("sched-deferred")?;
+    let (y, go_y, ran_y) = waiter("sched-preempted")?;
     let cs = crate::cpus::of(me).ok_or("no CPU state")?;
     let result = (|| -> R {
+        // Both are blocked in `wait` by now (they ran at their spawn: KernelRt on this CPU, the caller fair).
+        crate::sleep_ms(10);
         let lock = SpinLock::new(());
+        let deferred0 = crate::DEFERRED_PREEMPTIONS.get();
         {
             let _g = lock.lock();
             kassert!(ksync::preempt_count() > 0, "a held spin lock does not count");
+            go_x.complete();
+            kassert!(!ran_x.load(Ordering::Acquire), "switched to the woken thread under a spin lock");
             cs.need_resched.store(true, Ordering::Release);
             let _irq = hal::cpu::IrqGuard::new();
             kassert!(!crate::irq_exit_preempt(true), "preempted a spin-lock holder");
         }
+        kassert!(ran_x.load(Ordering::Acquire), "the reschedule deferred under the lock did not happen where it dropped");
+        kassert!(crate::DEFERRED_PREEMPTIONS.get() > deferred0, "the switch at the lock's drop was not the deferred one");
         cs.need_resched.store(true, Ordering::Release);
         {
             let _irq = hal::cpu::IrqGuard::new();
             kassert!(!crate::irq_exit_preempt(false), "preempted code that had interrupts off");
         }
-        cs.need_resched.store(true, Ordering::Release);
         let switched = {
             let _irq = hal::cpu::IrqGuard::new();
+            go_y.complete();
+            // Only the interrupt exit may switch: the wake-up's own deferral is taken back.
+            let _ = hal::percpu::take_deferred_resched();
+            cs.need_resched.store(true, Ordering::Release);
             crate::irq_exit_preempt(true)
         };
-        // A tick since the spawn may have preempted us for it already: that is the same path, and nothing is left to do.
-        kassert!(switched || ran.load(Ordering::Acquire), "a pending reschedule did not preempt");
-        let t0 = time::now_ns();
-        while !ran.load(Ordering::Acquire) && time::now_ns() - t0 < 5 * SEC {
-            crate::sleep_ms(1);
-        }
-        kassert!(ran.load(Ordering::Acquire), "the waiting thread did not run");
+        kassert!(switched && ran_y.load(Ordering::Acquire), "a pending reschedule did not preempt at the interrupt exit (switched {switched})");
         Ok(())
     })();
     cs.need_resched.store(false, Ordering::Release);
-    let j = join_all(core::slice::from_ref(&x), "preempted");
+    go_x.complete();
+    go_y.complete();
+    let j = join_all(&[x, y], "preempted");
     result?;
     j
 }

@@ -1,9 +1,10 @@
-//! AB-10a: the TLS and LDT calls Wine's WoW64 makes (`set_thread_area`, `get_thread_area`, `modify_ldt`), as
-//! 64-bit syscalls (205, 211, 154) and through `int 0x80` with the 32-bit ABI (243, 244, 123). Every other
-//! `int 0x80` number answers -ENOSYS (Georg 27.10.: no full 32-bit support). Linux semantics from
-//! linux-6.6/arch/x86/kernel/tls.c (do_set_thread_area, do_get_thread_area, tls_desc_okay), ldt.c (read_ldt,
-//! write_ldt, read_default_ldt, modify_ldt), include/asm/desc.h (fill_ldt, LDT_empty, LDT_zero) and
-//! entry/common.c (do_int80_syscall_32). The descriptors themselves live in hal (`entry::segs`).
+//! AB-10a: the TLS and LDT calls Wine's WoW64 makes (`set_thread_area`, `get_thread_area`, `modify_ldt`), as 64-bit
+//! syscalls (205, 211, 154) and through `int 0x80` with the 32-bit ABI (243, 244, 123). Every other `int 0x80` number
+//! answers -ENOSYS (Georg 27.10.: no full 32-bit support). Linux semantics from linux-6.6/arch/x86/kernel/tls.c
+//! (do_set_thread_area, do_get_thread_area, tls_desc_okay), ldt.c (read_ldt, write_ldt, read_default_ldt, modify_ldt),
+//! include/asm/desc.h (fill_ldt, LDT_empty, LDT_zero) and entry/common.c (do_int80_syscall_32) (Linux 7.3.1 differs:
+//! linux-7.3.1/arch/x86/entry/syscall_32.c:123, see plan/spec/linux7-differences.md). The descriptors themselves live
+//! in hal (`entry::segs`).
 
 use crate::{SysCtx, syscall_nr};
 use alloc::sync::Arc;

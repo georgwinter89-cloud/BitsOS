@@ -81,6 +81,19 @@ pub enum EnableError {
     BridgeUntouched(Loc),
     /// The function is not in the scanned tree.
     NotScanned,
+    /// GP B7: the firmware left an IOMMU translating or guarding memory and BitsOS has no IOMMU driver, so no
+    /// function is given bus master (the verdict's name, `acpi::dma_gate`).
+    DmaBlocked(&'static str),
+}
+
+/// GP B7: may this enable set bus master? `gate` is `acpi::dma_gate()`'s answer (`Err`: the verdict's name). An
+/// enable without DMA is never refused here, and without a DMAR table the gate is always open (every AMD machine).
+/// Pure; host-tested.
+pub fn dma_allowed(dma: bool, gate: Result<(), &'static str>) -> Result<(), EnableError> {
+    match gate {
+        Err(verdict) if dma => Err(EnableError::DmaBlocked(verdict)),
+        _ => Ok(()),
+    }
 }
 
 impl core::fmt::Display for EnableError {
@@ -94,6 +107,7 @@ impl core::fmt::Display for EnableError {
             EnableError::Busy => write!(f, "another enable or restore did not finish in time, or the driver is being removed"),
             EnableError::BridgeUntouched(at) => write!(f, "bridge {at} on the path is untouched"),
             EnableError::NotScanned => write!(f, "function not in the scanned tree"),
+            EnableError::DmaBlocked(v) => write!(f, "an IOMMU the firmware left active would stop this device's DMA ({v}); BitsOS has no IOMMU driver"),
         }
     }
 }
@@ -102,7 +116,7 @@ impl EnableError {
     /// Event name for the log.
     pub fn name(&self) -> &'static str {
         match self {
-            EnableError::Untouched(_) | EnableError::Storage => "enable.refused",
+            EnableError::Untouched(_) | EnableError::Storage | EnableError::DmaBlocked(_) => "enable.refused",
             _ => "enable.failed",
         }
     }

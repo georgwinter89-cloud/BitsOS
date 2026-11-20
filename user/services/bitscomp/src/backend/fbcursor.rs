@@ -1,5 +1,5 @@
-//! WY-11: GX-5a's hardware cursor door on `/dev/fb0` (gopfb fbdev/cursor.rs, change request 1 of
-//! plan/notes/gx-GX-5a.md): `FBIO_BITSOS_CURSOR = _IOW('F', 0xB2, struct bitsos_fb_cursor)`, 40 bytes
+//! WY-11: GX-5a's hardware cursor door on `/dev/fb0` (gopfb fbdev/cursor.rs,
+//! plan/spec/gpu.md §11.3): `FBIO_BITSOS_CURSOR = _IOW('F', 0xB2, struct bitsos_fb_cursor)`, 40 bytes
 //! `{u32 op (0 hide, 1 image, 2 move); u32 flags (bit 0 straight alpha); s32 x, y (hotspot, screen pixels);
 //! u32 width, height (1..256); u32 hot_x, hot_y; u64 pixels}`. Linux (and a V2 kernel without it) answers
 //! ENOTTY, QEMU's V2 ENODEV: both mean the pointer stays in the frames.
@@ -89,7 +89,7 @@ impl Drop for FbCursor {
 mod tests {
     use super::*;
 
-    /// The kernel's decoder, copied from gopfb fbdev/cursor.rs in plan/notes/gx-GX-5a-cr.patch (`Arg::from_bytes`):
+    /// The kernel's decoder, copied from gopfb fbdev/cursor.rs (`Arg::from_bytes`):
     /// (op, flags, x, y, width, height, hot_x, hot_y, pixels).
     fn kernel_reads(b: &[u8; 40]) -> (u32, u32, i32, i32, u32, u32, u32, u32, u64) {
         let u = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn request_number_is_iow_f_b2_40() {
-        // _IOW(type, nr, size) = 1 << 30 | size << 16 | type << 8 | nr (linux-6.6/include/uapi/asm-generic/ioctl.h).
+        // _IOW(type, nr, size) = 1 << 30 | size << 16 | type << 8 | nr (linux-7.3.1/include/uapi/asm-generic/ioctl.h).
         assert_eq!(FBIO_BITSOS_CURSOR, (1 << 30) | (40 << 16) | ((b'F' as u64) << 8) | 0xB2);
         assert_eq!((OP_HIDE, OP_IMAGE, OP_MOVE), (0, 1, 2));
     }

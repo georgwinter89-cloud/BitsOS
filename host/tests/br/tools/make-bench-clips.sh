@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# BR-4a: the clips for page/bench.html ?mode=video (BR-4 on the Mini-PC: YouTube-like 1080p60 VP9 and AV1 with
-# Opus, played by Brave's software decoders). Made locally by ffmpeg from its test sources (moving pattern, so
-# every frame differs); never downloaded. Usage: make-bench-clips.sh [out-dir] [seconds]
+# BR-4a: the clips for page/bench.html ?mode=video (BR-4 on the Mini-PC, plan/guides/brave.md "Budget": YouTube-like
+# 1080p60 VP9 and AV1 with Opus, which Brave decodes on the 780M through VA-API). Made locally by ffmpeg from its test
+# sources (moving pattern, so every frame differs); never downloaded. Usage: make-bench-clips.sh [out-dir] [seconds]
 # Default out-dir: /var/tmp/claude-v2/br-bench (serve it with page/bench.html copied next to it).
 set -euo pipefail
 out=${1:-/var/tmp/claude-v2/br-bench}

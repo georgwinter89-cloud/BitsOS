@@ -152,9 +152,9 @@ pub fn render(t: &Table, q: &Query, now: u64) -> String {
     out
 }
 
-/// No store: `metrics=off`, or the sampler did not start.
+/// No store: the sampler did not start.
 fn off_answer() -> ToolResult {
-    Ok(alloc::vec![ToolOutput::Text(String::from("metrics off (CONFIG metrics=off, or the sampler did not start: see log subsystem=klog name=metrics.)"))])
+    Ok(alloc::vec![ToolOutput::Text(String::from("metrics off (the sampler did not start: see log subsystem=klog name=metrics.)"))])
 }
 
 pub fn metrics(ctx: &ToolContext, args: &Json) -> ToolResult {
@@ -178,6 +178,7 @@ mcp::mcp_tool!(
     name: "metrics",
     owner: "RB",
     safety: Read,
+    local: true,
     description: "Machine metrics sampled every 2 s, as series over a time range: cpu.<n>|all.busy/user/system (%), proc.<pid>.<name>.cpu (% of one CPU, programs that used CPU), mem.total/free/used.<kind> (B), net.<card>.rx_bytes/tx_bytes (B/s), rx_frames/tx_frames/rx_dropped/tx_dropped (/s), disk.<name>.requests/dispatches (/s), queued/inflight/inflight_max/errors/timeouts (n), temp.tctl/ccd<i> (C), power.pkg (W), metrics.cost (% of one CPU the sampler takes), and every kernel counter (totals, n). Range in seconds since boot (the [time] of the log): from/to, or last (default the last 60 s). name: comma-separated parts of series names (e.g. 'cpu.all,temp,igc'). max: points per series (default 30); a point covers several rounds then, agg says how (avg, min, max, last; totals default to last). Lines: 'time t...', then '<series> <unit> v...' with '-' for no value. Earlier boots and times before the rings: since/until (wall time, local: 'YYYY-MM-DD HH:MM', 'HH:MM' = the last 24 h, or unix seconds) instead of from/to/last answer from the journal (bitsjournal, weeks back).",
     schema: r#"{"type":"object","properties":{"since":{"type":"string","description":"wall time (local): 'YYYY-MM-DD HH:MM[:SS]', 'HH:MM' (the last 24 h) or unix seconds; answered from the journal (all boots, weeks back)"},"until":{"type":"string","description":"wall time like since (default now)"},"name":{"type":"string","description":"comma-separated parts of series names"},"from":{"type":"number","minimum":0,"description":"seconds since boot"},"to":{"type":"number","minimum":0,"description":"seconds since boot"},"last":{"type":"number","minimum":0,"description":"the last n seconds (instead of from), default 60"},"max":{"type":"integer","minimum":1,"maximum":2000,"description":"points per series, default 30"},"agg":{"type":"string","enum":["avg","min","max","last"]}},"additionalProperties":false}"#,
     handler: metrics,

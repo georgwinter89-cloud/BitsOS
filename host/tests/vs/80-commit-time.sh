@@ -22,7 +22,7 @@ NAME=vs-commit
 IMG="target/xtask/$NAME.img"
 BIG_MB=48
 
-cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info,bitsvol=debug;wlan=off;nvme_write=off;data_img_mb=64"
+cargo xtask image --name "$NAME" --config-extra "token=$TOKEN;mcp_port=8765;loglevel=info,bitsvol=debug;nvme_write=off;data_img_mb=64"
 kib=$(( $(stat -c %s "$IMG") / 1024 + 700 * 1024 ))
 rm -f "$IMG"
 mkfs.fat -F 32 -n BITSOS -C "$IMG" "$kib" > /dev/null

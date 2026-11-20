@@ -1,8 +1,7 @@
-//! ktests of the WLAN driver (prefix `wl`). Under QEMU (no RTL8852BE): without `wlan=on` nothing is
-//! attached and the chip's IDs stay untouched by the PCI core; the netdev glue against a card that
+//! ktests of the WLAN driver (prefix `wl`). Under QEMU (no RTL8852BE): the netdev glue against a card that
 //! has no chip (queues, link, backpressure, the panic mirror); CONFIG parsing keeps the passphrase
-//! out of every text; the MCP tool refuses a passphrase argument. On the Mini-PC with `wlan=on`
-//! (class Wlan: runs over MCP on hardware only with `wlan=on`) the attached card's status.
+//! out of every text; the MCP tool refuses a passphrase argument. On the Mini-PC (class Wlan: runs over MCP on
+//! hardware where CONFIG names a WLAN) the attached card's status.
 //! Every test is rerunnable (Safe tests run several times per boot over MCP).
 
 use alloc::format;
@@ -16,19 +15,6 @@ use ktest::{TestResult, kassert, ktest};
 
 use crate::card::{Card, txq_max};
 use crate::netdev::WlanNet;
-
-fn untouched() -> TestResult {
-    if pci::registry::opted_in("wlan") {
-        return ktest::fail("wlan=on: the driver may attach (wl.chip.status checks it)");
-    }
-    kassert!(crate::cards().is_empty(), "a card attached without wlan=on");
-    kassert!(
-        pci::registry::untouched_key(crate::VENDOR_REALTEK, crate::DEV_RTL8852BE, 0x02_80_00) == Some("wlan"),
-        "10EC:B852 is not kept untouched by the wlan key"
-    );
-    Ok(())
-}
-ktest!("wl.untouched", QemuAll, untouched);
 
 fn glue() -> TestResult {
     let c = Arc::new(Card::new(String::from("wlan-test"), String::from("-"), None, None));
@@ -149,12 +135,12 @@ fn quiesce_lock_held() -> TestResult {
 }
 ktest!("wl.quiesce.lock_held", Safe, quiesce_lock_held);
 
-/// On the Mini-PC with wlan=on: the card is attached, its thread runs, the status has no secret.
+/// On the Mini-PC: the card is attached, its thread runs, the status has no secret.
 /// Reads only (rerunnable); the join itself is the desk's check list.
 fn chip_status() -> TestResult {
     let cards = crate::cards();
     let Some(c) = cards.first() else {
-        return ktest::fail("no RTL8852BE attached (wlan=on and the Mini-PC's 04:00.0 are needed)");
+        return ktest::fail("no RTL8852BE attached (the Mini-PC's 04:00.0 is needed)");
     };
     let lines = crate::tool::status_lines(c);
     let text = lines.join("\n");

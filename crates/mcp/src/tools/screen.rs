@@ -3,7 +3,9 @@
 //! region; or, with `format: "text"`, the kernel console's text grid.
 //!
 //! The frame is copied under the display's lock (one memcpy of the region) and encoded outside it, so drawing
-//! waits for the copy only, never for the encoder.
+//! waits for the copy only, never for the encoder. SHOT: while a program draws straight into the scanout buffers,
+//! only the region is read from the buffer shown, which fbdev holds still for the copy (one whole frame, never rows
+//! of two; at most 100 ms, else the answer says to ask again).
 
 use super::{bad, number, opt_str};
 use crate::png::{self, PngError};
@@ -12,7 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use display::font;
+use display::{font, PictureError};
 
 /// Largest scale-down factor (a bound on one request's argument, not a count of things).
 pub const SCALE_MAX: u64 = 16;
@@ -59,14 +61,6 @@ pub fn shot_args(args: &Json, fw: u32, fh: u32) -> Result<Shot, ToolError> {
         return Err(ToolError::BadArgument(format!("height: y {y} + height {h} must be 1 to {fh}")));
     }
     Ok(Shot { x: x as u32, y: y as u32, w: w as u32, h: h as u32, scale: scale as u32 })
-}
-
-/// Copies the shot's region of the frame (`pixels` is `fw` wide) into a new buffer, `w * h` pixels.
-pub fn copy_region(pixels: &[u32], fw: u32, s: &Shot, dst: &mut Vec<u32>) {
-    for row in s.y..s.y + s.h {
-        let at = (row * fw + s.x) as usize;
-        dst.extend_from_slice(&pixels[at..at + s.w as usize]);
-    }
 }
 
 /// Row `oy` of the scaled picture as RGB: each output pixel is the average of its `scale` x `scale` block
@@ -119,29 +113,40 @@ pub fn take(args: &Json, now_ns: &dyn Fn() -> u64) -> Result<(Shot, Vec<u8>, Sta
     let s = shot_args(args, fw, fh)?;
     let t0 = now_ns();
     let mut region: Vec<u32> = Vec::new();
-    if region.try_reserve_exact(s.w as usize * s.h as usize).is_err() {
-        klog::event!(Warn, "mcp", "screen.no_memory", width = s.w, height = s.h; "no memory for the region copy");
-        return Err(ToolError::Failed(format!("no memory for a copy of {}x{} pixels; ask again with a smaller region", s.w, s.h)));
-    }
     // DP-2: the picture the screen shows (a fullscreen fbdev program's while it has the screen), not only the
-    // console's frame.
-    let same = display::with_screen(|px, w, h| {
+    // console's frame. SHOT: only the region is read, and it is one whole picture.
+    let r = display::Rect::new(s.x, s.y, s.w, s.h);
+    match display::copy_screen(r, &mut region) {
         // The frame can only change size through set_device; then the arguments no longer fit.
-        if (w, h) != (fw, fh) {
-            return false;
+        Ok(size) if size == (fw, fh) => {}
+        Ok(_) | Err(PictureError::Size(..)) | Err(PictureError::NoPicture) => {
+            klog::event!(Warn, "mcp", "screen.display_changed", width = fw, height = fh; "the frame changed size or went away during the copy");
+            return Err(ToolError::Failed(String::from("the display changed while the picture was taken; ask again")));
         }
-        copy_region(px, fw, &s, &mut region);
-        true
-    });
-    if same != Some(true) {
-        klog::event!(Warn, "mcp", "screen.display_changed", width = fw, height = fh; "the frame changed size or went away during the copy");
-        return Err(ToolError::Failed(String::from("the display changed while the picture was taken; ask again")));
+        Err(e) => return Err(picture_failed(e, &s)),
     }
     let t1 = now_ns();
     let png = encode(&region, &s, PNG_LIMIT).map_err(|e| too_big(e, &s))?;
     let t2 = now_ns();
     let st = Stats { frame: (fw, fh), copy_ms: (t1 - t0) / 1_000_000, encode_ms: (t2 - t1) / 1_000_000, bytes: png.len() };
     Ok((s, png, st))
+}
+
+/// A copy that failed for a reason other than the display changing (pure, host-tested).
+pub fn picture_failed(e: PictureError, s: &Shot) -> ToolError {
+    match e {
+        PictureError::NotWhole => {
+            klog::event!(Info, "mcp", "screen.not_whole", width = s.w, height = s.h; "the picture could not be held still for the copy");
+            ToolError::Failed(String::from(
+                "the picture could not be taken whole: the program on the screen kept drawing into it longer than a screenshot may hold it (100 ms); ask again, or ask for a smaller region",
+            ))
+        }
+        PictureError::NoMemory => {
+            klog::event!(Warn, "mcp", "screen.no_memory", width = s.w, height = s.h; "no memory for the region copy");
+            ToolError::Failed(format!("no memory for a copy of {}x{} pixels; ask again with a smaller region", s.w, s.h))
+        }
+        PictureError::Size(..) | PictureError::NoPicture => ToolError::Failed(String::from("the display changed while the picture was taken; ask again")),
+    }
 }
 
 fn no_display() -> ToolError {
@@ -337,7 +342,7 @@ mod tests {
         let px: Vec<u32> = (0..fw * fh).map(|i| i.wrapping_mul(2_654_435_761) & 0x00FF_FFFF).collect();
         let s = shot_args(&args(r#"{"x":3,"y":4,"width":30,"height":17,"scale":4}"#), fw, fh).unwrap();
         let mut region = Vec::new();
-        copy_region(&px, fw, &s, &mut region);
+        display::copy_rect(&px, fw, fh, display::Rect::new(s.x, s.y, s.w, s.h), &mut region).unwrap();
         assert_eq!(region.len(), 30 * 17);
         let png = encode(&region, &s, usize::MAX).unwrap();
         let (w, h, rgb) = crate::png::tests::decode(&png);
@@ -411,6 +416,20 @@ mod tests {
         scaled_row(&px, &s, 359, &mut want);
         assert_eq!(&rgb[359 * 640 * 3..], &want[..]);
         assert!(t.elapsed() < std::time::Duration::from_secs(60), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_picture_that_could_not_be_held_says_to_ask_again() {
+        let s = Shot { x: 0, y: 0, w: 2560, h: 180, scale: 1 };
+        match picture_failed(PictureError::NotWhole, &s) {
+            ToolError::Failed(m) => assert!(m.contains("could not be taken whole") && m.contains("ask again"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match picture_failed(PictureError::NoMemory, &s) {
+            ToolError::Failed(m) => assert!(m.contains("2560x180") && m.contains("smaller region"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(picture_failed(PictureError::Size(1, 1), &s), ToolError::Failed(m) if m.contains("display changed")));
     }
 
     #[test]

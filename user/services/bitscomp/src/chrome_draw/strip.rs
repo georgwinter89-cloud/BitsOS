@@ -1,6 +1,6 @@
 //! DS-3: the Bühne's bottom: the time strip "Verlauf · Heute" (hour ticks, one lane per workspace, the now marker;
-//! empty until the snapshots fill it) and the row under it (the hint line from real counts, the Feld bar as a
-//! look, minimised windows and Startseite). The now marker moves only when the status clock's minute changes, so
+//! empty until the snapshots fill it) and the row under it (the hint line from real counts, the Feld bar,
+//! minimised windows and Startseite). The now marker moves only when the status clock's minute changes, so
 //! the strip is redrawn at most once a minute and a still desktop draws 0 frames.
 
 use crate::canvas::{Box2, Canvas};
@@ -34,6 +34,17 @@ pub struct StripLook {
     pub active: usize,
     /// From the status clock: changes once a minute.
     pub now: Option<(i32, i32)>,
+    /// REWIND: "Zurückspulen" can open (else grey), the pointer is on it, and the short reason it cannot.
+    pub rewind: (bool, bool, &'static str),
+}
+
+/// REWIND: where "Zurückspulen" lies in the strip `strip` (logical px; as `strip` draws it, for clicks and
+/// `ctl hot`); None when the strip is too low for it.
+pub fn rewind_rect(strip: Rect, t: &Theme) -> Option<Rect> {
+    let bf = t.bfont(Family::Ui, 13.0, Weight::SemiBold);
+    let w = (bf.width("Zurückspulen") as f64 / t.scale).ceil() as i32 + t.bl(52.0);
+    let r = Rect { x: strip.x + t.bl(24.0), y: strip.y + t.bl(64.0), w, h: t.bl(44.0) };
+    (r.y + r.h <= strip.y + strip.h).then_some(r)
 }
 
 pub fn strip(l: &StripLook, t: &Theme, area: Rect) -> Canvas {
@@ -43,13 +54,13 @@ pub fn strip(l: &StripLook, t: &Theme, area: Rect) -> Canvas {
     let mut c = Canvas::new(w, h);
     let b = p.b(l.rect);
     let r = t.radius_card as f32 * kk;
-    hud::panel_shadow(&mut c, b, r, &t.shadow_raised, t);
     c.rrect(b, r, hud::glass(t, Glass::Bar));
     c.rrect_line(b, r, kk, alpha(t.accent, 0.18));
     hud::brackets(&mut c, b, t);
     let s = p.r(l.rect);
     let at = |x: f32, y: f32| (s.x as f32 + x * kk, s.y as f32 + y * kk);
-    // The label column: "VERLAUF", "Heute", and "Zurückspulen" (shown as not available until the snapshots exist).
+    // The label column: "VERLAUF", "Heute", and "Zurückspulen" (grey until bitssnap lists snapshots; on hover the
+    // reason under it).
     let lab = t.style(Style::Label);
     let (lx, _) = at(24.0, 0.0);
     let lx = lx as i32;
@@ -60,14 +71,27 @@ pub fn strip(l: &StripLook, t: &Theme, area: Rect) -> Canvas {
     let bw = bf.width("Zurückspulen") + (52.0 * kk) as i32;
     let bb = Box2 { x: lx as f32, y: s.y as f32 + 64.0 * kk, w: bw as f32, h: 44.0 * kk };
     if bb.y + bb.h <= b.y + b.h {
-        c.rrect_line(bb, 14.0 * kk, kk, t.line);
+        let (ready, hover, why) = l.rewind;
+        let edge = match (ready, hover) {
+            (true, true) => t.accent,
+            (true, false) => t.line_strong,
+            (false, _) => t.line,
+        };
+        if ready && hover {
+            c.rrect(bb, 14.0 * kk, alpha(t.accent, 0.12));
+        }
+        c.rrect_line(bb, 14.0 * kk, kk, edge);
         let (ix, iy) = (bb.x + 14.0 * kk, bb.y + bb.h / 2.0);
         for dx in [0.0, 5.5] {
             let x0 = ix + dx * kk;
-            c.poly(&[(x0 + 5.5 * kk, iy - 4.5 * kk), (x0 + 5.5 * kk, iy + 4.5 * kk), (x0, iy)], t.muted);
+            c.poly(&[(x0 + 5.5 * kk, iy - 4.5 * kk), (x0 + 5.5 * kk, iy + 4.5 * kk), (x0, iy)], if ready { t.accent } else { t.muted });
         }
         let tx = (bb.x + 38.0 * kk) as i32;
-        c.text_fit(&bf, Rect { x: tx, y: bb.y as i32, w: bw - (38.0 * kk) as i32, h: bb.h as i32 }, "Zurückspulen", t.muted);
+        c.text_fit(&bf, Rect { x: tx, y: bb.y as i32, w: bw - (38.0 * kk) as i32, h: bb.h as i32 }, "Zurückspulen", if ready { t.text } else { t.muted });
+        if !ready && hover && !why.is_empty() {
+            let band = Rect { x: bb.x as i32, y: (bb.y + bb.h + 3.0 * kk) as i32, w: (180.0 * kk) as i32, h: (14.0 * kk) as i32 };
+            c.text_fit(&lab, band, &Theme::label(Style::Label, why), t.muted);
+        }
     }
     // The hours: 13 ticks over 12 hours, labels above.
     let (ax, ay) = at(200.0, 34.0);
@@ -150,11 +174,16 @@ pub struct BottomLook {
     pub feld: Rect,
     pub home: Option<Rect>,
     pub min_items: Vec<Rect>,
+    /// DESK-LEFT: each chip's x (drawn in the letter's place while the pointer is on the chip).
+    pub min_close: Vec<Rect>,
     pub theme: u64,
     pub text: String,
     /// MC-9b: "Claude darf: installieren bis 08:00" while a grant runs.
     pub grant: Option<String>,
     pub minimized: Vec<String>,
+    /// C (12.11.): each minimised window's program letter, and the "+N" chip (rect, N, its list open).
+    pub letters: Vec<char>,
+    pub min_more: Option<(Rect, usize, bool)>,
     pub home_lit: bool,
     pub hover: Option<Hover>,
 }
@@ -179,12 +208,29 @@ pub fn bottom(l: &BottomLook, t: &Theme, area: Rect) -> Canvas {
     let mono = t.bfont(Family::Mono, 12.0, Weight::Medium);
     for (i, (r, name)) in l.min_items.iter().zip(&l.minimized).enumerate() {
         let b = p.b(*r);
-        let on = l.hover == Some(Hover::Chrome(C::Min(i)));
+        let on_x = l.hover == Some(Hover::Chrome(C::MinClose(i)));
+        let on = on_x || l.hover == Some(Hover::Chrome(C::Min(i)));
         c.rrect(b, b.h / 2.0, alpha(t.panel, 0.6));
         c.rrect_line(b, b.h / 2.0, kk, if on { t.line_strong } else { t.line });
+        match l.min_close.get(i).filter(|_| on) {
+            // The x in the letter's place while the pointer is on the chip: nothing moves.
+            Some(x) => crate::min_row::close_mark(&mut c, p.b(*x), on_x, t),
+            None => {
+                let side = 16.0 * kk;
+                let ch = l.letters.get(i).copied().unwrap_or('?');
+                crate::min_row::letter(&mut c, Box2 { x: b.x + 10.0 * kk, y: b.y + (b.h - side) / 2.0, w: side, h: side }, ch, t);
+            }
+        }
         let pr = p.r(*r);
-        let band = Rect { x: pr.x + (12.0 * kk) as i32, w: pr.w - (24.0 * kk) as i32, ..pr };
+        let band = Rect { x: pr.x + (32.0 * kk) as i32, w: pr.w - (44.0 * kk) as i32, ..pr };
         c.text_fit(&mono, band, name, if on { t.text } else { t.muted });
+    }
+    if let Some((r, n, open)) = l.min_more {
+        let b = p.b(r);
+        let on = open || l.hover == Some(Hover::Chrome(C::MinMore));
+        c.rrect(b, b.h / 2.0, alpha(t.panel, 0.6));
+        c.rrect_line(b, b.h / 2.0, kk, if open { t.accent } else if on { t.line_strong } else { t.line });
+        c.text_mid(&mono, p.r(r), &format!("+{n}"), if on { t.text } else { t.muted });
     }
     if let Some(r) = l.home {
         let b = p.b(r);
@@ -199,21 +245,16 @@ pub fn bottom(l: &BottomLook, t: &Theme, area: Rect) -> Canvas {
     c
 }
 
-/// The Feld bar as the design shows it (opening it comes with the Feld): a glass pill with Claude's small ring, a
-/// caret, the invitation and the key that will open it (Win+Leertaste, Georg's answer 6). No microphone yet.
+/// The Feld bar as the design shows it (a click opens the Feld): a glass pill with Claude's small ring, a caret, the
+/// invitation and the key that opens it too (Win+Leertaste, Georg's answer 6). No microphone yet.
 fn feld(c: &mut Canvas, b: Box2, t: &Theme, hover: bool) {
     let kk = k(t);
     let r = b.h / 2.0;
-    hud::panel_shadow(c, b, r, &t.shadow_lifted, t);
-    hud::panel_glow(c, b, r, t);
     c.rrect(b, r, alpha(t.panel, 0.78));
     c.rrect_line(Box2 { x: b.x - kk, y: b.y - kk, w: b.w + 2.0 * kk, h: b.h + 2.0 * kk }, r + kk, kk, alpha(t.accent, if hover { 0.7 } else { 0.45 }));
     let cy = b.y + b.h / 2.0;
     let ix = b.x + 22.0 * kk + 13.0 * kk;
-    // WY-19b: at the gpu level the ring breathes (`fx::plan::feld_ring`).
-    if !t.effects_gpu {
-        c.ring(ix, cy, 9.0 * kk, 2.4 * kk, t.accent);
-    }
+    // WY-19b: the ring breathes (`fx::plan::feld_ring`).
     c.disc(ix, cy, 3.0 * kk, t.accent);
     let cx = ix + 13.0 * kk + 14.0 * kk;
     c.fill(cx as i32, (cy - 11.0 * kk) as i32, (2.0 * kk).round() as i32, (22.0 * kk) as i32, t.accent);
@@ -245,8 +286,6 @@ pub fn stage(stage: Rect, t: &Theme, area: Rect) -> Canvas {
     let mut c = Canvas::new(w, h);
     let b = p.b(stage);
     let r = t.radius_card as f32 * kk;
-    hud::panel_shadow(&mut c, b, r, &t.shadow_lifted, t);
-    hud::panel_glow(&mut c, b, r, t);
     c.rrect(b, r, hud::glass(t, Glass::Card));
     c.rrect_line(b, r, kk, alpha(t.accent, 0.18));
     hud::brackets(&mut c, b, t);
@@ -274,7 +313,7 @@ mod tests {
         let t = crate::theme::Theme::build(&Default::default());
         let rect = Rect { x: 51, y: 879, w: 1946, h: 137 };
         let area = crate::chrome_draw::buehne::padded(rect, &t, 0);
-        let look = |now| StripLook { rect, theme: 1, lanes: vec![("A".into(), 0), ("B".into(), 1), ("C".into(), 2)], active: 0, now };
+        let look = |now| StripLook { rect, theme: 1, lanes: vec![("A".into(), 0), ("B".into(), 1), ("C".into(), 2)], active: 0, now, rewind: (false, false, "") };
         let a = strip(&look(Some((14, 32))), &t, area);
         let b = strip(&look(Some((14, 32))), &t, area);
         let c2 = strip(&look(Some((14, 33))), &t, area);

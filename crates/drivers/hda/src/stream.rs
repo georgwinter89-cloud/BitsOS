@@ -1,13 +1,15 @@
 //! Stream descriptors: ring layout and buffer descriptor list, reset, programming, run/stop, and the play
 //! position from LPIB with the AMD wrap quirk. After `linux-6.6/sound/hda/hdac_stream.c` (`stream_reset` :224,
-//! `stream_setup` :256, `setup_periods` :488) and V1 `snd/stream.asm` (`sd_setup` :35), `snd/ring.asm:24-33`.
+//! `stream_setup` :256, `setup_periods` :488; Linux 7.3.1 differs: `linux-7.3.1/sound/hda/core/stream.c:239`,
+//! see plan/spec/linux7-differences.md) and V1 `snd/stream.asm` (`sd_setup` :35), `snd/ring.asm:24-33`.
 
 use crate::hw::{until, Hw, Mem};
 use crate::regs::*;
 
 /// The largest ring one stream may have, and all streams of a controller together: Linux's managed PCM buffer
-/// limit (`linux-6.6/sound/pci/hda/hda_controller.c:693` MAX_PREALLOC_SIZE) and per-card total
-/// (`sound/core/pcm_memory.c:30` max_alloc_per_card). SN-4 announces it as buffer_bytes_max.
+/// limit (`linux-6.6/sound/pci/hda/hda_controller.c:693` MAX_PREALLOC_SIZE; Linux 7.3.1 differs:
+/// `linux-7.3.1/sound/hda/common/controller.c:692`, see plan/spec/linux7-differences.md) and per-card total
+/// (`sound/core/pcm_memory.c:29` max_alloc_per_card). SN-4 announces it as buffer_bytes_max.
 pub const MAX_RING_BYTES: u32 = 32 * 1024 * 1024;
 
 /// Ring and periods in bytes; `periods` BDL entries of `period_bytes` each (one per period: our rings are one
@@ -78,16 +80,13 @@ pub fn reset<H: Hw + ?Sized>(hw: &H, i: usize) -> bool {
     entered && left
 }
 
-/// Programs a reset descriptor (Linux `stream_setup` order): tag (and traffic priority without snooping),
+/// Programs a reset descriptor (Linux `stream_setup` order): tag,
 /// CBL, format, LVI, BDL address.
-pub fn program<H: Hw + ?Sized>(hw: &H, i: usize, tag: u8, format: u16, bdl: u64, l: &Layout, tp: bool) {
+pub fn program<H: Hw + ?Sized>(hw: &H, i: usize, tag: u8, format: u16, bdl: u64, l: &Layout) {
     let b = sd(i);
     // The 32-bit control register without its status byte (writing status bits back would clear them).
     let mut ctl = hw.rd32(b + SD_CTL) & 0x00FF_FFFF & !(SD_CTL_TAG_MASK | SD_CTL_RUN as u32);
     ctl |= (tag as u32 & 0xF) << SD_CTL_TAG_SHIFT;
-    if tp {
-        ctl |= SD_CTL_TP;
-    }
     hw.wr32(b + SD_CTL, ctl);
     hw.wr32(b + SD_CBL, l.ring_bytes);
     hw.wr16(b + SD_FORMAT, format);

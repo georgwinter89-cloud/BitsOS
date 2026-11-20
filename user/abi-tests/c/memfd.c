@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -300,6 +301,9 @@ static int basic(void) {
         unlink(shm);
         res("fallocate 1 TiB", falloc(t, 0, 0, 1L << 40));
         res("fallocate 1 TiB KEEP_SIZE", falloc(t, FL_KEEP_SIZE, 0, 1L << 40));
+        /* An end in the last page below 8 EiB: EFBIG before the size check (linux-7.3.1/mm/shmem.c:3691). */
+        res("fallocate in the last page", falloc(t, 0, LONG_MAX - PG, 100));
+        res("fallocate in the last page KEEP_SIZE", falloc(t, FL_KEEP_SIZE, LONG_MAX - PG, 100));
         fstat(t, &st);
         say("its size stays: %ld", (long)st.st_size);
         close(t);

@@ -17,7 +17,7 @@
 //! - `mc.install.paths_over_mcp` (QemuOnly): a real install from uploaded files, byte for byte on the stick.
 //!
 //! The two path tests skip with a visible reason (`NO_PATHS`) while RB's tool lacks the paths (MC-4b change
-//! request 1: plan/notes/mc-MC-4b-rb-paths.patch); once the desk applies it they run and must pass.
+//! request 1 to RB); once RB's tool has them they run and must pass.
 
 use super::files::Fnv;
 use crate::kernel::SEC;
@@ -291,7 +291,7 @@ ktest!("mc.install.dry_run", Safe, install_dry_run);
 
 /// The skip of the path tests names what is missing, so the gate's skip list shows it (MC-4b fixer: a visible
 /// skip, not a silent pass).
-const NO_PATHS: &str = "install_kernel has no kernel_path/initrd_path: apply plan/notes/mc-MC-4b-rb-paths.patch (MC-4b change request 1 to RB)";
+const NO_PATHS: &str = "install_kernel has no kernel_path/initrd_path (MC-4b change request 1 to RB)";
 
 /// The dry run from files uploaded with `write_file` (kernel_path/initrd_path), the exact byte counts in the
 /// answer, and the refusals of that source; the stick is the same before and after.

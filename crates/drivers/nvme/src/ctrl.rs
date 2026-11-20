@@ -114,7 +114,7 @@ impl CmdError {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// Use MSI-X/MSI (CONFIG `nvme_irq=off`: polled).
+    /// Use MSI-X/MSI (the test key `ktest_poll=nvme`: polled).
     pub irqs: bool,
     /// Linux's defaults: admin 60 s, I/O 30 s (core.c `admin_timeout`, `io_timeout`).
     pub admin_timeout_ns: u64,
@@ -276,6 +276,9 @@ pub struct Controller<H: Hw> {
     pub(crate) info: SpinLock<Info>,
     /// NV-2p: the only blocks Write and Dataset Management may name; None: nothing is ever written.
     window: SpinLock<Option<WriteWindow>>,
+    /// CRASHDISK: the boot window, readable without the lock (the panic writer): open, and a count of its changes.
+    boot_open: AtomicBool,
+    boot_gen: AtomicU64,
     pub stats: Stats,
 }
 
@@ -299,6 +302,8 @@ impl<H: Hw> Controller<H> {
             stop_gen: AtomicU64::new(0),
             info: SpinLock::named("nvme.info", Info::default()),
             window: SpinLock::named("nvme.window", None),
+            boot_open: AtomicBool::new(false),
+            boot_gen: AtomicU64::new(0),
             stats,
         }
     }
@@ -617,7 +622,9 @@ impl<H: Hw> Controller<H> {
         if changed && restart {
             self.layout.fetch_add(1, Ordering::AcqRel);
             // Other namespaces, other blocks: the checked window no longer means anything.
-            *self.window.lock() = None;
+            let mut w = self.window.lock();
+            *w = None;
+            self.mirror_boot(&w);
         }
         let usable = namespaces.iter().filter(|n| n.unusable.is_none()).count();
         let nq = qinfo.len();
@@ -873,7 +880,25 @@ impl<H: Hw> Controller<H> {
     /// NV-2p: `block::gpt::window`'s checked range is the only one this controller writes from now on.
     pub fn arm_window(&self, nsid: u32, first: u64, blocks: u64) {
         klog::event!(Info, "nvme", "window.armed", ctrl = self.name.as_str(), nsid = nsid, first = first, blocks = blocks);
-        *self.window.lock() = Some(WriteWindow::new(nsid, first, blocks));
+        let mut w = self.window.lock();
+        *w = Some(WriteWindow::new(nsid, first, blocks));
+        self.mirror_boot(&w);
+    }
+
+    /// CRASHDISK: called under the window lock after each change.
+    fn mirror_boot(&self, w: &Option<WriteWindow>) {
+        self.boot_gen.fetch_add(1, Ordering::AcqRel);
+        self.boot_open.store(w.is_some_and(|w| w.boot().is_some()), Ordering::Release);
+    }
+
+    /// CRASHDISK: the boot window is open (lock-free).
+    pub fn boot_open(&self) -> bool {
+        self.boot_open.load(Ordering::Acquire)
+    }
+
+    /// CRASHDISK: how often the window changed (lock-free; the panic writer compares it with its own).
+    pub fn boot_gen(&self) -> u64 {
+        self.boot_gen.load(Ordering::Acquire)
     }
 
     /// The boot ESP's range beside the armed window of `nsid` (fs-fat's /boot there, through `block::LowerWindow`).
@@ -882,6 +907,7 @@ impl<H: Hw> Controller<H> {
         let mut w = self.window.lock();
         let Some(next) = w.filter(|w| w.nsid() == nsid).and_then(|w| w.with_boot(first, blocks)) else { return false };
         *w = Some(next);
+        self.mirror_boot(&w);
         drop(w);
         klog::event!(Info, "nvme", "window.boot_opened", ctrl = self.name.as_str(), nsid = nsid, first = first, blocks = blocks);
         true
@@ -893,13 +919,18 @@ impl<H: Hw> Controller<H> {
             && x.boot().is_some()
         {
             *w = Some(x.without_boot());
+            self.mirror_boot(&w);
             drop(w);
             klog::event!(Info, "nvme", "window.boot_closed", ctrl = self.name.as_str());
         }
     }
 
     pub fn disarm_window(&self) {
-        if self.window.lock().take().is_some() {
+        let mut w = self.window.lock();
+        let had = w.take().is_some();
+        self.mirror_boot(&w);
+        drop(w);
+        if had {
             klog::event!(Info, "nvme", "window.disarmed", ctrl = self.name.as_str());
         }
     }

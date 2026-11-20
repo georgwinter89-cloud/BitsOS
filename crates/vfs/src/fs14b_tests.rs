@@ -77,7 +77,7 @@ fn byte(c: &PageCache, pg: u64) -> u8 {
 fn windows_are_kept_and_never_read_twice() {
     let b = Runs::new(8, 0);
     let c = PageCache::with_backend(b.clone(), 1000 * P);
-    // A fault reads around its page (linux-6.6/mm/filemap.c:3195): 4 before, 8 in all.
+    // A fault reads around its page (linux-7.3.1/mm/filemap.c:3435): 4 before, 8 in all.
     c.page_for_map(10, false).unwrap();
     assert_eq!(b.take(), [(6, 8)]);
     assert_eq!(c.pages(), 8);
@@ -148,16 +148,37 @@ fn a_bad_neighbour_does_not_fail_a_good_page() {
 
 #[test]
 fn a_waiter_reads_alone_after_the_timeout() {
-    let slow = FILL_WAIT_NS / 1_000_000 * 2;
-    let b = Runs::new(16, slow);
+    use core::sync::atomic::{AtomicBool, Ordering};
+    let b = Runs::new(16, 0);
     let c = Arc::new(PageCache::with_backend(b.clone(), 64 * P));
+    // Judged by order: the first read (window 12..28) is inside the backend before page 21 is asked for, and stays
+    // there until the waiter gave up and read page 21 alone (60 s at most, then the calls show the wrong order).
+    let (begun, alone) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (b1, a1) = (begun.clone(), alone.clone());
+    *b.hook.lock() = Some(Arc::new(move |first: u64| {
+        if first == 21 {
+            a1.store(true, Ordering::SeqCst);
+            return;
+        }
+        b1.store(true, Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        while !a1.load(Ordering::SeqCst) && t0.elapsed() < core::time::Duration::from_secs(60) {
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+    }) as Hook);
     std::thread::scope(|s| {
         let c1 = c.clone();
         s.spawn(move || c1.page_for_map(20, false).unwrap());
-        std::thread::sleep(core::time::Duration::from_millis(slow / 4));
-        // Page 21 is in the first read's window; that read takes longer than the wait.
+        while !begun.load(Ordering::SeqCst) {
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+        // Page 21 is in the first read's window; that read lasts longer than the wait.
+        let t0 = std::time::Instant::now();
         c.page_for_map(21, false).unwrap();
+        assert!(t0.elapsed().as_nanos() >= FILL_WAIT_NS as u128 / 2, "the waiter read alone before the wait was over");
     });
+    *b.hook.lock() = None;
+    assert!(alone.load(Ordering::SeqCst));
     assert_eq!(b.take(), [(12, 16), (21, 1)]);
     assert_eq!(byte(&c, 21), 21 ^ 0x3C);
     assert_eq!(c.pages(), 16);
@@ -203,4 +224,69 @@ fn a_window_keeps_pages_already_in_the_cache() {
     assert_eq!(buf[(5 * P) as usize], 0);
     assert_eq!(buf[(7 * P) as usize], 19 ^ 0x3C);
     assert_eq!(c.dirty_pages(), 2);
+}
+
+/// L7-VFS row #50, decision in plan/spec/storage.md §3.1: code faults on a backend without read-ahead (FAT's
+/// window of 32, and a window of 8 for comparison) read around the page (`Reach::Around`, what `fault_ra` does)
+/// or, as Linux 7.3.1's VM_EXEC rule (mm/filemap.c:3407), forward from it inside the VMA. A 512-page code VMA at
+/// file page 16, about 400 faults per pattern (LCG seed 12345: random pages, ascending, 50 clusters of 8 pages
+/// ascending, the same clusters shuffled). Synthetic patterns, not a recorded trace. The device request count is
+/// the measure, a proxy for time (on a USB stick one request costs far more than a 4 KiB page, FS-14b); no time
+/// is measured. A plain test so the desk can re-run it (`cargo test -p vfs --lib
+/// exec_faults_around_against_forward -- --nocapture` prints the table); it fails if forward ever needs fewer
+/// requests than around at FAT's window.
+#[test]
+fn exec_faults_around_against_forward() {
+    const FIRST: u64 = 16;
+    const LEN: u64 = 512;
+    let mut seed = 12345u64;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % LEN
+    };
+    let random: Vec<u64> = (0..400).map(|_| next()).collect();
+    let ascending: Vec<u64> = (0..400).collect();
+    let clustered: Vec<u64> = (0..50).flat_map(|_| {
+        let at = next().min(LEN - 8);
+        at..at + 8
+    }).collect();
+    // The same clusters' pages in a shuffled order inside each cluster (calls into a function's neighbours).
+    let shuffled: Vec<u64> = clustered.chunks(8).flat_map(|c| {
+        let mut c = c.to_vec();
+        for i in (1..c.len()).rev() {
+            c.swap(i, (next() as usize) % (i + 1));
+        }
+        c
+    }).collect();
+    let hint = crate::pagecache::MapHint { random: false, sequential: false, exec: true, first: FIRST, end: FIRST + LEN };
+    std::println!("window | pattern | around: requests / pages / outside | forward: requests / pages / outside");
+    for window in [8u64, 32] {
+        for (name, faults) in [("random", &random), ("ascending", &ascending), ("clustered", &clustered), ("shuffled", &shuffled)] {
+            let mut got = [(0u64, 0u64, 0u64); 2];
+            for (k, slot) in got.iter_mut().enumerate() {
+                let b = Runs::new(window, 0);
+                let c = PageCache::with_backend(b.clone(), 1000 * P);
+                for &f in faults.iter() {
+                    let pg = FIRST + f;
+                    if c.cached(pg).is_some() {
+                        continue;
+                    }
+                    if k == 0 {
+                        c.fault_ra(pg, &hint);
+                    } else {
+                        c.fill_with(pg, crate::pagecache::Reach::Window(pg, window.min(FIRST + LEN - pg))).unwrap();
+                    }
+                }
+                let calls = b.take();
+                let pages = calls.iter().map(|&(_, n)| n).sum();
+                let outside = calls.iter().flat_map(|&(s, n)| s..s + n).filter(|&p| !(FIRST..FIRST + LEN).contains(&p)).count() as u64;
+                *slot = (calls.len() as u64, pages, outside);
+            }
+            let [a, f] = got;
+            std::println!("{window} | {name} | {} / {} / {} | {} / {} / {}", a.0, a.1, a.2, f.0, f.1, f.2);
+            assert_eq!(f.2, 0, "forward stays inside the VMA");
+            // FAT's window (the backend this rule is about): around never needs more requests.
+            assert!(window != 32 || a.0 <= f.0, "{window} {name}: around {} requests, forward {}", a.0, f.0);
+        }
+    }
 }

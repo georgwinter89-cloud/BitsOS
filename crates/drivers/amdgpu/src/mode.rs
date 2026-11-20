@@ -2,14 +2,16 @@
 //! pure over a register owner (`flip::Rw`) so the host tests run it against the fake engine (`tests::mode`).
 //! `switch` holds the state (confirmation, rollback), `live` the kernel glue.
 //!
-//! **What changes (G-3c R-min, scaled).** The scanned surface: its viewport (PRI/SEC_VIEWPORT_DIMENSION) becomes
-//! the new size inside the unchanged GOP framebuffer (same pitch, same A0/A1 addresses, so no buffer moves), and
-//! the DPP scaler stretches it to the OTG's active area with AUTOCAL_MODE = AUTOSCALE ("Autocal calculate the
-//! scaling ratio and initial phase and the DSCL_MODE_SEL must be set to 1",
-//! linux-6.6/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c:62-77). The OTG timing, the DP link, the DTO
-//! and the stream stay as the firmware lit them: the monitor keeps its native timing and rate, so a mode is any
-//! size the monitor offers up to the link's active area, at the link's rate (a new timing needs the "new timing,
-//! same link" sequence of `G/doku/14-modeset.md` §14.2, unmeasured: open question GX-4 Q1).
+//! **What changes (G-3c R-min, scaled).** The scanned surface: its viewport (PRI/SEC_VIEWPORT_DIMENSION) becomes the
+//! new size inside the unchanged GOP framebuffer (same pitch, same A0/A1 addresses, so no buffer moves), and the DPP
+//! scaler stretches it to the OTG's active area with AUTOCAL_MODE = AUTOSCALE ("Autocal calculate the scaling ratio and
+//! initial phase and the DSCL_MODE_SEL must be set to 1",
+//! linux-6.6/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_dpp_dscl.c:62-77; Linux 7.3.1 differs:
+//! linux-7.3.1/drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp_dscl.c:62, see plan/spec/linux7-differences.md).
+//! The OTG timing, the DP link, the DTO and the stream stay as the firmware lit them: the monitor keeps its native
+//! timing and rate, so a mode is any size the monitor offers up to the link's active area, at the link's rate (a new
+//! timing needs the "new timing, same link" sequence of `G/doku/14-modeset.md` §14.2, unmeasured: open question GX-4
+//! Q1).
 //!
 //! When the GOP left the scaler in bypass (the native mode at 1:1), the switch first writes V1's measured
 //! scaling state of this very pipe (the GOP's own 1024x768 -> 2560x1440 programming, G3-PLAN §3.0 A7 and §3.6
@@ -557,8 +559,9 @@ pub fn plan(boot: &PipeRegs, hubp: u8, home: Size, to: Size) -> Plan {
 }
 
 /// Writes `plan` on pipe `p` under its OTG's master update lock (optc3_lock, linux-6.6/drivers/gpu/drm/amd/display/
-/// dc/dcn30/dcn30_optc.c:119); the unlock runs on every path (X1), the first error is returned. True when the
-/// lock status was seen. No allocation, no sleep (Quiesce).
+/// dc/dcn30/dcn30_optc.c:119; Linux 7.3.1 differs: linux-7.3.1/drivers/gpu/drm/amd/display/dc/optc/dcn30/
+/// dcn30_optc.c:119, see plan/spec/linux7-differences.md); the unlock runs on every path (X1), the first error is
+/// returned. True when the lock status was seen. No allocation, no sleep (Quiesce).
 pub fn apply(r: &impl Rw, p: &Pipe, plan: &Plan) -> Result<bool, FlipError> {
     let k = u32::from(p.otg);
     let res = flip::lock(r, k).and_then(|seen| {

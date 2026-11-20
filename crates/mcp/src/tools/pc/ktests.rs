@@ -76,9 +76,9 @@ fn registry() -> TestResult {
     Ok(())
 }
 
-/// 00:00.0 read through the tool equals what the scan found, at widths 4, 2 and 1. On q35 the MCH is untouched
-/// (the contract test's key), so only its header is readable and a read past it is refused; elsewhere the
-/// whole space is.
+/// 00:00.0 read through the tool equals what the scan found, at widths 4, 2 and 1. An untouched host bridge
+/// (the Gaming-PC's rules never hold one) would be readable in its header only; every machine reads the whole
+/// space.
 fn read_host_bridge() -> TestResult {
     let at = Loc::new(0, 0, 0, 0);
     let f = pci::function(at).ok_or("no 00:00.0 in the tree")?;
@@ -132,8 +132,8 @@ fn storage_refused() -> TestResult {
     Ok(())
 }
 
-/// Every untouched function (Mini-PC: 04:00.0 and 00:02.2 until wlan=on; q35: the MCH and the SMBus with
-/// test keys): the command register readable and equal to the scan's (PC-4 check list item 1), a read past
+/// Every untouched function (the Gaming-PC: its never-touch list and network rule; q35: the SMBus of the test
+/// rule): the command register readable and equal to the scan's (PC-4 check list item 1), a read past
 /// the header, every write and every BAR access refused, the command register unchanged afterwards.
 fn untouched_refused() -> TestResult {
     let nodes: Vec<pci::Node> = pci::tree().into_iter().filter(|n| n.untouched.is_some()).collect();

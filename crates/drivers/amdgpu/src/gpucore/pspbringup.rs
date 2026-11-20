@@ -4,7 +4,7 @@
 //! device: the fakes in host tests and ktests, `psplive::LiveHw` on the Mini-PC, so the desk's run is the code
 //! the tests ran. Pure apart from klog: the live glue gathers the inputs (start state, carve-out, firmware).
 //!
-//! Policy (gx-roadmap.md wave 24, gx-scout-bringup.md M1/M2): a PSP whose secure OS does not run, or a start
+//! Policy (plan/spec/gpu.md §11.4): a PSP whose secure OS does not run, or a start
 //! state the classifier could not read, is refused before any write; any start but cold destroys a stale ring
 //! and TMR first; any non-zero status is fatal and undone; unless `keep`, the run ends with the undo (DESTROY_TMR,
 //! DESTROY_RINGS), so it can be repeated.
@@ -185,6 +185,7 @@ pub fn admit(start: Start) -> Result<bool, &'static str> {
         Start::GcUnsettled => Err("the kernel before sent EnableGfxImu and GC did not boot; TMR and ring are left under a possibly running RLC/IMU (its note): reboot (mode 2 is refused on 13.0.4)"),
         Start::PspDown => Err("the PSP secure OS does not run (C2PMSG_81 is 0): BitsOS has no bootloader path, Linux refuses too; reboot"),
         Start::Unknown => Err("the start state is unknown (a register the classifier needs did not read): nothing written"),
+        Start::ThisBoot => Err("this boot's own bring-up holds the GPU (its run is kept): continue it, or until=stop first"),
     }
 }
 
@@ -294,7 +295,7 @@ fn snap_of(r: &Report, f: impl Fn(&Step) -> bool) -> Option<&psp::Snap> {
     r.steps.iter().position(f).and_then(|i| r.snaps.get(i))
 }
 
-/// The pass rules of M1 and M2 (gx-scout-bringup.md: C2PMSG_64 `& 0x8000FFFF == 0x80000000` after create, the
+/// The pass rules of M1 and M2 (C2PMSG_64 `& 0x8000FFFF == 0x80000000` after create, the
 /// fence moving per command, LOAD_TOC's TMR size, every image accepted, autoload after RLC_G).
 pub fn checks(r: &Report, inp: &Inputs, fence: u32) -> Vec<Check> {
     let mut v = Vec::new();
@@ -927,9 +928,9 @@ pub fn gfx_mark_lines(marks: &[(&'static str, usize, usize)], i: usize) -> Vec<S
 /// What the desk does next for this error.
 pub fn advice(e: &PspError) -> &'static str {
     match e {
-        PspError::Timeout { what: "ring.ready", .. } => ": C2PMSG_64 never got ready: reboot, do not retry (gx-roadmap wave 24)",
+        PspError::Timeout { what: "ring.ready", .. } => ": C2PMSG_64 never got ready: reboot, do not retry (plan/spec/gpu.md §11.4)",
         PspError::Timeout { what: "fence", .. } | PspError::Wedged => ": the PSP may still run that frame: reboot before another run",
-        PspError::RingNotReset { .. } => ": the write pointer survived create: report it (gx-GX-7d open point)",
+        PspError::RingNotReset { .. } => ": the write pointer survived create: report it",
         PspError::CmdStatus { .. } => ": the PSP refused a command: stopped and undone",
         _ => "",
     }

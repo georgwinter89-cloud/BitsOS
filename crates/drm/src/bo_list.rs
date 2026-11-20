@@ -1,7 +1,7 @@
-//! DR-8: what CS (and DR-9's BO_LIST ioctl) copy from the program: user memory in pieces with kvmalloc's limit,
-//! records out of chunk data, and BO lists (`amdgpu_bo_list.c`). DR-9: `DRM_IOCTL_AMDGPU_BO_LIST` (create,
-//! destroy, update; linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c:236) and the per-file table a CS
-//! names a list from (`amdgpu_bo_list_get`, :174).
+//! DR-8: what CS (and DR-9's BO_LIST ioctl) copy from the program: user memory in pieces with kvmalloc's limit, records
+//! out of chunk data, and BO lists (`amdgpu_bo_list.c`). DR-9: `DRM_IOCTL_AMDGPU_BO_LIST` (create, destroy, update;
+//! linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c:179) and the per-file table a CS names a list from
+//! (`amdgpu_bo_list_get`, :142).
 
 use crate::dispatch::Ctx;
 use crate::file::DrmFile;
@@ -150,11 +150,15 @@ pub(crate) fn rec<T: Wire>(b: &[u8], i: usize) -> T {
     T::decode(&tmp[..T::SIZE]).unwrap_or(T::ZERO)
 }
 
-/// `amdgpu_bo_create_list_entry_array` (amdgpu_bo_list.c) as CachyOS's kernel has it: the entry size must be
-/// the struct's (EINVAL before anything is read, also for an empty list; Linux 6.6 took any size).
+/// `AMDGPU_BO_LIST_MAX_ENTRIES` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c:39).
+pub const BO_LIST_MAX_ENTRIES: u32 = 128 * 1024;
+
+/// `amdgpu_bo_create_list_entry_array` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c:164): more than
+/// 128 Ki entries EINVAL, then the entry size must be the struct's (EINVAL before anything is read, also for an
+/// empty list).
 pub(crate) fn bo_list_entries(ctx: &Ctx, li: &drm_amdgpu_bo_list_in) -> Result<Vec<drm_amdgpu_bo_list_entry>, Errno> {
     let es = drm_amdgpu_bo_list_entry::SIZE as u64;
-    if li.bo_info_size as u64 != es {
+    if li.bo_number > BO_LIST_MAX_ENTRIES || li.bo_info_size as u64 != es {
         return Err(EINVAL);
     }
     let n = li.bo_number as u64;

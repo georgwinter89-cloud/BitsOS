@@ -1,0 +1,105 @@
+pidfd_open = yes
+n2h(bad flag) = -EINVAL
+n2h(CONNECTABLE|EMPTY_PATH) = -EINVAL
+n2h(CONNECTABLE|FID) = -EINVAL
+n2h(pidfd, "") without EMPTY_PATH = -ENOENT
+n2h(pidfd, "x") = -ENOTDIR
+n2h(bad name) = -EFAULT
+n2h(-1, "", EMPTY_PATH) = -EBADF
+n2h(missing file) = -ENOENT
+n2h(/proc/self/status) = -EOPNOTSUPP
+n2h(eventfd) = -EOPNOTSUPP
+n2h(/proc/self/status, FID) = 0
+  handle_bytes 12, type 0x81, holds the inode = yes
+n2h(/proc/self/status, FID, handle_bytes 11) = -EOVERFLOW
+  handle_bytes 12, type 0xff
+n2h(tmpfs file, FID) = 0
+  handle_bytes 12, type 0x1, holds the inode = yes
+n2h(tmpfs file by fd, FID) = 0
+  handle_bytes 12, type 0x1, holds the inode = yes
+n2h(eventfd, FID) = 0
+  handle_bytes 12, type 0x81, holds the inode = yes
+n2h(pipe, FID) = 0
+  handle_bytes 12, type 0x81, holds the inode = yes
+n2h(bad handle address) = -EFAULT
+n2h(handle_bytes 129) = -EINVAL
+n2h(handle_bytes 4) = -EOVERFLOW
+  too small: handle_bytes 8, type 0xff, mount id written = yes
+n2h(bad mount id address) = -EFAULT
+  bad mount id: handle untouched = yes
+n2h(pidfd) = 0
+  handle_bytes 8, type 0xfe, holds the pidfs inode = yes, mount id as fdinfo's = yes
+n2h(pidfd, FID) = 0
+  FID handle is the same = yes
+n2h(pidfd, MNT_ID_UNIQUE) = 0
+  the same handle = yes
+n2h(thread pidfd of the leader) = 0
+  the same handle as the process's = yes
+obh(pidfd, O_RDONLY) = 0
+obh(pidfd, O_RDONLY): names the pid = yes, F_GETFL = 02, F_GETFD = 0
+obh(PIDFS_ROOT, O_CLOEXEC) = 0
+obh(PIDFS_ROOT, O_CLOEXEC): names the pid = yes, F_GETFL = 02000002, F_GETFD = 1
+obh(PIDFS_ROOT, O_NONBLOCK) = 0
+obh(PIDFS_ROOT, O_NONBLOCK): names the pid = yes, F_GETFL = 04002, F_GETFD = 0
+obh(PIDFS_ROOT, O_EXCL) = 0
+obh(PIDFS_ROOT, O_EXCL): names the pid = yes, F_GETFL = 0202, F_GETFD = 0
+obh(PIDFS_ROOT, O_WRONLY) = 0
+obh(PIDFS_ROOT, O_WRONLY): names the pid = yes, F_GETFL = 03, F_GETFD = 0
+obh(PIDFS_ROOT, O_RDWR|O_LARGEFILE) = 0
+obh(PIDFS_ROOT, O_RDWR|O_LARGEFILE): names the pid = yes, F_GETFL = 02, F_GETFD = 0
+obh: the same pidfs inode = yes
+obh(O_TRUNC) = -EINVAL
+obh(O_CREAT) = -EINVAL
+obh(O_DIRECTORY) = -EINVAL
+obh(O_PATH) = -EINVAL
+obh(O_APPEND) = -EINVAL
+obh(bad handle address) = -EFAULT
+obh(handle_bytes 0) = -EINVAL
+obh(handle_bytes 129) = -EINVAL
+obh(type -1) = -EINVAL
+obh(unknown user flag) = -EINVAL
+obh(IS_CONNECTABLE) under its own pidfd = 0
+obh(IS_CONNECTABLE) under its own pidfd: names the pid = yes, F_GETFL = 02, F_GETFD = 0
+obh(IS_CONNECTABLE) under PIDFS_ROOT = -ESTALE
+obh(IS_DIR) = -ESTALE
+obh(type 1) = -ESTALE
+obh(handle_bytes 4) = -ESTALE
+obh(handle_bytes 12) = 0
+obh(handle_bytes 12): names the pid = yes, F_GETFL = 02, F_GETFD = 0
+obh(unknown inode) = -ESTALE
+obh(-1) = -EBADF
+obh(-10001) = -EBADF
+obh(closed fd) = -EBADF
+obh(-1, bad flags) = -EBADF
+obh(NSFS_ROOT) = -ESTALE
+obh(ns file) = -ESTALE
+obh(AT_FDCWD) unprivileged = -EPERM
+obh(AT_FDCWD, O_DIRECTORY) unprivileged = -EPERM
+obh(a directory) unprivileged = -EPERM
+obh(AT_FDCWD, bad handle address) = -EFAULT
+child handle = 0
+child handle differs from ours = yes
+obh(child) = 0
+obh(child): names the pid = yes, F_GETFL = 02, F_GETFD = 0
+obh(child's handle, IS_CONNECTABLE) under our pidfd = -ESTALE
+obh(child's handle, IS_CONNECTABLE) under its pidfd = 0
+obh(child's handle, IS_CONNECTABLE) under its pidfd: names the pid = yes, F_GETFL = 02, F_GETFD = 0
+obh(zombie child) = 0
+obh(zombie child): names the pid = yes, F_GETFL = 02, F_GETFD = 0
+child: exit 3
+obh(reaped child) = -ESTALE
+n2h(reaped child's pidfd) = 0, the same handle = yes
+thread handle = 0
+thread handle differs from the process's = yes
+obh(thread, O_EXCL) = 0
+obh(thread, O_EXCL): names the pid = yes, F_GETFL = 0202, F_GETFD = 0
+obh(thread, without O_EXCL) = 0
+pidfd_send_signal(it, SIGUSR1) = 0
+  pending for the process = yes, for the thread = no
+  taken by the leader = yes
+obh(ended thread) = -ESTALE
+in a new pid namespace: obh(the parent's handle) = -ESTALE
+in a new pid namespace: own handle = 0
+in a new pid namespace: obh(own) = 0
+in a new pid namespace: the same pidfs inode = yes
+pid namespace child: exit 0

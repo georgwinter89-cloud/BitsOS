@@ -1,4 +1,4 @@
-//! SX-2: the namespaces Chromium's sandbox uses (linux-6.6/kernel/nsproxy.c, user_namespace.c,
+//! SX-2: the namespaces Chromium's sandbox uses (linux-7.3.1/kernel/nsproxy.c, user_namespace.c,
 //! pid_namespace.c, kernel/utsname.c, ipc/namespace.c, net/core/net_namespace.c).
 //!
 //! - `user`: user namespaces with their id maps (`idmap`); a `Cred` names its namespace (`cred.rs`).
@@ -10,7 +10,7 @@
 //! - `mnt` (SX-3a): mount namespaces around FS's views (`vfs::MountNs`).
 //! - `NsSet` (Linux `nsproxy`): what a group's members use and its children get.
 //!
-//! Approximation (recorded in plan/notes/sx-SX-2.md): Linux keeps the nsproxy per thread; V2 keeps it per thread
+//! Approximation (plan/spec/sandbox.md §2): Linux keeps the nsproxy per thread; V2 keeps it per thread
 //! group, like the credentials (AB-13). Chromium only unshares while single-threaded, and unshare of a user or
 //! pid namespace needs a single thread anyway.
 //!
@@ -31,12 +31,15 @@ mod tests;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// linux-6.6/include/linux/proc_ns.h: the fixed inode numbers of the initial namespaces.
+/// linux-7.3.1/include/uapi/linux/nsfs.h:48 `init_ns_ino`: the fixed inode numbers of the initial namespaces
+/// (cgroup 0xEFFFFFFB and time 0xEFFFFFFA have no V2 namespace).
 pub const INIT_IPC_INUM: u32 = 0xEFFF_FFFF;
 pub const INIT_UTS_INUM: u32 = 0xEFFF_FFFE;
 pub const INIT_USER_INUM: u32 = 0xEFFF_FFFD;
 pub const INIT_PID_INUM: u32 = 0xEFFF_FFFC;
-/// `PROC_DYNAMIC_FIRST`: the first number `proc_alloc_inum` hands out (the initial network namespace gets it).
+pub const INIT_NET_INUM: u32 = 0xEFFF_FFF9;
+pub const INIT_MNT_INUM: u32 = 0xEFFF_FFF8;
+/// `PROC_DYNAMIC_FIRST` (linux-7.3.1/fs/proc/generic.c:197): the first number `proc_alloc_inum` hands out.
 const DYNAMIC_FIRST: u32 = 0xF000_0000;
 
 static NEXT_INUM: AtomicU32 = AtomicU32::new(DYNAMIC_FIRST);

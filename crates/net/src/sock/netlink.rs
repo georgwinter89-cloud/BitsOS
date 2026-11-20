@@ -1,4 +1,4 @@
-//! AF_NETLINK sockets, protocol NETLINK_ROUTE (linux-6.6/net/netlink/af_netlink.c): port ids (bind, autobind
+//! AF_NETLINK sockets, protocol NETLINK_ROUTE (linux-7.3.1/net/netlink/af_netlink.c): port ids (bind, autobind
 //! with the process id first, negative ids after a collision), connect, multicast groups, the request path into
 //! the kernel (`netlink_rcv_skb` → `rtnl::rcv_msg`, answered before sendmsg returns, as Linux does: musl reads
 //! the answers with MSG_DONTWAIT), dumps handed out as the reader reads (`netlink_dump`), acks
@@ -766,6 +766,7 @@ impl NetlinkSock {
         if self.opts.has(super::flag::PASSCRED) {
             r.creds = Some(creds);
         }
+        r.sec = self.opts.has(super::flag::PASSSEC);
         Ok(r)
     }
 
@@ -921,7 +922,7 @@ static LAST: SpinLock<Option<Snap>> = SpinLock::named("net.netlink.last", None);
 fn snap(links: &[ifview::Link]) -> Snap {
     links
         .iter()
-        .map(|l| (l.index, (l.flags(), l.mtu, l.txqlen), l.addrs.iter().map(|a| ifview::Addr { valid_s: 0, preferred_s: 0, ..a.clone() }).collect(), l.addrs6.clone()))
+        .map(|l| (l.index, (l.flags(), l.mtu, l.txqlen), l.addrs.iter().map(ifview::Addr::announced).collect(), l.addrs6.clone()))
         .collect()
 }
 
@@ -967,19 +968,29 @@ fn round() {
     let now = snap(&links);
     // Without a base (the first member just joined) the round only takes one.
     let Some(before) = LAST.lock().replace(now.clone()) else { return };
-    send_changes(&INIT, &before, &links, &now);
+    send_changes(&INIT, &before, &links, &now, (0, 0));
 }
 
-/// NW-11: a namespace's lo changed (`NetView::edit`): its members hear what differs between the views.
-pub(crate) fn announce(t: &Tables, before: &[ifview::Link], after: &[ifview::Link]) {
+/// NW-11: a namespace's lo changed (`NetView::edit`): its members hear what differs between the views; the
+/// address messages carry `req` (sequence number, port) of the request that made the change.
+pub(crate) fn announce(t: &Tables, before: &[ifview::Link], after: &[ifview::Link], req: (u32, u32)) {
     if t.member_count.load(Ordering::Acquire) == 0 {
         return;
     }
-    send_changes(t, &snap(before), after, &snap(after));
+    send_changes(t, &snap(before), after, &snap(after), req);
+}
+
+/// L7-NET: one notification a request makes itself (`rtmsg_ifa` of a replaced address), to `group` of `t`.
+pub(crate) fn announce_one(t: &Tables, group: u32, m: &[u8]) {
+    if t.member_count.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let n = t.broadcast(None, group, m, Ucred::default());
+    NOTIFIED.add(n as u64);
 }
 
 /// The notifications from snapshot `before` to `links` (whose snapshot is `now`), broadcast in `t`.
-fn send_changes(t: &Tables, before: &Snap, links: &[ifview::Link], now: &Snap) {
+fn send_changes(t: &Tables, before: &Snap, links: &[ifview::Link], now: &Snap, (seq, pid): (u32, u32)) {
     let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
     for (l, (index, dev, addrs, addrs6)) in links.iter().zip(now.iter()) {
         let old = before.iter().find(|b| b.0 == *index);
@@ -994,12 +1005,11 @@ fn send_changes(t: &Tables, before: &Snap, links: &[ifview::Link], now: &Snap) {
         let mut gone: Vec<&ifview::Addr> = old.map(|o| o.2.iter().filter(|a| !addrs.iter().any(|b| key(b) == key(a))).collect()).unwrap_or_default();
         gone.sort_by_key(|a| !a.secondary());
         for a in gone {
-            out.push((rtnl::RTNLGRP_IPV4_IFADDR, rtnl::addr_msg(l, a, rtnl::RTM_DELADDR, 0, 0, 0)));
+            out.push((rtnl::RTNLGRP_IPV4_IFADDR, rtnl::addr_msg(l, a, rtnl::RTM_DELADDR, 0, seq, pid)));
         }
         for a in l.addrs.iter() {
-            let plain = ifview::Addr { valid_s: 0, preferred_s: 0, ..a.clone() };
-            if !old.is_some_and(|o| o.2.contains(&plain)) {
-                out.push((rtnl::RTNLGRP_IPV4_IFADDR, rtnl::addr_msg(l, a, rtnl::RTM_NEWADDR, 0, 0, 0)));
+            if !old.is_some_and(|o| o.2.contains(&a.announced())) {
+                out.push((rtnl::RTNLGRP_IPV4_IFADDR, rtnl::addr_msg(l, a, rtnl::RTM_NEWADDR, 0, seq, pid)));
             }
         }
         for a in old.map(|o| o.3.iter().filter(|a| !addrs6.contains(a)).collect::<Vec<_>>()).unwrap_or_default() {

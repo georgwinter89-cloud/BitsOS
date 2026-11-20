@@ -45,7 +45,7 @@ pub fn mount_new(ns: &MountNs, path: &str, perm: u32, size_pages: Option<u64>) -
     ns.mount(&at, sb, root, false)
 }
 
-/// AB-7c: what Linux's `shmem_show_options` (linux-6.6/mm/shmem.c) prints for these mount options: the size
+/// AB-7c: what Linux's `shmem_show_options` (linux-7.3.1/mm/shmem.c:4855) prints for these mount options: the size
 /// when one was given, the root mode unless 1777, and `inode64` (V2's inode numbers are 64-bit). `nr_inodes`
 /// is always Linux's default (FS-15, statfs), which `shmem_show_options` leaves out; no uid/gid or huge pages.
 pub fn options(perm: u32, size_pages: Option<u64>) -> alloc::string::String {

@@ -1,6 +1,8 @@
-//! execve and execveat: the path and the argument strings are copied from the caller with Linux's rules and
-//! in its order (linux-6.6/fs/exec.c `do_execveat_common`, `count`, `bprm_stack_limits`, `copy_strings`:
-//! the name, then envp and argv, each from its last string to its first), then `proc::execve` runs the file.
+//! execve and execveat in Linux 7.3.1's order (fs/exec.c:1897 `do_execveat_common`): the flags (`do_open_execat`
+//! :780, EINVAL), the name (EFAULT, ENAMETOOLONG, ENOENT for an empty one without AT_EMPTY_PATH), the program file
+//! is opened (`alloc_bprm` :1510: ENOENT, EACCES, ELOOP, ETXTBSY...), and only then are argv and envp counted and
+//! copied (`count` :331, `bprm_stack_limits` :403, `copy_strings` :453: the name, then envp and argv, each from its
+//! last string to its first); then `proc::execve` runs the file.
 
 use crate::SysCtx;
 use alloc::vec::Vec;
@@ -88,6 +90,9 @@ fn strings(c: &SysCtx<'_>, arr: u64, n: u64, space: &mut u64) -> Result<proc::Ar
 }
 
 fn exec(c: &mut SysCtx<'_>, dirfd: i32, path: u64, argv: u64, envp: u64, flags: u64) -> i64 {
+    if !proc::exec_flags_valid(flags) {
+        return -EINVAL;
+    }
     let mut name = Vec::new();
     match hal::usercopy::strncpy_from_user(c.proc.mm.root(), path, &mut name, PATH_MAX) {
         Ok(_) => {}
@@ -97,6 +102,13 @@ fn exec(c: &mut SysCtx<'_>, dirfd: i32, path: u64, argv: u64, envp: u64, flags: 
     if name.is_empty() && flags & AT_EMPTY_PATH == 0 {
         return -ENOENT;
     }
+    let opened = match proc::exec_open(c.proc, c.thread, dirfd, &name, flags) {
+        Ok(o) => o,
+        Err(e) => {
+            klog::event!(Debug, "syscall", "exec.failed", pid = c.proc.pid, path = alloc::string::String::from_utf8_lossy(&name).as_ref(), errno = e);
+            return -e;
+        }
+    };
     let r = (|| -> Result<proc::ExecRequest, i64> {
         let argc = count(c, argv)?;
         let envc = count(c, envp)?;
@@ -112,7 +124,7 @@ fn exec(c: &mut SysCtx<'_>, dirfd: i32, path: u64, argv: u64, envp: u64, flags: 
         let envs = strings(c, envp, envc, &mut space)?;
         let mut args = strings(c, argv, argc, &mut space)?;
         if args.is_empty() {
-            // Linux 6.6: a NULL or empty argv gets "" as argv[0].
+            // A NULL or empty argv gets "" as argv[0] (linux-7.3.1/fs/exec.c:1951).
             args.push(b"").map_err(|e| -e)?;
         }
         Ok(proc::ExecRequest { dirfd, path: name.clone(), flags, argv: args, envp: envs })
@@ -121,7 +133,7 @@ fn exec(c: &mut SysCtx<'_>, dirfd: i32, path: u64, argv: u64, envp: u64, flags: 
         Ok(r) => r,
         Err(e) => return e,
     };
-    match proc::execve(c.proc, c.thread, c.user, &r) {
+    match proc::execve(c.proc, c.thread, c.user, &r, opened) {
         Ok(()) => 0,
         Err(e) => {
             klog::event!(Debug, "syscall", "exec.failed", pid = c.proc.pid, path = alloc::string::String::from_utf8_lossy(&r.path).as_ref(), errno = e);

@@ -1,7 +1,7 @@
 //! The status bar's building blocks with real values only (WY-5; the block protocol itself is WY-6): CPU load
-//! from /proc/stat (the `cpu` line: user nice system idle iowait irq softirq steal, linux-6.6/fs/proc/stat.c:127),
+//! from /proc/stat (the `cpu` line: user nice system idle iowait irq softirq steal, linux-7.3.1/fs/proc/stat.c:91),
 //! the network link from /sys/class/net/*/operstate ("up", or "unknown" with carrier 1 for drivers that report no
-//! operstate; linux-6.6/net/core/net-sysfs.c:294 and :192), the temperature
+//! operstate; linux-7.3.1/net/core/net-sysfs.c:436 and :307), the temperature
 //! only where /sys/class/hwmon has a temp*_input (millidegrees, Documentation/hwmon/sysfs-interface.rst), the clock
 //! (local time when a valid time zone is set, else UTC and marked so). A block without a source is left out, not
 //! faked. Sampled every 5 s and on the minute; a frame is drawn only when a shown value changes, and the CPU value
@@ -27,7 +27,7 @@ pub struct Status {
     pub cpus: usize,
     pub blocks: Vec<Block>,
     pub clock: String,
-    /// Test mode (`--fixed-status`): fixed values, nothing is read, so screenshots compare.
+    /// Host tests (`Status::fixed`): fixed values, nothing is read, so their results do not follow the machine.
     pub fixed: bool,
     next: Option<Duration>,
     /// DS-2: the busy ring's step clock (its frames wake through `due`/`tick`, the status bar's wake source).
@@ -144,6 +144,13 @@ fn now_parts(secs: i64) -> (libc::tm, bool) {
     }
 }
 
+/// SELFOPT-1: the local offset from UTC in minutes as the clock uses it (0 without a time zone); bitsbench's
+/// night window is local time.
+pub fn offset_min() -> i32 {
+    let (tm, local) = now_parts(epoch_secs());
+    if local { (tm.tm_gmtoff / 60) as i32 } else { 0 }
+}
+
 /// What `ctl clock` adds to the shown text: whether it is local time, what decided it, and the offset libc answers.
 pub fn zone_report() -> String {
     let tz = std::env::var("TZ").ok();
@@ -214,10 +221,11 @@ pub fn epoch_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-/// The fixed test values (`--fixed-status`): a clock that never moves, a load that never changes.
+/// The host tests' fixed values (`Status::fixed`): a clock that never moves, a load that never changes.
 pub const FIXED_SECS: i64 = 1_792_593_120; // Wed 2026-10-21 14:32 UTC
 
 impl Status {
+    #[cfg(test)]
     pub fn fixed() -> Status {
         let mut s = Status { fixed: true, cpus: 16, ..Default::default() };
         s.blocks = vec![Block { label: "CPU".into(), value: "12 %".into() }, Block { label: "Netz".into(), value: "Kabel".into() }];

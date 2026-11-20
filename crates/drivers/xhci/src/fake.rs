@@ -47,18 +47,35 @@ pub struct Cfg {
     pub never_halts: bool,
     /// Port 1 shows CCS as the firmware left it (US-1 tests); USB tests attach real fake devices instead.
     pub boot_ccs: bool,
+    /// How long after RS goes off HCH comes on (0 = at once).
+    pub halt_takes: u64,
+    /// How long HCRST stays set, and how long after that CNR clears.
+    pub hcrst_takes: u64,
+    pub cnr_takes: u64,
 }
+
+/// The reset the model always had: HCRST for 2 ms, CNR 1 ms longer.
+const HCRST_TAKES: u64 = 2 * MS;
+const CNR_TAKES: u64 = MS;
 
 impl Cfg {
     /// The Mini-PC's controllers: 64-byte contexts, 2 scratchpad pages, AC64.
     pub fn minipc() -> Cfg {
         Cfg { csz64: true, scratchpads: 2, ports: 7, slots: 64, erst_max: 1, ppc: true, ac64: true, legacy: Legacy::NotOwned,
-            cnr_stuck: false, hse_on_run: false, never_halts: false, boot_ccs: true }
+            cnr_stuck: false, hse_on_run: false, never_halts: false, boot_ccs: true, halt_takes: 0, hcrst_takes: HCRST_TAKES, cnr_takes: CNR_TAKES }
+    }
+    /// The Gaming-PC's chipset controller as Linux shows it (80:14.0, 8086:7f6e): 32-byte contexts (HCCPARAMS1
+    /// 0x20007fc1: CSZ clear, AC64 set, no port power control), 14 USB 2 and 8 USB 3 ports, the legacy capability
+    /// owned by the BIOS (the firmware drives the keyboard until the OS asks). Scratchpad count and slots are not
+    /// known from Linux's log; the values are the fake's.
+    pub fn gaming_pc() -> Cfg {
+        Cfg { csz64: false, scratchpads: 2, ports: 22, slots: 64, erst_max: 1, ppc: false, ac64: true, legacy: Legacy::Releases(5 * MS),
+            cnr_stuck: false, hse_on_run: false, never_halts: false, boot_ccs: true, halt_takes: 0, hcrst_takes: HCRST_TAKES, cnr_takes: CNR_TAKES }
     }
     /// QEMU's qemu-xhci: 32-byte contexts, no scratchpads, ERST Max 0.
     pub fn qemu() -> Cfg {
         Cfg { csz64: false, scratchpads: 0, ports: 8, slots: 64, erst_max: 0, ppc: false, ac64: true, legacy: Legacy::None,
-            cnr_stuck: false, hse_on_run: false, never_halts: false, boot_ccs: true }
+            cnr_stuck: false, hse_on_run: false, never_halts: false, boot_ccs: true, halt_takes: 0, hcrst_takes: HCRST_TAKES, cnr_takes: CNR_TAKES }
     }
     /// For USB tests: no phantom device on port 1.
     pub fn bare(self) -> Cfg {
@@ -91,6 +108,7 @@ pub struct Model {
     bios_release_at: Option<u64>,
     reset_done_at: Option<u64>,
     cnr_clear_at: Option<u64>,
+    halt_at: Option<u64>,
     hcrst_at: Option<u64>,
     pub early_read: bool,
     pub iman: u32,
@@ -146,6 +164,7 @@ impl Model {
             bios_release_at: None,
             reset_done_at: None,
             cnr_clear_at: None,
+            halt_at: None,
             hcrst_at: None,
             early_read: false,
             iman: 0,
@@ -259,6 +278,11 @@ impl Model {
         if self.bios_release_at.is_some_and(|t| now >= t) {
             self.bios_release_at = None;
             self.legsup &= !legacy::BIOS_OWNED;
+        }
+        if self.halt_at.is_some_and(|t| now >= t) {
+            self.halt_at = None;
+            self.usbsts |= sts::HCH;
+            self.crr = false;
         }
         self.usb_tick();
     }
@@ -400,8 +424,9 @@ impl Model {
             self.usbcmd = cmd::HCRST;
             self.usbsts = sts::HCH | sts::CNR;
             self.hcrst_at = Some(self.time);
-            self.reset_done_at = Some(self.time + 2 * MS);
-            self.cnr_clear_at = Some(self.time + 3 * MS);
+            self.halt_at = None;
+            self.reset_done_at = Some(self.time + self.cfg.hcrst_takes);
+            self.cnr_clear_at = Some(self.time + self.cfg.hcrst_takes + self.cfg.cnr_takes);
             self.config = 0;
             self.dcbaap = 0;
             self.crcr_ptr = 0;
@@ -419,12 +444,17 @@ impl Model {
         self.usbcmd = v & (cmd::RS | cmd::INTE | cmd::HSEE);
         if v & cmd::RS != 0 {
             self.usbsts &= !sts::HCH;
+            self.halt_at = None;
             if self.cfg.hse_on_run {
                 self.usbsts |= sts::HSE;
             }
         } else if !self.cfg.never_halts {
-            self.usbsts |= sts::HCH;
-            self.crr = false;
+            if self.cfg.halt_takes == 0 {
+                self.usbsts |= sts::HCH;
+                self.crr = false;
+            } else if self.usbsts & sts::HCH == 0 && self.halt_at.is_none() {
+                self.halt_at = Some(self.time + self.cfg.halt_takes);
+            }
         }
     }
 

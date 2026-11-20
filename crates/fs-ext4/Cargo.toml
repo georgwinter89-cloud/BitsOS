@@ -18,10 +18,10 @@ ksync = { path = "../ksync" }
 mm-core = { path = "../mm-core" }
 ktest = { path = "../ktest" }
 uapi = { path = "../uapi" }
+# EINS-C: the trash ktests act as a process of an assistant tree (`policy::Subject::tree`).
+policy = { path = "../policy" }
 miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
 
 [lints]
 workspace = true
 
-[dev-dependencies]
-policy = { path = "../policy" }

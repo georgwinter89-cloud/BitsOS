@@ -5,7 +5,7 @@ pub const IOC_WRITE: u32 = 1;
 pub const IOC_READ: u32 = 2;
 
 /// Builds an ioctl number; None when a field does not fit (Linux refuses such a size at compile time:
-/// linux-6.6/include/uapi/asm-generic/ioctl.h:32 has 14 size bits).
+/// linux-7.3.1/include/uapi/asm-generic/ioctl.h:32 has 14 size bits).
 pub const fn checked_ioc(dir: u32, ty: u32, nr: u32, size: u32) -> Option<u32> {
     if dir > 3 || ty > 0xff || nr > 0xff || size > 0x3fff {
         return None;

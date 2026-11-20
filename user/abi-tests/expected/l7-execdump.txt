@@ -1,0 +1,28 @@
+readable: child dumpable for its owner = yes
+readable: open mem = ok
+readable: open environ = ok
+readable: readlink exe = ok
+readable: process_vm_readv = ok
+readable: /proc/<pid>/status owner = caller
+readable: exit status 0x0
+run-only: child dumpable for its owner = no
+run-only: open mem = EACCES
+run-only: open environ = EACCES
+run-only: readlink exe = EACCES
+run-only: process_vm_readv = EPERM
+run-only: /proc/<pid>/status owner = root
+run-only: exit status 0x0
+run-only, user namespace with both maps: child dumpable for its owner = yes
+run-only, user namespace with both maps: open mem = ok
+run-only, user namespace with both maps: open environ = ok
+run-only, user namespace with both maps: readlink exe = ok
+run-only, user namespace with both maps: process_vm_readv = ok
+run-only, user namespace with both maps: /proc/<pid>/status owner = caller
+run-only, user namespace with both maps: exit status 0x0
+run-only, user namespace without gid map: child dumpable for its owner = no
+run-only, user namespace without gid map: open mem = EACCES
+run-only, user namespace without gid map: open environ = EACCES
+run-only, user namespace without gid map: readlink exe = EACCES
+run-only, user namespace without gid map: process_vm_readv = EPERM
+run-only, user namespace without gid map: /proc/<pid>/status owner = root
+run-only, user namespace without gid map: exit status 0x0

@@ -1,6 +1,6 @@
 //! GX-7j: the GFX ring stage on the host. The ktests' checks (`ktests_gfxring`), Linux's GFX tail and CP start
 //! against the 27.10. capture (the fixture tests/data/linux-780m-gfx-writes.txt, public; compared with the capture
-//! itself where plan/ is), the clear-state buffer against the capture's ring dump, and the register map against
+//! itself, host/tests/gx/fixtures), the clear-state buffer against the capture's ring dump, and the register map against
 //! the generated tables.
 
 use super::regdiff::{capture, table_names};
@@ -106,10 +106,7 @@ fn fixture_text(linux: &[(u32, u32)], names: &super::regdiff::Names) -> String {
 
 #[test]
 fn gfx_fixture_is_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED gfx_fixture_is_the_capture: no capture (plan/ is not public); the fixture stands in");
-        return;
-    };
+    let t = capture();
     let want = fixture_text(&t.writes(false), &table_names());
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/linux-780m-gfx-writes.txt");
     if std::env::var_os("GX_WRITE_FIXTURE").is_some() {
@@ -123,10 +120,7 @@ fn gfx_fixture_is_the_capture() {
 /// 7.1 writes each once in the window, with our value.
 #[test]
 fn unnamed_golden_and_unhalt_are_the_capture() {
-    let Some(t) = capture() else {
-        std::eprintln!("SKIPPED unnamed_golden_and_unhalt_are_the_capture: no capture (plan/ is not public); check_values has the values");
-        return;
-    };
+    let t = capture();
     let a = GfxAddrs::from_discovery(&fakechip::discovery_780m()).unwrap();
     let w = t.writes(false);
     let start = w.iter().position(|&(b, _)| Some(b) == a.byte(R::CgttGsNggClkCtrl)).unwrap();
@@ -144,18 +138,14 @@ fn unnamed_golden_and_unhalt_are_the_capture() {
 /// 12-byte header), where cp_gfx_start wrote the same stream; RLC_CSIB_LENGTH was 960 there.
 #[test]
 fn csb_is_the_capture() {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plan/hw/gx-780m-linux-trace-2026-10-27/gx-6d9cae1d/bundle/load/rings/amdgpu_ring_gfx_0.0.0");
-    let Ok(ring) = std::fs::read(&p) else {
-        std::eprintln!("SKIPPED csb_is_the_capture: {} missing (plan/ is not public)", p.display());
-        return;
-    };
+    let p = super::regdiff::fixture("amdgpu_ring_gfx_0.0.0");
+    let ring = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e} (the capture's GFX ring dump is tracked there)", p.display()));
     assert!(ring.len() >= 12 + gfxring::CSB.len());
     assert!(&ring[12..12 + gfxring::CSB.len()] == gfxring::CSB, "gfx11_csb.bin differs from the capture's ring dump");
-    if let Some(t) = capture() {
-        let a = GfxAddrs::from_discovery(&fakechip::discovery_780m()).unwrap();
-        let len = t.writes(false).into_iter().find(|&(b, _)| Some(b) == a.byte(R::RlcCsibLength)).map(|x| x.1);
-        assert_eq!(len, Some(gfxring::CSB_DW));
-    }
+    let t = capture();
+    let a = GfxAddrs::from_discovery(&fakechip::discovery_780m()).unwrap();
+    let len = t.writes(false).into_iter().find(|&(b, _)| Some(b) == a.byte(R::RlcCsibLength)).map(|x| x.1);
+    assert_eq!(len, Some(gfxring::CSB_DW));
 }
 
 /// Our stage against Linux: the tail from what the stage found is Linux's write for write (gfx_tail); the CP part
@@ -197,11 +187,10 @@ fn gfx_phases_against_linux() {
             );
         }
     }
-    if let Some(t) = capture() {
-        let ours = gfxring::linux_sequence(r, &a);
-        let tail = regdiff::diff_phase(phase("gfx_tail"), &t.writes(false), &ours, &names, &[]);
-        assert!(tail.diffs.is_empty(), "{}", regdiff::render(core::slice::from_ref(&tail)));
-    }
+    let t = capture();
+    let ours = gfxring::linux_sequence(r, &a);
+    let tail = regdiff::diff_phase(phase("gfx_tail"), &t.writes(false), &ours, &names, &[]);
+    assert!(tail.diffs.is_empty(), "{}", regdiff::render(core::slice::from_ref(&tail)));
 }
 
 /// The OTG CRC is a pass rule of `until=gfx_ring` (as of `sdma` and `gart`).

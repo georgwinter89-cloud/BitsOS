@@ -105,6 +105,9 @@ pub struct Reports {
     pub steals: AtomicU64,
     /// W35 MM-1: pageblocks of another migrate type taken over whole.
     pub whole_blocks: AtomicU64,
+    /// W35 MM-2: fallbacks that looked for a pageblock to claim (`group::NoClaim`: far fewer than `steals` in a
+    /// run of steals).
+    pub sweeps: AtomicU64,
     seen: [AtomicU64; SEEN],
     fallback_told: AtomicBool,
     mixing_told: AtomicBool,
@@ -136,6 +139,7 @@ impl Reports {
             heap_reclaims: AtomicU64::new(0),
             steals: AtomicU64::new(0),
             whole_blocks: AtomicU64::new(0),
+            sweeps: AtomicU64::new(0),
             seen: [const { AtomicU64::new(0) }; SEEN],
             fallback_told: AtomicBool::new(false),
             mixing_told: AtomicBool::new(false),
@@ -176,6 +180,12 @@ impl Reports {
             crate::buddy::count_whole_block();
         }
     }
+    pub fn sweep(&self) {
+        self.sweeps.fetch_add(1, Relaxed);
+        if self.global {
+            crate::buddy::count_sweep();
+        }
+    }
     pub fn drain(&self) {
         self.drains.fetch_add(1, Relaxed);
         if self.global {
@@ -207,7 +217,7 @@ impl Reports {
 
     pub fn heap_alloc_fail(&self, size: usize) {
         self.heap_fail_size.store(size as u64, Relaxed);
-        for (slot, ret) in self.heap_fail_callers.iter().zip(callers()) {
+        for (slot, ret) in self.heap_fail_callers.iter().zip(crate::callers::callers::<CALLERS>()) {
             slot.store(ret, Relaxed);
         }
         self.heap_alloc_fails.fetch_add(1, Relaxed);
@@ -316,40 +326,9 @@ pub static GLOBAL: Reports = Reports::new(true);
 /// Emits the pending events of the boot allocator and the heap (see `Reports::flush`).
 pub fn flush_reports() {
     GLOBAL.flush("frames");
+    crate::buddy::flush_takers();
+    crate::heap::flush_atomic_large();
 }
 
 /// How many return addresses a refused heap request keeps.
 const CALLERS: usize = 12;
-
-/// The return addresses above this function, innermost first, as far as the frame records on this thread's stack
-/// lead (the kernel is built with frame pointers). 11.11.2026: the size alone did not say who kept asking for
-/// 4 MiB.
-#[cfg(target_os = "none")]
-#[inline(never)]
-fn callers() -> [u64; CALLERS] {
-    let mut out = [0u64; CALLERS];
-    let st = hal::switch::current_stack();
-    let mut fp: u64;
-    // SAFETY: reads a register, nothing else.
-    unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
-    for slot in &mut out {
-        if fp < st.bottom || fp % 8 != 0 || fp.checked_add(16).is_none_or(|end| end > st.top) {
-            break;
-        }
-        // SAFETY: `fp` is 8-aligned and lies inside this thread's mapped kernel stack with 16 bytes below its top:
-        // two readable stack words. In a function with a frame record they are the caller's frame pointer and the
-        // return address; otherwise plain words, which the bounds check of the next round judges.
-        let (next, ret) = unsafe { ((fp as *const u64).read(), ((fp + 8) as *const u64).read()) };
-        *slot = ret;
-        if next <= fp {
-            break;
-        }
-        fp = next;
-    }
-    out
-}
-
-#[cfg(not(target_os = "none"))]
-fn callers() -> [u64; CALLERS] {
-    [0; CALLERS]
-}

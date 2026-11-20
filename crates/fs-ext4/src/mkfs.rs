@@ -30,7 +30,7 @@ const INODE_SIZE: u64 = 256;
 const EXTRA_ISIZE: u16 = 32;
 const JOURNAL_INO: u32 = 8;
 const LPF_INO: u32 = 11;
-/// jbd2 refuses a journal below this (`JBD2_MIN_JOURNAL_BLOCKS`, linux-6.6/include/linux/jbd2.h:69).
+/// jbd2 refuses a journal below this (`JBD2_MIN_JOURNAL_BLOCKS`, linux-7.3.1/include/linux/jbd2.h:66).
 const MIN_JOURNAL: u64 = 1024;
 /// Largest journal made here: one extent inside one group (a group's free run is below 32768 blocks).
 const MAX_JOURNAL: u64 = 16384;

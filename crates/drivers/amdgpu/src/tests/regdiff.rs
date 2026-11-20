@@ -1,7 +1,8 @@
 //! GX-7c: Linux's register trace (`regtrace`) and the diff harness (`regdiff`): the parser on hand-made lines
-//! (home values removed), the diff's missing/extra/reordered verdicts, and, when the 27.10. capture is in
-//! plan/hw (never in the public tree; skipped otherwise), our PSP bring-up against the fakes compared with
-//! Linux's writes phase by phase, the SMU fake's table against Linux's real messages, and the watcher's view.
+//! (home values removed), the diff's missing/extra/reordered verdicts, and, against the 27.10. capture
+//! (host/tests/gx/fixtures/trace-load.txt.zst; missing is a failure), our PSP bring-up against the fakes
+//! compared with Linux's writes phase by phase, the SMU fake's table against Linux's real messages, and the
+//! watcher's view.
 
 use crate::gpucore::fakechip;
 use crate::gpucore::hwid;
@@ -169,24 +170,23 @@ pub(super) fn table_names() -> Names {
     out
 }
 
-/// The 27.10. capture, when the private plan/hw is there and zstd is installed (decompressed once).
-pub(super) fn capture() -> Option<&'static Trace> {
-    static T: std::sync::OnceLock<Option<Trace>> = std::sync::OnceLock::new();
+/// The 27.10. capture (host/tests/gx/fixtures, decompressed once with the `zstd` tool). A missing file or zstd
+/// is a failure: every test that compares against the capture needs it.
+pub(super) fn capture() -> &'static Trace {
+    static T: std::sync::OnceLock<Trace> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plan/hw/gx-780m-linux-trace-2026-10-27/gx-6d9cae1d/trace-load.txt.zst");
-        if !p.exists() {
-            std::eprintln!("skip: {} missing (plan/ is not public)", p.display());
-            return None;
-        }
-        match std::process::Command::new("zstd").arg("-dc").arg(&p).output() {
-            Ok(o) if o.status.success() => Some(regtrace::parse(&String::from_utf8_lossy(&o.stdout))),
-            r => {
-                std::eprintln!("skip: zstd -dc failed: {:?}", r.map(|o| o.status));
-                None
-            }
-        }
+        let p = fixture("trace-load.txt.zst");
+        assert!(p.exists(), "{} missing: the 27.10. Linux capture is tracked there", p.display());
+        let o = std::process::Command::new("zstd").arg("-dc").arg(&p).output();
+        let o = o.unwrap_or_else(|e| panic!("zstd -dc {}: {e} (install zstd: pacman -S zstd)", p.display()));
+        assert!(o.status.success(), "zstd -dc {} failed: {}", p.display(), o.status);
+        regtrace::parse(&String::from_utf8_lossy(&o.stdout))
     })
-    .as_ref()
+}
+
+/// A file of host/tests/gx/fixtures (real dumps the GX host tests compare against).
+pub(super) fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/gx/fixtures").join(name)
 }
 
 /// Known differences of our PSP phase, with the reason.
@@ -200,7 +200,7 @@ const ALLOW_PSP: &[Allow] = &[Allow {
 
 #[test]
 fn linux_capture_whole_trace_reads() {
-    let Some(t) = capture() else { return };
+    let t = capture();
     assert_eq!(t.events.len(), 67_850);
     assert!(t.bad.is_empty() && t.dc_unpaired == 0, "{:?}", &t.bad[..t.bad.len().min(5)]);
     assert_eq!(t.events.iter().filter(|e| e.kind == Kind::Write).count(), 14_754);
@@ -209,7 +209,7 @@ fn linux_capture_whole_trace_reads() {
 
 #[test]
 fn linux_capture_against_our_bringup() {
-    let Some(t) = capture() else { return };
+    let t = capture();
     let names = table_names();
     // GX-7e: the engine the desk runs (`pspbringup::run`, Until::Gfx, kept: no undo), not the 7c test driver.
     let d = fakechip::discovery_780m();
@@ -228,7 +228,7 @@ fn linux_capture_against_our_bringup() {
     let reports = regdiff::diff(PHASES, &linux, &ours, &names, &allow);
     std::eprintln!("{}", regdiff::render(&reports));
     let got: Vec<(&str, usize, usize, usize)> = reports.iter().map(|r| (r.name, r.linux, r.ours, r.matched)).collect();
-    assert_eq!(got, [("psp", 31, 24, 24), ("smu", 63, 9, 9), ("mes", 29, 0, 0), ("imu_rlc", 18, 0, 0), ("sdma", 26, 0, 0), ("gmc_mmhub", 143, 0, 0), ("gmc_gfxhub", 143, 0, 0), ("gfx_tail", 165, 0, 0), ("gfx_ring", 6, 0, 0)]);
+    assert_eq!(got, [("psp", 31, 25, 25), ("smu", 63, 9, 9), ("mes", 29, 0, 0), ("imu_rlc", 18, 0, 0), ("sdma", 26, 0, 0), ("gmc_mmhub", 143, 0, 0), ("gmc_gfxhub", 143, 0, 0), ("gfx_tail", 165, 0, 0), ("gfx_ring", 6, 0, 0)]);
     for r in &reports[..2] {
         assert_eq!(r.failures().count(), 0, "{} differs from Linux beyond the known: {}", r.name, regdiff::render(core::slice::from_ref(r)));
         assert_eq!((r.count(DiffKind::Extra), r.count(DiffKind::Reordered)), (0, 0), "{}", r.name);
@@ -242,7 +242,7 @@ fn linux_capture_against_our_bringup() {
 
 #[test]
 fn linux_capture_smu_messages_are_the_fakes_table() {
-    let Some(t) = capture() else { return };
+    let t = capture();
     let f = FakeGpu::new(Hostile::None);
     let m = f.smu.drv;
     let (msg, arg) = (m.msg_at / 4, m.arg_at / 4);
@@ -270,7 +270,7 @@ fn linux_capture_smu_messages_are_the_fakes_table() {
 
 #[test]
 fn linux_capture_through_the_watcher() {
-    let Some(t) = capture() else { return };
+    let t = capture();
     let g = DisplayGuard::from_discovery(&fakechip::discovery_780m());
     let mut dcn_dc = 0;
     let mut mmhub = BTreeMap::new();
@@ -299,7 +299,7 @@ fn linux_capture_through_the_watcher() {
 /// PMFW fake writes exactly what Linux wrote in the SMU phase (the template GX-7e's client is diffed against).
 #[test]
 fn linux_capture_smu_phase_replayed_on_the_fake() {
-    let Some(t) = capture() else { return };
+    let t = capture();
     let mut f = FakeGpu::new(Hostile::None);
     let m = f.smu.drv;
     for &(id, arg, _) in smufake::LINUX_LOAD {

@@ -59,9 +59,13 @@ impl CompositorHandler for App {
             if let Some(window) = self.find_window(&root) {
                 window.on_commit();
                 if self.note_first_frame(&window, surface) {
+                    // DESK-LEFT: a question its program asks before closing a minimised window.
+                    self.min_close_answer(&window);
                     // WY-5b: a foot of ours has its signal handlers now.
                     if let Ok(pid) = u32::try_from(self.pid_of(&window)) {
                         self.foot_drawn(pid);
+                        // PE-1: its start showed a window.
+                        self.prog_mapped(pid);
                         // WY-7: its start (or its launcher's: the same process group) is answered now.
                         let group = Self::group_of(pid);
                         if self.launches.mapped(pid) | self.launches.mapped(group) {
@@ -70,6 +74,8 @@ impl CompositorHandler for App {
                     }
                     // WY-5: the start page's "recently used" (the app id is known by the first frame).
                     let id = crate::ctl::names(&window).0;
+                    // GM-6b: its program's play time runs from now (sofa-mode.md 3.4).
+                    self.play_mapped(&window);
                     if !id.is_empty() {
                         let a = self.address_of(&window);
                         self.recent_add(&a);
@@ -78,6 +84,8 @@ impl CompositorHandler for App {
                 if let Some(toplevel) = window.toplevel()
                     && !toplevel.is_initial_configure_sent()
                 {
+                    // DB4: a learned state (maximised, a tile's width) before the window is first seen.
+                    self.habit_initial(&window);
                     // The size and server-side frame were set as pending state when the window was placed.
                     toplevel.send_configure();
                 }
@@ -157,8 +165,9 @@ impl XdgShellHandler for App {
         surface.with_pending_state(|s| s.decoration_mode = Some(DecoMode::ServerSide));
         let window = Window::new_wayland_window(surface);
         crate::ctl::win_id(&window);
-        self.place_new(window);
+        self.place_new(window.clone());
         self.layout_dirty = true;
+        self.sofa_window_new(&window);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -282,6 +291,7 @@ impl SeatHandler for App {
             self.grant = None;
         }
         set_data_device_focus(&self.dh, seat, client);
+        self.text_in.focus(focused);
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -294,9 +304,7 @@ impl SeatHandler for App {
             CursorImageStatus::Surface(s) => Some(s),
             _ => None,
         };
-        if self.draw_pointer {
-            self.needs_frame = true;
-        }
+        self.needs_frame = true;
         // WY-11: a new shape reaches the hardware cursor at once (not at the next loop turn).
         self.cursor_sync();
     }
@@ -383,6 +391,11 @@ impl App {
 
     /// The same for either kind of window (an X11 one asks through `_NET_WM_STATE`).
     pub(crate) fn window_fullscreen(&mut self, w: &Window, on: bool) -> bool {
+        self.window_fullscreen_why(w, on, "on its own request")
+    }
+
+    /// `window_fullscreen` with the reason for the log line (GM-6a: the sofa mode makes its windows fullscreen).
+    pub(crate) fn window_fullscreen_why(&mut self, w: &Window, on: bool, why: &str) -> bool {
         let w = w.clone();
         let id = crate::ctl::win_id(&w);
         if on && (self.ws.is_minimized(&w) || self.desk.parked.iter().any(|ws| ws.is_minimized(&w))) {
@@ -402,11 +415,12 @@ impl App {
                 }
                 return false;
             }
-            eprintln!("bitscomp: window {id} {} fullscreen on its own request", if on { "enters" } else { "leaves" });
+            eprintln!("bitscomp: window {id} {} fullscreen {why}", if on { "enters" } else { "leaves" });
             if on {
                 // Keys go to the client now, and no bar comes over it.
                 self.address_end();
                 self.page_edit_end();
+                self.assist_blur();
                 if self.desk.reveal.clear() {
                     self.chrome_dirty();
                 }

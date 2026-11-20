@@ -10,6 +10,8 @@
 //! - [`ids`]: VMID manager (a scheduling-time resource) and PASID allocator.
 //! - [`gart`]: the flat GART table of VMID 0.
 //! - [`pm4`], [`sdma`]: GFX 11 PM4 and SDMA 6.0 packet encoders and decoders.
+//! - [`sdma7`]: the two packet forms of SDMA 7.0 that differ from 6.0 (the RX 9070 XT).
+//! - [`gfx12`]: the PM4 packets of GFX 12 that differ from GFX 11, and the list Linux emits (the RX 9070 XT).
 //! - [`ring`]: ring geometry, reservation, NOP padding, IB padding, IB and fence frames.
 //! - [`fence`]: 64-bit fence timelines with wrapping comparison; [`wb`]: writeback slots.
 //! - [`sim`]: the interpreters (the fake GPU's CP and SDMA engines) on an abstract [`bus`].
@@ -17,9 +19,10 @@
 //! - [`watch`]: per-ring job timeout over the fence timeline, the hung-ring verdict and report (GR-3).
 //! - [`recover`]: the recovery ladder as data: soft kill, queue reset, GC re-init, mode 2 behind a closed gate.
 //! - [`told`]: reset counters, QUERY_STATE2 flags, how jobs end (GR-3). GX-8 and GX-9a call these three.
+//! - [`vcn`]: VCN 4's unified-queue packets, test IBs, DPG SRAM list and shared page (GX-8v).
 //!
-//! Linux 6.6 is the reference for bit positions and behaviour (`linux-6.6/drivers/gpu/drm/amd/amdgpu/`):
-//! amdgpu_vm.h:57-112, gmc_v11_0.c:446-545, amdgpu_vm_pt.c, amdgpu_ids.c, amdgpu_gart.c, nvd.h, gfx_v11_0.c,
+//! Linux 7.3.1 is the reference for bit positions and behaviour (`linux-7.3.1/drivers/gpu/drm/amd/amdgpu/`):
+//! amdgpu_vm.h:57-118, gmc_v11_0.c:413-545, amdgpu_vm_pt.c, amdgpu_ids.c, amdgpu_gart.c, nvd.h, gfx_v11_0.c,
 //! sdma_v6_0.c, sdma_v6_0_0_pkt_open.h, amdgpu_ring.c, amdgpu_fence.c. No sizes of the
 //! carve-out, the GART window or the VMID range are built in: they are constructor arguments.
 //!
@@ -37,6 +40,7 @@ pub mod bus;
 pub mod encode;
 pub mod fence;
 pub mod gart;
+pub mod gfx12;
 pub mod hang;
 pub mod ids;
 pub mod pm4;
@@ -44,9 +48,11 @@ pub mod pte;
 pub mod recover;
 pub mod ring;
 pub mod sdma;
+pub mod sdma7;
 pub mod sim;
 pub mod store;
 pub mod told;
+pub mod vcn;
 pub mod vm;
 pub mod walk;
 pub mod watch;

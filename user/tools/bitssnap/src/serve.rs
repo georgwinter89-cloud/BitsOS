@@ -152,6 +152,11 @@ pub fn serve(once: bool) -> i32 {
     }
     if !once {
         std::thread::Builder::new().name("bitssnap-mcp".into()).spawn(mcp_loop).ok();
+        // REWIND: the desktop's own way in (local.rs); without it "Zurückspulen" says the service is not there.
+        let sock = std::env::var("BITSSNAP_SOCKET").unwrap_or_else(|_| crate::local::SOCKET.into());
+        if let Err(e) = crate::local::start(&sock) {
+            crate::log_warn(&format!("desktop socket: {e}; the desktop cannot rewind on this start"));
+        }
         log("started: snapshots of /data every snap.interval_min minutes");
     }
     let mut said_never = String::new();
@@ -480,7 +485,7 @@ mod tests {
     }
 
     /// The serve loop as `serve` wires it (look_of + auto_rounds + sched::run): two hours at 5 minutes are
-    /// 24 rounds, not one per wake-up (desk-minipc-w11.md S3), each with the settings it fell due under.
+    /// 24 rounds, not one per wake-up, each with the settings it fell due under.
     #[test]
     fn serve_takes_a_round_per_interval_not_per_wakeup() {
         struct Fake(u64, u64);

@@ -149,7 +149,7 @@ fn hostile_blobs_refused_with_reason() {
     x[l.die0 + 10] ^= 0x40; // a version byte, no checksum fixed
     assert!(matches!(refuse(&x), Why::BinaryChecksum { .. }));
 
-    for size in [0u16, 59, 9000] {
+    for size in [0u16, 59, 11000] {
         let mut x = good.clone();
         poke16(&mut x, 10, size);
         assert!(matches!(refuse(&x), Why::BinarySize { .. }), "size {size}");
@@ -298,15 +298,11 @@ fn random_damage_never_panics() {
     assert!(refused > 0 && ok + refused == 4000);
 }
 
-/// The real binary from the Mini-PC (gx_probe hex=true, desk), compared with Linux's sysfs view. Skipped until the
-/// desk adds the file.
+/// The real binary from the Mini-PC (gx_probe hex=true, desk), compared with Linux's sysfs view.
 #[test]
 fn minipc_real_blob() {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host/tests/gx/fixtures/minipc-780m-discovery.bin");
-    let Ok(buf) = std::fs::read(&p) else {
-        std::eprintln!("skip: {} not there yet (the desk adds it from gx_probe hex=true)", p.display());
-        return;
-    };
+    let p = super::regdiff::fixture("minipc-780m-discovery.bin");
+    let buf = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e} (tracked fixture)", p.display()));
     let d = parse(&buf).unwrap_or_else(|w| panic!("real blob refused: {w}"));
     let want = minipc_ips();
     assert_eq!(d.ips.len(), want.len());
@@ -415,4 +411,43 @@ fn where_the_binary_lies() {
     assert_eq!(vram::discovery_pos(0), None);
     // DCN_VM_FB_OFFSET 0x123 (16 MB units) with 512 MB.
     let _ = blob::slot(0);
+}
+
+/// L7 row 42: Linux 7.3.1 reads 10 KiB, and without a signature at the default place takes DRIVER_SCRATCH_0..2
+/// (amdgpu_discovery.c:338-357).
+#[test]
+fn tmr_place_as_linux() {
+    assert_eq!(disc::TMR_SIZE, 10 << 10);
+    let def = (8u64 << 30) - (64 << 10);
+    let vram = 8u64 << 30;
+    let scratch = |lo: u32, hi: u32, size: u32| move |b: u32| Some(if b == 0x250 { lo } else if b == 0x254 { hi } else if b == 0x258 { size } else { 0xdead });
+    let other = scratch(0x1000_0000, 1, 0x3000);
+    assert_eq!(disc::tmr_place(def, Some(disc::BINARY_SIGNATURE), other, 8 << 32), (def, disc::TMR_SIZE), "a signature: the default");
+    assert_eq!(disc::tmr_place(def, Some(0), scratch(0x1000_0000, 1, 0x3000), 8 << 32), (0x1_1000_0000, 0x3000), "the scratch place");
+    assert_eq!(disc::tmr_place(def, None, scratch(0x1000_0000, 0, 0x3000), vram), (0x1000_0000, 0x3000), "an unreadable signature too");
+    assert_eq!(disc::tmr_place(def, Some(0), scratch(0x1000_0000, 0, 0), vram), (def, disc::TMR_SIZE), "size 0: the default");
+    assert_eq!(disc::tmr_place(def, Some(0), scratch(0x1000_0000, 0, 0x1_0004), vram), (def, disc::TMR_SIZE), "above 64 KiB");
+    assert_eq!(disc::tmr_place(def, Some(0), scratch(0x1000_0002, 0, 0x3000), vram), (def, disc::TMR_SIZE), "unaligned");
+    assert_eq!(disc::tmr_place(def, Some(0), scratch(0xffff_f000, 1, 0x3000), vram), (def, disc::TMR_SIZE), "past VRAM");
+    assert_eq!(disc::tmr_place(def, Some(0), |_| None, vram), (def, disc::TMR_SIZE), "registers not readable");
+}
+
+/// L7 row 42 (checker): the table at the default place is read once, 10 KiB, with no extra index writes (the
+/// Mini-PC ktest gx.disc.indirect counts chunks * (CHUNK_DWORDS + 3)); without the signature the scratch place.
+#[test]
+fn tmr_read_costs_only_its_chunks() {
+    let def = 0x4000u64;
+    let mut w = FakeWindow::new(0x8000 / 4);
+    w.vram[(def / 4) as usize] = disc::BINARY_SIGNATURE;
+    let no_scratch = |_: u32| -> Option<u32> { panic!("scratch read although the signature is there") };
+    let (pos, got) = vram::read_tmr(&w, def, no_scratch, 0x8000);
+    assert_eq!((pos, got.map(|b| b.len())), (def, Ok(disc::TMR_SIZE)));
+    let chunks = (disc::TMR_SIZE / 4).div_ceil(vram::CHUNK_DWORDS);
+    assert_eq!(w.writes.borrow().len(), chunks * (vram::CHUNK_DWORDS + 3), "index writes of the table's chunks only");
+    // No signature: DRIVER_SCRATCH_0..2 name 0x100 bytes at 0x1000.
+    let w = FakeWindow::new(0x8000 / 4);
+    let scratch = |b: u32| Some(match b { 0x250 => 0x1000, 0x254 => 0, 0x258 => 0x100, _ => 0 });
+    let (pos, got) = vram::read_tmr(&w, def, scratch, 0x8000);
+    let want: Vec<u8> = w.vram[0x400..0x440].iter().flat_map(|d| d.to_le_bytes()).collect();
+    assert_eq!((pos, got), (0x1000, Ok(want)));
 }

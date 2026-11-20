@@ -329,9 +329,6 @@ impl VirtioNet {
         drop(old);
         self.pending.store(0, Ordering::Release);
         self.irq_mode.store(IRQ_POLLED, Ordering::Release);
-        if net::config("net_irq").is_some_and(|v| v.trim() == "off") {
-            return (NO_VECTOR, NO_VECTOR);
-        }
         let p = self.pending.clone();
         let hook: pci::IrqHook = Arc::new(move |i: u16| {
             p.fetch_or(1u32 << (i & 31), Ordering::AcqRel);

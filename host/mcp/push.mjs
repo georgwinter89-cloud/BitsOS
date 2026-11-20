@@ -15,6 +15,7 @@
 // --home (MC-push2): the tree goes into the user's home \BITSOS2\home\ (--name home, e.g. Georg's Cobalt profile
 // unpacked from cobalt_files.tar): files are added and replaced, never removed (the home holds more than one
 // tree); BitsOS gives them the user's owner (uid/gid 1000, 0700/0600) as they move in.
+// --add (GP-R2): as --home for any other package: the tree's files are added and replaced, nothing is removed.
 // --file/--to (MC-push2): one file to one place (e.g. --to /boot/BITSOS2/bin/cobalt), staged and committed the same
 // way through \BITSOS2\.push-<package>\; nothing else in that package changes. Below home only with --home.
 //
@@ -39,6 +40,7 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { basename, resolve } from 'node:path';
 import { connect, McpError, readToken, upload } from './mcp-call.mjs';
+import { tokenFileFor } from './token.mjs';
 import { compare, FAT_MAX, fileTarget, isHome, journalProblem, makePlan, nameProblem, scanTree, sha256File } from './push-plan.mjs';
 
 let PORT_LO = 8770, PORT_HI = 8799;
@@ -49,7 +51,7 @@ if (process.env.BITSOS_PUSH_PORTS) {
   [PORT_LO, PORT_HI] = [Number(m[1]), Number(m[2])];
 }
 const VALUE = ['--tree', '--file', '--to', '--name', '--bind', '--me', '--port', '--via', '--timeout-ms', '--wait-ms', '--token-file', '--root', '--tls'];
-const SWITCH = ['--dry-run', '--home'];
+const SWITCH = ['--dry-run', '--home', '--add', '--gaming-pc'];
 const opts = {}, rest = [];
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -61,7 +63,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a.startsWith('--')) fail(`unknown option ${a}`, 2);
   else rest.push(a);
 }
-const USAGE = 'usage: node push.mjs <host[:port]> (--tree DIR [--name N] [--home] | --file F --to PATH [--home]) --bind A [--me A] [--port 8770-8799] [--via fetch|write] [--dry-run] [--timeout-ms N] [--wait-ms N] [--token-file F] [--tls DIR|auto]';
+const USAGE = 'usage: node push.mjs <host[:port]> (--tree DIR [--name N] [--home | --add] | --file F --to PATH [--home]) --bind A [--me A] [--port 8770-8799] [--via fetch|write] [--dry-run] [--timeout-ms N] [--wait-ms N] [--token-file F] [--gaming-pc] [--tls DIR|auto]';
 const [host] = rest;
 const fileMode = opts.file !== undefined;
 if (!host || rest.length > 1 || fileMode === (opts.tree !== undefined)) fail(USAGE, 2);
@@ -94,8 +96,13 @@ const home = isHome(name);
 if (home) name = 'home';
 if (allowHome && !home) fail(`--home is only for \\BITSOS2\\home (--name home, or --to ${root}/home/...)`, 2);
 if (home) target = fileMode ? `${root}/home${target.slice(root.length + 1).replace(/^[^/]*/, '')}` : `${root}/home`;
-// --home and --file never remove anything (the home holds more than this tree; a file push touches one file).
-const keep = home || fileMode;
+// GP-R2: --add puts a tree's files into a package that holds more than the tree (the Gaming-PC's firmware set beside
+// the stick's other firmware): added and replaced, never removed, as --home does for the home.
+const add = opts.add === true;
+if (add && (fileMode || home)) fail('--add goes with --tree into a package other than home (--home and --file never remove anything anyway)', 2);
+// --home, --add and --file never remove anything (the home holds more than this tree; a file push touches one file).
+const keep = home || fileMode || add;
+const adds = home || add;
 const staging = `${root}/.push-${name}`, stagedFiles = `${staging}/files`;
 const label = fileMode ? `${target}/${only}` : name;
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -127,10 +134,10 @@ let local;
 if (fileMode) local = { files: [{ rel: only, abs: tree, size: statSync(tree).size, sha256: await sha256File(tree) }], dirs: [] };
 else try { local = await scanTree(tree); } catch (e) { fail(`${tree} cannot go onto the stick:\n${e.message}`, 2); }
 const localBytes = local.files.reduce((n, f) => n + f.size, 0);
-console.log(`${fileMode ? 'file' : 'tree'}: ${tree}: ${local.files.length} files, ${(localBytes / 1e6).toFixed(1)} MB -> ${fileMode ? label : target}${home ? ' (the user\'s home: nothing there is removed)' : ''}`);
+console.log(`${fileMode ? 'file' : 'tree'}: ${tree}: ${local.files.length} files, ${(localBytes / 1e6).toFixed(1)} MB -> ${fileMode ? label : target}${home ? ' (the user\'s home: nothing there is removed)' : add ? ' (--add: nothing there is removed)' : ''}`);
 
 let token;
-try { token = readToken(opts['token-file']); } catch (e) { fail(e.message, 2); }
+try { token = readToken(tokenFileFor(opts['token-file'], opts['gaming-pc'])); } catch (e) { fail(e.message, 2); }
 let session;
 try { session = await connect(host, { token, tls: opts.tls, tokenFile: opts['token-file'] }); } catch (e) {
   if (!(e instanceof McpError)) throw e;
@@ -213,7 +220,7 @@ const staged = opts['dry-run'] && st0.entries.some((e) => e.path === 'PLAN.json'
 const plan = makePlan(local, remote.entries, staged.entries, { keep });
 console.log(`compare: ${remote.entries.filter((e) => e.type === 'file').length} files on BitsOS hashed in ${Date.now() - t0} ms; `
   + `${plan.same} unchanged, ${plan.upload.length} to upload (${(plan.bytes / 1e6).toFixed(1)} MB), ${plan.reuse.length} staged already, `
-  + `${plan.remove.length} to remove, ${plan.stale.length} stale in the staging tree${home ? `, ${plan.kept} only on BitsOS kept` : ''}`);
+  + `${plan.remove.length} to remove, ${plan.stale.length} stale in the staging tree${adds ? `, ${plan.kept} only on BitsOS kept` : ''}`);
 for (const f of plan.upload) console.log(`  upload ${f.rel} (${f.size} bytes)`);
 for (const r of plan.remove) console.log(`  remove ${r}`);
 if (opts['dry-run']) {
@@ -319,11 +326,11 @@ console.log(`commit: ${want.length} files in place, ${plan.remove.length} remove
 
 // ---- 6. the package as BitsOS has it ----
 const after = await manifest(target, 'sha256', only);
-const left = compare(local, after.entries.filter((e) => e.type === 'file'), { extraOk: home });
+const left = compare(local, after.entries.filter((e) => e.type === 'file'), { extraOk: adds });
 if (left.length) {
   for (const d of left.slice(0, 20)) console.error(`  ${d}`);
   fail(`${fileMode ? label : target} differs from ${tree} in ${left.length} files after the commit`);
 }
-const what = fileMode ? `${label} equals the file` : `${target} ${home ? 'holds' : 'equals'} the tree`;
-console.log(`push: ${label}: ${n} files uploaded (${(sent / 1e6).toFixed(1)} MB), ${plan.reuse.length} from an earlier run, ${plan.remove.length} removed, ${plan.same} unchanged; ${what} (SHA-256 of all ${local.files.length} files on BitsOS)${home ? `; ${plan.kept} files only on BitsOS kept` : ''}`);
+const what = fileMode ? `${label} equals the file` : `${target} ${adds ? 'holds' : 'equals'} the tree`;
+console.log(`push: ${label}: ${n} files uploaded (${(sent / 1e6).toFixed(1)} MB), ${plan.reuse.length} from an earlier run, ${plan.remove.length} removed, ${plan.same} unchanged; ${what} (SHA-256 of all ${local.files.length} files on BitsOS)${adds ? `; ${plan.kept} files only on BitsOS kept` : ''}`);
 process.exit(0);

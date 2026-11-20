@@ -1,7 +1,9 @@
 //! File events on the roots (DESIGN §3): one inotify watch per directory wakes the indexer soon after a
 //! change, so a deleted or renamed file leaves the index in seconds, not at the next rescan. The periodic
 //! rescan stays the safety net: on a queue overflow (`watch.overflow`), when the watch limit of the system is
-//! reached (`watch.limit`), and on V2, where inotify is a stub that never fires (rust-ecosystem.md).
+//! reached (`watch.limit`), and for what inotify cannot see. V2's inotify is real since FS-14 (28.10.) and
+//! works unchanged; the QEMU scenario host/tests/cx/20-ctxd-v2.sh checks that a new, a renamed and a deleted
+//! file each come through a `watch.wake`, not the rescan.
 
 use crate::engine::Engine;
 use crate::roots::{self, Root};
@@ -136,6 +138,7 @@ fn run(w: &mut Watcher, e: &Engine, roots: &[Root], debounce: Duration) {
             crate::event!("warn", "watch.overflow", fallback = "rescan");
         }
         if relevant || overflow {
+            crate::event!("debug", "watch.wake", overflow = overflow);
             e.wake_indexer();
         }
     }

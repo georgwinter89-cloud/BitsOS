@@ -8,6 +8,8 @@ description = "MCP kernel service, tool registry (owner: MC)"
 zeroize = { version = "=1.9.1", default-features = false }
 # MC-8a: the pure protocol (HTTP head, JSON, JSON-RPC, the gate), shared with the user-space service bitsmcp.
 mcp-wire = { path = "../mcp-wire" }
+# UPDATE: hw_info and /proc/bitsos/generation name the build's version number.
+bitsver = { path = "../bitsver" }
 net = { path = "../net" }
 ksync = { path = "../ksync" }
 klog = { path = "../klog" }
@@ -25,6 +27,8 @@ hal = { path = "../hal" }
 platform = { path = "../platform" }
 mm-core = { path = "../mm-core" }
 pci = { path = "../pci" }
+# GP-ROUND: the profile's name and tiers (hw_info, the ktest machine rule) and the Gaming-PC's report text.
+gp-platform = { path = "../gp-platform" }
 display = { path = "../display" }
 console = { path = "../console" }
 vfs = { path = "../vfs" }

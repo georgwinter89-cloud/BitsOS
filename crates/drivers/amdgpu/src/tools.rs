@@ -165,6 +165,7 @@ pub fn writes_text(total: u64, mismatched: u64, recent: &[dcn::LoggedWrite]) -> 
                 dcn::Owner::Other => "",
                 dcn::Owner::Flip => " (page flip)",
                 dcn::Owner::Cursor => " (cursor)",
+                dcn::Owner::AudioIndex => " (sound: endpoint index)",
             }
         );
     }
@@ -244,9 +245,6 @@ fn dcn_flip(ctx: &ToolContext, args: &Json) -> ToolResult {
     let Some(s) = s else {
         return Err(ToolError::Failed(out + "no page flips here (QEMU has no AMD display engine)"));
     };
-    if !s.active() && !s.rearm() {
-        return Err(ToolError::Failed(out + "the surface fell back to one image and A0 is not settled yet"));
-    }
     if test == "pace" {
         pace_fits(flips, s.timing().period_ns())?;
     }

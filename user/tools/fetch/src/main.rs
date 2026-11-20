@@ -10,7 +10,7 @@ mod url;
 
 use args::Opts;
 use sha2::{Digest, Sha256};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
@@ -27,6 +27,7 @@ pub enum Code {
     Write = 9,
     Hash = 10,
     Timeout = 11,
+    Size = 12,
 }
 
 #[derive(Debug)]
@@ -61,6 +62,9 @@ fn run(o: &Opts) -> Res<()> {
     let mut tls_cfg = None;
     let mut redirects = 0u32;
     let end = o.max_time.and_then(|t| Instant::now().checked_add(t));
+    let token = if o.auth_stdin { Some(read_token()?) } else { None };
+    // The origin the token belongs to: scheme, host and port of the URL as given.
+    let origin = (url.https, url.host.to_ascii_lowercase(), url.port);
     let (mut body, total) = loop {
         if url.https && tls_cfg.is_none() {
             let bundle = tls::bundle_path(o.ca.as_deref()).map_err(|m| Fail(Code::Tls, m))?;
@@ -71,7 +75,8 @@ fn run(o: &Opts) -> Res<()> {
             }
         }
         let mut s = conn::open(&url, o.timeout, end, tls_cfg.as_ref())?;
-        s.write_all(&http::request(&url.host_header(), &url.target)).and_then(|_| s.flush()).map_err(|e| conn::classify(e, conn::Phase::Request, o.timeout))?;
+        let bearer = token.as_deref().filter(|_| (url.https, url.host.to_ascii_lowercase(), url.port) == origin);
+        s.write_all(&http::request_with(&url.host_header(), &url.target, o.accept.as_deref(), bearer)).and_then(|_| s.flush()).map_err(|e| conn::classify(e, conn::Phase::Request, o.timeout))?;
         let mut r = BufReader::with_capacity(64 * 1024, s);
         let head = http::read_head(&mut r).map_err(|e| conn::http_fail(e, o.timeout))?;
         if matches!(head.status, 301 | 302 | 303 | 307 | 308) {
@@ -96,6 +101,11 @@ fn run(o: &Opts) -> Res<()> {
         }
         let framing = head.framing().map_err(|e| conn::http_fail(e, o.timeout))?;
         let total = if let http::Framing::Length(n) = framing { Some(n) } else { None };
+        if let (Some(t), Some(m)) = (total, o.max_size)
+            && t > m
+        {
+            return Err(Fail(Code::Size, format!("the body has {t} bytes, more than --max-size {m}")));
+        }
         break (http::Body::new(r, framing), total);
     };
     let mut sink = sink::Sink::open(&out)?;
@@ -123,6 +133,18 @@ fn run(o: &Opts) -> Res<()> {
     Ok(())
 }
 
+/// `--auth-stdin`: the token on stdin's first line (never on the command line, which every process can read in
+/// /proc). Only the characters a bearer token has; anything else is refused before a byte goes out.
+fn read_token() -> Res<String> {
+    let mut line = String::new();
+    std::io::stdin().lock().take(4096).read_line(&mut line).map_err(|e| Fail(Code::Usage, format!("--auth-stdin: {e}")))?;
+    let t = line.trim_end_matches(['\n', '\r']);
+    if t.is_empty() || t.len() > 1024 || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b)) {
+        return Err(Fail(Code::Usage, String::from("--auth-stdin: the first line of stdin is no token")));
+    }
+    Ok(t.to_string())
+}
+
 fn copy(body: &mut impl Read, sink: &mut sink::Sink, total: Option<u64>, o: &Opts) -> Res<[u8; 32]> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -137,6 +159,12 @@ fn copy(body: &mut impl Read, sink: &mut sink::Sink, total: Option<u64>, o: &Opt
                 return Err(conn::classify(e, conn::Phase::Body, o.timeout));
             }
         };
+        if let Some(m) = o.max_size
+            && p.got + n as u64 > m
+        {
+            p.abort();
+            return Err(Fail(Code::Size, format!("the body is larger than --max-size {m}")));
+        }
         hasher.update(&buf[..n]);
         sink.write(&buf[..n])?;
         p.tick(n as u64);

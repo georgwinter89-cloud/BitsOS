@@ -1,6 +1,6 @@
-//! SX-2 glue: unshare(2), setns(2), chroot(2) and the id views every other call uses (linux-6.6/kernel/fork.c
-//! `ksys_unshare`, kernel/nsproxy.c `setns`, fs/open.c:593 `chroot`). The namespaces themselves are in
-//! `proc::ns`.
+//! SX-2 glue: unshare(2), setns(2), chroot(2) and the id views every other call uses (linux-7.3.1/kernel/fork.c:3254
+//! `ksys_unshare` with UNSHARE_EMPTY_MNTNS, kernel/nsproxy.c:569 `setns`, fs/open.c:591 `chroot`; fchroot is in
+//! `fchroot.rs`). The namespaces themselves are in `proc::ns`.
 //!
 //! Id views: a program names processes by its pid namespace's numbers and users by its user namespace's ids.
 //! `find`/`find_thread` turn a number from a program into the process or thread (None: not visible, ESRCH);
@@ -10,9 +10,9 @@
 //!
 //! chroot: every check of Linux runs here (EFAULT, ENAMETOOLONG, ENOENT, ENOTDIR, EACCES on the path and on the
 //! directory, then EPERM without CAP_SYS_CHROOT in the caller's user namespace); the root lives in the
-//! calling thread's `vfs::FsState` (FS-16: apart from the fd table, plan/notes/fs-FS-16.md), which CLONE_FS shares and absolute
+//! calling thread's `vfs::FsState` (FS-16: apart from the fd table), which CLONE_FS shares and absolute
 //! lookups, getcwd, `/proc/<pid>/root` and execve follow. A root that is the directory of something gone (the
-//! fdinfo directory of an ended task) answers ENOENT to every lookup below it.
+//! fdinfo directory of a reaped task) answers ESRCH to every lookup below it.
 
 use crate::SysCtx;
 use alloc::sync::Arc;
@@ -21,7 +21,7 @@ use proc::ns::user::MapKind;
 use proc::{Process, Thread};
 use uapi::errno::*;
 
-/// linux-6.6/arch/x86/entry/syscalls/syscall_64.tbl (uapi is desk-owned: CR 4).
+/// linux-7.3.1/arch/x86/entry/syscalls/syscall_64.tbl:173 (uapi is desk-owned: CR 4).
 pub(crate) const NR_CHROOT: usize = uapi::nr::CHROOT;
 pub(crate) const NR_UNSHARE: usize = uapi::nr::UNSHARE;
 pub(crate) const NR_SETNS: usize = uapi::nr::SETNS;
@@ -76,8 +76,9 @@ fn sys_unshare(c: &mut SysCtx<'_>) -> i64 {
 }
 crate::syscall_nr!(NR_UNSHARE, "unshare", sys_unshare);
 
-/// setns(fd, nstype): EBADF for a bad fd; a namespace file goes to `Process::setns`; a pidfd is not built
-/// (EINVAL, event); any other file EINVAL (`setns`).
+/// setns(fd, nstype) (linux-7.3.1/kernel/nsproxy.c:569): EBADF for a bad fd; a namespace file goes to
+/// `Process::setns`; a pidfd to `Process::setns_task`, which enters several namespaces of its task at once
+/// (`check_setns_flags`, `validate_nsset`, `commit_nsset`); any other file is EINVAL.
 fn sys_setns(c: &mut SysCtx<'_>) -> i64 {
     let fd = c.args[0] as u32 as i32;
     let nstype = c.args[1] as u32 as i32;
@@ -95,8 +96,16 @@ fn sys_setns(c: &mut SysCtx<'_>) -> i64 {
             }
         };
     }
-    if proc::pidfd::group_of(&f).is_some() {
-        klog::event!(Info, "ns", "unsupported", pid = c.proc.pid, flags = klog::Hex(nstype as u32 as u64), what = "setns through a pidfd");
+    // L7-RESTE-AB 2: a pidfd enters several namespaces of its task at once (`validate_nsset`).
+    if let Some(t) = proc::pidfd::target_of(&f) {
+        drop(f);
+        return match c.proc.setns_task(c.thread, &t, nstype as u32 as u64) {
+            Ok(()) => 0,
+            Err(e) => {
+                klog::event!(Debug, "ns", "setns.failed", pid = c.proc.pid, target = t.id(), errno = e);
+                -e
+            }
+        };
     }
     -EINVAL
 }
@@ -133,7 +142,7 @@ crate::syscall_nr!(NR_CHROOT, "chroot", sys_chroot);
 /// Puts `root` in place as the calling thread's root (`set_fs_root`): in its `vfs::FsState`, which every CLONE_FS
 /// sharer sees (Chromium's chroot child changes its parent's root this way) and a CLONE_FILES-only sibling does
 /// not (FS-16: the state is apart from the fd table).
-fn set_root(fs: &vfs::FsState, pid: u32, root: vfs::Path) -> i64 {
+pub(crate) fn set_root(fs: &vfs::FsState, pid: u32, root: vfs::Path) -> i64 {
     fs.set_root(root);
     klog::event!(Info, "ns", "chroot", pid = pid);
     0

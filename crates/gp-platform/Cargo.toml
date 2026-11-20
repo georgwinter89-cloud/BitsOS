@@ -1,0 +1,9 @@
+[package]
+name = "gp-platform"
+version = "0.1.0"
+edition = "2024"
+description = "Gaming-PC platform rules (second PCI root, never-touch list, disk guard, clock, MADT, DMAR): pure logic, no hardware access (gp-roadmap SK-1)"
+publish = false
+
+[lints]
+workspace = true

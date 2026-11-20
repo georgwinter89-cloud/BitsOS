@@ -1,4 +1,4 @@
-//! DS-5: the step list of `/proc/bitsos/boot` (DS-4's interface, plan/notes/in-DS-4.md) and bitscomp's own steps
+//! DS-5: the step list of `/proc/bitsos/boot` (DS-4's interface, plan/spec/usb.md §4.3) and bitscomp's own steps
 //! that continue it. Pure: parsing, the merge and the picture's `View` are host-tested.
 
 use super::boot_draw::{Art, Row, State, View};

@@ -352,7 +352,7 @@ impl evdev::Listener for Swallow {
 }
 
 /// Decided for IN-6 (notes, fixer table): a program that grabs a mouse (EVIOCGRAB) owns it alone, the VT
-/// included, as in Linux (linux-6.6/drivers/input/input.c:155, evdev.c:341): its moves do not move the kernel's
+/// included, as in Linux (linux-7.3.1/drivers/input/input.c:120, evdev.c:337): its moves do not move the kernel's
 /// pointer, on the console or over a program; once the grab ends they do again.
 fn pointer_grabbed() -> TestResult {
     let _console = crate::ktest_lease::ConsoleLease::take()?;

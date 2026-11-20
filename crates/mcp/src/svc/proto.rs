@@ -1,7 +1,8 @@
 //! The line protocol on `/run/bitsos/mcp.sock` (MC-6): JSON-RPC 2.0, one message per line (`\n`), both ways.
 //! It is a small part of MCP itself, so a service's author knows it already:
 //!
-//! service -> kernel: `register` {service, tools: [{name, description, inputSchema, safety}]}, `unregister`
+//! service -> kernel: `register` {service, tools: [{name, description, inputSchema, safety, local}]} (`local`:
+//! optional, MC-L: offer the tool on `/run/bitsos/tools.sock` too; only from services of uid 0), `unregister`
 //! {tools: [names]}, `ping`; the notification `notifications/progress` {progressToken, message} (text for
 //! `output`). The kernel answers each request with `result` or `error` (-32602 names the first bad tool and why).
 //! kernel -> service: `tools/call` {name, arguments, _meta: {progressToken, timeout_ms}} (id = progressToken),
@@ -46,6 +47,8 @@ pub struct NewTool {
     /// The schema as the kernel lists it (its own serialisation of the parsed schema).
     pub schema: String,
     pub safety: Safety,
+    /// MC-L: the service asks for the tool to be offered on the local tools socket too (`"local": true`).
+    pub local: bool,
     /// Bytes it adds to `tools/list`.
     pub listed: usize,
 }
@@ -133,8 +136,13 @@ pub fn parse_tool(t: &Json) -> Result<NewTool, String> {
         return Err(fail(&format!("inputSchema longer than {SCHEMA_MAX} bytes")));
     }
     let safety = t.get("safety").and_then(Json::as_str).and_then(safety_of).ok_or_else(|| fail("safety must be \"read\", \"change\" or \"delete_overwrite\" (B5)"))?;
+    let local = match t.get("local") {
+        None | Some(Json::Null) => false,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err(fail("local must be true or false")),
+    };
     let listed = escaped(name) + escaped(description) + schema.len() + LIST_FIXED;
-    Ok(NewTool { name: String::from(name), description: String::from(description), schema, safety, listed })
+    Ok(NewTool { name: String::from(name), description: String::from(description), schema, safety, local, listed })
 }
 
 /// `register`'s `tools`: every one valid and no name twice, or the first problem.
@@ -196,13 +204,23 @@ pub fn result_of(msg: &Json, who: &str) -> ToolResult {
     Ok(out)
 }
 
-/// The kernel's `tools/call` to a service.
-pub fn call_line(id: u64, tool: &str, args: &Json, timeout_ms: u64) -> String {
+/// The kernel's `tools/call` to a service. `caller`: the program on this machine that called (pid, uid; MC-L,
+/// the local tools socket), None for the network side (the token's holder). The service can so apply to a
+/// local program the rules it has for that uid, and say in its own records who it was.
+/// `full`: the gate runs it for a client with a live full-access grant (MC-10); only the kernel writes `access`.
+pub fn call_line(id: u64, tool: &str, args: &Json, timeout_ms: u64, caller: Option<(u32, u32)>, full: bool) -> String {
     let mut s = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":");
     json::escape_into(tool, &mut s);
     s.push_str(",\"arguments\":");
     args.write_to(&mut s);
-    s.push_str(&format!(",\"_meta\":{{\"progressToken\":{id},\"timeout_ms\":{timeout_ms}}}}}}}\n"));
+    s.push_str(&format!(",\"_meta\":{{\"progressToken\":{id},\"timeout_ms\":{timeout_ms}"));
+    if let Some((pid, uid)) = caller {
+        s.push_str(&format!(",\"caller\":{{\"pid\":{pid},\"uid\":{uid}}}"));
+    }
+    if full {
+        s.push_str(",\"access\":\"full\"");
+    }
+    s.push_str("}}}\n");
     s
 }
 

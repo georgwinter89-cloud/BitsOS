@@ -1,5 +1,5 @@
 //! File locks (AB-5): POSIX record locks and open-file-description (OFD) locks of fcntl(2), and flock(2)
-//! locks, after linux-6.6/fs/locks.c.
+//! locks, after linux-7.3.1/fs/locks.c.
 //!
 //! - **Owners.** A POSIX lock belongs to the fd table (`fl_owner = current->files`): threads and CLONE_FILES
 //!   processes share them, fork does not inherit them, and *any* close of an fd of the file by that table

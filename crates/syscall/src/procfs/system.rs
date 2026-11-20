@@ -1,6 +1,7 @@
-//! AB-7b: the system-wide text files of /proc (linux-6.6 fs/proc/{meminfo,stat,uptime,loadavg,version}.c,
-//! fs/filesystems.c). The formatters are pure (host tests); the `render_*` functions gather the numbers.
-//! Values V2 does not keep are 0 (see the notes): page-cache, slab, page-table and IRQ counts, iowait.
+//! AB-7b: the system-wide text files of /proc (linux-7.3.1 fs/proc/{meminfo,stat,uptime,loadavg,version}.c,
+//! fs/filesystems.c).
+//! The formatters are pure (host tests); the `render_*` functions gather the numbers. Values V2 does not keep are 0
+//! (see the notes): page-cache, slab, page-table and IRQ counts, iowait.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -30,10 +31,12 @@ pub(super) struct Mem {
 /// `VMALLOC_TOTAL >> 10` with 4-level paging, as Linux prints it.
 const VMALLOC_TOTAL_KB: u64 = 34_359_738_367;
 
-/// `meminfo_proc_show` with CachyOS's configuration (ZSWAP, MEMORY_FAILURE, THP, CMA, UNACCEPTED_MEMORY) and
-/// `hugetlb_report_meminfo`. Shared memory (tmpfs, /dev/shm, memfd) is Linux's shmem: in Cached, on the anon
+/// `meminfo_proc_show` (linux-7.3.1/fs/proc/meminfo.c:164: Balloon, GPUActive and GPUReclaim follow Unaccepted
+/// unconditionally) with CachyOS's configuration (ZSWAP, MEMORY_FAILURE, THP, CMA, UNACCEPTED_MEMORY) and
+/// `hugetlb_report_meminfo`. V2 has no balloon driver and its GPU driver keeps no per-node page counters, so the
+/// three are 0. Shared memory (tmpfs, /dev/shm, memfd) is Linux's shmem: in Cached, on the anon
 /// LRU, and never reclaimable (no swap). Other page-cache pages are file pages in Cached and Active(file).
-/// MemAvailable is si_mem_available, linux-6.6/mm/show_mem.c:32 (MM-9 reclaims clean file pages).
+/// MemAvailable is si_mem_available, linux-7.3.1/mm/show_mem.c:33 (MM-9 reclaims clean file pages).
 pub(super) fn meminfo(m: &Mem) -> String {
     let mut s = String::new();
     let z = 0;
@@ -82,7 +85,7 @@ pub(super) fn meminfo(m: &Mem) -> String {
     }
     s.push_str("HardwareCorrupted:     0 kB\n");
     kb_line(&mut s, "AnonHugePages", mm::thp::anon_huge_bytes() >> 10);
-    for k in ["ShmemHugePages", "ShmemPmdMapped", "FileHugePages", "FilePmdMapped", "CmaTotal", "CmaFree", "Unaccepted"] {
+    for k in ["ShmemHugePages", "ShmemPmdMapped", "FileHugePages", "FilePmdMapped", "CmaTotal", "CmaFree", "Unaccepted", "Balloon", "GPUActive", "GPUReclaim"] {
         kb_line(&mut s, k, 0);
     }
     s.push_str("HugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\n");
@@ -214,21 +217,23 @@ fn render_loadavg() -> String {
 }
 vfs::procfile!("/proc/loadavg", render_loadavg);
 
-/// `/proc/interrupts`, the IPI rows only (INT-W7, YT-5 CR 1 / MM-tlb): the header of `show_interrupts`
-/// (linux-6.6/kernel/irq/proc.c:477-483, prec 3) and `arch_show_interrupts`' RES and TLB rows
-/// (arch/x86/kernel/irq.c:97-108), so a playback's reschedule and TLB-shootdown IPIs can be read before and
-/// after. Device IRQ rows are not listed (hw_info's msi section has them).
+/// `/proc/interrupts`, the IPI rows only (INT-W7, YT-5 CR 1 / MM-tlb): the header of `irq_seq_show`
+/// (linux-7.3.1/kernel/irq/proc.c:539, `irq_proc_calc_prec` :477 starts at 4 digits) and `arch_show_interrupts`'
+/// RES and TLB rows (linux-7.3.1/arch/x86/kernel/irq.c:177: `"%*s:"`, each count `" %10u"`), so a playback's
+/// reschedule and TLB-shootdown IPIs can be read before and after. Device IRQ rows are not listed (hw_info's msi
+/// section has them), and V2 has fewer than 10000 IRQs, so the width stays 4.
 pub(super) fn interrupts(cpus: &[(usize, u64, u64)]) -> String {
+    const PREC: usize = 4;
     let mut s = String::new();
-    let _ = write!(s, "{:11}", "");
+    let _ = write!(s, "{:w$}", "", w = PREC + 8);
     for (c, _, _) in cpus {
         let _ = write!(s, "CPU{c:<8}");
     }
     s.push('\n');
     for (name, what, pick) in [("RES", "Rescheduling interrupts", 1usize), ("TLB", "TLB shootdowns", 2)] {
-        let _ = write!(s, "{name:>3}: ");
+        let _ = write!(s, "{name:>w$}:", w = PREC);
         for &(_, res, tlb) in cpus {
-            let _ = write!(s, "{:10} ", if pick == 1 { res } else { tlb } as u32);
+            let _ = write!(s, " {:10}", if pick == 1 { res } else { tlb } as u32);
         }
         let _ = writeln!(s, "  {what}");
     }
@@ -249,7 +254,7 @@ pub(super) fn version() -> String {
 vfs::procfile!("/proc/version", version);
 
 /// `filesystems_proc_show`: the file system types V2's kernel has, in Linux's registration order (ext4 before
-/// vfat, linux-6.6/fs/Makefile:65,77), "nodev" for those without a device. pipefs and sockfs name the objects behind pipe and socket fds (their
+/// vfat, linux-7.3.1/fs/Makefile:65,77), "nodev" for those without a device. pipefs and sockfs name the objects behind pipe and socket fds (their
 /// `/proc/<pid>/fd` links) and, as on Linux, cannot be mounted by a program (mount(2) knows the types in
 /// `vfs::mount_fs::known`).
 pub(super) fn filesystems() -> String {

@@ -84,6 +84,29 @@ pub fn with_sys<R>(f: impl FnOnce(&crate::sysapi::Sys<'_>) -> R) -> Result<R, i6
     Ok(f(&crate::sysapi::Sys { vol: &vol, ns: &ns, mount: MOUNT }))
 }
 
+/// CRASHDISK: the panic record's area (`crash_area`) on the mounted boot volume.
+pub fn with_crash_area<R>(f: impl FnOnce(&crate::crash_area::Area<'_>) -> R) -> Result<R, i64> {
+    let vol = volume().ok_or(ENODEV)?;
+    let ns = vfs::root_ns();
+    Ok(f(&crate::crash_area::Area { vol: &vol, ns: &ns, mount: MOUNT }))
+}
+
+/// GP-START: [`Volume::allocate_unzeroed`] for the empty file at `path` below `/boot/BITSOS2/` of the boot view (the
+/// stick's data image while it is made, `fs-ext4` data.rs). Kernel only.
+pub fn allocate_unzeroed(path: &str, bytes: u64) -> Result<(), i64> {
+    let vol = volume().ok_or(ENODEV)?;
+    if !path.strip_prefix(MOUNT).is_some_and(|p| p.starts_with("/BITSOS2/")) {
+        return Err(EPERM);
+    }
+    let found = vfs::root_ns().lookup_path(path.as_bytes(), false)?;
+    vol.allocate_unzeroed(found.dentry.inode.meta.ino, bytes)
+}
+
+/// The whole disk the mounted boot volume lies on (the stick, or the NVMe namespace holding the ESP).
+pub fn whole_disk() -> Option<Arc<Disk>> {
+    MOUNTED.lock().as_ref().and_then(|m| m.whole.upgrade())
+}
+
 /// The mounted boot volume lies on an NVMe disk (no data.img there: fs-ext4's fallback is the stick's).
 pub fn on_nvme() -> bool {
     MOUNTED.lock().as_ref().is_some_and(|m| m.nvme)
@@ -249,7 +272,8 @@ fn mount_inner(d: Arc<Disk>) -> Result<Option<&'static str>, &'static str> {
     let dev = Arc::new(DiskDev::new(vd.clone(), start, sectors, Some(gate.clone())));
     let vol = Volume::mount(dev, Options { writable: false, stick: true }, CLOCK)?;
     let ns = vfs::root_ns();
-    match crate::glue::mount(&vol, &ns, MOUNT, false) {
+    // UPD-4: with the running version's parts bound over their places (`binds`).
+    match crate::binds::mount_boot(&vol, &ns, MOUNT) {
         // FS-13: the device as Linux names it (`mnt_devname`), so /proc/mounts shows /boot's real source.
         Ok(m) => m.sb.set_source(&source_name(d.name(), at, &scan.parts)),
         Err(e) => {
@@ -336,7 +360,7 @@ fn teardown(m: Mounted) {
     m.shut();
     m.vol.set_gone();
     let ns = vfs::root_ns();
-    let r = ns.lookup_path(MOUNT.as_bytes(), true).and_then(|p| ns.umount(&p));
+    let r = crate::binds::umount_boot(&ns, MOUNT);
     klog::event!(Warn, "fat", "stick.gone", disk = m.disk, umount = r.err().unwrap_or(0); "the boot stick went away: /boot unmounted");
 }
 

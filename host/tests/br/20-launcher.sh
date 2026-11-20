@@ -3,8 +3,8 @@
 # fake tree (a fake brave that answers LD_TRACE_LOADED_OBJECTS and writes into its --user-data-dir, a fake ld.so), a
 # fake desktop (a process with XDG_RUNTIME_DIR and a real Wayland-named socket), fake mount tables and a fake
 # pidof. Checks --check, the libraries, the desktop, the user switch, the three profile places (data volume, tar
-# on the stick with .old fallback and unclean ends, RAM), the downloads folder (BR-7), the environment and flags,
-# arguments and the exit code.
+# on the stick with .old fallback and unclean ends, RAM), the downloads folder (BR-7), the environment and flags
+# (BR-8: the GPU's), the sandbox that is always on (BR-6b), arguments and the exit code.
 # Host only, a few seconds; nothing outside the run directory, no Brave, no QEMU, no screen.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -13,9 +13,11 @@ R=${BITSOS_RUN_DIR:-$wt/target/br/launcher}/fake
 L=$wt/user/ports/brave-launcher/bitsos/brave
 BB=$wt/user/ports/busybox/out/busybox
 if [ ! -x "$BB" ]; then
+  # BusyBox is built against the program sysroot (musl); a fresh checkout has neither yet.
+  [ -d "$wt/user/sysroot/out/sysroot" ] || bash "$wt/user/sysroot/build.sh" >/dev/null 2>&1 || true
   V2_OFFLINE=1 sh "$wt/user/ports/busybox/build.sh" >/dev/null 2>&1 || true
 fi
-[ -x "$BB" ] || { echo "SKIP: no BusyBox build ($BB)"; exit 0; }
+[ -x "$BB" ] || { echo "RED: no BusyBox build ($BB): user/sysroot/build.sh or user/ports/busybox/build.sh failed"; exit 1; }
 rm -rf "$R"; mkdir -p "$R/bin" "$R/rootbin" "$R/xdg" "$R/tmp" "$R/user" "$R/data"
 fails=0
 ok() { echo "ok   $1"; }
@@ -36,12 +38,14 @@ printf '#!%s sh\n[ "$*" = "-r -p -n -f chroot / /bin/sh -c :" ] || { echo "unsha
 chmod +x "$R/bin/pidof" "$R/rootbin/id" "$R/rootbin/chpst.ok" "$R/bin/unshare"
 
 T=$R/mnt/BITSOS2/brave
-mkdir -p "$T/lib" "$T/locales" "$T/etc/fonts" "$T/share/glib-2.0/schemas" "$T/fonts" "$T/fontcache" "$T/share/mime" \
-  "$T/share/icons/Adwaita" "$T/etc/gdk-pixbuf" "$T/glycin" "$T/share/glycin-loaders/2+/conf.d" "$T/libexec"
+mkdir -p "$T/lib/gbm" "$T/lib/dri" "$T/locales" "$T/etc/fonts" "$T/share/glib-2.0/schemas" "$T/fonts" "$T/fontcache" "$T/share/mime" \
+  "$T/share/icons/Adwaita" "$T/etc/gdk-pixbuf" "$T/glycin" "$T/share/glycin-loaders/2+/conf.d" "$T/libexec" "$T/share/glvnd/egl_vendor.d"
 for f in resources.pak icudtl.dat v8_context_snapshot.bin locales/en-US.pak lib/libgtk-3.so.0 lib/libsoftokn3.so \
     lib/libfreeblpriv3.so etc/fonts/fonts.conf share/glib-2.0/schemas/gschemas.compiled fonts/a.ttf fonts/b.ttf \
     fontcache/x-le64.cache-12 share/mime/mime.cache share/icons/Adwaita/index.theme etc/gdk-pixbuf/loaders.cache \
-    glycin/glycin-image-rs share/glycin-loaders/2+/conf.d/glycin-image-rs.conf libexec/bwrap; do : >"$T/$f"; done
+    glycin/glycin-image-rs share/glycin-loaders/2+/conf.d/glycin-image-rs.conf libexec/bwrap lib/libEGL.so.1 \
+    lib/libEGL_mesa.so.0 lib/libGLESv2.so.2 lib/libgbm.so.1 lib/gbm/dri_gbm.so lib/libva.so.2 lib/libva-drm.so.2 \
+    lib/dri/radeonsi_drv_video.so share/glvnd/egl_vendor.d/50_mesa.json; do : >"$T/$f"; done
 cat >"$T/brave" <<EOF
 #!$BB sh
 if [ "\$LD_TRACE_LOADED_OBJECTS" = 1 ]; then
@@ -57,9 +61,10 @@ if [ -L "\$d/SingletonLock" ]; then
   if kill -0 "\${l#host-}" 2>/dev/null; then echo "\$*" >"$R/forward.txt"; exit 0; fi
   echo stale >"$R/lock.txt"
 else echo none >"$R/lock.txt"; fi
-case " \$* " in *" --no-sandbox "*) ;; *) if [ -e "$R/nosb" ]; then
+if [ -e "$R/nosb" ]; then
   echo "[1:1:1027/000000.000000:FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc(128)] No usable sandbox! fake"
-  echo "\$*" >"$R/args-sandboxed.txt"; exit 133; fi ;; esac
+  exit 133
+fi
 env | sort >"$R/env.txt"; echo "\$*" >"$R/args.txt"
 n=\$(cat "\$d/Cookies" 2>/dev/null || echo 0); echo \$((n + 1)) >"\$d/Cookies"
 mkdir -p "\$d/Default/Code Cache/js" "\$d/GrShaderCache"
@@ -92,8 +97,9 @@ sleep 0.2
 
 launch() { env -i BRAVE_MOUNT="$R/mnt" BRAVE_MOUNTS="$R/mounts.${MNT:-rw}" BRAVE_PATH="${XPATH:-$R/bin}" BRAVE_ALSA_SYS=/nonexistent \
   BRAVE_TMP="$R/tmp" BRAVE_USER_RUN="$R/user" BRAVE_DATA="$R/data" BRAVE_LDSO="$R/ldso" XDG_RUNTIME_DIR="$R/xdg" \
-  BRAVE_DATA_STATE="${STATE_F:-$R/nostate/data-state}" ${BRAVE_DATA_WAIT:+BRAVE_DATA_WAIT=$BRAVE_DATA_WAIT} ${BRUN:+BRAVE_RUN=$BRUN} \
-  ${WD:+WAYLAND_DISPLAY=$WD} FAKE_BITSCOMP="${DESK-$desk}" FAKE_MISSING="${FAKE_MISSING:-}" FAKE_NOUSERNS="${FAKE_NOUSERNS:-}" FAKE_USERNS_HANG="${FAKE_USERNS_HANG:-}" ${SB_SECS:+BRAVE_SANDBOX_SECS=$SB_SECS} ${SB_T:+BRAVE_SANDBOX=$SB_T} ${BRAVE_WAIT:+BRAVE_WAIT=$BRAVE_WAIT} ${THEME_T:+BRAVE_THEME=$THEME_T} LANG=de_DE.UTF-8 PATH="$R/bin" \
+  BRAVE_APPS="${BAPPS:-$R/noapps}" BRAVE_BITSRUN="$R/bitsrun" ${BSTICK:+BRAVE_TEST_STICK=$BSTICK} \
+  BRAVE_DATA_STATE="${STATE_F:-$R/nostate/data-state}" ${BRAVE_DATA_WAIT:+BRAVE_DATA_WAIT=$BRAVE_DATA_WAIT} \
+  ${WD:+WAYLAND_DISPLAY=$WD} FAKE_BITSCOMP="${DESK-$desk}" FAKE_MISSING="${FAKE_MISSING:-}" FAKE_NOUSERNS="${FAKE_NOUSERNS:-}" FAKE_USERNS_HANG="${FAKE_USERNS_HANG:-}" ${SB_SECS:+BRAVE_TEST_SANDBOX_SECS=$SB_SECS} ${BRAVE_WAIT:+BRAVE_WAIT=$BRAVE_WAIT} ${THEME_T:+BRAVE_THEME=$THEME_T} ${HOUR_T:+THEME_HOUR=$HOUR_T} LANG=de_DE.UTF-8 PATH="$R/bin" \
   "$BB" sh "$L" "$@" >"$R/${OUT:-out}" 2>&1; }
 cookie() { "$BB" tar -xOf "${1:-$PROF}" profile/Cookies 2>/dev/null; }
 has() { grep -q -- "$1" "$R/args.txt"; }
@@ -101,7 +107,7 @@ envv() { grep -qx -- "$1" "$R/env.txt"; }
 
 launch --check; rc=$?
 check "--check passes on a whole tree" '[ $rc = 0 ] && grep -qx "brave: tree $T: ok" "$R/out"'
-check "--check counts distinct libraries over brave and the dlopened ones" 'grep -qx "brave: libraries: 5 found, none missing" "$R/out"'
+check "--check counts distinct libraries over brave and the dlopened ones (BR-8: the GPU's too)" 'grep -qx "brave: libraries: 13 found, none missing" "$R/out"'
 check "--check: fonts, desktop, user, sound" 'grep -qx "brave: fonts: 2 in $T/fonts, 1 prebuilt cache file(s)" "$R/out" && grep -qx "brave: desktop: $R/xdg/wayland-bits-0" "$R/out" && grep -qx "brave: user: runs as uid $(id -u)" "$R/out" && grep -qx "brave: sound: no ALSA configuration (/nonexistent)" "$R/out"'
 check "--check: no data volume, no home yet: RAM only" 'grep -q "^brave: profile: in RAM only ($RUN/profile): no data volume at $R/data and $P is not writable for uid" "$R/out"'
 check "--check: downloads in RAM without a data volume" 'grep -qx "brave: downloads: $RUN/home/Downloads (in RAM)" "$R/out"'
@@ -109,6 +115,8 @@ FAKE_MISSING=1 launch --check; rc=$?
 check "--check fails on a missing library" '[ $rc = 1 ] && grep -qx "brave: libraries missing: libcups.so.2 => not found" "$R/out"'
 mv "$T/lib/libgtk-3.so.0" "$R/gtk"; launch --check; rc=$?
 check "--check fails on a missing file" '[ $rc = 1 ] && grep -q "^brave: tree $T: lib/libgtk-3.so.0 is missing" "$R/out"'
+launch; rc=$?
+check "PE-1: a start with a missing file says it in plain German (the desktop's card shows only that line)" '[ $rc = 1 ] && grep -q "^brave: tree $T: lib/libgtk-3.so.0 is missing" "$R/out" && [ "$(grep "^» " "$R/out")" = "» Brave startet nicht: Auf dem Stick fehlen Dateien von Brave." ]'
 mv "$R/gtk" "$T/lib/libgtk-3.so.0"
 mv "$T/share/mime/mime.cache" "$R/mime"; launch --check; rc=$?
 check "BR-7: --check fails without the MIME database" '[ $rc = 1 ] && grep -q "^brave: tree $T: share/mime/mime.cache is missing" "$R/out"'
@@ -128,7 +136,7 @@ check "no desktop: nothing starts" '[ $rc = 1 ] && grep -qx "brave: desktop: non
 XPATH="$R/rootbin:$R/bin" launch --check; rc=$?
 check "as root without id change: --check says refused" '[ $rc = 1 ] && grep -q "^brave: user: runs as uid 0: refused, root cannot hand over to uid 1000" "$R/out"'
 XPATH="$R/rootbin:$R/bin" launch; rc=$?
-check "as root without id change: refused in German and English" '[ $rc = 1 ] && grep -q "^brave: Brave startet nicht als root: " "$R/out" && grep -q "^brave: Brave does not run as root: " "$R/out" && [ ! -e "$R/args.txt" ]'
+check "as root without id change: refused in German and English" '[ $rc = 1 ] && grep -qx "» Brave startet nicht mit Verwalterrechten. Bitte als normaler Benutzer starten." "$R/out" && grep -q "^brave: Brave does not run as root: " "$R/out" && [ ! -e "$R/args.txt" ]'
 cp "$R/rootbin/chpst.ok" "$R/rootbin/chpst"
 XPATH="$R/rootbin:$R/bin" launch --check; rc=$?
 check "as root with id change: --check says uid 1000, the stick's tar profile" '[ $rc = 0 ] && grep -qx "brave: user: runs as uid 1000 (started by root: chpst -u 1000:1000)" "$R/out" && grep -q "^brave: profile: $PROF (packed back" "$R/out"'
@@ -139,9 +147,10 @@ rm -f "$R/rootbin/chpst"
 mkdir -p "$R/data/home/1000"
 MNT=data launch http://127.0.0.1:31001/ -- --lang=de; rc=$?
 check "data volume: the profile in appdata" '[ $rc = 0 ] && grep -qx "brave: profile: $R/data/appdata/brave" "$R/out" && has "--user-data-dir=$R/data/appdata/brave" && ! has "--disk-cache-dir" && [ "$(cat "$R/data/appdata/brave/Cookies")" = 1 ]'
-check "BR-1's flags without --no-sandbox, the URL and the extra arguments" 'has "^--ozone-platform=wayland --disable-gpu --password-store=basic --disable-breakpad --disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required --user-data-dir=" && has " http://127.0.0.1:31001/ --lang=de$" && ! has "-sandbox"'
+check "BR-1's flags with BR-8's GPU (ANGLE on GL, VA-API decode), without --no-sandbox, the URL and the extra arguments" 'has "^--ozone-platform=wayland --use-gl=angle --use-angle=gl --enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,VaapiIgnoreDriverChecks --password-store=basic --disable-breakpad --disable-crash-reporter --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required --enable-wayland-ime --wayland-text-input-version=3 --user-data-dir=" && has " http://127.0.0.1:31001/ --lang=de$" && ! has "-sandbox"'
 check "BR-6: the sandbox is on (namespaces probed as Brave's user)" 'grep -qx "brave: sandbox: on (user, PID and network namespaces; the kernel names seccomp in /proc: \(yes\|no\))" "$R/out"'
 check "a clean environment pointing into the tree" 'envv "LD_LIBRARY_PATH=$T/lib" && envv "FONTCONFIG_FILE=$T/etc/fonts/fonts.conf" && envv "WAYLAND_DISPLAY=wayland-bits-0" && envv "XDG_RUNTIME_DIR=$R/xdg" && envv "HOME=$RUN/home" && envv "GSETTINGS_SCHEMA_DIR=$T/share/glib-2.0/schemas" && envv "XCURSOR_PATH=$T/share/icons" && envv "LANG=de_DE.UTF-8" && ! grep -q "^FAKE_\|^BRAVE_" "$R/env.txt"'
+check "BR-8: the GPU's libraries and files from the tree" 'envv "__EGL_VENDOR_LIBRARY_FILENAMES=$T/share/glvnd/egl_vendor.d/50_mesa.json" && envv "GBM_BACKENDS_PATH=$T/lib/gbm" && envv "DRIRC_CONFIGDIR=$T/share/drirc.d" && envv "AMDGPU_ASIC_ID_TABLE_PATHS=$T/share/libdrm" && envv "LIBVA_DRIVERS_PATH=$T/lib/dri" && envv "LIBVA_DRIVER_NAME=radeonsi" && ! has "--disable-gpu"'
 check "light or unknown theme: no forced dark mode" '! has "--force-dark-mode"'
 check "BR-7: image loaders, MIME database and icons from the tree" 'envv "GDK_PIXBUF_MODULE_FILE=$T/etc/gdk-pixbuf/loaders.cache" && envv "PATH=$R/bin:$T/libexec" && envv "XDG_DATA_DIRS=$T/share:/usr/share"'
 check "BR-7: data volume: downloads into /data/home/1000/Downloads (user-dirs.dirs)" 'grep -qx "brave: downloads: $R/data/home/1000/Downloads (data volume)" "$R/out" && [ -d "$R/data/home/1000/Downloads" ] && grep -qx "XDG_DOWNLOAD_DIR=\"$R/data/home/1000/Downloads\"" "$RUN/home/.config/user-dirs.dirs"'
@@ -149,35 +158,31 @@ MNT=data launch; rc=$?
 check "data volume: the lock link of a Brave that is gone is dropped" '[ $rc = 0 ] && [ "$(cat "$R/lock.txt")" = none ] && [ "$(cat "$R/data/appdata/brave/Cookies")" = 2 ] && [ ! -e "$RUN/.lock" ]'
 THEME_T=dark MNT=data launch http://127.0.0.1:31001/; rc=$?
 check "dark desktop theme: Brave and web pages dark (--force-dark-mode)" '[ $rc = 0 ] && has " --force-dark-mode" && ! has "--no-sandbox"'
-# BR-6b: the default is BRAVE_SANDBOX=on: probed and said, never --no-sandbox; auto keeps BR-6's fallback.
-# A probe that hangs ends after BRAVE_SANDBOX_SECS (B4) and counts as no sandbox.
+# WY-SET: "Nach Uhrzeit" (auto) as the desktop: light from 07 to 19 (no settingsd here: its default hours).
+for hm in 06:dark 07:light 10:light 18:light 19:dark 23:dark; do
+  HOUR_T=${hm%:*} THEME_T=auto MNT=data launch http://127.0.0.1:31001/; rc=$?
+  if [ "${hm#*:}" = dark ]; then
+    check "theme auto at ${hm%:*} o'clock: dark like the desktop" '[ $rc = 0 ] && has " --force-dark-mode"'
+  else
+    check "theme auto at ${hm%:*} o'clock: light like the desktop" '[ $rc = 0 ] && ! has "--force-dark-mode"'
+  fi
+done
+# BR-6b: the sandbox is always on: probed and said, never --no-sandbox. A probe that hangs ends after its time (B4)
+# and counts as no sandbox.
 FAKE_USERNS_HANG=1 SB_SECS=1 MNT=data launch; rc=$?
-check "BR-6b: a hanging probe ends after its time, said as missing, Brave starts with its sandbox (Chromium decides)" '[ $rc = 0 ] && ! has "--no-sandbox" && grep -qx "brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: no answer within 1 s; BRAVE_SANDBOX=on adds no --no-sandbox: Chromium decides)" "$R/out"'
-FAKE_USERNS_HANG=1 SB_SECS=1 SB_T=auto MNT=data launch; rc=$?
-check "BR-6: auto: a hanging probe, Brave starts without the sandbox and says why" '[ $rc = 0 ] && has " --no-sandbox --user-data-dir=" && grep -qx "brave: sandbox: off (--no-sandbox; no user, PID and network namespace for uid [0-9]*: no answer within 1 s)" "$R/out"'
-# The probe passes, Chromium finds no usable sandbox: one more start with --no-sandbox (auto), none by default.
-: >"$R/nosb"; rm -f "$R/args-sandboxed.txt"
-SB_T=auto MNT=data launch; rc=$?
-check "BR-6: auto: Chromium's 'No usable sandbox!' after a passed probe: started again with --no-sandbox, said, first log kept" '[ $rc = 0 ] && [ -e "$R/args-sandboxed.txt" ] && has " --no-sandbox --user-data-dir=" && grep -qx "brave: sandbox: off (--no-sandbox; Chromium: No usable sandbox! fake); starting again" "$R/out" && grep -q "No usable sandbox" "$RUN/brave-nosandbox.log"'
-rm -f "$R/args.txt"
+check "BR-6b: a hanging probe ends after its time, said as missing, Brave starts with its sandbox (Chromium decides)" '[ $rc = 0 ] && ! has "--no-sandbox" && grep -qx "brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: no answer within 1 s; Chromium decides)" "$R/out"'
+# The probe passes, Chromium finds no usable sandbox: Brave stays ended.
+: >"$R/nosb"; rm -f "$R/args.txt"
 MNT=data launch; rc=$?
-check "BR-6b: default: Chromium's 'No usable sandbox!' ends the start (no --no-sandbox), said in English and German" '[ $rc = 133 ] && [ ! -e "$R/args.txt" ] && ! grep -q "starting again" "$R/out" && grep -qx "brave: sandbox: missing (Chromium: No usable sandbox! fake; BRAVE_SANDBOX=on: Brave stays ended)" "$R/out" && grep -q "^brave: Brave findet keine Sandbox" "$R/out"'
+check "BR-6b: Chromium's 'No usable sandbox!' ends the start (no --no-sandbox, no second start), said in English and German" '[ $rc = 133 ] && [ ! -e "$R/args.txt" ] && grep -qx "brave: sandbox: missing (Chromium: No usable sandbox! fake; Brave stays ended)" "$R/out" && grep -qx "» Brave startet nicht: Der Schutzraum, in dem Brave Webseiten öffnet, fehlt in BitsOS noch." "$R/out" && [ "$(grep -c "^» " "$R/out")" = 1 ] && grep -q "^brave:   \[.*No usable sandbox! fake$" "$R/out"'
 FAKE_NOUSERNS=1 MNT=data launch; rc=$?
-check "BR-6b: default, kernel without namespaces: the probe says missing, Chromium refuses, nothing falls back" '[ $rc = 133 ] && grep -q "^brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: unshare: unshare(0x70000000): Function not implemented; " "$R/out" && grep -q "^brave: sandbox: missing (Chromium: " "$R/out" && ! grep -q "sandbox: off" "$R/out"'
+check "BR-6b: kernel without namespaces: the probe says missing, Chromium refuses, nothing falls back" '[ $rc = 133 ] && grep -q "^brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: unshare: unshare(0x70000000): Function not implemented; " "$R/out" && grep -q "^brave: sandbox: missing (Chromium: " "$R/out" && ! grep -q "sandbox: off" "$R/out"'
 rm -f "$R/nosb"
-# A kernel without user namespaces: by default said and no --no-sandbox; auto: --no-sandbox after the flags.
+# A kernel without user namespaces: said and no --no-sandbox.
 FAKE_NOUSERNS=1 THEME_T=dark MNT=data launch http://127.0.0.1:31001/; rc=$?
-check "BR-6b: no user namespaces, default: said as missing, no --no-sandbox, the theme kept" '[ $rc = 0 ] && has "^--ozone-platform=wayland .*--autoplay-policy=no-user-gesture-required --force-dark-mode --user-data-dir=" && ! has "--no-sandbox" && grep -qx "brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: unshare: unshare(0x70000000): Function not implemented; BRAVE_SANDBOX=on adds no --no-sandbox: Chromium decides)" "$R/out"'
-FAKE_NOUSERNS=1 THEME_T=dark SB_T=auto MNT=data launch http://127.0.0.1:31001/; rc=$?
-check "BR-6: auto, no user namespaces: --no-sandbox added and said, the theme kept" '[ $rc = 0 ] && has "^--ozone-platform=wayland .*--autoplay-policy=no-user-gesture-required --force-dark-mode --no-sandbox --user-data-dir=" && grep -qx "brave: sandbox: off (--no-sandbox; no user, PID and network namespace for uid [0-9]*: unshare: unshare(0x70000000): Function not implemented)" "$R/out"'
-SB_T=off MNT=data launch; rc=$?
-check "BR-6: BRAVE_SANDBOX=off: --no-sandbox without a probe" '[ $rc = 0 ] && has " --no-sandbox --user-data-dir=" && grep -qx "brave: sandbox: off (--no-sandbox; BRAVE_SANDBOX=off)" "$R/out"'
-SB_T=on MNT=data launch; rc=$?
-check "BR-6b: BRAVE_SANDBOX=on (as the default): probed, on" '[ $rc = 0 ] && ! has "--no-sandbox" && grep -qx "brave: sandbox: on (user, PID and network namespaces; the kernel names seccomp in /proc: \(yes\|no\))" "$R/out"'
+check "BR-6b: no user namespaces: said as missing, no --no-sandbox, the theme kept" '[ $rc = 0 ] && has "^--ozone-platform=wayland .*--autoplay-policy=no-user-gesture-required --enable-wayland-ime --wayland-text-input-version=3 --force-dark-mode --user-data-dir=" && ! has "--no-sandbox" && grep -qx "brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: unshare: unshare(0x70000000): Function not implemented; Chromium decides)" "$R/out"'
 FAKE_NOUSERNS=1 MNT=data launch --check; rc=$?
 check "BR-6b: --check names a missing sandbox and fails" '[ $rc = 1 ] && grep -q "^brave: sandbox: missing (no user, PID and network namespace for uid [0-9]*: " "$R/out"'
-FAKE_NOUSERNS=1 SB_T=auto MNT=data launch --check; rc=$?
-check "BR-6: auto: --check names the fallback" '[ $rc = 0 ] && grep -q "^brave: sandbox: off (--no-sandbox; no user, PID and network namespace for uid [0-9]*: " "$R/out"'
 MNT=datafat launch --check
 check "a vfat /data is no data volume" 'grep -q "^brave: profile: $PROF (packed back after a clean end; $R/data is vfat)" "$R/out" || grep -q "^brave: profile: in RAM only .*$R/data is vfat" "$R/out"'
 MNT=data launch --check
@@ -251,12 +256,12 @@ check "a stale lock is taken over" '[ $rc = 0 ] && grep -qx "brave: the lock of 
 "$BB" sh -c 'sleep 120; :' "$L" & holder=$!; pids="$pids $holder"
 mkdir -p "$RUN/.lock"; echo $holder >"$RUN/.lock/pid"
 BRAVE_WAIT=1 launch; rc=$?
-check "a live start without Brave: nothing started" '[ $rc = 1 ] && grep -qx "brave: another start (pid $holder) holds $RUN/.lock, but no Brave runs: nothing started" "$R/out"'
+check "a live start without Brave: nothing started" '[ $rc = 1 ] && grep -qx "brave: another start (pid $holder) holds $RUN/.lock, but no Brave runs: nothing started" "$R/out" && grep -qx "» Brave wird schon gestartet, zeigt aber kein Fenster. Bitte gleich noch einmal öffnen." "$R/out"'
 kill $holder; rm -rf "$RUN/.lock"
 MNT=ro launch; rc=$?
 check "a read-only stick: RAM only, nothing written" '[ $rc = 0 ] && grep -q "^brave: profile: in RAM only: no data volume at $R/data and the stick is not mounted writable" "$R/out" && ! grep -q "saved on the stick" "$R/out"'
 
-# INT-W11: /data still coming (the kernel's state line), the stick's tar taken over once, BRAVE_RUN.
+# INT-W11: /data still coming (the kernel's state line), the stick's tar taken over once.
 mkdir -p "$R/state"; echo creating >"$R/state/data-state"
 STATE_F="$R/state/data-state" launch; rc=$?
 check "data volume being made: no wait, the stick's profile" '[ $rc = 0 ] && grep -qx "brave: profile: data volume is being made; the stick'"'"'s profile is used this time" "$R/out" && grep -q "^brave: profile: taken from the stick" "$R/out"'
@@ -272,8 +277,44 @@ MNT=data launch; rc=$?
 check "data volume: the stick's tar taken over once and renamed" '[ $rc = 0 ] && grep -qx "brave: profile: the stick'"'"'s brave_profile.tar taken over into $R/data/appdata/brave (now brave_profile.tar.imported)" "$R/out" && [ ! -e "$PROF" ] && [ -f "$PROF.imported" ] && [ "$(cat "$R/data/appdata/brave/Cookies")" = $((want + 1)) ] && [ ! -e "$R/data/appdata/brave/.import" ]'
 MNT=data launch; rc=$?
 check "data volume: a later start takes nothing over" '[ $rc = 0 ] && ! grep -q "taken over" "$R/out" && [ "$(cat "$R/data/appdata/brave/Cookies")" = $((want + 2)) ]'
-MNT=data BRUN="$R/pkgrun" launch; rc=$?
-check "BRAVE_RUN puts HOME, log and lock there" '[ $rc = 0 ] && envv "HOME=$R/pkgrun/home" && [ -f "$R/pkgrun/brave.log" ]'
+
+# BR-9: Brave installed from the programs (/apps/brave-bin) is the one Brave: every start goes to bitsrun brave-bin
+# (HOME left to passwd, the desktop's socket named), the stick's tree is not started; BRAVE_TEST_STICK=1 still
+# starts it. The fake bitsrun ends at once with Chromium's sandbox error while $R/pkgfail exists.
+printf '#!%s sh\n{ echo "args=$*"; echo "home=[$HOME]"; echo "wd=$WAYLAND_DISPLAY"; echo "uid=$(id -u)"; } >"%s/bitsrun.txt"\n[ ! -e "%s/pkgfail" ] || { echo "FATAL: No usable sandbox! fake"; exit 133; }\n' "$BB" "$R" "$R" >"$R/bitsrun"
+chmod +x "$R/bitsrun"
+# A package half removed: current without the binary is no installed Brave.
+mkdir -p "$R/apps/brave-bin/current/root/opt/brave-bin"
+rm -f "$R/args.txt" "$R/bitsrun.txt"
+BAPPS=$R/apps launch --check
+check "BR-9: --check: a package without its binary is incomplete, the stick's tree starts" 'grep -qx "brave: installed Brave: $R/apps/brave-bin is incomplete (no $R/apps/brave-bin/current/root/opt/brave-bin/brave): the stick'"'"'s tree starts" "$R/out"'
+BAPPS=$R/apps MNT=data launch; rc=$?
+check "BR-9: a package without its binary: the stick's tree starts" '[ $rc = 0 ] && [ -e "$R/args.txt" ] && [ ! -e "$R/bitsrun.txt" ]'
+rm -f "$R/args.txt"
+printf '#!/bin/sh\n' >"$R/apps/brave-bin/current/root/opt/brave-bin/brave"
+chmod +x "$R/apps/brave-bin/current/root/opt/brave-bin/brave"
+BAPPS=$R/apps launch --check
+check "BR-9: --check names the installed Brave" 'grep -qx "brave: installed Brave: $R/apps/brave-bin (every start goes to it)" "$R/out"'
+launch --check
+check "BR-9: --check without it: none" 'grep -qx "brave: installed Brave: none" "$R/out"'
+BAPPS=$R/apps MNT=data launch https://a.test/ -- --start-fullscreen; rc=$?
+check "BR-9: a start goes to the installed Brave, arguments as given" '[ $rc = 0 ] && grep -qx "args=brave-bin https://a.test/ -- --start-fullscreen" "$R/bitsrun.txt" && grep -qx "home=\[\]" "$R/bitsrun.txt" && grep -qx "wd=wayland-bits-0" "$R/bitsrun.txt" && [ ! -e "$R/args.txt" ] && grep -q "^brave: starting the installed Brave" "$R/out"'
+check "BR-9: the installed Brave's end is said, its output in the run folder's log" 'grep -qx "brave: the installed Brave ended (code 0) after [0-9]* s" "$R/out" && grep -q "^brave: starting the installed Brave (.* log $RUN/installed.log)" "$R/out"'
+# It ends with an error (Chromium found no sandbox in the view): its code, the plain German line and its last
+# lines; nothing starts in its place.
+: >"$R/pkgfail"; rm -f "$R/bitsrun.txt"
+BAPPS=$R/apps MNT=data launch https://a.test/; rc=$?
+check "BR-9: the installed Brave ends with an error: its code, plain German line, its last lines, the stick's tree not started" '[ $rc = 133 ] && [ -e "$R/bitsrun.txt" ] && [ ! -e "$R/args.txt" ] && grep -qx "brave: the installed Brave ended (code 133) after [0-9]* s" "$R/out" && grep -qx "» Brave hat sich mit einem Fehler beendet." "$R/out" && grep -qx "brave:   FATAL: No usable sandbox! fake" "$R/out"'
+rm -f "$R/pkgfail" "$R/bitsrun.txt"
+BAPPS=$R/apps BSTICK=1 MNT=data launch; rc=$?
+check "BR-9: BRAVE_TEST_STICK=1 starts the stick's tree" '[ $rc = 0 ] && [ -e "$R/args.txt" ] && [ ! -e "$R/bitsrun.txt" ]'
+rm -f "$R/args.txt"
+DESK= BAPPS=$R/apps launch; rc=$?
+check "BR-9: no desktop: the installed Brave is not started either" '[ $rc = 1 ] && [ ! -e "$R/bitsrun.txt" ] && grep -qx "brave: desktop: none runs (start the desktop first)" "$R/out"'
+cp "$R/rootbin/chpst.ok" "$R/rootbin/chpst"
+XPATH="$R/rootbin:$R/bin" BAPPS=$R/apps launch; rc=$?
+check "BR-9: started by root: bitsrun runs as uid 1000" '[ $rc = 0 ] && grep -qx "uid=1000" "$R/bitsrun.txt" && grep -qx "args=brave-bin" "$R/bitsrun.txt"'
+rm -f "$R/rootbin/chpst"
 
 if [ $fails = 0 ]; then echo "launcher: all checks passed"; rm -rf "$R"; exit 0; fi
 echo "launcher: $fails checks failed (run dir $R)"; exit 1

@@ -133,6 +133,14 @@ pub fn service_offer_for(safety: Safety, verified: bool, granted: bool) -> Optio
     if granted { Some(Offer::Gate) } else { service_offer(safety, verified) }
 }
 
+/// DB2: service tools only a client with full access (MC-10, Georg's yes at the keyboard) gets, whatever their
+/// safety: they show what Georg's programs did (bitsaccess's access log).
+const GRANT_ONLY: &[&str] = &["access_log"];
+
+pub fn grant_only(tool: &str) -> bool {
+    GRANT_ONLY.contains(&tool)
+}
+
 /// The reason for a kernel tool the table names as dropped (None: offered, or a name the table does not know,
 /// which the service answers as an unknown tool).
 pub fn known_dropped(tool: &str) -> Option<&'static str> {

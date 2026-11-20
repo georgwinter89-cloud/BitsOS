@@ -1,8 +1,9 @@
 //! The key groups settingsd brings itself. The names are an interface: WY-5 (bitscomp) reads `theme.*`, the
-//! kernel reads the CONFIG.TXT names of `kernel.*`. plan/notes/CL-1.md lists them.
+//! kernel reads the CONFIG.TXT names of `kernel.*`.
 //!
 //! Theme (plan/spec/desktop.md §2/§4): dark first, neutral colours with one accent (default holographic cyan),
-//! Exo 2 plus a monospace, scale 125 %, motion medium with a calm setting, effect level cheap until the GPU path.
+//! Exo 2 plus a monospace, scale 125 %, motion medium with a calm setting; the effects are always the full GPU ones
+//! (DECISIONS 18.11.), so they have no key.
 
 use crate::key::{Applier, KeyDef, Restart, Safety};
 use crate::value::{LEVELS_DE, Type, Value};
@@ -43,11 +44,14 @@ pub fn theme() -> Vec<KeyDef> {
     let mut v = vec![
         t(
             "theme.mode",
-            choice(&[("dark", "Dunkel"), ("light", "Hell")]),
+            choice(&[("dark", "Dunkel"), ("light", "Hell"), ("auto", "Nach Uhrzeit")]),
             text("dark"),
             "Helles oder dunkles Design",
             "Light or dark look",
         ),
+        // WY-SET: the hours of theme.mode `auto` (Georg 14.11.: light from 07:00 to 19:00).
+        t("theme.auto.light_from", int(0, 23, "Uhr"), Value::Int(7), "Nach Uhrzeit: hell ab dieser Stunde", "By time: light from this hour"),
+        t("theme.auto.dark_from", int(0, 23, "Uhr"), Value::Int(19), "Nach Uhrzeit: dunkel ab dieser Stunde", "By time: dark from this hour"),
         t(
             "theme.accent",
             Type::Color,
@@ -98,13 +102,6 @@ pub fn theme() -> Vec<KeyDef> {
             Value::Int(8),
             "Eckenradius von Fenstern und Knöpfen",
             "Corner radius of windows and buttons",
-        ),
-        t(
-            "theme.effects",
-            choice(&[("cheap", "Sparsam"), ("gpu", "GPU")]),
-            text("cheap"),
-            "Effektstufe: sparsam (ohne Grafiktreiber) oder GPU",
-            "Effect level: cheap (no GPU driver) or GPU",
         ),
         t(
             "theme.motion",
@@ -217,13 +214,6 @@ pub fn layout() -> Vec<KeyDef> {
             "Favoriten: Adressen, durch Kommas getrennt",
             "Favourites: addresses separated by commas",
         ),
-        t(
-            "claude.name",
-            Type::Text { max: 64 },
-            text("Claude"),
-            "Name des Assistenten",
-            "The assistant's name",
-        ),
     ]
 }
 
@@ -266,16 +256,6 @@ pub fn kernel() -> Vec<KeyDef> {
             "Schrift der Textkonsole",
             "Font of the text console",
             k("console_font", None),
-            Restart::Reboot,
-        ),
-        // SC-9: CONFIG idle= (sched::cstate::configure); deep uses the firmware's C2/C3 when the plan allows them.
-        def(
-            "kernel.idle",
-            choice(&[("deep", "Tiefe Schlafzustände (spart Strom)"), ("c1", "Nur leichter Schlaf (wie früher)")]),
-            text("deep"),
-            "Wie tief untätige Prozessorkerne schlafen",
-            "How deep idle processor cores sleep",
-            k("idle", None),
             Restart::Reboot,
         ),
         // SN-10: hdmi-off is an action (MCP snd, the console), not a stored value, so it is not a choice here.
@@ -336,11 +316,151 @@ pub fn own() -> Vec<KeyDef> {
     ]
 }
 
+/// The AI keys every part reads (CL-3a, CL-5s; DECISIONS 21.10.: no AI is built in by name, so every provider
+/// default is empty). Nothing applies them: `assist` reads them for each request. The provider keys
+/// `ai.provider.<id>.*` are not in this list: their names depend on the list `ai.providers`, `providers.rs`
+/// makes them. EINS (plan/spec/assistent-eins K2): one level for everything the assistant does, `ai.level`,
+/// `auto` unless Georg chooses less (DECISIONS 18.11.: everything built is on); loosening it again is his own yes
+/// (`leash.rs`).
+pub fn ai() -> Vec<KeyDef> {
+    let a = |name: &str, ty: Type, default: Value, de: &str, en: &str| {
+        def(name, ty, default, de, en, Applier::Settingsd, Restart::None)
+    };
+    let mut v = vec![a(
+        crate::leash::LEVEL,
+        choice(&[("answer", "Nur antworten"), ("ask", "Fragt vorher"), ("auto", "Automodus")]),
+        text("auto"),
+        "Wie viel der Assistent darf: nur antworten, vor jedem Eingriff fragen, oder im Automodus alles ohne Nachfrage (die festen Regeln gelten immer)",
+        "How much the assistant may do: only answer, ask before each change, or do everything unasked in automode (the fixed rules always hold)",
+    )];
+    v.extend(ai_fixed(&a));
+    v
+}
+
+/// The bytes a list of provider names may take; a role holds one of those names, so it gets the same room.
+/// Not a count of providers: a text key names its size so one key cannot fill the stick (`Type::Text`).
+const NAMES_MAX: usize = 65536;
+
+fn ai_fixed(a: &dyn Fn(&str, Type, Value, &str, &str) -> KeyDef) -> Vec<KeyDef> {
+    vec![
+        a(
+            "ai.providers",
+            Type::Text { max: NAMES_MAX },
+            text(""),
+            "Namen der eingerichteten KI-Anbieter, durch Kommas getrennt. Ein neuer Name legt einen Anbieter an; ein gestrichener Name entfernt ihn mit seinen Angaben und seinem Schlüssel",
+            "Names of the AI providers that are set up, separated by commas. A new name adds a provider; a name taken off removes it with its settings and its key",
+        ),
+        a(
+            "ai.role.chat",
+            Type::Text { max: NAMES_MAX },
+            text(""),
+            "Welcher Anbieter im Gespräch antwortet (leer: keiner)",
+            "Which provider answers in the chat (empty: none)",
+        ),
+        a(
+            "ai.role.chat_fallback",
+            Type::Text { max: NAMES_MAX },
+            text(""),
+            "Ersatz für das Gespräch, wenn der erste Anbieter nicht erreichbar ist: Namen der Reihe nach, durch Kommas getrennt (leer: keiner)",
+            "Fallback for the chat when the first provider is away: names in order, separated by commas (empty: none)",
+        ),
+        a(
+            "ai.assistant.name",
+            Type::Text { max: 64 },
+            text("Claude"),
+            "Name des Assistenten",
+            "The assistant's name",
+        ),
+        a(
+            "ai.cloud_notice",
+            Type::Bool,
+            Value::Bool(true),
+            "Am Ring zeigen, wenn etwas aus deinen Dateien an einen Anbieter in der Cloud geht („geht an …“)",
+            "Show at the ring when something from your files goes to a cloud provider (\"goes to …\")",
+        ),
+        a(
+            "ai.local_only",
+            Type::Bool,
+            Value::Bool(false),
+            "Nur lokal: kein Anbieter in der Cloud wird angesprochen",
+            "Local only: no cloud provider is contacted",
+        ),
+        a(
+            "ai.timeout_s",
+            int(1, 86_400, "s"),
+            Value::Int(600),
+            "Wie lange eine Antwort des Anbieters höchstens dauern darf",
+            "The longest a provider's answer may take",
+        ),
+        a(
+            "ai.retries",
+            int(0, 20, ""),
+            Value::Int(2),
+            "Wie oft eine Anfrage wiederholt wird, wenn der Anbieter überlastet ist oder um eine Pause bittet",
+            "How often a request is tried again when the provider is overloaded or asks for a pause",
+        ),
+        a(
+            "ai.tool_rounds",
+            int(1, 1000, ""),
+            Value::Int(20),
+            "Wie viele Werkzeug-Runden der Assistent je Frage höchstens macht",
+            "The most rounds of tool calls the assistant makes per question",
+        ),
+        a(
+            "ai.max_tokens",
+            int(256, 1_000_000, "Tokens"),
+            Value::Int(64_000),
+            "Längste Antwort (nur für Anbieter, die eine Grenze verlangen)",
+            "Longest answer (only for providers that require a limit)",
+        ),
+        // `assist --mcp` hands BitsOS's tools to another program; on (Georg 18.11.: everything built is on), that
+        // program asks him itself. Off: only what the chat runs unasked.
+        a(
+            "ai.mcp.ask_tools",
+            Type::Bool,
+            Value::Bool(true),
+            "Dürfen andere Programme über „assist --mcp“ auch Werkzeuge benutzen, die etwas ändern (das Programm fragt dich dann selbst, BitsOS fragt nicht mehr)",
+            "May other programs, through \"assist --mcp\", also use tools that change something (that program then asks you itself, BitsOS no longer does)",
+        ),
+    ]
+}
+
 pub fn all() -> Vec<KeyDef> {
     let mut v = theme();
     v.extend(kernel());
     v.extend(own());
+    v.extend(ai());
+    v.extend(machine());
     v
+}
+
+/// GP-CPU2: keys only some machines have. `kernel.cpu_policy` exists only on BitsOS (`/proc/bitsos`) with an Intel CPU
+/// that has HWP with an energy preference (`hwp_epp` in `/proc/cpuinfo`): the Gaming-PC. The Mini-PC's AMD CPU and
+/// every QEMU guest lack the flag, so their key lists and settings pages stay as they were; host tests run on Linux,
+/// where `/proc/bitsos` does not exist.
+pub fn machine() -> Vec<KeyDef> {
+    let on_bitsos = std::path::Path::new("/proc/bitsos").is_dir();
+    if on_bitsos && cpu_policy_applies(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default()) { vec![cpu_policy()] } else { Vec::new() }
+}
+
+/// Whether `/proc/cpuinfo` (its first `flags` line) names `hwp_epp` on a GenuineIntel CPU.
+pub fn cpu_policy_applies(cpuinfo: &str) -> bool {
+    let field = |name: &str| cpuinfo.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim() == name).map(|(_, v)| v.trim()));
+    field("vendor_id") == Some("GenuineIntel") && field("flags").is_some_and(|f| f.split_whitespace().any(|x| x == "hwp_epp"))
+}
+
+/// CONFIG `cpu_policy=` (GP-CPU2, read by `hal::cpu::hwp::parse_policy` at boot): Linux's two energy preferences,
+/// shown on the page "Leistung" next to the night measurements so the self-optimisation can compare them.
+pub fn cpu_policy() -> KeyDef {
+    def(
+        "kernel.cpu_policy",
+        choice(&[("balanced", "Ausgewogen (wie Linux)"), ("performance", "Höchstleistung (mehr Strom)")]),
+        text("balanced"),
+        "Wie der Prozessor zwischen Tempo und Stromverbrauch abwägt",
+        "How the processor weighs speed against power",
+        Applier::Kernel { config: "cpu_policy".into(), sys: None },
+        Restart::Reboot,
+    )
 }
 
 /// Namespaces only settingsd defines keys in. `theme` is open: bitscomp may add tokens of its own (WY-5).
@@ -349,5 +469,19 @@ pub const PRELOAD_ALL: &str = "all";
 
 pub const RESERVED: &[&str] = &["kernel", "settings"];
 /// Namespaces several owners share (each key still has one owner). `desktop` and `claude` are open too: settingsd
-/// brings their first keys (WY-5), CL-3 and later desktop items add their own.
-pub const SHARED: &[&str] = &["theme", "desktop", "claude"];
+/// brought their first keys (WY-5; `claude.name` became `ai.assistant.name` with CL-5s). `ai`: settingsd brings
+/// the fixed keys and makes the provider keys, `assist` registers the levels of the tools it finds.
+pub const SHARED: &[&str] = &["theme", "desktop", "claude", "ai"];
+/// Keys of a shared namespace that are one system program's alone (CL-S): prefix -> owner, which must be the
+/// program of that name in settingsd's own directory. Only below such a prefix does a shared namespace hold
+/// secrets, and nobody else registers a key there, so a provider key stored earlier is never adopted under
+/// another owner. "Any program from that directory" would not do: `nc` or the `settings` command live there
+/// too and say whatever their caller types.
+/// `ai.tools` (CL-T, retired with EINS): once the per-tool levels; nobody registers there any more, and the entry
+/// keeps it so (a key of that name would look like a level that counts).
+/// `ai.provider` (CL-5s): settingsd makes these keys itself from `ai.providers` (`providers.rs`), for this
+/// program; the entry still says who alone may register there (an older `assist` did).
+/// `ai.assistant` and `ai.cloud_notice` (CL-3s): the assistant reads its name (it goes into the system prompt
+/// of every question) and whether Georg is told before a question goes to a cloud provider from these.
+/// settingsd brings both keys since CL-5s; nobody else adds a key beside the name.
+pub const HOLDERS: &[(&str, &str)] = &[("ai.provider", "assist"), ("ai.tools", "assist"), ("ai.assistant", "assist"), ("ai.cloud_notice", "assist")];

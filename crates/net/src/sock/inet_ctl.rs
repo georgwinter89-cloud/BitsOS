@@ -1,6 +1,6 @@
 //! Receive ancillary data of AF_INET and AF_INET6 datagram sockets: `ip_cmsg_recv_offset`
-//! (linux-6.6/net/ipv4/ip_sockglue.c:56-74,180-200) and `ip6_datagram_recv_common_ctl` / `_specific_ctl`
-//! (linux-6.6/net/ipv6/datagram.c:600-635, order as udpv6_recvmsg, net/ipv6/udp.c:419-428). BitsOS senders
+//! (linux-7.3.1/net/ipv4/ip_sockglue.c:54-72,169-199) and `ip6_datagram_recv_common_ctl` / `_specific_ctl`
+//! (linux-7.3.1/net/ipv6/datagram.c:595-646, order as udpv6_recvmsg, net/ipv6/udp.c:557-566). BitsOS senders
 //! use the default hop limit and traffic class, so a datagram carries 64 and 0.
 
 use super::inet6::{encode_in6_as, SOL_IPV6};

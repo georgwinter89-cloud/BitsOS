@@ -295,6 +295,9 @@ pub(crate) fn irq_restore(s: IrqSave) {
     };
     if on {
         hal::cpu::enable_interrupts();
+        // The guard's lock and count went first (Linux: unlock, local_irq_restore, preempt_enable): a reschedule
+        // deferred meanwhile is acted on now that interrupts are on.
+        hal::percpu::resched_point();
     }
 }
 

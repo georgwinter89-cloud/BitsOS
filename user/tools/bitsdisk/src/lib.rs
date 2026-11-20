@@ -5,6 +5,8 @@
 
 use std::io;
 
+pub mod umzug;
+
 /// One disk of the list.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Disk {

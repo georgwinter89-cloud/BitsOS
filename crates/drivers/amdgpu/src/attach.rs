@@ -3,7 +3,7 @@
 //! snapshot, saved-5.json, broken copies). **Read-only**: nothing here writes a register or PCI configuration.
 //!
 //! V1's gate 8 (`dcn_settle`) flipped a pipe left on A1 back to A0, a write. In V2 the attach only *reports*
-//! it (`Settle`); GX-3's flip path settles before its first flip (decision in plan/notes/gx-GX-2.md).
+//! it (`Settle`); GX-3's flip path settles before its first flip (plan/spec/gpu.md §11.3).
 
 use crate::layout as l;
 use alloc::string::String;

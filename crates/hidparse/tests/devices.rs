@@ -109,7 +109,7 @@ fn six_key_keyboard_with_leds_and_consumer_keys() {
     );
     let map = InputMap::new(&d);
     // Two applications, but Consumer Control joins the keyboard's input device
-    // (hidinput_match_application, linux-6.6/drivers/hid/hid-input.c:2187-2206).
+    // (hidinput_match_application, linux-7.3.1/drivers/hid/hid-input.c:2241-2262).
     assert_eq!(map.groups.len(), 1, "consumer keys on the keyboard's device");
     let (kb, cc) = (&map.groups[0], &map.groups[0]);
     assert_eq!(kb.application, 0x10006);

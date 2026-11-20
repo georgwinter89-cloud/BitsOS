@@ -1,6 +1,6 @@
-//! MES 11 (the micro engine scheduler inside GC 11): Linux `mes_v11_0` (linux-6.6 amdgpu/mes_v11_0.c; the 27.10.
+//! MES 11 (the micro engine scheduler inside GC 11): Linux `mes_v11_0` (linux-7.3.1 amdgpu/mes_v11_0.c; the 27.10.
 //! capture ran Linux 7.1, whose mes_v11_0.c is followed where the two differ). Two pipes of ME 3: the scheduler
-//! pipe 0 runs `_mes_2` (falls back to `_mes`), the KIQ pipe 1 runs `_mes1` (amdgpu_mes.c:1398-1418); both are
+//! pipe 0 runs `_mes_2` (falls back to `_mes`), the KIQ pipe 1 runs `_mes1` (amdgpu_mes.c:778-803); both are
 //! loaded by the PSP and started here. GX-7k: the registers (`M`, (segment, dword) of gc_11_0_0_offset.h in GC's
 //! bases), their fields and Linux's values; the MQDs (`mesmqd`), the MES API frames and KIQ packets (`mesapi`).
 //! The run is `gpucore::mes`.

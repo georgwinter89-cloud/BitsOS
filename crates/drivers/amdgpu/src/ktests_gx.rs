@@ -162,13 +162,13 @@ fn classify_state() -> ktest::TestResult {
     let Some(g) = Gpu::get() else {
         return ktest::fail("no AMD GPU function (QEMU)");
     };
-    let Some(found) = probe::kept().or_else(|| fetch_carve_out(g.regs, g.display.is_ok()).ok()) else {
+    let Some(found) = probe::kept(g.regs).or_else(|| fetch_carve_out(g.regs, g.display.is_ok()).ok()) else {
         return ktest::fail("no discovery table in this boot (the carve-out gave none): run gx.disc.indirect first");
     };
     let d = disc::parse(&found.bytes).map_err(|w| format!("kept copy refused: {w}"))?;
     let w0 = crate::dcn::write_counts();
-    let (a, ta) = crate::state::classify_live(g.regs, &d);
-    let (b, tb) = crate::state::classify_live(g.regs, &d);
+    let (a, ta) = crate::state::classify_live(g.st(), g.regs, &d);
+    let (b, tb) = crate::state::classify_live(g.st(), g.regs, &d);
     kassert!(crate::dcn::write_counts() == w0, "display write log changed");
     kassert!(ta.writes == 0 && tb.writes == 0, "the owner logged writes: {ta:?} {tb:?}");
     kassert!(a.start != crate::gpucore::classify::Start::Unknown, "unknown: {:?}", a.why);
@@ -218,13 +218,13 @@ ktest::ktest!("gx.iommu.read", Safe, iommu_read);
 /// section's verdict (with the sample lines) when the CPU could not read the binary there.
 fn fetch_carve_out(regs: &crate::dcn::DcnRegs, display_attached: bool) -> Result<probe::Found, String> {
     let g = crate::gpu::Gpu::get().ok_or_else(|| String::from("no AMD GPU function"))?;
-    let copy = probe::kept();
+    let copy = probe::kept(g.regs);
     let d = copy.as_ref().and_then(|f| disc::parse(&f.bytes).ok());
     let c = crate::carve::section(probe::fb_offset(regs, d.as_ref(), probe::dcn_fb_offset(regs, display_attached)), probe::dcn_fb_offset(regs, display_attached), probe::memsize(regs).ok(), probe::gop_in_bar0(g.bar0), g.bar0.map(|b| b.1));
     match c.discovery {
         Some((phys, bytes)) if disc::parse(&bytes).is_ok() => {
             let found = probe::Found { via: probe::Via::CarveOut { phys }, bytes };
-            probe::keep(&found);
+            probe::keep(g.regs, &found);
             Ok(found)
         }
         _ => Err(c.lines.join("; ")),

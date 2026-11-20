@@ -1,6 +1,6 @@
 //! Linux-compatible signal frames on the user stack (owner: AB, item AB-6).
 //!
-//! The x86-64 `struct rt_sigframe` (linux-6.6/arch/x86/include/asm/sigframe.h:59; `ucontext` and `sigcontext`
+//! The x86-64 `struct rt_sigframe` (linux-7.3.1/arch/x86/include/asm/sigframe.h:59; `ucontext` and `sigcontext`
 //! from include/uapi/asm-generic/ucontext.h and arch/x86/include/uapi/asm/sigcontext.h) as bytes, and the user
 //! FPU image Linux puts below it (arch/x86/kernel/fpu/signal.c): the XSAVE standard format of every user state
 //! XCR0 enables, as large as the CPUID 0xD sub-leaf offsets give (SC-1's `xsave::layout` mask), with Linux's
@@ -209,8 +209,8 @@ pub fn selector_fault(cs: u16, ss: u16, uc_flags: u64) -> Option<u64> {
     None
 }
 
-/// `frame_uc_flags`: UC_STRICT_RESTORE_SS only for a signal that interrupted 64-bit code (linux-6.6/arch/x86/
-/// kernel/signal_64.c), so a 32-bit frame's sigreturn takes its SS as saved.
+/// `frame_uc_flags`: UC_STRICT_RESTORE_SS only for a signal that interrupted 64-bit code (linux-7.3.1/arch/x86/
+/// kernel/signal_64.c:149), so a 32-bit frame's sigreturn takes its SS as saved.
 pub fn frame_uc_flags(cs: u16) -> u64 {
     UC_FP_XSTATE | UC_SIGCONTEXT_SS | if cs == crate::gdt::USER_CS { UC_STRICT_RESTORE_SS } else { 0 }
 }

@@ -26,10 +26,10 @@ fn failing(_: &ToolContext, args: &Json) -> ToolResult {
 }
 
 static TOOLS: [ToolEntry; 4] = [
-    ToolEntry { name: "zz_echo", description: "Echo.", input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["text"]}"#, owner: "MC", safety: Safety::Read, handler: echo },
-    ToolEntry { name: "picture", description: "A PNG.", input_schema: r#"{"type":"object","properties":{}}"#, owner: "DP", safety: Safety::Change, handler: picture },
-    ToolEntry { name: "slow", description: "Own default deadline.", input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"timeout_ms":{"type":"integer","default":30000}}}"#, owner: "MC", safety: Safety::Read, handler: echo },
-    ToolEntry { name: "failing", description: "Fails.", input_schema: r#"{"type":"object","properties":{"how":{"type":"string"}}}"#, owner: "MC", safety: Safety::DeleteOverwrite, handler: failing },
+    ToolEntry { name: "zz_echo", description: "Echo.", input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["text"]}"#, owner: "MC", safety: Safety::Read, local: false, handler: echo },
+    ToolEntry { name: "picture", description: "A PNG.", input_schema: r#"{"type":"object","properties":{}}"#, owner: "DP", safety: Safety::Change, local: false, handler: picture },
+    ToolEntry { name: "slow", description: "Own default deadline.", input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"timeout_ms":{"type":"integer","default":30000}}}"#, owner: "MC", safety: Safety::Read, local: false, handler: echo },
+    ToolEntry { name: "failing", description: "Fails.", input_schema: r#"{"type":"object","properties":{"how":{"type":"string"}}}"#, owner: "MC", safety: Safety::DeleteOverwrite, local: false, handler: failing },
 ];
 
 const NOW: u64 = 1_000_000_000;

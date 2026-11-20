@@ -54,9 +54,12 @@ pub enum Kind {
     Access,
     /// MC-10: pairing a new client under `mcp=service` (`pair_client`): always asked.
     Pair,
+    /// PK-6f (D6): bitspkgd's `program_install`, `program_remove` and `programs_refresh` (loading the package
+    /// lists from the mirrors): Georg's yes at the machine, or his time grant (Strg+Alt+G).
+    Program,
 }
 
-pub const KINDS: [Kind; 9] = [Kind::Install, Kind::Pin, Kind::Reload, Kind::Reboot, Kind::Settings, Kind::Nvme, Kind::Other, Kind::Access, Kind::Pair];
+pub const KINDS: [Kind; 10] = [Kind::Install, Kind::Pin, Kind::Reload, Kind::Reboot, Kind::Settings, Kind::Nvme, Kind::Other, Kind::Access, Kind::Pair, Kind::Program];
 
 impl Kind {
     pub fn name(self) -> &'static str {
@@ -70,6 +73,7 @@ impl Kind {
             Kind::Other => "other",
             Kind::Access => "access",
             Kind::Pair => "pair",
+            Kind::Program => "program",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -87,6 +91,7 @@ impl Kind {
             "reload" => Kind::Reload,
             "reboot" => Kind::Reboot,
             "nvme_gate" => Kind::Nvme,
+            "program_install" | "program_remove" | "programs_refresh" => Kind::Program,
             crate::access::REQUEST_ACCESS => Kind::Access,
             crate::access::PAIR_CLIENT => Kind::Pair,
             t if t.starts_with("settings_") => Kind::Settings,
@@ -220,6 +225,9 @@ mod tests {
         assert!(Kind::Install.grantable() && Kind::Reload.grantable() && !Kind::Nvme.grantable() && !Kind::Other.grantable());
         assert_eq!((Kind::of("request_access"), Kind::of("pair_client")), (Kind::Access, Kind::Pair));
         assert!(!Kind::Access.grantable() && !Kind::Pair.grantable(), "full access and pairings are always asked");
+        assert_eq!((Kind::of("program_install"), Kind::of("program_remove"), Kind::of("programs_search")), (Kind::Program, Kind::Program, Kind::Other));
+        assert_eq!((Kind::of("programs_refresh"), Kind::of("programs_info")), (Kind::Program, Kind::Other), "the refresh fetches from mirrors: asked like an install");
+        assert!(Kind::Program.grantable(), "D6: a time grant (Strg+Alt+G) may cover programs");
         for k in KINDS {
             assert_eq!(Kind::parse(k.name()), Some(k));
         }

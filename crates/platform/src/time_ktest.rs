@@ -79,6 +79,9 @@ fn calibration() -> R {
     kassert!((time::clock::MIN_HZ..=time::clock::MAX_HZ).contains(&c.hz), "rate {} Hz", c.hz);
     kassert!(time::tsc_hz() == c.hz, "clock runs at {} Hz, calibration said {}", time::tsc_hz(), c.hz);
     kassert!(time::source() == c.source.code(), "source code {} vs {:?}", time::source(), c.source);
+    if c.hpet_trust.untrusted() {
+        return calibration_without_hpet(&c);
+    }
     if !hypervisor() {
         kassert!(matches!(c.source, time::Source::Hpet | time::Source::Reload(_)), "on hardware the HPET gives the rate (spec §7.1), got {:?} ({:?})", c.source, c.tried);
     }
@@ -94,6 +97,29 @@ fn calibration() -> R {
         }
     }
     Err(format!("clock vs HPET: {best} ppm at best in 3 tries over 200 ms (limit 200000): the clock runs at another rate"))
+}
+
+/// GP B5 (the Gaming-PC; never the Mini-PC, whose HPET is trusted): the HPET was neither started nor read, the rate
+/// is a measurement against the PM timer or the PIT, CPUID 0x15's exact rate once that measurement confirmed it, or a
+/// Reload's; and where both exist they agree to the bound the rule states.
+fn calibration_without_hpet(c: &time::Calibration) -> R {
+    kassert!(c.hpet.is_none() && time::hpet_read().is_none(), "an untrusted HPET was started ({:?})", c.hpet);
+    kassert!(!c.tried.iter().any(|t| t.0 == time::Source::Hpet), "an untrusted HPET was measured against: {:?}", c.tried);
+    kassert!(
+        matches!(c.source, time::Source::PmTimer | time::Source::Pit | time::Source::Cpuid15 | time::Source::Reload(_)),
+        "rate from {:?} ({:?})", c.source, c.tried
+    );
+    if let Some((measured, s)) = c.settled {
+        use gp_platform::clock::{RateFrom, AGREE_PPM};
+        kassert!(
+            s.from != RateFrom::MeasuredAgainstCpuid15,
+            "measured {measured} Hz and CPUID 0x15 {:?} Hz differ by {:?} ppm (limit {AGREE_PPM})", c.cpuid.leaf15_hz, s.ppm
+        );
+        if s.from == RateFrom::Cpuid15Checked {
+            kassert!(Some(c.hz) == c.cpuid.leaf15_hz && c.source == time::Source::Cpuid15, "CPUID 0x15 confirmed but not taken: {} Hz from {:?}", c.hz, c.source);
+        }
+    }
+    Ok(())
 }
 
 /// The clock agrees with the HPET to 100 ppm over 200 ms. Each end is the tightest of several back-to-back reads with
@@ -231,8 +257,8 @@ fn record_cpu(slot: usize) {
 
 /// Every online CPU's LAPIC timer runs and fires a timer armed there, on that CPU, from its interrupt.
 fn lapic_every_cpu() -> R {
-    if time::lapic::config() == time::lapic::Config::Poll {
-        return ktest::fail("hrtimer=poll");
+    if time::lapic::poll_test() {
+        return ktest::fail("ktest_timer=poll");
     }
     let cpus = online();
     FIRED_ON.cover_possible();
@@ -442,7 +468,7 @@ fn hrtimer_cancel_rearm() -> R {
 /// window, because the tick fires there by interrupt and the interrupt exit switches (CP-5 + SC-3/SC-4).
 fn preempt_busy() -> R {
     if !hal::vectors::irq_exit_hook_installed() {
-        return ktest::fail("no preemption at interrupt exit: sched::timers::tick_preempts() is false (change request 1 in plan/notes/cp-CP-5.md)");
+        return ktest::fail("no preemption at interrupt exit: sched::timers::tick_preempts() is false (CP-5's change request 1, plan/spec/core.md §7.4)");
     }
     let cpus = online();
     if cpus.len() < 2 {
@@ -506,7 +532,7 @@ fn preempt_busy() -> R {
 /// at least half of them (hardware; a quarter under QEMU) — other threads wake CPUs now and then.
 fn idle_halts() -> R {
     if !time::interrupt_driven() {
-        return ktest::fail("timers are polled (hrtimer=poll or a CPU without a LAPIC timer)");
+        return ktest::fail("timers are polled (ktest_timer=poll or a CPU without a LAPIC timer)");
     }
     let cpus = online();
     if cpus.len() < 2 {
@@ -530,7 +556,7 @@ fn idle_halts() -> R {
     let shares: Vec<String> = cpus.iter().map(|&c| format!("{c}:{}", halted[c])).collect();
     klog::event!(Info, "cp", "ktest.idle_halts", cpus = cpus.len(), duty_samples = duty, samples = SAMPLES, halted = shares.join(","));
     if duty > SAMPLES / 2 {
-        return ktest::fail(&format!("a CPU held poll duty in {duty} of {SAMPLES} samples: SC's idle loop still spins for the pollers (change request 1 in plan/notes/cp-CP-5.md)"));
+        return ktest::fail(&format!("a CPU held poll duty in {duty} of {SAMPLES} samples: SC's idle loop still spins for the pollers (CP-5's change request 1, plan/spec/core.md §7.4)"));
     }
     let need = if hypervisor() { SAMPLES / 4 } else { SAMPLES / 2 };
     let low: Vec<usize> = cpus.iter().copied().filter(|&c| c != me && halted[c] < need).collect();

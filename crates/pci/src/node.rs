@@ -146,6 +146,21 @@ impl Problem {
             Problem::AriNotEnumerated => "ari.not_enumerated",
         }
     }
+
+    /// GP-R2: what Linux 7.3.1 meets on a healthy board without a word, logged as Info instead of Warn (the
+    /// Gaming-PC's two xHCI and two I2C functions). A function found in D1-D3hot: `pci_pm_init` powers it up
+    /// silently (drivers/pci/pci.c:3201-3265 via `pci_power_up`, pci.c:1329-1395). A vendor-specific capability
+    /// (id 9, standard space) of length 0: the core walks capabilities by id and next pointer only and never reads
+    /// that length (drivers/pci/pci.h:139-171 `PCI_FIND_NEXT_CAP`); vfio, the one core-side reader of it, hides a
+    /// zero-length capability at debug level (drivers/vfio/pci/vfio_pci_config.c:1350-1356, 1589-1595). A length
+    /// of 1 or 2 (shorter than its own header) or one past the space stays a warning: that table is broken.
+    pub fn normal(&self) -> bool {
+        match *self {
+            Problem::CapBadLength { id, at, len: 0 } => id == crate::caps::id::VENDOR as u16 && at < 0x100,
+            Problem::BarPowerState { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 /// One function in the device tree.

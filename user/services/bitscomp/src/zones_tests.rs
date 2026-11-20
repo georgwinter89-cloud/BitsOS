@@ -17,6 +17,16 @@ fn header_parts() {
     assert_eq!(header_part(F, TILED2, t(), cx, cy), Part::Close);
     let (fx, fy) = centre(float_button(F, t()));
     assert_eq!(header_part(F, TILED2, t(), fx, fy), Part::Float);
+    // C (12.11.): minimise left of float; on a floating window left of maximise; the tabs end before it.
+    let (nx, ny) = centre(min_button(F, false, t()));
+    assert_eq!(header_part(F, TILED2, t(), nx, ny), Part::Minimize);
+    assert_eq!(min_button(F, false, t()).x + min_button(F, false, t()).w + 2, float_button(F, t()).x);
+    let fl = Place::Floating { index: 0 };
+    let (mx, my) = centre(min_button(F, true, t()));
+    assert_eq!(header_part(F, fl, t(), mx, my), Part::Minimize);
+    assert_eq!(min_button(F, true, t()).x + min_button(F, true, t()).w + 2, max_button(F, t()).x);
+    let last = tabs::strip(F, 2, 0, t()).tabs[1];
+    assert!(last.x + last.w <= min_button(F, false, t()).x, "the tabs end before the minimise button");
     let s = tabs::strip(F, 2, 0, t());
     for (i, &r) in s.tabs.iter().enumerate() {
         assert_eq!(header_part(F, TILED2, t(), r.x as f64 + 4.0, F.y as f64 + 1.0), Part::Tab(i), "full height");
@@ -43,8 +53,9 @@ fn overflow_chip_and_reorder_slots() {
     assert_eq!(header_part(narrow, place, t(), mx, my), Part::More);
     let first = s.tabs[0];
     assert_eq!(header_part(narrow, place, t(), first.x as f64 + 4.0, my), Part::Tab(s.first));
-    // Dragging page 0 of a three-tab strip.
-    let s = tabs::strip(F, 3, 0, t());
+    // Dragging page 0 of a three-tab strip (wide enough for three beside four buttons).
+    let s = tabs::strip(Rect { w: 480, ..F }, 3, 0, t());
+    assert!(s.more.is_none());
     let x = |i: usize| s.tabs[i].x as f64 + s.tabs[i].w as f64 * 0.75;
     assert_eq!(reorder_target(&s, 0, 0, x(0)), Drop::None, "its own place");
     assert_eq!(reorder_target(&s, 0, 0, x(1)), Drop::Reorder { tile: 0, slot: 2, to: 1 });

@@ -95,6 +95,7 @@ pub fn evaluate(e: &Engine, topics: &[Topic]) -> Value {
                 deadline: Duration::from_secs(30),
                 hidden: vec![],
                 force_doc: None,
+                anchors: vec![],
             };
             let out = e.search(&req);
             ms.push(out.took_ms);

@@ -1,6 +1,6 @@
 //! The two checksums ext4 uses: crc32c (Castagnoli) for metadata_csum, as Linux's `ext4_chksum` computes it
-//! (the raw register, no inversion before or after: linux-6.6/fs/ext4/ext4.h:2449), and crc16 (poly 0x8005,
-//! reflected; linux-6.6/lib/crc16.c) for the old `gdt_csum` group descriptors. Software tables: the kernel is
+//! (the raw register, no inversion before or after: linux-7.3.1/fs/ext4/ext4.h:2657), and crc16 (poly 0x8005,
+//! reflected; linux-7.3.1/lib/crc/crc16.c) for the old `gdt_csum` group descriptors. Software tables: the kernel is
 //! built without SSE, and the SSE4.2 `crc32` instruction would need a target-feature function.
 
 const fn table32() -> [[u32; 256]; 8] {

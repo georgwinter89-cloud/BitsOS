@@ -43,9 +43,9 @@ pub struct PhaseDef {
     pub rules: &'static [(&'static str, Rule)],
 }
 
-/// The bring-up phases of GC 11.0.1 / PSP 13.0.4 / SMU 13.0.4 (linux-6.6 amdgpu_device_ip_init order: PSP's
-/// firmware load, SMU hw_init, GFX hw_init with the RLC autoload wait, MES-KIQ, SDMA). Names are linux-6.6's
-/// asic_reg ones (MP1's in mp_13_0_4).
+/// The bring-up phases of GC 11.0.1 / PSP 13.0.4 / SMU 13.0.4 (linux-7.3.1 amdgpu_device.c:2369
+/// amdgpu_device_ip_init order: PSP's firmware load, SMU hw_init, GFX hw_init with the RLC autoload wait,
+/// MES-KIQ, SDMA). Names are linux-7.3.1's asic_reg ones (MP1's in mp_13_0_4).
 pub const PHASES: &[PhaseDef] = &[
     PhaseDef {
         name: "psp",
@@ -121,9 +121,10 @@ pub const PHASES: &[PhaseDef] = &[
         window: Some(("CGTT_GS_NGG_CLK_CTRL", "RLC_SRM_CNTL")),
         rules: &[("RLC_CSIB_ADDR", Rule::Any)],
     },
-    // GX-7j: the CP: cp_set_doorbell_range through cp_gfx_start's CP_DEVICE_ID. Linux 7.1 (the capture) maps the
-    // GFX queue through MES in between (the `mes` phase); the direct path's CP_RB0/CP_RB_ writes have no capture
-    // and are extra by design (linux-6.6 cp_gfx_resume). The CP's unhalt (CP_ME_CNTL) is compared by value apart.
+    // GX-7j: the CP: cp_set_doorbell_range through cp_gfx_start's CP_DEVICE_ID. Linux 7.1 (the capture) maps the GFX
+    // queue through MES in between (the `mes` phase); the direct path's CP_RB0/CP_RB_ writes have no capture and are
+    // extra by design (linux-7.3.1 gfx_v11_0.c:3789 cp_gfx_resume). The CP's unhalt (CP_ME_CNTL) is compared by value
+    // apart.
     PhaseDef {
         name: "gfx_ring",
         prefixes: &["CP_RB_DOORBELL_RANGE_", "CP_MEC_DOORBELL_RANGE_", "CP_RB0_", "CP_RB_", "CP_MAX_CONTEXT", "CP_DEVICE_ID"],

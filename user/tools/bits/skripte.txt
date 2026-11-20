@@ -1,0 +1,7 @@
+# The set "skripte" (PLAN K7, Georg 14.11.): <program as bitspkg names it> <its commands, linked to bits in /bin>.
+# Each program is its pacman package with its own closure (plan/PACKAGES.md 6.6, D8); nothing else is pulled.
+python  python3 python
+git     git
+curl    curl
+jq      jq
+ripgrep rg

@@ -19,6 +19,7 @@ extern crate alloc;
 
 pub mod bootart;
 pub mod bootdraw;
+pub mod bootmarks;
 pub mod bootscreen;
 pub mod bootsteps;
 pub mod stepdetail;
@@ -34,13 +35,16 @@ pub mod ldisc;
 pub mod logfilter;
 pub mod monitor;
 pub mod pointer_over;
+pub mod power_supply;
 pub mod ptm;
 pub mod pts;
 pub mod pty;
 pub mod rawkeys;
 pub mod render;
+pub mod report_page;
 pub mod repeat;
 pub mod reset;
+pub mod text_ask;
 pub mod screen;
 pub mod termios;
 pub mod tty;
@@ -54,11 +58,16 @@ mod ktests_boot;
 #[doc(hidden)]
 pub mod ktests_in4;
 mod ktests_pty;
+mod ktests_pty_inst;
 mod ktests_in6;
+mod ktests_draw;
+mod ktests_ask;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_boot;
+#[cfg(test)]
+mod tests_gs1;
 #[cfg(test)]
 mod tests_watch;
 #[cfg(test)]
@@ -72,9 +81,15 @@ mod tests_in8;
 #[cfg(test)]
 mod tests_pty;
 #[cfg(test)]
+mod tests_pty_inst;
+#[cfg(test)]
 mod tests_quiet;
 #[cfg(test)]
 mod tests_vt;
+#[cfg(test)]
+mod tests_gp;
+#[cfg(test)]
+mod tests_draw;
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -140,10 +155,25 @@ pub fn log_level() -> u8 {
     LOG_LEVEL.load(Ordering::Acquire)
 }
 
+/// GP-ROUND: the profile gaming-pc raises its own short list of lines to the screen (`logfilter::PROFILE_IMPORTANT`).
+static PROFILE_LINES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called by the kernel before `configure` (whose replay of the boot lines then shows them too) under the profile
+/// gaming-pc only. That machine has no GPU driver yet: its screen is the report page and the text console, so the
+/// boot screen and the desktop start stay off there (`bootscreen::configure`).
+pub fn set_profile_lines(on: bool) {
+    PROFILE_LINES.store(on, Ordering::Release);
+}
+
+/// The Gaming-PC's profile (`set_profile_lines`).
+pub(crate) fn gaming_pc() -> bool {
+    PROFILE_LINES.load(Ordering::Acquire)
+}
+
 struct LogSink;
 impl klog::Sink for LogSink {
     fn write_line(&self, level: klog::Level, line: &str) {
-        if logfilter::shows(log_level(), level, line) {
+        if logfilter::shows_with(log_level(), level, line, PROFILE_LINES.load(Ordering::Acquire)) {
             vt::write_line(line, screen::index_of(level_color(level)));
         }
     }
@@ -191,13 +221,12 @@ pub(crate) fn attach_log() {
 }
 
 /// CONFIG keys of the console (the kernel calls this right after `init`): `console_font=vga|noto`,
-/// `console_scrollback=<rows>`, `console_log=off|error|warn|info|debug|all` (default warn; IN-3's name
-/// `console_loglevel` is still read when `console_log` is not set), DS-4's `desktop=auto|on|off` (default auto: on
-/// real hardware the console shows the boot screen and starts the desktop, under a hypervisor it keeps the text
-/// console) and `desktop_program=<path> [args]` (default /bin/bitscomp). Attaches the log sink at the end.
+/// `console_scrollback=<rows>`, `console_log=off|error|warn|info|debug|all` (default warn) and DS-4's test key
+/// `ktest_desktop_program=<path> [args]` (the desktop is /boot/BITSOS2/bin/bitscomp). The boot screen starts here and the desktop after boot
+/// (everywhere but the Gaming-PC, where the text console stays: `gaming_pc`). Attaches the log sink at the end.
 pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
     configure_keys(get);
-    // DS-4: `desktop=` and the boot screen, before the log sink so the replayed lines only go into the text model.
+    // DS-4: the boot screen, before the log sink so the replayed lines only go into the text model.
     bootscreen::configure(get);
     attach_log();
 }
@@ -219,11 +248,10 @@ fn configure_keys(get: &dyn Fn(&str) -> Option<String>) {
             Err(_) => klog::event!(Warn, "console", "config.bad", key = "console_scrollback", value = v.as_str(); "want a number of rows"),
         }
     }
-    let log = get("console_log").map(|v| ("console_log", v)).or_else(|| get("console_loglevel").map(|v| ("console_loglevel", v)));
-    if let Some((key, v)) = log {
+    if let Some(v) = get("console_log") {
         match logfilter::parse(&v) {
             Some(n) => set_log_level(n, "config"),
-            None => klog::event!(Warn, "console", "config.bad", key = key, value = v.as_str(); "want {}; keeping {}", logfilter::CHOICES, logfilter::name(log_level())),
+            None => klog::event!(Warn, "console", "config.bad", key = "console_log", value = v.as_str(); "want {}; keeping {}", logfilter::CHOICES, logfilter::name(log_level())),
         }
     }
 }
@@ -238,7 +266,38 @@ pub fn captured() -> Vec<u8> {
     CAPTURE.lock().iter().copied().collect()
 }
 
-/// Appends `buf` to a capture ring of at most `max` bytes (only the newest `max` bytes of `buf` are copied).
+/// Appends `piece` to `CAPTURE`. The ring grows to its MiB with `console.capture` dropped: under the spin lock the
+/// heap could neither reclaim nor wait (it doubled there on every few writes until full, Mini-PC 12.11.2026).
+fn capture(piece: &[u8]) {
+    // Before the guard: the emptied smaller ring is freed after the unlock.
+    let mut fresh: Option<VecDeque<u8>> = None;
+    loop {
+        let mut ring = CAPTURE.lock();
+        let keep = (ring.len() + piece.len()).min(CAPTURE_MAX);
+        if ring.capacity() < keep {
+            match fresh.as_mut().filter(|f| f.capacity() >= keep) {
+                Some(f) => {
+                    f.extend(ring.drain(..));
+                    core::mem::swap(&mut *ring, f);
+                }
+                None => {
+                    let want = keep.max(ring.capacity().saturating_mul(2)).min(CAPTURE_MAX);
+                    drop(ring);
+                    drop(fresh.take());
+                    let mut f = VecDeque::new();
+                    f.reserve_exact(want);
+                    fresh = Some(f);
+                    continue;
+                }
+            }
+        }
+        capture_into(&mut ring, piece, CAPTURE_MAX);
+        return;
+    }
+}
+
+/// Appends `buf` to a capture ring of at most `max` bytes (only the newest `max` bytes of `buf` are copied). With
+/// room for the result (`capture`) it allocates nothing.
 pub fn capture_into(ring: &mut VecDeque<u8>, buf: &[u8], max: usize) {
     let buf = &buf[buf.len().saturating_sub(max)..];
     let over = (ring.len() + buf.len()).saturating_sub(max);
@@ -293,7 +352,7 @@ impl ConsoleDev {
                 Err(e) if done == 0 => return Err(e),
                 Err(_) => break,
             };
-            capture_into(&mut CAPTURE.lock(), piece, CAPTURE_MAX);
+            capture(piece);
             hal::serial::write_bytes(piece);
             vt::write_program(&screen);
             // Linux's `respond_string`: a report goes into the terminal's input as if typed.

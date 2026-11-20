@@ -1,4 +1,4 @@
-//! The console's side of the screen (linux-6.6/drivers/tty/vt/vt_ioctl.c KDSETMODE; V2 crates/console
+//! The console's side of the screen (linux-7.3.1/drivers/tty/vt/vt_ioctl.c:376 KDSETMODE; V2 crates/console
 //! ttyioctl.rs and vt.rs): bitscomp puts its terminal (or /dev/tty0) into KD_GRAPHICS, so the VT draws and types
 //! nothing and fbdev shows bitscomp's picture at once, and puts it back to KD_TEXT when it ends (normally, on
 //! SIGTERM/SIGINT/SIGHUP, or from the panic hook). V2 allows KDSETMODE to the terminal's session or root only
@@ -10,7 +10,7 @@
 //! WY-7: a root start that drops to the user (`drop_root`) switches to KD_GRAPHICS as root and back to KD_TEXT
 //! as the user, without CAP_SYS_TTY_CONFIG. That works on the controlling terminal (a foreground start from the
 //! console shell); a `setsid` start (/dev/tty0, no controlling terminal) gets EPERM, as on Linux
-//! (linux-6.6/drivers/tty/vt/vt_ioctl.c:746 perm), and the console comes back only through V2's reclaim above. Linux has no such
+//! (linux-7.3.1/drivers/tty/vt/vt_ioctl.c:744 perm), and the console comes back only through V2's reclaim above. Linux has no such
 //! reclaim: there the VT would stay in KD_GRAPHICS, so a dropping start on Linux must be a foreground one.
 
 use std::sync::atomic::{AtomicI32, Ordering};

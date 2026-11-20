@@ -51,20 +51,22 @@ impl Hw for LiveHw {
     fn delay_us(&mut self, _us: u64) {}
 }
 
-/// The owner's totals of this boot (kept across probes so a refused write would stay visible).
-static TOTALS: Mutex<Totals> = Mutex::named("amdgpu.bringup", Totals { writes: 0, refused: 0, failed: 0, mismatched: 0, mem_refused: 0, registers: 0 });
+/// The owner's totals of this boot are kept across probes (so a refused write would stay visible) with the device's
+/// register owner (`DcnRegs::probe_totals`).
 const WAIT_NS: u64 = 100_000_000;
 
 /// Classifies through a fresh owner with its gate shut; returns the state and the owner's totals.
-pub fn classify_live(regs: &'static DcnRegs, d: &Discovery) -> (State, Totals) {
+pub fn classify_live(dv: &crate::psplive::State, regs: &'static DcnRegs, d: &Discovery) -> (State, Totals) {
     let allowed = classify::addresses(d).into_iter().filter_map(|(_, b)| b).collect();
     let mut owner = Bringup::new(LiveHw { regs, allowed }, Gate::Refuse(READ_ONLY), LOG_KEEP);
     // GX-7f: with the stop note this boot or the kernel before left (a clean stop looks like a crash otherwise).
     let note = crate::psplive::current_note();
     // GX-7i2: and this boot's own traces (the doorbell aperture its SDMA stage turned on), before the Linux signs.
-    let st = classify::classify_traced(d, &mut |b| owner.reg_read(b), note.as_ref(), crate::psplive::own_traces());
+    // GPY: and what this boot's bring-up holds now (its own run, IH ring, GART), so its own work is no Linux sign.
+    let this = crate::psplive::this_boot(dv);
+    let st = classify::classify_boot(d, &mut |b| owner.reg_read(b), note.as_ref(), crate::psplive::own_traces(dv), this);
     let t = owner.log().totals();
-    let all = match TOTALS.lock_timeout(WAIT_NS) {
+    let all = match regs.probe_totals.lock_timeout(WAIT_NS) {
         Some(mut g) => {
             g.writes += t.writes;
             g.refused += t.refused;

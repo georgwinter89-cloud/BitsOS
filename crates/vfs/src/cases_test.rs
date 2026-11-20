@@ -924,7 +924,7 @@ pub(crate) fn program_view() -> (Arc<MountNs>, FdTable) {
 }
 
 pub(crate) const USER: Cred = Cred { uid: 1000, gid: 1000 };
-pub(crate) const SUBJECT: policy::Subject = policy::Subject { program: policy::ProgramId(7), pid: 100, uid: 1000 };
+pub(crate) const SUBJECT: policy::Subject = policy::Subject { program: policy::ProgramId(7), pid: 100, uid: 1000, tree: 0 };
 
 #[test]
 fn sys_cases() {

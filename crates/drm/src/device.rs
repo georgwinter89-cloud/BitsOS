@@ -1,6 +1,7 @@
 //! DRM devices: what a GPU backend tells the core (`Driver`), the registry with Linux's minor numbers
-//! (linux-6.6/drivers/gpu/drm/drm_drv.c:119 `drm_minor_alloc`: 64 per kind, render minors 128..191), and the
-//! CONFIG switch `drm=` that decides whether the fake GPU stands in for a missing hardware backend.
+//! (linux-7.3.1/drivers/gpu/drm/drm_drv.c:143 `drm_minor_alloc`: render minors 128..191 first, then the extended
+//! range 192..2^20-1 shared by primary and render minors, :141/:157), and the test-only CONFIG `drm=fake` that puts
+//! the fake GPU in for a missing hardware backend (QEMU scenarios).
 
 use crate::dispatch::{Ctx, Desc};
 use crate::file::DrmFile;
@@ -9,7 +10,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ksync::SpinLock;
 use linux::errno::*;
 use vfs::Errno;
@@ -18,8 +19,10 @@ use vfs::Errno;
 pub const DRM_MAJOR: u32 = 226;
 /// Render minors start here (`64 * DRM_MINOR_RENDER`).
 pub const RENDER_BASE: u32 = 128;
-/// Minors per kind (Linux's ABI: libdrm derives the kind from `minor >> 6`).
+/// Minors per kind in the legacy range (libdrm used to derive the kind from `minor >> 6`).
 pub const MINORS_PER_KIND: u32 = 64;
+/// `DRM_EXTENDED_MINOR_LIMIT` (linux-7.3.1/drivers/gpu/drm/drm_drv.c:141): 192 up to `(1 << MINORBITS) - 1`.
+pub const EXTENDED_MINORS: core::ops::RangeInclusive<u32> = 192..=(1 << 20) - 1;
 /// How long `unplug` waits for calls still inside the device (Linux `synchronize_srcu` waits without a bound;
 /// B4 wants one). After it the teardown goes on with a Warn: the driver must tolerate a late call.
 const UNPLUG_WAIT_NS: u64 = 1_000_000_000;
@@ -31,6 +34,8 @@ pub struct Features {
     pub modeset: bool,
     pub syncobj: bool,
     pub syncobj_timeline: bool,
+    /// DRIVER_ATOMIC: GET_CAP's ATOMIC_ASYNC_PAGE_FLIP follows async_page_flip.
+    pub atomic: bool,
 }
 
 /// The `mode_config` values GET_CAP reports for a KMS driver.
@@ -48,11 +53,10 @@ pub struct ModeConfig {
     pub fb_modifiers: bool,
 }
 
-/// DRM_IOCTL_VERSION's answer and the features.
+/// DRM_IOCTL_VERSION's answer and the features. No date: Linux dropped the driver date, VERSION answers "0".
 #[derive(Clone, Copy, Debug)]
 pub struct DriverInfo {
     pub name: &'static str,
-    pub date: &'static str,
     pub desc: &'static str,
     pub major: i32,
     pub minor: i32,
@@ -147,7 +151,7 @@ struct Warned {
 }
 
 pub struct Device {
-    index: u32,
+    minor: u32,
     driver: Arc<dyn Driver>,
     unique: String,
     unplugged: AtomicBool,
@@ -163,11 +167,8 @@ impl Device {
     pub fn driver(&self) -> &dyn Driver {
         &*self.driver
     }
-    pub fn index(&self) -> u32 {
-        self.index
-    }
     pub fn render_minor(&self) -> u32 {
-        RENDER_BASE + self.index
+        self.minor
     }
     /// The bus id GET_UNIQUE answers (`dev_name` of the PCI function).
     pub fn unique(&self) -> &str {
@@ -274,13 +275,41 @@ impl Drop for DevGuard<'_> {
 
 static DEVICES: SpinLock<Vec<Arc<Device>>> = SpinLock::named("drm.devices", Vec::new());
 
-/// Adds a device under the lowest free render minor (ENOSPC after 64, Linux's range).
+/// The lowest free minor of `range` in the sorted list `taken`.
+fn lowest_free(taken: &[u32], range: core::ops::RangeInclusive<u32>) -> Option<u32> {
+    let mut want = *range.start();
+    for &m in taken.iter().filter(|m| range.contains(m)) {
+        if m > want {
+            break;
+        }
+        want = m + 1;
+    }
+    range.contains(&want).then_some(want)
+}
+
+/// Adds a device under the lowest free render minor (`drm_minor_alloc`): 128..191, then the extended range
+/// (`xa_alloc`'s EBUSY when that is full too).
 pub fn register(driver: Arc<dyn Driver>) -> Result<Arc<Device>, Errno> {
+    register_at(driver, None)
+}
+
+/// GP-GPU1: `register` for a driver that keeps its own stable order of devices (amdgpu: the boot display is 0, then
+/// by PCI address). `index` asks for `renderD<128 + index>`, so a card keeps its node number whichever device comes
+/// up first; a taken or impossible wish falls back to the lowest free minor (with an event). `None` is `register`.
+pub fn register_at(driver: Arc<dyn Driver>, index: Option<u32>) -> Result<Arc<Device>, Errno> {
     let unique = driver.pci().slot_name();
     let mut l = DEVICES.lock();
-    let index = (0..MINORS_PER_KIND).find(|i| !l.iter().any(|d| d.index == *i)).ok_or(ENOSPC)?;
+    let taken: Vec<u32> = l.iter().map(|d| d.minor).collect();
+    let wished = index.and_then(|i| RENDER_BASE.checked_add(i)).filter(|m| *m < RENDER_BASE + MINORS_PER_KIND && !taken.contains(m));
+    if let (Some(i), None) = (index, wished) {
+        klog::event!(Warn, "drm", "device.minor_wish", index = i, pci = unique.as_str(); "the wished render minor is taken or out of range: the lowest free one");
+    }
+    let minor = match wished {
+        Some(m) => m,
+        None => lowest_free(&taken, RENDER_BASE..=RENDER_BASE + MINORS_PER_KIND - 1).or_else(|| lowest_free(&taken, EXTENDED_MINORS)).ok_or(EBUSY)?,
+    };
     let dev = Arc::new(Device {
-        index,
+        minor,
         driver,
         unique,
         unplugged: AtomicBool::new(false),
@@ -288,7 +317,7 @@ pub fn register(driver: Arc<dyn Driver>) -> Result<Arc<Device>, Errno> {
         warned: SpinLock::named("drm.device.warned", Warned::default()),
         unplug_wakers: crate::fence::CbList::new(),
     });
-    let at = l.iter().position(|d| d.index > index).unwrap_or(l.len());
+    let at = l.iter().position(|d| d.minor > minor).unwrap_or(l.len());
     l.insert(at, dev.clone());
     drop(l);
     let i = dev.driver.info();
@@ -347,34 +376,25 @@ pub fn by_render_minor(minor: u32) -> Option<Arc<Device>> {
     DEVICES.lock().iter().find(|d| d.render_minor() == minor).cloned()
 }
 
-// ---- CONFIG drm=auto|fake|off
+// ---- CONFIG drm=fake (test only)
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// The hardware backend registers itself when its bring-up passed (`amdgpu::hw`); until then no DRM device, as Linux without a GPU driver.
-    Auto = 0,
-    /// The fake GPU (QEMU scenarios with Mesa, the ABI diff; never needed on hardware).
-    Fake = 1,
-    /// No DRM device at all.
-    Off = 2,
-}
-
-static MODE: AtomicU8 = AtomicU8::new(Mode::Auto as u8);
+/// The fake GPU stands in at boot (QEMU scenarios with Mesa, the ABI diff; never on hardware, where the hardware
+/// backend registers itself when its bring-up passed, `amdgpu::hw`).
+static FAKE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static BOOT: ksync::Once<()> = ksync::Once::new();
 
-/// CONFIG `drm=`: the kernel calls `drm::configure(&config::get)` at boot (desk change request); without the
-/// call the mode is `auto`.
+/// CONFIG `drm=fake` and `drm_fake_hang=` (both a test's): the kernel calls `drm::configure(&config::get)` at boot;
+/// without the call there is no fake.
 pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
-    let m = match get("drm").as_deref().map(str::trim) {
-        None | Some("") | Some("auto") => Mode::Auto,
-        Some("fake") => Mode::Fake,
-        Some("off") => Mode::Off,
+    let fake = match get("drm").as_deref().map(str::trim) {
+        None | Some("") => false,
+        Some("fake") => true,
         Some(other) => {
-            klog::event!(Warn, "drm", "config.unknown", value = other; "drm= takes auto, fake or off: auto");
-            Mode::Auto
+            klog::event!(Warn, "drm", "config.unknown", value = other; "drm= takes only fake (a test's): no fake");
+            false
         }
     };
-    MODE.store(m as u8, Ordering::Release);
+    FAKE.store(fake, Ordering::Release);
     let lose = match get("drm_fake_hang").as_deref().map(str::trim) {
         None | Some("") | Some("reset") => false,
         Some("lose") => true,
@@ -390,26 +410,17 @@ pub fn configure(get: &dyn Fn(&str) -> Option<String>) {
 /// a program meets on the chip when GX-9a's ladder cannot recover. Default `reset`: Linux's recovered job timeout.
 static FAKE_LOSES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-pub fn mode() -> Mode {
-    match MODE.load(Ordering::Acquire) {
-        1 => Mode::Fake,
-        2 => Mode::Off,
-        _ => Mode::Auto,
-    }
-}
-
-/// Whether the fake GPU stands in at boot.
-pub fn fake_wanted(m: Mode) -> bool {
-    m == Mode::Fake
+/// Whether the fake GPU stands in at boot (CONFIG `drm=fake`).
+pub fn fake_wanted() -> bool {
+    FAKE.load(Ordering::Acquire)
 }
 
 /// The boot devices, once (`drm::boot`, after the VFS is up: the node goes into /dev). Under `drm=fake` the fake
 /// gets renderD128 and its node.
 pub(crate) fn boot_devices() {
     BOOT.get_or_init(|| {
-        let m = mode();
-        if !fake_wanted(m) {
-            klog::event!(Info, "drm", "fake.off", mode = format!("{m:?}").as_str(); "no fake DRM device (drm=fake gives one)");
+        if !fake_wanted() {
+            klog::event!(Info, "drm", "fake.off"; "no fake DRM device (the test-only drm=fake gives one)");
             return;
         }
         let fake = crate::fake::FakeGpu::radeon_780m();

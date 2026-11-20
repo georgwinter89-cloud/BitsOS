@@ -40,8 +40,28 @@ static PROFILE: Once<(String, String)> = Once::new();
 
 pub(crate) fn set_profile(config: &dyn Fn(&str) -> Option<String>) {
     PROFILE.get_or_init(|| {
-        (config("profile").unwrap_or_else(|| String::from("normal")), config("profile_reason").unwrap_or_else(|| String::from("-")))
+        let (p, why) = (config("profile").unwrap_or_else(|| String::from("normal")), config("profile_reason").unwrap_or_else(|| String::from("-")));
+        // GP-GUARD CR4: under the Gaming-PC's profile the line also names what the stick released.
+        if gp_platform::tiers::is_gaming_pc(Some(&p)) {
+            use gp_platform::tiers::{NET_KEY, NVME_KEY, STICK_KEY, Tiers};
+            let t = Tiers::from_values(config(NET_KEY).as_deref(), config(STICK_KEY).as_deref(), config(NVME_KEY).as_deref());
+            return (p, format!("{why} tiers={}", t.name()));
+        }
+        (p, why)
     });
+}
+
+/// GP-ROUND: the Gaming-PC's report page as text (`hw_info {"section":"report"}`); set by the kernel under the
+/// profile gaming-pc only, so every other machine's `hw_info` is what it was.
+static REPORT: Once<fn() -> Option<Vec<String>>> = Once::new();
+
+pub fn set_report_source(f: fn() -> Option<Vec<String>>) {
+    REPORT.get_or_init(|| f);
+}
+
+/// The report's lines; None when no report source exists on this machine.
+pub(crate) fn report() -> Option<Option<Vec<String>>> {
+    REPORT.get().map(|f| f())
 }
 
 /// The kernel calls this once with its BootInfo and its own version (`env!("CARGO_PKG_VERSION")` of the
@@ -60,6 +80,35 @@ pub(crate) fn set_facts(f: BootFacts) {
 pub fn facts() -> Option<BootFacts> {
     FACTS.get().copied()
 }
+
+/// One line for user space (GM-6c change request: Einstellungen > System names the generation). `generation=0`:
+/// bitsboot handed none on. After a Reload the number is still the one bitsboot started (`reload` says so).
+pub(crate) fn generation_line(f: Option<BootFacts>) -> String {
+    match f {
+        None => String::from("generation=0 reason=unknown reload=0 version=unknown\n"),
+        Some(f) => format!(
+            "generation={} reason={} reload={} version={}\n",
+            f.generation.map_or(0, |g| g.number),
+            f.generation.map_or("unknown", |g| gens::reason_name(g.reason)),
+            f.reload.unwrap_or(0),
+            f.kernel_version
+        ),
+    }
+}
+
+/// UPDATE: the build's version for hw_info: its number and date, or that it has none (a development build).
+pub fn version_text() -> String {
+    match (bitsver::NUMBER, bitsver::DATE) {
+        (0, _) => String::from("none(development)"),
+        (n, "") => format!("{n}"),
+        (n, d) => format!("{n}({d})"),
+    }
+}
+
+fn generation_render() -> String {
+    generation_line(facts())
+}
+vfs::procfile!("/proc/bitsos/generation", generation_render);
 
 pub fn reason_name(r: u32) -> &'static str {
     match r {
@@ -219,7 +268,7 @@ pub fn lines(uptime_ns: u64) -> alloc::vec::Vec<String> {
     let mut out = alloc::vec::Vec::new();
     match facts() {
         Some(f) => {
-            out.push(format!("kernel version={} uptime_s={}", f.kernel_version, uptime_ns / 1_000_000_000));
+            out.push(format!("kernel version={} uptime_s={} bitsos_version={}", f.kernel_version, uptime_ns / 1_000_000_000, version_text()));
             match f.generation {
                 Some(g) => out.push(format!(
                     "generation {} reason={} ({}{}) skipped={} flags={:#x}",
@@ -255,6 +304,14 @@ pub fn lines(uptime_ns: u64) -> alloc::vec::Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_generation_line_for_user_space() {
+        assert_eq!(generation_line(None), "generation=0 reason=unknown reload=0 version=unknown\n");
+        let g = Generation { number: 130, reason: gen_reason::NEWEST_OK, skipped: 0, flags: 0 };
+        let f = BootFacts { kernel_version: "0.1.0", generation: Some(g), reload: Some(2), boot_id: None };
+        assert_eq!(generation_line(Some(f)), "generation=130 reason=NEWEST_OK reload=2 version=0.1.0\n");
+    }
 
     fn g(number: u32, reason: u32, skipped: u32) -> Option<Generation> {
         Some(Generation { number, reason, skipped, flags: 0 })

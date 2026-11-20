@@ -141,10 +141,10 @@ pub(crate) fn wlan(ctx: &ToolContext, args: &Json) -> ToolResult {
     let cmd = parse(args)?;
     let cards: Vec<Arc<Card>> = crate::cards();
     if cards.is_empty() {
-        let why = if pci::registry::opted_in("wlan") {
-            "no RTL8852BE (10EC:B852) was found"
+        let why = if pci::gp::active() {
+            "the Gaming-PC profile holds every WLAN card (this PC is on the cable)"
         } else {
-            "wlan=on is not in CONFIG.TXT: the WLAN chip and its bridge stay untouched (R8 d)"
+            "no RTL8852BE (10EC:B852) was found"
         };
         return Ok(alloc::vec![ToolOutput::Text(format!("wlan: no card ({why})"))]);
     }
@@ -166,7 +166,7 @@ mcp::mcp_tool!(
     name: "wlan",
     owner: "WL",
     safety: Change,
-    description: "The WLAN card (RTL8852BE, attached only with wlan=on in CONFIG.TXT). action: status (default; state, SSID, BSSID, channel, signal dBm, rates, IP, default route, counters, last error, never waits), scan (channels: list of one band, default 1-13; dwell_ms 10-1000, default 120; at most 15 s in all; only without a link), join (the network of wlan_ssid=/wlan_psk= in CONFIG.TXT, the supervisor rejoins by itself), leave (no rejoin until join). The passphrase is never an argument and never shown. The cable stays the lifeline: the WLAN never takes it down.",
+    description: "The WLAN card (RTL8852BE; held under the Gaming-PC profile). action: status (default; state, SSID, BSSID, channel, signal dBm, rates, IP, default route, counters, last error, never waits), scan (channels: list of one band, default 1-13; dwell_ms 10-1000, default 120; at most 15 s in all; only without a link), join (the network of wlan_ssid=/wlan_psk= in CONFIG.TXT, the supervisor rejoins by itself), leave (no rejoin until join). The passphrase is never an argument and never shown. The cable stays the lifeline: the WLAN never takes it down.",
     schema: r#"{"type":"object","properties":{"action":{"type":"string","enum":["status","scan","join","leave"]},"channels":{"type":"array","items":{"type":"integer","minimum":1,"maximum":165}},"dwell_ms":{"type":"integer","minimum":10,"maximum":1000}}}"#,
     handler: wlan,
 );

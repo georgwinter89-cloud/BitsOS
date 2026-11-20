@@ -64,7 +64,7 @@ impl Reveal {
         self.shown.take().is_some()
     }
 
-    /// Shows `e` at once (`ctl reveal`, for the headless pictures).
+    /// Shows `e` at once (`ctl reveal`).
     pub fn show(&mut self, e: Edge) {
         self.pushing = None;
         self.shown = Some(e);

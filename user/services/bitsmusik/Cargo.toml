@@ -1,0 +1,21 @@
+[package]
+name = "bitsmusik"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS music player (GM-6m): scans Musik folders, tags and m3u lists, plays through the kernel's ALSA PCM, JSON lines on /run/user/1000/bitsmusik.sock"
+publish = false
+
+# settingsd: its JSON (no serde in the user workspace). usys: the PCM ioctls without unsafe here.
+# symphonia: Georg's decision S2 (6.11.2026), plan/spec/rust-ecosystem.md §2.8: =0.6.1, MPL-2.0, default
+# features off, only the formats the player needs (mp3 with its id3v2 tags, flac, ogg/vorbis, wav/pcm, aac/m4a).
+[dependencies]
+settingsd = { path = "../settingsd" }
+usys = { path = "../../tools/usys" }
+symphonia = { version = "=0.6.1", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "wav", "pcm", "aac", "isomp4", "id3v2"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitsmusik"
+path = "src/main.rs"

@@ -1,6 +1,6 @@
-//! Group descriptors (linux-6.6/fs/ext4/ext4.h:390 `struct ext4_group_desc`): the 32-byte and 64-byte layouts,
-//! their checksums (`ext4_group_desc_csum`, linux-6.6/fs/ext4/super.c:3224) and where the table lives
-//! (`descriptor_loc`, super.c:3530, including meta_bg).
+//! Group descriptors (linux-7.3.1/fs/ext4/ext4.h:402 `struct ext4_group_desc`): the 32-byte and 64-byte layouts,
+//! their checksums (`ext4_group_desc_csum`, linux-7.3.1/fs/ext4/super.c:3270) and where the table lives
+//! (`descriptor_loc`, super.c:3576, including meta_bg).
 
 use crate::crc::{crc16, crc32c};
 use crate::le::*;
@@ -165,7 +165,7 @@ pub fn itb_per_group(geo: &Geo) -> u64 {
 }
 
 /// Blocks at the start of group `g` that hold the superblock copy, descriptor blocks and reserved GDT
-/// (`ext4_num_base_meta_blocks`, linux-6.6/fs/ext4/balloc.c:919).
+/// (`ext4_num_base_meta_blocks`, linux-7.3.1/fs/ext4/balloc.c:931).
 pub fn base_meta_blocks(geo: &Geo, g: u32) -> u64 {
     use crate::sb::incompat::META_BG;
     let sup = geo.has_super(g) as u64;

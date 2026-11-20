@@ -1,7 +1,7 @@
 //! AB-7a: what `/proc/<pid>` needs from the process model that no syscall keeps: the image's layout (Linux
 //! `mm->{start_code, end_code, start_data, end_data, start_stack, arg_start, arg_end, env_start, env_end}` and
-//! `mm->exe_file`, set by linux-6.6/fs/binfmt_elf.c `load_elf_binary` :1193-1300 and `create_elf_tables`
-//! :335-362), the signal sets `/proc/<pid>/status` prints (fs/proc/array.c `task_sig`), and `oom_score_adj`
+//! `mm->exe_file`, set by linux-7.3.1/fs/binfmt_elf.c `load_elf_binary` :1300-1305 and `create_elf_tables`
+//! :328-355), the signal sets `/proc/<pid>/status` prints (fs/proc/array.c `task_sig`), and `oom_score_adj`
 //! (fs/proc/base.c `__set_oom_adj` :1060; V2 has no OOM killer yet, the value is kept and inherited).
 
 use crate::elf::{Elf, PAGE};
@@ -101,7 +101,7 @@ pub struct SigView {
 
 impl Group {
     /// AB-7c getrusage RUSAGE_SELF/THREAD `ru_maxrss` in pages: the earlier images' peak and the current
-    /// image's (`mm`) high-water mark (linux-6.6/kernel/sys.c:1831,1847 `setmax_mm_hiwater_rss`).
+    /// image's (`mm`) high-water mark (linux-7.3.1/kernel/sys.c:1864,1924 `setmax_mm_hiwater_rss`).
     pub fn maxrss_pages(&self, mm: &mm::AddressSpace) -> u64 {
         self.maxrss.load(Ordering::Relaxed).max(mm.hiwater_rss_pages())
     }
@@ -110,7 +110,7 @@ impl Group {
         self.cmaxrss.load(Ordering::Relaxed)
     }
     /// `getrusage(p, RUSAGE_BOTH)`'s `ru_maxrss` in pages, what wait4/waitid report for a collected child:
-    /// the larger of its own peak and its children's (linux-6.6/kernel/sys.c:1803-1832, kernel/exit.c:1192).
+    /// the larger of its own peak and its children's (linux-7.3.1/kernel/sys.c:1846-1929, kernel/exit.c:1265).
     pub fn both_maxrss_pages(&self, mm: &mm::AddressSpace) -> u64 {
         self.maxrss_pages(mm).max(self.children_maxrss_pages())
     }

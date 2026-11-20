@@ -292,6 +292,10 @@ mod tests {
         let one = text_of(&call("hw_info", r#"{"section":"memory"}"#));
         assert!(one.starts_with("== memory ==") && !one.contains("== cpu =="), "{one}");
         assert_eq!(code(&call("hw_info", r#"{"section":"disk"}"#)), Some(-32602));
+        // GP-ROUND: no report source on the host (as on the Mini-PC): "all" has no report section, the named one says why.
+        assert!(!all.contains("== report =="), "{all}");
+        let r = text_of(&call("hw_info", r#"{"section":"report"}"#));
+        assert!(r.starts_with("== report ==") && r.contains("only the Gaming-PC's profile makes one"), "{r}");
     }
 
     #[test]

@@ -1,10 +1,13 @@
 //! bitssnap (VS-2, V2-PLAN §1a B1): snapshots of /data. The kernel freezes ext4, snapshots its bitsvol volume and
 //! thaws (crates/snapshots, `/dev/bitssnap`); this tool schedules them (`serve`, started by init), keeps them by
 //! the retention rules (`retention`, settings `snap.*`), lists them and brings a file or folder back
-//! (`restore`). VS-4 builds it for CachyOS too (the rescue side).
+//! (`restore`). VS-4 builds it for CachyOS too (the rescue side). REWIND: the desktop asks through a local
+//! socket of `serve` (`local`).
 #![forbid(unsafe_code)]
 
 pub mod dev;
+pub mod local;
+pub mod local_ops;
 pub mod restore;
 pub mod restore_tool;
 pub mod retention;

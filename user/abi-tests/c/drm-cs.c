@@ -144,6 +144,11 @@ static void ib(uint32_t ip, uint32_t ring, uint32_t flags) {
     add(C_IB, &c, sizeof c);
 }
 
+static void ib_bytes(uint32_t ip, uint32_t bytes) {
+    struct chunk_ib c = {0, 0, 1ull << 32, bytes, ip, 0, 0};
+    add(C_IB, &c, sizeof c);
+}
+
 static struct list_entry entry;
 
 static void list(void) {
@@ -280,6 +285,10 @@ int main(void) {
             {"CS BO_HANDLES entry size 4, bad pointer", 1, 4, (void *)8, 1},
             {"CS BO_HANDLES no entries", 0, 8, longer, 1},
             {"CS BO_HANDLES priority 99", 1, 8, longer, 1},
+            /* Linux 7.3.1: at most 128 Ki entries (amdgpu_bo_list.c:169), checked before the entry size. */
+            {"CS BO_HANDLES 131072 entries, bad pointer", 131072, 8, (void *)8, 0},
+            {"CS BO_HANDLES 131073 entries, bad pointer", 131073, 8, (void *)8, 0},
+            {"CS BO_HANDLES 131073 entries, entry size 12", 131073, 12, (void *)8, 0},
         };
         longer[0].priority = 99;
         for (unsigned i = 0; i < sizeof ls / sizeof ls[0]; i++) {
@@ -344,6 +353,22 @@ int main(void) {
     ib(COMPUTE, 0, CE);
     unknown_in();
     res("CS CE flag on compute", submit());
+    /* Linux 7.3.1: an IB fits its ring's packet (amdgpu_cs.c:395): 0xFFFFF dwords on GFX, compute, SDMA, VPE,
+     * 0x7FFFF0 on the others. The unknown in-syncobj stops a CS whose IB passed (ENOENT): no job. */
+    ib_bytes(GFX, 0xFFFFF * 4);
+    unknown_in();
+    res("CS GFX IB of 0xFFFFF dwords", submit());
+    ib_bytes(GFX, 0xFFFFF * 4 + 4);
+    unknown_in();
+    res("CS GFX IB of 0x100000 dwords", submit());
+    ib_bytes(COMPUTE, 0xFFFFF * 4 + 4);
+    unknown_in();
+    res("CS compute IB of 0x100000 dwords", submit());
+    ib_bytes(DMA, 0xFFFFF * 4 + 4);
+    unknown_in();
+    res("CS DMA IB of 0x100000 dwords", submit());
+    /* The 0x7FFFF0 limit of the multimedia rings is a host test (crates/drm l7_tests): V2's chip backend has no
+     * VCN ring, so its answer (EINVAL for the IP type) is not CachyOS's. */
     {
         struct list_in bad = {0, 0, 1, 8, (uintptr_t)&entry};
         static struct list_entry none = {12345, 0};

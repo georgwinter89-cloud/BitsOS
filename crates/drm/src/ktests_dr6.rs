@@ -1,4 +1,4 @@
-//! DR-6 in-kernel tests (Safe, rerunnable; they need the fake GPU, `drm=fake` or the QEMU fallback, and skip
+//! DR-6 in-kernel tests (Safe, rerunnable; they need the fake GPU, `drm=fake` or the fake a ktest adds under QEMU, and fail
 //! without it): GEM objects on real `DmaPages` (frames, write-combined GTT, INFO's usage), PRIME export with the
 //! object's pages and reservation object, import of the own export, carve-outs of 512 MiB and 8 GiB, and the ABI
 //! program, whose output must be CachyOS's (host/tests/dr/fixtures/abi-drm-gem.txt, the transcript of

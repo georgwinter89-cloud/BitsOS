@@ -1,5 +1,5 @@
-//! DR-8: `DRM_IOCTL_AMDGPU_WAIT_CS` and `DRM_IOCTL_AMDGPU_WAIT_FENCES` (linux-6.6/drivers/gpu/drm/amd/amdgpu/
-//! amdgpu_cs.c:1456 and :1708): waits for jobs by context, ring and sequence number until an absolute
+//! DR-8: `DRM_IOCTL_AMDGPU_WAIT_CS` and `DRM_IOCTL_AMDGPU_WAIT_FENCES` (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/
+//! amdgpu_cs.c:1508 and :1760): waits for jobs by context, ring and sequence number until an absolute
 //! CLOCK_MONOTONIC deadline (a negative one: no deadline, `amdgpu_gem_timeout`). A deadline in the past looks
 //! once and answers at once. Waits sleep in slices and end on a kill, a signal (EINTR) or the unplug (ENODEV).
 

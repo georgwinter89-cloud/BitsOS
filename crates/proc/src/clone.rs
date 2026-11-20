@@ -1,6 +1,11 @@
-//! clone, clone3, fork and vfork (linux-6.6/kernel/fork.c `kernel_clone` :2868, `copy_process` :2240): a new
+//! clone, clone3, fork and vfork (linux-7.3.1/kernel/fork.c `kernel_clone` :2730, `copy_process` :2022): a new
 //! thread in the caller's group (CLONE_THREAD) or a new process with a copied (fork) or shared (CLONE_VM,
 //! vfork) address space.
+//!
+//! L7-PROC: clone3's Linux 7 flags CLONE_AUTOREAP (reaped at its end, no signal), CLONE_NNP (no_new_privs on the
+//! child) and CLONE_PIDFD_AUTOKILL (SIGKILL when the clone pidfd closes) with `copy_process`'s checks
+//! (:2089-2117); CLONE_PIDFD with CLONE_THREAD gives a thread pidfd. CLONE_EMPTY_MNTNS is CLONE_NEWNS whose new
+//! view holds a copy of the root mount alone (`ns::set::for_clone`, linux-7.3.1/fs/namespace.c:4420).
 //!
 //! SX-2: CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET, CLONE_NEWUTS and CLONE_NEWIPC make namespaces
 //! (`ns::set::for_clone`); the child's pid lives in the new pid namespace and the caller gets the child's number
@@ -11,8 +16,8 @@
 //!
 //! V2's limits, each refused with EINVAL and an event (Linux accepts them): cgroup and time namespaces
 //! (`ns::set`; a kernel built without them answers EINVAL too), CLONE_INTO_CGROUP, and a CLONE_THREAD without
-//! CLONE_FILES (the fd table belongs to the group's image; no libc asks for that). One approximation, recorded in
-//! plan/notes/ab-AB-4.md: CLONE_SIGHAND without CLONE_THREAD copies the actions instead of sharing them.
+//! CLONE_FILES (the fd table belongs to the group's image; no libc asks for that). One approximation (plan/spec/abi.md
+//! §3): CLONE_SIGHAND without CLONE_THREAD copies the actions instead of sharing them.
 //! FS-16: the cwd, root and umask (`vfs::FsState`) are apart from the fd table as in Linux (`copy_fs` and
 //! `copy_files`): CLONE_FS shares them, else the child gets a copy; a thread without CLONE_FS takes its own.
 
@@ -82,9 +87,28 @@ fn check(p: &Process, a: &CloneArgs) -> Result<(), Errno> {
     if f & CLONE_THREAD != 0 && (f & (CLONE_NEWUSER | CLONE_NEWPID) != 0 || !Arc::ptr_eq(&p.pid_ns, &p.nsset().pid_for_children)) {
         return Err(EINVAL);
     }
-    if f & CLONE_PIDFD != 0 && f & (CLONE_DETACHED | CLONE_THREAD) != 0 {
+    if f & CLONE_PIDFD != 0 && f & CLONE_DETACHED != 0 {
         return Err(EINVAL);
     }
+    if f & CLONE_AUTOREAP != 0 && (f & (CLONE_THREAD | CLONE_PARENT) != 0 || a.exit_signal != 0) {
+        return Err(EINVAL);
+    }
+    if f & CLONE_PARENT != 0 && p.group().autoreap.load(core::sync::atomic::Ordering::Acquire) {
+        return Err(EINVAL);
+    }
+    if f & CLONE_NNP != 0 && f & CLONE_THREAD != 0 {
+        return Err(EINVAL);
+    }
+    if f & CLONE_PIDFD_AUTOKILL != 0 {
+        if f & CLONE_PIDFD == 0 || f & CLONE_AUTOREAP == 0 || f & CLONE_THREAD != 0 {
+            return Err(EINVAL);
+        }
+        // Without CLONE_NNP the child could gain privileges after it was spawned.
+        if f & CLONE_NNP == 0 && !crate::cred::ns_capable(&p.cred(), &p.cred().user_ns, Cap::SysAdmin) {
+            return Err(EPERM);
+        }
+    }
+
     if f & CLONE_INTO_CGROUP != 0 {
         return Err(refuse(p, f, "cgroups"));
     }
@@ -121,7 +145,7 @@ pub fn clone(p: &Arc<Process>, t: &Arc<Thread>, ctx: &UserContext, a: &CloneArgs
         return Err(EINTR);
     }
     // RLIMIT_NPROC counts the real uid's tasks; exempt are the root user and CAP_SYS_RESOURCE/ADMIN
-    // (`copy_process`, linux-6.6/kernel/fork.c:2370).
+    // (`copy_process`, linux-7.3.1/kernel/fork.c:2189).
     let cred = p.cred();
     let exempt = cred.uid == 0 || capable(&cred, Cap::SysResource) || capable(&cred, Cap::SysAdmin);
     if !exempt && p.limits.get(RLIMIT_NPROC).is_some_and(|l| task::threads_of_uid(cred.uid) >= l.cur) {
@@ -154,7 +178,7 @@ pub fn clone(p: &Arc<Process>, t: &Arc<Thread>, ctx: &UserContext, a: &CloneArgs
 }
 
 /// clone3's set_tid as Linux's `alloc_pid` checks it for the child's pid namespace `ns`: no more entries than
-/// levels (and V2 honours one), 1..pid_max, a running init unless it asks for 1, CAP_CHECKPOINT_RESTORE (or
+/// levels (and V2 honours one), 1..the namespace's pid_max, a running init unless it asks for 1, CAP_CHECKPOINT_RESTORE (or
 /// CAP_SYS_ADMIN) in the namespace's user namespace (`checkpoint_restore_ns_capable`); EEXIST comes when the id
 /// is taken.
 fn wanted_tid(p: &Process, a: &CloneArgs, ns: &crate::ns::pid::PidNs) -> Result<Option<u32>, Errno> {
@@ -162,7 +186,7 @@ fn wanted_tid(p: &Process, a: &CloneArgs, ns: &crate::ns::pid::PidNs) -> Result<
         return Err(EINVAL);
     }
     let Some(t) = a.set_tid else { return Ok(None) };
-    if t < 1 || t as u32 >= crate::pid_max() {
+    if t < 1 || t as u32 >= ns.pid_max() {
         return Err(EINVAL);
     }
     let reaper_runs = if ns.is_init() { crate::find(1).is_some_and(|i| !i.is_finished()) } else { ns.reaper() != 0 };
@@ -187,7 +211,7 @@ fn wanted_tid(p: &Process, a: &CloneArgs, ns: &crate::ns::pid::PidNs) -> Result<
 }
 
 /// The new thread's alternate signal stack: the caller's, unless the child shares the memory without vfork
-/// (`sas_ss_reset`, linux-6.6/kernel/fork.c:2551): two threads on one stack would overwrite each other.
+/// (`sas_ss_reset`, linux-7.3.1/kernel/fork.c:2385): two threads on one stack would overwrite each other.
 fn child_alt_stack(t: &Thread, flags: u64) -> crate::signal::AltStack {
     if flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0 { crate::signal::AltStack::DISABLED } else { t.alt_stack() }
 }
@@ -216,19 +240,41 @@ fn new_thread(p: &Arc<Process>, t: &Thread, a: &CloneArgs, want: Option<u32>, cc
     if a.flags & CLONE_CHILD_CLEARTID != 0 {
         th.clear_child_tid.store(a.child_tid, core::sync::atomic::Ordering::Release);
     }
+    // L7-PROC: CLONE_PIDFD with CLONE_THREAD: a PIDFD_THREAD pidfd of the new thread (`copy_process` :2356).
+    let pidfd = if a.flags & CLONE_PIDFD != 0 {
+        match reserve_pidfd(p, p, a.pidfd) {
+            Ok(fd) => Some(fd),
+            Err(e) => {
+                p.pid_ns.free(tid);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+    // After the pidfd's number, before the start, as `new_process`: `kernel_clone` writes parent_tid only once
+    // `copy_process` succeeded (linux-7.3.1/kernel/fork.c:2799), so a failed clone leaves it alone.
     if a.flags & CLONE_PARENT_SETTID != 0 {
         let _ = p.mm.copy_to_user(a.parent_tid, &vtid.to_le_bytes());
     }
+    let held = th.clone();
     if let Err(e) = task::start(p, th, cctx, fpu, Some(segs), settid, t.kthread(), Some(t)) {
+        if let Some(fd) = pidfd {
+            p.fds.unreserve(fd);
+        }
         p.pid_ns.free(tid);
         return Err(if e == SpawnError::NoMemory { EAGAIN } else { e.errno() });
     }
+    if let Some(fd) = pidfd {
+        p.fds.commit(fd, crate::pidfd::new_file(p.group(), Some((tid, Some(held))), false, false));
+    }
     THREADS.inc();
+    crate::perf_hook::fork(p.pid, tid, p.pid, t.tid());
     klog::event!(Debug, "proc", "clone.thread", pid = p.pid, tid = tid, flags = klog::Hex(a.flags));
     Ok(vtid)
 }
 
-/// `copy_process`'s CLONE_PIDFD step (linux-6.6/kernel/fork.c:2531): an fd of the caller's table reserved
+/// `copy_process`'s CLONE_PIDFD step (linux-7.3.1/kernel/fork.c:2353): an fd of the caller's table reserved
 /// (close-on-exec, `get_unused_fd_flags(O_RDWR | O_CLOEXEC)`) and its number written to the `int` at `uaddr`
 /// (`put_user`). The file is published only once the child started (`fd_install` at the end of copy_process),
 /// so a failed start only gives the reserved number back and nobody sees a pidfd of a child that never ran.
@@ -287,7 +333,9 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
             let ids = Ids { tgid: pid, ppid, pgid, sid, session_leader: false, creator_tid: creator, cred: cred.clone(), pid_ns: child_pid_ns.clone(), nsset: set.clone() };
             let g = Group::new(ids, exit_signal, p.class, signals, limits, time::now_ns());
             g.set_ctty(ctty);
-            make_image(pid, name, path, argv, p.program, &cred, mm, fds, fs, ns, g, ldt)
+            // EINS-C: the assistant's tree goes with every child (CLONE_THREAD shares the group already).
+            g.inherit_tree(p.group());
+            make_image(pid, name, path, argv, p.program, &cred, mm, fds, fs, ns, g, ldt, p.exec_user_ns.clone())
         },
         want,
         &child_pid_ns,
@@ -323,9 +371,16 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
     } else {
         None
     };
+    if f & CLONE_AUTOREAP != 0 {
+        child.group().autoreap.store(true, core::sync::atomic::Ordering::Release);
+    }
     child.release();
     let th = Thread::new(child.pid, child.group());
     th.prctl().inherit(t.prctl());
+    // L7-PROC CLONE_NNP: `task_set_no_new_privs(p)` after the creator's state was copied.
+    if f & CLONE_NNP != 0 {
+        th.prctl().set_no_new_privs();
+    }
     th.ipc().undo.inherit(&t.ipc().undo, f & CLONE_SYSVSEM != 0);
     // `set_cred_user_ns`: a new user namespace gives the full bounding set.
     if f & CLONE_NEWUSER != 0 {
@@ -342,6 +397,7 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
     // FS-13: a forked child reads for its parent's preload session (Brave's zygote children). Before the start
     // (FS-15 AB-1): once running, the child may fault in pages on another CPU, and those belong to the session.
     vfs::preload::forked(p.pid, child.pid);
+    vfs::access::forked(p.pid, p.uid, child.pid);
     if let Err(e) = task::start(&child, th, cctx, fpu, Some(segs), settid, t.kthread(), None) {
         klog::event!(Warn, "proc", "clone.no_thread", pid = p.pid, child = child.pid);
         if let Some(fd) = pidfd {
@@ -352,9 +408,10 @@ fn new_process(p: &Arc<Process>, t: &Arc<Thread>, a: &CloneArgs, want: Option<u3
         return Err(if e == SpawnError::NoMemory { EAGAIN } else { e.errno() });
     }
     if let Some(fd) = pidfd {
-        p.fds.commit(fd, crate::pidfd::new_file(child.group(), false));
+        p.fds.commit(fd, crate::pidfd::new_file(child.group(), None, false, f & CLONE_PIDFD_AUTOKILL != 0));
     }
     FORKS.inc();
+    crate::perf_hook::fork(child.pid, child.pid, p.pid, t.tid());
     klog::event!(Info, "proc", "fork", pid = p.pid, child = child.pid, flags = klog::Hex(f), kind = if vfork { "vfork" } else if vm { "clone_vm" } else { "fork" });
     if vfork {
         // Linux `wait_for_vfork_done`: killable; the child's execve or end completes it.

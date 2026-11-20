@@ -15,7 +15,16 @@ fn strs(j: Option<&Json>) -> Vec<String> {
 }
 
 /// The keys that stay free text: a font name, a list of programs, a name. Anything else that is text is a set.
-const FREE_TEXT: &[&str] = &["theme.font.display", "theme.font.ui", "theme.font.mono", "desktop.favourites", "claude.name"];
+const FREE_TEXT: &[&str] = &[
+    "theme.font.display",
+    "theme.font.ui",
+    "theme.font.mono",
+    "desktop.favourites",
+    "ai.assistant.name",
+    "ai.providers",
+    "ai.role.chat",
+    "ai.role.chat_fallback",
+];
 
 #[test]
 fn every_fixed_set_key_is_a_choice_with_german_names() {
@@ -42,7 +51,6 @@ fn every_fixed_set_key_is_a_choice_with_german_names() {
         "settings.language",
         "theme.mode",
         "theme.motion",
-        "theme.effects",
         "theme.layout.address_bar",
     ] {
         let d = builtin::all().into_iter().find(|d| d.name == k).unwrap();

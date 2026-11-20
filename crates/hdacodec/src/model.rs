@@ -146,7 +146,8 @@ impl Codec {
     }
 
     /// AMD codec revision 3 or later: only the AA01 codec counts (`linux-6.6/sound/pci/hda/patch_hdmi.c:4082`,
-    /// `is_amdhdmi_rev3_or_later`; checked in SN-2).
+    /// `is_amdhdmi_rev3_or_later`; checked in SN-2; Linux 7.3.1 differs:
+    /// `linux-7.3.1/sound/hda/codecs/hdmi/atihdmi.c:17`, see plan/spec/linux7-differences.md).
     pub fn ati_rev3(&self) -> bool {
         self.vendor_id == 0x1002_AA01 && self.revision_id & 0xFF00 >= 0x0300
     }

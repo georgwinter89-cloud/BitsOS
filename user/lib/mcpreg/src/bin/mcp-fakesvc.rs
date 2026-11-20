@@ -8,6 +8,9 @@
 //!   bad   <name>        registers a tool with a bad schema, prints the refusal, exits 3
 //!   fork  <name>        <name>_fork (read), then forks: the child prints "child <pid>" and sleeps 60 s holding
 //!                       the socket, the parent exits 0 (its tools must vanish though no EOF comes)
+//!   loc   <name>        <name>_loc (read, marked local: MC-L) and <name>_net (read, not marked), both echo
+//!   ask   <socket> <line>...   MC-L: no service at all, a client of the local tools socket: sends each line,
+//!                       prints "< <answer line>" for each, "closed" when the socket ends, "done" at the end
 //! Socket: BITSOS_MCP_SOCK or /run/bitsos/mcp.sock. Prints "registered <n>" once its tools are there.
 
 use mcpreg::{Event, Reply, Safety, Service, Tool};
@@ -18,6 +21,9 @@ const SCHEMA: &str = r#"{"type":"object","properties":{"n":{"type":"integer"},"t
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("echo");
+    if mode == "ask" {
+        std::process::exit(ask(args.get(2).map(String::as_str).unwrap_or("/run/bitsos/tools.sock"), args.get(3..).unwrap_or(&[])));
+    }
     let name = args.get(2).cloned().unwrap_or_else(|| "fakesvc".to_string());
     let count: usize = args.get(3).and_then(|n| n.parse().ok()).unwrap_or(100);
     if let Err(e) = run(mode, &name, count) {
@@ -39,7 +45,8 @@ fn run(mode: &str, name: &str, count: usize) -> Result<(), mcpreg::Error> {
         "many" => (0..count).map(|i| tool(format!("{name}_t{i:03}"), Safety::Read, SCHEMA)).collect::<Result<_, _>>()?,
         "bad" => vec![tool(format!("{name}_bad"), Safety::Read, r#"{"type":"string"}"#)?],
         "fork" => vec![tool(format!("{name}_fork"), Safety::Read, SCHEMA)?],
-        other => return Err(mcpreg::Error::Protocol(format!("unknown mode {other} (echo, hang, crash, many, bad, fork)"))),
+        "loc" => vec![tool(format!("{name}_loc"), Safety::Read, SCHEMA)?.local(), tool(format!("{name}_net"), Safety::Read, SCHEMA)?],
+        other => return Err(mcpreg::Error::Protocol(format!("unknown mode {other} (echo, hang, crash, many, bad, fork, loc, ask)"))),
     };
     let n = s.register(&tools)?.len();
     println!("registered {n}");
@@ -68,6 +75,38 @@ fn run(mode: &str, name: &str, count: usize) -> Result<(), mcpreg::Error> {
         }
     }
     Ok(())
+}
+
+/// MC-L: a plain client of the local tools socket (this program is not the assistant, so the kernel's own
+/// socket refuses it; a test's door may admit it). Exit 0 when every line was answered, 2 when the socket
+/// ended first, 1 when it could not connect.
+fn ask(path: &str, lines: &[String]) -> i32 {
+    use std::io::{BufRead, BufReader};
+    let s = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("connect {path}: {e}");
+            return 1;
+        }
+    };
+    let mut r = BufReader::new(&s);
+    let mut code = 0;
+    for l in lines {
+        // A refused peer's write may fail (the kernel hung up already): its refusal line is still to read.
+        let _ = (&s).write_all(l.as_bytes()).and_then(|_| (&s).write_all(b"\n"));
+        let mut a = String::new();
+        match r.read_line(&mut a) {
+            Ok(n) if n > 0 => println!("< {}", a.trim_end()),
+            _ => {
+                println!("closed");
+                code = 2;
+                break;
+            }
+        }
+    }
+    println!("done");
+    let _ = std::io::stdout().flush();
+    code
 }
 
 /// fork(2) without libc (the user workspace has none): the child sleeps holding every fd, then exits.

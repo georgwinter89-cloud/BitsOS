@@ -1,6 +1,5 @@
-//! WY-19: which effects a frame shows, in the element order of `render::build_elements` (topmost first). Every function
-//! here returns nothing at the cheap level, so the level costs that one test. All sizes are the design's board px
-//! (Main.dc.html) on the physical grid, as the cached images draw them.
+//! WY-19: which effects a frame shows, in the element order of `render::build_elements` (topmost first). All sizes are
+//! the design's board px (Main.dc.html) on the physical grid, as the cached images draw them.
 
 use std::time::Duration;
 
@@ -10,7 +9,7 @@ use crate::chrome_render::buehne::Buehne;
 use crate::header::px_rect;
 use crate::layout::{Place, Placement, Rect};
 use crate::state::App;
-use crate::theme::{Motion, Rgba, Shadow, Theme, alpha};
+use crate::theme::{Motion, Rgba, Shadow, alpha};
 use crate::win::Window;
 
 /// CSS `backdrop-filter: blur(16px) saturate(1.25)` of `.glass`.
@@ -44,7 +43,7 @@ fn shadow(app: &mut App, key: Key, b: Rect, r: f32, (dy, blur, spread): (f32, f3
     out.push(app.fx.element(key, rect, Kind::Shadow { bx, radius, sigma, color, hole, hole_radius: r }));
 }
 
-/// The two layers of a shadow token at the GPU level, with the soft accent glow if `glow`.
+/// The two layers of a shadow token, with the soft accent glow if `glow`.
 fn shadows(app: &mut App, name: &'static str, id: u64, b: Rect, r: f32, s: &Shadow, glow: bool, out: &mut Vec<FxElement>) {
     let t = app.theme.clone();
     let k = t.board as f32;
@@ -61,9 +60,6 @@ fn shadows(app: &mut App, name: &'static str, id: u64, b: Rect, r: f32, s: &Shad
 
 /// A glass panel at `rect` (logical): the blur under its image, its shadows under that.
 pub fn panel(app: &mut App, name: &'static str, rect: Rect, radius: f32, s: &Shadow, glow: bool, out: &mut Vec<FxElement>) {
-    if !app.theme.effects_gpu {
-        return;
-    }
     let t = app.theme.clone();
     let b = px_rect(rect, t.scale);
     let sigma = GLASS_BLUR * t.board as f32;
@@ -89,6 +85,14 @@ pub fn column(app: &mut App, map: Rect, next: Rect) -> Vec<FxElement> {
     out
 }
 
+/// CL-3b: the conversation's panel in the column.
+pub fn chat(app: &mut App, r: Rect) -> Vec<FxElement> {
+    let mut out = Vec::new();
+    let t = app.theme.clone();
+    panel(app, "chat", r, t.radius_card as f32 * t.board as f32, &t.shadow_raised, false, &mut out);
+    out
+}
+
 /// The time strip.
 pub fn strip(app: &mut App, r: Rect) -> Vec<FxElement> {
     let mut out = Vec::new();
@@ -108,9 +112,6 @@ pub fn feld(app: &mut App, r: Rect) -> Vec<FxElement> {
 
 /// A classic bar: glass with square corners (a revealed one over live windows too).
 pub fn bar(app: &mut App, name: &'static str, r: Rect) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let kind = Kind::Glass { radius: 0.0, sigma: GLASS_BLUR * t.board as f32, saturate: GLASS_SATURATE };
     Some(app.fx.element((name, 0), arr(px_rect(r, t.scale)), kind))
@@ -119,7 +120,7 @@ pub fn bar(app: &mut App, name: &'static str, r: Rect) -> Option<FxElement> {
 /// The soft shadow under a window's content (over the windows below it): lifted when focused or floating.
 pub fn window(app: &mut App, p: &Placement<Window>) -> Vec<FxElement> {
     let mut out = Vec::new();
-    if !app.theme.effects_gpu || p.fullscreen {
+    if p.fullscreen {
         return out;
     }
     let t = app.theme.clone();
@@ -147,9 +148,6 @@ fn dot(app: &mut App, key: Key, (cx, cy): (f32, f32), r: f32, stroke: f32, color
 
 /// The mark's core in the header (`.breathe`): the header image leaves it out at this level.
 pub fn mark(app: &mut App, b: &Buehne, dy: f32) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let k = t.board as f32;
     let m = px_rect(b.mark, t.scale);
@@ -161,9 +159,6 @@ pub fn mark(app: &mut App, b: &Buehne, dy: f32) -> Option<FxElement> {
 
 /// Claude's small ring in the Feld pill (`.breathe`).
 pub fn feld_ring(app: &mut App, r: Rect) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let k = t.board as f32;
     let b = px_rect(r, t.scale);
@@ -173,24 +168,19 @@ pub fn feld_ring(app: &mut App, r: Rect) -> Option<FxElement> {
     Some(dot(app, ("feld-ring", 0), at, 9.0 * k * s, 2.4 * k, alpha(t.accent, a), 0.0))
 }
 
-/// The dot before the headline's label (`.pulse`).
+/// The dot before the headline (`.pulse`).
 pub fn headline_dot(app: &mut App, r: Rect) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let k = t.board as f32;
     let b = px_rect(r, t.scale);
     let now = app.fx_now();
     let a = if t.motion == Motion::Off { 1.0 } else { motion::pulse(now) };
-    Some(dot(app, ("headline-dot", 0), (b.x as f32 + 4.0 * k, b.y as f32 + 8.0 * k), 4.0 * k, 0.0, alpha(t.accent, a), 0.0))
+    let (dx, dy, dr) = crate::chrome_draw::buehne::HEADLINE_DOT;
+    Some(dot(app, ("headline-dot", 0), (b.x as f32 + dx * k, b.y as f32 + dy * k), dr * k, 0.0, alpha(t.accent, a), 0.0))
 }
 
 /// The headline's text glow (Main.dc.html's `text-shadow`): the halo of the image pushed just before it.
 pub fn halo(app: &mut App, name: &'static str, r: Rect) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let sigma = 18.0 * t.board as f32;
     let b = px_rect(r, t.scale);
@@ -202,9 +192,6 @@ pub fn halo(app: &mut App, name: &'static str, r: Rect) -> Option<FxElement> {
 
 /// Claude's ring: its dash turns on the GPU; the sprite under it keeps the outer ring and the core.
 pub fn ring(app: &mut App, name: &'static str, rect: Rect, size: f32, ring: crate::desk::Ring, dy: f32) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let b = px_rect(Rect { y: rect.y + dy.round() as i32, ..rect }, t.scale);
     let k = size * t.scale as f32 / 48.0;
@@ -222,9 +209,6 @@ pub fn ring(app: &mut App, name: &'static str, rect: Rect, size: f32, ring: crat
 
 /// The map's disc and the radar's sweep (Main.dc.html's "Übersicht": 232 px at 100, 66).
 pub fn radar(app: &mut App, map: Rect) -> Option<FxElement> {
-    if !app.theme.effects_gpu {
-        return None;
-    }
     let t = app.theme.clone();
     let k = t.board as f32;
     let m = px_rect(map, t.scale);
@@ -284,7 +268,7 @@ pub fn bezier_points(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], out
 pub fn ground(app: &mut App, full_screen: bool) -> Vec<FxElement> {
     let mut out = Vec::new();
     let t = app.theme.clone();
-    if !t.effects_gpu || full_screen || app.boot_shown() {
+    if full_screen || app.boot_shown() {
         return out;
     }
     let (w, h) = crate::chrome_render::wallpaper::output_px(app);
@@ -307,12 +291,6 @@ pub fn ground(app: &mut App, full_screen: bool) -> Vec<FxElement> {
 pub fn top(app: &mut App, full_screen: bool) -> Vec<FxElement> {
     let mut out = Vec::new();
     let t = app.theme.clone();
-    if !t.effects_gpu {
-        app.fx.still();
-        app.fx.playing = None;
-        app.fx.title = None;
-        return out;
-    }
     let now = crate::pacer::now();
     let (w, h) = crate::chrome_render::wallpaper::output_px(app);
     transition(app, now, (w, h), &mut out);
@@ -402,11 +380,6 @@ impl App {
 
 /// The arrival on another picture (a workspace, the desktop after the boot scene).
 pub const WIPE: Play = Play::Wipe;
-
-/// Whether the level is drawn.
-pub fn drawn(t: &Theme) -> bool {
-    t.effects_gpu
-}
 
 #[cfg(test)]
 mod tests {

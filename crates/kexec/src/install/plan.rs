@@ -72,6 +72,9 @@ pub enum PlanError {
     NoNumberLeft,
     /// No confirmed generation would stay as a fallback (the caller can allow it).
     NoFallback,
+    /// UPDATE: a numbered version installs only above every folder on the medium (`newest`); going back is the
+    /// explicit "back" action (a PIN to a slot still there), never an install.
+    NotNewer { want: u32, newest: u32 },
 }
 
 impl PlanError {
@@ -81,6 +84,12 @@ impl PlanError {
             PlanError::NoFallback => String::from(
                 "no confirmed (OK) generation on the stick would stay as the fallback: if the new kernel failed, bitsboot \
                  would start it again and again, and only a plug-over could help. allow_no_fallback=true installs anyway",
+            ),
+            PlanError::NotNewer { want, newest } if want == newest => format!(
+                "version {want} is installed already (\\BITSOS2\\SYS\\{want}\\): a version installs once; a new build gets a higher number from the desk"
+            ),
+            PlanError::NotNewer { want, newest } => format!(
+                "version {want} is older than generation {newest} on this medium: an install only goes forward; going back is system_pin to a generation still there (the update page's \"Zurück\")"
             ),
         }
     }
@@ -121,13 +130,24 @@ pub fn valid_pin(gens: &[Gen], pin: Option<u32>) -> Option<u32> {
 
 /// The plan for one install. `unpin`: the caller removes the pin with this install.
 pub fn install(gens: &[Gen], pin: Option<u32>, keep: u32, unpin: bool, allow_no_fallback: bool) -> Result<InstallPlan, PlanError> {
+    install_versioned(gens, pin, keep, unpin, allow_no_fallback, None)
+}
+
+/// UPDATE: `install` for a bundle of version `version` (None: a development build). A numbered bundle takes its
+/// own number as its slot (the same code has the same number on every medium), and only above every existing
+/// folder: bitsboot starts the highest number, and a kernel waiting to confirm generation n must never confirm
+/// other files that took n (RB-6). A development build keeps the old rule (one above the highest folder).
+pub fn install_versioned(gens: &[Gen], pin: Option<u32>, keep: u32, unpin: bool, allow_no_fallback: bool, version: Option<u32>) -> Result<InstallPlan, PlanError> {
     let newest = gens.iter().max_by_key(|g| g.n);
     let replaced = newest.filter(|g| !g.ok).map(|g| g.n);
     let top = newest.map_or(0, |g| g.n);
-    if top >= NUMBER_MAX {
-        return Err(PlanError::NoNumberLeft);
-    }
-    let number = top + 1;
+    let number = match version {
+        Some(v) if v <= top => return Err(PlanError::NotNewer { want: v, newest: top }),
+        Some(v) if v > NUMBER_MAX => return Err(PlanError::NoNumberLeft),
+        Some(v) => v,
+        None if top >= NUMBER_MAX => return Err(PlanError::NoNumberLeft),
+        None => top + 1,
+    };
     // The stick after the replacement, with the new generation (unconfirmed, newest).
     let mut after: Vec<Gen> = gens.iter().filter(|g| Some(g.n) != replaced).copied().collect();
     after.push(Gen { n: number, new: true, kernel: true, initrd: true, ..Gen::default() });
@@ -140,6 +160,17 @@ pub fn install(gens: &[Gen], pin: Option<u32>, keep: u32, unpin: bool, allow_no_
     let freed = gens.iter().filter(|g| Some(g.n) == replaced || gone.contains(&g.n)).map(|g| g.bytes).sum();
     let pinned_instead = if unpin { None } else { valid_pin(gens, pin) };
     Ok(InstallPlan { number, replaced, tidy: tidy(&after, &gone), prune: gone, fallback, pinned_instead, freed })
+}
+
+/// UPDATE ("Zurück zur vorherigen Version"): the generation a PIN takes the machine back to: the newest confirmed
+/// one with both files below `from` (the running generation, or the newest when nothing is known).
+pub fn back_target(gens: &[Gen], from: Option<u32>) -> Result<u32, String> {
+    let from = from.or_else(|| gens.iter().map(|g| g.n).max()).unwrap_or(0);
+    gens.iter()
+        .filter(|g| g.ok && g.kernel && g.initrd && g.n < from)
+        .map(|g| g.n)
+        .max()
+        .ok_or_else(|| format!("no confirmed generation older than {from} is left on this medium"))
 }
 
 /// What the kernel's own confirmation of generation `n` does.

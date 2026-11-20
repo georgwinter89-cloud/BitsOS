@@ -1,6 +1,6 @@
 //! File content on the volume: reading through the block mapping (holes and unwritten extents read zero),
-//! writing a run of pages in the order data needs (blocks marked used, then the data, then the extents and
-//! the inode that point at it), truncate, the orphan list and freeing an inode.
+//! fallocate, truncate, the orphan list and freeing an inode. Writing a run of pages is `flight`'s (the data
+//! first and without the volume lock, then the blocks, the extents and the inode that point at it).
 
 use crate::extent::{self, Edit, Ext, Found, Target};
 use crate::inode::{DiskInode, FL_INLINE_DATA};
@@ -12,18 +12,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::errno::*;
 
-/// A piece of a write: file blocks [l, l + n) at disk block `p`; `fresh` when allocated for this write,
-/// `unwritten` when it was a preallocated (unwritten) extent.
-struct Seg {
-    l: u64,
-    n: u64,
-    p: u64,
-    fresh: bool,
-    unwritten: bool,
-}
-
 /// Largest single request to the device (bytes).
-const IO_MAX: usize = 1 << 20;
+pub(crate) const IO_MAX: usize = 1 << 20;
 
 /// A file read's pieces in order (`State::read_plan`): FS-STALL maps under the volume lock and reads after it.
 pub struct ReadPlan {
@@ -139,7 +129,7 @@ impl State {
     }
 
     /// Turns a block-mapped (ext2/ext3) file, directory or slow symlink into an extent tree before V2
-    /// changes it (`ext4_ext_migrate`, linux-6.6/fs/ext4/migrate.c:409): the new tree and the inode in one
+    /// changes it (`ext4_ext_migrate`, linux-7.3.1/fs/ext4/migrate.c:410): the new tree and the inode in one
     /// transaction, the old indirect blocks freed in the next. Nothing to do for extent, inline, device and
     /// fast-symlink inodes.
     pub fn migrate(&mut self, ino: u32) -> Result<(), i64> {
@@ -171,7 +161,7 @@ impl State {
         self.free_list(&list)
     }
 
-    /// fallocate's allocation (`ext4_alloc_file_blocks`, linux-6.6/fs/ext4/extents.c:4416): every hole of
+    /// fallocate's allocation (`ext4_alloc_file_blocks`, linux-7.3.1/fs/ext4/extents.c:4598): every hole of
     /// [off, off + len) gets unwritten extents (read as zeros until written) in one transaction, so the space
     /// survives eviction and a cut; the size is the caller's (mode 0 extends it afterwards). `keep`: as
     /// `alloc_blocks`.
@@ -227,142 +217,6 @@ impl State {
         })
     }
 
-    /// Writes `data` at `off` (block aligned) of a regular file whose size is `size`; the disk size grows to
-    /// cover what was written (never past `size`). `keep`: blocks other files' cached data was promised.
-    pub fn write_file(&mut self, ino: u32, off: u64, data: &[u8], size: u64, keep: u64) -> Result<(), i64> {
-        let bs = self.geo.bs;
-        let mut di = self.inode(None, ino)?;
-        if !di.is_reg() {
-            return Err(EINVAL);
-        }
-        if !extent::uses_extents(&di) {
-            self.migrate(ino)?;
-            di = self.inode(None, ino)?;
-        }
-        if di.flags() & FL_INLINE_DATA != 0 {
-            // Only on an inline_data volume, which mounts read-only (`sb::parse`).
-            return Err(EROFS);
-        }
-        if off % bs != 0 {
-            return Err(EINVAL);
-        }
-        let first = off / bs;
-        let n = (data.len() as u64).div_ceil(bs);
-        if first + n > 1 << 32 {
-            return Err(EFBIG);
-        }
-        // 1. the mapping, with new blocks for the holes (marked used first)
-        let mut segs: Vec<Seg> = Vec::new();
-        let mut atx = Tx::new();
-        let mut goal = self.file_goal(&di, first)?;
-        let mut l = first;
-        let r = (|| -> Result<(), i64> {
-            while l < first + n {
-                let want = first + n - l;
-                match self.map_at(Some(&atx), &di, l)? {
-                    Ok((p, m, unwritten)) => {
-                        let m = m.min(want);
-                        segs.push(Seg { l, n: m, p, fresh: false, unwritten });
-                        goal = p + m;
-                        l += m;
-                    }
-                    Err(hole) => {
-                        let m = hole.min(want).min(extent::INIT_MAX as u64);
-                        let (p, got) = self.alloc_blocks(&mut atx, goal, m, keep)?;
-                        segs.push(Seg { l, n: got, p, fresh: true, unwritten: false });
-                        goal = p + got;
-                        l += got;
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(e) = r {
-            // Nothing points at the blocks taken so far: the disk never saw them taken.
-            self.abort(atx);
-            return Err(e);
-        }
-        // Without a journal the allocation is on the disk before the data (FS-8a's order). With one, the
-        // allocation, the mapping and the frees stay one transaction that joins after the data was written
-        // (ordered mode), so no commit can fall between them and leave blocks taken that nothing uses.
-        let journal = self.jnl.is_some();
-        if !journal {
-            self.commit(core::mem::take(&mut atx))?;
-        }
-        // 2. the data
-        if let Err(e) = self.write_segs(&segs, first, data) {
-            if journal {
-                self.abort(atx);
-            }
-            return Err(e);
-        }
-        // 3. the pointers and the inode
-        let mut map = |st: &mut State, tx: &mut Tx| -> Result<Vec<(u64, u64)>, i64> {
-            let mut fresh = 0u64;
-            let (tree, freed) = {
-                let mut ed = Edit::new(st, tx, &mut di, goal);
-                for s in segs.iter().filter(|s| s.fresh || s.unwritten) {
-                    ed.set(s.l as u32, s.n, Target::Map { pblk: s.p, unwritten: false })?;
-                    if s.fresh {
-                        fresh += s.n;
-                    }
-                }
-                (ed.tree_blocks, core::mem::take(&mut ed.freed))
-            };
-            let new_size = di.size().max(size.min(off + data.len() as u64));
-            di.set_size(new_size);
-            let b512 = di.blocks512(&st.geo) as i64 + (fresh as i64 + tree) * (bs / 512) as i64;
-            di.set_blocks512(&st.geo, b512.max(0) as u64)?;
-            let t = st.now();
-            di.set_time(crate::inode::Stamp::C, t);
-            st.put_inode(tx, &mut di)?;
-            Ok(freed)
-        };
-        if !journal {
-            let freed = self.with_tx(map)?;
-            return self.free_list(&freed);
-        }
-        let r = map(self, &mut atx).and_then(|freed| freed.iter().try_for_each(|&(p, n)| self.free_blocks_range(&mut atx, p, n)));
-        match r {
-            Ok(()) => self.commit(atx),
-            Err(e) => {
-                self.abort(atx);
-                Err(e)
-            }
-        }
-    }
-
-    /// Step 2 of `write_file`: the data of every segment to its blocks (the last block padded with zeros).
-    fn write_segs(&mut self, segs: &[Seg], first: u64, data: &[u8]) -> Result<(), i64> {
-        let bs = self.geo.bs;
-        let mut pad = Vec::new();
-        for s in segs {
-            let mut b = 0u64;
-            while b < s.n {
-                let at = ((s.l - first + b) * bs) as usize;
-                let cnt = ((s.n - b) as usize).min(IO_MAX / bs as usize);
-                let end = (at + cnt * bs as usize).min(data.len());
-                let src = &data[at..end];
-                // The whole blocks straight from the caller's buffer; only a short last block goes through a copy
-                // of one block (a copy of the whole piece was up to 1 MiB from the heap, inside write-back).
-                let whole = src.len() / bs as usize * bs as usize;
-                if whole > 0 {
-                    self.write_blocks(s.p + b, &src[..whole])?;
-                }
-                if whole < src.len() {
-                    pad.clear();
-                    pad.extend_from_slice(&src[whole..]);
-                    pad.resize(bs as usize, 0);
-                    let p = core::mem::take(&mut pad);
-                    self.write_blocks(s.p + b + whole as u64 / bs, &p)?;
-                    pad = p;
-                }
-                b += cnt as u64;
-            }
-        }
-        Ok(())
-    }
-
     /// Frees blocks in a transaction of their own (after the one that dropped the last pointer).
     pub fn free_list(&mut self, list: &[(u64, u64)]) -> Result<(), i64> {
         if list.is_empty() {
@@ -377,7 +231,7 @@ impl State {
     }
 
     /// Where new blocks for file block `l` should go: after the block before it, else the inode's group.
-    fn file_goal(&self, di: &DiskInode, l: u64) -> Result<u64, i64> {
+    pub(crate) fn file_goal(&self, di: &DiskInode, l: u64) -> Result<u64, i64> {
         if l > 0
             && let Ok(Ok((p, _, _))) = self.map_at(None, di, l - 1)
         {
@@ -404,9 +258,21 @@ impl State {
             && let Ok((p, _, false)) = self.map_at(None, &di, edge / bs)?
         {
             let mut b = vec![0u8; bs as usize];
-            self.read_blocks(p, &mut b)?;
+            self.read_data_block(p, &mut b)?;
             b[(edge % bs) as usize..].fill(0);
-            self.write_blocks(p, &b)?;
+            // File data, so FS-W2's data path (beside the disk's cache): ordered as a step's data, at the device before
+            // the size joins a transaction, durable by that commit's first flush. No step of the file is in flight
+            // (`lock_file`) and none begins under this lock, so nothing else writes the block meanwhile.
+            // A timeout may still land later (`write_end`): the block stays the file's, and is kept out of use in
+            // this mount once a truncate or unlink frees it, so it never goes to another file or to metadata.
+            if let Err(e) = self.write_data_block(p, &b) {
+                if e == ETIMEDOUT {
+                    self.flights.quarantine(p, 1, false);
+                    klog::event!(Warn, "ext4", "flight.blocks_kept", ino = ino, blocks = 1u64; "a write to a file's blocks timed out at the device: the blocks are left unused until the next mount");
+                    return Err(EIO);
+                }
+                return Err(e);
+            }
         }
         let keep_blocks = size.div_ceil(bs);
         let all = self.with_tx(|st, tx| {
@@ -477,9 +343,17 @@ impl State {
     /// blocks and the inode bit freed in the next. `orphan`: it is on the orphan list.
     pub fn evict(&mut self, ino: u32, orphan: bool) -> Result<(), i64> {
         let dir = self.inode(None, ino)?.is_dir();
+        if dir {
+            self.dirx.forget(ino);
+        }
         if let Err(e) = self.migrate(ino) {
             klog::event!(Warn, "ext4", "evict.migrate_failed", ino = ino, errno = e; "block-mapped inode: blocks left for e2fsck");
         }
+        // With a journal the frees join the transaction that deletes the inode and takes it off the orphan list: a
+        // failure anywhere leaves the whole inode on the list for the next mount (Linux frees in the truncate's
+        // handle). Without one, two writes in this order: a cut between them leaves blocks and bit taken and unowned
+        // (e2fsck), never free while an inode on the disk still points at them.
+        let journal = self.jnl.is_some();
         let free = self.with_tx(|st, tx| {
             if orphan {
                 st.orphan_del(tx, ino)?;
@@ -503,16 +377,23 @@ impl State {
             di.set_blocks512(&st.geo, 0)?;
             di.set_dtime(t.sec as u32);
             st.put_inode(tx, &mut di)?;
+            if journal {
+                st.free_evicted(tx, &free, ino, dir)?;
+            }
             Ok(free)
         })?;
-        self.with_tx(|st, tx| {
-            for &(p, n) in &free {
-                st.free_blocks_range(tx, p, n)?;
-            }
-            st.free_inode(tx, ino, dir)
-        })?;
+        if !journal {
+            self.with_tx(|st, tx| st.free_evicted(tx, &free, ino, dir))?;
+        }
         self.nodes.remove(&ino);
         Ok(())
+    }
+
+    fn free_evicted(&mut self, tx: &mut Tx, free: &[(u64, u64)], ino: u32, dir: bool) -> Result<(), i64> {
+        for &(p, n) in free {
+            self.free_blocks_range(tx, p, n)?;
+        }
+        self.free_inode(tx, ino, dir)
     }
 
     /// Mount-time `ext4_orphan_cleanup` (orphan.c): unlinked inodes are freed, linked ones truncated to

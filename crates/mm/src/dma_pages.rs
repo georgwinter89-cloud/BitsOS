@@ -1,4 +1,4 @@
-//! Pinned scattered DMA pages (MM-14, GX roadmap wave 23; scout gx-scout-vm-rings.md section 8 items 1 and 5):
+//! Pinned scattered DMA pages (MM-14):
 //! the system memory of GPU buffers (GTT objects, rings, page tables, dma-bufs, udmabuf).
 //!
 //! A `DmaPages` holds N frames that need not be contiguous (blocks of up to 2 MiB, largest first, as Linux's TTM
@@ -7,7 +7,7 @@
 //! device gets their addresses per page or per block (`device_addr`, `segment`): physical while the IOMMU is off
 //! (V2 keeps it off); `device_addr_of` is the one place an IOMMU mapping would go. The CPU type is per object:
 //! write-back (cached, the device snoops: x86 PCIe default) unless the driver asks for WC or UC, which retypes
-//! the direct map of each block (Linux `set_pages_array_wc`, linux-6.6/arch/x86/mm/pat/set_memory.c:2258).
+//! the direct map of each block (Linux `set_pages_array_wc`, linux-7.3.1/arch/x86/mm/pat/set_memory.c:2597).
 //!
 //! Lifetime: the object is shared as `Arc<DmaPages>`. Programs map it through a device VMA
 //! (`device::Aperture::Pages`; the map keeps an `Arc`), a driver that gave the device the addresses holds a
@@ -19,7 +19,7 @@
 //!
 //! Limits (Georg's rule: dynamic, no fixed number): all pinned pages together may take `share` percent of the
 //! managed RAM (default 50 %, Linux's TTM default `ttm_pages_limit` = half of RAM,
-//! linux-6.6/drivers/gpu/drm/ttm/ttm_device.c:87-88, which amdgpu uses as GTT size, amdgpu_ttm.c:1926), measured
+//! linux-7.3.1/drivers/gpu/drm/ttm/ttm_device.c:90-91, which amdgpu uses as GTT size, amdgpu_ttm.c:2188), measured
 //! again when a request is refused (managed memory grows after boot). A `PinOwner` (a GPU client, a udmabuf
 //! creator) can bind its own share on top, so one program cannot pin all of it. Every pinned page is charged
 //! to the strict commit as well (V2-PLAN R2): it is RAM the system can no longer promise to programs. A refusal

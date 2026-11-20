@@ -1,5 +1,5 @@
-//! `/proc/<pid>/fd` and `/proc/<pid>/fdinfo` (linux-6.6/fs/proc/fd.c `proc_readfd_common`,
-//! `proc_lookupfd_common`, `tid_fd_update_inode`, `proc_fd_link`, `seq_show` :23).
+//! `/proc/<pid>/fd` and `/proc/<pid>/fdinfo` (linux-7.3.1/fs/proc/fd.c:243 `proc_readfd_common`,
+//! `proc_lookupfd_common` :221, `tid_fd_update_inode` :127, `proc_fd_link` :174, `seq_show` :23).
 //!
 //! fd: the open fds in number order, each a magic link whose text is `d_path` of the file (`/memfd:<name>
 //! (deleted)`, a removed file's path with " (deleted)") or the object's own name (`pipe:[ino]`,
@@ -34,6 +34,13 @@ fn fd_entry(t: &Target, p: &Process, fd: usize, f: &OpenFile) -> SynthEntry {
 }
 
 impl DirSource for FdDir {
+    /// `proc_fd_permission` (linux-7.3.1/fs/proc/fd.c:326): the mode bits (dr-x------ for the owner), and any
+    /// thread of the process itself even when they say no (a setuid program reading its own fds).
+    fn permission(&self, _who: Cred, _want: u32) -> Option<Result<(), Errno>> {
+        let me = proc::current()?;
+        let g = self.0.group().ok()?;
+        Arc::ptr_eq(me.group(), &g).then_some(Ok(()))
+    }
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
         let (_, p) = self.0.live().map_err(|_| ENOENT)?;
         Ok(p.fds.open_fds().iter().map(|(n, f)| fd_entry(&self.0, &p, *n, f)).collect())
@@ -76,7 +83,7 @@ impl MagicLink for FdLink {
             // S_IFSOCK: sockfs inodes are 0777, the open itself answers ENXIO (`sock_no_open`).
             0o140000 => return Some(Err(ENXIO)),
             // The shared anon inode (eventfd, epoll, timerfd, signalfd, pidfd) is root's and 0600: others fail
-            // its permission check (EACCES) before the open's ENXIO (linux-6.6/fs/anon_inodes.c, fs/libfs.c
+            // its permission check (EACCES) before the open's ENXIO (linux-7.3.1/fs/anon_inodes.c:349, fs/libfs.c:1663
             // `alloc_anon_inode`).
             _ if me_uid != 0 => return Some(Err(EACCES)),
             _ => return Some(Err(ENXIO)),
@@ -113,7 +120,10 @@ fn anon_place(f: &OpenFile) -> vfs::Path {
     vfs::Path { mnt: root.mnt, dentry }
 }
 
-/// `/proc/<pid>/fdinfo`: r-x for everyone; listing and reading need ptrace READ access (EACCES).
+/// `/proc/<pid>/fdinfo`: r-x for everyone; listing, reading and every lookup below it need ptrace READ access
+/// (EACCES), and once the task is gone they answer ESRCH (linux-7.3.1/fs/proc/fd.c:85 `proc_fdinfo_permission`,
+/// the directory's permission op, asked by every walk through it and by chdir, also when the directory is the
+/// caller's root).
 pub(super) struct FdInfoDir(pub(super) Target);
 
 impl FdInfoDir {
@@ -124,22 +134,30 @@ impl FdInfoDir {
 }
 
 impl DirSource for FdInfoDir {
+    /// ESRCH, then EACCES, then the mode bits (`generic_permission`).
+    fn permission(&self, _who: Cred, _want: u32) -> Option<Result<(), Errno>> {
+        match self.0.live() {
+            Err(e) => Some(Err(e)),
+            Ok((_, p)) if !may_read_mm(&p) => Some(Err(EACCES)),
+            Ok(_) => None,
+        }
+    }
     fn may_open(&self) -> Result<(), Errno> {
-        let (_, p) = self.0.live().map_err(|_| ENOENT)?;
+        let (_, p) = self.0.live()?;
         if !may_read_mm(&p) {
             return Err(EACCES);
         }
         Ok(())
     }
     fn entries(&self) -> Result<Vec<SynthEntry>, Errno> {
-        let (_, p) = self.0.live().map_err(|_| ENOENT)?;
+        let (_, p) = self.0.live()?;
         if !may_read_mm(&p) {
             return Err(EACCES);
         }
         Ok(p.fds.open_fds().iter().map(|(n, _)| self.entry(&p, *n)).collect())
     }
     fn lookup(&self, name: &[u8]) -> Result<Option<SynthEntry>, Errno> {
-        let (_, p) = self.0.live().map_err(|_| ENOENT)?;
+        let (_, p) = self.0.live()?;
         if !may_read_mm(&p) {
             return Err(EACCES);
         }
@@ -162,7 +180,9 @@ impl FdInfo {
         let f = p.fds.get(self.fd).map_err(|_| ENOENT)?;
         let cloexec = p.fds.cloexec(self.fd).unwrap_or(false);
         let a = f.stat();
-        let mut s = fdinfo_head(f.pos_racy(), f.status_flags() | if cloexec { O_CLOEXEC } else { 0 }, a.mnt_id, a.ino);
+        // `file->f_flags`: a pidfd's carry PIDFD_THREAD and PIDFD_AUTOKILL (linux-7.3.1/fs/pidfs.c:961), as F_GETFL.
+        let flags = f.status_flags() | proc::pidfd::shown_flags(&f).unwrap_or(0) | if cloexec { O_CLOEXEC } else { 0 };
+        let mut s = fdinfo_head(f.pos_racy(), flags, a.mnt_id, a.ino);
         // `f_op->show_fdinfo` of the objects this lane owns.
         if let Some(extra) = crate::timerfd::fdinfo(&f).or_else(|| crate::signalfd::fdinfo(&f)).or_else(|| proc::pidfd::fdinfo(&f)) {
             s.push_str(&extra);

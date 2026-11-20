@@ -1,6 +1,6 @@
 //! GM-8: `\BITSOS2\vkquake\` (vkQuake and SDL2 of their pinned releases, LibreQuake's data, on the Mesa tree's glibc) and its
 //! launcher `\BITSOS2\bin\vkquake` as the package list names them. Class Program: on the Mini-PC only, where a missing tree
-//! is a failure (CONTRACTS section 4); `host/tests/minipc/quake.sh` starts them first. Rerunnable; no window, no sound, no GPU
+//! is a failure (CONTRACTS section 4); the Mini-PC ktest round runs them. Rerunnable; no window, no sound, no GPU
 //! job: only the game's server starts, on the stick's files, with a home in a scratch folder.
 //! - `ul.pkg.vkquake`: every file's size, the SHA-256 of all up to 1 MiB, the pieces a start needs, the licences, the loader
 //!   the program names, `vkquake --check`, and the server: the tree's libraries load, map `start` of the data loads.

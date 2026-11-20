@@ -259,7 +259,7 @@ pub fn parse_frame(f: &[u8]) -> Option<(FrameAddr, &[u8])> {
 // ---------------------------------------------------------------------------------------------------------
 // CONFIG
 
-/// Where the mirror sends: CONFIG `mirror=a.b.c.d[:port]` (V1's key `console=` is read too).
+/// Where the mirror sends: CONFIG `mirror=a.b.c.d[:port]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     pub ip: [u8; 4],

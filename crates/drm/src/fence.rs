@@ -1,4 +1,4 @@
-//! Fences (Linux `dma_fence`, linux-6.6/drivers/dma-buf/dma-fence.c, dma-fence-chain.c, dma-fence-array.c,
+//! Fences (Linux `dma_fence`, linux-7.3.1/drivers/dma-buf/dma-fence.c, dma-fence-chain.c, dma-fence-array.c,
 //! dma-fence-unwrap.c): a fence a driver signals (`Fence::new`, `signal`), the always-signaled stub, timeline
 //! chains (one node per point, `chain`) and arrays (merged sync_files). Waiters hang a callback on every
 //! unsignaled leaf behind a fence (`add_callback`); a callback only says "look again", the waiter re-checks.

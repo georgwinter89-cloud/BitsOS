@@ -24,7 +24,7 @@ impl PciFunction {
 pub(crate) fn l12_off_locked(at: Loc) -> Result<L12Report, AspmError> {
     let fname = format!("{at}");
     let may_storage = device::driver_of_loc(at) == Some(crate::optin::STORAGE_DRIVER);
-    let nodes = NODES.lock().clone();
+    let nodes = NODES.get();
     let Some(idx) = nodes.iter().position(|n| n.loc == at) else {
         klog::event!(Warn, "pci", "aspm.refused", function = fname.as_str(), reason = "not_scanned");
         return Err(AspmError::NotScanned);

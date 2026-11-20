@@ -1,4 +1,4 @@
-//! The seccomp program bitsinstall runs under after its setup (classic BPF, linux-6.6/kernel/seccomp.c; SX-1 on
+//! The seccomp program bitsinstall runs under after its setup (classic BPF, linux-7.3.1/kernel/seccomp.c; SX-1 on
 //! V2). Unlike bitsmcp it keeps the file system and its sockets (the grants file, /proc/<pid>/exe of a
 //! confirmer, the confirmer's socket), so the program is a deny list: another arch or an x32 number, starting a
 //! program, a fork (clone without CLONE_THREAD), tracing, another process's memory, kernel images and modules,

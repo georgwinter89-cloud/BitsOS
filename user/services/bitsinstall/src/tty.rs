@@ -1,6 +1,6 @@
 //! MC-11: the text console's devices for `bitsinstall::console`: the screen is /dev/tty0 (written, and asked with
-//! KDGETMODE whether a program has the screen: linux-6.6/drivers/tty/vt/vt_ioctl.c), the keyboards are the
-//! evdev nodes /dev/input/event* with keys (linux-6.6/drivers/input/evdev.c). Each device is judged by
+//! KDGETMODE whether a program has the screen: linux-7.3.1/drivers/tty/vt/vt_ioctl.c:383), the keyboards are the
+//! evdev nodes /dev/input/event* with keys (linux-7.3.1/drivers/input/evdev.c). Each device is judged by
 //! bitscomp's rule (`console::injected_why`); a real one is grabbed for the dialog (EVIOCGRAB: the VT and its
 //! shell get none of its keys), and given back at the dialog's end (EVIOCGRAB 0, then closed). Fixer (MC-11
 //! review): a real keyboard also gets EVIOC_BITSOS_PHYSICAL, so events a program writes into its node
@@ -43,7 +43,7 @@ const fn eviocgphys(len: u64) -> u64 {
     ioc(READ, 0x07, len)
 }
 const EV_KEY: u16 = 1;
-/// KEY_MAX + 1 bits (linux-6.6/include/uapi/linux/input-event-codes.h KEY_MAX 0x2ff).
+/// KEY_MAX + 1 bits (linux-7.3.1/include/uapi/linux/input-event-codes.h:837 KEY_MAX 0x2ff).
 const KEY_BYTES: u64 = 0x300 / 8;
 const fn eviocgbit_key(len: u64) -> u64 {
     ioc(READ, 0x20 + EV_KEY as u64, len)

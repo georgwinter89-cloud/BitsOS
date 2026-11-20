@@ -3,9 +3,8 @@
 # CP-5: the LAPIC timer paths QEMU's default (-cpu host: TSC-deadline) does not take (functional only).
 #  1. -cpu host,-tsc-deadline -smp 16: like the Mini-PC (no TSC-deadline), every CPU calibrates its one-shot
 #     timer (auto picks it), all 16 go live, and cp.time, contract.hrtimer_sleep and the sched tests pass on it.
-#  2. hrtimer=poll -smp 4: the escape hatch: no LAPIC timer, every hrtimer on the polled queue; the contract and
-#     sched tests still pass, the per-CPU timer test skips.
-#  3. lapic_timer=fast: an unknown value is named in a warning and auto is used.
+#  2. the test key ktest_timer=poll -smp 4: no LAPIC timer, every hrtimer on the polled queue (the path of a CPU
+#     whose timer cannot start); the contract and sched tests still pass.
 set -eu
 cd "$BITSOS_ROOT"
 RUN="$BITSOS_RUN_DIR"
@@ -30,7 +29,7 @@ no_fail() { # log, what
 # 1. One-shot on 16 CPUs (the Mini-PC's mode).
 run oneshot "loglevel=info" "cp.time,contract.hrtimer,sched" -smp 16 -cpu host,-tsc-deadline
 L="$RUN/oneshot.log"
-n=$(count "$L" 'time lapic.timer cpu=[0-9]+ mode=oneshot counts_per_ms=[1-9][0-9]* config=auto')
+n=$(count "$L" 'time lapic.timer cpu=[0-9]+ mode=oneshot counts_per_ms=[1-9][0-9]*')
 [ "$n" = 16 ] && echo "ok   16 CPUs calibrated their one-shot timer" || { echo "FAIL $n CPUs in one-shot mode, wanted 16"; fail=1; }
 check "$L" 'time timers.ready cpus=16 live=16 mode=oneshot interrupt_driven=true' "every CPU's timers fire by interrupt"
 check "$L" 'KTEST ok cp.time.lapic_every_cpu' "a timer fired on every CPU from its own one-shot timer"
@@ -38,19 +37,13 @@ check "$L" 'KTEST ok cp.time.hrtimer_cancel_rearm' "cancel and re-arm from the c
 check "$L" 'KTEST ok contract.hrtimer_sleep' "the HrTimer contract test"
 no_fail "$L" "one-shot"
 
-# 2. hrtimer=poll.
-run poll "hrtimer=poll" "cp.time,-cp.time.lapic_every_cpu,-cp.time.idle_halts,-cp.time.preempt_busy,contract.hrtimer,sched.sleep,sched.wait" -smp 4
+# 2. The polled queue (test key).
+run poll "ktest_timer=poll" "cp.time,-cp.time.lapic_every_cpu,-cp.time.idle_halts,-cp.time.preempt_busy,contract.hrtimer,sched.sleep,sched.wait" -smp 4
 L="$RUN/poll.log"
 n=$(count "$L" 'time lapic.timer_off cpu=[0-9]+ ')
-[ "$n" = 4 ] && echo "ok   hrtimer=poll: no CPU started its LAPIC timer" || { echo "FAIL hrtimer=poll: $n 'lapic.timer_off', wanted 4"; fail=1; }
-check "$L" 'interrupt_driven=false' "hrtimer=poll: not interrupt-driven"
-check "$L" 'KTEST ok contract.hrtimer_sleep' "hrtimer=poll: the contract test passes on the polled queue"
+[ "$n" = 4 ] && echo "ok   ktest_timer=poll: no CPU started its LAPIC timer" || { echo "FAIL ktest_timer=poll: $n 'lapic.timer_off', wanted 4"; fail=1; }
+check "$L" 'interrupt_driven=false' "ktest_timer=poll: not interrupt-driven"
+check "$L" 'KTEST ok contract.hrtimer_sleep' "ktest_timer=poll: the contract test passes on the polled queue"
 no_fail "$L" "poll"
 
-# 3. A value that is not understood.
-run badcfg "lapic_timer=fast" "contract.hrtimer" -smp 2
-L="$RUN/badcfg.log"
-check "$L" 'time config.unknown key=lapic_timer value=fast' "lapic_timer=fast is named in a warning"
-check "$L" 'time lapic.timer cpu=0 mode=[a-z_]+ .*config=auto' "and auto is used"
-no_fail "$L" "bad value"
 exit $fail

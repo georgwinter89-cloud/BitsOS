@@ -1,0 +1,15 @@
+unshare(CLONE_NEWUSER) = 0
+chdir(/proc/self) = 0
+unshare(UNSHARE_EMPTY_MNTNS) = 0
+a new mount namespace = yes
+unshare: getcwd = /
+unshare: stat(/proc/self) = -ENOENT
+unshare: stat(/) = 0
+unshare: mountinfo lines = 1, mount points: / 
+chdir(/) before clone3 = 0
+clone3 child: getcwd = /
+clone3 child: stat(/proc/self) = -ENOENT
+clone3 child: stat(/) = 0
+clone3 child: mountinfo lines = 1, mount points: / 
+clone3 child: exit 0
+clone3(CLONE_EMPTY_MNTNS) = yes

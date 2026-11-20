@@ -1,18 +1,18 @@
 //! `/sys/bitsos/<name>`: BitsOS's own runtime attributes (CL-1 change request 3), the place where settingsd
-//! applies kernel.* keys at once. Linux sysfs semantics (linux-6.6/fs/sysfs/file.c sysfs_kf_write,
+//! applies kernel.* keys at once. Linux sysfs semantics (linux-7.3.1/fs/sysfs/file.c:136 sysfs_kf_write,
 //! fs/kernfs/file.c kernfs_fop_write_iter): mode 0644; a read gives the value and a newline; every write is the
 //! whole value (one trailing newline dropped) wherever the file position is, an empty write is 0, and a write
-//! is cut at 4096 bytes (PAGE_SIZE, file.c:304); O_CREAT|O_TRUNC on an
+//! is cut at 4096 bytes (PAGE_SIZE, file.c:315); O_CREAT|O_TRUNC on an
 //! existing attribute is accepted and ignored (the synth layer does that), so `echo v > /sys/bitsos/x` works.
 //! Only uid 0 may write (EACCES otherwise); a value the setter refuses gives its errno. A read-only attribute
-//! (`register_ro`) is mode 0444 and an open for writing is EACCES even for root (linux-6.6/fs/kernfs/file.c:
-//! 646-660 kernfs_fop_open: no S_IWUGO or no write op).
+//! (`register_ro`) is mode 0444 and an open for writing is EACCES even for root (linux-7.3.1/fs/kernfs/file.c:
+//! 622-629 kernfs_fop_open: no S_IWUGO or no write op).
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-/// kernfs's write bound without atomic_write_len (linux-6.6/fs/kernfs/file.c:304).
+/// kernfs's write bound without atomic_write_len (linux-7.3.1/fs/kernfs/file.c:315).
 const PAGE: usize = 4096;
 use ksync::Mutex;
 use uapi::errno::*;
@@ -131,7 +131,7 @@ fn sys_bitsos() -> ktest::TestResult {
     use vfs::abi::{O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY};
     use vfs::ops::Ctx;
     let ns = vfs::root_ns();
-    let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0 };
+    let subject = policy::Subject { program: policy::ProgramId(1), pid: 0x7fff_0000, uid: 0, tree: 0 };
     let root = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 0, gid: 0 }, umask: 0o022, subject };
     let user = Ctx { ns: &ns, root: ns.root_path(), cwd: ns.root_path(), cred: Cred { uid: 1000, gid: 1000 }, umask: 0o022, subject: policy::Subject { uid: 1000, ..subject } };
     let path = b"/sys/bitsos/console_log";

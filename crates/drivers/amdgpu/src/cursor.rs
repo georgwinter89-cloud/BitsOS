@@ -24,7 +24,9 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use gopfb::FbTarget;
 
-/// `dc->caps.max_cursor_size` of DCN 3.1.4 (linux-6.6 dc/dcn314/dcn314_resource.c:1860): a hardware fact.
+/// `dc->caps.max_cursor_size` of DCN 3.1.4 (linux-6.6 dc/dcn314/dcn314_resource.c:1860; Linux 7.3.1 differs:
+/// linux-7.3.1/drivers/gpu/drm/amd/display/dc/resource/dcn314/dcn314_resource.c:2002,
+/// see plan/spec/linux7-differences.md): a hardware fact.
 pub const MAX: u32 = 256;
 /// One surface: MAX x MAX ARGB8888 (CURSOR_PITCH 256).
 pub const SLOT_BYTES: u64 = (MAX as u64) * (MAX as u64) * 4;

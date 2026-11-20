@@ -1,0 +1,25 @@
+[package]
+name = "bitspkgd"
+version = "0.1.0"
+edition = "2024"
+description = "BitsOS program service (PK-6f): bitspkg's library behind /run/bitsos/pkg.sock for the desktop and Claude"
+publish = false
+
+# Only crates of this workspace: bitspkg (the library: the /apps lock and the cut safety stay in it), settingsd
+# (its JSON and line reader), mcpreg (MC-6: the MCP tools), bitsinstall (MC-9a's peer check of the compositor
+# grant holder), usys (SO_PEERCRED, the scheduling class, dup2 for /dev/kmsg). No new download.
+[dependencies]
+bitspkg = { path = "../../tools/bitspkg" }
+settingsd = { path = "../settingsd" }
+mcpreg = { path = "../../lib/mcpreg" }
+bitsinstall = { path = "../bitsinstall" }
+usys = { path = "../../tools/usys" }
+# UPDATE: the update page's ops (signed versions from the workshop repository).
+bitsupdate = { path = "../../lib/bitsupdate" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bitspkgd"
+path = "src/main.rs"

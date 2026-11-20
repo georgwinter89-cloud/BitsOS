@@ -33,7 +33,7 @@ fn rows_show_favourites_recent_by_program_and_all() {
     assert_eq!(r.iter().map(|r| r.title).collect::<Vec<_>>(), [FAVOURITES, RECENT, ALL]);
     assert_eq!(r[0].ids, s(&["terminal", "einstellungen"]), "addresses of no program are left out");
     assert_eq!(r[1].ids, s(&["writer", "einstellungen", "brave"]), "counted by program, not by address");
-    assert_eq!(r[2].ids, s(&["brave", "einstellungen", "terminal", "writer"]), "A-Z");
+    assert_eq!(r[2].ids, s(&["brave", "einstellungen", "sofa-modus", "system", "terminal", "writer"]), "A-Z");
     // Up to eight recent programs.
     let many: Vec<(String, String)> = (0..12).map(|i| (format!("p{i:02}"), format!("P{i:02}"))).collect();
     let refs: Vec<(&str, &str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str(), "")).collect();
@@ -158,4 +158,55 @@ fn pin_into_the_default_favourites_keeps_them() {
     assert_eq!(pin(&ix, &pinned, "brave"), pinned, "no duplicate");
     assert_eq!(pin(&ix, &default, "einstellungen"), default, "Einstellungen is there already (as einstellungen/aussehen)");
     assert_eq!(unpin(&ix, &pinned, "terminal"), s(&["einstellungen/aussehen", "programm/brave"]));
+}
+
+#[test]
+fn the_heads_buttons_sit_beside_the_search_at_every_size() {
+    for (w, h, scale) in [(2560, 1440, 1.0), (2000, 1125, 1.25), (1920, 1080, 1.0), (1280, 720, 1.0), (1024, 600, 1.0), (800, 600, 1.0)] {
+        let mut t = Theme::default();
+        t.board = t.board / t.scale * scale;
+        t.scale = scale;
+        let g = geo(Rect { x: 0, y: 0, w, h }, 48, &t);
+        for count in [None, Some(3), Some(120)] {
+            let hd = head(&g, &t, count);
+            let inside = |r: Rect| r.x >= g.search.x && r.y >= g.search.y && r.x + r.w <= g.search.x + g.search.w && r.y + r.h <= g.search.y + g.search.h;
+            assert!(inside(hd.add) && inside(hd.esc) && inside(hd.text), "{w}x{h}: {hd:?} in {:?}", g.search);
+            assert!(hd.text.x + hd.text.w < hd.add.x, "{w}x{h}: the search text ends before the add button");
+            match hd.updates {
+                Some(u) => {
+                    assert!(inside(u) && hd.add.x + hd.add.w < u.x && u.x + u.w < hd.esc.x, "{w}x{h}: {hd:?}");
+                    assert!(hd.text.w >= t.bl(240.0) - 1, "{w}x{h}: a readable search beside both buttons");
+                }
+                None => assert!(hd.add.x + hd.add.w < hd.esc.x, "{w}x{h}: {hd:?}"),
+            }
+            let (line, link, hint) = empty(&g, &t);
+            assert!(line.y + line.h <= link.y && link.y + link.h <= hint.y && link.x >= g.body.x && link.x + link.w <= g.body.x + g.body.w, "{w}x{h}");
+        }
+        if w >= 1280 {
+            assert!(head(&g, &t, Some(3)).updates.is_some(), "{w}x{h}: Aktualisierungen has room");
+        }
+    }
+}
+
+#[test]
+fn the_buttons_open_the_pages_tabs_and_hand_the_search_on() {
+    assert_eq!(Button::Add.address("foot"), "programme/hinzufuegen", "the head's button opens the page plainly");
+    assert_eq!(Button::Updates.address("x"), "programme/aktualisierungen");
+    assert_eq!(Button::AddSearch.address("  foot  "), "programme/hinzufuegen/foot");
+    assert_eq!(Button::AddSearch.address(" "), "programme/hinzufuegen");
+    use crate::programme_view::{Tab, View};
+    for (a, tab, q) in [
+        ("programme/hinzufuegen/foot", Tab::Add, Some("foot")),
+        ("programme/hinzufuegen/foot terminal", Tab::Add, Some("foot terminal")),
+        ("programme/hinzufuegen/", Tab::Add, None),
+        ("programme/hinzufuegen", Tab::Add, None),
+        ("programme/aktualisierungen", Tab::Updates, None),
+        ("programme/foot", Tab::Program, None),
+    ] {
+        let v = View::of_address(a);
+        assert_eq!((v.tab, View::search_of(a).as_deref()), (tab, q), "{a}");
+    }
+    assert_eq!(View::of_address("programme/hinzufuegen/foot").address(), "programme/hinzufuegen", "the page's own address drops the search");
+    assert_eq!(crate::address::resolve("apps/hinzufuegen/foot"), crate::address::Open::Programme("hinzufuegen/foot".into()));
+    assert_eq!(crate::page_kind::PageKind::of_address("programme/hinzufuegen/foot"), crate::page_kind::PageKind::Programme);
 }

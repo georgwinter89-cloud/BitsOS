@@ -30,7 +30,7 @@ pub struct FileKeep {
     owner: Option<u32>,
 }
 
-/// O_NOFOLLOW (linux-6.6/include/uapi/asm-generic/fcntl.h: 00400000): the last part of the path must not be a link.
+/// O_NOFOLLOW (linux-7.3.1/include/uapi/asm-generic/fcntl.h:60, 1 << 17): the last part of the path must not be a link.
 const O_NOFOLLOW: i32 = 0o400000;
 
 fn dev(p: &Path) -> Option<u64> {

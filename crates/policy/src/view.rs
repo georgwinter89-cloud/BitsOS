@@ -219,6 +219,12 @@ fn insert_live(c: &Arc<Conn>) {
     }
 }
 
+/// The live list's length and capacity: a test brings it to the edge where the next open grows it (ATOMIC-3).
+pub fn live_room() -> (usize, usize) {
+    let s = STORE.lock();
+    (s.live.len(), s.live.capacity())
+}
+
 /// Moves `c` from the live list (if it is there) to the past ones.
 fn retire(c: &Arc<Conn>) {
     let keep = conn_keep().max(1);

@@ -157,8 +157,8 @@ fn refusals_before_any_write() {
     let nodes = build(&w, &ALL, keys_off);
     w.writes.lock().unwrap().clear();
     let at = |t: (u8, u8, u8)| idx(&nodes, Loc::new(0, t.0, t.1, t.2));
-    assert_eq!(aspm::l12_off(&w, &nodes, at(WLAN), false), Err(AspmError::Untouched("wlan")));
-    assert_eq!(aspm::l12_off(&w, &nodes, at(WLAN_BRIDGE), false), Err(AspmError::Untouched("wlan")));
+    assert_eq!(aspm::l12_off(&w, &nodes, at(WLAN), false), Err(AspmError::Untouched(super::HELD)));
+    assert_eq!(aspm::l12_off(&w, &nodes, at(WLAN_BRIDGE), false), Err(AspmError::Untouched(super::HELD)));
     assert_eq!(aspm::l12_off(&w, &nodes, at(NVME0), false), Err(AspmError::Storage));
     assert_eq!(aspm::l12_off(&w, &nodes, idx(&nodes, PORT), false), Err(AspmError::NoLink), "a root port on bus 0");
     assert_eq!(aspm::l12_off(&w, &nodes, 9999, false), Err(AspmError::NotScanned));

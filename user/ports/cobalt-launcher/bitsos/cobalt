@@ -16,7 +16,7 @@
 # from the console) it runs as uid 1000 (BusyBox chpst -u 1000:1000; V2's credentials since AB-13) and says so; if
 # root cannot hand over, it refuses to start: one rule for every start, and nothing of root's in user 1000's files.
 # COBALT_ALLOW_ROOT=1 runs it as root anyway (works; for diagnosis). YouTube's "This video format is not supported"
-# was not root's doing: plan/notes/yt-YT-6.md.
+# was not root's doing: plan/spec/programs.md §2.3.
 # The COBALT_* settings exist for host/tests/yt/launcher.sh (a fake tree and mount table on the build host).
 MNT=${COBALT_MOUNT:-/boot}
 T=${COBALT_TREE:-$MNT/BITSOS2/cobalt}

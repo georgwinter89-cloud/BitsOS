@@ -171,7 +171,7 @@ fn add<H: Hw>(owner: &mut Bringup<Watch<H>>, inp: &VmInputs, s: &ProcSpec, r: &m
     mes::zero(owner, p.page_mc, 0x1000).map_err(memory)?;
     mes::mem(owner, p.mqd, &mes::dwords(&p.mqd())).map_err(memory)?;
     owner.store_barrier();
-    let q = PmQueue::new(p.ring_mc, RING_BYTES, Some(p.page_mc + RPTR), p.page_mc + WPTR, DOORBELL_DW).map_err(memory)?;
+    let q = PmQueue::new_gfx(p.ring_mc, RING_BYTES, Some(p.page_mc + RPTR), p.page_mc + WPTR, DOORBELL_DW).map_err(memory)?;
     q.reset(owner).map_err(memory)?;
     let mut ring = sched_ring(owner, &inp.mes);
     let mut dbs = Vec::new();

@@ -324,7 +324,7 @@ fn master_writers_on_several_threads_stay_within_the_flip_buffer() {
 
 /// A cooked slave whose reader drains it while nobody reads the master: the master's writes all go through (no
 /// wait for its own unread echo) and the echo stops at `TO_MASTER_MAX + ECHO_ROOM`, as on CachyOS (fixer finding
-/// 1: Linux discards echo there too, linux-6.6/drivers/tty/n_tty.c:736).
+/// 1: Linux discards echo there too, linux-7.3.1/drivers/tty/n_tty.c:711).
 #[test]
 fn unread_echo_never_blocks_the_masters_writes() {
     let (m, _) = open();

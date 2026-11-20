@@ -79,8 +79,10 @@ pub fn config_guard(old: &[u8], new: &[u8]) -> Result<(), String> {
     // FS-7 CR10 (INT-A2a): the kernel and bitsboot read a key's LAST line; a write that keeps every line but
     // reorders or drops them can still change that value (nvme_write=on above nvme_write=off). FS-7's guard checks it.
     if let Err(k) = fs_fat::protect::config_guard(old, new) {
+        // GP-GUARD CR12: the list is the guard's own, so it names every key it holds.
         return Err(format!(
-            "CONFIG.TXT: the value of {k} that counts (its last line) would change or, for mcp, go; nvme_write, stick_write, usb_msd_write, mcp and mcp_confirmer are set only by Georg himself (R8a)"
+            "CONFIG.TXT: the value of {k} that counts (its last line) would change or, for mcp, go; {} are set only by Georg himself (R8a)",
+            GUARDED_KEYS.join(", ")
         ));
     }
     Ok(())

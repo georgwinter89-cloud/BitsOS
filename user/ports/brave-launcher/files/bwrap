@@ -6,6 +6,6 @@
 # download). Since SX-3b every V2 image has the real Bubblewrap at /bin/bwrap, which comes first on PATH and wins
 # (br/40-download.sh: "sandbox by /bin/bwrap"), so on V2 this file is never run; br/40-download.sh's host step still
 # uses it to keep the host's bwrap away from the loaders. Retiring it is a BR item with a restage of the shared
-# Brave stage (plan/notes/desk-C1.md).
+# Brave stage.
 echo "bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces." >&2
 exit 1

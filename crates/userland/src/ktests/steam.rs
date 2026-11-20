@@ -1,6 +1,6 @@
 //! GM-2a: `\BITSOS2\steam\` (Valve's bootstrap, the client's zips, the graphics provider) and its launcher
 //! `\BITSOS2\bin\steam` as the package list names them. Class Program: on the Mini-PC only, where a missing tree is a
-//! failure (CONTRACTS section 4); `host/tests/minipc/steam_check.py --ktest` starts it first. Rerunnable; `--check` and
+//! failure (CONTRACTS section 4); the Mini-PC ktest round runs it. Rerunnable; `--check` and
 //! `--env` start nothing and write nothing. The desktop and the data volume must be up, as for the start itself.
 //! - `ul.pkg.steam`: every file's size, the SHA-256 of all up to 1 MiB, the pieces a start needs, `steam --check` as uid 0
 //!   and 1000, and the environment Steam gets (`steam --env`).

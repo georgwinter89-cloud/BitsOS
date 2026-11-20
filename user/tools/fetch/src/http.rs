@@ -22,11 +22,20 @@ impl From<io::Error> for Error {
     }
 }
 
+#[cfg(test)]
 pub fn request(host_header: &str, target: &str) -> Vec<u8> {
+    request_with(host_header, target, None, None)
+}
+
+/// UPDATE: `request` with another Accept (GitHub's API hands a release asset out for `application/octet-stream`)
+/// and a bearer token (`--auth-stdin`). Neither may carry a line break (header injection): the caller checks.
+pub fn request_with(host_header: &str, target: &str, accept: Option<&str>, bearer: Option<&str>) -> Vec<u8> {
+    let auth = bearer.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
     format!(
-        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: fetch/{} (BitsOS)\r\nAccept: */*\r\n\
+        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: fetch/{} (BitsOS)\r\nAccept: {}\r\n{auth}\
          Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        accept.unwrap_or("*/*")
     )
     .into_bytes()
 }
@@ -353,6 +362,13 @@ mod tests {
         let edge = format!("HTTP/1.1 200 OK\r\nX: {}\r\nY: z\r\n\r\n", "a".repeat(MAX_HEAD - 22));
         assert!(parse(&edge).is_err());
         assert!(parse(&"HTTP/1.1 100 Continue\r\n\r\n".repeat(MAX_HEAD / 20)).is_err());
+    }
+
+    #[test]
+    fn accept_and_bearer_are_one_line_each() {
+        let r = String::from_utf8(request_with("api:443", "/x", Some("application/octet-stream"), Some("tok_1"))).unwrap();
+        assert!(r.contains("\r\nAccept: application/octet-stream\r\nAuthorization: Bearer tok_1\r\nAccept-Encoding: identity\r\n"), "{r}");
+        assert!(!String::from_utf8(request("h", "/")).unwrap().contains("Authorization"));
     }
 
     #[test]

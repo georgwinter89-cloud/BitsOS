@@ -22,9 +22,11 @@
 //! counted in `report` and turned into events by the `mm.report` thread. A panic first calls
 //! `enter_emergency`, after which the heap takes no lock at all (core.md 10.3).
 
+mod atomic;
 mod large;
 
 use large::large_shape;
+pub(crate) use atomic::flush as flush_atomic_large;
 pub use large::{OrderWant, MAX_WANTED};
 use crate::mags::{MagSlots, CAP};
 use crate::pages::PageSrc;
@@ -70,14 +72,13 @@ pub struct KernelHeap {
 /// the heap's retry.
 const HEAP_RECLAIM_TRIES: u32 = 32;
 /// Tries an allocation makes while it leaves the min-watermark reserve to callers that cannot reclaim: the plain
-/// try, one after the heap's own caches gave back, one after a reclaim round. Then it takes the reserve and only
-/// stays patient if that fails too. Mini-PC 11.11.2026, generation 115: with the cache full the free count sits
-/// under the min watermark for seconds (cache and program allocations dip into it after their rounds), and
-/// allocations that kept the reserve for their whole patience held `mm.as`, `nvme.io` and others for 2 s
-/// (lock statistics: hold_max 2000 ms on a dozen classes), sound and picture stalling with them.
+/// try, one after the heap's own caches gave back, one after a reclaim round. Then it takes those frames
+/// (`reclaim::Keep::dip`) and only stays patient if that fails too. Mini-PC 11.11.2026, generation 115: with the
+/// cache full the free count sits under the min watermark for seconds (cache and program allocations dip into
+/// it after their rounds), and allocations that kept the reserve for their whole patience held `mm.as`, `nvme.io`
+/// and others for 2 s (lock statistics: hold_max 2000 ms on a dozen classes), sound and picture stalling with
+/// them. The HighAtomic pageblocks stay closed to it until its last try (`reclaim::keep_reserve`).
 const KEEP_TRIES: u32 = 3;
-/// The order `regain` asks reclaim to free room for when a slab is missing.
-const SLAB_ORDER_HINT: u32 = 2;
 
 /// How long one heap allocation may spend taking page cache back before it answers null, where it may not wait
 /// (a spin lock is held: `reclaim_for` does nothing there, the bound is for the tries themselves).
@@ -90,6 +91,12 @@ const REGAIN_PATIENT_NS: u64 = 2_000_000_000;
 /// The pause before the next try when a patient round found nothing to take (kswapd and the reclaimers on other
 /// CPUs free frames meanwhile).
 const PATIENT_WAIT_US: u64 = 500;
+/// The patience of a caller another thread sleeps for (it holds a `Mutex` with waiters: `mm.as` of a program whose
+/// threads fault, a file's data lock). Mini-PC 12.11.2026, generation 137: munmap held `mm.as` for 0.7 s while
+/// forty threads of the game waited; the patience was the one path that keeps a caller that long. Past this the
+/// allocation makes its last try with the reserves open (`reclaim::Keep::last`) instead of more rounds; that the
+/// whole reserve is gone after 100 ms of rounds is the case the patience did not save either.
+pub(crate) const REGAIN_HELD_NS: u64 = 100_000_000;
 /// Blocks up to this order (1 MiB) get the patience: what kernel code allocates without a way to fail. A larger
 /// request (a buffer sized by a caller) answers null after `REGAIN_NS` as before, so it cannot stall for seconds.
 const PATIENT_ORDER: u32 = 8;
@@ -99,6 +106,53 @@ const PATIENT_ORDER: u32 = 8;
 struct Regain {
     grace: crate::grace::WaitBudget,
     until: Option<u64>,
+    /// When the first reclaim round began (the time is counted when the allocation ends).
+    since: Option<u64>,
+    /// The patience was cut because another thread waits for a lock the caller holds.
+    cut: bool,
+}
+
+klog::counter!(PATIENT_ALLOCS, "mm.heap.patient_allocs");
+klog::counter!(PATIENCE_CUT, "mm.heap.patience_cut");
+// The longest any one allocation spent in reclaim rounds, and the longest of those whose caller others waited for.
+klog::counter!(REGAIN_MAX_US, "mm.heap.regain_max_us");
+klog::counter!(REGAIN_HELD_MAX_US, "mm.heap.regain_held_max_us");
+
+/// Raises a counter used as a maximum (two raisers at once may leave the smaller: a measurement, not a bound).
+fn raise(c: &klog::metrics::Counter, v: u64) {
+    let cur = c.get();
+    if v > cur {
+        c.add(v - cur);
+    }
+}
+
+/// Whether a patient allocation whose rounds began at `since` stops now because others wait for its caller
+/// (`held`, asked only once the rounds took `REGAIN_HELD_NS`: the book is the scheduler's, and most end before).
+pub(crate) fn cut_patience(patient: bool, since: Option<u64>, now: Option<u64>, held: impl FnOnce() -> bool) -> bool {
+    patient && matches!((since, now), (Some(s), Some(t)) if t.saturating_sub(s) >= REGAIN_HELD_NS) && held()
+}
+
+/// The start of an allocation's rounds: the first round that had a clock. A round before the clock starts none
+/// (else the time since 0 was counted: a bogus `regain_max_us` and a cut at once).
+pub(crate) fn rounds_began(since: &mut Option<u64>, now: Option<u64>) -> Option<u64> {
+    if since.is_none() {
+        *since = now;
+    }
+    *since
+}
+
+impl Drop for Regain {
+    fn drop(&mut self) {
+        let (Some(t0), Some(t1)) = (self.since, ksync::now_ns()) else { return };
+        let us = t1.saturating_sub(t0) / 1000;
+        if us * 1000 >= REGAIN_NS {
+            PATIENT_ALLOCS.inc();
+        }
+        raise(&REGAIN_MAX_US, us);
+        if self.cut {
+            raise(&REGAIN_HELD_MAX_US, us);
+        }
+    }
 }
 
 /// Spins `us` microseconds, not past `until`.
@@ -181,7 +235,9 @@ impl KernelHeap {
         });
         if !mapped || !self.src.set_seed(virt as usize, len as usize) {
             self.reports().heap_bad_free(virt);
+            return;
         }
+        self.mags.make();
     }
 
     /// The seed as a physical range ((0, 0) if none): the frame allocator never hands it out.
@@ -273,24 +329,66 @@ impl KernelHeap {
         // Where it may reclaim, the heap leaves the reserve to callers that cannot (spin-lock holders) until its
         // last try (round 2: a console write under its spin locks found no frame at all, the heap's big blocks had
         // taken the reserve); Linux's GFP_KERNEL keeps the min watermark the same way.
-        let mut keep = crate::reclaim::keep_reserve();
+        let keep = crate::reclaim::keep_reserve();
+        // What reclaim and compaction are asked to make room for: this class's slab. An order below it never
+        // serves the slab, and the caller would wait out its patience beside blocks too small for it.
+        let order = self.classes[c].geo.order;
         for attempt in 0u32.. {
-            if attempt == KEEP_TRIES && keep.as_ref().is_some_and(crate::reclaim::Keep::held) {
-                keep = None;
+            if attempt == KEEP_TRIES && let Some(k) = &keep {
+                k.dip();
             }
             if let Some(o) = self.small_try(c) {
                 return o;
             }
-            // A slab is a block of a few frames: the same small order for every class.
-            if !self.regain(&mut regain, attempt, SLAB_ORDER_HINT) {
+            if !self.regain(&mut regain, attempt, order) {
                 break;
             }
         }
-        if keep.as_ref().is_some_and(crate::reclaim::Keep::held) {
-            drop(keep);
-            return self.small_try(c).unwrap_or(0);
+        // Null is next, and null to the Rust allocator's caller is a kernel panic: nothing is kept from this try.
+        if let Some(k) = keep.as_ref().filter(|k| k.held()) {
+            k.last();
+            if let Some(o) = self.small_try(c) {
+                return o;
+            }
+            return self.never_fail(order, k, &mut || self.small_try(c)).unwrap_or(0);
         }
         0
+    }
+
+    /// MEMCRASH row 2 (`oom`): a block of order <= `oom::COSTLY_ORDER` whose caller may sleep does not fail. Called
+    /// after the last try with the reserves open: each round reclaims and compacts again, frees what passed its
+    /// grace period, tries with both reserves kept (`Keep::hold`; all of them only for a thread whose program is
+    /// being ended, Linux ALLOC_OOM, and on the try before the OOM killer), and between two rounds `oom::Stall`
+    /// sleeps a millisecond for kswapd and kcompactd and, after rounds without progress, asks the OOM killer.
+    /// None where the rule does not hold (the caller answers null as before) or when nothing was left to kill.
+    ///
+    /// This is also the answer to the patience cut (`cut_patience`): an allocation whose caller holds a lock others
+    /// wait for stops its patient rounds after `REGAIN_HELD_NS`, takes its last try with the reserves open, and,
+    /// for a small block, goes on here instead of answering null (the null was the Mini-PC's panic of 13.11.2026).
+    fn never_fail(&self, order: u32, keep: &crate::reclaim::Keep, try_once: &mut dyn FnMut() -> Option<usize>) -> Option<usize> {
+        if !self.global || !crate::oom::may_nofail(order) {
+            return None;
+        }
+        let mut stall = crate::oom::Stall::new(order);
+        loop {
+            let mut grace = crate::grace::WaitBudget::default();
+            if crate::grace::waiting() {
+                crate::grace::expedite_with(&mut grace);
+            }
+            self.drain_scattered();
+            let round = self.src.heap_round(order, &mut grace);
+            if crate::oom::current_dying() || stall.oom_next() {
+                keep.last();
+            } else {
+                keep.hold();
+            }
+            if let Some(v) = try_once() {
+                return Some(v);
+            }
+            if !stall.next(round.progress()) {
+                return None;
+            }
+        }
     }
 
     fn small_try(&self, c: usize) -> Option<usize> {
@@ -347,6 +445,14 @@ impl KernelHeap {
     /// allocation spends at most that long here however many rounds it makes (FS-STALL review R3).
     fn regain(&self, r: &mut Regain, attempt: u32, order: u32) -> bool {
         if attempt == 0 {
+            // MEMCRASH row 1: a block of several frames found none. Linux boosts the watermarks when an allocation
+            // steals from another migrate type's pageblock (`boost`); the Mini-PC's crash of 13.11.2026 was such a
+            // miss with free memory above the high watermark, where kswapd slept: the boost wakes it to reclaim
+            // and compact beyond the high watermark for a while.
+            if order > 0 && self.global {
+                crate::boost::raise();
+                crate::boost::wake_if_boosted();
+            }
             // Under the shared budget, and waiting only where reclaim may (round 2 item 5: a spin lock may be
             // `mm.grace` itself); elsewhere only what already passed its grace period.
             if crate::grace::waiting() {
@@ -362,10 +468,16 @@ impl KernelHeap {
         }
         let now = ksync::now_ns();
         // Patient only with a clock: the deadline is what ends the tries then.
-        let patient = now.is_some() && order <= PATIENT_ORDER && crate::reclaim::context_allows() && !crate::reclaim::hurried() && !crate::reclaim::reclaiming();
+        let patient = now.is_some() && order <= PATIENT_ORDER && crate::reclaim::context_allows() && !crate::reclaim::hurried() && !crate::oom::memalloc();
         let span = if patient { REGAIN_PATIENT_NS } else { REGAIN_NS };
+        let since = rounds_began(&mut r.since, now);
         let until = *r.until.get_or_insert(now.map_or(u64::MAX, |t| t.saturating_add(span)));
         if now.is_some_and(|t| t >= until) || (!patient && attempt >= 1 + HEAP_RECLAIM_TRIES) {
+            return false;
+        }
+        if cut_patience(patient, since, now, ksync::holds_waited_lock) {
+            r.cut = true;
+            PATIENCE_CUT.inc();
             return false;
         }
         if !self.src.reclaim_for(order, &mut r.grace) {

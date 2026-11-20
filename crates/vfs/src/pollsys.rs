@@ -1,4 +1,4 @@
-//! FS-4's syscalls: poll, ppoll, select, pselect6 (linux-6.6/fs/select.c) and epoll_create, epoll_create1,
+//! FS-4's syscalls: poll, ppoll, select, pselect6 (linux-7.3.1/fs/select.c) and epoll_create, epoll_create1,
 //! epoll_ctl, epoll_wait, epoll_pwait, epoll_pwait2 (fs/eventpoll.c), with Linux's argument checks and error
 //! order, on the abstract user memory of `sys` (host tests run them unchanged; `vfs-sys` registers them).
 //!

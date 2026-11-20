@@ -1,5 +1,5 @@
-//! Process syscalls: exit (one thread) and exit_group (AB-2, AB-4), wait4 and waitid (linux-6.6/kernel/exit.c
-//! `kernel_wait4` :1745, `kernel_waitid` :1646, `SYSCALL_DEFINE5(waitid)` :1712), getppid, and the process
+//! Process syscalls: exit (one thread) and exit_group (AB-2, AB-4), wait4 and waitid (linux-7.3.1/kernel/exit.c
+//! `kernel_wait4` :1858, `kernel_waitid` :1807, `SYSCALL_DEFINE5(waitid)` :1825), getppid, and the process
 //! group and session calls (kernel/sys.c; the rules are in `proc::job`).
 
 use crate::SysCtx;
@@ -98,8 +98,10 @@ pub(crate) fn waitid_select(c: &SysCtx<'_>, which: u32, id: i32) -> Result<(Sele
         if id < 0 {
             return Err(-EINVAL);
         }
-        let (g, status) = crate::pidfd::get(c, id)?;
-        let sel = Select::Exact { pid: g.tgid, group: Arc::as_ptr(&g) as usize };
+        // L7-PROC: a thread pidfd's pid (PIDTYPE_PID) is never a child unless it is the leader's: ECHILD.
+        let (t, status) = crate::pidfd::get_target(c, id)?;
+        let g = t.group.clone();
+        let sel = Select::Exact { pid: t.id(), group: Arc::as_ptr(&g) as usize };
         return Ok((sel, status & uapi::ab::pidfd::PIDFD_NONBLOCK != 0, Some(g)));
     }
     waitid_plain(c, which, id).map(|s| (global_sel(c, s), false, None))
@@ -159,7 +161,7 @@ fn sys_waitid(c: &mut SysCtx<'_>) -> i64 {
         Err(e) => return e,
     };
     // An O_NONBLOCK pidfd waits as WNOHANG; nothing to report then is EAGAIN unless the caller asked for
-    // WNOHANG itself (linux-6.6/kernel/exit.c:1700-1705).
+    // WNOHANG itself (linux-7.3.1/kernel/exit.c:1801-1802, :1818-1819).
     let mut wopts = opts_from(options, sel, options & WEXITED != 0);
     wopts.nohang |= nonblock;
     let r = match proc::wait_for(c.proc, c.thread.tid(), &wopts) {

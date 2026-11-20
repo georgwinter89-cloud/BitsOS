@@ -1,9 +1,9 @@
 #!/bin/sh
-# SX-3c: the Steam Linux Runtime 3.0 (sniper) with pressure-vessel for the V2 scenario, plus the software graphics
-# provider pressure-vessel takes the drivers from. Output in out/ (git ignores it):
+# SX-3c: the Steam Linux Runtime 3.0 (sniper) with pressure-vessel for the V2 scenario, plus the graphics provider
+# pressure-vessel takes the drivers from. Output in out/ (git ignores it):
 #   out/SteamLinuxRuntime_sniper/   Valve's tree as published (the arm64 pressure-vessel left out)
-#   out/gfx/                        a small Arch-shaped sysroot: the GM-1a Mesa tree (llvmpipe, lavapipe, RADV,
-#                                   radeonsi, glvnd, the Vulkan loader) and the whole glibc of the same package
+#   out/gfx/                        a small Arch-shaped sysroot: the GM-1a Mesa tree (RADV, radeonsi, glvnd, the
+#                                   Vulkan loader; no software driver since DECISIONS 18.11.) and the whole glibc of the same package
 #                                   (pressure-vessel takes the newer glibc of runtime and provider, and with it every
 #                                   glibc library and ldconfig), usr/lib + lib, lib64 -> usr/lib, an ld.so.cache
 # The runtime tarball comes from repo.steampowered.com (pinned snapshot, SHA256 = Valve's SHA256SUMS), the Mesa tree
@@ -81,11 +81,10 @@ ln -s lib "$gfx/usr/lib64"
 ln -s usr/bin "$gfx/bin"
 ln -s usr/bin "$gfx/sbin"
 ln -s bin "$gfx/usr/sbin"
-# Mesa's GLX vendor library lives in the Xwayland tree (WY-3b), not in the Mesa tree. Without it the runtime's own older one stays
-# in the container, and that cannot load this provider's drivers ("image driver extension not found").
-xw=${XWAYLAND_STAGE:-/var/tmp/claude-v2/stage/xwayland}/lib
+# Mesa's GLX vendor library and what it needs come with the Mesa tree. Without them the runtime's own older ones stay in the
+# container, and those cannot load this provider's drivers ("image driver extension not found").
 for l in libGLX_mesa.so.0 libxcb-glx.so.0 libXext.so.6 libXxf86vm.so.1; do
-  cp -L "$xw/$l" "$gfx/usr/lib/$l" || die "no $l in $xw: stage the Xwayland tree first"
+  [ -e "$gfx/usr/lib/$l" ] || die "no $l in the Mesa tree ($mesa/lib)"
 done
 : > "$gfx/etc/ld.so.conf"
 ldconfig -r "$gfx" -X

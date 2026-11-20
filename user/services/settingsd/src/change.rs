@@ -5,6 +5,7 @@ use crate::events::{Level, q};
 use crate::journal::{Entry, Journal};
 use crate::json::Json;
 use crate::key::{Applier, KeyDef, Restart, Safety};
+use crate::providers;
 use crate::registry::{Error, Registry, err, now_ms};
 use crate::store::{self, Job, Place, Writer};
 use crate::value::Value;
@@ -13,12 +14,15 @@ use std::collections::BTreeSet;
 pub struct Who<'a> {
     pub source: &'a str,
     pub confirmed: bool,
+    /// The program on the socket, for the events of a refusal (None: a caller inside settingsd).
+    pub asker: Option<&'a crate::peer::Peer>,
 }
 
 impl Registry {
     pub fn set(&mut self, key: &str, value: &Json, who: &Who) -> Result<Json, Error> {
         let d = self.def(key)?.clone();
         let v = d.ty.parse_json(value).map_err(|e| err("bad_value", format!("{key}: {e}")))?;
+        providers::check_value(key, &v).map_err(|e| err("bad_value", format!("{key}: {e}")))?;
         self.change(&d, if v == d.default { None } else { Some(v) }, who, "set", None)
     }
 
@@ -34,15 +38,15 @@ impl Registry {
         self.undo_expect(n, None, who)
     }
 
-    /// `undo` that names the change it may revert (WY-10/2): with `expect` and n == 1, a newer change made
-    /// meanwhile (another program, a second page) is `changed_meanwhile` and nothing changes.
+    /// `undo` that names the newest change it may revert (WY-10/2): with `expect`, a newer change made
+    /// meanwhile (another program, a second page) is `changed_meanwhile` and nothing changes. The journal
+    /// only grows and an undo takes the newest first, so the newest names the whole run of `n`.
     pub fn undo_expect(&mut self, n: usize, expect: Option<u64>, who: &Who) -> Result<Json, Error> {
         let todo = self.journal.undo_candidates(n.max(1));
         if todo.is_empty() {
             return Err(err("nothing_to_undo", "the journal has no change left to undo"));
         }
         if let Some(want) = expect
-            && n <= 1
             && todo[0].seq != want
         {
             return Err(err(
@@ -86,10 +90,27 @@ impl Registry {
         if d.safety == Safety::Confirm && !who.confirmed {
             return Err(err("needs_confirm", format!("{}: ask Georg first, then send \"confirmed\": true", d.name)));
         }
+        if d.safety == Safety::Confirm && who.asker.is_some_and(crate::vouch::in_tree) {
+            self.ev.emit(Level::Warn, "confirm.refused", &format!("what={op} key={} why={}", q(&d.name), q(crate::vouch::TREE)));
+            return Err(err("needs_confirm", format!("{}: Aus dem Assistenten heraus zählt die Bestätigung nicht; Georg ändert das selbst: {}.", d.name, crate::vouch::WHERE)));
+        }
         let old = self.values.get(&d.name).cloned();
         let eff = |v: &Option<Value>| v.clone().unwrap_or_else(|| d.default.clone());
+        let now = |k: &str| self.values.get(k).cloned().or_else(|| self.defs.get(k).map(|d| d.default.clone()));
+        if let Some(what) = crate::leash::loosens_beside(&d.name, &eff(&old), &eff(&new), &now) {
+            self.own_yes(op, &d.name, who, &what)?;
+        }
         if old == new && undoes.is_none() {
             return Ok(self.answer(d, &old, &new, "unchanged", None, "-").with("changed", false));
+        }
+        if old != new {
+            self.check_redirect(d, op, who)?;
+        }
+        // A name taken off the provider list takes the provider along (`providers.rs`).
+        let leaving = if d.name == providers::LIST { self.leaving(new.as_ref(), who)? } else { Vec::new() };
+        // Their roles first: the list's own change stays the newest, the one an undo by number names.
+        for (role, left) in self.roles_without(&leaving) {
+            self.change(&role, left, who, "set", None)?;
         }
         if let Applier::Kernel { config, .. } = &d.applier {
             let check = Job::ConfigCheck(self.paths.config(&self.place), config.clone(), new.as_ref().map(Value::show));
@@ -108,6 +129,9 @@ impl Registry {
             Some(v) => self.values.insert(d.name.clone(), v.clone()),
             None => self.values.remove(&d.name),
         };
+        let (gone, forgot) = self.drop_providers(&leaving, who.source);
+        // Should the write below move everything to the fallback, the stick loses them at the resync.
+        self.pending.extend(gone.iter().cloned());
         let secret = d.safety == Safety::Secret;
         let entry = self.journal.add(Entry {
             seq: 0,
@@ -124,7 +148,10 @@ impl Registry {
             .effective("settings.history_keep")
             .and_then(|v| if let Value::Int(n) = v { usize::try_from(n).ok() } else { None });
         let trimmed = keep.is_some_and(|k| self.journal.trim(k));
-        let stored = self.persist(d, &entry, trimmed);
+        let stored = self.persist(d, &entry, trimmed || forgot);
+        if d.name == providers::LIST {
+            self.settle_providers(&gone);
+        }
         let show = |v: &Option<Value>| if secret { "***".to_string() } else { eff(v).show() };
         self.ev.emit(
             Level::Info,
@@ -190,7 +217,7 @@ impl Registry {
                         format!("{}: {} still hangs since an earlier write", d.name, p.display()),
                     ));
                 }
-                // sysfs takes the whole buffer (linux-6.6/fs/sysfs/file.c sysfs_kf_write); a newline ends it.
+                // sysfs takes the whole buffer (linux-7.3.1/fs/sysfs/file.c:136 sysfs_kf_write); a newline ends it.
                 let (p2, text) = (p.clone(), format!("{}\n", v.show()));
                 let r = self.sys.call(move || store::write_attr(&p2, &text).map_err(|e| e.to_string()));
                 let fail = |this: &Self, e: String| {

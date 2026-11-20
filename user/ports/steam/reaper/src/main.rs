@@ -3,7 +3,7 @@
 //! Same as Valve's: the words before `--` mean nothing, its three error texts, child subreaper, fork and exec, waits until
 //! no descendant is left. On purpose not as Valve's: TERM and INT go on to the command's process group, the exit code is the
 //! command's (Valve's always 0), and a command that cannot start ends with 127 or 126 (Valve's child falls into the wait loop).
-//! Word list and Valve's `main`: plan/notes/sx-GM-2b.md. Linux: kernel/sys.c PR_SET_CHILD_SUBREAPER, kernel/exit.c:583.
+//! Word list and Valve's `main`: plan/spec/sandbox.md §6. Linux: kernel/sys.c PR_SET_CHILD_SUBREAPER, kernel/exit.c:583.
 
 mod sys;
 

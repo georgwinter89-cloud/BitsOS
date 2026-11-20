@@ -1,6 +1,8 @@
-/* SX-2: /proc/<pid>/ns/ files and setns(2) (linux-6.6/fs/proc/namespaces.c, fs/nsfs.c, kernel/nsproxy.c setns,
+/* SX-2: /proc/<pid>/ns/ files and setns(2) (linux-7.3.1/fs/proc/namespaces.c, fs/nsfs.c, kernel/nsproxy.c:569 setns,
  * kernel/user_namespace.c userns_install, kernel/utsname.c utsns_install, kernel/pid_namespace.c
- * pidns_install). Shaped like linux-6.6/tools/testing/selftests/nsfs. Inode numbers appear only as relations. */
+ * pidns_install). Shaped like linux-7.3.1/tools/testing/selftests/filesystems/nsfs. Inode numbers appear
+ * only as relations, except the fixed ones of the initial namespaces the program starts in
+ * (linux-7.3.1/include/uapi/linux/nsfs.h:48). */
 #include "ns.h"
 #include <sys/utsname.h>
 
@@ -45,8 +47,8 @@ static int in_userns(void) {
     return 0;
 }
 
-/* Mode "fsshared": entering a user namespace needs an fs_struct nobody else uses (linux-6.6/kernel/user_namespace.c
- * userns_install: EINVAL while a CLONE_FS sibling shares it); after unshare(CLONE_FS) it works. */
+/* Mode "fsshared": entering a user namespace needs an fs_struct nobody else uses (linux-7.3.1/kernel/user_namespace.c
+ * userns_install :1358: EINVAL while a CLONE_FS sibling shares it); after unshare(CLONE_FS) it works. */
 static int fsshared(void) {
     int go[2], ready[2], hold[2];
     if (pipe(go) || pipe(ready))
@@ -102,6 +104,7 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof path, "/proc/self/ns/%s", names[i]);
         unsigned long n = ino_of_link(path, type, sizeof type);
         printf("%s: readlink type %s, stat inode is the number = %s\n", names[i], type, yn(n && n == ino(path)));
+        printf("%s: initial namespace inode %#lx\n", names[i], n);
     }
     printf("pid and pid_for_children are one namespace = %s\n", yn(ino("/proc/self/ns/pid") == ino("/proc/self/ns/pid_for_children")));
     printf("user differs from net = %s\n", yn(ino("/proc/self/ns/user") != ino("/proc/self/ns/net")));

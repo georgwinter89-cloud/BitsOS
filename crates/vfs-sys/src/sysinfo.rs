@@ -30,19 +30,32 @@ impl FileSource for Config {
     }
 }
 
-fn pci_entries() -> Vec<FlatEntry> {
-    pci::sysfs::entries()
-        .into_iter()
+/// PCI's view in the VFS's form, kept while PCI hands out the same view object.
+type Kept = (Arc<Vec<pci::sysfs::SysEntry>>, Arc<Vec<FlatEntry>>);
+static PCI_KEPT: ksync::SpinLock<Option<Kept>> = ksync::SpinLock::named("vfs.sys.pci_view", None);
+
+fn pci_entries() -> Arc<Vec<FlatEntry>> {
+    let from = pci::sysfs::entries_shared();
+    if let Some((_, flat)) = PCI_KEPT.lock().as_ref().filter(|(of, _)| Arc::ptr_eq(of, &from)) {
+        return flat.clone();
+    }
+    let flat: Vec<FlatEntry> = from
+        .iter()
         .map(|e| FlatEntry {
-            path: e.path,
-            kind: match e.kind {
+            path: e.path.clone(),
+            kind: match &e.kind {
                 pci::sysfs::SysKind::Dir => FlatKind::Dir,
-                pci::sysfs::SysKind::Text(t) => FlatKind::Text(t),
-                pci::sysfs::SysKind::Link(t) => FlatKind::Link(t),
-                pci::sysfs::SysKind::Config { loc, size } => FlatKind::File { perm: 0o444, src: Arc::new(Config { loc, size }) },
+                pci::sysfs::SysKind::Text(t) => FlatKind::Text(t.clone()),
+                pci::sysfs::SysKind::Link(t) => FlatKind::Link(t.clone()),
+                pci::sysfs::SysKind::Config { loc, size } => FlatKind::File { perm: 0o444, src: Arc::new(Config { loc: *loc, size: *size }) },
             },
         })
-        .collect()
+        .collect();
+    let flat = Arc::new(flat);
+    let old = core::mem::replace(&mut *PCI_KEPT.lock(), Some((from, flat.clone())));
+    // Freed with the lock released.
+    drop(old);
+    flat
 }
 
 fn pci_view() -> Arc<dyn DirSource> {

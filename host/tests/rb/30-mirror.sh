@@ -8,7 +8,7 @@
 #           second start and the line after it, no loss marker;
 #   boot 2: a forced panic after the boot went out: its line can only come through the panic path
 #           (try_event! + NetDevice::poll_tx). Needs the desk's panic-handler lines and an allocation-free
-#           console emergency write (plan/notes/rb-RB-4.md, change requests 1 and 2). Without them: RED.
+#           console emergency write (RB-4's change requests 1 and 2). Without them: RED.
 # Ports: the listener on LO+300 (never 6666, the real listener's).
 set -eu
 cd "${BITSOS_ROOT:-$(git rev-parse --show-toplevel)}"

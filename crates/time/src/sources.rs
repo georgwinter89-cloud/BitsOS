@@ -151,6 +151,20 @@ fn measure_counter(read: &mut dyn FnMut() -> u64, ctr: Counter) -> Result<u64, C
     calib::measure(read, &mut tsc, &mut pause, ctr, calib::WINDOW_FS)
 }
 
+/// TSC ticks per millisecond no CPU reaches (20 GHz): the PIT wait's time bound before any rate is known.
+pub const PIT_GIVE_UP_TICKS_PER_MS: u64 = 20_000_000;
+/// The older bound, kept as the last resort should the TSC itself stand still.
+pub const PIT_GIVE_UP_SPINS: u64 = 50_000_000;
+
+/// Whether the wait for the PIT's output is over without a result (pure; host-tested). A PIT that counts ends the
+/// wait itself after `ms` ms, long before either bound. One whose clock the firmware gated (Intel chipsets can
+/// switch the 8254 off) never does: without the time bound that wait was 50 million port reads with interrupts
+/// off, most of a minute on real hardware, before anything is on the screen. With it: `ms` ms of a 20 GHz clock,
+/// which on a 4 GHz machine is five times `ms`.
+pub fn pit_gave_up(spins: u64, tsc_elapsed: u64, ms: u64) -> bool {
+    spins > PIT_GIVE_UP_SPINS || tsc_elapsed > ms.saturating_mul(PIT_GIVE_UP_TICKS_PER_MS)
+}
+
 /// PIT channel 2 with the speaker gate: TSC ticks during `ms` ms (at most 54) of PIT time; `None` without a
 /// PIT (the gate never ends) or on the host.
 pub fn calibrate_with_pit(ms: u64) -> Option<u64> {
@@ -168,7 +182,7 @@ pub fn calibrate_with_pit(ms: u64) -> Option<u64> {
     let mut spins = 0u64;
     while hal::portio::inb(0x61).ok()? & 0x20 == 0 {
         spins += 1;
-        if spins > 50_000_000 {
+        if pit_gave_up(spins, hal::cpu::rdtsc().wrapping_sub(start), ms) {
             let _ = hal::portio::outb(0x61, p61);
             return None;
         }
@@ -200,4 +214,26 @@ pub fn cpuid_rates() -> CpuidRates {
         r.leaf16_mhz = (mhz != 0).then_some(mhz);
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pit_wait_ends_by_time_long_before_the_spin_bound() {
+        // A PIT that counts: 10 ms on the Mini-PC (3.8 GHz) and on a 10 GHz clock, a few thousand port reads.
+        assert!(!pit_gave_up(30_000, 10 * 3_800_000, 10));
+        assert!(!pit_gave_up(30_000, 10 * 10_000_000, 10));
+        assert!(!pit_gave_up(150_000, 50 * 10_000_000, 50));
+        // A gated PIT on the Gaming-PC (3.9 GHz): over after 10 x 20 M ticks, which is 51 ms, not 50 M reads.
+        assert!(pit_gave_up(60_000, 200_000_001, 10));
+        assert!(!pit_gave_up(60_000, 200_000_000, 10));
+        assert!(pit_gave_up(300_000, 1_000_000_001, 50));
+        // A TSC that stands still: the spin bound still ends it.
+        assert!(pit_gave_up(PIT_GIVE_UP_SPINS + 1, 0, 10));
+        assert!(!pit_gave_up(PIT_GIVE_UP_SPINS, 0, 10));
+        // A huge window does not overflow into "give up at once".
+        assert!(!pit_gave_up(1, u64::MAX - 1, u64::MAX));
+    }
 }

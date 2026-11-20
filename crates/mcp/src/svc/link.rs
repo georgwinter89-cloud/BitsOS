@@ -4,8 +4,9 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::any::Any;
 use net::sock::abi::{AF_UNIX, MSG_DONTWAIT, MSG_NOSIGNAL, SHUT_RDWR};
 use net::sock::unix::{SendArgs, UType, UnixSock};
 use net::sock::{Caller, SliceSource};
@@ -19,6 +20,16 @@ pub struct Peer {
     pub gid: u32,
 }
 
+/// Which program image called connect, where the socket keeps that (INT-CL3T; `net::sock::Program`).
+#[derive(Clone)]
+pub enum By {
+    /// This kind of link keeps no record (std's sockets in host tests): the pid is all there is.
+    Untold,
+    /// The kernel's socket: the image that called connect, a `Process` of the process layer. None: the kernel
+    /// itself connected, or that image is gone (it ended, or its process runs another program by now).
+    Image(Option<Arc<dyn Any + Send + Sync>>),
+}
+
 /// One service's connection.
 pub trait Link: Send + Sync {
     /// Blocks until bytes arrive (their count), the peer closed (0) or `close` was called (0 or an error).
@@ -28,6 +39,16 @@ pub trait Link: Send + Sync {
     /// Ends both directions; a blocked `read` returns.
     fn close(&self);
     fn peer(&self) -> Peer;
+    /// The program image that called connect.
+    fn by(&self) -> By {
+        By::Untold
+    }
+    /// Whether the peer is gone for good, asked without waiting and without taking its bytes (MC-L: a caller
+    /// that waits for a tool looks here instead of reading). The kernel's sockets say so once both directions
+    /// ended (the peer's last holder closed it); false where it cannot be told.
+    fn hung_up(&self) -> bool {
+        false
+    }
 }
 
 /// The socket services connect to.
@@ -51,6 +72,10 @@ const SOCK_UMASK: u32 = 0o111;
 pub struct UnixLink {
     sock: Arc<UnixSock>,
     peer: Peer,
+    /// The image that called connect, as the socket recorded it. Weak, as the socket's own record: a link
+    /// must not keep a program's image alive (the door holds the image of a peer it admitted, no other link
+    /// does); the address still cannot go to a later image while this stands.
+    by: Option<Weak<dyn Any + Send + Sync>>,
 }
 
 impl Link for UnixLink {
@@ -86,6 +111,12 @@ impl Link for UnixLink {
     fn peer(&self) -> Peer {
         self.peer
     }
+    fn by(&self) -> By {
+        By::Image(self.by.as_ref().and_then(Weak::upgrade))
+    }
+    fn hung_up(&self) -> bool {
+        self.sock.poll() & vfs::Events::HUP != 0
+    }
 }
 
 impl Drop for UnixLink {
@@ -104,7 +135,8 @@ impl Listen for UnixListen {
     fn accept(&self) -> Result<Box<dyn Link>, i64> {
         let s = self.sock.accept(false)?;
         let c = s.peercred().unwrap_or_default();
-        Ok(Box::new(UnixLink { sock: s, peer: Peer { pid: c.pid, uid: c.uid, gid: c.gid } }))
+        let by = s.peer_program().map(|p| p.image.clone());
+        Ok(Box::new(UnixLink { sock: s, peer: Peer { pid: c.pid, uid: c.uid, gid: c.gid }, by }))
     }
     fn close(&self) {
         let _ = self.sock.shutdown(SHUT_RDWR);
@@ -131,7 +163,7 @@ fn sockaddr(path: &str) -> Vec<u8> {
 
 /// Listens on `path` in the root name space: makes its folder (0755), removes a stale socket of an earlier
 /// registry, binds (mode 0666) and listens. A socket someone still listens on stays (EADDRINUSE, as Linux's
-/// bind: linux-6.6/net/unix/af_unix.c unix_bind_bsd); stale = a probe connect is refused (ECONNREFUSED), the
+/// bind: linux-7.3.1/net/unix/af_unix.c:1356 unix_bind_bsd); stale = a probe connect is refused (ECONNREFUSED), the
 /// usual test of a daemon's socket. Another kind of file there: bind's EADDRINUSE.
 pub fn bind_kernel(path: &str) -> Result<UnixListen, i64> {
     let ns = vfs::root_ns();
@@ -172,5 +204,5 @@ pub fn connect_kernel(path: &str) -> Result<UnixLink, i64> {
         sock.release(false);
         return Err(e);
     }
-    Ok(UnixLink { sock, peer: Peer::default() })
+    Ok(UnixLink { sock, peer: Peer::default(), by: None })
 }

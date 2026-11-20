@@ -63,9 +63,9 @@ stop_own() {
 trap stop_own EXIT
 fail() { echo "RED: $*"; exit 1; }
 
-# usb_msd_skip=on: the US-4 mass storage driver leaves the sticks to these raw transfer tests (US-4's own tests are
+# ktest_usb_msd_skip=on: the US-4 mass storage driver leaves the sticks to these raw transfer tests (US-4's own tests are
 # in 50-msd.sh).
-cargo xtask image --name "$NAME" --ktest --config-extra "ktest=us.xfer,us.enum.boot;usb_xfer_test=on;usb_msd_skip=on;loglevel=info"
+cargo xtask image --name "$NAME" --ktest --config-extra "ktest=us.xfer,us.enum.boot;usb_xfer_test=on;ktest_usb_msd_skip=on;loglevel=info"
 for attempt in 1 2; do
     rm -f "$SOCK" "$LOG"
     cargo xtask qemu --name "$NAME" --timeout 240 --serial-log "$LOG" -- \

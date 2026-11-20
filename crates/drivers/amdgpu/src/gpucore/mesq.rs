@@ -59,7 +59,7 @@ pub(crate) fn run<H: Hw>(owner: &mut Bringup<Watch<H>>, a: &MesAddrs, l: &Layout
     let m = mem(owner, l.compute_mqd, &mesmqd::bytes(&mesmqd::compute_mqd(&cp)));
     select(owner, a, 0, 0, 0)?;
     m?;
-    let mut comp = PmQueue::new(cp.ring, cp.ring_bytes, Some(cp.rptr), cp.wptr, mes11::COMPUTE_DOORBELL_DW)?;
+    let mut comp = PmQueue::new_gfx(cp.ring, cp.ring_bytes, Some(cp.rptr), cp.wptr, mes11::COMPUTE_DOORBELL_DW)?;
     comp.reset(owner)?;
     // amdgpu_gfx_mes_enable_kcq: the KIQ's SET_RESOURCES (every queue, no cleaner shader) and its ring test, then
     // the compute ring through MES.
@@ -74,7 +74,7 @@ pub(crate) fn run<H: Hw>(owner: &mut Bringup<Watch<H>>, a: &MesAddrs, l: &Layout
     select(owner, a, 0, 0, 0)?;
     m?;
     zero(owner, gp.ring, gp.ring_bytes)?;
-    let mut gq = PmQueue::new(gp.ring, gp.ring_bytes, Some(gp.rptr), gp.wptr, gfx11::DOORBELL_DW)?;
+    let mut gq = PmQueue::new_gfx(gp.ring, gp.ring_bytes, Some(gp.rptr), gp.wptr, gfx11::DOORBELL_DW)?;
     gq.reset(owner)?;
     let f = Frame::map_legacy(mesapi::qtype::GFX, mes11::GFX_PIPE, mes11::GFX_QUEUE, gfx11::DOORBELL_DW, gp.mqd, gp.wptr);
     api(owner, l, ring, inp.api_us, r, STEPS[2], f, format!("ME 0 pipe {} queue {}, doorbell {:#x}, MQD MC {:#x}, ring MC {:#x} {} KiB", mes11::GFX_PIPE, mes11::GFX_QUEUE, gfx11::DOORBELL_DW, gp.mqd, gp.ring, gp.ring_bytes >> 10))?;

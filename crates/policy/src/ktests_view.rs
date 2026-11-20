@@ -14,7 +14,7 @@ static RUN: AtomicU32 = AtomicU32::new(0);
 
 /// A subject no real process has: a new pid per call.
 pub(crate) fn fresh(program: u32) -> Subject {
-    Subject { program: ProgramId(program), pid: 0x7f00_0000 + RUN.fetch_add(1, Ordering::Relaxed), uid: 1000 }
+    Subject { program: ProgramId(program), pid: 0x7f00_0000 + RUN.fetch_add(1, Ordering::Relaxed), uid: 1000, tree: 0 }
 }
 
 /// One answer record for `build_answer`: owner name, type, data (A/AAAA bytes, or a CNAME target name).
@@ -303,7 +303,7 @@ pub(crate) fn kernel_answers_ignored() -> TestResult {
     let ans = build_answer("kernel.example", 1, &[Rr::A("kernel.example", ip)]);
     note_dns_answer(&Subject::KERNEL, &ans);
     kassert!(!crate::dns::stored(&Subject::KERNEL, IpAddr::V4(ip)), "the kernel's answer was stored");
-    let sys = Subject { program: ProgramId::SYSTEM, pid: 0, uid: 0 };
+    let sys = Subject { program: ProgramId::SYSTEM, pid: 0, uid: 0, tree: 0 };
     note_dns_answer(&sys, &ans);
     kassert!(!crate::dns::stored(&sys, IpAddr::V4(ip)), "a pid 0 answer was stored");
     // Through a socket's peers too, also after the kernel socket asked that server.

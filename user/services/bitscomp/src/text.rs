@@ -1,8 +1,9 @@
 //! Text of the interface (WY-5, DS-1): the design v2 families Bricolage Grotesque (display), Figtree (interface) and
 //! JetBrains Mono (labels, addresses), and Exo 2 (the first look's font, still selectable), all OFL 1.1 (fonts/),
-//! rendered by fontdue with grey-level antialiasing. The faces are built into the binary (no font files on V2, no
-//! fontconfig) and parsed on first use, so a family nobody shows costs nothing at boot. A character the font lacks
-//! comes from the next family that has it; the glyphs none has are drawn as paths (`icon`). One glyph cache for all
+//! rendered by fontdue with grey-level antialiasing. The faces are built into the binary (no fontconfig) and parsed
+//! on first use, so a family nobody shows costs nothing at boot. A character the font lacks
+//! comes from the next family that has it, then from V2's symbol font files (`crate::symbols`, read on first
+//! need); the interface's own signs none has are drawn as paths (`icon`). One glyph cache for all
 //! sizes (key: face or icon, pixel size, character); it is a cache, emptied when it grows large.
 
 mod icon;
@@ -33,7 +34,7 @@ pub enum Weight {
     Regular,
     Medium,
     SemiBold,
-    /// Figtree 700 and Exo 2 700 (the boards' strong text, DS-2..5).
+    /// Figtree 700, Exo 2 700 and Bricolage 700 (the boards' strong text and big titles, DS-2..5, GM-6f).
     Bold,
 }
 
@@ -117,6 +118,7 @@ impl Families {
 const FILES: &[(Typeface, i32, &[u8])] = &[
     (Typeface::Bricolage, 500, include_bytes!("../fonts/BricolageGrotesque-500.ttf")),
     (Typeface::Bricolage, 600, include_bytes!("../fonts/BricolageGrotesque-600.ttf")),
+    (Typeface::Bricolage, 700, include_bytes!("../fonts/BricolageGrotesque-700.ttf")),
     (Typeface::Figtree, 400, include_bytes!("../fonts/Figtree-400.ttf")),
     (Typeface::Figtree, 500, include_bytes!("../fonts/Figtree-500.ttf")),
     (Typeface::Figtree, 600, include_bytes!("../fonts/Figtree-600.ttf")),
@@ -134,9 +136,32 @@ const FILES: &[(Typeface, i32, &[u8])] = &[
 /// Where a character the font lacks is looked for next.
 const FALLBACK: [Typeface; 4] = [Typeface::Figtree, Typeface::JetBrainsMono, Typeface::Exo2, Typeface::Bricolage];
 
+/// A face index: the built-in files first, then V2's symbol font files (`crate::symbols`) at FILES.len() + k.
 fn face(i: usize) -> &'static Face {
     static FACES: [OnceLock<Face>; FILES.len()] = [const { OnceLock::new() }; FILES.len()];
-    FACES[i].get_or_init(|| Face::from_bytes(FILES[i].2, FontSettings::default()).expect("built-in font parses"))
+    match i.checked_sub(FILES.len()) {
+        None => FACES[i].get_or_init(|| Face::from_bytes(FILES[i].2, FontSettings::default()).expect("built-in font parses")),
+        Some(k) => symbol_face(k).expect("a symbol face is only chosen once it loaded"),
+    }
+}
+
+/// GPY: V2's symbol font file `k`, read and parsed on the first character no built-in family has; a file that is
+/// missing or does not parse is no face (that character keeps the empty box, as before).
+fn symbol_face(k: usize) -> Option<&'static Face> {
+    static FACES: [OnceLock<Option<Face>>; crate::symbols::FONTS.len()] =
+        [const { OnceLock::new() }; crate::symbols::FONTS.len()];
+    FACES[k]
+        .get_or_init(|| {
+            let (name, path) = crate::symbols::FONTS[k];
+            match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| Face::from_bytes(b, FontSettings::default()).map_err(str::to_string)) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("bitscomp: symbol font {name} ({path}): {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// The parsed face of `tf` nearest to weight `w`, for a drawing that places glyphs itself: DS-5's boot scene must
@@ -281,6 +306,11 @@ impl Font {
                 .filter(|&&tf| tf != self.typeface)
                 .map(|&tf| file(tf, self.weight))
                 .find(|&i| face(i).has_glyph(c))
+                .or_else(|| {
+                    (0..crate::symbols::FONTS.len())
+                        .find(|&k| symbol_face(k).is_some_and(|f| f.has_glyph(c)))
+                        .map(|k| FILES.len() + k)
+                })
                 .map_or(Src::Face(own), Src::Face);
             m.insert((own, c), s);
             s

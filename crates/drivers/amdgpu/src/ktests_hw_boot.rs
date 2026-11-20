@@ -59,6 +59,9 @@ enum Run {
 }
 
 /// `run`'s chip.
+/// The fake chips' held jobs (GP-GPU1: a device's `hw::live::Slots::held`; the fakes here have no device).
+static HELD: crate::hw::live::HeldJobs = crate::hw::live::HeldJobs::new();
+
 struct FakeBoot {
     d: Discovery,
     start: StartAs,
@@ -249,7 +252,7 @@ impl Chip for FakeBoot {
     }
     fn stop(&self, lines: &mut Vec<String>) -> Result<bool, ()> {
         self.stops.set(self.stops.get() + 1);
-        match self.slot.stop_gate() {
+        match self.slot.stop_gate(&HELD) {
             Ok(n) => lines.extend(n),
             Err(why) => {
                 lines.push(why);
@@ -508,34 +511,47 @@ fn after_reload() -> ktest::TestResult {
 }
 ktest::ktest!("gx.hw.boot_after_reload", Safe, after_reload);
 
-/// `hw::boot::spawn` as the kernel's call starts it, in the scenario's boot: the thread takes the hold, lets go at its end,
-/// and the report stands. The state is the boot's own, so only this boot may play with it.
+/// `hw::boot::spawn` as the kernel's call starts it, in the scenario's boot: the thread takes the hold and tells the
+/// desktop's start at its end (up: start; failed: no desktop, the one line), and the report stands. The state is the
+/// boot's own, so only this boot may play with it.
 fn thread() -> ktest::TestResult {
     use crate::hw::boot::{Script, ScriptChip};
+    use console::bootscreen::{DesktopGpu, desktop_gpu, no_gpu_line};
     for (script, up) in [(Script::Up, true), (Script::Fail, false)] {
-        boot::spawn(ScriptChip { script, gate: ToolGate::new() }, BOUND_NS);
-        kassert!(console::bootscreen::desktop_hold().is_some() || !boot::answer().contains("still running"), "no hold while it runs");
+        boot::spawn(&crate::devs::registry().machine, ScriptChip { script, gate: ToolGate::new() }, BOUND_NS);
+        kassert!(matches!(desktop_gpu(), DesktopGpu::Held(_)) || !boot::answer().contains("still running"), "no hold while it runs");
         let t0 = crate::hw::clock_ns();
-        while console::bootscreen::desktop_hold().is_some() {
+        while matches!(desktop_gpu(), DesktopGpu::Held(_)) {
             kassert!(crate::hw::clock_ns().saturating_sub(t0) < BOUND_NS, "{script:?}: still held past the bound");
             sched::sleep_ns(10_000_000);
         }
         let a = boot::answer();
         let want = if up { "gx_bringup: PASS\nboot: up on renderD" } else { "gx_bringup: FAIL\nboot: failed at sdma, stop done" };
         kassert!(a.starts_with(want), "{script:?}: {a}");
+        let told = desktop_gpu();
+        if up {
+            kassert!(told == DesktopGpu::Up, "{script:?}: the desktop was told {told:?}");
+        } else {
+            let line = no_gpu_line();
+            kassert!(told == DesktopGpu::None && line == boot::failed_line("sdma"), "{script:?}: the desktop was told {told:?}, line {line:?}");
+        }
     }
     Ok(())
 }
 ktest::ktest!("gx.hw.boot_thread", Run("gx/10-boot"), thread);
 
-/// What the boot's run left, in `gx/15-boot-gpu`'s boots, after it ended: the desktop let go, and a render node only when it
-/// came up. The failing boots have `drm=off`, so any device is one that the run left behind.
+/// What the boot's run left, in `gx/10-boot`'s boots 1-3, after it ended: the desktop told (up: it may start; failed: no
+/// desktop), and a render node only when it came up. The failing boots have no `drm=fake`, so any device is one that the
+/// run left behind.
 fn report() -> ktest::TestResult {
-    kassert!(console::bootscreen::desktop_hold().is_none(), "the desktop is still held");
+    use console::bootscreen::{DesktopGpu, desktop_gpu};
+    let told = desktop_gpu();
     let a = boot::answer();
     if a.starts_with("gx_bringup: PASS\nboot: up on renderD128") {
+        kassert!(told == DesktopGpu::Up, "up, and the desktop was told {told:?}");
         kassert!(drm::device::by_render_minor(128).is_some(), "up, and no render node: {a}");
     } else if a.starts_with("gx_bringup: FAIL\nboot: failed at") {
+        kassert!(told == DesktopGpu::None, "failed, and the desktop was told {told:?}");
         kassert!(a.contains(", stop done"), "not stopped: {a}");
         kassert!(drm::device::devices().is_empty(), "failed, and a render node stands: {a}");
     } else {
@@ -543,4 +559,4 @@ fn report() -> ktest::TestResult {
     }
     Ok(())
 }
-ktest::ktest!("gx.hw.boot_report", Run("gx/15-boot-gpu"), report);
+ktest::ktest!("gx.hw.boot_report", Run("gx/10-boot"), report);

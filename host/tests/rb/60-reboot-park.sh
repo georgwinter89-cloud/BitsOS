@@ -10,12 +10,12 @@
 #  2. poweroff (rb_quiesce_test=poweroff) -> SHUTDOWN guest-shutdown;
 #  3. platform-reboot / 4. platform-poweroff: platform::power::reboot/poweroff (the console's commands);
 #  5. MCP: ktest rb.quiesce.load_for_mcp starts the workers, then the MCP tool `reboot`.
-# Runs 3-5 check the park only when the desk's glue is in (change requests 1 and 2 of plan/notes/rb-RB-quiesce.md:
+# Runs 3-5 check the park only when the desk's glue is in (RB-quiesce's change requests 1 and 2:
 # `park_others` in crates/platform/src/power.rs and crates/mcp/src/tools/reboot.rs); without it they check that
 # the reset or power-off still happens and say SKIP for the park lines. RB_REQUIRE_GLUE=1 (the desk's acceptance
 # run once CR1/CR2 are in) turns those SKIPs into FAILs.
-# RB-14: the same for the storage stop before the park (change requests CR-1 reboot.rs, CR-2 platform/power.rs of
-# plan/notes/rb-RB-14.md): once the source calls block::shutdown::stop_all there, runs 3 and 5 must log
+# RB-14: the same for the storage stop before the park (change requests CR-1 reboot.rs, CR-2
+# platform/power.rs): once the source calls block::shutdown::stop_all there, runs 3 and 5 must log
 # `block shutdown.done why=<reboot|mcp-reboot> ... quiet=true` before the park line; until then SKIP.
 # RB-15: the shutdown order of klog::shutdown on the console (runs 3 and 5): the mirror paused before the storage
 # stop, the storage step, the park, the quiesce step, then the drivers' quiesce and the reset; no step out of

@@ -3,12 +3,12 @@
 # regression of the stage or a pacman -Syu that left it behind turns this red before a Brave download aborts again
 # (Georg 24.10.): the MIME database, the empty loaders.cache, glycin's loader with its config pointing into the tree
 # and matching this host's glycin, the bwrap stand-in, icons without SVG and an index.theme listing every shipped
-# folder. Host only, a few seconds, no QEMU. Without a stage it says so and passes (nothing to check).
+# folder; BR-8: the GPU's libraries and files. Host only, a few seconds, no QEMU. Without a stage it is red: it could check nothing (no SKIP, CR-BR9-6).
 set -uo pipefail
-S=${BRAVE_STAGE:-/var/tmp/claude-v2/stage/brave}
+S=${BRAVE_STAGE:-/var/tmp/claude-v2/stage/brave-w41}
 V2=/boot/BITSOS2/brave
 L=glycin-image-rs
-[ -d "$S" ] || { echo "skip: no stage at $S (bash user/ports/brave-launcher/scripts/stage-v2.sh makes it)"; exit 0; }
+[ -d "$S" ] || { echo "FAIL: no stage at $S, nothing checked (bash user/ports/brave-launcher/scripts/stage-v2.sh makes it)"; exit 1; }
 fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 CONF=$S/share/glycin-loaders/2+/conf.d/$L.conf
@@ -29,5 +29,15 @@ dirs=$(sed -n 's/^\(Scaled\)\{0,1\}Directories=//p' "$S/share/icons/Adwaita/inde
 unlisted=$(cd "$S/share/icons/Adwaita" && find . -mindepth 2 -maxdepth 2 -type d ! -path './cursors*' | sed 's|^\./||' | sort |
   while read -r d; do grep -qx "$d" <<<"$dirs" || echo "$d"; done)
 check "Adwaita: every shipped icon folder is in index.theme${unlisted:+ (not listed: $(echo $unlisted | cut -c1-200))}" '[ -z "$unlisted" ]'
+# BR-8: what Brave's GPU process dlopens (EGL, GLES, GBM, VA-API), each resolving with the tree's lib/ first as Brave
+# finds it (LD_LIBRARY_PATH), and the files the launcher points Mesa at.
+for so in libEGL.so.1 libEGL_mesa.so.0 libGLESv2.so.2 libgbm.so.1 gbm/dri_gbm.so libva.so.2 libva-drm.so.2 dri/radeonsi_drv_video.so; do
+  check "BR-8: lib/$so, its libraries found" '[ -f "$S/lib/$so" ] && out=$(LD_LIBRARY_PATH="$S/lib" ldd "$S/lib/$so" 2>&1) && ! grep -q "not found" <<<"$out"'
+done
+check "BR-8: the VA stand-in's one need is libgallium (where __vaDriverInit lives)" \
+  'readelf -d "$S/lib/dri/radeonsi_drv_video.so" | grep "(NEEDED)" | grep -q "\[libgallium-.*\.so\]" && [ "$(readelf -d "$S/lib/dri/radeonsi_drv_video.so" | grep -c "(NEEDED)")" = 1 ]'
+check "BR-8: glvnd's vendor file names libEGL_mesa.so.0" 'grep -q "\"library_path\" *: *\"libEGL_mesa.so.0\"" "$S/share/glvnd/egl_vendor.d/50_mesa.json"'
+check "BR-8: Mesa's radeonsi defaults and libdrm's AMD product table" '[ -f "$S/share/drirc.d/00-radeonsi-defaults.conf" ] && [ -s "$S/share/libdrm/amdgpu.ids" ]'
+check "BR-8: no GLX (libGL.so.1) and no software driver in the tree" '[ ! -e "$S/lib/libGL.so.1" ] && [ -z "$(find "$S/lib" -name "*swrast*" -o -name "*lvp*" | head -n 1)" ]'
 [ $fails = 0 ] || { echo "stage $S: $fails check(s) failed: rebuild it with stage-v2.sh"; exit 1; }
 echo "stage $S: all ok"

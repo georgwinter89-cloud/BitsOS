@@ -11,8 +11,7 @@ Three tools, all in this directory, none needs a GPU of the host:
 
 Build: `gcc -O2 -shared -fPIC -I/usr/include/libdrm -o drmtrace.so drmtrace.c -ldl -lpthread` and
 `gcc -O2 -I/usr/include/libdrm -o drmreplay drmreplay.c` (the uapi headers of libdrm; the numbers are the kernel's).
-Tests: `host/tests/gm/30-drmtrace-tools.sh` (host, no QEMU) and the hostile and damaged-trace steps of
-`host/tests/gm/20-radv-fake.sh`.
+Tests: `host/tests/gm/30-drmtrace-tools.sh` (host, no QEMU).
 On V2 both run through the Mesa tree's loader like every glibc program there (`run /path/drmreplay TRACE`).
 
 ## Turning it on
@@ -57,7 +56,7 @@ GPU addresses stay (each fd's GPU VM starts empty, so the program's addresses ar
 traced IB dwords are written into this run's buffer at the IB's address. Absolute timeouts are moved: a wait that
 ended well gets 5 s from now, one that timed out none. "Ended well" follows Linux: the syncobj waits answer ETIME
 on a timeout, GEM_WAIT_IDLE and WAIT_CS answer 0 with `out.status` 1 for "still busy", WAIT_FENCES 0 with status
-1 for "signalled" (linux-6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:1493, :1631); that status is compared too.
+1 for "signalled" (linux-7.3.1/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:1545, :1683); that status is compared too.
 
 Same = the same return value and errno, and for INFO (except counters and clocks: TIMESTAMP, usage, evictions,
 MEMORY, SENSOR, VRAM_LOST_COUNTER, GPUVM_FAULT, NUM_HANDLES) and GET_CAP the same answer.

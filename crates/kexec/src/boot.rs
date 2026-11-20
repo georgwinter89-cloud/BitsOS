@@ -20,6 +20,22 @@ static BLANK_DONE: AtomicBool = AtomicBool::new(false);
 /// RB-18: what the running kernel still holds in clear (`config::get`), for a Reload whose stick does not answer.
 static LIVE_SECRETS: Once<fn(&str) -> Option<String>> = Once::new();
 
+/// GP-GUARD: lines the kernel's config module put over the record (the Gaming-PC profile's never-relaxed lines, or
+/// the whole fallback when the loader named no profile). Empty on every other machine.
+static IMPOSED: Once<alloc::vec::Vec<(&'static str, &'static str)>> = Once::new();
+
+/// The kernel's config module calls this once, before any reader of [`config`]: these lines win over the record's,
+/// and an empty value takes the key away. The block layer, the window rule and the panic mode read CONFIG through
+/// [`config`], so without this they would still see what the kernel's own map no longer says.
+pub fn set_imposed(lines: alloc::vec::Vec<(&'static str, &'static str)>) {
+    IMPOSED.get_or_init(|| lines);
+}
+
+/// `Some(value)` when the kernel imposed `key` (pure; an empty value means "no such line").
+pub fn imposed_value<'a>(lines: &'a [(&'static str, &'static str)], key: &str) -> Option<&'a str> {
+    lines.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
 /// The kernel's config module calls this before `set_boot_info`.
 pub fn set_live_secrets(f: fn(&str) -> Option<String>) {
     LIVE_SECRETS.get_or_init(|| f);
@@ -155,6 +171,9 @@ pub fn config(key: &str) -> Option<String> {
     if crate::secret::is_secret(key) {
         klog::event!(Warn, "kexec", "config.secret_refused", key = key; "kexec::boot::config does not hand out a secret");
         return None;
+    }
+    if let Some(v) = IMPOSED.get().and_then(|l| imposed_value(l, key)) {
+        return (!v.is_empty()).then(|| v.to_string());
     }
     let (bi, _) = boot_info()?;
     let text = core::str::from_utf8(bi.config()?).ok()?;

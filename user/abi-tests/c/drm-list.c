@@ -152,6 +152,11 @@ int main(void) {
     list("CREATE entry size 0, none", CREATE, 0, 0, 0, entries);
     list("CREATE NULL entries", CREATE, 0, 1, 8, NULL);
     list("CREATE kernel entries", CREATE, 0, 1, 8, KERNEL_ADDR);
+    /* Linux 7.3.1: at most 128 Ki entries (amdgpu_bo_list.c:169), before the entry size. */
+    list("CREATE 131072 entries, NULL", CREATE, 0, 131072, 8, NULL);
+    list("CREATE 131073 entries, NULL", CREATE, 0, 131073, 8, NULL);
+    list("CREATE 131073 entries, entry size 12", CREATE, 0, 131073, 12, NULL);
+    list("CREATE 2^31 entries", CREATE, 0, 1u << 31, 8, NULL);
     list("DESTROY 3, entry size 12", DESTROY, 3, 1, 12, entries);
     list("DESTROY 3 again, NULL entries", DESTROY, 3, 1, 8, NULL);
     list("operation 3", 3, 1, 0, 8, entries);

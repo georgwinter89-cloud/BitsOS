@@ -4,7 +4,7 @@
 //! elsewhere with a plain ext4 (`mkfs.ext4` on CachyOS) is mounted as a plain loop image.
 //!
 //! A background thread waits for the stick's write decision. A missing image is made only on a writable stick
-//! with room for it: grown as `data.img.new` (zero-filled by FAT, in steps so `/boot` stays usable), pool and
+//! with room for it: grown as `data.img.new` (on the stick its clusters allocated unwritten, GP-START), pool and
 //! ext4 made inside, then renamed to `data.img` (a cut before the rename leaves only the `.new` file, removed
 //! at the next boot). An existing `data.img` is never shrunk, reformatted or deleted: one V2 cannot read stays
 //! as it is and `/data` is not mounted. A read-only stick mounts `/data` read-only.
@@ -43,7 +43,7 @@ const MIN_MB: u64 = 32;
 const MAX_MB: u64 = 4095;
 /// Room the stick keeps after a new image (kernel generations, programs below `\BITSOS2\`).
 const KEEP_FREE: u64 = 512 << 20;
-/// The image grows in steps of this size: FAT holds its volume lock while it zero-fills one step.
+/// Off the stick (a test's image) the file grows zero-filled in steps of this size: FAT holds its volume lock per step.
 const GROW_STEP: u64 = 16 << 20;
 /// How long the thread waits for the stick (USB enumerates and settles after the kernel starts).
 const STICK_WAIT_MS: u64 = 120_000;
@@ -160,18 +160,32 @@ pub fn look_at_pool(dev: Arc<dyn BlockDevice>) -> PoolLook {
     }
 }
 
-/// Grows `place.temp` to `bytes` (zero-filled), makes the pool and ext4 inside, renames it to `place.image`.
+/// Grows `place.temp` to `bytes`, makes the pool and ext4 inside, renames it to `place.image`.
+///
+/// GP-START: on the stick the clusters are allocated without writing zeros (2 GiB of zeros took minutes through a
+/// USB-2 stick and kept every other stick access waiting meanwhile, settingsd's included). Nothing the stick held
+/// there before shows through /data: the pool reads only what it wrote (a new chunk is written whole, zeros around
+/// a partial write, bitsvol volume.rs `fill_chunk`; `Pool::format` clears both superblock slots first), and the
+/// image file itself is root's alone (fs-fat protect.rs). Elsewhere (a test's image) it is grown zero-filled.
 fn create(ns: &MountNs, place: &Place, bytes: u64) -> Result<(), i64> {
     let c = Ctx::kernel(ns);
     ns.create_file_bytes(place.temp.as_bytes(), 0o644, &[])?;
     let file = ns.lookup_path(place.temp.as_bytes(), false)?.dentry.inode.clone();
     let t0 = ksync::now_ns().unwrap_or(0);
-    let mut size = 0;
-    while size < bytes {
-        size = (size + GROW_STEP).min(bytes);
-        file.truncate(size)?;
-        if size % (256 << 20) == 0 || size == bytes {
-            klog::event!(Info, "ext4", "data.grow", bytes = size, of = bytes, ms = ksync::now_ns().unwrap_or(0).saturating_sub(t0) / 1_000_000);
+    let ms = || ksync::now_ns().unwrap_or(0).saturating_sub(t0) / 1_000_000;
+    if place.on_stick {
+        fs_fat::stick::allocate_unzeroed(place.temp, bytes)?;
+        // The FAT entry has the size already; this tells the page cache (nothing more is written).
+        file.truncate(bytes)?;
+        klog::event!(Info, "ext4", "data.grow", bytes = bytes, of = bytes, zeroed = false, ms = ms());
+    } else {
+        let mut size = 0;
+        while size < bytes {
+            size = (size + GROW_STEP).min(bytes);
+            file.truncate(size)?;
+            if size % (256 << 20) == 0 || size == bytes {
+                klog::event!(Info, "ext4", "data.grow", bytes = size, of = bytes, ms = ms());
+            }
         }
     }
     file.sync(SyncKind::Fsync)?;
@@ -184,7 +198,7 @@ fn create(ns: &MountNs, place: &Place, bytes: u64) -> Result<(), i64> {
     {
         vfs::writeback::Flush::flush(&*fat, SyncKind::Fsync)?;
     }
-    klog::event!(Info, "ext4", "data.created", path = place.image, bytes = bytes, ms = ksync::now_ns().unwrap_or(0).saturating_sub(t0) / 1_000_000);
+    klog::event!(Info, "ext4", "data.created", path = place.image, bytes = bytes, ms = ms());
     Ok(())
 }
 
@@ -271,12 +285,13 @@ fn mount_pool(pool: Pool, ns: &MountNs, at: &str, opts: Options, pool_name: &str
     }
 }
 
-/// `/data/appdata` and `/data/home/1000` for the user (uid 1000), made when missing. An existing one is kept,
+/// `/data/appdata`, `/data/home/1000` and `/data/leistung` (SELFOPT-1: the nightly benchmark's measurements,
+/// written by bitsbench as the desktop user) for the user (uid 1000), made when missing. An existing one is kept,
 /// except one still empty and owned by root where the user's is wanted: a cut between the mkdir and the chown
 /// left it so, and nothing else makes it.
 pub fn user_dirs(ns: &MountNs, at: &str) -> Result<(), i64> {
     let c = Ctx::kernel(ns);
-    for (rel, mode, owner) in [("appdata", 0o755, UID), ("home", 0o755, 0), ("home/1000", 0o700, UID)] {
+    for (rel, mode, owner) in [("appdata", 0o755, UID), ("home", 0o755, 0), ("home/1000", 0o700, UID), ("leistung", 0o755, UID)] {
         let p = alloc::format!("{at}/{rel}");
         match c.mkdir(None, p.as_bytes(), mode) {
             Ok(path) => {

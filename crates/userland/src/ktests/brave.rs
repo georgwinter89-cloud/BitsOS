@@ -26,8 +26,21 @@ const BRAVE: &str = "/boot/BITSOS2/brave/brave";
 const LIBS: &str = "/boot/BITSOS2/brave/lib/";
 const FONTS: &str = "/boot/BITSOS2/brave/fonts";
 const LDSO: &str = "/usr/lib/ld-linux-x86-64.so.2";
-/// The libraries Chromium (ui/gtk) and NSS dlopen; stage-v2.sh puts them into lib/, xtask adds what they link.
-const DLOPENED: &[&str] = &["libgtk-3.so.0", "libsoftokn3.so", "libfreeblpriv3.so"];
+/// The libraries Chromium (ui/gtk, BR-8's GPU process: EGL, GLES, GBM, VA-API) and NSS dlopen; stage-v2.sh puts them
+/// into lib/, xtask adds what they link. The launcher's DLOPENED lists the same.
+const DLOPENED: &[&str] = &[
+    "libgtk-3.so.0",
+    "libsoftokn3.so",
+    "libfreeblpriv3.so",
+    "libEGL.so.1",
+    "libEGL_mesa.so.0",
+    "libGLESv2.so.2",
+    "libgbm.so.1",
+    "gbm/dri_gbm.so",
+    "libva.so.2",
+    "libva-drm.so.2",
+    "dri/radeonsi_drv_video.so",
+];
 /// Files up to this size are hashed in `ul.pkg.brave`, bigger ones in `ul.pkg.brave_sha` (a test cost, not a limit:
 /// the tree's 8 bigger files hold 5/6 of its bytes).
 const HASH_IN_MAIN: u64 = 8 << 20;
@@ -96,8 +109,8 @@ fn brave() -> TestResult {
         kassert!(file_ok(&bad, false).is_err_and(|e| e.contains("bytes")), "a wrong size for {} was not reported", small.path);
     }
 
-    // The loader as the kernel starts brave (LD_LIBRARY_PATH: Brave has no RPATH), and as dlopen finds GTK 3 and
-    // NSS's soft token in lib/ (ld.so --list, which is what ldd runs).
+    // The loader as the kernel starts brave (LD_LIBRARY_PATH: Brave has no RPATH), and as dlopen finds GTK 3, NSS's
+    // soft token and the GPU's libraries in lib/ (ld.so --list, which is what ldd runs).
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
     let runs = [format!("LD_LIBRARY_PATH={LIBS} LD_TRACE_LOADED_OBJECTS=1 exec {BRAVE}")]
         .into_iter()
@@ -124,10 +137,11 @@ fn brave() -> TestResult {
     fontcache(&tree)?;
 
     // The launcher counts the same: distinct "name => path" lines over brave and the dlopened libraries.
-    // BR-6b: the base flags never carry --no-sandbox; only BRAVE_SANDBOX=auto (after a failed probe) or off add it.
+    // BR-6b: the flags never carry --no-sandbox (the sandbox is always on); BR-8: never --disable-gpu.
     let script = read(&launcher);
     let flags = script.split_once("\nFLAGS=\"").and_then(|(_, r)| r.split_once('"')).map(|(f, _)| f);
-    kassert!(flags.is_some_and(|f| !f.contains("--no-sandbox")), "{launcher}: FLAGS= {flags:?} (want no --no-sandbox)");
+    kassert!(flags.is_some_and(|f| !f.contains("--no-sandbox") && !f.contains("--disable-gpu")), "{launcher}: FLAGS= {flags:?} (want neither --no-sandbox nor --disable-gpu)");
+    kassert!(!script.contains("--no-sandbox\"") && !script.contains("BRAVE_SANDBOX="), "{launcher}: a way to start without the sandbox is left");
     let want_libs = format!("brave: libraries: {} found, none missing", found.len());
     for uid in [1000u32, 0] {
         let s = start_as("/bin/sh", &["sh", &launcher, "--check"], None, false, Some(uid))?;

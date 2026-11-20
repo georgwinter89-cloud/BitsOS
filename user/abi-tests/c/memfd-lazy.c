@@ -1,7 +1,7 @@
 /* fs-memfd-lazy: tmpfs and memfd pages charged when they are allocated, not at ftruncate (FS-14), as programs see
  * it, for the ABI diff (CachyOS is the oracle; user/abi-tests/c/memfd-lazy.c is the same file) and the ktests
- * fs.memfd.lazy*. Linux: memfds and tmpfs files are VM_NORESERVE (linux-6.6/mm/memfd.c:363, mm/shmem.c:1153
- * shmem_setattr writes i_size only; shmem_inode_acct_block :210 charges each new page). Prints results, errno
+ * fs.memfd.lazy*. Linux: memfds and tmpfs files are VM_NORESERVE (linux-7.3.1/mm/memfd.c:469, mm/shmem.c:1329
+ * shmem_setattr writes i_size only; shmem_inode_acct_blocks :222 charges each new page). Prints results, errno
  * names and st_blocks (512-byte units) only. Modes (argv[1]):
  *   pools   foot 1.28's buffer pools: 4 x (memfd_create, ftruncate 512 MiB, mmap MAP_SHARED, touch one page)
  *   blocks  st_blocks counts allocated pages only: ftruncate, writes, a far write, read faults, hole punch,

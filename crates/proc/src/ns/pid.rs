@@ -1,4 +1,4 @@
-//! SX-2: pid namespaces (linux-6.6/kernel/pid_namespace.c, kernel/pid.c).
+//! SX-2: pid namespaces (linux-7.3.1/kernel/pid_namespace.c, kernel/pid.c).
 //!
 //! V2 keeps one global id per process and thread (the initial namespace's number: TABLE, TASKS, `/proc`).
 //! A namespace below the initial one holds a second numbering: `nr -> global id` and back, one entry per
@@ -19,12 +19,12 @@ use super::user::UserNs;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ksync::{Once, SpinLock};
 use uapi::errno::*;
 use vfs::Errno;
 
-/// linux-6.6/include/linux/pid_namespace.h `MAX_PID_NS_LEVEL`: 32 nested levels at most (ENOSPC beyond; an
+/// linux-7.3.1/include/linux/pid_namespace.h:15 `MAX_PID_NS_LEVEL`: 32 nested levels at most (ENOSPC beyond; an
 /// ABI value).
 pub const MAX_LEVEL: u32 = 32;
 /// `RESERVED_PIDS`: numbers wrap to here once the cursor passed it.
@@ -51,6 +51,9 @@ pub struct PidNs {
     /// The user namespace it was made in (setns and `CAP_CHECKPOINT_RESTORE` ask it).
     pub user_ns: Arc<UserNs>,
     nums: SpinLock<Numbers>,
+    /// L7-PROC: its own `pid_max` (linux-7.3.1/kernel/pid.c:782 `register_pidns_sysctls`): its numbers stay
+    /// below it; the initial namespace's bounds the global ids.
+    pid_max: AtomicU32,
     /// Its place in the creator's `max_pid_namespaces` (none for the initial one).
     _charge: Option<super::count::Charge>,
 }
@@ -79,6 +82,7 @@ pub fn init_pid_ns() -> &'static Arc<PidNs> {
             parent: None,
             user_ns: super::user::init_user_ns().clone(),
             nums: SpinLock::named("proc.pidns", Numbers { cursor: 0, by_nr: BTreeMap::new(), by_id: BTreeMap::new(), reaper: 1, adding: true }),
+            pid_max: AtomicU32::new(crate::PID_MAX),
             _charge: None,
         })
     })
@@ -107,6 +111,8 @@ pub fn create(parent: &Arc<PidNs>, user_ns: &Arc<UserNs>, euid: u32) -> Result<A
         parent: Some(parent.clone()),
         user_ns: user_ns.clone(),
         nums: SpinLock::named("proc.pidns", Numbers { cursor: 0, by_nr: BTreeMap::new(), by_id: BTreeMap::new(), reaper: 0, adding: true }),
+        // `create_pid_namespace` starts at PID_MAX_LIMIT; the levels above still bound their own numbers.
+        pid_max: AtomicU32::new(PID_MAX_LIMIT),
         _charge: Some(charge),
     });
     LIVE.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +133,30 @@ fn gap(used: &BTreeMap<u32, u32>, from: u32, to: u32) -> Option<u32> {
     (c < to).then_some(c)
 }
 
+/// `PID_MAX_LIMIT` on 64-bit (`pid_max_max`).
+pub const PID_MAX_LIMIT: u32 = 4_194_304;
+
+/// `pid_max_min` (linux-7.3.1/kernel/pid.c:827): RESERVED_PIDS + 1, raised to 8 per possible CPU.
+pub fn pid_max_min() -> u32 {
+    (crate::PID_WRAP + 1).max(8 * hal::percpu::possible_cpus() as u32)
+}
+
 impl PidNs {
+    /// This namespace's `pid_max` (`/proc/sys/kernel/pid_max` as its members read it).
+    pub fn pid_max(&self) -> u32 {
+        self.pid_max.load(Ordering::Relaxed)
+    }
+    /// A write of `/proc/sys/kernel/pid_max` by a member (`proc_dointvec_minmax` with `pid_max_min` and
+    /// `pid_max_max`): EINVAL outside them. Live processes keep their numbers; the next number wraps when the
+    /// cursor is at or above the new limit (`alloc_pid`).
+    pub fn set_pid_max(&self, v: u64) -> Result<(), Errno> {
+        if !(pid_max_min() as u64..=PID_MAX_LIMIT as u64).contains(&v) {
+            return Err(EINVAL);
+        }
+        self.pid_max.store(v as u32, Ordering::Relaxed);
+        klog::event!(Info, "proc", "pid_max.set", inum = self.inum, value = v);
+        Ok(())
+    }
     pub fn is_init(&self) -> bool {
         self.level == 0
     }
@@ -244,12 +273,11 @@ impl PidNs {
         if self.is_init() {
             return Ok(());
         }
-        let limit = crate::pid_max();
         let mut done: Vec<&PidNs> = Vec::new();
         let mut cur: &PidNs = self;
         let mut first = true;
         while !cur.is_init() {
-            let r = done.try_reserve(1).map_err(|_| ENOMEM).and_then(|_| cur.take(id, if first { want } else { None }, limit));
+            let r = done.try_reserve(1).map_err(|_| ENOMEM).and_then(|_| cur.take(id, if first { want } else { None }, cur.pid_max()));
             match r {
                 Ok(nr) => {
                     if first && nr == 1 && process {

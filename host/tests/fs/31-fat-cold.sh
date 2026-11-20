@@ -1,7 +1,6 @@
 #!/bin/bash
 # slow
-# FS-14b: a cold start reads each byte from the stick once (plan/notes/desk-minipc-w11.md "Cold vs warm start":
-# Brave's first start read 4.5 GB for its 575 MB folder). The stick image is rebuilt like Georg's stick: FAT32
+# FS-14b: a cold start reads each byte from the stick once (Brave's first start read 4.5 GB for its 575 MB folder). The stick image is rebuilt like Georg's stick: FAT32
 # with 32 KiB clusters (2100 MiB sparse: FAT32 needs >= 65525 clusters), xtask's ESP tree, plus a Brave-like
 # folder \BITSOS2\brave\ with a 512 MiB "binary" and a 40 MiB .pak. One ktest boot (fs.fat.cold): the binary is
 # faulted by two mappings from two threads at once, the next cold file read with read(); the stick's read bytes

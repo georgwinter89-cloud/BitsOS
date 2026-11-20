@@ -85,8 +85,6 @@ pub const SD_CTL_INT: u8 = SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE;
 /// Stream tag, bits 23:20 of the 32-bit control register.
 pub const SD_CTL_TAG_SHIFT: u32 = 20;
 pub const SD_CTL_TAG_MASK: u32 = 0xF << 20;
-/// Traffic priority (Linux sets it when snooping is off).
-pub const SD_CTL_TP: u32 = 1 << 18;
 /// SD_STS: buffer completion (2), FIFO error (3), descriptor error (4); write 1 to clear. FIFO ready (5).
 pub const SD_STS_BCIS: u8 = 1 << 2;
 pub const SD_STS_FIFOE: u8 = 1 << 3;

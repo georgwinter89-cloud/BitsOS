@@ -75,7 +75,20 @@ klog::counter!(VMAP_QUARANTINED, "mm.vmap.quarantined");
 /// registers it as hal's device mapper.
 pub(crate) fn init(lo: u64, hi: u64, taken: &[(u64, u64)], ram: Vec<(u64, u64)>, mtrrs: Mtrrs) {
     let mut space = VaSpace::new(lo, hi);
-    let room = space.reserve_room(ROOM) && KVA.lock().live.try_reserve(ROOM).is_ok();
+    // The list's room is made before `mm.vmap.kva` (192 KiB, which under a spin lock needs a free run); nothing
+    // reserves before the hook below is installed, so the list it replaces is empty.
+    let mut live = Vec::new();
+    let made = space.reserve_room(ROOM) && live.try_reserve(ROOM).is_ok();
+    let (old, room) = {
+        let mut k = KVA.lock();
+        if k.live.is_empty() {
+            (core::mem::replace(&mut k.live, live), made)
+        } else {
+            let r = made && k.live.capacity() - k.live.len() >= ROOM;
+            (live, r)
+        }
+    };
+    drop(old);
     let mut kept = 0u64;
     for &(s, e) in taken {
         let (s, e) = (s.max(lo), e.min(hi));
@@ -505,6 +518,14 @@ pub fn release(base: u64, len: u64) -> bool {
 /// the live list (so it was a live reservation of exactly `len`), before the rest is unmapped. None: not a live
 /// reservation, nothing changed; `Err`: kept out of use (and whether the quarantine list took it).
 pub(crate) fn release_quiet(base: u64, len: u64, before: &mut dyn FnMut(u64, u64)) -> Option<Result<UnmapStats, (paging::MapError, bool)>> {
+    release_with(base, len, &mut |b, l| {
+        before(b, l);
+        paging::unmap_kernel(b, l, &mut |_| {})
+    })
+}
+
+/// `release_quiet` with the caller's unmap of the range (taken off the live list first; Ok gives it back).
+pub(crate) fn release_with(base: u64, len: u64, unmap: &mut dyn FnMut(u64, u64) -> Result<UnmapStats, paging::MapError>) -> Option<Result<UnmapStats, (paging::MapError, bool)>> {
     let r = {
         let mut k = KVA.lock();
         match k.live.binary_search_by_key(&base, |x| x.body) {
@@ -512,8 +533,7 @@ pub(crate) fn release_quiet(base: u64, len: u64, before: &mut dyn FnMut(u64, u64
             _ => None,
         }
     }?;
-    before(r.body, r.end - r.body);
-    Some(match paging::unmap_kernel(r.body, r.end - r.body, &mut |_| {}) {
+    Some(match unmap(r.body, r.end - r.body) {
         Ok(stat) => {
             give_back(&r);
             Ok(stat)
@@ -524,6 +544,12 @@ pub(crate) fn release_quiet(base: u64, len: u64, before: &mut dyn FnMut(u64, u64
             Err((e, kept))
         }
     })
+}
+
+/// Whether [base, base + len) is a live `reserve`d range of exactly that size.
+pub(crate) fn reserved(base: u64, len: u64) -> bool {
+    let k = KVA.lock();
+    k.live.binary_search_by_key(&base, |x| x.body).is_ok_and(|i| k.live[i].end - k.live[i].body == len)
 }
 
 /// Live plain reservations and quarantined ones.

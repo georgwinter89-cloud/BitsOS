@@ -15,8 +15,8 @@ use devmodel::net::{LinkState, MacAddr, NetStats};
 use devmodel::DevError;
 use ksync::SpinLock;
 
-/// Ring sizes (parameters, spec §3; not limits on a count of things, R1), whether to ask for interrupts (NW-4;
-/// CONFIG `net_irq=off` turns them off) and the queue vector's gap between interrupts (CONFIG `igc_itr_us`).
+/// Ring sizes (parameters, spec §3; not limits on a count of things, R1), whether to ask for interrupts (NW-4; false
+/// only for the ktest's second card on QEMU's 82576, `ktests::i226_path`) and the queue vector's gap between interrupts (`regs::ITR_US_DEFAULT`).
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub rx_ring: usize,
@@ -42,7 +42,7 @@ pub const HEALTH_EVERY_NS: u64 = 1_000_000_000;
 pub const TX_LATE_NS: u64 = 100_000_000;
 pub const TX_LATE_RESTART: u32 = 3;
 /// Given-back RX descriptors are handed to the card in groups of this many (one RDT write per group; Linux
-/// `IGC_RX_BUFFER_WRITE`, linux-6.6/drivers/net/ethernet/intel/igc/igc.h:440): a burst never finds the ring
+/// `IGC_RX_BUFFER_WRITE`, linux-7.3.1/drivers/net/ethernet/intel/igc/igc.h:532): a burst never finds the ring
 /// short of descriptors that were already free.
 pub const RX_WRITE_EVERY: usize = 16;
 /// Retry a card that did not come back: every 10 s six times, then every 60 s: the cable may be the only way
@@ -55,7 +55,7 @@ pub const DRAIN_US: u64 = 100_000;
 /// Quiesce: how long the TX and RX queues may take to report off after the disable (RB-15).
 pub const QUEUE_WAIT_US: u64 = 10_000;
 /// Quiesce: Linux `igc_down`'s wait after the receive/transmit disables (`usleep_range(10000, 20000)`,
-/// linux-6.6/drivers/net/ethernet/intel/igc/igc_main.c:5087), here at least this long in all.
+/// linux-7.3.1/drivers/net/ethernet/intel/igc/igc_main.c:5347), here at least this long in all.
 pub const QUEUE_SETTLE_US: u64 = 10_000;
 /// How long an explicit `restart` waits for one the poller is running (a bring-up takes up to ~4 s).
 const RESTART_WAIT_NS: u64 = 10_000_000_000;
@@ -452,9 +452,9 @@ impl<H: Hw> Card<H> {
     }
 
     /// Stops the card's DMA and interrupts (`V1:igc.asm:129-142`, Quiesce in spec §2.2), in Linux's order
-    /// (`igc_down` + `__igc_shutdown`, linux-6.6/drivers/net/ethernet/intel/igc/igc_main.c:5057, 7028): receive
+    /// (`igc_down` + `__igc_shutdown`, linux-7.3.1/drivers/net/ethernet/intel/igc/igc_main.c:5317, 7435): receive
     /// off, optionally the TX ring drained, transmit off, both queues disabled (TXDCTL with SWFLUSH,
-    /// `igc_disable_tx_ring_hw` :319) and waited for, at least Linux's 10 ms, interrupts masked, the reset (GIO
+    /// `igc_disable_tx_ring_hw` :326) and waited for, at least Linux's 10 ms, interrupts masked, the reset (GIO
     /// master disable and its wait for pending requests first, `igc_reset_hw_base`), the queues once more (as
     /// `igc_down` after `igc_reset`), Wake-on-LAN off, DRV_LOAD off, MSI off **before** bus master off.
     /// Lock-free, spinning only, no klog: Quiesce runs it on the panic path. Every wait that ran out is counted

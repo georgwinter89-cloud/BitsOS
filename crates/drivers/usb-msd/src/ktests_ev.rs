@@ -1,6 +1,6 @@
 //! US-ev (B4) in QEMU: HID reports carry the controller interrupt's time and reach their sink on the KernelRt
 //! event thread, and stick reads go on while the HID pipes flood. Needs HID devices no driver took
-//! (`usbhid_raw=on`; `host/tests/us/60-ev.sh` adds usb-kbd, usb-tablet and usb-mouse). Timing is logged, never
+//! (`usb_ev_test=on`; `host/tests/us/60-ev.sh` adds usb-kbd, usb-tablet and usb-mouse). Timing is logged, never
 //! judged here: the Mini-PC check list compares the speeds.
 
 use crate::ktests::{now, read, ready_disks, settle, Crc32};
@@ -124,7 +124,7 @@ fn stamps() -> TestResult {
     kassert!(settle(), "USB did not settle");
     let pipes = start_pipes()?;
     if pipes.is_empty() {
-        return ktest::fail("no unbound HID device (usbhid_raw=on, scenario us/60-ev.sh)");
+        return ktest::fail("no unbound HID device (usb_ev_test=on, scenario us/60-ev.sh)");
     }
     // `check` names the pipe that fell short if 10 s were not enough.
     until(10_000 * MS, || pipes.iter().all(|p| p.flow.reports.load(Ordering::Acquire) >= 200));
@@ -158,7 +158,7 @@ fn flood_read() -> TestResult {
     let (crc_quiet, quiet) = read_span(&d)?;
     let pipes = start_pipes()?;
     if pipes.is_empty() {
-        return ktest::fail("no unbound HID device (usbhid_raw=on, scenario us/60-ev.sh)");
+        return ktest::fail("no unbound HID device (usb_ev_test=on, scenario us/60-ev.sh)");
     }
     let before: u64 = pipes.iter().map(|p| p.flow.reports.load(Ordering::Acquire)).sum();
     let r = read_span(&d);

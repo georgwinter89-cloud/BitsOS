@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -96,6 +97,19 @@ static int helper(int argc, char **argv) {
         printf("exec-child %s: argc=%d env=%s\n", argc > 2 ? argv[2] : "?", argc, e ? e : "none");
         flush();
         return 5;
+    }
+    if (!strcmp(m, "comm")) {
+        /* linux-7.3.1/fs/exec.c:1281: after fexecve the comm is the file's name, else kbasename(filename). */
+        char c[32] = {0};
+        int fd = open("/proc/self/comm", O_RDONLY);
+        long n = fd >= 0 ? read(fd, c, sizeof c - 1) : -1;
+        if (n > 0 && c[n - 1] == '\n')
+            c[n - 1] = 0;
+        char pn[17] = {0};
+        prctl(PR_GET_NAME, pn);
+        printf("comm %s: /proc/self/comm \"%s\", PR_GET_NAME \"%s\"\n", argc > 2 ? argv[2] : "?", c, pn);
+        flush();
+        return 0;
     }
     if (!strcmp(m, "pidcheck")) {
         yes("pidcheck.same_pid", getpid() == atoi(argv[2]));
@@ -369,6 +383,24 @@ static void t_exec_errors(void) {
     memset(long_path, 'a', 4999);
     long_path[4999] = 0;
     show("execve.path_too_long", execve(long_path, av, ev));
+    /* linux-7.3.1/fs/exec.c:1510 alloc_bprm opens the file before argv and envp are counted and copied, and
+     * do_open_execat checks the flags before the name. */
+    show("execve.missing_with_bad_argv", execve("/tmp/abi-fork-does-not-exist", KERNEL_ADDR, ev));
+    show("execve.directory_with_bad_envp", execve("/tmp", av, KERNEL_ADDR));
+    show("execve.no_x_bit_with_bad_argv_entry", execve(f, bad_entry, ev));
+    big[131071] = 'a';
+    show("execve.missing_with_too_long_string", execve("/tmp/abi-fork-does-not-exist", av_big, ev));
+    big[131071] = 0;
+    SYS("execveat.bad_flags_and_bad_path", SYS_execveat, AT_FDCWD, KERNEL_ADDR, av, ev, 1);
+    SYS("execveat.bad_flags_and_empty_path", SYS_execveat, AT_FDCWD, "", av, ev, 1);
+    /* AT_EXECVE_CHECK (0x10000): open and argument copy only; the content is not looked at. */
+    SYS("execveat.check_self", SYS_execveat, AT_FDCWD, self, av, ev, 0x10000);
+    SYS("execveat.check_not_a_program", SYS_execveat, AT_FDCWD, g, av, ev, 0x10000);
+    SYS("execveat.check_no_x_bit", SYS_execveat, AT_FDCWD, f, av, ev, 0x10000);
+    SYS("execveat.check_missing", SYS_execveat, AT_FDCWD, "/tmp/abi-fork-does-not-exist", av, ev, 0x10000);
+    SYS("execveat.check_bad_argv", SYS_execveat, AT_FDCWD, self, KERNEL_ADDR, ev, 0x10000);
+    SYS("execveat.check_with_nofollow_flag_on_a_link", SYS_execveat, AT_FDCWD, "/proc/self/exe", av, ev, 0x10000 | AT_SYMLINK_NOFOLLOW);
+    SYS("execveat.check_and_unknown_flag", SYS_execveat, AT_FDCWD, self, av, ev, 0x10000 | 0x20000);
     /* Script errors: a missing interpreter, none at all, one without x, a loop. */
     path_of(h, sizeof h, "-e.sh");
     put_file(h, "#!/tmp/abi-fork-no-interpreter\n", 0755);
@@ -406,6 +438,19 @@ static void t_execveat(void) {
         _exit(127);
     }
     reap("execveat.dirfd_relative", p);
+    /* The comm after an exec: fexecve names it after the file, a dirfd-relative name by its last part. */
+    if ((p = pfork()) == 0) {
+        char *a[] = {"x", "comm", "fexecve", NULL};
+        syscall(SYS_execveat, fd, "", a, env1, AT_EMPTY_PATH);
+        _exit(127);
+    }
+    reap("execveat.comm_fexecve", p);
+    if ((p = pfork()) == 0) {
+        char *a[] = {"x", "comm", "dirfd-relative", NULL};
+        syscall(SYS_execveat, root, "proc/self/exe", a, env1, 0);
+        _exit(127);
+    }
+    reap("execveat.comm_dirfd_relative", p);
     SYS("execveat.bad_flags", SYS_execveat, AT_FDCWD, self, av, ev, 1);
     SYS("execveat.file_as_dirfd", SYS_execveat, fd, "x", av, ev, 0);
     SYS("execveat.bad_dirfd", SYS_execveat, 999, "x", av, ev, 0);

@@ -1,6 +1,6 @@
 // mcp-call.mjs (V2): a small MCP client for BitsOS V2's kernel MCP server, as a command and as a module for
 // reload.mjs and echt.mjs. Same command line as V1's BitsOS-Plattform/mcp-call.mjs:
-//   node mcp-call.mjs <host[:port]> <tool> [json arguments] [--token-file <path>] [--png <file>] [--save <file>]
+//   node mcp-call.mjs <host[:port]> <tool> [json arguments | @args.json] [--token-file <path>] [--png <file>] [--save <file>]
 //                     [--tls <key store>]
 //   e.g. node mcp-call.mjs 192.168.100.113 hw_info '{"section":"cpu"}' --token-file token.txt
 //        node mcp-call.mjs 127.0.0.1:25300 screen '{}' --png screen.png
@@ -8,8 +8,9 @@
 // Each request goes on a connection of its own (initialize, notifications/initialized, tools/call), node:http
 // without keep-alive (V1's reasons: Windows/undici probes and fetch's 300 s limit). The tool's text goes to
 // stdout; a PNG (screen) to --png; --save writes the bytes of a read_file answer (its base64 data, decoded).
-// The port is 8765 unless given. The token comes from --token-file (its first line) or BITSOS_TOKEN; it is
-// never printed and never in a URL. The answer is awaited timeout_ms + 30 s (the tool's own deadline plus
+// The port is 8765 unless given. The token comes from --token-file (its first line) or BITSOS_TOKEN, else from the
+// Gaming-PC's token file with --gaming-pc (token.mjs: .config/bitsos-gaming-pc/token.txt below %USERPROFILE% or ~); it is never printed and
+// never in a URL. The answer is awaited timeout_ms + 30 s (the tool's own deadline plus
 // room), so long calls work.
 // MC-8b: --tls <key store> (pair.mjs made it; e.g. ~/.config/bitsos-mcp) speaks mutual TLS to the user-space MCP
 // service once it is paired: this host's key from the store, the Mini-PC's key pinned (pins/<host>.der). A
@@ -22,8 +23,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { connect as tlsConnect } from 'node:tls';
 import { fingerprint, KeyError, storeOf, tlsFor } from './mcp-keys.mjs';
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './is-main.mjs';
+import { defaultTokenFile, tokenFileFor } from './token.mjs';
 
 export const PROTOCOL = '2025-06-18';
 
@@ -33,7 +34,7 @@ export class McpError extends Error {
   constructor(kind, message) { super(message); this.kind = kind; }
 }
 
-// --token-file's first line, else BITSOS_TOKEN
+// --token-file's first line, else BITSOS_TOKEN (a command finds the file with token.mjs's tokenFileFor first)
 export function readToken(file) {
   if (file) {
     let text;
@@ -43,7 +44,7 @@ export function readToken(file) {
     return token;
   }
   const token = process.env.BITSOS_TOKEN?.trim();
-  if (!token) throw new McpError('token', 'no token: set BITSOS_TOKEN or give --token-file <path> (the token= of CONFIG.TXT)');
+  if (!token) throw new McpError('token', `no token: give --token-file <path> or set BITSOS_TOKEN (the token= of CONFIG.TXT); for the Gaming-PC put it into ${defaultTokenFile()} (one line) and add --gaming-pc`);
   return token;
 }
 
@@ -219,22 +220,29 @@ async function main(argv) {
   const opts = {}, rest = [];
   for (let i = 0; i < argv.length; i++) {
     if (['--token-file', '--png', '--save', '--tls'].includes(argv[i])) opts[argv[i].slice(2)] = argv[++i];
+    else if (argv[i] === '--gaming-pc') opts['gaming-pc'] = true;
     else rest.push(argv[i]);
   }
   const [host, tool, json] = rest;
   if (!host || !tool || rest.length > 3 || Object.values(opts).includes(undefined)) {
-    console.error('usage: node mcp-call.mjs <host[:port]> <tool> [json arguments] [--token-file <path>] [--png <file>] [--save <file>] [--tls <key store>]\n'
-      + 'the token from BITSOS_TOKEN or --token-file; --tls: mutual TLS with the key store pair.mjs made (a directory, or auto:\n'
+    console.error('usage: node mcp-call.mjs <host[:port]> <tool> [json arguments | @file.json] [--token-file <path>] [--png <file>] [--save <file>] [--tls <key store>] [--gaming-pc]\n'
+      + 'the token from BITSOS_TOKEN or --token-file (--gaming-pc: else from the Gaming-PC\'s token file, host/mcp/token.mjs); --tls: mutual TLS with the key store pair.mjs made (a directory, or auto:\n'
       + 'BITSOS_MCP_STORE, else bitsos-mcp/ next to the token file, else ~/.config/bitsos-mcp)');
     return 2;
   }
   let args = {};
-  if (json) {
-    try { args = JSON.parse(json); } catch { console.error(`the arguments are no JSON object: ${json}`); return 2; }
+  // GP-ROUND: @<file> reads the arguments from a JSON file (Windows' cmd and PowerShell 5 mangle quotes in a
+  // command line; host/remote-desk/args/ holds the check list's arguments as files).
+  let text = json;
+  if (json?.startsWith('@')) {
+    try { text = readFileSync(json.slice(1), 'utf8').replace(/^\uFEFF/, ''); } catch { console.error(`cannot read the arguments file ${json.slice(1)}`); return 2; }
+  }
+  if (text) {
+    try { args = JSON.parse(text); } catch { console.error(`the arguments are no JSON object: ${text}`); return 2; }
     if (typeof args !== 'object' || args === null || Array.isArray(args)) { console.error('the arguments must be a JSON object'); return 2; }
   }
   try {
-    const session = await connect(host, { token: readToken(opts['token-file']), tls: opts.tls, tokenFile: opts['token-file'] });
+    const session = await connect(host, { token: readToken(tokenFileFor(opts['token-file'], opts['gaming-pc'])), tls: opts.tls, tokenFile: opts['token-file'] });
     const r = await session.call(tool, args);
     if (opts.save && !r.isError) {
       let data;
@@ -260,4 +268,4 @@ async function main(argv) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) process.exitCode = await main(process.argv.slice(2));
+if (isMain(import.meta.url)) process.exitCode = await main(process.argv.slice(2));

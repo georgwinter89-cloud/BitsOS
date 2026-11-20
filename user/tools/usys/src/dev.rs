@@ -3,20 +3,24 @@
 //!
 //! The rule of the crate holds: the kernel writes only into a Rust buffer the wrapper was given, sized for the
 //! request. An ioctl number carries its argument size in bits 16..29 when its direction bits are set
-//! (linux-6.6/include/uapi/asm-generic/ioctl.h `_IOC`); old numbers without a size (fbdev's 0x46xx) are allowed
+//! (linux-7.3.1/include/uapi/asm-generic/ioctl.h:69 `_IOC`); old numbers without a size (fbdev's 0x46xx) are allowed
 //! only from a table with their struct sizes. A request whose size does not fit the buffer is refused here
 //! (`REFUSED`) without a syscall.
 
 use super::{Errno, REFUSED, SysResult, nr, raw, ret};
 
 /// Old fbdev requests without a size in the number, with the size of the struct they read or write
-/// (linux-6.6/include/uapi/linux/fb.h: fb_var_screeninfo 160 bytes, fb_fix_screeninfo 80, fb_con2fbmap 8).
+/// (linux-7.3.1/include/uapi/linux/fb.h: fb_var_screeninfo 160 bytes, fb_fix_screeninfo 80, fb_con2fbmap 8).
 const LEGACY: &[(u32, usize)] = &[
     (0x4600, 160), // FBIOGET_VSCREENINFO
     (0x4601, 160), // FBIOPUT_VSCREENINFO
     (0x4602, 80),  // FBIOGET_FSCREENINFO
     (0x4606, 160), // FBIOPAN_DISPLAY
     (0x460F, 8),   // FBIOGET_CON2FBMAP
+    // UPDATE (bitsupdate token): the terminal's settings, struct termios of asm-generic/termbits.h (4 flag words,
+    // c_line, c_cc[19]: 36 bytes), to read a secret without echo.
+    (0x5401, 36), // TCGETS
+    (0x5402, 36), // TCSETS
 ];
 
 /// Requests whose argument is a plain value, not a pointer (evdev.c `evdev_do_ioctl`: EVIOCGRAB and EVIOCREVOKE
@@ -40,6 +44,18 @@ pub fn ioctl_buf(fd: usize, req: u32, buf: &mut [u8]) -> SysResult {
     }
     // SAFETY: the request's argument is at most `buf.len()` bytes (checked above), and buf is ours for the call.
     ret(unsafe { raw(nr::IOCTL, [fd, req as usize, buf.as_mut_ptr() as usize, 0, 0, 0]) })
+}
+
+/// Requests without an argument (asound.h `_IO('A', n)`: SNDRV_PCM_IOCTL_PREPARE 0x40, DROP 0x43; GM-6m's player).
+const NO_ARG: &[u32] = &[0x4140, 0x4143];
+
+/// ioctl(fd, req, 0) for the requests in [`NO_ARG`]; any other request is refused.
+pub fn ioctl_none(fd: usize, req: u32) -> SysResult {
+    if !NO_ARG.contains(&req) {
+        return Err(REFUSED);
+    }
+    // SAFETY: these requests take no argument; the kernel never reads or writes through the third word.
+    ret(unsafe { raw(nr::IOCTL, [fd, req as usize, 0, 0, 0, 0]) })
 }
 
 /// ioctl(fd, req, value) for the requests in [`BY_VALUE`]; any other request is refused.
@@ -161,7 +177,7 @@ mod tests {
         for (req, size) in evdev {
             assert_eq!(ioctl_size(req), Some(size), "{req:#x}");
         }
-        for (req, size) in [(0x4600u32, 160usize), (0x4601, 160), (0x4602, 80), (0x4606, 160), (0x460f, 8)] {
+        for (req, size) in [(0x4600u32, 160usize), (0x4601, 160), (0x4602, 80), (0x4606, 160), (0x460f, 8), (0x5401, 36), (0x5402, 36)] {
             assert_eq!(ioctl_size(req), Some(size), "{req:#x}");
         }
         // EVIOCGRAB, EVIOCREVOKE, FBIOBLANK take their value itself.

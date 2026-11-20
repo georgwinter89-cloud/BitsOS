@@ -15,7 +15,10 @@ mod recovery;
 mod recovery_chip;
 mod recovery_hostile;
 mod rings;
+mod gfx12;
+mod sdma7;
 mod sim;
+mod vcn;
 mod vm;
 mod watch;
 

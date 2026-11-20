@@ -46,13 +46,16 @@ meminfo FilePmdMapped: yes
 meminfo CmaTotal: yes
 meminfo CmaFree: yes
 meminfo Unaccepted: yes
+meminfo Balloon: yes
+meminfo GPUActive: yes
+meminfo GPUReclaim: yes
 meminfo HugePages_Total: yes
 meminfo HugePages_Free: yes
 meminfo HugePages_Rsvd: yes
 meminfo HugePages_Surp: yes
 meminfo Hugepagesize: yes
 meminfo Hugetlb: yes
-meminfo 6.6 keys in Linux order: yes
+meminfo 7.3 keys in Linux order: yes
 meminfo kB lines padded as show_val_kb: yes
 meminfo MemFree and MemAvailable within MemTotal: yes
 meminfo SwapFree within SwapTotal: yes
@@ -152,13 +155,19 @@ present = possible: yes
 offline = possible - online: yes
 kernel_max = 8191
 isolated empty: yes
+enabled = present: yes
+housekeeping empty: yes
+nohz_full empty: yes
 kernel_max >= the highest possible CPU: yes
 mode /sys/devices/system/cpu/online = 444 size as Linux
 mode /sys/devices/system/cpu/possible = 444 size as Linux
 mode /sys/devices/system/cpu/present = 444 size as Linux
 mode /sys/devices/system/cpu/offline = 444 size as Linux
 mode /sys/devices/system/cpu/kernel_max = 444 size as Linux
+mode /sys/devices/system/cpu/enabled = 444 size as Linux
 mode /sys/devices/system/cpu/isolated = 444 size as Linux
+mode /sys/devices/system/cpu/housekeeping = 444 size as Linux
+mode /sys/devices/system/cpu/nohz_full = 444 size as Linux
 cpuN directories = possible CPUs: yes
 cpu0/online = ENOENT
 cpuinfo blocks = online CPUs: yes

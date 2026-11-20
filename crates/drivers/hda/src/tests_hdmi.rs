@@ -236,7 +236,7 @@ impl Raw for Counting {
     }
 }
 
-/// SN-13 (desk-minipc-w13 FAIL 1): reading an endpoint register selects it in `EP_INDEX` and puts the index back;
+/// SN-13 (Mini-PC 23.10.): reading an endpoint register selects it in `EP_INDEX` and puts the index back;
 /// both writes reach the owner but are not display writes, so `write_calls` stays. `sense` and `state` the same.
 #[test]
 fn endpoint_reads_select_the_index_but_write_nothing() {
@@ -282,6 +282,55 @@ fn display_writes_still_count() {
     assert_eq!(latch.write_calls(), real + 1);
     assert_eq!(latch.write_calls() + latch.selects(), c.raw().len() as u64);
     restored(&c.f);
+}
+
+/// GPY (GX-D9 red at Gen 159/160): which owner method each write takes. The paired index selects go to
+/// `write_select`, which `DcnRegs` logs as the sound's (`Owner::AudioIndex`, not counted by the GX picture proof);
+/// the endpoint data write, a BAR write and an unpaired index write go to `write` and count, also during `on`.
+struct Owned {
+    c: Counting,
+    selects: Mutex<Vec<(u32, u32)>>,
+}
+
+impl Raw for Owned {
+    fn read(&self, byte: u32) -> Result<u32, DcnError> {
+        self.c.read(byte)
+    }
+    fn write(&self, byte: u32, v: u32) -> Result<(), DcnError> {
+        self.c.write(byte, v)
+    }
+    fn write_unchecked(&self, byte: u32, v: u32) -> Result<(), DcnError> {
+        self.c.write_unchecked(byte, v)
+    }
+    fn write_select(&self, byte: u32, v: u32) -> Result<(), DcnError> {
+        self.selects.lock().unwrap().push((byte, v));
+        self.c.f.write(byte, v)
+    }
+}
+
+#[test]
+fn paired_index_selects_take_the_sounds_owner_and_nothing_else_does() {
+    let o = Owned { c: Counting::new(), selects: Mutex::new(Vec::new()) };
+    let (latch, pair) = (Latch::new(), IrqSpinLock::new(()));
+    let ctx = Ctx { raw: &o, latch: &latch, pair: &pair };
+    let old = o.c.f.img().index();
+    let _ = dpaudio::state(&mut ctx.bus(false));
+    let v = dpaudio::get(&mut ctx.bus(false), Loc::Ep(0x54)).unwrap();
+    assert_eq!(v, o.c.f.img().g(Loc::Ep(0x54)));
+    let sel = o.selects.lock().unwrap().clone();
+    assert!(sel.len() >= 2 && sel.iter().all(|&(b, _)| b == dpaudio::EP_INDEX), "{sel:X?}");
+    assert_eq!(sel.last(), Some(&(dpaudio::EP_INDEX, old)), "put back");
+    assert!(o.c.raw().is_empty(), "a read of the audio state is no counted write: {:X?}", o.c.raw());
+    // The endpoint's data write and every BAR write are counted writes.
+    dpaudio::put(&mut ctx.bus(false), Loc::Ep(0x54), v).unwrap();
+    assert_eq!(o.c.raw(), [(dpaudio::EP_DATA, v)]);
+    Regs::write(&mut ctx.bus(false), dpaudio::EP_INDEX, old).unwrap();
+    assert_eq!(o.c.raw().last(), Some(&(dpaudio::EP_INDEX, old)), "an unpaired index write counts");
+    // HDMI sound switched on: its 48 writes all count; only its paired selects are the sound's.
+    let n = o.c.raw().len();
+    assert!(ctx.on(&az()).is_ok());
+    assert_eq!(o.c.raw().len() - n, 48, "{:X?}", &o.c.raw()[n..]);
+    assert!(o.selects.lock().unwrap().iter().all(|&(b, _)| b == dpaudio::EP_INDEX));
 }
 
 /// SN-13 (w25): Linux's DP audio on sends `UpdatePmeRestore` between the endpoint's enable and the packets, its

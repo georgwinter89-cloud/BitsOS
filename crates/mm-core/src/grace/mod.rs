@@ -13,10 +13,10 @@
 //! hold no slot and never delay anything; only a CPU inside a section does, for the length of that section.
 //! `hal::switch`'s sync generations (sched/reap.rs's quiescent points) cannot serve here: they flush every TLB
 //! per generation, count IPI'd idle CPUs and pass a CPU in the resched IPI even inside a reader's critical
-//! section (plan/notes/pf-scout-memory.md section 3). The reaper thread is still the background driver: its
+//! section (plan/spec/storage.md §3.2). The reaper thread is still the background driver: its
 //! passes call `drain` (sched/reap.rs).
 //!
-//! Waiting memory is a third state of a frame (Linus's list on 4c0f369, plan/notes/pf-scout-memory.md section 4):
+//! Waiting memory is a third state of a frame (Linus's list on 4c0f369, plan/spec/storage.md §3.2):
 //! - counted: `pending_bytes` (part of the owner's `used_by_kind`, also in `FrameStats::pending_bytes`), counted
 //!   as free by MemAvailable and kswapd;
 //! - drained by the allocator before it answers out-of-memory (`Buddy::alloc`, `alloc_reclaiming`,
@@ -90,6 +90,8 @@ fn grow(n: usize) -> bool {
     if GROWING.compare_exchange(false, true, Acquire, Relaxed).is_err() {
         return true;
     }
+    // A refusal is handled (the caller looks again): no never-failing loop (`oom::no_retry`).
+    let _bounded = crate::oom::no_retry();
     let mut v: Vec<Slot> = Vec::new();
     let ok = v.try_reserve_exact(n).is_ok();
     if ok {
@@ -118,12 +120,14 @@ fn grow(n: usize) -> bool {
     done
 }
 
-/// `Box::new` that answers None instead of aborting when the heap is out of room (R2).
+/// `Box::new` that answers None instead of aborting when the heap is out of room (R2). Its callers have a
+/// fallback (index nodes, the grace queue's blocks, freeing paths): it never enters the never-failing loop.
 pub fn try_box<T>(v: T) -> Option<Box<T>> {
     let layout = Layout::new::<T>();
     if layout.size() == 0 {
         return Some(Box::new(v));
     }
+    let _bounded = crate::oom::no_retry();
     // SAFETY: the layout is T's and non-zero sized; on success the memory is initialised with `v` before the
     // Box takes it, and a Box of T frees it with the same layout.
     unsafe {
@@ -191,7 +195,7 @@ fn claim(hint: usize) -> Option<&'static Slot> {
         // section loads afterwards is never older than the epoch it is counted in. PF-7: the store and the loads
         // after it need the order store-then-load. The locked compare-exchange (and `xchg`, the SeqCst store) is
         // already that barrier on x86-64: Linux's `smp_mb__after_atomic` is empty for the same reason
-        // (linux-6.6/arch/x86/include/asm/barrier.h); an `mfence` on top cost 33 cycles per section. A host of
+        // (linux-7.3.1/arch/x86/include/asm/barrier.h:76); an `mfence` on top cost 33 cycles per section. A host of
         // another architecture keeps the fence.
         loop {
             #[cfg(target_arch = "x86_64")]

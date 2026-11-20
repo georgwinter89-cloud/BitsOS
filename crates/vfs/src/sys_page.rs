@@ -8,7 +8,7 @@
 //! not cached, a user page that must fault in, a step that raced a truncate) the locked path
 //! (`read_direct`) does. A user fault ends the read at the first user page that faults, and the bounce path
 //! (`sys::read_into`) finishes it, as Linux's `filemap_read` ends at a short `copy_folio_to_iter`
-//! (linux-6.6/mm/filemap.c:2703-2709) and returns the bytes so far.
+//! (linux-7.3.1/mm/filemap.c:2875-2884) and returns the bytes so far.
 
 use crate::abi::MAX_RW_COUNT;
 use crate::frame::PAGE;

@@ -1,6 +1,9 @@
 //! The Unix socket (DESIGN §2.1): JSON lines, `{"id", "op", "args"}` → `{"id", "ok", "result"|"error"}`.
 //! Hostile input never panics; a line over 1 MiB is answered with `bad_request` and the connection stays
 //! usable. The socket is for Georg's own programs (desktop, CLI, UI): callers here are `Caller::Desktop`.
+//! CX-5: op `mcp` carries one JSON-RPC message of the MCP door (`mcp::handle_rpc`, `Caller::Mcp`): the
+//! assistant offers ctxd's tools to a model through it, with exactly the privacy of the MCP door (no private
+//! root, short snippets), since its answers go to an AI.
 
 use crate::api;
 use crate::engine::{Caller, Engine};
@@ -60,7 +63,8 @@ pub fn read_line(r: &mut impl BufRead, max: usize) -> io::Result<Line> {
     }
 }
 
-pub fn handle_line(e: &Engine, line: &str) -> Value {
+/// `desktop`: the connection is bitscomp's (`peer::desktop`), which alone speaks for Georg's own Vorrang input.
+pub fn handle_line(e: &Engine, line: &str, desktop: bool) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return json!({"id": null, "ok": false, "error": {"code": "bad_request", "message": "not JSON"}}),
@@ -76,6 +80,13 @@ pub fn handle_line(e: &Engine, line: &str) -> Value {
             e.wake_indexer();
             Ok(json!({"queued": true}))
         }
+        "open" => crate::api::opened(e, &args),
+        "mcp" => match crate::mcp::handle_rpc(e, &args) {
+            Some(answer) => Ok(answer),
+            None => Ok(json!({"accepted": true})),
+        },
+        // DB4: the one memory's ops (C4), the desktop's only.
+        o if crate::habits_ops::OPS.contains(&o) => crate::habits_ops::call(e, o, &args, desktop).unwrap_or_else(|| api::call(e, o, &args, Caller::Desktop)),
         _ => api::call(e, op, &args, Caller::Desktop),
     };
     match r {
@@ -86,6 +97,8 @@ pub fn handle_line(e: &Engine, line: &str) -> Value {
 
 fn serve_conn(e: Arc<Engine>, s: UnixStream) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(600)));
+    // Asked once, right after accept: the kernel's record of who connected does not change afterwards.
+    let desktop = crate::peer::desktop(&s);
     let Ok(w) = s.try_clone() else { return };
     let mut w = io::BufWriter::new(w);
     let mut r = BufReader::new(s);
@@ -96,7 +109,7 @@ fn serve_conn(e: Arc<Engine>, s: UnixStream) {
                 json!({"id": null, "ok": false, "error": {"code": "bad_request", "message": "line longer than 1 MiB"}})
             }
             Ok(Line::Text(l)) if l.trim().is_empty() => continue,
-            Ok(Line::Text(l)) => handle_line(&e, &l),
+            Ok(Line::Text(l)) => handle_line(&e, &l, desktop),
         };
         if writeln!(w, "{resp}").and_then(|_| w.flush()).is_err() {
             return;

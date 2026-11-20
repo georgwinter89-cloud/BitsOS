@@ -2,7 +2,7 @@
  * unshare/clone of user+mount+pid, mount(NULL, "/", MS_SLAVE|MS_REC), a tmpfs base, the new root bound onto
  * itself, pivot_root(base, oldroot), proc/devpts/mqueue/tmpfs mounts, read-only binds by MS_REMOUNT|MS_BIND,
  * umount2(oldroot, MNT_DETACH), pivot_root(".", ".") + umount2(".", MNT_DETACH)), then mountinfo and mounts as
- * Linux prints them (linux-6.6/fs/namespace.c, fs/pnode.c, fs/proc_namespace.c).
+ * Linux prints them (linux-7.3.1/fs/namespace.c, fs/pnode.c, fs/proc_namespace.c).
  *
  * Modes: (none) the container; "prop" shared/slave/private/unbindable propagation; "errors" the refusals in
  * Linux's order; "clone" clone(CLONE_NEWUSER|CLONE_NEWNS); "overlay" a read-only overlay of two layers;
@@ -390,6 +390,10 @@ static int mode_errors(void) {
     M("bind file onto dir", mount("/tmp/f", "/tmp/d", NULL, MS_BIND, NULL));
     M("bind dir onto file", mount("/tmp/d", "/tmp/f", NULL, MS_BIND, NULL));
     M("pivot_root onto a file", pivot("/tmp/f", "/tmp/d"));
+    /* A bind of the parent's file system: this namespace's root may unmount it, but not force it (can_umount). */
+    M("bind /bin", mount("/bin", "/tmp/d", NULL, MS_BIND, NULL));
+    M("umount2 force a foreign file system", umount2("/tmp/d", MNT_FORCE));
+    M("umount2 the bind", umount2("/tmp/d", 0));
     M("umount2 expire", umount2("/tmp", MNT_EXPIRE));
     M("umount2 expire detach", umount2("/tmp", MNT_EXPIRE | MNT_DETACH));
     M("chdir tmp", chdir("/tmp"));
@@ -402,8 +406,8 @@ static int mode_errors(void) {
     M("remount own sb read-only", mount(NULL, "/tmp", NULL, MS_REMOUNT | MS_RDONLY, NULL));
     touch("write on read-only sb", "/tmp/g");
     mountinfo("errors", 0);
-    /* Last: Linux 6.6 refuses MNT_FORCE without CAP_SYS_ADMIN in the initial namespace (can_umount); newer
-     * kernels unmount (expected/sx3.known). */
+    /* Last: MNT_FORCE needs CAP_SYS_ADMIN over the file system (linux-7.3.1/fs/namespace.c:2077 can_umount), which
+     * this namespace's root has for its own tmpfs: it unmounts. */
     M("umount2 force", umount2("/tmp", MNT_FORCE));
     return 0;
 }
@@ -675,7 +679,7 @@ static int mode_sockbind(void) {
 
 /* SX-3b (bwrap --disable-userns): /proc/sys/user/max_user_namespaces is the reader's user namespace's limit,
  * writable only with CAP_SYS_RESOURCE there; 1 written in a namespace allows one namespace made there, so the
- * second level cannot make a third (every level counts, linux-6.6/kernel/ucount.c inc_ucount). */
+ * second level cannot make a third (every level counts, linux-7.3.1/kernel/ucount.c:218 inc_ucount). */
 static void limit_line(const char *label) {
     char b[64];
     long n = slurp("/proc/sys/user/max_user_namespaces", b, sizeof b);
@@ -721,7 +725,13 @@ static int mode_nslimit(void) {
     printf("open for write inside = %s\n", fd >= 0 ? "ok" : me(errno));
     wline("write 3000000000", fd, "3000000000");
     wline("write -1", fd, "-1");
+    wline("write -0", fd, "-0");
     wline("write blank", fd, " \n");
+    /* do_proc_vec answers the bytes up to the number and the white space behind it. */
+    int part = open("/proc/sys/user/max_user_namespaces", O_WRONLY);
+    wline("write 2 junk", part, "2 junk");
+    if (part >= 0)
+        close(part);
     wline("write 1", fd, "1");
     wline("write 5 at offset 1", fd, "5");
     close(fd);
@@ -739,7 +749,7 @@ static int mode_nslimit(void) {
 
 /* SX-3b: PR_SET_PDEATHSIG of a pid namespace's init whose parent is outside the namespace (bwrap
  * --die-with-parent --unshare-pid): the parent's end kills it, although an init ignores the signals sent from
- * inside its namespace (linux-6.6/kernel/signal.c:1233, SEND_SIG_NOINFO from an invisible sender is forced).
+ * inside its namespace (linux-7.3.1/kernel/signal.c:1213, SEND_SIG_NOINFO from an invisible sender is forced).
  * The init is reparented to this process (a subreaper) and reaped here; 5 s bound. */
 static int mode_pdeath(void) {
     int ready[2], idp[2];
@@ -804,7 +814,7 @@ static int mode_pdeath(void) {
 
 /* SX-3c (pressure-vessel's fds opened before the container): readlink of /proc/self/fd/N and getcwd for places
  * the caller's root does not reach show the path up to the top of the place's own mount chain
- * (linux-6.6/fs/d_path.c __prepend_path; getcwd adds "(unreachable)", d_path.c:432): a file of the view the
+ * (linux-7.3.1/fs/d_path.c:104 __prepend_path; getcwd adds "(unreachable)", d_path.c:435): a file of the view the
  * fd was opened in keeps its whole path there, a file of a lazily unmounted tree the path from its root.
  * The test directory's name (it carries the pid) is printed as D. */
 static void fdlink_in(const char *proc, const char *label, int fd, const char *dir) {
@@ -931,12 +941,10 @@ static int mode_fdpath(void) {
     return 0;
 }
 
-/* SX-3c: the hard links pressure-vessel's --copy-runtime makes (linux-6.6/fs/namei.c do_linkat, may_linkat,
+/* SX-3c: the hard links pressure-vessel's --copy-runtime makes (linux-7.3.1/fs/namei.c filename_linkat, may_linkat,
  * vfs_link), in a tmpfs of a user namespace's own: a second name keeps the data when the first goes, a bind of
  * the same file system is another mount (EXDEV), a read-only bind is EROFS (before EXDEV), an O_TMPFILE file
- * gets its first name through /proc/self/fd, a removed one none. AT_EMPTY_PATH is left to the vfs host test:
- * Linux 6.6 refuses it without CAP_DAC_READ_SEARCH (namei.c:4648), CachyOS's newer kernel allows it for the
- * opener, so the two would differ. */
+ * gets its first name through /proc/self/fd, a removed one none. AT_EMPTY_PATH: abi-linkat-empty. */
 static void nlinks(const char *label, const char *path) {
     struct stat st;
     if (stat(path, &st))

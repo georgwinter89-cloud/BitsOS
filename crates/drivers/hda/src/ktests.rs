@@ -55,7 +55,7 @@ fn probe() -> TestResult {
         let mode = c.link_mode().map_or("none", |m| m.name());
         let irq = d.irq_info().map(|(m, n)| format!("{}:{n}", m.name())).unwrap_or_else(|| "polled".into());
         klog::event!(Info, "ktest", "hda.ctrl", ctrl = c.name(), kind = c.kind().name(), link = mode, codecs = c.codecs().len(),
-            outputs = outs.len(), irq = irq.as_str(), snoop = c.snooped(), timeouts = c.link_stats().0);
+            outputs = outs.len(), irq = irq.as_str(), timeouts = c.link_stats().0);
         for o in &outs {
             klog::event!(Info, "ktest", "hda.out", ctrl = c.name(), cad = o.id.cad, pin = klog::Hex(o.id.pin as u64), kind = kind_name(o.kind),
                 converter = klog::Hex(o.converter as u64), formats = o.formats.len(), playable = o.playable,

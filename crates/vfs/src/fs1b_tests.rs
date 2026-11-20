@@ -1,5 +1,5 @@
 //! FS-1b host tests beyond the case list: mknod by device number opens the device registered under it
-//! (`special`, the answer to fs-FS-2.md open point 3).
+//! (`special`: device nodes are looked up by number).
 use crate::cases_test::{program_view, SUBJECT, USER};
 use crate::inode::Cred;
 use crate::ops::Ctx;

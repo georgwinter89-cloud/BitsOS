@@ -392,23 +392,19 @@ fn fired_is_read_even_when_the_chip_refuses() {
 
 #[test]
 fn config_defaults_and_bad_values() {
-    let (c, p) = config::parse(None, None, None, None, None, false);
-    assert!(c.on && !c.on_from_config && p.is_none());
-    assert_eq!((c.timeout_s, c.alive_s, c.grace_s, c.reload_grace), (30, 10, 240, false));
-    let (c, _) = config::parse(None, None, None, None, None, true);
-    assert!(!c.on, "off under a hypervisor by default");
-    let (c, p) = config::parse(Some("on"), Some("60"), Some("20"), Some("300"), Some("grace"), true);
-    assert!(c.on && c.on_from_config && p.is_none());
-    assert_eq!((c.timeout_s, c.alive_s, c.grace_s, c.reload_grace), (60, 20, 300, true));
-    let (c, p) = config::parse(Some("OFF"), None, None, None, None, false);
-    assert!(!c.on && p.is_none());
-    let (c, p) = config::parse(Some("maybe"), Some("2"), None, None, Some("x"), false);
-    assert!(c.on && c.timeout_s == 30);
-    assert_eq!(p, Some("watchdog"));
-    let (c, p) = config::parse(None, Some("8"), Some("10"), None, None, false);
+    let (c, p) = config::parse(None, None, None);
+    assert!(p.is_none());
+    assert_eq!((c.timeout_s, c.alive_s, c.grace_s), (30, 10, 240));
+    let (c, p) = config::parse(Some("60"), Some("20"), Some("300"));
+    assert!(p.is_none());
+    assert_eq!((c.timeout_s, c.alive_s, c.grace_s), (60, 20, 300));
+    let (c, p) = config::parse(Some("2"), None, None);
+    assert_eq!(c.timeout_s, 30);
+    assert_eq!(p, Some("watchdog_timeout"));
+    let (c, p) = config::parse(Some("8"), Some("10"), None);
     assert_eq!((c.timeout_s, c.alive_s), (8, 5), "window shrunk to fit the timeout");
     assert_eq!(p, Some("watchdog_alive"));
-    let (c, p) = config::parse(None, Some("45s"), None, Some("1"), None, false);
+    let (c, p) = config::parse(Some("45s"), None, Some("1"));
     assert_eq!((c.timeout_s, c.grace_s), (45, 240));
     assert_eq!(p, Some("watchdog_grace"));
 }
@@ -416,7 +412,7 @@ fn config_defaults_and_bad_values() {
 #[test]
 fn hang_only_when_armed() {
     assert!(hang_refusal(State::Armed).is_none());
-    for st in [State::NotStarted, State::Starting, State::Absent, State::Off, State::Unusable, State::Stopped, State::Grace] {
+    for st in [State::NotStarted, State::Starting, State::Absent, State::Unusable, State::Stopped, State::Grace] {
         assert!(hang_refusal(st).is_some_and(|t| t.contains(st.name())), "{st:?}");
     }
 }
@@ -534,9 +530,8 @@ fn hold_clock() -> u64 {
 
 /// RB-17 fixer: the paths around the held Reload besides the clean one. A hang between the Quiesce and the jump
 /// (held, never stopped) is reset after the last crumb's count and gets no kick; a jump that failed after the
-/// stop is armed again without kicks (`after_failed_jump`'s call) and resets after the timeout; with
-/// `watchdog_reload=grace` the crumbs land counted from now and the next start reads them as "about", never
-/// incomplete.
+/// stop is armed again without kicks (`after_failed_jump`'s call) and resets after the timeout; under a reboot's
+/// grace the crumbs land counted from now and the next start reads them as "about", never incomplete.
 #[test]
 fn a_held_reload_resets_a_hang_rearms_after_a_failed_jump_and_grace_stays_about() {
     use crate::crumb::{self, Previous};
@@ -579,8 +574,8 @@ fn a_held_reload_resets_a_hang_rearms_after_a_failed_jump_and_grace_stays_about(
     assert!(d.hold());
     d.arm_unkicked().unwrap();
     assert!(fake.running() && fake.count() == 30);
-    // watchdog_reload=grace: the grace instead of the hold, the crumbs after it land, the counter runs into the
-    // next start (read with `running`): "about", never "stopped there".
+    // A reboot's grace (no hold): the crumbs after it land, the counter runs into the next start (read with
+    // `running`): "about", never "stopped there".
     let fake = Arc::new(Fake::new(false, false, Some(hold_clock)));
     let d = Dog::new(Box::new(fake.clone()), Box::new(FakeCpus(t.clone())), hold_clock, pol(), 30);
     d.arm().unwrap();

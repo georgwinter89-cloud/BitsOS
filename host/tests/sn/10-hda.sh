@@ -4,7 +4,7 @@
 #  A: two controllers at once (the SN-3 switching setup), MSI, 4 CPUs: hda0 plays 2 s at 48 kHz (mixer off),
 #     hda1 2 s at 44.1 kHz (mixer on: the DAC amp at 0 dB); each WAV is checked sample-exactly (wavcheck.py);
 #     probe/dump/jack ktests too.
-#  B: one controller, 16 CPUs, CONFIG hda_irq=off (polled) and hda_snoop=off (UC/WC DMA, or the logged fallback).
+#  B: one controller, 16 CPUs, the test key ktest_poll=hda (polled).
 #  C: ich9-intel-hda (8086:293E): Quiesce with a running stream and the restart, a bring-up over a running
 #     stream (QemuOnly tests).
 #  D: SN-7, the reboot's Quiesce order with the mixer streaming silence (QemuOnly).
@@ -58,16 +58,11 @@ nocheck "$LOG" ' E snd ' "A: no error events"
 LOG="$RUN/b.log"
 W2="$RUN/hda2.wav"
 rm -f "$W2"
-boot hda-b 16 "ktest=sn.hda.play;hda_irq=off;hda_snoop=off" "$LOG" -- \
+boot hda-b 16 "ktest=sn.hda.play;ktest_poll=hda" "$LOG" -- \
     -audiodev "wav,id=a0,path=$W2,out.frequency=48000,out.channels=2,out.format=s16" \
     -device intel-hda,id=h0 -device hda-duplex,bus=h0.0,audiodev=a0,mixer=off
-check "$LOG" 'KTEST done passed=1 failed=0' "B: play passes polled and without snooping"
-check "$LOG" 'snd hda.irq_mode ctrl=hda0 mode=polled' "B: polled (hda_irq=off)"
-if grep -aq 'W snd hda.snoop_fallback' "$LOG"; then
-    echo "ok   B: UC/WC memory refused (MM-4 before MM-6), logged fallback to snooping"
-else
-    check "$LOG" 'snd hda.open ctrl=hda0 .*snoop=false' "B: stream on uncached/write-combining memory"
-fi
+check "$LOG" 'KTEST done passed=1 failed=0' "B: play passes polled"
+check "$LOG" 'snd hda.irq_mode ctrl=hda0 mode=polled' "B: polled (ktest_poll=hda)"
 python3 -I "$HERE/wavcheck.py" "$W2" --rate 48000 --frames 96000 || fail=1
 nocheck "$LOG" ' E snd ' "B: no error events"
 

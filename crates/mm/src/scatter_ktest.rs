@@ -157,3 +157,34 @@ fn scatter_deferred() -> TestResult {
     Ok(())
 }
 ktest!("mm.heap.scatter_deferred", Safe, scatter_deferred);
+
+/// A scattered block too large to be kept costs one shootdown round when it goes (frames and range together,
+/// `hal::paging::unmap_kernel_frames`); before, two (Mini-PC 12.11.2026: 15 interrupts per block on sixteen CPUs).
+/// Its frames come back: the frame allocator holds as many heap frames as before the blocks.
+fn scatter_one_round() -> TestResult {
+    const BLOCKS: u64 = 16;
+    let frag = Fragmented::new()?;
+    kassert!(frag.loose_bytes() >= 64 * MIB, "only {} MiB of single frames to work with", frag.loose_bytes() / MIB);
+    let heap_frames = || mm_core::frames().map_or(0, |f| f.stats().used_by_kind[Kind::Heap as usize]);
+    let (h0, k0) = (heap_frames(), metric("mm.heap.scatter_kept"));
+    let mut rounds = 0;
+    for i in 0..BLOCKS {
+        let mut v: Vec<u8> = Vec::new();
+        v.try_reserve_exact(4 * MIB).map_err(|_| alloc::format!("block {i}: no 4 MiB block although single frames are free"))?;
+        kassert!(scattered(v.as_ptr()), "block {i} {:p} is not in the vmap area", v.as_ptr());
+        v.resize(4 * MIB, 0x5A);
+        // Only the free's own window is counted (not the allocation and the 4 MiB of writes).
+        let r0 = hal::paging::tlb::stats().kernel;
+        drop(v);
+        rounds += hal::paging::tlb::stats().kernel - r0;
+    }
+    let (h1, k1) = (heap_frames(), metric("mm.heap.scatter_kept"));
+    // Another thread's kernel shootdown inside one of the sixteen short windows (a stack reaped) is the slack: two.
+    kassert!(rounds <= BLOCKS + 2, "{rounds} kernel shootdown rounds for {BLOCKS} freed blocks");
+    kassert!(k1 == k0, "{} frames kept out of use", k1 - k0);
+    // Bytes (used_by_kind); 64 frames of slack for other threads' heap growth meanwhile.
+    kassert!(h1 <= h0 + 64 * PAGE, "heap bytes {h0} -> {h1}: the blocks' frames did not come back");
+    drop(frag);
+    whole_again()
+}
+ktest!("mm.heap.scatter_one_round", Safe, scatter_one_round);
