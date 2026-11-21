@@ -25,6 +25,11 @@ But it boots.<br>
 *Cities: Skylines II (through Steam and Proton) beside YouTube in Brave, on the Mini-PC's Radeon 780M, 19 November
 2026.*
 
+[![A one-minute video of BitsOS on the Mini-PC: YouTube in Brave, the system page and Farthest Frontier side by side](docs/images/minipc-video-2026-11-21.jpg)](docs/videos/bitsos-minipc-2026-11-21.mp4)
+
+*A one-minute video, filmed off the monitor on 21 November 2026: YouTube in Brave, BitsOS's system page and
+Farthest Frontier side by side on the Mini-PC. Click the picture to open the video.*
+
 BitsOS is an operating system with its own kernel, written in Rust. To programs it speaks Linux: it implements 278 of
 the 386 system calls of Linux 7.3.1 on x86-64, so ordinary Linux programs (the Brave browser, LibreOffice, Valve's
 Steam client and, through Proton, Windows games) run on it unchanged, with no Linux underneath. It has its own boot
