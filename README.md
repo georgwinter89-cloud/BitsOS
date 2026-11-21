@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/b50625db-2c75-4882-8c71-fc459383d333
+
 # BitsOS
 
 We have no idea what we're doing.<br>
